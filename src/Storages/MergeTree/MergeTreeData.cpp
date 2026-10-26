@@ -6437,6 +6437,13 @@ MergeTreeDataPartFormat MergeTreeData::choosePartFormat(
     return {part_type, storage_type};
 }
 
+MergeTreeDataPartFormat MergeTreeData::normalizePartFormatForDisk(MergeTreeDataPartFormat format, const DiskPtr & disk)
+{
+    if (format.storage_type == MergeTreeDataPartStorageType::Packed && !disk->allowsPackedParts())
+        format.storage_type = MergeTreeDataPartStorageType::Full;
+    return format;
+}
+
 MergeTreeDataPartBuilder MergeTreeData::getDataPartBuilder(
     const String & name, const VolumePtr & volume, const String & part_dir, const ReadSettings & read_settings_, PartDirIntent intent) const
 {

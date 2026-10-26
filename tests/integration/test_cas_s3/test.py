@@ -161,6 +161,71 @@ def test_cas_s3():
     )
 
 
+def test_cas_s3_packed_parts():
+    node = cluster.instances["node"]
+
+    node.query("DROP TABLE IF EXISTS cas_packed SYNC")
+    node.query(
+        """
+        CREATE TABLE cas_packed (
+            id UInt64,
+            value UInt64
+        ) ENGINE = MergeTree()
+        ORDER BY id
+        SETTINGS storage_policy = '{}', min_bytes_for_full_part_storage = '1G'
+        """.format(
+            STORAGE_POLICY
+        )
+    )
+
+    node.query(
+        "INSERT INTO cas_packed SELECT number, number % 100 FROM numbers({})".format(
+            NUM_ROWS
+        )
+    )
+    node.query(
+        "INSERT INTO cas_packed SELECT number + {0}, number % 100 FROM numbers({0})".format(
+            NUM_ROWS
+        )
+    )
+
+    assert (
+        node.query(
+            "SELECT uniqExact(part_storage_type), any(part_storage_type) "
+            "FROM system.parts WHERE database = currentDatabase() "
+            "AND table = 'cas_packed' AND active"
+        ).strip()
+        == "1\tPacked"
+    )
+
+    node.query("OPTIMIZE TABLE cas_packed FINAL")
+
+    assert (
+        node.query(
+            "SELECT uniqExact(part_storage_type), any(part_storage_type) "
+            "FROM system.parts WHERE database = currentDatabase() "
+            "AND table = 'cas_packed' AND active"
+        ).strip()
+        == "1\tPacked"
+    )
+
+    node.restart_clickhouse()
+
+    expected_sum = NUM_ROWS * (2 * NUM_ROWS - 1)
+    assert int(node.query("SELECT count() FROM cas_packed")) == 2 * NUM_ROWS
+    assert int(node.query("SELECT sum(id) FROM cas_packed")) == expected_sum
+    assert (
+        node.query(
+            "SELECT uniqExact(part_storage_type), any(part_storage_type) "
+            "FROM system.parts WHERE database = currentDatabase() "
+            "AND table = 'cas_packed' AND active"
+        ).strip()
+        == "1\tPacked"
+    )
+
+    node.query("DROP TABLE cas_packed SYNC")
+
+
 def test_mutations_and_patch_parts_survive_restart():
     # A mutated part and a patch part are ordinary content-addressed parts published as refs. After a
     # restart the active set must be rediscovered from the refs in S3, so the post-mutation /

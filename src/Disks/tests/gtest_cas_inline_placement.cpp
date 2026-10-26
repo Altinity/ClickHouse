@@ -26,3 +26,16 @@ TEST(CASInlinePlacement, EagerMetadataFilesAreInlineCandidates)
     EXPECT_FALSE(partFileMustStayBlob("minmax_date.idx"));
     EXPECT_FALSE(partFileMustStayBlob("default_compression_codec.txt"));
 }
+
+TEST(CASInlinePlacement, PackedArchiveBasenameStaysBlob)
+{
+    EXPECT_TRUE(partFileMustStayBlob("data.packed"));
+    EXPECT_TRUE(partFileMustStayBlob("data.packed.tmp"));
+    EXPECT_TRUE(partFileMustStayBlob("projection.proj/data.packed"));
+    EXPECT_TRUE(partFileMustStayBlob("projection.proj/data.packed.tmp"));
+
+    EXPECT_FALSE(partFileMustStayBlob("not_data.packed"));
+    EXPECT_FALSE(partFileMustStayBlob("data.packed.backup"));
+    EXPECT_FALSE(partFileMustStayBlob("data.packed.tmp.backup"));
+    EXPECT_FALSE(partFileMustStayBlob("projection.proj/not_data.packed"));
+}

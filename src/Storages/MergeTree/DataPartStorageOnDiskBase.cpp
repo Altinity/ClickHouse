@@ -4,6 +4,7 @@
 #include <Backups/BackupSettings.h>
 #include <Core/Defines.h>
 #include <Disks/IDiskTransaction.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
 #include <Disks/SingleDiskVolume.h>
 #include <Common/Jemalloc.h>
 #include <Common/JemallocMergeTreeArena.h>
@@ -32,6 +33,9 @@
 
 #include <fmt/ranges.h>
 
+#include <set>
+#include <vector>
+
 namespace DB
 {
 
@@ -47,6 +51,50 @@ namespace ErrorCodes
 
 namespace
 {
+class DataPartStorageIteratorOnDisk final : public IDataPartStorageIterator
+{
+public:
+    DataPartStorageIteratorOnDisk(DiskPtr disk_, DirectoryIteratorPtr it_)
+        : disk(std::move(disk_)), it(std::move(it_))
+    {
+    }
+
+    void next() override { it->next(); }
+    bool isValid() const override { return it->isValid(); }
+    bool isFile() const override { return isValid() && disk->existsFile(it->path()); }
+    std::string name() const override { return it->name(); }
+    std::string path() const override { return it->path(); }
+
+private:
+    DiskPtr disk;
+    DirectoryIteratorPtr it;
+};
+
+/// Iterates names prepared by `iterateDirectoryInTransactionOrDisk`: the union of committed and staged
+/// immediate children. `isFile` checks only the disk, so it returns false for a staged-only file.
+/// `MergeTreeIndexGranularityInfo::getMarksTypeFromFilesystem` uses this view to detect a mark file by
+/// its extension while the parent part is still staged.
+class DataPartStorageMergedIterator final : public IDataPartStorageIterator
+{
+public:
+    DataPartStorageMergedIterator(DiskPtr disk_, std::string dir_path_, std::vector<std::string> names_)
+        : disk(std::move(disk_)), dir_path(std::move(dir_path_)), names(std::move(names_))
+    {
+    }
+
+    void next() override { ++pos; }
+    bool isValid() const override { return pos < names.size(); }
+    std::string name() const override { return names[pos]; }
+    std::string path() const override { return fs::path(dir_path) / names[pos]; }
+    bool isFile() const override { return isValid() && disk->existsFile(path()); }
+
+private:
+    DiskPtr disk;
+    std::string dir_path;
+    std::vector<std::string> names;
+    size_t pos = 0;
+};
+
     /// fsync `dir_path` and every subdirectory below it (children first), so that the directory
     /// entries created by a freeze/hardlink clone become durable. Used only for local disks
     /// (on remote/object disks getDirectorySyncGuard() returns nullptr and this is a no-op).
@@ -1323,6 +1371,118 @@ bool DataPartStorageOnDiskBase::hasActiveTransaction() const
 bool DataPartStorageOnDiskBase::isCaseInsensitive() const
 {
     return getDisk()->isCaseInsensitive();
+}
+
+bool DataPartStorageOnDiskBase::existsFileInTransactionOrDisk(const std::string & path) const
+{
+    if (transaction && transaction->tryGetInFlightFileSize(path).has_value())
+        return true;
+    return volume->getDisk()->existsFile(path);
+}
+
+bool DataPartStorageOnDiskBase::existsDirectoryInTransactionOrDisk(const std::string & path) const
+{
+    if (transaction && transaction->hasInFlightDirectory(path))
+        return true;
+    return volume->getDisk()->existsDirectory(path);
+}
+
+DataPartStorageIteratorPtr DataPartStorageOnDiskBase::iterateDirectoryInTransactionOrDisk(const std::string & path) const
+{
+    if (transaction)
+    {
+        if (auto staged = transaction->listInFlightDirectory(path); !staged.empty())
+        {
+            std::set<std::string> names(staged.begin(), staged.end());
+            if (volume->getDisk()->existsDirectory(path))
+                for (auto it = volume->getDisk()->iterateDirectory(path); it->isValid(); it->next())
+                    names.insert(it->name());
+            return std::make_unique<DataPartStorageMergedIterator>(
+                volume->getDisk(), path, std::vector<std::string>(names.begin(), names.end()));
+        }
+    }
+
+    return std::make_unique<DataPartStorageIteratorOnDisk>(
+        volume->getDisk(),
+        volume->getDisk()->iterateDirectory(path));
+}
+
+size_t DataPartStorageOnDiskBase::getFileSizeInTransactionOrDisk(const std::string & path) const
+{
+    if (transaction)
+        if (auto size = transaction->tryGetInFlightFileSize(path))
+            return *size;
+    return volume->getDisk()->getFileSize(path);
+}
+
+StoredObjects DataPartStorageOnDiskBase::getStorageObjectsInTransactionOrDisk(const std::string & path) const
+{
+    if (transaction)
+    {
+        if (auto inflight = transaction->tryGetInFlightStorageObjects(path))
+            return std::move(*inflight);
+        /// An in-flight file can exist before it has storage objects, for example while an upload is pending.
+        /// Do not expose a committed object at the same path in that case.
+        if (transaction->tryGetInFlightFileSize(path))
+            return {};
+    }
+    return volume->getDisk()->getStorageObjects(path);
+}
+
+void DataPartStorageOnDiskBase::prepareReadInTransactionOrDisk(
+    const std::string & path,
+    const ReadSettings & settings,
+    std::optional<size_t> read_hint,
+    ReadPipeline & pipeline) const
+{
+    if (transaction)
+    {
+        StoredObjects inflight_objects;
+        if (auto objects = transaction->tryGetInFlightStorageObjects(path))
+            inflight_objects = std::move(*objects);
+        else if (auto size = transaction->tryGetInFlightFileSize(path))
+            /// `ReadPipeline::build` treats an empty object list as an empty file and does not invoke
+            /// the source. This placeholder makes it invoke the source, which ignores the object and
+            /// reads the staged bytes through the transaction.
+            inflight_objects = StoredObjects{StoredObject(path, path, *size)};
+
+        if (!inflight_objects.empty())
+        {
+            /// Keep the transaction alive for as long as the pipeline can invoke the custom source.
+            auto current_transaction = transaction;
+            pipeline.setSource(
+                [current_transaction, path](const StoredObject &, const ReadSettings & read_settings, bool, bool)
+                {
+                    auto buffer = current_transaction->tryReadFileInFlight(path, read_settings, std::nullopt);
+                    if (!buffer)
+                        throw Exception(ErrorCodes::LOGICAL_ERROR, "In-flight file {} cannot be read", path);
+                    return buffer;
+                },
+                std::move(inflight_objects),
+                settings);
+            return;
+        }
+    }
+
+    volume->getDisk()->prepareRead(path, settings, read_hint, pipeline);
+}
+
+std::unique_ptr<ReadBufferFromFileBase> DataPartStorageOnDiskBase::readFileIfExistsInTransactionOrDisk(
+    const std::string & path,
+    const ReadSettings & settings,
+    std::optional<size_t> read_hint) const
+{
+    if (transaction)
+    {
+        auto in_flight_size = transaction->tryGetInFlightFileSize(path);
+        if (auto buffer = transaction->tryReadFileInFlight(path, settings, read_hint))
+            return buffer;
+        /// If the transaction knows this file but cannot read it, this is a logical error.
+        /// Do not fall back to a committed file at the same path.
+        if (in_flight_size)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "In-flight file {} cannot be read", path);
+    }
+    return volume->getDisk()->readFileIfExists(path, settings, read_hint);
 }
 
 std::shared_ptr<const PackedFilesReader> DataPartStorageOnDiskBase::getArchiveReaderForFile(const std::string & name) const

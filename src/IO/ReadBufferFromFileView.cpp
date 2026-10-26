@@ -28,11 +28,14 @@ ReadBufferFromFileView::ReadBufferFromFileView(
     file_offset_of_buffer_end = impl_buffer_end;
     original_working_buffer = working_buffer;
     resizeWorkingBuffer();
+    restoreViewWorkingBuffer(0);
 }
 
 void ReadBufferFromFileView::prefetch(Priority priority)
 {
+    const size_t view_position = getPosition();
     executeWithOriginalBuffer([&]{ impl->prefetch(priority); });
+    restoreViewWorkingBuffer(view_position);
 }
 
 void ReadBufferFromFileView::setReadUntilPosition(size_t position)
@@ -54,6 +57,7 @@ void ReadBufferFromFileView::setReadUntilPosition(size_t position)
     });
     file_offset_of_buffer_end = impl_buffer_end;
     resizeWorkingBuffer();
+    restoreViewWorkingBuffer(getPosition());
 }
 
 void ReadBufferFromFileView::setReadUntilEnd()
@@ -68,6 +72,7 @@ void ReadBufferFromFileView::setReadUntilEnd()
     });
     file_offset_of_buffer_end = impl_buffer_end;
     resizeWorkingBuffer();
+    restoreViewWorkingBuffer(getPosition());
 }
 
 off_t ReadBufferFromFileView::getPosition()
@@ -96,7 +101,10 @@ bool ReadBufferFromFileView::nextImpl()
         /// the impl continues from ITS position - incrementing would mislabel the new chunk.
         file_offset_of_buffer_end = impl_buffer_end;
         resizeWorkingBuffer();
+        restoreViewWorkingBuffer(getPosition());
     }
+    else
+        restoreViewWorkingBuffer(current_position - left_bound);
 
     return result;
 }
@@ -130,6 +138,7 @@ off_t ReadBufferFromFileView::seek(off_t off, int whence)
 
     file_offset_of_buffer_end = impl_buffer_end;
     resizeWorkingBuffer();
+    restoreViewWorkingBuffer(result - left_bound);
 
     return result - left_bound;
 }
@@ -137,6 +146,8 @@ off_t ReadBufferFromFileView::seek(off_t off, int whence)
 template <typename Op>
 void ReadBufferFromFileView::executeWithOriginalBuffer(Op && op)
 {
+    const size_t view_position = getPosition();
+
     /// Set original buffer as working buffer.
     working_buffer.swap(original_working_buffer);
 
@@ -154,11 +165,26 @@ void ReadBufferFromFileView::executeWithOriginalBuffer(Op && op)
         /// seek bound checks), so restore-on-exception is required for the view to stay consistent.
         swap(*impl);
         original_working_buffer = working_buffer;
+        restoreViewWorkingBuffer(view_position);
         throw;
     }
     swap(*impl);
 
     original_working_buffer = working_buffer;
+}
+
+void ReadBufferFromFileView::restoreViewWorkingBuffer(size_t view_position)
+{
+    if (working_buffer.empty())
+    {
+        bytes = view_position;
+        return;
+    }
+
+    const size_t native_offset = pos - working_buffer.begin();
+    const size_t view_offset = std::min(native_offset, view_position);
+    working_buffer = Buffer(pos - view_offset, working_buffer.end());
+    bytes = view_position - view_offset;
 }
 
 size_t ReadBufferFromFileView::getRightBound() const

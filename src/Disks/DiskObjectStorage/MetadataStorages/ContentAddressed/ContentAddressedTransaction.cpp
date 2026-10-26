@@ -66,6 +66,12 @@ bool hasSuffix(std::string_view s, std::string_view suffix)
 
 bool partFileMustStayBlob(std::string_view file_name)
 {
+    auto basename = file_name;
+    if (const auto separator = basename.find_last_of('/'); separator != std::string_view::npos)
+        basename.remove_prefix(separator + 1);
+
+    if (basename == "data.packed" || basename == "data.packed.tmp")
+        return true;
     if (file_name == "primary.idx")
         return true;
     for (std::string_view suffix : {".bin", ".mrk", ".mrk2", ".mrk3", ".cmrk", ".cmrk2", ".cmrk3"})

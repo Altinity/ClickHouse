@@ -2,6 +2,7 @@
 
 #include <IO/ReadBufferFromFileView.h>
 #include <IO/ReadBufferFromFileBase.h>
+#include <IO/ReadBufferFromMemory.h>
 
 #include <cstring>
 
@@ -123,6 +124,37 @@ class ReadBufferFromFileViewTest : public ::testing::TestWithParam<Case>
 
 }
 
+TEST(ReadBufferFromFileViewCount, MemoryBacked)
+{
+    const auto data = makePayload(1057);
+    auto inner = std::make_unique<ReadBufferFromOutsideMemoryFile>("memory", data);
+    ReadBufferFromFileView view(std::move(inner), "viewed", 1053, 1057);
+
+    EXPECT_EQ(view.count(), 0);
+    EXPECT_EQ(readExact(view, 4), data.substr(1053, 4));
+    EXPECT_EQ(view.count(), 4);
+    EXPECT_EQ(view.seek(1, SEEK_SET), 1);
+    EXPECT_EQ(view.getPosition(), 1);
+    EXPECT_EQ(readExact(view, 3), data.substr(1054, 3));
+    EXPECT_EQ(view.count(), 4);
+}
+
+TEST(ReadBufferFromFileViewCount, Nested)
+{
+    const auto data = makePayload(1088);
+    auto memory = std::make_unique<ReadBufferFromOutsideMemoryFile>("memory", data);
+    auto inner = std::make_unique<ReadBufferFromFileView>(std::move(memory), "inner", 1024, 1088);
+    ReadBufferFromFileView view(std::move(inner), "outer", 29, 33);
+
+    EXPECT_EQ(view.count(), 0);
+    EXPECT_EQ(readExact(view, 4), data.substr(1053, 4));
+    EXPECT_EQ(view.count(), 4);
+    EXPECT_EQ(view.seek(1, SEEK_SET), 1);
+    EXPECT_EQ(view.getPosition(), 1);
+    EXPECT_EQ(readExact(view, 3), data.substr(1054, 3));
+    EXPECT_EQ(view.count(), 4);
+}
+
 TEST_P(ReadBufferFromFileViewTest, SequentialReadWholeView)
 {
     const auto [chunk, mode] = GetParam();
@@ -193,9 +225,27 @@ TEST_P(ReadBufferFromFileViewTest, SetReadUntilTruncateThenExtend)
     EXPECT_EQ(view->getPosition(), 30);
     EXPECT_EQ(readExact(*view, 100), payload.substr(30, 100));
 
+    EXPECT_EQ(view->count(), 130);
     view->setReadUntilEnd();
+    EXPECT_EQ(view->count(), 130);
     EXPECT_EQ(readExact(*view, payload.size() - 130), payload.substr(130));
     EXPECT_TRUE(view->eof());
+    EXPECT_EQ(view->count(), payload.size());
+}
+
+TEST_P(ReadBufferFromFileViewTest, PrefetchKeepsCount)
+{
+    const auto [chunk, mode] = GetParam();
+    const auto payload = makePayload(1000);
+    auto view = makeView(payload, chunk, mode);
+
+    EXPECT_EQ(readExact(*view, 37), payload.substr(0, 37));
+    const auto count = view->count();
+    EXPECT_EQ(count, 37);
+    view->prefetch(Priority{0});
+    EXPECT_EQ(view->count(), count);
+    EXPECT_EQ(readExact(*view, 23), payload.substr(37, 23));
+    EXPECT_EQ(view->count(), 60);
 }
 
 /// The exact shape of the failing compact-part in-order read: per granule, adjust the right
