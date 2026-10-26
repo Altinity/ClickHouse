@@ -1,5 +1,7 @@
 #include <Databases/DataLake/Common.h>
 
+#include <Interpreters/Context.h>
+
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeDate.h>
 #include <DataTypes/DataTypeDateTime64.h>
@@ -68,9 +70,12 @@ DB::DataTypePtr getType(const String & type_name, bool nullable, DB::ContextPtr 
 {
     String name = trim(type_name);
 
-    if (name.starts_with("array<") && name.ends_with(">"))
+    /// Iceberg names this type `list`, Hive names it `array`; Glue passes through whichever spelling
+    /// the writer that registered the table used.
+    if ((name.starts_with("array<") || name.starts_with("list<")) && name.ends_with(">"))
     {
-        String inner = name.substr(6, name.size() - 7);
+        const size_t open = name.find('<');
+        String inner = name.substr(open + 1, name.size() - open - 2);
         return std::make_shared<DB::DataTypeArray>(getType(inner, nullable, context));
     }
 
@@ -111,6 +116,13 @@ DB::DataTypePtr getType(const String & type_name, bool nullable, DB::ContextPtr 
 
     return nullable ? DB::makeNullable(DB::Iceberg::IcebergSchemaProcessor::getSimpleType(name, context))
                     : DB::Iceberg::IcebergSchemaProcessor::getSimpleType(name, context);
+}
+
+DB::ForwardedAuthTokenPtr getForwardedAuthToken(const DB::ContextPtr & context)
+{
+    if (!context)
+        return {};
+    return context->getForwardedAuthToken();
 }
 
 std::pair<std::string, std::string> parseTableName(const std::string & name)

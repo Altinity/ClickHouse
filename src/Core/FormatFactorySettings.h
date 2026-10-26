@@ -209,6 +209,9 @@ When reading Parquet files, skip whole row groups based on the WHERE expressions
     DECLARE(UInt64, input_format_parquet_dictionary_filter_push_down, 1024 * 1024, R"(
 When reading Parquet files (with reader v3), skip whole row groups based on the WHERE/PREWHERE expressions and the dictionary page contents, when all data pages of a column chunk are dictionary-encoded. The value is the maximum dictionary page size (in bytes) for which this optimization is applied; set to 0 to disable. This takes precedence over the bloom filter when both are available.
 )", 0) \
+    DECLARE(UInt64, input_format_parquet_footer_read_size, 0, R"(
+Size (in bytes) of the initial tail read that fetches the Parquet footer (`FileMetaData`) when opening a file with reader v3. `0` (default) sizes the read adaptively to the file - 1% of the file size, clamped to `[128 KiB, 2 MiB]` - so it usually covers the whole footer in a single read even for wide files with hundreds of columns. Set a non-zero value to force a fixed initial read size instead of the adaptive one; this is useful for very high-latency object storage where reading a larger tail up front avoids a second round trip. The value is clamped to the file size.
+)", 0) \
     DECLARE(Bool, input_format_parquet_enable_json_parsing, true, R"(
 When reading Parquet files, parse JSON columns as ClickHouse JSON Column.
 )", 0) \
@@ -692,7 +695,7 @@ Allow data types conversion in Native input format
 Read data types in binary format instead of type names in Native input format
 )", 0) \
     DECLARE(UInt64, output_format_compression_level, 3, R"(
-Default compression level if query output is compressed. The setting is applied when `SELECT` query has `INTO OUTFILE` or when writing to table functions `file`, `url`, `hdfs`, `s3`, or `azureBlobStorage`.
+Default compression level if query output is compressed. The setting is applied when `SELECT` query has `INTO OUTFILE` or when writing to table functions `file`, `url`, `hdfs`, `s3`, or `azureBlobStorage`. It is also applied to the compressed response to an HTTP request with a method other than `gzip` and `deflate`, for which [http_zlib_compression_level](#http_zlib_compression_level) is used.
 
 Possible values: from `1` to `22`
 )", 0) \
@@ -1729,6 +1732,9 @@ Indicate which field of protobuf oneof was found by means of setting enum value 
 )", 0) \
     DECLARE(Bool, input_format_parquet_allow_geoparquet_parser, true, R"(
 Use geo column parser to convert Array(UInt8) into Point/MultiPoint/Linestring/Polygon/MultiLineString/MultiPolygon types
+)", 0) \
+    DECLARE(Bool, input_format_parquet_detect_variant_by_structure, true, R"(
+Read a Parquet group that has no `VARIANT` logical type, but has the layout of an unshredded variant (a `metadata` and a `value` field of type `BYTE_ARRAY`), as a variant, i.e. as `Dynamic`, instead of `Tuple`. Spark 4.0 writes variant columns this way. Groups annotated with the `VARIANT` logical type are always read as a variant.
 )", 0) \
     DECLARE(Bool, output_format_parquet_geometadata, true, R"(
 Allow to write information about geo columns in parquet metadata and encode columns in WKB format.

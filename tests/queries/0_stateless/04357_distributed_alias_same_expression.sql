@@ -97,10 +97,11 @@ SELECT a1, a2, count() AS c FROM dist_same_expr GROUP BY a1, a2 WITH ROLLUP ORDE
 -- the collapsed keys through the grouping-sets merge machinery is not implemented, so the combination is rejected
 -- rather than returning wrong results. The rejection only applies when two-level aggregation is reachable at all, so
 -- each of these queries pins a non-zero threshold rather than relying on the (randomized) session values.
+-- `enable_alias_marker` is off because `__aliasMarker` keeps a1 and a2 distinct on the shard, so nothing is collapsed.
 SELECT a1, a2, count() AS c FROM dist_same_expr GROUP BY GROUPING SETS ((a1, a2), (a1)) ORDER BY a1, a2
-    SETTINGS prefer_localhost_replica = 0, group_by_two_level_threshold = 100000, group_by_two_level_threshold_bytes = 50000000; -- { serverError NOT_IMPLEMENTED }
+    SETTINGS prefer_localhost_replica = 0, group_by_two_level_threshold = 100000, group_by_two_level_threshold_bytes = 50000000, enable_alias_marker = 0; -- { serverError NOT_IMPLEMENTED }
 SELECT a1, a2, count() AS c FROM dist_same_expr GROUP BY GROUPING SETS ((a1, a2), (a1)) ORDER BY a1, a2
-    SETTINGS prefer_localhost_replica = 0, group_by_two_level_threshold = 1, group_by_two_level_threshold_bytes = 1; -- { serverError NOT_IMPLEMENTED }
+    SETTINGS prefer_localhost_replica = 0, group_by_two_level_threshold = 1, group_by_two_level_threshold_bytes = 1, enable_alias_marker = 0; -- { serverError NOT_IMPLEMENTED }
 -- With both two-level thresholds at 0 no shard can build a bucketed state, so the mismatch is unreachable and the same
 -- grouping sets are accepted. The result must match the equivalent single-node aggregation (each group counted once per
 -- shard, so twice here).
@@ -133,9 +134,9 @@ ENGINE = Distributed('test_cluster_two_shards_localhost', currentDatabase(), loc
 INSERT INTO local_same_expr3 (dt, x) VALUES ('2024-01-01 00:00:00', 7);
 
 SELECT a1, a2, a3, count() AS c FROM dist_same_expr3 GROUP BY GROUPING SETS ((a1), (a2, a3)) ORDER BY a1, a2, a3
-    SETTINGS prefer_localhost_replica = 0, group_by_two_level_threshold = 100000, group_by_two_level_threshold_bytes = 50000000; -- { serverError NOT_IMPLEMENTED }
+    SETTINGS prefer_localhost_replica = 0, group_by_two_level_threshold = 100000, group_by_two_level_threshold_bytes = 50000000, enable_alias_marker = 0; -- { serverError NOT_IMPLEMENTED }
 SELECT a1, a2, a3, count() AS c FROM dist_same_expr3 GROUP BY GROUPING SETS ((a2, a3), (a1)) ORDER BY a1, a2, a3
-    SETTINGS prefer_localhost_replica = 0, group_by_two_level_threshold = 1, group_by_two_level_threshold_bytes = 1; -- { serverError NOT_IMPLEMENTED }
+    SETTINGS prefer_localhost_replica = 0, group_by_two_level_threshold = 1, group_by_two_level_threshold_bytes = 1, enable_alias_marker = 0; -- { serverError NOT_IMPLEMENTED }
 -- The representative-absent set is likewise accepted when two-level aggregation is impossible.
 SELECT a1, a2, a3, count() AS c FROM dist_same_expr3 GROUP BY GROUPING SETS ((a2, a3), (a1)) ORDER BY a1, a2, a3
     SETTINGS prefer_localhost_replica = 0, group_by_two_level_threshold = 0, group_by_two_level_threshold_bytes = 0;

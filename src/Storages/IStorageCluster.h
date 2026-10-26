@@ -63,6 +63,9 @@ public:
     const String & getOriginalClusterName() const { return cluster_name; }
     virtual String getClusterName(ContextPtr /* context */) const { return getOriginalClusterName(); }
 
+    /// Old interpreter: rewrite JOIN / IN to GLOBAL JOIN / GLOBAL IN so GlobalSubqueriesVisitor can broadcast right tables.
+    static void rewriteASTForGlobalJoin(ASTPtr & query);
+
     /// Prepare the `SELECT ... FROM f(...)` query (`f` is a table function) for the other nodes of the cluster: add the
     /// structure and format arguments so that the nodes do not infer the schema again, and turn a plain table
     /// function (`url`, `s3`, ...) that `parallel_replicas_for_cluster_engines` converted into this cluster
@@ -174,6 +177,14 @@ private:
     };
 
     static QueryTreeInfo getQueryTreeInfo(QueryTreeNodePtr query_tree, ContextPtr context);
+    static QueryTreeInfo getQueryJoinInfoFromAST(const ASTPtr & query);
+    static QueryTreeInfo getQueryJoinInfo(const SelectQueryInfo & query_info, const ContextPtr & context);
+    static bool needsInitiatorLocalJoin(const QueryTreeInfo & info);
+    static void rewriteQueryForInitiatorLocalJoin(
+        ASTPtr & query_to_send,
+        const SelectQueryInfo & query_info,
+        const QueryTreeInfo & info,
+        const ContextPtr & context);
 };
 
 
