@@ -130,13 +130,16 @@ exercise()
     ${CLICKHOUSE_CLIENT} --query "SYSTEM FLUSH LOGS query_log"
 
     echo "reads"
+    # `log_comment` is stable across runs in the same database. Take the latest
+    # `QueryFinish` for each statement. `max(read_rows)` would keep a scan from
+    # an earlier run and report this run as a data read.
     ${CLICKHOUSE_CLIENT} --format TabSeparated --query "
         WITH entries AS
         (
             SELECT
                 replaceOne(log_comment, '${tag}_', '') AS name,
-                max(read_rows) AS read_rows,
-                max(ProfileEvents['IcebergTrivialCountOptimizationApplied']) AS trivial_count
+                argMax(read_rows, event_time_microseconds) AS read_rows,
+                argMax(ProfileEvents['IcebergTrivialCountOptimizationApplied'], event_time_microseconds) AS trivial_count
             FROM system.query_log
             WHERE type = 'QueryFinish'
                 AND is_initial_query
