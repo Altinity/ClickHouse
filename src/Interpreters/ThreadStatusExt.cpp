@@ -131,13 +131,15 @@ ThreadGroup::ThreadGroup(ContextPtr query_context_, Int32 os_threads_nice_value_
     };
 }
 
-ThreadGroup::ThreadGroup(ThreadGroupPtr parent_thread_group)
-    : parent(std::move(parent_thread_group))
+ThreadGroup::ThreadGroup(ThreadGroupPtr parent_)
+    : parent(std::move(parent_))
     , master_thread_id(parent->master_thread_id)
     , query_context(parent->query_context)
     , global_context(parent->global_context)
     , fatal_error_callback(parent->fatal_error_callback)
     , os_threads_nice_value(parent->os_threads_nice_value)
+    /// Keep the parent group alive: this child parents its trackers at the parent's via raw pointers (B90).
+    , parent_thread_group(parent)
     , memory_spill_scheduler(parent->memory_spill_scheduler)
     , performance_counters(VariableContext::Process, &parent->performance_counters)
     , memory_tracker(&parent->memory_tracker, VariableContext::Process, /*log_peak_memory_usage_in_destructor*/ false)
@@ -145,13 +147,15 @@ ThreadGroup::ThreadGroup(ThreadGroupPtr parent_thread_group)
 {
 }
 
-ThreadGroup::ThreadGroup(ContextPtr query_context_, ThreadGroupPtr parent_thread_group)
-    : parent(std::move(parent_thread_group))
+ThreadGroup::ThreadGroup(ContextPtr query_context_, ThreadGroupPtr parent_)
+    : parent(std::move(parent_))
     , master_thread_id(CurrentThread::get().thread_id)
     , query_context(query_context_)
     , global_context(query_context_->getGlobalContext())
     , fatal_error_callback(parent->fatal_error_callback)
     , os_threads_nice_value(parent->os_threads_nice_value)
+    /// Keep the parent group alive: this child parents its trackers at the parent's via raw pointers (B90).
+    , parent_thread_group(parent)
     , memory_spill_scheduler(parent->memory_spill_scheduler)
     , performance_counters(VariableContext::Process, &parent->performance_counters)
     , memory_tracker(&parent->memory_tracker, VariableContext::Process, /*log_peak_memory_usage_in_destructor*/ false)

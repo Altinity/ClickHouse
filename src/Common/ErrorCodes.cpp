@@ -693,6 +693,8 @@
     M(1017, EXPORT_PARTITION_ALREADY_EXPORTED) \
     M(1018, PARTITION_EXPORT_FAILED) \
     M(1021, AZURE_OBJECT_CHANGED_DURING_READ) \
+    M(1037, CAS_WRITE_UNATTRIBUTED) \
+    M(1038, CAS_DELETE_MARKER) \
     /* See END */
 
 #ifdef APPLY_FOR_EXTERNAL_ERROR_CODES
@@ -709,7 +711,7 @@ namespace ErrorCodes
     APPLY_FOR_ERROR_CODES(M)
 #undef M
 
-    constexpr ErrorCode END = 1021;
+    constexpr ErrorCode END = 1038;
 
 #if !defined(CLICKHOUSE_PARSER_MINIMAL_BUILD)
     /** One `ErrorPairHolder` per error code, each holding two `Error` structs - the last message,
