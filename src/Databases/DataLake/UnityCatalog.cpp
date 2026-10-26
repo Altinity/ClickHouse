@@ -539,7 +539,7 @@ bool UnityCatalog::isNamespaceAllowed(const std::string & namespace_) const
 }
 
 ICatalog::CredentialsRefreshCallback UnityCatalog::getCredentialsConfigurationCallback(
-    const DB::StorageID & table_id, const DB::ForwardedAuthTokenPtr & /*auth_token*/)
+    const DB::StorageID & table_id, const TableMetadata & /*table_metadata*/, const DB::ForwardedAuthTokenPtr & /*auth_token*/)
 {
     if (!table_id.hasUUID())
         throw DB::Exception(

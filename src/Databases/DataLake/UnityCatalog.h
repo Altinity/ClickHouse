@@ -85,7 +85,7 @@ private:
         TableMetadata & result) const;
 
     ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(
-        const DB::StorageID & table_id, const DB::ForwardedAuthTokenPtr & auth_token) override;
+        const DB::StorageID & table_id, const TableMetadata & table_metadata, const DB::ForwardedAuthTokenPtr & auth_token) override;
 
     ICatalog::CredentialsRefreshCallback getWriteCredentialsConfigurationCallback(const DB::StorageID & table_id) override;
 

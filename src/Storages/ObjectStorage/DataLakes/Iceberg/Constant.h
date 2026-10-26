@@ -13,6 +13,7 @@ namespace DB::Iceberg
 DEFINE_ICEBERG_FIELD(boolean);
 DEFINE_ICEBERG_FIELD(bigint);
 DEFINE_ICEBERG_FIELD(binary);
+DEFINE_ICEBERG_FIELD(varbyte);
 DEFINE_ICEBERG_FIELD(double);
 DEFINE_ICEBERG_FIELD(date);
 DEFINE_ICEBERG_FIELD(data_file);
@@ -44,6 +45,7 @@ DEFINE_ICEBERG_FIELD(summary);
 DEFINE_ICEBERG_FIELD(time);
 DEFINE_ICEBERG_FIELD(timestamp);
 DEFINE_ICEBERG_FIELD(timestamptz);
+DEFINE_ICEBERG_FIELD_ALIAS(timestamp_with_local_time_zone, timestamp with local time zone);
 DEFINE_ICEBERG_FIELD(timestamp_ns);
 DEFINE_ICEBERG_FIELD(timestamptz_ns);
 DEFINE_ICEBERG_FIELD(type)
@@ -103,6 +105,7 @@ DEFINE_ICEBERG_FIELD(replace);
 DEFINE_ICEBERG_FIELD_ALIAS(format_version, format-version);
 DEFINE_ICEBERG_FIELD_ALIAS(current_snapshot_id, current-snapshot-id);
 DEFINE_ICEBERG_FIELD_ALIAS(first_row_id, first-row-id);
+DEFINE_ICEBERG_FIELD_ALIAS(manifest_first_row_id, first_row_id);
 DEFINE_ICEBERG_FIELD_ALIAS(added_rows, added-rows);
 DEFINE_ICEBERG_FIELD_ALIAS(next_row_id, next-row-id);
 DEFINE_ICEBERG_FIELD_ALIAS(metadata_snapshot_id, snapshot-id);
@@ -195,6 +198,10 @@ DEFINE_ICEBERG_FIELD_COMPOUND(data_file, sort_order_id);
 DEFINE_ICEBERG_FIELD_COMPOUND(data_file, record_count);
 DEFINE_ICEBERG_FIELD_COMPOUND(data_file, file_size_in_bytes);
 DEFINE_ICEBERG_FIELD_COMPOUND(data_file, key_metadata);
+DEFINE_ICEBERG_FIELD_COMPOUND(data_file, first_row_id);
+
+constexpr Int32 row_id_field_id = 2147483540;
+constexpr Int32 last_updated_sequence_number_field_id = 2147483539;
 
 /// Fallback defaults for snapshot retention policy when table properties are absent.
 /// These values follow the Java reference implementation; the Iceberg spec does not

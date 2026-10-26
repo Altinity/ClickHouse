@@ -715,7 +715,8 @@ struct ContextSharedPart : boost::noncopyable
     std::unique_ptr<DDLWorker> ddl_worker TSA_GUARDED_BY(mutex); /// Process ddl commands from zk.
     LoadTaskPtr ddl_worker_startup_task;                         /// To postpone `ddl_worker->startup()` after all tables startup
     /// Rules for selecting the compression settings, depending on the size of the part.
-    mutable std::unique_ptr<CompressionCodecSelector> compression_codec_selector TSA_GUARDED_BY(mutex);
+    mutable OnceFlag compression_codec_selector_initialized;
+    mutable std::unique_ptr<CompressionCodecSelector> compression_codec_selector;
     /// Storage disk chooser for MergeTree engines
     mutable std::shared_ptr<const DiskSelector> merge_tree_disk_selector TSA_GUARDED_BY(storage_policies_mutex);
     /// Storage policy chooser for MergeTree engines
@@ -1373,6 +1374,15 @@ void ContextSharedMutex::lockSharedImpl()
     Base::lockSharedImpl();
     ProfileEvents::increment(ProfileEvents::ContextLockWaitMicroseconds, watch.elapsedMicroseconds());
 }
+
+/// An entry of `ContextData::scalars`. `from_client` is true when the block arrived from the client
+/// over the wire (`Context::addClientScalar`) rather than being computed by the server, so that
+/// `Context::hasComputedScalar` can keep such a block out of the analyzer's scalar-subquery cache.
+struct ScalarEntry
+{
+    Block block;
+    bool from_client = false;
+};
 
 ContextData::ContextData()
 {
@@ -2684,7 +2694,10 @@ std::pair<UInt64, String> Context::setConcurrentThreadsSoftLimit(UInt64 num, UIn
 Scalars Context::getScalars() const
 {
     std::lock_guard lock(mutex);
-    return scalars;
+    Scalars res;
+    for (const auto & [name, entry] : scalars)
+        res.emplace(name, entry.block);
+    return res;
 }
 
 
@@ -2699,7 +2712,7 @@ Block Context::getScalar(const String & name) const
         // often, so 'bad arguments' for now.
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Scalar {} doesn't exist (internal bug)", backQuoteIfNeed(name));
     }
-    return it->second;
+    return it->second.block;
 }
 
 std::optional<Block> Context::tryGetSpecialScalar(const String & name) const
@@ -2841,7 +2854,18 @@ void Context::addScalar(const String & name, const Block & block)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Global context cannot have scalars");
 
     std::lock_guard lock(mutex);
-    scalars[name] = block;
+    /// A server-computed value overrides any client-supplied one of the same name and is trusted.
+    scalars[name] = ScalarEntry{block, /*from_client=*/ false};
+}
+
+
+void Context::addClientScalar(const String & name, const Block & block)
+{
+    if (isGlobalContext())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Global context cannot have scalars");
+
+    std::lock_guard lock(mutex);
+    scalars[name] = ScalarEntry{block, /*from_client=*/ true};
 }
 
 
@@ -2862,6 +2886,16 @@ bool Context::hasScalar(const String & name) const
 
     std::lock_guard lock(mutex);
     return scalars.contains(name);
+}
+
+bool Context::hasComputedScalar(const String & name) const
+{
+    if (isGlobalContext())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Global context cannot have scalars");
+
+    std::lock_guard lock(mutex);
+    auto it = scalars.find(name);
+    return it != scalars.end() && !it->second.from_client;
 }
 
 void Context::addQueryAccessInfo(
@@ -7223,6 +7257,16 @@ std::shared_ptr<SessionLog> Context::getSessionLog() const
 }
 
 
+bool Context::hasSystemLogs() const
+{
+    std::lock_guard lock(mutex_shared_context);
+    if (!shared)
+        return false;
+
+    SharedLockGuard lock2(shared->mutex);
+    return shared->system_logs != nullptr;
+}
+
 std::shared_ptr<ZooKeeperLog> Context::getZooKeeperLog() const
 {
     std::lock_guard lock(mutex_shared_context);
@@ -7461,18 +7505,16 @@ void Context::setDashboardsConfig(const Poco::Util::AbstractConfiguration & conf
 
 CompressionCodecPtr Context::chooseCompressionCodec(size_t part_size, double part_size_ratio) const
 {
-    std::lock_guard lock(shared->mutex);
-
-    if (!shared->compression_codec_selector)
+    callOnce(shared->compression_codec_selector_initialized, [&]
     {
         constexpr auto config_name = "compression";
-        const auto & config = shared->getConfigRefWithLock(lock);
+        auto config = shared->getConfig();
 
-        if (config.has(config_name))
-            shared->compression_codec_selector = std::make_unique<CompressionCodecSelector>(config, "compression");
+        if (config->has(config_name))
+            shared->compression_codec_selector = std::make_unique<CompressionCodecSelector>(*config, config_name);
         else
             shared->compression_codec_selector = std::make_unique<CompressionCodecSelector>();
-    }
+    });
 
     return shared->compression_codec_selector->choose(part_size, part_size_ratio);
 }

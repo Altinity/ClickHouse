@@ -90,6 +90,29 @@ namespace
             user.authentication_methods.emplace_back(backup_authentication_method);
         }
 
+        /// A user-level `VALID UNTIL`/`VALID FOR` clause applies to every method the user already has.
+        /// The methods added by this statement are not in the list yet; they get the deadline in the loop
+        /// below, which has to skip those carrying their own more specific clause.
+        if (global_valid_until)
+        {
+            for (auto & authentication_method : user.authentication_methods)
+                authentication_method.setValidUntil(*global_valid_until);
+        }
+
+        for (size_t i = 0; i < authentication_methods.size(); ++i)
+        {
+            auto authentication_method = authentication_methods[i];
+
+            /// A method's own `VALID UNTIL`/`VALID FOR` clause takes precedence over the user-level one.
+            if (global_valid_until && !query.authentication_methods[i]->valid_until)
+                authentication_method.setValidUntil(*global_valid_until);
+
+            /// Replace a method the user already has instead of adding a copy, moving it to the end of the list:
+            /// `RESET AUTHENTICATION METHODS TO NEW` keeps the last one.
+            std::erase(user.authentication_methods, authentication_method);
+            user.authentication_methods.emplace_back(std::move(authentication_method));
+        }
+
         // max_number_of_authentication_methods == 0 means unlimited
         if (!authentication_methods.empty() && max_number_of_authentication_methods != 0)
         {
@@ -111,7 +134,7 @@ namespace
 #endif
             };
 
-            auto number_of_authentication_methods = count_methods(user.authentication_methods) + count_methods(authentication_methods);
+            auto number_of_authentication_methods = count_methods(user.authentication_methods);
             if (number_of_authentication_methods > max_number_of_authentication_methods)
             {
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
@@ -120,40 +143,10 @@ namespace
             }
         }
 
-        for (const auto & authentication_method : authentication_methods)
-        {
-            user.authentication_methods.emplace_back(authentication_method);
-        }
-
         bool has_no_password_authentication_method = false;
 
-        /// The methods added in this statement were just appended at the end of the list, so the first
-        /// `num_pre_existing_methods` entries are the methods the user already had before this statement.
-        chassert(user.authentication_methods.size() >= authentication_methods.size());
-        const size_t num_pre_existing_methods = user.authentication_methods.size() - authentication_methods.size();
-
-        for (size_t i = 0; i < user.authentication_methods.size(); ++i)
+        for (const auto & authentication_method : user.authentication_methods)
         {
-            auto & authentication_method = user.authentication_methods[i];
-
-            if (global_valid_until)
-            {
-                /// A user-level `VALID UNTIL` / `VALID FOR` clause applies to every authentication method,
-                /// except a method added in the same statement that carries its own explicit clause - its
-                /// more specific deadline must be preserved. Pre-existing methods (e.g. the ones already on
-                /// the user during `ALTER USER ... VALID FOR ... ADD IDENTIFIED ...`) always take the
-                /// user-level deadline.
-                bool method_has_explicit_valid_until = false;
-                if (i >= num_pre_existing_methods)
-                {
-                    const auto & method_ast = query.authentication_methods[i - num_pre_existing_methods];
-                    method_has_explicit_valid_until = method_ast->valid_until != nullptr;
-                }
-
-                if (!method_has_explicit_valid_until)
-                    authentication_method.setValidUntil(*global_valid_until);
-            }
-
             if (authentication_method.getType() == AuthenticationType::NO_PASSWORD)
             {
                 has_no_password_authentication_method = true;

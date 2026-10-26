@@ -157,6 +157,18 @@ static constexpr auto NAMESPACES_ENDPOINT = "namespaces";
 /// so that they ask for a fresh one on the next request.
 static constexpr auto UNKNOWN_EXPIRATION_TOKEN_LIFETIME = std::chrono::minutes(1);
 
+DB::HTTPHeaderEntry parseAuthHeader(const std::string & auth_header)
+{
+    /// Parse a string of format "Authorization: <auth_scheme> <auth_token>"
+    /// into a key-value header "Authorization", "<auth_scheme> <auth_token>"
+
+    auto pos = auth_header.find(':');
+    if (pos == std::string::npos)
+        throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "Unexpected format of auth header");
+
+    return DB::HTTPHeaderEntry(auth_header.substr(0, pos), auth_header.substr(pos + 1));
+}
+
 namespace
 {
 
@@ -187,18 +199,6 @@ std::pair<std::string, std::string> parseCatalogCredential(const std::string & c
         client_secret = catalog_credential.substr(pos + 1);
     }
     return std::pair(client_id, client_secret);
-}
-
-DB::HTTPHeaderEntry parseAuthHeader(const std::string & auth_header)
-{
-    /// Parse a string of format "Authorization: <auth_scheme> <auth_token>"
-    /// into a key-value header "Authorization", "<auth_scheme> <auth_token>"
-
-    auto pos = auth_header.find(':');
-    if (pos == std::string::npos)
-        throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "Unexpected format of auth header");
-
-    return DB::HTTPHeaderEntry(auth_header.substr(0, pos), auth_header.substr(pos + 1));
 }
 
 std::string correctAPIURI(const std::string & uri)
@@ -1743,6 +1743,8 @@ DB::ReadWriteBufferFromHTTPPtr RestCatalog::createReadBuffer(
         };
         auto result_headers = auth_headers ? *auth_headers : getAuthHeaders(auth_context);
         std::move(headers.begin(), headers.end(), std::back_inserter(result_headers));
+        /// The auth headers may carry a token from the OAuth server or values from the database settings.
+        context->getGlobalContext()->getHTTPHeaderFilter().checkAndNormalizeHeaders(result_headers);
 
         return DB::BuilderRWBufferFromHTTP(url)
             .withConnectionGroup(DB::HTTPConnectionGroupType::HTTP)
@@ -2577,6 +2579,7 @@ void RestCatalog::sendRequest(
         DB::HTTPHeaderEntries headers = getAuthHeaders(auth_context);
         headers.emplace_back("Content-Type", "application/json");
         headers.emplace_back("X-Iceberg-Access-Delegation", "vended-credentials");
+        context->getGlobalContext()->getHTTPHeaderFilter().checkAndNormalizeHeaders(headers);
         return DB::BuilderRWBufferFromHTTP(url)
             .withConnectionGroup(DB::HTTPConnectionGroupType::HTTP)
             .withMethod(method)
@@ -3062,7 +3065,7 @@ void RestCatalog::cacheCredentials(
 }
 
 ICatalog::CredentialsRefreshCallback RestCatalog::getCredentialsConfigurationCallback(
-    const DB::StorageID & storage_id, const DB::ForwardedAuthTokenPtr & auth_token)
+    const DB::StorageID & storage_id, const TableMetadata & /*table_metadata*/, const DB::ForwardedAuthTokenPtr & auth_token)
 {
     return [this, storage_id, auth_token] () -> std::shared_ptr<IStorageCredentials>
     {
