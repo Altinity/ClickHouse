@@ -20,6 +20,8 @@
 
 #include <atomic>
 #include <optional>
+#include <string>
+#include <string_view>
 
 namespace DB
 {
@@ -29,6 +31,8 @@ namespace ErrorCodes
     extern const int ICEBERG_SPECIFICATION_VIOLATION;
     extern const int BAD_ARGUMENTS;
     extern const int LOGICAL_ERROR;
+    extern const int S3_OBJECT_CHANGED_DURING_READ;
+    extern const int AZURE_OBJECT_CHANGED_DURING_READ;
 }
 
 namespace Setting
@@ -83,6 +87,43 @@ namespace
 
 using FooterBlobsPtr = PuffinFilesCache::FooterBlobsPtr;
 
+/// Marker shared by the local/HDFS/Web check and the cache-load catch. S3 and Azure report the same
+/// race with their own error codes, from the `If-Match` on the listed etag.
+constexpr std::string_view PUFFIN_LISTED_ETAG_MISMATCH = "changed while loading a cached Puffin deletion vector";
+
+bool storagePinsReadToListedEtag(const IObjectStorage & object_storage)
+{
+    const auto type = object_storage.getType();
+    return type == ObjectStorageType::S3 || type == ObjectStorageType::Azure;
+}
+
+bool isPuffinListedEtagMismatch(const Exception & e)
+{
+    if (e.code() == ErrorCodes::S3_OBJECT_CHANGED_DURING_READ || e.code() == ErrorCodes::AZURE_OBJECT_CHANGED_DURING_READ)
+        return true;
+    return e.message().find(PUFFIN_LISTED_ETAG_MISMATCH) != std::string::npos;
+}
+
+/// S3 and Azure enforce the listed etag on the GET itself. Other backends ignore `StoredObject::etag`,
+/// so compare the etag again after the bytes have been read and refuse to cache a different generation.
+void throwIfListedEtagDrifted(const IObjectStorage & object_storage, const String & puffin_path, const ObjectMetadata & listed)
+{
+    if (!listed.isEtagUsableAsCacheKey() || storagePinsReadToListedEtag(object_storage))
+        return;
+
+    const auto current = object_storage.getObjectMetadata(puffin_path, /*with_tags=*/ false);
+    if (current.etag == listed.etag)
+        return;
+
+    throw Exception(
+        ErrorCodes::BAD_ARGUMENTS,
+        "Puffin object '{}' {} (listed etag {}, current etag {})",
+        puffin_path,
+        PUFFIN_LISTED_ETAG_MISMATCH,
+        listed.etag,
+        current.etag);
+}
+
 void logUndersizedPuffinFilesCacheOnce(LoggerPtr log, size_t max_size_in_bytes, UInt64 minimum_entry_weight)
 {
     static std::atomic_flag logged = ATOMIC_FLAG_INIT;
@@ -103,17 +144,21 @@ FooterBlobsPtr readFooterBlobs(
     const std::optional<ObjectMetadata> & puffin_metadata,
     ContextPtr context,
     LoggerPtr log,
-    bool disable_filesystem_cache)
+    bool disable_filesystem_cache,
+    bool pin_listed_etag)
 {
     /// Seeding the metadata matters: `createReadBuffer` issues its own `getObjectMetadata`
     /// (an S3 `HEAD`) only when it is empty, so a caller that already has it pays one request
     /// for the whole deletion-vector load instead of one per buffer it opens.
+    /// `pin_listed_etag` sends that same etag as `If-Match` on the GET, including when
+    /// `s3_validate_etag_on_read` / `azure_validate_etag_on_read` is off.
     RelativePathWithMetadata puffin_object{puffin_path, puffin_metadata};
     auto read_settings = context->getReadSettings();
     if (disable_filesystem_cache)
         read_settings.enable_filesystem_cache = false;
 
-    auto read_buffer = createReadBuffer(puffin_object, object_storage, context, log, read_settings);
+    auto read_buffer = createReadBuffer(
+        puffin_object, object_storage, context, log, read_settings, /*allow_page_cache=*/ true, pin_listed_etag);
 
     auto * seekable = dynamic_cast<SeekableReadBuffer *>(read_buffer.get());
     if (!seekable)
@@ -123,7 +168,10 @@ FooterBlobsPtr readFooterBlobs(
     if (!file_size)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Cannot determine Puffin file size for '{}'", puffin_path);
 
-    return std::make_shared<const std::vector<PuffinBlob>>(readPuffinFooterBlobsFromSeekable(*seekable, *file_size));
+    auto footer = std::make_shared<const std::vector<PuffinBlob>>(readPuffinFooterBlobsFromSeekable(*seekable, *file_size));
+    if (pin_listed_etag && puffin_metadata)
+        throwIfListedEtagDrifted(*object_storage, puffin_path, *puffin_metadata);
+    return footer;
 }
 
 DataLakeObjectMetadata::ExcludedRowsPtr loadDeletionVectorUncached(
@@ -140,14 +188,16 @@ DataLakeObjectMetadata::ExcludedRowsPtr loadDeletionVectorUncached(
     bool disable_filesystem_cache,
     FooterBlobsPtr preloaded_footer,
     PuffinFilesCache * footer_cache = nullptr,
-    const std::optional<PuffinFooterCacheKey> & footer_key = {})
+    const std::optional<PuffinFooterCacheKey> & footer_key = {},
+    bool pin_listed_etag = false)
 {
     RelativePathWithMetadata puffin_object{puffin_path, puffin_metadata};
     auto read_settings = context->getReadSettings();
     if (disable_filesystem_cache)
         read_settings.enable_filesystem_cache = false;
 
-    auto read_buffer = createReadBuffer(puffin_object, object_storage, context, log, read_settings);
+    auto read_buffer = createReadBuffer(
+        puffin_object, object_storage, context, log, read_settings, /*allow_page_cache=*/ true, pin_listed_etag);
 
     auto * seekable = dynamic_cast<SeekableReadBuffer *>(read_buffer.get());
     if (!seekable)
@@ -170,7 +220,13 @@ DataLakeObjectMetadata::ExcludedRowsPtr loadDeletionVectorUncached(
                 footer_owner = footer_cache->getOrSetFooter(*footer_key, [&]()
                 {
                     return readFooterBlobs(
-                        object_storage, puffin_path, puffin_metadata, context, log, /*disable_filesystem_cache=*/ true);
+                        object_storage,
+                        puffin_path,
+                        puffin_metadata,
+                        context,
+                        log,
+                        /*disable_filesystem_cache=*/ true,
+                        pin_listed_etag);
                 });
             }
             else
@@ -192,6 +248,9 @@ DataLakeObjectMetadata::ExcludedRowsPtr loadDeletionVectorUncached(
         *read_buffer, content_offset, content_size_in_bytes, expected_cardinality);
 
     validateDeletionVectorPositionsAgainstDataFile(deleted_positions, expected_cardinality, data_file_record_count);
+
+    if (pin_listed_etag && puffin_metadata)
+        throwIfListedEtagDrifted(*object_storage, puffin_path, *puffin_metadata);
 
     if (deleted_positions.empty())
         return nullptr;
@@ -336,11 +395,11 @@ DataLakeObjectMetadata::ExcludedRowsPtr loadDeletionVector(
     if (!puffin_object.metadata)
         puffin_object.metadata = object_storage->getObjectMetadata(puffin_object.getPath(), /*with_tags=*/ false);
 
-    if (puffin_object.metadata->etag.empty())
+    if (!puffin_object.metadata->isEtagUsableAsCacheKey())
     {
         LOG_TRACE(
             log,
-            "Not using Puffin files cache for '{}', because etag is empty",
+            "Not using Puffin files cache for '{}', because etag is empty or not a strong content identifier",
             puffin_path);
         return loadDeletionVectorUncached(
             object_storage,
@@ -368,7 +427,7 @@ DataLakeObjectMetadata::ExcludedRowsPtr loadDeletionVector(
         expected_cardinality_u64,
         static_cast<UInt64>(data_file_record_count));
 
-    /// Empty etag is the only reason tryCreate* returns nullopt; that case is handled above.
+    /// Empty etag is the only reason tryCreate* returns nullopt; a weak etag never reaches here.
     if (!footer_key || !cache_key)
     {
         throw Exception(
@@ -403,12 +462,45 @@ DataLakeObjectMetadata::ExcludedRowsPtr loadDeletionVector(
     /// Footer is keyed by file identity only, so N DV slices in one coalesced Puffin share one parse.
     /// Resolve the footer only on a Puffin deletion-vector cache miss (nested memo lookup).
     /// Delta `.bin` objects have no Puffin footer; detection inside the uncached loader skips memo.
-    return cache->getOrSetDeletionVector(*cache_key, [&]()
+    /// The load is pinned to the etag in the cache key. If the object is overwritten in between,
+    /// nothing is inserted and the read is repeated without the cache.
+    try
     {
+        return cache->getOrSetDeletionVector(*cache_key, [&]()
+        {
+            return loadDeletionVectorUncached(
+                object_storage,
+                puffin_path,
+                /*puffin_metadata=*/ puffin_object.metadata,
+                content_offset,
+                content_size_in_bytes,
+                expected_data_file,
+                expected_cardinality_u64,
+                data_file_record_count,
+                context,
+                log,
+                true,
+                nullptr,
+                cache.get(),
+                footer_key,
+                /*pin_listed_etag=*/ true);
+        });
+    }
+    catch (const Exception & e)
+    {
+        if (!isPuffinListedEtagMismatch(e))
+            throw;
+
+        LOG_WARNING(
+            log,
+            "Puffin object '{}' {} (etag {}); reading it without the cache",
+            puffin_path,
+            PUFFIN_LISTED_ETAG_MISMATCH,
+            puffin_object.metadata->etag);
         return loadDeletionVectorUncached(
             object_storage,
             puffin_path,
-            /*puffin_metadata=*/ puffin_object.metadata,
+            /*puffin_metadata=*/ std::nullopt,
             content_offset,
             content_size_in_bytes,
             expected_data_file,
@@ -416,11 +508,9 @@ DataLakeObjectMetadata::ExcludedRowsPtr loadDeletionVector(
             data_file_record_count,
             context,
             log,
-            true,
-            nullptr,
-            cache.get(),
-            footer_key);
-    });
+            false,
+            nullptr);
+    }
 }
 
 }
