@@ -1040,6 +1040,46 @@ void Reader::prepareBloomFilterCondition()
 
 void Reader::initializePrefetches()
 {
+    /// One S3 GET is one contiguous range. Contiguous bloom filters (ClickHouse writer) are read together.
+    /// A small file with many filters is read once, and later column reads reuse that buffer.
+    const size_t coalesce_max = options.format.parquet.bloom_filter_coalesce_max_bytes;
+    if (coalesce_max > 0 && options.format.parquet.bloom_filter_push_down)
+    {
+        size_t bloom_count = 0;
+        for (const RowGroup & row_group : row_groups)
+        {
+            if (!row_group.need_to_process)
+                continue;
+            for (size_t column_idx = 0; column_idx < primitive_columns.size(); ++column_idx)
+            {
+                /// Same gates as the bloom-filter registration below. A dictionary-filtered chunk still
+                /// reads its bloom filter as a fallback, so it counts. A chunk that will not register
+                /// a range must not turn on a whole-file read.
+                const auto & column_info = primitive_columns[column_idx];
+                if (!column_info.use_bloom_filter || column_info.bloom_filter_hashes.empty())
+                    continue;
+                const auto & meta = row_group.columns[column_idx].meta->meta_data;
+                const bool nullable = column_info.levels.back().def > 0;
+                const bool can_be_null = !meta.statistics.__isset.null_count || meta.statistics.null_count != 0;
+                if (nullable && can_be_null && !column_info.output_nullable)
+                    continue;
+                /// `bloom_filter_length` is optional (Parquet 2.10). An offset without it is still a
+                /// filter; the hard-way path below derives the length and registers that range.
+                const bool length_missing_or_positive = !meta.__isset.bloom_filter_length || meta.bloom_filter_length > 0;
+                if (meta.__isset.bloom_filter_offset && length_missing_or_positive)
+                    ++bloom_count;
+            }
+        }
+        if (bloom_count >= 2)
+        {
+            const size_t file_size = prefetcher.getFileSize();
+            const size_t seek = options.min_bytes_for_seek;
+            const bool whole_file = file_size <= coalesce_max && seek > 0 && bloom_count >= (file_size + seek - 1) / seek;
+            prefetcher.configureCoalescing(whole_file ? file_size : coalesce_max, whole_file, whole_file);
+        }
+    }
+    const uint8_t bloom_group = prefetcher.bloomFilterCoalesceGroup();
+
     bool use_offset_index = options.format.parquet.use_offset_index || format_filter_info->prewhere_info || format_filter_info->row_level_filter
         || format_filter_info->rows_to_read
         || std::any_of(primitive_columns.begin(), primitive_columns.end(), [](const auto & c) { return !c.column_index_conditions.empty(); });
@@ -1106,7 +1146,10 @@ void Reader::initializePrefetches()
                 || column.meta->meta_data.statistics.null_count != 0;
             bool bloom_filter_null_safe = !nullable || !can_be_null || primitive_columns[column_idx].output_nullable;
 
-            if (options.format.parquet.bloom_filter_push_down &&
+            /// A row group outside the requested subset produces no rows. Do not register its filter:
+            /// the count above skips it, and a registered filter would still be read.
+            if (row_group.need_to_process &&
+                options.format.parquet.bloom_filter_push_down &&
                 primitive_columns[column_idx].use_bloom_filter &&
                 !primitive_columns[column_idx].bloom_filter_hashes.empty() &&
                 bloom_filter_null_safe &&
@@ -1121,15 +1164,20 @@ void Reader::initializePrefetches()
                     size_t len = size_t(column.meta->meta_data.bloom_filter_length);
                     max_header_length = std::min(max_header_length, len);
                     column.bloom_filter_data_bytes = len;
+                    /// The body is only a fallback when the dictionary filter can still rule the chunk out.
+                    /// Leave it out of the bloom coalesce group: the header is read first and would
+                    /// otherwise download the body before that filter is tried. A whole-file read still
+                    /// assigns every range to the group.
+                    const uint8_t bloom_data_group = column.use_dictionary_filter ? uint8_t{0} : bloom_group;
                     column.bloom_filter_data_prefetch = prefetcher.registerRange(
                         size_t(column.meta->meta_data.bloom_filter_offset),
-                        len, /*likely_to_be_used=*/ false);
+                        len, /*likely_to_be_used=*/ false, bloom_data_group);
                 }
                 /// bloom_filter_header_prefetch and bloom_filter_data_prefetch overlap, that's ok.
                 column.use_bloom_filter = true;
                 column.bloom_filter_header_prefetch = prefetcher.registerRange(
                     size_t(column.meta->meta_data.bloom_filter_offset),
-                    max_header_length, /*likely_to_be_used=*/ true);
+                    max_header_length, /*likely_to_be_used=*/ true, bloom_group);
             }
 
             /// Offset index.
@@ -1207,8 +1255,10 @@ void Reader::initializePrefetches()
                 size_t end = it == all_offsets.end() ? prefetcher.getFileSize() : *it;
 
                 column.bloom_filter_data_bytes = end - offset;
+                /// Same group rule as the length-known path above.
+                const uint8_t bloom_data_group = column.use_dictionary_filter ? uint8_t{0} : bloom_group;
                 column.bloom_filter_data_prefetch = prefetcher.registerRange(
-                    offset, end - offset, /*likely_to_be_used=*/ false);
+                    offset, end - offset, /*likely_to_be_used=*/ false, bloom_data_group);
             }
         }
     }

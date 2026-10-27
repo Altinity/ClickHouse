@@ -209,6 +209,20 @@ When reading Parquet files, skip whole row groups based on the WHERE expressions
     DECLARE(UInt64, input_format_parquet_dictionary_filter_push_down, 1024 * 1024, R"(
 When reading Parquet files (with reader v3), skip whole row groups based on the WHERE/PREWHERE expressions and the dictionary page contents, when all data pages of a column chunk are dictionary-encoded. The value is the maximum dictionary page size (in bytes) for which this optimization is applied; set to 0 to disable. This takes precedence over the bloom filter when both are available.
 )", 0) \
+    DECLARE(UInt64, input_format_parquet_bloom_filter_coalesce_max_bytes, 64 * 1024 * 1024, R"(
+Max bytes of one read when loading Parquet bloom filters.
+
+ClickHouse writes those filters back-to-back, after the row-group data, so nothing sits between neighboring filters. Filters in that block are read together, up to this many bytes. If the file itself is not larger than this value and it has enough filters that separate reads would cost more than one read of the file, the whole file is read once and later column reads reuse that buffer. `0` keeps one read per bloom filter.
+
+This is separate from `remote_read_min_bytes_for_seek` (and from `input_format_parquet_local_file_min_bytes_for_seek` for a local file):
+
+- `remote_read_min_bytes_for_seek` merges a neighboring range only when that range is shorter than the seek threshold. A bloom filter longer than the threshold stays its own read.
+- Raising that threshold far enough to cover a large bloom filter also applies to dictionary pages, indexes, and column data, so unrelated bytes are read with the filters.
+- An ordinary coalesced read may grow to four times the seek threshold. This setting is its own cap, and it applies only to bloom-filter ranges.
+- Enough filters in a file no larger than this setting select one read of the whole file. The seek threshold has no such rule.
+
+A bloom body kept only as a fallback for the dictionary filter is not part of this read. Its header is still read.
+)", 0) \
     DECLARE(UInt64, input_format_parquet_footer_read_size, 0, R"(
 Size (in bytes) of the initial tail read that fetches the Parquet footer (`FileMetaData`) when opening a file with reader v3. `0` (default) sizes the read adaptively to the file - 1% of the file size, clamped to `[128 KiB, 2 MiB]` - so it usually covers the whole footer in a single read even for wide files with hundreds of columns. Set a non-zero value to force a fixed initial read size instead of the adaptive one; this is useful for very high-latency object storage where reading a larger tail up front avoids a second round trip. The value is clamped to the file size.
 )", 0) \
