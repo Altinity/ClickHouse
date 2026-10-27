@@ -229,16 +229,14 @@ getClient(const S3::URI & url, const S3Settings & settings, ContextPtr context, 
         }
     }
 
-<<<<<<< HEAD
-    auto shared_cache = S3::ClientCacheRegistry::instance().getOrCreateCacheForKey(url.endpoint, url.bucket);
-=======
     /// `gcp_oauth` adds an `Authorization` header to every request, so it must obey the same filter.
     if (boost::iequals(client_configuration.http_client, "gcp_oauth"))
     {
         HTTPHeaderEntries gcp_oauth_headers{{"Authorization", "Bearer"}};
         context->getHTTPHeaderFilter().checkAndNormalizeHeaders(gcp_oauth_headers);
     }
->>>>>>> v26.3.60.2-lts
+
+    auto shared_cache = S3::ClientCacheRegistry::instance().getOrCreateCacheForKey(url.endpoint, url.bucket);
 
     return S3::ClientFactory::instance().create(
         client_configuration,
