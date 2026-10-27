@@ -1,0 +1,5 @@
+update_untouched_projections manifest_put=1 ref_repoint=0 build_abort=0
+drop_unused_column manifest_put=1 ref_repoint=0 build_abort=0
+rows	1000	499500	499500	500500
+p1	10	499500
+p4	3	2994

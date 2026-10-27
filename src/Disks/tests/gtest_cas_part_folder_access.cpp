@@ -1494,6 +1494,28 @@ TEST(CASPartFolderAccess, MoveRefExactAbortsOnDestinationPrecommit)
     EXPECT_TRUE(access.existsRef({ns, "src"}, Cas::Freshness::ForceFresh));
 }
 
+/// The audit event is emitted after the Move or drop landed; a sink that throws loses the row, never the mutation.
+TEST(CASPartFolderAccess, AuditSinkFailureDoesNotFailTheDurableMoveOrDrop)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store);
+    publishPart(store, ns, "src", {inlineEntry("f", "v1")});
+    const auto m = access.resolve({ns, "src"}, Cas::Freshness::ForceFresh)->manifest_id.ref;
+    std::vector<Cas::CasEventType> seen;
+    store->setEventSink([&](Cas::CasEvent e) { seen.push_back(e.type); throw std::runtime_error("audit sink is down"); });
+
+    EXPECT_TRUE(access.moveRefExact({ns, "src"}, {ns, "dst"}, m));
+    EXPECT_FALSE(access.existsRef({ns, "src"}, Cas::Freshness::ForceFresh));
+    EXPECT_TRUE(access.existsRef({ns, "dst"}, Cas::Freshness::ForceFresh));
+    EXPECT_EQ(access.dropRefExact({ns, "dst"}, m), Cas::Removal::Removed);
+    EXPECT_FALSE(access.existsRef({ns, "dst"}, Cas::Freshness::ForceFresh));
+    EXPECT_EQ(std::ranges::count(seen, Cas::CasEventType::RefMove), 1) << "the move's audit event reached the sink";
+    EXPECT_EQ(std::ranges::count(seen, Cas::CasEventType::RefDrop), 1) << "the drop's audit event reached the sink";
+    store->setEventSink(nullptr);
+}
+
 TEST(CASPartFolderAccess, SecondMoveFailureLeavesFirstMoved)
 {
     auto backend = std::make_shared<CountingBackend>();

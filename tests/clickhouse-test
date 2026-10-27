@@ -1607,6 +1607,7 @@ class FailureReason(enum.Enum):
     COVERAGE = "coverage"
     S3_STORAGE = "s3-storage"
     CAS_STORAGE = "cas-storage"
+    CAS_STORAGE_ONLY = "requires a CAS disk as the default MergeTree storage (cas-storage tag)"
     AZURE_BLOB_STORAGE = "azure-blob-storage"
     BUILD = "not running for current build"
     NO_PARALLEL_REPLICAS = "smth is not supported with parallel replicas"
@@ -3236,6 +3237,8 @@ class TestCase:
             and args.cas_storage
         ):
             return FailureReason.CAS_STORAGE
+        if tags and ("cas-storage" in tags) and not args.cas_storage:
+            return FailureReason.CAS_STORAGE_ONLY
         if tags and ("no-azure-blob-storage" in tags) and args.azure_blob_storage:
             return FailureReason.AZURE_BLOB_STORAGE
         if (

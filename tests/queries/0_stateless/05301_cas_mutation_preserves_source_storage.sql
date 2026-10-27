@@ -1,4 +1,4 @@
--- Tags: no-random-merge-tree-settings, no-replicated-database, no-shared-merge-tree
+-- Tags: no-fasttest, no-random-merge-tree-settings, no-replicated-database, no-shared-merge-tree
 
 DROP TABLE IF EXISTS cas_mutation_source_plain SYNC;
 DROP TABLE IF EXISTS cas_mutation_source_replicated SYNC;
