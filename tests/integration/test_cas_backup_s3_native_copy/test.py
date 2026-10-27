@@ -56,7 +56,7 @@ def backup_disk_destination(disk, name):
     return f"Disk('{disk}', '{RUN_TOKEN}/{name}')"
 
 
-def create_and_fill(node, table, storage_policy=STORAGE_POLICY):
+def create_and_fill(node, table, storage_policy=STORAGE_POLICY, num_rows=NUM_ROWS):
     node.query(f"DROP TABLE IF EXISTS {table} SYNC")
     node.query(
         f"""
@@ -73,7 +73,7 @@ def create_and_fill(node, table, storage_policy=STORAGE_POLICY):
             randomPrintableASCII(64),
             if(number % 7 = 0, NULL, toInt64(number)),
             [toUInt32(number), toUInt32(number + 1)]
-        FROM numbers({NUM_ROWS})
+        FROM numbers({num_rows})
         """
     )
 
@@ -273,6 +273,40 @@ def test_backup_to_s3_falls_back_without_multipart():
     actual = column_fingerprints(node, restored)
     assert actual["count"] == expected["count"]
     assert not [c for c in COLUMNS if actual[c] != expected[c]]
+
+    node.query(f"DROP TABLE {table} SYNC")
+    node.query(f"DROP TABLE {restored} SYNC")
+
+
+def test_backup_to_s3_small_cas_blobs_only_buffers():
+    node = cluster.instances["node"]
+    table = "cas_backup_small_blobs"
+    restored = f"{table}_restored"
+    s3_destination = backup_s3_destination("small_blobs")
+    query_id = f"{table}_backup_{RUN_TOKEN}"
+
+    create_and_fill(node, table, num_rows=10)
+    expected = column_fingerprints(node, table)
+
+    node.query(
+        f"BACKUP TABLE {table} TO {s3_destination} SETTINGS allow_s3_native_copy = 1",
+        query_id=query_id,
+    )
+    events = transfer_events(node, query_id)
+
+    assert events["server_side_part_copy"] == 0, (
+        "a small CAS source blob must not use UploadPartCopy"
+    )
+    assert events["server_side_object_copy"] == 0, (
+        "CopyObject cannot omit the CAS envelope"
+    )
+    assert events["buffered_write"] > 0, "small CAS blobs must be uploaded through buffers"
+
+    node.query(f"DROP TABLE IF EXISTS {restored} SYNC")
+    node.query(f"RESTORE TABLE {table} AS {restored} FROM {s3_destination}")
+
+    actual = column_fingerprints(node, restored)
+    assert actual == expected
 
     node.query(f"DROP TABLE {table} SYNC")
     node.query(f"DROP TABLE {restored} SYNC")
