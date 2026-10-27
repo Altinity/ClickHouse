@@ -101,6 +101,8 @@ const KeyCondition::AtomMap KeyCondition::atom_map
             {
                 out.function = RPNElement::FUNCTION_IN_RANGE;
                 out.range = Range(value);
+                /// `NULL <=> c` is false, so `NOT (key <=> c)` is true and must keep a chunk that has NULL.
+                out.false_on_null = true;
                 return true;
             }
         },
@@ -6810,6 +6812,197 @@ bool KeyCondition::mayBeTrueInRange(
     const DataTypes & data_types) const
 {
     return checkInRange(used_key_size, left_keys, right_keys, data_types, BoolMask::consider_only_can_be_true).can_be_true;
+}
+
+namespace
+{
+
+/// One SQL result when the column under consideration is NULL.
+enum class SqlBool
+{
+    False,
+    True,
+    Unknown,
+};
+
+/// Every SQL result an expression might still have. Other columns are `any`: false, true, or unknown.
+struct TruthOnNull
+{
+    bool has_false = false;
+    bool has_true = false;
+    bool has_unknown = false;
+
+    static TruthOnNull isFalse()
+    {
+        TruthOnNull value;
+        value.has_false = true;
+        return value;
+    }
+
+    static TruthOnNull isTrue()
+    {
+        TruthOnNull value;
+        value.has_true = true;
+        return value;
+    }
+
+    static TruthOnNull isUnknown()
+    {
+        TruthOnNull value;
+        value.has_unknown = true;
+        return value;
+    }
+
+    static TruthOnNull any()
+    {
+        TruthOnNull value;
+        value.has_false = true;
+        value.has_true = true;
+        value.has_unknown = true;
+        return value;
+    }
+
+    static TruthOnNull from(SqlBool value)
+    {
+        if (value == SqlBool::False)
+            return isFalse();
+        if (value == SqlBool::True)
+            return isTrue();
+        return isUnknown();
+    }
+
+    bool has(SqlBool value) const
+    {
+        if (value == SqlBool::False)
+            return has_false;
+        if (value == SqlBool::True)
+            return has_true;
+        return has_unknown;
+    }
+
+    void add(TruthOnNull other)
+    {
+        has_false = has_false || other.has_false;
+        has_true = has_true || other.has_true;
+        has_unknown = has_unknown || other.has_unknown;
+    }
+};
+
+SqlBool sqlAnd(SqlBool left, SqlBool right)
+{
+    if (left == SqlBool::False || right == SqlBool::False)
+        return SqlBool::False;
+    if (left == SqlBool::True && right == SqlBool::True)
+        return SqlBool::True;
+    return SqlBool::Unknown;
+}
+
+SqlBool sqlOr(SqlBool left, SqlBool right)
+{
+    if (left == SqlBool::True || right == SqlBool::True)
+        return SqlBool::True;
+    if (left == SqlBool::False && right == SqlBool::False)
+        return SqlBool::False;
+    return SqlBool::Unknown;
+}
+
+/// `NOT` swaps false and true. Unknown stays unknown, including when the set is every possible result.
+TruthOnNull sqlNot(TruthOnNull value)
+{
+    std::swap(value.has_false, value.has_true);
+    return value;
+}
+
+TruthOnNull combineOnNull(TruthOnNull left, TruthOnNull right, bool is_and)
+{
+    const SqlBool values[] = {SqlBool::False, SqlBool::True, SqlBool::Unknown};
+    TruthOnNull result;
+    for (SqlBool left_value : values)
+    {
+        if (!left.has(left_value))
+            continue;
+        for (SqlBool right_value : values)
+        {
+            if (!right.has(right_value))
+                continue;
+            result.add(TruthOnNull::from(is_and ? sqlAnd(left_value, right_value) : sqlOr(left_value, right_value)));
+        }
+    }
+    return result;
+}
+
+}
+
+bool KeyCondition::mayBeTrueOnNull(size_t key_column) const
+{
+    /// `WHERE` keeps a row only when the predicate is true. A comparison with NULL is unknown.
+    std::vector<TruthOnNull> stack;
+    for (const auto & element : rpn)
+    {
+        const bool uses_this_column
+            = std::find(element.key_columns.begin(), element.key_columns.end(), key_column) != element.key_columns.end();
+
+        switch (element.function)
+        {
+            case RPNElement::FUNCTION_IN_RANGE:
+            case RPNElement::FUNCTION_NOT_IN_RANGE:
+            case RPNElement::FUNCTION_ARGS_IN_HYPERRECTANGLE:
+            case RPNElement::FUNCTION_POINT_IN_POLYGON:
+                /// A bare comparison is unknown on NULL. `<=>` is false. `assumeNotNull` can make either one true.
+                if (!uses_this_column || !element.monotonic_functions_chain.empty())
+                {
+                    stack.push_back(TruthOnNull::any());
+                }
+                else if (element.false_on_null)
+                {
+                    stack.push_back(TruthOnNull::isFalse());
+                }
+                else
+                {
+                    stack.push_back(TruthOnNull::isUnknown());
+                }
+                break;
+            case RPNElement::FUNCTION_IN_SET:
+            case RPNElement::FUNCTION_NOT_IN_SET:
+                /// `nullIn` / `notNullIn` (`transform_null_in`) can match NULL. A normal `IN` does not, but the
+                /// RPN does not record which one this is, so keep the chunk.
+                stack.push_back(TruthOnNull::any());
+                break;
+            case RPNElement::FUNCTION_IS_NULL:
+                stack.push_back(uses_this_column ? TruthOnNull::isTrue() : TruthOnNull::any());
+                break;
+            case RPNElement::FUNCTION_IS_NOT_NULL:
+                stack.push_back(uses_this_column ? TruthOnNull::isFalse() : TruthOnNull::any());
+                break;
+            case RPNElement::FUNCTION_UNKNOWN:
+                stack.push_back(TruthOnNull::any());
+                break;
+            case RPNElement::ALWAYS_FALSE:
+                stack.push_back(TruthOnNull::isFalse());
+                break;
+            case RPNElement::ALWAYS_TRUE:
+                stack.push_back(TruthOnNull::isTrue());
+                break;
+            case RPNElement::FUNCTION_NOT:
+                if (stack.empty())
+                    return true;
+                stack.back() = sqlNot(stack.back());
+                break;
+            case RPNElement::FUNCTION_AND:
+            case RPNElement::FUNCTION_OR:
+            {
+                if (stack.size() < 2)
+                    return true;
+                const TruthOnNull right = stack.back();
+                stack.pop_back();
+                stack.back() = combineOnNull(stack.back(), right, element.function == RPNElement::FUNCTION_AND);
+                break;
+            }
+        }
+    }
+
+    /// A broken expression, or one that can still be true, must not prune.
+    return stack.size() != 1 || stack.back().has_true;
 }
 
 String KeyCondition::RPNElement::toString(const std::vector<String> & key_names) const
