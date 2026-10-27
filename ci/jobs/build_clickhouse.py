@@ -227,15 +227,15 @@ def main():
     if use_thinlto_cache:
         print(f"ThinLTO cache is enabled in {thinlto_cache_dir}")
         cmake_cmd += f" -DTHINLTO_CACHE_DIR={thinlto_cache_dir}"
-        # Optional second marker `.link_jobs` holding a number: link that many
-        # binaries concurrently instead of the memory-derived default, so the
-        # two serial thin-link phases (clickhouse, keeper) overlap.
-        link_jobs_marker = f"{thinlto_cache_dir}/.link_jobs"
-        if os.path.exists(link_jobs_marker):
-            with open(link_jobs_marker) as f:
-                link_jobs = int(f.read().strip())
-            print(f"Linking {link_jobs} binaries concurrently ({link_jobs_marker})")
-            cmake_cmd += f" -DPARALLEL_LINK_JOBS={link_jobs}"
+
+    # Link `clickhouse` and `clickhouse-keeper` concurrently. Each ThinLTO link
+    # spends most of its time in a single-threaded thin-link phase, so the two
+    # overlap almost entirely: measured on a 16-core, 62 GB builder with zram,
+    # 114.5 -> 83 min cold and 65.5 -> 48.5 min warm. The memory-derived
+    # default in limit_jobs.cmake budgets ~100 GB per `-g` link and would
+    # allow only one; the real peak of both links together was ~48 GB.
+    if "ENABLE_THINLTO=1" in cmake_cmd:
+        cmake_cmd += " -DPARALLEL_LINK_JOBS=2"
 
     # PGO/BOLT profile integration for release builds. The sccache-warmup builds
     # are deliberately excluded: they exist only to populate the shared compiler
