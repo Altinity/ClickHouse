@@ -1,9 +1,12 @@
-# rebuild in #33610
+# rebuild in #2701
 # docker build -t altinityinfra/stateless-test .
 ARG FROM_TAG=latest
 FROM altinityinfra/test-base:$FROM_TAG
 
 ARG odbc_driver_url="https://github.com/ClickHouse/clickhouse-odbc/releases/download/v1.1.6.20200320/clickhouse-odbc-1.1.6-Linux.tar.gz"
+
+# The test-base image carries an outdated Kitware apt key
+RUN curl -s https://apt.kitware.com/keys/kitware-archive-latest.asc | gpg --dearmor - > /etc/apt/trusted.gpg.d/kitware.gpg
 
 # golang version 1.13 on Ubuntu 20 is enough for tests
 RUN apt-get update -y \
@@ -67,17 +70,8 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 ENV NUM_TRIES=1
 ENV MAX_RUN_TIME=0
 
-# Unrelated to vars in setup_minio.sh, but should be the same there
-# to have the same binaries for local running scenario
-ARG MINIO_SERVER_VERSION=2022-01-03T18-22-58Z
-ARG MINIO_CLIENT_VERSION=2022-01-05T23-52-51Z
-ARG TARGETARCH
-
-# Download Minio-related binaries
-RUN arch=${TARGETARCH:-amd64} \
-    && curl -L "https://dl.min.io/server/minio/release/linux-${arch}/archive/minio.RELEASE.${MINIO_SERVER_VERSION}" -o ./minio \
-    && curl -L "https://dl.min.io/client/mc/release/linux-${arch}/archive/mc.RELEASE.${MINIO_CLIENT_VERSION}" -o ./mc \
-    && chmod +x ./mc ./minio
+# MinIO no longer publishes binaries on dl.min.io, take them from the mirror image
+COPY --from=clickhouse/minio-minio:RELEASE.2024-07-31T05-46-26Z /usr/bin/minio /usr/bin/mc ./
 
 RUN curl -L --no-verbose -O 'https://archive.apache.org/dist/hadoop/common/hadoop-3.3.1/hadoop-3.3.1.tar.gz' \
     && tar -xvf hadoop-3.3.1.tar.gz \
@@ -87,8 +81,10 @@ ENV MINIO_ROOT_USER="clickhouse"
 ENV MINIO_ROOT_PASSWORD="clickhouse"
 ENV EXPORT_S3_STORAGE_POLICIES=1
 
+# Current azurite dependencies need a newer Node.js than the Ubuntu one
 RUN npm install -g azurite@3.28.0 \
-    && npm install -g tslib@2.6.2
+    && npm install -g tslib@2.6.2 \
+    && npm install -g node@20.20.2
 
 COPY run.sh /
 COPY setup_minio.sh /

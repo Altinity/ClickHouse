@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import json
 import logging
 import os
 import sys
@@ -8,6 +9,7 @@ from typing import List
 
 from ci_config import CI_CONFIG, Build
 from env_helper import (
+    CI_CONFIG_PATH,
     GITHUB_JOB_URL,
     GITHUB_REPOSITORY,
     GITHUB_SERVER_URL,
@@ -56,6 +58,12 @@ def main():
     required_builds = len(builds_for_check)
     missing_builds = 0
 
+    ci_jobs = None
+    if Path(CI_CONFIG_PATH).is_file():
+        with open(CI_CONFIG_PATH, encoding="utf-8") as jfd:
+            jobs_data = json.load(jfd)["jobs_data"]
+        ci_jobs = jobs_data["jobs_to_do"] + jobs_data["jobs_to_skip"]
+
     # Collect reports from json artifacts
     build_results = []  # type: List[BuildResult]
     for build_name in builds_for_check:
@@ -65,6 +73,11 @@ def main():
         if not build_result:
             if build_name == Build.FUZZERS:
                 logging.info("Build [%s] is missing - skip", Build.FUZZERS)
+                continue
+            if ci_jobs is not None and build_name not in ci_jobs:
+                # e.g. excluded with a ci_exclude_ tag
+                logging.info("Build [%s] is not in this CI run - skip", build_name)
+                required_builds -= 1
                 continue
             logging.warning("Build results for %s is missing", build_name)
             build_result = BuildResult.missing_result("missing")
