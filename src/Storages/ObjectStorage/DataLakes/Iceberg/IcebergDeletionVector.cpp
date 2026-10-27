@@ -20,7 +20,6 @@
 
 #include <atomic>
 #include <optional>
-#include <string>
 #include <string_view>
 
 namespace DB
@@ -31,8 +30,6 @@ namespace ErrorCodes
     extern const int ICEBERG_SPECIFICATION_VIOLATION;
     extern const int BAD_ARGUMENTS;
     extern const int LOGICAL_ERROR;
-    extern const int S3_OBJECT_CHANGED_DURING_READ;
-    extern const int AZURE_OBJECT_CHANGED_DURING_READ;
 }
 
 namespace Setting
@@ -87,21 +84,15 @@ namespace
 
 using FooterBlobsPtr = PuffinFilesCache::FooterBlobsPtr;
 
-/// Marker shared by the local/HDFS/Web check and the cache-load catch. S3 and Azure report the same
-/// race with their own error codes, from the `If-Match` on the listed etag.
+/// Marker for the local/HDFS/Web generation check. S3 and Azure report the same race with their own
+/// error codes, from the `If-Match` on the listed etag. The mismatch is not retried: a later object
+/// must not be applied under the listed offset, length, and cardinality.
 constexpr std::string_view PUFFIN_LISTED_ETAG_MISMATCH = "changed while loading a cached Puffin deletion vector";
 
 bool storagePinsReadToListedEtag(const IObjectStorage & object_storage)
 {
     const auto type = object_storage.getType();
     return type == ObjectStorageType::S3 || type == ObjectStorageType::Azure;
-}
-
-bool isPuffinListedEtagMismatch(const Exception & e)
-{
-    if (e.code() == ErrorCodes::S3_OBJECT_CHANGED_DURING_READ || e.code() == ErrorCodes::AZURE_OBJECT_CHANGED_DURING_READ)
-        return true;
-    return e.message().find(PUFFIN_LISTED_ETAG_MISMATCH) != std::string::npos;
 }
 
 /// S3 and Azure enforce the listed etag on the GET itself. Other backends ignore `StoredObject::etag`,
@@ -462,45 +453,15 @@ DataLakeObjectMetadata::ExcludedRowsPtr loadDeletionVector(
     /// Footer is keyed by file identity only, so N DV slices in one coalesced Puffin share one parse.
     /// Resolve the footer only on a Puffin deletion-vector cache miss (nested memo lookup).
     /// Delta `.bin` objects have no Puffin footer; detection inside the uncached loader skips memo.
-    /// The load is pinned to the etag in the cache key. If the object is overwritten in between,
-    /// nothing is inserted and the read is repeated without the cache.
-    try
+    /// The load is pinned to the etag in the cache key. If the object is overwritten in between, the
+    /// loader throws and `getOrSetDeletionVector` does not insert. The query fails instead of reading
+    /// the new generation under the listed offset, length, and cardinality.
+    return cache->getOrSetDeletionVector(*cache_key, [&]()
     {
-        return cache->getOrSetDeletionVector(*cache_key, [&]()
-        {
-            return loadDeletionVectorUncached(
-                object_storage,
-                puffin_path,
-                /*puffin_metadata=*/ puffin_object.metadata,
-                content_offset,
-                content_size_in_bytes,
-                expected_data_file,
-                expected_cardinality_u64,
-                data_file_record_count,
-                context,
-                log,
-                true,
-                nullptr,
-                cache.get(),
-                footer_key,
-                /*pin_listed_etag=*/ true);
-        });
-    }
-    catch (const Exception & e)
-    {
-        if (!isPuffinListedEtagMismatch(e))
-            throw;
-
-        LOG_WARNING(
-            log,
-            "Puffin object '{}' {} (etag {}); reading it without the cache",
-            puffin_path,
-            PUFFIN_LISTED_ETAG_MISMATCH,
-            puffin_object.metadata->etag);
         return loadDeletionVectorUncached(
             object_storage,
             puffin_path,
-            /*puffin_metadata=*/ std::nullopt,
+            /*puffin_metadata=*/ puffin_object.metadata,
             content_offset,
             content_size_in_bytes,
             expected_data_file,
@@ -508,9 +469,12 @@ DataLakeObjectMetadata::ExcludedRowsPtr loadDeletionVector(
             data_file_record_count,
             context,
             log,
-            false,
-            nullptr);
-    }
+            true,
+            nullptr,
+            cache.get(),
+            footer_key,
+            /*pin_listed_etag=*/ true);
+    });
 }
 
 }
