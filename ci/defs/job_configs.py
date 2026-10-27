@@ -462,7 +462,7 @@ class JobConfigs:
         Job.ParamSet(
             parameter=BuildTypes.AMD_CFI,
             provides=[ArtifactNames.CH_AMD_CFI],
-            runs_on=RunnerLabels.ARM_LARGE,
+            runs_on=RunnerLabels.BUILDER_ARM,
             timeout=4 * 3600,
         ),
     )
@@ -505,12 +505,12 @@ class JobConfigs:
         ).parametrize(
             Job.ParamSet(
                 parameter=BuildTypes.AMD_RELEASE_PR_CACHE_WARMUP,
-                runs_on=RunnerLabels.ARM_LARGE,
+                runs_on=RunnerLabels.BUILDER_ARM,
                 timeout=3 * 3600,
             ),
             Job.ParamSet(
                 parameter=BuildTypes.ARM_RELEASE_PR_CACHE_WARMUP,
-                runs_on=RunnerLabels.ARM_LARGE,
+                runs_on=RunnerLabels.BUILDER_ARM,
             ),
         )
     ]
