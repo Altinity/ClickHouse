@@ -204,8 +204,7 @@ int SSLManager::verifyCallback(bool server, int ok, X509_STORE_CTX* pStore)
 {
 	/// OpenSSL calls this for every certificate of the chain, with `ok` set to 1 if it has
 	/// no other errors, so this rejects a chain that contains a distrusted certificate at any
-	/// depth, whichever trust store (the system one, the configured one or the embedded one)
-	/// it was built from. The rejection is reported like any other verification error.
+	/// depth, whichever trust store (the system one or the configured one) it was built from. The rejection is reported like any other verification error.
 	if (X509 * cert = X509_STORE_CTX_get_current_cert(pStore))
 	{
 		int distrusted = checkDistrustedCertificate(cert);
