@@ -37,15 +37,16 @@ ${CLICKHOUSE_CLIENT} --use_iceberg_metadata_files_cache=0 --query "
     SELECT count() FROM nullable_minmax WHERE NOT partner_id = 'sg2o27m';"
 
 echo '--- min/max prunes a file with nulls when the predicate rejects null ---'
+# `FORMAT Null` keeps these out of the reference. `query_log` still records the prune counters.
 ${CLICKHOUSE_CLIENT} --use_iceberg_metadata_files_cache=0 --query "
     SELECT count() FROM nullable_minmax WHERE partner_id = 'sg2o27m'
-        SETTINGS log_comment = '${CLICKHOUSE_DATABASE}_eq_probe';
+        SETTINGS log_comment = '${CLICKHOUSE_DATABASE}_eq_probe' FORMAT Null;
     SELECT count() FROM nullable_minmax WHERE partner_id = 'aaa'
-        SETTINGS log_comment = '${CLICKHOUSE_DATABASE}_eq_low';
+        SETTINGS log_comment = '${CLICKHOUSE_DATABASE}_eq_low' FORMAT Null;
     SELECT count() FROM nullable_minmax WHERE partner_id IS NULL
-        SETTINGS log_comment = '${CLICKHOUSE_DATABASE}_is_null';
+        SETTINGS log_comment = '${CLICKHOUSE_DATABASE}_is_null' FORMAT Null;
     SELECT count() FROM nullable_minmax WHERE NOT partner_id = 'sg2o27m'
-        SETTINGS log_comment = '${CLICKHOUSE_DATABASE}_not_probe';
+        SETTINGS log_comment = '${CLICKHOUSE_DATABASE}_not_probe' FORMAT Null;
     SYSTEM FLUSH LOGS query_log;"
 
 ${CLICKHOUSE_CLIENT} --query "
