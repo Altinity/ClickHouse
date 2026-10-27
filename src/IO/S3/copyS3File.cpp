@@ -723,7 +723,6 @@ namespace
             request.SetContentType("binary/octet-stream");
 
             client_ptr->setKMSHeaders(request);
-
         }
 
         void processCopyRequest(S3::CopyObjectRequest & request)
@@ -760,7 +759,6 @@ namespace
                                 outcome.GetError().GetMessage(),
                                 outcome.GetError().GetErrorType(),
                                 outcome.GetError().GetExceptionName());
-
                         LOG_INFO(
                             log,
                             "Multipart upload using copy is not supported, will try regular upload for Bucket: {}, Key: {}, Object size: "

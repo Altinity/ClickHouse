@@ -109,10 +109,8 @@ bool Client::RetryStrategy::ShouldRetry(const Aws::Client::AWSError<Aws::Client:
     if (error.GetResponseCode() == Aws::Http::HttpResponseCode::MOVED_PERMANENTLY)
         return false;
 
-    /// A 412 Precondition Failed is the DETERMINISTIC result of a conditional request (the
-    /// content-addressed backend's CAS/dedup writes). Retrying never changes it, and on a store that
-    /// returns a non-AWS body (RustFS) the SDK marks the 412 retryable and storms the write path — and
-    /// downstream SYSTEM SYNC REPLICA (B166). One 412 policy across the retry and CA conditional ops.
+    /// A 412 is the deterministic answer to a conditional request; retrying it only storms the store
+    /// (some S3-compatible servers return a body the SDK marks retryable).
     if (S3::isPreconditionFailedError(error))
         return false;
 

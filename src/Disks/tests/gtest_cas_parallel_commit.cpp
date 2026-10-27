@@ -89,7 +89,7 @@ struct CaWiringFixture
     Cas::CommitOutcome repointToFreshManifest(const Cas::PartRefKey & key)
     {
         return access.repointRef(key, {inlineEntry("f0", fmt::format("repoint-{}", ++content_counter))},
-            Cas::ProvenanceOp::Other);
+            Cas::ProvenanceOp::Other, access.resolve(key, Cas::Freshness::ForceFresh)->manifest_id.ref);
     }
 };
 
@@ -149,7 +149,7 @@ TEST(CASCommitOutcome, RepointRefByteEqualNoOpReportsCurrentManifestNotCreated)
     const Cas::CommitOutcome oc1 = fx.commitSimplePart(key, /*blobs=*/1);
 
     const Cas::CommitOutcome oc_noop = fx.partAccess().repointRef(
-        key, {CaWiringFixture::inlineEntry("f0", fmt::format("payload-{}-0", key.ref))}, Cas::ProvenanceOp::Other);
+        key, {CaWiringFixture::inlineEntry("f0", fmt::format("payload-{}-0", key.ref))}, Cas::ProvenanceOp::Other, oc1.manifest_ref);
     EXPECT_FALSE(oc_noop.created);
     EXPECT_EQ(oc_noop.manifest_ref, oc1.manifest_ref);
 }
@@ -221,7 +221,7 @@ struct CaTxnRollbackFixture
         e.ref = Cas::BlobRef{Cas::BlobHashAlgo::CityHash128, Cas::BlobDigest::fromU128(u128Of(bytes))};
         e.blob_size = bytes.size();
         e.inline_bytes = bytes;
-        const auto oc = partAccess().repointRef(key, {e}, Cas::ProvenanceOp::Other);
+        const auto oc = partAccess().repointRef(key, {e}, Cas::ProvenanceOp::Other, partAccess().resolve(key, Cas::Freshness::ForceFresh)->manifest_id.ref);
         last_repoint_manifest = oc.manifest_ref;
     }
 

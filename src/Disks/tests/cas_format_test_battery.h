@@ -142,7 +142,7 @@ inline void runFormatBattery(const FormatBatteryCase & c)
 
     /// v+1 gate.
     const String v_now = fmt::format("\"v\":{}", currentCompatibilityVersion());
-    const String v_next = fmt::format("\"v\":{}", currentCompatibilityVersion() + 1);
+    const String v_next = fmt::format("\"v\":{}", G_BUILD + 1);
     String future;
     if (c.make_future_version)
         future = c.make_future_version(text);

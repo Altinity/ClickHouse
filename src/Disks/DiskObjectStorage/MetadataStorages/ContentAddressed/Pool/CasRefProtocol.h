@@ -64,19 +64,50 @@ enum class RootMutationOrigin : uint8_t
 ///
 /// It is also safety-bearing: `CasRefLedger::confirmExactRef` refuses to certify a ref while a queued
 /// or carved item's scope covers it, and `flushRefBatch` fails an item whose ops name a ref outside its
-/// declared scope, so a caller must name exactly the ref its ops mutate.
+/// declared scope, so a caller must name exactly the ref its ops mutate. A two-ref scope exists for the
+/// owner move, which mutates its source and destination names in one op.
 struct MutationScope
 {
     enum class Kind : uint8_t { Ref, WholeShard };
     Kind kind = Kind::WholeShard;
     String ref_name;   /// set iff kind == Ref
+    String second_ref_name;   /// non-empty only for a two-ref scope
+
+    /// True iff `name` is one of the refs this scope names. A whole-shard scope names none explicitly.
+    bool names(const String & name) const
+    {
+        return kind == Kind::Ref && (ref_name == name || (!second_ref_name.empty() && second_ref_name == name));
+    }
+
+    /// Calls `f` for every ref name this scope names (none for a whole-shard scope).
+    template <typename F>
+    void forEachName(F && f) const
+    {
+        if (kind != Kind::Ref)
+            return;
+        f(ref_name);
+        if (!second_ref_name.empty())
+            f(second_ref_name);
+    }
+
+    /// The scope's ref names for a diagnostic: `'a'` or `'a', 'b'`.
+    String namesForLog() const
+    {
+        String out = "'" + ref_name + "'";
+        if (!second_ref_name.empty())
+            out += ", '" + second_ref_name + "'";
+        return out;
+    }
 
     /// Creates a scope for a mutation that touches exactly one ref name. The name is moved into the
     /// scope because scopes are normally assembled as part of an append request.
-    static MutationScope ref(String name) { return {Kind::Ref, std::move(name)}; }
+    static MutationScope ref(String name) { return {Kind::Ref, std::move(name), {}}; }
+
+    /// Creates a scope for a mutation that touches exactly two distinct ref names.
+    static MutationScope refs(String a, String b) { return {Kind::Ref, std::move(a), std::move(b)}; }
 
     /// Creates a scope for a mutation that cannot safely share a batch with per-ref mutations.
-    static MutationScope wholeShard() { return {Kind::WholeShard, {}}; }
+    static MutationScope wholeShard() { return {Kind::WholeShard, {}, {}}; }
 };
 
 /// Kind of mutation being applied, used in diagnostic logging and metrics. Does not affect behaviour.
@@ -84,6 +115,7 @@ enum class RootMutationKind : uint8_t
 {
     Publish,
     Drop,
+    Move,
     Precommit,
     Promote,
     Abandon,
@@ -110,6 +142,7 @@ inline std::string_view toString(RootMutationKind kind)
     {
         case RootMutationKind::Publish:           return "Publish";
         case RootMutationKind::Drop:              return "Drop";
+        case RootMutationKind::Move:              return "Move";
         case RootMutationKind::Precommit:         return "Precommit";
         case RootMutationKind::Promote:           return "Promote";
         case RootMutationKind::Abandon:           return "Abandon";
@@ -214,6 +247,13 @@ public:
     const RefTxnId & getGreatestApplied() const { return greatest_applied; }
     const RefCowMap & getCommitted() const { return committed; }
     const std::set<std::pair<String, ManifestRef>> & getPrecommits() const { return precommits; }
+    /// True iff any precommit, whatever its manifest, is live under `ref_name`: another build is about to
+    /// claim that name.
+    bool hasLivePrecommitFor(const String & ref_name) const
+    {
+        const auto lb = precommits.lower_bound({ref_name, ManifestRef{}});
+        return lb != precommits.end() && lb->first == ref_name;
+    }
     uint64_t getSnapshotBodyBytes() const { return snapshot_body_bytes; }
     uint64_t getRemovalBodyBytes() const { return removal_body_bytes; }
 
@@ -274,8 +314,8 @@ private:
     void applyOp(const RefOp & op, const RefTxnId & txn_id);
 
     /// The `owner_transition` op kind: dispatches on the `(old_binding, new_binding)` shape to one of
-    /// the four legal transitions (add precommit / remove precommit / remove committed / promote). Any
-    /// other shape is not a recognized transition. The add-precommit arm's cross-owner uniqueness check
+    /// the five legal transitions (add precommit / remove precommit / remove committed / promote / move).
+    /// Any other shape is not a recognized transition. The add-precommit arm's cross-owner uniqueness check
     /// runs unconditionally (it is O(1) via `owned_manifests`). Was free.
     void applyOwnerTransition(const RefOp & op);
 
@@ -603,8 +643,8 @@ struct RefManifestEdge
 };
 
 /// The manifest edges of ONE decoded transaction, in operation order, reading NO manifest body.
-/// `owner_transition` recognizes EXACTLY the four shapes `classifyOwnerTransitionShape`
-/// (Pool/CasRefProtocol.cpp) also uses to drive `RefTableState::applyOwnerTransition` -- the SAME
+/// `owner_transition` recognizes EXACTLY the five shapes `classifyOwnerTransitionShape`
+/// (Formats/CasRefLogFormat.h) also uses to drive `RefTableState::applyOwnerTransition` -- the SAME
 /// classification, not a second copy of the shape knowledge:
 ///   - add precommit (no old_binding, new_binding.kind == Precommit)     => `+1` for `new.manifest_ref`
 ///   - remove precommit / remove committed (old_binding set, no new_binding)
@@ -612,6 +652,8 @@ struct RefManifestEdge
 ///   - promote (old_binding.kind == Precommit, new_binding.kind == Committed, SAME ref_name and
 ///     manifest_ref)                                                    => no edge (net zero: the
 ///     manifest keeps an owner the whole time)
+///   - move (old_binding.kind == Committed, new_binding.kind == Committed, DIFFERENT ref_name, SAME
+///     manifest_ref)                                                    => no edge (ownership transfer)
 ///   - `namespace_birth` / `set_published_at` / `remove_namespace`      => no edge
 /// Any other `owner_transition` shape -- neither binding, old+new naming DIFFERENT manifests, a
 /// promote whose old/new ref_name disagree, or any other kind combination -- throws `CORRUPTED_DATA`.

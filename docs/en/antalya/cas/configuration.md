@@ -253,6 +253,14 @@ requiring a fresh pool.
 | `xxh3-128` | Maximum speed | Fastest, 128-bit, no known collision classes |
 | `cityhash128` (default) | ClickHouse-ecosystem compatibility, and a possible future hash-reuse mode that avoids recomputation | Fast, but has a known class of collisions that occurs far more often than an ideal hash function would predict |
 
+## Upgrading a pool from 26.6.x {#upgrading-from-26-6}
+
+A 26.8 server renames a committed part with one ref-log `Move` record (`cas_log` event `ref_move`); a 26.6.x server cannot read such a record. A pool created by a writable 26.8 mount requires reader generation 2 from birth. The pool records the minimum reader generation it requires (`min_reader_generation`). The first writable mount by a 26.8 server raises it from 1 to 2 and logs a WARNING (`min_reader_generation raised 1 -> 2`); the raise is one-way and happens before any part is renamed. A mount with `readonly` set never raises it. That first writable start is the point of no return for 26.6.x mounts of the pool.
+
+Upgrade order: stop every 26.6.x server that mounts the pool, upgrade all of them to 26.8, then start them. There is no per-server switch: a 26.8 server always raises the floor on its first writable mount. With GC enabled on the 26.6.x servers, follow [Upgrading a pool with GC enabled](operations/debugging.md#upgrade-gc) first. A 26.6.x server that stays up after the raise cannot re-mount the pool on its own: after a lost mount lease or fence it stays unmounted until it is upgraded.
+
+What a 26.6.x server does if it meets a generation-2 pool: it refuses to mount after a restart (`UNKNOWN_FORMAT_VERSION` at startup: `CAS pool meta: pool requires reader generation 2 but this build supports at most 1`). An already mounted 26.6.x server keeps serving namespaces that have no `ref_move` record; direct recovery of a namespace that has one cannot cross the record until a later generation-1 snapshot gives it a new base; its GC round holds on the undecodable log and performs no deletions. Fetch-by-relink is protected by namespace ownership and the mount fence, not by the log version. No data is deleted or lost. Downgrading a pool whose floor is 2 is not supported.
+
 ## Server-level settings {#server-settings}
 
 Source: `ServerSettings.cpp`. This setting is process-wide rather than scoped to one disk block.

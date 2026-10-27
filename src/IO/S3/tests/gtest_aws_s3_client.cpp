@@ -217,7 +217,7 @@ static void testServerSideEncryption(
 
 TEST(IOTestAwsS3Client, DoesNotRetryPreconditionFailed)
 {
-    /// B166: a 412 Precondition Failed (conditional CAS/dedup writes of the content-addressed
+    /// A 412 Precondition Failed (conditional CAS/dedup writes of the content-addressed
     /// backend) must NOT be retried, even when the SDK marks it retryable because an S3-compatible
     /// server (e.g. RustFS) returned a body whose ExceptionName it could not parse. Retrying it is a
     /// storm that stalls the write path.

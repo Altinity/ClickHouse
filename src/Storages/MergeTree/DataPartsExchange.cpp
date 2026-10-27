@@ -98,16 +98,6 @@ constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_PARTS_PROJECTION = 7;
 constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_METADATA_VERSION = 8;
 constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_COLUMNS_SUBSTREAMS = 9;
 constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_INVALIDATED_SYSTEM_COLUMNS = 10;
-/// CAS replication 2b: fetch-by-relink. The receiver advertises its content-addressed pool identity
-/// (`cas_pool_uuid`) and, if it matches the sender's own pool, the sender sends only the
-/// part's content id (`part_id`) + the mutable header — no file bytes — and the receiver "fetches" by
-/// publishing its own ref to the blobs already present in the shared pool (the CA analogue of the
-/// zero-copy metadata-only fetch). Everything is gated behind a matching pool_uuid, so a non-CA fetch
-/// is byte-for-byte unchanged.
-/// Kept although nothing gates on it any more: the offer gate moved to `..._WITH_CA_CONFIRM` below, but
-/// 10 is a version peers still advertise, and deleting the record of what it meant would leave the next
-/// reader unable to tell what an incoming 10 promises (a relink it will NOT confirm).
-[[maybe_unused]] constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_CA_RELINK = 10;
 /// CAS replication, publish-then-confirm. A relink offer is now accompanied by a
 /// source token, and the endpoint answers a second, part-less request that asks whether that token is
 /// still exactly what the sender's ref names. A server advertising this version serves the confirm
@@ -412,10 +402,10 @@ void Service::processQuery(const HTMLForm & params, ReadBufferPtr body, WriteBuf
         /// Strictly gated on a matching pool_uuid: a non-CA part, a CA part on a different pool, or a
         /// receiver without the capability all fall through to the unchanged byte path below.
         ///
-        /// The gate is `..._WITH_CA_CONFIRM`, not `..._WITH_CA_RELINK`: a receiver is offered a relink
+        /// The gate is `..._WITH_CA_CONFIRM`: a receiver is offered a relink
         /// only once it advertises that it will confirm the offer before promoting it. A receiver that
-        /// still advertises `..._WITH_CA_RELINK` gets the bytes — mixed versions degrade to bytes, never
-        /// to an unconfirmed relink. This gate and the version the client advertises
+        /// still advertises 10 (a build whose relink had no confirm step) gets the bytes — mixed versions
+        /// degrade to bytes, never to an unconfirmed relink. This gate and the version the client advertises
         /// (`fetchSelectedPart`) are one change in two places; separated in either order they either
         /// disable relink outright or hand an unconfirmed relink to a receiver that claimed it confirms.
         if (client_protocol_version >= REPLICATION_PROTOCOL_VERSION_WITH_CA_CONFIRM

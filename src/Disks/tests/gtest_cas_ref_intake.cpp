@@ -123,8 +123,8 @@ TEST(CASRefIntake, ManifestEdgesPerOperationShape)
     }
 }
 
-/// `manifestEdgesOfTxn` rejects every `owner_transition` shape outside the four `classifyOwnerTransitionShape`
-/// recognizes (Pool/CasRefProtocol.cpp) -- it must never silently assign edge meaning to a shape the
+/// `manifestEdgesOfTxn` rejects every `owner_transition` shape outside the five `classifyOwnerTransitionShape`
+/// recognizes (Formats/CasRefLogFormat.cpp) -- it must never silently assign edge meaning to a shape the
 /// writer/replay state machine would refuse to apply. Each case throws `CORRUPTED_DATA`.
 TEST(CASRefIntake, ManifestEdgesRejectsUnrecognizedShapes)
 {

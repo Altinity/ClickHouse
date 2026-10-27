@@ -65,7 +65,9 @@ inline candidate. Blob-class files stage to local scratch by default. Explicit
 `cas_staging_backend = s3` requires native same-store copy at writable mount and stages a complete
 `[header][payload]` object. Its first publication after a destination miss may copy that object
 verbatim; a condemned or subsequent publication opens the staged payload, retags it, and streams.
-The `tmp_ → final` rename is a pure overlay re-key; durable publication happens only in `commit`.
+A rename staged before the commit (`tmp_ → final` inside one transaction) is a pure overlay re-key.
+Writers commit the part right after `finalize`, under its temporary name; the rename that follows is
+one ref-log `Move` of the committed ref (see [replication](replication.md)).
 
 **Step 1 — `stageManifest`.** Caps (see the
 [manifests-and-refs page](/antalya/cas/architecture/manifests-and-refs#part-manifests)) are

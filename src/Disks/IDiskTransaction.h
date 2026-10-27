@@ -151,7 +151,7 @@ public:
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Blob reference counting is not implemented for this disk transaction");
     }
 
-    /// In-flight read-your-writes for a part being assembled by THIS transaction (B59). Forwarded to the
+    /// In-flight read-your-writes for a part being assembled by THIS transaction. Forwarded to the
     /// metadata transaction by object-storage disk transactions; default (e.g. local disk) is no in-flight
     /// visibility, so a reader falls through to the committed path.
     virtual std::optional<StoredObjects> tryGetInFlightStorageObjects(const std::string & /*path*/) const { return {}; }

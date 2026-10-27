@@ -211,7 +211,7 @@ TEST(CASGCMaintenanceState, FutureVersionPropagatesInsteadOfResetting)
     auto op = requests.admit();
 
     ASSERT_TRUE(std::holds_alternative<Committed>(op.create(key, fmt::format(
-        "{{\"type\":\"cas_gc_maintenance_state\",\"v\":{}}}\n{{\"janitor_cursor\":\"\"}}\n", currentCompatibilityVersion() + 1),
+        "{{\"type\":\"cas_gc_maintenance_state\",\"v\":{}}}\n{{\"janitor_cursor\":\"\"}}\n", G_BUILD + 1),
         Retry::once())));
 
     /// The seed write above lands through the same `write` primitive `CountingBackend` counts, so

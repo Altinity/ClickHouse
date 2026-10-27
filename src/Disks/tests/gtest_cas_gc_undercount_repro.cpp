@@ -21,7 +21,7 @@
 /// twice from a blob's count, driving it to -1. Same fix — the second removal of an already-absent
 /// edge is a no-op. (Formerly staged the second event as a `{old=committed(r1),
 /// new=committed(r2)}` "repoint" -- a single op naming DIFFERENT manifests in its old/new bindings.
-/// Post-classifier (see Pool/CasRefProtocol.cpp's `classifyOwnerTransitionShape`) that single-op shape
+/// Post-classifier (see Formats/CasRefLogFormat.cpp's `classifyOwnerTransitionShape`) that single-op shape
 /// is not representable at all: `manifestEdgesOfTxn` now throws `CORRUPTED_DATA` on it, same as the
 /// state machine always has. The ACTUALLY representable duplicate-removal hazard -- two SEPARATE
 /// remove-committed events both naming `old=committed(r1)`, which the GC fold extracts blindly without
@@ -341,7 +341,7 @@ TEST(CASGCUndercount, H1bFenceWindowRemovalReFoldedNextRoundUnderflows)
 /// ============== UNRECOGNIZED owner_transition SHAPE ABORTS THE ROUND, NEVER DELETES =================
 ///
 /// A decodable ref log whose `owner_transition` op is SHAPE-illegal (here: neither `old_binding` nor
-/// `new_binding` set) is exactly what `classifyOwnerTransitionShape` (Pool/CasRefProtocol.cpp) throws
+/// `new_binding` set) is exactly what `classifyOwnerTransitionShape` (Formats/CasRefLogFormat.cpp) throws
 /// `CORRUPTED_DATA` on. `writeRefLogTxnRaw` -- the same codec real writers use -- never checks op-shape
 /// legality at encode/decode time, so this body is perfectly decodable; only `manifestEdgesOfTxn`'s
 /// shape classification rejects it, at GC fold time.

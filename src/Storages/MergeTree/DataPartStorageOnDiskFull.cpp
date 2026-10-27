@@ -22,6 +22,8 @@ namespace DB
 namespace FailPoints
 {
     extern const char part_storage_fail_commit_transaction[];
+    extern const char part_storage_pause_before_commit_transaction[];
+    extern const char part_storage_pause_after_commit_transaction[];
 }
 
 namespace ErrorCodes
@@ -254,11 +256,7 @@ void DataPartStorageOnDiskFull::createProjection(const std::string & name)
 
 void DataPartStorageOnDiskFull::beginTransaction()
 {
-    /// A borrowed projection sub-part shares the PARENT part's whole-part transaction (on a
-    /// content-addressed disk a part is one atomic unit: one manifest + one ref). It must not open its
-    /// own — riding the parent transaction is the point (B58) — so begin is a no-op here. This
-    /// centralizes the rule the 6 merge/mutate call sites used to duplicate as
-    /// `if (!isContentAddressed()) beginTransaction()`.
+    /// A borrowed projection sub-part shares the parent part's transaction and must not open its own.
     if (has_shared_transaction)
         return;
 
@@ -287,8 +285,14 @@ void DataPartStorageOnDiskFull::commitTransaction()
         throw Exception(ErrorCodes::FAULT_INJECTED, "part_storage_fail_commit_transaction");
     });
 
+    /// Lets a test hold the part inside its storage commit and prove that no MergeTree lock is held here.
+    FailPointInjection::pauseFailPoint(FailPoints::part_storage_pause_before_commit_transaction);
+
     transaction->commit();
     transaction.reset();
+
+    /// Lets a test stop the process between the durable commit and the rename that follows.
+    FailPointInjection::pauseFailPoint(FailPoints::part_storage_pause_after_commit_transaction);
 }
 
 void DataPartStorageOnDiskFull::checkpointTransaction()

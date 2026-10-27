@@ -8,7 +8,8 @@
 # time: audit events are timestamped at delivery and can arrive after the removal returns. The test
 # waits for the terminal records, one `ref_drop` per outdated part, before counting. Background GC is off
 # on the disk. The namespace filter drops the disk's mount and watermark events and needs a table with a
-# UUID (an `Atomic` or `Replicated` database).
+# UUID (an `Atomic` or `Replicated` database). Publications under a `tmp_` name are not counted: a part is
+# published once under its `tmp_*` name and then moved, so the oracle counts the committed name.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -78,7 +79,7 @@ run_case()
             '$name',
             'delete_tmp_events', countIf(position(ref_name, 'delete_tmp_') > 0),
             'ref_repoint', countIf(event_type = 'ref_repoint'),
-            'extra_manifest_publish', countIf(event_type = 'build_publish' AND NOT has($all_names, ref_name)),
+            'extra_manifest_publish', countIf(event_type = 'build_publish' AND NOT has($all_names, ref_name) AND NOT startsWith(ref_name, 'tmp_')),
             'ref_drop_per_part', countIf(event_type = 'ref_drop' AND has($outdated_names, ref_name)) / $outdated,
             'active_part_ref_drops', countIf(event_type = 'ref_drop' AND ref_name = '$active_name')
         FROM system.cas_log

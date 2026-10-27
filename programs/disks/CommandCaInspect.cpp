@@ -26,6 +26,7 @@ public:
     CommandCaInspect() : ICommand("CommandCaInspect")
     {
         command_name = "cas-inspect";
+        exits_nonzero_on_error = true;
         description = "Decode a content-addressed pool object (by its raw object-storage key) to JSON (read-only).";
         options_description.add_options()("key", po::value<String>(), "the raw object-storage key to decode (mandatory, positional)");
         positional_options_description.add("key", 1);

@@ -254,14 +254,10 @@ public:
     /// hazard — "promote a precommit whose copy did not complete" — has no code
     /// path to occur through: promotion is not a recoverable/resumable operation, only a synchronous
     /// one that either completes within the writing process or never happens at all.
-    /// `allow_repoint` opts into an intended
-    /// repoint of a committed ref that already names a DIFFERENT manifest -- a standalone write/remove
-    /// on an already-committed part (the committed-publish machinery's missing piece; the promote guard's
-    /// own error text already named it: "use republishRef for an intended repoint"). Default `false`
-    /// preserves the existing unique-ref guard byte-for-byte: a committed ref naming a different manifest
-    /// still throws ABORTED. With `true`, the guard is skipped and the old committed binding is retired
-    /// in the SAME ref-log record as the ordinary precommit->committed promotion, plus a
-    /// `CasEventType::RefRepoint` audit event -- every effective repoint is loud by construction.
+    /// `policy` (see `PublishPolicy`) says how a committed ref that already names a DIFFERENT manifest is
+    /// treated. `create()` keeps the unique-ref guard: the promote is refused. `replaceIfCurrent(m)` retires
+    /// the old committed binding in the SAME ref-log record as the ordinary precommit->committed promotion,
+    /// plus a `CasEventType::RefRepoint` audit event -- every effective repoint is loud by construction.
     ///
     /// Returns `created`: whether `final_ref_name` had NO committed row before this call. Derived
     /// INSIDE the `appendRefOps` builder (the same in-closure-output pattern the builder already uses
@@ -270,7 +266,14 @@ public:
     /// (true), a repoint of an existing binding (false), and the idempotent re-promote no-op (false,
     /// since a committed row for this exact manifest already existed). `build_ops` runs at most once,
     /// on the flush leader, so this single evaluation is authoritative.
-    bool promote(const RootNamespace & target_ns, const String & final_ref_name, UInt128 build_id, const ManifestId & id, bool allow_repoint = false);
+    ///
+    /// `replaceIfCurrent` carries the committed manifest the repointing caller resolved before staging:
+    /// the promote fails closed (`CAS_OWNERSHIP_CONFLICT`) unless the committed row still names exactly that
+    /// manifest -- an absent row means the ref was moved or dropped under the writer, a different manifest
+    /// means a concurrent repoint won. Either way the stale writer must re-resolve instead of recreating or
+    /// overwriting the binding.
+    bool promote(const RootNamespace & target_ns, const String & final_ref_name, UInt128 build_id, const ManifestId & id,
+                 PublishPolicy policy = {});
 
     /// Retire the build sequence so the GC watermark floor can advance; staged manifest debris is best-effort
     /// cleaned, with the orphan sweep as the durable backstop.

@@ -128,6 +128,27 @@ struct ManifestRef
     }
 };
 
+/// How a promote treats a ref that is already committed under the destination name.
+///   create():            absent -> bind; the same manifest -> idempotent success; another manifest ->
+///                        refused (write-retry-later: the unique-ref invariant).
+///   replaceIfCurrent(m): the ref must still name `m` (absent or another manifest -> CAS_OWNERSHIP_CONFLICT);
+///                        then it is repointed to the new manifest in the same ref-log record.
+/// A staged manifest is always fresh, so "the same manifest" means the same ManifestRef, not the same
+/// bytes; the byte-equal no-op is `CachedPartFolderAccess::repointRef`'s job.
+struct PublishPolicy
+{
+    /// The manifest the ref must still name for an intended repoint; unset = first-time commit.
+    std::optional<ManifestRef> expected;
+
+    static PublishPolicy create() { return {}; }
+    static PublishPolicy replaceIfCurrent(ManifestRef expected_)
+    {
+        PublishPolicy p;
+        p.expected = std::move(expected_);
+        return p;
+    }
+};
+
 /// The namespace-qualified protocol identity used by GC for source edges, blob deltas, cleanup work,
 /// and addressing. It is the pair `(root_namespace, ManifestRef)`.
 /// Two namespaces may legally carry the same `ManifestRef` tuple without addressing the same object;

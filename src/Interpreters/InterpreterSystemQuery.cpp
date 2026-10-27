@@ -86,7 +86,6 @@
 #include <Storages/StorageQueryRunner.h>
 #include <Storages/StorageProxy.h>
 #include <Storages/StorageReplicatedMergeTree.h>
-#include <Storages/StorageTableProxy.h>
 #include <Storages/StorageURL.h>
 #include <base/coverage.h>
 #include <Common/CoverageCollection.h>
@@ -290,18 +289,6 @@ AccessType getRequiredAccessType(StorageActionBlockType action_type)
 }
 
 constexpr std::string_view table_is_not_replicated = "Table {} is not replicated";
-
-/// A table in a database created with `lazy_load_tables = 1` stays wrapped in a `StorageTableProxy`
-/// until its first access, so a `dynamic_cast` to the real engine (e.g. `StorageReplicatedMergeTree`)
-/// fails and a `SYSTEM` verb that targets one specific named table misreports it as not replicated.
-/// Materialize the proxy before such a cast; generic query paths already materialize on read by
-/// design and must not go through this helper.
-StoragePtr unwrapTableProxy(const StoragePtr & storage)
-{
-    if (const auto * proxy = dynamic_cast<const StorageTableProxy *>(storage.get()))
-        return proxy->getNested();
-    return storage;
-}
 
 }
 
@@ -1513,7 +1500,7 @@ void InterpreterSystemQuery::restoreReplica()
 {
     getContext()->checkAccess(AccessType::SYSTEM_RESTORE_REPLICA, table_id);
 
-    const StoragePtr table_ptr = unwrapTableProxy(DatabaseCatalog::instance().getTable(table_id, getContext()));
+    const StoragePtr table_ptr = DatabaseCatalog::instance().getTable(table_id, getContext());
 
     auto * const table_replicated_ptr = castStorage<StorageReplicatedMergeTree>(table_ptr, DeferredTable::Load).get();
 
@@ -1804,7 +1791,7 @@ void InterpreterSystemQuery::dropReplica(ASTSystemQuery & query)
     if (!table_id.empty())
     {
         getContext()->checkAccess(AccessType::SYSTEM_DROP_REPLICA, table_id);
-        StoragePtr table = unwrapTableProxy(DatabaseCatalog::instance().getTable(table_id, getContext()));
+        StoragePtr table = DatabaseCatalog::instance().getTable(table_id, getContext());
 
         if (!dropStorageReplica(query.replica, table))
             throw Exception(ErrorCodes::BAD_ARGUMENTS, table_is_not_replicated.data(), table_id.getNameForLogs());
@@ -2379,7 +2366,7 @@ void InterpreterSystemQuery::syncReplica(ASTSystemQuery & query)
 void InterpreterSystemQuery::waitLoadingParts()
 {
     getContext()->checkAccess(AccessType::SYSTEM_WAIT_LOADING_PARTS, table_id);
-    StoragePtr table = unwrapTableProxy(DatabaseCatalog::instance().getTable(table_id, getContext()));
+    StoragePtr table = DatabaseCatalog::instance().getTable(table_id, getContext());
 
     if (auto * merge_tree = castStorage<MergeTreeData>(table, DeferredTable::Load).get())
     {
@@ -2915,7 +2902,7 @@ void InterpreterSystemQuery::loadOrUnloadPrimaryKeysImpl(bool load)
     if (!table_id.empty())
     {
         getContext()->checkAccess(load ? AccessType::SYSTEM_LOAD_PRIMARY_KEY : AccessType::SYSTEM_UNLOAD_PRIMARY_KEY, table_id.database_name, table_id.table_name);
-        StoragePtr table = unwrapTableProxy(DatabaseCatalog::instance().getTable(table_id, getContext()));
+        StoragePtr table = DatabaseCatalog::instance().getTable(table_id, getContext());
 
         if (auto * merge_tree = castStorage<MergeTreeData>(table, DeferredTable::Load).get())
         {
@@ -3066,8 +3053,8 @@ void InterpreterSystemQuery::flushDistributed(ASTSystemQuery & query)
     /// reference here (DROP on an Atomic database does not take the exclusive drop_lock,
     /// and the flush does not hold an async-insert lock), so a concurrent DROP could
     /// otherwise destroy the table while flushClusterNodesAllData is still running.
-    auto table = unwrapTableProxy(DatabaseCatalog::instance().getTable(table_id, getContext()));
-    if (auto * storage_distributed = dynamic_cast<StorageDistributed *>(table.get()))
+    auto table = DatabaseCatalog::instance().getTable(table_id, getContext());
+    if (auto * storage_distributed = castStorage<StorageDistributed>(table, DeferredTable::Load).get())
         storage_distributed->flushClusterNodesAllData(getContext(), settings_changes);
     else
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Table {} is not distributed", table_id.getNameForLogs());

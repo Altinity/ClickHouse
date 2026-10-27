@@ -89,7 +89,8 @@ use the corresponding `old_*` and `new_*` key bundles.
 
 ## Generation history {#generation-history}
 
-The format's generation history was reset to a flat `{1, 1}` baseline (`G_BUILD == 1`): CAS is
-pre-release, carries no persisted data, and pays no compatibility cost for starting the count over.
+The generation history starts at a flat `{1, 1}` baseline (reset before 26.6.4, the first release whose
+pools persist). Current generations: `G_BUILD == 2` (the highest a reader accepts), `G_WRITE_FLOOR == 1` (stamped on
+ordinary objects). Only ref-log transactions that carry a `Move` op are stamped 2.
 Every class's `changePoints` begins at generation 1; a future breaking change appends a real entry to
 that class's own array and bumps `G_BUILD`, the same way it always has.

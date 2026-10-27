@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string_view>
 
@@ -10,15 +11,15 @@ namespace DB::Cas
 /// supplies the version gate and the per-object text-file traits used by the codecs in this
 /// directory; it does not own object bytes or storage lifecycle state.
 
-/// The highest pool-format generation this build understands. A build keeps every decoder for
-/// generations 1..G_BUILD (new code always reads old); an object is readable iff its
-/// compatibility_version <= G_BUILD. Bump this (and append a change-point in CasFormat.cpp) when a new
-/// format generation is introduced.
-///
-/// The generation history was reset to this {1, 1} baseline: CAS is pre-release, carries no persisted
-/// data, and so pays no compatibility cost for starting the count over. Every class's `changePoints`
-/// begins at generation 1 until a future change appends a real entry.
-constexpr uint32_t G_BUILD = 1;
+/// The highest pool-format generation this build understands: an object is readable iff its
+/// compatibility_version <= G_BUILD. Readers for every lower generation are kept.
+constexpr uint32_t G_BUILD = 2;
+/// The compatibility version stamped on ordinary objects: they carry no generation-2 construct, so
+/// only a Move-bearing ref log is stamped `G_REF_MOVE`. What gates a generation-1 reader is the pool's
+/// `min_reader_generation`, which a writable mount of this build raises to `G_REF_MOVE` before any Move.
+constexpr uint32_t G_WRITE_FLOOR = 1;
+/// The generation that introduced the committed-owner move in the ref log (`OwnerTransitionShape::Move`).
+constexpr uint32_t G_REF_MOVE = 2;
 
 /// Stable identifiers for every self-describing persisted object class. The text registry uses the
 /// corresponding `type` string as the on-disk identity. Numeric values are part of the format history:
@@ -62,13 +63,21 @@ enum class FormatId : uint16_t
 /// always stamps `G_BUILD`.
 uint32_t currentWriterVersion();
 
-/// Returns the compatibility generation stamped on newly written objects. Until the roster and
-/// write-down-to-floor policy exist, this is always `G_BUILD`; readers reject values above `G_BUILD`.
+/// Returns the compatibility generation stamped on newly written objects: always `G_WRITE_FLOOR`.
+/// Readers reject values above `G_BUILD`.
 uint32_t currentCompatibilityVersion();
 
+/// Unit tests only: lets a generation-2 build act as an older reader by lowering the read ceiling.
+/// `std::nullopt` restores `G_BUILD`.
+void setReadCeilingForTest(std::optional<uint32_t> ceiling);
+
+/// The highest generation this process reads: `G_BUILD`, or the test override.
+uint32_t currentReadCeiling();
+
 /// Applies the common fail-closed reader gate. If an object's `compatibility_version` exceeds
-/// `G_BUILD`, throws `UNKNOWN_FORMAT_VERSION` before the caller interprets the body; `what` identifies
-/// the object in the exception message.
+/// `currentReadCeiling()`, throws `UNKNOWN_FORMAT_VERSION` before the caller interprets the body; `what`
+/// identifies the object in the exception message. The pool's `min_reader_generation` goes through the
+/// same ceiling (`decodePoolMeta`).
 void checkCompatibility(uint32_t compatibility_version, std::string_view what);
 
 /// One append-only entry in a class's format history. At `generation`, the class's ENCODING or the

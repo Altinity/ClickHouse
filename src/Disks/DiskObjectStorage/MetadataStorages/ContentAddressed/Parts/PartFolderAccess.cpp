@@ -1,12 +1,15 @@
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasClock.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Common/DateLUT.h>
+#include <Common/LockMemoryExceptionInThread.h>
 #include <Common/MemoryTracker.h>
 #include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
 #include <base/defines.h>
 #include <base/scope_guard.h>
+#include <Common/scope_guard_safe.h>
 #include <algorithm>
 #include <chrono>
 #include <unordered_set>
@@ -18,6 +21,7 @@ namespace ErrorCodes
     extern const int FILE_DOESNT_EXIST;
     extern const int ABORTED;
     extern const int LOGICAL_ERROR;
+    extern const int NETWORK_ERROR;
 }
 }
 
@@ -30,6 +34,7 @@ namespace ProfileEvents
     extern const Event CASPartFolderViewInvalidations;
     extern const Event CASRefRollbackBestEffortDropFailed;
     extern const Event CASRefRepoint;
+    extern const Event CASRefMove;
 }
 
 namespace CurrentMetrics
@@ -295,8 +300,7 @@ bool CachedPartFolderAccess::existsRef(const PartRefKey & key, Freshness freshne
 }
 
 Cas::CommitOutcome CachedPartFolderAccess::promoteBuild(Cas::PartWriteTxn & build, const PartRefKey & key, UInt128 build_id,
-                                          const Cas::ManifestId & manifest_id, bool allow_repoint,
-                                          bool * commit_recorded)
+                                          const Cas::ManifestId & manifest_id, Cas::PublishPolicy policy, bool * commit_recorded)
 {
     /// `build.promote` derives `created` INSIDE its own `appendRefOps` builder (the same in-closure
     /// pattern as that builder's `repoint_old`) and returns it the instant the append confirms.
@@ -310,7 +314,7 @@ Cas::CommitOutcome CachedPartFolderAccess::promoteBuild(Cas::PartWriteTxn & buil
     /// the build and, one layer up again, reports a byte fallback for a relink that already published.
     Cas::CommitOutcome outcome{key.ns, key.ref, manifest_id.ref, /*created=*/false};
 
-    const bool created = build.promote(key.ns, key.ref, build_id, manifest_id, allow_repoint);
+    const bool created = build.promote(key.ns, key.ref, build_id, manifest_id, std::move(policy));
 
     /// POST-DURABLE REGION. Two plain stores, no allocation, no call that can fail.
     {
@@ -332,6 +336,7 @@ Cas::CommitOutcome CachedPartFolderAccess::promoteBuild(Cas::PartWriteTxn & buil
 
 namespace
 {
+
 
 /// A failed publish must not leak a live-epoch precommit binding: only `abandon` removes it (the build
 /// destructor merely retires the build seq; the stale-precommit sweep is prior-epoch-scoped and GC
@@ -391,7 +396,7 @@ bool PreparedPartWrite::commitIsUnresolved() const
     return build && build->commitState() == Cas::PartWriteTxn::CommitState::Uncertain;
 }
 
-Cas::CommitOutcome PreparedPartWrite::promote(bool allow_repoint)
+Cas::CommitOutcome PreparedPartWrite::promote(Cas::PublishPolicy policy)
 {
     if (terminal)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
@@ -405,7 +410,7 @@ Cas::CommitOutcome PreparedPartWrite::promote(bool allow_repoint)
         /// the outcome assembly and the cache invalidation that follow the append can throw, and a
         /// handle that had not yet recorded the commit would then take the catch below and abandon a
         /// build whose ref is already published.
-        return owner->promoteBuild(*build, key, build->buildId(), id, allow_repoint, &terminal);
+        return owner->promoteBuild(*build, key, build->buildId(), id, std::move(policy), &terminal);
     }
     catch (...)
     {
@@ -465,47 +470,197 @@ PreparedPartWrite CachedPartFolderAccess::prepareEntries(const PartRefKey & dst,
 }
 
 Cas::CommitOutcome CachedPartFolderAccess::publishEntries(const PartRefKey & dst,
-    const std::vector<Cas::ManifestEntry> & entries, Cas::ProvenanceOp op, bool allow_repoint)
+    const std::vector<Cas::ManifestEntry> & entries, Cas::ProvenanceOp op, Cas::PublishPolicy policy)
 {
     /// The atomic form: prepare and promote back to back, with no window in between. `promote` carries
     /// the catch-abandon-rethrow discipline, so a failure here behaves exactly as it did when this was
     /// one function.
     PreparedPartWrite prepared = prepareEntries(dst, entries, op);
-    return prepared.promote(allow_repoint);
+    return prepared.promote(std::move(policy));
 }
 
 bool CachedPartFolderAccess::republishRef(const PartRefKey & src, const PartRefKey & dst)
 {
     /// Content addressing has no rename, so move a committed ref by reading the source manifest
     /// through the pool's manifest cache after a fresh ref resolve, publishing equivalent entries at
-    /// the destination, and then dropping the source. The source blobs are adopted by evidence of the
+    /// the destination, and then removing the source. The source blobs are adopted by evidence of the
     /// live source edge, never re-probed; the decode is never taken from a retained view.
     auto resolved = store->resolveRef(src.ns, src.ref);
     if (!resolved)
         return false;
+    const Cas::ManifestRef src_manifest_ref = resolved->manifest_id.ref;
     const auto src_manifest = store->readManifestShared(resolved->manifest_id);
+
+    const auto drop_source_or_abort = [&](const std::optional<Cas::CommitOutcome> & created_dst)
+    {
+        runHookForTest(TestHook::BeforeSourceDrop);
+        /// The source is removed only while it still names the manifest we republished.
+        const Removal outcome = dropRefExact(src, src_manifest_ref);
+        if (outcome == Removal::Removed)
+            return;
+        /// Absent: the only writer that removes a part under rename is an identical concurrent rename
+        /// (a queue re-drive) that saw our byte-equal destination and finished the move; MergeTree holds
+        /// a part being renamed, so an independent removal cannot race here. Treat it as completed and
+        /// never compensate — that would delete the other rename's result.
+        if (outcome == Removal::Gone)
+            return;
+        /// Mismatch: another writer repointed the source, so a content-equal destination is stale,
+        /// whoever created it. Drop it by exact manifest (a destination holding anything else is never
+        /// touched) and report the conflict.
+        if (created_dst && created_dst->created)
+            dropRefIfMatches(dst, created_dst->manifest_ref);
+        throwCasOwnershipConflict("republishRef: source '{}' was repointed concurrently while being renamed to '{}'; the part must be re-resolved",
+            src.ns.string() + "/" + src.ref, dst.ns.string() + "/" + dst.ref);
+    };
 
     /// If `dst` is already committed, a previous attempt may have completed its promote before the
     /// source drop. Compare content rather than the whole manifest, whose ref/namespace/digest
-    /// legitimately differ: equal content completes the move by dropping `src`; different content
+    /// legitimately differ: equal content completes the move by removing `src`; different content
     /// is a conflict and leaves the source intact.
     if (auto dst_resolved = store->resolveRef(dst.ns, dst.ref))
     {
         const auto dst_manifest = store->readManifestShared(dst_resolved->manifest_id);
         if (dst_manifest->entries != src_manifest->entries)
-            throw Exception(ErrorCodes::ABORTED,
-                "republishRef: destination '{}' is already committed with different content — refusing "
+            throwCasOwnershipConflict("republishRef: destination '{}' is already committed with different content — refusing "
                 "(rename/attach conflict)", dst.ns.string() + "/" + dst.ref);
-        dropRef(src);
+        drop_source_or_abort(Cas::CommitOutcome{dst.ns, dst.ref, dst_resolved->manifest_id.ref, /*created=*/true});
         return true;
     }
 
-    publishEntries(dst, src_manifest->entries, Cas::ProvenanceOp::Other);
-    dropRef(src);
+    runHookForTest(TestHook::BeforeDestinationPublish);
+
+    std::optional<Cas::CommitOutcome> oc;
+    try
+    {
+        oc = publishEntries(dst, src_manifest->entries, Cas::ProvenanceOp::Other);
+    }
+    catch (const Exception & e)
+    {
+        /// `throwCasWriteRetryLater` raises `NETWORK_ERROR` for many causes, so the code alone is not
+        /// the filter; the equality check below is. Completion requires `dst` to exist with entries equal
+        /// to the source manifest, which holds in exactly two cases: our promote landed but its response
+        /// was lost, or an identical concurrent rename promoted its content-equal manifest first and our
+        /// promote refused. Absent `dst` rethrows the original exception; `dst` with other content is an
+        /// ownership conflict, like the pre-publish check.
+        if (e.code() != ErrorCodes::NETWORK_ERROR)
+            throw;
+        const auto dst_resolved = store->resolveRef(dst.ns, dst.ref);
+        if (!dst_resolved)
+            throw;
+        if (store->readManifestShared(dst_resolved->manifest_id)->entries != src_manifest->entries)
+            throwCasOwnershipConflict("republishRef: destination '{}' is already committed with different content — refusing "
+                "(rename/attach conflict)", dst.ns.string() + "/" + dst.ref);
+        drop_source_or_abort(Cas::CommitOutcome{dst.ns, dst.ref, dst_resolved->manifest_id.ref, /*created=*/true});
+        return true;
+    }
+    drop_source_or_abort(oc);
     return true;
 }
 
-Cas::CommitOutcome CachedPartFolderAccess::repointRef(const PartRefKey & key, std::vector<Cas::ManifestEntry> entries, Cas::ProvenanceOp op)
+std::optional<Cas::ManifestRef> CachedPartFolderAccess::renameCommittedRef(
+    const PartRefKey & src, const PartRefKey & dst, const std::optional<Cas::ManifestRef> & expected)
+{
+    const auto resolved = resolve(src, Freshness::ForceFresh);
+    if (!resolved)
+        return std::nullopt;
+    if (expected && !(resolved->manifest_id.ref == *expected))
+        Cas::throwCasOwnershipConflict("renameCommittedRef: source '{}' names another manifest than the one this rename read; "
+            "the part must be re-resolved", src.ns.string() + "/" + src.ref);
+    /// A writable mount always admits owner moves (`Pool::open` raises the reader floor first), so inside
+    /// one namespace the only reason to republish is a committed destination: an earlier attempt published
+    /// it by republication and crashed before dropping the source. `republishRef` completes that re-drive
+    /// when the content is equal and conflicts when it differs.
+    if (src.ns.string() == dst.ns.string() && !existsRef(dst, Freshness::ForceFresh))
+    {
+        moveRefExact(src, dst, resolved->manifest_id.ref);
+        return resolved->manifest_id.ref;   /// a Move keeps the manifest
+    }
+    if (!republishRef(src, dst))
+        return std::nullopt;
+    const auto renamed = resolve(dst, Freshness::ForceFresh);
+    if (!renamed)
+        return std::nullopt;
+    return renamed->manifest_id.ref;
+}
+
+bool CachedPartFolderAccess::moveRefExact(const PartRefKey & src, const PartRefKey & dst, const Cas::ManifestRef & expected)
+{
+    /// `renameCommittedRef` routes a cross-namespace rename to `republishRef`, and a writable mount always
+    /// admits owner moves; both checks stay in release builds because a wrong Move is a format-level write.
+    if (src.ns.string() != dst.ns.string())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "moveRefExact: '{}' and '{}' are in different namespaces", src.ns.string(), dst.ns.string());
+    if (!store->refMoveAllowed())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "moveRefExact: owner move requested while the pool floor forbids it");
+    runHookForTest(TestHook::BeforeMoveAppend);
+    bool moved = false;
+    /// Erased on every exit: an append that throws after landing must not leave a stale `src` view.
+    /// The guard allocates, so a memory-limit exception inside it must not terminate.
+    SCOPE_EXIT_MEMORY_SAFE({
+        eraseView(src);
+        eraseView(dst);
+    });
+    /// Two names in one operation: the scope names both so unrelated refs may still co-batch and be confirmed.
+    /// No completion check after a retry-later failure: the ledger's own resolve-before-reissue read already
+    /// proves a landed write that is readable, and an unreadable one wedges the lane until a later append
+    /// settles it — nothing this call could read would say more than the ledger did.
+    const RefTxnId txn_id = store->appendRefOps(src.ns, MutationScope::refs(src.ref, dst.ref),
+        [&](const RefTableState & state) -> std::vector<RefOp>
+        {
+            moved = false;
+            const auto & committed = state.getCommitted();
+            const auto s = committed.find(src.ref);
+            const auto d = committed.find(dst.ref);
+            if (s == committed.end() && d != committed.end() && d->second.manifest_ref == expected)
+                return {};   /// already moved by an earlier attempt
+            if (d != committed.end())
+            {
+                /// One manifest has one committed owner (`owned_manifests`); two rows naming `expected` is a broken table.
+                if (s != committed.end() && s->second.manifest_ref == expected && d->second.manifest_ref == expected)
+                    throw Exception(ErrorCodes::CORRUPTED_DATA,
+                        "moveRefExact: '{}' and '{}' both name manifest {}", src.ns.string() + "/" + src.ref,
+                        dst.ns.string() + "/" + dst.ref, Cas::manifestRefDebugString(expected));
+                throwCasOwnershipConflict("moveRefExact: destination '{}' is already committed with different content (rename/attach conflict)",
+                    dst.ns.string() + "/" + dst.ref);
+            }
+            /// Precommits are keyed by (ref_name, manifest_ref): any live precommit under the destination
+            /// name is another build about to claim it, an ordinary race and not corruption.
+            if (state.hasLivePrecommitFor(dst.ref))
+                throwCasOwnershipConflict("moveRefExact: destination '{}' has a live precommit", dst.ns.string() + "/" + dst.ref);
+            if (s == committed.end() || !(s->second.manifest_ref == expected))
+                throwCasOwnershipConflict("moveRefExact: source '{}' changed concurrently ({}); the part must be re-resolved",
+                    src.ns.string() + "/" + src.ref, s == committed.end() ? "it is gone" : "it names another manifest now");
+            moved = true;
+            RefOp op;
+            op.kind = RefOpKind::OwnerTransition;
+            op.old_binding = RefOwnerBinding{RefOwnerKind::Committed, src.ref, expected};
+            op.new_binding = RefOwnerBinding{RefOwnerKind::Committed, dst.ref, expected};
+            /// The part's modification time follows the rename, as on a local disk, so detached/moving
+            /// aging and temporary-directory cleanup see the rename time.
+            return {op, makeSetPublishedAtOp(dst.ref, expected, Cas::nowMs())};
+        },
+        RootMutationOrigin::Writer, RootMutationKind::Move);
+    if (!moved)
+        return false;
+    ProfileEvents::increment(ProfileEvents::CASRefMove);
+    emitAuditBestEffort("moveRefExact: audit event failed after the move landed", [&]
+    {
+        Cas::CasEvent ev;
+        ev.type = Cas::CasEventType::RefMove;
+        ev.namespace_ = src.ns.string();
+        ev.ref_name = src.ref;
+        ev.object_kind = Cas::CasEventObjectKind::Manifest;
+        ev.object_hash = Cas::manifestRefDebugString(expected);
+        ev.at_version = txn_id.ref_sequence;
+        ev.outcome = "ok";
+        ev.reason = "committed part renamed by one owner move; the manifest is unchanged";
+        ev.detail["dst_ref"] = dst.ref;
+        return ev;
+    });
+    return true;
+}
+
+Cas::CommitOutcome CachedPartFolderAccess::repointRef(const PartRefKey & key, std::vector<Cas::ManifestEntry> entries, Cas::ProvenanceOp op,
+    const Cas::ManifestRef & expected)
 {
     /// Compare the candidate `entries` against the currently committed manifest's
     /// decoded entries. This must NOT stage a candidate manifest first: `stageManifest` mints a
@@ -525,41 +680,28 @@ Cas::CommitOutcome CachedPartFolderAccess::repointRef(const PartRefKey & key, st
     /// round-trip before comparing regardless — this is the same content comparison used by `republishRef`,
     /// which is symmetric for the same reason (both sides there are already decoded).
     auto resolved = resolve(key, Freshness::ForceFresh);
-    if (resolved)
-    {
-        const auto committed_manifest = store->readManifestShared(resolved->manifest_id);
-        Cas::PartManifest probe;
-        probe.ref = committed_manifest->ref;
-        probe.root_namespace_id = committed_manifest->root_namespace_id;
-        probe.entries = entries;
-        probe.payload_digest = Cas::computePayloadDigest(probe);
-        const Cas::PartManifest canonical_candidate = Cas::decodePartManifest(Cas::encodePartManifest(probe));
-        if (committed_manifest->entries == canonical_candidate.entries)
-            /// ZERO pool mutations: the outcome describes the manifest ALREADY committed, unchanged.
-            return Cas::CommitOutcome{key.ns, key.ref, resolved->manifest_id.ref, /*created=*/false};
-    }
+    if (!resolved || !(resolved->manifest_id.ref == expected))
+        throwCasOwnershipConflict("committed part '{}/{}' moved or dropped while its rewrite was staged", key.ns.string(), key.ref);
+    const auto committed_manifest = store->readManifestShared(resolved->manifest_id);
+    Cas::PartManifest probe;
+    probe.ref = committed_manifest->ref;
+    probe.root_namespace_id = committed_manifest->root_namespace_id;
+    probe.entries = entries;
+    probe.payload_digest = Cas::computePayloadDigest(probe);
+    const Cas::PartManifest canonical_candidate = Cas::decodePartManifest(Cas::encodePartManifest(probe));
+    if (committed_manifest->entries == canonical_candidate.entries)
+        /// ZERO pool mutations: the outcome describes the manifest ALREADY committed, unchanged.
+        return Cas::CommitOutcome{key.ns, key.ref, resolved->manifest_id.ref, /*created=*/false};
     /// `publishEntries` takes `entries` by const reference, so the caller-owned vector remains valid.
     /// Capture the exact outcome IMMEDIATELY -- before the ProfileEvent/logging below -- so it is
     /// published ahead of any further (even if non-throwing in practice) post-commit work.
-    const Cas::CommitOutcome oc = publishEntries(key, entries, op, /*allow_repoint=*/true);
+    const Cas::CommitOutcome oc = publishEntries(key, entries, op, Cas::PublishPolicy::replaceIfCurrent(expected));
     ProfileEvents::increment(ProfileEvents::CASRefRepoint);
-    if (resolved)
-    {
-        /// Repoint is the normal mechanism for effective standalone writes/removes on committed parts,
-        /// so this routine event is logged at debug level while the counter remains an operator-facing signal.
-        LOG_DEBUG(getLogger("CachedPartFolderAccess"),
-            "Repointed committed ref {}/{} ({} entries) — standalone write/remove on a committed part",
-            key.ns.string(), key.ref, entries.size());
-    }
-    else
-    {
-        /// A repoint normally targets an existing ref. Keep an unexpected create-shaped call visible
-        /// at warning level rather than silently treating it as ordinary publication.
-        LOG_WARNING(getLogger("CachedPartFolderAccess"),
-            "repointRef published {}/{} ({} entries) with no prior committed ref to repoint — "
-            "unexpected call shape (repointRef requires an existing committed ref)",
-            key.ns.string(), key.ref, entries.size());
-    }
+    /// Repoint is the normal mechanism for effective standalone writes/removes on committed parts,
+    /// so this routine event is logged at debug level while the counter remains an operator-facing signal.
+    LOG_DEBUG(getLogger("CachedPartFolderAccess"),
+        "Repointed committed ref {}/{} ({} entries) — standalone write/remove on a committed part",
+        key.ns.string(), key.ref, entries.size());
     return oc;
 }
 
@@ -605,6 +747,7 @@ void CachedPartFolderAccess::dropRefBestEffort(const PartRefKey & key) noexcept
     {
         /// Best-effort destructor/rollback cleanup: debris is GC-reclaimed, but swallowing the
         /// exception without a diagnostic could leave a live phantom ref after a backend outage.
+        LockMemoryExceptionInThread lock_memory_tracker(VariableContext::Global);
         ProfileEvents::increment(ProfileEvents::CASRefRollbackBestEffortDropFailed);
         tryLogCurrentException(getLogger("CachedPartFolderAccess"),
             fmt::format("CA best-effort rollback dropRef failed (ns={} ref={}); the ref may remain live",
@@ -617,38 +760,57 @@ void CachedPartFolderAccess::dropRefBestEffort(const PartRefKey & key) noexcept
 
 bool CachedPartFolderAccess::dropRefIfMatches(const PartRefKey & key, const Cas::ManifestRef & expected) noexcept
 {
-    /// One `appendRefOps` builder does both the read and the conditional removal, mirroring
-    /// `CasRefLedger::dropRef`'s own protocol shape (read the committed binding, emit ONE
-    /// `OwnerTransition` removal op) but with the removal guarded on `expected` inside the SAME
-    /// closure -- the leader-thread read of `state.getCommitted()` is the authoritative committed
-    /// binding at append time, so this is race-free the same way `PartWriteTxn::promote`'s
-    /// `repoint_old`/idempotent-guard reads are: `build_ops` runs at most once, on the flush leader,
-    /// against the batch-validated state. A mismatch (repointed since `expected` was observed, or
-    /// already absent) returns an empty op list -- a legitimate no-op, not an error, exactly like
-    /// `promote`'s own idempotent-redrive branch.
-    bool removed = false;
     try
     {
-        const RefTxnId txn_id = store->appendRefOps(key.ns, MutationScope::ref(key.ref),
-            [&](const RefTableState & state) -> std::vector<RefOp>
+        return dropRefExact(key, expected) == Removal::Removed;
+    }
+    catch (...)
+    {
+        /// Best-effort rollback cleanup, like dropRefBestEffort: debris is GC-reclaimed, but swallowing
+        /// without a diagnostic could leave a live phantom ref after a backend outage. A rollback often
+        /// runs because of a memory limit, and the diagnostic below allocates.
+        LockMemoryExceptionInThread lock_memory_tracker(VariableContext::Global);
+        ProfileEvents::increment(ProfileEvents::CASRefRollbackBestEffortDropFailed);
+        tryLogCurrentException(getLogger("CachedPartFolderAccess"),
+            fmt::format("CA conditional rollback dropRefIfMatches failed (ns={} ref={} expected={}); "
+                        "the ref may remain live", key.ns.string(), key.ref, Cas::manifestRefDebugString(expected)));
+        return false;
+    }
+}
+
+Removal CachedPartFolderAccess::dropRefExact(const PartRefKey & key, const Cas::ManifestRef & expected)
+{
+    /// One `appendRefOps` builder does both the read and the conditional removal, mirroring
+    /// `CasRefLedger::dropRef`'s protocol shape (read the committed binding, emit ONE `OwnerTransition`
+    /// removal op) with the removal guarded on `expected` inside the SAME closure: the leader-thread read
+    /// of `state.getCommitted()` is the authoritative committed binding at append time, so a concurrent
+    /// repoint cannot slip between the check and the op.
+    Removal outcome = Removal::Gone;
+    /// Erased on every exit: an append that throws after landing must not leave a stale view.
+    SCOPE_EXIT_MEMORY_SAFE(eraseView(key));
+    const RefTxnId txn_id = store->appendRefOps(key.ns, MutationScope::ref(key.ref),
+        [&](const RefTableState & state) -> std::vector<RefOp>
+        {
+            const auto it = state.getCommitted().find(key.ref);
+            if (it == state.getCommitted().end())
             {
-                const auto it = state.getCommitted().find(key.ref);
-                if (it == state.getCommitted().end() || !(it->second.manifest_ref == expected))
-                    return {};   /// absent, or repointed away from `expected` -- leave it alone
-
-                removed = true;
-                RefOp op;
-                op.kind = RefOpKind::OwnerTransition;
-                op.old_binding = RefOwnerBinding{RefOwnerKind::Committed, key.ref, expected};
-                return {op};
-            },
-            RootMutationOrigin::Writer, RootMutationKind::Drop);
-
-        /// Audit a successful conditional removal exactly like `CasRefLedger::dropRef` audits its own
-        /// unconditional one -- otherwise a rollback drop (this method's only caller, as of Task 3)
-        /// would be invisible in `system.cas_log`. Byte-neutral to the ref-log: this is
-        /// an audit event only, emitted after the removal is already durable.
-        if (removed && store->hasEventSink())
+                outcome = Removal::Gone;
+                return {};
+            }
+            if (!(it->second.manifest_ref == expected))
+            {
+                outcome = Removal::Mismatch;
+                return {};
+            }
+            outcome = Removal::Removed;
+            RefOp op;
+            op.kind = RefOpKind::OwnerTransition;
+            op.old_binding = RefOwnerBinding{RefOwnerKind::Committed, key.ref, expected};
+            return {op};
+        },
+        RootMutationOrigin::Writer, RootMutationKind::Drop);
+    if (outcome == Removal::Removed)
+        emitAuditBestEffort("dropRefExact: audit event failed after the drop landed", [&]
         {
             Cas::CasEvent ev;
             ev.type = Cas::CasEventType::RefDrop;
@@ -658,24 +820,10 @@ bool CachedPartFolderAccess::dropRefIfMatches(const PartRefKey & key, const Cas:
             ev.object_hash = Cas::manifestRefDebugString(expected);
             ev.at_version = txn_id.ref_sequence;
             ev.outcome = "ok";
-            ev.reason = "dropRefIfMatches: conditional rollback removed the exact manifest this caller committed";
-            store->emitEvent(std::move(ev));
-        }
-    }
-    catch (...)
-    {
-        /// Best-effort rollback cleanup, like dropRefBestEffort: debris is GC-reclaimed, but swallowing
-        /// without a diagnostic could leave a live phantom ref after a backend outage.
-        removed = false;
-        ProfileEvents::increment(ProfileEvents::CASRefRollbackBestEffortDropFailed);
-        tryLogCurrentException(getLogger("CachedPartFolderAccess"),
-            fmt::format("CA conditional rollback dropRefIfMatches failed (ns={} ref={} expected={}); "
-                        "the ref may remain live", key.ns.string(), key.ref, Cas::manifestRefDebugString(expected)));
-    }
-    /// The read above is authoritative fresh state regardless of outcome, so any locally retained view
-    /// is invalidated unconditionally -- cheap and conservative, matching dropRefBestEffort.
-    eraseView(key);
-    return removed;
+            ev.reason = "dropRefExact: committed ref removed while it still named the expected manifest";
+            return ev;
+        });
+    return outcome;
 }
 
 void CachedPartFolderAccess::dropNamespace(const Cas::RootNamespace & ns)

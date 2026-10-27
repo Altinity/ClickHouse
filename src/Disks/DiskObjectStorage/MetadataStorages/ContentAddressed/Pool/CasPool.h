@@ -752,6 +752,7 @@ public:
     /// Internal surface for PartWriteTxn (same TU family; not for the wiring):
     const PoolConfig & poolConfig() const { return config; }
     const PoolMeta & poolMeta() const { return meta; }
+    bool refMoveAllowed() const { return meta.min_reader_generation >= G_REF_MOVE; }
     const Layout & layout() const { return pool_layout; }
 
     /// ---- the three request planes ----
@@ -1221,8 +1222,8 @@ private:
 
     /// CAS mixed-algo pools: monotone in-memory cache of `algos_used`, seeded from
     /// `meta.algos_used` at open. Guards `isAlgoAdmitted`/`refreshAdmittedAlgos` -- ITS OWN mutex,
-    /// not `meta`'s (there is no other mutable access to `meta` post-open; this avoids taking a
-    /// wider lock than the cache needs). Kept sorted (a plain vector; membership is a handful of
+    /// not `meta`'s (`Pool::open` writes `meta.min_reader_generation` once more, before any caller holds the
+    /// pool; nothing else mutates `meta` post-open, so this avoids taking a wider lock than the cache needs). Kept sorted (a plain vector; membership is a handful of
     /// entries, no need for a set).
     mutable std::mutex admitted_algos_mutex;
     std::vector<uint8_t> admitted_algos;

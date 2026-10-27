@@ -110,7 +110,7 @@ MultipleDisksObjectStorageTransaction::MultipleDisksObjectStorageTransaction(
 
 void DiskObjectStorageTransaction::addOperation(std::function<void(MetadataTransactionPtr tx)> op)
 {
-    if (metadata_storage->appliesOperationsEagerly() || metadata_storage->transactionIsStagingOverlay())
+    if (metadata_storage->appliesOperationsEagerly())
         op(metadata_transaction);
     else
         operations_to_execute.push_back(std::move(op));
@@ -291,7 +291,7 @@ std::unique_ptr<WriteBufferFromFileBase> DiskObjectStorageTransaction::writeFile
 
     WriteSettings enriched_settings = updateIOSchedulingSettings(settings, read_resource_name, write_resource_name);
 
-    /// [TXN-ONE-PIPELINE] Give the metadata storage a chance to own the write (e.g. a content-addressed
+    /// Give the metadata storage a chance to own the write (e.g. a content-addressed
     /// hash-on-write buffer whose blob key is known only after the last byte). It returns a fully-wrapped
     /// buffer (hash-on-write + append RMW + inline/blob split + autocommit/lifetime pin using `owner`), or
     /// nullptr to fall through to the generic up-front-key streaming path below. Called BEFORE the append
@@ -468,9 +468,7 @@ void DiskObjectStorageTransaction::writeFileUsingBlobWritingFunction(
     /// We always use mode Rewrite because we simulate append using metadata and different files
     object.bytes_size = std::move(write_blob_function)(blob_path, WriteMode::Rewrite, /*object_attributes=*/std::nullopt);
 
-    /// [TXN-ONE-PIPELINE] Routed through addOperation for uniformity. Unreachable on CA (Audit 6):
-    /// generateObjectKeyForPath above throws NOT_IMPLEMENTED first, so CA never reaches this metadata
-    /// effect and never queues. On ordinary storage addOperation queues exactly as before.
+    /// Unreachable on a content-addressed storage: generateObjectKeyForPath above throws NOT_IMPLEMENTED first.
     addOperation([object, mode](MetadataTransactionPtr tx)
     {
         if (mode == WriteMode::Rewrite)
@@ -492,7 +490,7 @@ void DiskObjectStorageTransaction::createHardLink(const std::string & src_path, 
     /// For CA `addOperation` runs eagerly (call-time), which is load-bearing for read-your-writes: a
     /// carried-forward projection hardlinked into the open whole-part transaction during a mutation must
     /// be visible to `loadProjections` (same finalize, before commit) via the directory overlay. Deferring
-    /// it to commit replay would hide it until after `loadProjections` ran (B58/B63). The metadata-level
+    /// it to commit replay would hide it until after `loadProjections` ran. The metadata-level
     /// `createHardLink` is an idempotent map assignment, so eager staging is equivalent to the queued
     /// replay — commit publishes the manifest from the staging.
     addOperation([src_path, dst_path](MetadataTransactionPtr tx)
@@ -643,10 +641,7 @@ void DiskObjectStorageTransaction::copyFileImpl(
         return;
     }
 
-    /// [TXN-ONE-PIPELINE] Routed through addOperation for uniformity. Unreachable on CA (Audit 6):
-    /// copyFileImpl calls generateObjectKeyForPath above, which throws NOT_IMPLEMENTED on CA before this
-    /// point (and the empty-source case returns via the real writeFile above), so CA never queues here.
-    /// On ordinary storage addOperation queues exactly as before.
+    /// Unreachable on a content-addressed storage: copyFileImpl's generateObjectKeyForPath throws NOT_IMPLEMENTED first.
     addOperation([blobs_to_create, missing_locations, to_file_path](MetadataTransactionPtr tx)
     {
         for (const auto & blob : blobs_to_create)
@@ -668,13 +663,13 @@ void MultipleDisksObjectStorageTransaction::copyFile(const std::string & from_fi
 
 void DiskObjectStorageTransaction::commit()
 {
-    /// [TXN-ONE-PIPELINE] An eager staging-overlay transaction (e.g. CA) must route every mutating method
-    /// straight to the metadata transaction at call time and keep this queue empty. A non-empty queue here
-    /// means a mutating method bypassed `addOperation` — which would re-introduce the two-timeline split this
-    /// design eliminates. Fail closed with a real throw (NOT chassert, which is a no-op in release builds).
-    if (metadata_storage->transactionIsStagingOverlay() && !operations_to_execute.empty())
+    /// An eager transaction (memory, CA) routes every mutating method to the metadata transaction at call
+    /// time and keeps this queue empty. A non-empty queue here means a mutating method bypassed
+    /// `addOperation`, which would split the transaction into two timelines. Fail closed with a real throw
+    /// (the chassert below is a no-op in release builds).
+    if (metadata_storage->appliesOperationsEagerly() && !operations_to_execute.empty())
         throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "An eager staging-overlay transaction must not queue deferred operations "
+            "An eager transaction must not queue deferred operations "
             "(a mutating method bypassed addOperation): {} queued", operations_to_execute.size());
 
     auto component_guard = Coordination::setCurrentComponent("DiskObjectStorageTransaction::commit");
@@ -722,11 +717,10 @@ void DiskObjectStorageTransaction::commit()
 
 TransactionCommitOutcomeVariant DiskObjectStorageTransaction::tryCommit(const TransactionCommitOptionsVariant & options)
 {
-    /// [TXN-ONE-PIPELINE] See commit(): an eager staging-overlay transaction must never queue deferred
-    /// operations. Fail closed (real throw, not chassert) if a mutating method bypassed `addOperation`.
-    if (metadata_storage->transactionIsStagingOverlay() && !operations_to_execute.empty())
+    /// See commit(): an eager transaction must never queue deferred operations.
+    if (metadata_storage->appliesOperationsEagerly() && !operations_to_execute.empty())
         throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "An eager staging-overlay transaction must not queue deferred operations "
+            "An eager transaction must not queue deferred operations "
             "(a mutating method bypassed addOperation): {} queued", operations_to_execute.size());
 
     chassert(operations_to_execute.empty() || !metadata_storage->appliesOperationsEagerly());

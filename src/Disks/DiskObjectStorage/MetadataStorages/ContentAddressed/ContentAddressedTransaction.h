@@ -137,6 +137,11 @@ private:
         /// Created lazily when a staged blob, inline entry, or adopted entry first needs publication.
         Cas::PartWriteTxnPtr build;
         std::vector<Cas::ManifestEntry> entries;   /// staged manifest entries (uploads + adoptions)
+        /// The committed manifest this transaction found under the part's name when it first staged a
+        /// write to it; a later commit requires exactly that binding. Empty for a part the transaction
+        /// creates (`tmp_*`), where a committed row at commit time is somebody else's part, not ours,
+        /// and for a staged re-key destination, which has no base by design.
+        std::optional<Cas::ManifestRef> base_manifest_ref;
         /// Paths removed from a committed part's manifest by this transaction. Publication carries
         /// forward all other committed entries. If `removeDirectory` drops the whole ref in the same
         /// transaction, that ref-drop supersedes these marks and clears them.

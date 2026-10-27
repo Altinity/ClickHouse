@@ -1934,7 +1934,7 @@ TEST(CASPartWriteTxn, PromoteSucceedsWhenPrecommitIsLiveOwner)
 /// all-tree-part-files Task 2 (TLA+ `WRepoint`):
 /// `promote`'s existing unique-ref guard (BUG 1a) refuses to overwrite a committed ref naming a
 /// DIFFERENT manifest -- correct for an ACCIDENTAL double-publish, but there is no way to perform an
-/// INTENDED repoint (a standalone write/remove on an already-committed part) without it. `allow_repoint`
+/// INTENDED repoint (a standalone write/remove on an already-committed part) without it. `PublishPolicy::replace`
 /// opts into exactly that: the guard's throw is skipped, and the committed-transition RefOp (old =
 /// the currently-committed manifest, new = the incoming one) is appended in the SAME ref-log record as
 /// the ordinary precommit->committed promotion -- the C++ realization of `WRepoint`'s one-event
@@ -1966,7 +1966,7 @@ TEST(CASPartWriteTxnRepoint, PromoteRepointsCommittedRef)
     build2->putBlob(idOf("m2"), BlobSource::fromString("m2"));
     build2->putBlob(idOf("m2x"), BlobSource::fromString("m2x"));
 
-    /// allow_repoint = false (the default) -> NETWORK_ERROR (CAS write-retry-later), existing invariant
+    /// PublishPolicy::create (the default) -> NETWORK_ERROR (CAS write-retry-later), existing invariant
     /// untouched; M1 still resolves.
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR,
         [&] { build2->promote(ns, "part_1", build2->buildId(), m2_id); });
@@ -1978,7 +1978,7 @@ TEST(CASPartWriteTxnRepoint, PromoteRepointsCommittedRef)
     {
         events->push(e);
     });
-    EXPECT_NO_THROW(build2->promote(ns, "part_1", build2->buildId(), m2_id, /*allow_repoint=*/true));
+    EXPECT_NO_THROW(build2->promote(ns, "part_1", build2->buildId(), m2_id, PublishPolicy::replaceIfCurrent(m1_id.ref)));
     auto resolved = s->resolveRef(ns, "part_1");
     ASSERT_TRUE(resolved);
     EXPECT_EQ(resolved->manifest_id.ref, m2_id.ref);

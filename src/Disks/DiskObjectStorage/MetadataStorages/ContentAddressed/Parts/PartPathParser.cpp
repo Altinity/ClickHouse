@@ -190,9 +190,8 @@ static std::optional<PartDirAnchor> findPartDirComponent(const std::vector<std::
         const size_t part_idx = *uuid_idx + 1;
         if (part_idx < p.size())
         {
-            // The reserved deduplication-log directory is a table-level subdir, not a part dir
-            // (see kDeduplicationLogsDirName).
-            if (p[part_idx] == kDeduplicationLogsDirName)
+            // A reserved directory is a table-level subdir, not a part dir (see isReservedTableSubdir).
+            if (isReservedTableSubdir(p[part_idx]))
                 return std::nullopt;
             return PartDirAnchor{*uuid_idx, part_idx}; // table id = the single <uuid> component
         }
@@ -352,13 +351,13 @@ std::optional<TableFilePath> parseTableFilePath(const std::string & path)
     if (p.size() < 2 || findPartDirComponent(p))
         return std::nullopt;
 
-    // A reserved table-level subdirectory (deduplication_logs/) splits the path explicitly: the
-    // table id is everything before it, the tail is the reserved dir and everything under it.
-    // Without this the generic "last component is the file" rule would fold the subdir into the
-    // table id and mis-scope the log objects. Index >= 1 so the table id is never the bare root.
+    // A reserved table-level subdirectory (deduplication_logs/, partition_exports/) splits the path
+    // explicitly: the table id is everything before it, the tail is the reserved dir and everything
+    // under it. Without this the generic "last component is the file" rule would fold the subdir into
+    // the table id and mis-scope the objects. Index >= 1 so the table id is never the bare root.
     for (size_t i = 1; i + 1 < p.size(); ++i)
     {
-        if (p[i] == kDeduplicationLogsDirName)
+        if (isReservedTableSubdir(p[i]))
         {
             TableFilePath r;
             r.table_uuid = joinTableId(p, 0, i);

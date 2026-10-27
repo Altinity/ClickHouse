@@ -117,7 +117,7 @@ public:
         throwNotImplemented();
     }
 
-    /// [TXN-ONE-PIPELINE] Optional per-metadata write buffer. Returns a ready-to-use buffer when the
+    /// Optional per-metadata write buffer. Returns a ready-to-use buffer when the
     /// metadata implementation owns its write mechanism (e.g. a content-addressed hash-on-write buffer
     /// whose blob key is known only after the last byte). `owner` is the disk transaction that must be
     /// kept alive for the returned buffer's lifetime and, when `autocommit`, committed from the finalize
@@ -171,17 +171,23 @@ public:
         throwNotImplemented();
     }
 
-    /// In-flight read-your-writes for a part being assembled by THIS transaction (B59). A CA part-build
+    /// In-flight read-your-writes for a part being assembled by THIS transaction. A CA part-build
     /// transaction stages blobs (uploaded) + mutable bytes before the single commit; these let a reader
     /// that holds the transaction resolve those staged files before they are committed. Default: no
     /// in-flight visibility (the committed metadata path is authoritative).
+    /// Contract: the answers are additive only. A positive answer describes a file this transaction
+    /// staged; an empty answer means "not staged here, fall through to committed metadata" and never
+    /// "absent" (no tombstones: a staged removal is invisible to readers). For a staged file the size
+    /// from `tryGetInFlightFileSize` equals the bytes `tryReadFileInFlight` serves. Independent of
+    /// `IMetadataStorage::appliesOperationsEagerly`: an eager storage may offer no in-flight view.
     virtual std::optional<StoredObjects> tryGetInFlightStorageObjects(const std::string & /*path*/) const { return {}; }
     virtual std::unique_ptr<ReadBufferFromFileBase> tryReadFileInFlight(
         const std::string & /*path*/, const ReadSettings & /*settings*/, std::optional<size_t> /*read_hint*/) const { return nullptr; }
     virtual std::optional<uint64_t> tryGetInFlightFileSize(const std::string & /*path*/) const { return {}; }
-    /// Directory-granularity counterpart of the file trio: true iff this transaction has STAGED at least one
-    /// file under `path` for `path`'s part. Used so a carried-forward projection dir is visible to
-    /// loadProjections during finalize. Default: no in-flight directory visibility.
+    /// Directory-granularity counterpart of the file trio: true when this transaction has STAGED at least
+    /// one file under an INNER directory `path` of a part (a projection dir). The part directory itself
+    /// answers false (see `ContentAddressedTransaction::hasInFlightDirectory`). Used so a carried-forward
+    /// projection dir is visible to loadProjections during finalize. Default: no in-flight directory visibility.
     virtual bool hasInFlightDirectory(const std::string & /*path*/) const { return false; }
     /// Immediate-child names staged directly under `path` (one level). Used so loadProjections'
     /// withPartFormatFromDisk can iterate a staged projection dir to find its mark file. Default: empty.
@@ -325,6 +331,12 @@ public:
     virtual bool isReadOnly() const = 0;
 
     /// True if transactions apply operations immediately instead of accumulating them until commit.
+    /// Contract: an operation `DiskObjectStorageTransaction` submits through `addOperation` runs against
+    /// the metadata transaction at call time and never enters `operations_to_execute`; a non-empty queue
+    /// at commit is a `LOGICAL_ERROR`. Nothing more is implied — not external visibility (memory mutates
+    /// shared state at once, content-addressed storage stages privately until commit), not atomicity or
+    /// rollback, not the in-flight read API of `IMetadataTransaction`. A `writeFile` may still submit its
+    /// metadata effect only when the buffer is finalized.
     virtual bool appliesOperationsEagerly() const
     {
         return false;
@@ -358,13 +370,6 @@ public:
     virtual bool isContentAddressed() const { return false; }
 
     virtual bool allowsPackedParts() const { return true; }
-
-    /// [TXN-ONE-PIPELINE] True when a transaction from this storage stages every mutation into a
-    /// transaction-private overlay at call time (eager) rather than queuing effects for FIFO replay in
-    /// commit. When true, DiskObjectStorageTransaction routes every mutating method straight to the
-    /// metadata transaction and keeps its own operations_to_execute queue empty. Default false
-    /// (ordinary object storage).
-    virtual bool transactionIsStagingOverlay() const { return false; }
 
     /// True when a file write through this metadata storage publishes atomically, i.e. no partial
     /// content is ever observable under the file's final name (see `IDataPartStorage::supportsAtomicFileWrites`).

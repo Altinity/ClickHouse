@@ -2746,6 +2746,9 @@ static std::pair<StorageMergeTree::MutableDataPartsVector, std::vector<scope_gua
     for (auto & part: future_parts)
     {
         auto [new_data_part, tmp_dir_holder] = data.createEmptyPart(part.part_info, part.partition, part.part_name, part.metadata_snapshot, txn, std::move(part.patch_part_index));
+        /// Publish the part now, off the parts lock; renameParts then renames it (one owner move on a content-addressed disk)
+        /// instead of Transaction::commit publishing it under the lock.
+        new_data_part->getDataPartStorage().commitTransaction();
         data_parts.first.emplace_back(std::move(new_data_part));
         data_parts.second.emplace_back(std::move(tmp_dir_holder));
     }

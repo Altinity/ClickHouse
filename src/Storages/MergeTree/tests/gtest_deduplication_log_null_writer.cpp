@@ -22,7 +22,7 @@ namespace
 {
 constexpr auto FORMAT_VERSION = MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING;
 
-/// B37 regression: a `MergeTreeDeduplicationLog` whose `current_writer` is null (the disk could not
+/// Regression: a `MergeTreeDeduplicationLog` whose `current_writer` is null (the disk could not
 /// host the append-mode log -- see `MergeTreeDeduplicationLog::load()`'s early-return path for a
 /// `DiskObjectStorage` whose metadata storage type is neither `Plain` nor `ContentAddressed`) used to
 /// be dereferenced unconditionally by `addPart`/`dropPart`: a release-build `chassert` is a no-op, so

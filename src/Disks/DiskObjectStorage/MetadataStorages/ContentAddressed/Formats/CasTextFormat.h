@@ -150,7 +150,8 @@ inline void closeObject(CasJsonWriter & out, bool & first) { out.closeObject(fir
 /// Argument order mirrors the IO helpers so migrated codecs keep their call shapes.
 inline void writeChar(char c, CasJsonWriter & out) { out.appendChar(c); }
 inline void writeIntText(uint64_t v, CasJsonWriter & out) { out.u64Number(v); }
-void writeHeaderLine(CasJsonWriter & out, FormatId id);
+void writeHeaderLine(CasJsonWriter & out, FormatId id, uint32_t compatibility_version);
+inline void writeHeaderLine(CasJsonWriter & out, FormatId id) { writeHeaderLine(out, id, currentCompatibilityVersion()); }
 void writeTrailerLine(CasJsonWriter & out, uint64_t n);
 
 /// A wire-key carrier for migrated writer call sites. Its explicit constructor makes a codec pass a

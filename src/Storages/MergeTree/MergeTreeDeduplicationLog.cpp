@@ -275,9 +275,8 @@ std::vector<MergeTreeDeduplicationLog::AddPartResult> MergeTreeDeduplicationLog:
         throw Exception(ErrorCodes::ABORTED, "Storage has been shutdown when we add this part.");
     }
 
-    /// A disk that cannot host the append-mode log leaves current_writer null; the release-build
-    /// chassert above is a no-op, so dereferencing it would segfault. Fail closed with a clear
-    /// exception instead of crashing the server (B37).
+    /// A disk that cannot host the append-mode log leaves current_writer null; the chassert above is a
+    /// no-op in release builds, so fail closed with an exception instead.
     if (!current_writer)
         throw Exception(
             ErrorCodes::LOGICAL_ERROR,
@@ -321,7 +320,7 @@ void MergeTreeDeduplicationLog::dropPart(const MergeTreePartInfo & drop_part_inf
         throw Exception(ErrorCodes::ABORTED, "Storage has been shutdown when we drop this part.");
     }
 
-    /// As in addPart: a null writer must produce a clear exception, never a segfault (B37).
+    /// As in addPart: a null writer must produce an exception, never a null dereference.
     if (!current_writer)
         throw Exception(
             ErrorCodes::LOGICAL_ERROR,

@@ -22,8 +22,10 @@ public:
     CommandFsck() : ICommand("CommandFsck")
     {
         command_name = "cas-fsck";
+        exits_nonzero_on_error = true;
         description = "Independently verify content-addressed pool reachability (read-only). "
-                      "Exits nonzero if any reachable object is missing (dangling).";
+                      "Exits 1 on a hard finding: a reachable object missing (dangling), a hole in a ref-log "
+                      "stream (chain_broken), a corrupted GC run, or a malformed key (lifeless_keys).";
         options_description.add_options()("detail", "list per-object rows (class, key, size, reachable_from)")(
             "timeout", po::value<UInt64>(), "abort the scan after N seconds with a clear error instead of hanging (default 600; 0 = unbounded)")(
             "namespace", po::value<String>(), "scope the scan to namespaces with this prefix (skips the pool-wide "
@@ -177,6 +179,9 @@ public:
                 "cas-fsck: {} key(s) under this pool name are malformed or unresolvable — no current "
                 "writer could have produced them, or their catalog incarnation is ambiguous/unreadable "
                 "(the keys are listed as `lifeless-key` rows under --detail)", report.lifeless_keys);
+        /// `unreachable` stays a soft finding: it counts every present blob no ref names, and that includes
+        /// the GC pipeline's `pending_gc`/`awaiting_gc` and an in-flight build's not-yet-adopted blobs
+        /// (`unaccounted`), so a healthy pool under load is never clean by that measure.
     }
 };
 

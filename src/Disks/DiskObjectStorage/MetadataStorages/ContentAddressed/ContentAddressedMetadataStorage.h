@@ -243,7 +243,6 @@ public:
     bool isContentAddressed() const override { return true; }
     bool allowsPackedParts() const override { return allow_packed_parts; }
 
-
     /// Fail-close gate shared by every mutating entry point (transactions, GC round, GC rebuild,
     /// pool-member decommission): an observe-only (`<readonly>`) disk must reject them all.
     void checkNotReadOnly(std::string_view what) const;
@@ -265,9 +264,9 @@ public:
     /// mutating entries through it.
     CasOpAdmission checkOpAdmitted(CasOpClass op) const;
 
-    /// Content-addressed transactions are eager staging overlays: each mutating disk-transaction
-    /// method reaches the metadata transaction immediately rather than entering the FIFO queue.
-    bool transactionIsStagingOverlay() const override { return true; }
+    /// Each mutating disk-transaction method reaches the metadata transaction immediately rather than
+    /// entering the FIFO queue; the effects stay in the transaction-private staging until commit.
+    bool appliesOperationsEagerly() const override { return true; }
     bool supportsAtomicFileWrites() const override { return true; }
     bool supportsTransactionalMutableFiles() const override { return true; }
     bool areBlobPathsRandom() const override { return false; }
@@ -607,6 +606,24 @@ public:
     }
 
 private:
+    /// A single coherent snapshot of the pool and its cached part-folder facade, taken under ONE
+    /// `pointer_mutex` acquisition (see `poolAccess()`) so no caller can observe `pool` from one mount
+    /// generation and `part_access` from another -- the two used to be fetched by two separate calls
+    /// to `store()`/`partAccess()` at some call sites, each taking its own `pointer_mutex` snapshot.
+    struct PoolAccessSnapshot
+    {
+        Cas::PoolPtr pool;
+        std::shared_ptr<Cas::CachedPartFolderAccess> part_access;
+    };
+
+    /// The one place that takes a `{pool, facade}` snapshot under a SINGLE `pointer_mutex`
+    /// acquisition. Throws `INVALID_STATE` (via `throwStorageNotStarted`) when no pool is published
+    /// (before the first `startup` or after `shutdown` -- the storage-level Constructing/ShutDown
+    /// lifecycle), then refuses a terminal pool via `throwIfLifecycleTerminal`. `store()`/`partAccess()`
+    /// are thin wrappers over this and take both fields from one snapshot, so no caller can straddle a
+    /// startup/shutdown that changes `cas_store`/`part_access`.
+    PoolAccessSnapshot poolAccess() const;
+
     const ObjectStoragePtr object_storage;
     const std::string storage_path_prefix;
     const std::string storage_path_full;
@@ -664,16 +681,6 @@ private:
     const bool blob_hash_allow_new;
     /// Per-disk `<skip_access_check>` policy passed to `Cas::PoolConfig`.
     const bool skip_access_check;
-    /// A single coherent snapshot of the pool and its cached part-folder facade, taken under ONE
-    /// `pointer_mutex` acquisition (see `poolAccess()`) so no caller can observe `pool` from one mount
-    /// generation and `part_access` from another -- the two used to be fetched by two separate calls
-    /// to `store()`/`partAccess()` at some call sites, each taking its own `pointer_mutex` snapshot.
-    struct PoolAccessSnapshot
-    {
-        Cas::PoolPtr pool;
-        std::shared_ptr<Cas::CachedPartFolderAccess> part_access;
-    };
-
     /// Set by startup (Pool::open is fail-closed; empty store == not started). shared_ptr so
     /// store()/partAccess() can return a by-value snapshot under `pointer_mutex` (see below) instead
     /// of a reference that could dangle across a concurrent `shutdown` reset.
@@ -728,16 +735,6 @@ private:
             return physical_key_prefix + key;
         return physical_key_prefix + "/" + key;
     }
-
-    /// The one place that takes a `{pool, facade}` snapshot under a SINGLE `pointer_mutex`
-    /// acquisition. Throws `INVALID_STATE` (via `throwStorageNotStarted`) when no pool is published
-    /// (before the first `startup` or after `shutdown` -- the storage-level Constructing/ShutDown
-    /// lifecycle), then refuses a terminal pool via `throwIfLifecycleTerminal`. `store()`/`partAccess()`
-    /// are thin wrappers over this; every other caller that needs BOTH the pool and the facade for one
-    /// logical operation must call this ONCE and use both fields from the same snapshot, rather than
-    /// calling `store()` and `partAccess()` separately -- otherwise it could straddle a startup/shutdown
-    /// that changes `cas_store`/`part_access`.
-    PoolAccessSnapshot poolAccess() const;
 
     /// Atomically unpublishes every pool-owning facade, then stops/releases/drains them in dependency
     /// order outside `pointer_mutex`. Each phase is independently fail-soft because this is also called

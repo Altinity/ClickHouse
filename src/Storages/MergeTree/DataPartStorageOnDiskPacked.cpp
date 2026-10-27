@@ -1,4 +1,5 @@
 #include <Storages/MergeTree/DataPartStorageOnDiskPacked.h>
+#include <Common/FailPoint.h>
 
 #include <IO/Expect404ResponseScope.h>
 #include <IO/Operators.h>
@@ -14,7 +15,6 @@
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeIndicesSerialization.h>
-#include <Common/FailPoint.h>
 #include <Common/logger_useful.h>
 
 namespace DB
@@ -23,6 +23,8 @@ namespace DB
 namespace FailPoints
 {
     extern const char part_storage_fail_commit_transaction[];
+    extern const char part_storage_pause_before_commit_transaction[];
+    extern const char part_storage_pause_after_commit_transaction[];
 }
 
 namespace ErrorCodes
@@ -559,10 +561,13 @@ void DataPartStorageOnDiskPacked::commitTransaction()
     if (has_shared_transaction)
         return;
 
+    /// The same fault-injection seams as the Full storage: a test fails or holds the close of the PART's
+    /// disk transaction whatever storage format the randomized settings picked.
     fiu_do_on(FailPoints::part_storage_fail_commit_transaction,
     {
         throw Exception(ErrorCodes::FAULT_INJECTED, "part_storage_fail_commit_transaction");
     });
+    FailPointInjection::pauseFailPoint(FailPoints::part_storage_pause_before_commit_transaction);
 
     transaction->commit();
 
@@ -571,6 +576,9 @@ void DataPartStorageOnDiskPacked::commitTransaction()
 
     transaction.reset();
     is_precommitted = false;
+
+    /// Lets a test stop the process between the durable commit and the rename that follows.
+    FailPointInjection::pauseFailPoint(FailPoints::part_storage_pause_after_commit_transaction);
 }
 
 void DataPartStorageOnDiskPacked::checkpointTransaction()

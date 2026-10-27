@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCatalogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPoolMetaFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include "cas_test_helpers.h"
 #include <Common/Exception.h>
@@ -25,6 +26,8 @@
 
 namespace DB::ErrorCodes
 {
+extern const int BAD_ARGUMENTS;
+extern const int CORRUPTED_DATA;
 extern const int INVALID_STATE;
 extern const int NOT_IMPLEMENTED;
 }
@@ -159,6 +162,19 @@ bool headPresent(Backend & backend, const String & key)
 {
     DB::Cas::tests::OperationForTest op(backend);
     return (*op).head(key, Retry::standard()).has_value();
+}
+
+/// Rewrites `_pool_meta` with reader floor 1, as a pool a generation-1 writer (26.6) leaves it.
+void lowerFloorToGenerationOne(Backend & backend)
+{
+    DB::Cas::tests::OperationForTest op(backend);
+    const auto current = (*op).read(kPoolMetaKey, Retry::once());
+    ASSERT_TRUE(current.has_value());
+    const auto head = (*op).head(kPoolMetaKey, Retry::once());
+    ASSERT_TRUE(head.has_value());
+    PoolMeta pm = decodePoolMeta(current->bytes);
+    pm.min_reader_generation = G_WRITE_FLOOR;
+    ASSERT_TRUE(std::holds_alternative<Committed>((*op).replace(kPoolMetaKey, encodePoolMeta(pm), head->etag, Retry::once())));
 }
 
 template <typename F>
@@ -554,4 +570,77 @@ TEST(CASBootstrapOrdering, DecommissionWithAbsentMetaFailsClosedNoMint)
 
     EXPECT_EQ(backend->writeCount(), 0u) << "decommission must not mint a fresh _pool_meta";
     EXPECT_FALSE(readPresent(*backend, kPoolMetaKey));
+}
+
+TEST(CASBootstrapOrdering, WritableOpenRaisesTheFloorForOwnerMoves)
+{
+    auto backend = std::make_shared<RecordingBackend>();
+    Pool::open(backend, makeConfig());
+    lowerFloorToGenerationOne(*backend);
+    {
+        PoolConfig cfg = makeConfig();
+        cfg.read_only = true;
+        auto pool = Pool::open(backend, cfg);
+        EXPECT_EQ(pool->poolMeta().min_reader_generation, 1u);
+        EXPECT_FALSE(pool->refMoveAllowed());
+    }
+    auto pool = Pool::open(backend, makeConfig());
+    EXPECT_EQ(pool->poolMeta().min_reader_generation, 2u);
+    EXPECT_TRUE(pool->refMoveAllowed());
+    DB::Cas::tests::OperationForTest op(*backend);
+    const auto stored = (*op).read(kPoolMetaKey, Retry::once());
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(decodePoolMeta(stored->bytes).min_reader_generation, 2u) << "the raise must be durable";
+}
+
+TEST(CASBootstrapOrdering, ReadOnlyOpenNeverRaisesTheFloor)
+{
+    auto backend = std::make_shared<RecordingBackend>();
+    Pool::open(backend, makeConfig());
+    lowerFloorToGenerationOne(*backend);
+    backend->clearLog();
+    PoolConfig cfg = makeConfig();
+    cfg.read_only = true;
+    auto pool = Pool::open(backend, cfg);
+    EXPECT_EQ(backend->writeCount(), 0u) << "an observe open must never write";
+    EXPECT_EQ(pool->poolMeta().min_reader_generation, 1u);
+    EXPECT_FALSE(pool->refMoveAllowed());
+}
+
+TEST(CASBootstrapOrdering, ReadOnlyOpenNeverAdmitsAHashAlgorithm)
+{
+    auto backend = std::make_shared<RecordingBackend>();
+    Pool::open(backend, makeConfig());
+    backend->clearLog();
+    PoolConfig cfg = makeConfig();
+    cfg.read_only = true;
+    cfg.blob_hash_algo = BlobHashAlgo::XXH3_128;
+    cfg.blob_hash_allow_new = true;
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&] { Pool::open(backend, cfg); });
+    EXPECT_EQ(backend->writeCount(), 0u) << "an observe open must not write pool meta even when admission is configured";
+}
+
+TEST(CASBootstrapOrdering, FailedMountLeavesTheFloorUnchanged)
+{
+    auto backend = std::make_shared<RecordingBackend>();
+    {
+        PoolConfig cfg = makeConfig();
+        cfg.server_id = 1;
+        Pool::open(backend, cfg);
+    }
+    lowerFloorToGenerationOne(*backend);
+    /// The server root is owned by server_id 1; a different server_id is refused by the owner anchor
+    /// inside mountWritable, which must happen before the floor is touched.
+    PoolConfig cfg = makeConfig();
+    cfg.server_id = 2;
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { Pool::open(backend, cfg); });
+    DB::Cas::tests::OperationForTest op(*backend);
+    EXPECT_EQ(PoolMeta::createOrValidate(*op, Layout(cfg.pool_prefix), 256).min_reader_generation, 1u);
+}
+
+TEST(CASBootstrapOrdering, NewPoolStartsAtGenerationTwo)
+{
+    auto backend = std::make_shared<RecordingBackend>();
+    auto pool = Pool::open(backend, makeConfig());
+    EXPECT_EQ(pool->poolMeta().min_reader_generation, 2u);
 }

@@ -221,6 +221,7 @@ bool DisksApp::processQueryText(const String & text)
     for (const auto & subquery : subqueries)
     {
         std::optional<String> error_string;
+        command.reset();
         // std::cerr << "SUBQUERY: " << subquery << "\n";
         try
         {
@@ -235,8 +236,8 @@ bool DisksApp::processQueryText(const String & text)
         {
             int code = err.code();
             error_string = getExceptionMessageForLogging(err, true, false);
-            if (command && command->command_name.starts_with("cas-"))
-                last_command_exit_code = code;
+            if (command && command->exits_nonzero_on_error)
+                last_command_exit_code = 1;
             if (code == ErrorCodes::BAD_ARGUMENTS)
             {
                 if (command.get())
@@ -253,14 +254,14 @@ bool DisksApp::processQueryText(const String & text)
         catch (std::exception & err)
         {
             error_string = err.what();
-            if (command && command->command_name.starts_with("cas-"))
-                last_command_exit_code = ErrorCodes::STD_EXCEPTION;
+            if (command && command->exits_nonzero_on_error)
+                last_command_exit_code = 1;
         }
         catch (...) // Ok: report unknown exception
         {
             error_string = "Unknown exception";
-            if (command && command->command_name.starts_with("cas-"))
-                last_command_exit_code = ErrorCodes::STD_EXCEPTION;
+            if (command && command->exits_nonzero_on_error)
+                last_command_exit_code = 1;
         }
         if (error_string.has_value())
         {
@@ -624,8 +625,8 @@ int DisksApp::main(const std::vector<String> & /*args*/)
     if (log_file)
         log_file->close();
 
-    /// Non-interactive runs surface a failing command as a nonzero process exit (CI/cron gating,
-    /// e.g. `cas-fsck` reporting dangling objects). Interactive sessions are unaffected.
+    /// A non-interactive run exits 1 when a `cas-*` command threw (`ICommand::exits_nonzero_on_error`),
+    /// whatever ran after it; every other command keeps the upstream "always 0" contract.
     if (query.has_value() && last_command_exit_code != 0)
         return last_command_exit_code;
     return Application::EXIT_OK;

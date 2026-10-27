@@ -819,8 +819,8 @@ The server successfully detected this situation and will download merged part fr
     M(S3ListObjects, "Number of S3 API ListObjects calls.", ValueType::Number) \
     M(S3ListObjectsMicroseconds, "Time of S3 API ListObjects execution.", ValueType::Microseconds) \
     M(S3HeadObject,  "Number of S3 API HeadObject calls.", ValueType::Number) \
-    /* CA per-namespace S3 op instrumentation (B168 P0). 80 = 8 namespaces × 10 ops; attributes the */ \
-    /* S3 op-count (PUTs/HEADs/404s/412s/LISTs) by CA operation type via the InstrumentedBackend seam. */ \
+    /* CA per-namespace S3 op instrumentation: one event per (namespace, op) cell of the table in */ \
+    /* CasInstrumentedBackend.cpp; attributes PUTs/HEADs/404s/412s/LISTs to the CA operation type. */ \
     M(CASBlobPut,        "Number of CAS blob PUT requests. Grows with blob uploads and indicates storage write traffic.", ValueType::Number) \
     M(CASBlobPutDeduplicated,   "Number of CAS blob deduplicating PUT requests. Grows when uploads reuse existing content.", ValueType::Number) \
     M(CASBlobOverwrite,  "Number of CAS blob overwrite requests. Growing values indicate repeated replacement writes.", ValueType::Number) \
@@ -879,6 +879,8 @@ The server successfully detected this situation and will download merged part fr
     M(CASBlobDelete,     "Number of CAS blob DELETE requests. Grows with cleanup and GC deletion activity.", ValueType::Number) \
     M(CASBlobList,       "Number of CAS blob LIST requests. Growing values indicate more object enumeration.", ValueType::Number) \
     M(CASRefRepoint, "Number of CAS committed-reference repoints that republish a manifest. Growth indicates standalone part updates or removals.", ValueType::Number) \
+    M(CASRefMove, "Number of CAS committed-reference renames done as one ref-log owner move, with no manifest republication.", ValueType::Number) \
+    M(CASOwnershipConflict, "Number of CAS operations refused with CAS_OWNERSHIP_CONFLICT: the committed reference the writer had read was moved, dropped or repointed before its change landed.", ValueType::Number) \
     M(CASManifestPut,        "Number of CAS manifest PUT requests. Grows with manifest creation and indicates metadata write traffic.", ValueType::Number) \
     M(CASManifestPutDeduplicated,   "Number of CAS deduplicating manifest PUT requests. Grows when existing manifests are reused.", ValueType::Number) \
     M(CASManifestOverwrite,  "Number of CAS manifest overwrite requests. Growing values indicate repeated manifest replacement.", ValueType::Number) \
@@ -975,7 +977,6 @@ The server successfully detected this situation and will download merged part fr
     M(CASConditionalWriteCommitted, "Number of CAS conditional writes completed successfully. Growth indicates successful conditional-update activity.", ValueType::Number) \
     M(CASConditionalWriteDefiniteFailure, "Number of CAS conditional writes rejected with certainty before applying. A non-zero value indicates invalid requests, oversized entities, or access denial.", ValueType::Number) \
     M(CASConditionalWriteUnresolved, "Number of CAS conditional writes with an unknown outcome after conflict, timeout, connection loss, or server error. A non-zero value indicates backend instability or state requiring resolution.", ValueType::Number) \
-    M(CASConditionalWriteFenceLostPostWrite, "Number of CAS writes that succeeded but lost the final mount-fence check. A non-zero value indicates late responses after the mount lifecycle changed.", ValueType::Number) \
     M(CASRequestAttempt, "Number of physical requests the CAS request contract started. Each one was admitted by the mount fence and reserved against the call's deadline before it was sent.", ValueType::Number) \
     M(CASRequestReissue, "Number of CAS requests re-sent: after a jittered backoff for an ordinary failure, after a flat pause for a connect-failure hint, or at once with no pause at all for a first-attempt fuse. Growth means the object store is throttling, failing, or contended.", ValueType::Number) \
     M(CASRequestConflictPause, "Number of clean lost races the CAS request contract repaid after a flat jitter instead of a growing backoff: the resolve read had settled the conflict and no transport fault preceded it.", ValueType::Number) \

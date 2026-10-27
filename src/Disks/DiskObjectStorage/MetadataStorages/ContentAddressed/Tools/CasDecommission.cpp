@@ -1,3 +1,4 @@
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasClock.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
@@ -29,12 +30,6 @@ namespace DB::Cas
 
 namespace
 {
-
-uint64_t nowMs()
-{
-    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count());
-}
 
 std::string_view removalName(Removal r)
 {
@@ -465,7 +460,7 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
                     if (const auto owner = op.read(owner_key, Retry::standard()))
                     {
                         OwnerObject tombstoned = decodeOwner(owner->bytes);
-                        tombstoned.retired_at_ms = nowMs();
+                        tombstoned.retired_at_ms = Cas::nowMs();
                         /// `op.replace` resolves an ambiguous attempt with a resolve read on its own:
                         /// a transient transport error here (or one whose response was simply lost)
                         /// must not be reported as a hard failure when the write actually landed.

@@ -111,6 +111,10 @@ public:
     String command_name;
     String description;
     ProgramOptionsDescription options_description;
+    /// A non-interactive `--query` exits 1 when a command with this flag throws. Upstream commands keep
+    /// the "always 0" contract (04812 runs failing commands on purpose); the `cas-*` tools set it so CI
+    /// and cron can gate on `cas-fsck`.
+    bool exits_nonzero_on_error = false;
 
 protected:
     PositionalProgramOptionsDescription positional_options_description;

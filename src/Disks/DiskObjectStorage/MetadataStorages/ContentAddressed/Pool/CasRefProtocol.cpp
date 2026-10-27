@@ -109,51 +109,6 @@ void checkRemoveNamespaceOrdering(const std::vector<RefOp> & ops)
 std::mutex g_recovery_replay_memory_probe_mutex;
 std::function<void(int64_t)> g_recovery_replay_memory_probe;
 
-/// The four legal `owner_transition` shapes, decided purely from the (old_binding, new_binding)
-/// optionals and their `RefOwnerKind`s -- no state read. `RefTableState::applyOwnerTransition` (the
-/// writer/replay state machine) and `manifestEdgesOfTxn` (the GC fold's edge extractor) both switch
-/// over this single classification instead of each carrying their own shape predicates, so a shape
-/// neither consumer recognizes cannot silently acquire divergent meaning in one of them.
-enum class OwnerTransitionShape : uint8_t
-{
-    AddPrecommit,      /// no old_binding, new_binding.kind == Precommit
-    RemovePrecommit,   /// old_binding.kind == Precommit, no new_binding
-    RemoveCommitted,   /// old_binding.kind == Committed, no new_binding
-    Promote,           /// old_binding.kind == Precommit, new_binding.kind == Committed, SAME ref_name
-                       /// and manifest_ref
-};
-
-/// Classify `op`'s (old_binding, new_binding) shape into one of the four legal transitions. Anything
-/// else -- neither binding, old+new naming DIFFERENT manifests, a promote whose old/new ref_name
-/// disagree, or any other kind combination -- throws `CORRUPTED_DATA` naming the offending combination
-/// instead of falling through to a caller that would otherwise assign it accidental meaning.
-[[nodiscard]] OwnerTransitionShape classifyOwnerTransitionShape(const RefOp & op)
-{
-    const bool has_old = op.old_binding.has_value();
-    const bool has_new = op.new_binding.has_value();
-
-    if (!has_old && has_new && op.new_binding->kind == RefOwnerKind::Precommit)
-        return OwnerTransitionShape::AddPrecommit;
-
-    if (has_old && !has_new && op.old_binding->kind == RefOwnerKind::Precommit)
-        return OwnerTransitionShape::RemovePrecommit;
-
-    if (has_old && !has_new && op.old_binding->kind == RefOwnerKind::Committed)
-        return OwnerTransitionShape::RemoveCommitted;
-
-    if (has_old && has_new && op.old_binding->kind == RefOwnerKind::Precommit
-        && op.new_binding->kind == RefOwnerKind::Committed
-        && op.old_binding->ref_name == op.new_binding->ref_name
-        && op.old_binding->manifest_ref == op.new_binding->manifest_ref)
-        return OwnerTransitionShape::Promote;
-
-    throw Exception(ErrorCodes::CORRUPTED_DATA,
-        "owner_transition does not match any legal transition shape (has_old={}, old_kind={}, "
-        "has_new={}, new_kind={})",
-        has_old, has_old ? std::to_string(static_cast<uint8_t>(op.old_binding->kind)) : "n/a",
-        has_new, has_new ? std::to_string(static_cast<uint8_t>(op.new_binding->kind)) : "n/a");
-}
-
 }
 
 void setRecoveryReplayMemoryProbeForTest(std::function<void(int64_t delta_footprint_bytes)> probe)
@@ -231,8 +186,8 @@ bool RefTableState::manifestAlreadyOwned(const ManifestRef & manifest_ref) const
 }
 
 /// The `owner_transition` op kind: dispatches on the `(old_binding,
-/// new_binding)` shape to one of the four legal transitions (add precommit / remove precommit /
-/// remove committed / promote). Any other shape is not a recognized transition.
+/// new_binding)` shape to one of the five legal transitions (add precommit / remove precommit /
+/// remove committed / promote / move). Any other shape is not a recognized transition.
 void RefTableState::applyOwnerTransition(const RefOp & op)
 {
     if (lifecycle != RefLifecycle::Live)
@@ -326,6 +281,39 @@ void RefTableState::applyOwnerTransition(const RefOp & op)
             snapshot_body_bytes += committedRowEncodedSize(row);
             removal_body_bytes  += removalOpEncodedSize(RefOwnerKind::Committed, row.ref_name, row.manifest_ref);
             committed.emplace(b.ref_name, std::move(row));
+            return;
+        }
+
+        /// Move: a committed row changes its ref_name, keeping its manifest_ref and published_at_ms.
+        case OwnerTransitionShape::Move:
+        {
+            const RefOwnerBinding & from = *op.old_binding;
+            const RefOwnerBinding & to = *op.new_binding;
+            const auto it = committed.find(from.ref_name);
+            if (it == committed.end() || !(it->second.manifest_ref == from.manifest_ref))
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "RefTableState: exact committed binding '{}' to move is absent", from.ref_name);
+            if (committed.contains(to.ref_name))
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "RefTableState: move destination '{}' is already committed", to.ref_name);
+            /// Precommits are keyed by (ref_name, manifest_ref); any precommit under the destination name
+            /// means another build is about to claim it.
+            if (hasLivePrecommitFor(to.ref_name))
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "RefTableState: move destination '{}' has a live precommit", to.ref_name);
+            /// `RefCowMap` has no node handle, so the destination is inserted before the source is
+            /// erased: an allocation failure in between leaves a duplicate row, never a lost one.
+            RefCommittedRow row = it->second;
+            RefCommittedRow moved = row;
+            moved.ref_name = to.ref_name;
+            committed.emplace(to.ref_name, std::move(moved));
+            snapshot_body_bytes -= committedRowEncodedSize(row);
+            removal_body_bytes  -= removalOpEncodedSize(RefOwnerKind::Committed, row.ref_name, row.manifest_ref);
+            row.ref_name = to.ref_name;
+            snapshot_body_bytes += committedRowEncodedSize(row);
+            removal_body_bytes  += removalOpEncodedSize(RefOwnerKind::Committed, row.ref_name, row.manifest_ref);
+            committed.erase(from.ref_name);
+            /// `owned_manifests` is untouched: the manifest keeps its single owner across the rename.
             return;
         }
     }
@@ -766,6 +754,8 @@ std::vector<RefManifestEdge> manifestEdgesOfTxn(const RefLogTxn & txn)
                 /// Same-manifest owner move: the manifest keeps an owner the whole time, so there is no
                 /// net edge.
                 continue;
+            case OwnerTransitionShape::Move:
+                continue;   /// ownership transfer, no edge
         }
         /// Reachable only if a future `OwnerTransitionShape` enumerator is added without a matching
         /// `case` -- `-Wswitch`/`-Werror` catches that at compile time; this throw is the runtime

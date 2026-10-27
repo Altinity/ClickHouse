@@ -142,13 +142,16 @@ check therefore attributes it to exactly that server root, under the same strict
 content, and that root can confirm its exact refs.
 
 `DETACH`, `ATTACH`, and merge-result renames all reduce to the same two
-moves: re-key any *staged* source into the destination, then `republishRef(src → dst)` for any
-*committed* source. `republishRef` resolves the source ref freshly and reads its manifest through
-the manifest cache, publishes an
-equivalent-entry manifest under the destination ref — a **new** manifest id, with blobs untouched
-and adopted by evidence — then drops the source ref. A destination that already exists with
-identical entries just drops the source, an idempotent re-drive; one with different entries
-throws.
+moves: re-key any *staged* source into the destination, then rename any *committed* source. Inside
+one table namespace the rename is one ref-log `Move` record (`moveRefExact`): the committed ref
+changes its name and keeps its manifest, conditional on the manifest the caller resolved — any other
+current binding is `CAS_OWNERSHIP_CONFLICT`, and a retried rename that finds the move already done is
+a no-op. Across namespaces (`MOVE PARTITION TO TABLE`), or when the destination already exists from an
+earlier attempt, `republishRef` publishes an equivalent-entry
+manifest under the destination ref — a **new** manifest id, with blobs untouched and adopted by
+evidence — then drops the source ref while it still names the republished manifest. A destination
+that already exists with identical entries just drops the source, an idempotent re-drive; one with
+different entries throws.
 
 Manifests are therefore per-ref and never moved: a detach creates a new manifest for
 `detached/<part>` and retires the old one, and the blobs' net in-degree is unchanged.

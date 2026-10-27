@@ -62,19 +62,11 @@ String joinAlgoNames(const std::vector<uint8_t> & algos_used)
         joinAlgoNames(pool.algos_used), blobHashAlgoName(config_algo));
 }
 
-/// The relaxed admission check (replaces an earlier fail-close that required the single pool algo to match):
-/// re-reads `key` itself (via `readModifyWrite`'s own observe) rather than trusting a snapshot the
-/// caller already holds, so a caller that only knows the key is present -- never a stale decode --
-/// can ask this to settle admission. Already a member of `algos_used` => OK, no write (steady state,
-/// `decide` declines). Not a member and `!allow_new` => `BAD_ARGUMENTS` (the pool is never touched).
-/// Not a member and `allow_new` => CAS-union `config_algo` into `algos_used` (recomputed from the
-/// FRESH value on every retry -- union-only, so there is no ABA) and raises `min_reader_generation` to
-/// THIS build's own floor (`G_BUILD`, `CasFormat.h`) in the SAME write (first registration of a
-/// schema-3-bearing algo also raises `min_reader_generation` -- a build that cannot decode schema-3
-/// settlement state has an OLDER `G_BUILD` and is correctly refused by the startup gate once a future
-/// generation bump lands here). A concurrent admitter's own union is folded in the same way, since
-/// `decide` runs again against whatever `readModifyWrite` observes on retry.
-PoolMeta admitOrValidate(CasOperation & op, const String & key, BlobHashAlgo config_algo, bool allow_new)
+/// Read-modify-write of `_pool_meta` after `createOrValidate` proved it exists: `mutate` edits the decoded
+/// meta in place and returns whether it changed anything (false = no write). Re-run against the fresh value
+/// on every conditional-write retry. Returns the meta as last observed (mutated when it was written).
+template <typename Mutate>
+PoolMeta rmwPoolMeta(CasOperation & op, const String & key, std::string_view what, Mutate && mutate)
 {
     PoolMeta observed;
     WriteResult result = op.readModifyWrite(
@@ -82,30 +74,57 @@ PoolMeta admitOrValidate(CasOperation & op, const String & key, BlobHashAlgo con
         [&](const std::optional<Object> & current) -> std::optional<String>
         {
             if (!current)
-                throw Exception(ErrorCodes::LOGICAL_ERROR,
-                    "CAS pool meta: '{}' vanished mid-admission (conflicting write then a concurrent delete)", key);
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS pool meta '{}' vanished during {}", key, what);
             observed = decodePoolMeta(current->bytes);
-
-            if (isAlgoAdmittedIn(observed, config_algo))
+            if (!mutate(observed))
                 return std::nullopt;
-            if (!allow_new)
-                throwNotAdmitted(observed, config_algo);
-
-            observed.algos_used.push_back(static_cast<uint8_t>(config_algo));
-            std::sort(observed.algos_used.begin(), observed.algos_used.end());
-            observed.min_reader_generation = G_BUILD;
             return encodePoolMeta(observed);
         },
         Retry::standard());
-    orThrow(std::move(result), fmt::format("CAS pool meta admission on '{}'", key));
+    orThrow(std::move(result), fmt::format("CAS pool meta {} on '{}'", what, key));
     return observed;
 }
 
+/// The relaxed admission check (replaces an earlier fail-close that required the single pool algo to match):
+/// re-reads `key` itself (via `readModifyWrite`'s own observe) rather than trusting a snapshot the
+/// caller already holds, so a caller that only knows the key is present -- never a stale decode --
+/// can ask this to settle admission. Already a member of `algos_used` => OK, no write (steady state,
+/// the mutator declines). Not a member and `!allow_new` => `BAD_ARGUMENTS` (the pool is never touched).
+/// Not a member and `allow_new` => CAS-union `config_algo` into `algos_used` (recomputed from the
+/// FRESH value on every retry -- union-only, so there is no ABA). Every known algorithm is readable by a
+/// generation-1 build, so admission never touches `min_reader_generation`. A concurrent
+/// admitter's own union is folded in the same way, since the mutator runs again against whatever
+/// `readModifyWrite` observes on retry.
+PoolMeta admitOrValidate(CasOperation & op, const String & key, BlobHashAlgo config_algo, bool allow_new)
+{
+    return rmwPoolMeta(op, key, "admission", [&](PoolMeta & meta)
+    {
+        if (isAlgoAdmittedIn(meta, config_algo))
+            return false;
+        if (!allow_new)
+            throwNotAdmitted(meta, config_algo);
+        meta.algos_used.push_back(static_cast<uint8_t>(config_algo));
+        std::sort(meta.algos_used.begin(), meta.algos_used.end());
+        return true;
+    });
+}
+
+}
+
+PoolMeta PoolMeta::raiseMinReaderGeneration(CasOperation & op, const Layout & layout, uint64_t generation)
+{
+    return rmwPoolMeta(op, layout.poolMetaKey(), "reader-floor raise", [&](PoolMeta & meta)
+    {
+        if (meta.min_reader_generation >= generation)
+            return false;
+        meta.min_reader_generation = generation;
+        return true;
+    });
 }
 
 PoolMeta PoolMeta::createOrValidate(
     CasOperation & op, const Layout & layout, uint64_t blob_header_len, uint64_t gc_shards,
-    BlobHashAlgo blob_hash_algo, bool allow_new, bool allow_mint)
+    BlobHashAlgo blob_hash_algo, bool allow_new, bool allow_mint, uint64_t initial_min_reader_generation)
 {
     /// The passed config is the caller's responsibility — reject bad values before any I/O.
     validatePoolBlobHeaderLen(blob_header_len, ErrorCodes::BAD_ARGUMENTS, "pool meta");
@@ -131,9 +150,8 @@ PoolMeta PoolMeta::createOrValidate(
     }
 
     /// Absent => mint a pool id and try to create the object with `algos_used = {blob_hash_algo}`.
-    /// Every pool this build creates is schema-3-shaped from birth (schemas 1/2 do not exist in this
-    /// build at all), so the reader-generation floor is stamped at THIS build's `G_BUILD` at
-    /// creation, not left at 0.
+    /// The floor records which readers may mount; a new pool starts at the floor its writers need
+    /// (generation 2), not at this build's read ceiling.
     ///
     /// BOOTSTRAP GATE: minting is permitted ONLY on the verified bootstrap path. A
     /// non-bootstrap caller (a read-only/observe open, `openForDecommission`) passes `allow_mint=false`
@@ -152,7 +170,7 @@ PoolMeta PoolMeta::createOrValidate(
     pm.pool_id = mintPoolId();
     pm.blob_header_len = blob_header_len;
     pm.gc_shards = gc_shards;
-    pm.min_reader_generation = G_BUILD;
+    pm.min_reader_generation = initial_min_reader_generation;
     pm.algos_used = {static_cast<uint8_t>(blob_hash_algo)};
 
     WriteResult result = op.create(key, encodePoolMeta(pm), Retry::standard());

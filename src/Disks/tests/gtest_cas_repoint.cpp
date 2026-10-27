@@ -4,10 +4,9 @@
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/ProfileEvents.h>
 
-/// Task 3 (all-tree-part-files plan, 2026-07-15): `CachedPartFolderAccess::repointRef` -- the audited
-/// primitive a standalone write/remove on an already-COMMITTED part must go through once the mutable
-/// per-part file set is empty. It republishes
-/// the whole manifest with the new entry set, riding `PartWriteTxn::promote`'s `allow_repoint` mode (Task 2).
+/// `CachedPartFolderAccess::repointRef` -- the audited primitive a standalone write/remove on an
+/// already-COMMITTED part must go through once the mutable per-part file set is empty. It republishes
+/// the whole manifest with the new entry set, riding `PartWriteTxn::promote`'s `PublishPolicy::replace` mode.
 
 namespace ProfileEvents
 {
@@ -62,7 +61,7 @@ TEST(CASRepoint, ByteEqualIsNoOp)
 
     backend->resetCounts();
     const uint64_t repoints_before = ProfileEvents::global_counters[ProfileEvents::CASRefRepoint];
-    const DB::Cas::CommitOutcome oc = access.repointRef(key, {inlineEntry("checksums.txt", "cs")}, ProvenanceOp::Other);
+    const DB::Cas::CommitOutcome oc = access.repointRef(key, {inlineEntry("checksums.txt", "cs")}, ProvenanceOp::Other, id.ref);
     EXPECT_FALSE(oc.created);
     EXPECT_EQ(oc.manifest_ref, id.ref) << "the byte-equal outcome must name the manifest ALREADY committed, unchanged";
 
@@ -91,7 +90,7 @@ TEST(CASRepoint, AddFileRepoints)
 
     const uint64_t repoints_before = ProfileEvents::global_counters[ProfileEvents::CASRefRepoint];
     const std::vector<ManifestEntry> new_entries{inlineEntry("checksums.txt", "cs"), inlineEntry("metadata_version.txt", "7")};
-    const DB::Cas::CommitOutcome oc = access.repointRef(key, new_entries, ProvenanceOp::Other);
+    const DB::Cas::CommitOutcome oc = access.repointRef(key, new_entries, ProvenanceOp::Other, id_before.ref);
     EXPECT_FALSE(oc.created);
     EXPECT_NE(oc.manifest_ref, id_before.ref);
 
