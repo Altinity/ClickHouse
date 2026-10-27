@@ -75,8 +75,10 @@ ENV MINIO_ROOT_PASSWORD="clickhouse"
 ENV EXPORT_S3_STORAGE_POLICIES=1
 
 # TODO: check against 3.29.0, but 23.8.11 had azurite@3.28.0
+# Current azurite dependencies need a newer Node.js than the Ubuntu one
 RUN npm install -g azurite@3.29.0 \
-    && npm install -g tslib@2.6.2
+    && npm install -g tslib@2.6.2 \
+    && npm install -g node@20.20.2
 
 
 COPY run.sh /
