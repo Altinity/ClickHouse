@@ -1,4 +1,4 @@
-# rebuild in #33610
+# rebuild in #2701
 # docker build -t altinityinfra/stateless-test .
 ARG FROM_TAG=latest
 FROM altinityinfra/test-base:$FROM_TAG
