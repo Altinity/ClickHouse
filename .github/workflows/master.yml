@@ -859,7 +859,7 @@ jobs:
           PYTHONUNBUFFERED=1 python3 -m praktika run 'Build (amd_llvm_coverage_per_test)' --workflow "MasterCI" --ci --timestamp
 
   build_amd_release:
-    runs-on: [self-hosted, altinity-on-demand, altinity-builder, volume-clickhouse_thinlto-200GB]
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder, altinity-volume-clickhouse_thinlto-200GB]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF9yZWxlYXNlKQ==') }}
     name: "Build (amd_release)"
@@ -903,7 +903,7 @@ jobs:
           PYTHONUNBUFFERED=1 python3 -m praktika run 'Build (amd_release)' --workflow "MasterCI" --ci --timestamp
 
   build_arm_release:
-    runs-on: [self-hosted, altinity-on-demand, altinity-builder, volume-clickhouse_thinlto-200GB]
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder, altinity-volume-clickhouse_thinlto-200GB]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFybV9yZWxlYXNlKQ==') }}
     name: "Build (arm_release)"
@@ -947,7 +947,7 @@ jobs:
           PYTHONUNBUFFERED=1 python3 -m praktika run 'Build (arm_release)' --workflow "MasterCI" --ci --timestamp
 
   build_amd_release_pr_cache_warmup:
-    runs-on: [self-hosted, altinity-on-demand, altinity-builder, volume-clickhouse_thinlto-200GB]
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder, altinity-volume-clickhouse_thinlto-200GB]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF9yZWxlYXNlX3ByX2NhY2hlX3dhcm11cCk=') }}
     name: "Build (amd_release_pr_cache_warmup)"
@@ -991,7 +991,7 @@ jobs:
           PYTHONUNBUFFERED=1 python3 -m praktika run 'Build (amd_release_pr_cache_warmup)' --workflow "MasterCI" --ci --timestamp
 
   build_arm_release_pr_cache_warmup:
-    runs-on: [self-hosted, altinity-on-demand, altinity-builder, volume-clickhouse_thinlto-200GB]
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder, altinity-volume-clickhouse_thinlto-200GB]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFybV9yZWxlYXNlX3ByX2NhY2hlX3dhcm11cCk=') }}
     name: "Build (arm_release_pr_cache_warmup)"

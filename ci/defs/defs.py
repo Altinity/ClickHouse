@@ -18,8 +18,8 @@ S3_REPORT_BUCKET_HTTP_ENDPOINT = altinity_overrides.S3_REPORT_BUCKET_HTTP_ENDPOI
 class RunnerLabels:
     CI_SERVICES = "ci_services"
     CI_SERVICES_EBS = "ci_services_ebs"
-    BUILDER_AMD = ["self-hosted", "altinity-on-demand", "altinity-builder", "volume-clickhouse_thinlto-200GB"]
-    BUILDER_ARM = ["self-hosted", "altinity-on-demand", "altinity-builder", "volume-clickhouse_thinlto-200GB"]
+    BUILDER_AMD = ["self-hosted", "altinity-on-demand", "altinity-builder", "altinity-volume-clickhouse_thinlto-200GB"]
+    BUILDER_ARM = ["self-hosted", "altinity-on-demand", "altinity-builder", "altinity-volume-clickhouse_thinlto-200GB"]
     FUNC_TESTER_AMD = ["self-hosted", "altinity-on-demand", "altinity-func-tester"]
     FUNC_TESTER_ARM = [
         "self-hosted",
