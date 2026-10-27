@@ -49,6 +49,74 @@ TEST(ClusterFunctionReadTaskResponse, RejectsSchemaTransformOnProtocolBeforeData
     }
 }
 
+std::shared_ptr<ActionsDAG> makeOutputOnlySchemaTransform()
+{
+    auto dag = std::make_shared<ActionsDAG>();
+    auto type = std::make_shared<DataTypeUInt64>();
+    auto constant = type->createColumnConstWithDefaultValue(0);
+    const auto & added = dag->addColumn(std::move(constant), type, "added");
+    dag->getOutputs().push_back(&added);
+    return dag;
+}
+
+TEST(ClusterFunctionReadTaskResponse, RejectsOutputOnlySchemaTransformOnProtocolBeforeDataLakeMetadata)
+{
+    ClusterFunctionReadTaskResponse response;
+    response.path = "/path/file.parquet";
+    response.data_lake_metadata.schema_transform = makeOutputOnlySchemaTransform();
+
+    String serialized;
+    WriteBufferFromString out(serialized);
+    try
+    {
+        response.serialize(out, DBMS_CLUSTER_INITIAL_PROCESSING_PROTOCOL_VERSION, DBMS_ANTALYA_PROTOCOL_VERSION);
+        FAIL() << "Expected exception";
+    }
+    catch (const Exception & e)
+    {
+        EXPECT_EQ(e.code(), ErrorCodes::UNKNOWN_PROTOCOL);
+        EXPECT_NE(e.message().find("schema_transform"), std::string::npos);
+    }
+}
+
+TEST(ClusterFunctionReadTaskResponse, RoundTripsOutputOnlySchemaTransformOnSupportedProtocol)
+{
+    ClusterFunctionReadTaskResponse response;
+    response.path = "/path/file.parquet";
+    response.data_lake_metadata.schema_transform = makeOutputOnlySchemaTransform();
+
+    String serialized;
+    WriteBufferFromString out(serialized);
+    response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_DATA_LAKE_METADATA, DBMS_ANTALYA_PROTOCOL_VERSION);
+    out.finalize();
+
+    ReadBufferFromString in(serialized);
+    ClusterFunctionReadTaskResponse deserialized;
+    deserialized.deserialize(in, DBMS_ANTALYA_PROTOCOL_VERSION);
+
+    ASSERT_TRUE(deserialized.data_lake_metadata.schema_transform);
+    EXPECT_TRUE(deserialized.data_lake_metadata.schema_transform->getInputs().empty());
+    ASSERT_EQ(deserialized.data_lake_metadata.schema_transform->getOutputs().size(), 1u);
+    EXPECT_EQ(deserialized.data_lake_metadata.schema_transform->getOutputs().front()->result_name, "added");
+}
+
+TEST(ClusterFunctionReadTaskResponse, DropsEmptySchemaTransformSentinel)
+{
+    ClusterFunctionReadTaskResponse response;
+    response.path = "/path/file.parquet";
+
+    String serialized;
+    WriteBufferFromString out(serialized);
+    response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_DATA_LAKE_METADATA, DBMS_ANTALYA_PROTOCOL_VERSION);
+    out.finalize();
+
+    ReadBufferFromString in(serialized);
+    ClusterFunctionReadTaskResponse deserialized;
+    deserialized.deserialize(in, DBMS_ANTALYA_PROTOCOL_VERSION);
+
+    EXPECT_FALSE(deserialized.data_lake_metadata.schema_transform);
+}
+
 TEST(ClusterFunctionReadTaskResponse, AllowsEmptySchemaTransformOnProtocolBeforeDataLakeMetadata)
 {
     ClusterFunctionReadTaskResponse response;

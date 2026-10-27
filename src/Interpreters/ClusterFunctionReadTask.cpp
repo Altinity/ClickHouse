@@ -27,6 +27,18 @@ namespace Setting
     extern const SettingsBool cluster_function_process_archive_on_multiple_nodes;
 }
 
+namespace
+{
+
+/// An empty DAG is the on-wire stand-in for a missing `schema_transform`. A transform that only
+/// adds columns has outputs and no inputs; that is still schema evolution and must be kept.
+bool schemaTransformCarriesColumns(const ActionsDAG & dag)
+{
+    return !dag.getInputs().empty() || !dag.getOutputs().empty();
+}
+
+}
+
 ClusterFunctionReadTaskResponse::ClusterFunctionReadTaskResponse(ObjectInfoPtr object, const ContextPtr & context)
 {
     if (!object)
@@ -96,10 +108,11 @@ void ClusterFunctionReadTaskResponse::serialize(WriteBuffer & out, size_t worker
         = std::min(static_cast<UInt64>(worker_protocol_version), static_cast<UInt64>(DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION));
 
     /// Fail closed: protocol < 2 omits `schema_transform`, so workers would skip data-lake schema
-    /// evolution and return wrong columns / values.
+    /// evolution and return wrong columns / values. An output-only DAG (added columns, no inputs)
+    /// is still evolution; only a fully empty DAG is the missing-transform sentinel.
     if (protocol_version < DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_DATA_LAKE_METADATA
         && data_lake_metadata.schema_transform
-        && !data_lake_metadata.schema_transform->getInputs().empty())
+        && schemaTransformCarriesColumns(*data_lake_metadata.schema_transform))
     {
         throw Exception(
             ErrorCodes::UNKNOWN_PROTOCOL,
@@ -256,7 +269,7 @@ void ClusterFunctionReadTaskResponse::deserialize(ReadBuffer & in, UInt64 antaly
         /// Trusted intra-cluster metadata: decode types without the input complexity limit.
         auto transform = std::make_shared<ActionsDAG>(ActionsDAG::deserialize(in, registry, Context::getGlobalContextInstance(), 0));
 
-        if (!path.empty() && !transform->getInputs().empty())
+        if (!path.empty() && schemaTransformCarriesColumns(*transform))
         {
             data_lake_metadata.schema_transform = std::move(transform);
         }
