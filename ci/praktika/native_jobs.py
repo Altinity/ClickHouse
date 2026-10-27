@@ -1,4 +1,5 @@
 import dataclasses
+import hashlib
 import json
 import platform
 import os
@@ -38,6 +39,102 @@ def _GH_Auth(workflow, force=False):
         GHAuth.auth(app_id=app_id, app_key=pem)
 
 
+def _submodule_auth_env() -> dict:
+    env = os.environ.copy()
+    if not Settings.ENABLE_SUBMODULE_CLONE_AUTH:
+        return env
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or ""
+    if not token:
+        token = Shell.get_output("gh auth token") or ""
+    if not token:
+        print("WARNING: no GH token available, submodule clones run anonymously")
+        return env
+    env["GIT_CONFIG_COUNT"] = "1"
+    env["GIT_CONFIG_KEY_0"] = (
+        f"url.https://x-access-token:{token}@github.com/.insteadOf"
+    )
+    env["GIT_CONFIG_VALUE_0"] = "https://github.com/"
+    return env
+
+
+def _prepare_submodule_cache(workflow_config: RunConfig) -> Result:
+    """Compute a content-addressed hash of submodule SHAs and ensure a cache
+    archive exists in S3. Stores the hash in workflow_config so that downstream
+    jobs with needs_submodules=True can restore it."""
+    stop_watch = Utils.Stopwatch()
+    info = ""
+    try:
+        submodule_shas = Digest.get_submodule_shas()
+        if not submodule_shas:
+            print("WARNING: No submodules found, skipping submodule cache")
+            return Result.create_from(
+                name="Submodule Cache",
+                status=Result.Status.SUCCESS,
+                stopwatch=stop_watch,
+                info="No submodules",
+            )
+
+        cache_hash = hashlib.sha256(submodule_shas.encode()).hexdigest()[:16]
+        s3_path = f"{Settings.CACHE_S3_PATH}/submodules/{cache_hash}.tar.zst"
+        print(f"Submodule cache hash: {cache_hash}")
+
+        if S3.head_object(s3_path):
+            print(f"Submodule cache hit: {s3_path}")
+            info = f"cache hit: {cache_hash}"
+        else:
+            print(f"Submodule cache miss, creating: {s3_path}")
+            Shell.check("git submodule sync", verbose=True, strict=True)
+            Shell.check("git submodule init", verbose=True, strict=True)
+            Shell.check(
+                "git submodule update --depth=1 --single-branch --jobs 64",
+                verbose=True,
+                strict=True,
+                retries=3,
+                env=_submodule_auth_env(),
+            )
+            archive_path = f"{Settings.TEMP_DIR}/submodules_{cache_hash}.tar.zst"
+            Shell.check(
+                f"tar -cf - .git/modules | zstd -c -T0 > {archive_path}",
+                verbose=True,
+                strict=True,
+            )
+            # Write-once conditional create (If-None-Match: *) instead of an
+            # unconditional overwrite. The object is content-addressed by the
+            # submodule SHAs, so it never legitimately changes.
+            created = S3.put(
+                s3_path=s3_path,
+                local_path=archive_path,
+                if_none_matched=True,
+                no_strict=True,
+            )
+            Shell.check(f"rm -f {archive_path}")
+            if not created and not S3.head_object(s3_path):
+                raise RuntimeError(f"failed to upload submodule cache {s3_path}")
+            info = (
+                f"cache miss, created: {cache_hash}"
+                if created
+                else f"cache miss, created concurrently: {cache_hash}"
+            )
+
+        workflow_config.submodule_cache_hash = cache_hash
+        workflow_config.dump()
+        status = Result.Status.SUCCESS
+    except Exception as e:
+        print(f"ERROR: Submodule cache failed: {e}")
+        traceback.print_exc()
+        info = f"{e}\n{traceback.format_exc()}"
+        # Do not continue with an empty submodule_cache_hash. Builds would
+        # skip the restore and clone the same pins themselves.
+        status = Result.Status.FAILED
+
+    return Result.create_from(
+        name="Submodule Cache",
+        status=status,
+        stopwatch=stop_watch,
+        info=info,
+    )
+
+
 _workflow_config_job = Job.Config(
     name=Settings.CI_CONFIG_JOB_NAME,
     runs_on=Settings.CI_CONFIG_RUNS_ON,
@@ -50,7 +147,9 @@ _workflow_config_job = Job.Config(
         else None
     ),
     command=f"{Settings.PYTHON_INTERPRETER} -m praktika.native_jobs '{Settings.CI_CONFIG_JOB_NAME}'",
-    timeout=600,
+    # On a submodule-cache miss this job clones all submodules
+    # (see _prepare_submodule_cache), which can take well over 10 minutes.
+    timeout=1800,
 )
 
 _docker_build_manifest_job = Job.Config(
@@ -360,6 +459,7 @@ def _config_workflow(workflow: Workflow.Config, job_name) -> Result:
         cache_artifacts={},
         cache_jobs={},
         filtered_jobs={},
+        submodule_cache_hash="",
         custom_data={},
     ).dump()
 
@@ -604,6 +704,14 @@ def _config_workflow(workflow: Workflow.Config, job_name) -> Result:
                 info=info,
             )
         )
+
+    if (
+        results[-1].is_ok()
+        and workflow.enable_cache
+        and Settings.ENABLE_SUBMODULE_CACHE
+    ):
+        result = _prepare_submodule_cache(workflow_config)
+        results.append(result)
 
     if workflow.enable_slack_feed:
         if env.PR_NUMBER:
