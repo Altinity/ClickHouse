@@ -228,6 +228,15 @@ def main():
         print(f"ThinLTO cache is enabled in {thinlto_cache_dir}")
         cmake_cmd += f" -DTHINLTO_CACHE_DIR={thinlto_cache_dir}"
 
+    # Link `clickhouse` and `clickhouse-keeper` concurrently. Each ThinLTO link
+    # spends most of its time in a single-threaded thin-link phase, so the two
+    # overlap almost entirely: measured on a 16-core, 62 GB builder with zram,
+    # 114.5 -> 83 min cold and 65.5 -> 48.5 min warm. The memory-derived
+    # default in limit_jobs.cmake budgets ~100 GB per `-g` link and would
+    # allow only one; the real peak of both links together was ~48 GB.
+    if "ENABLE_THINLTO=1" in cmake_cmd:
+        cmake_cmd += " -DPARALLEL_LINK_JOBS=2"
+
     # PGO/BOLT profile integration for release builds. The sccache-warmup builds
     # are deliberately excluded: they exist only to populate the shared compiler
     # cache, and PGO/BOLT belong to the real release builds.
