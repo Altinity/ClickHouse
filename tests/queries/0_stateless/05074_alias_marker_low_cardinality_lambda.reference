@@ -1,0 +1,28 @@
+payload_type
+LowCardinality(Nullable(Int64))	LowCardinality(Nullable(Int64))
+LowCardinality(Nullable(Int64))	LowCardinality(Nullable(Int64))
+LowCardinality(Nullable(Int64))	LowCardinality(Nullable(Int64))
+lambda_local
+[1]
+[2]
+[NULL]
+lambda_capture_local
+[1]
+[2]
+[NULL]
+lambda_distributed_ast
+[1]
+[2]
+[NULL]
+lambda_capture_distributed_ast
+[1]
+[2]
+[NULL]
+lambda_distributed_plan
+[1]
+[2]
+[NULL]
+lambda_capture_distributed_plan
+[1]
+[2]
+[NULL]

@@ -1989,6 +1989,7 @@ void loadFuzzerServerSettings(const FuzzConfig & fc)
            "iceberg_insert_max_bytes_in_data_file",
            "input_format_max_block_size_bytes",
            "input_format_parquet_dictionary_filter_push_down",
+           "input_format_parquet_footer_read_size",
            "input_format_parquet_local_file_min_bytes_for_seek",
            "input_format_parquet_prefer_block_bytes",
            "input_format_parquet_memory_low_watermark",
