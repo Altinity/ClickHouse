@@ -48,8 +48,10 @@ jobs:
 
       - name: Install ansible and required collections
         run: |
-          pip install --user ansible boto3 botocore natsort
-          ansible-galaxy collection install amazon.aws community.aws
+          sudo apt-get update
+          sudo apt-add-repository --yes --update ppa:ansible/ansible
+          sudo apt-get install -y ansible python3-pip
+          pip3 install boto3 botocore natsort --break-system-packages
 
       - name: Run static deploy playbook
         run: |
