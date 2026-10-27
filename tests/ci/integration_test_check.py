@@ -51,6 +51,7 @@ IMAGES = [
     "altinityinfra/mysql-php-client",
     "altinityinfra/nginx-dav",
     "altinityinfra/postgresql-java-client",
+    "altinityinfra/python-bottle",
 ]
 
 
