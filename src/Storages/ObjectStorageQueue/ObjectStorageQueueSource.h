@@ -38,6 +38,10 @@ public:
             const ObjectInfo & object_info,
             FileMetadataPtr file_metadata_);
 
+        /// Bucket splitting copies through `clone`. The base implementation slices to `ObjectInfo`
+        /// and drops `file_metadata`.
+        std::shared_ptr<ObjectInfo> clone() const override { return std::make_shared<ObjectStorageQueueObjectInfo>(*this); }
+
         FileMetadataPtr file_metadata;
     };
 

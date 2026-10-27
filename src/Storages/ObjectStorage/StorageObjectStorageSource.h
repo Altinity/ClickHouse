@@ -392,6 +392,10 @@ public:
 
         size_t fileSizeInArchive() const override { return file_info.uncompressed_size; }
 
+        /// Bucket splitting copies through `clone`. The base implementation slices to `ObjectInfo`
+        /// and drops the archive path, reader, and file info.
+        std::shared_ptr<ObjectInfo> clone() const override { return std::make_shared<ObjectInfoInArchive>(*this); }
+
         const ObjectInfoPtr archive_object;
         const std::string path_in_archive;
         const std::shared_ptr<IArchiveReader> archive_reader;
