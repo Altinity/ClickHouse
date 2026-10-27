@@ -954,7 +954,10 @@ bool applyIcebergIdentityPartitionAggregationIfPossible(
             return false;
     }
 
-    auto files = storage->getIdentityPartitionFiles(query_context);
+    /// Column types come from the storage snapshot pinned at analysis. Read that
+    /// `datalake_table_state`, not a commit that landed after the pin.
+    const auto & storage_snapshot = table_node ? table_node->getStorageSnapshot() : table_function_node->getStorageSnapshot();
+    auto files = storage->getIdentityPartitionFiles(storage_snapshot->metadata, query_context);
     if (!files)
         return false;
 

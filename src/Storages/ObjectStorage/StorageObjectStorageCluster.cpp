@@ -331,12 +331,14 @@ std::optional<UInt64> StorageObjectStorageCluster::totalBytes(ContextPtr query_c
     return configuration->totalBytes(query_context);
 }
 
-std::optional<std::vector<IdentityPartitionFile>> StorageObjectStorageCluster::getIdentityPartitionFiles(ContextPtr query_context) const
+std::optional<std::vector<IdentityPartitionFile>> StorageObjectStorageCluster::getIdentityPartitionFiles(
+    const StorageMetadataPtr & storage_metadata, ContextPtr query_context) const
 {
     /// The initiator's `pure_storage` reads the snapshot once. Shards are not asked.
     /// `pure_storage` itself returns nullopt when `distributed_processing` is set.
+    /// `storage_metadata` is the cluster snapshot pinned at analysis. `pure_storage` shares this configuration.
     if (pure_storage)
-        return pure_storage->getIdentityPartitionFiles(query_context);
+        return pure_storage->getIdentityPartitionFiles(storage_metadata, query_context);
     return std::nullopt;
 }
 

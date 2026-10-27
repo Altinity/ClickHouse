@@ -588,7 +588,8 @@ std::optional<UInt64> StorageObjectStorage::totalBytes(ContextPtr query_context)
     return configuration->totalBytes(query_context);
 }
 
-std::optional<std::vector<IdentityPartitionFile>> StorageObjectStorage::getIdentityPartitionFiles(ContextPtr query_context) const
+std::optional<std::vector<IdentityPartitionFile>> StorageObjectStorage::getIdentityPartitionFiles(
+    const StorageMetadataPtr & storage_metadata, ContextPtr query_context) const
 {
 #if USE_AVRO
     /// A replica with `distributed_processing` sees only its own tasks. Answering from the whole
@@ -596,13 +597,19 @@ std::optional<std::vector<IdentityPartitionFile>> StorageObjectStorage::getIdent
     if (distributed_processing || !configuration->isIcebergConfiguration())
         return std::nullopt;
 
-    is_table_function ? configuration->lazyInitializeIfNeeded(object_storage, query_context) : configuration->update(object_storage, query_context);
+    /// Analysis pinned `datalake_table_state`. `configuration->update` would load a newer commit
+    /// and disagree with the column types of this query. A missing pin scans, and the read path pins one snapshot.
+    if (!storage_metadata || !storage_metadata->datalake_table_state.has_value())
+        return std::nullopt;
+
+    configuration->lazyInitializeIfNeeded(object_storage, query_context);
 
     auto iceberg = std::dynamic_pointer_cast<IcebergMetadata>(configuration->getExternalMetadata());
     if (!iceberg)
         return std::nullopt;
-    return iceberg->getDataFileIdentityPartitions(query_context);
+    return iceberg->getDataFileIdentityPartitions(storage_metadata, query_context);
 #else
+    (void)storage_metadata;
     (void)query_context;
     return std::nullopt;
 #endif

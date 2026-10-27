@@ -1630,9 +1630,15 @@ std::optional<size_t> IcebergMetadata::totalRows(ContextPtr local_context) const
     return static_cast<size_t>(result);
 }
 
-std::optional<std::vector<IdentityPartitionFile>> IcebergMetadata::getDataFileIdentityPartitions(ContextPtr local_context) const
+std::optional<std::vector<IdentityPartitionFile>> IcebergMetadata::getDataFileIdentityPartitions(
+    StorageMetadataPtr storage_metadata, ContextPtr local_context) const
 {
-    auto [actual_data_snapshot, actual_table_state_snapshot] = getRelevantState(local_context);
+    /// Same snapshot the scan uses. `getRelevantState` would read the latest metadata file instead.
+    auto table_state = extractIcebergSnapshotIdFromMetadataObject(storage_metadata);
+    if (!table_state)
+        return std::nullopt;
+
+    auto actual_data_snapshot = getRelevantDataSnapshotFromTableStateSnapshot(*table_state, local_context);
 
     if (!actual_data_snapshot)
         return std::vector<IdentityPartitionFile>{};
@@ -1650,7 +1656,7 @@ std::optional<std::vector<IdentityPartitionFile>> IcebergMetadata::getDataFileId
     for (const auto & manifest_list_entry : actual_data_snapshot->manifest_list_entries)
     {
         auto manifest_file_ptr = getManifestFileEntriesHandle(
-            object_storage, persistent_components, local_context, log, manifest_list_entry, actual_table_state_snapshot.schema_id, *external_storages);
+            object_storage, persistent_components, local_context, log, manifest_list_entry, table_state->schema_id, *external_storages);
 
         for (const auto & processed : manifest_file_ptr.getFilesWithoutDeleted(FileContentType::DATA))
             if (!isPathReadable(

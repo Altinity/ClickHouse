@@ -881,8 +881,9 @@ It is currently only implemented in StorageObjectStorage.
     virtual std::optional<UInt64> totalRowsByPartitionPredicate(const ActionsDAG &, ContextPtr) const { return {}; }
 
     /// Live data files with identity partition values and `record_count`.
-    /// nullopt means the storage cannot answer exactly, so the caller must scan.
-    virtual std::optional<std::vector<IdentityPartitionFile>> getIdentityPartitionFiles(ContextPtr) const { return {}; }
+    /// `storage_metadata` is the snapshot pinned at analysis. The files must come from that
+    /// state, not from a newer commit. nullopt means the storage cannot answer exactly, so the caller must scan.
+    virtual std::optional<std::vector<IdentityPartitionFile>> getIdentityPartitionFiles(const StorageMetadataPtr & /*storage_metadata*/, ContextPtr) const { return {}; }
 
     /// Aggregated `(num_rows, num_defaults)` for `column_name` across all visible parts,
     /// taken from per-part `SerializationInfo`. Returns nullopt when the storage cannot

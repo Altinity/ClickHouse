@@ -65,7 +65,7 @@ public:
 
     std::optional<UInt64> totalRows(ContextPtr query_context) const override;
     std::optional<UInt64> totalBytes(ContextPtr query_context) const override;
-    std::optional<std::vector<IdentityPartitionFile>> getIdentityPartitionFiles(ContextPtr query_context) const override;
+    std::optional<std::vector<IdentityPartitionFile>> getIdentityPartitionFiles(const StorageMetadataPtr & storage_metadata, ContextPtr query_context) const override;
 
     void setClusterNameFromFunctionArgument(bool cluster_name_from_function_argument_)
     {
