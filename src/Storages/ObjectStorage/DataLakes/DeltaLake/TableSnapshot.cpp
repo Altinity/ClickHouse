@@ -202,7 +202,8 @@ public:
                     /* schema */nullptr),
                 "scan");
 
-            if (engine_predicate_exception && enable_clustering_predicate_fallback && !clustering_columns.empty())
+            const bool full_translation_failed = engine_predicate_exception || predicate->hasUnsupportedNodes();
+            if (full_translation_failed && enable_clustering_predicate_fallback && !clustering_columns.empty())
             {
                 /// Full predicate translation failed. Try a fallback: restrict the filter
                 /// to only reference clustering columns (which always have per-file min/max stats).
@@ -232,7 +233,18 @@ public:
                 {
                     std::exception_ptr fallback_exception;
                     auto fallback_predicate = getEnginePredicate(restricted_dag, fallback_exception, nullptr);
-                    if (!fallback_exception)
+
+                    /// The predicate is translated inside `ffi::scan`, so its outcome is known only afterwards.
+                    KernelScan fallback_scan;
+                    fallback_scan = KernelUtils::unwrapResult(
+                        ffi::scan(
+                            kernel_snapshot_state->snapshot.get(),
+                            kernel_snapshot_state->engine.get(),
+                            fallback_predicate.get(),
+                            /* schema */nullptr),
+                        "scan");
+
+                    if (!fallback_exception && !fallback_predicate->hasUnsupportedNodes())
                     {
                         LOG_INFO(
                             log,
@@ -242,13 +254,7 @@ public:
 
                         ProfileEvents::increment(ProfileEvents::DeltaLakeClusteringPredicateFallbacks);
 
-                        scan = KernelUtils::unwrapResult(
-                            ffi::scan(
-                                kernel_snapshot_state->snapshot.get(),
-                                kernel_snapshot_state->engine.get(),
-                                fallback_predicate.get(),
-                                /* schema */nullptr),
-                            "scan");
+                        scan = std::move(fallback_scan);
                     }
                 }
             }

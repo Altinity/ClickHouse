@@ -5719,7 +5719,10 @@ def test_liquid_clustering_data_skipping(started_cluster):
 
     # Full scan — note the total scanned files.
     full_scan_id = f"{TABLE_NAME}_full_scan"
-    instance.query(f"SELECT count() FROM {TABLE_NAME}", query_id=full_scan_id)
+    instance.query(
+        f"SELECT count() FROM {TABLE_NAME} SETTINGS optimize_trivial_count_query = 0",
+        query_id=full_scan_id,
+    )
     instance.query("SYSTEM FLUSH LOGS")
     full_scan_files = int(
         instance.query(

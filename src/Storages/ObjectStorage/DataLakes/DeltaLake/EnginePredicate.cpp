@@ -99,6 +99,8 @@ struct EngineIteratorData
 
     bool hasException() const { return predicate.exception != nullptr; }
 
+    void markUnsupportedNode() { predicate.has_unsupported_nodes = true; }
+
     const LoggerPtr & log() const { return predicate.log; }
 
     const DB::ActionsDAG::Node * next()
@@ -160,6 +162,12 @@ private:
             {
                 return reinterpret_cast<const void *>(result);
             }
+
+            if (!iterator_data->hasException())
+            {
+                LOG_TEST(iterator_data->log(), "Unsupported node: {}", node->result_name);
+                iterator_data->markUnsupportedNode();
+            }
         }
         catch (...)
         {
@@ -179,7 +187,11 @@ uintptr_t EnginePredicate::visitPredicate(void * data, ffi::KernelExpressionVisi
     EngineIterator engine_iterator(iterator_data);
     auto result = ffi::visit_predicate_and(state, &engine_iterator);
 
-    LOG_TEST(iterator_data.log(), "visitPredicate finished (exception: {})", predicate->hasException());
+    LOG_TEST(
+        iterator_data.log(),
+        "visitPredicate finished (exception: {}, unsupported nodes: {})",
+        predicate->hasException(),
+        predicate->hasUnsupportedNodes());
     return result;
 }
 
