@@ -159,7 +159,7 @@ jobs:
       - name: Docker setup
         uses: ./.github/actions/docker_setup
         with:
-          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_USERNAME: altinityinfra
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Setup batch

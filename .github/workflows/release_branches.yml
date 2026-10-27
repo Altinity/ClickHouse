@@ -91,7 +91,7 @@ jobs:
       - name: Common docker setup
         uses: ./.github/actions/docker_setup
         with:
-          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_USERNAME: altinityinfra
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Download changed aarch64 images
