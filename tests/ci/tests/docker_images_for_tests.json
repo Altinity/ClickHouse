@@ -5,7 +5,9 @@
     },
     "docker/packager/binary": {
         "name": "altinityinfra/binary-builder",
-        "dependent": []
+        "dependent": [
+            "docker/test/codebrowser"
+        ]
     },
     "docker/test/compatibility/centos": {
         "name": "altinityinfra/test-old-centos",
@@ -17,6 +19,14 @@
     },
     "docker/test/integration/base": {
         "name": "altinityinfra/integration-test",
+        "dependent": []
+    },
+    "docker/test/fuzzer": {
+        "name": "altinityinfra/fuzzer",
+        "dependent": []
+    },
+    "docker/test/performance-comparison": {
+        "name": "altinityinfra/performance-comparison",
         "dependent": []
     },
     "docker/test/util": {
@@ -43,12 +53,24 @@
         "name": "altinityinfra/unit-test",
         "dependent": []
     },
+    "docker/test/stress": {
+        "name": "altinityinfra/stress-test",
+        "dependent": []
+    },
+    "docker/test/codebrowser": {
+        "name": "altinityinfra/codebrowser",
+        "dependent": []
+    },
     "docker/test/integration/runner": {
         "name": "altinityinfra/integration-tests-runner",
         "dependent": []
     },
     "docker/test/fasttest": {
         "name": "altinityinfra/fasttest",
+        "dependent": []
+    },
+    "docker/test/style": {
+        "name": "altinityinfra/style-test",
         "dependent": []
     },
     "docker/test/integration/s3_proxy": {
@@ -92,14 +114,14 @@
         "dependent": []
     },
     "docker/test/base": {
-        "name": "altinityinfra/test-base",
-        "dependent": [
+         "name": "altinityinfra/test-base",
+         "dependent": [
             "docker/test/stateless",
             "docker/test/integration/base",
             "docker/test/fuzzer",
             "docker/test/keeper-jepsen",
             "docker/test/sqltest"
-        ]
+         ]
     },
     "docker/test/integration/kerberized_hadoop": {
         "name": "altinityinfra/kerberized-hadoop",
@@ -111,6 +133,22 @@
     },
     "docker/test/keeper-jepsen": {
         "name": "altinityinfra/keeper-jepsen-test",
+        "dependent": []
+    },
+    "docker/docs/builder": {
+        "name": "altinityinfra/docs-builder",
+        "only_amd64": true,
+        "dependent": [
+            "docker/docs/check",
+            "docker/docs/release"
+        ]
+    },
+    "docker/docs/check": {
+        "name": "altinityinfra/docs-check",
+        "dependent": []
+    },
+    "docker/docs/release": {
+        "name": "altinityinfra/docs-release",
         "dependent": []
     },
     "docker/test/sqllogic": {
