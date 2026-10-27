@@ -211,6 +211,56 @@ ${CLICKHOUSE_CLIENT} --format TabSeparated --query "
     ORDER BY event_time_microseconds DESC
     LIMIT 1"
 
+# `rand()` differs per row. A match must not keep the whole file `record_count`.
+echo "rand_filter"
+${CLICKHOUSE_CLIENT} --query "
+    SELECT count() FROM ${LOCAL_TABLE}
+    WHERE rand() % 2 = 0
+    SETTINGS
+        log_comment = '${PREFIX}_rand_filter',
+        log_queries = 1,
+        optimize_trivial_count_query = 1,
+        use_iceberg_metadata_files_cache = 0,
+        enable_parallel_replicas = 0" > /dev/null
+${CLICKHOUSE_CLIENT} --query "SYSTEM FLUSH LOGS query_log"
+${CLICKHOUSE_CLIENT} --format TabSeparated --query "
+    SELECT if(
+        read_rows >= 10000,
+        'data',
+        concat('metadata read_rows=', toString(read_rows)))
+    FROM system.query_log
+    WHERE type = 'QueryFinish'
+        AND is_initial_query
+        AND current_database = currentDatabase()
+        AND log_comment = '${PREFIX}_rand_filter'
+    ORDER BY event_time_microseconds DESC
+    LIMIT 1"
+
+# `toYear(d)` is the same for every row of an identity partition file.
+echo "to_year"
+${CLICKHOUSE_CLIENT} --format TabSeparated --query "
+    SELECT count() FROM ${LOCAL_TABLE}
+    WHERE toYear(d) = 2026
+    SETTINGS
+        log_comment = '${PREFIX}_to_year',
+        log_queries = 1,
+        optimize_trivial_count_query = 1,
+        use_iceberg_metadata_files_cache = 0,
+        enable_parallel_replicas = 0"
+${CLICKHOUSE_CLIENT} --query "SYSTEM FLUSH LOGS query_log"
+${CLICKHOUSE_CLIENT} --format TabSeparated --query "
+    SELECT if(
+        read_rows <= 10,
+        'metadata',
+        concat('data read_rows=', toString(read_rows)))
+    FROM system.query_log
+    WHERE type = 'QueryFinish'
+        AND is_initial_query
+        AND current_database = currentDatabase()
+        AND log_comment = '${PREFIX}_to_year'
+    ORDER BY event_time_microseconds DESC
+    LIMIT 1"
+
 exercise "icebergLocal" "icebergLocal('${LOCAL_PATH}')"
 
 create_table "${S3_TABLE}" "IcebergS3(s3_conn, filename = '${S3_KEY}')"

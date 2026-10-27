@@ -821,6 +821,15 @@ bool applyIcebergIdentityPartitionAggregationIfPossible(
                 const auto & function = node->as<const FunctionNode &>();
                 if (!function.isOrdinaryFunction() || function.getFunctionName() == "arrayJoin")
                     return false;
+                /// One file stands for every row in it. `rand` and `rowNumberInBlock` differ per row,
+                /// and `sleep` is observable each time it runs. A deterministic function of the identity
+                /// value, such as `toYear(d)`, is the same for every row in the file.
+                const auto resolved = function.getFunction();
+                if (!resolved
+                    || !resolved->isDeterministicInScopeOfQuery()
+                    || resolved->isStateful()
+                    || resolved->hasObservableSideEffects())
+                    return false;
                 for (const auto & argument : function.getArguments().getNodes())
                 {
                     if (!self(argument, out, self))
