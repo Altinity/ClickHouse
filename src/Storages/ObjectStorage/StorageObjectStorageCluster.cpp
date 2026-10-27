@@ -1146,6 +1146,13 @@ bool StorageObjectStorageCluster::supportsSubcolumns() const
     return IStorageCluster::supportsSubcolumns();
 }
 
+bool StorageObjectStorageCluster::supportsColumnsWithDynamicStructure() const
+{
+    if (pure_storage)
+        return pure_storage->supportsColumnsWithDynamicStructure();
+    return IStorageCluster::supportsColumnsWithDynamicStructure();
+}
+
 bool StorageObjectStorageCluster::supportsTrivialCountOptimization(const StorageSnapshotPtr & snapshot, ContextPtr context) const
 {
     if (pure_storage)

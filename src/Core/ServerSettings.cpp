@@ -184,6 +184,11 @@ A value of `0` means unlimited.
     DECLARE(UInt64, max_format_parsing_thread_pool_size, 100, R"(
 Maximum total number of threads to use for parsing input.
 )", 0) \
+    DECLARE(UInt64, cas_blob_upload_pool_size, 16, R"(
+ClickHouse uses threads from this dedicated server-wide pool to upload blobs in parallel when
+committing a content-addressed (CAS) part. `cas_blob_upload_pool_size` limits the
+maximum number of threads in the pool. Zero is rejected: the pool must have at least one thread.
+)", 0) \
     DECLARE(UInt64, max_iceberg_manifest_decode_thread_pool_size, 100, R"(
 Maximum total number of threads to use for decoding Iceberg data manifest files.
 
@@ -2257,6 +2262,8 @@ void ServerSettings::checkUnknownSettings(const Poco::Util::AbstractConfiguratio
         "distributed_cache_log",
         "distributed_cache_server_log",
         "instrumentation_trace_log",
+        "cas_log",
+        "cas_gc_log",
         "default_system_log_flush_policy",
         "create_union_system_log_tables",
         /// Legacy system log section names that older releases (or cloud deployments) read but the

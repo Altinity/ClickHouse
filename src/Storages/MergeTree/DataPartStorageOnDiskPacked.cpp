@@ -1,4 +1,5 @@
 #include <Storages/MergeTree/DataPartStorageOnDiskPacked.h>
+#include <Common/FailPoint.h>
 
 #include <IO/Expect404ResponseScope.h>
 #include <IO/Operators.h>
@@ -19,8 +20,16 @@
 namespace DB
 {
 
+namespace FailPoints
+{
+    extern const char part_storage_fail_commit_transaction[];
+    extern const char part_storage_pause_before_commit_transaction[];
+    extern const char part_storage_pause_after_commit_transaction[];
+}
+
 namespace ErrorCodes
 {
+    extern const int FAULT_INJECTED;
     extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
     extern const int NOT_INITIALIZED;
@@ -78,7 +87,7 @@ DataPartStoragePtr DataPartStorageOnDiskPacked::getProjection(const std::string 
 
 bool DataPartStorageOnDiskPacked::exists() const
 {
-    return volume->getDisk()->existsFileOrDirectory(fs::path(root_path) / part_dir);
+    return existsDirectoryInTransactionOrDisk(fs::path(root_path) / part_dir);
 }
 
 bool DataPartStorageOnDiskPacked::existsDirectory(const std::string & file_name) const
@@ -89,7 +98,7 @@ bool DataPartStorageOnDiskPacked::existsDirectory(const std::string & file_name)
     /// exceed the OS filename limit, so probing them would throw ENAMETOOLONG instead of returning false
     /// and wrongly mark the part broken during checkConsistency.
     if (isWrittenSeparately(file_name))
-        return volume->getDisk()->existsDirectory(fs::path(root_path) / part_dir / file_name);
+        return existsDirectoryInTransactionOrDisk(fs::path(root_path) / part_dir / file_name);
     return false;
 }
 
@@ -97,12 +106,10 @@ class DataPartStorageIteratorOnDiskPacked final : public IDataPartStorageIterato
 {
 public:
     DataPartStorageIteratorOnDiskPacked(
-        Names files_, DiskPtr disk_,
-        const String & root_path_, const String & part_dir_)
+        Names files_, DataPartStorageIteratorPtr dir_it_, const String & part_dir_)
         : files(std::move(files_))
         , files_it(files.begin())
-        , disk(std::move(disk_))
-        , dir_it(disk->iterateDirectory(fs::path(root_path_) / part_dir_))
+        , dir_it(std::move(dir_it_))
         , part_dir(part_dir_)
     {
     }
@@ -135,7 +142,7 @@ public:
         if (files_it == files.end())
         {
             skipDataFile();
-            return dir_it->isValid() && disk->existsFile(dir_it->path());
+            return dir_it->isFile();
         }
 
         return true;
@@ -174,15 +181,15 @@ private:
     Names files;
     Names::const_iterator files_it;
 
-    DiskPtr disk;
-    DirectoryIteratorPtr dir_it;
+    DataPartStorageIteratorPtr dir_it;
     String part_dir;
 };
 
 DataPartStorageIteratorPtr DataPartStorageOnDiskPacked::iterate() const
 {
     auto files = reader ? reader->getFileNames() : Names{};
-    return std::make_unique<DataPartStorageIteratorOnDiskPacked>(std::move(files), volume->getDisk(), root_path, part_dir);
+    return std::make_unique<DataPartStorageIteratorOnDiskPacked>(
+        std::move(files), iterateDirectoryInTransactionOrDisk(fs::path(root_path) / part_dir), part_dir);
 }
 
 Poco::Timestamp DataPartStorageOnDiskPacked::getFileLastModified(const String & file_name) const
@@ -214,14 +221,13 @@ bool DataPartStorageOnDiskPacked::existsFileImpl(const std::string & file_name) 
             return true;
     }
 
-    auto disk = volume->getDisk();
     if (isWrittenSeparately(file_name))
-        return disk->existsFile(fs::path(root_path) / part_dir / file_name);
+        return existsFileInTransactionOrDisk(fs::path(root_path) / part_dir / file_name);
 
     if (!reader)
         return false;
 
-    return disk->existsFile(getRelativeDataPath()) && reader->exists(file_name);
+    return existsFileInTransactionOrDisk(getRelativeDataPath()) && reader->exists(file_name);
 }
 
 size_t DataPartStorageOnDiskPacked::getFileSizeImpl(const String & file_name) const
@@ -233,16 +239,15 @@ size_t DataPartStorageOnDiskPacked::getFileSizeImpl(const String & file_name) co
             return skip_reader->getFileSize(file_name);
     }
 
-    auto disk = volume->getDisk();
     if (isWrittenSeparately(file_name))
-        return disk->getFileSize(fs::path(root_path) / part_dir / file_name);
+        return getFileSizeInTransactionOrDisk(fs::path(root_path) / part_dir / file_name);
 
     /// The archive itself is a physical file on disk; its size can be read directly
     /// without going through the packed index (which only knows individual file sizes).
     if (file_name == DATA_FILE_NAME)
-        return disk->getFileSize(fs::path(root_path) / part_dir / DATA_FILE_NAME);
+        return getFileSizeInTransactionOrDisk(fs::path(root_path) / part_dir / DATA_FILE_NAME);
 
-    if (!disk->existsFile(getRelativeDataPath()))
+    if (!existsFileInTransactionOrDisk(getRelativeDataPath()))
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "File {} does not exist, cannot get file size of {}", getRelativeDataPath(), file_name);
 
     if (!reader)
@@ -254,15 +259,13 @@ size_t DataPartStorageOnDiskPacked::getFileSizeImpl(const String & file_name) co
 
 PackedFilesIO::FileOffset DataPartStorageOnDiskPacked::getFileOffsetAndSize(const std::string & file_name) const
 {
-    auto disk = volume->getDisk();
-
     if (file_name == DATA_FILE_NAME)
-        return {0, disk->getFileSize(fs::path(root_path) / part_dir / DATA_FILE_NAME)};
+        return {0, getFileSizeInTransactionOrDisk(fs::path(root_path) / part_dir / DATA_FILE_NAME)};
 
     if (isWrittenSeparately(file_name))
-        return {0, disk->getFileSize(fs::path(root_path) / part_dir / file_name)};
+        return {0, getFileSizeInTransactionOrDisk(fs::path(root_path) / part_dir / file_name)};
 
-    if (!disk->existsFile(getRelativeDataPath()))
+    if (!existsFileInTransactionOrDisk(getRelativeDataPath()))
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "File {} does not exist, cannot get file size of {}", getRelativeDataPath(), file_name);
 
     if (!reader)
@@ -297,7 +300,7 @@ std::vector<std::string> DataPartStorageOnDiskPacked::getRemotePaths(const std::
     if (isWrittenSeparately(file_name))
         file_path = fs::path(root_path) / part_dir / file_name;
 
-    auto objects = volume->getDisk()->getStorageObjects(file_path);
+    auto objects = getStorageObjectsInTransactionOrDisk(file_path);
 
     std::vector<std::string> remote_paths;
     remote_paths.reserve(objects.size());
@@ -341,8 +344,7 @@ void DataPartStorageOnDiskPacked::prepareReadImpl(
                 [this, file_name = name, inner](const StoredObject &, const ReadSettings & s, bool, bool)
                     -> std::unique_ptr<ReadBufferFromFileBase>
                 {
-                    auto outer_buf = reader->readFile(
-                        volume->getDisk(), getRelativeDataPath(), String(SKIP_INDICES_PACKED_FILENAME), s, std::nullopt);
+                    auto outer_buf = readArchiveFile(String(SKIP_INDICES_PACKED_FILENAME), s, std::nullopt);
                     return std::make_unique<ReadBufferFromFileView>(std::move(outer_buf), file_name, inner.offset, inner.offset + inner.size);
                 };
             pipeline.setSource(std::move(creator), StoredObjects{StoredObject{}}, settings);
@@ -352,7 +354,7 @@ void DataPartStorageOnDiskPacked::prepareReadImpl(
 
     if (isWrittenSeparately(name))
     {
-        volume->getDisk()->prepareRead(fs::path(root_path) / part_dir / name, settings, read_hint, pipeline);
+        prepareReadInTransactionOrDisk(fs::path(root_path) / part_dir / name, settings, read_hint, pipeline);
         return;
     }
 
@@ -365,7 +367,7 @@ void DataPartStorageOnDiskPacked::prepareReadImpl(
         [this, file_name = name, read_hint](const StoredObject &, const ReadSettings & read_settings, bool, bool)
             -> std::unique_ptr<ReadBufferFromFileBase>
         {
-            return reader->readFile(volume->getDisk(), getRelativeDataPath(), file_name, read_settings, read_hint);
+            return readArchiveFile(file_name, read_settings, read_hint);
         },
         StoredObjects{StoredObject(name, "", reader->getFileSize(name))},
         settings);
@@ -523,9 +525,11 @@ void DataPartStorageOnDiskPacked::createProjection(const std::string & name)
 
 void DataPartStorageOnDiskPacked::beginTransaction()
 {
+    if (has_shared_transaction)
+        return;
+
     if (transaction || writer)
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "Uncommitted{}transaction already exists", has_shared_transaction ? " shared " : " ");
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Uncommitted transaction already exists");
 
     transaction = volume->getDisk()->createTransaction();
     resetWriterFromTransaction();
@@ -548,14 +552,22 @@ void DataPartStorageOnDiskPacked::commitTransaction()
     if (!transaction || (!writer && !is_precommitted))
         throw Exception(ErrorCodes::LOGICAL_ERROR, "There is no uncommitted transaction");
 
-    if (has_shared_transaction)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot commit shared transaction");
-
     if (!is_precommitted)
     {
         finalizeWriter();
         is_precommitted = true;
     }
+
+    if (has_shared_transaction)
+        return;
+
+    /// The same fault-injection seams as the Full storage: a test fails or holds the close of the PART's
+    /// disk transaction whatever storage format the randomized settings picked.
+    fiu_do_on(FailPoints::part_storage_fail_commit_transaction,
+    {
+        throw Exception(ErrorCodes::FAULT_INJECTED, "part_storage_fail_commit_transaction");
+    });
+    FailPointInjection::pauseFailPoint(FailPoints::part_storage_pause_before_commit_transaction);
 
     transaction->commit();
 
@@ -564,6 +576,17 @@ void DataPartStorageOnDiskPacked::commitTransaction()
 
     transaction.reset();
     is_precommitted = false;
+
+    /// Lets a test stop the process between the durable commit and the rename that follows.
+    FailPointInjection::pauseFailPoint(FailPoints::part_storage_pause_after_commit_transaction);
+}
+
+void DataPartStorageOnDiskPacked::checkpointTransaction()
+{
+    if (isContentAddressed())
+        return;
+
+    IDataPartStorage::checkpointTransaction();
 }
 
 #if CLICKHOUSE_CLOUD
@@ -572,14 +595,14 @@ TransactionCommitOutcomeVariant DataPartStorageOnDiskPacked::tryCommitTransactio
     if (!transaction || (!writer && !is_precommitted))
         throw Exception(ErrorCodes::LOGICAL_ERROR, "There is no uncommitted transaction");
 
-    if (has_shared_transaction)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot commit shared transaction");
-
     if (!is_precommitted)
     {
         finalizeWriter();
         is_precommitted = true;
     }
+
+    if (has_shared_transaction)
+        return true;
 
     auto result = transaction->tryCommit(options);
 
@@ -601,7 +624,7 @@ void DataPartStorageOnDiskPacked::undoTransaction()
         return;
 
     if (has_shared_transaction)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot commit shared transaction");
+        return;
 
     transaction->undo();
     transaction.reset();
@@ -615,6 +638,34 @@ void DataPartStorageOnDiskPacked::undoTransaction()
 String DataPartStorageOnDiskPacked::getRelativeDataPath() const
 {
     return fs::path(root_path) / part_dir / DATA_FILE_NAME;
+}
+
+std::unique_ptr<ReadBufferFromFileBase> DataPartStorageOnDiskPacked::readArchive(
+    const String & archive_path,
+    const ReadSettings & settings,
+    std::optional<size_t> read_hint) const
+{
+    auto buffer = readFileIfExistsInTransactionOrDisk(archive_path, PackedFilesReader::patchSettings(settings), read_hint);
+    if (!buffer)
+        throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "File {} does not exist", archive_path);
+    return buffer;
+}
+
+std::unique_ptr<ReadBufferFromFileBase> DataPartStorageOnDiskPacked::readArchive(
+    const ReadSettings & settings,
+    std::optional<size_t> read_hint) const
+{
+    return readArchive(getRelativeDataPath(), settings, read_hint);
+}
+
+std::unique_ptr<ReadBufferFromFileBase> DataPartStorageOnDiskPacked::readArchiveFile(
+    const String & file_name,
+    const ReadSettings & settings,
+    std::optional<size_t> read_hint) const
+{
+    if (!reader)
+        throw Exception(ErrorCodes::NOT_INITIALIZED, "Cannot read file, because reader is not initialized");
+    return reader->readFile(readArchive(settings, read_hint), file_name);
 }
 
 bool DataPartStorageOnDiskPacked::isWrittenSeparately(const String & file_name) const
@@ -661,8 +712,11 @@ void DataPartStorageOnDiskPacked::resetReader(const ReadSettings & read_settings
         return;
 
     auto data_path = getRelativeDataPath();
-    if (volume->getDisk()->existsFile(data_path))
-        reader.emplace(volume->getDisk(), data_path, read_settings);
+    if (existsFileInTransactionOrDisk(data_path))
+    {
+        auto buffer = readArchive(read_settings, std::nullopt);
+        reader.emplace(*buffer);
+    }
 }
 
 std::shared_ptr<const PackedFilesReader> DataPartStorageOnDiskPacked::getSkipIndicesPackedReader() const
@@ -695,13 +749,13 @@ std::shared_ptr<const PackedFilesReader> DataPartStorageOnDiskPacked::getSkipInd
         try
         {
             auto inner_archive_buf = reader->readFile(
-                volume->getDisk(), data_path, String(SKIP_INDICES_PACKED_FILENAME), getReadSettings(), std::nullopt);
+                readArchive(data_path, getReadSettings(), std::nullopt), String(SKIP_INDICES_PACKED_FILENAME));
             auto inner_index = PackedFilesReader::readIndex(*inner_archive_buf);
             seedSkipIndicesPackedReader(inner_index);
         }
         catch (const Exception &)
         {
-            if (volume->getDisk()->existsFile(data_path))
+            if (existsFileInTransactionOrDisk(data_path))
                 throw;
         }
     }
@@ -748,7 +802,7 @@ void DataPartStorageOnDiskPacked::finalizeWriter()
             if (writer->isWritten(name))
                 continue;
 
-            auto in = reader->readFile(volume->getDisk(), getRelativeDataPath(), name, {}, {});
+            auto in = readArchiveFile(name, {}, {});
             auto out = writer->writeFile(name);
 
             copyData(*in, *out);
@@ -927,7 +981,7 @@ MutableDataPartStoragePtr DataPartStorageOnDiskPacked::freeze(
                     continue;
             }
 
-            auto read_buf = reader->readFile(volume->getDisk(), getRelativeDataPath(), file, read_settings, {});
+            auto read_buf = readArchiveFile(file, read_settings, {});
             auto write_buf = dest_storage->writeFile(file, DBMS_DEFAULT_BUFFER_SIZE, WriteMode::Rewrite, write_settings);
             copyData(*read_buf, *write_buf);
             write_buf->finalize();
@@ -1067,7 +1121,7 @@ MutableDataPartStoragePtr DataPartStorageOnDiskPacked::freezeRemote(
                     continue;
             }
 
-            auto read_buf = reader->readFile(volume->getDisk(), getRelativeDataPath(), file, read_settings, {});
+            auto read_buf = readArchiveFile(file, read_settings, {});
             auto write_buf = dest_storage->writeFile(file, DBMS_DEFAULT_BUFFER_SIZE, WriteMode::Rewrite, write_settings);
             copyData(*read_buf, *write_buf);
             write_buf->finalize();
@@ -1098,7 +1152,7 @@ MutableDataPartStoragePtr DataPartStorageOnDiskPacked::freezeRemote(
             {
                 /// Transactions doesn't support copy between different metadata storages, so doing it manually
                 auto write_buf = dest_storage->transaction->writeFile(dest_storage->getRelativeDataPath(), DBMS_DEFAULT_BUFFER_SIZE, WriteMode::Rewrite, write_settings);
-                auto read_buf = src_disk->readFile(getRelativeDataPath(), read_settings);
+                auto read_buf = readArchive(read_settings, std::nullopt);
                 copyData(*read_buf, *write_buf);
                 write_buf->finalize();
             }

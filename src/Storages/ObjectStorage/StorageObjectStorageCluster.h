@@ -175,6 +175,8 @@ public:
 
     bool supportsSubcolumns() const override;
 
+    bool supportsColumnsWithDynamicStructure() const override;
+
     bool supportsTrivialCountOptimization(const StorageSnapshotPtr &, ContextPtr) const override;
 
     /// Things required for PREWHERE.
