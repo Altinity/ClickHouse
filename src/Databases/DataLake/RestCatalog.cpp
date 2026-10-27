@@ -1108,7 +1108,6 @@ void RestCatalog::sendRequest(const String & endpoint, Poco::JSON::Object::Ptr r
     const std::string body_str = DB::removeEscapedSlashes(oss.str());
 
     const auto & context = getContext();
-    context->getGlobalContext()->getHTTPHeaderFilter().checkAndNormalizeHeaders(headers);
 
     DB::ReadWriteBufferFromHTTP::OutStreamCallback out_stream_callback;
     if (!body_str.empty())
@@ -1127,6 +1126,7 @@ void RestCatalog::sendRequest(const String & endpoint, Poco::JSON::Object::Ptr r
 
     DB::HTTPHeaderEntries headers = getAuthHeaders(/* update_token = */ true, method, url, extra_headers, body_str);
     headers.emplace_back("Content-Type", "application/json");
+    context->getGlobalContext()->getHTTPHeaderFilter().checkAndNormalizeHeaders(headers);
     auto wb = DB::BuilderRWBufferFromHTTP(url)
         .withConnectionGroup(DB::HTTPConnectionGroupType::HTTP)
         .withMethod(method)
