@@ -250,6 +250,8 @@ def build_and_push_one_image(
 
     cmd = (
         "docker buildx build --builder default "
+        # A single image is required by `docker manifest create`, not an index with an attestation
+        "--provenance=false "
         f"--label build-url={GITHUB_RUN_URL} "
         f"{from_tag_arg}"
         # A hack to invalidate cache, grep for it in docker/ dir
