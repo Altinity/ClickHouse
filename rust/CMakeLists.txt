@@ -81,6 +81,8 @@ function(add_rust_subdirectory src)
     message(STATUS "Copy ${src} to ${dst}")
     file(COPY "${src}" DESTINATION "${CMAKE_CURRENT_BINARY_DIR}"
         PATTERN target EXCLUDE)
+    # The copied crate is outside of the workspace, give it the workspace lock file to keep dependency versions pinned
+    file(COPY "Cargo.lock" DESTINATION "${dst}")
     add_subdirectory("${dst}" "${dst}")
 
     # cmake -E copy* do now know how to exclude files
