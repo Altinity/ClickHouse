@@ -163,7 +163,6 @@ DiskObjectStorage::DiskObjectStorage(
         .is_encrypted = false,
         .is_cached = object_storages->takePointingTo(cluster->getLocalLocation())->supportsCache(),
         .zookeeper_name = metadata_storage->getZooKeeperName(),
-        .files_are_whole_objects = !metadata_storage->isContentAddressed(),
     };
     resource_changes_subscription = Context::getGlobalContextInstance()->getWorkloadEntityStoragePtr()->getAllEntitiesAndSubscribe(
         [this] (const std::vector<IWorkloadEntityStorage::Event> & events)
@@ -333,14 +332,12 @@ void DiskObjectStorage::copyFile( /// NOLINT
     const std::function<void()> & cancellation_hook)
 {
     auto component_guard = Coordination::setCurrentComponent("DiskObjectStorage::copyFile");
-    const auto source_description = getDataSourceDescription();
-    const auto destination_description = to_disk.getDataSourceDescription();
-    auto * to_disk_object_storage = dynamic_cast<DiskObjectStorage *>(&to_disk);
-    if (to_disk_object_storage && source_description == destination_description
-        && source_description.canUseNativeCopyWith(destination_description))
+    if (getDataSourceDescription() == to_disk.getDataSourceDescription()
+        && !isContentAddressed() && !to_disk.isContentAddressed())
     {
         /// It may use s3-server-side copy
-        auto transaction = createObjectStorageTransactionToAnotherDisk(*to_disk_object_storage);
+        auto & to_disk_object_storage = dynamic_cast<DiskObjectStorage &>(to_disk);
+        auto transaction = createObjectStorageTransactionToAnotherDisk(to_disk_object_storage);
         try
         {
             transaction->copyFile(from_file_path, to_file_path, read_settings, write_settings);
