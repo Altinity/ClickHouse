@@ -27,6 +27,8 @@ public:
     /// only to read the index here; they are not retained.
     PackedFilesReader(const DiskPtr & disk, const String & data_file_name, const ReadSettings & read_settings);
 
+    explicit PackedFilesReader(ReadBufferFromFileBase & data_file);
+
     /// Constructor that initializes the index by the provided one.
     explicit PackedFilesReader(PackedFilesIO::Index index_);
 
@@ -48,9 +50,14 @@ public:
         const ReadSettings & settings,
         std::optional<size_t> read_hint) const;
 
+    std::unique_ptr<ReadBufferFromFileBase> readFile(
+        std::unique_ptr<ReadBufferFromFileBase> data_file,
+        const String & file_name) const;
+
     const PackedFilesIO::Index & getIndex() const { return index; }
 
     static PackedFilesIO::Index readIndex(ReadBuffer & in);
+    static ReadSettings patchSettings(ReadSettings settings);
 
 private:
     /// Index of archive: immutable and path-independent.

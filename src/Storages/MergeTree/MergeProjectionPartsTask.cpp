@@ -128,6 +128,7 @@ bool MergeProjectionPartsTask::executeStep()
 
         /// FIXME (alesapin) we should use some temporary storage for this,
         /// not commit each subprojection part
+        /// On a content-addressed disk the sub-part shares the parent's transaction, where commitTransaction is a no-op.
         next_level_parts.back()->getDataPartStorage().commitTransaction();
         next_level_parts.back()->is_temp = true;
         next_level_parts.back()->temp_projection_block_number = block_num;

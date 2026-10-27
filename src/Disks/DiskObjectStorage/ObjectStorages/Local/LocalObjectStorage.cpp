@@ -733,6 +733,11 @@ std::optional<ObjectMetadata> LocalObjectStorage::tryGetObjectMetadata(const std
     auto resolved_path = resolvePathRelativelyToKeyPrefix(path);
     LOG_TEST(log, "Getting metadata for path: {}", resolved_path);
 
+    /// A directory is not an object; report it as absent instead of surfacing "Is a directory".
+    std::error_code error;
+    if (fs::is_directory(resolved_path, error))
+        return {};
+
     return tryStatResolvedPath(resolved_path);
 }
 

@@ -162,6 +162,12 @@ MergeTreeDataPartBuilder & MergeTreeDataPartBuilder::withPartType(MergeTreeDataP
 
 MergeTreeDataPartBuilder & MergeTreeDataPartBuilder::withPartStorageType(MergeTreeDataPartStorageType storage_type_)
 {
+    if (volume
+        && intent == PartDirIntent::CreateFresh
+        && storage_type_ == MergeTreeDataPartStorageType::Packed
+        && !volume->getDisk()->allowsPackedParts())
+        storage_type_ = MergeTreeDataPartStorageType::Full;
+
     part_storage = getPartStorageByType(storage_type_, volume, root_path, part_dir, intent == PartDirIntent::OpenExisting, read_settings);
     return *this;
 }
