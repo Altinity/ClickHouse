@@ -19,15 +19,8 @@
 #include <Columns/ColumnArray.h>
 #include <Columns/ColumnConst.h>
 #include <DataTypes/DataTypeArray.h>
-<<<<<<< HEAD
-=======
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeNullable.h>
-#include <DataTypes/DataTypesNumber.h>
-#include <DataTypes/NestedUtils.h>
-#include <Interpreters/RequiredSourceColumnsVisitor.h>
-#include <Storages/ColumnsDescription.h>
->>>>>>> cceaa01663b (Merge pull request #102156 from il9ue/fix/nullable-cross-type-modify-upstream)
 #include <Storages/StorageInMemoryMetadata.h>
 
 namespace DB
@@ -175,19 +168,12 @@ ASTPtr convertRequiredExpressions(Block & block, const NamesAndTypesList & requi
                     "Please specify `DEFAULT` expression in ALTER MODIFY COLUMN statement",
                     required_column.name, column_in_block.type->getName(), required_column.type->getName());
 
-<<<<<<< HEAD
-            auto convert_func = makeASTFunction("_CAST",
-                makeASTFunction("ifNull", std::make_shared<ASTIdentifier>(required_column.name), default_value),
-                std::make_shared<ASTLiteral>(required_column.type->getName()));
-
-=======
             /// _CAST(if(isNull(col), _CAST(default, 'T'), _CAST(assumeNotNull(col), 'T')), 'T')
-            auto is_null = makeASTFunction("isNull", make_intrusive<ASTIdentifier>(required_column.name));
-            auto cast_default = makeASTFunction("_CAST", default_value, make_intrusive<ASTLiteral>(required_column.type->getName()));
-            auto cast_value = makeASTFunction("_CAST", makeASTFunction("assumeNotNull", make_intrusive<ASTIdentifier>(required_column.name)), make_intrusive<ASTLiteral>(required_column.type->getName()));
+            auto is_null = makeASTFunction("isNull", std::make_shared<ASTIdentifier>(required_column.name));
+            auto cast_default = makeASTFunction("_CAST", default_value, std::make_shared<ASTLiteral>(required_column.type->getName()));
+            auto cast_value = makeASTFunction("_CAST", makeASTFunction("assumeNotNull", std::make_shared<ASTIdentifier>(required_column.name)), std::make_shared<ASTLiteral>(required_column.type->getName()));
             auto filled = makeASTFunction("if", std::move(is_null), std::move(cast_default), std::move(cast_value));
-            auto convert_func = makeASTFunction("_CAST", std::move(filled), make_intrusive<ASTLiteral>(required_column.type->getName()));
->>>>>>> cceaa01663b (Merge pull request #102156 from il9ue/fix/nullable-cross-type-modify-upstream)
+            auto convert_func = makeASTFunction("_CAST", std::move(filled), std::make_shared<ASTLiteral>(required_column.type->getName()));
             conversion_expr_list->children.emplace_back(setAlias(convert_func, required_column.name));
 
             continue;
