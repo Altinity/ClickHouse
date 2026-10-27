@@ -66,7 +66,7 @@ The files of a part fall into two categories:
 
 | Category | Example | How it is copied |
 |---|---|---|
-| Blob | `data.bin`, marks, `primary.idx` | an `UploadPartCopy` naming a byte range — only the payload moves, without the blob's internal header |
+| Blob | `data.bin`, marks, `primary.idx` | an `UploadPartCopy` naming a byte range — only the payload moves, without the blob's internal header; a blob of 5 MiB or smaller goes through buffers, see below |
 | Inside the manifest | `checksums.txt`, `count.txt`, `columns.txt` | read through the `CAS` read path and written through ClickHouse's buffers |
 
 A blob object is `[header][payload]`, so a file never starts at the beginning of its object. Every
@@ -75,9 +75,15 @@ into the backup, and a later restore would read wrong data.
 
 If a byte range cannot be copied inside `S3`, `CAS` does not fall back to copying the whole object —
 the file is read and written through ClickHouse instead. That is slower, but correct. ClickHouse takes
-that path on its own in three cases: the query sets `s3_allow_multipart_copy = 0`; the store is
-recognized as `GCS`, whose current XML API has no `UploadPartCopy`; or `UploadPartCopy` is refused with
-`AccessDenied`.
+that path on its own in four cases: the blob object is 5 MiB or smaller; the query sets
+`s3_allow_multipart_copy = 0`; the store is recognized as `GCS`, whose current XML API has no
+`UploadPartCopy`; or `UploadPartCopy` is refused with `AccessDenied`.
+
+The size limit comes from `S3`: it accepts a byte range in `UploadPartCopy` only if the source object
+is greater than 5 MB, and answers `InvalidRequest` otherwise. The limit is on the whole blob object,
+not on the upload part, so `s3_min_upload_part_size` does not change it. A small blob is read through
+the `CAS` read path and written through ClickHouse's buffers. In a table with small parts most blobs
+are below the limit, so most of its files take this path.
 
 A store that refuses `UploadPartCopy` with any other error fails the `BACKUP` instead, because
 ClickHouse cannot tell a missing capability from a transient failure. On such a store, set
@@ -136,9 +142,10 @@ It is a useful building block, not a replacement for `BACKUP`.
   store, and only when the destination is on the same endpoint as the pool. Other destinations,
   including `Disk(...)`, get the copy through ClickHouse's buffers.
 - A blob is copied inside `S3` only with multipart copy (`UploadPartCopy`), because only it can name a
-  byte range. With `s3_allow_multipart_copy = 0`, on a store recognized as `GCS`, and when
-  `UploadPartCopy` is refused with `AccessDenied`, every blob goes through ClickHouse's buffers
-  instead. A store that refuses `UploadPartCopy` with another error fails the `BACKUP`; set
+  byte range. A blob object of 5 MiB or smaller always goes through ClickHouse's buffers, because
+  `S3` accepts a byte-range copy only from a source object greater than 5 MB. With
+  `s3_allow_multipart_copy = 0`, on a store recognized as `GCS`, and when `UploadPartCopy` is refused
+  with `AccessDenied`, every blob goes through ClickHouse's buffers instead. A store that refuses `UploadPartCopy` with another error fails the `BACKUP`; set
   `s3_allow_multipart_copy = 0` there.
 - Restore onto a `CAS` disk always writes through ClickHouse, see [restore](#restore).
 - A disk-level write of a part file onto a `CAS` disk outside of a part transaction is rejected with
