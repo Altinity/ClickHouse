@@ -10,7 +10,6 @@ import json
 from datetime import datetime
 from datetime import timezone
 from functools import lru_cache
-from glob import glob
 import urllib.parse
 import re
 import subprocess
@@ -30,7 +29,14 @@ DATABASE_USER_VAR = "CLICKHOUSE_TEST_STAT_LOGIN"
 DATABASE_PASSWORD_VAR = "CLICKHOUSE_TEST_STAT_PASSWORD"
 S3_BUCKET = "altinity-build-artifacts"
 GITHUB_REPO = "Altinity/ClickHouse"
+GITHUB_GIT_URL = f"https://github.com/{GITHUB_REPO}.git"
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
+# Release tags are fetched here rather than refs/tags/ so local tags are never touched.
+RELEASE_TAG_REF_PREFIX = "refs/workflow-report/tags/"
+# Resolve from this file so discovery works from repo root or the action folder.
+KNOWN_FAILS_FILE = (
+    Path(__file__).resolve().parents[3] / "tests" / "broken_tests.yaml"
+)
 
 CVE_SEVERITY_ORDER = {"critical": 1, "high": 2, "medium": 3, "low": 4, "negligible": 5}
 
@@ -58,13 +64,28 @@ def query_dataframe_with_retry(
             wait = backoff_seconds * attempt
             time.sleep(wait)
 
-def get_commit_statuses(sha: str) -> pd.DataFrame:
+def _results_link_has_ref(target_url: str | None, ref: str) -> bool:
+    """
+    Whether a CI status results link has `ref` in it:`json.html?REF=<ref>&...` for
+    praktika jobs, `/REFs/<ref>/...` for regression jobs.
+    """
+    target_url = target_url or ""
+    return f"REF={ref}&" in target_url or f"/REFs/{ref}/" in target_url
+
+
+def get_commit_statuses(sha: str, pr_number: int, ref: str) -> pd.DataFrame:
     """
     Fetch commit statuses for a given SHA and return as a pandas DataFrame.
     Handles pagination to get all statuses.
 
+    Statuses belong to the commit, not the ref, so a release tag and its branch
+    can write to the same job names. For release runs (`pr_number` 0), only
+    statuses of `ref` are kept.
+
     Args:
         sha (str): Commit SHA to fetch statuses for.
+        pr_number (int): Pull request number, 0 for release runs.
+        ref (str): Ref of the run being reported.
 
     Returns:
         pd.DataFrame: DataFrame containing all statuses.
@@ -113,6 +134,7 @@ def get_commit_statuses(sha: str) -> pd.DataFrame:
             "results_link": item["target_url"],
         }
         for item in all_data
+        if pr_number != 0 or _results_link_has_ref(item["target_url"], ref)
     ]
 
     # Create DataFrame
@@ -213,8 +235,10 @@ def _enrich_prs_in_release_merge_prs(df: pd.DataFrame, repo: str) -> pd.DataFram
 
 
 def _git_rev_parse(ref: str, cwd: str | None) -> str | None:
+    # Peel to a commit so a raw SHA that is not in the object store fails.
+    # git rev-parse --verify <40-hex> succeeds even when the object is missing.
     p = subprocess.run(
-        ["git", "rev-parse", "--verify", ref],
+        ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
         cwd=cwd,
         capture_output=True,
         text=True,
@@ -234,7 +258,7 @@ def _git_is_ancestor(ancestor: str, descendant: str, cwd: str | None) -> bool:
 
 
 def _git_log_merge_prs(
-    baseline: str, branch_ref: str, cwd: str | None, repo: str
+    baseline: str, commit_sha: str, cwd: str | None, repo: str
 ) -> pd.DataFrame:
     p = subprocess.run(
         [
@@ -242,7 +266,7 @@ def _git_log_merge_prs(
             "-c",
             "core.quotepath=false",
             "log",
-            f"{baseline}..{branch_ref}",
+            f"{baseline}..{commit_sha}",
             "--merges",
             "--format=%H%x09%s",
         ],
@@ -262,7 +286,7 @@ def _git_log_merge_prs(
         if not m:
             continue
         pr_number, head_owner = int(m.group(1)), m.group(2)
-        if head_owner.lower() != repo.split("/")[0].lower():
+        if head_owner == 'ClickHouse':
             continue
         rows.append(
             {
@@ -278,11 +302,11 @@ def _git_log_merge_prs(
     return df
 
 
-def _find_release_baseline(
-    branch_ref: str, repo: str, cwd: str | None
-) -> tuple[str | None, str | None]:
+def _get_github_releases(repo: str) -> list[dict]:
+    """Non-draft GitHub releases of repo, newest first."""
     if not GITHUB_TOKEN:
-        return None, None
+        print("GITHUB_TOKEN is not set; skipping GitHub releases lookup")
+        return []
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github.v3+json",
@@ -295,33 +319,51 @@ def _find_release_baseline(
         raise Exception(
             f"GitHub API request failed: {response.status_code} {response.text}"
         )
-    for rel in response.json():
-        if rel.get("draft"):
-            continue
+    return [rel for rel in response.json() if not rel.get("draft")]
+
+
+def _find_release_baseline(
+    branch_ref: str,
+    releases: list[dict],
+    cwd: str | None,
+    commit_sha: str,
+) -> tuple[str | None, str | None, str | None]:
+    """Return (tag_name, tag_sha, published_date YYYY-MM-DD) for the latest
+    release tag in releases that is an ancestor of commit_sha.
+    Version-tag refs skip the matching release so the range is previous→this tag.
+    """
+    parsed = _parse_release_ref(branch_ref)
+    skip_current = parsed is not None and parsed[2] is not None
+    for rel in releases:
         tag_name = rel.get("tag_name")
         if not tag_name:
             continue
-        tag_sha = _git_rev_parse(tag_name, cwd)
+        tag_sha = _release_tag_sha(tag_name, cwd)
         if not tag_sha:
             continue
-        if not _git_is_ancestor(tag_sha, branch_ref, cwd):
+        if not _git_is_ancestor(tag_sha, commit_sha, cwd):
             continue
-        return tag_name, tag_sha
-    return None, None
+        if skip_current and _git_is_ancestor(commit_sha, tag_sha, cwd):
+            continue
+        published_at = rel.get("published_at") or rel.get("created_at") or ""
+        published_date = published_at[:10] if published_at else None
+        return tag_name, tag_sha, published_date
+    return None, None, None
 
 
-def _find_rebase_baseline(branch_ref: str, cwd: str | None) -> str | None:
+def _find_rebase_baseline(commit_sha: str, cwd: str | None) -> str | None:
     p = subprocess.run(
         [
             "git",
             "log",
-            branch_ref,
+            commit_sha,
             "--reverse",
             "-i",
             "-E",
             "--grep=^Rebase CICD",
             "--grep=Merge pull request .*rebase-cicd",
             "--grep=Merge pull request .*from Altinity/rebase/",
+            "--grep=Merge pull request .*from Altinity/bump/",
             "--format=%H",
         ],
         cwd=cwd,
@@ -336,50 +378,206 @@ def _find_rebase_baseline(branch_ref: str, cwd: str | None) -> str | None:
     return lines[0]
 
 
-def get_prs_in_release_dataframe(
-    branch_ref: str = "HEAD",
-    *,
-    repo: str = GITHUB_REPO,
-    cwd: str,
-) -> pd.DataFrame:
-    f"""
-    PRs merged into branch_ref that belong in the next release notes: after the latest GitHub
-    Release tag on this history, or after the oldest rebase bootstrap if no such tag exists.
-    Only merge commits whose subject has from <repo_owner>/ (e.g. from Altinity/) are included.
-    Columns: pr_number, pr_name, labels. Omits PRs labeled cicd.
-    """
-    branch_sha = _git_rev_parse(branch_ref, cwd)
-    if not branch_sha:
-        raise Exception(f"Cannot resolve branch ref: {branch_ref!r}")
-
-    # CI often checks out with --depth=1 and --no-tags; fetch enough history and tags once.
-    subprocess.run(
-        ["git", "fetch", "--tags", "origin"],
+def _git_commit_time(sha: str, cwd: str | None) -> str | None:
+    p = subprocess.run(
+        ["git", "show", "-s", "--format=%ct", sha],
         cwd=cwd,
         capture_output=True,
         text=True,
         check=False,
     )
+    if p.returncode != 0:
+        return None
+    timestamp = p.stdout.strip()
+    if not timestamp:
+        return None
+    return datetime.fromtimestamp(int(timestamp), timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
 
-    baseline_ref, baseline_sha = _find_release_baseline(branch_ref, repo, cwd)
-    if not baseline_sha:
-        # If no release tag, try to find rebase commit 500 commits back.
-        subprocess.run(
-            ["git", "fetch", "--deepen=500", "origin", branch_ref],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        rebase_sha = _find_rebase_baseline(branch_ref, cwd)
-        if not rebase_sha:
-            raise Exception(
-                "No release tag on this branch and no rebase bootstrap merge found"
+
+def _git_is_shallow(cwd: str | None) -> bool:
+    p = subprocess.run(
+        ["git", "rev-parse", "--is-shallow-repository"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return p.stdout.strip() == "true"
+
+
+def _git_fetch(options: list[str], refspecs: list[str], cwd: str | None) -> None:
+    p = subprocess.run(
+        ["git", "fetch", *options, GITHUB_GIT_URL, *refspecs],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if p.returncode != 0:
+        raise Exception(f"git fetch failed: {p.stderr.strip()}")
+
+
+def _release_tag_sha(tag_name: str, cwd: str | None) -> str | None:
+    return _git_rev_parse(f"{RELEASE_TAG_REF_PREFIX}{tag_name}", cwd)
+
+
+def _read_autogenerated_versions(sha: str, cwd: str | None) -> tuple[int, int]:
+    p = subprocess.run(
+        ["git", "show", f"{sha}:cmake/autogenerated_versions.txt"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    major = re.search(r"SET\(VERSION_MAJOR (\d+)\)", p.stdout)
+    minor = re.search(r"SET\(VERSION_MINOR (\d+)\)", p.stdout)
+    if not major or not minor:
+        raise Exception(f"Cannot read version from {sha}")
+    return int(major.group(1)), int(minor.group(1))
+
+
+def _filter_releases_to_version_line(
+    releases: list[dict],
+    branch_ref: str,
+    commit_sha: str,
+    cwd: str | None,
+) -> list[dict]:
+    """Keep GitHub releases that belong on commit_sha's version line."""
+    parsed = _parse_release_ref(branch_ref)
+    if parsed is not None:
+        flavour, minor_version, _ = parsed
+        suffix = f"altinity{flavour}"
+        prefix = f"v{minor_version}."
+        return [
+            rel
+            for rel in releases
+            if (tag := rel.get("tag_name"))
+            and tag.startswith(prefix)
+            and tag.endswith(f".{suffix}")
+        ]
+    major, minor = _read_autogenerated_versions(commit_sha, cwd)
+    prefix = f"v{major}.{minor}."
+    return [
+        rel
+        for rel in releases
+        if (tag := rel.get("tag_name")) and tag.startswith(prefix)
+    ]
+
+
+def _fetch_release_tags(releases: list[dict], cwd: str) -> None:
+    """Fetch release tags into RELEASE_TAG_REF_PREFIX; skip tags missing remotely."""
+    for rel in releases:
+        tag_name = rel.get("tag_name")
+        if not tag_name:
+            continue
+        try:
+            _git_fetch(
+                ["--no-tags"],
+                [f"+refs/tags/{tag_name}:{RELEASE_TAG_REF_PREFIX}{tag_name}"],
+                cwd,
             )
-        baseline_sha = rebase_sha
+        except Exception as e:
+            # NOTE (strtgbb): one deleted remote tag must not abort the section, but
+            # if it is the newest release the baseline moves back to an older one
+            print(f"WARNING: skipping release tag {tag_name}: {e}")
 
-    df = _git_log_merge_prs(baseline_sha, branch_ref, cwd, repo)
-    return _enrich_prs_in_release_merge_prs(df, repo)
+
+def _fetch_commit(commit_sha: str, cwd: str) -> None:
+    """Fetch the workflow commit from GITHUB_GIT_URL.
+
+    Local checkouts might be a different branch and might not have the run SHA yet.
+    --filter/--unshallow would convert a full clone into a partial one, so those
+    options are used only when the checkout is already shallow.
+    """
+    if _git_is_shallow(cwd):
+        _git_fetch(["--filter=tree:0", "--unshallow"], [commit_sha], cwd)
+    else:
+        _git_fetch(["--no-tags"], [commit_sha], cwd)
+
+
+def get_prs_in_release_dataframe(
+    branch_ref: str = "HEAD",
+    *,
+    repo: str = GITHUB_REPO,
+    cwd: str,
+    commit_sha: str,
+) -> tuple[pd.DataFrame, str | None]:
+    f"""
+    PRs merged into branch_ref that belong in the next release notes: after the latest GitHub
+    Release tag on this history, or after the oldest rebase bootstrap if no such tag exists.
+    Merge commits whose subject is from the upstream repository (ClickHouse/) are omitted.
+    Columns: pr_number, pr_name, labels.
+
+    commit_sha is the workflow commit from the GitHub Actions API.
+
+    Returns (dataframe, baseline commit time as UTC YYYY-MM-DDTHH:MM:SSZ or None).
+    """
+    _fetch_commit(commit_sha, cwd)
+    resolved = _git_rev_parse(commit_sha, cwd)
+    if not resolved:
+        raise Exception(f"Cannot resolve commit: {commit_sha!r}")
+    commit_sha = resolved
+
+    releases = _filter_releases_to_version_line(
+        _get_github_releases(repo), branch_ref, commit_sha, cwd
+    )
+    _fetch_release_tags(releases, cwd)
+
+    _, baseline_sha, _ = _find_release_baseline(
+        branch_ref, releases, cwd, commit_sha=commit_sha
+    )
+    if not baseline_sha:
+        baseline_sha = _find_rebase_baseline(commit_sha, cwd)
+
+    if not baseline_sha:
+        raise Exception(
+            "No release tag on this branch and no rebase bootstrap merge found"
+        )
+
+    df = _git_log_merge_prs(baseline_sha, commit_sha, cwd, repo)
+    return (
+        _enrich_prs_in_release_merge_prs(df, repo),
+        _git_commit_time(baseline_sha, cwd),
+    )
+
+
+def _parse_release_ref(ref_name: str) -> tuple[str, str, str | None] | None:
+    """Parse a release ref into (flavour, minor_version, full_version).
+
+    Handles version tags (``v25.8.28.10001.altinitystable``) and release
+    branches (``stable-25.8``, ``antalya-25.8``, ``fips-25.3``). ``full_version`` is None for branches, which
+    carry no patch or tweak. Returns None for refs without a version.
+    """
+    # Match tag
+    match = re.match(
+        r"^v((\d+\.\d+)\.\d+\.\d+)\.altinity(stable|antalya|fips|test)$", ref_name
+    )
+    if match:
+        flavour = match.group(3) if match.group(3) in ("antalya", "fips") else "stable"
+        return flavour, match.group(2), match.group(1)
+    # Match branch
+    match = re.match(r"^(stable|antalya|fips)-(\d+\.\d+)$", ref_name)
+    if match:
+        return match.group(1), match.group(2), None
+    return None
+
+
+def _prs_in_release_search_url(branch_name: str, baseline_time: str | None) -> str | None:
+    if not baseline_time:
+        return None
+    # Tag-triggered runs expose the tag as head_branch; search needs the PR base
+    # branch (e.g. v25.8.28.10001.altinitystable → stable-25.8).
+    parsed = _parse_release_ref(branch_name)
+    if parsed:
+        flavour, minor_version, _ = parsed
+        branch_name = f"{flavour}-{minor_version}"
+    query = f"is:pr base:{branch_name} merged:>{baseline_time}"
+    return (
+        f"https://github.com/{GITHUB_REPO}/pulls?"
+        + urllib.parse.urlencode({"q": query})
+    )
 
 
 def _checks_latest_test_status_cte(commit_sha: str, branch_name: str) -> str:
@@ -398,7 +596,12 @@ def _checks_latest_test_status_cte(commit_sha: str, branch_name: str) -> str:
                 check_start_time,
                 maxIf(
                     check_start_time,
-                    NOT (check_name LIKE 'Stateless%' AND NOT match(test_name, '^[0-9]{{5}}'))
+                    test_name != ''
+                    AND test_name NOT IN ('Pre Hooks', 'Post Hooks')
+                    AND NOT (
+                        check_name LIKE 'Stateless%'
+                        AND NOT match(test_name, '^[0-9]{{5}}')
+                    )
                 ) OVER (PARTITION BY check_name) AS latest_check_start_time
             FROM `gh-data`.checks
             WHERE commit_sha = '{commit_sha}' AND head_ref = '{branch_name}'
@@ -614,6 +817,10 @@ def get_new_fails_this_pr(
 
     # Combine both types of fails and select only desired columns
     desired_columns = ["job_name", "test_name", "test_status", "results_link"]
+    if len(checks_fails) > 0 and "labels" in checks_fails.columns:
+        desired_columns.insert(desired_columns.index("results_link"), "labels")
+        if len(regression_fails) > 0:
+            regression_fails["labels"] = ""
     all_pr_fails = pd.concat([checks_fails, regression_fails], ignore_index=True)[
         desired_columns
     ]
@@ -683,33 +890,91 @@ def get_new_fails_this_pr(
     return new_fails_df
 
 
-@lru_cache
-def get_workflow_config() -> dict:
+def _workflow_config_s3_url(pr_number: int, commit_sha: str, ref_name: str) -> str:
+    if pr_number == 0:
+        return (
+            f"https://{S3_BUCKET}.s3.amazonaws.com/REFs/{ref_name}/{commit_sha}/"
+            "config_workflow/workflow_config_masterci.json"
+        )
+    return (
+        f"https://{S3_BUCKET}.s3.amazonaws.com/PRs/{pr_number}/{commit_sha}/"
+        "config_workflow/workflow_config_pr.json"
+    )
 
-    # 25.12+
+
+def _workflow_config_from_local() -> dict | None:
+    # NOTE (strtgbb): 25.8 FinishCIReport still writes ci/tmp/workflow_config*.json
+    # (including workflow_config_release_builds.json). 26.8 S3 lookup only knows
+    # masterci/pr filenames, so local wins when present.
     if os.path.exists("./ci/tmp/workflow_status.json"):
         with open("./ci/tmp/workflow_status.json", "r") as f:
             data = json.load(f)["config_workflow"]["outputs"]["data"]
-            assert data is not None, "data is None"
             if isinstance(data, str):
                 data = json.loads(data)
-            assert (
-                "WORKFLOW_CONFIG" in data.keys()
-            ), f"WORKFLOW_CONFIG not found in data: {data.keys()}"
-            return data["WORKFLOW_CONFIG"]
-
+            if isinstance(data, dict) and "WORKFLOW_CONFIG" in data:
+                return data["WORKFLOW_CONFIG"]
+            if isinstance(data, dict):
+                return data
     workflow_config_files = glob("./ci/tmp/workflow_config*.json")
-    if len(workflow_config_files) == 0:
-        raise Exception("No workflow config file found")
-    if len(workflow_config_files) > 1:
-        raise Exception("Multiple workflow config files found")
-    with open(workflow_config_files[0], "r") as f:
-        return json.load(f)
+    if len(workflow_config_files) == 1:
+        with open(workflow_config_files[0], "r") as f:
+            return json.load(f)
+    return None
 
 
-def get_cached_job(job_name: str) -> dict:
-    workflow_config = get_workflow_config()
-    return workflow_config["cache_jobs"].get(job_name, {})
+@lru_cache
+def get_workflow_config(pr_number: int, commit_sha: str, ref_name: str) -> dict:
+    """Load workflow config from the local run, then S3.
+
+    On failure, warn and return a minimal empty config (same shape recreation uses).
+    """
+    local = _workflow_config_from_local()
+    if local is not None:
+        return local
+    url = _workflow_config_s3_url(pr_number, commit_sha, ref_name)
+    try:
+        response = requests.get(url, timeout=30)
+        if response.status_code != 200:
+            print(
+                f"WARNING:Failed to fetch workflow config from {url}: "
+                f"{response.status_code}"
+            )
+            return {"cache_jobs": {}}
+        return response.json()
+    except Exception as e:
+        print(f"WARNING:Failed to fetch workflow config from {url}: {e}")
+        return {"cache_jobs": {}}
+
+
+def get_cached_job(
+    job_name: str, pr_number: int, commit_sha: str, ref_name: str
+) -> dict:
+    workflow_config = get_workflow_config(pr_number, commit_sha, ref_name)
+    return workflow_config.get("cache_jobs", {}).get(job_name, {})
+
+@lru_cache
+def get_expected_version_labels(ref_name: str) -> tuple[str, ...]:
+    """Return required version labels for the release ref being reported.
+
+    Stable releases use the minor version label. Antalya releases use
+    ``antalya`` and ``antalya-{minor_version}``. The full version label is only
+    required on tag-triggered runs, where the tag pins patch and tweak.
+    Returns an empty tuple when the ref carries no version.
+    """
+    parsed = _parse_release_ref(ref_name)
+    if not parsed:
+        print(f"WARNING:No version in ref [{ref_name}], not checking version labels.")
+        return ()
+    flavour, minor_version, full_version = parsed
+    if flavour == "antalya":
+        labels = ("antalya", f"antalya-{minor_version}")
+        if full_version:
+            labels += (f"antalya-{full_version}",)
+        return labels
+    labels = (minor_version,)
+    if full_version:
+        labels += (full_version,)
+    return labels
 
 
 def get_cves(pr_number, commit_sha, branch):
@@ -727,7 +992,9 @@ def get_cves(pr_number, commit_sha, branch):
         else:
             return f"PRs/{pr_number}/{commit_sha}/grype/"
 
-    cached_server_job = get_cached_job("Docker server image")
+    cached_server_job = get_cached_job(
+        "Docker server image", pr_number, commit_sha, branch
+    )
     if cached_server_job:
         prefixes_to_check.add(
             format_prefix(
@@ -736,7 +1003,9 @@ def get_cves(pr_number, commit_sha, branch):
                 cached_server_job["branch"],
             )
         )
-    cached_keeper_job = get_cached_job("Docker keeper image")
+    cached_keeper_job = get_cached_job(
+        "Docker keeper image", pr_number, commit_sha, branch
+    )
     if cached_keeper_job:
         prefixes_to_check.add(
             format_prefix(
@@ -820,17 +1089,25 @@ def url_to_html_link(url: str) -> str:
     return f'<a href="{url}">{text}</a>'
 
 
-def format_pr_labels_with_verification(labels: str) -> str:
+def format_pr_labels_with_verification(labels: str, branch_name: str = "") -> str:
     """Format the PR labels with verification.
 
     Expects ``labels`` to be already HTML-escaped at collection time
     (see _enrich_prs_in_release_merge_prs).
+
+    Requires ``verified`` plus the version labels expected for ``branch_name``.
     """
-    labels_list = labels.split(", ")
-    if "verified" in labels_list:
+    required_labels = get_expected_version_labels(branch_name) if branch_name else ()
+    labels_list = labels.split(", ") if labels else []
+    required = ["verified", *required_labels]
+    missing = [label for label in required if label not in labels_list]
+    if not missing:
         return labels
-    else:
-        return f'<span style="font-weight: bold; color: red;">{labels} (missing verification)</span>'
+    missing_text = html.escape(", ".join(missing), quote=True)
+    return (
+        f'<span style="font-weight: bold; color: red;">'
+        f"{labels} (missing: {missing_text})</span>"
+    )
 
 
 def format_test_name_for_linewrap(text: str) -> str:
@@ -852,7 +1129,83 @@ def format_test_status(text: str) -> str:
     return f'<span style="font-weight: bold; color: {color}">{text}</span>'
 
 
-def format_results_as_html_table(results) -> str:
+def _label_names_from_ext(ext: dict) -> list[str]:
+    names = []
+    for item in ext.get("labels") or []:
+        if isinstance(item, str):
+            name = item
+        elif isinstance(item, dict) and item.get("name"):
+            name = item["name"]
+        else:
+            continue
+        if name != "cidb":
+            names.append(name)
+    return names
+
+
+def fetch_workflow_result_json(
+    pr_number: int, branch: str, commit_sha: str
+) -> dict | None:
+    if pr_number == 0:
+        ref_param = f"REF={branch}"
+        workflow_name = "MasterCI"
+    else:
+        ref_param = f"PR={pr_number}"
+        workflow_name = "PR"
+
+    status_file = f"result_{workflow_name.lower()}.json"
+    s3_path = (
+        f"https://{S3_BUCKET}.s3.amazonaws.com/"
+        f"{ref_param.replace('=', 's/')}/{commit_sha}/{status_file}"
+    )
+    try:
+        response = requests.get(s3_path, timeout=30)
+        if response.status_code != 200:
+            return None
+        return response.json()
+    except Exception as e:
+        print(f"WARNING:Failed to fetch workflow result from {s3_path}: {e}")
+        return None
+
+
+def get_failure_labels_from_workflow(workflow_data: dict | None) -> dict:
+    if not workflow_data:
+        return {}
+    labels_map = {}
+    for job in workflow_data.get("results") or []:
+        job_name = job.get("name")
+        if not job_name:
+            continue
+        for leaf in job.get("results") or []:
+            test_name = leaf.get("name")
+            if not test_name:
+                continue
+            names = _label_names_from_ext(leaf.get("ext") or {})
+            if names:
+                labels_map[(job_name, test_name)] = ", ".join(names)
+    return labels_map
+
+
+def add_labels_to_checks_fails(
+    checks_fails: pd.DataFrame, workflow_data: dict | None
+) -> pd.DataFrame:
+    if checks_fails is None or len(checks_fails) == 0:
+        return checks_fails
+    labels_map = get_failure_labels_from_workflow(workflow_data)
+    df = checks_fails.copy()
+    df["labels"] = df.apply(
+        lambda row: labels_map.get((row["job_name"], row["test_name"]), ""),
+        axis=1,
+    )
+    cols = [c for c in df.columns if c != "labels"]
+    if "results_link" in cols:
+        cols.insert(cols.index("results_link"), "labels")
+    else:
+        cols.append("labels")
+    return df[cols]
+
+
+def format_results_as_html_table(results, *, branch_name: str = "") -> str:
     if not isinstance(results, pd.DataFrame):
         return results
 
@@ -885,48 +1238,39 @@ def format_results_as_html_table(results) -> str:
         "PR Number": lambda n: url_to_html_link(
             f"https://github.com/{GITHUB_REPO}/pull/{n}"
         ),
-        "PR Labels": format_pr_labels_with_verification,
+        "PR Labels": lambda labels: format_pr_labels_with_verification(
+            labels, branch_name=branch_name
+        ),
+        "Labels": lambda labels: html.escape(str(labels), quote=True) if labels else "",
     }
 
-    html = results.to_html(
+    return results.to_html(
         index=False,
         formatters=formatters,
         escape=False,
         border=0,
         classes=["test-results-table"],
     )
-    return html
 
 
 def backfill_skipped_statuses(
-    job_statuses: pd.DataFrame, pr_number: int, branch: str, commit_sha: str
+    job_statuses: pd.DataFrame,
+    workflow_result: dict | None,
 ):
     """
     Fill in the job statuses for skipped jobs.
     """
-
-    if pr_number == 0:
-        ref_param = f"REF={branch}"
-        workflow_name = "MasterCI"
-    else:
-        ref_param = f"PR={pr_number}"
-        workflow_name = "PR"
-
-    status_file = f"result_{workflow_name.lower()}.json"
-    s3_path = f"https://{S3_BUCKET}.s3.amazonaws.com/{ref_param.replace('=', 's/')}/{commit_sha}/{status_file}"
-    response = requests.get(s3_path)
-
-    if response.status_code != 200:
+    if workflow_result is None:
         return job_statuses
 
-    status_data = response.json()
     skipped_jobs = []
-    for job in status_data["results"]:
-        if job["status"] == "skipped" and len(job["links"]) > 0:
+    for job in workflow_result["results"]:
+        status = job["status"].lower()
+        if status == "skipped" and len(job["links"]) > 0:
             skipped_jobs.append(
                 {
                     "job_name": job["name"],
-                    "job_status": job["status"],
+                    "job_status": status,
                     "message": job["info"],
                     "results_link": job["links"][0],
                 }
@@ -1008,7 +1352,7 @@ def parse_args() -> argparse.Namespace:
         "--no-upload", action="store_true", help="Do not upload the report"
     )
     parser.add_argument(
-        "--known-fails", type=str, help="Path to the file with known fails"
+        "--known-fails", action="store_true", help="Check known fails"
     )
     parser.add_argument(
         "--cves", action="store_true", help="Get CVEs from Grype results"
@@ -1024,7 +1368,7 @@ def create_workflow_report(
     pr_number: int = None,
     commit_sha: str = None,
     no_upload: bool = False,
-    known_fails_file_path: str = None,
+    check_known_fails: bool = False,
     check_cves: bool = False,
     mark_preview: bool = False,
 ) -> str:
@@ -1066,10 +1410,15 @@ def create_workflow_report(
         settings={"use_numpy": True},
     )
 
+    workflow_result = fetch_workflow_result_json(pr_number, branch_name, commit_sha)
+
     results_dfs = {
         "prs_in_release": [],
-        "job_statuses": get_commit_statuses(commit_sha),
-        "checks_fails": get_checks_fails(db_client, commit_sha, branch_name),
+        "job_statuses": get_commit_statuses(commit_sha, pr_number, branch_name),
+        "checks_fails": add_labels_to_checks_fails(
+            get_checks_fails(db_client, commit_sha, branch_name),
+            workflow_result,
+        ),
         "checks_known_fails": [],
         "pr_new_fails": [],
         "checks_errors": get_checks_errors(db_client, commit_sha, branch_name),
@@ -1077,11 +1426,17 @@ def create_workflow_report(
         "docker_images_cves": [],
     }
     known_fails = {}
+    prs_in_release_search_url = None
 
     if pr_number == 0 and not mark_preview:
         try:
-            prs_df = get_prs_in_release_dataframe(branch_name, cwd=os.getcwd())
+            prs_df, baseline_time = get_prs_in_release_dataframe(
+                branch_name, cwd=os.getcwd(), commit_sha=commit_sha
+            )
             results_dfs["prs_in_release"] = prs_df
+            prs_in_release_search_url = _prs_in_release_search_url(
+                branch_name, baseline_time
+            )
         except Exception as e:
             print(f"Error in get_prs_in_release_dataframe: {e}")
 
@@ -1096,11 +1451,11 @@ def create_workflow_report(
     # This might occur when run in preview mode.
     cves_not_checked = not check_cves or results_dfs["docker_images_cves"] is ...
 
-    if known_fails_file_path:
-        if not os.path.exists(known_fails_file_path):
-            print(f"WARNING:Known fails file {known_fails_file_path} not found.")
+    if check_known_fails:
+        if not KNOWN_FAILS_FILE.exists():
+            print(f"WARNING:Known fails file {KNOWN_FAILS_FILE} not found.")
         else:
-            known_fails = get_broken_tests_rules(known_fails_file_path)
+            known_fails = get_broken_tests_rules(str(KNOWN_FAILS_FILE))
 
             results_dfs["checks_known_fails"] = get_checks_known_fails(
                 db_client, commit_sha, branch_name, known_fails
@@ -1125,7 +1480,8 @@ def create_workflow_report(
             pr_info = {}
 
     results_dfs["job_statuses"] = backfill_skipped_statuses(
-        results_dfs["job_statuses"], pr_number, branch_name, commit_sha
+        results_dfs["job_statuses"],
+        workflow_result,
     )
 
     high_cve_count = 0
@@ -1173,10 +1529,14 @@ def create_workflow_report(
         "build_report_links": get_build_report_links(
             results_dfs["job_statuses"], pr_number, branch_name, commit_sha
         ),
+        "prs_in_release_search_url": prs_in_release_search_url,
         "prs_in_release_html": (
             "<p>PR details are not loaded during preview.</p>"
             if mark_preview or pr_number != 0
-            else format_results_as_html_table(results_dfs["prs_in_release"])
+            else format_results_as_html_table(
+                results_dfs["prs_in_release"],
+                branch_name=branch_name,
+            )
         ),
         "ci_jobs_status_html": format_results_as_html_table(
             results_dfs["job_statuses"]

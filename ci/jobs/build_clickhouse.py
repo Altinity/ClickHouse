@@ -137,6 +137,10 @@ def main():
             res = Shell.check(
                 f"mkdir -p {build_dir} && git submodule sync && git submodule init"
             )
+            if os.path.isdir(".git/modules/contrib") and os.listdir(
+                ".git/modules/contrib"
+            ):
+                print("Submodule cache detected, populating working trees from cache")
             res = res and Shell.check(
                 f"git config --file .gitmodules --null --get-regexp path | sed -z 's|.*\\n||' | xargs --max-procs=10 --null --no-run-if-empty --max-args=1 git submodule update --depth=1 --single-branch",
                 retries=3,
