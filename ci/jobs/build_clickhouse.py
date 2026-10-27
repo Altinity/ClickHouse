@@ -216,16 +216,13 @@ def main():
         cmake_cmd += " -DDISABLE_ALL_DEBUG_SYMBOLS=1"
 
     # ThinLTO cache: the link reuses the optimized native objects of modules
-    # that did not change since the previous link in this directory. The
-    # directory is a host path mounted by BINARY_DOCKER_COMMAND and is only
-    # useful on a builder that keeps its disk between jobs, so it is opt-in
-    # per builder: the cache is used when the operator created the marker
-    # file `.enabled` in it. Elsewhere the directory is created empty by
-    # praktika and ignored, so a wiped builder does not pay for writing a
-    # cache it will never read.
+    # that did not change since the previous link in this directory. It is an
+    # attached volume that BINARY_DOCKER_COMMAND mounts only on builders that
+    # have it, so a builder whose disk is wiped between jobs has no directory
+    # here and does not pay for writing a cache it will never read.
     thinlto_cache_dir = "/thinlto-cache"
-    use_thinlto_cache = "ENABLE_THINLTO=1" in cmake_cmd and os.path.exists(
-        f"{thinlto_cache_dir}/.enabled"
+    use_thinlto_cache = "ENABLE_THINLTO=1" in cmake_cmd and os.path.isdir(
+        thinlto_cache_dir
     )
     if use_thinlto_cache:
         print(f"ThinLTO cache is enabled in {thinlto_cache_dir}")

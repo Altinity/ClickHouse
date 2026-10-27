@@ -29,10 +29,10 @@ BINARY_DOCKER_COMMAND = (
     f"+--memory={Utils.physical_memory() * 95 // 100}"
     f"+--memory-reservation={Utils.physical_memory() * 9 // 10}"
     f"+--volume=.:/ClickHouse"
-    # Host directory for the ThinLTO cache of release builds, see `use_thinlto_cache`
-    # in build_clickhouse.py. A path under the runner home so the runner user can
-    # create it; praktika runs the docker command through bash, which expands $HOME.
-    "+--volume=$HOME/.cache/clickhouse-thinlto:/thinlto-cache"
+    # Attached volume holding the ThinLTO cache of release builds, see
+    # `use_thinlto_cache` in build_clickhouse.py. Mounted only on builders that
+    # have it, so the build job can key on the directory's presence.
+    "+--volume-if-exists=/mnt/clickhouse_thinlto:/thinlto-cache"
     '+--env=AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"+--env=AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"'
 )
 BINARY_DOCKER_COMMAND_SANITIZER = (
