@@ -40,6 +40,7 @@ from commit_status_helper import (
 from digest_helper import DockerDigester, JobDigester
 from env_helper import (
     CI,
+    CI_CONFIG_PATH,
     GITHUB_JOB_API_URL,
     GITHUB_RUN_URL,
     REPO_COPY,
@@ -2084,6 +2085,10 @@ def main() -> int:
             else:
                 exit_code = 1
         else:
+            # Build reports use it to know which builds are part of this CI run
+            Path(TEMP_PATH).mkdir(parents=True, exist_ok=True)
+            with open(CI_CONFIG_PATH, "w", encoding="utf-8") as jfd:
+                json.dump(indata, jfd)
             exit_code = _run_test(check_name, args.run_command)
     ### RUN action: end
 
