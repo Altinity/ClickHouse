@@ -22,8 +22,9 @@ BACKUP TABLE t TO S3('https://bucket.s3.amazonaws.com/backups/b1', 'key', 'secre
 RESTORE TABLE t AS t_restored FROM S3('https://bucket.s3.amazonaws.com/backups/b1', 'key', 'secret');
 ```
 
-The destination can be anything: `S3`, `Disk`, `File`, or an archive. A backup can be restored onto a
-disk of any type, because it holds the table's files rather than the pool's objects.
+The destination can be `S3`, `Disk`, `File`, or an archive, but not a `CAS` disk (see
+[limitations](#limitations)). A backup can be restored onto a disk of any type, because it holds the
+table's files rather than the pool's objects.
 
 **An `Atomic` database is required.** That has been the default since 20.x. On the deprecated
 `Ordinary` engine the backup fails with `SUPPORT_IS_DISABLED`: that path pins files with temporary
@@ -49,12 +50,14 @@ process is gone. For durable pinning there is `FREEZE`, which publishes a real r
 
 Which path runs depends on the destination.
 
-**A destination outside the pool** — the common case: another bucket, a local disk, an archive. Files
-are read through the `CAS` read path and written to the destination. Pool deduplication is lost:
+**A destination outside the pool** — the common case: another `S3` endpoint, a local disk, an
+archive. Files are read through the `CAS` read path and written to the destination. Pool deduplication is lost:
 what was one blob shared by several replicas becomes ordinary files in the backup.
 
 **An `S3(...)` destination on the same `S3` endpoint as the pool** — the copy of a blob then runs
-inside the `S3` store itself, without sending the bytes through ClickHouse. The server issues one `UploadPartCopy` per upload part, so a payload larger than one part takes several.
+inside the `S3` store itself, without sending the bytes through ClickHouse. Only the endpoint has to
+match: the backup can be in another bucket. The server issues one `UploadPartCopy` per upload part,
+so a payload larger than one part takes several.
 
 ```sql
 BACKUP TABLE t TO S3('http://s3.example.com/bucket/backups/b1', 'key', 'secret');
@@ -74,16 +77,16 @@ copy of a blob therefore names the payload range. A copy of the whole object wou
 into the backup, and a later restore would read wrong data.
 
 If a byte range cannot be copied inside `S3`, `CAS` does not fall back to copying the whole object —
-the file is read and written through ClickHouse instead. That is slower, but correct. ClickHouse takes
-that path on its own in four cases: the blob object is 5 MiB or smaller; the query sets
-`s3_allow_multipart_copy = 0`; the store is recognized as `GCS`, whose current XML API has no
+the payload is read and written through ClickHouse instead. That is slower, but correct. ClickHouse
+reads only the payload range of the blob object, directly from the pool, and uploads it to the
+backup. It takes that path on its own in four cases: the blob object is 5 MiB or smaller; the query
+sets `s3_allow_multipart_copy = 0`; the store is recognized as `GCS`, whose current XML API has no
 `UploadPartCopy`; or `UploadPartCopy` is refused with `AccessDenied`.
 
 The size limit comes from `S3`: it accepts a byte range in `UploadPartCopy` only if the source object
 is greater than 5 MB, and answers `InvalidRequest` otherwise. The limit is on the whole blob object,
-not on the upload part, so `s3_min_upload_part_size` does not change it. A small blob is read through
-the `CAS` read path and written through ClickHouse's buffers. In a table with small parts most blobs
-are below the limit, so most of its files take this path.
+not on the upload part, so `s3_min_upload_part_size` does not change it. In a table with small parts
+most blobs are below the limit, so most of its files take this path.
 
 A store that refuses `UploadPartCopy` with any other error fails the `BACKUP` instead, because
 ClickHouse cannot tell a missing capability from a transient failure. On such a store, set
@@ -145,8 +148,8 @@ It is a useful building block, not a replacement for `BACKUP`.
   byte range. A blob object of 5 MiB or smaller always goes through ClickHouse's buffers, because
   `S3` accepts a byte-range copy only from a source object greater than 5 MB. With
   `s3_allow_multipart_copy = 0`, on a store recognized as `GCS`, and when `UploadPartCopy` is refused
-  with `AccessDenied`, every blob goes through ClickHouse's buffers instead. A store that refuses `UploadPartCopy` with another error fails the `BACKUP`; set
-  `s3_allow_multipart_copy = 0` there.
+  with `AccessDenied`, every blob goes through ClickHouse's buffers instead. A store that refuses
+  `UploadPartCopy` with another error fails the `BACKUP`; set `s3_allow_multipart_copy = 0` there.
 - Restore onto a `CAS` disk always writes through ClickHouse, see [restore](#restore).
 - A disk-level write of a part file onto a `CAS` disk outside of a part transaction is rejected with
   `NOT_IMPLEMENTED` and the message `Autocommit writes are not supported for content part files`: a
