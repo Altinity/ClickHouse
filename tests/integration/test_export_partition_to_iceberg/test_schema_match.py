@@ -628,6 +628,98 @@ def test_export_partition_with_castable_widening(cluster, source_engine):
     )
 
 
+def test_export_partition_with_unsigned_to_wider_signed_widening(cluster, source_engine):
+    """An unsigned column exported into a strictly wider signed column (UInt8 -> Int16,
+    UInt16 -> Int32, UInt32 -> Int64, Nullable(UInt8) -> Nullable(Int16)) is a lossless
+    cast, so it is accepted without export_merge_tree_part_allow_lossy_cast and the
+    maximum values of the source types round-trip unchanged."""
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_unsigned_widen_{uid}"
+    iceberg_table = f"iceberg_unsigned_widen_{uid}"
+
+    make_source(
+        node, mt_table, "u8 UInt8, u16 UInt16, u32 UInt32, opt Nullable(UInt8), year Int32", "year",
+        replica_name="replica1", engine=source_engine,
+    )
+    node.query(f"INSERT INTO {mt_table} VALUES (255, 65535, 4294967295, 255, 2020), (0, 0, 0, NULL, 2020)")
+
+    make_iceberg_s3(
+        node, iceberg_table, "u8 Int16, u16 Int32, u32 Int64, opt Nullable(Int16), year Int32", partition_by="year"
+    )
+
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    wait_for_export_status(node, mt_table, iceberg_table, "2020", "COMPLETED")
+
+    result = node.query(f"SELECT u8, u16, u32, opt, year FROM {iceberg_table} ORDER BY u8").strip()
+    assert result == "0\t0\t0\t\\N\t2020\n255\t65535\t4294967295\t255\t2020", (
+        f"Unexpected data after unsigned -> wider signed export:\n{result}"
+    )
+
+
+def test_export_partition_unsigned_partition_column_widened_to_signed(cluster, source_engine):
+    """A partition column that is unsigned in the source (year UInt16) and a strictly wider
+    signed integer in the destination (year Int32) passes the lossy-cast gate without the
+    opt-in, and the partition value is preserved."""
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_unsigned_pcol_{uid}"
+    iceberg_table = f"iceberg_unsigned_pcol_{uid}"
+
+    make_source(node, mt_table, "id Int32, year UInt16", "year", replica_name="replica1", engine=source_engine)
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2020)")
+
+    make_iceberg_s3(node, iceberg_table, "id Int32, year Int32", partition_by="year")
+
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    wait_for_export_status(node, mt_table, iceberg_table, "2020", "COMPLETED")
+
+    result = node.query(f"SELECT id, year FROM {iceberg_table} ORDER BY id").strip()
+    assert result == "1\t2020\n2\t2020", f"Unexpected data after unsigned partition column export:\n{result}"
+
+
+@pytest.mark.parametrize(
+    "source_type,destination_type",
+    [("UInt16", "Int16"), ("UInt32", "Int32"), ("UInt64", "Int64")],
+)
+def test_export_partition_unsigned_to_same_size_signed_rejected_without_optin(
+    cluster, source_engine, source_type, destination_type
+):
+    """An unsigned column exported into a signed column of the same size is lossy (values above
+    the signed maximum wrap), so it is rejected synchronously with INCOMPATIBLE_COLUMNS unless
+    export_merge_tree_part_allow_lossy_cast is set."""
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_unsigned_same_size_{uid}"
+    iceberg_table = f"iceberg_unsigned_same_size_{uid}"
+
+    make_source(
+        node, mt_table, f"id {source_type}, year Int32", "year", replica_name="replica1", engine=source_engine
+    )
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020)")
+
+    make_iceberg_s3(node, iceberg_table, f"id {destination_type}, year Int32", partition_by="year")
+
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table} "
+        f"SETTINGS allow_insert_into_iceberg = 1"
+    )
+    assert "INCOMPATIBLE_COLUMNS" in error, f"Expected INCOMPATIBLE_COLUMNS, got: {error!r}"
+    assert "lossy cast" in error, f"Expected 'lossy cast' in error, got: {error!r}"
+
+    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count == 0, f"Expected no rows after a rejected export, got {count}"
+
+
 def test_export_partition_with_castable_narrowing_values_fit(cluster, source_engine):
     """A lossy narrowing (id Int64 -> Int32) succeeds once the user opts in via
     export_merge_tree_part_allow_lossy_cast."""

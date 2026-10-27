@@ -88,7 +88,7 @@ calling thread only submits and joins, never occupies a pool slot, so a pool of 
 to a correct serial run and can never deadlock. The contract is merge-nothing: if any task threw,
 nothing is merged and the first error in dispatch order is rethrown. Results are folded into the
 dependency set on the owning thread, into a copy, committed by one no-throw swap. Every physical
-task starts with blob `HEAD`; a present non-condemned body or a completed publication yields an
+task starts with blob `HEAD`; a present body with a `Clean` marker or a completed publication yields an
 explicit `Materialized` proof. A trusted source manifest instead yields `TrustedManifest` without
 blob I/O. Pool size is the
 server setting `cas_blob_upload_pool_size` (default 16).
@@ -112,7 +112,7 @@ something recoverable; no row loses data or leaves a dangling reference.
 
 | # | Crash window | Left behind | Who cleans it |
 |---|---|---|---|
-| C1 | During staging | Local temp files, or S3 staging objects | Local: unconditional cleanup plus buffer destructor. S3: the mount's own staging sweep at next mount — never deleted on abort |
+| C1 | During staging | Local temp files, or S3 staging objects | Local: unconditional cleanup plus buffer destructor. S3: the transaction deletes it on commit or abort (best-effort); after a crash, the next mount of the same `server_root_id` sweeps it, or `SYSTEM CAS DROP POOL MEMBER` drains it |
 | C2 | After `stageManifest`, before `precommitAdd` | An unreferenced manifest body | Writer's best-effort exact-token delete; durable backstop is the orphan-manifest sweep |
 | C3 | `precommitAdd` returned Unresolved | A possibly-live precommit binding | Intent recorded pre-append; `abandon` appends the exact removal, tolerating absence. The body is never writer-deleted |
 | C4 | Between `precommitAdd` and `promote` | A live precommit plus uploaded blobs | No resume path exists. Removed by `abandon`, else by a fenced successor's stale-precommit sweep |

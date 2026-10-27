@@ -217,6 +217,10 @@ static std::optional<WriteDataFilesResult> writeDataFiles(
     Poco::JSON::Object::Ptr data_schema)
 {
     chassert(commands.size() == 1);
+    auto iceberg_format_settings = format_settings;
+    if (!iceberg_format_settings)
+        iceberg_format_settings = getFormatSettings(context);
+    iceberg_format_settings->parquet.output_timestamp_adjusted_to_utc_from_timezone = true;
     DataFileWriteResultByPartitionKey delete_data_result;
     DataFileStatisticsByPartitionKey delete_data_statistics;
     std::unordered_map<ChunkPartitioner::PartitionKey, std::unique_ptr<WriteBuffer>, ChunkPartitioner::PartitionKeyHasher> delete_data_write_buffers;
@@ -284,7 +288,7 @@ static std::optional<WriteDataFilesResult> writeDataFiles(
                     column_mapper->setStorageColumnEncoding(std::move(field_ids));
                     FormatFilterInfoPtr format_filter_info = std::make_shared<FormatFilterInfo>(nullptr, context, column_mapper, nullptr, nullptr);
                     auto output_format = FormatFactory::instance().getOutputFormat(
-                        write_format, *write_buffer, delete_file_sample_block, context, format_settings, format_filter_info);
+                        write_format, *write_buffer, delete_file_sample_block, context, iceberg_format_settings, format_filter_info);
 
                     delete_data_write_buffers[partition_key] = std::move(write_buffer);
                     delete_data_writers[partition_key] = std::move(output_format);
@@ -385,7 +389,7 @@ static std::optional<WriteDataFilesResult> writeDataFiles(
                     ColumnMapperPtr data_column_mapper = createColumnMapper(data_schema);
                     FormatFilterInfoPtr data_format_filter_info = std::make_shared<FormatFilterInfo>(nullptr, context, data_column_mapper, nullptr, nullptr);
                     auto data_output_format = FormatFactory::instance().getOutputFormat(
-                        write_format, *data_write_buffer, data_block, context, format_settings, data_format_filter_info);
+                        write_format, *data_write_buffer, data_block, context, iceberg_format_settings, data_format_filter_info);
 
                     update_data_write_buffers[partition_key] = std::move(data_write_buffer);
                     it = update_data_writers.emplace(partition_key, std::move(data_output_format)).first;
@@ -491,6 +495,7 @@ static bool writeMetadataFiles(
     auto manifest_entries_in_storage = std::make_shared<Strings>();
     std::vector<Iceberg::IcebergPathFromMetadata> manifest_entries;
     std::vector<Int64> manifest_entry_sizes;
+    std::vector<Int64> manifest_entry_row_counts;
     std::vector<std::vector<std::pair<Field, DataTypePtr>>> entry_partition_summaries;
     auto cleanup = [object_storage, &delete_filenames, &path_resolver, manifest_entries_in_storage, storage_manifest_list_name, storage_metadata_name]()
     {
@@ -517,6 +522,7 @@ static bool writeMetadataFiles(
             auto manifest_entry_path = filename_generator.generateManifestEntryName();
             manifest_entries_in_storage->push_back(path_resolver.resolve(manifest_entry_path));
             manifest_entries.push_back(manifest_entry_path);
+            manifest_entry_row_counts.push_back(delete_filename.total_rows);
 
             /// The manifest holds a single partition tuple, which becomes its manifest-list field summary.
             if (chunk_partitioner)
@@ -591,10 +597,11 @@ static bool writeMetadataFiles(
                     content_type,
                     /* use_previous_snapshots */ true,
                     /* per_entry_content_types */ {},
-                    /* existing_entry_counts */ {},
+                    /* entry_counts */ {},
                     /* carry_forward_manifest_paths */ {},
                     /* entry_partition_spec_ids */ {},
-                    entry_partition_summaries);
+                    entry_partition_summaries,
+                    manifest_entry_row_counts);
                 buffer_manifest_list->finalize();
             }
             catch (...)
@@ -633,7 +640,7 @@ static bool writeMetadataFiles(
             {
                 auto catalog_filename = path_resolver.resolveForCatalog(metadata_info.path);
                 const auto & [namespace_name, table_name] = DataLake::parseTableName(table_id.getTableName());
-                if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot))
+                if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot, context->getForwardedAuthToken()))
                 {
                     cleanup();
                     return false;
@@ -993,7 +1000,7 @@ void alter(
                 metadata->getValue<Int32>(Iceberg::f_last_column_id),
                 getHighestFieldId(new_schema));
             commit_attempted = true;
-            if (!catalog->updateSchema(namespace_name, table_name, catalog_filename, new_schema, previous_schema_id, new_last_column_id, metadata))
+            if (!catalog->updateSchema(namespace_name, table_name, catalog_filename, new_schema, previous_schema_id, new_last_column_id, metadata, context->getForwardedAuthToken()))
             {
                 ++i;
                 continue;
