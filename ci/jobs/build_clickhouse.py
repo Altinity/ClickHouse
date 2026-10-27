@@ -105,6 +105,7 @@ def parse_args():
 
 def run_shell(name, command, **kwargs):
     print(f"\n>>>> {name}\n")
+    kwargs.setdefault("verbose", True)
     Shell.check(command, **kwargs)
     print(f"\n<<<< {name}\n")
 
@@ -213,6 +214,19 @@ def main():
         and "ENABLE_THINLTO=1" in cmake_cmd
     ):
         cmake_cmd += " -DDISABLE_ALL_DEBUG_SYMBOLS=1"
+
+    # ThinLTO cache: the link reuses the optimized native objects of modules
+    # that did not change since the previous link in this directory. It is an
+    # attached volume that BINARY_DOCKER_COMMAND mounts only on builders that
+    # have it, so a builder whose disk is wiped between jobs has no directory
+    # here and does not pay for writing a cache it will never read.
+    thinlto_cache_dir = "/thinlto-cache"
+    use_thinlto_cache = "ENABLE_THINLTO=1" in cmake_cmd and os.path.isdir(
+        thinlto_cache_dir
+    )
+    if use_thinlto_cache:
+        print(f"ThinLTO cache is enabled in {thinlto_cache_dir}")
+        cmake_cmd += f" -DTHINLTO_CACHE_DIR={thinlto_cache_dir}"
 
     # PGO/BOLT profile integration for release builds. The sccache-warmup builds
     # are deliberately excluded: they exist only to populate the shared compiler
@@ -463,6 +477,11 @@ def main():
                 results.append(retry_cmake)
 
         run_shell("sccache stats", "sccache --show-stats")
+        if use_thinlto_cache:
+            run_shell(
+                "thinlto cache stats",
+                f"du -sh {thinlto_cache_dir} && find {thinlto_cache_dir} -type f | wc -l && df -h {thinlto_cache_dir}",
+            )
         if build_type in (BuildTypes.AMD_TIDY, BuildTypes.ARM_TIDY):
             run_shell("clang-tidy-cache stats", "clang-tidy-cache.py --show-stats")
             clang_tidy_cache_log = "./ci/tmp/clang-tidy-cache.log"
