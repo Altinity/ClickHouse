@@ -257,8 +257,7 @@ uint64_t allocateWriterEpochForTest(const BackendPtr & backend, const Layout & l
 {
     CasRequests requests(backend, Fence::open());
     CasOperation op = requests.admit();
-    return allocateWriterEpoch(op, layout, server_root_id, EpochMintPolicy::NormalMount, 0,
-                               [] { return RefCatalog{}; });
+    return allocateWriterEpoch(op, layout, server_root_id, [] { return RefCatalog{}; });
 }
 
 /// A fixture enumeration on an open fence: the primitive `list` override in this file's test backend

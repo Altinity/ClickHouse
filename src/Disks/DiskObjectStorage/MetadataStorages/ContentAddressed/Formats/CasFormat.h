@@ -44,7 +44,7 @@ enum class FormatId : uint16_t
     /// Value 15 is retired: the fold seal is the sole per-generation coverage record after the
     /// one-pass GC round. The following three classes are per-server-root mount-safety objects.
     Owner = 16,           /// `cas_owner` anchor from server-root ID to server UUID.
-    ServerEpoch = 17,     /// `cas_epoch` writer-epoch fence carrying `next_writer_epoch`.
+    ServerEpoch = 17,     /// `cas_epoch` writer-epoch fence carrying `next_writer_epoch` and an optional `allocation_nonce`.
     MountLease = 18,      /// Live `cas_mount_lease` object.
     /// These identifiers cover objects that were added to the registry after their initial codecs:
     /// the ref transaction log, complete ref snapshot, blob freshness sidecar, and GC heartbeat.

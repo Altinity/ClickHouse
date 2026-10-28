@@ -362,6 +362,12 @@ struct PoolConfig
     }
 };
 
+/// The live incarnation at one instant: the writer epoch and the fence generation it was admitted under.
+struct MountIncarnation
+{
+    uint64_t writer_epoch = 0;
+    uint64_t fence_generation = 0;
+};
 
 struct PartWriteInfo
 {
@@ -424,19 +430,21 @@ public:
     /// Construct a pool after backend capabilities and durable pool metadata have been validated.
     /// For a writable configuration, `open` also claims the configured mount before returning; a
     /// read-only configuration returns an instance that performs no mutating startup operations.
+    /// A start over a verified, drained retirement of its `server_root_id` rejoins it as an empty member
+    /// (`claimOwnerOrThrow`).
     static PoolPtr open(BackendPtr backend, PoolConfig config);
-    /// Admin writer mount of the VICTIM `server_root_id`, for `SYSTEM CAS DROP POOL
-    /// MEMBER`. Impersonates the victim's
-    /// owner uuid (`readOwnerUuid`, or -- when the owner anchor itself is missing -- recovered from a
-    /// lingering mount lease) and mounts writable under `MountClaimPolicy::NoWait`: a live victim
-    /// lease is an immediate `ABORTED` refusal (no wait-and-observe, no FORCE variant), unlike the
-    /// bounded reclaim wait a normal `open` pays. Throws `BAD_ARGUMENTS` when there is nothing to
-    /// decommission (no owner anchor and no mount lease for `victim_srid`).
+    /// Admin writer mount of the VICTIM `server_root_id`, for `SYSTEM CAS DROP POOL MEMBER`.
+    /// Impersonates the victim's owner uuid (`readOwnerUuid`, or, when the owner was deleted by hand, the uuid
+    /// of the surviving lease) and mounts writable under `MountClaimPolicy::NoWait`: a live victim lease is an
+    /// immediate `ABORTED` refusal; a tombstoned owner of the victim is accepted; a member without an epoch
+    /// counter is refused (`CORRUPTED_DATA`). Throws `BAD_ARGUMENTS` when neither owner nor lease exists.
     static PoolPtr openForDecommission(BackendPtr backend, PoolConfig config, const String & victim_srid);
     /// Stop the mount-renewal and remount activity, drain ref-log work, and release the owned
     /// backend-facing components in their dependency order. Destruction is also the clean-farewell
     /// path for a writable mount, so it must complete before the owning backend is released.
     ~Pool();
+    /// The teardown writes no clean farewell: a successor then waits for this lease to be fenced or observed dead.
+    void withholdFarewell() noexcept { farewell_withheld = true; }
 
     bool tryDispatchDetached(std::function<void(DetachedStopToken)> task);
     /// Marks this pool as being torn down. The open request plane refuses every further admission and
@@ -514,6 +522,9 @@ public:
     /// Throws the typed transient refusal (`throwCasTransientUnavailable`) unless the fence is currently
     /// held AND still at `admitted_generation`.
     void checkFenceOrThrow(uint64_t admitted_generation) const { mount_runtime.checkFenceOrThrow(admitted_generation); }
+    /// Throws the transient refusal when the fence moved between the two reads, so the pair is never mixed.
+    MountIncarnation captureMountIncarnation() const;
+    void setIncarnationCaptureHookForTest(std::function<void()> hook) { incarnation_capture_hook_for_test = std::move(hook); }
 
     /// ---- pool lifecycle condition (rev.7 §1; owned by `mount_runtime`) ----
     /// Atomic read of the current lifecycle condition. Thin forwarder; safe to call from any thread.
@@ -773,10 +784,10 @@ public:
     /// on the fence would make a self-remount, which runs with the fence latched lost, unable ever to
     /// reclaim.
     CasRequests & openRequests() { return gc_requests; }
-    /// The owning `BackendPtr` itself (not just a reference into it): the decommission slot-retirement
-    /// decommission step (`CasDecommission.cpp`) must keep the backend alive across `admin.reset()` -- the graceful
-    /// close that stamps the mount's farewell -- to physically delete the control objects afterward. A
-    /// bare `Backend &` from `backend()` would dangle the instant the owning `Pool` is destroyed.
+    /// The owning `BackendPtr` itself (not just a reference into it): decommission (`CasDecommission.cpp`)
+    /// keeps the backend alive across `admin.reset()` -- the graceful close that stamps the mount's farewell --
+    /// to read the farewell back and mark the retirement verified. A bare `Backend &` from `backend()` would
+    /// dangle the instant the owning `Pool` is destroyed.
     BackendPtr poolBackendPtr() const { return pool_backend; }
 
     /// Staging write surface for `PartWriteTxn`: thin delegate onto the ref ledger, so a staging write
@@ -1211,6 +1222,7 @@ private:
     /// config they take their clock from. `mutable` because issuing a request is not a change to the
     /// pool: a `const` observer still has to read the store.
     mutable CasRequests mount_requests;
+    std::function<void()> incarnation_capture_hook_for_test;
     mutable CasRequests lease_requests;
     mutable CasRequests gc_requests;
 
@@ -1222,6 +1234,7 @@ private:
     /// Sticky fail-close bit for the destructor's allocation-failure path. If a duty could not enter
     /// the queue, no mount teardown may claim a clean farewell even though the guarded map is empty.
     std::atomic<bool> writer_cleanup_queue_failed{false};
+    std::atomic<bool> farewell_withheld{false};
 
     /// CAS mixed-algo pools: monotone in-memory cache of `algos_used`, seeded from
     /// `meta.algos_used` at open. Guards `isAlgoAdmitted`/`refreshAdmittedAlgos` -- ITS OWN mutex,
@@ -1278,6 +1291,9 @@ private:
     /// moved to `mount_runtime`, but the top-level remount serialization guards
     /// the Pool-side orchestration, so it stays on Pool.
     std::mutex remount_mutex;
+
+    /// Set once by the owner claim in `mountWritable`; a remount checks against it and never updates it.
+    uint64_t recorded_owner_life = 0;
 
     /// The single home of the [D5] per-lifecycle reason detail (spec §1) — the human-readable text that
     /// names the ACTUAL sub-state, WITHOUT the `content-addressed pool '<id>' ` prefix. Both

@@ -345,4 +345,20 @@ void Layout::checkNamespace(const RootNamespace & ns) const
     }
 }
 
+std::optional<uint64_t> Layout::stagedEpochOf(std::string_view rest)
+{
+    const size_t slash = rest.find('/');
+    if (slash == std::string_view::npos)
+        return rest.empty() ? std::nullopt : std::optional<uint64_t>(0);
+    const std::string_view dir = rest.substr(0, slash);
+    const std::string_view leaf = rest.substr(slash + 1);
+    if (dir.empty() || leaf.empty() || leaf.find('/') != std::string_view::npos)
+        return std::nullopt;
+    uint64_t epoch = 0;
+    const auto [end, ec] = std::from_chars(dir.data(), dir.data() + dir.size(), epoch);
+    if (ec != std::errc{} || end != dir.data() + dir.size())
+        return std::nullopt;
+    return epoch;
+}
+
 }
