@@ -158,7 +158,7 @@ const CatalogEntry * catalogEntryOf(const CasRefCatalog::Snapshot & catalog_cut,
     return it == catalog_cut.catalog.entries.end() ? nullptr : &*it;
 }
 
-void filterCandidatesByCatalog(
+void excludeCandidatesWithChangedCatalogEntries(
     CasOperation & op,
     const Layout & layout,
     const CasRefCatalog::Snapshot & catalog_cut,
@@ -168,12 +168,12 @@ void filterCandidatesByCatalog(
     if (candidates.empty())
         return;
 
-    const CasRefCatalog::Snapshot post_floor_catalog = CasRefCatalog::read(op, layout);
-    post_floor_catalog.life_index.throwIfAmbiguous("CAS orphan manifest sweep post-floor catalog");
+    const CasRefCatalog::Snapshot rechecked_catalog = CasRefCatalog::read(op, layout);
+    rechecked_catalog.life_index.throwIfAmbiguous("CAS orphan manifest sweep post-floor catalog");
     std::erase_if(candidates, [&](const ListedManifestObject & candidate)
     {
         const CatalogEntry * before = catalogEntryOf(catalog_cut, candidate.ns);
-        const CatalogEntry * after = catalogEntryOf(post_floor_catalog, candidate.ns);
+        const CatalogEntry * after = catalogEntryOf(rechecked_catalog, candidate.ns);
         if ((!before && !after) || (before && after && *before == *after))
             return false;
         ++result.skipped;
@@ -945,7 +945,7 @@ ManifestSweepResult planManifestCursorPage(
         decided_through = listed.key;
     }
 
-    filterCandidatesByCatalog(op, layout, catalog_cut, candidates, result);
+    excludeCandidatesWithChangedCatalogEntries(op, layout, catalog_cut, candidates, result);
 
     size_t next_body_hint = 0;
     for (const ListedManifestObject & candidate : candidates)
