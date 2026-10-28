@@ -81,6 +81,8 @@ public:
 protected:
     virtual void updateBeforeRead(const ContextPtr &) {}
     void updateQueryWithJoinToSendIfNeeded(ASTPtr & query_to_send, SelectQueryInfo query_info, const ContextPtr & context);
+    /// `DataLakeCatalog` tables need this to avoid resolving the catalog table a second time for the header.
+    virtual bool canReuseResolvedQueryTreeForHeader() const { return false; }
 
     virtual void updateConfigurationIfNeeded(ContextPtr /* context */) {}
 

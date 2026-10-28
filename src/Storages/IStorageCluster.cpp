@@ -732,7 +732,7 @@ void IStorageCluster::read(
     {
         /// For an unchanged query, calculate the header from the resolved query tree. Re-analyzing
         /// the original AST resolves DataLakeCatalog tables once more and repeats a remote catalog lookup.
-        if (query_to_send == query_info.query && query_info.query_tree)
+        if (canReuseResolvedQueryTreeForHeader() && query_to_send == query_info.query && query_info.query_tree)
             sample_block = getHeaderForProcessingStage(column_names, storage_snapshot, query_info, context, processed_stage);
         else
             sample_block = InterpreterSelectQueryAnalyzer::getSampleBlock(query_to_send, context, SelectQueryOptions(processed_stage));

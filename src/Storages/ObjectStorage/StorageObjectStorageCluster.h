@@ -203,6 +203,7 @@ private:
 
     /// Whether this query is served by `pure_storage` instead of being distributed over a cluster.
     bool readsFromPureStorage(ContextPtr context) const;
+    bool canReuseResolvedQueryTreeForHeader() const override { return is_datalake_catalog_table; }
 
     void readFallBackToPure(
         QueryPlan & query_plan,
@@ -243,6 +244,8 @@ private:
     const ObjectStoragePtr object_storage;
     /// True for explicit *Cluster(...); false for SETTINGS / ENGINE / DataLake paths.
     bool cluster_name_from_function_argument = false;
+    /// True only for tables resolved through a `DataLakeCatalog` database.
+    bool is_datalake_catalog_table = false;
 
     /// non-clustered storage to fall back on pure realisation if needed
     std::shared_ptr<StorageObjectStorage> pure_storage;
