@@ -39,6 +39,12 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         /// controls new feature and it's 'true' by default, use 'false' as previous_value).
         /// It's used to implement `compatibility` setting (see https://github.com/ClickHouse/ClickHouse/issues/35972)
         /// Note: please check if the key already exists to prevent duplicate entries.
+        addSettingsChanges(settings_changes_history, "26.6.8.20003.altinityantalya",
+        {
+            {"iceberg_target_data_file_size_bytes", 536870912, 536870912, "Target file size for Iceberg bin-packing compaction (default 512 MiB)."},
+            {"iceberg_min_data_file_size_bytes", 402653184, 402653184, "Files below this size are candidates for Iceberg bin-packing compaction (default 384 MiB)."},
+        });
+
         addSettingsChanges(settings_changes_history, "26.6.4.20001.altinityantalya",
         {
             {"input_format_parquet_footer_read_size", 65536, 0, "New setting to override the adaptive Parquet footer initial read size with a fixed number of bytes; 0 keeps the adaptive behavior. Before this setting the reader always read a fixed 64 KiB tail."},
