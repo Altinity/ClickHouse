@@ -1,0 +1,2 @@
+attach_from build_publish 1 manifest_put 1 ref_move 1
+move_to_table build_publish 2 manifest_put 2 ref_move 2
