@@ -13,8 +13,8 @@ from github import Github
 
 from clickhouse_helper import ClickHouseHelper, prepare_tests_results_for_clickhouse
 from commit_status_helper import format_description, get_commit, post_commit_status
-from env_helper import REPO_COPY, RUNNER_TEMP, GITHUB_RUN_URL
-from get_robot_token import get_best_robot_token, get_parameter_from_ssm
+from env_helper import REPO_COPY, RUNNER_TEMP, GITHUB_RUN_URL, DOCKER_PASSWORD
+from get_robot_token import get_best_robot_token
 from pr_info import PRInfo
 from report import TestResults, TestResult
 from s3_helper import S3Helper
@@ -250,6 +250,8 @@ def build_and_push_one_image(
 
     cmd = (
         "docker buildx build --builder default "
+        # A single image is required by `docker manifest create`, not an index with an attestation
+        "--provenance=false "
         f"--label build-url={GITHUB_RUN_URL} "
         f"{from_tag_arg}"
         # A hack to invalidate cache, grep for it in docker/ dir
@@ -426,7 +428,7 @@ def main():
         logging.info('Doing docker login')
         subprocess.check_output(  # pylint: disable=unexpected-keyword-arg
             "docker login --username 'altinityinfra' --password-stdin",
-            input=get_parameter_from_ssm("dockerhub-password"),
+            input=DOCKER_PASSWORD,
             encoding="utf-8",
             shell=True,
         )

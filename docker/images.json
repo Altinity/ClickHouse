@@ -115,6 +115,7 @@
          "dependent": [
             "docker/test/fuzzer",
             "docker/test/integration/base",
+            "docker/test/server-jepsen",
             "docker/test/sqllogic",
             "docker/test/sqltest",
             "docker/test/stateless",

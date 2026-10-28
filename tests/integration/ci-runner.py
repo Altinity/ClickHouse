@@ -316,6 +316,7 @@ class ClickhouseIntegrationTestsRunner:
             "altinityinfra/mysql-php-client",
             "altinityinfra/nginx-dav",
             "altinityinfra/postgresql-java-client",
+            "altinityinfra/python-bottle",
         ]
 
     def _pre_pull_images(self, repo_path):

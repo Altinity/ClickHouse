@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, mock_open
 from pathlib import Path
 
 from env_helper import GITHUB_RUN_URL
@@ -17,8 +17,13 @@ import docker_server as ds
 
 
 class TestDockerImageCheck(unittest.TestCase):
-    def test_get_changed_docker_images(self):
+    @patch("docker_images_check.subprocess")
+    def test_get_changed_docker_images(self, mock_subprocess):
+        # A push to an existing PR, where every unchanged image is already built for it
+        mock_subprocess.run.return_value.returncode = 0
         pr_info = PRInfo(PRInfo.default_event.copy())
+        pr_info.number = 12345
+        pr_info.event = {"action": "synchronize"}
         pr_info.changed_files = {
             "docker/test/stateless",
             "docker/test/base",
@@ -58,30 +63,30 @@ class TestDockerImageCheck(unittest.TestCase):
                     False,
                     "altinityinfra/test-base",  # type: ignore
                 ),
-                # di.DockerImage(
-                #     "docker/test/fuzzer",
-                #     "altinityinfra/fuzzer",
-                #     False,
-                #     "altinityinfra/test-base",  # type: ignore
-                # ),
-                # di.DockerImage(
-                #     # "docker/test/keeper-jepsen",
-                #     # "altinityinfra/keeper-jepsen-test",
-                #     False,
-                #     "altinityinfra/test-base",  # type: ignore
-                # ),
-                # di.DockerImage(
-                #     "docker/docs/check",
-                #     "altinityinfra/docs-check",
-                #     False,
-                #    "altinityinfra/docs-builder",  # type: ignore
-                # ),
-                # di.DockerImage(
-                #     "docker/docs/release",
-                #     "altinityinfra/docs-release",
-                #     False,
-                #    "altinityinfra/docs-builder",  # type: ignore
-                # ),
+                di.DockerImage(
+                    "docker/test/fuzzer",
+                    "altinityinfra/fuzzer",
+                    False,
+                    "altinityinfra/test-base",  # type: ignore
+                ),
+                di.DockerImage(
+                    "docker/test/keeper-jepsen",
+                    "altinityinfra/keeper-jepsen-test",
+                    False,
+                    "altinityinfra/test-base",  # type: ignore
+                ),
+                di.DockerImage(
+                    "docker/docs/check",
+                    "altinityinfra/docs-check",
+                    False,
+                    "altinityinfra/docs-builder",  # type: ignore
+                ),
+                di.DockerImage(
+                    "docker/docs/release",
+                    "altinityinfra/docs-release",
+                    False,
+                    "altinityinfra/docs-builder",  # type: ignore
+                ),
                 di.DockerImage(
                     "docker/test/stateful",
                     "altinityinfra/stateful-test",
@@ -122,6 +127,7 @@ class TestDockerImageCheck(unittest.TestCase):
         self.assertEqual(versions, ["1", "1-HEAD"])
         self.assertEqual(result_version, "1-HEAD")
 
+    @patch("docker_images_check.open", mock_open(), create=True)
     @patch("docker_images_check.TeePopen")
     @patch("platform.machine")
     def test_build_and_push_one_image(self, mock_machine, mock_popen):
@@ -132,12 +138,13 @@ class TestDockerImageCheck(unittest.TestCase):
         mock_popen.assert_called_once()
         mock_machine.assert_not_called()
         self.assertIn(
-            f"docker buildx build --builder default --label build-url={GITHUB_RUN_URL} "
+            "docker buildx build --builder default --provenance=false "
+            f"--label build-url={GITHUB_RUN_URL} "
             "--build-arg FROM_TAG=version "
             f"--build-arg CACHE_INVALIDATOR={GITHUB_RUN_URL} "
             "--tag name:version --cache-from type=registry,ref=name:version "
             "--cache-from type=registry,ref=name:latest "
-            "--cache-to type=inline,mode=max --push --progress plain path",
+            "--cache-to type=inline,mode=max --tag name:latest --push --progress plain path",
             mock_popen.call_args.args,
         )
         self.assertTrue(result)
@@ -149,12 +156,13 @@ class TestDockerImageCheck(unittest.TestCase):
         mock_popen.assert_called_once()
         mock_machine.assert_not_called()
         self.assertIn(
-            f"docker buildx build --builder default --label build-url={GITHUB_RUN_URL} "
+            "docker buildx build --builder default --provenance=false "
+            f"--label build-url={GITHUB_RUN_URL} "
             "--build-arg FROM_TAG=version2 "
             f"--build-arg CACHE_INVALIDATOR={GITHUB_RUN_URL} "
             "--tag name:version2 --cache-from type=registry,ref=name:version2 "
             "--cache-from type=registry,ref=name:latest "
-            "--cache-to type=inline,mode=max --progress plain path",
+            "--cache-to type=inline,mode=max --tag name:latest --progress plain path",
             mock_popen.call_args.args,
         )
         self.assertTrue(result)
@@ -166,11 +174,12 @@ class TestDockerImageCheck(unittest.TestCase):
         mock_popen.assert_called_once()
         mock_machine.assert_not_called()
         self.assertIn(
-            f"docker buildx build --builder default --label build-url={GITHUB_RUN_URL} "
+            "docker buildx build --builder default --provenance=false "
+            f"--label build-url={GITHUB_RUN_URL} "
             f"--build-arg CACHE_INVALIDATOR={GITHUB_RUN_URL} "
             "--tag name:version2 --cache-from type=registry,ref=name:version2 "
             "--cache-from type=registry,ref=name:latest "
-            "--cache-to type=inline,mode=max --progress plain path",
+            "--cache-to type=inline,mode=max --tag name:latest --progress plain path",
             mock_popen.call_args.args,
         )
         self.assertFalse(result)
@@ -184,13 +193,14 @@ class TestDockerImageCheck(unittest.TestCase):
         mock_popen.assert_called_once()
         mock_machine.assert_not_called()
         self.assertIn(
-            f"docker buildx build --builder default --label build-url={GITHUB_RUN_URL} "
+            "docker buildx build --builder default --provenance=false "
+            f"--label build-url={GITHUB_RUN_URL} "
             f"--build-arg CACHE_INVALIDATOR={GITHUB_RUN_URL} "
             "--tag name:version2 --cache-from type=registry,ref=name:version2 "
             "--cache-from type=registry,ref=name:latest "
             "--cache-from type=registry,ref=name:cached-version "
             "--cache-from type=registry,ref=name:another-cached "
-            "--cache-to type=inline,mode=max --progress plain path",
+            "--cache-to type=inline,mode=max --tag name:latest --progress plain path",
             mock_popen.call_args.args,
         )
         self.assertFalse(result)
