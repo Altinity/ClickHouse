@@ -49,6 +49,9 @@ TEST(ClusterFunctionReadTaskResponse, RejectsSchemaTransformOnProtocolBeforeData
     }
 }
 
+namespace
+{
+
 std::shared_ptr<ActionsDAG> makeOutputOnlySchemaTransform()
 {
     auto dag = std::make_shared<ActionsDAG>();
@@ -57,6 +60,8 @@ std::shared_ptr<ActionsDAG> makeOutputOnlySchemaTransform()
     const auto & added = dag->addColumn(std::move(constant), type, "added");
     dag->getOutputs().push_back(&added);
     return dag;
+}
+
 }
 
 TEST(ClusterFunctionReadTaskResponse, RejectsOutputOnlySchemaTransformOnProtocolBeforeDataLakeMetadata)
