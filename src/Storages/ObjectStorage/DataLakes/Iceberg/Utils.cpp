@@ -346,15 +346,34 @@ bool writeMetadataFileAndVersionHint(
     bool try_write_version_hint,
     bool * version_hint_names_metadata_file)
 {
+<<<<<<< HEAD
     bool hint_names_metadata_file = false;
 
+=======
+    return tryWriteMetadataFileAndVersionHint(
+               resolver, metadata_file_info, metadata_file_content, version_hint_path, object_storage, context, try_write_version_hint)
+        == MetadataCommitResult::Committed;
+}
+
+MetadataCommitResult tryWriteMetadataFileAndVersionHint(
+    const IcebergPathResolver & resolver,
+    const GeneratedMetadataFileWithInfo & metadata_file_info,
+    const std::string & metadata_file_content,
+    const IcebergPathFromMetadata & version_hint_path,
+    DB::ObjectStoragePtr object_storage,
+    DB::ContextPtr context,
+    bool try_write_version_hint)
+{
+>>>>>>> e6ae78c5318 (Merge pull request #2420 from Altinity/iceberg_rewrite_files_compaction)
     auto storage_metadata_path = resolver.resolve(metadata_file_info.path);
     auto storage_version_hint_path = resolver.resolve(version_hint_path);
+
+    /// A failure here is a storage error, not a lost race, so it propagates to the caller.
+    if (object_storage->exists(StoredObject(storage_metadata_path)))
+        return MetadataCommitResult::Conflict;
+
     try
     {
-        if (object_storage->exists(StoredObject(storage_metadata_path)))
-            return false;
-
         Iceberg::writeMessageToFile(
             metadata_file_content,
             storage_metadata_path,
@@ -376,8 +395,9 @@ bool writeMetadataFileAndVersionHint(
     }
     catch (...)
     {
+        /// Covers both a lost If-None-Match race and a write whose outcome is unknown (e.g. a timeout).
         tryLogCurrentException(__PRETTY_FUNCTION__);
-        return false;
+        return MetadataCommitResult::Unknown;
     }
 
     /// Once any writer has created `version-hint.text`, every subsequent writer must keep it in
@@ -449,11 +469,12 @@ bool writeMetadataFileAndVersionHint(
                 old_version,
                 metadata_file_info.version);
             object_storage->removeObjectIfExists(StoredObject(storage_metadata_path));
-            return false;
+            return MetadataCommitResult::Conflict;
         }
         ++i;
     }
 
+<<<<<<< HEAD
     /// The metadata file is already written with `If-None-Match: *`, which is the commit itself: reporting
     /// a failure here would make the caller retry and commit the same change a second time. A stale hint
     /// only delays readers with `iceberg_use_version_hint = 1` until the next writer advances it.
@@ -470,6 +491,9 @@ bool writeMetadataFileAndVersionHint(
         *version_hint_names_metadata_file = hint_names_metadata_file;
 
     return true;
+=======
+    return MetadataCommitResult::Committed;
+>>>>>>> e6ae78c5318 (Merge pull request #2420 from Altinity/iceberg_rewrite_files_compaction)
 }
 
 
@@ -1512,6 +1536,20 @@ static MetadataFileWithInfo getLatestMetadataFileAndVersion(
         )->latest_metadata;
     }
     return load_fn();
+}
+
+std::optional<Int32> getMaxMetadataFileVersionInDirectory(const ObjectStoragePtr & object_storage, const String & table_path)
+{
+    std::optional<Int32> max_version;
+    for (const auto & path : listFiles(*object_storage, table_path, "metadata", ".metadata.json"))
+    {
+        if (isTemporaryMetadataFile(std::filesystem::path(path).filename()))
+            continue;
+        const Int32 version = getMetadataFileAndVersion(path).version;
+        if (!max_version || version > *max_version)
+            max_version = version;
+    }
+    return max_version;
 }
 
 MetadataFileWithInfo getLatestOrExplicitMetadataFileAndVersion(

@@ -175,9 +175,11 @@ MultipleFileWriter::MultipleFileWriter(
     const std::optional<FormatSettings> & format_settings_,
     const String & write_format_,
     SharedHeader sample_block_,
-    std::function<void(const std::string &)> new_file_path_callback_)
+    std::function<void(const std::string &)> new_file_path_callback_,
+    FileSizeMeasure file_size_measure_)
     : max_data_file_num_rows(max_data_file_num_rows_)
     , max_data_file_num_bytes(max_data_file_num_bytes_)
+    , file_size_measure(file_size_measure_)
     , schema(schema_)
     , aggregate_stats(schema_)
     , column_mapper(Iceberg::createColumnMapperFromFields(schema_))
@@ -307,7 +309,13 @@ void MultipleFileWriter::consume(const Chunk & chunk)
     if (has_nothing_leaves)
         filtered_columns = filterColumns(chunk.getColumns());
 
-    if (!current_file_num_rows || *current_file_num_rows >= max_data_file_num_rows || *current_file_num_bytes >= max_data_file_num_bytes)
+    /// A zero limit means "no limit": with a plain `>=` comparison it would roll over to a new
+    /// file after the first written chunk, splitting the output into one file per chunk.
+    const bool has_open_file = current_file_num_rows.has_value();
+    const bool row_limit_reached = has_open_file && max_data_file_num_rows > 0 && *current_file_num_rows >= max_data_file_num_rows;
+    const bool bytes_limit_reached = has_open_file && max_data_file_num_bytes > 0
+        && (file_size_measure == FileSizeMeasure::WrittenBytes ? buffer->count() : *current_file_num_bytes) >= max_data_file_num_bytes;
+    if (!has_open_file || row_limit_reached || bytes_limit_reached)
     {
         startNewFile();
     }
@@ -326,6 +334,10 @@ void MultipleFileWriter::consume(const Chunk & chunk)
 
 void MultipleFileWriter::finalize()
 {
+    /// No chunk was consumed, so no file was started.
+    if (!buffer)
+        return;
+
     output_format->flush();
     output_format->finalize();
 
