@@ -1431,6 +1431,20 @@ static MetadataFileWithInfo getLatestMetadataFileAndVersion(
     return load_fn();
 }
 
+std::optional<Int32> getMaxMetadataFileVersionInDirectory(const ObjectStoragePtr & object_storage, const String & table_path)
+{
+    std::optional<Int32> max_version;
+    for (const auto & path : listFiles(*object_storage, table_path, "metadata", ".metadata.json"))
+    {
+        if (isTemporaryMetadataFile(std::filesystem::path(path).filename()))
+            continue;
+        const Int32 version = getMetadataFileAndVersion(path).version;
+        if (!max_version || version > *max_version)
+            max_version = version;
+    }
+    return max_version;
+}
+
 MetadataFileWithInfo getLatestOrExplicitMetadataFileAndVersion(
     const ObjectStoragePtr & object_storage,
     const String & table_path,

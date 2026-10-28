@@ -549,7 +549,8 @@ bool IcebergMetadata::optimize(
     };
 
     /// Bin-packing never rewrites a file a position delete applies to, so it cannot remove them.
-    if (Iceberg::hasLivePositionDeletes(persistent_components, object_storage, *secondary_storages, data_lake_settings, context))
+    if (Iceberg::hasLivePositionDeletes(
+            persistent_components, object_storage, *secondary_storages, data_lake_settings, context, catalog, storage_id))
     {
         LOG_INFO(log, "Table has live position delete files, applying them with a full compaction");
         compactIcebergTable(

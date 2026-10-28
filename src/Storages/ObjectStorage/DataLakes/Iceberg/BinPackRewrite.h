@@ -27,12 +27,15 @@ enum class BinPackCommitResult : uint8_t
 
 /// Whether the latest snapshot has live position delete files. Bin-packing leaves the files they
 /// apply to untouched, so such tables are compacted by `compactIcebergTable` instead.
+/// When `catalog` is set, the latest snapshot is the one the catalog points to.
 bool hasLivePositionDeletes(
     const PersistentTableComponents & persistent_table_components,
     ObjectStoragePtr object_storage,
     SecondaryStorages & secondary_storages,
     const DataLakeStorageSettings & data_lake_settings,
-    ContextPtr context);
+    ContextPtr context,
+    const std::shared_ptr<DataLake::ICatalog> & catalog,
+    const StorageID & storage_id);
 
 /// Execute bin-packing compaction for an Iceberg table: merge small data files into
 /// larger ones, producing a `replace` snapshot that atomically swaps the old files

@@ -52,6 +52,7 @@ namespace DB::Setting
 namespace DB::DataLakeStorageSetting
 {
     extern const DataLakeStorageSettingsBool iceberg_use_version_hint;
+    extern const DataLakeStorageSettingsString iceberg_metadata_file_path;
 }
 
 namespace DB::Iceberg
@@ -595,17 +596,74 @@ BinPackPlan buildBinPackPlan(
 
 struct LatestMetadata
 {
+    /// The new metadata file gets version `version + 1`.
     Int32 version;
     Poco::JSON::Object::Ptr object;
+    /// The catalog's metadata location the compaction is based on; empty without a catalog.
+    String catalog_metadata_location;
 };
+
+String getCatalogMetadataLocation(const DataLake::ICatalog & catalog, const StorageID & storage_id, ContextPtr context)
+{
+    DataLake::TableMetadata table_metadata = DataLake::TableMetadata().withDataLakeSpecificProperties().withLocation();
+    const auto & [namespace_name, table_name] = DataLake::parseTableName(storage_id.getTableName());
+    catalog.getTableMetadata(namespace_name, table_name, context, table_metadata);
+
+    auto specific_properties = table_metadata.getDataLakeSpecificProperties();
+    if (!specific_properties.has_value() || specific_properties->iceberg_metadata_file_location.empty())
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "Catalog did not return a metadata file location for table '{}.{}'",
+            namespace_name, table_name);
+
+    return table_metadata.getMetadataLocation(specific_properties->iceberg_metadata_file_location);
+}
 
 LatestMetadata readLatestMetadata(
     const PersistentTableComponents & persistent_table_components,
     ObjectStoragePtr object_storage,
     const DataLakeStorageSettings & data_lake_settings,
     ContextPtr context,
+    const std::shared_ptr<DataLake::ICatalog> & catalog,
+    const StorageID & storage_id,
     LoggerPtr log)
 {
+    if (catalog)
+    {
+        /// The catalog, not the newest file in the `metadata` directory, holds the current
+        /// snapshot: a newer file may be left by a commit that failed before updating the catalog.
+        String catalog_metadata_location = getCatalogMetadataLocation(*catalog, storage_id, context);
+
+        DataLakeStorageSettings effective_settings = data_lake_settings;
+        effective_settings[DataLakeStorageSetting::iceberg_metadata_file_path] = catalog_metadata_location;
+        const auto catalog_metadata = getLatestOrExplicitMetadataFileAndVersion(
+            object_storage,
+            persistent_table_components.table_path,
+            effective_settings,
+            persistent_table_components.metadata_cache,
+            context,
+            log.get(),
+            persistent_table_components.table_uuid,
+            persistent_table_components.metadata_compression_method,
+            /* force_fetch_latest_metadata */ true,
+            /* ignore_explicit_metadata_file_path */ false);
+
+        auto metadata_object = getMetadataJSONObject(
+            catalog_metadata.path,
+            object_storage,
+            persistent_table_components.metadata_cache,
+            context,
+            log,
+            catalog_metadata.compression_method,
+            persistent_table_components.table_uuid);
+
+        /// The new metadata file must not reuse the name of a newer file left in the directory.
+        const auto max_directory_version = getMaxMetadataFileVersionInDirectory(object_storage, persistent_table_components.table_path);
+        const Int32 version = std::max(catalog_metadata.version, max_directory_version.value_or(catalog_metadata.version));
+
+        return {version, metadata_object, std::move(catalog_metadata_location)};
+    }
+
     const auto [metadata_version, metadata_file_path, _] = getLatestOrExplicitMetadataFileAndVersion(
         object_storage,
         persistent_table_components.table_path,
@@ -627,7 +685,7 @@ LatestMetadata readLatestMetadata(
         persistent_table_components.metadata_compression_method,
         persistent_table_components.table_uuid);
 
-    return {metadata_version, metadata_object};
+    return {metadata_version, metadata_object, {}};
 }
 
 enum class MetadataFileOwner : uint8_t
@@ -666,10 +724,13 @@ bool hasLivePositionDeletes(
     ObjectStoragePtr object_storage,
     SecondaryStorages & secondary_storages,
     const DataLakeStorageSettings & data_lake_settings,
-    ContextPtr context)
+    ContextPtr context,
+    const std::shared_ptr<DataLake::ICatalog> & catalog,
+    const StorageID & storage_id)
 {
     LoggerPtr log = getLogger("IcebergBinPack");
-    const auto metadata_object = readLatestMetadata(persistent_table_components, object_storage, data_lake_settings, context, log).object;
+    const auto metadata_object
+        = readLatestMetadata(persistent_table_components, object_storage, data_lake_settings, context, catalog, storage_id, log).object;
 
     if (!metadata_object->has(f_current_snapshot_id))
         return false;
@@ -771,7 +832,9 @@ RewriteResult rewriteBins(
         BinResult bin_result;
         bin_result.partition_key = bin.partition_key;
 
-        /// Prepare the MultipleFileWriter for this bin.
+        /// Prepare the MultipleFileWriter for this bin. Files are limited by their size on storage, which is
+        /// what the plan compares with `min_file_size`: limited by in-memory size, compressible data would
+        /// produce files below `min_file_size` that every next OPTIMIZE rewrites again.
         MultipleFileWriter writer(
             /* max_data_file_num_rows */ 0,  /// no row limit; size limit is used
             /* max_data_file_num_bytes */ target_size,
@@ -786,7 +849,8 @@ RewriteResult rewriteBins(
             [&](const std::string & path)
             {
                 new_data_file_paths.push_back(IcebergPathFromMetadata::deserialize(path));
-            });
+            },
+            MultipleFileWriter::FileSizeMeasure::WrittenBytes);
 
         /// Read each source file and feed into the writer.
         for (auto & file_entry : bin.files)
@@ -1259,10 +1323,28 @@ BinPackCommitResult commitMetadata(
     const DataLakeStorageSettings & data_lake_settings,
     const std::shared_ptr<DataLake::ICatalog> & catalog,
     const StorageID & storage_id,
+    const String & catalog_metadata_location,
     bool & keep_files_on_error,
     const std::function<void()> & cleanup,
     LoggerPtr log)
 {
+    /// A catalog may repoint the table without a compare-and-swap (Glue `UpdateTable` is unconditional),
+    /// so a snapshot built on a superseded metadata file would replace the newer history. This check
+    /// narrows that window; it cannot close it.
+    if (catalog)
+    {
+        const String current_location = getCatalogMetadataLocation(*catalog, storage_id, context);
+        if (current_location != catalog_metadata_location)
+        {
+            LOG_INFO(
+                log,
+                "Catalog metadata location changed from {} to {} during bin-pack compaction, cleaning up",
+                catalog_metadata_location, current_location);
+            cleanup();
+            return BinPackCommitResult::Conflict;
+        }
+    }
+
     /// From here on the new metadata may become live and reference the new files, so an exception
     /// must not remove them. Paths that know the snapshot did not land call `cleanup` themselves.
     keep_files_on_error = true;
@@ -1317,8 +1399,8 @@ BinPackCommitResult executeBinPackCompaction(
     UInt64 target_size = settings[Setting::iceberg_target_data_file_size_bytes];
     UInt64 min_size = settings[Setting::iceberg_min_data_file_size_bytes];
 
-    const auto [metadata_version, metadata_object]
-        = readLatestMetadata(persistent_table_components, object_storage, data_lake_settings, context, log);
+    const auto [metadata_version, metadata_object, catalog_metadata_location]
+        = readLatestMetadata(persistent_table_components, object_storage, data_lake_settings, context, catalog, storage_id, log);
 
     /// Format version 3 requires row lineage (`_row_id`, `_last_updated_sequence_number`) to be carried
     /// into rewritten files, which the rewrite does not do yet.
@@ -1442,7 +1524,7 @@ BinPackCommitResult executeBinPackCompaction(
         auto commit = commitMetadata(
             metadata_object, snapshot_result.snapshot, generated_metadata_info,
             generator, path_resolver, persistent_table_components, object_storage,
-            context, data_lake_settings, catalog, storage_id, keep_files_on_error, cleanup, log);
+            context, data_lake_settings, catalog, storage_id, catalog_metadata_location, keep_files_on_error, cleanup, log);
 
         if (commit != BinPackCommitResult::Committed)
             return commit;
