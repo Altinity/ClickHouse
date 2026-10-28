@@ -65,6 +65,11 @@ group_by_row_limit
 TOO_MANY_ROWS
 group_by_row_limit_any
 2
+read_optimization_off
+2026-01-10
+data
+read_optimization_off_group
+data
 icebergLocal
 files 10
 max_d

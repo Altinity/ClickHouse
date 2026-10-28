@@ -136,6 +136,7 @@ namespace DB
 namespace Setting
 {
     extern const SettingsMap additional_table_filters;
+    extern const SettingsBool allow_experimental_iceberg_read_optimization;
     extern const SettingsUInt64 allow_experimental_parallel_reading_from_replicas;
     extern const SettingsBool optimize_trivial_view_pushdown_to_distributed;
     extern const SettingsUInt64 distributed_group_by_no_merge;
@@ -746,6 +747,11 @@ bool applyIcebergIdentityPartitionAggregationIfPossible(
     /// With this setting an empty input must produce no row. The prepared state always produces one
     /// row for an aggregate without `GROUP BY`, so leave that case to the normal pipeline.
     if (settings[Setting::empty_result_for_aggregation_by_empty_set])
+        return false;
+
+    /// `allow_experimental_iceberg_read_optimization` turns off answers taken from Iceberg metadata.
+    /// `min`, `max`, and filtered or grouped `count` then scan the data files.
+    if (!settings[Setting::allow_experimental_iceberg_read_optimization])
         return false;
 
     if (query_context->getClientInfo().query_kind == ClientInfo::QueryKind::SECONDARY_QUERY)

@@ -297,6 +297,56 @@ ${CLICKHOUSE_CLIENT} --format TabSeparated --query "
             enable_parallel_replicas = 0
     )"
 
+# `allow_experimental_iceberg_read_optimization = 0` must scan. Unfiltered `count()` stays on trivial count.
+echo "read_optimization_off"
+${CLICKHOUSE_CLIENT} --format TabSeparated --query "
+    SELECT max(d) FROM ${LOCAL_TABLE}
+    SETTINGS
+        log_comment = '${PREFIX}_read_optimization_off',
+        log_queries = 1,
+        allow_experimental_iceberg_read_optimization = 0,
+        optimize_trivial_count_query = 1,
+        use_iceberg_metadata_files_cache = 0,
+        enable_parallel_replicas = 0"
+${CLICKHOUSE_CLIENT} --query "SYSTEM FLUSH LOGS query_log"
+${CLICKHOUSE_CLIENT} --format TabSeparated --query "
+    SELECT if(
+        read_rows >= 10000,
+        'data',
+        concat('metadata read_rows=', toString(read_rows)))
+    FROM system.query_log
+    WHERE type = 'QueryFinish'
+        AND is_initial_query
+        AND current_database = currentDatabase()
+        AND log_comment = '${PREFIX}_read_optimization_off'
+    ORDER BY event_time_microseconds DESC
+    LIMIT 1"
+
+echo "read_optimization_off_group"
+${CLICKHOUSE_CLIENT} --query "
+    SELECT d, count() FROM ${LOCAL_TABLE}
+    GROUP BY d
+    SETTINGS
+        log_comment = '${PREFIX}_read_optimization_off_group',
+        log_queries = 1,
+        allow_experimental_iceberg_read_optimization = 0,
+        optimize_trivial_count_query = 1,
+        use_iceberg_metadata_files_cache = 0,
+        enable_parallel_replicas = 0" > /dev/null
+${CLICKHOUSE_CLIENT} --query "SYSTEM FLUSH LOGS query_log"
+${CLICKHOUSE_CLIENT} --format TabSeparated --query "
+    SELECT if(
+        read_rows >= 10000,
+        'data',
+        concat('metadata read_rows=', toString(read_rows)))
+    FROM system.query_log
+    WHERE type = 'QueryFinish'
+        AND is_initial_query
+        AND current_database = currentDatabase()
+        AND log_comment = '${PREFIX}_read_optimization_off_group'
+    ORDER BY event_time_microseconds DESC
+    LIMIT 1"
+
 exercise "icebergLocal" "icebergLocal('${LOCAL_PATH}')"
 
 create_table "${S3_TABLE}" "IcebergS3(s3_conn, filename = '${S3_KEY}')"
