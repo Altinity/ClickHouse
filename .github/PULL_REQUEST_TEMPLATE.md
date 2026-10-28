@@ -38,3 +38,20 @@ tests/ci/cancel_and_rerun_workflow_lambda/app.py
 - [ ] <!---ci_exclude_aarch64--> All with Aarch64
 - [ ] <!---ci_exclude_regression--> All Regression
 - [ ] <!---no_ci_cache--> Disable CI Cache
+
+#### Regression jobs to run:
+- [ ] <!---ci_regression_common--> Fast suites (mostly <1h)
+- [ ] <!---ci_regression_aggregate_functions--> Aggregate Functions (2h)
+- [ ] <!---ci_regression_alter--> Alter (1.5h)
+- [ ] <!---ci_regression_benchmark--> Benchmark (30m)
+- [ ] <!---ci_regression_clickhouse_keeper--> ClickHouse Keeper (1h)
+- [ ] <!---ci_regression_iceberg--> Iceberg (2h)
+- [ ] <!---ci_regression_ldap--> LDAP (1h)
+- [ ] <!---ci_regression_oauth--> OAuth (5m)
+- [ ] <!---ci_regression_parquet--> Parquet (1.5h)
+- [ ] <!---ci_regression_rbac--> RBAC (1.5h)
+- [ ] <!---ci_regression_ssl_server--> SSL Server (1h)
+- [ ] <!---ci_regression_s3--> S3 (2h)
+- [ ] <!---ci_regression_s3_export--> S3 Export (2h)
+- [ ] <!---ci_regression_swarms--> Swarms (30m)
+- [ ] <!---ci_regression_tiered_storage--> Tiered Storage (2h)

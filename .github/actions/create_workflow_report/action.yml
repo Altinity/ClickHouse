@@ -2,8 +2,9 @@ name: Create and Upload Combined Report
 description: Create and upload a combined CI report
 inputs:
   workflow_config:
-    description: "Workflow config"
-    required: true
+    description: "Workflow config (25.8 generated YAML still passes this)"
+    required: false
+    default: ""
   final:
     description: "Control whether the report is final or a preview"
     required: false
@@ -12,6 +13,7 @@ runs:
   using: "composite"
   steps:
     - name: Create workflow config
+      if: ${{ inputs.workflow_config != '' }}
       shell: bash
       run: |
         mkdir -p ./ci/tmp
@@ -27,10 +29,13 @@ runs:
         FINAL: ${{ inputs.final }}
       shell: bash
       run: |
-        pip install clickhouse-driver==0.2.8 numpy==1.26.4 pandas==2.0.3 jinja2==3.1.5
+        # Newer runners have these deps preinstalled; only install on Ubuntu 22.
+        if [[ -f /etc/os-release ]] && . /etc/os-release && [[ "$VERSION_ID" == "22.04" ]]; then
+          pip install clickhouse-driver==0.2.8 numpy==1.26.4 pandas==2.0.3 jinja2==3.1.5
+        fi
 
         CMD="python3 .github/actions/create_workflow_report/create_workflow_report.py"
-        ARGS="--actions-run-url $ACTIONS_RUN_URL --known-fails tests/broken_tests.yaml --cves --pr-number $PR_NUMBER"
+        ARGS="--actions-run-url $ACTIONS_RUN_URL --known-fails --cves --pr-number $PR_NUMBER"
 
         set +e -x
         if [[ "$FINAL" == "false" ]]; then

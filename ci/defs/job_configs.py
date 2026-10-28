@@ -85,6 +85,7 @@ class JobConfigs:
             ],
         ),
         result_name_for_cidb="Tests",
+        needs_submodules=True,
     )
     tidy_build_arm_jobs = Job.Config(
         name=JobNames.BUILD,
@@ -94,6 +95,7 @@ class JobConfigs:
         run_in_docker=BINARY_DOCKER_COMMAND,
         timeout=3600 * 4,
         digest_config=build_digest_config,
+        needs_submodules=True,
     ).parametrize(
         Job.ParamSet(
             parameter=BuildTypes.ARM_TIDY,
@@ -109,6 +111,7 @@ class JobConfigs:
         run_in_docker=BINARY_DOCKER_COMMAND,
         timeout=3600 * 4,
         digest_config=build_digest_config,
+        needs_submodules=True,
     ).parametrize(
         Job.ParamSet(
             parameter=BuildTypes.AMD_TIDY,
@@ -125,6 +128,7 @@ class JobConfigs:
         run_in_docker=BINARY_DOCKER_COMMAND,
         timeout=3600 * 3,
         digest_config=build_digest_config,
+        needs_submodules=True,
         post_hooks=[
             "python3 ./ci/jobs/scripts/job_hooks/build_master_head_hook.py",
             # "python3 ./ci/jobs/scripts/job_hooks/build_profile_hook.py",
@@ -230,6 +234,7 @@ class JobConfigs:
         run_in_docker=BINARY_DOCKER_COMMAND,
         timeout=3600 * 2,
         digest_config=build_digest_config,
+        needs_submodules=True,
         post_hooks=[
             "python3 ./ci/jobs/scripts/job_hooks/build_master_head_hook.py",
             "python3 ./ci/jobs/scripts/job_hooks/build_profile_hook.py",
