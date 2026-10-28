@@ -489,7 +489,11 @@ def main():
         if use_thinlto_cache:
             run_shell(
                 "thinlto cache stats",
-                f"du -sh {thinlto_cache_dir} && find {thinlto_cache_dir} -type f | wc -l && df -h {thinlto_cache_dir}",
+                # The volume's root-owned `lost+found` is unreadable for the
+                # build user, so count only lld's own entries.
+                f"du -sh --exclude=lost+found {thinlto_cache_dir}; "
+                f"find {thinlto_cache_dir} -maxdepth 1 -name 'llvmcache-*' | wc -l; "
+                f"df -h {thinlto_cache_dir}",
             )
         if build_type in (BuildTypes.AMD_TIDY, BuildTypes.ARM_TIDY):
             run_shell("clang-tidy-cache stats", "clang-tidy-cache.py --show-stats")
