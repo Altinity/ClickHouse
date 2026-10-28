@@ -261,6 +261,42 @@ ${CLICKHOUSE_CLIENT} --format TabSeparated --query "
     ORDER BY event_time_microseconds DESC
     LIMIT 1"
 
+# `max_rows_to_group_by` must use the scan. The manifest path would return every partition.
+echo "group_by_row_limit"
+set +e
+limit_output=$(${CLICKHOUSE_CLIENT} --query "
+    SELECT d, count() FROM ${LOCAL_TABLE}
+    GROUP BY d
+    SETTINGS
+        max_rows_to_group_by = 1,
+        group_by_overflow_mode = 'throw',
+        optimize_trivial_count_query = 1,
+        use_iceberg_metadata_files_cache = 0,
+        enable_parallel_replicas = 0" 2>&1)
+limit_status=$?
+set -e
+if [ "${limit_status}" -eq 0 ] || [[ "${limit_output}" != *"TOO_MANY_ROWS"* ]]; then
+    echo "group_by_row_limit expected TOO_MANY_ROWS, status=${limit_status}"
+    printf '%s\n' "${limit_output}"
+    exit 1
+fi
+echo "TOO_MANY_ROWS"
+
+# `any` stops after the key that crosses `max_rows_to_group_by`, so limit 1 keeps two groups.
+echo "group_by_row_limit_any"
+${CLICKHOUSE_CLIENT} --format TabSeparated --query "
+    SELECT count() FROM
+    (
+        SELECT d, count() FROM ${LOCAL_TABLE}
+        GROUP BY d
+        SETTINGS
+            max_rows_to_group_by = 1,
+            group_by_overflow_mode = 'any',
+            optimize_trivial_count_query = 1,
+            use_iceberg_metadata_files_cache = 0,
+            enable_parallel_replicas = 0
+    )"
+
 exercise "icebergLocal" "icebergLocal('${LOCAL_PATH}')"
 
 create_table "${S3_TABLE}" "IcebergS3(s3_conn, filename = '${S3_KEY}')"

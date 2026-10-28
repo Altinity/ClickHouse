@@ -783,6 +783,11 @@ bool applyIcebergIdentityPartitionAggregationIfPossible(
         || query_node.isGroupByWithGroupingSets())
         return false;
 
+    /// `max_rows_to_group_by` is enforced while keys are inserted. This path emits every group,
+    /// and `MergingAggregated` is built without that limit, so `throw`, `break`, and `any` would not apply.
+    if (query_node.hasGroupBy() && settings[Setting::max_rows_to_group_by])
+        return false;
+
     if (!query_node.getCorrelatedColumnsSet().empty() || queryHasArrayJoinInJoinTree(query_tree))
         return false;
 

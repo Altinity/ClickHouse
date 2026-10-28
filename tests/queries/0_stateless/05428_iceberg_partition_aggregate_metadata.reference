@@ -61,6 +61,10 @@ data
 to_year
 10000
 metadata
+group_by_row_limit
+TOO_MANY_ROWS
+group_by_row_limit_any
+2
 icebergLocal
 files 10
 max_d
