@@ -353,6 +353,8 @@ if __name__ == "__main__":
                 env_tags += "-e {}={} ".format("DOCKER_NGINX_DAV_TAG", tag)
             elif image == "altinityinfra/postgresql-java-client":
                 env_tags += "-e {}={} ".format("DOCKER_POSTGRESQL_JAVA_CLIENT_TAG", tag)
+            elif image == "altinityinfra/python-bottle":
+                env_tags += "-e {}={} ".format("DOCKER_PYTHON_BOTTLE_TAG", tag)
             else:
                 logging.info("Unknown image %s" % (image))
 
