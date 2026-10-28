@@ -48,6 +48,19 @@ public:
         const Iceberg::IcebergPathFromMetadata & metadata_file_path,
         Int64 parent_snapshot_id);
 
+    /// Create a `replace` snapshot for bin-packing compaction: atomically removes small files and adds merged files.
+    NextMetadataResult generateReplaceSnapshot(
+        FileNamesGenerator & generator,
+        const Iceberg::IcebergPathFromMetadata & metadata_file_path,
+        Int64 parent_snapshot_id,
+        Int64 added_data_files,
+        Int64 added_records,
+        Int64 added_files_size,
+        Int64 removed_data_files,
+        Int64 removed_records,
+        Int64 removed_files_size,
+        Int64 num_partitions);
+
     void generateDropColumnMetadata(const String & column_name);
     /// Returns false when neither the type nor the position changed (true no-op).
     /// Throws when the requested type differs from the current one but maps to the same Iceberg type.
@@ -75,6 +88,17 @@ private:
 
     Int64 getMaxSequenceNumber();
     Poco::JSON::Object::Ptr getParentSnapshot(Int64 parent_snapshot_id);
+
+    /// Appends a `replace` snapshot with the given `summary`, makes it current and records it in the logs.
+    /// `summary` gets `total-*` counters equal to the parent totals shifted by the deltas.
+    NextMetadataResult appendReplaceSnapshot(
+        FileNamesGenerator & generator,
+        const Iceberg::IcebergPathFromMetadata & metadata_file_path,
+        Int64 parent_snapshot_id,
+        Poco::JSON::Object::Ptr summary,
+        Int64 records_delta,
+        Int64 files_size_delta,
+        Int64 data_files_delta);
 
     /// Returns the schema referenced by `current-schema-id`, or nullptr when it is absent.
     Poco::JSON::Object::Ptr findCurrentSchema() const;
