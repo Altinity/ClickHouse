@@ -246,15 +246,32 @@ public:
 
                     if (!fallback_exception && !fallback_predicate->hasUnsupportedNodes())
                     {
-                        LOG_INFO(
-                            log,
-                            "Full predicate translation failed; falling back to clustering-column-only "
-                            "predicate for file-level data skipping (clustering columns: {})",
-                            fmt::join(clustering_columns, ", "));
-
                         ProfileEvents::increment(ProfileEvents::DeltaLakeClusteringPredicateFallbacks);
 
-                        scan = std::move(fallback_scan);
+                        if (engine_predicate_exception)
+                        {
+                            /// The original scan's predicate may be in an unreliable state
+                            /// after a translation exception; use the restricted predicate.
+                            LOG_INFO(
+                                log,
+                                "Full predicate translation failed; falling back to clustering-column-only "
+                                "predicate for file-level data skipping (clustering columns: {})",
+                                fmt::join(clustering_columns, ", "));
+
+                            scan = std::move(fallback_scan);
+                        }
+                        else
+                        {
+                            /// The original scan already contains every translatable conjunct,
+                            /// including all clustering-column conjuncts of the restricted
+                            /// predicate, so keeping it is never weaker than the fallback scan.
+                            LOG_INFO(
+                                log,
+                                "Full predicate translation has unsupported nodes; keeping the original "
+                                "scan, which already includes the clustering-column conjuncts "
+                                "(clustering columns: {})",
+                                fmt::join(clustering_columns, ", "));
+                        }
                     }
                 }
             }

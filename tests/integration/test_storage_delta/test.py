@@ -74,6 +74,9 @@ def get_spark(log_dir=None):
             "spark.sql.catalog.spark_catalog.warehouse",
             "/var/lib/clickhouse/user_files/test_storage_delta",
         )
+        .config(
+            "spark.databricks.delta.clusteredTable.enableClusteringTablePreview", "true"
+        )
         .config("spark.driver.memory", "2g")
         .config("spark.executor.memory", "2g")
         .master("local")
@@ -162,7 +165,7 @@ def started_cluster():
             ],
             user_configs=["configs/users.d/users.xml"],
             with_installed_binary=True,
-            image="clickhouse/clickhouse-server",
+            image="altinity/clickhouse-server",
             tag=CLICKHOUSE_CI_MIN_TESTED_VERSION,
             with_minio=True,
             with_azurite=True,
@@ -5651,7 +5654,7 @@ def test_liquid_clustering(started_cluster):
     delta_path = f"/{TABLE_NAME}"
     spark.sql(f"""
         CREATE TABLE delta.`{delta_path}` (a INT, b STRING)
-        USING DELTA CLUSTER BY (a)
+        USING DELTA CLUSTER BY (a, b)
     """)
     spark.sql(f"""
         INSERT INTO delta.`{delta_path}`
@@ -5697,7 +5700,7 @@ def test_liquid_clustering_data_skipping(started_cluster):
     delta_path = f"/{TABLE_NAME}"
     spark.sql(f"""
         CREATE TABLE delta.`{delta_path}` (a INT, b STRING)
-        USING DELTA CLUSTER BY (a)
+        USING DELTA CLUSTER BY (a, b)
     """)
 
     # Insert multiple batches to produce several files after OPTIMIZE.
@@ -5707,6 +5710,18 @@ def test_liquid_clustering_data_skipping(started_cluster):
             SELECT id + {i * 1000} as a, CAST(id + {i * 1000} AS STRING) as b
             FROM range(1000)
         """)
+    # OPTIMIZE targets ~1GB cubes/files by default, which would pack this small
+    # dataset into a single file and leave nothing to skip. Shrink the cube and
+    # file size targets so several files are produced.
+    spark.conf.set("spark.databricks.delta.optimize.maxFileSize", "10240")
+    spark.conf.set(
+        "spark.databricks.delta.optimize.clustering.mergeStrategy.minCubeSize.targetCubeSize",
+        "10240",
+    )
+    spark.conf.set(
+        "spark.databricks.delta.optimize.clustering.mergeStrategy.minCubeSize.threshold",
+        "1024",
+    )
     spark.sql(f"OPTIMIZE delta.`{delta_path}`")
 
     files = default_upload_directory(started_cluster, "s3", delta_path, "")
@@ -5765,14 +5780,16 @@ def test_liquid_clustering_predicate_fallback(started_cluster):
 
     delta_path = f"/{TABLE_NAME}"
     spark.sql(f"""
-        CREATE TABLE delta.`{delta_path}` (a INT, b STRING)
-        USING DELTA CLUSTER BY (a)
+        CREATE TABLE delta.`{delta_path}` (a INT, b STRING, c STRING)
+        USING DELTA CLUSTER BY (a, b)
     """)
 
     for i in range(5):
         spark.sql(f"""
             INSERT INTO delta.`{delta_path}`
-            SELECT id + {i * 1000} as a, CAST(id + {i * 1000} AS STRING) as b
+            SELECT id + {i * 1000} as a,
+                   CAST(id + {i * 1000} AS STRING) as b,
+                   CAST(id + {i * 1000} + 1 AS STRING) as c
             FROM range(1000)
         """)
     spark.sql(f"OPTIMIZE delta.`{delta_path}`")
@@ -5783,11 +5800,13 @@ def test_liquid_clustering_predicate_fallback(started_cluster):
     create_delta_table(instance, "s3", TABLE_NAME, started_cluster)
 
     # Query with a clustering filter (a = 42) AND an untranslatable expression
-    # (cityHash64). The full predicate translation should fail, but the fallback
-    # should push the `a = 42` part for file-level skipping.
+    # referencing non-clustering column `c` (cityHash64 cannot be translated by
+    # the delta-kernel engine predicate). `restrictFilterDAGToInputs` will
+    # replace the non-clustering conjunct with constant true, leaving only
+    # `a = 42` for the fallback predicate to push for file-level skipping.
     fallback_query_id = f"{TABLE_NAME}_fallback"
     result = instance.query(
-        f"SELECT a FROM {TABLE_NAME} WHERE a = 42 AND cityHash64(b) != 0",
+        f"SELECT a FROM {TABLE_NAME} WHERE a = 42 AND cityHash64(c) != 0",
         query_id=fallback_query_id,
     )
     assert result.strip() == "42"
