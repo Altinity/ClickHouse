@@ -4,8 +4,8 @@ create table xxxxx (col1 String, col2 String, _time DateTime, projection p (sele
 
 create table yyyyyyy (col1 String, col2 String, _time DateTime, projection p (select * order by col2)) engine=MergeTree partition by col1 order by tuple();
 
-insert into xxxxx (col1, col2, _time) values ('xxx', 'zzzz', now()+1);
-insert into yyyyyyy (col1, col2, _time) values ('xxx', 'zzzz', now());
+insert into xxxxx (col1, col2, _time) values ('xxx', 'zzzz', '2100-01-01 00:00:01');
+insert into yyyyyyy (col1, col2, _time) values ('xxx', 'zzzz', '2100-01-01 00:00:00');
 
 SELECT count()
 FROM xxxxx
