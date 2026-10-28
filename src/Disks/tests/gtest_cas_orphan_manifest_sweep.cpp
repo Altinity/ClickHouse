@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCkpt.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Common/Exception.h>
@@ -370,23 +371,226 @@ TEST(CASOrphanManifestSweep, CursorPageRespectsDeleteBudget)
     EXPECT_NE(first_exists, second_exists);
 }
 
-/// A physical manifest captured before a catalog cut which omits its name is dead-life debris: a live
-/// creation cannot publish a life-owned object before its catalog row. It therefore has an eventual
-/// page-sweep owner without trying to reconstruct a deleted incarnation from the key.
-TEST(CASOrphanManifestSweep, CursorPageDeletesObservedBodyWhenCatalogOmitsNamespace)
+TEST(CASOrphanManifestSweep, CursorPageRetainsRowlessBodyWithoutMountLease)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/catalog-absent-debris@cas@"};
     const ManifestRef r = ref(5, 0xA9);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("debris", DB::UInt128(9))});
-    /// No mount lease/watermark exists: after legal catalog-row deletion there may be no server-root
-    /// state left to supply one. The post-observation absent row is the complete dead-life proof.
 
     const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget=*/100, /*delete_budget=*/10);
 
+    EXPECT_EQ(result.floor_lookups, 1u);
+    EXPECT_TRUE(result.nominations.empty());
+    EXPECT_EQ(result.deleted, 0u);
+    EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})));
+}
+
+TEST(CASOrphanManifestSweep, CursorPageRetainsStagedManifestUntilFirstPublication)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{store->poolConfig().server_root_id + "/staged-before-admission@cas@"};
+    auto build = store->beginPartWrite(PartWriteInfo{
+        .intended_ref = ns.string() + "/part", .intended_namespace = ns, .op = ProvenanceOp::Insert});
+    ManifestEntry entry;
+    entry.path = "f";
+    entry.placement = EntryPlacement::Inline;
+    entry.ref = BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of("v"))};
+    entry.blob_size = 1;
+    entry.inline_bytes = "v";
+    const ManifestId id = build->stageManifest({entry});
+    CasOperation op = store->openRequests().admit();
+    ASSERT_FALSE(CasRefCatalog::lifeIfCataloged(op, store->layout(), ns));
+
+    const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", 100, 10);
+
+    ASSERT_TRUE(result.nominations.empty());
+    EXPECT_EQ(result.deleted, 0u);
+    ASSERT_TRUE(headExists(*backend, store->layout().manifestKey(id)));
+    build->precommitAdd(ns, "part", id);
+    build->promote(ns, "part", build->buildId(), id);
+    const PartManifest manifest = store->readManifest(id);
+    ASSERT_EQ(manifest.entries.size(), 1u);
+    EXPECT_EQ(manifest.entries.front().inline_bytes, "v");
+}
+
+TEST(CASOrphanManifestSweep, CursorPageRetainsRowlessBodyOfActiveBuild)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/active-before-admission@cas@"};
+    const ManifestId id = writeManifestRaw(*backend, store->layout(), ns, ref(5, 1), {blobEntryFor("f", DB::UInt128(1))});
+    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 5);
+
+    const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", 100, 10);
+
+    EXPECT_TRUE(result.nominations.empty());
+    EXPECT_EQ(result.deleted, 0u);
+    EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(id)));
+}
+
+TEST(CASOrphanManifestSweep, CursorPageDeletesRowlessBodyBelowFloor)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/retired-before-admission@cas@"};
+    const ManifestId id = writeManifestRaw(*backend, store->layout(), ns, ref(5, 1), {blobEntryFor("f", DB::UInt128(1))});
+    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);
+
+    const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", 100, 10);
+
     EXPECT_EQ(result.deleted, 1u);
-    EXPECT_FALSE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})));
+    EXPECT_FALSE(headExists(*backend, store->layout().manifestKey(id)));
+}
+
+TEST(CASOrphanManifestSweep, CursorPageRetainsRowlessBodyWhenNamespaceAppearsAfterCatalogCut)
+{
+    auto backend = std::make_shared<SweepReadHookBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/admitted-after-cut@cas@"};
+    const ManifestRef candidate = ref(5, 1);
+    const ManifestId id = writeManifestRaw(*backend, layout, ns, candidate, {blobEntryFor("f", DB::UInt128(1))});
+    setWatermarkMinActive(*backend, layout, kServerRoot, kWriterEpoch, 5);
+    backend->arm(layout.mountKey(kServerRoot), 1, [&]
+    {
+        publishCommittedTransition(*backend, layout, ns, "part", std::nullopt, candidate);
+        setWatermarkMinActive(*backend, layout, kServerRoot, kWriterEpoch, 6);
+    });
+
+    const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", 100, 10);
+
+    EXPECT_TRUE(backend->didFire());
+    EXPECT_TRUE(result.nominations.empty());
+    EXPECT_TRUE(headExists(*backend, layout.manifestKey(id)));
+}
+
+TEST(CASOrphanManifestSweep, CursorPageRetainsBodyWhenNamespaceIsRebornAfterCatalogCut)
+{
+    auto backend = std::make_shared<SweepReadHookBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/reborn-after-cut@cas@"};
+    const ManifestRef candidate = ref(5, 1);
+    const ManifestId id = writeManifestRaw(*backend, layout, ns, candidate, {blobEntryFor("f", DB::UInt128(1))});
+    registerNamespaceRaw(*backend, layout, ns);
+    seedConsumedSealCursor(*backend, layout, ns);
+    seedEmptyRecoveryAuthority(*backend, layout, ns);
+    setWatermarkMinActive(*backend, layout, kServerRoot, kWriterEpoch, 6);
+    backend->arm(layout.mountKey(kServerRoot), 1, [&]
+    {
+        OperationForTest op(*backend);
+        const auto before = CasRefCatalog::read(*op, layout);
+        RefCatalog next = before.catalog;
+        ASSERT_EQ(next.entries.size(), 1u);
+        next.entries.front().incarnation = fixture::fixtureLife(RootNamespace{"00/successor@cas@"}).incarnation;
+        ASSERT_TRUE(before.etag);
+        ASSERT_TRUE(std::holds_alternative<Committed>(
+            (*op).replace(layout.refCatalogKey(), encodeRefCatalog(next), *before.etag, Retry::standard())));
+        publishCommittedTransition(*backend, layout, ns, "part", std::nullopt, candidate);
+    });
+
+    const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", 100, 10);
+
+    EXPECT_TRUE(backend->didFire());
+    EXPECT_TRUE(result.nominations.empty());
+    EXPECT_EQ(result.deleted, 0u);
+    EXPECT_TRUE(headExists(*backend, layout.manifestKey(id)));
+}
+
+TEST(CASOrphanManifestSweep, CursorPageRetainsBodyWhenCatalogEntryDisappearsOrChangesState)
+{
+    for (bool remove_entry : {false, true})
+    {
+        SCOPED_TRACE(remove_entry);
+        auto backend = std::make_shared<SweepReadHookBackend>();
+        auto store = openPoolForTest(backend);
+        const Layout & layout = store->layout();
+        const RootNamespace ns{"00/lifecycle-after-cut@cas@"};
+        const ManifestId id = writeManifestRaw(*backend, layout, ns, ref(5, 1), {blobEntryFor("f", DB::UInt128(1))});
+        registerNamespaceRaw(*backend, layout, ns);
+        seedConsumedSealCursor(*backend, layout, ns);
+        seedEmptyRecoveryAuthority(*backend, layout, ns);
+        setWatermarkMinActive(*backend, layout, kServerRoot, kWriterEpoch, 6);
+        backend->arm(layout.refCatalogKey(), 2, [&]
+        {
+            OperationForTest op(*backend);
+            const auto before = CasRefCatalog::read(*op, layout);
+            RefCatalog next = before.catalog;
+            ASSERT_EQ(next.entries.size(), 1u);
+            if (remove_entry)
+                next.entries.clear();
+            else
+            {
+                next.entries.front().state = NsState::Removing;
+                next.entries.front().removal_started_round = 1;
+            }
+            ASSERT_TRUE(before.etag);
+            ASSERT_TRUE(std::holds_alternative<Committed>(
+                (*op).replace(layout.refCatalogKey(), encodeRefCatalog(next), *before.etag, Retry::standard())));
+        });
+
+        const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", 100, 10);
+
+        EXPECT_TRUE(backend->didFire());
+        EXPECT_TRUE(result.nominations.empty());
+        EXPECT_TRUE(headExists(*backend, layout.manifestKey(id)));
+    }
+}
+
+TEST(CASOrphanManifestSweep, CursorPageRejectsAmbiguousPostFloorCatalog)
+{
+    auto backend = std::make_shared<SweepReadHookBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/ambiguous-after-cut@cas@"};
+    const ManifestId id = writeManifestRaw(*backend, layout, ns, ref(5, 1), {blobEntryFor("f", DB::UInt128(1))});
+    registerNamespaceRaw(*backend, layout, ns);
+    seedConsumedSealCursor(*backend, layout, ns);
+    seedEmptyRecoveryAuthority(*backend, layout, ns);
+    setWatermarkMinActive(*backend, layout, kServerRoot, kWriterEpoch, 6);
+    backend->arm(layout.refCatalogKey(), 2, [&]
+    {
+        OperationForTest op(*backend);
+        const auto before = CasRefCatalog::read(*op, layout);
+        RefCatalog next = before.catalog;
+        ASSERT_EQ(next.entries.size(), 1u);
+        CatalogEntry duplicate = next.entries.front();
+        duplicate.ns = RootNamespace{"00/ambiguous-after-cut-twin@cas@"};
+        next.entries.push_back(duplicate);
+        std::sort(next.entries.begin(), next.entries.end(),
+            [](const CatalogEntry & lhs, const CatalogEntry & rhs) { return lhs.ns.string() < rhs.ns.string(); });
+        ASSERT_TRUE(before.etag);
+        ASSERT_TRUE(std::holds_alternative<Committed>(
+            (*op).replace(layout.refCatalogKey(), encodeRefCatalog(next), *before.etag, Retry::standard())));
+    });
+    backend->resetCounts();
+
+    EXPECT_THROW(sweepManifestCursorPageForTest(*store, "", 100, 10), DB::Exception);
+
+    EXPECT_TRUE(backend->didFire());
+    EXPECT_EQ(backend->getCount(layout.manifestKey(id)), 0u);
+    EXPECT_EQ(backend->deleteCount(layout.manifestKey(id)), 0u);
+}
+
+TEST(CASOrphanManifestSweep, CursorPagePropagatesPostFloorCatalogReadFailure)
+{
+    auto backend = std::make_shared<SweepReadHookBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/catalog-read-failure@cas@"};
+    const ManifestId id = writeManifestRaw(*backend, layout, ns, ref(5, 1), {blobEntryFor("f", DB::UInt128(1))});
+    setWatermarkMinActive(*backend, layout, kServerRoot, kWriterEpoch, 6);
+    backend->arm(layout.refCatalogKey(), 2, [] { throw std::runtime_error("injected catalog read failure"); });
+    backend->resetCounts();
+
+    EXPECT_ANY_THROW(sweepManifestCursorPageForTest(*store, "", 100, 10));
+
+    EXPECT_TRUE(backend->didFire());
+    EXPECT_EQ(backend->getCount(layout.manifestKey(id)), 0u);
+    EXPECT_EQ(backend->deleteCount(layout.manifestKey(id)), 0u);
 }
 
 /// Manifest keys are write-once, so a same-key rewrite after the observation below never happens in

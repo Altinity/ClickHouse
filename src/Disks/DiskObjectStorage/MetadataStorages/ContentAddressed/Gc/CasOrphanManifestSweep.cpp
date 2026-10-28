@@ -78,6 +78,22 @@ struct ListedManifestObject
     String key;
 };
 
+bool isBuildBelowFloor(
+    CasOperation & op,
+    const Layout & layout,
+    const ListedManifestObject & manifest,
+    std::map<String, std::optional<MountLease>> & floor_by_ns,
+    ManifestSweepResult & result)
+{
+    auto [floor_it, floor_inserted] = floor_by_ns.emplace(manifest.ns.string(), std::nullopt);
+    if (floor_inserted)
+    {
+        ++result.floor_lookups;
+        floor_it->second = floorForNamespace(op, layout, manifest.ns, &result.floor_reads);
+    }
+    return prefixEligibleUnder(floor_it->second, manifest.prefix);
+}
+
 /// Delegates to the shared `Layout::parseManifestKey`, which validates the canonical manifest-key
 /// encoding. Keeping parsing in `Layout` avoids a second interpretation of the manifest path and ensures
 /// the sweep and filesystem checker derive the same namespace and build identity.
@@ -140,6 +156,29 @@ const CatalogEntry * catalogEntryOf(const CasRefCatalog::Snapshot & catalog_cut,
         catalog_cut.catalog.entries.begin(), catalog_cut.catalog.entries.end(),
         [&](const CatalogEntry & entry) { return entry.ns == ns; });
     return it == catalog_cut.catalog.entries.end() ? nullptr : &*it;
+}
+
+void excludeCandidatesWithChangedCatalogEntries(
+    CasOperation & op,
+    const Layout & layout,
+    const CasRefCatalog::Snapshot & catalog_cut,
+    std::vector<ListedManifestObject> & candidates,
+    ManifestSweepResult & result)
+{
+    if (candidates.empty())
+        return;
+
+    const CasRefCatalog::Snapshot rechecked_catalog = CasRefCatalog::read(op, layout);
+    rechecked_catalog.life_index.throwIfAmbiguous("CAS orphan manifest sweep post-floor catalog");
+    std::erase_if(candidates, [&](const ListedManifestObject & candidate)
+    {
+        const CatalogEntry * before = catalogEntryOf(catalog_cut, candidate.ns);
+        const CatalogEntry * after = catalogEntryOf(rechecked_catalog, candidate.ns);
+        if ((!before && !after) || (before && after && *before == *after))
+            return false;
+        ++result.skipped;
+        return true;
+    });
 }
 
 /// The durable `last_folded_ref_id` of a coverage row, `{0, 0}` when there is none — as for a fresh
@@ -758,23 +797,14 @@ ManifestSweepResult planManifestCursorPage(
             continue;
         }
 
-        const CatalogEntry * catalog_entry = catalogEntryOf(catalog_cut, parsed->ns);
-        if (catalog_entry)
+        if (!isBuildBelowFloor(op, layout, *parsed, floor_by_ns, result))
         {
-            auto [floor_it, floor_inserted] = floor_by_ns.emplace(parsed->ns.string(), std::nullopt);
-            if (floor_inserted)
-            {
-                ++result.floor_lookups;
-                floor_it->second = floorForNamespace(op, layout, parsed->ns, &result.floor_reads);
-            }
-            if (!prefixEligibleUnder(floor_it->second, parsed->prefix))
-            {
-                ++result.skipped;
-                decided_through = listed.key;
-                continue;
-            }
+            ++result.skipped;
+            decided_through = listed.key;
+            continue;
         }
 
+        const CatalogEntry * catalog_entry = catalogEntryOf(catalog_cut, parsed->ns);
         auto [view_it, view_inserted] = view_by_ns.emplace(parsed->ns.string(), NamespaceFoldView{});
         auto [active_it, inserted] = active_by_ns.emplace(parsed->ns.string(), std::set<String>{});
         if (inserted)
@@ -882,10 +912,6 @@ ManifestSweepResult planManifestCursorPage(
             continue;
         }
 
-        /// If the post-observation catalog cut has no row, this candidate was necessarily created by a
-        /// now-dead life: creation publishes its row before any life-owned object. No current life can
-        /// name it, and a concurrent later creation can only replace its token after this observation.
-        /// A catalog-named row instead needs the ordinary coverage/owner proof below.
         if (catalog_entry)
         {
             /// THE §6 SAFETY FLOOR, the same predicate `sweepNamespace` calls, under the same watermark
@@ -918,6 +944,8 @@ ManifestSweepResult planManifestCursorPage(
         candidates.push_back(*parsed);
         decided_through = listed.key;
     }
+
+    excludeCandidatesWithChangedCatalogEntries(op, layout, catalog_cut, candidates, result);
 
     size_t next_body_hint = 0;
     for (const ListedManifestObject & candidate : candidates)
