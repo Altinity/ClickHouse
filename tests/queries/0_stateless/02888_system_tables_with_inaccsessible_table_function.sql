@@ -14,7 +14,7 @@ CREATE TABLE {CLICKHOUSE_DATABASE:Identifier}.tablefunc06 (a int) AS s3('http://
 
 
 CREATE TABLE {CLICKHOUSE_DATABASE:Identifier}.tablefunc01_without_schema AS postgresql('127.121.0.1:5432', 'postgres_db', 'postgres_table', 'postgres_user', '124444'); -- { serverError 614 }
-CREATE TABLE {CLICKHOUSE_DATABASE:Identifier}.tablefunc02_without_schema AS mysql('127.123.0.1:3306', 'mysql_db', 'mysql_table', 'mysql_user','123123'); -- {serverError 279 }
+CREATE TABLE {CLICKHOUSE_DATABASE:Identifier}.tablefunc02_without_schema AS mysql('127.123.0.1:3306', 'mysql_db', 'mysql_table', 'mysql_user','123123'); -- {serverError POCO_EXCEPTION }
 
 SELECT name, engine, engine_full, create_table_query, data_paths, notEmpty([metadata_path]), notEmpty([uuid])
     FROM system.tables

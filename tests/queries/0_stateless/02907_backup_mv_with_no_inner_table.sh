@@ -19,12 +19,12 @@ ${CLICKHOUSE_CLIENT} -nm --query "drop table \`$inner_table\` sync"
 
 ${CLICKHOUSE_CLIENT} -nm --query "
 set send_logs_level = 'error';
-backup table ${CLICKHOUSE_DATABASE}.\`mv\` to Disk('backups', '${CLICKHOUSE_TEST_UNIQUE_NAME}');
+backup table ${CLICKHOUSE_DATABASE}.\`mv\` to Disk('default', 'backups/${CLICKHOUSE_TEST_UNIQUE_NAME}');
 " | grep -o "BACKUP_CREATED"
 
 ${CLICKHOUSE_CLIENT} -nm --query "
 drop table mv;
-restore table ${CLICKHOUSE_DATABASE}.\`mv\` from Disk('backups', '${CLICKHOUSE_TEST_UNIQUE_NAME}');
+restore table ${CLICKHOUSE_DATABASE}.\`mv\` from Disk('default', 'backups/${CLICKHOUSE_TEST_UNIQUE_NAME}');
 " | grep -o "RESTORED"
 
 ${CLICKHOUSE_CLIENT} --query "select count() from mv;"
