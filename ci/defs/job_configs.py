@@ -93,6 +93,7 @@ common_ft_job_config = Job.Config(
         include_paths=[
             "./ci/jobs/functional_tests.py",
             "./ci/jobs/scripts/clickhouse_proc.py",
+            "./ci/jobs/scripts/pick_endpoint.py",
             "./ci/jobs/scripts/functional_tests_results.py",
             "./ci/jobs/scripts/functional_tests/setup_log_cluster.sh",
             "./ci/praktika/cidb.py",
@@ -127,6 +128,7 @@ common_stress_job_config = Job.Config(
             "./tests/queries/0_stateless/",
             "./ci/jobs/stress_job.py",
             "./ci/jobs/scripts/clickhouse_proc.py",
+            "./ci/jobs/scripts/pick_endpoint.py",
             "./ci/jobs/scripts/stress/stress.py",
             "./tests/clickhouse-test",
             "./tests/config",

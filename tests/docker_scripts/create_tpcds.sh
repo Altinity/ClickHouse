@@ -5,7 +5,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 INIT_SQL="$REPO_ROOT/tests/benchmarks/tpc-ds/init.sql"
-S3_BASE="https://tpc-ds-sf1.s3.amazonaws.com"
+S3_BASE="${S3_BASE:-https://tpc-ds-sf1.s3.amazonaws.com}"
 
 awk -v s3="$S3_BASE" '
 /^---/ { next }

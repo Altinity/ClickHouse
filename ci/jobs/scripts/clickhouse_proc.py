@@ -722,7 +722,9 @@ MAX_EXECUTION_TIME=1800
 
 clickhouse-client --query "SHOW DATABASES"
 clickhouse-client --query "CREATE DATABASE datasets"
-clickhouse-client < ./tests/docker_scripts/create.sql
+python3 ./ci/jobs/scripts/pick_endpoint.py create-sql ./tests/docker_scripts/create.sql | clickhouse-client
+S3_BASE=$(python3 ./ci/jobs/scripts/pick_endpoint.py tpcds)
+export S3_BASE
 bash ./tests/docker_scripts/create_tpcds.sh
 clickhouse-client --query "SHOW TABLES FROM datasets"
 
