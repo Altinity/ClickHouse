@@ -442,7 +442,7 @@ BlockIO InterpreterCheckQuery::execute()
         LOG_DEBUG(log, "Checking database name = {} ", database_name);
         context->checkAccess(AccessType::CHECK, database_name);
         auto database = DatabaseCatalog::instance().getDatabase(database_name);
-        database->checkDatabase();
+        database->checkDatabase(context);
         BlockIO res;
         return res;
     }

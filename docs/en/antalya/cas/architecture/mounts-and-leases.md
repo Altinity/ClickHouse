@@ -20,8 +20,8 @@ otherwise regenerate the same `ServerUUID` from a wiped local state directory, w
 silently steal an existing identity.
 
 Validation (`validateServerRootId`, `Pool/CasServerRoot.h`) is fail-closed `BAD_ARGUMENTS`, no
-sanitizing fallback: non-empty, at most 255 bytes, no empty/`.`/`..` path segment, no `_files` or
-`_manifests` segment.
+sanitizing fallback: non-empty, at most 255 bytes, no `/`, not `.` or `..`, not `_files` or
+`_manifests`.
 
 It roots four subtrees and owns catalog names at or below `<server_root_id>`:
 
@@ -38,6 +38,11 @@ dedup work. Ref/namespace keys are also deliberately opaque and do not embed the
 Each replica sharing a backend endpoint must use a distinct `cas_server_root_id`; omitting the setting
 is a startup error.
 
+The id may not contain `/`, and this holds for an id that already owns its owner object too: decommission
+and the staging sweep select a member's objects by key prefix, so a member `a/b` would be drained by a
+decommission of `a`. A server whose id contains `/` refuses to open the disk; see
+[recreating a member whose id contains `/`](/antalya/cas/operations/migration#recreate-id-with-slash).
+
 ## The owner claim {#owner-claim}
 
 `claimOwnerOrThrow` binds `server_root_id` ↔ `server_uuid` **permanently**. The owner object is never deleted
@@ -46,10 +51,10 @@ and never reassigned — decommission only tombstones it in place.
 | Observed at `gc/server-roots/<server_root_id>/owner` | Action |
 |---|---|
 | present, same `server_uuid`, not tombstoned | proceed |
-| present, `retired_at_ms` set | `CORRUPTED_DATA` — explicitly decommissioned, refuses to resume |
-| present, different `server_uuid` | `CORRUPTED_DATA` — names the regenerated-uuid-file cause |
-| absent, subtree provably empty | `putIfAbsent` the owner (claim) |
+| present, `retired_at_ms` set | `CORRUPTED_DATA` — explicitly decommissioned; the refusal says to configure a new `cas_server_root_id` |
+| present, different `server_uuid` | `CORRUPTED_DATA` — names the regenerated-uuid-file cause and, for a dead owner, `SYSTEM CAS DROP POOL MEMBER` |
 | absent, subtree non-empty | `CORRUPTED_DATA` — identity lost over existing data |
+| absent, subtree provably empty | `putIfAbsent` the owner (claim) |
 | lost the `putIfAbsent` race | re-read; equal uuid proceeds, else `CORRUPTED_DATA` |
 
 "Provably empty" requires both an authoritative decoded catalog naming no life owned by `server_root_id` and
@@ -81,14 +86,17 @@ watermark — there is no separate watermark object. `MountLease` fields: `serve
   after a flat pause and settled by the reissue's own answer (a 2xx) or by the exact `GET` that
   follows its `412`. The renewer adopts the result only when the complete body, including `write_attempt_id`,
   equals its immutable request. If the predecessor token is still current, another identical `PUT`
-  may follow bounded backoff. A same-pair twin, GC-fenced body, successor, foreign holder, or absent
+  follows after a pause. A same-pair twin, GC-fenced body, successor, foreign holder, or absent
   body is never treated as this renewal.
-- **Absolute deadline.** Renewal uses `CLOCK_BOOTTIME`, not `CLOCK_MONOTONIC`, so a VM resumed from
-  suspend correctly observes itself expired. Its absolute deadline is the minimum of the existing
-  request-operation budget and the last confirmed lease deadline minus the safety margin. The
-  controller checks that one attempt envelope still fits before each backend `PUT` or resolving
-  `GET`, after each interruptible backoff, and before accepting success. A retry, `GET`, response
-  timestamp, or wall-clock step never extends authority.
+- **Deadline from the start.** Renewal uses `CLOCK_BOOTTIME`, not `CLOCK_MONOTONIC`, so a VM resumed
+  from suspend correctly observes itself expired. A confirmed renewal sets the deadline to its own
+  start plus the lease; a retry, `GET`, response timestamp, or wall-clock step never moves it. The
+  background renewal has no deadline of its own: it retries one body every 0.8–1.2 s (measured from
+  the start of the previous attempt) until the store answers about the slot, or until a stop, a
+  remount park request, a lost fence or a pool leaving `Live` ends it. A
+  refusal (`AccessDenied`, `MalformedXML`, …) sends the same body again one renewal period later.
+  The bounded renewals — the startup re-anchor, the remount re-anchor, and the background renewal of a
+  pool opened for decommission — stay bounded by the last confirmed lease minus the safety margin.
 - **Cadence.** The runtime normally starts a logical renewal every `cas_mount_renew_period_ms` (default
   10 s), with TTL `cas_mount_lease_ttl_ms` (default 30 s, TTL/3 renewal ratio). The next beat is anchored
   at the committed body's pre-I/O BOOTTIME start. A slow recovery therefore causes an immediate
@@ -103,38 +111,52 @@ watermark — there is no separate watermark object. `MountLease` fields: `serve
 
 **Losing the lease is neither read-only mode nor a process abort.** `MountLeaseRenewer` is a
 synchronous durable-slot state machine. A committed result advances its token, sequence, confirmed
-BOOTTIME deadline, and cadence anchor. Any admitted deterministic failure, confirmed conflict, or
-ambiguity left at the deadline/attempt limit moves it to `RenewalTerminal`; it cannot mint another
-body or publish a clean farewell. Owner cancellation before any request is the only
-`NotAttempted` result and leaves clean release possible. Cancellation after a request was sent is
-terminal because that request may still land.
+BOOTTIME deadline, and cadence anchor. A deterministic failure, a confirmed conflict, or, for a
+bounded renewal, ambiguity left at its deadline moves it to `RenewalTerminal`; it cannot mint another
+body or publish a clean farewell. Owner cancellation before any request, or between two calls of the
+background renewal after a refusal or after a read that found the slot unchanged, is `NotAttempted` and
+leaves clean release possible. Cancellation after a request of the current call was sent, or while the
+reads after a refused precondition repeat, is terminal: that request may still land, or the slot may
+have moved.
+
+**An expired lease is a pause.** While the store does not answer, writes stop being admitted once the
+remaining lease cannot cover one write: `2 × envelope + safety_margin` before the deadline. From that
+moment `system.cas_mounts` shows `lifecycle = 'not_live'` and `lifecycle_reason = 'lease_expired'`,
+and the server logs one `WARNING`, at the next renewal attempt, that ends with the last renewal error:
+`CAS mount lease of '<server_root_id>' under writer_epoch <E> has too little time left for a write`.
+Nothing is remounted. A confirmed renewal resumes writes under the same `writer_epoch` only if its start
+plus the lease leaves more than `2 × envelope + safety_margin`; a renewal confirmed later than that
+leaves writes paused, and the next one starts at once. A clean shutdown during a pause skips the
+farewell, which has no lease room left, and leaves the slot for GC to observe. Such a late renewal stores an `expires_at_ms` already in the past, and GC still does
+not fence the slot for it: GC fences only a token it watched unchanged for its whole threshold.
 
 After the renewer call returns, `CasMountRuntime` consumes the result. A terminal result trips the
 local fence (latches `lost`, bumps the fence generation, moves the in-process runtime to
 `TransientNotLive`) and latches one self-remount generation. A confirmed foreign/successor or
 same-pair conflict remains a typed fail-closed error; it is never adopted. A real fence still costs
 only an epoch: recovery reclaims with a fresh one, bounded at three whole-chain attempts. This is the
-general CAS posture: doubt about the source fails closed, while transport ambiguity may retry only
-inside authority already proved by the last confirmed lease.
+general CAS posture: doubt about the source fails closed, while transport ambiguity is retried until a
+definitive answer and writes are admitted only inside the last confirmed lease.
 
 GC's own view of a dead server is symmetric and clock-skew-immune: a slot becomes fence-eligible
 only after the leader observes the *same* renewal token hold stable, on its own monotonic clock,
-for `TTL + floor(TTL/20) + period` — close to, but not identical to, the threshold a re-mounting
-server uses to wait out a predecessor, which observes `TTL + floor(TTL/20) + max(1,
-floor(period/2))`. Both thresholds are evaluated purely on the observer's own clock and its own
-configured `TTL`/`period`; nothing about the writer's timing travels on the wire. The stamped
-`expires_at_ms` never participates in either decision — it is a writer-stamped diagnostic used by
-`system.cas_mounts` and by the non-authoritative decommission epoch-recovery precheck, never an
-authorization; local fencing is derived instead from the confirmed request's pre-I/O `BOOTTIME`
+for `L + floor(L/20) + period`. `L` is the longer of the leader's own `cas_mount_lease_ttl_ms` and the
+lease the slot's body declares (`expires_at_ms − started_at_ms`). A body without stamps, or with a
+non-positive interval (a farewell), declares nothing. A re-mounting server waits out a predecessor the
+same way with the step `max(1, floor(period/2))`. `period` is always the observer's own. The two stamps
+are compared only with each other, never with the observer's clock. `expires_at_ms` alone is a
+writer-stamped diagnostic used by `system.cas_mounts` and the non-authoritative decommission
+epoch-recovery precheck. Local fencing is derived from the confirmed request's pre-I/O `BOOTTIME`
 anchor plus the TTL, and wall-clock `now` stays audit-only.
 
-Every server sharing a pool must therefore run the identical `cas_mount_lease_ttl_ms` and
-`cas_mount_renew_period_ms`: a member or GC leader configured with a shorter threshold than its
-peers can fence out a healthy peer whose token-update gap merely exceeds that shorter threshold —
-a peer renewing frequently stays live, one that missed a renewal does not. Change these values only
-with every member of the pool stopped; a graceful restart removes only that member's own startup
-observation and does not make mixed thresholds safe. With the defaults (TTL 30 s, period 10 s,
-margin 2 s), `TTL − margin − period − 2 × envelope = 4 s` is the scheduling-lateness budget before
+`cas_mount_lease_ttl_ms` is local to each server. It is how long this server may write after its last
+confirmed renewal, and every other server waits at least this long before fencing or reclaiming its
+slot. A configured value above 10 minutes (600000 ms) is clamped to 10 minutes with a warning at startup, so no holder declares a longer lease. Mixed values are safe, and so is changing the value one server at a time in any order. A longer
+lease on one server delays recovery after that server's crash, and the GC leader logs one `WARNING` per
+slot whose declared lease differs from its own. A server built without this rule waits only its own
+lease: keep the values equal until every server of the pool runs a build with the rule.
+
+With the defaults (TTL 30 s, period 10 s, margin 2 s), `TTL − margin − period − 2 × envelope = 4 s` is the scheduling-lateness budget before
 the first renewal attempt of a period can begin, where `envelope = attempt_timeout + 2 × cap` and
 `cap` is `attempt_timeout` when the disk's `connect_timeout_ms` is `0`, else
 `min(connect_timeout_ms, attempt_timeout)` (7 s with defaults).
@@ -165,17 +187,21 @@ a `MountClaimResult::Kind` together with a `MountPriorState` describing which ce
 
 | `Kind` | Meaning |
 |---|---|
-| `Claimed` | fresh claim (absent slot), same-`(uuid, epoch)` refresh, or a certified reclaim |
-| `LiveDoubleStart` | same `server_uuid`, different `writer_epoch`, and no certificate of death yet — a live twin, wait it out |
+| `Claimed` | fresh claim (absent slot), or a certified reclaim of an older `writer_epoch` |
+| `LiveDoubleStart` | same `server_uuid` with an older `writer_epoch` and no certificate of death yet — a live twin, wait it out; or the same `(uuid, epoch)` already in the slot — two starts got one epoch, refused at once |
 | `ForeignOwner` | different `server_uuid` — refused unconditionally |
 | `FencedSelf` | same `(uuid, epoch)`, but `gc_fenced` — terminal for *this* epoch; the caller must mint a fresh one |
 
+A claim never installs a `writer_epoch` at or below the one in the slot. When the slot holds a newer
+`writer_epoch` of the same `server_uuid`, the claim fails with `ABORTED` and writes nothing: another
+start or a decommission of this `server_root_id` allocated after this one.
+
 | `MountPriorState` | Certificate that justified the reclaim |
 |---|---|
-| `None` | no reclaim needed (fresh claim or same-epoch refresh) |
+| `None` | no reclaim needed (fresh claim) |
 | `Clean` | the predecessor's own graceful farewell (`min_active_build_sequence == UINT64_MAX`) |
 | `Fenced` | GC's own threshold-gated fence-out (`gc_fenced`) |
-| `UncleanObserved` | this claimant's own token-stability observation held for the full `TTL + drift` window |
+| `UncleanObserved` | this claimant's own token-stability observation held for the full observation threshold (the longer of the two leases, plus drift and step) |
 | `UncleanUnsafe` | the operator's explicit `cas_unsafe_remount_no_delay` authorization carried the slot's exact token — not a certificate of death |
 
 ## Behavioral mount-slot model {#mount-state-machines}
@@ -190,8 +216,8 @@ stateDiagram-v2
     Live --> Live: renewer beat, putOverwrite seq+1
     Live --> Fenced: GC observes a stable token past threshold, gc_fenced=1, body preserved
     Live --> Terminated: certified drain, terminal farewell (expires_at=now, min_active_build_sequence=MAX)
-    Fenced --> Live: same-uuid claim with a fresh writer_epoch, instant reclaim
-    Terminated --> Live: same-uuid claim with a fresh writer_epoch, instant reclaim
+    Fenced --> Live: same-uuid claim with a higher writer_epoch, instant reclaim
+    Terminated --> Live: same-uuid claim with a higher writer_epoch, instant reclaim
     Live --> Live: same-uuid claim, proven-dead token via UncleanObserved
     Live --> Live: same-uuid claim under cas_unsafe_remount_no_delay, no observation
     Fenced --> Fenced: same uuid and epoch claim, FencedSelf, no write
@@ -238,6 +264,11 @@ including while an older generation is active. Before renewer replacement, remou
 is in flight. A successful remount handles only its snapshotted generation; a newer request is
 processed before renewal resumes.
 
+The renewal worker does not fail on the server memory limit. Its allocations still count toward
+`max_server_memory_usage`, but a server above that limit keeps renewing its mount lease. A
+`std::bad_alloc` still ends the renewal. Conditional writes upload on the thread that issues them. Their
+write buffer opens at the object's size, capped at 1 MiB, and grows for a larger object.
+
 **Clean unmount:** request stop and join both persistent workers, drain the ref lanes, and only if
 the drain *certified* quiescence call `MountLeaseRenewer::release` on an `Active` renewer to write the
 terminal farewell (`expires_at_ms` already expired, `min_active_build_sequence = UINT64_MAX`). That sentinel is what
@@ -251,7 +282,8 @@ which any reclaim is instant.
 
 **Permanent removal** of a dead replica (`Cas::decommissionPoolMember`, driven by
 `SYSTEM CAS DROP POOL MEMBER '<server_root_id>' FROM DISK '<disk>'`) claims the victim's mount slot
-as an administrative writer with a no-wait policy (refuses immediately if the member is alive),
+as an administrative writer with a no-wait policy (refuses unless the slot is terminal:
+`terminated` or `fenced`; an `expired` slot is refused until the disk's GC leader fences it),
 drops every ref-bearing namespace, sweeps manifest debris before the slot (deleting the mount
 removes the watermark authority), drains staging and roots, then — only with zero warnings —
 retires in order: mount, epoch, a final liveness re-check, owner tombstone.
@@ -269,6 +301,7 @@ becomes `state = 'corrupt'`, never an exception). Shows every `server_root_id` i
 | `state` | one of `live`, `expired`, `terminated`, `fenced`, `corrupt` |
 | `is_leader`, `pending_reclaim`, `last_success_age_seconds`, `wedged_namespace_count` | GC health, process-local; **`NULL` on every peer row** — a process-local fact must never be stamped onto another server's row |
 | `lifecycle`, `lifecycle_reason`, `lifecycle_detail`, `lifecycle_since` | the SQL surface for the in-process `PoolLifecycle` runtime above: `lifecycle` is one of `live`, `not_live`, `identity_lost`, `vanished`, `constructing`, `shutdown`; `lifecycle_reason` distinguishes `replaced` from `forgotten` for a `vanished` disk; `lifecycle_detail` carries the full diagnosis text; `lifecycle_since` is when the current non-live state began (`NULL` while live) |
+| `renewal_in_progress`, `renewal_attempts`, `last_renewal_error` | the running (or last) lease renewal: conditional `PUT`s sent so far and the last failed request, updated per attempt; **`NULL` on every peer row** |
 
 The lifecycle snapshot is I/O-free and ungated, so a not-live, never-started, or vanished disk
 still produces a row instead of silently disappearing from the table.

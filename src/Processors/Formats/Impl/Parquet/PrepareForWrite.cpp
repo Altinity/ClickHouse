@@ -419,9 +419,11 @@ void preparePrimitiveColumn(ColumnPtr column, DataTypePtr type, const std::strin
             }
 
             parq::TimestampType tt;
-            /// (Shouldn't we check the DateTime64's timezone parameter here? No, the actual number
-            /// in DateTime64 column is always in UTC, regardless of the timezone parameter.)
-            tt.__set_isAdjustedToUTC(true);
+            /// ClickHouse ticks are always UTC. By default keep isAdjustedToUTC=true. Iceberg
+            /// sets output_timestamp_adjusted_to_utc_from_timezone so timestamp(_ns) is
+            /// TIMESTAMP(*, false) and timestamptz(_ns) is TIMESTAMP(*, true).
+            tt.__set_isAdjustedToUTC(
+                options.output_timestamp_adjusted_to_utc_from_timezone ? dt.hasExplicitTimeZone() : true);
             tt.__set_unit(unit);
             parq::LogicalType t;
             t.__set_TIMESTAMP(tt);

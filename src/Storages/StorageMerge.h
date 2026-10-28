@@ -258,10 +258,11 @@ private:
 
         /// Create explicit filter transform to exclude
         /// rows that are not conform to row level policy
-        void addFilterTransform(QueryPlan &) const;
+        void addFilterTransform(QueryPlan &, const String & table_alias) const;
 
     private:
         std::string filter_column_name; // complex filter, may contain logic operations
+        bool remove_filter_column = true;
         ActionsDAG actions_dag;
         ExpressionActionsPtr filter_actions;
         StorageMetadataPtr storage_metadata_snapshot;
@@ -306,6 +307,7 @@ private:
         const Block & header,
         SelectQueryInfo & modified_query_info,
         const StorageSnapshotPtr & snapshot,
+        const ColumnsDescription & merge_columns,
         const Aliases & aliases,
         const RowPolicyDataOpt & row_policy_data_opt,
         ContextPtr context,

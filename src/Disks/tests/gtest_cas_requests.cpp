@@ -34,6 +34,7 @@
 
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <functional>
@@ -71,6 +72,7 @@ using DB::Cas::tests::CountingBackend;
 using DB::Cas::tests::FakeClock;
 using DB::Cas::tests::expectBytes;
 using DB::Cas::tests::expectThrowsCode;
+using DB::Cas::tests::expectThrowsCodeWithMessage;
 
 namespace
 {
@@ -496,6 +498,36 @@ struct IndeterminateProbeBackend : InMemoryBackend
     }
 };
 
+/// With a zero attempt reservation only a reissue gate asks the fence for a non-zero budget, and what
+/// it asks for is the pause the loop is about to sleep. The first such gate moves the clock so the
+/// window left equals that pause, which lands the sleep exactly on the deadline whatever the jitter
+/// drew. Every later `admit` answers `after_landing`.
+struct PauseLandsOnDeadline
+{
+    FakeClock & clock;
+    uint64_t deadline_ms;
+    Fence::Admit after_landing = Fence::Admit::Ok;
+    std::optional<uint64_t> landed_pause_ms = std::nullopt;
+
+    Fence fence()
+    {
+        return Fence{
+            []() -> uint64_t { return 0; },
+            [this](uint64_t, uint64_t needed_ms)
+            {
+                if (landed_pause_ms)
+                    return after_landing;
+                if (needed_ms > 0)
+                {
+                    clock.now.store(deadline_ms - needed_ms);
+                    landed_pause_ms = needed_ms;
+                }
+                return Fence::Admit::Ok;
+            },
+            [](uint64_t) {}};
+    }
+};
+
 /// Refuses the FIRST `list` naming each distinct cursor -- one refusal per page -- and charges every
 /// list a fixed slice of the caller's clock, so what a page costs is a fact rather than a jitter draw.
 /// `always_refuse_cursor` keeps one page refused for good.
@@ -577,6 +609,51 @@ TEST(CASRetry, BindSaturatesAndLeavesAnEqualLeaseOffTheLeaseSource)
     const Retry::Bound lease = Retry::untilLeaseSafe(now + 91'999, 2'000).bind(now);
     EXPECT_EQ(lease.deadline_ms, now + 89'999);
     EXPECT_TRUE(lease.lease_bound);
+}
+
+TEST(CASRetrySpacing, UntilDefinitiveHasNoDeadlineAndSpacesItsAttempts)
+{
+    constexpr uint64_t largest = std::numeric_limits<uint64_t>::max();
+    const Retry policy = Retry::untilDefinitive();
+    EXPECT_FALSE(policy.lease_deadline_ms.has_value());
+    EXPECT_FALSE(policy.single_attempt);
+    EXPECT_EQ(policy.attempt_spacing_ms, std::optional<uint64_t>(1'000));
+    for (const uint64_t now : {uint64_t{0}, uint64_t{1'000'000}, largest - 1, largest})
+    {
+        const Retry::Bound bound = policy.bind(now);
+        EXPECT_EQ(bound.deadline_ms, largest) << "now " << now;
+        EXPECT_FALSE(bound.lease_bound) << "now " << now;
+    }
+    EXPECT_FALSE(Retry::standard().attempt_spacing_ms.has_value());
+    EXPECT_FALSE(Retry::untilLeaseSafe(2'000'000, 2'000).attempt_spacing_ms.has_value());
+}
+
+TEST(CASRetrySpacing, SpacedPauseWaitsOutTheRestOfTheDraw)
+{
+    EXPECT_EQ(Retry::spacedPause(1'000, 5'000, 5'000), 1'000u);
+    EXPECT_EQ(Retry::spacedPause(1'000, 5'000, 5'300), 700u);
+    EXPECT_EQ(Retry::spacedPause(1'000, 5'000, 6'000), 0u);
+    EXPECT_EQ(Retry::spacedPause(1'000, 5'000, 10'000), 0u);
+    EXPECT_EQ(Retry::spacedPause(1'000, 5'000, 4'000), 1'000u);
+}
+
+TEST(CASRetrySpacing, DrawIsWithinAFifthOfTheSpacing)
+{
+    bool low = false;
+    bool high = false;
+    for (int i = 0; i < 2'000; ++i)
+    {
+        const uint64_t draw = Retry::drawSpacing(1'000);
+        ASSERT_GE(draw, 800u);
+        ASSERT_LE(draw, 1'200u);
+        low = low || draw < 850;
+        high = high || draw > 1'150;
+    }
+    /// The bounds alone cannot tell a draw from a constant.
+    EXPECT_TRUE(low);
+    EXPECT_TRUE(high);
+    constexpr uint64_t largest = std::numeric_limits<uint64_t>::max();
+    EXPECT_GE(Retry::drawSpacing(largest), largest - largest / 5) << "the top of the range must not wrap";
 }
 
 TEST(CASRequests, CreateThenReplaceThenRemove)
@@ -690,6 +767,110 @@ TEST(CASRequests, AmbiguousCreateThatNeverLandedIsReissued)
     EXPECT_EQ(committed->attempts_sent, 2u);
     EXPECT_EQ(backend->getTotal(), 1u);     /// the resolve proved absence, and only then did a reissue follow
     EXPECT_EQ(clock.sleeps.size(), 1u);
+}
+
+namespace
+{
+
+/// Each guarded write takes `write_ms` on the injected clock and, while `failing` is positive, throws a
+/// transport timeout after it.
+class SlowFailingWrites final : public CountingBackend
+{
+public:
+    explicit SlowFailingWrites(FakeClock & clock_) : clock(clock_) {}
+
+    std::expected<String, Backend::RawConflict> write(const String & key, const String & bytes,
+        const std::optional<String> & expected_value, TransportAccess & access) override
+    {
+        if (expected_value)
+        {
+            clock.now += write_ms;
+            if (failing > 0)
+            {
+                --failing;
+                throw Poco::TimeoutException("injected write timeout");
+            }
+        }
+        return CountingBackend::write(key, bytes, expected_value, access);
+    }
+
+    uint64_t write_ms = 0;
+    int failing = 0;
+
+private:
+    FakeClock & clock;
+};
+
+}
+
+/// Unclear writes are reissued past the standard 90 s window, each a spacing draw after the previous
+/// attempt started, and the read that settles each one is sent at once.
+TEST(CASRequestsSpacing, UnclearWritesAreReissuedPastAnyWindowOneSpacingApart)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<SlowFailingWrites>(clock);
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    const Etag seen = *orThrow(op.create("k", "v1", Retry::standard()), "seed");
+    constexpr int failures = 120;
+    backend->write_ms = 300;
+    backend->failing = failures;
+    const uint64_t gets_before = backend->getTotal();
+    const uint64_t start = clock.now;
+
+    const WriteResult result = op.replace("k", "v2", seen, Retry::untilDefinitive());
+
+    const auto * committed = std::get_if<Committed>(&result);
+    ASSERT_NE(committed, nullptr);
+    EXPECT_EQ(committed->attempts_sent, failures + 1u);
+    EXPECT_GT(clock.now - start, 90'000u);
+    ASSERT_EQ(clock.sleeps.size(), static_cast<size_t>(failures));
+    for (const uint64_t pause : clock.sleeps)
+    {
+        EXPECT_GE(pause, 500u);
+        EXPECT_LE(pause, 900u);
+    }
+    EXPECT_EQ(backend->getTotal() - gets_before, static_cast<uint64_t>(failures)) << "one settling read per unclear attempt";
+}
+
+TEST(CASRequestsSpacing, ReadRetriesAreSpaced)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    (void)orThrow(op.create("k", "v", Retry::standard()), "seed");
+    backend->failNextReadWith("k", std::make_exception_ptr(Poco::TimeoutException("injected read failure")));
+    backend->failNextReadWith("k", std::make_exception_ptr(Poco::TimeoutException("injected read failure")));
+
+    const auto object = op.read("k", Retry::untilDefinitive());
+
+    ASSERT_TRUE(object.has_value());
+    ASSERT_EQ(clock.sleeps.size(), 2u);
+    for (const uint64_t pause : clock.sleeps)
+    {
+        EXPECT_GE(pause, 800u);
+        EXPECT_LE(pause, 1'200u);
+    }
+}
+
+/// Golden: a policy without spacing keeps the growing backoff.
+TEST(CASRequestsSpacing, AStandardPolicyKeepsItsGrowingBackoff)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<SlowFailingWrites>(clock);
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    const Etag seen = *orThrow(op.create("k", "v1", Retry::standard()), "seed");
+    backend->failing = 3;
+
+    const WriteResult result = op.replace("k", "v2", seen, Retry::standard());
+
+    ASSERT_TRUE(std::holds_alternative<Committed>(result));
+    ASSERT_EQ(clock.sleeps.size(), 3u);
+    EXPECT_LE(clock.sleeps[0], 200u);
+    EXPECT_LE(clock.sleeps[1], 400u);
+    EXPECT_LE(clock.sleeps[2], 800u);
 }
 
 /// The engine's own attempt number reaches the transport through `TransportAccess::attemptNo()`, for
@@ -902,6 +1083,59 @@ TEST(CASRequests, ProbeSentinelRetriesOnlyTheIndeterminateOutcome)
         EXPECT_EQ(backend->probes, 1u);
         EXPECT_TRUE(clock.sleeps.empty());
     }
+}
+
+TEST(CASRequests, ProbeSentinelReturnsTheLastIndeterminateWhenAPauseEndsOnTheDeadline)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<IndeterminateProbeBackend>();
+    backend->indeterminate_answers = std::numeric_limits<size_t>::max();
+    PauseLandsOnDeadline landing{.clock = clock, .deadline_ms = clock.now.load() + 10'000};
+    auto requests = makeRequests(backend, clock, landing.fence());
+    requests.setAttemptReservationForTest(0);
+    auto op = requests.admit();
+
+    const SentinelProbeResult result = op.probeSentinel("k", Retry::within(10'000));
+    EXPECT_EQ(result.outcome, ProbeOutcome::Indeterminate);
+    ASSERT_TRUE(landing.landed_pause_ms.has_value());
+    EXPECT_EQ(clock.now.load(), landing.deadline_ms);
+    ASSERT_FALSE(clock.sleeps.empty());
+    EXPECT_EQ(clock.sleeps.back(), *landing.landed_pause_ms);
+    /// The last pause ended on the boundary, so no probe followed it.
+    EXPECT_EQ(backend->probes, clock.sleeps.size());
+}
+
+TEST(CASRequests, ProbeSentinelStillThrowsARefusalAfterAPauseEndsOnTheDeadline)
+{
+    const auto expect_refusal = [](Fence::Admit refusal, const String & expected_message)
+    {
+        FakeClock clock;
+        auto backend = std::make_shared<IndeterminateProbeBackend>();
+        backend->indeterminate_answers = std::numeric_limits<size_t>::max();
+        PauseLandsOnDeadline landing{.clock = clock, .deadline_ms = clock.now.load() + 10'000, .after_landing = refusal};
+        auto requests = makeRequests(backend, clock, landing.fence());
+        requests.setAttemptReservationForTest(0);
+        auto op = requests.admit();
+
+        expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, expected_message,
+                                    [&] { (void)op.probeSentinel("k", Retry::within(10'000)); });
+        EXPECT_TRUE(landing.landed_pause_ms.has_value());
+    };
+    expect_refusal(Fence::Admit::LostOrRearmed, "mount fence tripped before the request");
+    expect_refusal(Fence::Admit::NoBudget, "no lease budget for one more request");
+}
+
+TEST(CASRequests, ProbeSentinelWithNoWindowThrowsBeforeAnyProbe)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<IndeterminateProbeBackend>();
+    auto requests = makeRequests(backend, clock);
+    requests.setAttemptReservationForTest(0);
+    auto op = requests.admit();
+
+    expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "gave up at the policy deadline after 0 attempt(s)",
+                                [&] { (void)op.probeSentinel("k", Retry::within(0)); });
+    EXPECT_EQ(backend->probes, 0u);
 }
 
 TEST(CASRequests, AdmissionIsCheckedAtThreePoints)
