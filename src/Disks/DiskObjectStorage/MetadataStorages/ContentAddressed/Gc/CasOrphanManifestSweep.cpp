@@ -758,23 +758,20 @@ ManifestSweepResult planManifestCursorPage(
             continue;
         }
 
-        const CatalogEntry * catalog_entry = catalogEntryOf(catalog_cut, parsed->ns);
-        if (catalog_entry)
+        auto [floor_it, floor_inserted] = floor_by_ns.emplace(parsed->ns.string(), std::nullopt);
+        if (floor_inserted)
         {
-            auto [floor_it, floor_inserted] = floor_by_ns.emplace(parsed->ns.string(), std::nullopt);
-            if (floor_inserted)
-            {
-                ++result.floor_lookups;
-                floor_it->second = floorForNamespace(op, layout, parsed->ns, &result.floor_reads);
-            }
-            if (!prefixEligibleUnder(floor_it->second, parsed->prefix))
-            {
-                ++result.skipped;
-                decided_through = listed.key;
-                continue;
-            }
+            ++result.floor_lookups;
+            floor_it->second = floorForNamespace(op, layout, parsed->ns, &result.floor_reads);
+        }
+        if (!prefixEligibleUnder(floor_it->second, parsed->prefix))
+        {
+            ++result.skipped;
+            decided_through = listed.key;
+            continue;
         }
 
+        const CatalogEntry * catalog_entry = catalogEntryOf(catalog_cut, parsed->ns);
         auto [view_it, view_inserted] = view_by_ns.emplace(parsed->ns.string(), NamespaceFoldView{});
         auto [active_it, inserted] = active_by_ns.emplace(parsed->ns.string(), std::set<String>{});
         if (inserted)
@@ -882,10 +879,6 @@ ManifestSweepResult planManifestCursorPage(
             continue;
         }
 
-        /// If the post-observation catalog cut has no row, this candidate was necessarily created by a
-        /// now-dead life: creation publishes its row before any life-owned object. No current life can
-        /// name it, and a concurrent later creation can only replace its token after this observation.
-        /// A catalog-named row instead needs the ordinary coverage/owner proof below.
         if (catalog_entry)
         {
             /// THE §6 SAFETY FLOOR, the same predicate `sweepNamespace` calls, under the same watermark
@@ -917,6 +910,21 @@ ManifestSweepResult planManifestCursorPage(
 
         candidates.push_back(*parsed);
         decided_through = listed.key;
+    }
+
+    if (!candidates.empty())
+    {
+        const CasRefCatalog::Snapshot post_floor_catalog = CasRefCatalog::read(op, layout);
+        post_floor_catalog.life_index.throwIfAmbiguous("CAS orphan manifest sweep post-floor catalog");
+        std::erase_if(candidates, [&](const ListedManifestObject & candidate)
+        {
+            const CatalogEntry * before = catalogEntryOf(catalog_cut, candidate.ns);
+            const CatalogEntry * after = catalogEntryOf(post_floor_catalog, candidate.ns);
+            if ((!before && !after) || (before && after && *before == *after))
+                return false;
+            ++result.skipped;
+            return true;
+        });
     }
 
     size_t next_body_hint = 0;
