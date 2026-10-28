@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/tests/cas_test_helpers.h>
+#include "cas_sweep_test_support.h"
 #include <Common/ThreadPool.h>
 #include <Common/CurrentMetrics.h>
 #include <Common/ProfileEvents.h>
@@ -86,6 +87,204 @@ struct PageFixture
     }
 };
 
+struct RowlessPageFixture
+{
+    std::shared_ptr<SweepReadHookBackend> backend = std::make_shared<SweepReadHookBackend>();
+    PoolPtr store = openPoolForTest(backend);
+
+    RowlessPageFixture()
+    {
+        setWatermarkMinActive(*backend, store->layout(), "test", 1, 100);
+    }
+
+    String add(uint64_t sequence, const RootNamespace & ns = kNs, uint64_t epoch = 1)
+    {
+        const ManifestRef ref{.writer_epoch = epoch, .build_sequence = sequence, .manifest_ordinal = 1};
+        const ManifestId id = writeManifestRaw(*backend, store->layout(), ns, ref, {blobEntryFor("f", DB::UInt128(sequence))});
+        return store->layout().manifestKey(id);
+    }
+
+    void replaceCatalogOnSecondRead(String bytes)
+    {
+        OperationForTest op(*backend);
+        const auto before = CasRefCatalog::read(*op, store->layout());
+        ASSERT_TRUE(before.etag);
+        backend->arm(store->layout().refCatalogKey(), 2, [this, catalog_bytes = std::move(bytes), token = *before.etag]
+        {
+            OperationForTest replacement(*backend);
+            ASSERT_TRUE(std::holds_alternative<Committed>(
+                (*replacement).replace(store->layout().refCatalogKey(), catalog_bytes, token, Retry::standard())));
+        });
+    }
+
+    ManifestSweepResult page(uint64_t list_budget = 100, uint64_t nomination_budget = 100)
+    {
+        backend->resetCounts();
+        return planManifestCursorPage(*store, "", list_budget, nomination_budget, true, nullptr);
+    }
+};
+
+}
+
+TEST(CASOrphanSweepRequests, RowlessPageRetainsBuildsAbovePublishedFloor)
+{
+    RowlessPageFixture f;
+    const Layout & layout = f.store->layout();
+    const std::vector<String> keys{f.add(5), f.add(6), f.add(8)};
+    setWatermarkMinActive(*f.backend, layout, "test", 1, 5);
+
+    const ManifestSweepResult result = f.page();
+
+    EXPECT_TRUE(result.nominations.empty());
+    EXPECT_EQ(result.skipped, 3u);
+    EXPECT_EQ(result.floor_lookups, 1u);
+    EXPECT_EQ(f.backend->getCount(layout.mountKey("test")), 1u);
+    EXPECT_EQ(f.backend->getCount(layout.refCatalogKey()), 1u);
+    for (const String & key : keys)
+        EXPECT_EQ(f.backend->getCount(key), 0u);
+}
+
+TEST(CASOrphanSweepRequests, RowlessPageRespectsEpochAndRetiredFloor)
+{
+    struct Case
+    {
+        uint64_t epoch;
+        uint64_t floor;
+        size_t nominations;
+    };
+    for (const Case & c : {Case{1, 5, 1}, Case{3, 5, 0}, Case{2, std::numeric_limits<uint64_t>::max(), 1}})
+    {
+        SCOPED_TRACE(c.epoch);
+        RowlessPageFixture f;
+        const String key = f.add(5, kNs, c.epoch);
+        setWatermarkMinActive(*f.backend, f.store->layout(), "test", 2, c.floor);
+
+        const ManifestSweepResult result = f.page();
+
+        EXPECT_EQ(result.nominations.size(), c.nominations);
+        EXPECT_EQ(f.backend->getCount(key), c.nominations);
+    }
+}
+
+TEST(CASOrphanSweepRequests, PostFloorCatalogFiltersOnlyChangedNamespaces)
+{
+    RowlessPageFixture f;
+    const Layout & layout = f.store->layout();
+    const String changed = f.add(1);
+    const String stable = f.add(1, RootNamespace{"test/store/465/bb@cas@"});
+    CatalogEntry entry;
+    entry.ns = kNs;
+    entry.state = NsState::Live;
+    entry.incarnation = fixture::fixtureLife(kNs).incarnation;
+    f.replaceCatalogOnSecondRead(encodeRefCatalog(RefCatalog{.entries = {entry}}));
+
+    const ManifestSweepResult result = f.page();
+
+    EXPECT_TRUE(f.backend->didFire());
+    ASSERT_EQ(result.nominations.size(), 1u);
+    EXPECT_EQ(result.nominations.front().key, stable);
+    EXPECT_EQ(result.skipped, 1u);
+    EXPECT_EQ(f.backend->getCount(changed), 0u);
+    EXPECT_EQ(f.backend->getCount(stable), 1u);
+    EXPECT_EQ(f.backend->getCount(layout.refCatalogKey()), 2u);
+}
+
+TEST(CASOrphanSweepRequests, PostFloorRetentionDoesNotRefillNominationBudget)
+{
+    RowlessPageFixture f;
+    const Layout & layout = f.store->layout();
+    const String first = f.add(1);
+    const String second = f.add(2);
+    ASSERT_LT(first, second);
+    CatalogEntry entry;
+    entry.ns = kNs;
+    entry.state = NsState::Live;
+    entry.incarnation = fixture::fixtureLife(kNs).incarnation;
+    f.replaceCatalogOnSecondRead(encodeRefCatalog(RefCatalog{.entries = {entry}}));
+
+    const ManifestSweepResult result = f.page(100, 1);
+
+    EXPECT_TRUE(f.backend->didFire());
+    EXPECT_TRUE(result.nominations.empty());
+    EXPECT_EQ(result.next_cursor, first);
+    EXPECT_FALSE(result.wrapped);
+    EXPECT_EQ(f.backend->getCount(first), 0u);
+    EXPECT_EQ(f.backend->getCount(second), 0u);
+    EXPECT_EQ(f.backend->listCount(layout.casManifestsPrefix()), 1u);
+}
+
+TEST(CASOrphanSweepRequests, MalformedPostFloorCatalogFailsBeforeBodyReads)
+{
+    RowlessPageFixture f;
+    const String key = f.add(1);
+    f.replaceCatalogOnSecondRead("not a catalog");
+
+    EXPECT_THROW(f.page(), DB::Exception);
+
+    EXPECT_TRUE(f.backend->didFire());
+    EXPECT_EQ(f.backend->getCount(key), 0u);
+    EXPECT_EQ(f.backend->deleteCount(key), 0u);
+}
+
+TEST(CASOrphanSweepRequests, CandidatePageReadsCatalogTwice)
+{
+    RowlessPageFixture f;
+    const Layout & layout = f.store->layout();
+    const std::vector<String> keys{f.add(1), f.add(2), f.add(3)};
+
+    const ManifestSweepResult result = f.page();
+
+    EXPECT_EQ(result.nominations.size(), 3u);
+    EXPECT_EQ(f.backend->getCount(layout.refCatalogKey()), 2u);
+    EXPECT_EQ(result.floor_lookups, 1u);
+    EXPECT_EQ(f.backend->getCount(layout.mountKey("test")), 1u);
+    EXPECT_EQ(f.backend->listCount(layout.casManifestsPrefix()), 1u);
+    for (const String & key : keys)
+        EXPECT_EQ(f.backend->getCount(key), 1u);
+}
+
+TEST(CASOrphanSweepRequests, ListOnlyPageDoesNotReadPostFloorCatalog)
+{
+    RowlessPageFixture f;
+    const Layout & layout = f.store->layout();
+    const String first = f.add(1);
+    const String second = f.add(2);
+
+    const ManifestSweepResult result = f.page(1, 0);
+
+    EXPECT_TRUE(result.nominations.empty());
+    EXPECT_EQ(f.backend->getCount(layout.refCatalogKey()), 1u);
+    EXPECT_EQ(result.floor_lookups, 0u);
+    EXPECT_EQ(f.backend->getCount(first), 0u);
+    EXPECT_EQ(f.backend->getCount(second), 0u);
+    EXPECT_EQ(result.next_cursor, first);
+    EXPECT_FALSE(result.wrapped);
+}
+
+TEST(CASOrphanSweepRequests, UnrelatedCatalogChangeDoesNotRetainStableOrphan)
+{
+    RowlessPageFixture f;
+    const Layout & layout = f.store->layout();
+    const String key = f.add(1);
+    seedFoldCursorForTest(*f.backend, layout, kNs, RefTxnId{2, 1});
+    writeRecoverableCkptForRawFixture(*f.backend, layout, kNs, RefCkpt{
+        .life_epoch = 1, .committed_through = std::nullopt,
+        .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt});
+    casAdmitEntry(*f.backend, layout, RootNamespace{"test/zz-unrelated@cas@"});
+    OperationForTest op(*f.backend);
+    RefCatalog next = CasRefCatalog::read(*op, layout).catalog;
+    ASSERT_EQ(next.entries.size(), 2u);
+    next.entries.back().state = NsState::Removing;
+    next.entries.back().removal_started_round = 1;
+    f.replaceCatalogOnSecondRead(encodeRefCatalog(next));
+
+    const ManifestSweepResult result = f.page();
+
+    EXPECT_TRUE(f.backend->didFire());
+    ASSERT_EQ(result.nominations.size(), 1u);
+    EXPECT_EQ(result.nominations.front().key, key);
+    EXPECT_EQ(f.backend->getCount(layout.refCatalogKey()), 2u);
+    EXPECT_EQ(f.backend->getCount(key), 1u);
 }
 
 TEST(CASOrphanSweepRequests, FloorIsReadOncePerNamespacePerPage)
