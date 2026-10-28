@@ -4,6 +4,7 @@
 #if USE_AWS_S3
 
 #include <Common/Exception.h>
+#include <Common/HTTPHeaderFilter.h>
 #include <Common/StringUtils.h>
 #include <Common/logger_useful.h>
 #include <Common/Macros.h>
@@ -21,6 +22,8 @@
 #include <IO/S3Common.h>
 #include <IO/S3/Client.h>
 #include <IO/S3/Credentials.h>
+
+#include <boost/algorithm/string/predicate.hpp>
 
 #include <IO/S3Settings.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/S3/S3ObjectStorage.h>
@@ -224,6 +227,13 @@ getClient(const S3::URI & url, const S3Settings & settings, ContextPtr context, 
             secret_access_key = s3_updated_credentials->getSecretAccessKey();
             session_token = s3_updated_credentials->getSessionToken();
         }
+    }
+
+    /// `gcp_oauth` adds an `Authorization` header to every request, so it must obey the same filter.
+    if (boost::iequals(client_configuration.http_client, "gcp_oauth"))
+    {
+        HTTPHeaderEntries gcp_oauth_headers{{"Authorization", "Bearer"}};
+        context->getHTTPHeaderFilter().checkAndNormalizeHeaders(gcp_oauth_headers);
     }
 
     auto shared_cache = S3::ClientCacheRegistry::instance().getOrCreateCacheForKey(url.endpoint, url.bucket);

@@ -634,6 +634,8 @@ DB::ReadWriteBufferFromHTTPPtr RestCatalog::createReadBuffer(
     {
         auto result_headers = getAuthHeaders(update_token, Poco::Net::HTTPRequest::HTTP_GET, url, headers, {});
         std::move(headers.begin(), headers.end(), std::back_inserter(result_headers));
+        /// The auth headers may carry a token from the OAuth server or values from the database settings.
+        context->getGlobalContext()->getHTTPHeaderFilter().checkAndNormalizeHeaders(result_headers);
 
         return DB::BuilderRWBufferFromHTTP(url)
             .withConnectionGroup(DB::HTTPConnectionGroupType::HTTP)
@@ -1124,6 +1126,7 @@ void RestCatalog::sendRequest(const String & endpoint, Poco::JSON::Object::Ptr r
 
     DB::HTTPHeaderEntries headers = getAuthHeaders(/* update_token = */ true, method, url, extra_headers, body_str);
     headers.emplace_back("Content-Type", "application/json");
+    context->getGlobalContext()->getHTTPHeaderFilter().checkAndNormalizeHeaders(headers);
     auto wb = DB::BuilderRWBufferFromHTTP(url)
         .withConnectionGroup(DB::HTTPConnectionGroupType::HTTP)
         .withMethod(method)
