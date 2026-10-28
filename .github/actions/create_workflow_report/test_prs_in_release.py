@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Unit tests for PRs-in-release baseline selection and merge filtering."""
 
+import io
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -22,6 +24,7 @@ from create_workflow_report import (
     _release_tag_sha,
     _filter_releases_to_version_line,
     get_prs_in_release_dataframe,
+    get_workflow_config,
 )
 
 CURRENT_TAG = "v26.6.4.20001.altinityantalya"
@@ -405,6 +408,32 @@ class TestChecksLatestTestStatusCte(unittest.TestCase):
         sql = _checks_latest_test_status_cte("deadbeef", "antalya-25.8")
         self.assertIn("test_name != ''", sql)
         self.assertIn("NOT IN ('Pre Hooks', 'Post Hooks')", sql)
+
+
+class TestGetWorkflowConfigStdout(unittest.TestCase):
+    def tearDown(self):
+        get_workflow_config.cache_clear()
+
+    def test_s3_404_warning_goes_to_stderr(self):
+        # action.yml takes the script's stdout as the report URL. A WARNING on
+        # stdout makes grep '^https?://' fail even after a successful upload.
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            patch(
+                "create_workflow_report._workflow_config_from_local",
+                return_value=None,
+            ),
+            patch("create_workflow_report.requests.get", return_value=mock_resp),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            cfg = get_workflow_config(2719, "abc", "antalya-25.8")
+        self.assertEqual(cfg, {"cache_jobs": {}})
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("WARNING", stderr.getvalue())
 
 
 if __name__ == "__main__":

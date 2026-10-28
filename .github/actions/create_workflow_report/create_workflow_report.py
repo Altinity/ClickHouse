@@ -938,12 +938,13 @@ def get_workflow_config(pr_number: int, commit_sha: str, ref_name: str) -> dict:
         if response.status_code != 200:
             print(
                 f"WARNING:Failed to fetch workflow config from {url}: "
-                f"{response.status_code}"
+                f"{response.status_code}",
+                file=sys.stderr,
             )
             return {"cache_jobs": {}}
         return response.json()
     except Exception as e:
-        print(f"WARNING:Failed to fetch workflow config from {url}: {e}")
+        print(f"WARNING:Failed to fetch workflow config from {url}: {e}", file=sys.stderr)
         return {"cache_jobs": {}}
 
 
