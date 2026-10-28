@@ -1,6 +1,10 @@
 name: Create and Upload Combined Report
 description: Create and upload a combined CI report
 inputs:
+  workflow_config:
+    description: "Workflow config (25.8 generated YAML still passes this)"
+    required: false
+    default: ""
   final:
     description: "Control whether the report is final or a preview"
     required: false
@@ -8,6 +12,15 @@ inputs:
 runs:
   using: "composite"
   steps:
+    - name: Create workflow config
+      if: ${{ inputs.workflow_config != '' }}
+      shell: bash
+      run: |
+        mkdir -p ./ci/tmp
+        cat > ./ci/tmp/workflow_config.json << 'EOF'
+        ${{ inputs.workflow_config }}
+        EOF
+
     - name: Create and upload workflow report
       env:
         PR_NUMBER: ${{ github.event.pull_request.number || 0 }}

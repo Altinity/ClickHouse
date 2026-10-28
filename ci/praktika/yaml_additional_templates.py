@@ -115,13 +115,14 @@ class AltinityWorkflowTemplates:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     steps:
       - name: Check out repository code
-        uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
+        uses: actions/checkout@v6
         with:
-          clear-repository: true
+          clean: true
       - name: Finalize workflow report
         if: ${{ !cancelled() }}
         uses: ./.github/actions/create_workflow_report
         with:
+          workflow_config: ${{ needs.config_workflow.outputs.data }}
           final: true
 """,
         "SourceUpload": r"""
@@ -135,12 +136,11 @@ class AltinityWorkflowTemplates:
         VERSION: ${{ fromJson(needs.config_workflow.outputs.data).custom_data.version.string }}
     steps:
       - name: Check out repository code
-        uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
+        uses: actions/checkout@v6
         with:
-          clear-repository: true
+          clean: true
           ref: ${{ fromJson(needs.config_workflow.outputs.data).git_ref }}
           submodules: true
-          fetch-depth: 0
           filter: tree:0
       - name: Install aws cli
         uses: unfor19/install-aws-cli-action@v1
@@ -149,7 +149,8 @@ class AltinityWorkflowTemplates:
           arch: arm64
       - name: Create source tar
         run: |
-          cd .. && tar czf $RUNNER_TEMP/build_source.src.tar.gz ClickHouse/
+          rm -f $RUNNER_TEMP/*.src.tar.gz
+          cd .. && tar czf $RUNNER_TEMP/build_source.src.tar.gz --exclude='ClickHouse/.git' ClickHouse/
       - name: Upload source tar
         run: |
           if [ "$PR_NUMBER" -eq 0 ]; then

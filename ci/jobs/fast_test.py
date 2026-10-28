@@ -59,6 +59,8 @@ def clone_submodules():
 
     res = Shell.check("git submodule sync", verbose=True, strict=True)
     res = res and Shell.check("git submodule init", verbose=True, strict=True)
+    if os.path.isdir(".git/modules/contrib") and os.listdir(".git/modules/contrib"):
+        print("Submodule cache detected, populating working trees from cache")
     res = res and Shell.check(
         command=f"xargs --max-procs={min([Utils.cpu_count(), 10])} --null --no-run-if-empty --max-args=1 git submodule update --depth 1 --single-branch",
         stdin_str="\0".join(submodules_to_update) + "\0",
