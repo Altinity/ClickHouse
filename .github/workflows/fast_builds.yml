@@ -800,7 +800,7 @@ jobs:
         run: echo "::warning title=GH artifact upload failed::Failed to upload [CH_ARM_MSAN_GH] to GitHub artifacts (e.g. quota/rate limit). Downstream consumers will fall back to S3."
 
   build_amd_release:
-    runs-on: [self-hosted, altinity-on-demand, altinity-builder, altinity-volume-clickhouse_thinlto-200GB]
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder, altinity-thinlto-cache-amd]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF9yZWxlYXNlKQ==') }}
     name: "Build (amd_release)"
@@ -844,7 +844,7 @@ jobs:
           PYTHONUNBUFFERED=1 python3 -m praktika run 'Build (amd_release)' --workflow "Fast Builds" --ci --timestamp
 
   build_arm_release:
-    runs-on: [self-hosted, altinity-on-demand, altinity-builder, altinity-volume-clickhouse_thinlto-200GB]
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder, altinity-thinlto-cache-arm]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFybV9yZWxlYXNlKQ==') }}
     name: "Build (arm_release)"
