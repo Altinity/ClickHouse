@@ -1,4 +1,8 @@
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
+#include "config.h"
+#if USE_AVRO
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
+#endif
 #include <Storages/MergeTree/MergeTreePartInfo.h>
 
 #include <Common/CurrentThread.h>
@@ -582,6 +586,33 @@ std::optional<UInt64> StorageObjectStorage::totalBytes(ContextPtr query_context)
 
     is_table_function ? configuration->lazyInitializeIfNeeded(object_storage, query_context) : configuration->update(object_storage, query_context);
     return configuration->totalBytes(query_context);
+}
+
+std::optional<std::vector<IdentityPartitionFile>> StorageObjectStorage::getIdentityPartitionFiles(
+    const StorageMetadataPtr & storage_metadata, ContextPtr query_context) const
+{
+#if USE_AVRO
+    /// A replica with `distributed_processing` sees only its own tasks. Answering from the whole
+    /// snapshot here would count every shard's rows on every shard.
+    if (distributed_processing || !configuration->isIcebergConfiguration())
+        return std::nullopt;
+
+    /// Analysis pinned `datalake_table_state`. `configuration->update` would load a newer commit
+    /// and disagree with the column types of this query. A missing pin scans, and the read path pins one snapshot.
+    if (!storage_metadata || !storage_metadata->datalake_table_state.has_value())
+        return std::nullopt;
+
+    configuration->lazyInitializeIfNeeded(object_storage, query_context);
+
+    auto iceberg = std::dynamic_pointer_cast<IcebergMetadata>(configuration->getExternalMetadata());
+    if (!iceberg)
+        return std::nullopt;
+    return iceberg->getDataFileIdentityPartitions(storage_metadata, query_context);
+#else
+    (void)storage_metadata;
+    (void)query_context;
+    return std::nullopt;
+#endif
 }
 
 void StorageObjectStorage::read(

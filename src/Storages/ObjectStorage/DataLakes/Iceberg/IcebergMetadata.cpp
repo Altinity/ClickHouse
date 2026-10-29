@@ -1630,6 +1630,84 @@ std::optional<size_t> IcebergMetadata::totalRows(ContextPtr local_context) const
     return static_cast<size_t>(result);
 }
 
+std::optional<std::vector<IdentityPartitionFile>> IcebergMetadata::getDataFileIdentityPartitions(
+    StorageMetadataPtr storage_metadata, ContextPtr local_context) const
+{
+    /// Same snapshot the scan uses. `getRelevantState` would read the latest metadata file instead.
+    auto table_state = extractIcebergSnapshotIdFromMetadataObject(storage_metadata);
+    if (!table_state)
+        return std::nullopt;
+
+    auto actual_data_snapshot = getRelevantDataSnapshotFromTableStateSnapshot(*table_state, local_context);
+
+    if (!actual_data_snapshot)
+        return std::vector<IdentityPartitionFile>{};
+
+    /// Same fail-closed conditions as `totalRows`: deletes make `record_count` not equal to
+    /// the number of surviving rows, and an unreadable path must not be answered from metadata.
+    if (actual_data_snapshot->total_equality_delete_rows.has_value()
+        && *actual_data_snapshot->total_equality_delete_rows > 0)
+        return std::nullopt;
+
+    if (!persistent_components.schema_processor)
+        return std::nullopt;
+
+    std::vector<IdentityPartitionFile> result;
+    for (const auto & manifest_list_entry : actual_data_snapshot->manifest_list_entries)
+    {
+        auto manifest_file_ptr = getManifestFileEntriesHandle(
+            object_storage, persistent_components, local_context, log, manifest_list_entry, table_state->schema_id, *external_storages);
+
+        for (const auto & processed : manifest_file_ptr.getFilesWithoutDeleted(FileContentType::DATA))
+            if (!isPathReadable(
+                    persistent_components.table_location,
+                    processed->parsed_entry->file_path_key.serialize(),
+                    object_storage,
+                    local_context))
+                return std::nullopt;
+
+        if (!manifest_file_ptr.getFilesWithoutDeleted(FileContentType::EQUALITY_DELETE).empty()
+            || !manifest_file_ptr.getFilesWithoutDeleted(FileContentType::POSITION_DELETE).empty())
+            return std::nullopt;
+
+        for (const auto & processed : manifest_file_ptr.getFilesWithoutDeleted(FileContentType::DATA))
+        {
+            const auto & entry = *processed->parsed_entry;
+            /// A deletion vector on the data file itself, or a negative count, is not an exact row count.
+            if (entry.isDeletionVector() || entry.record_count < 0)
+                return std::nullopt;
+            /// An empty file contributes no rows and no group.
+            if (entry.record_count == 0)
+                continue;
+            if (!processed->common_partition_specification)
+                return std::nullopt;
+
+            auto partition_values = Iceberg::getIdentityPartitionColumnValues(
+                *processed, *persistent_components.schema_processor, /* skip_nulls */ false);
+
+            IdentityPartitionFile file;
+            file.record_count = static_cast<UInt64>(entry.record_count);
+            for (auto & [column_name, column_value] : partition_values)
+            {
+                auto it = std::find_if(file.identity_values.begin(), file.identity_values.end(), [&](const auto & existing)
+                {
+                    return existing.first == column_name;
+                });
+                if (it != file.identity_values.end())
+                {
+                    if (!(it->second == column_value))
+                        return std::nullopt;
+                    continue;
+                }
+                file.identity_values.emplace_back(std::move(column_name), std::move(column_value));
+            }
+            result.push_back(std::move(file));
+        }
+    }
+
+    return result;
+}
+
 std::optional<size_t> IcebergMetadata::totalBytes(ContextPtr local_context) const
 {
     auto [actual_data_snapshot, actual_table_state_snapshot] = getRelevantState(local_context);

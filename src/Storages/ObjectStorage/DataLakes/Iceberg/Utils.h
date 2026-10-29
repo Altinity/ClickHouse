@@ -189,7 +189,9 @@ void forEachAvroEntry(
 using PartitionColumnValues = std::vector<std::pair<String, DB::Field>>;
 
 PartitionColumnValues getIdentityPartitionColumnValues(
-    const ProcessedManifestFileEntry & manifest_file_entry, const IcebergSchemaProcessor & schema_processor);
+    const ProcessedManifestFileEntry & manifest_file_entry,
+    const IcebergSchemaProcessor & schema_processor,
+    bool skip_nulls = true);
 }
 
 #endif

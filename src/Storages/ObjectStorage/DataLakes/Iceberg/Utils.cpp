@@ -2187,7 +2187,7 @@ void forEachAvroEntry(
 }
 
 PartitionColumnValues getIdentityPartitionColumnValues(
-    const ProcessedManifestFileEntry & manifest_file_entry, const IcebergSchemaProcessor & schema_processor)
+    const ProcessedManifestFileEntry & manifest_file_entry, const IcebergSchemaProcessor & schema_processor, bool skip_nulls)
 {
     const auto & partition_key_value = manifest_file_entry.parsed_entry->partition_key_value;
     if (partition_key_value.empty())
@@ -2228,7 +2228,9 @@ PartitionColumnValues getIdentityPartitionColumnValues(
         {
             value = convertFieldToTypeOrThrow(raw_value, *name_and_type->type);
         }
-        if (value.isNull())
+        /// A null identity value is a real SQL NULL group. Callers that only need the
+        /// non-null values (pruning, compaction) skip them; aggregation must keep them.
+        if (value.isNull() && skip_nulls)
             continue;
 
         result.emplace_back(name_and_type->name, std::move(value));
