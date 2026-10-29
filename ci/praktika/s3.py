@@ -15,6 +15,8 @@ from .utils import Shell, Utils
 
 try:
     import boto3
+    from botocore import UNSIGNED
+    from botocore.config import Config
     from botocore.exceptions import ClientError, NoCredentialsError
 
     BOTO3_AVAILABLE = True
@@ -58,9 +60,45 @@ def scan_file_for_sensitive_data(file_content, file_name):
 
 class S3:
     _boto3_client = None
+    _external_clients = {}
 
     @classmethod
-    def _get_boto3_client(cls):
+    def _external_bucket_config(cls, bucket):
+        return (Settings.S3_EXTERNAL_BUCKETS or {}).get(bucket)
+
+    @classmethod
+    def _get_external_client(cls, bucket, config, anonymous):
+        assert BOTO3_AVAILABLE, f"boto3 is required for S3 bucket [{bucket}]"
+        client = cls._external_clients.get((bucket, anonymous))
+        if client is None:
+            if anonymous:
+                credentials = {"config": Config(signature_version=UNSIGNED)}
+            else:
+                access_key = os.environ.get(config["access_key_env"], "")
+                secret_key = os.environ.get(config["secret_key_env"], "")
+                # boto3 would otherwise send the ambient AWS credentials to this endpoint
+                assert (
+                    access_key and secret_key
+                ), f"S3 bucket [{bucket}] needs [{config['access_key_env']}] and [{config['secret_key_env']}] set"
+                credentials = {
+                    "aws_access_key_id": access_key,
+                    "aws_secret_access_key": secret_key,
+                }
+            client = boto3.client(
+                "s3",
+                endpoint_url=config["endpoint_url"],
+                region_name=config["region"],
+                **credentials,
+            )
+            cls._external_clients[(bucket, anonymous)] = client
+        return client
+
+    @classmethod
+    def _get_boto3_client(cls, bucket=None, read=False):
+        config = cls._external_bucket_config(bucket)
+        if config:
+            anonymous = read and bool(config.get("public_read"))
+            return cls._get_external_client(bucket, config, anonymous)
         if not BOTO3_AVAILABLE:
             return None
         if cls._boto3_client is None:
@@ -188,7 +226,7 @@ class S3:
                 extra_args["Tagging"] = urlencode(tags)
 
             def _upload():
-                client = cls._get_boto3_client()
+                client = cls._get_boto3_client(bucket)
                 if extra_args:
                     client.upload_file(
                         str(local_path), bucket, key, ExtraArgs=extra_args
@@ -260,23 +298,68 @@ class S3:
         s3_full_path = str(s3_full_path).removeprefix("s3://")
         bucket, key = s3_full_path.split("/", maxsplit=1)
 
-        command = (
-            f"aws s3api put-object --bucket {bucket} --key {key} --body {local_path}"
-        )
-        if if_none_matched:
-            command += ' --if-none-match "*"'
-        if if_match:
-            command += f' --if-match "{if_match}"'
-        if metadata:
-            for k, v in metadata.items():
-                command += f" --metadata {k}={v}"
+        if cls._external_bucket_config(bucket):
+            res = cls._put_object_boto3(
+                bucket,
+                key,
+                local_path,
+                text,
+                metadata,
+                if_none_matched,
+                if_match,
+                no_strict,
+            )
+        else:
+            command = f"aws s3api put-object --bucket {bucket} --key {key} --body {local_path}"
+            if if_none_matched:
+                command += ' --if-none-match "*"'
+            if if_match:
+                command += f' --if-match "{if_match}"'
+            if metadata:
+                for k, v in metadata.items():
+                    command += f" --metadata {k}={v}"
 
-        if text:
-            command += ' --content-type "text/plain; charset=utf-8"'
-        res = cls.run_command_with_retries(command, no_strict=no_strict)
+            if text:
+                command += ' --content-type "text/plain; charset=utf-8"'
+            res = cls.run_command_with_retries(command, no_strict=no_strict)
         if res:
             StorageUsage.add_uploaded(local_path)
         return res
+
+    @classmethod
+    def _put_object_boto3(
+        cls,
+        bucket,
+        key,
+        local_path,
+        text,
+        metadata,
+        if_none_matched,
+        if_match,
+        no_strict,
+    ):
+        args = {"Bucket": bucket, "Key": key}
+        if metadata:
+            args["Metadata"] = metadata
+        if text:
+            args["ContentType"] = "text/plain; charset=utf-8"
+        if if_none_matched:
+            args["IfNoneMatch"] = "*"
+        if if_match:
+            args["IfMatch"] = if_match
+        try:
+            with open(local_path, "rb") as f:
+                cls._get_boto3_client(bucket).put_object(Body=f, **args)
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code", "")
+            if error_code in ("PreconditionFailed", "ConditionalRequestConflict"):
+                print(f"S3 conditional request failed (concurrent write detected): {error_code}")
+                return False
+            print(f"ERROR: Failed to put S3 object [{bucket}/{key}]: {error_code}")
+            if not no_strict:
+                raise
+            return False
+        return True
 
     @classmethod
     def run_command_with_retries(
@@ -354,7 +437,7 @@ class S3:
                     local_file.parent.mkdir(parents=True, exist_ok=True)
 
                     def _download():
-                        client = cls._get_boto3_client()
+                        client = cls._get_boto3_client(bucket, read=True)
                         client.download_file(bucket, key, str(local_file))
 
                     # Retry on transient credential failures
@@ -426,18 +509,32 @@ class S3:
     def head_object(cls, s3_path):
         s3_path = str(s3_path).removeprefix("s3://")
         bucket, key = s3_path.split("/", maxsplit=1)
-        output = Shell.get_output(
-            f"aws s3api head-object --bucket {bucket} --key {key}", verbose=True
-        )
-        if not output:
-            return None
-        data = json.loads(output)
+        if cls._external_bucket_config(bucket):
+            try:
+                data = cls._get_boto3_client(bucket, read=True).head_object(
+                    Bucket=bucket, Key=key
+                )
+            except ClientError as e:
+                if e.response.get("Error", {}).get("Code", "") in (
+                    "404",
+                    "NoSuchKey",
+                    "NotFound",
+                ):
+                    return None
+                raise
+        else:
+            output = Shell.get_output(
+                f"aws s3api head-object --bucket {bucket} --key {key}", verbose=True
+            )
+            if not output:
+                return None
+            data = json.loads(output)
         # HeadObject omits optional fields (Expiration) unless a lifecycle Expire
         # rule applies, and emits extra keys Object does not declare.
         return cls.Object(
             AcceptRanges=data.get("AcceptRanges", ""),
             Expiration=data.get("Expiration", ""),
-            LastModified=data.get("LastModified", ""),
+            LastModified=str(data.get("LastModified", "")),
             ContentLength=data.get("ContentLength", 0),
             ETag=data.get("ETag", ""),
             ContentType=data.get("ContentType", ""),
@@ -456,7 +553,7 @@ class S3:
         """
         s3_path = str(s3_path).removeprefix("s3://")
         bucket, key = s3_path.split("/", maxsplit=1)
-        client = cls._get_boto3_client()
+        client = cls._get_boto3_client(bucket, read=True)
         assert client, "boto3 client is required for S3 read-access probe"
 
         def _probe():

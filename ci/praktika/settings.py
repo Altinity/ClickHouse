@@ -1,7 +1,7 @@
 import dataclasses
 import importlib.util
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 
 @dataclasses.dataclass
@@ -111,6 +111,8 @@ class _Settings:
     # If enabled, submodule clones authenticate with the App installation token
     # (required for private submodules); otherwise they run anonymously.
     ENABLE_SUBMODULE_CLONE_AUTH: bool = False
+    # bucket/prefix of the submodule archive, defaults to CACHE_S3_PATH
+    SUBMODULE_CACHE_S3_PATH: str = ""
 
     # v2: records carry the producing workflow event, used as the reuse trust
     # signal instead of the branch (see CacheRunnerHooks.configure).
@@ -127,6 +129,9 @@ class _Settings:
     S3_UPSTREAM_REPORT_BUCKET: str = ""
     HTML_PAGE_FILE: str = "./ci/praktika/json.html"
     S3_BUCKET_TO_HTTP_ENDPOINT: Optional[Dict[str, str]] = None
+    # Non-AWS buckets: {bucket: {endpoint_url, region, access_key_env, secret_key_env, public_read}}
+    # The keys are read from the named env vars; with public_read, reads are unsigned.
+    S3_EXTERNAL_BUCKETS: Optional[Dict[str, Dict[str, Any]]] = None
     TEXT_CONTENT_EXTENSIONS: Iterable[str] = frozenset([".txt", ".log"])
     # Compress if text file size exceeds this threshold (in MB, 0 - disable compression)
     COMPRESS_THRESHOLD_MB: int = 0
@@ -177,6 +182,8 @@ _USER_DEFINED_SETTINGS = [
     "EVENT_FEED_S3_PATH",
     "AWS_REGION",
     "S3_BUCKET_TO_HTTP_ENDPOINT",
+    "S3_EXTERNAL_BUCKETS",
+    "SUBMODULE_CACHE_S3_PATH",
     "TEXT_CONTENT_EXTENSIONS",
     "TEMP_DIR",
     "OUTPUT_DIR",
