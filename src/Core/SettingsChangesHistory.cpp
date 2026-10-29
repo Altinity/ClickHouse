@@ -41,14 +41,12 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         /// controls new feature and it's 'true' by default, use 'false' as previous_value).
         /// It's used to implement `compatibility` setting (see https://github.com/ClickHouse/ClickHouse/issues/35972)
         /// Note: please check if the key already exists to prevent duplicate entries.
-        addSettingsChanges(settings_changes_history, "26.10",
         addSettingsChanges(settings_changes_history, "26.6.8.20003.altinityantalya",
         {
             {"iceberg_target_data_file_size_bytes", 536870912, 536870912, "Target file size for Iceberg bin-packing compaction (default 512 MiB)."},
             {"iceberg_min_data_file_size_bytes", 402653184, 402653184, "Files below this size are candidates for Iceberg bin-packing compaction (default 384 MiB)."},
         });
-
-        addSettingsChanges(settings_changes_history, "26.6.4.20001.altinityantalya",
+        addSettingsChanges(settings_changes_history, "26.10",
         {
             {"azure_validate_etag_on_read", false, true, "New setting to detect concurrent in-place overwrites of Azure blobs during a read by pinning every `GET` to the listed `ETag` with `If-Match` and validating the `ETag` of the response, like `s3_validate_etag_on_read` does for S3. `compatibility` with versions before 26.10 restores the previous behavior (no validation)."},
         });

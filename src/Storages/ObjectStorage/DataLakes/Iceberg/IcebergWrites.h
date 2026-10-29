@@ -142,34 +142,22 @@ void generateManifestFile(
     /// overrides both the record count / file size AND the column statistics for the corresponding file.
     const std::vector<IcebergSerializedFileStats> & per_file_stats = {});
 
-<<<<<<< HEAD
-/// Per manifest-list entry file/row counts and lineage for rewritten manifests.
-=======
-/// Per manifest-list entry file/row counts for a rewrite; the caller supplies counts matching the entry statuses it wrote.
->>>>>>> e6ae78c5318 (Merge pull request #2420 from Altinity/iceberg_rewrite_files_compaction)
+/// Per manifest-list entry file/row counts and lineage for a rewrite; the caller supplies counts matching the entry statuses it wrote.
 struct ManifestListEntryCounts
 {
     Int64 existing_files_count = 0;
     Int64 existing_rows_count = 0;
     /// Minimum data sequence number across the entries in this manifest, used as the manifest-list `min_sequence_number`.
     Int64 min_sequence_number = 0;
-<<<<<<< HEAD
-    /// True when the manifest's entries are ADDED in the snapshot whose manifest list is being
-    /// written, so its counts are reported as added_*. False when the manifest is carried
-    /// forward from an earlier snapshot or contains only pre-existing files (metadata-only
-    /// rewrite), so its counts are reported as existing_*.
-    bool counts_are_added = false;
+    Int64 added_files_count = 0;
+    Int64 added_rows_count = 0;
+    Int64 deleted_files_count = 0;
+    Int64 deleted_rows_count = 0;
     /// When set, override the entry's `added_snapshot_id` / `sequence_number`, preserving the
     /// lineage of a manifest that was first added by an earlier snapshot and is carried
     /// forward into this manifest list.
     std::optional<Int64> added_snapshot_id;
     std::optional<Int64> added_sequence_number;
-=======
-    Int64 added_files_count = 0;
-    Int64 added_rows_count = 0;
-    Int64 deleted_files_count = 0;
-    Int64 deleted_rows_count = 0;
->>>>>>> e6ae78c5318 (Merge pull request #2420 from Altinity/iceberg_rewrite_files_compaction)
 };
 
 struct PreviousManifestAction

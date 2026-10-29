@@ -1411,17 +1411,11 @@ void generateManifestList(
         auto summary = new_snapshot->getObject(Iceberg::f_summary);
         if (manifest_rewrite)
         {
-<<<<<<< HEAD
             /// The counts must agree per entry with the manifest's entry statuses: a manifest
-            /// whose entries are ADDED in this snapshot reports added_* counts, while a
+            /// whose entries are ADDED in this snapshot reports added_* counts, a
             /// carried-forward manifest (or a metadata-only rewrite that preserves lineage,
-            /// whose entries stay EXISTING) reports existing_* counts.
-=======
-            /// The counts must agree with the manifest's entry statuses: a metadata-only
-            /// rewrite (`replace`) preserves lineage and its entries stay EXISTING, a
-            /// regenerated manifest without lineage emits its entries as ADDED, and a
-            /// bin-pack rewrite also marks the replaced files as DELETED.
->>>>>>> e6ae78c5318 (Merge pull request #2420 from Altinity/iceberg_rewrite_files_compaction)
+            /// whose entries stay EXISTING) reports existing_* counts, and a bin-pack rewrite
+            /// also marks the replaced files as DELETED.
             const auto & counts = entry_counts[entry_idx];
             setVersionedField(entry, static_cast<Int32>(counts.added_files_count), Iceberg::f_added_files_count);
             setVersionedField(entry, static_cast<Int32>(counts.existing_files_count), Iceberg::f_existing_files_count);

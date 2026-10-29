@@ -13,6 +13,7 @@
 #include <Interpreters/Context.h>
 #include <Interpreters/ExpressionActions.h>
 #include <Interpreters/ProcessList.h>
+#include <Processors/Formats/IInputFormat.h>
 #include <Storages/ObjectStorage/DataLakes/Common/Common.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ChunkPartitioner.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Compaction.h>
@@ -64,7 +65,7 @@ namespace
 SharedHeader makeHeaderFromSchema(IcebergSchemaProcessor & schema_processor, Int32 schema_id)
 {
     Block header;
-    for (const auto & column : *schema_processor.getClickhouseTableSchemaById(schema_id))
+    for (const auto & column : *schema_processor.getClickHouseTableSchemaById(schema_id))
         header.insert(ColumnWithTypeAndName(column.type->createColumn(), column.type, column.name));
     return std::make_shared<const Block>(std::move(header));
 }
@@ -189,7 +190,7 @@ ManifestScanResult scanManifestList(
     ObjectStoragePtr object_storage,
     const PersistentTableComponents & persistent_table_components,
     ContextPtr context,
-    SecondaryStorages & secondary_storages,
+    ExternalStorageCache & secondary_storages,
     Int32 partition_spec_id,
     Int32 current_schema_id,
     UInt64 min_file_size,
@@ -294,7 +295,7 @@ BinPackPlan buildBinPackPlan(
     Poco::JSON::Object::Ptr metadata_object,
     const PersistentTableComponents & persistent_table_components,
     ObjectStoragePtr object_storage,
-    SecondaryStorages & secondary_storages,
+    ExternalStorageCache & secondary_storages,
     ContextPtr context,
     UInt64 min_file_size,
     UInt64 target_file_size)
@@ -722,7 +723,7 @@ MetadataFileOwner getMetadataFileOwner(
 bool hasLivePositionDeletes(
     const PersistentTableComponents & persistent_table_components,
     ObjectStoragePtr object_storage,
-    SecondaryStorages & secondary_storages,
+    ExternalStorageCache & secondary_storages,
     const DataLakeStorageSettings & data_lake_settings,
     ContextPtr context,
     const std::shared_ptr<DataLake::ICatalog> & catalog,
@@ -810,7 +811,7 @@ RewriteResult rewriteBins(
     BinPackPlan & plan,
     const PersistentTableComponents & persistent_table_components,
     ObjectStoragePtr object_storage,
-    SecondaryStorages & secondary_storages,
+    ExternalStorageCache & secondary_storages,
     ContextPtr context,
     Poco::JSON::Object::Ptr current_schema,
     IcebergSchemaProcessor & schema_processor,
@@ -1179,6 +1180,11 @@ ManifestListInput writeManifests(
             kept_total_rows += kept.record_count;
         }
 
+        ManifestListEntryCounts kept_counts;
+        kept_counts.existing_files_count = static_cast<Int64>(kept_files.size());
+        kept_counts.existing_rows_count = kept_total_rows;
+        kept_counts.min_sequence_number = kept_min_seq;
+
         write_manifest_for_entries(
             partition_key,
             kept_paths,
@@ -1189,7 +1195,7 @@ ManifestListInput writeManifests(
             kept_sort_order_ids,
             kept_lineage,
             std::nullopt,
-            {static_cast<Int64>(kept_files.size()), kept_total_rows, kept_min_seq});
+            kept_counts);
     }
 
     return mli;
@@ -1203,7 +1209,7 @@ void writeManifestList(
     const IcebergPathResolver & path_resolver,
     Poco::JSON::Object::Ptr metadata_object,
     ObjectStoragePtr object_storage,
-    SecondaryStorages & secondary_storages,
+    ExternalStorageCache & secondary_storages,
     ContextPtr context,
     IcebergPathFromMetadata & manifest_list_path)
 {
@@ -1386,7 +1392,7 @@ BinPackCommitResult commitMetadata(
 BinPackCommitResult executeBinPackCompaction(
     const PersistentTableComponents & persistent_table_components,
     ObjectStoragePtr object_storage,
-    SecondaryStorages & secondary_storages,
+    ExternalStorageCache & secondary_storages,
     const DataLakeStorageSettings & data_lake_settings,
     ContextPtr context,
     const String & write_format,

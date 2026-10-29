@@ -75,7 +75,8 @@ MetadataCommitResult tryWriteMetadataFileAndVersionHint(
     const IcebergPathFromMetadata & version_hint_path,
     DB::ObjectStoragePtr object_storage,
     DB::ContextPtr context,
-    bool try_write_version_hint);
+    bool try_write_version_hint,
+    bool * version_hint_names_metadata_file = nullptr);
 
 /// Same as `tryWriteMetadataFileAndVersionHint`, returns false unless the result is `Committed`.
 bool writeMetadataFileAndVersionHint(
@@ -155,7 +156,6 @@ MetadataFileWithInfo getLatestOrExplicitMetadataFileAndVersion(
     bool force_fetch_latest_metadata = true,
     bool ignore_explicit_metadata_file_path = false);
 
-<<<<<<< HEAD
 MetadataFileWithInfo getLatestMetadataFileAndVersionWithCatalog(
     const ObjectStoragePtr & object_storage,
     const std::shared_ptr<DataLake::ICatalog> & catalog,
@@ -168,12 +168,11 @@ MetadataFileWithInfo getLatestMetadataFileAndVersionWithCatalog(
     const std::optional<String> & table_uuid,
     CompressionMethod known_compression_method,
     bool ignore_explicit_metadata_file_path = true);
-=======
+
 /// The highest version among the metadata files in the `metadata` directory of the table,
 /// regardless of the version hint, the metadata cache, and which file is current.
 /// Returns `std::nullopt` if the directory has no metadata files.
 std::optional<Int32> getMaxMetadataFileVersionInDirectory(const ObjectStoragePtr & object_storage, const String & table_path);
->>>>>>> e6ae78c5318 (Merge pull request #2420 from Altinity/iceberg_rewrite_files_compaction)
 
 std::pair<Poco::JSON::Object::Ptr, Int32> parseTableSchemaV1Method(const Poco::JSON::Object::Ptr & metadata_object);
 std::pair<Poco::JSON::Object::Ptr, Int32> parseTableSchemaV2Method(const Poco::JSON::Object::Ptr & metadata_object);

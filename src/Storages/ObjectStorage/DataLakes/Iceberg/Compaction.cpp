@@ -892,8 +892,8 @@ static bool writeConsolidatedManifestFile(
                 manifest_min_sequence_number = std::min(manifest_min_sequence_number, lineage.sequence_number.value_or(0));
 
             ManifestListEntryCounts consolidated_counts;
-            consolidated_counts.files_count = static_cast<Int64>(pd.file_paths.size());
-            consolidated_counts.rows_count = manifest_existing_rows;
+            consolidated_counts.existing_files_count = static_cast<Int64>(pd.file_paths.size());
+            consolidated_counts.existing_rows_count = manifest_existing_rows;
             consolidated_counts.min_sequence_number = manifest_min_sequence_number;
             existing_entry_counts.push_back(consolidated_counts);
 
@@ -1059,15 +1059,7 @@ bool overwriteIsPositionDeleteOnly(const SnapshotSummaryUpdateOverwrite & update
         case SnapshotSummaryOperation::DELETE:
             return std::nullopt;
         case SnapshotSummaryOperation::OVERWRITE: {
-<<<<<<< HEAD
             if (overwriteIsPositionDeleteOnly(summary->getUpdate<Iceberg::SnapshotSummaryUpdateOverwrite>()))
-=======
-            const auto & update = summary->getUpdate<Iceberg::SnapshotSummaryUpdateOverwrite>();
-            /// current compaction (OPTIME TABLE my_iceberg) supports only overwrites wich has only position delete files
-            if (update.added_files == 0 && update.added_delete_files != 0
-                && update.added_position_delete_files == update.added_delete_files
-                && update.added_equality_delete_files == 0)
->>>>>>> e6ae78c5318 (Merge pull request #2420 from Altinity/iceberg_rewrite_files_compaction)
                 return std::nullopt;
             throw DB::Exception(ErrorCodes::NOT_IMPLEMENTED, "Unsupported snapshot's operation type {}", summary->getOperation());
         }
@@ -1295,23 +1287,13 @@ static void writeMetadataFiles(
                 Int64 manifest_rows = 0;
                 for (const auto rows : file_row_counts)
                     manifest_rows += static_cast<Int64>(rows);
-<<<<<<< HEAD
                 ManifestListEntryCounts counts;
-                counts.files_count = static_cast<Int64>(data_files_vec.size());
-                counts.rows_count = manifest_rows;
+                counts.added_files_count = static_cast<Int64>(data_files_vec.size());
+                counts.added_rows_count = manifest_rows;
                 counts.min_sequence_number = remapped_sequence_number;
                 counts.added_snapshot_id = manifest_lineage.added_snapshot_id;
                 counts.added_sequence_number = remapped_sequence_number;
                 manifest_file_counts[manifest_entry->patched_path] = counts;
-=======
-                const Int64 manifest_min_sequence_number = snapshot->has(Iceberg::f_metadata_sequence_number)
-                    ? snapshot->getValue<Int64>(Iceberg::f_metadata_sequence_number)
-                    : 0;
-                manifest_file_counts[manifest_entry->patched_path]
-                    = {.min_sequence_number = manifest_min_sequence_number,
-                       .added_files_count = static_cast<Int64>(data_files_vec.size()),
-                       .added_rows_count = manifest_rows};
->>>>>>> e6ae78c5318 (Merge pull request #2420 from Altinity/iceberg_rewrite_files_compaction)
             }
             generateManifestFile(
                 metadata_object,
@@ -1394,7 +1376,13 @@ static void writeMetadataFiles(
             ManifestListEntryCounts counts;
             if (auto it = manifest_file_counts.find(entry); it != manifest_file_counts.end())
                 counts = it->second;
-            counts.counts_are_added = counts.added_snapshot_id.has_value() && *counts.added_snapshot_id == list_snapshot_id;
+            if (!counts.added_snapshot_id.has_value() || *counts.added_snapshot_id != list_snapshot_id)
+            {
+                counts.existing_files_count = counts.added_files_count;
+                counts.existing_rows_count = counts.added_rows_count;
+                counts.added_files_count = 0;
+                counts.added_rows_count = 0;
+            }
             entry_counts.push_back(counts);
         }
         auto buffer_manifest_list = object_storage->writeObject(

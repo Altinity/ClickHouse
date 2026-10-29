@@ -12,7 +12,7 @@
 
 namespace DB
 {
-struct SecondaryStorages;
+struct ExternalStorageCache;
 }
 
 namespace DB::Iceberg
@@ -31,7 +31,7 @@ enum class BinPackCommitResult : uint8_t
 bool hasLivePositionDeletes(
     const PersistentTableComponents & persistent_table_components,
     ObjectStoragePtr object_storage,
-    SecondaryStorages & secondary_storages,
+    ExternalStorageCache & secondary_storages,
     const DataLakeStorageSettings & data_lake_settings,
     ContextPtr context,
     const std::shared_ptr<DataLake::ICatalog> & catalog,
@@ -51,7 +51,7 @@ bool hasLivePositionDeletes(
 BinPackCommitResult executeBinPackCompaction(
     const PersistentTableComponents & persistent_table_components,
     ObjectStoragePtr object_storage,
-    SecondaryStorages & secondary_storages,
+    ExternalStorageCache & secondary_storages,
     const DataLakeStorageSettings & data_lake_settings,
     ContextPtr context,
     const String & write_format,

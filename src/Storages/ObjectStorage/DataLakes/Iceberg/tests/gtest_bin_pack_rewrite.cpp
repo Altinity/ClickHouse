@@ -11,6 +11,7 @@
 #include <IO/WriteBufferFromString.h>
 #include <Processors/Formats/Impl/AvroRowInputFormat.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/ExternalPathResolver.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergPath.h>
 #include <Storages/ObjectStorage/Utils.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/MetadataGenerator.h>
@@ -296,7 +297,7 @@ TEST(IcebergBinPackRewrite, ManifestListCountsMatchEntryStatuses)
     kept_counts.existing_rows_count = 50;
 
     IcebergPathResolver path_resolver("s3://bucket/table", "table");
-    SecondaryStorages secondary_storages;
+    ExternalStorageCache secondary_storages;
     WriteBufferFromOwnString buf;
     generateManifestList(
         path_resolver,

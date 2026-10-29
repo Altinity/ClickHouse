@@ -346,12 +346,15 @@ bool writeMetadataFileAndVersionHint(
     bool try_write_version_hint,
     bool * version_hint_names_metadata_file)
 {
-<<<<<<< HEAD
-    bool hint_names_metadata_file = false;
-
-=======
     return tryWriteMetadataFileAndVersionHint(
-               resolver, metadata_file_info, metadata_file_content, version_hint_path, object_storage, context, try_write_version_hint)
+               resolver,
+               metadata_file_info,
+               metadata_file_content,
+               version_hint_path,
+               object_storage,
+               context,
+               try_write_version_hint,
+               version_hint_names_metadata_file)
         == MetadataCommitResult::Committed;
 }
 
@@ -362,9 +365,11 @@ MetadataCommitResult tryWriteMetadataFileAndVersionHint(
     const IcebergPathFromMetadata & version_hint_path,
     DB::ObjectStoragePtr object_storage,
     DB::ContextPtr context,
-    bool try_write_version_hint)
+    bool try_write_version_hint,
+    bool * version_hint_names_metadata_file)
 {
->>>>>>> e6ae78c5318 (Merge pull request #2420 from Altinity/iceberg_rewrite_files_compaction)
+    bool hint_names_metadata_file = false;
+
     auto storage_metadata_path = resolver.resolve(metadata_file_info.path);
     auto storage_version_hint_path = resolver.resolve(version_hint_path);
 
@@ -391,7 +396,7 @@ MetadataCommitResult tryWriteMetadataFileAndVersionHint(
         if (e.code() == ErrorCodes::UNSUPPORTED_METHOD)
             throw;
         tryLogCurrentException(__PRETTY_FUNCTION__);
-        return false;
+        return MetadataCommitResult::Unknown;
     }
     catch (...)
     {
@@ -474,7 +479,6 @@ MetadataCommitResult tryWriteMetadataFileAndVersionHint(
         ++i;
     }
 
-<<<<<<< HEAD
     /// The metadata file is already written with `If-None-Match: *`, which is the commit itself: reporting
     /// a failure here would make the caller retry and commit the same change a second time. A stale hint
     /// only delays readers with `iceberg_use_version_hint = 1` until the next writer advances it.
@@ -490,10 +494,7 @@ MetadataCommitResult tryWriteMetadataFileAndVersionHint(
     if (version_hint_names_metadata_file)
         *version_hint_names_metadata_file = hint_names_metadata_file;
 
-    return true;
-=======
     return MetadataCommitResult::Committed;
->>>>>>> e6ae78c5318 (Merge pull request #2420 from Altinity/iceberg_rewrite_files_compaction)
 }
 
 

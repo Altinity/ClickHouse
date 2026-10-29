@@ -70,12 +70,8 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Storages/ColumnsDescription.h>
 #include <Storages/ObjectStorage/DataLakes/Common/AvroForIcebergDeserializer.h>
-<<<<<<< HEAD
-=======
 #include <Interpreters/ProcessList.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/BinPackRewrite.h>
-#include <Storages/ObjectStorage/DataLakes/Iceberg/Compaction.h>
->>>>>>> e6ae78c5318 (Merge pull request #2420 from Altinity/iceberg_rewrite_files_compaction)
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ExpireSnapshotsExecute.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/RemoveOrphanFilesExecute.h>
@@ -143,12 +139,9 @@ extern const int FILE_ALREADY_EXISTS;
 extern const int METADATA_MISMATCH;
 extern const int UNFINISHED;
 extern const int INCORRECT_DATA;
-<<<<<<< HEAD
 extern const int FILE_DOESNT_EXIST;
-=======
 extern const int LIMIT_EXCEEDED;
 extern const int QUERY_WAS_CANCELLED;
->>>>>>> e6ae78c5318 (Merge pull request #2420 from Altinity/iceberg_rewrite_files_compaction)
 }
 
 namespace Setting
@@ -551,10 +544,11 @@ IcebergMetadata::getIcebergDataSnapshot(Poco::JSON::Object::Ptr metadata_object,
 }
 
 bool IcebergMetadata::optimize(
-<<<<<<< HEAD
     [[maybe_unused]] const StorageMetadataPtr & metadata_snapshot,
     [[maybe_unused]] ContextPtr context,
-    [[maybe_unused]] const std::optional<FormatSettings> & format_settings)
+    [[maybe_unused]] const std::optional<FormatSettings> & format_settings,
+    [[maybe_unused]] std::shared_ptr<DataLake::ICatalog> catalog,
+    [[maybe_unused]] const StorageID & storage_id)
 {
     checkTableRootIsQueriedPath("OPTIMIZE");
 
@@ -570,16 +564,6 @@ bool IcebergMetadata::optimize(
     iceberg_compaction_metadata_generator->waitUntilUpdated();
     return true;
 #else
-    if (context->getSettingsRef()[Setting::allow_experimental_iceberg_compaction])
-=======
-    const StorageMetadataPtr & metadata_snapshot,
-    ContextPtr context,
-    const std::optional<FormatSettings> & format_settings,
-    std::shared_ptr<DataLake::ICatalog> catalog,
-    const StorageID & storage_id)
-{
-    checkTableRootIsQueriedPath("OPTIMIZE");
-
     if (!context->getSettingsRef()[Setting::allow_experimental_iceberg_compaction])
         throw Exception(
             ErrorCodes::BAD_ARGUMENTS, "Enable 'allow_experimental_iceberg_compaction' setting to call optimize for iceberg tables.");
@@ -594,7 +578,6 @@ bool IcebergMetadata::optimize(
             persistent_components.format_version);
 
     auto invalidate_metadata_cache = [&]()
->>>>>>> e6ae78c5318 (Merge pull request #2420 from Altinity/iceberg_rewrite_files_compaction)
     {
         if (persistent_components.metadata_cache)
         {
@@ -606,7 +589,7 @@ bool IcebergMetadata::optimize(
 
     /// Bin-packing never rewrites a file a position delete applies to, so it cannot remove them.
     if (Iceberg::hasLivePositionDeletes(
-            persistent_components, object_storage, *secondary_storages, data_lake_settings, context, catalog, storage_id))
+            persistent_components, object_storage, *external_storages, data_lake_settings, context, catalog, storage_id))
     {
         LOG_INFO(log, "Table has live position delete files, applying them with a full compaction");
         compactIcebergTable(
@@ -637,7 +620,7 @@ bool IcebergMetadata::optimize(
         const auto result = Iceberg::executeBinPackCompaction(
             persistent_components,
             object_storage,
-            *secondary_storages,
+            *external_storages,
             data_lake_settings,
             context,
             write_format,
@@ -650,13 +633,10 @@ bool IcebergMetadata::optimize(
             return true;
         }
     }
-<<<<<<< HEAD
-#endif
-=======
 
     throw Exception(ErrorCodes::LIMIT_EXCEEDED,
         "Bin-pack compaction did not commit after {} attempts because of concurrent modifications", MAX_BIN_PACK_RETRIES);
->>>>>>> e6ae78c5318 (Merge pull request #2420 from Altinity/iceberg_rewrite_files_compaction)
+#endif
 }
 
 bool IcebergMetadata::optimizeManifestFiles(
@@ -1369,7 +1349,6 @@ IcebergMetadata::IcebergHistory IcebergMetadata::getHistory(ContextPtr local_con
 
     auto metadata_object
         = getMetadataJSONObject(metadata_file_path, object_storage, persistent_components.metadata_cache, local_context, log, compression_method, persistent_components.table_uuid);
-    chassert(persistent_components.format_version == metadata_object->getValue<int>(f_format_version));
 
     /// History
     std::vector<Iceberg::IcebergHistoryRecord> iceberg_history;
