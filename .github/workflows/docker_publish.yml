@@ -45,7 +45,7 @@ jobs:
       image_archives_path: ${{ steps.set_path.outputs.image_archives_path }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v6
 
       - name: Docker Hub Login
         uses: docker/login-action@v2
@@ -113,7 +113,7 @@ jobs:
 
       - name: Upload image archives
         if: ${{ github.event.inputs.upload_artifacts || inputs.upload_artifacts }}
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v7
         with:
           name: docker-images-backup
           path: image_archives/

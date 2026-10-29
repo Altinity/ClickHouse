@@ -90,7 +90,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        SUITE: [aes_encryption, atomic_insert, base_58, clickhouse_keeper_failover, data_types, datetime64_extended_range, disk_level_encryption, dns, engines, example, extended_precision_data_types, functions, jwt_authentication, kafka, kerberos, key_value, lightweight_delete, memory, part_moves_between_shards, selects, session_timezone, settings, swarms, version, window_functions]
+        SUITE: [aes_encryption, atomic_insert, base_58, clickhouse_keeper_failover, data_types, datetime64_extended_range, disk_level_encryption, dns, engines, example, extended_precision_data_types, functions, jwt_authentication, kafka, kerberos, key_value, memory, part_moves_between_shards, selects, session_timezone, settings, swarms, version, window_functions]
     uses: ./.github/workflows/regression-reusable-suite.yml
     with:
       ref: ${{ inputs.commit }}
@@ -101,6 +101,33 @@ jobs:
       runner_type: ${{ inputs.runner_type }}
       build_sha: ${{ inputs.build_sha }}
       job_name: ${{ matrix.SUITE }}
+    secrets: inherit
+
+  LightweightDelete:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - PART: 1
+            FILTER: --only "/lightweight delete/disk space/*"
+          - PART: 2
+            FILTER: --only "/lightweight delete/hard restart/*"
+          - PART: 3
+            FILTER: --skip "/lightweight delete/disk space/*" "/lightweight delete/hard restart/*" "/lightweight delete/alter after delete/*" "/lightweight delete/concurrent alter and delete/*" "/lightweight delete/concurrent delete/*" "/lightweight delete/basic checks/*" "/lightweight delete/performance/*" "/lightweight delete/ontime tests/*"
+          - PART: 4
+            FILTER: --only "/lightweight delete/alter after delete/*" "/lightweight delete/concurrent alter and delete/*" "/lightweight delete/concurrent delete/*" "/lightweight delete/basic checks/*" "/lightweight delete/performance/*" "/lightweight delete/ontime tests/*"
+    uses: ./.github/workflows/regression-reusable-suite.yml
+    with:
+      ref: ${{ inputs.commit }}
+      arch: ${{ inputs.arch }}
+      suite_name: lightweight_delete
+      suite_executable: regression.py
+      timeout_minutes: 300
+      runner_type: ${{ inputs.runner_type }}
+      part: ${{ matrix.PART }}
+      build_sha: ${{ inputs.build_sha }}
+      job_name: lightweight_delete
+      extra_args: ${{ matrix.FILTER }}
     secrets: inherit
 
   AggregateFunctions:

@@ -318,7 +318,7 @@ jobs:
       REPO_SUBTITLE: ${{ inputs.release_environment == 'production' && 'Stable Builds' || 'Staging Builds' }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: Altinity/ClickHouse
           ref: antalya
