@@ -283,19 +283,52 @@ fi
 echo "TOO_MANY_ROWS"
 
 # `any` stops after the key that crosses `max_rows_to_group_by`, so limit 1 keeps two groups.
+# Each thread applies that on its own, and the merge keeps every partial key, so pin one thread.
 echo "group_by_row_limit_any"
 ${CLICKHOUSE_CLIENT} --format TabSeparated --query "
     SELECT count() FROM
     (
         SELECT d, count() FROM ${LOCAL_TABLE}
         GROUP BY d
-        SETTINGS
-            max_rows_to_group_by = 1,
-            group_by_overflow_mode = 'any',
-            optimize_trivial_count_query = 1,
-            use_iceberg_metadata_files_cache = 0,
-            enable_parallel_replicas = 0
-    )"
+    )
+    SETTINGS
+        max_rows_to_group_by = 1,
+        group_by_overflow_mode = 'any',
+        max_threads = 1,
+        make_distributed_plan = 0,
+        optimize_trivial_count_query = 1,
+        use_iceberg_metadata_files_cache = 0,
+        enable_parallel_replicas = 0"
+
+# A limit above the partition count still answers from the manifest. The CI profile sets
+# `max_rows_to_group_by` to a large non-zero value.
+echo "group_by_row_limit_fits"
+${CLICKHOUSE_CLIENT} --format TabSeparated --query "
+    SELECT count() FROM
+    (
+        SELECT d FROM ${LOCAL_TABLE}
+        GROUP BY d
+    )
+    SETTINGS
+        log_comment = '${PREFIX}_group_by_row_limit_fits',
+        log_queries = 1,
+        max_rows_to_group_by = 100,
+        optimize_trivial_count_query = 1,
+        use_iceberg_metadata_files_cache = 0,
+        enable_parallel_replicas = 0"
+${CLICKHOUSE_CLIENT} --query "SYSTEM FLUSH LOGS query_log"
+${CLICKHOUSE_CLIENT} --format TabSeparated --query "
+    SELECT if(
+        read_rows <= 10,
+        'metadata',
+        concat('data read_rows=', toString(read_rows)))
+    FROM system.query_log
+    WHERE type = 'QueryFinish'
+        AND is_initial_query
+        AND current_database = currentDatabase()
+        AND log_comment = '${PREFIX}_group_by_row_limit_fits'
+    ORDER BY event_time_microseconds DESC
+    LIMIT 1"
 
 # `allow_experimental_iceberg_read_optimization = 0` must scan. Unfiltered `count()` stays on trivial count.
 echo "read_optimization_off"

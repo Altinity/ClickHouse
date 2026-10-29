@@ -789,11 +789,6 @@ bool applyIcebergIdentityPartitionAggregationIfPossible(
         || query_node.isGroupByWithGroupingSets())
         return false;
 
-    /// `max_rows_to_group_by` is enforced while keys are inserted. This path emits every group,
-    /// and `MergingAggregated` is built without that limit, so `throw`, `break`, and `any` would not apply.
-    if (query_node.hasGroupBy() && settings[Setting::max_rows_to_group_by])
-        return false;
-
     if (!query_node.getCorrelatedColumnsSet().empty() || queryHasArrayJoinInJoinTree(query_tree))
         return false;
 
@@ -1162,6 +1157,14 @@ bool applyIcebergIdentityPartitionAggregationIfPossible(
             }
         }
     }
+
+    /// `max_rows_to_group_by` is enforced while keys are inserted, and `MergingAggregated` does not
+    /// reapply it. The groups fit under the limit for every overflow mode, including the CI profile
+    /// value. Past the limit, `throw`, `break`, and `any` stay on the scan.
+    if (!group_keys.empty()
+        && settings[Setting::max_rows_to_group_by]
+        && groups.size() > settings[Setting::max_rows_to_group_by])
+        return false;
 
     Block result;
     for (size_t key_index = 0; key_index < group_keys.size(); ++key_index)
