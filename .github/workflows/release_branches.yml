@@ -20,10 +20,10 @@ on: # yamllint disable-line rule:truthy
       - reopened
       - opened
     branches:
-      - 'releases/*'
+      - 'fips-*'
   push:
     branches:
-      - 'releases/*'
+      - 'fips-*'
     tags:
       - '*'
   workflow_dispatch:
