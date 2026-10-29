@@ -1,7 +1,7 @@
 # The Dockerfile.ubuntu exists for the tests/ci/docker_server.py script
 # If the image is built from Dockerfile.alpine, then the `-alpine` suffix is added automatically,
 # so the only purpose of Dockerfile.ubuntu is to push `latest`, `head` and so on w/o suffixes
-FROM ubuntu:20.04 AS glibc-donor
+FROM ubuntu:22.04 AS glibc-donor
 ARG TARGETARCH
 
 RUN arch=${TARGETARCH:-amd64} \
@@ -74,6 +74,8 @@ RUN mkdir -p "${DEFAULT_DATA_DIR}" "${DEFAULT_LOG_DIR}" "${DEFAULT_CONFIG_DIR}" 
     && chown clickhouse:clickhouse "${DEFAULT_DATA_DIR}" \
     && chown root:clickhouse "${DEFAULT_LOG_DIR}" \
     && chmod ugo+Xrw -R "${DEFAULT_DATA_DIR}" "${DEFAULT_LOG_DIR}" "${DEFAULT_CONFIG_DIR}"
+
+RUN apk update && apk upgrade --no-cache
 
 # /var/lib/clickhouse is necessary due to the current default configuration for Keeper
 VOLUME "${DEFAULT_DATA_DIR}" /var/lib/clickhouse
