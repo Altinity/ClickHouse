@@ -46,7 +46,27 @@ class CI:
                 JobNames.JEPSEN_KEEPER,
                 JobNames.JEPSEN_SERVER,
             ]
-        )
+        ),
+        WorkFlowNames.FAST_BUILDS: LabelConfig(
+            run_jobs=[
+                BuildNames.PACKAGE_RELEASE,
+                BuildNames.PACKAGE_AARCH64,
+                BuildNames.PACKAGE_ASAN,
+                BuildNames.PACKAGE_UBSAN,
+                BuildNames.PACKAGE_TSAN,
+                BuildNames.PACKAGE_MSAN,
+                BuildNames.PACKAGE_DEBUG,
+                JobNames.BUILD_CHECK,
+                JobNames.DOCKER_SERVER,
+                JobNames.DOCKER_KEEPER,
+                JobNames.INSTALL_TEST_AMD,
+                JobNames.INSTALL_TEST_ARM,
+                JobNames.STATELESS_TEST_RELEASE,
+                JobNames.STATELESS_TEST_AARCH64,
+                JobNames.SIGN_RELEASE,
+                JobNames.SIGN_AARCH64,
+            ]
+        ),
     }  # type: Dict[str, LabelConfig]
 
     TAG_CONFIGS = {
