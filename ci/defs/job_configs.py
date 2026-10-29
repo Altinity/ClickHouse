@@ -76,6 +76,7 @@ common_build_job_config = Job.Config(
     run_in_docker=BINARY_DOCKER_COMMAND,
     timeout=3600 * 4,
     digest_config=build_digest_config,
+    needs_submodules=True,
 )
 
 common_ft_job_config = Job.Config(
@@ -87,11 +88,12 @@ common_ft_job_config = Job.Config(
     # --root/--privileged/--cgroupns=host is required for clickhouse-test --memory-limit
     # --ulimit nofile is raised so that azurite-rs (the in-process Azure Blob
     # Storage emulator) does not run out of file descriptors under parallel load
-    run_in_docker=f"altinityinfra/stateless-test+--memory={LIMITED_MEM}+--cgroupns=host+--cap-add=SYS_PTRACE+--privileged+--security-opt seccomp=unconfined+--ulimit nofile=1048576:1048576+--tmpfs /tmp/clickhouse:mode=1777+--volume=./ci/tmp/var/lib/clickhouse:/var/lib/clickhouse+--volume=./ci/tmp/etc/clickhouse-client:/etc/clickhouse-client+--volume=./ci/tmp/etc/clickhouse-server:/etc/clickhouse-server+--volume=./ci/tmp/etc/clickhouse-server1:/etc/clickhouse-server1+--volume=./ci/tmp/etc/clickhouse-server2:/etc/clickhouse-server2+--volume=./ci/tmp/var/log:/var/log+root+--env=AZURE_STORAGE_KEY=$AZURE_STORAGE_KEY+--env=AZURE_ACCOUNT_NAME=$AZURE_ACCOUNT_NAME+--env=AZURE_CONTAINER_NAME=$AZURE_CONTAINER_NAME+--env=AZURE_STORAGE_ACCOUNT_URL=$AZURE_STORAGE_ACCOUNT_URL+--env=CLICKHOUSE_TEST_STAT_URL=$CLICKHOUSE_TEST_STAT_URL+--env=CLICKHOUSE_TEST_STAT_LOGIN=$CLICKHOUSE_TEST_STAT_LOGIN+--env=CLICKHOUSE_TEST_STAT_PASSWORD=$CLICKHOUSE_TEST_STAT_PASSWORD",
+    run_in_docker=f"altinityinfra/stateless-test+--memory={LIMITED_MEM}+--cgroupns=host+--cap-add=SYS_PTRACE+--privileged+--dns-search='.'+--security-opt seccomp=unconfined+--ulimit nofile=1048576:1048576+--tmpfs /tmp/clickhouse:mode=1777+--volume=./ci/tmp/var/lib/clickhouse:/var/lib/clickhouse+--volume=./ci/tmp/etc/clickhouse-client:/etc/clickhouse-client+--volume=./ci/tmp/etc/clickhouse-server:/etc/clickhouse-server+--volume=./ci/tmp/etc/clickhouse-server1:/etc/clickhouse-server1+--volume=./ci/tmp/etc/clickhouse-server2:/etc/clickhouse-server2+--volume=./ci/tmp/var/log:/var/log+root+--env=AZURE_STORAGE_KEY=$AZURE_STORAGE_KEY+--env=AZURE_ACCOUNT_NAME=$AZURE_ACCOUNT_NAME+--env=AZURE_CONTAINER_NAME=$AZURE_CONTAINER_NAME+--env=AZURE_STORAGE_ACCOUNT_URL=$AZURE_STORAGE_ACCOUNT_URL+--env=CLICKHOUSE_TEST_STAT_URL=$CLICKHOUSE_TEST_STAT_URL+--env=CLICKHOUSE_TEST_STAT_LOGIN=$CLICKHOUSE_TEST_STAT_LOGIN+--env=CLICKHOUSE_TEST_STAT_PASSWORD=$CLICKHOUSE_TEST_STAT_PASSWORD",
     digest_config=Job.CacheDigestConfig(
         include_paths=[
             "./ci/jobs/functional_tests.py",
             "./ci/jobs/scripts/clickhouse_proc.py",
+            "./ci/jobs/scripts/pick_endpoint.py",
             "./ci/jobs/scripts/functional_tests_results.py",
             "./ci/jobs/scripts/functional_tests/setup_log_cluster.sh",
             "./ci/praktika/cidb.py",
@@ -126,6 +128,7 @@ common_stress_job_config = Job.Config(
             "./tests/queries/0_stateless/",
             "./ci/jobs/stress_job.py",
             "./ci/jobs/scripts/clickhouse_proc.py",
+            "./ci/jobs/scripts/pick_endpoint.py",
             "./ci/jobs/scripts/stress/stress.py",
             "./tests/clickhouse-test",
             "./tests/config",
@@ -193,6 +196,7 @@ class JobConfigs:
         run_in_docker="altinityinfra/fasttest+--network=host+--volume=./ci/tmp/var/lib/clickhouse:/var/lib/clickhouse+--volume=./ci/tmp/etc/clickhouse-client:/etc/clickhouse-client+--volume=./ci/tmp/etc/clickhouse-server:/etc/clickhouse-server+--volume=./ci/tmp/var/log:/var/log+--volume=.:/ClickHouse+--env=AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID+--env=AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY",
         digest_config=fast_test_digest_config,
         result_name_for_cidb="Tests",
+        needs_submodules=True,
     )
     darwin_fast_test_jobs = Job.Config(
         name="Darwin fast test",

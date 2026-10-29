@@ -48,6 +48,9 @@ CI_DB_READ_USER: str = ""
 CI_DB_READ_URL: str = os.environ.get("CLICKHOUSE_TEST_STAT_URL", "") + "play"
 
 USE_CUSTOM_GH_AUTH = False
+# NOTE (strtgbb): anonymous submodule fetches of non-tip pins get refused
+# after the burst of ~150 clones; send the ambient gh token instead.
+ENABLE_SUBMODULE_CLONE_AUTH = True
 # SECRET_GH_APP_ID: str = "woolenwolf_gh_app.clickhouse-app-id"
 # SECRET_GH_APP_PEM_KEY: str = "woolenwolf_gh_app.clickhouse-app-key"
 
