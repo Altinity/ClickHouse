@@ -114,6 +114,13 @@ parquet::format::FileMetaData ParquetV3BlockInputFormat::getFileMetadata(Parquet
     }
 }
 
+void ParquetV3BlockInputFormat::prefetch()
+{
+    if (need_only_count)
+        return;
+    initializeIfNeeded();
+}
+
 Chunk ParquetV3BlockInputFormat::read()
 {
     if (need_only_count)
