@@ -149,6 +149,7 @@ if (NOT CMAKE_HOST_SYSTEM_NAME STREQUAL CMAKE_SYSTEM_NAME
             "-DOPENSSL_ROOT_DIR=${OPENSSL_BUILD_DIR}"
             "-DOPENSSL_INCLUDE_DIR=${OPENSSL_BUILD_DIR}/include"
             "-DZLIB_ROOT_DIR=${zlib_source_dir}"
+            "-DZLIB_ENABLE_TESTS=OFF"
             "-DgRPC_SSL_PROVIDER=package"
             # TODO: Bump c-ares
             "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"

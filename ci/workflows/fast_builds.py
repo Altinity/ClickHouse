@@ -19,7 +19,7 @@ BLOCKING_BUILD_JOBS = [
 ]
 
 workflow = Workflow.Config(
-    name="Release Builds",
+    name="Fast Builds",
     event=Workflow.Event.DISPATCH,
     jobs=[
         *[
