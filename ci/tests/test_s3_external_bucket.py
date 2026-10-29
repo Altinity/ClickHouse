@@ -153,7 +153,16 @@ def test_signed_client_uses_the_configured_endpoint(monkeypatch):
     assert client.meta.endpoint_url == "https://s3.example.test"
     assert client.meta.region_name == "example-1"
     assert S3._get_boto3_client(BUCKET) is client
-    assert S3._get_boto3_client(BUCKET, read=True) is not client
+    assert S3._get_boto3_client(BUCKET, read=True) is client
+
+
+def test_forbidden_is_a_miss_only_for_anonymous_reads(monkeypatch, no_credentials):
+    _use_client(monkeypatch, _FakeClient("403"))
+    assert S3.head_object(f"{BUCKET}/prefix/archive") is None
+    monkeypatch.setenv("EXTERNAL_S3_ACCESS_KEY", "key")
+    monkeypatch.setenv("EXTERNAL_S3_SECRET_KEY", "secret")
+    with pytest.raises(ClientError):
+        S3.head_object(f"{BUCKET}/prefix/archive")
 
 
 def test_other_buckets_still_use_the_aws_cli(monkeypatch):

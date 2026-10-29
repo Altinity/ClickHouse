@@ -130,7 +130,7 @@ class _Settings:
     HTML_PAGE_FILE: str = "./ci/praktika/json.html"
     S3_BUCKET_TO_HTTP_ENDPOINT: Optional[Dict[str, str]] = None
     # Non-AWS buckets: {bucket: {endpoint_url, region, access_key_env, secret_key_env, public_read}}
-    # The keys are read from the named env vars; with public_read, reads are unsigned.
+    # The keys are read from the named env vars; with public_read, jobs without them read unsigned.
     S3_EXTERNAL_BUCKETS: Optional[Dict[str, Dict[str, Any]]] = None
     TEXT_CONTENT_EXTENSIONS: Iterable[str] = frozenset([".txt", ".log"])
     # Compress if text file size exceeds this threshold (in MB, 0 - disable compression)

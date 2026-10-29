@@ -67,6 +67,19 @@ class S3:
         return (Settings.S3_EXTERNAL_BUCKETS or {}).get(bucket)
 
     @classmethod
+    def _reads_anonymously(cls, bucket):
+        """Reads of a public_read bucket are unsigned unless this job has the bucket's keys."""
+        config = cls._external_bucket_config(bucket)
+        return bool(
+            config
+            and config.get("public_read")
+            and not (
+                os.environ.get(config["access_key_env"])
+                and os.environ.get(config["secret_key_env"])
+            )
+        )
+
+    @classmethod
     def _get_external_client(cls, bucket, config, anonymous):
         assert BOTO3_AVAILABLE, f"boto3 is required for S3 bucket [{bucket}]"
         client = cls._external_clients.get((bucket, anonymous))
@@ -97,7 +110,7 @@ class S3:
     def _get_boto3_client(cls, bucket=None, read=False):
         config = cls._external_bucket_config(bucket)
         if config:
-            anonymous = read and bool(config.get("public_read"))
+            anonymous = read and cls._reads_anonymously(bucket)
             return cls._get_external_client(bucket, config, anonymous)
         if not BOTO3_AVAILABLE:
             return None
@@ -520,6 +533,9 @@ class S3:
                     "NoSuchKey",
                     "NotFound",
                 ):
+                    return None
+                # A public bucket answers a missing key with 403 to callers who may not list it
+                if e.response.get("Error", {}).get("Code", "") == "403" and cls._reads_anonymously(bucket):
                     return None
                 raise
         else:
