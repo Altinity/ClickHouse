@@ -80,7 +80,11 @@ public:
 
 protected:
     virtual void updateBeforeRead(const ContextPtr &) {}
-    void updateQueryWithJoinToSendIfNeeded(ASTPtr & query_to_send, SelectQueryInfo query_info, const ContextPtr & context);
+    void updateQueryWithJoinToSendIfNeeded(
+        ASTPtr & query_to_send,
+        SelectQueryInfo query_info,
+        const ContextPtr & context,
+        QueryTreeNodePtr * resolved_query_tree = nullptr);
     /// `DataLakeCatalog` tables need this to avoid resolving the catalog table a second time for the header.
     virtual bool canReuseResolvedQueryTreeForHeader() const { return false; }
 
@@ -186,7 +190,8 @@ private:
         ASTPtr & query_to_send,
         const SelectQueryInfo & query_info,
         const QueryTreeInfo & info,
-        const ContextPtr & context);
+        const ContextPtr & context,
+        QueryTreeNodePtr * resolved_query_tree);
 };
 
 
