@@ -63,6 +63,19 @@ INSTALL_PYTHON_REQS_FOR_NATIVE_JOBS = ""
 # after the burst of ~150 clones; send the ambient gh token instead.
 ENABLE_SUBMODULE_CLONE_AUTH = True
 
+# Most runners are in Hetzner (hel1): cache there to avoid AWS egress.
+CI_CACHE_BUCKET = "altinity-builds-cache"
+SUBMODULE_CACHE_S3_PATH = f"{CI_CACHE_BUCKET}/ci_ch_cache"
+S3_EXTERNAL_BUCKETS = {
+    CI_CACHE_BUCKET: {
+        "endpoint_url": "https://hel1.your-objectstorage.com",
+        "region": "hel1",
+        "access_key_env": "HETZNER_S3_ACCESS_KEY",
+        "secret_key_env": "HETZNER_S3_SECRET_KEY",
+        "public_read": True,
+    }
+}
+
 DISABLED_WORKFLOWS = [
     "backport_branches.py",
     "custom_build_praktika.py",
