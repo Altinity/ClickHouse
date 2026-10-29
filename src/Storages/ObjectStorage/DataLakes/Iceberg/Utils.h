@@ -16,6 +16,20 @@
 #include <Poco/JSON/Parser.h>
 
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
+#include <DataTypes/IDataType_fwd.h>
+
+namespace DB::Iceberg
+{
+
+/// Maps a ClickHouse type to an Iceberg JSON type. `timestamp_ns` / `timestamptz_ns`
+/// require `format_version` >= 3; lower versions throw instead of writing v3 types
+/// into v1/v2 metadata.
+std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & iter, UInt64 format_version);
+
+/// Whether two Iceberg type descriptors denote the same type, ignoring the ids of nested fields.
+bool icebergTypesEqualIgnoringIds(Poco::Dynamic::Var old_type, Poco::Dynamic::Var new_type);
+
+}
 
 #if USE_AVRO
 
@@ -93,14 +107,6 @@ Poco::JSON::Object::Ptr getMetadataJSONObject(
     CompressionMethod compression_method,
     const std::optional<String> & table_uuid);
 
-
-/// Maps a ClickHouse type to an Iceberg JSON type. `timestamp_ns` / `timestamptz_ns`
-/// require `format_version` >= 3; lower versions throw instead of writing v3 types
-/// into v1/v2 metadata.
-std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & iter, UInt64 format_version);
-
-/// Whether two Iceberg type descriptors denote the same type, ignoring the ids of nested fields.
-bool icebergTypesEqualIgnoringIds(Poco::Dynamic::Var old_type, Poco::Dynamic::Var new_type);
 
 /// Throws if `type` contains `Nothing` at any depth (the Iceberg `unknown` type) and
 /// `format_version` is below 3, the first format version that defines `unknown`.
