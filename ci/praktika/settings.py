@@ -75,6 +75,12 @@ class _Settings:
     ######################################
     #        CI Cache settings           #
     ######################################
+    # If enabled, Config Workflow creates a content-addressed .git/modules/ archive
+    # in S3. Jobs with needs_submodules=True download it instead of cloning from GitHub.
+    ENABLE_SUBMODULE_CACHE: bool = False
+    # If enabled, submodule clones rewrite github.com URLs with the ambient
+    # GITHUB_TOKEN / gh auth token; otherwise they run anonymously.
+    ENABLE_SUBMODULE_CLONE_AUTH: bool = False
     CACHE_VERSION: int = 1
     CACHE_DIGEST_LEN: int = 20
     CACHE_S3_PATH: str = ""
@@ -171,6 +177,8 @@ _USER_DEFINED_SETTINGS = [
     "CI_DB_READ_USER",
     "CI_DB_READ_URL",
     "TEST_FAILURE_PATTERNS",
+    "ENABLE_SUBMODULE_CACHE",
+    "ENABLE_SUBMODULE_CLONE_AUTH",
 ]
 
 

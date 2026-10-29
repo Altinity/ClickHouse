@@ -126,7 +126,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        SUITE: [aes_encryption, atomic_insert, attach, base_58, clickhouse_keeper_failover,data_types, datetime64_extended_range, disk_level_encryption, dns, engines, example, extended_precision_data_types, functions, jwt_authentication, kafka, kerberos, key_value, lightweight_delete, memory, part_moves_between_shards, selects, session_timezone, settings, version, window_functions]
+        SUITE: [aes_encryption, atomic_insert, attach, base_58, clickhouse_keeper_failover,data_types, datetime64_extended_range, disk_level_encryption, dns, engines, example, extended_precision_data_types, functions, jwt_authentication, kafka, kerberos, key_value, memory, part_moves_between_shards, selects, session_timezone, settings, version, window_functions]
     uses: ./.github/workflows/regression-reusable-suite.yml
     with:
       ref: ${{ inputs.commit }}
@@ -141,6 +141,40 @@ jobs:
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
       job_name: ${{ matrix.SUITE }}
+    secrets: inherit
+
+  LightweightDelete:
+    if: |
+      fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs[0] == null ||
+      contains(fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs, 'common')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - PART: 1
+            FILTER: --only "/lightweight delete/disk space/*"
+          - PART: 2
+            FILTER: --only "/lightweight delete/hard restart/*"
+          - PART: 3
+            FILTER: --skip "/lightweight delete/disk space/*" "/lightweight delete/hard restart/*" "/lightweight delete/alter after delete/*" "/lightweight delete/concurrent alter and delete/*" "/lightweight delete/concurrent delete/*" "/lightweight delete/basic checks/*" "/lightweight delete/performance/*" "/lightweight delete/ontime tests/*"
+          - PART: 4
+            FILTER: --only "/lightweight delete/alter after delete/*" "/lightweight delete/concurrent alter and delete/*" "/lightweight delete/concurrent delete/*" "/lightweight delete/basic checks/*" "/lightweight delete/performance/*" "/lightweight delete/ontime tests/*"
+    uses: ./.github/workflows/regression-reusable-suite.yml
+    with:
+      ref: ${{ inputs.commit }}
+      workflow_config: ${{ inputs.workflow_config }}
+      suite_name: lightweight_delete
+      suite_executable: regression.py
+      output_format: new-fails
+      flags: --with-analyzer
+      timeout_minutes: 300
+      runner_arch: ${{ inputs.arch }}
+      runner_type: ${{ inputs.runner_type }}
+      part: ${{ matrix.PART }}
+      build_sha: ${{ inputs.build_sha }}
+      set_commit_status: true
+      job_name: lightweight_delete
+      extra_args: ${{ matrix.FILTER }}
     secrets: inherit
 
   AggregateFunctions:
@@ -301,6 +335,29 @@ jobs:
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
       job_name: ldap_${{ matrix.SUITE }}
+    secrets: inherit
+
+  OAuth:
+    if: |
+      contains(fromJson(inputs.workflow_config).JOB_KV_DATA.version.string, 'antalya') &&
+      (
+        fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs[0] == null ||
+        contains(fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs, 'oauth')
+      )
+    uses: ./.github/workflows/regression-reusable-suite.yml
+    with:
+      ref: ${{ inputs.commit }}
+      workflow_config: ${{ inputs.workflow_config }}
+      suite_name: oauth
+      suite_executable: regression.py
+      output_format: new-fails
+      flags: --with-analyzer --identity-provider keycloak
+      timeout_minutes: ${{ inputs.timeout_minutes }}
+      runner_arch: ${{ inputs.arch }}
+      runner_type: ${{ inputs.runner_type }}
+      build_sha: ${{ inputs.build_sha }}
+      set_commit_status: true
+      job_name: oauth
     secrets: inherit
 
   Parquet:

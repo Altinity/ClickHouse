@@ -68,6 +68,8 @@ def clone_submodules():
 
     res = Shell.check("git submodule sync", verbose=True, strict=True)
     res = res and Shell.check("git submodule init", verbose=True, strict=True)
+    if os.path.isdir(".git/modules/contrib") and os.listdir(".git/modules/contrib"):
+        print("Submodule cache detected, populating working trees from cache")
     res = res and Shell.check(
         # NOTE: max-procs was 10 before, increased to 20 to speed up checkout.
         # Roll back to 10 if this starts hitting GitHub rate limits.

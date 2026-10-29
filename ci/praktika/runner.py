@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import socket
 import sys
 import traceback
 from pathlib import Path
@@ -69,6 +70,7 @@ class Runner:
             cache_artifacts={},
             cache_jobs={},
             filtered_jobs={},
+            submodule_cache_hash="",
             custom_data={},
         )
         # Extract repository name from git remote (format: owner/repo)
@@ -335,7 +337,47 @@ class Runner:
                     if fallback_artifact.compress_zst:
                         Utils.decompress_file(Path(Settings.INPUT_DIR) / fallback_path)
 
+        if not local_run and job.needs_submodules and Settings.ENABLE_SUBMODULE_CACHE:
+            self._restore_submodule_cache()
+
         return 0
+
+    @staticmethod
+    def _restore_submodule_cache():
+        try:
+            wf_config = RunConfig.from_workflow_data()
+            cache_hash = wf_config.submodule_cache_hash
+            if not cache_hash:
+                print(
+                    "NOTE: No submodule cache hash in workflow config, skipping restore"
+                )
+                return
+            s3_path = f"{Settings.CACHE_S3_PATH}/submodules/{cache_hash}.tar.zst"
+            local_archive = f"{Settings.TEMP_DIR}/submodules_{cache_hash}.tar.zst"
+            print(f"Restoring submodule cache: {s3_path}")
+            S3.copy_file_from_s3(
+                s3_path=s3_path, local_path=local_archive, no_strict=True
+            )
+            if Path(local_archive).exists():
+                if Shell.check(
+                    f"zstd -d {local_archive} --stdout | tar -xf - -C .",
+                    verbose=True,
+                ):
+                    Shell.check(f"rm -f {local_archive}")
+                    print("Submodule cache restored successfully")
+                else:
+                    print("WARNING: Submodule cache extraction failed, cleaning up")
+                    Shell.check("rm -rf .git/modules")
+                    Shell.check(f"rm -f {local_archive}")
+            else:
+                print(
+                    "WARNING: Submodule cache download failed, will clone from GitHub"
+                )
+        except Exception as e:
+            print(
+                f"WARNING: Submodule cache restore failed: {e}, will clone from GitHub"
+            )
+            traceback.print_exc()
 
     def _run(
         self,
@@ -386,6 +428,18 @@ class Runner:
             )
             from_root = "root" in docker_settings
             settings = [s for s in docker_settings if s.startswith("-")]
+            # NOTE (strtgbb): FT/integration docker is not --network=host, so
+            # the runner /etc/hosts mapping for the web-disk proxy is invisible
+            # inside the container. Resolve on the host and pass --add-host.
+            # Skip if the name is not configured on this runner (e.g. CI Tests).
+            _proxy_host = "dockerhub-proxy.dockerhub-proxy-zone"
+            try:
+                _proxy_ip = socket.getaddrinfo(_proxy_host, None)[0][4][0]
+                settings.append(f"--add-host={_proxy_host}:{_proxy_ip}")
+            except OSError as e:
+                print(
+                    f"NOTE: skipping --add-host for {_proxy_host}: {e}"
+                )
             if ":" in job.run_in_docker:
                 docker_name, docker_tag = job.run_in_docker.split(":")
                 print(
