@@ -291,7 +291,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (release)
-      runner_type: altinity-func-tester
+      runner_type: altinity-func-tester, 16c
       data: ${{ needs.RunConfig.outputs.data }}
   FunctionalStatelessTestAarch64:
     needs: [RunConfig, BuilderDebAarch64]
@@ -300,7 +300,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (aarch64)
-      runner_type: altinity-func-tester-aarch64
+      runner_type: altinity-func-tester-aarch64, 16c
       data: ${{ needs.RunConfig.outputs.data }}
   FunctionalStatelessTestAsan:
     needs: [RunConfig, BuilderDebAsan]
@@ -309,7 +309,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (asan)
-      runner_type: altinity-func-tester
+      runner_type: altinity-func-tester, 32g
       data: ${{ needs.RunConfig.outputs.data }}
   FunctionalStatelessTestTsan:
     needs: [RunConfig, BuilderDebTsan]
@@ -318,7 +318,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (tsan)
-      runner_type: altinity-func-tester
+      runner_type: altinity-func-tester, 32g
       data: ${{ needs.RunConfig.outputs.data }}
   FunctionalStatelessTestMsan:
     needs: [RunConfig, BuilderDebMsan]
@@ -327,7 +327,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (msan)
-      runner_type: altinity-func-tester
+      runner_type: altinity-func-tester, 32g
       data: ${{ needs.RunConfig.outputs.data }}
   FunctionalStatelessTestUBsan:
     needs: [RunConfig, BuilderDebUBsan]
@@ -336,7 +336,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (ubsan)
-      runner_type: altinity-func-tester
+      runner_type: altinity-func-tester, 32g
       data: ${{ needs.RunConfig.outputs.data }}
   FunctionalStatelessTestDebug:
     needs: [RunConfig, BuilderDebDebug]
@@ -345,7 +345,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (debug)
-      runner_type: altinity-func-tester
+      runner_type: altinity-func-tester, 16c
       data: ${{ needs.RunConfig.outputs.data }}
 ##############################################################################################
 ######################################### STRESS TESTS #######################################
@@ -405,7 +405,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Integration tests (asan)
-      runner_type: altinity-func-tester
+      runner_type: altinity-func-tester, 16c
       data: ${{ needs.RunConfig.outputs.data }}
   IntegrationTestsAnalyzerAsan:
     needs: [RunConfig, BuilderDebAsan]
@@ -414,7 +414,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Integration tests (asan, old analyzer)
-      runner_type: altinity-func-tester
+      runner_type: altinity-func-tester, 16c
       data: ${{ needs.RunConfig.outputs.data }}
   IntegrationTestsTsan:
     needs: [RunConfig, BuilderDebTsan]
@@ -423,7 +423,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Integration tests (tsan)
-      runner_type: altinity-func-tester
+      runner_type: altinity-func-tester, 16c
       data: ${{ needs.RunConfig.outputs.data }}
   IntegrationTestsRelease:
     needs: [RunConfig, BuilderDebRelease]
@@ -432,7 +432,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Integration tests (release)
-      runner_type: altinity-func-tester
+      runner_type: altinity-func-tester, 16c
       data: ${{ needs.RunConfig.outputs.data }}
 #############################################################################################
 ##################################### REGRESSION TESTS ######################################
