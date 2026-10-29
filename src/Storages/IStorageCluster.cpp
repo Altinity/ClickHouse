@@ -3,6 +3,7 @@
 #include <pcg_random.hpp>
 #include <Common/randomSeed.h>
 
+#include <Analyzer/createUniqueAliasesIfNecessary.h>
 #include <Functions/FunctionsLogical.h>
 #include <Functions/IFunctionAdaptors.h>
 
@@ -737,7 +738,14 @@ void IStorageCluster::read(
         if (canReuseResolvedQueryTreeForHeader() && resolved_query_tree)
             sample_block = InterpreterSelectQueryAnalyzer::getSampleBlock(resolved_query_tree, context, SelectQueryOptions(processed_stage));
         else if (canReuseResolvedQueryTreeForHeader() && query_to_send == query_info.query && query_info.query_tree)
-            sample_block = getHeaderForProcessingStage(column_names, storage_snapshot, query_info, context, processed_stage);
+        {
+            /// A shard re-analyzes this query and `createUniqueAliasesIfNecessary` restarts `__tableN` at 1.
+            /// The resolved tree still has the outer alias (`__table2` when this table is not leftmost).
+            auto query_info_for_header = query_info;
+            query_info_for_header.query_tree = query_info.query_tree->clone();
+            createUniqueAliasesIfNecessary(query_info_for_header.query_tree, context);
+            sample_block = getHeaderForProcessingStage(column_names, storage_snapshot, query_info_for_header, context, processed_stage);
+        }
         else
             sample_block = InterpreterSelectQueryAnalyzer::getSampleBlock(query_to_send, context, SelectQueryOptions(processed_stage));
     }
