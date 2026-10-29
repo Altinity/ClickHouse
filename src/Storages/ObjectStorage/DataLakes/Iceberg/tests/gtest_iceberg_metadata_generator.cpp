@@ -589,14 +589,25 @@ Poco::JSON::Object::Ptr makeMetadataWithAnnotatedField(
     const String & name, const Poco::Dynamic::Var & iceberg_type, bool required, const String & annotation)
 {
     auto metadata = makeMetadataWithField(name, iceberg_type, required);
-    metadata->getArray(f_schemas)->getObject(0)->getArray(f_fields)->getObject(0)->set(f_clickhouse_type, annotation);
+    auto field_id = metadata->getArray(f_schemas)->getObject(0)->getArray(f_fields)->getObject(0)->getValue<Int32>(f_id);
+    Poco::JSON::Object::Ptr properties = new Poco::JSON::Object;
+    properties->set(Iceberg::getClickHouseTypePropertyKey(field_id, /*schema_id=*/ 0), annotation);
+    metadata->set(f_properties, properties);
     return metadata;
+}
+
+std::optional<String> findFieldAnnotation(const Poco::JSON::Object::Ptr & metadata, const String & name, Int32 schema_id)
+{
+    const auto annotations = Iceberg::getClickHouseTypeAnnotations(metadata, schema_id);
+    const auto it = annotations.find(findCurrentFieldValue(metadata, name, f_id).convert<Int32>());
+    if (it == annotations.end())
+        return std::nullopt;
+    return it->second;
 }
 
 std::optional<String> findCurrentFieldAnnotation(const Poco::JSON::Object::Ptr & metadata, const String & name)
 {
-    auto value = findCurrentFieldValue(metadata, name, f_clickhouse_type);
-    return value.isEmpty() ? std::nullopt : std::optional{value.extract<String>()};
+    return findFieldAnnotation(metadata, name, metadata->getValue<Int32>(f_current_schema_id));
 }
 
 void expectModifyRejected(
@@ -1276,10 +1287,23 @@ TEST(IcebergMetadataGenerator, ModifyColumnChangingTheSimpleAggregateFunctionRew
     EXPECT_TRUE(MetadataGenerator(metadata).generateModifyColumnMetadata(
         "s", DataTypeFactory::instance().get("SimpleAggregateFunction(max, UInt64)"), getContext().context));
 
-    const auto after = readSchemaState(metadata);
-    EXPECT_EQ(after.schema_count, before.schema_count + 1);
-    EXPECT_NE(after.current_schema_id, before.current_schema_id);
+    /// The Iceberg schema is the same, so the annotation is rewritten for the current schema id.
+    expectSchemaUnchanged(metadata, before);
     EXPECT_EQ(findCurrentFieldAnnotation(metadata, "s"), "SimpleAggregateFunction(max, UInt64)");
+}
+
+TEST(IcebergMetadataGenerator, ModifyColumnWideningKeepsTheAnnotationOfTheOldSchema)
+{
+    tryRegisterAggregateFunctions();
+    auto metadata
+        = makeMetadataWithAnnotatedField("x", "int", /* required */ true, "SimpleAggregateFunction(max, Int32)");
+
+    EXPECT_TRUE(MetadataGenerator(metadata).generateModifyColumnMetadata(
+        "x", DataTypeFactory::instance().get("SimpleAggregateFunction(max, Int64)"), getContext().context));
+
+    ASSERT_EQ(metadata->getValue<Int32>(f_current_schema_id), 1);
+    EXPECT_EQ(findFieldAnnotation(metadata, "x", 0), "SimpleAggregateFunction(max, Int32)");
+    EXPECT_EQ(findFieldAnnotation(metadata, "x", 1), "SimpleAggregateFunction(max, Int64)");
 }
 
 TEST(IcebergMetadataGenerator, ModifyColumnAddingASimpleAggregateFunctionRecordsTheAnnotation)

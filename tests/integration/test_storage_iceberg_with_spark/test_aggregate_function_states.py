@@ -158,13 +158,16 @@ def test_aggregate_states_round_trip(started_cluster_iceberg_with_spark, storage
         f"{WAREHOUSE}/{TABLE_NAME}/",
     )
 
-    fields = fields_by_name(latest_metadata(TABLE_NAME))
+    metadata = latest_metadata(TABLE_NAME)
+    fields = fields_by_name(metadata)
+    properties = metadata.get("properties", {})
     assert fields["k"]["type"] == "int"
-    assert "clickhouse.type" not in fields["k"]
+    assert metadata["current-schema-id"] == 0
+    assert f"clickhouse.type.{fields['k']['id']}.0" not in properties
     assert fields["u"]["type"] == "binary"
-    assert fields["u"]["clickhouse.type"] == "AggregateFunction(uniq, UInt64)"
+    assert properties[f"clickhouse.type.{fields['u']['id']}.0"] == "AggregateFunction(uniq, UInt64)"
     assert fields["s"]["type"] == "long"
-    assert fields["s"]["clickhouse.type"] == "SimpleAggregateFunction(sum, UInt64)"
+    assert properties[f"clickhouse.type.{fields['s']['id']}.0"] == "SimpleAggregateFunction(sum, UInt64)"
 
 
 @pytest.mark.parametrize("storage_type", ["s3"])

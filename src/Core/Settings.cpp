@@ -8137,12 +8137,12 @@ Allow parsing Iceberg `geometry` and `geography` field types as ClickHouse `Geom
     DECLARE(Bool, allow_experimental_aggregate_function_states_in_open_formats, false, R"(
 Allow `AggregateFunction` states in Parquet files and Iceberg tables, and `SimpleAggregateFunction`
 columns in Iceberg tables. A state is stored as opaque binary, with its ClickHouse type recorded in
-`clickhouse.column_types` (Parquet file metadata) or `clickhouse.type` (Iceberg schema field).
+`clickhouse.column_types` (Parquet file metadata) or `clickhouse.type.<field-id>.<schema-id>` (Iceberg table properties).
 
 Gates both writing such columns and reconstructing their types on read. When enabled, the data, not
 the query, chooses the deserializer for the stored bytes, so keep it disabled for untrusted sources.
-More [in Parquet](/interfaces/formats/Parquet#aggregate-function-states) and
-[in Iceberg](/engines/table-engines/integrations/iceberg#aggregate-function-states).
+More [in Parquet](/reference/formats/Parquet/Parquet#aggregate-function-states) and
+[in Iceberg](/reference/engines/table-engines/integrations/iceberg#aggregate-function-states).
 )", 0) \
     DECLARE(Bool, show_data_lake_catalogs_in_system_tables, false, R"(
 Enables showing data lake catalogs in system tables.

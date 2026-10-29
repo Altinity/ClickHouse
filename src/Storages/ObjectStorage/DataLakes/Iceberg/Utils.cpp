@@ -44,6 +44,7 @@
 #include <Poco/UUIDGenerator.h>
 #include <Common/DateLUT.h>
 #include <Common/quoteString.h>
+#include <Common/StringUtils.h>
 #include <Core/ColumnWithTypeAndName.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Disks/IStoragePolicy.h>
@@ -635,6 +636,81 @@ void checkUnknownTypeAllowed(const String & column_name, const DataTypePtr & typ
         column_name, type->getName(), format_version);
 }
 
+String getClickHouseTypePropertyKey(Int32 field_id, Int32 schema_id)
+{
+    return fmt::format("{}.{}.{}", Iceberg::f_clickhouse_type, field_id, schema_id);
+}
+
+ClickHouseTypeAnnotations getClickHouseTypeAnnotations(const Poco::JSON::Object::Ptr & metadata_object, Int32 schema_id)
+{
+    ClickHouseTypeAnnotations annotations;
+    if (!metadata_object->has(Iceberg::f_properties))
+        return annotations;
+    const auto properties = metadata_object->getObject(Iceberg::f_properties);
+    const String prefix = String(Iceberg::f_clickhouse_type) + ".";
+    /// For each field, the schema id of the entry in effect and its value.
+    std::map<Int32, std::pair<Int32, String>> entries;
+    for (const auto & [key, value] : *properties)
+    {
+        if (!key.starts_with(prefix))
+            continue;
+        /// Only keys whose suffix is `<field-id>.<schema-id>` are annotations
+        const std::string_view suffix = std::string_view(key).substr(prefix.size());
+        const size_t dot = suffix.find('.');
+        Int32 field_id;
+        Int32 entry_schema_id;
+        if (dot == std::string_view::npos || !tryParse(field_id, suffix.substr(0, dot))
+            || !tryParse(entry_schema_id, suffix.substr(dot + 1)) || entry_schema_id > schema_id)
+            continue;
+        auto [it, inserted] = entries.try_emplace(field_id, entry_schema_id, value.extract<String>());
+        if (!inserted && it->second.first < entry_schema_id)
+            it->second = {entry_schema_id, value.extract<String>()};
+    }
+    for (auto & [field_id, entry] : entries)
+    {
+        if (!entry.second.empty())
+            annotations.emplace(field_id, std::move(entry.second));
+    }
+    return annotations;
+}
+
+void setClickHouseTypeAnnotation(Poco::JSON::Object::Ptr metadata_object, Int32 field_id, Int32 schema_id, const String & annotation)
+{
+    const auto key = getClickHouseTypePropertyKey(field_id, schema_id);
+    const auto inherited_annotations = getClickHouseTypeAnnotations(metadata_object, schema_id - 1);
+    const auto inherited = inherited_annotations.find(field_id);
+    const String & inherited_annotation = inherited == inherited_annotations.end() ? String{} : inherited->second;
+    if (annotation == inherited_annotation)
+    {
+        if (metadata_object->has(Iceberg::f_properties))
+            metadata_object->getObject(Iceberg::f_properties)->remove(key);
+        return;
+    }
+
+    if (!metadata_object->has(Iceberg::f_properties))
+        metadata_object->set(Iceberg::f_properties, Poco::JSON::Object::Ptr(new Poco::JSON::Object));
+    metadata_object->getObject(Iceberg::f_properties)->set(key, annotation);
+}
+
+void addIcebergTableSchemasFromMetadata(
+    const Poco::JSON::Object::Ptr & metadata_object, IcebergSchemaProcessor & schema_processor, ContextPtr context)
+{
+    auto add_schema = [&](const Poco::JSON::Object::Ptr & schema)
+    {
+        schema_processor.addIcebergTableSchema(
+            schema, context, getClickHouseTypeAnnotations(metadata_object, schema->getValue<Int32>(f_schema_id)));
+    };
+    /// `schemas` is optional in format version 1, which keeps its only schema in the top-level `schema`.
+    if (!metadata_object->has(f_schemas))
+    {
+        add_schema(parseTableSchemaV1Method(metadata_object).first);
+        return;
+    }
+    auto schemas = metadata_object->getArray(f_schemas);
+    for (UInt32 i = 0; i < schemas->size(); ++i)
+        add_schema(schemas->getObject(i));
+}
+
 /// Returns type and required
 std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & iter, UInt64 format_version)
 {
@@ -779,6 +855,102 @@ std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & ite
         default:
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unsupported type for iceberg {}", type->getName());
     }
+}
+
+namespace
+{
+
+String removeASCIIWhitespace(const String & s)
+{
+    String result;
+    result.reserve(s.size());
+    for (char c : s)
+    {
+        if (!isWhitespaceASCII(c))
+            result.push_back(c);
+    }
+    return result;
+}
+
+/// A missing key matches only a missing key.
+bool optionalBoolsEqual(const Poco::JSON::Object::Ptr & first, const Poco::JSON::Object::Ptr & second, const char * key)
+{
+    const bool first_has = first->has(key);
+    if (first_has != second->has(key))
+        return false;
+    return !first_has || first->getValue<bool>(key) == second->getValue<bool>(key);
+}
+
+}
+
+/// Only the properties that define the type are compared. Field ids are ignored because
+/// `getIcebergType` allocates them from a running counter, so a previous attempt may have written
+/// the very same type with lower ids. Other keys (`doc`, defaults, the `required` that
+/// `getIcebergType` puts on a list) are ignored because other writers emit or omit them freely.
+bool icebergTypesEqualIgnoringIds(Poco::Dynamic::Var old_type, Poco::Dynamic::Var new_type)
+{
+    if (old_type.isString() || new_type.isString())
+    {
+        if (!old_type.isString() || !new_type.isString())
+            return false;
+        /// Writers differ in spacing, e.g. `decimal(10,2)` and `decimal(10, 2)`.
+        return removeASCIIWhitespace(old_type.extract<String>()) == removeASCIIWhitespace(new_type.extract<String>());
+    }
+
+    if (old_type.type() != typeid(Poco::JSON::Object::Ptr) || new_type.type() != typeid(Poco::JSON::Object::Ptr))
+        return false;
+
+    auto old_object = old_type.extract<Poco::JSON::Object::Ptr>();
+    auto new_object = new_type.extract<Poco::JSON::Object::Ptr>();
+    if (!old_object || !new_object)
+        return false;
+
+    if (old_object->has("precision") || new_object->has("precision"))
+    {
+        return old_object->has("precision") && new_object->has("precision")
+            && old_object->getValue<Int32>("precision") == new_object->getValue<Int32>("precision")
+            && old_object->getValue<Int32>("scale") == new_object->getValue<Int32>("scale");
+    }
+
+    if (!old_object->has(Iceberg::f_type) || !new_object->has(Iceberg::f_type))
+        return false;
+    const auto kind = old_object->getValue<String>(Iceberg::f_type);
+    if (kind != new_object->getValue<String>(Iceberg::f_type))
+        return false;
+
+    if (kind == Iceberg::f_list)
+    {
+        return optionalBoolsEqual(old_object, new_object, Iceberg::f_element_required)
+            && icebergTypesEqualIgnoringIds(old_object->get(Iceberg::f_element), new_object->get(Iceberg::f_element));
+    }
+
+    if (kind == Iceberg::f_map)
+    {
+        return optionalBoolsEqual(old_object, new_object, Iceberg::f_value_required)
+            && icebergTypesEqualIgnoringIds(old_object->get(Iceberg::f_key), new_object->get(Iceberg::f_key))
+            && icebergTypesEqualIgnoringIds(old_object->get(Iceberg::f_value), new_object->get(Iceberg::f_value));
+    }
+
+    if (kind == Iceberg::f_struct)
+    {
+        auto old_fields = old_object->getArray(Iceberg::f_fields);
+        auto new_fields = new_object->getArray(Iceberg::f_fields);
+        if (!old_fields || !new_fields || old_fields->size() != new_fields->size())
+            return false;
+        for (UInt32 i = 0; i < old_fields->size(); ++i)
+        {
+            auto old_field = old_fields->getObject(i);
+            auto new_field = new_fields->getObject(i);
+            if (!old_field || !new_field
+                || old_field->getValue<String>(Iceberg::f_name) != new_field->getValue<String>(Iceberg::f_name)
+                || !optionalBoolsEqual(old_field, new_field, Iceberg::f_required)
+                || !icebergTypesEqualIgnoringIds(old_field->get(Iceberg::f_type), new_field->get(Iceberg::f_type)))
+                return false;
+        }
+        return true;
+    }
+
+    return false;
 }
 
 Poco::Dynamic::Var getAvroType(DataTypePtr type, Int32 field_id)
@@ -1270,7 +1442,8 @@ std::pair<Poco::JSON::Object::Ptr, String> createEmptyMetadataFile(
         field->set(Iceberg::f_required, type.second);
         field->set(Iceberg::f_type, type.first);
         if (needsClickHouseTypeAnnotation(column.type))
-            field->set(Iceberg::f_clickhouse_type, getClickHouseTypeAnnotationName(column.type));
+            setClickHouseTypeAnnotation(
+                new_metadata_file_content, iter_for_initial_columns, /*schema_id=*/ 0, getClickHouseTypeAnnotationName(column.type));
         column_name_to_source_id[column.name] = iter_for_initial_columns;
         schema_fields->add(field);
     }

@@ -353,7 +353,8 @@ Poco::JSON::Object::Ptr buildUpdateSchemaRequestBody(
     Poco::JSON::Object::Ptr metadata,
     Poco::JSON::Object::Ptr new_schema,
     Int32 previous_schema_id,
-    Int32 new_last_column_id)
+    Int32 new_last_column_id,
+    Poco::JSON::Object::Ptr previous_properties)
 {
     Poco::JSON::Object::Ptr request_body = new Poco::JSON::Object;
     {
@@ -381,11 +382,14 @@ Poco::JSON::Object::Ptr buildUpdateSchemaRequestBody(
         schema_for_rest->set(IDENTIFIER_FIELD_IDS, empty_identifier_field_ids);
     }
 
+    const auto new_schema_id = new_schema->getValue<Int32>(DB::Iceberg::f_schema_id);
+    /// The change keeps the current schema and touches only the table properties.
+    const bool schema_unchanged = new_schema_id == previous_schema_id;
+
     std::optional<Int32> existing_equivalent_schema_id;
-    if (metadata && metadata->has(DB::Iceberg::f_schemas))
+    if (!schema_unchanged && metadata && metadata->has(DB::Iceberg::f_schemas))
     {
         auto schemas = metadata->getArray(DB::Iceberg::f_schemas);
-        auto new_schema_id = new_schema->getValue<Int32>(DB::Iceberg::f_schema_id);
         for (UInt32 i = 0; i < schemas->size(); ++i)
         {
             auto existing_schema = schemas->getObject(i);
@@ -399,6 +403,36 @@ Poco::JSON::Object::Ptr buildUpdateSchemaRequestBody(
         }
     }
 
+    /// The catalog keeps the id of the equivalent schema, so the ClickHouse type annotations recorded for the new id
+    /// are not sent and the ones in effect for the equivalent schema must already be the same.
+    std::unordered_set<String> skipped_properties;
+    if (existing_equivalent_schema_id.has_value())
+    {
+        const auto fields = DB::Iceberg::IcebergSchemaProcessor::traverseSchema(new_schema->getArray(DB::Iceberg::f_fields));
+        const auto existing_annotations = DB::Iceberg::getClickHouseTypeAnnotations(metadata, *existing_equivalent_schema_id);
+        const auto new_annotations = DB::Iceberg::getClickHouseTypeAnnotations(metadata, new_schema_id);
+        for (const auto & [name, field_id] : fields)
+        {
+            const auto existing_it = existing_annotations.find(static_cast<Int32>(field_id));
+            const auto new_it = new_annotations.find(static_cast<Int32>(field_id));
+            const String existing_annotation = existing_it == existing_annotations.end() ? String{} : existing_it->second;
+            const String new_annotation = new_it == new_annotations.end() ? String{} : new_it->second;
+            if (existing_annotation != new_annotation)
+                throw DB::Exception(
+                    DB::ErrorCodes::NOT_IMPLEMENTED,
+                    "Cannot commit schema {} of table {}.{}: the catalog reuses the equivalent schema {} for it, "
+                    "where column '{}' has ClickHouse type annotation '{}' instead of '{}'",
+                    new_schema_id,
+                    namespace_name,
+                    table_name,
+                    *existing_equivalent_schema_id,
+                    name,
+                    existing_annotation,
+                    new_annotation);
+            skipped_properties.insert(DB::Iceberg::getClickHouseTypePropertyKey(static_cast<Int32>(field_id), new_schema_id));
+        }
+    }
+
     Poco::JSON::Array::Ptr updates = new Poco::JSON::Array;
     if (existing_equivalent_schema_id.has_value())
     {
@@ -407,7 +441,7 @@ Poco::JSON::Object::Ptr buildUpdateSchemaRequestBody(
         set_current_schema->set("schema-id", *existing_equivalent_schema_id);
         updates->add(set_current_schema);
     }
-    else
+    else if (!schema_unchanged)
     {
         {
             Poco::JSON::Object::Ptr add_schema = new Poco::JSON::Object;
@@ -421,6 +455,45 @@ Poco::JSON::Object::Ptr buildUpdateSchemaRequestBody(
             set_current_schema->set("action", "set-current-schema");
             set_current_schema->set("schema-id", -1);
             updates->add(set_current_schema);
+        }
+    }
+
+    if (previous_properties && metadata)
+    {
+        Poco::JSON::Object::Ptr properties
+            = metadata->has(DB::Iceberg::f_properties) ? metadata->getObject(DB::Iceberg::f_properties) : nullptr;
+
+        Poco::JSON::Object::Ptr changed = new Poco::JSON::Object;
+        if (properties)
+        {
+            for (const auto & [key, value] : *properties)
+            {
+                if (skipped_properties.contains(key))
+                    continue;
+                if (!previous_properties->has(key) || previous_properties->get(key).toString() != value.toString())
+                    changed->set(key, value);
+            }
+        }
+        if (changed->size() > 0)
+        {
+            Poco::JSON::Object::Ptr set_properties = new Poco::JSON::Object;
+            set_properties->set("action", "set-properties");
+            set_properties->set("updates", changed);
+            updates->add(set_properties);
+        }
+
+        Poco::JSON::Array::Ptr removed = new Poco::JSON::Array;
+        for (const auto & [key, value] : *previous_properties)
+        {
+            if (!properties || !properties->has(key))
+                removed->add(key);
+        }
+        if (removed->size() > 0)
+        {
+            Poco::JSON::Object::Ptr remove_properties = new Poco::JSON::Object;
+            remove_properties->set("action", "remove-properties");
+            remove_properties->set("removals", removed);
+            updates->add(remove_properties);
         }
     }
 
@@ -2730,6 +2803,12 @@ bool RestCatalog::createTable(
     if (metadata_content->has("format-version"))
         properties->set("format-version", std::to_string(metadata_content->getValue<int>("format-version")));
 
+    if (metadata_content->has(DB::Iceberg::f_properties))
+    {
+        for (const auto & [key, value] : *metadata_content->getObject(DB::Iceberg::f_properties))
+            properties->set(key, value);
+    }
+
     request_body->set("properties", properties);
 
     try
@@ -2802,6 +2881,7 @@ bool RestCatalog::updateSchema(
     Int32 previous_schema_id,
     Int32 new_last_column_id,
     Poco::JSON::Object::Ptr metadata,
+    Poco::JSON::Object::Ptr previous_properties,
     const DB::ForwardedAuthTokenPtr & auth_token) const
 {
     fiu_do_on(DB::FailPoints::iceberg_alter_catalog_update_schema_fail, { return false; });
@@ -2812,7 +2892,7 @@ bool RestCatalog::updateSchema(
     const std::string endpoint = (base_url / state_snapshot->config.prefix / NAMESPACES_ENDPOINT / encodeNamespaceForURI(namespace_name) / "tables" / table_name).generic_string();
 
     auto request_body = buildUpdateSchemaRequestBody(
-        namespace_name, table_name, metadata, new_schema, previous_schema_id, new_last_column_id);
+        namespace_name, table_name, metadata, new_schema, previous_schema_id, new_last_column_id, previous_properties);
 
     try
     {

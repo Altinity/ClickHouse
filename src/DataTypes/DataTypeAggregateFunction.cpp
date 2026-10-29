@@ -694,7 +694,7 @@ bool parquetWriterCouldProduce(const DataTypePtr & annotated, const DataTypePtr 
 
 }
 
-bool annotatedTypeMatchesDerived(const DataTypePtr & annotated_type, const DataTypePtr & derived_type, bool strict)
+bool annotatedTypeMatchesDerived(const DataTypePtr & annotated_type, const DataTypePtr & derived_type)
 {
     auto annotated = removeLowCardinalityAndNullable(annotated_type);
     auto derived = removeLowCardinalityAndNullable(derived_type);
@@ -710,7 +710,7 @@ bool annotatedTypeMatchesDerived(const DataTypePtr & annotated_type, const DataT
             if (!derived_array)
                 return false;
             return annotatedTypeMatchesDerived(
-                assert_cast<const DataTypeArray &>(*annotated).getNestedType(), derived_array->getNestedType(), strict);
+                assert_cast<const DataTypeArray &>(*annotated).getNestedType(), derived_array->getNestedType());
         }
         case TypeIndex::Tuple:
         {
@@ -719,7 +719,7 @@ bool annotatedTypeMatchesDerived(const DataTypePtr & annotated_type, const DataT
             if (!derived_tuple || derived_tuple->getElements().size() != annotated_tuple.getElements().size())
                 return false;
             for (size_t i = 0; i < annotated_tuple.getElements().size(); ++i)
-                if (!annotatedTypeMatchesDerived(annotated_tuple.getElement(i), derived_tuple->getElement(i), strict))
+                if (!annotatedTypeMatchesDerived(annotated_tuple.getElement(i), derived_tuple->getElement(i)))
                     return false;
             return true;
         }
@@ -729,11 +729,11 @@ bool annotatedTypeMatchesDerived(const DataTypePtr & annotated_type, const DataT
             const auto * derived_map = typeid_cast<const DataTypeMap *>(derived.get());
             if (!derived_map)
                 return false;
-            return annotatedTypeMatchesDerived(annotated_map.getKeyType(), derived_map->getKeyType(), strict)
-                && annotatedTypeMatchesDerived(annotated_map.getValueType(), derived_map->getValueType(), strict);
+            return annotatedTypeMatchesDerived(annotated_map.getKeyType(), derived_map->getKeyType())
+                && annotatedTypeMatchesDerived(annotated_map.getValueType(), derived_map->getValueType());
         }
         default:
-            return !strict || parquetWriterCouldProduce(annotated, derived);
+            return parquetWriterCouldProduce(annotated, derived);
     }
 }
 

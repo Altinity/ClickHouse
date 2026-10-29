@@ -10,6 +10,7 @@
 #include "config.h"
 #if USE_AVRO
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #endif
 
 #include <Poco/JSON/Object.h>
@@ -43,13 +44,13 @@ DB::ContextMutablePtr contextWithAggregateFunctionStates(bool allow)
     return context;
 }
 
-void expectAnnotatedSchemaRejected(const Poco::JSON::Object::Ptr & schema)
+void expectAnnotatedSchemaRejected(const Poco::JSON::Object::Ptr & schema, const ClickHouseTypeAnnotations & annotations)
 {
     auto context = contextWithAggregateFunctionStates(true);
     IcebergSchemaProcessor processor(context);
     try
     {
-        processor.addIcebergTableSchema(schema, context);
+        processor.addIcebergTableSchema(schema, context, annotations);
         FAIL() << "The annotation does not describe the field type and must be rejected";
     }
     catch (const DB::Exception & e)
@@ -176,7 +177,7 @@ TEST(IcebergSchemaProcessor, UnknownFieldInSchemaProducesNullableNothing)
 {
     auto schema = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"placeholder","required":false,"type":"unknown"}]})json");
     IcebergSchemaProcessor processor(getContext().context);
-    EXPECT_NO_THROW(processor.addIcebergTableSchema(schema, getContext().context));
+    EXPECT_NO_THROW(processor.addIcebergTableSchema(schema, getContext().context, {}));
 }
 
 TEST(IcebergSchemaProcessor, GetSimpleTypeUnknownThrows)
@@ -200,7 +201,7 @@ TEST(IcebergSchemaProcessor, InitialSchemaTypeWithStringLiteralArgumentThrows)
 {
     auto schema = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"c0","required":false,"type":"MyType('Hello ( world )')"}]})json");
     IcebergSchemaProcessor processor(getContext().context);
-    EXPECT_THROW(processor.addIcebergTableSchema(schema, getContext().context), DB::Exception);
+    EXPECT_THROW(processor.addIcebergTableSchema(schema, getContext().context, {}), DB::Exception);
 }
 
 /// The primitive parser must accept the same inner-whitespace spellings that the
@@ -230,8 +231,8 @@ TEST(IcebergSchemaProcessor, DecimalTypeWhitespaceIsInsensitive)
     auto first = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"c0","required":false,"type":"decimal(20,0)"}]})json");
     auto second = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"c0","required":false,"type":"decimal(20, 0)"}]})json");
     IcebergSchemaProcessor processor(getContext().context);
-    processor.addIcebergTableSchema(first, getContext().context);
-    EXPECT_NO_THROW(processor.addIcebergTableSchema(second, getContext().context));
+    processor.addIcebergTableSchema(first, getContext().context, {});
+    EXPECT_NO_THROW(processor.addIcebergTableSchema(second, getContext().context, {}));
 }
 
 /// A genuinely different type bound to the same schema-id must still be rejected.
@@ -240,8 +241,8 @@ TEST(IcebergSchemaProcessor, RebindingSchemaIdToDifferentTypeStillRejected)
     auto first = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"c0","required":false,"type":"decimal(20,0)"}]})json");
     auto second = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"c0","required":false,"type":"decimal(20,2)"}]})json");
     IcebergSchemaProcessor processor(getContext().context);
-    processor.addIcebergTableSchema(first, getContext().context);
-    EXPECT_THROW(processor.addIcebergTableSchema(second, getContext().context), DB::Exception);
+    processor.addIcebergTableSchema(first, getContext().context, {});
+    EXPECT_THROW(processor.addIcebergTableSchema(second, getContext().context, {}), DB::Exception);
 }
 
 /// The manifest header 'schema' key is only a copy of the table schema at write time; metadata.json
@@ -254,9 +255,9 @@ TEST(IcebergSchemaProcessor, ConflictingManifestSchemaToleratedWhenEnabled)
     auto from_metadata = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"ts","required":false,"type":"timestamptz"}]})json");
     auto from_manifest = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"ts","required":false,"type":"timestamp"}]})json");
     IcebergSchemaProcessor processor(getContext().context);
-    processor.addIcebergTableSchema(from_metadata, getContext().context);
+    processor.addIcebergTableSchema(from_metadata, getContext().context, {});
     EXPECT_NO_THROW(processor.addIcebergTableSchema(
-        from_manifest, getContext().context, IcebergSchemaProcessor::SchemaSource::ManifestFile, /*tolerate_conflicting_manifest_schemas=*/true));
+        from_manifest, getContext().context, {}, IcebergSchemaProcessor::SchemaSource::ManifestFile, /*tolerate_conflicting_manifest_schemas=*/true));
 
     /// The metadata.json copy must win: the field keeps the timestamptz type.
     auto schema = processor.getClickHouseTableSchemaById(0);
@@ -270,10 +271,10 @@ TEST(IcebergSchemaProcessor, ConflictingManifestSchemaRejectedWhenDisabled)
     auto from_metadata = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"ts","required":false,"type":"timestamptz"}]})json");
     auto from_manifest = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"ts","required":false,"type":"timestamp"}]})json");
     IcebergSchemaProcessor processor(getContext().context);
-    processor.addIcebergTableSchema(from_metadata, getContext().context);
+    processor.addIcebergTableSchema(from_metadata, getContext().context, {});
     EXPECT_THROW(
         processor.addIcebergTableSchema(
-            from_manifest, getContext().context, IcebergSchemaProcessor::SchemaSource::ManifestFile, /*tolerate_conflicting_manifest_schemas=*/false),
+            from_manifest, getContext().context, {}, IcebergSchemaProcessor::SchemaSource::ManifestFile, /*tolerate_conflicting_manifest_schemas=*/false),
         DB::Exception);
 }
 
@@ -284,10 +285,10 @@ TEST(IcebergSchemaProcessor, ConflictingMetadataSchemaAlwaysRejected)
     auto first = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"ts","required":false,"type":"timestamptz"}]})json");
     auto second = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"ts","required":false,"type":"timestamp"}]})json");
     IcebergSchemaProcessor processor(getContext().context);
-    processor.addIcebergTableSchema(first, getContext().context);
+    processor.addIcebergTableSchema(first, getContext().context, {});
     EXPECT_THROW(
         processor.addIcebergTableSchema(
-            second, getContext().context, IcebergSchemaProcessor::SchemaSource::Metadata, /*tolerate_conflicting_manifest_schemas=*/true),
+            second, getContext().context, {}, IcebergSchemaProcessor::SchemaSource::Metadata, /*tolerate_conflicting_manifest_schemas=*/true),
         DB::Exception);
 }
 
@@ -298,7 +299,7 @@ TEST(IcebergSchemaProcessor, ManifestSchemaWithNewIdRegistersNormally)
     auto from_manifest = parseSchema(R"json({"schema-id":5,"fields":[{"id":1,"name":"ts","required":false,"type":"timestamp"}]})json");
     IcebergSchemaProcessor processor(getContext().context);
     EXPECT_NO_THROW(processor.addIcebergTableSchema(
-        from_manifest, getContext().context, IcebergSchemaProcessor::SchemaSource::ManifestFile, /*tolerate_conflicting_manifest_schemas=*/true));
+        from_manifest, getContext().context, {}, IcebergSchemaProcessor::SchemaSource::ManifestFile, /*tolerate_conflicting_manifest_schemas=*/true));
     EXPECT_TRUE(processor.hasClickHouseTableSchemaById(5));
 }
 
@@ -312,15 +313,15 @@ TEST(IcebergSchemaProcessor, ManifestHeaderRegisteredFirstIsReplacedByMetadata)
     auto other = parseSchema(R"json({"schema-id":1,"fields":[{"id":1,"name":"ts","required":false,"type":"timestamptz"},{"id":2,"name":"v","required":false,"type":"int"}]})json");
     auto from_metadata = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"ts","required":false,"type":"timestamptz"}]})json");
     IcebergSchemaProcessor processor(getContext().context);
-    processor.addIcebergTableSchema(from_manifest, getContext().context, IcebergSchemaProcessor::SchemaSource::ManifestFile, /*tolerate_conflicting_manifest_schemas=*/true);
-    processor.addIcebergTableSchema(other, getContext().context);
+    processor.addIcebergTableSchema(from_manifest, getContext().context, {}, IcebergSchemaProcessor::SchemaSource::ManifestFile, /*tolerate_conflicting_manifest_schemas=*/true);
+    processor.addIcebergTableSchema(other, getContext().context, {});
 
     /// Populate everything derived from the schema that came from the manifest.
     EXPECT_EQ(processor.getFieldCharacteristics(0, 1).type->getName(), "Nullable(DateTime64(6))");
     auto stale_dag = processor.getSchemaTransformationDagByIds(getContext().context, 0, 1);
     ASSERT_NE(stale_dag, nullptr);
 
-    EXPECT_NO_THROW(processor.addIcebergTableSchema(from_metadata, getContext().context));
+    EXPECT_NO_THROW(processor.addIcebergTableSchema(from_metadata, getContext().context, {}));
 
     auto schema = processor.getClickHouseTableSchemaById(0);
     ASSERT_EQ(schema->size(), 1u);
@@ -331,10 +332,10 @@ TEST(IcebergSchemaProcessor, ManifestHeaderRegisteredFirstIsReplacedByMetadata)
     /// Once metadata.json has settled the schema-id, a later divergent schema from a manifest is handled like
     /// any header conflicting with a known metadata.json copy: ignored when tolerated, rejected otherwise.
     EXPECT_NO_THROW(processor.addIcebergTableSchema(
-        from_manifest, getContext().context, IcebergSchemaProcessor::SchemaSource::ManifestFile, /*tolerate_conflicting_manifest_schemas=*/true));
+        from_manifest, getContext().context, {}, IcebergSchemaProcessor::SchemaSource::ManifestFile, /*tolerate_conflicting_manifest_schemas=*/true));
     EXPECT_THROW(
         processor.addIcebergTableSchema(
-            from_manifest, getContext().context, IcebergSchemaProcessor::SchemaSource::ManifestFile, /*tolerate_conflicting_manifest_schemas=*/false),
+            from_manifest, getContext().context, {}, IcebergSchemaProcessor::SchemaSource::ManifestFile, /*tolerate_conflicting_manifest_schemas=*/false),
         DB::Exception);
     EXPECT_EQ(processor.getClickHouseTableSchemaById(0)->front().type->getName(), "Nullable(DateTime64(6, 'UTC'))");
 }
@@ -347,14 +348,14 @@ TEST(IcebergSchemaProcessor, ManifestHeaderRegisteredFirstIsConfirmedByIdentical
     auto from_metadata = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"ts","required":false,"type":"timestamptz"}]})json");
     auto degraded = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"ts","required":false,"type":"timestamp"}]})json");
     IcebergSchemaProcessor processor(getContext().context);
-    processor.addIcebergTableSchema(from_manifest, getContext().context, IcebergSchemaProcessor::SchemaSource::ManifestFile, /*tolerate_conflicting_manifest_schemas=*/true);
-    EXPECT_NO_THROW(processor.addIcebergTableSchema(from_metadata, getContext().context));
+    processor.addIcebergTableSchema(from_manifest, getContext().context, {}, IcebergSchemaProcessor::SchemaSource::ManifestFile, /*tolerate_conflicting_manifest_schemas=*/true);
+    EXPECT_NO_THROW(processor.addIcebergTableSchema(from_metadata, getContext().context, {}));
 
     EXPECT_NO_THROW(processor.addIcebergTableSchema(
-        degraded, getContext().context, IcebergSchemaProcessor::SchemaSource::ManifestFile, /*tolerate_conflicting_manifest_schemas=*/true));
+        degraded, getContext().context, {}, IcebergSchemaProcessor::SchemaSource::ManifestFile, /*tolerate_conflicting_manifest_schemas=*/true));
     EXPECT_THROW(
         processor.addIcebergTableSchema(
-            degraded, getContext().context, IcebergSchemaProcessor::SchemaSource::ManifestFile, /*tolerate_conflicting_manifest_schemas=*/false),
+            degraded, getContext().context, {}, IcebergSchemaProcessor::SchemaSource::ManifestFile, /*tolerate_conflicting_manifest_schemas=*/false),
         DB::Exception);
     EXPECT_EQ(processor.getClickHouseTableSchemaById(0)->front().type->getName(), "Nullable(DateTime64(6, 'UTC'))");
 }
@@ -368,11 +369,11 @@ TEST(IcebergSchemaProcessor, ConflictingManifestHeadersWithoutMetadataSchemaReje
     auto second = parseSchema(R"json({"schema-id":5,"fields":[{"id":1,"name":"ts","required":false,"type":"timestamptz"}]})json");
     auto other = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"ts","required":false,"type":"timestamptz"}]})json");
     IcebergSchemaProcessor processor(getContext().context);
-    processor.addIcebergTableSchema(other, getContext().context);
-    processor.addIcebergTableSchema(first, getContext().context, IcebergSchemaProcessor::SchemaSource::ManifestFile, /*tolerate_conflicting_manifest_schemas=*/true);
+    processor.addIcebergTableSchema(other, getContext().context, {});
+    processor.addIcebergTableSchema(first, getContext().context, {}, IcebergSchemaProcessor::SchemaSource::ManifestFile, /*tolerate_conflicting_manifest_schemas=*/true);
     try
     {
-        processor.addIcebergTableSchema(second, getContext().context, IcebergSchemaProcessor::SchemaSource::ManifestFile, /*tolerate_conflicting_manifest_schemas=*/true);
+        processor.addIcebergTableSchema(second, getContext().context, {}, IcebergSchemaProcessor::SchemaSource::ManifestFile, /*tolerate_conflicting_manifest_schemas=*/true);
         FAIL() << "expected ICEBERG_SPECIFICATION_VIOLATION";
     }
     catch (const DB::Exception & e)
@@ -389,8 +390,8 @@ TEST(IcebergSchemaProcessor, RebindingSchemaIdToRenamedFieldStillRejected)
     auto first = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"c0","required":false,"type":"long"}]})json");
     auto second = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"c9","required":false,"type":"long"}]})json");
     IcebergSchemaProcessor processor(getContext().context);
-    processor.addIcebergTableSchema(first, getContext().context);
-    EXPECT_THROW(processor.addIcebergTableSchema(second, getContext().context), DB::Exception);
+    processor.addIcebergTableSchema(first, getContext().context, {});
+    EXPECT_THROW(processor.addIcebergTableSchema(second, getContext().context, {}), DB::Exception);
 }
 
 /// The whitespace-insensitive comparison must reach into list/map wrappers: the nested
@@ -403,8 +404,8 @@ TEST(IcebergSchemaProcessor, ListElementDecimalWhitespaceIsInsensitive)
     auto second = parseSchema(
         R"json({"schema-id":0,"fields":[{"id":1,"name":"c0","required":false,"type":{"type":"list","element-id":2,"element-required":false,"element":"decimal(20, 0)"}}]})json");
     IcebergSchemaProcessor processor(getContext().context);
-    processor.addIcebergTableSchema(first, getContext().context);
-    EXPECT_NO_THROW(processor.addIcebergTableSchema(second, getContext().context));
+    processor.addIcebergTableSchema(first, getContext().context, {});
+    EXPECT_NO_THROW(processor.addIcebergTableSchema(second, getContext().context, {}));
 }
 
 /// Same for map key/value primitive types (here map<decimal, decimal>).
@@ -415,8 +416,8 @@ TEST(IcebergSchemaProcessor, MapKeyValueDecimalWhitespaceIsInsensitive)
     auto second = parseSchema(
         R"json({"schema-id":0,"fields":[{"id":1,"name":"c0","required":false,"type":{"type":"map","key-id":2,"key":"decimal(20, 0)","value-id":3,"value-required":false,"value":"decimal(10, 2)"}}]})json");
     IcebergSchemaProcessor processor(getContext().context);
-    processor.addIcebergTableSchema(first, getContext().context);
-    EXPECT_NO_THROW(processor.addIcebergTableSchema(second, getContext().context));
+    processor.addIcebergTableSchema(first, getContext().context, {});
+    EXPECT_NO_THROW(processor.addIcebergTableSchema(second, getContext().context, {}));
 }
 
 /// The Iceberg geography/geometry primitives carry parameters too, e.g.
@@ -428,8 +429,8 @@ TEST(IcebergSchemaProcessor, GeographyTypeWhitespaceIsInsensitive)
     auto first = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"c0","required":false,"type":"geography(C,A)"}]})json");
     auto second = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"c0","required":false,"type":"geography(C, A)"}]})json");
     IcebergSchemaProcessor processor(getContext().context, /*allow_geo_parser_=*/true);
-    processor.addIcebergTableSchema(first, getContext().context);
-    EXPECT_NO_THROW(processor.addIcebergTableSchema(second, getContext().context));
+    processor.addIcebergTableSchema(first, getContext().context, {});
+    EXPECT_NO_THROW(processor.addIcebergTableSchema(second, getContext().context, {}));
 }
 
 /// A geo type string carrying leading/trailing whitespace must map to its alias just like the
@@ -441,8 +442,8 @@ TEST(IcebergSchemaProcessor, GeographyTypeEdgeWhitespaceIsInsensitive)
     auto first = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"c0","required":false,"type":" geography(C,A) "}]})json");
     auto second = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"c0","required":false,"type":"geography(C, A)"}]})json");
     IcebergSchemaProcessor processor(getContext().context, /*allow_geo_parser_=*/true);
-    processor.addIcebergTableSchema(first, getContext().context);
-    EXPECT_NO_THROW(processor.addIcebergTableSchema(second, getContext().context));
+    processor.addIcebergTableSchema(first, getContext().context, {});
+    EXPECT_NO_THROW(processor.addIcebergTableSchema(second, getContext().context, {}));
 }
 
 /// Schema-evolution path: renaming a geo field across two schema-ids while only changing the
@@ -454,8 +455,8 @@ TEST(IcebergSchemaProcessor, RenameGeoFieldAcrossSchemaIdsWithWhitespaceIsRename
     auto old_schema = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"a","required":false,"type":"geography(C,A)"}]})json");
     auto new_schema = parseSchema(R"json({"schema-id":1,"fields":[{"id":1,"name":"b","required":false,"type":"geography(C, A)"}]})json");
     IcebergSchemaProcessor processor(getContext().context, /*allow_geo_parser_=*/true);
-    processor.addIcebergTableSchema(old_schema, getContext().context);
-    processor.addIcebergTableSchema(new_schema, getContext().context);
+    processor.addIcebergTableSchema(old_schema, getContext().context, {});
+    processor.addIcebergTableSchema(new_schema, getContext().context, {});
 
     auto dag = processor.getSchemaTransformationDagByIds(getContext().context, 0, 1);
     ASSERT_TRUE(dag);
@@ -471,7 +472,7 @@ TEST(IcebergSchemaProcessor, InitialSchemaDecimalInnerWhitespaceAccepted)
 {
     auto schema = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"c0","required":false,"type":"decimal( 20, 0 )"}]})json");
     IcebergSchemaProcessor processor(getContext().context);
-    EXPECT_NO_THROW(processor.addIcebergTableSchema(schema, getContext().context));
+    EXPECT_NO_THROW(processor.addIcebergTableSchema(schema, getContext().context, {}));
 }
 
 /// Schema-evolution across two schema-ids where a decimal widens (allowed conversion) while its
@@ -482,8 +483,8 @@ TEST(IcebergSchemaProcessor, WidenDecimalAcrossSchemaIdsWithInnerWhitespace)
     auto old_schema = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"c0","required":false,"type":"decimal(10,2)"}]})json");
     auto new_schema = parseSchema(R"json({"schema-id":1,"fields":[{"id":1,"name":"c0","required":false,"type":"decimal( 20, 2 )"}]})json");
     IcebergSchemaProcessor processor(getContext().context);
-    processor.addIcebergTableSchema(old_schema, getContext().context);
-    processor.addIcebergTableSchema(new_schema, getContext().context);
+    processor.addIcebergTableSchema(old_schema, getContext().context, {});
+    processor.addIcebergTableSchema(new_schema, getContext().context, {});
 
     auto dag = processor.getSchemaTransformationDagByIds(getContext().context, 0, 1);
     ASSERT_TRUE(dag);
@@ -500,8 +501,8 @@ TEST(IcebergSchemaProcessor, RebindingListElementToDifferentTypeStillRejected)
     auto second = parseSchema(
         R"json({"schema-id":0,"fields":[{"id":1,"name":"c0","required":false,"type":{"type":"list","element-id":2,"element-required":false,"element":"decimal(20,2)"}}]})json");
     IcebergSchemaProcessor processor(getContext().context);
-    processor.addIcebergTableSchema(first, getContext().context);
-    EXPECT_THROW(processor.addIcebergTableSchema(second, getContext().context), DB::Exception);
+    processor.addIcebergTableSchema(first, getContext().context, {});
+    EXPECT_THROW(processor.addIcebergTableSchema(second, getContext().context, {}), DB::Exception);
 }
 
 /// Spacing normalization only removes whitespace adjacent to the delimiters '(', ')', '[', ']', ','.
@@ -523,7 +524,7 @@ TEST(IcebergSchemaProcessor, InitialSchemaDecimalMalformedInnerTokenWhitespaceTh
 {
     auto schema = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"c0","required":false,"type":"decimal(2 0,0)"}]})json");
     IcebergSchemaProcessor processor(getContext().context);
-    EXPECT_THROW(processor.addIcebergTableSchema(schema, getContext().context), DB::Exception);
+    EXPECT_THROW(processor.addIcebergTableSchema(schema, getContext().context, {}), DB::Exception);
 }
 
 /// Trailing garbage after the scale token must be rejected. Canonicalizing spacing does not remove
@@ -539,7 +540,7 @@ TEST(IcebergSchemaProcessor, InitialSchemaDecimalTrailingGarbageInScaleThrows)
 {
     auto schema = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"c0","required":false,"type":"decimal(20,0 0)"}]})json");
     IcebergSchemaProcessor processor(getContext().context);
-    EXPECT_THROW(processor.addIcebergTableSchema(schema, getContext().context), DB::Exception);
+    EXPECT_THROW(processor.addIcebergTableSchema(schema, getContext().context, {}), DB::Exception);
 }
 
 /// A new schema-id introduced during evolution is parsed at add time (getSimpleType runs on every
@@ -550,8 +551,8 @@ TEST(IcebergSchemaProcessor, SchemaEvolutionDecimalTrailingGarbageInScaleThrows)
     auto old_schema = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"c0","required":false,"type":"decimal(10,2)"}]})json");
     auto new_schema = parseSchema(R"json({"schema-id":1,"fields":[{"id":1,"name":"c0","required":false,"type":"decimal(20,2 2)"}]})json");
     IcebergSchemaProcessor processor(getContext().context);
-    processor.addIcebergTableSchema(old_schema, getContext().context);
-    EXPECT_THROW(processor.addIcebergTableSchema(new_schema, getContext().context), DB::Exception);
+    processor.addIcebergTableSchema(old_schema, getContext().context, {});
+    EXPECT_THROW(processor.addIcebergTableSchema(new_schema, getContext().context, {}), DB::Exception);
 }
 
 /// A missing scale ("decimal(20,)") or a sign-only scale ("decimal(20,+)") is malformed metadata and
@@ -571,10 +572,10 @@ TEST(IcebergSchemaProcessor, AnnotatedSimpleAggregateFunctionFieldNeedsNoSetting
 {
     tryRegisterAggregateFunctions();
     auto schema = parseSchema(
-        R"json({"schema-id":0,"fields":[{"id":1,"name":"s","required":true,"type":"long","clickhouse.type":"SimpleAggregateFunction(sum, Int64)"}]})json");
+        R"json({"schema-id":0,"fields":[{"id":1,"name":"s","required":true,"type":"long"}]})json");
     auto context = contextWithAggregateFunctionStates(false);
     IcebergSchemaProcessor processor(context);
-    processor.addIcebergTableSchema(schema, context);
+    processor.addIcebergTableSchema(schema, context, {{1, "SimpleAggregateFunction(sum, Int64)"}});
 
     auto columns = processor.getClickHouseTableSchemaById(0);
     ASSERT_EQ(columns->size(), 1u);
@@ -582,24 +583,86 @@ TEST(IcebergSchemaProcessor, AnnotatedSimpleAggregateFunctionFieldNeedsNoSetting
     EXPECT_EQ(columns->front().type->getName(), "SimpleAggregateFunction(sum, Int64)");
 }
 
+TEST(IcebergSchemaProcessor, ChangedAnnotationReparsesIdenticalSchema)
+{
+    tryRegisterAggregateFunctions();
+    const std::string schema_json = R"json({"schema-id":0,"fields":[{"id":1,"name":"s","required":true,"type":"long"}]})json";
+    auto context = contextWithAggregateFunctionStates(false);
+    IcebergSchemaProcessor processor(context);
+
+    processor.addIcebergTableSchema(parseSchema(schema_json), context, {{1, "SimpleAggregateFunction(sum, Int64)"}});
+    EXPECT_EQ(processor.getClickHouseTableSchemaById(0)->front().type->getName(), "SimpleAggregateFunction(sum, Int64)");
+
+    processor.addIcebergTableSchema(parseSchema(schema_json), context, {});
+    EXPECT_EQ(processor.getClickHouseTableSchemaById(0)->front().type->getName(), "Int64");
+    EXPECT_EQ(processor.getFieldCharacteristics(0, 1).type->getName(), "Int64");
+}
+
+TEST(IcebergSchemaProcessor, SchemasKeepTheAnnotationsTheyWereRegisteredWith)
+{
+    tryRegisterAggregateFunctions();
+    auto context = contextWithAggregateFunctionStates(false);
+    IcebergSchemaProcessor processor(context);
+
+    processor.addIcebergTableSchema(
+        parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"s","required":true,"type":"long"}]})json"),
+        context,
+        {{1, "SimpleAggregateFunction(sum, Int64)"}});
+    processor.addIcebergTableSchema(
+        parseSchema(
+            R"json({"schema-id":1,"fields":[{"id":1,"name":"s","required":true,"type":"long"},{"id":2,"name":"t","required":false,"type":"long"}]})json"),
+        context,
+        {});
+
+    EXPECT_EQ(processor.getFieldCharacteristics(0, 1).type->getName(), "SimpleAggregateFunction(sum, Int64)");
+    EXPECT_EQ(processor.getFieldCharacteristics(1, 1).type->getName(), "Int64");
+
+    auto dag = processor.getSchemaTransformationDagByIds(context, 0, 1);
+    ASSERT_EQ(dag->getInputs().size(), 1u);
+    EXPECT_EQ(dag->getInputs().front()->result_type->getName(), "SimpleAggregateFunction(sum, Int64)");
+}
+
 TEST(IcebergSchemaProcessor, AnnotationNotMatchingTheFieldTypeIsRejected)
 {
     tryRegisterAggregateFunctions();
-    expectAnnotatedSchemaRejected(parseSchema(
-        R"json({"schema-id":0,"fields":[{"id":1,"name":"u","required":true,"type":"long","clickhouse.type":"AggregateFunction(uniq, UInt64)"}]})json"));
+    expectAnnotatedSchemaRejected(
+        parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"u","required":true,"type":"long"}]})json"),
+        {{1, "AggregateFunction(uniq, UInt64)"}});
+}
+
+/// Another engine promoted the field from `int` to `long`, leaving the annotation stale.
+TEST(IcebergSchemaProcessor, AnnotationOfAPromotedFieldIsRejected)
+{
+    tryRegisterAggregateFunctions();
+    expectAnnotatedSchemaRejected(
+        parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"s","required":true,"type":"long"}]})json"),
+        {{1, "SimpleAggregateFunction(max, Int32)"}});
+}
+
+/// ClickHouse writes both `Int64` and `UInt64` as `long`.
+TEST(IcebergSchemaProcessor, AnnotationWrittenAsTheSameIcebergTypeIsAccepted)
+{
+    tryRegisterAggregateFunctions();
+    auto schema = parseSchema(
+        R"json({"schema-id":0,"fields":[{"id":1,"name":"s","required":true,"type":"long"}]})json");
+    auto context = contextWithAggregateFunctionStates(false);
+    IcebergSchemaProcessor processor(context);
+    processor.addIcebergTableSchema(schema, context, {{1, "SimpleAggregateFunction(sum, UInt64)"}});
+    EXPECT_EQ(processor.getClickHouseTableSchemaById(0)->front().type->getName(), "SimpleAggregateFunction(sum, UInt64)");
 }
 
 TEST(IcebergSchemaProcessor, RetryAfterRefusedAggregateFunctionStateSchemaSucceeds)
 {
     tryRegisterAggregateFunctions();
     const std::string refused_json
-        = R"json({"schema-id":0,"fields":[{"id":1,"name":"a","required":false,"type":"long"},{"id":2,"name":"u","required":false,"type":"binary","clickhouse.type":"AggregateFunction(uniq, UInt64)"}]})json";
+        = R"json({"schema-id":0,"fields":[{"id":1,"name":"a","required":false,"type":"long"},{"id":2,"name":"u","required":true,"type":"binary"}]})json";
     IcebergSchemaProcessor processor(getContext().context);
+    const ClickHouseTypeAnnotations annotations{{2, "AggregateFunction(uniq, UInt64)"}};
 
     auto refused_context = contextWithAggregateFunctionStates(false);
     try
     {
-        processor.addIcebergTableSchema(parseSchema(refused_json), refused_context);
+        processor.addIcebergTableSchema(parseSchema(refused_json), refused_context, annotations);
         FAIL() << "The annotation names an aggregate function and must be refused without the setting";
     }
     catch (const DB::Exception & e)
@@ -613,8 +676,8 @@ TEST(IcebergSchemaProcessor, RetryAfterRefusedAggregateFunctionStateSchemaSuccee
 
     auto allowed_context = contextWithAggregateFunctionStates(true);
     const std::string allowed_json
-        = R"json({"schema-id":0,"fields":[{"id":1,"name":"a2","required":false,"type":"int"},{"id":2,"name":"u","required":false,"type":"binary","clickhouse.type":"AggregateFunction(uniq, UInt64)"}]})json";
-    ASSERT_NO_THROW(processor.addIcebergTableSchema(parseSchema(allowed_json), allowed_context));
+        = R"json({"schema-id":0,"fields":[{"id":1,"name":"a2","required":false,"type":"int"},{"id":2,"name":"u","required":true,"type":"binary"}]})json";
+    ASSERT_NO_THROW(processor.addIcebergTableSchema(parseSchema(allowed_json), allowed_context, annotations));
     auto columns = processor.getClickHouseTableSchemaById(0);
     ASSERT_EQ(columns->size(), 2u);
     EXPECT_EQ(columns->front().name, "a2");
@@ -625,6 +688,34 @@ TEST(IcebergSchemaProcessor, RetryAfterRefusedAggregateFunctionStateSchemaSuccee
     EXPECT_FALSE(processor.tryGetColumnIDByName(0, "a").has_value());
 }
 
+TEST(IcebergSchemaProcessor, RefusedChangedAnnotationKeepsRegisteredSchema)
+{
+    tryRegisterAggregateFunctions();
+    const std::string schema_json = R"json({"schema-id":0,"fields":[{"id":1,"name":"u","required":true,"type":"binary"}]})json";
+    auto context = contextWithAggregateFunctionStates(false);
+    IcebergSchemaProcessor processor(context);
+
+    processor.addIcebergTableSchema(parseSchema(schema_json), context, {});
+    EXPECT_EQ(processor.getClickHouseTableSchemaById(0)->front().type->getName(), "String");
+
+    try
+    {
+        processor.addIcebergTableSchema(parseSchema(schema_json), context, {{1, "AggregateFunction(uniq, UInt64)"}});
+        FAIL() << "The annotation names an aggregate function and must be refused without the setting";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::SUPPORT_IS_DISABLED) << e.message();
+    }
+
+    ASSERT_TRUE(processor.hasClickHouseTableSchemaById(0));
+    auto columns = processor.getClickHouseTableSchemaById(0);
+    ASSERT_EQ(columns->size(), 1u);
+    EXPECT_EQ(columns->front().type->getName(), "String");
+    EXPECT_EQ(processor.getFieldCharacteristics(0, 1).type->getName(), "String");
+    EXPECT_EQ(processor.tryGetColumnIDByName(0, "u"), 1);
+}
+
 #if USE_AVRO
 TEST(IcebergSchemaProcessor, SkippingTheSchemaNeitherAppliesTheGateNorPublishesTheSchema)
 {
@@ -633,8 +724,8 @@ TEST(IcebergSchemaProcessor, SkippingTheSchemaNeitherAppliesTheGateNorPublishesT
     auto metadata = parser
                         .parse(
                             R"json({"format-version":2,"current-schema-id":0,"schemas":[{"schema-id":0,)json"
-                            R"json("fields":[{"id":1,"name":"u","required":false,"type":"binary",)json"
-                            R"json("clickhouse.type":"AggregateFunction(uniq, UInt64)"}]}]})json")
+                            R"json("fields":[{"id":1,"name":"u","required":true,"type":"binary"}]}],)json"
+                            R"json("properties":{"clickhouse.type.1.0":"AggregateFunction(uniq, UInt64)"}})json")
                         .extract<Poco::JSON::Object::Ptr>();
 
     auto log = getLogger("IcebergSchemaProcessorTest");
@@ -658,5 +749,39 @@ TEST(IcebergSchemaProcessor, SkippingTheSchemaNeitherAppliesTheGateNorPublishesT
     ASSERT_EQ(columns->size(), 1u);
     EXPECT_EQ(columns->front().name, "u");
     EXPECT_EQ(columns->front().type->getName(), "AggregateFunction(uniq, UInt64)");
+}
+
+TEST(IcebergSchemaProcessor, PropertyWithClickHouseTypePrefixButNoFieldIdIsNotAnAnnotation)
+{
+    Poco::JSON::Parser parser;
+    auto metadata = parser
+                        .parse(
+                            R"json({"properties":{"clickhouse.type.comment":"x","clickhouse.type.1":"x",)json"
+                            R"json("clickhouse.type.1.x":"x","clickhouse.type.1.0.1":"x",)json"
+                            R"json("clickhouse.type.1.0":"SimpleAggregateFunction(sum, Int64)"}})json")
+                        .extract<Poco::JSON::Object::Ptr>();
+
+    ClickHouseTypeAnnotations annotations;
+    ASSERT_NO_THROW(annotations = getClickHouseTypeAnnotations(metadata, 0));
+    EXPECT_EQ(annotations, (ClickHouseTypeAnnotations{{1, "SimpleAggregateFunction(sum, Int64)"}}));
+}
+
+TEST(IcebergSchemaProcessor, AnnotationInEffectIsTheOneWithTheGreatestSchemaIdNotAbove)
+{
+    Poco::JSON::Parser parser;
+    auto metadata = parser
+                        .parse(
+                            R"json({"properties":{"clickhouse.type.1.0":"SimpleAggregateFunction(max, Int32)",)json"
+                            R"json("clickhouse.type.1.2":"SimpleAggregateFunction(max, Int64)","clickhouse.type.1.4":"",)json"
+                            R"json("clickhouse.type.2.3":"SimpleAggregateFunction(sum, Int64)"}})json")
+                        .extract<Poco::JSON::Object::Ptr>();
+
+    EXPECT_EQ(getClickHouseTypeAnnotations(metadata, 0), (ClickHouseTypeAnnotations{{1, "SimpleAggregateFunction(max, Int32)"}}));
+    EXPECT_EQ(getClickHouseTypeAnnotations(metadata, 1), (ClickHouseTypeAnnotations{{1, "SimpleAggregateFunction(max, Int32)"}}));
+    EXPECT_EQ(getClickHouseTypeAnnotations(metadata, 2), (ClickHouseTypeAnnotations{{1, "SimpleAggregateFunction(max, Int64)"}}));
+    EXPECT_EQ(
+        getClickHouseTypeAnnotations(metadata, 3),
+        (ClickHouseTypeAnnotations{{1, "SimpleAggregateFunction(max, Int64)"}, {2, "SimpleAggregateFunction(sum, Int64)"}}));
+    EXPECT_EQ(getClickHouseTypeAnnotations(metadata, 4), (ClickHouseTypeAnnotations{{2, "SimpleAggregateFunction(sum, Int64)"}}));
 }
 #endif

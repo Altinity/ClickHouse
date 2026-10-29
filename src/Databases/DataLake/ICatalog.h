@@ -339,6 +339,7 @@ public:
     /// `new_schema` is the full new schema object and `previous_schema_id` is the schema id that the
     /// catalog is expected to currently have - used to build the optimistic-concurrency requirement
     /// (`assert-current-schema-id`) on transactional catalogs (e.g. Iceberg REST).
+    /// `previous_properties` are the table properties before the change.
     /// Returns `false` on a recoverable conflict so the caller can retry, throws otherwise.
     virtual bool updateSchema(
         const String & namespace_name,
@@ -348,6 +349,7 @@ public:
         Int32 previous_schema_id,
         Int32 new_last_column_id,
         Poco::JSON::Object::Ptr metadata,
+        Poco::JSON::Object::Ptr previous_properties,
         const DB::ForwardedAuthTokenPtr & auth_token) const;
 
     /// Drop table from catalog.

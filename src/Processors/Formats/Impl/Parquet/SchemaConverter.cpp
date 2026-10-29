@@ -207,7 +207,7 @@ DataTypePtr SchemaConverter::resolveAnnotatedType(const String & column_name, co
             type_name, column_name, clickhouse_column_types_key, e.message());
     }
 
-    if (!annotatedTypeMatchesDerived(annotated_type, derived_type, /*strict=*/ true))
+    if (!annotatedTypeMatchesDerived(annotated_type, derived_type))
         throw Exception(
             ErrorCodes::INCORRECT_DATA,
             "Parquet file records ClickHouse type {} for column {} in its `{}` metadata, but the "

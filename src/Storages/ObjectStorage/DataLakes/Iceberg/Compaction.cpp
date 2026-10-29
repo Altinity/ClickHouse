@@ -264,6 +264,9 @@ static Plan getPlan(
     plan.initial_metadata_object = initial_metadata_object;
     plan.initial_metadata_path = metadata_file_path;
 
+    /// Register the metadata.json schemas before the manifest headers carry copies of them without the type annotations.
+    addIcebergTableSchemasFromMetadata(initial_metadata_object, *persistent_table_components.schema_processor, context);
+
     std::vector<ProcessedManifestFileEntryPtr> all_positional_delete_files;
     std::unordered_map<Iceberg::IcebergPathFromMetadata, std::shared_ptr<ManifestFilePlan>> manifest_files;
     std::unordered_set<Iceberg::IcebergPathFromMetadata> referenced_file_paths;
@@ -557,6 +560,10 @@ static bool writeConsolidatedManifestFile(
             "Iceberg metadata does not contain a schema entry matching current-schema-id {}",
             current_schema_id);
 
+    /// Register the metadata.json schemas before the manifest headers carry copies of them without the type annotations,
+    /// and so that the partition spec resolution below can query any of them by id.
+    addIcebergTableSchemasFromMetadata(metadata_object, *persistent_table_components.schema_processor, context);
+
     auto partitions_specs = metadata_object->getArray(f_partition_specs);
 
     /// After partition evolution each manifest must be rewritten under the spec its source files used; resolve and cache spec info per spec-id.
@@ -602,10 +609,7 @@ static bool writeConsolidatedManifestFile(
             source_ids.push_back(spec_field->getValue<Int32>(Iceberg::f_source_id));
         }
 
-        /// Derive partition value types from a schema that defines every source column the spec references, preferring the current schema then any historical one; register all schemas first so they can be queried by id.
-        for (UInt32 i = 0; i < schemas->size(); ++i)
-            persistent_table_components.schema_processor->addIcebergTableSchema(schemas->getObject(i), context);
-
+        /// Derive partition value types from a schema that defines every source column the spec references, preferring the current schema then any historical one.
         auto build_sample_block = [&](Int32 schema_id) -> std::optional<Block>
         {
             auto fields_characteristics

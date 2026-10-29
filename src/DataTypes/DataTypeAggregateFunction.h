@@ -113,7 +113,7 @@ bool needsClickHouseTypeAnnotation(const DataTypePtr & type);
 /// Returns an annotation name that preserves explicit aggregate-state versions.
 String getClickHouseTypeAnnotationName(const DataTypePtr & type);
 
-/// Checks an annotation against the schema-derived type. Strict mode also verifies the Parquet mapping.
-bool annotatedTypeMatchesDerived(const DataTypePtr & annotated, const DataTypePtr & derived, bool strict = false);
+/// Checks an annotation against the type derived from a Parquet schema, including the Parquet writer's mapping.
+bool annotatedTypeMatchesDerived(const DataTypePtr & annotated, const DataTypePtr & derived);
 
 }

@@ -99,9 +99,27 @@ Poco::JSON::Object::Ptr getMetadataJSONObject(
 /// into v1/v2 metadata.
 std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & iter, UInt64 format_version);
 
+/// Whether two Iceberg type descriptors denote the same type, ignoring the ids of nested fields.
+bool icebergTypesEqualIgnoringIds(Poco::Dynamic::Var old_type, Poco::Dynamic::Var new_type);
+
 /// Throws if `type` contains `Nothing` at any depth (the Iceberg `unknown` type) and
 /// `format_version` is below 3, the first format version that defines `unknown`.
 void checkUnknownTypeAllowed(const String & column_name, const DataTypePtr & type, Int64 format_version);
+
+/// Table property `clickhouse.type.<field-id>.<schema-id>` records a type Iceberg cannot express for the field,
+/// effective from that schema id until the next property of the field. An empty value records no type.
+String getClickHouseTypePropertyKey(Int32 field_id, Int32 schema_id);
+
+/// The annotations in effect for schema `schema_id`: per field, the property with the greatest schema id not above it.
+ClickHouseTypeAnnotations getClickHouseTypeAnnotations(const Poco::JSON::Object::Ptr & metadata_object, Int32 schema_id);
+
+/// Records `annotation` (empty for none) for `field_id` from schema `schema_id` on. The property is removed
+/// when the field inherits the same annotation from a lower schema id.
+void setClickHouseTypeAnnotation(Poco::JSON::Object::Ptr metadata_object, Int32 field_id, Int32 schema_id, const String & annotation);
+
+/// Registers every schema of the table metadata with the ClickHouse type annotations in effect for it.
+void addIcebergTableSchemasFromMetadata(
+    const Poco::JSON::Object::Ptr & metadata_object, IcebergSchemaProcessor & schema_processor, ContextPtr context);
 
 Poco::Dynamic::Var getAvroType(DataTypePtr type, Int32 field_id);
 Poco::Dynamic::Var getAvroLogicalType(DataTypePtr type);

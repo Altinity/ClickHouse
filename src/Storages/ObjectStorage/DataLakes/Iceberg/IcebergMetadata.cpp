@@ -409,7 +409,8 @@ Int32 IcebergMetadata::parseTableSchema(
     auto add_schema = [&](const Poco::JSON::Object::Ptr & schema)
     {
         if (schema_parsing == SchemaParsing::Parse)
-            schema_processor.addIcebergTableSchema(schema, context_);
+            schema_processor.addIcebergTableSchema(
+                schema, context_, getClickHouseTypeAnnotations(metadata_object, schema->getValue<Int32>(f_schema_id)));
     };
 
     /// v2 and v3 (and later) store schemas in the `schemas` array. Only v1 has a top-level `schema`.
@@ -475,7 +476,8 @@ static Poco::JSON::Object::Ptr traverseMetadataAndFindNecessarySnapshotObject(
         for (UInt32 j = 0; j < schemas->size(); ++j)
         {
             auto schema = schemas->getObject(j);
-            schema_processor->addIcebergTableSchema(schema, local_context);
+            schema_processor->addIcebergTableSchema(
+                schema, local_context, getClickHouseTypeAnnotations(metadata_object, schema->getValue<Int32>(f_schema_id)));
         }
     }
     Poco::JSON::Object::Ptr current_snapshot = nullptr;
@@ -1019,7 +1021,7 @@ static void checkAggregateFunctionStatesAllowed(const String & column_name, cons
     throw Exception(
         ErrorCodes::SUPPORT_IS_DISABLED,
         "Column '{}' has type {}, which Iceberg cannot express natively: the aggregate state is stored as "
-        "binary and its ClickHouse type is recorded in the schema. To allow this, enable setting "
+        "binary and its ClickHouse type is recorded in the table properties. To allow this, enable setting "
         "allow_experimental_aggregate_function_states_in_open_formats",
         column_name,
         type->getName());

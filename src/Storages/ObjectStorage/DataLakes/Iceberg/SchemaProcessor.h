@@ -1,6 +1,7 @@
 #pragma once
 
 
+#include <map>
 #include <memory>
 #include <mutex>
 
@@ -27,6 +28,9 @@ namespace DB::Iceberg
 ColumnMapperPtr createColumnMapperFromFields(Poco::JSON::Array::Ptr fields);
 
 ColumnMapperPtr createColumnMapper(Poco::JSON::Object::Ptr schema_object);
+
+/// ClickHouse type names in effect for the fields of a schema (`clickhouse.type.<field-id>.<schema-id>` table properties), by field id.
+using ClickHouseTypeAnnotations = std::map<Int32, String>;
 
 /**
  * Iceberg supports the following data types (see https://iceberg.apache.org/spec/#schemas-and-data-types):
@@ -102,9 +106,11 @@ public:
     explicit IcebergSchemaProcessor(ContextPtr context_, bool allow_geo_parser_ = false)
         : WithContext(context_), allow_geo_parser(allow_geo_parser_) {}
 
+    /// `clickhouse_type_annotations` are the ones in effect for the schema in the table metadata it belongs to.
     void addIcebergTableSchema(
         Poco::JSON::Object::Ptr schema_ptr,
         ContextPtr context_,
+        const ClickHouseTypeAnnotations & clickhouse_type_annotations,
         SchemaSource source = SchemaSource::Metadata,
         bool tolerate_conflicting_manifest_schemas = false);
     std::shared_ptr<NamesAndTypesList> getClickHouseTableSchemaById(Int32 id);
@@ -120,7 +126,8 @@ public:
     static DataTypePtr getSimpleType(const String & type_name, ContextPtr context_, bool allow_geo_parser = true);
 
     /// The ClickHouse type the reader derives for a top-level schema field.
-    DataTypePtr getClickHouseFieldType(const Poco::JSON::Object::Ptr & field, ContextPtr context_);
+    DataTypePtr getClickHouseFieldType(
+        const Poco::JSON::Object::Ptr & field, const ClickHouseTypeAnnotations & clickhouse_type_annotations, ContextPtr context_);
 
     static std::unordered_map<String, Int64> traverseSchema(Poco::JSON::Array::Ptr schema);
 
@@ -148,28 +155,41 @@ private:
     mutable std::map<std::pair<Int32, Int32>, NameAndTypePair> clickhouse_types_by_source_ids TSA_GUARDED_BY(mutex);
     mutable std::map<std::pair<Int32, std::string>, Int32> clickhouse_ids_by_source_names TSA_GUARDED_BY(mutex);
     std::optional<Int32> current_schema_id TSA_GUARDED_BY(mutex) = 0;
+    /// Per-field lookups of the schema `addIcebergTableSchema` is parsing, installed only once the whole schema parsed.
+    std::map<std::pair<Int32, Int32>, NameAndTypePair> parsed_clickhouse_types_by_source_ids TSA_GUARDED_BY(mutex);
+    std::map<std::pair<Int32, std::string>, Int32> parsed_clickhouse_ids_by_source_names TSA_GUARDED_BY(mutex);
     std::unordered_map<Int64, Int32> schema_id_by_snapshot TSA_GUARDED_BY(mutex);
     /// Schema-ids whose registered copy came from a manifest file header and has not been confirmed
     /// by an identical metadata.json copy yet. Such a copy is replaced when metadata.json binds the
     /// schema-id to a different schema, and two manifest headers disagreeing on such a schema-id is
     /// an error, because no authoritative copy is left to decide between them.
     std::unordered_set<Int32> manifest_sourced_schema_ids TSA_GUARDED_BY(mutex);
+    /// The annotations each registered schema was parsed with.
+    std::unordered_map<Int32, ClickHouseTypeAnnotations> clickhouse_type_annotations_by_schema_ids TSA_GUARDED_BY(mutex);
 
     /// Forget the schema registered for `schema_id` together with everything derived from it: the
     /// per-field lookups and the cached schema transformation DAGs in either direction. They are
     /// keyed by schema-id and never rebuilt once populated, so a stale entry would keep answering.
     void dropCachedSchema(Int32 schema_id) TSA_REQUIRES(mutex);
 
+    /// The subset of `clickhouse_type_annotations` that refers to the fields of `schema`.
+    static ClickHouseTypeAnnotations getClickHouseTypeAnnotationsOfSchema(
+        const Poco::JSON::Object::Ptr & schema, const ClickHouseTypeAnnotations & clickhouse_type_annotations);
+    bool clickHouseTypeAnnotationsUnchanged(Int32 schema_id, const ClickHouseTypeAnnotations & schema_annotations) const
+        TSA_REQUIRES_SHARED(mutex);
+
     NamesAndTypesList getSchemaType(const Poco::JSON::Object::Ptr & schema);
     DataTypePtr getComplexTypeFromObject(
         const Poco::JSON::Object::Ptr & type,
         String & current_full_name,
         ContextPtr context_,
+        const ClickHouseTypeAnnotations & clickhouse_type_annotations,
         bool is_subfield_of_root);
     DataTypePtr getFieldType(
         const Poco::JSON::Object::Ptr & field,
         const String & type_key,
         ContextPtr context_,
+        const ClickHouseTypeAnnotations & clickhouse_type_annotations,
         bool required,
         String & current_full_name = default_link,
         bool is_subfield_of_root = false);
@@ -180,6 +200,8 @@ private:
     std::shared_ptr<ActionsDAG> getSchemaTransformationDag(
         const Poco::JSON::Object::Ptr & old_schema,
         const Poco::JSON::Object::Ptr & new_schema,
+        const ClickHouseTypeAnnotations & old_annotations,
+        const ClickHouseTypeAnnotations & new_annotations,
         ContextPtr context_,
         Int32 old_id,
         Int32 new_id);
