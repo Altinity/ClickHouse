@@ -16,6 +16,7 @@
 #include <Databases/DatabasesCommon.h>
 #include <Databases/IDatabase.h>
 #include <Disks/supportWritingWithAppend.h>
+#include <Disks/DiskObjectStorage/DiskObjectStorage.h>
 #include <IO/SharedThreadPools.h>
 #include <IO/copyData.h>
 #include <Interpreters/ClusterProxy/SelectStreamFactory.h>
@@ -230,11 +231,15 @@ static bool supportTransaction(const Disks & disks, LoggerPtr log)
 {
     for (const auto & disk : disks)
     {
-        if (!supportWritingWithAppend(disk))
-        {
-            LOG_DEBUG(log, "Disk {} does not support writing with append", disk->getName());
-            return false;
-        }
+        if (supportWritingWithAppend(disk))
+            continue;
+        /// A content-addressed disk does not support append, but persists the per-part mutable
+        /// transaction file (txn_version.txt) via its per-ref sidecar, which is all MVCC needs.
+        if (auto * obj = dynamic_cast<DiskObjectStorage *>(disk.get());
+            obj && obj->getMetadataStorage()->supportsTransactionalMutableFiles())
+            continue;
+        LOG_DEBUG(log, "Disk {} does not support transactions", disk->getName());
+        return false;
     }
     return true;
 }
@@ -2742,6 +2747,9 @@ static std::pair<StorageMergeTree::MutableDataPartsVector, std::vector<scope_gua
     for (auto & part: future_parts)
     {
         auto [new_data_part, tmp_dir_holder] = data.createEmptyPart(part.part_info, part.partition, part.part_name, part.metadata_snapshot, txn, std::move(part.patch_part_index));
+        /// Publish the part now, off the parts lock; renameParts then renames it (one owner move on a content-addressed disk)
+        /// instead of Transaction::commit publishing it under the lock.
+        new_data_part->getDataPartStorage().commitTransaction();
         data_parts.first.emplace_back(std::move(new_data_part));
         data_parts.second.emplace_back(std::move(tmp_dir_holder));
     }

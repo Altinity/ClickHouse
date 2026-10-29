@@ -1,21 +1,25 @@
 """Pruning by the Iceberg v3 row lineage columns (`_row_id`, `_last_updated_sequence_number`).
 
-Both columns are derived from file-level metadata, so a filter on them is answerable from the
-manifest alone: a data file holds the row ids `[first_row_id, first_row_id + record_count)` and a
-single `_last_updated_sequence_number` (its data sequence number). That makes the incremental "give
-me everything changed after sequence number N" read - the way row lineage is meant to be consumed -
-a metadata-only file skip, and a `_row_id` point lookup a single-file read.
+Both columns are derived from file-level metadata: a data file inherits the row ids
+`[first_row_id, first_row_id + record_count)` and a single `_last_updated_sequence_number` (its data
+sequence number). That makes the incremental "give me everything changed after sequence number N"
+read - the way row lineage is meant to be consumed - a metadata-only file skip.
 
 The trap these tests guard is the copy-on-write rewrite: a file whose rows carry materialized row
 ids does NOT hold the contiguous range its manifest entry advertises, so pruning it by that range
-drops live rows. See `test_row_lineage.py` for how the values themselves are derived.
+drops live rows. Unless the manifest declares bounds for a lineage column, only the upper end of the
+inherited range bounds a file. See `test_row_lineage.py` for how the values themselves are derived.
 
 NOTE: row lineage is written only by `iceberg-spark-runtime` 1.10.0 and later, see the version
 pinned in `ci/docker/integration/runner/Dockerfile`.
 """
 
+import json
+import os
 import uuid
 
+import avro.datafile
+import avro.io
 import pytest
 
 from helpers.iceberg_utils import (
@@ -25,6 +29,11 @@ from helpers.iceberg_utils import (
     get_creation_expression,
     get_uuid_str,
 )
+
+# The reserved field ids of `_row_id` and `_last_updated_sequence_number`, which a manifest uses to
+# key statistics about them.
+ROW_ID_FIELD_ID = 2147483540
+LAST_UPDATED_SEQUENCE_NUMBER_FIELD_ID = 2147483539
 
 # Both runs must read the same data, so only the metadata-level skip differs between them.
 PRUNING_DISABLED = {
@@ -106,14 +115,15 @@ def test_row_id_filter_prunes_files(started_cluster_iceberg_with_spark, storage_
         == 0
     )
 
-    # A point lookup touches the one file whose row id range contains the value.
+    # Spark writes no lineage statistics for new rows, so a file may hold any row id up to the top of
+    # its block: a point lookup skips only the files whose whole block is below the value.
     assert (
         _pruned_files(
             instance,
             TABLE_NAME,
             f"SELECT id FROM {table_expression} WHERE _row_id = 25 ORDER BY ALL",
         )
-        == 4
+        == 2
     )
 
     # A half-open range keeps the two files above it.
@@ -132,7 +142,7 @@ def test_row_id_filter_prunes_files(started_cluster_iceberg_with_spark, storage_
             TABLE_NAME,
             f"SELECT id FROM {table_expression} WHERE _row_id < 10 ORDER BY ALL",
         )
-        == 4
+        == 0
     )
 
     # A range spanning everything prunes nothing.
@@ -177,7 +187,7 @@ def test_incremental_read_by_sequence_number_prunes_files(
             TABLE_NAME,
             f"SELECT id FROM {table_expression} WHERE _last_updated_sequence_number = 2 ORDER BY ALL",
         )
-        == 4
+        == 1
     )
 
     assert (
@@ -353,6 +363,158 @@ def test_materialized_row_ids_are_not_pruned_away(
     )
 
 
+def _current_manifest_list(table_name):
+    """Path of the current snapshot's manifest list, on the filesystem Spark just wrote it to."""
+    metadata_dir = f"/var/lib/clickhouse/user_files/iceberg_data/default/{table_name}/metadata"
+    with open(os.path.join(metadata_dir, "version-hint.text")) as f:
+        version = f.read().strip()
+    with open(os.path.join(metadata_dir, f"v{version}.metadata.json")) as f:
+        metadata = json.load(f)
+    snapshot = next(
+        entry
+        for entry in metadata["snapshots"]
+        if entry["snapshot-id"] == metadata["current-snapshot-id"]
+    )
+    return snapshot["manifest-list"]
+
+
+def _rewrite_avro(path, patch_record):
+    """Rewrite an avro file in place with `patch_record` applied to each record, preserving the
+    writer schema, the codec and the Iceberg file metadata. Returns how many records it changed, so
+    that a field the writer did not produce fails the test instead of silently patching nothing."""
+    with open(path, "rb") as f:
+        reader = avro.datafile.DataFileReader(f, avro.io.DatumReader())
+        schema = reader.datum_reader.writers_schema
+        file_meta = dict(reader.meta)
+        codec = reader.codec
+        records = list(reader)
+        reader.close()
+
+    patched = sum(1 for record in records if patch_record(record))
+    if patched:
+        with open(path, "wb") as f:
+            writer = avro.datafile.DataFileWriter(
+                f, avro.io.DatumWriter(), schema, codec=codec
+            )
+            for key, value in file_meta.items():
+                if not key.startswith("avro."):
+                    writer.set_meta(key, value)
+            for record in records:
+                writer.append(record)
+            writer.close()
+    return patched
+
+
+@pytest.mark.parametrize("storage_type", ["s3"])
+def test_materialized_row_lineage_without_statistics_is_not_pruned_away(
+    started_cluster_iceberg_with_spark, storage_type
+):
+    instance = started_cluster_iceberg_with_spark.instances["node1"]
+    spark = started_cluster_iceberg_with_spark.spark_session
+    TABLE_NAME = "test_row_lineage_no_lineage_stats_" + storage_type + "_" + get_uuid_str()
+
+    # The rewritten file of `test_materialized_row_ids_are_not_pruned_away`: it keeps the row ids 0..3
+    # and the sequence number 1 of its untouched rows, below its inherited block 4..7 and number 2.
+    spark.sql(
+        f"CREATE TABLE {TABLE_NAME} (id bigint, data string) USING iceberg "
+        f"TBLPROPERTIES ('format-version' = '3', 'write.update.mode' = 'copy-on-write')"
+    )
+    spark.sql(f"INSERT INTO {TABLE_NAME} select id, 'a' from range(0, 4)")
+    spark.sql(f"UPDATE {TABLE_NAME} SET data = 'z' WHERE id = 1")
+
+    lineage_field_ids = (ROW_ID_FIELD_ID, LAST_UPDATED_SEQUENCE_NUMBER_FIELD_ID)
+    sizes_left_for_table_columns = []
+
+    def drop_row_lineage_statistics(record):
+        # Every metric map is optional and a missing id means "unknown", so a writer may keep the
+        # statistics of the table columns and leave out those of the reserved lineage columns.
+        data_file = record["data_file"]
+        dropped = False
+        for name in (
+            "column_sizes",
+            "value_counts",
+            "null_value_counts",
+            "nan_value_counts",
+            "lower_bounds",
+            "upper_bounds",
+        ):
+            stats = data_file.get(name)
+            if stats is None:
+                continue
+            kept = [item for item in stats if item["key"] not in lineage_field_ids]
+            dropped = dropped or len(kept) != len(stats)
+            data_file[name] = kept
+        if dropped:
+            sizes_left_for_table_columns.append(len(data_file["column_sizes"] or []))
+        return dropped
+
+    with open(_current_manifest_list(TABLE_NAME), "rb") as f:
+        reader = avro.datafile.DataFileReader(f, avro.io.DatumReader())
+        data_manifests = [
+            entry["manifest_path"] for entry in reader if entry["content"] == 0
+        ]
+        reader.close()
+
+    # Only the rewritten file has lineage statistics to drop, and it must keep sizes for its table
+    # columns: the manifest then knows about some columns of the file, but nothing about lineage.
+    assert (
+        sum(_rewrite_avro(path, drop_row_lineage_statistics) for path in data_manifests)
+        == 1
+    )
+    assert sizes_left_for_table_columns[0] > 0
+
+    _publish(started_cluster_iceberg_with_spark, storage_type, TABLE_NAME)
+    table_expression = _table_function(
+        started_cluster_iceberg_with_spark, storage_type, TABLE_NAME
+    )
+
+    for row_key in range(4):
+        assert (
+            instance.query(
+                f"SELECT id FROM {table_expression} WHERE _row_id = {row_key}",
+                settings=PRUNING_ENABLED,
+            ).strip()
+            == str(row_key)
+        )
+
+    assert (
+        instance.query(
+            f"SELECT id FROM {table_expression} WHERE _last_updated_sequence_number = 1 ORDER BY ALL",
+            settings=PRUNING_ENABLED,
+        ).strip()
+        == "0\n2\n3"
+    )
+
+    assert (
+        _pruned_files(
+            instance,
+            TABLE_NAME,
+            f"SELECT id FROM {table_expression} WHERE _row_id = 1 ORDER BY ALL",
+        )
+        == 0
+    )
+
+    # Every value the file can hold is still at most the top of its inherited block, so a filter
+    # above it prunes the file.
+    assert (
+        _pruned_files(
+            instance,
+            TABLE_NAME,
+            f"SELECT id FROM {table_expression} WHERE _row_id >= 8 ORDER BY ALL",
+        )
+        == 1
+    )
+
+    assert (
+        _pruned_files(
+            instance,
+            TABLE_NAME,
+            f"SELECT id FROM {table_expression} WHERE _last_updated_sequence_number > 2 ORDER BY ALL",
+        )
+        == 1
+    )
+
+
 # The tests above read what Spark wrote. The ones below prune over metadata ClickHouse wrote itself:
 # the inherited row id range of a manifest entry is only as good as the `first_row_id` the writer put
 # into the manifest list, so the same filters are replayed against a table of its own making.
@@ -390,12 +552,13 @@ def test_row_id_filter_prunes_files_clickhouse(started_cluster_iceberg_with_spar
 
     assert _pruned_files(instance, TABLE_NAME, f"SELECT id FROM {TABLE_NAME} ORDER BY ALL") == 0
 
-    # A point lookup touches the one file whose row id range contains the value.
+    # No lineage statistics are written for new rows, so a point lookup skips only the files whose
+    # whole block is below the value.
     assert (
         _pruned_files(
             instance, TABLE_NAME, f"SELECT id FROM {TABLE_NAME} WHERE _row_id = 25 ORDER BY ALL"
         )
-        == 4
+        == 2
     )
 
     # A half-open range keeps the two files above it.
@@ -410,7 +573,7 @@ def test_row_id_filter_prunes_files_clickhouse(started_cluster_iceberg_with_spar
         _pruned_files(
             instance, TABLE_NAME, f"SELECT id FROM {TABLE_NAME} WHERE _row_id < 10 ORDER BY ALL"
         )
-        == 4
+        == 0
     )
 
     # A range spanning everything prunes nothing.
@@ -448,7 +611,7 @@ def test_incremental_read_by_sequence_number_prunes_files_clickhouse(
             TABLE_NAME,
             f"SELECT id FROM {TABLE_NAME} WHERE _last_updated_sequence_number = 2 ORDER BY ALL",
         )
-        == 4
+        == 1
     )
 
     assert (

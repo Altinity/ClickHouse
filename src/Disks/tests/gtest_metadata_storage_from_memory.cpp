@@ -22,8 +22,25 @@
 namespace fs = std::filesystem;
 using namespace DB;
 
+namespace DB::ErrorCodes
+{
+    extern const int LOGICAL_ERROR;
+}
+
 namespace
 {
+
+/// Reaches the protected queue of `DiskObjectStorageTransaction` to plant the deferred operation that
+/// `addOperation` never queues on an eager storage. Never instantiated; it only names the member.
+struct QueueProbe : DiskObjectStorageTransaction
+{
+    static void plantDeferredOperation(const DiskTransactionPtr & tx)
+    {
+        auto * object_tx = dynamic_cast<DiskObjectStorageTransaction *>(tx.get());
+        ASSERT_TRUE(object_tx);
+        (object_tx->*(&QueueProbe::operations_to_execute)).emplace_back([](MetadataTransactionPtr) {});
+    }
+};
 
 std::shared_ptr<MetadataStorageFromMemory> makeWritableStorage()
 {
@@ -420,6 +437,37 @@ TEST(MetadataStorageFromMemory, TransientBuildStateDetection)
     EXPECT_EQ(takePendingOwnRemovals(tx), std::vector<String>{"blobs/dropped"});
 }
 
+struct LocalDiskUnderTest
+{
+    std::shared_ptr<LocalObjectStorage> object_storage;
+    std::shared_ptr<DiskObjectStorage> disk;
+};
+
+/// A `DiskObjectStorage` over a local object storage under `dir`. Its constructor starts a
+/// `BlobKillerThread` on the global context's schedule pool, whose threads live in the global thread
+/// pool for the rest of the process.
+static LocalDiskUnderTest makeDiskOverLocal(const String & dir)
+{
+    LocalDiskUnderTest result;
+    result.object_storage = std::make_shared<LocalObjectStorage>(
+        LocalObjectStorageSettings("test", dir + "blobs", /*read_only_=*/false));
+    DiskPtr metadata_disk = std::make_shared<DiskLocal>("metadata_disk", dir + "metadata");
+    MetadataStoragePtr metadata_storage = std::make_shared<MetadataStorageFromDisk>(
+        metadata_disk, "/", result.object_storage->createKeyGenerator(),
+        /*persist_removal_queue_=*/false, /*removal_log_compaction_threshold_=*/1000);
+
+    std::unordered_map<Location, LocationInfo> cluster_registry = {{"main", {true, true, ""}}};
+    std::unordered_map<Location, ObjectStoragePtr> object_storage_registry = {{"main", result.object_storage}};
+
+    ClusterConfigurationPtr cluster = std::make_shared<ClusterConfiguration>("local_blobs", std::move(cluster_registry));
+    ObjectStorageRouterPtr object_storages = std::make_shared<ObjectStorageRouter>(std::move(object_storage_registry));
+
+    Poco::AutoPtr<Poco::Util::XMLConfiguration> config(new Poco::Util::XMLConfiguration());
+    result.disk = std::make_shared<DiskObjectStorage>(
+        "local_blobs", std::move(cluster), std::move(metadata_storage), std::move(object_storages), nullptr, *config, "");
+    return result;
+}
+
 /// A real disk transaction bound to a memory metadata storage: uploads hit the real object
 /// storage, metadata applies immediately.
 class DiskObjectStorageOverMemoryMetadataTest : public ::testing::Test
@@ -430,23 +478,9 @@ protected:
         temp_dir = std::make_unique<Poco::TemporaryFile>();
         temp_dir->createDirectories();
 
-        const String dir = temp_dir->path() + "/";
-        object_storage = std::make_shared<LocalObjectStorage>(
-            LocalObjectStorageSettings("test", dir + "blobs", /*read_only_=*/false));
-        DiskPtr metadata_disk = std::make_shared<DiskLocal>("metadata_disk", dir + "metadata");
-        MetadataStoragePtr metadata_storage = std::make_shared<MetadataStorageFromDisk>(
-            metadata_disk, "/", object_storage->createKeyGenerator(),
-            /*persist_removal_queue_=*/false, /*removal_log_compaction_threshold_=*/1000);
-
-        std::unordered_map<Location, LocationInfo> cluster_registry = {{"main", {true, true, ""}}};
-        std::unordered_map<Location, ObjectStoragePtr> object_storage_registry = {{"main", object_storage}};
-
-        ClusterConfigurationPtr cluster = std::make_shared<ClusterConfiguration>("local_blobs", std::move(cluster_registry));
-        ObjectStorageRouterPtr object_storages = std::make_shared<ObjectStorageRouter>(std::move(object_storage_registry));
-
-        Poco::AutoPtr<Poco::Util::XMLConfiguration> config(new Poco::Util::XMLConfiguration());
-        disk = std::make_shared<DiskObjectStorage>(
-            "local_blobs", std::move(cluster), std::move(metadata_storage), std::move(object_storages), nullptr, *config, "");
+        auto under_test = makeDiskOverLocal(temp_dir->path() + "/");
+        object_storage = std::move(under_test.object_storage);
+        disk = std::move(under_test.disk);
     }
 
     size_t countBlobs() const
@@ -653,3 +687,74 @@ TEST_F(DiskObjectStorageOverMemoryMetadataTest, UndoRemovesRewrittenBlobs)
     tx->undo();
     EXPECT_EQ(countBlobs(), 0u);
 }
+
+/// An eager storage must never see a queued operation at commit: both commit entry points fail closed
+/// with LOGICAL_ERROR in release builds and abort under DEBUG_OR_SANITIZER_BUILD.
+#ifndef DEBUG_OR_SANITIZER_BUILD
+TEST_F(DiskObjectStorageOverMemoryMetadataTest, CommitRefusesQueuedOperationOnEagerStorage)
+{
+    auto wrapped = disk->wrapWithMemoryMetadata();
+    ASSERT_TRUE(wrapped->getMetadataStorage()->appliesOperationsEagerly());
+    auto tx = wrapped->createTransaction();
+    QueueProbe::plantDeferredOperation(tx);
+
+    try
+    {
+        tx->commit();
+        FAIL() << "commit accepted a queued operation on an eager storage";
+    }
+    catch (const Exception & e)
+    {
+        EXPECT_EQ(e.code(), ErrorCodes::LOGICAL_ERROR);
+        EXPECT_NE(e.message().find("must not queue deferred operations"), String::npos) << e.message();
+    }
+}
+
+TEST_F(DiskObjectStorageOverMemoryMetadataTest, TryCommitRefusesQueuedOperationOnEagerStorage)
+{
+    auto wrapped = disk->wrapWithMemoryMetadata();
+    auto tx = wrapped->createTransaction();
+    QueueProbe::plantDeferredOperation(tx);
+
+    try
+    {
+        tx->tryCommit(NoCommitOptions{});
+        FAIL() << "tryCommit accepted a queued operation on an eager storage";
+    }
+    catch (const Exception & e)
+    {
+        EXPECT_EQ(e.code(), ErrorCodes::LOGICAL_ERROR);
+        EXPECT_NE(e.message().find("must not queue deferred operations"), String::npos) << e.message();
+    }
+}
+#else
+/// Not the fixture: a death test runs before every other suite, and a `DiskObjectStorage` built in the
+/// parent would leave the global schedule pool's threads in the global thread pool for the whole run,
+/// so `ThreadPool.GlobalFull1`'s `global_pool.wait()` never returns. The disk exists only in the child
+/// that dies.
+TEST(DiskObjectStorageOverMemoryMetadataDeathTest, CommitRefusesQueuedOperationOnEagerStorageAborts)
+{
+    EXPECT_DEATH(
+        {
+            Poco::TemporaryFile temp_dir;
+            temp_dir.createDirectories();
+            auto tx = makeDiskOverLocal(temp_dir.path() + "/").disk->wrapWithMemoryMetadata()->createTransaction();
+            QueueProbe::plantDeferredOperation(tx);
+            tx->commit();
+        },
+        "must not queue deferred operations");
+}
+
+TEST(DiskObjectStorageOverMemoryMetadataDeathTest, TryCommitRefusesQueuedOperationOnEagerStorageAborts)
+{
+    EXPECT_DEATH(
+        {
+            Poco::TemporaryFile temp_dir;
+            temp_dir.createDirectories();
+            auto tx = makeDiskOverLocal(temp_dir.path() + "/").disk->wrapWithMemoryMetadata()->createTransaction();
+            QueueProbe::plantDeferredOperation(tx);
+            tx->tryCommit(NoCommitOptions{});
+        },
+        "must not queue deferred operations");
+}
+#endif
