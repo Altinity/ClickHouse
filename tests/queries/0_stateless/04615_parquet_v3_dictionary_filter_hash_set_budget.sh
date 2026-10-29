@@ -11,6 +11,11 @@
 # watermark would keep pruning; if it regresses to an overestimate (say, back to the hash-table
 # model this replaced, ~4 cells per value plus the vector), the looser watermark would stop
 # pruning. Either flip changes `rows_read` and fails this test.
+#
+# NOTE: The pruning reservation only sees the BloomFilterBlocksOrDictionary stage's share of
+# `input_format_parquet_memory_high_watermark` (about 10% on this branch; see `ReadManager`), not
+# the whole watermark, so the "affords" values below are looser than the same numbers would be on
+# a build with a larger stage fraction.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -47,7 +52,7 @@ echo "generous memory budget: the dictionary filter prunes row group 1, only 163
 run 4000000000 "select count() from file('${DATA_FILE}', Parquet) where category = 5"
 
 echo "watermark that affords the hash vectors: the dictionary filter still prunes, only 16384 rows are read"
-run 6000000 "select count() from file('${DATA_FILE}', Parquet) where category = 5"
+run 10000000 "select count() from file('${DATA_FILE}', Parquet) where category = 5"
 
 echo "watermark just below what the value set needs: pruning must be skipped, all 32768 rows are read"
 run 4000000 "select count() from file('${DATA_FILE}', Parquet) where category = 5"
@@ -58,7 +63,7 @@ run 1 "select count() from file('${DATA_FILE}', Parquet) where category = 5"
 echo "results are identical regardless of the memory budget"
 diff \
     <(${CH} --input_format_parquet_memory_high_watermark=4000000000 --query="select category, count(), sum(n) from file('${DATA_FILE}', Parquet) where category in (5, 100007, 100, 116383) group by category order by category") \
-    <(${CH} --input_format_parquet_memory_high_watermark=6000000 --query="select category, count(), sum(n) from file('${DATA_FILE}', Parquet) where category in (5, 100007, 100, 116383) group by category order by category") \
+    <(${CH} --input_format_parquet_memory_high_watermark=10000000 --query="select category, count(), sum(n) from file('${DATA_FILE}', Parquet) where category in (5, 100007, 100, 116383) group by category order by category") \
     && echo "OK"
 
 # The extra default-value hash added under `input_format_null_as_default`: row group 0 holds 4096
@@ -93,7 +98,7 @@ run 4000000000 "select count() from file('${NULLS_FILE}', Parquet, 'n UInt64, ca
 # vector, so appending would not change the behavior here. It is pinned by a `chassert` in
 # `hashDictionaryValues` instead, which every debug and sanitizer build checks on this very query.
 echo "null_as_default, watermark that affords the hash vectors: the null-free row group is still pruned"
-run 1100000 "select count() from file('${NULLS_FILE}', Parquet, 'n UInt64, category Int32') where category = 0" --input_format_null_as_default=1
+run 2000000 "select count() from file('${NULLS_FILE}', Parquet, 'n UInt64, category Int32') where category = 0" --input_format_null_as_default=1
 
 echo "null_as_default, watermark just below what the value set needs: pruning is skipped, all 8704 rows are read"
 run 975000 "select count() from file('${NULLS_FILE}', Parquet, 'n UInt64, category Int32') where category = 0" --input_format_null_as_default=1
