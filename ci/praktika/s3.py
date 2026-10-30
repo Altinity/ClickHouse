@@ -18,6 +18,7 @@ try:
     from botocore import UNSIGNED
     from botocore.config import Config
     from botocore.exceptions import ClientError, NoCredentialsError
+    from boto3.s3.transfer import TransferConfig
 
     BOTO3_AVAILABLE = True
 except ImportError:
@@ -84,8 +85,13 @@ class S3:
         assert BOTO3_AVAILABLE, f"boto3 is required for S3 bucket [{bucket}]"
         client = cls._external_clients.get((bucket, anonymous))
         if client is None:
+            client_config = {
+                "max_pool_connections": config.get("download_concurrency", 10)
+            }
             if anonymous:
-                credentials = {"config": Config(signature_version=UNSIGNED)}
+                credentials = {
+                    "config": Config(signature_version=UNSIGNED, **client_config)
+                }
             else:
                 access_key = os.environ.get(config["access_key_env"], "")
                 secret_key = os.environ.get(config["secret_key_env"], "")
@@ -96,6 +102,7 @@ class S3:
                 credentials = {
                     "aws_access_key_id": access_key,
                     "aws_secret_access_key": secret_key,
+                    "config": Config(**client_config),
                 }
             client = boto3.client(
                 "s3",
@@ -451,7 +458,17 @@ class S3:
 
                     def _download():
                         client = cls._get_boto3_client(bucket, read=True)
-                        client.download_file(bucket, key, str(local_file))
+                        concurrency = (cls._external_bucket_config(bucket) or {}).get(
+                            "download_concurrency"
+                        )
+                        client.download_file(
+                            bucket,
+                            key,
+                            str(local_file),
+                            Config=TransferConfig(max_concurrency=concurrency)
+                            if concurrency
+                            else None,
+                        )
 
                     # Retry on transient credential failures
                     cls._retry_on_no_credentials(_download)
