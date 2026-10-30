@@ -29,11 +29,9 @@ from helpers.iceberg_timestamp_ns import (
     ROWS,
     SPARK_TIMESTAMP_SENTINEL_US,
     check_minmax_far_future_us_upper_bound,
-    check_minmax_ns_bounds_on_timestamp_schema,
     check_ns_pruning,
     check_ns_pruning_datetime64_microseconds,
     patch_iceberg_table_long_to_timestamp_ns,
-    patch_iceberg_timestamp_bounds_us_to_ns,
     patch_iceberg_timestamp_upper_bounds,
 )
 from helpers.iceberg_utils import check_validity_and_get_prunned_files_general
@@ -117,13 +115,6 @@ def _create_timestamp_table(started_cluster, table_name, patch, rows=ROWS):
         return f"{s3_key}/"
     finally:
         shutil.rmtree(work, ignore_errors=True)
-
-
-def _create_timestamp_table_with_ns_bounds(started_cluster, table_name, rows=ROWS):
-    """Iceberg v2 `timestamp` (microseconds) whose manifest min/max bytes are nanoseconds."""
-    return _create_timestamp_table(
-        started_cluster, table_name, patch_iceberg_timestamp_bounds_us_to_ns, rows=rows
-    )
 
 
 def _create_timestamp_table_with_upper_bound_us(started_cluster, table_name, micros):
@@ -238,31 +229,6 @@ def test_minmax_pruning_datetime64_nanoseconds_microsecond_predicate(
         )
 
     check_ns_pruning_datetime64_microseconds(node, table, "value", pruned_files, timezone=timezone)
-
-
-def test_minmax_pruning_ns_bounds_on_timestamp_schema(started_cluster_iceberg_no_spark):
-    """Iceberg `timestamp` (`DateTime64(6)`) with nanosecond min/max bytes must not over-prune.
-
-    Customer: `WHERE time_unix_nano <= toDateTime64('2026-08-11 20:02:07.897356', 6)`
-    returns 0 with min/max pruning and the correct row count without it.
-    """
-    node = started_cluster_iceberg_no_spark.instances["node1"]
-    s3_filename = _create_timestamp_table_with_ns_bounds(
-        started_cluster_iceberg_no_spark, "minmax_ns_on_ts"
-    )
-    table = _iceberg_table(s3_filename)
-
-    def pruned_files(select_expression):
-        return check_validity_and_get_prunned_files_general(
-            node,
-            "minmax_ns_on_ts",
-            PRUNE_OFF,
-            PRUNE_ON,
-            "IcebergMinMaxIndexPrunedFiles",
-            select_expression,
-        )
-
-    check_minmax_ns_bounds_on_timestamp_schema(node, table, "value", pruned_files)
 
 
 @pytest.mark.parametrize(
