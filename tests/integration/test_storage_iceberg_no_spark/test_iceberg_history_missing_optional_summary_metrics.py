@@ -81,17 +81,21 @@ def test_iceberg_history_missing_optional_summary_metrics(
                 del summary[field]
                 removed += 1
     assert removed > 0, "no optional summary metric was removed: the fixture is vacuous"
+    stripped_snapshot_ids = ", ".join(
+        str(snap["snapshot-id"]) for snap in meta["snapshots"]
+    )
 
     # A NEW metadata version, never an in-place rewrite: metadata JSON is cached
     # (`use_iceberg_metadata_files_cache` defaults to 1), so an in-place edit of the
     # already-read version is not re-read and this test would pass without the fix.
     _write_next_metadata(instance, table_name, meta, prev)
 
-    # This is the statement from the bug report. `IcebergMetadata::optimize` calls
-    # `getHistory` before `compactIcebergTable`, so the summary is read here for both
-    # format versions and only the compaction that follows it is v2-only. On the cloud
-    # build `OPTIMIZE` is gated by a member flag rather than this setting and that path
-    # never calls `getHistory` at all.
+    # This is the statement from the bug report; it must not fail on the stripped
+    # summary. `IcebergMetadata::optimize` rejects format version 1 up front, and for
+    # version 2 without live position deletes it runs bin-pack compaction, which commits
+    # a new `replace` snapshot without calling `getHistory`. On the cloud build
+    # `OPTIMIZE` is gated by a member flag rather than this setting and that path never
+    # calls `getHistory` at all.
     is_cloud = instance.query(
         "SELECT value FROM system.build_options WHERE name = 'CLICKHOUSE_CLOUD'"
     ).strip()
@@ -105,11 +109,12 @@ def test_iceberg_history_missing_optional_summary_metrics(
         assert (
             "Can not convert empty value" not in message
         ), f"OPTIMIZE hit the missing-optional-summary-metric conversion: {message}"
-        # Anything else must be one of the two known post-`getHistory` rejections,
-        # otherwise an unrelated failure would pass this check silently.
+        # Anything else must be one of the two known rejections, otherwise an unrelated
+        # failure would pass this check silently.
         tolerated = is_cloud == "1" or (
             format_version == 1
-            and "Compaction is supported only for format_version 2" in message
+            and "OPTIMIZE TABLE is supported only for Iceberg format_version 2"
+            in message
         )
         assert tolerated, f"OPTIMIZE failed unexpectedly: {message}"
 
@@ -122,13 +127,17 @@ def test_iceberg_history_missing_optional_summary_metrics(
     # `append` snapshot, so a stripped summary reports them as 0 while the previous,
     # unstripped version reports a non-zero byte count. Without this, reading the older
     # metadata file would satisfy every other assertion here.
+    #
+    # Only the stripped snapshots are counted: a successful v2 `OPTIMIZE` adds its own
+    # `replace` snapshot with a complete summary.
     counters = (
         instance.query(
             f"SELECT count(), "
             f"countIf(summary['added-files-size'] = '0'), "
             f"countIf(summary['changed-partition-count'] = '0') "
             f"FROM system.iceberg_history "
-            f"WHERE database = 'default' AND table = '{table_name}' FORMAT TSV"
+            f"WHERE database = 'default' AND table = '{table_name}' "
+            f"AND snapshot_id IN ({stripped_snapshot_ids}) FORMAT TSV"
         )
         .strip()
         .split("\t")
