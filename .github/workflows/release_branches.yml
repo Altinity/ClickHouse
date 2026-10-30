@@ -259,6 +259,26 @@ jobs:
           docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
           sudo rm -fr "$TEMP_PATH"
 
+  GrypeScanServer:
+    needs: [DockerServerImages]
+    strategy:
+      fail-fast: false
+      matrix:
+        suffix: ['', '-alpine']
+    uses: ./.github/workflows/grype_scan.yml
+    secrets: inherit
+    with:
+      docker_image: altinityinfra/clickhouse-server
+      tag-suffix: ${{ matrix.suffix }}
+
+  GrypeScanKeeper:
+      needs: [DockerServerImages]
+      uses: ./.github/workflows/grype_scan.yml
+      secrets: inherit
+      with:
+        docker_image: altinityinfra/clickhouse-keeper
+
+
 ############################################################################################
 ##################################### BUILD REPORTER #######################################
 ############################################################################################
