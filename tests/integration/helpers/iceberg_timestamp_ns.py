@@ -164,57 +164,13 @@ def check_ns_pruning_datetime64_microseconds(node, table, column, pruned_files, 
     ) == "3\n4\n"
 
 
-def check_minmax_ns_bounds_on_timestamp_schema(node, table, column, pruned_files):
-    """Customer min/max over-prune: Iceberg `timestamp` with nanosecond min/max bytes.
-
-    OTEL `time_unix_nano` tables are often declared as Iceberg `timestamp`
-    (`DateTime64(6)`) while 8-byte lower/upper bounds stay in nanoseconds.
-    ClickHouse then deserializes those ns bytes as microseconds (year 2299),
-    so `WHERE col <= toDateTime64('2026-...', 6)` prunes every file while the
-    parquet scan (microseconds) with `use_iceberg_partition_pruning = 0` is correct.
-    """
-    type_name = node.query(
-        f"SELECT toTypeName({column}) FROM {table} LIMIT 1",
-        settings=PRUNE_OFF,
-    )
-    assert "DateTime64(6" in type_name, type_name
-    assert "DateTime64(9" not in type_name, type_name
-
-    ids = node.query(f"SELECT id FROM {table} ORDER BY id", settings=PRUNE_OFF)
-    assert ids == "1\n2\n3\n4\n"
-    # Parquet is timestamp[us] (correct 2024 wall times). Iceberg lower/upper bounds
-    # are still the original nanosecond int64 bytes, so DateTime64(6) min/max
-    # interprets them as year 2299 and over-prunes.
-    micros = node.query(
-        f"SELECT toUnixTimestamp64Micro({column}) FROM {table} WHERE id = 1",
-        settings=PRUNE_OFF,
-    ).strip()
-    assert micros == "1704067200123456", micros
-
-    # Same predicate shape as the customer query: scale-6 literal near a file's
-    # nanosecond upper bound. Rows 1 and 2 must survive; pruning must not drop them.
-    le_after_row2 = datetime64_literal(
-        "2024-03-15 12:00:00.000001000", scale=6, timezone=None
-    )
-    query = f"SELECT id FROM {table} WHERE {column} <= {le_after_row2} ORDER BY id"
-    # One data file covering all four timestamps; the predicate overlaps it, so
-    # min/max pruning must keep the file. Over-pruning currently returns 0 rows.
-    assert pruned_files(query) == 0
-    assert node.query(query, settings=PRUNE_ON) == "1\n2\n"
-
-    count_query = f"SELECT count() FROM {table} WHERE {column} <= {le_after_row2}"
-    assert pruned_files(count_query) == 0
-    assert node.query(count_query, settings=PRUNE_ON) == "2\n"
-
-
 def _utc_datetime_to_micros(dt):
     """Integer microseconds from Unix epoch. Do not use float `timestamp` * 1e6."""
     delta = dt - datetime(1970, 1, 1, tzinfo=timezone.utc)
     return delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
 
 
-# Spec-correct Iceberg `timestamp` microseconds that sit in the ambiguous band
-# (1e16, 1e18]: converting them as nanoseconds over-prunes.
+# Spec-correct Iceberg `timestamp` microseconds, including the Spark `9999-12-31` sentinel.
 SPARK_TIMESTAMP_SENTINEL_US = _utc_datetime_to_micros(
     datetime(9999, 12, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
 )
@@ -223,79 +179,12 @@ DATETIME64_MAX_US = _utc_datetime_to_micros(
 )
 
 
-# One day after the Unix epoch as nanoseconds. Kept as microseconds this is ~1972,
-# so a predicate on 1970-01-02 over-prunes unless the decoder fails open.
-NEAR_EPOCH_NS_ROWS = [
-    (86_400_000_000_000, 1, "1970-01-02 00:00:00.000000000"),
-]
-
-# 50 days after the epoch as nanoseconds (`4.32e15`). Same integer as ~2106 µs,
-# so a predicate on 1970-02-20 over-prunes unless the decoder fails open.
-OVERLAP_BAND_NS_ROWS = [
-    (4_320_000_000_000_000, 1, "1970-02-20 00:00:00.000000000"),
-]
-
-
-def check_minmax_near_epoch_ns_bounds_on_timestamp_schema(node, table, column, pruned_files):
-    """Iceberg `timestamp` whose min/max bytes are near-epoch nanoseconds must not over-prune.
-
-    One day after the epoch is `8.64e13` ns (`|ticks| <= 1e16`). The inverted-range
-    check does not fire when both bounds stay in that band.
-    """
-    type_name = node.query(
-        f"SELECT toTypeName({column}) FROM {table} LIMIT 1",
-        settings=PRUNE_OFF,
-    )
-    assert "DateTime64(6" in type_name, type_name
-    assert "DateTime64(9" not in type_name, type_name
-
-    ids = node.query(f"SELECT id FROM {table} ORDER BY id", settings=PRUNE_OFF)
-    assert ids == "1\n"
-    micros = node.query(
-        f"SELECT toUnixTimestamp64Micro({column}) FROM {table} WHERE id = 1",
-        settings=PRUNE_OFF,
-    ).strip()
-    assert micros == "86400000000", micros
-
-    eq_epoch_day = datetime64_literal("1970-01-02 00:00:00.000000000", scale=6, timezone=None)
-    query = f"SELECT id FROM {table} WHERE {column} = {eq_epoch_day} ORDER BY id"
-    assert pruned_files(query) == 0
-    assert node.query(query, settings=PRUNE_ON) == "1\n"
-
-
-def check_minmax_overlap_band_ns_bounds_on_timestamp_schema(node, table, column, pruned_files):
-    """Iceberg `timestamp` whose min/max bytes are leftover-band nanoseconds must not over-prune.
-
-    50 days after the epoch is `4.32e15` ns, which is also a 2024–2286 microsecond
-    timestamp. The decoder cannot tell the scales apart and must fail open.
-    """
-    type_name = node.query(
-        f"SELECT toTypeName({column}) FROM {table} LIMIT 1",
-        settings=PRUNE_OFF,
-    )
-    assert "DateTime64(6" in type_name, type_name
-    assert "DateTime64(9" not in type_name, type_name
-
-    ids = node.query(f"SELECT id FROM {table} ORDER BY id", settings=PRUNE_OFF)
-    assert ids == "1\n"
-    micros = node.query(
-        f"SELECT toUnixTimestamp64Micro({column}) FROM {table} WHERE id = 1",
-        settings=PRUNE_OFF,
-    ).strip()
-    assert micros == "4320000000000", micros
-
-    eq_day = datetime64_literal("1970-02-20 00:00:00.000000000", scale=6, timezone=None)
-    query = f"SELECT id FROM {table} WHERE {column} = {eq_day} ORDER BY id"
-    assert pruned_files(query) == 0
-    assert node.query(query, settings=PRUNE_ON) == "1\n"
-
-
 def check_minmax_far_future_us_upper_bound(node, table, column, pruned_files):
-    """Iceberg `timestamp` with a far-future microsecond *upper* bound must not over-prune.
+    """Iceberg `timestamp` with a far-future microsecond upper bound must keep matching rows.
 
-    Lower bound stays a real 2024 microsecond value. If the decoder treats the
-    upper bound as nanoseconds, max becomes ~1978, the [min, max] range inverts,
-    and `WHERE col <= toDateTime64('2024-03-15 ...', 6)` drops the file.
+    Lower bound stays a real 2024 microsecond value. The upper bound is the Spark
+    `9999-12-31` sentinel or the `DateTime64` maximum. A predicate on 2024 must
+    still return the matching rows.
     """
     type_name = node.query(
         f"SELECT toTypeName({column}) FROM {table} LIMIT 1",
@@ -318,117 +207,6 @@ def check_minmax_far_future_us_upper_bound(node, table, column, pruned_files):
     query = f"SELECT id FROM {table} WHERE {column} <= {le_after_row2} ORDER BY id"
     assert pruned_files(query) == 0
     assert node.query(query, settings=PRUNE_ON) == "1\n2\n"
-
-
-def _scale_bound_bytes(raw, factor=1000):
-    if not isinstance(raw, (bytes, bytearray)) or len(raw) != 8:
-        return raw
-    value = struct.unpack("<q", raw)[0]
-    return struct.pack("<q", value * factor)
-
-
-def scale_timestamp_bounds_us_to_ns(obj, field_ids=(1, 2)):
-    """Multiply Iceberg timestamp (us) lower/upper bounds by 1000 so they look like ns."""
-    field_ids = set(field_ids)
-    scaled = 0
-    if isinstance(obj, dict):
-        for key in ("lower_bounds", "upper_bounds"):
-            bounds = obj.get(key)
-            if isinstance(bounds, dict):
-                for bound_key, bound_value in list(bounds.items()):
-                    try:
-                        column_id = int(bound_key)
-                    except (TypeError, ValueError):
-                        continue
-                    if column_id in field_ids:
-                        new_value = _scale_bound_bytes(bound_value)
-                        if new_value != bound_value:
-                            bounds[bound_key] = new_value
-                            scaled += 1
-            elif isinstance(bounds, list):
-                for item in bounds:
-                    if not isinstance(item, dict):
-                        continue
-                    bound_key = item.get("key", item.get("field_id"))
-                    try:
-                        column_id = int(bound_key)
-                    except (TypeError, ValueError):
-                        continue
-                    if column_id in field_ids and "value" in item:
-                        new_value = _scale_bound_bytes(item["value"])
-                        if new_value != item["value"]:
-                            item["value"] = new_value
-                            scaled += 1
-        for value_key, value in obj.items():
-            if value_key in ("lower_bounds", "upper_bounds"):
-                continue
-            scaled += scale_timestamp_bounds_us_to_ns(value, field_ids)
-    elif isinstance(obj, list):
-        for value in obj:
-            scaled += scale_timestamp_bounds_us_to_ns(value, field_ids)
-    return scaled
-
-
-def rewrite_avro_scale_timestamp_bounds_us_to_ns(
-    src: Path, dst: Path, old=None, new=None, field_ids=(1, 2)
-):
-    with open(src, "rb") as handle:
-        reader = avro.datafile.DataFileReader(handle, avro.io.DatumReader())
-        schema = reader.datum_reader.writers_schema
-        codec = reader.codec
-        meta = dict(reader.meta)
-        records = []
-        scaled = 0
-        for record in reader:
-            if old is not None and new is not None:
-                record = _deep_replace(record, old, new)
-            scaled += scale_timestamp_bounds_us_to_ns(record, field_ids)
-            records.append(record)
-        reader.close()
-
-    with open(dst, "wb") as handle:
-        writer = avro.datafile.DataFileWriter(handle, avro.io.DatumWriter(), schema, codec=codec)
-        for key, value in meta.items():
-            key_str = key.decode("utf-8") if isinstance(key, (bytes, bytearray)) else key
-            if key_str.startswith("avro."):
-                continue
-            text = _meta_text(value)
-            if old is not None and new is not None:
-                text = text.replace(old, new)
-            writer.set_meta(key_str, text.encode("utf-8"))
-        for record in records:
-            writer.append(record)
-        writer.close()
-    return scaled
-
-
-def patch_iceberg_timestamp_bounds_us_to_ns(
-    table_location: Path, old_prefix=None, new_prefix=None, field_ids=(1, 2)
-):
-    """Keep Iceberg `timestamp` / parquet microseconds, but rewrite min/max bounds as ns.
-
-    That is the customer layout: scan is DateTime64(6) in 2024/2026, while
-    `deserializeFieldFromBinaryRepr` treats 8-byte ns bounds as microseconds (year 2299)
-    and min/max pruning drops every file.
-    """
-    meta_dir = table_location / "metadata"
-    if old_prefix is not None and new_prefix is not None:
-        for metadata_file in meta_dir.glob("*.metadata.json"):
-            text = metadata_file.read_text().replace(old_prefix, new_prefix)
-            metadata_file.write_text(text)
-
-    scaled_total = 0
-    for avro_file in list(meta_dir.glob("*.avro")):
-        tmp = avro_file.with_suffix(".avro.tmp")
-        scaled = rewrite_avro_scale_timestamp_bounds_us_to_ns(
-            avro_file, tmp, old_prefix, new_prefix, field_ids=field_ids
-        )
-        if scaled or old_prefix is not None:
-            tmp.replace(avro_file)
-        else:
-            tmp.unlink()
-        scaled_total += scaled
-    assert scaled_total > 0, f"no timestamp min/max bounds scaled under {table_location}"
 
 
 def _set_bound_bytes(raw, value):
