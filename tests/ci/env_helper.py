@@ -15,6 +15,7 @@ TEMP_PATH = os.getenv("TEMP_PATH", p.abspath(p.join(module_dir, "./tmp")))
 REPORT_PATH = f"{TEMP_PATH}/reports"
 # FIXME: latest should not be used in CI, set temporary for transition to "docker with digest as a tag"
 DOCKER_TAG = os.getenv("DOCKER_TAG", "latest")
+DOCKER_PASSWORD = os.getenv("DOCKER_PASSWORD")
 CACHES_PATH = os.getenv("CACHES_PATH", TEMP_PATH)
 CLOUDFLARE_TOKEN = os.getenv("CLOUDFLARE_TOKEN")
 GITHUB_EVENT_PATH = os.getenv("GITHUB_EVENT_PATH", "")
@@ -37,6 +38,11 @@ S3_ARTIFACT_DOWNLOAD_TEMPLATE = (
     f"{S3_DOWNLOAD}/{S3_BUILDS_BUCKET}/"
     "{pr_or_release}/{commit}/{build_name}/{artifact}"
 )
+CLICKHOUSE_TEST_STAT_LOGIN = os.getenv("CLICKHOUSE_TEST_STAT_LOGIN")
+CLICKHOUSE_TEST_STAT_PASSWORD = os.getenv("CLICKHOUSE_TEST_STAT_PASSWORD")
+CLICKHOUSE_TEST_STAT_URL = os.getenv("CLICKHOUSE_TEST_STAT_URL")
+DOCKER_PASSWORD = os.getenv("DOCKER_PASSWORD")
+ROBOT_TOKEN = os.getenv("ROBOT_TOKEN")
 
 # These parameters are set only on demand, and only once
 _GITHUB_JOB_ID = ""

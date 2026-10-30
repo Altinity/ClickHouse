@@ -8,6 +8,11 @@ env:
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  CLICKHOUSE_TEST_STAT_LOGIN: ${{ secrets.CLICKHOUSE_TEST_STAT_LOGIN }}
+  CLICKHOUSE_TEST_STAT_PASSWORD: ${{ secrets.CLICKHOUSE_TEST_STAT_PASSWORD }}
+  CLICKHOUSE_TEST_STAT_URL: ${{ secrets.CLICKHOUSE_TEST_STAT_URL }}
+  DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+  ROBOT_TOKEN: ${{ secrets.ROBOT_TOKEN }}
 
 name: Build ClickHouse
 'on':
@@ -54,7 +59,7 @@ jobs:
     if: ${{ contains(fromJson(inputs.data).jobs_data.jobs_to_do, inputs.build_name) || inputs.force }}
     env:
       GITHUB_JOB_OVERRIDDEN: Build-${{inputs.build_name}}
-    runs-on: [self-hosted, altinity-setup-builder, altinity-type-ccx53, altinity-on-demand, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04]
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
