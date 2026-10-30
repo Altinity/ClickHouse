@@ -893,7 +893,8 @@ void ContentAddressedMetadataStorage::startup()
     {
         Cas::sweepOwnMountStaging(
             *object_storage,
-            physicalKey(view.pool_prefix + "/staging/" + server_root_id) + "/");
+            physicalKey(Cas::Layout(view.pool_prefix).stagingPrefix(server_root_id)),
+            pool->liveWriterEpoch());
     }
 
     /// The background GC scheduler runs only on the disk-factory path (context non-null) and when
@@ -1354,7 +1355,12 @@ String ContentAddressedMetadataStorage::stagingKeyPrefix() const
 {
     /// This is the writer-owned `staging/<server_root_id>/` subtree. `store` throws `INVALID_STATE`
     /// when no pool is published; every writer caller runs after `startup`.
-    return physicalKey(store()->poolConfig().pool_prefix + "/staging/" + server_root_id);
+    return physicalKey(store()->layout().stagingPrefix(server_root_id));
+}
+
+String ContentAddressedMetadataStorage::stagingKey(uint64_t writer_epoch, const String & leaf) const
+{
+    return physicalKey(store()->layout().stagingKey(server_root_id, writer_epoch, leaf));
 }
 
 /// ==== namespace mapping ====
