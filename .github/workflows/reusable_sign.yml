@@ -116,14 +116,14 @@ jobs:
           ${{secrets.secret_envs}}
           DOCKER_TAG<<DOCKER_JSON
           ${{ toJson(fromJson(inputs.data).docker_data.images) }}
+          DOCKER_JSON
           TEMP_PATH=${{runner.temp}}/signed
           REPORTS_PATH=${{runner.temp}}/reports_dir
-          DOCKER_JSON
           EOF
       - name: Common setup
         uses: ./.github/actions/common_setup
         with:
-          job_type: test
+          job_type: signed
       - name: Docker setup
         uses: ./.github/actions/docker_setup
       - name: Setup batch
@@ -160,7 +160,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{inputs.test_name}} signed-hashes
-          path: ${{ env.TEMP_PATH }}/*.gpg
+          path: |
+            ${{ env.TEMP_PATH }}/*.gpg
+            ${{ env.TEMP_PATH }}/signing_pubkey.asc
       - name: Clean
         if: always()
         uses: ./.github/actions/clean
