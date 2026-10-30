@@ -17,7 +17,7 @@ ENV LANG=en_US.UTF-8 \
     TZ=UTC \
     CLICKHOUSE_CONFIG=/etc/clickhouse-server/config.xml
 
-COPY --from=glibc-donor /lib/linux-gnu/libc.so.6 /lib/linux-gnu/libdl.so.2 /lib/linux-gnu/libm.so.6 /lib/linux-gnu/libpthread.so.0 /lib/linux-gnu/librt.so.1 /lib/linux-gnu/libnss_dns.so.2 /lib/linux-gnu/libnss_files.so.2 /lib/linux-gnu/libresolv.so.2 /lib/linux-gnu/ld-2.31.so /lib/
+COPY --from=glibc-donor /lib/linux-gnu/libc.so.6 /lib/linux-gnu/libdl.so.2 /lib/linux-gnu/libm.so.6 /lib/linux-gnu/libpthread.so.0 /lib/linux-gnu/librt.so.1 /lib/linux-gnu/libnss_dns.so.2 /lib/linux-gnu/libnss_files.so.2 /lib/linux-gnu/libresolv.so.2 /lib/linux-gnu/ld-2.35.so /lib/
 COPY --from=glibc-donor /etc/nsswitch.conf /etc/
 COPY docker_related_config.xml /etc/clickhouse-server/config.d/
 COPY entrypoint.sh /entrypoint.sh
