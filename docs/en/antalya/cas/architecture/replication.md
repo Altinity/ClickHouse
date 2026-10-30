@@ -69,7 +69,7 @@ sequenceDiagram
 | 4 | The receiver trusts nothing from the wire but the entry list | The sender's manifest id, namespace and payload digest are ignored; the target namespace and ref come from the receiver's own router, and manifest path hygiene is validated at decode |
 | 5 | The confirm is I/O-free and fail-closed | A cold, evicted, unfenced or terminal mount answers `Unknown`. `No` and `Unknown` both go on the wire as `unproven`, because the fence check is evaluated last, so a `No` cannot be distinguished from "cannot prove it right now" |
 | 6 | Only the literal `yes` authorizes promotion | Everything else — including a timeout — is one outcome: throw and retry later |
-| 7 | Promote outcomes are three-way | `Committed` proceeds; a **proven** not-committed state (body-absent precommit, precommit no longer live owner, ref conflict) falls back to a byte fetch; `Unresolved` **throws**, because returning "fall back" there would publish the part twice |
+| 7 | Promote outcomes are three-way | `Committed` proceeds; a **proven** not-committed state (precommit no longer live owner, ref conflict) falls back to a byte fetch; `Unresolved` **throws**, because returning "fall back" there would publish the part twice. The receiver stages its manifest in the same build, so `promote` does not read the body back |
 
 The byte-fetch fallback is bounded: it re-invokes the fetch with relink disabled, which stops the
 receiver advertising its pool uuid, which stops the sender offering relink — so the relink path
@@ -102,7 +102,7 @@ The part is never quietly placed on another disk instead. This is the behaviour 
 content-addressed policy always had, and a mixed policy now shares it.
 
 The byte-fetch fallback after a relink that failed for a mechanism reason (a corrupted manifest, a
-body-absent precommit, a ref conflict) re-requests the bytes on the same pool disk, where they
+ref conflict) re-requests the bytes on the same pool disk, where they
 content-address and deduplicate against the pool — the placement outlives the relink. A manifest of a
 newer format generation is not degraded to bytes today (a tracked gap, `[relink-fallback-unknown-format-version]`
 in the backlog).

@@ -113,6 +113,16 @@ bool isDeterministicBlobPublicationFailure(const std::exception & error)
     return dynamic_cast<const Poco::Exception *>(&error) == nullptr;
 }
 
+std::vector<BlobRef> blobDependenciesOf(const std::vector<ManifestEntry> & entries)
+{
+    std::vector<BlobRef> dependencies;
+    dependencies.reserve(entries.size());
+    for (const ManifestEntry & entry : entries)
+        if (entry.placement == EntryPlacement::Blob)
+            dependencies.push_back(entry.ref);
+    return dependencies;
+}
+
 }
 
 /// The pool-wide content-hash convention, with the selected `algo`: `Cas::blobHashHexOneShot` uses the same
@@ -658,6 +668,8 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
             "stageManifest: encoded manifest {} bytes exceeds cap {}", encoded_text.size(), kMaxManifestEncodedBytes);
     const String encoded = sealObject(FormatId::PartManifest, encoded_text);
 
+    std::vector<BlobRef> blob_dependencies = blobDependenciesOf(body.entries);
+
     const ManifestId id{owning_ns, ref};
     const String key = store->layout().manifestKey(id);
 
@@ -714,8 +726,9 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
         e.reason = "stageManifest: part-manifest body written";
     });
 
-    staged_manifests.push_back(id);
-    staged_manifest_ids.insert(id);   /// A3 mint-tightening: `precommitAdd`'s only legal fresh-ownership source
+    staged_manifests.emplace(
+        id,
+        StagedManifest{manifest_incarnation, std::move(blob_dependencies)});
     return id;
 }
 
@@ -732,13 +745,13 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
 
     /// A3 mint-tightening (ABA barrier for the relink confirm's exact-`ManifestRef` equality): an
     /// unowned `ManifestId` may enter ownership only from the transaction that freshly staged it.
-    /// Evaluated HERE (synchronously, off this transaction's own private `staged_manifest_ids` --
+    /// Evaluated HERE (synchronously, off this transaction's own private `staged_manifests` --
     /// never mutated concurrently, so no snapshot races) rather than read live inside the closure
     /// below, because it does not depend on ledger state at all. The bool is captured BY VALUE into
     /// the closure -- consistent with every other capture there -- rather than capturing `this`,
     /// which would let a closure that outlives this stack (see the capture comment below) dereference
     /// a dead transaction. Enforcement, however, is NOT done here: see the closure for why.
-    const bool id_staged_by_this_txn = staged_manifest_ids.contains(id);
+    const bool id_staged_by_this_txn = staged_manifests.contains(id);
 
     /// One `owner_transition` create-precommit op.
     /// No body HEAD — a missing body is a legal fail-closed, non-activating intent, unchanged from the
@@ -841,19 +854,26 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             "promote: manifest namespace '{}' != target namespace '{}'",
             id.root_namespace.string(), target_ns.string());
 
-    /// Read + validate the manifest body ONCE (O(manifest entries), one streaming read). Absent or
-    /// invalid ⇒ fail closed: a committed ref must never name a missing/mismatched manifest.
-    const String manifest_key = store->layout().manifestKey(id);
-    CasOperation op = store->mountRequests().admit();
-    const auto body_got = op.read(manifest_key, Retry::standard());
-    if (!body_got)
-        throwCasWriteRetryLater(fmt::format(
-            "promote: manifest body absent at {} — failing closed (retry with a fresh ManifestId)", manifest_key));
-    const PartManifest body = decodePartManifest(openObject(FormatId::PartManifest, body_got->bytes));
-    if (!refMatchesBody(id.ref, body))
-        throwCasWriteRetryLater(fmt::format("promote: RefMatchesBody failed for {}", manifest_key));
-    if (!manifestNamespaceMatches(target_ns, body))
-        throwCasWriteRetryLater(fmt::format("promote: ManifestNamespaceMatches failed for {}", manifest_key));
+    std::vector<BlobRef> manifest_blob_dependencies;
+    if (const auto staged = staged_manifests.find(id); staged != staged_manifests.end())
+    {
+        manifest_blob_dependencies = staged->second.blob_dependencies;
+    }
+    else
+    {
+        const String manifest_key = store->layout().manifestKey(id);
+        CasOperation op = store->mountRequests().admit();
+        const auto body_got = op.read(manifest_key, Retry::standard());
+        if (!body_got)
+            throwCasWriteRetryLater(fmt::format(
+                "promote: manifest body absent at {} — failing closed (retry with a fresh ManifestId)", manifest_key));
+        const PartManifest body = decodePartManifest(openObject(FormatId::PartManifest, body_got->bytes));
+        if (!refMatchesBody(id.ref, body))
+            throwCasWriteRetryLater(fmt::format("promote: RefMatchesBody failed for {}", manifest_key));
+        if (!manifestNamespaceMatches(target_ns, body))
+            throwCasWriteRetryLater(fmt::format("promote: ManifestNamespaceMatches failed for {}", manifest_key));
+        manifest_blob_dependencies = blobDependenciesOf(body.entries);
+    }
 
     /// Blob readiness is checked inside the append closure below, after owner liveness. It consumes
     /// only this build's explicit dependency proofs and performs no backend copy-forward.
@@ -879,13 +899,14 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
     commit_state = CommitState::Uncertain;
     store->appendRefOps(target_ns, MutationScope::ref(final_ref_name),
         /// Capture the closure's INPUTS by value (ref name, manifest id, promote build id, repoint flag,
-        /// and the manifest `body` it revalidates) rather than `[&]`, as defense-in-depth against a
+        /// and the manifest blob dependencies it revalidates) rather than `[&]`, as defense-in-depth against a
         /// closure outliving this stack. Unlike `precommitAdd`, this closure cannot be made fully
         /// self-contained: `dependencyProof` reads this build's `deps` member (so it must
         /// keep `this`), and `repoint_old`/`created` are OUTPUTS read after the call returns (so they stay
         /// references). The ref-lane leadership guard is the real fix; both residual by-reference captures
         /// are safe because the guard guarantees the closure is never invoked after this frame unwinds.
-        [this, final_ref_name, id, promote_build_id, allow_repoint, body, &repoint_old, &created]
+        [this, final_ref_name, id, promote_build_id, allow_repoint,
+         manifest_dependencies = std::move(manifest_blob_dependencies), &repoint_old, &created]
         (const RefTableState & state) -> std::vector<RefOp>
         {
             created = !state.getCommitted().contains(final_ref_name);
@@ -928,16 +949,14 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             /// build's precommit edge is durable — matching the relink trust model (ordinary
             /// ReplicatedMergeTree interserver trust). A genuinely-absent adopted blob is an invariant
             /// violation caught by fsck, not here.
-            for (const ManifestEntry & e : body.entries)
+            for (const BlobRef & ref : manifest_dependencies)
             {
-                if (e.placement != EntryPlacement::Blob)
-                    continue;
-                const auto proof = dependencyProof(e.ref);
+                const auto proof = dependencyProof(ref);
                 if (!proof)
                     throw Exception(ErrorCodes::LOGICAL_ERROR,
                         "promote: blob leaf {} has no dependency proof at commit — a pending upload "
                         "never completed; failing closed",
-                        store->layout().blobKey(e.ref));
+                        store->layout().blobKey(ref));
 
                 switch (*proof)
                 {
@@ -959,7 +978,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
                         {
                             ev.type = CasEventType::BlobReuseAdopt;
                             ev.object_kind = CasEventObjectKind::Blob;
-                            ev.object_hash = blobIdOf(e.ref);
+                            ev.object_hash = blobIdOf(ref);
                             ev.outcome = "adopt";
                             ev.reason = "manifest-trust";   /// distinguishable trusted-adopt class (empty token)
                         });
@@ -968,7 +987,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
 
                 throw Exception(ErrorCodes::LOGICAL_ERROR,
                     "promote: blob leaf {} has an unnamed dependency proof at commit; failing closed",
-                    store->layout().blobKey(e.ref));
+                    store->layout().blobKey(ref));
             }
 
             /// BUG 1a: refuse to overwrite a live committed ref that already names a DIFFERENT manifest —
@@ -1239,19 +1258,24 @@ void PartWriteTxn::cleanupStagedManifestDebrisBestEffort()
     /// while keeping it is not: an unreferenced body is ordinary orphan-sweep debris.
     const bool precommit_attempted = precommit_state != PrecommitState::NotAttempted;
     CasOperation op = store->mountRequests().admit();
-    for (const ManifestId & id : staged_manifests)
+    for (const auto & [id, staged] : staged_manifests)
     {
         if (precommit_attempted && id.ref == precommit_manifest && id.root_namespace == precommit_target_ns)
             continue;   /// the (possibly) live precommit body — left for GC (delete-after-sealed-decrements)
         try
         {
-            const String key = store->layout().manifestKey(id);
-            if (const auto observed = op.head(key, Retry::standard()))
-                op.remove(key, observed->etag, Retry::standard());
+            const Removal removal = op.remove(staged.incarnation.key(), staged.incarnation, Retry::standard());
+            if (removal != Removal::Removed)
+                LOG_DEBUG(getLogger("CasPartWriteTxn"),
+                    "abandon: staged manifest {} was not removed ({}), left for the orphan sweep",
+                    staged.incarnation.key(), removal == Removal::Gone ? "gone" : "incarnation mismatch");
         }
-        catch (...) // NOLINT(bugprone-empty-catch)
+        catch (...)
         {
             /// Best-effort cleanup: the GC backstop sweep is the durable guarantee.
+            tryLogCurrentException(getLogger("CasPartWriteTxn"),
+                fmt::format("abandon: staged manifest {} cleanup failed, left for the orphan sweep", staged.incarnation.key()),
+                LogsLevel::debug);
         }
     }
 }

@@ -1115,7 +1115,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                 o.kind = ObjectKind::Blob;
                 o.size = sz;
                 o.cls = FsckClass::Unreachable;
-                if (parsed && prefixEligible(store, ns, prefix))
+                if (parsed && isBuildPrefixCoveredByFloor(store, ns, prefix))
                     o.reachable_from = {"reclaimable-pre-precommit"};
                 else
                     o.reachable_from = {"in-flight-pre-precommit"};

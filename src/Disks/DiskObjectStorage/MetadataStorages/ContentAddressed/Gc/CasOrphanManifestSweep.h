@@ -190,17 +190,17 @@ struct ManifestSweepResult
 uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix,
                         std::vector<String> * warnings = nullptr);
 
-/// Whether `prefix` is sweep-eligible by the durable watermark fact alone. The floor is read from the
-/// mount lease identified by the namespace's server-root prefix, not inferred from the manifest key or a
-/// judged-dead heuristic. A missing lease provides no deletion authority, so the prefix is not eligible.
-bool prefixEligible(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix);
+/// Whether `prefix` is covered by the durable watermark fact alone. The floor is read from the mount
+/// lease identified by the namespace's server-root prefix, not inferred from the manifest key or a
+/// judged-dead heuristic. A missing lease provides no deletion authority, so the prefix is not covered.
+bool isBuildPrefixCoveredByFloor(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix);
 
-/// The pure half of `prefixEligible`: whether `prefix` is retired under one observation of the mount
-/// floor. `nullopt` (no mount body under any prefix of the namespace) admits nothing. Retirement is
-/// permanent -- the epoch and the acknowledgement floor only grow and the farewell is terminal -- so
-/// an admission derived from any observation stays true afterwards, which is what lets a page judge
+/// The pure overload: whether `prefix` is covered by one observation of the mount floor. `nullopt`
+/// (no mount body under any prefix of the namespace) covers nothing. Coverage is permanent -- the epoch
+/// and the acknowledgement floor only grow and the farewell is terminal -- so a result derived from
+/// any observation stays true afterwards, which is what lets a page judge
 /// every build of a namespace against one read.
-bool prefixEligibleUnder(const std::optional<MountLease> & floor, const BuildPrefix & prefix);
+bool isBuildPrefixCoveredByFloor(const std::optional<MountLease> & floor, const BuildPrefix & prefix);
 
 /// Plan one cursor page without deleting. A key is decided from key-derived facts first; only a
 /// candidate's body is read, after the catalog cut, then decoded and identity-validated; its exact
