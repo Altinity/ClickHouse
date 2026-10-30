@@ -853,6 +853,12 @@ IStorageCluster::RemoteCallVariables IStorageCluster::convertToRemote(
     if (!table_expression->table_function)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't find table function in table expression");
 
+    /// `AS alias` is stored on the inner table function. `JoinedTables` reads only the outer
+    /// table function, so `remote()` must carry the same alias. Leave it on the inner function:
+    /// `addTableFunction` sends that node to the remote initiator and does not copy a non-empty
+    /// outer alias onto the replacement.
+    const String table_alias = table_expression->table_function->tryGetAlias();
+
     boost::intrusive_ptr<ASTFunction> remote_query;
 
     if (shard_addresses[0].user_specified)
@@ -866,6 +872,11 @@ IStorageCluster::RemoteCallVariables IStorageCluster::convertToRemote(
     else
     { // without specified user/password remote query is executed from default user
         remote_query = makeASTFunction(remote_function_name, make_intrusive<ASTLiteral>(host_name), table_expression->table_function);
+    }
+
+    if (!table_alias.empty())
+    {
+        remote_query->setAlias(table_alias);
     }
 
     table_expression->table_function = remote_query;
