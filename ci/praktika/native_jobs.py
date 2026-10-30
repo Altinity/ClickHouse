@@ -10,6 +10,7 @@ from pathlib import Path
 
 from . import Job, Workflow
 from ._environment import _Environment
+from .cache import Cache
 from .cidb import CIDB
 from .digest import Digest
 from .docker import Docker
@@ -252,13 +253,22 @@ def _prepare_submodule_cache(workflow, workflow_config: RunConfig) -> Result:
             )
 
         cache_hash = hashlib.sha256(submodule_shas.encode()).hexdigest()[:16]
-        s3_path = f"{Settings.CACHE_S3_PATH}/submodules/{cache_hash}.tar.zst"
+        s3_path = Cache.submodule_archive_s3_path(cache_hash)
         print(f"Submodule cache hash: {cache_hash}")
 
         # Check if cache already exists in S3
         if S3.head_object(s3_path):
             print(f"Submodule cache hit: {s3_path}")
             info = f"cache hit: {cache_hash}"
+        elif Info().is_community_pr:
+            # Like sccache, community PRs only read; jobs clone without a hash.
+            print(f"Submodule cache miss, community PR will not create it: {s3_path}")
+            return Result.create_from(
+                name="Submodule Cache",
+                status=Result.Status.OK,
+                stopwatch=stop_watch,
+                info=f"cache miss, not creating (read-only): {cache_hash}",
+            )
         else:
             print(f"Submodule cache miss, creating: {s3_path}")
             Shell.check("git submodule sync", verbose=True, strict=True)
@@ -270,6 +280,12 @@ def _prepare_submodule_cache(workflow, workflow_config: RunConfig) -> Result:
                 retries=3,
                 env=_submodule_auth_env(workflow),
             )
+            # The archive is public: never upload it with the clone token inside.
+            leaked = Shell.get_output(
+                "grep -rIlF x-access-token .git/config .git/modules --exclude-dir=objects"
+            )
+            if leaked:
+                raise RuntimeError(f"submodule cache would contain a GitHub token: {leaked}")
             archive_path = f"{Settings.TEMP_DIR}/submodules_{cache_hash}.tar.zst"
             Shell.check(
                 f"tar -cf - .git/modules | zstd -c -T0 > {archive_path}",
@@ -892,7 +908,11 @@ def _config_workflow(workflow: Workflow.Config, job_name) -> Result:
             )
         )
 
-    if results[-1].is_ok() and workflow.enable_cache and Settings.ENABLE_SUBMODULE_CACHE:
+    if (
+        results[-1].is_ok()
+        and (workflow.enable_cache or Info().is_community_pr)
+        and Settings.ENABLE_SUBMODULE_CACHE
+    ):
         result = _prepare_submodule_cache(workflow, workflow_config)
         results.append(result)
 

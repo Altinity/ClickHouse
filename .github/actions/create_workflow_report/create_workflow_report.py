@@ -64,13 +64,28 @@ def query_dataframe_with_retry(
             wait = backoff_seconds * attempt
             time.sleep(wait)
 
-def get_commit_statuses(sha: str) -> pd.DataFrame:
+def _results_link_has_ref(target_url: str | None, ref: str) -> bool:
+    """
+    Whether a CI status results link has `ref` in it:`json.html?REF=<ref>&...` for
+    praktika jobs, `/REFs/<ref>/...` for regression jobs.
+    """
+    target_url = target_url or ""
+    return f"REF={ref}&" in target_url or f"/REFs/{ref}/" in target_url
+
+
+def get_commit_statuses(sha: str, pr_number: int, ref: str) -> pd.DataFrame:
     """
     Fetch commit statuses for a given SHA and return as a pandas DataFrame.
     Handles pagination to get all statuses.
 
+    Statuses belong to the commit, not the ref, so a release tag and its branch
+    can write to the same job names. For release runs (`pr_number` 0), only
+    statuses of `ref` are kept.
+
     Args:
         sha (str): Commit SHA to fetch statuses for.
+        pr_number (int): Pull request number, 0 for release runs.
+        ref (str): Ref of the run being reported.
 
     Returns:
         pd.DataFrame: DataFrame containing all statuses.
@@ -119,6 +134,7 @@ def get_commit_statuses(sha: str) -> pd.DataFrame:
             "results_link": item["target_url"],
         }
         for item in all_data
+        if pr_number != 0 or _results_link_has_ref(item["target_url"], ref)
     ]
 
     # Create DataFrame
@@ -362,9 +378,9 @@ def _find_rebase_baseline(commit_sha: str, cwd: str | None) -> str | None:
     return lines[0]
 
 
-def _git_commit_date(sha: str, cwd: str | None) -> str | None:
+def _git_commit_time(sha: str, cwd: str | None) -> str | None:
     p = subprocess.run(
-        ["git", "show", "-s", "--format=%cs", sha],
+        ["git", "show", "-s", "--format=%ct", sha],
         cwd=cwd,
         capture_output=True,
         text=True,
@@ -372,8 +388,12 @@ def _git_commit_date(sha: str, cwd: str | None) -> str | None:
     )
     if p.returncode != 0:
         return None
-    date = p.stdout.strip()
-    return date or None
+    timestamp = p.stdout.strip()
+    if not timestamp:
+        return None
+    return datetime.fromtimestamp(int(timestamp), timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
 
 
 def _git_is_shallow(cwd: str | None) -> bool:
@@ -492,7 +512,7 @@ def get_prs_in_release_dataframe(
 
     commit_sha is the workflow commit from the GitHub Actions API.
 
-    Returns (dataframe, baseline_date YYYY-MM-DD or None).
+    Returns (dataframe, baseline commit time as UTC YYYY-MM-DDTHH:MM:SSZ or None).
     """
     _fetch_commit(commit_sha, cwd)
     resolved = _git_rev_parse(commit_sha, cwd)
@@ -505,13 +525,11 @@ def get_prs_in_release_dataframe(
     )
     _fetch_release_tags(releases, cwd)
 
-    _, baseline_sha, baseline_date = _find_release_baseline(
+    _, baseline_sha, _ = _find_release_baseline(
         branch_ref, releases, cwd, commit_sha=commit_sha
     )
     if not baseline_sha:
         baseline_sha = _find_rebase_baseline(commit_sha, cwd)
-        if baseline_sha:
-            baseline_date = _git_commit_date(baseline_sha, cwd)
 
     if not baseline_sha:
         raise Exception(
@@ -519,7 +537,10 @@ def get_prs_in_release_dataframe(
         )
 
     df = _git_log_merge_prs(baseline_sha, commit_sha, cwd, repo)
-    return _enrich_prs_in_release_merge_prs(df, repo), baseline_date
+    return (
+        _enrich_prs_in_release_merge_prs(df, repo),
+        _git_commit_time(baseline_sha, cwd),
+    )
 
 
 def _parse_release_ref(ref_name: str) -> tuple[str, str, str | None] | None:
@@ -543,8 +564,8 @@ def _parse_release_ref(ref_name: str) -> tuple[str, str, str | None] | None:
     return None
 
 
-def _prs_in_release_search_url(branch_name: str, baseline_date: str | None) -> str | None:
-    if not baseline_date:
+def _prs_in_release_search_url(branch_name: str, baseline_time: str | None) -> str | None:
+    if not baseline_time:
         return None
     # Tag-triggered runs expose the tag as head_branch; search needs the PR base
     # branch (e.g. v25.8.28.10001.altinitystable → stable-25.8).
@@ -552,7 +573,7 @@ def _prs_in_release_search_url(branch_name: str, baseline_date: str | None) -> s
     if parsed:
         flavour, minor_version, _ = parsed
         branch_name = f"{flavour}-{minor_version}"
-    query = f"is:pr base:{branch_name} merged:>{baseline_date}"
+    query = f"is:pr base:{branch_name} merged:>{baseline_time}"
     return (
         f"https://github.com/{GITHUB_REPO}/pulls?"
         + urllib.parse.urlencode({"q": query})
@@ -1370,7 +1391,7 @@ def create_workflow_report(
 
     results_dfs = {
         "prs_in_release": [],
-        "job_statuses": get_commit_statuses(commit_sha),
+        "job_statuses": get_commit_statuses(commit_sha, pr_number, branch_name),
         "checks_fails": add_labels_to_checks_fails(
             get_checks_fails(db_client, commit_sha, branch_name),
             workflow_result,
@@ -1386,12 +1407,12 @@ def create_workflow_report(
 
     if pr_number == 0 and not mark_preview:
         try:
-            prs_df, baseline_date = get_prs_in_release_dataframe(
+            prs_df, baseline_time = get_prs_in_release_dataframe(
                 branch_name, cwd=os.getcwd(), commit_sha=commit_sha
             )
             results_dfs["prs_in_release"] = prs_df
             prs_in_release_search_url = _prs_in_release_search_url(
-                branch_name, baseline_date
+                branch_name, baseline_time
             )
         except Exception as e:
             print(f"Error in get_prs_in_release_dataframe: {e}")
