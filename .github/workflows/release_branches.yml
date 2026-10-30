@@ -478,6 +478,7 @@ jobs:
       - RegressionTestsAarch64
       - GrypeScan
       - SignRelease
+      - SignAarch64
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     steps:
       - name: Check out repository code
