@@ -73,6 +73,8 @@ S3_EXTERNAL_BUCKETS = {
         "access_key_env": "HETZNER_S3_ACCESS_KEY",
         "secret_key_env": "HETZNER_S3_SECRET_KEY",
         "public_read": True,
+        # netcup runners get ~2.5 MB/s per connection from hel1
+        "download_concurrency": 32,
     }
 }
 

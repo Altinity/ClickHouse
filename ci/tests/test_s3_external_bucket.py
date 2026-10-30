@@ -180,3 +180,18 @@ def test_submodule_archive_path(monkeypatch):
     assert Cache.submodule_archive_s3_path("abc") == "bucket/cache/submodules/abc.tar.zst"
     monkeypatch.setattr(Settings, "SUBMODULE_CACHE_S3_PATH", f"{BUCKET}/cache")
     assert Cache.submodule_archive_s3_path("abc") == f"{BUCKET}/cache/submodules/abc.tar.zst"
+
+
+def test_download_concurrency(monkeypatch, tmp_path, no_credentials):
+    seen = {}
+
+    class Client:
+        def download_file(self, bucket, key, filename, Config=None):
+            seen["concurrency"] = Config.max_concurrency
+
+    monkeypatch.setattr(S3, "_external_clients", {(BUCKET, True): Client()})
+    monkeypatch.setitem(EXTERNAL[BUCKET], "download_concurrency", 32)
+    assert S3.copy_file_from_s3(f"{BUCKET}/prefix/archive", str(tmp_path / "out"))
+    assert seen["concurrency"] == 32
+    monkeypatch.setattr(S3, "_external_clients", {})
+    assert S3._get_boto3_client(BUCKET, read=True).meta.config.max_pool_connections == 32

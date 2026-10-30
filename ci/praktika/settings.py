@@ -129,8 +129,9 @@ class _Settings:
     S3_UPSTREAM_REPORT_BUCKET: str = ""
     HTML_PAGE_FILE: str = "./ci/praktika/json.html"
     S3_BUCKET_TO_HTTP_ENDPOINT: Optional[Dict[str, str]] = None
-    # Non-AWS buckets: {bucket: {endpoint_url, region, access_key_env, secret_key_env, public_read}}
+    # Non-AWS buckets: {bucket: {endpoint_url, region, access_key_env, secret_key_env, public_read, download_concurrency}}
     # The keys are read from the named env vars; with public_read, jobs without them read unsigned.
+    # download_concurrency (optional): parallel ranged GETs, for links with a low rate per connection.
     S3_EXTERNAL_BUCKETS: Optional[Dict[str, Dict[str, Any]]] = None
     TEXT_CONTENT_EXTENSIONS: Iterable[str] = frozenset([".txt", ".log"])
     # Compress if text file size exceeds this threshold (in MB, 0 - disable compression)
