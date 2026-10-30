@@ -29,49 +29,38 @@ Int64 decimal64Ticks(const Field & field)
 
 }
 
-TEST(IcebergFieldParseHelpers, NearEpochNanosecondDateTime64BoundsFailOpen)
+TEST(IcebergFieldParseHelpers, MicrosecondDateTime64BoundsAreKept)
 {
     auto type = std::make_shared<DataTypeDateTime64>(6);
-    /// One day after the epoch as nanoseconds: kept as µs this is ~1972, not 1970-01-02.
-    constexpr Int64 one_day_ns = 86'400'000'000'000LL;
-    EXPECT_FALSE(deserializeFieldFromBinaryRepr(littleEndianInt64(one_day_ns), type, true).has_value());
-    EXPECT_FALSE(deserializeFieldFromBinaryRepr(littleEndianInt64(one_day_ns), type, false).has_value());
-    EXPECT_FALSE(deserializeFieldFromBinaryRepr(littleEndianInt64(-one_day_ns), type, true).has_value());
+    /// 2024-02-20 10:00:00 UTC as microseconds — spec-correct Iceberg `timestamp`.
+    constexpr Int64 us_2024_02_20 = 1'708'423'200'000'000LL;
+    auto lower = deserializeFieldFromBinaryRepr(littleEndianInt64(us_2024_02_20), type, true);
+    auto upper = deserializeFieldFromBinaryRepr(littleEndianInt64(us_2024_02_20), type, false);
+    ASSERT_TRUE(lower.has_value());
+    ASSERT_TRUE(upper.has_value());
+    EXPECT_EQ(decimal64Ticks(*lower), us_2024_02_20);
+    EXPECT_EQ(decimal64Ticks(*upper), us_2024_02_20);
+
+    /// 1960-01-01 00:00:00 UTC as microseconds.
+    constexpr Int64 us_1960_01_01 = -315'619'200'000'000LL;
+    auto negative = deserializeFieldFromBinaryRepr(littleEndianInt64(us_1960_01_01), type, true);
+    ASSERT_TRUE(negative.has_value());
+    EXPECT_EQ(decimal64Ticks(*negative), us_1960_01_01);
+
+    /// Spark `9999-12-31` sentinel is spec-correct microseconds.
+    constexpr Int64 spark_9999_us = 253'402'300'799'999'999LL;
+    auto sentinel = deserializeFieldFromBinaryRepr(littleEndianInt64(spark_9999_us), type, false);
+    ASSERT_TRUE(sentinel.has_value());
+    EXPECT_EQ(decimal64Ticks(*sentinel), spark_9999_us);
 }
 
-TEST(IcebergFieldParseHelpers, AmbiguousScaleDateTime64BoundsFailOpen)
+TEST(IcebergFieldParseHelpers, NanosecondDateTime64BoundsAreKept)
 {
-    auto type = std::make_shared<DataTypeDateTime64>(6);
-    /// 2024-01-01 UTC µs is also ~19.7 days as ns. No integer test splits those scales.
-    constexpr Int64 us_2024_01_01 = 1'704'067'200'000'000LL;
-    EXPECT_FALSE(deserializeFieldFromBinaryRepr(littleEndianInt64(us_2024_01_01), type, true).has_value());
-    EXPECT_FALSE(deserializeFieldFromBinaryRepr(littleEndianInt64(-us_2024_01_01), type, true).has_value());
-
-    /// 50 days after the epoch as ns (`4.32e15`) sits in the same band as 2024–2286 µs.
-    constexpr Int64 fifty_days_ns = 4'320'000'000'000'000LL;
-    EXPECT_FALSE(deserializeFieldFromBinaryRepr(littleEndianInt64(fifty_days_ns), type, true).has_value());
-    EXPECT_FALSE(deserializeFieldFromBinaryRepr(littleEndianInt64(fifty_days_ns), type, false).has_value());
-
-    /// Band upper edge: 1e16 ns is ~1970-04-26, 1e16 µs is ~year 2286.
-    constexpr Int64 one_e16 = 10'000'000'000'000'000LL;
-    EXPECT_FALSE(deserializeFieldFromBinaryRepr(littleEndianInt64(one_e16), type, true).has_value());
-}
-
-TEST(IcebergFieldParseHelpers, ProvenNanosecondDateTime64BoundsAreConverted)
-{
-    auto type = std::make_shared<DataTypeDateTime64>(6);
+    auto type = std::make_shared<DataTypeDateTime64>(9);
     constexpr Int64 ns_2024_01_01 = 1'704'067'200'123'456'789LL;
     auto field = deserializeFieldFromBinaryRepr(littleEndianInt64(ns_2024_01_01), type, true);
     ASSERT_TRUE(field.has_value());
-    EXPECT_EQ(decimal64Ticks(*field), ns_2024_01_01 / 1000);
-}
-
-TEST(IcebergFieldParseHelpers, FarFutureMicrosecondDateTime64BoundsFailOpen)
-{
-    auto type = std::make_shared<DataTypeDateTime64>(6);
-    /// Spark 9999-12-31 sentinel sits in (1e16, 1e18].
-    constexpr Int64 spark_9999_us = 253'402'300'799'999'999LL;
-    EXPECT_FALSE(deserializeFieldFromBinaryRepr(littleEndianInt64(spark_9999_us), type, false).has_value());
+    EXPECT_EQ(decimal64Ticks(*field), ns_2024_01_01);
 }
 
 #endif
