@@ -6,14 +6,28 @@ from ci.defs.defs import BuildTypes, ToolSet
 from ci.jobs.scripts.clickhouse_version import CHVersion
 from ci.praktika.info import Info
 from ci.praktika.result import Result
+from ci.praktika.s3 import S3
 from ci.praktika.settings import Settings
 from ci.praktika.utils import MetaClasses, Shell, Utils
+from ci.settings.altinity_overrides import CI_CACHE_BUCKET
 
 current_directory = Utils.cwd()
 build_dir = f"{current_directory}/ci/tmp/build"
 temp_dir = f"{current_directory}/ci/tmp"
 repo_path_normalized = "/ClickHouse"
 build_dir_normalized = f"{repo_path_normalized}/ci/tmp/build"
+
+# ThinLTO cache: lld stores the optimized native object of every module it
+# links, and the next link of an unchanged module reuses it instead of running
+# the backend again. The cache travels between builders as one archive per
+# branch, build type and debug-info flavour.
+THINLTO_CACHE_S3_PATH = f"{CI_CACHE_BUCKET}/ci_ch_cache/thinlto"
+thinlto_cache_dir = f"{temp_dir}/thinlto_cache"
+thinlto_cache_dir_normalized = f"{repo_path_normalized}/ci/tmp/thinlto_cache"
+thinlto_cache_archive = f"{temp_dir}/thinlto_cache.tar.zst"
+# An archive holds the entries one build used, about 15 GB for a `-g` build of
+# `clickhouse` and `clickhouse-keeper`. Much more means pruning went wrong.
+THINLTO_CACHE_MAX_BYTES = {"g": 20 << 30, "g0": 5 << 30}
 
 BUILD_TYPE_TO_CMAKE = {
     BuildTypes.AMD_DEBUG: f"    cmake --debug-trycompile -DCMAKE_VERBOSE_MAKEFILE=1 -LA -DCMAKE_BUILD_TYPE=Debug -DENABLE_THINLTO=0 -DSANITIZE=          -DENABLE_CHECK_HEAVY_BUILDS=1 -DBUILD_STRIPPED_BINARY=1 -DENABLE_CLICKHOUSE_SELF_EXTRACTING=1 -DCMAKE_C_COMPILER={ToolSet.COMPILER_C} -DCMAKE_CXX_COMPILER={ToolSet.COMPILER_CPP} -DCOMPILER_CACHE={ToolSet.COMPILER_CACHE}        -DCMAKE_TOOLCHAIN_FILE={repo_path_normalized}/cmake/linux/toolchain-x86_64.cmake -DENABLE_BUILD_PROFILING=1 -DENABLE_TESTS=1 -DENABLE_LEXER_TEST=1 -DENABLE_UTILS=0 -DCMAKE_FIND_PACKAGE_NO_PACKAGE_REGISTRY=ON -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_SYSCONFDIR=/etc -DCMAKE_INSTALL_LOCALSTATEDIR=/var -DCMAKE_SKIP_INSTALL_ALL_DEPENDENCY=ON -DENABLE_BUZZHOUSE=1",
@@ -101,6 +115,111 @@ def parse_args():
         action="store_true",
     )
     return parser.parse_args()
+
+
+def thinlto_cache_flavour(cmake_cmd):
+    return "g0" if "-DDISABLE_ALL_DEBUG_SYMBOLS=1" in cmake_cmd else "g"
+
+
+def thinlto_cache_s3_path(info, build_type, cmake_cmd):
+    """PR builds share the cache of their base branch, other builds use their own branch."""
+    branch = info.base_branch if info.pr_number > 0 else info.git_branch
+    if not branch:
+        return None
+    return f"{THINLTO_CACHE_S3_PATH}/{branch}/{build_type}-{thinlto_cache_flavour(cmake_cmd)}.tar.zst"
+
+
+def restore_thinlto_cache(s3_path):
+    shutil.rmtree(thinlto_cache_dir, ignore_errors=True)
+    os.makedirs(thinlto_cache_dir)
+    if not S3.head_object(s3_path):
+        print(f"ThinLTO cache miss: {s3_path}")
+        return True
+    try:
+        S3.copy_file_from_s3(s3_path=s3_path, local_path=thinlto_cache_archive)
+        Shell.check(
+            f"set -o pipefail; zstd -d --long=27 -c {thinlto_cache_archive} | tar -xf - -C {thinlto_cache_dir}",
+            verbose=True,
+            strict=True,
+        )
+    except BaseException:
+        # A partly extracted entry would be linked as is: start cold instead.
+        shutil.rmtree(thinlto_cache_dir, ignore_errors=True)
+        os.makedirs(thinlto_cache_dir)
+        raise
+    finally:
+        if os.path.exists(thinlto_cache_archive):
+            os.remove(thinlto_cache_archive)
+    # With an access time of zero, the kernel records the next read of an
+    # entry even under `relatime`, which is how the upload step tells the
+    # entries this build used from the ones it did not.
+    count = 0
+    size = 0
+    with os.scandir(thinlto_cache_dir) as entries:
+        for entry in entries:
+            stat = entry.stat(follow_symlinks=False)
+            os.utime(entry.path, (0, stat.st_mtime))
+            count += 1
+            size += stat.st_size
+    print(f"ThinLTO cache restored: {count} entries, {size / (1 << 30):.1f} GiB")
+    return True
+
+
+def thinlto_cache_tracks_reads():
+    probe = f"{thinlto_cache_dir}/.atime-probe"
+    with open(probe, "w") as f:
+        f.write("probe")
+    os.utime(probe, (0, os.stat(probe).st_mtime))
+    with open(probe) as f:
+        f.read()
+    tracked = os.stat(probe).st_atime > 0
+    os.remove(probe)
+    return tracked
+
+
+def upload_thinlto_cache(s3_path, flavour):
+    """Keep the entries this build read or wrote, then upload them."""
+    assert thinlto_cache_tracks_reads(), (
+        f"{thinlto_cache_dir} does not record file reads (mounted with noatime?), "
+        "so the entries this build used are unknown"
+    )
+    kept = 0
+    removed = 0
+    size = 0
+    with os.scandir(thinlto_cache_dir) as entries:
+        for entry in entries:
+            stat = entry.stat(follow_symlinks=False)
+            # Anything else is a temporary file of an interrupted link.
+            used = entry.name.startswith("llvmcache-") and entry.is_file(
+                follow_symlinks=False
+            ) and stat.st_atime > 0
+            if used:
+                kept += 1
+                size += stat.st_size
+            else:
+                os.remove(entry.path)
+                removed += 1
+    print(
+        f"ThinLTO cache: kept {kept} entries ({size / (1 << 30):.1f} GiB), "
+        f"removed {removed} unused"
+    )
+    assert size <= THINLTO_CACHE_MAX_BYTES[flavour], (
+        f"ThinLTO cache of {size} bytes exceeds the {THINLTO_CACHE_MAX_BYTES[flavour]} "
+        f"bytes expected for a `-{flavour}` build, not uploading it"
+    )
+    Shell.check(
+        f"set -o pipefail; tar -cf - -C {thinlto_cache_dir} . | zstd -T0 -3 --long=27 -c > {thinlto_cache_archive}",
+        verbose=True,
+        strict=True,
+    )
+    print(
+        f"ThinLTO cache archive: {os.path.getsize(thinlto_cache_archive) / (1 << 30):.1f} GiB"
+    )
+    S3.copy_file_to_s3(
+        s3_path=s3_path, local_path=thinlto_cache_archive, with_rename=True
+    )
+    os.remove(thinlto_cache_archive)
+    return True
 
 
 def run_shell(name, command, **kwargs):
@@ -215,18 +334,16 @@ def main():
     ):
         cmake_cmd += " -DDISABLE_ALL_DEBUG_SYMBOLS=1"
 
-    # ThinLTO cache: the link reuses the optimized native objects of modules
-    # that did not change since the previous link in this directory. It is an
-    # attached volume that BINARY_DOCKER_COMMAND mounts only on builders that
-    # have it, so a builder whose disk is wiped between jobs has no directory
-    # here and does not pay for writing a cache it will never read.
-    thinlto_cache_dir = "/thinlto-cache"
-    use_thinlto_cache = "ENABLE_THINLTO=1" in cmake_cmd and os.path.isdir(
-        thinlto_cache_dir
-    )
-    if use_thinlto_cache:
-        print(f"ThinLTO cache is enabled in {thinlto_cache_dir}")
-        cmake_cmd += f" -DTHINLTO_CACHE_DIR={thinlto_cache_dir}"
+    # ThinLTO cache for every build that links with ThinLTO. The cache-warmup
+    # builds only compile. Everyone reads the archive (community PRs anonymously);
+    # pushes and internal PRs write it, like the shared compiler cache.
+    thinlto_cache_s3 = None
+    if "ENABLE_THINLTO=1" in cmake_cmd and not cache_warmup:
+        thinlto_cache_s3 = thinlto_cache_s3_path(info, build_type, cmake_cmd)
+    thinlto_cache_writable = not info.is_local_run and not info.is_community_pr
+    if thinlto_cache_s3:
+        print(f"ThinLTO cache: {thinlto_cache_s3}, writable: {thinlto_cache_writable}")
+        cmake_cmd += f" -DTHINLTO_CACHE_DIR={thinlto_cache_dir_normalized}"
 
     # Link `clickhouse` and `clickhouse-keeper` concurrently. Each ThinLTO link
     # spends most of its time in a single-threaded thin-link phase, so the two
@@ -445,6 +562,15 @@ def main():
         else:
             build_command = f"command time -v ninja {targets}"
 
+        if thinlto_cache_s3:
+            results.append(
+                Result.from_commands_run(
+                    name="Restore ThinLTO cache",
+                    command=restore_thinlto_cache,
+                    command_args=[thinlto_cache_s3],
+                )
+            )
+
         build_result_index = len(results)
         results.append(
             Result.from_commands_run(
@@ -485,16 +611,20 @@ def main():
             else:
                 results.append(retry_cmake)
 
-        run_shell("sccache stats", "sccache --show-stats")
-        if use_thinlto_cache:
-            run_shell(
-                "thinlto cache stats",
-                # The volume's root-owned `lost+found` is unreadable for the
-                # build user, so count only lld's own entries.
-                f"du -sh --exclude=lost+found {thinlto_cache_dir}; "
-                f"find {thinlto_cache_dir} -maxdepth 1 -name 'llvmcache-*' | wc -l; "
-                f"df -h {thinlto_cache_dir}",
+        if (
+            thinlto_cache_s3
+            and thinlto_cache_writable
+            and results[build_result_index].is_ok()
+        ):
+            results.append(
+                Result.from_commands_run(
+                    name="Upload ThinLTO cache",
+                    command=upload_thinlto_cache,
+                    command_args=[thinlto_cache_s3, thinlto_cache_flavour(cmake_cmd)],
+                )
             )
+
+        run_shell("sccache stats", "sccache --show-stats")
         if build_type in (BuildTypes.AMD_TIDY, BuildTypes.ARM_TIDY):
             run_shell("clang-tidy-cache stats", "clang-tidy-cache.py --show-stats")
             clang_tidy_cache_log = "./ci/tmp/clang-tidy-cache.log"

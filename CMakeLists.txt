@@ -500,7 +500,9 @@ if (ENABLE_THINLTO AND NOT ENABLE_TESTS AND NOT SANITIZE)
     # link still run in full. Entries are content-addressed, so concurrent
     # writers cannot corrupt each other.
     set (THINLTO_CACHE_DIR "" CACHE PATH "Directory for the ThinLTO cache (lld --thinlto-cache-dir); empty disables the cache")
-    set (THINLTO_CACHE_POLICY "prune_after=0s:cache_size=90%:cache_size_bytes=180g" CACHE STRING "Pruning policy for the ThinLTO cache (lld --thinlto-cache-policy)")
+    # lld prunes after each link by default. That is off here, since CI keeps
+    # exactly the entries a build used; set a policy for a long-lived cache dir.
+    set (THINLTO_CACHE_POLICY "prune_after=0s:cache_size=0%:cache_size_bytes=0:cache_size_files=0" CACHE STRING "Pruning policy for the ThinLTO cache (lld --thinlto-cache-policy)")
     if (THINLTO_CACHE_DIR)
         if (NOT LINKER_NAME MATCHES "lld")
             message (FATAL_ERROR "THINLTO_CACHE_DIR requires lld, but LINKER_NAME is '${LINKER_NAME}'")

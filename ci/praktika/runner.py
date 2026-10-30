@@ -481,19 +481,6 @@ class Runner:
             if not job.timeout_shell_cleanup:
                 job.timeout_shell_cleanup = f"docker rm -f {container_name}"
             workdir = f"--workdir={current_dir}"
-            # `--volume-if-exists=HOST:CONTAINER` mounts HOST only on runners
-            # that have it (e.g. an attached cache volume), instead of creating
-            # an empty directory everywhere like `--volume` does.
-            optional_volumes = [
-                s for s in settings if s.startswith("--volume-if-exists=")
-            ]
-            for setting in optional_volumes:
-                settings.remove(setting)
-                volume = setting.removeprefix("--volume-if-exists=")
-                if Path(volume.split(":")[0]).exists():
-                    settings.append(f"--volume={volume}")
-                else:
-                    print(f"NOTE: optional volume [{volume}] is not present on this runner")
             for setting in settings:
                 if setting.startswith("--volume"):
                     volume = setting.removeprefix("--volume=").split(":")[0]

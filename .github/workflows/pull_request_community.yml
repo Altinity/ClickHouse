@@ -817,7 +817,7 @@ jobs:
           retention-days: 14
 
   build_amd_release:
-    runs-on: [self-hosted, altinity-on-demand, altinity-builder, altinity-thinlto-cache-amd]
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, fast_test]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF9yZWxlYXNlKQ==') }}
     name: "Build (amd_release)"
@@ -909,7 +909,7 @@ jobs:
           retention-days: 14
 
   build_arm_release:
-    runs-on: [self-hosted, altinity-on-demand, altinity-builder, altinity-thinlto-cache-arm]
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, fast_test]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFybV9yZWxlYXNlKQ==') }}
     name: "Build (arm_release)"

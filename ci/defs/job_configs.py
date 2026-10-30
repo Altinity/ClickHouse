@@ -29,16 +29,9 @@ BINARY_DOCKER_COMMAND = (
     f"+--memory={Utils.physical_memory() * 95 // 100}"
     f"+--memory-reservation={Utils.physical_memory() * 9 // 10}"
     f"+--volume=.:/ClickHouse"
-    # ThinLTO cache of release builds, see `use_thinlto_cache` in
-    # build_clickhouse.py. Mounted only on builders that have it, so the build
-    # job can key on the directory's presence. Cloud builders get one attached
-    # volume per target architecture (see `RunnerLabels.BUILDER_AMD`); static
-    # builders keep a single directory on their own disk for both targets. A
-    # builder has exactly one of the three.
-    "+--volume-if-exists=/mnt/clickhouse_thinlto_amd:/thinlto-cache"
-    "+--volume-if-exists=/mnt/clickhouse_thinlto_arm:/thinlto-cache"
-    "+--volume-if-exists=/mnt/clickhouse_thinlto:/thinlto-cache"
     '+--env=AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"+--env=AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"'
+    # Writes to the ThinLTO cache in Hetzner Object Storage; jobs without them read anonymously
+    '+--env=HETZNER_S3_ACCESS_KEY="$HETZNER_S3_ACCESS_KEY"+--env=HETZNER_S3_SECRET_KEY="$HETZNER_S3_SECRET_KEY"'
 )
 BINARY_DOCKER_COMMAND_SANITIZER = (
     BINARY_DOCKER_COMMAND + "+--security-opt seccomp=unconfined"
@@ -467,7 +460,7 @@ class JobConfigs:
         Job.ParamSet(
             parameter=BuildTypes.AMD_CFI,
             provides=[ArtifactNames.CH_AMD_CFI],
-            runs_on=RunnerLabels.BUILDER_AMD,
+            runs_on=RunnerLabels.ARM_LARGE,
             timeout=4 * 3600,
         ),
     )
@@ -510,12 +503,12 @@ class JobConfigs:
         ).parametrize(
             Job.ParamSet(
                 parameter=BuildTypes.AMD_RELEASE_PR_CACHE_WARMUP,
-                runs_on=RunnerLabels.BUILDER_AMD,
+                runs_on=RunnerLabels.ARM_LARGE,
                 timeout=3 * 3600,
             ),
             Job.ParamSet(
                 parameter=BuildTypes.ARM_RELEASE_PR_CACHE_WARMUP,
-                runs_on=RunnerLabels.BUILDER_ARM,
+                runs_on=RunnerLabels.ARM_LARGE,
             ),
         )
     ]
