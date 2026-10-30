@@ -60,8 +60,8 @@ name: Regression test workflow - Release
       DOCKER_USERNAME:
         description: username of the docker user.
         required: true
-      DOCKER_PASSWORD:
-        description: password to the docker user.
+      DOCKER_TOKEN:
+        description: token of the docker user.
         required: true
       REGRESSION_AWS_S3_BUCKET:
         description: aws s3 bucket used for regression tests.
