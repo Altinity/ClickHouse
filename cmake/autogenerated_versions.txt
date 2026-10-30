@@ -2,15 +2,24 @@
 
 # NOTE: VERSION_REVISION has nothing common with DBMS_TCP_PROTOCOL_VERSION,
 # only DBMS_TCP_PROTOCOL_VERSION should be incremented on protocol changes.
-SET(VERSION_REVISION 54523)
+SET(VERSION_REVISION 54546)
 SET(VERSION_MAJOR 26)
 SET(VERSION_MINOR 8)
-SET(VERSION_PATCH 11)
-SET(VERSION_GITHASH bedf2ab54b8a0c34afbf2d907eaf933324f43cd6)
-SET(VERSION_DESCRIBE v26.8.11.10001.altinitytest)
-SET(VERSION_STRING 26.8.11.10001.altinitytest)
+SET(VERSION_PATCH 34)
+SET(VERSION_GITHASH 4ca42662d1a0175631b2f340620d5a50dd049999)
+SET(VERSION_DESCRIBE v26.8.34.1-lts)
+SET(VERSION_STRING 26.8.34.1)
 # end of autochange
+
+# Note (strtgbb): 
+# Do not customize VERSION_DESCRIBE or VERSION_STRING
+# They will be overwritten at compile time
+# Only modify the below
 
 SET(VERSION_TWEAK 10001)
 SET(VERSION_FLAVOUR altinitytest)
 
+# Pre-release flavour (this file) → release flavour (tag):
+#   altinitytest     → altinitystable
+#   antalyatest      → altinityantalya
+#   altinityfipstest → altinityfips
