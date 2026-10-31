@@ -224,8 +224,9 @@ static Plan getPlan(
     /// from createEmptyMetadataFile, which produces format_version 2, so a v3 table would be
     /// silently downgraded and lose v3-only state such as row lineage (first_row_id /
     /// next_row_id).
-    if (initial_metadata_object->getValue<Int32>(Iceberg::f_format_version) != 2)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Compaction is supported only for format_version 2.");
+    const Int32 format_version = initial_metadata_object->getValue<Int32>(Iceberg::f_format_version);
+    if (format_version != 2)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Compaction is supported only for format_version 2, got {}", format_version);
 
     /// `writeMetadataFiles` partitions by the default spec only after the rewritten data files are written,
     /// so an unsupported spec must be rejected here, before any object is created.
@@ -891,8 +892,8 @@ static bool writeConsolidatedManifestFile(
                 manifest_min_sequence_number = std::min(manifest_min_sequence_number, lineage.sequence_number.value_or(0));
 
             ManifestListEntryCounts consolidated_counts;
-            consolidated_counts.files_count = static_cast<Int64>(pd.file_paths.size());
-            consolidated_counts.rows_count = manifest_existing_rows;
+            consolidated_counts.existing_files_count = static_cast<Int64>(pd.file_paths.size());
+            consolidated_counts.existing_rows_count = manifest_existing_rows;
             consolidated_counts.min_sequence_number = manifest_min_sequence_number;
             existing_entry_counts.push_back(consolidated_counts);
 
@@ -1060,22 +1061,36 @@ bool overwriteIsPositionDeleteOnly(const SnapshotSummaryUpdateOverwrite & update
         case SnapshotSummaryOperation::OVERWRITE: {
             if (overwriteIsPositionDeleteOnly(summary->getUpdate<Iceberg::SnapshotSummaryUpdateOverwrite>()))
                 return std::nullopt;
-            [[fallthrough]];
-        }
-        case SnapshotSummaryOperation::REPLACE:
             throw DB::Exception(ErrorCodes::NOT_IMPLEMENTED, "Unsupported snapshot's operation type {}", summary->getOperation());
+        }
+        case SnapshotSummaryOperation::REPLACE: {
+            /// A `replace` can only be the first snapshot of the compacted history (see `compactIcebergTable`),
+            /// so it is regenerated as an append of all its live data files.
+            const auto totals = summary->getTotals();
+            return SnapshotSummaryUpdateAppend{
+                .added_files = totals.data_files,
+                .added_records = totals.records,
+                .added_files_size = totals.files_size,
+                .num_partitions = summary->getUpdate<Iceberg::SnapshotSummaryUpdateReplace>().num_partitions};
+        }
     }
 };
 
 namespace
 {
 
-/// Current experimental compact implementation expects snapshots to be either appends or overwrites which has only position deletes
-/// Lets force this invariant
+/// Current experimental compact implementation expects snapshots to be either appends or overwrites which has only position deletes,
+/// optionally preceded by a single `replace`. Lets force this invariant
 void checkIfIcebergHistorySupported(const IcebergHistory & history)
 {
-    for (const auto & history_record : history)
+    for (size_t i = 0; i < history.size(); ++i)
     {
+        const auto & history_record = history[i];
+        if (i != 0 && history_record.snapshot_summary
+            && history_record.snapshot_summary->getOperation() == SnapshotSummaryOperation::REPLACE)
+            throw DB::Exception(
+                ErrorCodes::LOGICAL_ERROR, "A replace snapshot must start the compacted history, snapshot={}", history_record.snapshot_id);
+
         auto append = tryGetAppendUpdate(history_record);
         if (append && append->added_files == 0)
             throw DB::Exception(
@@ -1273,8 +1288,8 @@ static void writeMetadataFiles(
                 for (const auto rows : file_row_counts)
                     manifest_rows += static_cast<Int64>(rows);
                 ManifestListEntryCounts counts;
-                counts.files_count = static_cast<Int64>(data_files_vec.size());
-                counts.rows_count = manifest_rows;
+                counts.added_files_count = static_cast<Int64>(data_files_vec.size());
+                counts.added_rows_count = manifest_rows;
                 counts.min_sequence_number = remapped_sequence_number;
                 counts.added_snapshot_id = manifest_lineage.added_snapshot_id;
                 counts.added_sequence_number = remapped_sequence_number;
@@ -1361,7 +1376,13 @@ static void writeMetadataFiles(
             ManifestListEntryCounts counts;
             if (auto it = manifest_file_counts.find(entry); it != manifest_file_counts.end())
                 counts = it->second;
-            counts.counts_are_added = counts.added_snapshot_id.has_value() && *counts.added_snapshot_id == list_snapshot_id;
+            if (!counts.added_snapshot_id.has_value() || *counts.added_snapshot_id != list_snapshot_id)
+            {
+                counts.existing_files_count = counts.added_files_count;
+                counts.existing_rows_count = counts.added_rows_count;
+                counts.added_files_count = 0;
+                counts.added_rows_count = 0;
+            }
             entry_counts.push_back(counts);
         }
         auto buffer_manifest_list = object_storage->writeObject(
@@ -1597,6 +1618,16 @@ void compactIcebergTable(
     ContextPtr context_,
     const String & write_format)
 {
+    /// Snapshots before the latest `replace` reference data files it removed. Compaction regenerates the
+    /// history from that snapshot on, which expires the older snapshots.
+    auto last_replace = std::find_if(
+        snapshots_info.rbegin(),
+        snapshots_info.rend(),
+        [](const Iceberg::IcebergHistoryRecord & record)
+        { return record.snapshot_summary && record.snapshot_summary->getOperation() == SnapshotSummaryOperation::REPLACE; });
+    if (last_replace != snapshots_info.rend())
+        snapshots_info.erase(snapshots_info.begin(), std::prev(last_replace.base()));
+
     checkIfIcebergHistorySupported(snapshots_info);
 
     auto plan = getPlan(
