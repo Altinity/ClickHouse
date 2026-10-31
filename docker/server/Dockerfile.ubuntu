@@ -26,7 +26,6 @@ RUN sed -i "s|http://archive.ubuntu.com|${apt_archive}|g" /etc/apt/sources.list 
         tzdata \
         wget \
     && apt-get upgrade --yes --no-install-recommends \
-    && busybox --install -s \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /var/cache/debconf /tmp/*
 
