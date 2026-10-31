@@ -283,7 +283,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (release)
-      runner_type: altinity-func-tester
+      runner_type: altinity-func-tester, 16c
       data: ${{ needs.RunConfig.outputs.data }}
   FunctionalStatelessTestAarch64:
     needs: [RunConfig, BuilderDebAarch64]
@@ -292,7 +292,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (aarch64)
-      runner_type: altinity-func-tester-aarch64
+      runner_type: altinity-func-tester-aarch64, 16c
       data: ${{ needs.RunConfig.outputs.data }}
   FunctionalStatelessTestAsan:
     needs: [RunConfig, BuilderDebAsan]
@@ -301,7 +301,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (asan)
-      runner_type: altinity-func-tester
+      runner_type: altinity-func-tester, 32g
       data: ${{ needs.RunConfig.outputs.data }}
   FunctionalStatelessTestTsan:
     needs: [RunConfig, BuilderDebTsan]
@@ -310,7 +310,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (tsan)
-      runner_type: altinity-func-tester
+      runner_type: altinity-func-tester, 32g
       data: ${{ needs.RunConfig.outputs.data }}
   FunctionalStatelessTestUBsan:
     needs: [RunConfig, BuilderDebUBsan]
@@ -319,7 +319,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (ubsan)
-      runner_type: altinity-func-tester
+      runner_type: altinity-func-tester, 32g
       data: ${{ needs.RunConfig.outputs.data }}
   FunctionalStatelessTestDebug:
     needs: [RunConfig, BuilderDebDebug]
@@ -328,7 +328,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (debug)
-      runner_type: altinity-func-tester
+      runner_type: altinity-func-tester, 16c
       data: ${{ needs.RunConfig.outputs.data }}
 ##############################################################################################
 ######################################### STRESS TESTS #######################################
@@ -379,7 +379,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Integration tests (asan)
-      runner_type: altinity-func-tester
+      runner_type: altinity-func-tester, 16c
       data: ${{ needs.RunConfig.outputs.data }}
   IntegrationTestsAnalyzerAsan:
     needs: [RunConfig, BuilderDebAsan]
@@ -388,7 +388,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Integration tests (asan, old analyzer)
-      runner_type: altinity-func-tester
+      runner_type: altinity-func-tester, 16c
       data: ${{ needs.RunConfig.outputs.data }}
   IntegrationTestsTsan:
     needs: [RunConfig, BuilderDebTsan]
@@ -397,7 +397,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Integration tests (tsan)
-      runner_type: altinity-func-tester
+      runner_type: altinity-func-tester, 16c
       data: ${{ needs.RunConfig.outputs.data }}
   IntegrationTestsRelease:
     needs: [RunConfig, BuilderDebRelease]
@@ -406,7 +406,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Integration tests (release)
-      runner_type: altinity-func-tester
+      runner_type: altinity-func-tester, 16c
       data: ${{ needs.RunConfig.outputs.data }}
 #############################################################################################
 ##################################### REGRESSION TESTS ######################################
@@ -418,10 +418,10 @@ jobs:
     secrets: inherit
     with:
       runner_type: altinity-regression-tester
-      commit: e1f4e6ae0d862388e113cbc74b8dab32b9db64fc
+      commit: release
       arch: release
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-      timeout_minutes: 300
+      timeout_minutes: 210
   RegressionTestsAarch64:
     needs: [RunConfig, BuilderDebAarch64]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.RunConfig.outputs.data).ci_settings.exclude_keywords, 'regression') && !contains(fromJson(needs.RunConfig.outputs.data).ci_settings.exclude_keywords, 'aarch64')}}
@@ -429,10 +429,10 @@ jobs:
     secrets: inherit
     with:
       runner_type: altinity-regression-tester-aarch64
-      commit: e1f4e6ae0d862388e113cbc74b8dab32b9db64fc
+      commit: release
       arch: aarch64
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-      timeout_minutes: 300
+      timeout_minutes: 210
   SignRelease:
     needs: [RunConfig, BuilderDebRelease]
     if: ${{ !failure() && !cancelled() }}
@@ -478,6 +478,7 @@ jobs:
       - RegressionTestsAarch64
       - GrypeScan
       - SignRelease
+      - SignAarch64
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     steps:
       - name: Check out repository code
