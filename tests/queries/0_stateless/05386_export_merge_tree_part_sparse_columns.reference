@@ -1,0 +1,7 @@
+---- Sparse column cast to a wider type, first granule without zeros
+Sparse
+300000	0
+---- Sparse Nullable column, null counts
+Sparse
+299699	0
+299699
