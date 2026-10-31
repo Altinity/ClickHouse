@@ -831,6 +831,9 @@ void mutate(
             }
         }
 
+        /// Register the metadata.json schemas before the manifest headers carry copies of them without the type annotations.
+        addIcebergTableSchemasFromMetadata(metadata, *persistent_table_components.schema_processor, context);
+
         /// Validate against the freshly-fetched snapshot. Bound to this exact
         /// metadata version, so a concurrent writer that commits non-Parquet
         /// data files between iterations is caught by the next retry.
@@ -939,6 +942,9 @@ void alter(
         auto metadata = getMetadataJSONObject(metadata_path, object_storage, persistent_table_components.metadata_cache, context, log, compression_method, persistent_table_components.table_uuid);
 
         const auto previous_schema_id = metadata->getValue<Int32>(Iceberg::f_current_schema_id);
+        Poco::JSON::Object::Ptr previous_properties = metadata->has(Iceberg::f_properties)
+            ? new Poco::JSON::Object(*metadata->getObject(Iceberg::f_properties))
+            : new Poco::JSON::Object;
 
         auto metadata_json_generator = MetadataGenerator(metadata);
 
@@ -1026,7 +1032,9 @@ void alter(
                 metadata->getValue<Int32>(Iceberg::f_last_column_id),
                 getHighestFieldId(new_schema));
             commit_attempted = true;
-            if (!catalog->updateSchema(namespace_name, table_name, catalog_filename, new_schema, previous_schema_id, new_last_column_id, metadata, context->getForwardedAuthToken()))
+            if (!catalog->updateSchema(
+                    namespace_name, table_name, catalog_filename, new_schema, previous_schema_id, new_last_column_id, metadata,
+                    previous_properties, context->getForwardedAuthToken()))
             {
                 ++i;
                 continue;

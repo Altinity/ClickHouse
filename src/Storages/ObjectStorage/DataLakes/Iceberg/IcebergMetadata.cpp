@@ -1,5 +1,6 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/SnapshotSummary.h>
 #include <base/defines.h>
+#include <DataTypes/DataTypeAggregateFunction.h>
 #include <DataTypes/DataTypeString.h>
 #include <base/sleep.h>
 #include "config.h"
@@ -156,6 +157,7 @@ extern const SettingsString iceberg_metadata_compression_method;
 extern const SettingsBool allow_insert_into_iceberg;
 extern const SettingsBool allow_experimental_iceberg_compaction;
 extern const SettingsBool allow_experimental_geo_types_in_iceberg;
+extern const SettingsBool allow_experimental_aggregate_function_states_in_open_formats;
 extern const SettingsBool allow_iceberg_remove_orphan_files;
 extern const SettingsBool allow_experimental_expire_snapshots;
 extern const SettingsSeconds lock_acquire_timeout;
@@ -288,7 +290,7 @@ Iceberg::PersistentTableComponents IcebergMetadata::initializePersistentTableCom
 }
 
 std::pair<IcebergDataSnapshotPtr, TableStateSnapshot> IcebergMetadata::getRelevantState(
-    const ContextPtr & context, bool force_fetch_latest_metadata) const
+    const ContextPtr & context, bool force_fetch_latest_metadata, SchemaParsing schema_parsing) const
 {
     const auto [metadata_version, metadata_file_path, compression_method] = getLatestOrExplicitMetadataFileAndVersion(
         object_storage,
@@ -300,7 +302,7 @@ std::pair<IcebergDataSnapshotPtr, TableStateSnapshot> IcebergMetadata::getReleva
         persistent_components.table_uuid,
         persistent_components.metadata_compression_method,
         force_fetch_latest_metadata);
-    return getState(context, metadata_file_path, metadata_version);
+    return getState(context, metadata_file_path, metadata_version, schema_parsing);
 }
 
 IcebergMetadata::IcebergMetadata(
@@ -361,8 +363,10 @@ void IcebergMetadata::backgroundMetadataPrefetcherThread()
         /// first, we fetch the latest metadata version and cache it;
         /// as a part of the same method, we download metadata.json of the latest metadata version
         /// and after parsing it, we fetch manifest lists, parse and cache them
+        ///
+        /// Schema parsing depends on query settings, which a background prefetch has no authority to apply.
         auto ctx = Context::createCopy(Context::getGlobalContextInstance());
-        auto [actual_data_snapshot, actual_table_state_snapshot] = getRelevantState(ctx, true);
+        auto [actual_data_snapshot, actual_table_state_snapshot] = getRelevantState(ctx, true, SchemaParsing::Skip);
         if (actual_data_snapshot)
         {
             for (const auto & entry : actual_data_snapshot->manifest_list_entries)
@@ -394,19 +398,27 @@ Int32 IcebergMetadata::parseTableSchema(
     const Poco::JSON::Object::Ptr & metadata_object,
     IcebergSchemaProcessor & schema_processor,
     ContextPtr context_,
-    LoggerPtr metadata_logger)
+    LoggerPtr metadata_logger,
+    SchemaParsing schema_parsing)
 {
     const auto format_version = metadata_object->getValue<Int32>(f_format_version);
 
     if (metadata_object->has(f_last_column_id) && !metadata_object->isNull(f_last_column_id))
         schema_processor.updateLastColumnId(metadata_object->getValue<Int32>(f_last_column_id));
 
+    auto add_schema = [&](const Poco::JSON::Object::Ptr & schema)
+    {
+        if (schema_parsing == SchemaParsing::Parse)
+            schema_processor.addIcebergTableSchema(
+                schema, context_, getClickHouseTypeAnnotations(metadata_object, schema->getValue<Int32>(f_schema_id)));
+    };
+
     /// v2 and v3 (and later) store schemas in the `schemas` array. Only v1 has a top-level `schema`.
     /// Using the v1 parser first for v3 looks like a spec violation and logs a false warning.
     if (format_version >= 2)
     {
         auto [schema, current_schema_id] = parseTableSchemaV2Method(metadata_object);
-        schema_processor.addIcebergTableSchema(schema, context_);
+        add_schema(schema);
         return current_schema_id;
     }
     else
@@ -414,7 +426,7 @@ Int32 IcebergMetadata::parseTableSchema(
         try
         {
             auto [schema, current_schema_id] = parseTableSchemaV1Method(metadata_object);
-            schema_processor.addIcebergTableSchema(schema, context_);
+            add_schema(schema);
             return current_schema_id;
         }
         catch (const Exception & first_error)
@@ -424,7 +436,7 @@ Int32 IcebergMetadata::parseTableSchema(
             try
             {
                 auto [schema, current_schema_id] = parseTableSchemaV2Method(metadata_object);
-                schema_processor.addIcebergTableSchema(schema, context_);
+                add_schema(schema);
                 LOG_WARNING(
                     metadata_logger,
                     "Iceberg table schema was parsed using v2 specification, but it was impossible to parse it using v1 "
@@ -451,17 +463,22 @@ static Poco::JSON::Object::Ptr traverseMetadataAndFindNecessarySnapshotObject(
     Poco::JSON::Object::Ptr metadata_object,
     Int64 snapshot_id,
     IcebergSchemaProcessorPtr schema_processor,
-    ContextPtr local_context)
+    ContextPtr local_context,
+    IcebergMetadata::SchemaParsing schema_parsing)
 {
     if (!metadata_object->has(f_snapshots))
         throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION, "No snapshot set found in metadata for iceberg file");
     if (metadata_object->has(f_last_column_id) && !metadata_object->isNull(f_last_column_id))
         schema_processor->updateLastColumnId(metadata_object->getValue<Int32>(f_last_column_id));
-    auto schemas = metadata_object->get(f_schemas).extract<Poco::JSON::Array::Ptr>();
-    for (UInt32 j = 0; j < schemas->size(); ++j)
+    if (schema_parsing == IcebergMetadata::SchemaParsing::Parse)
     {
-        auto schema = schemas->getObject(j);
-        schema_processor->addIcebergTableSchema(schema, local_context);
+        auto schemas = metadata_object->get(f_schemas).extract<Poco::JSON::Array::Ptr>();
+        for (UInt32 j = 0; j < schemas->size(); ++j)
+        {
+            auto schema = schemas->getObject(j);
+            schema_processor->addIcebergTableSchema(
+                schema, local_context, getClickHouseTypeAnnotations(metadata_object, schema->getValue<Int32>(f_schema_id)));
+        }
     }
     Poco::JSON::Object::Ptr current_snapshot = nullptr;
     auto snapshots = metadata_object->get(f_snapshots).extract<Poco::JSON::Array::Ptr>();
@@ -525,14 +542,15 @@ IcebergDataSnapshotPtr IcebergMetadata::createIcebergDataSnapshotFromSnapshotJSO
         total_equality_deletes);
 }
 
-IcebergDataSnapshotPtr
-IcebergMetadata::getIcebergDataSnapshot(Poco::JSON::Object::Ptr metadata_object, Int64 snapshot_id, ContextPtr local_context) const
+IcebergDataSnapshotPtr IcebergMetadata::getIcebergDataSnapshot(
+    Poco::JSON::Object::Ptr metadata_object, Int64 snapshot_id, ContextPtr local_context, SchemaParsing schema_parsing) const
 {
     auto object = traverseMetadataAndFindNecessarySnapshotObject(
         metadata_object,
         snapshot_id,
         persistent_components.schema_processor,
-        local_context);
+        local_context,
+        schema_parsing);
     if (!object)
         throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION, "No snapshot found for id `{}`", snapshot_id);
 
@@ -623,7 +641,7 @@ bool IcebergMetadata::optimizeManifestFiles(
 }
 
 std::pair<IcebergDataSnapshotPtr, Int32>
-IcebergMetadata::getStateImpl(const ContextPtr & local_context, Poco::JSON::Object::Ptr metadata_object) const
+IcebergMetadata::getStateImpl(const ContextPtr & local_context, Poco::JSON::Object::Ptr metadata_object, SchemaParsing schema_parsing) const
 {
     std::optional<String> manifest_list_file;
 
@@ -664,18 +682,18 @@ IcebergMetadata::getStateImpl(const ContextPtr & local_context, Poco::JSON::Obje
                 ErrorCodes::BAD_ARGUMENTS,
                 "No snapshot found in snapshot log before requested timestamp for iceberg table {}",
                 persistent_components.table_path);
-        auto data_snapshot = getIcebergDataSnapshot(metadata_object, *current_snapshot_id, local_context);
+        auto data_snapshot = getIcebergDataSnapshot(metadata_object, *current_snapshot_id, local_context, schema_parsing);
         return {data_snapshot, static_cast<Int32>(data_snapshot->schema_id_on_snapshot_commit)};
     }
     else if (snapshot_id_changed)
     {
         Int64 current_snapshot_id = local_context->getSettingsRef()[Setting::iceberg_snapshot_id];
-        auto data_snapshot = getIcebergDataSnapshot(metadata_object, current_snapshot_id, local_context);
+        auto data_snapshot = getIcebergDataSnapshot(metadata_object, current_snapshot_id, local_context, schema_parsing);
         return {data_snapshot, static_cast<Int32>(data_snapshot->schema_id_on_snapshot_commit)};
     }
     else
     {
-        auto schema_id = parseTableSchema(metadata_object, *persistent_components.schema_processor, local_context, log);
+        auto schema_id = parseTableSchema(metadata_object, *persistent_components.schema_processor, local_context, log, schema_parsing);
         if (!metadata_object->has(f_current_snapshot_id))
         {
             return {nullptr, schema_id};
@@ -687,13 +705,14 @@ IcebergMetadata::getStateImpl(const ContextPtr & local_context, Poco::JSON::Obje
         {
             return {nullptr, schema_id};
         }
-        auto data_snapshot = getIcebergDataSnapshot(metadata_object, current_snapshot_id, local_context);
+        auto data_snapshot = getIcebergDataSnapshot(metadata_object, current_snapshot_id, local_context, schema_parsing);
         return {data_snapshot, schema_id};
     }
 }
 
 std::pair<IcebergDataSnapshotPtr, TableStateSnapshot>
-IcebergMetadata::getState(const ContextPtr & local_context, const String & metadata_path, Int32 metadata_version) const
+IcebergMetadata::getState(
+    const ContextPtr & local_context, const String & metadata_path, Int32 metadata_version, SchemaParsing schema_parsing) const
 {
     IcebergDataSnapshotPtr data_snapshot;
     TableStateSnapshot table_state_snapshot;
@@ -710,7 +729,7 @@ IcebergMetadata::getState(const ContextPtr & local_context, const String & metad
         std::nullopt,
         std::nullopt);
 
-    std::tie(data_snapshot, table_state_snapshot.schema_id) = getStateImpl(local_context, metadata_object);
+    std::tie(data_snapshot, table_state_snapshot.schema_id) = getStateImpl(local_context, metadata_object, schema_parsing);
     table_state_snapshot.snapshot_id = data_snapshot ? std::optional{data_snapshot->snapshot_id} : std::nullopt;
     table_state_snapshot.metadata_version = metadata_version;
     table_state_snapshot.metadata_file_path = metadata_path;
@@ -992,6 +1011,22 @@ void IcebergMetadata::alterPartitionDropImpl(
     executor.run();
 }
 
+static void checkAggregateFunctionStatesAllowed(const String & column_name, const DataTypePtr & type, const ContextPtr & context)
+{
+    if (!type || !needsClickHouseTypeAnnotation(type))
+        return;
+    if (context->getSettingsRef()[Setting::allow_experimental_aggregate_function_states_in_open_formats])
+        return;
+
+    throw Exception(
+        ErrorCodes::SUPPORT_IS_DISABLED,
+        "Column '{}' has type {}, which Iceberg cannot express natively: the aggregate state is stored as "
+        "binary and its ClickHouse type is recorded in the table properties. To allow this, enable setting "
+        "allow_experimental_aggregate_function_states_in_open_formats",
+        column_name,
+        type->getName());
+}
+
 void IcebergMetadata::alter(
     const AlterCommands & params,
     ContextPtr context,
@@ -1005,6 +1040,9 @@ void IcebergMetadata::alter(
             "Alter iceberg is experimental. "
             "To allow its usage, enable setting allow_insert_into_iceberg");
     }
+
+    for (const auto & command : params)
+        checkAggregateFunctionStatesAllowed(command.column_name, command.data_type, context);
 
     Iceberg::alter(params, context, storage_id, object_storage, data_lake_settings, persistent_components, write_format, catalog);
 }
@@ -1131,6 +1169,9 @@ void IcebergMetadata::createInitial(
         }
     }
 
+    for (const auto & column : columns->getAll())
+        checkAggregateFunctionStatesAllowed(column.name, column.type, local_context);
+
     String location_path = configuration_ptr->getRawPath().path;
     if (!location_path.contains("://") && !location_path.starts_with('/'))
         location_path = "/" + location_path;
@@ -1251,7 +1292,7 @@ Iceberg::IcebergDataSnapshotPtr IcebergMetadata::getRelevantDataSnapshotFromTabl
     if (!table_state_snapshot.snapshot_id.has_value())
         return nullptr;
     Poco::JSON::Object::Ptr snapshot_object = traverseMetadataAndFindNecessarySnapshotObject(
-        metadata_object, *table_state_snapshot.snapshot_id, persistent_components.schema_processor, local_context);
+        metadata_object, *table_state_snapshot.snapshot_id, persistent_components.schema_processor, local_context, SchemaParsing::Parse);
 
     return createIcebergDataSnapshotFromSnapshotJSON(snapshot_object, *table_state_snapshot.snapshot_id, local_context);
 }

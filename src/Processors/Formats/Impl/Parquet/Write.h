@@ -28,6 +28,7 @@ struct WriteOptions
     bool output_date_as_uint16 = false;
     bool output_enum_as_byte_array = false;
     bool output_timestamp_adjusted_to_utc_from_timezone = false;
+    bool allow_aggregate_function_states = false;
 
     /// Note: the meaning of some compression methods here is different from
     /// wrapReadBufferWithCompressionMethod:

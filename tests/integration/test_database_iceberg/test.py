@@ -3939,3 +3939,67 @@ def test_datalake_catalog_wrapper_object_storage_cluster(started_cluster, engine
             node2.query(f"DROP DATABASE IF EXISTS {catalog_db}")
         if cluster_mode == "database":
             node.query(f"DROP DATABASE IF EXISTS {cluster_catalog_name}")
+
+
+def test_clickhouse_type_annotation_survives_catalog(started_cluster):
+    node = started_cluster.instances["node1"]
+    ns, tbl = f"ann_{uuid.uuid4().hex}", "t"
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+    node.query(
+        f"""
+CREATE TABLE {CATALOG_NAME}.`{ns}.{tbl}` (id Int64, s SimpleAggregateFunction(sum, Int64))
+ENGINE = IcebergS3('http://minio1:9001/warehouse-rest/{ns}/', '{minio_access_key}', '{minio_secret_key}')
+SETTINGS allow_experimental_aggregate_function_states_in_open_formats = 1
+    """,
+        settings={
+            "allow_experimental_database_iceberg": 1,
+            "write_full_path_in_iceberg_metadata": 1,
+            "allow_experimental_aggregate_function_states_in_open_formats": 1,
+        },
+    )
+    catalog = load_catalog_impl(started_cluster)
+
+    def metadata():
+        loc = catalog.load_table(f"{ns}.{tbl}").metadata_location
+        bucket, key = loc[len("s3://"):].split("/", 1)
+        return json.loads(get_file_contents(started_cluster.minio_client, bucket, key))
+
+    def annotations(schema_id=None):
+        # The `clickhouse.type.<field-id>.<schema-id>` entry with the greatest schema id not above `schema_id` is in effect.
+        meta = metadata()
+        if schema_id is None:
+            schema_id = meta["current-schema-id"]
+        schema = next(s for s in meta["schemas"] if s["schema-id"] == schema_id)
+        entries = {}
+        for key, value in meta.get("properties", {}).items():
+            parts = key.split(".")
+            if len(parts) == 4 and parts[:2] == ["clickhouse", "type"] and parts[2].isdigit() and parts[3].isdigit():
+                field_id, entry_schema_id = int(parts[2]), int(parts[3])
+                if entry_schema_id <= schema_id and entry_schema_id >= entries.get(field_id, (-1, None))[0]:
+                    entries[field_id] = (entry_schema_id, value)
+        return {f["name"]: entries.get(f["id"], (None, None))[1] or None for f in schema["fields"]}
+
+    # 1. Survives CREATE through the REST catalog?
+    assert annotations()["s"] == "SimpleAggregateFunction(sum, Int64)"
+    # 2. Survives a commit by another engine?
+    arrow_schema = pa.schema([pa.field("id", pa.int64(), nullable=False),
+                              pa.field("s", pa.int64(), nullable=False)])
+    catalog.load_table(f"{ns}.{tbl}").append(
+        pa.Table.from_pylist([{"id": 1, "s": 2}], schema=arrow_schema))
+    assert annotations()["s"] == "SimpleAggregateFunction(sum, Int64)"
+    # 3. ClickHouse still sees the type
+    assert "SimpleAggregateFunction" in node.query(f"DESCRIBE {CATALOG_NAME}.`{ns}.{tbl}`")
+    # 4. ALTER through the catalog records and removes the annotation
+    alter_settings = {"allow_insert_into_iceberg": 1, "allow_experimental_aggregate_function_states_in_open_formats": 1}
+    node.query(
+        f"ALTER TABLE {CATALOG_NAME}.`{ns}.{tbl}` ADD COLUMN m SimpleAggregateFunction(max, Nullable(Int64))",
+        settings=alter_settings)
+    assert annotations()["m"] == "SimpleAggregateFunction(max, Nullable(Int64))"
+    schema_id_before_modify = metadata()["current-schema-id"]
+    node.query(f"ALTER TABLE {CATALOG_NAME}.`{ns}.{tbl}` MODIFY COLUMN s Int64", settings=alter_settings)
+    # Only the annotation changes, so the catalog keeps the current schema.
+    assert metadata()["current-schema-id"] == schema_id_before_modify
+    assert annotations() == {"id": None, "s": None, "m": "SimpleAggregateFunction(max, Nullable(Int64))"}
+    # The schema the first rows were written with keeps its annotation.
+    assert annotations(0) == {"id": None, "s": "SimpleAggregateFunction(sum, Int64)"}
+    assert node.query(f"SELECT id, s, toTypeName(s) FROM {CATALOG_NAME}.`{ns}.{tbl}`") == "1\t2\tInt64\n"

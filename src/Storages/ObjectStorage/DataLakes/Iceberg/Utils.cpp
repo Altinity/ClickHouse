@@ -8,6 +8,7 @@
 #include <Core/ColumnsWithTypeAndName.h>
 #include <Core/Settings.h>
 #include <Core/TypeId.h>
+#include <DataTypes/DataTypeAggregateFunction.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeCustom.h>
 #include <DataTypes/DataTypeDateTime64.h>
@@ -43,6 +44,7 @@
 #include <Poco/UUIDGenerator.h>
 #include <Common/DateLUT.h>
 #include <Common/quoteString.h>
+#include <Common/StringUtils.h>
 #include <Core/ColumnWithTypeAndName.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Disks/IStoragePolicy.h>
@@ -52,10 +54,263 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #include <Poco/String.h>
 
+#include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
+
+namespace DB::ErrorCodes
+{
+extern const int BAD_ARGUMENTS;
+}
+
+namespace DB::Iceberg
+{
+
+/// Returns type and required
+std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & iter, UInt64 format_version)
+{
+    switch (type->getTypeId())
+    {
+        case TypeIndex::UInt8:
+        {
+            if (isBool(type))
+                return {"boolean", true};
+            return {"int", true};
+        }
+        case TypeIndex::Int8:
+        case TypeIndex::UInt16:
+        case TypeIndex::Int16:
+        case TypeIndex::UInt32:
+        case TypeIndex::Int32:
+            return {"int", true};
+        case TypeIndex::UInt64:
+        case TypeIndex::Int64:
+            return {"long", true};
+        case TypeIndex::Float32:
+            return {"float", true};
+        case TypeIndex::Float64:
+            return {"double", true};
+        case TypeIndex::Date:
+        case TypeIndex::Date32:
+            return {"date", true};
+        case TypeIndex::DateTime:
+            return {"timestamp", true};
+        case TypeIndex::DateTime64:
+        {
+            /// Iceberg `timestamp` is microseconds; `timestamp_ns` is nanoseconds and is
+            /// allowed only in format version 3. Writing it into v1/v2 metadata is invalid.
+            const auto scale = getDecimalScale(*type);
+            if (scale == 9)
+            {
+                if (format_version < 3)
+                    throw Exception(
+                        ErrorCodes::BAD_ARGUMENTS,
+                        "Iceberg type {} requires format version 3 or higher, got version {}",
+                        type->getName(),
+                        format_version);
+
+                auto date_time64 = std::static_pointer_cast<const DataTypeDateTime64>(type);
+                if (date_time64->hasExplicitTimeZone())
+                    return {Iceberg::f_timestamptz_ns, true};
+                return {Iceberg::f_timestamp_ns, true};
+            }
+            if (scale <= 6)
+                return {Iceberg::f_timestamp, true};
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unsupported type for iceberg {}", type->getName());
+        }
+        case TypeIndex::Time:
+            return {"time", true};
+        case TypeIndex::Time64:
+            if (getDecimalScale(*type) <= 6)
+                return {"time", true};
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unsupported type for iceberg {}", type->getName());
+        case TypeIndex::String:
+            return {"string", true};
+        case TypeIndex::AggregateFunction:
+            return {Iceberg::f_binary, true};
+        case TypeIndex::UUID:
+            return {"uuid", true};
+        case TypeIndex::Nothing:
+            return {"unknown", false};
+        case TypeIndex::Decimal32:
+        case TypeIndex::Decimal64:
+        case TypeIndex::Decimal128:
+        case TypeIndex::Decimal256:
+        {
+            auto precision = getDecimalPrecision(*type);
+            if (precision > 38)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Iceberg decimal type supports precision up to 38, got {}", precision);
+            return {"decimal(" + std::to_string(precision) + ", " + std::to_string(getDecimalScale(*type)) + ")", true};
+        }
+        case TypeIndex::Tuple:
+        {
+            auto type_tuple = std::static_pointer_cast<const DataTypeTuple>(type);
+            Poco::JSON::Object::Ptr result = new Poco::JSON::Object;
+            result->set(Iceberg::f_type, "struct");
+            Poco::JSON::Array::Ptr fields = new Poco::JSON::Array;
+            size_t iter_names = 1;
+            size_t iter_fields = iter;
+            iter += type_tuple->getElements().size();
+            for (const auto & element : type_tuple->getElements())
+            {
+                Poco::JSON::Object::Ptr field = new Poco::JSON::Object;
+                field->set(Iceberg::f_id, ++iter_fields);
+                field->set(Iceberg::f_name, type_tuple->getNameByPosition(iter_names));
+                /// Recurse on the element itself: `getNormalizedType` would rename a nested
+                /// tuple's elements to "1", "2", ... (`DataTypeTuple::getNormalizedType`).
+                auto child_type = getIcebergType(element, iter, format_version);
+                field->set(Iceberg::f_required, child_type.second);
+                field->set(Iceberg::f_type, child_type.first);
+                fields->add(field);
+                ++iter_names;
+            }
+            result->set(Iceberg::f_fields, fields);
+            return {result, true};
+        }
+        case TypeIndex::Array:
+        {
+            auto type_array = std::static_pointer_cast<const DataTypeArray>(type);
+            Poco::JSON::Object::Ptr field = new Poco::JSON::Object;
+
+            field->set(Iceberg::f_type, "list");
+            field->set(Iceberg::f_element_id, ++iter);
+            auto child_type = getIcebergType(type_array->getNestedType(), iter, format_version);
+            field->set(Iceberg::f_required, false);
+            field->set(Iceberg::f_element, child_type.first);
+            field->set(Iceberg::f_element_required, child_type.second);
+            return {field, true};
+        }
+        case TypeIndex::Map:
+        {
+            auto type_map = std::static_pointer_cast<const DataTypeMap>(type);
+            Poco::JSON::Object::Ptr field = new Poco::JSON::Object;
+
+            field->set(Iceberg::f_type, "map");
+            field->set(Iceberg::f_key_id, ++iter);
+            field->set(Iceberg::f_value_id, ++iter);
+
+            field->set(Iceberg::f_key, getIcebergType(type_map->getKeyType(), iter, format_version).first);
+            auto value_type = getIcebergType(type_map->getValueType(), iter, format_version);
+            field->set(Iceberg::f_value, value_type.first);
+            field->set(Iceberg::f_value_required, value_type.second);
+            return {field, true};
+        }
+        case TypeIndex::Nullable:
+        {
+            auto type_nullable = std::static_pointer_cast<const DataTypeNullable>(type);
+            return {getIcebergType(type_nullable->getNestedType(), iter, format_version).first, false};
+        }
+        case TypeIndex::Variant:
+        {
+            if (type->getCustomName() && type->getCustomName()->getName() == "Geometry")
+                return {Iceberg::f_geometry, false};
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unsupported type for iceberg {}", type->getName());
+        }
+        default:
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unsupported type for iceberg {}", type->getName());
+    }
+}
+
+namespace
+{
+
+String removeASCIIWhitespace(const String & s)
+{
+    String result;
+    result.reserve(s.size());
+    for (char c : s)
+    {
+        if (!isWhitespaceASCII(c))
+            result.push_back(c);
+    }
+    return result;
+}
+
+/// A missing key matches only a missing key.
+bool optionalBoolsEqual(const Poco::JSON::Object::Ptr & first, const Poco::JSON::Object::Ptr & second, const char * key)
+{
+    const bool first_has = first->has(key);
+    if (first_has != second->has(key))
+        return false;
+    return !first_has || first->getValue<bool>(key) == second->getValue<bool>(key);
+}
+
+}
+
+/// Only the properties that define the type are compared. Field ids are ignored because
+/// `getIcebergType` allocates them from a running counter, so a previous attempt may have written
+/// the very same type with lower ids. Other keys (`doc`, defaults, the `required` that
+/// `getIcebergType` puts on a list) are ignored because other writers emit or omit them freely.
+bool icebergTypesEqualIgnoringIds(Poco::Dynamic::Var old_type, Poco::Dynamic::Var new_type)
+{
+    if (old_type.isString() || new_type.isString())
+    {
+        if (!old_type.isString() || !new_type.isString())
+            return false;
+        /// Writers differ in spacing, e.g. `decimal(10,2)` and `decimal(10, 2)`.
+        return removeASCIIWhitespace(old_type.extract<String>()) == removeASCIIWhitespace(new_type.extract<String>());
+    }
+
+    if (old_type.type() != typeid(Poco::JSON::Object::Ptr) || new_type.type() != typeid(Poco::JSON::Object::Ptr))
+        return false;
+
+    auto old_object = old_type.extract<Poco::JSON::Object::Ptr>();
+    auto new_object = new_type.extract<Poco::JSON::Object::Ptr>();
+    if (!old_object || !new_object)
+        return false;
+
+    if (old_object->has("precision") || new_object->has("precision"))
+    {
+        return old_object->has("precision") && new_object->has("precision")
+            && old_object->getValue<Int32>("precision") == new_object->getValue<Int32>("precision")
+            && old_object->getValue<Int32>("scale") == new_object->getValue<Int32>("scale");
+    }
+
+    if (!old_object->has(Iceberg::f_type) || !new_object->has(Iceberg::f_type))
+        return false;
+    const auto kind = old_object->getValue<String>(Iceberg::f_type);
+    if (kind != new_object->getValue<String>(Iceberg::f_type))
+        return false;
+
+    if (kind == Iceberg::f_list)
+    {
+        return optionalBoolsEqual(old_object, new_object, Iceberg::f_element_required)
+            && icebergTypesEqualIgnoringIds(old_object->get(Iceberg::f_element), new_object->get(Iceberg::f_element));
+    }
+
+    if (kind == Iceberg::f_map)
+    {
+        return optionalBoolsEqual(old_object, new_object, Iceberg::f_value_required)
+            && icebergTypesEqualIgnoringIds(old_object->get(Iceberg::f_key), new_object->get(Iceberg::f_key))
+            && icebergTypesEqualIgnoringIds(old_object->get(Iceberg::f_value), new_object->get(Iceberg::f_value));
+    }
+
+    if (kind == Iceberg::f_struct)
+    {
+        auto old_fields = old_object->getArray(Iceberg::f_fields);
+        auto new_fields = new_object->getArray(Iceberg::f_fields);
+        if (!old_fields || !new_fields || old_fields->size() != new_fields->size())
+            return false;
+        for (UInt32 i = 0; i < old_fields->size(); ++i)
+        {
+            auto old_field = old_fields->getObject(i);
+            auto new_field = new_fields->getObject(i);
+            if (!old_field || !new_field
+                || old_field->getValue<String>(Iceberg::f_name) != new_field->getValue<String>(Iceberg::f_name)
+                || !optionalBoolsEqual(old_field, new_field, Iceberg::f_required)
+                || !icebergTypesEqualIgnoringIds(old_field->get(Iceberg::f_type), new_field->get(Iceberg::f_type)))
+                return false;
+        }
+        return true;
+    }
+
+    return false;
+}
+
+}
+
 #if USE_AVRO
 
 #include <Processors/Formats/Impl/AvroRowInputFormat.h>
-#include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergDataObjectInfo.h>
 #include <IO/ReadHelpers.h>
 #include <filesystem>
@@ -82,7 +337,6 @@ using namespace DB;
 namespace DB::ErrorCodes
 {
 extern const int FILE_DOESNT_EXIST;
-extern const int BAD_ARGUMENTS;
 extern const int ICEBERG_SPECIFICATION_VIOLATION;
 extern const int LOGICAL_ERROR;
 extern const int UNSUPPORTED_METHOD;
@@ -634,148 +888,79 @@ void checkUnknownTypeAllowed(const String & column_name, const DataTypePtr & typ
         column_name, type->getName(), format_version);
 }
 
-/// Returns type and required
-std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & iter, UInt64 format_version)
+String getClickHouseTypePropertyKey(Int32 field_id, Int32 schema_id)
 {
-    switch (type->getTypeId())
+    return fmt::format("{}.{}.{}", Iceberg::f_clickhouse_type, field_id, schema_id);
+}
+
+ClickHouseTypeAnnotations getClickHouseTypeAnnotations(const Poco::JSON::Object::Ptr & metadata_object, Int32 schema_id)
+{
+    ClickHouseTypeAnnotations annotations;
+    if (!metadata_object->has(Iceberg::f_properties))
+        return annotations;
+    const auto properties = metadata_object->getObject(Iceberg::f_properties);
+    const String prefix = String(Iceberg::f_clickhouse_type) + ".";
+    /// For each field, the schema id of the entry in effect and its value.
+    std::map<Int32, std::pair<Int32, String>> entries;
+    for (const auto & [key, value] : *properties)
     {
-        case TypeIndex::UInt8:
-        {
-            if (isBool(type))
-                return {"boolean", true};
-            return {"int", true};
-        }
-        case TypeIndex::Int8:
-        case TypeIndex::UInt16:
-        case TypeIndex::Int16:
-        case TypeIndex::UInt32:
-        case TypeIndex::Int32:
-            return {"int", true};
-        case TypeIndex::UInt64:
-        case TypeIndex::Int64:
-            return {"long", true};
-        case TypeIndex::Float32:
-            return {"float", true};
-        case TypeIndex::Float64:
-            return {"double", true};
-        case TypeIndex::Date:
-        case TypeIndex::Date32:
-            return {"date", true};
-        case TypeIndex::DateTime:
-            return {"timestamp", true};
-        case TypeIndex::DateTime64:
-        {
-            /// Iceberg `timestamp` is microseconds; `timestamp_ns` is nanoseconds and is
-            /// allowed only in format version 3. Writing it into v1/v2 metadata is invalid.
-            const auto scale = getDecimalScale(*type);
-            if (scale == 9)
-            {
-                if (format_version < 3)
-                    throw Exception(
-                        ErrorCodes::BAD_ARGUMENTS,
-                        "Iceberg type {} requires format version 3 or higher, got version {}",
-                        type->getName(),
-                        format_version);
-
-                auto date_time64 = std::static_pointer_cast<const DataTypeDateTime64>(type);
-                if (date_time64->hasExplicitTimeZone())
-                    return {Iceberg::f_timestamptz_ns, true};
-                return {Iceberg::f_timestamp_ns, true};
-            }
-            if (scale <= 6)
-                return {Iceberg::f_timestamp, true};
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unsupported type for iceberg {}", type->getName());
-        }
-        case TypeIndex::Time:
-            return {"time", true};
-        case TypeIndex::Time64:
-            if (getDecimalScale(*type) <= 6)
-                return {"time", true};
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unsupported type for iceberg {}", type->getName());
-        case TypeIndex::String:
-            return {"string", true};
-        case TypeIndex::UUID:
-            return {"uuid", true};
-        case TypeIndex::Nothing:
-            return {"unknown", false};
-        case TypeIndex::Decimal32:
-        case TypeIndex::Decimal64:
-        case TypeIndex::Decimal128:
-        case TypeIndex::Decimal256:
-        {
-            auto precision = getDecimalPrecision(*type);
-            if (precision > 38)
-                throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                    "Iceberg decimal type supports precision up to 38, got {}", precision);
-            return {"decimal(" + std::to_string(precision) + ", " + std::to_string(getDecimalScale(*type)) + ")", true};
-        }
-        case TypeIndex::Tuple:
-        {
-            auto type_tuple = std::static_pointer_cast<const DataTypeTuple>(type);
-            Poco::JSON::Object::Ptr result = new Poco::JSON::Object;
-            result->set(Iceberg::f_type, "struct");
-            Poco::JSON::Array::Ptr fields = new Poco::JSON::Array;
-            size_t iter_names = 1;
-            size_t iter_fields = iter;
-            iter += type_tuple->getElements().size();
-            for (const auto & element : type_tuple->getElements())
-            {
-                Poco::JSON::Object::Ptr field = new Poco::JSON::Object;
-                field->set(Iceberg::f_id, ++iter_fields);
-                field->set(Iceberg::f_name, type_tuple->getNameByPosition(iter_names));
-                /// Recurse on the element itself: `getNormalizedType` would rename a nested
-                /// tuple's elements to "1", "2", ... (`DataTypeTuple::getNormalizedType`).
-                auto child_type = getIcebergType(element, iter, format_version);
-                field->set(Iceberg::f_required, child_type.second);
-                field->set(Iceberg::f_type, child_type.first);
-                fields->add(field);
-                ++iter_names;
-            }
-            result->set(Iceberg::f_fields, fields);
-            return {result, true};
-        }
-        case TypeIndex::Array:
-        {
-            auto type_array = std::static_pointer_cast<const DataTypeArray>(type);
-            Poco::JSON::Object::Ptr field = new Poco::JSON::Object;
-
-            field->set(Iceberg::f_type, "list");
-            field->set(Iceberg::f_element_id, ++iter);
-            auto child_type = getIcebergType(type_array->getNestedType(), iter, format_version);
-            field->set(Iceberg::f_required, false);
-            field->set(Iceberg::f_element, child_type.first);
-            field->set(Iceberg::f_element_required, child_type.second);
-            return {field, true};
-        }
-        case TypeIndex::Map:
-        {
-            auto type_map = std::static_pointer_cast<const DataTypeMap>(type);
-            Poco::JSON::Object::Ptr field = new Poco::JSON::Object;
-
-            field->set(Iceberg::f_type, "map");
-            field->set(Iceberg::f_key_id, ++iter);
-            field->set(Iceberg::f_value_id, ++iter);
-
-            field->set(Iceberg::f_key, getIcebergType(type_map->getKeyType(), iter, format_version).first);
-            auto value_type = getIcebergType(type_map->getValueType(), iter, format_version);
-            field->set(Iceberg::f_value, value_type.first);
-            field->set(Iceberg::f_value_required, value_type.second);
-            return {field, true};
-        }
-        case TypeIndex::Nullable:
-        {
-            auto type_nullable = std::static_pointer_cast<const DataTypeNullable>(type);
-            return {getIcebergType(type_nullable->getNestedType(), iter, format_version).first, false};
-        }
-        case TypeIndex::Variant:
-        {
-            if (type->getCustomName() && type->getCustomName()->getName() == "Geometry")
-                return {Iceberg::f_geometry, false};
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unsupported type for iceberg {}", type->getName());
-        }
-        default:
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unsupported type for iceberg {}", type->getName());
+        if (!key.starts_with(prefix))
+            continue;
+        /// Only keys whose suffix is `<field-id>.<schema-id>` are annotations
+        const std::string_view suffix = std::string_view(key).substr(prefix.size());
+        const size_t dot = suffix.find('.');
+        Int32 field_id;
+        Int32 entry_schema_id;
+        if (dot == std::string_view::npos || !tryParse(field_id, suffix.substr(0, dot))
+            || !tryParse(entry_schema_id, suffix.substr(dot + 1)) || entry_schema_id > schema_id)
+            continue;
+        auto [it, inserted] = entries.try_emplace(field_id, entry_schema_id, value.extract<String>());
+        if (!inserted && it->second.first < entry_schema_id)
+            it->second = {entry_schema_id, value.extract<String>()};
     }
+    for (auto & [field_id, entry] : entries)
+    {
+        if (!entry.second.empty())
+            annotations.emplace(field_id, std::move(entry.second));
+    }
+    return annotations;
+}
+
+void setClickHouseTypeAnnotation(Poco::JSON::Object::Ptr metadata_object, Int32 field_id, Int32 schema_id, const String & annotation)
+{
+    const auto key = getClickHouseTypePropertyKey(field_id, schema_id);
+    const auto inherited_annotations = getClickHouseTypeAnnotations(metadata_object, schema_id - 1);
+    const auto inherited = inherited_annotations.find(field_id);
+    const String & inherited_annotation = inherited == inherited_annotations.end() ? String{} : inherited->second;
+    if (annotation == inherited_annotation)
+    {
+        if (metadata_object->has(Iceberg::f_properties))
+            metadata_object->getObject(Iceberg::f_properties)->remove(key);
+        return;
+    }
+
+    if (!metadata_object->has(Iceberg::f_properties))
+        metadata_object->set(Iceberg::f_properties, Poco::JSON::Object::Ptr(new Poco::JSON::Object));
+    metadata_object->getObject(Iceberg::f_properties)->set(key, annotation);
+}
+
+void addIcebergTableSchemasFromMetadata(
+    const Poco::JSON::Object::Ptr & metadata_object, IcebergSchemaProcessor & schema_processor, ContextPtr context)
+{
+    auto add_schema = [&](const Poco::JSON::Object::Ptr & schema)
+    {
+        schema_processor.addIcebergTableSchema(
+            schema, context, getClickHouseTypeAnnotations(metadata_object, schema->getValue<Int32>(f_schema_id)));
+    };
+    /// `schemas` is optional in format version 1, which keeps its only schema in the top-level `schema`.
+    if (!metadata_object->has(f_schemas))
+    {
+        add_schema(parseTableSchemaV1Method(metadata_object).first);
+        return;
+    }
+    auto schemas = metadata_object->getArray(f_schemas);
+    for (UInt32 i = 0; i < schemas->size(); ++i)
+        add_schema(schemas->getObject(i));
 }
 
 Poco::Dynamic::Var getAvroType(DataTypePtr type, Int32 field_id)
@@ -1266,6 +1451,9 @@ std::pair<Poco::JSON::Object::Ptr, String> createEmptyMetadataFile(
         auto type = getIcebergType(column.type, iter, format_version);
         field->set(Iceberg::f_required, type.second);
         field->set(Iceberg::f_type, type.first);
+        if (needsClickHouseTypeAnnotation(column.type))
+            setClickHouseTypeAnnotation(
+                new_metadata_file_content, iter_for_initial_columns, /*schema_id=*/ 0, getClickHouseTypeAnnotationName(column.type));
         column_name_to_source_id[column.name] = iter_for_initial_columns;
         schema_fields->add(field);
     }

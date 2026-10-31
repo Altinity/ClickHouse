@@ -106,11 +106,18 @@ public:
     std::shared_ptr<NamesAndTypesList> getInitialSchemaByPath(ContextPtr local_context, ObjectInfoPtr object_info) const override;
     std::shared_ptr<const ActionsDAG> getSchemaTransformer(ContextPtr local_context, ObjectInfoPtr object_info) const override;
 
+    enum class SchemaParsing
+    {
+        Parse,
+        Skip,
+    };
+
     static Int32 parseTableSchema(
         const Poco::JSON::Object::Ptr & metadata_object,
         Iceberg::IcebergSchemaProcessor & schema_processor,
         ContextPtr context_,
-        LoggerPtr metadata_logger);
+        LoggerPtr metadata_logger,
+        SchemaParsing schema_parsing = SchemaParsing::Parse);
 
     bool supportsUpdate() const override { return true; }
     bool supportsWrites() const override { return true; }
@@ -245,10 +252,14 @@ public:
 
     std::pair<Iceberg::IcebergDataSnapshotPtr, Iceberg::TableStateSnapshot> getRelevantState(
         const ContextPtr & context,
-        bool force_fetch_latest_metadata = false) const;
+        bool force_fetch_latest_metadata = false,
+        SchemaParsing schema_parsing = SchemaParsing::Parse) const;
 
-    std::pair<Iceberg::IcebergDataSnapshotPtr, Iceberg::TableStateSnapshot>
-    getState(const ContextPtr & local_context, const String & metadata_path, Int32 metadata_version) const;
+    std::pair<Iceberg::IcebergDataSnapshotPtr, Iceberg::TableStateSnapshot> getState(
+        const ContextPtr & local_context,
+        const String & metadata_path,
+        Int32 metadata_version,
+        SchemaParsing schema_parsing = SchemaParsing::Parse) const;
 
     const DB::Iceberg::PersistentTableComponents & getPersistentComponents() const
     {
@@ -268,12 +279,12 @@ private:
         ContextPtr context_,
         LoggerPtr log);
 
-    Iceberg::IcebergDataSnapshotPtr
-    getIcebergDataSnapshot(Poco::JSON::Object::Ptr metadata_object, Int64 snapshot_id, ContextPtr local_context) const;
+    Iceberg::IcebergDataSnapshotPtr getIcebergDataSnapshot(
+        Poco::JSON::Object::Ptr metadata_object, Int64 snapshot_id, ContextPtr local_context, SchemaParsing schema_parsing) const;
 
     Iceberg::IcebergDataSnapshotPtr createIcebergDataSnapshotFromSnapshotJSON(Poco::JSON::Object::Ptr snapshot_object, Int64 snapshot_id, ContextPtr local_context) const;
     std::pair<Iceberg::IcebergDataSnapshotPtr, Int32>
-    getStateImpl(const ContextPtr & local_context, Poco::JSON::Object::Ptr metadata_object) const;
+    getStateImpl(const ContextPtr & local_context, Poco::JSON::Object::Ptr metadata_object, SchemaParsing schema_parsing) const;
     Iceberg::IcebergDataSnapshotPtr
     getRelevantDataSnapshotFromTableStateSnapshot(Iceberg::TableStateSnapshot table_state_snapshot, ContextPtr local_context) const;
     StorageObjectStorageConfigurationPtr getConfiguration() const;

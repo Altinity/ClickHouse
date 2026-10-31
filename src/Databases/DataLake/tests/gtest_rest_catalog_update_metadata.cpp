@@ -228,6 +228,28 @@ TEST(RestCatalogUpdateSchemaBody, NonEmptyIdentifierFieldIdsPreventDeduplication
     EXPECT_EQ(set_schema->getValue<Int32>("schema-id"), -1);
 }
 
+TEST(RestCatalogUpdateSchemaBody, UnchangedSchemaSendsOnlyThePropertyChanges)
+{
+    /// A `MODIFY COLUMN` that changes only the ClickHouse type annotation keeps the current schema.
+    auto schema = makeSingleColumnSchema(0, std::nullopt);
+    auto metadata = makeMetadataWithSchemas({schema});
+    Poco::JSON::Object::Ptr properties = new Poco::JSON::Object;
+    properties->set("clickhouse.type.1.0", "SimpleAggregateFunction(max, Int32)");
+    metadata->set(Iceberg::f_properties, properties);
+    Poco::JSON::Object::Ptr previous_properties = new Poco::JSON::Object;
+    previous_properties->set("clickhouse.type.1.0", "SimpleAggregateFunction(sum, Int32)");
+
+    auto body = DataLake::buildUpdateSchemaRequestBody("ns", "t", metadata, schema, 0, 1, previous_properties);
+    ASSERT_TRUE(body);
+
+    auto updates = body->getArray("updates");
+    ASSERT_EQ(updates->size(), 1u);
+    auto set_properties = findUpdateByAction(updates, "set-properties");
+    ASSERT_TRUE(set_properties);
+    EXPECT_EQ(
+        set_properties->getObject("updates")->getValue<std::string>("clickhouse.type.1.0"), "SimpleAggregateFunction(max, Int32)");
+}
+
 TEST(RestCatalogUpdateSchemaBody, NormalPathEmitsAddSchema)
 {
     Poco::JSON::Object::Ptr metadata = new Poco::JSON::Object;
