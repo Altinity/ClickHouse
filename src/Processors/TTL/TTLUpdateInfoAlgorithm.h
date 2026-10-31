@@ -11,6 +11,7 @@ enum class TTLUpdateField : uint8_t
     TABLE_TTL,
     ROWS_WHERE_TTL,
     MOVES_TTL,
+    EXPORT_TTL,
     RECOMPRESSION_TTL,
     GROUP_BY_TTL,
 };

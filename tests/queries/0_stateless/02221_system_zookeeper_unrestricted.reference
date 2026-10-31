@@ -20,6 +20,10 @@ creator_info
 creator_info
 deduplication_hashes
 deduplication_hashes
+export_features
+export_features
+export_ttl
+export_ttl
 exports
 exports
 failed_parts
@@ -82,3 +86,5 @@ table_shared_id
 table_shared_id
 temp
 temp
+version
+version

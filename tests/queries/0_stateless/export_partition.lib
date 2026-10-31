@@ -17,22 +17,23 @@ function partition_export_source_engine()
     fi
 }
 
-# Poll `system.partition_exports` until the given export reaches the expected status (or timeout).
-# $1 source table, $2 destination database, $3 destination table, $4 partition id, $5 expected status.
+# Poll `system.distributed_exports` until the given number of export tasks of a partition exist and all of
+# them completed (or timeout). Every `EXPORT PARTITION` creates a new task.
+# $1 source table, $2 destination database, $3 destination table, $4 partition id, $5 number of tasks (1 by default).
 function wait_for_partition_export_status()
 {
     local source_table="$1"
     local destination_database="$2"
     local destination_table="$3"
     local partition_id="$4"
-    local expected="$5"
+    local expected="${5:-1}	${5:-1}"
 
-    local status
+    local state
     local i=0
     while [ "$i" -lt 120 ]
     do
-        status=$(${CLICKHOUSE_CLIENT} --query "SELECT status FROM system.partition_exports WHERE source_table = '$source_table' AND destination_database = '$destination_database' AND destination_table = '$destination_table' AND partition_id = '$partition_id'")
-        if [ "$status" = "$expected" ]
+        state=$(${CLICKHOUSE_CLIENT} --query "SELECT count(), countIf(status = 'COMPLETED') FROM system.distributed_exports WHERE source_table = '$source_table' AND destination_database = '$destination_database' AND destination_table = '$destination_table' AND partition_id = '$partition_id'")
+        if [ "$state" = "$(echo -e "$expected")" ]
         then
             return 0
         fi
@@ -40,7 +41,7 @@ function wait_for_partition_export_status()
         i=$((i + 1))
     done
 
-    echo "TIMEOUT waiting for the export of $partition_id to $destination_database.$destination_table to reach $expected (last: '$status')"
+    echo "TIMEOUT waiting for ${5:-1} completed export(s) of $partition_id to $destination_database.$destination_table (last tasks, completed: '$state')"
     return 1
 }
 
@@ -75,21 +76,18 @@ function run_partition_export_roundtrip_test()
 
     echo "Export partition 2020"
     ${CLICKHOUSE_CLIENT} --query "ALTER TABLE $mt_table EXPORT PARTITION ID '2020' TO TABLE $s3_table"
-    wait_for_partition_export_status "$mt_table" "$CLICKHOUSE_DATABASE" "$s3_table" "2020" "COMPLETED"
+    wait_for_partition_export_status "$mt_table" "$CLICKHOUSE_DATABASE" "$s3_table" "2020"
 
     echo "Export partition 2021"
     ${CLICKHOUSE_CLIENT} --query "ALTER TABLE $mt_table EXPORT PARTITION ID '2021' TO TABLE $s3_table"
-    wait_for_partition_export_status "$mt_table" "$CLICKHOUSE_DATABASE" "$s3_table" "2021" "COMPLETED"
+    wait_for_partition_export_status "$mt_table" "$CLICKHOUSE_DATABASE" "$s3_table" "2021"
 
     echo "Select from destination table (2020, 2021)"
     ${CLICKHOUSE_CLIENT} --query "SELECT * FROM $s3_table ORDER BY id"
 
-    echo "Re-exporting 2020 without force is rejected"
-    ${CLICKHOUSE_CLIENT} --query "ALTER TABLE $mt_table EXPORT PARTITION ID '2020' TO TABLE $s3_table" 2>&1 | grep -o "EXPORT_PARTITION_ALREADY_EXPORTED" | head -1
-
-    echo "Export remaining partitions with EXPORT PARTITION ALL (skip existing)"
-    ${CLICKHOUSE_CLIENT} --query "ALTER TABLE $mt_table EXPORT PARTITION ALL TO TABLE $s3_table SETTINGS export_merge_tree_partition_all_on_error = 'skip_conflicts'"
-    wait_for_partition_export_status "$mt_table" "$CLICKHOUSE_DATABASE" "$s3_table" "2022" "COMPLETED"
+    echo "Export partition 2022"
+    ${CLICKHOUSE_CLIENT} --query "ALTER TABLE $mt_table EXPORT PARTITION ID '2022' TO TABLE $s3_table"
+    wait_for_partition_export_status "$mt_table" "$CLICKHOUSE_DATABASE" "$s3_table" "2022"
 
     echo "Select from destination table (all partitions)"
     ${CLICKHOUSE_CLIENT} --query "SELECT * FROM $s3_table ORDER BY id"
@@ -98,8 +96,14 @@ function run_partition_export_roundtrip_test()
     ${CLICKHOUSE_CLIENT} --query "CREATE TABLE $mt_roundtrip ENGINE = $roundtrip_engine PARTITION BY year ORDER BY tuple() AS SELECT * FROM $s3_table"
     ${CLICKHOUSE_CLIENT} --query "SELECT * FROM $mt_roundtrip ORDER BY id"
 
-    echo "system.partition_exports statuses"
-    ${CLICKHOUSE_CLIENT} --query "SELECT partition_id, status, parts_count, parts_to_do FROM system.partition_exports WHERE source_table = '$mt_table' AND destination_table = '$s3_table' ORDER BY partition_id"
+    echo "system.distributed_exports statuses"
+    ${CLICKHOUSE_CLIENT} --query "SELECT partition_id, status, parts_count, parts_to_do, source FROM system.distributed_exports WHERE source_table = '$mt_table' AND destination_table = '$s3_table' ORDER BY partition_id"
+
+    echo "Re-exporting 2020 creates a new task, whose files already exist and are skipped"
+    ${CLICKHOUSE_CLIENT} --query "ALTER TABLE $mt_table EXPORT PARTITION ID '2020' TO TABLE $s3_table"
+    wait_for_partition_export_status "$mt_table" "$CLICKHOUSE_DATABASE" "$s3_table" "2020" 2
+    ${CLICKHOUSE_CLIENT} --query "SELECT count(), uniqExact(transaction_id) FROM system.distributed_exports WHERE source_table = '$mt_table' AND destination_table = '$s3_table' AND partition_id = '2020'"
+    ${CLICKHOUSE_CLIENT} --query "SELECT id, count() FROM $s3_table WHERE year = 2020 GROUP BY id ORDER BY id"
 
     ${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS $mt_table"
     ${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS $s3_table"
@@ -130,21 +134,23 @@ function run_partition_export_dotted_destination_test()
 
     echo "Export partition 2020 to the first destination"
     ${CLICKHOUSE_CLIENT} --query "ALTER TABLE $mt_table EXPORT PARTITION ID '2020' TO TABLE \`$dotted_database\`.y"
-    wait_for_partition_export_status "$mt_table" "$dotted_database" "y" "2020" "COMPLETED"
+    wait_for_partition_export_status "$mt_table" "$dotted_database" "y" "2020"
 
     echo "The same partition can be exported to the second destination"
     ${CLICKHOUSE_CLIENT} --query "ALTER TABLE $mt_table EXPORT PARTITION ID '2020' TO TABLE $CLICKHOUSE_DATABASE.\`x.y\`"
-    wait_for_partition_export_status "$mt_table" "$CLICKHOUSE_DATABASE" "x.y" "2020" "COMPLETED"
+    wait_for_partition_export_status "$mt_table" "$CLICKHOUSE_DATABASE" "x.y" "2020"
 
     echo "Both exports are tracked independently"
-    ${CLICKHOUSE_CLIENT} --query "SELECT replaceOne(destination_database, '$CLICKHOUSE_DATABASE', '{db}'), destination_table, status FROM system.partition_exports WHERE source_table = '$mt_table' ORDER BY 1, 2"
+    ${CLICKHOUSE_CLIENT} --query "SELECT replaceOne(destination_database, '$CLICKHOUSE_DATABASE', '{db}'), destination_table, status FROM system.distributed_exports WHERE source_table = '$mt_table' ORDER BY 1, 2"
 
     echo "Both destinations received the partition"
     ${CLICKHOUSE_CLIENT} --query "SELECT * FROM \`$dotted_database\`.y ORDER BY id"
     ${CLICKHOUSE_CLIENT} --query "SELECT * FROM $CLICKHOUSE_DATABASE.\`x.y\` ORDER BY id"
 
-    echo "Re-exporting to the first destination is still rejected"
-    ${CLICKHOUSE_CLIENT} --query "ALTER TABLE $mt_table EXPORT PARTITION ID '2020' TO TABLE \`$dotted_database\`.y" 2>&1 | grep -o "EXPORT_PARTITION_ALREADY_EXPORTED" | head -1
+    echo "Re-exporting to the first destination only adds a task of the first destination"
+    ${CLICKHOUSE_CLIENT} --query "ALTER TABLE $mt_table EXPORT PARTITION ID '2020' TO TABLE \`$dotted_database\`.y"
+    wait_for_partition_export_status "$mt_table" "$dotted_database" "y" "2020" 2
+    ${CLICKHOUSE_CLIENT} --query "SELECT replaceOne(destination_database, '$CLICKHOUSE_DATABASE', '{db}'), destination_table, count() FROM system.distributed_exports WHERE source_table = '$mt_table' GROUP BY 1, 2 ORDER BY 1, 2"
 
     ${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS $CLICKHOUSE_DATABASE.\`x.y\`"
     ${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS $mt_table"

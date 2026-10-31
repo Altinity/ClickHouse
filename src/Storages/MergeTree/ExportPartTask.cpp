@@ -1,8 +1,15 @@
 #include <mutex>
 #include <Storages/MergeTree/ExportPartTask.h>
-#include <Storages/MergeTree/ExportPartitionUtils.h>
+#include <Storages/MergeTree/ExportTaskUtils.h>
+#include <Storages/MergeTree/ExportTTLIndex.h>
 #include <Storages/MergeTree/MergeTreeSequentialSource.h>
 #include <Storages/MergeTree/MergeTreeData.h>
+#include <Storages/MergeTree/MergeTreeVirtualColumns.h>
+#include <DataTypes/DataTypesNumber.h>
+#include <Functions/FunctionFactory.h>
+#include <Processors/QueryPlan/FilterStep.h>
+#include <Common/SipHash.h>
+#include <base/hex.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/inplaceBlockConversions.h>
 #include <Core/Settings.h>
@@ -118,13 +125,9 @@ namespace
 
     void addExportConvertingActions(
         QueryPlan & plan_for_part,
-        const IStorage & destination_storage,
+        const Block & destination_header,
         const ContextPtr & local_context)
     {
-        FailPointInjection::pauseFailPoint(FailPoints::export_part_pause_before_schema_validation);
-
-        const auto destination_metadata = destination_storage.getInMemoryMetadataPtr(local_context, false);
-        const auto destination_header = destination_metadata->getSampleBlockNonMaterialized();
         const auto & destination_columns = destination_header.getColumnsWithTypeAndName();
 
         const auto schema_match_mode =
@@ -135,7 +138,7 @@ namespace
         auto source_columns = plan_for_part.getCurrentHeader()->getColumnsWithTypeAndName();
         const bool src_has_extra_columns = source_columns.size() > destination_columns.size();
 
-        ExportPartitionUtils::checkExportSchemaColumnsCount(
+        ExportTaskUtils::checkExportSchemaColumnsCount(
             source_columns.size(),
             destination_columns.size(),
             ignore_extra_source_columns);
@@ -187,6 +190,52 @@ namespace
         plan_for_part.addStep(std::move(expression_step));
     }
 
+    /// Keeps the rows of the blocks in `ranges` and removes the `_block_number` column they are told by.
+    void addBlockNumberFilter(QueryPlan & plan_for_part, const ExportBlockNumberRanges & ranges, const ContextPtr & local_context)
+    {
+        const auto header = plan_for_part.getCurrentHeader();
+        ActionsDAG dag(header->getColumnsWithTypeAndName());
+        const auto & block_number = dag.findInOutputs(BlockNumberColumn::name);
+
+        const auto type = std::make_shared<DataTypeUInt64>();
+        const auto constant = [&](Int64 value) -> const ActionsDAG::Node &
+        {
+            return dag.addColumn(type->createColumnConst(1, static_cast<UInt64>(value)), type, toString(value));
+        };
+
+        auto & factory = FunctionFactory::instance();
+        ActionsDAG::NodeRawConstPtrs conditions;
+        for (const auto & [min_block, max_block] : ranges)
+        {
+            const auto & at_least = dag.addFunction(factory.get("greaterOrEquals", local_context), {&block_number, &constant(min_block)}, {});
+            const auto & at_most = dag.addFunction(factory.get("lessOrEquals", local_context), {&block_number, &constant(max_block)}, {});
+            conditions.push_back(&dag.addFunction(factory.get("and", local_context), {&at_least, &at_most}, {}));
+        }
+
+        const auto * filter = conditions.front();
+        if (conditions.size() > 1)
+            filter = &dag.addFunction(factory.get("or", local_context), std::move(conditions), {});
+
+        auto & outputs = dag.getOutputs();
+        std::erase_if(outputs, [](const ActionsDAG::Node * node) { return node->result_name == BlockNumberColumn::name; });
+        outputs.push_back(filter);
+
+        auto filter_step = std::make_unique<FilterStep>(header, std::move(dag), filter->result_name, /* remove_filter_column */ true);
+        filter_step->setStepDescription("Keep the rows of the blocks that the export task exports");
+        plan_for_part.addStep(std::move(filter_step));
+    }
+
+    String getBlockRangesHash(const ExportBlockNumberRanges & ranges)
+    {
+        SipHash hash;
+        for (const auto & [min_block, max_block] : ranges)
+        {
+            hash.update(min_block);
+            hash.update(max_block);
+        }
+        return getHexUIntLowercase(hash.get64());
+    }
+
     String buildDestinationFilename(
         const MergeTreePartExportManifest & manifest,
         const StorageID & storage_id,
@@ -236,12 +285,28 @@ bool ExportPartTask::executeStep()
     const auto & metadata_snapshot = manifest.metadata_snapshot;
 
     /// Read only physical columns from the part
-    const auto columns_to_read = metadata_snapshot->getColumns().getNamesOfPhysical();
+    auto columns_to_read = metadata_snapshot->getColumns().getNamesOfPhysical();
+
+    /// A task of the `EXPORT` TTL exports the rows of some blocks only. Unless the part holds no other
+    /// rows, e.g. because it was merged with exported parts, they are told apart by `_block_number`,
+    /// which merges keep.
+    bool filter_by_block_number = false;
+    if (!manifest.block_ranges.empty())
+    {
+        const auto ranges = ExportTTLUtils::toPartInfos(manifest.data_part->info.getPartitionId(), manifest.block_ranges);
+        filter_by_block_number = !ExportBlockRanges::isCoveredByUnion(manifest.data_part->info, ranges);
+        if (filter_by_block_number)
+            columns_to_read.push_back(BlockNumberColumn::name);
+    }
 
     MergeTreeSequentialSourceType read_type = MergeTreeSequentialSourceType::Export;
 
+    /// A part without rows, e.g. emptied by a mutation, has nothing to write, and its min/max index,
+    /// which places the rows in the destination, is not initialized. It is exported as no files.
+    const bool has_rows = manifest.data_part->rows_count != 0;
+
     Block block_with_partition_values;
-    if (metadata_snapshot->hasPartitionKey())
+    if (metadata_snapshot->hasPartitionKey() && has_rows)
     {
         /// todo arthur do I need to init minmax_idx?
         block_with_partition_values = manifest.data_part->getMinMaxIndex()->getBlock(storage);
@@ -309,20 +374,34 @@ bool ExportPartTask::executeStep()
                 "Failpoint: export_part_retryable_throw");
         });
 
-        const auto filename = buildDestinationFilename(manifest, storage.getStorageID(), local_context);
+        auto filename = buildDestinationFilename(manifest, storage.getStorageID(), local_context);
+        /// A filtered export of a part holds other rows than an export of all of them, so the files that
+        /// one left are never taken for the result of the other.
+        if (filter_by_block_number)
+            filename += "_" + getBlockRangesHash(manifest.block_ranges);
 
-        auto import_result = destination_storage->import(
-            filename,
-            block_with_partition_values,
-            new_file_path_callback,
-            manifest.file_already_exists_policy,
-            manifest.settings[Setting::export_merge_tree_part_max_bytes_per_file],
-            manifest.settings[Setting::export_merge_tree_part_max_rows_per_file],
-            manifest.iceberg_metadata_json,
-            getFormatSettings(local_context),
-            local_context);
+        FailPointInjection::pauseFailPoint(FailPoints::export_part_pause_before_schema_validation);
 
-        if (import_result.already_exported)
+        std::optional<IStorage::ImportResult> import_result;
+        if (has_rows)
+        {
+            import_result = destination_storage->import(
+                filename,
+                block_with_partition_values,
+                new_file_path_callback,
+                manifest.file_already_exists_policy,
+                manifest.settings[Setting::export_merge_tree_part_max_bytes_per_file],
+                manifest.settings[Setting::export_merge_tree_part_max_rows_per_file],
+                manifest.iceberg_metadata_json,
+                getFormatSettings(local_context),
+                local_context);
+        }
+
+        if (!import_result)
+        {
+            LOG_INFO(getLogger("ExportPartTask"), "Part {} has no rows, nothing to export", manifest.data_part->name);
+        }
+        else if (import_result->already_exported)
         {
             /// An earlier attempt at this part already wrote the whole set of destination files and
             /// committed it, but died before the result was recorded durably. Adopt those files as
@@ -330,14 +409,14 @@ bool ExportPartTask::executeStep()
             ProfileEvents::increment(ProfileEvents::PartsExportDuplicated);
 
             LOG_INFO(getLogger("ExportPartTask"), "Part {} was already exported as {} file(s), reusing them",
-                manifest.data_part->name, import_result.exported_paths.size());
+                manifest.data_part->name, import_result->exported_paths.size());
 
-            for (const auto & exported_path : import_result.exported_paths)
+            for (const auto & exported_path : import_result->exported_paths)
                 new_file_path_callback(exported_path);
         }
         else
         {
-            sink = std::move(import_result.sink);
+            sink = std::move(import_result->sink);
 
             bool apply_deleted_mask = true;
             bool read_with_direct_io = local_context->getSettingsRef()[Setting::min_bytes_to_use_direct_io] > manifest.data_part->getBytesOnDisk();
@@ -374,11 +453,16 @@ bool ExportPartTask::executeStep()
                 local_context,
                 getLogger("ExportPartition"));
 
+            if (filter_by_block_number)
+                addBlockNumberFilter(plan_for_part, manifest.block_ranges, local_context);
+
             /// We need to support exporting materialized and alias columns to object storage. For some reason, object storage engines don't support them.
             /// This is a hack that materializes the columns before the export so they can be exported to tables that have matching columns
             materializeSpecialColumns(plan_for_part.getCurrentHeader(), metadata_snapshot, local_context, plan_for_part);
 
-            addExportConvertingActions(plan_for_part, *destination_storage, local_context);
+            /// The destination schema may change after `import` read it, for example when a query reloads it
+            /// from Iceberg metadata, so convert to the header of the sink rather than to the current schema.
+            addExportConvertingActions(plan_for_part, sink->getHeader(), local_context);
 
             QueryPlanOptimizationSettings optimization_settings(local_context);
             auto pipeline_settings = BuildQueryPipelineSettings(local_context);
@@ -419,13 +503,13 @@ bool ExportPartTask::executeStep()
         /// For the direct EXPORT PART → Iceberg path there is no deferred-commit callback
         /// (the partition-export path provides one that writes to ZooKeeper).
         /// Commit the Iceberg metadata inline here so the rows become visible immediately.
-        if (destination_storage->isDataLake() && !manifest.completion_callback)
+        if (import_result && destination_storage->isDataLake() && !manifest.completion_callback)
         {
-            IStorage::IcebergCommitExportPartitionArguments iceberg_args;
+            IStorage::IcebergCommitExportArguments iceberg_args;
             iceberg_args.metadata_json_string = manifest.iceberg_metadata_json;
             iceberg_args.partition_source_block = block_with_partition_values;
 
-            destination_storage->commitExportPartitionTransaction(
+            destination_storage->commitExportTransaction(
                 manifest.transaction_id,
                 manifest.data_part->info.getPartitionId(),
                 (*exports_list_entry)->destination_file_paths,
