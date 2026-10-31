@@ -30,6 +30,8 @@ BINARY_DOCKER_COMMAND = (
     f"+--memory-reservation={Utils.physical_memory() * 9 // 10}"
     f"+--volume=.:/ClickHouse"
     '+--env=AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"+--env=AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"'
+    # Writes to the ThinLTO cache in Hetzner Object Storage; jobs without them read anonymously
+    '+--env=HETZNER_S3_ACCESS_KEY="$HETZNER_S3_ACCESS_KEY"+--env=HETZNER_S3_SECRET_KEY="$HETZNER_S3_SECRET_KEY"'
 )
 BINARY_DOCKER_COMMAND_SANITIZER = (
     BINARY_DOCKER_COMMAND + "+--security-opt seccomp=unconfined"
@@ -443,7 +445,7 @@ class JobConfigs:
                 ArtifactNames.RPM_ARM_RELEASE,
                 ArtifactNames.TGZ_ARM_RELEASE,
             ],
-            runs_on=RunnerLabels.BUILDER_AMD,
+            runs_on=RunnerLabels.BUILDER_ARM,
         ),
     )
     release_build_jobs_with_examples = [

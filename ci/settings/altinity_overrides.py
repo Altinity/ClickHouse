@@ -29,6 +29,8 @@ S3_REPORT_BUCKET = S3_REPORT_BUCKET_NAME
 S3_BUCKET_TO_HTTP_ENDPOINT = {
     S3_BUCKET_NAME: S3_BUCKET_HTTP_ENDPOINT,
     S3_REPORT_BUCKET_NAME: S3_REPORT_BUCKET_HTTP_ENDPOINT,
+    # S3.copy_file_to_s3 returns a public link to every upload
+    "altinity-builds-cache": "altinity-builds-cache.hel1.your-objectstorage.com",
 }
 ENABLE_ARTIFACTS_REPORT = True
 
