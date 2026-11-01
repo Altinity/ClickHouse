@@ -2170,11 +2170,6 @@ namespace FailPoints
     extern const char iceberg_writes_post_publish_throw[];
 }
 
-namespace
-{
-
-/// Find the partition spec object with the given spec-id inside a metadata JSON document.
-/// Throws METADATA_MISMATCH if the spec is not found (indicates metadata/spec-id mismatch).
 Poco::JSON::Object::Ptr lookupPartitionSpec(const Poco::JSON::Object::Ptr & meta, Int64 spec_id)
 {
     auto specs = meta->getArray(Iceberg::f_partition_specs);
@@ -2201,6 +2196,9 @@ Poco::JSON::Object::Ptr lookupSchema(const Poco::JSON::Object::Ptr & meta, Int64
     throw Exception(ErrorCodes::METADATA_MISMATCH,
         "Schema with id {} not found in table metadata", schema_id);
 }
+
+namespace
+{
 
 /// Derive the Iceberg partition tuple for an exported part from a representative source row.
 /// The MergeTree `partition.value` is the source partition-key expression result; it is neither
@@ -2481,9 +2479,7 @@ std::optional<IStorage::ExportPartitionCommitInfo> IcebergMetadata::commitImport
         }
 
         {
-            std::ostringstream oss; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
-            Poco::JSON::Stringifier::stringify(metadata, oss, 4);
-            std::string json_representation = removeEscapedSlashes(oss.str());
+            std::string json_representation = stringifyJSON(metadata, 4);
 
             LOG_DEBUG(log, "Writing new metadata file {}", storage_metadata_name);
             auto hint_path = filename_generator.generateVersionHint();

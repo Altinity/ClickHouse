@@ -190,6 +190,13 @@ using PartitionColumnValues = std::vector<std::pair<String, DB::Field>>;
 
 PartitionColumnValues getIdentityPartitionColumnValues(
     const ProcessedManifestFileEntry & manifest_file_entry, const IcebergSchemaProcessor & schema_processor);
+
+/// Walk a schema's fields array and return field-id -> raw Iceberg type string
+/// (e.g. "date", "timestamptz") for every leaf field, including nested struct members.
+std::unordered_map<Int64, String> collectIcebergTypesByFieldId(Poco::JSON::Array::Ptr schema_fields);
+
+/// Returns the manifest-list path of the current snapshot, or empty string if no current snapshot.
+String getCurrentManifestListPath(const Poco::JSON::Object::Ptr & metadata);
 }
 
 #endif

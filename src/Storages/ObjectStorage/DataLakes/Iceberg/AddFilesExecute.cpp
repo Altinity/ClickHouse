@@ -30,6 +30,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ExecuteCommandArgs.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/FileNamesGenerator.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergDataFileEntry.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergWrites.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/MetadataGenerator.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/SchemaProcessor.h>
@@ -130,35 +131,6 @@ bool hasHiddenPathComponent(const String & path)
 bool endsWithParquet(const String & path)
 {
     return Poco::toLower(path).ends_with(".parquet");
-}
-
-/// Mirrors the anonymous-namespace helper in IcebergMetadata.cpp: find the partition spec
-/// object with the given spec-id inside a metadata JSON document; throws if absent.
-Poco::JSON::Object::Ptr lookupPartitionSpec(const Poco::JSON::Object::Ptr & metadata, Int64 spec_id)
-{
-    auto specs = metadata->getArray(Iceberg::f_partition_specs);
-    for (size_t i = 0; i < specs->size(); ++i)
-    {
-        auto spec = specs->getObject(static_cast<UInt32>(i));
-        if (spec->getValue<Int64>(Iceberg::f_spec_id) == spec_id)
-            return spec;
-    }
-    throw Exception(ErrorCodes::METADATA_MISMATCH,
-        "Partition spec with id {} not found in table metadata", spec_id);
-}
-
-/// Find the schema object with the given schema-id inside a metadata JSON document; throws if absent.
-Poco::JSON::Object::Ptr lookupSchema(const Poco::JSON::Object::Ptr & metadata, Int64 schema_id)
-{
-    auto schemas = metadata->getArray(Iceberg::f_schemas);
-    for (size_t i = 0; i < schemas->size(); ++i)
-    {
-        auto schema = schemas->getObject(static_cast<UInt32>(i));
-        if (schema->getValue<Int32>(Iceberg::f_schema_id) == schema_id)
-            return schema;
-    }
-    throw Exception(ErrorCodes::METADATA_MISMATCH,
-        "Schema with id {} not found in table metadata", schema_id);
 }
 
 /// Expand trailing-slash paths into concrete *.parquet files below them.
@@ -625,22 +597,7 @@ std::unordered_set<String> listLiveDataFiles(
     const FormatSettings & format_settings)
 {
     std::unordered_set<String> live_paths;
-    if (!metadata->has(Iceberg::f_current_snapshot_id) || metadata->isNull(Iceberg::f_current_snapshot_id))
-        return live_paths;
-
-    Int64 current_snapshot_id = metadata->getValue<Int64>(Iceberg::f_current_snapshot_id);
-    if (current_snapshot_id < 0)
-        return live_paths;
-    String manifest_list;
-    for (const auto & snapshot_var : *metadata->getArray(Iceberg::f_snapshots))
-    {
-        auto snapshot = snapshot_var.extract<Poco::JSON::Object::Ptr>();
-        if (snapshot->getValue<Int64>(Iceberg::f_metadata_snapshot_id) == current_snapshot_id)
-        {
-            manifest_list = snapshot->getValue<String>(Iceberg::f_manifest_list);
-            break;
-        }
-    }
+    String manifest_list = getCurrentManifestListPath(metadata);
     if (manifest_list.empty())
         return live_paths;
 
@@ -757,32 +714,7 @@ AddFilesResult addFiles(
         field_id_to_column_path.emplace(id, path);
 
     /// Iceberg primitive type per field id (for date/timestamp transform scaling).
-    std::unordered_map<Int64, String> iceberg_type_by_field_id;
-    {
-        std::function<void(Poco::JSON::Object::Ptr, const String &)> collect_types;
-        collect_types = [&](Poco::JSON::Object::Ptr field, const String & prefix)
-        {
-            String name = prefix.empty() ? field->getValue<String>(Iceberg::f_name) : prefix + "." + field->getValue<String>(Iceberg::f_name);
-            Int64 id = field->getValue<Int64>(Iceberg::f_id);
-            auto type_var = field->get(Iceberg::f_type);
-            if (type_var.isString())
-            {
-                iceberg_type_by_field_id[id] = type_var.extract<String>();
-            }
-            else if (type_var.isStruct())
-            {
-                auto type_obj = type_var.extract<Poco::JSON::Object::Ptr>();
-                String kind = type_obj->getValue<String>(Iceberg::f_type);
-                if (kind == "struct")
-                {
-                    for (const auto & nested : *type_obj->getArray(Iceberg::f_fields))
-                        collect_types(nested.extract<Poco::JSON::Object::Ptr>(), name);
-                }
-            }
-        };
-        for (const auto & field_var : *schema_fields)
-            collect_types(field_var.extract<Poco::JSON::Object::Ptr>(), "");
-    }
+    auto iceberg_type_by_field_id = collectIcebergTypesByFieldId(schema_fields);
 
     /// Source columns for partition fields, from the ClickHouse schema (top-level fields only).
     /// The schema processor is populated lazily (e.g. by reads or native writes); on a freshly
@@ -1054,9 +986,7 @@ AddFilesResult addFiles(
             }
 
             {
-                std::ostringstream oss; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
-                Poco::JSON::Stringifier::stringify(metadata, oss, 4);
-                std::string json_representation = removeEscapedSlashes(oss.str());
+                std::string json_representation = stringifyJSON(metadata, 4);
 
                 auto hint_path = filename_generator.generateVersionHint();
                 if (!writeMetadataFileAndVersionHint(
