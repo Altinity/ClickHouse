@@ -47,11 +47,31 @@ TEST(IcebergFieldParseHelpers, MicrosecondDateTime64BoundsAreKept)
     ASSERT_TRUE(negative.has_value());
     EXPECT_EQ(decimal64Ticks(*negative), us_1960_01_01);
 
-    /// Spark `9999-12-31` sentinel is spec-correct microseconds.
+    /// Spark `9999-12-31` sentinel is spec-correct microseconds, below `1e18`.
     constexpr Int64 spark_9999_us = 253'402'300'799'999'999LL;
     auto sentinel = deserializeFieldFromBinaryRepr(littleEndianInt64(spark_9999_us), type, false);
     ASSERT_TRUE(sentinel.has_value());
     EXPECT_EQ(decimal64Ticks(*sentinel), spark_9999_us);
+
+    /// `1e18` itself does not exceed the threshold, so it stays microseconds.
+    constexpr Int64 exactly_1e18 = 1'000'000'000'000'000'000LL;
+    auto edge = deserializeFieldFromBinaryRepr(littleEndianInt64(exactly_1e18), type, true);
+    ASSERT_TRUE(edge.has_value());
+    EXPECT_EQ(decimal64Ticks(*edge), exactly_1e18);
+}
+
+TEST(IcebergFieldParseHelpers, NanosecondBoundsAbove1e18OnTimestampAreConverted)
+{
+    auto type = std::make_shared<DataTypeDateTime64>(6);
+    /// #2240: `2026-08-11 19:02:06.576815622` stored as nanoseconds on `timestamp`.
+    constexpr Int64 ns_2026_08_11 = 1'786'474'926'576'815'622LL;
+    auto lower = deserializeFieldFromBinaryRepr(littleEndianInt64(ns_2026_08_11), type, true);
+    auto upper = deserializeFieldFromBinaryRepr(littleEndianInt64(ns_2026_08_11), type, false);
+    ASSERT_TRUE(lower.has_value());
+    ASSERT_TRUE(upper.has_value());
+    /// Division truncates toward zero; the upper bound widens by one microsecond.
+    EXPECT_EQ(decimal64Ticks(*lower), 1'786'474'926'576'815LL);
+    EXPECT_EQ(decimal64Ticks(*upper), 1'786'474'926'576'816LL);
 }
 
 TEST(IcebergFieldParseHelpers, NanosecondDateTime64BoundsAreKept)
