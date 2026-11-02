@@ -7,6 +7,7 @@
 #include <base/unaligned.h>
 #include <Core/Field.h>
 #include <DataTypes/DataTypeDateTime64.h>
+#include <DataTypes/DataTypeNullable.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergFieldParseHelpers.h>
 
 using namespace DB;
@@ -65,6 +66,12 @@ TEST(IcebergFieldParseHelpers, TimestampBoundsUseBothRangesBetween1e16And1e18)
     EXPECT_EQ(decimal64Ticks(ranges[0].upper), middle);
     EXPECT_EQ(decimal64Ticks(ranges[1].lower), middle / 1000);
     EXPECT_EQ(decimal64Ticks(ranges[1].upper), middle / 1000);
+
+    /// Optional Iceberg `timestamp` is `Nullable(DateTime64(6))` and uses the same two ranges.
+    auto nullable_ranges = deserializeDateTime64MinMaxRanges(bytes, bytes, makeNullable(type));
+    ASSERT_EQ(nullable_ranges.size(), 2);
+    EXPECT_EQ(decimal64Ticks(nullable_ranges[0].lower), middle);
+    EXPECT_EQ(decimal64Ticks(nullable_ranges[1].lower), middle / 1000);
 
     /// Below `1e16` there is no nanosecond interpretation.
     constexpr Int64 us_2024_02_20 = 1'708'423'200'000'000LL;

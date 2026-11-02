@@ -527,7 +527,8 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
                     || type_id == DB::TypeIndex::Variant)
                     continue;
 
-                if (WhichDataType(name_and_type.type).isDateTime64())
+                /// Optional Iceberg fields are `Nullable(DateTime64)`. The outer type is not `DateTime64`.
+                if (WhichDataType(removeNullable(name_and_type.type)).isDateTime64())
                 {
                     /// `|ticks| < 1e16` is one microsecond range. `|ticks| >= 1e18` is one
                     /// nanosecond range. Values between them produce both, and the file is
