@@ -53,8 +53,12 @@ jobs:
   Build:
     name: Build-${{inputs.build_name}}
     if: ${{ contains(fromJson(inputs.data).jobs_data.jobs_to_do, inputs.build_name) || inputs.force }}
+    timeout-minutes: 150
     env:
       GITHUB_JOB_OVERRIDDEN: Build-${{inputs.build_name}}
+      # Abort a submodule fetch stalled below 1 KB/s for 60 s, so .github/retry.sh can retry it.
+      GIT_HTTP_LOW_SPEED_LIMIT: 1000
+      GIT_HTTP_LOW_SPEED_TIME: 60
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     steps:
       - name: Check out repository code
