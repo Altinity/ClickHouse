@@ -957,6 +957,8 @@ ManifestSweepResult planManifestCursorPage(
         decided_through = listed.key;
     }
 
+    /// A writer may create a namespace, commit a ref and advance the floor after `catalog_cut` was read.
+    /// Recheck after floor reads so the old catalog cut cannot make its committed manifest look unowned.
     excludeCandidatesWithChangedCatalogEntries(op, layout, catalog_cut, candidates, result);
 
     size_t next_body_hint = 0;
