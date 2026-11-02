@@ -371,7 +371,64 @@ bool queryHasRightOrFullJoin(const ASTPtr & query)
     return false;
 }
 
-void rewriteASTJoinsToGlobal(ASTPtr & query)
+bool astContainsTableIdentifier(const ASTPtr & node)
+{
+    if (!node)
+        return false;
+
+    if (node->as<ASTTableIdentifier>())
+        return true;
+
+    for (const auto & child : node->children)
+        if (astContainsTableIdentifier(child))
+            return true;
+
+    return false;
+}
+
+/// A named table in `IN` is read where the client connected. `IN (SELECT 1)` has no table and stays on the replica.
+bool inRightSideIsInitiatorLocal(const ASTPtr & rhs)
+{
+    if (!rhs)
+        return false;
+
+    if (rhs->as<ASTIdentifier>() || rhs->as<ASTTableIdentifier>())
+        return true;
+
+    if (rhs->as<ASTSubquery>() || rhs->as<ASTSelectQuery>() || rhs->as<ASTSelectWithUnionQuery>())
+        return astContainsTableIdentifier(rhs);
+
+    return false;
+}
+
+void rewriteInitiatorLocalInToGlobalIn(ASTPtr & node)
+{
+    if (!node)
+        return;
+
+    if (auto * function = node->as<ASTFunction>())
+    {
+        if (isNameOfLocalInFunction(function->name) && function->arguments && function->arguments->children.size() >= 2
+            && inRightSideIsInitiatorLocal(function->arguments->children[1]))
+            function->name = getGlobalInFunctionNameForLocalInFunctionName(function->name);
+    }
+
+    for (auto & child : node->children)
+    {
+        if (astIsNestedSelect(child))
+            continue;
+        rewriteInitiatorLocalInToGlobalIn(child);
+    }
+}
+
+enum class GlobalInRewrite : uint8_t
+{
+    None,
+    InitiatorLocal,
+    All,
+};
+
+void rewriteASTJoinsToGlobal(ASTPtr & query, GlobalInRewrite in_rewrite)
 {
     ASTSelectQuery * select_query = query->as<ASTSelectQuery>();
     if (!select_query)
@@ -381,7 +438,7 @@ void rewriteASTJoinsToGlobal(ASTPtr & query)
             if (union_query->list_of_selects)
             {
                 for (auto & child : union_query->list_of_selects->children)
-                    rewriteASTJoinsToGlobal(child);
+                    rewriteASTJoinsToGlobal(child, in_rewrite);
             }
         }
         return;
@@ -402,14 +459,17 @@ void rewriteASTJoinsToGlobal(ASTPtr & query)
         }
     }
 
-    rewriteASTInFunctionsToGlobalIn(query);
+    if (in_rewrite == GlobalInRewrite::All)
+        rewriteASTInFunctionsToGlobalIn(query);
+    else if (in_rewrite == GlobalInRewrite::InitiatorLocal)
+        rewriteInitiatorLocalInToGlobalIn(query);
 }
 
 }
 
 void IStorageCluster::rewriteASTForGlobalJoin(ASTPtr & query)
 {
-    rewriteASTJoinsToGlobal(query);
+    rewriteASTJoinsToGlobal(query, GlobalInRewrite::All);
 }
 
 /// The initiator interpreter usually does this already: `IStorageCluster::isRemote` is true, so
@@ -421,7 +481,8 @@ namespace
 {
 void broadcastOldAnalyzerGlobalJoin(ASTPtr & query_to_send, const SelectQueryInfo & query_info, const ContextPtr & context)
 {
-    IStorageCluster::rewriteASTForGlobalJoin(query_to_send);
+    /// `IN (SELECT 1)` stays on the replica. `IN some_table` is read on the initiator.
+    rewriteASTJoinsToGlobal(query_to_send, GlobalInRewrite::InitiatorLocal);
 
     auto prepared_sets = query_info.prepared_sets ? query_info.prepared_sets : std::make_shared<PreparedSets>();
     TemporaryTablesMapping external_tables;
