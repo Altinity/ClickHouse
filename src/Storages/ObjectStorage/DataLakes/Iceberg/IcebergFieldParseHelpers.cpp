@@ -26,13 +26,14 @@ namespace Iceberg
 namespace
 {
 
-/// 1e18 ns is ~year 2001; customer 2026 ns bounds are `~1.76e18`.
+/// `1e16` us is `2286-11-20`. `1e18` ns is `2001-09-09`.
+constexpr Int64 microseconds_only_threshold = 10'000'000'000'000'000LL;
 constexpr Int64 nanoseconds_lower_threshold = 1'000'000'000'000'000'000LL;
 constexpr Int64 nanoseconds_per_microsecond = 1000;
 
-bool magnitudeExceeds(Int64 value, Int64 threshold)
+bool magnitudeBelow(Int64 value, Int64 threshold)
 {
-    return value > threshold || value < -threshold;
+    return value > -threshold && value < threshold;
 }
 
 /// Convert ns ticks to us ticks without shrinking a [lower, upper] range.
@@ -57,7 +58,8 @@ Int64 nanosecondsToMicrosecondsForBound(Int64 nanoseconds, bool lower_bound)
 
 /// Iceberg timestamps are 8-byte little-endian (spec Appendix D).
 /// Some writers store nanosecond stats on Iceberg `timestamp` (`DateTime64(6)`).
-/// Convert only when `|ticks| > 1e18`. A smaller value stays microseconds.
+/// `|ticks| >= 1e18` is nanoseconds. A smaller value stays microseconds here;
+/// the min/max pruner also tries nanoseconds for `|ticks| >= 1e16`.
 std::optional<Field> deserializeDateTime64FromBinaryRepr(const std::string & str, const IDataType & type, bool lower_bound)
 {
     if (str.size() != sizeof(Int64))
@@ -68,11 +70,28 @@ std::optional<Field> deserializeDateTime64FromBinaryRepr(const std::string & str
 
     if (scale == 6)
     {
-        if (magnitudeExceeds(unscaled, nanoseconds_lower_threshold))
+        if (!magnitudeBelow(unscaled, nanoseconds_lower_threshold))
             unscaled = nanosecondsToMicrosecondsForBound(unscaled, lower_bound);
     }
 
     return DecimalField<DateTime64>(DateTime64(unscaled), scale);
+}
+
+std::optional<Int64> loadDateTime64Ticks(const std::string & str)
+{
+    if (str.size() != sizeof(Int64))
+        return std::nullopt;
+    return unalignedLoadLittleEndian<Int64>(str.data());
+}
+
+void appendRange(std::vector<DateTime64BoundRange> & ranges, Int64 lower_ticks, Int64 upper_ticks, UInt32 scale)
+{
+    if (lower_ticks > upper_ticks)
+        return;
+
+    ranges.push_back(DateTime64BoundRange{
+        DecimalField<DateTime64>(DateTime64(lower_ticks), scale),
+        DecimalField<DateTime64>(DateTime64(upper_ticks), scale)});
 }
 
 }
@@ -203,6 +222,46 @@ static std::optional<Field> deserializeDecimalBound(const std::string & str, UIn
     }
 
     return DecimalField<DecimalType>(unscaled_value, scale);
+}
+
+std::vector<DateTime64BoundRange> deserializeDateTime64MinMaxRanges(
+    const std::string & lower_str,
+    const std::string & upper_str,
+    DataTypePtr type)
+{
+    std::vector<DateTime64BoundRange> ranges;
+    const auto lower_ticks = loadDateTime64Ticks(lower_str);
+    const auto upper_ticks = loadDateTime64Ticks(upper_str);
+    if (!lower_ticks || !upper_ticks)
+        return ranges;
+
+    const UInt32 scale = getDecimalScale(*removeNullable(type));
+    if (scale != 6)
+    {
+        appendRange(ranges, *lower_ticks, *upper_ticks, scale);
+        return ranges;
+    }
+
+    /// Both ends must accept a unit. A lower bound below `1e16` and an upper bound
+    /// of `1e18` produce no range, and min/max pruning skips the column.
+    const bool allow_microseconds = magnitudeBelow(*lower_ticks, nanoseconds_lower_threshold)
+        && magnitudeBelow(*upper_ticks, nanoseconds_lower_threshold);
+    const bool allow_nanoseconds = !magnitudeBelow(*lower_ticks, microseconds_only_threshold)
+        && !magnitudeBelow(*upper_ticks, microseconds_only_threshold);
+
+    if (allow_microseconds)
+        appendRange(ranges, *lower_ticks, *upper_ticks, scale);
+
+    if (allow_nanoseconds)
+    {
+        appendRange(
+            ranges,
+            nanosecondsToMicrosecondsForBound(*lower_ticks, true),
+            nanosecondsToMicrosecondsForBound(*upper_ticks, false),
+            scale);
+    }
+
+    return ranges;
 }
 
 std::optional<Field> deserializeFieldFromBinaryRepr(const std::string & str, DataTypePtr expected_type, bool lower_bound)

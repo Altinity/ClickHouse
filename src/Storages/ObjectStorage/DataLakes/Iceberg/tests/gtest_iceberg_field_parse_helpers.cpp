@@ -52,12 +52,33 @@ TEST(IcebergFieldParseHelpers, MicrosecondDateTime64BoundsAreKept)
     auto sentinel = deserializeFieldFromBinaryRepr(littleEndianInt64(spark_9999_us), type, false);
     ASSERT_TRUE(sentinel.has_value());
     EXPECT_EQ(decimal64Ticks(*sentinel), spark_9999_us);
+}
 
-    /// `1e18` itself does not exceed the threshold, so it stays microseconds.
-    constexpr Int64 exactly_1e18 = 1'000'000'000'000'000'000LL;
-    auto edge = deserializeFieldFromBinaryRepr(littleEndianInt64(exactly_1e18), type, true);
-    ASSERT_TRUE(edge.has_value());
-    EXPECT_EQ(decimal64Ticks(*edge), exactly_1e18);
+TEST(IcebergFieldParseHelpers, TimestampBoundsUseBothRangesBetween1e16And1e18)
+{
+    auto type = std::make_shared<DataTypeDateTime64>(6);
+    constexpr Int64 middle = 200'000'000'000'000'000LL;
+    const auto bytes = littleEndianInt64(middle);
+    auto ranges = deserializeDateTime64MinMaxRanges(bytes, bytes, type);
+    ASSERT_EQ(ranges.size(), 2);
+    EXPECT_EQ(decimal64Ticks(ranges[0].lower), middle);
+    EXPECT_EQ(decimal64Ticks(ranges[0].upper), middle);
+    EXPECT_EQ(decimal64Ticks(ranges[1].lower), middle / 1000);
+    EXPECT_EQ(decimal64Ticks(ranges[1].upper), middle / 1000);
+
+    /// Below `1e16` there is no nanosecond interpretation.
+    constexpr Int64 us_2024_02_20 = 1'708'423'200'000'000LL;
+    const auto small = littleEndianInt64(us_2024_02_20);
+    auto microseconds = deserializeDateTime64MinMaxRanges(small, small, type);
+    ASSERT_EQ(microseconds.size(), 1);
+    EXPECT_EQ(decimal64Ticks(microseconds[0].lower), us_2024_02_20);
+
+    /// A small lower bound keeps the Spark sentinel as microseconds only.
+    constexpr Int64 spark_9999_us = 253'402'300'799'999'999LL;
+    auto sentinel = deserializeDateTime64MinMaxRanges(small, littleEndianInt64(spark_9999_us), type);
+    ASSERT_EQ(sentinel.size(), 1);
+    EXPECT_EQ(decimal64Ticks(sentinel[0].lower), us_2024_02_20);
+    EXPECT_EQ(decimal64Ticks(sentinel[0].upper), spark_9999_us);
 }
 
 TEST(IcebergFieldParseHelpers, NanosecondBoundsAbove1e18OnTimestampAreConverted)
@@ -72,6 +93,16 @@ TEST(IcebergFieldParseHelpers, NanosecondBoundsAbove1e18OnTimestampAreConverted)
     /// Division truncates toward zero; the upper bound widens by one microsecond.
     EXPECT_EQ(decimal64Ticks(*lower), 1'786'474'926'576'815LL);
     EXPECT_EQ(decimal64Ticks(*upper), 1'786'474'926'576'816LL);
+
+    /// `1e18` itself is nanoseconds. The pair has only the converted range.
+    constexpr Int64 exactly_1e18 = 1'000'000'000'000'000'000LL;
+    auto edge = deserializeFieldFromBinaryRepr(littleEndianInt64(exactly_1e18), type, true);
+    ASSERT_TRUE(edge.has_value());
+    EXPECT_EQ(decimal64Ticks(*edge), exactly_1e18 / 1000);
+    const auto edge_bytes = littleEndianInt64(exactly_1e18);
+    auto edge_ranges = deserializeDateTime64MinMaxRanges(edge_bytes, edge_bytes, type);
+    ASSERT_EQ(edge_ranges.size(), 1);
+    EXPECT_EQ(decimal64Ticks(edge_ranges[0].lower), exactly_1e18 / 1000);
 }
 
 TEST(IcebergFieldParseHelpers, NanosecondDateTime64BoundsAreKept)
