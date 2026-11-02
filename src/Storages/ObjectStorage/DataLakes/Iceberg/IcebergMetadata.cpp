@@ -70,6 +70,8 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Storages/ColumnsDescription.h>
 #include <Storages/ObjectStorage/DataLakes/Common/AvroForIcebergDeserializer.h>
+#include <Interpreters/ProcessList.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/BinPackRewrite.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ExpireSnapshotsExecute.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/RemoveOrphanFilesExecute.h>
@@ -138,6 +140,8 @@ extern const int METADATA_MISMATCH;
 extern const int UNFINISHED;
 extern const int INCORRECT_DATA;
 extern const int FILE_DOESNT_EXIST;
+extern const int LIMIT_EXCEEDED;
+extern const int QUERY_WAS_CANCELLED;
 }
 
 namespace Setting
@@ -542,7 +546,9 @@ IcebergMetadata::getIcebergDataSnapshot(Poco::JSON::Object::Ptr metadata_object,
 bool IcebergMetadata::optimize(
     [[maybe_unused]] const StorageMetadataPtr & metadata_snapshot,
     [[maybe_unused]] ContextPtr context,
-    [[maybe_unused]] const std::optional<FormatSettings> & format_settings)
+    [[maybe_unused]] const std::optional<FormatSettings> & format_settings,
+    [[maybe_unused]] std::shared_ptr<DataLake::ICatalog> catalog,
+    [[maybe_unused]] const StorageID & storage_id)
 {
     checkTableRootIsQueriedPath("OPTIMIZE");
 
@@ -558,27 +564,78 @@ bool IcebergMetadata::optimize(
     iceberg_compaction_metadata_generator->waitUntilUpdated();
     return true;
 #else
-    if (context->getSettingsRef()[Setting::allow_experimental_iceberg_compaction])
+    if (!context->getSettingsRef()[Setting::allow_experimental_iceberg_compaction])
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS, "Enable 'allow_experimental_iceberg_compaction' setting to call optimize for iceberg tables.");
+
+    /// Format version 3 requires row lineage to be carried into rewritten files, which neither
+    /// compaction path does yet. The cached version may be stale, so both paths check the latest
+    /// metadata again; this only rejects early.
+    if (persistent_components.format_version != 2)
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "OPTIMIZE TABLE is supported only for Iceberg format_version 2, got {}",
+            persistent_components.format_version);
+
+    auto invalidate_metadata_cache = [&]()
     {
-        const auto sample_block = std::make_shared<const Block>(metadata_snapshot->getSampleBlock());
-        auto snapshots_info = getHistory(context);
+        if (persistent_components.metadata_cache)
+        {
+            persistent_components.metadata_cache->remove(persistent_components.table_path);
+            if (persistent_components.table_uuid)
+                persistent_components.metadata_cache->remove(*persistent_components.table_uuid);
+        }
+    };
+
+    /// Bin-packing never rewrites a file a position delete applies to, so it cannot remove them.
+    if (Iceberg::hasLivePositionDeletes(
+            persistent_components, object_storage, *external_storages, data_lake_settings, context, catalog, storage_id))
+    {
+        LOG_INFO(log, "Table has live position delete files, applying them with a full compaction");
         compactIcebergTable(
-            snapshots_info,
+            getHistory(context),
             persistent_components,
             object_storage,
             external_storages,
             data_lake_settings,
             format_settings,
-            sample_block,
+            std::make_shared<const Block>(metadata_snapshot->getSampleBlock()),
             context,
             write_format);
+        invalidate_metadata_cache();
         return true;
     }
-    else
+
+    /// Each attempt rewrites data files, so a conflict is retried only a few times.
+    static constexpr size_t MAX_BIN_PACK_RETRIES = 5;
+
+    for (size_t attempt = 0; attempt < MAX_BIN_PACK_RETRIES; ++attempt)
     {
-        throw Exception(
-            ErrorCodes::BAD_ARGUMENTS, "Enable 'allow_experimental_iceberg_compaction' setting to call optimize for iceberg tables.");
+        if (auto elem = context->getProcessListElement(); elem && elem->isKilled())
+            throw Exception(ErrorCodes::QUERY_WAS_CANCELLED, "OPTIMIZE TABLE cancelled during bin-pack retry loop");
+
+        if (attempt > 0)
+            LOG_INFO(log, "Retrying bin-pack compaction (attempt {}/{})", attempt + 1, MAX_BIN_PACK_RETRIES);
+
+        const auto result = Iceberg::executeBinPackCompaction(
+            persistent_components,
+            object_storage,
+            *external_storages,
+            data_lake_settings,
+            context,
+            write_format,
+            catalog,
+            storage_id);
+
+        if (result == Iceberg::BinPackCommitResult::Committed)
+        {
+            invalidate_metadata_cache();
+            return true;
+        }
     }
+
+    throw Exception(ErrorCodes::LIMIT_EXCEEDED,
+        "Bin-pack compaction did not commit after {} attempts because of concurrent modifications", MAX_BIN_PACK_RETRIES);
 #endif
 }
 
@@ -1292,7 +1349,6 @@ IcebergMetadata::IcebergHistory IcebergMetadata::getHistory(ContextPtr local_con
 
     auto metadata_object
         = getMetadataJSONObject(metadata_file_path, object_storage, persistent_components.metadata_cache, local_context, log, compression_method, persistent_components.table_uuid);
-    chassert(persistent_components.format_version == metadata_object->getValue<int>(f_format_version));
 
     /// History
     std::vector<Iceberg::IcebergHistoryRecord> iceberg_history;
