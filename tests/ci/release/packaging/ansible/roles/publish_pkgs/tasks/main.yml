@@ -62,29 +62,25 @@
   loop_control:
     label: "{{ item.path }}"
 
-- name: Update CloudFront distribution
-  community.aws.cloudfront_distribution:
-    region: "{{ aws_region }}"
-    state: present
-    caller_reference: "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.DistributionConfig.CallerReference }}"
-    origins:
-      - id: "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.DistributionConfig.Origins.Items[0].Id }}"
-        domain_name: "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.DistributionConfig.Origins.Items[0].DomainName }}"
-        origin_path: "/{{ new_cloudfront_origin_path | default(omit) }}"
-        custom_origin_config:
-          origin_protocol_policy: "http-only"
-    aliases:
-      - "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.DistributionConfig.Aliases.Items[0] }}"
-    viewer_certificate:
-      acm_certificate_arn: "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.DistributionConfig.ViewerCertificate.ACMCertificateArn }}"
-      ssl_support_method: "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.DistributionConfig.ViewerCertificate.SSLSupportMethod }}"
-    logging:
-      bucket: "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.DistributionConfig.Logging.Bucket }}"
-      enabled: "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.DistributionConfig.Logging.Enabled }}"
-      include_cookies: "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.DistributionConfig.Logging.IncludeCookies }}"
-      prefix: "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.DistributionConfig.Logging.Prefix }}"
-  when: 'not (push_to_active|default(false))'
-  register: distribution
+- name: Set CloudFront origin path only
+  when: not (push_to_active | default(false) | bool)
+  vars:
+    cf_distribution_id: "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.Id }}"
+    cf_origin_path: "/{{ new_cloudfront_origin_path | regex_replace('^/', '') }}"
+  shell: |
+    set -euo pipefail
+    aws cloudfront get-distribution-config --id "{{ cf_distribution_id }}" > /tmp/cf-dist.json
+    ETAG=$(jq -r '.ETag' /tmp/cf-dist.json)
+    jq --arg path "{{ cf_origin_path }}" \
+      '.DistributionConfig.Origins.Items[0].OriginPath = $path | .DistributionConfig' \
+      /tmp/cf-dist.json > /tmp/cf-config.json
+    aws cloudfront update-distribution \
+      --id "{{ cf_distribution_id }}" \
+      --if-match "$ETAG" \
+      --distribution-config file:///tmp/cf-config.json
+    rm -f /tmp/cf-dist.json /tmp/cf-config.json
+  args:
+    executable: /bin/bash
 
 - name: Invalidate CloudFront cache
   community.aws.cloudfront_invalidation:
@@ -94,5 +90,8 @@
   register: invalidation
 
 - name: Wait for CloudFront invalidation to be complete
-  shell: "aws cloudfront wait invalidation-completed --distribution-id {{ distribution.id }} --id {{ invalidation.invalidation.id }}"
+  shell: >-
+    aws cloudfront wait invalidation-completed
+    --distribution-id {{ cloudfront_info.cloudfront[repo_dns_name].Distribution.Id }}
+    --id {{ invalidation.invalidation.id }}
 
