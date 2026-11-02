@@ -70,6 +70,14 @@ std::optional<MountLease> mountLeaseForNamespace(CasOperation & op, const Layout
     return std::nullopt;
 }
 
+BuildFloor toBuildFloor(const MountLease & mount_lease)
+{
+    return BuildFloor{
+        .writer_epoch = mount_lease.writer_epoch,
+        .min_active_build_sequence = mount_lease.min_active_build_sequence
+    };
+}
+
 struct ListedManifestObject
 {
     RootNamespace ns;
@@ -91,7 +99,7 @@ bool isBuildUnderFloor(
         ++result.floor_lookups;
         lease_it->second = mountLeaseForNamespace(op, layout, manifest.ns, &result.floor_reads);
     }
-    return prefixEligibleUnder(lease_it->second, manifest.build_prefix);
+    return buildPrefixEligibleUnderFloor(lease_it->second.transform(toBuildFloor), manifest.build_prefix);
 }
 
 /// Delegates to the shared `Layout::parseManifestKey`, which validates the canonical manifest-key
@@ -568,32 +576,32 @@ namespace
 /// do not replace that authority check with a frozen-sequence or judged-dead guess. Compare
 /// `writer_epoch` first, then `build_sequence`, so old-epoch
 /// debris drains after a process restart even when its build_sequence is above the current min_active_build_sequence.
-bool prefixEligibleOn(CasOperation & op, const Layout & layout, const RootNamespace & ns, const BuildPrefix & prefix)
+bool buildPrefixEligibleUnderFloorOn(
+    CasOperation & op, const Layout & layout, const RootNamespace & ns, const BuildPrefix & build_prefix)
 {
-    return prefixEligibleUnder(mountLeaseForNamespace(op, layout, ns), prefix);
+    return buildPrefixEligibleUnderFloor(mountLeaseForNamespace(op, layout, ns).transform(toBuildFloor), build_prefix);
 }
 
 }
 
-bool prefixEligibleUnder(const std::optional<MountLease> & floor, const BuildPrefix & prefix)
+bool buildPrefixEligibleUnderFloor(const std::optional<BuildFloor> & floor, const BuildPrefix & build_prefix)
 {
     if (!floor)
         return false;
 
-    const MountLease & w = *floor;
-    if (prefix.writer_epoch < w.writer_epoch)
+    if (floor->writer_epoch > build_prefix.writer_epoch)
         return true;
-    if (prefix.writer_epoch > w.writer_epoch)
+    if (floor->writer_epoch < build_prefix.writer_epoch)
         return false;
-    if (w.min_active_build_sequence == std::numeric_limits<uint64_t>::max())
+    if (floor->min_active_build_sequence == std::numeric_limits<uint64_t>::max())
         return true;   /// farewell/retired sentinel: every seq is retired
-    return w.min_active_build_sequence > prefix.build_sequence;
+    return floor->min_active_build_sequence > build_prefix.build_sequence;
 }
 
-bool prefixEligible(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix)
+bool buildPrefixEligibleUnderFloor(Pool & store, const RootNamespace & ns, const BuildPrefix & build_prefix)
 {
     CasOperation op = store.openRequests().admit();
-    return prefixEligibleOn(op, store.layout(), ns, prefix);
+    return buildPrefixEligibleUnderFloorOn(op, store.layout(), ns, build_prefix);
 }
 
 uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix,
@@ -601,7 +609,7 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
 {
     const Layout & layout = store.layout();
     CasOperation op = store.openRequests().admit();
-    if (!prefixEligibleOn(op, layout, ns, prefix))
+    if (!buildPrefixEligibleUnderFloorOn(op, layout, ns, prefix))
         return 0;   /// not eligible by the durable watermark fact — delete nothing (controls #8/#9)
 
     /// Build the protection view. A missing snapshot body, an invalid transaction, or an incomplete

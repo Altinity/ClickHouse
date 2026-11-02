@@ -335,18 +335,18 @@ TEST(CASOrphanSweepRequests, RetainedKeysCostNoBodyRead)
         EXPECT_EQ(f.backend->getCount(layout.manifestKey(ManifestId{kNs, build(seq)})), 0u) << seq;
 }
 
-TEST(CASOrphanSweepRequests, PrefixEligibleUnderIsTheFourComparisons)
+TEST(CASOrphanSweepRequests, BuildPrefixEligibleUnderFloorIsTheFourComparisons)
 {
-    MountLease floor;
+    BuildFloor floor;
     floor.writer_epoch = 3;
     floor.min_active_build_sequence = 10;
-    EXPECT_TRUE(prefixEligibleUnder(floor, BuildPrefix{.writer_epoch = 2, .build_sequence = 999}));
-    EXPECT_FALSE(prefixEligibleUnder(floor, BuildPrefix{.writer_epoch = 4, .build_sequence = 1}));
-    EXPECT_TRUE(prefixEligibleUnder(floor, BuildPrefix{.writer_epoch = 3, .build_sequence = 9}));
-    EXPECT_FALSE(prefixEligibleUnder(floor, BuildPrefix{.writer_epoch = 3, .build_sequence = 10}));
+    EXPECT_TRUE(buildPrefixEligibleUnderFloor(floor, BuildPrefix{.writer_epoch = 2, .build_sequence = 999}));
+    EXPECT_FALSE(buildPrefixEligibleUnderFloor(floor, BuildPrefix{.writer_epoch = 4, .build_sequence = 1}));
+    EXPECT_TRUE(buildPrefixEligibleUnderFloor(floor, BuildPrefix{.writer_epoch = 3, .build_sequence = 9}));
+    EXPECT_FALSE(buildPrefixEligibleUnderFloor(floor, BuildPrefix{.writer_epoch = 3, .build_sequence = 10}));
     floor.min_active_build_sequence = std::numeric_limits<uint64_t>::max();
-    EXPECT_TRUE(prefixEligibleUnder(floor, BuildPrefix{.writer_epoch = 3, .build_sequence = 10}));
-    EXPECT_FALSE(prefixEligibleUnder(std::nullopt, BuildPrefix{.writer_epoch = 1, .build_sequence = 1}));
+    EXPECT_TRUE(buildPrefixEligibleUnderFloor(floor, BuildPrefix{.writer_epoch = 3, .build_sequence = 10}));
+    EXPECT_FALSE(buildPrefixEligibleUnderFloor(std::nullopt, BuildPrefix{.writer_epoch = 1, .build_sequence = 1}));
 }
 
 namespace
