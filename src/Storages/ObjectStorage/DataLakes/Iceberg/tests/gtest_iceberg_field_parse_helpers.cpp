@@ -55,6 +55,16 @@ TEST(IcebergFieldParseHelpers, MicrosecondDateTime64BoundsAreKept)
     EXPECT_EQ(decimal64Ticks(*sentinel), spark_9999_us);
 }
 
+TEST(IcebergFieldParseHelpers, AmbiguousTimestampBoundsAreTheOpenMiddleBand)
+{
+    EXPECT_FALSE(isAmbiguousIcebergTimestampBound(iceberg_timestamp_microseconds_only_threshold - 1));
+    EXPECT_TRUE(isAmbiguousIcebergTimestampBound(iceberg_timestamp_microseconds_only_threshold));
+    EXPECT_TRUE(isAmbiguousIcebergTimestampBound(200'000'000'000'000'000LL));
+    EXPECT_TRUE(isAmbiguousIcebergTimestampBound(-200'000'000'000'000'000LL));
+    EXPECT_TRUE(isAmbiguousIcebergTimestampBound(iceberg_timestamp_nanoseconds_lower_threshold - 1));
+    EXPECT_FALSE(isAmbiguousIcebergTimestampBound(iceberg_timestamp_nanoseconds_lower_threshold));
+}
+
 TEST(IcebergFieldParseHelpers, TimestampBoundsUseBothRangesBetween1e16And1e18)
 {
     auto type = std::make_shared<DataTypeDateTime64>(6);

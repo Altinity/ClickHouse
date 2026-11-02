@@ -16,6 +16,23 @@
 namespace DB::Iceberg
 {
 
+/// `iceberg_timestamp_microseconds_only_threshold` microseconds is `2286-11-20`.
+/// `iceberg_timestamp_nanoseconds_lower_threshold` nanoseconds is `2001-09-09`.
+constexpr Int64 iceberg_timestamp_microseconds_only_threshold = 10'000'000'000'000'000LL;
+constexpr Int64 iceberg_timestamp_nanoseconds_lower_threshold = 1'000'000'000'000'000'000LL;
+
+inline bool icebergTimestampMagnitudeBelow(Int64 value, Int64 threshold)
+{
+    return value > -threshold && value < threshold;
+}
+
+/// `[iceberg_timestamp_microseconds_only_threshold, iceberg_timestamp_nanoseconds_lower_threshold)`.
+inline bool isAmbiguousIcebergTimestampBound(Int64 ticks)
+{
+    return !icebergTimestampMagnitudeBelow(ticks, iceberg_timestamp_microseconds_only_threshold)
+        && icebergTimestampMagnitudeBelow(ticks, iceberg_timestamp_nanoseconds_lower_threshold);
+}
+
 /// Convert a Field to Int64, accepting Int64 and UInt64 (with overflow check).
 Int64 fieldToInt64(const Field & value, std::string_view context, std::string_view arg_name);
 

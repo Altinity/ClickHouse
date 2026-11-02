@@ -26,15 +26,7 @@ namespace Iceberg
 namespace
 {
 
-/// `1e16` us is `2286-11-20`. `1e18` ns is `2001-09-09`.
-constexpr Int64 microseconds_only_threshold = 10'000'000'000'000'000LL;
-constexpr Int64 nanoseconds_lower_threshold = 1'000'000'000'000'000'000LL;
 constexpr Int64 nanoseconds_per_microsecond = 1000;
-
-bool magnitudeBelow(Int64 value, Int64 threshold)
-{
-    return value > -threshold && value < threshold;
-}
 
 /// Convert ns ticks to us ticks without shrinking a [lower, upper] range.
 Int64 nanosecondsToMicrosecondsForBound(Int64 nanoseconds, bool lower_bound)
@@ -70,7 +62,7 @@ std::optional<Field> deserializeDateTime64FromBinaryRepr(const std::string & str
 
     if (scale == 6)
     {
-        if (!magnitudeBelow(unscaled, nanoseconds_lower_threshold))
+        if (!icebergTimestampMagnitudeBelow(unscaled, iceberg_timestamp_nanoseconds_lower_threshold))
             unscaled = nanosecondsToMicrosecondsForBound(unscaled, lower_bound);
     }
 
@@ -244,10 +236,10 @@ std::vector<DateTime64BoundRange> deserializeDateTime64MinMaxRanges(
 
     /// Both ends must accept a unit. A lower bound below `1e16` and an upper bound
     /// of `1e18` produce no range, and min/max pruning skips the column.
-    const bool allow_microseconds = magnitudeBelow(*lower_ticks, nanoseconds_lower_threshold)
-        && magnitudeBelow(*upper_ticks, nanoseconds_lower_threshold);
-    const bool allow_nanoseconds = !magnitudeBelow(*lower_ticks, microseconds_only_threshold)
-        && !magnitudeBelow(*upper_ticks, microseconds_only_threshold);
+    const bool allow_microseconds = icebergTimestampMagnitudeBelow(*lower_ticks, iceberg_timestamp_nanoseconds_lower_threshold)
+        && icebergTimestampMagnitudeBelow(*upper_ticks, iceberg_timestamp_nanoseconds_lower_threshold);
+    const bool allow_nanoseconds = !icebergTimestampMagnitudeBelow(*lower_ticks, iceberg_timestamp_microseconds_only_threshold)
+        && !icebergTimestampMagnitudeBelow(*upper_ticks, iceberg_timestamp_microseconds_only_threshold);
 
     if (allow_microseconds)
         appendRange(ranges, *lower_ticks, *upper_ticks, scale);

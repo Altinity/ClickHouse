@@ -2,7 +2,10 @@
 #include <Storages/ObjectStorage/StorageObjectStorageSource.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFile.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergFieldParseHelpers.h>
+#include <base/unaligned.h>
 #include <Core/TypeId.h>
+#include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypesDecimal.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
 #include <Core/Field.h>
@@ -158,7 +161,22 @@ DataFileMetaInfo::DataFileMetaInfo(
                     auto left = Iceberg::deserializeFieldFromBinaryRepr(left_str, type, true);
                     auto right = Iceberg::deserializeFieldFromBinaryRepr(right_str, type, false);
                     if (left && right && !DB::Range::less(*right, *left))
-                        hyperrectangle = DB::Range(*left, true, *right, true);
+                    {
+                        const auto non_nullable_type = removeNullable(type);
+                        bool ambiguous_timestamp = false;
+                        if (WhichDataType(non_nullable_type).isDateTime64() && getDecimalScale(*non_nullable_type) == 6
+                            && left_str.size() == sizeof(Int64) && right_str.size() == sizeof(Int64))
+                        {
+                            const Int64 left_ticks = unalignedLoadLittleEndian<Int64>(left_str.data());
+                            const Int64 right_ticks = unalignedLoadLittleEndian<Int64>(right_str.data());
+                            /// `[1e16, 1e18)` can be microseconds or nanoseconds, so the constant-column
+                            /// shortcut must not substitute either reading.
+                            ambiguous_timestamp = Iceberg::isAmbiguousIcebergTimestampBound(left_ticks)
+                                || Iceberg::isAmbiguousIcebergTimestampBound(right_ticks);
+                        }
+                        if (!ambiguous_timestamp)
+                            hyperrectangle = DB::Range(*left, true, *right, true);
+                    }
                 }
             }
         }
