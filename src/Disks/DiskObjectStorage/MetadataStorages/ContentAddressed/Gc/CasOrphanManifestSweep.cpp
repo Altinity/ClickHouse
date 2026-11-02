@@ -45,8 +45,8 @@ void onGcEnumerationPage()
 /// mount there is no deletion authority, so the caller must leave the prefix untouched. The mount's
 /// `writer_epoch` and `min_active_build_sequence` are the single durable epoch/floor pair used for eligibility, including
 /// across process replacement and the retired sentinel.
-std::optional<MountLease> floorForNamespace(CasOperation & op, const Layout & layout, const RootNamespace & ns,
-                                            uint64_t * reads = nullptr)
+std::optional<MountLease> mountLeaseForNamespace(CasOperation & op, const Layout & layout, const RootNamespace & ns,
+                                               uint64_t * reads = nullptr)
 {
     const String & value = ns.string();
     size_t pos = value.size();
@@ -73,25 +73,25 @@ std::optional<MountLease> floorForNamespace(CasOperation & op, const Layout & la
 struct ListedManifestObject
 {
     RootNamespace ns;
-    BuildPrefix prefix;
+    BuildPrefix build_prefix;
     ManifestRef ref;
     String key;
 };
 
-bool isBuildBelowFloor(
+bool isBuildUnderFloor(
     CasOperation & op,
     const Layout & layout,
     const ListedManifestObject & manifest,
-    std::map<String, std::optional<MountLease>> & floor_by_ns,
+    std::map<String, std::optional<MountLease>> & mount_lease_by_ns,
     ManifestSweepResult & result)
 {
-    auto [floor_it, floor_inserted] = floor_by_ns.emplace(manifest.ns.string(), std::nullopt);
-    if (floor_inserted)
+    auto [lease_it, lease_inserted] = mount_lease_by_ns.emplace(manifest.ns.string(), std::nullopt);
+    if (lease_inserted)
     {
         ++result.floor_lookups;
-        floor_it->second = floorForNamespace(op, layout, manifest.ns, &result.floor_reads);
+        lease_it->second = mountLeaseForNamespace(op, layout, manifest.ns, &result.floor_reads);
     }
-    return prefixEligibleUnder(floor_it->second, manifest.prefix);
+    return prefixEligibleUnder(lease_it->second, manifest.build_prefix);
 }
 
 /// Delegates to the shared `Layout::parseManifestKey`, which validates the canonical manifest-key
@@ -105,7 +105,7 @@ std::optional<ListedManifestObject> parseListedManifestObject(const Layout & lay
 
     return ListedManifestObject{
         .ns = parsed->root_namespace,
-        .prefix = BuildPrefix{.writer_epoch = parsed->ref.writer_epoch, .build_sequence = parsed->ref.build_sequence},
+        .build_prefix = BuildPrefix{.writer_epoch = parsed->ref.writer_epoch, .build_sequence = parsed->ref.build_sequence},
         .ref = parsed->ref,
         .key = key};
 }
@@ -570,7 +570,7 @@ namespace
 /// debris drains after a process restart even when its build_sequence is above the current min_active_build_sequence.
 bool prefixEligibleOn(CasOperation & op, const Layout & layout, const RootNamespace & ns, const BuildPrefix & prefix)
 {
-    return prefixEligibleUnder(floorForNamespace(op, layout, ns), prefix);
+    return prefixEligibleUnder(mountLeaseForNamespace(op, layout, ns), prefix);
 }
 
 }
@@ -746,7 +746,7 @@ ManifestSweepResult planManifestCursorPage(
     /// One floor observation per namespace for the whole page. Every build of a namespace is judged
     /// against the same mount body; reading it per build prefix would cost three requests per listed
     /// key on a pool where every INSERT is its own build.
-    std::map<String, std::optional<MountLease>> floor_by_ns;
+    std::map<String, std::optional<MountLease>> mount_lease_by_ns;
     std::map<String, NamespaceFoldView> view_by_ns;
     std::map<String, std::set<String>> active_by_ns;
     std::set<String> errored_namespaces;   /// protection view unavailable => skip, never delete
@@ -797,7 +797,11 @@ ManifestSweepResult planManifestCursorPage(
             continue;
         }
 
-        if (!isBuildBelowFloor(op, layout, *parsed, floor_by_ns, result))
+        /// Within one `writer_epoch`, `build_sequence < min_active_build_sequence` means the build is no longer active.
+        /// It may have completed `promote`, been cancelled, or finished cleanup. This does not yet make its manifests
+        /// safe to delete: ownership and fold coverage must also be checked.
+        /// If `build_sequence >= min_active_build_sequence`, the build may still be active, so retain its manifests.
+        if (!isBuildUnderFloor(op, layout, *parsed, mount_lease_by_ns, result))
         {
             ++result.skipped;
             decided_through = listed.key;
@@ -918,7 +922,7 @@ ManifestSweepResult planManifestCursorPage(
             /// eligibility. A refusal is recorded rather than silent (Constraint 10).
             String retain_reason;
             SweepRetainClass retain_class = SweepRetainClass::None;
-            if (!manifestDeletionPremise(view_it->second, ManifestKey{parsed->key, parsed->prefix},
+            if (!manifestDeletionPremise(view_it->second, ManifestKey{parsed->key, parsed->build_prefix},
                                          &retain_reason, &retain_class))
             {
                 /// The sentence goes to the debug log for whoever is chasing ONE object; the class goes to
