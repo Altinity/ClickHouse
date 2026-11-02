@@ -208,6 +208,10 @@ ManifestFilesPruner::ManifestFilesPruner(
             if (!name_and_type.has_value())
                 continue;
 
+            /// Bounds use the Iceberg encoding of the field, which an annotated type does not necessarily share.
+            if (schema_processor.hasClickHouseTypeAnnotation(initial_schema_id, used_column_id))
+                continue;
+
             min_max_column_types.emplace(used_column_id, name_and_type->type);
             name_and_type->name = DB::backQuote(DB::toString(used_column_id));
         }

@@ -122,6 +122,8 @@ public:
     Poco::JSON::Object::Ptr getIcebergTableSchemaById(Int32 id) const;
     bool hasClickHouseTableSchemaById(Int32 id) const;
     bool isSchemaRegisteredFromMetadata(Int32 id) const;
+    /// Whether the type of `field_id` in schema `schema_id` comes from a `clickhouse.type` table property.
+    bool hasClickHouseTypeAnnotation(Int32 schema_id, Int32 field_id) const;
 
     static DataTypePtr getSimpleType(const String & type_name, ContextPtr context_, bool allow_geo_parser = true);
 

@@ -265,7 +265,6 @@ deserializeFieldFromBinaryRepr(const std::string & str, DataTypePtr expected_typ
     if (WhichDataType(non_nullable_type).isDateTime64())
         return deserializeDateTime64FromBinaryRepr(str, *non_nullable_type, lower_bound);
 
-    auto column = non_nullable_type->createColumn();
     if (WhichDataType(non_nullable_type).isDecimal())
     {
         if (str.empty())
@@ -288,6 +287,7 @@ deserializeFieldFromBinaryRepr(const std::string & str, DataTypePtr expected_typ
 
     /// For all other types except decimal binary representation
     /// matches our internal representation
+    auto column = non_nullable_type->createColumn();
     column->insertData(str.data(), str.length());
     Field result;
     column->get(0, result);

@@ -8,6 +8,7 @@ import pytest
 from helpers.iceberg_utils import (
     create_iceberg_table,
     default_download_directory,
+    default_upload_directory,
     get_creation_expression,
     get_uuid_str,
 )
@@ -211,3 +212,66 @@ def test_aggregate_states_read_by_spark(started_cluster_iceberg_with_spark, stor
     for line in expected.split("\n"):
         k, state_hex, sum_value = line.split("\t")
         assert spark_rows[int(k)] == (state_hex, int(sum_value))
+
+
+@pytest.mark.parametrize("storage_type", ["s3"])
+def test_aggregate_states_merged_after_spark_append(started_cluster_iceberg_with_spark, storage_type):
+    instance = started_cluster_iceberg_with_spark.instances["node1"]
+    spark = started_cluster_iceberg_with_spark.spark_session
+    TABLE_NAME = "test_agg_states_spark_append_" + storage_type + "_" + get_uuid_str()
+
+    create_iceberg_table(
+        storage_type,
+        instance,
+        TABLE_NAME,
+        started_cluster_iceberg_with_spark,
+        SPARK_SCHEMA,
+        format_version=2,
+        settings=STATE_SETTINGS,
+        additional_settings=PARQUET_STATE_SETTINGS,
+    )
+    insert_states(instance, TABLE_NAME, "toInt64(number)")
+
+    default_download_directory(
+        started_cluster_iceberg_with_spark,
+        storage_type,
+        f"{WAREHOUSE}/{TABLE_NAME}/",
+        f"{WAREHOUSE}/{TABLE_NAME}/",
+    )
+
+    with open(f"{WAREHOUSE}/{TABLE_NAME}/metadata/version-hint.text", "wb") as f:
+        f.write(b"1")
+
+    appended = instance.query(
+        "SELECT toInt32(number % 2) AS k, hex(uniqState(toUInt64(number % 23))), sum(toInt64(number))"
+        " FROM numbers(200, 100) GROUP BY k ORDER BY k FORMAT TSV"
+    ).strip()
+    values = ", ".join(
+        f"({k}, X'{state_hex}', {sum_value})"
+        for k, state_hex, sum_value in (line.split("\t") for line in appended.split("\n"))
+    )
+    spark.sql(f"INSERT INTO {TABLE_NAME} VALUES {values}")
+
+    # The appended file must carry bounds for the column holding the states.
+    u_field_id = fields_by_name(latest_metadata(TABLE_NAME))["u"]["id"]
+    spark_files = spark.sql(
+        f"SELECT lower_bounds, upper_bounds FROM spark_catalog.default.{TABLE_NAME}.files WHERE lower_bounds IS NOT NULL"
+    ).collect()
+    assert any(
+        u_field_id in (row["lower_bounds"] or {}) and u_field_id in (row["upper_bounds"] or {}) for row in spark_files
+    ), f"No data file has bounds for field {u_field_id}: {spark_files}"
+
+    default_upload_directory(
+        started_cluster_iceberg_with_spark,
+        storage_type,
+        f"{WAREHOUSE}/{TABLE_NAME}/",
+        f"{WAREHOUSE}/{TABLE_NAME}/",
+    )
+
+    assert instance.query(
+        f"SELECT k, uniqMerge(u), sum(s) FROM {TABLE_NAME} GROUP BY k ORDER BY k",
+        settings=STATE_SETTINGS,
+    ) == instance.query(
+        "SELECT toInt32(number % 2) AS k, uniq(toUInt64(number % 23)), sum(number)"
+        " FROM numbers(300) GROUP BY k ORDER BY k"
+    )
