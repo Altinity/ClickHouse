@@ -83,7 +83,7 @@ TEST(IcebergFieldParseHelpers, TimestampBoundsUseBothRangesBetween1e16And1e18)
     EXPECT_EQ(decimal64Ticks(nullable_ranges[0].lower), middle);
     EXPECT_EQ(decimal64Ticks(nullable_ranges[1].lower), middle / 1000);
 
-    /// Below `1e16` there is no nanosecond interpretation.
+    /// `2024-02-20` is below `1e16`, so it has one microsecond range.
     constexpr Int64 us_2024_02_20 = 1'708'423'200'000'000LL;
     const auto small = littleEndianInt64(us_2024_02_20);
     auto microseconds = deserializeDateTime64MinMaxRanges(small, small, type);
@@ -96,6 +96,31 @@ TEST(IcebergFieldParseHelpers, TimestampBoundsUseBothRangesBetween1e16And1e18)
     ASSERT_EQ(sentinel.size(), 1);
     EXPECT_EQ(decimal64Ticks(sentinel[0].lower), us_2024_02_20);
     EXPECT_EQ(decimal64Ticks(sentinel[0].upper), spark_9999_us);
+}
+
+TEST(IcebergFieldParseHelpers, BoundsBelow1e16StayMicroseconds)
+{
+    auto type = std::make_shared<DataTypeDateTime64>(6);
+    /// `86400000000000` is one day in nanoseconds (`1970-01-02`) and 1000 days in
+    /// microseconds (`1972-09-27`). It is below `1e16`, so Iceberg `timestamp` keeps
+    /// the integer and does not add a nanosecond range. The constant-column shortcut
+    /// may use this point: it is not the ambiguous middle band.
+    constexpr Int64 ticks = 86'400'000'000'000LL;
+    EXPECT_FALSE(isAmbiguousIcebergTimestampBound(ticks));
+    EXPECT_LT(ticks, iceberg_timestamp_microseconds_only_threshold);
+
+    const auto bytes = littleEndianInt64(ticks);
+    auto lower = deserializeFieldFromBinaryRepr(bytes, type, true);
+    auto upper = deserializeFieldFromBinaryRepr(bytes, type, false);
+    ASSERT_TRUE(lower.has_value());
+    ASSERT_TRUE(upper.has_value());
+    EXPECT_EQ(decimal64Ticks(*lower), ticks);
+    EXPECT_EQ(decimal64Ticks(*upper), ticks);
+
+    auto ranges = deserializeDateTime64MinMaxRanges(bytes, bytes, type);
+    ASSERT_EQ(ranges.size(), 1);
+    EXPECT_EQ(decimal64Ticks(ranges[0].lower), ticks);
+    EXPECT_EQ(decimal64Ticks(ranges[0].upper), ticks);
 }
 
 TEST(IcebergFieldParseHelpers, NanosecondBoundsAbove1e18OnTimestampAreConverted)
