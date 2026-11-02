@@ -42,6 +42,9 @@
 #include <Analyzer/InDepthQueryTreeVisitor.h>
 #include <Analyzer/Utils.h>
 #include <Interpreters/TreeRewriter.h>
+#include <Interpreters/DatabaseCatalog.h>
+#include <Interpreters/GlobalSubqueriesVisitor.h>
+#include <Interpreters/PreparedSets.h>
 #include <Core/Joins.h>
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTFunction.h>
@@ -409,6 +412,46 @@ void IStorageCluster::rewriteASTForGlobalJoin(ASTPtr & query)
     rewriteASTJoinsToGlobal(query);
 }
 
+/// The initiator interpreter usually does this already: `IStorageCluster::isRemote` is true, so
+/// `GlobalSubqueriesVisitor` replaces a `GLOBAL` right side with an external table. This pass
+/// covers a query that still names a local table when `convertToRemote` runs. A second pass
+/// is a no-op once that external table is in the context. Sets are added to the interpreter's
+/// `prepared_sets`, which `DelayedCreatingSetsStep` builds before the rows are sent.
+namespace
+{
+void broadcastOldAnalyzerGlobalJoin(ASTPtr & query_to_send, const SelectQueryInfo & query_info, const ContextPtr & context)
+{
+    IStorageCluster::rewriteASTForGlobalJoin(query_to_send);
+
+    auto prepared_sets = query_info.prepared_sets ? query_info.prepared_sets : std::make_shared<PreparedSets>();
+    TemporaryTablesMapping external_tables;
+    bool has_global_subqueries = false;
+
+    /// `table_join` stays null: the right side is read with all of its columns. Passing the
+    /// analyzed join here would rebuild its actions against an AST the first pass may already
+    /// have rewritten to an external table.
+    GlobalSubqueriesVisitor::Data data(
+        context,
+        /* subquery_depth */ 0,
+        /* is_remote */ true,
+        /* is_explain */ false,
+        external_tables,
+        prepared_sets,
+        has_global_subqueries,
+        /* table_join */ nullptr);
+    GlobalSubqueriesVisitor(data).visit(query_to_send);
+
+    /// The read context is const. External tables live on the query context, and a later
+    /// `Context::createCopy` still sees them through `getExternalTables`.
+    auto mutable_context = context->getQueryContext();
+    for (auto & [name, holder] : external_tables)
+    {
+        if (!mutable_context->tryResolveStorageID(StorageID{"", name}, Context::ResolveExternal))
+            mutable_context->addExternalTable(name, std::move(*holder));
+    }
+}
+}
+
 /*
 Try to make subquery to send on nodes
 Converts
@@ -455,14 +498,18 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
     }
     case ObjectStorageClusterJoinMode::GLOBAL:
     {
-        /// Old analyzer: ship the left scan only. `INNER`/`LEFT`/`CROSS` stay in `query_to_send`.
+        /// Old analyzer. `RIGHT`/`FULL`/`PASTE` stay on the initiator. `INNER`/`LEFT`/`CROSS`
+        /// stay in `query_to_send`, with the right side replaced by an external table.
         if (!query_info.query_tree)
         {
             if (queryHasRightOrFullJoin(query_to_send))
             {
                 auto info = getQueryJoinInfoFromAST(query_to_send);
                 rewriteQueryForInitiatorLocalJoin(query_to_send, query_info, info, context);
+                return;
             }
+
+            broadcastOldAnalyzerGlobalJoin(query_to_send, query_info, context);
             return;
         }
 

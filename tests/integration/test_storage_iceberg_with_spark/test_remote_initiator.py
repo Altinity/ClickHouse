@@ -144,14 +144,17 @@ def test_remote_initiator_global_join_without_analyzer(started_cluster_iceberg_w
     instance.query(f"CREATE TABLE {TABLE2_NAME} (tag INT, number2 INT) ENGINE=Memory")
     instance.query(f"INSERT INTO {TABLE2_NAME} VALUES (1, 2)")
 
-    res = instance.query(f"""
-        SELECT t1.tag, t1.number, t2.number2
-        FROM {TABLE_NAME} AS t1
-        JOIN {TABLE2_NAME} AS t2 USING (tag)
-        SETTINGS
-            object_storage_remote_initiator=1,
-            object_storage_remote_initiator_cluster='cluster_simple',
-            object_storage_cluster_join_mode='global',
-            allow_experimental_analyzer=0
-        """)
-    assert res == "1\t1\t2\n"
+    # `convertToRemote` picks one replica of `cluster_simple`. The Memory table exists only on
+    # node1, so a single run can pass by landing there. Repeat until every replica is likely.
+    for _ in range(9):
+        res = instance.query(f"""
+            SELECT t1.tag, t1.number, t2.number2
+            FROM {TABLE_NAME} AS t1
+            JOIN {TABLE2_NAME} AS t2 USING (tag)
+            SETTINGS
+                object_storage_remote_initiator=1,
+                object_storage_remote_initiator_cluster='cluster_simple',
+                object_storage_cluster_join_mode='global',
+                allow_experimental_analyzer=0
+            """)
+        assert res == "1\t1\t2\n"
