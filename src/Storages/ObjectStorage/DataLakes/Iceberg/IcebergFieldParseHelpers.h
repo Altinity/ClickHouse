@@ -60,8 +60,9 @@ struct DateTime64BoundRange
 };
 
 /// `DateTime64(6)` min/max used for file pruning.
-/// `|ticks| < 1e16` is microseconds. `|ticks| >= 1e18` is nanoseconds.
-/// A value between them can be either, so both ranges are returned.
+/// Both bounds use one precision. If either has `|ticks| < 1e16`, both are
+/// microseconds. Otherwise, if either has `|ticks| >= 1e18`, both are nanoseconds.
+/// When both sit in `[1e16, 1e18)`, both ranges are returned.
 /// `DateTime64(9)` returns the raw nanosecond range.
 std::vector<DateTime64BoundRange> deserializeDateTime64MinMaxRanges(
     const std::string & lower_str,

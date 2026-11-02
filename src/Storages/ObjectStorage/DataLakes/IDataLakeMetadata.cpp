@@ -2,7 +2,6 @@
 #include <Storages/ObjectStorage/StorageObjectStorageSource.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFile.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergFieldParseHelpers.h>
-#include <base/unaligned.h>
 #include <Core/TypeId.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypesDecimal.h>
@@ -158,23 +157,20 @@ DataFileMetaInfo::DataFileMetaInfo(
                 String right_str;
                 if (i_bounds->second.first.tryGet(left_str) && i_bounds->second.second.tryGet(right_str))
                 {
-                    auto left = Iceberg::deserializeFieldFromBinaryRepr(left_str, type, true);
-                    auto right = Iceberg::deserializeFieldFromBinaryRepr(right_str, type, false);
-                    if (left && right && !DB::Range::less(*right, *left))
+                    const auto non_nullable_type = removeNullable(type);
+                    if (WhichDataType(non_nullable_type).isDateTime64() && getDecimalScale(*non_nullable_type) == 6)
                     {
-                        const auto non_nullable_type = removeNullable(type);
-                        bool ambiguous_timestamp = false;
-                        if (WhichDataType(non_nullable_type).isDateTime64() && getDecimalScale(*non_nullable_type) == 6
-                            && left_str.size() == sizeof(Int64) && right_str.size() == sizeof(Int64))
-                        {
-                            const Int64 left_ticks = unalignedLoadLittleEndian<Int64>(left_str.data());
-                            const Int64 right_ticks = unalignedLoadLittleEndian<Int64>(right_str.data());
-                            /// `[1e16, 1e18)` can be microseconds or nanoseconds, so the constant-column
-                            /// shortcut must not substitute either reading.
-                            ambiguous_timestamp = Iceberg::isAmbiguousIcebergTimestampBound(left_ticks)
-                                || Iceberg::isAmbiguousIcebergTimestampBound(right_ticks);
-                        }
-                        if (!ambiguous_timestamp)
+                        /// The pair has one precision. Two ranges are the ambiguous middle band,
+                        /// so the constant-column shortcut must not pick either reading.
+                        const auto timestamp_ranges = Iceberg::deserializeDateTime64MinMaxRanges(left_str, right_str, type);
+                        if (timestamp_ranges.size() == 1)
+                            hyperrectangle = DB::Range(timestamp_ranges[0].lower, true, timestamp_ranges[0].upper, true);
+                    }
+                    else
+                    {
+                        auto left = Iceberg::deserializeFieldFromBinaryRepr(left_str, type, true);
+                        auto right = Iceberg::deserializeFieldFromBinaryRepr(right_str, type, false);
+                        if (left && right && !DB::Range::less(*right, *left))
                             hyperrectangle = DB::Range(*left, true, *right, true);
                     }
                 }

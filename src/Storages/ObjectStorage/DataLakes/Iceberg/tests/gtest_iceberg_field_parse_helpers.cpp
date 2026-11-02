@@ -123,6 +123,37 @@ TEST(IcebergFieldParseHelpers, BoundsBelow1e16StayMicroseconds)
     EXPECT_EQ(decimal64Ticks(ranges[0].upper), ticks);
 }
 
+TEST(IcebergFieldParseHelpers, BoundsThatDifferBy1000ShareOnePrecision)
+{
+    auto type = std::make_shared<DataTypeDateTime64>(6);
+    /// `1e15` microseconds and `1e18` nanoseconds are the same instant. The lower bound is
+    /// below `1e16`, so both stay microseconds and the constant-column shortcut sees a range.
+    constexpr Int64 lower_us = 1'000'000'000'000'000LL;
+    constexpr Int64 upper_times_1000 = 1'000'000'000'000'000'000LL;
+    auto ranges = deserializeDateTime64MinMaxRanges(littleEndianInt64(lower_us), littleEndianInt64(upper_times_1000), type);
+    ASSERT_EQ(ranges.size(), 1);
+    EXPECT_EQ(decimal64Ticks(ranges[0].lower), lower_us);
+    EXPECT_EQ(decimal64Ticks(ranges[0].upper), upper_times_1000);
+    EXPECT_NE(decimal64Ticks(ranges[0].lower), decimal64Ticks(ranges[0].upper));
+
+    /// The same gap before the epoch. `|upper| < 1e16`, so the lower bound is not divided.
+    constexpr Int64 negative_lower = -1'000'000'000'000'000'000LL;
+    constexpr Int64 negative_upper = -1'000'000'000'000'000LL;
+    auto negative = deserializeDateTime64MinMaxRanges(
+        littleEndianInt64(negative_lower), littleEndianInt64(negative_upper), type);
+    ASSERT_EQ(negative.size(), 1);
+    EXPECT_EQ(decimal64Ticks(negative[0].lower), negative_lower);
+    EXPECT_EQ(decimal64Ticks(negative[0].upper), negative_upper);
+
+    /// Neither bound is below `1e16`, and one is at `1e18`, so both are nanoseconds.
+    constexpr Int64 middle = iceberg_timestamp_microseconds_only_threshold;
+    auto nanoseconds = deserializeDateTime64MinMaxRanges(
+        littleEndianInt64(middle), littleEndianInt64(upper_times_1000), type);
+    ASSERT_EQ(nanoseconds.size(), 1);
+    EXPECT_EQ(decimal64Ticks(nanoseconds[0].lower), middle / 1000);
+    EXPECT_EQ(decimal64Ticks(nanoseconds[0].upper), upper_times_1000 / 1000);
+}
+
 TEST(IcebergFieldParseHelpers, NanosecondBoundsAbove1e18OnTimestampAreConverted)
 {
     auto type = std::make_shared<DataTypeDateTime64>(6);

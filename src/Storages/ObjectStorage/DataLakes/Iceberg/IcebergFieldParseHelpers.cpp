@@ -241,18 +241,29 @@ std::vector<DateTime64BoundRange> deserializeDateTime64MinMaxRanges(
         return ranges;
     }
 
-    /// Both ends must accept a unit. A lower bound below `1e16` and an upper bound
-    /// of `1e18` produce no range, and min/max pruning skips the column.
-    const bool allow_microseconds = icebergTimestampMagnitudeBelow(*lower_ticks, iceberg_timestamp_nanoseconds_lower_threshold)
-        && icebergTimestampMagnitudeBelow(*upper_ticks, iceberg_timestamp_nanoseconds_lower_threshold);
-    const bool allow_nanoseconds = !icebergTimestampMagnitudeBelow(*lower_ticks, iceberg_timestamp_microseconds_only_threshold)
-        && !icebergTimestampMagnitudeBelow(*upper_ticks, iceberg_timestamp_microseconds_only_threshold);
+    /// One precision for the pair. A bound below `1e16` keeps both as microseconds,
+    /// so `1e15` and `1e18` stay that range instead of collapsing to one microsecond.
+    /// Otherwise a bound at or above `1e18` converts both from nanoseconds.
+    const bool one_below_1e16 = icebergTimestampMagnitudeBelow(*lower_ticks, iceberg_timestamp_microseconds_only_threshold)
+        || icebergTimestampMagnitudeBelow(*upper_ticks, iceberg_timestamp_microseconds_only_threshold);
+    const bool one_at_or_above_1e18 = !icebergTimestampMagnitudeBelow(*lower_ticks, iceberg_timestamp_nanoseconds_lower_threshold)
+        || !icebergTimestampMagnitudeBelow(*upper_ticks, iceberg_timestamp_nanoseconds_lower_threshold);
 
-    if (allow_microseconds)
-        appendRange(ranges, *lower_ticks, *upper_ticks, scale);
-
-    if (allow_nanoseconds)
+    if (one_below_1e16)
     {
+        appendRange(ranges, *lower_ticks, *upper_ticks, scale);
+    }
+    else if (one_at_or_above_1e18)
+    {
+        appendRange(
+            ranges,
+            nanosecondsToMicrosecondsForBound(*lower_ticks, true),
+            nanosecondsToMicrosecondsForBound(*upper_ticks, false),
+            scale);
+    }
+    else
+    {
+        appendRange(ranges, *lower_ticks, *upper_ticks, scale);
         appendRange(
             ranges,
             nanosecondsToMicrosecondsForBound(*lower_ticks, true),
