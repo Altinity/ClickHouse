@@ -206,7 +206,11 @@ def test_remote_initiator_global_join_without_analyzer(started_cluster_iceberg_w
         """)
     assert res == "1\t1\n"
 
-    res = instance.query(f"""
+    # `IN (SELECT 1)` has no table, so the replica must still see that subquery.
+    # Broadcasting it replaces the text with an external table name.
+    query_id = uuid.uuid4().hex
+    res = instance.query(
+        f"""
         SELECT tag, number
         FROM {TABLE_NAME}
         WHERE number IN (SELECT 1)
@@ -215,5 +219,18 @@ def test_remote_initiator_global_join_without_analyzer(started_cluster_iceberg_w
             object_storage_remote_initiator_cluster='cluster_simple',
             object_storage_cluster_join_mode='global',
             allow_experimental_analyzer=0
-        """)
+        """,
+        query_id=query_id,
+    )
     assert res == "1\t1\n"
+    for node in started_cluster_iceberg_with_spark.instances.values():
+        node.query("SYSTEM FLUSH LOGS")
+    sent_with_subquery = instance.query(f"""
+        SELECT count()
+        FROM clusterAllReplicas('cluster_simple', system.query_log)
+        WHERE initial_query_id = '{query_id}'
+            AND type = 'QueryFinish'
+            AND is_initial_query = 0
+            AND position(query, 'IN (SELECT 1)') > 0
+        """)
+    assert sent_with_subquery != "0\n"
