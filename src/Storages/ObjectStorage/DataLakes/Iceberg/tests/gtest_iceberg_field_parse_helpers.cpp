@@ -122,6 +122,25 @@ TEST(IcebergFieldParseHelpers, NanosecondBoundsAbove1e18OnTimestampAreConverted)
     EXPECT_EQ(decimal64Ticks(edge_ranges[0].lower), exactly_1e18 / 1000);
 }
 
+TEST(IcebergFieldParseHelpers, DateTime64BoundsAreStoredLittleEndian)
+{
+    auto type = std::make_shared<DataTypeDateTime64>(6);
+    /// 2024-02-20 10:00:00 UTC. The written bytes must be little-endian, then read back unchanged.
+    constexpr Int64 us_2024_02_20 = 1'708'423'200'000'000LL;
+    const auto bytes = serializeDateTime64IcebergBound(us_2024_02_20);
+    EXPECT_EQ(bytes, littleEndianInt64(us_2024_02_20));
+    auto field = deserializeFieldFromBinaryRepr(bytes, type, true);
+    ASSERT_TRUE(field.has_value());
+    EXPECT_EQ(decimal64Ticks(*field), us_2024_02_20);
+
+    constexpr Int64 us_1960_01_01 = -315'619'200'000'000LL;
+    const auto negative_bytes = serializeDateTime64IcebergBound(us_1960_01_01);
+    EXPECT_EQ(negative_bytes, littleEndianInt64(us_1960_01_01));
+    auto negative = deserializeFieldFromBinaryRepr(negative_bytes, type, false);
+    ASSERT_TRUE(negative.has_value());
+    EXPECT_EQ(decimal64Ticks(*negative), us_1960_01_01);
+}
+
 TEST(IcebergFieldParseHelpers, NanosecondDateTime64BoundsAreKept)
 {
     auto type = std::make_shared<DataTypeDateTime64>(9);

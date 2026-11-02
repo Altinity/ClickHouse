@@ -88,6 +88,13 @@ void appendRange(std::vector<DateTime64BoundRange> & ranges, Int64 lower_ticks, 
 
 }
 
+std::string serializeDateTime64IcebergBound(Int64 ticks)
+{
+    std::string bytes(sizeof(Int64), '\0');
+    unalignedStoreLittleEndian<Int64>(bytes.data(), ticks);
+    return bytes;
+}
+
 Int64 fieldToInt64(const Field & value, std::string_view context, std::string_view arg_name)
 {
     if (value.getType() == Field::Types::Int64)

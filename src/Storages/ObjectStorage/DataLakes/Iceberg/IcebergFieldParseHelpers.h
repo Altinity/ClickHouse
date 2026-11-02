@@ -49,6 +49,9 @@ std::vector<Int64> fieldToInt64Array(const Field & value, std::string_view conte
 /// See https://iceberg.apache.org/spec/#appendix-d-single-value-serialization
 std::optional<Field> deserializeFieldFromBinaryRepr(const std::string & str, DataTypePtr expected_type, bool lower_bound);
 
+/// Appendix D stores `timestamp` and `timestamp_ns` as an 8-byte little-endian `long`.
+std::string serializeDateTime64IcebergBound(Int64 ticks);
+
 /// One interpretation of an Iceberg `timestamp` lower/upper pair.
 struct DateTime64BoundRange
 {
