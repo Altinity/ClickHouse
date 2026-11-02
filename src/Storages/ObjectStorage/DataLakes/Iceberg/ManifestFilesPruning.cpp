@@ -520,8 +520,12 @@ PruningReturnStatus ManifestFilesPruner::canBePruned(
         }
 
         auto rect_it = entry_hyperrectangles.find(column_id);
-        if (has_no_nulls && rect_it != entry_hyperrectangles.end()
-            && !key_condition.mayBeTrueInRange(1, &rect_it->second.left, &rect_it->second.right, data_types))
+        /// A null in the file does not make a null-rejecting predicate true, so the non-null
+        /// bounds still prune. A predicate that can match null keeps the file unless the
+        /// manifest says the column has no nulls.
+        if (rect_it != entry_hyperrectangles.end()
+            && !key_condition.mayBeTrueInRange(1, &rect_it->second.left, &rect_it->second.right, data_types)
+            && (has_no_nulls || !key_condition.mayBeTrueOnNull(0)))
         {
             return PruningReturnStatus::MIN_MAX_INDEX_PRUNED;
         }
