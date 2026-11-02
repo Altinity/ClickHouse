@@ -26,13 +26,6 @@ inline bool icebergTimestampMagnitudeBelow(Int64 value, Int64 threshold)
     return value > -threshold && value < threshold;
 }
 
-/// `[iceberg_timestamp_microseconds_only_threshold, iceberg_timestamp_nanoseconds_lower_threshold)`.
-inline bool isAmbiguousIcebergTimestampBound(Int64 ticks)
-{
-    return !icebergTimestampMagnitudeBelow(ticks, iceberg_timestamp_microseconds_only_threshold)
-        && icebergTimestampMagnitudeBelow(ticks, iceberg_timestamp_nanoseconds_lower_threshold);
-}
-
 /// Convert a Field to Int64, accepting Int64 and UInt64 (with overflow check).
 Int64 fieldToInt64(const Field & value, std::string_view context, std::string_view arg_name);
 

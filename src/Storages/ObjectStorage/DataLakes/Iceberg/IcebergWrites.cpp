@@ -174,12 +174,6 @@ std::vector<uint8_t> dumpValue(T value)
     return bytes;
 }
 
-std::vector<uint8_t> dumpDateTime64Bound(Int64 ticks)
-{
-    const auto bytes = Iceberg::serializeDateTime64IcebergBound(ticks);
-    return std::vector<uint8_t>(bytes.begin(), bytes.end());
-}
-
 DataTypePtr getTimeTypeOrNull(DataTypePtr type)
 {
     if (type->isNullable())
@@ -358,7 +352,10 @@ std::vector<uint8_t> dumpFieldToBytes(const Field & field, DataTypePtr type)
         case TypeIndex::UInt64:
             return dumpValue(applyVisitor(FieldVisitorConvertToNumber<Int64>(), field));
         case TypeIndex::DateTime64:
-            return dumpDateTime64Bound(getDateTime64ValueForIcebergBounds(field, type));
+        {
+            const auto bytes = Iceberg::serializeDateTime64IcebergBound(getDateTime64ValueForIcebergBounds(field, type));
+            return std::vector<uint8_t>(bytes.begin(), bytes.end());
+        }
         case TypeIndex::String:
         {
             auto value = field.safeGet<String>();

@@ -530,9 +530,6 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
                 /// Optional Iceberg fields are `Nullable(DateTime64)`. The outer type is not `DateTime64`.
                 if (WhichDataType(removeNullable(name_and_type.type)).isDateTime64())
                 {
-                    /// Both bounds share one precision. If either is below `1e16`, both are
-                    /// microseconds. Otherwise, if either is at or above `1e18`, both are
-                    /// nanoseconds. The open middle band produces both ranges.
                     const auto timestamp_ranges = deserializeDateTime64MinMaxRanges(left_str, right_str, name_and_type.type);
                     if (timestamp_ranges.empty())
                         continue;

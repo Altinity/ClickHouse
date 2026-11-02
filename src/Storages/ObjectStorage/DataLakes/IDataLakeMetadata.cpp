@@ -160,8 +160,7 @@ DataFileMetaInfo::DataFileMetaInfo(
                     const auto non_nullable_type = removeNullable(type);
                     if (WhichDataType(non_nullable_type).isDateTime64() && getDecimalScale(*non_nullable_type) == 6)
                     {
-                        /// The pair has one precision. Two ranges are the ambiguous middle band,
-                        /// so the constant-column shortcut must not pick either reading.
+                        /// Two ranges are the middle band, so this column is not a constant.
                         const auto timestamp_ranges = Iceberg::deserializeDateTime64MinMaxRanges(left_str, right_str, type);
                         if (timestamp_ranges.size() == 1)
                             hyperrectangle = DB::Range(timestamp_ranges[0].lower, true, timestamp_ranges[0].upper, true);

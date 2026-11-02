@@ -55,16 +55,6 @@ TEST(IcebergFieldParseHelpers, MicrosecondDateTime64BoundsAreKept)
     EXPECT_EQ(decimal64Ticks(*sentinel), spark_9999_us);
 }
 
-TEST(IcebergFieldParseHelpers, AmbiguousTimestampBoundsAreTheOpenMiddleBand)
-{
-    EXPECT_FALSE(isAmbiguousIcebergTimestampBound(iceberg_timestamp_microseconds_only_threshold - 1));
-    EXPECT_TRUE(isAmbiguousIcebergTimestampBound(iceberg_timestamp_microseconds_only_threshold));
-    EXPECT_TRUE(isAmbiguousIcebergTimestampBound(200'000'000'000'000'000LL));
-    EXPECT_TRUE(isAmbiguousIcebergTimestampBound(-200'000'000'000'000'000LL));
-    EXPECT_TRUE(isAmbiguousIcebergTimestampBound(iceberg_timestamp_nanoseconds_lower_threshold - 1));
-    EXPECT_FALSE(isAmbiguousIcebergTimestampBound(iceberg_timestamp_nanoseconds_lower_threshold));
-}
-
 TEST(IcebergFieldParseHelpers, TimestampBoundsUseBothRangesBetween1e16And1e18)
 {
     auto type = std::make_shared<DataTypeDateTime64>(6);
@@ -106,9 +96,6 @@ TEST(IcebergFieldParseHelpers, BoundsBelow1e16StayMicroseconds)
     /// the integer and does not add a nanosecond range. The constant-column shortcut
     /// may use this point: it is not the ambiguous middle band.
     constexpr Int64 ticks = 86'400'000'000'000LL;
-    EXPECT_FALSE(isAmbiguousIcebergTimestampBound(ticks));
-    EXPECT_LT(ticks, iceberg_timestamp_microseconds_only_threshold);
-
     const auto bytes = littleEndianInt64(ticks);
     auto lower = deserializeFieldFromBinaryRepr(bytes, type, true);
     auto upper = deserializeFieldFromBinaryRepr(bytes, type, false);

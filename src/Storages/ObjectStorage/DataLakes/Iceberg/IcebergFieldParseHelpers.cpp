@@ -241,9 +241,7 @@ std::vector<DateTime64BoundRange> deserializeDateTime64MinMaxRanges(
         return ranges;
     }
 
-    /// One precision for the pair. A bound below `1e16` keeps both as microseconds,
-    /// so `1e15` and `1e18` stay that range instead of collapsing to one microsecond.
-    /// Otherwise a bound at or above `1e18` converts both from nanoseconds.
+    /// One precision for the pair. Below `1e16` keeps `1e15` and `1e18` as microseconds.
     const bool one_below_1e16 = icebergTimestampMagnitudeBelow(*lower_ticks, iceberg_timestamp_microseconds_only_threshold)
         || icebergTimestampMagnitudeBelow(*upper_ticks, iceberg_timestamp_microseconds_only_threshold);
     const bool one_at_or_above_1e18 = !icebergTimestampMagnitudeBelow(*lower_ticks, iceberg_timestamp_nanoseconds_lower_threshold)
