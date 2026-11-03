@@ -37,6 +37,8 @@ std::vector<PuffinBlob> readPuffinFooterFromSeekable(SeekableReadBuffer & seekab
 
 /// Shared deletion-vector-v1 payload helpers (also used by `PuffinDeletionVectorReader`).
 std::string_view extractDeletionVectorPayload(std::string_view blob);
+/// `expected_cardinality` may be omitted. Materialization is still capped at
+/// `PUFFIN_DV_MAX_MATERIALIZED_POSITIONS` either way.
 std::vector<UInt64> deserializeRoaringPositionBitmap(
     std::string_view bytes, std::optional<UInt64> expected_cardinality = std::nullopt);
 void deserializeDeletionVectorV1(std::string_view blob, UInt64 expected_cardinality, ColumnUInt64 & positions);

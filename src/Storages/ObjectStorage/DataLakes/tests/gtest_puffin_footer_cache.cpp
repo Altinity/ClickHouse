@@ -293,3 +293,36 @@ TEST(PuffinFooterMemo, SharesBudgetAndMetricsWithDeletionVectors)
     EXPECT_EQ(CurrentMetrics::get(CurrentMetrics::PuffinFilesCacheBytes), bytes_before);
     EXPECT_EQ(CurrentMetrics::get(CurrentMetrics::PuffinFilesCacheFiles), files_before);
 }
+
+TEST(PuffinFooterMemo, BasePointerUpdatesFooterMemo)
+{
+    /// `clear` / `setMaxSizeInBytes` / `setMaxCount` must reach the footer memo even when the
+    /// static type is `CacheBase`. A non-virtual base method would leave the memo resident.
+    PuffinFilesCache cache("SLRU", 1'000'000, 100, 0.5);
+    PuffinFilesCache::Base & base = cache;
+
+    const auto key_a = PuffinFilesCache::tryCreateFooterKey("Local:////test", "a.puffin", "etag-a");
+    const auto key_b = PuffinFilesCache::tryCreateFooterKey("Local:////test", "b.puffin", "etag-b");
+    ASSERT_TRUE(key_a.has_value());
+    ASSERT_TRUE(key_b.has_value());
+
+    ASSERT_NE(cache.getOrSetFooter(*key_a, loadFixtureFooter), nullptr);
+    EXPECT_EQ(cache.footerMemoEntries(), 1u);
+
+    base.clear();
+    EXPECT_EQ(cache.footerMemoEntries(), 0u);
+    EXPECT_EQ(cache.footerMemoBytes(), 0u);
+
+    ASSERT_NE(cache.getOrSetFooter(*key_a, loadFixtureFooter), nullptr);
+    base.setMaxSizeInBytes(0);
+    EXPECT_EQ(cache.footerMemoEntries(), 0u);
+    EXPECT_EQ(cache.footerMemoBytes(), 0u);
+
+    base.setMaxSizeInBytes(1'000'000);
+    ASSERT_NE(cache.getOrSetFooter(*key_a, loadFixtureFooter), nullptr);
+    ASSERT_NE(cache.getOrSetFooter(*key_b, loadFixtureFooter), nullptr);
+    EXPECT_EQ(cache.footerMemoEntries(), 2u);
+
+    base.setMaxCount(1);
+    EXPECT_EQ(cache.footerMemoEntries(), 1u);
+}

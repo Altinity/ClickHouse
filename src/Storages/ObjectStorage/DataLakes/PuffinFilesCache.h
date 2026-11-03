@@ -135,10 +135,10 @@ public:
         const String & etag);
 
     /// Clears deletion-vector entries and footer memo.
-    void clear();
+    void clear() override;
 
-    void setMaxSizeInBytes(size_t max_size_in_bytes);
-    void setMaxCount(size_t max_count);
+    void setMaxSizeInBytes(size_t max_size_in_bytes) override;
+    void setMaxCount(size_t max_count) override;
 
     /// Test/observability helpers for the footer memo.
     size_t footerMemoEntries() const;
