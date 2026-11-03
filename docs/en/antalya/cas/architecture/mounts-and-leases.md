@@ -51,11 +51,10 @@ and never reassigned — decommission only tombstones it in place.
 | Observed at `gc/server-roots/<server_root_id>/owner` | Action |
 |---|---|
 | present, same `server_uuid`, not tombstoned | proceed |
-| present, `retired_at_ms` set | `CORRUPTED_DATA` for a server start or remount; the decommission admin accepts its own victim's tombstone |
+| present, `retired_at_ms` set | `CORRUPTED_DATA` for a server start; a self-remount stops in `IdentityLost`; the decommission admin accepts its own victim's tombstone |
 | present, different `server_uuid` | `CORRUPTED_DATA` — names the regenerated-uuid-file cause and, for a dead owner, `SYSTEM CAS DROP POOL MEMBER` |
 | absent, subtree provably empty | `putIfAbsent` the owner (claim) |
 | absent, subtree non-empty | `CORRUPTED_DATA` — identity lost over existing data |
-| absent, subtree provably empty | `putIfAbsent` the owner (claim) |
 | lost the `putIfAbsent` race | re-read; equal uuid proceeds, else `CORRUPTED_DATA` |
 
 The owner carries `owner_life`, a counter every owner write sets to the read value + 1 by `If-Match`, so
@@ -63,9 +62,10 @@ two owner writes never repeat their bytes and a delayed `If-Match` against an ol
 land. A process records the life it started under; after every mount claim (start, self-remount,
 decommission) it reads the owner once more and requires its own `server_uuid` and that life
 (`recheckOwnerAfterClaim`); otherwise it fences its own mount body and fails, so a successor does not wait
-the refused lease out. A self-remount also compares the life before it allocates an epoch: an owner at
-another life, not retired, moves the pool to `IdentityLost` instead of retrying. `retirement_verified`
-marks a decommission whose claim, tombstone and farewell all held.
+the refused lease out. A self-remount also reads the owner before it claims: a different `server_uuid`, a
+retirement or another life moves the pool to `IdentityLost`, at the latest on the next attempt, instead of
+retrying. The retirement counts on its own: a tombstone written by 26.6.4 drops `owner_life`.
+`retirement_verified` marks a decommission whose claim, tombstone and farewell all held.
 
 "Provably empty" requires both an authoritative decoded catalog naming no life owned by `server_root_id` and
 a 1-key `LIST` probe finding nothing under `cas/manifests/<server_root_id>/` or `roots/<server_root_id>/`.

@@ -158,6 +158,11 @@ uint64_t claimOwnerOrThrow(
     CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid,
     const ObserveRefCatalog & observe_catalog, RetiredOwnerPolicy retired_policy = RetiredOwnerPolicy::Refuse);
 
+/// Why a self-remount can never resume under `(our_uuid, recorded_life)`: the owner belongs to another server, is
+/// retired, or is at another life. Empty when the owner allows it or is absent; the claim decides the absent case.
+/// A tombstone written by 26.6.4 drops `owner_life` and reads as life 0, so the retirement is checked on its own.
+String remountOwnerRefusal(CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid, uint64_t recorded_life);
+
 /// What a claimer requires of the owner once its body is in the slot and before it installs the renewer.
 struct OwnerExpectation
 {

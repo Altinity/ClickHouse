@@ -518,6 +518,29 @@ std::optional<UInt128> readOwnerUuid(CasOperation & op, const Layout & l, const 
     return owner->server_uuid;
 }
 
+String remountOwnerRefusal(CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid, uint64_t recorded_life)
+{
+    const std::optional<OwnerObject> owner = readOwnerObject(op, l, srid);
+    if (!owner)
+        return {};
+    if (owner->server_uuid != our_uuid)
+        return fmt::format(
+            "CAS server-root '{}' is owned by a different server since this process started (owner server_uuid={}, "
+            "ours={}); this process cannot resume it", srid, u128ToHex(owner->server_uuid), u128ToHex(our_uuid));
+    if (owner->retired_at_ms)
+        return fmt::format(
+            "CAS server-root '{}' was decommissioned while this process was fenced (owner retired at {} ms, owner "
+            "life {}); this process stops for good and a restart refuses this server_root_id, see the CAS "
+            "troubleshooting docs: a decommissioned member refuses to start",
+            srid, *owner->retired_at_ms, owner->owner_life);
+    if (owner->owner_life != recorded_life)
+        return fmt::format(
+            "CAS server-root '{}': the owner moved from life {} to life {} since this process started (a rejoin or "
+            "a decommission rollback); restart the server to continue under the current life",
+            srid, recorded_life, owner->owner_life);
+    return {};
+}
+
 uint64_t claimOwnerOrThrow(
     CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid,
     const ObserveRefCatalog & observe_catalog, RetiredOwnerPolicy retired_policy)

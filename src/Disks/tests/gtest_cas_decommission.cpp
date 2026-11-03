@@ -1999,7 +1999,10 @@ TEST_F(CASDecommission, PausedRunCannotUntombstoneARerunsTombstone)
         if (!std::exchange(armed, false))
             return;
         /// Run 1 is paused right after its tombstone. GC fences it; the rerun reclaims, refreshes the
+    DB::Cas::tests::ScopedLoggerCapture capture("CasPool", "warning");
         /// tombstone, drains, farewells and verifies.
+    EXPECT_EQ(admin->lifecycle(), PoolLifecycle::IdentityLost);
+    EXPECT_NE(capture.captured().find("lost its admin claim and does not remount"), String::npos) << capture.captured();
         fenceSlot();
         rerun = run("a2");
     });
