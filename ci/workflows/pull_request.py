@@ -139,7 +139,7 @@ workflow = Workflow.Config(
         #     FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES
         # ),
     ],
-    additional_jobs=["GrypeScan", "Regression", "CIReport", "SourceUpload"],
+    additional_jobs=["GrypeScan", "Regression", "CIReport"],
     artifacts=[
         *ArtifactConfigs.unittests_binaries,
         *ArtifactConfigs.clickhouse_binaries,
