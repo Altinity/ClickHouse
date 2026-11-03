@@ -198,7 +198,8 @@ The command returns one row (or, offline, one line per field) with `namespaces_r
 `staging_objects_removed`, `mountpoint_objects_removed`, `member_retired`, `warnings` and
 `namespaces_pending_gc`; the SQL row ends with `namespaces_pending_gc`. It is resumable: a rerun skips namespaces already marked removed and reports them
 under `namespaces_already_removed` rather than redoing the work. A per-object drain failure is recorded as
-a `warning`; the owner keeps an unverified tombstone and the next run resumes over it. `member_retired = 1`
+a `warning`; the owner keeps an unverified tombstone and the next run resumes over it. So does a run that
+loses its claim during the drain; only a claim lost before the drain rolls the tombstone back. `member_retired = 1`
 means the owner carries a verified retirement; rows still listed under `namespaces_pending_gc` are deleted
 by GC and need no rerun. See [troubleshooting](/antalya/cas/operations/troubleshooting) for
 `member_retired = 0`.

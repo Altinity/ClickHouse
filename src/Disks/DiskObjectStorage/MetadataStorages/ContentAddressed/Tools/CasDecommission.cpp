@@ -132,7 +132,7 @@ void logWarnings(const String & srid, const std::vector<String> & warnings)
         LOG_WARNING(getLogger("CasDecommission"), "CAS decommission '{}': {}", srid, warning);
 }
 
-/// Undo this run's tombstone after a lost claim: the next life, not retired, no mark. An earlier retirement
+/// Undo this run's tombstone after a claim lost before the drain: the next life, not retired, no mark. An earlier retirement
 /// stays: its tombstone landed while its run held the claim, so no member runs under it. A rollback whose
 /// precondition moved was overtaken by a later owner write, which then owns the outcome.
 void rollBackTombstone(CasOperation & op, const Layout & layout, const String & srid, const Tombstone & tombstone,
@@ -158,15 +158,23 @@ void rollBackTombstone(CasOperation & op, const Layout & layout, const String & 
                            + "' before rerunning");
 }
 
-/// Every exit after the tombstone and before the farewell: the tombstone stays while the claim holds. A failed
-/// confirm is a warning, so an exit that already carries an error still propagates its own.
+/// Every exit after the tombstone and before the farewell: the tombstone stays while the claim holds. A lost claim
+/// rolls it back only before the drain starts: once the drain may have removed data, the tombstone is what keeps the
+/// member from mounting over the hole, and a rerun finishes the retirement. A failed confirm is a warning, so an exit
+/// that already carries an error still propagates its own.
 void confirmClaimOrRollBack(CasOperation & op, const Layout & layout, const String & srid, UInt128 victim_uuid,
-                            uint64_t admin_epoch, const Tombstone & tombstone, std::vector<String> & warnings)
+                            uint64_t admin_epoch, const Tombstone & tombstone, bool drain_started,
+                            std::vector<String> & warnings)
 {
     try
     {
-        if (!adminClaimStillHeld(op, layout, srid, victim_uuid, admin_epoch))
+        if (adminClaimStillHeld(op, layout, srid, victim_uuid, admin_epoch))
+            return;
+        if (!drain_started)
             rollBackTombstone(op, layout, srid, tombstone, warnings);
+        else
+            warnings.push_back("the admin claim was lost during the drain; the tombstone stays because the drain may "
+                               "have removed data; do not start this member, rerun SYSTEM CAS DROP POOL MEMBER");
     }
     catch (...)
     {
@@ -251,7 +259,7 @@ Tombstone writeTombstone(CasOperation & control, Pool & admin, const Layout & la
     if (landed && landed->bytes == bytes)
     {
         const Tombstone tombstone{.owner = owner, .previously_retired = previously_retired, .etag = landed->etag};
-        confirmClaimOrRollBack(control, layout, srid, victim_uuid, admin_epoch, tombstone, warnings);
+        confirmClaimOrRollBack(control, layout, srid, victim_uuid, admin_epoch, tombstone, /*drain_started=*/false, warnings);
     }
     else
         admin.withholdFarewell();
@@ -535,6 +543,7 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
     /// From here on every exit decides the tombstone's fate (`confirmClaimOrRollBack`).
     const Tombstone tombstone = writeTombstone(control, *admin, layout, victim_srid, victim_uuid, admin_epoch, report.warnings);
 
+    bool drain_started = false;
     try
     {
         /// The claim must have held through the tombstone write.
@@ -544,16 +553,19 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
         }
         else
         {
+            drain_started = true;
             drainVictim(*admin, catalog_cut, victim_srid, report, gc_round_needed);
             if (!report.warnings.empty())
-                confirmClaimOrRollBack(control, layout, victim_srid, victim_uuid, admin_epoch, tombstone, report.warnings);
+                confirmClaimOrRollBack(control, layout, victim_srid, victim_uuid, admin_epoch, tombstone, drain_started,
+                                       report.warnings);
         }
     }
     catch (...)
     {
         /// The farewell `admin`'s destructor writes on unwind is a clean body, which the confirm would read as
         /// a lost claim, so the decision is made here, while the admin is alive.
-        confirmClaimOrRollBack(control, layout, victim_srid, victim_uuid, admin_epoch, tombstone, report.warnings);
+        confirmClaimOrRollBack(control, layout, victim_srid, victim_uuid, admin_epoch, tombstone, drain_started,
+                               report.warnings);
         logWarnings(victim_srid, report.warnings);
         throw;
     }

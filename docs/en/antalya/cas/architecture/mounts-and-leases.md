@@ -303,8 +303,10 @@ keeps `owner`, `epoch` and `mount` and removes only data, in six steps:
    member without an epoch counter is refused.
 2. Tombstone the owner at the next `owner_life`, on the admin's fenced mount plane: no attempt is sent
    after the admin's lease deadline, so a late retry cannot land on a victim that restarted after it.
-3. Confirm the slot still holds the admin's claim; otherwise roll the tombstone back, unless the owner was
-   already retired before this run. Every exit between (2) and (5) runs this confirm.
+3. Confirm the slot still holds the admin's claim. A claim lost before the drain rolls the tombstone back,
+   unless the owner was already retired before this run. A claim lost during the drain keeps the tombstone:
+   the drain may have removed data, and the tombstone keeps the member from mounting over it. Every failed
+   exit between (2) and (5) runs this confirm; a clean drain is checked by the verify in (6).
 4. Drop every namespace, sweep manifest debris, drain `staging/` and `roots/`, all on the admin's fenced
    mount plane.
 5. Write the admin's clean farewell.
