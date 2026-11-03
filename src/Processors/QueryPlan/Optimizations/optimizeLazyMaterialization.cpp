@@ -38,7 +38,6 @@ static void removeUsedColumnNames(
     String filter_name = {})
 {
     const auto & actions_outputs = actions.getOutputs();
-    NameSet passthrough_inputs;
 
     for (const auto * output_node : actions_outputs)
     {
@@ -52,16 +51,6 @@ static void removeUsedColumnNames(
 
         if (!node)
             continue;
-
-        /// The lazy reader maps each source column to a single output name. If an input
-        /// is forwarded more than once (for example, both a column and its alias), read
-        /// it eagerly so all outputs contain real data and do not duplicate lazy row coordinates.
-        if (node->type == ActionsDAG::ActionType::INPUT && !passthrough_inputs.insert(node->result_name).second)
-        {
-            const auto it = alias_index.find(node->result_name);
-            if (it != alias_index.end())
-                lazily_read_column_name_set.erase(it->second);
-        }
 
         if (node->type == ActionsDAG::ActionType::FUNCTION || node->type == ActionsDAG::ActionType::ARRAY_JOIN
             || (!filter_name.empty() && filter_name == output_node->result_name))
@@ -96,7 +85,12 @@ static void removeUsedColumnNames(
         }
     }
 
-    /// Update alias name index.
+    /// We cannot use alias_index directly, otherwise
+    /// input a → output b
+    /// input b → output a
+    /// would be processed improperly
+    AliasToName updated_alias_index = alias_index;
+
     for (const auto * output_node : actions_outputs)
     {
         const auto * node = output_node;
@@ -106,17 +100,15 @@ static void removeUsedColumnNames(
             chassert(node->children.size() == 1);
             node = node->children.front();
         }
-        if (node && node != output_node && node->type == ActionsDAG::ActionType::INPUT)
+        updated_alias_index.erase(output_node->result_name);
+        if (node && node->type == ActionsDAG::ActionType::INPUT)
         {
             const auto it = alias_index.find(node->result_name);
             if (it != alias_index.end())
-            {
-                const auto real_column_name = it->second;
-                alias_index.emplace(output_node->result_name, real_column_name);
-                alias_index.erase(node->result_name);
-            }
+                updated_alias_index.emplace(output_node->result_name, it->second);
         }
     }
+    alias_index.swap(updated_alias_index);
 }
 
 static void collectLazilyReadColumnNames(
@@ -176,6 +168,17 @@ static void collectLazilyReadColumnNames(
                 if (it == alias_index.end())
                     continue;
                 lazily_read_column_name_set.erase(it->second);
+            }
+
+            /// Intermediate expressions may forward both a source and its alias before
+            /// a projection drops one. Only duplicate sources surviving at the sorting
+            /// output are incompatible with the lazy reader's single output name mapping.
+            NameSet output_sources;
+            for (const auto & column : *sorting_step->getOutputHeader())
+            {
+                const auto it = alias_index.find(column.name);
+                if (it != alias_index.end() && !output_sources.insert(it->second).second)
+                    lazily_read_column_name_set.erase(it->second);
             }
             continue;
         }
