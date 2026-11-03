@@ -1491,16 +1491,14 @@ JoinTreeQueryPlan buildQueryPlanForTableExpression(QueryTreeNodePtr table_expres
                         auto table_function_ast = table_function_node->toAST();
                         table_function_ast->setAlias({});
 
-                        WriteBufferFromOwnString out;
-                        IAST::FormatSettings format_settings(
-                            /*one_line=*/true,
-                            IdentifierQuotingRule::WhenNecessary,
-                            IdentifierQuotingStyle::Backticks,
-                            /*show_secrets_=*/false);
-
-                        table_function_ast->format(out, format_settings);
-
-                        auto table_function_serialized_ast = std::move(out.str());
+                        /// This serialized AST only travels inside the cluster, over the native
+                        /// protocol, to build the same table function on the executing shard (see
+                        /// `ReadFromTableFunctionStep` / `resolveStorages`). It is never shown to the
+                        /// user, so keep secrets, same as the plain-SQL distributed query path
+                        /// (`IStorageCluster::readFromRemoteInitiator` / `ClusterProxy::rewriteSelectQuery`
+                        /// use `formatWithSecretsOneLine` for the same reason). Hiding them here would
+                        /// send a masked literal (e.g. a redacted S3 secret key) to the remote shard.
+                        auto table_function_serialized_ast = table_function_ast->formatWithSecretsOneLine();
 
                         auto reading_from_table_function = std::make_unique<ReadFromTableFunctionStep>(
                             sample_block,

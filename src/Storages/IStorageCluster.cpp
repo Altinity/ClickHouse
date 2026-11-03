@@ -42,6 +42,9 @@
 #include <Analyzer/InDepthQueryTreeVisitor.h>
 #include <Analyzer/Utils.h>
 #include <Interpreters/TreeRewriter.h>
+#include <Interpreters/DatabaseCatalog.h>
+#include <Interpreters/GlobalSubqueriesVisitor.h>
+#include <Interpreters/PreparedSets.h>
 #include <Core/Joins.h>
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTFunction.h>
@@ -306,33 +309,6 @@ void stripObjectStorageRemoteInitiatorSettings(ASTPtr & query)
         select_query->setExpression(ASTSelectQuery::Expression::SETTINGS, {});
 }
 
-void rewriteASTInFunctionsToGlobalIn(ASTPtr & node)
-{
-    if (!node)
-        return;
-
-    if (auto * function = node->as<ASTFunction>())
-    {
-        if (isNameOfLocalInFunction(function->name) && function->arguments && function->arguments->children.size() >= 2)
-        {
-            const auto & rhs = function->arguments->children[1];
-            if (rhs
-                && (rhs->as<ASTSubquery>() || rhs->as<ASTSelectQuery>() || rhs->as<ASTSelectWithUnionQuery>()
-                    || rhs->as<ASTIdentifier>() || rhs->as<ASTTableIdentifier>()))
-            {
-                function->name = getGlobalInFunctionNameForLocalInFunctionName(function->name);
-            }
-        }
-    }
-
-    for (auto & child : node->children)
-    {
-        if (astIsNestedSelect(child))
-            continue;
-        rewriteASTInFunctionsToGlobalIn(child);
-    }
-}
-
 bool queryHasRightOrFullJoin(const ASTPtr & query)
 {
     if (!query)
@@ -368,6 +344,59 @@ bool queryHasRightOrFullJoin(const ASTPtr & query)
     return false;
 }
 
+bool astContainsTableIdentifier(const ASTPtr & node)
+{
+    if (!node)
+        return false;
+
+    if (node->as<ASTTableIdentifier>())
+        return true;
+
+    for (const auto & child : node->children)
+        if (astContainsTableIdentifier(child))
+            return true;
+
+    return false;
+}
+
+/// A named table in `IN` is read where the client connected. `IN (SELECT 1)` has no table and stays on the replica.
+bool inRightSideIsInitiatorLocal(const ASTPtr & rhs)
+{
+    if (!rhs)
+        return false;
+
+    if (rhs->as<ASTIdentifier>() || rhs->as<ASTTableIdentifier>())
+        return true;
+
+    if (rhs->as<ASTSubquery>() || rhs->as<ASTSelectQuery>() || rhs->as<ASTSelectWithUnionQuery>())
+        return astContainsTableIdentifier(rhs);
+
+    return false;
+}
+
+void rewriteInitiatorLocalInToGlobalIn(ASTPtr & node)
+{
+    if (!node)
+        return;
+
+    if (auto * function = node->as<ASTFunction>())
+    {
+        if (isNameOfLocalInFunction(function->name) && function->arguments && function->arguments->children.size() >= 2
+            && inRightSideIsInitiatorLocal(function->arguments->children[1]))
+            function->name = getGlobalInFunctionNameForLocalInFunctionName(function->name);
+    }
+
+    for (auto & child : node->children)
+    {
+        if (astIsNestedSelect(child))
+            continue;
+        rewriteInitiatorLocalInToGlobalIn(child);
+    }
+}
+
+/// `IN some_table` is read on the initiator. `IN (SELECT 1)` stays on the replica.
+/// `getSampleBlockImpl` sends this same tree, so the interpreter pass must not
+/// turn every subquery into `globalIn` before the broadcast pass runs.
 void rewriteASTJoinsToGlobal(ASTPtr & query)
 {
     ASTSelectQuery * select_query = query->as<ASTSelectQuery>();
@@ -399,7 +428,7 @@ void rewriteASTJoinsToGlobal(ASTPtr & query)
         }
     }
 
-    rewriteASTInFunctionsToGlobalIn(query);
+    rewriteInitiatorLocalInToGlobalIn(query);
 }
 
 }
@@ -407,6 +436,47 @@ void rewriteASTJoinsToGlobal(ASTPtr & query)
 void IStorageCluster::rewriteASTForGlobalJoin(ASTPtr & query)
 {
     rewriteASTJoinsToGlobal(query);
+}
+
+/// The initiator interpreter usually does this already: `IStorageCluster::isRemote` is true, so
+/// `GlobalSubqueriesVisitor` replaces a `GLOBAL` right side with an external table. This pass
+/// covers a query that still names a local table when `convertToRemote` runs. A second pass
+/// is a no-op once that external table is in the context. Sets are added to the interpreter's
+/// `prepared_sets`, which `DelayedCreatingSetsStep` builds before the rows are sent.
+namespace
+{
+void broadcastOldAnalyzerGlobalJoin(ASTPtr & query_to_send, const SelectQueryInfo & query_info, const ContextPtr & context)
+{
+    /// Idempotent with `rewriteASTForGlobalJoin`: `IN (SELECT 1)` is still local here.
+    rewriteASTJoinsToGlobal(query_to_send);
+
+    auto prepared_sets = query_info.prepared_sets ? query_info.prepared_sets : std::make_shared<PreparedSets>();
+    TemporaryTablesMapping external_tables;
+    bool has_global_subqueries = false;
+
+    /// `table_join` stays null: the right side is read with all of its columns. Passing the
+    /// analyzed join here would rebuild its actions against an AST the first pass may already
+    /// have rewritten to an external table.
+    GlobalSubqueriesVisitor::Data data(
+        context,
+        /* subquery_depth */ 0,
+        /* is_remote */ true,
+        /* is_explain */ false,
+        external_tables,
+        prepared_sets,
+        has_global_subqueries,
+        /* table_join */ nullptr);
+    GlobalSubqueriesVisitor(data).visit(query_to_send);
+
+    /// The read context is const. External tables live on the query context, and a later
+    /// `Context::createCopy` still sees them through `getExternalTables`.
+    auto mutable_context = context->getQueryContext();
+    for (auto & [name, holder] : external_tables)
+    {
+        if (!mutable_context->tryResolveStorageID(StorageID{"", name}, Context::ResolveExternal))
+            mutable_context->addExternalTable(name, std::move(*holder));
+    }
+}
 }
 
 /*
@@ -455,14 +525,18 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
     }
     case ObjectStorageClusterJoinMode::GLOBAL:
     {
-        /// Old analyzer: ship the left scan only. `INNER`/`LEFT`/`CROSS` stay in `query_to_send`.
+        /// Old analyzer. `RIGHT`/`FULL`/`PASTE` stay on the initiator. `INNER`/`LEFT`/`CROSS`
+        /// stay in `query_to_send`, with the right side replaced by an external table.
         if (!query_info.query_tree)
         {
             if (queryHasRightOrFullJoin(query_to_send))
             {
                 auto info = getQueryJoinInfoFromAST(query_to_send);
                 rewriteQueryForInitiatorLocalJoin(query_to_send, query_info, info, context);
+                return;
             }
+
+            broadcastOldAnalyzerGlobalJoin(query_to_send, query_info, context);
             return;
         }
 
@@ -853,6 +927,12 @@ IStorageCluster::RemoteCallVariables IStorageCluster::convertToRemote(
     if (!table_expression->table_function)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't find table function in table expression");
 
+    /// `AS alias` is stored on the inner table function. `JoinedTables` reads only the outer
+    /// table function, so `remote()` must carry the same alias. Leave it on the inner function:
+    /// `addTableFunction` sends that node to the remote initiator and does not copy a non-empty
+    /// outer alias onto the replacement.
+    const String table_alias = table_expression->table_function->tryGetAlias();
+
     boost::intrusive_ptr<ASTFunction> remote_query;
 
     if (shard_addresses[0].user_specified)
@@ -866,6 +946,11 @@ IStorageCluster::RemoteCallVariables IStorageCluster::convertToRemote(
     else
     { // without specified user/password remote query is executed from default user
         remote_query = makeASTFunction(remote_function_name, make_intrusive<ASTLiteral>(host_name), table_expression->table_function);
+    }
+
+    if (!table_alias.empty())
+    {
+        remote_query->setAlias(table_alias);
     }
 
     table_expression->table_function = remote_query;
