@@ -30,6 +30,8 @@ on: # yamllint disable-line rule:truthy
   push:
     branches:
       - 'releases/23.8**'
+    tags:
+      - 'v23.8**'
   workflow_dispatch:
 
 jobs:

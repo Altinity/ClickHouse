@@ -62,6 +62,7 @@ jobs:
             TAG_SUFFIX: ${{ inputs.tag-suffix }}
             SPECIFIED_VERSION: ${{ inputs.version }}
             INPUT_DOCKER_IMAGE: ${{ inputs.docker_image }}
+            PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
           run: |
             python3 ./tests/ci/version_helper.py | grep = | tee /tmp/version_info
             source /tmp/version_info
@@ -73,7 +74,7 @@ jobs:
             if [[ "$INPUT_DOCKER_IMAGE" == *:* ]]; then
                 DOCKER_IMAGE=$INPUT_DOCKER_IMAGE
             else
-                DOCKER_IMAGE="${INPUT_DOCKER_IMAGE}:$PR_NUMBER-$VERSION$TAG_SUFFIX"
+                DOCKER_IMAGE="${INPUT_DOCKER_IMAGE}:${PR_NUMBER}-${VERSION}${TAG_SUFFIX}"
             fi
             echo "docker_image=$DOCKER_IMAGE" >> $GITHUB_OUTPUT
             echo "version=$VERSION" >> $GITHUB_OUTPUT
