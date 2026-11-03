@@ -303,6 +303,10 @@ def _pre_action(s3, job_name, batch, indata, pr_info):
         #   testing), otherwise reports won't be found
         if not (pr_info.is_scheduled or pr_info.is_dispatched):
             report_prefix = Utils.normalize_string(pr_info.head_ref)
+    elif isinstance(pr_info.ref, str) and pr_info.ref.startswith("refs/tags/"):
+        # For tag-triggered runs, use tag name as prefix to avoid downloading
+        # reports from other runs with the same digest.
+        report_prefix = Utils.normalize_string(pr_info.head_ref)
     elif pr_info.is_pr:
         report_prefix = str(pr_info.number)
     print(
