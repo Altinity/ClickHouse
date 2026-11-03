@@ -2540,10 +2540,10 @@ ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::takeNextObject(bool 
 
         ClusterFunctionReadTaskResponsePtr task;
         {
-            /// The lock covers only the enabled-state check and the task callback. Once
-            /// `SYSTEM STOP SWARM MODE` returns, no worker is inside `callback`. The retry
-            /// wait and metadata resolution stay outside the lock so they cannot block stopping
-            /// swarm mode or other task requests.
+            /// The shared lock covers only the enabled-state check and the task callback, so
+            /// admissions from different queries run concurrently. Once `SYSTEM STOP SWARM MODE`
+            /// returns, no worker is inside `callback`. The retry wait and metadata resolution
+            /// stay outside the lock so they cannot block stopping swarm mode.
             auto swarm_mode_lock = getContext()->lockSwarmMode();
             if (!getContext()->isSwarmModeEnabled())
             {

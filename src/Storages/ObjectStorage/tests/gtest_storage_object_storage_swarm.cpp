@@ -90,6 +90,47 @@ TEST(StorageObjectStorageSwarm, StopDoesNotBlockDuringTaskRetryWait)
     EXPECT_EQ(callbacks.load(), 2);
 }
 
+TEST(StorageObjectStorageSwarm, ConcurrentTaskAdmissionsDoNotSerialize)
+{
+    auto context = DB::Context::createCopy(::getContext().context);
+    context->startSwarmMode();
+
+    std::mutex mutex;
+    std::condition_variable both_inside;
+    size_t inside = 0;
+    std::atomic<bool> overlapped{false};
+
+    /// Each admission waits for the other to enter the callback. With an exclusive admission
+    /// lock the second one cannot enter until the first leaves, so the wait times out.
+    DB::ClusterFunctionReadTaskCallback callback = [&]()
+    {
+        std::unique_lock lock(mutex);
+        ++inside;
+        both_inside.notify_all();
+        if (both_inside.wait_for(lock, std::chrono::seconds(5), [&] { return inside >= 2; }))
+            overlapped = true;
+        return std::make_shared<DB::ClusterFunctionReadTaskResponse>();
+    };
+
+    auto run_admission = [&]()
+    {
+        DB::StorageObjectStorageSource::ReadTaskIterator iterator(
+            callback,
+            /*max_threads_count=*/1,
+            /*is_archive_=*/false,
+            /*object_storage_=*/nullptr,
+            /*table_location_=*/"",
+            context);
+    };
+
+    std::thread first(run_admission);
+    std::thread second(run_admission);
+    first.join();
+    second.join();
+
+    EXPECT_TRUE(overlapped.load());
+}
+
 TEST(StorageObjectStorageSwarm, InterruptUnblocksTaskAdmissionBeforeStop)
 {
     auto context = DB::Context::createCopy(::getContext().context);

@@ -35,6 +35,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 
 
 namespace Poco::Net
@@ -1894,8 +1895,9 @@ public:
     /// taking the admission lock, which that read is holding.
     void interruptSwarmTaskAdmission();
     bool isSwarmTaskAdmissionInterrupted() const;
-    /// Serializes swarm task admission with `stopSwarmMode`.
-    std::unique_lock<std::mutex> lockSwarmMode() const;
+    /// Shared lock for one swarm task admission. Admissions run concurrently with each other;
+    /// `stopSwarmMode` and `startSwarmMode` take the lock exclusively.
+    std::shared_lock<SharedMutex> lockSwarmMode() const;
 
     bool isInternalQuery() const { return is_internal_query; }
     void setInternalQuery(bool internal) { is_internal_query = internal; }
