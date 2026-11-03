@@ -584,6 +584,27 @@ void optimizeTreeSecondPass(
         optimizeJoinByShards(root);
 
     considerEnablingParallelReplicas(optimization_settings, root, query_plan);
+<<<<<<< HEAD
+=======
+
+    /// Run after every optimization that can rewrite aggregation, sorting, projections,
+    /// distributed fragments, or parallel replicas. This placement makes the pass a pure
+    /// admission check: no later optimization needs to retract the heap or its synthetic sort.
+    if (optimization_settings.enable_group_by_top_k_optimization)
+    {
+        traverseQueryPlan(stack, root, [&](auto & frame_node) { tryOptimizeGroupByTopK(&frame_node, nodes, extra_settings); });
+    }
+
+    /// Runs behind every rewrite of the HAVING filter it reads, and behind the pass above, whose `top_k` it refuses.
+    if (optimization_settings.aggregation_having_prefilter)
+    {
+        traverseQueryPlan(
+            stack, root, [&](auto & frame_node) { tryPushHavingPrefilterIntoAggregation(&frame_node, nodes, extra_settings); });
+    }
+
+    /// Last: it reads the final consumers of every remote read.
+    allowReadingShardsFromSeveralReplicas(root);
+>>>>>>> 22a323d93d6 (Merge pull request #128865 from groeneai/offset-parallel-replicas-ordered-merges)
 }
 
 void addStepsToBuildSets(

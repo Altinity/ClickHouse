@@ -55,6 +55,8 @@ public:
 
     bool hasSerializedPlan() const;
 
+    void allowReadingShardFromSeveralReplicas(bool allow) { allow_reading_shard_from_several_replicas = allow; }
+
 private:
     ClusterProxy::SelectStreamFactory::Shards shards;
     QueryProcessingStage::Enum stage;
@@ -70,7 +72,11 @@ private:
     const String cluster_name;
     UnavailableShardTrackerPtr unavailable_shard_tracker;
     std::optional<GetPriorityForLoadBalancing> priority_func_factory;
+<<<<<<< HEAD
     bool is_remote_function = false;
+=======
+    bool allow_reading_shard_from_several_replicas = false;
+>>>>>>> 22a323d93d6 (Merge pull request #128865 from groeneai/offset-parallel-replicas-ordered-merges)
 
     Pipes addPipes(const ClusterProxy::SelectStreamFactory::Shards & used_shards, const SharedHeader & out_header);
 
