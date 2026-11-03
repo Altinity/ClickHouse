@@ -161,9 +161,11 @@ def test_remote_initiator_global_join_without_analyzer(started_cluster_iceberg_w
 
     # The alias `t2` is already a temporary table with a different row. The join must use the Memory row.
     # One client session, so the temporary table is visible to the SELECT.
+    # The integration image has `/usr/bin/clickhouse` and no `clickhouse-client` on `PATH`.
     res = instance.exec_in_container(
         [
-            "clickhouse-client",
+            "/usr/bin/clickhouse",
+            "client",
             "--multiquery",
             "--query",
             f"""
