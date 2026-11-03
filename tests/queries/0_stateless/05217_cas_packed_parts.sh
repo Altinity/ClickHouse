@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Tags: no-fasttest, no-random-merge-tree-settings, no-parallel, cas-storage
-# cas-storage: the oracles below read system.cas_log of the default disk and use the cas_packed_mixed policy of the CAS lanes.
+# Tags: no-fasttest, no-random-merge-tree-settings, cas-storage
+# cas-storage: the destination section uses the cas_packed_mixed policy of the CAS lane config. The packed
+# tables live on test-owned disks so GC and FSCK oracles see only this test's objects and parallel runs are safe.
 
 set -euo pipefail
 
@@ -8,6 +9,18 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
 
+PACKED_DISK_NAME="${CLICKHOUSE_DATABASE}_05217_packed_${CLICKHOUSE_TEST_UNIQUE_NAME}_${RANDOM}"
+PACKED_POOL="${CLICKHOUSE_USER_FILES_UNIQUE}_05217_packed_${RANDOM}"
+PACKED_DISK="disk(
+    type = object_storage,
+    object_storage_type = local,
+    metadata_type = cas,
+    cas_server_root_id = '${CLICKHOUSE_DATABASE}_05217_packed',
+    name = '${PACKED_DISK_NAME}',
+    path = '${PACKED_POOL}/',
+    cas_allow_packed_parts = 1,
+    cas_gc_enabled = 1,
+    cas_gc_interval_sec = 1)"
 DISABLED_DISK_NAME="${CLICKHOUSE_DATABASE}_05217_disabled_${CLICKHOUSE_TEST_UNIQUE_NAME}_${RANDOM}"
 DISABLED_POOL="${CLICKHOUSE_USER_FILES_UNIQUE}_05217_disabled_${RANDOM}"
 COMPACT_QUERY_ID="${CLICKHOUSE_DATABASE}_05217_compact_${CLICKHOUSE_TEST_UNIQUE_NAME}"
@@ -16,8 +29,8 @@ COMPACT_SALT="${CLICKHOUSE_DATABASE}_${CLICKHOUSE_TEST_UNIQUE_NAME}_compact"
 WIDE_SALT="${CLICKHOUSE_DATABASE}_${CLICKHOUSE_TEST_UNIQUE_NAME}_wide"
 UNFREEZE_STRUCTURE='command_type String, partition_id String, part_name String, backup_name String, backup_path String, part_backup_path String'
 
-rm -rf "${DISABLED_POOL:?}"
-mkdir -p "${DISABLED_POOL}"
+rm -rf "${PACKED_POOL:?}" "${DISABLED_POOL:?}"
+mkdir -p "${PACKED_POOL}" "${DISABLED_POOL}"
 
 drain_gc()
 {
@@ -78,7 +91,8 @@ CREATE TABLE cas_packed_local
 ENGINE = MergeTree
 PARTITION BY tuple()
 ORDER BY id
-SETTINGS min_bytes_for_full_part_storage = '1G',
+SETTINGS disk = ${PACKED_DISK},
+    min_bytes_for_full_part_storage = '1G',
     min_bytes_for_wide_part = '1G',
     index_granularity = 64,
     index_granularity_bytes = 10485760;
@@ -95,7 +109,8 @@ CREATE TABLE cas_packed_wide
 ENGINE = MergeTree
 PARTITION BY tuple()
 ORDER BY id
-SETTINGS min_bytes_for_full_part_storage = '1G',
+SETTINGS disk = ${PACKED_DISK},
+    min_bytes_for_full_part_storage = '1G',
     min_bytes_for_wide_part = 0,
     index_granularity = 64,
     index_granularity_bytes = 10485760;
@@ -173,24 +188,14 @@ EOF
 check_table cas_packed_local compact_check_insert
 check_table cas_packed_wide wide_check_insert
 
-MAIN_DISK=$(${CLICKHOUSE_CLIENT} --query "
-    SELECT any(disk_name)
-    FROM system.parts
-    WHERE database = currentDatabase() AND table = 'cas_packed_local' AND active")
-MAIN_DISK_IS_CAS=$(${CLICKHOUSE_CLIENT} --query "SELECT count() FROM system.cas_mounts WHERE disk = '${MAIN_DISK}'")
-if [ "${MAIN_DISK_IS_CAS}" != "1" ]; then
-    echo "the default disk '${MAIN_DISK}' is not content-addressed; this test runs on the CAS lanes only" >&2
-    exit 1
-fi
-
 ${CLICKHOUSE_CLIENT} --query "SYSTEM FLUSH LOGS cas_log"
 ${CLICKHOUSE_CLIENT} --multiquery <<EOF
 SELECT 'compact_blob_put', count()
 FROM system.cas_log
-WHERE disk_name = '${MAIN_DISK}' AND event_type = 'blob_put' AND query_id = '${COMPACT_QUERY_ID}';
+WHERE disk_name = '${PACKED_DISK_NAME}' AND event_type = 'blob_put' AND query_id = '${COMPACT_QUERY_ID}';
 SELECT 'wide_blob_put', count()
 FROM system.cas_log
-WHERE disk_name = '${MAIN_DISK}' AND event_type = 'blob_put' AND query_id = '${WIDE_QUERY_ID}';
+WHERE disk_name = '${PACKED_DISK_NAME}' AND event_type = 'blob_put' AND query_id = '${WIDE_QUERY_ID}';
 EOF
 
 ${CLICKHOUSE_CLIENT} --multiquery <<EOF
@@ -295,7 +300,8 @@ CREATE TABLE cas_packed_copy
 ENGINE = MergeTree
 PARTITION BY tuple()
 ORDER BY id
-SETTINGS min_bytes_for_full_part_storage = '1G',
+SETTINGS disk = ${PACKED_DISK},
+    min_bytes_for_full_part_storage = '1G',
     min_bytes_for_wide_part = '1G',
     index_granularity = 64,
     index_granularity_bytes = 10485760;
@@ -399,16 +405,15 @@ ${CLICKHOUSE_CLIENT} --query "DROP TABLE cas_packed_copy SYNC"
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE cas_packed_wide SYNC"
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE cas_packed_disabled SYNC"
 
-drain_gc "${MAIN_DISK}" default
-check_fsck "${MAIN_DISK}" default
-
-drain_gc cas_packed_disabled destination
-check_fsck cas_packed_disabled destination
+drain_gc "${PACKED_DISK_NAME}" packed
+check_fsck "${PACKED_DISK_NAME}" packed
 
 drain_gc "${DISABLED_DISK_NAME}" disabled
 check_fsck "${DISABLED_DISK_NAME}" disabled
 
 ${CLICKHOUSE_CLIENT} --allow_repeated_settings --send_logs_level=fatal \
+    --query "SYSTEM CAS FORGET '${PACKED_DISK_NAME}'"
+${CLICKHOUSE_CLIENT} --allow_repeated_settings --send_logs_level=fatal \
     --query "SYSTEM CAS FORGET '${DISABLED_DISK_NAME}'"
 
-rm -rf "${DISABLED_POOL:?}"
+rm -rf "${PACKED_POOL:?}" "${DISABLED_POOL:?}"
