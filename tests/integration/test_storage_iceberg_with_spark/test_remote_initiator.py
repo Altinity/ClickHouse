@@ -209,10 +209,14 @@ def test_remote_initiator_global_join_without_analyzer(started_cluster_iceberg_w
     assert res == "1\t1\n"
 
     # `IN (SELECT 1)` has no table, so a replica must still see that subquery.
-    # The sent text is `IN ((SELECT 1) AS _subqueryN)`. Choosing node1 runs in-process and writes no non-initial `query_log` row.
+    # The sent text is `IN ((SELECT 1) AS _subqueryN)`. Choosing node1 runs in-process and writes no
+    # non-initial `query_log` row. `QueryFinish` can be queued after the first `SYSTEM FLUSH LOGS`,
+    # so a later flush is what makes an earlier replica query visible.
+    query_ids = []
     saw_remote_subquery = False
     for _ in range(9):
         query_id = uuid.uuid4().hex
+        query_ids.append(query_id)
         res = instance.query(
             f"""
             SELECT tag, number
@@ -232,7 +236,7 @@ def test_remote_initiator_global_join_without_analyzer(started_cluster_iceberg_w
         sent_with_subquery = instance.query(f"""
             SELECT count()
             FROM clusterAllReplicas('cluster_simple', system.query_log)
-            WHERE initial_query_id = '{query_id}'
+            WHERE initial_query_id IN ({", ".join(f"'{query_id}'" for query_id in query_ids)})
                 AND type = 'QueryFinish'
                 AND is_initial_query = 0
                 AND position(query, '(SELECT 1)') > 0
@@ -240,4 +244,16 @@ def test_remote_initiator_global_join_without_analyzer(started_cluster_iceberg_w
         if sent_with_subquery != "0\n":
             saw_remote_subquery = True
             break
+    if not saw_remote_subquery:
+        for node in started_cluster_iceberg_with_spark.instances.values():
+            node.query("SYSTEM FLUSH LOGS")
+        sent_with_subquery = instance.query(f"""
+            SELECT count()
+            FROM clusterAllReplicas('cluster_simple', system.query_log)
+            WHERE initial_query_id IN ({", ".join(f"'{query_id}'" for query_id in query_ids)})
+                AND type = 'QueryFinish'
+                AND is_initial_query = 0
+                AND position(query, '(SELECT 1)') > 0
+            """)
+        saw_remote_subquery = sent_with_subquery != "0\n"
     assert saw_remote_subquery
