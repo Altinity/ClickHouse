@@ -83,10 +83,10 @@ def format_message(branch, sha, run_id, grouped, previous):
         return None
     short = (sha or "")[:7]
     header = f"{branch} · {short}" if short else branch
-    report = (
-        "https://s3.amazonaws.com/altinity-build-artifacts/"
-        f"REFs/{branch}/{sha}/{run_id}/ci_run_report.html"
-    )
+    bucket = os.environ.get("S3_ARTIFACT_BUCKET")
+    if not bucket:
+        raise RuntimeError("S3_ARTIFACT_BUCKET is not set")
+    report = f"https://s3.amazonaws.com/{bucket}/REFs/{branch}/{sha}/{run_id}/ci_run_report.html"
     return "\n".join([header, *lines, f"Report: {report}"])
 
 

@@ -102,7 +102,7 @@ jobs:
           if: always()
           id: upload_results
           env:
-            S3_BUCKET: "altinity-build-artifacts"
+            S3_BUCKET: ${{ vars.S3_ARTIFACT_BUCKET }}
             COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
             PR_NUMBER: ${{ env.PR_NUMBER || github.event.pull_request.number || 0 }}
             DOCKER_IMAGE: ${{ steps.set_version.outputs.docker_image }}

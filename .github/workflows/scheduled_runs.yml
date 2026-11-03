@@ -197,4 +197,5 @@ jobs:
           TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id || '' }}
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          S3_ARTIFACT_BUCKET: ${{ vars.S3_ARTIFACT_BUCKET }}
         run: python3 ci/jobs/scheduled_run_summary.py

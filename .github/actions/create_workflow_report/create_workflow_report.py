@@ -27,7 +27,7 @@ import yaml
 DATABASE_HOST_VAR = "CHECKS_DATABASE_HOST"
 DATABASE_USER_VAR = "CLICKHOUSE_TEST_STAT_LOGIN"
 DATABASE_PASSWORD_VAR = "CLICKHOUSE_TEST_STAT_PASSWORD"
-S3_BUCKET = "altinity-build-artifacts"
+S3_BUCKET = os.getenv("S3_ARTIFACT_BUCKET")
 GITHUB_REPO = "Altinity/ClickHouse"
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
 # Resolve from this file so discovery works from repo root or the action folder.
@@ -1269,7 +1269,9 @@ def create_workflow_report(
         print(f"{DATABASE_PASSWORD_VAR} is not set")
     if not GITHUB_TOKEN:
         print("GITHUB_TOKEN is not set")
-    if not all([host, user, password, GITHUB_TOKEN]):
+    if not S3_BUCKET:
+        print("S3_ARTIFACT_BUCKET is not set")
+    if not all([host, user, password, GITHUB_TOKEN, S3_BUCKET]):
         raise Exception("Required environment variables are not set")
 
     run_id = actions_run_url.split("/")[-1]

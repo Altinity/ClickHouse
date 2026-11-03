@@ -130,7 +130,7 @@ jobs:
 
       - name: 📦 Get deb url
         env:
-          S3_BASE_URL: https://altinity-build-artifacts.s3.amazonaws.com/
+          S3_BASE_URL: https://${{ vars.S3_ARTIFACT_BUCKET }}.s3.amazonaws.com/
           PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
         run: |
           REPORTS_PATH=${{ runner.temp }}/reports_dir
