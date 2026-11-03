@@ -21,7 +21,7 @@ import requests
 from clickhouse_driver import Client
 from clickhouse_driver.errors import ServerException
 import boto3
-from botocore.exceptions import NoCredentialsError
+from botocore.exceptions import ClientError, NoCredentialsError
 import yaml
 
 
@@ -891,15 +891,20 @@ def get_new_fails_this_pr(
     return new_fails_df
 
 
-def _workflow_config_s3_url(pr_number: int, commit_sha: str, ref_name: str) -> str:
+def _s3_get_json(key: str):
+    s3_client = boto3.client("s3", endpoint_url=os.getenv("S3_URL"))
+    response = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
+    return json.loads(response["Body"].read().decode("utf-8"))
+
+
+def _workflow_config_s3_key(pr_number: int, commit_sha: str, ref_name: str) -> str:
     if pr_number == 0:
         return (
-            f"https://{S3_BUCKET}.s3.amazonaws.com/REFs/{ref_name}/{commit_sha}/"
+            f"REFs/{ref_name}/{commit_sha}/"
             "config_workflow/workflow_config_masterci.json"
         )
     return (
-        f"https://{S3_BUCKET}.s3.amazonaws.com/PRs/{pr_number}/{commit_sha}/"
-        "config_workflow/workflow_config_pr.json"
+        f"PRs/{pr_number}/{commit_sha}/config_workflow/workflow_config_pr.json"
     )
 
 
@@ -932,19 +937,14 @@ def get_workflow_config(pr_number: int, commit_sha: str, ref_name: str) -> dict:
     local = _workflow_config_from_local()
     if local is not None:
         return local
-    url = _workflow_config_s3_url(pr_number, commit_sha, ref_name)
+    key = _workflow_config_s3_key(pr_number, commit_sha, ref_name)
     try:
-        response = requests.get(url, timeout=30)
-        if response.status_code != 200:
-            print(
-                f"WARNING:Failed to fetch workflow config from {url}: "
-                f"{response.status_code}",
-                file=sys.stderr,
-            )
-            return {"cache_jobs": {}}
-        return response.json()
+        return _s3_get_json(key)
     except Exception as e:
-        print(f"WARNING:Failed to fetch workflow config from {url}: {e}", file=sys.stderr)
+        print(
+            f"WARNING:Failed to fetch workflow config from s3://{S3_BUCKET}/{key}: {e}",
+            file=sys.stderr,
+        )
         return {"cache_jobs": {}}
 
 
@@ -1155,18 +1155,16 @@ def fetch_workflow_result_json(
         ref_param = f"PR={pr_number}"
         workflow_name = "PR"
 
-    status_file = f"result_{workflow_name.lower()}.json"
-    s3_path = (
-        f"https://{S3_BUCKET}.s3.amazonaws.com/"
-        f"{ref_param.replace('=', 's/')}/{commit_sha}/{status_file}"
+    key = (
+        f"{ref_param.replace('=', 's/')}/{commit_sha}/"
+        f"result_{workflow_name.lower()}.json"
     )
     try:
-        response = requests.get(s3_path, timeout=30)
-        if response.status_code != 200:
-            return None
-        return response.json()
+        return _s3_get_json(key)
+    except ClientError:
+        return None
     except Exception as e:
-        print(f"WARNING:Failed to fetch workflow result from {s3_path}: {e}")
+        print(f"WARNING:Failed to fetch workflow result from s3://{S3_BUCKET}/{key}: {e}")
         return None
 
 
