@@ -195,6 +195,9 @@ public:
         const FieldRef * right_keys,
         const DataTypes & data_types) const;
 
+    /// Whether the condition can be true when `key_column` is SQL NULL. Other columns stay arbitrary.
+    bool mayBeTrueOnNull(size_t key_column) const;
+
     /// Checks that the index can not be used
     /// FUNCTION_UNKNOWN will be AND'ed (if any).
     bool alwaysUnknownOrTrue() const;
@@ -357,6 +360,10 @@ public:
 
         /// Whether to relax the key condition (e.g., for LIKE queries without a perfect prefix).
         bool relaxed = false;
+
+        /// `isNotDistinctFrom` (`<=>`) with a non-NULL constant is false when the column is NULL.
+        /// A normal comparison is unknown. `NOT` of this atom is therefore true for NULL.
+        bool false_on_null = false;
 
         /// For FUNCTION_IN_RANGE and FUNCTION_NOT_IN_RANGE.
         Range range = Range::createWholeUniverse();

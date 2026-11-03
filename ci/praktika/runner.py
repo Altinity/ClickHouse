@@ -11,6 +11,7 @@ import traceback
 from pathlib import Path
 
 from ._environment import _Environment
+from .cache import Cache
 from .artifact import Artifact
 from .cidb import CIDB
 from .digest import Digest
@@ -362,7 +363,7 @@ class Runner:
             if not cache_hash:
                 print("NOTE: No submodule cache hash in workflow config, skipping restore")
                 return
-            s3_path = f"{Settings.CACHE_S3_PATH}/submodules/{cache_hash}.tar.zst"
+            s3_path = Cache.submodule_archive_s3_path(cache_hash)
             local_archive = f"{Settings.TEMP_DIR}/submodules_{cache_hash}.tar.zst"
             print(f"Restoring submodule cache: {s3_path}")
             S3.copy_file_from_s3(s3_path=s3_path, local_path=local_archive, no_strict=True)
