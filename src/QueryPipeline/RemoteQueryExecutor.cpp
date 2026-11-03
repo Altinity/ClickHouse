@@ -804,9 +804,9 @@ RemoteQueryExecutor::ReadResult RemoteQueryExecutor::processPacket(Packet packet
                 connections->dumpAddresses());
             break;
         case Protocol::Server::Data:
-            /// Note: `packet.block.rows() > 0` means it's a header block.
-            /// We can actually return it, and the first call to RemoteQueryExecutor::read
-            /// will return earlier. We should consider doing it.
+            /// `rows() > 0` is a data block. A header block has zero rows and is not data from
+            /// the replica: skip it and keep reading. Returning that header from the first `read`
+            /// would expose the schema earlier; that is left for later.
             if (!packet.block.empty() && (packet.block.rows() > 0))
             {
                 got_data_from_replica = true;
