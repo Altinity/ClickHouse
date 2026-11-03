@@ -94,7 +94,8 @@ workflow = Workflow.Config(
         ],
         *[
             job.set_run_after(REGULAR_BUILD_NAMES)
-            for job in JobConfigs.release_build_jobs_with_examples
+            # NOTE (strtgbb): no clickhouse-examples, nothing uses it and it delays the ThinLTO link of clickhouse
+            for job in JobConfigs.release_build_jobs
         ],
         # *[ # NOTE (strtgbb): we don't run special build jobs
         #     job.set_run_after(CORE_BLOCKING_JOB_NAMES)
@@ -255,7 +256,7 @@ workflow = Workflow.Config(
         ArtifactConfigs.wasm_parser,
         ArtifactConfigs.fuzzers,
         ArtifactConfigs.fuzzers_corpus,
-        ArtifactConfigs.clickhouse_examples,
+        # ArtifactConfigs.clickhouse_examples,
         # *ArtifactConfigs.llvm_profdata_file,
         # ArtifactConfigs.llvm_coverage_info_file,
         ArtifactConfigs.toolchain_pgo_bolt_amd,

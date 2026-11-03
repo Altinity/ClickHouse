@@ -492,10 +492,9 @@ class JobConfigs:
     # master data directly comparable to a PR build (official master builds
     # keep debug symbols, PR builds strip them). The hook uploads only for the
     # arm variant (see _PROFILED_BUILDS in build_profile_hook.py).
+    # NOTE (strtgbb): no --build-examples for the arm warmup, PR builds no longer build clickhouse-examples
     sccache_warmup_build_jobs = [
-        job.set_command(f"{job.command} --build-examples")
-        if f"({BuildTypes.ARM_RELEASE_PR_CACHE_WARMUP})" in job.name
-        else job
+        job
         for job in common_build_job_config.set_post_hooks(
             post_hooks=[
                 # "python3 ./ci/jobs/scripts/job_hooks/build_profile_hook.py",
