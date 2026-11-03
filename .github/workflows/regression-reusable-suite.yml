@@ -93,6 +93,7 @@ jobs:
       build_sha: ${{ inputs.build_sha }}
       pr_number: ${{ github.event.number }}
       artifacts: builds
+      S3_ARTIFACT_BUCKET: ${{ vars.S3_ARTIFACT_BUCKET }}
       # Args
       args: --test-to-end
         --no-colors
