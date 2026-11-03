@@ -209,7 +209,7 @@ def test_remote_initiator_global_join_without_analyzer(started_cluster_iceberg_w
     assert res == "1\t1\n"
 
     # `IN (SELECT 1)` has no table, so a replica must still see that subquery.
-    # Choosing node1 runs the query in this process and writes no non-initial `query_log` row.
+    # The sent text is `IN ((SELECT 1) AS _subqueryN)`. Choosing node1 runs in-process and writes no non-initial `query_log` row.
     saw_remote_subquery = False
     for _ in range(9):
         query_id = uuid.uuid4().hex
@@ -235,7 +235,7 @@ def test_remote_initiator_global_join_without_analyzer(started_cluster_iceberg_w
             WHERE initial_query_id = '{query_id}'
                 AND type = 'QueryFinish'
                 AND is_initial_query = 0
-                AND position(query, 'IN (SELECT 1)') > 0
+                AND position(query, '(SELECT 1)') > 0
             """)
         if sent_with_subquery != "0\n":
             saw_remote_subquery = True
