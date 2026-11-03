@@ -199,7 +199,8 @@ The command returns one row (or, offline, one line per field) with `namespaces_r
 `staging_objects_removed`, `mountpoint_objects_removed`, `member_retired`, `warnings` and
 `namespaces_pending_gc`; the SQL row ends with `namespaces_pending_gc`. It is resumable: a rerun skips namespaces already marked removed and reports them
 under `namespaces_already_removed` rather than redoing the work. A per-object drain failure is recorded as
-a `warning`; the owner keeps an unverified tombstone and the next run resumes over it. `member_retired = 1`
+a `warning`; the owner keeps an unverified tombstone and the next run resumes over it. So does a run that
+loses its claim during the drain; only a claim lost before the drain rolls the tombstone back. `member_retired = 1`
 means the owner carries a verified retirement; rows still listed under `namespaces_pending_gc` are deleted
 by GC and need no rerun. See [troubleshooting](/antalya/cas/operations/troubleshooting) for
 `member_retired = 0`.
@@ -257,7 +258,8 @@ before its tombstone ends `fenced` with the owner not retired. Do not rerun on a
 `retirement_verified = 1` is finished: restart the member to rejoin. A `live`, `expired`, `terminated` or
 `fenced` row belongs to whoever owns the id now, a rejoined member included, and a rerun would delete its data.
 A run that warns `the tombstone was rolled back` lost its claim and left the id unretired: running the command
-again is a new decommission of the id.
+again is a new decommission of the id. A run that warns `the admin claim was lost during the drain` keeps its tombstone and
+is finished by a rerun under this rule.
 
 A tombstone can land late: the store may apply it after the run reported an error. If a server of the id ran
 after the tombstone time printed in its start error, do not rerun: the rerun deletes what that server wrote.

@@ -33,6 +33,7 @@ namespace DB::ErrorCodes
 
 namespace ProfileEvents
 {
+    extern const Event CASIdentityLost;
     extern const Event CASMountLeaseLost;
     extern const Event CASMountExclusivityViolation;
 }
@@ -3523,29 +3524,101 @@ TEST(CASMount, FenceRecoveryReclaimRechecksTheOwner)
     EXPECT_EQ(slot.writer_epoch, 2u) << "the remount's fresh epoch reached the slot";
     EXPECT_TRUE(slot.gc_fenced) << "and was fenced by the refused recheck";
     EXPECT_FALSE(store->mayMutate());
+
+    /// The next attempt reads the tombstone before it claims.
+    EXPECT_FALSE(store->tryRemountOnce());
+    EXPECT_EQ(store->lifecycle(), PoolLifecycle::IdentityLost);
+    EXPECT_EQ(slotBody(*b, l, "r").writer_epoch, 2u);
 }
 
-/// Another process of the same uuid rejoined (the life moved) while this one was fenced. The remount sees the
-/// moved life before it allocates an epoch and stops for good instead of retrying.
-TEST(CASMount, RemountRefusesAfterASameUuidRejoin)
+namespace
 {
-    auto b = std::make_shared<InMemoryBackend>();
-    Layout l("p");
-    auto store = Pool::open(b, rootConfig());
-    rewriteOwnerAt(*b, l, "r", UInt128(1));   /// life 2, same uuid, not retired
+void writeOwnerAt(Backend & backend, const Layout & l, const String & srid, const OwnerObject & owner)
+{
+    DB::Cas::tests::OperationForTest op(backend);
+    const auto current = (*op).read(l.ownerKey(srid), Retry::once());
+    ASSERT_TRUE(current.has_value());
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        (*op).replace(l.ownerKey(srid), encodeOwner(owner), current->etag, Retry::once())));
+}
+
+/// The owner changed while `store` was fenced. The remount stops in `IdentityLost` before it claims the slot or
+/// allocates an epoch, says `why` in its result, and counts one `CASIdentityLost`.
+void expectRemountStopsForGood(const std::shared_ptr<InMemoryBackend> & b, const PoolPtr & store,
+                               const std::function<void()> & change_owner, std::string_view why)
+{
+    const Layout l("p");
+    change_owner();
     DB::Cas::tests::fenceOutMountForTest(*b, l.mountKey("r"));
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->renewWatermarkOnce(); });
     Ops ops(b);
+    const String owner_before = ops.op.read(l.ownerKey("r"), Retry::standard())->bytes;
     const String counter_before = ops.op.read(l.epochKey("r"), Retry::standard())->bytes;
+    const uint64_t epoch_before = slotBody(*b, l, "r").writer_epoch;
+    const uint64_t identity_lost_before = ProfileEvents::global_counters[ProfileEvents::CASIdentityLost].load();
+    DB::Cas::tests::ScopedLoggerCapture capture("CasPool", "warning");
 
     EXPECT_FALSE(store->tryRemountOnce());
     EXPECT_EQ(store->lifecycle(), PoolLifecycle::IdentityLost);
     EXPECT_FALSE(store->tryRemountOnce());
 
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASIdentityLost].load(), identity_lost_before + 1);
+    EXPECT_NE(capture.captured().find(why), String::npos) << capture.captured();
     EXPECT_EQ(ops.op.read(l.epochKey("r"), Retry::standard())->bytes, counter_before) << "no epoch was allocated";
+    EXPECT_EQ(ops.op.read(l.ownerKey("r"), Retry::standard())->bytes, owner_before) << "the owner was not written";
     const MountLease slot = slotBody(*b, l, "r");
-    EXPECT_EQ(slot.writer_epoch, 1u);
+    EXPECT_EQ(slot.writer_epoch, epoch_before);
     EXPECT_TRUE(slot.gc_fenced);
+}
+}
+
+/// Another process of the same uuid rejoined (the life moved) while this one was fenced.
+TEST(CASMount, RemountRefusesAfterASameUuidRejoin)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    auto store = Pool::open(b, rootConfig());
+    expectRemountStopsForGood(b, store, [&] { rewriteOwnerAt(*b, l, "r", UInt128(1)); }, "moved from life 1 to life 2");
+}
+
+/// A member paused past its lease, fenced by GC, then decommissioned.
+TEST(CASMount, RemountStopsForGoodOverARetiredOwner)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    auto store = Pool::open(b, rootConfig());
+    expectRemountStopsForGood(
+        b, store, [&] { DB::Cas::tests::tombstoneOwnerForTest(*b, l.ownerKey("r")); },
+        "was decommissioned while this process was fenced");
+}
+
+/// A member started over a 26.6.4 owner (no `owner_life`, so life 0) and a 26.6.4 decommission tombstoned it: the
+/// tombstone also reads as life 0, so only the retirement itself ends the remount.
+TEST(CASMount, RemountStopsForGoodOverA2664TombstoneAtLifeZero)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    { auto first = Pool::open(b, rootConfig()); }
+    writeOwnerAt(*b, l, "r",
+                 OwnerObject{.server_uuid = UInt128(1), .retired_at_ms = std::nullopt, .owner_life = 0, .retirement_verified = false});
+    auto store = Pool::open(b, rootConfig());   /// records life 0: a matching claim does not rewrite the owner
+    expectRemountStopsForGood(
+        b, store,
+        [&]
+        {
+            writeOwnerAt(*b, l, "r",
+                         OwnerObject{.server_uuid = UInt128(1), .retired_at_ms = 1, .owner_life = 0, .retirement_verified = false});
+        },
+        "was decommissioned while this process was fenced");
+}
+
+/// Another server owns the id now; no retry can resume it.
+TEST(CASMount, RemountStopsForGoodOverAForeignOwner)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    auto store = Pool::open(b, rootConfig());
+    expectRemountStopsForGood(b, store, [&] { rewriteOwnerAt(*b, l, "r", UInt128(2)); }, "owned by a different server");
 }
 
 namespace

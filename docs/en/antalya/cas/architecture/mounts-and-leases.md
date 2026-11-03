@@ -52,12 +52,11 @@ at the next life ([rejoin](#rejoin)).
 | Observed at `gc/server-roots/<server_root_id>/owner` | Action |
 |---|---|
 | present, same `server_uuid`, not tombstoned | proceed |
-| present, `retired_at_ms` set, `retirement_verified` | a server start rejoins when its preconditions hold ([below](#rejoin)); a remount fails with `CORRUPTED_DATA`; the decommission admin accepts its victim's tombstone |
-| present, `retired_at_ms` set, not verified | `CORRUPTED_DATA` for a server start or remount: the decommission is not finished; the decommission admin accepts it |
+| present, `retired_at_ms` set, `retirement_verified` | a server start rejoins when its preconditions hold ([below](#rejoin)); a self-remount stops in `IdentityLost`; the decommission admin accepts its victim's tombstone |
+| present, `retired_at_ms` set, not verified | `CORRUPTED_DATA` for a server start: the decommission is not finished; a self-remount stops in `IdentityLost`; the decommission admin accepts it |
 | present, different `server_uuid`, not tombstoned | `CORRUPTED_DATA` — names the regenerated-uuid-file cause and, for a dead owner, `SYSTEM CAS DROP POOL MEMBER` |
 | absent, subtree provably empty | `putIfAbsent` the owner (claim) |
 | absent, subtree non-empty | `CORRUPTED_DATA` — identity lost over existing data |
-| absent, subtree provably empty | `putIfAbsent` the owner (claim) |
 | lost the `putIfAbsent` race | re-read; equal uuid proceeds, else `CORRUPTED_DATA` |
 
 The owner carries `owner_life`, a counter every owner write sets to the read value + 1 by `If-Match`, so
@@ -65,9 +64,10 @@ two owner writes never repeat their bytes and a delayed `If-Match` against an ol
 land. A process records the life it started under; after every mount claim (start, self-remount,
 decommission) it reads the owner once more and requires its own `server_uuid` and that life
 (`recheckOwnerAfterClaim`); otherwise it fences its own mount body and fails, so a successor does not wait
-the refused lease out. A self-remount also compares the life before it allocates an epoch: an owner at
-another life, not retired, moves the pool to `IdentityLost` instead of retrying. `retirement_verified`
-marks a decommission whose claim, tombstone and farewell all held.
+the refused lease out. A self-remount also reads the owner before it claims: a different `server_uuid`, a
+retirement or another life moves the pool to `IdentityLost`, at the latest on the next attempt, instead of
+retrying. The retirement counts on its own: a tombstone written by 26.6.4 drops `owner_life`.
+`retirement_verified` marks a decommission whose claim, tombstone and farewell all held.
 
 "Provably empty" requires both an authoritative decoded catalog naming no life owned by `server_root_id` and
 a 1-key `LIST` probe finding nothing under `cas/manifests/<server_root_id>/` or `roots/<server_root_id>/`.
@@ -356,8 +356,10 @@ keeps `owner`, `epoch` and `mount` and removes only data, in six steps:
    after GC fences the admin's slot or its own start sees the lease hold still for the observation threshold.
    A tombstone applied later than that is the case the
    [rerun rule](/antalya/cas/operations/migration#rejoin-rerun-rule) repairs by hand.
-3. Confirm the slot still holds the admin's claim; otherwise roll the tombstone back, unless the owner was
-   already retired before this run. Every exit between (2) and (5) runs this confirm.
+3. Confirm the slot still holds the admin's claim. A claim lost before the drain rolls the tombstone back,
+   unless the owner was already retired before this run. A claim lost during the drain keeps the tombstone:
+   the drain may have removed data, and the tombstone keeps the member from mounting over it. Every failed
+   exit between (2) and (5) runs this confirm; a clean drain is checked by the verify in (6).
 4. Drop every namespace, sweep manifest debris, drain `staging/` and `roots/`, all on the admin's fenced
    mount plane.
 5. Write the admin's clean farewell.

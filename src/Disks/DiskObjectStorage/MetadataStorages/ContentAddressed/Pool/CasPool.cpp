@@ -1032,6 +1032,7 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
     /// Private ctor: make_shared cannot reach it.
     PoolPtr store(new Pool(std::move(backend), std::move(config), std::move(meta)));
     store->setEventSink(std::move(store->config.event_sink));
+    store->decommission_admin = true;
 
     /// Register-before-first-write, belt-and-braces: same invariant `open` asserts.
     chassert(store->isAlgoAdmitted(write_algo));
@@ -1498,11 +1499,22 @@ bool Pool::tryRemountOnce()
         /// Require the catalog before allocating a new epoch or replacing the mount slot.
         step = "ref_catalog_observe";
         (void)observe_catalog();
-        step = "owner_claim";
         /// The open plane throughout: the mount fence is latched lost here (starting the renewer does
         /// not clear it), so an operation admitted under the fence could never make the claim that
         /// re-establishes it.
         CasOperation owner_op = gc_requests.admit();
+        /// No retry can undo a foreign, retired or rewritten owner, so stop for good before the claim and the epoch.
+        step = "owner_check";
+        error = remountOwnerRefusal(owner_op, pool_layout, srid, our_uuid, recorded_owner_life);
+        if (!error.empty())
+        {
+            if (decommission_admin)
+                error = fmt::format("the SYSTEM CAS DROP POOL MEMBER run for '{}' lost its admin claim and does not "
+                                    "remount; the run reports its own outcome ({})", srid, error);
+            mount_runtime.enterIdentityLost(error);
+            return false;
+        }
+        step = "owner_claim";
         const uint64_t owner_life = claimOwnerOrThrow(owner_op, pool_layout, srid, our_uuid, observe_catalog);
         if (owner_life != recorded_owner_life)
         {

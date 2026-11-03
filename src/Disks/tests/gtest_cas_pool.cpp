@@ -55,6 +55,7 @@ extern const Event CASMountExclusivityViolation;
 extern const Event CASMountLeaseLost;
 extern const Event CASMountReleaseSkippedForeignOccupant;
 extern const Event CASRemountAttempts;
+extern const Event CASIdentityLost;
 extern const Event CASRemountSucceeded;
 extern const Event CASRemountFailed;
 }
@@ -1747,6 +1748,38 @@ TEST(CASPoolRemount, ForeignOwnerIsNeverTakenOver)
     ASSERT_TRUE(occupant_after.has_value()) << "nor is it taken over at release";
     EXPECT_EQ(occupant_after->bytes, occupant_before->bytes)
         << "the slot must be left byte-for-byte as the foreign owner wrote it";
+}
+
+/// The background remount loop over a retired owner: one attempt ends in `IdentityLost`, counts one
+/// `CASIdentityLost`, and the worker exits instead of backing off and retrying.
+TEST(CASPoolRemount, RemountLoopEndsOverARetiredOwner)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto first_attempt = std::make_shared<std::promise<void>>();
+    auto attempts = std::make_shared<std::atomic<uint64_t>>(0);
+    auto store = Pool::open(backend, PoolConfig{
+        .pool_prefix = "remount-loop-retired-owner",
+        .server_root_id = "test",
+        .background_watermark = true,
+        .event_sink = [first_attempt, attempts](const CasEvent & event)
+        {
+            if (event.type == CasEventType::MountRemount && attempts->fetch_add(1) == 0)
+                first_attempt->set_value();
+        },
+    });
+    const String owner_key = store->layout().ownerKey("test");
+    const String mount_key = store->layout().mountKey("test");
+    const uint64_t identity_lost_before = ProfileEvents::global_counters[ProfileEvents::CASIdentityLost].load();
+
+    DB::Cas::tests::tombstoneOwnerForTest(*backend, owner_key);
+    fenceOutMount(*backend, mount_key);
+    ASSERT_TRUE(store->scheduleRemountForTest());
+    ASSERT_EQ(first_attempt->get_future().wait_for(std::chrono::seconds(60)), std::future_status::ready);
+    EXPECT_EQ(store->lifecycle(), PoolLifecycle::IdentityLost);
+
+    store.reset();   /// joins both workers
+    EXPECT_EQ(attempts->load(), 1u) << "the loop did not retry";
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASIdentityLost].load(), identity_lost_before + 1);
 }
 
 TEST(CASPoolRemount, ShutdownGuardRefusesToArmRemount)

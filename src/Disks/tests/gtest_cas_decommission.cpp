@@ -1871,9 +1871,9 @@ TEST_F(CASDecommission, DrainStopsWalkingAfterTheFirstRefusedDelete)
     EXPECT_TRUE(exists("p/roots/victim/c_third"));
 }
 
-/// The admin is fenced in the store AND past its local deadline: the drain stops, and the rollback goes
-/// through the control plane, which the mount fence does not gate.
-TEST_F(CASDecommission, RollbackRunsOnTheControlPlaneAfterAFence)
+/// The admin is fenced in the store AND past its local deadline after its first roots delete: the drain stops with
+/// data already gone, so the tombstone stays and the member cannot start over the hole.
+TEST_F(CASDecommission, FenceDuringTheDrainKeepsTheTombstone)
 {
     auto backend = startVictim(std::make_shared<ExpireLeaseOnFirstRootsDeleteBackend>());
     seed("p/roots/victim/a_first");
@@ -1887,8 +1887,14 @@ TEST_F(CASDecommission, RollbackRunsOnTheControlPlaneAfterAFence)
 
     ASSERT_TRUE(backend->fired());
     EXPECT_FALSE(report.member_retired);
-    expectOwner(3, false, false);   /// rolled back
+    EXPECT_TRUE(std::ranges::any_of(report.warnings, [](const String & w) { return w.contains("lost during the drain"); }))
+        << fmt::format("{}", fmt::join(report.warnings, "; "));
+    EXPECT_FALSE(exists("p/roots/victim/a_first")) << "the first delete landed";
+    expectOwner(2, true, false);   /// claim 1, tombstone 2, kept
     EXPECT_TRUE(slot().gc_fenced);
+    /// A start with a server uuid would rejoin a verified retirement; this one is not verified.
+    expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "decommission is not finished", [&]
+        { Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_id = UInt128(7), .server_root_id = "victim"}); });
 }
 
 TEST_F(CASDecommission, FenceLossOnAListPageStillRunsTheConfirm)
@@ -1901,7 +1907,51 @@ TEST_F(CASDecommission, FenceLossOnAListPageStillRunsTheConfirm)
     EXPECT_THROW(runOnClock("a1", clock), DB::Exception);
 
     ASSERT_TRUE(backend->fired());
-    expectOwner(3, false, false);   /// the exception exit confirmed and rolled back
+    expectOwner(2, true, false);   /// the exception exit confirmed and kept the tombstone: the drain had started
+}
+
+/// GC fences the admin right after it dropped a namespace, and its lease deadline passes. The run stops with that
+/// namespace gone: the tombstone stays, a restart of the member is refused, and a rerun retires it.
+TEST_F(CASDecommission, FenceAfterANamespaceDropKeepsTheTombstone)
+{
+    auto backend = startVictim(std::make_shared<InMemoryBackend>(), [](Pool & victim)
+    {
+        makeTableWithRefs(victim, "victim/db/t1", 1, 0);
+        makeTableWithRefs(victim, "victim/db/t2", 1, 0);
+    });
+    auto clock = farClock();
+    bool fenced = false;
+    std::optional<DecommissionReport> report;
+    std::optional<int> error_code;
+    try
+    {
+        report = decommissionPoolMember(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "a1"}, "victim",
+            [&](const CasEvent & e)
+            {
+                if (e.type != CasEventType::MemberDecommission || e.outcome != "namespace_removed"
+                    || std::exchange(fenced, true))
+                    return;
+                fenceSlot();
+                clock->now += 31'000;   /// past the default 30 s TTL: the admin sends nothing more
+            },
+            /*request_gc_round=*/{}, [clock] { return clock->nowFn()(); }, [clock](uint64_t ms) { clock->sleepFn()(ms); });
+    }
+    catch (const DB::Exception & e)
+    {
+        error_code = e.code();   /// the second namespace drop is refused by the fence
+    }
+
+    ASSERT_TRUE(fenced);
+    ASSERT_NE(report.has_value(), error_code.has_value()) << "the run either throws or reports";
+    if (report)
+        EXPECT_FALSE(report->member_retired);
+    expectOwner(2, true, false);
+    /// A start with a server uuid would rejoin a verified retirement; this one is not verified.
+    expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "decommission is not finished", [&]
+        { Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_id = UInt128(7), .server_root_id = "victim"}); });
+
+    const auto rerun = run("a2");
+    EXPECT_TRUE(rerun.member_retired) << fmt::format("{}", fmt::join(rerun.warnings, "; "));
 }
 
 /// Real time: the background renewer keeps the admin's lease alive across a drain longer than one TTL (1 s
@@ -1958,7 +2008,10 @@ TEST_F(CASDecommission, FencedAdminFailsInsteadOfRemounting)
     tombstoneOwner();
     fenceSlot();
     admin->tripMountLost();   /// what the renewer does when it finds its body fenced
+    DB::Cas::tests::ScopedLoggerCapture capture("CasPool", "warning");
     EXPECT_FALSE(admin->tryRemountOnce());
+    EXPECT_EQ(admin->lifecycle(), PoolLifecycle::IdentityLost);
+    EXPECT_NE(capture.captured().find("lost its admin claim and does not remount"), String::npos) << capture.captured();
     const MountLease body = slot();
     EXPECT_EQ(body.writer_epoch, admin_epoch);
     EXPECT_TRUE(body.gc_fenced);
@@ -1966,7 +2019,7 @@ TEST_F(CASDecommission, FencedAdminFailsInsteadOfRemounting)
 }
 
 /// The admin is GC-fenced during its drain; its renewer trips and its self-remount fails
-/// (owner retired). The run's exit confirms, finds the claim lost and rolls the tombstone back. Real time:
+/// (owner retired). The run's exit confirms, finds the claim lost and keeps the tombstone. Real time:
 /// TTL 1 s, renewal every 200 ms, a 400 ms delete per roots object.
 TEST_F(CASDecommission, FailedRemountStillRunsTheConfirm)
 {
@@ -1988,7 +2041,8 @@ TEST_F(CASDecommission, FailedRemountStillRunsTheConfirm)
     EXPECT_FALSE(report.member_retired);
     EXPECT_GT(ProfileEvents::global_counters[ProfileEvents::CASRemountFailed].load(), remount_failures_before)
         << "the admin's self-remount ran and failed";
-    expectOwner(3, false, false);   /// rolled back: the claim was lost
+    expectOwner(2, true, false);   /// kept: the claim was lost during the drain
+    EXPECT_FALSE(exists("p/roots/victim/a")) << "the delete that tripped the fence landed";
     EXPECT_TRUE(slot().gc_fenced);
 }
 

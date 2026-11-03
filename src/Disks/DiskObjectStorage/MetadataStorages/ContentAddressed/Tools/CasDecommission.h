@@ -46,8 +46,9 @@ bool adminClaimStillHeld(CasOperation & op, const Layout & layout, const String 
 ///    refused; an owner retired by an earlier run is accepted.
 /// 2. Tombstone the owner on the admin's fenced mount plane: the next owner life, retired, keeping an earlier
 ///    verified mark. No attempt is sent after the admin's lease deadline.
-/// 3. Confirm the claim still holds. A lost claim rolls the tombstone back unless the owner was already
-///    retired; the same confirm runs on every exit before the farewell.
+/// 3. Confirm the claim still holds. A claim lost before the drain rolls the tombstone back unless the owner was
+///    already retired; a claim lost during the drain keeps it. The same confirm runs on every failed exit before the
+///    farewell; a clean drain is checked in step 6.
 /// 4. Drain on the admin's fenced mount plane: each victim namespace through `Pool::dropNamespace`, then
 ///    eligible manifest debris, staging objects and mountpoint objects.
 /// 5. Write the admin's clean farewell.
