@@ -39,7 +39,7 @@ workflow = Workflow.Config(
             if any(t in job.name for t in ("release", "binary"))
         ],
     ],
-    additional_jobs=["GrypeScan", "SignRelease", "CIReport", "SourceUpload"],
+    additional_jobs=["GrypeScan", "SignRelease", "CIReport"],
     artifacts=[
         *ArtifactConfigs.clickhouse_binaries,
         *ArtifactConfigs.clickhouse_stripped_binaries,
