@@ -1,0 +1,7 @@
+replicated_insert	build_publish	1
+replicated_insert	manifest_put	1
+replicated_insert	ref_move	1
+fetch	build_publish	1
+fetch	manifest_put	1
+fetch	ref_move	1
+replicated_merge	1	0	3

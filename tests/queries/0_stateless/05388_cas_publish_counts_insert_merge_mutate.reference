@@ -1,0 +1,12 @@
+insert	1	1
+optimize	1	1
+mutate	1	1
+untouched_mutate	1	1
+gc_drained 1
+fsck_dangling 0
+fsck_unreachable 0
+fsck_unaccounted 0
+fsck_stale_edge 0
+fsck_corrupted_runs 0
+fsck_chain_broken 0
+fsck_lifeless_keys 0

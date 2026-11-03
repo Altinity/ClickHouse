@@ -81,6 +81,7 @@ public:
 
     void beginTransaction() override;
     void commitTransaction() override;
+    void checkpointTransaction() override;
 
     void setPreferredFileOrder(const Strings & file_names) override { preferred_file_order = file_names; }
 
@@ -130,6 +131,17 @@ private:
 
     String getRelativeDataPath() const;
     bool isWrittenSeparately(const String & file_name) const;
+    std::unique_ptr<ReadBufferFromFileBase> readArchive(
+        const String & archive_path,
+        const ReadSettings & settings,
+        std::optional<size_t> read_hint) const;
+    std::unique_ptr<ReadBufferFromFileBase> readArchive(
+        const ReadSettings & settings,
+        std::optional<size_t> read_hint) const;
+    std::unique_ptr<ReadBufferFromFileBase> readArchiveFile(
+        const String & file_name,
+        const ReadSettings & settings,
+        std::optional<size_t> read_hint) const;
 
     /// True if any of the given files lives inside data.packed (rather than being written separately),
     /// which forces the whole archive to be copied rather than hardlinked during a clone/freeze.

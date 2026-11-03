@@ -27,6 +27,8 @@ namespace ErrorCodes
     extern const int NOT_IMPLEMENTED;
 }
 
+struct IDiskTransaction;
+
 /// Tries to provide some "transactions" interface, which allow
 /// to execute (commit) operations simultaneously. We don't provide
 /// any snapshot isolation here, so no read operations in transactions
@@ -115,6 +117,16 @@ public:
         throwNotImplemented();
     }
 
+    /// Optional per-metadata write buffer. Returns a ready-to-use buffer when the
+    /// metadata implementation owns its write mechanism (e.g. a content-addressed hash-on-write buffer
+    /// whose blob key is known only after the last byte). `owner` is the disk transaction that must be
+    /// kept alive for the returned buffer's lifetime and, when `autocommit`, committed from the finalize
+    /// callback. Default nullptr: the caller uses the generic streaming write path unchanged.
+    virtual std::unique_ptr<WriteBufferFromFileBase> tryCreateWriteBuffer(
+        const std::shared_ptr<IDiskTransaction> & /*owner*/,
+        const std::string & /*path*/, size_t /*buf_size*/, WriteMode /*mode*/,
+        const WriteSettings & /*settings*/, bool /*autocommit*/) { return nullptr; }
+
     /// Metadata related methods
 
     /// Generate blob name for passed absolute local path.
@@ -158,6 +170,28 @@ public:
     {
         throwNotImplemented();
     }
+
+    /// In-flight read-your-writes for a part being assembled by THIS transaction. A CA part-build
+    /// transaction stages blobs (uploaded) + mutable bytes before the single commit; these let a reader
+    /// that holds the transaction resolve those staged files before they are committed. Default: no
+    /// in-flight visibility (the committed metadata path is authoritative).
+    /// Contract: the answers are additive only. A positive answer describes a file this transaction
+    /// staged; an empty answer means "not staged here, fall through to committed metadata" and never
+    /// "absent" (no tombstones: a staged removal is invisible to readers). For a staged file the size
+    /// from `tryGetInFlightFileSize` equals the bytes `tryReadFileInFlight` serves. Independent of
+    /// `IMetadataStorage::appliesOperationsEagerly`: an eager storage may offer no in-flight view.
+    virtual std::optional<StoredObjects> tryGetInFlightStorageObjects(const std::string & /*path*/) const { return {}; }
+    virtual std::unique_ptr<ReadBufferFromFileBase> tryReadFileInFlight(
+        const std::string & /*path*/, const ReadSettings & /*settings*/, std::optional<size_t> /*read_hint*/) const { return nullptr; }
+    virtual std::optional<uint64_t> tryGetInFlightFileSize(const std::string & /*path*/) const { return {}; }
+    /// Directory-granularity counterpart of the file trio: true when this transaction has STAGED at least
+    /// one file under an INNER directory `path` of a part (a projection dir). The part directory itself
+    /// answers false (see `ContentAddressedTransaction::hasInFlightDirectory`). Used so a carried-forward
+    /// projection dir is visible to loadProjections during finalize. Default: no in-flight directory visibility.
+    virtual bool hasInFlightDirectory(const std::string & /*path*/) const { return false; }
+    /// Immediate-child names staged directly under `path` (one level). Used so loadProjections'
+    /// withPartFormatFromDisk can iterate a staged projection dir to find its mark file. Default: empty.
+    virtual std::vector<std::string> listInFlightDirectory(const std::string & /*path*/) const { return {}; }
 
     virtual ~IMetadataTransaction() = default;
 
@@ -297,6 +331,12 @@ public:
     virtual bool isReadOnly() const = 0;
 
     /// True if transactions apply operations immediately instead of accumulating them until commit.
+    /// Contract: an operation `DiskObjectStorageTransaction` submits through `addOperation` runs against
+    /// the metadata transaction at call time and never enters `operations_to_execute`; a non-empty queue
+    /// at commit is a `LOGICAL_ERROR`. Nothing more is implied — not external visibility (memory mutates
+    /// shared state at once, content-addressed storage stages privately until commit), not atomicity or
+    /// rollback, not the in-flight read API of `IMetadataTransaction`. A `writeFile` may still submit its
+    /// metadata effect only when the buffer is finalized.
     virtual bool appliesOperationsEagerly() const
     {
         return false;
@@ -322,6 +362,18 @@ public:
     {
         return false;
     }
+
+    /// Returns true if the metadata storage is content-addressed, i.e. blob keys are derived
+    /// from content hashes and are only known after all bytes have been written. Such a storage
+    /// cannot use the up-front-key streaming write path of `DiskObjectStorageTransaction`; the
+    /// disk transaction delegates writes to the metadata transaction's content-addressed buffer.
+    virtual bool isContentAddressed() const { return false; }
+
+    virtual bool allowsPackedParts() const { return true; }
+
+    /// True when a file write through this metadata storage publishes atomically, i.e. no partial
+    /// content is ever observable under the file's final name (see `IDataPartStorage::supportsAtomicFileWrites`).
+    virtual bool supportsAtomicFileWrites() const { return false; }
 
     using BlobsToRemove = std::unordered_map<StoredObject, LocationSet>;
     virtual BlobsToRemove getBlobsToRemove(const ClusterConfigurationPtr & /*cluster*/, int64_t /*max_count*/) { return {}; }
@@ -360,6 +412,12 @@ public:
 
     /// True if write with Append mode supported.
     virtual bool supportWritingWithAppend() const { return false; }
+
+    /// True iff this metadata storage can persist the per-part mutable transaction file (txn_version.txt)
+    /// under MVCC. Distinct from supportWritingWithAppend: transactions rewrite txn_version.txt (tmp +
+    /// replaceFile), they never WriteMode::Append, so append-capability is the wrong proxy. A
+    /// content-addressed disk supports the mutable txn file via its per-ref sidecar.
+    virtual bool supportsTransactionalMutableFiles() const { return false; }
 
 protected:
     [[noreturn]] static void throwNotImplemented()

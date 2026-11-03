@@ -1,0 +1,4 @@
+packed_before_merge	2	Wide	Packed	2
+merge_algorithm	Vertical
+rows_after_merge	2	3	30
+storage_after_merge	1	Full	1

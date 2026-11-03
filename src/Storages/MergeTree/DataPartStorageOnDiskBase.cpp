@@ -2,7 +2,9 @@
 #include <Backups/BackupEntryFromImmutableFile.h>
 #include <Backups/BackupEntryWrappedWith.h>
 #include <Backups/BackupSettings.h>
+#include <Core/Defines.h>
 #include <Disks/IDiskTransaction.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
 #include <Disks/SingleDiskVolume.h>
 #include <Common/Jemalloc.h>
 #include <Common/JemallocMergeTreeArena.h>
@@ -16,6 +18,7 @@
 #include <IO/ReadPipeline.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteBufferFromFileBase.h>
+#include <IO/WriteHelpers.h>
 #include <IO/copyData.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/MergeTreeTransaction/VersionMetadataOnDisk.h>
@@ -30,6 +33,9 @@
 
 #include <fmt/ranges.h>
 
+#include <set>
+#include <vector>
+
 namespace DB
 {
 
@@ -40,10 +46,55 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
     extern const int FILE_DOESNT_EXIST;
     extern const int CORRUPTED_DATA;
+    extern const int SUPPORT_IS_DISABLED;
 }
 
 namespace
 {
+class DataPartStorageIteratorOnDisk final : public IDataPartStorageIterator
+{
+public:
+    DataPartStorageIteratorOnDisk(DiskPtr disk_, DirectoryIteratorPtr it_)
+        : disk(std::move(disk_)), it(std::move(it_))
+    {
+    }
+
+    void next() override { it->next(); }
+    bool isValid() const override { return it->isValid(); }
+    bool isFile() const override { return isValid() && disk->existsFile(it->path()); }
+    std::string name() const override { return it->name(); }
+    std::string path() const override { return it->path(); }
+
+private:
+    DiskPtr disk;
+    DirectoryIteratorPtr it;
+};
+
+/// Iterates names prepared by `iterateDirectoryInTransactionOrDisk`: the union of committed and staged
+/// immediate children. `isFile` checks only the disk, so it returns false for a staged-only file.
+/// `MergeTreeIndexGranularityInfo::getMarksTypeFromFilesystem` uses this view to detect a mark file by
+/// its extension while the parent part is still staged.
+class DataPartStorageMergedIterator final : public IDataPartStorageIterator
+{
+public:
+    DataPartStorageMergedIterator(DiskPtr disk_, std::string dir_path_, std::vector<std::string> names_)
+        : disk(std::move(disk_)), dir_path(std::move(dir_path_)), names(std::move(names_))
+    {
+    }
+
+    void next() override { ++pos; }
+    bool isValid() const override { return pos < names.size(); }
+    std::string name() const override { return names[pos]; }
+    std::string path() const override { return fs::path(dir_path) / names[pos]; }
+    bool isFile() const override { return isValid() && disk->existsFile(path()); }
+
+private:
+    DiskPtr disk;
+    std::string dir_path;
+    std::vector<std::string> names;
+    size_t pos = 0;
+};
+
     /// fsync `dir_path` and every subdirectory below it (children first), so that the directory
     /// entries created by a freeze/hardlink clone become durable. Used only for local disks
     /// (on remote/object disks getDirectorySyncGuard() returns nullptr and this is a no-op).
@@ -305,6 +356,16 @@ bool DataPartStorageOnDiskBase::isStoredOnRemoteDisk() const
     return volume->getDisk()->isRemote();
 }
 
+bool DataPartStorageOnDiskBase::isContentAddressed() const
+{
+    return volume->getDisk()->isContentAddressed();
+}
+
+bool DataPartStorageOnDiskBase::supportsAtomicFileWrites() const
+{
+    return volume->getDisk()->supportsAtomicFileWrites();
+}
+
 std::optional<String> DataPartStorageOnDiskBase::getCacheName() const
 {
     if (volume->getDisk()->supportsCache())
@@ -436,6 +497,18 @@ void DataPartStorageOnDiskBase::backup(
 
     auto disk = volume->getDisk();
 
+    /// The temporary-hard-link BACKUP path (used for Ordinary, non-UUID databases) calls
+    /// disk->createHardLink with a non-part-shaped temp path, which on a CAS disk
+    /// would otherwise surface as a raw LOGICAL_ERROR. Fail closed with a clear message instead.
+    /// The pointer-holding path (make_temporary_hard_links=false, used by Atomic/UUID databases)
+    /// uses getStorageObjects and round-trips on a CAS disk, so it is left untouched.
+    if (make_temporary_hard_links && disk->isContentAddressed())
+        throw Exception(
+            ErrorCodes::SUPPORT_IS_DISABLED,
+            "BACKUP via temporary hard links is not supported on a CAS disk yet; "
+            "use an Atomic database (which backs up via pointer-holding) instead; disk '{}'",
+            disk->getName());
+
     fs::path temp_part_dir;
     std::shared_ptr<TemporaryFileOnDisk> temp_dir_owner;
     if (make_temporary_hard_links)
@@ -541,8 +614,16 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freeze(
     const ClonePartParams & params) const
 {
     auto disk = volume->getDisk();
-    if (params.external_transaction)
-        params.external_transaction->createDirectories(to);
+
+    /// A content-addressed disk publishes a part as one unit, so a clone without an enclosing transaction
+    /// runs through one self-created transaction instead of per-file autocommits.
+    DiskTransactionPtr owned_transaction;
+    if (!params.external_transaction && disk->isContentAddressed())
+        owned_transaction = disk->createTransaction();
+    const DiskTransactionPtr & clone_transaction = params.external_transaction ? params.external_transaction : owned_transaction;
+
+    if (clone_transaction)
+        clone_transaction->createDirectories(to);
     else
         disk->createDirectories(to);
 
@@ -557,7 +638,7 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freeze(
         /* max_level= */ {},
         params.copy_instead_of_hardlink,
         params.files_to_copy_instead_of_hardlinks,
-        params.external_transaction);
+        clone_transaction);
 
     if (save_metadata_callback)
         save_metadata_callback(disk);
@@ -567,14 +648,28 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freeze(
     /// and get discarded as `Outdated`. Remove the temporary file before the main file so the cleanup
     /// is fail-closed: a failure between the two removals leaves a valid `txn_version.txt` rather than
     /// the dangerous tmp-only state.
-    if (params.external_transaction)
+    if (clone_transaction)
     {
-        params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / "delete-on-destroy.txt");
-        params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TMP_TXN_VERSION_METADATA_FILE_NAME);
-        params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TXN_VERSION_METADATA_FILE_NAME);
+        clone_transaction->removeFileIfExists(fs::path(to) / dir_path / "delete-on-destroy.txt");
+        clone_transaction->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TMP_TXN_VERSION_METADATA_FILE_NAME);
+        clone_transaction->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TXN_VERSION_METADATA_FILE_NAME);
         if (!params.keep_metadata_version)
-            params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / IMergeTreeDataPart::METADATA_VERSION_FILE_NAME);
-        IMergeTreeDataPart::writeInvalidatedSystemColumnsFile(*params.external_transaction, fs::path(to) / dir_path, params.invalidated_columns_to_write, write_settings);
+            clone_transaction->removeFileIfExists(fs::path(to) / dir_path / IMergeTreeDataPart::METADATA_VERSION_FILE_NAME);
+        IMergeTreeDataPart::writeInvalidatedSystemColumnsFile(*clone_transaction, fs::path(to) / dir_path, params.invalidated_columns_to_write, write_settings);
+
+        /// Write `metadata_version.txt` inside the clone transaction so it is part of the single whole-part
+        /// commit; `cloneAndLoadDataPart`'s own later write lands as a byte-equal no-op.
+        if (params.metadata_version_to_write.has_value())
+        {
+            chassert(!params.keep_metadata_version);
+            auto out_metadata = clone_transaction->writeFile(
+                fs::path(to) / dir_path / IMergeTreeDataPart::METADATA_VERSION_FILE_NAME,
+                4096,
+                WriteMode::Rewrite,
+                write_settings);
+            writeText(*params.metadata_version_to_write, *out_metadata);
+            out_metadata->finalize();
+        }
     }
     else
     {
@@ -593,6 +688,12 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freeze(
     if (params.fsync_part_directory && !params.external_transaction && !disk->isRemote())
         fsyncFrozenCloneTree(*disk, fs::path(to) / dir_path);
 
+    /// Commit the self-created transaction (the whole-part clone commit point for CA). An external
+    /// transaction is committed by its owner, as before. Before the arena scope below, so the commit's
+    /// own allocations are not attributed to the MergeTree arena.
+    if (owned_transaction)
+        owned_transaction->commit();
+
     /// The SingleDiskVolume and the DataPartStorageOnDiskFull built by `create` are stored on the
     /// frozen part for its whole lifetime; route them into the dedicated MergeTree arena, like the
     /// builder-owned storage path.
@@ -606,6 +707,52 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freeze(
     return frozen_storage;
 }
 
+namespace
+{
+
+/// Recursively copy every file under `source_path` on `src_disk` into `destination_path` through
+/// `dst_transaction`'s NON-autocommit `writeFile` (IDiskTransaction::writeFile, NOT
+/// writeFileWithAutoCommit) -- the same primitive `freeze` already uses for a single file (the
+/// metadata_version.txt write, DataPartStorageOnDiskBase::freeze). Cross-disk, so it cannot reuse
+/// Backup()/BackupImpl: that helper's transactional branch calls transaction->copyFile, which is
+/// SAME-disk only (DiskObjectStorageTransaction::copyFile throws NOT_IMPLEMENTED across disks on
+/// CA), and its non-transactional branch always autocommits per file via IDisk::copyFile /
+/// copyDirectoryContent. Sequential, not the parallel copyThroughBuffers thread pool: a
+/// content-addressed transaction batches every file into ONE eventual manifest, and its staging
+/// map is not mutex-guarded. Its callers are a background move and a user-issued cross-disk attach,
+/// so parallelizing this remains a deferred optimization whose cost is now visible to a waiting
+/// statement rather than only to a background operation.
+void copyDirectoryContentIntoTransaction(
+    IDisk & src_disk,
+    const String & source_path,
+    IDiskTransaction & dst_transaction,
+    const String & destination_path,
+    const ReadSettings & read_settings,
+    const WriteSettings & write_settings,
+    const std::function<void()> & cancellation_hook)
+{
+    dst_transaction.createDirectories(destination_path);
+    for (auto it = src_disk.iterateDirectory(source_path); it->isValid(); it->next())
+    {
+        auto source = it->path();
+        auto destination = fs::path(destination_path) / it->name();
+
+        if (src_disk.existsDirectory(source))
+        {
+            copyDirectoryContentIntoTransaction(
+                src_disk, source, dst_transaction, destination, read_settings, write_settings, cancellation_hook);
+            continue;
+        }
+
+        auto in = src_disk.readFile(source, read_settings);
+        auto out = dst_transaction.writeFile(destination, DBMS_DEFAULT_BUFFER_SIZE, WriteMode::Rewrite, write_settings);
+        copyData(*in, *out, cancellation_hook);
+        out->finalize();
+    }
+}
+
+}
+
 MutableDataPartStoragePtr DataPartStorageOnDiskBase::freezeRemote(
     const std::string & to,
     const std::string & dir_path,
@@ -616,25 +763,55 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freezeRemote(
     const ClonePartParams & params) const
 {
     auto src_disk = volume->getDisk();
-    if (params.external_transaction)
-        params.external_transaction->createDirectories(to);
-    else
-        dst_disk->createDirectories(to);
 
-    /// freezeRemote() using copy instead of hardlinks for all files
-    /// In this case, files_to_copy_intead_of_hardlinks is set by empty
-    Backup(
-        src_disk,
-        dst_disk,
-        getRelativePath(),
-        fs::path(to) / dir_path,
-        read_settings,
-        write_settings,
-        params.make_source_readonly,
-        /* max_level= */ {},
-        true,
-        /* files_to_copy_intead_of_hardlinks= */ {},
-        params.external_transaction);
+    /// A content-addressed destination models a part as ONE atomic unit: N files become one manifest
+    /// and one ref. The generic path below fans the files onto a thread pool, and each becomes an
+    /// independent autocommit transaction against that same ref -- two of them resolve it as absent,
+    /// both publish a one-file manifest, and the loser is refused. So when the caller supplied no
+    /// transaction of its own, run the whole clone through ONE self-created transaction, the same
+    /// shape `freeze` uses. `Backup` cannot serve this path: its transactional branch calls
+    /// `copyFile` on the transaction, which is same-disk only and refuses a cross-disk
+    /// content-addressed copy.
+    DiskTransactionPtr owned_transaction;
+    if (!params.external_transaction && dst_disk->isContentAddressed())
+        owned_transaction = dst_disk->createTransaction();
+
+    if (owned_transaction)
+    {
+        try
+        {
+            copyDirectoryContentIntoTransaction(
+                *src_disk, getRelativePath(), *owned_transaction, fs::path(to) / dir_path,
+                read_settings, write_settings, /* cancellation_hook= */ {});
+        }
+        catch (...)
+        {
+            owned_transaction->undo();
+            throw;
+        }
+    }
+    else
+    {
+        if (params.external_transaction)
+            params.external_transaction->createDirectories(to);
+        else
+            dst_disk->createDirectories(to);
+
+        /// `freezeRemote` using copy instead of hardlinks for all files
+        /// In this case, files_to_copy_intead_of_hardlinks is set by empty
+        Backup(
+            src_disk,
+            dst_disk,
+            getRelativePath(),
+            fs::path(to) / dir_path,
+            read_settings,
+            write_settings,
+            params.make_source_readonly,
+            /* max_level= */ {},
+            true,
+            /* files_to_copy_intead_of_hardlinks= */ {},
+            params.external_transaction);
+    }
 
     /// The save_metadata_callback function acts on the target dist.
     if (save_metadata_callback)
@@ -645,14 +822,28 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freezeRemote(
     /// and get discarded as `Outdated`. Remove the temporary file before the main file so the cleanup
     /// is fail-closed: a failure between the two removals leaves a valid `txn_version.txt` rather than
     /// the dangerous tmp-only state.
-    if (params.external_transaction)
+    /// These removals belong to the clone. On the content-addressed arm they MUST go through the same
+    /// transaction: sent straight to the disk they would autocommit, which is exactly the
+    /// one-publish-per-file behaviour the single transaction above exists to prevent.
+    if (const DiskTransactionPtr & clone_transaction = owned_transaction ? owned_transaction : params.external_transaction)
     {
-        params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / "delete-on-destroy.txt");
-        params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TMP_TXN_VERSION_METADATA_FILE_NAME);
-        params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TXN_VERSION_METADATA_FILE_NAME);
-        if (!params.keep_metadata_version)
-            params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / IMergeTreeDataPart::METADATA_VERSION_FILE_NAME);
-        IMergeTreeDataPart::writeInvalidatedSystemColumnsFile(*params.external_transaction, fs::path(to) / dir_path, params.invalidated_columns_to_write, write_settings);
+        try
+        {
+            clone_transaction->removeFileIfExists(fs::path(to) / dir_path / "delete-on-destroy.txt");
+            clone_transaction->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TMP_TXN_VERSION_METADATA_FILE_NAME);
+            clone_transaction->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TXN_VERSION_METADATA_FILE_NAME);
+            if (!params.keep_metadata_version)
+                clone_transaction->removeFileIfExists(fs::path(to) / dir_path / IMergeTreeDataPart::METADATA_VERSION_FILE_NAME);
+            IMergeTreeDataPart::writeInvalidatedSystemColumnsFile(*clone_transaction, fs::path(to) / dir_path, params.invalidated_columns_to_write, write_settings);
+            if (owned_transaction)
+                owned_transaction->commit();
+        }
+        catch (...)
+        {
+            if (owned_transaction)
+                owned_transaction->undo();
+            throw;
+        }
     }
     else
     {
@@ -695,18 +886,46 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::clonePart(
                         dir_path, getRelativePath(), path_to_clone, fullPath(dst_disk, path_to_clone));
     }
 
-    try
+    if (dst_disk->isContentAddressed())
     {
-        dst_disk->createDirectories(to);
-        src_disk->copyDirectoryContent(getRelativePath(), dst_disk, path_to_clone, read_settings, write_settings, cancellation_hook);
+        /// L2 (MOVE-to-CA fix): a content-addressed disk models a part as ONE atomic unit (N
+        /// files -> one manifest -> one ref). The generic per-file autocommit path below would
+        /// publish a separate one-file ref per file -- colliding on the shared "moving" ref
+        /// before L1, and throwing NOT_IMPLEMENTED on a non-first content file even after L1
+        /// ("Autocommit writes are not supported for content part files"). Run the whole clone
+        /// through ONE self-created disk transaction instead, mirroring freeze's
+        /// owned_transaction shape -- but streaming cross-disk bytes, since freeze's Backup() is
+        /// same-disk hardlink/copyFile (throws NOT_IMPLEMENTED for CA cross-disk).
+        auto clone_transaction = dst_disk->createTransaction();
+        try
+        {
+            copyDirectoryContentIntoTransaction(
+                *src_disk, getRelativePath(), *clone_transaction, path_to_clone,
+                read_settings, write_settings, cancellation_hook);
+            clone_transaction->commit();
+        }
+        catch (...)
+        {
+            LOG_WARNING(log, "Rolling back transaction after failed attempt to move a data part to {}", path_to_clone);
+            clone_transaction->undo();
+            throw;
+        }
     }
-    catch (...)
+    else
     {
-        /// It's safe to remove it recursively (even with zero-copy-replication)
-        /// because we've just did full copy through copyDirectoryContent
-        LOG_WARNING(log, "Removing directory {} after failed attempt to move a data part", path_to_clone);
-        dst_disk->removeRecursive(path_to_clone);
-        throw;
+        try
+        {
+            dst_disk->createDirectories(to);
+            src_disk->copyDirectoryContent(getRelativePath(), dst_disk, path_to_clone, read_settings, write_settings, cancellation_hook);
+        }
+        catch (...)
+        {
+            /// It's safe to remove it recursively (even with zero-copy-replication)
+            /// because we've just did full copy through copyDirectoryContent
+            LOG_WARNING(log, "Removing directory {} after failed attempt to move a data part", path_to_clone);
+            dst_disk->removeRecursive(path_to_clone);
+            throw;
+        }
     }
 
     /// The SingleDiskVolume and the DataPartStorageOnDiskFull built by `create` are stored on the
@@ -821,6 +1040,17 @@ void DataPartStorageOnDiskBase::remove(
     bool has_delete_prefix = part_dir_without_slash.filename().string().starts_with("delete_tmp_");
     std::optional<CanRemoveDescription> can_remove_description;
     auto disk = volume->getDisk();
+
+    /// On a content-addressed disk a part is one ref, and dropping it is one atomic ref-log record.
+    /// The `delete_tmp_` rename and the unlink batch below would each publish a new manifest first:
+    /// two manifest writes and five extra ref-log records per removed part, more with projections.
+    if (disk->isContentAddressed() && getParentDirectory() != MergeTreeData::DETACHED_DIR_NAME)
+    {
+        auto description = can_remove_callback();
+        disk->removeSharedRecursive(fs::path(from) / "", !description.can_remove_anything, description.files_not_to_remove);
+        return;
+    }
+
     fs::path to = fs::path(root_path) / part_dir_without_slash;
 
     if (!has_delete_prefix)
@@ -1130,6 +1360,118 @@ bool DataPartStorageOnDiskBase::hasActiveTransaction() const
 bool DataPartStorageOnDiskBase::isCaseInsensitive() const
 {
     return getDisk()->isCaseInsensitive();
+}
+
+bool DataPartStorageOnDiskBase::existsFileInTransactionOrDisk(const std::string & path) const
+{
+    if (transaction && transaction->tryGetInFlightFileSize(path).has_value())
+        return true;
+    return volume->getDisk()->existsFile(path);
+}
+
+bool DataPartStorageOnDiskBase::existsDirectoryInTransactionOrDisk(const std::string & path) const
+{
+    if (transaction && transaction->hasInFlightDirectory(path))
+        return true;
+    return volume->getDisk()->existsDirectory(path);
+}
+
+DataPartStorageIteratorPtr DataPartStorageOnDiskBase::iterateDirectoryInTransactionOrDisk(const std::string & path) const
+{
+    if (transaction)
+    {
+        if (auto staged = transaction->listInFlightDirectory(path); !staged.empty())
+        {
+            std::set<std::string> names(staged.begin(), staged.end());
+            if (volume->getDisk()->existsDirectory(path))
+                for (auto it = volume->getDisk()->iterateDirectory(path); it->isValid(); it->next())
+                    names.insert(it->name());
+            return std::make_unique<DataPartStorageMergedIterator>(
+                volume->getDisk(), path, std::vector<std::string>(names.begin(), names.end()));
+        }
+    }
+
+    return std::make_unique<DataPartStorageIteratorOnDisk>(
+        volume->getDisk(),
+        volume->getDisk()->iterateDirectory(path));
+}
+
+size_t DataPartStorageOnDiskBase::getFileSizeInTransactionOrDisk(const std::string & path) const
+{
+    if (transaction)
+        if (auto size = transaction->tryGetInFlightFileSize(path))
+            return *size;
+    return volume->getDisk()->getFileSize(path);
+}
+
+StoredObjects DataPartStorageOnDiskBase::getStorageObjectsInTransactionOrDisk(const std::string & path) const
+{
+    if (transaction)
+    {
+        if (auto inflight = transaction->tryGetInFlightStorageObjects(path))
+            return std::move(*inflight);
+        /// An in-flight file can exist before it has storage objects, for example while an upload is pending.
+        /// Do not expose a committed object at the same path in that case.
+        if (transaction->tryGetInFlightFileSize(path))
+            return {};
+    }
+    return volume->getDisk()->getStorageObjects(path);
+}
+
+void DataPartStorageOnDiskBase::prepareReadInTransactionOrDisk(
+    const std::string & path,
+    const ReadSettings & settings,
+    std::optional<size_t> read_hint,
+    ReadPipeline & pipeline) const
+{
+    if (transaction)
+    {
+        StoredObjects inflight_objects;
+        if (auto objects = transaction->tryGetInFlightStorageObjects(path))
+            inflight_objects = std::move(*objects);
+        else if (auto size = transaction->tryGetInFlightFileSize(path))
+            /// `ReadPipeline::build` treats an empty object list as an empty file and does not invoke
+            /// the source. This placeholder makes it invoke the source, which ignores the object and
+            /// reads the staged bytes through the transaction.
+            inflight_objects = StoredObjects{StoredObject(path, path, *size)};
+
+        if (!inflight_objects.empty())
+        {
+            /// Keep the transaction alive for as long as the pipeline can invoke the custom source.
+            auto current_transaction = transaction;
+            pipeline.setSource(
+                [current_transaction, path](const StoredObject &, const ReadSettings & read_settings, bool, bool)
+                {
+                    auto buffer = current_transaction->tryReadFileInFlight(path, read_settings, std::nullopt);
+                    if (!buffer)
+                        throw Exception(ErrorCodes::LOGICAL_ERROR, "In-flight file {} cannot be read", path);
+                    return buffer;
+                },
+                std::move(inflight_objects),
+                settings);
+            return;
+        }
+    }
+
+    volume->getDisk()->prepareRead(path, settings, read_hint, pipeline);
+}
+
+std::unique_ptr<ReadBufferFromFileBase> DataPartStorageOnDiskBase::readFileIfExistsInTransactionOrDisk(
+    const std::string & path,
+    const ReadSettings & settings,
+    std::optional<size_t> read_hint) const
+{
+    if (transaction)
+    {
+        auto in_flight_size = transaction->tryGetInFlightFileSize(path);
+        if (auto buffer = transaction->tryReadFileInFlight(path, settings, read_hint))
+            return buffer;
+        /// If the transaction knows this file but cannot read it, this is a logical error.
+        /// Do not fall back to a committed file at the same path.
+        if (in_flight_size)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "In-flight file {} cannot be read", path);
+    }
+    return volume->getDisk()->readFileIfExists(path, settings, read_hint);
 }
 
 std::shared_ptr<const PackedFilesReader> DataPartStorageOnDiskBase::getArchiveReaderForFile(const std::string & name) const

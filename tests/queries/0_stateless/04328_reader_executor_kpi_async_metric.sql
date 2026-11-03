@@ -1,7 +1,9 @@
--- Tags: no-distributed-cache, no-encrypted-storage, no-parallel-replicas
+-- Tags: no-distributed-cache, no-encrypted-storage, no-parallel-replicas, no-cas-storage
 -- The executor falls back on the distributed cache and decryption (which can't be
 -- disabled from the test), so its metrics would not be emitted there; skip those
--- configs (as in 04316 / 04327).
+-- configs (as in 04316 / 04327). Content-addressed storage always adds a
+-- `file_view` stage (byte window inside a shared blob), which the executor
+-- falls back on the same way -- see `ReadPipeline::tryBuildReaderExecutor`.
 --   no-parallel-replicas: the counters are incremented on whichever replica reads the
 --   mark, so the initiator's `query_log` row does not carry them.
 --

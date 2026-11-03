@@ -45,6 +45,7 @@ public:
 
     void beginTransaction() override;
     void commitTransaction() override;
+    void checkpointTransaction() override;
     void precommitTransaction() override {}
     bool hasActiveTransaction() const override { return transaction != nullptr; }
 #if CLICKHOUSE_CLOUD
