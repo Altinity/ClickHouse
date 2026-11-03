@@ -120,6 +120,44 @@ namespace
             RE2::Replace(&result, re, replacement);
         return result;
     }
+
+    /// Parse a list of <map><from>X</from><to>Y</to></map> children of `section`, keeping config order.
+    std::vector<std::pair<String, String>> parseGroupMapping(
+        const Poco::Util::AbstractConfiguration & config, const String & prefix_str, const String & section)
+    {
+        std::vector<std::pair<String, String>> result;
+        if (!config.has(prefix_str + section))
+            return result;
+
+        Poco::Util::AbstractConfiguration::Keys map_keys;
+        config.keys(prefix_str + section, map_keys);
+
+        for (const auto & key : map_keys)
+        {
+            const String entry_prefix = prefix_str + section + "." + key;
+            if (!config.has(entry_prefix + ".from") || !config.has(entry_prefix + ".to"))
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                                "{} entry '{}' must contain both 'from' and 'to' subelements", section, key);
+
+            const String from = config.getString(entry_prefix + ".from");
+            const String to = config.getString(entry_prefix + ".to");
+
+            if (from.empty())
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "{} entry '{}': 'from' must not be empty", section, key);
+            if (to.empty())
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "{} entry '{}': 'to' must not be empty", section, key);
+
+            const auto it = std::find_if(result.begin(), result.end(), [&](const auto & entry) { return entry.first == from; });
+            if (it != result.end())
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                                "{} has duplicate 'from' value '{}' (already mapped to '{}', cannot remap to '{}')",
+                                section, from, it->second, to);
+
+            result.emplace_back(from, to);
+        }
+
+        return result;
+    }
 }
 
 TokenAccessStorage::TokenAccessStorage(const String & storage_name_, AccessControl & access_control_, const Poco::Util::AbstractConfiguration & config_, const String & prefix_)
@@ -184,33 +222,11 @@ TokenAccessStorage::TokenAccessStorage(const String & storage_name_, AccessContr
     /// children. The mapping rewrites incoming group names BEFORE `roles_filter` / `roles_transform`,
     /// so each subsequent stage operates on the mapped value. Groups not listed here pass through
     /// to filter/transform unchanged.
-    if (config.has(prefix_str + "roles_mapping"))
-    {
-        Poco::Util::AbstractConfiguration::Keys map_keys;
-        config.keys(prefix_str + "roles_mapping", map_keys);
+    for (auto & [from, to] : parseGroupMapping(config, prefix_str, "roles_mapping"))
+        roles_mapping.emplace(std::move(from), std::move(to));
 
-        for (const auto & key : map_keys)
-        {
-            const String entry_prefix = prefix_str + "roles_mapping." + key;
-            if (!config.has(entry_prefix + ".from") || !config.has(entry_prefix + ".to"))
-                throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                                "roles_mapping entry '{}' must contain both 'from' and 'to' subelements", key);
-
-            const String from = config.getString(entry_prefix + ".from");
-            const String to = config.getString(entry_prefix + ".to");
-
-            if (from.empty())
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "roles_mapping entry '{}': 'from' must not be empty", key);
-            if (to.empty())
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "roles_mapping entry '{}': 'to' must not be empty", key);
-
-            auto [it, inserted] = roles_mapping.emplace(from, to);
-            if (!inserted)
-                throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                                "roles_mapping has duplicate 'from' value '{}' (already mapped to '{}', cannot remap to '{}')",
-                                from, it->second, to);
-        }
-    }
+    /// `profiles_mapping` matches the raw incoming group, independently of the roles pipeline.
+    profiles_mapping = parseGroupMapping(config, prefix_str, "profiles_mapping");
 
     provider_name = config.getString(prefix_str + "processor");
     if (provider_name.empty())
@@ -529,40 +545,38 @@ void TokenAccessStorage::assignRolesNoLock(User & user, const std::set<String> &
     user_external_roles[user_name] = external_roles;
 }
 
-void TokenAccessStorage::assignProfileNoLock(User & user) const
+void TokenAccessStorage::assignProfilesNoLock(User & user, const std::set<String> & groups) const
 {
-    if (default_profile_name.empty())
-        return;
-
     const auto & user_name = user.getName();
-    auto & settings = user.settings;
 
-    // Look up the profile ID once
-    const auto profile_id = access_control.find<SettingsProfile>(default_profile_name);
-    if (!profile_id)
+    std::vector<String> profile_names;
+    if (!default_profile_name.empty())
+        profile_names.push_back(default_profile_name);
+    for (const auto & [group, profile_name] : profiles_mapping)
     {
-        LOG_TRACE(getLogger(), "Did not assign profile '{}' to user '{}': profile not found", default_profile_name, user_name);
-        return;
+        if (groups.contains(group))
+            profile_names.push_back(profile_name);
     }
 
-    // Check if profile is already assigned
-    bool profile_already_assigned = false;
-    for (const auto & element : settings)
+    /// The user's settings consist only of the profiles assigned here, so they are rebuilt from scratch:
+    /// a profile of a group the user is no longer in is removed.
+    SettingsProfileElements settings;
+    for (const auto & profile_name : profile_names)
     {
-        if (element.parent_profile.has_value() && element.parent_profile == *profile_id)
+        const auto profile_id = access_control.find<SettingsProfile>(profile_name);
+        if (!profile_id)
         {
-            profile_already_assigned = true;
-            break;
+            LOG_TRACE(getLogger(), "Did not assign profile '{}' to user '{}': profile not found", profile_name, user_name);
+            continue;
         }
-    }
 
-    if (!profile_already_assigned)
-    {
         SettingsProfileElement profile_element;
         profile_element.parent_profile = *profile_id;
         settings.push_back(std::move(profile_element));
-        LOG_TRACE(getLogger(), "Assigned profile '{}' to user '{}'", default_profile_name, user_name);
+        LOG_TRACE(getLogger(), "Assigned profile '{}' to user '{}'", profile_name, user_name);
     }
+
+    user.settings = std::move(settings);
 }
 
 std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
@@ -631,7 +645,7 @@ std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
             /// the bearer token; grant common roles only. Session applies the
             /// roles pushed by the initiator.
             assignRolesNoLock(*new_user, /* external_roles= */ {});
-            assignProfileNoLock(*new_user);
+            assignProfilesNoLock(*new_user, /* groups= */ {});
             id = memory_storage.insert(new_user);
 
             lock.unlock();
@@ -656,6 +670,7 @@ std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
     /// Pipeline: incoming group --(roles_mapping)--> mapped name --(roles_filter)--> kept/dropped --(roles_transform)--> CH role name.
     /// Each stage is independent and optional; groups absent from `roles_mapping` pass through unchanged.
     std::set<String> external_roles;
+    const std::set<String> groups = token_credentials.getGroups();
 
     /// Defensive: a broken filter regex must NEVER fall through to the permissive
     /// "grant everything that survives the rest of the pipeline" branch. Parse-time
@@ -674,7 +689,7 @@ std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
         const bool has_filter = roles_filter.has_value();
         const bool has_transform = roles_transform_pattern.has_value() && roles_transform_replacement.has_value();
 
-        for (const auto & group : token_credentials.getGroups())
+        for (const auto & group : groups)
         {
             String name = group;
 
@@ -712,7 +727,7 @@ std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
     if (new_user)
     {
         assignRolesNoLock(*new_user, external_roles);
-        assignProfileNoLock(*new_user);
+        assignProfilesNoLock(*new_user, groups);
         id = memory_storage.insert(new_user);
     }
     else
@@ -737,13 +752,13 @@ std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
 
         if (roles_changed)
         {
-            memory_storage.update(*id, [this, &external_roles] (const AccessEntityPtr & entity_, const UUID &) -> AccessEntityPtr
+            memory_storage.update(*id, [this, &external_roles, &groups] (const AccessEntityPtr & entity_, const UUID &) -> AccessEntityPtr
             {
                 if (auto user_entity = typeid_cast<std::shared_ptr<const User>>(entity_))
                 {
                     auto changed_user = typeid_cast<std::shared_ptr<User>>(user_entity->clone());
                     assignRolesNoLock(*changed_user, external_roles);
-                    assignProfileNoLock(*changed_user);
+                    assignProfilesNoLock(*changed_user, groups);
                     return changed_user;
                 }
                 return entity_;
@@ -751,14 +766,14 @@ std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
         }
         else
         {
-            /// Roles are stable; just refresh the profile in case it was
-            /// added/changed in config since the last auth.
-            memory_storage.update(*id, [this] (const AccessEntityPtr & entity_, const UUID &) -> AccessEntityPtr
+            /// Roles are stable; just refresh the profiles, which depend on the
+            /// groups and on which profiles exist now.
+            memory_storage.update(*id, [this, &groups] (const AccessEntityPtr & entity_, const UUID &) -> AccessEntityPtr
             {
                 if (auto user_entity = typeid_cast<std::shared_ptr<const User>>(entity_))
                 {
                     auto changed_user = typeid_cast<std::shared_ptr<User>>(user_entity->clone());
-                    assignProfileNoLock(*changed_user);
+                    assignProfilesNoLock(*changed_user, groups);
                     return changed_user;
                 }
                 return entity_;

@@ -39,6 +39,11 @@ class Cache:
         def from_dict(cls, obj):
             return Cache.CacheRecord(**obj)
 
+    @staticmethod
+    def submodule_archive_s3_path(cache_hash):
+        base = Settings.SUBMODULE_CACHE_S3_PATH or Settings.CACHE_S3_PATH
+        return f"{base}/submodules/{cache_hash}.tar.zst"
+
     def __init__(self):
         self.digest = Digest()
         self.success = {}  # type Dict[str, Any]

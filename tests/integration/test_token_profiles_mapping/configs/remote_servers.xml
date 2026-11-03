@@ -1,0 +1,19 @@
+<clickhouse>
+    <remote_servers>
+        <test_token_cluster>
+            <secret>profiles_mapping_cluster_secret</secret>
+            <shard>
+                <replica>
+                    <host>instance1</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+            <shard>
+                <replica>
+                    <host>instance2</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </test_token_cluster>
+    </remote_servers>
+</clickhouse>
