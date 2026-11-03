@@ -70,6 +70,8 @@ namespace ErrorCodes
     extern const int UNKNOWN_TABLE;
     extern const int UNKNOWN_DATABASE;
     extern const int BAD_ARGUMENTS;
+    extern const int ATTEMPT_TO_READ_AFTER_EOF;
+    extern const int NETWORK_ERROR;
 }
 
 namespace FailPoints
@@ -670,7 +672,32 @@ RemoteQueryExecutor::ReadResult RemoteQueryExecutor::read()
             in_receive_packet_window = false;
         });
 
-        auto packet = connections->receivePacket();
+        Packet packet;
+        try
+        {
+            packet = connections->receivePacket();
+        }
+        catch (const Exception & e)
+        {
+            /// Same tolerance as the async read path (`RemoteQueryExecutorReadContext::Task::run`):
+            /// a cluster node that died unexpectedly (kill/segfault/power off/etc.) closes the socket
+            /// either cleanly (`ATTEMPT_TO_READ_AFTER_EOF`) or via an RST (`NETWORK_ERROR`, e.g.
+            /// "Connection reset by peer" when the killed process still had unread bytes queued).
+            /// `Connection::receivePacket` has already disconnected this connection either way.
+            /// If this executor has not processed any data from this shard yet, synthesize a
+            /// `ConnectionLost` packet instead of failing the whole query; `processPacket` below
+            /// decides whether that can actually be swallowed (task retry support, parallel replicas
+            /// state) and rethrows the original exception otherwise.
+            if ((e.code() == ErrorCodes::ATTEMPT_TO_READ_AFTER_EOF || e.code() == ErrorCodes::NETWORK_ERROR)
+                && !got_data_from_replica
+                && skip_unavailable_shards)
+            {
+                packet.type = Protocol::Server::ConnectionLost;
+                packet.exception = std::make_unique<Exception>(getCurrentExceptionMessageAndPattern(true), getCurrentExceptionCode());
+            }
+            else
+                throw;
+        }
 
         LockAndBlocker lock(was_cancelled_mutex);
         if (was_cancelled)
