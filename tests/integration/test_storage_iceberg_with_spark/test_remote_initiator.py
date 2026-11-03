@@ -187,7 +187,7 @@ def test_remote_initiator_global_join_without_analyzer(started_cluster_iceberg_w
     res = instance.query(f"""
         SELECT t1.tag, t1.number
         FROM {TABLE_NAME} AS t1
-        JOIN numbers(2) AS t2 ON t1.number = t2.number + 1
+        JOIN numbers(2) AS t2 ON t1.tag = toInt32(t2.number + 1)
         SETTINGS
             object_storage_remote_initiator=1,
             object_storage_remote_initiator_cluster='cluster_simple',
