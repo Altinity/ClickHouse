@@ -3946,6 +3946,10 @@ try
 
             is_cancelled = true;
 
+            /// In-flight task admissions hold `swarm_mode_mutex` while reading the next task.
+            /// Interrupt that read before waiting for the lock; query cancellation alone does not
+            /// unblock the socket.
+            global_context->interruptSwarmTaskAdmission();
             global_context->stopSwarmMode();
 
             LOG_DEBUG(log, "Waiting for current connections to close.");

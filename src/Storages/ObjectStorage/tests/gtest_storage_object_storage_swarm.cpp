@@ -7,7 +7,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <future>
+#include <mutex>
 #include <thread>
 
 namespace DB::FailPoints
@@ -85,5 +87,82 @@ TEST(StorageObjectStorageSwarm, StopDoesNotBlockDuringTaskRetryWait)
     EXPECT_TRUE(stopped);
     /// Prefetch asks once and does not wait. The following `next` asks once, then sees swarm mode
     /// stopped and must not ask again.
+    EXPECT_EQ(callbacks.load(), 2);
+}
+
+TEST(StorageObjectStorageSwarm, InterruptUnblocksTaskAdmissionBeforeStop)
+{
+    auto context = DB::Context::createCopy(::getContext().context);
+    context->startSwarmMode();
+
+    std::mutex mutex;
+    std::condition_variable ready;
+    bool in_admission = false;
+    std::atomic<int> callbacks{0};
+
+    DB::ClusterFunctionReadTaskCallback callback = [&]()
+    {
+        if (++callbacks == 1)
+        {
+            auto response = std::make_shared<DB::ClusterFunctionReadTaskResponse>();
+            response->retry_after_us = 1;
+            return response;
+        }
+
+        std::unique_lock lock(mutex);
+        in_admission = true;
+        ready.notify_all();
+        ready.wait(lock, [&] { return context->isSwarmTaskAdmissionInterrupted(); });
+        return std::make_shared<DB::ClusterFunctionReadTaskResponse>();
+    };
+
+    std::exception_ptr error;
+    std::thread worker([&]()
+    {
+        try
+        {
+            DB::StorageObjectStorageSource::ReadTaskIterator iterator(
+                callback,
+                /*max_threads_count=*/1,
+                /*is_archive_=*/false,
+                /*object_storage_=*/nullptr,
+                /*table_location_=*/"",
+                context);
+            (void)iterator.next(/*processor=*/0);
+        }
+        catch (...)
+        {
+            error = std::current_exception();
+        }
+    });
+
+    bool entered = false;
+    {
+        std::unique_lock lock(mutex);
+        entered = ready.wait_for(lock, std::chrono::seconds(5), [&] { return in_admission; });
+    }
+    if (!entered)
+    {
+        context->interruptSwarmTaskAdmission();
+        ready.notify_all();
+        worker.join();
+        context->startSwarmMode();
+        FAIL() << "Task admission callback did not start";
+    }
+
+    auto stop_result = std::async(std::launch::async, [&] { return context->stopSwarmMode(); });
+    /// The callback still holds the admission lock, so stop cannot finish yet.
+    EXPECT_EQ(stop_result.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout);
+
+    context->interruptSwarmTaskAdmission();
+    ready.notify_all();
+
+    ASSERT_EQ(stop_result.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    EXPECT_TRUE(stop_result.get());
+
+    worker.join();
+    context->startSwarmMode();
+
+    ASSERT_FALSE(error);
     EXPECT_EQ(callbacks.load(), 2);
 }

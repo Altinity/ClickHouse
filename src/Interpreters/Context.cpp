@@ -816,6 +816,9 @@ struct ContextSharedPart : boost::noncopyable
 
     std::atomic<bool> shutdown_called = false;
     std::atomic<bool> swarm_mode_enabled = true;
+    /// Set before shutdown waits on `swarm_mode_mutex`. The task callback's socket read
+    /// observes this and returns, instead of holding the lock until `receive_timeout`.
+    std::atomic<bool> swarm_task_admission_interrupted = false;
     /// Serializes task admission with `SYSTEM STOP SWARM MODE`. The lock is held
     /// while a worker asks the initiator for its next task, so no task can be
     /// assigned after `stopSwarmMode` returns.
@@ -1018,6 +1021,8 @@ struct ContextSharedPart : boost::noncopyable
       */
     void shutdown() TSA_NO_THREAD_SAFETY_ANALYSIS
     {
+        /// The admission lock is held across the task-response read. Wake that read before waiting.
+        swarm_task_admission_interrupted.store(true);
         {
             std::lock_guard lock(swarm_mode_mutex);
             swarm_mode_enabled = false;
@@ -8026,6 +8031,16 @@ bool Context::startSwarmMode()
 bool Context::isSwarmModeEnabled() const
 {
     return shared->swarm_mode_enabled;
+}
+
+void Context::interruptSwarmTaskAdmission()
+{
+    shared->swarm_task_admission_interrupted.store(true);
+}
+
+bool Context::isSwarmTaskAdmissionInterrupted() const
+{
+    return shared->swarm_task_admission_interrupted.load();
 }
 
 std::unique_lock<std::mutex> Context::lockSwarmMode() const

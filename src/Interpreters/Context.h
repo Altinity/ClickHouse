@@ -1890,6 +1890,10 @@ public:
     bool startSwarmMode();
     /// Return current swarm mode state.
     bool isSwarmModeEnabled() const;
+    /// Ask an in-flight task admission to leave its blocking read. Shutdown sets this before
+    /// taking the admission lock, which that read is holding.
+    void interruptSwarmTaskAdmission();
+    bool isSwarmTaskAdmissionInterrupted() const;
     /// Serializes swarm task admission with `stopSwarmMode`.
     std::unique_lock<std::mutex> lockSwarmMode() const;
 

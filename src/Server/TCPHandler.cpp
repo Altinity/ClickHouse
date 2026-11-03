@@ -2490,6 +2490,41 @@ void TCPHandler::sendHello()
 
 ClusterFunctionReadTaskResponsePtr TCPHandler::receiveClusterFunctionReadTaskResponse(QueryState & state)
 {
+    /// This read holds the swarm admission lock in `takeNextObject`. A single `recv` would keep
+    /// shutdown on that lock until `receive_timeout` (300 seconds by default). Poll and leave
+    /// when shutdown asks the admission to stop.
+    constexpr UInt64 shutdown_poll_us = 100000; /// 100 ms
+    const auto receive_timeout_us = receive_timeout.totalMicroseconds();
+    UInt64 timeout_us = shutdown_poll_us;
+    if (receive_timeout_us > 0)
+        timeout_us = std::min(timeout_us, static_cast<UInt64>(receive_timeout_us));
+
+    auto admission_interrupted = [&]()
+    {
+        return server.isCancelled() || (state.query_context && state.query_context->isSwarmTaskAdmissionInterrupted());
+    };
+
+    /// A response already buffered in the socket is read below. Otherwise leave immediately when
+    /// shutdown has asked for the admission lock this read is holding.
+    if (admission_interrupted() && !in->poll(0))
+        throw NetException(ErrorCodes::ABORTED, "Server shutdown interrupted receiving a cluster task response");
+
+    Stopwatch watch;
+    while (!in->poll(timeout_us))
+    {
+        if (admission_interrupted())
+            throw NetException(ErrorCodes::ABORTED, "Server shutdown interrupted receiving a cluster task response");
+
+        checkIfQueryCanceled(state);
+
+        if (receive_timeout_us > 0 && watch.elapsedMicroseconds() >= static_cast<UInt64>(receive_timeout_us))
+            throw NetException(
+                ErrorCodes::SOCKET_TIMEOUT,
+                "Timeout exceeded while receiving a cluster task response. Waited for {} seconds, timeout is {} seconds.",
+                watch.elapsedSeconds(),
+                receive_timeout.totalSeconds());
+    }
+
     UInt64 packet_type = 0;
     state.at_packet_boundary = false;
     readVarUInt(packet_type, *in);
