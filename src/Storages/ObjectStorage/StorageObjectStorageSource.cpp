@@ -108,6 +108,7 @@ namespace FailPoints
 {
 extern const char object_storage_source_pause_before_virtual_columns[];
 extern const char swarm_mode_before_task_admission_lock[];
+extern const char swarm_mode_during_task_retry_wait[];
 }
 
 namespace ErrorCodes
@@ -2537,17 +2538,21 @@ ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::takeNextObject(bool 
             FailPointInjection::notifyPauseAndWaitForResume(FailPoints::swarm_mode_before_task_admission_lock);
         });
 
-        /// Keep the lock through the task callback. This makes the enabled-state check and task
-        /// assignment one admission operation: once `SYSTEM STOP SWARM MODE` returns, workers
-        /// cannot obtain any new task.
-        auto swarm_mode_lock = getContext()->lockSwarmMode();
-        if (!getContext()->isSwarmModeEnabled())
+        ClusterFunctionReadTaskResponsePtr task;
         {
-            LOG_DEBUG(getLogger("StorageObjectStorageSource"), "STOP SWARM MODE called, stop getting new tasks");
-            return nullptr;
-        }
+            /// The lock covers only the enabled-state check and the task callback. Once
+            /// `SYSTEM STOP SWARM MODE` returns, no worker is inside `callback`. The retry
+            /// wait and metadata resolution stay outside the lock so they cannot block stopping
+            /// swarm mode or other task requests.
+            auto swarm_mode_lock = getContext()->lockSwarmMode();
+            if (!getContext()->isSwarmModeEnabled())
+            {
+                LOG_DEBUG(getLogger("StorageObjectStorageSource"), "STOP SWARM MODE called, stop getting new tasks");
+                return nullptr;
+            }
 
-        auto task = callback();
+            task = callback();
+        }
 
         if (auto query_status = getContext()->getProcessListElement())
             query_status->checkTimeLimit();
@@ -2564,6 +2569,13 @@ ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::takeNextObject(bool 
             /// TODO: wait asynchronously instead of sleeping in this thread.
             auto wait_time = std::min<UInt64>(100000, *task->retry_after_us);
             ProfileEvents::increment(ProfileEvents::ObjectStorageClusterWaitingMicroseconds, wait_time);
+
+            /// Test-only pause after the admission lock is released. `SYSTEM STOP SWARM MODE`
+            /// must return while this worker is still waiting to ask for another task.
+            fiu_do_on(FailPoints::swarm_mode_during_task_retry_wait, {
+                FailPointInjection::notifyPauseAndWaitForResume(FailPoints::swarm_mode_during_task_retry_wait);
+            });
+
             sleepForMicroseconds(wait_time);
             continue;
         }
