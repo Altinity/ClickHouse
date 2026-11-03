@@ -626,7 +626,9 @@ def test_relink_is_selected_by_the_capability_not_the_version():
 
     Three raw requests at the sender, identical except for the two knobs:
       - version 10 with the capability: the offer (control, and the proof that the capability selects it);
-      - version 11 without the capability: bytes, `server_protocol_version=10`;
+      - version 11 with a pool and without the capability: bytes, `server_protocol_version=10`. This is
+        what a released 26.6.x receiver sends (it gates relink on version 11), so relink between
+        26.6.x and this build is off in both directions;
       - version 10 without the capability: bytes.
     The receiver-side branch — a genuinely OLD sender that offers a relink with NO source token — is not
     covered here.
