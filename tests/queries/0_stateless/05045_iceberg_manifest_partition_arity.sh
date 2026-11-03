@@ -200,12 +200,17 @@ ${CLICKHOUSE_CLIENT} --use_iceberg_metadata_files_cache=0 --query "SELECT sum(v)
     | grep -oF 'ICEBERG_SPECIFICATION_VIOLATION' | head -n1
 ${CLICKHOUSE_CLIENT} --use_iceberg_metadata_files_cache=0 --query "SELECT sum(v) FROM t_nokey_ok WHERE p = 1"
 
-echo '--- A7 partition pruning happens, and stops when the key is narrower ---'
+# Deliberate divergence from upstream: upstream's ManifestFilesPruner::canBePruned drops
+# partition pruning when the partition key is narrower than the tuple; antalya projects
+# the tuple by `partition_key_spec_positions` and still prunes soundly, so
+# `IcebergPartitionPrunedFiles` is 1 here. Keep this so the next upstream sync does not
+# silently flip the expectation back.
+echo '--- A7 partition pruning happens, also when the key is narrower (projected by spec position) ---'
 probes partition_control "SELECT sum(v) FROM t_ok WHERE p = 1" \
        partition_narrow "SELECT sum(v) FROM t_narrow WHERE p = 1"
 report IcebergPartitionPrunedFiles partition_control partition_narrow
 
-echo '--- A8 a leading unmodellable field is not realigned onto the wrong value ---'
+echo '--- A8 a leading unmodellable field is skipped by position, and pruning still gives the right rows ---'
 # The one query serves as both the value check and the pruning probe, so manifest-list pruning is
 # off here for the same reason as in `probes`.
 ${CLICKHOUSE_CLIENT} --use_iceberg_metadata_files_cache=0 --use_iceberg_manifest_list_partition_pruning=0 --query "

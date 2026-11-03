@@ -18,12 +18,12 @@ ICEBERG_SPECIFICATION_VIOLATION
 --- A6 the tuple arity is validated even when no partition key is modelled ---
 ICEBERG_SPECIFICATION_VIOLATION
 201
---- A7 partition pruning happens, and stops when the key is narrower ---
+--- A7 partition pruning happens, also when the key is narrower (projected by spec position) ---
 1
-0
---- A8 a leading unmodellable field is not realigned onto the wrong value ---
+1
+--- A8 a leading unmodellable field is skipped by position, and pruning still gives the right rows ---
 201
-0
+1
 --- A9 the manifest list prunes both tables before their patched manifests are read ---
 201
 201
