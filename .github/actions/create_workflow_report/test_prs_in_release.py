@@ -8,6 +8,8 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import MagicMock, patch
 
+from botocore.exceptions import ClientError
+
 import pandas as pd
 
 from create_workflow_report import (
@@ -417,8 +419,12 @@ class TestGetWorkflowConfigStdout(unittest.TestCase):
     def test_s3_404_warning_goes_to_stderr(self):
         # action.yml takes the script's stdout as the report URL. A WARNING on
         # stdout makes grep '^https?://' fail even after a successful upload.
-        mock_resp = MagicMock()
-        mock_resp.status_code = 404
+        missing = ClientError(
+            {"Error": {"Code": "NoSuchKey", "Message": "Not Found"}},
+            "GetObject",
+        )
+        s3_client = MagicMock()
+        s3_client.get_object.side_effect = missing
         stdout = io.StringIO()
         stderr = io.StringIO()
         with (
@@ -426,7 +432,7 @@ class TestGetWorkflowConfigStdout(unittest.TestCase):
                 "create_workflow_report._workflow_config_from_local",
                 return_value=None,
             ),
-            patch("create_workflow_report.requests.get", return_value=mock_resp),
+            patch("create_workflow_report.boto3.client", return_value=s3_client),
             redirect_stdout(stdout),
             redirect_stderr(stderr),
         ):
