@@ -1886,6 +1886,8 @@ public:
     bool startSwarmMode();
     /// Return current swarm mode state.
     bool isSwarmModeEnabled() const;
+    /// Serializes swarm task admission with `stopSwarmMode`.
+    std::unique_lock<std::mutex> lockSwarmMode() const;
 
     bool isInternalQuery() const { return is_internal_query; }
     void setInternalQuery(bool internal) { is_internal_query = internal; }

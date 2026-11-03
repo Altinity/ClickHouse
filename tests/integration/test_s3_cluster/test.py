@@ -2169,3 +2169,75 @@ def test_graceful_shutdown(started_cluster):
     node_to_shutdown.start_clickhouse()
 
     assert errors == 0
+
+
+def test_stop_swarm_mode_does_not_admit_new_task(started_cluster):
+    initiator = started_cluster.instances["s0_0_0"]
+    worker = started_cluster.instances["s0_1_0"]
+    failpoint = "swarm_mode_before_task_admission_lock"
+    result = {}
+
+    expected = initiator.query(
+        f"""
+        SELECT count()
+        FROM s3(
+            'http://minio1:9001/root/data/graceful/*',
+            'minio',
+            '{minio_secret_key}',
+            'CSV',
+            'value UInt32, name String')
+        """
+    )
+    task_requests_before = int(
+        worker.query(
+            "SELECT value FROM system.events "
+            "WHERE event = 'ReadTaskRequestsSent' "
+            "SETTINGS system_events_show_zero_values = 1"
+        )
+    )
+
+    worker.query("SYSTEM START SWARM MODE")
+    worker.query(f"SYSTEM ENABLE FAILPOINT {failpoint}")
+
+    def run_query():
+        try:
+            result["value"] = initiator.query(
+                f"""
+                SELECT count()
+                FROM s3Cluster(
+                    'cluster_simple',
+                    'http://minio1:9001/root/data/graceful/*',
+                    'minio',
+                    '{minio_secret_key}',
+                    'CSV',
+                    'value UInt32, name String')
+                """
+            )
+        except QueryRuntimeException as ex:
+            result["error"] = str(ex)
+
+    query_thread = threading.Thread(target=run_query)
+    query_thread.start()
+
+    try:
+        worker.query(f"SYSTEM WAIT FAILPOINT {failpoint} PAUSE")
+        worker.query("SYSTEM STOP SWARM MODE")
+        worker.query(f"SYSTEM DISABLE FAILPOINT {failpoint}")
+
+        query_thread.join(timeout=30)
+        assert not query_thread.is_alive()
+        assert "error" not in result
+        assert result["value"] == expected
+
+        task_requests_after = int(
+            worker.query(
+                "SELECT value FROM system.events "
+                "WHERE event = 'ReadTaskRequestsSent' "
+                "SETTINGS system_events_show_zero_values = 1"
+            )
+        )
+        assert task_requests_after == task_requests_before
+    finally:
+        worker.query(f"SYSTEM DISABLE FAILPOINT {failpoint}")
+        worker.query("SYSTEM START SWARM MODE")
+        query_thread.join(timeout=30)

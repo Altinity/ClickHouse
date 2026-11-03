@@ -816,6 +816,10 @@ struct ContextSharedPart : boost::noncopyable
 
     std::atomic<bool> shutdown_called = false;
     std::atomic<bool> swarm_mode_enabled = true;
+    /// Serializes task admission with `SYSTEM STOP SWARM MODE`. The lock is held
+    /// while a worker asks the initiator for its next task, so no task can be
+    /// assigned after `stopSwarmMode` returns.
+    mutable std::mutex swarm_mode_mutex;
 
     Stopwatch uptime_watch TSA_GUARDED_BY(mutex);
 
@@ -1014,8 +1018,11 @@ struct ContextSharedPart : boost::noncopyable
       */
     void shutdown() TSA_NO_THREAD_SAFETY_ANALYSIS
     {
-        swarm_mode_enabled = false;
-        CurrentMetrics::set(CurrentMetrics::IsSwarmModeEnabled, 0);
+        {
+            std::lock_guard lock(swarm_mode_mutex);
+            swarm_mode_enabled = false;
+            CurrentMetrics::set(CurrentMetrics::IsSwarmModeEnabled, 0);
+        }
         bool is_shutdown_called = shutdown_called.exchange(true);
         if (is_shutdown_called)
             return;
@@ -7972,6 +7979,7 @@ void Context::shutdown() TSA_NO_THREAD_SAFETY_ANALYSIS
 
 bool Context::stopSwarmMode()
 {
+    std::lock_guard lock(shared->swarm_mode_mutex);
     bool expected_is_enabled = true;
     bool is_stopped_now = shared->swarm_mode_enabled.compare_exchange_strong(expected_is_enabled, false);
     if (is_stopped_now)
@@ -7982,6 +7990,7 @@ bool Context::stopSwarmMode()
 
 bool Context::startSwarmMode()
 {
+    std::lock_guard lock(shared->swarm_mode_mutex);
     bool expected_is_enabled = false;
     bool is_started_now = shared->swarm_mode_enabled.compare_exchange_strong(expected_is_enabled, true);
     if (is_started_now)
@@ -7993,6 +8002,11 @@ bool Context::startSwarmMode()
 bool Context::isSwarmModeEnabled() const
 {
     return shared->swarm_mode_enabled;
+}
+
+std::unique_lock<std::mutex> Context::lockSwarmMode() const
+{
+    return std::unique_lock(shared->swarm_mode_mutex);
 }
 
 Context::ApplicationType Context::getApplicationType() const
