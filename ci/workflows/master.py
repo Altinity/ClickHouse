@@ -66,7 +66,6 @@ workflow = Workflow.Config(
         "GrypeScan",
         "Regression",
         "CIReport",
-        "SourceUpload",
     ],
     artifacts=[
         *ArtifactConfigs.unittests_binaries,
