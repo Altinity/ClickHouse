@@ -37,6 +37,7 @@
 #include <Storages/ObjectStorage/DataLakes/DataLakeStorageSettings.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/AvroSchema.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergFieldParseHelpers.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergWrites.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFile.h>
@@ -352,7 +353,10 @@ std::vector<uint8_t> dumpFieldToBytes(const Field & field, DataTypePtr type)
         case TypeIndex::Time64:
             return dumpValue(getTimeValueInMicroseconds(field, type));
         case TypeIndex::DateTime64:
-            return dumpValue(getDateTime64ValueForIcebergBounds(field, type));
+        {
+            const auto bytes = Iceberg::serializeDateTime64IcebergBound(getDateTime64ValueForIcebergBounds(field, type));
+            return std::vector<uint8_t>(bytes.begin(), bytes.end());
+        }
         case TypeIndex::String:
         {
             auto value = field.safeGet<String>();

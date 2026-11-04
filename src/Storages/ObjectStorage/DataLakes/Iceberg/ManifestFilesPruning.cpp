@@ -436,7 +436,7 @@ std::optional<Range> rangeOfPartitionValue(const String & transform_name, const 
 }
 
 PruningReturnStatus ManifestFilesPruner::canBePruned(
-    const ProcessedManifestFileEntryPtr & entry, const std::unordered_map<Int32, DB::Range> & entry_hyperrectangles) const
+    const ProcessedManifestFileEntryPtr & entry, const std::unordered_map<Int32, std::vector<DB::Range>> & entry_hyperrectangles) const
 {
     const auto & partition_value = entry->parsed_entry->partition_key_value;
 
@@ -520,10 +520,21 @@ PruningReturnStatus ManifestFilesPruner::canBePruned(
         }
 
         auto rect_it = entry_hyperrectangles.find(column_id);
-        if (has_no_nulls && rect_it != entry_hyperrectangles.end()
-            && !key_condition.mayBeTrueInRange(1, &rect_it->second.left, &rect_it->second.right, data_types))
+        if (has_no_nulls && rect_it != entry_hyperrectangles.end())
         {
-            return PruningReturnStatus::MIN_MAX_INDEX_PRUNED;
+            /// A `timestamp` column in `[1e16, 1e18)` has two ranges. Prune only when every range misses.
+            bool may_be_true = false;
+            for (const auto & range : rect_it->second)
+            {
+                if (key_condition.mayBeTrueInRange(1, &range.left, &range.right, data_types))
+                {
+                    may_be_true = true;
+                    break;
+                }
+            }
+
+            if (!may_be_true)
+                return PruningReturnStatus::MIN_MAX_INDEX_PRUNED;
         }
     }
 
