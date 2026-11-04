@@ -82,6 +82,10 @@ const UInt128 kGc = hexToU128("00000000000000000000000000000001");
 /// be said out loud.
 void noAuthorityRefresh() {}
 
+/// The retirement announcement is mandatory for the same reason: a drain that erases without it has to
+/// say so.
+void noRetirementRecord(const NamespaceLifeId &) {}
+
 /// The lying store, shared from `cas_test_helpers.h`: every key is served by exact GET while the
 /// selected ones are HIDDEN from every LIST. That is the only way to build the cross-namespace
 /// scenario -- the hidden namespace's records stay durable and readable, so a round that KNOWS to
@@ -2972,7 +2976,7 @@ TEST(CASCatalogLifecycleReconciler, EmptyCatalogReturnsAuthoritativeCompleteCut)
 
     CasFoldSeal parent;
     CatalogLifecycleReconciler reconciler(op, layout, parent);
-    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh);
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh, noRetirementRecord);
 
     EXPECT_EQ(result.authority_status, AuthorityStatus::Authoritative);
     EXPECT_EQ(result.catalog_resolution, CatalogResolution::DrainComplete);
@@ -2998,7 +3002,7 @@ TEST(CASCatalogLifecycleReconciler, DeletesEligibleRowsFromReturnedResolutionCut
     backend->resetCounts();
 
     CatalogLifecycleReconciler reconciler(op, layout, parent);
-    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh);
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh, noRetirementRecord);
 
     EXPECT_EQ(result.authority_status, AuthorityStatus::Authoritative);
     EXPECT_EQ(result.catalog_resolution, CatalogResolution::DrainComplete);
@@ -3009,6 +3013,38 @@ TEST(CASCatalogLifecycleReconciler, DeletesEligibleRowsFromReturnedResolutionCut
     const std::vector<String> journal = backend->journalSnapshot();
     const String catalog_get = "get " + layout.refCatalogKey();
     EXPECT_EQ(std::count(journal.begin(), journal.end(), catalog_get), deletes + 1);
+}
+
+/// The retirement announcement precedes the erase of its row: a record made afterwards leaves a
+/// window in which the life is gone but unrecorded.
+TEST(CASCatalogLifecycleReconciler, AnnouncesEachLifeBeforeItsRowIsErased)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    constexpr size_t deletes = 3;
+    seedCompletedRemovingBatch(op, store, kGc, deletes);
+    const auto parent_object = op.read(layout.foldSealKey(1, 1), Retry::once());
+    ASSERT_TRUE(parent_object);
+    const CasFoldSeal parent = decodeFoldSeal(parent_object->bytes);
+
+    std::vector<NamespaceLifeId> announced;
+    size_t announced_while_cataloged = 0;
+    CatalogLifecycleReconciler reconciler(op, layout, parent);
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(
+        noAuthorityRefresh,
+        [&](const NamespaceLifeId & life)
+        {
+            announced.push_back(life);
+            if (CasRefCatalog::lifeIfCataloged(op, layout, life.ns) == std::optional<NamespaceLifeId>{life})
+                ++announced_while_cataloged;
+        });
+
+    EXPECT_EQ(result.deleted, deletes);
+    EXPECT_EQ(announced, result.retired_lives) << "each life is announced exactly once, in erase order";
+    EXPECT_EQ(announced_while_cataloged, deletes) << "the announcement must precede the erase of its row";
 }
 
 TEST(CASCatalogLifecycleReconciler, ReturnsRetiredLifeWhenAuthorityMovesAfterResolution)
@@ -3035,7 +3071,7 @@ TEST(CASCatalogLifecycleReconciler, ReturnsRetiredLifeWhenAuthorityMovesAfterRes
     });
 
     CatalogLifecycleReconciler reconciler(fenced_op, layout, parent);
-    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh);
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh, noRetirementRecord);
 
     EXPECT_EQ(result.authority_status, AuthorityStatus::FencedOut);
     EXPECT_EQ(result.catalog_resolution, CatalogResolution::ExactRowAbsent);
@@ -3065,7 +3101,7 @@ TEST(CASCatalogLifecycleReconciler, InitialFenceLossReportsEligibleRowStillPrese
     backend->afterReadOf(layout.refCatalogKey(), [&] { authority_held = false; });
 
     CatalogLifecycleReconciler reconciler(fenced_op, layout, parent);
-    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh);
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh, noRetirementRecord);
 
     EXPECT_EQ(result.authority_status, AuthorityStatus::FencedOut);
     EXPECT_EQ(result.catalog_resolution, CatalogResolution::ExactRowStillPresent);
@@ -3096,7 +3132,7 @@ TEST(CASCatalogLifecycleReconciler, RetriesFromTheMandatoryConflictResolutionCut
     backend->conflictNextCatalogCas(layout.refCatalogKey());
 
     CatalogLifecycleReconciler reconciler(op, layout, parent);
-    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh);
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh, noRetirementRecord);
 
     EXPECT_EQ(result.authority_status, AuthorityStatus::Authoritative);
     EXPECT_EQ(result.catalog_resolution, CatalogResolution::DrainComplete);

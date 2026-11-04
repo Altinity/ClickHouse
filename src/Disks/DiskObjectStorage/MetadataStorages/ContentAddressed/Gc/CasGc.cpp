@@ -687,6 +687,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     {
         GcPhaseTimer t(phase_sink, "pre_fold_ref_drain");
         const CatalogLifecycleReconcileResult drain_result = drainCompletedRemoving(state);
+        /// Erases made here were recorded before the erase; this covers rows another actor removed.
         for (const NamespaceLifeId & retired_life : drain_result.retired_lives)
             store->invalidateRemovedCatalogLife(retired_life);
         if (drain_result.authority_status != AuthorityStatus::Authoritative
@@ -4431,6 +4432,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// zero catalog mutations. Only after that distinction is resolved do we complete the hot LIST and
     /// take the sole fresh work cut.
     const CatalogLifecycleReconcileResult drain_result = drainCompletedRemoving(state);
+    /// Erases made here were recorded before the erase; this covers rows another actor removed.
     for (const NamespaceLifeId & retired_life : drain_result.retired_lives)
         store->invalidateRemovedCatalogLife(retired_life);
     if (drain_result.authority_status != AuthorityStatus::Authoritative
@@ -5072,7 +5074,9 @@ CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(const GcState & lease
     refreshAuthority(admitted_generation);
     CasOperation op = store->openRequests().admit([this] { return authority_held; });
     return CatalogLifecycleReconciler(op, store->layout(), *parent)
-        .reconcile([this, admitted_generation] { refreshAuthority(admitted_generation); });
+        .reconcile(
+            [this, admitted_generation] { refreshAuthority(admitted_generation); },
+            [this](const NamespaceLifeId & life) { store->invalidateRemovedCatalogLife(life); });
 }
 
 }

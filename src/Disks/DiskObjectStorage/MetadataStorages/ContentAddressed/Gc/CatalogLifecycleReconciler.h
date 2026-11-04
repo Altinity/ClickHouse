@@ -49,7 +49,13 @@ public:
     /// every erase is authorised by a reading taken in its own attempt, and it is run once more before
     /// the drain-complete verdict, which would otherwise report from the reading its last erase left.
     /// It is a refresh, not a verdict: the verdict stays `op.admitted()`.
-    CatalogLifecycleReconcileResult reconcile(const std::function<void()> & refresh_authority);
+    ///
+    /// `before_erase` is called with each life just before its row is first erased, so the caller can
+    /// record the retirement ahead of the erase. A life whose row another actor already removed is
+    /// not announced; it is reported in `retired_lives`.
+    CatalogLifecycleReconcileResult reconcile(
+        const std::function<void()> & refresh_authority,
+        const std::function<void(const NamespaceLifeId &)> & before_erase);
 
 private:
     std::optional<CatalogEntry> selectEligible(const CasRefCatalog::Snapshot & catalog) const;
