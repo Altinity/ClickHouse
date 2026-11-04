@@ -483,10 +483,44 @@ bool StoragePolicy::containsVolume(const String & volume_name) const
     return volume_index_by_volume_name.contains(volume_name);
 }
 
+namespace
+{
+
+/// Returns the first disk of `disk_names` that the policy config names, or an empty string.
+String findNamedDisk(const Poco::Util::AbstractConfiguration & config, const String & policy_prefix, const NameSet & disk_names)
+{
+    if (disk_names.empty())
+        return {};
+
+    const String volumes_prefix = policy_prefix + ".volumes";
+    if (!config.has(volumes_prefix))
+        return {};
+
+    Poco::Util::AbstractConfiguration::Keys volumes;
+    config.keys(volumes_prefix, volumes);
+    for (const auto & volume : volumes)
+    {
+        Poco::Util::AbstractConfiguration::Keys keys;
+        config.keys(volumes_prefix + "." + volume, keys);
+        for (const auto & key : keys)
+        {
+            if (!startsWith(key, "disk"))
+                continue;
+            auto disk_name = config.getString(volumes_prefix + "." + volume + "." + key);
+            if (disk_names.contains(disk_name))
+                return disk_name;
+        }
+    }
+    return {};
+}
+
+}
+
 StoragePolicySelector::StoragePolicySelector(
     const Poco::Util::AbstractConfiguration & config,
     const String & config_prefix,
-    DiskSelectorPtr disks)
+    DiskSelectorPtr disks,
+    const NameSet & disks_to_skip)
 {
     Poco::Util::AbstractConfiguration::Keys keys;
     config.keys(config_prefix, keys);
@@ -504,12 +538,22 @@ StoragePolicySelector::StoragePolicySelector(
          *  else
          */
 
+        if (auto skipped_disk = findNamedDisk(config, config_prefix + "." + name, disks_to_skip); !skipped_disk.empty())
+        {
+            LOG_WARNING(
+                getLogger("StoragePolicySelector"),
+                "Storage policy {} is not loaded: disk {} is being created as a custom disk",
+                backQuote(name),
+                backQuote(skipped_disk));
+            continue;
+        }
+
         policies.emplace(name, std::make_shared<StoragePolicy>(name, config, config_prefix + "." + name, disks));
         LOG_INFO(getLogger("StoragePolicySelector"), "Storage policy {} loaded", backQuote(name));
     }
 
     /// Add default policy if it isn't explicitly specified.
-    if (!policies.contains(DEFAULT_STORAGE_POLICY_NAME))
+    if (!policies.contains(DEFAULT_STORAGE_POLICY_NAME) && findNamedDisk(config, config_prefix + "." + DEFAULT_STORAGE_POLICY_NAME, disks_to_skip).empty())
     {
         auto default_policy = std::make_shared<StoragePolicy>(DEFAULT_STORAGE_POLICY_NAME, config, config_prefix + "." + DEFAULT_STORAGE_POLICY_NAME, disks);
         policies.emplace(DEFAULT_STORAGE_POLICY_NAME, std::move(default_policy));
@@ -517,9 +561,14 @@ StoragePolicySelector::StoragePolicySelector(
 }
 
 
-StoragePolicySelectorPtr StoragePolicySelector::updateFromConfig(const Poco::Util::AbstractConfiguration & config, const String & config_prefix, DiskSelectorPtr disks, Strings & new_disks) const
+StoragePolicySelectorPtr StoragePolicySelector::updateFromConfig(
+    const Poco::Util::AbstractConfiguration & config,
+    const String & config_prefix,
+    DiskSelectorPtr disks,
+    Strings & new_disks,
+    const NameSet & disks_to_skip) const
 {
-    std::shared_ptr<StoragePolicySelector> result = std::make_shared<StoragePolicySelector>(config, config_prefix, disks);
+    std::shared_ptr<StoragePolicySelector> result = std::make_shared<StoragePolicySelector>(config, config_prefix, disks, disks_to_skip);
     std::set<String> disks_before_reload;
     std::set<String> disks_after_reload;
     /// First pass, check.
@@ -528,9 +577,14 @@ StoragePolicySelectorPtr StoragePolicySelector::updateFromConfig(const Poco::Uti
         if (!name.starts_with(TMP_STORAGE_POLICY_PREFIX))
         {
             if (!result->policies.contains(name))
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Storage policy {} is missing in new configuration", backQuote(name));
+            {
+                if (findNamedDisk(config, config_prefix + "." + name, disks_to_skip).empty())
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS, "Storage policy {} is missing in new configuration", backQuote(name));
 
-            policy->checkCompatibleWith(result->policies[name]);
+                result->policies[name] = policy;
+            }
+            else
+                policy->checkCompatibleWith(result->policies[name]);
         }
 
         for (const auto & disk : policy->getDisks())
@@ -543,7 +597,7 @@ StoragePolicySelectorPtr StoragePolicySelector::updateFromConfig(const Poco::Uti
     for (const auto & [name, policy] : policies)
     {
         /// Do not reload from config temporary storage policy, because it is not present in config.
-        if (name.starts_with(TMP_STORAGE_POLICY_PREFIX))
+        if (name.starts_with(TMP_STORAGE_POLICY_PREFIX) || result->policies[name] == policy)
             result->policies[name] = policy;
         else
             result->policies[name] = std::make_shared<StoragePolicy>(policy, config, config_prefix + "." + name, disks);
