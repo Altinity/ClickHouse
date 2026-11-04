@@ -175,6 +175,8 @@ public:
     {
     }
 
+    bool joinable() const { return thread.joinable(); }
+
     ~ParkedReader()
     {
         backend.releaseOnce();
@@ -396,6 +398,7 @@ TEST(CASNsFileIncarnation, ColdReaderIsRefusedWhenReleasedRightAfterTheDrainEras
     store->dropNamespace(ns);
     (void)runRegularRoundReclaiming(gc);
     (void)runRegularRoundReclaiming(gc);
+    ASSERT_FALSE(reader->joinable()) << "the drain's erase must have released and joined the reader";
     reader->join();
     ASSERT_FALSE(CasRefCatalog::lifeIfCataloged(catalog_op, layout, ns));
 

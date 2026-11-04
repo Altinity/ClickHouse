@@ -896,8 +896,9 @@ private:
         bool removal_admission_closed = false;
         std::condition_variable cv;
 
-        /// Published when GC is about to erase the exact catalog row, or after it observed the row gone.
-        /// The exact cache pointer is detached;
+        /// Published by `invalidateRemovedCatalogLife`: from the GC drain just before it erases the exact
+        /// catalog row, from `reconcileCatalogCut` once a cut shows the life gone, and from the
+        /// stalled-`Creating` cancellation in `dropNamespaceImpl`. The exact cache pointer is detached;
         /// old holders observe the flag and remain a predecessor, never a rebindable name handle.
         std::atomic<bool> catalog_life_invalidated{false};
 
@@ -1048,8 +1049,8 @@ private:
     /// name slot or runtime.
     std::shared_ptr<RefTableRuntime> lookupRefTableRuntime(const RootNamespace & ns) const;
 
-    /// `Write` may birth the namespace; `Read` is non-creating (it includes removing a file). It picks
-    /// the wording of a stale-observation refusal, which is retryable either way.
+    /// Picks the wording of a stale-observation refusal, which is retryable either way: `Read` for
+    /// non-creating callers (removing a file included), `Write` for the rest.
     enum class RuntimeAdmission : uint8_t
     {
         Read,
