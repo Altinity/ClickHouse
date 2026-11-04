@@ -1690,6 +1690,8 @@ public:
     /// share one creation: they all get its disk or a copy of its exception. A failed creation is not
     /// remembered. The creator must not request a disk of its own name.
     DiskPtr getOrCreateDisk(const String & name, DiskCreator creator) const;
+    /// Number of requests currently waiting for the creation of the disk `name` started by another request.
+    size_t getDiskCreationWaiters(const String & name) const;
 
     StoragePoliciesMap getPoliciesMap() const;
     DisksMap getDisksMap() const;
@@ -1959,6 +1961,8 @@ private:
     StoragePolicySelectorPtr getStoragePolicySelector(std::lock_guard<std::mutex> & lock) const;
 
     DiskSelectorPtr getDiskSelector(std::lock_guard<std::mutex> & lock) const;
+    /// Like `DiskSelector::get`, but says so when the disk is still being created by `getOrCreateDisk`.
+    DiskPtr getDiskOrExplainCreation(std::lock_guard<std::mutex> & lock, const String & name) const;
 
     DisksMap getDisksMap(std::lock_guard<std::mutex> & lock) const;
 

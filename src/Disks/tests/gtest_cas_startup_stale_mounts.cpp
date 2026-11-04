@@ -7,6 +7,7 @@
 #include <Disks/DiskFactory.h>
 #include <Disks/DiskLocal.h>
 #include <Disks/DiskFromAST.h>
+#include <Disks/StoragePolicy.h>
 #include <Disks/registerDisks.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
@@ -43,6 +44,7 @@
 namespace DB::ErrorCodes
 {
 extern const int BAD_ARGUMENTS;
+extern const int UNKNOWN_DISK;
 }
 
 namespace
@@ -216,6 +218,18 @@ protected:
     }
 
     /// Disks stay in the global context after a test, so every name is unique within the process.
+    /// Spins until `count` requests wait for the creation of `name`: no timing assumption, and a creator
+    /// that never gets its waiter fails the test by the deadline instead of passing.
+    static void waitForWaiters(const String & name, size_t count)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (getContext().context->getDiskCreationWaiters(name) < count)
+        {
+            ASSERT_LT(std::chrono::steady_clock::now(), deadline) << "no request joined the creation";
+            std::this_thread::yield();
+        }
+    }
+
     static String uniqueDiskName(const String & prefix)
     {
         static std::atomic<size_t> counter = 0;
@@ -422,18 +436,17 @@ TEST_F(CASStartupStaleMounts, ConcurrentRequestsShareOneFailure)
     std::mutex mutex;
     std::condition_variable cv;
     bool first_started = false;
-    bool second_returned = false;
     std::atomic<size_t> creator_calls = 0;
 
     const auto failing_creator = [&](const DB::DisksMap &) -> DB::DiskPtr
     {
         ++creator_calls;
-        std::unique_lock lock(mutex);
-        first_started = true;
-        cv.notify_all();
-        /// Gives the second request time to join this creation; it returns early only if it did not join.
-        /// A late scheduler can only cause a false failure, never a false pass.
-        cv.wait_for(lock, std::chrono::seconds(5), [&] { return second_returned; });
+        {
+            std::lock_guard lock(mutex);
+            first_started = true;
+            cv.notify_all();
+        }
+        waitForWaiters(name, 1);
         DB::ErrnoException::throwWithErrno(DB::ErrorCodes::BAD_ARGUMENTS, ENOSPC, "creation failed");
     };
 
@@ -472,13 +485,7 @@ TEST_F(CASStartupStaleMounts, ConcurrentRequestsShareOneFailure)
         std::unique_lock lock(mutex);
         first_is_creating = cv.wait_for(lock, std::chrono::seconds(30), [&] { return first_started; });
     }
-    std::thread second([&]
-    {
-        request("second", second_outcome);
-        std::lock_guard lock(mutex);
-        second_returned = true;
-        cv.notify_all();
-    });
+    std::thread second([&] { request("second", second_outcome); });
     first.join();
     second.join();
 
@@ -522,4 +529,153 @@ TEST_F(CASStartupStaleMounts, ConfigReloadSkipsADiskBeingCreated)
 
     EXPECT_EQ(disk, created);
     EXPECT_EQ(getContext().context->getDisk(name), created);
+}
+
+/// A reload during a creation drops only the storage policies that name the disk being created.
+/// Policies on other disks are applied, and a policy that already exists keeps its previous disks.
+TEST_F(CASStartupStaleMounts, ConfigReloadKeepsPoliciesThatDoNotNameTheDiskBeingCreated)
+{
+    const String name = uniqueDiskName("reload_policies");
+    const fs::path other_path = root / "other_disk";
+    const fs::path config_disk_path = root / "config_disk";
+    const fs::path custom_disk_path = root / "custom_disk";
+    for (const auto & path : {other_path, config_disk_path, custom_disk_path})
+        fs::create_directories(path);
+
+    const auto reload_config = [&](const String & policies, bool with_creating_disk)
+    {
+        std::ostringstream xml;
+        xml << "<clickhouse><storage_configuration><disks>"
+            << "<other><type>local</type><path>" << other_path.string() << "/</path></other>";
+        if (with_creating_disk)
+            xml << "<" << name << "><type>local</type><path>" << config_disk_path.string() << "/</path></" << name << ">";
+        xml << "</disks><policies>" << policies << "</policies></storage_configuration></clickhouse>";
+        std::istringstream in(xml.str());
+        return Poco::AutoPtr<Poco::Util::XMLConfiguration>(new Poco::Util::XMLConfiguration(in));
+    };
+    const auto policy = [](const String & policy_name, const String & disks)
+    {
+        return "<" + policy_name + "><volumes><v>" + disks + "</v></volumes></" + policy_name + ">";
+    };
+
+    getContext().context->getPoliciesMap();
+    getContext().context->updateStorageConfiguration(*reload_config(policy("p_old", "<disk>other</disk>"), false));
+    ASSERT_TRUE(getContext().context->getPoliciesMap().contains("p_old"));
+
+    getContext().context->getOrCreateDisk(name, [&](const DB::DisksMap &) -> DB::DiskPtr
+    {
+        const String policies = policy("p_old", "<disk>other</disk><disk>" + name + "</disk>")
+            + policy("p_new_on_creating", "<disk>" + name + "</disk>") + policy("p_new_on_other", "<disk>other</disk>");
+        getContext().context->updateStorageConfiguration(*reload_config(policies, true));
+        return std::make_shared<DB::DiskLocal>(name, custom_disk_path.string() + "/");
+    });
+
+    const auto policies = getContext().context->getPoliciesMap();
+    EXPECT_TRUE(policies.contains("p_new_on_other"));
+    EXPECT_FALSE(policies.contains("p_new_on_creating"));
+    ASSERT_TRUE(policies.contains("p_old"));
+    EXPECT_EQ(policies.at("p_old")->getDisks().size(), 1u);
+}
+
+/// A failed creation rethrows the creator's own exception, not a copy sliced to a base type.
+TEST_F(CASStartupStaleMounts, FailedCreationKeepsTheExceptionTypeForTheCreator)
+{
+    EXPECT_THROW(
+        getContext().context->getOrCreateDisk(uniqueDiskName("fenced_creator"), [&](const DB::DisksMap &) -> DB::DiskPtr
+        {
+            throw MountFencedException("fenced");
+        }),
+        MountFencedException);
+}
+
+/// While a disk is being created, resolving it by name says so instead of reporting an unknown disk.
+TEST_F(CASStartupStaleMounts, LookupOfADiskBeingCreatedSaysSo)
+{
+    const String name = uniqueDiskName("lookup_in_flight");
+    const fs::path custom_disk_path = root / "custom_disk";
+    fs::create_directories(custom_disk_path);
+
+    String get_disk_message;
+    String policy_message;
+    int get_disk_code = 0;
+    getContext().context->getOrCreateDisk(name, [&](const DB::DisksMap &) -> DB::DiskPtr
+    {
+        try
+        {
+            getContext().context->getDisk(name);
+        }
+        catch (const DB::Exception & e)
+        {
+            get_disk_code = e.code();
+            get_disk_message = e.message();
+        }
+        try
+        {
+            getContext().context->getStoragePolicyFromDisk(name);
+        }
+        catch (const DB::Exception & e)
+        {
+            policy_message = e.message();
+        }
+        return std::make_shared<DB::DiskLocal>(name, custom_disk_path.string() + "/");
+    });
+
+    EXPECT_EQ(get_disk_code, DB::ErrorCodes::UNKNOWN_DISK);
+    EXPECT_TRUE(get_disk_message.contains("being created")) << get_disk_message;
+    EXPECT_TRUE(policy_message.contains("being created")) << policy_message;
+    EXPECT_NO_THROW(getContext().context->getDisk(name));
+}
+
+/// A waiter of a failed creation gets a copy of the creator's exception of the same type.
+TEST_F(CASStartupStaleMounts, WaiterOfAFailedCreationGetsTheExceptionType)
+{
+    const String name = uniqueDiskName("fenced_waiter");
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool creating = false;
+    bool waiter_got_fenced = false;
+    bool creator_got_fenced = false;
+
+    std::thread creator([&]
+    {
+        try
+        {
+            getContext().context->getOrCreateDisk(name, [&](const DB::DisksMap &) -> DB::DiskPtr
+            {
+                {
+                    std::lock_guard lock(mutex);
+                    creating = true;
+                    cv.notify_all();
+                }
+                waitForWaiters(name, 1);
+                throw MountFencedException("fenced");
+            });
+        }
+        catch (const MountFencedException &)
+        {
+            creator_got_fenced = true;
+        }
+        catch (...)
+        {
+        }
+    });
+    {
+        std::unique_lock lock(mutex);
+        ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(30), [&] { return creating; }));
+    }
+    try
+    {
+        getContext().context->getOrCreateDisk(name, [](const DB::DisksMap &) -> DB::DiskPtr { return nullptr; });
+    }
+    catch (const MountFencedException &)
+    {
+        waiter_got_fenced = true;
+    }
+    catch (...)
+    {
+    }
+    creator.join();
+
+    EXPECT_TRUE(creator_got_fenced);
+    EXPECT_TRUE(waiter_got_fenced);
 }

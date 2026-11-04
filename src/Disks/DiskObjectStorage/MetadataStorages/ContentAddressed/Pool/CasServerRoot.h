@@ -271,6 +271,10 @@ class MountFencedException : public DB::Exception
 public:
     explicit MountFencedException(const String & msg)
         : DB::Exception(msg, DB::ErrorCodes::ABORTED) {}
+
+    /// Copies of this exception (`copyMutableException`) must keep the type that catch sites match.
+    MountFencedException * clone() const override { return new MountFencedException(*this); }
+    void rethrow() const override { throw *this; } // NOLINT
 };
 
 /// A caller never claims twice with one `writer_epoch`; a retry allocates a new one. That is why a

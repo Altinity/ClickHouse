@@ -666,7 +666,12 @@ struct ContextSharedPart : boost::noncopyable
     /// Storage disk chooser for MergeTree engines
     mutable std::shared_ptr<const DiskSelector> merge_tree_disk_selector TSA_GUARDED_BY(storage_policies_mutex);
     /// Custom disks being created by `getOrCreateDisk`, by name
-    mutable std::unordered_map<String, std::shared_future<DiskPtr>> disks_being_created TSA_GUARDED_BY(storage_policies_mutex);
+    struct DiskCreation
+    {
+        std::shared_future<DiskPtr> result;
+        size_t waiters = 0;
+    };
+    mutable std::unordered_map<String, DiskCreation> disks_being_created TSA_GUARDED_BY(storage_policies_mutex);
     /// Storage policy chooser for MergeTree engines
     mutable std::shared_ptr<const StoragePolicySelector> merge_tree_storage_policy_selector TSA_GUARDED_BY(storage_policies_mutex);
 
@@ -6773,7 +6778,17 @@ DiskPtr Context::getDisk(const String & name) const
 {
     std::lock_guard lock(shared->storage_policies_mutex);
 
+    return getDiskOrExplainCreation(lock, name);
+}
+
+DiskPtr Context::getDiskOrExplainCreation(std::lock_guard<std::mutex> & lock, const String & name) const TSA_REQUIRES(shared->storage_policies_mutex)
+{
     auto disk_selector = getDiskSelector(lock);
+    if (auto disk = disk_selector->tryGet(name))
+        return disk;
+
+    if (shared->disks_being_created.contains(name))
+        throw Exception(ErrorCodes::UNKNOWN_DISK, "Disk {} is being created by another request, retry when it is created", backQuote(name));
 
     return disk_selector->get(name);
 }
@@ -6812,13 +6827,14 @@ DiskPtr Context::getOrCreateDisk(const String & name, DiskCreator creator) const
 
         if (auto it = shared->disks_being_created.find(name); it != shared->disks_being_created.end())
         {
-            creation = it->second;
+            ++it->second.waiters;
+            creation = it->second.result;
         }
         else
         {
             disks_map = disk_selector->getDisksMap();
             creation = promise.get_future().share();
-            shared->disks_being_created.emplace(name, creation);
+            shared->disks_being_created.emplace(name, ContextSharedPart::DiskCreation{creation, 0});
             is_creator = true;
         }
     }
@@ -6856,12 +6872,22 @@ DiskPtr Context::getOrCreateDisk(const String & name, DiskCreator creator) const
         }
     }
 
+    /// Waiters get a copy so that the creator can modify its own exception while they read theirs.
     if (error)
-        promise.set_exception(error);
+        promise.set_exception(copyMutableException(error));
     else
         promise.set_value(disk);
 
-    return getDiskCreationResult(creation);
+    if (error)
+        std::rethrow_exception(error);
+    return disk;
+}
+
+size_t Context::getDiskCreationWaiters(const String & name) const
+{
+    std::lock_guard lock(shared->storage_policies_mutex);
+    auto it = shared->disks_being_created.find(name);
+    return it == shared->disks_being_created.end() ? 0 : it->second.waiters;
 }
 
 StoragePolicyPtr Context::getStoragePolicy(const String & name) const
@@ -6883,8 +6909,7 @@ StoragePolicyPtr Context::getStoragePolicyFromDisk(const String & disk_name) con
 
     if (!storage_policy)
     {
-        auto disk_selector = getDiskSelector(lock);
-        auto disk = disk_selector->get(disk_name);
+        auto disk = getDiskOrExplainCreation(lock, disk_name);
         auto volume = std::make_shared<SingleDiskVolume>("_volume_" + disk_name, disk);
 
         static const auto move_factor_for_single_disk_volume = 0.0;
@@ -6963,11 +6988,11 @@ void Context::updateStorageConfiguration(const Poco::Util::AbstractConfiguration
     {
         std::lock_guard lock(shared->storage_policies_mutex);
         Strings disks_to_reinit;
+        NameSet disks_being_created;
+        for (const auto & [name, _] : shared->disks_being_created)
+            disks_being_created.insert(name);
         if (shared->merge_tree_disk_selector)
         {
-            NameSet disks_being_created;
-            for (const auto & [name, _] : shared->disks_being_created)
-                disks_being_created.insert(name);
             shared->merge_tree_disk_selector = shared->merge_tree_disk_selector->updateFromConfig(
                 config, "storage_configuration.disks", shared_from_this(), disks_being_created);
         }
@@ -6977,7 +7002,7 @@ void Context::updateStorageConfiguration(const Poco::Util::AbstractConfiguration
             try
             {
                 shared->merge_tree_storage_policy_selector = shared->merge_tree_storage_policy_selector->updateFromConfig(
-                    config, "storage_configuration.policies", shared->merge_tree_disk_selector, disks_to_reinit);
+                    config, "storage_configuration.policies", shared->merge_tree_disk_selector, disks_to_reinit, disks_being_created);
             }
             catch (Exception & e)
             {
