@@ -1895,6 +1895,10 @@ public:
     /// returns without sending another task request.
     void interruptSwarmTaskAdmission();
     bool isSwarmTaskAdmissionInterrupted() const;
+    /// Production shutdown never clears the interrupt: it stays set until process exit.
+    /// Unit tests share one `ContextSharedPart` through `createCopy` and must clear it,
+    /// or a later test sees admission as already interrupted.
+    void resetSwarmTaskAdmissionInterruptedForTests();
     /// Shared lock for one swarm task admission. Admissions run concurrently with each other;
     /// `stopSwarmMode` and `startSwarmMode` take the lock exclusively. The callback drops the
     /// caller's lock before waiting on its connection mutex, then locks again only to send.

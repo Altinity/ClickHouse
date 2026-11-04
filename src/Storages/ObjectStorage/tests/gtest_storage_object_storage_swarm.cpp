@@ -242,7 +242,7 @@ TEST(StorageObjectStorageSwarm, SiblingAdmissionDoesNotPinStopDuringResponseRead
         std::lock_guard connection_lock(connection_mutex);
         {
             auto admission = context->lockSwarmMode();
-            if (!context->isSwarmModeEnabled() || context->isSwarmTaskAdmissionInterrupted())
+            if (!context->isSwarmModeEnabled())
                 return std::make_shared<DB::ClusterFunctionReadTaskResponse>();
         }
 
@@ -317,6 +317,21 @@ TEST(StorageObjectStorageSwarm, SiblingAdmissionDoesNotPinStopDuringResponseRead
 TEST(StorageObjectStorageSwarm, InterruptUnblocksTaskAdmissionBeforeStop)
 {
     auto context = DB::Context::createCopy(::getContext().context);
+    /// `createCopy` shares the process-wide interrupt flag. Clear it on entry and on every
+    /// exit, including a failed assertion, so a later test is not already interrupted.
+    struct ClearAdmissionInterrupt
+    {
+        explicit ClearAdmissionInterrupt(const DB::ContextMutablePtr & context_) : context(context_)
+        {
+            context->resetSwarmTaskAdmissionInterruptedForTests();
+        }
+        ~ClearAdmissionInterrupt()
+        {
+            context->resetSwarmTaskAdmissionInterruptedForTests();
+        }
+        DB::ContextMutablePtr context;
+    };
+    ClearAdmissionInterrupt clear_admission_interrupt(context);
     context->startSwarmMode();
 
     std::mutex mutex;

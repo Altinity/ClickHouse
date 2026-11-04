@@ -8046,6 +8046,11 @@ bool Context::isSwarmTaskAdmissionInterrupted() const
     return shared->swarm_task_admission_interrupted.load();
 }
 
+void Context::resetSwarmTaskAdmissionInterruptedForTests()
+{
+    shared->swarm_task_admission_interrupted.store(false);
+}
+
 std::shared_lock<SharedMutex> Context::lockSwarmMode() const
 {
     return std::shared_lock(shared->swarm_mode_mutex);
