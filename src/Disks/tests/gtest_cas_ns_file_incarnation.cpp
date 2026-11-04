@@ -243,7 +243,17 @@ TEST(CASNsFileIncarnation, ColdReaderDoesNotRepublishALifeRetiredAfterItsCatalog
         retired = !CasRefCatalog::lifeIfCataloged(catalog_op, layout, ns).has_value();
     };
 
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)store->namespaceFilesLifeIfReadable(ns); });
+    try
+    {
+        (void)store->namespaceFilesLifeIfReadable(ns);
+        FAIL() << "expected the cold reader to be refused";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR);
+        EXPECT_NE(e.message().find("was retired while"), String::npos) << e.message();
+        EXPECT_EQ(e.message().find("write"), String::npos) << "a read is not a write: " << e.message();
+    }
     ASSERT_TRUE(retired) << "the race must fire after the reader's second catalog read and drain the row";
     EXPECT_NE(store->refTableLifeForTest(ns), retired_life)
         << "a runtime for the retired life was published";

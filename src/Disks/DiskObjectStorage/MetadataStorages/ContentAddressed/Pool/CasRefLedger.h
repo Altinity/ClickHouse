@@ -943,7 +943,8 @@ private:
     {
         std::shared_ptr<RefTableRuntime> current;
         /// Bumped by `invalidateRemovedCatalogLife`, and by the eviction of a runtime that had closed or
-        /// applied its removal (another server's GC leader may drain that life without telling us). A slot with a non-zero count is never erased (only
+        /// applied its removal: another server's GC leader may drain that life without telling us.
+        /// A slot with a non-zero count is never erased (only
         /// remount clears it, and remount also moves the fence generation), so a cold admission compares
         /// the count it captured before its catalog read with the one at insertion.
         uint64_t retirements = 0;
@@ -1046,13 +1047,22 @@ private:
     /// name slot or runtime.
     std::shared_ptr<RefTableRuntime> lookupRefTableRuntime(const RootNamespace & ns) const;
 
+    /// Whether the caller admitting a runtime reads or mutates the namespace; it picks the wording of a
+    /// stale-observation refusal, which is retryable either way.
+    enum class RuntimeAdmission : uint8_t
+    {
+        Read,
+        Write,
+    };
+
     /// Publishes or returns one runtime for an exact catalog-observed life and admitted mount-fence
     /// generation. A conflicting attached identity is a stale observation and fails closed rather than
     /// retargeting either runtime. `retirements_seen` is `refNameRetirements` captured before the
     /// catalog read that produced `life`; if a retirement of this name landed since, the observation is
     /// stale and the call throws retry-later instead of republishing a possibly retired life.
     std::shared_ptr<RefTableRuntime> acquireRefTableRuntime(
-        const NamespaceLifeId & life, uint64_t admitted_generation, uint64_t retirements_seen);
+        const NamespaceLifeId & life, uint64_t admitted_generation, uint64_t retirements_seen,
+        RuntimeAdmission admission);
 
     /// The name's retirement count, under `ref_queue_mutex`. Zero for a name with no slot.
     uint64_t refNameRetirements(const RootNamespace & ns) const;
