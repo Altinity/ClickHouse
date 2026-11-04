@@ -215,6 +215,105 @@ TEST(StorageObjectStorageSwarm, TaskResponseReadDoesNotBlockStop)
     EXPECT_EQ(callbacks.load(), 1);
 }
 
+TEST(StorageObjectStorageSwarm, SiblingAdmissionDoesNotPinStopDuringResponseRead)
+{
+    auto context = DB::Context::createCopy(::getContext().context);
+    context->startSwarmMode();
+
+    /// Stands in for one connection's `callback_mutex`. The task response read holds it.
+    std::mutex connection_mutex;
+    std::mutex mutex;
+    std::condition_variable ready;
+    int reached_connection = 0;
+    bool reader_in_receive = false;
+    bool finish_read = false;
+
+    /// Same order as the `TCPHandler` read-task callback: drop the caller's admission lock,
+    /// wait for the connection mutex, then hold the admission lock only around the send.
+    DB::ClusterFunctionReadTaskCallback callback = [&]()
+    {
+        context->releaseSwarmAdmissionLock();
+        {
+            std::lock_guard lock(mutex);
+            ++reached_connection;
+        }
+        ready.notify_all();
+
+        std::lock_guard connection_lock(connection_mutex);
+        {
+            auto admission = context->lockSwarmMode();
+            if (!context->isSwarmModeEnabled() || context->isSwarmTaskAdmissionInterrupted())
+                return std::make_shared<DB::ClusterFunctionReadTaskResponse>();
+        }
+
+        std::unique_lock lock(mutex);
+        if (!reader_in_receive)
+        {
+            reader_in_receive = true;
+            ready.notify_all();
+            ready.wait(lock, [&] { return finish_read; });
+        }
+        return std::make_shared<DB::ClusterFunctionReadTaskResponse>();
+    };
+
+    std::exception_ptr error;
+    std::thread worker([&]()
+    {
+        try
+        {
+            DB::StorageObjectStorageSource::ReadTaskIterator iterator(
+                callback,
+                /*max_threads_count=*/2,
+                /*is_archive_=*/false,
+                /*object_storage_=*/nullptr,
+                /*table_location_=*/"",
+                context);
+            (void)iterator;
+        }
+        catch (...)
+        {
+            error = std::current_exception();
+        }
+    });
+
+    bool both_reached = false;
+    {
+        std::unique_lock lock(mutex);
+        both_reached = ready.wait_for(lock, std::chrono::seconds(5), [&] { return reached_connection >= 2 && reader_in_receive; });
+    }
+    if (!both_reached)
+    {
+        {
+            std::lock_guard lock(mutex);
+            finish_read = true;
+        }
+        ready.notify_all();
+        worker.join();
+        context->startSwarmMode();
+        FAIL() << "Sibling admissions did not reach the response read";
+    }
+
+    auto stop_result = std::async(std::launch::async, [&] { return context->stopSwarmMode(); });
+    const bool stop_finished = stop_result.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+    bool stopped = false;
+    if (stop_finished)
+        stopped = stop_result.get();
+
+    {
+        std::lock_guard lock(mutex);
+        finish_read = true;
+    }
+    ready.notify_all();
+    if (stop_result.valid())
+        stop_result.wait();
+    worker.join();
+    context->startSwarmMode();
+
+    ASSERT_FALSE(error);
+    ASSERT_TRUE(stop_finished);
+    EXPECT_TRUE(stopped);
+}
+
 TEST(StorageObjectStorageSwarm, InterruptUnblocksTaskAdmissionBeforeStop)
 {
     auto context = DB::Context::createCopy(::getContext().context);

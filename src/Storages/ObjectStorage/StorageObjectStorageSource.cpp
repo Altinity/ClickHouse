@@ -2541,11 +2541,12 @@ ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::takeNextObject(bool 
 
         ClusterFunctionReadTaskResponsePtr task;
         {
-            /// The shared lock covers the enabled-state check and sending the task request.
-            /// The callback releases it before reading the response, so a request already sent
-            /// is still answered while `SYSTEM STOP SWARM MODE` can return. Admissions from
-            /// different queries run concurrently. The retry wait and metadata resolution stay
-            /// outside the lock.
+            /// The shared lock covers the enabled-state check. The callback drops it before
+            /// waiting on its own connection mutex, then takes it again only to send the task
+            /// request. A response read and a sibling blocked on that connection mutex do not
+            /// hold it, so `SYSTEM STOP SWARM MODE` is not stuck for `receive_timeout`.
+            /// Admissions from different queries run concurrently. The retry wait and metadata
+            /// resolution stay outside the lock.
             auto swarm_mode_lock = getContext()->lockSwarmMode();
             if (!getContext()->isSwarmModeEnabled())
             {

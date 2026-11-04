@@ -820,10 +820,11 @@ struct ContextSharedPart : boost::noncopyable
     /// sees it and returns without sending another task request.
     std::atomic<bool> swarm_task_admission_interrupted = false;
     /// Held shared while a worker decides to ask for a task and sends that request. The
-    /// response read does not hold it, so admissions still run concurrently and stop is not
-    /// stuck for `receive_timeout`. Stop/start/shutdown hold it exclusively: no request is
-    /// sent after `stopSwarmMode` returns. `SharedMutex` prefers writers, so a pending stop
-    /// blocks new admissions instead of waiting behind them.
+    /// callback drops it before waiting on the connection mutex, and the response read does
+    /// not hold it, so a sibling blocked on that mutex does not keep stop behind
+    /// `receive_timeout`. Stop/start/shutdown hold it exclusively: no request is sent after
+    /// `stopSwarmMode` returns. `SharedMutex` prefers writers, so a pending stop blocks new
+    /// admissions instead of waiting behind them.
     mutable SharedMutex swarm_mode_mutex;
 
     Stopwatch uptime_watch TSA_GUARDED_BY(mutex);

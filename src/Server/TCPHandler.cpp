@@ -821,29 +821,41 @@ void TCPHandler::runImpl()
                     Stopwatch watch;
                     CurrentMetrics::Increment callback_metric_increment(CurrentMetrics::ReadTaskRequestsSent);
 
+                    /// `takeNextObject` holds the admission lock across this callback. Drop it before
+                    /// waiting for `callback_mutex`: a sibling thread of this query may already hold
+                    /// that mutex while reading a task response, and `stopSwarmMode` must not wait
+                    /// out that read behind the shared admission lock.
+                    if (query_state->query_context)
+                        query_state->query_context->releaseSwarmAdmissionLock();
+
                     std::lock_guard lock(*callback_mutex);
 
                     checkIfQueryCanceled(*query_state);
 
                     try
                     {
-                        /// Shutdown sets the interrupt flag before it waits for this lock. Return
-                        /// without sending, so the worker query ends instead of failing, and no
-                        /// response is left unread on the connection.
-                        if (server.isCancelled()
-                            || (query_state->query_context && query_state->query_context->isSwarmTaskAdmissionInterrupted()))
-                            return std::make_shared<ClusterFunctionReadTaskResponse>();
-
-                        sendReadTaskRequest();
-
-                        ProfileEvents::increment(ProfileEvents::ReadTaskRequestsSent);
-
-                        /// The initiator may already be assigning the file for this request.
-                        /// Read that response without the admission lock: `stopSwarmMode` can
-                        /// return, and the assigned file is still processed.
                         if (query_state->query_context)
-                            query_state->query_context->releaseSwarmAdmissionLock();
+                        {
+                            /// Re-check under the admission lock after the connection mutex. Shutdown
+                            /// sets the interrupt flag before it waits for this lock. Return without
+                            /// sending, so the worker query ends and no response is left unread.
+                            auto swarm_mode_lock = query_state->query_context->lockSwarmMode();
+                            if (server.isCancelled()
+                                || !query_state->query_context->isSwarmModeEnabled()
+                                || query_state->query_context->isSwarmTaskAdmissionInterrupted())
+                                return std::make_shared<ClusterFunctionReadTaskResponse>();
 
+                            sendReadTaskRequest();
+                            ProfileEvents::increment(ProfileEvents::ReadTaskRequestsSent);
+                        }
+                        else
+                        {
+                            sendReadTaskRequest();
+                            ProfileEvents::increment(ProfileEvents::ReadTaskRequestsSent);
+                        }
+
+                        /// The admission lock is released above. The initiator may already be assigning
+                        /// the file for this request; read that response so the assigned file is processed.
                         auto res = receiveClusterFunctionReadTaskResponse(*query_state);
 
                         ProfileEvents::increment(ProfileEvents::ReadTaskRequestsSentElapsedMicroseconds, watch.elapsedMicroseconds());

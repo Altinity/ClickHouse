@@ -1896,8 +1896,8 @@ public:
     void interruptSwarmTaskAdmission();
     bool isSwarmTaskAdmissionInterrupted() const;
     /// Shared lock for one swarm task admission. Admissions run concurrently with each other;
-    /// `stopSwarmMode` and `startSwarmMode` take the lock exclusively. The lock covers the
-    /// decision to send a task request. The callback releases it before reading the response.
+    /// `stopSwarmMode` and `startSwarmMode` take the lock exclusively. The callback drops the
+    /// caller's lock before waiting on its connection mutex, then locks again only to send.
     std::shared_lock<SharedMutex> lockSwarmMode() const;
     void bindSwarmAdmissionLock(std::shared_lock<SharedMutex> * lock) const;
     void unbindSwarmAdmissionLock() const;
