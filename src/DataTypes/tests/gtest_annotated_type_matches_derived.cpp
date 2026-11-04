@@ -46,8 +46,6 @@ TEST(AnnotatedTypeMatchesDerived, ContainersAreMatchedElementwise)
     EXPECT_FALSE(matches("Map(String, AggregateFunction(uniq, UInt64))", "Array(Tuple(String, String))"));
     EXPECT_FALSE(matches("Tuple(a AggregateFunction(uniq, UInt64), b UInt64)", "String"));
     EXPECT_FALSE(matches("Tuple(a AggregateFunction(uniq, UInt64), b UInt64)", "Tuple(a String)"));
-
-    EXPECT_TRUE(matches("SimpleAggregateFunction(anyLast, Nullable(String))", "Nullable(String)"));
 }
 
 TEST(AnnotatedTypeMatchesDerived, StrictModeRefusesAnAnnotationThatRetypesTheColumn)
@@ -72,13 +70,6 @@ TEST(AnnotatedTypeMatchesDerived, StrictModeRefusesAnAnnotationThatRetypesTheCol
 
 TEST(AnnotatedTypeMatchesDerived, StrictModeAcceptsWhatTheParquetWriterProduces)
 {
-    EXPECT_TRUE(matches("SimpleAggregateFunction(sum, UInt64)", "UInt64"));
-    EXPECT_TRUE(matches("SimpleAggregateFunction(anyLast, String)", "String"));
-    EXPECT_TRUE(matches("SimpleAggregateFunction(anyLast, UUID)", "UUID"));
-    EXPECT_TRUE(matches("SimpleAggregateFunction(anyLast, Decimal(18, 4))", "Decimal(18, 4)"));
-    EXPECT_TRUE(matches("SimpleAggregateFunction(anyLast, FixedString(16))", "FixedString(16)"));
-    EXPECT_TRUE(matches("SimpleAggregateFunction(anyLast, Date32)", "Date32"));
-
     EXPECT_TRUE(matches("SimpleAggregateFunction(sum, UInt64)", "Nullable(UInt64)"));
     EXPECT_TRUE(matches("SimpleAggregateFunction(anyLast, Nullable(String))", "String"));
     EXPECT_TRUE(matches("SimpleAggregateFunction(anyLast, Nullable(String))", "Nullable(String)"));

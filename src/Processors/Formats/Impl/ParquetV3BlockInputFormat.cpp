@@ -575,7 +575,7 @@ Geometry columns must appear at the root of the schema or nested inside `Tuple` 
 
 Parquet has no aggregate-state type, so ClickHouse writes an [`AggregateFunction`](/reference/data-types/aggregatefunction) column as a plain `BYTE_ARRAY` holding the serialized state - the same bytes the `-State` combinator produces - with no `STRING`/`UTF8` logical type, since a state is arbitrary binary data rather than text. A [`SimpleAggregateFunction(f, T)`](/reference/data-types/simpleaggregatefunction) column is written as an ordinary value of type `T`.
 
-Neither type can be recovered from the Parquet schema alone: every `AggregateFunction` state is just a binary column, and a `SimpleAggregateFunction` is indistinguishable from its storage type. ClickHouse therefore records the type names in a `clickhouse.column_types` key in the file-level Parquet metadata, as a JSON object mapping column name to ClickHouse type name. The recorded name includes the state version, which is what pins the serialized layout across server versions.
+Neither type can be recovered from the Parquet schema alone: every `AggregateFunction` state is just a binary column, and a `SimpleAggregateFunction` is indistinguishable from its storage type. ClickHouse therefore records the type names in a `clickhouse.column_types` key in the file-level Parquet metadata, as a JSON object `{"version": 1, "columns": {...}}` whose `columns` maps column name to ClickHouse type name. The recorded name includes the state version, which is what pins the serialized layout across server versions.
 
 Both writing an `AggregateFunction` column and reconstructing one from that metadata on read are gated by [`allow_experimental_aggregate_function_states_in_open_formats`](/reference/settings/session-settings/allow-experimental#allow_experimental_aggregate_function_states_in_open_formats), which is disabled by default. A state is an opaque blob passed to the deserializer of whichever aggregate function the file names, so with the setting enabled it is the file, not the query, choosing that deserializer; keep it disabled for files from untrusted sources, where such a file is then rejected rather than read as `String`. With it disabled, writing is refused with `UNKNOWN_TYPE`, exactly as in versions that did not support states in Parquet at all. `SimpleAggregateFunction` is gated in neither direction: it is stored as an ordinary value of its storage type and has always been written that way.
 
@@ -602,7 +602,7 @@ SELECT uniqMerge(CAST(u AS AggregateFunction(uniq, UInt64)))
 FROM file('states.parquet', Parquet, 'u String');
 ```
 
-Reading fails rather than guessing if the recorded type does not describe the data actually in the file. Min/max statistics are never used for pruning a state column, because bounds over serialized states are meaningless.
+Reading fails rather than guessing if the recorded type does not describe the data actually in the file. Min/max statistics, the column index and bloom filters are not written for a state column, and statistics are never used for pruning one, because bounds over serialized states are meaningless.
 
 Other query engines see a plain binary (or `T`-typed) column and ignore the metadata key. The same mechanism backs [aggregate-state support in Iceberg tables](/reference/engines/table-engines/integrations/iceberg#aggregate-function-states), whose data files are Parquet.
 

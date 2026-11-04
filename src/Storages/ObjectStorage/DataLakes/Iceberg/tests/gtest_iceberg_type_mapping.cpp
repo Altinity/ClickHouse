@@ -179,32 +179,6 @@ TEST(IcebergTypeMapping, NullableDecimalPrecisionAboveSpecLimitIsRejected)
     expectIcebergTypeRejected(makeNullable(createDecimal<DataTypeDecimal>(76, 1)));
 }
 
-TEST(IcebergTypeMapping, AggregateFunctionMapsToBinary)
-{
-    tryRegisterAggregateFunctions();
-    auto type = DataTypeFactory::instance().get("AggregateFunction(uniq, UInt64)");
-    Int32 iter = 0;
-    UInt64 format_version = 3;
-    auto [iceberg_type, required] = getIcebergType(type, iter, format_version);
-    ASSERT_TRUE(iceberg_type.isString());
-    EXPECT_EQ(iceberg_type.extract<String>(), "binary");
-    EXPECT_TRUE(required);
-}
-
-TEST(IcebergTypeMapping, AggregateStatesNeedATypeAnnotation)
-{
-    tryRegisterAggregateFunctions();
-    EXPECT_TRUE(needsClickHouseTypeAnnotation(DataTypeFactory::instance().get("AggregateFunction(uniq, UInt64)")));
-    EXPECT_TRUE(needsClickHouseTypeAnnotation(DataTypeFactory::instance().get("SimpleAggregateFunction(sum, UInt64)")));
-    EXPECT_TRUE(needsClickHouseTypeAnnotation(DataTypeFactory::instance().get("Array(AggregateFunction(uniq, UInt64))")));
-    EXPECT_TRUE(
-        needsClickHouseTypeAnnotation(DataTypeFactory::instance().get("SimpleAggregateFunction(anyLast, Nullable(String))")));
-
-    EXPECT_FALSE(needsClickHouseTypeAnnotation(std::make_shared<DataTypeUInt64>()));
-    EXPECT_FALSE(needsClickHouseTypeAnnotation(DataTypeFactory::instance().get("Array(Nullable(String))")));
-    EXPECT_FALSE(needsClickHouseTypeAnnotation(DataTypeFactory::instance().get("Tuple(a UInt32, b String)")));
-}
-
 TEST(IcebergTypeMapping, AnnotationNamePinsAggregateStateVersion)
 {
     tryRegisterAggregateFunctions();

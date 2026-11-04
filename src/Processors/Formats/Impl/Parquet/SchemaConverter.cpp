@@ -76,8 +76,24 @@ SchemaConverter::SchemaConverter(
             {
                 Poco::JSON::Parser parser;
                 const auto object = parser.parse(kv.value).extract<Poco::JSON::Object::Ptr>();
-                for (const auto & name : object->getNames())
-                    annotated_column_type_names[name] = object->getValue<String>(name);
+                const auto version = object->getValue<Int64>("version");
+                if (version != clickhouse_column_types_version)
+                    throw Exception(
+                        ErrorCodes::INCORRECT_DATA,
+                        "Unsupported version {} of the `{}` key-value metadata of the parquet file, supported version is {}",
+                        version,
+                        clickhouse_column_types_key,
+                        clickhouse_column_types_version);
+
+                const auto columns = object->getObject("columns");
+                if (!columns)
+                    throw Exception(
+                        ErrorCodes::INCORRECT_DATA,
+                        "The `{}` key-value metadata of the parquet file has no `columns` object",
+                        clickhouse_column_types_key);
+
+                for (const auto & name : columns->getNames())
+                    annotated_column_type_names[name] = columns->getValue<String>(name);
             }
             catch (Exception & e)
             {

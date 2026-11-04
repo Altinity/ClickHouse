@@ -13,8 +13,10 @@ namespace DB::Parquet
 /// Namespace with structs generated from parquet.thrift
 namespace parq = parquet::format;
 
-/// Maps top-level columns to ClickHouse types not represented by the Parquet schema.
+/// Maps top-level columns to ClickHouse types not represented by the Parquet schema,
+/// as JSON `{"version": 1, "columns": {"<column name>": "<type name>", ...}}`.
 constexpr const char * clickhouse_column_types_key = "clickhouse.column_types";
+constexpr int clickhouse_column_types_version = 1;
 
 /// All templates are explicitly instantiated, feel free to add more types.
 

@@ -234,7 +234,7 @@ def make_mt(
     engine="MergeTree()",
     extra_settings="",
 ):
-    """Create a MergeTree-family table with block-number settings."""
+    """Create a MergeTree table with block-number settings."""
     settings = f"{_BLOCK_SETTINGS}, {extra_settings}" if extra_settings else _BLOCK_SETTINGS
     node.query(
         f"""
@@ -338,7 +338,10 @@ def make_iceberg_s3(
     if_not_exists=False,
     extra_settings="",
 ):
-    """Create an IcebergS3 table at a MinIO prefix."""
+    """Create an IcebergS3 table at a MinIO prefix.
+
+    *url* defaults to ``http://minio1:9001/root/data/{name}/``.
+    """
     if url is None:
         url = f"http://minio1:9001/root/data/{name}/"
     ine = "IF NOT EXISTS " if if_not_exists else ""

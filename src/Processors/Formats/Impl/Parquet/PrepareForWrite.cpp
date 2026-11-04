@@ -975,6 +975,7 @@ void prepareColumnRecursive(
             binary_options.output_string_as_string = false;
             preparePrimitiveColumn(
                 column, type, name, binary_options, states, schemas, lookupLeafFieldId(column_field_ids, name));
+            states.back().write_statistics = false;
             break;
         }
         default:

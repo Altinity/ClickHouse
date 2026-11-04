@@ -172,7 +172,7 @@ def test_aggregate_states_round_trip(started_cluster_iceberg_with_spark, storage
 
 
 @pytest.mark.parametrize("storage_type", ["s3"])
-def test_aggregate_states_read_by_spark(started_cluster_iceberg_with_spark, storage_type):
+def test_aggregate_states_with_spark(started_cluster_iceberg_with_spark, storage_type):
     instance = started_cluster_iceberg_with_spark.instances["node1"]
     spark = started_cluster_iceberg_with_spark.spark_session
     TABLE_NAME = "test_agg_states_spark_" + storage_type + "_" + get_uuid_str()
@@ -201,46 +201,14 @@ def test_aggregate_states_read_by_spark(started_cluster_iceberg_with_spark, stor
 
     df = spark.read.format("iceberg").load(f"{WAREHOUSE}/{TABLE_NAME}")
     assert dict(df.dtypes) == {"k": "int", "u": "binary", "s": "bigint"}
-
     spark_rows = {row["k"]: (bytes(row["u"]).hex().upper(), row["s"]) for row in df.collect()}
-    assert len(spark_rows) == 2
-
     expected = instance.query(
         f"SELECT k, hex(u), s FROM {TABLE_NAME} ORDER BY k FORMAT TSV", settings=STATE_SETTINGS
     ).strip()
-    assert expected != ""
-    for line in expected.split("\n"):
-        k, state_hex, sum_value = line.split("\t")
-        assert spark_rows[int(k)] == (state_hex, int(sum_value))
-
-
-@pytest.mark.parametrize("storage_type", ["s3"])
-def test_aggregate_states_merged_after_spark_append(started_cluster_iceberg_with_spark, storage_type):
-    instance = started_cluster_iceberg_with_spark.instances["node1"]
-    spark = started_cluster_iceberg_with_spark.spark_session
-    TABLE_NAME = "test_agg_states_spark_append_" + storage_type + "_" + get_uuid_str()
-
-    create_iceberg_table(
-        storage_type,
-        instance,
-        TABLE_NAME,
-        started_cluster_iceberg_with_spark,
-        SPARK_SCHEMA,
-        format_version=2,
-        settings=STATE_SETTINGS,
-        additional_settings=PARQUET_STATE_SETTINGS,
-    )
-    insert_states(instance, TABLE_NAME, "toInt64(number)")
-
-    default_download_directory(
-        started_cluster_iceberg_with_spark,
-        storage_type,
-        f"{WAREHOUSE}/{TABLE_NAME}/",
-        f"{WAREHOUSE}/{TABLE_NAME}/",
-    )
-
-    with open(f"{WAREHOUSE}/{TABLE_NAME}/metadata/version-hint.text", "wb") as f:
-        f.write(b"1")
+    assert spark_rows == {
+        int(k): (state_hex, int(sum_value))
+        for k, state_hex, sum_value in (line.split("\t") for line in expected.split("\n"))
+    }
 
     appended = instance.query(
         "SELECT toInt32(number % 2) AS k, hex(uniqState(toUInt64(number % 23))), sum(toInt64(number))"

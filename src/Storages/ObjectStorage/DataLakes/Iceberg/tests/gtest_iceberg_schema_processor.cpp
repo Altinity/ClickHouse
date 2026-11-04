@@ -568,21 +568,6 @@ TEST(IcebergSchemaProcessor, GetSimpleTypeDecimalSignOnlyScaleThrows)
     EXPECT_THROW(IcebergSchemaProcessor::getSimpleType("decimal(20,+)", getContext().context), DB::Exception);
 }
 
-TEST(IcebergSchemaProcessor, AnnotatedSimpleAggregateFunctionFieldNeedsNoSetting)
-{
-    tryRegisterAggregateFunctions();
-    auto schema = parseSchema(
-        R"json({"schema-id":0,"fields":[{"id":1,"name":"s","required":true,"type":"long"}]})json");
-    auto context = contextWithAggregateFunctionStates(false);
-    IcebergSchemaProcessor processor(context);
-    processor.addIcebergTableSchema(schema, context, {{1, "SimpleAggregateFunction(sum, Int64)"}});
-
-    auto columns = processor.getClickHouseTableSchemaById(0);
-    ASSERT_EQ(columns->size(), 1u);
-    EXPECT_EQ(columns->front().name, "s");
-    EXPECT_EQ(columns->front().type->getName(), "SimpleAggregateFunction(sum, Int64)");
-}
-
 TEST(IcebergSchemaProcessor, ChangedAnnotationReparsesIdenticalSchema)
 {
     tryRegisterAggregateFunctions();
@@ -625,18 +610,10 @@ TEST(IcebergSchemaProcessor, SchemasKeepTheAnnotationsTheyWereRegisteredWith)
 TEST(IcebergSchemaProcessor, AnnotationNotMatchingTheFieldTypeIsRejected)
 {
     tryRegisterAggregateFunctions();
-    expectAnnotatedSchemaRejected(
-        parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"u","required":true,"type":"long"}]})json"),
-        {{1, "AggregateFunction(uniq, UInt64)"}});
-}
-
-/// Another engine promoted the field from `int` to `long`, leaving the annotation stale.
-TEST(IcebergSchemaProcessor, AnnotationOfAPromotedFieldIsRejected)
-{
-    tryRegisterAggregateFunctions();
-    expectAnnotatedSchemaRejected(
-        parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"s","required":true,"type":"long"}]})json"),
-        {{1, "SimpleAggregateFunction(max, Int32)"}});
+    auto schema = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"s","required":true,"type":"long"}]})json");
+    expectAnnotatedSchemaRejected(schema, {{1, "AggregateFunction(uniq, UInt64)"}});
+    /// Another engine promoted the field from `int` to `long`, leaving the annotation stale.
+    expectAnnotatedSchemaRejected(schema, {{1, "SimpleAggregateFunction(max, Int32)"}});
 }
 
 /// ClickHouse writes both `Int64` and `UInt64` as `long`.

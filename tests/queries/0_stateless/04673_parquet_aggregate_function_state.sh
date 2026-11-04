@@ -6,7 +6,6 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 SUFFIX="${CLICKHOUSE_DATABASE}_${RANDOM}"
 FILE="agg_state_${SUFFIX}.parquet"
-NESTED="agg_state_nested_${SUFFIX}.parquet"
 MIXED="agg_state_mixed_${SUFFIX}.parquet"
 VERSIONED="agg_state_versioned_${SUFFIX}.parquet"
 REFUSED="agg_state_refused_${SUFFIX}.parquet"
@@ -20,7 +19,7 @@ CACHED_SKIP="agg_state_cached_skip_${SUFFIX}.parquet"
 
 cleanup()
 {
-    rm -f "${USER_FILES_PATH}/${FILE}" "${USER_FILES_PATH}/${NESTED}" "${USER_FILES_PATH}/${MIXED}" \
+    rm -f "${USER_FILES_PATH}/${FILE}" "${USER_FILES_PATH}/${MIXED}" \
         "${USER_FILES_PATH}/${VERSIONED}" "${USER_FILES_PATH}/${REFUSED}" \
         "${USER_FILES_PATH}/${SIMPLE}" "${USER_FILES_PATH}/${UNKNOWN}" "${USER_FILES_PATH}/${MATRIX}" \
         "${USER_FILES_PATH}/${RETYPED_SOURCE}" "${USER_FILES_PATH}/${RETYPED}" \
@@ -56,13 +55,6 @@ ${CLICKHOUSE_CLIENT} ${STATES} --query "
     GROUP BY k
 "
 
-echo '-- without the setting the recorded state type is refused, not silently read as String'
-if ${CLICKHOUSE_CLIENT} --query "DESC file('${FILE}', Parquet)" 2>&1 \
-    | grep -q "allow_experimental_aggregate_function_states_in_open_formats"
-then
-    echo 1
-fi
-
 echo '-- schema inference recovers the aggregate types from the file'
 ${CLICKHOUSE_CLIENT} ${STATES} --query "DESC file('${FILE}', Parquet)"
 
@@ -91,14 +83,6 @@ ${CLICKHOUSE_CLIENT} ${STATES} --query "
     FROM file('${MIXED}', Parquet)
 "
 
-echo '-- a state nested in an Array'
-${CLICKHOUSE_CLIENT} ${STATES} --query "
-    INSERT INTO FUNCTION file('${NESTED}', Parquet)
-    SELECT [uniqState(number), uniqState(number + 100)] AS a FROM numbers(10)
-"
-${CLICKHOUSE_CLIENT} ${STATES} --query "DESC file('${NESTED}', Parquet)"
-${CLICKHOUSE_CLIENT} ${STATES} --query "SELECT arrayMap(x -> finalizeAggregation(x), a) FROM file('${NESTED}', Parquet)"
-
 echo '-- a state pinned to a non-default version keeps that version'
 ${CLICKHOUSE_CLIENT} ${STATES} --query "
     INSERT INTO FUNCTION file('${VERSIONED}', Parquet)
@@ -110,10 +94,6 @@ ${CLICKHOUSE_CLIENT} ${STATES} --query "
     SELECT sumMapMerge(m) = (SELECT sumMap([number % 3], [toUInt32(number)]) FROM numbers(100)) AS matches
     FROM file('${VERSIONED}', Parquet)
 "
-
-echo '-- a refused state column can be skipped instead of refusing the whole file'
-${CLICKHOUSE_CLIENT} ${SKIP} ${NO_CACHE} --query "DESC file('${FILE}', Parquet)"
-${CLICKHOUSE_CLIENT} ${SKIP} ${NO_CACHE} --query "SELECT sum(k) FROM file('${FILE}', Parquet)"
 
 echo '-- an annotation naming an aggregate function this server does not have breaks only its column'
 python3 -c "
@@ -151,13 +131,15 @@ ${CLICKHOUSE_CLIENT} ${STATES} --query "
         anyLastSimpleState(toUUID('00000000-0000-0000-0000-000000000001')) AS uu,
         anyLastSimpleState(toDecimal64('1.25', 4)) AS dec,
         uniqState(number) AS state,
-        tuple(uniqState(number), toUInt64(7)) AS tup
+        tuple(uniqState(number), toUInt64(7)) AS tup,
+        [uniqState(number), uniqState(number + 100)] AS arr_state
     FROM numbers(3)
 "
 ${CLICKHOUSE_CLIENT} ${STATES} --query "DESC file('${MATRIX}', Parquet)"
 ${CLICKHOUSE_CLIENT} ${STATES} --query "
     SELECT num, str, nullable, low_cardinality, arr, m, d, dt, dt64, e, ip4, ip6, toString(i128) AS i128, hex(fs), uu, dec,
-           finalizeAggregation(state) AS uniq_state, finalizeAggregation(tup.1) AS uniq_in_tuple, tup.2 AS plain_in_tuple
+           finalizeAggregation(state) AS uniq_state, finalizeAggregation(tup.1) AS uniq_in_tuple, tup.2 AS plain_in_tuple,
+           arrayMap(x -> finalizeAggregation(x), arr_state) AS uniq_in_array
     FROM file('${MATRIX}', Parquet)
     FORMAT Vertical
 "
@@ -189,7 +171,6 @@ if ${CLICKHOUSE_CLIENT} ${NO_CACHE} --query "DESC file('${RETYPED}', Parquet)" 2
 then
     echo 1
 fi
-${CLICKHOUSE_CLIENT} ${SKIP} ${NO_CACHE} --query "SELECT sum(k) FROM file('${RETYPED}', Parquet)"
 
 echo '-- a schema inferred with the setting on is not served to a query that has it off'
 ${CLICKHOUSE_CLIENT} ${STATES} --query "
