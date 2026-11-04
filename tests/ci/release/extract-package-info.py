@@ -1,6 +1,7 @@
 #! /usr/bin/env python3
 
 import os
+import re
 import sys
 import argparse
 from datetime import datetime, timezone
@@ -16,6 +17,11 @@ def generate_time(folder_time: str = None) -> str:
     """Generate time string.
     """
     if folder_time:
+        # Ends up in $GITHUB_ENV, S3 paths and ansible extra vars (which Ansible templates),
+        # so only allow plain path characters, e.g. 2026-10-30T15-35-51.747.
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", folder_time):
+            print(f"Error: invalid folder_time {folder_time!r}", file=sys.stderr)
+            sys.exit(1)
         return folder_time
 
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S.%f")[:-3]
@@ -163,9 +169,11 @@ def main():
     if package_version >= version.parse("25.6"):
         deb_exists = file_exists(f"https://s3.amazonaws.com/{args.artifact_src_bucket}/{artifact_url}/build_amd_release/clickhouse-server_{args.package_version}_amd64.deb")
         set_env_variable("BUILD_DIR", "build_amd_release")
+        set_env_variable("ARM_BUILD_DIR", "build_arm_release")
     else:
         deb_exists = file_exists(f"https://s3.amazonaws.com/{args.artifact_src_bucket}/{artifact_url}/package_release/clickhouse-server_{args.package_version}_amd64.deb")
         set_env_variable("BUILD_DIR", "package_release")
+        set_env_variable("ARM_BUILD_DIR", "package_aarch64")
 
     if not deb_exists:
         print(f"\n✗ ERROR: Required DEB file not found", file=sys.stderr)

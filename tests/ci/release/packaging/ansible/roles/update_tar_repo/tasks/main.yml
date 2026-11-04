@@ -51,26 +51,3 @@
   loop: "{{ tgz_repos }}"
   when: cloudfront_origin_path != ""
 
-- name: Check for source tarball
-  stat:
-    path: "/home/runner/.cache/tmp/packages/clickhouse-{{ pkgver }}.src.tar.gz"
-  register: src_tarball
-
-- name: Warn if source tarball is missing
-  debug:
-    msg: "WARNING: clickhouse-{{ pkgver }}.src.tar.gz is missing; skipping src-repo copy"
-  when: not src_tarball.stat.exists
-
-- name: Copy new src
-  shell: "mv /home/runner/.cache/tmp/packages/clickhouse-{{ pkgver }}.src.tar.gz {{ local_repo_path }}/{{ repo_prefix }}src-repo/clickhouse-{{ pkgver }}.src.tar.gz"
-  when: src_tarball.stat.exists
-
-- name: Sync remaining repos between source and target
-  shell: |
-    if [ -d "{{ local_repo_path }}/{{ item }}" ]; then
-      aws s3 sync --delete "{{ local_repo_path }}/{{ item }}" "{{ s3_repo_target_path }}/{{ item }}"
-    else
-      echo "WARNING: {{ local_repo_path }}/{{ item }} does not exist; skipping src-repo sync"
-    fi
-  loop: "{{ src_repos }}"
-  when: cloudfront_origin_path != ""

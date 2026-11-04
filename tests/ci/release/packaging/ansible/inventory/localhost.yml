@@ -59,11 +59,6 @@ all:
         - "fips-tgz-repo"
         - "antalya-tgz-repo"
         - "hotfix-tgz-repo"
-      src_repos:
-        - "src-repo"
-        - "fips-src-repo"
-        - "antalya-src-repo"
-        - "hotfix-src-repo"
       bin_repos:
         - "bin-repo"
         - "fips-bin-repo"
