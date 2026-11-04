@@ -2174,7 +2174,7 @@ def test_graceful_shutdown(started_cluster):
 def test_stop_swarm_mode_does_not_admit_new_task(started_cluster):
     initiator = started_cluster.instances["s0_0_0"]
     worker = started_cluster.instances["s0_1_0"]
-    failpoint = "swarm_mode_before_task_admission_lock"
+    failpoint = "swarm_mode_before_task_request"
     result = {}
 
     expected = initiator.query(

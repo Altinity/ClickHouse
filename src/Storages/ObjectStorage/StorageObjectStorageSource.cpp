@@ -107,7 +107,7 @@ namespace DB
 namespace FailPoints
 {
 extern const char object_storage_source_pause_before_virtual_columns[];
-extern const char swarm_mode_before_task_admission_lock[];
+extern const char swarm_mode_before_task_request[];
 }
 
 namespace ErrorCodes
@@ -2533,8 +2533,8 @@ ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::takeNextObject(bool 
     {
         /// Test-only pause before the next task request. A concurrent `SYSTEM STOP SWARM MODE`
         /// must complete before this worker asks the initiator for another task.
-        fiu_do_on(FailPoints::swarm_mode_before_task_admission_lock, {
-            FailPointInjection::notifyPauseAndWaitForResume(FailPoints::swarm_mode_before_task_admission_lock);
+        fiu_do_on(FailPoints::swarm_mode_before_task_request, {
+            FailPointInjection::notifyPauseAndWaitForResume(FailPoints::swarm_mode_before_task_request);
         });
 
         /// Recheck after each `retry_after_us` wait. The read-task callback checks again under
