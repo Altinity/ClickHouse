@@ -88,9 +88,10 @@ namespace
 {
 /// Closing clauses for a write that was not attempted because an earlier transaction of the same
 /// table is unresolved. Each carries the outcome phrase the earlier transaction's own writer saw.
-constexpr std::string_view outcome_unknown_tail = "it may or may not take effect; a retry may duplicate it";
+constexpr std::string_view outcome_unknown_tail = "it may or may not take effect, and retrying the earlier write may duplicate it; this write was not attempted";
 constexpr std::string_view durable_unconfirmed_tail
-    = "the next ref-log recovery installs it, so it may still take effect and a retry may duplicate it";
+    = "the next ref-log recovery installs it, so it may still take effect, and retrying the earlier write "
+      "may duplicate it; this write was not attempted";
 
 /// The relink confirm's logger, resolved once. `LOG_IMPL` evaluates its logger argument BEFORE testing
 /// the level, so `getLogger` at the call site would take the global logger-registry lock on every
@@ -2307,7 +2308,7 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
         {
             result.survivor_error = makeCasWriteRetryLaterExceptionPtr(fmt::format(
                 "CAS ref-log append for namespace '{}': lane recovery is still in progress; an earlier "
-                "transaction is durable but was not acknowledged, and this write was not attempted: {}",
+                "transaction is durable but was not acknowledged: {}",
                 ns.string(), durable_unconfirmed_tail));
         }
         else
@@ -2315,7 +2316,7 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
             result.survivor_error = std::make_exception_ptr(Exception(
                 ErrorCodes::INVALID_STATE,
                 "CAS ref-log append for namespace '{}': terminal lane state {} does not permit wedge "
-                "resolution",
+                "resolution; this write was not attempted",
                 ns.string(), static_cast<uint8_t>(*invalid_lane_state)));
         }
         return result;
@@ -2646,7 +2647,8 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
             result.survivor_error = std::make_exception_ptr(Exception(ErrorCodes::INVALID_STATE,
                 "CAS ref-log append for namespace '{}': writer epoch {} was CLOSED by a successor's epoch "
                 "seal at {}-{}, which conclusively rejects the wedged transaction (it was never "
-                "acknowledged). This mount's append lane resumes only under a later epoch",
+                "acknowledged): nothing is durable, so a retry cannot duplicate this transaction. This mount's "
+                "append lane resumes only under a later epoch",
                 ns.string(), wedge.txn_id.writer_epoch,
                 wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence));
             break;
@@ -2659,8 +2661,10 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
             result.survivor_error = std::make_exception_ptr(Exception(ErrorCodes::CORRUPTED_DATA,
                 "CAS ref-log append for namespace '{}': impossible foreign interference observed at the "
                 "wedged slot '{}' — the mount is fenced closed and a remount is scheduled; the lane is "
-                "deliberately left wedged for inspection. See the anomaly diagnostics log",
-                ns.string(), wedge.key));
+                "deliberately left wedged for inspection; wedged txn {}-{} outcome is unknown: {}. See the anomaly "
+                "diagnostics log",
+                ns.string(), wedge.key, wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence,
+                outcome_unknown_tail));
             break;
         case WedgeResolution::StillWedged:
         {
@@ -3767,11 +3771,13 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
             }
             else
             {
+                const std::string_view promote_note = item->kind == RootMutationKind::Promote
+                    ? " (a promoted part returns after a restart that precedes part cleanup)" : "";
                 complete_error(one, std::make_exception_ptr(Exception(failure.code,
                     "CAS ref-log txn {}-{} for namespace '{}' is durable but was not acknowledged ({}); the "
-                    "next ref-log recovery installs it, so the write may still take effect (a promoted part "
-                    "returns after a restart that precedes part cleanup) and a retry may duplicate it",
-                    id.writer_epoch, id.ref_sequence, ns.string(), failure.cause)));
+                    "next ref-log recovery installs it, so the write may still take effect{} and a retry may "
+                    "duplicate it",
+                    id.writer_epoch, id.ref_sequence, ns.string(), failure.cause, promote_note)));
             }
         }
     };

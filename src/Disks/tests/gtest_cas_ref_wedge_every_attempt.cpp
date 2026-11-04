@@ -673,7 +673,8 @@ TEST(CASRefWedgeEveryAttempt, RetiredLifeRefusesWedgeRetryBeforeAnyRequestOrAdop
     retry.join();
     store->setWedgeBeforeSlotOccupyHookForTest(nullptr);
 
-    EXPECT_TRUE(retry_error);
+    ASSERT_TRUE(retry_error);
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "outcome is unknown", [&] { std::rethrow_exception(retry_error); });
     EXPECT_EQ(backend->putCount(wedged_key), 0u) << "retirement must refuse before the retry send";
     EXPECT_EQ(backend->getCount(wedged_key), 0u) << "a refused retry needs no occupant resolution read";
     EXPECT_FALSE(readObj(*backend, wedged_key)) << "the predecessor wedge was adopted or made durable";
@@ -902,7 +903,8 @@ TEST(CASRefWedgeEveryAttempt, SuccessorSealAtTheWedgedKeyRejectsConclusivelyAndS
 
     /// The next caller's resolution meets the seal. Its own items fail -- permanently, not "retry
     /// later": nothing about this lane's epoch will ever accept a write again.
-    expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { store->dropRef(ns, "y"); });
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::INVALID_STATE, "nothing is durable",
+        [&] { store->dropRef(ns, "y"); });
 
     EXPECT_FALSE(store->refLaneWedgedForTest(ns)) << "a conclusive rejection clears the wedge";
     EXPECT_TRUE(store->resolveRef(ns, "x").has_value()) << "the rejected transaction was never applied";
@@ -1022,7 +1024,8 @@ TEST(CASRefWedgeEveryAttempt, ForeignNonSealOccupantIsCorruptedDataAndSchedulesA
     /// Something that is neither our bytes nor a seal occupies the slot.
     ASSERT_TRUE(std::holds_alternative<Committed>(backend->putAsSuccessor(wedged_key, "not a ref-log object at all")));
 
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->dropRef(ns, "y"); });
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "outcome is unknown",
+        [&] { store->dropRef(ns, "y"); });
 
     EXPECT_FALSE(store->refLaneWedgedForTest(ns));
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Faulted);
@@ -1087,7 +1090,9 @@ TEST(CASRefWedgeEveryAttempt, RetryUnderAnOlderAdmissionGenerationSendsNothing)
     bumpFenceGeneration(store, epoch);
     ASSERT_NE(store->wedgedAdmittedGenerationForTest(ns), store->fenceGeneration());
 
-    EXPECT_ANY_THROW(store->dropRef(ns, "y"));
+    /// Refused at admission, before the write reaches the queue: no wedge phrase, by design.
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "no longer admitted",
+        [&] { store->dropRef(ns, "y"); });
 
     EXPECT_EQ(backend->putCount(wedged_key), puts_before)
         << "the retry must be refused pre-attempt: nothing may reach the store under a foreign generation";
@@ -1138,7 +1143,8 @@ TEST(CASRefWedgeEveryAttempt, ResultReleasedAfterAFenceBumpAndSuccessorSealIsIne
     /// And it must be the RETRY-SAFE class. A moved incarnation is usually a routine lease blip, and the
     /// storage layer classifies retry-safety on exactly `ABORTED || NETWORK_ERROR` — surfacing the fence
     /// check's own `INVALID_STATE` here would turn every blip into a hard failure for the caller.
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { std::rethrow_exception(caller_error); });
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "outcome is unknown",
+        [&] { std::rethrow_exception(caller_error); });
     EXPECT_TRUE(store->refLaneWedgedForTest(ns)) << "no unwedge";
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_before) << "no install";
     EXPECT_EQ(store->lastEpochSealForTest(ns), std::nullopt)
