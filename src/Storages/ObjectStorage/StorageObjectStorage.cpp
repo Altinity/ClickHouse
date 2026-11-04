@@ -837,7 +837,7 @@ bool StorageObjectStorage::optimize(
     bool /*cleanup*/,
     [[maybe_unused]] ContextPtr context)
 {
-    return configuration->optimize(object_storage, metadata_snapshot, context, format_settings);
+    return configuration->optimize(object_storage, metadata_snapshot, context, format_settings, catalog, getStorageID());
 }
 
 bool StorageObjectStorage::supportsImport(ContextPtr local_context) const

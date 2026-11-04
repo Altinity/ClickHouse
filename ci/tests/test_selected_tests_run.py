@@ -342,10 +342,10 @@ def test_pr_workflow_keeps_full_suite_msan_wasmedge_functional_tests():
         if "amd_msan, WasmEdge" in name:
             full_suite_msan_wasmedge_jobs.append(name)
             continue
-        # The flaky, targeted and azure jobs run their own selection or config.
+        # The flaky, targeted, azure and cas jobs run their own selection or config.
         assert any(
             marker in name
-            for marker in ("selected tests", "flaky check", "targeted", "azure")
+            for marker in ("selected tests", "flaky check", "targeted", "azure", "cas ")
         ), f"full-suite sanitizer functional test job in the PR workflow: {name}"
 
     assert len(full_suite_msan_wasmedge_jobs) == 10

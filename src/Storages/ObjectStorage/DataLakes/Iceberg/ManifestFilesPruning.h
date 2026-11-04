@@ -36,6 +36,35 @@ class ManifestFileIterator;
 
 DB::ASTPtr getASTFromTransform(const String & transform_name_src, const String & column_name, const String & time_zone);
 
+struct PartitionKeyFromSpec
+{
+    PartitionSpecification partition_specification;
+    std::optional<DB::KeyDescription> key_description;
+    /// Indices (into the Avro partition tuple) of the spec fields that were kept for pruning;
+    /// needed to project a full partition tuple down to the partition key.
+    std::vector<size_t> partition_key_spec_positions;
+    /// Total number of fields in the spec, including ones skipped from the partition key
+    /// (e.g. multi-arg V3 transforms); the arity every partition tuple in the manifest must have.
+    size_t partition_spec_fields_count = 0;
+};
+
+PartitionKeyFromSpec buildPartitionKeyFromSpec(
+    const Poco::JSON::Array::Ptr & partition_specification_json,
+    Int32 schema_id,
+    const IcebergSchemaProcessor & schema_processor,
+    DB::ContextPtr context);
+
+/// NOTE: tricky part to support RENAME column.
+/// Takes ActionDAG representation of user's WHERE expression and
+/// renames columns to their original numeric ID's in iceberg.
+std::unique_ptr<DB::ActionsDAG> renameFilterDagColumnsToFieldIds(
+    const IcebergSchemaProcessor & schema_processor,
+    Int32 current_schema_id,
+    Int32 target_schema_id,
+    const DB::ActionsDAG * source_dag,
+    std::vector<Int32> & used_columns_in_filter,
+    std::unordered_map<Int32, DB::NameAndTypePair> & row_lineage_columns_in_filter);
+
 /// Prune specific data files based on manifest content
 class ManifestFilesPruner
 {
@@ -51,13 +80,6 @@ private:
     std::unordered_map<Int32, DB::KeyCondition> min_max_key_conditions;
     std::unordered_map<Int32, DB::DataTypePtr> min_max_column_types;
     std::unordered_map<Int32, DB::NameAndTypePair> row_lineage_columns;
-    /// NOTE: tricky part to support RENAME column.
-    /// Takes ActionDAG representation of user's WHERE expression and
-    /// rename columns to the their origina numeric ID's in iceberg
-    std::unique_ptr<DB::ActionsDAG> transformFilterDagForManifest(
-        const DB::ActionsDAG * source_dag,
-        std::vector<Int32> & used_columns_in_filter,
-        std::unordered_map<Int32, DB::NameAndTypePair> & row_lineage_columns_in_filter) const;
 
 public:
     ManifestFilesPruner(
