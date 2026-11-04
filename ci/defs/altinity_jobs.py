@@ -23,7 +23,6 @@ class AltinityArtifactConfigs:
 
 class AltinityJobNames:
     SIGN_RELEASE = "Sign release"
-    SOURCE_UPLOAD = "Source upload"
 
 
 class AltinityJobConfigs:
@@ -60,12 +59,4 @@ class AltinityJobConfigs:
             ],
             provides=[AltinityArtifactNames.SIGNED_ARM_RELEASE],
         ),
-    )
-    # No digest_config: the job tars the whole source tree, which changes every
-    # commit, so it must never be skipped by the content-addressed CI cache.
-    source_upload_job = Job.Config(
-        name=AltinityJobNames.SOURCE_UPLOAD,
-        runs_on=RunnerLabels.STYLE_CHECK_ARM,
-        command="python3 ./ci/jobs/source_upload.py",
-        timeout=3600,
     )

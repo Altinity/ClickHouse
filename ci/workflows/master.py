@@ -50,7 +50,6 @@ workflow = Workflow.Config(
         JobConfigs.docker_keeper,
         *JobConfigs.install_check_master_jobs,
         *AltinityJobConfigs.sign_release_jobs,
-        AltinityJobConfigs.source_upload_job,
         *JobConfigs.compatibility_test_jobs,
         *JobConfigs.functional_tests_jobs,
         # *JobConfigs.functional_test_llvm_coverage_jobs, # NOTE (strtgbb): Not configured yet. Determine if useful first.
