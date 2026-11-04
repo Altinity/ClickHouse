@@ -25,6 +25,7 @@ from create_workflow_report import (
     _parse_release_ref,
     _release_tag_sha,
     _filter_releases_to_version_line,
+    _repo_and_run_id,
     get_prs_in_release_dataframe,
     get_workflow_config,
 )
@@ -440,6 +441,20 @@ class TestGetWorkflowConfigStdout(unittest.TestCase):
         self.assertEqual(cfg, {"cache_jobs": {}})
         self.assertEqual(stdout.getvalue(), "")
         self.assertIn("WARNING", stderr.getvalue())
+
+
+class TestRepoAndRunId(unittest.TestCase):
+    def test_parses_owner_and_run_from_actions_url(self):
+        repo, run_id = _repo_and_run_id(
+            "https://github.com/Altinity/clickhouse-private/actions/runs/41773029729"
+        )
+        self.assertEqual(repo, "Altinity/clickhouse-private")
+        self.assertEqual(run_id, "41773029729")
+
+    def test_unknown_url_keeps_public_repo(self):
+        repo, run_id = _repo_and_run_id("https://example.com/runs/99")
+        self.assertEqual(repo, "Altinity/ClickHouse")
+        self.assertEqual(run_id, "99")
 
 
 if __name__ == "__main__":
