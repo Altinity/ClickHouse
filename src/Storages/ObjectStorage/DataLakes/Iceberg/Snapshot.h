@@ -4,6 +4,7 @@
 #if USE_AVRO
 
 #include <DataTypes/DataTypeDateTime64.h>
+#include <Poco/JSON/Array.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadataFilesCache.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFile.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/SnapshotSummary.h>
@@ -28,6 +29,7 @@ struct IcebergDataSnapshot
     std::optional<size_t> total_equality_delete_rows;
     std::optional<String> partition_key;
     std::optional<String> sorting_key;
+    Poco::JSON::Array::Ptr partition_specs;
 
     std::optional<size_t> getTotalRows() const
     {
