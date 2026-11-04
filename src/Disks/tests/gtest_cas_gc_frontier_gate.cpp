@@ -3132,16 +3132,41 @@ TEST(CASCatalogLifecycleReconciler, RetriesFromTheMandatoryConflictResolutionCut
     backend->conflictNextCatalogCas(layout.refCatalogKey());
 
     CatalogLifecycleReconciler reconciler(op, layout, parent);
-    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh, noRetirementRecord);
+    size_t announcements = 0;
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(
+        noAuthorityRefresh, [&](const NamespaceLifeId &) { ++announcements; });
 
     EXPECT_EQ(result.authority_status, AuthorityStatus::Authoritative);
     EXPECT_EQ(result.catalog_resolution, CatalogResolution::DrainComplete);
     EXPECT_EQ(result.deleted, 1);
+    EXPECT_EQ(announcements, 1) << "one announcement per life, however many erase attempts it takes";
     const std::vector<String> journal = backend->journalSnapshot();
     const String catalog_get = "get " + layout.refCatalogKey();
     EXPECT_EQ(std::count(journal.begin(), journal.end(), catalog_get), 4)
         << "selection, the refused write's own resolve read, the mandatory resolution cut the retry "
            "reuses, and the committed erase's resolution -- the catalog takes no cut of its own";
+}
+
+/// A failing announcement aborts the drain before any erase is sent: no record means no erase.
+TEST(CASCatalogLifecycleReconciler, AFailingAnnouncementSendsNoErase)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    seedCompletedRemoving(op, store, kGc);
+    const auto parent_object = op.read(layout.foldSealKey(1, 1), Retry::once());
+    ASSERT_TRUE(parent_object);
+    const CasFoldSeal parent = decodeFoldSeal(parent_object->bytes);
+    backend->resetCounts();
+
+    CatalogLifecycleReconciler reconciler(op, layout, parent);
+    EXPECT_THROW(
+        (void)reconciler.reconcile(noAuthorityRefresh, [](const NamespaceLifeId &) { throw std::runtime_error("record failed"); }),
+        std::runtime_error);
+    EXPECT_EQ(backend->putOverwriteCount(layout.refCatalogKey()), 0) << "the erase must not be sent";
+    EXPECT_FALSE(CasRefCatalog::read(op, layout).catalog.entries.empty()) << "the row must still be cataloged";
 }
 
 /// THE DRAIN'S AUTHORITY, end to end. `CatalogLifecycleReconciler` and
