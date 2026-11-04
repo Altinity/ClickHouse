@@ -73,6 +73,7 @@
 #include <Interpreters/ProcessList.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/BinPackRewrite.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/AddFilesExecute.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ExpireSnapshotsExecute.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/RemoveOrphanFilesExecute.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergDataObjectInfo.h>
@@ -1114,6 +1115,13 @@ Pipe IcebergMetadata::executeCommand(
         checkTableRootIsQueriedPath("remove_orphan_files");
         return Iceberg::executeRemoveOrphanFiles(
             args, context, object_storage_, data_lake_settings, persistent_components, *external_storages);
+    }
+    else if (command_name == "add_files")
+    {
+        checkTableRootIsQueriedPath("add_files");
+        return Iceberg::executeAddFiles(
+            args, context, object_storage_, data_lake_settings, persistent_components,
+            write_format, catalog_, storage_id.getTableName(), *external_storages);
     }
     else
     {
