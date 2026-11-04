@@ -1619,6 +1619,12 @@ TEST(CASRefWriterAppendLane, DurableUnconfirmedTextNamesPrecommitAndPromoteApart
     promoted->precommitAdd(ns, "prom", prom_id);
     const String promote_message = messageOf([&] { promoted->promote(ns, "prom", promoted->buildId(), prom_id); });
 
+    /// A kind other than promote must not carry the promote-only note.
+    publishEmptyPart(store, ns, "between_again");
+    const String drop_message = messageOf([&] { store->dropRef(ns, "x"); });
+    EXPECT_NE(drop_message.find("is durable but was not acknowledged"), String::npos) << drop_message;
+    EXPECT_EQ(drop_message.find("promoted part returns"), String::npos) << drop_message;
+
     EXPECT_NE(precommit_message.find("never published"), String::npos) << precommit_message;
     EXPECT_EQ(precommit_message.find("may still take effect"), String::npos) << precommit_message;
     EXPECT_NE(promote_message.find("is durable but was not acknowledged"), String::npos) << promote_message;

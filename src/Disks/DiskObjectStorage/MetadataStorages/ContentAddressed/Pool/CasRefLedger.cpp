@@ -2661,7 +2661,7 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
             result.survivor_error = std::make_exception_ptr(Exception(ErrorCodes::CORRUPTED_DATA,
                 "CAS ref-log append for namespace '{}': impossible foreign interference observed at the "
                 "wedged slot '{}' — the mount is fenced closed and a remount is scheduled; the lane is "
-                "deliberately left wedged for inspection; wedged txn {}-{} outcome is unknown: {}. See the anomaly "
+                "left faulted for inspection; wedged txn {}-{} outcome is unknown: {}. See the anomaly "
                 "diagnostics log",
                 ns.string(), wedge.key, wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence,
                 outcome_unknown_tail));
