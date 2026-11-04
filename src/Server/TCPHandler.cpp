@@ -836,13 +836,9 @@ void TCPHandler::runImpl()
                             auto admission = query_state->query_context->lockSwarmMode();
                             if (server.isCancelled() || !query_state->query_context->isSwarmModeEnabled())
                                 return std::make_shared<ClusterFunctionReadTaskResponse>();
+                        }
 
-                            sendReadTaskRequest();
-                        }
-                        else
-                        {
-                            sendReadTaskRequest();
-                        }
+                        sendReadTaskRequest();
 
                         ProfileEvents::increment(ProfileEvents::ReadTaskRequestsSent);
 
