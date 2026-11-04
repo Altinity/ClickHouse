@@ -8,7 +8,11 @@
 #include "cas_test_helpers.h"
 #include <algorithm>
 #include <functional>
+#include <atomic>
+#include <chrono>
 #include <future>
+#include <memory>
+#include <mutex>
 #include <thread>
 
 /// Namespace files are keyed by an opaque LIFE, not by its name: `cas/ns/state/<life_id>/_files/<name>`
@@ -99,20 +103,24 @@ void expectRefusedAsRetired(const std::exception_ptr & error)
 }
 
 /// Parks the cold admission running on `parked_thread` right after its `park_on_read`-th read of
-/// `catalog_key` returns, and releases it right after the next conditional write of `catalog_key`
-/// that leaves `erased_ns` uncataloged returns: the window between the drain's catalog erase and
-/// anything the drain does afterwards.
+/// `catalog_key` returns. `on_erase_landed` runs once, right after the first conditional write of
+/// `catalog_key` for which `erase_landed` holds returns: the window between the drain's catalog erase
+/// and anything the drain does afterwards.
 class ParkedAdmissionBackend : public CountingBackend
 {
 public:
     String catalog_key;
-    std::thread::id parked_thread;
+    std::atomic<std::thread::id> parked_thread{};
     size_t park_on_read = 0;
     std::function<bool()> erase_landed;
     std::function<void()> on_erase_landed;
 
     std::promise<void> parked;
-    std::promise<void> release;
+
+    void releaseOnce()
+    {
+        std::call_once(release_once, [this] { release.set_value(); });
+    }
 
     std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
     {
@@ -138,6 +146,52 @@ public:
         }
         return result;
     }
+
+private:
+    std::promise<void> release;
+    std::once_flag release_once;
+};
+
+/// Runs `admission` on its own thread, which registers itself as the parked thread before its first
+/// request. The destructor releases the park and joins, so a failing assertion in the test body
+/// cannot leave a joinable thread behind.
+class ParkedReader
+{
+public:
+    ParkedReader(ParkedAdmissionBackend & backend_, std::function<void()> body)
+        : backend(backend_)
+        , thread([this, admission = std::move(body)]
+          {
+              backend.parked_thread = std::this_thread::get_id();
+              try
+              {
+                  admission();
+              }
+              catch (...)
+              {
+                  error = std::current_exception();
+              }
+          })
+    {
+    }
+
+    ~ParkedReader()
+    {
+        backend.releaseOnce();
+        join();
+    }
+
+    void join()
+    {
+        if (thread.joinable())
+            thread.join();
+    }
+
+    std::exception_ptr error;
+
+private:
+    ParkedAdmissionBackend & backend;
+    std::thread thread;
 };
 
 }
@@ -326,38 +380,26 @@ TEST(CASNsFileIncarnation, ColdReaderIsRefusedWhenReleasedRightAfterTheDrainEras
     CasOperation catalog_op = catalog_requests.admit();
     Gc gc(store, kGcId);
 
-    std::exception_ptr reader_error;
-    std::thread reader;
+    std::unique_ptr<ParkedReader> reader;
     backend->catalog_key = layout.refCatalogKey();
     backend->park_on_read = 2;
     backend->erase_landed = [&] { return !CasRefCatalog::lifeIfCataloged(catalog_op, layout, ns).has_value(); };
     backend->on_erase_landed = [&]
     {
-        backend->release.set_value();
-        reader.join();
+        backend->releaseOnce();
+        reader->join();
     };
     auto parked = backend->parked.get_future();
-    reader = std::thread([&]
-    {
-        try
-        {
-            (void)store->namespaceFilesLifeIfReadable(ns);
-        }
-        catch (...)
-        {
-            reader_error = std::current_exception();
-        }
-    });
-    backend->parked_thread = reader.get_id();
-    parked.wait();
+    reader = std::make_unique<ParkedReader>(*backend, [&] { (void)store->namespaceFilesLifeIfReadable(ns); });
+    ASSERT_EQ(parked.wait_for(std::chrono::seconds(60)), std::future_status::ready) << "the reader never reached its park";
 
     store->dropNamespace(ns);
     (void)runRegularRoundReclaiming(gc);
     (void)runRegularRoundReclaiming(gc);
-    ASSERT_FALSE(reader.joinable()) << "the reader must have been released by the drain's erase";
+    reader->join();
     ASSERT_FALSE(CasRefCatalog::lifeIfCataloged(catalog_op, layout, ns));
 
-    expectRefusedAsRetired(reader_error);
+    expectRefusedAsRetired(reader->error);
     EXPECT_NE(store->refTableLifeForTest(ns), retired_life) << "a runtime for the retired life was published";
 }
 
@@ -384,24 +426,11 @@ TEST(CASNsFileIncarnation, ColdAdmissionIsRefusedWhenARemoteLeaderRetiredTheLife
         PoolConfig{.pool_prefix = "p", .server_root_id = "leader", .gc_fold_max_defer_rounds = 0});
     ASSERT_EQ(owner->refTableRuntimeIdentityForTest(ns), 0u);
 
-    std::exception_ptr reader_error;
-    std::thread reader;
     backend->catalog_key = owner->layout().refCatalogKey();
     backend->park_on_read = 2;
     auto parked = backend->parked.get_future();
-    reader = std::thread([&]
-    {
-        try
-        {
-            (void)owner->namespaceFilesLifeIfReadable(ns);
-        }
-        catch (...)
-        {
-            reader_error = std::current_exception();
-        }
-    });
-    backend->parked_thread = reader.get_id();
-    parked.wait();
+    ParkedReader reader(*backend, [&] { (void)owner->namespaceFilesLifeIfReadable(ns); });
+    ASSERT_EQ(parked.wait_for(std::chrono::seconds(60)), std::future_status::ready) << "the reader never reached its park";
 
     /// The owner installs and drops the life; only the leader drains it.
     ASSERT_EQ(owner->namespaceLife(ns), *retired_life);
@@ -417,9 +446,9 @@ TEST(CASNsFileIncarnation, ColdAdmissionIsRefusedWhenARemoteLeaderRetiredTheLife
     publishWithProductionBirth(owner, other, "x");
     ASSERT_EQ(owner->refTableRuntimeIdentityForTest(ns), 0u) << "the dead life's runtime must have been evicted";
 
-    backend->release.set_value();
+    backend->releaseOnce();
     reader.join();
-    expectRefusedAsRetired(reader_error);
+    expectRefusedAsRetired(reader.error);
     EXPECT_NE(owner->refTableLifeForTest(ns), retired_life) << "a runtime for the retired life was published";
 }
 
