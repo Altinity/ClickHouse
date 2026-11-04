@@ -30,7 +30,6 @@
 #include <Interpreters/FileCache/FileCacheFactory.h>
 #include <Interpreters/FileCache/FileCacheKey.h>
 #include <Interpreters/Context.h>
-#include <base/scope_guard.h>
 #include <Interpreters/ExpressionActions.h>
 #include <Interpreters/ProcessList.h>
 #include <Interpreters/castColumn.h>
@@ -109,7 +108,6 @@ namespace FailPoints
 {
 extern const char object_storage_source_pause_before_virtual_columns[];
 extern const char swarm_mode_before_task_admission_lock[];
-extern const char swarm_mode_during_task_retry_wait[];
 }
 
 namespace ErrorCodes
@@ -2533,31 +2531,22 @@ ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::takeNextObject(bool 
 {
     while (true)
     {
-        /// Test-only pause before the admission lock. A concurrent `SYSTEM STOP SWARM MODE`
-        /// must complete before this worker can ask the initiator for another task.
+        /// Test-only pause before the next task request. A concurrent `SYSTEM STOP SWARM MODE`
+        /// must complete before this worker asks the initiator for another task.
         fiu_do_on(FailPoints::swarm_mode_before_task_admission_lock, {
             FailPointInjection::notifyPauseAndWaitForResume(FailPoints::swarm_mode_before_task_admission_lock);
         });
 
-        ClusterFunctionReadTaskResponsePtr task;
+        /// Recheck after each `retry_after_us` wait. The read-task callback checks again under
+        /// the admission lock before it sends, so a stop that lands after this check still
+        /// does not produce a request.
+        if (!getContext()->isSwarmModeEnabled())
         {
-            /// The shared lock covers the enabled-state check. The callback drops it before
-            /// waiting on its own connection mutex, then takes it again only to send the task
-            /// request. A response read and a sibling blocked on that connection mutex do not
-            /// hold it, so `SYSTEM STOP SWARM MODE` is not stuck for `receive_timeout`.
-            /// Admissions from different queries run concurrently. The retry wait and metadata
-            /// resolution stay outside the lock.
-            auto swarm_mode_lock = getContext()->lockSwarmMode();
-            if (!getContext()->isSwarmModeEnabled())
-            {
-                LOG_DEBUG(getLogger("StorageObjectStorageSource"), "STOP SWARM MODE called, stop getting new tasks");
-                return nullptr;
-            }
-
-            getContext()->bindSwarmAdmissionLock(&swarm_mode_lock);
-            SCOPE_EXIT({ getContext()->unbindSwarmAdmissionLock(); });
-            task = callback();
+            LOG_DEBUG(getLogger("StorageObjectStorageSource"), "STOP SWARM MODE called, stop getting new tasks");
+            return nullptr;
         }
+
+        auto task = callback();
 
         if (auto query_status = getContext()->getProcessListElement())
             query_status->checkTimeLimit();
@@ -2574,13 +2563,6 @@ ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::takeNextObject(bool 
             /// TODO: wait asynchronously instead of sleeping in this thread.
             auto wait_time = std::min<UInt64>(100000, *task->retry_after_us);
             ProfileEvents::increment(ProfileEvents::ObjectStorageClusterWaitingMicroseconds, wait_time);
-
-            /// Test-only pause after the admission lock is released. `SYSTEM STOP SWARM MODE`
-            /// must return while this worker is still waiting to ask for another task.
-            fiu_do_on(FailPoints::swarm_mode_during_task_retry_wait, {
-                FailPointInjection::notifyPauseAndWaitForResume(FailPoints::swarm_mode_during_task_retry_wait);
-            });
-
             sleepForMicroseconds(wait_time);
             continue;
         }

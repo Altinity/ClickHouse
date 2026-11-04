@@ -1891,21 +1891,10 @@ public:
     bool startSwarmMode();
     /// Return current swarm mode state.
     bool isSwarmModeEnabled() const;
-    /// Set by shutdown before `stopSwarmMode`. A callback that still holds the admission lock
-    /// returns without sending another task request.
-    void interruptSwarmTaskAdmission();
-    bool isSwarmTaskAdmissionInterrupted() const;
-    /// Production shutdown never clears the interrupt: it stays set until process exit.
-    /// Unit tests share one `ContextSharedPart` through `createCopy` and must clear it,
-    /// or a later test sees admission as already interrupted.
-    void resetSwarmTaskAdmissionInterruptedForTests();
-    /// Shared lock for one swarm task admission. Admissions run concurrently with each other;
-    /// `stopSwarmMode` and `startSwarmMode` take the lock exclusively. The callback drops the
-    /// caller's lock before waiting on its connection mutex, then locks again only to send.
+    /// Shared lock for one swarm task send. The read-task callback holds it only across the
+    /// enabled check and `sendReadTaskRequest`. The response read does not. `stopSwarmMode`
+    /// and `startSwarmMode` take it exclusively.
     std::shared_lock<SharedMutex> lockSwarmMode() const;
-    void bindSwarmAdmissionLock(std::shared_lock<SharedMutex> * lock) const;
-    void unbindSwarmAdmissionLock() const;
-    void releaseSwarmAdmissionLock() const;
 
     bool isInternalQuery() const { return is_internal_query; }
     void setInternalQuery(bool internal) { is_internal_query = internal; }

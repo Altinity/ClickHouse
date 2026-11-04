@@ -3946,10 +3946,6 @@ try
 
             is_cancelled = true;
 
-            /// A callback still deciding to send a task request returns without sending.
-            /// A request already sent is answered without holding `swarm_mode_mutex`, so this
-            /// does not wait out `receive_timeout` and does not fail the worker query.
-            global_context->interruptSwarmTaskAdmission();
             global_context->stopSwarmMode();
 
             LOG_DEBUG(log, "Waiting for current connections to close.");

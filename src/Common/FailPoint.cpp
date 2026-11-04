@@ -48,7 +48,6 @@ static struct InitFiu
     PAUSEABLE_ONCE(remote_query_executor_finish_drain_pause) \
     ONCE(connection_stale_on_establish) \
     PAUSEABLE(swarm_mode_before_task_admission_lock) \
-    PAUSEABLE(swarm_mode_during_task_retry_wait) \
     REGULAR(cluster_discovery_faults) \
     REGULAR(cluster_discovery_unregister_fail) \
     ONCE(cluster_discovery_retry_signal_fail) \

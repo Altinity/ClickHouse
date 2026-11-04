@@ -816,15 +816,10 @@ struct ContextSharedPart : boost::noncopyable
 
     std::atomic<bool> shutdown_called = false;
     std::atomic<bool> swarm_mode_enabled = true;
-    /// Set before shutdown waits on `swarm_mode_mutex`. A callback that still holds the lock
-    /// sees it and returns without sending another task request.
-    std::atomic<bool> swarm_task_admission_interrupted = false;
-    /// Held shared while a worker decides to ask for a task and sends that request. The
-    /// callback drops it before waiting on the connection mutex, and the response read does
-    /// not hold it, so a sibling blocked on that mutex does not keep stop behind
-    /// `receive_timeout`. Stop/start/shutdown hold it exclusively: no request is sent after
-    /// `stopSwarmMode` returns. `SharedMutex` prefers writers, so a pending stop blocks new
-    /// admissions instead of waiting behind them.
+    /// Held shared only across the decision to send a task request. The response read does
+    /// not hold it, so `stopSwarmMode` is not stuck for `receive_timeout`. Stop, start, and
+    /// shutdown hold it exclusively: no request is sent after `stopSwarmMode` returns.
+    /// `SharedMutex` prefers writers, so a pending stop blocks new admissions.
     mutable SharedMutex swarm_mode_mutex;
 
     Stopwatch uptime_watch TSA_GUARDED_BY(mutex);
@@ -1024,9 +1019,9 @@ struct ContextSharedPart : boost::noncopyable
       */
     void shutdown() TSA_NO_THREAD_SAFETY_ANALYSIS
     {
-        /// Wake a callback that is about to send a task request so it returns before this waits.
-        swarm_task_admission_interrupted.store(true);
         {
+            /// A callback still deciding to send observes the disabled mode under this lock
+            /// and returns without sending. The response read does not hold the lock.
             std::lock_guard lock(swarm_mode_mutex);
             swarm_mode_enabled = false;
             CurrentMetrics::set(CurrentMetrics::IsSwarmModeEnabled, 0);
@@ -8036,42 +8031,9 @@ bool Context::isSwarmModeEnabled() const
     return shared->swarm_mode_enabled;
 }
 
-void Context::interruptSwarmTaskAdmission()
-{
-    shared->swarm_task_admission_interrupted.store(true);
-}
-
-bool Context::isSwarmTaskAdmissionInterrupted() const
-{
-    return shared->swarm_task_admission_interrupted.load();
-}
-
-void Context::resetSwarmTaskAdmissionInterruptedForTests()
-{
-    shared->swarm_task_admission_interrupted.store(false);
-}
-
 std::shared_lock<SharedMutex> Context::lockSwarmMode() const
 {
     return std::shared_lock(shared->swarm_mode_mutex);
-}
-
-static thread_local std::shared_lock<SharedMutex> * current_swarm_admission_lock = nullptr;
-
-void Context::bindSwarmAdmissionLock(std::shared_lock<SharedMutex> * lock) const
-{
-    current_swarm_admission_lock = lock;
-}
-
-void Context::unbindSwarmAdmissionLock() const
-{
-    current_swarm_admission_lock = nullptr;
-}
-
-void Context::releaseSwarmAdmissionLock() const
-{
-    if (current_swarm_admission_lock && current_swarm_admission_lock->owns_lock())
-        current_swarm_admission_lock->unlock();
 }
 
 Context::ApplicationType Context::getApplicationType() const

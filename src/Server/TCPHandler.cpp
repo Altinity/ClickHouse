@@ -821,13 +821,6 @@ void TCPHandler::runImpl()
                     Stopwatch watch;
                     CurrentMetrics::Increment callback_metric_increment(CurrentMetrics::ReadTaskRequestsSent);
 
-                    /// `takeNextObject` holds the admission lock across this callback. Drop it before
-                    /// waiting for `callback_mutex`: a sibling thread of this query may already hold
-                    /// that mutex while reading a task response, and `stopSwarmMode` must not wait
-                    /// out that read behind the shared admission lock.
-                    if (query_state->query_context)
-                        query_state->query_context->releaseSwarmAdmissionLock();
-
                     std::lock_guard lock(*callback_mutex);
 
                     checkIfQueryCanceled(*query_state);
@@ -836,26 +829,25 @@ void TCPHandler::runImpl()
                     {
                         if (query_state->query_context)
                         {
-                            /// Re-check under the admission lock after the connection mutex. Shutdown
-                            /// sets the interrupt flag before it waits for this lock. Return without
-                            /// sending, so the worker query ends and no response is left unread.
-                            auto swarm_mode_lock = query_state->query_context->lockSwarmMode();
-                            if (server.isCancelled()
-                                || !query_state->query_context->isSwarmModeEnabled()
-                                || query_state->query_context->isSwarmTaskAdmissionInterrupted())
+                            /// Held only across the decision to send. A sibling waiting on `callback_mutex`
+                            /// does not hold it, and the response read below does not either, so
+                            /// `stopSwarmMode` is not stuck for `receive_timeout`. Returning without
+                            /// sending ends the worker query and leaves no response unread.
+                            auto admission = query_state->query_context->lockSwarmMode();
+                            if (server.isCancelled() || !query_state->query_context->isSwarmModeEnabled())
                                 return std::make_shared<ClusterFunctionReadTaskResponse>();
 
                             sendReadTaskRequest();
-                            ProfileEvents::increment(ProfileEvents::ReadTaskRequestsSent);
                         }
                         else
                         {
                             sendReadTaskRequest();
-                            ProfileEvents::increment(ProfileEvents::ReadTaskRequestsSent);
                         }
 
-                        /// The admission lock is released above. The initiator may already be assigning
-                        /// the file for this request; read that response so the assigned file is processed.
+                        ProfileEvents::increment(ProfileEvents::ReadTaskRequestsSent);
+
+                        /// The admission lock ended with the block above. Read the response so a file
+                        /// the initiator already assigned for this request is still processed.
                         auto res = receiveClusterFunctionReadTaskResponse(*query_state);
 
                         ProfileEvents::increment(ProfileEvents::ReadTaskRequestsSentElapsedMicroseconds, watch.elapsedMicroseconds());
@@ -2515,32 +2507,6 @@ void TCPHandler::sendHello()
 
 ClusterFunctionReadTaskResponsePtr TCPHandler::receiveClusterFunctionReadTaskResponse(QueryState & state)
 {
-    /// `sendReadTaskRequest` has already run. A response may arrive after this returns on error,
-    /// so the connection must not be reused: the next query would read that response as its packet.
-    state.at_packet_boundary = false;
-
-    /// Poll so query cancellation is noticed without waiting out `receive_timeout`. The admission
-    /// lock is no longer held; shutdown does not wait here, and this read is not failed on shutdown.
-    /// The assigned file is processed when the initiator's response arrives.
-    constexpr UInt64 cancel_poll_us = 100000; /// 100 ms
-    const auto receive_timeout_us = receive_timeout.totalMicroseconds();
-    UInt64 timeout_us = cancel_poll_us;
-    if (receive_timeout_us > 0)
-        timeout_us = std::min(timeout_us, static_cast<UInt64>(receive_timeout_us));
-
-    Stopwatch watch;
-    while (!in->poll(timeout_us))
-    {
-        checkIfQueryCanceled(state);
-
-        if (receive_timeout_us > 0 && watch.elapsedMicroseconds() >= static_cast<UInt64>(receive_timeout_us))
-            throw NetException(
-                ErrorCodes::SOCKET_TIMEOUT,
-                "Timeout exceeded while receiving a cluster task response. Waited for {} seconds, timeout is {} seconds.",
-                watch.elapsedSeconds(),
-                receive_timeout.totalSeconds());
-    }
-
     UInt64 packet_type = 0;
     state.at_packet_boundary = false;
     readVarUInt(packet_type, *in);
