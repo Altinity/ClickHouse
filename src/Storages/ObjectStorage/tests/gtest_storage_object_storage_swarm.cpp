@@ -131,6 +131,90 @@ TEST(StorageObjectStorageSwarm, ConcurrentTaskAdmissionsDoNotSerialize)
     EXPECT_TRUE(overlapped.load());
 }
 
+TEST(StorageObjectStorageSwarm, TaskResponseReadDoesNotBlockStop)
+{
+    auto context = DB::Context::createCopy(::getContext().context);
+    context->startSwarmMode();
+
+    std::mutex mutex;
+    std::condition_variable ready;
+    bool lock_released = false;
+    bool finish_read = false;
+    std::atomic<int> callbacks{0};
+
+    /// The response read releases the admission lock, then waits. `stopSwarmMode` must return
+    /// during that wait. The callback still returns, so the worker query is not failed.
+    DB::ClusterFunctionReadTaskCallback callback = [&]()
+    {
+        ++callbacks;
+        context->releaseSwarmAdmissionLock();
+
+        std::unique_lock lock(mutex);
+        lock_released = true;
+        ready.notify_all();
+        ready.wait(lock, [&] { return finish_read; });
+        return std::make_shared<DB::ClusterFunctionReadTaskResponse>();
+    };
+
+    std::exception_ptr error;
+    std::thread worker([&]()
+    {
+        try
+        {
+            DB::StorageObjectStorageSource::ReadTaskIterator iterator(
+                callback,
+                /*max_threads_count=*/1,
+                /*is_archive_=*/false,
+                /*object_storage_=*/nullptr,
+                /*table_location_=*/"",
+                context);
+            (void)iterator;
+        }
+        catch (...)
+        {
+            error = std::current_exception();
+        }
+    });
+
+    bool entered = false;
+    {
+        std::unique_lock lock(mutex);
+        entered = ready.wait_for(lock, std::chrono::seconds(5), [&] { return lock_released; });
+    }
+    if (!entered)
+    {
+        {
+            std::lock_guard lock(mutex);
+            finish_read = true;
+        }
+        ready.notify_all();
+        worker.join();
+        context->startSwarmMode();
+        FAIL() << "Task callback did not release the admission lock";
+    }
+
+    auto stop_result = std::async(std::launch::async, [&] { return context->stopSwarmMode(); });
+    const bool stop_finished = stop_result.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+    bool stopped = false;
+    if (stop_finished)
+        stopped = stop_result.get();
+
+    {
+        std::lock_guard lock(mutex);
+        finish_read = true;
+    }
+    ready.notify_all();
+    if (stop_result.valid())
+        stop_result.wait();
+    worker.join();
+    context->startSwarmMode();
+
+    ASSERT_FALSE(error);
+    ASSERT_TRUE(stop_finished);
+    EXPECT_TRUE(stopped);
+    EXPECT_EQ(callbacks.load(), 1);
+}
+
 TEST(StorageObjectStorageSwarm, InterruptUnblocksTaskAdmissionBeforeStop)
 {
     auto context = DB::Context::createCopy(::getContext().context);

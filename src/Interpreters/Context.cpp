@@ -816,13 +816,14 @@ struct ContextSharedPart : boost::noncopyable
 
     std::atomic<bool> shutdown_called = false;
     std::atomic<bool> swarm_mode_enabled = true;
-    /// Set before shutdown waits on `swarm_mode_mutex`. The task callback's socket read
-    /// observes this and returns, instead of holding the lock until `receive_timeout`.
+    /// Set before shutdown waits on `swarm_mode_mutex`. A callback that still holds the lock
+    /// sees it and returns without sending another task request.
     std::atomic<bool> swarm_task_admission_interrupted = false;
-    /// Task admissions hold it shared while a worker asks the initiator for its next task, so
-    /// they run concurrently. Stop/start/shutdown hold it exclusively: no task can be assigned
-    /// after `stopSwarmMode` returns. `SharedMutex` prefers writers, so a pending stop blocks
-    /// new admissions instead of waiting behind them.
+    /// Held shared while a worker decides to ask for a task and sends that request. The
+    /// response read does not hold it, so admissions still run concurrently and stop is not
+    /// stuck for `receive_timeout`. Stop/start/shutdown hold it exclusively: no request is
+    /// sent after `stopSwarmMode` returns. `SharedMutex` prefers writers, so a pending stop
+    /// blocks new admissions instead of waiting behind them.
     mutable SharedMutex swarm_mode_mutex;
 
     Stopwatch uptime_watch TSA_GUARDED_BY(mutex);
@@ -1022,7 +1023,7 @@ struct ContextSharedPart : boost::noncopyable
       */
     void shutdown() TSA_NO_THREAD_SAFETY_ANALYSIS
     {
-        /// The admission lock is held across the task-response read. Wake that read before waiting.
+        /// Wake a callback that is about to send a task request so it returns before this waits.
         swarm_task_admission_interrupted.store(true);
         {
             std::lock_guard lock(swarm_mode_mutex);
@@ -8047,6 +8048,24 @@ bool Context::isSwarmTaskAdmissionInterrupted() const
 std::shared_lock<SharedMutex> Context::lockSwarmMode() const
 {
     return std::shared_lock(shared->swarm_mode_mutex);
+}
+
+static thread_local std::shared_lock<SharedMutex> * current_swarm_admission_lock = nullptr;
+
+void Context::bindSwarmAdmissionLock(std::shared_lock<SharedMutex> * lock) const
+{
+    current_swarm_admission_lock = lock;
+}
+
+void Context::unbindSwarmAdmissionLock() const
+{
+    current_swarm_admission_lock = nullptr;
+}
+
+void Context::releaseSwarmAdmissionLock() const
+{
+    if (current_swarm_admission_lock && current_swarm_admission_lock->owns_lock())
+        current_swarm_admission_lock->unlock();
 }
 
 Context::ApplicationType Context::getApplicationType() const

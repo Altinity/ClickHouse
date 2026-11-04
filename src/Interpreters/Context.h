@@ -1891,13 +1891,17 @@ public:
     bool startSwarmMode();
     /// Return current swarm mode state.
     bool isSwarmModeEnabled() const;
-    /// Ask an in-flight task admission to leave its blocking read. Shutdown sets this before
-    /// taking the admission lock, which that read is holding.
+    /// Set by shutdown before `stopSwarmMode`. A callback that still holds the admission lock
+    /// returns without sending another task request.
     void interruptSwarmTaskAdmission();
     bool isSwarmTaskAdmissionInterrupted() const;
     /// Shared lock for one swarm task admission. Admissions run concurrently with each other;
-    /// `stopSwarmMode` and `startSwarmMode` take the lock exclusively.
+    /// `stopSwarmMode` and `startSwarmMode` take the lock exclusively. The lock covers the
+    /// decision to send a task request. The callback releases it before reading the response.
     std::shared_lock<SharedMutex> lockSwarmMode() const;
+    void bindSwarmAdmissionLock(std::shared_lock<SharedMutex> * lock) const;
+    void unbindSwarmAdmissionLock() const;
+    void releaseSwarmAdmissionLock() const;
 
     bool isInternalQuery() const { return is_internal_query; }
     void setInternalQuery(bool internal) { is_internal_query = internal; }

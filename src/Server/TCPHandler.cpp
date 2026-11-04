@@ -827,9 +827,22 @@ void TCPHandler::runImpl()
 
                     try
                     {
+                        /// Shutdown sets the interrupt flag before it waits for this lock. Return
+                        /// without sending, so the worker query ends instead of failing, and no
+                        /// response is left unread on the connection.
+                        if (server.isCancelled()
+                            || (query_state->query_context && query_state->query_context->isSwarmTaskAdmissionInterrupted()))
+                            return std::make_shared<ClusterFunctionReadTaskResponse>();
+
                         sendReadTaskRequest();
 
                         ProfileEvents::increment(ProfileEvents::ReadTaskRequestsSent);
+
+                        /// The initiator may already be assigning the file for this request.
+                        /// Read that response without the admission lock: `stopSwarmMode` can
+                        /// return, and the assigned file is still processed.
+                        if (query_state->query_context)
+                            query_state->query_context->releaseSwarmAdmissionLock();
 
                         auto res = receiveClusterFunctionReadTaskResponse(*query_state);
 
@@ -2490,31 +2503,22 @@ void TCPHandler::sendHello()
 
 ClusterFunctionReadTaskResponsePtr TCPHandler::receiveClusterFunctionReadTaskResponse(QueryState & state)
 {
-    /// This read holds the swarm admission lock in `takeNextObject`. A single `recv` would keep
-    /// shutdown on that lock until `receive_timeout` (300 seconds by default). Poll and leave
-    /// when shutdown asks the admission to stop.
-    constexpr UInt64 shutdown_poll_us = 100000; /// 100 ms
+    /// `sendReadTaskRequest` has already run. A response may arrive after this returns on error,
+    /// so the connection must not be reused: the next query would read that response as its packet.
+    state.at_packet_boundary = false;
+
+    /// Poll so query cancellation is noticed without waiting out `receive_timeout`. The admission
+    /// lock is no longer held; shutdown does not wait here, and this read is not failed on shutdown.
+    /// The assigned file is processed when the initiator's response arrives.
+    constexpr UInt64 cancel_poll_us = 100000; /// 100 ms
     const auto receive_timeout_us = receive_timeout.totalMicroseconds();
-    UInt64 timeout_us = shutdown_poll_us;
+    UInt64 timeout_us = cancel_poll_us;
     if (receive_timeout_us > 0)
         timeout_us = std::min(timeout_us, static_cast<UInt64>(receive_timeout_us));
-
-    auto admission_interrupted = [&]()
-    {
-        return server.isCancelled() || (state.query_context && state.query_context->isSwarmTaskAdmissionInterrupted());
-    };
-
-    /// A response already buffered in the socket is read below. Otherwise leave immediately when
-    /// shutdown has asked for the admission lock this read is holding.
-    if (admission_interrupted() && !in->poll(0))
-        throw NetException(ErrorCodes::ABORTED, "Server shutdown interrupted receiving a cluster task response");
 
     Stopwatch watch;
     while (!in->poll(timeout_us))
     {
-        if (admission_interrupted())
-            throw NetException(ErrorCodes::ABORTED, "Server shutdown interrupted receiving a cluster task response");
-
         checkIfQueryCanceled(state);
 
         if (receive_timeout_us > 0 && watch.elapsedMicroseconds() >= static_cast<UInt64>(receive_timeout_us))

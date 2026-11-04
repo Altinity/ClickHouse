@@ -3946,9 +3946,9 @@ try
 
             is_cancelled = true;
 
-            /// In-flight task admissions hold `swarm_mode_mutex` while reading the next task.
-            /// Interrupt that read before waiting for the lock; query cancellation alone does not
-            /// unblock the socket.
+            /// A callback still deciding to send a task request returns without sending.
+            /// A request already sent is answered without holding `swarm_mode_mutex`, so this
+            /// does not wait out `receive_timeout` and does not fail the worker query.
             global_context->interruptSwarmTaskAdmission();
             global_context->stopSwarmMode();
 
