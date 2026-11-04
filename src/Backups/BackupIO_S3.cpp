@@ -651,18 +651,41 @@ void BackupWriterS3::copyFileFromDisk(
             const bool whole_object = (src_offset == 0) && (length == source_size);
 
             if (whole_object)
+            {
+                chassert(!src_disk->isContentAddressed());
                 copyS3File(
-                    src_client, /* src_bucket */ blob_path[1], /* src_key */ blob_path[0], length,
-                    /* dest_s3_client */ client, /* dest_bucket */ s3_uri.bucket,
+                    src_client,
+                    /* src_bucket */ blob_path[1],
+                    /* src_key */ blob_path[0],
+                    length,
+                    /* dest_s3_client */ client,
+                    /* dest_bucket */ s3_uri.bucket,
                     /* dest_key */ fs::path(s3_uri.key) / path_in_backup,
-                    s3_settings.request_settings, read_settings, blob_storage_log, runner, create_read_buffer);
+                    s3_settings.request_settings,
+                    read_settings,
+                    blob_storage_log,
+                    runner,
+                    create_read_buffer);
+            }
             else
+            {
                 copyS3FileRange(
-                    src_client, /* src_bucket */ blob_path[1], /* src_key */ blob_path[0], src_offset, length,
+                    src_client,
+                    /* src_bucket */ blob_path[1],
+                    /* src_key */ blob_path[0],
+                    src_offset,
+                    length,
                     /* src_object_size= */ source_size,
-                    /* dest_s3_client */ client, /* dest_bucket */ s3_uri.bucket,
+                    /* dest_s3_client */ client,
+                    /* dest_bucket */ s3_uri.bucket,
                     /* dest_key */ fs::path(s3_uri.key) / path_in_backup,
-                    s3_settings.request_settings, read_settings, blob_storage_log, runner, create_read_buffer);
+                    s3_settings.request_settings,
+                    read_settings,
+                    blob_storage_log,
+                    runner,
+                    create_read_buffer);
+            }
+
             return; /// copied!
         }
     }

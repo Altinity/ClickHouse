@@ -35,7 +35,7 @@ hard links, which object storage does not have.
 On a plain disk a backup pins files against deletion with a hard link. `CAS` uses a different
 mechanism — pointer holding:
 
-- the backup holds a `shared_ptr` to the table and to each part;
+- the backup keeps the table and its parts alive;
 - the outdated-part cleanup skips those parts;
 - while a part is alive so is its [ref](/antalya/cas/architecture/manifests-and-refs#ref-table) — the
   name under which the part is registered in its namespace's ref table, and through which it points
