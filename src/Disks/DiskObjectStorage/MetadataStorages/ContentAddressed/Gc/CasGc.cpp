@@ -687,9 +687,6 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     {
         GcPhaseTimer t(phase_sink, "pre_fold_ref_drain");
         const CatalogLifecycleReconcileResult drain_result = drainCompletedRemoving(state);
-        /// Erases made here were recorded before the erase; this covers rows another actor removed.
-        for (const NamespaceLifeId & retired_life : drain_result.retired_lives)
-            store->invalidateRemovedCatalogLife(retired_life);
         if (drain_result.authority_status != AuthorityStatus::Authoritative
             || drain_result.catalog_resolution != CatalogResolution::DrainComplete)
             throwCasWriteRetryLater("CAS GC pre-fold drain lost authority before the catalog settled");
@@ -4432,9 +4429,6 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// zero catalog mutations. Only after that distinction is resolved do we complete the hot LIST and
     /// take the sole fresh work cut.
     const CatalogLifecycleReconcileResult drain_result = drainCompletedRemoving(state);
-    /// Erases made here were recorded before the erase; this covers rows another actor removed.
-    for (const NamespaceLifeId & retired_life : drain_result.retired_lives)
-        store->invalidateRemovedCatalogLife(retired_life);
     if (drain_result.authority_status != AuthorityStatus::Authoritative
         || drain_result.catalog_resolution != CatalogResolution::DrainComplete)
         throwCasWriteRetryLater("CAS GC rebuild lost authority before the catalog settled");

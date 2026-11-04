@@ -231,8 +231,8 @@ public:
     /// re-reads the exact catalog row.
     bool namespaceStillLogicallyPresent(const RootNamespace & ns);
 
-    /// Called after a complete catalog observation proves an exact resident life absent or replaced.
-    /// It does not
+    /// Called after a complete catalog observation proves an exact resident life absent or replaced,
+    /// or by GC immediately before it erases a row whose terminal removal is folded. It does not
     /// destroy the runtime: existing callers that already captured the old physical life may finish
     /// with their stale-or-not-found contract. The name slot is detached by exact pointer identity; a
     /// later name-based touch may publish a distinct successor runtime.
@@ -896,7 +896,8 @@ private:
         bool removal_admission_closed = false;
         std::condition_variable cv;
 
-        /// Published after GC commits the exact catalog deletion. The exact cache pointer is detached;
+        /// Published when GC is about to erase the exact catalog row, or after it observed the row gone.
+        /// The exact cache pointer is detached;
         /// old holders observe the flag and remain a predecessor, never a rebindable name handle.
         std::atomic<bool> catalog_life_invalidated{false};
 
@@ -944,9 +945,9 @@ private:
         std::shared_ptr<RefTableRuntime> current;
         /// Bumped by `invalidateRemovedCatalogLife`, and by the eviction of a runtime that had closed or
         /// applied its removal: another server's GC leader may drain that life without telling us.
-        /// A slot with a non-zero count is never erased (only
-        /// remount clears it, and remount also moves the fence generation), so a cold admission compares
-        /// the count it captured before its catalog read with the one at insertion.
+        /// A slot with a non-zero count is never erased (only remount clears it, and remount also moves
+        /// the fence generation), so a cold admission compares the count it captured before its catalog
+        /// read with the one at insertion.
         uint64_t retirements = 0;
     };
     static constexpr size_t kMaxRefBatch = 1000;
@@ -1047,8 +1048,8 @@ private:
     /// name slot or runtime.
     std::shared_ptr<RefTableRuntime> lookupRefTableRuntime(const RootNamespace & ns) const;
 
-    /// Whether the caller admitting a runtime reads or mutates the namespace; it picks the wording of a
-    /// stale-observation refusal, which is retryable either way.
+    /// `Write` may birth the namespace; `Read` is non-creating (it includes removing a file). It picks
+    /// the wording of a stale-observation refusal, which is retryable either way.
     enum class RuntimeAdmission : uint8_t
     {
         Read,

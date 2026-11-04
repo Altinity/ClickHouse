@@ -170,7 +170,8 @@ public:
     /// `before_erase`, when set, receives the life once, after admission is confirmed and before the
     /// first erase is sent. It lets a caller record the retirement while the row still exists: a
     /// record made after the erase leaves a window in which the life is gone but unrecorded. An
-    /// exception from it propagates and no erase is sent.
+    /// exception from it propagates and no erase is sent. The only production caller, the GC drain,
+    /// always passes it; the empty default exists for tests that exercise the erase alone.
     static CompletedRemovingDeleteResult deleteCompletedRemovingAtSnapshot(
         CasOperation & op, const Layout & layout, Snapshot catalog_snapshot,
         const CatalogEntry & observed, const CasFoldSeal & authoritative_parent,
