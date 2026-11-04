@@ -2,14 +2,19 @@
 
 # here
 import argparse
+import atexit
 import json
 import logging
+import shutil
 import subprocess
 import sys
+import threading
 import time
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from os import path as p, makedirs
 from typing import List
+from urllib.parse import unquote, urlparse
 
 from github import Github
 
@@ -39,6 +44,85 @@ BUCKETS = {
     "arm64": "package_aarch64"
 }
 git = Git(ignore_no_tags=True)
+
+
+def packages_for_image(image_repo: str) -> List[str]:
+    if "clickhouse-server" in image_repo:
+        return [
+            "clickhouse-client",
+            "clickhouse-server",
+            "clickhouse-common-static",
+        ]
+    if "clickhouse-keeper" in image_repo:
+        return ["clickhouse-keeper"]
+    assert False, "BUG"
+
+
+def is_package_file(name: str, packages: List[str]) -> bool:
+    if "-dbg" in name:
+        return False
+    if not (
+        name.endswith(".deb")
+        or name.endswith(".tgz")
+        or name.endswith(".tgz.sha512")
+    ):
+        return False
+    return any(pkg in name for pkg in packages)
+
+
+def download_packages_from_s3(
+    s3: S3Helper, s3_prefix: str, dest: Path, packages: List[str]
+) -> List[Path]:
+    dest.mkdir(parents=True, exist_ok=True)
+    files = []
+    for build_name in BUCKETS.values():
+        prefix = f"{s3_prefix}/{build_name}"
+        keys = s3.list_prefix(prefix)
+        build_dir = dest / build_name
+        build_dir.mkdir(parents=True, exist_ok=True)
+        for key in keys:
+            name = Path(key).name
+            if not is_package_file(name, packages):
+                continue
+            local = build_dir / name
+            if not local.is_file():
+                logging.info(
+                    "Downloading s3://%s/%s to %s", S3_BUILDS_BUCKET, key, local
+                )
+                s3.client.download_file(S3_BUILDS_BUCKET, key, str(local))
+            files.append(local)
+    return files
+
+
+def start_package_http_server(root: Path, files: List[Path]) -> ThreadingHTTPServer:
+    allowed = {f.relative_to(root).as_posix() for f in files}
+
+    class Handler(SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=str(root), **kwargs)
+
+        def list_directory(self, _path):
+            self.send_error(404, "Not found")
+            return None
+
+        def do_GET(self):
+            rel = Path(unquote(urlparse(self.path).path)).as_posix().lstrip("/")
+            if rel not in allowed:
+                self.send_error(404, "Not found")
+                return
+            self.path = "/" + rel
+            super().do_GET()
+
+        def log_message(self, fmt, *args):
+            logging.info("package-http " + fmt, *args)
+
+    # 0.0.0.0: buildx uses the docker-container driver; wget runs in that
+    # container and reaches the runner via host.docker.internal/host-gateway.
+    httpd = ThreadingHTTPServer(("0.0.0.0", 0), Handler)
+    threading.Thread(
+        target=httpd.serve_forever, daemon=True, name="package-http"
+    ).start()
+    return httpd
 
 
 class DelOS(argparse.Action):
@@ -259,6 +343,8 @@ def build_and_push_image(
         metadata_path = p.join(TEMP_PATH, arch_tag)
         dockerfile = p.join(image.full_path, f"Dockerfile.{os}")
         cmd_args = list(init_args)
+        if bucket_prefix and "host.docker.internal" in bucket_prefix:
+            cmd_args.append("--add-host=host.docker.internal:host-gateway")
         cmd_args.extend(buildx_args(bucket_prefix, arch))
         if not push:
             cmd_args.append(f"--tag={image.repo}:{arch_tag}")
@@ -334,8 +420,23 @@ def main():
     if CI:
         pr_info = PRInfo()
         release_or_pr, _ = get_release_or_pr(pr_info, args.version)
-        args.bucket_prefix = (
-            f"{S3_DOWNLOAD}/{S3_BUILDS_BUCKET}/{release_or_pr}/{pr_info.sha}"
+        s3_helper = S3Helper()
+        pkg_root = Path(TEMP_PATH) / "docker_pkg"
+        if pkg_root.exists():
+            shutil.rmtree(pkg_root)
+        package_files = download_packages_from_s3(
+            s3_helper,
+            f"{release_or_pr}/{pr_info.sha}",
+            pkg_root,
+            packages_for_image(image.repo),
+        )
+        assert package_files, f"No packages downloaded for {image.repo}"
+        httpd = start_package_http_server(pkg_root, package_files)
+        atexit.register(httpd.shutdown)
+        port = httpd.server_address[1]
+        args.bucket_prefix = f"http://host.docker.internal:{port}"
+        logging.info(
+            "Serving %s package files at %s", len(package_files), args.bucket_prefix
         )
         tags.append(f"{pr_info.number}-{args.version.string}")
 
