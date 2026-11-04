@@ -593,7 +593,8 @@ TEST(CASRefWedgeEveryAttempt, DurableCreatedWedgeNeedsRecoveryWhenItsFrontierCan
     backend->fail_cas_latched = true;
     const size_t pauses_before = clock->pauseCount();
 
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "y"); });
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR,
+        "is durable but was not acknowledged", [&] { store->dropRef(ns, "y"); });
     backend->fail_cas_latched = false;
     backend->fail_cas_substr.clear();
 
@@ -734,7 +735,8 @@ TEST(CASRefWedgeEveryAttempt, DefiniteRefusalOfARetryAttemptKeepsTheLaneWedged)
     /// The retry's own create is definitively refused.
     backend->definite_substr = logPrefix(store, ns);
     backend->definite_count = 1;
-    EXPECT_ANY_THROW(store->dropRef(ns, "y"));
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "outcome is unknown",
+        [&] { store->dropRef(ns, "y"); });
 
     EXPECT_TRUE(store->refLaneWedgedForTest(ns)) << "a definite refusal AFTER an ambiguous attempt must not unwedge";
     EXPECT_EQ(store->wedgedKeyForTest(ns), wedged_key) << "the SAME wedge, not a fresh one";

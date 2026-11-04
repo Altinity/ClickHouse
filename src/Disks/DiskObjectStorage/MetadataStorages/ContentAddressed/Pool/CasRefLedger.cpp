@@ -86,6 +86,12 @@ namespace DB::Cas
 
 namespace
 {
+/// Closing clauses for a write that was not attempted because an earlier transaction of the same
+/// table is unresolved. Each carries the outcome phrase the earlier transaction's own writer saw.
+constexpr std::string_view outcome_unknown_tail = "it may or may not take effect; a retry may duplicate it";
+constexpr std::string_view durable_unconfirmed_tail
+    = "the next ref-log recovery installs it, so it may still take effect and a retry may duplicate it";
+
 /// The relink confirm's logger, resolved once. `LOG_IMPL` evaluates its logger argument BEFORE testing
 /// the level, so `getLogger` at the call site would take the global logger-registry lock on every
 /// refusal even with tracing off -- and `confirmExactRef` refuses while holding pool-wide append
@@ -2300,9 +2306,9 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
         if (*invalid_lane_state == RefLaneState::NeedsRecovery)
         {
             result.survivor_error = makeCasWriteRetryLaterExceptionPtr(fmt::format(
-                "CAS ref-log append for namespace '{}': lane recovery is still in progress; retry after "
-                "recovery completes",
-                ns.string()));
+                "CAS ref-log append for namespace '{}': lane recovery is still in progress; an earlier "
+                "transaction is durable but was not acknowledged, and this write was not attempted: {}",
+                ns.string(), durable_unconfirmed_tail));
         }
         else
         {
@@ -2357,9 +2363,11 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
         result.kind = WedgeResolution::StillWedged;
         result.survivor_error = makeCasWriteRetryLaterExceptionPtr(fmt::format(
             "CAS ref-log append for namespace '{}': the bounded retry of wedged txn {}-{} failed ({}), "
-            "which says nothing about the earlier ambiguous attempt — the lane stays wedged",
+            "which says nothing about the earlier ambiguous attempt — the lane stays wedged; wedged txn {}-{} "
+            "outcome is unknown: {}",
             ns.string(), wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence,
-            getCurrentExceptionMessage(/*with_stacktrace*/ false)));
+            getCurrentExceptionMessage(/*with_stacktrace*/ false),
+            wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence, outcome_unknown_tail));
         return result;
     }
 
@@ -2370,8 +2378,10 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
         result.kind = WedgeResolution::StillWedged;
         result.survivor_error = makeCasWriteRetryLaterExceptionPtr(fmt::format(
             "CAS ref-log append for namespace '{}': the bounded retry of wedged txn {}-{} was definitively "
-            "refused ({}), which says nothing about the earlier ambiguous attempt — the lane stays wedged",
-            ns.string(), wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence, refused->message));
+            "refused ({}), which says nothing about the earlier ambiguous attempt — the lane stays wedged; "
+            "wedged txn {}-{} outcome is unknown: {}",
+            ns.string(), wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence, refused->message,
+            wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence, outcome_unknown_tail));
         return result;
     }
 
@@ -2428,7 +2438,11 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
         catch (...)
         {
             result.kind = WedgeResolution::StillWedged;
-            result.survivor_error = std::current_exception();
+            result.survivor_error = std::make_exception_ptr(Exception(getCurrentExceptionCode(),
+                "CAS ref-log append for namespace '{}': wedged txn {}-{} is durable but was not acknowledged "
+                "(publishing its checkpoint frontier was not confirmed: {}): {}",
+                ns.string(), wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence,
+                getCurrentExceptionMessage(false, false, false, false), durable_unconfirmed_tail));
             std::lock_guard lock(rt->state_mutex);
             if (same_wedge_under_lock())
                 requireRecovery(*rt, ns, "wedged-frontier publication");
@@ -2438,9 +2452,10 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
         {
             result.kind = WedgeResolution::StillWedged;
             result.survivor_error = makeCasWriteRetryLaterExceptionPtr(fmt::format(
-                "CAS ref-log append for namespace '{}': wedged txn {}-{} is durable, but its admitted "
-                "fence moved before checkpoint-frontier publication; the lane needs recovery",
-                ns.string(), wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence));
+                "CAS ref-log append for namespace '{}': wedged txn {}-{} is durable but was not acknowledged "
+                "(its admitted fence moved before checkpoint-frontier publication; the lane needs "
+                "recovery): {}",
+                ns.string(), wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence, durable_unconfirmed_tail));
             std::lock_guard lock(rt->state_mutex);
             if (same_wedge_under_lock())
                 requireRecovery(*rt, ns, "wedged-frontier publication fence");
@@ -2716,6 +2731,9 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
                                       ns.string(), txn);
                     break;
             }
+            why += reason == Reason::StaleState
+                ? fmt::format("; wedged txn {} is durable but was not acknowledged: {}", txn, durable_unconfirmed_tail)
+                : fmt::format("; wedged txn {} outcome is unknown: {}", txn, outcome_unknown_tail);
             result.survivor_error = makeCasWriteRetryLaterExceptionPtr(why);
             break;
         }
@@ -3727,12 +3745,35 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
 
     /// Callers must learn whether a retry can duplicate this transaction, so the two outcomes that
     /// leave that open say so, and keep the original code and cause.
-    const auto durable_unconfirmed = [&](int code, const String & cause)
+    struct DurableUnconfirmed
     {
-        return std::make_exception_ptr(Exception(code,
-            "CAS ref-log txn {}-{} for namespace '{}' is durable but was not acknowledged ({}); the next "
-            "ref-log recovery installs it, so the write may still take effect and a retry may duplicate it",
-            id.writer_epoch, id.ref_sequence, ns.string(), cause));
+        int code;
+        String cause;
+    };
+    /// A precommit binding is never published as a part; a promotion can come back after a restart.
+    /// The chunk can mix kinds, so every waiter gets the text of its own step.
+    const auto fail_durable_unconfirmed = [&](const DurableUnconfirmed & failure)
+    {
+        for (const auto & item : chunk_survivors)
+        {
+            const std::vector<std::shared_ptr<RefMutationItem>> one{item};
+            if (item->kind == RootMutationKind::Precommit)
+            {
+                complete_error(one, std::make_exception_ptr(Exception(failure.code,
+                    "CAS ref-log txn {}-{} for namespace '{}' is durable but was not acknowledged ({}); the "
+                    "next ref-log recovery installs the precommit binding, but the part is never published, "
+                    "so its rows will not appear",
+                    id.writer_epoch, id.ref_sequence, ns.string(), failure.cause)));
+            }
+            else
+            {
+                complete_error(one, std::make_exception_ptr(Exception(failure.code,
+                    "CAS ref-log txn {}-{} for namespace '{}' is durable but was not acknowledged ({}); the "
+                    "next ref-log recovery installs it, so the write may still take effect (a promoted part "
+                    "returns after a restart that precedes part cleanup) and a retry may duplicate it",
+                    id.writer_epoch, id.ref_sequence, ns.string(), failure.cause)));
+            }
+        }
     };
     const auto outcome_unknown = [&](int code, const String & cause)
     {
@@ -4004,8 +4045,8 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                 std::lock_guard lock(rt->state_mutex);
                 requireRecovery(*rt, ns, "committed-frontier publication");
             }
-            complete_error(chunk_survivors, durable_unconfirmed(getCurrentExceptionCode(),
-                "publishing its checkpoint frontier was not confirmed: " + getCurrentExceptionMessage(false, false, false, false)));
+            fail_durable_unconfirmed({getCurrentExceptionCode(),
+                "publishing its checkpoint frontier was not confirmed: " + getCurrentExceptionMessage(false, false, false, false)});
             return false;
         }
         if (frontier_outcome == CkptPublishOutcome::FencedOut)
@@ -4014,15 +4055,15 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                 std::lock_guard lock(rt->state_mutex);
                 requireRecovery(*rt, ns, "committed-frontier publication fence");
             }
-            complete_error(chunk_survivors, durable_unconfirmed(ErrorCodes::NETWORK_ERROR,
-                "the mount fence moved before the frontier was published"));
+            fail_durable_unconfirmed({ErrorCodes::NETWORK_ERROR,
+                "the mount fence moved before the frontier was published"});
             return false;
         }
 
         if (carve_hook_for_test)
             carve_hook_for_test(CarvePhaseForTest::PostDurableInstall);
         bool install_refused = false;
-        std::exception_ptr install_admission_error;
+        std::optional<DurableUnconfirmed> install_admission_error;
         {
             std::lock_guard lock(rt->state_mutex);
             /// The checkpoint CAS can succeed and the fence can move before the state lock is
@@ -4036,9 +4077,9 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
             catch (...)
             {
                 requireRecovery(*rt, ns, "post-frontier install admission");
-                install_admission_error = durable_unconfirmed(getCurrentExceptionCode(),
+                install_admission_error = DurableUnconfirmed{getCurrentExceptionCode(),
                     "its install was not admitted after the frontier was published: "
-                    + getCurrentExceptionMessage(false, false, false, false));
+                    + getCurrentExceptionMessage(false, false, false, false)};
             }
             /// Only this leader mutates `rt->state`, so the candidate's base snapshot is still the
             /// current one: there is one append-lane leader per table at a time (the `leader_active`
@@ -4108,15 +4149,16 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         }
         if (install_admission_error)
         {
-            complete_error(chunk_survivors, install_admission_error);
+            fail_durable_unconfirmed(*install_admission_error);
             return false;
         }
         if (install_refused)
         {
             complete_error(chunk_survivors, std::make_exception_ptr(Exception(
                 ErrorCodes::LOGICAL_ERROR,
-                "CAS ref-log append for namespace '{}': txn {}-{} is durable but this table changed "
-                "before installation; the lane needs recovery and refuses later writes until replay",
+                "CAS ref-log append for namespace '{}': txn {}-{} is durable but was not acknowledged "
+                "(this table changed before installation); the lane needs recovery and refuses later "
+                "writes until replay",
                 ns.string(), id.writer_epoch, id.ref_sequence)));
             return false;
         }

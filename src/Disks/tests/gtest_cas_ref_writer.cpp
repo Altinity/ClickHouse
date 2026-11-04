@@ -1577,6 +1577,55 @@ TEST(CASRefWriterAppendLane, CheckpointConflictAfterLogCommitRequiresRecoveryWit
         << "no later id may be allocated above an unfrontiered durable transaction";
 }
 
+/// The same `_ckpt` failure after the ref-log commit means different things per step: a promoted part
+/// can come back after a restart, a precommitted one is never published. The texts must differ.
+TEST(CASRefWriterAppendLane, DurableUnconfirmedTextNamesPrecommitAndPromoteApart)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/frontier-conflict-steps"};
+    publishEmptyPart(store, ns, "x");
+    const NamespaceLifeId life = lifeIfCatalogedForTest(backend, store->layout(), ns).value();
+    const String ckpt_key = store->layout().refCkptKey(life);
+    auto clock = VirtualRetryClock::installOn(store);
+
+    auto messageOf = [&](const std::function<void()> & step)
+    {
+        backend->ckpt_conflict_key = ckpt_key;
+        backend->ckpt_conflict_latched = true;
+        String message;
+        try
+        {
+            step();
+        }
+        catch (const DB::Exception & e)
+        {
+            message = e.message();
+        }
+        backend->disarmFaults();
+        return message;
+    };
+
+    auto precommitted = startBuildFor(store, ns, "pre");
+    const ManifestId pre_id = precommitted->stageManifest({});
+    const String precommit_message = messageOf([&] { precommitted->precommitAdd(ns, "pre", pre_id); });
+    precommitted.reset();
+
+    /// Recover the lane so the promote below reaches its own ref-log commit.
+    publishEmptyPart(store, ns, "between");
+
+    auto promoted = startBuildFor(store, ns, "prom");
+    const ManifestId prom_id = promoted->stageManifest({});
+    promoted->precommitAdd(ns, "prom", prom_id);
+    const String promote_message = messageOf([&] { promoted->promote(ns, "prom", promoted->buildId(), prom_id); });
+
+    EXPECT_NE(precommit_message.find("never published"), String::npos) << precommit_message;
+    EXPECT_EQ(precommit_message.find("may still take effect"), String::npos) << precommit_message;
+    EXPECT_NE(promote_message.find("is durable but was not acknowledged"), String::npos) << promote_message;
+    EXPECT_NE(promote_message.find("restart"), String::npos) << promote_message;
+    EXPECT_EQ(promote_message.find("never published"), String::npos) << promote_message;
+}
+
 TEST(CASRefWriterAppendLane, FenceMovementAtCheckpointPublicationRequiresRecoveryWithoutInstall)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
