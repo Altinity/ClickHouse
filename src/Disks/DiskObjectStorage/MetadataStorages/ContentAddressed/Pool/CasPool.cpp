@@ -647,7 +647,8 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
         = is_decommission ? RetiredOwnerPolicy::AcceptForDecommission : RetiredOwnerPolicy::Refuse;
     CasOperation owner_op = store->gc_requests.admit();
     const uint64_t owner_life = claimOwnerOrThrow(
-        owner_op, store->pool_layout, srid, our_uuid, observe_catalog, claim_retired_policy);
+        owner_op, store->pool_layout, srid, our_uuid, observe_catalog, claim_retired_policy,
+        [s = store.get()](CasEvent e) { s->emitEvent(std::move(e)); });
     store->recorded_owner_life = owner_life;
 
     const auto now_ms = []() -> uint64_t

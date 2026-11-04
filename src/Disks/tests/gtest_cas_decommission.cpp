@@ -2448,8 +2448,27 @@ TEST(CASRejoin, NewUuidReclaimsTheOldLifesFarewell)
     retireVictim(backend, "admin");
     const Layout layout("p");
     const MountLease farewell = readSlot(*backend, layout, "victim");
+    const uint64_t retired_life = readOwner(*backend, layout, "victim").owner_life;
 
-    auto rejoined = Pool::open(backend, victimConfig(UInt128(77)));
+    auto events = std::make_shared<std::vector<CasEvent>>();
+    PoolConfig config = victimConfig(UInt128(77));
+    config.event_sink = [events](CasEvent e)
+    {
+        if (e.type == CasEventType::MountClaim && e.outcome.starts_with("rejoin"))
+            events->push_back(std::move(e));
+    };
+    auto rejoined = Pool::open(backend, config);
+
+    ASSERT_EQ(events->size(), 2u) << "one event per rejoin write";
+    EXPECT_EQ((*events)[0].outcome, "rejoin_mount_rewrite");
+    EXPECT_EQ((*events)[1].outcome, "rejoin_owner");
+    for (const CasEvent & e : *events)
+    {
+        EXPECT_EQ(e.detail.at("retired_uuid"), u128ToHex(victim_uuid));
+        EXPECT_EQ(e.detail.at("retired_life"), std::to_string(retired_life));
+        EXPECT_EQ(e.detail.at("server_uuid"), u128ToHex(UInt128(77)));
+        EXPECT_EQ(e.detail.at("owner_life"), std::to_string(retired_life + 1));
+    }
 
     const OwnerObject owner = readOwner(*backend, layout, "victim");
     EXPECT_EQ(owner.server_uuid, UInt128(77));
@@ -2575,6 +2594,8 @@ TEST(CASRejoin, RefusesWhileDataOfTheOldLifeRemains)
         {
             EXPECT_EQ(e.code(), ErrorCodes::ABORTED) << e.message();
             EXPECT_NE(e.message().find(part), String::npos) << e.message();
+            if (leftover == ServerRootLeftover::CatalogRows)
+                EXPECT_NE(e.message().find("victim/db/t1 (removing)"), String::npos) << "the refusal names the row";
             if (leftover != ServerRootLeftover::RootsObjects)
                 EXPECT_NE(e.message().find("on the GC leader"), String::npos) << e.message();
         }
@@ -2903,10 +2924,32 @@ TEST(CASRejoin, RemountDoesNotRejoin)
     const OwnerObject before = readOwner(*backend, layout, "victim");
 
     EXPECT_FALSE(store->tryRemountOnce());
+    EXPECT_EQ(store->lifecycle(), PoolLifecycle::IdentityLost);
 
     const OwnerObject after = readOwner(*backend, layout, "victim");
     EXPECT_EQ(after.owner_life, before.owner_life);
     EXPECT_TRUE(after.retired_at_ms.has_value());
+}
+
+/// The member was fenced while still running, decommissioned, and its id rejoined under a new uuid. The old
+/// process stops for good instead of retrying.
+TEST(CASRejoin, OldProcessStopsForGoodAfterANewUuidRejoin)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto old_process = Pool::open(backend, victimConfig());
+    const Layout layout("p");
+    fenceOutMountForTest(*backend, layout.mountKey("victim"));
+    expectThrowsCode(ErrorCodes::ABORTED, [&] { old_process->renewWatermarkOnce(); });
+    retireVictim(backend, "admin");
+    auto rejoined = Pool::open(backend, victimConfig(UInt128(77)));
+    const MountLease slot_before = readSlot(*backend, layout, "victim");
+
+    EXPECT_FALSE(old_process->tryRemountOnce());
+    EXPECT_EQ(old_process->lifecycle(), PoolLifecycle::IdentityLost);
+
+    const MountLease slot_after = readSlot(*backend, layout, "victim");
+    EXPECT_EQ(slot_after.server_uuid, UInt128(77));
+    EXPECT_EQ(slot_after.writer_epoch, slot_before.writer_epoch) << "the old process wrote nothing";
 }
 
 

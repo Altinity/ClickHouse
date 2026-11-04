@@ -98,7 +98,9 @@ previous life.
 
 Then a new `server_uuid` first rewrites the terminal `mount` body under its own uuid, and the owner becomes
 `{server_uuid, owner_life + 1}` by `If-Match`. A lost `If-Match` re-reads the owner and decides again. The
-kept counter gives the new life an epoch above every earlier one.
+kept counter gives the new life an epoch above every earlier one. Each of the two writes emits a `MountClaim`
+event, `rejoin_mount_rewrite` and `rejoin_owner`, with the retired and the new `server_uuid` and life. A process
+of the old life that is still running stops in `IdentityLost` at its next remount.
 
 | Refusal | Code | Cause |
 |---|---|---|
@@ -106,7 +108,7 @@ kept counter gives the new life an epoch above every earlier one.
 | `cannot rejoin` | `CORRUPTED_DATA` | `epoch` or `mount` is missing: the id was retired by 26.6.4, or the object was deleted by hand |
 | `decommission is not finished` | `CORRUPTED_DATA` | the tombstone is not verified; `system.cas_mounts` shows the id as `retired` with `retirement_verified = 0` once its slot is terminal |
 | `still running` | `ABORTED` | a decommission run holds the slot, or the lease of a killed run or an interrupted restart has not lapsed and been fenced by GC (up to one GC round after the lease threshold) |
-| `previous life remains` | `ABORTED` | the message names the first part left: catalog rows, `cas/manifests/<server_root_id>/` or `roots/<server_root_id>/` |
+| `previous life remains` | `ABORTED` | the message names the first part left: catalog rows (with the first namespaces and their state), `cas/manifests/<server_root_id>/` or `roots/<server_root_id>/` |
 | `kept changing` | `ABORTED` | the owner or the slot changed under every rejoin attempt of this start; restart |
 
 For `previous life remains`, catalog rows and manifests are removed by GC over several rounds: run `SYSTEM CAS GC RUN '<disk>'` on the GC leader

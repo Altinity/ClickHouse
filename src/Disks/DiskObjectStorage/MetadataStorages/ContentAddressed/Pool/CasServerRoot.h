@@ -170,9 +170,11 @@ enum class RetiredOwnerPolicy : uint8_t
 ///   - absent, subtree non-empty → `CORRUPTED_DATA` (identity lost over data).
 /// The returned life is 0 for a body written before the field existed.
 /// The owner object is never deleted; a rejoin is the one supported change of its uuid.
+/// `sink` receives one `MountClaim` event per rejoin write.
 uint64_t claimOwnerOrThrow(
     CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid,
-    const ObserveRefCatalog & observe_catalog, RetiredOwnerPolicy retired_policy = RetiredOwnerPolicy::Refuse);
+    const ObserveRefCatalog & observe_catalog, RetiredOwnerPolicy retired_policy = RetiredOwnerPolicy::Refuse,
+    const CasEventSink & sink = {});
 
 /// Why a self-remount can never resume under `(our_uuid, recorded_life)`: the owner belongs to another server, is
 /// retired, or is at another life. Empty when the owner allows it or is absent; the claim decides the absent case.

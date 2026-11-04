@@ -12,6 +12,7 @@
 #include <base/arithmeticOverflow.h>
 #include <base/getFQDNOrHostName.h>
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 #include <magic_enum.hpp>
 
 #include <algorithm>
@@ -551,11 +552,55 @@ String accessProbeKey(const Layout & l, const String & srid, UInt128 server_uuid
         hex.substr(0, 8), hex.substr(8, 4), hex.substr(12, 4), hex.substr(16, 4), hex.substr(20));
 }
 
+/// One `MountClaim` event per rejoin write, so the audit trail shows who took the slot and the owner. Delivery
+/// failures are contained: they cannot change the rejoin decision.
+void emitRejoinEvent(const CasEventSink & sink, const String & srid, std::string_view branch, std::string_view reason,
+                     const OwnerObject & retired, UInt128 our_uuid, uint64_t new_life) noexcept
+{
+    try
+    {
+        if (!sink)
+            return;
+        CasEvent e;
+        e.type = CasEventType::MountClaim;
+        e.object_kind = CasEventObjectKind::None;
+        e.outcome = String{branch};
+        e.reason = String{reason};
+        e.detail = {{"server_root_id", srid}, {"branch", String{branch}},
+                    {"retired_uuid", u128ToHex(retired.server_uuid)}, {"retired_life", std::to_string(retired.owner_life)},
+                    {"server_uuid", u128ToHex(our_uuid)}, {"owner_life", std::to_string(new_life)}};
+        sink(std::move(e));
+    }
+    catch (...)   // NOLINT(bugprone-empty-catch)
+    {
+    }
+}
+
+/// The first catalog rows of the retired id's previous life, as `namespace (state)`, for the refusal text.
+String leftoverCatalogRows(const RefCatalog & catalog, const String & srid)
+{
+    constexpr size_t max_named = 5;
+    const String owned_prefix = srid + "/";
+    std::vector<String> named;
+    size_t total = 0;
+    for (const CatalogEntry & entry : catalog.entries)
+    {
+        if (entry.ns.string() != srid && !entry.ns.string().starts_with(owned_prefix))
+            continue;
+        if (++total <= max_named)
+            named.push_back(fmt::format("{} ({})", entry.ns.string(), nsStateToWord(entry.state)));
+    }
+    String text = fmt::format("{}", fmt::join(named, ", "));
+    if (total > max_named)
+        text += fmt::format(" and {} more", total - max_named);
+    return text;
+}
+
 /// Take over the retired `owner` as `our_uuid` at its next life. nullopt: an `If-Match` lost to another
 /// write, and the caller decides again from a fresh owner read.
 std::optional<uint64_t> rejoinRetiredOwner(
     CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid, const OwnerObject & owner,
-    const Etag & owner_etag, const ObserveRefCatalog & observe_catalog)
+    const Etag & owner_etag, const ObserveRefCatalog & observe_catalog, const CasEventSink & sink)
 {
     /// Checked before the retirement, so an id retired by 26.6.4 (no `epoch`, no `mount`) is never sent to a
     /// rerun, which would refuse the absent counter.
@@ -580,15 +625,18 @@ std::optional<uint64_t> rejoinRetiredOwner(
     if (const std::optional<Meta> probe_meta = op.head(probe, Retry::standard()))
         /// A lost `If-Match` leaves the probe in place, and the leftover check below refuses on it.
         (void)op.remove(probe, probe_meta->etag, Retry::standard());
-    switch (serverRootLeftover(op, l, srid, observe_catalog()))
+    const RefCatalog catalog = observe_catalog();
+    switch (serverRootLeftover(op, l, srid, catalog))
     {
         case ServerRootLeftover::None:
             break;
         case ServerRootLeftover::CatalogRows:
             throw Exception(ErrorCodes::ABORTED,
                 "CAS server-root '{}' is retired but data of its previous life remains: catalog rows of the old life are not "
-                "yet removed by GC. Run SYSTEM CAS GC RUN '<disk>' on the GC leader (is_leader = 1 in system.cas_mounts; "
-                "it can take several rounds) and restart this server", srid);
+                "yet removed by GC: {}. Run SYSTEM CAS GC RUN '<disk>' on the GC leader (is_leader = 1 in system.cas_mounts; "
+                "it can take several rounds) and restart this server. A row that stays `removing` for many rounds is held "
+                "by GC: the leader counts it in CASGCStuckRemovals and logs a stuck-removal warning naming the reason",
+                srid, leftoverCatalogRows(catalog, srid));
         case ServerRootLeftover::Manifests:
             throw Exception(ErrorCodes::ABORTED,
                 "CAS server-root '{}' is retired but data of its previous life remains: manifests under cas/manifests/{}/ are "
@@ -618,6 +666,8 @@ std::optional<uint64_t> rejoinRetiredOwner(
                 op.replace(l.mountKey(srid), encodeMountLease(ours), mount->etag, Retry::standard()),
                 fmt::format("CAS server-root '{}' rejoin mount write", srid)))
             return std::nullopt;
+        emitRejoinEvent(sink, srid, "rejoin_mount_rewrite", "a rejoin under a new server uuid rewrote the retired terminal body",
+                        owner, our_uuid, owner.owner_life + 1);
     }
 
     const uint64_t life = owner.owner_life + 1;
@@ -628,6 +678,7 @@ std::optional<uint64_t> rejoinRetiredOwner(
                 owner_etag, Retry::standard()),
             fmt::format("CAS server-root '{}' rejoin owner write", srid)))
         return std::nullopt;
+    emitRejoinEvent(sink, srid, "rejoin_owner", "a server start took over the retired owner at its next life", owner, our_uuid, life);
     LOG_WARNING(getLogger("CasMountLease"),
         "CAS server-root '{}': rejoined as an empty member under server_uuid {} at owner life {} (retired life {} of {})",
         srid, u128ToHex(our_uuid), life, owner.owner_life, u128ToHex(owner.server_uuid));
@@ -660,7 +711,7 @@ String remountOwnerRefusal(CasOperation & op, const Layout & l, const String & s
 
 uint64_t claimOwnerOrThrow(
     CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid,
-    const ObserveRefCatalog & observe_catalog, RetiredOwnerPolicy retired_policy)
+    const ObserveRefCatalog & observe_catalog, RetiredOwnerPolicy retired_policy, const CasEventSink & sink)
 {
     if (!observe_catalog)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS server-root '{}': catalog observer is required", srid);
@@ -684,7 +735,7 @@ uint64_t claimOwnerOrThrow(
                     "server uuid, so it does not rejoin it. Only a server start with a server uuid rejoins a retired "
                     "id: start the server that should own it, or configure a new <cas_server_root_id> for this disk",
                     srid, *owner.retired_at_ms, owner.owner_life);
-            if (const std::optional<uint64_t> life = rejoinRetiredOwner(op, l, srid, our_uuid, owner, current->etag, observe_catalog))
+            if (const std::optional<uint64_t> life = rejoinRetiredOwner(op, l, srid, our_uuid, owner, current->etag, observe_catalog, sink))
                 return *life;
             if (decision == max_owner_decisions)
                 throw Exception(ErrorCodes::ABORTED,

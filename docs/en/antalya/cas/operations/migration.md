@@ -236,7 +236,7 @@ The start rejoins only after the decommission finished:
 |---|---|
 | `cannot rejoin` | `epoch` or `mount` is missing: the id was retired by 26.6.4 or the object was deleted by hand. Configure a new `cas_server_root_id` |
 | `decommission is not finished` | finish the decommission under the [rerun rule](#rejoin-rerun-rule) until `member_retired = 1`, then restart |
-| `previous life remains` | the message names the part left. Catalog rows or manifests: run `SYSTEM CAS GC RUN '<disk>'` on the GC leader, `is_leader = 1` (it can take several rounds) and restart. An object under `roots/<server_root_id>/`: delete it by hand and restart |
+| `previous life remains` | the message names the part left, and for catalog rows the first namespaces and their state. Catalog rows or manifests: run `SYSTEM CAS GC RUN '<disk>'` on the GC leader, `is_leader = 1` (it can take several rounds) and restart. A row that stays `removing` for many rounds is held by GC: the leader counts it in `CASGCStuckRemovals` and its stuck-removal warning names the reason. An object under `roots/<server_root_id>/`: delete it by hand and restart |
 | `still running` | a decommission run, a killed run or an interrupted restart holds the slot: wait for the run to finish, or for the lease to lapse and GC to fence it (up to one GC round after the lease threshold), then restart |
 | `kept changing` | other starts or a decommission run kept rewriting the owner or the slot during this start: restart |
 | `no server uuid` | the process (for example `clickhouse disks` before a uuid file exists) has no server uuid and never rejoins: start the server that should own the id |
