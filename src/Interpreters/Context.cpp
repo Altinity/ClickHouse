@@ -6796,7 +6796,7 @@ DiskPtr Context::getDiskOrExplainCreation(std::lock_guard<std::mutex> & lock, co
 namespace
 {
 
-/// All callers of one creation get the same stored exception. Each rethrows its own copy, so a
+/// All waiters of one creation get the same stored exception. Each rethrows its own copy, so a
 /// caller that modifies its exception (e.g. `addMessage`) does not race with the others.
 DiskPtr getDiskCreationResult(const std::shared_future<DiskPtr> & creation)
 {
@@ -6883,7 +6883,7 @@ DiskPtr Context::getOrCreateDisk(const String & name, DiskCreator creator) const
     return disk;
 }
 
-size_t Context::getDiskCreationWaiters(const String & name) const
+size_t Context::getDiskCreationWaitersForTest(const String & name) const
 {
     std::lock_guard lock(shared->storage_policies_mutex);
     auto it = shared->disks_being_created.find(name);

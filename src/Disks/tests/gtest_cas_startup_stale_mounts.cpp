@@ -217,19 +217,19 @@ protected:
         fs::remove_all(root);
     }
 
-    /// Disks stay in the global context after a test, so every name is unique within the process.
     /// Spins until `count` requests wait for the creation of `name`: no timing assumption, and a creator
     /// that never gets its waiter fails the test by the deadline instead of passing.
     static void waitForWaiters(const String & name, size_t count)
     {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-        while (getContext().context->getDiskCreationWaiters(name) < count)
+        while (getContext().context->getDiskCreationWaitersForTest(name) < count)
         {
             ASSERT_LT(std::chrono::steady_clock::now(), deadline) << "no request joined the creation";
             std::this_thread::yield();
         }
     }
 
+    /// Disks stay in the global context after a test, so every name is unique within the process.
     static String uniqueDiskName(const String & prefix)
     {
         static std::atomic<size_t> counter = 0;
@@ -558,34 +558,49 @@ TEST_F(CASStartupStaleMounts, ConfigReloadKeepsPoliciesThatDoNotNameTheDiskBeing
         return "<" + policy_name + "><volumes><v>" + disks + "</v></volumes></" + policy_name + ">";
     };
 
+    /// Policies outlive the test in the global context and a reload cannot drop one, so names are
+    /// unique per run and every reload repeats the policies of earlier runs.
+    static String earlier_policies;
+    const String p_old = name + "_old";
+    const String p_new_on_creating = name + "_new_on_creating";
+    const String p_new_on_other = name + "_new_on_other";
+
     getContext().context->getPoliciesMap();
-    getContext().context->updateStorageConfiguration(*reload_config(policy("p_old", "<disk>other</disk>"), false));
-    ASSERT_TRUE(getContext().context->getPoliciesMap().contains("p_old"));
+    getContext().context->updateStorageConfiguration(*reload_config(earlier_policies + policy(p_old, "<disk>other</disk>"), false));
+    ASSERT_TRUE(getContext().context->getPoliciesMap().contains(p_old));
 
     getContext().context->getOrCreateDisk(name, [&](const DB::DisksMap &) -> DB::DiskPtr
     {
-        const String policies = policy("p_old", "<disk>other</disk><disk>" + name + "</disk>")
-            + policy("p_new_on_creating", "<disk>" + name + "</disk>") + policy("p_new_on_other", "<disk>other</disk>");
+        const String policies = earlier_policies + policy(p_old, "<disk>other</disk><disk>" + name + "</disk>")
+            + policy(p_new_on_creating, "<disk>" + name + "</disk>") + policy(p_new_on_other, "<disk>other</disk>");
         getContext().context->updateStorageConfiguration(*reload_config(policies, true));
         return std::make_shared<DB::DiskLocal>(name, custom_disk_path.string() + "/");
     });
 
+    earlier_policies += policy(p_old, "<disk>other</disk>") + policy(p_new_on_other, "<disk>other</disk>");
+
     const auto policies = getContext().context->getPoliciesMap();
-    EXPECT_TRUE(policies.contains("p_new_on_other"));
-    EXPECT_FALSE(policies.contains("p_new_on_creating"));
-    ASSERT_TRUE(policies.contains("p_old"));
-    EXPECT_EQ(policies.at("p_old")->getDisks().size(), 1u);
+    EXPECT_TRUE(policies.contains(p_new_on_other));
+    EXPECT_FALSE(policies.contains(p_new_on_creating));
+    ASSERT_TRUE(policies.contains(p_old));
+    EXPECT_EQ(policies.at(p_old)->getDisks().size(), 1u);
 }
+
+/// Has no `clone` or `rethrow`, so any copy of it is sliced to `DB::Exception`.
+struct ExceptionWithoutRethrow : DB::Exception
+{
+    using DB::Exception::Exception;
+};
 
 /// A failed creation rethrows the creator's own exception, not a copy sliced to a base type.
 TEST_F(CASStartupStaleMounts, FailedCreationKeepsTheExceptionTypeForTheCreator)
 {
     EXPECT_THROW(
-        getContext().context->getOrCreateDisk(uniqueDiskName("fenced_creator"), [&](const DB::DisksMap &) -> DB::DiskPtr
+        getContext().context->getOrCreateDisk(uniqueDiskName("creator_exception"), [&](const DB::DisksMap &) -> DB::DiskPtr
         {
-            throw MountFencedException("fenced");
+            throw ExceptionWithoutRethrow(DB::ErrorCodes::BAD_ARGUMENTS, "creation failed");
         }),
-        MountFencedException);
+        ExceptionWithoutRethrow);
 }
 
 /// While a disk is being created, resolving it by name says so instead of reporting an unknown disk.
@@ -633,6 +648,7 @@ TEST_F(CASStartupStaleMounts, WaiterOfAFailedCreationGetsTheExceptionType)
     std::mutex mutex;
     std::condition_variable cv;
     bool creating = false;
+    bool creator_started = false;
     bool waiter_got_fenced = false;
     bool creator_got_fenced = false;
 
@@ -661,21 +677,25 @@ TEST_F(CASStartupStaleMounts, WaiterOfAFailedCreationGetsTheExceptionType)
     });
     {
         std::unique_lock lock(mutex);
-        ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(30), [&] { return creating; }));
+        creator_started = cv.wait_for(lock, std::chrono::seconds(30), [&] { return creating; });
     }
-    try
+    if (creator_started)
     {
-        getContext().context->getOrCreateDisk(name, [](const DB::DisksMap &) -> DB::DiskPtr { return nullptr; });
-    }
-    catch (const MountFencedException &)
-    {
-        waiter_got_fenced = true;
-    }
-    catch (...)
-    {
+        try
+        {
+            getContext().context->getOrCreateDisk(name, [](const DB::DisksMap &) -> DB::DiskPtr { return nullptr; });
+        }
+        catch (const MountFencedException &)
+        {
+            waiter_got_fenced = true;
+        }
+        catch (...)
+        {
+        }
     }
     creator.join();
 
+    EXPECT_TRUE(creator_started) << "the creator never started";
     EXPECT_TRUE(creator_got_fenced);
     EXPECT_TRUE(waiter_got_fenced);
 }

@@ -486,14 +486,15 @@ bool StoragePolicy::containsVolume(const String & volume_name) const
 namespace
 {
 
-bool policyNamesAnyDisk(const Poco::Util::AbstractConfiguration & config, const String & policy_prefix, const NameSet & disk_names)
+/// Returns the first disk of `disk_names` that the policy config names, or an empty string.
+String findNamedDisk(const Poco::Util::AbstractConfiguration & config, const String & policy_prefix, const NameSet & disk_names)
 {
     if (disk_names.empty())
-        return false;
+        return {};
 
     const String volumes_prefix = policy_prefix + ".volumes";
     if (!config.has(volumes_prefix))
-        return false;
+        return {};
 
     Poco::Util::AbstractConfiguration::Keys volumes;
     config.keys(volumes_prefix, volumes);
@@ -502,10 +503,15 @@ bool policyNamesAnyDisk(const Poco::Util::AbstractConfiguration & config, const 
         Poco::Util::AbstractConfiguration::Keys keys;
         config.keys(volumes_prefix + "." + volume, keys);
         for (const auto & key : keys)
-            if (startsWith(key, "disk") && disk_names.contains(config.getString(volumes_prefix + "." + volume + "." + key)))
-                return true;
+        {
+            if (!startsWith(key, "disk"))
+                continue;
+            auto disk_name = config.getString(volumes_prefix + "." + volume + "." + key);
+            if (disk_names.contains(disk_name))
+                return disk_name;
+        }
     }
-    return false;
+    return {};
 }
 
 }
@@ -532,12 +538,13 @@ StoragePolicySelector::StoragePolicySelector(
          *  else
          */
 
-        if (policyNamesAnyDisk(config, config_prefix + "." + name, disks_to_skip))
+        if (auto skipped_disk = findNamedDisk(config, config_prefix + "." + name, disks_to_skip); !skipped_disk.empty())
         {
             LOG_WARNING(
                 getLogger("StoragePolicySelector"),
-                "Storage policy {} is not loaded: it names a disk that is being created",
-                backQuote(name));
+                "Storage policy {} is not loaded: disk {} is being created as a custom disk",
+                backQuote(name),
+                backQuote(skipped_disk));
             continue;
         }
 
@@ -546,7 +553,7 @@ StoragePolicySelector::StoragePolicySelector(
     }
 
     /// Add default policy if it isn't explicitly specified.
-    if (!policies.contains(DEFAULT_STORAGE_POLICY_NAME) && !policyNamesAnyDisk(config, config_prefix + "." + DEFAULT_STORAGE_POLICY_NAME, disks_to_skip))
+    if (!policies.contains(DEFAULT_STORAGE_POLICY_NAME) && findNamedDisk(config, config_prefix + "." + DEFAULT_STORAGE_POLICY_NAME, disks_to_skip).empty())
     {
         auto default_policy = std::make_shared<StoragePolicy>(DEFAULT_STORAGE_POLICY_NAME, config, config_prefix + "." + DEFAULT_STORAGE_POLICY_NAME, disks);
         policies.emplace(DEFAULT_STORAGE_POLICY_NAME, std::move(default_policy));
@@ -571,7 +578,7 @@ StoragePolicySelectorPtr StoragePolicySelector::updateFromConfig(
         {
             if (!result->policies.contains(name))
             {
-                if (!policyNamesAnyDisk(config, config_prefix + "." + name, disks_to_skip))
+                if (findNamedDisk(config, config_prefix + "." + name, disks_to_skip).empty())
                     throw Exception(ErrorCodes::BAD_ARGUMENTS, "Storage policy {} is missing in new configuration", backQuote(name));
 
                 result->policies[name] = policy;
