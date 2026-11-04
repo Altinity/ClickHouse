@@ -20,7 +20,7 @@ import requests
 from clickhouse_driver import Client
 from clickhouse_driver.errors import ServerException
 import boto3
-from botocore.exceptions import NoCredentialsError
+from botocore.exceptions import ClientError, NoCredentialsError
 import yaml
 
 
@@ -29,6 +29,22 @@ DATABASE_USER_VAR = "CLICKHOUSE_TEST_STAT_LOGIN"
 DATABASE_PASSWORD_VAR = "CLICKHOUSE_TEST_STAT_PASSWORD"
 S3_BUCKET = os.getenv("S3_ARTIFACT_BUCKET")
 GITHUB_REPO = "Altinity/ClickHouse"
+
+
+def _repo_and_run_id(actions_run_url: str) -> tuple[str, str]:
+    parts = urllib.parse.urlparse(actions_run_url).path.strip("/").split("/")
+    if (
+        len(parts) >= 5
+        and parts[2] == "actions"
+        and parts[3] == "runs"
+        and parts[0]
+        and parts[1]
+        and parts[4]
+    ):
+        return f"{parts[0]}/{parts[1]}", parts[4]
+    return GITHUB_REPO, actions_run_url.rstrip("/").split("/")[-1]
+
+
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
 # Resolve from this file so discovery works from repo root or the action folder.
 KNOWN_FAILS_FILE = (
@@ -70,7 +86,9 @@ def _results_link_has_ref(target_url: str | None, ref: str) -> bool:
     return f"REF={ref}&" in target_url or f"/REFs/{ref}/" in target_url
 
 
-def get_commit_statuses(sha: str, pr_number: int, ref: str) -> pd.DataFrame:
+def get_commit_statuses(
+    sha: str, pr_number: int, ref: str, repo: str = GITHUB_REPO
+) -> pd.DataFrame:
     """
     Fetch commit statuses for a given SHA and return as a pandas DataFrame.
     Handles pagination to get all statuses.
@@ -92,7 +110,7 @@ def get_commit_statuses(sha: str, pr_number: int, ref: str) -> pd.DataFrame:
         "Accept": "application/vnd.github.v3+json",
     }
 
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/commits/{sha}/statuses"
+    url = f"https://api.github.com/repos/{repo}/commits/{sha}/statuses"
 
     all_data = []
 
@@ -147,7 +165,7 @@ def get_commit_statuses(sha: str, pr_number: int, ref: str) -> pd.DataFrame:
     ).reset_index(drop=True)
 
 
-def get_pr_info_from_number(pr_number: str) -> dict:
+def get_pr_info_from_number(pr_number: str, repo: str = GITHUB_REPO) -> dict:
     """
     Fetch pull request information for a given PR number.
 
@@ -162,7 +180,7 @@ def get_pr_info_from_number(pr_number: str) -> dict:
         "Accept": "application/vnd.github.v3+json",
     }
 
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/pulls/{pr_number}"
+    url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}"
     response = requests.get(url, headers=headers)
 
     if response.status_code != 200:
@@ -173,7 +191,7 @@ def get_pr_info_from_number(pr_number: str) -> dict:
     return response.json()
 
 
-def get_run_details(run_id: str) -> dict:
+def get_run_details(run_id: str, repo: str = GITHUB_REPO) -> dict:
     """
     Fetch run details for a given run URL.
     """
@@ -182,7 +200,7 @@ def get_run_details(run_id: str) -> dict:
         "Accept": "application/vnd.github.v3+json",
     }
 
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/runs/{run_id}"
+    url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id}"
     response = requests.get(url, headers=headers)
 
     if response.status_code != 200:
@@ -472,7 +490,9 @@ def _parse_release_ref(ref_name: str) -> tuple[str, str, str | None] | None:
     return None
 
 
-def _prs_in_release_search_url(branch_name: str, baseline_time: str | None) -> str | None:
+def _prs_in_release_search_url(
+    branch_name: str, baseline_time: str | None, repo: str = GITHUB_REPO
+) -> str | None:
     if not baseline_time:
         return None
     # Tag-triggered runs expose the tag as head_branch; search needs the PR base
@@ -483,7 +503,7 @@ def _prs_in_release_search_url(branch_name: str, baseline_time: str | None) -> s
         branch_name = f"{flavour}-{minor_version}"
     query = f"is:pr base:{branch_name} merged:>{baseline_time}"
     return (
-        f"https://github.com/{GITHUB_REPO}/pulls?"
+        f"https://github.com/{repo}/pulls?"
         + urllib.parse.urlencode({"q": query})
     )
 
@@ -798,15 +818,20 @@ def get_new_fails_this_pr(
     return new_fails_df
 
 
-def _workflow_config_s3_url(pr_number: int, commit_sha: str, ref_name: str) -> str:
+def _s3_get_json(key: str):
+    s3_client = boto3.client("s3", endpoint_url=os.getenv("S3_URL"))
+    response = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
+    return json.loads(response["Body"].read().decode("utf-8"))
+
+
+def _workflow_config_s3_key(pr_number: int, commit_sha: str, ref_name: str) -> str:
     if pr_number == 0:
         return (
-            f"https://{S3_BUCKET}.s3.amazonaws.com/REFs/{ref_name}/{commit_sha}/"
+            f"REFs/{ref_name}/{commit_sha}/"
             "config_workflow/workflow_config_masterci.json"
         )
     return (
-        f"https://{S3_BUCKET}.s3.amazonaws.com/PRs/{pr_number}/{commit_sha}/"
-        "config_workflow/workflow_config_pr.json"
+        f"PRs/{pr_number}/{commit_sha}/config_workflow/workflow_config_pr.json"
     )
 
 
@@ -816,18 +841,14 @@ def get_workflow_config(pr_number: int, commit_sha: str, ref_name: str) -> dict:
 
     On failure, warn and return a minimal empty config (same shape recreation uses).
     """
-    url = _workflow_config_s3_url(pr_number, commit_sha, ref_name)
+    key = _workflow_config_s3_key(pr_number, commit_sha, ref_name)
     try:
-        response = requests.get(url, timeout=30)
-        if response.status_code != 200:
-            print(
-                f"WARNING:Failed to fetch workflow config from {url}: "
-                f"{response.status_code}"
-            )
-            return {"cache_jobs": {}}
-        return response.json()
+        return _s3_get_json(key)
     except Exception as e:
-        print(f"WARNING:Failed to fetch workflow config from {url}: {e}")
+        print(
+            f"WARNING:Failed to fetch workflow config from s3://{S3_BUCKET}/{key}: {e}",
+            file=sys.stderr,
+        )
         return {"cache_jobs": {}}
 
 
@@ -1038,18 +1059,16 @@ def fetch_workflow_result_json(
         ref_param = f"PR={pr_number}"
         workflow_name = "PR"
 
-    status_file = f"result_{workflow_name.lower()}.json"
-    s3_path = (
-        f"https://{S3_BUCKET}.s3.amazonaws.com/"
-        f"{ref_param.replace('=', 's/')}/{commit_sha}/{status_file}"
+    key = (
+        f"{ref_param.replace('=', 's/')}/{commit_sha}/"
+        f"result_{workflow_name.lower()}.json"
     )
     try:
-        response = requests.get(s3_path, timeout=30)
-        if response.status_code != 200:
-            return None
-        return response.json()
+        return _s3_get_json(key)
+    except ClientError:
+        return None
     except Exception as e:
-        print(f"WARNING:Failed to fetch workflow result from {s3_path}: {e}")
+        print(f"WARNING:Failed to fetch workflow result from s3://{S3_BUCKET}/{key}: {e}")
         return None
 
 
@@ -1090,7 +1109,9 @@ def add_labels_to_checks_fails(
     return df[cols]
 
 
-def format_results_as_html_table(results, *, branch_name: str = "") -> str:
+def format_results_as_html_table(
+    results, *, branch_name: str = "", repo: str = GITHUB_REPO
+) -> str:
     if not isinstance(results, pd.DataFrame):
         return results
 
@@ -1121,7 +1142,7 @@ def format_results_as_html_table(results, *, branch_name: str = "") -> str:
             f'<span data-sort="{CVE_SEVERITY_ORDER.get(str(s).lower(), 6)}">{s}</span>'
         ),
         "PR Number": lambda n: url_to_html_link(
-            f"https://github.com/{GITHUB_REPO}/pull/{n}"
+            f"https://github.com/{repo}/pull/{n}"
         ),
         "PR Labels": lambda labels: format_pr_labels_with_verification(
             labels, branch_name=branch_name
@@ -1274,9 +1295,9 @@ def create_workflow_report(
     if not all([host, user, password, GITHUB_TOKEN, S3_BUCKET]):
         raise Exception("Required environment variables are not set")
 
-    run_id = actions_run_url.split("/")[-1]
+    github_repo, run_id = _repo_and_run_id(actions_run_url)
 
-    run_details = get_run_details(run_id)
+    run_details = get_run_details(run_id, github_repo)
     branch_name = run_details.get("head_branch", "unknown branch")
     if pr_number is None or commit_sha is None:
         if pr_number is None:
@@ -1301,7 +1322,9 @@ def create_workflow_report(
 
     results_dfs = {
         "prs_in_release": [],
-        "job_statuses": get_commit_statuses(commit_sha, pr_number, branch_name),
+        "job_statuses": get_commit_statuses(
+            commit_sha, pr_number, branch_name, github_repo
+        ),
         "checks_fails": add_labels_to_checks_fails(
             get_checks_fails(db_client, commit_sha, branch_name),
             workflow_result,
@@ -1318,11 +1341,11 @@ def create_workflow_report(
     if pr_number == 0 and not mark_preview:
         try:
             prs_df, baseline_time = get_prs_in_release_dataframe(
-                branch_name, cwd=os.getcwd()
+                branch_name, cwd=os.getcwd(), repo=github_repo
             )
             results_dfs["prs_in_release"] = prs_df
             prs_in_release_search_url = _prs_in_release_search_url(
-                branch_name, baseline_time
+                branch_name, baseline_time, github_repo
             )
         except Exception as e:
             print(f"Error in get_prs_in_release_dataframe: {e}")
@@ -1352,8 +1375,8 @@ def create_workflow_report(
         pr_info_html = f"Release ({branch_name})"
     else:
         try:
-            pr_info = get_pr_info_from_number(pr_number)
-            pr_info_html = f"""<a href="https://github.com/{GITHUB_REPO}/pull/{pr_info["number"]}">
+            pr_info = get_pr_info_from_number(pr_number, github_repo)
+            pr_info_html = f"""<a href="https://github.com/{github_repo}/pull/{pr_info["number"]}">
                     #{pr_info.get("number")} ({pr_info.get("base", {}).get('ref')} <- {pr_info.get("head", {}).get('ref')})  {pr_info.get("title")}
                     </a>"""
             results_dfs["pr_new_fails"] = get_new_fails_this_pr(
@@ -1388,7 +1411,7 @@ def create_workflow_report(
     # Define the context for rendering
     context = {
         "title": "ClickHouse® CI Workflow Run Report",
-        "github_repo": GITHUB_REPO,
+        "github_repo": github_repo,
         "s3_bucket": S3_BUCKET,
         "pr_info_html": pr_info_html,
         "pr_number": pr_number,
@@ -1423,6 +1446,7 @@ def create_workflow_report(
             else format_results_as_html_table(
                 results_dfs["prs_in_release"],
                 branch_name=branch_name,
+                repo=github_repo,
             )
         ),
         "ci_jobs_status_html": format_results_as_html_table(
