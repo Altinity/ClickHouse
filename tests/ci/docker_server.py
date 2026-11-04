@@ -117,12 +117,33 @@ def start_package_http_server(root: Path, files: List[Path]) -> ThreadingHTTPSer
             logging.info("package-http " + fmt, *args)
 
     # 0.0.0.0: buildx uses the docker-container driver; wget runs in that
-    # container and reaches the runner via host.docker.internal/host-gateway.
+    # container and reaches the runner via the docker bridge gateway.
     httpd = ThreadingHTTPServer(("0.0.0.0", 0), Handler)
     threading.Thread(
         target=httpd.serve_forever, daemon=True, name="package-http"
     ).start()
     return httpd
+
+
+def docker_bridge_gateway() -> str:
+    # buildx docker-container driver does not support host-gateway.
+    try:
+        out = subprocess.check_output(
+            [
+                "docker",
+                "network",
+                "inspect",
+                "bridge",
+                "-f",
+                "{{(index .IPAM.Config 0).Gateway}}",
+            ],
+            text=True,
+        ).strip()
+        if out:
+            return out
+    except Exception as e:
+        logging.warning("Failed to inspect docker bridge gateway: %s", e)
+    return "172.17.0.1"
 
 
 class DelOS(argparse.Action):
@@ -343,8 +364,6 @@ def build_and_push_image(
         metadata_path = p.join(TEMP_PATH, arch_tag)
         dockerfile = p.join(image.full_path, f"Dockerfile.{os}")
         cmd_args = list(init_args)
-        if bucket_prefix and "host.docker.internal" in bucket_prefix:
-            cmd_args.append("--add-host=host.docker.internal:host-gateway")
         cmd_args.extend(buildx_args(bucket_prefix, arch))
         if not push:
             cmd_args.append(f"--tag={image.repo}:{arch_tag}")
@@ -434,7 +453,7 @@ def main():
         httpd = start_package_http_server(pkg_root, package_files)
         atexit.register(httpd.shutdown)
         port = httpd.server_address[1]
-        args.bucket_prefix = f"http://host.docker.internal:{port}"
+        args.bucket_prefix = f"http://{docker_bridge_gateway()}:{port}"
         logging.info(
             "Serving %s package files at %s", len(package_files), args.bucket_prefix
         )
