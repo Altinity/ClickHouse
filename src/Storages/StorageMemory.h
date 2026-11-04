@@ -46,6 +46,14 @@ public:
     {
         std::shared_ptr<const Blocks> blocks;
         size_t rows_approx = 0;
+
+        std::unique_ptr<StorageSnapshot::Data> clone() const override
+        {
+            auto copy = std::make_unique<SnapshotData>();
+            copy->blocks = blocks;
+            copy->rows_approx = rows_approx;
+            return copy;
+        }
     };
 
     StorageSnapshotPtr getStorageSnapshot(const StorageMetadataPtr & metadata_snapshot, ContextPtr query_context) const override;

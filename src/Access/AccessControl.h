@@ -276,6 +276,9 @@ public:
     void setTokenAuthEnabled(bool enable);
     bool isTokenAuthEnabled() const;
 
+    void setTokenForwardingEnabled(bool enable);
+    bool isTokenForwardingEnabled() const;
+
 private:
     class ContextAccessCache;
     class CustomSettingsPrefixes;
@@ -313,6 +316,7 @@ private:
     std::atomic_bool enable_read_write_grants = false;
     std::atomic_bool allow_impersonate_user = false;
     std::atomic_bool enable_token_auth = true;
+    std::atomic_bool enable_token_forwarding = false;
 };
 
 }

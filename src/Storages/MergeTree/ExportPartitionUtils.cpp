@@ -43,6 +43,7 @@
 #include <Storages/ColumnsDescription.h>
 
 #if USE_AVRO
+#include <Storages/ObjectStorage/DataLakes/Iceberg/ChunkPartitioner.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFilesPruning.h>
@@ -941,6 +942,8 @@ namespace
         const UInt32 spec_size = spec_fields ? static_cast<UInt32>(spec_fields->size()) : 0;
         if (spec_size == 0)
             return;
+
+        ChunkPartitioner::checkPartitionSpecSupportedForWrites(spec_fields);
 
         /// Rebuild the destination spec as a ClickHouse partition key, the way the Iceberg read path does in
         /// ManifestFileIterator, so the same compatibility rule applies as for a plain object storage

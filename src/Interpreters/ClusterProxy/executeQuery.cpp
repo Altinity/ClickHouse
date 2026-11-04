@@ -1,5 +1,6 @@
 #include <Analyzer/QueryNode.h>
 #include <Analyzer/UnionNode.h>
+#include <Analyzer/Utils.h>
 #include <Columns/ColumnConst.h>
 #include <Common/ProfileEvents.h>
 #include <Core/QueryProcessingStage.h>
@@ -1169,6 +1170,8 @@ std::optional<QueryPipeline> executeInsertSelectWithParallelReplicas(
     {
         InterpreterSelectQueryAnalyzer analyzer(query_ast.select, new_context, {});
         const auto & query_tree = analyzer.getQueryTree();
+        /// This parallel `INSERT SELECT` path renders directly, bypassing `queryNodeToDistributedSelectQuery`.
+        assertNoPendingAliasMarkersForDistributedSerialization(query_tree);
         auto select_ast = query_tree->toAST();
 
         auto new_query_ast = query_ast.clone();

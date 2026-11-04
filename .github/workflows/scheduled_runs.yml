@@ -68,17 +68,33 @@ jobs:
             --jq '.[0].sha')
           echo "Tip of ${BRANCH}: ${tip}"
 
+          unfinished=0
+          unfinished_ids=""
+          for status in in_progress queued waiting requested pending; do
+            payload=$(gh api -X GET \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -f branch="$BRANCH" \
+              -f status="$status" \
+              -F per_page=5 \
+              "/repos/Altinity/ClickHouse/actions/workflows/${WORKFLOW}/runs")
+            count=$(jq '.total_count // 0' <<<"$payload")
+            ids=$(jq -r '[.workflow_runs // [] | .[].id | tostring] | join(" ")' <<<"$payload")
+            echo "Unfinished ${WORKFLOW} on ${BRANCH} (${status}): ${count}"
+            unfinished=$((unfinished + count))
+            if [ -n "$ids" ]; then
+              unfinished_ids="${unfinished_ids} ${ids}"
+            fi
+          done
+
           runs=$(gh api -X GET \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             -f branch="$BRANCH" \
+            -f status=completed \
             -F per_page=10 \
             "/repos/Altinity/ClickHouse/actions/workflows/${WORKFLOW}/runs")
 
-          active=$(jq '
-            [.workflow_runs[]
-              | select(.status == "queued" or .status == "in_progress" or .status == "waiting" or .status == "requested" or .status == "pending")]
-            | length' <<<"$runs")
           latest_sha=$(jq -r '.workflow_runs[0].head_sha // empty' <<<"$runs")
           latest_id=$(jq -r '.workflow_runs[0].id // empty' <<<"$runs")
           latest_status=$(jq -r '.workflow_runs[0].status // empty' <<<"$runs")
@@ -86,8 +102,8 @@ jobs:
 
           dispatch=false
           previous_run_id=""
-          if [ "$active" -gt 0 ]; then
-            echo "${WORKFLOW} already has an unfinished run on ${BRANCH}"
+          if [ "$unfinished" -gt 0 ]; then
+            echo "${WORKFLOW} already has an unfinished run on ${BRANCH}:${unfinished_ids}"
           elif [ -z "$latest_sha" ]; then
             echo "No previous ${WORKFLOW} run on ${BRANCH}"
             dispatch=true

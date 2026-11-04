@@ -2129,20 +2129,20 @@ Possible values:
 - `allow` — Allows the use of these types of subqueries.
 )", IMPORTANT) \
     DECLARE(ObjectStorageClusterJoinMode, object_storage_cluster_join_mode, ObjectStorageClusterJoinMode::ALLOW, R"(
-Changes the behaviour of object storage cluster function or table.
-
-ClickHouse applies this setting when the query contains the product of object storage cluster function or table, i.e. when the query for a object storage cluster function or table contains a non-GLOBAL subquery for the object storage cluster function or table.
+Where a [JOIN](../../sql-reference/statements/select/join.md#distributed-join) runs when its left table is a cluster table function (`s3Cluster`, `icebergCluster`, and the other `*Cluster` functions) or a table engine with [`object_storage_cluster`](#object_storage_cluster) set.
 
 Restrictions:
 
-- Only applied for JOIN subqueries.
-- Only if the FROM section uses a object storage cluster function or table.
+- Only applied for `JOIN` and for `IN`/`WHERE` subqueries that reference other tables.
+- Only if the FROM section uses an object storage cluster function or table.
 
 Possible values:
 
-- `local` — Replaces the database and table in the subquery with local ones for the destination server (shard), leaving the normal `IN`/`JOIN.`
-- `global` — Replaces the `IN`/`JOIN` query with `GLOBAL IN`/`GLOBAL JOIN.` Right table executes first and is added to the secondary query as temporay table.
-- `allow` — Default value. Allows the use of these types of subqueries.
+- `global` — Replaces the `IN`/`JOIN` query with `GLOBAL IN`/`GLOBAL JOIN`. Right table executes first and is added to the secondary query as a temporary table.
+- `allow` — Default value. Reads the left object-storage table on cluster nodes and executes `JOIN` / local `IN` on the initiator, so the right table does not need to exist on remote nodes.
+- `local` — Deprecated legacy alias of `allow`.
+
+See [Distributed JOIN](../../sql-reference/statements/select/join.md#object-storage-cluster-join-mode).
 )", 0) \
     \
     DECLARE(UInt64, max_concurrent_queries_for_all_users, 0, R"(
@@ -8390,6 +8390,16 @@ Allow to explicitly use 'OPTIMIZE' for iceberg tables.
     DECLARE(UInt64, iceberg_manifest_min_count_to_compact, 30, R"(
 Minimum number of manifest files required to trigger manifest-only compaction via OPTIMIZE TABLE ... MANIFEST.
 If the current number of manifest files is less than or equal to this threshold, compaction is skipped.
+Requires allow_experimental_iceberg_compaction to be enabled.
+)", EXPERIMENTAL) \
+    DECLARE(UInt64, iceberg_target_data_file_size_bytes, 536870912, R"(
+Target data file size in bytes for Iceberg bin-packing compaction via OPTIMIZE TABLE.
+Small files are merged until the result approaches this size.  Default is 512 MiB.
+Requires allow_experimental_iceberg_compaction to be enabled.
+)", EXPERIMENTAL) \
+    DECLARE(UInt64, iceberg_min_data_file_size_bytes, 402653184, R"(
+Data files smaller than this threshold are candidates for bin-packing compaction via OPTIMIZE TABLE.
+Default is 384 MiB (75% of iceberg_target_data_file_size_bytes).
 Requires allow_experimental_iceberg_compaction to be enabled.
 )", EXPERIMENTAL) \
     DECLARE(Bool, allow_iceberg_remove_orphan_files, false, R"(

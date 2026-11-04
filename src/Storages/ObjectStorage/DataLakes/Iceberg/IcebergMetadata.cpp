@@ -68,6 +68,8 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Storages/ColumnsDescription.h>
 #include <Storages/ObjectStorage/DataLakes/Common/AvroForIcebergDeserializer.h>
+#include <Interpreters/ProcessList.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/BinPackRewrite.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Compaction.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ExpireSnapshotsExecute.h>
@@ -126,6 +128,8 @@ extern const int SUPPORT_IS_DISABLED;
 extern const int METADATA_MISMATCH;
 extern const int UNFINISHED;
 extern const int INCORRECT_DATA;
+extern const int LIMIT_EXCEEDED;
+extern const int QUERY_WAS_CANCELLED;
 }
 
 namespace Setting
@@ -377,7 +381,9 @@ Int32 IcebergMetadata::parseTableSchema(
 {
     const auto format_version = metadata_object->getValue<Int32>(f_format_version);
 
-    if (format_version == 2)
+    /// v2 and v3 (and later) store schemas in the `schemas` array. Only v1 has a top-level `schema`.
+    /// Using the v1 parser first for v3 looks like a spec violation and logs a false warning.
+    if (format_version >= 2)
     {
         auto [schema, current_schema_id] = parseTableSchemaV2Method(metadata_object);
         schema_processor.addIcebergTableSchema(schema, context_);
@@ -513,31 +519,86 @@ IcebergMetadata::getIcebergDataSnapshot(Poco::JSON::Object::Ptr metadata_object,
 }
 
 bool IcebergMetadata::optimize(
-    const StorageMetadataPtr & metadata_snapshot, ContextPtr context, const std::optional<FormatSettings> & format_settings)
+    const StorageMetadataPtr & metadata_snapshot,
+    ContextPtr context,
+    const std::optional<FormatSettings> & format_settings,
+    std::shared_ptr<DataLake::ICatalog> catalog,
+    const StorageID & storage_id)
 {
     checkTableRootIsQueriedPath("OPTIMIZE");
 
-    if (context->getSettingsRef()[Setting::allow_experimental_iceberg_compaction])
+    if (!context->getSettingsRef()[Setting::allow_experimental_iceberg_compaction])
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS, "Enable 'allow_experimental_iceberg_compaction' setting to call optimize for iceberg tables.");
+
+    /// Format version 3 requires row lineage to be carried into rewritten files, which neither
+    /// compaction path does yet. The cached version may be stale, so both paths check the latest
+    /// metadata again; this only rejects early.
+    if (persistent_components.format_version != 2)
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "OPTIMIZE TABLE is supported only for Iceberg format_version 2, got {}",
+            persistent_components.format_version);
+
+    auto invalidate_metadata_cache = [&]()
     {
-        const auto sample_block = std::make_shared<const Block>(metadata_snapshot->getSampleBlock());
-        auto snapshots_info = getHistory(context);
+        if (persistent_components.metadata_cache)
+        {
+            persistent_components.metadata_cache->remove(persistent_components.table_path);
+            if (persistent_components.table_uuid)
+                persistent_components.metadata_cache->remove(*persistent_components.table_uuid);
+        }
+    };
+
+    /// Bin-packing never rewrites a file a position delete applies to, so it cannot remove them.
+    if (Iceberg::hasLivePositionDeletes(
+            persistent_components, object_storage, *secondary_storages, data_lake_settings, context, catalog, storage_id))
+    {
+        LOG_INFO(log, "Table has live position delete files, applying them with a full compaction");
         compactIcebergTable(
-            snapshots_info,
+            getHistory(context),
             persistent_components,
             object_storage,
             secondary_storages,
             data_lake_settings,
             format_settings,
-            sample_block,
+            std::make_shared<const Block>(metadata_snapshot->getSampleBlock()),
             context,
             write_format);
+        invalidate_metadata_cache();
         return true;
     }
-    else
+
+    /// Each attempt rewrites data files, so a conflict is retried only a few times.
+    static constexpr size_t MAX_BIN_PACK_RETRIES = 5;
+
+    for (size_t attempt = 0; attempt < MAX_BIN_PACK_RETRIES; ++attempt)
     {
-        throw Exception(
-            ErrorCodes::BAD_ARGUMENTS, "Enable 'allow_experimental_iceberg_compaction' setting to call optimize for iceberg tables.");
+        if (auto elem = context->getProcessListElement(); elem && elem->isKilled())
+            throw Exception(ErrorCodes::QUERY_WAS_CANCELLED, "OPTIMIZE TABLE cancelled during bin-pack retry loop");
+
+        if (attempt > 0)
+            LOG_INFO(log, "Retrying bin-pack compaction (attempt {}/{})", attempt + 1, MAX_BIN_PACK_RETRIES);
+
+        const auto result = Iceberg::executeBinPackCompaction(
+            persistent_components,
+            object_storage,
+            *secondary_storages,
+            data_lake_settings,
+            context,
+            write_format,
+            catalog,
+            storage_id);
+
+        if (result == Iceberg::BinPackCommitResult::Committed)
+        {
+            invalidate_metadata_cache();
+            return true;
+        }
     }
+
+    throw Exception(ErrorCodes::LIMIT_EXCEEDED,
+        "Bin-pack compaction did not commit after {} attempts because of concurrent modifications", MAX_BIN_PACK_RETRIES);
 }
 
 bool IcebergMetadata::optimizeManifestFiles(
@@ -805,7 +866,7 @@ void IcebergMetadata::truncate(ContextPtr context, std::shared_ptr<DataLake::ICa
         String catalog_filename = resolver.resolveForCatalog(metadata_info.path);
 
         const auto & [namespace_name, table_name] = DataLake::parseTableName(storage_id.getTableName());
-        if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot))
+        if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot, context->getForwardedAuthToken()))
             throw Exception(ErrorCodes::INCORRECT_DATA,
                 "Failed to commit Iceberg truncate update to catalog.");
     }
@@ -1057,7 +1118,7 @@ void IcebergMetadata::createInitial(
         /// validation, so a rejected CREATE leaves no trace in the catalog): a catalog
         /// that shares its storage view with the data (e.g. SeaweedFS) refuses to create
         /// a namespace over the plain directory those files would leave behind.
-        catalog->createNamespaceIfNotExists(namespace_name, namespace_location);
+        catalog->createNamespaceIfNotExists(namespace_name, namespace_location, local_context->getForwardedAuthToken());
     }
 
     if (!catalog_writes_metadata_file)
@@ -1113,7 +1174,9 @@ void IcebergMetadata::createInitial(
 
         /// Always ask for a conflict to be reported as `false`, so the files staged above are removed
         /// before `TABLE_ALREADY_EXISTS` is thrown, with or without `IF NOT EXISTS`.
-        if (!catalog->createTable(namespace_name, table_name, catalog_filename, metadata_content_object, compression_method, /* if_not_exists */ true))
+        if (!catalog->createTable(
+                namespace_name, table_name, catalog_filename, metadata_content_object, compression_method, /* if_not_exists */ true,
+                local_context->getForwardedAuthToken()))
         {
             if (!catalog_writes_metadata_file)
             {
@@ -1846,8 +1909,14 @@ KeyDescription IcebergMetadata::getSortingKey(ContextPtr local_context, TableSta
 
     auto [schema, current_schema_id] = parseTableSchemaV2Method(metadata_object);
     auto result = getSortingKeyDescriptionFromMetadata(metadata_object, *persistent_components.schema_processor->getClickhouseTableSchemaById(current_schema_id), local_context);
-    auto sort_order_id = metadata_object->getValue<Int64>(f_default_sort_order_id);
-    result.sort_order_id = sort_order_id;
+    /// Only attach the sort-order id when the parsed key is non-empty.  When multi-arg or
+    /// unsupported transforms truncate the key to empty, pairing a stale sort_order_id with
+    /// an empty key would let `isDataSortedBySortingKey` incorrectly claim data is sorted.
+    if (result.definition_ast != nullptr)
+    {
+        auto sort_order_id = metadata_object->getValue<Int64>(f_default_sort_order_id);
+        result.sort_order_id = sort_order_id;
+    }
     return result;
 }
 
@@ -2161,7 +2230,13 @@ std::optional<IStorage::ExportPartitionCommitInfo> IcebergMetadata::commitImport
             try
             {
                 generateManifestList(
-                    resolver, metadata, object_storage, *secondary_storages, context, {manifest_entry_path}, new_snapshot, {manifest_lengths}, *buffer_manifest_list, Iceberg::FileContentType::DATA, true);
+                    resolver, metadata, object_storage, *secondary_storages, context, {manifest_entry_path}, new_snapshot, {manifest_lengths}, *buffer_manifest_list, Iceberg::FileContentType::DATA, true,
+                    /* per_entry_content_types */ {},
+                    /* entry_counts */ {},
+                    /* carry_forward_manifest_paths */ {},
+                    /* entry_partition_spec_ids */ {},
+                    /* entry_partition_summaries */ {},
+                    /* entry_row_counts */ {total_rows});
                 buffer_manifest_list->finalize();
             }
             catch (...)
@@ -2201,7 +2276,7 @@ std::optional<IStorage::ExportPartitionCommitInfo> IcebergMetadata::commitImport
                     catalog_filename = blob_storage_type_name + "://" + blob_storage_namespace_name + "/" + catalog_filename;
 
                 const auto & [namespace_name, table_name] = DataLake::parseTableName(table_id.getTableName());
-                if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot))
+                if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot, context->getForwardedAuthToken()))
                 {
                     cleanup(true);
                     return {};

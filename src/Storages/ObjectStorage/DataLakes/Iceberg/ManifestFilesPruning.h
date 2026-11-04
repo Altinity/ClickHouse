@@ -3,6 +3,7 @@
 
 #include <optional>
 #include <unordered_map>
+#include <vector>
 
 #include <Core/NamesAndTypes.h>
 #include <Parsers/IAST_fwd.h>
@@ -43,6 +44,8 @@ private:
     Int32 current_schema_id;
     Int32 initial_schema_id;
     const DB::KeyDescription * partition_key;
+    /// Which positions in the Avro partition tuple correspond to the kept partition-key columns.
+    std::vector<size_t> partition_key_spec_positions;
     std::optional<DB::KeyCondition> partition_key_condition;
 
     std::unordered_map<Int32, DB::KeyCondition> min_max_key_conditions;
@@ -64,7 +67,9 @@ public:
         const ManifestFileIterator & manifest_file,
         DB::ContextPtr context);
 
-    PruningReturnStatus canBePruned(const ProcessedManifestFileEntryPtr & entry, const std::unordered_map<Int32, DB::Range> & entry_hyperrectangles) const;
+    PruningReturnStatus canBePruned(
+        const ProcessedManifestFileEntryPtr & entry,
+        const std::unordered_map<Int32, std::vector<DB::Range>> & entry_hyperrectangles) const;
 };
 
 }

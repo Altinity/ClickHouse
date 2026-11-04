@@ -181,7 +181,12 @@ public:
 
     std::string getTableLocation() const override { return persistent_components.table_location; }
 
-    bool optimize(const StorageMetadataPtr & metadata_snapshot, ContextPtr context, const std::optional<FormatSettings> & format_settings) override;
+    bool optimize(
+        const StorageMetadataPtr & metadata_snapshot,
+        ContextPtr context,
+        const std::optional<FormatSettings> & format_settings,
+        std::shared_ptr<DataLake::ICatalog> catalog,
+        const StorageID & storage_id) override;
     bool optimizeManifestFiles(
         const StorageMetadataPtr & metadata_snapshot,
         ContextPtr context,

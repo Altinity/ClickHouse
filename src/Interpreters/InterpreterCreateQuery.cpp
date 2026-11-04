@@ -1906,7 +1906,7 @@ BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
                 "views, dictionaries, ATTACH, CLONE AS, and REPLACE TABLE are not allowed");
 
         if (engine_user_specified)
-            database->validateCreateTableEngine(*create.storage);
+            database->validateCreateTableEngine(*create.storage, getContext());
 
         if (datalake_unsupported_storage_clause && !ignore_unsupported_properties)
         {

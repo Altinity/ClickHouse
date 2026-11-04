@@ -929,7 +929,7 @@ The server successfully detected this situation and will download merged part fr
     M(CASGCRefWalkPlansBuilt, "Number of complete catalog-authoritative CAS ref walk plans constructed by ordinary GC and rebuild. A regular or rebuilding invocation that reaches the post-LIST catalog cut increments this exactly once, including a round that later defers.", ValueType::Number) \
     M(CASGCUnmatchedAdoptedParentLives, "Number of adopted-parent CAS ref-life rows dropped because the post-LIST catalog cut has no matching physical life. Each occurrence is inert for planning and suppression and is logged with its exact physical life id; a persistent nonzero rate indicates old generation state is outliving catalog removal.", ValueType::Number) \
     M(CASGCStuckRemovals, "Number of adopted CAS GC rounds that observed a Removing namespace at or beyond the diagnostic age threshold without terminal cleanup evidence. Incremented and warned every such round; diagnostic only, with no effect on folding, suppression, appends, or deletion.", ValueType::Number) \
-    M(CASGCNamespaceCleanupLeaks, "Number of dead-life namespace objects whose reclamation the perpetual janitor could not confirm because HEAD or exact-delete failed. Each occurrence is logged with the exact key and remains leak-only: it neither suppresses destructive GC nor blocks catalog lifecycle progress.", ValueType::Number) \
+    M(CASGCNamespaceCleanupLeaks, "Number of dead-life namespace objects whose reclamation the perpetual janitor could not confirm because HEAD, exact-delete or a batch delete failed. Each occurrence is logged with the key, or the first key of the batch, and remains leak-only: it neither suppresses destructive GC nor blocks catalog lifecycle progress.", ValueType::Number) \
     M(CASDetachedWorkDrainTimeouts, "Counts CAS storage teardowns whose bounded wait for detached background work expired with work still in flight. The teardown proceeds, but for that teardown it could not be established that no tracked task still holds the pool. Expected to stay at zero.", ValueType::Number) \
     M(CASEventDroppedContextExpired, "Number of CAS system-log events dropped because the storage's `Context` reference expired before delivery. A non-zero value indicates event production outlived the owning server context.", ValueType::Number) \
     M(CASGCUnappliedFoldedTransactions, "Number of ref transactions a GC round folded and merged but whose blob deltas never reached a shard reducer. Always 0 on a healthy round; a nonzero value fails the round closed, because the round would otherwise advance its fold cursor past a transaction it never applied.", ValueType::Number) \
@@ -1738,6 +1738,10 @@ The server successfully detected this situation and will download merged part fr
     M(ObjectStorageListObjectsCachePrefixMatchHits, "Number of times object storage list objects operation hit the cache using prefix matching.", ValueType::Number) \
     M(DataLakeRestCatalogCredentialsVended, "Number of table metadata requests to REST catalog asking to vend storage credentials.", ValueType::Number) \
     M(DataLakeRestCatalogCredentialsCacheHits, "Number of table metadata requests to REST catalog reusing cached storage credentials.", ValueType::Number) \
+    M(DataLakeRestCatalogTokenExchange, "Number of RFC 8693 token exchanges performed to obtain a session token for the querying user.", ValueType::Number) \
+    M(DataLakeRestCatalogTokenExchangeMicroseconds, "Total time of RFC 8693 token exchanges.", ValueType::Microseconds) \
+    M(DataLakeRestCatalogTokenExchangeFailures, "Number of RFC 8693 token exchanges that failed.", ValueType::Number) \
+    M(DataLakeRestCatalogUserTokenCacheHits, "Number of times a previously exchanged per-user session token was reused.", ValueType::Number) \
     \
     M(DataLakeRestCatalogLoadConfig, "Number of 'load config' requests to Iceberg REST catalog.", ValueType::Number) \
     M(DataLakeRestCatalogLoadConfigMicroseconds, "Total time of 'load config' requests to Iceberg REST catalog.", ValueType::Microseconds) \
@@ -1776,6 +1780,10 @@ The server successfully detected this situation and will download merged part fr
     M(DataLakeGlueCatalogUpdateTableMicroseconds, "Total time of 'update table' requests to Iceberg Glue catalog.", ValueType::Microseconds) \
     M(DataLakeGlueCatalogDropTable, "Number of 'drop table' requests to Iceberg Glue catalog.", ValueType::Number) \
     M(DataLakeGlueCatalogDropTableMicroseconds, "Total time of 'drop table' requests to Iceberg Glue catalog.", ValueType::Microseconds) \
+    M(DataLakeGlueCatalogAssumeRoleWithWebIdentity, "Number of AWS STS `AssumeRoleWithWebIdentity` calls made to turn a forwarded user token into credentials for the Glue catalog.", ValueType::Number) \
+    M(DataLakeGlueCatalogAssumeRoleWithWebIdentityMicroseconds, "Total time of AWS STS `AssumeRoleWithWebIdentity` calls made for forwarded user tokens.", ValueType::Microseconds) \
+    M(DataLakeGlueCatalogAssumeRoleWithWebIdentityFailures, "Number of AWS STS `AssumeRoleWithWebIdentity` calls that returned no credentials.", ValueType::Number) \
+    M(DataLakeGlueCatalogUserClientCacheHits, "Number of times a Glue client built for a forwarded user token was reused.", ValueType::Number) \
     \
     M(DataLakeUnityCatalogGetTables, "Number of 'get tables' requests to Iceberg Unity catalog.", ValueType::Number) \
     M(DataLakeUnityCatalogGetTablesMicroseconds, "Total time of 'get tables' requests to Iceberg Unity catalog.", ValueType::Microseconds) \

@@ -328,7 +328,13 @@ public:
         return nullptr;
     }
 
-    virtual bool optimize(ObjectStoragePtr /*object_storage*/, const StorageMetadataPtr & /*metadata_snapshot*/, ContextPtr /*context*/, const std::optional<FormatSettings> & /*format_settings*/)
+    virtual bool optimize(
+        ObjectStoragePtr /*object_storage*/,
+        const StorageMetadataPtr & /*metadata_snapshot*/,
+        ContextPtr /*context*/,
+        const std::optional<FormatSettings> & /*format_settings*/,
+        std::shared_ptr<DataLake::ICatalog> /*catalog*/,
+        const StorageID & /*storage_id*/)
     {
         return false;
     }

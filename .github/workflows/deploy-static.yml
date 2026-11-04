@@ -7,14 +7,11 @@ on:
         description: 'The environment to deploy to. "staging" or "production"'
         required: true
         default: 'staging'
-      keep_current_bucket:
+      push_to_active:
         description: >-
-          Deploy onto whichever Blue/Green bucket is currently live, instead of
-          the normal release toggle. This workflow never touches packages, so
-          the other bucket is likely several releases stale - toggling to it
-          would make those stale packages live again. Leave this true unless
-          you specifically want to stage static changes on the inactive side
-          first.
+          If true, deploy static assets onto the currently live Blue/Green
+          prefix and do not rotate CloudFront. If false, deploy static assets
+          onto the inactive prefix and rotate CloudFront to it.
         required: true
         type: boolean
         default: true
@@ -24,7 +21,10 @@ env:
 
 jobs:
   deploy-static:
-    runs-on: [altinity-style-checker-aarch64, altinity-on-demand]
+    runs-on: ${{
+      inputs.release_environment == 'staging' && 'arc-runners-clickhouse-signer' ||
+      inputs.release_environment == 'production' && 'arc-runners-clickhouse-signer-prod'
+     }}
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -55,15 +55,15 @@ jobs:
 
       - name: Run static deploy playbook
         run: |
-          echo "Deploying static site assets (installer.sh, landing page, CloudFront routing) to ${{ inputs.release_environment }}..."
-          echo "Keep current bucket (skip Blue/Green toggle): ${{ inputs.keep_current_bucket }}"
-          if ! ansible-playbook -i release/packaging/ansible/inventory/localhost.yml \
+          echo "Deploying static site assets to ${{ inputs.release_environment }}..."
+          echo "push_to_active=${{ inputs.push_to_active }} (true=stay on live prefix, false=rotate Blue/Green)"
+          if ! ansible-playbook -i tests/ci/release/packaging/ansible/inventory/localhost.yml \
             -e aws_region="$AWS_REGION" \
             -e repo_dns_name="$REPO_DNS_NAME" \
             -e repo_name="$REPO_NAME" \
             -e repo_subtitle="$REPO_SUBTITLE" \
-            -e push_to_active=${{ inputs.keep_current_bucket }} \
-            release/packaging/ansible/deploy-static.yml; then
+            -e push_to_active=${{ inputs.push_to_active }} \
+            tests/ci/release/packaging/ansible/deploy-static.yml; then
             echo "Ansible playbook failed"
             exit 1
           fi

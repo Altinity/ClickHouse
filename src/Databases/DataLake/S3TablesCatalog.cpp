@@ -115,7 +115,8 @@ S3TablesCatalog::S3TablesCatalog(
         /* urlEscapePath = */ false);
 
     CatalogState initial_state;
-    initial_state.config = loadConfig(initial_state);
+    initial_state.config = loadConfig(initial_state, /* generation */ 0, /* auth_token */ {});
+    initial_state.config_loaded = true;
 
     if (initial_state.config.prefix.empty())
     {
@@ -129,9 +130,9 @@ S3TablesCatalog::S3TablesCatalog(
 
 /// S3 Tables only supports a single level of namespaces (no nesting),
 /// so we use flat listChildNamespaces() instead of the base class's getNamespacesRecursive().
-DB::Names S3TablesCatalog::getTables() const
+DB::Names S3TablesCatalog::getTables(const DB::ForwardedAuthTokenPtr & auth_token) const
 {
-    auto namespaces = listChildNamespaces("");
+    auto namespaces = listChildNamespaces("", auth_token);
 
     auto & pool = getContext()->getIcebergCatalogThreadpool();
     DB::ThreadPoolCallbackRunnerLocal<void> runner(pool, DB::ThreadName::DATALAKE_REST_CATALOG);
@@ -143,7 +144,7 @@ DB::Names S3TablesCatalog::getTables() const
         runner.enqueueAndKeepTrack(
             [&, ns]
             {
-                auto tables_in_ns = RestCatalog::listTablesInNamespace(ns);
+                auto tables_in_ns = RestCatalog::listTablesInNamespace(ns, auth_token);
                 std::lock_guard lock(mutex);
                 std::move(tables_in_ns.begin(), tables_in_ns.end(), std::back_inserter(tables));
             });
@@ -198,9 +199,10 @@ bool S3TablesCatalog::tryGetTableMetadata(
     return true;
 }
 
-ICatalog::CredentialsRefreshCallback S3TablesCatalog::getCredentialsConfigurationCallback(const DB::StorageID & storage_id)
+ICatalog::CredentialsRefreshCallback S3TablesCatalog::getCredentialsConfigurationCallback(
+    const DB::StorageID & storage_id, const DB::ForwardedAuthTokenPtr & auth_token)
 {
-    auto base_cb = RestCatalog::getCredentialsConfigurationCallback(storage_id);
+    auto base_cb = RestCatalog::getCredentialsConfigurationCallback(storage_id, auth_token);
     return [this, base_callback = std::move(base_cb)] () -> std::shared_ptr<IStorageCredentials>
     {
         if (base_callback)
@@ -218,12 +220,17 @@ ICatalog::CredentialsRefreshCallback S3TablesCatalog::getCredentialsConfiguratio
     };
 }
 
-void S3TablesCatalog::dropTable(const String & namespace_name, const String & table_name, bool delete_data, bool if_exists) const
+void S3TablesCatalog::dropTable(
+    const String & namespace_name,
+    const String & table_name,
+    bool delete_data,
+    bool if_exists,
+    const DB::ForwardedAuthTokenPtr & auth_token) const
 {
     /// https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-delete.html
     if (!delete_data)
     {
-        if (if_exists && !existsTable(namespace_name, table_name))
+        if (if_exists && !existsTable(namespace_name, table_name, auth_token))
             return;
 
         throw DB::Exception(
@@ -233,7 +240,7 @@ void S3TablesCatalog::dropTable(const String & namespace_name, const String & ta
             namespace_name, table_name);
     }
 
-    const auto state_snapshot = state.get();
+    const auto state_snapshot = getStateSnapshot();
     const std::string endpoint
         = (base_url / state_snapshot->config.prefix / "namespaces" / namespace_name / "tables" / table_name).string()
         + "?purgeRequested=True";
@@ -243,7 +250,8 @@ void S3TablesCatalog::dropTable(const String & namespace_name, const String & ta
     {
         ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogDropTable);
         auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogDropTableMicroseconds);
-        sendRequest(*state_snapshot, endpoint, request_body, Poco::Net::HTTPRequest::HTTP_DELETE, true);
+        sendRequest(
+            *state_snapshot, state_snapshot.generation, endpoint, request_body, auth_token, Poco::Net::HTTPRequest::HTTP_DELETE, true);
     }
     catch (const DB::HTTPException & ex)
     {
@@ -257,17 +265,12 @@ void S3TablesCatalog::dropTable(const String & namespace_name, const String & ta
     }
 }
 
-DB::HTTPHeaderEntries S3TablesCatalog::getAuthHeaders(
-    const CatalogState & /*catalog_state*/,
-    bool /*update_token*/,
-    const String & method,
-    const Poco::URI & url,
-    const DB::HTTPHeaderEntries & extra_headers,
-    const String & body,
-    bool * /*used_cached_oauth_token*/) const
+DB::HTTPHeaderEntries S3TablesCatalog::getAuthHeaders(const AuthContext & auth_context) const
 {
     DB::HTTPHeaderEntries all_signed;
-    signRequestWithAWSV4(method, url, extra_headers, body, *signer, region, "s3tables", all_signed);
+    signRequestWithAWSV4(
+        auth_context.method, auth_context.url, auth_context.extra_headers, auth_context.body,
+        *signer, region, "s3tables", all_signed);
 
     DB::HTTPHeaderEntries auth_headers;
     for (auto & h : all_signed)

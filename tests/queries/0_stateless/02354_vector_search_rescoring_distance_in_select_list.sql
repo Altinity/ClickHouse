@@ -60,52 +60,68 @@ INSERT INTO tab_bf16 VALUES (0, [1.0, 0.0]),
                         (9, [0.0, 2.4]);
 
 -- The nearest neighbours to [0.0, 0.2] are 5,6,7,8
+--
+-- Round the distances: the bf16 index quantization differs between builds
+-- (2.2 is stored as 2.203125 with SimSIMD, 2.1875 without it). The inner
+-- query keeps the distance function in the SELECT list, as in ClickHouse#85514.
 
 SELECT 'Column: Array(Float32)';
 
 SELECT '-- Search vector: Array(Float64)';
-WITH CAST([0.0, 2.0] AS Array(Float64)) AS reference_vec
-SELECT id, L2Distance(vec, reference_vec)
-FROM tab_f32
-ORDER BY L2Distance(vec, reference_vec)
-LIMIT 4;
+SELECT id, round(d, 1) FROM (
+    WITH CAST([0.0, 2.0] AS Array(Float64)) AS reference_vec
+    SELECT id, L2Distance(vec, reference_vec) AS d
+    FROM tab_f32
+    ORDER BY L2Distance(vec, reference_vec)
+    LIMIT 4
+) ORDER BY id;
 
 SELECT '-- Search vector: Array(Float32)';
-WITH CAST([0.0, 2.0] AS Array(BFloat16)) AS reference_vec
-SELECT id, L2Distance(vec, reference_vec)
-FROM tab_f32
-ORDER BY L2Distance(vec, reference_vec)
-LIMIT 4;
+SELECT id, round(d, 1) FROM (
+    WITH CAST([0.0, 2.0] AS Array(BFloat16)) AS reference_vec
+    SELECT id, L2Distance(vec, reference_vec) AS d
+    FROM tab_f32
+    ORDER BY L2Distance(vec, reference_vec)
+    LIMIT 4
+) ORDER BY id;
 
 SELECT '-- Search vector: Array(BFloat16)';
-WITH CAST([0.0, 2.0] AS Array(BFloat16)) AS reference_vec
-SELECT id, L2Distance(vec, reference_vec)
-FROM tab_f32
-ORDER BY L2Distance(vec, reference_vec)
-LIMIT 4;
+SELECT id, round(d, 1) FROM (
+    WITH CAST([0.0, 2.0] AS Array(BFloat16)) AS reference_vec
+    SELECT id, L2Distance(vec, reference_vec) AS d
+    FROM tab_f32
+    ORDER BY L2Distance(vec, reference_vec)
+    LIMIT 4
+) ORDER BY id;
 
 SELECT 'Column: Array(BFloat16)';
 
 SELECT '-- Search vector: Array(Float64)';
-WITH [0.0, 2.0] AS reference_vec
-SELECT id, L2Distance(vec, reference_vec)
-FROM tab_bf16
-ORDER BY L2Distance(vec, reference_vec)
-LIMIT 4;
+SELECT id, round(d, 1) FROM (
+    WITH [0.0, 2.0] AS reference_vec
+    SELECT id, L2Distance(vec, reference_vec) AS d
+    FROM tab_bf16
+    ORDER BY L2Distance(vec, reference_vec)
+    LIMIT 4
+) ORDER BY id;
 
 SELECT '-- Search vector: Array(Float32)';
-WITH CAST([0.0, 2.0] AS Array(BFloat16)) AS reference_vec
-SELECT id, L2Distance(vec, reference_vec)
-FROM tab_bf16
-ORDER BY L2Distance(vec, reference_vec)
-LIMIT 4;
+SELECT id, round(d, 1) FROM (
+    WITH CAST([0.0, 2.0] AS Array(BFloat16)) AS reference_vec
+    SELECT id, L2Distance(vec, reference_vec) AS d
+    FROM tab_bf16
+    ORDER BY L2Distance(vec, reference_vec)
+    LIMIT 4
+) ORDER BY id;
 
 SELECT '-- Search vector: Array(BFloat16)';
-WITH CAST([0.0, 2.0] AS Array(Float32)) AS reference_vec
-SELECT id, L2Distance(vec, reference_vec)
-FROM tab_bf16
-ORDER BY L2Distance(vec, reference_vec)
-LIMIT 4;
+SELECT id, round(d, 1) FROM (
+    WITH CAST([0.0, 2.0] AS Array(Float32)) AS reference_vec
+    SELECT id, L2Distance(vec, reference_vec) AS d
+    FROM tab_bf16
+    ORDER BY L2Distance(vec, reference_vec)
+    LIMIT 4
+) ORDER BY id;
 
 DROP TABLE tab_f32;
 DROP TABLE tab_bf16;

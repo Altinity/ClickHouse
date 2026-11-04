@@ -38,12 +38,14 @@ REGISTER_FUNCTION(AliasMarker)
 {
     factory.registerFunction<FunctionAliasMarker>(FunctionDocumentation{
         .description = R"(
-Internal function that marks ALIAS column expressions for the analyzer. Not intended for direct use.
+Internal function. Returns its first argument unchanged. The second argument records which ALIAS column the
+expression was inlined from, so that a shard names the result the way the initiator expects. Not intended for
+direct use: an explicitly supplied string id controls the planner's action name.
 )",
-        .syntax = {"__aliasMarker(expr, alias_name)"},
+        .syntax = {"__aliasMarker(expr, alias_id)"},
         .arguments = {
             {"expr", "Expression to mark.", {"Any"}},
-            {"alias_name", "Alias name attached to the expression.", {"String"}},
+            {"alias_id", "Identity of the ALIAS column the expression came from.", {"Any"}},
         },
         .returned_value = {"Returns expr unchanged.", {"Any"}},
         .introduced_in = {25, 8},
