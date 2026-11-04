@@ -98,11 +98,25 @@ constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_PARTS_PROJECTION = 7;
 constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_METADATA_VERSION = 8;
 constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_COLUMNS_SUBSTREAMS = 9;
 constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_INVALIDATED_SYSTEM_COLUMNS = 10;
-/// CAS replication, publish-then-confirm. A relink offer is now accompanied by a
-/// source token, and the endpoint answers a second, part-less request that asks whether that token is
-/// still exactly what the sender's ref names. A server advertising this version serves the confirm
-/// action; a receiver advertising it must confirm before it promotes.
-constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_CA_CONFIRM = 11;
+/// The newest protocol version this build speaks. Fork features ride on their own request parameters
+/// (`cas_capabilities`, `cas_pool_uuid`), never on a version number upstream may assign another meaning.
+constexpr auto REPLICATION_PROTOCOL_VERSION_LATEST = REPLICATION_PROTOCOL_VERSION_WITH_INVALIDATED_SYSTEM_COLUMNS;
+
+/// CAS capabilities a receiver advertises on the fetch request, as a comma-separated list. Each token is
+/// a promise about how the receiver treats what the sender offers.
+constexpr auto CA_CAPABILITIES_PARAM = "cas_capabilities";
+/// CAS replication, publish-then-confirm: the receiver confirms a relink offer against its source token
+/// (a second, part-less request) before it promotes. A relink is offered only to a receiver that promises
+/// this; a receiver without it gets the bytes, never an unconfirmed relink.
+constexpr auto CA_CAPABILITY_RELINK_CONFIRM = "relink_confirm";
+
+bool hasCasCapability(const String & advertised, std::string_view capability)
+{
+    for (const auto token : std::views::split(advertised, ','))
+        if (std::string_view(token) == capability)
+            return true;
+    return false;
+}
 
 std::string getEndpointId(const std::string & node_id)
 {
@@ -331,7 +345,7 @@ void Service::processQuery(const HTMLForm & params, ReadBufferPtr body, WriteBuf
     MergeTreePartInfo::fromPartName(part_name, data.format_version);
 
     /// We pretend to work as older server version, to be sure that client will correctly process our version
-    response.addCookie({"server_protocol_version", toString(std::min(client_protocol_version, REPLICATION_PROTOCOL_VERSION_WITH_CA_CONFIRM))});
+    response.addCookie({"server_protocol_version", toString(std::min(client_protocol_version, REPLICATION_PROTOCOL_VERSION_LATEST))});
 
     LOG_TRACE(log, "Sending part {}", part_name);
 
@@ -402,13 +416,12 @@ void Service::processQuery(const HTMLForm & params, ReadBufferPtr body, WriteBuf
         /// Strictly gated on a matching pool_uuid: a non-CA part, a CA part on a different pool, or a
         /// receiver without the capability all fall through to the unchanged byte path below.
         ///
-        /// The gate is `..._WITH_CA_CONFIRM`: a receiver is offered a relink
-        /// only once it advertises that it will confirm the offer before promoting it. A receiver that
-        /// still advertises 10 (a build whose relink had no confirm step) gets the bytes — mixed versions
-        /// degrade to bytes, never to an unconfirmed relink. This gate and the version the client advertises
-        /// (`fetchSelectedPart`) are one change in two places; separated in either order they either
-        /// disable relink outright or hand an unconfirmed relink to a receiver that claimed it confirms.
-        if (client_protocol_version >= REPLICATION_PROTOCOL_VERSION_WITH_CA_CONFIRM
+        /// The gate is the `relink_confirm` capability: a receiver is offered a relink only once it
+        /// advertises that it will confirm the offer before promoting it. A receiver without it (an older
+        /// build, or an upstream build whatever protocol version it speaks) gets the bytes — mixed versions
+        /// degrade to bytes, never to an unconfirmed relink. This gate and the capability the client
+        /// advertises (`fetchSelectedPart`) are one change in two places.
+        if (hasCasCapability(params.get(CA_CAPABILITIES_PARAM, ""), CA_CAPABILITY_RELINK_CONFIRM)
             && part->getDataPartStorage().isContentAddressed())
         {
             /// The receiver advertises every pool its storage policy has a writable content-addressed
@@ -703,11 +716,10 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
     {
         {"endpoint",                endpoint_id},
         {"part",                    part_name},
-        /// Advertising `..._WITH_CA_CONFIRM` is a PROMISE, not a capability list: this receiver will
-        /// confirm a relink offer against its source before it promotes (`relinkPartToDisk`). It is the
-        /// pair of the sender-side offer gate on the same constant, and the two cannot be separated —
-        /// see the comment there.
-        {"client_protocol_version", toString(REPLICATION_PROTOCOL_VERSION_WITH_CA_CONFIRM)},
+        {"client_protocol_version", toString(REPLICATION_PROTOCOL_VERSION_LATEST)},
+        /// A PROMISE: this receiver confirms a relink offer against its source before it promotes
+        /// (`relinkPartToDisk`). It is the pair of the sender-side offer gate on the same token.
+        {CA_CAPABILITIES_PARAM,      CA_CAPABILITY_RELINK_CONFIRM},
         {"compress",                "false"}
     });
 
