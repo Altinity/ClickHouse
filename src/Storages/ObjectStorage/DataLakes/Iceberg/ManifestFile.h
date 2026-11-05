@@ -73,6 +73,16 @@ struct PartitionSpecsEntry
 };
 using PartitionSpecification = std::vector<PartitionSpecsEntry>;
 
+struct PartitionFieldSummary
+{
+    bool contains_null = false;
+    bool contains_nan = false;
+    std::optional<String> lower_bound;
+    std::optional<String> upper_bound;
+};
+
+using PartitionFieldSummaries = std::vector<PartitionFieldSummary>;
+
 struct ManifestFileCacheableInfo
 {
     std::shared_ptr<AvroForIcebergDeserializer> deserializer;

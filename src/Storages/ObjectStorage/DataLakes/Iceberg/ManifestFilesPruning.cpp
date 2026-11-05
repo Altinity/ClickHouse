@@ -20,8 +20,11 @@
 #include <Common/quoteString.h>
 #include <fmt/ranges.h>
 
+#include <Core/Settings.h>
+#include <Interpreters/Context.h>
 #include <Interpreters/ExpressionActions.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergFieldParseHelpers.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFile.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFileIterator.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFilesPruning.h>
@@ -33,6 +36,11 @@ namespace DB::ErrorCodes
 {
     extern const int ICEBERG_SPECIFICATION_VIOLATION;
     extern const int LOGICAL_ERROR;
+}
+
+namespace DB::Setting
+{
+    extern const SettingsTimezone iceberg_partition_timezone;
 }
 
 namespace
@@ -106,10 +114,13 @@ namespace
     constexpr const char * last_sequence_number_column = "_last_updated_sequence_number";
 }
 
-std::unique_ptr<DB::ActionsDAG> ManifestFilesPruner::transformFilterDagForManifest(
+std::unique_ptr<DB::ActionsDAG> renameFilterDagColumnsToFieldIds(
+    const IcebergSchemaProcessor & schema_processor,
+    Int32 current_schema_id,
+    Int32 target_schema_id,
     const DB::ActionsDAG * source_dag,
     std::vector<Int32> & used_columns_in_filter,
-    std::unordered_map<Int32, DB::NameAndTypePair> & row_lineage_columns_in_filter) const
+    std::unordered_map<Int32, DB::NameAndTypePair> & row_lineage_columns_in_filter)
 {
     const auto & inputs = source_dag->getInputs();
 
@@ -150,7 +161,7 @@ std::unique_ptr<DB::ActionsDAG> ManifestFilesPruner::transformFilterDagForManife
             continue;
 
         /// We take data type from manifest schema, not latest type
-        auto column_from_manifest = schema_processor.tryGetFieldCharacteristics(initial_schema_id, column_id);
+        auto column_from_manifest = schema_processor.tryGetFieldCharacteristics(target_schema_id, column_id);
         if (!column_from_manifest.has_value())
             continue;
 
@@ -163,7 +174,6 @@ std::unique_ptr<DB::ActionsDAG> ManifestFilesPruner::transformFilterDagForManife
     result->removeUnusedActions();
     return result;
 }
-
 
 ManifestFilesPruner::ManifestFilesPruner(
     const IcebergSchemaProcessor & schema_processor_,
@@ -183,7 +193,8 @@ ManifestFilesPruner::ManifestFilesPruner(
 
     std::unique_ptr<ActionsDAG> transformed_dag;
     std::vector<Int32> used_columns_in_filter;
-    transformed_dag = transformFilterDagForManifest(filter_dag, used_columns_in_filter, row_lineage_columns);
+    transformed_dag = renameFilterDagColumnsToFieldIds(
+        schema_processor, current_schema_id, initial_schema_id, filter_dag, used_columns_in_filter, row_lineage_columns);
     chassert(transformed_dag != nullptr);
 
     if (manifest_file.hasPartitionKey())
@@ -222,6 +233,100 @@ ManifestFilesPruner::ManifestFilesPruner(
         ActionsDAGWithInversionPushDown inverted_dag(transformed_dag->getOutputs().front(), context, /* boolean_context */ true);
         min_max_key_conditions.emplace(used_column_id, KeyCondition(inverted_dag, context, {name_and_type->name}, expression));
     }
+}
+
+PartitionKeyFromSpec buildPartitionKeyFromSpec(
+    const Poco::JSON::Array::Ptr & partition_specification_json,
+    Int32 schema_id,
+    const IcebergSchemaProcessor & schema_processor,
+    DB::ContextPtr context)
+{
+    PartitionKeyFromSpec result;
+    result.partition_spec_fields_count = partition_specification_json->size();
+
+    DB::NamesAndTypesList partition_columns_description;
+    std::unordered_set<String> partition_columns_seen;
+    auto partition_key_ast = make_intrusive<ASTFunction>();
+    partition_key_ast->name = "tuple";
+    partition_key_ast->arguments = make_intrusive<DB::ASTExpressionList>();
+    partition_key_ast->children.push_back(partition_key_ast->arguments);
+
+    for (size_t i = 0; i != partition_specification_json->size(); ++i)
+    {
+        auto partition_specification_field = partition_specification_json->getObject(static_cast<UInt32>(i));
+
+        /// Iceberg V3 spec: partition fields use either singular `source-id` (single-arg transforms)
+        /// or `source-ids` (multi-arg transforms, e.g. bucket over multiple columns). They are mutually exclusive.
+        bool has_source_id = partition_specification_field->has(f_source_id);
+        bool has_source_ids = partition_specification_field->has(f_source_ids);
+
+        std::vector<Int32> source_ids;
+        if (has_source_id && has_source_ids)
+        {
+            throw Exception(
+                ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                "Partition field in Iceberg manifest has both 'source-id' and 'source-ids' — they are mutually exclusive per the Iceberg spec");
+        }
+        else if (has_source_ids)
+        {
+            auto source_ids_array = partition_specification_field->getArray(f_source_ids);
+            for (UInt32 idx = 0; idx < source_ids_array->size(); ++idx)
+                source_ids.push_back(source_ids_array->getElement<Int32>(idx));
+        }
+        else if (has_source_id)
+        {
+            source_ids.push_back(partition_specification_field->getValue<Int32>(f_source_id));
+        }
+        else
+        {
+            throw Exception(
+                ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                "Partition field in Iceberg manifest has neither 'source-id' nor 'source-ids'");
+        }
+
+        if (source_ids.empty())
+        {
+            throw Exception(
+                ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                "Partition field in Iceberg manifest has an empty 'source-ids' array");
+        }
+
+        auto transform_name = partition_specification_field->getValue<String>(f_partition_transform);
+        auto partition_name = partition_specification_field->getValue<String>(f_partition_name);
+        result.partition_specification.emplace_back(PartitionSpecsEntry{std::move(source_ids), transform_name, partition_name, static_cast<Int32>(i)});
+
+        /// Multi-argument transforms (V3): we cannot evaluate the transform, so skip pruning for this field.
+        /// Per the Iceberg V3 spec: "all v3 readers are required to read tables with unknown transforms,
+        /// ignoring the unsupported partition fields when filtering."
+        if (result.partition_specification.back().isMultiArg())
+            continue;
+
+        auto source_id = result.partition_specification.back().source_ids[0];
+        /// NOTE: tricky part to support RENAME column in partition key. Instead of some name
+        /// we use column internal number as it's name.
+        auto numeric_column_name = DB::backQuote(DB::toString(source_id));
+        std::optional<DB::NameAndTypePair> column_characteristics = schema_processor.tryGetFieldCharacteristics(schema_id, source_id);
+        if (!column_characteristics.has_value())
+            continue;
+        auto partition_ast = getASTFromTransform(transform_name, numeric_column_name, context->getSettingsRef()[Setting::iceberg_partition_timezone]);
+        /// Unsupported partition key expression
+        if (partition_ast == nullptr)
+            continue;
+
+        partition_key_ast->as<ASTFunction>()->arguments->children.emplace_back(std::move(partition_ast));
+        /// One source column may back several partition fields (e.g. hours(ts) and identity ts).
+        /// The tuple key AST keeps one child per field, but getKeyFromAST resolves identifiers
+        /// against these input columns, which must contain each source column at most once.
+        if (partition_columns_seen.insert(numeric_column_name).second)
+            partition_columns_description.emplace_back(numeric_column_name, removeNullable(column_characteristics->type));
+        result.partition_key_spec_positions.push_back(i);
+    }
+
+    if (!partition_columns_description.empty())
+        result.key_description.emplace(DB::KeyDescription::getKeyFromAST(
+            std::move(partition_key_ast), ColumnsDescription(partition_columns_description), {}, context));
+
+    return result;
 }
 
 namespace

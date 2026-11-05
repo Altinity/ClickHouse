@@ -31,8 +31,8 @@ sequenceDiagram
     participant Snd as Sender
     participant S3 as Shared pool
 
-    R->>Snd: GET part, cas_pool_uuid = every pool of R's policy, client_protocol_version = 11
-    Note over R: advertising 11 is a promise to confirm before promoting
+    R->>Snd: GET part, cas_pool_uuid = every pool of R's policy, cas_capabilities = relink_confirm
+    Note over R: the capability is a promise to confirm before promoting
     Snd->>Snd: same disk pool uuid? identity, never endpoint plus prefix
     Snd->>S3: resolve the offer once -- manifest bytes and confirm token from the SAME view
     Snd-->>R: cookies cas_relink = part_manifest_v2, cas_source_token = ..., cas_pool_uuid = the matched pool -- body = manifest bytes
@@ -64,7 +64,7 @@ sequenceDiagram
 | # | Gate | What it enforces |
 |---|---|---|
 | 1 | Pool identity | The receiver advertises `cas_pool_uuid` — the pool uuids of every content-addressed disk of its storage policy that is not read-only, as one list — and the sender offers relink only if its own disk's pool uuid is **in** it, naming that uuid in a `cas_pool_uuid` response cookie. Matching by endpoint and prefix was tried and rejected — a minted pool uuid is the identity |
-| 2 | Protocol version 11 | On the receiver side, advertising it is a promise to run the confirm round trip before promoting |
+| 2 | The `relink_confirm` capability | The receiver sends `cas_capabilities=relink_confirm` with the fetch; the sender offers a relink only to a receiver that promised to run the confirm round trip before promoting. The replication protocol version stays upstream's and never selects a relink |
 | 3 | One resolution for two outputs | The manifest bytes and the confirm token come from the **same** view. Two separate calls would allow a repoint in between and hand the receiver a token naming a manifest whose entries it never adopted |
 | 4 | The receiver trusts nothing from the wire but the entry list | The sender's manifest id, namespace and payload digest are ignored; the target namespace and ref come from the receiver's own router, and manifest path hygiene is validated at decode |
 | 5 | The confirm is I/O-free and fail-closed | A cold, evicted, unfenced or terminal mount answers `Unknown`. `No` and `Unknown` both go on the wire as `unproven`, because the fence check is evaluated last, so a `No` cannot be distinguished from "cannot prove it right now" |
