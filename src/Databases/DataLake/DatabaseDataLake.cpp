@@ -1186,9 +1186,7 @@ void DatabaseDataLake::validateCreateTableEngine(const ASTStorage & storage, Con
 
     if (storage.settings)
     {
-        /// When the table is reopened, these settings are taken from the database settings and format settings from
-        /// the query settings. So a table-level value is kept only when it matches the database one or is written
-        /// into the table metadata at creation.
+        /// Reject table-level settings that are lost when the table is reopened.
 #define DATA_LAKE_SETTING_NAME(TYPE, NAME, ...) #NAME,
         static const std::unordered_set<std::string_view> settings_from_database = {
             DATA_LAKE_STORAGE_RELATED_SETTINGS(DATA_LAKE_SETTING_NAME, DATA_LAKE_SETTING_NAME)};
