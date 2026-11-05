@@ -62,6 +62,8 @@ INSERT INTO tab_bf16 VALUES (0, [1.0, 0.0]),
                         (9, [0.0, 2.4]);
 
 -- The nearest neighbours to [0.0, 0.2] are 5,6,7,8
+-- Round distances: ARM sanitizer builds disable SimSIMD and scalar USearch
+-- differs in the 3rd decimal (0.203125 vs 0.1875). Neighbor order is unchanged.
 
 SELECT 'Column: Array(Float32)';
 

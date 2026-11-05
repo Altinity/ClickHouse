@@ -1192,11 +1192,11 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  stateless_tests_amd_msan_wasmedge_parallel_1_8:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
+  stateless_tests_amd_msan_wasmedge_parallel_1_6:
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder, 64g]
     needs: [build_amd_asan_ubsan, build_amd_debug, build_amd_msan, build_amd_tsan, build_arm_binary, config_workflow, fast_test, stateless_tests_amd_asan_ubsan_db_disk_distributed_plan_sequential_selected_tests, stateless_tests_amd_asan_ubsan_distributed_plan_parallel_selected_tests, stateless_tests_amd_debug_parallel, stateless_tests_amd_tsan_parallel_selected_tests, stateless_tests_arm_binary_parallel, stateless_tests_arm_binary_sequential]
-    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfbXNhbiwgV2FzbUVkZ2UsIHBhcmFsbGVsLCAxLzgp') }}
-    name: "Stateless tests (amd_msan, WasmEdge, parallel, 1/8)"
+    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfbXNhbiwgV2FzbUVkZ2UsIHBhcmFsbGVsLCAxLzYp') }}
+    name: "Stateless tests (amd_msan, WasmEdge, parallel, 1/6)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
       pipeline_status: ${{ steps.run.outputs.pipeline_status || 'undefined' }}
@@ -1211,7 +1211,7 @@ jobs:
       - name: Docker setup
         uses: ./.github/actions/docker_setup
         with:
-          test_name: "Stateless tests (amd_msan, WasmEdge, parallel, 1/8)"
+          test_name: "Stateless tests (amd_msan, WasmEdge, parallel, 1/6)"
 
       - name: Prepare env script
         run: |
@@ -1238,14 +1238,14 @@ jobs:
         id: run
         run: |
           . ./ci/tmp/praktika_setup_env.sh
-          PYTHONUNBUFFERED=1 python3 -m praktika run 'Stateless tests (amd_msan, WasmEdge, parallel, 1/8)' --workflow "Community PR" --ci --timestamp
+          PYTHONUNBUFFERED=1 python3 -m praktika run 'Stateless tests (amd_msan, WasmEdge, parallel, 1/6)' --workflow "Community PR" --ci --timestamp
 
       - name: Upload failure report artifact
         if: failure()
         uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
-          name: failure-stateless_tests_amd_msan_wasmedge_parallel_1_8
+          name: failure-stateless_tests_amd_msan_wasmedge_parallel_1_6
           path: |
             ci/tmp/result_*.json
             ci/tmp/test_result.txt
@@ -1256,11 +1256,11 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  stateless_tests_amd_msan_wasmedge_parallel_2_8:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
+  stateless_tests_amd_msan_wasmedge_parallel_2_6:
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder, 64g]
     needs: [build_amd_asan_ubsan, build_amd_debug, build_amd_msan, build_amd_tsan, build_arm_binary, config_workflow, fast_test, stateless_tests_amd_asan_ubsan_db_disk_distributed_plan_sequential_selected_tests, stateless_tests_amd_asan_ubsan_distributed_plan_parallel_selected_tests, stateless_tests_amd_debug_parallel, stateless_tests_amd_tsan_parallel_selected_tests, stateless_tests_arm_binary_parallel, stateless_tests_arm_binary_sequential]
-    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfbXNhbiwgV2FzbUVkZ2UsIHBhcmFsbGVsLCAyLzgp') }}
-    name: "Stateless tests (amd_msan, WasmEdge, parallel, 2/8)"
+    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfbXNhbiwgV2FzbUVkZ2UsIHBhcmFsbGVsLCAyLzYp') }}
+    name: "Stateless tests (amd_msan, WasmEdge, parallel, 2/6)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
       pipeline_status: ${{ steps.run.outputs.pipeline_status || 'undefined' }}
@@ -1275,7 +1275,7 @@ jobs:
       - name: Docker setup
         uses: ./.github/actions/docker_setup
         with:
-          test_name: "Stateless tests (amd_msan, WasmEdge, parallel, 2/8)"
+          test_name: "Stateless tests (amd_msan, WasmEdge, parallel, 2/6)"
 
       - name: Prepare env script
         run: |
@@ -1302,14 +1302,14 @@ jobs:
         id: run
         run: |
           . ./ci/tmp/praktika_setup_env.sh
-          PYTHONUNBUFFERED=1 python3 -m praktika run 'Stateless tests (amd_msan, WasmEdge, parallel, 2/8)' --workflow "Community PR" --ci --timestamp
+          PYTHONUNBUFFERED=1 python3 -m praktika run 'Stateless tests (amd_msan, WasmEdge, parallel, 2/6)' --workflow "Community PR" --ci --timestamp
 
       - name: Upload failure report artifact
         if: failure()
         uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
-          name: failure-stateless_tests_amd_msan_wasmedge_parallel_2_8
+          name: failure-stateless_tests_amd_msan_wasmedge_parallel_2_6
           path: |
             ci/tmp/result_*.json
             ci/tmp/test_result.txt
@@ -1320,11 +1320,11 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  stateless_tests_amd_msan_wasmedge_parallel_3_8:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
+  stateless_tests_amd_msan_wasmedge_parallel_3_6:
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder, 64g]
     needs: [build_amd_asan_ubsan, build_amd_debug, build_amd_msan, build_amd_tsan, build_arm_binary, config_workflow, fast_test, stateless_tests_amd_asan_ubsan_db_disk_distributed_plan_sequential_selected_tests, stateless_tests_amd_asan_ubsan_distributed_plan_parallel_selected_tests, stateless_tests_amd_debug_parallel, stateless_tests_amd_tsan_parallel_selected_tests, stateless_tests_arm_binary_parallel, stateless_tests_arm_binary_sequential]
-    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfbXNhbiwgV2FzbUVkZ2UsIHBhcmFsbGVsLCAzLzgp') }}
-    name: "Stateless tests (amd_msan, WasmEdge, parallel, 3/8)"
+    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfbXNhbiwgV2FzbUVkZ2UsIHBhcmFsbGVsLCAzLzYp') }}
+    name: "Stateless tests (amd_msan, WasmEdge, parallel, 3/6)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
       pipeline_status: ${{ steps.run.outputs.pipeline_status || 'undefined' }}
@@ -1339,7 +1339,7 @@ jobs:
       - name: Docker setup
         uses: ./.github/actions/docker_setup
         with:
-          test_name: "Stateless tests (amd_msan, WasmEdge, parallel, 3/8)"
+          test_name: "Stateless tests (amd_msan, WasmEdge, parallel, 3/6)"
 
       - name: Prepare env script
         run: |
@@ -1366,14 +1366,14 @@ jobs:
         id: run
         run: |
           . ./ci/tmp/praktika_setup_env.sh
-          PYTHONUNBUFFERED=1 python3 -m praktika run 'Stateless tests (amd_msan, WasmEdge, parallel, 3/8)' --workflow "Community PR" --ci --timestamp
+          PYTHONUNBUFFERED=1 python3 -m praktika run 'Stateless tests (amd_msan, WasmEdge, parallel, 3/6)' --workflow "Community PR" --ci --timestamp
 
       - name: Upload failure report artifact
         if: failure()
         uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
-          name: failure-stateless_tests_amd_msan_wasmedge_parallel_3_8
+          name: failure-stateless_tests_amd_msan_wasmedge_parallel_3_6
           path: |
             ci/tmp/result_*.json
             ci/tmp/test_result.txt
@@ -1384,11 +1384,11 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  stateless_tests_amd_msan_wasmedge_parallel_4_8:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
+  stateless_tests_amd_msan_wasmedge_parallel_4_6:
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder, 64g]
     needs: [build_amd_asan_ubsan, build_amd_debug, build_amd_msan, build_amd_tsan, build_arm_binary, config_workflow, fast_test, stateless_tests_amd_asan_ubsan_db_disk_distributed_plan_sequential_selected_tests, stateless_tests_amd_asan_ubsan_distributed_plan_parallel_selected_tests, stateless_tests_amd_debug_parallel, stateless_tests_amd_tsan_parallel_selected_tests, stateless_tests_arm_binary_parallel, stateless_tests_arm_binary_sequential]
-    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfbXNhbiwgV2FzbUVkZ2UsIHBhcmFsbGVsLCA0Lzgp') }}
-    name: "Stateless tests (amd_msan, WasmEdge, parallel, 4/8)"
+    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfbXNhbiwgV2FzbUVkZ2UsIHBhcmFsbGVsLCA0LzYp') }}
+    name: "Stateless tests (amd_msan, WasmEdge, parallel, 4/6)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
       pipeline_status: ${{ steps.run.outputs.pipeline_status || 'undefined' }}
@@ -1403,7 +1403,7 @@ jobs:
       - name: Docker setup
         uses: ./.github/actions/docker_setup
         with:
-          test_name: "Stateless tests (amd_msan, WasmEdge, parallel, 4/8)"
+          test_name: "Stateless tests (amd_msan, WasmEdge, parallel, 4/6)"
 
       - name: Prepare env script
         run: |
@@ -1430,14 +1430,14 @@ jobs:
         id: run
         run: |
           . ./ci/tmp/praktika_setup_env.sh
-          PYTHONUNBUFFERED=1 python3 -m praktika run 'Stateless tests (amd_msan, WasmEdge, parallel, 4/8)' --workflow "Community PR" --ci --timestamp
+          PYTHONUNBUFFERED=1 python3 -m praktika run 'Stateless tests (amd_msan, WasmEdge, parallel, 4/6)' --workflow "Community PR" --ci --timestamp
 
       - name: Upload failure report artifact
         if: failure()
         uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
-          name: failure-stateless_tests_amd_msan_wasmedge_parallel_4_8
+          name: failure-stateless_tests_amd_msan_wasmedge_parallel_4_6
           path: |
             ci/tmp/result_*.json
             ci/tmp/test_result.txt
@@ -1448,11 +1448,11 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  stateless_tests_amd_msan_wasmedge_parallel_5_8:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
+  stateless_tests_amd_msan_wasmedge_parallel_5_6:
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder, 64g]
     needs: [build_amd_asan_ubsan, build_amd_debug, build_amd_msan, build_amd_tsan, build_arm_binary, config_workflow, fast_test, stateless_tests_amd_asan_ubsan_db_disk_distributed_plan_sequential_selected_tests, stateless_tests_amd_asan_ubsan_distributed_plan_parallel_selected_tests, stateless_tests_amd_debug_parallel, stateless_tests_amd_tsan_parallel_selected_tests, stateless_tests_arm_binary_parallel, stateless_tests_arm_binary_sequential]
-    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfbXNhbiwgV2FzbUVkZ2UsIHBhcmFsbGVsLCA1Lzgp') }}
-    name: "Stateless tests (amd_msan, WasmEdge, parallel, 5/8)"
+    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfbXNhbiwgV2FzbUVkZ2UsIHBhcmFsbGVsLCA1LzYp') }}
+    name: "Stateless tests (amd_msan, WasmEdge, parallel, 5/6)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
       pipeline_status: ${{ steps.run.outputs.pipeline_status || 'undefined' }}
@@ -1467,7 +1467,7 @@ jobs:
       - name: Docker setup
         uses: ./.github/actions/docker_setup
         with:
-          test_name: "Stateless tests (amd_msan, WasmEdge, parallel, 5/8)"
+          test_name: "Stateless tests (amd_msan, WasmEdge, parallel, 5/6)"
 
       - name: Prepare env script
         run: |
@@ -1494,14 +1494,14 @@ jobs:
         id: run
         run: |
           . ./ci/tmp/praktika_setup_env.sh
-          PYTHONUNBUFFERED=1 python3 -m praktika run 'Stateless tests (amd_msan, WasmEdge, parallel, 5/8)' --workflow "Community PR" --ci --timestamp
+          PYTHONUNBUFFERED=1 python3 -m praktika run 'Stateless tests (amd_msan, WasmEdge, parallel, 5/6)' --workflow "Community PR" --ci --timestamp
 
       - name: Upload failure report artifact
         if: failure()
         uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
-          name: failure-stateless_tests_amd_msan_wasmedge_parallel_5_8
+          name: failure-stateless_tests_amd_msan_wasmedge_parallel_5_6
           path: |
             ci/tmp/result_*.json
             ci/tmp/test_result.txt
@@ -1512,11 +1512,11 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  stateless_tests_amd_msan_wasmedge_parallel_6_8:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
+  stateless_tests_amd_msan_wasmedge_parallel_6_6:
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder, 64g]
     needs: [build_amd_asan_ubsan, build_amd_debug, build_amd_msan, build_amd_tsan, build_arm_binary, config_workflow, fast_test, stateless_tests_amd_asan_ubsan_db_disk_distributed_plan_sequential_selected_tests, stateless_tests_amd_asan_ubsan_distributed_plan_parallel_selected_tests, stateless_tests_amd_debug_parallel, stateless_tests_amd_tsan_parallel_selected_tests, stateless_tests_arm_binary_parallel, stateless_tests_arm_binary_sequential]
-    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfbXNhbiwgV2FzbUVkZ2UsIHBhcmFsbGVsLCA2Lzgp') }}
-    name: "Stateless tests (amd_msan, WasmEdge, parallel, 6/8)"
+    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfbXNhbiwgV2FzbUVkZ2UsIHBhcmFsbGVsLCA2LzYp') }}
+    name: "Stateless tests (amd_msan, WasmEdge, parallel, 6/6)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
       pipeline_status: ${{ steps.run.outputs.pipeline_status || 'undefined' }}
@@ -1531,7 +1531,7 @@ jobs:
       - name: Docker setup
         uses: ./.github/actions/docker_setup
         with:
-          test_name: "Stateless tests (amd_msan, WasmEdge, parallel, 6/8)"
+          test_name: "Stateless tests (amd_msan, WasmEdge, parallel, 6/6)"
 
       - name: Prepare env script
         run: |
@@ -1558,14 +1558,14 @@ jobs:
         id: run
         run: |
           . ./ci/tmp/praktika_setup_env.sh
-          PYTHONUNBUFFERED=1 python3 -m praktika run 'Stateless tests (amd_msan, WasmEdge, parallel, 6/8)' --workflow "Community PR" --ci --timestamp
+          PYTHONUNBUFFERED=1 python3 -m praktika run 'Stateless tests (amd_msan, WasmEdge, parallel, 6/6)' --workflow "Community PR" --ci --timestamp
 
       - name: Upload failure report artifact
         if: failure()
         uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
-          name: failure-stateless_tests_amd_msan_wasmedge_parallel_6_8
+          name: failure-stateless_tests_amd_msan_wasmedge_parallel_6_6
           path: |
             ci/tmp/result_*.json
             ci/tmp/test_result.txt
@@ -1576,139 +1576,11 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  stateless_tests_amd_msan_wasmedge_parallel_7_8:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
-    needs: [build_amd_asan_ubsan, build_amd_debug, build_amd_msan, build_amd_tsan, build_arm_binary, config_workflow, fast_test, stateless_tests_amd_asan_ubsan_db_disk_distributed_plan_sequential_selected_tests, stateless_tests_amd_asan_ubsan_distributed_plan_parallel_selected_tests, stateless_tests_amd_debug_parallel, stateless_tests_amd_tsan_parallel_selected_tests, stateless_tests_arm_binary_parallel, stateless_tests_arm_binary_sequential]
-    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfbXNhbiwgV2FzbUVkZ2UsIHBhcmFsbGVsLCA3Lzgp') }}
-    name: "Stateless tests (amd_msan, WasmEdge, parallel, 7/8)"
-    outputs:
-      data: ${{ steps.run.outputs.DATA }}
-      pipeline_status: ${{ steps.run.outputs.pipeline_status || 'undefined' }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ env.CHECKOUT_REF }}
-
-      - name: Setup
-        uses: ./.github/actions/runner_setup
-      - name: Docker setup
-        uses: ./.github/actions/docker_setup
-        with:
-          test_name: "Stateless tests (amd_msan, WasmEdge, parallel, 7/8)"
-
-      - name: Prepare env script
-        run: |
-          rm -rf ./ci/tmp
-          mkdir -p ./ci/tmp
-          cat > ./ci/tmp/praktika_setup_env.sh << 'ENV_SETUP_SCRIPT_EOF'
-          export PYTHONPATH=./ci:.:
-
-          cat > ./ci/tmp/workflow_job.json << 'EOF'
-          ${{ toJson(job) }}
-          EOF
-          cat > ./ci/tmp/workflow_status.json << 'EOF'
-          ${{ toJson(needs) }}
-          EOF
-          ENV_SETUP_SCRIPT_EOF
-
-      - name: Download artifact CH_AMD_MSAN
-        uses: actions/download-artifact@v8
-        with:
-          name: CH_AMD_MSAN
-          path: ./ci/tmp
-
-      - name: Run
-        id: run
-        run: |
-          . ./ci/tmp/praktika_setup_env.sh
-          PYTHONUNBUFFERED=1 python3 -m praktika run 'Stateless tests (amd_msan, WasmEdge, parallel, 7/8)' --workflow "Community PR" --ci --timestamp
-
-      - name: Upload failure report artifact
-        if: failure()
-        uses: actions/upload-artifact@v7
-        continue-on-error: true
-        with:
-          name: failure-stateless_tests_amd_msan_wasmedge_parallel_7_8
-          path: |
-            ci/tmp/result_*.json
-            ci/tmp/test_result.txt
-            ci/tmp/pytest*.jsonl
-            ci/tmp/gtest.json
-            ci/tmp/logs.tar.gz
-            ci/tmp/configs.tar.gz
-          if-no-files-found: ignore
-          retention-days: 14
-
-  stateless_tests_amd_msan_wasmedge_parallel_8_8:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
-    needs: [build_amd_asan_ubsan, build_amd_debug, build_amd_msan, build_amd_tsan, build_arm_binary, config_workflow, fast_test, stateless_tests_amd_asan_ubsan_db_disk_distributed_plan_sequential_selected_tests, stateless_tests_amd_asan_ubsan_distributed_plan_parallel_selected_tests, stateless_tests_amd_debug_parallel, stateless_tests_amd_tsan_parallel_selected_tests, stateless_tests_arm_binary_parallel, stateless_tests_arm_binary_sequential]
-    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfbXNhbiwgV2FzbUVkZ2UsIHBhcmFsbGVsLCA4Lzgp') }}
-    name: "Stateless tests (amd_msan, WasmEdge, parallel, 8/8)"
-    outputs:
-      data: ${{ steps.run.outputs.DATA }}
-      pipeline_status: ${{ steps.run.outputs.pipeline_status || 'undefined' }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ env.CHECKOUT_REF }}
-
-      - name: Setup
-        uses: ./.github/actions/runner_setup
-      - name: Docker setup
-        uses: ./.github/actions/docker_setup
-        with:
-          test_name: "Stateless tests (amd_msan, WasmEdge, parallel, 8/8)"
-
-      - name: Prepare env script
-        run: |
-          rm -rf ./ci/tmp
-          mkdir -p ./ci/tmp
-          cat > ./ci/tmp/praktika_setup_env.sh << 'ENV_SETUP_SCRIPT_EOF'
-          export PYTHONPATH=./ci:.:
-
-          cat > ./ci/tmp/workflow_job.json << 'EOF'
-          ${{ toJson(job) }}
-          EOF
-          cat > ./ci/tmp/workflow_status.json << 'EOF'
-          ${{ toJson(needs) }}
-          EOF
-          ENV_SETUP_SCRIPT_EOF
-
-      - name: Download artifact CH_AMD_MSAN
-        uses: actions/download-artifact@v8
-        with:
-          name: CH_AMD_MSAN
-          path: ./ci/tmp
-
-      - name: Run
-        id: run
-        run: |
-          . ./ci/tmp/praktika_setup_env.sh
-          PYTHONUNBUFFERED=1 python3 -m praktika run 'Stateless tests (amd_msan, WasmEdge, parallel, 8/8)' --workflow "Community PR" --ci --timestamp
-
-      - name: Upload failure report artifact
-        if: failure()
-        uses: actions/upload-artifact@v7
-        continue-on-error: true
-        with:
-          name: failure-stateless_tests_amd_msan_wasmedge_parallel_8_8
-          path: |
-            ci/tmp/result_*.json
-            ci/tmp/test_result.txt
-            ci/tmp/pytest*.jsonl
-            ci/tmp/gtest.json
-            ci/tmp/logs.tar.gz
-            ci/tmp/configs.tar.gz
-          if-no-files-found: ignore
-          retention-days: 14
-
-  stateless_tests_amd_msan_wasmedge_sequential_1_2:
+  stateless_tests_amd_msan_wasmedge_sequential_1_4:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester, 32g]
     needs: [build_amd_asan_ubsan, build_amd_debug, build_amd_msan, build_amd_tsan, build_arm_binary, config_workflow, fast_test, stateless_tests_amd_asan_ubsan_db_disk_distributed_plan_sequential_selected_tests, stateless_tests_amd_asan_ubsan_distributed_plan_parallel_selected_tests, stateless_tests_amd_debug_parallel, stateless_tests_amd_tsan_parallel_selected_tests, stateless_tests_arm_binary_parallel, stateless_tests_arm_binary_sequential]
-    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfbXNhbiwgV2FzbUVkZ2UsIHNlcXVlbnRpYWwsIDEvMik=') }}
-    name: "Stateless tests (amd_msan, WasmEdge, sequential, 1/2)"
+    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfbXNhbiwgV2FzbUVkZ2UsIHNlcXVlbnRpYWwsIDEvNCk=') }}
+    name: "Stateless tests (amd_msan, WasmEdge, sequential, 1/4)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
       pipeline_status: ${{ steps.run.outputs.pipeline_status || 'undefined' }}
@@ -1723,7 +1595,7 @@ jobs:
       - name: Docker setup
         uses: ./.github/actions/docker_setup
         with:
-          test_name: "Stateless tests (amd_msan, WasmEdge, sequential, 1/2)"
+          test_name: "Stateless tests (amd_msan, WasmEdge, sequential, 1/4)"
 
       - name: Prepare env script
         run: |
@@ -1750,14 +1622,14 @@ jobs:
         id: run
         run: |
           . ./ci/tmp/praktika_setup_env.sh
-          PYTHONUNBUFFERED=1 python3 -m praktika run 'Stateless tests (amd_msan, WasmEdge, sequential, 1/2)' --workflow "Community PR" --ci --timestamp
+          PYTHONUNBUFFERED=1 python3 -m praktika run 'Stateless tests (amd_msan, WasmEdge, sequential, 1/4)' --workflow "Community PR" --ci --timestamp
 
       - name: Upload failure report artifact
         if: failure()
         uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
-          name: failure-stateless_tests_amd_msan_wasmedge_sequential_1_2
+          name: failure-stateless_tests_amd_msan_wasmedge_sequential_1_4
           path: |
             ci/tmp/result_*.json
             ci/tmp/test_result.txt
@@ -1768,11 +1640,11 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  stateless_tests_amd_msan_wasmedge_sequential_2_2:
+  stateless_tests_amd_msan_wasmedge_sequential_2_4:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester, 32g]
     needs: [build_amd_asan_ubsan, build_amd_debug, build_amd_msan, build_amd_tsan, build_arm_binary, config_workflow, fast_test, stateless_tests_amd_asan_ubsan_db_disk_distributed_plan_sequential_selected_tests, stateless_tests_amd_asan_ubsan_distributed_plan_parallel_selected_tests, stateless_tests_amd_debug_parallel, stateless_tests_amd_tsan_parallel_selected_tests, stateless_tests_arm_binary_parallel, stateless_tests_arm_binary_sequential]
-    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfbXNhbiwgV2FzbUVkZ2UsIHNlcXVlbnRpYWwsIDIvMik=') }}
-    name: "Stateless tests (amd_msan, WasmEdge, sequential, 2/2)"
+    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfbXNhbiwgV2FzbUVkZ2UsIHNlcXVlbnRpYWwsIDIvNCk=') }}
+    name: "Stateless tests (amd_msan, WasmEdge, sequential, 2/4)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
       pipeline_status: ${{ steps.run.outputs.pipeline_status || 'undefined' }}
@@ -1787,7 +1659,7 @@ jobs:
       - name: Docker setup
         uses: ./.github/actions/docker_setup
         with:
-          test_name: "Stateless tests (amd_msan, WasmEdge, sequential, 2/2)"
+          test_name: "Stateless tests (amd_msan, WasmEdge, sequential, 2/4)"
 
       - name: Prepare env script
         run: |
@@ -1814,14 +1686,142 @@ jobs:
         id: run
         run: |
           . ./ci/tmp/praktika_setup_env.sh
-          PYTHONUNBUFFERED=1 python3 -m praktika run 'Stateless tests (amd_msan, WasmEdge, sequential, 2/2)' --workflow "Community PR" --ci --timestamp
+          PYTHONUNBUFFERED=1 python3 -m praktika run 'Stateless tests (amd_msan, WasmEdge, sequential, 2/4)' --workflow "Community PR" --ci --timestamp
 
       - name: Upload failure report artifact
         if: failure()
         uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
-          name: failure-stateless_tests_amd_msan_wasmedge_sequential_2_2
+          name: failure-stateless_tests_amd_msan_wasmedge_sequential_2_4
+          path: |
+            ci/tmp/result_*.json
+            ci/tmp/test_result.txt
+            ci/tmp/pytest*.jsonl
+            ci/tmp/gtest.json
+            ci/tmp/logs.tar.gz
+            ci/tmp/configs.tar.gz
+          if-no-files-found: ignore
+          retention-days: 14
+
+  stateless_tests_amd_msan_wasmedge_sequential_3_4:
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester, 32g]
+    needs: [build_amd_asan_ubsan, build_amd_debug, build_amd_msan, build_amd_tsan, build_arm_binary, config_workflow, fast_test, stateless_tests_amd_asan_ubsan_db_disk_distributed_plan_sequential_selected_tests, stateless_tests_amd_asan_ubsan_distributed_plan_parallel_selected_tests, stateless_tests_amd_debug_parallel, stateless_tests_amd_tsan_parallel_selected_tests, stateless_tests_arm_binary_parallel, stateless_tests_arm_binary_sequential]
+    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfbXNhbiwgV2FzbUVkZ2UsIHNlcXVlbnRpYWwsIDMvNCk=') }}
+    name: "Stateless tests (amd_msan, WasmEdge, sequential, 3/4)"
+    outputs:
+      data: ${{ steps.run.outputs.DATA }}
+      pipeline_status: ${{ steps.run.outputs.pipeline_status || 'undefined' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Stateless tests (amd_msan, WasmEdge, sequential, 3/4)"
+
+      - name: Prepare env script
+        run: |
+          rm -rf ./ci/tmp
+          mkdir -p ./ci/tmp
+          cat > ./ci/tmp/praktika_setup_env.sh << 'ENV_SETUP_SCRIPT_EOF'
+          export PYTHONPATH=./ci:.:
+
+          cat > ./ci/tmp/workflow_job.json << 'EOF'
+          ${{ toJson(job) }}
+          EOF
+          cat > ./ci/tmp/workflow_status.json << 'EOF'
+          ${{ toJson(needs) }}
+          EOF
+          ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_MSAN
+        uses: actions/download-artifact@v8
+        with:
+          name: CH_AMD_MSAN
+          path: ./ci/tmp
+
+      - name: Run
+        id: run
+        run: |
+          . ./ci/tmp/praktika_setup_env.sh
+          PYTHONUNBUFFERED=1 python3 -m praktika run 'Stateless tests (amd_msan, WasmEdge, sequential, 3/4)' --workflow "Community PR" --ci --timestamp
+
+      - name: Upload failure report artifact
+        if: failure()
+        uses: actions/upload-artifact@v7
+        continue-on-error: true
+        with:
+          name: failure-stateless_tests_amd_msan_wasmedge_sequential_3_4
+          path: |
+            ci/tmp/result_*.json
+            ci/tmp/test_result.txt
+            ci/tmp/pytest*.jsonl
+            ci/tmp/gtest.json
+            ci/tmp/logs.tar.gz
+            ci/tmp/configs.tar.gz
+          if-no-files-found: ignore
+          retention-days: 14
+
+  stateless_tests_amd_msan_wasmedge_sequential_4_4:
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester, 32g]
+    needs: [build_amd_asan_ubsan, build_amd_debug, build_amd_msan, build_amd_tsan, build_arm_binary, config_workflow, fast_test, stateless_tests_amd_asan_ubsan_db_disk_distributed_plan_sequential_selected_tests, stateless_tests_amd_asan_ubsan_distributed_plan_parallel_selected_tests, stateless_tests_amd_debug_parallel, stateless_tests_amd_tsan_parallel_selected_tests, stateless_tests_arm_binary_parallel, stateless_tests_arm_binary_sequential]
+    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfbXNhbiwgV2FzbUVkZ2UsIHNlcXVlbnRpYWwsIDQvNCk=') }}
+    name: "Stateless tests (amd_msan, WasmEdge, sequential, 4/4)"
+    outputs:
+      data: ${{ steps.run.outputs.DATA }}
+      pipeline_status: ${{ steps.run.outputs.pipeline_status || 'undefined' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Stateless tests (amd_msan, WasmEdge, sequential, 4/4)"
+
+      - name: Prepare env script
+        run: |
+          rm -rf ./ci/tmp
+          mkdir -p ./ci/tmp
+          cat > ./ci/tmp/praktika_setup_env.sh << 'ENV_SETUP_SCRIPT_EOF'
+          export PYTHONPATH=./ci:.:
+
+          cat > ./ci/tmp/workflow_job.json << 'EOF'
+          ${{ toJson(job) }}
+          EOF
+          cat > ./ci/tmp/workflow_status.json << 'EOF'
+          ${{ toJson(needs) }}
+          EOF
+          ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_MSAN
+        uses: actions/download-artifact@v8
+        with:
+          name: CH_AMD_MSAN
+          path: ./ci/tmp
+
+      - name: Run
+        id: run
+        run: |
+          . ./ci/tmp/praktika_setup_env.sh
+          PYTHONUNBUFFERED=1 python3 -m praktika run 'Stateless tests (amd_msan, WasmEdge, sequential, 4/4)' --workflow "Community PR" --ci --timestamp
+
+      - name: Upload failure report artifact
+        if: failure()
+        uses: actions/upload-artifact@v7
+        continue-on-error: true
+        with:
+          name: failure-stateless_tests_amd_msan_wasmedge_sequential_4_4
           path: |
             ci/tmp/result_*.json
             ci/tmp/test_result.txt

@@ -215,7 +215,8 @@ workflow = Workflow.Config(
         #     job.set_run_after(CORE_BLOCKING_JOB_NAMES)
         #     for job in JobConfigs.performance_comparison_with_master_head_jobs
         # ], # NOTE (strtgbb): failed previously due to GH secrets not being handled properly, try again later
-        JobConfigs.parser_memory_check_job,
+        # NOTE (strtgbb): ooks up master clickhouse-examples on upstream S3
+        # JobConfigs.parser_memory_check_job,
         # ClickBench runs on PRs only when files in its digest change
         # (see `clickbench_jobs.digest_config`), so the cost is bounded.
         # *[
