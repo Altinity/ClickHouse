@@ -44,6 +44,8 @@
 #include <Interpreters/Context.h>
 
 #include <IO/ReadHelpers.h>
+#include <Parsers/ParserDataType.h>
+#include <Parsers/parseQuery.h>
 
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ComplexTypeSchemaProcessorFunctions.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
@@ -412,6 +414,26 @@ std::pair<size_t, size_t> parseDecimal(const String & type_name)
     return {precision, scale};
 }
 
+/// Checked on the AST, so that an aggregate function named by table metadata is not resolved while the setting is off.
+void checkAggregateFunctionStateAnnotationAllowed(Int32 field_id, const String & type_name, const ContextPtr & context)
+{
+    if (context->getSettingsRef()[Setting::allow_experimental_aggregate_function_states_in_open_formats])
+        return;
+
+    ParserDataType parser;
+    const auto ast = parseQuery(parser, type_name, 0, DBMS_DEFAULT_MAX_PARSER_DEPTH, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
+    if (astHasAggregateFunctionType(ast))
+        throw Exception(
+            ErrorCodes::SUPPORT_IS_DISABLED,
+            "Iceberg field with id {} records ClickHouse type {} in table properties `{}.{}.<schema-id>`. Reading aggregate "
+            "function states from an Iceberg table is disabled: enable setting "
+            "allow_experimental_aggregate_function_states_in_open_formats to honour the recorded type",
+            field_id,
+            type_name,
+            Iceberg::f_clickhouse_type,
+            field_id);
+}
+
 }
 
 namespace Iceberg
@@ -444,6 +466,10 @@ void IcebergSchemaProcessor::addIcebergTableSchema(
         return;
 
     auto schema_annotations = getClickHouseTypeAnnotationsOfSchema(schema_ptr, clickhouse_type_annotations);
+
+    /// Checked on every call, including for an already registered schema: the setting belongs to the current query.
+    for (const auto & [field_id, type_name] : schema_annotations)
+        checkAggregateFunctionStateAnnotationAllowed(field_id, type_name, context_);
 
     std::unordered_map<String, String> type_mapping;
     if (allow_geo_parser)
@@ -805,20 +831,8 @@ DataTypePtr IcebergSchemaProcessor::getFieldType(
         return derived_type;
 
     const String & annotated_name = annotation_it->second;
+    checkAggregateFunctionStateAnnotationAllowed(field_id, annotated_name, context_);
     auto annotated_type = DataTypeFactory::instance().get(annotated_name);
-
-    /// Read the gate from the query context rather than the context captured at `ATTACH`.
-    if (hasAggregateFunctionType(annotated_type)
-        && !context_->getSettingsRef()[Setting::allow_experimental_aggregate_function_states_in_open_formats])
-        throw Exception(
-            ErrorCodes::SUPPORT_IS_DISABLED,
-            "Iceberg field '{}' records ClickHouse type {} in table properties `{}.{}.<schema-id>`. Reading aggregate function "
-            "states from an Iceberg table is disabled: enable setting "
-            "allow_experimental_aggregate_function_states_in_open_formats to honour the recorded type",
-            field->has(f_name) ? field->getValue<String>(f_name) : type_key,
-            annotated_name,
-            f_clickhouse_type,
-            field_id);
 
     /// The annotation is valid only for the Iceberg type ClickHouse writes for it. The format version affects only
     /// whether `timestamp_ns` may be written, so the latest one is used and the field's own type decides.

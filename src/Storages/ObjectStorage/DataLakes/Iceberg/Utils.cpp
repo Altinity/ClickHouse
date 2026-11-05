@@ -939,9 +939,9 @@ ClickHouseTypeAnnotations getClickHouseTypeAnnotations(const Poco::JSON::Object:
         if (dot == std::string_view::npos || !tryParse(field_id, suffix.substr(0, dot))
             || !tryParse(entry_schema_id, suffix.substr(dot + 1)) || entry_schema_id > schema_id)
             continue;
-        auto [it, inserted] = entries.try_emplace(field_id, entry_schema_id, value.extract<String>());
+        auto [it, inserted] = entries.try_emplace(field_id, entry_schema_id, value.toString());
         if (!inserted && it->second.first < entry_schema_id)
-            it->second = {entry_schema_id, value.extract<String>()};
+            it->second = {entry_schema_id, value.toString()};
     }
     for (auto & [field_id, entry] : entries)
     {

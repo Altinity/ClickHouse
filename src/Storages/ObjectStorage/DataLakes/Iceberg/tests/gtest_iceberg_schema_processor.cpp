@@ -614,6 +614,10 @@ TEST(IcebergSchemaProcessor, AnnotationNotMatchingTheFieldTypeIsRejected)
     expectAnnotatedSchemaRejected(schema, {{1, "AggregateFunction(uniq, UInt64)"}});
     /// Another engine promoted the field from `int` to `long`, leaving the annotation stale.
     expectAnnotatedSchemaRejected(schema, {{1, "SimpleAggregateFunction(max, Int32)"}});
+    /// Another engine made a required state field optional, leaving the annotation stale.
+    expectAnnotatedSchemaRejected(
+        parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"u","required":false,"type":"binary"}]})json"),
+        {{1, "AggregateFunction(uniq, UInt64)"}});
 }
 
 /// ClickHouse writes both `Int64` and `UInt64` as `long`.
@@ -663,6 +667,27 @@ TEST(IcebergSchemaProcessor, RetryAfterRefusedAggregateFunctionStateSchemaSuccee
     EXPECT_EQ(field.type->getName(), "Nullable(Int32)");
     EXPECT_EQ(columns->back().type->getName(), "AggregateFunction(uniq, UInt64)");
     EXPECT_FALSE(processor.tryGetColumnIDByName(0, "a").has_value());
+}
+
+TEST(IcebergSchemaProcessor, AggregateFunctionStateSchemaRegisteredByAllowedQueryIsRefusedWithoutSetting)
+{
+    tryRegisterAggregateFunctions();
+    const std::string schema_json = R"json({"schema-id":0,"fields":[{"id":1,"name":"u","required":true,"type":"binary"}]})json";
+    const ClickHouseTypeAnnotations annotations{{1, "AggregateFunction(uniq, UInt64)"}};
+    IcebergSchemaProcessor processor(getContext().context);
+
+    processor.addIcebergTableSchema(parseSchema(schema_json), contextWithAggregateFunctionStates(true), annotations);
+    ASSERT_TRUE(processor.hasClickHouseTableSchemaById(0));
+
+    try
+    {
+        processor.addIcebergTableSchema(parseSchema(schema_json), contextWithAggregateFunctionStates(false), annotations);
+        FAIL() << "A query without the setting must be refused even when the schema is already registered";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::SUPPORT_IS_DISABLED) << e.message();
+    }
 }
 
 TEST(IcebergSchemaProcessor, RefusedChangedAnnotationKeepsRegisteredSchema)

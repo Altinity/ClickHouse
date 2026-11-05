@@ -8139,8 +8139,9 @@ Allow `AggregateFunction` states in Parquet files and Iceberg tables, and `Simpl
 columns in Iceberg tables. A state is stored as opaque binary, with its ClickHouse type recorded in
 `clickhouse.column_types` (Parquet file metadata) or `clickhouse.type.<field-id>.<schema-id>` (Iceberg table properties).
 
-Gates both writing such columns and reconstructing their types on read. When enabled, the data, not
-the query, chooses the deserializer for the stored bytes, so keep it disabled for untrusted sources.
+Gates writing such columns and reading `AggregateFunction` states; `SimpleAggregateFunction` columns
+are gated on write only. When enabled, the data, not the query, chooses the deserializer for the stored
+bytes, so keep it disabled for untrusted sources.
 More [in Parquet](/reference/formats/Parquet/Parquet#aggregate-function-states) and
 [in Iceberg](/reference/engines/table-engines/integrations/iceberg#aggregate-function-states).
 )", 0) \

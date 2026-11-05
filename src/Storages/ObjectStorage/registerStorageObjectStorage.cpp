@@ -1282,11 +1282,8 @@ it is that metadata, not the query, which chooses the deserializer; keep it disa
 untrusted sources, where such a field is then rejected rather than read as `String`. A
 `SimpleAggregateFunction` column is not gated on read, holding ordinary values of its storage type.
 
-The setting is read from the query that parses the schema, so a session `SET` or a `SETTINGS` clause
-on that query supplies it. The `iceberg*` table functions build a fresh storage object per query, so
-for them it takes effect per query; the table engine parses the schema once and keeps it, so the
-query that first touches the table after `ATTACH` decides, and that outcome holds - including for
-queries that do not set it - until `DETACH TABLE` or a server restart.
+The setting is checked on every query, so a session `SET` or a `SETTINGS` clause on that query
+supplies it.
 
 Writing goes through the ordinary Parquet writer, which takes the same setting from its format
 settings. An object storage table engine freezes its format settings at `CREATE TABLE` - the server
