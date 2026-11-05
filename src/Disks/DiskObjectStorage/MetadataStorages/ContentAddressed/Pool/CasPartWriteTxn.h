@@ -208,14 +208,14 @@ public:
     /// The id is recorded for best-effort `abandon` cleanup.
     ManifestId stageManifest(std::vector<ManifestEntry> entries);
 
-    /// A3 mint-tightening: `id` must either be one THIS transaction minted via `stageManifest`, or
+    /// A3 mint-tightening: `manifest_id` must either be one THIS transaction minted via `stageManifest`, or
     /// already be `final_ref_name`'s current committed manifest (the idempotent re-drive -- see the
     /// closure in the .cpp). Any other id names a manifest this transaction never staged and does not
     /// currently own -- most commonly one a DIFFERENT, since-abandoned/dropped transaction once staged
     /// -- and granting it fresh ownership here would let a later exact-`ManifestRef` equality check
     /// (the relink confirm) compare true against a token whose blobs may already be reclaimed (an ABA).
     /// Rejected with `LOGICAL_ERROR`: this is a programming-invariant violation, never an operational one.
-    void precommitAdd(const RootNamespace & target_ns, const String & final_ref_name, const ManifestId & id);
+    void precommitAdd(const RootNamespace & target_ns, const String & final_ref_name, const ManifestId & manifest_id);
 
     /// Atomically promote the precommit to the committed ref with one `appendRefOps` call on the target ref's
     /// ref-log entry.
@@ -252,7 +252,7 @@ public:
     /// manifest -- an absent row means the ref was moved or dropped under the writer, a different manifest
     /// means a concurrent repoint won. Either way the stale writer must re-resolve instead of recreating or
     /// overwriting the binding.
-    bool promote(const RootNamespace & target_ns, const String & final_ref_name, UInt128 build_id, const ManifestId & id,
+    bool promote(const RootNamespace & target_ns, const String & final_ref_name, UInt128 build_id, const ManifestId & manifest_id,
                  PublishPolicy policy = {});
 
     /// Retire the build sequence so the GC watermark floor can advance; staged manifest debris is best-effort

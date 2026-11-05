@@ -702,16 +702,16 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
     return id;
 }
 
-void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & final_ref_name, const ManifestId & id)
+void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & final_ref_name, const ManifestId & manifest_id)
 {
     requireAlive();
 
     /// ManifestNamespaceMatches at the source: the precommit's manifest must belong to the target
-    /// namespace (its key is built from id.root_namespace). A cross-namespace precommit is a bug.
-    if (id.root_namespace != target_ns)
+    /// namespace (its key is built from manifest_id.root_namespace). A cross-namespace precommit is a bug.
+    if (manifest_id.root_namespace != target_ns)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "precommitAdd: manifest namespace '{}' != target namespace '{}'",
-            id.root_namespace.string(), target_ns.string());
+            manifest_id.root_namespace.string(), target_ns.string());
 
     /// A3 mint-tightening (ABA barrier for the relink confirm's exact-`ManifestRef` equality): an
     /// unowned `ManifestId` may enter ownership only from the transaction that freshly staged it.
@@ -721,11 +721,11 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
     /// the closure -- consistent with every other capture there -- rather than capturing `this`,
     /// which would let a closure that outlives this stack (see the capture comment below) dereference
     /// a dead transaction. Enforcement, however, is NOT done here: see the closure for why.
-    const bool id_staged_by_this_txn = staged_manifest_ids.contains(id);
+    const bool id_staged_by_this_txn = staged_manifest_ids.contains(manifest_id);
 
     /// One `owner_transition` create-precommit op.
     /// No body HEAD — a missing body is a legal fail-closed, non-activating intent, unchanged from the
-    /// old protocol. Precommit ownership carries NO separate build token: `id.ref` (writer_epoch,
+    /// old protocol. Precommit ownership carries NO separate build token: `manifest_id.ref` (writer_epoch,
     /// build_sequence, manifest_ordinal) IS the build identity (the tuple
     /// §Transaction Log Format: "there is no second build token"). `build_ops` is invoked from inside
     /// the per-namespace flush, so it sees the table's CURRENT state including any earlier item of the
@@ -735,7 +735,7 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
     ///
     /// THE INTENT IS RECORDED BEFORE THE APPEND, and that ordering is the whole point: an `Unresolved`
     /// append MAY HAVE LANDED (`CasRefLedger.cpp`, the `Unresolved` arm says so explicitly), so a
-    /// `precommitAdd` that throws can still have made `id.ref` a live precommit owner. Setting the
+    /// `precommitAdd` that throws can still have made `manifest_id.ref` a live precommit owner. Setting the
     /// fields afterwards left that case with an object which believed it had never precommitted:
     /// `abandon` queued no removal and `cleanupStagedManifestDebrisBestEffort` -- deciding from the same
     /// unset state -- writer-DELETED the body, so a wedge that later resolved as committed installed a
@@ -744,7 +744,7 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
     /// values, so this cannot throw between the record and the append.
     precommit_target_ns = target_ns;
     precommit_final_ref = final_ref_name;
-    precommit_manifest = id.ref;
+    precommit_manifest = manifest_id.ref;
     precommit_state = PrecommitState::Uncertain;
 
     store->appendRefOps(target_ns, MutationScope::ref(final_ref_name),
@@ -752,7 +752,7 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
         /// and manifest id) rather than `[&]`: defense-in-depth so a closure that ever outlives this
         /// stack frame (e.g. if the append lane stranded its item) never dereferences a dead stack. The
         /// ref-lane leadership guard is the real fix; this makes the closure self-contained regardless.
-        [pool = store, target_ns, final_ref_name, id, id_staged_by_this_txn](const RefTableState & state) -> std::vector<RefOp>
+        [pool = store, target_ns, final_ref_name, manifest_id, id_staged_by_this_txn](const RefTableState & state) -> std::vector<RefOp>
         {
             /// Idempotent re-add: the target ref is ALREADY committed to this EXACT manifest_ref (a
             /// legitimate re-drive calling precommitAdd+promote again for content that is already
@@ -761,13 +761,13 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
             /// manifest", which the state machine enforces for every OTHER case.
             ///
             if (const auto it = state.getCommitted().find(final_ref_name);
-                it != state.getCommitted().end() && it->second.manifest_ref == id.ref)
+                it != state.getCommitted().end() && it->second.manifest_ref == manifest_id.ref)
                 return {};
             if (!id_staged_by_this_txn)
                 throw Exception(ErrorCodes::LOGICAL_ERROR,
                     "precommitAdd: manifest '{}' was not staged by this transaction and is not the current "
                     "committed manifest of ref '{}' -- refusing to re-own a foreign or previously-dropped identity",
-                    manifestRefDebugString(id.ref), final_ref_name);
+                    manifestRefDebugString(manifest_id.ref), final_ref_name);
 
             std::vector<RefOp> ops;
             if (state.getLifecycle() != RefLifecycle::Live)
@@ -781,7 +781,7 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
             }
             RefOp add;
             add.kind = RefOpKind::OwnerTransition;
-            add.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, final_ref_name, id.ref};
+            add.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, final_ref_name, manifest_id.ref};
             ops.push_back(add);
             return ops;
         },
@@ -803,21 +803,21 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
     });
 }
 
-bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final_ref_name, UInt128 promote_build_id, const ManifestId & id,
+bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final_ref_name, UInt128 promote_build_id, const ManifestId & manifest_id,
     PublishPolicy policy)
 {
     requireAlive();
-    if (id.root_namespace != target_ns)
+    if (manifest_id.root_namespace != target_ns)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "promote: manifest namespace '{}' != target namespace '{}'",
-            id.root_namespace.string(), target_ns.string());
+            manifest_id.root_namespace.string(), target_ns.string());
 
-    const auto staged = staged_manifest_ids.find(id);
+    const auto staged = staged_manifest_ids.find(manifest_id);
     if (staged == staged_manifest_ids.end())
         throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "promote: manifest '{}' was not staged by this transaction", manifestRefDebugString(id.ref));
+            "promote: manifest '{}' was not staged by this transaction", manifestRefDebugString(manifest_id.ref));
 
-    const String manifest_key = store->layout().manifestKey(id);
+    const String manifest_key = store->layout().manifestKey(manifest_id);
     if (staged->second.incarnation.key() != manifest_key)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "promote: staged manifest record names key '{}', expected '{}'",
@@ -835,7 +835,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
     std::optional<ManifestRef> repoint_old;
     /// `created`: whether `final_ref_name` has NO committed row as of THIS builder's read of `state`
     /// -- set as the very first statement of the closure (before any other branch), so it is correct
-    /// on every path: idempotent re-promote no-op (a committed row for `id.ref` already existed ->
+    /// on every path: idempotent re-promote no-op (a committed row for `manifest_id.ref` already existed ->
     /// false), an intended repoint (a committed row for a DIFFERENT manifest already existed -> false),
     /// or a genuine first-time bind (no committed row -> true). Same in-closure-output pattern as
     /// `repoint_old` immediately below; read by the caller only after `appendRefOps` returns.
@@ -847,7 +847,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
     /// may not.
     commit_state = CommitState::Uncertain;
     store->appendRefOps(target_ns, MutationScope::ref(final_ref_name),
-        [this, final_ref_name, id, promote_build_id, policy,
+        [this, final_ref_name, manifest_id, promote_build_id, policy,
          manifest_dependencies = std::move(manifest_blob_dependencies), &repoint_old, &created]
         (const RefTableState & state) -> std::vector<RefOp>
         {
@@ -859,7 +859,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             /// precommit that a first successful call already consumed. Mirrors precommitAdd's matching
             /// guard; the DIFFERENT-manifest case below remains the BUG-1a fail-closed leak guard.
             if (const auto it = state.getCommitted().find(final_ref_name);
-                it != state.getCommitted().end() && it->second.manifest_ref == id.ref)
+                it != state.getCommitted().end() && it->second.manifest_ref == manifest_id.ref)
                 return {};
 
             if (policy.expected)
@@ -881,9 +881,9 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             /// a removal of the precommit binding, the blobs' in-degree was already decremented and a Δ=0
             /// move would re-publish a committed ref over to-be-deleted blobs ⇒ a dangling committed
             /// manifest (INV_NO_DANGLE). `RefTableState::getPrecommits` materializes live ownership directly:
-            /// `id.ref` alone identifies the build (there is no second
+            /// `manifest_id.ref` alone identifies the build (there is no second
             /// build token"), so an exact-binding lookup answers the same question directly.
-            if (!state.getPrecommits().contains({final_ref_name, id.ref}))
+            if (!state.getPrecommits().contains({final_ref_name, manifest_id.ref}))
                 throwCasWriteRetryLater(fmt::format(
                     "promote: precommit owner binding for ref '{}' (build {}) was removed (abandon or GC "
                     "reclaim) and is no longer the live owner — failing closed; the build must restart "
@@ -951,7 +951,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             /// write-retry-later, not LOGICAL_ERROR: a conflicting durable state the caller handles, never a
             /// must-not-happen invariant.
             if (const auto it = state.getCommitted().find(final_ref_name);
-                it != state.getCommitted().end() && !(it->second.manifest_ref == id.ref))
+                it != state.getCommitted().end() && !(it->second.manifest_ref == manifest_id.ref))
             {
                 if (!policy.expected)
                     throwCasWriteRetryLater(fmt::format(
@@ -987,11 +987,11 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             }
             RefOp transition;
             transition.kind = RefOpKind::OwnerTransition;
-            transition.old_binding = RefOwnerBinding{RefOwnerKind::Precommit, final_ref_name, id.ref};
-            transition.new_binding = RefOwnerBinding{RefOwnerKind::Committed, final_ref_name, id.ref};
+            transition.old_binding = RefOwnerBinding{RefOwnerKind::Precommit, final_ref_name, manifest_id.ref};
+            transition.new_binding = RefOwnerBinding{RefOwnerKind::Committed, final_ref_name, manifest_id.ref};
             ops.push_back(transition);
 
-            ops.push_back(makeSetPublishedAtOp(final_ref_name, id.ref, Cas::nowMs()));
+            ops.push_back(makeSetPublishedAtOp(final_ref_name, manifest_id.ref, Cas::nowMs()));
             return ops;
         },
         RootMutationOrigin::Writer, RootMutationKind::Promote);
@@ -1008,7 +1008,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             e.type = CasEventType::BuildPublish;
             e.namespace_ = target_ns.string();
             e.ref_name = final_ref_name;
-            e.object_hash = manifestRefDebugString(id.ref);
+            e.object_hash = manifestRefDebugString(manifest_id.ref);
             e.token = u128ToHex(promote_build_id);
             e.outcome = "promoted";
             e.reason = "promote: atomic owner move precommit(build_id) -> ref(final_ref_name) after fail-closed reval";
@@ -1035,7 +1035,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
                 e.namespace_ = target_ns.string();
                 e.ref_name = final_ref_name;
                 e.object_kind = CasEventObjectKind::Manifest;
-                e.object_hash = manifestRefDebugString(id.ref);
+                e.object_hash = manifestRefDebugString(manifest_id.ref);
                 e.outcome = "repointed";
                 e.reason = "promote: committed ref retargeted from an old manifest to a "
                            "new one in one ref-log record -- standalone write/remove on a committed part";
