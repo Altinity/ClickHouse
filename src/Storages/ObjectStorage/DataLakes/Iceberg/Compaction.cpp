@@ -489,6 +489,7 @@ static void writeDataFiles(
 
 static bool writeConsolidatedManifestFile(
     int metadata_version,
+    const String & metadata_file_path,
     Poco::JSON::Object::Ptr metadata_object,
     const PersistentTableComponents & persistent_table_components,
     ObjectStoragePtr object_storage, ContextPtr context,
@@ -817,7 +818,7 @@ static bool writeConsolidatedManifestFile(
     // Manifest-only rewrite: use a snapshot type that carries all total-* counters forward unchanged, since passing deltas would inflate the totals.
     auto new_snapshot = metadata_generator.generateManifestOnlySnapshot(
         generator,
-        generated_metadata_info.path,
+        path_resolver.reverseResolve(metadata_file_path),
         current_snapshot_id);
 
     // Write one manifest file per (partition spec, partition value) group.
@@ -1558,6 +1559,7 @@ void compactIcebergManifests(
 
         if (writeConsolidatedManifestFile(
                 metadata_version,
+                metadata_file_path,
                 metadata_object,
                 persistent_table_components,
                 object_storage_,

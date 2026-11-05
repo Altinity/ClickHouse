@@ -837,7 +837,7 @@ void IcebergMetadata::truncate(ContextPtr context, std::shared_ptr<DataLake::ICa
     auto metadata_info = filename_generator.generateMetadataPathWithInfo();
 
     auto [new_snapshot, manifest_list_path] = MetadataGenerator(metadata_object).generateNextMetadata(
-        filename_generator, metadata_info.path, parent_snapshot_id,
+        filename_generator, resolver.reverseResolve(actual_table_state_snapshot.metadata_file_path), parent_snapshot_id,
         /* added_files */ 0, /* added_records */ 0, /* added_files_size */ 0,
         /* num_partitions */ 0, /* added_delete_files */ 0, /* num_deleted_rows */ 0,
         std::nullopt, std::nullopt, MetadataGenerator::SnapshotOperation::Append, /*is_truncate=*/true);
@@ -2250,6 +2250,7 @@ std::vector<Field> recomputeExportPartitionValues(
 std::optional<IStorage::ExportPartitionCommitInfo> IcebergMetadata::commitImportPartitionTransactionImpl(
     FileNamesGenerator & filename_generator,
     Poco::JSON::Object::Ptr & metadata,
+    String & metadata_file_path,
     Poco::JSON::Object::Ptr & partition_spec,
     const String & transaction_id,
     Int64 original_schema_id,
@@ -2294,7 +2295,7 @@ std::optional<IStorage::ExportPartitionCommitInfo> IcebergMetadata::commitImport
         parent_snapshot = metadata->getValue<Int64>(Iceberg::f_current_snapshot_id);
 
     auto [new_snapshot, manifest_list_path] = MetadataGenerator(metadata).generateNextMetadata(
-        filename_generator, metadata_info.path, parent_snapshot, total_data_files, total_rows, total_chunks_size, total_data_files, /* added_delete_files */0, /* num_deleted_rows */0);
+        filename_generator, resolver.reverseResolve(metadata_file_path), parent_snapshot, total_data_files, total_rows, total_chunks_size, total_data_files, /* added_delete_files */0, /* num_deleted_rows */0);
     const auto storage_manifest_list_name = resolver.resolve(manifest_list_path);
 
     /// Embed the stable transaction identifier in the snapshot summary so that a retry after crash
@@ -2371,6 +2372,7 @@ std::optional<IStorage::ExportPartitionCommitInfo> IcebergMetadata::commitImport
                 getLogger("IcebergMetadata"),
                 compression_method,
                 persistent_components.table_uuid);
+            metadata_file_path = metadata_path;
 
             /// For the export path the schema and partition spec are fixed at the start of the
             /// operation (saved in ZooKeeper). If either changed we must fail immediately —
@@ -2681,12 +2683,14 @@ IStorage::ExportPartitionCommitInfo IcebergMetadata::commitExportPartitionTransa
         per_file_stats.push_back(std::move(stats));
     }
 
+    String metadata_file_path = updated_metadata_file_info.path;
     size_t attempt = 0;
     while (attempt < MAX_TRANSACTION_RETRIES)
     {
         auto commit_info = commitImportPartitionTransactionImpl(
                 filename_generator,
                 metadata,
+                metadata_file_path,
                 partition_spec,
                 transaction_id,
                 original_schema_id,

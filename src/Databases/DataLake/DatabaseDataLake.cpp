@@ -187,6 +187,14 @@ String getLocationScheme(const std::shared_ptr<DataLake::ICatalog> & catalog)
         catalog->getCatalogType());
 }
 
+/// Storage settings that a catalog table is opened with.
+std::shared_ptr<DataLakeStorageSettings> getTableStorageSettings(const DatabaseDataLakeSettings & settings)
+{
+    auto storage_settings = std::make_shared<DataLakeStorageSettings>();
+    storage_settings->loadFromSettingsChanges(settings.allChanged());
+    return storage_settings;
+}
+
 /// Translate the database-layer `TablesFilter` into the catalog-layer
 /// `TableNameFilter` so the catalog can restrict which namespaces it lists.
 DataLake::TableNameFilter toCatalogTableNameFilter(const TablesFilter & tables_filter)
@@ -1024,8 +1032,7 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
 
     LOG_TEST(log, "Using table endpoint: {}", args[0]->as<ASTLiteral>()->value.safeGet<String>());
 
-    auto storage_settings = std::make_shared<DataLakeStorageSettings>();
-    storage_settings->loadFromSettingsChanges(settings.allChanged());
+    auto storage_settings = getTableStorageSettings(settings);
 
     if (auto table_specific_properties = table_metadata.getDataLakeSpecificProperties();
         table_specific_properties.has_value())
@@ -1176,6 +1183,41 @@ void DatabaseDataLake::validateCreateTableEngine(const ASTStorage & storage, Con
             ErrorCodes::BAD_ARGUMENTS,
             "This DataLakeCatalog assigns table locations itself, so an explicit table `ENGINE` "
             "is not supported; omit the `ENGINE` clause");
+
+    if (storage.settings)
+    {
+        /// When the table is reopened, these settings are taken from the database settings and format settings from
+        /// the query settings. So a table-level value is kept only when it matches the database one or is written
+        /// into the table metadata at creation.
+#define DATA_LAKE_SETTING_NAME(TYPE, NAME, ...) #NAME,
+        static const std::unordered_set<std::string_view> settings_from_database = {
+            DATA_LAKE_STORAGE_RELATED_SETTINGS(DATA_LAKE_SETTING_NAME, DATA_LAKE_SETTING_NAME)};
+#undef DATA_LAKE_SETTING_NAME
+
+        const auto database_storage_settings = getTableStorageSettings(*database_settings.get());
+        DataLakeStorageSettings table_storage_settings;
+        table_storage_settings.loadFromSettingsChanges(storage.settings->changes);
+
+        for (const auto & change : storage.settings->changes)
+        {
+            /// An unknown setting is rejected when the storage is created.
+            const auto tier = DataLakeStorageSettings::tryGetTierOfBuiltin(change.name);
+            if (!tier || *tier == SettingsTierType::OBSOLETE || change.name == "iceberg_format_version")
+                continue;
+
+            if (!settings_from_database.contains(change.name))
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Table setting `{}` is not kept by a DataLakeCatalog table: "
+                    "it is taken from the query settings when the table is reopened",
+                    change.name);
+
+            if (table_storage_settings.get(change.name) != database_storage_settings->get(change.name))
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Table setting `{}` differs from its value in this DataLakeCatalog. "
+                    "The table is reopened with the database settings, so the table-level value would be lost",
+                    change.name);
+        }
+    }
 
     catalog->loadConfigIfNeeded(DataLake::getForwardedAuthToken(context_));
     const auto catalog_storage_type = catalog->getStorageType();
@@ -1901,7 +1943,7 @@ void registerDatabaseDataLake(DatabaseFactory & factory)
 
         DatabaseDataLakeSettings database_settings;
         if (database_engine_define->settings)
-            database_settings.loadFromQuery(*database_engine_define, args.create_query.attach);
+            database_settings.loadFromQuery(*database_engine_define);
 
         const auto & auth_header_str = database_settings[DatabaseDataLakeSetting::auth_header].value;
         /// Validate `auth_header` on CREATE only (matches the `allow_experimental_database_*`

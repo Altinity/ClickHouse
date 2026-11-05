@@ -55,6 +55,9 @@ public:
         const Iceberg::IcebergPathFromMetadata & metadata_file_path,
         Int64 parent_snapshot_id);
 
+    /// Records the metadata file that the generated one replaces.
+    void appendMetadataLog(const Iceberg::IcebergPathFromMetadata & previous_metadata_file_path, Int64 timestamp_ms);
+
     void generateDropColumnMetadata(const String & column_name);
     /// Returns false when neither the type nor the position changed (true no-op).
     /// Throws when the requested type differs from the current one but maps to the same Iceberg type.
