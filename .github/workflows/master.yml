@@ -4,6 +4,7 @@ name: MasterCI
 env:
   # Force the stdout and stderr streams to be unbuffered
   PYTHONUNBUFFERED: 1
+  S3_ARTIFACT_BUCKET: ${{ vars.S3_ARTIFACT_BUCKET }}
 
 on: # yamllint disable-line rule:truthy
   push:
