@@ -281,6 +281,9 @@ String renderGcState(const GcState & s)
         .add("snap_pruned_through", jsonUInt(s.snap_pruned_through))
         .add("snap_attempt", jsonUInt(s.snap_attempt))
         .add("manifest_sweep_cursor", jsonEscape(s.manifest_sweep_cursor))
+        .add("orphan_manifest_sweep_active", s.orphan_manifest_sweep_active ? "true" : "false")
+        .add("orphan_manifest_sweep_started_at_ms", jsonUInt(s.orphan_manifest_sweep_started_at_ms))
+        .add("orphan_manifest_sweep_completed_at_ms", jsonUInt(s.orphan_manifest_sweep_completed_at_ms))
         .add("lease", renderGcLease(s.lease))
         .str();
 }

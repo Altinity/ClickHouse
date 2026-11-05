@@ -640,6 +640,7 @@ private:
     const uint64_t gc_shards;                    /// Blob-hash-prefix reducer shard count, fixed at pool creation.
     const uint64_t manifest_sweep_list_budget_keys;
     const uint64_t manifest_sweep_delete_budget_keys;
+    const uint64_t orphan_manifest_sweep_interval_sec;
     const uint64_t gc_round_graduation_budget;
     const uint64_t gc_round_redelete_budget;
     const uint64_t gc_round_sweep_namespace_budget;
