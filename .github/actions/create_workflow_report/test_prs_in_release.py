@@ -8,6 +8,8 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import MagicMock, patch
 
+from botocore.exceptions import ClientError
+
 import pandas as pd
 
 from create_workflow_report import (
@@ -23,6 +25,7 @@ from create_workflow_report import (
     _parse_release_ref,
     _release_tag_sha,
     _filter_releases_to_version_line,
+    _repo_and_run_id,
     get_prs_in_release_dataframe,
     get_workflow_config,
 )
@@ -417,8 +420,12 @@ class TestGetWorkflowConfigStdout(unittest.TestCase):
     def test_s3_404_warning_goes_to_stderr(self):
         # action.yml takes the script's stdout as the report URL. A WARNING on
         # stdout makes grep '^https?://' fail even after a successful upload.
-        mock_resp = MagicMock()
-        mock_resp.status_code = 404
+        missing = ClientError(
+            {"Error": {"Code": "NoSuchKey", "Message": "Not Found"}},
+            "GetObject",
+        )
+        s3_client = MagicMock()
+        s3_client.get_object.side_effect = missing
         stdout = io.StringIO()
         stderr = io.StringIO()
         with (
@@ -426,7 +433,7 @@ class TestGetWorkflowConfigStdout(unittest.TestCase):
                 "create_workflow_report._workflow_config_from_local",
                 return_value=None,
             ),
-            patch("create_workflow_report.requests.get", return_value=mock_resp),
+            patch("create_workflow_report.boto3.client", return_value=s3_client),
             redirect_stdout(stdout),
             redirect_stderr(stderr),
         ):
@@ -434,6 +441,20 @@ class TestGetWorkflowConfigStdout(unittest.TestCase):
         self.assertEqual(cfg, {"cache_jobs": {}})
         self.assertEqual(stdout.getvalue(), "")
         self.assertIn("WARNING", stderr.getvalue())
+
+
+class TestRepoAndRunId(unittest.TestCase):
+    def test_parses_owner_and_run_from_actions_url(self):
+        repo, run_id = _repo_and_run_id(
+            "https://github.com/Altinity/clickhouse-private/actions/runs/41773029729"
+        )
+        self.assertEqual(repo, "Altinity/clickhouse-private")
+        self.assertEqual(run_id, "41773029729")
+
+    def test_unknown_url_keeps_public_repo(self):
+        repo, run_id = _repo_and_run_id("https://example.com/runs/99")
+        self.assertEqual(repo, "Altinity/ClickHouse")
+        self.assertEqual(run_id, "99")
 
 
 if __name__ == "__main__":
