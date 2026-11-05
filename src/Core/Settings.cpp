@@ -9199,6 +9199,17 @@ Does not apply to explicit *Cluster table functions, to 'object_storage_remote_i
 With remote initiator + remote_initiator_cluster, the initiator sends plain s3()/iceberg() and passes
 object_storage_cluster as a query setting so the remote can resolve or fall back (OSC may be unknown locally).
 )", EXPERIMENTAL) \
+    DECLARE(UInt64, object_storage_cluster_local_read_max_files, 0, R"(
+Read an object-storage cluster query on the initiator when listing finishes with at most this many files.
+`0` disables the check and always uses the cluster when it has nodes.
+The check runs while planning, before cluster connections are opened. It stops once it has seen more files than this limit, or once `object_storage_cluster_local_read_probe_ms` elapses, and then keeps the distributed read.
+It counts files after the filter known at planning time. A filter pushed later can only remove more files, so a query that is classified as local stays local.
+Does not apply to `object_storage_remote_initiator` or to writes.
+)", EXPERIMENTAL) \
+    DECLARE(UInt64, object_storage_cluster_local_read_probe_ms, 50, R"(
+Time budget, in milliseconds, for deciding `object_storage_cluster_local_read_max_files`.
+`0` means no limit. If the budget runs out before the file list ends, the query stays on the cluster.
+)", EXPERIMENTAL) \
     DECLARE(UInt64, object_storage_max_nodes, 0, R"(
 Limit for hosts used for request in object storage cluster table functions - azureBlobStorageCluster, s3Cluster, hdfsCluster, etc.
 Possible values:

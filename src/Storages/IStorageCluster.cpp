@@ -658,6 +658,15 @@ void IStorageCluster::read(
 {
     updateBeforeRead(context);
 
+    /// `getQueryProcessingStage` already returned `FetchColumns` for this decision, so the plan above
+    /// this read is the local one. A distributed plan must not be replaced by a local column scan.
+    if (query_info.object_storage_cluster_read_locally == true
+        && processed_stage == QueryProcessingStage::Enum::FetchColumns)
+    {
+        readFallBackToPure(query_plan, column_names, storage_snapshot, query_info, context, processed_stage, max_block_size, num_streams);
+        return;
+    }
+
     if (!isClusterSupported())
     {
         readFallBackToPure(query_plan, column_names, storage_snapshot, query_info, context, processed_stage, max_block_size, num_streams);

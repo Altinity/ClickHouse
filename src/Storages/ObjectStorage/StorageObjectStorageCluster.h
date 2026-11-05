@@ -224,6 +224,22 @@ private:
 
     bool usesObjectStorageClusterSettingSyntax() const override { return !cluster_name_from_function_argument; }
 
+    /// Same iterator the cluster task distributor uses, without opening cluster connections.
+    ObjectIterator createObjectIteratorForRead(
+        const ActionsDAG::Node * predicate,
+        const ActionsDAG * filter,
+        const ContextPtr & local_context,
+        StorageMetadataPtr storage_metadata_snapshot,
+        bool tasks_go_to_other_replicas,
+        bool emit_profile_events) const;
+
+    /// True when the pruned file list ends with at most `object_storage_cluster_local_read_max_files` files
+    /// inside `object_storage_cluster_local_read_probe_ms`. Anything unfinished stays on the cluster.
+    bool isSmallEnoughForLocalRead(
+        const ContextPtr & context,
+        const StorageSnapshotPtr & storage_snapshot,
+        const SelectQueryInfo & query_info) const;
+
     /*
     In case the table was created with `object_storage_cluster` setting,
     modify the AST query object so that it uses the table function implementation

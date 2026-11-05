@@ -9,6 +9,7 @@
 #include <QueryPipeline/StreamLocalLimits.h>
 
 #include <memory>
+#include <optional>
 
 namespace DB
 {
@@ -217,6 +218,12 @@ struct SelectQueryInfo
 
     /// For IStorageSystemOneBlock
     std::vector<UInt8> columns_mask;
+
+    /// Decision of `object_storage_cluster_local_read_max_files`, shared by `getQueryProcessingStage` and `read`.
+    /// `true` — the file list ended within the threshold, read on the initiator.
+    /// `false` — the probe stopped early, keep the distributed read.
+    /// Unset — the probe did not run.
+    std::optional<bool> object_storage_cluster_read_locally;
 
     bool isFinal() const;
 
