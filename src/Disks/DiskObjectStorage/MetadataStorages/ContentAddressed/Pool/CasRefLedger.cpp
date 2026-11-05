@@ -3755,7 +3755,9 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         int code;
         String cause;
     };
-    /// A precommit binding is never published as a part; a promotion can come back after a restart.
+    /// A precommit binding is never published as a part. What a durable promotion means to the table
+    /// depends on the engine (`MergeTree` activates it at restart, `ReplicatedMergeTree` detaches it as
+    /// unexpected), which this layer cannot see, so the text claims only that the write may take effect.
     /// The chunk can mix kinds, so every waiter gets the text of its own step.
     const auto fail_durable_unconfirmed = [&](const DurableUnconfirmed & failure)
     {
@@ -3772,13 +3774,11 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
             }
             else
             {
-                const std::string_view promote_note = item->kind == RootMutationKind::Promote
-                    ? " (a promoted part returns after a restart that precedes part cleanup)" : "";
                 complete_error(one, std::make_exception_ptr(Exception(failure.code,
                     "CAS ref-log txn {}-{} for namespace '{}' is durable but was not acknowledged ({}); the "
-                    "next ref-log recovery installs it, so the write may still take effect{} and a retry may "
+                    "next ref-log recovery installs it, so the write may still take effect and a retry may "
                     "duplicate it",
-                    id.writer_epoch, id.ref_sequence, ns.string(), failure.cause, promote_note)));
+                    id.writer_epoch, id.ref_sequence, ns.string(), failure.cause)));
             }
         }
     };

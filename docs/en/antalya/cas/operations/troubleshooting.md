@@ -50,7 +50,7 @@ lost lease, self-remount supersession, terminal-lane `INVALID_STATE`) carry no p
 |---|---|---|
 | `nothing is durable, so a retry cannot duplicate this transaction` | The store refused the write, or it was refused before any request was sent | Cannot duplicate this transaction. See the deduplication note below |
 | `outcome is unknown` | A request may have been sent and nothing settled its result. The append lane stays wedged until the same key resolves, unless the resolution finds a foreign object, which faults the lane and schedules a remount | May duplicate: this write may still take effect. For a blocked write, "it" is the earlier write, which may be this client's own earlier attempt; the blocked write itself was not attempted |
-| `is durable but was not acknowledged` | It landed (named as `txn <epoch>-<seq>`), then a later step failed: the `_ckpt` frontier publish, the mount fence, or the install admission. The next ref-log recovery installs it | May duplicate: the write may still take effect. For a promoted part, a restart before part cleanup drops the ref brings the rows back |
+| `is durable but was not acknowledged` | It landed (named as `txn <epoch>-<seq>`), then a later step failed: the `_ckpt` frontier publish, the mount fence, or the install admission. The next ref-log recovery installs it | May duplicate: the write may still take effect. What a promoted part becomes at a restart before part cleanup drops the ref depends on the engine; see below |
 | `is durable but was not acknowledged` together with `the part is never published` | The same failure, at the precommit step of an `INSERT`. Recovery installs the precommit binding, which is later removed; the part never appears | The rows do not appear. Within `non_replicated_deduplication_window` a retry of the same block is skipped as a duplicate (see the deduplication note below), so the rows are lost |
 
 Scope: an `INSERT` that spans several partitions commits one part at a time. Earlier parts stay
@@ -59,8 +59,13 @@ the whole query is duplicate-free.
 
 For an `INSERT` in the last two rows, the part is rolled back in memory, so a `SELECT` right after
 the error does not show its rows. If a promotion landed and the server restarts before part
-cleanup drops the ref, the rows appear. A failure at the precommit step never publishes the part,
-and its message says so.
+cleanup drops the ref, the engine decides what the part becomes. `MergeTree` loads it as active,
+and its rows appear. `ReplicatedMergeTree` makes the part durable before registering it in Keeper
+(`MergeTreeData::Transaction::renameParts` runs before the Keeper multi), so the part has no
+Keeper entry: at startup it is an unexpected part and is moved to `detached/ignored_<part>`. Its
+rows do not appear, and because the block id never reached Keeper a retry is not deduplicated; it
+lands a second copy only if the detached part is later attached by hand. A failure at the
+precommit step never publishes the part, and its message says so.
 
 `non_replicated_deduplication_window` does not make these retries safe. `MergeTree` writes the
 block id to the deduplication log before the CAS commit and does not remove it when the commit

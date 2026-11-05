@@ -1627,7 +1627,8 @@ TEST(CASRefWriterAppendLane, DurableUnconfirmedTextNamesPrecommitAndPromoteApart
     EXPECT_NE(precommit_message.find("never published"), String::npos) << precommit_message;
     EXPECT_EQ(precommit_message.find("may still take effect"), String::npos) << precommit_message;
     EXPECT_NE(promote_message.find("is durable but was not acknowledged"), String::npos) << promote_message;
-    EXPECT_NE(promote_message.find("restart"), String::npos) << promote_message;
+    EXPECT_NE(promote_message.find("may still take effect"), String::npos) << promote_message;
+    EXPECT_EQ(promote_message.find("restart"), String::npos) << promote_message;
     EXPECT_EQ(promote_message.find("never published"), String::npos) << promote_message;
 }
 
