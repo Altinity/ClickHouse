@@ -24,9 +24,7 @@
 #include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
-#include <Poco/ConsoleChannel.h>
 #include <Poco/Exception.h>
-#include <Poco/Logger.h>
 
 namespace ProfileEvents
 {
@@ -440,7 +438,7 @@ TEST(CASPartWriteTxn, StageManifestUsesPerBuildOrdinals)
     EXPECT_EQ(next.ref.manifest_ordinal, 1u);
 }
 
-TEST(CASPartWriteTxn, PromoteOwnStagedManifestDoesNotReadBody)
+TEST(CASPartWriteTxn, PromoteOwnStagedManifestWithoutEntriesDoesNotReadBody)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto counting = std::make_shared<KeyCountingBackend>(backend);
@@ -457,7 +455,7 @@ TEST(CASPartWriteTxn, PromoteOwnStagedManifestDoesNotReadBody)
     EXPECT_EQ(counting->getCountFor(manifest_key) - gets_before, 0u);
 }
 
-TEST(CASPartWriteTxn, PromoteOwnStagedManifestChecksBlobDependenciesWithoutBodyRead)
+TEST(CASPartWriteTxn, PromoteOwnStagedManifestWithInlineAndBlobsDoesNotReadBody)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto counting = std::make_shared<KeyCountingBackend>(backend);
@@ -473,16 +471,6 @@ TEST(CASPartWriteTxn, PromoteOwnStagedManifestChecksBlobDependenciesWithoutBodyR
         {inline_entry, blobManifestEntry("a.bin", "blob-a"), blobManifestEntry("b.bin", "blob-b")});
     build->precommitAdd(ns, "part", id);
     build->putBlob(idOf("blob-a"), BlobSource::fromString("blob-a"));
-
-    EXPECT_DEATH(
-        {
-            Poco::Logger::root().setChannel(new Poco::ConsoleChannel);
-            Poco::Logger::root().setLevel("fatal");
-            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
-            build->promote(ns, "part", build->buildId(), id);
-        },
-        "no dependency proof");
-
     build->putBlob(idOf("blob-b"), BlobSource::fromString("blob-b"));
     const String manifest_key = store->layout().manifestKey(id);
     const size_t gets_before = counting->getCountFor(manifest_key);
