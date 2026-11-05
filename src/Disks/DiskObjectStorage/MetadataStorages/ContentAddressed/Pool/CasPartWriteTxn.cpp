@@ -616,9 +616,9 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
             "stageManifest: manifest ordinal cap {} exceeded for build_seq {}", kMaxManifestOrdinal, build_seq);
     const ManifestRef ref{epoch, build_seq, next_manifest_ordinal++};
 
-    /// Build the body. payload_digest is integrity/debug only — never a key, never dedup, never
-    /// in-degree. The body repeats its own ref + namespace for fail-closed RefMatchesBody /
-    /// ManifestNamespaceMatches at read/fold/promote time.
+    /// Build the body. `payload_digest` is integrity/debug only: never a key, dedup input, or in-degree.
+    /// Repeating `ref` and `root_namespace_id` lets readers and GC folds validate `refMatchesBody` and
+    /// `manifestNamespaceMatches`.
     const RootNamespace owning_ns = manifestNamespace();
     PartManifest body;
     body.ref = ref;
@@ -760,6 +760,10 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
             /// for an already-owned manifest would violate "no conflicting owner may name the same
             /// manifest", which the state machine enforces for every OTHER case.
             ///
+            /// Keep the committed-match check and the staging-membership guard in this closure.
+            /// A separate resolve could observe a committed match, then race with a repoint or drop
+            /// before the append. Both decisions must use the same `state` so a stale observation
+            /// cannot grant fresh ownership to a foreign manifest id.
             if (const auto it = state.getCommitted().find(final_ref_name);
                 it != state.getCommitted().end() && it->second.manifest_ref == manifest_id.ref)
                 return {};
@@ -847,6 +851,10 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
     /// may not.
     commit_state = CommitState::Uncertain;
     store->appendRefOps(target_ns, MutationScope::ref(final_ref_name),
+        /// Own the inputs and `blob_refs` in the closure. `this` supplies dependency proofs;
+        /// `repoint_old` and `created` are outputs read after `appendRefOps` returns.
+        /// The ref-lane leadership guard completes or removes queued items on every exit, so these
+        /// borrowed references cannot be used after this frame unwinds.
         [this, final_ref_name, manifest_id, promote_build_id, policy,
          blob_refs = std::move(manifest_blob_refs), &repoint_old, &created]
         (const RefTableState & state) -> std::vector<RefOp>

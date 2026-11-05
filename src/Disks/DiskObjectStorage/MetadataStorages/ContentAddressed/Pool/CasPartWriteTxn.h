@@ -202,12 +202,17 @@ public:
     /// Mint a root-local part `ManifestId`, write its body under
     /// `cas/manifests/<ns>/<writer_epoch>/<build_sequence>/000001.zst` via the pool's shared request
     /// controller. It uses budgeted attempts with resolve-before-reissue and performs no preliminary HEAD,
-    /// because `manifest_ordinal` is monotone within this build. It enforces manifest-size caps before the body
-    /// write returns and therefore before any owner transition is published. The body is not retained after a
-    /// successful write; on retry the caller re-stages from source. Every call uses a fresh manifest ordinal.
+    /// because `manifest_ordinal` is monotone within this build. Entry paths and manifest-size caps are
+    /// validated before the body write. After a successful write, the confirmed incarnation and `blob_refs`
+    /// are retained for `promote`; the body itself is not retained. On retry the caller re-stages from source.
+    /// Every call uses a fresh manifest ordinal.
     /// The id is recorded for best-effort `abandon` cleanup.
     ManifestId stageManifest(std::vector<ManifestEntry> entries);
 
+    /// Add the precommit owner intent with one `appendRefOps` call. Its `OwnerTransition` binds
+    /// `(final_ref_name, manifest_id.ref)` as `Precommit` in the ref log. There is no separate
+    /// `_precommits` namespace and no body `HEAD`.
+    ///
     /// A3 mint-tightening: `manifest_id` must either be one THIS transaction minted via `stageManifest`, or
     /// already be `final_ref_name`'s current committed manifest (the idempotent re-drive -- see the
     /// closure in the .cpp). Any other id names a manifest this transaction never staged and does not
@@ -219,6 +224,15 @@ public:
 
     /// Atomically promote the precommit to the committed ref with one `appendRefOps` call on the target ref's
     /// ref-log entry.
+    /// `manifest_id` must have been staged by this `PartWriteTxn`. Its retained `StagedManifest` supplies
+    /// `blob_refs` without a body `GET`; missing staging evidence throws `LOGICAL_ERROR` before the append.
+    /// Inside the append closure, an already committed own manifest is a no-op. Otherwise, check the
+    /// expected committed binding and live precommit, then require a dependency proof for every `BlobRef`.
+    /// `Materialized` leaves rely on the precommit edge; `TrustedManifest` leaves rely on the source
+    /// manifest edge. Neither needs a per-blob probe here. Missing ownership throws `NETWORK_ERROR`;
+    /// missing or invalid dependency proofs throw `LOGICAL_ERROR`.
+    /// Commit one `Precommit` to `Committed` owner move with `SetPublishedAt`; promotion emits no blob deltas.
+    ///
     /// PROCESS-RESTART INVARIANT: a `PartWriteTxn` is a plain in-memory C++ object owned by the wiring's
     /// `ContentAddressedTransaction` — it is NEVER persisted and NEVER resumed across a process
     /// restart. There is no "replay a precommit" code path anywhere in the core: `promote` is called
@@ -370,6 +384,10 @@ private:
 
     std::vector<ManifestId> staged_manifests;             /// for best-effort abandon cleanup
 
+    /// Confirmed staging records, inserted by `stageManifest` before it returns the manifest id.
+    /// Membership is the source of fresh ownership in `precommitAdd` and is required by `promote`.
+    /// Retain records for this build's lifetime, including after `promote`, so repeated promotion stays
+    /// idempotent. Keep this ownership evidence separate from the `staged_manifests` cleanup list.
     std::map<ManifestId, const StagedManifest> staged_manifest_ids;
 
     std::map<DepKey, BlobDepRecord> deps;                 /// dependencies recorded by this build (blobs only)

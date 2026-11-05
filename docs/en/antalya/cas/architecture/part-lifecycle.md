@@ -53,7 +53,7 @@ sequenceDiagram
     end
     PW->>PW: merge upload results on the owning thread, one no-throw swap
     TX->>PW: promote
-    PW->>PW: validate the staged manifest record and blob dependencies
+    PW->>PW: validate the staged manifest record and blob dependency proofs
     PW->>S3: append ref-log txn: retire old committed, Precommit to Committed, SetPublishedAt
     Note over PW: commit durable, then retire the build sequence
     end
@@ -96,8 +96,8 @@ blob I/O. Pool size is the
 server setting `cas_blob_upload_pool_size` (default 16).
 
 **Step 4 — `promote`.** Uses the in-memory record produced by this `PartWriteTxn`'s successful
-conditional create: the confirmed object incarnation and blob dependencies. A missing record is an
-invariant violation and raises `LOGICAL_ERROR` before the append. There is no manifest `GET`.
+conditional create: the confirmed object incarnation and blob references (`blob_refs`). A missing
+record is an invariant violation and raises `LOGICAL_ERROR` before the append. There is no manifest `GET`.
 Promotion then sets the commit state to `Uncertain` before the append — past that point, failure
 is no longer proof of the negative — checks that the precommit is still the live owner, and
 validates explicit dependency proofs.

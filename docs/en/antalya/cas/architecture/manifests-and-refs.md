@@ -56,20 +56,21 @@ the **same** blobs and moves the ref in one ref-log record — a repoint, covere
 [part-lifecycle page](/antalya/cas/architecture/part-lifecycle#repoint).
 
 The writer retains a compact record after its own successful `stageManifest`: the confirmed object
-incarnation and the blob dependencies in the order the caller passed the entries. The encoded body
-sorts entries by path, so this order can differ from a decoded body. Only the order of dependency
-checks and `BlobReuseAdopt` events depends on it. The matching `promote` requires this record and
+incarnation and the blob references (`blob_refs`) in the order the caller passed the entries.
+The encoded body sorts entries by path, so this order can differ from a decoded body. Only the
+order of dependency checks and `BlobReuseAdopt` events depends on it. The matching `promote` requires this record and
 never reads the immutable body back. A manifest not staged by that `PartWriteTxn` is an invariant
 violation: `promote` raises `LOGICAL_ERROR` before the ref-log append, even if another transaction
 already committed that manifest. Repeating `promote` on the same `PartWriteTxn` for its own
 already committed manifest remains an idempotent no-op.
 
-The record only shows that the body existed when the conditional create was confirmed. Inside the
-protocol nothing deletes it before `promote`: the orphan sweep does not touch the prefix of a
-build sequence that is still active. A body removed outside the protocol (a bucket lifecycle or
-expiry rule on `cas/manifests/`, a manual delete) is not detected by `promote`, which commits the
-ref anyway. The read path then fails with `FILE_DOESNT_EXIST`, and `fsck` reports the reference
-as dangling. Do not put lifecycle or expiry rules on the pool prefix.
+The record only shows that the body existed when the conditional create was confirmed. It is not
+a fresh existence check or proof of GC protection. If the body is removed after staging, `promote`
+does not detect that removal and can still commit the ref. This also applies to external deletion
+by a bucket lifecycle rule, expiry rule, or manual operation. A backend read of the missing body
+raises `FILE_DOESNT_EXIST`; a manifest decode cache hit can delay detection. `fsck` reports a
+dangling reference when it confirms that the body is absent and the ref still names it.
+Do not put lifecycle or expiry rules on the pool prefix.
 
 ## Manifest lifecycle and the orphan sweep {#manifest-lifecycle}
 
