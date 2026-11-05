@@ -8,6 +8,8 @@ class AltinityWorkflowTemplates:
   AZURE_CONTAINER_NAME: ${{{{ secrets.AZURE_CONTAINER_NAME }}}}
   AZURE_STORAGE_ACCOUNT_URL: "https://${{{{ secrets.AZURE_ACCOUNT_NAME }}}}.blob.core.windows.net/"
   ROBOT_TOKEN: ${{{{ secrets.ROBOT_TOKEN }}}}
+  HETZNER_S3_ACCESS_KEY: ${{{{ secrets.HETZNER_S3_ACCESS_KEY }}}}
+  HETZNER_S3_SECRET_KEY: ${{{{ secrets.HETZNER_S3_SECRET_KEY }}}}
 """
     # Additional pre steps for all jobs
     JOB_SETUP_STEPS = """
