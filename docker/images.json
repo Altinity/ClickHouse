@@ -122,11 +122,6 @@
             "docker/test/unit"
          ]
     },
-    "docker/test/integration/kerberized_hadoop": {
-        "only_amd64": true,
-        "name": "altinityinfra/kerberized-hadoop",
-        "dependent": []
-    },
     "docker/test/server-jepsen": {
         "name": "altinityinfra/server-jepsen-test",
         "dependent": []
