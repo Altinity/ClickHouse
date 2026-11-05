@@ -1,4 +1,10 @@
+import json
+import os
+import re
+
 from helpers.export_partition_helpers import (
+    MINIO_PASS,
+    MINIO_USER,
     make_iceberg_s3,
     make_source,
     unique_suffix,
@@ -46,6 +52,17 @@ def test_export_partition_to_iceberg(cluster, source_engine):
     assert result == "1\t2020\n2\t2020\n3\t2020", (
         f"Unexpected data in Iceberg table:\n{result}"
     )
+
+    # The commit must append the metadata file it replaces to `metadata-log`.
+    rows = node.query(
+        f"SELECT _file, raw FROM s3('http://minio1:9001/root/data/{iceberg_table}/metadata/*.metadata.json', "
+        f"'{MINIO_USER}', '{MINIO_PASS}', 'RawBLOB', 'raw String') FORMAT JSONEachRow"
+    ).strip().split("\n")
+    metadata_files = sorted(
+        (json.loads(row) for row in rows), key=lambda row: int(re.match(r"v(\d+)", row["_file"]).group(1))
+    )
+    metadata_log = json.loads(metadata_files[-1]["raw"])["metadata-log"]
+    assert os.path.basename(metadata_log[-1]["metadata-file"]) == metadata_files[-2]["_file"], metadata_log
 
 
 def test_export_two_partitions_to_iceberg(cluster, source_engine):
