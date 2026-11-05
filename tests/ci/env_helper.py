@@ -15,6 +15,7 @@ TEMP_PATH = os.getenv("TEMP_PATH", p.abspath(p.join(module_dir, "./tmp")))
 REPORT_PATH = f"{TEMP_PATH}/reports"
 # FIXME: latest should not be used in CI, set temporary for transition to "docker with digest as a tag"
 DOCKER_TAG = os.getenv("DOCKER_TAG", "latest")
+DOCKER_PASSWORD = os.getenv("DOCKER_PASSWORD")
 CACHES_PATH = os.getenv("CACHES_PATH", TEMP_PATH)
 CLOUDFLARE_TOKEN = os.getenv("CLOUDFLARE_TOKEN")
 GITHUB_EVENT_PATH = os.getenv("GITHUB_EVENT_PATH", "")
@@ -28,15 +29,21 @@ IMAGES_PATH = os.getenv("IMAGES_PATH", TEMP_PATH)
 REPO_COPY = os.getenv("REPO_COPY", GITHUB_WORKSPACE)
 RUNNER_TEMP = os.getenv("RUNNER_TEMP", p.abspath(p.join(module_dir, "./tmp")))
 S3_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
-S3_BUILDS_BUCKET = os.getenv("S3_BUILDS_BUCKET", "altinity-build-artifacts")
+S3_ARTIFACT_BUCKET = os.getenv("S3_ARTIFACT_BUCKET")
+S3_BUILDS_BUCKET = os.getenv("S3_BUILDS_BUCKET") or S3_ARTIFACT_BUCKET
 S3_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-S3_TEST_REPORTS_BUCKET = os.getenv("S3_TEST_REPORTS_BUCKET", "altinity-build-artifacts")
+S3_TEST_REPORTS_BUCKET = os.getenv("S3_TEST_REPORTS_BUCKET") or S3_ARTIFACT_BUCKET
 S3_URL = os.getenv("S3_URL", "https://s3.amazonaws.com")
 S3_DOWNLOAD = os.getenv("S3_DOWNLOAD", S3_URL)
 S3_ARTIFACT_DOWNLOAD_TEMPLATE = (
     f"{S3_DOWNLOAD}/{S3_BUILDS_BUCKET}/"
     "{pr_or_release}/{commit}/{build_name}/{artifact}"
 )
+CLICKHOUSE_TEST_STAT_LOGIN = os.getenv("CLICKHOUSE_TEST_STAT_LOGIN")
+CLICKHOUSE_TEST_STAT_PASSWORD = os.getenv("CLICKHOUSE_TEST_STAT_PASSWORD")
+CLICKHOUSE_TEST_STAT_URL = os.getenv("CLICKHOUSE_TEST_STAT_URL")
+DOCKER_PASSWORD = os.getenv("DOCKER_PASSWORD")
+ROBOT_TOKEN = os.getenv("ROBOT_TOKEN")
 
 # These parameters are set only on demand, and only once
 _GITHUB_JOB_ID = ""
