@@ -813,19 +813,9 @@ void optimizeTreeSecondPass(
     {
         traverseQueryPlan(stack, root, [&](auto & frame_node) { tryOptimizeGroupByTopK(&frame_node, nodes, extra_settings); });
     }
-<<<<<<< HEAD
-=======
-
-    /// Runs behind every rewrite of the HAVING filter it reads, and behind the pass above, whose `top_k` it refuses.
-    if (optimization_settings.aggregation_having_prefilter)
-    {
-        traverseQueryPlan(
-            stack, root, [&](auto & frame_node) { tryPushHavingPrefilterIntoAggregation(&frame_node, nodes, extra_settings); });
-    }
 
     /// Last: it reads the final consumers of every remote read.
     allowReadingShardsFromSeveralReplicas(root);
->>>>>>> 22a323d93d6 (Merge pull request #128865 from groeneai/offset-parallel-replicas-ordered-merges)
 }
 
 void addStepsToBuildSets(

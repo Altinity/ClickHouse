@@ -869,15 +869,9 @@ void ReadFromRemote::addPipe(
         //     connect to instantiates the coordinator which manages the reading on the whole shard and
         //     returns the result of the shard, so several connections mean several coordinators;
         //   * with parallel replicas disabled, or not applicable for any other reason (e.g. by
-<<<<<<< HEAD
         //     `automatic_parallel_replicas_mode` or `parallel_replicas_only_with_analyzer`), a replica
         //     just executes the query over all of its data.
-        if (context->canUseOffsetParallelReplicas())
-=======
-        //     `automatic_parallel_replicas_mode`), a replica just executes the query over all of its
-        //     data.
         if (context->canUseOffsetParallelReplicas() && allow_reading_shard_from_several_replicas)
->>>>>>> 22a323d93d6 (Merge pull request #128865 from groeneai/offset-parallel-replicas-ordered-merges)
             remote_query_executor->setPoolMode(PoolMode::GET_MANY);
         else
             remote_query_executor->setPoolMode(PoolMode::GET_ONE);
@@ -910,22 +904,10 @@ Pipes ReadFromRemote::addPipes(const ClusterProxy::SelectStreamFactory::Shards &
 
 void ReadFromRemote::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
 {
-<<<<<<< HEAD
-    Pipes pipes = addPipes(shards, output_header);
-=======
     if (context->canUseOffsetParallelReplicas() && !allow_reading_shard_from_several_replicas)
         LOG_DEBUG(log, "Reading every shard from one replica, the consumers of the read may depend on the order of its streams");
 
-    Pipes pipes = addPipes(shards, output_header, unavailable_shard_tracker);
-
-    /// One pipe per executor, so the built pipes are this query's complete unit count.
-    if (unavailable_shard_tracker)
-    {
-        if (pipes.size() > shards.size())
-            unavailable_shard_tracker->registerExtraUnits(pipes.size() - shards.size());
-        unavailable_shard_tracker->seal();
-    }
->>>>>>> 22a323d93d6 (Merge pull request #128865 from groeneai/offset-parallel-replicas-ordered-merges)
+    Pipes pipes = addPipes(shards, output_header);
 
     auto pipe = Pipe::unitePipes(std::move(pipes));
 
