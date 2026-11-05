@@ -214,13 +214,14 @@ removes that churn, with no measured cost.
 
 ## Advanced GC pacing settings {#advanced-gc-pacing-settings}
 
-These settings bound individual phases of a `GC` round. The first two accept any `UInt64` value;
-for the remaining caps, `0` means unbounded.
+These settings control the schedule and work limits of a `GC` round. For per-round caps, `0` means
+unbounded unless the table states otherwise.
 
 | Setting | Default | Bounds | Description |
 |---|---|---|---|
-| `cas_manifest_sweep_list_budget_keys` | `1000` | `UInt64` | Orphan-manifest sweep `LIST` budget per round |
-| `cas_manifest_sweep_delete_budget_keys` | `100` | `UInt64` | Orphan-manifest sweep `DELETE` budget per round |
+| `cas_orphan_manifest_sweep_interval_sec` | `3600` | `UInt64` | Minimum wait after a completed orphan-manifest traversal before starting another; `0` means no wait |
+| `cas_manifest_sweep_list_budget_keys` | `1000` | `UInt64` | Orphan-manifest sweep `LIST` budget per permitted round; `0` pauses the traversal without losing its cursor |
+| `cas_manifest_sweep_delete_budget_keys` | `100` | `UInt64` | Orphan-manifest sweep candidate budget per page; `0` lists without nominating deletions |
 | `cas_gc_bulk_delete_chunk_keys` | `1000` | `1`–`1000` | Most keys per batch delete request in GC's write-once families (owner-removed manifest bodies, covered ref logs and snapshots, the namespace janitor's dead ref logs and snapshots), capped by the storage's batch-delete limit |
 | `cas_gc_round_graduation_budget` | `5000` | `0` = unbounded | Blob-graduation (`condemned` → `delete_pending`) cohort cap per round |
 | `cas_gc_round_redelete_budget` | `5000` | `0` = unbounded | Exact-token re-delete cohort cap for prior `delete_pending` rows per round |
@@ -230,6 +231,24 @@ for the remaining caps, `0` means unbounded.
 | `cas_gc_round_prefix_wholesale_budget` | `20000` | `0` = unbounded | Generation-prefix wholesale-delete object cap during pruning per round |
 | `cas_gc_round_handoff_prefix_wholesale_budget` | `5000` | `0` = unbounded | Post-`CAS` hand-off generation-prefix reclaim cap per round, reserved separately so pruning cannot starve the one-shot hand-off |
 | `cas_gc_round_outcome_entry_budget` | `5000` | `0` = unbounded | `GcOutcomes` entry cap across the re-delete/spared audit log per round |
+
+### Orphan-manifest sweep schedule {#orphan-manifest-sweep-schedule}
+
+The first eligible traversal starts without waiting. Once started, it continues in bounded pages
+without waiting for `cas_orphan_manifest_sweep_interval_sec` between successful pages. The interval
+starts after the traversal's completion is committed. Completion means reaching the end of the key
+space, not that every later manifest-body deletion succeeded. Repeated `SYSTEM CAS GC RUN` commands
+respect the same schedule. Setting the interval to `0` allows another traversal on the next eligible
+round; setting the `LIST` budget to `0` pauses progress.
+
+When destructive work is suppressed, the traversal's cursor and timestamps remain unchanged.
+After a suppressed fold is committed, idle retries on that same generation use the existing bounded
+fold cadence: up to eight deferred invocations by default, then another fold. Ref-log changes and
+due blob graduation can force a fold sooner. A new leader may make an immediate attempt. These retry
+controls are internal `PoolConfig` fields, not additional disk settings.
+
+Normal blob reclamation and cleanup of manifests whose owners were removed keep their own GC rules;
+the hourly interval applies to the orphan-manifest traversal.
 
 ## Migration from unprefixed keys {#migration-from-unprefixed-keys}
 
