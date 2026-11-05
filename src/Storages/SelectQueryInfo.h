@@ -38,6 +38,8 @@ using ClusterPtr = std::shared_ptr<Cluster>;
 class PlannerContext;
 using PlannerContextPtr = std::shared_ptr<PlannerContext>;
 
+struct ObjectStorageClusterReadProbe;
+
 class PreparedSets;
 using PreparedSetsPtr = std::shared_ptr<PreparedSets>;
 
@@ -224,6 +226,10 @@ struct SelectQueryInfo
     /// `false` — the probe stopped early, keep the distributed read.
     /// Unset — the probe did not run.
     std::optional<bool> object_storage_cluster_read_locally;
+
+    /// Iterator and files the probe already produced. Shared so a copied `SelectQueryInfo` (a plan step)
+    /// still reads the same objects instead of listing them again.
+    std::shared_ptr<ObjectStorageClusterReadProbe> object_storage_cluster_read_probe;
 
     bool isFinal() const;
 

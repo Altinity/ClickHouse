@@ -59,7 +59,8 @@ public:
         const ActionsDAG * filter,
         const ContextPtr & context,
         ClusterPtr cluster,
-        StorageMetadataPtr storage_metadata_snapshot) const override;
+        StorageMetadataPtr storage_metadata_snapshot,
+        ObjectIterator probed_iterator = {}) const override;
 
     String getPathSample(ContextPtr context);
 
@@ -235,10 +236,11 @@ private:
 
     /// True when the pruned file list ends with at most `object_storage_cluster_local_read_max_files` files
     /// inside `object_storage_cluster_local_read_probe_ms`. Anything unfinished stays on the cluster.
+    /// The iterator and the objects it already returned are stored on `query_info` for the read that follows.
     bool isSmallEnoughForLocalRead(
         const ContextPtr & context,
         const StorageSnapshotPtr & storage_snapshot,
-        const SelectQueryInfo & query_info) const;
+        SelectQueryInfo & query_info) const;
 
     /*
     In case the table was created with `object_storage_cluster` setting,

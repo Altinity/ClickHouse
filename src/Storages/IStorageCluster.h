@@ -11,6 +11,8 @@ namespace DB
 class Cluster;
 using ClusterPtr = std::shared_ptr<Cluster>;
 
+struct IObjectIterator;
+
 
 /**
  *  Base cluster for Storages used in table functions like s3Cluster and hdfsCluster.
@@ -43,12 +45,15 @@ public:
     ClusterPtr getCluster(ContextPtr context) const { return getClusterImpl(context, cluster_name); }
 
     /// Query is needed for pruning by virtual columns (_file, _path)
+    /// `probed_iterator`, when set, is the local-read probe's iterator with the files it already
+    /// returned replayed first. Callers that did not probe pass null and the storage lists from scratch.
     virtual RemoteQueryExecutor::Extension getTaskIteratorExtension(
         const ActionsDAG::Node * predicate,
         const ActionsDAG * filter_actions_dag,
         const ContextPtr & context,
         ClusterPtr cluster,
-        StorageMetadataPtr storage_metadata_snapshot) const
+        StorageMetadataPtr storage_metadata_snapshot,
+        std::shared_ptr<IObjectIterator> probed_iterator = {}) const
         = 0;
 
     QueryProcessingStage::Enum getQueryProcessingStage(ContextPtr, QueryProcessingStage::Enum, const StorageSnapshotPtr &, SelectQueryInfo &) const override;

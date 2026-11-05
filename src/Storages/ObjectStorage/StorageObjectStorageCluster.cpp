@@ -737,7 +737,7 @@ ObjectIterator StorageObjectStorageCluster::createObjectIteratorForRead(
 bool StorageObjectStorageCluster::isSmallEnoughForLocalRead(
     const ContextPtr & context,
     const StorageSnapshotPtr & storage_snapshot,
-    const SelectQueryInfo & query_info) const
+    SelectQueryInfo & query_info) const
 {
     const auto & settings = context->getSettingsRef();
     const UInt64 max_files = settings[Setting::object_storage_cluster_local_read_max_files];
@@ -746,16 +746,19 @@ bool StorageObjectStorageCluster::isSmallEnoughForLocalRead(
     const ActionsDAG * filter = query_info.filter_actions_dag.get();
     const ActionsDAG::Node * predicate = (filter && !filter->getOutputs().empty()) ? filter->getOutputs().front() : nullptr;
 
+    /// `tasks_go_to_other_replicas` is set before the first `next`, so iceberg objects already carry the
+    /// external-storage check the cluster distributor needs. Profile events fire here once; the read reuses
+    /// these objects and does not list them again.
     auto iterator = createObjectIteratorForRead(
         predicate,
         filter,
         context,
         storage_snapshot->metadata,
-        /* tasks_go_to_other_replicas */ false,
-        /* emit_profile_events */ false);
+        /* tasks_go_to_other_replicas */ true,
+        /* emit_profile_events */ true);
 
+    auto probe = std::make_shared<ObjectStorageClusterReadProbe>();
     Stopwatch watch;
-    UInt64 files = 0;
     bool read_locally = false;
     const char * reason = "file count exceeded threshold";
 
@@ -767,27 +770,33 @@ bool StorageObjectStorageCluster::isSmallEnoughForLocalRead(
             break;
         }
 
-        if (!iterator->next(0))
+        auto object = iterator->next(0);
+        if (!object)
         {
             read_locally = true;
+            probe->exhausted = true;
             reason = "file list exhausted";
             break;
         }
 
-        ++files;
-        if (files > max_files)
+        probe->pulled.push_back(std::move(object));
+        if (probe->pulled.size() > max_files)
             break;
     }
+
+    if (!probe->exhausted)
+        probe->iterator = std::move(iterator);
 
     LOG_TRACE(
         getLogger("StorageObjectStorageCluster"),
         "Local-read probe for {} saw {} file(s) (limit {}), read_locally={}, reason={}",
         getStorageID().getNameForLogs(),
-        files,
+        probe->pulled.size(),
         max_files,
         read_locally,
         reason);
 
+    query_info.object_storage_cluster_read_probe = std::move(probe);
     return read_locally;
 }
 
@@ -796,15 +805,22 @@ RemoteQueryExecutor::Extension StorageObjectStorageCluster::getTaskIteratorExten
     const ActionsDAG * filter,
     const ContextPtr & local_context,
     ClusterPtr cluster,
-    StorageMetadataPtr storage_metadata_snapshot) const
+    StorageMetadataPtr storage_metadata_snapshot,
+    ObjectIterator probed_iterator) const
 {
-    auto iterator = createObjectIteratorForRead(
-        predicate,
-        filter,
-        local_context,
-        storage_metadata_snapshot,
-        /* tasks_go_to_other_replicas */ true,
-        /* emit_profile_events */ true);
+    /// The probe already advanced this iterator. Replaying its objects avoids listing the same files again.
+    /// Do not call `setTasksGoToOtherReplicas` here: that flag has to be set before the first `next`.
+    auto iterator = std::move(probed_iterator);
+    if (!iterator)
+    {
+        iterator = createObjectIteratorForRead(
+            predicate,
+            filter,
+            local_context,
+            storage_metadata_snapshot,
+            /* tasks_go_to_other_replicas */ true,
+            /* emit_profile_events */ true);
+    }
 
     std::vector<std::string> ids_of_hosts;
     for (const auto & shard : cluster->getShardsInfo())

@@ -172,6 +172,17 @@ void ReadFromObjectStorageStep::createIterator()
     if (iterator_wrapper)
         return;
 
+    /// The cluster local-read probe already listed these files. `_tags` is not part of that listing
+    /// (`with_tags` is false there), so a query that reads `_tags` lists again.
+    if (!info.requested_virtual_columns.contains("_tags"))
+    {
+        if (auto reused = takeObjectStorageClusterReadProbe(query_info.object_storage_cluster_read_probe, /*for_local_read*/ true))
+        {
+            iterator_wrapper = std::move(reused);
+            return;
+        }
+    }
+
     const ActionsDAG::Node * predicate = nullptr;
     if (filter_actions_dag)
         predicate = filter_actions_dag->getOutputs().at(0);

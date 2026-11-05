@@ -168,7 +168,12 @@ private:
 };
 
 RemoteQueryExecutor::Extension StorageURLCluster::getTaskIteratorExtension(
-    const ActionsDAG::Node * predicate, const ActionsDAG * /* filter */, const ContextPtr & context, ClusterPtr, StorageMetadataPtr metadata) const
+    const ActionsDAG::Node * predicate,
+    const ActionsDAG * /* filter */,
+    const ContextPtr & context,
+    ClusterPtr,
+    StorageMetadataPtr metadata,
+    std::shared_ptr<IObjectIterator> /* probed_iterator */) const
 {
     auto callback = std::make_shared<UrlTaskIterator>(
         uri,

@@ -13,6 +13,7 @@
 #include <Processors/Formats/IInputFormat.h>
 #include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
+#include <mutex>
 
 namespace ProfileEvents
 {
@@ -211,6 +212,109 @@ String ObjectInfo::getIdentifierForPath(const String & path, bool include_file_b
     if (include_file_bucket_info && file_bucket_info)
         result += file_bucket_info->getIdentifier();
     return result;
+}
+
+namespace
+{
+
+void clearUnfetchedObjectMetadata(const ObjectInfoPtr & object)
+{
+    if (!object)
+        return;
+
+    auto & metadata = object->relative_path_with_metadata.metadata;
+    /// `skip_object_metadata` stores a placeholder with `size_bytes == 0`. `createReadBuffer` treats
+    /// any present metadata as a real size, so a local read of that object would return no rows.
+    if (metadata && !metadata->is_fetched)
+        metadata.reset();
+}
+
+class ObjectIteratorWithPrefetchedObjects : public IObjectIterator
+{
+public:
+    ObjectIteratorWithPrefetchedObjects(ObjectInfos pulled_, ObjectIterator remaining_, bool clear_unfetched_metadata_)
+        : pulled(std::move(pulled_))
+        , remaining(std::move(remaining_))
+        , clear_unfetched_metadata(clear_unfetched_metadata_)
+    {
+        if (clear_unfetched_metadata)
+        {
+            for (const auto & object : pulled)
+                clearUnfetchedObjectMetadata(object);
+        }
+    }
+
+    ObjectInfoPtr next(size_t id) override
+    {
+        std::lock_guard lock(mutex);
+        if (index < pulled.size())
+            return pulled[index++];
+
+        if (!remaining)
+            return nullptr;
+
+        auto object = remaining->next(id);
+        if (clear_unfetched_metadata)
+            clearUnfetchedObjectMetadata(object);
+        return object;
+    }
+
+    size_t estimatedKeysCount() override
+    {
+        if (remaining)
+            return remaining->estimatedKeysCount();
+        return pulled.size();
+    }
+
+    std::optional<UInt64> getSnapshotVersion() const override
+    {
+        if (remaining)
+            return remaining->getSnapshotVersion();
+        return std::nullopt;
+    }
+
+    void setEmitProfileEvents(bool value) override
+    {
+        emit_profile_events = value;
+        if (remaining)
+            remaining->setEmitProfileEvents(value);
+    }
+
+    void setTasksGoToOtherReplicas(bool value) override
+    {
+        tasks_go_to_other_replicas = value;
+        if (remaining)
+            remaining->setTasksGoToOtherReplicas(value);
+    }
+
+private:
+    ObjectInfos pulled;
+    size_t index = 0;
+    ObjectIterator remaining;
+    bool clear_unfetched_metadata = false;
+    std::mutex mutex;
+};
+
+ObjectIterator makeReplayingObjectIterator(ObjectInfos pulled, ObjectIterator remaining, bool clear_unfetched_metadata)
+{
+    return std::make_shared<ObjectIteratorWithPrefetchedObjects>(std::move(pulled), std::move(remaining), clear_unfetched_metadata);
+}
+
+}
+
+ObjectIterator takeObjectStorageClusterReadProbe(const std::shared_ptr<ObjectStorageClusterReadProbe> & probe, bool for_local_read)
+{
+    if (!probe || probe->consumed)
+        return nullptr;
+
+    probe->consumed = true;
+
+    ObjectIterator remaining = probe->exhausted ? ObjectIterator{} : std::move(probe->iterator);
+    ObjectInfos pulled = std::move(probe->pulled);
+    probe->iterator.reset();
+    probe->pulled.clear();
+
+    return makeReplayingObjectIterator(std::move(pulled), std::move(remaining), for_local_read);
 }
 
 }
