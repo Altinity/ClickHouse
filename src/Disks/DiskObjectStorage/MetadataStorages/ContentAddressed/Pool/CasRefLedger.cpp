@@ -13,8 +13,10 @@
 #include <Common/logger_useful.h>
 #include <Common/MemoryTracker.h>
 #include <Common/ProfileEvents.h>
+#include <Common/SharedLockGuard.h>
 #include <Common/setThreadName.h>
 #include <Common/ThreadPool.h>
+#include <Common/UniqueLock.h>
 #include <base/sleep.h>
 #include <fmt/format.h>
 #include <algorithm>
@@ -269,6 +271,7 @@ void CasRefLedger::refuseUnlessAdmitted(const CasOperation & op, std::string_vie
 void CasRefLedger::setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_fn)
 {
     mount_requests.setSleepFnForTest(sleep_fn);
+    UniqueLock lock(recovery_retry_sleep_mutex);
     recovery_retry_sleep_fn = [recovery_sleep_fn = std::move(sleep_fn)](
         uint64_t total_ms, const std::optional<DetachedStopToken> &)
     {
@@ -279,6 +282,7 @@ void CasRefLedger::setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_f
 void CasRefLedger::setRefRecoveryRetrySleepForTest(
     std::function<void(uint64_t, const std::optional<DetachedStopToken> &)> sleep_fn)
 {
+    UniqueLock lock(recovery_retry_sleep_mutex);
     recovery_retry_sleep_fn = std::move(sleep_fn);
 }
 
@@ -1645,6 +1649,7 @@ void CasRefLedger::ensureRefTableRecovered(
             /// `state_mutex`) never runs unlocked -- same obligation as the walk's window above.
             try
             {
+                SharedLockGuard sleep_lock(recovery_retry_sleep_mutex);
                 recovery_retry_sleep_fn(backoff_ms, token);
             }
             catch (...)

@@ -10,6 +10,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasDetachedWork.h>
+#include <Common/SharedMutex.h>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -717,7 +718,10 @@ private:
     /// Backoff sleep used by `ensureRefTableRecovered`'s transient-retry loop. Default is an
     /// interruptible slice-sleep (bails early if `fence_ok_fn` drops or detached teardown starts);
     /// `setCasRetrySleepForTest` overrides it (a unit test injects a clock-advancing no-op).
-    std::function<void(uint64_t, const std::optional<DetachedStopToken> &)> recovery_retry_sleep_fn;
+    /// The mutex protects callback replacement by tests while recovery is running.
+    SharedMutex recovery_retry_sleep_mutex;
+    std::function<void(uint64_t, const std::optional<DetachedStopToken> &)> recovery_retry_sleep_fn
+        TSA_GUARDED_BY(recovery_retry_sleep_mutex);
 
     /// One queued append caller. `build_ops` is invoked at most once by the flush leader and returns the
     /// caller's operations rather than mutating storage directly. Completion fields are synchronized by
