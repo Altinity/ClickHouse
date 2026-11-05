@@ -5,6 +5,9 @@ import os
 from os import path as p
 from typing import Tuple
 
+# NOTE (strtgbb): get_robot_token imports this name while env_helper is still loading
+ROBOT_TOKEN = os.getenv("ROBOT_TOKEN")
+
 from build_download_helper import APIException, get_gh_api
 
 module_dir = p.abspath(p.dirname(__file__))
@@ -51,7 +54,6 @@ CLICKHOUSE_TEST_STAT_LOGIN = os.getenv("CLICKHOUSE_TEST_STAT_LOGIN")
 CLICKHOUSE_TEST_STAT_PASSWORD = os.getenv("CLICKHOUSE_TEST_STAT_PASSWORD")
 CLICKHOUSE_TEST_STAT_URL = os.getenv("CLICKHOUSE_TEST_STAT_URL")
 DOCKER_PASSWORD = os.getenv("DOCKER_PASSWORD")
-ROBOT_TOKEN = os.getenv("ROBOT_TOKEN")
 
 # These parameters are set only on demand, and only once
 _GITHUB_JOB_ID = ""
