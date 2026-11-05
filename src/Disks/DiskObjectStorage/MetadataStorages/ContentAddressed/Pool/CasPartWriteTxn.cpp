@@ -760,18 +760,6 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
             /// for an already-owned manifest would violate "no conflicting owner may name the same
             /// manifest", which the state machine enforces for every OTHER case.
             ///
-            /// A3 mint-tightening's enforcement lives HERE, gated on this SAME live-state read, rather
-            /// than unconditionally before the closure: a legitimate re-drive can be handed an id that
-            /// this exact `PartWriteTxn` object never staged (e.g. a fresh build re-precommitting
-            /// content a PRIOR, since-destroyed build already promoted -- `CasPromoteRepublish.
-            /// PromoteSameManifestIsIdempotent`). That case is not a fresh ownership grant: the manifest
-            /// is already `final_ref_name`'s live, currently-protected binding, so re-affirming it
-            /// creates no new ABA surface. Checking membership-or-committed-match atomically under the
-            /// SAME state read (rather than a separate pre-check against a possibly-stale resolve) is
-            /// what keeps this race-free: a snapshot taken before the closure could see "already
-            /// committed to id.ref" and let a later closure invocation append a fresh owner_transition
-            /// after a concurrent repoint moved the ref away from id.ref in between -- exactly the
-            /// re-ownership of a dropped identity this check exists to prevent.
             if (const auto it = state.getCommitted().find(final_ref_name);
                 it != state.getCommitted().end() && it->second.manifest_ref == id.ref)
                 return {};
@@ -824,33 +812,17 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             "promote: manifest namespace '{}' != target namespace '{}'",
             id.root_namespace.string(), target_ns.string());
 
+    const auto staged = staged_manifest_ids.find(id);
+    if (staged == staged_manifest_ids.end())
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "promote: manifest '{}' was not staged by this transaction", manifestRefDebugString(id.ref));
+
     const String manifest_key = store->layout().manifestKey(id);
-    std::vector<BlobRef> manifest_blob_dependencies;
-    if (const auto staged = staged_manifest_ids.find(id); staged != staged_manifest_ids.end())
-    {
-        if (staged->second.incarnation.key() != manifest_key)
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "promote: staged manifest record names key '{}', expected '{}'",
-                staged->second.incarnation.key(), manifest_key);
-        manifest_blob_dependencies = staged->second.blob_dependencies;
-    }
-    else
-    {
-        CasOperation op = store->mountRequests().admit();
-        const auto body_got = op.read(manifest_key, Retry::standard());
-        if (!body_got)
-            throwCasWriteRetryLater(fmt::format(
-                "promote: manifest body absent at {} — failing closed (retry with a fresh ManifestId)", manifest_key));
-        const PartManifest body = decodePartManifest(openObject(FormatId::PartManifest, body_got->bytes));
-        if (!refMatchesBody(id.ref, body))
-            throwCasWriteRetryLater(fmt::format("promote: RefMatchesBody failed for {}", manifest_key));
-        if (!manifestNamespaceMatches(target_ns, body))
-            throwCasWriteRetryLater(fmt::format("promote: ManifestNamespaceMatches failed for {}", manifest_key));
-        manifest_blob_dependencies.reserve(body.entries.size());
-        for (const ManifestEntry & entry : body.entries)
-            if (entry.placement == EntryPlacement::Blob)
-                manifest_blob_dependencies.push_back(entry.ref);
-    }
+    if (staged->second.incarnation.key() != manifest_key)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "promote: staged manifest record names key '{}', expected '{}'",
+            staged->second.incarnation.key(), manifest_key);
+    std::vector<BlobRef> manifest_blob_dependencies = staged->second.blob_dependencies;
 
     /// Blob readiness is checked inside the append closure below, after owner liveness. It consumes
     /// only this build's explicit dependency proofs and performs no backend copy-forward.

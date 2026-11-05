@@ -58,9 +58,11 @@ the **same** blobs and moves the ref in one ref-log record — a repoint, covere
 The writer retains a compact record after its own successful `stageManifest`: the confirmed object
 incarnation and the blob dependencies in the order the caller passed the entries. The encoded body
 sorts entries by path, so this order can differ from a decoded body. Only the order of dependency
-checks and `BlobReuseAdopt` events depends on it. The matching `promote` uses this record without
-reading the immutable body back. Promotion of a manifest not staged by that `PartWriteTxn` still
-performs an exact `GET` and validates `RefMatchesBody` and `ManifestNamespaceMatches` fail-closed.
+checks and `BlobReuseAdopt` events depends on it. The matching `promote` requires this record and
+never reads the immutable body back. A manifest not staged by that `PartWriteTxn` is an invariant
+violation: `promote` raises `LOGICAL_ERROR` before the ref-log append, even if another transaction
+already committed that manifest. Repeating `promote` on the same `PartWriteTxn` for its own
+already committed manifest remains an idempotent no-op.
 
 The record only shows that the body existed when the conditional create was confirmed. Inside the
 protocol nothing deletes it before `promote`: the orphan sweep does not touch the prefix of a

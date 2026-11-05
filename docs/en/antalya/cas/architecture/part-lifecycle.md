@@ -95,12 +95,12 @@ explicit `Materialized` proof. A trusted source manifest instead yields `Trusted
 blob I/O. Pool size is the
 server setting `cas_blob_upload_pool_size` (default 16).
 
-**Step 4 — `promote`.** A manifest staged by the same `PartWriteTxn` uses the in-memory record produced
-by the successful conditional create: the confirmed object incarnation and blob dependencies.
-There is no manifest `GET` on this normal path. A manifest not staged by this transaction is read and
-validated fail-closed. Promotion then sets the commit state to Uncertain before the append — past that
-point, failure is no longer proof of the negative — checks that the precommit is still the live owner,
-and validates explicit dependency proofs.
+**Step 4 — `promote`.** Uses the in-memory record produced by this `PartWriteTxn`'s successful
+conditional create: the confirmed object incarnation and blob dependencies. A missing record is an
+invariant violation and raises `LOGICAL_ERROR` before the append. There is no manifest `GET`.
+Promotion then sets the commit state to `Uncertain` before the append — past that point, failure
+is no longer proof of the negative — checks that the precommit is still the live owner, and
+validates explicit dependency proofs.
 `Materialized` leaves are edge-protected; `TrustedManifest` leaves are trusted through the durable
 source-manifest edge with no per-file `HEAD`; anything else is a `LOGICAL_ERROR`. The
 whole thing lands as one ref-log record: optional retirement of the old committed binding, the pure

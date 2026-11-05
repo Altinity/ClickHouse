@@ -481,11 +481,11 @@ TEST(CASPartWriteTxn, PromoteOwnStagedManifestWithInlineAndBlobsDoesNotReadBody)
     EXPECT_EQ(resolved->manifest_id, id);
 }
 
-TEST(CASPartWriteTxn, PromoteForeignManifestReadsAndValidatesBody)
+TEST(CASPartWriteTxn, PromoteRejectsManifestNotStagedByThisTransaction)
 {
-    for (const String scenario : {"valid", "missing", "wrong-ref", "wrong-namespace"})
+    for (const bool already_committed : {false, true})
     {
-        SCOPED_TRACE(scenario);
+        SCOPED_TRACE(already_committed);
         auto backend = std::make_shared<InMemoryBackend>();
         auto counting = std::make_shared<KeyCountingBackend>(backend);
         auto store = Pool::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
@@ -493,37 +493,28 @@ TEST(CASPartWriteTxn, PromoteForeignManifestReadsAndValidatesBody)
         auto owner = startBuildFor(store, ns, "part");
         const ManifestId id = owner->stageManifest({});
         owner->precommitAdd(ns, "part", id);
-        const String manifest_key = store->layout().manifestKey(id);
-
-        if (scenario != "valid")
-        {
-            OperationForTest op(*backend);
-            const auto body = (*op).read(manifest_key, Retry::once());
-            ASSERT_TRUE(body);
-            (*op).remove(manifest_key, body->etag, Retry::once());
-            if (scenario != "missing")
-            {
-                PartManifest replacement = decodePartManifest(openObject(FormatId::PartManifest, body->bytes));
-                if (scenario == "wrong-ref")
-                    ++replacement.ref.manifest_ordinal;
-                else
-                    replacement.root_namespace_id = RootNamespace{"srv1/other"};
-                replacement.payload_digest = computePayloadDigest(replacement);
-                (*op).create(manifest_key, sealObject(FormatId::PartManifest, encodePartManifest(replacement)), Retry::once());
-            }
-        }
+        if (already_committed)
+            ASSERT_TRUE(owner->promote(ns, "part", owner->buildId(), id));
 
         auto publisher = startBuildFor(store, ns, "part");
+        const String manifest_key = store->layout().manifestKey(id);
         const size_t gets_before = counting->getCountFor(manifest_key);
-        if (scenario == "valid")
-            EXPECT_TRUE(publisher->promote(ns, "part", owner->buildId(), id));
-        else
-            expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
-            {
-                publisher->promote(ns, "part", owner->buildId(), id);
-            });
-        EXPECT_EQ(counting->getCountFor(manifest_key) - gets_before, 1u);
-        EXPECT_EQ(store->resolveRef(ns, "part").has_value(), scenario == "valid");
+        const size_t tail_before = store->tailSinceSnapshotCountForTest(ns);
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+        EXPECT_DEATH(publisher->promote(ns, "part", publisher->buildId(), id), "");
+#else
+        DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::LOGICAL_ERROR, "was not staged by this transaction", [&]
+        {
+            publisher->promote(ns, "part", publisher->buildId(), id);
+        });
+#endif
+        EXPECT_EQ(counting->getCountFor(manifest_key) - gets_before, 0u);
+        EXPECT_EQ(publisher->commitState(), PartWriteTxn::CommitState::NotAttempted);
+        EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_before);
+        const auto resolved = store->resolveRef(ns, "part");
+        EXPECT_EQ(resolved.has_value(), already_committed);
+        if (resolved)
+            EXPECT_EQ(resolved->manifest_id, id);
     }
 }
 

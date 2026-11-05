@@ -124,12 +124,18 @@ TEST(CASPromoteRepublish, PromoteSameManifestIsIdempotent)
     auto s = openPool(b);
     const RootNamespace ns{"srv/tbl@cas@"};
     const String ref = "all_0_0_0";
-    const ManifestId id = publishCommitted(s, ns, ref, inlineEntries("f", "AAA"));
+    auto build = s->beginPartWrite(PartWriteInfo{.intended_ref = ns.string() + "/" + ref, .intended_namespace = ns});
+    const ManifestId id = build->stageManifest(inlineEntries("f", "AAA"));
+    build->precommitAdd(ns, ref, id);
+    EXPECT_TRUE(build->promote(ns, ref, build->buildId(), id));
 
-    /// Re-precommit + re-promote the SAME id onto the same ref: allowed (same manifest_ref).
-    auto build2 = s->beginPartWrite(PartWriteInfo{.intended_ref = ns.string() + "/" + ref, .intended_namespace = ns});
-    build2->precommitAdd(ns, ref, id);
-    EXPECT_NO_THROW(build2->promote(ns, ref, build2->buildId(), id));
+    const size_t tail_before = s->tailSinceSnapshotCountForTest(ns);
+    build->precommitAdd(ns, ref, id);
+    EXPECT_FALSE(build->promote(ns, ref, build->buildId(), id));
+    EXPECT_EQ(s->tailSinceSnapshotCountForTest(ns), tail_before);
+    const auto resolved = s->resolveRef(ns, ref);
+    ASSERT_TRUE(resolved);
+    EXPECT_EQ(resolved->manifest_id, id);
 }
 
 /// Sanity companion to BUG 1a: promote over an ABSENT ref (the normal insert path) must succeed
