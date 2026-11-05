@@ -455,6 +455,107 @@ TEST(CASPartWriteTxn, PromoteOwnStagedManifestDoesNotReadBody)
     EXPECT_EQ(counting->getCountFor(manifest_key) - gets_before, 0u);
 }
 
+TEST(CASPartWriteTxn, PromoteOwnStagedManifestChecksBlobDependenciesWithoutBodyRead)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto counting = std::make_shared<KeyCountingBackend>(backend);
+    auto store = Pool::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    const RootNamespace ns{"srv1/promote-staged-deps"};
+    auto build = startBuildFor(store, ns, "part");
+
+    ManifestEntry inline_entry;
+    inline_entry.path = "small";
+    inline_entry.placement = EntryPlacement::Inline;
+    inline_entry.inline_bytes = "abc";
+    const ManifestId id = build->stageManifest(
+        {inline_entry, blobManifestEntry("a.bin", "blob-a"), blobManifestEntry("b.bin", "blob-b")});
+    build->precommitAdd(ns, "part", id);
+    build->putBlob(idOf("blob-a"), BlobSource::fromString("blob-a"));
+
+    EXPECT_DEATH(
+        {
+            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+            build->promote(ns, "part", build->buildId(), id);
+        },
+        "no dependency proof");
+
+    build->putBlob(idOf("blob-b"), BlobSource::fromString("blob-b"));
+    const String manifest_key = store->layout().manifestKey(id);
+    const size_t gets_before = counting->getCountFor(manifest_key);
+    EXPECT_TRUE(build->promote(ns, "part", build->buildId(), id));
+    EXPECT_EQ(counting->getCountFor(manifest_key) - gets_before, 0u);
+    const auto resolved = store->resolveRef(ns, "part");
+    ASSERT_TRUE(resolved);
+    EXPECT_EQ(resolved->manifest_id, id);
+}
+
+TEST(CASPartWriteTxn, PromoteForeignManifestReadsAndValidatesBody)
+{
+    for (const String scenario : {"valid", "missing", "wrong-ref", "wrong-namespace"})
+    {
+        SCOPED_TRACE(scenario);
+        auto backend = std::make_shared<InMemoryBackend>();
+        auto counting = std::make_shared<KeyCountingBackend>(backend);
+        auto store = Pool::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+        const RootNamespace ns{"srv1/promote-foreign"};
+        auto owner = startBuildFor(store, ns, "part");
+        const ManifestId id = owner->stageManifest({});
+        owner->precommitAdd(ns, "part", id);
+        const String manifest_key = store->layout().manifestKey(id);
+
+        if (scenario != "valid")
+        {
+            OperationForTest op(*backend);
+            const auto body = (*op).read(manifest_key, Retry::once());
+            ASSERT_TRUE(body);
+            (*op).remove(manifest_key, body->etag, Retry::once());
+            if (scenario != "missing")
+            {
+                PartManifest replacement = decodePartManifest(openObject(FormatId::PartManifest, body->bytes));
+                if (scenario == "wrong-ref")
+                    ++replacement.ref.manifest_ordinal;
+                else
+                    replacement.root_namespace_id = RootNamespace{"srv1/other"};
+                replacement.payload_digest = computePayloadDigest(replacement);
+                (*op).create(manifest_key, sealObject(FormatId::PartManifest, encodePartManifest(replacement)), Retry::once());
+            }
+        }
+
+        auto publisher = startBuildFor(store, ns, "part");
+        const size_t gets_before = counting->getCountFor(manifest_key);
+        if (scenario == "valid")
+            EXPECT_TRUE(publisher->promote(ns, "part", owner->buildId(), id));
+        else
+            expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+            {
+                publisher->promote(ns, "part", owner->buildId(), id);
+            });
+        EXPECT_EQ(counting->getCountFor(manifest_key) - gets_before, 1u);
+        EXPECT_EQ(store->resolveRef(ns, "part").has_value(), scenario == "valid");
+    }
+}
+
+TEST(CASPartWriteTxn, StageManifestRejectsTraversalPathBeforeBodyWrite)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/traversal-path"};
+    auto build = startBuildFor(store, ns, "part");
+
+    ManifestEntry entry;
+    entry.path = "../evil";
+    entry.placement = EntryPlacement::Inline;
+    entry.inline_bytes = "payload";
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+    {
+        build->stageManifest({entry});
+    });
+
+    OperationForTest op(*backend);
+    EXPECT_TRUE((*op).list(store->layout().manifestNamespacePrefix(ns), "", 10, Retry::once()).keys.empty());
+}
+
 /// B171: the `cas_owner` owner-triple stamping (`PartWriteTxn::ownerMeta`) was DELETED — protection is now
 /// the build-root precommit edge (reachability), not revocable object metadata GC reads per-candidate.
 /// The old `CASPartWriteTxn.BlobCarriesOwnerTripleInMetadata` asserted that stamping; its coverage is replaced

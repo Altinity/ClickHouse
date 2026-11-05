@@ -316,9 +316,6 @@ TEST(CASPartManifestFormat, MixedAlgoEntriesRoundTrip)
     EXPECT_EQ(got.entries[1].blob_size, 200u);
 }
 
-/// Builds a single-Blob-entry manifest whose entry path is exactly `path` -- `encodePartManifest`
-/// itself does not validate path shape (only ordering/duplicates), so this lets the negative cases
-/// below reach `decodePartManifest`'s shape check unobstructed.
 static PartManifest manifestWithSinglePath(std::string_view path)
 {
     PartManifest m;
@@ -336,17 +333,30 @@ static PartManifest manifestWithSinglePath(std::string_view path)
     return m;
 }
 
-/// T11: manifest bytes arrive over the interserver relink channel, so decode enforces the same path
-/// hygiene as CasLayout::checkNamespace -- relative, no empty/'.'/'..' segments, no leading '/'.
-/// `encodePartManifest` does not itself reject these (see `manifestWithSinglePath`), so each case
-/// must fail closed at decode time instead.
-TEST(CASPartManifestFormat, DecodeRejectsMalformedEntryPaths)
+TEST(CASPartManifestFormat, EncodeRejectsMalformedEntryPaths)
 {
     for (const char * path : {"../evil", "/abs", "", "a//b", "a/./b"})
     {
         SCOPED_TRACE(path);
-        const String encoded = encodePartManifest(manifestWithSinglePath(path));
-        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePartManifest(encoded); });
+        PartManifest manifest = manifestWithSinglePath("safe");
+        manifest.entries[0].path = path;
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodePartManifest(manifest); });
+    }
+}
+
+TEST(CASPartManifestFormat, DecodeRejectsMalformedEntryPaths)
+{
+    const String valid = encodePartManifest(manifestWithSinglePath("safe"));
+    const String needle = R"("path":"safe")";
+    const size_t pos = valid.find(needle);
+    ASSERT_NE(pos, String::npos);
+
+    for (const char * path : {"../evil", "/abs", "", "a//b", "a/./b"})
+    {
+        SCOPED_TRACE(path);
+        String forged = valid;
+        forged.replace(pos, needle.size(), "\"path\":\"" + String(path) + "\"");
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePartManifest(forged); });
     }
 }
 
