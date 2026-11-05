@@ -96,7 +96,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Compatibility check (release)
-      runner_type: altinity-on-demand, altinity-func-tester
+      runner_type: altinity-on-demand, altinity-func-tester, 16c
       data: ${{ needs.RunConfig.outputs.data }}
   CompatibilityCheckAarch64:
     needs: [RunConfig, BuilderDebAarch64]
