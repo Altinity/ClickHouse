@@ -3283,6 +3283,7 @@ TEST(CASGCFrontierGate, DeferredRoundDrainsCompletedRemovingBeforeReturning)
     state.gc_shards = store->poolConfig().gc_shards;
     state.snap_generation = 1;
     state.snap_attempt = 1;
+    state.orphan_manifest_sweep_completed_at_ms = 1000;
     state.lease = GcLease{.owner = kGc, .seq = 1};
     ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.gcStateKey(), encodeGcState(state), Retry::once())));
 
@@ -3290,7 +3291,7 @@ TEST(CASGCFrontierGate, DeferredRoundDrainsCompletedRemovingBeforeReturning)
     ASSERT_TRUE(std::holds_alternative<Committed>(op.create(ckpt_key, "inert checkpoint debris", Retry::once())));
     const uint64_t catalog_cas_before = backend->putOverwriteCount(layout.refCatalogKey());
 
-    Gc gc(store, kGc);
+    Gc gc(store, kGc, [] { return 1001; });
     const RoundReport report = runRegularRoundReclaiming(gc);
     ASSERT_TRUE(report.acquired_lease);
     EXPECT_TRUE(report.deferred);

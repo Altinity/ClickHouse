@@ -540,6 +540,7 @@ TEST(CASWriterDuties, RejectedAttemptBodyIsEventuallyNominatedAndSwept)
         .server_root_id = "test",
         .manifest_sweep_list_budget_keys = 100,
         .manifest_sweep_delete_budget_keys = 100,
+        .orphan_manifest_sweep_interval_sec = 0,
         .gc_fold_max_defer_rounds = 0,
         .background_watermark = false,
         .mount_lease_ttl_ms = std::chrono::milliseconds(500),

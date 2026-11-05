@@ -27,6 +27,7 @@ TEST(CASFormatBattery, GcState)
         [](std::string_view d) { decodeGcState(std::string(openObject(FormatId::GcState, d))); },
         currentFormatHeader("cas_gc_state") +
         "{\"round\":\"4\",\"gc_shards\":1,\"snap_generation\":\"9\",\"snap_pruned_through\":\"7\",\"snap_attempt\":\"3\",\"manifest_sweep_cursor\":\"\","
+        "\"orphan_manifest_sweep_active\":false,\"orphan_manifest_sweep_started_at_ms\":\"0\",\"orphan_manifest_sweep_completed_at_ms\":\"0\","
         "\"lease_owner\":\"00000000000000000000000000000001\",\"lease_seq\":\"12\"}\n"});
 }
 
@@ -68,6 +69,7 @@ TEST(CASGCStateFormat, SnapPrunedThroughAndAttemptAndCursorRoundTrip)
     s.snap_pruned_through = 38;
     s.snap_attempt = 7;
     s.manifest_sweep_cursor = "p/cas/manifests/server/store/abc/table@cas@/writer/42/aa/id";
+    s.orphan_manifest_sweep_active = true;
     auto d = decodeGcState(encodeGcState(s));
     EXPECT_EQ(d.snap_pruned_through, 38u);
     EXPECT_EQ(d.snap_attempt, 7u);
@@ -83,6 +85,75 @@ TEST(CASGCStateFormat, DefaultsRoundTrip)
     EXPECT_EQ(d.snap_attempt, 0u);
     EXPECT_TRUE(d.manifest_sweep_cursor.empty());
     EXPECT_EQ(d.lease.owner, UInt128{});
+}
+
+namespace
+{
+
+String sweepScheduleWire(const String & cursor, const String & fields)
+{
+    return currentFormatHeader("cas_gc_state")
+        + "{\"round\":\"7\",\"gc_shards\":2,\"snap_generation\":\"42\",\"snap_pruned_through\":\"38\","
+          "\"snap_attempt\":\"7\",\"manifest_sweep_cursor\":\"" + cursor + "\"," + fields
+        + "\"lease_owner\":\"00000000000000000000000000000005\",\"lease_seq\":\"12\"}\n";
+}
+
+}
+
+TEST(CASGCStateFormat, SweepScheduleRoundTrip)
+{
+    for (const String & fields : {
+             String{"\"orphan_manifest_sweep_active\":true,\"orphan_manifest_sweep_started_at_ms\":\"1000\",\"orphan_manifest_sweep_completed_at_ms\":\"500\","},
+             String{"\"orphan_manifest_sweep_active\":true,\"orphan_manifest_sweep_started_at_ms\":\"0\",\"orphan_manifest_sweep_completed_at_ms\":\"0\","},
+             String{"\"orphan_manifest_sweep_active\":false,\"orphan_manifest_sweep_started_at_ms\":\"18446744073709551615\",\"orphan_manifest_sweep_completed_at_ms\":\"18446744073709551615\","}})
+    {
+        const String wire = sweepScheduleWire("", fields);
+        EXPECT_EQ(encodeGcState(decodeGcState(wire)), wire);
+    }
+}
+
+TEST(CASGCStateFormat, LegacyCursorResumesSweep)
+{
+    const String fields = "\"orphan_manifest_sweep_active\":true,\"orphan_manifest_sweep_started_at_ms\":\"0\",\"orphan_manifest_sweep_completed_at_ms\":\"0\",";
+    EXPECT_EQ(encodeGcState(decodeGcState(sweepScheduleWire("cursor", ""))), sweepScheduleWire("cursor", fields));
+}
+
+TEST(CASGCStateFormat, LegacyEmptyCursorAllowsFirstRun)
+{
+    const String fields = "\"orphan_manifest_sweep_active\":false,\"orphan_manifest_sweep_started_at_ms\":\"0\",\"orphan_manifest_sweep_completed_at_ms\":\"0\",";
+    EXPECT_EQ(encodeGcState(decodeGcState(sweepScheduleWire("", ""))), sweepScheduleWire("", fields));
+}
+
+TEST(CASGCStateFormat, RejectsPartialScheduleGroup)
+{
+    const String fields[] = {
+        "\"orphan_manifest_sweep_active\":true,",
+        "\"orphan_manifest_sweep_started_at_ms\":\"1000\",",
+        "\"orphan_manifest_sweep_completed_at_ms\":\"500\","};
+    for (unsigned mask = 1; mask < 7; ++mask)
+    {
+        String group;
+        for (unsigned bit = 0; bit < 3; ++bit)
+            if (mask & (1U << bit))
+                group += fields[bit];
+        EXPECT_THROW(decodeGcState(sweepScheduleWire("", group)), DB::Exception) << mask;
+    }
+}
+
+TEST(CASGCStateFormat, RejectsWrongScheduleTypes)
+{
+    EXPECT_THROW(decodeGcState(sweepScheduleWire("",
+        "\"orphan_manifest_sweep_active\":\"true\",\"orphan_manifest_sweep_started_at_ms\":\"1000\",\"orphan_manifest_sweep_completed_at_ms\":\"500\",")), DB::Exception);
+    EXPECT_THROW(decodeGcState(sweepScheduleWire("",
+        "\"orphan_manifest_sweep_active\":true,\"orphan_manifest_sweep_started_at_ms\":1000,\"orphan_manifest_sweep_completed_at_ms\":\"500\",")), DB::Exception);
+    EXPECT_THROW(decodeGcState(sweepScheduleWire("",
+        "\"orphan_manifest_sweep_active\":true,\"orphan_manifest_sweep_started_at_ms\":\"1000\",\"orphan_manifest_sweep_completed_at_ms\":false,")), DB::Exception);
+}
+
+TEST(CASGCStateFormat, RejectsInactiveWithCursor)
+{
+    EXPECT_THROW(decodeGcState(sweepScheduleWire("cursor",
+        "\"orphan_manifest_sweep_active\":false,\"orphan_manifest_sweep_started_at_ms\":\"1000\",\"orphan_manifest_sweep_completed_at_ms\":\"500\",")), DB::Exception);
 }
 
 TEST(CASGCStateFormat, RejectsZeroGcShards)
