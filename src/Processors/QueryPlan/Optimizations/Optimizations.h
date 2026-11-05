@@ -243,25 +243,11 @@ void optimizeJoinLogical(QueryPlan::Node & node, QueryPlan::Nodes &, const Query
 /// A separate tree traverse to apply sorting properties after *InOrder optimizations.
 void applyOrder(const QueryPlanOptimizationSettings & optimization_settings, QueryPlan::Node & root);
 
-<<<<<<< HEAD
-/// Returns the name of used projection or nullopt if no projection is used.
-std::optional<String> optimizeUseAggregateProjections(
-=======
-/// A separate tree traverse that propagates the stream-disjointness property (no two output streams
-/// carry the same key value).
-void applyStreamDisjointness(const QueryPlanOptimizationSettings & optimization_settings, QueryPlan::Node & root);
-
 /// Lets an offset based parallel replicas read use several replicas of a shard only if no consumer needs stream order.
 void allowReadingShardsFromSeveralReplicas(QueryPlan::Node & root);
 
-struct UseProjectionsResult
-{
-    std::optional<String> applied_projection;
-    std::unordered_map<String, String> projection_reject_reasons;
-};
-
-UseProjectionsResult optimizeUseAggregateProjections(
->>>>>>> 22a323d93d6 (Merge pull request #128865 from groeneai/offset-parallel-replicas-ordered-merges)
+/// Returns the name of used projection or nullopt if no projection is used.
+std::optional<String> optimizeUseAggregateProjections(
     QueryPlan::Node & node,
     QueryPlan::Nodes & nodes,
     const QueryPlanOptimizationSettings & optimization_settings);
