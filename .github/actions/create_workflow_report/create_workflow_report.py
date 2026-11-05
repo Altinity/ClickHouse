@@ -19,7 +19,7 @@ from botocore.exceptions import NoCredentialsError
 DATABASE_HOST_VAR = "CHECKS_DATABASE_HOST"
 DATABASE_USER_VAR = "CHECKS_DATABASE_USER"
 DATABASE_PASSWORD_VAR = "CHECKS_DATABASE_PASSWORD"
-S3_BUCKET = "altinity-build-artifacts"
+S3_BUCKET = os.getenv("S3_ARTIFACT_BUCKET")
 GITHUB_REPO = "Altinity/ClickHouse"
 
 # Set up the Jinja2 environment
