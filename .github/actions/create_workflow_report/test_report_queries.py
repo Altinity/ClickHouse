@@ -36,7 +36,11 @@ import pandas as pd
 from clickhouse_driver import Client
 from testflows.core import *
 
-from create_workflow_report import _git_log_merge_prs, get_checks_fails
+from create_workflow_report import (
+    _git_log_merge_prs,
+    get_checks_fails,
+    get_commit_statuses,
+)
 
 
 def check_result_matches_expect(df: pd.DataFrame, expect: list[str]) -> None:
@@ -172,11 +176,55 @@ def test_git_log_merge_prs_includes_fork_prs(self):
         assert set(df["pr_number"]) == {2226, 2252}
 
 
+@TestScenario
+def test_commit_statuses_only_keep_requested_ref(self):
+    """Test statuses written by another ref on the same commit are ignored."""
+    base = "https://altinity-build-artifacts.s3.amazonaws.com"
+    tag = "v26.6.8.20002.altinityantalya"
+    # GitHub returns statuses newest first.
+    statuses = [
+        ("Stress test", "failure", f"{base}/json.html?REF=antalya-26.6&sha=abc"),
+        ("Regression release x", "failure", f"{base}/REFs/antalya-26.6/abc/r.html"),
+        ("Regression release y", "success", f"{base}/REFs/{tag}/abc/r.html"),
+        ("Stress test", "success", f"{base}/json.html?REF={tag}&sha=abc"),
+        ("PR job", "success", f"{base}/json.html?PR=1&sha=abc"),
+    ]
+    response = type(
+        "Response",
+        (),
+        {
+            "status_code": 200,
+            "headers": {},
+            "json": lambda _: [
+                {"context": c, "state": st, "description": "", "target_url": u}
+                for c, st, u in statuses
+            ],
+        },
+    )()
+    with When("I fetch statuses for the release tag"):
+        with patch("create_workflow_report.requests.get", return_value=response):
+            df = get_commit_statuses("abc", 0, tag)
+
+    with Then("only statuses of the tag remain"):
+        assert dict(zip(df["job_name"], df["job_status"])) == {
+            "Stress test": "success",
+            "Regression release y": "success",
+        }
+
+    with When("I fetch statuses for a pull request run"):
+        with patch("create_workflow_report.requests.get", return_value=response):
+            df = get_commit_statuses("abc", 1, "some-branch")
+
+    with Then("statuses are not filtered by ref"):
+        assert set(df["job_name"]) == {"Stress test", "Regression release x", "Regression release y", "PR job"}
+
+
 @Name("test report queries")
 @TestModule
 def test_report_queries(self):
     Scenario(run=test_checks_fails_query, flags=TE)
     Scenario(run=test_git_log_merge_prs_includes_fork_prs, flags=TE)
+    Scenario(run=test_commit_statuses_only_keep_requested_ref, flags=TE)
 
 
 if main():

@@ -53,6 +53,7 @@ def test_dispatch_with_tags_renders_boolean_input_and_tag_trigger():
     assert "type: boolean" in yaml_text
     assert "push:" in yaml_text
     assert "tags: ['*']" in yaml_text
+    assert "group: ${{ github.workflow }}-${{ github.ref }}" in yaml_text
     assert "cancel-in-progress: true" in yaml_text
 
 
@@ -67,6 +68,7 @@ def test_schedule_concurrency_does_not_cancel_in_progress():
     )
 
     assert "concurrency:" in yaml_text
+    assert "group: ${{ github.workflow }}-${{ github.ref }}" in yaml_text
     assert "cancel-in-progress:" not in yaml_text
 
 

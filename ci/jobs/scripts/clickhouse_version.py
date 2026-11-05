@@ -1,3 +1,4 @@
+import time
 from pathlib import Path
 
 from ci.praktika.info import Info
@@ -77,13 +78,58 @@ def _tweak_from_git(githash) -> int:
     )
 
 
+def release_tags(version: "CHVersion", retries=3) -> dict:
+    """Remote tags matching `v<version.major>.<version.minor>.<version.patch>.*`, mapped
+    to commit SHA.
+
+    Raises if `git ls-remote` still fails after retries. An empty dict means
+    there are no releases yet, so a failed lookup must not look like one."""
+    command = (
+        f"git ls-remote --tags origin "
+        f"'refs/tags/v{version.major}.{version.minor}.{version.patch}.*'"
+    )
+    for attempt in range(retries):
+        code, stdout, stderr = Shell.get_res_stdout_stderr(command)
+        if code == 0:
+            break
+        if attempt < retries - 1:
+            time.sleep(2**attempt)
+    else:
+        raise RuntimeError(f"[{command}] failed: {stderr}")
+    tags = {}
+    for line in stdout.splitlines():
+        sha, ref = line.split()
+        # Annotated tags also list the commit as `<tag>^{}`.
+        tag = ref.removeprefix("refs/tags/").removesuffix("^{}")
+        tags[tag] = sha
+    return tags
+
+
+def next_release_tweak(
+    tags: dict, version: "CHVersion", track: int, current_sha: str
+) -> int:
+    """Next tweak on this track: `track`xxxx, one past the highest existing
+    counter. Tags on `current_sha` are skipped so a tag push keeps its own number.
+    """
+    prefix = f"v{version.major}.{version.minor}.{version.patch}."
+    last_tweak = track * 10000
+    for tag, sha in tags.items():
+        if sha == current_sha or not tag.startswith(prefix):
+            continue
+        tweak = tag.split(".")[3]
+        if tweak.isdigit() and int(tweak) // 10000 == track:
+            last_tweak = max(last_tweak, int(tweak))
+    return last_tweak + 1
+
+
 def _version_type_from_describe(versions: dict) -> str:
     """Recover the version type from the file's `VERSION_DESCRIBE` suffix, which
     is `v<string>-<version_type>` upstream and `v<string>` for Altinity
     flavoured versions."""
     describe = str(versions.get("describe", ""))
     flavour = str(versions.get("flavour") or "")
-    if flavour and describe == f"v{versions.get('string', '')}":
+    # NOTE (strtgbb): VERSION_DESCRIBE is left as is to avoid merge conflicts
+    if flavour:
         return flavour
     return describe.rsplit("-", 1)[1] if "-" in describe else ""
 
