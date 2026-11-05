@@ -103,7 +103,7 @@ workflow = Workflow.Config(
         #    for job in JobConfigs.performance_comparison_with_master_head_jobs
         # ], # NOTE (strtgbb): failed previously due to GH secrets not being handled properly, try again later
     ],
-    additional_jobs=["GrypeScan", "Regression", "CIReport", "SourceUpload"],
+    additional_jobs=["GrypeScan", "Regression", "CIReport"],
     artifacts=[
         *ArtifactConfigs.unittests_binaries,
         *ArtifactConfigs.clickhouse_binaries,
