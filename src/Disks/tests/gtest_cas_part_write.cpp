@@ -24,7 +24,9 @@
 #include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
+#include <Poco/ConsoleChannel.h>
 #include <Poco/Exception.h>
+#include <Poco/Logger.h>
 
 namespace ProfileEvents
 {
@@ -474,6 +476,8 @@ TEST(CASPartWriteTxn, PromoteOwnStagedManifestChecksBlobDependenciesWithoutBodyR
 
     EXPECT_DEATH(
         {
+            Poco::Logger::root().setChannel(new Poco::ConsoleChannel);
+            Poco::Logger::root().setLevel("fatal");
             DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
             build->promote(ns, "part", build->buildId(), id);
         },
