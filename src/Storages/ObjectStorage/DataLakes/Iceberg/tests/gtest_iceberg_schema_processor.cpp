@@ -19,15 +19,10 @@
 namespace DB::ErrorCodes
 {
     extern const int ICEBERG_SPECIFICATION_VIOLATION;
+    extern const int SUPPORT_IS_DISABLED;
 }
 
 using namespace DB::Iceberg;
-
-namespace DB::ErrorCodes
-{
-extern const int ICEBERG_SPECIFICATION_VIOLATION;
-extern const int SUPPORT_IS_DISABLED;
-}
 
 namespace
 {
