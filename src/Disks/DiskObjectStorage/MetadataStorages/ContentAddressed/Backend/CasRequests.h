@@ -214,7 +214,7 @@ private:
     friend class CasHotKeys;
 
     uint64_t now_ms() const;
-    void sleep_ms(uint64_t ms);
+    void sleep_ms(uint64_t ms) const;
 
     /// The one place a transport key is created. Every verb reaches the store through this, so no
     /// engine code -- and nothing outside it -- can name the key's type, let alone construct one.

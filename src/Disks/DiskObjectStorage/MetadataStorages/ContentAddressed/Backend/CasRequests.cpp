@@ -321,7 +321,7 @@ uint64_t CasRequests::now_ms() const
     return now_ms_fn();
 }
 
-void CasRequests::sleep_ms(uint64_t ms)
+void CasRequests::sleep_ms(uint64_t ms) const
 {
     SharedLockGuard lock(sleep_ms_mutex);
     sleep_ms_fn(ms);
