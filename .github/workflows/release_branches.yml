@@ -12,6 +12,7 @@ env:
   CLICKHOUSE_TEST_STAT_URL: ${{ secrets.CLICKHOUSE_TEST_STAT_URL }}
   DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
   ROBOT_TOKEN: ${{ secrets.ROBOT_TOKEN }}
+  S3_ARTIFACT_BUCKET: ${{ vars.S3_ARTIFACT_BUCKET }}
 
 on: # yamllint disable-line rule:truthy
   pull_request:
@@ -69,7 +70,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
           COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         run: |
-          REPORT_LINK=https://s3.amazonaws.com/altinity-build-artifacts/$PR_NUMBER/$COMMIT_SHA/ci_run_report.html
+          REPORT_LINK=https://s3.amazonaws.com/${{ vars.S3_ARTIFACT_BUCKET }}/$PR_NUMBER/$COMMIT_SHA/ci_run_report.html
           echo "Workflow Run Report: [View Report]($REPORT_LINK)" >> $GITHUB_STEP_SUMMARY
 
   BuildDockers:
