@@ -230,9 +230,7 @@ private:
         const ActionsDAG::Node * predicate,
         const ActionsDAG * filter,
         const ContextPtr & local_context,
-        StorageMetadataPtr storage_metadata_snapshot,
-        bool tasks_go_to_other_replicas,
-        bool emit_profile_events) const;
+        StorageMetadataPtr storage_metadata_snapshot) const;
 
     /// True when the pruned file list ends with at most `object_storage_cluster_local_read_max_files` files
     /// inside `object_storage_cluster_local_read_probe_ms`. Anything unfinished stays on the cluster.

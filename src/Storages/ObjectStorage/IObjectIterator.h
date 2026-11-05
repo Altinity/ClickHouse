@@ -175,17 +175,16 @@ private:
 };
 
 /// Files already returned by an object-storage cluster local-read probe, plus the iterator
-/// that produced them, still positioned after those files.
+/// that produced them. `iterator` is null once the list has ended.
 struct ObjectStorageClusterReadProbe
 {
     ObjectIterator iterator;
     ObjectInfos pulled;
-    bool exhausted = false;
+    bool read_locally = false;
     bool consumed = false;
 };
 
 /// Hands the probe to one consumer. A second call returns null.
-/// `for_local_read` drops placeholder metadata (`is_fetched == false`) so the read fetches the real size.
-ObjectIterator takeObjectStorageClusterReadProbe(const std::shared_ptr<ObjectStorageClusterReadProbe> & probe, bool for_local_read);
+ObjectIterator takeObjectStorageClusterReadProbe(const std::shared_ptr<ObjectStorageClusterReadProbe> & probe);
 
 }

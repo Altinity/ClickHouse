@@ -176,7 +176,7 @@ void ReadFromObjectStorageStep::createIterator()
     /// (`with_tags` is false there), so a query that reads `_tags` lists again.
     if (!info.requested_virtual_columns.contains("_tags"))
     {
-        if (auto reused = takeObjectStorageClusterReadProbe(query_info.object_storage_cluster_read_probe, /*for_local_read*/ true))
+        if (auto reused = takeObjectStorageClusterReadProbe(query_info.object_storage_cluster_read_probe))
         {
             iterator_wrapper = std::move(reused);
             return;

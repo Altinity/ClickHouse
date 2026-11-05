@@ -692,14 +692,8 @@ ObjectIterator StorageObjectStorageCluster::createObjectIteratorForRead(
     const ActionsDAG::Node * predicate,
     const ActionsDAG * filter,
     const ContextPtr & local_context,
-    StorageMetadataPtr storage_metadata_snapshot,
-    bool tasks_go_to_other_replicas,
-    bool emit_profile_events) const
+    StorageMetadataPtr storage_metadata_snapshot) const
 {
-    std::function<void(FileProgress)> file_progress_callback;
-    if (emit_profile_events)
-        file_progress_callback = local_context->getFileProgressCallback();
-
     auto iterator = StorageObjectStorageSource::createFileIterator(
         configuration,
         configuration->getQuerySettings(local_context),
@@ -712,12 +706,9 @@ ObjectIterator StorageObjectStorageCluster::createObjectIteratorForRead(
         storage_metadata_snapshot->virtuals.getSampleBlock(VirtualsKind::All, VirtualsMaterializationPlace::Reader).getNamesAndTypesList(),
         getHivePartitionColumnsWithoutVirtuals(storage_metadata_snapshot),
         nullptr,
-        file_progress_callback,
+        local_context->getFileProgressCallback(),
         /*ignore_archive_globs=*/false,
         /*skip_object_metadata=*/true);
-
-    if (!emit_profile_events)
-        iterator->setEmitProfileEvents(false);
 
     if (local_context->getSettingsRef()[Setting::cluster_table_function_split_granularity] == ObjectStorageGranularityLevel::BUCKET)
     {
@@ -728,9 +719,8 @@ ObjectIterator StorageObjectStorageCluster::createObjectIteratorForRead(
             local_context);
     }
 
-    if (tasks_go_to_other_replicas)
-        iterator->setTasksGoToOtherReplicas(true);
-
+    /// Before the first `next`, so iceberg objects carry the external-storage check the distributor needs.
+    iterator->setTasksGoToOtherReplicas(true);
     return iterator;
 }
 
@@ -746,20 +736,10 @@ bool StorageObjectStorageCluster::isSmallEnoughForLocalRead(
     const ActionsDAG * filter = query_info.filter_actions_dag.get();
     const ActionsDAG::Node * predicate = (filter && !filter->getOutputs().empty()) ? filter->getOutputs().front() : nullptr;
 
-    /// `tasks_go_to_other_replicas` is set before the first `next`, so iceberg objects already carry the
-    /// external-storage check the cluster distributor needs. Profile events fire here once; the read reuses
-    /// these objects and does not list them again.
-    auto iterator = createObjectIteratorForRead(
-        predicate,
-        filter,
-        context,
-        storage_snapshot->metadata,
-        /* tasks_go_to_other_replicas */ true,
-        /* emit_profile_events */ true);
+    auto iterator = createObjectIteratorForRead(predicate, filter, context, storage_snapshot->metadata);
 
     auto probe = std::make_shared<ObjectStorageClusterReadProbe>();
     Stopwatch watch;
-    bool read_locally = false;
     const char * reason = "file count exceeded threshold";
 
     while (true)
@@ -773,8 +753,7 @@ bool StorageObjectStorageCluster::isSmallEnoughForLocalRead(
         auto object = iterator->next(0);
         if (!object)
         {
-            read_locally = true;
-            probe->exhausted = true;
+            probe->read_locally = true;
             reason = "file list exhausted";
             break;
         }
@@ -784,7 +763,9 @@ bool StorageObjectStorageCluster::isSmallEnoughForLocalRead(
             break;
     }
 
-    if (!probe->exhausted)
+    /// A finished iterator must not stay attached: its `estimatedKeysCount` can be "unknown", which would
+    /// make a small local read start as many streams as a full listing.
+    if (!probe->read_locally)
         probe->iterator = std::move(iterator);
 
     LOG_TRACE(
@@ -793,9 +774,10 @@ bool StorageObjectStorageCluster::isSmallEnoughForLocalRead(
         getStorageID().getNameForLogs(),
         probe->pulled.size(),
         max_files,
-        read_locally,
+        probe->read_locally,
         reason);
 
+    const bool read_locally = probe->read_locally;
     query_info.object_storage_cluster_read_probe = std::move(probe);
     return read_locally;
 }
@@ -809,18 +791,9 @@ RemoteQueryExecutor::Extension StorageObjectStorageCluster::getTaskIteratorExten
     ObjectIterator probed_iterator) const
 {
     /// The probe already advanced this iterator. Replaying its objects avoids listing the same files again.
-    /// Do not call `setTasksGoToOtherReplicas` here: that flag has to be set before the first `next`.
     auto iterator = std::move(probed_iterator);
     if (!iterator)
-    {
-        iterator = createObjectIteratorForRead(
-            predicate,
-            filter,
-            local_context,
-            storage_metadata_snapshot,
-            /* tasks_go_to_other_replicas */ true,
-            /* emit_profile_events */ true);
-    }
+        iterator = createObjectIteratorForRead(predicate, filter, local_context, storage_metadata_snapshot);
 
     std::vector<std::string> ids_of_hosts;
     for (const auto & shard : cluster->getShardsInfo())
@@ -923,22 +896,21 @@ QueryProcessingStage::Enum StorageObjectStorageCluster::getQueryProcessingStage(
         return QueryProcessingStage::Enum::FetchColumns;
 
     /// Already decided for this query info. A second call must return the same stage `read` expects.
-    if (query_info.object_storage_cluster_read_locally == true)
-        return QueryProcessingStage::Enum::FetchColumns;
-
-    const auto & settings = context->getSettingsRef();
-    const bool can_probe = settings[Setting::object_storage_cluster_local_read_max_files] > 0
-        && !settings[Setting::object_storage_remote_initiator]
-        && context->getClientInfo().query_kind != ClientInfo::QueryKind::SECONDARY_QUERY
-        && !resolved.fallback_to_pure
-        && query_info.object_storage_cluster_read_locally != false
-        && storage_snapshot;
-
-    if (can_probe)
+    if (query_info.object_storage_cluster_read_probe)
     {
-        const bool read_locally = isSmallEnoughForLocalRead(context, storage_snapshot, query_info);
-        query_info.object_storage_cluster_read_locally = read_locally;
-        if (read_locally)
+        if (query_info.object_storage_cluster_read_probe->read_locally)
+            return QueryProcessingStage::Enum::FetchColumns;
+    }
+    else
+    {
+        const auto & settings = context->getSettingsRef();
+        const bool can_probe = settings[Setting::object_storage_cluster_local_read_max_files] > 0
+            && !settings[Setting::object_storage_remote_initiator]
+            && context->getClientInfo().query_kind != ClientInfo::QueryKind::SECONDARY_QUERY
+            && !resolved.fallback_to_pure
+            && storage_snapshot;
+
+        if (can_probe && isSmallEnoughForLocalRead(context, storage_snapshot, query_info))
             return QueryProcessingStage::Enum::FetchColumns;
     }
 
