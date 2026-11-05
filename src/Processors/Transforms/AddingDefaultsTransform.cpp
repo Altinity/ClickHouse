@@ -208,23 +208,9 @@ void AddingDefaultsTransform::transform(Chunk & chunk)
         dependencies[col_name] = std::move(deps);
     }
 
-<<<<<<< HEAD
-    if (!evaluate_block.columns())
-        evaluate_block.insert({ColumnConst::create(ColumnUInt8::create(1, 0), num_rows), std::make_shared<DataTypeUInt8>(), "_dummy"});
-
-    auto dag = evaluateMissingDefaults(evaluate_block, header.getNamesAndTypesList(), columns, context, false);
-    if (dag)
-    {
-        auto extracting_subcolumns_dag = createSubcolumnsExtractionActions(header, dag->getRequiredColumnsNames(), context);
-        auto actions = std::make_shared<ExpressionActions>(ActionsDAG::merge(std::move(extracting_subcolumns_dag), std::move(*dag)), ExpressionActionsSettings(context, CompileExpressions::yes), true);
-        actions->execute(evaluate_block);
-    }
-
-=======
     /// Process columns in dependency order (topological sort).
     /// In each iteration, process columns whose dependencies have all been satisfied.
     std::unordered_set<String> processed;
->>>>>>> d553ae43fab (Merge pull request #94615 from ClickHouse/fix-default-expression-dependency-evaluation)
     std::unordered_map<size_t, MutableColumnPtr> mixed_columns;
 
     while (processed.size() < columns_needing_defaults.size())
@@ -233,13 +219,8 @@ void AddingDefaultsTransform::transform(Chunk & chunk)
         std::vector<std::pair<String, size_t>> ready;
         for (const auto & [col_name, col_idx] : columns_needing_defaults)
         {
-<<<<<<< HEAD
-            column_read.column = recursiveRemoveSparse(column_read.column);
-            column_def.column = recursiveRemoveSparse(column_def.column);
-=======
             if (processed.contains(col_name))
                 continue;
->>>>>>> d553ae43fab (Merge pull request #94615 from ClickHouse/fix-default-expression-dependency-evaluation)
 
             bool all_deps_ready = true;
             for (const auto & dep : dependencies[col_name])
@@ -310,8 +291,8 @@ void AddingDefaultsTransform::transform(Chunk & chunk)
 
             if (!defaults_mask.empty())
             {
-                column_read.column = removeSpecialRepresentations(column_read.column);
-                auto column_def_cleaned = removeSpecialRepresentations(column_def.column);
+                column_read.column = recursiveRemoveSparse(column_read.column);
+                auto column_def_cleaned = recursiveRemoveSparse(column_def.column);
 
                 /// TODO: FixedString
                 if (isColumnedAsNumber(column_read.type) || isDecimal(column_read.type))
