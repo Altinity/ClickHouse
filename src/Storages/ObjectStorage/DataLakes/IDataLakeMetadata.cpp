@@ -3,6 +3,8 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFile.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergFieldParseHelpers.h>
 #include <Core/TypeId.h>
+#include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypesDecimal.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
 #include <Core/Field.h>
@@ -104,7 +106,8 @@ DataFileMetaInfo::DataFileMetaInfo(
     Int32 table_schema_id,
     Int32 file_schema_id,
     const std::unordered_map<Int32, Iceberg::ColumnInfo> & columns_info_,
-    const std::unordered_map<Int32, std::pair<Field, Field>> & value_bounds_)
+    const std::unordered_map<Int32, std::pair<Field, Field>> & value_bounds_,
+    const String & file_path)
 {
 #if USE_AVRO
     std::vector<Int32> column_ids;
@@ -154,22 +157,54 @@ DataFileMetaInfo::DataFileMetaInfo(
                 String right_str;
                 if (i_bounds->second.first.tryGet(left_str) && i_bounds->second.second.tryGet(right_str))
                 {
-                    auto left = Iceberg::deserializeFieldFromBinaryRepr(left_str, type, true);
-                    auto right = Iceberg::deserializeFieldFromBinaryRepr(right_str, type, false);
-                    if (left && right)
-                        hyperrectangle = DB::Range(*left, true, *right, true);
+                    const auto non_nullable_type = removeNullable(type);
+                    if (WhichDataType(non_nullable_type).isDateTime64() && getDecimalScale(*non_nullable_type) == 6)
+                    {
+                        /// Two ranges are the middle band, so this column is not a constant.
+                        const auto timestamp_ranges = Iceberg::deserializeDateTime64MinMaxRanges(left_str, right_str, type);
+                        if (timestamp_ranges.size() == 1)
+                            hyperrectangle = DB::Range(timestamp_ranges[0].lower, true, timestamp_ranges[0].upper, true);
+                    }
+                    else
+                    {
+                        auto left = Iceberg::deserializeFieldFromBinaryRepr(left_str, type, true);
+                        auto right = Iceberg::deserializeFieldFromBinaryRepr(right_str, type, false);
+                        if (left && right && !DB::Range::less(*right, *left))
+                            hyperrectangle = DB::Range(*left, true, *right, true);
+                    }
                 }
             }
         }
 
         columns_info[i_name->second] = {column.second.rows_count, column.second.nulls_count, hyperrectangle};
     }
+
+    /// Missing metrics do not mean the column is absent from the file. Record every column of the
+    /// file schema so the read optimization substitutes NULL only for columns added after the file
+    /// was written. `emplace` keeps the statistics already stored above.
+    size_t columns_without_metrics = 0;
+    if (schema_processor.hasClickhouseTableSchemaById(file_schema_id))
+    {
+        const auto fields = schema_processor.getIcebergTableSchemaById(file_schema_id)->getArray(Iceberg::f_fields);
+        for (size_t i = 0; i < fields->size(); ++i)
+        {
+            const auto field_id = fields->getObject(static_cast<UInt32>(i))->getValue<Int32>(Iceberg::f_id);
+            if (const auto table_field = schema_processor.tryGetFieldCharacteristics(table_schema_id, field_id))
+            {
+                if (columns_info.emplace(table_field->getNameInStorage(), ColumnInfo{}).second)
+                    ++columns_without_metrics;
+            }
+        }
+    }
+    if (columns_without_metrics)
+        LOG_DEBUG(getLogger("DataFileMetaInfo"), "File {} has {} columns without Iceberg metrics", file_path, columns_without_metrics);
 #else
     (void)schema_processor;
     (void)table_schema_id;
     (void)file_schema_id;
     (void)columns_info_;
     (void)value_bounds_;
+    (void)file_path;
 #endif
 }
 

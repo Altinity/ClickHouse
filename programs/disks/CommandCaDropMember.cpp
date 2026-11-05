@@ -56,12 +56,13 @@ public:
         std::cout << "server_root_id=" << report.srid << "\n"
                   << "namespaces_removed=" << report.namespaces_removed << "\n"
                   << "namespaces_already_removed=" << report.namespaces_already_removed << "\n"
+                  << "namespaces_pending_gc=" << report.namespaces_pending_gc << "\n"
                   << "committed_refs_removed=" << report.committed_refs_removed << "\n"
                   << "precommits_removed=" << report.precommits_removed << "\n"
                   << "manifest_debris_removed=" << report.manifest_debris_removed << "\n"
                   << "staging_objects_removed=" << report.staging_objects_removed << "\n"
                   << "mountpoint_objects_removed=" << report.mountpoint_objects_removed << "\n"
-                  << "slot_removed=" << (report.slot_removed ? "true" : "false") << "\n";
+                  << "member_retired=" << (report.member_retired ? "true" : "false") << "\n";
         for (const auto & w : report.warnings)
             std::cout << "warning=" << w << "\n";
     }

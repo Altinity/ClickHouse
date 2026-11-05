@@ -1,10 +1,10 @@
 #pragma once
+#include <Storages/IStorage_fwd.h>
 #include <Storages/VirtualColumnsDescription.h>
 
 namespace DB
 {
 
-class IStorage;
 class ICompressionCodec;
 
 using CompressionCodecPtr = std::shared_ptr<ICompressionCodec>;
@@ -24,6 +24,10 @@ struct StorageSnapshot
     struct Data
     {
         virtual ~Data() = default;
+
+        /// `master` shares `Data` through `shared_ptr`. Here it is still a `unique_ptr`,
+        /// so a second snapshot has to clone it instead of copying the pointer.
+        virtual std::unique_ptr<Data> clone() const { return nullptr; }
     };
 
     using DataPtr = std::unique_ptr<Data>;
@@ -39,6 +43,11 @@ struct StorageSnapshot
         DataPtr data_);
 
     std::shared_ptr<StorageSnapshot> clone(DataPtr data_) const;
+
+    /// Returns an equivalent snapshot that additionally owns `holder`, whose referent must be `storage`.
+    /// Ownership is what keeps that storage alive: `DatabaseCatalog::getTablesToDrop` treats a dropped
+    /// table as unused as soon as its only remaining `shared_ptr` is the catalog's own.
+    std::shared_ptr<StorageSnapshot> withStorageHolder(ConstStoragePtr holder) const;
 
     /// Get columns description
     ColumnsDescription getAllColumnsDescription() const;
@@ -65,6 +74,11 @@ struct StorageSnapshot
     /// Get default expression for a column.
     /// Takes into account physical and virtual columns.
     std::optional<ColumnDefault> getDefault(const String & column_name) const;
+
+private:
+    /// Empty on almost every snapshot: one that is consumed inside the scope of an owning
+    /// `StoragePtr` must not delay the drop of its table.
+    ConstStoragePtr storage_holder;
 };
 
 using StorageSnapshotPtr = std::shared_ptr<StorageSnapshot>;

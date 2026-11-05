@@ -347,6 +347,8 @@ struct FormatSettings
         bool case_insensitive_column_matching = false;
         bool filter_push_down = true;
         bool bloom_filter_push_down = true;
+        /// `0` sizes the initial footer read adaptively (1% of the file, clamped to [128 KiB, 2 MiB]).
+        size_t footer_read_size = 0;
         bool page_filter_push_down = true;
         bool use_offset_index = true;
 
@@ -374,6 +376,10 @@ struct FormatSettings
         bool output_datetime_as_uint32 = false;
         bool output_date_as_uint16 = false;
         bool output_enum_as_byte_array = false;
+        /// When false (default), DateTime64 is always written as isAdjustedToUTC=true because
+        /// ClickHouse ticks are UTC. Iceberg sets this so timestamp(_ns) is false and
+        /// timestamptz(_ns) is true, matching TIMESTAMP(*, hasExplicitTimeZone()).
+        bool output_timestamp_adjusted_to_utc_from_timezone = false;
 
         bool parallel_encoding = true;
         bool write_page_index = false;

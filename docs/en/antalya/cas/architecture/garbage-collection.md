@@ -57,7 +57,7 @@ follower or a deferred round execution returns before that commit.
 | 13 | `round_commit` | fold | Retention-prune old generations, then publish the single `gc/state` `CAS` that adopts the whole round |
 | 14 | `handoff_reclaim` | post-`CAS` | Reclaim a generation a ref moved off during this round, which the ordinary retention prune already skipped and will not revisit |
 | 15 | `manifest_deletes` | post-`CAS` | Delete manifest bodies whose owner-removal minus-one edge the `CAS` in phase 13 just adopted |
-| 16 | `namespace_cleanup` | leader; suppressed on `DEFER` | One bounded page of the perpetual namespace janitor, reclaiming dead-life debris |
+| 16 | `namespace_cleanup` | leader; suppressed on `DEFER` | Pages of the perpetual namespace janitor under a 20 s soft budget, reclaiming dead-life debris |
 | 17 | `ref_object_cleanup` | post-`CAS` | Prune ref logs and snapshots once both fold coverage and a live snapshot make them safe to delete |
 | 18 | `orphan_sweep` | post-`CAS` | Exact-token deletion for the [orphan-manifest sweep](/antalya/cas/architecture/manifests-and-refs#orphan-sweep), after phase 13 adopted each candidate's blob-source retirements and the cursor |
 
@@ -194,7 +194,8 @@ token of each `mount` object.
   deletes
 - **Safety:** fences only after this leader's *own* monotonic clock has watched the mount's
   write-token hold unchanged for `L + 5% + cas_mount_renew_period_ms`, where `L` is the longer of this server's
-  `cas_mount_lease_ttl_ms` and the lease the slot's body declares (defaults 30 s and 10 s); the write is
+  `cas_mount_lease_ttl_ms` and the lease the slot's body declares (defaults 30 s and 10 s), and only at the
+  start of a round, so a killed member becomes `fenced` up to one GC round later than that; the write is
   guarded by that exact token. A completed fence-out stays valid even if this GC later loses
   leadership. `expires_at_ms` (another host's wall clock) is never trusted.
 - **Fails the round if:** nothing — a per-mount `PUT` conflict is re-observed and re-classified
@@ -519,23 +520,36 @@ then picked up by the orphan-manifest sweep (phase 18).
 
 ## Phase 16 — namespace cleanup {#phase-16-namespace-cleanup}
 
-One bounded page of the perpetual namespace janitor: deletes the physical objects of namespace lives
-no longer in the catalog (dead-life debris).
+Pages of the perpetual namespace janitor: deletes the physical objects of namespace lives
+no longer in the catalog (dead-life debris). The phase takes the next page while the previous one
+deleted something and published its cursor, until a 20 s soft budget: no page starts after it, the
+page in progress finishes. After the last page of `cas/ns/` the next one starts from its beginning, so
+a pass that began mid-stream also reaches the debris before its cursor; the first page that deletes
+nothing ends the pass. A pool without debris costs one `LIST` per round.
 
 - **Runs on:** fold path here; also on the deferred path right after phase 4 with
   `suppress_destructive` forced on
-- **Reads:** the durable `janitor_cursor`; one `LIST` page (≤ 1000 keys) of `cas/ns/`; a fresh
-  ref-catalog snapshot; `gc/state` per fence re-check
-- **Writes / deletes:** exact-token `DELETE` per dead-life `_log` / `_snap` / `_ckpt` / `_files`
-  object; one `CAS` on the maintenance state when the page is decided
-- **Safety:** each delete is under a GC fence re-check (`lease.owner` / `lease.seq`) before it and
-  once at the end; the incarnation segment in every key makes an old life's objects structurally
+- **Reads:** per page: the durable `janitor_cursor`; one `LIST` page (≤ 1000 keys) of `cas/ns/`; a
+  fresh ref-catalog snapshot; `gc/state` for the fence re-check
+- **Writes / deletes:** per page: batch `DELETE`s of the dead-life `_log` / `_snap` objects, which
+  are write-once and need no token; one request per `cas_gc_bulk_delete_chunk_keys` keys, capped by
+  the storage's batch-delete limit (`objects_chunk_size_to_delete` on S3; one key on a storage
+  without a batch delete), run as jobs on the GC I/O pool (`cas_gc_io_concurrency`); exact-token `DELETE` per
+  dead-life `_ckpt` / `_files` object; one `CAS` on the maintenance state when the page is decided
+- **Safety:** each request is under a GC fence re-check (`lease.owner` / `lease.seq`), read once per
+  page and checked again before the cursor is published; the incarnation segment in every key makes an old life's objects structurally
   unreachable from a reborn same-name namespace, so a missed key can only leak storage, never expose
   it
-- **Fails the round if:** nothing — the whole page is wrapped in a catch-all ("namespace janitor
-  skipped this round")
+- **Fails the round if:** nothing — the whole phase is wrapped in a catch-all ("namespace janitor
+  stopped this round"). A failed batch `DELETE` leaks its keys and the cursor still advances. A failed
+  `LIST` resets the cursor to the stream start only on the first page of the phase; on a later page
+  the cursor the previous page published stays
 - **Observability:** phase row `namespace_cleanup`; metrics `janitor_pages`, `janitor_keys`,
-  `janitor_deleted`, `leaked`
+  `janitor_deleted` (keys of successful batch requests, absent ones included, plus exact removals),
+  `leaked` (failed keys of published pages; an unpublished page is listed again), `delete_requests`
+  (delete calls: one per exact-token delete and per batch, including a batch the storage refused
+  before its keys went one by one), `budget_exhausted`. Batch deletes run on the GC I/O pool, so the
+  row's `ProfileEvents` do not include their requests
 
 The cursor advances only when the whole page was decided under a held fence and an unambiguous
 catalog; under suppression it lists and classifies but deletes nothing and does not advance.
@@ -942,13 +956,17 @@ backend without batch delete: the refused bulk call plus one `DELETE` per key). 
 
 ### Phase 16 — namespace cleanup {#cost-phase-16}
 
+Per page; the phase takes one page in a round without debris and more under its 20 s budget while
+pages delete.
+
 | Key | Operation | Requests |
 |---|---|---:|
 | `<pool_prefix>/gc/maintenance_state` | `GET` | 1 (durable `janitor_cursor`) |
 | `<pool_prefix>/cas/ns/` | `LIST` | one page |
 | `<pool_prefix>/cas/ref_catalog` | `GET` | 1 |
-| `<pool_prefix>/gc/state` | `GET` | one per fence check |
-| dead-life object | `DELETE` | one per object (plus one `HEAD` per object whose `LIST` entry carried no token) |
+| `<pool_prefix>/gc/state` | `GET` | 1 (fence check) |
+| dead-life `_log` / `_snap` objects | batch `DELETE` | one per `cas_gc_bulk_delete_chunk_keys` keys, capped by the storage's batch-delete limit; one per key on a storage without a batch delete |
+| dead-life `_ckpt` / `_files` object | `DELETE` | one per object (plus one `HEAD` per object whose `LIST` entry carried no token) |
 | `<pool_prefix>/gc/maintenance_state` | `CAS` | 1 when the page is decided |
 
 ### Phase 17 — ref object cleanup {#cost-phase-17}
@@ -1009,12 +1027,12 @@ checksum disagrees with its seal).
 
 | Command | Effect |
 |---|---|
-| `SYSTEM CAS GC RUN [<disk>]` | One synchronous round execution on the contacted node; only the lease holder makes progress. The disk is optional: without it every content-addressed disk on the node runs one round. It runs even while the scheduler is stopped |
+| `SYSTEM CAS GC RUN [<disk>]` | One synchronous round execution on the contacted node; only the lease holder (the GC leader, `is_leader = 1` in `system.cas_mounts`) makes progress, and on any other node the command does nothing. The disk is optional: without it every content-addressed disk on the node runs one round. It runs even while the scheduler is stopped |
 | `SYSTEM CAS GC STOP <disk>` / `SYSTEM CAS GC START <disk>` | Stop or resume future background rounds on that disk's scheduler, preserving its identity. The disk is required |
 | `SYSTEM CAS GC REBUILD [FORCE] <disk>` (`clickhouse-disks cas-gc-rebuild`) | Fail-closed disaster-recovery path for a lost or corrupt `GC` baseline — the `CORRUPTED_DATA` errors that name it in their message (missing adopted seal, snapshot without a surviving log, cursor/apply mismatch). An `ABORTED` commit conflict or a `LOGICAL_ERROR` delete marker is not a reason to rebuild. It deliberately over-protects — it prefers bounded leaks over risking an under-count — and cannot delete live data directly: deletions it produces still flow through the normal round's condemn, graduate, exact-token path. The disk is required |
 | `clickhouse-disks cas-gc-dryrun` | Opens the disk read-only, constructs a non-leader `GC`, and prints what would be deleted with a reason per entry. Write-free, resolves runs through the seal's references. Documented caveat: it does not fold new owner events, so away from quiescence it can **over-report** — the subset guarantee holds only at quiescence, and its output must never feed a real delete |
 
-`SYSTEM CAS DROP POOL MEMBER '<server_root_id>' FROM DISK '<disk>'` — permanent removal of a dead
+`SYSTEM CAS DROP POOL MEMBER '<server_root_id>' FROM DISK '<disk>'` — removal of a dead
 replica, distinct from ordinary `GC` — is covered on the
 [mounts-and-leases page](/antalya/cas/architecture/mounts-and-leases#mount-lifecycle).
 `SYSTEM CAS FSCK <disk>` (`clickhouse-disks cas-fsck`) and its `dangling`/`unreachable` vocabulary

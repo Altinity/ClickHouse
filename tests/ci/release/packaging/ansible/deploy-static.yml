@@ -1,0 +1,4 @@
+- hosts: localhost
+  roles:
+    - get_cloudfront_info
+    - publish_pkgs

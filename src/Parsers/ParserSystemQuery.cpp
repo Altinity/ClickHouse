@@ -505,7 +505,7 @@ bool ParserSystemQuery::parseImpl(IParser::Pos & pos, ASTPtr & node, Expected & 
         {
             /// SYSTEM CAS DROP POOL MEMBER <srid> FROM DISK <disk> [ON CLUSTER cluster].
             /// Both the srid and the disk name are REQUIRED quoted string literals -- an srid is an
-            /// opaque server-root path (may contain '/'), not the bare identifier the sibling
+            /// opaque string, not the bare identifier the sibling
             /// CAS_* commands' disk TARGET accepts, so this does not go through
             /// parseQueryWithOnClusterAndTarget.
             ASTPtr ast;

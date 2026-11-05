@@ -98,6 +98,8 @@ The following table shows how Iceberg data types are mapped to ClickHouse data t
 | `fixed(N)` | `FixedString(N)` | |
 | `decimal(P, S)` | `Decimal(P, S)` | |
 
+Writes use the inverse mapping: `DateTime64(9)` is stored as `timestamp_ns`, and `DateTime64` with an explicit timezone and scale 9 as `timestamptz_ns`, but only when `iceberg_format_version` is 3 or higher. `DateTime` and `DateTime64` with scale 6 or less are stored as `timestamp`. Creating or altering an Iceberg table with `DateTime64` scale 9 on format version 1 or 2 raises an exception.
+
 ### Complex types {#complex-types}
 
 | Iceberg type | ClickHouse type |

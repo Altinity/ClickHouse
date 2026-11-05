@@ -29,7 +29,7 @@ To use token-based authentication, add `token_processors` section to `config.xml
 Its contents are different for different token processor types.
 
 **Common parameters**
-- `type` -- type of token processor. Supported values: `jwt_static_key`, `jwt_static_jwks`, `jwt_dynamic_jwks`, `entra` (`azure` is accepted as a back-compat alias and resolves to the same `entra` processor — see the [Entra](#entra) section), `openid`. Mandatory. Case-insensitive.
+- `type` -- type of token processor. Supported values: `jwt_static_key`, `jwt_static_jwks`, `jwt_dynamic_jwks`, `entra` (`azure` is accepted as a back-compat alias and resolves to the same `entra` processor — see the [Entra](#entra) section), `google`, `openid`. Mandatory. Case-insensitive.
 - `token_cache_lifetime` -- maximum lifetime of cached token (in seconds). Optional, default: 3600.
 - `username_claim` -- name of claim (field) that will be treated as ClickHouse username. Optional, default: "sub".
 - `groups_claim` -- name of claim (field) that contains list of groups user belongs to. This claim will be looked up in the token itself (in case token is a valid JWT, e.g. in Keycloak) or in response from `/userinfo`. Optional, default: "groups".
@@ -131,7 +131,7 @@ For JWKS-based validators (`jwt_static_jwks` and `jwt_dynamic_jwks`), RS* and ES
 
 ## IdP-specific presets and generic external providers
 
-This section covers two related kinds of processor: per-IdP convenience presets built on top of the generic JWT processors (currently `entra`), and the generic `openid` processor that talks to an arbitrary OIDC-compliant identity provider.
+This section covers per-IdP processors (`entra`, built on top of the generic JWT processors, and `google`), and the generic `openid` processor that talks to an arbitrary OIDC-compliant identity provider.
 
 :::note
 If the IdP issues access tokens that follow [RFC 9068](https://datatracker.ietf.org/doc/html/rfc9068) (the *JSON Web Token Profile for OAuth 2.0 Access Tokens*), the access token is itself a verifiable JWT and is best handled by one of the JWT processors above (typically `jwt_dynamic_jwks`) — no `/userinfo` or `/tokeninfo` round-trip is needed. The processors in this section exist for IdPs whose access tokens are opaque (e.g. Google), or whose JWT access tokens you prefer to validate by asking the IdP rather than locally.
@@ -225,6 +225,50 @@ Keep GUIDs in the token and translate them in the user-directory config (see [Id
 When switching from GUIDs to names, retune any `roles_filter` regex — for example `\bclickhouse-[a-zA-Z0-9]+\b` will not match strings like `ch_admin`.
 :::
 
+### Google {#google}
+
+`<type>google</type>` validates Google OAuth 2.0 access tokens. Google access tokens are opaque, so each token is checked against Google's `/tokeninfo` endpoint; `/userinfo` is additionally called only when `username_claim` is not returned by `/tokeninfo`. `expected_audience` and `username_claim` refer to fields of these endpoints' JSON responses, not of the token itself. Clients pass the access token via `--jwt` or the `Authorization: Bearer` header.
+
+Minimum configuration — no parameters are mandatory, but `expected_audience` should be set:
+
+```xml
+<clickhouse>
+    <token_processors>
+        <google_prod>
+          <type>google</type>
+          <expected_audience>1234567890-abcdef.apps.googleusercontent.com</expected_audience>
+        </google_prod>
+    </token_processors>
+</clickhouse>
+```
+
+**Parameters:**
+
+- `expected_audience` — OAuth client ID the token must be issued to (the `aud` field returned by `/tokeninfo`). If unset, any valid Google access token is accepted regardless of the client it was issued to; a warning is logged at startup so the gap is visible.
+- `username_claim` — Field to use as the ClickHouse username. Default: `sub` (the stable Google account ID). Common alternative: `email` (requires the `email` scope). Other fields (e.g. `hd`, or `name` with the `profile` scope) are read from `/userinfo`, which costs an extra request.
+- `token_cache_lifetime` — Same as for other processors.
+
+#### Mapping groups to ClickHouse roles {#google-group-mapping}
+
+When the token carries the user's email, the processor looks up the user's direct Google Groups memberships via the Cloud Identity API and returns group email addresses as external groups. Requirements:
+
+- The token must include the `https://www.googleapis.com/auth/cloud-identity.groups.readonly` scope.
+- The Cloud Identity API must be enabled in the Google Cloud project that owns the OAuth client.
+
+Only direct memberships are returned; groups inherited through nested groups are not. If the lookup fails, the user is still authenticated, without external groups.
+
+Since group identifiers are email addresses, use `roles_filter` and `roles_transform` to turn them into role names. For example, the following maps `ch-analysts@example.com` to the role `ch-analysts`:
+
+```xml
+<user_directories>
+    <token>
+        <processor>google_prod</processor>
+        <roles_filter>ch-[a-z-]+@example\.com</roles_filter>
+        <roles_transform>s/@.*//</roles_transform>
+    </token>
+</user_directories>
+```
+
 ### OpenID
 
 The `openid` processor speaks the OIDC protocol surface — `/userinfo` for identity, plus (when discovered or configured) the local JWT fast-path against the IdP's JWKS and RFC 7662 token introspection. Two mutually-exclusive configuration shapes:
@@ -299,6 +343,39 @@ If the IdP issues access tokens that follow [RFC 9068](https://datatracker.ietf.
 To reduce number of requests to IdP, tokens are cached internally for a maximum period of `token_cache_lifetime` seconds.
 If token expires sooner than `token_cache_lifetime`, then cache entry for this token will only be valid while token is valid.
 If token lifetime is longer than `token_cache_lifetime`, cache entry for this token will be valid for `token_cache_lifetime`. 
+
+## Forwarding the token to external services {#token-forwarding}
+
+By default, the authenticated token is not retained in the session for forwarding. Set
+`enable_token_forwarding` to `1` in `config.xml` to retain it for external-service authentication:
+
+```xml
+<enable_token_forwarding>1</enable_token_forwarding>
+```
+
+The setting is hot-reloadable and defaults to `false`. To use it with Iceberg REST or Glue, enable
+`oauth_forward_user_token` on the [`DataLakeCatalog`](/engines/database-engines/datalakecatalog)
+database. See [catalog token forwarding](/engines/database-engines/datalakecatalog#user-token-forwarding)
+for configuration and examples.
+
+:::danger Restrict `CREATE DATABASE`
+Database creators choose the endpoints that receive users' tokens. Grant `CREATE DATABASE` only
+to trusted users and restrict `remote_url_allow_hosts` for catalog and token-exchange endpoints.
+:::
+
+The forwarded token is sent to the catalog and token-exchange endpoints and, in passthrough mode, is
+also valid for ClickHouse itself. Use HTTPS for these endpoints in production; an HTTP endpoint is
+suitable only for local testing.
+
+Only the session's verified token is forwarded. It is not inherited by `EXECUTE AS` or
+`DEFINER` views, forwarded to other ClickHouse nodes, or persisted to disk.
+
+HTTP requests authenticate separately, so a rotated token takes effect on the next request.
+Native TCP sessions must reconnect with the new token.
+
+With `async_insert = 1`, each queued batch retains its token until the flush completes, even with
+`wait_for_async_insert = 0`. Different tokens use separate batches; rotation does not change a
+queued batch's token.
 
 ## Enabling token authentication for a user in `users.xml` {#enabling-jwt-auth-in-users-xml}
 

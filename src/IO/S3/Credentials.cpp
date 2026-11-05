@@ -57,11 +57,13 @@ namespace S3
 
 #    include <aws/core/utils/HashingUtils.h>
 #    include <aws/core/platform/FileSystem.h>
+#    include <aws/core/auth/signer/AWSNullSigner.h>
 
 #    include <Common/logger_useful.h>
 #    include <Common/Concepts.h>
 #    include <Common/SipHash.h>
 #    include <Common/ProfileEvents.h>
+#    include <Common/FormUrlEncode.h>
 #    include <IO/S3/PocoHTTPClient.h>
 #    include <IO/S3/Client.h>
 
@@ -1148,7 +1150,30 @@ void AssumeRoleRequest::AddQueryStringParameters(Aws::Http::URI & uri) const
         uri.AddQueryStringParameter("ExternalId", external_id);
 }
 
-AssumeRoleResult::AssumeRoleResult(Aws::AmazonWebServiceResult<Aws::Utils::Xml::XmlDocument> result)
+AssumeRoleWithWebIdentityRequest::AssumeRoleWithWebIdentityRequest(
+    std::string role_arn_, std::string role_session_name_, std::string web_identity_token_)
+    : role_arn(std::move(role_arn_))
+    , role_session_name(std::move(role_session_name_))
+    , web_identity_token(std::move(web_identity_token_))
+{
+}
+
+Aws::Http::HeaderValueCollection AssumeRoleWithWebIdentityRequest::GetHeaders() const
+{
+    return {{Aws::Http::HeaderValuePair(Aws::Http::CONTENT_TYPE_HEADER, Aws::FORM_CONTENT_TYPE)}};
+}
+
+Aws::String AssumeRoleWithWebIdentityRequest::SerializePayload() const
+{
+    return fmt::format(
+        "Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn={}&RoleSessionName={}&WebIdentityToken={}",
+        DB::formUrlEncode(role_arn),
+        DB::formUrlEncode(role_session_name),
+        DB::formUrlEncode(web_identity_token));
+}
+
+AssumeRoleResult::AssumeRoleResult(
+    Aws::AmazonWebServiceResult<Aws::Utils::Xml::XmlDocument> result, const char * result_node_name)
 {
     using namespace Aws::Utils::Xml;
     const auto & xml_document = result.GetPayload();
@@ -1160,10 +1185,10 @@ AssumeRoleResult::AssumeRoleResult(Aws::AmazonWebServiceResult<Aws::Utils::Xml::
         return;
     }
 
-    auto assume_role_result_node = response_node.FirstChild("AssumeRoleResult");
+    auto assume_role_result_node = response_node.FirstChild(result_node_name);
     if (assume_role_result_node.IsNull())
     {
-        LOG_WARNING(log, "AssumeRoleResult node is missing");
+        LOG_WARNING(log, "{} node is missing", result_node_name);
         return;
     }
 
@@ -1206,6 +1231,7 @@ AWSAssumeRoleClient::AWSAssumeRoleClient(
     if (!sts_endpoint_override.empty())
     {
         endpoint.SetURL(sts_endpoint_override);
+        web_identity_endpoint.SetURL(sts_endpoint_override);
         return;
     }
 
@@ -1219,14 +1245,26 @@ AWSAssumeRoleClient::AWSAssumeRoleClient(
     if (client_configuration.region != "aws-global")
         endpoint_str += client_configuration.region + ".";
 
-    endpoint_str += "amazonaws.com?Action=AssumeRole&Version=2011-06-15";
+    endpoint_str += "amazonaws.com";
 
-    endpoint.SetURL(endpoint_str);
+    web_identity_endpoint.SetURL(endpoint_str);
+    endpoint.SetURL(endpoint_str + "?Action=AssumeRole&Version=2011-06-15");
 }
 
 AssumeRoleOutcome AWSAssumeRoleClient::assumeRole(const AssumeRoleRequest & request) const
 {
     return AssumeRoleOutcome(MakeRequest(request, endpoint, Aws::Http::HttpMethod::HTTP_POST));
+}
+
+AssumeRoleOutcome AWSAssumeRoleClient::assumeRoleWithWebIdentity(const AssumeRoleWithWebIdentityRequest & request) const
+{
+    auto outcome = MakeRequest(
+        request, web_identity_endpoint, Aws::Http::HttpMethod::HTTP_POST, Aws::Auth::NULL_SIGNER);
+
+    if (!outcome.IsSuccess())
+        return AssumeRoleOutcome(outcome.GetError());
+
+    return AssumeRoleOutcome(AssumeRoleResult(outcome.GetResultWithOwnership(), "AssumeRoleWithWebIdentityResult"));
 }
 
 void AwsAuthSTSAssumeRoleCredentialsProvider::CacheKey::updateHash(SipHash & hash) const
@@ -1316,6 +1354,67 @@ void AwsAuthSTSAssumeRoleCredentialsProvider::Reload()
     AWSCredentialsProvider::Reload();
 
     LOG_TRACE(logger, "Successfully retrieved credentials");
+}
+
+AwsAuthSTSAssumeRoleWithWebIdentityCredentialsProvider::AwsAuthSTSAssumeRoleWithWebIdentityCredentialsProvider(
+    std::string role_arn_,
+    std::string session_name_,
+    std::string web_identity_token_,
+    uint64_t expiration_window_seconds_,
+    std::shared_ptr<AWSAssumeRoleClient> client_)
+    : role_arn(std::move(role_arn_))
+    , session_name(std::move(session_name_))
+    , web_identity_token(std::move(web_identity_token_))
+    , expiration_window_seconds(expiration_window_seconds_)
+    , client(std::move(client_))
+    , logger(getLogger("AwsAuthSTSAssumeRoleWithWebIdentityCredentialsProvider"))
+{
+}
+
+Aws::Auth::AWSCredentials AwsAuthSTSAssumeRoleWithWebIdentityCredentialsProvider::GetAWSCredentials()
+{
+    Aws::Utils::Threading::ReaderLockGuard guard(m_reloadLock);
+    if (!IsSetNeedRefresh() && !areCredentialsEmptyOrExpired(credentials, expiration_window_seconds))
+        return credentials;
+
+    guard.UpgradeToWriterLock();
+    if (!IsSetNeedRefresh() && !areCredentialsEmptyOrExpired(credentials, expiration_window_seconds)) // double-checked lock to avoid refreshing twice
+        return credentials;
+
+    Reload();
+    return credentials;
+}
+
+void AwsAuthSTSAssumeRoleWithWebIdentityCredentialsProvider::Reload()
+{
+    LOG_INFO(logger, "Credentials are empty or expired, attempting to renew with AssumeRoleWithWebIdentity for role {}", role_arn);
+
+    AssumeRoleWithWebIdentityRequest request(role_arn, session_name, web_identity_token);
+    auto outcome = client->assumeRoleWithWebIdentity(request);
+    if (!outcome.IsSuccess())
+    {
+        credentials = Aws::Auth::AWSCredentials{};
+        last_error = outcome.GetError().GetMessage();
+        LOG_WARNING(logger, "Failed to get credentials using AssumeRoleWithWebIdentity. Error: {}", last_error);
+        return;
+    }
+
+    last_error.clear();
+    const auto & result = outcome.GetResult();
+    credentials.SetAWSAccessKeyId(result.getAccessKeyID());
+    credentials.SetAWSSecretKey(result.getSecretAccessKey());
+    credentials.SetSessionToken(result.getSessionToken());
+    credentials.SetExpiration(result.getExpiration());
+
+    AWSCredentialsProvider::Reload();
+
+    LOG_TRACE(logger, "Successfully retrieved credentials for role {}", role_arn);
+}
+
+std::string AwsAuthSTSAssumeRoleWithWebIdentityCredentialsProvider::getLastError() const
+{
+    Aws::Utils::Threading::ReaderLockGuard guard(m_reloadLock);
+    return last_error;
 }
 
 std::shared_ptr<Aws::Auth::AWSCredentialsProvider> getCredentialsProvider(

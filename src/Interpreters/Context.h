@@ -15,6 +15,7 @@
 #include <IO/WriteSettings.h>
 #include <Disks/IO/getThreadPoolReader.h>
 #include <Formats/FormatSettings.h>
+#include <Access/ForwardedAuthToken.h>
 #include <Interpreters/ClientInfo.h>
 #include <Interpreters/Context_fwd.h>
 #include <Interpreters/StorageID.h>
@@ -361,6 +362,7 @@ protected:
     ContextSharedPart * shared{};
 
     ClientInfo client_info;
+    ForwardedAuthTokenPtr forwarded_auth_token;
     ExternalTablesInitializer external_tables_initializer_callback;
     QueryPlanDeserializationCallback query_plan_deserialization_callback;
 
@@ -968,6 +970,9 @@ public:
 
     /// Modify stored in the context information about the client executing a query.
     void setClientInfo(const ClientInfo & client_info_);
+
+    const ForwardedAuthTokenPtr & getForwardedAuthToken() const { return forwarded_auth_token; }
+    void setForwardedAuthToken(ForwardedAuthTokenPtr token);
     void setClientName(const String & client_name);
     void setClientInterface(ClientInfo::Interface interface);
     void setClientVersion(UInt64 client_version_major, UInt64 client_version_minor, UInt64 client_version_patch, unsigned client_tcp_protocol_version);
@@ -1685,7 +1690,14 @@ public:
     /// Provides storage disks
     DiskPtr getDisk(const String & name) const;
     using DiskCreator = std::function<DiskPtr(const DisksMap & disks_map)>;
+    /// Returns the disk `name`, creating it with `creator` if it does not exist yet. The creator runs
+    /// without the storage lock and gets a snapshot of the disks. Concurrent calls for the same name
+    /// share one creation: the calling creator gets the disk or rethrows its own exception, the others
+    /// get the disk or a copy of the exception. A failed creation is not remembered. The creator must
+    /// not call `getOrCreateDisk` for its own name: it would wait for itself.
     DiskPtr getOrCreateDisk(const String & name, DiskCreator creator) const;
+    /// For tests: the number of requests waiting for a creation of the disk `name` started by another request.
+    size_t getDiskCreationWaitersForTest(const String & name) const;
 
     StoragePoliciesMap getPoliciesMap() const;
     DisksMap getDisksMap() const;
@@ -1955,6 +1967,8 @@ private:
     StoragePolicySelectorPtr getStoragePolicySelector(std::lock_guard<std::mutex> & lock) const;
 
     DiskSelectorPtr getDiskSelector(std::lock_guard<std::mutex> & lock) const;
+    /// Like `DiskSelector::get`, but says so when the disk is still being created by `getOrCreateDisk`.
+    DiskPtr getDiskOrExplainCreation(std::lock_guard<std::mutex> & lock, const String & name) const;
 
     DisksMap getDisksMap(std::lock_guard<std::mutex> & lock) const;
 

@@ -1,4 +1,4 @@
--- Tags: no-fasttest
+-- Tags: no-fasttest, no-cpu-s390x
 -- ^ DataSketches is not built in fast-test builds.
 
 -- The state of a `Nullable` argument is the same bare DataSketches sketch as the state of a plain one,

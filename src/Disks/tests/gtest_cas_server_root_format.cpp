@@ -1,8 +1,11 @@
 #include "cas_format_test_battery.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Common/Exception.h>
+#include <IO/ReadBufferFromMemory.h>
 #include <limits>
+#include <optional>
 
 using namespace DB::Cas;
 
@@ -46,10 +49,48 @@ TEST(CASFormatBattery, ServerEpoch)
 {
     ServerEpoch e;
     e.next_writer_epoch = 7;
+    e.allocation_nonce = hexToU128("0123456789abcdeffedcba9876543210");
+    const String golden = currentFormatHeader("cas_epoch")
+        + "{\"next_writer_epoch\":\"7\",\"allocation_nonce\":\"0123456789abcdeffedcba9876543210\"}\n";
+    const ServerEpoch back = decodeServerEpoch(golden);
+    EXPECT_EQ(back.next_writer_epoch, 7u);
+    EXPECT_EQ(back.allocation_nonce, e.allocation_nonce);
     runFormatBattery({FormatId::ServerEpoch,
         [&] { return sealObject(FormatId::ServerEpoch, encodeServerEpoch(e)); },
         [](std::string_view s) { decodeServerEpoch(std::string(openObject(FormatId::ServerEpoch, s))); },
-        currentFormatHeader("cas_epoch") + "{\"next_writer_epoch\":\"7\"}\n"});
+        golden});
+}
+
+/// The counter body written by 26.6.4, before the allocation nonce existed.
+TEST(CASServerEpochFormat, BodyWithoutNonceDecodes)
+{
+    const ServerEpoch e = decodeServerEpoch(currentFormatHeader("cas_epoch") + "{\"next_writer_epoch\":\"7\"}\n");
+    EXPECT_EQ(e.next_writer_epoch, 7u);
+    EXPECT_FALSE(e.allocation_nonce.has_value());
+}
+
+/// The 26.6.4 decoder's loop: it knows only `next_writer_epoch` and hands every other key to `skipUnknown`.
+TEST(CASServerEpochFormat, NonceBodyDecodesWithThe2664KeySet)
+{
+    const String body = encodeServerEpoch(ServerEpoch{
+        .next_writer_epoch = 7, .allocation_nonce = hexToU128("0123456789abcdeffedcba9876543210")});
+    DB::ReadBufferFromMemory in(body.data(), body.size());
+    expectHeaderLine(in, FormatId::ServerEpoch);
+    const String line = readLine(in, traitsFor(FormatId::ServerEpoch).line_cap, "server-epoch");
+    DB::ReadBufferFromMemory line_in(line.data(), line.size());
+    JsonObjectReader r(line_in, "server-epoch");
+    std::optional<uint64_t> next;
+    String key;
+    while (r.nextKey(key))
+    {
+        if (key == "next_writer_epoch")
+            next = r.readU64String();
+        else
+            r.skipUnknown(key);
+    }
+    EXPECT_EQ(next, 7u);
+    EXPECT_TRUE(line_in.eof());
+    EXPECT_TRUE(in.eof());
 }
 
 TEST(CASServerEpochFormat, ZeroNextWriterEpochIsRejected)
@@ -180,4 +221,62 @@ TEST(CASMountLeaseFormat, RejectsMissingIdentityFields)
     expectMessage(header + "{" + epoch + attempt + rest + "\n", "CAS mount-lease: missing server_uuid");
     expectMessage(header + "{" + uuid + attempt + rest + "\n", "CAS mount-lease: missing writer_epoch");
     expectMessage(header + "{" + uuid + epoch + rest + "\n", "CAS mount-lease: missing or zero write_attempt_id");
+}
+
+TEST(CASOwnerFormat, LifeAndVerifiedRoundTrip)
+{
+    OwnerObject o;
+    o.server_uuid = hexToU128("0123456789abcdeffedcba9876543210");
+    o.retired_at_ms = 1752537600000ULL;
+    o.owner_life = 7;
+    o.retirement_verified = true;
+    EXPECT_EQ(encodeOwner(o), currentFormatHeader("cas_owner")
+        + "{\"server_uuid\":\"0123456789abcdeffedcba9876543210\",\"retired_at_ms\":1752537600000,"
+          "\"owner_life\":\"7\",\"retirement_verified\":true}\n");
+    const OwnerObject back = decodeOwner(encodeOwner(o));
+    EXPECT_EQ(back.owner_life, 7u);
+    EXPECT_TRUE(back.retirement_verified);
+    EXPECT_EQ(back.retired_at_ms, o.retired_at_ms);
+}
+
+/// The owner body written by 26.6.4 and by a never-retired owner: no life, no mark.
+TEST(CASOwnerFormat, BodyWithoutLifeReadsAsZeroAndUnverified)
+{
+    const OwnerObject o = decodeOwner(currentFormatHeader("cas_owner")
+        + "{\"server_uuid\":\"0123456789abcdeffedcba9876543210\"}\n");
+    EXPECT_EQ(o.owner_life, 0u);
+    EXPECT_FALSE(o.retirement_verified);
+    OwnerObject zero;
+    zero.server_uuid = o.server_uuid;
+    EXPECT_EQ(encodeOwner(zero), currentFormatHeader("cas_owner")
+        + "{\"server_uuid\":\"0123456789abcdeffedcba9876543210\"}\n")
+        << "a zero life and a false mark are not written, so the 26.6.4 bytes stay reachable";
+}
+
+/// The 26.6.4 decoder's loop knows `server_uuid` and `retired_at_ms` and hands every other key to `skipUnknown`.
+TEST(CASOwnerFormat, NewFieldsDecodeWithThe2664KeySet)
+{
+    const String body = encodeOwner(OwnerObject{
+        .server_uuid = hexToU128("0123456789abcdeffedcba9876543210"),
+        .retired_at_ms = 5, .owner_life = 3, .retirement_verified = true});
+    DB::ReadBufferFromMemory in(body.data(), body.size());
+    expectHeaderLine(in, FormatId::Owner);
+    const String line = readLine(in, traitsFor(FormatId::Owner).line_cap, "owner");
+    DB::ReadBufferFromMemory line_in(line.data(), line.size());
+    JsonObjectReader r(line_in, "owner");
+    String key;
+    std::optional<UInt128> uuid;
+    std::optional<uint64_t> retired;
+    while (r.nextKey(key))
+    {
+        if (key == "server_uuid")
+            uuid = r.readHex128();
+        else if (key == "retired_at_ms")
+            retired = r.readU64Number();
+        else
+            r.skipUnknown(key);
+    }
+    EXPECT_EQ(uuid, hexToU128("0123456789abcdeffedcba9876543210"));
+    EXPECT_EQ(retired, 5u);
+    EXPECT_TRUE(line_in.eof());
 }

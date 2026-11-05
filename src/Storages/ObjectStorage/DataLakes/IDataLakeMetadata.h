@@ -75,7 +75,8 @@ public:
         Int32 table_schema_id,
         Int32 file_schema_id,
         const std::unordered_map<Int32, Iceberg::ColumnInfo> & columns_info_,
-        const std::unordered_map<Int32, std::pair<Field, Field>> & value_bounds_);
+        const std::unordered_map<Int32, std::pair<Field, Field>> & value_bounds_,
+        const String & file_path);
 
     void serialize(WriteBuffer & out) const;
     static DataFileMetaInfo deserialize(ReadBuffer & in);
@@ -241,7 +242,11 @@ public:
         }
 
     virtual bool optimize(
-        const StorageMetadataPtr & /*metadata_snapshot*/, ContextPtr /*context*/, const std::optional<FormatSettings> & /*format_settings*/)
+        const StorageMetadataPtr & /*metadata_snapshot*/,
+        ContextPtr /*context*/,
+        const std::optional<FormatSettings> & /*format_settings*/,
+        std::shared_ptr<DataLake::ICatalog> /*catalog*/,
+        const StorageID & /*storage_id*/)
     {
         return false;
     }

@@ -84,8 +84,8 @@ JWKSType JWKSClient::getJWKS()
         session.sendRequest(request);
         std::istream & response_stream = session.receiveResponse(response);
         if (response.getStatus() != Poco::Net::HTTPResponse::HTTP_OK || !response_stream)
-            throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Failed to get user info by access token, code: {}, reason: {}",
-                response.getStatus(), response.getReason());
+            throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "GET to '{}' returned HTTP {} ({})",
+                jwks_uri.toString(), static_cast<int>(response.getStatus()), response.getReason());
         Poco::StreamCopier::copyToString(response_stream, response_string);
     }
     else
@@ -95,7 +95,8 @@ JWKSType JWKSClient::getJWKS()
         session.sendRequest(request);
         std::istream & response_stream = session.receiveResponse(response);
         if (response.getStatus() != Poco::Net::HTTPResponse::HTTP_OK || !response_stream)
-            throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Failed to get user info by access token, code: {}, reason: {}", response.getStatus(), response.getReason());
+            throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "GET to '{}' returned HTTP {} ({})",
+                jwks_uri.toString(), static_cast<int>(response.getStatus()), response.getReason());
         Poco::StreamCopier::copyToString(response_stream, response_string);
     }
 

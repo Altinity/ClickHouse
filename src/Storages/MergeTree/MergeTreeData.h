@@ -664,6 +664,15 @@ public:
         RangesInDataPartsPtr parts;
 
         MutationsSnapshotPtr mutations_snapshot;
+
+        std::unique_ptr<StorageSnapshot::Data> clone() const override
+        {
+            auto copy = std::make_unique<SnapshotData>();
+            copy->storage = storage;
+            copy->parts = parts;
+            copy->mutations_snapshot = mutations_snapshot;
+            return copy;
+        }
     };
 
     StorageSnapshotPtr getStorageSnapshot(const StorageMetadataPtr & metadata_snapshot, ContextPtr query_context) const override;

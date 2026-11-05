@@ -141,7 +141,7 @@ void HiveCatalog::executeWithRetry(Func && func) const
         DB::ErrorCodes::NO_HIVEMETASTORE, "Hive Metastore connection failed after {} attempts. Last error: {}", max_retries, last_err_msg);
 }
 
-bool HiveCatalog::empty() const
+bool HiveCatalog::empty(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     fiu_do_on(DB::FailPoints::check_database_datalake_negative,
     {
@@ -154,7 +154,7 @@ bool HiveCatalog::empty() const
     return result.empty();
 }
 
-DB::Names HiveCatalog::getTables() const
+DB::Names HiveCatalog::getTables(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     DB::Names result;
     DB::Names databases;
@@ -171,7 +171,7 @@ DB::Names HiveCatalog::getTables() const
     return result;
 }
 
-DataLake::ICatalog::Namespaces HiveCatalog::getNamespaces() const
+DataLake::ICatalog::Namespaces HiveCatalog::getNamespaces(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     /// HMS databases are flat — they cannot contain nested namespaces.
     DB::Names databases;
@@ -179,7 +179,7 @@ DataLake::ICatalog::Namespaces HiveCatalog::getNamespaces() const
     return databases;
 }
 
-DB::Names HiveCatalog::listTablesInNamespaceDirect(const std::string & namespace_name) const
+DB::Names HiveCatalog::listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     DB::Names current_tables;
     /// Retry transient `TTransportException` (same wrapper as `getTables`) rather
@@ -192,7 +192,7 @@ DB::Names HiveCatalog::listTablesInNamespaceDirect(const std::string & namespace
     return result;
 }
 
-bool HiveCatalog::existsTable(const std::string & namespace_name, const std::string & table_name) const
+bool HiveCatalog::existsTable(const std::string & namespace_name, const std::string & table_name, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     Apache::Hadoop::Hive::Table table;
 

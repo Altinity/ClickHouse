@@ -48,18 +48,19 @@ StorageSystemContentAddressedMounts::StorageSystemContentAddressedMounts(const S
         {"expires_at", std::make_shared<DataTypeDateTime64>(3), "Time when the lease expires."},
         {"min_active_build_sequence", std::make_shared<DataTypeUInt64>(), "Oldest in-flight build sequence (UINT64_MAX means the mount said farewell)."},
         {"gc_fenced", std::make_shared<DataTypeUInt8>(), "1 if GC fenced this slot out (terminal)."},
-        {"state", std::make_shared<DataTypeString>(), "Mount slot state: live, expired, terminated, fenced or corrupt."},
+        {"state", std::make_shared<DataTypeString>(), "Mount slot state: live, expired, terminated, fenced, retired or corrupt."},
         {"is_leader", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt8>()), "1 if this server's GC scheduler holds this disk's leadership lease. NULL on rows describing other servers' mounts."},
         {"pending_reclaim", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeInt64>()), "Cumulative condemned-minus-deleted backlog observed by this process's GC on this disk. NULL on rows describing other servers' mounts."},
         {"last_success_age_seconds", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt64>()), "Seconds since this disk's GC last led a round (0 if it never led). NULL on rows describing other servers' mounts."},
         {"wedged_namespace_count", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt64>()), "Ref-append lanes currently wedged on this disk. NULL on rows describing other servers' mounts."},
         {"lifecycle", std::make_shared<DataTypeString>(), "This server's content-addressed pool lifecycle for the disk (non-gated snapshot, always populated so a not-live disk stays visible): live, not_live, identity_lost, vanished, constructing (never started) or shutdown (torn down)."},
-        {"lifecycle_reason", std::make_shared<DataTypeString>(), "The enum-clean sub-state word for a vanished disk: replaced or forgotten. Empty for every other lifecycle (so lifecycle || '(' || lifecycle_reason || ')' reads e.g. vanished(forgotten))."},
-        {"lifecycle_detail", std::make_shared<DataTypeString>(), "The full typed reason text naming the actual cause when not live: the vanish diagnosis (data root replaced by a foreign pool / decommissioned by SYSTEM CAS FORGET at <time>) or the identity-loss message. Empty when live."},
-        {"lifecycle_since", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeDateTime>()), "When this server entered the current non-live lifecycle state. NULL when live (or the state is not backed by a live pool)."},
+        {"lifecycle_reason", std::make_shared<DataTypeString>(), "The enum-clean sub-state word: replaced or forgotten for a vanished disk, lease_expired for a not_live disk whose mount lease has too little time left to admit a write while its renewal keeps retrying. Empty for every other lifecycle (so lifecycle || '(' || lifecycle_reason || ')' reads e.g. vanished(forgotten))."},
+        {"lifecycle_detail", std::make_shared<DataTypeString>(), "The full typed reason text naming the actual cause when not live: the vanish diagnosis (data root replaced by a foreign pool / decommissioned by SYSTEM CAS FORGET at <time>) or the identity-loss message. Empty when live, and for not_live with lifecycle_reason lease_expired."},
+        {"lifecycle_since", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeDateTime>()), "When this server entered the current non-live lifecycle state; for lease_expired, when writes paused. NULL when live (or the state is not backed by a live pool)."},
         {"renewal_in_progress", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt8>()), "1 while this server renews its mount lease. NULL on rows describing other servers' mounts."},
         {"renewal_attempts", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt64>()), "Conditional PUTs sent by the current lease renewal, or by the last one once it ended. NULL on rows describing other servers' mounts."},
         {"last_renewal_error", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeString>()), "The last failed request of that renewal: '<VERB> <key>: <refused|transport> <code> <message>'. NULL when none failed, and on rows describing other servers' mounts."},
+        {"retirement_verified", std::make_shared<DataTypeUInt8>(), "1 if a decommission verified the retirement of a retired member, 0 otherwise."},
     }));
     storage_metadata.setVirtuals(createVirtuals());
     setInMemoryMetadata(storage_metadata);
@@ -107,6 +108,7 @@ Pipe StorageSystemContentAddressedMounts::read(
     MutableColumnPtr col_renewal_in_progress = ColumnNullable::create(ColumnUInt8::create(), ColumnUInt8::create());
     MutableColumnPtr col_renewal_attempts = ColumnNullable::create(ColumnUInt64::create(), ColumnUInt8::create());
     MutableColumnPtr col_last_renewal_error = ColumnNullable::create(ColumnString::create(), ColumnUInt8::create());
+    MutableColumnPtr col_retirement_verified = ColumnUInt8::create();
 
     const uint64_t now_ms = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -210,6 +212,7 @@ Pipe StorageSystemContentAddressedMounts::read(
                     col_min_active->insert(m.lease.min_active_build_sequence);
                     col_fenced->insert(static_cast<UInt8>(m.lease.gc_fenced));
                     col_state->insert(m.state);
+                    col_retirement_verified->insert(static_cast<UInt8>(m.retirement_verified));
 
                     /// GC health is a process-local fact about THIS server's scheduler. Stamping it onto
                     /// peer rows misreads as "peer B is GC leader" during incidents — NULL there instead.
@@ -255,6 +258,7 @@ Pipe StorageSystemContentAddressedMounts::read(
             col_min_active->insertDefault();
             col_fenced->insertDefault();
             col_state->insertDefault();
+            col_retirement_verified->insertDefault();
             col_is_leader->insertDefault();
             col_pending->insertDefault();
             col_last_success->insertDefault();
@@ -288,6 +292,7 @@ Pipe StorageSystemContentAddressedMounts::read(
     res_columns.emplace_back(std::move(col_renewal_in_progress));
     res_columns.emplace_back(std::move(col_renewal_attempts));
     res_columns.emplace_back(std::move(col_last_renewal_error));
+    res_columns.emplace_back(std::move(col_retirement_verified));
 
     UInt64 num_rows = res_columns.at(0)->size();
     Chunk chunk(std::move(res_columns), num_rows);

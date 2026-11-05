@@ -10,7 +10,6 @@
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeUUID.h>
 #include <DataTypes/DataTypesNumber.h>
-#include <DataTypes/DataTypeString.h>
 #include <DataTypes/NestedUtils.h>
 
 #include <Disks/IVolume.h>
@@ -55,7 +54,6 @@
 #include <Parsers/parseQuery.h>
 
 #include <Analyzer/ColumnNode.h>
-#include <Analyzer/ConstantNode.h>
 #include <Analyzer/FunctionNode.h>
 #include <Analyzer/TableNode.h>
 #include <Analyzer/TableFunctionNode.h>
@@ -213,7 +211,6 @@ namespace Setting
     extern const SettingsBool skip_unavailable_shards;
     extern const SettingsBool enable_global_with_statement;
     extern const SettingsBool allow_experimental_hybrid_table;
-    extern const SettingsBool enable_alias_marker;
 }
 
 namespace DistributedSetting
@@ -849,73 +846,6 @@ StorageSnapshotPtr StorageDistributed::getStorageSnapshot(const StorageMetadataP
 namespace
 {
 
-class ReplaseAliasColumnsVisitor : public InDepthQueryTreeVisitor<ReplaseAliasColumnsVisitor>
-{
-    QueryTreeNodePtr getColumnNodeAliasExpression(const QueryTreeNodePtr & node) const
-    {
-        const auto * column_node = node->as<ColumnNode>();
-        if (!column_node || !column_node->hasExpression())
-            return nullptr;
-
-        const auto & column_source = column_node->getColumnSourceOrNull();
-        if (!column_source || column_source->getNodeType() == QueryTreeNodeType::JOIN
-                           || column_source->getNodeType() == QueryTreeNodeType::CROSS_JOIN
-                           || column_source->getNodeType() == QueryTreeNodeType::ARRAY_JOIN)
-            return nullptr;
-
-        auto column_expression = column_node->getExpression();
-        const auto & column_name = column_node->getColumnName();
-
-        if (!context->getSettingsRef()[Setting::enable_alias_marker])
-        {
-            column_expression->setAlias(column_name);
-            return column_expression;
-        }
-
-        String alias_id;
-        const auto & source_alias = column_source->getAlias();
-        if (!source_alias.empty())
-            alias_id = source_alias + "." + column_name;
-        else
-            alias_id = column_name;
-
-        if (auto * function_node = column_expression->as<FunctionNode>();
-            function_node && function_node->getFunctionName() == "__aliasMarker")
-        {
-            auto & arguments = function_node->getArguments().getNodes();
-            if (arguments.size() == 2)
-                arguments[1] = std::make_shared<ConstantNode>(alias_id, std::make_shared<DataTypeString>());
-
-            column_expression->setAlias(column_name);
-            return column_expression;
-        }
-
-        QueryTreeNodes arguments;
-        arguments.reserve(2);
-        arguments.emplace_back(std::move(column_expression));
-        arguments.emplace_back(std::make_shared<ConstantNode>(alias_id, std::make_shared<DataTypeString>()));
-
-        auto alias_marker_node = std::make_shared<FunctionNode>("__aliasMarker");
-        alias_marker_node->getArguments().getNodes() = std::move(arguments);
-        alias_marker_node->setAlias(column_name);
-        resolveOrdinaryFunctionNodeByName(*alias_marker_node, "__aliasMarker", context);
-
-        return alias_marker_node;
-    }
-
-public:
-    explicit ReplaseAliasColumnsVisitor(ContextPtr context_) : context(std::move(context_)) {}
-
-    void visitImpl(QueryTreeNodePtr & node)
-    {
-        if (auto column_expression = getColumnNodeAliasExpression(node))
-            node = column_expression;
-    }
-
-private:
-    ContextPtr context;
-};
-
 using ColumnNameToColumnNodeMap = std::unordered_map<std::string, ColumnNodePtr>;
 
 ColumnNameToColumnNodeMap buildColumnNodesForTableExpression(const QueryTreeNodePtr & table_expression_node, const ContextPtr & context)
@@ -1151,7 +1081,7 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
          * (including fully-resolved ALIAS expressions) and rewrite the whole query tree
          * so all references to the replaced table share the same column source and
          * the same alias semantics. This keeps SELECT and WHERE consistent before
-         * ReplaseAliasColumnsVisitor performs final alias expansion.
+         * inlineAliasColumns performs final alias expansion.
          */
         ReplaceColumnNodesForTableExpressionVisitor replace_query_columns_visitor(
             replacement_table_expression,
@@ -1160,8 +1090,7 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
         replace_query_columns_visitor.visit(query_tree_to_modify);
     }
 
-    ReplaseAliasColumnsVisitor replace_alias_columns_visitor(query_context);
-    replace_alias_columns_visitor.visit(query_tree_to_modify);
+    inlineAliasColumns(query_tree_to_modify, query_context);
 
     const auto & settings = query_context->getSettingsRef();
 
@@ -1174,8 +1103,9 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
         rewriteJoinToGlobalJoinIfNeeded(query_node.getJoinTree());
     }
 
+    /// `buildQueryTreeForShard` materializes the marker ids on the way out, after the `__tableN` renumbering they are
+    /// built from.
     return buildQueryTreeForShard(query_info.planner_context, query_tree_to_modify, /*allow_global_join_for_right_table*/ false);
-
 }
 
 std::optional<std::pair<String, String>> tryGetParamTypeAndName(const ASTPtr & node)

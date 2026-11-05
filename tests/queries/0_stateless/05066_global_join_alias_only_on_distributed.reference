@@ -1,0 +1,18 @@
+projected_marker_on
+1	20
+2	40
+3	60
+clause_only_marker_on
+2
+3
+projected_marker_off
+1	20
+2	40
+3	60
+clause_only_marker_off
+2
+3
+implicit_global_join
+1	20
+2	40
+3	60

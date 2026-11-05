@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-fasttest
+# Tags: no-fasttest, no-cpu-s390x
 # no-fasttest -- compiled w/o datasketches
 
 # Malformed states must raise `CORRUPTED_DATA`, not a logical exception.
