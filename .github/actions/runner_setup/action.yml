@@ -25,7 +25,7 @@ runs:
           ZRAM_SIZE=$(($MemTotal / 1024 / 1024 * $Percent / 100)) # Convert to GiB
           .github/retry.sh 30 2 sudo zramctl --size ${ZRAM_SIZE}GiB --algorithm zstd /dev/zram0
           sudo mkswap /dev/zram0 && sudo swapon -p 100 /dev/zram0
-          sudo sysctl vm.swappiness=200
+          sudo sysctl vm.swappiness=80
     - name: Install awscli
       shell: bash
       run: |
