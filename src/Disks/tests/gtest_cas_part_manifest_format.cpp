@@ -9,6 +9,11 @@
 
 using namespace DB::Cas;
 
+namespace DB::ErrorCodes
+{
+    extern const int LIMIT_EXCEEDED;
+}
+
 namespace
 {
 
@@ -342,6 +347,77 @@ TEST(CASPartManifestFormat, EncodeRejectsMalformedEntryPaths)
         manifest.entries[0].path = path;
         expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodePartManifest(manifest); });
     }
+}
+
+TEST(CASPartManifestFormat, EncodeEnforcesEntryRecordLineCap)
+{
+    const size_t line_cap = traitsFor(FormatId::PartManifest).line_cap;
+    for (const EntryPlacement placement : {EntryPlacement::Inline, EntryPlacement::Blob})
+    {
+        const size_t record_bytes = placement == EntryPlacement::Inline
+            ? std::string_view{R"({"path":"","place":"inline","size":1})"}.size()
+            : std::string_view{R"({"path":"","place":"blob","algo":"ch128","digest":"00112233445566778899aabbccddeeff","size":10})"}.size();
+        for (const char path_char : {'a', '"', '\x01'})
+        {
+            const size_t escaped_char_bytes = path_char == 'a' ? 1 : path_char == '"' ? 2 : 6;
+            for (const size_t record_size : {line_cap - 1, line_cap, line_cap + 1})
+            {
+                SCOPED_TRACE(static_cast<int>(placement));
+                SCOPED_TRACE(static_cast<int>(path_char));
+                SCOPED_TRACE(record_size);
+                PartManifest manifest = manifestWithSinglePath("safe");
+                auto & entry = manifest.entries[0];
+                entry.placement = placement;
+                entry.inline_bytes = "v";
+                const size_t path_bytes = record_size - record_bytes;
+                entry.path = String(path_bytes / escaped_char_bytes, path_char) + String(path_bytes % escaped_char_bytes, 'a');
+                if (record_size > line_cap)
+                    expectThrowsCode(DB::ErrorCodes::LIMIT_EXCEEDED, [&] { encodePartManifest(manifest); });
+                else
+                {
+                    manifest.payload_digest = computePayloadDigest(manifest);
+                    const auto decoded = decodePartManifest(encodePartManifest(manifest));
+                    ASSERT_EQ(decoded.entries.size(), 1u);
+                    EXPECT_EQ(decoded.entries[0].path, entry.path);
+                    EXPECT_EQ(decoded.entries[0].size(), entry.size());
+                }
+            }
+        }
+    }
+}
+
+TEST(CASPartManifestFormat, EncodeEnforcesDescriptorLineCap)
+{
+    const size_t line_cap = traitsFor(FormatId::PartManifest).line_cap;
+    const size_t descriptor_bytes = std::string_view{
+        R"({"epoch":"17","build":"66","ord":7,"namespace":"","payload_digest":"00000000000000000000000000000000"})"}.size();
+    for (const size_t record_size : {line_cap, line_cap + 1})
+    {
+        SCOPED_TRACE(record_size);
+        PartManifest manifest = manifestWithSinglePath("safe");
+        manifest.entries.clear();
+        manifest.root_namespace_id = RootNamespace(String(record_size - descriptor_bytes, 'a'));
+        if (record_size > line_cap)
+            expectThrowsCode(DB::ErrorCodes::LIMIT_EXCEEDED, [&] { encodePartManifest(manifest); });
+        else
+        {
+            manifest.payload_digest = computePayloadDigest(manifest);
+            const auto decoded = decodePartManifest(encodePartManifest(manifest));
+            EXPECT_EQ(decoded.root_namespace_id, manifest.root_namespace_id);
+        }
+    }
+}
+
+TEST(CASPartManifestFormat, InlinePayloadMayExceedLineCap)
+{
+    PartManifest manifest = manifestWithSinglePath("safe");
+    auto & entry = manifest.entries[0];
+    entry.placement = EntryPlacement::Inline;
+    entry.inline_bytes = String(traitsFor(FormatId::PartManifest).line_cap + 1, '\x01');
+    manifest.payload_digest = computePayloadDigest(manifest);
+    const auto decoded = decodePartManifest(encodePartManifest(manifest));
+    ASSERT_EQ(decoded.entries.size(), 1u);
+    EXPECT_EQ(decoded.entries[0].inline_bytes, entry.inline_bytes);
 }
 
 TEST(CASPartManifestFormat, DecodeRejectsMalformedEntryPaths)
