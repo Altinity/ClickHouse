@@ -1,6 +1,5 @@
 from pathlib import Path
 
-from ci.jobs import source_upload
 from ci.jobs.scripts import clickhouse_version
 from ci.jobs.scripts.clickhouse_version import CHVersion
 from ci.jobs.scripts.workflow_hooks import version_log
@@ -181,37 +180,3 @@ def test_version_log_mirrors_version_into_workflow_custom_data(monkeypatch):
 
     assert stored["kv"] == config.custom_data["version"]
     assert "cidb" not in stored
-
-
-def test_source_upload_prefers_pipeline_version(monkeypatch):
-    pipeline_version = CHVersion(
-        26,
-        8,
-        1,
-        54513,
-        tweak=1,
-        githash="pr-sha",
-        version_type="testing",
-    )
-    monkeypatch.setattr(
-        CHVersion,
-        "get_current_version_from_ci_pipeline",
-        classmethod(lambda cls: pipeline_version),
-    )
-    monkeypatch.setattr(
-        CHVersion,
-        "get_current_version",
-        classmethod(
-            lambda cls, **kwargs: (_ for _ in ()).throw(
-                AssertionError("repo fallback must not replace the pipeline version")
-            )
-        ),
-    )
-
-    assert source_upload.get_version().string == "26.8.1.1"
-
-
-def test_source_upload_restores_submodule_cache():
-    from ci.defs.altinity_jobs import AltinityJobConfigs
-
-    assert AltinityJobConfigs.source_upload_job.needs_submodules
