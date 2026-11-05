@@ -12,7 +12,6 @@ concurrency:
 env:
   PYTHONUNBUFFERED: 1
   CHECKOUT_REF: ""
-  S3_ARTIFACT_BUCKET: ${{ vars.S3_ARTIFACT_BUCKET }}
 
 jobs:
 
