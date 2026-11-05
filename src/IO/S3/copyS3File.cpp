@@ -665,6 +665,12 @@ namespace
             bool source_allows_range_copy = src_object_size > MIN_SOURCE_SIZE_FOR_RANGE_COPY;
             if (is_ranged_copy && (!multipart_copy_available || !source_allows_range_copy))
             {
+                LOG_TRACE(
+                    log,
+                    "Ranged copy of {} cannot be native, will copy through buffers: multipart copy available = {}, source object size = {}",
+                    src_key,
+                    multipart_copy_available,
+                    src_object_size);
                 fallback_method();
                 return;
             }

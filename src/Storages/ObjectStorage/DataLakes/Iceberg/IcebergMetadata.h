@@ -185,7 +185,12 @@ public:
 
     std::string getTableLocation() const override { return persistent_components.table_location; }
 
-    bool optimize(const StorageMetadataPtr & metadata_snapshot, ContextPtr context, const std::optional<FormatSettings> & format_settings) override;
+    bool optimize(
+        const StorageMetadataPtr & metadata_snapshot,
+        ContextPtr context,
+        const std::optional<FormatSettings> & format_settings,
+        std::shared_ptr<DataLake::ICatalog> catalog,
+        const StorageID & storage_id) override;
     bool optimizeManifestFiles(
         const StorageMetadataPtr & metadata_snapshot,
         ContextPtr context,
@@ -271,7 +276,7 @@ private:
     Iceberg::IcebergDataSnapshotPtr
     getIcebergDataSnapshot(Poco::JSON::Object::Ptr metadata_object, Int64 snapshot_id, ContextPtr local_context) const;
 
-    Iceberg::IcebergDataSnapshotPtr createIcebergDataSnapshotFromSnapshotJSON(Poco::JSON::Object::Ptr snapshot_object, Int64 snapshot_id, ContextPtr local_context) const;
+    Iceberg::IcebergDataSnapshotPtr createIcebergDataSnapshotFromSnapshotJSON(Poco::JSON::Object::Ptr metadata_object, Poco::JSON::Object::Ptr snapshot_object, Int64 snapshot_id, ContextPtr local_context) const;
     std::pair<Iceberg::IcebergDataSnapshotPtr, Int32>
     getStateImpl(const ContextPtr & local_context, Poco::JSON::Object::Ptr metadata_object) const;
     Iceberg::IcebergDataSnapshotPtr
