@@ -319,7 +319,7 @@ private:
     struct StagedManifest
     {
         Etag incarnation;
-        std::vector<BlobRef> blob_dependencies;
+        std::vector<BlobRef> blob_refs;
     };
 
     /// Own the complete bounded `HEAD`/metadata/publication/reconciliation state machine. Build-neutral:
@@ -370,7 +370,7 @@ private:
 
     std::vector<ManifestId> staged_manifests;             /// for best-effort abandon cleanup
 
-    std::map<ManifestId, StagedManifest> staged_manifest_ids;
+    std::map<ManifestId, const StagedManifest> staged_manifest_ids;
 
     std::map<DepKey, BlobDepRecord> deps;                 /// dependencies recorded by this build (blobs only)
 

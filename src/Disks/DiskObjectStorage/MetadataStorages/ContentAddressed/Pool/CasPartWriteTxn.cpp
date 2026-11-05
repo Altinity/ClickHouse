@@ -633,11 +633,11 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
             "stageManifest: encoded manifest {} bytes exceeds cap {}", encoded_text.size(), kMaxManifestEncodedBytes);
     const String encoded = sealObject(FormatId::PartManifest, encoded_text);
 
-    std::vector<BlobRef> blob_dependencies;
-    blob_dependencies.reserve(body.entries.size());
+    std::vector<BlobRef> blob_refs;
+    blob_refs.reserve(body.entries.size());
     for (const ManifestEntry & entry : body.entries)
         if (entry.placement == EntryPlacement::Blob)
-            blob_dependencies.push_back(entry.ref);
+            blob_refs.push_back(entry.ref);
 
     const ManifestId id{owning_ns, ref};
     const String key = store->layout().manifestKey(id);
@@ -698,7 +698,7 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
     staged_manifests.push_back(id);
     staged_manifest_ids.emplace(
         id,
-        StagedManifest{manifest_incarnation, std::move(blob_dependencies)});
+        StagedManifest{manifest_incarnation, std::move(blob_refs)});
     return id;
 }
 
@@ -822,7 +822,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "promote: staged manifest record names key '{}', expected '{}'",
             staged->second.incarnation.key(), manifest_key);
-    std::vector<BlobRef> manifest_blob_dependencies = staged->second.blob_dependencies;
+    std::vector<BlobRef> manifest_blob_refs = staged->second.blob_refs;
 
     /// Blob readiness is checked inside the append closure below, after owner liveness. It consumes
     /// only this build's explicit dependency proofs and performs no backend copy-forward.
@@ -848,7 +848,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
     commit_state = CommitState::Uncertain;
     store->appendRefOps(target_ns, MutationScope::ref(final_ref_name),
         [this, final_ref_name, manifest_id, promote_build_id, policy,
-         manifest_dependencies = std::move(manifest_blob_dependencies), &repoint_old, &created]
+         blob_refs = std::move(manifest_blob_refs), &repoint_old, &created]
         (const RefTableState & state) -> std::vector<RefOp>
         {
             created = !state.getCommitted().contains(final_ref_name);
@@ -900,14 +900,14 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             /// build's precommit edge is durable — matching the relink trust model (ordinary
             /// ReplicatedMergeTree interserver trust). A genuinely-absent adopted blob is an invariant
             /// violation caught by fsck, not here.
-            for (const BlobRef & ref : manifest_dependencies)
+            for (const BlobRef & blob_ref : blob_refs)
             {
-                const auto proof = dependencyProof(ref);
+                const auto proof = dependencyProof(blob_ref);
                 if (!proof)
                     throw Exception(ErrorCodes::LOGICAL_ERROR,
                         "promote: blob leaf {} has no dependency proof at commit — a pending upload "
                         "never completed; failing closed",
-                        store->layout().blobKey(ref));
+                        store->layout().blobKey(blob_ref));
 
                 switch (*proof)
                 {
@@ -929,7 +929,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
                         {
                             ev.type = CasEventType::BlobReuseAdopt;
                             ev.object_kind = CasEventObjectKind::Blob;
-                            ev.object_hash = blobIdOf(ref);
+                            ev.object_hash = blobIdOf(blob_ref);
                             ev.outcome = "adopt";
                             ev.reason = "manifest-trust";   /// distinguishable trusted-adopt class (empty token)
                         });
@@ -938,7 +938,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
 
                 throw Exception(ErrorCodes::LOGICAL_ERROR,
                     "promote: blob leaf {} has an unnamed dependency proof at commit; failing closed",
-                    store->layout().blobKey(ref));
+                    store->layout().blobKey(blob_ref));
             }
 
             /// Refuse to overwrite a live committed ref that names a DIFFERENT manifest: that would orphan the
