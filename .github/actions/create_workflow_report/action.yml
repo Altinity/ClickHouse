@@ -14,7 +14,6 @@ runs:
         COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         ACTIONS_RUN_URL: ${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }}
         FINAL: ${{ inputs.final }}
-        S3_ARTIFACT_BUCKET: ${{ vars.S3_ARTIFACT_BUCKET }}
       shell: bash
       run: |
         pip install clickhouse-driver==0.2.8 numpy==1.26.4 pandas==2.0.3 jinja2==3.1.5
