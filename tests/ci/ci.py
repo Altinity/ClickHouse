@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 import docker_images_helper
 import upload_result_helper
 from build_check import get_release_or_pr
+from build_download_helper import download_builds, read_build_urls
 from ci_buddy import CIBuddy
 from ci_cache import CiCache
 from ci_config import BUILD_NAMES_MAPPING, CI
@@ -41,7 +42,7 @@ from commit_status_helper import (
     set_status_comment,
 )
 from digest_helper import DockerDigester
-from env_helper import GITHUB_REPOSITORY, GITHUB_RUN_ID, IS_CI, REPO_COPY, TEMP_PATH
+from env_helper import GITHUB_REPOSITORY, GITHUB_RUN_ID, IS_CI, REPORT_PATH, REPO_COPY, TEMP_PATH
 from get_robot_token import get_best_robot_token
 from git_helper import GIT_PREFIX, Git
 from git_helper import Runner as GitRunner
@@ -402,6 +403,31 @@ def _pre_action(s3, job_name, batch, indata, pr_info):
         ClickHouseHelper().insert_events_into(
             db="gh-data", table="checks", events=prepared_events
         )
+
+    if not to_be_skipped and job_name in (
+        CI.JobNames.DOCKER_SERVER,
+        CI.JobNames.DOCKER_KEEPER,
+    ):
+        dest = Path(REPO_COPY) / "ci" / "tmp"
+        dest.mkdir(parents=True, exist_ok=True)
+        print(f"Downloading required packages for [{job_name}] into {dest}")
+        downloaded = []
+        for build_name in CI.get_job_config(job_name).required_builds or []:
+            matching = []
+            for url in read_build_urls(build_name, REPORT_PATH):
+                name = os.path.basename(url.split("?")[0])
+                if "-dbg" in name:
+                    continue
+                if name.endswith(".deb") or ".tgz" in name:
+                    matching.append(url)
+            assert matching, f"No package artifacts in {build_name} report for {job_name}"
+            download_builds(dest, matching, lambda _: True)
+            downloaded.extend(matching)
+        print(
+            f"Downloaded {len(downloaded)} package artifacts: "
+            f"{[os.path.basename(url.split('?')[0]) for url in downloaded]}"
+        )
+
     print(f"Pre action done. Report files [{reports_files}] have been downloaded")
 
 
