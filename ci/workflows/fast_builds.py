@@ -47,7 +47,6 @@ workflow = Workflow.Config(
         JobConfigs.docker_keeper,
         *JobConfigs.install_check_master_jobs,
         *AltinityJobConfigs.sign_release_jobs,
-        AltinityJobConfigs.source_upload_job,
         *[
             job
             for job in FUNCTIONAL_TESTS_JOBS
