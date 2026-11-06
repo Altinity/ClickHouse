@@ -1,7 +1,7 @@
 -- Tags: no-fasttest
 -- Tag no-fasttest: Depends on Minio
 --
--- object_storage_cluster_local_read_max_files reads on the initiator when planning can list
+-- object_storage_cluster_local_read_max_tasks reads on the initiator when planning can list
 -- at most that many files inside the probe budget. More files keep the distributed read.
 -- `Shards` is incremented only by the distributed read.
 
@@ -22,7 +22,7 @@ SELECT count(), sum(x)
 FROM s3('http://localhost:11111/test/05428_object_storage_cluster_local_read_a.tsv', 'TSV', 'x UInt32')
 SETTINGS
     object_storage_cluster = 'test_shard_localhost',
-    object_storage_cluster_local_read_max_files = 10,
+    object_storage_cluster_local_read_max_tasks = 10,
     object_storage_cluster_local_read_probe_ms = 5000,
     log_comment = '05428_local_read_small';
 
@@ -41,7 +41,7 @@ SELECT count(), sum(x)
 FROM s3('http://localhost:11111/test/05428_object_storage_cluster_local_read_*.tsv', 'TSV', 'x UInt32')
 SETTINGS
     object_storage_cluster = 'test_shard_localhost',
-    object_storage_cluster_local_read_max_files = 1,
+    object_storage_cluster_local_read_max_tasks = 1,
     object_storage_cluster_local_read_probe_ms = 5000,
     log_comment = '05428_local_read_cluster';
 
@@ -60,7 +60,7 @@ SELECT count(), sum(x)
 FROM s3('http://localhost:11111/test/05428_object_storage_cluster_local_read_a.tsv', 'TSV', 'x UInt32')
 SETTINGS
     object_storage_cluster = 'test_shard_localhost',
-    object_storage_cluster_local_read_max_files = 0,
+    object_storage_cluster_local_read_max_tasks = 0,
     log_comment = '05428_local_read_disabled';
 
 SYSTEM FLUSH LOGS query_log;
@@ -77,7 +77,7 @@ SELECT 's3Cluster under the limit, local';
 SELECT count(), sum(x)
 FROM s3Cluster('test_shard_localhost', 'http://localhost:11111/test/05428_object_storage_cluster_local_read_a.tsv', 'TSV', 'x UInt32')
 SETTINGS
-    object_storage_cluster_local_read_max_files = 10,
+    object_storage_cluster_local_read_max_tasks = 10,
     object_storage_cluster_local_read_probe_ms = 5000,
     log_comment = '05428_local_read_cluster_function';
 

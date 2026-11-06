@@ -56,7 +56,7 @@ namespace Setting
     extern const SettingsInt64 delta_lake_snapshot_start_version;
     extern const SettingsInt64 delta_lake_snapshot_end_version;
     extern const SettingsUInt64 lock_object_storage_task_distribution_ms;
-    extern const SettingsUInt64 object_storage_cluster_local_read_max_files;
+    extern const SettingsUInt64 object_storage_cluster_local_read_max_tasks;
     extern const SettingsUInt64 object_storage_cluster_local_read_probe_ms;
 }
 
@@ -710,18 +710,25 @@ ObjectIterator StorageObjectStorageCluster::createObjectIteratorForRead(
         /*ignore_archive_globs=*/false,
         /*skip_object_metadata=*/true);
 
-    if (local_context->getSettingsRef()[Setting::cluster_table_function_split_granularity] == ObjectStorageGranularityLevel::BUCKET)
-    {
-        iterator = std::make_shared<ObjectIteratorSplitByBuckets>(
-            std::move(iterator),
-            configuration->getFormat(),
-            object_storage,
-            local_context);
-    }
-
     /// Before the first `next`, so iceberg objects carry the external-storage check the distributor needs.
+    /// The local-read probe counts tasks from this same iterator: one file, or one bucket when
+    /// `cluster_table_function_split_granularity` is `bucket`.
     iterator->setTasksGoToOtherReplicas(true);
-    return iterator;
+    return wrapIteratorForClusterTasks(std::move(iterator), local_context);
+}
+
+ObjectIterator StorageObjectStorageCluster::wrapIteratorForClusterTasks(
+    ObjectIterator iterator,
+    const ContextPtr & local_context) const
+{
+    if (local_context->getSettingsRef()[Setting::cluster_table_function_split_granularity] != ObjectStorageGranularityLevel::BUCKET)
+        return iterator;
+
+    return std::make_shared<ObjectIteratorSplitByBuckets>(
+        std::move(iterator),
+        configuration->getFormat(),
+        object_storage,
+        local_context);
 }
 
 bool StorageObjectStorageCluster::isSmallEnoughForLocalRead(
@@ -730,7 +737,7 @@ bool StorageObjectStorageCluster::isSmallEnoughForLocalRead(
     SelectQueryInfo & query_info) const
 {
     const auto & settings = context->getSettingsRef();
-    const UInt64 max_files = settings[Setting::object_storage_cluster_local_read_max_files];
+    const UInt64 max_tasks = settings[Setting::object_storage_cluster_local_read_max_tasks];
     const UInt64 probe_ms = settings[Setting::object_storage_cluster_local_read_probe_ms];
 
     const ActionsDAG * filter = query_info.filter_actions_dag.get();
@@ -740,7 +747,7 @@ bool StorageObjectStorageCluster::isSmallEnoughForLocalRead(
 
     auto probe = std::make_shared<ObjectStorageClusterReadProbe>();
     Stopwatch watch;
-    const char * reason = "file count exceeded threshold";
+    const char * reason = "task count exceeded threshold";
 
     while (true)
     {
@@ -754,12 +761,12 @@ bool StorageObjectStorageCluster::isSmallEnoughForLocalRead(
         if (!object)
         {
             probe->read_locally = true;
-            reason = "file list exhausted";
+            reason = "task list exhausted";
             break;
         }
 
         probe->pulled.push_back(std::move(object));
-        if (probe->pulled.size() > max_files)
+        if (probe->pulled.size() > max_tasks)
             break;
     }
 
@@ -770,10 +777,10 @@ bool StorageObjectStorageCluster::isSmallEnoughForLocalRead(
 
     LOG_TRACE(
         getLogger("StorageObjectStorageCluster"),
-        "Local-read probe for {} saw {} file(s) (limit {}), read_locally={}, reason={}",
+        "Local-read probe for {} saw {} task(s) (limit {}), read_locally={}, reason={}",
         getStorageID().getNameForLogs(),
         probe->pulled.size(),
-        max_files,
+        max_tasks,
         probe->read_locally,
         reason);
 
@@ -906,7 +913,7 @@ QueryProcessingStage::Enum StorageObjectStorageCluster::getQueryProcessingStage(
     else
     {
         const auto & settings = context->getSettingsRef();
-        const bool can_probe = settings[Setting::object_storage_cluster_local_read_max_files] > 0
+        const bool can_probe = settings[Setting::object_storage_cluster_local_read_max_tasks] > 0
             && !settings[Setting::object_storage_remote_initiator]
             && context->getClientInfo().query_kind != ClientInfo::QueryKind::SECONDARY_QUERY
             && !resolved.fallback_to_pure

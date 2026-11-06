@@ -225,15 +225,20 @@ private:
 
     bool usesObjectStorageClusterSettingSyntax() const override { return !cluster_name_from_function_argument; }
 
-    /// Same iterator the cluster task distributor uses, without opening cluster connections.
+    /// Same task iterator the cluster task distributor uses, without opening cluster connections.
+    /// With `cluster_table_function_split_granularity` = `bucket`, each step is one bucket.
     ObjectIterator createObjectIteratorForRead(
         const ActionsDAG::Node * predicate,
         const ActionsDAG * filter,
         const ContextPtr & local_context,
         StorageMetadataPtr storage_metadata_snapshot) const;
 
-    /// True when the pruned file list ends with at most `object_storage_cluster_local_read_max_files` files
-    /// inside `object_storage_cluster_local_read_probe_ms`. Anything unfinished stays on the cluster.
+    /// Split each file into row-group tasks when `cluster_table_function_split_granularity` is `bucket`.
+    ObjectIterator wrapIteratorForClusterTasks(ObjectIterator iterator, const ContextPtr & local_context) const;
+
+    /// True when the pruned task list ends with at most `object_storage_cluster_local_read_max_tasks` tasks
+    /// inside `object_storage_cluster_local_read_probe_ms`. A task is a file, or a bucket when split granularity is `bucket`.
+    /// Anything unfinished stays on the cluster.
     /// The iterator and the objects it already returned are stored on `query_info` under this storage's key.
     bool isSmallEnoughForLocalRead(
         const ContextPtr & context,

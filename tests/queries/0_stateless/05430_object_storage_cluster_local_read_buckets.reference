@@ -1,0 +1,9 @@
+four buckets, limit 1, cluster
+4	6
+1
+four buckets, limit 4, local
+4	6
+0
+same file, file granularity, local
+4	6
+0

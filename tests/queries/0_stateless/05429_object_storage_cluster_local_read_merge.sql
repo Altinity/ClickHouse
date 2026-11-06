@@ -40,7 +40,7 @@ SELECT 'small child local, large child cluster';
 SELECT count(), sum(x)
 FROM local_read_merge_05429_all
 SETTINGS
-    object_storage_cluster_local_read_max_files = 1,
+    object_storage_cluster_local_read_max_tasks = 1,
     object_storage_cluster_local_read_probe_ms = 5000,
     log_comment = '05429_merge_mixed';
 
