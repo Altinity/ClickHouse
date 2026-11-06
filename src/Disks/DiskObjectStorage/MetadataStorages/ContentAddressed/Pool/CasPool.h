@@ -679,7 +679,7 @@ public:
     /// `DirShape::TableDir` case.
     bool namespaceStillLogicallyPresent(const RootNamespace & ns);
 
-    /// GC callback after a proved exact catalog deletion; see `CasRefLedger` for the in-place cached
+    /// GC callback just before it erases a folded `Removing` row; see `CasRefLedger` for the in-place cached
     /// runtime invalidation contract.
     void invalidateRemovedCatalogLife(const NamespaceLifeId & life);
 
@@ -1145,6 +1145,10 @@ public:
     uint64_t refTableRuntimeAdmittedFenceGenerationForTest(const RootNamespace & ns)
     {
         return ref_ledger.refTableRuntimeAdmittedFenceGenerationForTest(ns);
+    }
+    uint64_t refNameRetirementsForTest(const RootNamespace & ns) const
+    {
+        return ref_ledger.refNameRetirementsForTest(ns);
     }
     std::optional<NamespaceLifeId> refTableLifeForTest(const RootNamespace & ns)
     {

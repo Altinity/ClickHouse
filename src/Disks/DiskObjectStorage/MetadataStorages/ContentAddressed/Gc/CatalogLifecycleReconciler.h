@@ -38,7 +38,7 @@ struct CatalogLifecycleReconcileResult
 ///
 /// This component owns only deterministic eligible-row selection and the catalog `N + 1` drain.
 /// It neither discovers the parent seal nor performs a hot ref LIST, ref walk, fold, publication,
-/// runtime invalidation, or physical deletion.
+/// or physical deletion. Runtime invalidation is the caller's `before_erase`.
 class CatalogLifecycleReconciler
 {
 public:
@@ -49,7 +49,12 @@ public:
     /// every erase is authorised by a reading taken in its own attempt, and it is run once more before
     /// the drain-complete verdict, which would otherwise report from the reading its last erase left.
     /// It is a refresh, not a verdict: the verdict stays `op.admitted()`.
-    CatalogLifecycleReconcileResult reconcile(const std::function<void()> & refresh_authority);
+    ///
+    /// `before_erase` is called with each life just before its row is first erased, so the caller can
+    /// record the retirement ahead of the erase. Every life in `retired_lives` has been announced.
+    CatalogLifecycleReconcileResult reconcile(
+        const std::function<void()> & refresh_authority,
+        const std::function<void(const NamespaceLifeId &)> & before_erase);
 
 private:
     std::optional<CatalogEntry> selectEligible(const CasRefCatalog::Snapshot & catalog) const;
