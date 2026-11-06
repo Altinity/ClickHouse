@@ -176,11 +176,14 @@ private:
 };
 
 /// Files already returned by an object-storage cluster local-read probe, plus the iterator
-/// that produced them. `iterator` is null once the list has ended.
+/// that produced them. `iterator` is null once the list has ended. `snapshot_version` is kept
+/// even then: a finished Delta iterator is not reusable, but `_data_lake_snapshot_version`
+/// is read from the iterator during the local scan.
 struct ObjectStorageClusterReadProbe
 {
     ObjectIterator iterator;
     ObjectInfos pulled;
+    std::optional<UInt64> snapshot_version;
     bool read_locally = false;
     bool consumed = false;
 };

@@ -770,6 +770,10 @@ bool StorageObjectStorageCluster::isSmallEnoughForLocalRead(
             break;
     }
 
+    /// Taken before the iterator is dropped. A finished Delta iterator reports an unknown key count,
+    /// so it must not stay attached, but the local read still asks it for `_data_lake_snapshot_version`.
+    probe->snapshot_version = iterator->getSnapshotVersion();
+
     /// A finished iterator must not stay attached: its `estimatedKeysCount` can be "unknown", which would
     /// make a small local read start as many streams as a full listing.
     if (!probe->read_locally)

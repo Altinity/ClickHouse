@@ -220,9 +220,13 @@ namespace
 class ObjectIteratorWithPrefetchedObjects : public IObjectIterator
 {
 public:
-    ObjectIteratorWithPrefetchedObjects(ObjectInfos pulled_, ObjectIterator remaining_)
+    ObjectIteratorWithPrefetchedObjects(
+        ObjectInfos pulled_,
+        ObjectIterator remaining_,
+        std::optional<UInt64> snapshot_version_)
         : pulled(std::move(pulled_))
         , remaining(std::move(remaining_))
+        , snapshot_version(snapshot_version_)
     {
     }
 
@@ -248,14 +252,20 @@ public:
     std::optional<UInt64> getSnapshotVersion() const override
     {
         if (remaining)
-            return remaining->getSnapshotVersion();
-        return std::nullopt;
+        {
+            if (auto version = remaining->getSnapshotVersion())
+            {
+                return version;
+            }
+        }
+        return snapshot_version;
     }
 
 private:
     ObjectInfos pulled;
     size_t index = 0;
     ObjectIterator remaining;
+    std::optional<UInt64> snapshot_version;
     std::mutex mutex;
 };
 
@@ -280,10 +290,13 @@ ObjectIterator takeObjectStorageClusterReadProbe(const std::shared_ptr<ObjectSto
 
     ObjectInfos pulled = std::move(probe->pulled);
     ObjectIterator remaining = std::move(probe->iterator);
+    const auto snapshot_version = probe->snapshot_version;
     probe->pulled.clear();
     probe->iterator.reset();
+    probe->snapshot_version.reset();
 
-    return std::make_shared<ObjectIteratorWithPrefetchedObjects>(std::move(pulled), std::move(remaining));
+    return std::make_shared<ObjectIteratorWithPrefetchedObjects>(
+        std::move(pulled), std::move(remaining), snapshot_version);
 }
 
 }
