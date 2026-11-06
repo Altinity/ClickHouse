@@ -102,6 +102,7 @@ protected:
     std::atomic<size_t> total_tables_to_startup{0};
     std::atomic<size_t> tables_started{0};
     AtomicStopwatch startup_watch;
+    std::atomic<bool> loading_stopped{false};
 
     DatabaseMetadataDiskSettings database_metadata_disk_settings;
     DiskPtr metadata_disk_ptr;
