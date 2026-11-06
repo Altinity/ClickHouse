@@ -3,6 +3,7 @@
 
 #include <optional>
 #include <unordered_map>
+#include <vector>
 
 #include <Core/NamesAndTypes.h>
 #include <Parsers/IAST_fwd.h>
@@ -89,7 +90,7 @@ public:
         const ManifestFileIterator & manifest_file,
         DB::ContextPtr context);
 
-    PruningReturnStatus canBePruned(const ProcessedManifestFileEntryPtr & entry, const std::unordered_map<Int32, DB::Range> & entry_hyperrectangles) const;
+    PruningReturnStatus canBePruned(const ProcessedManifestFileEntryPtr & entry, const std::unordered_map<Int32, std::vector<DB::Range>> & entry_hyperrectangles) const;
 
     const std::unordered_map<Int32, DB::DataTypePtr> & getMinMaxColumnTypes() const { return min_max_column_types; }
 };

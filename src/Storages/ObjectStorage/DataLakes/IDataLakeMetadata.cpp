@@ -3,6 +3,8 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFile.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergFieldParseHelpers.h>
 #include <Core/TypeId.h>
+#include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypesDecimal.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
 #include <Core/Field.h>
@@ -155,10 +157,21 @@ DataFileMetaInfo::DataFileMetaInfo(
                 String right_str;
                 if (i_bounds->second.first.tryGet(left_str) && i_bounds->second.second.tryGet(right_str))
                 {
-                    auto left = Iceberg::deserializeFieldFromBinaryRepr(left_str, type, true);
-                    auto right = Iceberg::deserializeFieldFromBinaryRepr(right_str, type, false);
-                    if (left && right && !DB::Range::less(*right, *left))
-                        hyperrectangle = DB::Range(*left, true, *right, true);
+                    const auto non_nullable_type = removeNullable(type);
+                    if (WhichDataType(non_nullable_type).isDateTime64() && getDecimalScale(*non_nullable_type) == 6)
+                    {
+                        /// Two ranges are the middle band, so this column is not a constant.
+                        const auto timestamp_ranges = Iceberg::deserializeDateTime64MinMaxRanges(left_str, right_str, type);
+                        if (timestamp_ranges.size() == 1)
+                            hyperrectangle = DB::Range(timestamp_ranges[0].lower, true, timestamp_ranges[0].upper, true);
+                    }
+                    else
+                    {
+                        auto left = Iceberg::deserializeFieldFromBinaryRepr(left_str, type, true);
+                        auto right = Iceberg::deserializeFieldFromBinaryRepr(right_str, type, false);
+                        if (left && right && !DB::Range::less(*right, *left))
+                            hyperrectangle = DB::Range(*left, true, *right, true);
+                    }
                 }
             }
         }

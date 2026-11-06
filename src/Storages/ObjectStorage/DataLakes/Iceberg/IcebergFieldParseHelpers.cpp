@@ -28,17 +28,7 @@ namespace Iceberg
 namespace
 {
 
-/// 1e16 µs is ~year 2286. Spark sentinels such as `9999-12-31` (`~2.53e17` µs)
-/// are spec-correct microseconds above this.
-constexpr Int64 microseconds_ambiguous_threshold = 10'000'000'000'000'000LL;
-/// 1e18 ns is ~year 2001; customer 2026 ns bounds are `~1.76e18`.
-constexpr Int64 nanoseconds_lower_threshold = 1'000'000'000'000'000'000LL;
 constexpr Int64 nanoseconds_per_microsecond = 1000;
-
-bool magnitudeExceeds(Int64 value, Int64 threshold)
-{
-    return value > threshold || value < -threshold;
-}
 
 /// Convert ns ticks to us ticks without shrinking a [lower, upper] range.
 Int64 nanosecondsToMicrosecondsForBound(Int64 nanoseconds, bool lower_bound)
@@ -61,10 +51,11 @@ Int64 nanosecondsToMicrosecondsForBound(Int64 nanoseconds, bool lower_bound)
 }
 
 /// Iceberg timestamps are 8-byte little-endian (spec Appendix D).
-/// Some writers store nanosecond stats on Iceberg `timestamp` (`DateTime64(6)`).
-/// `|ticks| <= 1e16` is kept as microseconds, as the spec requires. `|ticks| > 1e18`
-/// is converted from nanoseconds. `(1e16, 1e18]` fails open: it collides Spark
-/// `9999-12-31` sentinels with 1970–2001 nanoseconds.
+/// `timestamp` / `timestamptz` are `DateTime64(6)` and `timestamp_ns` /
+/// `timestamptz_ns` are `DateTime64(9)`. Some writers store nanosecond stats
+/// on Iceberg `timestamp`. `|ticks| >= 1e18` is nanoseconds. A smaller value
+/// stays microseconds here; the min/max pruner also tries nanoseconds for
+/// `|ticks| >= 1e16`.
 std::optional<Field> deserializeDateTime64FromBinaryRepr(const std::string & str, const IDataType & type, bool lower_bound)
 {
     if (str.size() != sizeof(Int64))
@@ -73,17 +64,39 @@ std::optional<Field> deserializeDateTime64FromBinaryRepr(const std::string & str
     Int64 unscaled = unalignedLoadLittleEndian<Int64>(str.data());
     const UInt32 scale = getDecimalScale(type);
 
-    if (scale == 6 && magnitudeExceeds(unscaled, microseconds_ambiguous_threshold))
+    if (scale == 6)
     {
-        if (!magnitudeExceeds(unscaled, nanoseconds_lower_threshold))
-            return std::nullopt;
-
-        unscaled = nanosecondsToMicrosecondsForBound(unscaled, lower_bound);
+        if (!icebergTimestampMagnitudeBelow(unscaled, iceberg_timestamp_nanoseconds_lower_threshold))
+            unscaled = nanosecondsToMicrosecondsForBound(unscaled, lower_bound);
     }
 
     return DecimalField<DateTime64>(DateTime64(unscaled), scale);
 }
 
+std::optional<Int64> loadDateTime64Ticks(const std::string & str)
+{
+    if (str.size() != sizeof(Int64))
+        return std::nullopt;
+    return unalignedLoadLittleEndian<Int64>(str.data());
+}
+
+void appendRange(std::vector<DateTime64BoundRange> & ranges, Int64 lower_ticks, Int64 upper_ticks, UInt32 scale)
+{
+    if (lower_ticks > upper_ticks)
+        return;
+
+    ranges.push_back(DateTime64BoundRange{
+        DecimalField<DateTime64>(DateTime64(lower_ticks), scale),
+        DecimalField<DateTime64>(DateTime64(upper_ticks), scale)});
+}
+
+}
+
+std::string serializeDateTime64IcebergBound(Int64 ticks)
+{
+    std::string bytes(sizeof(Int64), '\0');
+    unalignedStoreLittleEndian<Int64>(bytes.data(), ticks);
+    return bytes;
 }
 
 Int64 fieldToInt64(const Field & value, std::string_view context, std::string_view arg_name)
@@ -256,6 +269,55 @@ namespace
         return DecimalField<DecimalType>(unscaled_value, scale);
     }
 
+}
+
+std::vector<DateTime64BoundRange> deserializeDateTime64MinMaxRanges(
+    const std::string & lower_str,
+    const std::string & upper_str,
+    DataTypePtr type)
+{
+    std::vector<DateTime64BoundRange> ranges;
+    const auto lower_ticks = loadDateTime64Ticks(lower_str);
+    const auto upper_ticks = loadDateTime64Ticks(upper_str);
+    if (!lower_ticks || !upper_ticks)
+        return ranges;
+
+    const UInt32 scale = getDecimalScale(*removeNullable(type));
+    if (scale != 6)
+    {
+        appendRange(ranges, *lower_ticks, *upper_ticks, scale);
+        return ranges;
+    }
+
+    /// One precision for the pair. Below `1e16` keeps `1e15` and `1e18` as microseconds.
+    const bool one_below_1e16 = icebergTimestampMagnitudeBelow(*lower_ticks, iceberg_timestamp_microseconds_only_threshold)
+        || icebergTimestampMagnitudeBelow(*upper_ticks, iceberg_timestamp_microseconds_only_threshold);
+    const bool one_at_or_above_1e18 = !icebergTimestampMagnitudeBelow(*lower_ticks, iceberg_timestamp_nanoseconds_lower_threshold)
+        || !icebergTimestampMagnitudeBelow(*upper_ticks, iceberg_timestamp_nanoseconds_lower_threshold);
+
+    if (one_below_1e16)
+    {
+        appendRange(ranges, *lower_ticks, *upper_ticks, scale);
+    }
+    else if (one_at_or_above_1e18)
+    {
+        appendRange(
+            ranges,
+            nanosecondsToMicrosecondsForBound(*lower_ticks, true),
+            nanosecondsToMicrosecondsForBound(*upper_ticks, false),
+            scale);
+    }
+    else
+    {
+        appendRange(ranges, *lower_ticks, *upper_ticks, scale);
+        appendRange(
+            ranges,
+            nanosecondsToMicrosecondsForBound(*lower_ticks, true),
+            nanosecondsToMicrosecondsForBound(*upper_ticks, false),
+            scale);
+    }
+
+    return ranges;
 }
 
 std::optional<Field>

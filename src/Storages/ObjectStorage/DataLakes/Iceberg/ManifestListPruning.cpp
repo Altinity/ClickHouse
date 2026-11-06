@@ -53,6 +53,8 @@ std::optional<Field> deserializeUnsignedBound(const String & bytes, const IDataT
 
 /// Decode the lower/upper bounds of a single partition field summary. Returns nullopt when the
 /// summary carries no usable bounds (missing, null/nan, pre-1970 for unsigned types, or inverted).
+/// `DateTime64(6)` uses `deserializeDateTime64MinMaxRanges`. Two ranges means both bounds sit in
+/// `[1e16, 1e18)`, so this field is left unconstrained.
 std::optional<std::pair<Field, Field>> boundsOfPartitionFieldSummary(
     const PartitionFieldSummary & summary, const DataTypePtr & type, Int32 partition_spec_id, size_t field_index)
 {
@@ -61,6 +63,27 @@ std::optional<std::pair<Field, Field>> boundsOfPartitionFieldSummary(
         return {};
 
     const auto non_nullable_type = removeNullable(type);
+
+    if (WhichDataType(non_nullable_type).isDateTime64())
+    {
+        const auto timestamp_ranges = deserializeDateTime64MinMaxRanges(*summary.lower_bound, *summary.upper_bound, type);
+        if (timestamp_ranges.size() != 1)
+        {
+            /// Eight-byte bounds that produce no range are inverted. Two ranges are the ambiguous band.
+            if (timestamp_ranges.empty() && summary.lower_bound->size() == sizeof(Int64) && summary.upper_bound->size() == sizeof(Int64))
+            {
+                LOG_WARNING(
+                    getLogger("ManifestListPruner"),
+                    "Manifest list declares a lower bound above the upper bound for field {} of partition spec {}; "
+                    "skipping partition pruning for this field",
+                    field_index,
+                    partition_spec_id);
+            }
+            return {};
+        }
+
+        return std::pair{timestamp_ranges[0].lower, timestamp_ranges[0].upper};
+    }
 
     std::optional<Field> lower;
     std::optional<Field> upper;
