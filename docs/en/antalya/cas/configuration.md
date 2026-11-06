@@ -124,6 +124,20 @@ a longer lease on one server delays recovery after that server's crash. A server
 rule waits only its own lease, so keep the values equal until every server of the pool runs a build
 with it.
 
+A shorter TTL reduces the tolerance for object-storage delays; a shorter renewal period increases it
+(renewal starts earlier) at the cost of more background traffic. With the defaults,
+`cas_mount_lease_ttl_ms − cas_lease_safety_margin_ms − cas_mount_renew_period_ms − 2 × envelope =
+4000` ms is the scheduling-lateness budget before the first renewal attempt of a period can begin,
+where `envelope = cas_attempt_timeout_ms + 2 × cap` (7000 ms with defaults) and `cap` is
+`cas_attempt_timeout_ms` when the disk's `connect_timeout_ms` is `0`, else
+`min(connect_timeout_ms, cas_attempt_timeout_ms)` (1000 ms with defaults); the renewal then keeps
+retrying until `confirmed deadline − cas_lease_safety_margin_ms`.
+
+The `expires_at_ms` stamped into the mount object is a writer-stamped diagnostic used by
+`system.cas_mounts`; it never
+authorizes a reclaim or a GC fence-out. Local fencing is derived instead from the confirmed
+request's pre-I/O `CLOCK_BOOTTIME` anchor plus the TTL.
+
 ### Enabling `Packed` parts {#enabling-packed-parts}
 
 Set `cas_allow_packed_parts` in the block of the `CAS` disk with `metadata_type=cas`. A
@@ -164,20 +178,6 @@ Downgrade to a binary without CAS Packed support is not supported in the current
 `cas_allow_packed_parts = false` does not rewrite existing `Packed` parts and is not a safe downgrade
 procedure. Such an older binary also rejects the unknown `cas_allow_packed_parts` key even when its
 value is `false`.
-
-A shorter TTL reduces the tolerance for object-storage delays; a shorter renewal period increases it
-(renewal starts earlier) at the cost of more background traffic. With the defaults,
-`cas_mount_lease_ttl_ms − cas_lease_safety_margin_ms − cas_mount_renew_period_ms − 2 × envelope =
-4000` ms is the scheduling-lateness budget before the first renewal attempt of a period can begin,
-where `envelope = cas_attempt_timeout_ms + 2 × cap` (7000 ms with defaults) and `cap` is
-`cas_attempt_timeout_ms` when the disk's `connect_timeout_ms` is `0`, else
-`min(connect_timeout_ms, cas_attempt_timeout_ms)` (1000 ms with defaults); the renewal then keeps
-retrying until `confirmed deadline − cas_lease_safety_margin_ms`.
-
-The `expires_at_ms` stamped into the mount object is a writer-stamped diagnostic used by
-`system.cas_mounts`; it never
-authorizes a reclaim or a GC fence-out. Local fencing is derived instead from the confirmed
-request's pre-I/O `CLOCK_BOOTTIME` anchor plus the TTL.
 
 ## Recommended keep-alive settings {#recommended-keep-alive-settings}
 
