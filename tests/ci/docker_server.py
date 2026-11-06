@@ -2,14 +2,20 @@
 
 # here
 import argparse
+import atexit
 import json
 import logging
+import os
+import shutil
 import sys
+import threading
 import time
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from os import makedirs
 from os import path as p
 from pathlib import Path
 from typing import Dict, List
+from urllib.parse import unquote, urlparse
 
 from build_download_helper import read_build_urls
 from ci_utils import Utils
@@ -17,6 +23,7 @@ from docker_images_helper import DockerImageData, docker_login
 from env_helper import (
     GITHUB_RUN_URL,
     GITHUB_SERVER_URL,
+    REPO_COPY,
     REPORT_PATH,
     S3_BUILDS_BUCKET,
     S3_DOWNLOAD,
@@ -25,6 +32,7 @@ from env_helper import (
 from git_helper import GIT_PREFIX, Git, git_runner
 from pr_info import PRInfo
 from report import FAIL, FAILURE, OK, SUCCESS, JobReport, TestResult, TestResults
+from s3_helper import S3Helper
 from stopwatch import Stopwatch
 from tee_popen import TeePopen
 from version_helper import ClickHouseVersion, get_version_from_repo, version_arg
@@ -32,6 +40,147 @@ from version_helper import ClickHouseVersion, get_version_from_repo, version_arg
 git = Git(ignore_no_tags=True)
 
 ARCH = ("amd64", "arm64")
+ARCH_ALIASES = {
+    "amd64": ("amd64", "x86_64"),
+    "arm64": ("arm64", "aarch64"),
+}
+CI_TMP = Path(REPO_COPY) / "ci" / "tmp"
+
+
+def packages_for_image(image_repo: str) -> List[str]:
+    if "clickhouse-server" in image_repo:
+        return [
+            "clickhouse-client",
+            "clickhouse-server",
+            "clickhouse-common-static",
+        ]
+    if "clickhouse-keeper" in image_repo:
+        return ["clickhouse-keeper"]
+    assert False, "BUG"
+
+
+def _matches_arch(name: str, arch: str) -> bool:
+    for alias in ARCH_ALIASES[arch]:
+        if f"_{alias}." in name or f"-{alias}." in name:
+            return True
+    return False
+
+
+def package_files_from_dir(pkg_dir: Path, image_repo: str) -> Dict[str, List[Path]]:
+    packages = packages_for_image(image_repo)
+    if not pkg_dir.is_dir():
+        return {arch: [] for arch in ARCH}
+    files = [f for f in pkg_dir.rglob("*") if f.is_file() and "-dbg" not in f.name]
+    result: Dict[str, List[Path]] = {}
+    for arch in ARCH:
+        matched = []
+        for f in files:
+            if not any(pkg in f.name for pkg in packages):
+                continue
+            if not _matches_arch(f.name, arch):
+                continue
+            matched.append(f)
+        result[arch] = sorted(matched, key=lambda path: path.name)
+    return result
+
+
+def merge_files_by_arch(
+    *sources: Dict[str, List[Path]],
+) -> Dict[str, List[Path]]:
+    result: Dict[str, List[Path]] = {arch: [] for arch in ARCH}
+    seen = {arch: set() for arch in ARCH}
+    for source in sources:
+        for arch, files in source.items():
+            for f in files:
+                if f.name in seen[arch]:
+                    continue
+                seen[arch].add(f.name)
+                result[arch].append(f)
+    return result
+
+
+def s3_key_from_url(url: str) -> str:
+    path = unquote(urlparse(url).path).lstrip("/")
+    prefix = f"{S3_BUILDS_BUCKET}/"
+    if path.startswith(prefix):
+        return path[len(prefix) :]
+    return path
+
+
+def download_packages_from_s3(urls: List[str], dest: Path) -> List[Path]:
+    dest.mkdir(parents=True, exist_ok=True)
+    s3 = S3Helper()
+    files = []
+    for url in urls:
+        key = s3_key_from_url(url)
+        local = dest / Path(key).name
+        if not local.is_file():
+            logging.info("Downloading s3://%s/%s to %s", S3_BUILDS_BUCKET, key, local)
+            s3.download_file(S3_BUILDS_BUCKET, key, local)
+        files.append(local)
+    return files
+
+
+def local_package_dirs() -> List[Path]:
+    dirs = [
+        CI_TMP,
+        CI_TMP / "build",
+        Path(TEMP_PATH),
+        Path(TEMP_PATH) / "build",
+    ]
+    unique = []
+    seen = set()
+    for d in dirs:
+        resolved = str(d)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(d)
+    return unique
+
+
+def start_package_http_server(files: List[Path]) -> ThreadingHTTPServer:
+    http_root = Path(TEMP_PATH) / "docker_pkg_http"
+    if http_root.exists():
+        shutil.rmtree(http_root)
+    http_root.mkdir(parents=True)
+    allowed = set()
+    for f in files:
+        dest = http_root / f.name
+        if dest.exists():
+            continue
+        try:
+            os.link(f, dest)
+        except OSError:
+            shutil.copy2(f, dest)
+        allowed.add(f.name)
+
+    class Handler(SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=str(http_root), **kwargs)
+
+        def list_directory(self, _path):
+            self.send_error(404, "Not found")
+            return None
+
+        def do_GET(self):
+            name = Path(unquote(urlparse(self.path).path)).name
+            if name not in allowed:
+                self.send_error(404, "Not found")
+                return
+            self.path = "/" + name
+            super().do_GET()
+
+        def log_message(self, fmt, *args):
+            logging.info("package-http " + fmt, *args)
+
+    # 0.0.0.0: buildx uses the docker-container driver; wget runs in that
+    # container and reaches the runner via host.docker.internal/host-gateway.
+    httpd = ThreadingHTTPServer(("0.0.0.0", 0), Handler)
+    threading.Thread(
+        target=httpd.serve_forever, daemon=True, name="package-http"
+    ).start()
+    return httpd
 
 
 class DelOS(argparse.Action):
@@ -233,6 +382,8 @@ def build_and_push_image(
                 urls = [url for url in direct_urls[arch] if ".deb" in url]
             else:
                 urls = [url for url in direct_urls[arch] if ".tgz" in url]
+        if urls and any("host.docker.internal" in url for url in urls):
+            cmd_args.append("--add-host=host.docker.internal:host-gateway")
         cmd_args.extend(
             buildx_args(repo_urls, arch, direct_urls=urls, version=version.describe)
         )
@@ -387,43 +538,56 @@ def main():
     repo_urls = {}
     direct_urls: Dict[str, List[str]] = {}
 
-    for arch, build_name in zip(ARCH, ("package_release", "package_aarch64")):
-        if args.allow_build_reuse:
-            # read s3 urls from pre-downloaded build reports
-            if "clickhouse-server" in image_repo:
-                PACKAGES = [
-                    "clickhouse-client",
-                    "clickhouse-server",
-                    "clickhouse-common-static",
-                ]
-            elif "clickhouse-keeper" in image_repo:
-                PACKAGES = ["clickhouse-keeper"]
-            else:
-                assert False, "BUG"
-            urls = read_build_urls(build_name, Path(REPORT_PATH))
-            assert (
-                urls
-            ), f"URLS has not been read from build report, report path[{REPORT_PATH}], build [{build_name}]"
-            direct_urls[arch] = [
-                url
-                for url in urls
-                if any(package in url for package in PACKAGES) and "-dbg" not in url
-            ]
-        elif args.bucket_prefix:
-            assert not args.allow_build_reuse
+    if args.bucket_prefix:
+        for arch, build_name in zip(ARCH, ("package_release", "package_aarch64")):
             repo_urls[arch] = f"{args.bucket_prefix}/{build_name}"
-            print(f"Bucket prefix is set: Fetching packages from [{repo_urls}]")
-        elif args.sha:
-            version = args.version
+        print(f"Bucket prefix is set: Fetching packages from [{repo_urls}]")
+    elif args.sha:
+        version = args.version
+        for arch, build_name in zip(ARCH, ("package_release", "package_aarch64")):
             repo_urls[arch] = (
                 f"{S3_DOWNLOAD}/{S3_BUILDS_BUCKET}/"
                 f"{version.major}.{version.minor}/{args.sha}/{build_name}"
             )
-            print(f"Fetching packages from [{repo_urls}]")
-        else:
-            assert (
-                False
-            ), "--sha, --bucket_prefix or --allow-build-reuse (to fetch packages from build report) must be provided"
+        print(f"Fetching packages from [{repo_urls}]")
+    else:
+        files_by_arch = merge_files_by_arch(
+            *(package_files_from_dir(d, image_repo) for d in local_package_dirs())
+        )
+        package_files = [f for files in files_by_arch.values() for f in files]
+        if not package_files:
+            logging.info(
+                "No local packages in %s; downloading via S3Helper from build reports",
+                [str(d) for d in local_package_dirs()],
+            )
+            packages = packages_for_image(image_repo)
+            pkg_dir = Path(TEMP_PATH) / "docker_pkg"
+            downloaded: Dict[str, List[Path]] = {}
+            for arch, build_name in zip(ARCH, ("package_release", "package_aarch64")):
+                urls = read_build_urls(build_name, Path(REPORT_PATH))
+                filtered = [
+                    url
+                    for url in urls
+                    if any(package in url for package in packages) and "-dbg" not in url
+                ]
+                logging.info("Build report URLs [%s]: %s", arch, filtered)
+                downloaded[arch] = download_packages_from_s3(filtered, pkg_dir)
+            files_by_arch = downloaded
+            package_files = [f for files in files_by_arch.values() for f in files]
+        assert package_files, (
+            f"No packages found locally in {CI_TMP} or via S3 reports for {image_repo}"
+        )
+        httpd = start_package_http_server(package_files)
+        atexit.register(httpd.shutdown)
+        port = httpd.server_address[1]
+        base_url = f"http://host.docker.internal:{port}"
+        logging.info("Serving %s package files at %s", len(package_files), base_url)
+        direct_urls = {
+            arch: [f"{base_url}/{f.name}" for f in files]
+            for arch, files in files_by_arch.items()
+        }
+        for arch, urls in direct_urls.items():
+            logging.info("Package URLs [%s]: %s", arch, urls)
 
     if push:
         docker_login()
