@@ -231,6 +231,7 @@ def make_mt(
     columns,
     partition_by,
     order_by="tuple()",
+    engine="MergeTree()",
     extra_settings="",
 ):
     """Create a MergeTree table with block-number settings."""
@@ -238,7 +239,7 @@ def make_mt(
     node.query(
         f"""
         CREATE TABLE {name} ({columns})
-        ENGINE = MergeTree()
+        ENGINE = {engine}
         PARTITION BY {partition_by}
         ORDER BY {order_by}
         SETTINGS {settings}
@@ -335,6 +336,7 @@ def make_iceberg_s3(
     url=None,
     s3_retry_attempts=3,
     if_not_exists=False,
+    extra_settings="",
 ):
     """Create an IcebergS3 table at a MinIO prefix.
 
@@ -344,12 +346,15 @@ def make_iceberg_s3(
         url = f"http://minio1:9001/root/data/{name}/"
     ine = "IF NOT EXISTS " if if_not_exists else ""
     pclause = f"PARTITION BY {partition_by}" if partition_by else ""
+    settings = f"s3_retry_attempts = {s3_retry_attempts}"
+    if extra_settings:
+        settings += ", " + extra_settings
     node.query(
         f"""
         CREATE TABLE {ine}{name} ({columns})
         ENGINE = IcebergS3('{url}', '{MINIO_USER}', '{MINIO_PASS}')
         {pclause}
-        SETTINGS s3_retry_attempts = {s3_retry_attempts}
+        SETTINGS {settings}
         """
     )
 

@@ -386,8 +386,7 @@ BinPackPlan buildBinPackPlan(
             current_schema_id);
 
     /// Build partition types from the partitioner.
-    for (UInt32 i = 0; i < schemas->size(); ++i)
-        persistent_table_components.schema_processor->addIcebergTableSchema(schemas->getObject(i), context);
+    addIcebergTableSchemasFromMetadata(metadata_object, *persistent_table_components.schema_processor, context);
 
     auto fields_characteristics = persistent_table_components.schema_processor->tryGetFieldsCharacteristics(
         static_cast<Int32>(current_schema_id), partition_source_ids);
@@ -754,9 +753,7 @@ bool hasLivePositionDeletes(
         return false;
 
     const auto current_schema_id = metadata_object->getValue<Int32>(f_current_schema_id);
-    auto schemas = metadata_object->getArray(f_schemas);
-    for (UInt32 i = 0; i < schemas->size(); ++i)
-        persistent_table_components.schema_processor->addIcebergTableSchema(schemas->getObject(i), context);
+    addIcebergTableSchemasFromMetadata(metadata_object, *persistent_table_components.schema_processor, context);
 
     auto manifest_list = getManifestList(
         object_storage, persistent_table_components, context,

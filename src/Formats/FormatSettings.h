@@ -422,6 +422,7 @@ struct FormatSettings
         bool allow_geoparquet_parser = true;
         bool detect_variant_by_structure = true;
         bool spatial_filter_push_down = true;
+        bool allow_aggregate_function_states = false;
         bool write_geometadata = true;
         size_t max_dictionary_size = 1024 * 1024;
     } parquet{};
