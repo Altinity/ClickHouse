@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import os
+import urllib.parse
 from pathlib import Path
 from itertools import combinations
 import json
@@ -17,8 +18,22 @@ from botocore.exceptions import NoCredentialsError
 DATABASE_HOST_VAR = "CHECKS_DATABASE_HOST"
 DATABASE_USER_VAR = "CHECKS_DATABASE_USER"
 DATABASE_PASSWORD_VAR = "CHECKS_DATABASE_PASSWORD"
-S3_BUCKET = "altinity-build-artifacts"
+S3_BUCKET = os.getenv("S3_ARTIFACT_BUCKET")
 GITHUB_REPO = "Altinity/ClickHouse"
+
+
+def _repo_and_run_id(actions_run_url: str) -> tuple[str, str]:
+    parts = urllib.parse.urlparse(actions_run_url).path.strip("/").split("/")
+    if (
+        len(parts) >= 5
+        and parts[2] == "actions"
+        and parts[3] == "runs"
+        and parts[0]
+        and parts[1]
+        and parts[4]
+    ):
+        return f"{parts[0]}/{parts[1]}", parts[4]
+    return GITHUB_REPO, actions_run_url.rstrip("/").split("/")[-1]
 
 # Set up the Jinja2 environment
 template_dir = os.path.dirname(__file__)
@@ -29,7 +44,7 @@ template = Environment(loader=FileSystemLoader(template_dir)).get_template(
 )
 
 
-def get_commit_statuses(sha: str) -> pd.DataFrame:
+def get_commit_statuses(sha: str, repo: str = GITHUB_REPO) -> pd.DataFrame:
     """
     Fetch commit statuses for a given SHA and return as a pandas DataFrame.
     Handles pagination to get all statuses.
@@ -45,7 +60,7 @@ def get_commit_statuses(sha: str) -> pd.DataFrame:
         "Accept": "application/vnd.github.v3+json",
     }
 
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/commits/{sha}/statuses"
+    url = f"https://api.github.com/repos/{repo}/commits/{sha}/statuses"
 
     all_data = []
 
@@ -99,7 +114,7 @@ def get_commit_statuses(sha: str) -> pd.DataFrame:
     ).reset_index(drop=True)
 
 
-def get_pr_info_from_number(pr_number: str) -> dict:
+def get_pr_info_from_number(pr_number: str, repo: str = GITHUB_REPO) -> dict:
     """
     Fetch pull request information for a given PR number.
 
@@ -114,7 +129,7 @@ def get_pr_info_from_number(pr_number: str) -> dict:
         "Accept": "application/vnd.github.v3+json",
     }
 
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/pulls/{pr_number}"
+    url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}"
     response = requests.get(url, headers=headers)
 
     if response.status_code != 200:
@@ -130,14 +145,14 @@ def get_run_details(run_url: str) -> dict:
     """
     Fetch run details for a given run URL.
     """
-    run_id = run_url.split("/")[-1]
+    repo, run_id = _repo_and_run_id(run_url)
 
     headers = {
         "Authorization": f"token {os.getenv('GITHUB_TOKEN')}",
         "Accept": "application/vnd.github.v3+json",
     }
 
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/runs/{run_id}"
+    url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id}"
     response = requests.get(url, headers=headers)
 
     if response.status_code != 200:
@@ -535,6 +550,7 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
+    github_repo, run_id = _repo_and_run_id(args.actions_run_url)
 
     if args.pr_number is None or args.commit_sha is None:
         run_details = get_run_details(args.actions_run_url)
@@ -560,7 +576,7 @@ def main():
     branch_name = run_details.get("head_branch", "unknown branch")
 
     fail_results = {
-        "job_statuses": get_commit_statuses(args.commit_sha),
+        "job_statuses": get_commit_statuses(args.commit_sha, github_repo),
         "checks_fails": get_checks_fails(db_client, args.commit_sha, branch_name),
         "checks_known_fails": [],
         "pr_new_fails": [],
@@ -592,8 +608,8 @@ def main():
         pr_info_html = f"Release ({branch_name})"
     else:
         try:
-            pr_info = get_pr_info_from_number(args.pr_number)
-            pr_info_html = f"""<a href="https://github.com/{GITHUB_REPO}/pull/{pr_info["number"]}">
+            pr_info = get_pr_info_from_number(args.pr_number, github_repo)
+            pr_info_html = f"""<a href="https://github.com/{github_repo}/pull/{pr_info["number"]}">
                     #{pr_info.get("number")} ({pr_info.get("base", {}).get('ref')} <- {pr_info.get("head", {}).get('ref')})  {pr_info.get("title")}
                     </a>"""
             fail_results["pr_new_fails"] = get_new_fails_this_pr(
@@ -617,11 +633,11 @@ def main():
     # Define the context for rendering
     context = {
         "title": "ClickHouse® CI Workflow Run Report",
-        "github_repo": GITHUB_REPO,
+        "github_repo": github_repo,
         "s3_bucket": S3_BUCKET,
         "pr_info_html": pr_info_html,
         "pr_number": args.pr_number,
-        "workflow_id": args.actions_run_url.split("/")[-1],
+        "workflow_id": run_id,
         "commit_sha": args.commit_sha,
         "base_sha": "" if args.pr_number == 0 else pr_info.get("base", {}).get("sha"),
         "date": f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC",
