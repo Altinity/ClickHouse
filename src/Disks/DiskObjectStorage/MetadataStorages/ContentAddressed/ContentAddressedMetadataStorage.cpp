@@ -69,6 +69,7 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 gc_shards;
     extern const ContentAddressedSettingsUInt64 manifest_sweep_list_budget_keys;
     extern const ContentAddressedSettingsUInt64 manifest_sweep_delete_budget_keys;
+    extern const ContentAddressedSettingsUInt64 orphan_manifest_sweep_interval_sec;
     extern const ContentAddressedSettingsUInt64 gc_round_graduation_budget;
     extern const ContentAddressedSettingsUInt64 gc_round_redelete_budget;
     extern const ContentAddressedSettingsUInt64 gc_round_sweep_namespace_budget;
@@ -294,6 +295,7 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , gc_shards(settings_[ContentAddressedSetting::gc_shards].value)
     , manifest_sweep_list_budget_keys(settings_[ContentAddressedSetting::manifest_sweep_list_budget_keys].value)
     , manifest_sweep_delete_budget_keys(settings_[ContentAddressedSetting::manifest_sweep_delete_budget_keys].value)
+    , orphan_manifest_sweep_interval_sec(settings_[ContentAddressedSetting::orphan_manifest_sweep_interval_sec].value)
     , gc_round_graduation_budget(settings_[ContentAddressedSetting::gc_round_graduation_budget].value)
     , gc_round_redelete_budget(settings_[ContentAddressedSetting::gc_round_redelete_budget].value)
     , gc_round_sweep_namespace_budget(settings_[ContentAddressedSetting::gc_round_sweep_namespace_budget].value)
@@ -794,6 +796,7 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     pool_config.gc_shards = gc_shards;
     pool_config.manifest_sweep_list_budget_keys = manifest_sweep_list_budget_keys;
     pool_config.manifest_sweep_delete_budget_keys = manifest_sweep_delete_budget_keys;
+    pool_config.orphan_manifest_sweep_interval_sec = orphan_manifest_sweep_interval_sec;
     pool_config.gc_round_graduation_budget = gc_round_graduation_budget;
     pool_config.gc_round_redelete_budget = gc_round_redelete_budget;
     pool_config.gc_round_sweep_namespace_budget = gc_round_sweep_namespace_budget;

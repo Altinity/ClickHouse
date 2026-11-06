@@ -741,6 +741,7 @@ ManifestSweepResult planManifestCursorPage(
     else
         reader = std::make_unique<InlineKeyReader>(op);
     const ListPage page = op.list(layout.casManifestsPrefix(), cursor, list_budget, Retry::standard());
+    result.orphan_manifest_sweep_page_listed = true;
     /// This pass fetches exactly one page per round (the cursor advances across rounds, not within this
     /// call), so the metric increments once per call, not once per listed key.
     ProfileEvents::increment(ProfileEvents::CASGCEnumerationPages);

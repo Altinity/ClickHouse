@@ -35,6 +35,9 @@ struct GcState
     uint64_t snap_pruned_through = 0;   /// highest snap generation fully pruned (retention cursor)
     uint64_t snap_attempt = 0;     /// adopted attempt id (folding leader's lease.seq) for snap_generation
     String manifest_sweep_cursor;  /// best-effort orphan part-manifest cleanup cursor; reachability ignores it
+    bool orphan_manifest_sweep_active = false;
+    uint64_t orphan_manifest_sweep_started_at_ms = 0;
+    uint64_t orphan_manifest_sweep_completed_at_ms = 0;
     GcLease lease;
 };
 
