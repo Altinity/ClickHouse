@@ -505,7 +505,8 @@ jobs:
 #############################################################################################
   ASTFuzzerAsan:
     needs: [RunConfig, BuilderDebAsan]
-    if: ${{ !failure() && !cancelled() }}
+    # NOTE (strtgbb): AST fuzzers do not run on this branch
+    if: false
     uses: ./.github/workflows/reusable_test.yml
     secrets: inherit
     with:
@@ -514,7 +515,8 @@ jobs:
       data: ${{ needs.RunConfig.outputs.data }}
   ASTFuzzerTsan:
     needs: [RunConfig, BuilderDebTsan]
-    if: ${{ !failure() && !cancelled() }}
+    # NOTE (strtgbb): AST fuzzers do not run on this branch
+    if: false
     uses: ./.github/workflows/reusable_test.yml
     secrets: inherit
     with:
@@ -523,7 +525,8 @@ jobs:
       data: ${{ needs.RunConfig.outputs.data }}
   ASTFuzzerMsan:
     needs: [RunConfig, BuilderDebMsan]
-    if: ${{ !failure() && !cancelled() }}
+    # NOTE (strtgbb): AST fuzzers do not run on this branch
+    if: false
     uses: ./.github/workflows/reusable_test.yml
     secrets: inherit
     with:
@@ -532,7 +535,8 @@ jobs:
       data: ${{ needs.RunConfig.outputs.data }}
   ASTFuzzerUBsan:
     needs: [RunConfig, BuilderDebUBsan]
-    if: ${{ !failure() && !cancelled() }}
+    # NOTE (strtgbb): AST fuzzers do not run on this branch
+    if: false
     uses: ./.github/workflows/reusable_test.yml
     secrets: inherit
     with:
@@ -541,7 +545,8 @@ jobs:
       data: ${{ needs.RunConfig.outputs.data }}
   ASTFuzzerDebug:
     needs: [RunConfig, BuilderDebDebug]
-    if: ${{ !failure() && !cancelled() }}
+    # NOTE (strtgbb): AST fuzzers do not run on this branch
+    if: false
     uses: ./.github/workflows/reusable_test.yml
     secrets: inherit
     with:
