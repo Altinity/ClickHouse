@@ -3093,12 +3093,12 @@ TEST(CASPartWriteTxnMarkerRace, PresentBodyWithoutMarkerRepublishesOnce)
     OperationForTest op(*b);
     const Etag leftover = (*op).head(blob_key, Retry::once())->etag;
 
-    const auto creates_before = ProfileEvents::global_counters[ProfileEvents::CASMetaCreateClean].load();
+    const auto creates_before = ProfileEvents::global_counters[ProfileEvents::CASMetaCreateClean];
     auto first = precommittedBuildForPayload(s, RootNamespace{"srv1/leftover-a"}, "part", payload);
     const BlobUploadResult first_result = uploadOnce(first, ref, payload);
     EXPECT_EQ(first_result.diagnostics.action, BlobMaterializationAction::Published);
     EXPECT_EQ(first_result.diagnostics.reason, std::optional<BlobPublicationReason>(BlobPublicationReason::Absent));
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMetaCreateClean].load() - creates_before, 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMetaCreateClean] - creates_before, 1);
     const auto republished = (*op).head(blob_key, Retry::once());
     ASSERT_TRUE(republished.has_value());
     EXPECT_NE(republished->etag, leftover);
