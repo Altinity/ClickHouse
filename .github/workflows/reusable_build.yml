@@ -12,6 +12,7 @@ env:
   CLICKHOUSE_TEST_STAT_URL: ${{ secrets.CLICKHOUSE_TEST_STAT_URL }}
   DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
   ROBOT_TOKEN: ${{ secrets.ROBOT_TOKEN }}
+  S3_ARTIFACT_BUCKET: ${{ vars.S3_ARTIFACT_BUCKET }}
 
 name: Build ClickHouse
 'on':
@@ -96,7 +97,8 @@ jobs:
       - name: Create source tar
         run: |
           mkdir -p "$TEMP_PATH/build_check/package_release"
-          cd .. && tar czf $TEMP_PATH/build_source.src.tar.gz ClickHouse/
+          repo_dir=$(basename "$GITHUB_WORKSPACE")
+          tar czf $TEMP_PATH/build_source.src.tar.gz --transform "s|^$repo_dir|ClickHouse|" -C .. "$repo_dir"
           cd $TEMP_PATH && tar xvzf $TEMP_PATH/build_source.src.tar.gz
       - name: Pre
         run: |

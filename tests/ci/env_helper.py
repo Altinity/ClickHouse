@@ -5,6 +5,9 @@ import os
 from os import path as p
 from typing import Tuple
 
+# NOTE (strtgbb): get_robot_token imports this name while env_helper is still loading
+ROBOT_TOKEN = os.getenv("ROBOT_TOKEN")
+
 from build_download_helper import APIException, get_gh_api
 
 module_dir = p.abspath(p.dirname(__file__))
@@ -33,10 +36,11 @@ REPO_COPY = os.getenv("REPO_COPY", GITHUB_WORKSPACE)
 RUNNER_TEMP = os.getenv("RUNNER_TEMP", p.abspath(p.join(module_dir, "./tmp")))
 
 S3_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
-S3_BUILDS_BUCKET = os.getenv("S3_BUILDS_BUCKET", "altinity-build-artifacts")
-S3_BUILDS_BUCKET_PUBLIC = "altinity-build-artifacts"
+S3_ARTIFACT_BUCKET = os.getenv("S3_ARTIFACT_BUCKET")
+S3_BUILDS_BUCKET = os.getenv("S3_BUILDS_BUCKET") or S3_ARTIFACT_BUCKET
+S3_BUILDS_BUCKET_PUBLIC = S3_ARTIFACT_BUCKET
 S3_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-S3_TEST_REPORTS_BUCKET = os.getenv("S3_TEST_REPORTS_BUCKET", "altinity-build-artifacts")
+S3_TEST_REPORTS_BUCKET = os.getenv("S3_TEST_REPORTS_BUCKET") or S3_ARTIFACT_BUCKET
 
 S3_URL = os.getenv("S3_URL", "https://s3.amazonaws.com")
 S3_DOWNLOAD = os.getenv("S3_DOWNLOAD", S3_URL)
@@ -50,7 +54,6 @@ CLICKHOUSE_TEST_STAT_LOGIN = os.getenv("CLICKHOUSE_TEST_STAT_LOGIN")
 CLICKHOUSE_TEST_STAT_PASSWORD = os.getenv("CLICKHOUSE_TEST_STAT_PASSWORD")
 CLICKHOUSE_TEST_STAT_URL = os.getenv("CLICKHOUSE_TEST_STAT_URL")
 DOCKER_PASSWORD = os.getenv("DOCKER_PASSWORD")
-ROBOT_TOKEN = os.getenv("ROBOT_TOKEN")
 
 # These parameters are set only on demand, and only once
 _GITHUB_JOB_ID = ""

@@ -2,6 +2,7 @@ name: JepsenWorkflow
 env:
   # Force the stdout and stderr streams to be unbuffered
   PYTHONUNBUFFERED: 1
+  S3_ARTIFACT_BUCKET: ${{ vars.S3_ARTIFACT_BUCKET }}
 concurrency:
   group: jepsen
 on: # yamllint disable-line rule:truthy
