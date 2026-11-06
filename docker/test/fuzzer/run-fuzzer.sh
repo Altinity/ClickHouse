@@ -20,14 +20,30 @@ repo_dir=ch
 BINARY_TO_DOWNLOAD=${BINARY_TO_DOWNLOAD:="clang-18_debug_none_unsplitted_disable_False_binary"}
 BINARY_URL_TO_DOWNLOAD=${BINARY_URL_TO_DOWNLOAD:="https://clickhouse-builds.s3.amazonaws.com/$PR_TO_TEST/$SHA_TO_TEST/clickhouse_build_check/$BINARY_TO_DOWNLOAD/clickhouse"}
 BASE_REF=${BASE_REF:="master"}
+REPO="${GITHUB_REPOSITORY:-Altinity/ClickHouse}"
+
+# NOTE (strtgbb): token must not land in the set -x trace
+function git_auth
+{
+    set +x
+    local rc=0
+    if [ -n "${ROBOT_TOKEN:-}" ] && [ "$REPO" != "Altinity/ClickHouse" ]; then
+        git -c "http.extraheader=AUTHORIZATION: bearer ${ROBOT_TOKEN}" "$@"
+    else
+        git "$@"
+    fi
+    rc=$?
+    set -x
+    return "$rc"
+}
 
 function git_clone_with_retry
 {
     for _ in 1 2 3 4; do
         # Strip refs/tags/ prefix if present, as --branch expects just the tag/branch name
         local ref_name="${BASE_REF#refs/tags/}"
-        
-        if git clone --depth 1 https://github.com/Altinity/ClickHouse.git --branch "${ref_name}" -- "$1" 2>&1 | ts '%Y-%m-%d %H:%M:%S';then
+
+        if git_auth clone --depth 1 "https://github.com/${REPO}.git" --branch "${ref_name}" -- "$1" 2>&1 | ts '%Y-%m-%d %H:%M:%S';then
             return 0
         else
             sleep 0.5
@@ -46,22 +62,22 @@ function clone
     (
         cd "$repo_dir"
         if [ "$PR_TO_TEST" != "0" ]; then
-            if git fetch --depth 1 origin "+refs/pull/$PR_TO_TEST/merge"; then
+            if git_auth fetch --depth 1 origin "+refs/pull/$PR_TO_TEST/merge"; then
                 git checkout FETCH_HEAD
                 echo "Checked out pull/$PR_TO_TEST/merge ($(git rev-parse FETCH_HEAD))"
             else
-                git fetch --depth 1 origin "+refs/pull/$PR_TO_TEST/head"
+                git_auth fetch --depth 1 origin "+refs/pull/$PR_TO_TEST/head"
                 git checkout "$SHA_TO_TEST"
                 echo "Checked out nominal SHA $SHA_TO_TEST for PR $PR_TO_TEST"
             fi
             git diff --name-only ${BASE_REF} HEAD | tee ci-changed-files.txt
         else
             if [ -v SHA_TO_TEST ]; then
-                git fetch --depth 2 origin "$SHA_TO_TEST"
+                git_auth fetch --depth 2 origin "$SHA_TO_TEST"
                 git checkout "$SHA_TO_TEST"
                 echo "Checked out nominal SHA $SHA_TO_TEST for master"
             else
-                git fetch --depth 2 origin
+                git_auth fetch --depth 2 origin
                 echo "Using default repository head $(git rev-parse HEAD)"
             fi
             git diff --name-only HEAD~1 HEAD | tee ci-changed-files.txt
@@ -452,7 +468,7 @@ p.links a { padding: 5px; margin: 3px; background: #FFF; line-height: 2; white-s
 <body>
 <div class="main">
 
-<h1>AST Fuzzer for PR <a href="https://github.com/Altinity/ClickHouse/pull/${PR_TO_TEST}">#${PR_TO_TEST}</a> @ ${SHA_TO_TEST}</h1>
+<h1>AST Fuzzer for PR <a href="https://github.com/${REPO}/pull/${PR_TO_TEST}">#${PR_TO_TEST}</a> @ ${SHA_TO_TEST}</h1>
 <p class="links">
   <a href="run.log">run.log</a>
   <a href="fuzzer.log.zst">fuzzer.log.zst</a>

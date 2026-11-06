@@ -81,6 +81,7 @@ jobs:
       pr_number: ${{ github.event.number }}
       event_name: ${{ github.event_name }}
       artifacts: builds
+      S3_ARTIFACT_BUCKET: ${{ vars.S3_ARTIFACT_BUCKET }}
       args: --test-to-end
         --no-colors
         --local
