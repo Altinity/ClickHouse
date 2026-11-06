@@ -1558,7 +1558,8 @@ TEST(CASRefWriterAppendLane, CheckpointConflictAfterLogCommitRequiresRecoveryWit
     auto clock = VirtualRetryClock::installOn(store);
     backend->ckpt_conflict_key = ckpt_key;
     backend->ckpt_conflict_latched = true;
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR,
+        "is durable but was not acknowledged", [&] { store->dropRef(ns, "x"); });
     backend->disarmFaults();
 
     EXPECT_GT(clock->pauseCount(), 1u)
@@ -1574,6 +1575,62 @@ TEST(CASRefWriterAppendLane, CheckpointConflictAfterLogCommitRequiresRecoveryWit
     EXPECT_FALSE(readOf(backend, store->layout().refLogKey(
         life, RefTxnId{candidate.writer_epoch, candidate.ref_sequence + 1})))
         << "no later id may be allocated above an unfrontiered durable transaction";
+}
+
+/// The same `_ckpt` failure after the ref-log commit means different things per step: a promoted part
+/// can come back after a restart, a precommitted one is never published. The texts must differ.
+TEST(CASRefWriterAppendLane, DurableUnconfirmedTextNamesPrecommitAndPromoteApart)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/frontier-conflict-steps"};
+    publishEmptyPart(store, ns, "x");
+    const NamespaceLifeId life = lifeIfCatalogedForTest(backend, store->layout(), ns).value();
+    const String ckpt_key = store->layout().refCkptKey(life);
+    auto clock = VirtualRetryClock::installOn(store);
+
+    auto messageOf = [&](const std::function<void()> & step)
+    {
+        backend->ckpt_conflict_key = ckpt_key;
+        backend->ckpt_conflict_latched = true;
+        String message;
+        try
+        {
+            step();
+        }
+        catch (const DB::Exception & e)
+        {
+            message = e.message();
+        }
+        backend->disarmFaults();
+        return message;
+    };
+
+    auto precommitted = startBuildFor(store, ns, "pre");
+    const ManifestId pre_id = precommitted->stageManifest({});
+    const String precommit_message = messageOf([&] { precommitted->precommitAdd(ns, "pre", pre_id); });
+    precommitted.reset();
+
+    /// Recover the lane so the promote below reaches its own ref-log commit.
+    publishEmptyPart(store, ns, "between");
+
+    auto promoted = startBuildFor(store, ns, "prom");
+    const ManifestId prom_id = promoted->stageManifest({});
+    promoted->precommitAdd(ns, "prom", prom_id);
+    const String promote_message = messageOf([&] { promoted->promote(ns, "prom", promoted->buildId(), prom_id); });
+
+    /// A kind other than promote must not carry the promote-only note.
+    publishEmptyPart(store, ns, "between_again");
+    const String drop_message = messageOf([&] { store->dropRef(ns, "x"); });
+    EXPECT_NE(drop_message.find("is durable but was not acknowledged"), String::npos) << drop_message;
+    EXPECT_EQ(drop_message.find("promoted part returns"), String::npos) << drop_message;
+
+    EXPECT_NE(precommit_message.find("never published"), String::npos) << precommit_message;
+    EXPECT_EQ(precommit_message.find("may still take effect"), String::npos) << precommit_message;
+    EXPECT_NE(promote_message.find("is durable but was not acknowledged"), String::npos) << promote_message;
+    EXPECT_NE(promote_message.find("may still take effect"), String::npos) << promote_message;
+    EXPECT_EQ(promote_message.find("restart"), String::npos) << promote_message;
+    EXPECT_EQ(promote_message.find("never published"), String::npos) << promote_message;
 }
 
 TEST(CASRefWriterAppendLane, FenceMovementAtCheckpointPublicationRequiresRecoveryWithoutInstall)
@@ -1593,7 +1650,9 @@ TEST(CASRefWriterAppendLane, FenceMovementAtCheckpointPublicationRequiresRecover
 
     backend->ckpt_get_hook_key = ckpt_key;
     backend->ckpt_get_hook = [&] { store->tripMountLost(); };
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+    SCOPE_EXIT({ backend->ckpt_get_hook = nullptr; });
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR,
+        "is durable but was not acknowledged", [&] { store->dropRef(ns, "x"); });
 
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_before)
