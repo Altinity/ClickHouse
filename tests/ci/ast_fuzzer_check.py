@@ -6,7 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from build_download_helper import read_build_urls
+from build_download_helper import _s3_bucket_and_key, read_build_urls
 from clickhouse_helper import CiLogsCredentials
 from docker_images_helper import DockerImage, get_docker_image, pull_image
 from env_helper import REPORT_PATH, TEMP_PATH
@@ -19,6 +19,22 @@ from ci_config import CI
 IMAGE_NAME = "altinityinfra/fuzzer"
 
 
+def _url_for_container(url: str) -> str:
+    if not os.getenv("AWS_ACCESS_KEY_ID"):
+        return url
+    location = _s3_bucket_and_key(url)
+    if location is None:
+        return url
+    from s3_helper import S3Helper
+
+    bucket, key = location
+    return S3Helper().client.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": bucket, "Key": key},
+        ExpiresIn=4 * 60 * 60,
+    )
+
+
 def get_run_command(
     pr_info: PRInfo,
     build_url: str,
@@ -26,10 +42,12 @@ def get_run_command(
     ci_logs_args: str,
     image: DockerImage,
 ) -> str:
+    # Keep the URL out of the docker command, which is written to the log.
+    os.environ["BINARY_URL_TO_DOWNLOAD"] = _url_for_container(build_url)
     envs = [
         f"-e PR_TO_TEST={pr_info.number}",
         f"-e SHA_TO_TEST={pr_info.sha}",
-        f"-e BINARY_URL_TO_DOWNLOAD='{build_url}'",
+        "-e BINARY_URL_TO_DOWNLOAD",
         f"-e BASE_REF='{pr_info.base_ref}'",
         "-e GITHUB_REPOSITORY",
         "-e ROBOT_TOKEN",

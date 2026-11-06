@@ -22,13 +22,18 @@ BINARY_URL_TO_DOWNLOAD=${BINARY_URL_TO_DOWNLOAD:="https://clickhouse-builds.s3.a
 BASE_REF=${BASE_REF:="master"}
 REPO="${GITHUB_REPOSITORY:-Altinity/ClickHouse}"
 
-# NOTE (strtgbb): token must not land in the set -x trace
+# NOTE (strtgbb): git smart HTTP wants basic auth, and the token must stay out of the set -x trace
 function git_auth
 {
     set +x
     local rc=0
     if [ -n "${ROBOT_TOKEN:-}" ] && [ "$REPO" != "Altinity/ClickHouse" ]; then
-        git -c "http.extraheader=AUTHORIZATION: bearer ${ROBOT_TOKEN}" "$@"
+        local basic
+        basic=$(printf 'x-access-token:%s' "$ROBOT_TOKEN" | base64 -w0)
+        GIT_TERMINAL_PROMPT=0 git \
+            -c credential.helper= \
+            -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${basic}" \
+            "$@"
     else
         git "$@"
     fi
