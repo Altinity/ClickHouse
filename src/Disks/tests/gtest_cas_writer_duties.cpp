@@ -464,7 +464,7 @@ TEST(CASWriterDuties, RejectedAttemptBodyIsEventuallyNominatedAndSwept)
     /// field alone; pair the two so the mount lease's admission arithmetic sees what the budget claims.
     backend->setAttemptTimeoutMs(budget.attempt_timeout_ms);
     /// Rooted under the POOL's OWN `server_root_id` ("test", unlike this file's other fixtures, which
-    /// stay under "srv1" precisely because they never drive the orphan sweep): `prefixEligible`'s
+    /// stay under "srv1" precisely because they never drive the orphan sweep): `buildPrefixEligibleUnderFloor`'s
     /// watermark floor is looked up by walking the NAMESPACE's own prefix segments for a live mount
     /// lease, so a namespace rooted under any other server-root would find no floor and retain forever
     /// regardless of epoch/coverage.
