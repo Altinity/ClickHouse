@@ -2033,13 +2033,13 @@ TEST_F(CASDecommission, FailedRemountStillRunsTheConfirm)
         fenced = true;
         fenceSlot();
     };
-    const uint64_t remount_failures_before = ProfileEvents::global_counters[ProfileEvents::CASRemountFailed].load();
+    const uint64_t remount_failures_before = ProfileEvents::global_counters[ProfileEvents::CASRemountFailed];
 
     const auto report = run("a1", realTimeConfig());
 
     ASSERT_TRUE(fenced);
     EXPECT_FALSE(report.member_retired);
-    EXPECT_GT(ProfileEvents::global_counters[ProfileEvents::CASRemountFailed].load(), remount_failures_before)
+    EXPECT_GT(ProfileEvents::global_counters[ProfileEvents::CASRemountFailed], remount_failures_before)
         << "the admin's self-remount ran and failed";
     expectOwner(2, true, false);   /// kept: the claim was lost during the drain
     EXPECT_FALSE(exists("p/roots/victim/a")) << "the delete that tripped the fence landed";

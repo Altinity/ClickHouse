@@ -200,7 +200,7 @@ CountingS3::ObjectStore::FaultFn dropFirstTwo(Verb verb)
 
 uint64_t failedPublicationAttempts()
 {
-    return ProfileEvents::global_counters[ProfileEvents::CASBlobPublishAttemptFailed].load();
+    return ProfileEvents::global_counters[ProfileEvents::CASBlobPublishAttemptFailed];
 }
 
 }

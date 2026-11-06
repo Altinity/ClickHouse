@@ -3555,14 +3555,14 @@ void expectRemountStopsForGood(const std::shared_ptr<InMemoryBackend> & b, const
     const String owner_before = ops.op.read(l.ownerKey("r"), Retry::standard())->bytes;
     const String counter_before = ops.op.read(l.epochKey("r"), Retry::standard())->bytes;
     const uint64_t epoch_before = slotBody(*b, l, "r").writer_epoch;
-    const uint64_t identity_lost_before = ProfileEvents::global_counters[ProfileEvents::CASIdentityLost].load();
+    const uint64_t identity_lost_before = ProfileEvents::global_counters[ProfileEvents::CASIdentityLost];
     DB::Cas::tests::ScopedLoggerCapture capture("CasPool", "warning");
 
     EXPECT_FALSE(store->tryRemountOnce());
     EXPECT_EQ(store->lifecycle(), PoolLifecycle::IdentityLost);
     EXPECT_FALSE(store->tryRemountOnce());
 
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASIdentityLost].load(), identity_lost_before + 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASIdentityLost], identity_lost_before + 1);
     EXPECT_NE(capture.captured().find(why), String::npos) << capture.captured();
     EXPECT_EQ(ops.op.read(l.epochKey("r"), Retry::standard())->bytes, counter_before) << "no epoch was allocated";
     EXPECT_EQ(ops.op.read(l.ownerKey("r"), Retry::standard())->bytes, owner_before) << "the owner was not written";

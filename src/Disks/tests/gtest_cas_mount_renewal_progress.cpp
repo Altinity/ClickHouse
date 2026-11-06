@@ -25,7 +25,7 @@ namespace
 
 uint64_t attemptsCounter()
 {
-    return ProfileEvents::global_counters[ProfileEvents::CASMountRenewalAttempts].load();
+    return ProfileEvents::global_counters[ProfileEvents::CASMountRenewalAttempts];
 }
 
 /// Fixed boot clock and no-op sleep: every armed fault is finite, so retries end without time passing.

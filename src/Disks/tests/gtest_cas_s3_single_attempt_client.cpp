@@ -888,7 +888,7 @@ TEST(CASBackend, ConditionalMultipartNoSuchUploadIsUnresolved)
     auto backend = conditionalBackendForTest(
         S3ObjectCreationTestStorage::makeRetryingStorage(server.getUrl(), S3ObjectCreationTestStorage::forceOnePartMultipart));
     DB::Cas::CasRequests requests(DB::Cas::BackendPtr(backend), DB::Cas::Fence::open());
-    const uint64_t unresolved_before = ProfileEvents::global_counters[ProfileEvents::CASConditionalWriteUnresolved].load();
+    const uint64_t unresolved_before = ProfileEvents::global_counters[ProfileEvents::CASConditionalWriteUnresolved];
 
     auto op = requests.admit();
     const auto result = op.create("key", std::string(100, 'c'), DB::Cas::Retry::once());
@@ -896,7 +896,7 @@ TEST(CASBackend, ConditionalMultipartNoSuchUploadIsUnresolved)
     EXPECT_TRUE(std::holds_alternative<DB::Cas::Conflict>(result))
         << "variant " << result.index() << "; another writer's object must not be taken for this upload";
     EXPECT_EQ(server.count(CountingS3::Verb::CompleteMultipartUpload), 1u);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASConditionalWriteUnresolved].load() - unresolved_before, 1u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASConditionalWriteUnresolved] - unresolved_before, 1u);
 }
 
 #endif

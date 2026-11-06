@@ -1769,7 +1769,7 @@ TEST(CASPoolRemount, RemountLoopEndsOverARetiredOwner)
     });
     const String owner_key = store->layout().ownerKey("test");
     const String mount_key = store->layout().mountKey("test");
-    const uint64_t identity_lost_before = ProfileEvents::global_counters[ProfileEvents::CASIdentityLost].load();
+    const uint64_t identity_lost_before = ProfileEvents::global_counters[ProfileEvents::CASIdentityLost];
 
     DB::Cas::tests::tombstoneOwnerForTest(*backend, owner_key);
     fenceOutMount(*backend, mount_key);
@@ -1779,7 +1779,7 @@ TEST(CASPoolRemount, RemountLoopEndsOverARetiredOwner)
 
     store.reset();   /// joins both workers
     EXPECT_EQ(attempts->load(), 1u) << "the loop did not retry";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASIdentityLost].load(), identity_lost_before + 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASIdentityLost], identity_lost_before + 1);
 }
 
 TEST(CASPoolRemount, ShutdownGuardRefusesToArmRemount)
