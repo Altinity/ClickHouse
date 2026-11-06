@@ -31,12 +31,13 @@ on:
 concurrency:
   group: sign-and-release-${{ inputs.release_environment }}
   cancel-in-progress: false
+  queue: max
 
 env:
   ARTIFACT_NAME: build_report_package_release
   AWS_REGION: us-east-1
   SRC_BUCKET: ${{ vars.S3_ARTIFACT_BUCKET }}
-  S3_STORAGE_BUCKET: altinity-test-reports-temp
+  DEST_BUCKET: ${{ vars.S3_STORAGE_BUCKET }}
 
 jobs:
   approve-release:
@@ -69,13 +70,19 @@ jobs:
       major_version: ${{ env.MAJOR_VERSION }}
       build_dir: ${{ env.BUILD_DIR }}
       arm_build_dir: ${{ env.ARM_BUILD_DIR }}
+      package_version: ${{ env.PACKAGE_VERSION }}
     steps:
       - name: Checkout release scripts
         uses: actions/checkout@v6
         with:
-          sparse-checkout: tests/ci/release
+          sparse-checkout: |
+            tests/ci/release/extract-package-info.py
+            tests/ci/release/process-binaries.py
           filter: blob:none
           persist-credentials: false
+
+      - name: Install Python deps
+        run: pip3 install packaging requests boto3
 
       - name: Run script
         env:
@@ -83,7 +90,7 @@ jobs:
           WORKFLOW_URL: ${{ inputs.workflow_url }}
         run: |
           python3 tests/ci/release/extract-package-info.py \
-            --artifact-dest-bucket "$S3_STORAGE_BUCKET" \
+            --artifact-dest-bucket "$DEST_BUCKET" \
             --artifact-src-bucket "$SRC_BUCKET" \
             --package-version "$PACKAGE_VERSION" \
             --workflow-url "$WORKFLOW_URL"
@@ -113,8 +120,6 @@ jobs:
 
       - name: Process ARM binaries
         if: ${{ env.NEEDS_BINARY_PROCESSING == 'true' }}
-        env:
-          PACKAGE_VERSION: ${{ inputs.package_version }}
         run: |
           python3 tests/ci/release/process-binaries.py \
             --arch arm64 \
@@ -135,12 +140,12 @@ jobs:
       MAJOR_VERSION: ${{ needs.extract-package-info.outputs.major_version }}
       BUILD_DIR: ${{ needs.extract-package-info.outputs.build_dir }}
       ARM_BUILD_DIR: ${{ needs.extract-package-info.outputs.arm_build_dir }}
-      PACKAGE_VERSION: ${{ inputs.package_version }}
+      PACKAGE_VERSION: ${{ needs.extract-package-info.outputs.package_version }}
     steps:
       - name: Checkout release scripts
         uses: actions/checkout@v6
         with:
-          sparse-checkout: tests/ci/release
+          sparse-checkout: tests/ci/release/process-binaries.py
           filter: blob:none
           persist-credentials: false
 
@@ -225,7 +230,7 @@ jobs:
       REPO_DNS_NAME: ${{ inputs.release_environment == 'production' && 'builds.altinity.cloud' || 'builds.staging.altinity.cloud' }}
       REPO_NAME: ${{ inputs.release_environment == 'production' && 'altinity' || 'altinity-staging' }}
       REPO_SUBTITLE: ${{ inputs.release_environment == 'production' && 'Stable Builds' || 'Staging Builds' }}
-      PACKAGE_VERSION: ${{ inputs.package_version }}
+      PACKAGE_VERSION: ${{ needs.extract-package-info.outputs.package_version }}
       FOLDER_TIME: ${{ needs.extract-package-info.outputs.folder_time }}
       REPO_PREFIX: ${{ needs.extract-package-info.outputs.repo_prefix }}
       NEEDS_BINARY_PROCESSING: ${{ needs.extract-package-info.outputs.needs_binary_processing }}
@@ -241,7 +246,6 @@ jobs:
       - name: Checkout release scripts
         uses: actions/checkout@v6
         with:
-          repository: Altinity/ClickHouse
           path: ClickHouse
           sparse-checkout: tests/ci/release
           filter: blob:none
@@ -298,8 +302,8 @@ jobs:
             -e repo_name="$REPO_NAME" \
             -e repo_prefix="$REPO_PREFIX" \
             -e repo_subtitle="$REPO_SUBTITLE" \
-            -e s3_pkgs_bucket="$S3_STORAGE_BUCKET" \
-            -e s3_pkgs_path="builds/stable/v${PACKAGE_VERSION}/${FOLDER_TIME}" \
+            -e s3_pkgs_bucket="$DEST_BUCKET" \
+            -e s3_pkgs_path="pre-release/${PACKAGE_VERSION}/${FOLDER_TIME}" \
             ClickHouse/tests/ci/release/packaging/ansible/sign-and-release.yml
 
       - name: Remove GPG key and temporary files
@@ -321,7 +325,7 @@ jobs:
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      PACKAGE_VERSION: ${{ inputs.package_version }}
+      PACKAGE_VERSION: ${{ needs.extract-package-info.outputs.package_version }}
       DEST_URL: ${{ needs.extract-package-info.outputs.dest_url }}
     steps:
       - name: Install aws cli
@@ -330,19 +334,25 @@ jobs:
           version: 2
           arch: arm64
 
-      - name: Copy to released directory
+      - name: Copy from pre-released to released
         run: |
-          echo "Copying to released directory..."
-          echo "Source: ${DEST_URL}/"
-          echo "Destination: s3://${S3_STORAGE_BUCKET}/builds/released/v${PACKAGE_VERSION}/"
+          case "$DEST_URL" in
+            "s3://${DEST_BUCKET}/builds/pre-released/"?*) ;;
+            *) echo "::error::Unexpected DEST_URL '${DEST_URL}'"; exit 1 ;;
+          esac
 
-          if ! aws s3 sync "${DEST_URL}/" "s3://${S3_STORAGE_BUCKET}/builds/released/v${PACKAGE_VERSION}/" --no-progress; then
+          RELEASED_URL="s3://${DEST_BUCKET}/builds/released/v${PACKAGE_VERSION}/"
+          echo "Copying pre-released build to released directory..."
+          echo "Source: ${DEST_URL}/"
+          echo "Destination: ${RELEASED_URL}"
+
+          if ! aws s3 sync "${DEST_URL}/" "${RELEASED_URL}" --no-progress; then
             echo "Failed to copy to released directory"
             exit 1
           fi
 
           echo "Verifying copy operation..."
-          if ! aws s3 ls "s3://${S3_STORAGE_BUCKET}/builds/released/v${PACKAGE_VERSION}/" | grep -q "packages"; then
+          if ! aws s3 ls "${RELEASED_URL}" | grep -q "packages"; then
             echo "Error: Packages directory not found in destination"
             exit 1
           fi

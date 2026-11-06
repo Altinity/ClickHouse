@@ -10,7 +10,7 @@ import requests
 from packaging import version
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
-GITHUB_REPO = "Altinity/ClickHouse"
+GITHUB_REPO = os.getenv("GITHUB_REPOSITORY", "Altinity/ClickHouse")
 
 
 def generate_time(folder_time: str = None) -> str:
@@ -27,13 +27,20 @@ def generate_time(folder_time: str = None) -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S.%f")[:-3]
 
 
-def file_exists(url: str) -> bool:
-    """Check if a file exists at the given URL.
-    """
+def s3_object_exists(bucket: str, key: str) -> bool:
+    """Check if an S3 object exists using AWS credentials from the environment."""
+    import boto3
+    from botocore.exceptions import ClientError
+
     try:
-        response = requests.head(url, allow_redirects=True)
-        return response.status_code == 200
-    except requests.RequestException:
+        boto3.client("s3").head_object(Bucket=bucket, Key=key)
+        return True
+    except ClientError as e:
+        code = str(e.response.get("Error", {}).get("Code", ""))
+        if code in ("404", "NoSuchKey", "NotFound"):
+            print(f"S3 object not found: s3://{bucket}/{key}", file=sys.stderr)
+            return False
+        print(f"S3 head failed for s3://{bucket}/{key}: {e}", file=sys.stderr)
         return False
 
 
@@ -67,17 +74,24 @@ def get_repo_prefix(altinity_build_feature: str) -> str:
     return repo_prefix_map[altinity_build_feature]
 
 
+def repo_from_workflow_url(run_url: str) -> str:
+    """owner/repo from a github.com/.../actions/runs/<id> URL, else GITHUB_REPO."""
+    match = re.search(r"github\.com/([^/]+/[^/]+)/actions/runs/", run_url)
+    return match.group(1) if match else GITHUB_REPO
+
+
 def get_run_details(run_url: str) -> dict:
     """Fetch run details for a given run .
     """
     run_id = run_url.split("/")[-1]
+    repo = repo_from_workflow_url(run_url)
 
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github.v3+json",
     }
 
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/runs/{run_id}"
+    url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id}"
     response = requests.get(url, headers=headers)
 
     if response.status_code != 200:
@@ -127,6 +141,12 @@ def main():
 
     args = parser.parse_args()
 
+    # Accept "v25.8.1.2.altinitystable" as well as "25.8.1.2.altinitystable".
+    args.package_version = args.package_version.strip()
+    if args.package_version[:1] in ("v", "V"):
+        args.package_version = args.package_version[1:]
+    set_env_variable("PACKAGE_VERSION", args.package_version)
+
     folder_time = generate_time(args.folder_time)
 
     run_details = get_run_details(args.workflow_url)
@@ -155,7 +175,7 @@ def main():
     print(f"Artifact URL: {artifact_url}")
 
     set_env_variable("COMMIT_HASH", commit_sha)
-    set_env_variable("DEST_URL", f"s3://{args.artifact_dest_bucket}/builds/stable/v{package_version}/{folder_time}")
+    set_env_variable("DEST_URL", f"s3://{args.artifact_dest_bucket}/builds/pre-released/v{args.package_version}/{folder_time}")
     set_env_variable("DOCKER_VERSION", f"{pr_number}-{args.package_version}")
     set_env_variable("FOLDER_TIME", folder_time)
     set_env_variable("MAJOR_VERSION", str(package_version.major))
@@ -167,13 +187,16 @@ def main():
 
     # Validate clickhouse-server amd64 deb file with correct version exists
     if package_version >= version.parse("25.6"):
-        deb_exists = file_exists(f"https://s3.amazonaws.com/{args.artifact_src_bucket}/{artifact_url}/build_amd_release/clickhouse-server_{args.package_version}_amd64.deb")
-        set_env_variable("BUILD_DIR", "build_amd_release")
+        build_dir = "build_amd_release"
+        set_env_variable("BUILD_DIR", build_dir)
         set_env_variable("ARM_BUILD_DIR", "build_arm_release")
     else:
-        deb_exists = file_exists(f"https://s3.amazonaws.com/{args.artifact_src_bucket}/{artifact_url}/package_release/clickhouse-server_{args.package_version}_amd64.deb")
-        set_env_variable("BUILD_DIR", "package_release")
+        build_dir = "package_release"
+        set_env_variable("BUILD_DIR", build_dir)
         set_env_variable("ARM_BUILD_DIR", "package_aarch64")
+
+    deb_key = f"{artifact_url}/{build_dir}/clickhouse-server_{args.package_version}_amd64.deb"
+    deb_exists = s3_object_exists(args.artifact_src_bucket, deb_key)
 
     if not deb_exists:
         print(f"\n✗ ERROR: Required DEB file not found", file=sys.stderr)

@@ -122,7 +122,7 @@ jobs:
           echo "$server_version" | grep "altinity" || FAILED_SERVER=true
           
           # Start server and test
-          sudo -u clickhouse clickhouse-server --config-file /etc/clickhouse-server/config.xml --daemon
+          clickhouse su clickhouse:clickhouse clickhouse-server --config-file /etc/clickhouse-server/config.xml --daemon
           sleep 10
           clickhouse-client -q 'SELECT 1'
           
