@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Core/Names.h>
 #include <Disks/IStoragePolicy.h>
 #include <Disks/IDisk.h>
 
@@ -118,9 +119,20 @@ class StoragePolicySelector
 public:
     static constexpr auto TMP_STORAGE_POLICY_PREFIX = "__";
 
-    StoragePolicySelector(const Poco::Util::AbstractConfiguration & config, const String & config_prefix, DiskSelectorPtr disks);
+    /// Policies that name a disk of `disks_to_skip` are left out: that disk is not available yet.
+    StoragePolicySelector(
+        const Poco::Util::AbstractConfiguration & config,
+        const String & config_prefix,
+        DiskSelectorPtr disks,
+        const NameSet & disks_to_skip = {});
 
-    StoragePolicySelectorPtr updateFromConfig(const Poco::Util::AbstractConfiguration & config, const String & config_prefix, DiskSelectorPtr disks, Strings & new_disks) const;
+    /// An existing policy that names a disk of `disks_to_skip` in the new configuration keeps its previous definition.
+    StoragePolicySelectorPtr updateFromConfig(
+        const Poco::Util::AbstractConfiguration & config,
+        const String & config_prefix,
+        DiskSelectorPtr disks,
+        Strings & new_disks,
+        const NameSet & disks_to_skip = {}) const;
 
     /// Policy by name
     StoragePolicyPtr get(const String & name) const;
