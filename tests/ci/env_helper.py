@@ -31,10 +31,11 @@ REPO_COPY = os.getenv("REPO_COPY", GITHUB_WORKSPACE)
 RUNNER_TEMP = os.getenv("RUNNER_TEMP", p.abspath(p.join(module_dir, "./tmp")))
 
 S3_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
-S3_BUILDS_BUCKET = os.getenv("S3_BUILDS_BUCKET", "altinity-build-artifacts")
-S3_BUILDS_BUCKET_PUBLIC = "altinity-build-artifacts"
+S3_ARTIFACT_BUCKET = os.getenv("S3_ARTIFACT_BUCKET")
+S3_BUILDS_BUCKET = os.getenv("S3_BUILDS_BUCKET") or S3_ARTIFACT_BUCKET
+S3_BUILDS_BUCKET_PUBLIC = S3_ARTIFACT_BUCKET
 S3_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-S3_TEST_REPORTS_BUCKET = os.getenv("S3_TEST_REPORTS_BUCKET", "altinity-build-artifacts")
+S3_TEST_REPORTS_BUCKET = os.getenv("S3_TEST_REPORTS_BUCKET") or S3_ARTIFACT_BUCKET
 
 S3_URL = os.getenv("S3_URL", "https://s3.amazonaws.com")
 S3_DOWNLOAD = os.getenv("S3_DOWNLOAD", S3_URL)
