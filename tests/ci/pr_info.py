@@ -204,9 +204,10 @@ class PRInfo:
                 self.base_name = self.repo_full_name
                 self.head_ref = ref
                 self.head_name = self.repo_full_name
-                self.diff_urls.append(
-                    self.compare_url(github_event["before"], self.sha)
-                )
+                before_sha = github_event["before"]
+                # Tag on an existing commit sets before to 0000...0000; GitHub compare 404s on that SHA.
+                if not all(x == "0" for x in before_sha):
+                    self.diff_urls.append(self.compare_url(before_sha, self.sha))
             else:
                 self.number = pull_request["number"]
                 self.docker_image_tag = str(self.number)
