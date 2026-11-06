@@ -77,7 +77,7 @@ class DockerImage:
 
 
 def get_changed_docker_images(
-    pr_info: PRInfo, images_dict: ImagesDict
+    pr_info: PRInfo, images_dict: ImagesDict, suffix: Optional[str] = None
 ) -> Set[DockerImage]:
     if not images_dict:
         return set()
@@ -125,8 +125,16 @@ def get_changed_docker_images(
                 image for image in all_images if image not in changed_images
             ]
             logging.info(f"Unchanged images: {unchanged_images}")
+            expected = _docker_platform(f"x-{suffix}") if suffix else ""
             for image in unchanged_images:
-                if subprocess.run(f"docker manifest inspect {image.repo}:{pr_info.number}", shell=True).returncode != 0:
+                merged_missing = subprocess.run(
+                    f"docker manifest inspect {image.repo}:{pr_info.number}", shell=True
+                ).returncode != 0
+                # An aarch64 tag that holds an amd64 image still satisfies the manifest check.
+                wrong_arch = bool(expected) and not _pushed_platform_ok(
+                    image.repo, f"{pr_info.number}-{suffix}", expected
+                )
+                if merged_missing or wrong_arch:
                     changed_images.append(image)
 
     # The order is important: dependents should go later than bases, so that
@@ -213,6 +221,40 @@ def build_and_push_dummy_image(
     return True, build_log
 
 
+def _docker_platform(version_string: str) -> str:
+    if version_string.endswith("-aarch64"):
+        return "linux/arm64"
+    if version_string.endswith("-amd64"):
+        return "linux/amd64"
+    return ""
+
+
+def _pushed_platform_ok(repo: str, tag: str, expected: str) -> bool:
+    result = subprocess.run(
+        ["docker", "buildx", "imagetools", "inspect", f"{repo}:{tag}"],
+        capture_output=True,
+        encoding="utf-8",
+    )
+    text = (result.stdout or "") + (result.stderr or "")
+    if result.returncode != 0:
+        logging.error("imagetools inspect failed for %s:%s\n%s", repo, tag, text)
+        return False
+    platforms = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("platform:"):
+            platforms.append(stripped.split(":", 1)[1].strip())
+    logging.info("Pushed %s:%s platforms: %s", repo, tag, platforms)
+    if not platforms or any(
+        item != expected and not item.startswith(expected + "/") for item in platforms
+    ):
+        logging.error(
+            "Image %s:%s is %s, expected %s", repo, tag, platforms, expected
+        )
+        return False
+    return True
+
+
 def build_and_push_one_image(
     image: DockerImage,
     version_string: str,
@@ -240,18 +282,20 @@ def build_and_push_one_image(
     if child:
         from_tag_arg = f"--build-arg FROM_TAG={version_string} "
 
-    cache_from = (
-        f"--cache-from type=registry,ref={image.repo}:{version_string} "
-        f"--cache-from type=registry,ref={image.repo}:latest"
-    )
+    # NOTE (strtgbb): :latest is whichever arch pushed last, so it poisons the other arch's cache
+    cache_from = f"--cache-from type=registry,ref={image.repo}:{version_string} "
     for tag in additional_cache:
         assert tag
         cache_from = f"{cache_from} --cache-from type=registry,ref={image.repo}:{tag}"
+
+    docker_platform = _docker_platform(version_string)
+    platform_arg = f"--platform {docker_platform} " if docker_platform else ""
 
     cmd = (
         "docker buildx build --builder default "
         # A single image is required by `docker manifest create`, not an index with an attestation
         "--provenance=false "
+        f"{platform_arg}"
         f"--label build-url={GITHUB_RUN_URL} "
         f"{from_tag_arg}"
         # A hack to invalidate cache, grep for it in docker/ dir
@@ -281,6 +325,11 @@ def build_and_push_one_image(
 
     if retcode != 0:
         logging.error("Building image {} failed with error: {}\n{}".format(image, retcode, ''.join(list(open(build_log, 'rt')))))
+        return False, build_log
+
+    if push and docker_platform and not _pushed_platform_ok(
+        image.repo, version_string, docker_platform
+    ):
         return False, build_log
 
     logging.info("Processing of %s successfully finished", image.repo)
@@ -452,7 +501,7 @@ def main():
             # If the event does not contain diff, nothing will be built
             pass
 
-    changed_images = get_changed_docker_images(pr_info, images_dict)
+    changed_images = get_changed_docker_images(pr_info, images_dict, args.suffix)
     if changed_images:
         logging.info(
             "Has changed images: %s", ", ".join([im.path for im in changed_images])
