@@ -193,8 +193,8 @@ token of each `mount` object.
 - **Writes / deletes:** a token-guarded `PUT` per fenced mount (`gc_fenced = true`, `seq + 1`); no
   deletes
 - **Safety:** fences only after this leader's *own* monotonic clock has watched the mount's
-  write-token hold unchanged for `cas_mount_lease_ttl_ms + 5% + cas_mount_renew_period_ms`
-  (defaults 30 s and 10 s; every server sharing the pool must run the same values); the write is
+  write-token hold unchanged for `L + 5% + cas_mount_renew_period_ms`, where `L` is the longer of this server's
+  `cas_mount_lease_ttl_ms` and the lease the slot's body declares (defaults 30 s and 10 s); the write is
   guarded by that exact token. A completed fence-out stays valid even if this GC later loses
   leadership. `expires_at_ms` (another host's wall clock) is never trusted.
 - **Fails the round if:** nothing — a per-mount `PUT` conflict is re-observed and re-classified
