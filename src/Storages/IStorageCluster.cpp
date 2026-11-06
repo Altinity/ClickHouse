@@ -177,7 +177,8 @@ void ReadFromCluster::createExtension()
 
     /// The probe listed with the filter known at `getQueryProcessingStage`. A filter pushed later still
     /// applies as a row filter; the iterator is not rebuilt.
-    ObjectIterator probed_iterator = takeObjectStorageClusterReadProbe(query_info.object_storage_cluster_read_probe);
+    ObjectIterator probed_iterator = takeObjectStorageClusterReadProbe(findObjectStorageClusterReadProbe(
+        query_info.object_storage_cluster_read_probes, storage->localReadProbeStorageKey()));
     extension = storage->getTaskIteratorExtension(
         predicate,
         filter,
@@ -666,10 +667,12 @@ void IStorageCluster::read(
 
     /// `getQueryProcessingStage` already returned `FetchColumns` for this decision, so the plan above
     /// this read is the local one. A distributed plan must not be replaced by a local column scan.
-    if (query_info.object_storage_cluster_read_probe
-        && query_info.object_storage_cluster_read_probe->read_locally
-        && processed_stage == QueryProcessingStage::Enum::FetchColumns)
+    /// Publish this storage's probe into the single slot the pure read step consumes. That step copies
+    /// `query_info` and does not know which cluster storage it belongs to.
+    if (const auto probe = findObjectStorageClusterReadProbe(query_info.object_storage_cluster_read_probes, localReadProbeStorageKey());
+        probe && probe->read_locally && processed_stage == QueryProcessingStage::Enum::FetchColumns)
     {
+        query_info.object_storage_cluster_read_probe = probe;
         readFallBackToPure(query_plan, column_names, storage_snapshot, query_info, context, processed_stage, max_block_size, num_streams);
         return;
     }

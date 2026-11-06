@@ -778,7 +778,7 @@ bool StorageObjectStorageCluster::isSmallEnoughForLocalRead(
         reason);
 
     const bool read_locally = probe->read_locally;
-    query_info.object_storage_cluster_read_probe = std::move(probe);
+    query_info.object_storage_cluster_read_probes.emplace(localReadProbeStorageKey(), std::move(probe));
     return read_locally;
 }
 
@@ -895,10 +895,12 @@ QueryProcessingStage::Enum StorageObjectStorageCluster::getQueryProcessingStage(
     if (shouldReadLocallyOnFallbackToPure(resolved, context))
         return QueryProcessingStage::Enum::FetchColumns;
 
-    /// Already decided for this query info. A second call must return the same stage `read` expects.
-    if (query_info.object_storage_cluster_read_probe)
+    /// Already decided for this storage. A second call must return the same stage `read` expects.
+    /// The map is per storage: a `Merge` shares this query info across children.
+    if (const auto existing_probe = findObjectStorageClusterReadProbe(
+            query_info.object_storage_cluster_read_probes, localReadProbeStorageKey()))
     {
-        if (query_info.object_storage_cluster_read_probe->read_locally)
+        if (existing_probe->read_locally)
             return QueryProcessingStage::Enum::FetchColumns;
     }
     else

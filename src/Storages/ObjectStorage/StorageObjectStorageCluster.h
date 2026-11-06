@@ -234,7 +234,7 @@ private:
 
     /// True when the pruned file list ends with at most `object_storage_cluster_local_read_max_files` files
     /// inside `object_storage_cluster_local_read_probe_ms`. Anything unfinished stays on the cluster.
-    /// The iterator and the objects it already returned are stored on `query_info` for the read that follows.
+    /// The iterator and the objects it already returned are stored on `query_info` under this storage's key.
     bool isSmallEnoughForLocalRead(
         const ContextPtr & context,
         const StorageSnapshotPtr & storage_snapshot,

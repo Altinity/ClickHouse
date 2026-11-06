@@ -83,6 +83,10 @@ public:
         const ContextPtr & /*context*/,
         bool /*make_cluster_function*/) {}
 
+    /// Key for this storage's local-read probe on `SelectQueryInfo`. A `Merge` passes one query info
+    /// to every child, so the probe cannot live in a single slot.
+    const void * localReadProbeStorageKey() const { return this; }
+
 protected:
     virtual void updateBeforeRead(const ContextPtr &) {}
     void updateQueryWithJoinToSendIfNeeded(ASTPtr & query_to_send, SelectQueryInfo query_info, const ContextPtr & context);

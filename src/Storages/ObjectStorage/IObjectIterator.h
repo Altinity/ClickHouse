@@ -8,6 +8,7 @@
 #include <Common/Logger.h>
 #include <Common/Macros.h>
 #include <Formats/FormatSettings.h>
+#include <unordered_map>
 
 namespace DB
 {
@@ -186,5 +187,10 @@ struct ObjectStorageClusterReadProbe
 
 /// Hands the probe to one consumer. A second call returns null.
 ObjectIterator takeObjectStorageClusterReadProbe(const std::shared_ptr<ObjectStorageClusterReadProbe> & probe);
+
+/// The probe this storage ran, or null when this storage has not probed yet.
+std::shared_ptr<ObjectStorageClusterReadProbe> findObjectStorageClusterReadProbe(
+    const std::unordered_map<const void *, std::shared_ptr<ObjectStorageClusterReadProbe>> & probes,
+    const void * storage);
 
 }

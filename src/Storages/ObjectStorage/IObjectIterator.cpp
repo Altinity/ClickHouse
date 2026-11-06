@@ -261,6 +261,16 @@ private:
 
 }
 
+std::shared_ptr<ObjectStorageClusterReadProbe> findObjectStorageClusterReadProbe(
+    const std::unordered_map<const void *, std::shared_ptr<ObjectStorageClusterReadProbe>> & probes,
+    const void * storage)
+{
+    const auto it = probes.find(storage);
+    if (it == probes.end())
+        return {};
+    return it->second;
+}
+
 ObjectIterator takeObjectStorageClusterReadProbe(const std::shared_ptr<ObjectStorageClusterReadProbe> & probe)
 {
     if (!probe || probe->consumed)

@@ -10,6 +10,7 @@
 
 #include <memory>
 #include <optional>
+#include <unordered_map>
 
 namespace DB
 {
@@ -221,9 +222,12 @@ struct SelectQueryInfo
     /// For IStorageSystemOneBlock
     std::vector<UInt8> columns_mask;
 
-    /// Set when the `object_storage_cluster_local_read_max_files` probe ran. Shared so a copied
-    /// `SelectQueryInfo` (a plan step) still reads the same objects. `read_locally` on the probe is the
-    /// decision `getQueryProcessingStage` and `read` both follow.
+    /// Local-read probes keyed by `IStorageCluster::localReadProbeStorageKey`. A `Merge` passes one
+    /// `SelectQueryInfo` to every child; one slot would reuse the first child's decision for the rest.
+    std::unordered_map<const void *, std::shared_ptr<ObjectStorageClusterReadProbe>> object_storage_cluster_read_probes;
+
+    /// The probe `read` publishes for the storage it is reading locally. `ReadFromObjectStorageStep`
+    /// copies `SelectQueryInfo` and has no cluster pointer, so it consumes this slot.
     std::shared_ptr<ObjectStorageClusterReadProbe> object_storage_cluster_read_probe;
 
     bool isFinal() const;
