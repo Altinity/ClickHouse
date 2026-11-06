@@ -184,6 +184,8 @@ struct PoolConfig
     uint64_t gc_io_concurrency = 16;
     /// Tests drive `renewWatermarkOnce` explicitly; gates both persistent runtime workers.
     bool background_watermark = false;
+    /// See `MountConfig::bounded_background_renewal`.
+    bool bounded_background_renewal = false;
     /// Installed on the pool before a writable mount can start its runtime-owned workers.
     CasEventSink event_sink = {};
 
@@ -256,10 +258,10 @@ struct PoolConfig
     /// boot clock (`Pool::bootMs`); injected by tests to drive the fence deadline deterministically.
     std::function<uint64_t()> boot_ms_fn = {};
 
-    /// The inter-attempt sleep for the mount, farewell and GC request planes (`mount_requests`,
-    /// `farewell_requests`, `gc_requests`), installed at their CONSTRUCTION -- before this `Pool` has
-    /// claimed or read anything. Empty = each plane's own production default (an interruptible real
-    /// sleep for the mount and GC planes, `CasRequests`'s own real sleep for the farewell plane). A test
+    /// The inter-attempt sleep for the mount, lease and GC request planes (`mount_requests`,
+    /// `lease_requests`, `gc_requests`), installed at their CONSTRUCTION -- before this `Pool` has
+    /// claimed or read anything. Empty = each plane's own production default, an interruptible real
+    /// sleep. A test
     /// that also freezes `boot_ms_fn` must supply a matching sleep here: a retry loop bound to a clock
     /// that only moves when this function is called would otherwise retry forever against a REAL sleep
     /// that never calls it, because the deadline it measures against never appears to elapse.
@@ -355,10 +357,17 @@ struct PoolConfig
             .boot_ms_fn = boot_ms_fn,
             .wait_sleep_fn = wait_sleep_fn,
             .worker_factory = worker_factory,
+            .bounded_background_renewal = bounded_background_renewal,
         };
     }
 };
 
+/// The live incarnation at one instant: the writer epoch and the fence generation it was admitted under.
+struct MountIncarnation
+{
+    uint64_t writer_epoch = 0;
+    uint64_t fence_generation = 0;
+};
 
 struct PartWriteInfo
 {
@@ -421,19 +430,21 @@ public:
     /// Construct a pool after backend capabilities and durable pool metadata have been validated.
     /// For a writable configuration, `open` also claims the configured mount before returning; a
     /// read-only configuration returns an instance that performs no mutating startup operations.
+    /// A start over a verified, drained retirement of its `server_root_id` rejoins it as an empty member
+    /// (`claimOwnerOrThrow`).
     static PoolPtr open(BackendPtr backend, PoolConfig config);
-    /// Admin writer mount of the VICTIM `server_root_id`, for `SYSTEM CAS DROP POOL
-    /// MEMBER`. Impersonates the victim's
-    /// owner uuid (`readOwnerUuid`, or -- when the owner anchor itself is missing -- recovered from a
-    /// lingering mount lease) and mounts writable under `MountClaimPolicy::NoWait`: a live victim
-    /// lease is an immediate `ABORTED` refusal (no wait-and-observe, no FORCE variant), unlike the
-    /// bounded reclaim wait a normal `open` pays. Throws `BAD_ARGUMENTS` when there is nothing to
-    /// decommission (no owner anchor and no mount lease for `victim_srid`).
+    /// Admin writer mount of the VICTIM `server_root_id`, for `SYSTEM CAS DROP POOL MEMBER`.
+    /// Impersonates the victim's owner uuid (`readOwnerUuid`, or, when the owner was deleted by hand, the uuid
+    /// of the surviving lease) and mounts writable under `MountClaimPolicy::NoWait`: a live victim lease is an
+    /// immediate `ABORTED` refusal; a tombstoned owner of the victim is accepted; a member without an epoch
+    /// counter is refused (`CORRUPTED_DATA`). Throws `BAD_ARGUMENTS` when neither owner nor lease exists.
     static PoolPtr openForDecommission(BackendPtr backend, PoolConfig config, const String & victim_srid);
     /// Stop the mount-renewal and remount activity, drain ref-log work, and release the owned
     /// backend-facing components in their dependency order. Destruction is also the clean-farewell
     /// path for a writable mount, so it must complete before the owning backend is released.
     ~Pool();
+    /// The teardown writes no clean farewell: a successor then waits for this lease to be fenced or observed dead.
+    void withholdFarewell() noexcept { farewell_withheld = true; }
 
     bool tryDispatchDetached(std::function<void(DetachedStopToken)> task);
     /// Marks this pool as being torn down. The open request plane refuses every further admission and
@@ -511,6 +522,9 @@ public:
     /// Throws the typed transient refusal (`throwCasTransientUnavailable`) unless the fence is currently
     /// held AND still at `admitted_generation`.
     void checkFenceOrThrow(uint64_t admitted_generation) const { mount_runtime.checkFenceOrThrow(admitted_generation); }
+    /// Throws the transient refusal when the fence moved between the two reads, so the pair is never mixed.
+    MountIncarnation captureMountIncarnation() const;
+    void setIncarnationCaptureHookForTest(std::function<void()> hook) { incarnation_capture_hook_for_test = std::move(hook); }
 
     /// ---- pool lifecycle condition (rev.7 §1; owned by `mount_runtime`) ----
     /// Atomic read of the current lifecycle condition. Thin forwarder; safe to call from any thread.
@@ -543,8 +557,11 @@ public:
         PoolLifecycle lifecycle = PoolLifecycle::Live;
         String detail;
         time_t since = 0;
+        /// `Live`, but the lease has too little time left to admit a write; `since` is then when writes paused.
+        bool writes_paused = false;
     };
     LifecycleSnapshot lifecycleSnapshot() const;
+    RenewalProgress renewalProgress() const { return mount_runtime.renewalProgress(); }
 
     /// `SYSTEM CAS FORGET` — the operator force-Vanish (spec §5). Drives THIS pool to
     /// `Vanished(forgotten)` with the fence-first protocol, node-locally, regardless of the current
@@ -760,20 +777,18 @@ public:
     /// operation admitted here is refused the moment the fence trips, is re-armed under a fresh lease
     /// incarnation, or runs out of room before the lease expires.
     CasRequests & mountRequests() { return mount_requests; }
-    /// The farewell plane, on an open fence -- shared with the mount-lease renewer's own claim/adopt,
-    /// not only its release: a self-remount claims with the fence already latched lost, so gating the
-    /// claim on the fence could never reclaim, and refusing the farewell because the mount fence has
-    /// already run down would leave the slot looking live until GC fences it out.
-    CasRequests & farewellRequests() { return farewell_requests; }
+    /// The lease plane, on an open fence: the renewer's claim and adoption, the remount re-anchor and
+    /// the farewell. None of them may be refused for want of the lease they establish or hand back.
+    CasRequests & leaseRequests() { return lease_requests; }
     /// The open-fence plane: GC, the offline tools, this pool's own reads, and the bootstrap-control
     /// claims. None of them hold a mount lease -- the claims are what ESTABLISHES one, so gating them
     /// on the fence would make a self-remount, which runs with the fence latched lost, unable ever to
     /// reclaim.
     CasRequests & openRequests() { return gc_requests; }
-    /// The owning `BackendPtr` itself (not just a reference into it): the decommission slot-retirement
-    /// decommission step (`CasDecommission.cpp`) must keep the backend alive across `admin.reset()` -- the graceful
-    /// close that stamps the mount's farewell -- to physically delete the control objects afterward. A
-    /// bare `Backend &` from `backend()` would dangle the instant the owning `Pool` is destroyed.
+    /// The owning `BackendPtr` itself (not just a reference into it): decommission (`CasDecommission.cpp`)
+    /// keeps the backend alive across `admin.reset()` -- the graceful close that stamps the mount's farewell --
+    /// to read the farewell back and mark the retirement verified. A bare `Backend &` from `backend()` would
+    /// dangle the instant the owning `Pool` is destroyed.
     BackendPtr poolBackendPtr() const { return pool_backend; }
 
     /// Staging write surface for `PartWriteTxn`: thin delegate onto the ref ledger, so a staging write
@@ -1173,9 +1188,9 @@ private:
         return std::forward<Mutation>(mutation)();
     }
 
-    /// The mount plane's inter-attempt sleep: interruptible, so a parked or stopping renewal is not
-    /// held for a whole capped backoff. Named rather than inlined because the test seam has to be able
-    /// to put it back.
+    /// The mount and lease planes' inter-attempt sleep: interruptible, so a parked or stopping renewal is
+    /// not held for a whole pause. Named rather than inlined because the test seam has to be able to put
+    /// it back.
     std::function<void(uint64_t)> mountPlaneSleepFn()
     {
         return [this](uint64_t ms) { mount_runtime.sleepInterruptibly(ms); };
@@ -1208,7 +1223,8 @@ private:
     /// config they take their clock from. `mutable` because issuing a request is not a change to the
     /// pool: a `const` observer still has to read the store.
     mutable CasRequests mount_requests;
-    mutable CasRequests farewell_requests;
+    std::function<void()> incarnation_capture_hook_for_test;
+    mutable CasRequests lease_requests;
     mutable CasRequests gc_requests;
 
     std::shared_ptr<DetachedRegistryState> detached_work = std::make_shared<DetachedRegistryState>();
@@ -1219,6 +1235,7 @@ private:
     /// Sticky fail-close bit for the destructor's allocation-failure path. If a duty could not enter
     /// the queue, no mount teardown may claim a clean farewell even though the guarded map is empty.
     std::atomic<bool> writer_cleanup_queue_failed{false};
+    std::atomic<bool> farewell_withheld{false};
 
     /// CAS mixed-algo pools: monotone in-memory cache of `algos_used`, seeded from
     /// `meta.algos_used` at open. Guards `isAlgoAdmitted`/`refreshAdmittedAlgos` -- ITS OWN mutex,
@@ -1275,6 +1292,13 @@ private:
     /// moved to `mount_runtime`, but the top-level remount serialization guards
     /// the Pool-side orchestration, so it stays on Pool.
     std::mutex remount_mutex;
+
+    /// Set once by the owner claim in `mountWritable`; a remount checks against it and never updates it.
+    uint64_t recorded_owner_life = 0;
+
+    /// The pool impersonates a victim for `SYSTEM CAS DROP POOL MEMBER` (`openForDecommission`). Its own tombstone
+    /// ends its remount like any retired owner, but the reason names the run, not a decommissioned server.
+    bool decommission_admin = false;
 
     /// The single home of the [D5] per-lifecycle reason detail (spec §1) — the human-readable text that
     /// names the ACTUAL sub-state, WITHOUT the `content-addressed pool '<id>' ` prefix. Both

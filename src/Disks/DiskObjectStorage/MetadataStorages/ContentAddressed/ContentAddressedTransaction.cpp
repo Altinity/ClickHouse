@@ -127,9 +127,8 @@ ContentAddressedTransaction::ContentAddressedTransaction(ContentAddressedMetadat
 
 ContentAddressedTransaction::~ContentAddressedTransaction()
 {
-    /// Always clean up pending staging (whether committed or not). On the success path
-    /// cleanupPendingTempFiles was already called at the end of commit(); this call is the defensive
-    /// backstop for aborted/exception-unwound transactions whose publishStaging never ran.
+    /// On abort this is the cleanup of local and S3 staging. After a commit it finds nothing left,
+    /// except when the commit published some parts and then threw.
     cleanupPendingTempFiles();
 
     /// An uncommitted transaction's uploads become min_active_build_sequence-spared debris: abandon every
@@ -209,37 +208,20 @@ void ContentAddressedTransaction::cleanupPendingTempFiles() noexcept
                 std::error_code ec;
                 std::filesystem::remove(pb.staging_key, ec);
             }
-            else if (committed)
+            else
             {
-                /// A successful commit deletes the S3 staging object
-                /// HERE — `committed` is only ever true when EVERY part's `publishStaging` ran to
-                /// completion (commit() sets it right before this call), which means every referenced
-                /// pending blob was already materialized (`PartWriteTxn::putBlob` → `publishBlob`)
-                /// or, for an orphaned pending blob (its entry removed by `unlinkFile`/`replaceFile`
-                /// before commit), was never going to be promoted at all — either way the staging object
-                /// is no longer needed as a re-readable publication source, so it is safe to reclaim now.
-                ///
-                /// An ABORTED/exception-unwound transaction (`committed == false`, including a partial
-                /// multi-part commit failure where an EARLIER part's blobs were already promoted) leaves
-                /// its S3 staging objects in place — `staging_key` is a remote object-storage key, never a
-                /// bare `fs::remove` target, and is reclaimed by the mount-lease-scoped sweeper
-                /// (`Cas::sweepOwnMountStaging`), never here. This mirrors the local path's own asymmetry:
-                /// `Local` staging is a private per-transaction scratch file removed unconditionally on
-                /// both commit and abort (nobody else can ever read it), whereas an `S3` staging object
-                /// is the sanctioned re-readable source for publication and must outlive an aborted
-                /// transaction so a later attempt (or the sweeper) can still account for it.
+                /// The S3 staging object is private to this transaction and nothing reads
+                /// `pending_blobs` after this call, so commit and abort delete it alike. An object that
+                /// outlived an abort would stay until the next mount of this `server_root_id`.
                 try
                 {
                     metadata_storage.objectStorage()->removeObjectIfExists(StoredObject(pb.staging_key));
                 }
                 catch (...) // NOLINT(bugprone-empty-catch)
                 {
-                    /// Best-effort (noexcept context): a stubborn delete just leaves debris for the
-                    /// mount-lease sweeper to reclaim on a later mount.
+                    /// Best-effort (noexcept context): a stubborn delete leaves debris for the mount-start sweep.
                 }
             }
-            /// else: an S3-mode pending blob of an ABORTED transaction — intentionally left in place
-            /// (see above); the mount-lease sweeper (`Cas::sweepOwnMountStaging`) is its reclaimer.
         }
         st.pending_blobs.clear();
     }
@@ -950,8 +932,6 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
 
         if (metadata_storage.stagingBackend() == Cas::StagingBackend::S3)
         {
-            const std::string staging_key = metadata_storage.stagingKeyPrefix() + "/" + getRandomASCIIString(32) + ".tmp";
-            auto object_sink = metadata_storage.objectStorage()->writeObject(StoredObject(staging_key), WriteMode::Rewrite);
             /// Build the fixed-length CABL envelope header now (before
             /// the payload is streamed) so the staging object holds `[header][payload]` and the promote
             /// stays a verbatim server-side copy. The header carries a FRESH `incarnation_tag`; `build_id`
@@ -961,11 +941,12 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
             std::string envelope_header = buildS3StagingBlobHeader(*r);
             /// The staged upload becomes durable in `sink->finalize()`, outside this request contract by
             /// design, so its admission is re-checked there through the callback below, against the
-            /// generation captured HERE. `admit().generation()` reads a plain value off a temporary
-            /// `CasOperation` that does not outlive this statement -- it names the fence generation at
-            /// THIS instant, not a live operation the two calls share.
+            /// generation captured HERE. The epoch in the key and the generation the finalize rechecks are
+            /// one capture, so a remount between them cannot stage new-generation bytes under an old epoch.
             const Cas::PoolPtr pool = metadata_storage.store();
-            const uint64_t admitted_generation = pool->mountRequests().admit().generation();
+            const Cas::MountIncarnation incarnation = pool->captureMountIncarnation();
+            const std::string staging_key = metadata_storage.stagingKey(incarnation.writer_epoch, getRandomASCIIString(32) + ".tmp");
+            auto object_sink = metadata_storage.objectStorage()->writeObject(StoredObject(staging_key), WriteMode::Rewrite);
             return std::make_unique<Cas::CaContentWriteBuffer>(
                 std::move(object_sink),
                 staging_key,
@@ -979,7 +960,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
                     const Cas::BlobRef ref{hash_algo, Cas::codecFor(hash_algo).fromHex(hash_hex)};
                     stageBlobPartFile(route, ref, size, key, Cas::StagingBackend::S3);
                 },
-                [pool, admitted_generation] { pool->checkFenceOrThrow(admitted_generation); });
+                [pool, generation = incarnation.fence_generation] { pool->checkFenceOrThrow(generation); });
         }
 
         return std::make_unique<Cas::CaContentWriteBuffer>(

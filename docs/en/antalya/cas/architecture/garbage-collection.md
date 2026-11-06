@@ -193,8 +193,9 @@ token of each `mount` object.
 - **Writes / deletes:** a token-guarded `PUT` per fenced mount (`gc_fenced = true`, `seq + 1`); no
   deletes
 - **Safety:** fences only after this leader's *own* monotonic clock has watched the mount's
-  write-token hold unchanged for `cas_mount_lease_ttl_ms + 5% + cas_mount_renew_period_ms`
-  (defaults 30 s and 10 s; every server sharing the pool must run the same values); the write is
+  write-token hold unchanged for `L + 5% + cas_mount_renew_period_ms`, where `L` is the longer of this server's
+  `cas_mount_lease_ttl_ms` and the lease the slot's body declares (defaults 30 s and 10 s), and only at the
+  start of a round, so a killed member becomes `fenced` up to one GC round later than that; the write is
   guarded by that exact token. A completed fence-out stays valid even if this GC later loses
   leadership. `expires_at_ms` (another host's wall clock) is never trusted.
 - **Fails the round if:** nothing — a per-mount `PUT` conflict is re-observed and re-classified
@@ -691,7 +692,7 @@ flowchart LR
     D -->|"still zero, .meta absent, Clean, older or unreadable"| C2["carried, .meta rewritten at this round, never throw"]
     D -->|"current token not equal to t"| SUP["SUPERSEDED -- a writer resurrected, re-condemn the CURRENT token"]
     G --> E["round n+2, pre-CAS: exact-token DELETE of blob at t"]
-    E -->|"Deleted or Absent"| F["then drop the .meta if it is still Condemned at round n or older"]
+    E -->|"Deleted or Absent"| F["then drop the .meta if it is still Condemned from a round before this one"]
     E -->|TokenMismatch| H["nothing deleted -- live at a newer token, leave the .meta alone"]
 ```
 
@@ -703,9 +704,11 @@ round that issues it and replaces an absent marker, `Clean`, or an older-round `
 
 Graduation reads the marker in the round that graduates and accepts only `Condemned` at the entry's round or
 newer: an older round may belong to another incarnation of the same content. The marker delete after a redelete
-removes only `Condemned` at the entry's round or older, conditional on the version it read, so a delayed delete
-never removes the marker of a later incarnation. It can leave an orphan `Condemned` marker over an absent body;
-the next writer of that hash republishes and clears it, and `cas-fsck` counts it in `meta_without_body`.
+removes only `Condemned` from a round before the deleting round, conditional on the version it read. This covers
+a marker the graduation gate re-stamped at a round later than the entry's. It can also remove the marker of a
+later incarnation; that is safe because a writer adopts only on `Clean` and republishes over an absent marker.
+A failed delete job can leave an orphan `Condemned` marker over an absent body; the next writer of that hash
+republishes and clears it, and `cas-fsck` counts it in `meta_without_body`.
 
 A blob whose in-degree reaches zero in round `n` is retired with `condemn_round = n`; it can graduate to
 `delete_pending` in round `n+1` at the earliest and be deleted in round `n+2`, so a minimum of two full rounds
@@ -764,7 +767,7 @@ logs:
 | `PUT` run segments | 1 per non-pure-carry shard, plus 1 fold seal |
 | `HEAD` blobs | 1 per newly condemned |
 | `GET` blob `.meta` at graduation | 1 per entry the graduation budget admits, plus 1 `GET` and 1 `PUT` per refusal (the rewrite job re-reads the marker before its conditional `PUT`) |
-| `GET` + conditional `DELETE` blob `.meta` after a redelete | 1 `GET` per `Deleted` or `Absent` outcome; the `DELETE` only while the marker is `Condemned` at the entry's round or older |
+| `GET` + conditional `DELETE` blob `.meta` after a redelete | 1 `GET` per `Deleted` or `Absent` outcome; the `DELETE` only while the marker is `Condemned` from a round before the deleting round |
 | Blob `HEAD` + conditional `DELETE` | 1 `HEAD` per `redelete` entry — an entry that graduated in an *earlier* round, not the current one — up to `cas_gc_round_redelete_budget`; a `DELETE` only when the body is present at the condemned token |
 | Successful lease `CAS gc/state` | 1 |
 | Commit `CAS gc/state` | 1 |
@@ -1024,12 +1027,12 @@ checksum disagrees with its seal).
 
 | Command | Effect |
 |---|---|
-| `SYSTEM CAS GC RUN [<disk>]` | One synchronous round execution on the contacted node; only the lease holder makes progress. The disk is optional: without it every content-addressed disk on the node runs one round. It runs even while the scheduler is stopped |
+| `SYSTEM CAS GC RUN [<disk>]` | One synchronous round execution on the contacted node; only the lease holder (the GC leader, `is_leader = 1` in `system.cas_mounts`) makes progress, and on any other node the command does nothing. The disk is optional: without it every content-addressed disk on the node runs one round. It runs even while the scheduler is stopped |
 | `SYSTEM CAS GC STOP <disk>` / `SYSTEM CAS GC START <disk>` | Stop or resume future background rounds on that disk's scheduler, preserving its identity. The disk is required |
 | `SYSTEM CAS GC REBUILD [FORCE] <disk>` (`clickhouse-disks cas-gc-rebuild`) | Fail-closed disaster-recovery path for a lost or corrupt `GC` baseline — the `CORRUPTED_DATA` errors that name it in their message (missing adopted seal, snapshot without a surviving log, cursor/apply mismatch). An `ABORTED` commit conflict or a `LOGICAL_ERROR` delete marker is not a reason to rebuild. It deliberately over-protects — it prefers bounded leaks over risking an under-count — and cannot delete live data directly: deletions it produces still flow through the normal round's condemn, graduate, exact-token path. The disk is required |
 | `clickhouse-disks cas-gc-dryrun` | Opens the disk read-only, constructs a non-leader `GC`, and prints what would be deleted with a reason per entry. Write-free, resolves runs through the seal's references. Documented caveat: it does not fold new owner events, so away from quiescence it can **over-report** — the subset guarantee holds only at quiescence, and its output must never feed a real delete |
 
-`SYSTEM CAS DROP POOL MEMBER '<server_root_id>' FROM DISK '<disk>'` — permanent removal of a dead
+`SYSTEM CAS DROP POOL MEMBER '<server_root_id>' FROM DISK '<disk>'` — removal of a dead
 replica, distinct from ordinary `GC` — is covered on the
 [mounts-and-leases page](/antalya/cas/architecture/mounts-and-leases#mount-lifecycle).
 `SYSTEM CAS FSCK <disk>` (`clickhouse-disks cas-fsck`) and its `dangling`/`unreachable` vocabulary
