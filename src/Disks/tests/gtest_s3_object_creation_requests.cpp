@@ -8,6 +8,7 @@
 #include <IO/ReadSettings.h>
 #include <IO/S3/copyS3File.h>
 #include <IO/S3/tests/CountingS3Server.h>
+#include <IO/WriteBufferFromFileBase.h>
 #include <IO/WriteSettings.h>
 #include <Common/Exception.h>
 #include <Common/tests/gtest_global_context.h>
