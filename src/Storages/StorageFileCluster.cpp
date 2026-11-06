@@ -163,7 +163,12 @@ private:
 };
 
 RemoteQueryExecutor::Extension StorageFileCluster::getTaskIteratorExtension(
-    const ActionsDAG::Node * predicate, const ActionsDAG * /* filter */, const ContextPtr & context, ClusterPtr, StorageMetadataPtr metadata) const
+    const ActionsDAG::Node * predicate,
+    const ActionsDAG * /* filter */,
+    const ContextPtr & context,
+    ClusterPtr,
+    StorageMetadataPtr metadata,
+    std::shared_ptr<IObjectIterator> /* probed_iterator */) const
 {
     /// A distributed `INSERT ... SELECT` hands the workers their tasks from here without going
     /// through `IStorageCluster::read`, so this is the one place every path shares.

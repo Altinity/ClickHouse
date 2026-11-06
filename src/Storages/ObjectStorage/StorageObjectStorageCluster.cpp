@@ -35,9 +35,12 @@
 #include <Storages/ObjectStorage/StorageObjectStorageSource.h>
 #include <Storages/extractTableFunctionFromSelectQuery.h>
 #include <Storages/ObjectStorage/StorageObjectStorageStableTaskDistributor.h>
+#include <Storages/SelectQueryInfo.h>
 
 #include <Common/CurrentThread.h>
 #include <Common/FailPoint.h>
+#include <Common/Stopwatch.h>
+#include <Common/logger_useful.h>
 namespace DB
 {
 namespace Setting
@@ -53,6 +56,8 @@ namespace Setting
     extern const SettingsInt64 delta_lake_snapshot_start_version;
     extern const SettingsInt64 delta_lake_snapshot_end_version;
     extern const SettingsUInt64 lock_object_storage_task_distribution_ms;
+    extern const SettingsUInt64 object_storage_cluster_local_read_max_tasks;
+    extern const SettingsUInt64 object_storage_cluster_local_read_probe_ms;
 }
 
 namespace ErrorCodes
@@ -683,11 +688,10 @@ private:
     ContextPtr context;
 };
 
-RemoteQueryExecutor::Extension StorageObjectStorageCluster::getTaskIteratorExtension(
+ObjectIterator StorageObjectStorageCluster::createObjectIteratorForRead(
     const ActionsDAG::Node * predicate,
     const ActionsDAG * filter,
     const ContextPtr & local_context,
-    ClusterPtr cluster,
     StorageMetadataPtr storage_metadata_snapshot) const
 {
     auto iterator = StorageObjectStorageSource::createFileIterator(
@@ -706,17 +710,101 @@ RemoteQueryExecutor::Extension StorageObjectStorageCluster::getTaskIteratorExten
         /*ignore_archive_globs=*/false,
         /*skip_object_metadata=*/true);
 
-    if (local_context->getSettingsRef()[Setting::cluster_table_function_split_granularity] == ObjectStorageGranularityLevel::BUCKET)
+    /// Before the first `next`, so iceberg objects carry the external-storage check the distributor needs.
+    /// The local-read probe counts tasks from this same iterator: one file, or one bucket when
+    /// `cluster_table_function_split_granularity` is `bucket`.
+    iterator->setTasksGoToOtherReplicas(true);
+    return wrapIteratorForClusterTasks(std::move(iterator), local_context);
+}
+
+ObjectIterator StorageObjectStorageCluster::wrapIteratorForClusterTasks(
+    ObjectIterator iterator,
+    const ContextPtr & local_context) const
+{
+    if (local_context->getSettingsRef()[Setting::cluster_table_function_split_granularity] != ObjectStorageGranularityLevel::BUCKET)
+        return iterator;
+
+    return std::make_shared<ObjectIteratorSplitByBuckets>(
+        std::move(iterator),
+        configuration->getFormat(),
+        object_storage,
+        local_context);
+}
+
+bool StorageObjectStorageCluster::isSmallEnoughForLocalRead(
+    const ContextPtr & context,
+    const StorageSnapshotPtr & storage_snapshot,
+    SelectQueryInfo & query_info) const
+{
+    const auto & settings = context->getSettingsRef();
+    const UInt64 max_tasks = settings[Setting::object_storage_cluster_local_read_max_tasks];
+    const UInt64 probe_ms = settings[Setting::object_storage_cluster_local_read_probe_ms];
+
+    const ActionsDAG * filter = query_info.filter_actions_dag.get();
+    const ActionsDAG::Node * predicate = (filter && !filter->getOutputs().empty()) ? filter->getOutputs().front() : nullptr;
+
+    auto iterator = createObjectIteratorForRead(predicate, filter, context, storage_snapshot->metadata);
+
+    auto probe = std::make_shared<ObjectStorageClusterReadProbe>();
+    Stopwatch watch;
+    const char * reason = "task count exceeded threshold";
+
+    while (true)
     {
-        iterator = std::make_shared<ObjectIteratorSplitByBuckets>(
-            std::move(iterator),
-            configuration->getFormat(),
-            object_storage,
-            local_context
-        );
+        if (probe_ms > 0 && watch.elapsedMilliseconds() >= probe_ms)
+        {
+            reason = "probe time budget exceeded";
+            break;
+        }
+
+        auto object = iterator->next(0);
+        if (!object)
+        {
+            probe->read_locally = true;
+            reason = "task list exhausted";
+            break;
+        }
+
+        probe->pulled.push_back(std::move(object));
+        if (probe->pulled.size() > max_tasks)
+            break;
     }
 
-    iterator->setTasksGoToOtherReplicas(true);
+    /// Taken before the iterator is dropped. A finished Delta iterator reports an unknown key count,
+    /// so it must not stay attached, but the local read still asks it for `_data_lake_snapshot_version`.
+    probe->snapshot_version = iterator->getSnapshotVersion();
+
+    /// A finished iterator must not stay attached: its `estimatedKeysCount` can be "unknown", which would
+    /// make a small local read start as many streams as a full listing.
+    if (!probe->read_locally)
+        probe->iterator = std::move(iterator);
+
+    LOG_TRACE(
+        getLogger("StorageObjectStorageCluster"),
+        "Local-read probe for {} saw {} task(s) (limit {}), read_locally={}, reason={}",
+        getStorageID().getNameForLogs(),
+        probe->pulled.size(),
+        max_tasks,
+        probe->read_locally,
+        reason);
+
+    const bool read_locally = probe->read_locally;
+    query_info.object_storage_cluster_read_probes.emplace(localReadProbeStorageKey(), std::move(probe));
+    return read_locally;
+}
+
+RemoteQueryExecutor::Extension StorageObjectStorageCluster::getTaskIteratorExtension(
+    const ActionsDAG::Node * predicate,
+    const ActionsDAG * filter,
+    const ContextPtr & local_context,
+    ClusterPtr cluster,
+    StorageMetadataPtr storage_metadata_snapshot,
+    ObjectIterator probed_iterator) const
+{
+    /// The probe already advanced this iterator. Replaying its objects avoids listing the same files again.
+    auto iterator = std::move(probed_iterator);
+    if (!iterator)
+        iterator = createObjectIteratorForRead(predicate, filter, local_context, storage_metadata_snapshot);
 
     std::vector<std::string> ids_of_hosts;
     for (const auto & shard : cluster->getShardsInfo())
@@ -817,6 +905,27 @@ QueryProcessingStage::Enum StorageObjectStorageCluster::getQueryProcessingStage(
     auto resolved = resolveClusterRead(context);
     if (shouldReadLocallyOnFallbackToPure(resolved, context))
         return QueryProcessingStage::Enum::FetchColumns;
+
+    /// Already decided for this storage. A second call must return the same stage `read` expects.
+    /// The map is per storage: a `Merge` shares this query info across children.
+    if (const auto existing_probe = findObjectStorageClusterReadProbe(
+            query_info.object_storage_cluster_read_probes, localReadProbeStorageKey()))
+    {
+        if (existing_probe->read_locally)
+            return QueryProcessingStage::Enum::FetchColumns;
+    }
+    else
+    {
+        const auto & settings = context->getSettingsRef();
+        const bool can_probe = settings[Setting::object_storage_cluster_local_read_max_tasks] > 0
+            && !settings[Setting::object_storage_remote_initiator]
+            && context->getClientInfo().query_kind != ClientInfo::QueryKind::SECONDARY_QUERY
+            && !resolved.fallback_to_pure
+            && storage_snapshot;
+
+        if (can_probe && isSmallEnoughForLocalRead(context, storage_snapshot, query_info))
+            return QueryProcessingStage::Enum::FetchColumns;
+    }
 
     return IStorageCluster::getQueryProcessingStage(context, to_stage, storage_snapshot, query_info);
 }
