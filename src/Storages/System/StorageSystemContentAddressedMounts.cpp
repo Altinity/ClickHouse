@@ -57,6 +57,9 @@ StorageSystemContentAddressedMounts::StorageSystemContentAddressedMounts(const S
         {"lifecycle_reason", std::make_shared<DataTypeString>(), "The enum-clean sub-state word for a vanished disk: replaced or forgotten. Empty for every other lifecycle (so lifecycle || '(' || lifecycle_reason || ')' reads e.g. vanished(forgotten))."},
         {"lifecycle_detail", std::make_shared<DataTypeString>(), "The full typed reason text naming the actual cause when not live: the vanish diagnosis (data root replaced by a foreign pool / decommissioned by SYSTEM CAS FORGET at <time>) or the identity-loss message. Empty when live."},
         {"lifecycle_since", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeDateTime>()), "When this server entered the current non-live lifecycle state. NULL when live (or the state is not backed by a live pool)."},
+        {"renewal_in_progress", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt8>()), "1 while this server renews its mount lease. NULL on rows describing other servers' mounts."},
+        {"renewal_attempts", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt64>()), "Conditional PUTs sent by the current lease renewal, or by the last one once it ended. NULL on rows describing other servers' mounts."},
+        {"last_renewal_error", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeString>()), "The last failed request of that renewal: '<VERB> <key>: <refused|transport> <code> <message>'. NULL when none failed, and on rows describing other servers' mounts."},
     }));
     storage_metadata.setVirtuals(createVirtuals());
     setInMemoryMetadata(storage_metadata);
@@ -101,6 +104,9 @@ Pipe StorageSystemContentAddressedMounts::read(
     MutableColumnPtr col_lifecycle_reason = ColumnString::create();
     MutableColumnPtr col_lifecycle_detail = ColumnString::create();
     MutableColumnPtr col_lifecycle_since = ColumnNullable::create(ColumnDateTime::create(), ColumnUInt8::create());
+    MutableColumnPtr col_renewal_in_progress = ColumnNullable::create(ColumnUInt8::create(), ColumnUInt8::create());
+    MutableColumnPtr col_renewal_attempts = ColumnNullable::create(ColumnUInt64::create(), ColumnUInt8::create());
+    MutableColumnPtr col_last_renewal_error = ColumnNullable::create(ColumnString::create(), ColumnUInt8::create());
 
     const uint64_t now_ms = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -117,6 +123,14 @@ Pipe StorageSystemContentAddressedMounts::read(
             col_lifecycle_since->insert(static_cast<UInt64>(snap.since));
         else
             col_lifecycle_since->insertDefault();   /// NULL while live / no backing pool
+    };
+
+    /// Process-local like GC health: NULL on peer rows.
+    const auto appendRenewalProgress = [&](const std::optional<Cas::RenewalProgress> & progress)
+    {
+        col_renewal_in_progress->insert(progress ? Field(static_cast<UInt64>(progress->in_progress)) : Field());
+        col_renewal_attempts->insert(progress ? Field(static_cast<UInt64>(progress->attempts_sent)) : Field());
+        col_last_renewal_error->insert(progress && progress->last_error ? Field(*progress->last_error) : Field());
     };
 
     for (const auto & [disk_name, disk] : context->getDisksMap())
@@ -153,8 +167,10 @@ Pipe StorageSystemContentAddressedMounts::read(
             store = nullptr;
         }
 
+        std::optional<Cas::RenewalProgress> progress;
         if (store)
         {
+            progress = store->renewalProgress();
             const uint64_t skew_margin_ms = static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count()) / 2;
             std::vector<Cas::MountInfo> mounts;
             bool list_ok = true;
@@ -216,6 +232,7 @@ Pipe StorageSystemContentAddressedMounts::read(
                     /// The lifecycle snapshot describes THIS server's pool condition for the disk; it is the
                     /// same for every mount slot listed, peer rows included.
                     appendLifecycle(snap);
+                    appendRenewalProgress(is_local_row ? progress : std::nullopt);
                     emitted_row = true;
                 }
             }
@@ -243,6 +260,7 @@ Pipe StorageSystemContentAddressedMounts::read(
             col_last_success->insertDefault();
             col_wedged->insertDefault();
             appendLifecycle(snap);
+            appendRenewalProgress(progress);
         }
     }
 
@@ -267,6 +285,9 @@ Pipe StorageSystemContentAddressedMounts::read(
     res_columns.emplace_back(std::move(col_lifecycle_reason));
     res_columns.emplace_back(std::move(col_lifecycle_detail));
     res_columns.emplace_back(std::move(col_lifecycle_since));
+    res_columns.emplace_back(std::move(col_renewal_in_progress));
+    res_columns.emplace_back(std::move(col_renewal_attempts));
+    res_columns.emplace_back(std::move(col_last_renewal_error));
 
     UInt64 num_rows = res_columns.at(0)->size();
     Chunk chunk(std::move(res_columns), num_rows);

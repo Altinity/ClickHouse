@@ -397,6 +397,56 @@ def test_transient_mount_renewal_retries_without_remount(start_cluster):
     assert node.query("SELECT payload FROM renewal_probe WHERE id = 0").strip() == "after-retry"
 
 
+def test_renewal_progress_is_visible_while_the_renewal_retries(start_cluster):
+    node = start_cluster["node"]
+    control_url = start_cluster["control_url"]
+    _control(control_url, "/config", {"reset": True})
+    # 503s on the mount PUT only: LIST and GET pass, so the table's own listing answers. Four faults
+    # back off at most 3 s in total, well inside one renewal's lease budget, so a burst never forces
+    # a remount; a burst that ends between two polls is re-armed once its renewal has ended.
+    fault_burst = {"rate": 1.0, "modes": ["503"], "methods": ["PUT"], "path_substring": MOUNT_REQUEST_PATH,
+                   "remaining_faults": 4, "seed": 802}
+    _control(control_url, "/config", fault_burst)
+    columns = (
+        "renewal_in_progress, renewal_attempts, last_renewal_error, toTypeName(renewal_in_progress), "
+        "toTypeName(renewal_attempts), toTypeName(last_renewal_error)"
+    )
+    local_row = "FROM system.cas_mounts WHERE disk = '{}' AND server_root_id = '{}'".format(DISK, SERVER_ROOT_ID)
+    query = "SELECT {} {} AND renewal_in_progress = 1 AND renewal_attempts >= 2 LIMIT 1 FORMAT TSV".format(
+        columns, local_row
+    )
+
+    def progress_row(deadline):
+        row = node.query(query, timeout=deadline.remaining()).strip()
+        if row:
+            return row
+        config = _control(control_url, "/config", {}, timeout=deadline.remaining())["config"]
+        exhausted = config["remaining_faults"] == 0
+        idle = node.query("SELECT renewal_in_progress {}".format(local_row), timeout=deadline.remaining()).strip() == "0"
+        if exhausted and idle:
+            _control(control_url, "/config", fault_burst, timeout=deadline.remaining())
+        return None
+
+    try:
+        row = _wait_until(progress_row, timeout=40)
+    finally:
+        _control(control_url, "/config", {"rate": 0.0})
+
+    _, _, error, *types = row.split("\t")
+    assert types == ["Nullable(UInt8)", "Nullable(UInt64)", "Nullable(String)"], row
+    assert error.startswith("PUT "), row
+    assert "gc/server-roots/{}/mount: transport SlowDown ".format(SERVER_ROOT_ID) in error, row
+
+    # Later tests diff the renewal counters, so the retried renewal must end first, live again whether
+    # it recovered or remounted.
+    _wait_until(
+        lambda deadline: node.query(
+            "SELECT lifecycle, renewal_in_progress {} FORMAT TSV".format(local_row), timeout=deadline.remaining()
+        ).strip() == "live\t0",
+        timeout=60,
+    )
+
+
 def test_landed_response_lost_adopts_exact_mount_write(start_cluster):
     node = start_cluster["node"]
     control_url = start_cluster["control_url"]

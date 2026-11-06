@@ -545,6 +545,7 @@ public:
         time_t since = 0;
     };
     LifecycleSnapshot lifecycleSnapshot() const;
+    RenewalProgress renewalProgress() const { return mount_runtime.renewalProgress(); }
 
     /// `SYSTEM CAS FORGET` — the operator force-Vanish (spec §5). Drives THIS pool to
     /// `Vanished(forgotten)` with the fence-first protocol, node-locally, regardless of the current

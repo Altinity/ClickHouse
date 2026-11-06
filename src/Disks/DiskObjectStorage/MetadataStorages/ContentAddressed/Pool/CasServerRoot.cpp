@@ -1629,6 +1629,7 @@ MountRenewResult MountLeaseRenewer::renewOn(
     result.attempt_start_boot_ms = attempt_start_boot_ms;
 
     CasOperation op = plane.admit(environment.live);
+    op.observeRequests(environment.requests);
     std::optional<WriteResult> written;
     try
     {

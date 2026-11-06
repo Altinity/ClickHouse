@@ -181,6 +181,7 @@ MountRenewOperationEnvironment renewalEnvironment(
         .boot_ms = [&boot_ms] { return boot_ms; },
         .live = live,
         .cancelled = cancelled,
+        .requests = {},
     };
 }
 
