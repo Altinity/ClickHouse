@@ -58,7 +58,7 @@ window and correlate them with the `server_root_id` in `system.cas_log`.
 | `CASMountRenewalRetries` | One per physical renewal `PUT` after the first in the same logical renewal | Positive growth shows in-period retry, not a later cadence beat |
 | `CASMountRenewalResolved` | One per logical renewal proved committed by an exact resolving `GET` | A response was ambiguous, but exact bytes and `write_attempt_id` proved the write |
 | `CASMountRenewalRecovered` | One per logical renewal committed after a retry or exact resolving `GET` | Recovered object-store blips that retained the existing mount incarnation |
-| `CASMountRenewalDeadlineExceeded` | One per logical renewal stopped by the external lease-safety deadline | The last confirmed lease no longer left enough safe time; this is narrower than request-budget exhaustion |
+| `CASMountRenewalDeadlineExceeded` | One per bounded logical renewal (startup or remount re-anchor, or a decommission's background renewal) stopped by the external lease-safety deadline | Growth means a bounded renewal found too little confirmed lease left; a mount's own background renewal never counts here |
 | `CASRemountAttempts` | One per invocation of the existing whole-chain remount attempt | Includes both successful and failed attempts |
 | `CASRemountSucceeded` | One per whole-chain attempt that restored `Live` under a fresh writer epoch | Must be a subset of `CASRemountAttempts` |
 | `CASRemountFailed` | One per whole-chain attempt that returned without restoring `Live` | Includes a named step exception or a step that returned transiently |

@@ -536,6 +536,7 @@ TEST(CASDecommission, AlwaysRenewsAdminClaimEvenWhenHostDiskIsObserveOnly)
         backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin", .background_watermark = false}, "victim");
     ASSERT_TRUE(admin != nullptr);
     EXPECT_TRUE(admin->poolConfig().background_watermark);
+    EXPECT_TRUE(admin->poolConfig().bounded_background_renewal);
 }
 
 TEST(CASDecommission, RefusesUnknownMember)

@@ -95,13 +95,17 @@ enum class CasOpAdmission : uint8_t
 ///   - `lifecycle`      — one of `live` / `not_live` / `identity_lost` / `vanished` (a live pool), or
 ///                        `constructing` / `shutdown` (no pool published).
 ///   - `reason`         — the ENUM-CLEAN sub-state word: `replaced` / `forgotten` for a
-///                        `vanished` pool, empty otherwise. Kept a small closed vocabulary so a downstream
+///                        `vanished` pool, `lease_expired` for a `not_live` row whose pool is `Live` but
+///                        whose lease has too little time left to admit a write, empty otherwise. Kept a
+///                        small closed vocabulary so a downstream
 ///                        `lifecycle || '(' || reason || ')'` yields e.g. exactly `vanished(forgotten)` —
 ///                        the [D5] free text lives in `detail`, never here.
 ///   - `detail`         — the full [D5] reason text naming the actual failure (the replaced
 ///                        diagnosis, the timestamped `FORGET` message, or the identity-loss message); spec §1
-///                        requires it appear verbatim in the snapshot. Empty while `live` and for a null pool.
-///   - `since`          — wall-clock second the current non-`live` state was entered; 0 while `live`/no pool.
+///                        requires it appear verbatim in the snapshot. Empty while `live`, for
+///                        `lease_expired`, and for a null pool.
+///   - `since`          — wall-clock second the current non-`live` state was entered (for
+///                        `lease_expired`, when writes paused); 0 while `live`/no pool.
 ///   - `pool_id`        — last-known pool UUID (empty before the first `startup`); the disk stays
 ///                        introspectable under its identity even once the pool is gone.
 ///   - `server_root_id` — this server's node-local root id owning the mount slot.
