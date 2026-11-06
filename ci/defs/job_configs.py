@@ -861,7 +861,14 @@ class JobConfigs:
                 "./docker/keeper",
             ],
         ),
-        requires=["Build (amd_release)", "Build (arm_release)"],
+        requires=[
+            ArtifactNames.DEB_AMD_RELEASE,
+            ArtifactNames.DEB_ARM_RELEASE,
+            ArtifactNames.TGZ_AMD_RELEASE,
+            ArtifactNames.TGZ_ARM_RELEASE,
+            "Build (amd_release)",
+            "Build (arm_release)",
+        ],
     )
     docker_keeper = Job.Config(
         name=JobNames.DOCKER_KEEPER,
@@ -875,7 +882,12 @@ class JobConfigs:
                 "./docker/keeper",
             ],
         ),
-        requires=["Build (amd_release)", "Build (arm_release)"],
+        requires=[
+            ArtifactNames.TGZ_AMD_RELEASE,
+            ArtifactNames.TGZ_ARM_RELEASE,
+            "Build (amd_release)",
+            "Build (arm_release)",
+        ],
     )
     sqlancer_master_jobs = Job.Config(
         name=JobNames.SQLANCER,
