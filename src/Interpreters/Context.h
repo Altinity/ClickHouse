@@ -35,6 +35,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 
 
 namespace Poco::Net
@@ -1890,6 +1891,10 @@ public:
     bool startSwarmMode();
     /// Return current swarm mode state.
     bool isSwarmModeEnabled() const;
+    /// Shared lock for one swarm task send. The read-task callback holds it only across the
+    /// enabled check and `sendReadTaskRequest`. The response read does not. `stopSwarmMode`
+    /// and `startSwarmMode` take it exclusively.
+    std::shared_lock<SharedMutex> lockSwarmMode() const;
 
     bool isInternalQuery() const { return is_internal_query; }
     void setInternalQuery(bool internal) { is_internal_query = internal; }
