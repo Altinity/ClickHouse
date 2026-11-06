@@ -3,6 +3,7 @@
 #include <pcg_random.hpp>
 #include <Common/randomSeed.h>
 
+#include <Analyzer/createUniqueAliasesIfNecessary.h>
 #include <Functions/FunctionsLogical.h>
 #include <Functions/IFunctionAdaptors.h>
 
@@ -441,7 +442,8 @@ or (object_storage_cluster_join_mode='global')
 void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
     ASTPtr & query_to_send,
     SelectQueryInfo query_info,
-    const ContextPtr & context)
+    const ContextPtr & context,
+    QueryTreeNodePtr * resolved_query_tree)
 {
     auto object_storage_cluster_join_mode = context->getSettingsRef()[Setting::object_storage_cluster_join_mode];
     switch (object_storage_cluster_join_mode)
@@ -453,7 +455,7 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
         if (!needsInitiatorLocalJoin(info))
             return;
 
-        rewriteQueryForInitiatorLocalJoin(query_to_send, query_info, info, context);
+        rewriteQueryForInitiatorLocalJoin(query_to_send, query_info, info, context, resolved_query_tree);
         return;
     }
     case ObjectStorageClusterJoinMode::GLOBAL:
@@ -464,7 +466,7 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
             if (queryHasRightOrFullJoin(query_to_send))
             {
                 auto info = getQueryJoinInfoFromAST(query_to_send);
-                rewriteQueryForInitiatorLocalJoin(query_to_send, query_info, info, context);
+                rewriteQueryForInitiatorLocalJoin(query_to_send, query_info, info, context, resolved_query_tree);
             }
             return;
         }
@@ -726,11 +728,26 @@ void IStorageCluster::read(
 
     SharedHeader sample_block;
 
-    updateQueryWithJoinToSendIfNeeded(query_to_send, query_info, context);
+    /// A join kept on the initiator replaces `query_to_send` but already has a resolved left-scan tree.
+    QueryTreeNodePtr resolved_query_tree;
+    updateQueryWithJoinToSendIfNeeded(query_to_send, query_info, context, &resolved_query_tree);
 
     if (settings[Setting::allow_experimental_analyzer])
     {
-        sample_block = InterpreterSelectQueryAnalyzer::getSampleBlock(query_to_send, context, SelectQueryOptions(processed_stage));
+        /// Re-analyzing the shard AST resolves a `DataLakeCatalog` table again and repeats a remote catalog lookup.
+        if (canReuseResolvedQueryTreeForHeader() && resolved_query_tree)
+            sample_block = InterpreterSelectQueryAnalyzer::getSampleBlock(resolved_query_tree, context, SelectQueryOptions(processed_stage));
+        else if (canReuseResolvedQueryTreeForHeader() && query_to_send == query_info.query && query_info.query_tree)
+        {
+            /// A shard re-analyzes this query and `createUniqueAliasesIfNecessary` restarts `__tableN` at 1.
+            /// The resolved tree still has the outer alias (`__table2` when this table is not leftmost).
+            auto query_info_for_header = query_info;
+            query_info_for_header.query_tree = query_info.query_tree->clone();
+            createUniqueAliasesIfNecessary(query_info_for_header.query_tree, context);
+            sample_block = getHeaderForProcessingStage(column_names, storage_snapshot, query_info_for_header, context, processed_stage);
+        }
+        else
+            sample_block = InterpreterSelectQueryAnalyzer::getSampleBlock(query_to_send, context, SelectQueryOptions(processed_stage));
     }
     else
     {
@@ -1060,7 +1077,8 @@ void IStorageCluster::rewriteQueryForInitiatorLocalJoin(
     ASTPtr & query_to_send,
     const SelectQueryInfo & query_info,
     const QueryTreeInfo & info,
-    const ContextPtr & context)
+    const ContextPtr & context,
+    QueryTreeNodePtr * resolved_query_tree)
 {
     /// Analyzer path: reuse `extractLeftTableExpression` and `buildQueryToReadColumnsFromTableExpression`
     /// (same helpers the planner uses when wrapping `IStorageCluster` in a subquery).
@@ -1101,6 +1119,9 @@ void IStorageCluster::rewriteQueryForInitiatorLocalJoin(
         auto & rewritten_query_node = rewritten_query_tree->as<QueryNode &>();
         rewritten_query_node.getPrewhere() = query_node.getPrewhere();
         rewritten_query_node.getWhere() = query_node.getWhere();
+
+        if (resolved_query_tree)
+            *resolved_query_tree = rewritten_query_tree;
 
         query_to_send = queryNodeToDistributedSelectQuery(rewritten_query_tree);
         return;
