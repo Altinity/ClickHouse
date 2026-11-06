@@ -65,7 +65,7 @@ void copyWithCreationClientAllowingFallback()
     auto storage = makeRetryingStorage("http://127.0.0.1:1");
     auto client = storage->getS3StorageClient();
     DB::copyS3File(
-        client, "test-bucket", "stage", 0, CountingS3::object_size, client, "test-bucket", "copy",
+        client, "test-bucket", "stage", CountingS3::object_size, client, "test-bucket", "copy",
         DB::S3Settings{}.request_settings, DB::ReadSettings{}, /*blob_storage_log=*/nullptr, /*schedule=*/{},
         /*fallback_file_reader=*/{}, /*object_metadata=*/std::nullopt, DB::ObjectStorageCopyMode::Default,
         /*object_creation_client=*/client);
