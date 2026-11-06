@@ -202,12 +202,30 @@ mount slot stays in place as a resume anchor rather than being fully retired.
 
 **Preconditions.** Confirm the member is actually and permanently dead before running this: the
 operation fences that `server_root_id` out even if the server comes back online, and it deletes
-namespace and drain state that cannot be recovered. Check `system.cas_mounts` for the member's
-`state` and `last_success_age_seconds` first — a `live` row, or one with a recent lease renewal,
-means the member is not a decommission candidate yet.
+namespace and drain state that cannot be recovered. The command claims the slot without waiting
+and trusts no wall clock, so it accepts only a terminal slot in `system.cas_mounts`:
+`state = 'terminated'` (clean stop) or `state = 'fenced'` (GC fenced the lease). A `live` or `expired`
+row is refused with `alive or contended`; a hard-killed member stays `expired` until the disk's GC leader fences it at the start of a GC round, once it has seen the lease unchanged for about one
+`cas_mount_lease_ttl_ms` plus one `cas_mount_renew_period_ms`; the wait can be one GC round longer. `SYSTEM CAS GC RUN` on the leader
+(`is_leader = 1` in `system.cas_mounts`) can trigger the fence, but the run that fences must come at
+least that long after the first run that saw the lease; two back-to-back runs do not fence.
 
 **Verification.** After the command reports `slot_removed = true` with no warnings, the member's
 `server_root_id` no longer appears as a row in `system.cas_mounts` on any peer, and a subsequent
 `SYSTEM CAS GC RUN` on the pool will no longer wait on or fence its heartbeat. See
 [mount, unmount, crash](/antalya/cas/architecture/mounts-and-leases#mount-lifecycle) for how the
 claim, drain, and retirement steps fit into the mount-slot lifecycle.
+
+## Recreating a member whose id contains `/` {#recreate-id-with-slash}
+
+A `cas_server_root_id` that contains `/` is refused: the disk fails to open with `BAD_ARGUMENTS` and a
+message that contains `contains '/'`. Pools created by earlier builds can hold such an id. To bring the
+server back:
+
+1. Set `<cas_server_root_id>` to a new value without `/`, for example `shard-01-replica-a` instead of
+   `shard-01/replica-a`. If the id comes from macros, remove the `/` from the template.
+2. Restart the server. The disk claims the new id over an empty subtree.
+
+Data stored under the old id is not visible under the new id. The old id's objects stay in the pool
+and keep their blobs referenced. `SYSTEM CAS DROP POOL MEMBER` and `clickhouse-disks cas-drop-member`
+refuse an id with `/`, so they cannot reclaim them.

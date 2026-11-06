@@ -80,14 +80,10 @@ struct MountRenewOperationEnvironment
 };
 
 /// Validate a `server_root_id` — the explicit, configured identity of the content-addressed layout
-/// subtree a server owns. It is a clean relative path: it composes into the
-/// object-key tree (`gc/server-roots/<srid>/...`, `roots/<srid>/...`), so the same hygiene the layout
-/// applies to a namespace applies here (mirrors `CasLayout.h::checkNamespace`):
-///   - non-empty;
-///   - no leading/trailing '/', no empty segment ("//");
-///   - no '.' or '..' segment;
-///   - total length <= 255;
-///   - no segment equal to the reserved "_files" / "_manifests".
+/// subtree a server owns. It composes into object keys (`gc/server-roots/<srid>/...`, `roots/<srid>/...`)
+/// as ONE path component: non-empty, at most 255 bytes, no '/', not '.' or '..', not the reserved
+/// "_files" / "_manifests". A '/' is refused even for an id that already owns its owner object, because
+/// decommission and the staging sweep select a member's objects by key prefix.
 /// Throws `ErrorCodes::BAD_ARGUMENTS` on any violation. Fail closed — there is no sanitizing fallback.
 inline void validateServerRootId(const String & id)
 {
@@ -98,27 +94,22 @@ inline void validateServerRootId(const String & id)
         throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
             "server_root_id '{}' is too long ({} > 255 bytes)", id, id.size());
 
-    size_t start = 0;
-    while (true)
-    {
-        size_t end = id.find('/', start);
-        const String segment = id.substr(start, end == String::npos ? String::npos : end - start);
-        if (segment.empty())
-            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
-                "server_root_id '{}' has an empty segment (leading/trailing or doubled '/')", id);
-        if (segment == "." || segment == "..")
-            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
-                "server_root_id '{}' uses a relative segment ('.' or '..')", id);
-        if (segment == "_files")
-            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
-                "server_root_id '{}' uses the reserved segment '_files'", id);
-        if (segment == "_manifests")
-            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
-                "server_root_id '{}' uses the reserved segment '_manifests'", id);
-        if (end == String::npos)
-            break;
-        start = end + 1;
-    }
+    if (id.find('/') != String::npos)
+        throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+            "server_root_id '{}' contains '/'. A decommission selects a member's objects by key prefix, so a "
+            "member 'a/b' would be drained by a decommission of 'a'. Recreate the server that uses this id under a new "
+            "<cas_server_root_id> without '/'; the objects of the old id stay in the pool and are not visible "
+            "under the new id",
+            id);
+    if (id == "." || id == "..")
+        throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+            "server_root_id '{}' uses a relative segment ('.' or '..')", id);
+    if (id == "_files")
+        throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+            "server_root_id '{}' uses the reserved segment '_files'", id);
+    if (id == "_manifests")
+        throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+            "server_root_id '{}' uses the reserved segment '_manifests'", id);
 }
 
 /// The per-server-root control objects (owner, epoch, and mount lease) and their text codecs are kept
@@ -152,9 +143,9 @@ std::optional<UInt128> readOwnerUuid(CasOperation & op, const Layout & l, const 
 ///   - owner present, equal `our_uuid`, and not tombstoned → ok (return);
 ///   - owner present and tombstoned → throw `CORRUPTED_DATA` (explicitly retired — fail closed);
 ///   - owner present, different → throw `CORRUPTED_DATA` (foreign owner — fail closed);
-///   - owner absent AND the subtree is provably empty → `create` the owner (claim);
 ///   - owner absent BUT the subtree is non-empty → throw `CORRUPTED_DATA` (identity lost over
-///     existing data — never silently re-claim).
+///     existing data — never silently re-claim);
+///   - owner absent, subtree provably empty → `create` the owner (claim).
 /// The owner object is never deleted and never reassigned to a different UUID.
 void claimOwnerOrThrow(
     CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid,
@@ -629,11 +620,10 @@ private:
 
 /// Mount-lease-scoped staging sweeper for objects left behind by S3-native staging.
 ///
-/// A leaked S3 staging object happens two ways: (1) an exception between blob publication succeeding and
-/// `cleanupPendingTempFiles` deleting the staging key (`ContentAddressedTransaction.cpp`), or (2) an
-/// aborted/cancelled transaction whose pending blobs were staged but never promoted — by design,
-/// `cleanupPendingTempFiles` deliberately leaves an S3 staging object in place on the abort path (never a
-/// bare `fs::remove` on a remote key), so this sweeper is its ONLY reclaimer. Debris from either case is
+/// A leaked S3 staging object is one whose transaction never ran `cleanupPendingTempFiles` (the process
+/// died, or an exception hit between `sink->finalize()` and `on_finalized` registering the key in
+/// `CaContentWriteBuffer::finalizeImpl`) or whose best-effort delete on commit or abort was lost. While
+/// the member lives, this sweeper is its only reclaimer. Debris from either case is
 /// bounded to `staging/<mount_id>/` — the ONE mount that could ever have written under that prefix, since
 /// every staging key this mount ever mints comes from `ContentAddressedMetadataStorage::stagingKeyPrefix()`
 /// (`physicalKey(pool_prefix + "/staging/" + server_root_id)`), keyed by THIS mount's own `server_root_id`.
