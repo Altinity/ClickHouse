@@ -418,9 +418,12 @@ void drainVictim(Pool & admin, const CasRefCatalog::Snapshot & catalog_cut, cons
         });
     }
 
-    /// The decommission claim has advanced the writer epoch, so every build prefix with
-    /// `prefix.writer_epoch < w.writer_epoch` is eligible here. Group the listed keys by namespace and
-    /// build prefix so each group can use the exact-token orphan sweep.
+    /// Manifest debris must be removed before the mount slot: deleting the mount body removes the
+    /// watermark authority, after which `mountLeaseForNamespace` returns no value and the ordinary orphan
+    /// sweep cannot prove that old-epoch debris is eligible. The decommission claim has advanced the
+    /// writer epoch, so every build prefix with `prefix.writer_epoch < w.writer_epoch` is eligible here.
+    /// Group the listed keys by namespace and build prefix so each group can use the exact-token orphan
+    /// sweep while the mount body still supplies its authority.
     {
         const String debris_prefix = admin.layout().casManifestsServerPrefix(victim_srid);
         std::set<std::tuple<String, uint64_t, uint64_t>> groups;   /// (namespace, writer epoch, build sequence)
