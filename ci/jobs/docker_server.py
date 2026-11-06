@@ -273,7 +273,6 @@ def build_and_push_image(
     if push:
         init_args.append("--push")
         init_args.append("--output=type=image")
-        init_args.append(f"--tag={image.name}")
     else:
         init_args.append("--output=type=docker")
 
@@ -319,8 +318,10 @@ def build_and_push_image(
                 sha=sha,
             )
         )
-        if not push:
-            cmd_args.append(f"--tag={image.name}:{arch_tag}")
+        # Always use a unique per-arch tag. Pushing an untagged name pushes the shared
+        # `:latest` tag, and concurrent builds (other PRs or repositories) pushing it at
+        # the same time can make `containerimage.digest` point to a foreign image.
+        cmd_args.append(f"--tag={image.name}:{arch_tag}")
         cmd_args.extend(
             [
                 f"--metadata-file={metadata_path}",
