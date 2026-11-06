@@ -10,18 +10,23 @@
 #include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
+#include <Common/LoggingHelpers.h>
 #include <Common/logger_useful.h>
 #include <Common/ProfileEvents.h>
 #include <Common/thread_local_rng.h>
 #include <Common/config_version.h>
 #include <base/defines.h>
+#include <base/scope_guard.h>
 #include <fmt/format.h>
 #include <algorithm>
 #include <chrono>
+#include <exception>
 
 namespace ProfileEvents
 {
     extern const Event CASBlobBodyPutAvoided;
+    extern const Event CASBlobPublishAttemptFailed;
+    extern const Event CASBlobPublishGaveUp;
     extern const Event CASBlobAdoptTrusted;
     extern const Event CASMetaPut;
     extern const Event CASMetaCompareSwap;
@@ -65,6 +70,17 @@ UInt128 mintU128()
     const UInt64 hi = thread_local_rng();
     const UInt64 lo = thread_local_rng();
     return (static_cast<UInt128>(hi) << 64) | lo;
+}
+
+/// Rate-limited, because under an outage every blob of every write fails here; the counter has them all.
+void recordFailedPublicationAttempt(
+    const String & key, BlobPublicationTransport transport, int attempt, int max_attempts, const String & error)
+{
+    ProfileEvents::increment(ProfileEvents::CASBlobPublishAttemptFailed);
+    LogSeriesLimiter log(getLogger("CasBlobPublishAttempt"), /*allowed_count=*/5, /*interval_s=*/30);
+    LOG_WARNING(log, "Publication of CAS blob {} ({}) failed, attempt {} of {}: {}",
+                key, transport == BlobPublicationTransport::Streaming ? "streaming" : "server-side copy",
+                attempt + 1, max_attempts, error);
 }
 
 bool isDeterministicBlobPublicationFailure(const std::exception & error)
@@ -385,6 +401,14 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
     };
 
     constexpr int max_publication_attempts = 8;
+    /// Every exit by exception after a failed attempt gave up on the blob, the attempt cap and the
+    /// loop's deadline alike.
+    int failed_attempts = 0;
+    const int exceptions_at_entry = std::uncaught_exceptions();
+    SCOPE_EXIT({
+        if (failed_attempts > 0 && std::uncaught_exceptions() > exceptions_at_entry)
+            ProfileEvents::increment(ProfileEvents::CASBlobPublishGaveUp);
+    });
     for (int attempt = 0; attempt < max_publication_attempts; ++attempt)
     {
         requireAlive();
@@ -486,6 +510,8 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             /// every further request of this operation refuses the same way.
             if (isDeterministicBlobPublicationFailure(error) || !op.admitted())
                 throw;
+            ++failed_attempts;
+            recordFailedPublicationAttempt(key, transport, attempt, max_publication_attempts, error.what());
             if (attempt + 1 == max_publication_attempts)
                 throwCasWriteRetryLater(fmt::format(
                     "PartWriteTxn::ensureBlobPresent: publication of {} remained ambiguous after {} "
@@ -497,6 +523,9 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
         }
         catch (...)
         {
+            ++failed_attempts;
+            recordFailedPublicationAttempt(
+                key, transport, attempt, max_publication_attempts, getCurrentExceptionMessage(/*with_stacktrace=*/false));
             if (attempt + 1 == max_publication_attempts)
                 throwCasWriteRetryLater(fmt::format(
                     "PartWriteTxn::ensureBlobPresent: publication of {} remained ambiguous after {} "

@@ -65,11 +65,20 @@ Ordered steps in `PartWriteTxn::ensureBlobPresent`:
 5. Streaming publication mints a fresh `incarnation_tag` and can use ordinary multipart. The first
    publication of an S3-staged source may use native same-store copy only after a miss; a condemned
    or subsequent publication retags and streams the staged payload.
+   The request that creates the object (`PutObject`, `CopyObject`, `CompleteMultipartUpload`) is
+   never resent by the S3 client after an ambiguous outcome; resends after a definite refusal, such as
+   expired credentials or a redirect, stay. On a store with content-derived ETags, a resent
+   envelope that lands after GC deleted it would restore the condemned incarnation. Part uploads keep
+   the client's retries.
 6. `BlobSource::beginPublication` consumes the shared, monotonic `publication_attempted` state
    before backend I/O. A lost response cannot re-enable verbatim copy on a later attempt.
-7. Retryable or ambiguous failures restart at `HEAD`. No dependency proof is recorded until a
-   present body with a `Clean` marker was observed, or publication and metadata reconciliation
-   completed.
+7. Retryable or ambiguous failures restart at `HEAD`: up to 8 attempts, each with a fresh envelope.
+   The engine starts no new attempt after the 90-second deadline, but an attempt already started can
+   run longer: each creating request waits up to the disk's `request_timeout_ms`, and multipart part
+   uploads keep their own retries. A write can therefore take longer than 90 seconds before it
+   fails with a retryable error. No dependency
+   proof is recorded until a present body with a `Clean` marker was observed, or publication and
+   metadata reconciliation completed.
 
 **Two writers uploading identical content** may both observe absence and both publish. The last
 physical incarnation wins, but the key proves that both payloads have the same logical identity and
