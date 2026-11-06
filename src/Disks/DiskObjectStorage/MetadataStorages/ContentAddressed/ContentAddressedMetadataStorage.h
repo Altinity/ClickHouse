@@ -402,9 +402,10 @@ public:
     /// Returns the underlying object storage for an S3 staging writer. It is meaningful only when
     /// `stagingBackend` is `S3`.
     const ObjectStoragePtr & objectStorage() const { return object_storage; }
-    /// Returns the physical `pool_prefix/staging/server_root_id` prefix for this mount's staging
-    /// area. Callers append a unique leaf.
+    /// The physical `Cas::Layout::stagingPrefix` of this mount's staging area, with a trailing `/`.
     String stagingKeyPrefix() const;
+    /// The physical `Cas::Layout::stagingKey` of one staged upload of this mount.
+    String stagingKey(uint64_t writer_epoch, const String & leaf) const;
 
     /// Bytes that live INSIDE pool metadata rather than as their own object: an Inline-placement
     /// manifest tree entry, or a verbatim namespace file. nullopt = the path is blob-backed (a real
