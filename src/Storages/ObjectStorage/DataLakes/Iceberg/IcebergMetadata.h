@@ -295,6 +295,7 @@ private:
     std::optional<IStorage::ExportPartitionCommitInfo> commitImportPartitionTransactionImpl(
         FileNamesGenerator & filename_generator,
         Poco::JSON::Object::Ptr & metadata,
+        String & metadata_file_path,
         Poco::JSON::Object::Ptr & partition_spec,
         const String & transaction_id,
         Int64 original_schema_id,

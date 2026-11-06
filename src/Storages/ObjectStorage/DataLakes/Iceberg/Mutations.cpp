@@ -981,6 +981,10 @@ void alter(
         if (succeeded)
             break;
 
+        metadata_json_generator.appendMetadataLog(
+            persistent_table_components.path_resolver.reverseResolve(metadata_path),
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+
         const auto new_schema_id = metadata->getValue<Int32>(Iceberg::f_current_schema_id);
         Poco::JSON::Object::Ptr new_schema;
         auto schemas = metadata->getArray(Iceberg::f_schemas);

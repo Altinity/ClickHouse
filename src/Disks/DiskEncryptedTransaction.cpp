@@ -1,6 +1,8 @@
 #include <Disks/DiskEncryptedTransaction.h>
 
 #if USE_SSL
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartPathParser.h>
 #include <IO/FileEncryptionCommon.h>
 #include <Common/Exception.h>
 #include <boost/algorithm/hex.hpp>
@@ -16,6 +18,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int DATA_ENCRYPTION_ERROR;
+    extern const int NOT_IMPLEMENTED;
 }
 
 
@@ -87,6 +90,15 @@ std::unique_ptr<WriteBufferFromFileBase> DiskEncryptedTransaction::writeFileImpl
     const WriteSettings & settings)
 {
     auto wrapped_path = wrappedPath(path);
+    if (delegate_disk->isContentAddressed() && Cas::isPartFilePath(wrapped_path))
+    {
+        auto part_path = Cas::parsePartFilePath(wrapped_path);
+        if (!part_path || part_path->file.empty() || Cas::partFileMustStayBlob(part_path->file))
+            throw Exception(
+                ErrorCodes::NOT_IMPLEMENTED,
+                "Writing content part files through an encrypted content-addressed disk is not supported");
+    }
+
     FileEncryption::Header header;
     String key;
     UInt64 old_file_size = 0;

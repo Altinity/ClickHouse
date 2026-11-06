@@ -450,6 +450,14 @@ Poco::JSON::Object::Ptr MetadataGenerator::getParentSnapshot(Int64 parent_snapsh
     return nullptr;
 }
 
+void MetadataGenerator::appendMetadataLog(const Iceberg::IcebergPathFromMetadata & previous_metadata_file_path, Int64 timestamp_ms)
+{
+    Poco::JSON::Object::Ptr new_metadata_item = new Poco::JSON::Object;
+    new_metadata_item->set(Iceberg::f_metadata_file, previous_metadata_file_path.serialize());
+    new_metadata_item->set(Iceberg::f_timestamp_ms, timestamp_ms);
+    getOrCreateArray(metadata_object, Iceberg::f_metadata_log)->add(new_metadata_item);
+}
+
 MetadataGenerator::NextMetadataResult MetadataGenerator::generateNextMetadata(
     FileNamesGenerator & generator,
     const Iceberg::IcebergPathFromMetadata & previous_metadata_file_path,
@@ -588,12 +596,7 @@ MetadataGenerator::NextMetadataResult MetadataGenerator::generateNextMetadata(
         metadata_object->getObject(Iceberg::f_refs)->getObject(Iceberg::f_main)->set(Iceberg::f_metadata_snapshot_id, snapshot_id);
 
     if (!previous_metadata_file_path.empty())
-    {
-        Poco::JSON::Object::Ptr new_metadata_item = new Poco::JSON::Object;
-        new_metadata_item->set(Iceberg::f_metadata_file, previous_metadata_file_path.serialize());
-        new_metadata_item->set(Iceberg::f_timestamp_ms, timestamp);
-        getOrCreateArray(metadata_object, Iceberg::f_metadata_log)->add(new_metadata_item);
-    }
+        appendMetadataLog(previous_metadata_file_path, timestamp);
     {
         Poco::JSON::Object::Ptr new_snapshot_item = new Poco::JSON::Object;
         new_snapshot_item->set(Iceberg::f_metadata_snapshot_id, snapshot_id);
@@ -696,12 +699,7 @@ MetadataGenerator::NextMetadataResult MetadataGenerator::appendReplaceSnapshot(
         metadata_object->getObject(Iceberg::f_refs)->getObject(Iceberg::f_main)->set(Iceberg::f_metadata_snapshot_id, snapshot_id);
     }
 
-    {
-        Poco::JSON::Object::Ptr new_metadata_item = new Poco::JSON::Object;
-        new_metadata_item->set(Iceberg::f_metadata_file, metadata_file_path.serialize());
-        new_metadata_item->set(Iceberg::f_timestamp_ms, timestamp);
-        metadata_object->getArray(Iceberg::f_metadata_log)->add(new_metadata_item);
-    }
+    appendMetadataLog(metadata_file_path, timestamp);
     {
         Poco::JSON::Object::Ptr new_snapshot_item = new Poco::JSON::Object;
         new_snapshot_item->set(Iceberg::f_metadata_snapshot_id, snapshot_id);
