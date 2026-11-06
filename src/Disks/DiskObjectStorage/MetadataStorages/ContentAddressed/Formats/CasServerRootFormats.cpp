@@ -18,11 +18,14 @@ namespace OwnerWire
 {
     constexpr WireKey server_uuid{"server_uuid"};
     constexpr WireKey retired_at_ms{"retired_at_ms"};
+    constexpr WireKey owner_life{"owner_life"};
+    constexpr WireKey retirement_verified{"retirement_verified"};
 }
 
 namespace ServerEpochWire
 {
     constexpr WireKey next_writer_epoch{"next_writer_epoch"};
+    constexpr WireKey allocation_nonce{"allocation_nonce"};
 }
 
 namespace MountLeaseWire
@@ -60,6 +63,10 @@ String encodeOwner(const OwnerObject & o)
     writeHex128Field(out, OwnerWire::server_uuid, o.server_uuid, first);
     if (o.retired_at_ms)
         writeNumberField(out, OwnerWire::retired_at_ms, *o.retired_at_ms, first);
+    if (o.owner_life != 0)
+        writeU64StringField(out, OwnerWire::owner_life, o.owner_life, first);
+    if (o.retirement_verified)
+        writeBoolField(out, OwnerWire::retirement_verified, true, first);
     closeObject(out, first);
     writeChar('\n', out);
     return std::move(out).take();
@@ -86,6 +93,10 @@ OwnerObject decodeOwner(std::string_view data)
         }
         else if (key == OwnerWire::retired_at_ms)
             rt = r.readU64Number();
+        else if (key == OwnerWire::owner_life)
+            o.owner_life = r.readU64String();
+        else if (key == OwnerWire::retirement_verified)
+            o.retirement_verified = r.readBool();
         else
             r.skipUnknown(key);
     }
@@ -103,6 +114,8 @@ String encodeServerEpoch(const ServerEpoch & e)
     writeHeaderLine(out, FormatId::ServerEpoch);
     bool first = true;
     writeU64StringField(out, ServerEpochWire::next_writer_epoch, e.next_writer_epoch, first);
+    if (e.allocation_nonce)
+        writeHex128Field(out, ServerEpochWire::allocation_nonce, *e.allocation_nonce, first);
     closeObject(out, first);
     writeChar('\n', out);
     return std::move(out).take();
@@ -126,6 +139,8 @@ ServerEpoch decodeServerEpoch(std::string_view data)
             e.next_writer_epoch = r.readU64String();
             saw = true;
         }
+        else if (key == ServerEpochWire::allocation_nonce)
+            e.allocation_nonce = r.readHex128();
         else
             r.skipUnknown(key);
     }

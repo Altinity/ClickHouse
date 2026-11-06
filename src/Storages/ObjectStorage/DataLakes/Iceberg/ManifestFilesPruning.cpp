@@ -274,7 +274,8 @@ Field reinterpretPartitionDateTime64(const Field & field, const IDataType & type
 }
 
 PruningReturnStatus ManifestFilesPruner::canBePruned(
-    const ProcessedManifestFileEntryPtr & entry, const std::unordered_map<Int32, DB::Range> & entry_hyperrectangles) const
+    const ProcessedManifestFileEntryPtr & entry,
+    const std::unordered_map<Int32, std::vector<DB::Range>> & entry_hyperrectangles) const
 {
     if (partition_key_condition.has_value())
     {
@@ -344,7 +345,21 @@ PruningReturnStatus ManifestFilesPruner::canBePruned(
         if (rect_it == entry_hyperrectangles.end())
             continue;
 
-        if (has_no_nulls && !key_condition.mayBeTrueInRange(1, &rect_it->second.left, &rect_it->second.right, {name_and_type->type}))
+        if (!has_no_nulls)
+            continue;
+
+        /// A `timestamp` column in `[1e16, 1e18)` has two ranges. Prune only when every range misses.
+        bool may_be_true = false;
+        for (const auto & range : rect_it->second)
+        {
+            if (key_condition.mayBeTrueInRange(1, &range.left, &range.right, {name_and_type->type}))
+            {
+                may_be_true = true;
+                break;
+            }
+        }
+
+        if (!may_be_true)
         {
             return PruningReturnStatus::MIN_MAX_INDEX_PRUNED;
         }

@@ -125,7 +125,8 @@ battery, skipping the battery used to skip it too, which is exactly why the thir
   writable generation-token mount; every other backend still skips only its permitted access-check
   I/O. This is what makes the exact-token delete check below unskippable on an *ordinary* writable
   mount. Decommissioning a pool member is the deliberate exception — it opens writable with the
-  battery skipped, because the fail-closed tradeoff inverts there: refusing an ordinary mount costs
+  battery skipped and logs one line naming what went unverified (versioning, conditional writes,
+  list-after-write), because the fail-closed tradeoff inverts there: refusing an ordinary mount costs
   availability and protects data, whereas refusing a decommission strands a pool with a dead replica
   in it and leaves the operator no way forward.
 - `checkConditionalWriteSingleAttemptSupport` — inside the battery. Refuses to mount writable unless the underlying

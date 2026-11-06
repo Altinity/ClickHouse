@@ -3,6 +3,7 @@
 #include <base/types.h>
 #include <base/extended_types.h>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string_view>
 
@@ -26,18 +27,36 @@ namespace DB::Cas
 struct OwnerObject
 {
     UInt128 server_uuid{};
-    /// Set when this identity was explicitly decommissioned by an operator (`CasDecommission`'s
-    /// final step tombstones the owner object in place rather than deleting it, since its content
+    /// Set when this identity was explicitly decommissioned by an operator (`CasDecommission`
+    /// tombstones the owner object in place rather than deleting it, since its content
     /// alone cannot distinguish decommissioned debris from a legitimate successor's live anchor).
     /// A normal claim (`claimOwnerOrThrow`) must refuse to silently resume a tombstoned identity.
     std::optional<uint64_t> retired_at_ms;
+    /// Every owner write sets this to the read value + 1, so two writes never carry the same bytes and an
+    /// `If-Match` against an older incarnation cannot land late. 0 = written before the field existed.
+    uint64_t owner_life = 0;
+    /// Set by the decommission run whose claim, tombstone and farewell all held; a later tombstone refresh
+    /// keeps it, a rollback drops it.
+    bool retirement_verified = false;
 };
+
+/// The owner of the next life after `current`. Every owner write after the first claim goes through it, so
+/// the life only grows and no write repeats earlier bytes.
+inline OwnerObject nextOwnerLife(const OwnerObject & current, std::optional<uint64_t> retired_at_ms, bool retirement_verified)
+{
+    return OwnerObject{.server_uuid = current.server_uuid, .retired_at_ms = retired_at_ms,
+                       .owner_life = current.owner_life + 1, .retirement_verified = retirement_verified};
+}
 
 /// Durable counter state used to allocate unique writer epochs. The stored value is the next epoch
 /// to allocate; the caller CAS-writes a larger value and adopts the previous value for its mount.
 struct ServerEpoch
 {
     uint64_t next_writer_epoch = 0;
+    /// Random per allocation decision, so an unclear write is ours only if the stored bytes match
+    /// exactly: a twin of the same uuid bumping to the same value writes a different nonce. Absent in
+    /// bodies written by 26.6.4.
+    std::optional<UInt128> allocation_nonce = std::nullopt;
 };
 
 /// The current liveness lease for one `(server_uuid, writer_epoch)` writer incarnation. The pool
@@ -53,11 +72,24 @@ struct MountLease
     uint64_t started_at_ms = 0;
     uint64_t seq = 0;
     uint64_t expires_at_ms = 0;
-    uint64_t min_active_build_sequence = 0;   /// UINT64_MAX = retired (farewell)
+    uint64_t min_active_build_sequence = 0;   /// UINT64_MAX = clean release (farewell); not an owner retirement
     bool gc_fenced = false;    /// GC fence-out of an expired lease; terminal
     /// One holder-originated body identity. Every physical retry of that one logical write reuses
     /// it; a GC fence copies the observed value while every successor holder body mints a new one.
     UInt128 write_attempt_id{};
+
+    /// The holder released the slot cleanly (its farewell): the `UINT64_MAX` sentinel in the build
+    /// watermark. Independent of `gc_fenced`, which callers check first.
+    bool isCleanRelease() const { return min_active_build_sequence == std::numeric_limits<uint64_t>::max(); }
+    bool isHeldBy(UInt128 uuid, uint64_t epoch) const { return server_uuid == uuid && writer_epoch == epoch; }
+    /// What a fence writes over this body: the same holder, `gc_fenced`, one `seq` later.
+    MountLease fencedCopy() const
+    {
+        MountLease fenced = *this;
+        fenced.gc_fenced = true;
+        fenced.seq += 1;
+        return fenced;
+    }
 };
 
 /// Encode the owner anchor as canonical text with the `cas_owner` header and a final newline. The
@@ -66,8 +98,8 @@ struct MountLease
 /// decisions belong to the caller that coordinates the server-root object.
 String encodeOwner(const OwnerObject & o);
 
-/// Decode an owner anchor, requiring its `server_uuid` field, tolerating an absent optional `retired_at_ms` retirement
-/// timestamp, and rejecting bytes after the body line. Unknown JSON fields are skipped for
+/// Decode an owner anchor, requiring its `server_uuid` field, tolerating absent `retired_at_ms`, `owner_life` and
+/// `retirement_verified`, and rejecting bytes after the body line. Unknown JSON fields are skipped for
 /// forward-compatible reads; malformed input, a missing `server_uuid`, and trailing data throw
 /// `CORRUPTED_DATA`.
 OwnerObject decodeOwner(std::string_view data);
@@ -77,7 +109,8 @@ OwnerObject decodeOwner(std::string_view data);
 /// codec.
 String encodeServerEpoch(const ServerEpoch & e);
 
-/// Decode the epoch counter, requiring its `next_writer_epoch` field and rejecting bytes after the body line.
+/// Decode the epoch counter, requiring its `next_writer_epoch` field, tolerating an absent `allocation_nonce`, and
+/// rejecting bytes after the body line.
 /// Unknown JSON fields are skipped for forward-compatible reads; malformed input, a missing or zero `next_writer_epoch`,
 /// and trailing data throw `CORRUPTED_DATA`.
 ServerEpoch decodeServerEpoch(std::string_view data);

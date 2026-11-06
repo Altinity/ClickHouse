@@ -3,10 +3,14 @@ import atexit
 import json
 import logging
 import os
+import shutil
 import tempfile
+import threading
 import traceback
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Dict, List
+from urllib.parse import unquote, urlparse
 
 from ci.jobs.scripts.clickhouse_version import CHVersion
 from ci.praktika import Secret
@@ -31,12 +35,74 @@ GITHUB_SERVER_URL = os.getenv("GITHUB_SERVER_URL", "https://github.com")
 #     atexit.register(os.remove, f.name)
 
 
-def read_build_urls(build_name: str):
-    artifact_report = temp_path / f"artifact_report_build_{build_name}.json"
-    if artifact_report.is_file():
-        with open(artifact_report, "r", encoding="utf-8") as f:
-            return json.load(f)["build_urls"]
-    return []
+def package_files_from_dir(pkg_dir: Path, image_repo: str) -> Dict[str, List[Path]]:
+    if "clickhouse-server" in image_repo:
+        packages = [
+            "clickhouse-client",
+            "clickhouse-server",
+            "clickhouse-common-static",
+        ]
+    elif "clickhouse-keeper" in image_repo:
+        packages = ["clickhouse-common-static", "clickhouse-keeper"]
+    else:
+        assert False, "BUG"
+
+    files = [f for f in pkg_dir.iterdir() if f.is_file() and "-dbg" not in f.name]
+    result: Dict[str, List[Path]] = {}
+    for arch in ARCH:
+        matched = []
+        for f in files:
+            if not any(pkg in f.name for pkg in packages):
+                continue
+            if f"_{arch}." not in f.name and f"-{arch}." not in f.name:
+                continue
+            matched.append(f)
+        result[arch] = sorted(matched, key=lambda p: p.name)
+    return result
+
+
+def start_package_http_server(files: List[Path]) -> ThreadingHTTPServer:
+    http_root = temp_path / "docker_pkg_http"
+    if http_root.exists():
+        shutil.rmtree(http_root)
+    http_root.mkdir(parents=True)
+    allowed = set()
+    for f in files:
+        dest = http_root / f.name
+        if dest.exists():
+            continue
+        try:
+            os.link(f, dest)
+        except OSError:
+            shutil.copy2(f, dest)
+        allowed.add(f.name)
+
+    class Handler(SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=str(http_root), **kwargs)
+
+        def list_directory(self, _path):
+            self.send_error(404, "Not found")
+            return None
+
+        def do_GET(self):
+            name = Path(unquote(urlparse(self.path).path)).name
+            if name not in allowed:
+                self.send_error(404, "Not found")
+                return
+            self.path = "/" + name
+            super().do_GET()
+
+        def log_message(self, fmt, *args):
+            logging.info("package-http " + fmt, *args)
+
+    # 0.0.0.0: buildx uses the docker-container driver; wget runs in that
+    # container and reaches the runner via host.docker.internal/host-gateway.
+    httpd = ThreadingHTTPServer(("0.0.0.0", 0), Handler)
+    threading.Thread(
+        target=httpd.serve_forever, daemon=True, name="package-http"
+    ).start()
+    return httpd
 
 
 class DockerImageData:
@@ -241,6 +307,8 @@ def build_and_push_image(
                     urls = [url for url in tgz_urls if "clickhouse-keeper" in url]
                 else:
                     urls = tgz_urls
+        if urls and any("host.docker.internal" in url for url in urls):
+            cmd_args.append("--add-host=host.docker.internal:host-gateway")
         cmd_args.extend(
             buildx_args(
                 repo_urls,
@@ -398,43 +466,27 @@ def main():
     repo_urls = {}
     direct_urls: Dict[str, List[str]] = {}
 
-    for arch, build_name in zip(ARCH, ("amd_release", "arm_release")):
-        if args.allow_build_reuse:
-            # read s3 urls from pre-downloaded build reports
-            if "clickhouse-server" in image_repo:
-                PACKAGES = [
-                    "clickhouse-client",
-                    "clickhouse-server",
-                    "clickhouse-common-static",
-                ]
-            elif "clickhouse-keeper" in image_repo:
-                # Both packages are needed to cover all three keeper image variants:
-                #   distroless: installs from .deb via dpkg; clickhouse-common-static
-                #               provides the clickhouse multi-tool binary (clickhouse-keeper
-                #               is a symlink to it). clickhouse-keeper .deb is not published
-                #               separately, so the common-static .deb is the only source.
-                #   alpine/ubuntu: installs from .tgz; clickhouse-keeper provides the
-                #               standalone keeper binary and its symlinks. The common-static
-                #               .tgz is implicitly excluded because the url filter below
-                #               keeps only urls containing "clickhouse-keeper" in the name.
-                PACKAGES = ["clickhouse-common-static", "clickhouse-keeper"]
-            else:
-                assert False, "BUG"
-            urls = read_build_urls(build_name)
-            assert urls, "URLS has not been read from build report"
-            direct_urls[arch] = [
-                url
-                for url in urls
-                if any(package in url for package in PACKAGES) and "-dbg" not in url
-            ]
-        elif args.bucket_prefix:
-            assert not args.allow_build_reuse
+    if args.bucket_prefix:
+        for arch, build_name in zip(ARCH, ("amd_release", "arm_release")):
             repo_urls[arch] = f"{args.bucket_prefix}/{build_name}"
-            print(f"Bucket prefix is set: Fetching packages from [{repo_urls}]")
-        else:
-            assert (
-                False
-            ), "--sha, --bucket_prefix or --allow-build-reuse (to fetch packages from build report) must be provided"
+        print(f"Bucket prefix is set: Fetching packages from [{repo_urls}]")
+    else:
+        # Praktika downloads job.requires (DEB_*/TGZ_*) into ci/tmp. Serve only
+        # those package files so the Dockerfile wget path works without S3 creds.
+        files_by_arch = package_files_from_dir(temp_path, image_repo)
+        package_files = [f for files in files_by_arch.values() for f in files]
+        assert package_files, f"No packages found in {temp_path} for {image_repo}"
+        httpd = start_package_http_server(package_files)
+        atexit.register(httpd.shutdown)
+        port = httpd.server_address[1]
+        base_url = f"http://host.docker.internal:{port}"
+        logging.info("Serving %s package files at %s", len(package_files), base_url)
+        direct_urls = {
+            arch: [f"{base_url}/{f.name}" for f in files]
+            for arch, files in files_by_arch.items()
+        }
+        for arch, urls in direct_urls.items():
+            logging.info("Package URLs [%s]: %s", arch, urls)
 
     if push:
         docker_login()

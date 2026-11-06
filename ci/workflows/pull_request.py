@@ -161,7 +161,6 @@ workflow = Workflow.Config(
             .set_name("Keeper Stress Tests (PR)")
             .set_timeout(3 * 3600),
         *JobConfigs.toolchain_build_jobs,
-        AltinityJobConfigs.source_upload_job,
     ],
     additional_jobs=["GrypeScan", "RegressionPR", "CIReport"],
     artifacts=[

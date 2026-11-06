@@ -87,7 +87,9 @@ namespace
         return false;
     }
 
-    void addRowLineageHyperrectangles(std::unordered_map<Int32, DB::Range> & hyperrectangles, const ProcessedManifestFileEntry & entry)
+    void addRowLineageHyperrectangles(
+        std::unordered_map<Int32, std::vector<DB::Range>> & hyperrectangles,
+        const ProcessedManifestFileEntry & entry)
     {
         const auto & parsed_entry = *entry.parsed_entry;
         if (!entry.first_row_id.has_value() || parsed_entry.record_count <= 0 || entry.sequence_number < 0)
@@ -110,17 +112,17 @@ namespace
             {
                 if (column_presence_is_known)
                 {
-                    hyperrectangles.emplace(field_id, DB::Range(inherited_lower_bound, true, inherited_upper_bound, true));
+                    hyperrectangles[field_id].emplace_back(inherited_lower_bound, true, inherited_upper_bound, true);
                     continue;
                 }
             }
             else if (auto range = getMaterializedRowLineageRange(parsed_entry, field_id))
             {
-                hyperrectangles.emplace(field_id, *range);
+                hyperrectangles[field_id].emplace_back(*range);
                 continue;
             }
 
-            hyperrectangles.emplace(field_id, DB::Range(UInt64(0), true, inherited_upper_bound, true));
+            hyperrectangles[field_id].emplace_back(UInt64(0), true, inherited_upper_bound, true);
         }
     }
 }
@@ -500,7 +502,7 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
     if (filter_dag)
     {
         /// Compute per-column hyperrectangles for DATA files
-        std::unordered_map<Int32, DB::Range> hyperrectangles;
+        std::unordered_map<Int32, std::vector<DB::Range>> hyperrectangles;
         if (parsed_entry->content_type == FileContentType::DATA)
         {
             for (const auto & [column_id, bounds] : parsed_entry->value_bounds)
@@ -525,6 +527,19 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
                     || type_id == DB::TypeIndex::Variant)
                     continue;
 
+                /// Optional Iceberg fields are `Nullable(DateTime64)`. The outer type is not `DateTime64`.
+                if (WhichDataType(removeNullable(name_and_type.type)).isDateTime64())
+                {
+                    const auto timestamp_ranges = deserializeDateTime64MinMaxRanges(left_str, right_str, name_and_type.type);
+                    if (timestamp_ranges.empty())
+                        continue;
+
+                    auto & ranges = hyperrectangles[column_id];
+                    for (const auto & timestamp_range : timestamp_ranges)
+                        ranges.emplace_back(timestamp_range.lower, true, timestamp_range.upper, true);
+                    continue;
+                }
+
                 auto left = deserializeFieldFromBinaryRepr(left_str, name_and_type.type, true);
                 auto right = deserializeFieldFromBinaryRepr(right_str, name_and_type.type, false);
                 if (!left || !right)
@@ -533,7 +548,7 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
                 if (DB::Range::less(*right, *left))
                     continue;
 
-                hyperrectangles.emplace(column_id, DB::Range(*left, true, *right, true));
+                hyperrectangles[column_id].emplace_back(*left, true, *right, true);
             }
 
             addRowLineageHyperrectangles(hyperrectangles, *entry);
