@@ -128,6 +128,18 @@ class Layout;
 bool serverRootSubtreeEmpty(
     CasOperation & op, const Layout & l, const String & srid, const RefCatalog & catalog_observation);
 
+/// The first part of a server root's subtree that is not empty, checked in this order.
+enum class ServerRootLeftover
+{
+    None,
+    CatalogRows,
+    Manifests,
+    RootsObjects,
+};
+
+ServerRootLeftover serverRootLeftover(
+    CasOperation & op, const Layout & l, const String & srid, const RefCatalog & catalog_observation);
+
 /// Supplied by the pool layer so the low-level server-root protocol always observes the mandatory
 /// catalog. Every absent-control retry obtains a fresh, successfully decoded observation.
 using ObserveRefCatalog = std::function<RefCatalog()>;
@@ -140,30 +152,37 @@ std::optional<UInt128> readOwnerUuid(CasOperation & op, const Layout & l, const 
 
 enum class RetiredOwnerPolicy : uint8_t
 {
-    Refuse,                  /// a server start or remount never resumes a tombstoned owner
+    Refuse,                  /// a remount, and every check after the owner claim, never accept a tombstoned owner
     AcceptForDecommission,   /// the decommission admin impersonates a retired victim to drain or rerun
+    RejoinIfVerified,        /// a server start takes over a verified, drained retirement as an empty member
 };
 
 /// Claim or validate the owner anchor that binds `srid` to a server uuid, and return the owner life.
 ///   - present, equal `our_uuid`, not tombstoned → the stored life;
+///   - present and tombstoned, under `RejoinIfVerified` (a server start), any non-zero uuid → rejoin as an
+///     empty member: the owner becomes `{our_uuid, owner_life + 1}` and that life is returned. Refused with
+///     `CORRUPTED_DATA` (zero uuid, `epoch` or `mount` missing, retirement not verified) or `ABORTED` (slot held,
+///     data of the old life left, owner or slot changing on every decision);
 ///   - present, equal `our_uuid`, tombstoned → `CORRUPTED_DATA` under `Refuse`; the stored life under
-///     `AcceptForDecommission` (the admin runs or reruns a decommission over its retired victim);
-///   - present, different uuid → `CORRUPTED_DATA` (foreign owner), tombstoned or not;
+///     `AcceptForDecommission`;
+///   - present, different uuid, outside a rejoin → `CORRUPTED_DATA` (foreign owner), tombstoned or not;
 ///   - absent, subtree provably empty → create `{our_uuid, owner_life = 1}` and return 1;
 ///   - absent, subtree non-empty → `CORRUPTED_DATA` (identity lost over data).
 /// The returned life is 0 for a body written before the field existed.
-/// The owner object is never deleted. A rejoin after a verified retirement is the one supported reassignment
-/// (not in this file yet); every other uuid change is a refusal.
+/// The owner object is never deleted; a rejoin is the one supported change of its uuid.
+/// `sink` receives one `MountClaim` event per rejoin write.
 uint64_t claimOwnerOrThrow(
     CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid,
-    const ObserveRefCatalog & observe_catalog, RetiredOwnerPolicy retired_policy = RetiredOwnerPolicy::Refuse);
+    const ObserveRefCatalog & observe_catalog, RetiredOwnerPolicy retired_policy = RetiredOwnerPolicy::Refuse,
+    const CasEventSink & sink = {});
 
 /// Why a self-remount can never resume under `(our_uuid, recorded_life)`: the owner belongs to another server, is
 /// retired, or is at another life. Empty when the owner allows it or is absent; the claim decides the absent case.
 /// A tombstone written by 26.6.4 drops `owner_life` and reads as life 0, so the retirement is checked on its own.
 String remountOwnerRefusal(CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid, uint64_t recorded_life);
 
-/// What a claimer requires of the owner once its body is in the slot and before it installs the renewer.
+/// What a claimer requires of the owner: after its body is in the slot and before it installs the renewer,
+/// and, for a foreign terminal body, before the reclaim write.
 struct OwnerExpectation
 {
     UInt128 server_uuid;
@@ -201,8 +220,8 @@ uint64_t allocateWriterEpoch(CasOperation & op, const Layout & l, const String &
                              const ObserveRefCatalog & observe_catalog);
 
 /// Which certificate of death, or the operator's explicit unsafe authorization, justified a
-/// same-uuid, older-epoch mount reclaim. `None` when no reclaim of that kind happened (a fresh
-/// claim, `LiveDoubleStart`, `ForeignOwner`, `FencedSelf`).
+/// older-epoch mount reclaim (`Fenced` and `Clean` also cover another uuid's terminal body). `None` when no
+/// reclaim of that kind happened (a fresh claim, `LiveDoubleStart`, `ForeignOwner`, `FencedSelf`).
 enum class MountPriorState
 {
     None,
@@ -241,7 +260,10 @@ enum class MountPriorState
 ///         now_ms` ALONE is never sufficient — comparing a predecessor's stamp against OUR wall clock
 ///         is unsafe because a clock-skewed or merely late-observing
 ///         caller must never conclude death from a bare timestamp read);
-///   - different `server_uuid` → `ForeignOwner` (do NOT write, regardless of expiry or prior state).
+///   - different `server_uuid` → `ForeignOwner`, no write, unless the body is terminal (`gc_fenced` or the
+///     clean marker), its `writer_epoch` is below `our_epoch`, and a fresh owner read matches
+///     `foreign_reclaim_owner`: then it is reclaimed like an older epoch of our own (`prior = Fenced` or
+///     `Clean`). A rejoin under a new uuid leaves such a body.
 struct MountClaimResult
 {
     /// Plain (unscoped) enum: callers compare with `MountClaimResult::Claimed` directly.
@@ -303,7 +325,8 @@ public:
 MountClaimResult claimMount(
     CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid, uint64_t our_epoch,
     uint64_t now_ms, uint64_t ttl_ms, const std::optional<Etag> & proven_dead_incarnation = {},
-    const CasEventSink & sink = {}, const std::optional<Etag> & unsafe_reclaim_authorization = {});
+    const CasEventSink & sink = {}, const std::optional<Etag> & unsafe_reclaim_authorization = {},
+    const std::optional<OwnerExpectation> & foreign_reclaim_owner = {});
 
 /// Format the operator-actionable startup error shown when the mount lease is held by a genuinely
 /// live second server (the same `server_root_id` is mounted twice). Produced only AFTER this server
@@ -316,6 +339,8 @@ String mountDoubleStartMessage(const String & srid, const std::optional<MountLea
 
 /// Observation-based mount claim for restart recovery.
 /// Wraps `claimMount` in a loop:
+///   - `foreign_reclaim_owner` is forwarded to `claimMount`, so `Claimed` can also come from another
+///     uuid's terminal body; any other foreign body is `ForeignOwner` at once, never observed;
 ///   - first attempt decided immediately for `Claimed` (fresh / reclaimed via `Fenced` or `Clean`),
 ///     `ForeignOwner`, `FencedSelf`, or a `LiveDoubleStart` on our own (uuid, epoch);
 ///   - a `LiveDoubleStart` from OUR OWN uuid with an older epoch (a stale lease from a prior incarnation of this server,
@@ -362,7 +387,8 @@ MountClaimResult claimMountAwaitingExpiry(
     uint64_t ttl_ms, uint64_t poll_interval_ms,
     const std::function<void(uint64_t)> & sleep_ms_fn,
     const std::function<void(const MountLease &, uint64_t)> & on_wait_start = {},
-    const CasEventSink & sink = {});
+    const CasEventSink & sink = {},
+    const std::optional<OwnerExpectation> & foreign_reclaim_owner = {});
 
 /// One `server_root_id`'s cross-round incarnation-stability observation,
 /// owned by the GC leader instance (`Cas::Gc::mount_obs`) and threaded through consecutive
@@ -468,16 +494,20 @@ std::vector<NonTerminalMountSlot> probeNonTerminalMountSlots(CasOperation & op, 
 /// A read-only snapshot of one server's mount slot, for introspection (`system.cas_mounts`).
 /// state: `live` (lease within TTL+skew), `expired` (lease ran out; the next GC round's heartbeat floor
 /// will fence it), `terminated` (clean farewell: `min_active_build_sequence == UINT64_MAX`), `fenced` (`gc_fenced`),
+/// `retired` (terminated or fenced, owner tombstoned; one more `GET` per terminated or fenced row),
 /// `corrupt` (body failed to decode — surfaced as a row, never an exception).
 struct MountInfo
 {
     String srid;
     MountLease lease;
     String state;
+    /// For a `retired` row: whether a decommission verified the retirement. A rerun is for an unverified one only.
+    bool retirement_verified = false;
 };
 
 /// Enumerate every mount slot under `gc/server-roots/`, decoded and classified — the read-only sibling
-/// of `computeHeartbeatFloor`: ZERO writes (no fence-out), per-row fail-open. One LIST + one GET per slot.
+/// of `computeHeartbeatFloor`: ZERO writes (no fence-out); an undecodable mount body, or an undecodable owner of a
+/// terminal row, is a `corrupt` row. One LIST, one GET per slot, and one more per terminated or fenced slot.
 std::vector<MountInfo> listMounts(CasOperation & op, const Layout & layout, uint64_t now_ms, uint64_t skew_margin_ms);
 
 /// Whether the mounted writer identified by `(server_root_id, writer_epoch)` (the two fields of a

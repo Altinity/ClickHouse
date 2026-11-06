@@ -650,16 +650,21 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     /// can reach a slot mutation; the callback remains available for fresh conflict rechecks below.
     (void)observe_catalog();
 
-    /// 2. Owner anchor — IDENTITY (clock-free). A foreign uuid fails closed; an absent owner over a
-    ///    non-empty subtree is CORRUPTED_DATA; a fresh empty root is claimed.
+    /// 2. Owner anchor — IDENTITY (clock-free). A foreign uuid fails closed unless it is a verified, drained
+    ///    retirement (rejoin); an absent owner over a non-empty subtree is CORRUPTED_DATA; a fresh empty root
+    ///    is claimed.
     /// Every step of this protocol runs on the OPEN plane. These are bootstrap-control writes: they
     /// establish the very right to write, and the mount fence they would otherwise be gated on is
     /// either unarmed (a first open) or latched lost (a self-remount, which could then never reclaim).
-    const RetiredOwnerPolicy retired_policy = policy == MountClaimPolicy::NoWait
-        ? RetiredOwnerPolicy::AcceptForDecommission
-        : RetiredOwnerPolicy::Refuse;
+    const bool is_decommission = policy == MountClaimPolicy::NoWait;
+    const RetiredOwnerPolicy claim_retired_policy
+        = is_decommission ? RetiredOwnerPolicy::AcceptForDecommission : RetiredOwnerPolicy::RejoinIfVerified;
+    const RetiredOwnerPolicy recheck_retired_policy
+        = is_decommission ? RetiredOwnerPolicy::AcceptForDecommission : RetiredOwnerPolicy::Refuse;
     CasOperation owner_op = store->gc_requests.admit();
-    const uint64_t owner_life = claimOwnerOrThrow(owner_op, store->pool_layout, srid, our_uuid, observe_catalog, retired_policy);
+    const uint64_t owner_life = claimOwnerOrThrow(
+        owner_op, store->pool_layout, srid, our_uuid, observe_catalog, claim_retired_policy,
+        [s = store.get()](CasEvent e) { s->emitEvent(std::move(e)); });
     store->recorded_owner_life = owner_life;
 
     const auto now_ms = []() -> uint64_t
@@ -748,6 +753,8 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
         if (policy == MountClaimPolicy::WaitForExpiry)
         {
             CasOperation claim_op = store->gc_requests.admit();
+            const OwnerExpectation foreign_reclaim_owner{
+                .server_uuid = our_uuid, .owner_life = owner_life, .retired = RetiredOwnerPolicy::Refuse};
             const bool unsafe = store->config.unsafe_remount_no_delay;
             if (unsafe)
             {
@@ -757,11 +764,11 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
                 /// freshly minted) falls through to the ordinary observed path
                 /// below.
                 claim = claimMount(claim_op, store->pool_layout, srid, our_uuid, writer_epoch, now_ms(), ttl_ms,
-                                   /*proven_dead_incarnation=*/{}, emit_mount_event);
+                                   /*proven_dead_incarnation=*/{}, emit_mount_event, /*unsafe_reclaim_authorization=*/{}, foreign_reclaim_owner);
                 if (claim.kind == MountClaimResult::LiveDoubleStart && claim.etag
                     && claim.body && claim.body->server_uuid == our_uuid)
                     claim = claimMount(claim_op, store->pool_layout, srid, our_uuid, writer_epoch, now_ms(), ttl_ms,
-                                       {}, emit_mount_event, /*unsafe_reclaim_authorization=*/claim.etag);
+                                       {}, emit_mount_event, /*unsafe_reclaim_authorization=*/claim.etag, foreign_reclaim_owner);
             }
             /// A `FencedSelf`, a foreign-uuid `LiveDoubleStart`/`ForeignOwner`, or a raced
             /// `LiveDoubleStart` the authorization above did not cover falls through here and re-runs
@@ -773,13 +780,15 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
                 claim = claimMountAwaitingExpiry(
                     claim_op, store->pool_layout, srid, our_uuid, writer_epoch,
                     [&now_ms]() { return now_ms(); }, [raw] { return raw->bootMsNow(); },
-                    ttl_ms, poll_interval_ms, sleep_ms, on_wait_start, emit_mount_event);
+                    ttl_ms, poll_interval_ms, sleep_ms, on_wait_start, emit_mount_event, foreign_reclaim_owner);
         }
         else
         {
             /// NoWait (decommission gate): a single unobserved attempt -- no bounded wait-and-retry
             /// for a stale-looking lease to lapse. Anything but Claimed/FencedSelf below is refused
             /// immediately.
+            /// No owner expectation: the admin impersonates the owner it retires, so whose life counts as
+            /// "ours" is ambiguous, and it never reclaims another uuid's body.
             CasOperation claim_op = store->gc_requests.admit();
             claim = claimMount(claim_op, store->pool_layout, srid, our_uuid, writer_epoch,
                 now_ms(), ttl_ms, /*proven_dead_incarnation=*/{}, emit_mount_event);
@@ -835,7 +844,7 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
         /// below runs under an owner this process did not start under.
         CasOperation recheck_op = store->gc_requests.admit();
         recheckOwnerAfterClaim(recheck_op, store->pool_layout, srid,
-            OwnerExpectation{.server_uuid = our_uuid, .owner_life = owner_life, .retired = retired_policy},
+            OwnerExpectation{.server_uuid = our_uuid, .owner_life = owner_life, .retired = recheck_retired_policy},
             writer_epoch, emit_mount_event);
 
         /// The mount object now holds OUR live (uuid, epoch) body. `installRenewer` constructs the renewer
@@ -1560,12 +1569,13 @@ bool Pool::tryRemountOnce()
                     "epoch={} expires_at_ms={}) for up to ~{} ms before reclaiming",
                     srid, u128ToHex(held.server_uuid), held.writer_epoch, held.expires_at_ms, threshold_ms);
             },
-            emit_mount_event);
+            emit_mount_event,
+            OwnerExpectation{.server_uuid = our_uuid, .owner_life = recorded_owner_life, .retired = RetiredOwnerPolicy::Refuse});
         if (claim.kind != MountClaimResult::Claimed)
         {
             LOG_WARNING(getLogger("CasPool"),
                 "CAS self-remount '{}': mount not claimable ({}); will retry", srid,
-                claim.kind == MountClaimResult::ForeignOwner ? "foreign owner — never taking over"
+                claim.kind == MountClaimResult::ForeignOwner ? "foreign live body, or the owner did not match — not taking over"
                                                              : "a live twin holds the lease");
             return false;
         }

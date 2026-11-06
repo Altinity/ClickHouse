@@ -12,6 +12,7 @@
 #include <base/arithmeticOverflow.h>
 #include <base/getFQDNOrHostName.h>
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 #include <magic_enum.hpp>
 
 #include <algorithm>
@@ -441,9 +442,17 @@ void throwIfOwnerRetired(const OwnerObject & owner, const String & srid, const S
 {
     if (!owner.retired_at_ms)
         return;
+
+    if (owner.retirement_verified)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS server-root '{}' was decommissioned (owner tombstoned at {} ms, life {}); this process cannot run "
+            "under the retired owner. Restart the server: a server start rejoins a finished decommission as an "
+            "empty member",
+            srid, *owner.retired_at_ms, owner.owner_life);
     throw Exception(ErrorCodes::CORRUPTED_DATA,
-        "CAS server-root '{}' was decommissioned (owner object '{}' retired at {} ms, owner life {}); refusing to "
-        "resume. To bring it back, see the CAS troubleshooting docs: a decommissioned member refuses to start",
+        "CAS server-root '{}' was decommissioned (owner object '{}' retired at {} ms, owner life {}) and the "
+        "decommission is not finished: its retirement is not verified. Finish it with SYSTEM CAS DROP POOL MEMBER under "
+        "the rerun rule of the CAS docs (bringing a member back), then restart this server",
         srid, owner_key, *owner.retired_at_ms, owner.owner_life);
 }
 }
@@ -493,21 +502,27 @@ void deliverDeferredMountRenewObservability(uint64_t remount_attempt_no) noexcep
     deliverMountRenewObservability(completed, remount_attempt_no);
 }
 
-bool serverRootSubtreeEmpty(
+ServerRootLeftover serverRootLeftover(
     CasOperation & op, const Layout & l, const String & srid, const RefCatalog & catalog_observation)
 {
     const String owned_prefix = srid + "/";
     for (const CatalogEntry & entry : catalog_observation.entries)
         if (entry.ns.string() == srid || entry.ns.string().starts_with(owned_prefix))
-            return false;
+            return ServerRootLeftover::CatalogRows;
 
     /// Manifests and loose roots retain logical path identity. Opaque namespace stream/state debris
     /// alone is not evidence that this server root owns live work.
     if (prefixHasAnyKey(op, l.casManifestsServerPrefix(srid)))
-        return false;
+        return ServerRootLeftover::Manifests;
     if (prefixHasAnyKey(op, l.serverRootDataPrefix(srid)))
-        return false;
-    return true;
+        return ServerRootLeftover::RootsObjects;
+    return ServerRootLeftover::None;
+}
+
+bool serverRootSubtreeEmpty(
+    CasOperation & op, const Layout & l, const String & srid, const RefCatalog & catalog_observation)
+{
+    return serverRootLeftover(op, l, srid, catalog_observation) == ServerRootLeftover::None;
 }
 
 std::optional<UInt128> readOwnerUuid(CasOperation & op, const Layout & l, const String & server_root_id)
@@ -516,6 +531,159 @@ std::optional<UInt128> readOwnerUuid(CasOperation & op, const Layout & l, const 
     if (!owner)
         return std::nullopt;
     return owner->server_uuid;
+}
+
+namespace
+{
+/// Every holder-originated mount body gets a random durable identity. UUIDv4 cannot be zero, but
+/// keep the postcondition explicit because zero is reserved as an uninitialized in-memory value.
+UInt128 newMountWriteAttemptId()
+{
+    const UInt128 id = UUIDHelpers::generateV4().toUnderType();
+    chassert(id != UInt128{});
+    return id;
+}
+
+/// The key `IDisk::checkAccess` writes under the disk root, `clickhouse_access_check_<server uuid>`.
+String accessProbeKey(const Layout & l, const String & srid, UInt128 server_uuid)
+{
+    const String hex = u128ToHex(server_uuid);
+    return fmt::format("{}clickhouse_access_check_{}-{}-{}-{}-{}", l.serverRootDataPrefix(srid),
+        hex.substr(0, 8), hex.substr(8, 4), hex.substr(12, 4), hex.substr(16, 4), hex.substr(20));
+}
+
+/// One `MountClaim` event per rejoin write, so the audit trail shows who took the slot and the owner. Delivery
+/// failures are contained: they cannot change the rejoin decision.
+void emitRejoinEvent(const CasEventSink & sink, const String & srid, std::string_view branch, std::string_view reason,
+                     const OwnerObject & retired, UInt128 our_uuid, uint64_t new_life) noexcept
+{
+    try
+    {
+        if (!sink)
+            return;
+        CasEvent e;
+        e.type = CasEventType::MountClaim;
+        e.object_kind = CasEventObjectKind::None;
+        e.outcome = String{branch};
+        e.reason = String{reason};
+        e.detail = {{"server_root_id", srid}, {"branch", String{branch}},
+                    {"retired_uuid", u128ToHex(retired.server_uuid)}, {"retired_life", std::to_string(retired.owner_life)},
+                    {"server_uuid", u128ToHex(our_uuid)}, {"owner_life", std::to_string(new_life)}};
+        sink(std::move(e));
+    }
+    catch (...)   // NOLINT(bugprone-empty-catch)
+    {
+    }
+}
+
+/// The first catalog rows of the retired id's previous life, as `namespace (state)`, for the refusal text.
+String leftoverCatalogRows(const RefCatalog & catalog, const String & srid)
+{
+    constexpr size_t max_named = 5;
+    const String owned_prefix = srid + "/";
+    std::vector<String> named;
+    size_t total = 0;
+    for (const CatalogEntry & entry : catalog.entries)
+    {
+        if (entry.ns.string() != srid && !entry.ns.string().starts_with(owned_prefix))
+            continue;
+        if (++total <= max_named)
+            named.push_back(fmt::format("{} ({})", entry.ns.string(), nsStateToWord(entry.state)));
+    }
+    String text = fmt::format("{}", fmt::join(named, ", "));
+    if (total > max_named)
+        text += fmt::format(" and {} more", total - max_named);
+    return text;
+}
+
+/// Take over the retired `owner` as `our_uuid` at its next life. nullopt: an `If-Match` lost to another
+/// write, and the caller decides again from a fresh owner read.
+std::optional<uint64_t> rejoinRetiredOwner(
+    CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid, const OwnerObject & owner,
+    const Etag & owner_etag, const ObserveRefCatalog & observe_catalog, const CasEventSink & sink)
+{
+    /// Checked before the retirement, so an id retired by 26.6.4 (no `epoch`, no `mount`) is never sent to a
+    /// rerun, which would refuse the absent counter.
+    const std::optional<Object> mount = op.read(l.mountKey(srid), Retry::standard());
+    if (!mount || !op.head(l.epochKey(srid), Retry::standard()))
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS server-root '{}' is retired but its {} object is missing: it was retired by an older version or the "
+            "object was deleted by hand, so it cannot rejoin. Configure a new <cas_server_root_id> for this disk",
+            srid, mount ? "epoch" : "mount");
+    /// A rerun of an unfinished decommission drains whoever owns the id when it starts.
+    if (!owner.retirement_verified)
+        throwIfOwnerRetired(owner, srid, l.ownerKey(srid));
+    const MountLease slot = decodeMountLease(mount->bytes);
+    if (!slot.gc_fenced && !slot.isCleanRelease())
+        throw Exception(ErrorCodes::ABORTED,
+            "CAS server-root '{}' is retired and its mount slot is held (server_uuid={}, writer_epoch={}): a "
+            "decommission run is still running, or its lease has not yet lapsed and been fenced by GC. Restart this "
+            "server later", srid, u128ToHex(slot.server_uuid), slot.writer_epoch);
+
+    /// A late `IDisk::checkAccess` of the old life can land after the drain; nothing else of it may remain.
+    const String probe = accessProbeKey(l, srid, owner.server_uuid);
+    if (const std::optional<Meta> probe_meta = op.head(probe, Retry::standard()))
+        /// A lost `If-Match` leaves the probe in place, and the leftover check below refuses on it.
+        (void)op.remove(probe, probe_meta->etag, Retry::standard());
+    const RefCatalog catalog = observe_catalog();
+    switch (serverRootLeftover(op, l, srid, catalog))
+    {
+        case ServerRootLeftover::None:
+            break;
+        case ServerRootLeftover::CatalogRows:
+            throw Exception(ErrorCodes::ABORTED,
+                "CAS server-root '{}' is retired but data of its previous life remains: catalog rows of the old life are not "
+                "yet removed by GC: {}. Run SYSTEM CAS GC RUN '<disk>' on the GC leader (is_leader = 1 in system.cas_mounts; "
+                "it can take several rounds) and restart this server. A row that stays `removing` for many rounds is held "
+                "by GC: the leader counts it in CASGCStuckRemovals and logs a stuck-removal warning naming the reason",
+                srid, leftoverCatalogRows(catalog, srid));
+        case ServerRootLeftover::Manifests:
+            throw Exception(ErrorCodes::ABORTED,
+                "CAS server-root '{}' is retired but data of its previous life remains: manifests under cas/manifests/{}/ are "
+                "not yet removed by GC. Run SYSTEM CAS GC RUN '<disk>' on the GC leader (is_leader = 1 in system.cas_mounts; "
+                "it can take several rounds) and restart this server", srid, srid);
+        case ServerRootLeftover::RootsObjects:
+            throw Exception(ErrorCodes::ABORTED,
+                "CAS server-root '{}' is retired but data of its previous life remains: an object under roots/{}/ appeared "
+                "after the drain. Delete it by hand and restart this server", srid, srid);
+    }
+
+    /// A uuid other than the retired owner's replaces the terminal body before the owner write, so a 26.6.4
+    /// starter of that owner's uuid loses its `If-Match` and has no claim recheck to fall back on. The owner's
+    /// own uuid writes nothing here: if its owner write then lost, its body would sit under another owner,
+    /// where such a starter could reclaim it.
+    if (our_uuid != owner.server_uuid)
+    {
+        MountLease ours = slot;
+        ours.server_uuid = our_uuid;
+        ours.hostname = getFQDNOrHostName();
+        ours.pid = static_cast<uint64_t>(::getpid());
+        ours.write_attempt_id = newMountWriteAttemptId();
+        ours.gc_fenced = false;
+        ours.min_active_build_sequence = std::numeric_limits<uint64_t>::max();
+        ours.seq += 1;
+        if (conflictOrThrow(
+                op.replace(l.mountKey(srid), encodeMountLease(ours), mount->etag, Retry::standard()),
+                fmt::format("CAS server-root '{}' rejoin mount write", srid)))
+            return std::nullopt;
+        emitRejoinEvent(sink, srid, "rejoin_mount_rewrite", "a rejoin under a new server uuid rewrote the retired terminal body",
+                        owner, our_uuid, owner.owner_life + 1);
+    }
+
+    const uint64_t life = owner.owner_life + 1;
+    if (conflictOrThrow(
+            op.replace(
+                l.ownerKey(srid),
+                encodeOwner(OwnerObject{.server_uuid = our_uuid, .retired_at_ms = std::nullopt, .owner_life = life}),
+                owner_etag, Retry::standard()),
+            fmt::format("CAS server-root '{}' rejoin owner write", srid)))
+        return std::nullopt;
+    emitRejoinEvent(sink, srid, "rejoin_owner", "a server start took over the retired owner at its next life", owner, our_uuid, life);
+    LOG_WARNING(getLogger("CasMountLease"),
+        "CAS server-root '{}': rejoined as an empty member under server_uuid {} at owner life {} (retired life {} of {})",
+        srid, u128ToHex(our_uuid), life, owner.owner_life, u128ToHex(owner.server_uuid));
+    return life;
+}
 }
 
 String remountOwnerRefusal(CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid, uint64_t recorded_life)
@@ -543,21 +711,45 @@ String remountOwnerRefusal(CasOperation & op, const Layout & l, const String & s
 
 uint64_t claimOwnerOrThrow(
     CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid,
-    const ObserveRefCatalog & observe_catalog, RetiredOwnerPolicy retired_policy)
+    const ObserveRefCatalog & observe_catalog, RetiredOwnerPolicy retired_policy, const CasEventSink & sink)
 {
     if (!observe_catalog)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS server-root '{}': catalog observer is required", srid);
     const String key = l.ownerKey(srid);
 
-    /// Owner present → it is identity: equal UUID is ok, a different UUID fails closed regardless
-    /// of any lease/clock state.
-    if (const std::optional<OwnerObject> owner = readOwnerObject(op, l, srid))
+    /// A lost rejoin write decides again from a fresh read; an owner or slot that changes on every decision fails
+    /// the start instead of spinning.
+    constexpr size_t max_owner_decisions = 4;
+    const bool may_rejoin = retired_policy == RetiredOwnerPolicy::RejoinIfVerified;
+    for (size_t decision = 1;; ++decision)
     {
-        if (owner->server_uuid == our_uuid)
+        const std::optional<Object> current = op.read(key, Retry::standard());
+        if (!current)
+            break;
+        const OwnerObject owner = decodeOwner(current->bytes);
+        if (owner.retired_at_ms && may_rejoin)
         {
-            if (retired_policy == RetiredOwnerPolicy::Refuse)
-                throwIfOwnerRetired(*owner, srid, key);
-            return owner->owner_life;
+            if (our_uuid == UInt128{})
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS server-root '{}' is retired (owner tombstoned at {} ms, life {}) and this process has no "
+                    "server uuid, so it does not rejoin it. Only a server start with a server uuid rejoins a retired "
+                    "id: start the server that should own it, or configure a new <cas_server_root_id> for this disk",
+                    srid, *owner.retired_at_ms, owner.owner_life);
+            if (const std::optional<uint64_t> life = rejoinRetiredOwner(op, l, srid, our_uuid, owner, current->etag, observe_catalog, sink))
+                return *life;
+            if (decision == max_owner_decisions)
+                throw Exception(ErrorCodes::ABORTED,
+                    "CAS server-root '{}': the owner or the mount slot kept changing during {} rejoin attempts; "
+                    "restart to try again", srid, max_owner_decisions);
+            continue;
+        }
+        /// Owner present → it is identity: equal UUID is ok, a different UUID fails closed regardless
+        /// of any lease/clock state.
+        if (owner.server_uuid == our_uuid)
+        {
+            if (retired_policy != RetiredOwnerPolicy::AcceptForDecommission)
+                throwIfOwnerRetired(owner, srid, key);
+            return owner.owner_life;
         }
         /// The common cause is a regenerated local uuid file (wiped /var/lib/clickhouse, a pod recreated
         /// without a persistent volume) while the pool kept the old identity; name it and the supported
@@ -573,7 +765,7 @@ uint64_t claimOwnerOrThrow(
             "'terminated' or 'fenced'. "
             "Deleting the owner object '{}' by hand is a last resort, only after verifying that NO server uses this "
             "root; it is refused while the subtree still holds data.",
-            srid, u128ToHex(owner->server_uuid), u128ToHex(our_uuid), srid, key);
+            srid, u128ToHex(owner.server_uuid), u128ToHex(our_uuid), srid, key);
     }
 
     /// Owner absent. Claiming is allowed ONLY over a provably-empty subtree; an absent owner over
@@ -581,7 +773,8 @@ uint64_t claimOwnerOrThrow(
     if (!serverRootSubtreeEmpty(op, l, srid, observe_catalog()))
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS server-root '{}' has no owner anchor but its data subtree is non-empty "
-            "(identity lost over existing data) — refusing to re-claim",
+            "(identity lost over existing data) — refusing to re-claim. Restoring the local uuid file does not help, "
+            "since no owner records a uuid to match. Configure a new <cas_server_root_id> for this disk",
             srid);
 
     const std::optional<Observation> occupant = conflictOrThrow(
@@ -610,7 +803,7 @@ uint64_t claimOwnerOrThrow(
             "CAS server-root '{}' owner anchor vanished during claim", srid);
     if (reread->server_uuid == our_uuid)
     {
-        if (retired_policy == RetiredOwnerPolicy::Refuse)
+        if (retired_policy != RetiredOwnerPolicy::AcceptForDecommission)
             throwIfOwnerRetired(*reread, srid, key);
         return reread->owner_life;
     }
@@ -707,15 +900,6 @@ uint64_t allocateWriterEpoch(
 
 namespace
 {
-/// Every holder-originated mount body gets a random durable identity. UUIDv4 cannot be zero, but
-/// keep the postcondition explicit because zero is reserved as an uninitialized in-memory value.
-UInt128 newMountWriteAttemptId()
-{
-    const UInt128 id = UUIDHelpers::generateV4().toUnderType();
-    chassert(id != UInt128{});
-    return id;
-}
-
 /// Build a fresh mount-lease body for (uuid, epoch) with the given seq, stamped from `now_ms`.
 MountLease makeMountBody(UInt128 uuid, uint64_t epoch, uint64_t seq, uint64_t now_ms, uint64_t ttl_ms)
 {
@@ -780,12 +964,35 @@ void emitMountEvent(const CasEventSink & sink, CasEventType type, const String &
         /// allocate or recurse through the same diagnostic machinery at a protocol-critical site.
     }
 }
+
+/// Why `owner` is not the one `expected` names; nullopt when it is.
+std::optional<String> ownerRefusal(const std::optional<OwnerObject> & owner, const String & srid, const OwnerExpectation & expected)
+{
+    if (!owner)
+        return fmt::format("CAS server-root '{}': the owner anchor vanished after the mount claim", srid);
+    if (owner->server_uuid != expected.server_uuid)
+        return fmt::format(
+            "CAS server-root '{}' is owned by a different server since this claim began (owner server_uuid={}, "
+            "ours={}); the mount slot was handed to another server and this claim is withdrawn",
+            srid, u128ToHex(owner->server_uuid), u128ToHex(expected.server_uuid));
+    if (owner->retired_at_ms && expected.retired != RetiredOwnerPolicy::AcceptForDecommission)
+        return fmt::format(
+            "CAS server-root '{}' was decommissioned (tombstoned at {} ms) while this claim was in progress; "
+            "refusing to run under a retired owner", srid, *owner->retired_at_ms);
+    if (owner->owner_life != expected.owner_life)
+        return fmt::format(
+            "CAS server-root '{}': the owner moved from life {} to life {} since this process started (a "
+            "retirement, a rollback or a rejoin happened in between); restart to continue under the current life",
+            srid, expected.owner_life, owner->owner_life);
+    return std::nullopt;
+}
 }
 
 MountClaimResult claimMount(
     CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid, uint64_t our_epoch,
     uint64_t now_ms, uint64_t ttl_ms, const std::optional<Etag> & proven_dead_incarnation,
-    const CasEventSink & sink, const std::optional<Etag> & unsafe_reclaim_authorization)
+    const CasEventSink & sink, const std::optional<Etag> & unsafe_reclaim_authorization,
+    const std::optional<OwnerExpectation> & foreign_reclaim_owner)
 {
     const String key = l.mountKey(srid);
     const auto got = op.read(key, Retry::standard());
@@ -806,13 +1013,21 @@ MountClaimResult claimMount(
 
     const MountLease existing = decodeMountLease(got->bytes);
 
-    /// Foreign owner → fail closed regardless of expiry. (This runs after the owner gate, so a foreign
-    /// mount should not normally exist, but the lease must never be taken across UUIDs.)
+    const bool clean_marker = existing.isCleanRelease();
+
+    /// A live body of another uuid is never taken. A terminal one below our epoch is what a rejoin under a new
+    /// uuid finds; it is reclaimed only once the owner reads as this claimer's own life. The owner is read before
+    /// the write, not only rechecked after it, so a reclaim never lands under somebody else's owner.
     if (existing.server_uuid != our_uuid)
     {
-        emitMountEvent(sink, CasEventType::MountConflict, srid, "foreign_owner", &existing,
-            "mount slot is held by a foreign server_uuid — refusing to take over across identities");
-        return {.kind = MountClaimResult::ForeignOwner, .body = existing, .etag = std::nullopt};
+        const bool reclaimable = (existing.gc_fenced || clean_marker) && existing.writer_epoch < our_epoch
+            && foreign_reclaim_owner && !ownerRefusal(readOwnerObject(op, l, srid), srid, *foreign_reclaim_owner);
+        if (!reclaimable)
+        {
+            emitMountEvent(sink, CasEventType::MountConflict, srid, "foreign_owner", &existing,
+                "mount slot is held by a foreign server_uuid — refusing to take over across identities");
+            return {.kind = MountClaimResult::ForeignOwner, .body = existing, .etag = std::nullopt};
+        }
     }
 
     /// An older allocation that reached the slot late must not replace a newer incarnation of this
@@ -866,7 +1081,6 @@ MountClaimResult claimMount(
     /// clean-marked, not (yet) proven-dead, not unsafe-authorized lease may simply be a live twin, and
     /// `expires_at_ms` alone can never distinguish that from a dead predecessor across two different
     /// clocks.
-    const bool clean_marker = existing.isCleanRelease();
     const bool proven_dead = proven_dead_incarnation && *proven_dead_incarnation == got->etag;
     const bool unsafe_authorized = unsafe_reclaim_authorization && *unsafe_reclaim_authorization == got->etag;
     if (existing.gc_fenced || clean_marker || proven_dead || unsafe_authorized)
@@ -884,7 +1098,8 @@ MountClaimResult claimMount(
                                      : proven_dead        ? MountPriorState::UncleanObserved
                                                            : MountPriorState::UncleanUnsafe;
         emitMountEvent(sink, CasEventType::MountClaim, srid, "reclaim", &existing,
-            existing.gc_fenced ? "same server_uuid, different writer_epoch, GC-fenced — reclaimed"
+            existing.server_uuid != our_uuid ? "terminal body of another server_uuid, the owner is ours — reclaimed"
+            : existing.gc_fenced ? "same server_uuid, different writer_epoch, GC-fenced — reclaimed"
             : clean_marker     ? "same server_uuid, different writer_epoch, clean farewell — reclaimed"
             : proven_dead      ? "same server_uuid, different writer_epoch, observed dead by "
                                  "token-stability observation — reclaimed"
@@ -935,25 +1150,8 @@ void recheckOwnerAfterClaim(
     CasOperation & op, const Layout & l, const String & srid, const OwnerExpectation & expected,
     uint64_t our_epoch, const CasEventSink & sink)
 {
-    const std::optional<OwnerObject> owner = readOwnerObject(op, l, srid);
-    String refusal;
-    if (!owner)
-        refusal = fmt::format("CAS server-root '{}': the owner anchor vanished after the mount claim", srid);
-    else if (owner->server_uuid != expected.server_uuid)
-        refusal = fmt::format(
-            "CAS server-root '{}' is owned by a different server since this claim began (owner server_uuid={}, "
-            "ours={}); the mount slot was handed to another server and this claim is withdrawn",
-            srid, u128ToHex(owner->server_uuid), u128ToHex(expected.server_uuid));
-    else if (owner->retired_at_ms && expected.retired == RetiredOwnerPolicy::Refuse)
-        refusal = fmt::format(
-            "CAS server-root '{}' was decommissioned (tombstoned at {} ms) while this claim was in progress; "
-            "refusing to run under a retired owner", srid, *owner->retired_at_ms);
-    else if (owner->owner_life != expected.owner_life)
-        refusal = fmt::format(
-            "CAS server-root '{}': the owner moved from life {} to life {} since this process started (a "
-            "retirement, a rollback or a rejoin happened in between); restart to continue under the current life",
-            srid, expected.owner_life, owner->owner_life);
-    if (refusal.empty())
+    const std::optional<String> refusal = ownerRefusal(readOwnerObject(op, l, srid), srid, expected);
+    if (!refusal)
         return;
 
     /// The fence only spares a successor the lease wait; its failure must not replace the owner's reason.
@@ -966,7 +1164,7 @@ void recheckOwnerAfterClaim(
         tryLogCurrentException(getLogger("CasMountLease"),
             fmt::format("CAS server-root '{}': the refused claim's mount body could not be fenced", srid));
     }
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "{}", refusal);
+    throw Exception(ErrorCodes::CORRUPTED_DATA, "{}", *refusal);
 }
 
 String mountDoubleStartMessage(const String & srid, const std::optional<MountLease> & existing)
@@ -1025,7 +1223,8 @@ MountClaimResult claimMountAwaitingExpiry(
     uint64_t ttl_ms, uint64_t poll_interval_ms,
     const std::function<void(uint64_t)> & sleep_ms_fn,
     const std::function<void(const MountLease &, uint64_t)> & on_wait_start,
-    const CasEventSink & sink)
+    const CasEventSink & sink,
+    const std::optional<OwnerExpectation> & foreign_reclaim_owner)
 {
     /// A zero poll interval would spin; a single-ms floor keeps the loop a real (bounded) wait.
     const uint64_t poll = poll_interval_ms == 0 ? 1 : poll_interval_ms;
@@ -1042,7 +1241,7 @@ MountClaimResult claimMountAwaitingExpiry(
     {
         const bool threshold_met = observed && mono_ms_fn() - observed_since >= threshold_ms;
         MountClaimResult r = claimMount(op, l, srid, our_uuid, our_epoch, now_ms_fn(), ttl_ms,
-            threshold_met ? observed : std::nullopt, sink, /*unsafe_reclaim_authorization=*/{});
+            threshold_met ? observed : std::nullopt, sink, /*unsafe_reclaim_authorization=*/{}, foreign_reclaim_owner);
         if (r.kind != MountClaimResult::LiveDoubleStart)
             return r;
         /// Observation certifies only an older epoch dead; a body of our own pair is never replaced,
@@ -1051,7 +1250,7 @@ MountClaimResult claimMountAwaitingExpiry(
             return r;
         /// A raced write observed a newer epoch of ours; the re-read refuses it with the newer-epoch error.
         if (r.body && r.body->server_uuid == our_uuid && r.body->writer_epoch > our_epoch)
-            return claimMount(op, l, srid, our_uuid, our_epoch, now_ms_fn(), ttl_ms, std::nullopt, sink, {});
+            return claimMount(op, l, srid, our_uuid, our_epoch, now_ms_fn(), ttl_ms, std::nullopt, sink, {}, foreign_reclaim_owner);
 
         /// `claimMount` already read the current body, and a raced write reports whatever its own
         /// resolve read observed. Reuse `r.etag` whenever it is set instead of re-reading the SAME key
@@ -1317,6 +1516,27 @@ std::vector<MountInfo> listMounts(CasOperation & op, const Layout & layout, uint
             info.state = "live";
         else
             info.state = "expired";
+        /// A decommission keeps the slot; the owner says whether the member behind a terminal row is retired, and
+        /// whether that retirement is verified: a rerun is for an unverified one only.
+        if (info.state == "terminated" || info.state == "fenced")
+        {
+            if (const auto owner_got = op.read(layout.ownerKey(info.srid), Retry::standard()))
+            {
+                try
+                {
+                    const OwnerObject owner = decodeOwner(owner_got->bytes);
+                    if (owner.retired_at_ms)
+                    {
+                        info.state = "retired";
+                        info.retirement_verified = owner.retirement_verified;
+                    }
+                }
+                catch (...)
+                {
+                    info.state = "corrupt";
+                }
+            }
+        }
         out.push_back(std::move(info));
         return true;
     }, Retry::standard());

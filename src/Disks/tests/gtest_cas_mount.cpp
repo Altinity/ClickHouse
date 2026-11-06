@@ -693,8 +693,8 @@ TEST(CASServerRootClaim, DecommissionPolicyAcceptsARetiredOwnerOfTheSameUuid)
     });
     EXPECT_EQ(claimOwnerOrThrow(ops.op, l, "r", UInt128(1), emptyCatalogObservation(),
                                 RetiredOwnerPolicy::AcceptForDecommission), 2u);
-    /// A retired owner of ANOTHER uuid is still foreign under either policy.
-    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "owned by a different server", [&]
+    /// A retired owner of ANOTHER uuid is still foreign under either policy; the refusal also names a duplicate id.
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "same <cas_server_root_id>", [&]
     {
         claimOwnerOrThrow(ops.op, l, "r", UInt128(2), emptyCatalogObservation(), RetiredOwnerPolicy::AcceptForDecommission);
     });
@@ -704,9 +704,10 @@ TEST(CASServerRootClaim, DecommissionPolicyAcceptsARetiredOwnerOfTheSameUuid)
 /// policy as the first read.
 TEST(CASServerRootClaim, ConflictRereadAppliesTheRetiredPolicy)
 {
-    for (const RetiredOwnerPolicy policy : {RetiredOwnerPolicy::Refuse, RetiredOwnerPolicy::AcceptForDecommission})
+    for (const RetiredOwnerPolicy policy :
+         {RetiredOwnerPolicy::Refuse, RetiredOwnerPolicy::AcceptForDecommission, RetiredOwnerPolicy::RejoinIfVerified})
     {
-        SCOPED_TRACE(policy == RetiredOwnerPolicy::Refuse ? "Refuse" : "AcceptForDecommission");
+        SCOPED_TRACE(static_cast<int>(policy));
         auto b = std::make_shared<InMemoryBackend>();
         Layout l("p");
         Ops ops(b);
@@ -720,9 +721,9 @@ TEST(CASServerRootClaim, ConflictRereadAppliesTheRetiredPolicy)
                 .server_uuid = UInt128(1), .retired_at_ms = 1752537600000ULL, .owner_life = 2}), Retry::standard()),
                 "racing tombstone");
         });
-        if (policy == RetiredOwnerPolicy::Refuse)
+        if (policy != RetiredOwnerPolicy::AcceptForDecommission)
         {
-            DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "decommissioned", [&]
+            DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "decommission is not finished", [&]
             {
                 claimOwnerOrThrow(ops.op, l, "r", UInt128(1), emptyCatalogObservation(), policy);
             });
@@ -735,33 +736,27 @@ TEST(CASServerRootClaim, ConflictRereadAppliesTheRetiredPolicy)
     }
 }
 
-/// GUARD: a server start over a tombstoned owner is refused in this PR whether or not the retirement is
-/// verified, and writes neither the counter nor the slot. (A later PR lets a verified, drained retirement
-/// rejoin; the unverified arm stays.)
-TEST(CASMount, PoolOpenNeverAcceptsARetiredOwner)
+/// A start over an unverified tombstone is refused and writes neither the counter nor the slot.
+TEST(CASMount, PoolOpenRefusesAnUnverifiedRetirement)
 {
-    for (const bool verified : {false, true})
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    { auto first = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r"}); }
+    Ops ops(b);
+    const auto owner = ops.op.read(l.ownerKey("r"), Retry::standard());
+    OwnerObject tombstone = decodeOwner(owner->bytes);
+    tombstone.retired_at_ms = 1;
+    tombstone.owner_life += 1;
+    tombstone.retirement_verified = false;
+    mustCommit(ops.op.replace(l.ownerKey("r"), encodeOwner(tombstone), owner->etag, Retry::standard()), "tombstone");
+    const Etag epoch_before = currentEtag(ops.op, l.epochKey("r"));
+    const Etag mount_before = currentEtag(ops.op, l.mountKey("r"));
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "decommission is not finished", [&]
     {
-        SCOPED_TRACE(verified ? "verified" : "unverified");
-        auto b = std::make_shared<InMemoryBackend>();
-        Layout l("p");
-        { auto first = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r"}); }
-        Ops ops(b);
-        const auto owner = ops.op.read(l.ownerKey("r"), Retry::standard());
-        OwnerObject tombstone = decodeOwner(owner->bytes);
-        tombstone.retired_at_ms = 1;
-        tombstone.owner_life += 1;
-        tombstone.retirement_verified = verified;
-        mustCommit(ops.op.replace(l.ownerKey("r"), encodeOwner(tombstone), owner->etag, Retry::standard()), "tombstone");
-        const Etag epoch_before = currentEtag(ops.op, l.epochKey("r"));
-        const Etag mount_before = currentEtag(ops.op, l.mountKey("r"));
-        DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "decommissioned", [&]
-        {
-            Pool::open(b, PoolConfig{.pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r"});
-        });
-        EXPECT_EQ(currentEtag(ops.op, l.epochKey("r")), epoch_before);
-        EXPECT_EQ(currentEtag(ops.op, l.mountKey("r")), mount_before);
-    }
+        Pool::open(b, PoolConfig{.pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r"});
+    });
+    EXPECT_EQ(currentEtag(ops.op, l.epochKey("r")), epoch_before);
+    EXPECT_EQ(currentEtag(ops.op, l.mountKey("r")), mount_before);
 }
 
 /// Each identity refusal names the supported recovery: the decommission verb for a dead foreign owner,
@@ -790,7 +785,7 @@ TEST(CASServerRootClaim, RefusalsNameTheSupportedRecovery)
     {
         EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
         EXPECT_NE(e.message().find("was decommissioned"), String::npos) << e.message();
-        EXPECT_NE(e.message().find("troubleshooting"), String::npos) << e.message();
+        EXPECT_NE(e.message().find("decommission is not finished"), String::npos) << e.message();
         EXPECT_EQ(e.message().find("clear the owner object"), String::npos) << e.message();
     }
 }
@@ -1000,7 +995,17 @@ TEST(CASServerRootClaim, MissingOwnerOverNonEmptyRootIsCorrupted)
     Ops ops(b);
     /// Simulate existing data without an owner (identity lost): plant a key under roots/<srid>/.
     mustCommit(ops.op.create(l.serverRootDataPrefix("r") + "some-data", "x", Retry::standard()), "root debris");
-    EXPECT_THROW(claimOwnerOrThrow(ops.op, l, "r", UInt128(1), emptyCatalogObservation()), DB::Exception);
+    try
+    {
+        claimOwnerOrThrow(ops.op, l, "r", UInt128(1), emptyCatalogObservation());
+        FAIL() << "the claim over an ownerless non-empty subtree must be refused";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA) << e.message();
+        EXPECT_NE(e.message().find("refusing to re-claim"), String::npos) << e.message();
+        EXPECT_NE(e.message().find("Configure a new <cas_server_root_id> for this disk"), String::npos) << e.message();
+    }
 }
 
 TEST(CASServerRootSafety, EveryCatalogLifecycleStateBlocksOwnerAndEpochRecreation)
@@ -3700,4 +3705,199 @@ TEST(CASMount, RecheckForDecommissionStillRefusesForeignOwnerAndMovedLife)
             EXPECT_TRUE(decodeMountLease(ops.op.read(l.mountKey("r"), Retry::standard())->bytes).gc_fenced);
         }
     }
+}
+
+namespace
+{
+MountLease terminalBody(UInt128 uuid, uint64_t epoch, bool fenced)
+{
+    MountLease body = liveBody(uuid, epoch);
+    if (fenced)
+        body.gc_fenced = true;
+    else
+        body.min_active_build_sequence = std::numeric_limits<uint64_t>::max();
+    return body;
+}
+
+const OwnerExpectation uuid_one_at_life_two{.server_uuid = UInt128(1), .owner_life = 2, .retired = RetiredOwnerPolicy::Refuse};
+
+OwnerObject liveOwner(UInt128 uuid, uint64_t life)
+{
+    return OwnerObject{.server_uuid = uuid, .retired_at_ms = std::nullopt, .owner_life = life, .retirement_verified = false};
+}
+
+/// The slot's body with another `server_uuid`, everything else kept: what a rejoin under a new uuid leaves.
+void rewriteSlotUuid(Backend & backend, const Layout & l, const String & srid, UInt128 uuid)
+{
+    DB::Cas::tests::OperationForTest op(backend);
+    const auto got = (*op).read(l.mountKey(srid), Retry::standard());
+    ASSERT_TRUE(got.has_value());
+    MountLease m = decodeMountLease(got->bytes);
+    m.server_uuid = uuid;
+    m.seq += 1;
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        (*op).replace(l.mountKey(srid), encodeMountLease(m), got->etag, Retry::standard())));
+}
+}
+
+/// After a rejoin under a new uuid the slot can hold another uuid's farewell or self-fence; the server
+/// whose owner life it is takes it over.
+TEST(CASMount, ForeignTerminalBodyIsReclaimable)
+{
+    for (const bool fenced : {false, true})
+    {
+        SCOPED_TRACE(fenced ? "gc_fenced" : "clean farewell");
+        auto b = std::make_shared<InMemoryBackend>();
+        Layout l("p");
+        Ops ops(b);
+        seedOwner(ops, l, liveOwner(UInt128(1), 2));
+        mustCommit(ops.op.create(l.mountKey("r"), encodeMountLease(terminalBody(UInt128(2), 7, fenced)), Retry::standard()), "slot");
+        const MountClaimResult claim = claimMount(ops.op, l, "r", UInt128(1), 8, 1000, 100, {}, {}, {}, uuid_one_at_life_two);
+        ASSERT_EQ(claim.kind, MountClaimResult::Claimed);
+        EXPECT_EQ(claim.prior, fenced ? MountPriorState::Fenced : MountPriorState::Clean);
+        const MountLease slot = slotBody(*b, l, "r");
+        EXPECT_EQ(slot.server_uuid, UInt128(1));
+        EXPECT_EQ(slot.writer_epoch, 8u);
+    }
+}
+
+/// The owner is read before the reclaim: a reclaim that a later recheck refuses would leave an old-uuid
+/// body that a 26.6.4 starter (no recheck) could take.
+TEST(CASMount, ForeignReclaimReadsTheOwnerFirst)
+{
+    struct Case
+    {
+        String name;
+        std::optional<OwnerObject> owner;
+        std::optional<OwnerExpectation> expected;
+    };
+    OwnerObject retired = liveOwner(UInt128(1), 2);
+    retired.retired_at_ms = 5;
+    const std::vector<Case> cases{
+        {"owner of another uuid", liveOwner(UInt128(3), 2), uuid_one_at_life_two},
+        {"owner retired", retired, uuid_one_at_life_two},
+        {"owner at another life", liveOwner(UInt128(1), 3), uuid_one_at_life_two},
+        {"owner absent", std::nullopt, uuid_one_at_life_two},
+        {"no expectation passed", liveOwner(UInt128(1), 2), std::nullopt}};
+    for (const Case & c : cases)
+    {
+        SCOPED_TRACE(c.name);
+        auto b = std::make_shared<InMemoryBackend>();
+        Layout l("p");
+        Ops ops(b);
+        if (c.owner)
+            seedOwner(ops, l, *c.owner);
+        mustCommit(ops.op.create(l.mountKey("r"), encodeMountLease(terminalBody(UInt128(2), 7, false)), Retry::standard()), "slot");
+        const auto before = ops.op.read(l.mountKey("r"), Retry::standard());
+        EXPECT_EQ(claimMount(ops.op, l, "r", UInt128(1), 8, 1000, 100, {}, {}, {}, c.expected).kind, MountClaimResult::ForeignOwner);
+        EXPECT_EQ(ops.op.read(l.mountKey("r"), Retry::standard())->etag, before->etag);
+    }
+}
+
+/// A foreign body at or above our epoch is never replaced: a delayed claimer with a lower epoch stays out.
+TEST(CASMount, ForeignTerminalBodyAtOrAboveOurEpochStaysForeign)
+{
+    for (const uint64_t body_epoch : {8, 9})
+    {
+        SCOPED_TRACE(body_epoch);
+        auto b = std::make_shared<InMemoryBackend>();
+        Layout l("p");
+        Ops ops(b);
+        seedOwner(ops, l, liveOwner(UInt128(1), 2));
+        mustCommit(ops.op.create(l.mountKey("r"), encodeMountLease(terminalBody(UInt128(2), body_epoch, false)), Retry::standard()), "slot");
+        const auto before = ops.op.read(l.mountKey("r"), Retry::standard());
+        EXPECT_EQ(claimMount(ops.op, l, "r", UInt128(1), 8, 1000, 100, {}, {}, {}, uuid_one_at_life_two).kind, MountClaimResult::ForeignOwner);
+        EXPECT_EQ(ops.op.read(l.mountKey("r"), Retry::standard())->etag, before->etag);
+    }
+}
+
+/// A live body of another uuid is never taken, whatever the owner says.
+TEST(CASMount, ForeignLiveBodyStaysForeignOwner)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    Ops ops(b);
+    seedOwner(ops, l, liveOwner(UInt128(1), 2));
+    mustCommit(ops.op.create(l.mountKey("r"), encodeMountLease(liveBody(UInt128(2), 7)), Retry::standard()), "slot");
+    const auto before = ops.op.read(l.mountKey("r"), Retry::standard());
+    EXPECT_EQ(claimMount(ops.op, l, "r", UInt128(1), 8, 1000, 100, {}, {}, {}, uuid_one_at_life_two).kind, MountClaimResult::ForeignOwner);
+    EXPECT_EQ(ops.op.read(l.mountKey("r"), Retry::standard())->etag, before->etag);
+}
+
+/// A start and a self-remount pass their owner expectation, so both take over a terminal body of another uuid.
+TEST(CASMount, ClaimPathsReclaimAForeignTerminalBodyOfTheirOwnOwner)
+{
+    {
+        SCOPED_TRACE("start");
+        auto b = std::make_shared<InMemoryBackend>();
+        Layout l("p");
+        { auto first = Pool::open(b, rootConfig()); }
+        rewriteSlotUuid(*b, l, "r", UInt128(2));
+        auto store = Pool::open(b, rootConfig());
+        const MountLease slot = slotBody(*b, l, "r");
+        EXPECT_EQ(slot.server_uuid, UInt128(1));
+        EXPECT_EQ(slot.writer_epoch, store->writerEpoch());
+    }
+    {
+        SCOPED_TRACE("self-remount");
+        auto b = std::make_shared<InMemoryBackend>();
+        Layout l("p");
+        auto store = Pool::open(b, rootConfig());
+        DB::Cas::tests::fenceOutMountForTest(*b, l.mountKey("r"));
+        DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->renewWatermarkOnce(); });
+        rewriteSlotUuid(*b, l, "r", UInt128(2));
+        EXPECT_TRUE(store->tryRemountOnce());
+        const MountLease slot = slotBody(*b, l, "r");
+        EXPECT_EQ(slot.server_uuid, UInt128(1));
+        EXPECT_FALSE(slot.gc_fenced);
+    }
+}
+
+/// A terminal row reads its owner: a tombstone makes it `retired`, and the row carries whether the retirement is
+/// verified. A live row never reads its owner (its owner here is undecodable).
+TEST(CASListMounts, TerminalSlotOfATombstonedOwnerIsRetired)
+{
+    const auto state_of = [](Ops & ops, const Layout & l, const String & srid) -> String
+    {
+        for (const MountInfo & m : listMounts(ops.op, l, /*now_ms=*/0, /*skew_margin_ms=*/0))
+            if (m.srid == srid)
+                return m.state + (m.retirement_verified ? "+verified" : "");
+        return "absent";
+    };
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    Ops ops(b);
+    { auto first = Pool::open(b, rootConfig()); }
+    EXPECT_EQ(state_of(ops, l, "r"), "terminated");
+    DB::Cas::tests::tombstoneOwnerForTest(*b, l.ownerKey("r"));
+    EXPECT_EQ(state_of(ops, l, "r"), "retired") << "an unverified tombstone";
+    DB::Cas::tests::tombstoneOwnerForTest(*b, l.ownerKey("r"), /*verified=*/true);
+    EXPECT_EQ(state_of(ops, l, "r"), "retired+verified");
+    DB::Cas::tests::fenceOutMountForTest(*b, l.mountKey("r"));
+    EXPECT_EQ(state_of(ops, l, "r"), "retired+verified") << "a fenced slot of a retired owner";
+    rewriteOwnerAt(*b, l, "r", UInt128(2));
+    EXPECT_EQ(state_of(ops, l, "r"), "fenced") << "a rejoined owner";
+
+    mustCommit(ops.op.create(l.ownerKey("x"), "garbage-not-a-proto", Retry::standard()), "undecodable owner of x");
+    mustCommit(ops.op.create(l.mountKey("x"), encodeMountLease(liveBody(UInt128(1), 4)), Retry::standard()), "live slot of x");
+    EXPECT_EQ(state_of(ops, l, "x"), "live") << "a non-terminal row keeps its lease state and never reads its owner";
+}
+
+TEST(CASListMounts, TerminalSlotWithAnUndecodableOwnerIsCorrupt)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    Ops ops(b);
+    { auto first = Pool::open(b, rootConfig()); }
+    DB::Cas::tests::OperationForTest op(*b);
+    const auto current = (*op).read(l.ownerKey("r"), Retry::once());
+    ASSERT_TRUE(current.has_value());
+    ASSERT_TRUE(std::holds_alternative<Committed>((*op).replace(l.ownerKey("r"), "garbage-not-a-proto", current->etag, Retry::once())));
+    mustCommit(ops.op.create(l.mountKey("other"), encodeMountLease(liveBody(UInt128(1), 4)), Retry::standard()), "live slot of other");
+    std::map<String, String> by_srid;
+    for (const MountInfo & m : listMounts(ops.op, l, /*now_ms=*/0, /*skew_margin_ms=*/0))
+        by_srid[m.srid] = m.state;
+    EXPECT_EQ(by_srid.size(), 2u);
+    EXPECT_EQ(by_srid["r"], "corrupt");
+    EXPECT_EQ(by_srid["other"], "live");
 }
