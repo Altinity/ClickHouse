@@ -5,7 +5,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasHotKeys.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRetry.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasWriteResult.h>
-#include <Common/SharedMutex.h>
 #include <IO/ReadBuffer.h>
 #include <base/types.h>
 
@@ -213,9 +212,6 @@ private:
     /// clock and sleep it reads and paces through `op.owner`.
     friend class CasHotKeys;
 
-    uint64_t now_ms() const;
-    void sleep_ms(uint64_t ms) const;
-
     /// The one place a transport key is created. Every verb reaches the store through this, so no
     /// engine code -- and nothing outside it -- can name the key's type, let alone construct one.
     /// `attempt_no` is the caller's own 1-based physical-attempt count, threaded to the transport
@@ -240,11 +236,8 @@ private:
 
     BackendPtr backend;
     Fence fence;
-    /// These mutexes protect callbacks changed by tests while background requests are running.
-    mutable SharedMutex now_ms_mutex;
-    std::function<uint64_t()> now_ms_fn TSA_GUARDED_BY(now_ms_mutex);
-    mutable SharedMutex sleep_ms_mutex;
-    std::function<void(uint64_t)> sleep_ms_fn TSA_GUARDED_BY(sleep_ms_mutex);
+    std::function<uint64_t()> now_ms;
+    std::function<void(uint64_t)> sleep_ms;
     uint64_t attempt_reservation_ms;
     /// The private lane of a `CasRequests` built without a pool; null when `hot_keys` is the pool's.
     std::unique_ptr<CasHotKeys> own_hot_keys;

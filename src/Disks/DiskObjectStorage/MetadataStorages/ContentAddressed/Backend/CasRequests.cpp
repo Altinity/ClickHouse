@@ -5,9 +5,7 @@
 #include <IO/ReadBuffer.h>
 #include <Common/LoggingHelpers.h>
 #include <Common/ProfileEvents.h>
-#include <Common/SharedLockGuard.h>
 #include <Common/Stopwatch.h>
-#include <Common/UniqueLock.h>
 #include <Common/logger_useful.h>
 #include <base/sleep.h>
 
@@ -307,36 +305,22 @@ CasRequests::CasRequests(BackendPtr backend_, Fence fence_,
                          CasHotKeys * hot_keys_)
     : backend(std::move(backend_))
     , fence(std::move(fence_))
-    , now_ms_fn(now_ms_ ? std::move(now_ms_) : std::function<uint64_t()>(bootClockMs))
-    , sleep_ms_fn(sleep_ms_ ? std::move(sleep_ms_) : std::function<void(uint64_t)>(sleepForMilliseconds))
+    , now_ms(now_ms_ ? std::move(now_ms_) : std::function<uint64_t()>(bootClockMs))
+    , sleep_ms(sleep_ms_ ? std::move(sleep_ms_) : std::function<void(uint64_t)>(sleepForMilliseconds))
     , attempt_reservation_ms(backend->attemptEnvelopeMs())
     , own_hot_keys(hot_keys_ ? nullptr : std::make_unique<CasHotKeys>(0))
     , hot_keys(hot_keys_ ? hot_keys_ : own_hot_keys.get())
 {
 }
 
-uint64_t CasRequests::now_ms() const
-{
-    SharedLockGuard lock(now_ms_mutex);
-    return now_ms_fn();
-}
-
-void CasRequests::sleep_ms(uint64_t ms) const
-{
-    SharedLockGuard lock(sleep_ms_mutex);
-    sleep_ms_fn(ms);
-}
-
 void CasRequests::setNowFnForTest(std::function<uint64_t()> now_ms_)
 {
-    UniqueLock lock(now_ms_mutex);
-    now_ms_fn = now_ms_ ? std::move(now_ms_) : std::function<uint64_t()>(bootClockMs);
+    now_ms = now_ms_ ? std::move(now_ms_) : std::function<uint64_t()>(bootClockMs);
 }
 
 void CasRequests::setSleepFnForTest(std::function<void(uint64_t)> sleep_ms_)
 {
-    UniqueLock lock(sleep_ms_mutex);
-    sleep_ms_fn = sleep_ms_ ? std::move(sleep_ms_) : std::function<void(uint64_t)>(sleepForMilliseconds);
+    sleep_ms = sleep_ms_ ? std::move(sleep_ms_) : std::function<void(uint64_t)>(sleepForMilliseconds);
 }
 
 CasOperation CasRequests::admit(Liveness liveness)
