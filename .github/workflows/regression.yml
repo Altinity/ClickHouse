@@ -105,6 +105,7 @@ env:
     --log raw.log
     --with-analyzer
   artifacts: builds
+  S3_ARTIFACT_BUCKET: ${{ vars.S3_ARTIFACT_BUCKET }}
   artifact_paths: |
     ./report.html
     ./*.log.txt

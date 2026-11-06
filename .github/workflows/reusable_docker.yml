@@ -29,6 +29,7 @@ env:
   DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   ROBOT_TOKEN: ${{ secrets.ROBOT_TOKEN }}
+  S3_ARTIFACT_BUCKET: ${{ vars.S3_ARTIFACT_BUCKET }}
 
 jobs:
   DockerBuildAarch64:

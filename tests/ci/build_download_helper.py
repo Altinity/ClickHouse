@@ -5,8 +5,9 @@ import logging
 import os
 import sys
 import time
+import urllib.parse
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Union
+from typing import Any, Callable, List, Optional, Tuple, Union
 
 import requests
 
@@ -132,10 +133,44 @@ def read_build_urls(build_name: str, reports_path: Union[Path, str]) -> List[str
     return []
 
 
+def _s3_bucket_and_key(url: str) -> Optional[Tuple[str, str]]:
+    parsed = urllib.parse.urlparse(url)
+    path = urllib.parse.unquote(parsed.path.lstrip("/"))
+    if not path:
+        return None
+    suffix = ".s3.amazonaws.com"
+    if parsed.netloc.endswith(suffix):
+        bucket = parsed.netloc[: -len(suffix)]
+        if bucket:
+            return bucket, path
+    if parsed.netloc == "s3.amazonaws.com":
+        bucket, sep, key = path.partition("/")
+        if sep and bucket and key:
+            return bucket, key
+    return None
+
+
+def _download_s3_artifact(url: str, path: Path) -> bool:
+    if not os.getenv("AWS_ACCESS_KEY_ID"):
+        return False
+    location = _s3_bucket_and_key(url)
+    if location is None:
+        return False
+    try:
+        from s3_helper import S3Helper
+    except ImportError:
+        return False
+    bucket, key = location
+    S3Helper().client.download_file(bucket, key, str(path))
+    return True
+
+
 def download_build_with_progress(url: str, path: Path) -> None:
     logging.info("Downloading from %s to temp path %s", url, path)
     for i in range(DOWNLOAD_RETRIES_COUNT):
         try:
+            if _download_s3_artifact(url, path):
+                break
             response = get_with_retries(url, retries=1, stream=True)
             total_length = int(response.headers.get("content-length", 0))
             if path.is_file() and total_length and path.stat().st_size == total_length:
