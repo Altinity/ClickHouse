@@ -14,7 +14,8 @@ from .common import setup_tables
 CLUSTER_INSTANCES = ["replica1"]
 
 # The happy paths of `EXPORT PARTITION` into an Iceberg destination: one partition, several
-# partitions, all of them, and the column statistics carried by the resulting manifest entry.
+# partitions, all of them, partitions whose rows were deleted, and the column statistics carried by
+# the resulting manifest entry.
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +185,55 @@ def test_export_partition_where_every_row_is_deleted(cluster, source_engine):
 
     count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
     assert count == 0, f"Expected the Iceberg table to stay empty, got {count} rows"
+
+
+def iceberg_snapshots(node, table: str) -> int:
+    return int(node.query(
+        f"SELECT count() FROM system.iceberg_history WHERE database = currentDatabase() AND table = '{table}'"
+    ).strip())
+
+
+def test_export_partition_of_parts_without_rows(cluster, source_engine):
+    """
+    A mutation that deletes every row of a part leaves a part without rows, kept by
+    `remove_empty_parts = 0`. Unlike after a lightweight delete, such a part has no min/max index.
+    The export must not need it: the source partition is a month, and the destination one a year,
+    which only the min/max index of the parts with rows can prove the month to lie in. A partition
+    of only such parts is exported as no files, so the task reaches COMPLETED without committing.
+    """
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_no_rows_{uid}"
+    iceberg_table = f"iceberg_no_rows_{uid}"
+    columns = "id Int64, event_date Date"
+
+    make_source(
+        node, mt_table, columns, "toYYYYMM(event_date)",
+        engine=source_engine, replica_name="replica1",
+        extra_settings="remove_empty_parts = 0, max_bytes_to_merge_at_max_space_in_pool = 1",
+    )
+    make_iceberg_s3(node, iceberg_table, columns, partition_by="toYearNumSinceEpoch(event_date)")
+
+    node.query(f"INSERT INTO {mt_table} VALUES (1, '2020-01-10')")
+    node.query(f"INSERT INTO {mt_table} VALUES (2, '2020-01-20')")
+    node.query(f"ALTER TABLE {mt_table} DELETE WHERE 1", settings={"mutations_sync": 2})
+
+    rows = node.query(
+        f"SELECT rows FROM system.parts WHERE database = currentDatabase() AND table = '{mt_table}' AND active"
+    ).split()
+    assert rows == ["0", "0"], f"Expected two parts without rows, got {rows}"
+
+    snapshots = iceberg_snapshots(node, iceberg_table)
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '202001' TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    wait_for_export_status(node, mt_table, iceberg_table, "202001", "COMPLETED")
+
+    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count == 0, f"Expected the Iceberg table to stay empty, got {count} rows"
+    assert iceberg_snapshots(node, iceberg_table) == snapshots, "An export without files committed a snapshot"
 
 
 def setup_stats_tables(node, mt_table: str, iceberg_table: str, engine: str = "ReplicatedMergeTree"):

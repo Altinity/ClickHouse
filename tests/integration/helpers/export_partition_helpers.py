@@ -39,6 +39,17 @@ def skip_if_remote_database_disk_enabled(cluster):
             )
 
 
+# Every `EXPORT PARTITION` creates a new task, so a partition may have several. The newest one is
+# the one a test just started; of tasks created in the same second, a pending one is preferred so
+# that an older finished task does not satisfy a wait.
+_NEWEST_TASK = "ORDER BY create_time DESC, status = 'PENDING' DESC LIMIT 1"
+
+
+def _task_filter(source_table, dest_table, partition_id):
+    dest_filter = f" AND destination_table = '{dest_table}'" if dest_table else ""
+    return f"source_table = '{source_table}'{dest_filter} AND partition_id = '{partition_id}'"
+
+
 def wait_for_export_status(
     node,
     source_table,
@@ -48,7 +59,7 @@ def wait_for_export_status(
     timeout=60,
     poll_interval=0.5,
 ):
-    """Poll `system.partition_exports` until status matches.
+    """Poll `system.distributed_exports` until the status of the newest task of the partition matches.
 
     *dest_table* may be ``None`` to skip filtering by destination table
     (useful for catalog-based tests where the destination is a database-qualified path).
@@ -56,14 +67,10 @@ def wait_for_export_status(
     start_time = time.time()
     last_status = None
     while time.time() - start_time < timeout:
-        dest_filter = (
-            f" AND destination_table = '{dest_table}'" if dest_table else ""
-        )
         status = node.query(
-            f"SELECT status FROM system.partition_exports"
-            f" WHERE source_table = '{source_table}'"
-            f"{dest_filter}"
-            f" AND partition_id = '{partition_id}'"
+            f"SELECT status FROM system.distributed_exports"
+            f" WHERE {_task_filter(source_table, dest_table, partition_id)}"
+            f" {_NEWEST_TASK}"
         ).strip()
 
         last_status = status
@@ -78,19 +85,55 @@ def wait_for_export_status(
     )
 
 
+def newest_active_part(node, table, partition_id):
+    """Name of the active part of *partition_id* with the highest block number."""
+    return node.query(
+        f"SELECT name FROM system.parts"
+        f" WHERE database = currentDatabase() AND table = '{table}'"
+        f" AND partition_id = '{partition_id}' AND active"
+        f" ORDER BY max_block_number DESC LIMIT 1"
+    ).strip()
+
+
+def assert_parts_not_merged_across_export_states(node, table, partition_id, part_names):
+    """Trigger merges of *partition_id* and check that none of *part_names* was merged. Each of them
+    must be in a different export state (exported, claimed, not exported) than its neighbours, or
+    be claimed by an export task of the `EXPORT` TTL.
+
+    Both merge paths are tried: `OPTIMIZE FINAL` merges the whole partition or nothing, a plain
+    `OPTIMIZE` runs the selector background merges use and may still merge parts in the same state
+    with each other, which is allowed.
+    """
+    error = node.query_and_get_error(
+        f"OPTIMIZE TABLE {table} PARTITION ID '{partition_id}' FINAL",
+        settings={"optimize_throw_if_noop": 1},
+    )
+    assert "export states" in error or "are being exported" in error, f"Unexpected error on {node.name}: {error}"
+
+    node.query(f"OPTIMIZE TABLE {table} PARTITION ID '{partition_id}'")
+
+    active_parts = node.query(
+        f"SELECT name FROM system.parts"
+        f" WHERE database = currentDatabase() AND table = '{table}'"
+        f" AND partition_id = '{partition_id}' AND active"
+    ).split()
+    merged = [name for name in part_names if name not in active_parts]
+    assert not merged, (
+        f"Parts {merged} were merged across export states on {node.name}; active parts: {active_parts}"
+    )
+
+
 def export_transaction_id(
     node,
     source_table,
     dest_table,
     partition_id,
 ):
-    """Return the current transaction id of a partition export, or an empty string if none."""
-    dest_filter = f" AND destination_table = '{dest_table}'" if dest_table else ""
+    """Return the transaction id of the newest export task of a partition, or an empty string if none."""
     return node.query(
-        f"SELECT transaction_id FROM system.partition_exports"
-        f" WHERE source_table = '{source_table}'"
-        f"{dest_filter}"
-        f" AND partition_id = '{partition_id}'"
+        f"SELECT transaction_id FROM system.distributed_exports"
+        f" WHERE {_task_filter(source_table, dest_table, partition_id)}"
+        f" {_NEWEST_TASK}"
     ).strip()
 
 
@@ -103,10 +146,10 @@ def wait_for_new_export_transaction(
     timeout=60,
     poll_interval=0.2,
 ):
-    """Wait until the export entry carries a transaction id other than *previous_transaction_id*.
+    """Wait until the newest export task of the partition is not *previous_transaction_id*.
 
-    A force re-export replaces the entry. Without this wait, the COMPLETED status of the export
-    being replaced can still be visible in the in-memory mirror and satisfy a status wait
+    A re-export creates a new task. Without this wait, the COMPLETED status of the previous task
+    can still be the newest one visible in the in-memory mirror and satisfy a status wait
     immediately, before the new export has even started.
     """
     start_time = time.time()
@@ -125,6 +168,20 @@ def wait_for_new_export_transaction(
     )
 
 
+def commit_marker_lines(node, source_table, dest_table, partition_id):
+    """Number of files committed to the plain object storage destination *dest_table* by the export
+    tasks of *partition_id*: each task commits with a marker `commit_<transaction_id>` that lists them.
+    """
+    transaction_ids = node.query(
+        f"SELECT transaction_id FROM system.distributed_exports WHERE {_task_filter(source_table, dest_table, partition_id)}"
+    ).split()
+
+    return sum(
+        int(node.query(f"SELECT count() FROM s3(s3_conn, filename='{dest_table}/commit_{transaction_id}*', format=LineAsString)"))
+        for transaction_id in transaction_ids
+    )
+
+
 def wait_for_export_to_start(
     node,
     source_table,
@@ -133,11 +190,11 @@ def wait_for_export_to_start(
     timeout=10,
     poll_interval=0.2,
 ):
-    """Poll until at least one row exists in `system.partition_exports`."""
+    """Poll until at least one row exists in `system.distributed_exports`."""
     start_time = time.time()
     while time.time() - start_time < timeout:
         count = node.query(
-            f"SELECT count() FROM system.partition_exports"
+            f"SELECT count() FROM system.distributed_exports"
             f" WHERE source_table = '{source_table}'"
             f"   AND destination_table = '{dest_table}'"
             f"   AND partition_id = '{partition_id}'"
@@ -162,11 +219,11 @@ def wait_for_exception_count(
     timeout=60,
     poll_interval=0.5,
 ):
-    """Wait for exception_count to reach at least *min_exception_count*.
+    """Wait for exception_count of the newest task of the partition to reach at least *min_exception_count*.
 
     The default timeout is intentionally larger than one manifest-updater poll
-    cycle (~30s, see StorageReplicatedMergeTree::exportMergeTreePartitionUpdatingTask).
-    For a ReplicatedMergeTree source, `system.partition_exports` is served from the
+    cycle (~30s, see StorageReplicatedMergeTree::exportTaskUpdatingTask).
+    For a ReplicatedMergeTree source, `system.distributed_exports` is served from the
     in-memory mirror, which is refreshed on (a) the periodic poll tick and (b)
     status changes. While the task is still PENDING (e.g. transient part-export
     failures with a generous max_retries), no status watch fires, so newly written
@@ -177,10 +234,9 @@ def wait_for_exception_count(
     last_exception_count = None
     while time.time() - start_time < timeout:
         exception_count_str = node.query(
-            f"SELECT exception_count FROM system.partition_exports"
-            f" WHERE source_table = '{source_table}'"
-            f"   AND destination_table = '{dest_table}'"
-            f"   AND partition_id = '{partition_id}'"
+            f"SELECT exception_count FROM system.distributed_exports"
+            f" WHERE {_task_filter(source_table, dest_table, partition_id)}"
+            f" {_NEWEST_TASK}"
         ).strip()
 
         if exception_count_str:
