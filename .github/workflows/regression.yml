@@ -104,6 +104,7 @@ env:
     --parallel 1
     --log raw.log
   artifacts: builds
+  S3_ARTIFACT_BUCKET: ${{ vars.S3_ARTIFACT_BUCKET }}
   artifact_paths: |
     ./report.html
     ./*.log.txt

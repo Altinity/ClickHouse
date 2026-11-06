@@ -308,7 +308,8 @@ class ClickhouseIntegrationTestsRunner:
             "altinityinfra/integration-helper",
             "altinityinfra/integration-test",
             "altinityinfra/integration-tests-runner",
-            "altinityinfra/kerberized-hadoop",
+            # NOTE (strtgbb): schema 1 base image, Docker Hub no longer serves it
+            # "altinityinfra/kerberized-hadoop",
             "altinityinfra/kerberos-kdc",
             "altinityinfra/mysql-golang-client",
             "altinityinfra/mysql-java-client",
