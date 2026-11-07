@@ -69,6 +69,23 @@ namespace
         const auto * nullable = assert_cast<const DB::DataTypeNullable *>(node->result_type.get());
         return nullable->getNestedType();
     }
+
+    /// Whether a node is a constant with value `true`.
+    /// Such nodes are produced e.g. by ActionsDAG::restrictFilterDAGToInputs,
+    /// which replaces non-computable branches of `and` with constant true,
+    /// or by constant folding of the filter.
+    bool isConstantTrueNode(const DB::ActionsDAG::Node * node)
+    {
+        if (!isConstNode(node) || !node->column)
+            return false;
+
+        /// Conjuncts of `and` in a filter DAG are always (Nullable) UInt8.
+        if (getTypeIndex(node) != DB::TypeIndex::UInt8)
+            return false;
+
+        const auto & column = *node->column;
+        return DB::isColumnConst(column) && column.getBool(0);
+    }
 }
 
 std::shared_ptr<EnginePredicate> getEnginePredicate(
@@ -84,9 +101,11 @@ struct EngineIteratorData
     EngineIteratorData(
         ffi::KernelExpressionVisitorState * state_,
         const DB::ActionsDAG::NodeRawConstPtrs & nodes_,
-        EnginePredicate & predicate_)
+        EnginePredicate & predicate_,
+        bool and_context_ = false)
         : state(state_)
         , predicate(predicate_)
+        , and_context(and_context_)
         , nodes(nodes_)
         , it(nodes.begin())
     {
@@ -99,6 +118,12 @@ struct EngineIteratorData
 
     bool hasException() const { return predicate.exception != nullptr; }
 
+    void markUnsupportedNode() { predicate.has_unsupported_nodes = true; }
+
+    /// Whether this iterator feeds `visit_predicate_and`, i.e. its nodes are
+    /// conjuncts of an AND predicate. Only then is it safe to drop constant true.
+    bool isAndContext() const { return and_context; }
+
     const LoggerPtr & log() const { return predicate.log; }
 
     const DB::ActionsDAG::Node * next()
@@ -110,6 +135,7 @@ struct EngineIteratorData
 
     ffi::KernelExpressionVisitorState * state;
     EnginePredicate & predicate;
+    const bool and_context;
 
 private:
     const DB::ActionsDAG::NodeRawConstPtrs & nodes;
@@ -135,30 +161,48 @@ private:
         auto * iterator_data = static_cast<EngineIteratorData *>(data_);
         try
         {
-            if (iterator_data->hasException())
+            while (true)
             {
-                LOG_TEST(iterator_data->log(), "Exception during processing");
-                return nullptr;
-            }
+                if (iterator_data->hasException())
+                {
+                    LOG_TEST(iterator_data->log(), "Exception during processing");
+                    return nullptr;
+                }
 
-            const auto * node = iterator_data->next();
-            if (!node)
-            {
-                LOG_TEST(iterator_data->log(), "Iterator finished");
-                return nullptr;
-            }
+                const auto * node = iterator_data->next();
+                if (!node)
+                {
+                    LOG_TEST(iterator_data->log(), "Iterator finished");
+                    return nullptr;
+                }
 
-            LOG_TEST(
-                iterator_data->log(),
-                "Node name: {}, node type: {}, column type: {}",
-                node->result_name,
-                node->type,
-                node->column ? toString(node->column->getDataType()) : "None");
+                LOG_TEST(
+                    iterator_data->log(),
+                    "Node name: {}, node type: {}, column type: {}",
+                    node->result_name,
+                    node->type,
+                    node->column ? toString(node->column->getDataType()) : "None");
 
-            auto result = getNextImpl(*iterator_data, node);
-            if (result && result != VISITOR_FAILED_OR_UNSUPPORTED)
-            {
-                return reinterpret_cast<const void *>(result);
+                /// Constant `true` does not change an AND predicate, so it can be
+                /// dropped instead of failing the translation (see isConstantTrueNode).
+                if (iterator_data->isAndContext() && isConstantTrueNode(node))
+                    continue;
+
+                auto result = getNextImpl(*iterator_data, node);
+                if (result && result != VISITOR_FAILED_OR_UNSUPPORTED)
+                {
+                    return reinterpret_cast<const void *>(result);
+                }
+
+                if (!iterator_data->hasException())
+                {
+                    LOG_TEST(iterator_data->log(), "Unsupported node: {}", node->result_name);
+                    iterator_data->markUnsupportedNode();
+                }
+
+                /// An unsupported node must not truncate the rest of the conjuncts:
+                /// the kernel treats nullptr as the end of the iterator, so
+                /// returning here would silently drop all the following nodes.
             }
         }
         catch (...)
@@ -175,11 +219,15 @@ private:
 uintptr_t EnginePredicate::visitPredicate(void * data, ffi::KernelExpressionVisitorState * state)
 {
     auto * predicate = static_cast<EnginePredicate *>(data);
-    EngineIteratorData iterator_data(state, predicate->filter.getOutputs(), *predicate);
+    EngineIteratorData iterator_data(state, predicate->filter.getOutputs(), *predicate, /* and_context_ */ true);
     EngineIterator engine_iterator(iterator_data);
     auto result = ffi::visit_predicate_and(state, &engine_iterator);
 
-    LOG_TEST(iterator_data.log(), "visitPredicate finished (exception: {})", predicate->hasException());
+    LOG_TEST(
+        iterator_data.log(),
+        "visitPredicate finished (exception: {}, unsupported nodes: {})",
+        predicate->hasException(),
+        predicate->hasUnsupportedNodes());
     return result;
 }
 
@@ -289,7 +337,8 @@ uintptr_t EngineIterator::getNextImpl(EngineIteratorData & iterator_data, const 
                 EngineIteratorData current_iterator_data(
                         iterator_data.state,
                         node->children,
-                        iterator_data.predicate);
+                        iterator_data.predicate,
+                        /* and_context_ */ true);
 
                 EngineIterator current_engine_iterator(current_iterator_data);
 
