@@ -126,6 +126,10 @@ EXTERN_TYPES_EXCLUDES=(
     ErrorCodes::values
     ErrorCodes::values[i]
     ErrorCodes::getErrorCodeByName
+    ErrorCodes::size
+    ErrorCodes::getCode
+    ErrorCodes::getValue
+    ErrorCodes::ANTALYA_ERROR_CODE_BASE
     ErrorCodes::Value
 )
 # Check unused/undefined/duplicate ErrorCodes, ProfileEvents, CurrentMetrics declarations.

@@ -1,0 +1,16 @@
+<clickhouse>
+    <error_log>
+        <database>system</database>
+        <table>error_log</table>
+        <collect_interval_milliseconds>100</collect_interval_milliseconds>
+        <flush_interval_milliseconds>100</flush_interval_milliseconds>
+    </error_log>
+    <prometheus>
+        <endpoint>/metrics</endpoint>
+        <port>8001</port>
+        <metrics>false</metrics>
+        <events>false</events>
+        <asynchronous_metrics>false</asynchronous_metrics>
+        <errors>true</errors>
+    </prometheus>
+</clickhouse>
