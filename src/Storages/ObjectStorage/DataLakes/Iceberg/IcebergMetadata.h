@@ -209,6 +209,7 @@ private:
 
     std::optional<String> getPartitionKey(ContextPtr local_context, Iceberg::TableStateSnapshot actual_table_state_snapshot) const;
     KeyDescription getSortingKey(ContextPtr local_context, Iceberg::TableStateSnapshot actual_table_state_snapshot) const;
+    KeyDescription getSortingKeyFromMetadata(const Poco::JSON::Object::Ptr & metadata_object, ContextPtr local_context) const;
 
     /// Non-empty return value means the attempt succeeded (covers both the normal
     /// publish path and the `isExportPartitionTransactionAlreadyCommitted` short-circuit).
