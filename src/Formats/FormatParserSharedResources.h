@@ -22,6 +22,15 @@ struct FormatParserSharedResources
     const size_t max_parsing_threads = 0;
     const size_t max_io_threads = 0;
 
+    /// How many readers a single stream may keep concurrently active (e.g. via
+    /// `object_storage_max_files_to_prefetch` priming several files' readers ahead of the one
+    /// currently being consumed). Per-reader budgets (see Parquet's `getLimitsPerReader`) divide by
+    /// `num_streams * max_concurrent_readers_per_stream`, not just `num_streams`, so that priming
+    /// more files ahead doesn't let each of them claim a whole stream's share of memory/threads as
+    /// if it were the only reader alive for that stream. Defaults to 1 (today's behaviour: exactly
+    /// one active reader per stream) so this is a no-op unless a caller opts into more.
+    const size_t max_concurrent_readers_per_stream = 1;
+
     std::atomic<size_t> num_streams{0};
     ThreadPoolCallbackRunnerFast parsing_runner;
     ThreadPoolCallbackRunnerFast io_runner;
