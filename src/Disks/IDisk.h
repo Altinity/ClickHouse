@@ -479,6 +479,8 @@ public:
     /// True when a file write on this disk publishes atomically (see `IDataPartStorage::supportsAtomicFileWrites`).
     virtual bool supportsAtomicFileWrites() const { return false; }
 
+    /// Whether a new part may be written in the `Packed` storage format on this disk. The format chooser
+    /// downgrades `Packed` to `Full` on a disk that answers false; parts already in `Packed` form stay readable.
     virtual bool allowsPackedParts() const { return true; }
 
     virtual bool isWriteOnce() const { return false; }
