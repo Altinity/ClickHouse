@@ -20,16 +20,38 @@ import requests
 from clickhouse_driver import Client
 from clickhouse_driver.errors import ServerException
 import boto3
-from botocore.exceptions import NoCredentialsError
+from botocore.exceptions import ClientError, NoCredentialsError
 import yaml
 
 
 DATABASE_HOST_VAR = "CHECKS_DATABASE_HOST"
 DATABASE_USER_VAR = "CLICKHOUSE_TEST_STAT_LOGIN"
 DATABASE_PASSWORD_VAR = "CLICKHOUSE_TEST_STAT_PASSWORD"
-S3_BUCKET = "altinity-build-artifacts"
+S3_BUCKET = os.getenv("S3_ARTIFACT_BUCKET")
 GITHUB_REPO = "Altinity/ClickHouse"
+
+
+def _repo_and_run_id(actions_run_url: str) -> tuple[str, str]:
+    parts = urllib.parse.urlparse(actions_run_url).path.strip("/").split("/")
+    if (
+        len(parts) >= 5
+        and parts[2] == "actions"
+        and parts[3] == "runs"
+        and parts[0]
+        and parts[1]
+        and parts[4]
+    ):
+        return f"{parts[0]}/{parts[1]}", parts[4]
+    return GITHUB_REPO, actions_run_url.rstrip("/").split("/")[-1]
+
+
+def _github_git_url(repo: str) -> str:
+    return f"https://github.com/{repo}.git"
+
+
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
+# Release tags are fetched here rather than refs/tags/ so local tags are never touched.
+RELEASE_TAG_REF_PREFIX = "refs/workflow-report/tags/"
 # Resolve from this file so discovery works from repo root or the action folder.
 KNOWN_FAILS_FILE = (
     Path(__file__).resolve().parents[3] / "tests" / "broken_tests.yaml"
@@ -70,7 +92,9 @@ def _results_link_has_ref(target_url: str | None, ref: str) -> bool:
     return f"REF={ref}&" in target_url or f"/REFs/{ref}/" in target_url
 
 
-def get_commit_statuses(sha: str, pr_number: int, ref: str) -> pd.DataFrame:
+def get_commit_statuses(
+    sha: str, pr_number: int, ref: str, repo: str = GITHUB_REPO
+) -> pd.DataFrame:
     """
     Fetch commit statuses for a given SHA and return as a pandas DataFrame.
     Handles pagination to get all statuses.
@@ -92,7 +116,7 @@ def get_commit_statuses(sha: str, pr_number: int, ref: str) -> pd.DataFrame:
         "Accept": "application/vnd.github.v3+json",
     }
 
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/commits/{sha}/statuses"
+    url = f"https://api.github.com/repos/{repo}/commits/{sha}/statuses"
 
     all_data = []
 
@@ -147,7 +171,7 @@ def get_commit_statuses(sha: str, pr_number: int, ref: str) -> pd.DataFrame:
     ).reset_index(drop=True)
 
 
-def get_pr_info_from_number(pr_number: str) -> dict:
+def get_pr_info_from_number(pr_number: str, repo: str = GITHUB_REPO) -> dict:
     """
     Fetch pull request information for a given PR number.
 
@@ -162,7 +186,7 @@ def get_pr_info_from_number(pr_number: str) -> dict:
         "Accept": "application/vnd.github.v3+json",
     }
 
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/pulls/{pr_number}"
+    url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}"
     response = requests.get(url, headers=headers)
 
     if response.status_code != 200:
@@ -173,7 +197,7 @@ def get_pr_info_from_number(pr_number: str) -> dict:
     return response.json()
 
 
-def get_run_details(run_id: str) -> dict:
+def get_run_details(run_id: str, repo: str = GITHUB_REPO) -> dict:
     """
     Fetch run details for a given run URL.
     """
@@ -182,7 +206,7 @@ def get_run_details(run_id: str) -> dict:
         "Accept": "application/vnd.github.v3+json",
     }
 
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/runs/{run_id}"
+    url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id}"
     response = requests.get(url, headers=headers)
 
     if response.status_code != 200:
@@ -232,8 +256,10 @@ def _enrich_prs_in_release_merge_prs(df: pd.DataFrame, repo: str) -> pd.DataFram
 
 
 def _git_rev_parse(ref: str, cwd: str | None) -> str | None:
+    # Peel to a commit so a raw SHA that is not in the object store fails.
+    # git rev-parse --verify <40-hex> succeeds even when the object is missing.
     p = subprocess.run(
-        ["git", "rev-parse", "--verify", ref],
+        ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
         cwd=cwd,
         capture_output=True,
         text=True,
@@ -253,7 +279,7 @@ def _git_is_ancestor(ancestor: str, descendant: str, cwd: str | None) -> bool:
 
 
 def _git_log_merge_prs(
-    baseline: str, branch_ref: str, cwd: str | None, repo: str
+    baseline: str, commit_sha: str, cwd: str | None, repo: str
 ) -> pd.DataFrame:
     p = subprocess.run(
         [
@@ -261,7 +287,7 @@ def _git_log_merge_prs(
             "-c",
             "core.quotepath=false",
             "log",
-            f"{baseline}..{branch_ref}",
+            f"{baseline}..{commit_sha}",
             "--merges",
             "--format=%H%x09%s",
         ],
@@ -297,15 +323,11 @@ def _git_log_merge_prs(
     return df
 
 
-def _find_release_baseline(
-    branch_ref: str, repo: str, cwd: str | None
-) -> tuple[str | None, str | None]:
-    """Return (tag_name, tag_sha) for the latest
-    non-draft release tag that is an ancestor of branch_ref.
-    Version-tag refs skip the matching release so the range is previous→this tag.
-    """
+def _get_github_releases(repo: str) -> list[dict]:
+    """Non-draft GitHub releases of repo, newest first."""
     if not GITHUB_TOKEN:
-        return None, None
+        print("GITHUB_TOKEN is not set; skipping GitHub releases lookup")
+        return []
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github.v3+json",
@@ -318,31 +340,44 @@ def _find_release_baseline(
         raise Exception(
             f"GitHub API request failed: {response.status_code} {response.text}"
         )
+    return [rel for rel in response.json() if not rel.get("draft")]
+
+
+def _find_release_baseline(
+    branch_ref: str,
+    releases: list[dict],
+    cwd: str | None,
+    commit_sha: str,
+) -> tuple[str | None, str | None, str | None]:
+    """Return (tag_name, tag_sha, published_date YYYY-MM-DD) for the latest
+    release tag in releases that is an ancestor of commit_sha.
+    Version-tag refs skip the matching release so the range is previous→this tag.
+    """
     parsed = _parse_release_ref(branch_ref)
     skip_current = parsed is not None and parsed[2] is not None
-    for rel in response.json():
-        if rel.get("draft"):
-            continue
+    for rel in releases:
         tag_name = rel.get("tag_name")
         if not tag_name:
             continue
-        tag_sha = _git_rev_parse(tag_name, cwd)
+        tag_sha = _release_tag_sha(tag_name, cwd)
         if not tag_sha:
             continue
-        if not _git_is_ancestor(tag_sha, branch_ref, cwd):
+        if not _git_is_ancestor(tag_sha, commit_sha, cwd):
             continue
-        if skip_current and _git_is_ancestor(branch_ref, tag_sha, cwd):
+        if skip_current and _git_is_ancestor(commit_sha, tag_sha, cwd):
             continue
-        return tag_name, tag_sha
-    return None, None
+        published_at = rel.get("published_at") or rel.get("created_at") or ""
+        published_date = published_at[:10] if published_at else None
+        return tag_name, tag_sha, published_date
+    return None, None, None
 
 
-def _find_rebase_baseline(branch_ref: str, cwd: str | None) -> str | None:
+def _find_rebase_baseline(commit_sha: str, cwd: str | None) -> str | None:
     p = subprocess.run(
         [
             "git",
             "log",
-            branch_ref,
+            commit_sha,
             "--reverse",
             "-i",
             "-E",
@@ -382,11 +417,118 @@ def _git_commit_time(sha: str, cwd: str | None) -> str | None:
     )
 
 
+def _git_is_shallow(cwd: str | None) -> bool:
+    p = subprocess.run(
+        ["git", "rev-parse", "--is-shallow-repository"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return p.stdout.strip() == "true"
+
+
+def _git_fetch(
+    options: list[str], refspecs: list[str], cwd: str | None, repo: str = GITHUB_REPO
+) -> None:
+    p = subprocess.run(
+        ["git", "fetch", *options, _github_git_url(repo), *refspecs],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if p.returncode != 0:
+        raise Exception(f"git fetch failed: {p.stderr.strip()}")
+
+
+def _release_tag_sha(tag_name: str, cwd: str | None) -> str | None:
+    return _git_rev_parse(f"{RELEASE_TAG_REF_PREFIX}{tag_name}", cwd)
+
+
+def _read_autogenerated_versions(sha: str, cwd: str | None) -> tuple[int, int]:
+    p = subprocess.run(
+        ["git", "show", f"{sha}:cmake/autogenerated_versions.txt"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    major = re.search(r"SET\(VERSION_MAJOR (\d+)\)", p.stdout)
+    minor = re.search(r"SET\(VERSION_MINOR (\d+)\)", p.stdout)
+    if not major or not minor:
+        raise Exception(f"Cannot read version from {sha}")
+    return int(major.group(1)), int(minor.group(1))
+
+
+def _filter_releases_to_version_line(
+    releases: list[dict],
+    branch_ref: str,
+    commit_sha: str,
+    cwd: str | None,
+) -> list[dict]:
+    """Keep GitHub releases that belong on commit_sha's version line."""
+    parsed = _parse_release_ref(branch_ref)
+    if parsed is not None:
+        flavour, minor_version, _ = parsed
+        suffix = f"altinity{flavour}"
+        prefix = f"v{minor_version}."
+        return [
+            rel
+            for rel in releases
+            if (tag := rel.get("tag_name"))
+            and tag.startswith(prefix)
+            and tag.endswith(f".{suffix}")
+        ]
+    major, minor = _read_autogenerated_versions(commit_sha, cwd)
+    prefix = f"v{major}.{minor}."
+    return [
+        rel
+        for rel in releases
+        if (tag := rel.get("tag_name")) and tag.startswith(prefix)
+    ]
+
+
+def _fetch_release_tags(
+    releases: list[dict], cwd: str, repo: str = GITHUB_REPO
+) -> None:
+    """Fetch release tags into RELEASE_TAG_REF_PREFIX; skip tags missing remotely."""
+    for rel in releases:
+        tag_name = rel.get("tag_name")
+        if not tag_name:
+            continue
+        try:
+            _git_fetch(
+                ["--no-tags"],
+                [f"+refs/tags/{tag_name}:{RELEASE_TAG_REF_PREFIX}{tag_name}"],
+                cwd,
+                repo,
+            )
+        except Exception as e:
+            # NOTE (strtgbb): one deleted remote tag must not abort the section, but
+            # if it is the newest release the baseline moves back to an older one
+            print(f"WARNING: skipping release tag {tag_name}: {e}")
+
+
+def _fetch_commit(commit_sha: str, cwd: str, repo: str = GITHUB_REPO) -> None:
+    """Fetch the workflow commit from the repository under test.
+
+    Local checkouts might be a different branch and might not have the run SHA yet.
+    --filter/--unshallow would convert a full clone into a partial one, so those
+    options are used only when the checkout is already shallow.
+    """
+    if _git_is_shallow(cwd):
+        _git_fetch(["--filter=tree:0", "--unshallow"], [commit_sha], cwd, repo)
+    else:
+        _git_fetch(["--no-tags"], [commit_sha], cwd, repo)
+
+
 def get_prs_in_release_dataframe(
     branch_ref: str = "HEAD",
     *,
     repo: str = GITHUB_REPO,
     cwd: str,
+    commit_sha: str,
 ) -> tuple[pd.DataFrame, str | None]:
     f"""
     PRs merged into branch_ref that belong in the next release notes: after the latest GitHub
@@ -394,57 +536,33 @@ def get_prs_in_release_dataframe(
     Merge commits whose subject is from the upstream repository (ClickHouse/) are omitted.
     Columns: pr_number, pr_name, labels.
 
+    commit_sha is the workflow commit from the GitHub Actions API.
+
     Returns (dataframe, baseline commit time as UTC YYYY-MM-DDTHH:MM:SSZ or None).
     """
-    branch_sha = _git_rev_parse(branch_ref, cwd)
-    if not branch_sha:
-        raise Exception(f"Cannot resolve branch ref: {branch_ref!r}")
+    _fetch_commit(commit_sha, cwd, repo)
+    resolved = _git_rev_parse(commit_sha, cwd)
+    if not resolved:
+        raise Exception(f"Cannot resolve commit: {commit_sha!r}")
+    commit_sha = resolved
 
-    # CI often checks out with --depth=1 and --no-tags; fetch tags once, then deepen
-    # in steps until a baseline is reachable.
-    # Observed baseline distances are ~1k commits and grow slowly, so DEEPEN_CAP sits
-    # well above that; the cap exists so a failed lookup fails fast instead of fetching
-    # the branch's entire (100k+ commit) history.
-    DEEPEN_STEP = 250
-    DEEPEN_CAP = 10000
-
-    subprocess.run(
-        ["git", "fetch", "--tags", "origin"],
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        check=False,
+    releases = _filter_releases_to_version_line(
+        _get_github_releases(repo), branch_ref, commit_sha, cwd
     )
+    _fetch_release_tags(releases, cwd, repo)
 
-    parsed = _parse_release_ref(branch_ref)
-    fetch_ref = (
-        f"refs/tags/{branch_ref}"
-        if parsed is not None and parsed[2] is not None
-        else branch_ref
+    _, baseline_sha, _ = _find_release_baseline(
+        branch_ref, releases, cwd, commit_sha=commit_sha
     )
-
-    baseline_sha = None
-    for _ in range(DEEPEN_CAP // DEEPEN_STEP):
-        subprocess.run(
-            ["git", "fetch", f"--deepen={DEEPEN_STEP}", "origin", fetch_ref],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        _, baseline_sha = _find_release_baseline(branch_ref, repo, cwd)
-        if not baseline_sha:
-            baseline_sha = _find_rebase_baseline(branch_ref, cwd)
-        if baseline_sha:
-            break
+    if not baseline_sha:
+        baseline_sha = _find_rebase_baseline(commit_sha, cwd)
 
     if not baseline_sha:
         raise Exception(
-            "No release tag on this branch and no rebase bootstrap merge found "
-            f"within {DEEPEN_CAP} commits"
+            "No release tag on this branch and no rebase bootstrap merge found"
         )
 
-    df = _git_log_merge_prs(baseline_sha, branch_ref, cwd, repo)
+    df = _git_log_merge_prs(baseline_sha, commit_sha, cwd, repo)
     return (
         _enrich_prs_in_release_merge_prs(df, repo),
         _git_commit_time(baseline_sha, cwd),
@@ -455,24 +573,26 @@ def _parse_release_ref(ref_name: str) -> tuple[str, str, str | None] | None:
     """Parse a release ref into (flavour, minor_version, full_version).
 
     Handles version tags (``v25.8.28.10001.altinitystable``) and release
-    branches (``stable-25.8``). ``full_version`` is None for branches, which
+    branches (``stable-25.8``, ``antalya-25.8``, ``fips-25.3``). ``full_version`` is None for branches, which
     carry no patch or tweak. Returns None for refs without a version.
     """
     # Match tag
     match = re.match(
-        r"^v((\d+\.\d+)\.\d+\.\d+)\.altinity(stable|antalya|test)$", ref_name
+        r"^v((\d+\.\d+)\.\d+\.\d+)\.altinity(stable|antalya|fips|test)$", ref_name
     )
     if match:
-        flavour = "antalya" if match.group(3) == "antalya" else "stable"
+        flavour = match.group(3) if match.group(3) in ("antalya", "fips") else "stable"
         return flavour, match.group(2), match.group(1)
     # Match branch
-    match = re.match(r"^(stable|antalya)-(\d+\.\d+)$", ref_name)
+    match = re.match(r"^(stable|antalya|fips)-(\d+\.\d+)$", ref_name)
     if match:
         return match.group(1), match.group(2), None
     return None
 
 
-def _prs_in_release_search_url(branch_name: str, baseline_time: str | None) -> str | None:
+def _prs_in_release_search_url(
+    branch_name: str, baseline_time: str | None, repo: str = GITHUB_REPO
+) -> str | None:
     if not baseline_time:
         return None
     # Tag-triggered runs expose the tag as head_branch; search needs the PR base
@@ -483,7 +603,7 @@ def _prs_in_release_search_url(branch_name: str, baseline_time: str | None) -> s
         branch_name = f"{flavour}-{minor_version}"
     query = f"is:pr base:{branch_name} merged:>{baseline_time}"
     return (
-        f"https://github.com/{GITHUB_REPO}/pulls?"
+        f"https://github.com/{repo}/pulls?"
         + urllib.parse.urlencode({"q": query})
     )
 
@@ -798,15 +918,20 @@ def get_new_fails_this_pr(
     return new_fails_df
 
 
-def _workflow_config_s3_url(pr_number: int, commit_sha: str, ref_name: str) -> str:
+def _s3_get_json(key: str):
+    s3_client = boto3.client("s3", endpoint_url=os.getenv("S3_URL"))
+    response = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
+    return json.loads(response["Body"].read().decode("utf-8"))
+
+
+def _workflow_config_s3_key(pr_number: int, commit_sha: str, ref_name: str) -> str:
     if pr_number == 0:
         return (
-            f"https://{S3_BUCKET}.s3.amazonaws.com/REFs/{ref_name}/{commit_sha}/"
+            f"REFs/{ref_name}/{commit_sha}/"
             "config_workflow/workflow_config_masterci.json"
         )
     return (
-        f"https://{S3_BUCKET}.s3.amazonaws.com/PRs/{pr_number}/{commit_sha}/"
-        "config_workflow/workflow_config_pr.json"
+        f"PRs/{pr_number}/{commit_sha}/config_workflow/workflow_config_pr.json"
     )
 
 
@@ -816,18 +941,14 @@ def get_workflow_config(pr_number: int, commit_sha: str, ref_name: str) -> dict:
 
     On failure, warn and return a minimal empty config (same shape recreation uses).
     """
-    url = _workflow_config_s3_url(pr_number, commit_sha, ref_name)
+    key = _workflow_config_s3_key(pr_number, commit_sha, ref_name)
     try:
-        response = requests.get(url, timeout=30)
-        if response.status_code != 200:
-            print(
-                f"WARNING:Failed to fetch workflow config from {url}: "
-                f"{response.status_code}"
-            )
-            return {"cache_jobs": {}}
-        return response.json()
+        return _s3_get_json(key)
     except Exception as e:
-        print(f"WARNING:Failed to fetch workflow config from {url}: {e}")
+        print(
+            f"WARNING:Failed to fetch workflow config from s3://{S3_BUCKET}/{key}: {e}",
+            file=sys.stderr,
+        )
         return {"cache_jobs": {}}
 
 
@@ -1038,18 +1159,16 @@ def fetch_workflow_result_json(
         ref_param = f"PR={pr_number}"
         workflow_name = "PR"
 
-    status_file = f"result_{workflow_name.lower()}.json"
-    s3_path = (
-        f"https://{S3_BUCKET}.s3.amazonaws.com/"
-        f"{ref_param.replace('=', 's/')}/{commit_sha}/{status_file}"
+    key = (
+        f"{ref_param.replace('=', 's/')}/{commit_sha}/"
+        f"result_{workflow_name.lower()}.json"
     )
     try:
-        response = requests.get(s3_path, timeout=30)
-        if response.status_code != 200:
-            return None
-        return response.json()
+        return _s3_get_json(key)
+    except ClientError:
+        return None
     except Exception as e:
-        print(f"WARNING:Failed to fetch workflow result from {s3_path}: {e}")
+        print(f"WARNING:Failed to fetch workflow result from s3://{S3_BUCKET}/{key}: {e}")
         return None
 
 
@@ -1090,7 +1209,9 @@ def add_labels_to_checks_fails(
     return df[cols]
 
 
-def format_results_as_html_table(results, *, branch_name: str = "") -> str:
+def format_results_as_html_table(
+    results, *, branch_name: str = "", repo: str = GITHUB_REPO
+) -> str:
     if not isinstance(results, pd.DataFrame):
         return results
 
@@ -1121,7 +1242,7 @@ def format_results_as_html_table(results, *, branch_name: str = "") -> str:
             f'<span data-sort="{CVE_SEVERITY_ORDER.get(str(s).lower(), 6)}">{s}</span>'
         ),
         "PR Number": lambda n: url_to_html_link(
-            f"https://github.com/{GITHUB_REPO}/pull/{n}"
+            f"https://github.com/{repo}/pull/{n}"
         ),
         "PR Labels": lambda labels: format_pr_labels_with_verification(
             labels, branch_name=branch_name
@@ -1269,12 +1390,14 @@ def create_workflow_report(
         print(f"{DATABASE_PASSWORD_VAR} is not set")
     if not GITHUB_TOKEN:
         print("GITHUB_TOKEN is not set")
-    if not all([host, user, password, GITHUB_TOKEN]):
+    if not S3_BUCKET:
+        print("S3_ARTIFACT_BUCKET is not set")
+    if not all([host, user, password, GITHUB_TOKEN, S3_BUCKET]):
         raise Exception("Required environment variables are not set")
 
-    run_id = actions_run_url.split("/")[-1]
+    github_repo, run_id = _repo_and_run_id(actions_run_url)
 
-    run_details = get_run_details(run_id)
+    run_details = get_run_details(run_id, github_repo)
     branch_name = run_details.get("head_branch", "unknown branch")
     if pr_number is None or commit_sha is None:
         if pr_number is None:
@@ -1299,7 +1422,9 @@ def create_workflow_report(
 
     results_dfs = {
         "prs_in_release": [],
-        "job_statuses": get_commit_statuses(commit_sha, pr_number, branch_name),
+        "job_statuses": get_commit_statuses(
+            commit_sha, pr_number, branch_name, github_repo
+        ),
         "checks_fails": add_labels_to_checks_fails(
             get_checks_fails(db_client, commit_sha, branch_name),
             workflow_result,
@@ -1316,11 +1441,11 @@ def create_workflow_report(
     if pr_number == 0 and not mark_preview:
         try:
             prs_df, baseline_time = get_prs_in_release_dataframe(
-                branch_name, cwd=os.getcwd()
+                branch_name, cwd=os.getcwd(), repo=github_repo, commit_sha=commit_sha
             )
             results_dfs["prs_in_release"] = prs_df
             prs_in_release_search_url = _prs_in_release_search_url(
-                branch_name, baseline_time
+                branch_name, baseline_time, github_repo
             )
         except Exception as e:
             print(f"Error in get_prs_in_release_dataframe: {e}")
@@ -1350,8 +1475,8 @@ def create_workflow_report(
         pr_info_html = f"Release ({branch_name})"
     else:
         try:
-            pr_info = get_pr_info_from_number(pr_number)
-            pr_info_html = f"""<a href="https://github.com/{GITHUB_REPO}/pull/{pr_info["number"]}">
+            pr_info = get_pr_info_from_number(pr_number, github_repo)
+            pr_info_html = f"""<a href="https://github.com/{github_repo}/pull/{pr_info["number"]}">
                     #{pr_info.get("number")} ({pr_info.get("base", {}).get('ref')} <- {pr_info.get("head", {}).get('ref')})  {pr_info.get("title")}
                     </a>"""
             results_dfs["pr_new_fails"] = get_new_fails_this_pr(
@@ -1386,7 +1511,7 @@ def create_workflow_report(
     # Define the context for rendering
     context = {
         "title": "ClickHouse® CI Workflow Run Report",
-        "github_repo": GITHUB_REPO,
+        "github_repo": github_repo,
         "s3_bucket": S3_BUCKET,
         "pr_info_html": pr_info_html,
         "pr_number": pr_number,
@@ -1421,6 +1546,7 @@ def create_workflow_report(
             else format_results_as_html_table(
                 results_dfs["prs_in_release"],
                 branch_name=branch_name,
+                repo=github_repo,
             )
         ),
         "ci_jobs_status_html": format_results_as_html_table(

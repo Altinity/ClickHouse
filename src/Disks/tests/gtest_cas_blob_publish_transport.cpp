@@ -188,6 +188,16 @@ CountingS3::ObjectStore::FaultFn dropFirst(Verb verb)
     };
 }
 
+CountingS3::ObjectStore::FaultFn dropFirstTwo(Verb verb)
+{
+    return [verb](const CountingS3::Request & request, Poco::Net::HTTPServerResponse &)
+    {
+        if (request.verb == verb && request.nth <= 2)
+            throw CountingS3::DropResponse();
+        return false;
+    };
+}
+
 uint64_t failedPublicationAttempts()
 {
     return ProfileEvents::global_counters[ProfileEvents::CASBlobPublishAttemptFailed].load();
@@ -222,6 +232,27 @@ TEST(CASBlobPublishTransport, LostPutIsRepublishedWithAFreshEnvelope)
     EXPECT_TRUE(first.incarnation_tag != second.incarnation_tag) << "the second publication resent the first envelope";
     EXPECT_EQ(store.get(path), puts[1].body);
     EXPECT_EQ(failedPublicationAttempts() - failed_before, 1u);
+}
+
+/// A single lost attempt is routine and the next one usually succeeds, so only a repeated failure is
+/// worth a client-visible warning.
+TEST(CASBlobPublishTransport, FirstFailedAttemptIsBelowWarning)
+{
+    (void)getContext();
+    CountingS3::ObjectStore store(dropFirstTwo(Verb::PutObject));
+    CountingS3Server server(store.responder());
+    auto pool = openPool(server.getUrl());
+    const std::string payload = "two-lost-puts-payload";
+    auto build = startBuild(pool, payload);
+    DB::Cas::tests::ScopedLogCapture capture("CasBlobPublishAttempt", "warning");
+
+    DB::Cas::BlobSource source;
+    source.size = payload.size();
+    source.open = [payload] { return std::make_unique<DB::ReadBufferFromOwnString>(payload); };
+    build->putBlob(DB::Cas::tests::idOf(payload), std::move(source));
+
+    EXPECT_EQ(capture.count("failed, attempt 1 of"), 0u) << capture.captured();
+    EXPECT_EQ(capture.count("failed, attempt 2 of"), 1u) << capture.captured();
 }
 
 /// A lost staged `CopyObject` is not resent: the staged copy is spent, so the retry streams.

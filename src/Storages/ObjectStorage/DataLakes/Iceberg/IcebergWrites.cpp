@@ -37,6 +37,7 @@
 #include <Storages/ObjectStorage/DataLakes/DataLakeStorageSettings.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/AvroSchema.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergFieldParseHelpers.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergWrites.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFile.h>
@@ -163,6 +164,8 @@ bool isNaNPartitionValue(const Field & field, DataTypePtr type)
     }
 }
 
+/// Integers, floats, dates and times are copied in host order. Their reader uses `insertData`, which
+/// expects that layout. `DateTime64` is the exception: it is loaded with `unalignedLoadLittleEndian`.
 template <typename T>
 std::vector<uint8_t> dumpValue(T value)
 {
@@ -349,7 +352,10 @@ std::vector<uint8_t> dumpFieldToBytes(const Field & field, DataTypePtr type)
         case TypeIndex::UInt64:
             return dumpValue(applyVisitor(FieldVisitorConvertToNumber<Int64>(), field));
         case TypeIndex::DateTime64:
-            return dumpValue(getDateTime64ValueForIcebergBounds(field, type));
+        {
+            const auto bytes = Iceberg::serializeDateTime64IcebergBound(getDateTime64ValueForIcebergBounds(field, type));
+            return std::vector<uint8_t>(bytes.begin(), bytes.end());
+        }
         case TypeIndex::String:
         {
             auto value = field.safeGet<String>();

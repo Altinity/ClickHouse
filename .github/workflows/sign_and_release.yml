@@ -10,6 +10,10 @@ on:
         description: 'The environment to release to. "staging" or "production"'
         required: true
         default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
       package_version:
         description: 'The version of the package to release'
         required: true
@@ -19,23 +23,35 @@ on:
         required: true
         default: true
         type: boolean
-      GPG_PASSPHRASE:
-        description: 'GPG passphrase for signing (required for production releases)'
-        required: false
-        type: string
       folder_time:
         description: 'Optional timestamp for the release folder. If not provided, one will be generated.'
         required: false
         type: string
 
+concurrency:
+  group: sign-and-release-${{ inputs.release_environment }}
+  cancel-in-progress: false
+  queue: max
+
 env:
   ARTIFACT_NAME: build_report_package_release
   AWS_REGION: us-east-1
-  SRC_BUCKET: altinity-build-artifacts
-  S3_STORAGE_BUCKET: altinity-test-reports-temp
+  SRC_BUCKET: ${{ vars.S3_ARTIFACT_BUCKET }}
+  DEST_BUCKET: ${{ vars.S3_STORAGE_BUCKET }}
 
 jobs:
+  approve-release:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.release_environment }}
+    steps:
+      - name: Release approved
+        run: echo "Release of ${PACKAGE_VERSION} to ${RELEASE_ENVIRONMENT} approved (started by ${GITHUB_ACTOR})"
+        env:
+          PACKAGE_VERSION: ${{ inputs.package_version }}
+          RELEASE_ENVIRONMENT: ${{ inputs.release_environment }}
+
   extract-package-info:
+    needs: approve-release
     runs-on: [altinity-style-checker-aarch64, altinity-on-demand]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -53,17 +69,31 @@ jobs:
       dest_url: ${{ env.DEST_URL }}
       major_version: ${{ env.MAJOR_VERSION }}
       build_dir: ${{ env.BUILD_DIR }}
+      arm_build_dir: ${{ env.ARM_BUILD_DIR }}
+      package_version: ${{ env.PACKAGE_VERSION }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Checkout release scripts
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            tests/ci/release/extract-package-info.py
+            tests/ci/release/process-binaries.py
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Install Python deps
+        run: pip3 install packaging requests boto3
 
       - name: Run script
+        env:
+          PACKAGE_VERSION: ${{ inputs.package_version }}
+          WORKFLOW_URL: ${{ inputs.workflow_url }}
         run: |
           python3 tests/ci/release/extract-package-info.py \
-            --artifact-dest-bucket $S3_STORAGE_BUCKET \
-            --artifact-src-bucket $SRC_BUCKET \
-            --package-version ${{ inputs.package_version }} \
-            --workflow-url ${{ inputs.workflow_url }}
+            --artifact-dest-bucket "$DEST_BUCKET" \
+            --artifact-src-bucket "$SRC_BUCKET" \
+            --package-version "$PACKAGE_VERSION" \
+            --workflow-url "$WORKFLOW_URL"
 
       - name: Display Extracted Information
         run: |
@@ -78,6 +108,8 @@ jobs:
           echo "src_url: ${SRC_URL}"
           echo "dest_url: ${DEST_URL}"
           echo "major_version: ${MAJOR_VERSION}"
+          echo "build_dir: ${BUILD_DIR}"
+          echo "arm_build_dir: ${ARM_BUILD_DIR}"
 
       - name: Install aws cli
         if: ${{ env.NEEDS_BINARY_PROCESSING == 'true' }}
@@ -86,61 +118,15 @@ jobs:
           version: 2
           arch: arm64
 
-      - name: Process ARM binary
+      - name: Process ARM binaries
         if: ${{ env.NEEDS_BINARY_PROCESSING == 'true' }}
         run: |
-          ARM_PATH=$([ "$BUILD_DIR" = "build_amd_release" ] && echo "build_arm_release" || echo "package_aarch64")
-
-          echo "Downloading clickhouse binary..."
-          if ! aws s3 cp "${SRC_URL}/${ARM_PATH}/clickhouse" clickhouse; then
-            echo "Failed to download clickhouse binary"
-            exit 1
-          fi
-
-          chmod +x clickhouse
-
-          echo "Running clickhouse binary..."
-          ./clickhouse -q'q'
-
-          echo "Downloading clickhouse-stripped binary..."
-          if ! aws s3 cp "${SRC_URL}/${ARM_PATH}/clickhouse-stripped" clickhouse-stripped; then
-            echo "Failed to download clickhouse-stripped binary"
-            exit 1
-          fi
-
-          chmod +x clickhouse-stripped
-
-          echo "Running clickhouse-stripped binary..."
-          ./clickhouse-stripped -q'q'
-
-          echo "Downloading clickhouse-common-static tar..."
-          if ! aws s3 cp "${SRC_URL}/${ARM_PATH}/clickhouse-common-static-${{ inputs.package_version }}-arm64.tgz" clickhouse-common-static.tgz; then
-            echo "Failed to download clickhouse-common-static tar"
-            exit 1
-          fi
-
-          tar -xvf clickhouse-common-static.tgz
-
-          if readelf -S "clickhouse-common-static-${{ inputs.package_version }}/usr/bin/clickhouse" | grep -q '\.symtab'; then
-            echo "✓ Binary has symtable"
-          else
-            echo "✗ Binary is missing symtable"
-            exit 1
-          fi
-
-          echo "Uploading processed binaries..."
-          if ! aws s3 cp clickhouse "${SRC_URL}/${ARM_PATH}/arm64-bin/non-self-extracting/"; then
-            echo "Failed to upload clickhouse binary"
-            exit 1
-          fi
-          if ! aws s3 cp clickhouse-stripped "${SRC_URL}/${ARM_PATH}/arm64-bin/non-self-extracting/"; then
-            echo "Failed to upload stripped clickhouse binary"
-            exit 1
-          fi
-          if ! aws s3 cp "clickhouse-common-static-${{ inputs.package_version }}/usr/bin/clickhouse" "${SRC_URL}/${ARM_PATH}/arm64-bin/non-self-extracting/clickhouse-with-symtable"; then
-            echo "Failed to upload clickhouse-with-symtable binary"
-            exit 1
-          fi
+          python3 tests/ci/release/process-binaries.py \
+            --arch arm64 \
+            --package-version "$PACKAGE_VERSION" \
+            --binaries-url "${SRC_URL}/${ARM_BUILD_DIR}" \
+            --tgz-url "${SRC_URL}/${ARM_BUILD_DIR}" \
+            --upload-url "${SRC_URL}/${ARM_BUILD_DIR}/arm64-bin/non-self-extracting"
 
   copy-packages:
     needs: extract-package-info
@@ -153,97 +139,45 @@ jobs:
       NEEDS_BINARY_PROCESSING: ${{ needs.extract-package-info.outputs.needs_binary_processing }}
       MAJOR_VERSION: ${{ needs.extract-package-info.outputs.major_version }}
       BUILD_DIR: ${{ needs.extract-package-info.outputs.build_dir }}
+      ARM_BUILD_DIR: ${{ needs.extract-package-info.outputs.arm_build_dir }}
+      PACKAGE_VERSION: ${{ needs.extract-package-info.outputs.package_version }}
     steps:
+      - name: Checkout release scripts
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: tests/ci/release/process-binaries.py
+          filter: blob:none
+          persist-credentials: false
+
       - name: Install aws cli
         uses: unfor19/install-aws-cli-action@v1
         with:
           version: 2
           arch: amd64
 
-      - name: Move verified packages to destination
+      - name: Copy packages to destination
         run: |
-          # Move ARM packages
-          ARM_PATH=$([ "$BUILD_DIR" = "build_amd_release" ] && echo "build_arm_release" || echo "package_aarch64")
-          echo "Moving verified ARM packages to destination..."
-          if ! aws s3 sync "${SRC_URL}/${ARM_PATH}/" "${DEST_URL}/packages/ARM_PACKAGES/"; then
-            echo "Failed to move ARM packages to destination"
-            exit 1
-          fi
+          aws s3 sync --no-progress --exclude "*.src.tar.gz" \
+            "${SRC_URL}/${ARM_BUILD_DIR}/" "${DEST_URL}/packages/ARM_PACKAGES/"
+          aws s3 sync --no-progress --exclude "*.src.tar.gz" \
+            "${SRC_URL}/${BUILD_DIR}/" "${DEST_URL}/packages/AMD_PACKAGES/"
 
-          # Move AMD packages
-          echo "Moving verified AMD packages to destination..."
-          if ! aws s3 sync "${SRC_URL}/${BUILD_DIR}/" "${DEST_URL}/packages/AMD_PACKAGES/"; then
-            echo "Failed to move AMD packages to destination"
-            exit 1
-          fi
-
-          # Clean up temporary directories
-          rm -rf /tmp/arm_packages /tmp/amd_packages
-
-      - name: Separate ARM binary
+      - name: Separate binaries
         run: |
           aws s3 mv "${DEST_URL}/packages/ARM_PACKAGES/clickhouse" "${DEST_URL}/packages/ARM_PACKAGES/arm64-bin/clickhouse"
           aws s3 mv "${DEST_URL}/packages/ARM_PACKAGES/clickhouse-stripped" "${DEST_URL}/packages/ARM_PACKAGES/arm64-bin/clickhouse-stripped"
-
-      - name: Separate AMD binary
-        run: |
           aws s3 mv "${DEST_URL}/packages/AMD_PACKAGES/clickhouse" "${DEST_URL}/packages/AMD_PACKAGES/amd64-bin/clickhouse"
           aws s3 mv "${DEST_URL}/packages/AMD_PACKAGES/clickhouse-stripped" "${DEST_URL}/packages/AMD_PACKAGES/amd64-bin/clickhouse-stripped"
 
-      - name: Process AMD binary
+      - name: Process AMD binaries
         if: ${{ env.NEEDS_BINARY_PROCESSING == 'true' }}
         run: |
-          echo "Downloading clickhouse binary..."
-          if ! aws s3 cp "${DEST_URL}/packages/AMD_PACKAGES/amd64-bin/clickhouse" clickhouse; then
-            echo "Failed to download clickhouse binary"
-            exit 1
-          fi
-
-          chmod +x clickhouse
-
-          echo "Running clickhouse binary..."
-          ./clickhouse -q'q'
-
-          echo "Downloading clickhouse-stripped binary..."
-          if ! aws s3 cp "${DEST_URL}/packages/AMD_PACKAGES/amd64-bin/clickhouse-stripped" clickhouse-stripped; then
-            echo "Failed to download clickhouse-stripped binary"
-            exit 1
-          fi
-
-          chmod +x clickhouse-stripped
-
-          echo "Running clickhouse-stripped binary..."
-          ./clickhouse-stripped -q'q'
-
-
-          echo "Downloading clickhouse-common-static tar..."
-          if ! aws s3 cp "${DEST_URL}/packages/AMD_PACKAGES/clickhouse-common-static-${{ inputs.package_version }}-amd64.tgz" clickhouse-common-static.tgz; then
-            echo "Failed to download clickhouse-common-static tar"
-            exit 1
-          fi
-
-          tar -xvf clickhouse-common-static.tgz
-
-          if readelf -S "clickhouse-common-static-${{ inputs.package_version }}/usr/bin/clickhouse" | grep -q '\.symtab'; then
-            echo "✓ Binary has symtable"
-          else
-            echo "✗ Binary is missing symtable"
-            exit 1
-          fi
-
-          echo "Uploading processed binaries..."
-          if ! aws s3 cp clickhouse "${DEST_URL}/packages/AMD_PACKAGES/amd64-bin/non-self-extracting/"; then
-            echo "Failed to upload clickhouse binary"
-            exit 1
-          fi
-          if ! aws s3 cp clickhouse-stripped "${DEST_URL}/packages/AMD_PACKAGES/amd64-bin/non-self-extracting/"; then
-            echo "Failed to upload stripped clickhouse binary"
-            exit 1
-          fi
-          if ! aws s3 cp clickhouse-common-static-${{ inputs.package_version }}/usr/bin/clickhouse "${DEST_URL}/packages/AMD_PACKAGES/amd64-bin/non-self-extracting/clickhouse-with-symtable"; then
-            echo "Failed to upload stripped clickhouse binary"
-            exit 1
-          fi
+          python3 tests/ci/release/process-binaries.py \
+            --arch amd64 \
+            --package-version "$PACKAGE_VERSION" \
+            --binaries-url "${DEST_URL}/packages/AMD_PACKAGES/amd64-bin" \
+            --tgz-url "${DEST_URL}/packages/AMD_PACKAGES" \
+            --upload-url "${DEST_URL}/packages/AMD_PACKAGES/amd64-bin/non-self-extracting"
 
   copy-test-results:
     needs: extract-package-info
@@ -287,6 +221,7 @@ jobs:
 
   sign-and-publish:
     needs: [extract-package-info, copy-packages]
+    environment: ${{ inputs.release_environment == 'production' && 'production-signing' || 'staging' }}
     runs-on: ${{
       inputs.release_environment == 'staging' && 'arc-runners-clickhouse-signer' ||
       inputs.release_environment == 'production' && 'arc-runners-clickhouse-signer-prod'
@@ -295,7 +230,7 @@ jobs:
       REPO_DNS_NAME: ${{ inputs.release_environment == 'production' && 'builds.altinity.cloud' || 'builds.staging.altinity.cloud' }}
       REPO_NAME: ${{ inputs.release_environment == 'production' && 'altinity' || 'altinity-staging' }}
       REPO_SUBTITLE: ${{ inputs.release_environment == 'production' && 'Stable Builds' || 'Staging Builds' }}
-      PACKAGE_VERSION: ${{ inputs.package_version }}
+      PACKAGE_VERSION: ${{ needs.extract-package-info.outputs.package_version }}
       FOLDER_TIME: ${{ needs.extract-package-info.outputs.folder_time }}
       REPO_PREFIX: ${{ needs.extract-package-info.outputs.repo_prefix }}
       NEEDS_BINARY_PROCESSING: ${{ needs.extract-package-info.outputs.needs_binary_processing }}
@@ -308,11 +243,13 @@ jobs:
           version: 2
           arch: arm64
 
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Checkout release scripts
+        uses: actions/checkout@v6
         with:
-          repository: Altinity/ClickHouse
           path: ClickHouse
+          sparse-checkout: tests/ci/release
+          filter: blob:none
+          persist-credentials: false
 
       - name: Install required packages
         run: |
@@ -342,79 +279,40 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
-      - name: Set up GPG passphrase
-        run: |
-          if [ "${RELEASE_ENVIRONMENT}" == "production" ]; then
-            if [ -z "${{ inputs.GPG_PASSPHRASE }}" ]; then
-              echo "Error: GPG_PASSPHRASE is required for production releases"
-              exit 1
-            fi
-            echo "${{ inputs.GPG_PASSPHRASE }}" > /tmp/gpg_passphrase
-          else
-            echo "${{ secrets.GPG_PASSPHRASE }}" > /tmp/gpg_passphrase
-          fi
-          chmod 600 /tmp/gpg_passphrase
+      - name: Import and unlock GPG key
+        id: gpg
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          SIGNING_SECRET_ID: ${{ inputs.release_environment == 'production' && secrets.SIGNING_PROD_SECRET_ID || secrets.SIGNING_STAGING_SECRET_ID }}
+        run: ClickHouse/tests/ci/release/gpg-setup.sh setup "$RELEASE_ENVIRONMENT"
 
       - name: Sign and publish packages
+        env:
+          GPG_KEY_ID: ${{ steps.gpg.outputs.key_id }}
+          GPG_KEY_NAME: ${{ steps.gpg.outputs.key_name }}
         run: |
-          if [ ! -f /tmp/gpg_passphrase ]; then
-            echo "Error: GPG passphrase file not found"
-            exit 1
-          fi
-
-          echo "Processing GPG key..."
-          if [ "${RELEASE_ENVIRONMENT}" == "production" ]; then
-            if ! aws secretsmanager get-secret-value --secret-id arn:aws:secretsmanager:us-east-1:${{ secrets.SIGNING_PROD_SECRET_ID }} --query SecretString --output text | sed -e "s/^'//" -e "s/'$//" | jq -r '.altinity_prod_gpg | @base64d' | gpg --quiet --batch --import >/dev/null 2>&1; then
-              echo "Failed to import prod GPG key"
-              exit 1
-            fi
-          else
-            if ! aws secretsmanager get-secret-value --secret-id arn:aws:secretsmanager:us-east-1:${{ secrets.SIGNING_STAGING_SECRET_ID }} --query SecretString --output text | sed -e "s/^'//" -e "s/'$//" | jq -r '.altinity_staging_gpg | @base64d' | gpg --quiet --batch --import >/dev/null 2>&1; then
-              echo "Failed to import staging GPG key"
-              exit 1
-            fi
-          fi
-
-          gpg --quiet --list-secret-keys --with-keygrip >/dev/null 2>&1
-          gpgconf --kill gpg-agent >/dev/null 2>&1
-          gpg-agent --daemon --allow-preset-passphrase >/dev/null 2>&1
-
-          if ! aws ssm get-parameter --name /gitlab-runner/key-encrypting-key --with-decryption --query Parameter.Value --output text | sudo tee /root/.key-encrypting-key >/dev/null; then
-            echo "Failed to get key encrypting key"
-            exit 1
-          fi
-
-          GPG_KEY_NAME=$(gpg --quiet --list-secret-keys | grep uid | head --lines 1 | tr -s " " | cut -d " " -f 4-)
-          GPG_KEY_ID=$(gpg --quiet --list-secret-keys --with-keygrip "${GPG_KEY_NAME}" | grep Keygrip | head --lines 1 | tr -s " " | cut -d " " -f 4)
-          cat /tmp/gpg_passphrase | base64 -d | sudo openssl enc -d -aes-256-cbc -pbkdf2 -pass file:/root/.key-encrypting-key -in - -out - | /usr/lib/gnupg/gpg-preset-passphrase --preset $GPG_KEY_ID >/dev/null 2>&1
-
-          echo "Running Ansible playbook for signing and publishing..."
-          echo "ansible-playbook -i ClickHouse/tests/ci/release/packaging/ansible/inventory/localhost.yml -e aws_region=$AWS_REGION -e local_repo_path="/home/runner/.cache/${{ inputs.release_environment }}" -e pkgver=\"${PACKAGE_VERSION}\" -e release_environment=$RELEASE_ENVIRONMENT -e repo_dns_name=$REPO_DNS_NAME -e repo_name=$REPO_NAME -e repo_prefix=\"$REPO_PREFIX\" -e repo_subtitle=\"$REPO_SUBTITLE\" -e s3_pkgs_bucket=$S3_STORAGE_BUCKET -e s3_pkgs_path=\"builds/stable/v${PACKAGE_VERSION}/${FOLDER_TIME}\" -e repo_path=\"/home/runner/.cache/${{ inputs.release_environment }}\" ClickHouse/tests/ci/release/packaging/ansible/sign-and-release.yml "
-          if ! ansible-playbook -i ClickHouse/tests/ci/release/packaging/ansible/inventory/localhost.yml \
-            -e aws_region=$AWS_REGION \
+          ansible-playbook -i ClickHouse/tests/ci/release/packaging/ansible/inventory/localhost.yml \
+            -e aws_region="$AWS_REGION" \
             -e gpg_key_id="$GPG_KEY_ID" \
             -e gpg_key_name="$GPG_KEY_NAME" \
-            -e local_repo_path="/home/runner/.cache/${{ inputs.release_environment }}" \
-            -e pkgver="${PACKAGE_VERSION}" \
-            -e release_environment=$RELEASE_ENVIRONMENT \
-            -e repo_dns_name=$REPO_DNS_NAME \
-            -e repo_name=$REPO_NAME \
+            -e local_repo_path="/home/runner/.cache/${RELEASE_ENVIRONMENT}" \
+            -e pkgver="$PACKAGE_VERSION" \
+            -e release_environment="$RELEASE_ENVIRONMENT" \
+            -e repo_dns_name="$REPO_DNS_NAME" \
+            -e repo_name="$REPO_NAME" \
             -e repo_prefix="$REPO_PREFIX" \
             -e repo_subtitle="$REPO_SUBTITLE" \
-            -e s3_pkgs_bucket=$S3_STORAGE_BUCKET \
-            -e s3_pkgs_path="builds/stable/v${PACKAGE_VERSION}/${FOLDER_TIME}" \
-            ClickHouse/tests/ci/release/packaging/ansible/sign-and-release.yml; then
-            echo "Ansible playbook failed"
-            exit 1
-          fi
-          gpgconf --kill gpg-agent
+            -e s3_pkgs_bucket="$DEST_BUCKET" \
+            -e s3_pkgs_path="pre-release/${PACKAGE_VERSION}/${FOLDER_TIME}" \
+            ClickHouse/tests/ci/release/packaging/ansible/sign-and-release.yml
 
-      - name: Cleanup temporary files
+      - name: Remove GPG key and temporary files
         if: always()
+        env:
+          GPG_FINGERPRINT: ${{ steps.gpg.outputs.fingerprint }}
         run: |
-          echo "Cleaning up temporary files..."
-          rm -rf /home/runner/.cache/tmp/packages || true
-          rm -f /tmp/gpg_passphrase || true
+          rm -rf /home/runner/.cache/tmp/packages
+          ClickHouse/tests/ci/release/gpg-setup.sh cleanup "$GPG_FINGERPRINT"
 
   repo-sanity-check:
     needs: sign-and-publish
@@ -427,7 +325,7 @@ jobs:
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      PACKAGE_VERSION: ${{ inputs.package_version }}
+      PACKAGE_VERSION: ${{ needs.extract-package-info.outputs.package_version }}
       DEST_URL: ${{ needs.extract-package-info.outputs.dest_url }}
     steps:
       - name: Install aws cli
@@ -436,19 +334,25 @@ jobs:
           version: 2
           arch: arm64
 
-      - name: Copy to released directory
+      - name: Copy from pre-released to released
         run: |
-          echo "Copying to released directory..."
-          echo "Source: ${DEST_URL}/"
-          echo "Destination: s3://${S3_STORAGE_BUCKET}/builds/released/v${PACKAGE_VERSION}/"
+          case "$DEST_URL" in
+            "s3://${DEST_BUCKET}/builds/pre-released/"?*) ;;
+            *) echo "::error::Unexpected DEST_URL '${DEST_URL}'"; exit 1 ;;
+          esac
 
-          if ! aws s3 sync "${DEST_URL}/" "s3://${S3_STORAGE_BUCKET}/builds/released/v${PACKAGE_VERSION}/" --no-progress; then
+          RELEASED_URL="s3://${DEST_BUCKET}/builds/released/v${PACKAGE_VERSION}/"
+          echo "Copying pre-released build to released directory..."
+          echo "Source: ${DEST_URL}/"
+          echo "Destination: ${RELEASED_URL}"
+
+          if ! aws s3 sync "${DEST_URL}/" "${RELEASED_URL}" --no-progress; then
             echo "Failed to copy to released directory"
             exit 1
           fi
 
           echo "Verifying copy operation..."
-          if ! aws s3 ls "s3://${S3_STORAGE_BUCKET}/builds/released/v${PACKAGE_VERSION}/" | grep -q "packages"; then
+          if ! aws s3 ls "${RELEASED_URL}" | grep -q "packages"; then
             echo "Error: Packages directory not found in destination"
             exit 1
           fi

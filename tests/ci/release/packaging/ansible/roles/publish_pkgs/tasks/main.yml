@@ -62,24 +62,23 @@
   loop_control:
     label: "{{ item.path }}"
 
-- name: Update CloudFront origin path
-  when: 'not (push_to_active|default(false)|bool)'
+- name: Set CloudFront origin path only
+  when: not (push_to_active | default(false) | bool)
+  vars:
+    cf_distribution_id: "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.Id }}"
+    cf_origin_path: "/{{ new_cloudfront_origin_path | regex_replace('^/', '') }}"
   shell: |
     set -euo pipefail
-    DIST_ID="{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.Id }}"
-    ORIGIN_PATH="{{ new_cloudfront_origin_path }}"
-    CONFIG_JSON=/tmp/cf-origin-path-config.json
-    NEW_CONFIG_JSON=/tmp/cf-origin-path-new-config.json
-    trap 'rm -f "$CONFIG_JSON" "$NEW_CONFIG_JSON"' EXIT
-    aws cloudfront get-distribution-config --id "$DIST_ID" > "$CONFIG_JSON"
-    DIST_ETAG=$(jq -r '.ETag' "$CONFIG_JSON")
-    jq --arg path "$ORIGIN_PATH" \
-      '.DistributionConfig | .Origins.Items[0].OriginPath = $path' \
-      "$CONFIG_JSON" > "$NEW_CONFIG_JSON"
+    aws cloudfront get-distribution-config --id "{{ cf_distribution_id }}" > /tmp/cf-dist.json
+    ETAG=$(jq -r '.ETag' /tmp/cf-dist.json)
+    jq --arg path "{{ cf_origin_path }}" \
+      '.DistributionConfig.Origins.Items[0].OriginPath = $path | .DistributionConfig' \
+      /tmp/cf-dist.json > /tmp/cf-config.json
     aws cloudfront update-distribution \
-      --id "$DIST_ID" \
-      --if-match "$DIST_ETAG" \
-      --distribution-config "file://$NEW_CONFIG_JSON"
+      --id "{{ cf_distribution_id }}" \
+      --if-match "$ETAG" \
+      --distribution-config file:///tmp/cf-config.json
+    rm -f /tmp/cf-dist.json /tmp/cf-config.json
   args:
     executable: /bin/bash
 
@@ -91,5 +90,8 @@
   register: invalidation
 
 - name: Wait for CloudFront invalidation to be complete
-  shell: "aws cloudfront wait invalidation-completed --distribution-id {{ cloudfront_info.cloudfront[repo_dns_name].Distribution.Id }} --id {{ invalidation.invalidation.id }}"
+  shell: >-
+    aws cloudfront wait invalidation-completed
+    --distribution-id {{ cloudfront_info.cloudfront[repo_dns_name].Distribution.Id }}
+    --id {{ invalidation.invalidation.id }}
 

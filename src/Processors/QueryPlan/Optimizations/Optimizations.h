@@ -243,6 +243,9 @@ void optimizeJoinLogical(QueryPlan::Node & node, QueryPlan::Nodes &, const Query
 /// A separate tree traverse to apply sorting properties after *InOrder optimizations.
 void applyOrder(const QueryPlanOptimizationSettings & optimization_settings, QueryPlan::Node & root);
 
+/// Lets an offset based parallel replicas read use several replicas of a shard only if no consumer needs stream order.
+void allowReadingShardsFromSeveralReplicas(QueryPlan::Node & root);
+
 /// Returns the name of used projection or nullopt if no projection is used.
 std::optional<String> optimizeUseAggregateProjections(
     QueryPlan::Node & node,

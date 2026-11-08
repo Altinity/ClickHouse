@@ -584,6 +584,9 @@ void optimizeTreeSecondPass(
         optimizeJoinByShards(root);
 
     considerEnablingParallelReplicas(optimization_settings, root, query_plan);
+
+    /// Last: it reads the final consumers of every remote read.
+    allowReadingShardsFromSeveralReplicas(root);
 }
 
 void addStepsToBuildSets(

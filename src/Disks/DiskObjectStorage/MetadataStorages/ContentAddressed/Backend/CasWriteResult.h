@@ -121,7 +121,9 @@ inline std::optional<Etag> orThrow(WriteResult && result, std::string_view what)
                 case GaveUp::Why::Deadline:
                     throwCasWriteRetryLater(fmt::format("{}: gave up at the {} deadline after {} attempt(s)", what, g.deadline_source == GaveUp::Source::Lease ? "lease" : "policy", g.sent_any ? "one or more" : "zero"));
                 case GaveUp::Why::Unresolved:
-                    throwCasWriteRetryLater(fmt::format("{}: the write is unresolved (sent, resolve read found {})", what, renderObservation(g.last_seen)));
+                    throwCasWriteRetryLater(g.sent_any
+                        ? fmt::format("{}: the write is unresolved (sent, resolve read found {})", what, renderObservation(g.last_seen))
+                        : fmt::format("{}: no write was sent; a read of the current object did not complete ({})", what, renderObservation(g.last_seen)));
             }
             UNREACHABLE();
         }}, result);

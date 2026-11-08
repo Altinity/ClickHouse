@@ -28,7 +28,7 @@ BINARY_DOCKER_COMMAND = (
     f"+--memory={Utils.physical_memory() * 95 // 100}"
     f"+--memory-reservation={Utils.physical_memory() * 9 // 10}"
     f"+--volume=.:/ClickHouse"
-    '+--env=AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"+--env=AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"'
+    '+--env=AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"+--env=AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"+--env=S3_ARTIFACT_BUCKET="$S3_ARTIFACT_BUCKET"'
 )
 BINARY_DOCKER_COMMAND_SANITIZER = (
     BINARY_DOCKER_COMMAND + "+--security-opt seccomp=unconfined"
@@ -230,7 +230,7 @@ class JobConfigs:
         runs_on=RunnerLabels.AMD_LARGE,
         command="python3 ./ci/jobs/fast_test.py",
         # --network=host required for ec2 metadata http endpoint to work
-        run_in_docker="altinityinfra/fasttest+--network=host+--volume=./ci/tmp/var/lib/clickhouse:/var/lib/clickhouse+--volume=./ci/tmp/etc/clickhouse-client:/etc/clickhouse-client+--volume=./ci/tmp/etc/clickhouse-server:/etc/clickhouse-server+--volume=./ci/tmp/var/log:/var/log+--volume=.:/ClickHouse+--env=AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID+--env=AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY",
+        run_in_docker="altinityinfra/fasttest+--network=host+--volume=./ci/tmp/var/lib/clickhouse:/var/lib/clickhouse+--volume=./ci/tmp/etc/clickhouse-client:/etc/clickhouse-client+--volume=./ci/tmp/etc/clickhouse-server:/etc/clickhouse-server+--volume=./ci/tmp/var/log:/var/log+--volume=.:/ClickHouse+--env=AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID+--env=AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY+--env=S3_ARTIFACT_BUCKET=$S3_ARTIFACT_BUCKET",
         digest_config=fast_test_digest_config,
         result_name_for_cidb="Tests",
         needs_submodules=True,
@@ -1406,7 +1406,7 @@ class JobConfigs:
     docker_server = Job.Config(
         name=JobNames.DOCKER_SERVER,
         runs_on=RunnerLabels.STYLE_CHECK_AMD,
-        command="python3 ./ci/jobs/docker_server.py --tag-type head --allow-build-reuse --push",
+        command="python3 ./ci/jobs/docker_server.py --tag-type head --allow-build-reuse --push --no-distroless",
         digest_config=Job.CacheDigestConfig(
             include_paths=[
                 "./ci/jobs/docker_server.py",
@@ -1416,13 +1416,18 @@ class JobConfigs:
                 ".github/workflows/grype_scan.yml",
             ],
         ),
-        requires=["Build (amd_release)", "Build (arm_release)"],
+        requires=[
+            ArtifactNames.DEB_AMD_RELEASE,
+            ArtifactNames.DEB_ARM_RELEASE,
+            ArtifactNames.TGZ_AMD_RELEASE,
+            ArtifactNames.TGZ_ARM_RELEASE,
+        ],
         post_hooks=["python3 ./ci/jobs/scripts/job_hooks/docker_clean_up_hook.py"],
     )
     docker_keeper = Job.Config(
         name=JobNames.DOCKER_KEEPER,
         runs_on=RunnerLabels.STYLE_CHECK_AMD,
-        command="python3 ./ci/jobs/docker_server.py --tag-type head --allow-build-reuse --push",
+        command="python3 ./ci/jobs/docker_server.py --tag-type head --allow-build-reuse --push --no-distroless",
         digest_config=Job.CacheDigestConfig(
             include_paths=[
                 "./ci/jobs/docker_server.py",
@@ -1432,7 +1437,10 @@ class JobConfigs:
                 ".github/workflows/grype_scan.yml",
             ],
         ),
-        requires=["Build (amd_release)", "Build (arm_release)"],
+        requires=[
+            ArtifactNames.TGZ_AMD_RELEASE,
+            ArtifactNames.TGZ_ARM_RELEASE,
+        ],
         post_hooks=["python3 ./ci/jobs/scripts/job_hooks/docker_clean_up_hook.py"],
     )
     sqlancer_master_jobs = Job.Config(

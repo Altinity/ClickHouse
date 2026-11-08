@@ -78,14 +78,17 @@ uint64_t nowMs()
 }
 
 /// Rate-limited, because under an outage every blob of every write fails here; the counter has them all.
+/// The first failure is routine and the next attempt usually succeeds, so only a repeat is a warning.
 void recordFailedPublicationAttempt(
     const String & key, BlobPublicationTransport transport, int attempt, int max_attempts, const String & error)
 {
     ProfileEvents::increment(ProfileEvents::CASBlobPublishAttemptFailed);
     LogSeriesLimiter log(getLogger("CasBlobPublishAttempt"), /*allowed_count=*/5, /*interval_s=*/30);
-    LOG_WARNING(log, "Publication of CAS blob {} ({}) failed, attempt {} of {}: {}",
-                key, transport == BlobPublicationTransport::Streaming ? "streaming" : "server-side copy",
-                attempt + 1, max_attempts, error);
+    const char * transport_name = transport == BlobPublicationTransport::Streaming ? "streaming" : "server-side copy";
+    if (attempt == 0)
+        LOG_INFO(log, "Publication of CAS blob {} ({}) failed, attempt {} of {}: {}", key, transport_name, attempt + 1, max_attempts, error);
+    else
+        LOG_WARNING(log, "Publication of CAS blob {} ({}) failed, attempt {} of {}: {}", key, transport_name, attempt + 1, max_attempts, error);
 }
 
 bool isDeterministicBlobPublicationFailure(const std::exception & error)

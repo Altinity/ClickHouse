@@ -842,7 +842,7 @@ void ReadFromRemote::addPipe(
         remote_query_executor->setRemoteFunction(is_remote_function);
         remote_query_executor->setShardCount(shard_count);
 
-        if (context->canUseTaskBasedParallelReplicas() || parallel_replicas_disabled)
+        if (context->canUseTaskBasedParallelReplicas() || parallel_replicas_disabled || !allow_reading_shard_from_several_replicas)
         {
             // when doing parallel reading from replicas (ParallelReplicasMode::READ_TASKS) on a shard:
             // establish a connection to a replica on the shard, the replica will instantiate coordinator to manage parallel reading from replicas on the shard.
@@ -852,6 +852,9 @@ void ReadFromRemote::addPipe(
             // each will execute parallel reading from replicas, so the query result will be multiplied by the number of created coordinators
             //
             // In case parallel replicas are disabled, there also should be a single connection to each shard to prevent result duplication
+            //
+            // With the offset based modes every replica returns its own part of the shard's result, and the replicas
+            // share one port, so a read whose consumer needs stream order uses one replica.
             remote_query_executor->setPoolMode(PoolMode::GET_ONE);
         }
         else
@@ -885,6 +888,9 @@ Pipes ReadFromRemote::addPipes(const ClusterProxy::SelectStreamFactory::Shards &
 
 void ReadFromRemote::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
 {
+    if (context->canUseOffsetParallelReplicas() && !allow_reading_shard_from_several_replicas)
+        LOG_DEBUG(log, "Reading every shard from one replica, the consumers of the read may depend on the order of its streams");
+
     Pipes pipes = addPipes(shards, output_header);
 
     auto pipe = Pipe::unitePipes(std::move(pipes));

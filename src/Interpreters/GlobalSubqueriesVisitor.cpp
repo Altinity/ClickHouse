@@ -54,13 +54,16 @@ void GlobalSubqueriesMatcher::Data::addExternalStorage(ASTPtr & ast, const Names
 
     if (const auto * ast_table_expr = ast->as<ASTTableExpression>())
     {
-        subquery_or_table_name = ast_table_expr->subquery;
-
+        /// `interpretSubquery` reads a table function. A `GLOBAL JOIN s3(...)` is that shape.
         if (ast_table_expr->database_and_table_name)
         {
             subquery_or_table_name = ast_table_expr->database_and_table_name;
             is_table = true;
         }
+        else if (ast_table_expr->table_function)
+            subquery_or_table_name = ast_table_expr->table_function;
+        else
+            subquery_or_table_name = ast_table_expr->subquery;
     }
     else if (ast->as<ASTTableIdentifier>())
     {
@@ -87,14 +90,14 @@ void GlobalSubqueriesMatcher::Data::addExternalStorage(ASTPtr & ast, const Names
     }
 
     String alias = subquery_or_table_name->tryGetAlias();
-    String external_table_name;
-    if (alias.empty())
-    {
-        auto hash = subquery_or_table_name->getTreeHash(/*ignore_aliases=*/ true);
-        external_table_name = fmt::format("_data_{}", toString(hash));
-    }
-    else
-        external_table_name = alias;
+    const auto hash = subquery_or_table_name->getTreeHash(/*ignore_aliases=*/ true);
+    const String hashed_name = fmt::format("_data_{}", toString(hash));
+    /// The alias is the SQL name. A session temporary table with that name must stay untouched,
+    /// so the broadcast is stored under `_data_{hash}` and the alias is only `AS alias`.
+    const bool alias_taken = !alias.empty()
+        && (external_tables.contains(alias)
+            || static_cast<bool>(getContext()->tryResolveStorageID(StorageID("", alias), Context::ResolveExternal)));
+    const String external_table_name = (alias.empty() || alias_taken) ? hashed_name : alias;
 
     /** We replace the subquery with the name of the temporary table.
         * It is in this form, the request will go to the remote server.
@@ -115,6 +118,7 @@ void GlobalSubqueriesMatcher::Data::addExternalStorage(ASTPtr & ast, const Names
     if (auto * ast_table_expr = ast->as<ASTTableExpression>())
     {
         ast_table_expr->subquery.reset();
+        ast_table_expr->table_function.reset();
         ast_table_expr->database_and_table_name = database_and_table_name;
 
         ast_table_expr->children.clear();
