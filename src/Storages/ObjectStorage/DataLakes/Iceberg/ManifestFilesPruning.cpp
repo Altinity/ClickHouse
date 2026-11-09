@@ -630,7 +630,7 @@ PruningReturnStatus ManifestFilesPruner::canBePruned(
         /// manifest says the column has no nulls.
         if (rect_it != entry_hyperrectangles.end() && (has_no_nulls || !key_condition.mayBeTrueOnNull(0)))
         {
-            /// A `timestamp` column in `[1e16, 1e18)` has two ranges. Prune only when every range misses.
+            /// The bounds are one range in the column unit. Prune only when it misses the predicate.
             bool may_be_true = false;
             for (const auto & range : rect_it->second)
             {

@@ -529,11 +529,36 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
                     continue;
 
                 /// Optional Iceberg fields are `Nullable(DateTime64)`. The outer type is not `DateTime64`.
+                /// `timestamp` / `timestamptz` bounds are microseconds; `timestamp_ns` / `timestamptz_ns` are nanoseconds.
                 if (WhichDataType(removeNullable(column_type)).isDateTime64())
                 {
                     const auto timestamp_ranges = deserializeDateTime64MinMaxRanges(left_str, right_str, column_type);
                     if (timestamp_ranges.empty())
+                    {
+                        /// Eight-byte bounds that produce no range are inverted. A shorter bound does not decode.
+                        if (left_str.size() == sizeof(Int64) && right_str.size() == sizeof(Int64))
+                        {
+                            LOG_WARNING(
+                                getLogger("ManifestFileIterator"),
+                                "Manifest file '{}' declares a lower bound above the upper bound for column id "
+                                "{} of data file '{}'; skipping min/max pruning for this column",
+                                path_to_manifest_file,
+                                column_id,
+                                parsed_entry->file_path_key);
+                        }
+                        else
+                        {
+                            /// Same message as a bound of any other type that does not decode.
+                            LOG_DEBUG(
+                                getLogger("ManifestFileIterator"),
+                                "Manifest file '{}' declares a bound that cannot be read as a usable range border "
+                                "for column id {} of data file '{}'; skipping min/max pruning for this column",
+                                path_to_manifest_file,
+                                column_id,
+                                parsed_entry->file_path_key);
+                        }
                         continue;
+                    }
 
                     auto & ranges = hyperrectangles[column_id];
                     for (const auto & timestamp_range : timestamp_ranges)
@@ -585,10 +610,6 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
                         parsed_entry->file_path_key);
                     continue;
                 }
-
-                /// Mixed-scale timestamp stats can decode to lower > upper; skip min/max for this column.
-                if (DB::Range::less(*right, *left))
-                    continue;
 
                 hyperrectangles[column_id].emplace_back(*left, true, *right, true);
             }

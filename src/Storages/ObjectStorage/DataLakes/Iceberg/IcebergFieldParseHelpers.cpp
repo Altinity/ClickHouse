@@ -28,8 +28,9 @@ namespace Iceberg
 namespace
 {
 
-/// Iceberg timestamps are 8-byte little-endian (spec Appendix D). The unit comes from the
-/// column type: `DateTime64(6)` bounds are microseconds and are returned as stored.
+/// Iceberg timestamps are 8-byte little-endian (spec Appendix D). `DateTime64(6)` (`timestamp` /
+/// `timestamptz`) bounds are microseconds and `DateTime64(9)` (`timestamp_ns` / `timestamptz_ns`)
+/// bounds are nanoseconds. Both are returned as stored.
 std::optional<Field> deserializeDateTime64FromBinaryRepr(const std::string & str, const IDataType & type, bool /*lower_bound*/)
 {
     if (str.size() != sizeof(Int64))
