@@ -729,6 +729,9 @@ class PullRequestPushYamlGen:
             format_kwargs[
                 "ENV_SECRETS"
             ] += AltinityWorkflowTemplates.ADDITIONAL_GLOBAL_ENV
+        format_kwargs[
+            "ENV_SECRETS"
+        ] += "  S3_ARTIFACT_BUCKET: ${{{{ vars.S3_ARTIFACT_BUCKET }}}}\n"
 
         template_1 = base_template.strip().format(
             NAME=self.workflow_config.name,

@@ -143,10 +143,11 @@ class Validator:
                         f"Must be Artifact.Config type, not {type(artifact)}: [{artifact}]",
                         workflow.name,
                     )
-                    if artifact.is_s3_artifact():
-                        assert (
-                            Settings.S3_ARTIFACT_PATH
-                        ), "Provide S3_ARTIFACT_PATH setting in any .py file in ./ci/settings/* to be able to use s3 for artifacts"
+                    # NOTE (strtgbb): S3_ARTIFACT_BUCKET is set on the job, not when workflows are generated
+                    # if artifact.is_s3_artifact():
+                    #     assert (
+                    #         Settings.S3_ARTIFACT_PATH
+                    #     ), "Provide S3_ARTIFACT_PATH setting in any .py file in ./ci/settings/* to be able to use s3 for artifacts"
 
             for job in workflow.jobs:
                 if job.requires and workflow.artifacts:
@@ -164,9 +165,10 @@ class Validator:
                     Settings.CI_CONFIG_RUNS_ON
                 ), f"Runner label to run workflow config job must be provided via CACHE_CONFIG_RUNS_ON setting if enable_cache=True, workflow [{workflow.name}]"
 
-                assert (
-                    Settings.CACHE_S3_PATH
-                ), f"CACHE_S3_PATH Setting must be defined if enable_cache=True, workflow [{workflow.name}]"
+                # NOTE (strtgbb): S3_ARTIFACT_BUCKET is set on the job, not when workflows are generated
+                # assert (
+                #     Settings.CACHE_S3_PATH
+                # ), f"CACHE_S3_PATH Setting must be defined if enable_cache=True, workflow [{workflow.name}]"
 
             if workflow.dockers:
                 if Settings.ENABLE_MULTIPLATFORM_DOCKER_IN_ONE_JOB == False:
@@ -200,9 +202,10 @@ class Validator:
                 )
 
             if workflow.enable_report:
-                assert (
-                    Settings.S3_REPORT_BUCKET
-                ), f"S3_REPORT_BUCKET Setting must be defined if enable_html=True, workflow [{workflow.name}]"
+                # NOTE (strtgbb): S3_ARTIFACT_BUCKET is set on the job, not when workflows are generated
+                # assert (
+                #     Settings.S3_REPORT_BUCKET
+                # ), f"S3_REPORT_BUCKET Setting must be defined if enable_html=True, workflow [{workflow.name}]"
                 assert (
                     Settings.S3_BUCKET_TO_HTTP_ENDPOINT
                 ), f"S3_BUCKET_TO_HTTP_ENDPOINT Setting must be defined if enable_html=True, workflow [{workflow.name}]"
