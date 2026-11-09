@@ -155,7 +155,6 @@ DataFileMetaInfo::DataFileMetaInfo(
                 String right_str;
                 if (i_bounds->second.first.tryGet(left_str) && i_bounds->second.second.tryGet(right_str))
                 {
-                    /// Bounds are one range in the column unit. An unreadable or inverted pair is not a constant.
                     auto left = Iceberg::deserializeFieldFromBinaryRepr(left_str, type, true);
                     auto right = Iceberg::deserializeFieldFromBinaryRepr(right_str, type, false);
                     if (left && right && !DB::Range::less(*right, *left))

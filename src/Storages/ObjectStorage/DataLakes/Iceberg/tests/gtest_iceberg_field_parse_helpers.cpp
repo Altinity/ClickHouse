@@ -7,7 +7,6 @@
 #include <base/unaligned.h>
 #include <Core/Field.h>
 #include <DataTypes/DataTypeDateTime64.h>
-#include <DataTypes/DataTypeNullable.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergFieldParseHelpers.h>
 
 using namespace DB;
@@ -48,30 +47,11 @@ TEST(IcebergFieldParseHelpers, MicrosecondDateTime64BoundsAreKept)
     ASSERT_TRUE(negative.has_value());
     EXPECT_EQ(decimal64Ticks(*negative), us_1960_01_01);
 
-    /// Spark `9999-12-31` sentinel is spec-correct microseconds, below `1e18`.
+    /// Spark `9999-12-31` sentinel is spec-correct microseconds.
     constexpr Int64 spark_9999_us = 253'402'300'799'999'999LL;
     auto sentinel = deserializeFieldFromBinaryRepr(littleEndianInt64(spark_9999_us), type, false);
     ASSERT_TRUE(sentinel.has_value());
     EXPECT_EQ(decimal64Ticks(*sentinel), spark_9999_us);
-}
-
-TEST(IcebergFieldParseHelpers, DateTime64BoundsAreStoredLittleEndian)
-{
-    auto type = std::make_shared<DataTypeDateTime64>(6);
-    /// 2024-02-20 10:00:00 UTC. The written bytes must be little-endian, then read back unchanged.
-    constexpr Int64 us_2024_02_20 = 1'708'423'200'000'000LL;
-    const auto bytes = serializeDateTime64IcebergBound(us_2024_02_20);
-    EXPECT_EQ(bytes, littleEndianInt64(us_2024_02_20));
-    auto field = deserializeFieldFromBinaryRepr(bytes, type, true);
-    ASSERT_TRUE(field.has_value());
-    EXPECT_EQ(decimal64Ticks(*field), us_2024_02_20);
-
-    constexpr Int64 us_1960_01_01 = -315'619'200'000'000LL;
-    const auto negative_bytes = serializeDateTime64IcebergBound(us_1960_01_01);
-    EXPECT_EQ(negative_bytes, littleEndianInt64(us_1960_01_01));
-    auto negative = deserializeFieldFromBinaryRepr(negative_bytes, type, false);
-    ASSERT_TRUE(negative.has_value());
-    EXPECT_EQ(decimal64Ticks(*negative), us_1960_01_01);
 }
 
 TEST(IcebergFieldParseHelpers, NanosecondDateTime64BoundsAreKept)

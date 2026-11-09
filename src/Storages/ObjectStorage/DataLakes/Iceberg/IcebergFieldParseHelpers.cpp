@@ -41,30 +41,6 @@ std::optional<Field> deserializeDateTime64FromBinaryRepr(const std::string & str
     return DecimalField<DateTime64>(DateTime64(unscaled), scale);
 }
 
-std::optional<Int64> loadDateTime64Ticks(const std::string & str)
-{
-    if (str.size() != sizeof(Int64))
-        return std::nullopt;
-    return unalignedLoadLittleEndian<Int64>(str.data());
-}
-
-void appendRange(std::vector<DateTime64BoundRange> & ranges, Int64 lower_ticks, Int64 upper_ticks, UInt32 scale)
-{
-    if (lower_ticks > upper_ticks)
-        return;
-
-    ranges.push_back(DateTime64BoundRange{
-        DecimalField<DateTime64>(DateTime64(lower_ticks), scale),
-        DecimalField<DateTime64>(DateTime64(upper_ticks), scale)});
-}
-
-}
-
-std::string serializeDateTime64IcebergBound(Int64 ticks)
-{
-    std::string bytes(sizeof(Int64), '\0');
-    unalignedStoreLittleEndian<Int64>(bytes.data(), ticks);
-    return bytes;
 }
 
 Int64 fieldToInt64(const Field & value, std::string_view context, std::string_view arg_name)
@@ -237,21 +213,6 @@ namespace
         return DecimalField<DecimalType>(unscaled_value, scale);
     }
 
-}
-
-std::vector<DateTime64BoundRange> deserializeDateTime64MinMaxRanges(
-    const std::string & lower_str,
-    const std::string & upper_str,
-    DataTypePtr type)
-{
-    std::vector<DateTime64BoundRange> ranges;
-    const auto lower_ticks = loadDateTime64Ticks(lower_str);
-    const auto upper_ticks = loadDateTime64Ticks(upper_str);
-    if (!lower_ticks || !upper_ticks)
-        return ranges;
-
-    appendRange(ranges, *lower_ticks, *upper_ticks, getDecimalScale(*removeNullable(type)));
-    return ranges;
 }
 
 std::optional<Field>

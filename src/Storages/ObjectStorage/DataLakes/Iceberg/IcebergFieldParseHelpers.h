@@ -35,24 +35,6 @@ std::vector<Int64> fieldToInt64Array(const Field & value, std::string_view conte
 std::optional<Field>
 deserializeFieldFromBinaryRepr(const std::string & str, DataTypePtr expected_type, bool lower_bound, bool compensate_rounding = true);
 
-/// Appendix D stores `timestamp`, `timestamptz`, `timestamp_ns`, and `timestamptz_ns` as an 8-byte little-endian `long`.
-std::string serializeDateTime64IcebergBound(Int64 ticks);
-
-/// One Iceberg timestamp lower/upper pair, in the unit of the column type.
-struct DateTime64BoundRange
-{
-    Field lower;
-    Field upper;
-};
-
-/// Min/max used for file pruning. `DateTime64(6)` is `timestamp` / `timestamptz` (microseconds) and
-/// `DateTime64(9)` is `timestamp_ns` / `timestamptz_ns` (nanoseconds). Bounds are read in that unit.
-/// Returns one range, or none when the pair is inverted or not 8 bytes.
-std::vector<DateTime64BoundRange> deserializeDateTime64MinMaxRanges(
-    const std::string & lower_str,
-    const std::string & upper_str,
-    DataTypePtr type);
-
 }
 
 #endif

@@ -541,7 +541,7 @@ std::optional<Range> rangeOfPartitionValue(const String & transform_name, const 
 }
 
 PruningReturnStatus ManifestFilesPruner::canBePruned(
-    const ProcessedManifestFileEntryPtr & entry, const std::unordered_map<Int32, std::vector<DB::Range>> & entry_hyperrectangles) const
+    const ProcessedManifestFileEntryPtr & entry, const std::unordered_map<Int32, DB::Range> & entry_hyperrectangles) const
 {
     const auto & partition_value = entry->parsed_entry->partition_key_value;
 
@@ -628,21 +628,11 @@ PruningReturnStatus ManifestFilesPruner::canBePruned(
         /// A null in the file does not make a null-rejecting predicate true, so the non-null
         /// bounds still prune. A predicate that can match null keeps the file unless the
         /// manifest says the column has no nulls.
-        if (rect_it != entry_hyperrectangles.end() && (has_no_nulls || !key_condition.mayBeTrueOnNull(0)))
+        if (rect_it != entry_hyperrectangles.end()
+            && !key_condition.mayBeTrueInRange(1, &rect_it->second.left, &rect_it->second.right, data_types)
+            && (has_no_nulls || !key_condition.mayBeTrueOnNull(0)))
         {
-            /// The bounds are one range in the column unit. Prune only when it misses the predicate.
-            bool may_be_true = false;
-            for (const auto & range : rect_it->second)
-            {
-                if (key_condition.mayBeTrueInRange(1, &range.left, &range.right, data_types))
-                {
-                    may_be_true = true;
-                    break;
-                }
-            }
-
-            if (!may_be_true)
-                return PruningReturnStatus::MIN_MAX_INDEX_PRUNED;
+            return PruningReturnStatus::MIN_MAX_INDEX_PRUNED;
         }
     }
 
