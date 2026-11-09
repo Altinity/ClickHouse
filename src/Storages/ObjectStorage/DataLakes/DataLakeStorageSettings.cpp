@@ -50,6 +50,11 @@ bool DataLakeStorageSettings::hasBuiltin(std::string_view name)
     return DataLakeStorageSettingsImpl::hasBuiltin(name);
 }
 
+std::optional<SettingsTierType> DataLakeStorageSettings::tryGetTierOfBuiltin(std::string_view name)
+{
+    return DataLakeStorageSettingsImpl::tryGetTierOfBuiltin(name);
+}
+
 void DataLakeStorageSettings::loadFromSettingsChanges(const SettingsChanges & changes)
 {
     for (const auto & [name, value, _] : changes)

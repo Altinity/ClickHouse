@@ -55,6 +55,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         addSettingsChanges(settings_changes_history, "26.8.34.20001.altinityantalya",
         {
             {"input_format_parquet_detect_variant_by_structure", false, true, "New setting to read Spark variant columns, which have no `VARIANT` logical type, as `Dynamic` instead of `Tuple`"},
+            {"use_iceberg_manifest_list_partition_pruning", false, true, "New setting to skip Iceberg manifest files whose manifest-list partition summaries cannot match the query filter, without reading them."},
         });
         addSettingsChanges(settings_changes_history, "26.8.27.20001.altinityantalya",
         {
