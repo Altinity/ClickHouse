@@ -81,7 +81,6 @@ public:
 
     void beginTransaction() override;
     void commitTransaction() override;
-    void checkpointTransaction() override;
 
     void setPreferredFileOrder(const Strings & file_names) override { preferred_file_order = file_names; }
 

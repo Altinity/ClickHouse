@@ -16,6 +16,7 @@
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
 #include <Processors/QueryPlan/QueryPlan.h>
 #include <Processors/QueryPlan/ExpressionStep.h>
+#include <Processors/Transforms/RemovingSparseTransform.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include "Common/setThreadName.h"
 #include <Common/Exception.h>
@@ -383,6 +384,16 @@ bool ExportPartTask::executeStep()
             QueryPlanOptimizationSettings optimization_settings(local_context);
             auto pipeline_settings = BuildQueryPipelineSettings(local_context);
             auto builder = plan_for_part.buildQueryPipeline(optimization_settings, pipeline_settings);
+
+            /// The sink of a storage without sparse serialization, and the output format it writes with,
+            /// expect full columns, as `INSERT` guarantees for it.
+            if (!destination_storage->supportsSparseSerialization())
+            {
+                builder->addSimpleTransform([](const SharedHeader & header) -> ProcessorPtr
+                {
+                    return std::make_shared<RemovingSparseTransform>(header);
+                });
+            }
 
             builder->setProgressCallback([&exports_list_entry](const Progress & progress)
             {
