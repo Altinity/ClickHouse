@@ -106,6 +106,10 @@ private:
     };
     mutable std::optional<SchemaInfo> schema;
 
+    /// Clustering columns from the `delta.clustering` domain metadata.
+    /// std::nullopt means not yet fetched; empty vector means not clustered.
+    mutable std::optional<DB::Names> clustering_columns;
+
     struct SnapshotStats
     {
         /// Total number of bytes in table
@@ -121,6 +125,7 @@ private:
 
     void initOrUpdateSnapshot() const TSA_REQUIRES(mutex);
     void initOrUpdateSchemaIfChanged() const TSA_REQUIRES(mutex);
+    void initOrUpdateClusteringColumns() const TSA_REQUIRES(mutex);
 
     SnapshotStats getSnapshotStats() const TSA_REQUIRES(mutex);
     SnapshotStats getSnapshotStatsImpl() const TSA_REQUIRES(mutex);
