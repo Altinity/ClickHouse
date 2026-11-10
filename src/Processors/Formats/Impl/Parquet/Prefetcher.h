@@ -72,6 +72,12 @@ public:
     /// PrefetchHandle::reset can later subtract from MemoryUsageDiff correctly.
     void startPrefetch(const std::vector<PrefetchHandle *> & requests_to_start, MemoryUsageDiff * diff);
 
+    /// True when `startPrefetch` of this handle will not charge any more bytes. A coalesced buffer is
+    /// charged once, on the first handle; the others only pin that buffer. The scheduler uses this to
+    /// keep running row groups whose reads are already in that buffer when the charge exceeds the
+    /// stage budget. Called from the scheduler before `startPrefetch`, on the thread that owns the row group.
+    bool prefetchChargeIsCovered(const PrefetchHandle & handle) const;
+
     /// If prefetched, returns prefetched data.
     /// If prefetch in progress, waits for it to complete.
     /// If prefetch not started, reads the data right here.

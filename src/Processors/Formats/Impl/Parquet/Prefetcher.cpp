@@ -211,6 +211,19 @@ void Prefetcher::startPrefetch(const std::vector<PrefetchHandle *> & requests_to
     }
 }
 
+bool Prefetcher::prefetchChargeIsCovered(const PrefetchHandle & handle) const
+{
+    if (!handle.request || handle.memory)
+        return true;
+    const RequestState * req = handle.request;
+    if (req->state.load(std::memory_order_acquire) != RequestState::State::HasTask)
+        return false;
+    /// `startPrefetch` publishes `task->length` once. After `coalesce_memory_state` is 1 every
+    /// handle of that task adds nothing, whichever coalesce group it was registered in.
+    const Task * task = req->task;
+    return task->coalesce_memory_state.load(std::memory_order_acquire) == 1;
+}
+
 std::vector<PrefetchHandle> Prefetcher::splitRange(
     PrefetchHandle request, const std::vector<std::pair</*global_offset*/ size_t, /*length*/ size_t>> & subranges, bool likely_to_be_used)
 {
