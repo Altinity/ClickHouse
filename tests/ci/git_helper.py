@@ -33,7 +33,7 @@ RELEASE_BRANCH_REGEXP = r"\A\d+[.]\d+\Z"
 TAG_REGEXP = (
     r"\Av\d{2}"  # First two digits of major part
     r"([.][1-9]\d*){3}"  # minor.patch.tweak parts
-    fr"[.-]({'|'.join(VersionType.VALID)})\Z"  # suffix with a version type
+    fr"(?:-1[.]|[.-])({'|'.join(VersionType.VALID)})\Z" # suffix with a version type
 )
 SHA_REGEXP = re.compile(r"\A([0-9]|[a-f]){40}\Z")
 
