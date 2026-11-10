@@ -42,6 +42,7 @@ private:
 
     /// Resizes working buffer if it exceeds the right bound.
     void resizeWorkingBuffer();
+    void restoreViewWorkingBuffer(size_t view_position);
 
     const std::unique_ptr<ReadBufferFromFileBase> impl;
     const String file_name;

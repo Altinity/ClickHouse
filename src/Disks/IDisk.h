@@ -472,6 +472,17 @@ public:
     /// If the disk is plain object storage.
     virtual bool isPlain() const { return false; }
 
+    /// If the disk is a content-addressed object-storage pool (`metadata_type = cas`).
+    /// A clean predicate so callers do not have to reach through `getDataSourceDescription`.
+    virtual bool isContentAddressed() const { return false; }
+
+    /// True when a file write on this disk publishes atomically (see `IDataPartStorage::supportsAtomicFileWrites`).
+    virtual bool supportsAtomicFileWrites() const { return false; }
+
+    /// Whether a new part may be written in the `Packed` storage format on this disk. The format chooser
+    /// downgrades `Packed` to `Full` on a disk that answers false; parts already in `Packed` form stay readable.
+    virtual bool allowsPackedParts() const { return true; }
+
     virtual bool isWriteOnce() const { return false; }
 
     virtual bool supportsHardLinks() const { return true; }

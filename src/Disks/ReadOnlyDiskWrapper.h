@@ -1,5 +1,7 @@
 #pragma once
 
+#include "config.h"
+
 #include <base/types.h>
 #include <Disks/IDisk.h>
 
@@ -89,6 +91,17 @@ public:
     NameSet getCacheLayersNames() const override { return delegate->getCacheLayersNames(); }
 
     MetadataStoragePtr getMetadataStorage() override { return delegate->getMetadataStorage(); }
+    /// Forwarded alongside getMetadataStorage: callers that gate on this predicate before reaching
+    /// for the metadata storage (ContentAddressedMetadataStorage::tryFromDisk and friends) must see
+    /// the delegate's answer through the wrapper, or a wrapped content-addressed disk silently
+    /// drops out of the CAS introspection paths.
+    bool isContentAddressed() const override { return delegate->isContentAddressed(); }
+    bool allowsPackedParts() const override { return delegate->allowsPackedParts(); }
+
+#if USE_AWS_S3
+    std::shared_ptr<const S3::Client> getS3StorageClient() const override { return delegate->getS3StorageClient(); }
+    std::shared_ptr<const S3::Client> tryGetS3StorageClient() const override { return delegate->tryGetS3StorageClient(); }
+#endif
 
     std::unordered_map<String, String> getSerializedMetadata(const std::vector<String> & file_paths) const override { return delegate->getSerializedMetadata(file_paths); }
 

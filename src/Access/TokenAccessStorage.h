@@ -67,6 +67,9 @@ private:
 
     std::set<String> common_role_names;                         // role name that should be granted to all users at all times
     String default_profile_name;                                // settings profile name that should be assigned to all users
+    /// Incoming group -> settings profile name, in config order. Profiles of all matched groups are assigned
+    /// after `default_profile_name`, so for the same setting a later profile overrides an earlier one.
+    std::vector<std::pair<String, String>> profiles_mapping;
     /// Optional IP allowlist applied to auto-provisioned users at creation
     /// time. When unset, auto-created users inherit the default `AnyHostTag`
     /// (current behavior, no breakage). When set, only clients whose source
@@ -87,7 +90,7 @@ private:
 
     void applyRoleChangeNoLock(bool grant, const UUID & role_id, const String & role_name);
     void assignRolesNoLock(User & user, const std::set<String> & external_roles) const;
-    void assignProfileNoLock(User & user) const;
+    void assignProfilesNoLock(User & user, const std::set<String> & groups) const;
 
 protected:
     std::optional<UUID> findImpl(AccessEntityType type, const String & name) const override;

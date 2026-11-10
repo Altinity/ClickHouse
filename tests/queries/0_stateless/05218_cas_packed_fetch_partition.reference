@@ -1,0 +1,9 @@
+source_data	3	6	60
+source_storage	Packed
+detached_parts	1
+detached_after_attach	0
+destination_data	3	6	60
+destination_row	0	10
+destination_row	2	20
+destination_row	4	30
+destination_storage	Packed

@@ -246,7 +246,7 @@ void DiskObjectStorageTransaction::removeFileIfExists(const std::string & path)
 {
     addOperation([path](MetadataTransactionPtr tx)
     {
-        tx->unlinkFile(path, /*if_exists=*/true, /*should_remove_objects*/true);
+        tx->unlinkFile(path, /*if_exists=*/true, /*should_remove_objects=*/true);
     });
 }
 
@@ -290,6 +290,16 @@ std::unique_ptr<WriteBufferFromFileBase> DiskObjectStorageTransaction::writeFile
     LOG_TEST(getLogger("DiskObjectStorageTransaction"), "write file {} mode {} autocommit {}", path, mode, autocommit);
 
     WriteSettings enriched_settings = updateIOSchedulingSettings(settings, read_resource_name, write_resource_name);
+
+    /// Give the metadata storage a chance to own the write (e.g. a content-addressed
+    /// hash-on-write buffer whose blob key is known only after the last byte). It returns a fully-wrapped
+    /// buffer (hash-on-write + append RMW + inline/blob split + autocommit/lifetime pin using `owner`), or
+    /// nullptr to fall through to the generic up-front-key streaming path below. Called BEFORE the append
+    /// check so a CA storage (which reports no native append) can service a verbatim append via
+    /// read-modify-rewrite inside the hook and reject a part-file append there.
+    if (auto buffer = metadata_transaction->tryCreateWriteBuffer(
+            shared_from_this(), path, buf_size, mode, enriched_settings, autocommit))
+        return buffer;
 
     /// NOTE: We check it here and not after writing blob because in case of plain/plain-rewritable metadata storages
     ///       undo of disk tx will actually remove existing data.
@@ -458,6 +468,7 @@ void DiskObjectStorageTransaction::writeFileUsingBlobWritingFunction(
     /// We always use mode Rewrite because we simulate append using metadata and different files
     object.bytes_size = std::move(write_blob_function)(blob_path, WriteMode::Rewrite, /*object_attributes=*/std::nullopt);
 
+    /// Unreachable on a content-addressed storage: generateObjectKeyForPath above throws NOT_IMPLEMENTED first.
     addOperation([object, mode](MetadataTransactionPtr tx)
     {
         if (mode == WriteMode::Rewrite)
@@ -476,10 +487,42 @@ void DiskObjectStorageTransaction::writeFileUsingBlobWritingFunction(
 
 void DiskObjectStorageTransaction::createHardLink(const std::string & src_path, const std::string & dst_path)
 {
+    /// For CA `addOperation` runs eagerly (call-time), which is load-bearing for read-your-writes: a
+    /// carried-forward projection hardlinked into the open whole-part transaction during a mutation must
+    /// be visible to `loadProjections` (same finalize, before commit) via the directory overlay. Deferring
+    /// it to commit replay would hide it until after `loadProjections` ran. The metadata-level
+    /// `createHardLink` is an idempotent map assignment, so eager staging is equivalent to the queued
+    /// replay — commit publishes the manifest from the staging.
     addOperation([src_path, dst_path](MetadataTransactionPtr tx)
     {
         tx->createHardLink(src_path, dst_path);
     });
+}
+
+std::optional<StoredObjects> DiskObjectStorageTransaction::tryGetInFlightStorageObjects(const std::string & path) const
+{
+    return metadata_transaction->tryGetInFlightStorageObjects(path);
+}
+
+std::unique_ptr<ReadBufferFromFileBase> DiskObjectStorageTransaction::tryReadFileInFlight(
+    const std::string & path, const ReadSettings & settings, std::optional<size_t> read_hint) const
+{
+    return metadata_transaction->tryReadFileInFlight(path, settings, read_hint);
+}
+
+std::optional<uint64_t> DiskObjectStorageTransaction::tryGetInFlightFileSize(const std::string & path) const
+{
+    return metadata_transaction->tryGetInFlightFileSize(path);
+}
+
+bool DiskObjectStorageTransaction::hasInFlightDirectory(const std::string & path) const
+{
+    return metadata_transaction->hasInFlightDirectory(path);
+}
+
+std::vector<std::string> DiskObjectStorageTransaction::listInFlightDirectory(const std::string & path) const
+{
+    return metadata_transaction->listInFlightDirectory(path);
 }
 
 void DiskObjectStorageTransaction::setReadOnly(const std::string & path)
@@ -598,6 +641,7 @@ void DiskObjectStorageTransaction::copyFileImpl(
         return;
     }
 
+    /// Unreachable on a content-addressed storage: copyFileImpl's generateObjectKeyForPath throws NOT_IMPLEMENTED first.
     addOperation([blobs_to_create, missing_locations, to_file_path](MetadataTransactionPtr tx)
     {
         for (const auto & blob : blobs_to_create)
@@ -619,6 +663,15 @@ void MultipleDisksObjectStorageTransaction::copyFile(const std::string & from_fi
 
 void DiskObjectStorageTransaction::commit()
 {
+    /// An eager transaction (memory, CA) routes every mutating method to the metadata transaction at call
+    /// time and keeps this queue empty. A non-empty queue here means a mutating method bypassed
+    /// `addOperation`, which would split the transaction into two timelines. Fail closed with a real throw
+    /// (the chassert below is a no-op in release builds).
+    if (metadata_storage->appliesOperationsEagerly() && !operations_to_execute.empty())
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "An eager transaction must not queue deferred operations "
+            "(a mutating method bypassed addOperation): {} queued", operations_to_execute.size());
+
     auto component_guard = Coordination::setCurrentComponent("DiskObjectStorageTransaction::commit");
     chassert(operations_to_execute.empty() || !metadata_storage->appliesOperationsEagerly());
     for (size_t i = 0; i < operations_to_execute.size(); ++i)
@@ -664,6 +717,12 @@ void DiskObjectStorageTransaction::commit()
 
 TransactionCommitOutcomeVariant DiskObjectStorageTransaction::tryCommit(const TransactionCommitOptionsVariant & options)
 {
+    /// See commit(): an eager transaction must never queue deferred operations.
+    if (metadata_storage->appliesOperationsEagerly() && !operations_to_execute.empty())
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "An eager transaction must not queue deferred operations "
+            "(a mutating method bypassed addOperation): {} queued", operations_to_execute.size());
+
     chassert(operations_to_execute.empty() || !metadata_storage->appliesOperationsEagerly());
     for (size_t i = 0; i < operations_to_execute.size(); ++i)
     {

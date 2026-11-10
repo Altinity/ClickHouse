@@ -53,10 +53,14 @@ public:
 
     /// Keeper metadata replicates itself; in-memory metadata is transient and has no local
     /// metadata files zero-copy could ship (see `getReplicatedFilesDescriptionForRemoteDisk`).
+    /// A content-addressed pool deduplicates blobs across parts and has no per-replica unique blob
+    /// ids; the zero-copy subsystem (B1) is explicitly out of scope for M1, so advertise it as
+    /// unsupported (honest capability — B31).
     bool supportZeroCopyReplication() const override
     {
         return metadata_storage->getType() != MetadataStorageType::Keeper
-            && metadata_storage->getType() != MetadataStorageType::Memory;
+            && metadata_storage->getType() != MetadataStorageType::Memory
+            && metadata_storage->getType() != MetadataStorageType::CAS;
     }
 
     bool supportParallelWrite() const override { return object_storages->takePointingTo(cluster->getLocalLocation())->supportParallelWrite(); }
@@ -181,6 +185,7 @@ public:
         const WriteSettings & settings) override;
 
     Strings getBlobPath(const String & path) const override;
+
     bool areBlobPathsRandom() const override;
     void writeFileUsingBlobWritingFunction(const String & path, WriteMode mode, WriteBlobFunction && write_blob_function) override;
 
@@ -220,6 +225,12 @@ public:
     bool isSharedCompatible() const;
 
     bool supportsHardLinks() const override;
+
+    bool isContentAddressed() const override;
+
+    bool allowsPackedParts() const override;
+
+    bool supportsAtomicFileWrites() const override;
 
     /// Get structure of object storage this disk works with. Examples:
     /// DiskObjectStorage(S3ObjectStorage)

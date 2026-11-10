@@ -30,7 +30,7 @@ FUNCTIONAL_TESTS_JOBS = [
     # discovery cannot provide a representative WasmEdge smoke test. Keep the
     # established full-suite MSan/WasmEdge lanes until that coverage exists.
     or "amd_msan, WasmEdge" in job.name
-] + JobConfigs.stateless_tests_selected_pr_jobs
+] + JobConfigs.stateless_tests_selected_pr_jobs + AltinityJobConfigs.cas_functional_tests_jobs
 
 ALL_FUNCTIONAL_TESTS = [job.name for job in FUNCTIONAL_TESTS_JOBS]
 
@@ -71,7 +71,7 @@ CODE_REVIEW_BLOCKING_JOBS = [
 REGULAR_BUILD_NAMES = [job.name for job in JobConfigs.build_jobs]
 
 PLAIN_FUNCTIONAL_TEST_JOB = [
-    j for j in JobConfigs.functional_tests_jobs if "amd_debug, parallel" in j.name
+    j for j in FUNCTIONAL_TESTS_JOBS if "amd_debug, parallel" in j.name
 ][0]
 
 workflow = Workflow.Config(
@@ -141,10 +141,14 @@ workflow = Workflow.Config(
         # reproduce) — a reproduction or an inconclusive ERROR does not block.
         # Like the sibling FT/IT jobs, it is deferred behind the core blocking jobs.
         JobConfigs.bugfix_validation_ut_job.set_run_after(CORE_BLOCKING_JOB_NAMES),
+        # The CAS stateless lanes need only their build artifact. Deferring them
+        # behind the blocking jobs makes a red ASan integration shard skip them
+        # silently, so they are not deferred.
         *[
             j.set_run_after(
                 CORE_BLOCKING_JOB_NAMES
                 if j.name not in CORE_BLOCKING_JOB_NAMES
+                and j not in AltinityJobConfigs.cas_functional_tests_jobs
                 else []
             )
             for j in FUNCTIONAL_TESTS_JOBS

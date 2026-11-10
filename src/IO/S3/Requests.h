@@ -13,6 +13,7 @@
 #include <aws/s3/model/ListObjectsRequest.h>
 #include <aws/s3/model/GetObjectRequest.h>
 #include <aws/s3/model/GetObjectTaggingRequest.h>
+#include <aws/s3/model/GetBucketVersioningRequest.h>
 #include <aws/s3/model/AbortMultipartUploadRequest.h>
 #include <aws/s3/model/CreateMultipartUploadRequest.h>
 #include <aws/s3/model/CompleteMultipartUploadRequest.h>
@@ -61,11 +62,26 @@ inline void setChecksumAlgorithm(R & request)
 }
 };
 
+/// Non-template interface so callers that only see the SDK's `Aws::AmazonWebServiceRequest` base
+/// (e.g. `Client::BuildHttpRequest`) can still ask whether a request opted into the typed
+/// `NativeConditional` request mode, without knowing which `ExtendedRequest<BaseRequest>` it is.
+class RequestWithNativeConditionalMode
+{
+public:
+    RequestWithNativeConditionalMode() = default;
+    RequestWithNativeConditionalMode(const RequestWithNativeConditionalMode &) = default;
+    RequestWithNativeConditionalMode & operator=(const RequestWithNativeConditionalMode &) = default;
+    RequestWithNativeConditionalMode(RequestWithNativeConditionalMode &&) = default;
+    RequestWithNativeConditionalMode & operator=(RequestWithNativeConditionalMode &&) = default;
+    virtual ~RequestWithNativeConditionalMode() = default;
+    virtual bool isNativeConditional() const = 0;
+};
+
 /// The `x-amz-storage-class` value for a storage class name; throws if the name contains CR or LF.
 Model::StorageClass getStorageClassForName(const std::string & name);
 
 template <typename BaseRequest>
-class ExtendedRequest : public BaseRequest
+class ExtendedRequest : public BaseRequest, public RequestWithNativeConditionalMode
 {
 public:
     Aws::Endpoint::EndpointParameters GetEndpointContextParams() const override
@@ -137,12 +153,20 @@ public:
         RequestChecksum::setChecksumAlgorithm(*this);
     }
 
+    /// Marks this request as eligible for the typed `NativeConditional` HTTP mode (see
+    /// `WriteSettings::object_storage_request_mode`). `Client::BuildHttpRequest` re-derives the
+    /// resulting HTTP bit from this on every SDK attempt, so setting it once here is enough to
+    /// survive retries and redirects, which each rebuild the HTTP request from scratch.
+    void setNativeConditional(bool value = true) const { native_conditional = value; }
+    bool isNativeConditional() const override { return native_conditional; }
+
 protected:
     mutable std::string region_override;
     mutable std::optional<S3::URI> uri_override;
     mutable ApiMode api_mode{ApiMode::AWS};
     mutable bool checksum = true;
     bool is_s3express_bucket = false;
+    mutable bool native_conditional = false;
 };
 
 class CopyObjectRequest : public ExtendedRequest<Model::CopyObjectRequest>
@@ -161,6 +185,7 @@ using ListObjectsV2Request = ExtendedRequest<Model::ListObjectsV2Request>;
 using ListObjectsRequest = ExtendedRequest<Model::ListObjectsRequest>;
 using GetObjectRequest = ExtendedRequest<Model::GetObjectRequest>;
 using GetObjectTaggingRequest = ExtendedRequest<Model::GetObjectTaggingRequest>;
+using GetBucketVersioningRequest = ExtendedRequest<Model::GetBucketVersioningRequest>;
 
 class UploadPartRequest : public ExtendedRequest<Model::UploadPartRequest>
 {
@@ -242,6 +267,13 @@ size_t getSDKAttemptNumber(const Aws::Http::HttpRequest & request);
 size_t getClickHouseAttemptNumber(const Aws::AmazonWebServiceRequest & request);
 size_t getClickHouseAttemptNumber(const Aws::Http::HttpRequest & request);
 void setClickHouseAttemptNumber(Aws::AmazonWebServiceRequest & request, size_t attempt);
+
+/// The attempt number a request carries when its caller seeded one: the caller's attempt for the first
+/// local try, then the local counter's increments. Seed 0 is "unseeded" and yields `local`.
+inline size_t seededAttemptNumber(size_t seed, size_t local)
+{
+    return (seed == 0 ? 1 : seed) + local - 1;
+}
 
 }
 

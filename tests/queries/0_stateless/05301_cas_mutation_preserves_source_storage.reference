@@ -1,0 +1,14 @@
+plain_before	1	Wide	Full
+plain_data	1728
+plain_after	1	Wide	Full
+plain_check
+1
+plain_projection	2	10
+plain_index	4
+replicated_before	1	Wide	Full
+replicated_data	1728
+replicated_after	1	Wide	Full
+replicated_check
+1
+replicated_projection	2	10
+replicated_index	4
