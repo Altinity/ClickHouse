@@ -516,11 +516,6 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
 
     /// The admin claim. `NoWait` refuses a live victim and accepts a tombstoned owner.
     PoolPtr admin = Pool::openForDecommission(std::move(backend), std::move(config), victim_srid);
-    if (drain_now_fn && drain_sleep_fn)
-    {
-        admin->setCasRequestNowFnForTest(drain_now_fn);
-        admin->setCasRetrySleepForTest(drain_sleep_fn);
-    }
     const UInt128 victim_uuid = admin->poolConfig().server_id;
     const uint64_t admin_epoch = admin->writerEpoch();
     const Layout layout = admin->layout();
