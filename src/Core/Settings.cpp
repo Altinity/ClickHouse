@@ -8181,6 +8181,9 @@ If enabled and the schema-id of an Iceberg manifest file is already registered f
 
 The manifest header schema is only a copy of the table schema at the time the manifest was written, and some writers (e.g. AWS S3 Tables maintenance jobs) have been observed storing degraded copies there. Other query engines resolve schemas from metadata.json and ignore divergent header copies, so the default follows them. A conflict between two metadata.json schema definitions still always fails the query.
 )", 0) \
+    DECLARE(Bool, use_iceberg_manifest_list_partition_pruning, true, R"(
+Skip whole Iceberg manifest files whose partition summaries in the manifest list cannot match the query filter, without reading them. Requires [use_iceberg_partition_pruning](#use_iceberg_partition_pruning) to be enabled and only helps when a manifest file holds few distinct partition values, which is what `rewriteManifests` clustered by the partition columns produces.
+)", 0) \
     DECLARE(Bool, optimize_distinct_in_order, true, R"(
 Enable DISTINCT optimization if some columns in DISTINCT form a prefix of sorting. For example, prefix of sorting key in merge tree or ORDER BY statement
 )", 0) \
@@ -8224,6 +8227,8 @@ Possible values:
 **Additional Info**
 
 This options will produce different results depending on the settings used.
+
+With `parallel_replicas_mode` `sampling_key`, or a custom key mode on a cluster with more than one shard, each replica returns its own part of the result of the shard. The replicas of a shard are used together only when the initiator aggregates or fully sorts these parts itself (for example an aggregation without `GROUP BY` keys). Otherwise, for example for `GROUP BY` with `distributed_aggregation_memory_efficient` or for `ORDER BY`, the shard is read from one replica.
 
 ### Parallel processing using `SAMPLE` key
 

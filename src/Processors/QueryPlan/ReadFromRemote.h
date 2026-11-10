@@ -55,6 +55,8 @@ public:
 
     bool hasSerializedPlan() const;
 
+    void allowReadingShardFromSeveralReplicas(bool allow) { allow_reading_shard_from_several_replicas = allow; }
+
 private:
     ClusterProxy::SelectStreamFactory::Shards shards;
     QueryProcessingStage::Enum stage;
@@ -71,6 +73,7 @@ private:
     UnavailableShardTrackerPtr unavailable_shard_tracker;
     std::optional<GetPriorityForLoadBalancing> priority_func_factory;
     bool is_remote_function = false;
+    bool allow_reading_shard_from_several_replicas = false;
 
     Pipes addPipes(const ClusterProxy::SelectStreamFactory::Shards & used_shards, const SharedHeader & out_header);
 

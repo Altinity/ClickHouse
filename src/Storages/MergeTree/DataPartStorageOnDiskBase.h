@@ -175,6 +175,9 @@ public:
 
     SyncGuardPtr getDirectorySyncGuard() const override;
     bool hasActiveTransaction() const override;
+    /// A content-addressed part is published once, as a whole, by its final commit: a mid-build commit
+    /// would publish the files written so far as a separate partial part, so the checkpoint is a no-op there.
+    void checkpointTransaction() override;
 
     bool isCaseInsensitive() const override;
 

@@ -197,6 +197,7 @@ public:
     bool supportsInlineData() const override { return delegate->supportsInlineData(); }
 
     bool appliesOperationsEagerly() const override { return delegate->appliesOperationsEagerly(); }
+    bool allowsPackedParts() const override { return delegate->allowsPackedParts(); }
 
     bool areBlobPathsRandom() const override
     {

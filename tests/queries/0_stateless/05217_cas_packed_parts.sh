@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Tags: no-fasttest, no-random-merge-tree-settings, no-parallel
+# Tags: no-fasttest, no-random-merge-tree-settings, cas-storage
+# cas-storage: the destination section uses the cas_packed_mixed policy of the CAS lane config. The packed
+# tables live on test-owned disks so GC and FSCK oracles see only this test's objects and parallel runs are safe.
 
 set -euo pipefail
 
@@ -7,6 +9,18 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
 
+PACKED_DISK_NAME="${CLICKHOUSE_DATABASE}_05217_packed_${CLICKHOUSE_TEST_UNIQUE_NAME}_${RANDOM}"
+PACKED_POOL="${CLICKHOUSE_USER_FILES_UNIQUE}_05217_packed_${RANDOM}"
+PACKED_DISK="disk(
+    type = object_storage,
+    object_storage_type = local,
+    metadata_type = cas,
+    cas_server_root_id = '${CLICKHOUSE_DATABASE}_05217_packed',
+    name = '${PACKED_DISK_NAME}',
+    path = '${PACKED_POOL}/',
+    cas_allow_packed_parts = 1,
+    cas_gc_enabled = 1,
+    cas_gc_interval_sec = 1)"
 DISABLED_DISK_NAME="${CLICKHOUSE_DATABASE}_05217_disabled_${CLICKHOUSE_TEST_UNIQUE_NAME}_${RANDOM}"
 DISABLED_POOL="${CLICKHOUSE_USER_FILES_UNIQUE}_05217_disabled_${RANDOM}"
 COMPACT_QUERY_ID="${CLICKHOUSE_DATABASE}_05217_compact_${CLICKHOUSE_TEST_UNIQUE_NAME}"
@@ -15,8 +29,8 @@ COMPACT_SALT="${CLICKHOUSE_DATABASE}_${CLICKHOUSE_TEST_UNIQUE_NAME}_compact"
 WIDE_SALT="${CLICKHOUSE_DATABASE}_${CLICKHOUSE_TEST_UNIQUE_NAME}_wide"
 UNFREEZE_STRUCTURE='command_type String, partition_id String, part_name String, backup_name String, backup_path String, part_backup_path String'
 
-rm -rf "${DISABLED_POOL:?}"
-mkdir -p "${DISABLED_POOL}"
+rm -rf "${PACKED_POOL:?}" "${DISABLED_POOL:?}"
+mkdir -p "${PACKED_POOL}" "${DISABLED_POOL}"
 
 drain_gc()
 {
@@ -77,7 +91,8 @@ CREATE TABLE cas_packed_local
 ENGINE = MergeTree
 PARTITION BY tuple()
 ORDER BY id
-SETTINGS min_bytes_for_full_part_storage = '1G',
+SETTINGS disk = ${PACKED_DISK},
+    min_bytes_for_full_part_storage = '1G',
     min_bytes_for_wide_part = '1G',
     index_granularity = 64,
     index_granularity_bytes = 10485760;
@@ -94,7 +109,8 @@ CREATE TABLE cas_packed_wide
 ENGINE = MergeTree
 PARTITION BY tuple()
 ORDER BY id
-SETTINGS min_bytes_for_full_part_storage = '1G',
+SETTINGS disk = ${PACKED_DISK},
+    min_bytes_for_full_part_storage = '1G',
     min_bytes_for_wide_part = 0,
     index_granularity = 64,
     index_granularity_bytes = 10485760;
@@ -172,26 +188,15 @@ EOF
 check_table cas_packed_local compact_check_insert
 check_table cas_packed_wide wide_check_insert
 
-MAIN_DISK=$(${CLICKHOUSE_CLIENT} --query "
-    SELECT any(disk_name)
-    FROM system.parts
-    WHERE database = currentDatabase() AND table = 'cas_packed_local' AND active")
-MAIN_DISK_IS_CAS=$(${CLICKHOUSE_CLIENT} --query "SELECT count() FROM system.cas_mounts WHERE disk = '${MAIN_DISK}'")
-
-if [ "${MAIN_DISK_IS_CAS}" = "1" ]; then
-    ${CLICKHOUSE_CLIENT} --query "SYSTEM FLUSH LOGS cas_log"
-    ${CLICKHOUSE_CLIENT} --multiquery <<EOF
+${CLICKHOUSE_CLIENT} --query "SYSTEM FLUSH LOGS cas_log"
+${CLICKHOUSE_CLIENT} --multiquery <<EOF
 SELECT 'compact_blob_put', count()
 FROM system.cas_log
-WHERE disk_name = '${MAIN_DISK}' AND event_type = 'blob_put' AND query_id = '${COMPACT_QUERY_ID}';
+WHERE disk_name = '${PACKED_DISK_NAME}' AND event_type = 'blob_put' AND query_id = '${COMPACT_QUERY_ID}';
 SELECT 'wide_blob_put', count()
 FROM system.cas_log
-WHERE disk_name = '${MAIN_DISK}' AND event_type = 'blob_put' AND query_id = '${WIDE_QUERY_ID}';
+WHERE disk_name = '${PACKED_DISK_NAME}' AND event_type = 'blob_put' AND query_id = '${WIDE_QUERY_ID}';
 EOF
-else
-    printf 'compact_blob_put\t3\n'
-    printf 'wide_blob_put\t3\n'
-fi
 
 ${CLICKHOUSE_CLIENT} --multiquery <<EOF
 
@@ -295,7 +300,8 @@ CREATE TABLE cas_packed_copy
 ENGINE = MergeTree
 PARTITION BY tuple()
 ORDER BY id
-SETTINGS min_bytes_for_full_part_storage = '1G',
+SETTINGS disk = ${PACKED_DISK},
+    min_bytes_for_full_part_storage = '1G',
     min_bytes_for_wide_part = '1G',
     index_granularity = 64,
     index_granularity_bytes = 10485760;
@@ -332,14 +338,17 @@ HAS_MIXED_POLICY=$(${CLICKHOUSE_CLIENT} --query "
     SELECT countDistinct(policy_name)
     FROM system.storage_policies
     WHERE policy_name = 'cas_packed_mixed'")
+if [ "${HAS_MIXED_POLICY}" != "1" ]; then
+    echo "storage policy 'cas_packed_mixed' is missing; the CAS lane config defines it" >&2
+    exit 1
+fi
 
-if [ "${HAS_MIXED_POLICY}" = "1" ]; then
-    ${CLICKHOUSE_CLIENT} --multiquery <<EOF
+${CLICKHOUSE_CLIENT} --multiquery <<EOF
 CREATE TABLE cas_packed_destination (id UInt64, value UInt64)
 ENGINE = MergeTree
 ORDER BY id
 SETTINGS storage_policy = 'cas_packed_mixed',
-    min_bytes_for_full_part_storage = '1G';
+min_bytes_for_full_part_storage = '1G';
 
 INSERT INTO cas_packed_destination VALUES (1, 10), (2, 20);
 
@@ -348,84 +357,63 @@ FROM system.parts
 WHERE database = currentDatabase() AND table = 'cas_packed_destination' AND active;
 EOF
 
-    DESTINATION_PART=$(${CLICKHOUSE_CLIENT} --query "
-        SELECT name
-        FROM system.parts
-        WHERE database = currentDatabase() AND table = 'cas_packed_destination' AND active")
-    ${CLICKHOUSE_CLIENT} --query "ALTER TABLE cas_packed_destination MOVE PART '${DESTINATION_PART}' TO VOLUME 'full'"
-    ${CLICKHOUSE_CLIENT} --query "
-        SELECT 'destination_moved_disabled', any(part_storage_type), countIf(disk_name = 'cas_packed_disabled')
-        FROM system.parts
-        WHERE database = currentDatabase() AND table = 'cas_packed_destination' AND active"
+DESTINATION_PART=$(${CLICKHOUSE_CLIENT} --query "
+    SELECT name
+    FROM system.parts
+    WHERE database = currentDatabase() AND table = 'cas_packed_destination' AND active")
+${CLICKHOUSE_CLIENT} --query "ALTER TABLE cas_packed_destination MOVE PART '${DESTINATION_PART}' TO VOLUME 'full'"
+${CLICKHOUSE_CLIENT} --query "
+    SELECT 'destination_moved_disabled', any(part_storage_type), countIf(disk_name = 'cas_packed_disabled')
+    FROM system.parts
+    WHERE database = currentDatabase() AND table = 'cas_packed_destination' AND active"
 
-    ${CLICKHOUSE_CLIENT} --query "
-        ALTER TABLE cas_packed_destination UPDATE value = value + 1 WHERE id = 1
-        SETTINGS mutations_sync = 2"
-    ${CLICKHOUSE_CLIENT} --query "
-        SELECT 'destination_mutated_disabled', any(part_storage_type), countIf(disk_name = 'cas_packed_disabled')
-        FROM system.parts
-        WHERE database = currentDatabase() AND table = 'cas_packed_destination' AND active"
+${CLICKHOUSE_CLIENT} --query "
+    ALTER TABLE cas_packed_destination UPDATE value = value + 1 WHERE id = 1
+    SETTINGS mutations_sync = 2"
+${CLICKHOUSE_CLIENT} --query "
+    SELECT 'destination_mutated_disabled', any(part_storage_type), countIf(disk_name = 'cas_packed_disabled')
+    FROM system.parts
+    WHERE database = currentDatabase() AND table = 'cas_packed_destination' AND active"
 
-    DESTINATION_PART=$(${CLICKHOUSE_CLIENT} --query "
-        SELECT name
-        FROM system.parts
-        WHERE database = currentDatabase() AND table = 'cas_packed_destination' AND active")
-    ${CLICKHOUSE_CLIENT} --query "ALTER TABLE cas_packed_destination MOVE PART '${DESTINATION_PART}' TO VOLUME 'packed'"
-    ${CLICKHOUSE_CLIENT} --query "
-        SELECT 'destination_moved_enabled', any(part_storage_type), countIf(disk_name = 'cas_packed_disabled')
-        FROM system.parts
-        WHERE database = currentDatabase() AND table = 'cas_packed_destination' AND active"
+DESTINATION_PART=$(${CLICKHOUSE_CLIENT} --query "
+    SELECT name
+    FROM system.parts
+    WHERE database = currentDatabase() AND table = 'cas_packed_destination' AND active")
+${CLICKHOUSE_CLIENT} --query "ALTER TABLE cas_packed_destination MOVE PART '${DESTINATION_PART}' TO VOLUME 'packed'"
+${CLICKHOUSE_CLIENT} --query "
+    SELECT 'destination_moved_enabled', any(part_storage_type), countIf(disk_name = 'cas_packed_disabled')
+    FROM system.parts
+    WHERE database = currentDatabase() AND table = 'cas_packed_destination' AND active"
 
-    ${CLICKHOUSE_CLIENT} --query "
-        ALTER TABLE cas_packed_destination UPDATE value = value + 1 WHERE id = 2
-        SETTINGS mutations_sync = 2"
-    ${CLICKHOUSE_CLIENT} --query "
-        SELECT 'destination_mutated_enabled', any(part_storage_type), countIf(disk_name = 'cas_packed_disabled')
-        FROM system.parts
-        WHERE database = currentDatabase() AND table = 'cas_packed_destination' AND active"
-    ${CLICKHOUSE_CLIENT} --query "
-        OPTIMIZE TABLE cas_packed_destination FINAL
-        SETTINGS optimize_throw_if_noop = 1"
-    ${CLICKHOUSE_CLIENT} --query "
-        SELECT 'destination_merged_enabled', any(part_storage_type), countIf(disk_name = 'cas_packed_disabled')
-        FROM system.parts
-        WHERE database = currentDatabase() AND table = 'cas_packed_destination' AND active"
-    ${CLICKHOUSE_CLIENT} --query "DROP TABLE cas_packed_destination SYNC"
-else
-    printf 'destination_initial\tPacked\t0\n'
-    printf 'destination_moved_disabled\tPacked\t1\n'
-    printf 'destination_mutated_disabled\tFull\t1\n'
-    printf 'destination_moved_enabled\tFull\t0\n'
-    printf 'destination_mutated_enabled\tFull\t0\n'
-    printf 'destination_merged_enabled\tPacked\t0\n'
-fi
+${CLICKHOUSE_CLIENT} --query "
+    ALTER TABLE cas_packed_destination UPDATE value = value + 1 WHERE id = 2
+    SETTINGS mutations_sync = 2"
+${CLICKHOUSE_CLIENT} --query "
+    SELECT 'destination_mutated_enabled', any(part_storage_type), countIf(disk_name = 'cas_packed_disabled')
+    FROM system.parts
+    WHERE database = currentDatabase() AND table = 'cas_packed_destination' AND active"
+${CLICKHOUSE_CLIENT} --query "
+    OPTIMIZE TABLE cas_packed_destination FINAL
+    SETTINGS optimize_throw_if_noop = 1"
+${CLICKHOUSE_CLIENT} --query "
+    SELECT 'destination_merged_enabled', any(part_storage_type), countIf(disk_name = 'cas_packed_disabled')
+    FROM system.parts
+    WHERE database = currentDatabase() AND table = 'cas_packed_destination' AND active"
+${CLICKHOUSE_CLIENT} --query "DROP TABLE cas_packed_destination SYNC"
 
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE cas_packed_copy SYNC"
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE cas_packed_wide SYNC"
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE cas_packed_disabled SYNC"
 
-if [ "${MAIN_DISK_IS_CAS}" = "1" ]; then
-    drain_gc "${MAIN_DISK}" default
-    check_fsck "${MAIN_DISK}" default
-else
-    echo "default_gc_drained" 1
-    echo "default_fsck_unreachable" 0
-    echo "default_fsck_dangling" 0
-fi
-
-if [ "${HAS_MIXED_POLICY}" = "1" ]; then
-    drain_gc cas_packed_disabled destination
-    check_fsck cas_packed_disabled destination
-else
-    echo "destination_gc_drained" 1
-    echo "destination_fsck_unreachable" 0
-    echo "destination_fsck_dangling" 0
-fi
+drain_gc "${PACKED_DISK_NAME}" packed
+check_fsck "${PACKED_DISK_NAME}" packed
 
 drain_gc "${DISABLED_DISK_NAME}" disabled
 check_fsck "${DISABLED_DISK_NAME}" disabled
 
 ${CLICKHOUSE_CLIENT} --allow_repeated_settings --send_logs_level=fatal \
+    --query "SYSTEM CAS FORGET '${PACKED_DISK_NAME}'"
+${CLICKHOUSE_CLIENT} --allow_repeated_settings --send_logs_level=fatal \
     --query "SYSTEM CAS FORGET '${DISABLED_DISK_NAME}'"
 
-rm -rf "${DISABLED_POOL:?}"
+rm -rf "${PACKED_POOL:?}" "${DISABLED_POOL:?}"

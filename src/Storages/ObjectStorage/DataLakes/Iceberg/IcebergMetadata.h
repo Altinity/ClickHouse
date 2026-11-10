@@ -276,7 +276,7 @@ private:
     Iceberg::IcebergDataSnapshotPtr
     getIcebergDataSnapshot(Poco::JSON::Object::Ptr metadata_object, Int64 snapshot_id, ContextPtr local_context) const;
 
-    Iceberg::IcebergDataSnapshotPtr createIcebergDataSnapshotFromSnapshotJSON(Poco::JSON::Object::Ptr snapshot_object, Int64 snapshot_id, ContextPtr local_context) const;
+    Iceberg::IcebergDataSnapshotPtr createIcebergDataSnapshotFromSnapshotJSON(Poco::JSON::Object::Ptr metadata_object, Poco::JSON::Object::Ptr snapshot_object, Int64 snapshot_id, ContextPtr local_context) const;
     std::pair<Iceberg::IcebergDataSnapshotPtr, Int32>
     getStateImpl(const ContextPtr & local_context, Poco::JSON::Object::Ptr metadata_object) const;
     Iceberg::IcebergDataSnapshotPtr
@@ -295,6 +295,7 @@ private:
     std::optional<IStorage::ExportPartitionCommitInfo> commitImportPartitionTransactionImpl(
         FileNamesGenerator & filename_generator,
         Poco::JSON::Object::Ptr & metadata,
+        String & metadata_file_path,
         Poco::JSON::Object::Ptr & partition_spec,
         const String & transaction_id,
         Int64 original_schema_id,
