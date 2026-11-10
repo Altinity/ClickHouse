@@ -205,7 +205,8 @@ public:
 
     /// Both may be called concurrently on one `CasRequests`: neither writes a member, and the only
     /// state either reads is the backend and the fence -- whose closures must therefore be thread-safe
-    /// too.
+    /// too. The test setters below DO write members: they belong to setup, before any operation runs
+    /// and before a pool's background workers start (`Pool::openForDecommission` starts them).
     ///
     /// Admitted now, under the fence's current generation.
     CasOperation admit(Liveness liveness = {});

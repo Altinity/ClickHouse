@@ -64,10 +64,11 @@ bool adminClaimStillHeld(CasOperation & op, const Layout & layout, const String 
 /// This is a writer operation, not GC: it emits the normal ref-edge deltas and does not invent ref
 /// transitions.
 ///
-/// `drain_now_fn`/`drain_sleep_fn`, when both set, replace the clock and retry sleep of the control-plane
-/// request engine this function opens and of the admin `Pool`'s planes, and become the `Pool`'s boot clock
-/// and retry sleep (`PoolConfig::boot_ms_fn`/`retry_sleep_fn`) whenever the caller left those unset: the
-/// farewell deadline is bound to the boot clock, so one fake clock must drive all of them.
+/// `drain_now_fn`/`drain_sleep_fn`, when both set, are the clock and retry sleep of the control-plane
+/// request engine this function opens, and fill `PoolConfig::boot_ms_fn`/`retry_sleep_fn` of the admin
+/// `Pool` when the caller left those unset: the farewell deadline is bound to the boot clock, so one fake
+/// clock must drive all of them. Both reach the `Pool` through its config, before it opens: its lease
+/// renewer starts inside `Pool::openForDecommission`, and a clock swapped after that races with it.
 DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
                                           const String & victim_srid, const CasEventSink & sink = {},
                                           const std::function<void()> & request_gc_round = {},

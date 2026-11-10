@@ -1091,8 +1091,10 @@ public:
     /// Test-only: replace the inter-attempt backoff sleep (e.g. with a clock-advancing no-op) on all
     /// three request planes and on ref-table recovery, for tests that drive a persistent write fault to
     /// exhaustion through a fully wired Pool/disk and must not serve the production sleeps for real.
-    /// Call before driving traffic. On the three request planes an empty function restores each plane's
-    /// own default, the mount plane's interruptible sleep included.
+    /// Call before driving traffic and before the background workers start: `openForDecommission` starts
+    /// them inside the open, so a decommission test passes the sleep as `PoolConfig::retry_sleep_fn`
+    /// instead. On the three request planes an empty function restores each plane's own default, the
+    /// mount plane's interruptible sleep included.
     ///
     /// It does NOT bound a reissue the engine refuses to start: the engine's inter-attempt backoff is
     /// jittered and drawn before the sleep, and admission compares that drawn duration against the
@@ -1103,10 +1105,13 @@ public:
     /// Test-only: replace the request engine's clock on all three planes. A test driving a PERSISTENT
     /// transient fault must run the retry window on a clock it advances; the sleep seam alone cannot
     /// bound it, because a read the engine keeps reissuing is bounded by the policy deadline and the
-    /// deadline is read from this clock.
+    /// deadline is read from this clock. Call before the background workers start: `openForDecommission`
+    /// starts them inside the open, so a decommission test passes the clock as `PoolConfig::boot_ms_fn`
+    /// instead.
     void setCasRequestNowFnForTest(std::function<uint64_t()> now_fn);
 
-    /// Test-only: replace only ref-table recovery's token-aware retry delay seam.
+    /// Test-only: replace only ref-table recovery's token-aware retry delay seam. Same rule: before the
+    /// background workers start.
     void setRefRecoveryRetrySleepForTest(
         std::function<void(uint64_t, const std::optional<DetachedStopToken> &)> sleep_fn);
 

@@ -964,9 +964,10 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
         claim_anchor_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms_u
             ? std::numeric_limits<uint64_t>::max()
             : claim_anchor_boot_ms + ttl_ms_u);
-    /// Gate the two persistent runtime workers with `background_watermark`: they run only in production
-    /// (`background_watermark` = context != nullptr && !read_only), never in unit tests — which
-    /// drive `renewWatermarkOnce` explicitly and rely on the armed sub-TTL deadline, never on a loop.
+    /// Gate the two persistent runtime workers with `background_watermark`: production sets it
+    /// (`background_watermark` = context != nullptr && !read_only) and `openForDecommission` forces it,
+    /// so the decommission tests run the pair too. The other unit-test opens leave it off and drive
+    /// `renewWatermarkOnce` explicitly, relying on the armed sub-TTL deadline, never on a loop.
     /// The synchronous renewer is still started above (it must adopt the mount and arm the fence on
     /// every writable open); only the worker pair is conditional. The merged
     /// heartbeat renews at `mount_renew_period` — one beat now renews the lease and the floor.
@@ -1051,14 +1052,10 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
     store->setEventSink(std::move(store->config.event_sink));
     store->decommission_admin = true;
 
+    /// Before `mountWritable` below: it starts the lease renewer, and a sleep installed after that races
+    /// with it. The three request planes took the same sleep in the constructor.
     if (store->config.retry_sleep_fn)
-    {
-        store->ref_ledger.setRefRecoveryRetrySleepForTest(
-            [sleep_fn = store->config.retry_sleep_fn](uint64_t ms, const std::optional<DetachedStopToken> &)
-            {
-                sleep_fn(ms);
-            });
-    }
+        store->ref_ledger.setCasRetrySleepForTest(store->config.retry_sleep_fn);
 
     /// Register-before-first-write, belt-and-braces: same invariant `open` asserts.
     chassert(store->isAlgoAdmitted(write_algo));
