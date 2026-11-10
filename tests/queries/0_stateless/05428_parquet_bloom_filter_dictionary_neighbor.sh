@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Tags: no-fasttest
 # Column `d` is dictionary-encoded, so its bloom body is a fallback and stays out of the coalesce
 # group. Column `p` is plain, and its filter is written right after `d` in each row group. A seek
 # longer than the `d` body must not merge `p`'s read with that body. Min/max cannot skip `d`
