@@ -318,15 +318,21 @@ def get_version_from_repo(
 
     # If this commit is tagged, use tag's version instead of something stored in cmake
     if git is not None and git.latest_tag:
-        version_from_tag = get_version_from_tag(git.latest_tag)
         logging.debug(f'Git latest tag: {git.latest_tag} ({git.commits_since_latest} commits ago)\n'
             f'"new" tag: {git.new_tag} ({git.commits_since_new})\n'
             f'current commit: {git.sha}\n'
             f'current brach: {git.branch}'
         )
-        if git.latest_tag and git.commits_since_latest == 0:
+        # Only trigger on tag push event
+        if (
+            git.latest_tag
+            and git.commits_since_latest == 0
+            and PRInfo
+            and PRInfo().is_push_event
+        ):
             # Tag has a priority over the version written in CMake.
             # Version must match (except tweak, flavour, description, etc.) to avoid accidental mess.
+            version_from_tag = get_version_from_tag(git.latest_tag)
             if not (version_from_tag.major == cmake_version.major \
                     and version_from_tag.minor == cmake_version.minor \
                     and version_from_tag.patch == cmake_version.patch \
