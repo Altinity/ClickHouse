@@ -345,6 +345,25 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
     size_t end_idx = range_idx + 1;
     size_t total_length_of_covered_ranges = end_offset - start_offset;
 
+    /// A dictionary-filter fallback body (coalesce group 0) starts at the same offset as its header
+    /// (coalesce group 1), and sorts before it because it is longer. The body is never attached to a task
+    /// of the header's group, so a task that covers it downloads bytes that no request reads.
+    /// `bodyEndBeforeHeader` returns the end of such a body in front of range `header_idx`, or 0 if there is none.
+    auto bodyEndBeforeHeader = [&](size_t header_idx) -> size_t
+    {
+        if (header_idx == 0)
+            return 0;
+        const RangeState & body = ranges[header_idx - 1];
+        const RangeState & header = ranges[header_idx];
+        const bool other_group = initial_req->coalesce_group != body.request->coalesce_group
+            && (initial_req->coalesce_group != 0 || body.request->coalesce_group != 0);
+        if (other_group && body.start == header.start && body.end > header.end)
+            return body.end;
+        return 0;
+    };
+    /// The initial range is a header: extending it to the right would cover its own body.
+    const size_t body_end_before_initial = bodyEndBeforeHeader(range_idx);
+
     /// Go left.
     size_t initial_offset = start_offset;
     for (size_t idx = range_idx; idx > 0; --idx)
@@ -365,6 +384,7 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
         /// A zero-byte gap is contiguous. `min_bytes_for_seek` of 0 must not split filters written back-to-back.
         const bool positive_gap = same_group ? r.end < start_offset : true;
         if (group_boundary ||
+            bodyEndBeforeHeader(idx - 1) != 0 || // taking that header would cover its body
             (positive_gap && r.end + gap_limit <= start_offset) || // short gap
             /// `end_past_cap` is the same-group cap. This addition wraps when the cap is `UInt64` max.
             (!same_group && r.start + span_limit <= initial_offset) || // task not too big
@@ -413,6 +433,7 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
         /// Same zero-gap rule as the left scan.
         const bool positive_gap = same_group ? end_offset < r.start : true;
         if (group_boundary ||
+            (body_end_before_initial != 0 && end_offset < body_end_before_initial) || // would cover the body
             (positive_gap && end_offset + gap_limit <= r.start) ||
             (!same_group && initial_offset + span_limit <= r.end) ||
             end_past_cap ||
