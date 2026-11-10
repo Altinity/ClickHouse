@@ -70,6 +70,8 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Storages/ColumnsDescription.h>
 #include <Storages/ObjectStorage/DataLakes/Common/AvroForIcebergDeserializer.h>
+#include <Interpreters/ProcessList.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/BinPackRewrite.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ExpireSnapshotsExecute.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/RemoveOrphanFilesExecute.h>
@@ -138,6 +140,8 @@ extern const int METADATA_MISMATCH;
 extern const int UNFINISHED;
 extern const int INCORRECT_DATA;
 extern const int FILE_DOESNT_EXIST;
+extern const int LIMIT_EXCEEDED;
+extern const int QUERY_WAS_CANCELLED;
 }
 
 namespace Setting
@@ -480,7 +484,7 @@ static Poco::JSON::Object::Ptr traverseMetadataAndFindNecessarySnapshotObject(
 }
 
 IcebergDataSnapshotPtr IcebergMetadata::createIcebergDataSnapshotFromSnapshotJSON(
-    Poco::JSON::Object::Ptr snapshot_object, Int64 snapshot_id, ContextPtr local_context) const
+    Poco::JSON::Object::Ptr metadata_object, Poco::JSON::Object::Ptr snapshot_object, Int64 snapshot_id, ContextPtr local_context) const
 {
     if (!snapshot_object->has(f_manifest_list))
         throw Exception(
@@ -522,7 +526,10 @@ IcebergDataSnapshotPtr IcebergMetadata::createIcebergDataSnapshotFromSnapshotJSO
         total_rows,
         total_bytes,
         total_position_deletes,
-        total_equality_deletes);
+        total_equality_deletes,
+        /* partition_key */ std::nullopt,
+        /* sorting_key */ std::nullopt,
+        metadata_object->has(f_partition_specs) ? metadata_object->get(f_partition_specs).extract<Poco::JSON::Array::Ptr>() : nullptr);
 }
 
 IcebergDataSnapshotPtr
@@ -536,13 +543,15 @@ IcebergMetadata::getIcebergDataSnapshot(Poco::JSON::Object::Ptr metadata_object,
     if (!object)
         throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION, "No snapshot found for id `{}`", snapshot_id);
 
-    return createIcebergDataSnapshotFromSnapshotJSON(object, snapshot_id, local_context);
+    return createIcebergDataSnapshotFromSnapshotJSON(metadata_object, object, snapshot_id, local_context);
 }
 
 bool IcebergMetadata::optimize(
     [[maybe_unused]] const StorageMetadataPtr & metadata_snapshot,
     [[maybe_unused]] ContextPtr context,
-    [[maybe_unused]] const std::optional<FormatSettings> & format_settings)
+    [[maybe_unused]] const std::optional<FormatSettings> & format_settings,
+    [[maybe_unused]] std::shared_ptr<DataLake::ICatalog> catalog,
+    [[maybe_unused]] const StorageID & storage_id)
 {
     checkTableRootIsQueriedPath("OPTIMIZE");
 
@@ -558,27 +567,78 @@ bool IcebergMetadata::optimize(
     iceberg_compaction_metadata_generator->waitUntilUpdated();
     return true;
 #else
-    if (context->getSettingsRef()[Setting::allow_experimental_iceberg_compaction])
+    if (!context->getSettingsRef()[Setting::allow_experimental_iceberg_compaction])
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS, "Enable 'allow_experimental_iceberg_compaction' setting to call optimize for iceberg tables.");
+
+    /// Format version 3 requires row lineage to be carried into rewritten files, which neither
+    /// compaction path does yet. The cached version may be stale, so both paths check the latest
+    /// metadata again; this only rejects early.
+    if (persistent_components.format_version != 2)
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "OPTIMIZE TABLE is supported only for Iceberg format_version 2, got {}",
+            persistent_components.format_version);
+
+    auto invalidate_metadata_cache = [&]()
     {
-        const auto sample_block = std::make_shared<const Block>(metadata_snapshot->getSampleBlock());
-        auto snapshots_info = getHistory(context);
+        if (persistent_components.metadata_cache)
+        {
+            persistent_components.metadata_cache->remove(persistent_components.table_path);
+            if (persistent_components.table_uuid)
+                persistent_components.metadata_cache->remove(*persistent_components.table_uuid);
+        }
+    };
+
+    /// Bin-packing never rewrites a file a position delete applies to, so it cannot remove them.
+    if (Iceberg::hasLivePositionDeletes(
+            persistent_components, object_storage, *external_storages, data_lake_settings, context, catalog, storage_id))
+    {
+        LOG_INFO(log, "Table has live position delete files, applying them with a full compaction");
         compactIcebergTable(
-            snapshots_info,
+            getHistory(context),
             persistent_components,
             object_storage,
             external_storages,
             data_lake_settings,
             format_settings,
-            sample_block,
+            std::make_shared<const Block>(metadata_snapshot->getSampleBlock()),
             context,
             write_format);
+        invalidate_metadata_cache();
         return true;
     }
-    else
+
+    /// Each attempt rewrites data files, so a conflict is retried only a few times.
+    static constexpr size_t MAX_BIN_PACK_RETRIES = 5;
+
+    for (size_t attempt = 0; attempt < MAX_BIN_PACK_RETRIES; ++attempt)
     {
-        throw Exception(
-            ErrorCodes::BAD_ARGUMENTS, "Enable 'allow_experimental_iceberg_compaction' setting to call optimize for iceberg tables.");
+        if (auto elem = context->getProcessListElement(); elem && elem->isKilled())
+            throw Exception(ErrorCodes::QUERY_WAS_CANCELLED, "OPTIMIZE TABLE cancelled during bin-pack retry loop");
+
+        if (attempt > 0)
+            LOG_INFO(log, "Retrying bin-pack compaction (attempt {}/{})", attempt + 1, MAX_BIN_PACK_RETRIES);
+
+        const auto result = Iceberg::executeBinPackCompaction(
+            persistent_components,
+            object_storage,
+            *external_storages,
+            data_lake_settings,
+            context,
+            write_format,
+            catalog,
+            storage_id);
+
+        if (result == Iceberg::BinPackCommitResult::Committed)
+        {
+            invalidate_metadata_cache();
+            return true;
+        }
     }
+
+    throw Exception(ErrorCodes::LIMIT_EXCEEDED,
+        "Bin-pack compaction did not commit after {} attempts because of concurrent modifications", MAX_BIN_PACK_RETRIES);
 #endif
 }
 
@@ -837,7 +897,7 @@ void IcebergMetadata::truncate(ContextPtr context, std::shared_ptr<DataLake::ICa
     auto metadata_info = filename_generator.generateMetadataPathWithInfo();
 
     auto [new_snapshot, manifest_list_path] = MetadataGenerator(metadata_object).generateNextMetadata(
-        filename_generator, metadata_info.path, parent_snapshot_id,
+        filename_generator, resolver.reverseResolve(actual_table_state_snapshot.metadata_file_path), parent_snapshot_id,
         /* added_files */ 0, /* added_records */ 0, /* added_files_size */ 0,
         /* num_partitions */ 0, /* added_delete_files */ 0, /* num_deleted_rows */ 0,
         std::nullopt, std::nullopt, MetadataGenerator::SnapshotOperation::Append, /*is_truncate=*/true);
@@ -1253,7 +1313,7 @@ Iceberg::IcebergDataSnapshotPtr IcebergMetadata::getRelevantDataSnapshotFromTabl
     Poco::JSON::Object::Ptr snapshot_object = traverseMetadataAndFindNecessarySnapshotObject(
         metadata_object, *table_state_snapshot.snapshot_id, persistent_components.schema_processor, local_context);
 
-    return createIcebergDataSnapshotFromSnapshotJSON(snapshot_object, *table_state_snapshot.snapshot_id, local_context);
+    return createIcebergDataSnapshotFromSnapshotJSON(metadata_object, snapshot_object, *table_state_snapshot.snapshot_id, local_context);
 }
 
 DataLakeMetadataPtr IcebergMetadata::create(
@@ -1292,7 +1352,6 @@ IcebergMetadata::IcebergHistory IcebergMetadata::getHistory(ContextPtr local_con
 
     auto metadata_object
         = getMetadataJSONObject(metadata_file_path, object_storage, persistent_components.metadata_cache, local_context, log, compression_method, persistent_components.table_uuid);
-    chassert(persistent_components.format_version == metadata_object->getValue<int>(f_format_version));
 
     /// History
     std::vector<Iceberg::IcebergHistoryRecord> iceberg_history;
@@ -2250,6 +2309,7 @@ std::vector<Field> recomputeExportPartitionValues(
 std::optional<IStorage::ExportPartitionCommitInfo> IcebergMetadata::commitImportPartitionTransactionImpl(
     FileNamesGenerator & filename_generator,
     Poco::JSON::Object::Ptr & metadata,
+    String & metadata_file_path,
     Poco::JSON::Object::Ptr & partition_spec,
     const String & transaction_id,
     Int64 original_schema_id,
@@ -2294,7 +2354,7 @@ std::optional<IStorage::ExportPartitionCommitInfo> IcebergMetadata::commitImport
         parent_snapshot = metadata->getValue<Int64>(Iceberg::f_current_snapshot_id);
 
     auto [new_snapshot, manifest_list_path] = MetadataGenerator(metadata).generateNextMetadata(
-        filename_generator, metadata_info.path, parent_snapshot, total_data_files, total_rows, total_chunks_size, total_data_files, /* added_delete_files */0, /* num_deleted_rows */0);
+        filename_generator, resolver.reverseResolve(metadata_file_path), parent_snapshot, total_data_files, total_rows, total_chunks_size, total_data_files, /* added_delete_files */0, /* num_deleted_rows */0);
     const auto storage_manifest_list_name = resolver.resolve(manifest_list_path);
 
     /// Embed the stable transaction identifier in the snapshot summary so that a retry after crash
@@ -2371,6 +2431,7 @@ std::optional<IStorage::ExportPartitionCommitInfo> IcebergMetadata::commitImport
                 getLogger("IcebergMetadata"),
                 compression_method,
                 persistent_components.table_uuid);
+            metadata_file_path = metadata_path;
 
             /// For the export path the schema and partition spec are fixed at the start of the
             /// operation (saved in ZooKeeper). If either changed we must fail immediately —
@@ -2681,12 +2742,14 @@ IStorage::ExportPartitionCommitInfo IcebergMetadata::commitExportPartitionTransa
         per_file_stats.push_back(std::move(stats));
     }
 
+    String metadata_file_path = updated_metadata_file_info.path;
     size_t attempt = 0;
     while (attempt < MAX_TRANSACTION_RETRIES)
     {
         auto commit_info = commitImportPartitionTransactionImpl(
                 filename_generator,
                 metadata,
+                metadata_file_path,
                 partition_spec,
                 transaction_id,
                 original_schema_id,

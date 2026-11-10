@@ -1,9 +1,9 @@
 import os
 
-S3_BUCKET_NAME = "altinity-build-artifacts"
-S3_REPORT_BUCKET_NAME = "altinity-build-artifacts"
-S3_BUCKET_HTTP_ENDPOINT = "altinity-build-artifacts.s3.amazonaws.com"
-S3_REPORT_BUCKET_HTTP_ENDPOINT = "altinity-build-artifacts.s3.amazonaws.com"
+S3_BUCKET_NAME = os.environ.get("S3_ARTIFACT_BUCKET") or ""
+S3_REPORT_BUCKET_NAME = S3_BUCKET_NAME
+S3_BUCKET_HTTP_ENDPOINT = f"{S3_BUCKET_NAME}.s3.amazonaws.com"
+S3_REPORT_BUCKET_HTTP_ENDPOINT = S3_BUCKET_HTTP_ENDPOINT
 
 
 class RunnerLabels:
@@ -23,14 +23,12 @@ ENABLE_MULTIPLATFORM_DOCKER_IN_ONE_JOB = False
 DOCKER_BUILD_AND_MERGE_RUNS_ON = RunnerLabels.STYLE_CHECK_AMD
 DOCKER_BUILD_ARM_RUNS_ON = RunnerLabels.STYLE_CHECK_ARM
 
-CACHE_S3_PATH = f"{S3_BUCKET_NAME}/ci_ch_cache"
+CACHE_S3_PATH = f"{S3_BUCKET_NAME}/ci_ch_cache" if S3_BUCKET_NAME else ""
 HTML_S3_PATH = S3_REPORT_BUCKET_NAME
 S3_REPORT_BUCKET = S3_REPORT_BUCKET_NAME
 S3_BUCKET_TO_HTTP_ENDPOINT = {
     S3_BUCKET_NAME: S3_BUCKET_HTTP_ENDPOINT,
     S3_REPORT_BUCKET_NAME: S3_REPORT_BUCKET_HTTP_ENDPOINT,
-    # S3.copy_file_to_s3 returns a public link to every upload
-    "altinity-builds-cache": "altinity-builds-cache.hel1.your-objectstorage.com",
 }
 ENABLE_ARTIFACTS_REPORT = True
 
@@ -66,10 +64,15 @@ INSTALL_PYTHON_REQS_FOR_NATIVE_JOBS = ""
 ENABLE_SUBMODULE_CLONE_AUTH = True
 
 # Most runners are in Hetzner (hel1): cache there to avoid AWS egress.
-CI_CACHE_BUCKET = "altinity-builds-cache"
-SUBMODULE_CACHE_S3_PATH = f"{CI_CACHE_BUCKET}/ci_ch_cache"
-S3_EXTERNAL_BUCKETS = {
-    CI_CACHE_BUCKET: {
+CI_CACHE_BUCKET = os.environ.get("HETZNER_CACHE_BUCKET") or ""
+SUBMODULE_CACHE_S3_PATH = f"{CI_CACHE_BUCKET}/ci_ch_cache" if CI_CACHE_BUCKET else ""
+S3_EXTERNAL_BUCKETS = {}
+if CI_CACHE_BUCKET:
+    # S3.copy_file_to_s3 returns a public link to every upload
+    S3_BUCKET_TO_HTTP_ENDPOINT[CI_CACHE_BUCKET] = (
+        f"{CI_CACHE_BUCKET}.hel1.your-objectstorage.com"
+    )
+    S3_EXTERNAL_BUCKETS[CI_CACHE_BUCKET] = {
         "endpoint_url": "https://hel1.your-objectstorage.com",
         "region": "hel1",
         "access_key_env": "HETZNER_S3_ACCESS_KEY",
@@ -78,7 +81,6 @@ S3_EXTERNAL_BUCKETS = {
         # netcup runners get ~2.5 MB/s per connection from hel1
         "download_concurrency": 32,
     }
-}
 
 DISABLED_WORKFLOWS = [
     "backport_branches.py",

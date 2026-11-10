@@ -1476,7 +1476,8 @@ void InterpreterCreateQuery::setEngine(ASTCreateQuery & create) const
         /// holds credentials
         getContext()->checkAccess(AccessType::SHOW_COLUMNS, as_database_name, as_table_name);
 
-        ASTPtr as_create_ptr = DatabaseCatalog::instance().getDatabase(as_database_name)->getCreateTableQuery(as_table_name, getContext());
+        const auto as_database = DatabaseCatalog::instance().getDatabase(as_database_name);
+        ASTPtr as_create_ptr = as_database->getCreateTableQuery(as_table_name, getContext());
 
         const auto & as_create = as_create_ptr->as<ASTCreateQuery &>();
 
@@ -1538,9 +1539,10 @@ void InterpreterCreateQuery::setEngine(ASTCreateQuery & create) const
                     if (target.inner_engine && !create.getTargetInnerEngine(target.kind))
                         check_access_to_inherited_definition(*target.inner_engine);
         }
-        else if (as_create.storage)
+        else if (as_create.storage || as_database->isDatalakeCatalog())
         {
-            /// A `DataLakeCatalog` that assigns table locations itself shows its tables without `ENGINE`.
+            /// A `DataLakeCatalog` that assigns table locations itself shows its tables without `ENGINE`,
+            /// and a table without keys has no storage clause at all.
             /// Only a `DataLakeCatalog` target can be created from such a table: it builds its own storage
             /// and copies the keys from the source metadata.
             const auto target_database = DatabaseCatalog::instance().tryGetDatabase(getContext()->resolveDatabase(create.getDatabase()));

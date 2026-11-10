@@ -90,22 +90,50 @@ a live precommit would clamp `GC`'s fold barrier forever.
 ### The orphan-manifest sweep {#orphan-sweep}
 
 The cursor-paced, budgeted sweep has two stages (`Gc/CasOrphanManifestSweep.cpp`). During fold
-planning, it freezes candidates with exact `GET`s, opens and decodes their bodies, and derives the
-state changes needed to make deletion safe. Only after the round `CAS` adopts those changes does
+planning, it checks candidates against the mount floor, ownership, fold coverage, and catalog
+lifecycle. It then freezes accepted candidates with exact `GET`s, opens and decodes their bodies,
+and derives the state changes needed to make deletion safe. Only after the round `CAS` adopts those changes does
 phase 18 perform physical deletion. Eligibility comes **exclusively** from the durable watermark
 in the mount lease — there is no age threshold and no time-based grace period anywhere in this
 protocol. No mount lease for the `server_root_id` means no deletion authority means nothing is
 swept for that root.
 
+The page reads an initial catalog cut `K0`. The mount floor applies to every candidate, including
+manifests whose namespace is absent from `K0`: a writer can stage a manifest before its first
+`precommitAdd` creates the catalog row. An active build, or a build above a lagging published floor,
+must therefore be retained even when no row exists.
+
+Ownership recovery and fold coverage use the row from `K0`. After collecting tentative candidates,
+the page reads one more catalog cut, `K1`, after all floor observations and before any candidate body
+is hinted or read. A candidate passes only if its namespace row is absent in both cuts or the full
+`CatalogEntry` is equal in both. A row that appears, disappears, changes incarnation, or changes
+lifecycle state retains that candidate. A change to another namespace does not block it. Recovery
+never switches to a newer row during this page.
+
+The second cut costs one extra catalog `GET` per page with tentative candidates; pages with none,
+including list-only pages, do not read it. The floor is read once per namespace per page. Candidates
+retained by `K1` increment `skipped` without refilling the nomination budget or rolling back the
+decision cursor. A read or decode error, or an ambiguous life index in `K1`, fails planning before
+body reads and before the new cursor can be adopted.
+
 ```mermaid
 flowchart TD
-    A["LIST one page of cas/manifests/<br/>freeze candidates with exact GET"] --> B{"build-prefix eligible?<br/>durable watermark fact only"}
+    A["LIST one page of cas/manifests/<br/>read initial catalog K0"] --> B{"build-prefix eligible?<br/>mount floor, including rowless namespaces"}
     B -->|"epoch less than lease epoch"| ELIG["eligible, old-epoch debris"]
     B -->|"same epoch, min_active_build_sequence clears build_seq"| ELIG
     B -->|"no lease, or epoch ahead, or build may be live"| SKIP["skip"]
-    ELIG --> C["protection view: committed manifests<br/>plus live precommits<br/>plus manifests with an unfolded minus-one"]
+    ELIG --> ROW{"namespace row in K0?"}
+    ROW -->|yes| C["protection view from K0:<br/>committed manifests, live precommits,<br/>and unfolded removal targets"]
+    ROW -->|no| T["tentative candidate"]
     C -->|"key protected"| SKIP2["skip"]
-    C -->|"not protected"| D{"open and decode<br/>frozen body"}
+    C -->|"not protected"| P{"deletion premise:<br/>fold coverage permits deletion?"}
+    P -->|no| SKIP2
+    P -->|yes| T
+    T --> K["read and validate one post-floor<br/>catalog K1 for all tentative candidates"]
+    K --> Q{"namespace row equal in K0 and K1<br/>or absent in both?"}
+    Q -->|no| SKIP2
+    Q -->|yes| GET["freeze candidate with exact GET"]
+    GET --> D{"open and decode<br/>frozen body"}
     D -->|"cannot open or decode"| U["retain; skipped++ and undecodable++<br/>log exact key; advance decision cursor<br/>continue to later candidates"]
     D -->|decoded| I{"body ref and namespace<br/>match key?"}
     I -->|no| BAD["CORRUPTED_DATA<br/>fail-closed round error"]
