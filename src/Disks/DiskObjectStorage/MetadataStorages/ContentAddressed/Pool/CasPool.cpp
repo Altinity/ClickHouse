@@ -1051,6 +1051,15 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
     store->setEventSink(std::move(store->config.event_sink));
     store->decommission_admin = true;
 
+    if (store->config.retry_sleep_fn)
+    {
+        store->ref_ledger.setRefRecoveryRetrySleepForTest(
+            [sleep_fn = store->config.retry_sleep_fn](uint64_t ms, const std::optional<DetachedStopToken> &)
+            {
+                sleep_fn(ms);
+            });
+    }
+
     /// Register-before-first-write, belt-and-braces: same invariant `open` asserts.
     chassert(store->isAlgoAdmitted(write_algo));
 
