@@ -45,8 +45,8 @@ void onGcEnumerationPage()
 /// mount there is no deletion authority, so the caller must leave the prefix untouched. The mount's
 /// `writer_epoch` and `min_active_build_sequence` are the single durable epoch/floor pair used for eligibility, including
 /// across process replacement and the retired sentinel.
-std::optional<MountLease> floorForNamespace(CasOperation & op, const Layout & layout, const RootNamespace & ns,
-                                            uint64_t * reads = nullptr)
+std::optional<MountLease> mountLeaseForNamespace(CasOperation & op, const Layout & layout, const RootNamespace & ns,
+                                               uint64_t * reads = nullptr)
 {
     const String & value = ns.string();
     size_t pos = value.size();
@@ -70,13 +70,37 @@ std::optional<MountLease> floorForNamespace(CasOperation & op, const Layout & la
     return std::nullopt;
 }
 
+BuildFloor toBuildFloor(const MountLease & mount_lease)
+{
+    return BuildFloor{
+        .writer_epoch = mount_lease.writer_epoch,
+        .min_active_build_sequence = mount_lease.min_active_build_sequence
+    };
+}
+
 struct ListedManifestObject
 {
     RootNamespace ns;
-    BuildPrefix prefix;
+    BuildPrefix build_prefix;
     ManifestRef ref;
     String key;
 };
+
+bool isBuildUnderFloor(
+    CasOperation & op,
+    const Layout & layout,
+    const ListedManifestObject & manifest,
+    std::map<String, std::optional<MountLease>> & mount_lease_by_ns,
+    ManifestSweepResult & result)
+{
+    auto [lease_it, lease_inserted] = mount_lease_by_ns.emplace(manifest.ns.string(), std::nullopt);
+    if (lease_inserted)
+    {
+        ++result.floor_lookups;
+        lease_it->second = mountLeaseForNamespace(op, layout, manifest.ns, &result.floor_reads);
+    }
+    return buildPrefixEligibleUnderFloor(lease_it->second.transform(toBuildFloor), manifest.build_prefix);
+}
 
 /// Delegates to the shared `Layout::parseManifestKey`, which validates the canonical manifest-key
 /// encoding. Keeping parsing in `Layout` avoids a second interpretation of the manifest path and ensures
@@ -89,7 +113,7 @@ std::optional<ListedManifestObject> parseListedManifestObject(const Layout & lay
 
     return ListedManifestObject{
         .ns = parsed->root_namespace,
-        .prefix = BuildPrefix{.writer_epoch = parsed->ref.writer_epoch, .build_sequence = parsed->ref.build_sequence},
+        .build_prefix = BuildPrefix{.writer_epoch = parsed->ref.writer_epoch, .build_sequence = parsed->ref.build_sequence},
         .ref = parsed->ref,
         .key = key};
 }
@@ -140,6 +164,29 @@ const CatalogEntry * catalogEntryOf(const CasRefCatalog::Snapshot & catalog_cut,
         catalog_cut.catalog.entries.begin(), catalog_cut.catalog.entries.end(),
         [&](const CatalogEntry & entry) { return entry.ns == ns; });
     return it == catalog_cut.catalog.entries.end() ? nullptr : &*it;
+}
+
+void excludeCandidatesWithChangedCatalogEntries(
+    CasOperation & op,
+    const Layout & layout,
+    const CasRefCatalog::Snapshot & catalog_cut,
+    std::vector<ListedManifestObject> & candidates,
+    ManifestSweepResult & result)
+{
+    if (candidates.empty())
+        return;
+
+    const CasRefCatalog::Snapshot rechecked_catalog = CasRefCatalog::read(op, layout);
+    rechecked_catalog.life_index.throwIfAmbiguous("CAS orphan manifest sweep post-floor catalog");
+    std::erase_if(candidates, [&](const ListedManifestObject & candidate)
+    {
+        const CatalogEntry * before = catalogEntryOf(catalog_cut, candidate.ns);
+        const CatalogEntry * after = catalogEntryOf(rechecked_catalog, candidate.ns);
+        if ((!before && !after) || (before && after && *before == *after))
+            return false;
+        ++result.skipped;
+        return true;
+    });
 }
 
 /// The durable `last_folded_ref_id` of a coverage row, `{0, 0}` when there is none — as for a fresh
@@ -529,32 +576,32 @@ namespace
 /// do not replace that authority check with a frozen-sequence or judged-dead guess. Compare
 /// `writer_epoch` first, then `build_sequence`, so old-epoch
 /// debris drains after a process restart even when its build_sequence is above the current min_active_build_sequence.
-bool prefixEligibleOn(CasOperation & op, const Layout & layout, const RootNamespace & ns, const BuildPrefix & prefix)
+bool buildPrefixEligibleUnderFloorOn(
+    CasOperation & op, const Layout & layout, const RootNamespace & ns, const BuildPrefix & build_prefix)
 {
-    return prefixEligibleUnder(floorForNamespace(op, layout, ns), prefix);
+    return buildPrefixEligibleUnderFloor(mountLeaseForNamespace(op, layout, ns).transform(toBuildFloor), build_prefix);
 }
 
 }
 
-bool prefixEligibleUnder(const std::optional<MountLease> & floor, const BuildPrefix & prefix)
+bool buildPrefixEligibleUnderFloor(const std::optional<BuildFloor> & floor, const BuildPrefix & build_prefix)
 {
     if (!floor)
         return false;
 
-    const MountLease & w = *floor;
-    if (prefix.writer_epoch < w.writer_epoch)
+    if (floor->writer_epoch > build_prefix.writer_epoch)
         return true;
-    if (prefix.writer_epoch > w.writer_epoch)
+    if (floor->writer_epoch < build_prefix.writer_epoch)
         return false;
-    if (w.isCleanRelease())
+    if (floor->min_active_build_sequence == std::numeric_limits<uint64_t>::max())
         return true;   /// farewell/retired sentinel: every seq is retired
-    return w.min_active_build_sequence > prefix.build_sequence;
+    return floor->min_active_build_sequence > build_prefix.build_sequence;
 }
 
-bool prefixEligible(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix)
+bool buildPrefixEligibleUnderFloor(Pool & store, const RootNamespace & ns, const BuildPrefix & build_prefix)
 {
     CasOperation op = store.openRequests().admit();
-    return prefixEligibleOn(op, store.layout(), ns, prefix);
+    return buildPrefixEligibleUnderFloorOn(op, store.layout(), ns, build_prefix);
 }
 
 uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix,
@@ -563,7 +610,7 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
     const Layout & layout = store.layout();
     /// The decommission drain runs under the admin's lease; a fenced admin must stop deleting.
     CasOperation op = store.mountRequests().admit();
-    if (!prefixEligibleOn(op, layout, ns, prefix))
+    if (!buildPrefixEligibleUnderFloorOn(op, layout, ns, prefix))
         return 0;   /// not eligible by the durable watermark fact — delete nothing (controls #8/#9)
 
     /// Build the protection view. A missing snapshot body, an invalid transaction, or an incomplete
@@ -709,7 +756,7 @@ ManifestSweepResult planManifestCursorPage(
     /// One floor observation per namespace for the whole page. Every build of a namespace is judged
     /// against the same mount body; reading it per build prefix would cost three requests per listed
     /// key on a pool where every INSERT is its own build.
-    std::map<String, std::optional<MountLease>> floor_by_ns;
+    std::map<String, std::optional<MountLease>> mount_lease_by_ns;
     std::map<String, NamespaceFoldView> view_by_ns;
     std::map<String, std::set<String>> active_by_ns;
     std::set<String> errored_namespaces;   /// protection view unavailable => skip, never delete
@@ -760,23 +807,18 @@ ManifestSweepResult planManifestCursorPage(
             continue;
         }
 
-        const CatalogEntry * catalog_entry = catalogEntryOf(catalog_cut, parsed->ns);
-        if (catalog_entry)
+        /// Within one `writer_epoch`, `build_sequence < min_active_build_sequence` means the build is no longer active.
+        /// It may have completed `promote`, been cancelled, or finished cleanup. This does not yet make its manifests
+        /// safe to delete: ownership and fold coverage must also be checked.
+        /// If `build_sequence >= min_active_build_sequence`, the build may still be active, so retain its manifests.
+        if (!isBuildUnderFloor(op, layout, *parsed, mount_lease_by_ns, result))
         {
-            auto [floor_it, floor_inserted] = floor_by_ns.emplace(parsed->ns.string(), std::nullopt);
-            if (floor_inserted)
-            {
-                ++result.floor_lookups;
-                floor_it->second = floorForNamespace(op, layout, parsed->ns, &result.floor_reads);
-            }
-            if (!prefixEligibleUnder(floor_it->second, parsed->prefix))
-            {
-                ++result.skipped;
-                decided_through = listed.key;
-                continue;
-            }
+            ++result.skipped;
+            decided_through = listed.key;
+            continue;
         }
 
+        const CatalogEntry * catalog_entry = catalogEntryOf(catalog_cut, parsed->ns);
         auto [view_it, view_inserted] = view_by_ns.emplace(parsed->ns.string(), NamespaceFoldView{});
         auto [active_it, inserted] = active_by_ns.emplace(parsed->ns.string(), std::set<String>{});
         if (inserted)
@@ -884,17 +926,13 @@ ManifestSweepResult planManifestCursorPage(
             continue;
         }
 
-        /// If the post-observation catalog cut has no row, this candidate was necessarily created by a
-        /// now-dead life: creation publishes its row before any life-owned object. No current life can
-        /// name it, and a concurrent later creation can only replace its token after this observation.
-        /// A catalog-named row instead needs the ordinary coverage/owner proof below.
         if (catalog_entry)
         {
             /// THE §6 SAFETY FLOOR, the same predicate `sweepNamespace` calls, under the same watermark
             /// eligibility. A refusal is recorded rather than silent (Constraint 10).
             String retain_reason;
             SweepRetainClass retain_class = SweepRetainClass::None;
-            if (!manifestDeletionPremise(view_it->second, ManifestKey{parsed->key, parsed->prefix},
+            if (!manifestDeletionPremise(view_it->second, ManifestKey{parsed->key, parsed->build_prefix},
                                          &retain_reason, &retain_class))
             {
                 /// The sentence goes to the debug log for whoever is chasing ONE object; the class goes to
@@ -920,6 +958,10 @@ ManifestSweepResult planManifestCursorPage(
         candidates.push_back(*parsed);
         decided_through = listed.key;
     }
+
+    /// A writer may create a namespace, commit a ref and advance the floor after `catalog_cut` was read.
+    /// Recheck after floor reads so the old catalog cut cannot make its committed manifest look unowned.
+    excludeCandidatesWithChangedCatalogEntries(op, layout, catalog_cut, candidates, result);
 
     size_t next_body_hint = 0;
     for (const ListedManifestObject & candidate : candidates)
