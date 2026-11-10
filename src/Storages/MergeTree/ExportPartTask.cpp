@@ -341,7 +341,8 @@ bool ExportPartTask::executeStep()
             sink = std::move(import_result.sink);
 
             bool apply_deleted_mask = true;
-            bool read_with_direct_io = local_context->getSettingsRef()[Setting::min_bytes_to_use_direct_io] > manifest.data_part->getBytesOnDisk();
+            const UInt64 min_bytes_to_use_direct_io = local_context->getSettingsRef()[Setting::min_bytes_to_use_direct_io];
+            bool read_with_direct_io = min_bytes_to_use_direct_io != 0 && manifest.data_part->getBytesOnDisk() >= min_bytes_to_use_direct_io;
             bool prefetch = false;
 
             MergeTreeData::IMutationsSnapshot::Params mutations_snapshot_params
