@@ -65,7 +65,17 @@ class S3:
 
     @classmethod
     def _external_bucket_config(cls, bucket):
-        return (Settings.S3_EXTERNAL_BUCKETS or {}).get(bucket)
+        config = (Settings.S3_EXTERNAL_BUCKETS or {}).get(bucket)
+        if not config or not config.get("endpoint_url"):
+            return None
+        return config
+
+    @classmethod
+    def _http_endpoint(cls, bucket):
+        config = (Settings.S3_EXTERNAL_BUCKETS or {}).get(bucket) or {}
+        endpoint = config.get("http_endpoint")
+        assert endpoint, f"S3 bucket [{bucket}] has no http_endpoint in S3_EXTERNAL_BUCKETS"
+        return endpoint
 
     @classmethod
     def _reads_anonymously(cls, bucket):
@@ -280,8 +290,7 @@ class S3:
             print(f"WARNING: Failed to record upload usage for {local_path}: {e}")
 
         bucket = s3_path.split("/")[0]
-        endpoint = Settings.S3_BUCKET_TO_HTTP_ENDPOINT[bucket]
-        assert endpoint
+        endpoint = cls._http_endpoint(bucket)
         return quote(f"https://{s3_full_path}".replace(bucket, endpoint), safe=":/?&=")
 
     @classmethod
@@ -643,7 +652,7 @@ class S3:
     def _dump_urls(cls, s3_path):
         # TODO: add support for path with '*'
         bucket, name = s3_path.split("/")[0], s3_path.split("/")[-1]
-        endpoint = Settings.S3_BUCKET_TO_HTTP_ENDPOINT[bucket]
+        endpoint = cls._http_endpoint(bucket)
 
         with open(Settings.ARTIFACT_URLS_FILE, "w", encoding="utf-8") as f:
             json.dump(
