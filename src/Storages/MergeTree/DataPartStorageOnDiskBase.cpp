@@ -1352,6 +1352,14 @@ void DataPartStorageOnDiskBase::createDirectories()
     executeWriteOperation([&](auto & disk) { disk.createDirectories(fs::path(root_path) / part_dir); });
 }
 
+void DataPartStorageOnDiskBase::checkpointTransaction()
+{
+    if (isContentAddressed())
+        return;
+
+    IDataPartStorage::checkpointTransaction();
+}
+
 bool DataPartStorageOnDiskBase::hasActiveTransaction() const
 {
     return transaction != nullptr;
