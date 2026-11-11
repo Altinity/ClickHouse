@@ -58,6 +58,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         addSettingsChanges(settings_changes_history, "26.8.27.20001.altinityantalya",
         {
             {"input_format_parquet_footer_read_size", 65536, 0, "New setting to override the adaptive Parquet footer initial read size with a fixed number of bytes; 0 keeps the adaptive behavior. Before this setting the reader always read a fixed 64 KiB tail. `compatibility` with 26.8 restores that fixed read."},
+            {"input_format_parquet_bloom_filter_coalesce_max_bytes", 0, 64 * 1024 * 1024, "Read contiguous Parquet bloom filters, or a small file that has many of them, in one request."},
         });
         addSettingsChanges(settings_changes_history, "26.8",
         {
