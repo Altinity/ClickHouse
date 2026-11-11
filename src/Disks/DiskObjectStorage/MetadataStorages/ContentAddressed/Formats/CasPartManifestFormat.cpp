@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasByteBudget.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasCodecUtil.h>
@@ -14,6 +15,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
+    extern const int LIMIT_EXCEEDED;
 }
 }
 
@@ -75,6 +77,20 @@ String bannerFor(std::string_view path, uint64_t n)
     return std::move(w).take();
 }
 
+void validateManifestEntryPath(std::string_view path)
+{
+    if (path.empty() || path.front() == '/')
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS part manifest: invalid entry path '{}'", path);
+    for (std::string_view rest = path; !rest.empty();)
+    {
+        const size_t slash = rest.find('/');
+        const std::string_view segment = rest.substr(0, slash);
+        if (segment.empty() || segment == "." || segment == "..")
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS part manifest: invalid entry path '{}'", path);
+        rest = slash == std::string_view::npos ? std::string_view{} : rest.substr(slash + 1);
+    }
+}
+
 }
 
 std::string_view entryPlacementToWireWord(EntryPlacement placement)
@@ -94,31 +110,52 @@ String encodePartManifest(const PartManifest & m)
     std::vector<const ManifestEntry *> sorted;
     sorted.reserve(m.entries.size());
     for (const auto & e : m.entries)
+    {
+        validateManifestEntryPath(e.path);
         sorted.push_back(&e);
+    }
     std::sort(sorted.begin(), sorted.end(),
               [](const ManifestEntry * a, const ManifestEntry * b) { return a->path < b->path; });
     for (size_t i = 1; i < sorted.size(); ++i)
         if (sorted[i]->path == sorted[i - 1]->path)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: duplicate path '{}'", sorted[i]->path);
 
+    const uint64_t line_cap = traitsFor(FormatId::PartManifest).line_cap;
+    const auto check_line_bytes = [&](size_t bytes, std::string_view what)
+    {
+        if (!fitsLineCap(bytes, line_cap))
+            throw Exception(ErrorCodes::LIMIT_EXCEEDED,
+                "CAS part manifest: the {} line encodes to {} bytes, over the {}-byte line cap",
+                what, bytes, line_cap);
+    };
+
     CasJsonWriter out(256);
     writeHeaderLine(out, FormatId::PartManifest);
+    check_line_bytes(out.size() - 1, "header");
 
     /// descriptor meta line: ManifestRef (epoch/build/ord, shared rendering with refsnaplog) + root
     /// namespace + payload digest.
     {
+        const size_t line_start = out.size();
         bool first = true;
         writeManifestRefFields(out, first, kBareManifestRefKeys, m.ref);
         writeStringField(out, PartManifestWire::ns, m.root_namespace_id.string(), first);
         writeHex128Field(out, PartManifestWire::payload_digest, m.payload_digest, first);
         closeObject(out, first);
+        check_line_bytes(out.size() - line_start, "descriptor");
         writeChar('\n', out);
     }
 
     for (const ManifestEntry * e : sorted)
+    {
+        const size_t line_start = out.size();
         writeEntryRecord(out, *e);
+        check_line_bytes(out.size() - line_start - 1, "entry record");
+    }
 
+    const size_t trailer_start = out.size();
     writeTrailerLine(out, sorted.size());
+    check_line_bytes(out.size() - trailer_start - 1, "trailer");
 
     /// payload zone: one banner + raw bytes + '\n' per Inline entry, in path order. Blob entries
     /// carry no payload-zone bytes (their bytes live in a separately addressed CAS blob).
@@ -127,6 +164,7 @@ String encodePartManifest(const PartManifest & m)
         if (e->placement != EntryPlacement::Inline)
             continue;
         const String banner = bannerFor(e->path, e->inline_bytes.size());
+        check_line_bytes(banner.size(), "payload banner");
         out.append(banner);
         writeChar('\n', out);
         out.append(e->inline_bytes);
@@ -208,20 +246,7 @@ PartManifest decodePartManifest(std::string_view data)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: record must start with \"path\"");
         ManifestEntry e;
         e.path = r.readString();
-
-        /// Manifest bytes arrive over the interserver relink channel: enforce the same path hygiene
-        /// as CasLayout::checkNamespace so no future consumer can inherit a traversal. Relative,
-        /// no empty/'.'/'..' segments. (Syntactic only — legal projection subdirs pass.)
-        if (e.path.empty() || e.path.front() == '/')
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS part manifest: invalid entry path '{}'", e.path);
-        for (std::string_view rest = e.path; !rest.empty();)
-        {
-            const size_t slash = rest.find('/');
-            const std::string_view seg = rest.substr(0, slash);
-            if (seg.empty() || seg == "." || seg == "..")
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS part manifest: invalid entry path '{}'", e.path);
-            rest = (slash == std::string_view::npos) ? std::string_view{} : rest.substr(slash + 1);
-        }
+        validateManifestEntryPath(e.path);
 
         std::optional<String> pm;
         BlobRefFields blob_ref;
