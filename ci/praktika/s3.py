@@ -3,6 +3,7 @@ import json
 import mimetypes
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional
 from urllib.parse import quote, urlencode
@@ -190,6 +191,30 @@ class S3:
         return
 
     @classmethod
+    def _object_is_fresh(cls, s3_path, window_seconds=5 * 60):
+        obj = cls.head_object(s3_path)
+        if not obj or not obj.LastModified:
+            return False
+        mtime = datetime.fromisoformat(obj.LastModified)
+        if mtime.tzinfo is None:
+            mtime = mtime.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - mtime).total_seconds()
+        return abs(age) <= window_seconds
+
+    @classmethod
+    def _wait_until_object_fresh(cls, s3_path):
+        # NOTE (strtgbb): Ceph returns 500 while CompleteMultipartUpload still holds its lock; a recent mtime means the cache is fresh.
+        for attempt in range(15):
+            if attempt:
+                time.sleep(2)
+            if cls._object_is_fresh(s3_path):
+                print(
+                    f"NOTE: multipart completion already in progress for [{s3_path}], cache object is fresh"
+                )
+                return True
+        return False
+
+    @classmethod
     def copy_file_to_s3(
         cls,
         s3_path,
@@ -229,6 +254,7 @@ class S3:
             BOTO3_AVAILABLE and cls._get_boto3_client()
         ), "boto3 is required for S3 uploads (the AWS CLI fallback is deprecated)"
 
+        bucket = ""
         try:
             s3_full_path_clean = str(s3_full_path).removeprefix("s3://")
             bucket, key = s3_full_path_clean.split("/", maxsplit=1)
@@ -279,9 +305,17 @@ class S3:
             if not no_strict:
                 raise
         except Exception as e:
-            print(f"ERROR: Failed to upload to S3 using boto3: {e}")
-            if not no_strict:
-                raise
+            recovered = (
+                bucket
+                and cls._external_bucket_config(bucket)
+                and type(e).__name__ == "S3UploadFailedError"
+                and "multipart completion is already in progress" in str(e)
+                and cls._wait_until_object_fresh(s3_full_path)
+            )
+            if not recovered:
+                print(f"ERROR: Failed to upload to S3 using boto3: {e}")
+                if not no_strict:
+                    raise
 
         # Common cleanup and return for both paths
         try:
