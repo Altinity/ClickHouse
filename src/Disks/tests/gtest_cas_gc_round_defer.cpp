@@ -24,6 +24,19 @@ extern const Event CASGCRefWalkPlansBuilt;
 namespace
 {
 const UInt128 kGc = UInt128(0xAB);
+
+void seedWaitingSweep(Backend & backend, const Layout & layout)
+{
+    OperationForTest op(backend);
+    const auto got = (*op).read(layout.gcStateKey(), Retry::once());
+    GcState state = got ? decodeGcState(got->bytes) : GcState{};
+    state.orphan_manifest_sweep_completed_at_ms = 1000;
+    state.lease = GcLease{kGc, 1};
+    if (got)
+        orThrow((*op).replace(layout.gcStateKey(), encodeGcState(state), got->etag, Retry::once()), "test waiting schedule");
+    else
+        orThrow((*op).create(layout.gcStateKey(), encodeGcState(state), Retry::once()), "test waiting schedule");
+}
 }
 
 TEST(CASGCRoundDefer, PredicateTruthTable)
@@ -424,9 +437,10 @@ TEST(CASGCRoundDefer, DeferredRoundRetriesPartialJanitorPageAtForcedFoldWithoutP
             .last_epoch_seal = std::nullopt}),
         Retry::once())));
 
+    seedWaitingSweep(*backend, layout);
     backend->resetCounts();
     std::vector<GcPhaseRecord> phases;
-    Gc gc(store, kGc);
+    Gc gc(store, kGc, [] { return 1001; });
     gc.setPhaseSink([&](const GcPhaseRecord & phase) { phases.push_back(phase); });
     const uint64_t plans_before
         = ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt];
@@ -645,7 +659,8 @@ TEST(CASGCRoundDefer, BoundedDeferralForcesFoldWithinWindow)
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", UInt128(1))});
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
 
-    Gc gc(store, kGc);
+    seedWaitingSweep(*backend, store->layout());
+    Gc gc(store, kGc, [] { return 1001; });
     for (int i = 0; i < 3; ++i)
     {
         const RoundReport rep = gc.runRegularRound();

@@ -101,7 +101,7 @@ uint64_t removeChunkWriteOnceOrOneByOne(CasOperation & op, const std::vector<Wri
 /// is reached (rounds_since_last_fold >= fold_max_defer_rounds). The graduation_due term is the
 /// load-bearing safety guard: no destructive decision ever runs on a not-fully-folded snapshot.
 bool shouldDeferRound(size_t changed_shards, bool graduation_due, uint64_t rounds_since_last_fold,
-                      uint64_t fold_threshold, uint64_t fold_max_defer_rounds);
+                      uint64_t fold_threshold, uint64_t fold_max_defer_rounds, bool force_orphan_manifest_sweep = false);
 
 /// One anomaly the fold surfaced (a clamped cursor — a missing committed/removal body, or the fold
 /// barrier on a live missing-body precommit). Surfaced to fsck/logs; recording an anomaly never throws:
@@ -739,7 +739,7 @@ private:
                     const RefPlan & walk_plan, UniversePolicy policy,
                     /// One instance for the WHOLE round, owned by `runRegularRound` and threaded through
                     /// every destructive-work family the round touches — see `GcRoundWorkBudget`.
-                    GcRoundWorkBudget & work_budget);
+                    GcRoundWorkBudget & work_budget, bool run_orphan_manifest_sweep);
 
     struct RedeleteIo
     {
@@ -987,6 +987,7 @@ private:
     /// it may fold one round sooner than a long-lived leader would, never later). Reset to 0 whenever
     /// a round folds; incremented on every DEFER. Bounds batching via `gc_fold_max_defer_rounds`.
     uint64_t rounds_since_last_fold_ = 0;
+    std::optional<uint64_t> orphan_manifest_sweep_retry_generation;
 
     /// THIS LEADER'S OWN AUTHORITY VERDICT, and the reason it is a cached bool rather than a probe.
     ///

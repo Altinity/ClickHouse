@@ -1878,6 +1878,7 @@ TEST(CASGCRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     config.server_root_id = "gc-runner";
     config.manifest_sweep_list_budget_keys = 1;
     config.manifest_sweep_delete_budget_keys = 1;
+    config.orphan_manifest_sweep_interval_sec = 0;
     /// This test drives MANY consecutive rounds expecting each to sweep + persist the cursor; force
     /// fold-every-round (Phase-4 Lever A would otherwise defer once the pool quiesces).
     config.gc_fold_max_defer_rounds = 0;

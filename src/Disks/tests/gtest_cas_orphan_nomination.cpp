@@ -130,6 +130,7 @@ ReadyFixture makeReadyFixture()
     config.server_root_id = "gc-runner";
     config.manifest_sweep_list_budget_keys = 100;
     config.manifest_sweep_delete_budget_keys = 100;
+    config.orphan_manifest_sweep_interval_sec = 0;
     config.gc_fold_max_defer_rounds = 0;
     f.store = Pool::open(f.backend, config);
     f.backend->layout = f.store->layout();
