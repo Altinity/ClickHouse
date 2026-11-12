@@ -3794,6 +3794,24 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
             id.writer_epoch, id.ref_sequence, ns.string(), cause));
     };
 
+    /// The lane close for a deposed writer: a successor's epoch seal occupies the key this append
+    /// derived, so the append is conclusively rejected and the lane resumes only under a later epoch.
+    const auto reject_append_at_successor_seal = [&]
+    {
+        ProfileEvents::increment(ProfileEvents::CASRefAppendSealRejected);
+        {
+            std::lock_guard lock(rt->state_mutex);
+            rt->last_epoch_seal = id;
+            rt->append_attempt.reset();
+            rt->lane_state = RefLaneState::Closed;
+        }
+        complete_error(chunk_survivors, std::make_exception_ptr(Exception(ErrorCodes::INVALID_STATE,
+            "CAS ref-log append for namespace '{}': writer epoch {} was CLOSED by a successor's epoch "
+            "seal at {}-{}, which conclusively rejects this transaction (it was never acknowledged). "
+            "This mount's append lane resumes only under a later epoch",
+            ns.string(), id.writer_epoch, id.writer_epoch, id.ref_sequence)));
+    };
+
     std::optional<WriteResult> written;
     try
     {
@@ -3899,18 +3917,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
             /// namespace's epoch-closing record. No anomaly, no fence -- this is the protocol working.
             /// Counted anyway: "the protocol working" here means THIS writer was deposed, and a lane that
             /// keeps landing on this arm is a mount that has lost its lease and does not know it yet.
-            ProfileEvents::increment(ProfileEvents::CASRefAppendSealRejected);
-            {
-                std::lock_guard lock(rt->state_mutex);
-                rt->last_epoch_seal = id;
-                rt->append_attempt.reset();
-                rt->lane_state = RefLaneState::Closed;
-            }
-            complete_error(chunk_survivors, std::make_exception_ptr(Exception(ErrorCodes::INVALID_STATE,
-                "CAS ref-log append for namespace '{}': writer epoch {} was CLOSED by a successor's epoch "
-                "seal at {}-{}, which conclusively rejects this transaction (it was never acknowledged). "
-                "This mount's append lane resumes only under a later epoch",
-                ns.string(), id.writer_epoch, id.writer_epoch, id.ref_sequence)));
+            reject_append_at_successor_seal();
             return false;
         }
         if (occupant != Occupant::Ours)
