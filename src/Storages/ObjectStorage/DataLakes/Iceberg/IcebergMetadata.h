@@ -340,6 +340,11 @@ private:
         std::shared_ptr<DataLake::ICatalog> catalog,
         const StorageID & storage_id);
 };
+
+/// Find the partition spec / schema object by id inside a metadata JSON document.
+/// Throws METADATA_MISMATCH if not found.
+Poco::JSON::Object::Ptr lookupPartitionSpec(const Poco::JSON::Object::Ptr & metadata, Int64 spec_id);
+Poco::JSON::Object::Ptr lookupSchema(const Poco::JSON::Object::Ptr & metadata, Int64 schema_id);
 }
 
 #endif

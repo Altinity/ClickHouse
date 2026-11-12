@@ -1,7 +1,9 @@
 
 #include <charconv>
+#include <functional>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <config.h>
 #include <fmt/ranges.h>
@@ -2274,6 +2276,55 @@ PartitionColumnValues getIdentityPartitionColumnValues(
     }
 
     return result;
+}
+
+std::unordered_map<Int64, String> collectIcebergTypesByFieldId(Poco::JSON::Array::Ptr schema_fields)
+{
+    std::unordered_map<Int64, String> result;
+
+    std::function<void(Poco::JSON::Object::Ptr, const String &)> collect_types;
+    collect_types = [&](Poco::JSON::Object::Ptr field, const String & prefix)
+    {
+        String name = prefix.empty() ? field->getValue<String>(Iceberg::f_name) : prefix + "." + field->getValue<String>(Iceberg::f_name);
+        Int64 id = field->getValue<Int64>(Iceberg::f_id);
+        auto type_var = field->get(Iceberg::f_type);
+        if (type_var.isString())
+        {
+            result[id] = type_var.extract<String>();
+        }
+        else if (type_var.isStruct())
+        {
+            auto type_obj = type_var.extract<Poco::JSON::Object::Ptr>();
+            String kind = type_obj->getValue<String>(Iceberg::f_type);
+            if (kind == "struct")
+            {
+                for (const auto & nested : *type_obj->getArray(Iceberg::f_fields))
+                    collect_types(nested.extract<Poco::JSON::Object::Ptr>(), name);
+            }
+        }
+    };
+    for (const auto & field_var : *schema_fields)
+        collect_types(field_var.extract<Poco::JSON::Object::Ptr>(), "");
+
+    return result;
+}
+
+String getCurrentManifestListPath(const Poco::JSON::Object::Ptr & metadata)
+{
+    if (!metadata->has(Iceberg::f_current_snapshot_id) || metadata->isNull(Iceberg::f_current_snapshot_id))
+        return {};
+
+    Int64 current_snapshot_id = metadata->getValue<Int64>(Iceberg::f_current_snapshot_id);
+    if (current_snapshot_id < 0)
+        return {};
+
+    for (const auto & snapshot_var : *metadata->getArray(Iceberg::f_snapshots))
+    {
+        auto snapshot = snapshot_var.extract<Poco::JSON::Object::Ptr>();
+        if (snapshot->getValue<Int64>(Iceberg::f_metadata_snapshot_id) == current_snapshot_id)
+            return snapshot->getValue<String>(Iceberg::f_manifest_list);
+    }
+    return {};
 }
 
 }
