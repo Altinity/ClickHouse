@@ -205,6 +205,8 @@ public:
     /// physical-attempt count (see `TransportAccess::attemptNo`), carried into
     /// `object_storage_attempt_number` so the HTTP client sees a reissue as attempt >= 2.
     WriteSettings conditionalWriteSettings(size_t attempt_no) const;
+    /// Settings for an unconditional blob publication: each object-creating request goes out at most once.
+    WriteSettings blobPublicationWriteSettings() const;
     WriteSettings conditionalWriteSettingsForTest() const { return conditionalWriteSettings(/*attempt_no=*/1); }
     /// Override the emulated backend's wall clock for deterministic expiry tests.
     void setEmuNowNsForTest(uint64_t now_ns);
