@@ -267,6 +267,9 @@ public:
     void initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &) override;
     void describeActions(FormatSettings & format_settings) const override;
 
+    /// The context sent to workers.
+    ContextPtr updateSettings() const;
+
     ReadFromClusterQuery(
         SharedHeader output_header_,
         std::shared_ptr<IStorageCluster> driver_storage_,
@@ -302,8 +305,6 @@ private:
     std::optional<Tables> external_tables;
     /// Predicate over the driver's own columns, used to prune its file listing. Null means list everything.
     std::shared_ptr<const ActionsDAG> driver_filter;
-
-    ContextPtr updateSettings() const;
 };
 
 }

@@ -124,7 +124,7 @@ std::optional<DriverPathResult> findDriverOnLeftSpine(const QueryTreeNodePtr & n
 
     if (const auto * query_node = node->as<QueryNode>())
     {
-        const auto & join_tree = query_node->getJoinTree();
+        const auto & join_tree = query_node->getJoinTreeNode();
         if (!join_tree || !isSafeIntermediateSubquery(*query_node))
             return {};
 
@@ -138,7 +138,7 @@ std::optional<DriverPathResult> findDriverOnLeftSpine(const QueryTreeNodePtr & n
         if ((join_kind != JoinKind::Inner || join_strictness != JoinStrictness::All) && join_kind != JoinKind::Left)
             return {};
 
-        auto left = findDriverOnLeftSpine(join_node->getLeftTableExpression(), context);
+        auto left = findDriverOnLeftSpine(join_node->getLeftTableExpressionNode(), context);
         if (!left)
             return {};
 
@@ -191,7 +191,7 @@ std::optional<DistributedObjectStorageCandidate> findDistributedObjectStorageCan
     if (!query_node_typed)
         return {};
 
-    const auto & join_tree = query_node_typed->getJoinTree();
+    const auto & join_tree = query_node_typed->getJoinTreeNode();
     if (!join_tree)
         return {};
 
@@ -210,6 +210,10 @@ std::optional<DistributedObjectStorageCandidate> findDistributedObjectStorageCan
 {
     /// Header analysis in `buildDistributedObjectStorageQueryPlan` must not dispatch recursively.
     if (select_query_options.only_analyze)
+        return {};
+
+    /// A plan built for a shard is serialized, and `ReadFromClusterQuery` has no serialized form.
+    if (select_query_options.build_logical_plan)
         return {};
 
     /// Independently interpreted subqueries number their `__tableN` identifiers locally.

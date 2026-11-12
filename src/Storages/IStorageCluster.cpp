@@ -1078,6 +1078,9 @@ ContextPtr ReadFromClusterQuery::updateSettings() const
 {
     Settings new_settings{context->getSettingsRef()};
 
+    /// Initiator-only settings such as `limit` would cut each worker's partial result, as in `ReadFromCluster`.
+    ClusterProxy::stripInitiatorOnlySettings(new_settings);
+
     /// Cluster table functions should always skip unavailable shards.
     new_settings[Setting::skip_unavailable_shards] = true;
 

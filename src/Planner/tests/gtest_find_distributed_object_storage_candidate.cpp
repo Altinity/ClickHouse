@@ -270,7 +270,8 @@ TEST(FindDistributedObjectStorageCandidate, RejectsDriverWithoutSelectAccess)
     auto context = contextWithNoGrants(state.context);
     context->setSetting("object_storage_cluster_join_mode", String("distributed"));
 
-    auto query_tree = analyze("SELECT driver.id FROM driver INNER JOIN safe_lookup ON driver.id = safe_lookup.id", context);
+    /// The analyzer checks access too, so analyze as a user who has it.
+    auto query_tree = analyze("SELECT driver.id FROM driver INNER JOIN safe_lookup ON driver.id = safe_lookup.id", state.context);
     EXPECT_FALSE(findDistributedObjectStorageCandidate(query_tree, context).has_value());
 }
 
@@ -286,7 +287,7 @@ TEST(FindDistributedObjectStorageCandidate, RejectsBuriedDriverWithoutSelectAcce
     auto query_tree = analyze(
         "SELECT x.id FROM (SELECT driver.id FROM driver INNER JOIN safe_lookup ON driver.id = safe_lookup.id) AS x "
         "INNER JOIN second_datalake_table ON x.id = second_datalake_table.id",
-        context);
+        state.context);
     EXPECT_FALSE(findDistributedObjectStorageCandidate(query_tree, context).has_value());
 }
 
@@ -488,13 +489,13 @@ TEST(FindDistributedObjectStorageCandidate, RejectsExplicitClusterTableFunctionA
 
     /// Build a TableFunctionNode directly -- no real TableFunctionFactory registration needed.
     auto & query_node = query_tree->as<QueryNode &>();
-    auto & join_node = query_node.getJoinTree()->as<JoinNode &>();
+    auto & join_node = query_node.getJoinTreeNode()->as<JoinNode &>();
 
     auto table_function_node = std::make_shared<TableFunctionNode>("icebergS3Cluster");
     auto explicit_cluster_storage = std::make_shared<FakeClusterStorage>(
         StorageID("system", "explicit_cluster_table"), "other-cluster");
     table_function_node->resolve(nullptr, explicit_cluster_storage, state.context, {});
-    join_node.getRightTableExpression() = table_function_node;
+    join_node.getRightTableExpressionNode() = table_function_node;
 
     EXPECT_FALSE(findDistributedObjectStorageCandidate(query_tree, state.context).has_value());
 }

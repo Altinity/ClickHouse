@@ -10,6 +10,7 @@
 #include <Common/tests/gtest_global_context.h>
 #include <Common/tests/gtest_global_register.h>
 #include <Core/NamesAndTypes.h>
+#include <Core/Settings.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Databases/DatabaseMemory.h>
 #include <Databases/DatabasesCommon.h>
@@ -217,7 +218,7 @@ private:
 };
 
 /// getQueryPlan() returns a reference into the interpreter's own move-only plan, so build+explain in one scope.
-String planAndExplain(const String & query, const ContextMutablePtr & context)
+String planAndExplain(const String & query, const ContextMutablePtr & context, SelectQueryOptions options = {})
 {
     ParserSelectQuery parser;
     ASTPtr ast = parseQuery(parser, query, 1000, 1000, 1000000);
@@ -226,7 +227,6 @@ String planAndExplain(const String & query, const ContextMutablePtr & context)
     addQueryTreePasses(pass_manager);
     pass_manager.run(query_tree);
 
-    SelectQueryOptions options;
     InterpreterSelectQueryAnalyzer interpreter(query_tree, context, options);
     auto & plan = interpreter.getQueryPlan();
 
@@ -589,4 +589,42 @@ TEST(DistributedObjectStorageJoinDispatch, SelfJoinOnTheDriverIsNotDispatched)
 
     auto plan_text = planAndExplain("SELECT a.id FROM driver AS a INNER JOIN driver AS b ON a.id = b.id", state.context);
     EXPECT_EQ(plan_text.find("ReadFromClusterQuery"), String::npos) << plan_text;
+}
+
+/// A plan built for a shard is serialized and sent, and `ReadFromClusterQuery` has no serialized form.
+TEST(DistributedObjectStorageJoinDispatch, LogicalPlanForShardIsNotDispatched)
+{
+    auto & state = State::instance();
+    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+
+    SelectQueryOptions options;
+    options.build_logical_plan = true;
+    auto plan_text = planAndExplain(
+        "SELECT driver.id, safe_lookup.lookup_id FROM driver INNER JOIN safe_lookup ON driver.id = safe_lookup.lookup_id",
+        state.context,
+        options);
+    EXPECT_EQ(plan_text.find("ReadFromClusterQuery"), String::npos) << plan_text;
+}
+
+/// Initiator-only settings such as `limit` shape the final result. A worker applying them would cut its partial result.
+TEST(DistributedObjectStorageJoinDispatch, InitiatorOnlySettingsAreNotSentToWorkers)
+{
+    auto & state = State::instance();
+    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    auto context = Context::createCopy(state.context);
+    context->setSetting("limit", UInt64(1));
+
+    ParserSelectQuery parser;
+    ASTPtr ast = parseQuery(
+        parser, "SELECT driver.id FROM driver INNER JOIN safe_lookup ON driver.id = safe_lookup.lookup_id", 1000, 1000, 1000000);
+    auto query_tree = buildQueryTree(ast, context);
+    QueryTreePassManager pass_manager(context);
+    addQueryTreePasses(pass_manager);
+    pass_manager.run(query_tree);
+
+    InterpreterSelectQueryAnalyzer interpreter(query_tree, context, SelectQueryOptions{});
+    auto * read_from_cluster_query = findReadFromClusterQuery(interpreter.getQueryPlan().getRootNode());
+    ASSERT_NE(read_from_cluster_query, nullptr);
+
+    EXPECT_FALSE(read_from_cluster_query->updateSettings()->getSettingsRef().isChanged("limit"));
 }
