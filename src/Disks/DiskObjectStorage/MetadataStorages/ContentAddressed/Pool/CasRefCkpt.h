@@ -63,6 +63,12 @@ enum class CkptPublishOutcome : uint8_t
                     /// proven durable. Re-read before assuming either way
 };
 
+/// True when the contribution is durable in `_ckpt`: it was written, or an identical value was already there.
+inline bool ckptContributionRecorded(CkptPublishOutcome outcome)
+{
+    return outcome == CkptPublishOutcome::Published || outcome == CkptPublishOutcome::IdenticalSkip;
+}
+
 /// Merge `contribution` into `life`'s `_ckpt` and make the result durable, as ONE read-modify-write
 /// on `op`.
 ///

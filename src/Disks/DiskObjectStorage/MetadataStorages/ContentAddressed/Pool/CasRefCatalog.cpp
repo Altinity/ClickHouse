@@ -644,8 +644,8 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::completeCreation(
     const RefCkpt contribution{.life_epoch = std::optional<uint64_t>{observed.creator->writer_epoch},
                                 .committed_through = std::nullopt,
                                 .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
-    if (publishCkpt(op, layout, NamespaceLifeId::fromCatalogEntry(observed.ns, observed.incarnation),
-                     contribution, policy) == CkptPublishOutcome::FencedOut)
+    if (!ckptContributionRecorded(publishCkpt(op, layout, NamespaceLifeId::fromCatalogEntry(observed.ns, observed.incarnation),
+                                              contribution, policy)))
         return NamespaceCreationOutcome::FencedOut;
 
     /// Step 3. `mutate` is the fence re-check point `casUpdate`'s header doc names -- checked FIRST,

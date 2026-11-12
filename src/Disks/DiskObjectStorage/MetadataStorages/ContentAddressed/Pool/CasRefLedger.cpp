@@ -926,7 +926,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
             .last_epoch_seal = refLogTxnIsEpochSeal(txn)
                 ? std::optional<RefTxnId>{txn.txn_id} : txn.prev_epoch_seal};
         checkRecoveryStillAdmitted(ns, rt, cancelled, token);
-        if (publishCkptContribution(op, life, contribution) == CkptPublishOutcome::FencedOut)
+        if (!ckptContributionRecorded(publishCkptContribution(op, life, contribution)))
             throwCasWriteRetryLater(fmt::format(
                 "CAS ref-table recovery for namespace '{}': the mount incarnation moved before the "
                 "checkpoint could record recovered txn {}-{}; nothing is installed",
@@ -1253,7 +1253,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
                                    .committed_through = last_epoch_seal,
                                    .checkpoint_snapshot_id = std::nullopt,
                                    .last_epoch_seal = last_epoch_seal};
-        if (publishCkptContribution(op, life, contribution) == CkptPublishOutcome::FencedOut)
+        if (!ckptContributionRecorded(publishCkptContribution(op, life, contribution)))
             throwCasWriteRetryLater(fmt::format(
                 "CAS ref-table recovery for namespace '{}': the mount incarnation moved before the "
                 "checkpoint could record the epoch seal {}-{}; the last attempt's fate is unresolved and "
@@ -3675,8 +3675,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     {
         try
         {
-            if (publishCkptContribution(op, rt->life, *prepared->birth_contribution)
-                == CkptPublishOutcome::FencedOut)
+            if (!ckptContributionRecorded(publishCkptContribution(op, rt->life, *prepared->birth_contribution)))
             {
                 complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
                     "CAS ref-log append for namespace '{}': the mount fence moved while creating the "
@@ -4665,12 +4664,11 @@ bool CasRefLedger::tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntimeImpl(
         snapshot_before_ckpt_cas_hook_for_test();
     try
     {
-        ckpt_advanced = publishCkptContribution(op, rt->life,
+        ckpt_advanced = ckptContributionRecorded(publishCkptContribution(op, rt->life,
                                                 RefCkpt{.life_epoch = std::nullopt,
                                                         .committed_through = candidate_x,
                                                         .checkpoint_snapshot_id = candidate_x,
-                                                        .last_epoch_seal = std::nullopt})
-            != CkptPublishOutcome::FencedOut;
+                                                        .last_epoch_seal = std::nullopt}));
     }
     catch (...)
     {
