@@ -1074,27 +1074,27 @@ void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const 
     pipeline.init(std::move(pipe));
 }
 
-ContextPtr ReadFromClusterQuery::updateSettings() const
+ContextPtr ReadFromClusterQuery::createRemoteContext() const
 {
-    Settings new_settings{context->getSettingsRef()};
+    auto remote_context = Context::createCopy(context);
 
     /// Initiator-only settings such as `limit` would cut each worker's partial result, as in `ReadFromCluster`.
-    ClusterProxy::stripInitiatorOnlySettings(new_settings);
+    Settings settings = remote_context->getSettingsCopy();
+    ClusterProxy::stripInitiatorOnlySettings(settings);
+    remote_context->setSettings(settings);
 
     /// Cluster table functions should always skip unavailable shards.
-    new_settings[Setting::skip_unavailable_shards] = true;
+    remote_context->setSetting("skip_unavailable_shards", true);
 
     /// Partners read locally. Only the driver's explicit `*Cluster` function consumes the initiator's file tasks.
-    new_settings[Setting::object_storage_cluster] = "";
+    remote_context->setSetting("object_storage_cluster", String{});
 
-    auto new_context = Context::createCopy(context);
-    new_context->setSettings(new_settings);
-    return new_context;
+    return remote_context;
 }
 
 void ReadFromClusterQuery::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
 {
-    auto new_context = updateSettings();
+    auto new_context = createRemoteContext();
 
     /// The planner supplies a predicate over the driver's columns for file pruning.
     const ActionsDAG::Node * predicate = driver_filter ? driver_filter->getOutputs().front() : nullptr;

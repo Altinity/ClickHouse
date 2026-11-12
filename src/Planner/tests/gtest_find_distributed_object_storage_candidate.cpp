@@ -617,3 +617,73 @@ TEST(FindDistributedObjectStorageCandidate, AcceptsDirectDriverWithFilterAndAggr
     ASSERT_TRUE(candidate.has_value());
     EXPECT_EQ(candidate->driver->getStorageID().table_name, "driver");
 }
+
+/// An aggregate needs finalization even without `GROUP BY`, so each worker would finalize its own slice.
+TEST(FindDistributedObjectStorageCandidate, RejectsAggregateWithoutGroupByOnDriverPath)
+{
+    const auto & state = State::instance();
+    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+
+    auto query_tree = analyze(
+        "SELECT x.c FROM (SELECT count() AS c FROM driver) AS x INNER JOIN safe_lookup ON x.c = safe_lookup.id",
+        state.context);
+
+    EXPECT_FALSE(findDistributedObjectStorageCandidate(query_tree, state.context).has_value());
+}
+
+/// A window function on the driver's path would see only one worker's slice of each window.
+TEST(FindDistributedObjectStorageCandidate, RejectsWindowFunctionOnDriverPath)
+{
+    const auto & state = State::instance();
+    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+
+    auto query_tree = analyze(
+        "SELECT x.id, x.n FROM (SELECT driver.id AS id, row_number() OVER () AS n FROM driver) AS x "
+        "INNER JOIN safe_lookup ON x.id = safe_lookup.id",
+        state.context);
+
+    EXPECT_FALSE(findDistributedObjectStorageCandidate(query_tree, state.context).has_value());
+}
+
+/// The checks above use the outer query's settings, but a nested `SETTINGS` clause applies only to its own scope.
+/// Here the nested filter would be re-resolved on workers, where the tables are table functions and the filter
+/// matches nothing.
+TEST(FindDistributedObjectStorageCandidate, RejectsAdditionalTableFiltersInNestedSubquery)
+{
+    const auto & state = State::instance();
+    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+
+    auto query_tree = analyze(
+        "SELECT f.id FROM (SELECT driver.id AS id FROM driver SETTINGS additional_table_filters = {'driver': 'id > 0'}) AS f "
+        "INNER JOIN safe_lookup ON f.id = safe_lookup.id",
+        state.context);
+
+    EXPECT_FALSE(findDistributedObjectStorageCandidate(query_tree, state.context).has_value());
+}
+
+/// A cluster named only in the driver's own scope is not the one the outer context would dispatch to.
+TEST(FindDistributedObjectStorageCandidate, RejectsClusterSetInNestedSubquery)
+{
+    const auto & state = State::instance();
+    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+
+    auto query_tree = analyze(
+        "SELECT f.id FROM (SELECT driver.id AS id FROM driver SETTINGS object_storage_cluster = 'other_cluster') AS f "
+        "INNER JOIN safe_lookup ON f.id = safe_lookup.id",
+        state.context);
+
+    EXPECT_FALSE(findDistributedObjectStorageCandidate(query_tree, state.context).has_value());
+}
+
+/// The outermost query's `SETTINGS` are already in the context the checks use.
+TEST(FindDistributedObjectStorageCandidate, AcceptsSettingsOnOutermostQuery)
+{
+    const auto & state = State::instance();
+    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+
+    auto query_tree = analyze(
+        "SELECT driver.id FROM driver INNER JOIN safe_lookup ON driver.id = safe_lookup.id SETTINGS max_threads = 1",
+        state.context);
+
+    EXPECT_TRUE(findDistributedObjectStorageCandidate(query_tree, state.context).has_value());
+}

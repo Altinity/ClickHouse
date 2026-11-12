@@ -2320,7 +2320,7 @@ Possible values:
 
   This is attempted only for the outermost `SELECT` of an initial query, and it is all-or-nothing: either the entire query is eligible and is dispatched as one unit, or ordinary planning handles the entire query. No narrower, nested candidate is attempted, and nothing falls back per level.
 
-  Eligibility requires that every other table reachable anywhere in the query also resolves through a `DataLake` catalog, has no row-level security policy, and is readable by the current user. An explicit `*Cluster()` table function, an ordinary local or `Distributed` table, or any table failing one of those checks makes the whole query ineligible. The combination is disabled outright when `additional_table_filters` is set or `object_storage_remote_initiator` is enabled.
+  Eligibility requires that every other table reachable anywhere in the query also resolves through a `DataLake` catalog, has no row-level security policy, and is readable by the current user. An explicit `*Cluster()` table function, an ordinary local or `Distributed` table, or any table failing one of those checks makes the whole query ineligible. The combination is disabled outright when `additional_table_filters` is set, `object_storage_remote_initiator` is enabled, or a nested subquery or CTE has its own `SETTINGS` clause.
 
   Performance characteristic to be aware of: only the driving table is partitioned across the cluster. Every other table in the query is read and recomputed **in full on every node**, including any `JOIN` or `GROUP BY` over them. That is a win when those relations are small relative to the driver and a loss when they are not; ClickHouse does not estimate this cost when deciding to dispatch.
 

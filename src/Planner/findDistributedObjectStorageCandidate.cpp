@@ -3,13 +3,13 @@
 #include <Access/Common/RowPolicyDefs.h>
 #include <Access/ContextAccess.h>
 #include <Access/EnabledRowPolicies.h>
-#include <Analyzer/FunctionNode.h>
+#include <Analyzer/AggregationUtils.h>
 #include <Analyzer/IQueryTreeNode.h>
 #include <Analyzer/JoinNode.h>
 #include <Analyzer/QueryNode.h>
 #include <Analyzer/TableFunctionNode.h>
 #include <Analyzer/TableNode.h>
-#include <Analyzer/UnionNode.h>
+#include <Analyzer/WindowFunctionsUtils.h>
 #include <Core/Settings.h>
 #include <Core/SettingsEnums.h>
 #include <Interpreters/Context.h>
@@ -72,25 +72,10 @@ bool isEligibleDriver(const TableNode & table_node, const ContextPtr & context)
     return !storage.getClusterName(context).empty();
 }
 
-/// Inspect this query's expressions without crossing into nested queries.
 /// An aggregate such as `count` needs finalization even without `GROUP BY`.
-bool containsAggregateOrWindowFunction(const QueryTreeNodePtr & node)
+bool hasAggregateOrWindowFunctionNodes(const QueryTreeNodePtr & node)
 {
-    if (!node)
-        return false;
-
-    if (const auto * function_node = node->as<FunctionNode>())
-        if (function_node->isAggregateFunction() || function_node->isWindowFunction())
-            return true;
-
-    if (node->as<QueryNode>() || node->as<UnionNode>())
-        return false;
-
-    for (const auto & child : node->getChildren())
-        if (containsAggregateOrWindowFunction(child))
-            return true;
-
-    return false;
+    return hasAggregateFunctionNodes(node) || hasWindowFunctionNodes(node);
 }
 
 /// Driver subqueries run on separate partitions, so they must not finalize partial results.
@@ -99,8 +84,8 @@ bool isSafeIntermediateSubquery(const QueryNode & query_node)
 {
     return !query_node.isDistinct() && !query_node.hasGroupBy() && !query_node.hasHaving() && !query_node.hasWindow()
         && !query_node.hasQualify() && !query_node.hasOrderBy() && !query_node.hasInterpolate() && !query_node.hasLimitBy()
-        && !query_node.hasLimit() && !query_node.hasOffset() && !containsAggregateOrWindowFunction(query_node.getProjectionNode())
-        && !containsAggregateOrWindowFunction(query_node.getWithNode());
+        && !query_node.hasLimit() && !query_node.hasOffset() && !hasAggregateOrWindowFunctionNodes(query_node.getProjectionNode())
+        && !hasAggregateOrWindowFunctionNodes(query_node.getWithNode());
 }
 
 struct DriverPathResult
@@ -170,6 +155,25 @@ bool allWorkerLocalTableReferencesAreSafe(const QueryTreeNodePtr & node, const T
     return true;
 }
 
+/// The checks use the outer query's settings, but a nested `SETTINGS` clause applies only to its own scope,
+/// e.g. `additional_table_filters` or `object_storage_cluster` set for the driver's subquery.
+bool hasNestedSettingsChanges(const QueryTreeNodePtr & node)
+{
+    for (const auto & child : node->getChildren())
+    {
+        if (!child)
+            continue;
+
+        if (const auto * query_node = child->as<QueryNode>(); query_node && query_node->hasSettingsChanges())
+            return true;
+
+        if (hasNestedSettingsChanges(child))
+            return true;
+    }
+
+    return false;
+}
+
 }
 
 std::optional<DistributedObjectStorageCandidate> findDistributedObjectStorageCandidate(
@@ -185,6 +189,9 @@ std::optional<DistributedObjectStorageCandidate> findDistributedObjectStorageCan
     /// Serialization changes the names used to match `additional_table_filters`.
     /// Parallel replicas are disabled for the same reason.
     if (!context->getSettingsRef()[Setting::additional_table_filters].value.empty())
+        return {};
+
+    if (hasNestedSettingsChanges(query_node))
         return {};
 
     const auto * query_node_typed = query_node->as<QueryNode>();

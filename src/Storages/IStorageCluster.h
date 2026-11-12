@@ -268,7 +268,7 @@ public:
     void describeActions(FormatSettings & format_settings) const override;
 
     /// The context sent to workers.
-    ContextPtr updateSettings() const;
+    ContextPtr createRemoteContext() const;
 
     ReadFromClusterQuery(
         SharedHeader output_header_,

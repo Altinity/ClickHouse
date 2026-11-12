@@ -626,5 +626,5 @@ TEST(DistributedObjectStorageJoinDispatch, InitiatorOnlySettingsAreNotSentToWork
     auto * read_from_cluster_query = findReadFromClusterQuery(interpreter.getQueryPlan().getRootNode());
     ASSERT_NE(read_from_cluster_query, nullptr);
 
-    EXPECT_FALSE(read_from_cluster_query->updateSettings()->getSettingsRef().isChanged("limit"));
+    EXPECT_FALSE(read_from_cluster_query->createRemoteContext()->getSettingsRef().isChanged("limit"));
 }
