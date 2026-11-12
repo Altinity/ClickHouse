@@ -153,21 +153,22 @@ row followed by a `recovered` one — and the older `unresolved_reason`, `deadli
 `stop_cause` keys are gone; everything they used to distinguish is now named directly by
 `classification`. Interpret the sequence as follows:
 
-- `outcome = 'recovered'` means an in-budget renewal landed, in the same epoch. `classification`
+- `outcome = 'recovered'` means a renewal landed after a retry or a settling read, in the same epoch.
+  Writes are re-admitted only if it left more than `2 × envelope + safety_margin` of lease. `classification`
   says how: `committed_by_read` means an exact `GET` proved a landed request; `committed_after_retry`
   means a later identical physical `PUT` completed and the response itself proved it.
-- `outcome = 'failed'` carries the decisive `classification`: `external_lease_deadline` (the
-  confirmed lease's own safety margin, not the request policy, ran out first — check object-store
-  latency or `BOOTTIME` advancement before anything else), `request_deadline` (the ninety-second
-  request policy exhausted first), `unresolved` (every attempt was ambiguous and never settled by
+- `outcome = 'failed'` carries the decisive `classification`: `external_lease_deadline` (a
+  bounded renewal only: the confirmed lease's own safety margin, not the request policy, ran out first — check object-store
+  latency or `BOOTTIME` advancement before anything else), `request_deadline` (a bounded
+  renewal only: the ninety-second request policy exhausted first), `unresolved` (every attempt was ambiguous and never settled by
   the time the operation gave up), `conflict` (an exact resolve read found another body — a
   same-pair twin, a GC-fenced body, a successor epoch, or a foreign holder), `cancelled` (a
   renewal in flight was cancelled by shutdown or a remount park request; expected during graceful
   shutdown), `fence_or_lifecycle_lost` (another local fence loss or a terminal lifecycle transition
-  closed admission while the operation was active), `deterministic_failure` (the store's own
-  answer proved the write never applied), and `vanished` (an exact resolve read proved the mount
-  slot absent — the pool directory was removed or renamed out of band, or a decommission raced the
-  renewal). `terminal_unclassified` means the renewal terminated through a path that assigned no
+  closed admission while the operation was active), `deterministic_failure` (a local
+  failure, or, for a bounded renewal, a store answer proving the write never applied;
+  the background renewal sends a refused write again), and `vanished` (an exact resolve read proved the mount
+  slot absent — the pool directory was removed or renamed out of band, or a 26.6.4 decommission deleted the slot; a decommission of this version keeps it). `terminal_unclassified` means the renewal terminated through a path that assigned no
   classification; that is a defect to report together with the surrounding rows, not an operator
   condition. Do not collapse these into a generic timeout — the action
   differs by classification, and only `external_lease_deadline` and `request_deadline` are about a
@@ -215,6 +216,9 @@ available:
 SYSTEM CAS GC RUN cas;
 ```
 
+Run it on the GC leader (`is_leader = 1` in `system.cas_mounts`). On any other node it does nothing and
+returns no error.
+
 One row per disk it ran on: `disk`, `acquired_lease`, `deferred`, `round`, `candidates_marked`,
 `objects_deleted`, `objects_absent`, `objects_replaced`, `objects_spared`, `manifests_deleted`,
 `entries_condemned`, `entries_graduated`, `entries_redeleted`, `entries_redelete_failed`, `fence_outs`,
@@ -249,8 +253,8 @@ SYSTEM CAS FORGET cas;
 
 It is an assertion, not a proof of erasure: the disk stays registered and answers further store-class
 access with a typed error, and a server restart re-registers the name. This is different from
-[`SYSTEM CAS DROP POOL MEMBER`](/antalya/cas/operations/migration#decommission), which permanently
-retires one pool *member*'s identity across the whole shared pool — `FORGET` only affects this node's
+[`SYSTEM CAS DROP POOL MEMBER`](/antalya/cas/operations/migration#decommission), which decommissions
+one pool *member* across the whole shared pool — `FORGET` only affects this node's
 own local view of one disk.
 
 ## Offline tools {#offline-tools}

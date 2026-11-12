@@ -48,7 +48,17 @@ TEST(CASProbe, FailsClosedOnDeleteMarkers)
     b->setSimulateDeleteMarkers(true);                           // versioning enabled on the prefix
     auto requests = makeRequests(*b);
     auto op = requests.admit();
-    EXPECT_THROW(runCapabilityProbe(op, "p/.cas_probe"), DB::Exception);
+    String message;
+    try
+    {
+        runCapabilityProbe(op, "p/.cas_probe");
+    }
+    catch (const DB::Exception & e)
+    {
+        message = e.message();
+    }
+    EXPECT_NE(message.find("does not make a versioned bucket usable"), String::npos) << message;
+    EXPECT_EQ(message.find("has no override"), String::npos) << message;
 }
 
 TEST(CASProbe, PassesOnEmulatedLocal)
