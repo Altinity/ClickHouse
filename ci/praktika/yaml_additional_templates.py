@@ -63,28 +63,37 @@ class AltinityWorkflowTemplates:
         version: ${{ fromJson(needs.config_workflow.outputs.data).workflow_config.custom_data.version.string }}
 """,
         "RegressionPR": r"""
+  RegressionTestsSelected:
+    needs: [config_workflow, build_amd_binary, build_arm_binary, build_amd_release, build_arm_release]
+    if: ${{ github.event_name == 'pull_request' && !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.custom_data.ci_exclude_tags, 'regression')}}
+    uses: ./.github/workflows/regression-selected.yml
+    secrets: inherit
+    with:
+      commit: {REGRESSION_HASH}
+      build_sha: ${{ github.event.pull_request.head.sha }}
+      workflow_config: ${{ needs.config_workflow.outputs.data }}
   RegressionTestsRelease:
     needs: [config_workflow, build_amd_binary, stateless_tests_amd_debug_parallel]
-    if: ${{  !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.custom_data.ci_exclude_tags, 'regression')}}
+    if: ${{ github.event_name != 'pull_request' && !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.custom_data.ci_exclude_tags, 'regression')}}
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
       runner_type: altinity-regression-tester
       commit: {REGRESSION_HASH}
       arch: release
-      build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      build_sha: ${{ github.sha }}
       timeout_minutes: 210
       workflow_config: ${{ needs.config_workflow.outputs.data }}
   RegressionTestsAarch64:
     needs: [config_workflow, build_arm_binary, stateless_tests_arm_binary_parallel]
-    if: ${{  !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.custom_data.ci_exclude_tags, 'regression') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.custom_data.ci_exclude_tags, 'aarch64')}}
+    if: ${{ github.event_name != 'pull_request' && !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.custom_data.ci_exclude_tags, 'regression') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.custom_data.ci_exclude_tags, 'aarch64')}}
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
       runner_type: altinity-regression-tester-aarch64
       commit: {REGRESSION_HASH}
       arch: aarch64
-      build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      build_sha: ${{ github.sha }}
       timeout_minutes: 210
       workflow_config: ${{ needs.config_workflow.outputs.data }}
 """,
