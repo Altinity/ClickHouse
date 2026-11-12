@@ -202,8 +202,10 @@ Returns one row: `disk`, `reachable`, `dangling`, `unreachable`, `pending_gc`, `
 means data loss — `unreachable`, `pending_gc`, and `awaiting_gc` are objects still
 moving through the normal condemn/graduate/delete pipeline, not a problem on their own.
 `chain_broken` and `corrupted_runs` are the other two hard findings: a hole in a ref-log stream and a
-GC source-edge run that failed its checksum, respectively. This summary-only form has no
-per-object `--detail` equivalent yet — for that, the offline `cas-fsck --detail` below is still
+GC source-edge run that failed its checksum, respectively. `unchecked` means the scan could not prove or
+refute a finding, for example because the checkpoint changed during the scan; rerun `fsck` and treat only
+a repeat as a finding. An absent tail log is `chain_broken` only when `_ckpt` is unchanged. This summary-only form has
+no per-object `--detail` equivalent yet — for that, the offline `cas-fsck --detail` below is still
 needed.
 
 ### SYSTEM CAS GC RUN {#sql-gc-run}

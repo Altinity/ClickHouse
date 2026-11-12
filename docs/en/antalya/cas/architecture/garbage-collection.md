@@ -568,17 +568,34 @@ from the catalog.
 - **Writes / deletes:** batch `DELETE` of the planned `_log` / `_snap` keys in chunks of
   `cas_gc_bulk_delete_chunk_keys` (one admitted `DELETE` per key on a backend without batch
   delete); the checkpoint-named snapshot is always retained
-- **Safety:** before each chunk, re-validates: ref-catalog token still equals the fold's catalog
-  cut, same row and life, unchanged GC fence. The first failure stops the whole pass. The
-  per-round `cas_gc_round_ref_cleanup_budget` cap counts objects and cuts a chunk to what remains;
-  on exhaustion the same candidates are recomputed next round.
+- **Safety:** before each chunk, re-reads the catalog and, only if the namespace's row and life check
+  passes, `gc/state`. The namespace's own catalog row is unchanged from the fold's cut and resolves to
+  the same life. The GC lease (owner and sequence) is the one this round adopted. Other namespaces'
+  rows matter only through the ambiguity check; the catalog `etag` does not matter: the keys carry the
+  life's incarnation and are never rewritten. A changed row or life skips that namespace for the rest
+  of the pass; its plan is rebuilt next round. A moved lease stops the whole pass. So does an absent
+  `gc/state`, a failed read of the catalog or `gc/state`, or an ambiguous catalog. A chunk that passed
+  this check completes even if the row or lease moves during its delete request. The per-round
+  `cas_gc_round_ref_cleanup_budget` cap counts objects
+  and cuts a chunk to what remains; on exhaustion the pass returns and the same candidates are
+  recomputed next round.
 - **Fails the round if:** no protocol check of its own — `suppress_destructive` returns immediately
-  (a clamp could leave a covered log whose delta is not yet durable); an authority re-validation
-  error or a namespace whose recovery triple does not validate stops the pass or skips that
-  namespace, but a chunk delete that exhausts its retry policy propagates (see
+  (a clamp could leave a covered log whose delta is not yet durable). A namespace whose recovery
+  triple does not validate is skipped, and the refusals in **Safety** skip a namespace or stop the
+  pass without failing the round. A chunk delete that exhausts its retry policy propagates (see
   [post-commit failures](#post-commit-failures))
-- **Observability:** phase row `ref_object_cleanup`; metrics `namespaces_planned`, `suppressed`,
-  `trim_enabled`; `ProfileEvent` `CASRefCleanupObjectsDeleted`
+- **Observability:** phase row `ref_object_cleanup`; metrics `suppressed`, `trim_enabled`,
+  `namespaces_planned`, `objects_planned`, `objects_deleted`, `namespaces_skipped`,
+  `stopped_lease_moved` (0/1), `stopped_authority_unverified` (0/1), `chunks_under_catalog_change`;
+  `ProfileEvent`s `CASRefCleanupObjectsPlanned`, `CASRefCleanupObjectsDeleted`,
+  `CASRefCleanupNamespacesSkipped`, `CASRefCleanupStoppedLeaseMoved`,
+  `CASRefCleanupStoppedAuthorityUnverified`, `CASRefCleanupChunksUnderCatalogChange`. The last
+  counts chunks deleted while the catalog `etag` differed from the fold's cut: it measures catalog
+  churn that no longer blocks cleanup. `namespaces_skipped` counts licence refusals only, not
+  namespaces without a plan. A skipped or undeleted key is planned again next round.
+  `namespaces_planned` counts every namespace with a listing, including those that get no plan. A pass
+  cut by the budget sets no flag: `objects_planned` exceeds `objects_deleted` with both `stopped_*`
+  metrics at 0.
 
 ## Phase 18 — orphan sweep {#phase-18-orphan-sweep}
 
@@ -974,7 +991,7 @@ pages delete.
 | Key | Operation | Requests |
 |---|---|---:|
 | checkpoint-named `_log`, predecessor seal, `_snap` | `GET` | per planned namespace (recovery-triple validation before any delete) |
-| `<pool_prefix>/cas/ref_catalog` and `<pool_prefix>/gc/state` | `GET` | one each per chunk (authority re-validation) |
+| `<pool_prefix>/cas/ref_catalog` and `<pool_prefix>/gc/state` | `GET` | up to one each per chunk (`gc/state` is not read when the row check skips the namespace) |
 | `_log` / `_snap` keys | batch `DELETE` | one request per chunk of ≤ `cas_gc_bulk_delete_chunk_keys` keys (the refused bulk call plus one per key on a backend without batch delete) |
 
 ### Phase 18 — orphan sweep {#cost-phase-18}

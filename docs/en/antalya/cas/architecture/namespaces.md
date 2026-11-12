@@ -96,7 +96,8 @@ There is no explicit "create namespace" statement; a namespace is born the first
 resolves its ref table (`CasRefLedger::resolveNamespaceLife`, bounded at 32 loop attempts). If the
 catalog has no row for the name at all, the resolving mount admits a `Creating` entry stamped with
 its own creator fence and a freshly minted `life_id`
-(`CasRefCatalog::createNamespace` → `casAdmitEntry`). Two more steps make it usable:
+(`CasRefCatalog::createNamespace` → `createNamespaceStep1`). Each decision mints a new `life_id`. An
+attempt of unknown fate is decided again on a fresh read and is never resent. Two more steps make it usable:
 
 1. **Publish the genesis checkpoint.** The first `_ckpt` ever written for this `life_id` carries
    `life_epoch = creator.writer_epoch` — the only writer that will ever know this namespace's
