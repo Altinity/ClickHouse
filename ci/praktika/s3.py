@@ -3,6 +3,7 @@ import json
 import mimetypes
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional
 from urllib.parse import quote, urlencode
@@ -65,7 +66,17 @@ class S3:
 
     @classmethod
     def _external_bucket_config(cls, bucket):
-        return (Settings.S3_EXTERNAL_BUCKETS or {}).get(bucket)
+        config = (Settings.S3_EXTERNAL_BUCKETS or {}).get(bucket)
+        if not config or not config.get("endpoint_url"):
+            return None
+        return config
+
+    @classmethod
+    def _http_endpoint(cls, bucket):
+        config = (Settings.S3_EXTERNAL_BUCKETS or {}).get(bucket) or {}
+        endpoint = config.get("http_endpoint")
+        assert endpoint, f"S3 bucket [{bucket}] has no http_endpoint in S3_EXTERNAL_BUCKETS"
+        return endpoint
 
     @classmethod
     def _reads_anonymously(cls, bucket):
@@ -86,7 +97,10 @@ class S3:
         client = cls._external_clients.get((bucket, anonymous))
         if client is None:
             client_config = {
-                "max_pool_connections": config.get("download_concurrency", 10)
+                "max_pool_connections": config.get("download_concurrency", 10),
+                # NOTE (strtgbb): the 60s default is too low for large transfers to/from hetzner s3
+                "connect_timeout": 180,
+                "read_timeout": 180,
             }
             if anonymous:
                 credentials = {
@@ -180,6 +194,30 @@ class S3:
         return
 
     @classmethod
+    def _object_is_fresh(cls, s3_path, window_seconds=5 * 60):
+        obj = cls.head_object(s3_path)
+        if not obj or not obj.LastModified:
+            return False
+        mtime = datetime.fromisoformat(obj.LastModified)
+        if mtime.tzinfo is None:
+            mtime = mtime.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - mtime).total_seconds()
+        return abs(age) <= window_seconds
+
+    @classmethod
+    def _wait_until_object_fresh(cls, s3_path):
+        # NOTE (strtgbb): Ceph returns 500 while CompleteMultipartUpload still holds its lock; a recent mtime means the cache is fresh.
+        for attempt in range(15):
+            if attempt:
+                time.sleep(2)
+            if cls._object_is_fresh(s3_path):
+                print(
+                    f"NOTE: multipart completion already in progress for [{s3_path}], cache object is fresh"
+                )
+                return True
+        return False
+
+    @classmethod
     def copy_file_to_s3(
         cls,
         s3_path,
@@ -219,6 +257,7 @@ class S3:
             BOTO3_AVAILABLE and cls._get_boto3_client()
         ), "boto3 is required for S3 uploads (the AWS CLI fallback is deprecated)"
 
+        bucket = ""
         try:
             s3_full_path_clean = str(s3_full_path).removeprefix("s3://")
             bucket, key = s3_full_path_clean.split("/", maxsplit=1)
@@ -269,9 +308,17 @@ class S3:
             if not no_strict:
                 raise
         except Exception as e:
-            print(f"ERROR: Failed to upload to S3 using boto3: {e}")
-            if not no_strict:
-                raise
+            recovered = (
+                bucket
+                and cls._external_bucket_config(bucket)
+                and type(e).__name__ == "S3UploadFailedError"
+                and "multipart completion is already in progress" in str(e)
+                and cls._wait_until_object_fresh(s3_full_path)
+            )
+            if not recovered:
+                print(f"ERROR: Failed to upload to S3 using boto3: {e}")
+                if not no_strict:
+                    raise
 
         # Common cleanup and return for both paths
         try:
@@ -280,8 +327,7 @@ class S3:
             print(f"WARNING: Failed to record upload usage for {local_path}: {e}")
 
         bucket = s3_path.split("/")[0]
-        endpoint = Settings.S3_BUCKET_TO_HTTP_ENDPOINT[bucket]
-        assert endpoint
+        endpoint = cls._http_endpoint(bucket)
         return quote(f"https://{s3_full_path}".replace(bucket, endpoint), safe=":/?&=")
 
     @classmethod
@@ -488,7 +534,11 @@ class S3:
                         raise
                     return False
                 except Exception as e:
-                    print(f"ERROR: Failed to download S3 object [{s3_path}]: {e}")
+                    cause = getattr(e, "last_exception", None)
+                    print(
+                        f"ERROR: Failed to download S3 object [{s3_path}]: {e}"
+                        + (f": {cause}" if cause else "")
+                    )
                     if not no_strict:
                         raise
                     return False
@@ -643,7 +693,7 @@ class S3:
     def _dump_urls(cls, s3_path):
         # TODO: add support for path with '*'
         bucket, name = s3_path.split("/")[0], s3_path.split("/")[-1]
-        endpoint = Settings.S3_BUCKET_TO_HTTP_ENDPOINT[bucket]
+        endpoint = cls._http_endpoint(bucket)
 
         with open(Settings.ARTIFACT_URLS_FILE, "w", encoding="utf-8") as f:
             json.dump(

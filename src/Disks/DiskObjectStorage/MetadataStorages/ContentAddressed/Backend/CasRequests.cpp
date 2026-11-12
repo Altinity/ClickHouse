@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 
+#include <Common/ErrorCodes.h>
 #include <Common/Exception.h>
 #include <IO/ReadBuffer.h>
 #include <Common/LoggingHelpers.h>
@@ -276,6 +277,27 @@ bool isFirstAttemptFuseTimeout([[maybe_unused]] const std::exception & e, [[mayb
 #else
     return false;
 #endif
+}
+
+bool isStoreAnswer(const std::exception & e)
+{
+    const auto * db = dynamic_cast<const Exception *>(&e);
+    return dynamic_cast<const Poco::Exception *>(&e) && !(db && isDeterministicLocalFailure(db->code()));
+}
+
+String describeRequestFailure(std::string_view verb, const String & key, const std::exception & e)
+{
+    const auto & poco = dynamic_cast<const Poco::Exception &>(e);
+    String code;
+#if USE_AWS_S3
+    if (const auto * s3 = dynamic_cast<const S3Exception *>(&e))
+        code = s3->getExceptionName();
+#endif
+    if (const auto * db = dynamic_cast<const Exception *>(&e); code.empty() && db)
+        code = String(ErrorCodes::getName(db->code()));
+    if (code.empty())
+        code = poco.name();
+    return fmt::format("{} {}: {} {} {}", verb, key, isDefinitelyRefusedWrite(e) ? "refused" : "transport", code, poco.message());
 }
 
 CasRequests::CasRequests(BackendPtr backend_, Fence fence_,
@@ -871,14 +893,23 @@ std::optional<WriteResult> CasOperation::gatedPause(uint64_t pause_ms, uint32_t 
     return std::nullopt;
 }
 
+uint64_t CasOperation::reissuePause(const WriteState & state, uint64_t unspaced_ms) const
+{
+    if (!state.spacing)
+        return unspaced_ms;
+    return Retry::pauseAfterAttempt(state.spacing->spacing_ms, state.spacing->attempt_started_ms, owner.now_ms());
+}
+
 std::optional<WriteResult> CasOperation::pauseAndReissue(WriteState & state, const Retry::Bound & bound)
 {
-    return gatedPause(Retry::backoff(++state.reissues), 2, state, bound, detail::recordReissue, /*should_sleep=*/true);
+    const uint64_t pause_ms = reissuePause(state, Retry::backoff(++state.reissues));
+    return gatedPause(pause_ms, 2, state, bound, detail::recordReissue, /*should_sleep=*/true);
 }
 
 std::optional<WriteResult> CasOperation::pauseForConflict(WriteState & state, const Retry::Bound & bound)
 {
-    return gatedPause(Retry::conflictBackoff(), 2, state, bound, detail::recordConflictPause, /*should_sleep=*/true);
+    return gatedPause(reissuePause(state, Retry::conflictBackoff()), 2, state, bound, detail::recordConflictPause,
+                      /*should_sleep=*/true);
 }
 
 /// A flat pause before reissuing an attempt whose failure text named a failed connection.
@@ -886,7 +917,7 @@ static constexpr uint64_t kConnectHintPauseMs = 50;
 
 std::optional<WriteResult> CasOperation::pauseFlat(WriteState & state, const Retry::Bound & bound)
 {
-    return gatedPause(kConnectHintPauseMs, 2, state, bound, detail::recordReissue, /*should_sleep=*/true);
+    return gatedPause(reissuePause(state, kConnectHintPauseMs), 2, state, bound, detail::recordReissue, /*should_sleep=*/true);
 }
 
 std::optional<WriteResult> CasOperation::reissueAtOnce(WriteState & state, const Retry::Bound & bound)
@@ -921,9 +952,13 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         if (!fits(reservation, bound))
             return gaveUp(GaveUp::Why::Deadline, sourceFor(bound), state);
 
+        if (policy.attempt_spacing_ms)
+            state.spacing = WriteState::Spacing{*policy.attempt_spacing_ms, owner.now_ms()};
         detail::recordAttempt();
         ++state.attempts_sent;
         state.sent_any = true;
+        if (observer.on_write_attempt)
+            observer.on_write_attempt(state.attempts_sent);
 
         /// Disengaged means the attempt threw: its fate is unproven, and nothing may be read out of it.
         std::optional<std::expected<String, Backend::RawConflict>> outcome;
@@ -952,6 +987,8 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         {
             if (isDeterministicLocalFailure(e.code()))
                 throw;
+            if (observer.on_failure)
+                observer.on_failure("PUT", key, e);
             /// ONE refresh per call, only for the class a credential could explain, and only when a
             /// reissue could sign with what it installs. So an oversized entity never triggers a
             /// re-acquisition, a denial fresh credentials do not fix is refused on the second look
@@ -1008,6 +1045,8 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
             /// still have landed, so `outcome` stays disengaged and the read below settles it.
             if (!dynamic_cast<const Poco::Exception *>(&e))
                 throw;
+            if (observer.on_failure)
+                observer.on_failure("PUT", key, e);
         }
 
         if (outcome && outcome->has_value())

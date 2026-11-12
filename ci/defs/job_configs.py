@@ -29,7 +29,9 @@ BINARY_DOCKER_COMMAND = (
     f"+--memory={Utils.physical_memory() * 95 // 100}"
     f"+--memory-reservation={Utils.physical_memory() * 9 // 10}"
     f"+--volume=.:/ClickHouse"
-    '+--env=AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"+--env=AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"'
+    '+--env=AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"+--env=AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"+--env=S3_ARTIFACT_BUCKET="$S3_ARTIFACT_BUCKET"'
+    # Writes to the ThinLTO cache in Hetzner Object Storage; jobs without them read anonymously
+    '+--env=HETZNER_S3_ACCESS_KEY="$HETZNER_S3_ACCESS_KEY"+--env=HETZNER_S3_SECRET_KEY="$HETZNER_S3_SECRET_KEY"+--env=HETZNER_CACHE_BUCKET="$HETZNER_CACHE_BUCKET"'
 )
 BINARY_DOCKER_COMMAND_SANITIZER = (
     BINARY_DOCKER_COMMAND + "+--security-opt seccomp=unconfined"
@@ -254,7 +256,7 @@ class JobConfigs:
         runs_on=RunnerLabels.AMD_LARGE,
         command="python3 ./ci/jobs/fast_test.py",
         # --network=host required for ec2 metadata http endpoint to work
-        run_in_docker="altinityinfra/fasttest+--network=host+--volume=./ci/tmp/var/lib/clickhouse:/var/lib/clickhouse+--volume=./ci/tmp/etc/clickhouse-client:/etc/clickhouse-client+--volume=./ci/tmp/etc/clickhouse-server:/etc/clickhouse-server+--volume=./ci/tmp/var/log:/var/log+--volume=.:/ClickHouse+--env=AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID+--env=AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY",
+        run_in_docker="altinityinfra/fasttest+--network=host+--volume=./ci/tmp/var/lib/clickhouse:/var/lib/clickhouse+--volume=./ci/tmp/etc/clickhouse-client:/etc/clickhouse-client+--volume=./ci/tmp/etc/clickhouse-server:/etc/clickhouse-server+--volume=./ci/tmp/var/log:/var/log+--volume=.:/ClickHouse+--env=AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID+--env=AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY+--env=S3_ARTIFACT_BUCKET=$S3_ARTIFACT_BUCKET",
         digest_config=fast_test_digest_config,
         result_name_for_cidb="Tests",
         needs_submodules=True,
@@ -443,7 +445,7 @@ class JobConfigs:
                 ArtifactNames.RPM_ARM_RELEASE,
                 ArtifactNames.TGZ_ARM_RELEASE,
             ],
-            runs_on=RunnerLabels.BUILDER_AMD,
+            runs_on=RunnerLabels.BUILDER_ARM,
         ),
     )
     release_build_jobs_with_examples = [
@@ -490,10 +492,9 @@ class JobConfigs:
     # master data directly comparable to a PR build (official master builds
     # keep debug symbols, PR builds strip them). The hook uploads only for the
     # arm variant (see _PROFILED_BUILDS in build_profile_hook.py).
+    # NOTE (strtgbb): no --build-examples for the arm warmup, PR builds no longer build clickhouse-examples
     sccache_warmup_build_jobs = [
-        job.set_command(f"{job.command} --build-examples")
-        if f"({BuildTypes.ARM_RELEASE_PR_CACHE_WARMUP})" in job.name
-        else job
+        job
         for job in common_build_job_config.set_post_hooks(
             post_hooks=[
                 # "python3 ./ci/jobs/scripts/job_hooks/build_profile_hook.py",
