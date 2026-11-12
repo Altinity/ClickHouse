@@ -51,6 +51,7 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+          REQUIRE_ARM64: ${{ !contains(fromJson(inputs.workflow_config).workflow_config.custom_data.ci_exclude_tags, 'aarch64') }}
         run: python3 .github/scripts/select_pr_regression.py --pr "${{ github.event.pull_request.number }}"
 
   run:
