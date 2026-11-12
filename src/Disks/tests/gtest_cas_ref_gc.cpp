@@ -12,6 +12,8 @@
 #include <Common/ProfileEvents.h>
 
 #include <algorithm>
+#include <atomic>
+#include <functional>
 #include <mutex>
 #include <set>
 
@@ -36,6 +38,11 @@ extern const Event CASRefLogBodyGets;
 extern const Event CASRefManifestBodyFoldGets;
 extern const Event CASRefEmittedEdges;
 extern const Event CASRefCleanupObjectsDeleted;
+extern const Event CASRefCleanupObjectsPlanned;
+extern const Event CASRefCleanupNamespacesSkipped;
+extern const Event CASRefCleanupStoppedLeaseMoved;
+extern const Event CASRefCleanupStoppedAuthorityUnverified;
+extern const Event CASRefCleanupChunksUnderCatalogChange;
 }
 
 namespace
@@ -137,6 +144,15 @@ public:
 
     static RootNamespace aliasNamespace() { return RootNamespace{"00/zz@cas@"}; }
 
+    /// What the first `gc/state` read of `licenceForChunk` meets, see `armGcStateFaultOnLicenceRevalidationForTest`.
+    /// `ReadFails` throws on that read and on every later one; it does not move the lease.
+    enum class GcStateFault : uint8_t
+    {
+        LeaseMoved,
+        Absent,
+        ReadFails,
+    };
+
     enum class Timing : uint8_t
     {
         AfterFirstDelete,
@@ -173,19 +189,19 @@ public:
     /// BEFORE `round_commit`'s own `gc/state` replace (which still holds the etag from lease adoption,
     /// phase 1), so that replace loses its own CAS and the round throws before `cleanupRefObjects`
     /// (phase 17) ever runs -- the "nothing deleted" assertions would pass vacuously, not because
-    /// cleanup refused. Instead, the hook only ARMS `armGcFenceMoveOnAuthorityHoldsRevalidationForTest`: the
+    /// cleanup refused. Instead, the hook only ARMS `armGcFenceMoveOnLicenceRevalidationForTest`: the
     /// actual lease bump is deferred to a LATER read of `gc/state`. Not the next one -- namespace
     /// janitor / orphan-sweep bookkeeping between `round_commit` and `cleanupRefObjects` also touches
-    /// the catalog and `gc/state`, just never the two BACK TO BACK the way `licenceForChunk` does
-    /// (catalog, then `gc/state`, nothing in between): that adjacency is the one place in a round only
-    /// `licenceForChunk`'s own revalidation produces, so gating on it -- rather than on the catalog key
-    /// alone -- is what actually lands the move inside that SAME call, well after `round_commit`.
+    /// the catalog and `gc/state`, and its authority probe (`Gc::refreshAuthority`) reads `gc/state`
+    /// right after the hot-scan cut's catalog read. So the seam skips that first catalog-then-`gc/state`
+    /// adjacency and fires on the next one, which is `licenceForChunk`'s own catalog read followed by
+    /// its `gc/state` read, well after `round_commit`.
     static void moveRefCleanupAuthorityBeforeFirstChunk(Authority authority_, CasOperation & op, const Layout & layout)
     {
         if (authority_ == Authority::GcFence)
             throw std::logic_error(
                 "moveRefCleanupAuthorityBeforeFirstChunk is for Authority::Catalog/CatalogRebirth only -- "
-                "use armGcFenceMoveOnAuthorityHoldsRevalidationForTest for Authority::GcFence");
+                "use armGcFenceMoveOnLicenceRevalidationForTest for Authority::GcFence");
         /// Same-content rewrite: only the catalog's TOKEN moves (mints a fresh etag), never its
         /// parsed content -- the pure "someone else touched this row" race `Authority::Catalog`
         /// models, as opposed to `Authority::CatalogRebirth`'s actual incarnation bump.
@@ -196,17 +212,40 @@ public:
     /// Arms the seam `read` below fires on: see the doc comment above. Called from the test body
     /// before the round (and so before any read-ahead worker exists), but still under the mutex, so
     /// this method and `read`'s critical sections never race even under future reordering.
-    void armGcFenceMoveOnAuthorityHoldsRevalidationForTest(const Layout & layout)
+    void armGcFenceMoveOnLicenceRevalidationForTest(const Layout & layout)
+    {
+        armGcStateFaultOnLicenceRevalidationForTest(layout, GcStateFault::LeaseMoved);
+    }
+
+    /// Same seam, other fault: `licenceForChunk`'s first `gc/state` read finds the object removed, or
+    /// it and every later one throw. The janitor pass of the same round runs before the fault is injected.
+    void armGcStateFaultOnLicenceRevalidationForTest(const Layout & layout, GcStateFault fault)
     {
         catalog_key = layout.refCatalogKey();
         gc_state_key = layout.gcStateKey();
         std::lock_guard lock(seam_mutex);
-        catalog_seam_armed = true;
+        armed_gc_state_fault = fault;
+        adjacencies_to_skip = 1;
+        adjacencies_skipped = 0;
+    }
+
+    /// Makes every bulk remove that names `key` throw. Set before the round starts.
+    void failBulkRemoveNaming(const String & key) { failing_remove_key = key; }
+
+    /// Called on the reading thread, outside `seam_mutex`, each time the armed `gc/state` fault fires.
+    /// Set before the round starts.
+    void setGcStateFaultObserver(std::function<void()> observer) { gc_state_fault_observer = std::move(observer); }
+
+    /// How many catalog-then-`gc/state` adjacencies passed unfaulted since arming.
+    size_t gcStateAdjacenciesSkipped()
+    {
+        std::lock_guard lock(seam_mutex);
+        return adjacencies_skipped;
     }
 
     /// `read` also runs on the GC read-ahead pool's threads (`CasGcReadAhead.cpp` schedules
     /// `CasOperation::read` there; `gc_io_concurrency` defaults to 16), concurrently with the round
-    /// thread's own reads -- `catalog_seam_armed` and `last_control_key_read` below are shared mutable
+    /// thread's own reads -- `armed_gc_state_fault` and `last_control_key_read` below are shared mutable
     /// state a pool thread's read can land between `licenceForChunk`'s two reads, so both are read AND
     /// written only under `seam_mutex`. `last_control_key_read` tracks only the catalog and `gc/state`
     /// keys, never any other key a read-ahead worker fetches: those workers never touch either control
@@ -214,14 +253,39 @@ public:
     /// adjacency signal even though it runs lock-free between this method's two critical sections.
     std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
     {
-        bool fires_here = false;
+        if (gc_state_reads_fail && key == gc_state_key)
+            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "test-injected: gc/state read fails");
+        std::optional<GcStateFault> fires_here;
         {
             std::lock_guard lock(seam_mutex);
-            fires_here = catalog_seam_armed && key == gc_state_key && last_control_key_read == catalog_key;
-            if (fires_here)
-                catalog_seam_armed = false;
+            if (armed_gc_state_fault && key == gc_state_key && last_control_key_read == catalog_key)
+            {
+                if (adjacencies_skipped < adjacencies_to_skip)
+                {
+                    ++adjacencies_skipped;
+                }
+                else
+                {
+                    fires_here = armed_gc_state_fault;
+                    armed_gc_state_fault.reset();
+                }
+            }
             if (key == catalog_key || key == gc_state_key)
                 last_control_key_read = key;
+        }
+        if (fires_here && gc_state_fault_observer)
+            gc_state_fault_observer();
+        if (fires_here == GcStateFault::Absent)
+        {
+            const auto current = CountingBackend::read(key, access);
+            if (!current || remove(key, current->value, access) != DB::Cas::Backend::RawRemoval::Removed)
+                throw std::runtime_error("test-injected gc/state removal did not apply");
+            return CountingBackend::read(key, access);
+        }
+        if (fires_here == GcStateFault::ReadFails)
+        {
+            gc_state_reads_fail = true;
+            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "test-injected: gc/state read fails");
         }
         if (fires_here)
         {
@@ -243,6 +307,10 @@ public:
     /// batch delete lands, so the chunk in flight still completes under the authority it observed.
     void removeManyWriteOnce(const std::vector<DB::Cas::WriteOnceKey> & keys, DB::Cas::TransportAccess & access) override
     {
+        if (!failing_remove_key.empty()
+            && std::any_of(keys.begin(), keys.end(),
+                [&](const DB::Cas::WriteOnceKey & key) { return key.str() == failing_remove_key; }))
+            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "test-injected: the delete naming '{}' fails", failing_remove_key);
         const bool names_first = std::any_of(keys.begin(), keys.end(),
             [&](const DB::Cas::WriteOnceKey & key) { return key.str() == first_cleanup_key; });
         if (armed && timing == Timing::DuringChunk && names_first)
@@ -368,15 +436,22 @@ private:
     std::optional<RootNamespace> target_ns;
     const Layout * layout_for_rebirth_seed = nullptr;
     bool armed = false;
-    /// Guards both members below: `read` runs concurrently on the GC read-ahead pool's threads, see
-    /// the doc comment on `read` itself.
+    /// Guards `armed_gc_state_fault`, `adjacencies_to_skip`, `adjacencies_skipped` and
+    /// `last_control_key_read`: `read` runs concurrently on the GC read-ahead pool's threads, see the doc
+    /// comment on `read` itself.
     std::mutex seam_mutex;
-    /// Independent of `armed`/`timing`/`authority` above: `armGcFenceMoveOnAuthorityHoldsRevalidationForTest`
+    std::function<void()> gc_state_fault_observer;
+    /// Independent of `armed`/`timing`/`authority` above: `armGcStateFaultOnLicenceRevalidationForTest`
     /// arms this, and the `read` override consumes it once.
-    bool catalog_seam_armed = false;
+    std::optional<GcStateFault> armed_gc_state_fault;
+    String failing_remove_key;
+    size_t adjacencies_to_skip = 0;
+    size_t adjacencies_skipped = 0;
+    /// Set by `GcStateFault::ReadFails`: every later `gc/state` read fails, so a retry cannot outlast it.
+    std::atomic<bool> gc_state_reads_fail = false;
     /// The most recent CONTROL key (catalog or `gc/state`) read -- every other key a read-ahead
     /// worker reads is ignored, so `read` can recognize the catalog-then-`gc/state` ADJACENCY
-    /// `licenceForChunk` alone produces -- see the doc comment above `moveRefCleanupAuthorityBeforeFirstChunk`.
+    /// `licenceForChunk` produces -- see the doc comment above `moveRefCleanupAuthorityBeforeFirstChunk`.
     String last_control_key_read;
 };
 
@@ -688,6 +763,11 @@ TEST(CASRefGc, RefObjectCleanupRespectsRoundBudgetAndConvergesAcrossRounds)
     ASSERT_EQ(countSurviving(), deletable_log_keys.size())
         << "nothing cleaned before the first round even runs";
 
+    using ProfileEvents::global_counters;
+    const auto lease_moved_before = global_counters[ProfileEvents::CASRefCleanupStoppedLeaseMoved];
+    const auto unverified_before = global_counters[ProfileEvents::CASRefCleanupStoppedAuthorityUnverified];
+    const auto skipped_before = global_counters[ProfileEvents::CASRefCleanupNamespacesSkipped];
+
     /// The SAME round that folds the whole tail also runs post-CAS cleanup, and with
     /// `gc_round_ref_cleanup_budget = 1` deletes exactly one of the five deletable candidates.
     runRegularRoundReclaiming(gc);
@@ -699,6 +779,11 @@ TEST(CASRefGc, RefObjectCleanupRespectsRoundBudgetAndConvergesAcrossRounds)
         runRegularRoundReclaiming(gc);
     EXPECT_EQ(countSurviving(), 0u)
         << "the whole deletable tail must eventually drain under repeated budgeted rounds";
+
+    /// Running out of budget is not a licence refusal.
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefCleanupStoppedLeaseMoved], lease_moved_before);
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefCleanupStoppedAuthorityUnverified], unverified_before);
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefCleanupNamespacesSkipped], skipped_before);
 }
 
 TEST(CASRefGc, RefObjectCleanupRetainsCheckpointPredecessorSealProof)
@@ -812,6 +897,34 @@ TEST(CASRefGcCleanupAuthority, CatalogTokenMoveBetweenChunksAllowsBothChunks)
     EXPECT_EQ(backend->deleteCount(keys.second_log_key), 1u);
 }
 
+/// Keeps the metrics of the latest `ref_object_cleanup` phase row of `gc`; empty until a row is emitted.
+struct RefCleanupPhaseCapture
+{
+    std::map<String, UInt64> metrics;
+    std::set<String> emitted_phases;
+
+    explicit RefCleanupPhaseCapture(Gc & gc)
+    {
+        gc.setPhaseSink([this](const GcPhaseRecord & rec)
+        {
+            emitted_phases.insert(rec.phase);
+            if (rec.phase == "ref_object_cleanup")
+                metrics = rec.metrics;
+        });
+    }
+
+    RefCleanupPhaseCapture(const RefCleanupPhaseCapture &) = delete;
+    RefCleanupPhaseCapture & operator=(const RefCleanupPhaseCapture &) = delete;
+
+    bool emitted(const String & phase) const { return emitted_phases.contains(phase); }
+
+    UInt64 metric(const String & name) const
+    {
+        const auto it = metrics.find(name);
+        return it == metrics.end() ? UINT64_MAX : it->second;
+    }
+};
+
 TEST(CASRefGcCleanupAuthority, GcFenceMoveBeforeFirstChunkRefusesEveryRefObjectDelete)
 {
     auto backend = std::make_shared<RefCleanupAuthorityRaceBackend>();
@@ -825,16 +938,23 @@ TEST(CASRefGcCleanupAuthority, GcFenceMoveBeforeFirstChunkRefusesEveryRefObjectD
     /// holds the etag from lease adoption (phase 1) -- that CAS would then lose and the round would
     /// throw before `cleanupRefObjects` (phase 17) ever runs, so "nothing deleted" would hold
     /// vacuously. Instead, only ARM the seam here: the actual bump happens on `licenceForChunk`'s own
-    /// `gc/state` read (phase 17, long after `round_commit` landed) -- see the class doc comment above
-    /// `moveRefCleanupAuthorityBeforeFirstChunk`.
+    /// `gc/state` read, the second catalog-then-`gc/state` adjacency after the arm (the first is the
+    /// janitor's authority probe) -- see the class doc comment above `moveRefCleanupAuthorityBeforeFirstChunk`.
     bool hook_fired = false;
     gc.setPostHotScanCatalogReadHookForTest([&]
     {
         hook_fired = true;
-        backend->armGcFenceMoveOnAuthorityHoldsRevalidationForTest(layout);
+        backend->armGcFenceMoveOnLicenceRevalidationForTest(layout);
+    });
+    RefCleanupPhaseCapture phase(gc);
+    bool fired_inside_ref_cleanup = false;
+    backend->setGcStateFaultObserver([&]
+    {
+        fired_inside_ref_cleanup = phase.emitted("namespace_cleanup") && !phase.emitted("ref_object_cleanup");
     });
     ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
     ASSERT_TRUE(hook_fired) << "the race hook never fired -- this test proves nothing about the race";
+    EXPECT_TRUE(fired_inside_ref_cleanup) << "the lease move must land at the ref cleanup's licence read, not the janitor's";
 
     OperationForTest raw_op(*backend);
     EXPECT_TRUE((*raw_op).head(keys.first_log_key, Retry::once()).has_value());
@@ -868,6 +988,7 @@ namespace
 {
 const RootNamespace kNsA{"00/aa@cas@"};
 const RootNamespace kNsB{"00/bb@cas@"};
+const RootNamespace kNsUnrelated{"00/zz@cas@"};
 
 std::shared_ptr<RefCleanupAuthorityRaceBackend> openChunkOfOneBackend(PoolPtr & store)
 {
@@ -875,6 +996,51 @@ std::shared_ptr<RefCleanupAuthorityRaceBackend> openChunkOfOneBackend(PoolPtr & 
     store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                                            .gc_bulk_delete_chunk_keys = 1, .gc_fold_max_defer_rounds = 0});
     return backend;
+}
+
+struct RefCleanupCounters
+{
+    uint64_t planned = 0;
+    uint64_t deleted = 0;
+    uint64_t skipped = 0;
+    uint64_t stopped_lease_moved = 0;
+    uint64_t stopped_authority_unverified = 0;
+    uint64_t under_catalog_change = 0;
+};
+
+RefCleanupCounters readRefCleanupCounters()
+{
+    using ProfileEvents::global_counters;
+    return RefCleanupCounters{
+        .planned = global_counters[ProfileEvents::CASRefCleanupObjectsPlanned],
+        .deleted = global_counters[ProfileEvents::CASRefCleanupObjectsDeleted],
+        .skipped = global_counters[ProfileEvents::CASRefCleanupNamespacesSkipped],
+        .stopped_lease_moved = global_counters[ProfileEvents::CASRefCleanupStoppedLeaseMoved],
+        .stopped_authority_unverified = global_counters[ProfileEvents::CASRefCleanupStoppedAuthorityUnverified],
+        .under_catalog_change = global_counters[ProfileEvents::CASRefCleanupChunksUnderCatalogChange]};
+}
+
+RefCleanupCounters refCleanupCountersSince(const RefCleanupCounters & before)
+{
+    const RefCleanupCounters now = readRefCleanupCounters();
+    return RefCleanupCounters{
+        .planned = now.planned - before.planned,
+        .deleted = now.deleted - before.deleted,
+        .skipped = now.skipped - before.skipped,
+        .stopped_lease_moved = now.stopped_lease_moved - before.stopped_lease_moved,
+        .stopped_authority_unverified = now.stopped_authority_unverified - before.stopped_authority_unverified,
+        .under_catalog_change = now.under_catalog_change - before.under_catalog_change};
+}
+
+/// The phase row repeats the counter deltas of the same round, plus the 0/1 stop flags.
+void expectPhaseMatchesCounters(const RefCleanupPhaseCapture & phase, const RefCleanupCounters & delta)
+{
+    EXPECT_EQ(phase.metric("objects_planned"), delta.planned);
+    EXPECT_EQ(phase.metric("objects_deleted"), delta.deleted);
+    EXPECT_EQ(phase.metric("namespaces_skipped"), delta.skipped);
+    EXPECT_EQ(phase.metric("stopped_lease_moved"), delta.stopped_lease_moved);
+    EXPECT_EQ(phase.metric("stopped_authority_unverified"), delta.stopped_authority_unverified);
+    EXPECT_EQ(phase.metric("chunks_under_catalog_change"), delta.under_catalog_change);
 }
 
 bool present(RefCleanupAuthorityRaceBackend & backend, const String & key)
@@ -899,8 +1065,8 @@ const CreatorFence kTestCreator{.server_root_id = "test", .writer_epoch = 1, .fe
 
 TEST(CASRefGcCleanupAuthority, UnrelatedNamespaceCreatedBetweenCutAndCleanupStillDeletesCoveredKeys)
 {
-    auto backend = std::make_shared<RefCleanupAuthorityRaceBackend>();
-    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    PoolPtr store;
+    auto backend = openChunkOfOneBackend(store);
     const Layout & layout = store->layout();
     const RefCleanupFixture keys = seedTwoCoveredLogs(*backend, layout, kNsA);
 
@@ -911,14 +1077,18 @@ TEST(CASRefGcCleanupAuthority, UnrelatedNamespaceCreatedBetweenCutAndCleanupStil
     {
         hook_fired = true;
         CasRefCatalog::casAdmitEntry(*race_op, layout, 1, CatalogEntry{
-            .ns = RootNamespace{"00/zz@cas@"}, .state = NsState::Creating, .incarnation = UInt128(777),
+            .ns = kNsUnrelated, .state = NsState::Creating, .incarnation = UInt128(777),
             .creator = kTestCreator});
     });
+    const RefCleanupCounters before = readRefCleanupCounters();
     ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
     ASSERT_TRUE(hook_fired);
 
     EXPECT_FALSE(present(*backend, keys.first_log_key));
     EXPECT_FALSE(present(*backend, keys.second_log_key));
+    const RefCleanupCounters delta = refCleanupCountersSince(before);
+    EXPECT_EQ(delta.under_catalog_change, 2u) << "both single-key chunks ran under a changed catalog etag";
+    EXPECT_EQ(delta.skipped, 0u);
 }
 
 TEST(CASRefGcCleanupAuthority, UnrelatedNamespaceDroppedBetweenCutAndCleanupStillDeletesCoveredKeys)
@@ -927,7 +1097,7 @@ TEST(CASRefGcCleanupAuthority, UnrelatedNamespaceDroppedBetweenCutAndCleanupStil
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     const RefCleanupFixture a = seedTwoCoveredLogs(*backend, layout, kNsA);
-    seedTwoCoveredLogs(*backend, layout, kNsB);
+    const RefCleanupFixture b = seedTwoCoveredLogs(*backend, layout, kNsB);
 
     Gc gc(store, kGc);
     OperationForTest race_op(*backend);
@@ -939,11 +1109,18 @@ TEST(CASRefGcCleanupAuthority, UnrelatedNamespaceDroppedBetweenCutAndCleanupStil
             = CasRefCatalog::beginRemoving(*race_op, layout, rowOf(*backend, layout, kNsB), 1);
         EXPECT_EQ(outcome, CasRefCatalog::BeginRemovingOutcome::Transitioned);
     });
+    const RefCleanupCounters before = readRefCleanupCounters();
     ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
     ASSERT_TRUE(hook_fired);
 
     EXPECT_FALSE(present(*backend, a.first_log_key));
     EXPECT_FALSE(present(*backend, a.second_log_key));
+    EXPECT_TRUE(present(*backend, b.first_log_key)) << "the namespace whose row moved keeps its keys";
+    EXPECT_TRUE(present(*backend, b.second_log_key));
+    const RefCleanupCounters delta = refCleanupCountersSince(before);
+    EXPECT_EQ(delta.skipped, 1u);
+    EXPECT_EQ(delta.planned, 4u);
+    EXPECT_EQ(delta.deleted, 2u);
 }
 
 TEST(CASRefGcCleanupAuthority, UnrelatedNamespaceErasedBetweenCutAndCleanupStillDeletesCoveredKeys)
@@ -952,7 +1129,7 @@ TEST(CASRefGcCleanupAuthority, UnrelatedNamespaceErasedBetweenCutAndCleanupStill
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     const RefCleanupFixture a = seedTwoCoveredLogs(*backend, layout, kNsA);
-    seedTwoCoveredLogs(*backend, layout, kNsB);
+    const RefCleanupFixture b = seedTwoCoveredLogs(*backend, layout, kNsB);
 
     Gc gc(store, kGc);
     OperationForTest race_op(*backend);
@@ -964,13 +1141,83 @@ TEST(CASRefGcCleanupAuthority, UnrelatedNamespaceErasedBetweenCutAndCleanupStill
         const CasRefCatalog::Snapshot snap = CasRefCatalog::read(*race_op, layout);
         RefCatalog next = snap.catalog;
         std::erase_if(next.entries, [&](const CatalogEntry & entry) { return entry.ns == kNsB; });
-        (*race_op).replace(layout.refCatalogKey(), encodeRefCatalog(next), *snap.etag, Retry::standard());
+        EXPECT_TRUE(std::holds_alternative<Committed>(
+            (*race_op).replace(layout.refCatalogKey(), encodeRefCatalog(next), *snap.etag, Retry::standard())))
+            << "the erase must land, or the test races nothing";
     });
+    const RefCleanupCounters before = readRefCleanupCounters();
     ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
     ASSERT_TRUE(hook_fired);
 
     EXPECT_FALSE(present(*backend, a.first_log_key));
     EXPECT_FALSE(present(*backend, a.second_log_key));
+    /// An erased row leaves its keys as dead-life debris, which the namespace janitor reclaims in the same
+    /// round before cleanup plans them. Cleanup itself deletes only A's keys and never counts B as skipped.
+    EXPECT_FALSE(present(*backend, b.first_log_key));
+    EXPECT_FALSE(present(*backend, b.second_log_key));
+    const RefCleanupCounters delta = refCleanupCountersSince(before);
+    EXPECT_EQ(delta.deleted, 2u);
+    EXPECT_EQ(delta.skipped, 0u);
+    EXPECT_EQ(delta.stopped_lease_moved, 0u);
+    EXPECT_EQ(delta.stopped_authority_unverified, 0u);
+}
+
+TEST(CASRefGcCleanupAuthority, OwnRowMovedBeforeItsFirstChunkSkipsOnlyThatNamespace)
+{
+    auto backend = std::make_shared<RefCleanupAuthorityRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const Layout & layout = store->layout();
+    const RefCleanupFixture a = seedTwoCoveredLogs(*backend, layout, kNsA);
+    const RefCleanupFixture b = seedTwoCoveredLogs(*backend, layout, kNsB);
+
+    Gc gc(store, kGc);
+    OperationForTest race_op(*backend);
+    bool hook_fired = false;
+    gc.setPostHotScanCatalogReadHookForTest([&]
+    {
+        hook_fired = true;
+        EXPECT_EQ(CasRefCatalog::beginRemoving(*race_op, layout, rowOf(*backend, layout, kNsA), 1),
+                  CasRefCatalog::BeginRemovingOutcome::Transitioned);
+    });
+    const RefCleanupCounters before = readRefCleanupCounters();
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    ASSERT_TRUE(hook_fired);
+
+    EXPECT_TRUE(present(*backend, a.first_log_key)) << "the first chunk of the moved namespace is refused";
+    EXPECT_TRUE(present(*backend, a.second_log_key));
+    EXPECT_FALSE(present(*backend, b.first_log_key)) << "a later namespace in the plan is still cleaned";
+    EXPECT_FALSE(present(*backend, b.second_log_key));
+    const RefCleanupCounters delta = refCleanupCountersSince(before);
+    EXPECT_EQ(delta.skipped, 1u);
+    EXPECT_EQ(delta.stopped_lease_moved, 0u);
+    EXPECT_EQ(delta.stopped_authority_unverified, 0u);
+    EXPECT_EQ(delta.deleted, 2u);
+}
+
+TEST(CASRefGcCleanupAuthority, TrimDisabledRoundReportsZeroCleanupMetricsAndDeletesNothing)
+{
+    auto backend = std::make_shared<RefCleanupAuthorityRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const Layout & layout = store->layout();
+    const RefCleanupFixture a = seedTwoCoveredLogs(*backend, layout, kNsA);
+
+    Gc gc(store, kGc);
+    gc.setTrimEnabledForTest(false);
+    RefCleanupPhaseCapture phase(gc);
+    const RefCleanupCounters before = readRefCleanupCounters();
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    gc.setTrimEnabledForTest(true);
+
+    EXPECT_EQ(phase.metric("trim_enabled"), 0u);
+    EXPECT_EQ(phase.metric("suppressed"), 0u);
+    for (const char * name : {"objects_planned", "objects_deleted", "namespaces_skipped", "stopped_lease_moved",
+                              "stopped_authority_unverified", "chunks_under_catalog_change"})
+        EXPECT_EQ(phase.metric(name), 0u) << name;
+    const RefCleanupCounters delta = refCleanupCountersSince(before);
+    EXPECT_EQ(delta.planned, 0u);
+    EXPECT_EQ(delta.deleted, 0u);
+    EXPECT_TRUE(present(*backend, a.first_log_key));
+    EXPECT_TRUE(present(*backend, a.second_log_key));
 }
 
 TEST(CASRefGcCleanupAuthority, RecoveryAfterCleanupUnderUnrelatedChurn)
@@ -986,13 +1233,16 @@ TEST(CASRefGcCleanupAuthority, RecoveryAfterCleanupUnderUnrelatedChurn)
         *op, layout, rowOf(*backend, layout, kNsA), readCkpt(*op, layout, life)->ckpt);
 
     Gc gc(store, kGc);
+    bool hook_fired = false;
     gc.setPostHotScanCatalogReadHookForTest([&]
     {
+        hook_fired = true;
         CasRefCatalog::casAdmitEntry(*op, layout, 1, CatalogEntry{
-            .ns = RootNamespace{"00/zz@cas@"}, .state = NsState::Creating, .incarnation = UInt128(777),
+            .ns = kNsUnrelated, .state = NsState::Creating, .incarnation = UInt128(777),
             .creator = kTestCreator});
     });
     ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    ASSERT_TRUE(hook_fired) << "without the churn this test proves nothing about it";
     ASSERT_FALSE(present(*backend, keys.first_log_key));
     ASSERT_FALSE(present(*backend, keys.second_log_key));
 
@@ -1003,7 +1253,7 @@ TEST(CASRefGcCleanupAuthority, RecoveryAfterCleanupUnderUnrelatedChurn)
     EXPECT_NO_THROW(after = recoverRefTableDetailedFromAuthority(
         *op, layout, rowOf(*backend, layout, kNsA), checkpoint->ckpt));
     ASSERT_TRUE(after);
-    EXPECT_EQ(after->state.getCommitted().size(), before.state.getCommitted().size());
+    EXPECT_TRUE(after->state.getCommitted() == before.state.getCommitted());
     EXPECT_EQ(after->state.getGreatestApplied(), before.state.getGreatestApplied());
 }
 
@@ -1018,12 +1268,22 @@ TEST(CASRefGcCleanupAuthority, OwnRowMoveRefusesOnlyThatNamespace)
                  RefCleanupAuthorityRaceBackend::Timing::DuringChunk, layout, a.first_log_key, kNsA);
 
     Gc gc(store, kGc);
+    RefCleanupPhaseCapture phase(gc);
+    const RefCleanupCounters before = readRefCleanupCounters();
     ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
 
     EXPECT_FALSE(present(*backend, a.first_log_key)) << "the chunk in flight completes";
     EXPECT_TRUE(present(*backend, a.second_log_key)) << "the moved row refuses the namespace's next chunk";
     EXPECT_FALSE(present(*backend, b.first_log_key));
     EXPECT_FALSE(present(*backend, b.second_log_key));
+
+    const RefCleanupCounters delta = refCleanupCountersSince(before);
+    EXPECT_EQ(delta.skipped, 1u);
+    EXPECT_EQ(delta.planned, 4u);
+    EXPECT_EQ(delta.deleted, 3u);
+    EXPECT_EQ(delta.stopped_lease_moved, 0u);
+    EXPECT_EQ(delta.stopped_authority_unverified, 0u);
+    expectPhaseMatchesCounters(phase, delta);
 }
 
 TEST(CASRefGcCleanupAuthority, OwnRowErasedDuringCleanupSkipsThatNamespace)
@@ -1037,12 +1297,14 @@ TEST(CASRefGcCleanupAuthority, OwnRowErasedDuringCleanupSkipsThatNamespace)
                  RefCleanupAuthorityRaceBackend::Timing::DuringChunk, layout, a.first_log_key, kNsA);
 
     Gc gc(store, kGc);
+    const RefCleanupCounters before = readRefCleanupCounters();
     ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
 
     EXPECT_FALSE(present(*backend, a.first_log_key)) << "the chunk in flight completes";
     EXPECT_TRUE(present(*backend, a.second_log_key));
     EXPECT_FALSE(present(*backend, b.first_log_key));
     EXPECT_FALSE(present(*backend, b.second_log_key));
+    EXPECT_EQ(refCleanupCountersSince(before).skipped, 1u);
 }
 
 TEST(CASRefGcCleanupAuthority, GcFenceMoveRefusesEveryNamespace)
@@ -1056,12 +1318,96 @@ TEST(CASRefGcCleanupAuthority, GcFenceMoveRefusesEveryNamespace)
                  RefCleanupAuthorityRaceBackend::Timing::DuringChunk, layout, a.first_log_key);
 
     Gc gc(store, kGc);
+    const RefCleanupCounters before = readRefCleanupCounters();
     ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
 
     EXPECT_FALSE(present(*backend, a.first_log_key)) << "the chunk in flight completes";
     EXPECT_TRUE(present(*backend, a.second_log_key));
     EXPECT_TRUE(present(*backend, b.first_log_key));
     EXPECT_TRUE(present(*backend, b.second_log_key));
+
+    const RefCleanupCounters delta = refCleanupCountersSince(before);
+    EXPECT_EQ(delta.stopped_lease_moved, 1u);
+    EXPECT_EQ(delta.skipped, 0u) << "a moved lease stops the pass; it is not a per-namespace skip";
+}
+
+namespace
+{
+/// Arms `fault` for `licenceForChunk`'s first `gc/state` read and expects the pass to stop as unverified:
+/// nothing deleted, every planned key still present, and the stop is not counted as a lease move.
+/// The janitor pass of the same round runs before the fault and the round returns normally.
+void expectGcStateFaultStopsAsUnverified(RefCleanupAuthorityRaceBackend::GcStateFault fault)
+{
+    PoolPtr store;
+    auto backend = openChunkOfOneBackend(store);
+    const Layout & layout = store->layout();
+    const RefCleanupFixture a = seedTwoCoveredLogs(*backend, layout, kNsA);
+
+    Gc gc(store, kGc);
+    bool hook_fired = false;
+    gc.setPostHotScanCatalogReadHookForTest([&]
+    {
+        hook_fired = true;
+        backend->armGcStateFaultOnLicenceRevalidationForTest(layout, fault);
+    });
+    RefCleanupPhaseCapture phase(gc);
+    /// The janitor's phase row is emitted before the ref cleanup starts and the cleanup's row after it ends.
+    bool fired_inside_ref_cleanup = false;
+    backend->setGcStateFaultObserver([&]
+    {
+        fired_inside_ref_cleanup = phase.emitted("namespace_cleanup") && !phase.emitted("ref_object_cleanup");
+    });
+    const RefCleanupCounters before = readRefCleanupCounters();
+    EXPECT_NO_THROW((void)runRegularRoundReclaiming(gc));
+    ASSERT_TRUE(hook_fired);
+    EXPECT_EQ(backend->gcStateAdjacenciesSkipped(), 1u) << "the janitor's adjacency must pass unfaulted first";
+    EXPECT_TRUE(fired_inside_ref_cleanup) << "the fault must fire at the ref cleanup's licence read, not the janitor's";
+
+    EXPECT_TRUE(present(*backend, a.first_log_key));
+    EXPECT_TRUE(present(*backend, a.second_log_key));
+    const RefCleanupCounters delta = refCleanupCountersSince(before);
+    EXPECT_EQ(delta.stopped_authority_unverified, 1u);
+    EXPECT_EQ(delta.stopped_lease_moved, 0u);
+    EXPECT_EQ(delta.deleted, 0u);
+    EXPECT_EQ(delta.skipped, 0u);
+    expectPhaseMatchesCounters(phase, delta);
+}
+}
+
+TEST(CASRefGcCleanupAuthority, GcStateAbsentAtTheLicenceCheckIsUnverifiedAuthorityNotALeaseMove)
+{
+    expectGcStateFaultStopsAsUnverified(RefCleanupAuthorityRaceBackend::GcStateFault::Absent);
+}
+
+TEST(CASRefGcCleanupAuthority, GcStateReadFailingAtTheLicenceCheckIsUnverifiedAuthority)
+{
+    expectGcStateFaultStopsAsUnverified(RefCleanupAuthorityRaceBackend::GcStateFault::ReadFails);
+}
+
+TEST(CASRefGcCleanupAuthority, PhaseMetricsSurviveADeleteChunkThatThrows)
+{
+    PoolPtr store;
+    auto backend = openChunkOfOneBackend(store);
+    const Layout & layout = store->layout();
+    const RefCleanupFixture a = seedTwoCoveredLogs(*backend, layout, kNsA);
+    backend->failBulkRemoveNaming(a.second_log_key);
+
+    Gc gc(store, kGc);
+    RefCleanupPhaseCapture phase(gc);
+    const RefCleanupCounters before = readRefCleanupCounters();
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)runRegularRoundReclaiming(gc); });
+
+    EXPECT_FALSE(present(*backend, a.first_log_key)) << "the first chunk was deleted";
+    EXPECT_TRUE(present(*backend, a.second_log_key));
+    const RefCleanupCounters delta = refCleanupCountersSince(before);
+    ASSERT_EQ(delta.planned, 2u);
+    ASSERT_EQ(delta.deleted, 1u);
+    for (const char * name : {"objects_planned", "objects_deleted", "namespaces_skipped", "stopped_lease_moved",
+                              "stopped_authority_unverified", "chunks_under_catalog_change"})
+        EXPECT_TRUE(phase.metrics.contains(name)) << name;
+    EXPECT_EQ(phase.metric("objects_planned"), 2u);
+    EXPECT_EQ(phase.metric("objects_deleted"), 1u);
+    expectPhaseMatchesCounters(phase, delta);
 }
 
 TEST(CASRefGcCleanupAuthority, AliasingIncarnationAdmittedDuringCleanupRefusesThePass)
@@ -1075,12 +1421,16 @@ TEST(CASRefGcCleanupAuthority, AliasingIncarnationAdmittedDuringCleanupRefusesTh
                  RefCleanupAuthorityRaceBackend::Timing::DuringChunk, layout, a.first_log_key, kNsA);
 
     Gc gc(store, kGc);
+    const RefCleanupCounters before = readRefCleanupCounters();
     ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
 
     EXPECT_FALSE(present(*backend, a.first_log_key)) << "the chunk in flight completes";
     EXPECT_TRUE(present(*backend, a.second_log_key));
     EXPECT_TRUE(present(*backend, b.first_log_key));
     EXPECT_TRUE(present(*backend, b.second_log_key));
+
+    const RefCleanupCounters delta = refCleanupCountersSince(before);
+    EXPECT_EQ(delta.stopped_authority_unverified, 1u);
 }
 
 TEST(CASRefGcCleanupAuthority, LeaseMoveDuringAChunkLetsTheChunkCompleteAndNothingElse)
@@ -1111,15 +1461,23 @@ TEST(CASRefGcCleanupAuthority, RebirthDuringAChunkDeletesOnlyTheOldLifesKeys)
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
     const RefCleanupFixture keys = seedTwoCoveredLogs(*backend, layout, ns);
+    const RefCleanupFixture later = seedTwoCoveredLogs(*backend, layout, kNsB);
     backend->arm(RefCleanupAuthorityRaceBackend::Authority::CatalogRebirth,
                  RefCleanupAuthorityRaceBackend::Timing::DuringChunk, layout, keys.first_log_key, ns);
 
     Gc gc(store, kGc);
+    const RefCleanupCounters before = readRefCleanupCounters();
     ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
 
     OperationForTest raw_op(*backend);
     EXPECT_FALSE((*raw_op).head(keys.first_log_key, Retry::once()).has_value());
     EXPECT_TRUE((*raw_op).head(keys.second_log_key, Retry::once()).has_value());
+    EXPECT_FALSE((*raw_op).head(later.first_log_key, Retry::once()).has_value()) << "a later namespace is still cleaned";
+    EXPECT_FALSE((*raw_op).head(later.second_log_key, Retry::once()).has_value());
+    const RefCleanupCounters first_round = refCleanupCountersSince(before);
+    EXPECT_EQ(first_round.skipped, 1u) << "a moved life skips the namespace";
+    EXPECT_EQ(first_round.stopped_authority_unverified, 0u);
+    EXPECT_EQ(first_round.stopped_lease_moved, 0u);
     /// Whatever the reborn life owns is untouched: its keys carry a different life id and were never
     /// in the cohort. Every key under the new life's stream prefix is still present -- `moveAuthority`'s
     /// `CatalogRebirth` branch seeds the reborn life's own `_log` and `_snap` right after the catalog
@@ -1156,12 +1514,20 @@ TEST(CASRefGcCleanupAuthority, RebirthDuringAChunkDeletesOnlyTheOldLifesKeys)
     /// `GcPhaseRecord::profile_events` delta is unavailable here: it needs a `CurrentThread` with an
     /// attached `ThreadStatus`, which a bare gtest thread does not have).
     std::optional<uint64_t> ref_cleanup_suppressed;
+    std::optional<uint64_t> ref_cleanup_objects_deleted;
+    std::optional<uint64_t> ref_cleanup_namespaces_skipped;
     std::optional<uint64_t> janitor_deleted;
     gc.setPhaseSink([&](const GcPhaseRecord & rec)
     {
         if (rec.phase == "ref_object_cleanup")
+        {
             if (const auto it = rec.metrics.find("suppressed"); it != rec.metrics.end())
                 ref_cleanup_suppressed = it->second;
+            if (const auto it = rec.metrics.find("objects_deleted"); it != rec.metrics.end())
+                ref_cleanup_objects_deleted = it->second;
+            if (const auto it = rec.metrics.find("namespaces_skipped"); it != rec.metrics.end())
+                ref_cleanup_namespaces_skipped = it->second;
+        }
         if (rec.phase == "namespace_cleanup")
             if (const auto it = rec.metrics.find("janitor_deleted"); it != rec.metrics.end())
                 janitor_deleted = it->second;
@@ -1172,6 +1538,10 @@ TEST(CASRefGcCleanupAuthority, RebirthDuringAChunkDeletesOnlyTheOldLifesKeys)
     ASSERT_TRUE(ref_cleanup_suppressed.has_value()) << "the ref_object_cleanup phase row never fired";
     EXPECT_EQ(*ref_cleanup_suppressed, 0u)
         << "round two must actually run destructive work, not merely leave everything alone because it was suppressed";
+    ASSERT_TRUE(ref_cleanup_objects_deleted.has_value()) << "the phase row lacks `objects_deleted`";
+    EXPECT_EQ(*ref_cleanup_objects_deleted, 0u);
+    ASSERT_TRUE(ref_cleanup_namespaces_skipped.has_value()) << "the phase row lacks `namespaces_skipped`";
+    EXPECT_EQ(*ref_cleanup_namespaces_skipped, 0u);
     EXPECT_EQ(global_counters[ProfileEvents::CASRefCleanupObjectsDeleted], ref_cleanup_deleted_before)
         << "cleanupRefObjects' own plan/cohort must delete NOTHING this round: the old life is not in it "
            "(no catalog entry names it) and the reborn life's own checkpoint-named log is not yet deletable";

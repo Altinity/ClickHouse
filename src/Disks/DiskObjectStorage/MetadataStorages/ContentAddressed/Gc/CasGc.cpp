@@ -64,6 +64,11 @@ namespace ProfileEvents
     extern const Event CASRefManifestBodyFoldGets;
     extern const Event CASRefEmittedEdges;
     extern const Event CASRefCleanupObjectsDeleted;
+    extern const Event CASRefCleanupObjectsPlanned;
+    extern const Event CASRefCleanupNamespacesSkipped;
+    extern const Event CASRefCleanupStoppedLeaseMoved;
+    extern const Event CASRefCleanupStoppedAuthorityUnverified;
+    extern const Event CASRefCleanupChunksUnderCatalogChange;
 }
 
 namespace DB
@@ -1493,11 +1498,22 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// what a reader of a round that reclaimed nothing needs to see.
     {
         GcPhaseTimer t(phase_sink, "ref_object_cleanup");
+        RefCleanupPassStats cleanup_stats;
+        /// Runs before `t` emits its row, also when a delete chunk throws: the pass has then already
+        /// deleted objects that the row must account for.
+        SCOPE_EXIT_SAFE({
+            t.metric("suppressed", suppress_destructive ? 1 : 0);
+            t.metric("trim_enabled", trim_enabled ? 1 : 0);
+            t.metric("namespaces_planned", folded.ref_tables.size());
+            t.metric("objects_planned", cleanup_stats.objects_planned);
+            t.metric("objects_deleted", cleanup_stats.objects_deleted);
+            t.metric("namespaces_skipped", cleanup_stats.namespaces_skipped);
+            t.metric("stopped_lease_moved", cleanup_stats.stopped_lease_moved ? 1 : 0);
+            t.metric("stopped_authority_unverified", cleanup_stats.stopped_authority_unverified ? 1 : 0);
+            t.metric("chunks_under_catalog_change", cleanup_stats.chunks_under_catalog_change);
+        });
         if (trim_enabled)
-            cleanupRefObjects(folded, state.lease, suppress_destructive, round_work_budget);
-        t.metric("suppressed", suppress_destructive ? 1 : 0);
-        t.metric("trim_enabled", trim_enabled ? 1 : 0);
-        t.metric("namespaces_planned", folded.ref_tables.size());
+            cleanupRefObjects(folded, state.lease, suppress_destructive, round_work_budget, cleanup_stats);
     }
 
     /// Bounded orphan-manifest backstop. The fold already exact-read each candidate, retired its exact
@@ -3909,17 +3925,28 @@ enum class RefCleanupLicence : uint8_t
     Delete,
     /// The namespace's own row or life changed; its plan is stale, other namespaces are unaffected.
     SkipNamespace,
-    /// The GC lease moved: no namespace may delete any more this pass.
+    /// `gc/state` was read and its lease owner or sequence differs from the adopted one: no namespace
+    /// may delete any more this pass.
     StopLeaseMoved,
-    /// A mandatory read failed or the catalog is ambiguous: nothing can be verified this pass.
+    /// A mandatory read failed, `gc/state` is absent, or the catalog is ambiguous: nothing can be
+    /// verified this pass.
     StopAuthorityUnverified,
+};
+
+struct RefCleanupVerdict
+{
+    RefCleanupLicence licence;
+    /// The catalog read for this verdict has another etag than the fold's cut.
+    bool catalog_etag_differs;
 };
 }
 
 void Gc::cleanupRefObjects(
     const FoldResult & folded, const GcLease & adopted_lease, bool suppress_destructive,
-    GcRoundWorkBudget & work_budget)
+    GcRoundWorkBudget & work_budget, RefCleanupPassStats & stats)
 {
+    stats = RefCleanupPassStats{};
+
     /// A clamp / ref-folding abort this round may leave landed-before-cut edges unfolded behind the clamp,
     /// so a covered-log cleanup could delete a log whose delta is not yet durable -- defer to a clean pass.
     if (suppress_destructive)
@@ -3950,14 +3977,17 @@ void Gc::cleanupRefObjects(
         /// this namespace's own row and life plus the GC lease, re-read immediately before the chunk. The
         /// unit of licence is one chunk of write-once keys: a `_log` or `_snap` key is published once at a
         /// life-qualified key and never rewritten, so there is nothing to HEAD, and the plan below is
-        /// derived from durable state a successor leader derives too. The catalog etag decides nothing:
-        /// churn on other namespaces' rows does not touch this life's keys. The catalog is read before
-        /// `gc/state`, back to back.
-        const auto licenceForChunk = [&](const String & first_key) -> RefCleanupLicence
+        /// derived from durable state a successor leader derives too. The catalog etag decides nothing; it
+        /// is only compared for `CASRefCleanupChunksUnderCatalogChange`. An ambiguous catalog still stops
+        /// the pass, whichever rows alias. Churn on other namespaces' rows does not touch this life's keys.
+        /// `gc/state` is read last, so the lease check is the observation nearest the delete.
+        bool catalog_etag_differs = false;
+        const auto licenceForChunk = [&](const String & first_key) -> RefCleanupVerdict
         {
             try
             {
                 const CasRefCatalog::Snapshot current_catalog = CasRefCatalog::read(op, layout);
+                catalog_etag_differs = current_catalog.etag != folded.catalog_cut->etag;
                 current_catalog.life_index.throwIfAmbiguous("CAS GC ref cleanup revalidation");
                 const auto current_entry_it = std::lower_bound(
                     current_catalog.catalog.entries.begin(), current_catalog.catalog.entries.end(), ns,
@@ -3971,7 +4001,7 @@ void Gc::cleanupRefObjects(
                     LOG_DEBUG(logger,
                         "CAS GC ref cleanup skips namespace '{}' from the chunk starting at '{}': its catalog row or life moved",
                         ns_str, first_key);
-                    return RefCleanupLicence::SkipNamespace;
+                    return {RefCleanupLicence::SkipNamespace, catalog_etag_differs};
                 }
 
                 const auto current_state_object = op.read(layout.gcStateKey(), Retry::standard());
@@ -3980,7 +4010,7 @@ void Gc::cleanupRefObjects(
                     LOG_WARNING(logger,
                         "CAS GC ref cleanup stopped before the chunk starting at '{}': mandatory gc/state is absent",
                         first_key);
-                    return RefCleanupLicence::StopLeaseMoved;
+                    return {RefCleanupLicence::StopAuthorityUnverified, catalog_etag_differs};
                 }
                 const GcState current_state = decodeGcState(current_state_object->bytes);
                 if (current_state.lease.owner != adopted_lease.owner
@@ -3988,7 +4018,7 @@ void Gc::cleanupRefObjects(
                 {
                     LOG_DEBUG(logger,
                         "CAS GC ref cleanup stopped before the chunk starting at '{}': GC fence moved", first_key);
-                    return RefCleanupLicence::StopLeaseMoved;
+                    return {RefCleanupLicence::StopLeaseMoved, catalog_etag_differs};
                 }
             }
             catch (const std::exception & e)
@@ -3996,9 +4026,9 @@ void Gc::cleanupRefObjects(
                 LOG_WARNING(logger,
                     "CAS GC ref cleanup stopped before the chunk starting at '{}': authority revalidation failed: {}",
                     first_key, e.what());
-                return RefCleanupLicence::StopAuthorityUnverified;
+                return {RefCleanupLicence::StopAuthorityUnverified, catalog_etag_differs};
             }
-            return RefCleanupLicence::Delete;
+            return {RefCleanupLicence::Delete, catalog_etag_differs};
         };
 
         const auto row_it = folded.fold_seal.ref_lives.find(entry_it->incarnation);
@@ -4043,6 +4073,8 @@ void Gc::cleanupRefObjects(
             chassert(snap_id < checkpoint_snapshot_id);
             cohort.push_back(layout.writeOnceRefSnapshotKey(life, snap_id));
         }
+        stats.objects_planned += cohort.size();
+        ProfileEvents::increment(ProfileEvents::CASRefCleanupObjectsPlanned, cohort.size());
 
         const size_t chunk_keys = std::clamp<size_t>(store->poolConfig().gc_bulk_delete_chunk_keys, 1, kBulkDeleteMaxKeys);
         const size_t request_keys = bulkDeleteChunkKeys();
@@ -4057,17 +4089,37 @@ void Gc::cleanupRefObjects(
             if (work_budget.max_ref_cleanup_objects != 0)
                 end = std::min(end, begin + (work_budget.max_ref_cleanup_objects - work_budget.ref_cleanup_objects_used));
             std::vector<WriteOnceKey> chunk(cohort.begin() + begin, cohort.begin() + end);
-            const RefCleanupLicence licence = licenceForChunk(chunk.front().str());
-            if (licence == RefCleanupLicence::SkipNamespace)
+            const RefCleanupVerdict verdict = licenceForChunk(chunk.front().str());
+            if (verdict.licence == RefCleanupLicence::SkipNamespace)
+            {
+                ++stats.namespaces_skipped;
+                ProfileEvents::increment(ProfileEvents::CASRefCleanupNamespacesSkipped);
                 break;
-            if (licence != RefCleanupLicence::Delete)
+            }
+            if (verdict.licence == RefCleanupLicence::StopLeaseMoved)
+            {
+                stats.stopped_lease_moved = true;
+                ProfileEvents::increment(ProfileEvents::CASRefCleanupStoppedLeaseMoved);
                 return;
+            }
+            if (verdict.licence == RefCleanupLicence::StopAuthorityUnverified)
+            {
+                stats.stopped_authority_unverified = true;
+                ProfileEvents::increment(ProfileEvents::CASRefCleanupStoppedAuthorityUnverified);
+                return;
+            }
             /// A backend without `DeleteObjects` (GCS) falls back to one admitted delete per key here.
             /// The budget and the profile event below count OBJECTS in `chunk`, which is the same
             /// `chunk.size()` whichever way `removeChunkWriteOnceOrOneByOne` actually sent them.
             removeCohortWriteOnce(op, chunk, request_keys, Retry::standard());
             work_budget.ref_cleanup_objects_used += chunk.size();
             ProfileEvents::increment(ProfileEvents::CASRefCleanupObjectsDeleted, chunk.size());   /// cleanup object deletion
+            stats.objects_deleted += chunk.size();
+            if (verdict.catalog_etag_differs)
+            {
+                ++stats.chunks_under_catalog_change;
+                ProfileEvents::increment(ProfileEvents::CASRefCleanupChunksUnderCatalogChange);
+            }
             /// Advance by what was actually sent, not the nominal chunk size: the budget cap above can
             /// truncate a chunk short of `chunk_keys`, and advancing by the full stride would skip the
             /// untried remainder instead of retrying it next iteration.
