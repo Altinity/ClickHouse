@@ -41,6 +41,10 @@ public:
     void load();
 
 private:
+    /// Pins the source parts of PENDING tasks. Called once the Outdated parts are loaded after startup,
+    /// because source parts merged away before a restart are not in memory before that.
+    void restorePartReferences();
+
     StorageMergeTree & storage;
 
     struct TaskEntry

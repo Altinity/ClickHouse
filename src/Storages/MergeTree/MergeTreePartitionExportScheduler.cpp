@@ -288,6 +288,19 @@ bool MergeTreePartitionExportScheduler::enforceTimeouts()
 
 bool MergeTreePartitionExportScheduler::run()
 {
+    /// Must come before `enforceTimeouts`, which returns false when nothing is pending: the removal
+    /// of Outdated parts blocked in `StorageMergeTree::startup` has to be unblocked in any case.
+    /// Exporting or committing before the Outdated parts are loaded would also fail on source parts
+    /// that are still on disk but not in memory yet.
+    if (!storage.isOutdatedPartsRemovalAllowed())
+    {
+        if (!storage.areOutdatedPartsLoaded())
+            return true;
+
+        restorePartReferences();
+        storage.setOutdatedPartsRemovalAllowed(true);
+    }
+
     /// Timeouts first, before the "cannot make progress this tick" early returns, so a wedged
     /// task (no move executors, memory pressure, ...) still expires.
     if (!enforceTimeouts())
@@ -754,20 +767,6 @@ void MergeTreePartitionExportScheduler::load()
             const auto key_description = describeKey(descriptor);
 
             TaskEntry entry;
-
-            /// Re-pin every source part of a resumable task, including already-exported ones.
-            /// Unfinished parts still need to be read; Iceberg commit also derives partition
-            /// values from the original parts, so they must survive until COMPLETED/FAILED/KILLED.
-            if (descriptor.status == MergeTreePartitionExportTask::Status::PENDING)
-            {
-                for (const auto & part : descriptor.parts)
-                {
-                    if (auto data_part = storage.getPartIfExists(
-                            part.part_name, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated}))
-                        entry.part_references.push_back(data_part);
-                }
-            }
-
             entry.setDescriptor(std::move(descriptor));
 
             /// The file name is a pure function of the composite key, so this code can never write
@@ -788,6 +787,31 @@ void MergeTreePartitionExportScheduler::load()
             tryLogCurrentException(storage.log, "Failed to load partition export descriptor " + file_name);
         }
     }
+}
+
+void MergeTreePartitionExportScheduler::restorePartReferences()
+{
+    std::lock_guard lock(mutex);
+
+    for (auto & [_, entry] : tasks)
+    {
+        const auto & descriptor = entry.getDescriptor();
+        if (descriptor.status != MergeTreePartitionExportTask::Status::PENDING)
+            continue;
+
+        /// Re-pin every source part of a resumable task, including already-exported ones.
+        /// Unfinished parts still need to be read; Iceberg commit also derives partition
+        /// values from the original parts, so they must survive until COMPLETED/FAILED/KILLED.
+        entry.part_references.clear();
+        for (const auto & part : descriptor.parts)
+        {
+            if (auto data_part = storage.getPartIfExists(
+                    part.part_name, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated}))
+                entry.part_references.push_back(data_part);
+        }
+    }
+
+    LOG_INFO(storage.log, "ExportPartition: re-pinned the source parts of pending export tasks");
 }
 
 }

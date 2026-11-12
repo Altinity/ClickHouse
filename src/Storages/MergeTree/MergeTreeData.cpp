@@ -4164,6 +4164,9 @@ MergeTreeData::DataPartsVector MergeTreeData::grabOldParts(bool force)
 {
     DataPartsVector res;
 
+    if (!outdated_parts_removal_allowed.load())
+        return res;
+
     /// If the method is already called from another thread, then we don't need to do anything.
     std::unique_lock lock(grab_old_parts_mutex, std::defer_lock);
     if (!lock.try_lock())

@@ -4786,9 +4786,19 @@ void StorageReplicatedMergeTree::mutationsFinalizingTask()
 void StorageReplicatedMergeTree::exportMergeTreePartitionUpdatingTask()
 {
     auto component_guard = Coordination::setCurrentComponent("StorageReplicatedMergeTree::exportMergeTreePartitionUpdatingTask");
+
+    /// `poll` pins the source parts of the tasks it discovers, so the first one must wait until the
+    /// Outdated parts are loaded: source parts merged away before a restart are not in memory before that.
+    if (!areOutdatedPartsLoaded())
+    {
+        export_merge_tree_partition_updating_task->scheduleAfter(1000);
+        return;
+    }
+
     try
     {
         export_merge_tree_partition_manifest_updater->poll();
+        setOutdatedPartsRemovalAllowed(true);
     }
     catch (const Coordination::Exception & e)
     {
@@ -6104,6 +6114,13 @@ void StorageReplicatedMergeTree::startup()
 {
     LOG_TRACE(log, "Starting up table");
     auto component_guard = Coordination::setCurrentComponent("StorageReplicatedMergeTree::startup");
+
+    /// Source parts of pending partition exports that were merged away before the restart are Outdated
+    /// parts that are loaded asynchronously. No Outdated part may be removed until the export updating
+    /// task has re-pinned them, see `exportMergeTreePartitionUpdatingTask`.
+    if (getContext()->getServerSettings()[ServerSetting::allow_experimental_export_merge_tree_partition] && !isStaticStorage())
+        setOutdatedPartsRemovalAllowed(false);
+
     startOutdatedAndUnexpectedDataPartsLoadingTask();
     startStatisticsCache();
     if (attach_thread)

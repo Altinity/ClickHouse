@@ -315,10 +315,13 @@ void StorageMergeTree::startup()
 
     try
     {
-        /// Reload persisted partition-export tasks (and re-pin their parts) before background merges
-        /// can start removing parts, then activate the scheduler task so PENDING tasks resume.
+        /// Reload persisted partition-export tasks, then activate the scheduler task so PENDING tasks resume.
+        /// Source parts merged away before the restart are Outdated parts that are loaded asynchronously,
+        /// so they can only be re-pinned by the scheduler once loading finishes. Until then no Outdated
+        /// part may be removed.
         if (partition_export_scheduler)
         {
+            setOutdatedPartsRemovalAllowed(false);
             partition_export_scheduler->load();
             partition_export_task->activateAndSchedule();
         }

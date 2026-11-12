@@ -1559,6 +1559,11 @@ public:
 
     void waitForOutdatedPartsToBeLoaded() const;
     void waitForUnexpectedPartsToBeLoaded() const;
+    bool areOutdatedPartsLoaded() const { return outdated_data_parts_loading_finished.load(); }
+
+    void setOutdatedPartsRemovalAllowed(bool allowed) { outdated_parts_removal_allowed.store(allowed); }
+    bool isOutdatedPartsRemovalAllowed() const { return outdated_parts_removal_allowed.load(); }
+
     bool canUsePolymorphicParts() const;
 
     void triggerBackgroundOperations();
@@ -2116,6 +2121,10 @@ protected:
     /// it is automatically finished.
     std::atomic_bool outdated_data_parts_loading_finished = true;
     std::atomic_bool unexpected_data_parts_loading_finished = true;
+
+    /// While false, `grabOldParts` removes nothing. Partition export clears it on startup and sets it
+    /// back after re-pinning its source parts, which is only possible once Outdated parts are loaded.
+    std::atomic_bool outdated_parts_removal_allowed = true;
 
     void loadOutdatedDataParts(bool is_async);
     void startOutdatedAndUnexpectedDataPartsLoadingTask();
