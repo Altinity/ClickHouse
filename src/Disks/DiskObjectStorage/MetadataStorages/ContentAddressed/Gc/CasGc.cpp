@@ -2782,9 +2782,9 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         /// The hold sits at the position the walk WOULD have read, which is canonical by construction.
         /// A namespace with no such position is a never-folded one whose listing shows no log -- the
         /// `_ckpt`-only "phantom table" `parseRefCkptKey` deliberately admits is exactly this shape --
-        /// and there is no walk to stop; the anomaly alone carries it, because the other consumer is
-        /// `cleanupRefObjects`, whose boundaries an ABSENT checkpoint WIDENS, and only the round's
-        /// destructive gate keeps the snapshot this unreadable object names from being deleted.
+        /// and there is no walk to stop; the anomaly alone carries it. The other consumer,
+        /// `cleanupRefObjects`, does not run this round: the hold or anomaly recorded here sets
+        /// `suppress_destructive`.
         if (!grounding)
         {
             LOG_WARNING(logger,
@@ -3901,6 +3901,21 @@ void Gc::reportSweepRetention(const ManifestSweepResult & result)
     retain_rollup_passes_since_report = 0;
 }
 
+namespace
+{
+/// What the pre-chunk revalidation of `Gc::cleanupRefObjects` allows for the next chunk.
+enum class RefCleanupLicence : uint8_t
+{
+    Delete,
+    /// The namespace's own row or life changed; its plan is stale, other namespaces are unaffected.
+    SkipNamespace,
+    /// The GC lease moved: no namespace may delete any more this pass.
+    StopLeaseMoved,
+    /// A mandatory read failed or the catalog is ambiguous: nothing can be verified this pass.
+    StopAuthorityUnverified,
+};
+}
+
 void Gc::cleanupRefObjects(
     const FoldResult & folded, const GcLease & adopted_lease, bool suppress_destructive,
     GcRoundWorkBudget & work_budget)
@@ -3931,15 +3946,14 @@ void Gc::cleanupRefObjects(
         const CatalogEntry & observed_entry = *entry_it;
         const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry_it->ns, entry_it->incarnation);
 
-        /// Current-life ref cleanup is not the dead-life janitor: every irreversible delete is still
-        /// licensed by the SAME complete catalog observation and GC lease that adopted the fold,
-        /// re-read immediately before the deletes it licenses. The unit
-        /// of licence is one chunk of write-once keys: a `_log` or `_snap` key is published once at a
+        /// Current-life ref cleanup is not the dead-life janitor: every irreversible delete is licensed by
+        /// this namespace's own row and life plus the GC lease, re-read immediately before the chunk. The
+        /// unit of licence is one chunk of write-once keys: a `_log` or `_snap` key is published once at a
         /// life-qualified key and never rewritten, so there is nothing to HEAD, and the plan below is
-        /// derived from durable state a successor leader derives too. A moved incarnation, changed
-        /// row/life, missing or unreadable authority object, or changed owner/sequence stops the whole
-        /// cleanup pass; continuing with another chunk would turn a refusal into a fallback.
-        const auto authorityHolds = [&](const String & first_key) -> bool
+        /// derived from durable state a successor leader derives too. The catalog etag decides nothing:
+        /// churn on other namespaces' rows does not touch this life's keys. The catalog is read before
+        /// `gc/state`, back to back.
+        const auto licenceForChunk = [&](const String & first_key) -> RefCleanupLicence
         {
             try
             {
@@ -3950,15 +3964,14 @@ void Gc::cleanupRefObjects(
                     [](const CatalogEntry & entry, const RootNamespace & needle) { return entry.ns < needle; });
                 const std::optional<NamespaceLifeId> current_life
                     = current_catalog.life_index.resolve(life.incarnation);
-                if (current_catalog.etag != folded.catalog_cut->etag
-                    || current_entry_it == current_catalog.catalog.entries.end()
+                if (current_entry_it == current_catalog.catalog.entries.end()
                     || current_entry_it->ns != ns || *current_entry_it != observed_entry
                     || !current_life || *current_life != life)
                 {
                     LOG_DEBUG(logger,
-                        "CAS GC ref cleanup stopped before the chunk starting at '{}': catalog observation/life moved",
-                        first_key);
-                    return false;
+                        "CAS GC ref cleanup skips namespace '{}' from the chunk starting at '{}': its catalog row or life moved",
+                        ns_str, first_key);
+                    return RefCleanupLicence::SkipNamespace;
                 }
 
                 const auto current_state_object = op.read(layout.gcStateKey(), Retry::standard());
@@ -3967,7 +3980,7 @@ void Gc::cleanupRefObjects(
                     LOG_WARNING(logger,
                         "CAS GC ref cleanup stopped before the chunk starting at '{}': mandatory gc/state is absent",
                         first_key);
-                    return false;
+                    return RefCleanupLicence::StopLeaseMoved;
                 }
                 const GcState current_state = decodeGcState(current_state_object->bytes);
                 if (current_state.lease.owner != adopted_lease.owner
@@ -3975,7 +3988,7 @@ void Gc::cleanupRefObjects(
                 {
                     LOG_DEBUG(logger,
                         "CAS GC ref cleanup stopped before the chunk starting at '{}': GC fence moved", first_key);
-                    return false;
+                    return RefCleanupLicence::StopLeaseMoved;
                 }
             }
             catch (const std::exception & e)
@@ -3983,9 +3996,9 @@ void Gc::cleanupRefObjects(
                 LOG_WARNING(logger,
                     "CAS GC ref cleanup stopped before the chunk starting at '{}': authority revalidation failed: {}",
                     first_key, e.what());
-                return false;
+                return RefCleanupLicence::StopAuthorityUnverified;
             }
-            return true;
+            return RefCleanupLicence::Delete;
         };
 
         const auto row_it = folded.fold_seal.ref_lives.find(entry_it->incarnation);
@@ -4044,7 +4057,10 @@ void Gc::cleanupRefObjects(
             if (work_budget.max_ref_cleanup_objects != 0)
                 end = std::min(end, begin + (work_budget.max_ref_cleanup_objects - work_budget.ref_cleanup_objects_used));
             std::vector<WriteOnceKey> chunk(cohort.begin() + begin, cohort.begin() + end);
-            if (!authorityHolds(chunk.front().str()))
+            const RefCleanupLicence licence = licenceForChunk(chunk.front().str());
+            if (licence == RefCleanupLicence::SkipNamespace)
+                break;
+            if (licence != RefCleanupLicence::Delete)
                 return;
             /// A backend without `DeleteObjects` (GCS) falls back to one admitted delete per key here.
             /// The budget and the profile event below count OBJECTS in `chunk`, which is the same

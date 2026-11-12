@@ -128,7 +128,14 @@ public:
         Catalog,
         GcFence,
         CatalogRebirth,
+        /// The two below rewrite the catalog row of the armed target namespace.
+        OwnRowRemoving,
+        OwnRowErased,
+        /// Admits a second row, named `aliasNamespace`, that carries the target's incarnation.
+        AliasingIncarnation,
     };
+
+    static RootNamespace aliasNamespace() { return RootNamespace{"00/zz@cas@"}; }
 
     enum class Timing : uint8_t
     {
@@ -145,18 +152,18 @@ public:
 
     void arm(
         Authority authority_, Timing timing_, const Layout & layout,
-        const String & first_cleanup_key_, const RootNamespace & reborn_ns_)
+        const String & first_cleanup_key_, const RootNamespace & target_ns_)
     {
-        arm(authority_, timing_, layout, first_cleanup_key_, std::optional<RootNamespace>{reborn_ns_});
+        arm(authority_, timing_, layout, first_cleanup_key_, std::optional<RootNamespace>{target_ns_});
     }
 
     /// "Before the first chunk" has no backend-request seam of its own to hang off: `cleanupRefObjects`
     /// issues no `HEAD`, and the chunk's own catalog/`gc/state` reads only happen ONCE, back to back,
     /// immediately before the delete they license -- by the time either is observable from a backend
-    /// override, the chunk's catalog snapshot is already cached in `authorityHolds`'s local, and moving
+    /// override, the chunk's catalog snapshot is already cached in `licenceForChunk`'s local, and moving
     /// the authority no longer changes what THIS chunk decides. The window that must be hit instead is
     /// the round's own hot-scan catalog cut: `Gc::setPostHotScanCatalogReadHookForTest` (`CasGc.h`)
-    /// fires the instant that cut is taken, before the round -- and later `authorityHolds` -- does
+    /// fires the instant that cut is taken, before the round -- and later `licenceForChunk` -- does
     /// anything else with it, so a move landed there is exactly "before the first chunk starts" and the
     /// chunk's later fresh reads observe it.
     ///
@@ -169,9 +176,9 @@ public:
     /// cleanup refused. Instead, the hook only ARMS `armGcFenceMoveOnAuthorityHoldsRevalidationForTest`: the
     /// actual lease bump is deferred to a LATER read of `gc/state`. Not the next one -- namespace
     /// janitor / orphan-sweep bookkeeping between `round_commit` and `cleanupRefObjects` also touches
-    /// the catalog and `gc/state`, just never the two BACK TO BACK the way `authorityHolds` does
+    /// the catalog and `gc/state`, just never the two BACK TO BACK the way `licenceForChunk` does
     /// (catalog, then `gc/state`, nothing in between): that adjacency is the one place in a round only
-    /// `authorityHolds`'s own revalidation produces, so gating on it -- rather than on the catalog key
+    /// `licenceForChunk`'s own revalidation produces, so gating on it -- rather than on the catalog key
     /// alone -- is what actually lands the move inside that SAME call, well after `round_commit`.
     static void moveRefCleanupAuthorityBeforeFirstChunk(Authority authority_, CasOperation & op, const Layout & layout)
     {
@@ -200,7 +207,7 @@ public:
     /// `read` also runs on the GC read-ahead pool's threads (`CasGcReadAhead.cpp` schedules
     /// `CasOperation::read` there; `gc_io_concurrency` defaults to 16), concurrently with the round
     /// thread's own reads -- `catalog_seam_armed` and `last_control_key_read` below are shared mutable
-    /// state a pool thread's read can land between `authorityHolds`'s two reads, so both are read AND
+    /// state a pool thread's read can land between `licenceForChunk`'s two reads, so both are read AND
     /// written only under `seam_mutex`. `last_control_key_read` tracks only the catalog and `gc/state`
     /// keys, never any other key a read-ahead worker fetches: those workers never touch either control
     /// key (they fetch ref-log/manifest bodies), so an unrelated concurrent read can never perturb the
@@ -248,14 +255,14 @@ public:
 private:
     void arm(
         Authority authority_, Timing timing_, const Layout & layout,
-        const String & first_cleanup_key_, std::optional<RootNamespace> reborn_ns_)
+        const String & first_cleanup_key_, std::optional<RootNamespace> target_ns_)
     {
         authority = authority_;
         timing = timing_;
         catalog_key = layout.refCatalogKey();
         gc_state_key = layout.gcStateKey();
         first_cleanup_key = first_cleanup_key_;
-        reborn_ns = std::move(reborn_ns_);
+        target_ns = std::move(target_ns_);
         layout_for_rebirth_seed = &layout;
         armed = true;
     }
@@ -284,11 +291,36 @@ private:
         {
             RefCatalog catalog = decodeRefCatalog(bytes);
             for (CatalogEntry & entry : catalog.entries)
-                if (reborn_ns && entry.ns == *reborn_ns)
+                if (target_ns && entry.ns == *target_ns)
                 {
                     entry.incarnation = entry.incarnation + 1;
                     reborn_incarnation = entry.incarnation;
                 }
+            bytes = encodeRefCatalog(catalog);
+        }
+        if (authority == Authority::OwnRowRemoving || authority == Authority::OwnRowErased
+            || authority == Authority::AliasingIncarnation)
+        {
+            RefCatalog catalog = decodeRefCatalog(bytes);
+            const auto target = std::find_if(catalog.entries.begin(), catalog.entries.end(),
+                [&](const CatalogEntry & entry) { return target_ns && entry.ns == *target_ns; });
+            if (target == catalog.entries.end())
+                throw std::logic_error("test-injected catalog move needs an armed target namespace that has a row");
+            if (authority == Authority::OwnRowRemoving)
+            {
+                target->state = NsState::Removing;
+                target->removal_started_round = 1;
+            }
+            else if (authority == Authority::OwnRowErased)
+                catalog.entries.erase(target);
+            else
+            {
+                catalog.entries.push_back(CatalogEntry{
+                    .ns = aliasNamespace(), .state = NsState::Creating, .incarnation = target->incarnation,
+                    .creator = CreatorFence{.server_root_id = "test", .writer_epoch = 1, .fence_generation = 1}});
+                std::sort(catalog.entries.begin(), catalog.entries.end(),
+                    [](const CatalogEntry & lhs, const CatalogEntry & rhs) { return lhs.ns < rhs.ns; });
+            }
             bytes = encodeRefCatalog(catalog);
         }
         if (!write(key, bytes, got->value, access).has_value())
@@ -298,18 +330,18 @@ private:
         /// earlier and an "unknown incarnation" sweep elsewhere in the SAME round can claim it, since
         /// no catalog entry yet names that incarnation) -- so the "reborn life untouched" assertions
         /// below test something real instead of an empty listing.
-        if (authority == Authority::CatalogRebirth && reborn_ns && reborn_incarnation != 0 && layout_for_rebirth_seed)
+        if (authority == Authority::CatalogRebirth && target_ns && reborn_incarnation != 0 && layout_for_rebirth_seed)
         {
             const Layout & layout = *layout_for_rebirth_seed;
-            const NamespaceLifeId reborn_life = NamespaceLifeId::fromCatalogEntry(*reborn_ns, reborn_incarnation);
+            const NamespaceLifeId reborn_life = NamespaceLifeId::fromCatalogEntry(*target_ns, reborn_incarnation);
             const RefTxnId reborn_log_id{1, 1};
             const RefLogTxn reborn_birth{
-                .ns = reborn_ns->string(), .txn_id = reborn_log_id, .ops = {namespaceBirthOp()},
+                .ns = target_ns->string(), .txn_id = reborn_log_id, .ops = {namespaceBirthOp()},
                 .prev_epoch_seal = std::nullopt};
             if (!write(layout.refLogKey(reborn_life, reborn_log_id),
                     sealObject(FormatId::RefLog, encodeRefLogTxn(reborn_birth)), std::nullopt, access).has_value())
                 throw std::runtime_error("test-injected reborn-life log seed lost its CAS");
-            const RefTableSnapshot reborn_snap = minimalLiveSnapshot(reborn_ns->string(), reborn_log_id);
+            const RefTableSnapshot reborn_snap = minimalLiveSnapshot(target_ns->string(), reborn_log_id);
             if (!write(layout.refSnapshotKey(reborn_life, reborn_log_id),
                     sealObject(FormatId::RefSnapshot, encodeRefTableSnapshot(reborn_snap)), std::nullopt, access).has_value())
                 throw std::runtime_error("test-injected reborn-life snapshot seed lost its CAS");
@@ -319,7 +351,7 @@ private:
             /// old cohort surviving round 2 would then be observing a no-op round, not the plan moving
             /// to the reborn life. `writeRecoverableCkptForRawFixture` resolves its own fresh catalog
             /// read, which already sees the incarnation bump the write just above landed.
-            writeRecoverableCkptForRawFixture(*this, layout, *reborn_ns, RefCkpt{
+            writeRecoverableCkptForRawFixture(*this, layout, *target_ns, RefCkpt{
                 .life_epoch = 1,
                 .committed_through = reborn_log_id,
                 .checkpoint_snapshot_id = reborn_log_id,
@@ -333,7 +365,7 @@ private:
     String catalog_key;
     String gc_state_key;
     String first_cleanup_key;
-    std::optional<RootNamespace> reborn_ns;
+    std::optional<RootNamespace> target_ns;
     const Layout * layout_for_rebirth_seed = nullptr;
     bool armed = false;
     /// Guards both members below: `read` runs concurrently on the GC read-ahead pool's threads, see
@@ -344,7 +376,7 @@ private:
     bool catalog_seam_armed = false;
     /// The most recent CONTROL key (catalog or `gc/state`) read -- every other key a read-ahead
     /// worker reads is ignored, so `read` can recognize the catalog-then-`gc/state` ADJACENCY
-    /// `authorityHolds` alone produces -- see the doc comment above `moveRefCleanupAuthorityBeforeFirstChunk`.
+    /// `licenceForChunk` alone produces -- see the doc comment above `moveRefCleanupAuthorityBeforeFirstChunk`.
     String last_control_key_read;
 };
 
@@ -730,7 +762,7 @@ TEST(CASRefGc, RefObjectCleanupRetainsCheckpointPredecessorSealProof)
     EXPECT_NO_THROW((void)recoverRefTableDetailedFromAuthority(op, layout, *entry, checkpoint->ckpt));
 }
 
-TEST(CASRefGcCleanupAuthority, CatalogTokenMoveBeforeFirstChunkRefusesEveryRefObjectDelete)
+TEST(CASRefGcCleanupAuthority, CatalogTokenMoveBeforeFirstChunkStillDeletesEveryCoveredKey)
 {
     auto backend = std::make_shared<RefCleanupAuthorityRaceBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
@@ -739,8 +771,8 @@ TEST(CASRefGcCleanupAuthority, CatalogTokenMoveBeforeFirstChunkRefusesEveryRefOb
 
     Gc gc(store, kGc);
     /// Lands the move in the exact window between the round's own hot-scan catalog cut (what
-    /// `authorityHolds` later compares `folded.catalog_cut` against) and everything after it -- "the
-    /// catalog moved before the first chunk starts", the case spec §D's test (1) names.
+    /// `licenceForChunk` later reads) and everything after it: the catalog token moved before the first
+    /// chunk starts, with no row changed.
     OperationForTest race_op(*backend);
     bool hook_fired = false;
     gc.setPostHotScanCatalogReadHookForTest([&]
@@ -753,13 +785,13 @@ TEST(CASRefGcCleanupAuthority, CatalogTokenMoveBeforeFirstChunkRefusesEveryRefOb
     ASSERT_TRUE(hook_fired) << "the race hook never fired -- this test proves nothing about the race";
 
     OperationForTest head_op(*backend);
-    EXPECT_TRUE((*head_op).head(keys.first_log_key, Retry::once()).has_value());
-    EXPECT_TRUE((*head_op).head(keys.second_log_key, Retry::once()).has_value());
-    EXPECT_EQ(backend->deleteCount(keys.first_log_key), 0u);
-    EXPECT_EQ(backend->deleteCount(keys.second_log_key), 0u);
+    EXPECT_FALSE((*head_op).head(keys.first_log_key, Retry::once()).has_value());
+    EXPECT_FALSE((*head_op).head(keys.second_log_key, Retry::once()).has_value());
+    EXPECT_EQ(backend->deleteCount(keys.first_log_key), 1u);
+    EXPECT_EQ(backend->deleteCount(keys.second_log_key), 1u);
 }
 
-TEST(CASRefGcCleanupAuthority, CatalogTokenMoveBetweenChunksAllowsFirstAndRefusesSecondDelete)
+TEST(CASRefGcCleanupAuthority, CatalogTokenMoveBetweenChunksAllowsBothChunks)
 {
     auto backend = std::make_shared<RefCleanupAuthorityRaceBackend>();
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
@@ -775,9 +807,9 @@ TEST(CASRefGcCleanupAuthority, CatalogTokenMoveBetweenChunksAllowsFirstAndRefuse
 
     OperationForTest raw_op(*backend);
     EXPECT_FALSE((*raw_op).head(keys.first_log_key, Retry::once()).has_value());
-    EXPECT_TRUE((*raw_op).head(keys.second_log_key, Retry::once()).has_value());
+    EXPECT_FALSE((*raw_op).head(keys.second_log_key, Retry::once()).has_value());
     EXPECT_EQ(backend->deleteCount(keys.first_log_key), 1u);
-    EXPECT_EQ(backend->deleteCount(keys.second_log_key), 0u);
+    EXPECT_EQ(backend->deleteCount(keys.second_log_key), 1u);
 }
 
 TEST(CASRefGcCleanupAuthority, GcFenceMoveBeforeFirstChunkRefusesEveryRefObjectDelete)
@@ -792,7 +824,7 @@ TEST(CASRefGcCleanupAuthority, GcFenceMoveBeforeFirstChunkRefusesEveryRefObjectD
     /// catalog above) would land BEFORE the round's own `round_commit` CAS (phase 13), which still
     /// holds the etag from lease adoption (phase 1) -- that CAS would then lose and the round would
     /// throw before `cleanupRefObjects` (phase 17) ever runs, so "nothing deleted" would hold
-    /// vacuously. Instead, only ARM the seam here: the actual bump happens on `authorityHolds`'s own
+    /// vacuously. Instead, only ARM the seam here: the actual bump happens on `licenceForChunk`'s own
     /// `gc/state` read (phase 17, long after `round_commit` landed) -- see the class doc comment above
     /// `moveRefCleanupAuthorityBeforeFirstChunk`.
     bool hook_fired = false;
@@ -830,6 +862,225 @@ TEST(CASRefGcCleanupAuthority, GcFenceMoveBetweenChunksAllowsFirstAndRefusesSeco
     EXPECT_TRUE((*raw_op).head(keys.second_log_key, Retry::once()).has_value());
     EXPECT_EQ(backend->deleteCount(keys.first_log_key), 1u);
     EXPECT_EQ(backend->deleteCount(keys.second_log_key), 0u);
+}
+
+namespace
+{
+const RootNamespace kNsA{"00/aa@cas@"};
+const RootNamespace kNsB{"00/bb@cas@"};
+
+std::shared_ptr<RefCleanupAuthorityRaceBackend> openChunkOfOneBackend(PoolPtr & store)
+{
+    auto backend = std::make_shared<RefCleanupAuthorityRaceBackend>();
+    store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
+                                           .gc_bulk_delete_chunk_keys = 1, .gc_fold_max_defer_rounds = 0});
+    return backend;
+}
+
+bool present(RefCleanupAuthorityRaceBackend & backend, const String & key)
+{
+    OperationForTest op(backend);
+    return (*op).head(key, Retry::once()).has_value();
+}
+
+CatalogEntry rowOf(RefCleanupAuthorityRaceBackend & backend, const Layout & layout, const RootNamespace & ns)
+{
+    OperationForTest op(backend);
+    const CasRefCatalog::Snapshot snap = CasRefCatalog::read(*op, layout);
+    const auto it = std::find_if(snap.catalog.entries.begin(), snap.catalog.entries.end(),
+        [&](const CatalogEntry & entry) { return entry.ns == ns; });
+    if (it == snap.catalog.entries.end())
+        throw std::logic_error("test namespace has no catalog row");
+    return *it;
+}
+
+const CreatorFence kTestCreator{.server_root_id = "test", .writer_epoch = 1, .fence_generation = 1};
+}
+
+TEST(CASRefGcCleanupAuthority, UnrelatedNamespaceCreatedBetweenCutAndCleanupStillDeletesCoveredKeys)
+{
+    auto backend = std::make_shared<RefCleanupAuthorityRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const Layout & layout = store->layout();
+    const RefCleanupFixture keys = seedTwoCoveredLogs(*backend, layout, kNsA);
+
+    Gc gc(store, kGc);
+    OperationForTest race_op(*backend);
+    bool hook_fired = false;
+    gc.setPostHotScanCatalogReadHookForTest([&]
+    {
+        hook_fired = true;
+        CasRefCatalog::casAdmitEntry(*race_op, layout, 1, CatalogEntry{
+            .ns = RootNamespace{"00/zz@cas@"}, .state = NsState::Creating, .incarnation = UInt128(777),
+            .creator = kTestCreator});
+    });
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    ASSERT_TRUE(hook_fired);
+
+    EXPECT_FALSE(present(*backend, keys.first_log_key));
+    EXPECT_FALSE(present(*backend, keys.second_log_key));
+}
+
+TEST(CASRefGcCleanupAuthority, UnrelatedNamespaceDroppedBetweenCutAndCleanupStillDeletesCoveredKeys)
+{
+    auto backend = std::make_shared<RefCleanupAuthorityRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const Layout & layout = store->layout();
+    const RefCleanupFixture a = seedTwoCoveredLogs(*backend, layout, kNsA);
+    seedTwoCoveredLogs(*backend, layout, kNsB);
+
+    Gc gc(store, kGc);
+    OperationForTest race_op(*backend);
+    bool hook_fired = false;
+    gc.setPostHotScanCatalogReadHookForTest([&]
+    {
+        hook_fired = true;
+        const CasRefCatalog::BeginRemovingOutcome outcome
+            = CasRefCatalog::beginRemoving(*race_op, layout, rowOf(*backend, layout, kNsB), 1);
+        EXPECT_EQ(outcome, CasRefCatalog::BeginRemovingOutcome::Transitioned);
+    });
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    ASSERT_TRUE(hook_fired);
+
+    EXPECT_FALSE(present(*backend, a.first_log_key));
+    EXPECT_FALSE(present(*backend, a.second_log_key));
+}
+
+TEST(CASRefGcCleanupAuthority, UnrelatedNamespaceErasedBetweenCutAndCleanupStillDeletesCoveredKeys)
+{
+    auto backend = std::make_shared<RefCleanupAuthorityRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const Layout & layout = store->layout();
+    const RefCleanupFixture a = seedTwoCoveredLogs(*backend, layout, kNsA);
+    seedTwoCoveredLogs(*backend, layout, kNsB);
+
+    Gc gc(store, kGc);
+    OperationForTest race_op(*backend);
+    bool hook_fired = false;
+    gc.setPostHotScanCatalogReadHookForTest([&]
+    {
+        hook_fired = true;
+        /// `casUpdate` refuses to drop a row, so the erase is a raw replace of the catalog object.
+        const CasRefCatalog::Snapshot snap = CasRefCatalog::read(*race_op, layout);
+        RefCatalog next = snap.catalog;
+        std::erase_if(next.entries, [&](const CatalogEntry & entry) { return entry.ns == kNsB; });
+        (*race_op).replace(layout.refCatalogKey(), encodeRefCatalog(next), *snap.etag, Retry::standard());
+    });
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    ASSERT_TRUE(hook_fired);
+
+    EXPECT_FALSE(present(*backend, a.first_log_key));
+    EXPECT_FALSE(present(*backend, a.second_log_key));
+}
+
+TEST(CASRefGcCleanupAuthority, RecoveryAfterCleanupUnderUnrelatedChurn)
+{
+    auto backend = std::make_shared<RefCleanupAuthorityRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const Layout & layout = store->layout();
+    const RefCleanupFixture keys = seedTwoCoveredLogs(*backend, layout, kNsA);
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(kNsA, rowOf(*backend, layout, kNsA).incarnation);
+
+    OperationForTest op(*backend);
+    const RecoveredRefTable before = recoverRefTableDetailedFromAuthority(
+        *op, layout, rowOf(*backend, layout, kNsA), readCkpt(*op, layout, life)->ckpt);
+
+    Gc gc(store, kGc);
+    gc.setPostHotScanCatalogReadHookForTest([&]
+    {
+        CasRefCatalog::casAdmitEntry(*op, layout, 1, CatalogEntry{
+            .ns = RootNamespace{"00/zz@cas@"}, .state = NsState::Creating, .incarnation = UInt128(777),
+            .creator = kTestCreator});
+    });
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    ASSERT_FALSE(present(*backend, keys.first_log_key));
+    ASSERT_FALSE(present(*backend, keys.second_log_key));
+
+    const std::optional<CkptSample> checkpoint = readCkpt(*op, layout, life);
+    ASSERT_TRUE(checkpoint);
+    EXPECT_NO_THROW((void)readCheckpointSnapshotBase(*op, layout, life, checkpoint->ckpt));
+    std::optional<RecoveredRefTable> after;
+    EXPECT_NO_THROW(after = recoverRefTableDetailedFromAuthority(
+        *op, layout, rowOf(*backend, layout, kNsA), checkpoint->ckpt));
+    ASSERT_TRUE(after);
+    EXPECT_EQ(after->state.getCommitted().size(), before.state.getCommitted().size());
+    EXPECT_EQ(after->state.getGreatestApplied(), before.state.getGreatestApplied());
+}
+
+TEST(CASRefGcCleanupAuthority, OwnRowMoveRefusesOnlyThatNamespace)
+{
+    PoolPtr store;
+    auto backend = openChunkOfOneBackend(store);
+    const Layout & layout = store->layout();
+    const RefCleanupFixture a = seedTwoCoveredLogs(*backend, layout, kNsA);
+    const RefCleanupFixture b = seedTwoCoveredLogs(*backend, layout, kNsB);
+    backend->arm(RefCleanupAuthorityRaceBackend::Authority::OwnRowRemoving,
+                 RefCleanupAuthorityRaceBackend::Timing::DuringChunk, layout, a.first_log_key, kNsA);
+
+    Gc gc(store, kGc);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+
+    EXPECT_FALSE(present(*backend, a.first_log_key)) << "the chunk in flight completes";
+    EXPECT_TRUE(present(*backend, a.second_log_key)) << "the moved row refuses the namespace's next chunk";
+    EXPECT_FALSE(present(*backend, b.first_log_key));
+    EXPECT_FALSE(present(*backend, b.second_log_key));
+}
+
+TEST(CASRefGcCleanupAuthority, OwnRowErasedDuringCleanupSkipsThatNamespace)
+{
+    PoolPtr store;
+    auto backend = openChunkOfOneBackend(store);
+    const Layout & layout = store->layout();
+    const RefCleanupFixture a = seedTwoCoveredLogs(*backend, layout, kNsA);
+    const RefCleanupFixture b = seedTwoCoveredLogs(*backend, layout, kNsB);
+    backend->arm(RefCleanupAuthorityRaceBackend::Authority::OwnRowErased,
+                 RefCleanupAuthorityRaceBackend::Timing::DuringChunk, layout, a.first_log_key, kNsA);
+
+    Gc gc(store, kGc);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+
+    EXPECT_FALSE(present(*backend, a.first_log_key)) << "the chunk in flight completes";
+    EXPECT_TRUE(present(*backend, a.second_log_key));
+    EXPECT_FALSE(present(*backend, b.first_log_key));
+    EXPECT_FALSE(present(*backend, b.second_log_key));
+}
+
+TEST(CASRefGcCleanupAuthority, GcFenceMoveRefusesEveryNamespace)
+{
+    PoolPtr store;
+    auto backend = openChunkOfOneBackend(store);
+    const Layout & layout = store->layout();
+    const RefCleanupFixture a = seedTwoCoveredLogs(*backend, layout, kNsA);
+    const RefCleanupFixture b = seedTwoCoveredLogs(*backend, layout, kNsB);
+    backend->arm(RefCleanupAuthorityRaceBackend::Authority::GcFence,
+                 RefCleanupAuthorityRaceBackend::Timing::DuringChunk, layout, a.first_log_key);
+
+    Gc gc(store, kGc);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+
+    EXPECT_FALSE(present(*backend, a.first_log_key)) << "the chunk in flight completes";
+    EXPECT_TRUE(present(*backend, a.second_log_key));
+    EXPECT_TRUE(present(*backend, b.first_log_key));
+    EXPECT_TRUE(present(*backend, b.second_log_key));
+}
+
+TEST(CASRefGcCleanupAuthority, AliasingIncarnationAdmittedDuringCleanupRefusesThePass)
+{
+    PoolPtr store;
+    auto backend = openChunkOfOneBackend(store);
+    const Layout & layout = store->layout();
+    const RefCleanupFixture a = seedTwoCoveredLogs(*backend, layout, kNsA);
+    const RefCleanupFixture b = seedTwoCoveredLogs(*backend, layout, kNsB);
+    backend->arm(RefCleanupAuthorityRaceBackend::Authority::AliasingIncarnation,
+                 RefCleanupAuthorityRaceBackend::Timing::DuringChunk, layout, a.first_log_key, kNsA);
+
+    Gc gc(store, kGc);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+
+    EXPECT_FALSE(present(*backend, a.first_log_key)) << "the chunk in flight completes";
+    EXPECT_TRUE(present(*backend, a.second_log_key));
+    EXPECT_TRUE(present(*backend, b.first_log_key));
+    EXPECT_TRUE(present(*backend, b.second_log_key));
 }
 
 TEST(CASRefGcCleanupAuthority, LeaseMoveDuringAChunkLetsTheChunkCompleteAndNothingElse)
@@ -1496,7 +1747,7 @@ RefCleanupRun runRefCleanupUnderStorageLimit(size_t storage_limit, uint64_t tabl
 }
 
 /// The storage's batch limit cuts the cleanup cohort into smaller requests, and the extra requests cost
-/// no extra authority reads: `authorityHolds` runs once per cohort, not once per request.
+/// no extra authority reads: `licenceForChunk` runs once per cohort, not once per request.
 TEST(CASRefGc, RefObjectCleanupCutsRequestsToTheStorageLimitWithoutExtraAuthorityReads)
 {
     const RefCleanupRun limited = runRefCleanupUnderStorageLimit(3, 8);
