@@ -182,10 +182,24 @@ RefCatalog casUpdateImpl(
     /// the conflict settled a transport fault. Under a single-attempt policy the first `Conflict` is
     /// the answer, as the engine's own verb answers it.
     const Retry frozen = op.freeze(policy);
+    /// Under `resend_unresolved = false` the engine returns an attempt whose fate is unknown instead of
+    /// resending its bytes, and this loop decides again on a fresh read. Attempt numbering continues,
+    /// so the next write is not a first attempt with the adaptive timeout again.
+    Retry attempt_policy = frozen;
     uint32_t settled_faults = 0;
     for (;;)
     {
-        WriteResult result = op.hotKeys().submit(key, op, frozen, decide);
+        WriteResult result = op.hotKeys().submit(key, op, attempt_policy, decide);
+        if (const auto * unresolved = std::get_if<GaveUp>(&result);
+            unresolved && unresolved->why == GaveUp::Why::Unresolved && unresolved->sent_any
+            && !frozen.resend_unresolved && !frozen.single_attempt)
+        {
+            attempt_policy.attempts_already_sent += unresolved->attempts_sent;
+            auto given_up = op.pauseBeforeRedecide(Retry::backoff(++settled_faults), *unresolved, frozen);
+            if (!given_up)
+                continue;
+            result = std::move(*given_up);
+        }
         if (const auto * conflict = std::get_if<Conflict>(&result); conflict && !frozen.single_attempt)
         {
             op.pause(conflict->any_ambiguous ? Retry::backoff(++settled_faults) : Retry::conflictBackoff());
@@ -284,9 +298,16 @@ std::function<void()> create_namespace_pre_check_hook_for_test;
 /// loop would blindly insert a second row for the same namespace and let `encodeRefCatalog`'s
 /// canonical-order/no-duplicate grammar check abort the process with `LOGICAL_ERROR` for what is, at
 /// this call site only, an ordinary race outcome.
-RefCatalog createNamespaceStep1(
-    CasOperation & op, const Layout & layout, uint64_t gc_shards, const CatalogEntry & entry,
-    const Retry & policy)
+///
+/// Each decision mints a fresh incarnation, and an attempt whose fate is unknown is decided again
+/// rather than resent (`resend_unresolved = false`). The catalog has no revision field: cancelling an
+/// added row restores the old bytes and ETag, so a late copy of a resent row could revive a cancelled
+/// life. This removes resends only; a late first attempt still relies on the store applying one
+/// conditional write at most once. The ETag is restored only when it is content-derived; a minted one
+/// never repeats. Returns the row that landed.
+CatalogEntry createNamespaceStep1(
+    CasOperation & op, const Layout & layout, uint64_t gc_shards, const RootNamespace & ns,
+    const CreatorFence & creator, const Retry & policy)
 {
     /// Moved into a local before invoking, not called on the global directly: a hook that reassigns
     /// `create_namespace_step1_pre_read_hook_for_test` from inside its own body (a test driving a
@@ -300,22 +321,32 @@ RefCatalog createNamespaceStep1(
         hook_to_run();
     }
 
-    const auto mutate = [&entry](const RefCatalog & cur) -> RefCatalog
+    const auto mutate = [&ns, &creator](const RefCatalog & cur) -> RefCatalog
     {
-        if (findEntry(cur, entry.ns) != cur.entries.end())
+        if (findEntry(cur, ns) != cur.entries.end())
             throw CatalogEntryAlreadyPresentMarker{};
+        const CatalogEntry entry{.ns = ns, .state = NsState::Creating,
+                                  .incarnation = mintFreshIncarnation(), .creator = creator};
         RefCatalog next = cur;
         const auto it = std::lower_bound(next.entries.begin(), next.entries.end(), entry,
             [](const CatalogEntry & a, const CatalogEntry & b) { return a.ns.string() < b.ns.string(); });
         next.entries.insert(it, entry);
         return next;
     };
-    return casUpdateImpl(op, layout, mutate,
-        [&entry, gc_shards, &layout](const RefCatalog & c)
+    Retry step1_policy = policy;
+    step1_policy.resend_unresolved = false;
+    const RefCatalog landed = casUpdateImpl(op, layout, mutate,
+        [&ns, gc_shards, &layout](const RefCatalog & c)
         {
-            return checkCatalogAdmission(c, gc_shards, layout, entry.ns);
+            return checkCatalogAdmission(c, gc_shards, layout, ns);
         },
-        policy);
+        step1_policy);
+    const auto row = findEntry(landed, ns);
+    if (row == landed.entries.end())
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CAS ref catalog '{}': namespace '{}' is absent from the catalog its step 1 write landed",
+            layout.refCatalogKey(), ns.string());
+    return *row;
 }
 
 }
@@ -684,8 +715,6 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::createNamespace(
         return NamespaceCreationOutcome::Superseded;
     }
 
-    const CatalogEntry entry{.ns = ns, .state = NsState::Creating,
-                              .incarnation = mintFreshIncarnation(), .creator = creator};
     /// The read above is a snapshot in time, not a lock: a sibling opener of the SAME namespace that
     /// also observed "no entry" can land its own step 1 between that read and this one. `casAdmitEntry`
     /// itself cannot be the backstop for that shape -- it retries its own `Conflict`s by blindly
@@ -693,9 +722,10 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::createNamespace(
     /// `encodeRefCatalog`'s grammar check as an unconditional `LOGICAL_ERROR` abort. `createNamespaceStep1`
     /// is the same admission, but rechecks presence on every read this loop performs (not just the one
     /// above) and reports the race as `Superseded` instead.
+    CatalogEntry entry;
     try
     {
-        createNamespaceStep1(op, layout, gc_shards, entry, policy);   /// step 1
+        entry = createNamespaceStep1(op, layout, gc_shards, ns, creator, policy);   /// step 1
     }
     catch (const CatalogEntryAlreadyPresentMarker &)
     {

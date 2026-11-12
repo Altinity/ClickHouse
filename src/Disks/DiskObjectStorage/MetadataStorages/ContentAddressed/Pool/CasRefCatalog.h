@@ -101,7 +101,8 @@ public:
     /// name that says "admitting". A namespace `entry.ns` already carries an entry is a bug in the
     /// caller (`createNamespace` below owns checking that first) and surfaces as
     /// `encodeRefCatalog`'s own canonical-order/no-duplicate grammar check, inside
-    /// `checkCatalogAdmission`.
+    /// `checkCatalogAdmission`. Used by tests only. It resends the caller's fixed row after an attempt of
+    /// unknown fate, so lifecycle creation goes through `createNamespace`.
     static RefCatalog casAdmitEntry(
         CasOperation & op, const Layout & layout, uint64_t gc_shards, const CatalogEntry & entry);
 
