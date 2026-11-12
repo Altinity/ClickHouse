@@ -8,9 +8,11 @@ on:
     types:
       - completed
     branches:
+      - antalya-26.8
       - antalya-26.6
       - antalya-26.3
       - antalya-25.8
+      - stable-26.8
       - stable-26.3
       - stable-25.8
       - releases/24.8.14
@@ -35,11 +37,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - branch: antalya-26.8
+            workflow: master.yml
           - branch: antalya-26.6
             workflow: master.yml
           - branch: antalya-26.3
             workflow: master.yml
           - branch: antalya-25.8
+            workflow: master.yml
+          - branch: stable-26.8
             workflow: master.yml
           - branch: stable-26.3
             workflow: master.yml
