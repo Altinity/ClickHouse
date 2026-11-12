@@ -97,7 +97,9 @@ class S3:
         client = cls._external_clients.get((bucket, anonymous))
         if client is None:
             client_config = {
-                "max_pool_connections": config.get("download_concurrency", 10)
+                "max_pool_connections": config.get("download_concurrency", 10),
+                # NOTE (strtgbb): the 60s default is too low for large uploads to hetzner s3
+                "read_timeout": 180,
             }
             if anonymous:
                 credentials = {
