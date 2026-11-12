@@ -1441,6 +1441,119 @@ def test_cluster_select(started_cluster):
     assert node2.query(f"SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`", settings={"parallel_replicas_for_cluster_engines": 1, "enable_parallel_replicas": 2, "cluster_for_parallel_replicas": "cluster_simple"}) == 'pablo\n'
 
 
+def test_object_storage_cluster_loads_rest_catalog_table_once(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_object_storage_cluster_{uuid.uuid4().hex}"
+    table_name = f"{test_ref}_table"
+    namespace = f"{test_ref}_namespace"
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(namespace)
+    table = create_table(catalog, namespace, table_name)
+    table.append(pa.Table.from_pylist([generate_record()]))
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+
+    query_id = f"object_storage_cluster_catalog_{uuid.uuid4().hex}"
+    assert (
+        node.query(
+            f"SELECT * FROM {CATALOG_NAME}.`{namespace}.{table_name}` "
+            "SETTINGS object_storage_cluster = 'cluster_simple' FORMAT Null",
+            query_id=query_id,
+        )
+        == ""
+    )
+
+    node.query("SYSTEM FLUSH LOGS system.query_log")
+    assert (
+        node.query(
+            "SELECT ProfileEvents['DataLakeRestCatalogGetTableMetadata'] "
+            "FROM system.query_log "
+            f"WHERE query_id = '{query_id}' AND type = 'QueryFinish' AND is_initial_query"
+        )
+        == "1\n"
+    )
+
+
+def test_object_storage_cluster_join_loads_rest_catalog_table_once(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_object_storage_cluster_join_{uuid.uuid4().hex}"
+    table_name = f"{test_ref}_table"
+    namespace = f"{test_ref}_namespace"
+    memory_table = f"{test_ref}_memory"
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(namespace)
+    table = create_table(catalog, namespace, table_name)
+    table.append(pa.Table.from_pylist([generate_record()]))
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+    node.query(f"CREATE TABLE {memory_table} (symbol String) ENGINE = Memory")
+    node.query(f"INSERT INTO {memory_table} VALUES ('kek')")
+
+    query_id = f"object_storage_cluster_join_catalog_{uuid.uuid4().hex}"
+    assert (
+        node.query(
+            f"SELECT t.symbol FROM {CATALOG_NAME}.`{namespace}.{table_name}` AS t "
+            f"INNER JOIN {memory_table} AS m ON t.symbol = m.symbol "
+            "SETTINGS object_storage_cluster = 'cluster_simple'",
+            query_id=query_id,
+        )
+        == "kek\n"
+    )
+
+    node.query("SYSTEM FLUSH LOGS system.query_log")
+    assert (
+        node.query(
+            "SELECT ProfileEvents['DataLakeRestCatalogGetTableMetadata'] "
+            "FROM system.query_log "
+            f"WHERE query_id = '{query_id}' AND type = 'QueryFinish' AND is_initial_query"
+        )
+        == "1\n"
+    )
+
+
+def test_object_storage_cluster_right_join_loads_rest_catalog_table_once(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_object_storage_cluster_right_join_{uuid.uuid4().hex}"
+    table_name = f"{test_ref}_table"
+    namespace = f"{test_ref}_namespace"
+    memory_table = f"{test_ref}_memory"
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(namespace)
+    table = create_table(catalog, namespace, table_name)
+    table.append(pa.Table.from_pylist([generate_record()]))
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+    node.query(f"CREATE TABLE {memory_table} (symbol String) ENGINE = Memory")
+    node.query(f"INSERT INTO {memory_table} VALUES ('kek')")
+
+    query_id = f"object_storage_cluster_right_join_catalog_{uuid.uuid4().hex}"
+    assert (
+        node.query(
+            f"SELECT t.symbol FROM {memory_table} AS m "
+            f"INNER JOIN {CATALOG_NAME}.`{namespace}.{table_name}` AS t ON m.symbol = t.symbol "
+            "SETTINGS object_storage_cluster = 'cluster_simple'",
+            query_id=query_id,
+        )
+        == "kek\n"
+    )
+
+    node.query("SYSTEM FLUSH LOGS system.query_log")
+    assert (
+        node.query(
+            "SELECT ProfileEvents['DataLakeRestCatalogGetTableMetadata'] "
+            "FROM system.query_log "
+            f"WHERE query_id = '{query_id}' AND type = 'QueryFinish' AND is_initial_query"
+        )
+        == "1\n"
+    )
+
+
 def test_on_cluster_ddl_rejected_for_datalake_catalog(started_cluster):
     node1 = started_cluster.instances["node1"]
     node2 = started_cluster.instances["node2"]
