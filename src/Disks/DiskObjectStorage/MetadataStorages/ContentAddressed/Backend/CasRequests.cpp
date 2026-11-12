@@ -464,6 +464,18 @@ Retry CasOperation::freeze(const Retry & policy) const
     return frozen;
 }
 
+std::optional<WriteResult> CasOperation::pauseBeforeRedecide(uint64_t ms, const GaveUp & unresolved, const Retry & policy)
+{
+    WriteState state;
+    state.attempts_sent = unresolved.attempts_sent;
+    state.sent_any = unresolved.sent_any;
+    state.last_seen = unresolved.last_seen;
+    /// Room for the next decision's two requests: its catalog read and its write.
+    constexpr uint32_t envelopes_for_next_decision = 2;
+    return gatedPause(ms, envelopes_for_next_decision, state, policy.bind(owner.now_ms()), detail::recordReissue,
+                      /*should_sleep=*/true);
+}
+
 bool CasOperation::fits(uint64_t needed_ms, const Retry::Bound & bound) const
 {
     /// Strict at the boundary. A backend with no attempt timeout reserves 0 and full jitter can draw a
@@ -978,7 +990,7 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         bool fuse = false;
         try
         {
-            outcome = owner.withTransportAccess(state.attempts_sent, [&](auto & access)
+            outcome = owner.withTransportAccess(state.attempts_sent + policy.attempts_already_sent, [&](auto & access)
             {
                 return owner.backend->write(key, bytes, expected_value, access);
             });
@@ -1032,7 +1044,7 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
                 ProfileEvents::increment(ProfileEvents::CASRequestConnectFailureHint);
             /// Checked AFTER the hint, so a hinted attempt stays hinted (reissued before its read); a
             /// fuse timeout is reissued after the settle read runs below.
-            fuse = isFirstAttemptFuseTimeout(e, state.attempts_sent);
+            fuse = isFirstAttemptFuseTimeout(e, state.attempts_sent + policy.attempts_already_sent);
             if (fuse && !refresh_owns_reissue)
                 ProfileEvents::increment(ProfileEvents::CASRequestFirstAttemptFuse);
         }
@@ -1074,7 +1086,7 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         /// would meet the same broken condition, so the reissue itself is the cheaper probe: the attempt
         /// stays ambiguous (`any_ambiguous` is set above), and if the reissue meets a refused precondition
         /// the read below settles it.
-        if (connect_hint && !policy.single_attempt)
+        if (connect_hint && !policy.single_attempt && policy.resend_unresolved)
         {
             if (auto given_up = pauseFlat(state, bound))
                 return *given_up;
@@ -1084,8 +1096,9 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         /// Every refused precondition, and every ambiguous attempt that was not reissued on a
         /// connect-failure hint, is settled by ONE exact read, under every policy: a refused
         /// precondition does not say WHO holds the key, and a 404 and a 412 reach here as the same
-        /// answer. A hinted attempt reaches this read only when its reissue meets a refused
-        /// precondition. A refused precondition needs only to know WHAT is there, so a presence-only
+        /// answer. A hinted attempt reaches this read after a reissue that met a refused
+        /// precondition, or at once under a policy that never resends it (`single_attempt`,
+        /// `resend_unresolved = false`). A refused precondition needs only to know WHAT is there, so a presence-only
         /// caller settles it with a HEAD; proving an ambiguous attempt landed needs the bytes, and there
         /// the body read is unavoidable.
         ProfileEvents::increment(ProfileEvents::CASRequestResolveRead);
@@ -1120,7 +1133,7 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         /// all, which proves neither way and leaves this write's ambiguity alive. A reissue is what
         /// settles it, and re-sending the same bytes under the same precondition is safe: it ends at
         /// the store's own answer. A policy with no reissue has to say it settled nothing.
-        if (policy.single_attempt)
+        if (policy.single_attempt || !policy.resend_unresolved)
             return gaveUp(GaveUp::Why::Unresolved, sourceFor(bound), state);
         /// The first attempt met the adaptive first-attempt timeout: a connection-quality answer, not a
         /// store fault. The read above settled nothing new about it, so re-send at once as attempt 2

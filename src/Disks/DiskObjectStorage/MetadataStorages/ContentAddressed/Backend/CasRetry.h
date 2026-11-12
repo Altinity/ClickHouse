@@ -18,6 +18,16 @@ struct Retry
     uint64_t window_ms;
     std::optional<uint64_t> lease_deadline_ms;
     bool single_attempt;
+    /// Physical attempts that earlier submissions of the same logical operation already sent. Only the
+    /// write path's transport attempt number continues from here (so a re-decided write keeps the
+    /// configured, not the adaptive first-attempt, timeouts); result and observer counts stay per call.
+    uint32_t attempts_already_sent = 0;
+    /// False: after a write attempt whose fate is unknown, never send the same bytes again; return
+    /// `GaveUp::Unresolved` so the caller decides new bytes. For namespace-create step 1, whose catalog
+    /// row must differ per attempt. A clean conflict and a credential reissue are unaffected. Read
+    /// paths ignore it. Clear it only in a loop that decides again on a fresh read (`casUpdateImpl`
+    /// with `CasOperation::pauseBeforeRedecide`); any other caller gets a bare `GaveUp::Unresolved`.
+    bool resend_unresolved = true;
     /// An ABSOLUTE bound on the caller's own clock, replacing `window_ms` in `bind`. A hand-written
     /// loop freezes one before it starts (`CasOperation::freeze`) and shares it across every call it
     /// makes, so the loop as a whole ends when that deadline does instead of granting each of its

@@ -292,6 +292,10 @@ public:
     /// so a test that replaces the sleep sees no real time pass in either. For the hand-written loops
     /// that reissue something the engine must not reissue for them.
     void pause(uint64_t ms) { owner.sleep_ms(ms); }
+    /// The pause before a loop re-decides after `unresolved`, gated like the engine's own reissue
+    /// pause. Returns the give-up instead of sleeping when the fence is lost or the pause plus two
+    /// attempt reservations (the re-read and the write) do not fit in `policy`.
+    std::optional<WriteResult> pauseBeforeRedecide(uint64_t ms, const GaveUp & unresolved, const Retry & policy);
     /// The verdict point: is this operation still admitted? For the sites that guard a decision rather
     /// than a request.
     bool admitted() const { return gate(0) == Gate::Ok; }

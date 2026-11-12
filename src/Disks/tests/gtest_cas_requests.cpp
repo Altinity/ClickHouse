@@ -778,6 +778,51 @@ TEST(CASRequests, AmbiguousCreateThatNeverLandedIsReissued)
 
 namespace
 {
+Retry neverResendUnresolved()
+{
+    Retry policy = Retry::standard();
+    policy.resend_unresolved = false;
+    return policy;
+}
+}
+
+TEST(CASRequests, AnUnresolvedWriteIsNotResentWhenThePolicyForbidsIt)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    backend->injectAmbiguousWrite("k");   /// the attempt's outcome is lost and the store is untouched
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+
+    WriteResult result = op.create("k", "v", neverResendUnresolved());
+    const auto * gave_up = std::get_if<GaveUp>(&result);
+    ASSERT_NE(gave_up, nullptr);
+    EXPECT_EQ(gave_up->why, GaveUp::Why::Unresolved);
+    EXPECT_TRUE(gave_up->sent_any);
+    EXPECT_EQ(gave_up->attempts_sent, 1u);
+    EXPECT_EQ(backend->writeCount("k"), 1u);
+    EXPECT_EQ(backend->getTotal(), 1u);   /// the resolve read still runs: it is what proves nothing landed
+    EXPECT_TRUE(clock.sleeps.empty());
+}
+
+TEST(CASRequests, AnUnresolvedWriteThatLandedIsStillCommittedByTheReadWhenThePolicyForbidsResending)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    backend->injectAmbiguousLandedWrite("k");
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+
+    WriteResult result = op.create("k", "v", neverResendUnresolved());
+    const auto * committed = std::get_if<Committed>(&result);
+    ASSERT_NE(committed, nullptr);
+    EXPECT_TRUE(committed->resolved_by_read);
+    EXPECT_EQ(committed->attempts_sent, 1u);
+    EXPECT_EQ(backend->writeCount("k"), 1u);
+}
+
+namespace
+{
 
 /// Each guarded write takes `write_ms` on the injected clock and, while `failing` is positive, throws a
 /// transport timeout after it.
@@ -2148,6 +2193,27 @@ TEST(CASRequests, AnExpiredTokenARefreshFixesIsResentWithoutAResolveRead)
     EXPECT_EQ(clock.sleeps.size(), 1u);
 }
 
+/// A credential answer is given before the store applies anything, so resending it is not resending an
+/// unresolved write, whatever the policy says about those.
+TEST(CASRequests, AnExpiredTokenARefreshFixesIsResentEvenWhenThePolicyForbidsResendingUnresolvedWrites)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    backend->setRefreshCredentialsResult(true);
+    backend->failNextWriteWith("k", s3Error(Aws::S3::S3Errors::INVALID_CLIENT_TOKEN_ID, "ExpiredToken"));
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+
+    WriteResult result = op.create("k", "v", neverResendUnresolved());
+    const auto * committed = std::get_if<Committed>(&result);
+    ASSERT_NE(committed, nullptr);
+    EXPECT_EQ(committed->attempts_sent, 2u);
+    EXPECT_FALSE(committed->resolved_by_read);
+    EXPECT_EQ(backend->writeCount("k"), 2u);
+    EXPECT_EQ(backend->getTotal(), 0u);
+    EXPECT_EQ(backend->refreshCredentialsCalls(), 1u);
+}
+
 TEST(CASRequests, AnExpiredTokenNoRefreshCanFixIsRefusedRatherThanRiddenToTheDeadline)
 {
     FakeClock clock;
@@ -2702,6 +2768,23 @@ TEST(CASRequestsConnectHint, OnceKeepsOneWriteAndOneRead)
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint] - hints_before, 1u);
 }
 
+TEST(CASRequestsConnectHint, NotResentWhenThePolicyForbidsResendingUnresolved)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    backend->failNextWriteWith("k", connectHint());
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+
+    WriteResult result = op.create("k", "v", neverResendUnresolved());
+    const auto * gave_up = std::get_if<GaveUp>(&result);
+    ASSERT_NE(gave_up, nullptr);
+    EXPECT_EQ(gave_up->why, GaveUp::Why::Unresolved);
+    EXPECT_TRUE(gave_up->sent_any);
+    EXPECT_EQ(backend->writeTotal(), 1u) << "a connect-failure hint must not reissue under a no-resend policy";
+    EXPECT_TRUE(clock.sleeps.empty());
+}
+
 TEST(CASRequestsConnectHint, EarlierAmbiguityStillSettlesByRead)
 {
     FakeClock clock;
@@ -3025,6 +3108,28 @@ TEST(CASRequestsFuse, FirstAttemptTimeoutReissuesWithoutSleep)
         EXPECT_EQ(std::get<Committed>(result).attempts_sent, 3u);
         EXPECT_EQ(clock.sleeps.size(), 1u);
     }
+}
+
+/// The adaptive first-attempt timeout belongs to the call's first physical attempt only. A re-decided
+/// write continues the attempt numbering, so the same text there is an ordinary failure: settled by a
+/// read and reissued after a pause.
+TEST(CASRequestsFuse, AFirstTimeoutOfAContinuedAttemptSequenceIsNotAFuse)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    backend->failNextWriteWith("k", fuseTimeout());
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    Retry policy = Retry::standard();
+    policy.attempts_already_sent = 1;
+    const auto fuses_before = ProfileEvents::global_counters[ProfileEvents::CASRequestFirstAttemptFuse];
+
+    WriteResult result = op.create("k", "v", policy);
+    const auto * committed = std::get_if<Committed>(&result);
+    ASSERT_NE(committed, nullptr);
+    EXPECT_EQ(committed->attempts_sent, 2u);
+    EXPECT_EQ(clock.sleeps.size(), 1u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestFirstAttemptFuse] - fuses_before, 0u);
 }
 
 TEST(CASRequestsFuse, GatesRefuseTheZeroPauseReissue)
