@@ -4044,7 +4044,7 @@ void Gc::cleanupRefObjects(
                 return;
             size_t end = std::min(cohort.size(), begin + chunk_keys);
             if (work_budget.max_ref_cleanup_objects != 0)
-                end = std::min(end, begin + (work_budget.max_ref_cleanup_objects - work_budget.ref_cleanup_objects_used));
+                end = std::min<size_t>(end, begin + (work_budget.max_ref_cleanup_objects - work_budget.ref_cleanup_objects_used));
             std::vector<WriteOnceKey> chunk(cohort.begin() + begin, cohort.begin() + end);
             if (!authorityHolds(chunk.front().str()))
                 return;
