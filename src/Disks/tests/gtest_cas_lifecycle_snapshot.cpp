@@ -7,6 +7,7 @@
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
 
+#include <chrono>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -234,4 +235,55 @@ TEST(CASLifecycleSnapshot, NaturalIdentityLostMatchesThrowDetail)
     EXPECT_NE(thrown.find(snap.detail), std::string::npos)
         << "snapshot detail and the typed error must not drift\n  detail: " << snap.detail
         << "\n  thrown: " << thrown;
+}
+
+/// An expired lease while the lifecycle stays `Live`: `not_live` / `lease_expired`, `since` is before the
+/// deadline, and a deadline back in the future returns the row to `live`.
+TEST(CASLifecycleSnapshot, ExpiredLeaseIsNotLiveUntilRestored)
+{
+    auto storage = openSnapshotStorage();
+    commitOnePart(*storage);
+    auto pool = storage->store();
+    const auto wall_now_s = []
+    {
+        return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    };
+
+    pool->setMountDeadline(pool->bootMsNow() - 5'000);
+    const CasLifecycleSnapshot expired = storage->lifecycleSnapshot();
+    const int64_t after_s = wall_now_s();
+
+    EXPECT_EQ(expired.lifecycle, "not_live");
+    EXPECT_EQ(expired.reason, "lease_expired");
+    EXPECT_GT(static_cast<int64_t>(expired.since), 0);
+    EXPECT_LE(static_cast<int64_t>(expired.since), after_s - 4);
+    EXPECT_EQ(pool->lifecycle(), PoolLifecycle::Live) << "the lifecycle enum is not touched";
+
+    pool->setMountDeadline(pool->bootMsNow() + 60'000);
+    const CasLifecycleSnapshot restored = storage->lifecycleSnapshot();
+    EXPECT_EQ(restored.lifecycle, "live");
+    EXPECT_TRUE(restored.reason.empty()) << restored.reason;
+    EXPECT_EQ(restored.since, 0);
+}
+
+/// The row is `not_live` from the moment the lease has too little time left to admit a write, before the
+/// deadline itself, and `since` moves with the deadline.
+TEST(CASLifecycleSnapshot, NotLiveOnceTheLeaseCannotAdmitAWrite)
+{
+    auto storage = openSnapshotStorage();
+    commitOnePart(*storage);
+    auto pool = storage->store();
+
+    pool->setMountDeadline(pool->bootMsNow() + 3'000);
+    const CasLifecycleSnapshot closing = storage->lifecycleSnapshot();
+    EXPECT_TRUE(pool->mayMutate()) << "the deadline has not passed";
+    EXPECT_EQ(closing.lifecycle, "not_live");
+    EXPECT_EQ(closing.reason, "lease_expired");
+
+    pool->setMountDeadline(pool->bootMsNow() - 5'000);
+    const CasLifecycleSnapshot expired = storage->lifecycleSnapshot();
+    const int64_t moved_s = static_cast<int64_t>(closing.since) - static_cast<int64_t>(expired.since);
+    EXPECT_GE(moved_s, 7);
+    EXPECT_LE(moved_s, 9);
 }

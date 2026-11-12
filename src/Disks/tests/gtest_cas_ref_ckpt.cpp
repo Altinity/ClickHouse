@@ -771,8 +771,22 @@ TEST(CASRefCheckpoint, AnExhaustedDeadlineUnderPersistentConflictThrowsRetryLate
     };
 
     const RefCkpt advance{.life_epoch = std::nullopt, .committed_through = ID_1_2, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = std::nullopt};
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { publishCkpt(op, layout, life, advance); });
+    String message;
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+    {
+        try
+        {
+            publishCkpt(op, layout, life, advance);
+        }
+        catch (const DB::Exception & e)
+        {
+            message = e.message();
+            throw;
+        }
+    });
     backend->after_read = nullptr;
+    EXPECT_NE(message.find("policy deadline"), String::npos) << message;
+    EXPECT_EQ(message.find("contention"), String::npos) << message;
     EXPECT_FALSE(clock.sleeps.empty()) << "the loop must back off between attempts, not spin";
     EXPECT_EQ(readCkptOrFail(setup, layout, life), base) << "no partial state: every attempt either "
                                                             "committed the complete merged body or wrote nothing";
