@@ -1234,8 +1234,10 @@ private:
     /// this is only the place that assembles the deadline from the ledger's own injectable boot clock
     /// and CAS budget; the algorithm itself is `publishCkpt`, shared verbatim with every other writer.
     ///
-    /// THREE call sites (corrected here from "two": `runRecoveryWalkOnce`'s own sealer contribution
-    /// below is a third and was missing from this count), and they contribute DISJOINT fields:
+    /// Six call sites. `life_epoch` comes only from the birth chunk and `checkpoint_snapshot_id` only from the
+    /// snapshot publisher; every frontier publisher contributes `committed_through`. `last_epoch_seal` comes
+    /// from the recovery walk, wedge resolution and the append chunk's commit contribution. The sites that
+    /// contribute the other fields:
     ///   - `commitRefChunk`'s namespace-birth transaction contributes `life_epoch` -- it is the only
     ///     writer that knows it (this transaction's own writer epoch), and spec §3 has the `_ckpt`
     ///     created before the namespace becomes Live. The contribution is no longer built at the call
@@ -1243,12 +1245,13 @@ private:
     ///     `commitRefChunk` passes that prepared value here. The split is deliberate -- DECIDING the
     ///     contribution is pure preparation, while THIS call is a birth chunk's first durable effect, so
     ///     the publish had to stay behind when preparation moved out;
-    ///   - `tryPublishSnapshotAndAdvanceCheckpointOnce` contributes `checkpoint_snapshot_id` once the
-    ///     snapshot body is durable, and contributes NOTHING about `life_epoch` (an absence, which the semantic-max
-    ///     merge leaves alone) because the publisher does not know it and must never guess;
+    ///   - `tryPublishSnapshotAndAdvanceCheckpointOnce` contributes `checkpoint_snapshot_id` (and the
+    ///     same id as `committed_through`) once the snapshot body is durable, and contributes NOTHING
+    ///     about `life_epoch` (an absence, which the semantic-max merge leaves alone) because the
+    ///     publisher does not know it and must never guess;
     ///   - `runRecoveryWalkOnce` contributes `last_epoch_seal` once its own CAS-walk minted or adopted
-    ///     one -- it is the only writer that mints seals, so it is the only writer that can record
-    ///     where the chain now ends.
+    ///     one. It is the only writer that mints or adopts a seal. Wedge resolution and the append
+    ///     chunk's commit contribution carry the chain link they already hold and never mint one.
     CkptPublishOutcome publishCkptContribution(CasOperation & op, const NamespaceLifeId & life,
                                                const RefCkpt & contribution);
 

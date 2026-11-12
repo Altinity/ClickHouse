@@ -646,6 +646,7 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::completeCreation(
                                 .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
     if (!ckptContributionRecorded(publishCkpt(op, layout, NamespaceLifeId::fromCatalogEntry(observed.ns, observed.incarnation),
                                               contribution, policy)))
+        /// This contribution has no `committed_through`, so no frontier refusal applies; only `FencedOut` lands here.
         return NamespaceCreationOutcome::FencedOut;
 
     /// Step 3. `mutate` is the fence re-check point `casUpdate`'s header doc names -- checked FIRST,

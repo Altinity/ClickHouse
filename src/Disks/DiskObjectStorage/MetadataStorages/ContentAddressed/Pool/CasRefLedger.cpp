@@ -74,6 +74,7 @@ namespace ProfileEvents
     extern const Event CASRefCheckpointPublished;
     extern const Event CASRefCheckpointIdenticalSkip;
     extern const Event CASRefCheckpointNotAdvanced;
+    extern const Event CASRefCheckpointFrontierRefused;
     extern const Event CASRefRecoveryEpochSealed;
     extern const Event CASRefRecoveryEpochSealAdopted;
     extern const Event CASRefRecoveryStragglerAdopted;
@@ -928,8 +929,9 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
         checkRecoveryStillAdmitted(ns, rt, cancelled, token);
         if (!ckptContributionRecorded(publishCkptContribution(op, life, contribution)))
             throwCasWriteRetryLater(fmt::format(
-                "CAS ref-table recovery for namespace '{}': the mount incarnation moved before the "
-                "checkpoint could record recovered txn {}-{}; nothing is installed",
+                "CAS ref-table recovery for namespace '{}': the mount incarnation moved, or a later epoch "
+                "sealed or passed it, before the checkpoint could record recovered txn {}-{}; nothing is "
+                "installed",
                 ns.string(), txn.txn_id.writer_epoch, txn.txn_id.ref_sequence));
 
         /// `publishCkptContribution` correctly merges a concurrent winner, but recovery's private
@@ -2417,8 +2419,10 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
     /// append path, publish its frontier under the SAME admission before the cached table can install
     /// it, return to `Ready`, or wake a surviving caller. This deliberately runs only for `Created` or
     /// byte-identical `Ours`: a successor seal is conclusive evidence that OUR transaction did not land
-    /// and retains the rejection path below without publishing our frontier.
+    /// and retains the rejection path below without publishing our frontier. The publication itself can
+    /// also report that seal, when our create landed in a slot cleanup reclaimed.
     bool same_wedge_before_frontier = false;
+    bool closed_by_successor_seal = occupant == Occupant::SuccessorSeal;
     {
         std::lock_guard lock(rt->state_mutex);
         same_wedge_before_frontier = same_wedge_under_lock();
@@ -2431,6 +2435,18 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
             .checkpoint_snapshot_id = std::nullopt,
             .last_epoch_seal = refLogTxnIsEpochSeal(wedged_txn)
                 ? std::optional<RefTxnId>{wedge.txn_id} : wedged_txn.prev_epoch_seal};
+
+        const auto keep_wedged_for_recovery = [&](std::string_view cause, std::string_view tail, std::string_view recovery_reason)
+        {
+            result.kind = WedgeResolution::StillWedged;
+            result.survivor_error = makeCasWriteRetryLaterExceptionPtr(fmt::format(
+                "CAS ref-log append for namespace '{}': wedged txn {}-{} is durable but was not acknowledged "
+                "({} before checkpoint-frontier publication; the lane needs recovery): {}",
+                ns.string(), wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence, cause, tail));
+            std::lock_guard lock(rt->state_mutex);
+            if (same_wedge_under_lock())
+                requireRecovery(*rt, ns, recovery_reason);
+        };
 
         CkptPublishOutcome frontier_outcome = CkptPublishOutcome::FencedOut;
         try
@@ -2450,18 +2466,21 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
                 requireRecovery(*rt, ns, "wedged-frontier publication");
             return result;
         }
-        if (frontier_outcome == CkptPublishOutcome::FencedOut)
+        if (frontier_outcome == CkptPublishOutcome::SuccessorSeal)
+            closed_by_successor_seal = true;
+        else if (frontier_outcome == CkptPublishOutcome::FencedOut)
         {
-            result.kind = WedgeResolution::StillWedged;
-            result.survivor_error = makeCasWriteRetryLaterExceptionPtr(fmt::format(
-                "CAS ref-log append for namespace '{}': wedged txn {}-{} is durable but was not acknowledged "
-                "(its admitted fence moved before checkpoint-frontier publication; the lane needs "
-                "recovery): {}",
-                ns.string(), wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence, durable_unconfirmed_tail));
-            std::lock_guard lock(rt->state_mutex);
-            if (same_wedge_under_lock())
-                requireRecovery(*rt, ns, "wedged-frontier publication fence");
+            keep_wedged_for_recovery("its admitted fence moved", durable_unconfirmed_tail, "wedged-frontier publication fence");
             return result;
+        }
+        else if (frontier_outcome == CkptPublishOutcome::Superseded)
+        {
+            keep_wedged_for_recovery("a later epoch moved past it", outcome_unknown_tail, "wedged-frontier publication superseded");
+            return result;
+        }
+        else
+        {
+            chassert(ckptContributionRecorded(frontier_outcome));
         }
     }
 
@@ -2495,7 +2514,10 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
         /// because the cost is a comparison and the failure mode is silent data loss.
         const bool same_wedge = same_wedge_under_lock();
 
-        if ((fence_moved || superseded) && same_wedge && exact_attempt_is_durable)
+        /// A record a successor seal closed is below the checkpoint: recovery never installs it, so it
+        /// takes the inert arm below rather than being promised to recovery.
+        const bool installable = exact_attempt_is_durable && !closed_by_successor_seal;
+        if ((fence_moved || superseded) && same_wedge && installable)
         {
             requireRecovery(*rt, ns, "wedged attempt resolved after its fence moved");
             reason = Reason::StaleState;
@@ -2519,12 +2541,14 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
                 ? Reason::RefusedPreAttempt : Reason::ResolveFoundNothing;
             result.kind = WedgeResolution::StillWedged;
         }
-        else if (occupant == Occupant::SuccessorSeal)
+        else if (closed_by_successor_seal)
         {
-            /// THE conclusive rejection (spec INV-2). The ref-log key is write-once and a successor put
-            /// its epoch-closing record there, so our bytes provably never landed and never can. The
-            /// operation was never acknowledged, so nothing is lost by failing it permanently -- and it
-            /// must be permanent, not "retry later": no later attempt in this epoch can ever succeed.
+            /// THE conclusive rejection. Either the ref-log key holds a successor's
+            /// epoch-closing record, so our bytes never landed and never can, or our create landed after
+            /// cleanup reclaimed that seal and `_ckpt` still names the seal at our id, so the bytes are not
+            /// history. The operation was never acknowledged, so nothing is lost by failing it permanently
+            /// -- and it must be permanent, not "retry later": no later attempt in this epoch can ever
+            /// succeed.
             ///
             /// The seal IS this namespace's epoch-closing record, so it is also the `prev_epoch_seal`
             /// that the first transaction of a LATER epoch must name. In this runtime that record is
@@ -2648,10 +2672,11 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
             result.survivor_error = std::make_exception_ptr(Exception(ErrorCodes::INVALID_STATE,
                 "CAS ref-log append for namespace '{}': writer epoch {} was CLOSED by a successor's epoch "
                 "seal at {}-{}, which conclusively rejects the wedged transaction (it was never "
-                "acknowledged): nothing is durable, so a retry cannot duplicate this transaction. This mount's "
+                "acknowledged): {}, so a retry cannot duplicate this transaction. This mount's "
                 "append lane resumes only under a later epoch",
                 ns.string(), wedge.txn_id.writer_epoch,
-                wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence));
+                wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence,
+                exact_attempt_is_durable ? "the record is not part of history" : "nothing is durable"));
             break;
         case WedgeResolution::Corrupted:
             on_impossible_interference(wedge.key,
@@ -3677,6 +3702,8 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         {
             if (!ckptContributionRecorded(publishCkptContribution(op, rt->life, *prepared->birth_contribution)))
             {
+                /// This contribution has no `committed_through`, so no frontier refusal applies; only
+                /// `FencedOut` lands here.
                 complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
                     "CAS ref-log append for namespace '{}': the mount fence moved while creating the "
                     "namespace's _ckpt, so the birth transaction was not sent", ns.string())));
@@ -3793,10 +3820,13 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
             id.writer_epoch, id.ref_sequence, ns.string(), cause));
     };
 
-    /// The lane close for a deposed writer: a successor's epoch seal occupies the key this append
-    /// derived, so the append is conclusively rejected and the lane resumes only under a later epoch.
+    /// A successor's epoch seal closed this epoch at the id this append derived, so the append is
+    /// conclusively rejected and the lane resumes only under a later epoch. No fence recheck here,
+    /// unlike the wedge path: the create-conflict arm closes the lane the same way.
     const auto reject_append_at_successor_seal = [&]
     {
+        /// Counted: this writer was deposed, and a lane that keeps landing here is a mount that lost its
+        /// lease and does not know it yet.
         ProfileEvents::increment(ProfileEvents::CASRefAppendSealRejected);
         {
             std::lock_guard lock(rt->state_mutex);
@@ -3911,11 +3941,6 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         }
         if (occupant == Occupant::SuccessorSeal)
         {
-            /// Conclusive rejection, identical in meaning to the wedge site's: our bytes provably never
-            /// landed and never can, the operation was never acknowledged, and the seal IS this
-            /// namespace's epoch-closing record. No anomaly, no fence -- this is the protocol working.
-            /// Counted anyway: "the protocol working" here means THIS writer was deposed, and a lane that
-            /// keeps landing on this arm is a mount that has lost its lease and does not know it yet.
             reject_append_at_successor_seal();
             return false;
         }
@@ -4045,12 +4070,12 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     {
         /// The log object is durable -- this call's own attempt committed it, or the conflict above
         /// proved an earlier attempt of this exact transaction already had. Either way it is not yet
-        /// admitted to logical history. Publish its exact frontier
-        /// under the SAME admission generation before any local consequence can make a later id
-        /// observable or wake a waiter. `Published` and `IdenticalSkip` both prove the contribution
-        /// durable. `FencedOut`, contention exhaustion, decode failure, or any other unresolved
-        /// publication leaves the log known durable but uninstalled, which is exactly
-        /// `NeedsRecovery`; recovery owns resolution of that window.
+        /// admitted to logical history. Publish its exact frontier under the SAME admission generation
+        /// before any local consequence can make a later id observable or wake a waiter. `Published` and
+        /// `IdenticalSkip` both prove the contribution durable. `SuccessorSeal` conclusively rejects it.
+        /// `FencedOut`, `Superseded`, contention exhaustion, decode failure, or any other unresolved
+        /// publication leaves the log known durable but uninstalled, which is exactly `NeedsRecovery`;
+        /// recovery owns resolution of that window.
         CkptPublishOutcome frontier_outcome = CkptPublishOutcome::FencedOut;
         try
         {
@@ -4066,6 +4091,21 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                 "publishing its checkpoint frontier was not confirmed: " + getCurrentExceptionMessage(false, false, false, false)});
             return false;
         }
+        if (frontier_outcome == CkptPublishOutcome::SuccessorSeal)
+        {
+            reject_append_at_successor_seal();
+            return false;
+        }
+        if (frontier_outcome == CkptPublishOutcome::Superseded)
+        {
+            {
+                std::lock_guard lock(rt->state_mutex);
+                requireRecovery(*rt, ns, "committed-frontier publication superseded");
+            }
+            complete_error(chunk_survivors, outcome_unknown(ErrorCodes::NETWORK_ERROR,
+                "a later epoch moved past it before the frontier was published"));
+            return false;
+        }
         if (frontier_outcome == CkptPublishOutcome::FencedOut)
         {
             {
@@ -4076,6 +4116,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                 "the mount fence moved before the frontier was published"});
             return false;
         }
+        chassert(ckptContributionRecorded(frontier_outcome));
 
         if (carve_hook_for_test)
             carve_hook_for_test(CarvePhaseForTest::PostDurableInstall);
@@ -4493,6 +4534,8 @@ CkptPublishOutcome CasRefLedger::publishCkptContribution(CasOperation & op, cons
         ProfileEvents::increment(ProfileEvents::CASRefCheckpointPublished);
     else if (outcome == CkptPublishOutcome::IdenticalSkip)
         ProfileEvents::increment(ProfileEvents::CASRefCheckpointIdenticalSkip);
+    else if (outcome == CkptPublishOutcome::SuccessorSeal || outcome == CkptPublishOutcome::Superseded)
+        ProfileEvents::increment(ProfileEvents::CASRefCheckpointFrontierRefused);
     return outcome;
 }
 
@@ -4664,6 +4707,8 @@ bool CasRefLedger::tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntimeImpl(
         snapshot_before_ckpt_cas_hook_for_test();
     try
     {
+        /// A snapshot contribution carries a non-seal frontier, so a zombie publisher can also get
+        /// `SuccessorSeal` or `Superseded`; neither advanced the checkpoint.
         ckpt_advanced = ckptContributionRecorded(publishCkptContribution(op, rt->life,
                                                 RefCkpt{.life_epoch = std::nullopt,
                                                         .committed_through = candidate_x,

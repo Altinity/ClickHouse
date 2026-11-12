@@ -46,10 +46,10 @@ RecoveryGrounding chooseRecoveryGrounding(const std::optional<CatalogEntry> & ca
 /// publish protocol remains simple: each write merges one contribution with the one durable body it
 /// just read.
 ///
-/// It is therefore NOT where `life_epoch`'s may-not-decrease rule lives, and that is a placement
-/// decision rather than an omission: a commutative function does not know which of its arguments is the
-/// durable one, so it cannot tell a decrease from an increase. That rule belongs to `publishCkpt`, which
-/// does know.
+/// It is therefore NOT where `life_epoch`'s may-not-decrease rule or the frontier refusals live, and that
+/// is a placement decision rather than an omission: a commutative function does not know which of its
+/// arguments is the durable one, so it cannot tell a decrease from an increase. Those rules belong to
+/// `publishCkpt`, which does know.
 RefCkpt mergeCkpt(const RefCkpt & a, const RefCkpt & b);
 
 /// What one `publishCkpt` call did.
@@ -61,9 +61,16 @@ enum class CkptPublishOutcome : uint8_t
     FencedOut,      /// this actor's admission is gone. Whether its last attempt landed is UNRESOLVED:
                     /// admission can be lost before the write is sent, and equally after the write is
                     /// proven durable. Re-read before assuming either way
+    SuccessorSeal,  /// CONCLUSIVE rejection of a non-seal frontier: a successor sealed this epoch at that
+                    /// id, so the record is not history even if its object exists. No further write
+                    /// follows the refusal. The late record stays below the checkpoint: no reader visits
+                    /// it, and ref cleanup deletes it
+    Superseded,     /// UNRESOLVED: a later epoch moved past this non-seal frontier, and `_ckpt` cannot tell
+                    /// whether the successor adopted it. No write follows the verdict, but an earlier
+                    /// attempt of this call may have landed. Handle like `FencedOut`
 };
 
-/// True when the contribution is durable in `_ckpt`: it was written, or an identical value was already there.
+/// True when the contribution is durable in `_ckpt`: the only outcomes after which a caller may act on it.
 inline bool ckptContributionRecorded(CkptPublishOutcome outcome)
 {
     return outcome == CkptPublishOutcome::Published || outcome == CkptPublishOutcome::IdenticalSkip;
@@ -77,12 +84,21 @@ inline bool ckptContributionRecorded(CkptPublishOutcome outcome)
 /// checkpoint, and the field a different writer knows merges in whenever it arrives, in either order.
 /// That is the whole reason each field is optional rather than defaulted.
 ///
-/// Both DECLINE-TIME verdicts consult `op.admitted()` before they speak, because a writer the fence is
-/// about to refuse has landed nothing AT THAT POINT: it is told `FencedOut` rather than `IdenticalSkip`
+/// The `life_epoch` and identical-body verdicts consult `op.admitted()` before they speak, because a writer
+/// the fence is about to refuse has landed nothing AT THAT POINT: it is told `FencedOut` rather than `IdenticalSkip`
 /// or a corruption verdict. `FencedOut` is returned rather than thrown because it is an expected,
 /// transient control signal, and the snapshot publisher that calls this sits after a durable PUT where
 /// an exception would be worse than a value. It does NOT promise the object is unchanged -- a lost
 /// admission is also reported for a write already proven durable.
+///
+/// A NON-seal frontier contribution (`committed_through` present and not equal to its own
+/// `last_epoch_seal`) is checked against the durable body before the merge, independently of admission,
+/// because the merge accepts a lower-epoch frontier by numeric comparison alone. Only such a
+/// contribution can get these outcomes; one without `committed_through` never does:
+///   - its `committed_through` equals the durable `last_epoch_seal` -> `SuccessorSeal`;
+///   - its epoch is below the durable frontier's, and the durable seal is not in its epoch strictly
+///     above it -> `Superseded`. An id below the seal of its own epoch was adopted by the successor's
+///     walk and still merges.
 ///
 /// FAILS CLOSED, never open:
 ///   - an existing `_ckpt` that does not decode PROPAGATES `CORRUPTED_DATA` and is never overwritten.
@@ -90,8 +106,8 @@ inline bool ckptContributionRecorded(CkptPublishOutcome outcome)
 ///     body derived from `contribution` alone would erase the base while leaving a well-formed object
 ///     behind -- corruption laundered into something a reader would trust.
 ///   - a contribution whose `life_epoch` is BELOW the durable one raises `CORRUPTED_DATA`, decided
-///     before the merge, so no body is built and no write is sent. This is the one refusal that HAS to
-///     live here rather than in `mergeCkpt`: only this function knows which side is durable.
+///     before the merge, so no body is built and no write is sent. This rule and the frontier verdicts
+///     HAVE to live here rather than in `mergeCkpt`: only this function knows which side is durable.
 ///   - exhausting the policy under persistent conflict throws the retry-later class. No partial state
 ///     exists to clean up: every attempt either committed the complete merged body or changed nothing.
 CkptPublishOutcome publishCkpt(CasOperation & op, const Layout & layout, const NamespaceLifeId & life,

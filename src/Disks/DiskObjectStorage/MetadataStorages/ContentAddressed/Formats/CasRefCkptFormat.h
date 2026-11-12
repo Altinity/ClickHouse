@@ -25,8 +25,9 @@ namespace DB::Cas
 ///
 /// TWO writers update it -- the snapshot publisher and the sealer -- and both run the SAME algorithm
 /// (`mergeCkpt` + `publishCkpt` in `Pool/CasRefCkpt.h`): read the whole body, merge by SEMANTIC
-/// MAXIMUM per field, token-CAS. (`publishCkpt` adds one refusal the merge itself cannot express -- a
-/// `life_epoch` BELOW the durable one -- because only the publish site knows which side is durable.)
+/// MAXIMUM per field, token-CAS. (`publishCkpt` adds refusals the merge itself cannot express -- a
+/// `life_epoch` BELOW the durable one, and a frontier a successor sealed or moved past -- because only
+/// the publish site knows which side is durable.)
 /// Writing the whole body is what makes a stale field dangerous, and
 /// the merge is what contains it: a writer that skipped it and wrote back the value it sampled
 /// earlier would silently regress the OTHER writer's progress (TLC counterexample
