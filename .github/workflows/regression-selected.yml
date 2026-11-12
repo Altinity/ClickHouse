@@ -25,9 +25,12 @@ jobs:
     name: select regression
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
     timeout-minutes: 40
+    env:
+      REQUIRE_ARM64: ${{ !contains(fromJson(inputs.workflow_config).workflow_config.custom_data.ci_exclude_tags, 'aarch64') }}
     outputs:
       jobs: ${{ steps.select.outputs.jobs }}
       job_count: ${{ steps.select.outputs.job_count }}
+      arches: ${{ steps.arches.outputs.arches }}
     steps:
       - name: Checkout clickhouse-regression
         uses: actions/checkout@v6
@@ -51,16 +54,24 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
-          REQUIRE_ARM64: ${{ !contains(fromJson(inputs.workflow_config).workflow_config.custom_data.ci_exclude_tags, 'aarch64') }}
         run: python3 .github/scripts/select_pr_regression.py --pr "${{ github.event.pull_request.number }}"
+
+      - name: Choose architectures
+        id: arches
+        run: |
+          if [ "$REQUIRE_ARM64" = "true" ]; then
+            echo 'arches=["x86","arm64"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'arches=["x86"]' >> "$GITHUB_OUTPUT"
+          fi
 
   run:
     needs: select
-    if: ${{ !cancelled() && needs.select.outputs.job_count != '0' && (matrix.arch != 'arm64' || !contains(fromJson(inputs.workflow_config).workflow_config.custom_data.ci_exclude_tags, 'aarch64')) }}
+    if: ${{ !cancelled() && needs.select.outputs.job_count != '0' }}
     strategy:
       fail-fast: false
       matrix:
-        arch: [x86, arm64]
+        arch: ${{ fromJson(needs.select.outputs.arches) }}
         job: ${{ fromJson(needs.select.outputs.jobs) }}
     uses: ./.github/workflows/regression-reusable-suite.yml
     secrets: inherit
