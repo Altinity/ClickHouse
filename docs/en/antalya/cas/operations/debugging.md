@@ -86,7 +86,8 @@ WHERE event_type = 'Finish' AND disk_name = 'cas'
 ORDER BY event_time DESC LIMIT 10;
 ```
 
-A `0`/`false` `is_leader` means this node never reclaims for this disk — check the peer that holds
+A `NULL` `last_success_age_seconds` means this server's GC has not completed a round as leader since it
+started. A `0`/`false` `is_leader` means this node never reclaims for this disk — check the peer that holds
 leadership instead. A steady `entries_condemned` with `entries_graduated` stuck at `0` means objects
 are being found but never crossing the safety floor (recall the grace period is measured in full
 rounds, not acks — see [condemnation and deletion](/antalya/cas/architecture/garbage-collection#condemn-delete)).

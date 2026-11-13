@@ -420,6 +420,29 @@ TEST(CASGCLog, FinishLogLineMatchesCasGcLogRow)
     }
 }
 
+/// A `Deferred` round completed as leader: it counts as a success for health, and like `NotALeader` it
+/// writes no `Information` line. On an empty pool with the default defer bound the first round defers.
+TEST(CASGCLog, ADeferredRoundCountsAsASuccessAndLogsNoFinishLine)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    std::vector<Rec> rows;
+    DB::Cas::CasGcScheduler sched(store, std::chrono::seconds(1), "test::gc", "ca", [&](const Rec & r) { rows.push_back(r); });
+    ASSERT_FALSE(sched.gcHealth().ever_succeeded);
+
+    DB::Cas::tests::ScopedLogCapture capture("test::gc", "information");
+    const RoundReport rep = sched.runOneRoundNow(Rec::Trigger::Manual);
+    ASSERT_TRUE(rep.acquired_lease);
+    ASSERT_TRUE(rep.deferred);
+
+    ASSERT_EQ(rows.back().event_type, Rec::EventType::Finish);
+    EXPECT_EQ(rows.back().outcome, Rec::Outcome::Deferred);
+    EXPECT_EQ(capture.count("GC round finished"), 0u) << capture.captured();
+    const auto health = sched.gcHealth();
+    EXPECT_TRUE(health.ever_succeeded);
+    EXPECT_TRUE(health.is_leader);
+}
+
 TEST(CASGCLog, AnAbortedRoundLogsExactlyOneFinishLine)
 {
     auto backend = std::make_shared<NetworkThrowingBackend>();
