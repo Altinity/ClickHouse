@@ -267,6 +267,11 @@ void CasRefLedger::refuseUnlessAdmitted(const CasOperation & op, std::string_vie
 {
     if (op.admitted())
         return;
+    throwNotAdmitted(what);
+}
+
+void CasRefLedger::throwNotAdmitted(std::string_view what) const
+{
     throwCasTransientUnavailable(
         fmt::format("content-addressed pool '{}'", server_root_id),
         fmt::format("{}: the operation is no longer admitted -- the mount lease has too little time left "
@@ -574,60 +579,119 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::lookupRefTableRunti
     return it == ref_name_slots.end() ? nullptr : it->second.current;
 }
 
-uint64_t CasRefLedger::refNameRetirements(const RootNamespace & ns) const
+CasRefLedger::ColdAdmission::ColdAdmission(
+    CasRefLedger & ledger_, String name_, uint64_t retirements_seen_, uint64_t epoch_) noexcept
+    : ledger(&ledger_)
+    , name(std::move(name_))
+    , retirements_seen(retirements_seen_)
+    , epoch(epoch_)
 {
+}
+
+CasRefLedger::ColdAdmission::ColdAdmission(ColdAdmission && other) noexcept
+    : ledger(std::exchange(other.ledger, nullptr))
+    , name(std::move(other.name))
+    , retirements_seen(other.retirements_seen)
+    , epoch(other.epoch)
+{
+}
+
+CasRefLedger::ColdAdmission::~ColdAdmission()
+{
+    if (!ledger)
+        return;
+    std::lock_guard lock(ledger->ref_queue_mutex);
+    ledger->releaseColdAdmissionLocked(*this);
+}
+
+CasRefLedger::ColdAdmission CasRefLedger::beginColdAdmission(const RootNamespace & ns)
+{
+    String name = ns.string();
     std::lock_guard lock(ref_queue_mutex);
-    const auto it = ref_name_slots.find(ns.string());
-    return it == ref_name_slots.end() ? 0 : it->second.retirements;
+    RefNameSlot & slot = ref_name_slots[name];
+    ++slot.admissions_in_flight;
+    return ColdAdmission(*this, std::move(name), slot.retirements, ref_name_slots_epoch);
+}
+
+void CasRefLedger::releaseColdAdmissionLocked(ColdAdmission & admission)
+{
+    admission.ledger = nullptr;
+    /// A remount cleared the slot this admission counted in; a slot of the same name now belongs to
+    /// admissions captured after the remount.
+    if (admission.epoch != ref_name_slots_epoch)
+        return;
+    const auto it = ref_name_slots.find(admission.name);
+    chassert(it != ref_name_slots.end() && it->second.admissions_in_flight > 0);
+    if (it == ref_name_slots.end())
+        return;
+    --it->second.admissions_in_flight;
+    eraseNameSlotIfUnusedLocked(it);
+}
+
+void CasRefLedger::eraseNameSlotIfUnusedLocked(std::map<String, RefNameSlot>::iterator it)
+{
+    if (!it->second.current && it->second.admissions_in_flight == 0)
+        ref_name_slots.erase(it);
 }
 
 std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireRefTableRuntime(
-    const NamespaceLifeId & life, uint64_t admitted_generation, uint64_t retirements_seen,
-    RuntimeAdmission admission)
+    const NamespaceLifeId & life, uint64_t admitted_generation, ColdAdmission && admission,
+    RuntimeAdmission kind)
 {
+    chassert(admission.ledger == this && admission.name == life.ns.string());
     refuseUnlessAdmitted(mount_requests.resume(admitted_generation), "ref-table runtime install");
 
     std::shared_ptr<RefTableRuntime> result;
     bool generation_moved = false;
+    bool slots_cleared_by_remount = false;
     bool retired_since_observation = false;
     bool identity_conflict = false;
     {
         std::lock_guard lock(ref_queue_mutex);
         generation_moved = fence_generation_fn() != admitted_generation;
-        const auto it = ref_name_slots.find(life.ns.string());
-        /// The catalog row this life came from may have been removed and drained after the caller read
-        /// it; inserting then would publish a runtime for a life the janitor sweeps.
-        retired_since_observation = (it == ref_name_slots.end() ? 0 : it->second.retirements) != retirements_seen;
-        if (!generation_moved && !retired_since_observation)
+        slots_cleared_by_remount = admission.epoch != ref_name_slots_epoch;
+        if (!generation_moved && !slots_cleared_by_remount)
         {
-            if (it != ref_name_slots.end() && it->second.current)
+            const auto it = ref_name_slots.find(life.ns.string());
+            chassert(it != ref_name_slots.end());
+            RefNameSlot & slot = it->second;
+            /// The catalog row this life came from may have been removed and drained after the caller read
+            /// it; inserting then would publish a runtime for a life the janitor sweeps.
+            retired_since_observation = slot.retirements != admission.retirements_seen;
+            if (!retired_since_observation)
             {
-                const auto & current = it->second.current;
-                if (current->life == life
-                    && current->admitted_fence_generation == admitted_generation
-                    && !current->catalog_life_invalidated.load(std::memory_order_acquire)
-                    && !current->superseded_by_remount.load(std::memory_order_acquire))
-                    result = current;
+                if (slot.current)
+                {
+                    const auto & current = slot.current;
+                    if (current->life == life
+                        && current->admitted_fence_generation == admitted_generation
+                        && !current->catalog_life_invalidated.load(std::memory_order_acquire)
+                        && !current->superseded_by_remount.load(std::memory_order_acquire))
+                        result = current;
+                    else
+                        identity_conflict = true;
+                }
                 else
-                    identity_conflict = true;
-            }
-            else
-            {
-                result = std::make_shared<RefTableRuntime>(
-                    next_ref_runtime_id.fetch_add(1, std::memory_order_relaxed) + 1,
-                    life,
-                    admitted_generation);
-                ref_name_slots[life.ns.string()].current = result;
+                {
+                    result = std::make_shared<RefTableRuntime>(
+                        next_ref_runtime_id.fetch_add(1, std::memory_order_relaxed) + 1,
+                        life,
+                        admitted_generation);
+                    slot.current = result;
+                }
             }
         }
+        releaseColdAdmissionLocked(admission);
     }
 
     if (generation_moved)
         refuseUnlessAdmitted(mount_requests.resume(admitted_generation), "ref-table runtime install");
+    if (slots_cleared_by_remount)
+        throwNotAdmitted("ref-table runtime install");
     /// Same retryable class on both planes; a read must not claim a write was attempted.
     const auto refuseStaleObservation = [&](const String & why)
     {
-        if (admission == RuntimeAdmission::Read)
+        if (kind == RuntimeAdmission::Read)
             throwCasTransientUnavailable(fmt::format("CAS namespace '{}'", life.ns.string()), why);
         throwCasWriteRetryLater(fmt::format("CAS namespace '{}': {}", life.ns.string(), why));
     };
@@ -669,7 +733,7 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireReadableRefT
     }
 
     const uint64_t admitted_generation = fence_generation_fn();
-    const uint64_t retirements_seen = refNameRetirements(ns);
+    ColdAdmission admission = beginColdAdmission(ns);
     CasOperation op = mount_requests.resume(admitted_generation);
     const CasRefCatalog::Snapshot first_catalog = CasRefCatalog::read(op, layout);
     refuseUnlessAdmitted(op, "cold readable runtime admission");
@@ -706,7 +770,7 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireReadableRefT
             fmt::format("its catalog row changed while a cold reader observed life {}; "
                         "retry from a fresh catalog observation", renderIncarnation(life.incarnation)));
 
-    return acquireRefTableRuntime(life, admitted_generation, retirements_seen, RuntimeAdmission::Read);
+    return acquireRefTableRuntime(life, admitted_generation, std::move(admission), RuntimeAdmission::Read);
 }
 
 std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireMutableRefTableRuntime(
@@ -714,14 +778,14 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireMutableRefTa
 {
     /// Captured before `namespaceLife`, whose answer may come from a runtime retired right after.
     const uint64_t admitted_generation = fence_generation_fn();
-    const uint64_t retirements_seen = refNameRetirements(ns);
+    ColdAdmission admission = beginColdAdmission(ns);
     const NamespaceLifeId life = namespaceLife(ns);
     if (const auto current = lookupRefTableRuntime(ns))
     {
         if (current->life == life)
             return current;
     }
-    return acquireRefTableRuntime(life, admitted_generation, retirements_seen, RuntimeAdmission::Write);
+    return acquireRefTableRuntime(life, admitted_generation, std::move(admission), RuntimeAdmission::Write);
 }
 
 void CasRefLedger::invalidateRemovedCatalogLife(const NamespaceLifeId & life)
@@ -729,11 +793,14 @@ void CasRefLedger::invalidateRemovedCatalogLife(const NamespaceLifeId & life)
     std::shared_ptr<RefTableRuntime> rt;
     {
         std::lock_guard lock(ref_queue_mutex);
+        /// No slot: no admission of the name is in flight, and a later one reads the catalog after this.
+        const auto it = ref_name_slots.find(life.ns.string());
+        if (it == ref_name_slots.end())
+            return;
         /// Recorded whatever is resident, a successor included: a cold admission of `life` may be
         /// between its catalog read and its insertion, and the successor may be evicted before it.
-        RefNameSlot & slot = ref_name_slots[life.ns.string()];
-        ++slot.retirements;
-        rt = slot.current;
+        ++it->second.retirements;
+        rt = it->second.current;
         if (!rt)
             return;
     }
@@ -755,7 +822,10 @@ void CasRefLedger::invalidateRemovedCatalogLife(const NamespaceLifeId & life)
         std::lock_guard queue_lock(ref_queue_mutex);
         const auto it = ref_name_slots.find(life.ns.string());
         if (it != ref_name_slots.end() && it->second.current == rt)
+        {
             it->second.current.reset();
+            eraseNameSlotIfUnusedLocked(it);
+        }
     }
     rt->cv.notify_all();
     rt->recovery_cv.notify_all();
@@ -1852,8 +1922,7 @@ void CasRefLedger::enforceRefTableCacheBudget(const RootNamespace & keep_ns)
             if (rt->removal_admission_closed || removal_applied)
                 ++it->second.retirements;
             evicted.push_back(std::move(rt));   /// keep alive past the erase and lock release
-            if (it->second.retirements == 0)
-                ref_name_slots.erase(it);
+            eraseNameSlotIfUnusedLocked(it);
             ProfileEvents::increment(ProfileEvents::CASRefTableEvictions);
         }
     }
@@ -1910,6 +1979,7 @@ void CasRefLedger::quiesceRefTablesForRemount()
             detached.push_back(rt);
         }
         ref_name_slots.clear();
+        ++ref_name_slots_epoch;
     }
     /// `detached` releases the map's references here (with no lock held); each runtime lives on only as
     /// long as an in-flight leader/caller still holds it.
@@ -5147,7 +5217,7 @@ NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
 
     /// A cold mutation observes or births the durable identity before allocating any local state.
     const uint64_t admitted_generation = fence_generation_fn();
-    const uint64_t retirements_seen = refNameRetirements(ns);
+    ColdAdmission admission = beginColdAdmission(ns);
     CasOperation op = mount_requests.resume(admitted_generation);
     const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(op, layout);
     refuseUnlessAdmitted(op, "cold mutable namespace admission");
@@ -5163,7 +5233,7 @@ NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
         ? NamespaceLifeId::fromCatalogEntry(entry_it->ns, entry_it->incarnation)
         : resolveNamespaceLife(ns, admitted_generation, live_epoch_fn());
     refuseUnlessAdmitted(op, "cold mutable namespace admission, after life resolution");
-    rt = acquireRefTableRuntime(life, admitted_generation, retirements_seen, RuntimeAdmission::Write);
+    rt = acquireRefTableRuntime(life, admitted_generation, std::move(admission), RuntimeAdmission::Write);
     ensureRefTableRecovered(ns, *rt);
     refuseTerminalLife(ns, *rt);
     return rt->life;
@@ -5227,7 +5297,7 @@ bool CasRefLedger::namespaceStillLogicallyPresent(const RootNamespace & ns)
     /// the one answer that must never be manufactured by a race, so it alone is re-confirmed by a
     /// second read of this namespace's row before being trusted.
     const uint64_t admitted_generation = fence_generation_fn();
-    const uint64_t retirements_seen = refNameRetirements(ns);
+    ColdAdmission admission = beginColdAdmission(ns);
     CasOperation op = mount_requests.resume(admitted_generation);
     const CasRefCatalog::Snapshot first_catalog = CasRefCatalog::read(op, layout);
     refuseUnlessAdmitted(op, "namespace presence probe");
@@ -5272,7 +5342,7 @@ bool CasRefLedger::namespaceStillLogicallyPresent(const RootNamespace & ns)
     /// therefore not proof that the CURRENT logical namespace `ns` is absent; a fresh catalog read is
     /// required before answering `false` for the name.
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry->ns, entry->incarnation);
-    const auto rt = acquireRefTableRuntime(life, admitted_generation, retirements_seen, RuntimeAdmission::Read);
+    const auto rt = acquireRefTableRuntime(life, admitted_generation, std::move(admission), RuntimeAdmission::Read);
     ensureRefTableRecovered(ns, *rt);
     bool this_incarnation_terminal = false;
     {
@@ -5311,7 +5381,7 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     /// class shares the bigger complete-table byte budget (encodeRefLogTxn's own `checkBudget`, keyed
     /// off the presence of a `RemoveNamespace` op) and is exempt from the ordinary per-op admission
     /// check (it only ever shrinks state; see `flushRefBatch`'s `state_growing` filter).
-    const uint64_t retirements_seen = refNameRetirements(ns);
+    ColdAdmission admission = beginColdAdmission(ns);
     CasOperation initial_op = mount_requests.admit();
     /// One deadline for every request that leads to the removal decision. The wait for the lane to
     /// drain and for another removal attempt counts against it but is never cut short.
@@ -5360,7 +5430,7 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     const NamespaceLifeId observed_life
         = NamespaceLifeId::fromCatalogEntry(initial_it->ns, initial_it->incarnation);
     const uint64_t runtime_generation = fence_generation_fn();
-    const auto rt = acquireRefTableRuntime(observed_life, runtime_generation, retirements_seen, RuntimeAdmission::Write);
+    const auto rt = acquireRefTableRuntime(observed_life, runtime_generation, std::move(admission), RuntimeAdmission::Write);
     ensureRefTableRecovered(ns, *rt);
     {
         std::unique_lock<std::mutex> queue_lock(ref_queue_mutex);

@@ -453,6 +453,7 @@ TEST(CASNsFileIncarnation, ColdAdmissionIsRefusedWhenARemoteLeaderRetiredTheLife
     reader.join();
     expectRefusedAsRetired(reader.error);
     EXPECT_NE(owner->refTableLifeForTest(ns), retired_life) << "a runtime for the retired life was published";
+    EXPECT_EQ(owner->refNameSlotCountForTest(), 1u) << "only the slot of the resident `other` remains";
 }
 
 /// A recovered runtime whose stream holds the terminal removal, with no local removal in progress (its
@@ -528,9 +529,8 @@ TEST(CASNsFileIncarnation, NamespaceLifeDetachesAResidentRemovedLifeWhoseRowIsGo
 }
 
 /// A delayed retirement callback for a predecessor arrives while a successor is resident. It must
-/// still advance the name's record, and the record must survive the successor's eviction: otherwise a
-/// cold admission that read the predecessor's row could insert it once the slot empties.
-TEST(CASNsFileIncarnation, RetirementWithASuccessorResidentIsRecordedAndSurvivesEviction)
+/// still advance the name's record without detaching the successor.
+TEST(CASNsFileIncarnation, RetirementWithASuccessorResidentIsRecorded)
 {
     auto backend = std::make_shared<CountingBackend>();
     PoolConfig config{.pool_prefix = "p", .server_root_id = "test"};
@@ -565,8 +565,7 @@ TEST(CASNsFileIncarnation, RetirementWithASuccessorResidentIsRecordedAndSurvives
     /// A 1-byte budget evicts the idle successor when another table is touched.
     publishWithProductionBirth(store, other, "x");
     ASSERT_EQ(store->refTableRuntimeIdentityForTest(ns), 0u) << "the successor must have been evicted";
-    EXPECT_EQ(store->refNameRetirementsForTest(ns), retirements_before + 1)
-        << "eviction must keep a slot that records a retirement";
+    EXPECT_EQ(store->refNameSlotCountForTest(), 1u) << "with no admission in flight only the slot of `other` remains";
 }
 
 /// The non-minting reader assignment site accepts exactly a catalog `Live` row. `Creating`,
@@ -676,4 +675,245 @@ TEST(CASNsFileIncarnation, RebirthDoesNotWaitForFilesToBeEmpty)
     EXPECT_EQ(row_it->second.cleanup_evidence->remove_txn_id, (RefTxnId{1, 1}));
     EXPECT_TRUE(catalog_op.head(debris_key, Retry::standard()).has_value())
         << "cleanup evidence does not gate on physical deletion";
+}
+
+/// A retirement record is needed only while a cold admission of its name is in flight: a server that
+/// creates and drops tables must not keep one per name it ever retired.
+TEST(CASNsFileIncarnation, RetirementRecordsDoNotAccumulateAcrossCreateDropCycles)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    PoolPtr store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
+    Gc gc(store, kGcId);
+
+    for (size_t i = 0; i < 50; ++i)
+    {
+        const RootNamespace ns{"00/cycle" + std::to_string(i) + "@cas@"};
+        publishWithProductionBirth(store, ns, "x");
+        store->dropNamespace(ns);
+        (void)runRegularRoundReclaiming(gc);
+        (void)runRegularRoundReclaiming(gc);
+        ASSERT_FALSE(CasRefCatalog::lifeIfCataloged(catalog_op, store->layout(), ns)) << ns.string();
+    }
+
+    EXPECT_EQ(store->refNameSlotCountForTest(), 0u);
+}
+
+/// A GC leader drains lives of names it never admitted; with no admission of them in flight, it keeps
+/// no record of those retirements.
+TEST(CASNsFileIncarnation, RemoteLeaderRetirementsLeaveNoRecordWithoutAnAdmission)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    const RootNamespace ns{kNsString};
+    PoolPtr writer = Pool::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "writer", .gc_fold_max_defer_rounds = 0});
+    PoolPtr leader = Pool::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "leader", .gc_fold_max_defer_rounds = 0});
+
+    publishWithProductionBirth(writer, ns, "x");
+    writer->dropNamespace(ns);
+    Gc gc(leader, kGcId);
+    (void)runRegularRoundReclaiming(gc);
+    (void)runRegularRoundReclaiming(gc);
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
+    ASSERT_FALSE(CasRefCatalog::lifeIfCataloged(catalog_op, leader->layout(), ns)) << "the leader must drain the row";
+
+    EXPECT_EQ(leader->refNameSlotCountForTest(), 0u);
+}
+
+/// The record of a retirement lives exactly as long as the cold admission that may still publish the
+/// retired life.
+TEST(CASNsFileIncarnation, ColdAdmissionInFlightKeepsTheRecordAndReleasesIt)
+{
+    auto backend = std::make_shared<ParkedAdmissionBackend>();
+    const RootNamespace ns{kNsString};
+    std::optional<NamespaceLifeId> retired_life;
+    {
+        PoolPtr writer = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+        publishWithProductionBirth(writer, ns, "predecessor");
+        retired_life = writer->namespaceLife(ns);
+    }
+
+    PoolPtr store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    ASSERT_EQ(store->refNameSlotCountForTest(), 0u);
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
+    Gc gc(store, kGcId);
+
+    backend->catalog_key = layout.refCatalogKey();
+    backend->park_on_read = 2;
+    auto parked = backend->parked.get_future();
+    ParkedReader reader(*backend, [&] { (void)store->namespaceFilesLifeIfReadable(ns); });
+    ASSERT_EQ(parked.wait_for(std::chrono::seconds(60)), std::future_status::ready) << "the reader never reached its park";
+
+    store->dropNamespace(ns);
+    (void)runRegularRoundReclaiming(gc);
+    (void)runRegularRoundReclaiming(gc);
+    ASSERT_FALSE(CasRefCatalog::lifeIfCataloged(catalog_op, layout, ns)) << "the drain must erase the row";
+    EXPECT_EQ(store->refNameSlotCountForTest(), 1u) << "the parked admission must keep its name's record";
+    EXPECT_GE(store->refNameRetirementsForTest(ns), 1u);
+
+    backend->releaseOnce();
+    reader.join();
+    expectRefusedAsRetired(reader.error);
+    EXPECT_NE(store->refTableLifeForTest(ns), retired_life) << "a runtime for the retired life was published";
+    EXPECT_EQ(store->refNameSlotCountForTest(), 0u) << "the refused admission must release the record";
+
+    /// A remount clears the slots while an admission is parked. Its release must leave alone the slot
+    /// that a later admission of the same name creates.
+    auto remount_backend = std::make_shared<ParkedAdmissionBackend>();
+    {
+        PoolPtr writer = openPoolForTest(remount_backend, /*gc_fold_max_defer_rounds=*/0);
+        publishWithProductionBirth(writer, ns, "live");
+    }
+    PoolPtr remounted = openPoolForTest(remount_backend, /*gc_fold_max_defer_rounds=*/0);
+    remount_backend->catalog_key = remounted->layout().refCatalogKey();
+    remount_backend->park_on_read = 2;
+    auto remount_parked = remount_backend->parked.get_future();
+    ParkedReader older(*remount_backend, [&] { (void)remounted->namespaceFilesLifeIfReadable(ns); });
+    ASSERT_EQ(remount_parked.wait_for(std::chrono::seconds(60)), std::future_status::ready)
+        << "the reader never reached its park";
+    ASSERT_EQ(remounted->refNameSlotCountForTest(), 1u);
+
+    remounted->quiesceRefTablesForRemountForTest();
+    ASSERT_EQ(remounted->refNameSlotCountForTest(), 0u);
+    std::optional<CasRefLedger::ColdAdmission> newer = remounted->beginColdAdmissionForTest(ns);
+    ASSERT_EQ(remounted->refNameSlotCountForTest(), 1u);
+
+    remount_backend->releaseOnce();
+    older.join();
+    ASSERT_TRUE(older.error) << "an admission from before the remount must be refused";
+    try
+    {
+        std::rethrow_exception(older.error);
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR);
+        EXPECT_NE(e.message().find("no longer admitted"), String::npos) << e.message();
+    }
+    EXPECT_EQ(remounted->refNameSlotCountForTest(), 1u)
+        << "the older admission must not release the slot of an admission captured after the remount";
+
+    newer.reset();
+    EXPECT_EQ(remounted->refNameSlotCountForTest(), 0u);
+}
+
+/// Every way a cold admission ends without publishing a runtime gives back what it took.
+TEST(CASNsFileIncarnation, AbortedColdAdmissionsReleaseTheirInFlightCount)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    const RootNamespace live{"00/live@cas@"};
+    const RootNamespace removing{"00/removing@cas@"};
+    const RootNamespace absent{"00/absent@cas@"};
+    std::optional<NamespaceLifeId> live_life;
+    {
+        PoolPtr writer = openPoolForTest(backend);
+        publishWithProductionBirth(writer, live, "x");
+        live_life = writer->namespaceLife(live);
+    }
+
+    PoolPtr store = openPoolForTest(backend);
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
+    CasRefCatalog::casAdmitEntry(catalog_op, store->layout(), 1, CatalogEntry{
+        .ns = removing, .state = NsState::Live, .incarnation = UInt128{33}});
+    CasRefCatalog::casUpdate(catalog_op, store->layout(), [&](const RefCatalog & current)
+    {
+        RefCatalog next = current;
+        const auto it = std::find_if(next.entries.begin(), next.entries.end(), [&](const CatalogEntry & entry)
+        {
+            return entry.ns == removing;
+        });
+        chassert(it != next.entries.end());
+        it->state = NsState::Removing;
+        it->removal_started_round = 1;
+        return next;
+    });
+    ASSERT_EQ(store->refNameSlotCountForTest(), 0u);
+
+    EXPECT_FALSE(store->namespaceFilesLifeIfReadable(absent));
+    EXPECT_EQ(store->refNameSlotCountForTest(), 0u) << "reader on an absent row";
+
+    EXPECT_FALSE(store->namespaceFilesLifeIfReadable(removing));
+    EXPECT_EQ(store->refNameSlotCountForTest(), 0u) << "reader on a Removing row";
+
+    EXPECT_FALSE(store->namespaceStillLogicallyPresent(absent));
+    EXPECT_EQ(store->refNameSlotCountForTest(), 0u) << "presence probe on an absent row";
+
+    (void)store->dropNamespace(absent);
+    EXPECT_EQ(store->refNameSlotCountForTest(), 0u) << "drop of a missing row";
+
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+    {
+        (void)store->dropNamespace(NamespaceLifeId::fromCatalogEntry(live, live_life->incarnation + 1));
+    });
+    EXPECT_EQ(store->refNameSlotCountForTest(), 0u) << "drop with an expected incarnation mismatch";
+
+    store->setReadableCatalogAfterObservationHookForTest([] { throw std::runtime_error("injected catalog read failure"); });
+    EXPECT_THROW((void)store->namespaceFilesLifeIfReadable(live), std::runtime_error);
+    store->setReadableCatalogAfterObservationHookForTest(nullptr);
+    EXPECT_EQ(store->refNameSlotCountForTest(), 0u) << "admission that throws after its catalog read";
+
+    EXPECT_EQ(store->namespaceLife(live), *live_life);
+    ASSERT_EQ(store->refNameSlotCountForTest(), 1u);
+    publishWithProductionBirth(store, live, "y");
+    EXPECT_EQ(store->refNameSlotCountForTest(), 1u) << "writer whose runtime is resident";
+    /// The resident runtime keeps the slot; only its detach shows whether the writer released its count.
+    store->dropNamespace(live);
+    Gc gc(store, kGcId);
+    (void)runRegularRoundReclaiming(gc);
+    (void)runRegularRoundReclaiming(gc);
+    ASSERT_FALSE(CasRefCatalog::lifeIfCataloged(catalog_op, store->layout(), live)) << "the drain must erase the row";
+    EXPECT_EQ(store->refNameSlotCountForTest(), 0u) << "writer whose runtime is resident, after its detach";
+}
+
+/// An admission of predecessor `L1` read its row before the drain; successor `L2` is then published
+/// and evicted, leaving no runtime for the name. The released admission must still be refused.
+TEST(CASNsFileIncarnation, ColdAdmissionOfAPredecessorIsRefusedAfterItsSuccessorIsEvicted)
+{
+    auto backend = std::make_shared<ParkedAdmissionBackend>();
+    const RootNamespace ns{kNsString};
+    const RootNamespace other{"00/bb@cas@"};
+    std::optional<NamespaceLifeId> predecessor;
+    {
+        PoolPtr writer = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+        publishWithProductionBirth(writer, ns, "predecessor");
+        predecessor = writer->namespaceLife(ns);
+    }
+
+    PoolConfig config{.pool_prefix = "p", .server_root_id = "owner"};
+    config.gc_fold_max_defer_rounds = 0;
+    config.ref_table_cache_bytes = 1;
+    PoolPtr store = Pool::open(backend, std::move(config));
+    const Layout & layout = store->layout();
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
+
+    backend->catalog_key = layout.refCatalogKey();
+    backend->park_on_read = 2;
+    auto parked = backend->parked.get_future();
+    ParkedReader reader(*backend, [&] { (void)store->namespaceFilesLifeIfReadable(ns); });
+    ASSERT_EQ(parked.wait_for(std::chrono::seconds(60)), std::future_status::ready) << "the reader never reached its park";
+
+    store->dropNamespace(ns);
+    Gc gc(store, kGcId);
+    (void)runRegularRoundReclaiming(gc);
+    (void)runRegularRoundReclaiming(gc);
+    ASSERT_FALSE(CasRefCatalog::lifeIfCataloged(catalog_op, layout, ns)) << "the drain must erase the row";
+
+    publishWithProductionBirth(store, ns, "successor");
+    ASSERT_NE(store->namespaceLife(ns), *predecessor);
+    /// A 1-byte budget evicts the idle successor when another table is touched.
+    publishWithProductionBirth(store, other, "x");
+    ASSERT_EQ(store->refTableRuntimeIdentityForTest(ns), 0u) << "the successor must have been evicted";
+
+    backend->releaseOnce();
+    reader.join();
+    expectRefusedAsRetired(reader.error);
+    EXPECT_NE(store->refTableLifeForTest(ns), predecessor) << "a runtime for the predecessor was published";
+    EXPECT_EQ(store->refNameSlotCountForTest(), 1u) << "only the slot of the resident `other` remains";
 }

@@ -267,6 +267,34 @@ public:
     /// orphaned runtime therefore fail closed instead of mutating state from the previous epoch.
     void quiesceRefTablesForRemount();
 
+    /// One cold admission of a name, from the capture of its retirement count before the catalog read
+    /// to the publish of its runtime. Until it is released, and unless a remount clears the map, the name's
+    /// slot and its retirement count stay.
+    /// The destructor takes `ref_queue_mutex`: never destroy one under that mutex or a `state_mutex`.
+    class ColdAdmission
+    {
+    public:
+        ColdAdmission(ColdAdmission && other) noexcept;
+        ColdAdmission & operator=(ColdAdmission &&) = delete;
+        ColdAdmission(const ColdAdmission &) = delete;
+        ColdAdmission & operator=(const ColdAdmission &) = delete;
+        ~ColdAdmission();
+
+    private:
+        friend class CasRefLedger;
+        ColdAdmission(CasRefLedger & ledger_, String name_, uint64_t retirements_seen_, uint64_t epoch_) noexcept;
+
+        /// Null once released or moved from.
+        CasRefLedger * ledger;
+        String name;
+        uint64_t retirements_seen;
+        /// `ref_name_slots_epoch` at capture: the slot this admission counts in.
+        uint64_t epoch;
+    };
+
+    /// Captures a cold admission of `ns` with no catalog read and no runtime.
+    ColdAdmission beginColdAdmissionForTest(const RootNamespace & ns) { return beginColdAdmission(ns); }
+
     /// The self-remount's CANCEL-OR-JOIN barrier over in-flight recoveries (spec §3: "self-remount
     /// cancels or waits out recovery before rearming"). Requests cancellation on every cached table,
     /// then WAITS until no recovery attempt is in flight anywhere, then clears the request. Returns only
@@ -558,10 +586,18 @@ public:
         const auto it = ref_name_slots.find(ns.string());
         return it == ref_name_slots.end() || !it->second.current ? 0 : it->second.current->admitted_fence_generation;
     }
-    /// How many lives of `ns` catalog retirement has recorded since the last remount.
+    /// The retirement count of `ns`'s slot; zero when the name has no slot.
     uint64_t refNameRetirementsForTest(const RootNamespace & ns) const
     {
-        return refNameRetirements(ns);
+        std::lock_guard<std::mutex> g(ref_queue_mutex);
+        const auto it = ref_name_slots.find(ns.string());
+        return it == ref_name_slots.end() ? 0 : it->second.retirements;
+    }
+    /// Every name slot, with or without a resident runtime.
+    size_t refNameSlotCountForTest() const
+    {
+        std::lock_guard<std::mutex> g(ref_queue_mutex);
+        return ref_name_slots.size();
     }
     /// The physical life currently pinned in the cached runtime, without resolving or recovering it.
     std::optional<NamespaceLifeId> refTableLifeForTest(const RootNamespace & ns)
@@ -960,10 +996,11 @@ private:
         std::shared_ptr<RefTableRuntime> current;
         /// Bumped by `invalidateRemovedCatalogLife`, and by the eviction of a runtime that had closed or
         /// applied its removal: another server's GC leader may drain that life without telling us.
-        /// A slot with a non-zero count is never erased (only remount clears it, and remount also moves
-        /// the fence generation), so a cold admission compares the count it captured before its catalog
-        /// read with the one at insertion.
+        /// A slot exists if and only if it has a `current` runtime or `admissions_in_flight > 0`, so
+        /// the count survives as long as a cold admission that captured it may still compare it.
         uint64_t retirements = 0;
+        /// Live `ColdAdmission`s of this name captured in the current `ref_name_slots_epoch`.
+        uint32_t admissions_in_flight = 0;
     };
     static constexpr size_t kMaxRefBatch = 1000;
     /// Recovery retries at most this many times when an object selected by LIST vanishes before GET.
@@ -985,6 +1022,9 @@ private:
     /// taking a mutex to read consistently does not make the read a mutation.
     mutable std::mutex ref_queue_mutex;
     std::map<String, RefNameSlot> ref_name_slots;
+    /// Bumped with every clear of `ref_name_slots` by a remount, under `ref_queue_mutex`: a
+    /// `ColdAdmission` from before the clear must not release a slot created after it.
+    uint64_t ref_name_slots_epoch = 0;
     /// Monotonic access stamp for whole-table cache LRU eviction, bumped on every table touch and
     /// recorded in `RefTableRuntime::last_touch_tick`.
     std::atomic<uint64_t> ref_table_access_tick{0};
@@ -1074,15 +1114,25 @@ private:
 
     /// Publishes or returns one runtime for an exact catalog-observed life and admitted mount-fence
     /// generation. A conflicting attached identity is a stale observation and fails closed rather than
-    /// retargeting either runtime. `retirements_seen` is `refNameRetirements` captured before the
-    /// catalog read that produced `life`; if a retirement of this name landed since, the observation is
-    /// stale and the call throws retry-later instead of republishing a possibly retired life.
+    /// retargeting either runtime. `admission` was begun before the catalog read that produced `life`;
+    /// if a retirement of this name landed since, the observation is stale and the call throws
+    /// retry-later instead of republishing a possibly retired life. Releases `admission` in its critical
+    /// section; if it throws before that, the caller's guard releases it.
     std::shared_ptr<RefTableRuntime> acquireRefTableRuntime(
-        const NamespaceLifeId & life, uint64_t admitted_generation, uint64_t retirements_seen,
-        RuntimeAdmission admission);
+        const NamespaceLifeId & life, uint64_t admitted_generation, ColdAdmission && admission,
+        RuntimeAdmission kind);
 
-    /// The name's retirement count, under `ref_queue_mutex`. Zero for a name with no slot.
-    uint64_t refNameRetirements(const RootNamespace & ns) const;
+    /// Creates the slot of `ns` if absent and counts the admission in it. Call it before the catalog
+    /// read whose answer the admission publishes.
+    ColdAdmission beginColdAdmission(const RootNamespace & ns);
+
+    /// Disarms `admission` and, when it counts in the current epoch, takes it out of its slot. Caller
+    /// holds `ref_queue_mutex`.
+    void releaseColdAdmissionLocked(ColdAdmission & admission);
+
+    /// Erases the slot at `it` unless it has a runtime or an admission in flight. Caller holds
+    /// `ref_queue_mutex`.
+    void eraseNameSlotIfUnusedLocked(std::map<String, RefNameSlot>::iterator it);
 
     /// Throws retry-later when `rt` (already recovered) has applied its namespace's terminal removal.
     void refuseTerminalLife(const RootNamespace & ns, RefTableRuntime & rt);
@@ -1307,6 +1357,7 @@ private:
     /// time left, or a caller-supplied liveness term that has since gone false -- because none of them
     /// leaves the caller anything more specific to act on than "this admission no longer holds".
     void refuseUnlessAdmitted(const CasOperation & op, std::string_view what) const;
+    [[noreturn]] void throwNotAdmitted(std::string_view what) const;
 
     /// Common candidate predicate for scheduler admission and execution after capture. Caller holds
     /// `rt.state_mutex`; an epoch seal is not state-bearing and cannot be snapshotted.

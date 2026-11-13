@@ -1170,6 +1170,13 @@ public:
     {
         return ref_ledger.refNameRetirementsForTest(ns);
     }
+    size_t refNameSlotCountForTest() const { return ref_ledger.refNameSlotCountForTest(); }
+    CasRefLedger::ColdAdmission beginColdAdmissionForTest(const RootNamespace & ns)
+    {
+        return ref_ledger.beginColdAdmissionForTest(ns);
+    }
+    /// The ref-table half of a self-remount alone: the fence generation does not move.
+    void quiesceRefTablesForRemountForTest() { ref_ledger.quiesceRefTablesForRemount(); }
     std::optional<NamespaceLifeId> refTableLifeForTest(const RootNamespace & ns)
     {
         return ref_ledger.refTableLifeForTest(ns);
