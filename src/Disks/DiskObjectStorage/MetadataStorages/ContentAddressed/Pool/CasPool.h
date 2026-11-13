@@ -610,12 +610,22 @@ public:
     /// `ResolveAudit`'s doc comment (`CasRefLedger.h`) for the one `Deferred` call site.
     std::optional<Resolved> resolveRef(const RootNamespace & ns, const String & ref_name, bool allow_stale = false,
                                        ResolveAudit audit = ResolveAudit::Emit);
-    /// Gate 1 of the relink confirm -- a thin forward to the ref ledger, whose declaration carries the
-    /// rules (`CasRefLedger::confirmExactRef`). Read-only and object-store-I/O-free by contract.
+    /// Gate 1 of the relink confirm. The ledger (`CasRefLedger::confirmExactRef`) decides from memory;
+    /// only its `Yes` is re-checked, by one `GET` of the mount slot after the ledger locks are
+    /// released, because local fence state cannot see a successor that claimed the slot. A slot this
+    /// mount no longer holds, or no renewer to prove it, turns `Yes` into `Unknown`; a failed read
+    /// throws, and the storage layer answers `Unknown`. Any other ledger answer issues no request.
     ConfirmAnswer confirmExactRef(const RootNamespace & ns, const String & ref_name,
-                                  const ManifestRef & manifest_ref) const
+                                  const ManifestRef & manifest_ref) const;
+    /// TEST SEAM: runs between the ownership capture and the ledger snapshot.
+    void setConfirmAfterOwnershipCaptureHookForTest(std::function<void()> hook)
     {
-        return ref_ledger.confirmExactRef(ns, ref_name, manifest_ref);
+        confirm_after_ownership_capture_hook_for_test = std::move(hook);
+    }
+    /// TEST SEAM: runs between the ledger's `Yes` and the mount-slot read, with no ledger lock held.
+    void setConfirmAfterLedgerSnapshotHookForTest(std::function<void()> hook)
+    {
+        confirm_after_ledger_snapshot_hook_for_test = std::move(hook);
     }
     /// Read the single immutable part manifest named by `id`. Serves the cached decode when the id
     /// is cached (no request); otherwise derives the key via CasLayout::manifestKey, GETs and decodes
@@ -1291,6 +1301,11 @@ private:
     /// NO member-order change is introduced. Declared after event_sink_, pool_backend, config and
     /// pool_layout so it is constructed after every dependency it is injected with.
     CasMountRuntime mount_runtime;
+
+    /// TEST SEAM for `setConfirmAfterOwnershipCaptureHookForTest`; set only while no confirm runs.
+    std::function<void()> confirm_after_ownership_capture_hook_for_test = {};
+    /// TEST SEAM for `setConfirmAfterLedgerSnapshotHookForTest`; set only while no confirm runs.
+    std::function<void()> confirm_after_ledger_snapshot_hook_for_test = {};
 
     /// Serializes `tryRemountOnce` (whose claim/recovery ORCHESTRATION stays on Pool). STAYS here with
     /// its guarded critical section: persistent worker ownership, fence atomics, and the build registry

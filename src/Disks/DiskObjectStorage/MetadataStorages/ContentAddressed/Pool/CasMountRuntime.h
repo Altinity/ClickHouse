@@ -197,6 +197,11 @@ public:
     /// The current renewer's ownership record, or null without a renewer. Takes `driver_mutex` only to
     /// copy the pointer.
     std::shared_ptr<const MountSlotOwnership> slotOwnership() const;
+    /// One `GET` of the mount slot, admitted on the mount plane: true when it still holds a body
+    /// `ownership` wrote (`MountSlotOwnership::holds`), false otherwise, including an absent slot.
+    /// A refused admission (lost fence, spent lease budget), a request failure and a decode failure
+    /// propagate.
+    bool slotHeldBy(const MountSlotOwnership & ownership) const;
     /// Permanently latch the local fence as lost for this runtime incarnation.
     void tripMountLost();
     /// Publish the BOOTTIME deadline from a successful lease renewal.

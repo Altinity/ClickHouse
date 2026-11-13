@@ -156,7 +156,8 @@ public:
     /// Performs ZERO object-store I/O: a cold, evicted or recovering table answers `Unknown` rather
     /// than recovering from storage, and no runtime is created as a side effect of asking. That is a
     /// contract, not an optimization -- the confirm is a read-only interserver query that a remote
-    /// receiver drives, so it must never be able to make this writer do work.
+    /// receiver drives, so the ledger must never do work for it. The one exception is the single mount-slot
+    /// `GET` that `Pool::confirmExactRef` adds after a `Yes`.
     ///
     /// The rules are evaluated as one snapshot spanning both lane mutexes, in this order: table warm
     /// and resident; lane state `Ready` or `Writing`, with no queued or carved mutation whose

@@ -45,6 +45,8 @@ namespace ProfileEvents
 {
     extern const Event CASPartFolderManifestGets;
     extern const Event CASRemountAttempts;
+    extern const Event CASRelinkConfirmRefusedSlotMoved;
+    extern const Event CASRelinkConfirmRefusedSlotUnreadable;
     extern const Event CASRemountSucceeded;
     extern const Event CASRemountFailed;
     extern const Event CASRemountHeldTransient;
@@ -2137,6 +2139,41 @@ DropNamespaceStats Pool::dropNamespace(const NamespaceLifeId & life)
     {
         return ref_ledger.dropNamespace(life);
     });
+}
+
+ConfirmAnswer Pool::confirmExactRef(const RootNamespace & ns, const String & ref_name,
+                                    const ManifestRef & manifest_ref) const
+{
+    /// Captured before the ledger snapshot: if a remount lands in between, this older ownership cannot
+    /// hold the new slot, so the mismatch refuses. The order is safety-bearing;
+    /// `RemountBetweenCaptureAndSnapshotAnswersUnknown` pins it.
+    const std::shared_ptr<const MountSlotOwnership> ownership = mount_runtime.slotOwnership();
+    if (confirm_after_ownership_capture_hook_for_test)
+        confirm_after_ownership_capture_hook_for_test();
+    const ConfirmAnswer answer = ref_ledger.confirmExactRef(ns, ref_name, manifest_ref);
+    if (answer != ConfirmAnswer::Yes)
+        return answer;
+    if (confirm_after_ledger_snapshot_hook_for_test)
+        confirm_after_ledger_snapshot_hook_for_test();
+    bool held = false;
+    if (ownership)
+    {
+        try
+        {
+            held = mount_runtime.slotHeldBy(*ownership);
+        }
+        catch (...)
+        {
+            ProfileEvents::increment(ProfileEvents::CASRelinkConfirmRefusedSlotUnreadable);
+            throw;
+        }
+    }
+    if (!held)
+    {
+        ProfileEvents::increment(ProfileEvents::CASRelinkConfirmRefusedSlotMoved);
+        return ConfirmAnswer::Unknown;
+    }
+    return ConfirmAnswer::Yes;
 }
 
 NamespaceLifeId Pool::namespaceLife(const RootNamespace & ns)

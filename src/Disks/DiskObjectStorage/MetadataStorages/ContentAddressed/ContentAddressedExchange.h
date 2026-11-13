@@ -170,13 +170,15 @@ public:
     /// unproven answer.
     virtual bool ownsNamespace(const String & server_root_id, const String & root_namespace) const = 0;
 
-    /// Sender side, gate 1 of the relink confirm (spec §confirm-primitive), forwarded to the ledger:
+    /// Sender side, gate 1 of the relink confirm, forwarded to the pool:
     /// does `ref_name` in `root_namespace` still name EXACTLY the manifest rendered by
     /// `manifest_ref_text` (the canonical `writer_epoch:build_sequence:manifest_ordinal` form) in this
-    /// writer's committed view? Read-only, performs ZERO object-store I/O, and creates nothing: a cold,
-    /// evicted, recovering, busy, wedged, poisoned or unfenced table answers `Unknown` rather than
-    /// doing work, because a remote peer drives this query. Never throws: an unparsable token and a
-    /// disk that is not started or has reached a terminal lifecycle are `Unknown` too.
+    /// writer's committed view? Read-only and creates nothing: a cold, evicted, recovering, busy,
+    /// wedged, poisoned or unfenced table answers `Unknown` rather than doing work, because a remote
+    /// peer drives this query. The only object-store request is at most one `GET` of this mount's lease slot,
+    /// made only when the in-memory view says `Yes`; a slot this mount no longer holds answers
+    /// `Unknown`. Never throws: an unparsable token, a failed slot read and a disk that is not started
+    /// or has reached a terminal lifecycle are `Unknown` too.
     virtual CasConfirmAnswer confirmExactRef(const String & root_namespace, const String & ref_name,
                                              const String & manifest_ref_text) const = 0;
 

@@ -261,7 +261,7 @@ def test_both_queues_drain_under_slow_checkpoints():
                 "arrived took some route other than fetch-by-relink".format(node.name)
             )
 
-        # No confirm may be refused by lane STATE on a healthy run. These two counters move only on
+        # No confirm may be refused by lane STATE on a healthy run. These counters move only on
         # `confirmExactRef`'s wedge and broken-lane branches — an unresolved append, or a lane in
         # NeedsRecovery, Closed, Faulted, or Writing with nothing carved. This case drives the fake's
         # control plane with a delay and never with a fault, so none of those is reachable here and a
@@ -284,10 +284,18 @@ def test_both_queues_drain_under_slow_checkpoints():
         # asked and answered `Yes`, and the delayed-PUT floor proves the checkpoint publications were
         # slowed, which is the contention itself. Its attribution is pinned in the unit suite, by
         # `CASConfirmExactRef.UntouchedRefConfirmsWhileAnotherRefIsQueued`.
+        #
+        # `SlotUnreadable` is zero because the delay knob matches only `_ckpt` PUTs: no fault reaches the
+        # mount key, so each slot read succeeds. `CASRelinkConfirmRefusedSlotMoved` is not listed: a renewal
+        # that commits between the read and the ownership check refuses a healthy mount.
         for node in (node1, node2):
-            for event in ("CASRelinkConfirmRefusedLaneWedged", "CASRelinkConfirmRefusedLaneBroken"):
+            for event in (
+                "CASRelinkConfirmRefusedLaneWedged",
+                "CASRelinkConfirmRefusedLaneBroken",
+                "CASRelinkConfirmRefusedSlotUnreadable",
+            ):
                 assert _refusal_counter(node, event) == 0, (
-                    "{} refused a relink confirm by lane state ({}), which no fault was injected to "
+                    "{} refused a relink confirm ({}), which no fault was injected to "
                     "produce. All refusal counters on this node:\n{}".format(
                         node.name, event, _refusal_counters(node)
                     )
