@@ -1029,6 +1029,9 @@ TEST(CASRefWriterChunkedFlush, SnapshotPublisherLatchedAcrossChunks)
     auto backend = std::make_shared<ChunkFaultBackend>();
     PoolConfig cfg;
     cfg.snapshot_log_count_threshold = 0;   /// every committed chunk crosses the tail-count threshold
+    /// A setup publisher that meets a `Writing` lane gives up; a backoff armed on the frozen clock would
+    /// then delay the parked `_snap/` PUT this test waits for.
+    cfg.snapshot_publish_backoff_initial_ms = 0;
     auto store = openPoolWith(backend, cfg);
     const DB::Cas::Layout & layout = store->layout();
     const RootNamespace ns{"srv1/chunk_snapshot_coalesce"};
@@ -1060,6 +1063,7 @@ TEST(CASRefWriterChunkedFlush, SnapshotPublisherLatchedAcrossChunks)
     seed_build->promote(ns, "seed", seed_build->buildId(), seed_manifest_id);
     store->waitForSnapshotPublishSettleForTest(ns);   /// drain the seed's publish chain -> tail == 0
     store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns);
+    ASSERT_EQ(store->tailSinceSnapshotCountForTest(ns), 0u) << "the setup must end with a compacted tail";
 
     /// Latch the FIRST `_snap/` PUT (chunk 1's publisher) at its conditional PUT -- i.e. AFTER it has
     /// captured chunk 1's prefix under state_mutex.
