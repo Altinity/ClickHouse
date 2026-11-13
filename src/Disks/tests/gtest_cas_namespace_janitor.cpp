@@ -261,7 +261,7 @@ NamespaceLifeId life(const char * name, uint64_t id)
 TEST(CASNamespaceJanitor, DeletesDeadFilesAndCheckpointFromOnePostListCatalogCut)
 {
     auto backend = std::make_shared<CountingBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     const Layout layout("p");
     seedCatalog(*backend, layout);
     const auto dead = life("dead", 41);
@@ -287,7 +287,7 @@ TEST(CASNamespaceJanitor, DeletesDeadFilesAndCheckpointFromOnePostListCatalogCut
 TEST(CASNamespaceJanitor, RetainsEveryCurrentLifecycleAndSuppressesAmbiguousCut)
 {
     auto backend = std::make_shared<CountingBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     const Layout layout("p");
     RefCatalog catalog;
     CatalogEntry creating{.ns = RootNamespace{"creating"}, .state = NsState::Creating, .incarnation = UInt128{51},
@@ -310,7 +310,7 @@ TEST(CASNamespaceJanitor, RetainsEveryCurrentLifecycleAndSuppressesAmbiguousCut)
 TEST(CASNamespaceJanitor, CatalogFirstCreatingRetainsEveryObjectOfTheNewLife)
 {
     auto backend = std::make_shared<CountingBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     const Layout layout("p");
     const CatalogEntry creating{
         .ns = RootNamespace{"catalog-first"},
@@ -341,7 +341,7 @@ TEST(CASNamespaceJanitor, CatalogFirstCreatingRetainsEveryObjectOfTheNewLife)
 TEST(CASNamespaceJanitor, CancelledCreatingCheckpointIsReclaimedThroughPublicLifecycle)
 {
     auto backend = std::make_shared<CountingBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     const Layout layout("p");
     const CatalogEntry creating{
         .ns = RootNamespace{"cancelled"},
@@ -369,7 +369,7 @@ TEST(CASNamespaceJanitor, CancelledCreatingCheckpointIsReclaimedThroughPublicLif
 TEST(CASNamespaceJanitor, SuppressionAndFenceLossDeleteNothing)
 {
     auto backend = std::make_shared<CountingBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     const Layout layout("p");
     seedCatalog(*backend, layout);
     const String first = layout.refCkptKey(life("dead-a", 61));
@@ -402,7 +402,7 @@ TEST(CASNamespaceJanitor, SuppressionAndFenceLossDeleteNothing)
 TEST(CASNamespaceJanitor, FenceLossOnRetainedOnlyPageDoesNotAdvanceCursor)
 {
     auto backend = std::make_shared<CountingBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     const Layout layout("p");
     const CatalogEntry current{
         .ns = RootNamespace{"current"}, .state = NsState::Live, .incarnation = UInt128{63}};
@@ -429,7 +429,7 @@ TEST(CASNamespaceJanitor, FenceLossOnRetainedOnlyPageDoesNotAdvanceCursor)
 TEST(CASNamespaceJanitor, FenceLossAfterLastDeleteRetainsCursorWithoutRollingBackDelete)
 {
     auto backend = std::make_shared<FlipAfterFirstDeleteBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     const Layout layout("p");
     seedCatalog(*backend, layout);
     const String dead = layout.refCkptKey(life("dead-after-delete", 64));
@@ -448,7 +448,7 @@ TEST(CASNamespaceJanitor, FenceLossAfterLastDeleteRetainsCursorWithoutRollingBac
 TEST(CASNamespaceJanitor, CursorResumesThenResetsAtEnd)
 {
     auto backend = std::make_shared<CountingBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     const Layout layout("p");
     seedCatalog(*backend, layout);
     const auto dead = life("dead", 71);
@@ -469,7 +469,7 @@ TEST(CASNamespaceJanitor, CursorResumesThenResetsAtEnd)
 TEST(CASNamespaceJanitor, TakesOneCatalogCutAfterListingAndContinuesPastMalformedKey)
 {
     auto backend = std::make_shared<OrderedJanitorBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     const Layout layout("p");
     seedCatalog(*backend, layout);
     const auto dead = life("dead", 81);
@@ -496,7 +496,7 @@ TEST(CASNamespaceJanitor, TakesOneCatalogCutAfterListingAndContinuesPastMalforme
 TEST(CASNamespaceJanitor, MalformedKeyIsFinalAndAdvancesCursor)
 {
     auto backend = std::make_shared<CountingBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     const Layout layout("p");
     seedCatalog(*backend, layout);
     const String first = layout.namespaceStreamRootPrefix() + "bad-a/_log/1-1.zst";
@@ -521,7 +521,7 @@ TEST(CASNamespaceJanitor, MalformedKeyIsFinalAndAdvancesCursor)
 TEST(CASNamespaceJanitor, DuplicateCurrentLifeSuppressesWholePage)
 {
     auto backend = std::make_shared<CountingBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     const Layout layout("p");
     RefCatalog catalog;
     catalog.entries = {
@@ -544,7 +544,7 @@ TEST(CASNamespaceJanitor, DuplicateCurrentLifeSuppressesWholePage)
 TEST(CASNamespaceJanitor, CorruptProgressResetsWithoutDeletingAndFilesOnlyOmittedCycleRetries)
 {
     auto backend = std::make_shared<OmitFirstNamespacePageBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     const Layout layout("p");
     seedCatalog(*backend, layout);
     const String dead = layout.namespaceFilesPrefix(life("dead", 101)) + "only-residue";
@@ -562,7 +562,7 @@ TEST(CASNamespaceJanitor, CorruptProgressResetsWithoutDeletingAndFilesOnlyOmitte
 TEST(CASNamespaceJanitor, ExactTokenMismatchRetainsConcurrentReplacement)
 {
     auto backend = std::make_shared<ReplaceBeforeJanitorDeleteBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     const Layout layout("p");
     seedCatalog(*backend, layout);
     const String dead = layout.refCkptKey(life("dead-a", 111));
@@ -584,7 +584,7 @@ TEST(CASNamespaceJanitor, ExactTokenMismatchRetainsConcurrentReplacement)
 TEST(CASNamespaceJanitor, TokenlessListHeadsDeadKeysAndRetainsConcurrentReplacement)
 {
     auto backend = std::make_shared<TokenlessListBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     const Layout layout("p");
     const CatalogEntry current{
         .ns = RootNamespace{"current"}, .state = NsState::Live, .incarnation = UInt128{161}};
@@ -616,7 +616,7 @@ TEST(CASNamespaceJanitor, TokenlessListHeadsDeadKeysAndRetainsConcurrentReplacem
 TEST(CASNamespaceJanitor, TokenlessListRechecksFenceAfterHeadBeforeDelete)
 {
     auto backend = std::make_shared<FenceLossDuringHeadBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     const Layout layout("p");
     seedCatalog(*backend, layout);
     const String dead_key = layout.refCkptKey(life("dead", 164));
@@ -636,7 +636,7 @@ TEST(CASNamespaceJanitor, PostListCatalogCutProtectsConcurrentCreationWithOneGet
 {
     const auto created = life("created", 121);
     auto backend = std::make_shared<CatalogAfterListBackend>(created);
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     const Layout layout("p");
     seedCatalog(*backend, layout);
     const String first = layout.refCkptKey(created);
@@ -655,7 +655,7 @@ TEST(CASNamespaceJanitor, PostListCatalogCutProtectsConcurrentCreationWithOneGet
 TEST(CASNamespaceJanitor, BackendRejectedCursorResetsExactlyAndDeletesNothing)
 {
     auto backend = std::make_shared<RejectCursorBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     const Layout layout("p");
     seedCatalog(*backend, layout);
     const String dead = layout.refCkptKey(life("dead", 131));
@@ -671,7 +671,7 @@ TEST(CASNamespaceJanitor, BackendRejectedCursorResetsExactlyAndDeletesNothing)
 TEST(CASNamespaceJanitor, CursorPublicationFailureIsLeakOnly)
 {
     auto backend = std::make_shared<FailMaintenancePublicationBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     const Layout layout("p");
     seedCatalog(*backend, layout);
     const String dead = layout.refCkptKey(life("dead", 141));
@@ -695,7 +695,7 @@ TEST(CASGcMaintenanceState, CatchPathWriteIsOnce)
 {
     auto backend = std::make_shared<ThrowingListAndAmbiguousWriteBackend>();
     FakeClock clock;
-    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn());
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), nullptr, DB::Cas::kDefaultRequestWindowMs);
     const Layout layout("p");
 
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR,

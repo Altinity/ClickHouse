@@ -380,7 +380,7 @@ String logPrefix(const PoolPtr & store, const RootNamespace & ns)
 
 CatalogEntry catalogEntryOrThrow(const BackendPtr & backend, const Layout & layout, const RootNamespace & ns)
 {
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
     const RefCatalog catalog = CasRefCatalog::read(op, layout).catalog;
     const auto it = std::find_if(catalog.entries.begin(), catalog.entries.end(), [&](const CatalogEntry & entry)
@@ -397,7 +397,7 @@ CatalogEntry catalogEntryOrThrow(const BackendPtr & backend, const Layout & layo
 /// creator identity makes the durable genesis checkpoint deterministic too.
 void admitProperlyBornEntry(const BackendPtr & backend, const Layout & layout, const RootNamespace & ns)
 {
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
     const CatalogEntry creating{
         .ns = ns,
@@ -415,7 +415,7 @@ CatalogEntry replaceCatalogLifeForWedgeRace(
     const BackendPtr & backend, const Layout & layout, const CatalogEntry & predecessor,
     UInt128 successor_incarnation)
 {
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
     const CasRefCatalog::Snapshot before_delete = CasRefCatalog::read(op, layout);
     RefCatalog without_predecessor = before_delete.catalog;
@@ -486,7 +486,7 @@ void reclaimSealSlotAsSuccessor(const std::shared_ptr<WedgeTestBackend> & backen
 
     backend->bypass_seams.store(true, std::memory_order_release);
     SCOPE_EXIT(backend->bypass_seams.store(false, std::memory_order_release));
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
     ASSERT_TRUE(std::holds_alternative<Committed>(op.create(slot_key, epochSealBytes(ns, slot), Retry::once())));
     ASSERT_EQ(publishCkpt(op, layout, life, frontier(slot, std::nullopt, slot)), CkptPublishOutcome::Published);
@@ -835,7 +835,7 @@ TEST(CASRefWedgeEveryAttempt, ADefiniteRefusalCannotSpeakForAnEarlierAmbiguousAt
     /// full jitter can draw a zero pause and a clock that does not move never reaches the deadline.
     CasRequests requests(backend, Fence::open(),
                          [&clock]() -> uint64_t { return clock; },
-                         [&clock, &pauses](uint64_t ms) { ++pauses; clock += ms + 1; });
+                         [&clock, &pauses](uint64_t ms) { ++pauses; clock += ms + 1; }, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
 
     /// One call: the first attempt ambiguous, and every attempt after it refused by the store. The
@@ -1625,7 +1625,7 @@ void recoveryWalkMeetsALateRecordInAReclaimedSealSlot(const RootNamespace & ns, 
     const String slot_key = layout.refLogKey(life, slot);
     const uint64_t successor_epoch = [&]
     {
-        CasRequests requests(backend, Fence::open());
+        CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
         CasOperation op = requests.admit();
         return allocateWriterEpoch(op, layout, "test", [] { return RefCatalog{}; });
     }();
@@ -1655,7 +1655,7 @@ void recoveryWalkMeetsALateRecordInAReclaimedSealSlot(const RootNamespace & ns, 
         };
         backend->bypass_seams.store(true, std::memory_order_release);
         SCOPE_EXIT(backend->bypass_seams.store(false, std::memory_order_release));
-        CasRequests requests(backend, Fence::open());
+        CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
         CasOperation op = requests.admit();
         ASSERT_TRUE(std::holds_alternative<Committed>(op.create(slot_key, epochSealBytes(ns, slot), Retry::once())));
         DB::Cas::tests::writeTxnAt(*backend, layout, ns, opened,
@@ -1780,7 +1780,7 @@ TEST(CASRefWedgeEveryAttempt, RecoveryWalkOfAWriterLaneInNeedsRecoveryRefusedByS
         };
         backend->bypass_seams.store(true, std::memory_order_release);
         SCOPE_EXIT(backend->bypass_seams.store(false, std::memory_order_release));
-        CasRequests requests(backend, Fence::open());
+        CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
         CasOperation op = requests.admit();
         ASSERT_TRUE(std::holds_alternative<Committed>(
             op.create(layout.refLogKey(life, seal), epochSealBytes(ns, seal), Retry::once())));

@@ -71,7 +71,7 @@ DB::Cas::BlobPublishRequest streamingPublication()
 /// One engine attempt of the backend's blob publication, so every counted request comes from below it.
 void publishOnce(const DB::ObjectStoragePtr & storage, const DB::Cas::BlobPublishRequest & request)
 {
-    DB::Cas::CasRequests requests(DB::Cas::BackendPtr(nativeBackend(storage)), DB::Cas::Fence::open());
+    DB::Cas::CasRequests requests(DB::Cas::BackendPtr(nativeBackend(storage)), DB::Cas::Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     auto op = requests.admit();
     op.publish(request, DB::Cas::Retry::once());
 }

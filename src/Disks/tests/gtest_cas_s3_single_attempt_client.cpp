@@ -794,7 +794,7 @@ TEST(CASEnvelopeWiring, FreezeConnectTimeoutCapReachesTheBackendOverProductionDi
         storage, DB::Cas::ObjectStorageBackend::Mode::Native,
         /*single_attempt_control_plane_=*/false, /*attempt_timeout_ms_=*/0, /*connect_timeout_cap_ms_=*/0);
     {
-        DB::Cas::CasRequests requests(DB::Cas::BackendPtr(uncapped_backend), DB::Cas::Fence::open());
+        DB::Cas::CasRequests requests(DB::Cas::BackendPtr(uncapped_backend), DB::Cas::Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
         auto op = requests.admit();
         EXPECT_TRUE(op.head("k", DB::Cas::Retry::once()).has_value());
         EXPECT_FALSE(storage->hasSingleAttemptClientForTest(0, 0))
@@ -811,7 +811,7 @@ TEST(CASEnvelopeWiring, FreezeConnectTimeoutCapReachesTheBackendOverProductionDi
     /// only `hasSingleAttemptClientForTest`/`getSingleAttemptClient` below can show.
     EXPECT_EQ(capped_backend->connectTimeoutCapMs(), *cap);
     {
-        DB::Cas::CasRequests requests(DB::Cas::BackendPtr(capped_backend), DB::Cas::Fence::open());
+        DB::Cas::CasRequests requests(DB::Cas::BackendPtr(capped_backend), DB::Cas::Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
         auto op = requests.admit();
         EXPECT_TRUE(op.head("k", DB::Cas::Retry::once()).has_value());
         ASSERT_TRUE(storage->hasSingleAttemptClientForTest(cas_attempt_timeout_ms, *cap))
@@ -832,7 +832,7 @@ TEST(CASBackend, LargeConditionalPutIsOneRequestWithTheWholeBody)
 
     DelayedResponseServer server(std::chrono::milliseconds(0), acceptPut);
     auto backend = conditionalBackendForTest(makeDispatchStorageForTest(server.getUrl(), 10000));
-    DB::Cas::CasRequests requests(DB::Cas::BackendPtr(backend), DB::Cas::Fence::open());
+    DB::Cas::CasRequests requests(DB::Cas::BackendPtr(backend), DB::Cas::Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
 
     const std::string body(3 * 1024 * 1024 + 1, 'L');
     auto op = requests.admit();
@@ -851,7 +851,7 @@ TEST(CASBackend, ConditionalPutRunsOnTheCallingThread)
     auto backend = conditionalBackendForTest(makeDispatchStorageForTest(server.getUrl(), 10000));
     EXPECT_FALSE(backend->conditionalWriteSettingsForTest().s3_allow_parallel_part_upload);
 
-    DB::Cas::CasRequests requests(DB::Cas::BackendPtr(backend), DB::Cas::Fence::open());
+    DB::Cas::CasRequests requests(DB::Cas::BackendPtr(backend), DB::Cas::Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     bool committed = false;
     uint64_t puts_on_calling_thread = 0;
     std::exception_ptr failure;
@@ -887,7 +887,7 @@ TEST(CASBackend, ConditionalPutBufferStartsAtTheBodySize)
     DelayedResponseServer server(std::chrono::milliseconds(0), acceptPut);
     auto storage = makeDispatchStorageForTest<BufferSizeRecordingS3ObjectStorage>(server.getUrl(), 10000);
     auto backend = conditionalBackendForTest(storage);
-    DB::Cas::CasRequests requests(DB::Cas::BackendPtr(backend), DB::Cas::Fence::open());
+    DB::Cas::CasRequests requests(DB::Cas::BackendPtr(backend), DB::Cas::Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
 
     const std::string body(37, 'b');
     {
@@ -918,7 +918,7 @@ TEST(CASBackend, ConditionalMultipartNoSuchUploadIsUnresolved)
     CountingS3::CountingS3Server server(store.responder());
     auto backend = conditionalBackendForTest(
         S3ObjectCreationTestStorage::makeRetryingStorage(server.getUrl(), S3ObjectCreationTestStorage::forceOnePartMultipart));
-    DB::Cas::CasRequests requests(DB::Cas::BackendPtr(backend), DB::Cas::Fence::open());
+    DB::Cas::CasRequests requests(DB::Cas::BackendPtr(backend), DB::Cas::Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     const uint64_t unresolved_before = ProfileEvents::global_counters[ProfileEvents::CASConditionalWriteUnresolved];
 
     auto op = requests.admit();

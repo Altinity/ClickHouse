@@ -492,7 +492,8 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
 
     /// Validate one immutable ownership cut before impersonating the victim, on the raw backend: no `Pool`
     /// exists yet. Namespace selection reuses this exact pre-mutation decision rather than a later read.
-    CasRequests preflight_requests(backend, Fence::open());
+    CasRequests preflight_requests(
+        backend, Fence::open(), {}, {}, nullptr, config.cas_request_budget.request_window_ms);
     CasOperation preflight_op = preflight_requests.admit();
     const Layout catalog_layout(config.pool_prefix);
     const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(preflight_op, catalog_layout);
@@ -517,7 +518,8 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
 
     /// The control plane: always admitted, so a fenced admin can still confirm, roll back and verify. It keeps
     /// its own shared_ptr to the backend and outlives `admin.reset()`.
-    CasRequests control_requests(admin->poolBackendPtr(), Fence::open());
+    CasRequests control_requests(
+        admin->poolBackendPtr(), Fence::open(), {}, {}, nullptr, admin->poolConfig().cas_request_budget.request_window_ms);
     if (drain_now_fn && drain_sleep_fn)
     {
         control_requests.setNowFnForTest(drain_now_fn);

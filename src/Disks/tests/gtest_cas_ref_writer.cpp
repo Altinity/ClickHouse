@@ -219,14 +219,14 @@ void publishWithProductionBirth(const PoolPtr & store, const RootNamespace & ns,
 std::optional<CkptSample> readCkptForTest(const BackendPtr & backend, const Layout & layout,
                                           const NamespaceLifeId & life)
 {
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
     return readCkpt(op, layout, life);
 }
 
 CasRefCatalog::Snapshot readCatalogForTest(const BackendPtr & backend, const Layout & layout)
 {
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
     return CasRefCatalog::read(op, layout);
 }
@@ -235,7 +235,7 @@ CasRefCatalog::Snapshot readCatalogForTest(const BackendPtr & backend, const Lay
 bool replaceForTest(const BackendPtr & backend, const String & key, const String & bytes,
                     const Etag & expected)
 {
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
     return std::holds_alternative<Committed>(op.replace(key, bytes, expected, Retry::standard()));
 }
@@ -243,7 +243,7 @@ bool replaceForTest(const BackendPtr & backend, const String & key, const String
 void casAdmitEntryForTest(const BackendPtr & backend, const Layout & layout, uint64_t gc_shards,
                           const CatalogEntry & entry)
 {
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
     CasRefCatalog::casAdmitEntry(op, layout, gc_shards, entry);
 }
@@ -251,14 +251,14 @@ void casAdmitEntryForTest(const BackendPtr & backend, const Layout & layout, uin
 std::optional<NamespaceLifeId> lifeIfCatalogedForTest(const BackendPtr & backend, const Layout & layout,
                                                       const RootNamespace & ns)
 {
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
     return CasRefCatalog::lifeIfCataloged(op, layout, ns);
 }
 
 uint64_t allocateWriterEpochForTest(const BackendPtr & backend, const Layout & layout, const String & server_root_id)
 {
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
     return allocateWriterEpoch(op, layout, server_root_id, [] { return RefCatalog{}; });
 }
@@ -267,7 +267,7 @@ uint64_t allocateWriterEpochForTest(const BackendPtr & backend, const Layout & l
 /// hides the legacy name, and a test walking a prefix should ride the same engine production does.
 ListPage listForTest(const BackendPtr & backend, const String & prefix, const String & cursor, size_t limit)
 {
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
     return op.list(prefix, cursor, limit, Retry::standard());
 }
@@ -276,14 +276,14 @@ ListPage listForTest(const BackendPtr & backend, const String & prefix, const St
 /// directly against a `RefWriterTestBackend` outside any Pool operation.
 std::optional<DB::Cas::Object> readOf(const BackendPtr & backend, const String & key)
 {
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
     return op.read(key, Retry::standard());
 }
 
 bool createRaw(const BackendPtr & backend, const String & key, const String & bytes)
 {
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
     return std::holds_alternative<Committed>(op.create(key, bytes, Retry::standard()));
 }
@@ -1377,7 +1377,7 @@ TEST(CASRefWriterRecovery, RestartOnVanishConvergesOnNewerSnapshot)
         writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), snap_y, {committedRow("b", mb)}));
         const auto before = readOf(backend, layout.refCkptKey(life));
         ASSERT_TRUE(before);
-        CasRequests requests(backend, Fence::open());
+        CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
         CasOperation op = requests.admit();
         ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
             .life_epoch = 1,
@@ -2035,7 +2035,7 @@ TEST(CASRefWriterAppendLane, I1AppendCorruptionSurfacesAndFencesTheMountForRemou
     fenced_mount.gc_fenced = true;
     fenced_mount.seq += 1;
     {
-        CasRequests requests(backend, Fence::open());
+        CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
         CasOperation op = requests.admit();
         ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(mount_key, encodeMountLease(fenced_mount), mount->etag, Retry::standard())));
     }
@@ -2286,7 +2286,7 @@ TEST(CASRefWriteContract, PostWriteFenceLossIsCounted)
     auto backend = std::make_shared<CountingBackend>();
     bool live = true;
     backend->onWriteCommitted("k", [&live] { live = false; });
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit([&live] { return live; });
 
     const auto before = global_counters[ProfileEvents::CASRequestFenceLostPostWrite];
@@ -2303,7 +2303,7 @@ TEST(CASRefWriteContract, PostWriteFenceLossIsCounted)
 TEST(CASRefWriteContract, CommittedSurfacesTheIncarnationFromTheWriteAndFromTheSettlingRead)
 {
     auto backend = std::make_shared<CountingBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
 
     CasOperation direct = requests.admit();
     const WriteResult first = direct.create("k1", "v1", Retry::standard());
@@ -3279,7 +3279,7 @@ TEST(CASRefWriterSnapshotPublish, RecoveredSealAboveThresholdDoesNotRedispatchUn
         RefCkpt recovered_seal = before_seal;
         recovered_seal.committed_through = seal_id;
         recovered_seal.last_epoch_seal = seal_id;
-        CasRequests requests(backend, Fence::open());
+        CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
         CasOperation op = requests.admit();
         ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(
             predecessor->layout().refCkptKey(life), encodeRefCkpt(recovered_seal), before->etag, Retry::standard())));
@@ -3913,7 +3913,7 @@ TEST(CASRefWriterRemount, FailedRemountPublishesNoRuntimeUnderFenceLossGeneratio
     foreign.server_uuid = foreign.server_uuid + UInt128{1};
     foreign.seq += 1;
     {
-        CasRequests requests(backend, Fence::open());
+        CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
         CasOperation op = requests.admit();
         ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(mount_key, encodeMountLease(foreign), got->etag, Retry::standard())));
     }
@@ -4180,7 +4180,7 @@ TEST(CASRefWriterNamespaceRemoval, CachedPositiveWriterCannotAppendAfterRemoving
     }
     if (writer_parked)
     {
-        CasRequests catalog_requests(backend, Fence::open());
+        CasRequests catalog_requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
         CasOperation catalog_op = catalog_requests.admit();
         CasRefCatalog::casUpdate(catalog_op, layout, [&](const RefCatalog & current)
         {
@@ -4603,7 +4603,7 @@ TEST(CASRefWriterNamespaceRemoval, AmbiguousBeginRemovingSurvivesRefTableEvictio
 const uint64_t kMaxBackoffDrawMs = 5000;
 const uint64_t kVirtualClockPauseSlackMs = 100;
 const uint64_t kOneWindowPlusBackoffMs
-    = DB::Cas::Retry::standard().window_ms + kMaxBackoffDrawMs + kVirtualClockPauseSlackMs;
+    = kDefaultRequestWindowMs + kMaxBackoffDrawMs + kVirtualClockPauseSlackMs;
 
 /// An ambiguous `Live -> Removing` write that the resolve read finds landed leaves nothing unresolved:
 /// the runtime is evictable and a refusal names `Removing`, not a write that may still land. The kept
@@ -4650,7 +4650,7 @@ TEST(CASRefWriterNamespaceRemoval, ResolveReadProvingRemovingLeavesNoUnresolvedW
     ASSERT_TRUE(released_at_ms.has_value());
     /// The loop gives up once the next pause no longer fits in the window, so at most one backoff draw
     /// before its end. An earlier release came from a read inside the loop.
-    EXPECT_GE(*released_at_ms - drop_started_ms, DB::Cas::Retry::standard().window_ms - kMaxBackoffDrawMs)
+    EXPECT_GE(*released_at_ms - drop_started_ms, kDefaultRequestWindowMs - kMaxBackoffDrawMs)
         << "the kept write was released inside the transition's retry loop, before it gave up; "
            "the resolve read in the catch was not what applied it";
     EXPECT_EQ(catalogEntryOrThrow(backend, layout, ns).state, NsState::Removing);
@@ -5544,7 +5544,7 @@ TEST(CASRefWriterNamespaceRemoval, PresenceProbeFenceLossPropagatesRatherThanAns
     foreign.server_uuid = foreign.server_uuid + UInt128{1};
     foreign.seq += 1;
     {
-        CasRequests requests(backend, Fence::open());
+        CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
         CasOperation op = requests.admit();
         ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(mount_key, encodeMountLease(foreign), got->etag, Retry::standard())));
     }
@@ -6333,7 +6333,7 @@ void seedSealFixtureDeadEpochs(const BackendPtr & backend, const Layout & layout
 /// unclean deterministically, without any real sleep.
 void seedUncleanPredecessorMount(const BackendPtr & backend, const Layout & layout, uint64_t epoch)
 {
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
     claimMount(op, layout, "test", UInt128(1), epoch, /*now_ms=*/1000, /*ttl_ms=*/500);
     fenceOutRefMount(*backend, layout.mountKey("test"));

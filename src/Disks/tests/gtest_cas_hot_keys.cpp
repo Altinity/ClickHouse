@@ -111,7 +111,7 @@ TEST(CASHotKeys, SubmissionsOfOneKeyAreSerializedInArrivalOrder)
     SyncClock clock;
     auto backend = std::make_shared<CountingBackend>();
     CasHotKeys hot_keys(0);
-    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys);
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys, DB::Cas::kDefaultRequestWindowMs);
     constexpr int N = 4;
     ParkFirstWrite park;
     park.install(*backend, "k");
@@ -168,7 +168,7 @@ TEST(CASHotKeys, ADecideRunsWithTheLaneMutexReleased)
     SyncClock clock;
     auto backend = std::make_shared<CountingBackend>();
     CasHotKeys hot_keys(0);
-    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys);
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys, DB::Cas::kDefaultRequestWindowMs);
     auto op = requests.admit();
     /// `queueDepthForTest` takes the lane's mutex; a `decide` run under it would deadlock this test,
     /// which hangs the whole `CAS*` gate rather than being reported by a per-test timeout. The call is
@@ -187,7 +187,7 @@ TEST(CASHotKeys, AFailedEnqueueLeavesNoEmptyLaneBehind)
     SyncClock clock;
     auto backend = std::make_shared<CountingBackend>();
     CasHotKeys hot_keys(0);
-    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys);
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys, DB::Cas::kDefaultRequestWindowMs);
     auto op = requests.admit();
     hot_keys.enter_after_lane_hook_for_test = [] { throw std::bad_alloc(); };
     EXPECT_THROW(hot_keys.submit("k", op, op.freeze(Retry::standard()), appendTicket(1)), std::bad_alloc);
@@ -203,7 +203,7 @@ TEST(CASHotKeys, ResultsAreTheEnginesOwn)
     auto backend = std::make_shared<CountingBackend>();
     backend->setRefreshCredentialsResult(false);
     CasHotKeys hot_keys(0);
-    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys);
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys, DB::Cas::kDefaultRequestWindowMs);
     auto op = requests.admit();
     ASSERT_TRUE(std::holds_alternative<Committed>(hot_keys.submit("k", op, op.freeze(Retry::standard()), appendTicket(1))));
 
@@ -288,7 +288,7 @@ TEST(CASHotKeys, ABaseReadThatFailsGivesUpAsReadModifyWriteDoes)
     auto backend = std::make_shared<CountingBackend>();
     backend->setAttemptTimeoutMs(1000);
     CasHotKeys hot_keys(0);
-    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys);
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys, DB::Cas::kDefaultRequestWindowMs);
     auto op = requests.admit();
     (void)orThrow(op.create("k", "1", Retry::standard()), "seed");
 
@@ -316,7 +316,7 @@ TEST(CASHotKeys, ABaseReadThatFailsGivesUpAsReadModifyWriteDoes)
     Fence fence{[] { return uint64_t{0}; },
                 [&](uint64_t, uint64_t needed) { return refuse_reservations && needed > 0 ? Fence::Admit::LostOrRearmed : Fence::Admit::Ok; },
                 [](uint64_t) {}};
-    CasRequests fenced_requests(backend, fence, clock.nowFn(), clock.sleepFn(), &hot_keys);
+    CasRequests fenced_requests(backend, fence, clock.nowFn(), clock.sleepFn(), &hot_keys, DB::Cas::kDefaultRequestWindowMs);
     auto fenced = fenced_requests.admit();
     refuse_reservations = true;
     WriteResult result = hot_keys.submit("k", fenced, fenced.freeze(Retry::standard()), appendTicket(3));
@@ -335,7 +335,7 @@ TEST(CASHotKeys, WaitersLeaveOnTheirOwnFenceLeaseAndDeadline)
     Fence fence{[] { return uint64_t{0}; },
                 [&](uint64_t, uint64_t) { return lease_spent ? Fence::Admit::NoBudget : Fence::Admit::Ok; },
                 [](uint64_t) {}};
-    CasRequests requests(backend, fence, clock.nowFn(), clock.sleepFn(), &hot_keys);
+    CasRequests requests(backend, fence, clock.nowFn(), clock.sleepFn(), &hot_keys, DB::Cas::kDefaultRequestWindowMs);
     ParkFirstWrite park;
     park.install(*backend, "k");
 
@@ -417,7 +417,7 @@ TEST(CASHotKeys, AThrottledHolderKeepsTheWaitersQueuedThroughItsBackoff)
     SyncClock clock;
     auto backend = std::make_shared<CountingBackend>();
     CasHotKeys hot_keys(0);
-    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys);
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys, DB::Cas::kDefaultRequestWindowMs);
 
     /// The holder's own `PUT` parks here on its first attempt; once the two waiters are proven
     /// queued behind it, the release makes that attempt ambiguous instead of letting it through, so
@@ -474,7 +474,7 @@ TEST(CASHotKeys, TheNextHoldStartsFromTheLandedObjectWithoutARead)
     SyncClock clock;
     auto backend = std::make_shared<CountingBackend>();
     CasHotKeys hot_keys(16ULL << 20);
-    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys);
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys, DB::Cas::kDefaultRequestWindowMs);
     auto op = requests.admit();
     const auto cache_starts_before = counter(ProfileEvents::CASHotKeyCacheStarts);
 
@@ -496,7 +496,7 @@ TEST(CASHotKeys, AnExternalWriterCostsOneResolveReadAndOneRetry)
     SyncClock clock;
     auto backend = std::make_shared<CountingBackend>();
     CasHotKeys hot_keys(16ULL << 20);
-    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys);
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys, DB::Cas::kDefaultRequestWindowMs);
     auto op = requests.admit();
     CasRequests external_requests = DB::Cas::tests::openRequestsForTest(backend);
     auto external = external_requests.admit();
@@ -532,7 +532,7 @@ TEST(CASHotKeys, MalformedBytesRepairedExternallyRaiseNoCorruptionVerdict)
     SyncClock clock;
     auto backend = std::make_shared<CountingBackend>();
     CasHotKeys hot_keys(16ULL << 20);
-    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys);
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys, DB::Cas::kDefaultRequestWindowMs);
     auto op = requests.admit();
     CasRequests external_requests = DB::Cas::tests::openRequestsForTest(backend);
     auto external = external_requests.admit();
@@ -571,7 +571,7 @@ TEST(CASHotKeys, ADeclineOnAHintIsRerenderedOnARead)
     SyncClock clock;
     auto backend = std::make_shared<CountingBackend>();
     CasHotKeys hot_keys(16ULL << 20);
-    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys);
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys, DB::Cas::kDefaultRequestWindowMs);
     auto op = requests.admit();
     CasRequests external_requests = DB::Cas::tests::openRequestsForTest(backend);
     auto external = external_requests.admit();
@@ -613,7 +613,7 @@ TEST(CASHotKeys, TheCacheForgetsWhatItCannotVouchFor)
     auto backend = std::make_shared<CountingBackend>();
     backend->setRefreshCredentialsResult(false);
     CasHotKeys hot_keys(16ULL << 20);
-    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys);
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys, DB::Cas::kDefaultRequestWindowMs);
     auto op = requests.admit();
     ASSERT_TRUE(std::holds_alternative<Committed>(hot_keys.submit("k", op, op.freeze(Retry::standard()), appendTicket(1))));
     const auto reads = [&] { return backend->getCount("k"); };
@@ -694,7 +694,7 @@ TEST(CASHotKeys, TheBudgetBoundsBytesAndEntries)
     const size_t etag_bytes = orThrow(probe.create("probe", "x", Retry::standard()), "probe")->render().size();
     const uint64_t one_entry = 1 + 1 + etag_bytes + 64;
     CasHotKeys hot_keys(one_entry + one_entry / 2);
-    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys);
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys, DB::Cas::kDefaultRequestWindowMs);
     auto op = requests.admit();
     const CasHotKeys::Decide one_byte = [](const std::optional<Object> &) -> std::optional<String> { return String("x"); };
 
@@ -714,7 +714,7 @@ TEST(CASHotKeys, TheBudgetBoundsBytesAndEntries)
 
     /// Empty objects weigh their key and their allowance: N of them stay bounded by the budget.
     CasHotKeys small(4 * one_entry);
-    CasRequests small_requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &small);
+    CasRequests small_requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &small, DB::Cas::kDefaultRequestWindowMs);
     auto small_op = small_requests.admit();
     const CasHotKeys::Decide empty = [](const std::optional<Object> &) -> std::optional<String> { return String(); };
     for (int i = 0; i < 40; ++i)
@@ -728,7 +728,7 @@ TEST(CASHotKeys, ACachedStartPastTheDeadlineSendsNothing)
     auto backend = std::make_shared<CountingBackend>();
     backend->setAttemptTimeoutMs(1000);
     CasHotKeys hot_keys(16ULL << 20);
-    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys);
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys, DB::Cas::kDefaultRequestWindowMs);
     auto op = requests.admit();
     ASSERT_TRUE(std::holds_alternative<Committed>(hot_keys.submit("k", op, op.freeze(Retry::standard()), appendTicket(1))));
 
@@ -750,7 +750,7 @@ TEST(CASHotKeys, AnIdenticalCandidateLandedByAnotherServerIsTheEnginesCommit)
     SyncClock clock;
     auto backend = std::make_shared<CountingBackend>();
     CasHotKeys hot_keys(16ULL << 20);
-    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys);
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys, DB::Cas::kDefaultRequestWindowMs);
     auto op = requests.admit();
     CasRequests external_requests = DB::Cas::tests::openRequestsForTest(backend);
     auto external = external_requests.admit();

@@ -176,7 +176,7 @@ std::map<String, UInt64> runRoundAndGetJanitorMetrics(Gc & gc)
 TEST(CASNamespaceJanitorBatches, DeadStreamKeysGoInOneBatchAndStateKeysStayExact)
 {
     auto backend = std::make_shared<CountingBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     const Layout layout("p");
     createObj(*backend, layout.refCatalogKey(), encodeRefCatalog({}));
     const NamespaceLifeId dead = life("dead", 301);
@@ -201,7 +201,7 @@ TEST(CASNamespaceJanitorBatches, DeadStreamKeysGoInOneBatchAndStateKeysStayExact
 TEST(CASNamespaceJanitorBatches, RebornLifeOnTheSamePageKeepsItsKeys)
 {
     auto backend = std::make_shared<CountingBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     const Layout layout("p");
     const CatalogEntry reborn{.ns = RootNamespace{"t"}, .state = NsState::Live, .incarnation = DB::UInt128{302}};
     createObj(*backend, layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {reborn}}));
@@ -221,7 +221,7 @@ TEST(CASNamespaceJanitorBatches, RebornLifeOnTheSamePageKeepsItsKeys)
 TEST(CASNamespaceJanitorBatches, FailedBatchLeaksAndCursorAdvances)
 {
     auto backend = std::make_shared<FailingBulkBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     const Layout layout("p");
     createObj(*backend, layout.refCatalogKey(), encodeRefCatalog({}));
     const std::vector<String> stream = seedLogs(*backend, layout, life("dead", 303), 4);
@@ -239,7 +239,7 @@ TEST(CASNamespaceJanitorBatches, FailedBatchLeaksAndCursorAdvances)
 TEST(CASNamespaceJanitorBatches, UnpublishedPageReportsNoLeaks)
 {
     auto backend = std::make_shared<FailingBulkBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     const Layout layout("p");
     createObj(*backend, layout.refCatalogKey(), encodeRefCatalog({}));
     seedLogs(*backend, layout, life("dead", 305), 4);
@@ -255,7 +255,7 @@ TEST(CASNamespaceJanitorBatches, UnpublishedPageReportsNoLeaks)
 TEST(CASNamespaceJanitorBatches, AuthorityLostAfterBatchHoldsCursor)
 {
     auto backend = std::make_shared<FlipAfterBulkBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     const Layout layout("p");
     createObj(*backend, layout.refCatalogKey(), encodeRefCatalog({}));
     const std::vector<String> stream = seedLogs(*backend, layout, life("dead", 304), 4);

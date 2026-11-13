@@ -1029,7 +1029,7 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupNeverGetsTheDyingObject)
 
     /// The republished body must NOT read back as the incarnation GC condemned -- that compare is the
     /// one GC's redelete makes, so it is the one this asserts.
-    CasRequests probe(b, Fence::open());
+    CasRequests probe(b, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation probe_op = probe.admit();
     const auto after = probe_op.head(blob_key, Retry::standard());
     ASSERT_TRUE(after.has_value());
@@ -2517,7 +2517,7 @@ TEST(CASPartWriteTxnStageManifestRetry, AmbiguousLandedWriteResolvesToCommittedW
     const auto ev = std::find_if(observed_events.begin(), observed_events.end(),
                                  [](const CasEvent & e) { return e.type == CasEventType::ManifestPut; });
     ASSERT_NE(ev, observed_events.end()) << "the stage must still emit its ManifestPut audit event";
-    CasRequests probe(b, Fence::open());
+    CasRequests probe(b, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation probe_op = probe.admit();
     const auto landed = probe_op.head(key, Retry::standard());
     ASSERT_TRUE(landed.has_value());

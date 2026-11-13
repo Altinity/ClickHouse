@@ -5,6 +5,9 @@
 namespace DB::Cas
 {
 
+/// The request window of a plane whose budget does not name one.
+inline constexpr uint64_t kDefaultRequestWindowMs = 90000;
+
 /// The limits a writable mount is configured with. `CasMountRuntime::admit` measures a request against
 /// `lease_safety_margin_ms` plus a caller-supplied need expressed in attempt envelopes (one for an
 /// ordinary attempt, TWO for a ref-log append's write-plus-settlement-read -- see
@@ -17,6 +20,9 @@ struct CasRequestBudget
     /// every attempt it starts; the actual socket-level wait is configured on the object storage's
     /// client (the object storage backend's single-attempt client), not by this struct.
     uint64_t attempt_timeout_ms = 5000;
+    /// How long a request whose policy names no window of its own keeps retrying, measured from the
+    /// call's start. Each request plane takes it from its pool's budget.
+    uint64_t request_window_ms = kDefaultRequestWindowMs;
     /// Startup-only margin folded into `validateCasRequestBudget`'s inequality against the mount lease
     /// TTL. Not consulted at runtime by the engine itself -- the caller's fence (backed by the local
     /// write fence's own deadline) is what actually gates lease-relative timing per attempt.

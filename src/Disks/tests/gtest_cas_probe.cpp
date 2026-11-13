@@ -19,7 +19,7 @@ namespace
 /// during pool bootstrap, before any mount fence exists to enforce.
 CasRequests makeRequests(Backend & backend)
 {
-    return CasRequests(BackendPtr(&backend, [](Backend *) {}), Fence::open());
+    return CasRequests(BackendPtr(&backend, [](Backend *) {}), Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
 }
 
 }

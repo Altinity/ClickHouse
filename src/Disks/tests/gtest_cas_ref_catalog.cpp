@@ -1145,7 +1145,7 @@ TEST(CASRefCatalog, CasUpdateEndsAtTheDeadlineNotAfterAHundredUnsleptIterations)
     EXPECT_GT(mutate_calls, 1);   /// genuinely retried, not a single-shot failure
     EXPECT_FALSE(clock.sleeps.empty()) << "every retry must back off; an unslept loop would burn the "
                                           "deadline on requests instead of waiting out the contention";
-    EXPECT_GE(clock.now - started_at, Retry::standard().window_ms - 5000)
+    EXPECT_GE(clock.now - started_at, kDefaultRequestWindowMs - 5000)
         << "the loop ended at the policy's own deadline, not at an iteration count";
 }
 
@@ -2307,7 +2307,7 @@ struct PoolAndExternal
     explicit PoolAndExternal(std::shared_ptr<CountingBackend> backend_)
         : backend(std::move(backend_))
         , hot_keys(16ULL << 20)
-        , pool(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys)
+        , pool(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys, DB::Cas::kDefaultRequestWindowMs)
         , external(DB::Cas::tests::openRequestsForTest(backend))
     {
     }
@@ -2693,7 +2693,7 @@ TEST(CASRefCatalog, CreateNamespaceStep1DoesNotPausePastItsDeadline)
     t.f.pool.setAttemptReservationForTest(1'000);
     t.backend->failNextWriteWith(t.backend->catalog_key, lostResponse());
     /// Leaves 1.5 s of the window: enough for the settle read, too little for a pause plus two envelopes.
-    t.backend->on_write = [&] { t.f.clock.now.fetch_add(Retry::standard().window_ms - 1'500); };
+    t.backend->on_write = [&] { t.f.clock.now.fetch_add(kDefaultRequestWindowMs - 1'500); };
     const size_t sleeps_before = t.f.clock.sleeps.size();
 
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)t.createA(); });
@@ -3216,7 +3216,7 @@ TEST(CASRefCatalog, TheGCEraseRacesTheLaneAsItRacesEverything)
 
     /// The erase runs on an open plane of the same pool while a lane holder is parked in its write:
     /// it does not wait.
-    CasRequests open_plane(f.backend, Fence::open(), f.clock.nowFn(), f.clock.sleepFn(), &f.hot_keys);
+    CasRequests open_plane(f.backend, Fence::open(), f.clock.nowFn(), f.clock.sleepFn(), &f.hot_keys, DB::Cas::kDefaultRequestWindowMs);
     CasOperation erase_op = open_plane.admit();
     std::latch parked(1);
     std::latch release(1);

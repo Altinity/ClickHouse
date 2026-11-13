@@ -3269,7 +3269,7 @@ TEST(CASMountLease, FarewellRunsOnAnOpenFenceAfterTheMountFenceIsLost)
         {
             if (fence_lost)
                 throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "mount fence lost");
-        }});
+        }}, {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     mount_requests.setNowFnForTest([&boot] { return boot; });
     mount_requests.setSleepFnForTest([&boot](uint64_t ms) { boot += ms; });
     CasRequests open_requests = openRequestsForTest(backend);
@@ -3314,7 +3314,7 @@ TEST(CASMountLease, ClaimIsNotAdmittedUnderTheMountFence)
     CasRequests mount_requests(backend, Fence{
         [] { return uint64_t{0}; },
         [](uint64_t, uint64_t) { return Fence::Admit::LostOrRearmed; },
-        [](uint64_t) { throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "mount fence lost"); }});
+        [](uint64_t) { throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "mount fence lost"); }}, {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     mount_requests.setNowFnForTest([&boot] { return boot; });
     mount_requests.setSleepFnForTest([&boot](uint64_t ms) { boot += ms; });
     CasRequests open_requests = openRequestsForTest(backend);
@@ -3403,7 +3403,7 @@ TEST(CASMountLease, RemountRenewalIsAdmittedOffTheMountFence)
     CasRequests mount_requests(backend, Fence{
         [] { return uint64_t{0}; },
         [](uint64_t, uint64_t) { return Fence::Admit::LostOrRearmed; },
-        [](uint64_t) { throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "mount fence lost"); }});
+        [](uint64_t) { throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "mount fence lost"); }}, {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     mount_requests.setNowFnForTest([&boot] { return boot; });
     mount_requests.setSleepFnForTest([&boot](uint64_t ms) { boot += ms; });
     CasRequests open_requests = openRequestsForTest(backend);

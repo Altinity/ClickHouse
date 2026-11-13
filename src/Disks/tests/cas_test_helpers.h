@@ -125,7 +125,8 @@ private:
 /// Every operation admitted from it holds a reference to it, so it must be named and outlive them.
 inline DB::Cas::CasRequests openRequestsForTest(DB::Cas::BackendPtr backend)
 {
-    return DB::Cas::CasRequests(std::move(backend), DB::Cas::Fence::open());
+    return DB::Cas::CasRequests(
+        std::move(backend), DB::Cas::Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
 }
 
 /// The same, for a fixture holding only a reference. The aliasing `shared_ptr` owns nothing, so the
@@ -185,7 +186,8 @@ class OperationForTest
 {
 public:
     explicit OperationForTest(DB::Cas::BackendPtr backend)
-        : requests(std::move(backend), DB::Cas::Fence::open()), operation(requests.admit())
+        : requests(std::move(backend), DB::Cas::Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs)
+        , operation(requests.admit())
     {
     }
 

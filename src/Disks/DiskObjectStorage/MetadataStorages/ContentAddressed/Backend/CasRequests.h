@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasFence.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasHotKeys.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestBudget.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRetry.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasWriteResult.h>
 #include <Common/Exception.h>
@@ -198,10 +199,12 @@ public:
     /// envelope (attempt timeout plus its connect caps): it is what the engine reserves before it
     /// starts anything. `hot_keys` is the pool's
     /// write lane, shared by its planes; without one this object owns a private lane with no cache,
-    /// so a write through it costs today's read and write.
+    /// so a write through it costs today's read and write. `default_window_ms` is the window of a
+    /// policy that names none (`Retry::standard`, `Retry::once`); it has no default, so a plane that
+    /// forgets the disk's `cas_request_window_ms` does not compile.
     CasRequests(BackendPtr backend_, Fence fence_,
-                std::function<uint64_t()> now_ms_ = {}, std::function<void(uint64_t)> sleep_ms_ = {},
-                CasHotKeys * hot_keys_ = nullptr);
+                std::function<uint64_t()> now_ms_, std::function<void(uint64_t)> sleep_ms_,
+                CasHotKeys * hot_keys_, uint64_t default_window_ms_);
 
     /// Both may be called concurrently on one `CasRequests`: neither writes a member, and the only
     /// state either reads is the backend and the fence -- whose closures must therefore be thread-safe
@@ -249,6 +252,9 @@ private:
         return std::forward<Fn>(fn)(access);
     }
 
+    /// `policy` bound to this plane's clock and default window.
+    Retry::Bound bindPolicy(const Retry & policy) const { return policy.bind(now_ms(), default_window_ms); }
+
     /// The store's answer for `key`, as an incarnation. Throws `CORRUPTED_DATA` naming the key when
     /// the value fails this backend's dialect grammar.
     Etag mint(const String & key, String value) const;
@@ -265,6 +271,7 @@ private:
     std::function<uint64_t()> now_ms;
     std::function<void(uint64_t)> sleep_ms;
     uint64_t attempt_reservation_ms;
+    uint64_t default_window_ms;
     /// The private lane of a `CasRequests` built without a pool; null when `hot_keys` is the pool's.
     std::unique_ptr<CasHotKeys> own_hot_keys;
     CasHotKeys * hot_keys;

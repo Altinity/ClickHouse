@@ -437,7 +437,7 @@ TEST(CASRefWriterChunkedFlush, DropNamespaceOverOpCapSucceeds)
         .checkpoint_snapshot_id = RefTxnId{epoch, 1},
         .last_epoch_seal = std::nullopt,
     });
-    CasRequests catalog_requests(backend, Fence::open());
+    CasRequests catalog_requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation catalog_op = catalog_requests.admit();
     const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(catalog_op, layout, ns).value();
     backend->resetCounts();

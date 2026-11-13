@@ -369,7 +369,7 @@ TEST(CASEvent, DeepReentrancyPreservesDeterministicPhysicalAttemptTruth)
         /// against, and with a sleep that advances it: the deepest renewal reissues, and no unit test
         /// may serve the engine's jittered backoff for real.
         planes[index] = std::make_unique<CasRequests>(
-            backends[index], Fence::open(), [&] { return boot_ms; }, [&](uint64_t ms) { boot_ms += ms; });
+            backends[index], Fence::open(), [&] { return boot_ms; }, [&](uint64_t ms) { boot_ms += ms; }, nullptr, DB::Cas::kDefaultRequestWindowMs);
         renewers[index] = std::make_unique<MountLeaseRenewer>(
             *planes[index],
             *planes[index],

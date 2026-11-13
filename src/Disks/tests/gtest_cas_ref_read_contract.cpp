@@ -60,7 +60,7 @@ void noAuthorityRefresh()
 /// `deleteCatalogLife` -- lifecycle-real, not a raw sentinel overwrite.
 void deleteCatalogLife(const BackendPtr & backend, const Layout & layout, const NamespaceLifeId & life)
 {
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
     CasRefCatalog::casUpdate(op, layout, [&](const RefCatalog & current)
     {
@@ -103,7 +103,7 @@ NamespaceLifeId admitReplacementLife(
     if (predecessor.incarnation == successor_incarnation)
         throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "Fixture life ids unexpectedly collide");
     const NamespaceLifeId successor = NamespaceLifeId::fromCatalogEntry(predecessor.ns, successor_incarnation);
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
     CasRefCatalog::casAdmitEntry(op, layout, gc_shards, CatalogEntry{
         .ns = successor.ns, .state = NsState::Live, .incarnation = successor.incarnation});

@@ -295,7 +295,7 @@ public:
     bool existsIgnoringFault(const String & key)
     {
         bypass_fault = true;
-        CasRequests requests(BackendPtr(std::shared_ptr<void>(), this), Fence::open());
+        CasRequests requests(BackendPtr(std::shared_ptr<void>(), this), Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
         CasOperation op = requests.admit();
         const bool present = op.head(key, Retry::once()).has_value();
         bypass_fault = false;

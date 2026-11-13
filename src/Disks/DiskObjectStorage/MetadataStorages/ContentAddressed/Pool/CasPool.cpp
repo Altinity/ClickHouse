@@ -194,13 +194,13 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
           [this](uint64_t g) { mount_runtime.checkFenceOrThrow(g); }},
           config.boot_ms_fn,
           config.retry_sleep_fn ? config.retry_sleep_fn : mountPlaneSleepFn(),
-          &hot_keys)
+          &hot_keys, config.cas_request_budget.request_window_ms)
     , lease_requests(
           pool_backend,
           Fence::open(),
           config.boot_ms_fn,
           config.retry_sleep_fn ? config.retry_sleep_fn : mountPlaneSleepFn(),
-          &hot_keys)
+          &hot_keys, config.cas_request_budget.request_window_ms)
     /// The open plane's fence is the pool's teardown flag: generation 0 forever, exactly like
     /// `Fence::open`, but `admit` refuses once `beginTeardown` ran. A GC round, an FSCK or a probe in
     /// flight is then refused at its next request instead of running to completion under a disk that
@@ -217,7 +217,7 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
           [](uint64_t) {}},
           config.boot_ms_fn,
           config.retry_sleep_fn ? config.retry_sleep_fn : openPlaneSleepFn(),
-          &hot_keys)
+          &hot_keys, config.cas_request_budget.request_window_ms)
     /// Seed the monotone admitted-algo cache from the pool state `createOrValidate` already
     /// established (fresh create, steady-state member, or a just-completed admission union) --
     /// register-before-first-write means this Pool's own `writeAlgo()` is ALWAYS a
@@ -422,7 +422,8 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
     Layout layout(config.pool_prefix);
     /// The whole bootstrap runs on an OPEN fence: there is no mount lease yet, and the claim below is
     /// what establishes one.
-    CasRequests bootstrap_requests(backend, Fence::open(), config.boot_ms_fn);
+    CasRequests bootstrap_requests(
+        backend, Fence::open(), config.boot_ms_fn, {}, nullptr, config.cas_request_budget.request_window_ms);
     bool initialize_empty_catalog = false;
     /// The probe writes and deletes throwaway keys to verify conditional-op enforcement. A read-only
     /// open must never mutate the pool it inspects; fsck only reads, so skip it. (Pool meta below is
@@ -1013,7 +1014,8 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
     /// with `config.boot_ms_fn`: a retry loop bound to a frozen test clock that only a fake sleep
     /// advances would otherwise retry forever against this engine's default REAL sleep, which never
     /// calls it -- the deadline it measures against would never appear to elapse.
-    CasRequests bootstrap_requests(backend, Fence::open(), config.boot_ms_fn, config.retry_sleep_fn);
+    CasRequests bootstrap_requests(
+        backend, Fence::open(), config.boot_ms_fn, config.retry_sleep_fn, nullptr, config.cas_request_budget.request_window_ms);
     CasOperation owner_op = bootstrap_requests.admit();
     std::optional<UInt128> victim_uuid = readOwnerUuid(owner_op, layout, victim_srid);
     if (!victim_uuid)

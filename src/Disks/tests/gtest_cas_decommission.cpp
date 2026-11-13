@@ -287,7 +287,7 @@ void makeTableWithRefs(Pool & victim, const String & ns_str, uint64_t committed,
     /// A throwaway open-fence operation, for the two `CasRefCatalog` calls below only: this fixture
     /// writes everything else directly against `backend` via the raw-write helpers, unrelated to any
     /// mount fence.
-    CasRequests requests(victim.poolBackendPtr(), Fence::open());
+    CasRequests requests(victim.poolBackendPtr(), Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
 
     /// Final physical ids are pool-wide. The generic raw-write helper intentionally uses one shared

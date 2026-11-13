@@ -15,7 +15,7 @@ namespace
 
 CasRequests makeRequests(BackendPtr backend, FakeClock & clock, Fence fence = Fence::open())
 {
-    return CasRequests(std::move(backend), std::move(fence), clock.nowFn(), clock.sleepFn());
+    return CasRequests(std::move(backend), std::move(fence), clock.nowFn(), clock.sleepFn(), nullptr, DB::Cas::kDefaultRequestWindowMs);
 }
 
 }

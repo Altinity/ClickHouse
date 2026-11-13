@@ -834,7 +834,7 @@ TEST(CASRefGc, RefObjectCleanupRetainsCheckpointPredecessorSealProof)
     Gc gc(store, kGc);
     runToFixpoint(store, gc);
 
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
     EXPECT_TRUE(op.head(layout.refLogKey(life, seal_id), Retry::once()).has_value())
         << "cleanup must retain the predecessor seal that proves the checkpoint base's epoch transition";
@@ -1763,7 +1763,7 @@ TEST(CASRefGc, RefSnaplogLifecycleE2E)
 
     /// The writer's compaction: a snapshot of ns_a covering its greatest log (va2), the same
     /// deterministic bytes the oracle recomputes.
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
     const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(op, layout);
     const RefTableState sa = recoverRefTableDetailedAtCatalogCutForTest(*backend, layout, catalog_cut, ns_a).state;
@@ -2033,7 +2033,7 @@ TEST(CASRefGc, CatalogAdmittedFreshLifeWithoutParentSeedsSuccessorSeal)
     const RootNamespace ns{"00/aa@cas@"};
     fixture::admitLive(*backend, layout, ns);
 
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
     const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(op, layout);
     ASSERT_EQ(catalog_cut.catalog.entries.size(), 1u);
