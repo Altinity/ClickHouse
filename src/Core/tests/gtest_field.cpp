@@ -1,5 +1,14 @@
 #include <gtest/gtest.h>
+#include <Common/Exception.h>
 #include <Core/Field.h>
+#include <IO/ReadBufferFromString.h>
+#include <IO/WriteBufferFromString.h>
+#include <IO/WriteHelpers.h>
+
+namespace DB::ErrorCodes
+{
+    extern const int ARGUMENT_OUT_OF_BOUND;
+}
 
 using namespace DB;
 
@@ -109,4 +118,58 @@ GTEST_TEST(Field, DeeplyNestedCopyAndDestroyDoesNotOverflowStack)
         Field src{obj};                   // Object lvalue -> copy
         ASSERT_EQ(src.getType(), Field::Types::Object);
     }
+}
+
+
+/// A binary Decimal whose scale exceeds the type's maximum precision is rejected at the
+/// deserialization boundary; otherwise the out-of-range scale overruns a fixed-size buffer in
+/// the decimal text writer.
+GTEST_TEST(Field, ReadBinaryDecimalOutOfRangeScaleThrows)
+{
+    WriteBufferFromOwnString wb;
+    writeBinary(UInt8(Field::Types::Decimal64), wb);
+    writeBinary(Int64(123), wb); /// value (Decimal<Int64> is a POD 8-byte payload)
+    writeBinary(UInt32(1000), wb); /// scale far above max_precision<Decimal64> = 18
+    wb.finalize();
+
+    ReadBufferFromString rb(wb.str());
+    try
+    {
+        readFieldBinary(rb);
+        FAIL() << "expected ARGUMENT_OUT_OF_BOUND";
+    }
+    catch (const Exception & e)
+    {
+        ASSERT_EQ(e.code(), ErrorCodes::ARGUMENT_OUT_OF_BOUND);
+    }
+
+    /// A valid scale round-trips.
+    WriteBufferFromOwnString ok_wb;
+    writeFieldBinary(Field(DecimalField<Decimal64>(Decimal64(12345), 4)), ok_wb);
+    ok_wb.finalize();
+    ReadBufferFromString ok_rb(ok_wb.str());
+    Field roundtrip = readFieldBinary(ok_rb);
+    ASSERT_EQ(roundtrip.safeGet<DecimalField<Decimal64>>().getScale(), 4u);
+}
+
+
+/// The text `Field` dump reader `restoreFromDump` shares the out-of-range-scale problem with the
+/// binary reader. The exponent form `Decimal64_'1e-1000'` builds a `DecimalField` with scale 1000 (the
+/// `e`/`E` branch of `readDigits` bypasses the closing-quote check the plain-fraction form hits),
+/// which an unfixed reader would hand to the decimal text writer. The scale must be rejected.
+GTEST_TEST(Field, RestoreFromDumpDecimalOutOfRangeScaleThrows)
+{
+    try
+    {
+        Field::restoreFromDump("Decimal64_'1e-1000'");
+        FAIL() << "expected ARGUMENT_OUT_OF_BOUND";
+    }
+    catch (const Exception & e)
+    {
+        ASSERT_EQ(e.code(), ErrorCodes::ARGUMENT_OUT_OF_BOUND);
+    }
+
+    /// An in-range exponent-form scale still round-trips.
+    Field restored = Field::restoreFromDump("Decimal64_'1e-5'");
+    ASSERT_EQ(restored.safeGet<DecimalField<Decimal64>>().getScale(), 5u);
 }
