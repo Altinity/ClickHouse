@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <future>
@@ -63,6 +64,7 @@ using namespace DB::Cas;
 using DB::Cas::tests::CountingBackend;
 using DB::Cas::tests::committedRow;
 using DB::Cas::tests::expectThrowsCode;
+using DB::Cas::tests::expectThrowsCodeWithMessage;
 using DB::Cas::tests::minimalLiveSnapshot;
 using DB::Cas::tests::namespaceBirthOp;
 using DB::Cas::tests::publishCommittedOps;
@@ -492,6 +494,11 @@ public:
         None,
         CommitThenThrow,
         OtherWriterReplacement,
+        /// Every matching catalog CAS throws an ambiguous error without landing, until reset to `None`.
+        ThrowUncommitted,
+        /// The first matching catalog CAS is kept instead of applied and its response is lost. Later ones
+        /// throw as in `ThrowUncommitted`. `releaseHeldCatalogWrite` applies the kept write.
+        HoldUncommitted,
     };
     CatalogCasFault catalog_cas_fault = CatalogCasFault::None;
     String catalog_fault_key;
@@ -502,6 +509,11 @@ public:
     /// This reaches the removal lane's post-close observation without faulting its initial discovery.
     int catalog_gets_before_fault = -1;
     int catalog_get_fault_count = 0;
+    /// Fail `get_fault_count` GETs of the exact key `get_fault_key`.
+    String get_fault_key;
+    int get_fault_count = 0;
+    /// Called with the key at the start of every GET, before any fault. May re-enter the pool.
+    std::function<void(const String &)> read_observer;
 
     String fault_key_substr;
     int fault_count = 0;
@@ -554,6 +566,13 @@ public:
     std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
     {
         recordRequestJournalEvent("GET " + key);
+        if (read_observer)
+            read_observer(key);
+        if (key == get_fault_key && get_fault_count > 0)
+        {
+            --get_fault_count;
+            throw std::runtime_error("RefWriterTestBackend: simulated read failure");
+        }
         if (key == ckpt_get_hook_key && ckpt_get_hook)
         {
             auto hook = std::exchange(ckpt_get_hook, nullptr);
@@ -631,6 +650,19 @@ public:
         {
             --ckpt_conflict_count;
             return std::unexpected(DB::Cas::Backend::RawConflict{});
+        }
+        if (key == catalog_fault_key && catalog_cas_fault == CatalogCasFault::HoldUncommitted && !held_catalog_write)
+        {
+            catalog_cas_fault_fired = true;
+            const auto current = InMemoryBackend::read(key, access);
+            held_catalog_write = HeldWrite{key, bytes, current ? current->bytes : String{}};
+            throw Poco::TimeoutException("RefWriterTestBackend: catalog CAS response lost; the request is still in flight");
+        }
+        if (key == catalog_fault_key
+            && (catalog_cas_fault == CatalogCasFault::ThrowUncommitted || catalog_cas_fault == CatalogCasFault::HoldUncommitted))
+        {
+            catalog_cas_fault_fired = true;
+            throw Poco::TimeoutException("RefWriterTestBackend: catalog CAS response lost before it landed");
         }
         if (key == catalog_fault_key && catalog_cas_fault != CatalogCasFault::None)
         {
@@ -740,6 +772,29 @@ public:
     /// See `createForTest`'s `block_this` branch. Set before spawning any thread that could race
     /// a create-shaped write, like `corrupt_key_substr`/`fault_key_substr` above -- not itself lock-protected.
     bool block_throw_corrupted_on_release = false;
+
+    struct HeldWrite
+    {
+        String key;
+        String bytes;
+        String expected_bytes;
+    };
+    std::optional<HeldWrite> held_catalog_write;
+
+    /// Delivers the kept catalog write the way the store would: it applies only if the object still holds
+    /// the bytes it was sent against. Returns whether it applied.
+    bool releaseHeldCatalogWrite()
+    {
+        catalog_cas_fault = CatalogCasFault::None;
+        const auto held = std::exchange(held_catalog_write, std::nullopt);
+        if (!held)
+            return false;
+        DB::Cas::tests::OperationForTest op(*this);
+        const auto got = (*op).read(held->key, DB::Cas::Retry::once());
+        if (!got || got->bytes != held->expected_bytes)
+            return false;
+        return std::holds_alternative<DB::Cas::Committed>((*op).replace(held->key, held->bytes, got->etag, DB::Cas::Retry::once()));
+    }
 
     /// "Deliver" the earlier ambiguous write: the request DID eventually land server-side, the caller
     /// just never saw the ack. No-op if no fault has fired since the last delivery.
@@ -4424,6 +4479,642 @@ TEST(CASRefWriterNamespaceRemoval, PredurableCatalogReadFailureReopensExactLiveL
         update.published_at_ms = 17;
     })) << "a fresh exact Live observation must reopen the lane after a pre-durable failure";
     EXPECT_EQ(catalogEntryOrThrow(backend, layout, ns).state, NsState::Live);
+}
+
+namespace
+{
+
+/// Every catalog CAS throws as if its response were lost, so the removal ends with an unknown outcome
+/// while the row stays `Live`.
+void dropWithAmbiguousCatalogWrite(
+    const std::shared_ptr<RefWriterTestBackend> & backend, const PoolPtr & store, const RootNamespace & ns,
+    RefWriterTestBackend::CatalogCasFault fault = RefWriterTestBackend::CatalogCasFault::ThrowUncommitted)
+{
+    backend->catalog_fault_key = store->layout().refCatalogKey();
+    backend->catalog_cas_fault = fault;
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropNamespace(ns); });
+    EXPECT_TRUE(backend->catalog_cas_fault_fired) << "the ambiguous catalog write was never reached";
+    if (fault != RefWriterTestBackend::CatalogCasFault::HoldUncommitted)
+        backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::None;
+    EXPECT_EQ(catalogEntryOrThrow(backend, store->layout(), ns).state, NsState::Live);
+}
+
+void updatePublishedAt(const PoolPtr & store, const RootNamespace & ns)
+{
+    store->updateRefPublishedAt(ns, "owned", [](RefPublishedAtUpdate & update)
+    {
+        update.published_at_ms = 17;
+    });
+}
+
+size_t catalogWritesInJournal(const std::shared_ptr<RefWriterTestBackend> & backend, const Layout & layout)
+{
+    const String catalog_write = "CAS " + layout.refCatalogKey();
+    const std::vector<String> journal = backend->requestJournal();
+    return static_cast<size_t>(std::count(journal.begin(), journal.end(), catalog_write));
+}
+
+/// A pinned lane names the possible late write; a lane that is merely Removing names the removal.
+void expectPositiveLaneClosed(const PoolPtr & store, const RootNamespace & ns)
+{
+    expectThrowsCodeWithMessage(
+        DB::ErrorCodes::NETWORK_ERROR, "a removal write may still land", [&] { updatePublishedAt(store, ns); });
+}
+
+}
+
+/// An ambiguous `Live -> Removing` write can still land after the call gave up, so one read showing
+/// `Live` must not reopen the positive lane: a later landing would stop writes at the next append.
+/// The backend keeps the write and applies it on release, after the removal call has returned.
+TEST(CASRefWriterNamespaceRemoval, AmbiguousBeginRemovingKeepsTheWriteLaneClosed)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend, wedgeTestBudget());
+    auto clock = VirtualRetryClock::installOn(store);
+    const RootNamespace ns{"srv1/ambiguous_begin_removing"};
+    publishEmptyPart(store, ns, "owned");
+
+    dropWithAmbiguousCatalogWrite(backend, store, ns, RefWriterTestBackend::CatalogCasFault::HoldUncommitted);
+    expectPositiveLaneClosed(store, ns);
+
+    ASSERT_TRUE(backend->releaseHeldCatalogWrite()) << "the kept write must still apply";
+    EXPECT_EQ(catalogEntryOrThrow(backend, store->layout(), ns).state, NsState::Removing);
+    expectPositiveLaneClosed(store, ns);
+
+    /// Creation resolves the namespace life through a different refusal site than a ref mutation does.
+    expectThrowsCodeWithMessage(
+        DB::ErrorCodes::NETWORK_ERROR, "a removal write may still land", [&] { (void)store->namespaceLife(ns); });
+
+    EXPECT_NO_THROW(store->dropNamespace(ns)) << "a retried removal completes";
+    EXPECT_FALSE(store->namespaceStillLogicallyPresent(ns));
+}
+
+/// The uncertainty outlives the call that created it: a retried removal that fails before it sends
+/// anything, then sees an unchanged `Live` row, must not reopen the lane.
+TEST(CASRefWriterNamespaceRemoval, FailedRetryAfterAmbiguousBeginRemovingDoesNotReopenTheLane)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend, wedgeTestBudget());
+    auto clock = VirtualRetryClock::installOn(store);
+    const RootNamespace ns{"srv1/ambiguous_then_failed_retry"};
+    publishEmptyPart(store, ns, "owned");
+
+    dropWithAmbiguousCatalogWrite(backend, store, ns);
+
+    backend->catalog_gets_before_fault = 1;   /// the retry's initial discovery passes; its post-close read fails
+    backend->catalog_get_fault_count = 1;
+    EXPECT_THROW(store->dropNamespace(ns), std::runtime_error);
+    expectPositiveLaneClosed(store, ns);
+
+    EXPECT_NO_THROW(store->dropNamespace(ns));
+}
+
+/// A fresh runtime would start with the lane open, so cache pressure must not evict the runtime that
+/// keeps it closed.
+TEST(CASRefWriterNamespaceRemoval, AmbiguousBeginRemovingSurvivesRefTableEviction)
+{
+    const CasRequestBudget budget = wedgeTestBudget();
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPoolWithConfig(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget, .ref_table_cache_bytes = 1});
+    auto clock = VirtualRetryClock::installOn(store);
+    const RootNamespace ns{"srv1/ambiguous_then_evicted"};
+    publishEmptyPart(store, ns, "owned");
+
+    dropWithAmbiguousCatalogWrite(backend, store, ns);
+    publishEmptyPart(store, RootNamespace{"srv1/other_a"}, "y");
+    publishEmptyPart(store, RootNamespace{"srv1/other_b"}, "z");
+
+    EXPECT_TRUE(store->refTableCachedForTest(ns)) << "the closed runtime must stay resident";
+    expectPositiveLaneClosed(store, ns);
+
+    /// The pinned runtime cannot be evicted, so the budget stays exceeded; a further namespace must still
+    /// load and accept a write.
+    const RootNamespace later{"srv1/other_c"};
+    EXPECT_NO_THROW(publishEmptyPart(store, later, "w"));
+    EXPECT_TRUE(store->resolveRef(later, "w").has_value());
+    EXPECT_TRUE(store->refTableCachedForTest(ns));
+    EXPECT_NO_THROW(store->dropNamespace(ns));
+}
+
+/// Upper bound on the virtual time one drop may spend: the window frozen at its entry, one backoff draw
+/// the pace does not consult the deadline for (`driveToTheWedge` asserts no pause exceeds it), and slack for
+/// the virtual clock's extra millisecond per pause.
+const uint64_t kMaxBackoffDrawMs = 5000;
+const uint64_t kVirtualClockPauseSlackMs = 100;
+const uint64_t kOneWindowPlusBackoffMs
+    = DB::Cas::Retry::standard().window_ms + kMaxBackoffDrawMs + kVirtualClockPauseSlackMs;
+
+/// An ambiguous `Live -> Removing` write that the resolve read finds landed leaves nothing unresolved:
+/// the runtime is evictable and a refusal names `Removing`, not a write that may still land. The kept
+/// write is applied just before the resolve read.
+TEST(CASRefWriterNamespaceRemoval, ResolveReadProvingRemovingLeavesNoUnresolvedWrite)
+{
+    const CasRequestBudget budget = wedgeTestBudget();
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPoolWithConfig(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget, .ref_table_cache_bytes = 1});
+    auto clock = VirtualRetryClock::installOn(store);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/resolve_read_proves_removing"};
+    publishEmptyPart(store, ns, "owned");
+
+    backend->catalog_fault_key = layout.refCatalogKey();
+    backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::HoldUncommitted;
+    /// The resolve read follows the loop's last read with no pause in between, so it is the first catalog
+    /// read that finds the clock unmoved since the previous one. The loop's own mismatch re-read can
+    /// also find it unmoved, so the release time is checked against the window below.
+    std::optional<uint64_t> previous_read_ms;
+    std::optional<uint64_t> released_at_ms;
+    bool applied_by_resolve_read = false;
+    backend->read_observer = [&](const String & key)
+    {
+        if (key != layout.refCatalogKey() || !backend->catalog_cas_fault_fired)
+            return;
+        const uint64_t now = clock->nowMs();
+        if (!applied_by_resolve_read && previous_read_ms == now)
+        {
+            applied_by_resolve_read = true;
+            released_at_ms = now;
+            backend->releaseHeldCatalogWrite();
+        }
+        previous_read_ms = now;
+    };
+    /// Wedge the terminal append so the runtime stays between `Removing` and the terminal transaction.
+    backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
+    const uint64_t drop_started_ms = clock->nowMs();
+    driveToTheWedge(*clock, *backend, [&] { store->dropNamespace(ns); });
+    backend->read_observer = nullptr;
+
+    ASSERT_TRUE(applied_by_resolve_read) << "the kept write was never applied before the resolve read";
+    ASSERT_TRUE(released_at_ms.has_value());
+    /// The loop gives up once the next pause no longer fits in the window, so at most one backoff draw
+    /// before its end. An earlier release came from a read inside the loop.
+    EXPECT_GE(*released_at_ms - drop_started_ms, DB::Cas::Retry::standard().window_ms - kMaxBackoffDrawMs)
+        << "the kept write was released inside the transition's retry loop, before it gave up; "
+           "the resolve read in the catch was not what applied it";
+    EXPECT_EQ(catalogEntryOrThrow(backend, layout, ns).state, NsState::Removing);
+    expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "is Removing", [&] { updatePublishedAt(store, ns); });
+
+    EXPECT_NO_THROW(store->dropNamespace(ns)) << "a retried removal completes";
+    publishEmptyPart(store, RootNamespace{"srv1/other_a"}, "y");
+    publishEmptyPart(store, RootNamespace{"srv1/other_b"}, "z");
+    EXPECT_FALSE(store->refTableCachedForTest(ns)) << "nothing may still land, so the runtime is not pinned";
+}
+
+/// A retried removal that proves the row `Removing` settles the earlier unanswered write: a refusal
+/// then names `Removing`, not a write that may still land. The terminal append is wedged so the retry
+/// ends between `Removing` and the terminal transaction.
+TEST(CASRefWriterNamespaceRemoval, RetryProvingRemovingClearsTheUnresolvedWrite)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend, wedgeTestBudget());
+    auto clock = VirtualRetryClock::installOn(store);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/retry_proves_removing"};
+    publishEmptyPart(store, ns, "owned");
+
+    dropWithAmbiguousCatalogWrite(backend, store, ns, RefWriterTestBackend::CatalogCasFault::HoldUncommitted);
+    expectPositiveLaneClosed(store, ns);
+
+    ASSERT_TRUE(backend->releaseHeldCatalogWrite()) << "the kept write must still apply";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
+    driveToTheWedge(*clock, *backend, [&] { store->dropNamespace(ns); });
+    EXPECT_EQ(catalogEntryOrThrow(backend, layout, ns).state, NsState::Removing);
+
+    expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "is Removing", [&] { updatePublishedAt(store, ns); });
+
+    EXPECT_NO_THROW(store->dropNamespace(ns)) << "a retried removal completes";
+}
+
+/// Two removal attempts on one runtime must not overlap between closing the lane and resolving the
+/// transition: otherwise one can reopen the lane before the other has sent its write. The first attempt
+/// holds the window open until the second one has made its last request before the gate (its catalog
+/// read, seen by the backend while the first is inside), then gives it time to enter.
+TEST(CASRefWriterNamespaceRemoval, ConcurrentRemovalAttemptsDoNotOverlapAndKeepTheLaneClosed)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend, wedgeTestBudget());
+    auto clock = VirtualRetryClock::installOn(store);
+    const RootNamespace ns{"srv1/concurrent_removals"};
+    publishEmptyPart(store, ns, "owned");
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    int entries = 0;
+    int inside = 0;
+    bool first_inside = false;
+    bool first_left = false;
+    bool second_read_seen = false;
+    bool second_read_seen_in_time = false;
+    bool second_entered_after_first_left = false;
+    bool overlapped = false;
+    store->setRemovalAttemptHookForTest([&]
+    {
+        std::unique_lock lock(mutex);
+        const int my_entry = ++entries;
+        if (++inside > 1)
+            overlapped = true;
+        if (my_entry == 2)
+            second_entered_after_first_left = first_left;
+        if (my_entry == 1)
+            first_inside = true;
+        cv.notify_all();
+        if (my_entry == 1)
+        {
+            second_read_seen_in_time = cv.wait_for(lock, std::chrono::seconds(30), [&] { return second_read_seen; });
+            cv.wait_for(lock, std::chrono::milliseconds(500), [&] { return overlapped; });
+        }
+        --inside;
+        if (my_entry == 1)
+            first_left = true;
+        cv.notify_all();
+    });
+    SCOPE_EXIT({ store->setRemovalAttemptHookForTest({}); });
+
+    /// While the first attempt sits in the hook, a catalog read can only come from the second one.
+    backend->read_observer = [&](const String & key)
+    {
+        if (key != store->layout().refCatalogKey())
+            return;
+        {
+            std::lock_guard lock(mutex);
+            if (!first_inside || first_left)
+                return;
+            second_read_seen = true;
+        }
+        cv.notify_all();
+    };
+    SCOPE_EXIT({ backend->read_observer = nullptr; });
+
+    backend->catalog_fault_key = store->layout().refCatalogKey();
+    backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::ThrowUncommitted;
+    const auto drop = [&]
+    {
+        try
+        {
+            store->dropNamespace(ns);
+        }
+        catch (const DB::Exception &) // NOLINT(bugprone-empty-catch)
+        {
+            /// Both attempts end ambiguously; the lane state is what this test inspects.
+        }
+    };
+    std::thread first(drop);
+    {
+        std::unique_lock lock(mutex);
+        EXPECT_TRUE(cv.wait_for(lock, std::chrono::seconds(30), [&] { return entries > 0; }));
+    }
+    std::thread second(drop);
+    first.join();
+    second.join();
+    backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::None;
+
+    EXPECT_TRUE(second_read_seen_in_time) << "the second attempt never reached the gate while the first was inside";
+    EXPECT_EQ(entries, 2);
+    EXPECT_TRUE(second_entered_after_first_left) << "the second attempt entered while the first was still inside";
+    EXPECT_FALSE(overlapped) << "two removal attempts were inside the close-to-resolve window at once";
+    expectPositiveLaneClosed(store, ns);
+    EXPECT_NO_THROW(store->dropNamespace(ns));
+}
+
+/// A refusal at the admission check inside `beginRemoving` comes before any write is sent, so nothing can
+/// land and a fresh `Live` row reopens the lane. The boot clock reads past the lease deadline exactly once,
+/// at that check.
+TEST(CASRefWriterNamespaceRemoval, RefusedBeginRemovingBeforeAnySendReopensTheLane)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    constexpr uint64_t boot_ms = 1'000;
+    auto lease_gone_once = std::make_shared<std::atomic<bool>>(false);
+    PoolConfig config;
+    config.cas_request_budget = wedgeTestBudget();
+    config.boot_ms_fn = [lease_gone_once]
+    {
+        return lease_gone_once->exchange(false) ? boot_ms + 1'000'000'000 : boot_ms;
+    };
+    auto store = openPoolWithConfig(backend, std::move(config));
+    auto clock = VirtualRetryClock::installOn(store);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/refused_begin_removing"};
+    publishEmptyPart(store, ns, "owned");
+
+    bool gc_state_read = false;
+    bool armed = false;
+    backend->read_observer = [&](const String & key)
+    {
+        if (key == layout.gcStateKey())
+            gc_state_read = true;
+        else if (key == layout.refCatalogKey() && gc_state_read && !armed)
+        {
+            armed = true;
+            lease_gone_once->store(true);
+        }
+    };
+    SCOPE_EXIT({ backend->read_observer = nullptr; });
+
+    backend->clearRequestJournal();
+    EXPECT_THROW(store->dropNamespace(ns), DB::Exception);
+    ASSERT_TRUE(armed) << "the removal never reached the catalog read of `beginRemoving`";
+    EXPECT_FALSE(lease_gone_once->load()) << "the lease was never reported gone at the admission check";
+    EXPECT_EQ(catalogWritesInJournal(backend, layout), 0u) << "the refused drop must not have sent a catalog write";
+    EXPECT_EQ(catalogEntryOrThrow(backend, layout, ns).state, NsState::Live);
+
+    EXPECT_NO_THROW(updatePublishedAt(store, ns));
+    EXPECT_NO_THROW(store->dropNamespace(ns));
+}
+
+/// A conflict found before the first write is sent leaves nothing that can land, so the row returning to
+/// the value this call observed reopens the lane.
+TEST(CASRefWriterNamespaceRemoval, EntryChangedBeforeAnySendReopensTheLane)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend, wedgeTestBudget());
+    auto clock = VirtualRetryClock::installOn(store);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/entry_changed_begin_removing"};
+    publishEmptyPart(store, ns, "owned");
+
+    const RefCatalog original = readCatalogForTest(backend, layout).catalog;
+    ASSERT_EQ(original.entries.size(), 1U);
+    RefCatalog other_life = original;
+    other_life.entries.front().incarnation = UInt128{0xfeed};
+    const auto set_catalog = [&](const RefCatalog & catalog)
+    {
+        DB::Cas::tests::OperationForTest op(*backend);
+        const auto got = (*op).read(layout.refCatalogKey(), Retry::once());
+        ASSERT_TRUE(got.has_value());
+        ASSERT_TRUE(std::holds_alternative<Committed>(
+            (*op).replace(layout.refCatalogKey(), encodeRefCatalog(catalog), got->etag, Retry::once())));
+    };
+
+    bool swapped = false;
+    bool restored = false;
+    bool in_observer = false;
+    int catalog_reads_since_swap = 0;
+    backend->read_observer = [&](const String & key)
+    {
+        if (in_observer)
+            return;
+        in_observer = true;
+        SCOPE_EXIT({ in_observer = false; });
+        if (key == layout.gcStateKey() && !swapped)
+        {
+            swapped = true;
+            set_catalog(other_life);
+        }
+        else if (key == layout.refCatalogKey() && swapped && !restored && ++catalog_reads_since_swap == 3)
+        {
+            restored = true;
+            set_catalog(original);
+        }
+    };
+    SCOPE_EXIT({ backend->read_observer = nullptr; });
+
+    backend->clearRequestJournal();
+    EXPECT_THROW(store->dropNamespace(ns), DB::Exception);
+    ASSERT_TRUE(restored) << "the schedule never reached the catch-side catalog read";
+    EXPECT_EQ(readCatalogForTest(backend, layout).catalog, original);
+    EXPECT_EQ(catalogWritesInJournal(backend, layout), 2u) << "only the test's own two swaps may write the catalog";
+
+    EXPECT_NO_THROW(updatePublishedAt(store, ns));
+    EXPECT_NO_THROW(store->dropNamespace(ns));
+}
+
+/// Nothing was sent when the read before `beginRemoving` fails, so an unchanged `Live` row reopens the lane.
+TEST(CASRefWriterNamespaceRemoval, FailureBeforeBeginRemovingReopensTheLane)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/failure_before_begin_removing"};
+    publishEmptyPart(store, ns, "owned");
+
+    backend->get_fault_key = layout.gcStateKey();
+    backend->get_fault_count = 1;
+    EXPECT_THROW(store->dropNamespace(ns), std::exception);
+    EXPECT_EQ(backend->get_fault_count, 0) << "the gc/state read was never reached";
+    EXPECT_EQ(catalogEntryOrThrow(backend, layout, ns).state, NsState::Live);
+
+    EXPECT_NO_THROW(updatePublishedAt(store, ns));
+}
+
+/// A failed catalog read inside `beginRemoving` comes before its first write, so an unchanged `Live` row
+/// reopens the lane. The first two catalog reads are the initial discovery and the post-close observation.
+TEST(CASRefWriterNamespaceRemoval, ReadFailureInsideBeginRemovingReopensTheLane)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend, wedgeTestBudget());
+    auto clock = VirtualRetryClock::installOn(store);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/read_failure_inside_begin_removing"};
+    publishEmptyPart(store, ns, "owned");
+
+    backend->catalog_fault_key = layout.refCatalogKey();
+    backend->catalog_gets_before_fault = 2;
+    backend->catalog_get_fault_count = 1;
+    backend->clearRequestJournal();
+    EXPECT_THROW(store->dropNamespace(ns), std::exception);
+    EXPECT_EQ(backend->catalog_get_fault_count, 0) << "the catalog read of `beginRemoving` was never reached";
+    EXPECT_EQ(catalogWritesInJournal(backend, layout), 0u) << "the failed drop must not have sent a catalog write";
+    EXPECT_EQ(catalogEntryOrThrow(backend, layout, ns).state, NsState::Live);
+
+    EXPECT_NO_THROW(updatePublishedAt(store, ns));
+    EXPECT_NO_THROW(store->dropNamespace(ns));
+}
+
+/// An attempt was sent and not answered; the lease then runs out before the next request. The
+/// unanswered attempt can still land, so the lane stays closed. This lease lever trips the engine's own
+/// gate first, so the outcome is a lease give-up, not `FencedOut`;
+/// `FencedOutAfterASentAttemptKeepsTheLaneClosed` covers that outcome.
+TEST(CASRefWriterNamespaceRemoval, LeaseGoneAfterASentAttemptKeepsTheLaneClosed)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    constexpr uint64_t boot_ms = 1'000;
+    auto lease_gone_once = std::make_shared<std::atomic<bool>>(false);
+    PoolConfig config;
+    config.cas_request_budget = wedgeTestBudget();
+    config.boot_ms_fn = [lease_gone_once]
+    {
+        return lease_gone_once->exchange(false) ? boot_ms + 1'000'000'000 : boot_ms;
+    };
+    auto store = openPoolWithConfig(backend, std::move(config));
+    auto clock = VirtualRetryClock::installOn(store);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/lease_gone_after_sent_attempt"};
+    publishEmptyPart(store, ns, "owned");
+
+    backend->catalog_fault_key = layout.refCatalogKey();
+    backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::HoldUncommitted;
+    bool armed = false;
+    backend->read_observer = [&](const String & key)
+    {
+        if (key == layout.refCatalogKey() && backend->catalog_cas_fault_fired && !armed)
+        {
+            armed = true;
+            lease_gone_once->store(true);
+        }
+    };
+    SCOPE_EXIT({ backend->read_observer = nullptr; });
+
+    expectThrowsCodeWithMessage(
+        DB::ErrorCodes::NETWORK_ERROR, "gave up at the lease deadline", [&] { store->dropNamespace(ns); });
+    ASSERT_TRUE(armed) << "the removal never read the catalog after the unanswered attempt";
+    EXPECT_FALSE(lease_gone_once->load()) << "the lease was never reported gone";
+    EXPECT_EQ(catalogEntryOrThrow(backend, layout, ns).state, NsState::Live);
+    expectPositiveLaneClosed(store, ns);
+}
+
+/// An attempt was sent and not answered; the drop's own admission check then fails, with the lease back
+/// before the catch-side read. The unanswered attempt can still land, so the lane stays closed. The check
+/// that trips is the first lease read after the second catalog read, which is the one inside the update's
+/// `decide` step; the first catalog read after the attempt is the engine's resolve read.
+TEST(CASRefWriterNamespaceRemoval, FencedOutAfterASentAttemptKeepsTheLaneClosed)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    constexpr uint64_t boot_ms = 1'000;
+    constexpr int admission_catalog_read = 2;
+    auto lease_gone_once = std::make_shared<std::atomic<bool>>(false);
+    PoolConfig config;
+    config.cas_request_budget = wedgeTestBudget();
+    config.boot_ms_fn = [lease_gone_once]
+    {
+        return lease_gone_once->exchange(false) ? boot_ms + 1'000'000'000 : boot_ms;
+    };
+    auto store = openPoolWithConfig(backend, std::move(config));
+    auto clock = VirtualRetryClock::installOn(store);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/fenced_out_after_sent_attempt"};
+    publishEmptyPart(store, ns, "owned");
+
+    const RefCatalog original = readCatalogForTest(backend, layout).catalog;
+    ASSERT_EQ(original.entries.size(), 1U);
+    RefCatalog other_life = original;
+    other_life.entries.front().incarnation = UInt128{0xfeed};
+    const auto set_catalog = [&](const RefCatalog & catalog)
+    {
+        DB::Cas::tests::OperationForTest op(*backend);
+        const auto got = (*op).read(layout.refCatalogKey(), Retry::once());
+        ASSERT_TRUE(got.has_value());
+        ASSERT_TRUE(std::holds_alternative<Committed>(
+            (*op).replace(layout.refCatalogKey(), encodeRefCatalog(catalog), got->etag, Retry::once())));
+    };
+
+    backend->catalog_fault_key = layout.refCatalogKey();
+    backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::HoldUncommitted;
+    bool swapped = false;
+    bool restored = false;
+    bool in_observer = false;
+    int catalog_reads_since_fault = 0;
+    backend->read_observer = [&](const String & key)
+    {
+        if (in_observer || key != layout.refCatalogKey() || !backend->catalog_cas_fault_fired)
+            return;
+        in_observer = true;
+        SCOPE_EXIT({ in_observer = false; });
+        ++catalog_reads_since_fault;
+        if (catalog_reads_since_fault == admission_catalog_read)
+            lease_gone_once->store(true);
+        /// The kept write stays kept; only the injected fault is switched off so the test's own writes land.
+        if (catalog_reads_since_fault == 1)
+        {
+            swapped = true;
+            backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::None;
+            set_catalog(other_life);
+        }
+        else if (catalog_reads_since_fault == 3)
+        {
+            restored = true;
+            set_catalog(original);
+        }
+    };
+    SCOPE_EXIT({ backend->read_observer = nullptr; });
+
+    expectThrowsCodeWithMessage(
+        DB::ErrorCodes::NETWORK_ERROR, "the mount fence moved while beginning removal",
+        [&] { store->dropNamespace(ns); });
+    ASSERT_TRUE(backend->catalog_cas_fault_fired) << "no removal attempt was sent and held";
+    ASSERT_TRUE(swapped && restored) << "the schedule never reached the catch-side catalog read";
+    EXPECT_FALSE(lease_gone_once->load()) << "the lease was never reported gone";
+    EXPECT_EQ(catalogEntryOrThrow(backend, layout, ns).state, NsState::Live);
+    expectPositiveLaneClosed(store, ns);
+}
+
+/// An attempt was sent and not answered; the row then differs from the one this call observed
+/// (`EntryChanged`) and returns to it before the catch-side read. The unanswered attempt can still land,
+/// so the lane stays closed.
+TEST(CASRefWriterNamespaceRemoval, EntryChangedAfterASentAttemptKeepsTheLaneClosed)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend, wedgeTestBudget());
+    auto clock = VirtualRetryClock::installOn(store);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/entry_changed_after_sent_attempt"};
+    publishEmptyPart(store, ns, "owned");
+
+    const RefCatalog original = readCatalogForTest(backend, layout).catalog;
+    ASSERT_EQ(original.entries.size(), 1U);
+    RefCatalog other_life = original;
+    other_life.entries.front().incarnation = UInt128{0xfeed};
+    const auto set_catalog = [&](const RefCatalog & catalog)
+    {
+        DB::Cas::tests::OperationForTest op(*backend);
+        const auto got = (*op).read(layout.refCatalogKey(), Retry::once());
+        ASSERT_TRUE(got.has_value());
+        ASSERT_TRUE(std::holds_alternative<Committed>(
+            (*op).replace(layout.refCatalogKey(), encodeRefCatalog(catalog), got->etag, Retry::once())));
+    };
+
+    backend->catalog_fault_key = layout.refCatalogKey();
+    backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::HoldUncommitted;
+    bool swapped = false;
+    bool restored = false;
+    bool in_observer = false;
+    int catalog_reads_since_fault = 0;
+    backend->read_observer = [&](const String & key)
+    {
+        if (in_observer || key != layout.refCatalogKey() || !backend->catalog_cas_fault_fired)
+            return;
+        in_observer = true;
+        SCOPE_EXIT({ in_observer = false; });
+        ++catalog_reads_since_fault;
+        /// The kept write stays kept; only the injected fault is switched off so the test's own writes land.
+        if (catalog_reads_since_fault == 1)
+        {
+            swapped = true;
+            backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::None;
+            set_catalog(other_life);
+        }
+        else if (catalog_reads_since_fault == 3)
+        {
+            restored = true;
+            set_catalog(original);
+        }
+    };
+    SCOPE_EXIT({ backend->read_observer = nullptr; });
+
+    expectThrowsCodeWithMessage(
+        DB::ErrorCodes::NETWORK_ERROR, "its exact catalog row changed while beginning removal",
+        [&] { store->dropNamespace(ns); });
+    ASSERT_TRUE(swapped && restored) << "the schedule never reached the catch-side catalog read";
+    EXPECT_EQ(readCatalogForTest(backend, layout).catalog, original);
+    expectPositiveLaneClosed(store, ns);
+}
+
+/// A remount replaces the runtime, and the new one starts with the lane open.
+TEST(CASRefWriterNamespaceRemoval, RemountReopensTheLaneAfterAnAmbiguousBeginRemoving)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend, wedgeTestBudget());
+    auto clock = VirtualRetryClock::installOn(store);
+    const RootNamespace ns{"srv1/ambiguous_then_remount"};
+    publishEmptyPart(store, ns, "owned");
+
+    dropWithAmbiguousCatalogWrite(backend, store, ns);
+    expectPositiveLaneClosed(store, ns);
+
+    fenceOutRefMount(*backend, store->layout().mountKey("test"));
+    ASSERT_TRUE(store->tryRemountOnce());
+    EXPECT_NO_THROW(updatePublishedAt(store, ns));
 }
 
 /// spec §Namespace Removal (writer, line 666): "After the transaction is durable, it applies the same

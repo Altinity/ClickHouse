@@ -316,6 +316,10 @@ public:
     uint64_t refRecoveryRestartsForTest(const RootNamespace & ns);
     /// Reports whether `ns` currently has an unresolved append `PUT`.
     bool refLaneWedgedForTest(const RootNamespace & ns);
+    /// Installs a hook run by each removal attempt after it closed and drained the positive lane, before
+    /// the post-close catalog read. An attempt that returns early on an already-terminal runtime skips it.
+    /// Set before any removal runs.
+    void setRemovalAttemptHookForTest(std::function<void()> hook) { removal_attempt_hook_for_test = std::move(hook); }
     /// Returns the object key retained for the unresolved append of `ns`.
     String wedgedKeyForTest(const RootNamespace & ns);
     /// Returns the fence generation retained with the unresolved append of `ns` (0 when not wedged).
@@ -889,6 +893,15 @@ private:
         /// New positive mutations check it in the same queue critical section as admission; the one
         /// terminal `DropNamespace` item is the sole exception.
         bool removal_admission_closed = false;
+        /// A `Live -> Removing` catalog write of this runtime ended with an unknown outcome that no read
+        /// has resolved, so it can still land. The lane stays closed and the runtime stays resident until
+        /// a remount replaces it or GC erases the row (`invalidateRemovedCatalogLife`). A later attempt that
+        /// proves the row `Removing` clears the flag; the lane stays closed as `Removing`.
+        /// Guarded by `ref_queue_mutex`.
+        bool removal_write_may_land = false;
+        /// One removal attempt at a time per runtime, so one attempt cannot reopen the lane between
+        /// another's close and its send. Guarded by `ref_queue_mutex`.
+        bool removal_attempt_active = false;
         std::condition_variable cv;
 
         /// Published after GC commits the exact catalog deletion. The exact cache pointer is detached;
@@ -1031,6 +1044,7 @@ private:
     std::function<void()> wedge_before_slot_occupy_hook_for_test;
     std::function<void()> snapshot_after_capture_hook_for_test;
     std::function<void()> snapshot_before_ckpt_cas_hook_for_test;
+    std::function<void()> removal_attempt_hook_for_test;
 
     /// Non-materializing diagnostic/cache lookup. It never observes the catalog and never creates a
     /// name slot or runtime.

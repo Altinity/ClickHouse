@@ -1785,7 +1785,8 @@ void CasRefLedger::enforceRefTableCacheBudget(const RootNamespace & keep_ns)
             const auto & rt = slot.current;
             if (!rt)
                 continue;
-            if (rt.use_count() != 1 || rt->leader_active || !rt->pending.empty())
+            /// A fresh runtime would reopen a lane that a possibly landing removal write keeps closed.
+            if (rt.use_count() != 1 || rt->leader_active || !rt->pending.empty() || rt->removal_write_may_land)
                 continue;
             cands.push_back(Cand{name, rt->last_touch_tick, weightOf(*rt)});
         }
@@ -2066,6 +2067,19 @@ RefTxnId CasRefLedger::appendRefOps(const RootNamespace & ns, MutationScope scop
 }
 
 
+namespace
+{
+
+/// The row may still be `Live` here, so the text must not claim `Removing`.
+[[noreturn]] void throwRemovalWriteMayLand(const RootNamespace & ns)
+{
+    throwCasWriteRetryLater(fmt::format(
+        "CAS namespace '{}': a removal write may still land, so positive ref mutation admission is "
+        "closed until a retried removal completes or the disk is remounted; retry later", ns.string()));
+}
+
+}
+
 RefTxnId CasRefLedger::appendRefOpsOnRuntime(
     const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt, MutationScope scope,
     std::function<std::vector<RefOp>(const RefTableState &)> build_ops,
@@ -2076,9 +2090,13 @@ RefTxnId CasRefLedger::appendRefOpsOnRuntime(
     {
         std::lock_guard<std::mutex> lock(ref_queue_mutex);
         if (rt->removal_admission_closed && !terminal_removal_authorized)
+        {
+            if (rt->removal_write_may_land)
+                throwRemovalWriteMayLand(ns);
             throwCasWriteRetryLater(fmt::format(
                 "CAS namespace '{}' is Removing: positive ref mutation admission is closed while "
                 "its terminal fold and catalog removal complete; retry later", ns.string()));
+        }
     };
     /// Check before recovery/maintenance so a known-Removing runtime cannot spend an object-store
     /// mutation on behalf of an operation it is already required to refuse.
@@ -2110,9 +2128,13 @@ RefTxnId CasRefLedger::appendRefOpsOnRuntime(
             "CAS store is shutting down — refusing to append ref-log transactions for server_root '{}'",
             config.server_root_id));
     if (rt->removal_admission_closed && !terminal_removal_authorized)
+    {
+        if (rt->removal_write_may_land)
+            throwRemovalWriteMayLand(ns);
         throwCasWriteRetryLater(fmt::format(
             "CAS namespace '{}' is Removing: positive ref mutation admission is closed while its "
             "terminal fold and catalog removal complete; retry later", ns.string()));
+    }
     rt->pending.push_back(item);
 
     while (!item->done)
@@ -5036,9 +5058,11 @@ NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
     {
         refuseUnlessAdmitted(mount_requests.resume(rt->admitted_fence_generation), "resident namespace life");
         bool removal_closed = false;
+        bool write_may_land = false;
         {
             std::lock_guard queue_lock(ref_queue_mutex);
             removal_closed = rt->removal_admission_closed;
+            write_may_land = rt->removal_write_may_land;
         }
         if (removal_closed)
         {
@@ -5048,9 +5072,13 @@ NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
             reconcileCatalogCut(CasRefCatalog::read(reconcile_op, layout));
             const auto refreshed = lookupRefTableRuntime(ns);
             if (refreshed == rt)
+            {
+                if (write_may_land)
+                    throwRemovalWriteMayLand(ns);
                 throwCasWriteRetryLater(fmt::format(
                     "CAS namespace '{}' is Removing: creation waits for its terminal fold and catalog "
                     "removal to complete; retry later", ns.string()));
+            }
             rt = refreshed;
         }
         if (rt)
@@ -5259,6 +5287,19 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     const auto rt = acquireRefTableRuntime(observed_life, runtime_generation);
     ensureRefTableRecovered(ns, *rt);
     {
+        std::unique_lock<std::mutex> queue_lock(ref_queue_mutex);
+        rt->cv.wait(queue_lock, [&]
+        {
+            return !rt->removal_attempt_active;
+        });
+        rt->removal_attempt_active = true;
+    }
+    SCOPE_EXIT({
+        std::lock_guard<std::mutex> queue_lock(ref_queue_mutex);
+        rt->removal_attempt_active = false;
+        rt->cv.notify_all();
+    });
+    {
         /// A real terminal transaction is idempotent. The representation also calls an empty, never-born
         /// stream `Removed`, but its absent `remove_txn_id` distinguishes that state: a cataloged life may
         /// already own `_ckpt` or `_files`, so it still needs durable birth+terminal evidence before GC
@@ -5281,12 +5322,16 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
         });
     }
 
+    if (removal_attempt_hook_for_test)
+        removal_attempt_hook_for_test();
+
     const uint64_t admitted_generation = fence_generation_fn();
     CasOperation removal_op = mount_requests.resume(admitted_generation);
     std::optional<CatalogEntry> observed_live;
     if (initial_it->state == NsState::Live)
         observed_live = *initial_it;
     bool removing_durable = false;
+    bool removal_write_outcome_unknown = false;
     try
     {
         const CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(removal_op, layout);
@@ -5314,11 +5359,19 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
             if (const auto got = removal_op.read(layout.gcStateKey(), Retry::standard()))
                 removal_started_round = decodeGcState(got->bytes).round;
 
+            /// The flag turns on at the first sent attempt of the `Live -> Removing` write. Before it nothing
+            /// can land, so a failure may reopen the lane. After it every exception, `FencedOut` and
+            /// `EntryChanged` may follow an attempt that can still land.
+            removal_op.observeRequests(RequestObserver{
+                .on_write_attempt = [&removal_write_outcome_unknown](uint32_t) { removal_write_outcome_unknown = true; },
+                .on_failure = {},
+            });
             switch (CasRefCatalog::beginRemoving(
                 removal_op, layout, *observed_live, removal_started_round))
             {
                 case CasRefCatalog::BeginRemovingOutcome::Transitioned:
                 case CasRefCatalog::BeginRemovingOutcome::AlreadyRemoving:
+                    removal_write_outcome_unknown = false;
                     removing_durable = true;
                     break;
                 case CasRefCatalog::BeginRemovingOutcome::EntryChanged:
@@ -5341,9 +5394,8 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     catch (...)
     {
         /// Resolve an ambiguous transition before deciding whether this lane may reopen. `Removing`
-        /// under the same life is conclusive success. Reopening is permitted only after a fresh exact
-        /// observation still proves the original `Live` row and the same mount fence; every unreadable,
-        /// changed or fenced case remains closed (fail-close) and propagates the original error.
+        /// under the same life is conclusive success. Reopening also needs a fresh exact `Live` row and
+        /// the same mount fence; every other case stays closed and propagates the original error.
         try
         {
             const CasRefCatalog::Snapshot fresh = CasRefCatalog::read(removal_op, layout);
@@ -5360,8 +5412,11 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
             {
                 refuseUnlessAdmitted(removal_op, "reopening the removal lane");
                 std::lock_guard<std::mutex> queue_lock(ref_queue_mutex);
-                rt->removal_admission_closed = false;
-                rt->cv.notify_all();
+                if (!removal_write_outcome_unknown && !rt->removal_write_may_land)
+                {
+                    rt->removal_admission_closed = false;
+                    rt->cv.notify_all();
+                }
             }
         }
         catch (...) // NOLINT(bugprone-empty-catch)
@@ -5370,10 +5425,30 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
             /// `Live` row deliberately leaves admission closed.
         }
         if (!removing_durable)
+        {
+            /// One read showing `Live` does not prove that a sent write never lands, so after an unknown
+            /// outcome the lane stays closed until GC erases the row or a remount replaces the runtime.
+            /// A retried `DROP` completes the removal.
+            if (removal_write_outcome_unknown)
+            {
+                {
+                    std::lock_guard<std::mutex> queue_lock(ref_queue_mutex);
+                    rt->removal_write_may_land = true;
+                }
+                LOG_WARNING(getLogger("CasRefLedger"),
+                    "CAS namespace '{}': the outcome of its Live -> Removing catalog write is unknown; writes "
+                    "stay refused until a retried removal completes or the disk is remounted", ns.string());
+            }
             throw;
+        }
     }
 
     chassert(removing_durable);
+
+    {
+        std::lock_guard<std::mutex> queue_lock(ref_queue_mutex);
+        rt->removal_write_may_land = false;
+    }
 
     /// This call's own removal
     /// transaction named, filled from the SAME `state` the ops below are built from -- a retried

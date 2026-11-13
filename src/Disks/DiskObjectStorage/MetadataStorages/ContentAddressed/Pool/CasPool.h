@@ -1070,6 +1070,10 @@ public:
     {
         ref_ledger.setNamespacePresenceProbeAfterFirstReadHookForTest(std::move(hook));
     }
+    void setRemovalAttemptHookForTest(std::function<void()> hook)
+    {
+        ref_ledger.setRemovalAttemptHookForTest(std::move(hook));
+    }
     void setNamespacePresenceProbeAfterTerminalProvenHookForTest(std::function<void()> hook)
     {
         ref_ledger.setNamespacePresenceProbeAfterTerminalProvenHookForTest(std::move(hook));
