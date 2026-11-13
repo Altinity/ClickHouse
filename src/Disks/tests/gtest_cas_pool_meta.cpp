@@ -11,6 +11,7 @@ namespace DB
 {
 namespace ErrorCodes
 {
+    extern const int INVALID_STATE;
     extern const int NETWORK_ERROR;
 }
 }
@@ -75,4 +76,42 @@ TEST(CASPoolMeta, AdmitOrValidateEndsAtTheDeadlineUnderPerpetualConflict)
     });
     /// Bounded by the deadline, not a live-lock: it paced its retries rather than spinning.
     EXPECT_FALSE(clock.sleeps.empty());
+}
+
+/// An object removed from the bucket between the read and the write of an admission is an environment
+/// fault, reported as `INVALID_STATE`; `LOGICAL_ERROR` is for program bugs and aborts debug builds.
+TEST(CASPoolMeta, PoolMetaVanishingMidAdmissionIsInvalidStateNotLogicalError)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    Layout layout("pool");
+    auto requests = makeRequests(backend, clock);
+
+    auto create_op = requests.admit();
+    (void)PoolMeta::createOrValidate(
+        create_op, layout, /*blob_header_len=*/256, /*gc_shards=*/1,
+        BlobHashAlgo::CityHash128, /*allow_new=*/false, /*allow_mint=*/true);
+
+    const String key = layout.poolMetaKey();
+    bool removed = false;
+    backend->onBeforeWrite(key, [&]
+    {
+        if (removed)
+            return;
+        removed = true;
+        auto hook_requests = DB::Cas::tests::openRequestsForTest(BackendPtr(backend));
+        auto hook_op = hook_requests.admit();
+        auto cur = hook_op.read(key, Retry::once());
+        ASSERT_TRUE(cur.has_value());
+        (void)hook_op.remove(key, cur->etag, Retry::once());
+    });
+
+    auto admit_op = requests.admit();
+    expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&]
+    {
+        (void)PoolMeta::createOrValidate(
+            admit_op, layout, 256, /*gc_shards=*/1,
+            BlobHashAlgo::XXH3_128, /*allow_new=*/true, /*allow_mint=*/false);
+    });
+    EXPECT_TRUE(removed);
 }
