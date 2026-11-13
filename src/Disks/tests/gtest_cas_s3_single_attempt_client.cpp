@@ -220,12 +220,14 @@ public:
 };
 
 /// A genuine `S3ObjectStorage` pointed at `endpoint`. `base_request_timeout_ms` is the base client's
-/// request AND connect timeout -- comfortably above the server's simulated delay, so a `Default` call
-/// succeeds. No SDK-level retry (`RetryStrategy{.max_retries = 0}`,
-/// `s3_slow_all_threads_after_retryable_error = false`): a retry would blur "the single-attempt clone
-/// made exactly one request" into "the SDK also tried again".
+/// request AND connect timeout. It is usually above the server's simulated delay, so a `Default` call
+/// succeeds; a test that needs the base client to time out passes a smaller one. `adaptive_timeouts`
+/// turns on the first-attempt timeouts, for a test about what a first attempt gets. No SDK-level retry
+/// (`RetryStrategy{.max_retries = 0}`, `s3_slow_all_threads_after_retryable_error = false`): a retry
+/// would blur "the single-attempt clone made exactly one request" into "the SDK also tried again".
 template <typename Storage = DB::S3ObjectStorage>
-std::shared_ptr<Storage> makeDispatchStorageForTest(const std::string & endpoint, long base_request_timeout_ms)
+std::shared_ptr<Storage> makeDispatchStorageForTest(
+    const std::string & endpoint, long base_request_timeout_ms, bool adaptive_timeouts = false)
 {
     DB::RemoteHostFilter remote_host_filter;
     DB::S3::PocoHTTPClientConfiguration cfg = DB::S3::ClientFactory::instance().createClientConfiguration(
@@ -245,8 +247,9 @@ std::shared_ptr<Storage> makeDispatchStorageForTest(const std::string & endpoint
     /// The adaptive-timeout strategy gives the FIRST attempt a much shorter deadline than
     /// `requestTimeoutMs` and only widens it on a later retry -- with SDK retries disabled above, that
     /// first (short) deadline is the only one this client ever gets, which would time out well under
-    /// `server_delay` regardless of `requestTimeoutMs`. Off, so `requestTimeoutMs` governs uniformly.
-    cfg.s3_use_adaptive_timeouts = false;
+    /// `server_delay` regardless of `requestTimeoutMs`. Off, so `requestTimeoutMs` governs uniformly,
+    /// unless the test is about what the first attempt gets.
+    cfg.s3_use_adaptive_timeouts = adaptive_timeouts;
     /// Each `{ }` block below creates and destroys its OWN ephemeral-port server; the default 30 s
     /// keep-alive would let the client pool a persistent connection that can outlive it. If a LATER
     /// block's server happens to be assigned that same now-free port (routine under many back-to-back
@@ -716,6 +719,34 @@ TEST(CASEnvelopeWiring, ProductionDispatchAppliesTheFrozenConnectCapAtConnectTim
                 ->getClientConfiguration().connectTimeoutMs,
             static_cast<long>(single_attempt_connect_cap_ms));
     }
+}
+
+/// The mount-time versioning probe has no caller-side reissue, so its one attempt must get the attempt
+/// timeout rather than the adaptive first-attempt one: a versioned bucket that answers later is still
+/// detected. The base request timeout is below the server delay, so a probe that kept it would time out.
+TEST(CASEnvelopeWiring, BucketVersioningProbeSingleAttemptOutlastsTheFirstAttemptTimeouts)
+{
+    (void)contextForTest();
+
+    DelayedResponseServer server(std::chrono::milliseconds(1000), [](Poco::Net::HTTPServerResponse & response)
+    {
+        static const std::string body
+            = "<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Enabled</Status>"
+              "</VersioningConfiguration>";
+        response.setContentType("application/xml");
+        response.setContentLength(body.size());
+        response.setStatus(Poco::Net::HTTPResponse::HTTP_OK);
+        response.send() << body;
+    });
+    auto storage = makeDispatchStorageForTest(server.getUrl(), /*base_request_timeout_ms=*/300, /*adaptive_timeouts=*/true);
+
+    const auto versioned = storage->isBucketVersioningEnabled(DB::ObjectStorageControlRequest{
+        .profile = DB::ObjectStorageRetryProfile::SingleAttempt,
+        .attempt_timeout_ms = 5000,
+        .connect_timeout_cap_ms = 1000});
+    ASSERT_TRUE(versioned.has_value()) << "the probe gave up before the attempt timeout";
+    EXPECT_TRUE(*versioned);
+    EXPECT_EQ(server.requestsSeen(), 1u);
 }
 
 /// `FreezeConnectTimeoutCapSnapshot` above pins the ARITHMETIC of `freezeConnectTimeoutCapMs` in

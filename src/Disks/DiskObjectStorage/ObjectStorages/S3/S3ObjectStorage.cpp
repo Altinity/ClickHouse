@@ -828,12 +828,20 @@ void S3ObjectStorage::pinConditionalOpsGenerationDialect(bool expect_generation_
     pinned_generation_dialect.store(expect_generation_tokens ? 1 : 0);
 }
 
-std::optional<bool> S3ObjectStorage::isBucketVersioningEnabled() const
+std::optional<bool> S3ObjectStorage::isBucketVersioningEnabled(const ObjectStorageControlRequest & control_request) const
 {
     S3::GetBucketVersioningRequest request;
     request.SetBucket(uri.bucket);
 
-    auto outcome = client.get()->GetBucketVersioning(request);
+    /// Nothing reissues this probe, so its one attempt must not run under the adaptive first-attempt
+    /// timeouts, which would turn a slow answer into "unknown".
+    const auto used_client = control_request.profile == ObjectStorageRetryProfile::SingleAttempt
+        ? getSingleAttemptClient(
+              control_request.attempt_timeout_ms,
+              control_request.connect_timeout_cap_ms,
+              /*disable_adaptive_timeouts=*/true)
+        : client.get();
+    auto outcome = used_client->GetBucketVersioning(request);
     if (!outcome.IsSuccess())
     {
         /// The caller only learns "unknown"; the reason is what the operator needs to act on.

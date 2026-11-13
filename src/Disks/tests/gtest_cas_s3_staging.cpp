@@ -1249,7 +1249,7 @@ public:
 
     DB::ObjectStorageType getType() const override { return DB::ObjectStorageType::S3; }
     bool conditionalOpsUseGenerationTokens() const override { return true; }
-    std::optional<bool> isBucketVersioningEnabled() const override { return false; }
+    std::optional<bool> isBucketVersioningEnabled(const DB::ObjectStorageControlRequest &) const override { return false; }
     bool supportsRetryProfile(DB::ObjectStorageRetryProfile) const override { return true; }
     bool supportsCopyMode(DB::ObjectStorageCopyMode mode) const override
     {

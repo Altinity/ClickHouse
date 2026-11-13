@@ -147,17 +147,19 @@ ObjectStorageBackend::ObjectStorageBackend(ObjectStoragePtr object_storage_, Mod
 /// evidence of a versioned bucket, its usual cause is a credential without permission to read the
 /// bucket configuration, and refusing on it would turn a missing IAM grant into a hard outage. The
 /// mount proceeds with a warning that names what was not verified and how the operator can verify it.
+/// The probe uses this backend's control-plane profile, because the default client would retry a failed
+/// attempt with SDK backoff, outside the mount's attempt budget.
 void ObjectStorageBackend::checkPoolPreconditions()
 {
     if (mode != Mode::Native || native_token_type != Dialect::Generation)
         return;
 
-    const auto versioned = object_storage->isBucketVersioningEnabled();
+    const auto versioned = object_storage->isBucketVersioningEnabled(controlRequest(/*attempt_no=*/0));
     if (!versioned.has_value())
     {
         LOG_WARNING(getLogger("CasObjectStorageBackend"),
             "CAS on GCS: could not VERIFY the bucket-versioning precondition (the versioning check "
-            "request failed, e.g. the credential lacks permission to read the bucket configuration, "
+            "request failed, e.g. it timed out or the credential lacks permission to read the bucket configuration, "
             "or this backend cannot answer it). Mounting anyway. If versioning IS enabled on this "
             "bucket, token-exact DELETEs archive noncurrent generations instead of reclaiming storage "
             "and GC silently stops reclaiming space. Confirm by hand that versioning is disabled, or "
