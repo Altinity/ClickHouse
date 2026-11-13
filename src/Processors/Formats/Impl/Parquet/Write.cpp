@@ -28,6 +28,8 @@
 #include <DataTypes/DataTypeEnum.h>
 #include <Core/Block.h>
 #include <DataTypes/DataTypeCustom.h>
+#include <DataTypes/DataTypeAggregateFunction.h>
+#include <Poco/JSON/Stringifier.h>
 
 #if USE_SNAPPY
 #include <snappy.h>
@@ -1301,8 +1303,17 @@ void writeColumnImpl(
 }
 
 void writeColumnChunkBody(
-    ColumnChunkWriteState & s, const WriteOptions & options, const FormatSettings & format_settings, WriteBuffer & out)
+    ColumnChunkWriteState & s, const WriteOptions & file_options, const FormatSettings & format_settings, WriteBuffer & out)
 {
+    /// Without page statistics the column index is not written either.
+    WriteOptions options = file_options;
+    if (!s.write_statistics)
+    {
+        options.write_column_chunk_statistics = false;
+        options.write_page_statistics = false;
+        options.write_bloom_filter = false;
+    }
+
     s.column_chunk.meta_data.__set_num_values(s.max_def > 0 ? s.def.size() : s.primitive_column->size());
 
     /// We'll be updating these as we go.
@@ -1686,6 +1697,34 @@ void writeFileFooter(FileWriteState & file,
 
             parquet::format::KeyValue key_value;
             key_value.__set_key("geo");
+            key_value.__set_value(oss.str());
+
+            meta.key_value_metadata.push_back(std::move(key_value));
+            meta.__isset.key_value_metadata = true;
+        }
+    }
+
+    {
+        Poco::JSON::Object::Ptr column_types = new Poco::JSON::Object;
+        for (const auto & [column_name, type] : header.getNamesAndTypesList())
+        {
+            if (!needsClickHouseTypeAnnotation(type))
+                continue;
+            column_types->set(column_name, getClickHouseTypeAnnotationName(type));
+        }
+
+        if (column_types->size())
+        {
+            Poco::JSON::Object::Ptr annotation = new Poco::JSON::Object;
+            annotation->set("version", clickhouse_column_types_version);
+            annotation->set("columns", column_types);
+
+            std::ostringstream // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+                oss;
+            Poco::JSON::Stringifier::stringify(annotation, oss);
+
+            parquet::format::KeyValue key_value;
+            key_value.__set_key(clickhouse_column_types_key);
             key_value.__set_value(oss.str());
 
             meta.key_value_metadata.push_back(std::move(key_value));

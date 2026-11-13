@@ -1,0 +1,18 @@
+widen
+k	Int32
+x	SimpleAggregateFunction(max, Int64)
+1	10	SimpleAggregateFunction(max, Int64)
+2	20	SimpleAggregateFunction(max, Int64)
+1	10	SimpleAggregateFunction(max, Int64)
+2	20	SimpleAggregateFunction(max, Int64)
+time travel
+1	10	SimpleAggregateFunction(max, Int32)
+drop the annotation
+k	Int32
+x	Int64
+1	10	Int64
+2	20	Int64
+1	10	Int64
+2	20	Int64
+time travel
+1	10	SimpleAggregateFunction(max, Int32)

@@ -44,6 +44,9 @@ struct SchemaConverter
     /// The key is the parquet column name, without ColumnMapper.
     std::unordered_map<String, GeoColumnMetadata> geo_columns;
 
+    /// Type names from the `clickhouse.column_types` footer metadata.
+    std::unordered_map<String, String> annotated_column_type_names;
+
     /// If precomputed_geo_columns has a value it is used directly (including the empty-map case)
     /// and the constructor skips parsing the "geo" key-value metadata. This ensures that a
     /// failed parse caught by the caller (which leaves an empty map) does not cause
@@ -133,6 +136,8 @@ private:
     };
 
     void checkHasColumns();
+
+    DataTypePtr resolveAnnotatedType(const String & column_name, const String & type_name, const DataTypePtr & derived_type) const;
 
     void processSubtree(TraversalNode & node);
 

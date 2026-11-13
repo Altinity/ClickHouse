@@ -1261,6 +1261,7 @@ bool GlueCatalog::updateSchema(
     Int32 /*previous_schema_id*/,
     Int32 /*new_last_column_id*/,
     Poco::JSON::Object::Ptr /*metadata*/,
+    Poco::JSON::Object::Ptr /*previous_properties*/,
     const DB::ForwardedAuthTokenPtr & auth_token) const
 {
     std::vector<Aws::Glue::Model::Column> columns;

@@ -56,6 +56,7 @@ ParquetBlockOutputFormat::ParquetBlockOutputFormat(WriteBuffer & out_, SharedHea
     options.output_date_as_uint16 = format_settings.parquet.output_date_as_uint16;
     options.output_enum_as_byte_array = format_settings.parquet.output_enum_as_byte_array;
     options.output_timestamp_adjusted_to_utc_from_timezone = format_settings.parquet.output_timestamp_adjusted_to_utc_from_timezone;
+    options.allow_aggregate_function_states = format_settings.parquet.allow_aggregate_function_states;
     options.data_page_size = format_settings.parquet.data_page_size;
     options.write_batch_size = format_settings.parquet.write_batch_size;
     options.write_page_index = format_settings.parquet.write_page_index;
