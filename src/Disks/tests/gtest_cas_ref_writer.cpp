@@ -781,10 +781,12 @@ public:
         block_first_match_only = true;
         blocked_key.clear();
     }
-    void awaitBlockEntered()
+    /// Bounded: a publisher that never reaches the blocked PUT fails the test instead of hanging it.
+    /// Returns false when no create-shaped write reached the block in time.
+    bool awaitBlockEntered()
     {
         std::unique_lock lk(block_mutex);
-        block_cv.wait(lk, [&] { return block_entered; });
+        return block_cv.wait_for(lk, std::chrono::seconds(20), [&] { return block_entered; });
     }
     void releaseBlock()
     {
@@ -2913,7 +2915,8 @@ TEST(CASRefWriterSnapshotPublish, AdoptionSubtractsCapturedCountersUnderConcurre
 
     backend->armPutBlock("_snap/");
     std::thread publisher([&] { store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns); });
-    backend->awaitBlockEntered();   /// the candidate (count=2) is captured; the PUT is now in flight, no lock held
+    /// the candidate (count=2) is captured; the PUT is now in flight, no lock held
+    ASSERT_TRUE(backend->awaitBlockEntered()) << "no create-shaped write reached the armed block within 20s";
 
     publishEmptyPart(store, ns, "b");   /// +2 more commits land WHILE the publish's PUT is in flight
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 4u);
@@ -2944,7 +2947,8 @@ TEST(CASRefWriterSnapshotPublish, PublicationNeverBlocksConcurrentAppend)
     publishEmptyPart(store, ns, "a");
     publishEmptyPart(store, ns, "b");   /// tail reaches 4 (> 3) -> dispatches a background publish
 
-    backend->awaitBlockEntered();   /// the dispatched attempt is now stuck mid-PUT on the snapshot key
+    /// the dispatched attempt is now stuck mid-PUT on the snapshot key
+    ASSERT_TRUE(backend->awaitBlockEntered()) << "no create-shaped write reached the armed block within 20s";
 
     /// An unrelated mutation on the SAME table must complete without waiting for the stuck publish.
     EXPECT_NO_THROW(store->dropRef(ns, "a"));
@@ -2977,7 +2981,8 @@ TEST(CASRefWriterSnapshotPublish, PublishThreadOutlivesDroppedPoolHandleWithoutC
     backend->armPutBlock("_snap/");
     publishEmptyPart(store, ns, "a");
     publishEmptyPart(store, ns, "b");   /// tail reaches 4 (> 3) -> dispatches a background publish
-    backend->awaitBlockEntered();       /// stuck mid-PUT, holding its OWN shared_ptr<Pool> copy
+    /// stuck mid-PUT, holding its OWN shared_ptr<Pool> copy
+    ASSERT_TRUE(backend->awaitBlockEntered()) << "no create-shaped write reached the armed block within 20s";
 
     std::weak_ptr<Pool> weak_store = store;
     store.reset();   /// drop the ONLY Pool handle this test holds
@@ -3017,7 +3022,8 @@ TEST(CASRefWriterSnapshotPublish, ConcurrentOutOfOrderPublishDoesNotRegressBaseN
     backend->armPutBlockFirstMatchOnly("_snap/");
 
     std::thread publisher1([&] { store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns); });
-    backend->awaitBlockEntered();   /// #1 is parked mid-PUT on `_snap/<older>`, holding no lock
+    /// #1 is parked mid-PUT on `_snap/<older>`, holding no lock
+    ASSERT_TRUE(backend->awaitBlockEntered()) << "no create-shaped write reached the armed block within 20s";
 
     /// While #1 is parked, commit more txns and run publish #2 to COMPLETION: it PUTs a strictly higher
     /// `_snap/<newer>` (unblocked) and adopts it, resetting the tail counters through its own candidate.
@@ -3255,15 +3261,20 @@ TEST(CASRefWriterSnapshotPublish, C4InFlightGateAdmitsAtMostOne)
     PoolConfig config;
     config.snapshot_log_count_threshold = 0;   /// any nonempty tail triggers
     config.snapshot_log_bytes_threshold = 1ULL << 40;
+    /// A setup publisher that meets the second commit's `Writing` lane gives up; without a backoff the
+    /// settle re-dispatch retries at once, so the setup always ends compacted.
+    config.snapshot_publish_backoff_initial_ms = 0;
     auto store = openPoolWithConfig(backend, config);
 
     publishEmptyPart(store, ns, "a");
-    store->waitForSnapshotPublishSettleForTest(ns);   /// drain the setup publishes; tail is compacted
+    store->waitForSnapshotPublishSettleForTest(ns);
+    ASSERT_TRUE(store->newestPublishedSnapshotIdForTest(ns).has_value());
+    ASSERT_EQ(store->tailSinceSnapshotCountForTest(ns), 0u) << "the setup must end with a compacted tail";
 
     /// Block the first `_snap` PUT so one publisher parks in flight.
     backend->armPutBlockFirstMatchOnly("_snap/");
     std::thread mutator([&] { store->dropRef(ns, "a"); });   /// its detached publisher blocks mid-PUT
-    backend->awaitBlockEntered();
+    ASSERT_TRUE(backend->awaitBlockEntered()) << "no create-shaped write reached the armed block within 20s";
 
     /// Many more reads while it is blocked must not admit a second publisher.
     for (int i = 0; i < 20; ++i)
