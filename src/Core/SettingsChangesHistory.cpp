@@ -50,6 +50,10 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         {
             {"azure_validate_etag_on_read", false, true, "New setting to detect concurrent in-place overwrites of Azure blobs during a read by pinning every `GET` to the listed `ETag` with `If-Match` and validating the `ETag` of the response, like `s3_validate_etag_on_read` does for S3. `compatibility` with versions before 26.10 restores the previous behavior (no validation)."},
         });
+        addSettingsChanges(settings_changes_history, "26.8.35.20001.altinityantalya",
+        {
+            {"delta_lake_clustering_predicate_fallback", false, true, "New setting to enable clustering-aware predicate fallback for Delta Lake tables with Liquid Clustering."},
+        });
         addSettingsChanges(settings_changes_history, "26.8.34.20001.altinityantalya",
         {
             {"input_format_parquet_detect_variant_by_structure", false, true, "New setting to read Spark variant columns, which have no `VARIANT` logical type, as `Dynamic` instead of `Tuple`"},
