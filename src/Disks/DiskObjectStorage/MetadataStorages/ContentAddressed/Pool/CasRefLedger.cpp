@@ -5241,7 +5241,10 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     /// off the presence of a `RemoveNamespace` op) and is exempt from the ordinary per-op admission
     /// check (it only ever shrinks state; see `flushRefBatch`'s `state_growing` filter).
     CasOperation initial_op = mount_requests.admit();
-    const CasRefCatalog::Snapshot initial_catalog = CasRefCatalog::read(initial_op, layout);
+    /// One deadline for every request that leads to the removal decision. The wait for the lane to
+    /// drain and for another removal attempt counts against it but is never cut short.
+    const Retry policy = initial_op.freeze(Retry::standard());
+    const CasRefCatalog::Snapshot initial_catalog = CasRefCatalog::read(initial_op, layout, policy);
     const auto initial_it = std::find_if(initial_catalog.catalog.entries.begin(), initial_catalog.catalog.entries.end(),
         [&](const CatalogEntry & entry) { return entry.ns == ns; });
     if (initial_it == initial_catalog.catalog.entries.end())
@@ -5260,8 +5263,9 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
             [&](const CreatorFence & creator)
             {
                 return isCreatorFenceTerminal(
-                    cancel_op, layout, creator.server_root_id, creator.writer_epoch);
-            }))
+                    cancel_op, layout, creator.server_root_id, creator.writer_epoch, policy);
+            },
+            policy))
         {
             case CasRefCatalog::StalledCreatingCancelOutcome::Cancelled:
                 invalidateRemovedCatalogLife(NamespaceLifeId::fromCatalogEntry(observed.ns, observed.incarnation));
@@ -5334,7 +5338,7 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     bool removal_write_outcome_unknown = false;
     try
     {
-        const CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(removal_op, layout);
+        const CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(removal_op, layout, policy);
         const auto entry_it = std::find_if(snapshot.catalog.entries.begin(), snapshot.catalog.entries.end(),
             [&](const CatalogEntry & entry) { return entry.ns == ns; });
         if (entry_it == snapshot.catalog.entries.end())
@@ -5356,7 +5360,7 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
         {
             observed_live = *entry_it;
             uint64_t removal_started_round = 0;
-            if (const auto got = removal_op.read(layout.gcStateKey(), Retry::standard()))
+            if (const auto got = removal_op.read(layout.gcStateKey(), policy))
                 removal_started_round = decodeGcState(got->bytes).round;
 
             /// The flag turns on at the first sent attempt of the `Live -> Removing` write. Before it nothing
@@ -5367,7 +5371,7 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
                 .on_failure = {},
             });
             switch (CasRefCatalog::beginRemoving(
-                removal_op, layout, *observed_live, removal_started_round))
+                removal_op, layout, *observed_live, removal_started_round, policy))
             {
                 case CasRefCatalog::BeginRemovingOutcome::Transitioned:
                 case CasRefCatalog::BeginRemovingOutcome::AlreadyRemoving:
@@ -5398,6 +5402,8 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
         /// the same mount fence; every other case stays closed and propagates the original error.
         try
         {
+            /// A fresh standard window, not `policy`: an expired policy would fail this read at once and
+            /// leave a healthy table closed.
             const CasRefCatalog::Snapshot fresh = CasRefCatalog::read(removal_op, layout);
             const auto fresh_it = std::find_if(fresh.catalog.entries.begin(), fresh.catalog.entries.end(),
                 [&](const CatalogEntry & entry) { return entry.ns == ns; });

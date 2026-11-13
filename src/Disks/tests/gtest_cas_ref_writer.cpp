@@ -4598,7 +4598,7 @@ TEST(CASRefWriterNamespaceRemoval, AmbiguousBeginRemovingSurvivesRefTableEvictio
 }
 
 /// Upper bound on the virtual time one drop may spend: the window frozen at its entry, one backoff draw
-/// the pace does not consult the deadline for (`driveToTheWedge` asserts no pause exceeds it), and slack for
+/// the pace does not consult the deadline for (the cap of `Retry::backoff`), and slack for
 /// the virtual clock's extra millisecond per pause.
 const uint64_t kMaxBackoffDrawMs = 5000;
 const uint64_t kVirtualClockPauseSlackMs = 100;
@@ -5098,6 +5098,137 @@ TEST(CASRefWriterNamespaceRemoval, EntryChangedAfterASentAttemptKeepsTheLaneClos
     ASSERT_TRUE(swapped && restored) << "the schedule never reached the catch-side catalog read";
     EXPECT_EQ(readCatalogForTest(backend, layout).catalog, original);
     expectPositiveLaneClosed(store, ns);
+}
+
+/// A creator-fence read made while the drop decides must draw on the drop's one frozen window: a slow
+/// first read plus a failing fence read must not exceed that window.
+TEST(CASRefWriterNamespaceRemoval, DropWithASlowCreatorFenceReadEndsAtTheEntryDeadline)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend, wedgeTestBudget());
+    auto clock = VirtualRetryClock::installOn(store);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/slow_creator_fence_read"};
+    const String foreign_creator = "foreign-creator";
+
+    CatalogEntry creating;
+    creating.ns = ns;
+    creating.state = NsState::Creating;
+    creating.incarnation = UInt128{0xc001};
+    creating.creator = CreatorFence{.server_root_id = foreign_creator, .writer_epoch = 7, .fence_generation = 1};
+    casAdmitEntryForTest(backend, layout, 1, creating);
+
+    bool first_catalog_read_done = false;
+    size_t fence_reads = 0;
+    backend->read_observer = [&](const String & key)
+    {
+        if (key == layout.refCatalogKey() && !first_catalog_read_done)
+        {
+            first_catalog_read_done = true;
+            clock->advance(60'000);
+        }
+        if (key == layout.mountKey(foreign_creator))
+        {
+            ++fence_reads;
+            throw DB::Exception(DB::ErrorCodes::S3_ERROR, "simulated transient GET failure");
+        }
+    };
+    SCOPE_EXIT({ backend->read_observer = nullptr; });
+
+    const uint64_t now_before = clock->nowMs();
+    EXPECT_THROW(store->dropNamespace(ns), DB::Exception);
+    ASSERT_TRUE(first_catalog_read_done);
+    EXPECT_GT(fence_reads, 0U) << "the creator fence was never read";
+    EXPECT_LE(clock->nowMs() - now_before, kOneWindowPlusBackoffMs)
+        << "the drop spent more than the one window frozen at its entry";
+}
+
+/// The `gc/state` read is part of the removal decision, so it draws on the same window as the catalog read
+/// that came before it.
+TEST(CASRefWriterNamespaceRemoval, DropSpendsOneWindowAcrossItsReads)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend, wedgeTestBudget());
+    auto clock = VirtualRetryClock::installOn(store);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/one_window_across_reads"};
+    publishEmptyPart(store, ns, "owned");
+
+    bool first_catalog_read_done = false;
+    size_t gc_state_reads = 0;
+    backend->read_observer = [&](const String & key)
+    {
+        if (key == layout.refCatalogKey() && !first_catalog_read_done)
+        {
+            first_catalog_read_done = true;
+            clock->advance(60'000);
+        }
+        if (key == layout.gcStateKey())
+        {
+            ++gc_state_reads;
+            throw DB::Exception(DB::ErrorCodes::S3_ERROR, "simulated transient GET failure");
+        }
+    };
+    SCOPE_EXIT({ backend->read_observer = nullptr; });
+
+    const uint64_t now_before = clock->nowMs();
+    EXPECT_THROW(store->dropNamespace(ns), DB::Exception);
+    ASSERT_TRUE(first_catalog_read_done);
+    EXPECT_GT(gc_state_reads, 0U) << "the gc/state read was never reached";
+    EXPECT_LE(clock->nowMs() - now_before, kOneWindowPlusBackoffMs)
+        << "the drop spent more than the one window frozen at its entry";
+}
+
+/// The `Live -> Removing` catalog update draws on the drop's one frozen window too: a slow first read
+/// plus catalog writes that never land must not exceed that window.
+TEST(CASRefWriterNamespaceRemoval, DropSpendsOneWindowAcrossItsCatalogUpdate)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend, wedgeTestBudget());
+    auto clock = VirtualRetryClock::installOn(store);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/one_window_across_catalog_update"};
+    publishEmptyPart(store, ns, "owned");
+
+    backend->catalog_fault_key = layout.refCatalogKey();
+    backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::ThrowUncommitted;
+    bool first_catalog_read_done = false;
+    backend->read_observer = [&](const String & key)
+    {
+        if (key == layout.refCatalogKey() && !first_catalog_read_done)
+        {
+            first_catalog_read_done = true;
+            clock->advance(60'000);
+        }
+    };
+    SCOPE_EXIT({ backend->read_observer = nullptr; });
+
+    const uint64_t now_before = clock->nowMs();
+    EXPECT_THROW(store->dropNamespace(ns), DB::Exception);
+    backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::None;
+    ASSERT_TRUE(first_catalog_read_done);
+    EXPECT_TRUE(backend->catalog_cas_fault_fired) << "no catalog write was attempted";
+    EXPECT_LE(clock->nowMs() - now_before, kOneWindowPlusBackoffMs)
+        << "the drop spent more than the one window frozen at its entry";
+}
+
+/// A local wait that outlasts the window is not cut short. The next read gives up at once with nothing
+/// sent, the catch-side read has its own window and finds the row `Live`, and the lane reopens.
+TEST(CASRefWriterNamespaceRemoval, AWaitLongerThanTheWindowEndsTheDropAndLeavesTheLaneOpen)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend, wedgeTestBudget());
+    auto clock = VirtualRetryClock::installOn(store);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/wait_longer_than_window"};
+    publishEmptyPart(store, ns, "owned");
+
+    store->setRemovalAttemptHookForTest([&] { clock->advance(100'000); });
+    SCOPE_EXIT({ store->setRemovalAttemptHookForTest({}); });
+
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropNamespace(ns); });
+    EXPECT_EQ(catalogEntryOrThrow(backend, layout, ns).state, NsState::Live);
+    EXPECT_NO_THROW(updatePublishedAt(store, ns));
 }
 
 /// A remount replaces the runtime, and the new one starts with the lane open.

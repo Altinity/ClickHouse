@@ -412,7 +412,7 @@ RefCatalog CasRefCatalog::casAdmitEntry(
 
 CasRefCatalog::BeginRemovingOutcome CasRefCatalog::beginRemoving(
     CasOperation & op, const Layout & layout, const CatalogEntry & observed,
-    uint64_t removal_started_round)
+    uint64_t removal_started_round, const Retry & policy)
 {
     if (observed.state != NsState::Live || observed.creator || observed.removal_started_round)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
@@ -437,7 +437,7 @@ CasRefCatalog::BeginRemovingOutcome CasRefCatalog::beginRemoving(
 
     try
     {
-        casUpdateImpl(op, layout, mutate, [](const RefCatalog & c) { return encodeRefCatalog(c); });
+        casUpdateImpl(op, layout, mutate, [](const RefCatalog & c) { return encodeRefCatalog(c); }, policy);
     }
     catch (const CatalogFenceMovedMarker &)
     {
@@ -445,7 +445,7 @@ CasRefCatalog::BeginRemovingOutcome CasRefCatalog::beginRemoving(
     }
     catch (const CatalogEntryMismatchMarker &)
     {
-        const Snapshot current = read(op, layout);
+        const Snapshot current = read(op, layout, policy);
         const auto it = findEntry(current.catalog, observed.ns);
         if (it != current.catalog.entries.end()
             && it->incarnation == observed.incarnation
@@ -594,7 +594,7 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
 
 CasRefCatalog::StalledCreatingCancelOutcome CasRefCatalog::cancelStalledCreating(
     CasOperation & op, const Layout & layout, const CatalogEntry & observed,
-    const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal)
+    const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal, const Retry & policy)
 {
     if (observed.state != NsState::Creating || !observed.creator)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
@@ -620,7 +620,7 @@ CasRefCatalog::StalledCreatingCancelOutcome CasRefCatalog::cancelStalledCreating
 
     try
     {
-        casUpdateImpl(op, layout, mutate, [](const RefCatalog & c) { return encodeRefCatalog(c); });
+        casUpdateImpl(op, layout, mutate, [](const RefCatalog & c) { return encodeRefCatalog(c); }, policy);
     }
     catch (const CatalogFenceMovedMarker &) { return StalledCreatingCancelOutcome::FencedOut; }
     catch (const CatalogEntryMismatchMarker &) { return StalledCreatingCancelOutcome::EntryChanged; }

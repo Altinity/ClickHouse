@@ -118,9 +118,10 @@ public:
     /// every catalog retry, and `op`'s admission is checked after every fresh read and before its
     /// write. A row already `Removing` under the same namespace/life resolves an ambiguous or
     /// concurrent transition positively; no caller may change its recorded start round afterward.
+    /// A `policy` carrying a deadline bounds the update and the read of its mismatch branch together.
     static BeginRemovingOutcome beginRemoving(
         CasOperation & op, const Layout & layout, const CatalogEntry & observed,
-        uint64_t removal_started_round);
+        uint64_t removal_started_round, const Retry & policy = Retry::standard());
 
     /// Outcome of the only fold-authorized catalog deletion. A refusal never writes the catalog.
     enum class CompletedRemovingDeleteOutcome : uint8_t
@@ -183,9 +184,11 @@ public:
 
     /// Exact-CAS-deletes one observed `Creating` row only after its complete creator fence is proven
     /// terminal. This performs no `_ckpt` or other physical cleanup; debris belongs to the janitor.
+    /// `policy` bounds the update; pass it to the predicate's own reads to bound those as well.
     static StalledCreatingCancelOutcome cancelStalledCreating(
         CasOperation & op, const Layout & layout, const CatalogEntry & observed,
-        const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal);
+        const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal,
+        const Retry & policy = Retry::standard());
 
     /// === The creation lifecycle, built on the two primitives above ===
 
