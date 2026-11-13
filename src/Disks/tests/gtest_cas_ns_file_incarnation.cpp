@@ -406,6 +406,55 @@ TEST(CASNsFileIncarnation, ColdReaderIsRefusedWhenReleasedRightAfterTheDrainEras
     EXPECT_NE(store->refTableLifeForTest(ns), retired_life) << "a runtime for the retired life was published";
 }
 
+/// The GC leader is another server: this pool never records the retirement. Its idle runtime for the
+/// dead life is evicted, and a cold admission that read the row `Live` before that must still be
+/// refused when it reaches its insertion.
+TEST(CASNsFileIncarnation, ColdAdmissionIsRefusedWhenARemoteLeaderRetiredTheLifeAndTheRuntimeWasEvicted)
+{
+    auto backend = std::make_shared<ParkedAdmissionBackend>();
+    const RootNamespace ns{kNsString};
+    const RootNamespace other{"00/bb@cas@"};
+    std::optional<NamespaceLifeId> retired_life;
+    {
+        PoolPtr writer = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+        publishWithProductionBirth(writer, ns, "predecessor");
+        retired_life = writer->namespaceLife(ns);
+    }
+
+    PoolConfig config{.pool_prefix = "p", .server_root_id = "owner"};
+    config.gc_fold_max_defer_rounds = 0;
+    config.ref_table_cache_bytes = 1;
+    PoolPtr owner = Pool::open(backend, std::move(config));
+    PoolPtr leader = Pool::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "leader", .gc_fold_max_defer_rounds = 0});
+    ASSERT_EQ(owner->refTableRuntimeIdentityForTest(ns), 0u);
+
+    backend->catalog_key = owner->layout().refCatalogKey();
+    backend->park_on_read = 2;
+    auto parked = backend->parked.get_future();
+    ParkedReader reader(*backend, [&] { (void)owner->namespaceFilesLifeIfReadable(ns); });
+    ASSERT_EQ(parked.wait_for(std::chrono::seconds(60)), std::future_status::ready) << "the reader never reached its park";
+
+    /// The owner installs and drops the life; only the leader drains it.
+    ASSERT_EQ(owner->namespaceLife(ns), *retired_life);
+    owner->dropNamespace(ns);
+    Gc gc(leader, kGcId);
+    (void)runRegularRoundReclaiming(gc);
+    (void)runRegularRoundReclaiming(gc);
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
+    ASSERT_FALSE(CasRefCatalog::lifeIfCataloged(catalog_op, owner->layout(), ns)) << "the leader must drain the row";
+
+    /// A 1-byte budget evicts the idle runtime when another table is touched.
+    publishWithProductionBirth(owner, other, "x");
+    ASSERT_EQ(owner->refTableRuntimeIdentityForTest(ns), 0u) << "the dead life's runtime must have been evicted";
+
+    backend->releaseOnce();
+    reader.join();
+    expectRefusedAsRetired(reader.error);
+    EXPECT_NE(owner->refTableLifeForTest(ns), retired_life) << "a runtime for the retired life was published";
+}
+
 /// A recovered runtime whose stream holds the terminal removal, with no local removal in progress (its
 /// removal-admission flag is clear): `namespaceLife` must not hand that life to a writer, on the cold
 /// call that recovers it or on the warm call that finds it resident.

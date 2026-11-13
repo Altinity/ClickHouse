@@ -1831,6 +1831,7 @@ void CasRefLedger::enforceRefTableCacheBudget(const RootNamespace & keep_ns)
             std::shared_ptr<RefTableRuntime> & rt = it->second.current;
             if (!rt)
                 continue;
+            bool removal_applied = false;
             {
                 /// `use_count() == 1` guarantees no other thread holds the runtime, so this try_lock
                 /// cannot fail; the RAII scope releases `state_mutex` before `rt` is moved out. A wedged
@@ -1840,10 +1841,16 @@ void CasRefLedger::enforceRefTableCacheBudget(const RootNamespace & keep_ns)
                 std::unique_lock<std::mutex> slock(rt->state_mutex, std::try_to_lock);
                 if (!slock.owns_lock() || rt->lane_state != RefLaneState::Ready)
                     continue;
+                removal_applied = rt->state.getLifecycle() != RefLifecycle::Live && rt->state.getRemoveTxnId().has_value();
             }
             if (rt.use_count() != 1 || rt->leader_active || !rt->pending.empty())
                 continue;   /// re-check under the still-held ref_queue_mutex
             total -= c.weight;
+            /// A removed life may be drained by another server's GC leader, which never calls
+            /// `invalidateRemovedCatalogLife` here. Record the removal at eviction so a cold admission
+            /// that read the row earlier is still refused.
+            if (rt->removal_admission_closed || removal_applied)
+                ++it->second.retirements;
             evicted.push_back(std::move(rt));   /// keep alive past the erase and lock release
             if (it->second.retirements == 0)
                 ref_name_slots.erase(it);

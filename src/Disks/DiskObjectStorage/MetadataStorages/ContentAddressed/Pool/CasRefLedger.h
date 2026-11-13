@@ -958,7 +958,8 @@ private:
     struct RefNameSlot
     {
         std::shared_ptr<RefTableRuntime> current;
-        /// Bumped by `invalidateRemovedCatalogLife`.
+        /// Bumped by `invalidateRemovedCatalogLife`, and by the eviction of a runtime that had closed or
+        /// applied its removal: another server's GC leader may drain that life without telling us.
         /// A slot with a non-zero count is never erased (only remount clears it, and remount also moves
         /// the fence generation), so a cold admission compares the count it captured before its catalog
         /// read with the one at insertion.
