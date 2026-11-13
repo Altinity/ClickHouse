@@ -221,7 +221,10 @@ TEST(CASNamespaceJanitorBatches, RebornLifeOnTheSamePageKeepsItsKeys)
 TEST(CASNamespaceJanitorBatches, FailedBatchLeaksAndCursorAdvances)
 {
     auto backend = std::make_shared<FailingBulkBackend>();
-    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
+    /// The failed batch is retried until the request window ends; a virtual clock ends it at once.
+    const auto clock = std::make_shared<DB::Cas::tests::VirtualRetryClock>();
+    CasRequests requests(backend, Fence::open(), DB::Cas::tests::VirtualRetryClock::nowFnOf(clock),
+                         DB::Cas::tests::VirtualRetryClock::sleepFnOf(clock), nullptr, DB::Cas::kDefaultRequestWindowMs);
     const Layout layout("p");
     createObj(*backend, layout.refCatalogKey(), encodeRefCatalog({}));
     const std::vector<String> stream = seedLogs(*backend, layout, life("dead", 303), 4);
@@ -315,6 +318,8 @@ TEST(CASNamespaceJanitorBatches, ListFailureAfterTheFirstPageKeepsTheCursor)
 {
     auto backend = std::make_shared<FailingNamespaceListBackend>();
     auto store = openPool(backend);
+    /// The injected failure is retried until the request window ends; a virtual clock ends it at once.
+    const auto clock = DB::Cas::tests::VirtualRetryClock::installOn(store);
     const Layout & layout = store->layout();
     const std::vector<String> stream = seedLogs(*backend, layout, life("dead", 322), 2500);
     backend->lists = 0;
@@ -415,11 +420,14 @@ TEST(CASNamespaceJanitorBatches, RefusedBatchGoesKeyByKeyAndLeaksOnlyTheFailedKe
 {
     auto backend = std::make_shared<NoBatchDeleteBackend>();
     auto store = openPool(backend);
+    /// The injected failure is retried until the request window ends; a virtual clock ends it at once.
+    const auto clock = DB::Cas::tests::VirtualRetryClock::installOn(store);
     const Layout & layout = store->layout();
     const std::vector<String> stream = seedLogs(*backend, layout, life("dead", 324), 1200);
     backend->failing_key = stream[1100];
 
-    Gc gc(store, DB::UInt128{325});
+    /// The janitor's time budget reads the same virtual clock, so the spent window still ends its pass.
+    Gc gc(store, DB::UInt128{325}, {}, DB::Cas::tests::VirtualRetryClock::nowFnOf(clock));
     const auto metrics = runRoundAndGetJanitorMetrics(gc);
 
     EXPECT_EQ(countPresent(*backend, stream), 1u);
