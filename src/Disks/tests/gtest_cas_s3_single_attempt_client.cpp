@@ -1004,7 +1004,7 @@ TEST(CASBackend, AListWalkOfTenThousandKeysStaysWithinItsRequestBound)
     ASSERT_EQ(seen.size(), key_count);
     EXPECT_TRUE(std::is_sorted(seen.begin(), seen.end()));
     EXPECT_EQ(std::adjacent_find(seen.begin(), seen.end()), seen.end()) << "a key was visited twice";
-    EXPECT_LE(server.count(CountingS3::Verb::Other), 21u);
+    EXPECT_LE(server.count(CountingS3::Verb::Other), 11u);
 }
 
 #endif

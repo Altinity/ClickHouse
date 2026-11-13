@@ -1131,7 +1131,10 @@ Backend::RawListPage ObjectStorageBackend::listUnder(
     static constexpr size_t max_store_page = 1'000'000;
     const size_t store_page = cursor.empty() ? std::min(limit, max_store_page) + 1 : 0;
     RawListPage page;
-    auto it = object_storage->iterate(physical_prefix, /*max_keys=*/store_page, /*with_tags=*/false, start_after, request);
+    /// The page ends at its sentinel; a prefetched next page would be a request nobody reads.
+    ObjectStorageControlRequest page_request = request;
+    page_request.prefetch_next_page = false;
+    auto it = object_storage->iterate(physical_prefix, /*max_keys=*/store_page, /*with_tags=*/false, start_after, page_request);
     for (; it->isValid(); it->next())
     {
         const auto child = it->current();
