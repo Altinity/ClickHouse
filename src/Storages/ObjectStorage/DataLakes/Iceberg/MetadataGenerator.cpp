@@ -8,8 +8,6 @@
 #include <optional>
 #include <Poco/JSON/Array.h>
 #include <Poco/JSON/Object.h>
-#include <Poco/JSON/Stringifier.h>
-#include <Poco/JSON/Parser.h>
 
 #include <Common/StringUtils.h>
 #include <Common/randomSeed.h>
@@ -38,16 +36,6 @@ namespace DB
 
 namespace
 {
-
-Poco::JSON::Object::Ptr deepCopy(Poco::JSON::Object::Ptr obj)
-{
-    std::ostringstream oss; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
-    obj->stringify(oss);
-
-    Poco::JSON::Parser parser;
-    auto result = parser.parse(oss.str());
-    return result.extract<Poco::JSON::Object::Ptr>();
-}
 
 /// Read a numeric `total-*` field from the parent snapshot's summary, returning std::nullopt when absent or null.
 std::optional<Int64> readParentTotal(Poco::JSON::Object::Ptr parent_snapshot, const char * field_name)
@@ -777,7 +765,7 @@ void MetadataGenerator::generateDropColumnMetadata(const String & column_name)
 {
     const auto next_schema_id = getNextSchemaId(metadata_object);
 
-    auto current_schema = deepCopy(getCurrentSchema());
+    auto current_schema = Iceberg::deepCopy(getCurrentSchema());
 
     auto fields = current_schema->getArray(Iceberg::f_fields);
     UInt32 index_to_drop = static_cast<UInt32>(fields->size());
@@ -888,7 +876,7 @@ void MetadataGenerator::generateAddColumnMetadata(const String & column_name, Da
     Iceberg::checkUnknownTypeAllowed(column_name, type, metadata_object->getValue<Int64>(Iceberg::f_format_version));
     const auto next_schema_id = getNextSchemaId(metadata_object);
 
-    auto current_schema = deepCopy(getCurrentSchema());
+    auto current_schema = Iceberg::deepCopy(getCurrentSchema());
 
     auto existing_fields = current_schema->getArray(Iceberg::f_fields);
     for (UInt32 i = 0; i < existing_fields->size(); ++i)
@@ -1023,7 +1011,7 @@ bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name,
         return false;
 
     const auto next_schema_id = getNextSchemaId(metadata_object);
-    current_schema = deepCopy(current_schema);
+    current_schema = Iceberg::deepCopy(current_schema);
     schema_fields = current_schema->getArray(Iceberg::f_fields);
     auto target_field = schema_fields->getObject(target_index);
 
@@ -1074,7 +1062,7 @@ bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name,
 
 void MetadataGenerator::generateRenameColumnMetadata(const String & column_name, const String & new_column_name)
 {
-    auto current_schema = deepCopy(getCurrentSchema());
+    auto current_schema = Iceberg::deepCopy(getCurrentSchema());
 
     auto schema_fields = current_schema->getArray(Iceberg::f_fields);
 

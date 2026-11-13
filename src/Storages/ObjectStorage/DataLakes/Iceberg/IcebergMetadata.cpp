@@ -243,18 +243,19 @@ Iceberg::TableStateSnapshotPtr extractIcebergSnapshotIdFromMetadataObject(Storag
 
 }
 
-Iceberg::PersistentTableComponents IcebergMetadata::initializePersistentTableComponents(
+std::pair<Iceberg::PersistentTableComponents, Iceberg::MetadataFileWithInfo> IcebergMetadata::initializePersistentTableComponents(
     ObjectStoragePtr object_storage,
     StorageObjectStorageConfigurationPtr configuration,
     IcebergMetadataFilesCachePtr cache_ptr,
     ContextPtr context_,
     LoggerPtr log)
 {
-    const auto [metadata_version, metadata_file_path, compression_method]
+    const auto latest_metadata
         = getLatestOrExplicitMetadataFileAndVersion(object_storage, configuration->getPathForRead().path, configuration->getDataLakeSettings(), cache_ptr, context_, log.get(), std::nullopt, CompressionMethod::None, /* force_fetch_latest_metadata */ false);
+    const auto & [metadata_version, metadata_file_path, compression_method] = latest_metadata;
     LOG_DEBUG(log, "Latest metadata file path is {}, version {}", metadata_file_path, metadata_version);
-    auto metadata_object
-        = getMetadataJSONObject(metadata_file_path, object_storage, cache_ptr, context_, log, compression_method, std::nullopt);
+    auto metadata_json_str = readMetadataJSONString(metadata_file_path, object_storage, cache_ptr != nullptr, context_, log, compression_method);
+    auto metadata_object = parseMetadataJSONString(metadata_json_str);
     Int32 format_version = metadata_object->getValue<Int32>(f_format_version);
     String table_location = metadata_object->getValue<String>(f_location);
     std::optional<String> table_uuid = std::nullopt;
@@ -273,9 +274,13 @@ Iceberg::PersistentTableComponents IcebergMetadata::initializePersistentTableCom
                 Iceberg::f_table_uuid);
         }
     }
+    if (cache_ptr && table_uuid)
+        cache_ptr->getOrSetTableMetadata(
+            IcebergMetadataFilesCache::getKey(*table_uuid, metadata_file_path),
+            [&]() { return std::make_shared<IcebergMetadataFilesCacheCell>(metadata_object, metadata_json_str.size()); });
     auto table_path = configuration->getPathForRead().path;
     auto root_derivation = IcebergPathResolver::deriveTableRoot(table_location, table_path, metadata_file_path);
-    return PersistentTableComponents{
+    PersistentTableComponents persistent_components{
         .schema_processor = std::make_shared<IcebergSchemaProcessor>(
             context_, context_->getSettingsRef()[Setting::allow_experimental_geo_types_in_iceberg]),
         .metadata_cache = cache_ptr,
@@ -289,12 +294,19 @@ Iceberg::PersistentTableComponents IcebergMetadata::initializePersistentTableCom
         .table_root_was_derived = root_derivation.relation == IcebergPathResolver::RootRelation::AdoptedDescendant,
         .common_namespace = configuration->getNamespace(),
     };
+    return {std::move(persistent_components), latest_metadata};
 }
 
-std::pair<IcebergDataSnapshotPtr, TableStateSnapshot> IcebergMetadata::getRelevantState(
+void IcebergMetadata::update(const ContextPtr &)
+{
+    std::lock_guard lock(cached_latest_metadata_mutex);
+    cached_latest_metadata.reset();
+}
+
+Iceberg::MetadataFileWithInfo IcebergMetadata::fetchLatestMetadata(
     const ContextPtr & context, bool force_fetch_latest_metadata) const
 {
-    const auto [metadata_version, metadata_file_path, compression_method] = getLatestOrExplicitMetadataFileAndVersion(
+    return getLatestOrExplicitMetadataFileAndVersion(
         object_storage,
         persistent_components.table_path,
         data_lake_settings,
@@ -304,20 +316,40 @@ std::pair<IcebergDataSnapshotPtr, TableStateSnapshot> IcebergMetadata::getReleva
         persistent_components.table_uuid,
         persistent_components.metadata_compression_method,
         force_fetch_latest_metadata);
-    return getState(context, metadata_file_path, metadata_version);
+}
+
+std::pair<IcebergDataSnapshotPtr, TableStateSnapshot> IcebergMetadata::getRelevantState(
+    const ContextPtr & context, bool force_fetch_latest_metadata) const
+{
+    /// Reuse the metadata file resolved when this object was created. `update` drops it so the next query lists again.
+    if (!force_fetch_latest_metadata && !data_lake_settings[DataLakeStorageSetting::iceberg_metadata_file_path].changed)
+    {
+        std::optional<Iceberg::MetadataFileWithInfo> latest_metadata;
+        {
+            std::lock_guard lock(cached_latest_metadata_mutex);
+            latest_metadata = cached_latest_metadata;
+        }
+        if (latest_metadata)
+            return getState(context, latest_metadata->path, latest_metadata->version);
+    }
+
+    const auto latest_metadata = fetchLatestMetadata(context, force_fetch_latest_metadata);
+    return getState(context, latest_metadata.path, latest_metadata.version);
 }
 
 IcebergMetadata::IcebergMetadata(
     ObjectStoragePtr object_storage_,
     StorageObjectStorageConfigurationPtr configuration_,
     Iceberg::PersistentTableComponents && persistent_components_,
-    ContextPtr context_)
+    ContextPtr context_,
+    std::optional<Iceberg::MetadataFileWithInfo> cached_latest_metadata_)
     : log(getLogger("IcebergMetadata"))
     , object_storage(std::move(object_storage_))
     , external_storages(std::make_shared<ExternalStorageCache>())
     , persistent_components(std::move(persistent_components_))
     , data_lake_settings(configuration_->getDataLakeSettings())
     , write_format(configuration_->getFormat())
+    , cached_latest_metadata(std::move(cached_latest_metadata_))
 {
     /// TODO: for now it's okay to start/stop the task via constructor/destructor. Once refactored, we'd need to plumb startup/shutdown and schedule the task from there
     if (persistent_components.metadata_cache && data_lake_settings[DataLakeStorageSetting::iceberg_metadata_async_prefetch_period_ms] != 0)
@@ -862,14 +894,14 @@ void IcebergMetadata::truncate(ContextPtr context, std::shared_ptr<DataLake::ICa
             "Iceberg truncate requires the allow_insert_into_iceberg setting to be enabled.");
 
     auto [actual_data_snapshot, actual_table_state_snapshot] = getRelevantState(context);
-    auto metadata_object = getMetadataJSONObject(
+    auto metadata_object = deepCopy(getMetadataJSONObject(
         actual_table_state_snapshot.metadata_file_path,
         object_storage,
         persistent_components.metadata_cache,
         context,
         log,
         persistent_components.metadata_compression_method,
-        persistent_components.table_uuid);
+        persistent_components.table_uuid));
 
     // Use -1 as the Iceberg spec sentinel for "no parent snapshot"
     // (distinct from snapshot ID 0 which is a valid snapshot).
@@ -1334,8 +1366,8 @@ DataLakeMetadataPtr IcebergMetadata::create(
     else
         LOG_TRACE(
             log, "Not using in-memory cache for iceberg metadata files, because the setting use_iceberg_metadata_files_cache is false.");
-    auto persistent_components = initializePersistentTableComponents(object_storage, configuration_ptr, cache_ptr, local_context, log);
-    return std::make_unique<IcebergMetadata>(object_storage, configuration_ptr, std::move(persistent_components), local_context);
+    auto [persistent_components, latest_metadata] = initializePersistentTableComponents(object_storage, configuration_ptr, cache_ptr, local_context, log);
+    return std::make_unique<IcebergMetadata>(object_storage, configuration_ptr, std::move(persistent_components), local_context, latest_metadata);
 }
 
 IcebergMetadata::IcebergHistory IcebergMetadata::getHistory(ContextPtr local_context) const
@@ -1604,9 +1636,17 @@ bool IcebergMetadata::supportsLazyMaterialization(StorageMetadataPtr storage_met
     return true;
 }
 
-std::optional<size_t> IcebergMetadata::totalRows(ContextPtr local_context) const
+std::optional<size_t> IcebergMetadata::totalRows(ContextPtr local_context, const std::optional<DataLakeTableStateSnapshot> & state) const
 {
-    auto [actual_data_snapshot, actual_table_state_snapshot] = getRelevantState(local_context);
+    IcebergDataSnapshotPtr actual_data_snapshot;
+    TableStateSnapshot actual_table_state_snapshot;
+    if (state)
+    {
+        actual_table_state_snapshot = std::get<TableStateSnapshot>(*state);
+        actual_data_snapshot = getRelevantDataSnapshotFromTableStateSnapshot(actual_table_state_snapshot, local_context);
+    }
+    else
+        std::tie(actual_data_snapshot, actual_table_state_snapshot) = getRelevantState(local_context);
 
     if (!actual_data_snapshot)
     {
@@ -2174,7 +2214,7 @@ DataLakeMetadataPtr IcebergMetadata::createWithDeserialization(
     auto configuration_ptr = configuration.lock();
     if (!configuration_ptr)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Trying to create Iceberg table, but storage configuration is expired");
-    auto standard_persistent_components
+    auto [standard_persistent_components, latest_metadata]
         = initializePersistentTableComponents(object_storage, configuration_ptr, cache_ptr, local_context, log);
     auto schema_processor = standard_persistent_components.schema_processor;
     auto deserialized_persistent_components = Iceberg::PersistentTableComponents{
@@ -2193,7 +2233,8 @@ DataLakeMetadataPtr IcebergMetadata::createWithDeserialization(
         /// Consistent with the resolver above, which is rooted at `table_path` itself.
         .table_root_was_derived = false,
         .common_namespace = configuration_ptr->getNamespace()};
-    auto metadata = std::make_unique<IcebergMetadata>(object_storage, configuration.lock(), std::move(deserialized_persistent_components), local_context);
+    auto metadata = std::make_unique<IcebergMetadata>(
+        object_storage, configuration.lock(), std::move(deserialized_persistent_components), local_context, latest_metadata);
     return metadata;
 }
 
@@ -2423,14 +2464,14 @@ std::optional<IStorage::ExportPartitionCommitInfo> IcebergMetadata::commitImport
             filename_generator.setVersion(last_version + 1);
             filename_generator.setCompressionMethod(compression_method);
 
-            metadata = getMetadataJSONObject(
+            metadata = deepCopy(getMetadataJSONObject(
                 metadata_path,
                 object_storage,
                 persistent_components.metadata_cache,
                 context,
                 getLogger("IcebergMetadata"),
                 compression_method,
-                persistent_components.table_uuid);
+                persistent_components.table_uuid));
             metadata_file_path = metadata_path;
 
             /// For the export path the schema and partition spec are fixed at the start of the
@@ -2662,14 +2703,14 @@ IStorage::ExportPartitionCommitInfo IcebergMetadata::commitExportPartitionTransa
         true);
 
     /// Latest metadata is ALWAYS necessary to commit - but we abort in case schema or partition spec changed
-    Poco::JSON::Object::Ptr metadata = getMetadataJSONObject(
+    Poco::JSON::Object::Ptr metadata = deepCopy(getMetadataJSONObject(
         updated_metadata_file_info.path,
         object_storage,
         persistent_components.metadata_cache,
         context,
         getLogger("IcebergMetadata"),
         updated_metadata_file_info.compression_method,
-        persistent_components.table_uuid);
+        persistent_components.table_uuid));
 
     if (isExportPartitionTransactionAlreadyCommitted(metadata, transaction_id))
     {
