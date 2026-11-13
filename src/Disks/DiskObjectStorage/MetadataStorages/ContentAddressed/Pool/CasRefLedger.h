@@ -57,6 +57,9 @@ enum class RefLaneState : uint8_t
     Faulted,
 };
 
+/// Stable name of a lane state, for messages and logs.
+std::string_view refLaneStateName(RefLaneState state);
+
 /// The answer of the relink confirm's gate 1 (`CasRefLedger::confirmExactRef`).
 ///
 /// `Yes` is the only answer that AUTHORIZES anything, so it is the only one that must be earned: it is

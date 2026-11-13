@@ -15,6 +15,7 @@
 #include <Common/ProfileEvents.h>
 #include <Common/setThreadName.h>
 #include <Common/ThreadPool.h>
+#include <base/defines.h>
 #include <base/sleep.h>
 #include <fmt/format.h>
 #include <algorithm>
@@ -4540,6 +4541,26 @@ void CasRefLedger::maybeScheduleSnapshotPublish(const RootNamespace & ns, const 
 }
 
 
+std::string_view refLaneStateName(RefLaneState state)
+{
+    switch (state)
+    {
+        case RefLaneState::Ready:
+            return "Ready";
+        case RefLaneState::Writing:
+            return "Writing";
+        case RefLaneState::Wedged:
+            return "Wedged";
+        case RefLaneState::NeedsRecovery:
+            return "NeedsRecovery";
+        case RefLaneState::Closed:
+            return "Closed";
+        case RefLaneState::Faulted:
+            return "Faulted";
+    }
+    UNREACHABLE();
+}
+
 void CasRefLedger::advancePublishBackoff(RefTableRuntime & rt)
 {
     /// Caller holds `rt.state_mutex`. Double the interval from `initial` up to `max` per consecutive
@@ -4738,10 +4759,15 @@ bool CasRefLedger::tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntimeImpl(
 
     if (blocked_lane)
     {
-        LOG_WARNING(getLogger("CasPool"),
-            "CAS ref table '{}': refusing snapshot publication while the append lane is not Ready "
-            "(state {})",
-            ns.string(), static_cast<uint8_t>(*blocked_lane));
+        /// `Writing` is the ordinary race with an appender, so only the other states warrant a warning.
+        if (*blocked_lane == RefLaneState::Writing)
+            LOG_DEBUG(getLogger("CasPool"),
+                "CAS ref table '{}': refusing snapshot publication while the append lane is not Ready (state {})",
+                ns.string(), refLaneStateName(*blocked_lane));
+        else
+            LOG_WARNING(getLogger("CasPool"),
+                "CAS ref table '{}': refusing snapshot publication while the append lane is not Ready (state {})",
+                ns.string(), refLaneStateName(*blocked_lane));
         return false;
     }
 
