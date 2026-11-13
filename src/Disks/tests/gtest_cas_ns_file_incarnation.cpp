@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCatalogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
@@ -39,6 +40,7 @@
 
 namespace DB::ErrorCodes
 {
+extern const int CORRUPTED_DATA;
 extern const int NETWORK_ERROR;
 }
 
@@ -103,9 +105,11 @@ void expectRefusedAsRetired(const std::exception_ptr & error)
 }
 
 /// Parks the cold admission running on `parked_thread` right after its `park_on_read`-th read of
-/// `catalog_key` returns. `on_erase_landed` runs once, right after the first conditional write of
-/// `catalog_key` for which `erase_landed` holds returns: the window between the drain's catalog erase
-/// and anything the drain does afterwards.
+/// `catalog_key` returns, or at the first `parkHere` it reaches. `before_erase_sent` runs once, right
+/// before the first conditional write of `catalog_key` that drops `erased_ns`: the window between the
+/// drain's announcement and its erase. `on_erase_landed` runs once, right after the first conditional
+/// write of `catalog_key` for which `erase_landed` holds returns: the window between the drain's catalog
+/// erase and anything the drain does afterwards.
 class ParkedAdmissionBackend : public CountingBackend
 {
 public:
@@ -114,6 +118,8 @@ public:
     size_t park_on_read = 0;
     std::function<bool()> erase_landed;
     std::function<void()> on_erase_landed;
+    String erased_ns;
+    std::function<void()> before_erase_sent;
 
     std::promise<void> parked;
 
@@ -122,13 +128,23 @@ public:
         std::call_once(release_once, [this] { release.set_value(); });
     }
 
+    void parkHere()
+    {
+        std::thread::id self = std::this_thread::get_id();
+        if (parked_thread.compare_exchange_strong(self, std::thread::id{}))
+        {
+            parked.set_value();
+            released.wait();
+        }
+    }
+
     std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
     {
         auto result = CountingBackend::read(key, access);
         if (key == catalog_key && std::this_thread::get_id() == parked_thread && park_on_read && --park_on_read == 0)
         {
             parked.set_value();
-            release.get_future().wait();
+            released.wait();
         }
         return result;
     }
@@ -137,6 +153,12 @@ public:
                                                                const std::optional<String> & expected_value,
                                                                DB::Cas::TransportAccess & access) override
     {
+        if (before_erase_sent && key == catalog_key && expected_value && dropsErasedNamespace(bytes))
+        {
+            auto once = std::move(before_erase_sent);
+            before_erase_sent = nullptr;
+            once();
+        }
         auto result = CountingBackend::write(key, bytes, expected_value, access);
         if (on_erase_landed && key == catalog_key && expected_value && result && erase_landed())
         {
@@ -148,7 +170,15 @@ public:
     }
 
 private:
+    bool dropsErasedNamespace(const String & bytes) const
+    {
+        const RefCatalog next = decodeRefCatalog(bytes);
+        return std::none_of(next.entries.begin(), next.entries.end(),
+            [&](const CatalogEntry & entry) { return entry.ns.string() == erased_ns; });
+    }
+
     std::promise<void> release;
+    std::shared_future<void> released = release.get_future().share();
     std::once_flag release_once;
 };
 
@@ -526,6 +556,258 @@ TEST(CASNsFileIncarnation, NamespaceLifeDetachesAResidentRemovedLifeWhoseRowIsGo
     const NamespaceLifeId reborn = owner->namespaceLife(ns);
     EXPECT_NE(reborn.incarnation, removed_life.incarnation);
     EXPECT_EQ(owner->refTableLifeForTest(ns), std::optional<NamespaceLifeId>{reborn});
+}
+
+namespace
+{
+
+/// Runs GC rounds until the janitor has swept the checkpoint of `life`; false if it never does.
+bool runRoundsUntilCheckpointSwept(Gc & gc, CountingBackend & backend, const Layout & layout, const NamespaceLifeId & life)
+{
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    for (int round = 0; round < 6; ++round)
+    {
+        if (!op.head(layout.refCkptKey(life), Retry::standard()))
+            return true;
+        (void)runRegularRoundReclaiming(gc);
+    }
+    return !op.head(layout.refCkptKey(life), Retry::standard());
+}
+
+}
+
+/// A presence probe admits the `Removing` row after the local drain announced it and before the erase,
+/// so its admission sees no retirement. The drain must detach that runtime once its erase lands: its
+/// recovery would otherwise find the swept checkpoint and fail on every later `namespaceLife`.
+TEST(CASNsFileIncarnation, ProbeAdmittedBetweenTheAnnouncementAndTheEraseIsDetachedByTheDrain)
+{
+    auto backend = std::make_shared<ParkedAdmissionBackend>();
+    const RootNamespace ns{kNsString};
+    std::optional<NamespaceLifeId> removed_life;
+    {
+        PoolPtr writer = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+        publishWithProductionBirth(writer, ns, "x");
+        removed_life = writer->namespaceLife(ns);
+        writer->dropNamespace(ns);
+    }
+
+    PoolConfig config{.pool_prefix = "p", .server_root_id = "store"};
+    config.gc_fold_max_defer_rounds = 0;
+    config.recovery_pre_first_request_hook_for_test = [backend_ptr = backend.get()] { backend_ptr->parkHere(); };
+    PoolPtr store = Pool::open(backend, std::move(config));
+    const Layout & layout = store->layout();
+    Gc gc(store, kGcId);
+    (void)runRegularRoundReclaiming(gc);
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
+    ASSERT_TRUE(CasRefCatalog::lifeIfCataloged(catalog_op, layout, ns)) << "the terminal fold alone keeps the row";
+
+    std::unique_ptr<ParkedReader> probe;
+    bool probe_parked = false;
+    backend->catalog_key = layout.refCatalogKey();
+    backend->erased_ns = ns.string();
+    backend->before_erase_sent = [&]
+    {
+        auto parked = backend->parked.get_future();
+        probe = std::make_unique<ParkedReader>(*backend, [&] { (void)store->namespaceStillLogicallyPresent(ns); });
+        probe_parked = parked.wait_for(std::chrono::seconds(60)) == std::future_status::ready;
+    };
+    ASSERT_TRUE(runRoundsUntilCheckpointSwept(gc, *backend, layout, *removed_life));
+    ASSERT_TRUE(probe_parked) << "the probe never parked in its recovery between the announcement and the erase";
+    ASSERT_FALSE(CasRefCatalog::lifeIfCataloged(catalog_op, layout, ns));
+    EXPECT_NE(store->refTableLifeForTest(ns), removed_life)
+        << "the drain must detach the runtime it published no record against";
+
+    backend->releaseOnce();
+    probe->join();
+    const NamespaceLifeId reborn = store->namespaceLife(ns);
+    EXPECT_NE(reborn.incarnation, removed_life->incarnation);
+    EXPECT_EQ(store->refTableLifeForTest(ns), std::optional<NamespaceLifeId>{reborn});
+}
+
+/// The same parked probe when GC runs on another server: nothing is announced or invalidated here. Its
+/// recovery fails on the swept checkpoint, and `namespaceLife` must still detach the resident runtime
+/// once the catalog no longer names its life.
+TEST(CASNsFileIncarnation, NamespaceLifeDetachesAnUnrecoverableResidentLifeWhoseRowARemoteDrainErased)
+{
+    auto backend = std::make_shared<ParkedAdmissionBackend>();
+    const RootNamespace ns{kNsString};
+    PoolPtr leader = Pool::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "leader", .gc_fold_max_defer_rounds = 0});
+    publishWithProductionBirth(leader, ns, "x");
+    const NamespaceLifeId removed_life = leader->namespaceLife(ns);
+    leader->dropNamespace(ns);
+
+    PoolConfig config{.pool_prefix = "p", .server_root_id = "owner"};
+    config.gc_fold_max_defer_rounds = 0;
+    config.recovery_pre_first_request_hook_for_test = [backend_ptr = backend.get()] { backend_ptr->parkHere(); };
+    PoolPtr owner = Pool::open(backend, std::move(config));
+    ASSERT_EQ(owner->refTableRuntimeIdentityForTest(ns), 0u);
+
+    auto parked = backend->parked.get_future();
+    ParkedReader probe(*backend, [&] { (void)owner->namespaceStillLogicallyPresent(ns); });
+    ASSERT_EQ(parked.wait_for(std::chrono::seconds(60)), std::future_status::ready) << "the probe never reached its recovery";
+    ASSERT_EQ(owner->refTableLifeForTest(ns), std::optional<NamespaceLifeId>{removed_life});
+
+    Gc gc(leader, kGcId);
+    ASSERT_TRUE(runRoundsUntilCheckpointSwept(gc, *backend, leader->layout(), removed_life));
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
+    ASSERT_FALSE(CasRefCatalog::lifeIfCataloged(catalog_op, owner->layout(), ns)) << "the leader must drain the row";
+
+    backend->releaseOnce();
+    probe.join();
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { std::rethrow_exception(probe.error); });
+    ASSERT_EQ(owner->refTableLifeForTest(ns), std::optional<NamespaceLifeId>{removed_life})
+        << "the unrecoverable runtime stays resident until a writer finds its row gone";
+
+    const NamespaceLifeId reborn = owner->namespaceLife(ns);
+    EXPECT_NE(reborn.incarnation, removed_life.incarnation);
+    EXPECT_EQ(owner->refTableLifeForTest(ns), std::optional<NamespaceLifeId>{reborn});
+}
+
+/// The drain announces between the probe's catalog read of a `Removing` row and its runtime
+/// insertion. The probe must answer present, its safe direction, rather than throw to `existsDirectory`.
+TEST(CASNsFileIncarnation, PresenceProbeAnswersPresentWhenTheDrainAnnouncesDuringItsAdmission)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    const RootNamespace ns{kNsString};
+    std::optional<NamespaceLifeId> removed_life;
+    {
+        PoolPtr writer = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+        publishWithProductionBirth(writer, ns, "x");
+        removed_life = writer->namespaceLife(ns);
+        writer->dropNamespace(ns);
+    }
+
+    PoolPtr store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    bool announced = false;
+    store->setNamespacePresenceProbeAfterFirstReadHookForTest([&]
+    {
+        store->invalidateRemovedCatalogLife(*removed_life);
+        announced = true;
+    });
+
+    EXPECT_TRUE(store->namespaceStillLogicallyPresent(ns));
+    store->setNamespacePresenceProbeAfterFirstReadHookForTest({});
+    ASSERT_TRUE(announced);
+    EXPECT_EQ(store->refTableLifeForTest(ns), std::nullopt) << "the refused probe must publish no runtime";
+    EXPECT_EQ(store->refNameSlotCountForTest(), 0u) << "and must release its admission";
+}
+
+/// A cold writer reads the row `Live`; another server drops the namespace, drains the row and sweeps
+/// the life before the writer inserts its runtime. Nothing recorded the retirement here, so the writer
+/// publishes a runtime for the swept life. Its write must not land there. Covers a FULLY swept life only
+/// (the checkpoint is gone); a partly swept life, where the checkpoint delete leaked, is not covered.
+TEST(CASNsFileIncarnation, ColdWriterCannotWriteIntoALifeFullySweptByARemoteLeader)
+{
+    auto backend = std::make_shared<ParkedAdmissionBackend>();
+    const RootNamespace ns{kNsString};
+    PoolPtr leader = Pool::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "leader", .gc_fold_max_defer_rounds = 0});
+    publishWithProductionBirth(leader, ns, "x");
+    const NamespaceLifeId swept_life = leader->namespaceLife(ns);
+
+    PoolPtr owner = Pool::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "owner", .gc_fold_max_defer_rounds = 0});
+    ASSERT_EQ(owner->refTableRuntimeIdentityForTest(ns), 0u);
+    backend->catalog_key = owner->layout().refCatalogKey();
+    backend->park_on_read = 1;
+    auto parked = backend->parked.get_future();
+    std::optional<NamespaceLifeId> written_life;
+    ParkedReader writer(*backend, [&]
+    {
+        const NamespaceLifeId life = owner->namespaceLife(ns);
+        owner->putNamespaceFile(life, kFile, "written\n");
+        written_life = life;
+    });
+    ASSERT_EQ(parked.wait_for(std::chrono::seconds(60)), std::future_status::ready) << "the writer never reached its park";
+
+    leader->dropNamespace(ns);
+    Gc gc(leader, kGcId);
+    ASSERT_TRUE(runRoundsUntilCheckpointSwept(gc, *backend, leader->layout(), swept_life));
+
+    backend->releaseOnce();
+    writer.join();
+    EXPECT_EQ(written_life, std::nullopt) << "a write was acknowledged into the swept life";
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { std::rethrow_exception(writer.error); });
+    EXPECT_EQ(owner->refTableLifeForTest(ns), std::optional<NamespaceLifeId>{swept_life})
+        << "the runtime of the swept life was published and stays resident";
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    EXPECT_FALSE(op.head(owner->layout().namespaceFileKey(swept_life, kFile), Retry::standard()));
+
+    const NamespaceLifeId reborn = owner->namespaceLife(ns);
+    EXPECT_NE(reborn.incarnation, swept_life.incarnation);
+}
+
+/// The owner's runtime becomes terminal through a presence probe of the `Removing` row, so its
+/// removal-admission flag stays clear. A remote leader drains the row and the runtime is evicted:
+/// the eviction must record the retirement from the applied removal alone.
+TEST(CASNsFileIncarnation, EvictingARuntimeWhoseRemovalWasAppliedRecordsTheRetirement)
+{
+    auto backend = std::make_shared<ParkedAdmissionBackend>();
+    const RootNamespace ns{kNsString};
+    const RootNamespace other{"00/bb@cas@"};
+    PoolPtr leader = Pool::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "leader", .gc_fold_max_defer_rounds = 0});
+    publishWithProductionBirth(leader, ns, "predecessor");
+    const NamespaceLifeId retired_life = leader->namespaceLife(ns);
+
+    PoolConfig config{.pool_prefix = "p", .server_root_id = "owner"};
+    config.gc_fold_max_defer_rounds = 0;
+    config.ref_table_cache_bytes = 1;
+    PoolPtr owner = Pool::open(backend, std::move(config));
+    backend->catalog_key = owner->layout().refCatalogKey();
+    backend->park_on_read = 2;
+    auto parked = backend->parked.get_future();
+    ParkedReader reader(*backend, [&] { (void)owner->namespaceFilesLifeIfReadable(ns); });
+    ASSERT_EQ(parked.wait_for(std::chrono::seconds(60)), std::future_status::ready) << "the reader never reached its park";
+
+    leader->dropNamespace(ns);
+    EXPECT_FALSE(owner->namespaceStillLogicallyPresent(ns));
+    ASSERT_EQ(owner->refTableLifeForTest(ns), std::optional<NamespaceLifeId>{retired_life})
+        << "the probe must have left the terminal runtime resident";
+    Gc gc(leader, kGcId);
+    (void)runRegularRoundReclaiming(gc);
+    (void)runRegularRoundReclaiming(gc);
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
+    ASSERT_FALSE(CasRefCatalog::lifeIfCataloged(catalog_op, owner->layout(), ns)) << "the leader must drain the row";
+    const uint64_t retirements_before = owner->refNameRetirementsForTest(ns);
+
+    publishWithProductionBirth(owner, other, "x");
+    ASSERT_EQ(owner->refTableRuntimeIdentityForTest(ns), 0u) << "the terminal runtime must have been evicted";
+    EXPECT_EQ(owner->refNameRetirementsForTest(ns), retirements_before + 1);
+
+    backend->releaseOnce();
+    reader.join();
+    expectRefusedAsRetired(reader.error);
+    EXPECT_NE(owner->refTableLifeForTest(ns), std::optional<NamespaceLifeId>{retired_life})
+        << "a runtime for the retired life was published";
+}
+
+/// Two cold admissions of one name share its slot: the first release must keep the slot, and with it
+/// the retirement record the second admission is checked against.
+TEST(CASNsFileIncarnation, TwoColdAdmissionsOfOneNameShareTheSlotUntilTheLastRelease)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    const RootNamespace ns{kNsString};
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(ns, UInt128{1});
+    PoolPtr cold = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+
+    std::optional<CasRefLedger::ColdAdmission> first = cold->beginColdAdmissionForTest(ns);
+    std::optional<CasRefLedger::ColdAdmission> second = cold->beginColdAdmissionForTest(ns);
+    ASSERT_EQ(cold->refNameSlotCountForTest(), 1u);
+
+    first.reset();
+    EXPECT_EQ(cold->refNameSlotCountForTest(), 1u) << "the second admission must keep the slot";
+    cold->invalidateRemovedCatalogLife(life);
+    EXPECT_EQ(cold->refNameRetirementsForTest(ns), 1u) << "a retirement must still be recorded for the second admission";
+
+    second.reset();
+    EXPECT_EQ(cold->refNameSlotCountForTest(), 0u) << "the last release must free the slot";
 }
 
 /// A delayed retirement callback for a predecessor arrives while a successor is resident. It must

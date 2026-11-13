@@ -228,7 +228,7 @@ std::function<RefCatalog(const RefCatalog &)> identityPreserving(
         if (candidate.entries.size() != current.entries.size())
             throw Exception(ErrorCodes::LOGICAL_ERROR,
                 "CasRefCatalog::casUpdate cannot add or delete catalog entries -- use casAdmitEntry, "
-                "deleteCompletedRemoving, or cancelStalledCreating");
+                "deleteCompletedRemovingAtSnapshot, or cancelStalledCreating");
         for (size_t i = 0; i < current.entries.size(); ++i)
         {
             if (candidate.entries[i].ns != current.entries[i].ns
@@ -456,35 +456,12 @@ CasRefCatalog::BeginRemovingOutcome CasRefCatalog::beginRemoving(
     return BeginRemovingOutcome::Transitioned;
 }
 
-CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemoving(
-    CasOperation & op, const Layout & layout, const CatalogEntry & observed,
-    const CasFoldSeal & authoritative_parent,
-    const std::function<void()> & refresh_authority)
-{
-    if (observed.state != NsState::Removing || !observed.removal_started_round)
-        return {
-            .outcome = CompletedRemovingDeleteOutcome::ProofRefused,
-            .invalidated_life = std::nullopt,
-            .catalog_snapshot = std::nullopt};
-
-    const auto parent_it = authoritative_parent.ref_lives.find(observed.incarnation);
-    if (parent_it == authoritative_parent.ref_lives.end()
-        || !parent_it->second.cleanup_evidence
-        || parent_it->second.coverage.hold)
-        return {
-            .outcome = CompletedRemovingDeleteOutcome::ProofRefused,
-            .invalidated_life = std::nullopt,
-            .catalog_snapshot = std::nullopt};
-
-    return deleteCompletedRemovingAtSnapshot(
-        op, layout, read(op, layout), observed, authoritative_parent, refresh_authority);
-}
-
 CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemovingAtSnapshot(
     CasOperation & op, const Layout & layout, Snapshot catalog_snapshot,
     const CatalogEntry & observed, const CasFoldSeal & authoritative_parent,
     const std::function<void()> & refresh_authority,
-    const std::function<void(const NamespaceLifeId &)> & before_erase)
+    const std::function<void(const NamespaceLifeId &)> & before_erase,
+    const std::function<void(const NamespaceLifeId &)> & erase_acknowledged)
 {
     if (observed.state != NsState::Removing || !observed.removal_started_round)
         return {
@@ -554,6 +531,8 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
         candidate.entries.erase(candidate.entries.begin() + (observed_it - catalog_snapshot.catalog.entries.begin()));
         WriteResult erase = op.replace(layout.refCatalogKey(), encodeRefCatalog(candidate),
                                        *catalog_snapshot.etag, policy);
+        if (erase_acknowledged && std::holds_alternative<Committed>(erase))
+            erase_acknowledged(old_life);
 
         /// Pause before the read: that read is the snapshot the next erase is conditioned on, and a
         /// write landing during a pause taken after it would refuse that erase every time.

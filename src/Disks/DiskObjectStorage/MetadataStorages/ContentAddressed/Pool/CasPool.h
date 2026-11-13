@@ -689,8 +689,8 @@ public:
     /// `DirShape::TableDir` case.
     bool namespaceStillLogicallyPresent(const RootNamespace & ns);
 
-    /// GC callback just before it erases a folded `Removing` row; see `CasRefLedger` for the in-place cached
-    /// runtime invalidation contract.
+    /// GC callback before its first attempt to erase a folded `Removing` row (the erase may not follow)
+    /// and again once the erase resolved; see `CasRefLedger` for the cached runtime invalidation contract.
     void invalidateRemovedCatalogLife(const NamespaceLifeId & life);
 
     /// Reconciles cached removal-closed ref runtimes against a complete catalog cut.

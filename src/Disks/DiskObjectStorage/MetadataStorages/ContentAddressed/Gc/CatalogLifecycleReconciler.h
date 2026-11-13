@@ -29,9 +29,7 @@ struct CatalogLifecycleReconcileResult
 {
     AuthorityStatus authority_status;
     CatalogResolution catalog_resolution;
-    std::vector<NamespaceLifeId> retired_lives;
     std::optional<CasRefCatalog::Snapshot> final_catalog_cut;
-    uint64_t deleted = 0;
 };
 
 /// Settles catalog rows that an already-adopted parent fold seal proved safe to remove.
@@ -50,14 +48,22 @@ public:
     /// the drain-complete verdict, which would otherwise report from the reading its last erase left.
     /// It is a refresh, not a verdict: the verdict stays `op.admitted()`.
     ///
-    /// `before_erase` is called with each life just before its row is first erased, so the caller can
-    /// record the retirement ahead of the erase. Every life in `retired_lives` has been announced.
+    /// `before_erase` is called with each life before its first erase attempt, so the caller can
+    /// record the retirement while the row still exists; the erase may not follow.
     CatalogLifecycleReconcileResult reconcile(
         const std::function<void()> & refresh_authority,
         const std::function<void(const NamespaceLifeId &)> & before_erase);
 
-    /// Erases that completed so far. Readable after `reconcile` throws, unlike `result.deleted`.
+    /// The two records below grow as `reconcile` runs and stay readable after it throws.
+
+    /// Erases the store acknowledged, plus erases whose resolution read found the row absent after an
+    /// unacknowledged attempt; each erase counts once.
     uint64_t completedErases() const { return completed_erases; }
+
+    /// Lives whose erase was acknowledged or whose row a resolution read found gone, in order: each was
+    /// announced to `before_erase` first. An admission that began after that announcement saw no
+    /// retirement, so the caller announces these lives again.
+    const std::vector<NamespaceLifeId> & retiredLives() const { return retired_lives; }
 
 private:
     std::optional<CatalogEntry> selectEligible(const CasRefCatalog::Snapshot & catalog) const;
@@ -68,6 +74,7 @@ private:
     const Layout & layout;
     const CasFoldSeal & adopted_parent;
     uint64_t completed_erases = 0;
+    std::vector<NamespaceLifeId> retired_lives;
 };
 
 }

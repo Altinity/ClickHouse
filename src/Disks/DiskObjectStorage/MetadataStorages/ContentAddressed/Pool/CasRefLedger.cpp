@@ -635,7 +635,7 @@ void CasRefLedger::eraseNameSlotIfUnusedLocked(std::map<String, RefNameSlot>::it
 }
 
 std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireRefTableRuntime(
-    const NamespaceLifeId & life, uint64_t admitted_generation, ColdAdmission && admission,
+    const NamespaceLifeId & life, uint64_t admitted_generation, ColdAdmission & admission,
     RuntimeAdmission kind)
 {
     chassert(admission.ledger == this && admission.name == life.ns.string());
@@ -652,14 +652,16 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireRefTableRunt
         slots_cleared_by_remount = admission.epoch != ref_name_slots_epoch;
         if (!generation_moved && !slots_cleared_by_remount)
         {
+            /// The admission keeps its slot alive, so a missing one is a bug; as in
+            /// `releaseColdAdmissionLocked`, a release build takes the safe exit and publishes nothing.
             const auto it = ref_name_slots.find(life.ns.string());
             chassert(it != ref_name_slots.end());
-            RefNameSlot & slot = it->second;
             /// The catalog row this life came from may have been removed and drained after the caller read
             /// it; inserting then would publish a runtime for a life the janitor sweeps.
-            retired_since_observation = slot.retirements != admission.retirements_seen;
+            retired_since_observation = it == ref_name_slots.end() || it->second.retirements != admission.retirements_seen;
             if (!retired_since_observation)
             {
+                RefNameSlot & slot = it->second;
                 if (slot.current)
                 {
                     const auto & current = slot.current;
@@ -691,10 +693,12 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireRefTableRunt
     /// Same retryable class on both planes; a read must not claim a write was attempted.
     const auto refuseStaleObservation = [&](const String & why)
     {
-        if (kind == RuntimeAdmission::Read)
+        if (kind != RuntimeAdmission::Write)
             throwCasTransientUnavailable(fmt::format("CAS namespace '{}'", life.ns.string()), why);
         throwCasWriteRetryLater(fmt::format("CAS namespace '{}': {}", life.ns.string(), why));
     };
+    if (retired_since_observation && kind == RuntimeAdmission::PresenceProbe)
+        return nullptr;
     if (retired_since_observation)
         refuseStaleObservation(fmt::format(
             "a life of this name was retired while life {} was being admitted; "
@@ -770,7 +774,7 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireReadableRefT
             fmt::format("its catalog row changed while a cold reader observed life {}; "
                         "retry from a fresh catalog observation", renderIncarnation(life.incarnation)));
 
-    return acquireRefTableRuntime(life, admitted_generation, std::move(admission), RuntimeAdmission::Read);
+    return acquireRefTableRuntime(life, admitted_generation, admission, RuntimeAdmission::Read);
 }
 
 std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireMutableRefTableRuntime(
@@ -785,7 +789,7 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireMutableRefTa
         if (current->life == life)
             return current;
     }
-    return acquireRefTableRuntime(life, admitted_generation, std::move(admission), RuntimeAdmission::Write);
+    return acquireRefTableRuntime(life, admitted_generation, admission, RuntimeAdmission::Write);
 }
 
 void CasRefLedger::invalidateRemovedCatalogLife(const NamespaceLifeId & life)
@@ -793,7 +797,9 @@ void CasRefLedger::invalidateRemovedCatalogLife(const NamespaceLifeId & life)
     std::shared_ptr<RefTableRuntime> rt;
     {
         std::lock_guard lock(ref_queue_mutex);
-        /// No slot: no admission of the name is in flight, and a later one reads the catalog after this.
+        /// No slot: no admission of the name is in flight. After an observation of the removal a later
+        /// admission reads the catalog after it. Before a GC erase the row is still `Removing`, so a later
+        /// presence probe or drop may admit it; the drain calls this again once the erase resolved.
         const auto it = ref_name_slots.find(life.ns.string());
         if (it == ref_name_slots.end())
             return;
@@ -5189,25 +5195,46 @@ NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
         }
         if (rt)
         {
-            ensureRefTableRecovered(ns, *rt);
+            std::exception_ptr recovery_error;
+            try
+            {
+                ensureRefTableRecovered(ns, *rt);
+            }
+            catch (...)
+            {
+                recovery_error = std::current_exception();
+            }
             bool terminal = false;
+            if (!recovery_error)
             {
                 std::lock_guard state_lock(rt->state_mutex);
                 terminal = rt->state.getLifecycle() != RefLifecycle::Live && rt->state.getRemoveTxnId().has_value();
             }
-            /// Only the removal-closed branch above reconciles, so a terminal life recovered outside a local
-            /// removal stays resident after its row is erased; detach it and take the cold path.
+            if (!recovery_error && !terminal)
+                return rt->life;
+
+            /// Only the removal-closed branch above reconciles, and a GC on another server never
+            /// invalidates here: a terminal life, or one whose checkpoint the janitor swept after its row
+            /// was erased, stays resident. Once the catalog no longer names it, detach it and go cold.
             bool row_gone = false;
-            if (terminal)
+            try
             {
                 CasOperation catalog_op = mount_requests.resume(rt->admitted_fence_generation);
                 const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(catalog_op, layout);
-                refuseUnlessAdmitted(catalog_op, "resident removed namespace life");
+                refuseUnlessAdmitted(catalog_op, "resident namespace life, catalog check");
                 const std::optional<NamespaceLifeId> catalog_life = catalog.life_index.resolve(rt->life.incarnation);
                 row_gone = !catalog_life || *catalog_life != rt->life;
             }
+            catch (...)
+            {
+                if (recovery_error)
+                    std::rethrow_exception(recovery_error);
+                throw;
+            }
             if (!row_gone)
             {
+                if (recovery_error)
+                    std::rethrow_exception(recovery_error);
                 refuseTerminalLife(ns, *rt);
                 return rt->life;
             }
@@ -5233,7 +5260,7 @@ NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
         ? NamespaceLifeId::fromCatalogEntry(entry_it->ns, entry_it->incarnation)
         : resolveNamespaceLife(ns, admitted_generation, live_epoch_fn());
     refuseUnlessAdmitted(op, "cold mutable namespace admission, after life resolution");
-    rt = acquireRefTableRuntime(life, admitted_generation, std::move(admission), RuntimeAdmission::Write);
+    rt = acquireRefTableRuntime(life, admitted_generation, admission, RuntimeAdmission::Write);
     ensureRefTableRecovered(ns, *rt);
     refuseTerminalLife(ns, *rt);
     return rt->life;
@@ -5342,7 +5369,11 @@ bool CasRefLedger::namespaceStillLogicallyPresent(const RootNamespace & ns)
     /// therefore not proof that the CURRENT logical namespace `ns` is absent; a fresh catalog read is
     /// required before answering `false` for the name.
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry->ns, entry->incarnation);
-    const auto rt = acquireRefTableRuntime(life, admitted_generation, std::move(admission), RuntimeAdmission::Read);
+    const auto rt = acquireRefTableRuntime(life, admitted_generation, admission, RuntimeAdmission::PresenceProbe);
+    /// GC announced the erase of this row during the admission. Throwing would fail
+    /// `DatabaseOnDisk::dropTable`, which calls `existsDirectory` after its rollback scope; `true` is safe.
+    if (!rt)
+        return true;
     ensureRefTableRecovered(ns, *rt);
     bool this_incarnation_terminal = false;
     {
@@ -5430,7 +5461,7 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     const NamespaceLifeId observed_life
         = NamespaceLifeId::fromCatalogEntry(initial_it->ns, initial_it->incarnation);
     const uint64_t runtime_generation = fence_generation_fn();
-    const auto rt = acquireRefTableRuntime(observed_life, runtime_generation, std::move(admission), RuntimeAdmission::Write);
+    const auto rt = acquireRefTableRuntime(observed_life, runtime_generation, admission, RuntimeAdmission::Write);
     ensureRefTableRecovered(ns, *rt);
     {
         std::unique_lock<std::mutex> queue_lock(ref_queue_mutex);

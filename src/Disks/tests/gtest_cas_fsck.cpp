@@ -484,7 +484,7 @@ TEST(CASFsck, CanonicalDeadLifeResidueIsJanitorPendingNotHardFinding)
     /// Simulate a fenced GC's exact-CAS catalog-row deletion: the row is gone, the life-owned physical
     /// object above survives it (the janitor's own job, not GC's own round). `casUpdate` deliberately
     /// refuses to add or delete rows (there is no generic catalog remove-by-name API -- deletion is
-    /// only `deleteCompletedRemoving`/`cancelStalledCreating`, both requiring the full fenced-GC
+    /// only `deleteCompletedRemovingAtSnapshot`/`cancelStalledCreating`, both requiring the full fenced-GC
     /// protocol this fixture is not driving), so inject the post-deletion catalog snapshot directly,
     /// mirroring `DuplicateLifeIdIsReportedWhileAnUnrelatedUniqueNamespaceStillProgresses` below.
     {

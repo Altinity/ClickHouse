@@ -847,6 +847,24 @@ inline void injectCondemnedSummarySeal(
         (*operation).replace(layout.gcStateKey(), state, existing_state->etag, DB::Cas::Retry::standard());
 }
 
+/// Runs `CasRefCatalog::deleteCompletedRemovingAtSnapshot` on a fresh catalog read, with no retirement
+/// record: the erase alone. A refused proof returns before any read.
+inline DB::Cas::CasRefCatalog::CompletedRemovingDeleteResult deleteCompletedRemovingForTest(
+    DB::Cas::CasOperation & op, const DB::Cas::Layout & layout, const DB::Cas::CatalogEntry & observed,
+    const DB::Cas::CasFoldSeal & authoritative_parent, const std::function<void()> & refresh_authority)
+{
+    using Outcome = DB::Cas::CasRefCatalog::CompletedRemovingDeleteOutcome;
+    const auto parent_it = authoritative_parent.ref_lives.find(observed.incarnation);
+    if (observed.state != DB::Cas::NsState::Removing || !observed.removal_started_round
+        || parent_it == authoritative_parent.ref_lives.end()
+        || !parent_it->second.cleanup_evidence
+        || parent_it->second.coverage.hold)
+        return {.outcome = Outcome::ProofRefused, .invalidated_life = std::nullopt, .catalog_snapshot = std::nullopt};
+    return DB::Cas::CasRefCatalog::deleteCompletedRemovingAtSnapshot(
+        op, layout, DB::Cas::CasRefCatalog::read(op, layout), observed, authoritative_parent, refresh_authority,
+        /*before_erase=*/{}, /*erase_acknowledged=*/{});
+}
+
 /// Whether blob `hash` is absent from the backend (its exact-token content object is gone).
 inline bool blobAbsent(DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::UInt128 & hash)
 {

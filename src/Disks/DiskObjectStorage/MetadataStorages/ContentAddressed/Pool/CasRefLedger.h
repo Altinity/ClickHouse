@@ -233,10 +233,11 @@ public:
     bool namespaceStillLogicallyPresent(const RootNamespace & ns);
 
     /// Called after a complete catalog observation proves an exact resident life absent or replaced,
-    /// or by GC immediately before it erases a row whose terminal removal is folded. It does not
-    /// destroy the runtime: existing callers that already captured the old physical life may finish
-    /// with their stale-or-not-found contract. The name slot is detached by exact pointer identity; a
-    /// later name-based touch may publish a distinct successor runtime.
+    /// and by GC before its first attempt to erase a row whose terminal removal is folded (the erase
+    /// may not follow) and again once the erase resolved. It does not destroy the runtime: existing
+    /// callers that already captured the old physical life may finish with their stale-or-not-found
+    /// contract. The name slot is detached by exact pointer identity; a later name-based touch may
+    /// publish a distinct successor runtime.
     void invalidateRemovedCatalogLife(const NamespaceLifeId & life);
 
     /// Reconciles resident removal-closed runtimes against one complete catalog observation. An exact
@@ -946,8 +947,9 @@ private:
         bool removal_attempt_active = false;
         std::condition_variable cv;
 
-        /// Published by `invalidateRemovedCatalogLife`: from the GC drain just before it erases the exact
-        /// catalog row, from `reconcileCatalogCut` once a cut shows the life gone, and from the
+        /// Published by `invalidateRemovedCatalogLife`: from the GC drain before its first attempt to erase
+        /// the exact catalog row and again once the erase resolved, from `reconcileCatalogCut` once a cut
+        /// shows the life gone, from `namespaceLife` once a catalog read shows it gone, and from the
         /// stalled-`Creating` cancellation in `dropNamespaceImpl`. The exact cache pointer is detached;
         /// old holders observe the flag and remain a predecessor, never a rebindable name handle.
         std::atomic<bool> catalog_life_invalidated{false};
@@ -1105,21 +1107,24 @@ private:
     std::shared_ptr<RefTableRuntime> lookupRefTableRuntime(const RootNamespace & ns) const;
 
     /// Picks the wording of a stale-observation refusal, which is retryable either way: `Read` for
-    /// non-creating callers (removing a file included), `Write` for the rest.
+    /// non-creating callers (removing a file included), `Write` for the rest. `PresenceProbe` reads,
+    /// and gets no runtime instead of the retired-name refusal.
     enum class RuntimeAdmission : uint8_t
     {
         Read,
         Write,
+        PresenceProbe,
     };
 
     /// Publishes or returns one runtime for an exact catalog-observed life and admitted mount-fence
     /// generation. A conflicting attached identity is a stale observation and fails closed rather than
     /// retargeting either runtime. `admission` was begun before the catalog read that produced `life`;
     /// if a retirement of this name landed since, the observation is stale and the call throws
-    /// retry-later instead of republishing a possibly retired life. Releases `admission` in its critical
+    /// retry-later instead of republishing a possibly retired life; a `PresenceProbe` gets `nullptr`
+    /// there. Releases `admission` in its critical
     /// section; if it throws before that, the caller's guard releases it.
     std::shared_ptr<RefTableRuntime> acquireRefTableRuntime(
-        const NamespaceLifeId & life, uint64_t admitted_generation, ColdAdmission && admission,
+        const NamespaceLifeId & life, uint64_t admitted_generation, ColdAdmission & admission,
         RuntimeAdmission kind);
 
     /// Creates the slot of `ns` if absent and counts the admission in it. Call it before the catalog

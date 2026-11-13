@@ -178,9 +178,12 @@ evidence from the fold running now.
 - **Retry order:** when an erase is refused because the catalog changed, the drain pauses first
   (full-jitter backoff, growing to 5 s), then re-reads the catalog, then sends the next erase against
   that fresh read. A catalog write that lands during the pause therefore cannot refuse the next erase.
-  A permanently contended catalog ends the drain at the request deadline with `NETWORK_ERROR`;
-  the deadline is one frozen window shared by every attempt on that row.
-- **Observability:** phase row `pre_fold_ref_drain`; metric `deleted` (rows removed)
+  A permanently contended catalog ends the drain with `NETWORK_ERROR` at the request deadline or after
+  100 erase attempts on one row, whichever comes first; the deadline is one frozen window shared by
+  every attempt on that row.
+- **Observability:** phase row `pre_fold_ref_drain`; metric `deleted` (erases the store acknowledged,
+  counted before the resolution read so a drain that throws still reports them, plus erases a
+  resolution read proved)
 
 On a fresh pool (`snap_generation = 0`) phase 2 is a no-op that still emits its phase row; it can
 first remove a row only in a leader round *after* some earlier fold committed a generation. Phase 3

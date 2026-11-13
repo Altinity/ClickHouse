@@ -65,9 +65,7 @@ CatalogLifecycleReconcileResult CatalogLifecycleReconciler::reconcile(
     CatalogLifecycleReconcileResult result{
         .authority_status = AuthorityStatus::Authoritative,
         .catalog_resolution = CatalogResolution::DrainComplete,
-        .retired_lives = {},
-        .final_catalog_cut = std::nullopt,
-        .deleted = 0};
+        .final_catalog_cut = std::nullopt};
     CasRefCatalog::Snapshot catalog = CasRefCatalog::read(op, layout);
 
     for (;;)
@@ -90,17 +88,26 @@ CatalogLifecycleReconcileResult CatalogLifecycleReconciler::reconcile(
             return result;
         }
 
+        bool acknowledged = false;
         CasRefCatalog::CompletedRemovingDeleteResult delete_result
             = CasRefCatalog::deleteCompletedRemovingAtSnapshot(
-                op, layout, std::move(catalog), *eligible, adopted_parent, refresh_authority, before_erase);
+                op, layout, std::move(catalog), *eligible, adopted_parent, refresh_authority, before_erase,
+                [&](const NamespaceLifeId & life)
+                {
+                    acknowledged = true;
+                    ++completed_erases;
+                    retired_lives.push_back(life);
+                });
         if (!delete_result.catalog_snapshot)
             throw Exception(ErrorCodes::LOGICAL_ERROR,
                 "CAS catalog lifecycle reconciliation returned no catalog resolution snapshot");
 
+        if (!acknowledged && delete_result.invalidated_life)
+            retired_lives.push_back(*delete_result.invalidated_life);
+        if (!acknowledged && delete_result.outcome == CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted)
+            ++completed_erases;
         catalog = std::move(*delete_result.catalog_snapshot);
         result.catalog_resolution = resolveExactRow(catalog, *eligible);
-        if (delete_result.invalidated_life)
-            result.retired_lives.push_back(*delete_result.invalidated_life);
 
         if (delete_result.outcome == CasRefCatalog::CompletedRemovingDeleteOutcome::FencedOut)
         {
@@ -115,8 +122,6 @@ CatalogLifecycleReconcileResult CatalogLifecycleReconciler::reconcile(
             throwCasWriteRetryLater(fmt::format(
                 "CAS catalog lifecycle reconciliation left completed-removal namespace '{}' present",
                 eligible->ns.string()));
-        if (delete_result.outcome == CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted)
-            result.deleted = ++completed_erases;
     }
 }
 

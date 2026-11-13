@@ -5260,9 +5260,7 @@ CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(const GcState & lease
         return {
             .authority_status = AuthorityStatus::Authoritative,
             .catalog_resolution = CatalogResolution::DrainComplete,
-            .retired_lives = {},
-            .final_catalog_cut = std::nullopt,
-            .deleted = 0};
+            .final_catalog_cut = std::nullopt};
 
     const std::optional<CasFoldSeal> parent = readFoldSeal(
         leased_state.snap_generation, leased_state.snap_attempt);
@@ -5282,9 +5280,27 @@ CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(const GcState & lease
     CasOperation op = store->openRequests().admit([this] { return authority_held; });
     CatalogLifecycleReconciler reconciler(op, store->layout(), *parent);
     SCOPE_EXIT({ completed_erases = reconciler.completedErases(); });
-    return reconciler.reconcile(
-        [this, admitted_generation] { refreshAuthority(admitted_generation); },
-        [this](const NamespaceLifeId & life) { store->invalidateRemovedCatalogLife(life); });
+    /// The announcement before the erase refuses admissions already in flight; a presence probe or a
+    /// drop that admitted the `Removing` row after it holds a runtime that the second one detaches; without
+    /// it only a writer's catalog check in `namespaceLife` would.
+    const auto invalidate_retired = [&]
+    {
+        for (const NamespaceLifeId & life : reconciler.retiredLives())
+            store->invalidateRemovedCatalogLife(life);
+    };
+    try
+    {
+        CatalogLifecycleReconcileResult result = reconciler.reconcile(
+            [this, admitted_generation] { refreshAuthority(admitted_generation); },
+            [this](const NamespaceLifeId & life) { store->invalidateRemovedCatalogLife(life); });
+        invalidate_retired();
+        return result;
+    }
+    catch (...)
+    {
+        invalidate_retired();
+        throw;
+    }
 }
 
 }

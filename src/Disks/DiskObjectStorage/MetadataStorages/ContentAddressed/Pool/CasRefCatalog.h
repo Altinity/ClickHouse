@@ -152,33 +152,31 @@ public:
     /// adopted parent carries cleanup evidence, but no hold, in the row keyed by the same opaque life
     /// id. The whole parent seal is consumed so a caller cannot separate the life id from its proof or
     /// reduce the proof to a caller-computed boolean. `op`'s admission is checked after every fresh
-    /// catalog read and before every attempted erase.
+    /// catalog read and before every attempted erase. The erase is conditioned on the incarnation of
+    /// `catalog_snapshot`, and the mandatory resolution snapshot is returned in the result so a
+    /// catalog-only drain can select the next row without an intervening read.
     ///
     /// `refresh_authority` runs at the top of every attempt, before the checks that decide whether to
     /// send one. It is not a verdict -- the verdict stays `op.admitted()` -- but that liveness may be
     /// a cached flag its holder refreshes from a fact this loop cannot see, and one reading taken
-    /// before the first erase must not authorise the rest. Mandatory: a caller whose liveness needs no
-    /// refresh passes a no-op and says so, instead of erasing unrefreshed because the argument was
-    /// easy to omit.
-    static CompletedRemovingDeleteResult deleteCompletedRemoving(
-        CasOperation & op, const Layout & layout, const CatalogEntry & observed,
-        const CasFoldSeal & authoritative_parent,
-        const std::function<void()> & refresh_authority);
-
-    /// Same exact deletion, using the caller's complete selected catalog snapshot and its incarnation
-    /// for the one erase attempt. Its mandatory resolution snapshot is returned in the result so a
-    /// catalog-only drain can select the next row without an intervening read.
+    /// before the first erase must not authorise the rest. A caller whose liveness needs no refresh
+    /// passes a no-op and says so.
     ///
     /// `before_erase`, when set, receives the life once, after admission is confirmed and before the
     /// first erase is sent. It lets a caller record the retirement while the row still exists: a
     /// record made after the erase leaves a window in which the life is gone but unrecorded. An
-    /// exception from it propagates and no erase is sent. The only production caller, the GC drain,
-    /// always passes it; the empty default exists for tests that exercise the erase alone.
+    /// exception from it propagates and no erase is sent. A caller that records nothing passes an empty
+    /// function and says so.
+    ///
+    /// `erase_acknowledged`, when set, receives the life once the store acknowledged its erase, before
+    /// the resolution read: that read may throw, or the call may end `FencedOut` or `EntryChanged`, and
+    /// a caller counting completed erases must not lose this one.
     static CompletedRemovingDeleteResult deleteCompletedRemovingAtSnapshot(
         CasOperation & op, const Layout & layout, Snapshot catalog_snapshot,
         const CatalogEntry & observed, const CasFoldSeal & authoritative_parent,
         const std::function<void()> & refresh_authority,
-        const std::function<void(const NamespaceLifeId &)> & before_erase = {});
+        const std::function<void(const NamespaceLifeId &)> & before_erase,
+        const std::function<void(const NamespaceLifeId &)> & erase_acknowledged);
 
     /// Outcome of exact stalled-creation cancellation, the only other exported deletion shape.
     enum class StalledCreatingCancelOutcome : uint8_t
