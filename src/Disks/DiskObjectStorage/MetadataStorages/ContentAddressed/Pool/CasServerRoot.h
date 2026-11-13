@@ -540,8 +540,9 @@ std::vector<MountInfo> listMounts(CasOperation & op, const Layout & layout, uint
 ///   - `gc_fenced` (the GC leader already fenced this incarnation; a fence costs an epoch, so its
 ///     renewer can never renew again),
 ///   - the clean-farewell sentinel `min_active_build_sequence == UINT64_MAX`,
-/// PLUS one more certificate available here that neither of those needs: a DIFFERENT `writer_epoch`
-/// currently live at that slot proves `writer_epoch`'s specific incarnation is superseded regardless of
+/// (both count only while the slot still holds `writer_epoch` itself),
+/// PLUS one more certificate available here that neither of those needs: a strictly GREATER `writer_epoch`
+/// at that slot proves `writer_epoch`'s specific incarnation is superseded regardless of
 /// its OWN certificate — `allocateWriterEpoch`/`claimMount` are why an epoch, once superseded, is never
 /// reclaimed by its former holder. The classification is an EXHAUSTIVE switch over these three
 /// certificates, not a positive allowlist -- mirrors `CasPool.cpp`'s own exhaustive switch over
@@ -549,11 +550,12 @@ std::vector<MountInfo> listMounts(CasOperation & op, const Layout & layout, uint
 /// consuming it lives in the caller) deliberately: a future certificate with no verdict assigned here
 /// must fail the BUILD (a missing `-Wswitch` case), never silently read as terminal.
 ///
-/// Deliberately conservative on the two cases that are NOT proof of death: an ABSENT mount slot
-/// (a read finding the key absent answers nothing about liveness — it is not proof either way)
-/// and an UNDECODABLE body (an unreadable lease of some other format generation is precisely the case
+/// Deliberately conservative on the three cases that are NOT proof of death: an ABSENT mount slot
+/// (a read finding the key absent answers nothing about liveness — it is not proof either way),
+/// an UNDECODABLE body (an unreadable lease of some other format generation is precisely the case
 /// that must block, not the one to wave through, mirroring `probeNonTerminalMountSlots`'s own stated
-/// discipline for that case) both return `false` — refuse reconciliation rather than guess.
+/// discipline for that case) and a slot holding a LOWER `writer_epoch` (an older incarnation,
+/// whatever it certifies about itself) all return `false` — refuse reconciliation rather than guess.
 /// A merely `expired` lease (a wall-clock reading past `expires_at_ms`) is likewise NEVER
 /// treated as a certificate, for the same reason `claimMount` itself refuses to trust one: comparing
 /// another node's stamp against a clock is exactly the unsafe comparison the mount protocol exists to

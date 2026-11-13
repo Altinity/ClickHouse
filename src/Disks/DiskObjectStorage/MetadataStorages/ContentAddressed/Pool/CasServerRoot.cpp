@@ -1546,8 +1546,8 @@ std::vector<MountInfo> listMounts(CasOperation & op, const Layout & layout, uint
 namespace
 {
 
-/// The three clock-free certificates `isCreatorFenceTerminal` recognises, plus `None` for a live body
-/// that carries none of them -- see the function's header doc for what each one proves and why
+/// The three clock-free certificates `isCreatorFenceTerminal` recognises, plus `None` when none of
+/// them applies to this epoch -- see the function's header doc for what each one proves and why
 /// `fence_generation` is not among them.
 enum class FenceCertificate : uint8_t
 {
@@ -1559,12 +1559,15 @@ enum class FenceCertificate : uint8_t
 
 FenceCertificate classifyFenceCertificate(const MountLease & lease, uint64_t fence_writer_epoch)
 {
+    if (lease.writer_epoch > fence_writer_epoch)
+        return FenceCertificate::SupersededEpoch;
+    /// A lower epoch is an older incarnation: its fence or farewell says nothing about this one.
+    if (lease.writer_epoch < fence_writer_epoch)
+        return FenceCertificate::None;
     if (lease.gc_fenced)
         return FenceCertificate::GcFenced;
     if (lease.isCleanRelease())
         return FenceCertificate::CleanFarewell;
-    if (lease.writer_epoch != fence_writer_epoch)
-        return FenceCertificate::SupersededEpoch;
     return FenceCertificate::None;
 }
 

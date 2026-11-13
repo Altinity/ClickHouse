@@ -3074,10 +3074,10 @@ TEST(CASMountObservation, GcFencedIsReclaimedInstantlyWithPriorFenced)
     EXPECT_EQ(sleeps, 0);
 }
 
-/// ---- Stage B Task 3: `isCreatorFenceTerminal` -- the cross-process terminality predicate
+/// ---- `isCreatorFenceTerminal` -- the cross-process terminality predicate
 /// `CasRefCatalog::reconcileStaleCreator` gates on. Built from `writer_epoch` plus the SAME two
 /// clock-free certificates `probeNonTerminalMountSlots`/`computeHeartbeatFloor` already use, PLUS a
-/// third certificate available only here: a currently-live DIFFERENT `writer_epoch` at the slot. ----
+/// third certificate available only here: a strictly GREATER `writer_epoch` at the slot. ----
 
 TEST(CASFenceTerminal, AbsentMountSlotIsNotTerminal)
 {
@@ -3126,18 +3126,53 @@ TEST(CASFenceTerminal, CleanFarewellIsTerminal)
     EXPECT_TRUE(isCreatorFenceTerminal(ops.op, l, "r", 7));
 }
 
-TEST(CASFenceTerminal, ADifferentLiveWriterEpochIsTerminalForTheOldOne)
+/// A slot at a greater epoch supersedes the older incarnation whatever that body certifies about its own
+/// epoch: live, GC-fenced or farewelled.
+TEST(CASFenceTerminal, AGreaterWriterEpochIsTerminalForTheOldOne)
 {
-    Ops ops(std::make_shared<InMemoryBackend>());
-    Layout l{"p"};
-    /// Slot now held at epoch 8 -- epoch 7's incarnation is superseded regardless of ITS OWN
-    /// certificate (neither fenced nor farewelled).
-    ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), /*our_epoch=*/8, 1000, 500).kind, MountClaimResult::Claimed);
+    enum class Body : uint8_t { Live, GcFenced, CleanFarewell };
+    for (const Body body : {Body::Live, Body::GcFenced, Body::CleanFarewell})
+    {
+        SCOPED_TRACE(static_cast<int>(body));
+        Ops ops(std::make_shared<InMemoryBackend>());
+        Layout l{"p"};
+        ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), /*our_epoch=*/8, 1000, 500).kind, MountClaimResult::Claimed);
+        auto got = ops.op.read(l.mountKey("r"), Retry::standard());
+        ASSERT_TRUE(got.has_value());
+        MountLease lease = decodeMountLease(got->bytes);
+        lease.gc_fenced = body == Body::GcFenced;
+        if (body == Body::CleanFarewell)
+            lease.min_active_build_sequence = std::numeric_limits<uint64_t>::max();
+        mustCommit(ops.op.replace(l.mountKey("r"), encodeMountLease(lease), got->etag, Retry::standard()), "epoch 8 body");
 
-    EXPECT_TRUE(isCreatorFenceTerminal(ops.op, l, "r", 7))
-        << "a different epoch is currently live at this slot -- epoch 7 can never reclaim it";
-    EXPECT_FALSE(isCreatorFenceTerminal(ops.op, l, "r", 8))
-        << "epoch 8 IS the current live epoch -- not terminal";
+        EXPECT_TRUE(isCreatorFenceTerminal(ops.op, l, "r", 7))
+            << "a greater epoch holds this slot -- epoch 7 can never reclaim it";
+        EXPECT_EQ(isCreatorFenceTerminal(ops.op, l, "r", 8), body != Body::Live)
+            << "epoch 8 is terminal only through its own certificate";
+    }
+}
+
+/// A slot below the fence epoch holds an older incarnation. Whatever that body certifies, live, GC-fenced
+/// or farewelled, is about the older epoch and proves nothing about the higher one.
+TEST(CASFenceTerminal, ALowerWriterEpochIsNotTerminalForTheHigherOne)
+{
+    enum class Body : uint8_t { Live, GcFenced, CleanFarewell };
+    for (const Body body : {Body::Live, Body::GcFenced, Body::CleanFarewell})
+    {
+        SCOPED_TRACE(static_cast<int>(body));
+        Ops ops(std::make_shared<InMemoryBackend>());
+        Layout l{"p"};
+        ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), /*our_epoch=*/7, 1000, 500).kind, MountClaimResult::Claimed);
+        auto got = ops.op.read(l.mountKey("r"), Retry::standard());
+        ASSERT_TRUE(got.has_value());
+        MountLease lease = decodeMountLease(got->bytes);
+        lease.gc_fenced = body == Body::GcFenced;
+        if (body == Body::CleanFarewell)
+            lease.min_active_build_sequence = std::numeric_limits<uint64_t>::max();
+        mustCommit(ops.op.replace(l.mountKey("r"), encodeMountLease(lease), got->etag, Retry::standard()), "epoch 7 body");
+
+        EXPECT_FALSE(isCreatorFenceTerminal(ops.op, l, "r", 8));
+    }
 }
 
 /// A merely EXPIRED lease (wall-clock past `expires_at_ms`, same epoch, no certificate) must NOT be
