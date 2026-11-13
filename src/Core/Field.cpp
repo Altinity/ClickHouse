@@ -6,6 +6,7 @@
 #include <IO/readDecimalText.h>
 #include <Core/Field.h>
 #include <Core/DecimalComparison.h>
+#include <Core/DecimalFunctions.h>
 #include <Common/FieldVisitorDump.h>
 #include <Common/FieldVisitorToString.h>
 #include <Common/FieldVisitorWriteBinary.h>
@@ -21,6 +22,7 @@ namespace ErrorCodes
     extern const int CANNOT_RESTORE_FROM_FIELD_DUMP;
     extern const int DECIMAL_OVERFLOW;
     extern const int INCORRECT_DATA;
+    extern const int ARGUMENT_OUT_OF_BOUND;
 }
 
 inline Field getBinaryValue(UInt8 type, ReadBuffer & buf)
@@ -292,6 +294,11 @@ void readQuoted(DecimalField<T> & x, ReadBuffer & buf)
     }
     else
         scale = -exponent;
+    /// The scale comes from the text; an out-of-range value later overruns a fixed-size buffer in
+    /// the decimal text writer, so reject it here, matching `DataTypeDecimalBase`.
+    if (scale > DecimalUtils::max_precision<T>)
+        throw Exception(ErrorCodes::ARGUMENT_OUT_OF_BOUND, "Scale {} is out of bounds (max scale: {})",
+                        scale, DecimalUtils::max_precision<T>);
     assertChar('\'', buf);
     x = DecimalField<T>{value, scale};
 }
