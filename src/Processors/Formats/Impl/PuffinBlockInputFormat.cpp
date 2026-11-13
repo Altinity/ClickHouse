@@ -700,6 +700,15 @@ roaring::Roaring readRoaringPortableSafe(const char * data, size_t size, Int32 k
 
 std::vector<UInt64> deserializeRoaringPositionBitmap(std::string_view bytes, std::optional<UInt64> expected_cardinality)
 {
+    /// A missing declared cardinality must not skip the materialization ceiling. Callers that pass
+    /// one still fail here before `positions.reserve`.
+    if (expected_cardinality.has_value() && *expected_cardinality > PUFFIN_DV_MAX_MATERIALIZED_POSITIONS)
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "Deletion vector cardinality {} exceeds materialization limit {}",
+            *expected_cardinality,
+            PUFFIN_DV_MAX_MATERIALIZED_POSITIONS);
+
     if (bytes.size() < sizeof(Int64))
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Deletion vector bitmap is too small");
 
@@ -742,31 +751,36 @@ std::vector<UInt64> deserializeRoaringPositionBitmap(std::string_view bytes, std
         if (bitmap_size > remaining)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Deletion vector roaring bitmap at key {} exceeds blob size", key);
 
-        if (expected_cardinality.has_value())
-        {
-            const UInt64 bitmap_cardinality = bitmap.cardinality();
-            UInt64 new_running_cardinality = 0;
-            if (common::addOverflow(running_cardinality, bitmap_cardinality, new_running_cardinality))
-                throw Exception(
-                    ErrorCodes::BAD_ARGUMENTS,
-                    "Deletion vector cardinality exceeds declared cardinality {}",
-                    *expected_cardinality);
+        /// Cap on the bitmap's own cardinality, before expanding it into `positions`. This runs
+        /// even when the caller did not declare a cardinality.
+        const UInt64 bitmap_cardinality = bitmap.cardinality();
+        UInt64 new_running_cardinality = 0;
+        if (common::addOverflow(running_cardinality, bitmap_cardinality, new_running_cardinality)
+            || new_running_cardinality > PUFFIN_DV_MAX_MATERIALIZED_POSITIONS)
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "Deletion vector cardinality exceeds materialization limit {}",
+                PUFFIN_DV_MAX_MATERIALIZED_POSITIONS);
 
-            if (new_running_cardinality > *expected_cardinality)
-                throw Exception(
-                    ErrorCodes::BAD_ARGUMENTS,
-                    "Deletion vector cardinality {} exceeds declared cardinality {}",
-                    new_running_cardinality,
-                    *expected_cardinality);
+        if (expected_cardinality.has_value() && new_running_cardinality > *expected_cardinality)
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "Deletion vector cardinality {} exceeds declared cardinality {}",
+                new_running_cardinality,
+                *expected_cardinality);
 
-            running_cardinality = new_running_cardinality;
-        }
+        running_cardinality = new_running_cardinality;
 
         for (UInt32 sub_position : bitmap)
         {
             const UInt64 position = positionFromKeyAndSubPosition(static_cast<UInt32>(key), sub_position);
             if (position > static_cast<UInt64>(DELETION_VECTOR_MAX_POSITION))
                 throw Exception(ErrorCodes::BAD_ARGUMENTS, "Deletion vector position {} is out of supported range", position);
+            if (positions.size() >= PUFFIN_DV_MAX_MATERIALIZED_POSITIONS)
+                throw Exception(
+                    ErrorCodes::BAD_ARGUMENTS,
+                    "Deletion vector cardinality exceeds materialization limit {}",
+                    PUFFIN_DV_MAX_MATERIALIZED_POSITIONS);
             positions.push_back(position);
         }
 

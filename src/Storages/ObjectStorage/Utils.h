@@ -31,13 +31,17 @@ void validateSupportedColumns(
 /// An empty column name has no identifier to render it with, so it cannot survive analysis.
 void validateLakeSchemaColumnNames(const NamesAndTypesList & schema, std::string_view lake_name);
 
+/// `pin_to_metadata_etag` pins the read to `object_info.metadata->etag` even when the backend's
+/// `validate_etag_on_read` setting is off. The Puffin deletion-vector cache uses it so bytes stored
+/// under a listed etag cannot come from a later in-place overwrite.
 std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     RelativePathWithMetadata & object_info,
     const ObjectStoragePtr & object_storage,
     const ContextPtr & context_,
     const LoggerPtr & log,
     const std::optional<ReadSettings> & read_settings = std::nullopt,
-    bool allow_page_cache = true);
+    bool allow_page_cache = true,
+    bool pin_to_metadata_etag = false);
 
 ASTs::iterator getFirstKeyValueArgument(ASTs & args);
 std::unordered_map<std::string, Field> parseKeyValueArguments(const ASTs & function_args, ContextPtr context);
