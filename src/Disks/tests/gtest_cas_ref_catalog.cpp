@@ -1493,6 +1493,135 @@ TEST(CASRefCatalogRemoval, AConflictingEraseBacksOffBeforeItsRetry)
         << "the seed, the refused erase, and the retry that landed";
 }
 
+/// A writer that lands during every backoff must not starve the erase: the next erase write is
+/// conditioned on a read taken after the pause, so only a write landing between that read and the
+/// erase can refuse it. The pause comes before the read, so no pause leaves the following erase
+/// sending against a stale snapshot.
+TEST(CASRefCatalogRemoval, AWriterLandingDuringEveryBackoffCannotStarveTheErase)
+{
+    const CatalogEntry removing{
+        .ns = RootNamespace{"a"},
+        .state = NsState::Removing,
+        .incarnation = UInt128{7},
+        .removal_started_round = 13};
+    CasFoldSeal ready_parent;
+    ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
+        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
+
+    {
+        auto backend = std::make_shared<WriteCountingBackend>();
+        DB::Cas::tests::FakeClock clock;
+        CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+        requests.setNowFnForTest(clock.nowFn());
+        CasOperation op = requests.admit();
+        CasOperation writer = requests.admit();
+        const Layout layout("erase-starve");
+        seedObject(op, layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}}));
+
+        size_t external_writes = 0;
+        auto pause = clock.sleepFn();
+        requests.setSleepFnForTest([&](uint64_t ms)
+        {
+            pause(ms);
+            CasRefCatalog::casAdmitEntry(
+                writer, layout, 1, liveEntry(fmt::format("b{}", external_writes), 100 + external_writes));
+            ++external_writes;
+        });
+
+        backend->refuseNextWrite(layout.refCatalogKey());
+        EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent, noAuthorityRefresh),
+            CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
+        EXPECT_EQ(clock.sleeps.size(), 1u) << "one refusal, one pause, and the erase after it lands";
+        EXPECT_EQ(external_writes, 1u);
+
+        const RefCatalog current = CasRefCatalog::read(op, layout).catalog;
+        ASSERT_EQ(current.entries.size(), 1u);
+        EXPECT_EQ(current.entries.front().ns, RootNamespace{"b0"}) << "the writer's row stays, the erased row is gone";
+    }
+
+    /// A pause that itself runs past the window is followed by no erase write.
+    {
+        auto backend = std::make_shared<WriteCountingBackend>();
+        DB::Cas::tests::FakeClock clock;
+        CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+        requests.setNowFnForTest(clock.nowFn());
+        auto pause = clock.sleepFn();
+        requests.setSleepFnForTest([&](uint64_t ms) { pause(ms + 200'000); });
+        CasOperation op = requests.admit();
+        const Layout layout("erase-pause-past-deadline");
+        seedObject(op, layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}}));
+        const uint64_t writes_after_seed = backend->writes(layout.refCatalogKey());
+
+        backend->refuseNextWrite(layout.refCatalogKey());
+        try
+        {
+            (void)CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent, noAuthorityRefresh);
+            ADD_FAILURE() << "a pause that crosses the window must end the call";
+        }
+        catch (const DB::Exception & e)
+        {
+            EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR);
+            EXPECT_NE(e.message().find("deadline"), String::npos) << e.message();
+        }
+        EXPECT_EQ(backend->writes(layout.refCatalogKey()) - writes_after_seed, 1u)
+            << "only the refused erase; nothing is sent after the pause crossed the deadline";
+        EXPECT_EQ(CasRefCatalog::read(op, layout).catalog.entries, std::vector<CatalogEntry>{removing});
+    }
+}
+
+/// The explicit catalog read that becomes the next erase's precondition is taken after the pause, not
+/// before it. The read inside `replace` that settles the refused write is not part of this order, so
+/// the test pins the relative order only.
+TEST(CASRefCatalogRemoval, AConflictedEraseSendsTheNextWriteFromAReadTakenAfterThePause)
+{
+    auto backend = std::make_shared<WriteCountingBackend>();
+    DB::Cas::tests::FakeClock clock;
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    requests.setNowFnForTest(clock.nowFn());
+    const Layout layout("erase-read-after-pause");
+    std::vector<size_t> journal_sizes_at_pause;
+    auto pause = clock.sleepFn();
+    requests.setSleepFnForTest([&](uint64_t ms)
+    {
+        pause(ms);
+        journal_sizes_at_pause.push_back(backend->journalFor(layout.refCatalogKey()).size());
+    });
+    CasOperation op = requests.admit();
+    const CatalogEntry removing{
+        .ns = RootNamespace{"a"},
+        .state = NsState::Removing,
+        .incarnation = UInt128{7},
+        .removal_started_round = 13};
+    seedObject(op, layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}}));
+    CasFoldSeal ready_parent;
+    ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
+        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
+
+    const CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(op, layout);
+    const size_t journal_before = backend->journalFor(layout.refCatalogKey()).size();
+    backend->refuseNextWrite(layout.refCatalogKey());
+
+    EXPECT_EQ(CasRefCatalog::deleteCompletedRemovingAtSnapshot(
+        op, layout, snapshot, removing, ready_parent, noAuthorityRefresh).outcome,
+        CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
+
+    const std::vector<WriteCountingBackend::Verb> full_journal = backend->journalFor(layout.refCatalogKey());
+    const std::vector<WriteCountingBackend::Verb> journal_since(
+        full_journal.begin() + static_cast<ptrdiff_t>(journal_before), full_journal.end());
+    using Verb = WriteCountingBackend::Verb;
+    ASSERT_EQ(journal_sizes_at_pause.size(), 1u);
+    const size_t pause_at = journal_sizes_at_pause.front() - journal_before;
+    ASSERT_GE(pause_at, 1u);
+    ASSERT_LT(pause_at + 1, journal_since.size()) << renderJournal(journal_since);
+    EXPECT_EQ(journal_since.front(), Verb::Write) << "the refused erase is sent first: " << renderJournal(journal_since);
+    EXPECT_EQ(journal_since[pause_at], Verb::Read)
+        << "the pause is followed by the explicit catalog read: " << renderJournal(journal_since);
+    EXPECT_EQ(journal_since[pause_at + 1], Verb::Write)
+        << "and the next erase write comes from that read: " << renderJournal(journal_since);
+}
+
 /// A caller's liveness need not be a fact this loop can read. The GC drain's is a cached
 /// leader-authority flag its owner refreshes by re-reading `gc/state`, so a leader deposed while an
 /// erase is in flight leaves that flag stale -- and on an unrecoverable delete path one reading taken

@@ -175,6 +175,11 @@ evidence from the fold running now.
 - **Fails the round if:** `gc/state` points at a missing parent seal (`CORRUPTED_DATA`); leadership
   changes mid-drain (`NETWORK_ERROR`, an `Aborted` finish that the next round retries — a write
   already sent stays safe, authorized by the parent seal and the catalog token)
+- **Retry order:** when an erase is refused because the catalog changed, the drain pauses first
+  (full-jitter backoff, growing to 5 s), then re-reads the catalog, then sends the next erase against
+  that fresh read. A catalog write that lands during the pause therefore cannot refuse the next erase.
+  A permanently contended catalog ends the drain at the request deadline with `NETWORK_ERROR`;
+  the deadline is one frozen window shared by every attempt on that row.
 - **Observability:** phase row `pre_fold_ref_drain`; metric `deleted` (rows removed)
 
 On a fresh pool (`snap_generation = 0`) phase 2 is a no-op that still emits its phase row; it can

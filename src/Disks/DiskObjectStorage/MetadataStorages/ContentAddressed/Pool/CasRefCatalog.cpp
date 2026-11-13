@@ -519,9 +519,9 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
     /// ONE bound for the whole loop, frozen before the first iteration: every erase and every
     /// resolution read below shares this deadline, so a permanently contended catalog gives up
     /// retry-later within one standard window rather than spending a fresh window per verb per
-    /// iteration. The paced retry at the end of the loop is a bare sleep that does not consult the
-    /// deadline, so the loop can sleep one backoff (at most 5 s) past it before the next erase refuses
-    /// to start.
+    /// iteration. The pause after a refused erase is a bare sleep that does not consult the deadline;
+    /// the read that follows it does, so a pause that crosses the deadline ends the call before the
+    /// next erase is sent.
     const Retry policy = op.freeze(Retry::standard());
 
     bool retirement_announced = false;
@@ -555,6 +555,12 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
         WriteResult erase = op.replace(layout.refCatalogKey(), encodeRefCatalog(candidate),
                                        *catalog_snapshot.etag, policy);
 
+        /// Pause before the read: that read is the snapshot the next erase is conditioned on, and a
+        /// write landing during a pause taken after it would refuse that erase every time.
+        /// The argument counts reissues so far: `backoff(0)` is no wait at all.
+        if (std::holds_alternative<Conflict>(erase))
+            op.pause(Retry::backoff(static_cast<uint32_t>(attempt) + 1));
+
         /// An operation whose admission is gone cannot issue the resolution read either, so the call
         /// ends HERE and reports the cut it was given rather than a fresh one. There is nothing further
         /// this actor may learn, and nothing further it may do.
@@ -587,12 +593,6 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
             throwCatalogWriteFailure(std::move(erase), fmt::format(
                 "CAS ref catalog erase for namespace '{}'", observed.ns.string()));
         }
-
-        /// Only a refused precondition reaches here, so this pause paces one contended key's retries.
-        /// The argument is the number of reissues so far, which is one more than the zero-based
-        /// iteration: `backoff(0)` is no wait at all, and the first retry is the one most likely to
-        /// collide with the writer that just won.
-        op.pause(Retry::backoff(static_cast<uint32_t>(attempt) + 1));
     }
 
     throwCasWriteRetryLater(fmt::format(
