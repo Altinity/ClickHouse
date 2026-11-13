@@ -97,7 +97,7 @@ entirely before release. Treat this table as a snapshot of the current build, no
 | `cas_blob_hash_allow_new` | `false` | Explicit opt-in to admit a new hash algorithm into an existing pool. One-way: once admitted, the pool carries both algorithms permanently |
 | `cas_allow_packed_parts` | `false` | Allow creation of new `Packed` MergeTree parts on this disk. The decision uses the actual destination disk, not every disk in its storage policy. A `type=cache` disk inherits this capability from the wrapped `CAS` disk; set the key in the `metadata_type=cas` disk block. Existing `Packed` parts remain readable when this setting is `false` |
 | `skip_access_check` | `false` | Skip the boot-time capability probe (start now, fix later). Only the preflight probe is skipped — the conditional-write correctness check still runs on every writable mount. **Not available on a writable generation-token (GCS) disk**, which refuses to mount with it: there, the probe battery is the only proof that a token-exact delete carries its generation precondition. Mount such a disk read-only if you need to defer the check |
-| `cas_mount_lease_ttl_ms` | `30000` | How long this server may write after its last confirmed renewal; every other server waits at least this long before fencing or reclaiming its slot (≥ 1, at most 600000 — a larger value is clamped to 10 minutes with a warning at startup, so no holder declares a longer lease). Lower values shorten recovery after this server's crash but reduce tolerance for object-storage and scheduling delays |
+| `cas_mount_lease_ttl_ms` | `120000` | How long this server may write after its last confirmed renewal; every other server waits at least this long before fencing or reclaiming its slot (≥ 1, at most 600000 — a larger value is clamped to 10 minutes with a warning at startup, so no holder declares a longer lease). Lower values shorten recovery after this server's crash but reduce tolerance for object-storage and scheduling delays. Set `30000` for faster recovery after a crash, at the costs [below](#mount-lease-costs) |
 | `cas_mount_renew_period_ms` | `10000` | Milliseconds between background mount-lease renewals (≥ 1). It must leave enough time for two attempt envelopes (a renewal write and its settlement read) and the lease safety margin before the TTL expires: `period + 2 × envelope + margin < TTL` |
 | `cas_gc_snapshot_generations_to_keep` | `3` | GC snapshot generations retained |
 | `cas_gc_shards` | `1` | Blob-hash-prefix reducer shards (≥ 1). Recorded in the pool at creation; a mismatching config is refused at mount |
@@ -108,7 +108,7 @@ entirely before release. Treat this table as a snapshot of the current build, no
 | `cas_manifest_decode_cache_bytes` | 128 MiB | Manifest decode cache byte budget (`0` disables) |
 | `cas_gc_meta_pool_size` | `16` | Bounded pool size for GC per-hash freshness-meta writes |
 | `cas_gc_io_concurrency` | `16` | Bounded pool size for GC object-storage requests that run in parallel: the fold's read-ahead (checkpoints, ref logs, manifests, zero-candidate HEADs), the orphan-manifest sweep planning reads, the `SYSTEM CAS GC REBUILD` read-ahead, the `pending_deletes` blob `HEAD` + conditional `DELETE` fan-out, and the namespace janitor's batch deletes of dead ref logs and snapshots. Not covered: meta writes (`cas_gc_meta_pool_size`) and all other GC requests, which run on the round thread. `1` runs the covered requests sequentially. `cas_gc_read_concurrency` is rejected without an alias; use `cas_gc_io_concurrency` instead |
-| `cas_attempt_timeout_ms` | `5000` | Budget for one HTTP attempt of a writable Native mount's control-plane requests (read, head, list, remove, conditional write, the mount-time bucket-versioning probe), at least 1. Together with the connect cap it forms the attempt envelope (`cas_attempt_timeout_ms + 2 × cap`; the cap is `cas_attempt_timeout_ms` itself when the disk's `connect_timeout_ms` is `0`, else `min(connect_timeout_ms, cas_attempt_timeout_ms)`) that the lease arithmetic reserves: one TCP connect and one TLS handshake under the cap each, send/receive bounded per socket operation by `cas_attempt_timeout_ms`. With background renewal the cadence check requires `cas_mount_renew_period_ms + 2 × envelope + cas_lease_safety_margin_ms < cas_mount_lease_ttl_ms`, which puts an effective ceiling on the frozen connect cap: under the defaults (TTL 30000, period 10000, margin 2000) the envelope must stay under 9000, so a disk `connect_timeout_ms` of 2000 ms or more refuses to open writable — lower the connect timeout or raise the TTL if you hit this. Blob body publication does not use this budget: its object-creating request is sent once under the disk's `request_timeout_ms`, with the connect timeout under the same cap |
+| `cas_attempt_timeout_ms` | `5000` | Budget for one HTTP attempt of a writable Native mount's control-plane requests (read, head, list, remove, conditional write, the mount-time bucket-versioning probe), at least 1. Together with the connect cap it forms the attempt envelope (`cas_attempt_timeout_ms + 2 × cap`; the cap is `cas_attempt_timeout_ms` itself when the disk's `connect_timeout_ms` is `0`, else `min(connect_timeout_ms, cas_attempt_timeout_ms)`) that the lease arithmetic reserves: one TCP connect and one TLS handshake under the cap each, send/receive bounded per socket operation by `cas_attempt_timeout_ms`. With background renewal the cadence check requires `cas_mount_renew_period_ms + 2 × envelope + cas_lease_safety_margin_ms < cas_mount_lease_ttl_ms`, which puts an effective ceiling on the frozen connect cap: under the defaults (TTL 120000, period 10000, margin 2000) the envelope must stay under 54000, which the default attempt timeout always meets because the cap never exceeds it; with a TTL of 30000 the envelope must stay under 9000, so a disk `connect_timeout_ms` of 2000 ms or more refuses to open writable — lower the connect timeout or raise the TTL if you hit this. Blob body publication does not use this budget: its object-creating request is sent once under the disk's `request_timeout_ms`, with the connect timeout under the same cap |
 | `cas_lease_safety_margin_ms` | `2000` | Startup-only margin validated against the mount lease TTL: the attempt envelope + `cas_lease_safety_margin_ms` must be strictly less than the mount lease TTL, and `cas_mount_renew_period_ms` + 2 × envelope + `cas_lease_safety_margin_ms` too, or the disk refuses to open writable |
 | `cas_unsafe_remount_no_delay` | `0` | Reclaim a mount slot that carries this server's own uuid at once after a hard restart, without observing the slot's token for the lease TTL. Unsafe whenever two processes can hold the same `server_uuid` (a copied uuid file, a stalled predecessor). After such a reclaim the predecessor can still start conditional writes until its own cutoff (`confirmed deadline − cas_lease_safety_margin_ms − 2 × envelope`) or until its next renewal meets the token guard, and a request it already sent may still materialize later. That is not a data hazard: ref-log keys carry `(writer_epoch, sequence)` and creates are conditional, so two writers can never commit different bodies to one key, and recovery's epoch seal settles any straggler (recovery fails closed after 64 successive seal-create attempts displaced by newly materializing old-epoch transactions). The exposure is availability, not data. Intended for test stands and deployments that guarantee one process per uuid |
 | `cas_staging_backend` | `local` | Blob staging backend (`local` \| `s3`); `s3` is opt-in and requires native same-store copy on writable mount. A transaction deletes its staging objects on commit and on abort; mount start removes leftovers of the same `server_root_id`. Neither can see a multipart upload that was never completed, so add an `AbortIncompleteMultipartUpload` lifecycle rule on the bucket to reclaim those |
@@ -119,15 +119,16 @@ longer of the observer's `cas_mount_lease_ttl_ms` and the lease the holder's bod
 (`expires_at_ms − started_at_ms`; a body without stamps or with a non-positive interval declares
 nothing). Startup's step is `max(1, floor(cas_mount_renew_period_ms / 2))` and GC's is
 `cas_mount_renew_period_ms`, both the observer's own. GC checks only at the start of a round, so a
-fence-out can land up to one GC round after that. Mixed values are therefore safe in any order;
-a longer lease on one server delays recovery after that server's crash. A server built without this
-rule waits only its own lease, so keep the values equal until every server of the pool runs a build
-with it.
+fence-out can land up to two GC intervals after that. When every server of the pool runs a build with
+this rule, mixed values are safe in any order; a longer lease on one server delays recovery after that
+server's crash. A server built without the rule waits only its own lease and can fence a holder that
+declares a longer one while that holder can still write: see
+[upgrading to the 120 s lease](#upgrading-lease-defaults) for the pin that a mixed pool must use.
 
 A shorter TTL reduces the tolerance for object-storage delays; a shorter renewal period increases it
 (renewal starts earlier) at the cost of more background traffic. With the defaults,
 `cas_mount_lease_ttl_ms − cas_lease_safety_margin_ms − cas_mount_renew_period_ms − 2 × envelope =
-4000` ms is the scheduling-lateness budget before the first renewal attempt of a period can begin,
+94000` ms is the scheduling-lateness budget before the first renewal attempt of a period can begin,
 where `envelope = cas_attempt_timeout_ms + 2 × cap` (7000 ms with defaults) and `cap` is
 `cas_attempt_timeout_ms` when the disk's `connect_timeout_ms` is `0`, else
 `min(connect_timeout_ms, cas_attempt_timeout_ms)` (1000 ms with defaults); the renewal then keeps
@@ -137,6 +138,26 @@ The `expires_at_ms` stamped into the mount object is a writer-stamped diagnostic
 `system.cas_mounts`; it never
 authorizes a reclaim or a GC fence-out. Local fencing is derived instead from the confirmed
 request's pre-I/O `CLOCK_BOOTTIME` anchor plus the TTL.
+
+### Lease TTL: 30 s versus 120 s {#mount-lease-costs}
+
+The write reserve is `2 × envelope + cas_lease_safety_margin_ms` (16 s with defaults, `envelope` as
+above). A server pauses its own writes one write reserve before its lease ends.
+
+| Effect | 30 s lease | 120 s lease | Source |
+|---|---|---|---|
+| Restart wait of a server that died without releasing its mount | about 43 s | about 138 s | Measured |
+| GC fence of a dead mount | about 103 s | about 224 s | Measured |
+| `system.cas_mounts` shows `expired` after | 45 s | 180 s | Derived: `lease + lease / 2` |
+| A server whose renewals stop pauses its own writes after the start of its last successful renewal | 14 s | 104 s | Derived: `lease − write reserve` |
+| The same server starts no request at all after the same start | 21 s | 111 s | Derived: `lease − envelope − cas_lease_safety_margin_ms` |
+
+The measured rows come from one test-stand run per lease, with a 10 s renewal period and a 60 s GC
+interval; treat them as approximate. The restart wait is the observation threshold
+`lease + lease / 20 + renewal period / 2` plus the server's own start time. The GC fence lands at a
+round start, between `lease + lease / 20 + renewal period` and that value plus two GC intervals after
+the last renewal. `cas_unsafe_remount_no_delay` still skips the
+restart wait.
 
 ### Enabling `Packed` parts {#enabling-packed-parts}
 
@@ -251,6 +272,50 @@ requiring a fresh pool.
 | `sha256` | Maximum safety | No known collision classes; slightly slower than the other two |
 | `xxh3-128` | Maximum speed | Fastest, 128-bit, no known collision classes |
 | `cityhash128` (default) | ClickHouse-ecosystem compatibility, and a possible future hash-reuse mode that avoids recomputation | Fast, but has a known class of collisions that occurs far more often than an ideal hash function would predict |
+
+## Upgrading to the 120 s lease and request window defaults {#upgrading-lease-defaults}
+
+This release changes three defaults. `cas_mount_lease_ttl_ms` moves from `30000` to `120000`. The
+request window moves from a fixed 90 s to `cas_request_window_ms`, default `120000`. The ref-table
+recovery budget moves from a fixed 120 s to twice the window. A server that runs with default settings
+therefore changes its lease when it is upgraded.
+
+**Pin the lease while the pool has older builds.** A build without the declared-lease rule (before
+`v26.6.8.20003`; in the 26.8 line, before the merge of
+https://github.com/Altinity/ClickHouse/pull/2805) waits only its own lease before it fences a mount.
+Before you upgrade any server of a pool that still has such a build, you must set
+`cas_mount_lease_ttl_ms` to `30000` on every upgraded server. Remove the pin only after every server of
+the pool runs a build with the rule.
+
+**What happens without the pin.**
+
+- An older server with a 30 s lease and a 10 s renewal period can fence a 120 s holder after about 42 s
+  of stalled renewals (30 s + 5 % + 10 s), up to one GC round later.
+- The holder learns of the fence only at its next renewal, which the store refuses. Until then, up to
+  104 s after the start of its last successful renewal (the lease minus the 16 s write reserve), its
+  writes still pass its own lease check.
+- Its ref-log appends, catalog writes and checkpoint writes in that window are conditional, but the
+  store refuses one only if another writer changed the same key first; the fence changes none of these
+  keys. Blob publication has no store precondition, and namespace files are written without looking at
+  the stored content.
+- The pool treats the holder as gone while it can still write, so the writes of that window are not
+  protected by the lease. Nothing destructive in GC keys off the fence itself, but other servers treat
+  the fenced slot as terminal: a server that opens one of the holder's unfinished namespace creations may
+  take it over, a `DROP` may cancel it, and `SYSTEM CAS DROP POOL MEMBER` accepts the slot.
+- No test covers this case.
+
+**Pools where every server has the rule.** The fence-out and the startup reclaim wait the longer of the
+observer's own lease and the lease the holder declares, so mixed values are safe there.
+
+**The request window key.** `cas_request_window_ms` is unknown to older builds, which refuse to load
+the disk with `UNKNOWN_SETTING`. Set it only after every server that reads the configuration runs a
+build that includes this change, and remove it before a downgrade.
+
+**Long attempt envelopes.** A writable disk now opens only when `cas_request_window_ms` is larger than
+twice the attempt envelope, so with the default window an envelope of 60 s or more refuses to open.
+At the default 120 s lease the cadence check already keeps the envelope below 54 s; this bites with a
+raised `cas_mount_lease_ttl_ms`. Raise `cas_request_window_ms` above twice the envelope after the
+upgrade, or lower `cas_attempt_timeout_ms` or the disk's `connect_timeout_ms`.
 
 ## Upgrading a pool from 26.6.x {#upgrading-from-26-6}
 

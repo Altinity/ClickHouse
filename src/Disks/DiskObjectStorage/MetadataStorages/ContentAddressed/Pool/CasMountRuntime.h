@@ -67,6 +67,7 @@ using RuntimeWorkerFactory = std::function<ThreadFromGlobalPool(std::function<vo
 /// lower-layer header to describe its own dependencies.
 struct MountConfig
 {
+    /// The values of a pool opened without disk settings (unit tests); a disk defaults to 120000/10000.
     std::chrono::milliseconds mount_lease_ttl_ms{30000};
     std::chrono::milliseconds mount_renew_period{10000};
     /// When false, tests drive `renewWatermarkOnce` explicitly. In production this flag enables both

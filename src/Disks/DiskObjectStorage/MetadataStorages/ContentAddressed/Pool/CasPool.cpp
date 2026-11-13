@@ -994,7 +994,7 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
     logSkippedCapabilityProbe(
         victim_srid, config.pool_prefix, fmt::format("decommission of pool member '{}'", victim_srid));
     /// The admin claim must be RENEWED like any writable mount: the host disk may be observe-only
-    /// (background_watermark=false), but an unrenewed claim (TTL ~30s) aborts any long drain midway.
+    /// (background_watermark=false), but an unrenewed claim (one mount lease TTL) aborts any long drain midway.
     config.background_watermark = true;
     /// Bounded by the lease, like the startup re-anchor: an admin claim that cannot renew ends rather than
     /// pauses.

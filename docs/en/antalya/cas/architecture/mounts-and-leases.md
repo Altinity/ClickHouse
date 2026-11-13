@@ -107,7 +107,7 @@ of the old life that is still running stops in `IdentityLost` at its next remoun
 | `no server uuid` | `CORRUPTED_DATA` | the process has no server uuid |
 | `cannot rejoin` | `CORRUPTED_DATA` | `epoch` or `mount` is missing: the id was retired by 26.6.4, or the object was deleted by hand |
 | `decommission is not finished` | `CORRUPTED_DATA` | the tombstone is not verified; `system.cas_mounts` shows the id as `retired` with `retirement_verified = 0` once its slot is terminal |
-| `still running` | `ABORTED` | a decommission run holds the slot, or the lease of a killed run or an interrupted restart has not lapsed and been fenced by GC (up to one GC round after the lease threshold) |
+| `still running` | `ABORTED` | a decommission run holds the slot, or the lease of a killed run or an interrupted restart has not lapsed and been fenced by GC (up to two GC intervals after the lease threshold) |
 | `previous life remains` | `ABORTED` | the message names the first part left: catalog rows (with the first namespaces and their state), `cas/manifests/<server_root_id>/` or `roots/<server_root_id>/` |
 | `kept changing` | `ABORTED` | the owner or the slot changed under every rejoin attempt of this start; restart |
 
@@ -143,7 +143,7 @@ watermark — there is no separate watermark object. `MountLease` fields: `serve
   The bounded renewals — the startup re-anchor, the remount re-anchor, and the background renewal of a
   pool opened for decommission — stay bounded by the last confirmed lease minus the safety margin.
 - **Cadence.** The runtime normally starts a logical renewal every `cas_mount_renew_period_ms` (default
-  10 s), with TTL `cas_mount_lease_ttl_ms` (default 30 s, TTL/3 renewal ratio). The next beat is anchored
+  10 s), with TTL `cas_mount_lease_ttl_ms` (default 120 s). The next beat is anchored
   at the committed body's pre-I/O BOOTTIME start. A slow recovery therefore causes an immediate
   catch-up beat when the nominal cadence has elapsed; it does not wait a fresh full period after the
   response.
@@ -195,12 +195,14 @@ anchor plus the TTL, and wall-clock `now` stays audit-only.
 
 `cas_mount_lease_ttl_ms` is local to each server. It is how long this server may write after its last
 confirmed renewal, and every other server waits at least this long before fencing or reclaiming its
-slot. A configured value above 10 minutes (600000 ms) is clamped to 10 minutes with a warning at startup, so no holder declares a longer lease. Mixed values are safe, and so is changing the value one server at a time in any order. A longer
+slot. A configured value above 10 minutes (600000 ms) is clamped to 10 minutes with a warning at startup, so no holder declares a longer lease. When every server of the pool runs a build with this rule, mixed
+values are safe, and so is changing the value one server at a time in any order. A longer
 lease on one server delays recovery after that server's crash, and the GC leader logs one `WARNING` per
-slot whose declared lease differs from its own. A server built without this rule waits only its own
-lease: keep the values equal until every server of the pool runs a build with the rule.
+slot whose declared lease differs from its own. A server built without the rule waits only its own
+lease and can fence a longer-lease holder that can still write; such a pool must pin equal values, see
+[upgrading to the 120 s lease](/antalya/cas/configuration#upgrading-lease-defaults).
 
-With the defaults (TTL 30 s, period 10 s, margin 2 s), `TTL − margin − period − 2 × envelope = 4 s` is the scheduling-lateness budget before
+With the defaults (TTL 120 s, period 10 s, margin 2 s), `TTL − margin − period − 2 × envelope = 94 s` is the scheduling-lateness budget before
 the first renewal attempt of a period can begin, where `envelope = attempt_timeout + 2 × cap` and
 `cap` is `attempt_timeout` when the disk's `connect_timeout_ms` is `0`, else
 `min(connect_timeout_ms, attempt_timeout)` (7 s with defaults).
@@ -372,7 +374,7 @@ unretired life after the tombstone (a rejoin, or another run's rollback) reports
 the warning `the owner moved on to life N`. Catalog rows GC still has to delete are reported as
 `namespaces_pending_gc`, not as a failure. The operator reruns only after `member_retired = 0`, under the
 [rerun rule](/antalya/cas/operations/migration#rejoin-rerun-rule); a rerun refused as alive or contended
-waits until GC fences the previous run's slot: about one mount lease TTL plus one GC round, with a GC leader
+waits until GC fences the previous run's slot: about one mount lease TTL plus up to two GC intervals, with a GC leader
 running. A later start under that `server_root_id` rejoins it as an empty member once the retirement is
 verified and drained ([rejoin](#rejoin)).
 

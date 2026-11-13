@@ -221,9 +221,10 @@ struct PoolConfig
     /// Mount-lease TTL: how long a freshly-renewed mount lease is valid. The local
     /// write fence's monotonic deadline is `renew_time + this`, so a superseded/paused writer is fenced
     /// once `this` elapses with no successful renew. The background renewer runs every
-    /// `mount_renew_period` (default ttl/3) so a healthy mount renews well before expiry.
+    /// `mount_renew_period` so a healthy mount renews well before expiry. These are the values of a
+    /// pool opened without disk settings, which is how unit tests open one; a disk defaults to 120000/10000.
     std::chrono::milliseconds mount_lease_ttl_ms{30000};
-    std::chrono::milliseconds mount_renew_period{10000};   /// = ttl/3 by default
+    std::chrono::milliseconds mount_renew_period{10000};
 
     /// `cas_unsafe_remount_no_delay`: reclaim a same-uuid, different-epoch, uncertified mount slot at
     /// once, with no token-stability observation at all. Unsafe whenever two processes can hold the

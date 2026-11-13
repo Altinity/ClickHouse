@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestBudget.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
@@ -27,6 +28,7 @@ namespace DB::ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 gc_interval_sec;
     extern const ContentAddressedSettingsUInt64 gc_bulk_delete_chunk_keys;
     extern const ContentAddressedSettingsUInt64 mount_lease_ttl_ms;
+    extern const ContentAddressedSettingsUInt64 mount_renew_period_ms;
     extern const ContentAddressedSettingsString scratch_path;
     extern const ContentAddressedSettingsBool unsafe_remount_no_delay;
     extern const ContentAddressedSettingsBool allow_packed_parts;
@@ -648,4 +650,19 @@ TEST(CASContentAddressedSettings, MountLeaseTtlAtTheMaximumIsKeptSilently)
     s.loadFromConfig(*cfg, "disk", "/data", "/data/scratch", identity_macros);
     EXPECT_EQ(s[ContentAddressedSetting::mount_lease_ttl_ms].value, 600'000u);
     EXPECT_EQ(countOccurrences(capture.captured(), "exceeds the maximum"), 0u) << capture.captured();
+}
+
+TEST(CASContentAddressedSettings, MountLeaseDefaultsSatisfyRequestBudget)
+{
+    ContentAddressedSettings s;
+    EXPECT_EQ(s[ContentAddressedSetting::mount_lease_ttl_ms].value, 120000u);
+    EXPECT_EQ(s[ContentAddressedSetting::mount_renew_period_ms].value, 10000u);
+
+    const Cas::CasRequestBudget budget;
+    const uint64_t ttl = s[ContentAddressedSetting::mount_lease_ttl_ms].value;
+    const uint64_t period = s[ContentAddressedSetting::mount_renew_period_ms].value;
+    EXPECT_NO_THROW(Cas::validateCasRequestBudget(budget, ttl, period, /*background_renewal=*/true));
+
+    const uint64_t write_reserve = 2 * budget.attemptEnvelopeMs() + budget.lease_safety_margin_ms;
+    EXPECT_EQ(ttl - period - write_reserve, 94000u);
 }
