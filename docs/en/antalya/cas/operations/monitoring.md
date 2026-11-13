@@ -129,6 +129,27 @@ A round that is recurring `Aborted` rather than `Error` still deserves attention
 but the underlying transient condition (backend unavailability, a lost lease, a competing leader)
 has not gone away.
 
+Each finished round also writes one `Information` line to the server log, for operators who have only
+the text log:
+
+```text
+GC round finished: round=42 outcome=Success trigger=Scheduled duration_ms=815 deleted=12 condemned=30 error_code=0 keys_listed=1043
+```
+
+The line is written for the outcomes `Success`, `Aborted`, `Error` and `Stopped`, for scheduled rounds and
+for `SYSTEM CAS GC RUN`. A round that ends as `NotALeader` or `Deferred` writes no `Information` line.
+
+| Field | `system.cas_gc_log` column of the `Finish` row |
+|---|---|
+| `round` | `round` |
+| `outcome` | `outcome` |
+| `trigger` | `trigger` |
+| `duration_ms` | `duration_ms` |
+| `deleted` | `objects_deleted` |
+| `condemned` | `entries_condemned` |
+| `error_code` | `error_code` |
+| `keys_listed` | none: the `ref_keys_listed` metric of the `defer_decision` phase row; `0` when the round ends before that phase |
+
 Which phase dominates round duration or the `LIST` budget — reproduced from the
 [per-phase rows](/operations/system-tables/cas_gc_log#per-phase-rows) reference:
 
