@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestBudget.h>
 
 #include <limits>
+#include <fmt/format.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
 
@@ -61,11 +62,16 @@ void validateCasRequestBudget(const CasRequestBudget & budget, uint64_t mount_le
                 "lease_safety_margin_ms ({}) must be strictly less than the mount lease TTL ({} ms)",
                 mount_renew_period_ms, envelope, budget.lease_safety_margin_ms, mount_lease_ttl_ms);
     }
+    /// The slack is computed only after the cadence check passed, so it cannot underflow.
+    const uint64_t write_reserve_ms = 2 * envelope + budget.lease_safety_margin_ms;
+    const String renewal_slack = background_renewal
+        ? fmt::format(" renewal_slack_ms={}", mount_lease_ttl_ms - mount_renew_period_ms - write_reserve_ms)
+        : String{};
     LOG_INFO(getLogger("CasRequestBudget"),
         "CAS request budget in effect: attempt_timeout_ms={} connect_timeout_cap_ms={} envelope_ms={} lease_safety_margin_ms={} "
-        "(mount_lease_ttl_ms={} mount_renew_period_ms={})",
+        "write_reserve_ms={}{} (mount_lease_ttl_ms={} mount_renew_period_ms={})",
         budget.attempt_timeout_ms, budget.connect_timeout_cap_ms.value_or(0), envelope, budget.lease_safety_margin_ms,
-        mount_lease_ttl_ms, mount_renew_period_ms);
+        write_reserve_ms, renewal_slack, mount_lease_ttl_ms, mount_renew_period_ms);
 }
 
 }

@@ -207,6 +207,11 @@ the first renewal attempt of a period can begin, where `envelope = attempt_timeo
 `cap` is `attempt_timeout` when the disk's `connect_timeout_ms` is `0`, else
 `min(connect_timeout_ms, attempt_timeout)` (7 s with defaults).
 
+The `CAS request budget in effect` line logged at mount carries both figures. `write_reserve_ms` is
+`2 × envelope + cas_lease_safety_margin_ms` (16000 with defaults). `renewal_slack_ms` appears only when background renewal is on and is
+`TTL − period − write_reserve_ms` (94000 with defaults), the lateness budget above. The line also
+carries `request_window_ms`, the retry window of `cas_request_window_ms`.
+
 ### Cloning a running server is unsupported {#clone-unsupported}
 
 Do not start a second server from a copy of a running server's data directory or volume, or restore one

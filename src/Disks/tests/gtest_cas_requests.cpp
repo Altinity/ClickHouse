@@ -3335,6 +3335,25 @@ TEST(CASRequestBudget, EnvelopeIsValidatedNotTheBareAttempt)
     });
 }
 
+TEST(CASRequestBudget, BudgetLogLineNamesReserveAndSlack)
+{
+    const CasRequestBudget budget;
+    {
+        DB::Cas::tests::ScopedLogCapture capture("CasRequestBudget", "information");
+        validateCasRequestBudget(budget, 120000, 10000, /*background_renewal=*/true);
+        const String log = capture.captured();
+        EXPECT_THAT(log, testing::HasSubstr("write_reserve_ms=16000")) << log;
+        EXPECT_THAT(log, testing::HasSubstr("renewal_slack_ms=94000")) << log;
+    }
+    {
+        DB::Cas::tests::ScopedLogCapture capture("CasRequestBudget", "information");
+        validateCasRequestBudget(budget, 120000, 10000, /*background_renewal=*/false);
+        const String log = capture.captured();
+        EXPECT_THAT(log, testing::HasSubstr("write_reserve_ms=16000")) << log;
+        EXPECT_THAT(log, testing::Not(testing::HasSubstr("renewal_slack_ms"))) << log;
+    }
+}
+
 TEST(CASRequests, ReservationIsTheEnvelope)
 {
     struct EnvelopeBackend : InMemoryBackend
