@@ -1050,7 +1050,6 @@ def test_create_table_engine_backend_mismatch_rejected(started_cluster):
         "IcebergAzure('http://acc.blob.core.windows.net/cont/tbl/', 'acc', 'key')",
         "IcebergLocal('/var/lib/clickhouse/user_files/tbl/')",
         "IcebergHDFS('hdfs://namenode:9000/tbl/')",
-        "Iceberg('/var/lib/clickhouse/user_files/tbl/') SETTINGS disk = 'local_blob_disk'",
     ]:
         error = node.query_and_get_error(
             f"CREATE TABLE {CATALOG_NAME}.`{root_namespace}.mismatch` (x String) ENGINE = {engine}",
@@ -1063,6 +1062,21 @@ def test_create_table_engine_backend_mismatch_rejected(started_cluster):
             "would be reopened with the catalog's storage backend and become unreadable" in error
         ), error
         assert "stores tables on S3" in error, error
+
+    # A table-level `disk` setting that differs from the catalog's value is rejected
+    # earlier, by the per-setting validation in DatabaseDataLake::validateCreateTableEngine,
+    # before the storage backend mismatch is checked.
+    error = node.query_and_get_error(
+        f"CREATE TABLE {CATALOG_NAME}.`{root_namespace}.mismatch` (x String) ENGINE = Iceberg('/var/lib/clickhouse/user_files/tbl/') SETTINGS disk = 'local_blob_disk'",
+        settings={
+            "allow_experimental_database_glue_catalog": 1,
+            "allow_database_glue_catalog": 1,
+        },
+    )
+    assert (
+        "Table setting `disk` differs from its value in this DataLakeCatalog" in error
+    ), error
+    assert "would be lost" in error, error
 
 
 def test_schema_evolution(started_cluster):
