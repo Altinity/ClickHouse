@@ -418,14 +418,19 @@ forensic outcome logs.
 - **Fails the round if:** a backend delete marker appears in a response — object versioning on a
   mis-provisioned pool (`LOGICAL_ERROR`)
 - **Observability:** phase row `pending_deletes`; metrics `deleted`, `absent`, `redeleted`,
-  `graduated`, `replaced`, `spared`, `outcome_logs_written`
+  `graduated`, `replaced`, `spared`, `outcome_logs_written`, `outcome_rows_dropped`
 
 Under `suppress_destructive` the `redelete` set is empty by construction, so nothing is deleted, and
 there is no graduation either (would-be graduates are carried unchanged); sparing and superseding
 still happen. An outcome log is written only for a shard that collected at least one budget-admitted
-redelete or spare outcome. The `RoundReport` counters `deleted`, `absent`, `replaced` and `spared`
-are tallied from the durable outcome logs, not the local decisions; `redeleted` counts the
-`redelete` entries processed, whether or not a `DELETE` was sent.
+redelete or spare outcome. Independently of that budget, a row is dropped once a conservative estimate of the log of one shard
+reaches 128 MiB in a round (192 bytes plus 6 per token character, per row), so the written log is
+smaller: about 52 MiB with 34-character S3 ETags and a 128-bit hash. A warning names the shard and
+the dropped count, and deletes are unaffected. `outcome_rows_dropped` counts the rows either limit
+dropped. The `RoundReport` counters `deleted`, `absent`, `replaced` and `spared` count every decision
+of the round, with or without an audit row; for a shard whose outcome log an earlier attempt of the
+same round already wrote, they count that adopted log instead. `redeleted` counts the `redelete`
+entries processed, whether or not a `DELETE` was sent.
 
 ## Phase 12 — meta pool wait {#phase-12-meta-pool-wait}
 

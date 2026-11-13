@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcOutcomesFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.h>
 #include <base/types.h>
@@ -10,6 +11,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -266,9 +268,11 @@ struct RetiredMergeResult
 /// walk (`CasOrphanManifestSweep.cpp`), ref-object/generation-prefix cleanup, the post-CAS hand-off
 /// reclaim, the post-CAS manifest-body cleanup, and the `GcOutcomes` audit log (`CasGc.cpp`). One instance
 /// is owned by `Gc::runRegularRound` per round and passed by reference/pointer into each family's call
-/// in turn, so a cap is cumulative across the WHOLE round, not reset per shard or per namespace. `0` in
-/// any bound is unbounded — the same opt-out convention every other CAS round budget uses, so a
-/// default-constructed instance reproduces pre-budget behavior everywhere. Exhausting a bound never drops
+/// in turn, so a cap is cumulative across the WHOLE round, not reset per shard or per namespace -- except
+/// `max_outcome_log_bytes`, which is per shard. `0` in any bound is unbounded, the same opt-out
+/// convention every other CAS round budget uses, except `max_outcome_log_bytes`: it defaults to 128 MiB
+/// and at `0` drops every row. A default-constructed instance therefore reproduces pre-budget behavior
+/// everywhere but for that limit. Exhausting a bound never drops
 /// WORK: each destructive family's caller carries the excess in its own already-durable pipeline (still
 /// `delete_pending`/condemned rows, a retained sweep candidate, a ref object left for next round) and
 /// retries next round with a fresh budget, or -- where nothing durable is left to carry (manifest cleanup,
@@ -350,6 +354,36 @@ struct GcRoundWorkBudget
     uint64_t outcome_entries_used = 0;
 
     bool outcomeEntryAvailable() const { return max_outcome_entries == 0 || outcome_entries_used < max_outcome_entries; }
+
+    /// Byte limit of the encoded outcome log of ONE shard, independent of the entry budget (the tighter
+    /// of the two wins). It keeps the log under the format's decompressed object cap, which only the
+    /// decoder enforces. Rows past it are dropped like rows past the entry budget.
+    static constexpr uint64_t kDefaultMaxOutcomeLogBytes = 128ULL * 1024 * 1024;
+    uint64_t max_outcome_log_bytes = kDefaultMaxOutcomeLogBytes;
+
+    struct OutcomeLogLedger
+    {
+        uint64_t bytes = kOutcomeLogFramingBound;
+        uint64_t dropped = 0;
+    };
+    std::map<uint64_t, OutcomeLogLedger> outcome_log_ledgers;
+
+    /// True if the audit row of `entry` for `shard` may be recorded; charges the entry and byte budgets.
+    bool admitOutcomeRow(uint64_t shard, const OutcomeEntry & entry)
+    {
+        if (!outcomeEntryAvailable())
+            return false;
+        OutcomeLogLedger & ledger = outcome_log_ledgers.try_emplace(shard).first->second;
+        const uint64_t row_bound = outcomeRowEncodedBound(entry);
+        if (ledger.bytes + row_bound > max_outcome_log_bytes)
+        {
+            ++ledger.dropped;
+            return false;
+        }
+        ledger.bytes += row_bound;
+        ++outcome_entries_used;
+        return true;
+    }
 };
 
 /// Merge the prior generation's source-edge run with new deltas. The prior run's `RunMarker::Condemned` rows RIDE

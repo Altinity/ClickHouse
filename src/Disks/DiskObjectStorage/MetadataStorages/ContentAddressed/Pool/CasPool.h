@@ -217,6 +217,8 @@ struct PoolConfig
 
     std::function<void(const BlobRef &)> gc_redelete_apply_hook_for_test = {};
     std::optional<size_t> gc_io_pool_refuse_at_for_test = std::nullopt;
+    /// TEST SEAM: replaces the default per-shard byte limit of a round's outcome log.
+    std::optional<uint64_t> gc_outcome_log_byte_limit_for_test = std::nullopt;
 
     /// Mount-lease TTL: how long a freshly-renewed mount lease is valid. The local
     /// write fence's monotonic deadline is `renew_time + this`, so a superseded/paused writer is fenced

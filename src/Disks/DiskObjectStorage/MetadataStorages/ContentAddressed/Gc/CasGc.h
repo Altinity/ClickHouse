@@ -769,6 +769,19 @@ private:
         std::exception_ptr exception;
     };
 
+    /// The settlement decisions of one shard in a round, counted where each is made: a decision whose
+    /// audit row the outcome-log limits dropped still counts.
+    struct OutcomeTally
+    {
+        uint64_t deleted = 0;
+        uint64_t absent = 0;
+        uint64_t replaced = 0;
+        uint64_t spared = 0;
+
+        void add(OutcomeKind kind);
+        uint64_t total() const { return deleted + absent + replaced + spared; }
+    };
+
     struct RedeleteRoundContext
     {
         uint64_t new_round;
@@ -777,6 +790,7 @@ private:
         GcRoundWorkBudget & round_work_budget;
         RoundReport & report;
         std::map<uint64_t, OutcomeLog> & outcomes;
+        std::map<uint64_t, OutcomeTally> & outcome_tallies;
         uint64_t & jobs_scheduled;
     };
 

@@ -1136,7 +1136,7 @@ TEST(CASGCRedeleteConcurrency, OutcomeBudgetCapsAuditRowsButNotDeletes)
         deleted_total += report[1];
     }
     EXPECT_EQ(redeleted_total, kBlobs) << "the budget caps audit rows, never deletes";
-    EXPECT_EQ(deleted_total, budget) << "`deleted` is tallied from the durable audit rows";
+    EXPECT_EQ(deleted_total, kBlobs) << "`deleted` counts every delete, not only those with an audit row";
 }
 
 TEST(CASGCRedeleteConcurrency, RoundsWithoutRedeletesWriteNoOutcomeLog)

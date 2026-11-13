@@ -620,11 +620,9 @@ void Gc::applyRedeleteOutcome(RedeleteRoundContext & ctx, const RetiredEntry & e
     /// The audit row is observability only -- the delete in `performRedeleteIo` already executed
     /// regardless of this cap. Skipping it here bounds the per-shard `GcOutcomes` body without
     /// skipping or deferring any destructive work.
-    if (ctx.round_work_budget.outcomeEntryAvailable())
-    {
+    ctx.outcome_tallies[ctx.shard].add(outcome_kind);
+    if (ctx.round_work_budget.admitOutcomeRow(ctx.shard, outcome))
         ctx.outcomes[ctx.shard].entries.push_back(std::move(outcome));
-        ++ctx.round_work_budget.outcome_entries_used;
-    }
     ++ctx.report.redeleted;
     ProfileEvents::increment(ProfileEvents::CASGCRetiredRedeleted);
     /// Drop the per-hash meta only on a removal or a proven absence — a mismatch means a
@@ -819,8 +817,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// planner), `pruneSupersededGenerations`, the post-CAS hand-off reclaim (its OWN reserve, never
     /// `pruneSupersededGenerations`' shared remainder), the post-CAS manifest-body cleanup, and
     /// `cleanupRefObjects`. A cap is therefore cumulative over the round, never reset between families or
-    /// shards. See `GcRoundWorkBudget`'s own comment for the fail-closed contract each family applies on
-    /// exhaustion.
+    /// shards, except the outcome log byte limit, which is per shard. See `GcRoundWorkBudget`'s own
+    /// comment for the fail-closed contract each family applies on exhaustion.
     GcRoundWorkBudget round_work_budget;
     round_work_budget.max_graduations = store->poolConfig().gc_round_graduation_budget;
     round_work_budget.max_redeletes = store->poolConfig().gc_round_redelete_budget;
@@ -830,6 +828,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     round_work_budget.max_prefix_wholesale_objects = store->poolConfig().gc_round_prefix_wholesale_budget;
     round_work_budget.max_handoff_prefix_wholesale_objects = store->poolConfig().gc_round_handoff_prefix_wholesale_budget;
     round_work_budget.max_outcome_entries = store->poolConfig().gc_round_outcome_entry_budget;
+    if (const auto limit = store->poolConfig().gc_outcome_log_byte_limit_for_test)
+        round_work_budget.max_outcome_log_bytes = *limit;
 
     /// The helping barrier precedes heartbeat work, DEFER, the hot stream LIST, and every successor
     /// artifact. A deferred invocation therefore cannot leave a row the adopted parent already proved
@@ -1068,6 +1068,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             record_redelete_job_metrics();
     });
     std::map<uint64_t, OutcomeLog> outcomes;
+    std::map<uint64_t, OutcomeTally> outcome_tallies;
     for (uint64_t shard = 0; shard < folded.retired_merge.size(); ++shard)
     {
         RetiredMergeResult & merge = folded.retired_merge[shard];
@@ -1095,6 +1096,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             .round_work_budget = round_work_budget,
             .report = report,
             .outcomes = outcomes,
+            .outcome_tallies = outcome_tallies,
             .jobs_scheduled = redelete_jobs_scheduled};
         redeleteBlobs(redelete_ctx, redelete_now, *io_pool, store->poolConfig().gc_io_concurrency, layout, op);
         for (const RetiredEntry & entry : merge.spared)
@@ -1122,12 +1124,11 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             /// The audit row is observability only -- `settleEntry` already unconditionally spared this
             /// entry (INV_NO_LOSS: recovery wins past any budget), so this cap can never re-condemn it;
             /// it only bounds whether the decision gets a `GcOutcomes` row.
-            if (round_work_budget.outcomeEntryAvailable())
-            {
-                outcomes[shard].entries.push_back(OutcomeEntry{.kind = entry.kind, .ref = entry.ref,
-                                                               .token = entry.token, .outcome = OutcomeKind::Spared});
-                ++round_work_budget.outcome_entries_used;
-            }
+            OutcomeEntry spared_row{.kind = entry.kind, .ref = entry.ref,
+                                    .token = entry.token, .outcome = OutcomeKind::Spared};
+            outcome_tallies[shard].add(OutcomeKind::Spared);
+            if (round_work_budget.admitOutcomeRow(shard, spared_row))
+                outcomes[shard].entries.push_back(std::move(spared_row));
             ProfileEvents::increment(ProfileEvents::CASGCRetiredSpared);
             /// A spare does NOT touch the
             /// meta. GC freshness meta is add-only — GC never publishes `Clean`. The in-degree recovered,
@@ -1188,10 +1189,23 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     }
 
     /// Outcome logs: write-once + byte-adopt (observation-bearing HEAD tokens — never the
-    /// deterministic-artifact path). Tally the report from the FINAL durable logs.
+    /// deterministic-artifact path). The report counts this round's decisions, except for a shard whose
+    /// log an earlier attempt of the same round already wrote: that durable log is adopted and counted.
+    uint64_t outcome_rows_recorded = 0;
+    uint64_t outcome_decisions = 0;
+    for (const auto & [shard, log] : outcomes)
+        outcome_rows_recorded += log.entries.size();
+    for (const auto & [shard, tally] : outcome_tallies)
+        outcome_decisions += tally.total();
     for (auto & [shard, log] : outcomes)
     {
         const String key = layout.outcomesKey(generation, attempt, new_round, shard);
+        if (const auto ledger = round_work_budget.outcome_log_ledgers.find(shard);
+            ledger != round_work_budget.outcome_log_ledgers.end() && ledger->second.dropped > 0)
+            LOG_WARNING(logger,
+                "CAS gc: the outcome log of shard {} reached its {}-byte limit; {} audit rows were not recorded "
+                "(the deletes and spares they describe happened)",
+                shard, round_work_budget.max_outcome_log_bytes, ledger->second.dropped);
         const String body = sealObject(FormatId::GcOutcomes, encodeOutcomeLog(log));
         WriteResult written = op.create(key, body, Retry::standard());
         if (const auto * conflict = std::get_if<Conflict>(&written))
@@ -1216,20 +1230,21 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                     throw Exception(ErrorCodes::ABORTED,
                         "CAS gc: undecodable outcome log at {} cannot be adopted: {}", key, e.message());
                 }
+                OutcomeTally adopted;
+                for (const OutcomeEntry & o : log.entries)
+                    adopted.add(o.outcome);
+                outcome_tallies[shard] = adopted;
             }
         }
         else
             orThrow(std::move(written), fmt::format("CAS gc: outcome log at {}", key));
-        for (const OutcomeEntry & o : log.entries)
-        {
-            switch (o.outcome)
-            {
-                case OutcomeKind::Deleted: ++report.deleted; break;
-                case OutcomeKind::Absent: ++report.absent; break;
-                case OutcomeKind::Replaced: ++report.replaced; break;
-                case OutcomeKind::Spared: ++report.spared; break;
-            }
-        }
+    }
+    for (const auto & [shard, tally] : outcome_tallies)
+    {
+        report.deleted += tally.deleted;
+        report.absent += tally.absent;
+        report.replaced += tally.replaced;
+        report.spared += tally.spared;
     }
     pending_deletes_timer->metric("redeleted", report.redeleted - redeleted_before);
     pending_deletes_timer->metric("graduated", report.graduated - graduated_before);
@@ -1238,6 +1253,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     pending_deletes_timer->metric("replaced", report.replaced);
     pending_deletes_timer->metric("spared", report.spared);
     pending_deletes_timer->metric("outcome_logs_written", outcomes.size());
+    pending_deletes_timer->metric("outcome_rows_dropped", outcome_decisions - outcome_rows_recorded);
     record_redelete_job_metrics();
     pending_deletes_timer.reset();   /// emits the `pending_deletes` row
 
@@ -5246,6 +5262,17 @@ bool Gc::acquireOrRenewLease(GcState & state, std::optional<Etag> & state_etag, 
     state = std::move(decided);
     state_etag = committed;
     return true;
+}
+
+void Gc::OutcomeTally::add(OutcomeKind kind)
+{
+    switch (kind)
+    {
+        case OutcomeKind::Deleted: ++deleted; break;
+        case OutcomeKind::Absent: ++absent; break;
+        case OutcomeKind::Replaced: ++replaced; break;
+        case OutcomeKind::Spared: ++spared; break;
+    }
 }
 
 CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(const GcState & leased_state)

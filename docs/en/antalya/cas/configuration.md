@@ -240,10 +240,17 @@ for the remaining caps, `0` means unbounded.
 
 Five of these caps (`cas_gc_round_graduation_budget`, `cas_gc_round_redelete_budget`,
 `cas_gc_round_ref_cleanup_budget`, `cas_gc_round_handoff_prefix_wholesale_budget`,
-`cas_gc_round_outcome_entry_budget`) default to `0` (unbounded); the old default was `5000`. Set the
-key back to `5000` to restore a cap. With no cap, the first round on a pool with a backlog drains the
-whole backlog in that one round, so that round can run long and issue many requests. That round also delays the dead-member
-fence-out, which runs only at the start of a round.
+`cas_gc_round_outcome_entry_budget`) default to `0` (unbounded). With no cap, each of those phases
+processes its whole eligible cohort in one round, so a round on a pool with a backlog can run long and
+issue many requests. Such a round also delays the dead-member fence-out, which runs only at the start
+of a round. One round still does not clear a backlog: a blob that graduates to `delete_pending` is
+deleted in a later round, and the sweep and prune caps stay finite.
+
+A cap carries the rest of its cohort to the next round, with two exceptions. At the
+`cas_gc_round_handoff_prefix_wholesale_budget` cap the rest of the generation prefix is never
+revisited and only `cas-fsck` reclaims it, so leave that key at `0`. At the
+`cas_gc_round_outcome_entry_budget` cap only audit rows are dropped; the decisions and the round's
+counters are unaffected, except for a shard whose log an earlier attempt of the round already wrote.
 
 | Setting | Default | Bounds | Description |
 |---|---|---|---|
@@ -256,8 +263,8 @@ fence-out, which runs only at the start of a round.
 | `cas_gc_round_sweep_recovery_op_budget` | `5000` | `0` = unbounded | Committed-tail ref-log `GET`/decode operations the orphan-manifest recovery walk may spend per round |
 | `cas_gc_round_ref_cleanup_budget` | `0` | `0` = unbounded | Ref-object cleanup cap for covered log and snapshot deletes per round |
 | `cas_gc_round_prefix_wholesale_budget` | `20000` | `0` = unbounded | Generation-prefix wholesale-delete object cap during pruning per round |
-| `cas_gc_round_handoff_prefix_wholesale_budget` | `0` | `0` = unbounded | Post-`CAS` hand-off generation-prefix reclaim cap per round, reserved separately so pruning cannot starve the one-shot hand-off |
-| `cas_gc_round_outcome_entry_budget` | `0` | `0` = unbounded | `GcOutcomes` entry cap across the re-delete/spared audit log per round |
+| `cas_gc_round_handoff_prefix_wholesale_budget` | `0` | `0` = unbounded | Post-`CAS` hand-off generation-prefix reclaim cap per round, reserved separately so pruning cannot starve the one-shot hand-off. At the cap the rest of the prefix is never revisited; only `cas-fsck` reclaims it. Leave it at `0` |
+| `cas_gc_round_outcome_entry_budget` | `0` | `0` = unbounded | `GcOutcomes` entry cap across the re-delete/spared audit log per round. At `0` the audit log of one shard is still limited: rows are dropped once a conservative estimate of its size reaches 128 MiB per round, so the written log is smaller (about 52 MiB with 34-character S3 ETags and a 128-bit hash). Deletes are unaffected |
 
 ## Migration from unprefixed keys {#migration-from-unprefixed-keys}
 
