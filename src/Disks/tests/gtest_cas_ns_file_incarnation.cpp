@@ -490,6 +490,43 @@ TEST(CASNsFileIncarnation, NamespaceLifeRefusesARecoveredTerminalLife)
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)store->namespaceLife(ns); });
 }
 
+/// A presence probe on a `Removing` row leaves a resident terminal runtime with no local removal in
+/// progress. Once a GC on another server erases the row, `namespaceLife` must detach that runtime and
+/// birth a new life instead of refusing until the runtime is evicted.
+TEST(CASNsFileIncarnation, NamespaceLifeDetachesAResidentRemovedLifeWhoseRowIsGone)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    const RootNamespace ns{kNsString};
+    PoolPtr owner = Pool::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "owner", .gc_fold_max_defer_rounds = 0});
+    PoolPtr leader = Pool::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "leader", .gc_fold_max_defer_rounds = 0});
+
+    publishWithProductionBirth(leader, ns, "x");
+    const NamespaceLifeId removed_life = leader->namespaceLife(ns);
+    leader->dropNamespace(ns);
+    ASSERT_EQ(owner->refTableRuntimeIdentityForTest(ns), 0u);
+
+    EXPECT_FALSE(owner->namespaceStillLogicallyPresent(ns));
+    ASSERT_EQ(owner->refTableLifeForTest(ns), std::optional<NamespaceLifeId>{removed_life})
+        << "the probe must have left the removed life's runtime resident";
+    expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "already removed",
+        [&] { (void)owner->namespaceLife(ns); });
+
+    Gc gc(leader, kGcId);
+    (void)runRegularRoundReclaiming(gc);
+    (void)runRegularRoundReclaiming(gc);
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
+    ASSERT_FALSE(CasRefCatalog::lifeIfCataloged(catalog_op, owner->layout(), ns)) << "the leader must drain the row";
+    ASSERT_EQ(owner->refTableLifeForTest(ns), std::optional<NamespaceLifeId>{removed_life})
+        << "a remote drain must not have detached the owner's runtime";
+
+    const NamespaceLifeId reborn = owner->namespaceLife(ns);
+    EXPECT_NE(reborn.incarnation, removed_life.incarnation);
+    EXPECT_EQ(owner->refTableLifeForTest(ns), std::optional<NamespaceLifeId>{reborn});
+}
+
 /// A delayed retirement callback for a predecessor arrives while a successor is resident. It must
 /// still advance the name's record, and the record must survive the successor's eviction: otherwise a
 /// cold admission that read the predecessor's row could insert it once the slot empties.

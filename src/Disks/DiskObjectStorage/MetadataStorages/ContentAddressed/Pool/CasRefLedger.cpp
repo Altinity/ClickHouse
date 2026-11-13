@@ -5120,8 +5120,28 @@ NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
         if (rt)
         {
             ensureRefTableRecovered(ns, *rt);
-            refuseTerminalLife(ns, *rt);
-            return rt->life;
+            bool terminal = false;
+            {
+                std::lock_guard state_lock(rt->state_mutex);
+                terminal = rt->state.getLifecycle() != RefLifecycle::Live && rt->state.getRemoveTxnId().has_value();
+            }
+            /// Only the removal-closed branch above reconciles, so a terminal life recovered outside a local
+            /// removal stays resident after its row is erased; detach it and take the cold path.
+            bool row_gone = false;
+            if (terminal)
+            {
+                CasOperation catalog_op = mount_requests.resume(rt->admitted_fence_generation);
+                const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(catalog_op, layout);
+                refuseUnlessAdmitted(catalog_op, "resident removed namespace life");
+                const std::optional<NamespaceLifeId> catalog_life = catalog.life_index.resolve(rt->life.incarnation);
+                row_gone = !catalog_life || *catalog_life != rt->life;
+            }
+            if (!row_gone)
+            {
+                refuseTerminalLife(ns, *rt);
+                return rt->life;
+            }
+            invalidateRemovedCatalogLife(rt->life);
         }
     }
 
