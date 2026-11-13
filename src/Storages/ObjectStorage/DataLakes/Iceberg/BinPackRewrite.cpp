@@ -28,6 +28,7 @@
 #include <Storages/ObjectStorage/Utils.h>
 #include <Poco/JSON/Stringifier.h>
 #include <Poco/String.h>
+#include <Common/FailPoint.h>
 #include <Common/FieldVisitorDump.h>
 #include <Common/Logger.h>
 #include <boost/container_hash/hash.hpp>
@@ -42,6 +43,11 @@ namespace DB::ErrorCodes
     extern const int ICEBERG_SPECIFICATION_VIOLATION;
     extern const int QUERY_WAS_CANCELLED;
     extern const int UNFINISHED;
+}
+
+namespace DB::FailPoints
+{
+    extern const char iceberg_compaction_pause_before_metadata_commit[];
 }
 
 namespace DB::Setting
@@ -1367,6 +1373,10 @@ BinPackCommitResult commitMetadata(
         if (storage_result != BinPackCommitResult::Committed)
             return storage_result;
     }
+
+    /// Test hook for Altinity/ClickHouse#2733: suspend here so a test can land a concurrent commit
+    /// in the window before an unconditional catalog publish (Glue `UpdateTable`).
+    FailPointInjection::pauseFailPoint(FailPoints::iceberg_compaction_pause_before_metadata_commit);
 
     if (catalog)
     {

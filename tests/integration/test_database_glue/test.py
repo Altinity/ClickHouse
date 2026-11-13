@@ -2237,3 +2237,99 @@ def test_catalog_schema_with_empty_column_name_is_rejected(started_cluster):
     assert node.query("SELECT 1") == "1\n"
 
     node.query(f"DROP DATABASE IF EXISTS {db_name} SYNC")
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="https://github.com/Altinity/ClickHouse/issues/2733: Glue UpdateTable is unconditional, "
+    "so an OPTIMIZE publish still drops a commit that lands in the publish window",
+)
+def test_optimize_bin_pack_concurrent_insert(started_cluster):
+    """Reproducer for https://github.com/Altinity/ClickHouse/issues/2733.
+
+    Bin-pack OPTIMIZE on a Glue-catalog table re-reads Glue's metadata_location
+    and aborts if it changed during the rewrite, but the subsequent Glue
+    UpdateTable replaces the pointer without checking the snapshot. This test
+    pauses the compaction inside commitMetadata right before the catalog
+    publish, lands an INSERT in that window, then releases. Both statements
+    succeed, yet on the current implementation the inserted row is silently
+    dropped from the current snapshot (hence xfail)."""
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_optimize_race_{uuid.uuid4()}"
+    table_name = f"{test_ref}_table"
+    root_namespace = f"{test_ref}_namespace"
+    table_ref = f"{CATALOG_NAME}.`{root_namespace}.{table_name}`"
+    write_settings = {
+        "allow_insert_into_iceberg": 1,
+        "write_full_path_in_iceberg_metadata": 1,
+    }
+
+    create_clickhouse_glue_database(started_cluster, node, CATALOG_NAME)
+    node.query(
+        f"CREATE TABLE {table_ref} (x String)",
+        settings={
+            "allow_experimental_database_glue_catalog": 1,
+            "allow_database_glue_catalog": 1,
+            "write_full_path_in_iceberg_metadata": 1,
+        },
+    )
+
+    # Two separate inserts produce two small data files, so bin-pack has work.
+    node.query(f"INSERT INTO {table_ref} VALUES ('before-1');", settings=write_settings)
+    node.query(f"INSERT INTO {table_ref} VALUES ('before-2');", settings=write_settings)
+    assert node.query(f"SELECT count() FROM {table_ref}").strip() == "2"
+
+    node.query("SYSTEM ENABLE FAILPOINT iceberg_compaction_pause_before_metadata_commit")
+
+    executor = ThreadPoolExecutor(max_workers=2)
+    try:
+        # 1. Wait for the compaction to pause at the failpoint.
+        wait_future = executor.submit(
+            lambda: node.query(
+                "SYSTEM WAIT FAILPOINT iceberg_compaction_pause_before_metadata_commit PAUSE",
+                timeout=120,
+            )
+        )
+
+        # 2. Start OPTIMIZE; it rewrites the two small files, re-reads
+        #    metadata_location, writes the new metadata file, then pauses
+        #    right before the unconditional Glue UpdateTable.
+        optimize_future = executor.submit(
+            lambda: node.query(
+                f"OPTIMIZE TABLE {table_ref}",
+                settings={
+                    "allow_experimental_iceberg_compaction": 1,
+                    "iceberg_target_data_file_size_bytes": 10 * 1024 * 1024,
+                    "iceberg_min_data_file_size_bytes": 10 * 1024 * 1024,
+                },
+                timeout=180,
+            )
+        )
+
+        # Wait for the pause to actually trigger before doing the concurrent INSERT.
+        wait_future.result(timeout=120)
+
+        # 3. Session B from the issue: a commit lands in the publish window.
+        node.query(
+            f"INSERT INTO {table_ref} VALUES ('inserted-during-optimize');",
+            settings=write_settings,
+        )
+
+        # 4. Release the failpoint; OPTIMIZE publishes its metadata through
+        #    Glue UpdateTable, which does not check the snapshot.
+        node.query("SYSTEM DISABLE FAILPOINT iceberg_compaction_pause_before_metadata_commit")
+        optimize_future.result(timeout=180)
+    finally:
+        # Always disable the failpoint -- if anything above raised before the
+        # explicit DISABLE ran (e.g. the WAIT timed out), it would otherwise
+        # stay enabled and poison subsequent tests on the same instance.
+        try:
+            node.query("SYSTEM DISABLE FAILPOINT iceberg_compaction_pause_before_metadata_commit")
+        except Exception:
+            pass
+        executor.shutdown(wait=False)
+
+    # 5. The row inserted during the publish window must remain in the current snapshot.
+    result = node.query(f"SELECT x FROM {table_ref} ORDER BY x").strip()
+    assert result == "before-1\nbefore-2\ninserted-during-optimize", result
