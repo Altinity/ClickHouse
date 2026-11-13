@@ -3936,3 +3936,134 @@ TEST(CASListMounts, TerminalSlotWithAnUndecodableOwnerIsCorrupt)
     EXPECT_EQ(by_srid["r"], "corrupt");
     EXPECT_EQ(by_srid["other"], "live");
 }
+
+namespace
+{
+/// A slot body at `key` as the backend serves it, replacing whatever is there.
+Object putSlotBody(Ops & ops, const String & key, const MountLease & body)
+{
+    const auto current = ops.op.read(key, Retry::standard());
+    mustCommit(
+        current ? ops.op.replace(key, encodeMountLease(body), current->etag, Retry::standard())
+                : ops.op.create(key, encodeMountLease(body), Retry::standard()),
+        "slot body");
+    return *ops.op.read(key, Retry::standard());
+}
+
+MountLease ownBody(uint64_t seq, UInt128 attempt_id)
+{
+    MountLease body = liveBody(UInt128(1), 7);
+    body.seq = seq;
+    body.write_attempt_id = attempt_id;
+    return body;
+}
+}
+
+TEST(CASMountSlotOwnership, HoldsTheLandedBody)
+{
+    Ops ops(std::make_shared<InMemoryBackend>());
+    const String key = Layout("p").mountKey("r");
+    MountSlotOwnership ownership(UInt128(1), 7);
+    const Object slot = putSlotBody(ops, key, ownBody(1, UInt128(11)));
+    EXPECT_FALSE(ownership.holds(slot)) << "nothing has landed yet";
+    ownership.landed(slot.etag);
+    EXPECT_TRUE(ownership.holds(slot));
+}
+
+TEST(CASMountSlotOwnership, HoldsTheInFlightAttemptBody)
+{
+    Ops ops(std::make_shared<InMemoryBackend>());
+    const String key = Layout("p").mountKey("r");
+    MountSlotOwnership ownership(UInt128(1), 7);
+    ownership.landed(putSlotBody(ops, key, ownBody(1, UInt128(11))).etag);
+    ownership.attempting(UInt128(12));
+    const Object landed_unanswered = putSlotBody(ops, key, ownBody(2, UInt128(12)));
+    EXPECT_TRUE(ownership.holds(landed_unanswered)) << "the ETag is unknown, the attempt id is in flight";
+    EXPECT_FALSE(ownership.holds(putSlotBody(ops, key, ownBody(3, UInt128(13))))) << "another attempt id";
+}
+
+TEST(CASMountSlotOwnership, DoesNotHoldAForeignUuidOrEpoch)
+{
+    Ops ops(std::make_shared<InMemoryBackend>());
+    const String key = Layout("p").mountKey("r");
+    MountSlotOwnership ownership(UInt128(1), 7);
+    ownership.attempting(UInt128(9));
+    MountLease foreign_uuid = liveBody(UInt128(2), 7);
+    MountLease other_epoch = liveBody(UInt128(1), 8);
+    for (const MountLease & body : {foreign_uuid, other_epoch})
+    {
+        const Object slot = putSlotBody(ops, key, body);
+        ownership.landed(slot.etag);
+        EXPECT_FALSE(ownership.holds(slot)) << "the ETag and the attempt id both match, the pair does not";
+    }
+}
+
+TEST(CASMountSlotOwnership, DoesNotHoldAGcFencedOrFarewelledBody)
+{
+    Ops ops(std::make_shared<InMemoryBackend>());
+    const String key = Layout("p").mountKey("r");
+    MountSlotOwnership ownership(UInt128(1), 7);
+    ownership.attempting(UInt128(9));
+    MountLease fenced = ownBody(2, UInt128(9));
+    fenced.gc_fenced = true;
+    MountLease farewell = ownBody(3, UInt128(9));
+    farewell.min_active_build_sequence = std::numeric_limits<uint64_t>::max();
+    for (const MountLease & body : {fenced, farewell})
+    {
+        const Object slot = putSlotBody(ops, key, body);
+        ownership.landed(slot.etag);
+        EXPECT_FALSE(ownership.holds(slot)) << "the ETag and the attempt id both match, the body is revoked";
+    }
+}
+
+TEST(CASMountSlotOwnership, DoesNotHoldTheAttemptBodyAfterTheAttemptEnded)
+{
+    Ops ops(std::make_shared<InMemoryBackend>());
+    const String key = Layout("p").mountKey("r");
+    MountSlotOwnership ownership(UInt128(1), 7);
+    ownership.attempting(UInt128(12));
+    const Object slot = putSlotBody(ops, key, ownBody(2, UInt128(12)));
+    ASSERT_TRUE(ownership.holds(slot));
+    ownership.attemptEnded();
+    EXPECT_FALSE(ownership.holds(slot));
+}
+
+TEST(CASMountSlotOwnership, RenewerRecordsItsStartAndEveryCommittedRenewal)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    Layout layout("p");
+    uint64_t now = 1000;
+    uint64_t boot = 0;
+    Ops ops(backend, &boot);
+    ASSERT_EQ(claimMount(ops.op, layout, "r", UInt128(1), 7, now, 100).kind, MountClaimResult::Claimed);
+    MountLeaseRenewer renewer(ops.mount, ops.farewell, layout, "r", UInt128(1), 7, std::chrono::milliseconds(100),
+                              [&] { return now; }, [] { return uint64_t{0}; }, {}, std::chrono::milliseconds(0),
+                              [&] { return boot; });
+    const String key = layout.mountKey("r");
+    renewer.start();
+    const std::shared_ptr<const MountSlotOwnership> ownership = renewer.slotOwnership();
+    ASSERT_TRUE(ownership);
+    Object previous = *ops.op.read(key, Retry::standard());
+    EXPECT_TRUE(ownership->holds(previous)) << "after start";
+    std::vector<bool> held_when_committed;
+    backend->onWriteCommitted(key, [&]
+    {
+        held_when_committed.push_back(ownership->holds(*ops.op.read(key, Retry::standard())));
+    });
+    for (int renewal = 1; renewal <= 2; ++renewal)
+    {
+        SCOPED_TRACE(renewal);
+        renewOrThrow(renewer);
+        const Object current = *ops.op.read(key, Retry::standard());
+        EXPECT_TRUE(ownership->holds(current)) << "the committed body";
+        EXPECT_FALSE(ownership->holds(previous)) << "the superseded body";
+        ASSERT_EQ(held_when_committed.size(), static_cast<size_t>(renewal));
+        EXPECT_TRUE(held_when_committed.back()) << "the in-flight attempt covers the body before `landed` runs";
+        previous = current;
+    }
+
+    /// Same pair and attempt id as the last renewal, new incarnation: held only while the attempt is in flight.
+    MountLease late_copy = decodeMountLease(previous.bytes);
+    ++late_copy.seq;
+    EXPECT_FALSE(ownership->holds(putSlotBody(ops, key, late_copy))) << "the attempt ended";
+}

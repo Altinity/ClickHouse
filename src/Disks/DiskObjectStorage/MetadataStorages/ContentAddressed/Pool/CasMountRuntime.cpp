@@ -101,6 +101,12 @@ bool CasMountRuntime::mayMutate() const
         && bootMsNow() < mount_fence.deadline_boot_ms.load(std::memory_order_acquire);
 }
 
+std::shared_ptr<const MountSlotOwnership> CasMountRuntime::slotOwnership() const
+{
+    std::lock_guard lock(driver_mutex);
+    return mount_renewer ? mount_renewer->slotOwnership() : nullptr;
+}
+
 void CasMountRuntime::tripMountLost()
 {
     mount_fence.lost.store(true, std::memory_order_release);

@@ -13,6 +13,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -573,6 +574,38 @@ std::vector<MountInfo> listMounts(CasOperation & op, const Layout & layout, uint
 bool isCreatorFenceTerminal(CasOperation & op, const Layout & layout, const String & server_root_id,
                             uint64_t writer_epoch, const Retry & policy = Retry::standard());
 
+/// Which mount-slot body this renewer owns: the last one it landed, and the one it is writing.
+/// A takeover or fence writes a new body, so the slot read is either one we wrote or one `holds`
+/// rejects. Shared with readers, so a reader keeps comparing against the incarnation it captured.
+class MountSlotOwnership
+{
+public:
+    MountSlotOwnership(UInt128 server_uuid_, uint64_t writer_epoch_)
+        : server_uuid(server_uuid_), writer_epoch(writer_epoch_)
+    {
+    }
+
+    /// A claim or renewal of ours landed and created `etag`.
+    void landed(const Etag & etag);
+    /// A renewal with this attempt id is about to be sent and may land before its answer arrives.
+    void attempting(UInt128 write_attempt_id);
+    /// No renewal is in flight any more, whether or not the last one landed.
+    void attemptEnded();
+
+    /// True when `slot` is neither GC-fenced nor a clean release, carries our `(server_uuid, writer_epoch)`,
+    /// and is either the last landed ETag or the in-flight attempt's body. No I/O. Throws `CORRUPTED_DATA`
+    /// for an undecodable body.
+    bool holds(const Object & slot) const;
+
+private:
+    const UInt128 server_uuid;
+    const uint64_t writer_epoch;
+    mutable std::mutex mutex;
+    std::optional<Etag> last_etag;
+    /// One slot suffices: a single renewal driver sets and clears it.
+    std::optional<UInt128> in_flight_attempt_id;
+};
+
 /// Synchronous owner of the durable mount lease and merged build-watermark body. The stable
 /// `CasMountRuntime` is the sole driver: this class never creates a thread, invokes a callback into the
 /// runtime, or performs a durable write from its destructor.
@@ -626,6 +659,7 @@ public:
     void release();
 
     MountLeaseRenewerState state() const { return renewer_state; }
+    std::shared_ptr<const MountSlotOwnership> slotOwnership() const { return slot_ownership; }
     bool canRelease() const { return renewer_state == MountLeaseRenewerState::Active; }
     uint64_t lastCommittedAttemptStartBootMs() const { return last_committed_attempt_start_boot_ms; }
 
@@ -671,6 +705,8 @@ private:
     String last_body;
     uint64_t confirmed_deadline_boot_ms = 0;
     uint64_t last_committed_attempt_start_boot_ms = 0;
+    /// Not recorded at farewell: the clean-release body it writes is one `holds` rejects.
+    const std::shared_ptr<MountSlotOwnership> slot_ownership;
 };
 
 /// Mount-lease-scoped staging sweeper for objects left behind by S3-native staging.

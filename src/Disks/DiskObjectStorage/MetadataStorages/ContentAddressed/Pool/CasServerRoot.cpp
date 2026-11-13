@@ -11,6 +11,7 @@
 #include <Core/UUID.h>
 #include <base/arithmeticOverflow.h>
 #include <base/getFQDNOrHostName.h>
+#include <base/scope_guard.h>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 #include <magic_enum.hpp>
@@ -1651,7 +1652,38 @@ MountLeaseRenewer::MountLeaseRenewer(
     , event_sink(std::move(event_sink_))
     , lease_safety_margin(lease_safety_margin_)
     , boot_ms_fn(boot_ms_fn_ ? std::move(boot_ms_fn_) : defaultBootMs)
+    , slot_ownership(std::make_shared<MountSlotOwnership>(server_uuid_, writer_epoch_))
 {
+}
+
+void MountSlotOwnership::landed(const Etag & etag)
+{
+    std::lock_guard lock(mutex);
+    last_etag = etag;
+}
+
+void MountSlotOwnership::attempting(UInt128 write_attempt_id)
+{
+    std::lock_guard lock(mutex);
+    in_flight_attempt_id = write_attempt_id;
+}
+
+void MountSlotOwnership::attemptEnded()
+{
+    std::lock_guard lock(mutex);
+    in_flight_attempt_id.reset();
+}
+
+bool MountSlotOwnership::holds(const Object & slot) const
+{
+    const MountLease lease = decodeMountLease(slot.bytes);
+    /// A fence keeps our pair and `write_attempt_id` yet revokes the lease; a farewell gives it up.
+    if (lease.gc_fenced || lease.isCleanRelease() || !lease.isHeldBy(server_uuid, writer_epoch))
+        return false;
+    /// The pair alone is not enough: another writer of the same pair leaves a different ETag.
+    std::lock_guard lock(mutex);
+    return (last_etag && slot.etag == *last_etag)
+        || (in_flight_attempt_id && lease.write_attempt_id == *in_flight_attempt_id);
 }
 
 String MountLeaseRenewer::encodeBody(
@@ -1787,6 +1819,7 @@ uint64_t MountLeaseRenewer::start(Liveness liveness)
         ? std::numeric_limits<uint64_t>::max()
         : attempt_start_boot_ms + ttl_ms;
     renewer_state = MountLeaseRenewerState::Active;
+    slot_ownership->landed(etag);
     return attempt_start_boot_ms;
 }
 
@@ -1963,6 +1996,9 @@ MountRenewResult MountLeaseRenewer::renewOn(
     MountRenewResult result;
     result.attempt_start_boot_ms = attempt_start_boot_ms;
 
+    /// One `attempting` covers every resend of the loop below: they carry the same attempt id.
+    slot_ownership->attempting(write_attempt_id);
+    SCOPE_EXIT(slot_ownership->attemptEnded());
     CasOperation op = plane.admit(environment.live);
     /// Counted here rather than taken from one engine call: the background renewal may span several.
     uint32_t attempts_sent = 0;
@@ -2034,6 +2070,9 @@ MountRenewResult MountLeaseRenewer::renewOn(
     {
         seq = next_seq;
         last_etag = std::move(committed->etag);
+        /// Runs before the scope guard ends the attempt: the in-flight id covers the landed body until
+        /// the ETag replaces it.
+        slot_ownership->landed(*last_etag);
         last_body = body;
         last_committed_attempt_start_boot_ms = attempt_start_boot_ms;
         const uint64_t ttl_ms = static_cast<uint64_t>(ttl.count());

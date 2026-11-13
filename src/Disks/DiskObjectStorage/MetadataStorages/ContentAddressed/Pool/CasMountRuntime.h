@@ -194,6 +194,9 @@ public:
     /// ---- local write fence ----
     /// Return whether a mutable operation may start under the locally observed lease state.
     bool mayMutate() const;
+    /// The current renewer's ownership record, or null without a renewer. Takes `driver_mutex` only to
+    /// copy the pointer.
+    std::shared_ptr<const MountSlotOwnership> slotOwnership() const;
     /// Permanently latch the local fence as lost for this runtime incarnation.
     void tripMountLost();
     /// Publish the BOOTTIME deadline from a successful lease renewal.
