@@ -9,8 +9,8 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
 
-DISK_A="disk(type = object_storage, object_storage_type = local, metadata_type = cas, cas_server_root_id = '${CLICKHOUSE_DATABASE}_pc3a', name = '${CLICKHOUSE_DATABASE}_pc3a', path = '${CLICKHOUSE_DATABASE}_pc3a_pool/')"
-DISK_B="disk(type = object_storage, object_storage_type = local, metadata_type = cas, cas_server_root_id = '${CLICKHOUSE_DATABASE}_pc3b', name = '${CLICKHOUSE_DATABASE}_pc3b', path = '${CLICKHOUSE_DATABASE}_pc3b_pool/')"
+DISK_A="disk(type = object_storage, object_storage_type = local, metadata_type = cas, cas_unsafe_remount_no_delay = 1, cas_server_root_id = '${CLICKHOUSE_DATABASE}_pc3a', name = '${CLICKHOUSE_DATABASE}_pc3a', path = '${CLICKHOUSE_DATABASE}_pc3a_pool/')"
+DISK_B="disk(type = object_storage, object_storage_type = local, metadata_type = cas, cas_unsafe_remount_no_delay = 1, cas_server_root_id = '${CLICKHOUSE_DATABASE}_pc3b', name = '${CLICKHOUSE_DATABASE}_pc3b', path = '${CLICKHOUSE_DATABASE}_pc3b_pool/')"
 
 counts() {
     ${CLICKHOUSE_CLIENT} -q "SYSTEM FLUSH LOGS cas_log"
