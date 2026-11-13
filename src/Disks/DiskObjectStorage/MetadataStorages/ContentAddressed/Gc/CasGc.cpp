@@ -422,7 +422,7 @@ void Gc::runNamespaceJanitor(
     {
         CasRequests & requests = store->openRequests();
         const Layout & layout = store->layout();
-        NamespaceJanitor janitor(requests, layout, 1000,
+        NamespaceJanitor janitor(requests, layout, CasOperation::kCasListPageKeys,
             [this](CasOperation & op, const std::vector<WriteOnceKey> & keys, NamespaceJanitorResult & out)
             {
                 removeWriteOnceOnIoPool(op, keys, out);
@@ -1838,7 +1838,7 @@ std::optional<std::pair<uint64_t, uint64_t>> Gc::newestFoldSealRef()
         }
         listed_generations.insert(generation);
         return true;
-    }, Retry::standard(), 1000, onGcEnumerationPage);
+    }, Retry::standard(), CasOperation::kCasListPageKeys, onGcEnumerationPage);
     const uint64_t listed_max_generation = listed_generations.empty() ? 0 : *listed_generations.rbegin();
 
     /// STEP DOWN THROUGH THE GENERATIONS THE LISTING ITSELF REPORTED until one carries a seal. The
@@ -1973,7 +1973,7 @@ Gc::GenerationSealProbe Gc::probeGenerationForSeal(uint64_t generation)
         if (!probe.seal_attempt || *probe.seal_attempt < attempt)
             probe.seal_attempt = attempt;
         return true;
-    }, Retry::standard(), 1000, onGcEnumerationPage);
+    }, Retry::standard(), CasOperation::kCasListPageKeys, onGcEnumerationPage);
     return probe;
 }
 
@@ -4168,7 +4168,7 @@ uint64_t deletePrefixWholesale(CasOperation & op, const String & prefix, uint64_
 {
     if (out_fully_drained)
         *out_fully_drained = false;
-    static constexpr size_t kListPageLimit = 1000;
+    static constexpr size_t kListPageLimit = CasOperation::kCasListPageKeys;
     uint64_t deleted = 0;
     String cursor;
     while (deleted < bounded_remaining)
@@ -4404,7 +4404,7 @@ RefScanSummary Gc::enumerateRefPrefix()
     CasOperation op = store->openRequests().admit();
 
     RefScanSummary scan;
-    static constexpr size_t kListPageLimit = 1000;
+    static constexpr size_t kListPageLimit = CasOperation::kCasListPageKeys;
     size_t count_in_page = 0;
     op.forEachListedKey(layout.casRefsPrefix(), [&](const ListedKey & lk)
     {
@@ -4683,7 +4683,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
             std::vector<String> table_keys;
             op.forEachListedKey(layout.namespaceStreamPrefix(life),
                 [&](const ListedKey & lk) { table_keys.push_back(lk.key); return true; },
-                Retry::standard(), 1000, onGcEnumerationPage);
+                Retry::standard(), CasOperation::kCasListPageKeys, onGcEnumerationPage);
             std::map<NamespaceLifePhysicalId, RefTableListing> grouped;
             try
             {
@@ -4734,7 +4734,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
                 /// Foreign key shape under `gc/gen` is debris, not a numbering input.
             }
             return true;
-        }, Retry::standard(), 1000, onGcEnumerationPage);
+        }, Retry::standard(), CasOperation::kCasListPageKeys, onGcEnumerationPage);
     }
     const uint64_t generation = max_gen + 1;
     const uint64_t budget = rebuild_edge_budget_override ? rebuild_edge_budget_override
@@ -4936,7 +4936,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
             }
             /// A missing/invalid UNOWNED body is debris (no owner claims it) — skip, never refuse.
             return true;
-        }, Retry::standard(), 1000, onGcEnumerationPage);
+        }, Retry::standard(), CasOperation::kCasListPageKeys, onGcEnumerationPage);
     }
 
     /// A REBUILD CONDEMNS NOTHING (spec §7).

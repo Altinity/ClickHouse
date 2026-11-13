@@ -709,7 +709,7 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
             return op.admitted();
         }
         return true;
-    }, Retry::standard(), 1000, onGcEnumerationPage);
+    }, Retry::standard(), CasOperation::kCasListPageKeys, onGcEnumerationPage);
     return deleted;
 }
 

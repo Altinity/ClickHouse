@@ -327,15 +327,15 @@ TEST(CASNamespaceJanitorBatches, ListFailureAfterTheFirstPageKeepsTheCursor)
 
     Gc gc(store, DB::UInt128{323});
     const auto failed = runRoundAndGetJanitorMetrics(gc);
-    EXPECT_EQ(failed.at("janitor_deleted"), 1000u);
-    EXPECT_EQ(countPresent(*backend, stream), 1500u);
+    EXPECT_EQ(failed.at("janitor_deleted"), CasOperation::kCasListPageKeys);
+    EXPECT_EQ(countPresent(*backend, stream), 2500u - CasOperation::kCasListPageKeys);
     const auto state = readState(store->openRequests(), layout);
     ASSERT_EQ(state.status, GcMaintenanceReadStatus::Valid);
-    EXPECT_EQ(state.state->janitor_cursor, stream[999]) << "the cursor the first page published stays";
+    EXPECT_EQ(state.state->janitor_cursor, stream[CasOperation::kCasListPageKeys - 1]) << "the cursor the first page published stays";
 
     backend->allowed_lists = std::numeric_limits<size_t>::max();
     const auto resumed = runRoundAndGetJanitorMetrics(gc);
-    EXPECT_EQ(resumed.at("janitor_deleted"), 1500u);
+    EXPECT_EQ(resumed.at("janitor_deleted"), 2500u - CasOperation::kCasListPageKeys);
     EXPECT_EQ(countPresent(*backend, stream), 0u);
 }
 
@@ -351,10 +351,10 @@ TEST(CASNamespaceJanitorBatches, BudgetStopsThePassAfterThePageInProgress)
     const auto first = runRoundAndGetJanitorMetrics(gc);
 
     EXPECT_EQ(first.at("janitor_pages"), 1u);
-    EXPECT_EQ(first.at("janitor_deleted"), 1000u);
+    EXPECT_EQ(first.at("janitor_deleted"), CasOperation::kCasListPageKeys);
     ASSERT_TRUE(first.contains("budget_exhausted"));
     EXPECT_EQ(first.at("budget_exhausted"), 1u);
-    EXPECT_EQ(countPresent(*backend, stream), 1500u);
+    EXPECT_EQ(countPresent(*backend, stream), 2500u - CasOperation::kCasListPageKeys);
 
     backend->step_ms = 0;
     const auto second = runRoundAndGetJanitorMetrics(gc);

@@ -54,7 +54,7 @@ void checkDeadline(const Deadline & deadline, std::string_view phase)
 void listAll(CasOperation & op, const String & prefix, std::unordered_map<String, uint64_t> & out,
              const FsckProgress & on_progress, const Deadline & deadline, std::string_view phase)
 {
-    static constexpr size_t kPageLimit = 1000;
+    static constexpr size_t kPageLimit = CasOperation::kCasListPageKeys;
     uint64_t pages = 0;
     size_t count_in_page = 0;
     op.forEachListedKey(prefix, [&](const ListedKey & k)

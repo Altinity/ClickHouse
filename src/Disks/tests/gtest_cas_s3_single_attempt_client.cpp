@@ -25,6 +25,7 @@
 #include <chrono>
 #include <exception>
 #include <functional>
+#include <algorithm>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -928,6 +929,82 @@ TEST(CASBackend, ConditionalMultipartNoSuchUploadIsUnresolved)
         << "variant " << result.index() << "; another writer's object must not be taken for this upload";
     EXPECT_EQ(server.count(CountingS3::Verb::CompleteMultipartUpload), 1u);
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASConditionalWriteUnresolved] - unresolved_before, 1u);
+}
+
+namespace
+{
+
+/// A bucket holding `key_count` sorted keys under `p/`, answering `ListObjectsV2` the way S3 does: at most
+/// 1000 keys per response, `IsTruncated` exactly when keys remain, the continuation token naming the last
+/// key returned. The caller counts requests through `CountingS3Server::count(Verb::Other)`.
+CountingS3::Responder pagedListingResponder(size_t key_count)
+{
+    auto keys = std::make_shared<std::vector<std::string>>();
+    for (size_t i = 0; i < key_count; ++i)
+    {
+        std::string number = std::to_string(i);
+        keys->push_back("p/" + std::string(10 - number.size(), '0') + number);
+    }
+    return [keys](const CountingS3::Request & request, Poco::Net::HTTPServerResponse & response)
+    {
+        std::string after;
+        size_t max_keys = 1000;
+        bool is_listing = false;
+        for (const auto & [name, value] : request.query)
+        {
+            if (name == "list-type")
+                is_listing = true;
+            else if (name == "continuation-token" || (name == "start-after" && after.empty()))
+                after = value;
+            else if (name == "max-keys")
+                max_keys = std::min<size_t>(max_keys, std::stoull(value));
+        }
+        if (!is_listing)
+            return CountingS3::answerOk(request.verb, response);
+
+        auto it = after.empty() ? keys->begin() : std::upper_bound(keys->begin(), keys->end(), after);
+        std::string body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>test-bucket</Name>";
+        std::string last;
+        size_t returned = 0;
+        for (; it != keys->end() && returned < max_keys; ++it, ++returned)
+        {
+            last = *it;
+            body += "<Contents><Key>" + *it + "</Key><LastModified>2026-01-01T00:00:00.000Z</LastModified>"
+                    "<ETag>&quot;etag&quot;</ETag><Size>1</Size></Contents>";
+        }
+        const bool truncated = it != keys->end();
+        body += "<KeyCount>" + std::to_string(returned) + "</KeyCount><IsTruncated>" + (truncated ? "true" : "false") + "</IsTruncated>";
+        if (truncated)
+            body += "<NextContinuationToken>" + last + "</NextContinuationToken>";
+        body += "</ListBucketResult>";
+        CountingS3::sendXml(response, Poco::Net::HTTPResponse::HTTP_OK, body);
+    };
+}
+
+}
+
+/// A walk costs about one request per page; a page that needed a second request to fit its sentinel
+/// would double the bill of every enumeration.
+TEST(CASBackend, AListWalkOfTenThousandKeysStaysWithinItsRequestBound)
+{
+    (void)contextForTest();
+    constexpr size_t key_count = 10000;
+    CountingS3::CountingS3Server server(pagedListingResponder(key_count));
+    auto backend = conditionalBackendForTest(makeDispatchStorageForTest(server.getUrl(), 10000));
+    DB::Cas::CasRequests requests(DB::Cas::BackendPtr(backend), DB::Cas::Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
+
+    std::vector<std::string> seen;
+    auto op = requests.admit();
+    op.forEachListedKey("p/", [&](const DB::Cas::ListedKey & listed)
+    {
+        seen.push_back(listed.key);
+        return true;
+    }, DB::Cas::Retry::standard());
+
+    ASSERT_EQ(seen.size(), key_count);
+    EXPECT_TRUE(std::is_sorted(seen.begin(), seen.end()));
+    EXPECT_EQ(std::adjacent_find(seen.begin(), seen.end()), seen.end()) << "a key was visited twice";
+    EXPECT_LE(server.count(CountingS3::Verb::Other), 21u);
 }
 
 #endif

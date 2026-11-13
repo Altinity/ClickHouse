@@ -1,6 +1,7 @@
 #include "cas_test_helpers.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasNamespaceJanitor.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcMaintenanceState.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
 
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
@@ -39,6 +40,20 @@ public:
         if (key.ends_with("/cas/ref_catalog"))
             events.push_back("catalog");
         return CountingBackend::read(key, access);
+    }
+};
+
+/// Records the page size every `list` asks the store for, per prefix.
+class ListLimitRecordingBackend : public CountingBackend
+{
+public:
+    std::vector<std::pair<String, size_t>> list_limits;
+
+    DB::Cas::Backend::RawListPage list(const String & prefix, const String & cursor, size_t limit,
+                                       DB::Cas::TransportAccess & access) override
+    {
+        list_limits.emplace_back(prefix, limit);
+        return CountingBackend::list(prefix, cursor, limit, access);
     }
 };
 
@@ -733,4 +748,37 @@ TEST(CASNamespaceJanitorIntegration, RegularGcRoundDeletesDeadNamespaceBytes)
     EXPECT_EQ(namespace_cleanup["janitor_pages"], 1u);
     EXPECT_GE(namespace_cleanup["janitor_keys"], 1u);
     EXPECT_EQ(namespace_cleanup["janitor_deleted"], 1u);
+}
+
+/// A page of 1000 keys needs a second store request for its sentinel; the janitor and every GC walk must
+/// ask for the page size that fits one response. A regular round, `rebuildBaseline` and the fsck scan are
+/// driven; every recorded limit is a probe (1 or 32) or the one-response page. The orphan-manifest sweep
+/// takes a configured budget and is left out.
+TEST(CASNamespaceJanitorIntegration, GcRoundListsEveryWalkWithTheOneResponsePageSize)
+{
+    auto backend = std::make_shared<ListLimitRecordingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace live_namespace{"00/live@cas@"};
+    fixture::admitLive(*backend, layout, live_namespace);
+    createObj(*backend, layout.refCkptKey(fixture::fixtureLife(live_namespace)),
+        encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1},
+                              .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt}));
+    Gc gc(store, UInt128{152});
+    const RoundReport report = runRegularRoundReclaiming(gc);
+    ASSERT_TRUE(report.acquired_lease);
+    (void)gc.rebuildBaseline(/*force=*/true);
+    (void)runFsck(*store, /*detail=*/false);
+
+    bool namespace_root_listed = false;
+    for (const auto & [prefix, limit] : backend->list_limits)
+    {
+        if (prefix == layout.casManifestsPrefix())
+            continue;
+        if (prefix == layout.namespaceRootPrefix())
+            namespace_root_listed = true;
+        EXPECT_TRUE(limit == 1 || limit == 32 || limit == CasOperation::kCasListPageKeys)
+            << "a walk of '" << prefix << "' asks for a page of " << limit << " keys";
+    }
+    EXPECT_TRUE(namespace_root_listed);
 }

@@ -322,12 +322,15 @@ public:
     std::optional<Object> read(const String & key, const Retry & policy);
     std::optional<Meta>   head(const String & key, const Retry & policy);
     ListPage               list(const String & prefix, const String & cursor, size_t limit, const Retry & policy);
+    /// The store returns at most 1000 keys per request, and a page needs one key more than its size to prove
+    /// the prefix continues, so a page and its sentinel fit one store response.
+    static constexpr size_t kCasListPageKeys = 999;
     /// Walks every key under `prefix` exactly once. The policy governs EACH PAGE, not the walk: a walk
     /// is an unbounded number of requests, and a silently truncated enumeration is the error a
     /// coverage record exists to prevent. `on_page_fetched` fires once per page DELIVERED; a page that
     /// took several reissues still fires once, and `CASRequestAttempt` is the physical count.
     void forEachListedKey(const String & prefix, const ListedKeyFn & fn, const Retry & per_page,
-                          size_t page_limit = 1000, const std::function<void()> & on_page_fetched = {});
+                          size_t page_limit = kCasListPageKeys, const std::function<void()> & on_page_fetched = {});
     Removal remove(const String & key, const Etag & seen, const Retry & policy);
     /// `head` then `remove` of what it saw, repeating on `Mismatch`. `Gone` when the key is already
     /// absent; never returns `Mismatch` -- under `once`, where there is no reissue to resolve one, a

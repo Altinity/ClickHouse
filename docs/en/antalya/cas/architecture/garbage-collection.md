@@ -542,7 +542,7 @@ nothing ends the pass. A pool without debris costs one `LIST` per round.
 
 - **Runs on:** fold path here; also on the deferred path right after phase 4 with
   `suppress_destructive` forced on
-- **Reads:** per page: the durable `janitor_cursor`; one `LIST` page (≤ 1000 keys) of `cas/ns/`; a
+- **Reads:** per page: the durable `janitor_cursor`; one `LIST` page (≤ 999 keys) of `cas/ns/`; a
   fresh ref-catalog snapshot; `gc/state` for the fence re-check
 - **Writes / deletes:** per page: batch `DELETE`s of the dead-life `_log` / `_snap` objects, which
   are write-once and need no token; one request per `cas_gc_bulk_delete_chunk_keys` keys, capped by
@@ -854,7 +854,7 @@ implementation and expand [what a round costs](#round-cost). Read every count as
 lower bound: token conflicts add re-reads and retries, backends whose `LIST` returns no token add
 one `HEAD` per key before each exact delete (phases 13, 14, 16), and recovery paths add fan-out.
 `N` is the number of items the phase acts on without conflicts; `P` is the number of paginated
-`LIST` requests (up to 1000 keys each).
+`LIST` requests (up to 999 keys each).
 
 ### Phase 1 — lease {#cost-phase-1}
 
