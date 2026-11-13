@@ -4,6 +4,7 @@
 #include <Common/FieldVisitorWriteBinary.h>
 #include <Core/AccurateComparison.h>
 #include <Core/DecimalComparison.h>
+#include <Core/DecimalFunctions.h>
 #include <Core/Field.h>
 #include <Core/CompareHelper.h>
 #include <IO/ReadBuffer.h>
@@ -29,6 +30,7 @@ extern const int INCORRECT_DATA;
 extern const int NOT_IMPLEMENTED;
 extern const int LOGICAL_ERROR;
 extern const int ILLEGAL_TYPE_OF_ARGUMENT;
+extern const int ARGUMENT_OUT_OF_BOUND;
 }
 
 bool AggregateFunctionStateData::operator < (const AggregateFunctionStateData &) const
@@ -457,6 +459,13 @@ void readQuoted(DecimalField<T> & x, ReadBuffer & buf)
     }
     else
         scale = -exponent;
+    /// The scale comes from the text: an exponent-form value such as `Decimal64_'1e-1000'` (e.g. in a
+    /// `CUSTOM`-flagged setting parsed by `SettingFieldCustom::parseFromString`) builds a scale that
+    /// bypasses the binary reader's check. An out-of-range scale later overruns a fixed-size buffer in
+    /// the decimal text writer, so reject it here, matching `DataTypeDecimalBase`.
+    if (scale > DecimalUtils::max_precision<T>)
+        throw Exception(ErrorCodes::ARGUMENT_OUT_OF_BOUND, "Scale {} is out of bounds (max scale: {})",
+                        scale, DecimalUtils::max_precision<T>);
     assertChar('\'', buf);
     x = DecimalField<T>{value, scale};
 }
