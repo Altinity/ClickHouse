@@ -1821,6 +1821,21 @@ TEST(CASMountStartup, RefusesWritableOpenWithInconsistentCasRequestBudget)
     });
 }
 
+/// The window check is not specific to writable mounts: a read-only disk binds the same window, and one
+/// at or below the envelope would give up before its first attempt.
+TEST(CASMountStartup, RefusesReadOnlyOpenWithRequestWindowAtTheAttemptEnvelope)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    CasRequestBudget budget;
+    budget.request_window_ms = budget.attemptEnvelopeMs();
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
+    {
+        Pool::open(b, PoolConfig{
+            .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r", .read_only = true,
+            .cas_request_budget = budget});
+    });
+}
+
 TEST(CASMountStartup, StaleSelfMountReclaimedAfterWait)
 {
     auto b = std::make_shared<InMemoryBackend>();

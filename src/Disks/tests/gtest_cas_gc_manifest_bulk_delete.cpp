@@ -161,7 +161,7 @@ TEST(CASGCManifestBulkDelete, AThrowInTheSecondChunkKeepsTheFirstChunksAuditAndA
         {
             aborted = true;
         }
-        /// A round that exhausted the full retry window (up to `Retry::standard()`'s 90s) may have
+        /// A round that exhausted the full retry window (up to the request window of `Retry::standard()`) may have
         /// outlasted the mount lease itself, so the aborted round's own lease-renewal attempt can
         /// throw too -- irrelevant to what this test asserts, so skip it once aborted.
         if (!aborted)

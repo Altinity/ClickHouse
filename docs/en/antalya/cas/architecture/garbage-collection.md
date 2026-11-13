@@ -106,7 +106,7 @@ that object.
 - **Runs on:** always — the only phase a `NotALeader` round emits
 - **Reads:** `gc/state`; `gc/hb` (only when another GC owns the lease)
 - **Writes / deletes:** one successful `CAS` on `gc/state` (acquire, renew or steal); a conflict is
-  re-observed and re-decided by the request engine within the standard 90-second write policy; no
+  re-observed and re-decided by the request engine within the configured request window (`cas_request_window_ms`, default 120 s); no
   deletes
 - **Safety:** the lease is *work de-duplication, not mutual exclusion* — see below
 - **Fails the round if:** this `Gc` instance saw `gc/state` before and it has since disappeared, or

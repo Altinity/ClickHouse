@@ -1856,9 +1856,9 @@ TEST(CASRefCatalogRemoval, ACommitTheResolutionReadContradictsFailsRetryLaterIns
 }
 
 /// The loop captures ONE bound before it starts and every call it makes shares it, so a permanently
-/// contended catalog gives up "retry later" inside one standard window rather than spending a fresh
+/// contended catalog gives up "retry later" inside one request window rather than spending a fresh
 /// window per verb across a hundred paced iterations -- which is hours against a document that
-/// promises ninety seconds. Every erase is refused and the injected clock absorbs every paced retry,
+/// promises one window. Every erase is refused and the injected clock absorbs every paced retry,
 /// so what ends the call is visible in the virtual time it took. The attempt cap stays as the
 /// secondary bound; it is not what ends this call.
 TEST(CASRefCatalogRemoval, PerpetualConflictGivesUpWithinOneWindowNotAtTheAttemptCap)
@@ -1927,7 +1927,7 @@ TEST(CASRefCatalogRemoval, PerpetualConflictGivesUpWithinOneWindowNotAtTheAttemp
         << "the shared bound, not the attempt cap, is what ended this call: " << message;
     /// Two windows, so the assertion survives the jitter of the paced retries while still failing a
     /// loop that binds a fresh window per iteration -- that one spends minutes here.
-    EXPECT_LT(clock.now - start, 2 * 90'000u) << "the loop outlived the window it captured";
+    EXPECT_LT(clock.now - start, 2 * kDefaultRequestWindowMs) << "the loop outlived the window it captured";
     EXPECT_LT(backend->refusedAttempts(), 100u) << "the attempt cap must not be what ends this call";
     /// Greater than one is what proves the loop iterated rather than failing on its first attempt.
     EXPECT_GT(backend->refusedAttempts(), 1u);

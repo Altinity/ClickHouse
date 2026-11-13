@@ -2547,7 +2547,7 @@ TEST(CASPoolShutdown, UnresolvedWedgeSkipsFarewell)
             *fake_boot += ms;
         }});
     /// The engine's own inter-attempt sleep advances the same clock its deadlines are read from, so the
-    /// retry bound is reached in test time rather than in ninety real seconds.
+    /// retry bound is reached in test time rather than after a real request window.
     store->setCasRetrySleepForTest([fake_boot](uint64_t ms)
     {
         *fake_boot += ms;

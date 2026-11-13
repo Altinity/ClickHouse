@@ -686,7 +686,7 @@ TEST(CASNamespaceJanitor, CursorPublicationFailureIsLeakOnly)
 /// The write inside `catch (...)` (the reset after a LIST failure) is admitted `once`: an unmodeled,
 /// unresolvable write attempt must give up after its one exact resolve read rather than looping through
 /// `Retry::standard()`'s backoff. `write_attempts == 1` is the discriminator: under `standard`, the same
-/// unresolvable write would keep reissuing until the ninety-second policy window (the LIST failure is
+/// unresolvable write would keep reissuing until the request window (the LIST failure is
 /// itself a genuine `NETWORK_ERROR`, which the read engine retries to its OWN deadline before this catch
 /// path is even entered -- so a raw sleep count is not a usable signal here, it is dirtied by the LIST's
 /// unrelated retries regardless of which policy the catch-path write uses; the injected clock exists only

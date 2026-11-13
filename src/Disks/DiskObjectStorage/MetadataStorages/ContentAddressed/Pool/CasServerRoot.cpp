@@ -892,8 +892,8 @@ uint64_t allocateWriterEpoch(
         Retry::standard());
 
     /// Non-convergence used to be `CORRUPTED_DATA`, on the reasoning that a hundred lost conditional
-    /// writes really is evidence of something wrong. The bound is a wall-clock deadline now, and ninety
-    /// seconds of a throttled store is not evidence of anything, so `orThrow`'s retry-later class is
+    /// writes really is evidence of something wrong. The bound is a wall-clock deadline now, and a whole request
+    /// window of a throttled store is not evidence of anything, so `orThrow`'s retry-later class is
     /// the honest verdict. Both fail closed at `Pool::open`.
     orThrow(std::move(result), fmt::format("CAS server-root '{}' writer_epoch allocation", srid));
     return allocated;

@@ -334,7 +334,7 @@ TEST(CASGCLog, TransientThrowIsClassifiedAborted)
 {
     auto backend = std::make_shared<NetworkThrowingBackend>();
     /// A PERSISTENT transient fault is reissued for the whole retry window, so the window has to run
-    /// on a clock this test advances -- otherwise one read spends ninety real seconds. Heap-owned, not
+    /// on a clock this test advances -- otherwise one read spends a real request window. Heap-owned, not
     /// a plain local: the Pool can outlive this stack frame (a background publish holds
     /// `shared_from_this()`), so a by-reference capture of a local -- even an already-atomic one --
     /// would dangle once the frame returns.

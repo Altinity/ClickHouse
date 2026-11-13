@@ -160,7 +160,7 @@ row followed by a `recovered` one — and the older `unresolved_reason`, `deadli
 - `outcome = 'failed'` carries the decisive `classification`: `external_lease_deadline` (a
   bounded renewal only: the confirmed lease's own safety margin, not the request policy, ran out first — check object-store
   latency or `BOOTTIME` advancement before anything else), `request_deadline` (a bounded
-  renewal only: the ninety-second request policy exhausted first), `unresolved` (every attempt was ambiguous and never settled by
+  renewal only: the configured request window (`cas_request_window_ms`, default 120 s) exhausted first), `unresolved` (every attempt was ambiguous and never settled by
   the time the operation gave up), `conflict` (an exact resolve read found another body — a
   same-pair twin, a GC-fenced body, a successor epoch, or a foreign holder), `cancelled` (a
   renewal in flight was cancelled by shutdown or a remount park request; expected during graceful

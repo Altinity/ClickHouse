@@ -335,7 +335,7 @@ inline DB::ContentAddressedSettings makeSettingsForTest(const std::string & serv
 }
 
 /// A clock that only ever moves when something sleeps on it, plus the record of every sleep it
-/// served. Injected into `CasRequests` so a policy's whole 90-second deadline is exercised in a test
+/// served. Injected into `CasRequests` so a policy's whole request window is exercised in a test
 /// that takes no wall-clock time, and so the schedule itself -- how many pauses, how long -- becomes
 /// an assertion rather than a wait. `now` is atomic and `sleeps` is mutex-guarded because a
 /// decommission session's background mount-lease renewer reads this same clock (via

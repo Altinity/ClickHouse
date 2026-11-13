@@ -711,7 +711,7 @@ TEST(CASRefCatalogBirthWiring, APerpetuallyChurningCatalogEntryIsPacedAndEndsWit
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->namespaceLife(ns); });
 
-    /// Sixteen jittered draws cannot exhaust a 90 s window even at their ceiling, so an unpaced loop
+    /// Sixteen jittered draws cannot exhaust the request window even at their ceiling, so an unpaced loop
     /// reaches its iteration cap having slept nothing at all.
     EXPECT_GE(clock->pauseCount() - pauses_before, 16u) << "each forced re-read is paced";
     /// The frozen window, plus at most one backoff draw the pace does not consult the deadline for,

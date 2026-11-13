@@ -5223,7 +5223,7 @@ TEST(CASRefWriterNamespaceRemoval, AWaitLongerThanTheWindowEndsTheDropAndLeavesT
     const RootNamespace ns{"srv1/wait_longer_than_window"};
     publishEmptyPart(store, ns, "owned");
 
-    store->setRemovalAttemptHookForTest([&] { clock->advance(100'000); });
+    store->setRemovalAttemptHookForTest([&] { clock->advance(kDefaultRequestWindowMs + 10'000); });
     SCOPE_EXIT({ store->setRemovalAttemptHookForTest({}); });
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropNamespace(ns); });

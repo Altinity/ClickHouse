@@ -31,6 +31,7 @@
 #include <Poco/Util/AbstractConfiguration.h>
 #include <base/sleep.h>
 #include <chrono>
+#include <limits>
 #include <filesystem>
 #include <ctime>
 #include <unordered_set>
@@ -90,6 +91,7 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 gc_bulk_delete_chunk_keys;
     extern const ContentAddressedSettingsUInt64 attempt_timeout_ms;
     extern const ContentAddressedSettingsUInt64 lease_safety_margin_ms;
+    extern const ContentAddressedSettingsUInt64 request_window_ms;
     extern const ContentAddressedSettingsBool blob_hash_allow_new;
 }
 
@@ -315,6 +317,7 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , gc_bulk_delete_chunk_keys(settings_[ContentAddressedSetting::gc_bulk_delete_chunk_keys].value)
     , cas_attempt_timeout_ms(settings_[ContentAddressedSetting::attempt_timeout_ms].value)
     , cas_lease_safety_margin_ms(settings_[ContentAddressedSetting::lease_safety_margin_ms].value)
+    , cas_request_window_ms(settings_[ContentAddressedSetting::request_window_ms].value)
     , staging_backend(settings_.stagingBackend())
     , blob_hash_algo(settings_.blobHashAlgo())
     , blob_hash_allow_new(settings_[ContentAddressedSetting::blob_hash_allow_new].value)
@@ -807,6 +810,7 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     pool_config.gc_bulk_delete_chunk_keys = gc_bulk_delete_chunk_keys;
     pool_config.cas_request_budget.attempt_timeout_ms = cas_attempt_timeout_ms;
     pool_config.cas_request_budget.lease_safety_margin_ms = cas_lease_safety_margin_ms;
+    setCasRequestWindow(pool_config.cas_request_budget, cas_request_window_ms);
     /// Frozen here, once: see `freezeConnectTimeoutCapMs`. A later reload that widens the disk's
     /// connect timeout cannot widen the envelope the lease arithmetic was validated against.
     pool_config.cas_request_budget.connect_timeout_cap_ms = freezeConnectTimeoutCapMs(object_storage, cas_attempt_timeout_ms);

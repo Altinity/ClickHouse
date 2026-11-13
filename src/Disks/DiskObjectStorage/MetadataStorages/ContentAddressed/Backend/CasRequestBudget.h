@@ -6,7 +6,7 @@ namespace DB::Cas
 {
 
 /// The request window of a plane whose budget does not name one.
-inline constexpr uint64_t kDefaultRequestWindowMs = 90000;
+inline constexpr uint64_t kDefaultRequestWindowMs = 120000;
 
 /// The limits a writable mount is configured with. `CasMountRuntime::admit` measures a request against
 /// `lease_safety_margin_ms` plus a caller-supplied need expressed in attempt envelopes (one for an
@@ -21,7 +21,8 @@ struct CasRequestBudget
     /// client (the object storage backend's single-attempt client), not by this struct.
     uint64_t attempt_timeout_ms = 5000;
     /// How long a request whose policy names no window of its own keeps retrying, measured from the
-    /// call's start. Each request plane takes it from its pool's budget.
+    /// call's start. Each request plane takes it from its pool's budget. Must exceed twice the attempt
+    /// envelope for a writable open and the envelope for a read-only one.
     uint64_t request_window_ms = kDefaultRequestWindowMs;
     /// Startup-only margin folded into `validateCasRequestBudget`'s inequality against the mount lease
     /// TTL. Not consulted at runtime by the engine itself -- the caller's fence (backed by the local
@@ -44,17 +45,26 @@ struct CasRequestBudget
     /// retried, with capped-exponential backoff, until this total wall-clock budget is spent — then the
     /// error propagates and the table's load fails for this touch (the `lazy_load_tables` database
     /// setting makes the NEXT touch retry). This sits ON TOP of each write's own `Retry` policy window
-    /// (`Retry::standard()`'s 90s): one recovery attempt may itself burn ~90s inside a single seal PUT.
-    /// Independent of the mount-lease invariants validated in `validateCasRequestBudget` — not part of
-    /// that inequality set.
-    uint64_t recovery_retry_budget_ms = 120000;
+    /// (`request_window_ms`): one recovery attempt may itself burn that long inside a single seal PUT, so the
+    /// storage layer sets this to twice the window. Not part of the inequality set validated in
+    /// `validateCasRequestBudget`.
+    uint64_t recovery_retry_budget_ms = 2 * kDefaultRequestWindowMs;
     uint64_t recovery_retry_initial_backoff_ms = 1000;
     uint64_t recovery_retry_max_backoff_ms = 30000;
 };
 
+/// Sets `request_window_ms` and derives `recovery_retry_budget_ms` as twice the window, saturating: one
+/// recovery attempt can spend a whole window inside a single write.
+void setCasRequestWindow(CasRequestBudget & budget, uint64_t window_ms);
+
+/// Throws `BAD_ARGUMENTS` unless `attemptEnvelopeMs() < request_window_ms`: the bound of a read-only open,
+/// which sends no write. A window at or below the envelope gives up before its first retry.
+void validateCasRequestWindow(const CasRequestBudget & budget);
+
 /// Startup validation: a writable mount refuses to open with an inconsistent budget rather than
 /// silently falling back to an unbounded or unsafe retry policy. Throws
 /// `BAD_ARGUMENTS` unless:
+///   2 × attemptEnvelopeMs() < request_window_ms   (a write reserves its attempt and its settlement read)
 ///   attemptEnvelopeMs() + lease_safety_margin_ms < mount_lease_ttl_ms
 /// and, when `background_renewal` is true (the mount runs a background renewer):
 ///   mount_renew_period_ms + 2 × attemptEnvelopeMs() + lease_safety_margin_ms < mount_lease_ttl_ms

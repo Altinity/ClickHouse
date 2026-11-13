@@ -3381,6 +3381,7 @@ TEST(CASRequestBudget, BudgetLogLineNamesReserveAndSlack)
         const String log = capture.captured();
         EXPECT_THAT(log, testing::HasSubstr("write_reserve_ms=16000")) << log;
         EXPECT_THAT(log, testing::HasSubstr("renewal_slack_ms=94000")) << log;
+        EXPECT_THAT(log, testing::HasSubstr("request_window_ms=120000")) << log;
     }
     {
         DB::Cas::tests::ScopedLogCapture capture("CasRequestBudget", "information");

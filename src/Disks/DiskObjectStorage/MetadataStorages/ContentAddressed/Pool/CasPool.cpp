@@ -409,7 +409,9 @@ Pool::LifecycleSnapshot Pool::lifecycleSnapshot() const
 
 PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
 {
-    if (!config.read_only)
+    if (config.read_only)
+        validateCasRequestWindow(config.cas_request_budget);
+    else
         validateWritableMountTiming(config);
 
     /// Wrap the pool backend once, transparently, so EVERY CA S3 op — probe, pool-meta,

@@ -2,10 +2,12 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestBudget.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.h>
 #include <Common/Exception.h>
+#include "cas_test_helpers.h"
 #include <Common/logger_useful.h>
 #include <Poco/AutoPtr.h>
 #include <Poco/StreamChannel.h>
 #include <Poco/Util/XMLConfiguration.h>
+#include <limits>
 #include <sstream>
 
 using namespace DB;
@@ -29,6 +31,7 @@ namespace DB::ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 gc_bulk_delete_chunk_keys;
     extern const ContentAddressedSettingsUInt64 mount_lease_ttl_ms;
     extern const ContentAddressedSettingsUInt64 mount_renew_period_ms;
+    extern const ContentAddressedSettingsUInt64 request_window_ms;
     extern const ContentAddressedSettingsString scratch_path;
     extern const ContentAddressedSettingsBool unsafe_remount_no_delay;
     extern const ContentAddressedSettingsBool allow_packed_parts;
@@ -665,4 +668,51 @@ TEST(CASContentAddressedSettings, MountLeaseDefaultsSatisfyRequestBudget)
 
     const uint64_t write_reserve = 2 * budget.attemptEnvelopeMs() + budget.lease_safety_margin_ms;
     EXPECT_EQ(ttl - period - write_reserve, 94000u);
+}
+
+TEST(CASContentAddressedSettings, RequestWindowDefaultAndValidation)
+{
+    auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id>");
+    ContentAddressedSettings s;
+    s.loadFromConfig(*cfg, "disk", "/data", "/data/scratch", identity_macros);
+    EXPECT_EQ(s[ContentAddressedSetting::request_window_ms].value, 120'000u);
+
+    /// A writable open needs room for a write's two envelopes, its attempt and its settlement read.
+    DB::Cas::CasRequestBudget budget;
+    budget.request_window_ms = 2 * budget.attemptEnvelopeMs();
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::BAD_ARGUMENTS, "twice the attempt envelope", [&]
+    {
+        DB::Cas::validateCasRequestBudget(budget, /*mount_lease_ttl_ms=*/120'000, /*mount_renew_period_ms=*/10'000,
+                                          /*background_renewal=*/true);
+    });
+    budget.request_window_ms = 2 * budget.attemptEnvelopeMs() + 1;
+    EXPECT_NO_THROW(DB::Cas::validateCasRequestBudget(budget, 120'000, 10'000, /*background_renewal=*/true));
+
+    /// A read-only open sends no write, so one envelope is its bound.
+    budget.request_window_ms = budget.attemptEnvelopeMs();
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::BAD_ARGUMENTS, "larger than the attempt envelope",
+        [&] { DB::Cas::validateCasRequestWindow(budget); });
+    budget.request_window_ms = budget.attemptEnvelopeMs() + 1;
+    EXPECT_NO_THROW(DB::Cas::validateCasRequestWindow(budget));
+
+    EXPECT_EQ(DB::Cas::CasRequestBudget{}.recovery_retry_budget_ms, 240'000u);
+}
+
+TEST(CASContentAddressedSettings, RequestWindowSettingSetsTheWindowAndTwiceTheRecoveryBudget)
+{
+    auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id><cas_request_window_ms>90000</cas_request_window_ms>");
+    ContentAddressedSettings s;
+    s.loadFromConfig(*cfg, "disk", "/data", "/data/scratch", identity_macros);
+
+    DB::Cas::PoolConfig pool_config;
+    DB::Cas::setCasRequestWindow(pool_config.cas_request_budget, s[ContentAddressedSetting::request_window_ms].value);
+    EXPECT_EQ(pool_config.cas_request_budget.request_window_ms, 90'000u);
+    EXPECT_EQ(pool_config.cas_request_budget.recovery_retry_budget_ms, 180'000u);
+
+    constexpr uint64_t max = std::numeric_limits<uint64_t>::max();
+    DB::Cas::setCasRequestWindow(pool_config.cas_request_budget, max / 2);
+    EXPECT_EQ(pool_config.cas_request_budget.recovery_retry_budget_ms, max - 1);
+    DB::Cas::setCasRequestWindow(pool_config.cas_request_budget, max / 2 + 1);
+    EXPECT_EQ(pool_config.cas_request_budget.recovery_retry_budget_ms, max);
+    EXPECT_EQ(pool_config.cas_request_budget.request_window_ms, max / 2 + 1);
 }
