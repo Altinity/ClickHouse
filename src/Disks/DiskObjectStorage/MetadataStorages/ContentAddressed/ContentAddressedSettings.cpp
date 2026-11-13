@@ -66,14 +66,14 @@ constexpr std::string_view CAS_KEY_PREFIX = "cas_";
     DECLARE(UInt64, gc_shards, 1, "Blob-hash-prefix reducer shards (>= 1); creation-time only", 0) \
     DECLARE(UInt64, manifest_sweep_list_budget_keys, 1000, "Orphan-manifest sweep LIST budget per round", 0) \
     DECLARE(UInt64, manifest_sweep_delete_budget_keys, 100, "Orphan-manifest sweep candidate budget per round: keys that pass every retain check, whose bodies are read and decided", 0) \
-    DECLARE(UInt64, gc_round_graduation_budget, 5000, "Blob graduation (condemned -> delete_pending) cohort cap per round (0 = unbounded)", 0) \
-    DECLARE(UInt64, gc_round_redelete_budget, 5000, "Blob redelete (exact-token delete of a prior delete_pending row) cohort cap per round (0 = unbounded)", 0) \
+    DECLARE(UInt64, gc_round_graduation_budget, 0, "Blob graduation (condemned -> delete_pending) cohort cap per round (0 = unbounded)", 0) \
+    DECLARE(UInt64, gc_round_redelete_budget, 0, "Blob redelete (exact-token delete of a prior delete_pending row) cohort cap per round (0 = unbounded)", 0) \
     DECLARE(UInt64, gc_round_sweep_namespace_budget, 20, "Orphan-manifest sweep: distinct namespaces per page whose protection view may be built (0 = unbounded)", 0) \
     DECLARE(UInt64, gc_round_sweep_recovery_op_budget, 5000, "Orphan-manifest sweep: committed-tail ref-log GET/decode ops the recovery walk may spend per round (0 = unbounded)", 0) \
-    DECLARE(UInt64, gc_round_ref_cleanup_budget, 5000, "Ref-object cleanup (covered log/snapshot deletes) cap per round (0 = unbounded)", 0) \
+    DECLARE(UInt64, gc_round_ref_cleanup_budget, 0, "Ref-object cleanup (covered log/snapshot deletes) cap per round (0 = unbounded)", 0) \
     DECLARE(UInt64, gc_round_prefix_wholesale_budget, 20000, "Generation-prefix wholesale delete (prune only) object cap per round (0 = unbounded)", 0) \
-    DECLARE(UInt64, gc_round_handoff_prefix_wholesale_budget, 5000, "Post-CAS hand-off generation-prefix reclaim object cap per round, reserved separately from gc_round_prefix_wholesale_budget so a prune-heavy round cannot starve the one-shot hand-off (0 = unbounded)", 0) \
-    DECLARE(UInt64, gc_round_outcome_entry_budget, 5000, "GcOutcomes per-round entry cap across the redelete/spared audit log (0 = unbounded)", 0) \
+    DECLARE(UInt64, gc_round_handoff_prefix_wholesale_budget, 0, "Post-CAS hand-off generation-prefix reclaim object cap per round, reserved separately from gc_round_prefix_wholesale_budget so a prune-heavy round cannot starve the one-shot hand-off (0 = unbounded)", 0) \
+    DECLARE(UInt64, gc_round_outcome_entry_budget, 0, "GcOutcomes per-round entry cap across the redelete/spared audit log (0 = unbounded)", 0) \
     DECLARE(UInt64, mount_lease_ttl_ms, 120000, "Mount lease validity after a successful claim or renewal, in milliseconds", 0) \
     DECLARE(UInt64, mount_renew_period_ms, 10000, "Interval between background mount lease renewals, in milliseconds", 0) \
     DECLARE(Bool, unsafe_remount_no_delay, false, "Reclaim a mount slot that carries this server's own uuid at once after a hard restart, without observing the slot's token for the lease TTL. Unsafe whenever two processes can hold the same server_uuid (a copied uuid file, a stalled predecessor): after such a reclaim the predecessor can still start conditional writes until its own cutoff (confirmed deadline − margin − 2 × envelope) or until its next renewal meets the token guard, and a request it already sent may materialize later. Ref-log keys carry (writer_epoch, sequence) and creates are conditional, so two writers can never commit different bodies to one key, and recovery's epoch seal settles stragglers -- the exposure is availability, not data: recovery fails closed after 64 successive seal-create attempts displaced by newly materializing old-epoch transactions. Intended for test stands and deployments that guarantee one process per uuid", 0) \

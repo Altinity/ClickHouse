@@ -117,7 +117,7 @@ struct PoolConfig
     /// (superseded-generation prune) caps, cumulative for the round. `prefix_wholesale_budget` is the
     /// round's shared remainder every prune `deletePrefixWholesale` call draws from, so no single call
     /// passes an unbounded `bounded_remaining`.
-    uint64_t gc_round_ref_cleanup_budget = 5000;
+    uint64_t gc_round_ref_cleanup_budget = 0;
     uint64_t gc_round_prefix_wholesale_budget = 20000;
     /// The post-CAS hand-off reclaim draws from its OWN reserve, never from `prefix_wholesale_budget`
     /// above: the prune safely under-serves and retries next round via its cursor, but the hand-off is a

@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestBudget.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Common/Exception.h>
 #include "cas_test_helpers.h"
 #include <Common/logger_useful.h>
@@ -29,6 +30,14 @@ namespace DB::ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 gc_shards;
     extern const ContentAddressedSettingsUInt64 gc_interval_sec;
     extern const ContentAddressedSettingsUInt64 gc_bulk_delete_chunk_keys;
+    extern const ContentAddressedSettingsUInt64 gc_round_graduation_budget;
+    extern const ContentAddressedSettingsUInt64 gc_round_redelete_budget;
+    extern const ContentAddressedSettingsUInt64 gc_round_ref_cleanup_budget;
+    extern const ContentAddressedSettingsUInt64 gc_round_handoff_prefix_wholesale_budget;
+    extern const ContentAddressedSettingsUInt64 gc_round_outcome_entry_budget;
+    extern const ContentAddressedSettingsUInt64 gc_round_sweep_namespace_budget;
+    extern const ContentAddressedSettingsUInt64 gc_round_sweep_recovery_op_budget;
+    extern const ContentAddressedSettingsUInt64 gc_round_prefix_wholesale_budget;
     extern const ContentAddressedSettingsUInt64 mount_lease_ttl_ms;
     extern const ContentAddressedSettingsUInt64 mount_renew_period_ms;
     extern const ContentAddressedSettingsUInt64 request_window_ms;
@@ -116,6 +125,29 @@ TEST(CASContentAddressedSettings, DefaultsAndOverridesLand)
     EXPECT_EQ(s[ContentAddressedSetting::gc_interval_sec].value, 60u);          /// table default
     /// Absent key -> the verbatim default (never touches the anchor).
     EXPECT_EQ(s[ContentAddressedSetting::scratch_path].value, "/data/default_scratch");
+}
+
+TEST(CASContentAddressedSettings, GcRoundBudgetsDefaultToUnbounded)
+{
+    auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id>");
+    ContentAddressedSettings s;
+    s.loadFromConfig(*cfg, "disk", "/data", "/data/default_scratch", identity_macros);
+    EXPECT_EQ(s[ContentAddressedSetting::gc_round_graduation_budget].value, 0u);
+    EXPECT_EQ(s[ContentAddressedSetting::gc_round_redelete_budget].value, 0u);
+    EXPECT_EQ(s[ContentAddressedSetting::gc_round_ref_cleanup_budget].value, 0u);
+    EXPECT_EQ(s[ContentAddressedSetting::gc_round_handoff_prefix_wholesale_budget].value, 0u);
+    EXPECT_EQ(s[ContentAddressedSetting::gc_round_outcome_entry_budget].value, 0u);
+
+    const Cas::PoolConfig pool_config;
+    EXPECT_EQ(pool_config.gc_round_graduation_budget, 0u);
+    EXPECT_EQ(pool_config.gc_round_redelete_budget, 0u);
+    EXPECT_EQ(pool_config.gc_round_ref_cleanup_budget, 0u);
+    EXPECT_EQ(pool_config.gc_round_handoff_prefix_wholesale_budget, 0u);
+    EXPECT_EQ(pool_config.gc_round_outcome_entry_budget, 0u);
+
+    EXPECT_EQ(s[ContentAddressedSetting::gc_round_sweep_namespace_budget].value, 20u);
+    EXPECT_EQ(s[ContentAddressedSetting::gc_round_sweep_recovery_op_budget].value, 5000u);
+    EXPECT_EQ(s[ContentAddressedSetting::gc_round_prefix_wholesale_budget].value, 20000u);
 }
 
 TEST(CASContentAddressedSettings, PackedPartsDefaultOffAndOptIn)

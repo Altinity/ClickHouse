@@ -238,19 +238,26 @@ removes that churn, with no measured cost.
 These settings bound individual phases of a `GC` round. The first two accept any `UInt64` value;
 for the remaining caps, `0` means unbounded.
 
+Five of these caps (`cas_gc_round_graduation_budget`, `cas_gc_round_redelete_budget`,
+`cas_gc_round_ref_cleanup_budget`, `cas_gc_round_handoff_prefix_wholesale_budget`,
+`cas_gc_round_outcome_entry_budget`) default to `0` (unbounded); the old default was `5000`. Set the
+key back to `5000` to restore a cap. With no cap, the first round on a pool with a backlog drains the
+whole backlog in that one round, so that round can run long and issue many requests. That round also delays the dead-member
+fence-out, which runs only at the start of a round.
+
 | Setting | Default | Bounds | Description |
 |---|---|---|---|
 | `cas_manifest_sweep_list_budget_keys` | `1000` | `UInt64` | Orphan-manifest sweep `LIST` budget per round |
 | `cas_manifest_sweep_delete_budget_keys` | `100` | `UInt64` | Orphan-manifest sweep `DELETE` budget per round |
 | `cas_gc_bulk_delete_chunk_keys` | `1000` | `1`–`1000` | Most keys per batch delete request in GC's write-once families (owner-removed manifest bodies, covered ref logs and snapshots, the namespace janitor's dead ref logs and snapshots), capped by the storage's batch-delete limit |
-| `cas_gc_round_graduation_budget` | `5000` | `0` = unbounded | Blob-graduation (`condemned` → `delete_pending`) cohort cap per round |
-| `cas_gc_round_redelete_budget` | `5000` | `0` = unbounded | Exact-token re-delete cohort cap for prior `delete_pending` rows per round |
+| `cas_gc_round_graduation_budget` | `0` | `0` = unbounded | Blob-graduation (`condemned` → `delete_pending`) cohort cap per round |
+| `cas_gc_round_redelete_budget` | `0` | `0` = unbounded | Exact-token re-delete cohort cap for prior `delete_pending` rows per round |
 | `cas_gc_round_sweep_namespace_budget` | `20` | `0` = unbounded | Distinct namespaces per orphan-manifest sweep page whose protection view may be built |
 | `cas_gc_round_sweep_recovery_op_budget` | `5000` | `0` = unbounded | Committed-tail ref-log `GET`/decode operations the orphan-manifest recovery walk may spend per round |
-| `cas_gc_round_ref_cleanup_budget` | `5000` | `0` = unbounded | Ref-object cleanup cap for covered log and snapshot deletes per round |
+| `cas_gc_round_ref_cleanup_budget` | `0` | `0` = unbounded | Ref-object cleanup cap for covered log and snapshot deletes per round |
 | `cas_gc_round_prefix_wholesale_budget` | `20000` | `0` = unbounded | Generation-prefix wholesale-delete object cap during pruning per round |
-| `cas_gc_round_handoff_prefix_wholesale_budget` | `5000` | `0` = unbounded | Post-`CAS` hand-off generation-prefix reclaim cap per round, reserved separately so pruning cannot starve the one-shot hand-off |
-| `cas_gc_round_outcome_entry_budget` | `5000` | `0` = unbounded | `GcOutcomes` entry cap across the re-delete/spared audit log per round |
+| `cas_gc_round_handoff_prefix_wholesale_budget` | `0` | `0` = unbounded | Post-`CAS` hand-off generation-prefix reclaim cap per round, reserved separately so pruning cannot starve the one-shot hand-off |
+| `cas_gc_round_outcome_entry_budget` | `0` | `0` = unbounded | `GcOutcomes` entry cap across the re-delete/spared audit log per round |
 
 ## Migration from unprefixed keys {#migration-from-unprefixed-keys}
 
@@ -276,10 +283,19 @@ requiring a fresh pool.
 
 ## Upgrading to the 120 s lease and request window defaults {#upgrading-lease-defaults}
 
-This release changes three defaults. `cas_mount_lease_ttl_ms` moves from `30000` to `120000`. The
-request window moves from a fixed 90 s to `cas_request_window_ms`, default `120000`. The ref-table
-recovery budget moves from a fixed 120 s to twice the window. A server that runs with default settings
-therefore changes its lease when it is upgraded.
+Builds that include this change move these defaults:
+
+- `cas_mount_lease_ttl_ms` moves from `30000` to `120000`. The wait after a hard restart grows with it,
+  from about 43 s to about 138 s (see [the lease costs](#mount-lease-costs)).
+- The request window moves from a fixed 90 s to `cas_request_window_ms`, default `120000`. The ref-table
+  recovery budget moves from a fixed 120 s to twice the window, 240 s.
+- The five `cas_gc_round_graduation_budget`, `cas_gc_round_redelete_budget`,
+  `cas_gc_round_ref_cleanup_budget`, `cas_gc_round_handoff_prefix_wholesale_budget` and
+  `cas_gc_round_outcome_entry_budget` caps move from `5000` to `0` (unbounded). The first rounds of an
+  upgraded leader can run long on a backlog and delay the fence-out of dead mounts; see the budget list
+  above.
+
+A server that runs with default settings therefore changes its lease when it is upgraded.
 
 **Pin the lease while the pool has older builds.** A build without the declared-lease rule (before
 `v26.6.8.20003`; in the 26.8 line, before the merge of

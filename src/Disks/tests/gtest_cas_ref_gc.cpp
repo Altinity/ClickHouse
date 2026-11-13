@@ -786,6 +786,55 @@ TEST(CASRefGc, RefObjectCleanupRespectsRoundBudgetAndConvergesAcrossRounds)
     EXPECT_EQ(global_counters[ProfileEvents::CASRefCleanupNamespacesSkipped], skipped_before);
 }
 
+TEST(CASRefGc, ZeroCleanupBudgetProcessesEveryEntryInOneRound)
+{
+    constexpr int kDeletable = 10;
+    auto survivorsAfterOneRound = [&](uint64_t budget)
+    {
+        auto backend = std::make_shared<InMemoryBackend>();
+        auto store = Pool::open(backend, PoolConfig{
+            .pool_prefix = "p", .server_root_id = "test",
+            .gc_round_ref_cleanup_budget = budget,
+            .gc_fold_max_defer_rounds = 0});
+        const Layout & layout = store->layout();
+        const RootNamespace ns{"00/aa@cas@"};
+        fixture::admitLive(*backend, layout, ns);
+
+        std::optional<ManifestRef> prev;
+        ManifestRef latest{};
+        uint64_t last_seq = 0;
+        for (int i = 1; i <= kDeletable + 1; ++i)
+        {
+            const ManifestRef r = mref(i);
+            writeManifestRaw(*backend, layout, ns, r, {blobEntryFor("a" + std::to_string(i), DB::UInt128(static_cast<uint64_t>(i)))});
+            last_seq = publishCommittedTransition(*backend, layout, ns, "t", prev, r);
+            prev = r;
+            latest = r;
+        }
+        RefTableSnapshot snap = minimalLiveSnapshot(ns.string(), RefTxnId{1, last_seq}, {committedRow("t", latest)});
+        writeRefSnapshotRaw(*backend, layout, snap);
+        replaceRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+            .life_epoch = 1,
+            .committed_through = RefTxnId{1, last_seq},
+            .checkpoint_snapshot_id = RefTxnId{1, last_seq},
+            .last_epoch_seal = std::nullopt,
+        });
+
+        Gc gc(store, kGc);
+        runRegularRoundReclaiming(gc);
+
+        OperationForTest raw_op(*backend);
+        size_t survivors = 0;
+        for (int i = 1; i <= kDeletable; ++i)
+            if ((*raw_op).head(layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, static_cast<uint64_t>(i)}), Retry::once()).has_value())
+                ++survivors;
+        return survivors;
+    };
+
+    EXPECT_EQ(survivorsAfterOneRound(3), 7u) << "a budget of 3 deletes exactly three of the ten covered logs";
+    EXPECT_EQ(survivorsAfterOneRound(0), 0u) << "a budget of 0 is unbounded: one round deletes all ten";
+}
+
 TEST(CASRefGc, RefObjectCleanupRetainsCheckpointPredecessorSealProof)
 {
     auto backend = std::make_shared<InMemoryBackend>();

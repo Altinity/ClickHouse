@@ -814,18 +814,22 @@ is one-shot and leaves its remainder to `cas-fsck`. The per-round budgets are or
 [advanced GC pacing settings](/antalya/cas/configuration#advanced-gc-pacing-settings) on the
 configuration page (`cas_gc_meta_pool_size` and `cas_gc_io_concurrency` sit in its main
 [disk-settings table](/antalya/cas/configuration#disk-settings)). `0` means unbounded for every
-`cas_gc_round_*` budget; `cas_manifest_sweep_list_budget_keys = 0` disables the sweep,
-`cas_manifest_sweep_delete_budget_keys = 0` lists without nominating, and the two pool sizes and
-the chunk size reject `0`:
+`cas_gc_round_*` budget. It is the default for the graduation, redelete, outcome-entry, hand-off
+and ref-cleanup budgets: each of those phases processes its whole eligible cohort in one round. One
+round does not clear a backlog: a blob that graduates in a round is deleted in a later round, and the
+sweep and prune caps stay finite. A cap on the hand-off leaks the rest of its prefix to `cas-fsck`,
+so leave that one at `0`. Among the sweep keys, `cas_manifest_sweep_list_budget_keys = 0`
+disables the sweep and `cas_manifest_sweep_delete_budget_keys = 0` lists without nominating. The two
+pool sizes and the chunk size reject `0`:
 
 | Setting | Default | Bounds |
 |---|---:|---|
-| `cas_gc_round_graduation_budget` | 5000 | condemned → `delete_pending` graduations per round (phase 9) |
-| `cas_gc_round_redelete_budget` | 5000 | `redelete` entries processed per round (phase 11) |
-| `cas_gc_round_outcome_entry_budget` | 5000 | outcome-log entries per round (phase 11) |
+| `cas_gc_round_graduation_budget` | 0 | condemned → `delete_pending` graduations per round (phase 9) |
+| `cas_gc_round_redelete_budget` | 0 | `redelete` entries processed per round (phase 11) |
+| `cas_gc_round_outcome_entry_budget` | 0 | outcome-log entries per round (phase 11) |
 | `cas_gc_round_prefix_wholesale_budget` | 20000 | listed objects the retention prune may process per round, gone ones included (phase 13) |
-| `cas_gc_round_handoff_prefix_wholesale_budget` | 5000 | listed objects the hand-off reclaim may process per round, reserved separately (phase 14) |
-| `cas_gc_round_ref_cleanup_budget` | 5000 | covered `_log` / `_snap` deletes per round (phase 17) |
+| `cas_gc_round_handoff_prefix_wholesale_budget` | 0 | listed objects the hand-off reclaim may process per round, reserved separately (phase 14) |
+| `cas_gc_round_ref_cleanup_budget` | 0 | covered `_log` / `_snap` deletes per round (phase 17) |
 | `cas_manifest_sweep_list_budget_keys` | 1000 | orphan-manifest sweep `LIST` budget in keys per round; `0` disables the sweep (phase 9) |
 | `cas_manifest_sweep_delete_budget_keys` | 100 | orphan-manifest sweep `DELETE` budget per round (phases 9, 18) |
 | `cas_gc_round_sweep_namespace_budget` | 20 | namespaces whose protection view the sweep may build per page (phase 9) |
