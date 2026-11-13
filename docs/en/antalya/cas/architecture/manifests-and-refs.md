@@ -307,9 +307,10 @@ durable at `LIST` time, so a namespace born after that `LIST` is invisible to th
 each discovered namespace, the replay itself is not `LIST`-driven — it is the same exact-`GET`,
 `_ckpt`-grounded arithmetic walk described above, just called from a caller-supplied catalog entry
 instead of a live mount. The relink-confirm handshake (see the
-[replication page](/antalya/cas/architecture/replication#relink-gates)) does zero object-store I/O
-and answers `Yes` only against the resident, warm, fence-live in-memory table — `No` is not proof
-of the negative, only `Yes` is fence-gated.
+[replication page](/antalya/cas/architecture/replication#relink-gates)) answers from the resident,
+warm, fence-live in-memory table. It makes no object-store request unless that table says `Yes`.
+Then it reads the mount slot once and answers `Yes` only if the slot is still held. `No` is not
+proof of the negative, only `Yes` is fence-gated.
 
 ## Namespace removal {#namespace-removal}
 
