@@ -824,6 +824,11 @@ struct ContextSharedPart : boost::noncopyable
 
     std::atomic<bool> shutdown_called = false;
     std::atomic<bool> swarm_mode_enabled = true;
+    /// Held shared only across the decision to send a task request. The response read does
+    /// not hold it, so `stopSwarmMode` is not stuck for `receive_timeout`. Stop, start, and
+    /// shutdown hold it exclusively: no request is sent after `stopSwarmMode` returns.
+    /// `SharedMutex` prefers writers, so a pending stop blocks new admissions.
+    mutable SharedMutex swarm_mode_mutex;
 
     Stopwatch uptime_watch TSA_GUARDED_BY(mutex);
 
@@ -1022,8 +1027,13 @@ struct ContextSharedPart : boost::noncopyable
       */
     void shutdown() TSA_NO_THREAD_SAFETY_ANALYSIS
     {
-        swarm_mode_enabled = false;
-        CurrentMetrics::set(CurrentMetrics::IsSwarmModeEnabled, 0);
+        {
+            /// A callback still deciding to send observes the disabled mode under this lock
+            /// and returns without sending. The response read does not hold the lock.
+            std::lock_guard lock(swarm_mode_mutex);
+            swarm_mode_enabled = false;
+            CurrentMetrics::set(CurrentMetrics::IsSwarmModeEnabled, 0);
+        }
         bool is_shutdown_called = shutdown_called.exchange(true);
         if (is_shutdown_called)
             return;
@@ -8099,6 +8109,7 @@ void Context::shutdown() TSA_NO_THREAD_SAFETY_ANALYSIS
 
 bool Context::stopSwarmMode()
 {
+    std::lock_guard lock(shared->swarm_mode_mutex);
     bool expected_is_enabled = true;
     bool is_stopped_now = shared->swarm_mode_enabled.compare_exchange_strong(expected_is_enabled, false);
     if (is_stopped_now)
@@ -8109,6 +8120,7 @@ bool Context::stopSwarmMode()
 
 bool Context::startSwarmMode()
 {
+    std::lock_guard lock(shared->swarm_mode_mutex);
     bool expected_is_enabled = false;
     bool is_started_now = shared->swarm_mode_enabled.compare_exchange_strong(expected_is_enabled, true);
     if (is_started_now)
@@ -8120,6 +8132,11 @@ bool Context::startSwarmMode()
 bool Context::isSwarmModeEnabled() const
 {
     return shared->swarm_mode_enabled;
+}
+
+std::shared_lock<SharedMutex> Context::lockSwarmMode() const
+{
+    return std::shared_lock(shared->swarm_mode_mutex);
 }
 
 Context::ApplicationType Context::getApplicationType() const
