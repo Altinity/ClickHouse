@@ -483,7 +483,8 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
 CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemovingAtSnapshot(
     CasOperation & op, const Layout & layout, Snapshot catalog_snapshot,
     const CatalogEntry & observed, const CasFoldSeal & authoritative_parent,
-    const std::function<void()> & refresh_authority)
+    const std::function<void()> & refresh_authority,
+    const std::function<void(const NamespaceLifeId &)> & before_erase)
 {
     if (observed.state != NsState::Removing || !observed.removal_started_round)
         return {
@@ -523,6 +524,7 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
     /// to start.
     const Retry policy = op.freeze(Retry::standard());
 
+    bool retirement_announced = false;
     for (size_t attempt = 0; attempt < kMaxCatalogCasAttempts; ++attempt)
     {
         /// So the admission consulted below is not one reading taken before the first attempt.
@@ -541,6 +543,12 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
         /// Nothing is attempted without admission, and a refusal here has sent nothing.
         if (!op.admitted())
             return resolved_result(CompletedRemovingDeleteOutcome::FencedOut);
+
+        if (before_erase && !retirement_announced)
+        {
+            before_erase(old_life);
+            retirement_announced = true;
+        }
 
         RefCatalog candidate = catalog_snapshot.catalog;
         candidate.entries.erase(candidate.entries.begin() + (observed_it - catalog_snapshot.catalog.entries.begin()));

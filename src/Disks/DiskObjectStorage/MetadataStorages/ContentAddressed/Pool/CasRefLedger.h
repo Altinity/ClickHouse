@@ -232,8 +232,8 @@ public:
     /// re-reads the exact catalog row.
     bool namespaceStillLogicallyPresent(const RootNamespace & ns);
 
-    /// Called after a complete catalog observation proves an exact resident life absent or replaced.
-    /// It does not
+    /// Called after a complete catalog observation proves an exact resident life absent or replaced,
+    /// or by GC immediately before it erases a row whose terminal removal is folded. It does not
     /// destroy the runtime: existing callers that already captured the old physical life may finish
     /// with their stale-or-not-found contract. The name slot is detached by exact pointer identity; a
     /// later name-based touch may publish a distinct successor runtime.
@@ -910,7 +910,9 @@ private:
         bool removal_attempt_active = false;
         std::condition_variable cv;
 
-        /// Published after GC commits the exact catalog deletion. The exact cache pointer is detached;
+        /// Published by `invalidateRemovedCatalogLife`: from the GC drain just before it erases the exact
+        /// catalog row, from `reconcileCatalogCut` once a cut shows the life gone, and from the
+        /// stalled-`Creating` cancellation in `dropNamespaceImpl`. The exact cache pointer is detached;
         /// old holders observe the flag and remain a predecessor, never a rebindable name handle.
         std::atomic<bool> catalog_life_invalidated{false};
 

@@ -689,7 +689,7 @@ public:
     /// `DirShape::TableDir` case.
     bool namespaceStillLogicallyPresent(const RootNamespace & ns);
 
-    /// GC callback after a proved exact catalog deletion; see `CasRefLedger` for the in-place cached
+    /// GC callback just before it erases a folded `Removing` row; see `CasRefLedger` for the in-place cached
     /// runtime invalidation contract.
     void invalidateRemovedCatalogLife(const NamespaceLifeId & life);
 

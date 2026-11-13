@@ -8,6 +8,12 @@
 #include "cas_test_helpers.h"
 #include <algorithm>
 #include <functional>
+#include <atomic>
+#include <chrono>
+#include <future>
+#include <memory>
+#include <mutex>
+#include <thread>
 
 /// Namespace files are keyed by an opaque LIFE, not by its name: `cas/ns/state/<life_id>/_files/<name>`
 /// (Stage B Task 4b, directive design change 2). This file pins the three properties that re-key exists
@@ -79,6 +85,115 @@ public:
         }
         return result;
     }
+};
+
+/// The cold admission must be refused by the retirement record itself, not by a later check.
+void expectRefusedAsRetired(const std::exception_ptr & error)
+{
+    ASSERT_TRUE(error) << "the reader inserted a runtime for the retired life";
+    try
+    {
+        std::rethrow_exception(error);
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR);
+        EXPECT_NE(e.message().find("was retired while"), String::npos) << e.message();
+    }
+}
+
+/// Parks the cold admission running on `parked_thread` right after its `park_on_read`-th read of
+/// `catalog_key` returns. `on_erase_landed` runs once, right after the first conditional write of
+/// `catalog_key` for which `erase_landed` holds returns: the window between the drain's catalog erase
+/// and anything the drain does afterwards.
+class ParkedAdmissionBackend : public CountingBackend
+{
+public:
+    String catalog_key;
+    std::atomic<std::thread::id> parked_thread{};
+    size_t park_on_read = 0;
+    std::function<bool()> erase_landed;
+    std::function<void()> on_erase_landed;
+
+    std::promise<void> parked;
+
+    void releaseOnce()
+    {
+        std::call_once(release_once, [this] { release.set_value(); });
+    }
+
+    std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        auto result = CountingBackend::read(key, access);
+        if (key == catalog_key && std::this_thread::get_id() == parked_thread && park_on_read && --park_on_read == 0)
+        {
+            parked.set_value();
+            release.get_future().wait();
+        }
+        return result;
+    }
+
+    std::expected<String, DB::Cas::Backend::RawConflict> write(const String & key, const String & bytes,
+                                                               const std::optional<String> & expected_value,
+                                                               DB::Cas::TransportAccess & access) override
+    {
+        auto result = CountingBackend::write(key, bytes, expected_value, access);
+        if (on_erase_landed && key == catalog_key && expected_value && result && erase_landed())
+        {
+            auto once = std::move(on_erase_landed);
+            on_erase_landed = nullptr;
+            once();
+        }
+        return result;
+    }
+
+private:
+    std::promise<void> release;
+    std::once_flag release_once;
+};
+
+/// Runs `admission` on its own thread, which registers itself as the parked thread before its first
+/// request. The destructor releases the park and joins, so a failing assertion in the test body
+/// cannot leave a joinable thread behind.
+class ParkedReader
+{
+public:
+    ParkedReader(ParkedAdmissionBackend & backend_, std::function<void()> body)
+        : backend(backend_)
+        , thread([this, admission = std::move(body)]
+          {
+              backend.parked_thread = std::this_thread::get_id();
+              try
+              {
+                  admission();
+              }
+              catch (...)
+              {
+                  error = std::current_exception();
+              }
+          })
+    {
+    }
+
+    bool joinable() const { return thread.joinable(); }
+
+    ~ParkedReader()
+    {
+        backend.releaseOnce();
+        join();
+    }
+
+    void join()
+    {
+        if (thread.joinable())
+            thread.join();
+    }
+
+    std::exception_ptr error;
+
+private:
+    ParkedAdmissionBackend & backend;
+    std::thread thread;
 };
 
 }
@@ -242,6 +357,52 @@ TEST(CASNsFileIncarnation, ColdWriterDoesNotRepublishALifeRetiredAfterItsCatalog
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)store->namespaceLife(ns); });
     ASSERT_TRUE(retired) << "the race must fire after the writer's catalog read and drain the row";
+    EXPECT_NE(store->refTableLifeForTest(ns), retired_life) << "a runtime for the retired life was published";
+}
+
+/// A cold reader parked between its second catalog read and its insertion while the drain erases the
+/// row: the reader is released the moment the erase returns, before the drain does anything else. The
+/// retirement must already be on record by then.
+TEST(CASNsFileIncarnation, ColdReaderIsRefusedWhenReleasedRightAfterTheDrainErasesItsRow)
+{
+    auto backend = std::make_shared<ParkedAdmissionBackend>();
+    const RootNamespace ns{kNsString};
+    std::optional<NamespaceLifeId> retired_life;
+    {
+        PoolPtr writer = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+        publishWithProductionBirth(writer, ns, "predecessor");
+        retired_life = writer->namespaceLife(ns);
+    }
+
+    PoolPtr store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    ASSERT_EQ(store->refTableRuntimeIdentityForTest(ns), 0u);
+
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
+    Gc gc(store, kGcId);
+
+    std::unique_ptr<ParkedReader> reader;
+    backend->catalog_key = layout.refCatalogKey();
+    backend->park_on_read = 2;
+    backend->erase_landed = [&] { return !CasRefCatalog::lifeIfCataloged(catalog_op, layout, ns).has_value(); };
+    backend->on_erase_landed = [&]
+    {
+        backend->releaseOnce();
+        reader->join();
+    };
+    auto parked = backend->parked.get_future();
+    reader = std::make_unique<ParkedReader>(*backend, [&] { (void)store->namespaceFilesLifeIfReadable(ns); });
+    ASSERT_EQ(parked.wait_for(std::chrono::seconds(60)), std::future_status::ready) << "the reader never reached its park";
+
+    store->dropNamespace(ns);
+    (void)runRegularRoundReclaiming(gc);
+    (void)runRegularRoundReclaiming(gc);
+    ASSERT_FALSE(reader->joinable()) << "the drain's erase must have released and joined the reader";
+    reader->join();
+    ASSERT_FALSE(CasRefCatalog::lifeIfCataloged(catalog_op, layout, ns));
+
+    expectRefusedAsRetired(reader->error);
     EXPECT_NE(store->refTableLifeForTest(ns), retired_life) << "a runtime for the retired life was published";
 }
 
