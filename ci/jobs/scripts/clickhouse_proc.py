@@ -1340,6 +1340,13 @@ fi
             return f"timed out after {self.DUMP_SYSTEM_TABLE_TIMEOUT}s\n{stderr}"
         return stderr
 
+    @staticmethod
+    def config_declares_cas_disk(config_dir):
+        return Shell.check(
+            f"grep -Rlq '<metadata_type>cas</metadata_type>' {config_dir}",
+            verbose=False,
+        )
+
     def dump_system_tables(self):
         # Stop server so we can safely read data with clickhouse-local.
         # Why do we read data with clickhouse-local?
@@ -1362,6 +1369,11 @@ fi
             "query_metric_log",
             "part_log",
         ]
+        # Only a CAS lane has these tables; on any other lane the dump would fail.
+        # A system log table is created at its first flush, so a short job can end before these two exist.
+        OPTIONAL_TABLES = ["cas_gc_log", "cas_log"]
+        if self.config_declares_cas_disk("/etc/clickhouse-server/"):
+            TABLES += OPTIONAL_TABLES
         ROWS_COUNT_IN_SYSTEM_TABLE_LIMIT = 20_000_000
 
         command_args = self.LOGS_SAVER_CLIENT_OPTIONS
@@ -1438,6 +1450,15 @@ fi
         scraping_system_table = Result(name="Scraping system tables", status=Result.Status.OK)
         for table in TABLES:
             path_arg = f" --path {self.run_path0}"
+            if table in OPTIONAL_TABLES:
+                # A failed existence check falls through to the dump, which reports its own error.
+                res, stdout, stderr = Shell.get_res_stdout_stderr(
+                    f"cd {self.run_path0} && {dump_prefix}clickhouse local {command_args} {path_arg} --query \"EXISTS TABLE system.{table}\" {command_args_post}",
+                    verbose=True,
+                )
+                if res == 0 and stdout.strip() == "0":
+                    print(f"system.{table} does not exist (never flushed); skipping its dump")
+                    continue
             res, stdout, stderr = Shell.get_res_stdout_stderr(
                 f"cd {self.run_path0} && {dump_prefix}clickhouse local {command_args} {path_arg} --query \"select * from system.{table} into outfile '{temp_dir}/system_tables/{table}.tsv' format TSVWithNamesAndTypes\" {command_args_post}",
                 verbose=True,
