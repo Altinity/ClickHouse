@@ -3137,3 +3137,105 @@ TEST(CASPartWriteTxnMarkerRace, PresentBodyWithoutMarkerRepublishesOnce)
     EXPECT_EQ(uploadOnce(second, ref, payload).diagnostics.action, BlobMaterializationAction::Observed);
     EXPECT_EQ((*op).head(blob_key, Retry::once())->etag, republished->etag);
 }
+
+namespace
+{
+
+String stageManifestFailureText(PartWriteTxn & build)
+{
+    try
+    {
+        build.stageManifest({blobManifestEntry("a.bin", "a")});
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR);
+        return e.message();
+    }
+    ADD_FAILURE() << "expected DB::Exception";
+    return {};
+}
+
+}
+
+/// Every give-up shape of a manifest PUT says whether the body may have landed: only a sent attempt can
+/// make it UNCERTAIN, and a refused or unsent one never claims it might have landed.
+TEST(CASPartWriteTxn, StageManifestGiveUpTextCoversEveryOutcome)
+{
+    using Why = GaveUp::Why;
+    using Source = GaveUp::Source;
+    struct Case
+    {
+        GaveUp gave_up;
+        const char * says;
+        bool uncertain;
+    };
+    const std::vector<Case> cases{
+        {{.why = Why::FenceLost, .deadline_source = Source::Policy, .sent_any = false, .last_seen = NotObserved{}},
+         "was refused: this server no longer holds the mount", false},
+        {{.why = Why::FenceLost, .deadline_source = Source::Policy, .sent_any = true, .last_seen = NotObserved{},
+          .attempts_sent = 2},
+         "was refused: this server no longer holds the mount", false},
+        {{.why = Why::Deadline, .deadline_source = Source::Policy, .sent_any = true, .last_seen = NotObserved{},
+          .attempts_sent = 3},
+         "3 attempt(s) sent, none conclusive by the policy deadline", true},
+        {{.why = Why::Deadline, .deadline_source = Source::Lease, .sent_any = true, .last_seen = NotObserved{},
+          .attempts_sent = 4},
+         "4 attempt(s) sent, none conclusive by the lease deadline", true},
+        {{.why = Why::Deadline, .deadline_source = Source::Lease, .sent_any = false, .last_seen = NotObserved{}},
+         "was not sent: the mount lease has too little time left", false},
+        {{.why = Why::Deadline, .deadline_source = Source::Policy, .sent_any = false, .last_seen = NotObserved{}},
+         "was not sent: the request window ran out before the first attempt", false},
+        {{.why = Why::Unresolved, .deadline_source = Source::Policy, .sent_any = true, .last_seen = NotObserved{},
+          .attempts_sent = 5},
+         "5 attempt(s) sent and the resolving read did not complete (nothing observed)", true},
+        {{.why = Why::Unresolved, .deadline_source = Source::Policy, .sent_any = false, .last_seen = ProvenAbsent{}},
+         "was not sent: a read of the current object did not complete (absent)", false},
+    };
+    for (const Case & c : cases)
+    {
+        const String text = describeManifestPutGiveUp(c.gave_up);
+        EXPECT_NE(text.find(c.says), String::npos) << text;
+        EXPECT_EQ(text.find("UNCERTAIN") != String::npos, c.uncertain) << text;
+        EXPECT_EQ(text.find("may have landed") != String::npos, c.uncertain) << text;
+    }
+}
+
+/// A manifest PUT refused by the lease margin never reached the store, so the text must not claim
+/// the body may have landed.
+TEST(CASPartWriteTxn, StageManifestNotSentUnderDrainedLeaseSaysNotSent)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    const auto boot_ms = std::make_shared<std::atomic<uint64_t>>(0);
+    PoolConfig config{.pool_prefix = "p", .server_root_id = "test"};
+    config.boot_ms_fn = [boot_ms] { return boot_ms->load(); };
+    const uint64_t lease_ms = static_cast<uint64_t>(config.mount_lease_ttl_ms.count());
+    const uint64_t margin_ms = config.cas_request_budget.lease_safety_margin_ms;
+    auto s = Pool::open(b, std::move(config));
+    useVirtualMountRequestClock(s);
+
+    /// Inside the safety margin, still before the lease deadline.
+    boot_ms->store(lease_ms - margin_ms / 2);
+
+    auto build = startBuildFor(s, RootNamespace{"srv/tbl"}, "part_drained");
+    const String text = stageManifestFailureText(*build);
+    EXPECT_NE(text.find("was not sent"), String::npos) << text;
+    EXPECT_EQ(text.find("UNCERTAIN"), String::npos) << text;
+}
+
+/// A manifest PUT that was sent, and whose every answer was lost, may have landed: the text says
+/// so and counts the attempts.
+TEST(CASPartWriteTxn, StageManifestSentThenGaveUpSaysUncertain)
+{
+    auto b = std::make_shared<ManifestPutFaultBackend>();
+    auto s = openPool(b);
+    useVirtualMountRequestClock(s, /*step_ms=*/10'000);
+    b->fault_count = 1000000;
+    b->attempt_cap = 100;
+
+    auto build = startBuildFor(s, RootNamespace{"srv/tbl"}, "part_uncertain");
+    const String text = stageManifestFailureText(*build);
+    ASSERT_GT(b->put_attempts, 1);
+    EXPECT_NE(text.find("UNCERTAIN"), String::npos) << text;
+    EXPECT_NE(text.find(fmt::format("{} attempt(s) sent", b->put_attempts)), String::npos) << text;
+}

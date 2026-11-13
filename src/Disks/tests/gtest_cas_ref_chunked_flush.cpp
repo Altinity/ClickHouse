@@ -79,8 +79,8 @@ PoolPtr openPool(const BackendPtr & backend)
     /// about chunking and op-caps, none about wall-clock lease behaviour, so any of them that runs
     /// long enough simply dies of an unrelated fence trip: `DropNamespaceOverOpCapSucceeds` (5200
     /// refs) takes 43-65s under a sanitizer and failed deterministically on all three sanitizer CI
-    /// builds with `txn is UNCERTAIN (retry budget exhausted)` — the pre-attempt fence reject, not a
-    /// real retry exhaustion. Same artifact, same fix as
+    /// builds with `mount fence tripped` — the pre-attempt fence reject, not a real retry
+    /// exhaustion. Same artifact, same fix as
     /// `CASPartWriteTxn.ManifestCapEncodedBytesJustUnderStagesSuccessfully` (2026-07-18): decouple the
     /// fence from execution speed. The waits in this file are `steady_clock` timeouts on futures and
     /// condvars, which are unaffected by this injection.
