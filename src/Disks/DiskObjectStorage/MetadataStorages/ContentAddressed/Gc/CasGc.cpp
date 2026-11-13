@@ -836,11 +836,13 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// complete, and a folding invocation takes its catalog cut only after the deletion settles.
     {
         GcPhaseTimer t(phase_sink, "pre_fold_ref_drain");
-        const CatalogLifecycleReconcileResult drain_result = drainCompletedRemoving(state);
+        uint64_t completed_erases = 0;
+        /// Declared after `t`, so it runs before the timer emits its record, on a throw too.
+        SCOPE_EXIT({ t.metric("deleted", completed_erases); });
+        const CatalogLifecycleReconcileResult drain_result = drainCompletedRemoving(state, completed_erases);
         if (drain_result.authority_status != AuthorityStatus::Authoritative
             || drain_result.catalog_resolution != CatalogResolution::DrainComplete)
             throwCasWriteRetryLater("CAS GC pre-fold drain lost authority before the catalog settled");
-        t.metric("deleted", drain_result.deleted);
     }
 
     /// Etag-guarded fence-out of dead mounts (liveness only — graduation itself paces on GC
@@ -5248,6 +5250,12 @@ bool Gc::acquireOrRenewLease(GcState & state, std::optional<Etag> & state_etag, 
 
 CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(const GcState & leased_state)
 {
+    uint64_t completed_erases = 0;
+    return drainCompletedRemoving(leased_state, completed_erases);
+}
+
+CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(const GcState & leased_state, uint64_t & completed_erases)
+{
     if (leased_state.snap_generation == 0)
         return {
             .authority_status = AuthorityStatus::Authoritative,
@@ -5272,10 +5280,11 @@ CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(const GcState & lease
     const uint64_t admitted_generation = leased_state.lease.seq;
     refreshAuthority(admitted_generation);
     CasOperation op = store->openRequests().admit([this] { return authority_held; });
-    return CatalogLifecycleReconciler(op, store->layout(), *parent)
-        .reconcile(
-            [this, admitted_generation] { refreshAuthority(admitted_generation); },
-            [this](const NamespaceLifeId & life) { store->invalidateRemovedCatalogLife(life); });
+    CatalogLifecycleReconciler reconciler(op, store->layout(), *parent);
+    SCOPE_EXIT({ completed_erases = reconciler.completedErases(); });
+    return reconciler.reconcile(
+        [this, admitted_generation] { refreshAuthority(admitted_generation); },
+        [this](const NamespaceLifeId & life) { store->invalidateRemovedCatalogLife(life); });
 }
 
 }

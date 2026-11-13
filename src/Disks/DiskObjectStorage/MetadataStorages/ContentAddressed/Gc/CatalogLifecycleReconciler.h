@@ -56,6 +56,9 @@ public:
         const std::function<void()> & refresh_authority,
         const std::function<void(const NamespaceLifeId &)> & before_erase);
 
+    /// Erases that completed so far. Readable after `reconcile` throws, unlike `result.deleted`.
+    uint64_t completedErases() const { return completed_erases; }
+
 private:
     std::optional<CatalogEntry> selectEligible(const CasRefCatalog::Snapshot & catalog) const;
     static CatalogResolution resolveExactRow(
@@ -64,6 +67,7 @@ private:
     CasOperation & op;
     const Layout & layout;
     const CasFoldSeal & adopted_parent;
+    uint64_t completed_erases = 0;
 };
 
 }

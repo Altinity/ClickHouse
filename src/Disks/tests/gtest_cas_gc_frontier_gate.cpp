@@ -120,6 +120,14 @@ public:
         conflict_next_catalog_cas = true;
     }
 
+    /// Lets `allowed` conditional writes of `key` through, then throws from every further one.
+    void failCatalogCasesAfter(const String & key, size_t allowed)
+    {
+        std::lock_guard lock(control_mutex);
+        catalog_key = key;
+        catalog_cas_budget = allowed;
+    }
+
     void waitForBlockedCatalogCas()
     {
         std::unique_lock lock(control_mutex);
@@ -199,6 +207,12 @@ public:
                 lose_next_catalog_cas_response = false;
                 lose_response = true;
             }
+            if (conditional && key == catalog_key && catalog_cas_budget)
+            {
+                if (*catalog_cas_budget == 0)
+                    throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected catalog write failure");
+                --*catalog_cas_budget;
+            }
             if (conditional && key == catalog_key && conflict_next_catalog_cas)
             {
                 conflict_next_catalog_cas = false;
@@ -241,6 +255,7 @@ private:
     bool release_catalog_cas = false;
     bool lose_next_catalog_cas_response = false;
     bool conflict_next_catalog_cas = false;
+    std::optional<size_t> catalog_cas_budget;
     String after_read_key;
     std::function<void()> after_read_hook;
 };
@@ -3259,6 +3274,33 @@ TEST(CASGCFrontierGate, ALeaderDeposedBetweenTwoErasesStopsAfterTheFirst)
             ++still_cataloged;
     EXPECT_EQ(still_cataloged, 1u)
         << "one row was erased before the deposition; the other survives it";
+}
+
+/// A drain that throws after erasing a row still reports that row: the phase record is what an
+/// operator reads to learn how far the round got.
+TEST(CASGCFrontierGate, AnAbortedDrainReportsTheRowsItErased)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    seedCompletedRemovingBatch(op, store, kGc, /*count=*/2);
+    backend->failCatalogCasesAfter(layout.refCatalogKey(), /*allowed=*/1);
+
+    std::optional<std::map<String, UInt64>> drain_metrics;
+    Gc gc(store, kGc);
+    gc.setPhaseSink([&](const GcPhaseRecord & rec)
+    {
+        if (rec.phase == "pre_fold_ref_drain")
+            drain_metrics = rec.metrics;
+    });
+    EXPECT_THROW(gc.runRegularRound(), DB::Exception);
+    gc.setPhaseSink({});
+
+    ASSERT_TRUE(drain_metrics.has_value()) << "the drain phase emits its record even when it throws";
+    ASSERT_TRUE(drain_metrics->contains("deleted")) << "the aborted drain reports its erase count";
+    EXPECT_EQ(drain_metrics->at("deleted"), 1u);
 }
 
 TEST(CASGCFrontierGate, HealthyRebuildUsesTheCatalogLifecycleReconciler)

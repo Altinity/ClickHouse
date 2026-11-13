@@ -564,6 +564,9 @@ private:
     /// Catalog-only helping barrier run immediately after lease acquisition. It validates the adopted
     /// parent and delegates deterministic `Removing`-row settlement to `CatalogLifecycleReconciler`.
     /// It performs no physical LIST or delete.
+    /// `completed_erases` is kept current while the drain runs, so it is valid after an exception.
+    CatalogLifecycleReconcileResult drainCompletedRemoving(const GcState & leased_state, uint64_t & completed_erases);
+    /// Same drain for callers that do not need the erase count.
     CatalogLifecycleReconcileResult drainCompletedRemoving(const GcState & leased_state);
 
     /// Run the independently paced physical namespace maintenance: pages from the persisted cursor while

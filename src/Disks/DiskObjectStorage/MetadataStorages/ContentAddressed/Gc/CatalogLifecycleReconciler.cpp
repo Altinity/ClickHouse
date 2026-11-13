@@ -116,7 +116,7 @@ CatalogLifecycleReconcileResult CatalogLifecycleReconciler::reconcile(
                 "CAS catalog lifecycle reconciliation left completed-removal namespace '{}' present",
                 eligible->ns.string()));
         if (delete_result.outcome == CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted)
-            ++result.deleted;
+            result.deleted = ++completed_erases;
     }
 }
 
