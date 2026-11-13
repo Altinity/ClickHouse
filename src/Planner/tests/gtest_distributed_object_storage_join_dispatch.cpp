@@ -628,3 +628,29 @@ TEST(DistributedObjectStorageJoinDispatch, InitiatorOnlySettingsAreNotSentToWork
 
     EXPECT_FALSE(read_from_cluster_query->createRemoteContext()->getSettingsRef().isChanged("limit"));
 }
+
+/// A worker runs the dispatched query as sent: neither `distributed` nor its fallback applies there. Sending
+/// `allow` also lets a worker that does not know `distributed` parse the settings.
+TEST(DistributedObjectStorageJoinDispatch, WorkersRunTheDispatchedQueryInAllowMode)
+{
+    auto & state = State::instance();
+    auto context = Context::createCopy(state.context);
+    context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    context->setSetting("object_storage_cluster_join_mode_fallback", String("global"));
+
+    ParserSelectQuery parser;
+    ASTPtr ast = parseQuery(
+        parser, "SELECT driver.id FROM driver INNER JOIN safe_lookup ON driver.id = safe_lookup.lookup_id", 1000, 1000, 1000000);
+    auto query_tree = buildQueryTree(ast, context);
+    QueryTreePassManager pass_manager(context);
+    addQueryTreePasses(pass_manager);
+    pass_manager.run(query_tree);
+
+    InterpreterSelectQueryAnalyzer interpreter(query_tree, context, SelectQueryOptions{});
+    auto * read_from_cluster_query = findReadFromClusterQuery(interpreter.getQueryPlan().getRootNode());
+    ASSERT_NE(read_from_cluster_query, nullptr);
+
+    EXPECT_EQ(
+        read_from_cluster_query->createRemoteContext()->getSettingsRef().get("object_storage_cluster_join_mode"),
+        Field(String("allow")));
+}

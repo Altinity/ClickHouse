@@ -2318,7 +2318,7 @@ Possible values:
 - `global` — `INNER`, `LEFT`, and `CROSS` run on the nodes. The initiator reads the right table once and sends it to each node. For `CROSS JOIN`, every table after the first is sent. `RIGHT` and `FULL` stay on the initiator, so unmatched rows of the preserved side are returned once.
 - `distributed` — Experimental. Dispatches a whole `JOIN` query to the cluster of its driving table, so the `JOIN` and any `GROUP BY` run on the cluster's nodes instead of on the initiator, which then only merges the partial aggregate states. The driving table is found by walking down the left side of the query -- through `INNER ALL`/`LEFT JOIN`s and through a subquery or CTE that does not itself aggregate, deduplicate, sort or limit -- and must be a `DataLake` catalog table distributed via `object_storage_cluster`.
 
-  This is attempted only for the outermost `SELECT` of an initial query, and it is all-or-nothing: either the entire query is eligible and is dispatched as one unit, or ordinary planning handles the entire query. No narrower, nested candidate is attempted, and nothing falls back per level.
+  This is attempted only for the outermost `SELECT` of an initial query, and it is all-or-nothing: either the entire query is eligible and is dispatched as one unit, or ordinary planning handles the entire query in the mode set by [`object_storage_cluster_join_mode_fallback`](#object_storage_cluster_join_mode_fallback). No narrower, nested candidate is attempted, and nothing falls back per level.
 
   Eligibility requires that every other table reachable anywhere in the query also resolves through a `DataLake` catalog, has no row-level security policy, and is readable by the current user. An explicit `*Cluster()` table function, an ordinary local or `Distributed` table, or any table failing one of those checks makes the whole query ineligible. The combination is disabled outright when `additional_table_filters` is set, `object_storage_remote_initiator` is enabled, or a nested subquery or CTE has its own `SETTINGS` clause.
 
@@ -2329,6 +2329,17 @@ Possible values:
   ClickHouse also does not verify that the dictionaries or user-defined functions the query references are configured identically on every node of the driver's cluster -- as with `Distributed`, that consistency is the deployment's responsibility.
 
 See [Distributed JOIN](../../sql-reference/statements/select/join.md#object-storage-cluster-join-mode).
+)", 0) \
+    DECLARE(ObjectStorageClusterJoinMode, object_storage_cluster_join_mode_fallback, ObjectStorageClusterJoinMode::ALLOW, R"(
+The mode for a query that [`object_storage_cluster_join_mode`](#object_storage_cluster_join_mode) `= 'distributed'` does not send whole to the cluster, for example because one of its tables is not from a `DataLake` catalog. Has no effect with any other `object_storage_cluster_join_mode`.
+
+Possible values:
+
+- `allow` — Default. Behave as `object_storage_cluster_join_mode = 'allow'`.
+- `global` — Behave as `object_storage_cluster_join_mode = 'global'`.
+- `local` — Deprecated legacy alias of `allow`.
+
+`distributed` is not a valid value.
 )", 0) \
     \
     DECLARE(UInt64, max_concurrent_queries_for_all_users, 0, R"(
