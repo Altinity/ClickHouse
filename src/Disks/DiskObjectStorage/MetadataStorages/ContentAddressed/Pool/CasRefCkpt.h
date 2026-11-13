@@ -108,6 +108,9 @@ inline bool ckptContributionRecorded(CkptPublishOutcome outcome)
 ///   - a contribution whose `life_epoch` is BELOW the durable one raises `CORRUPTED_DATA`, decided
 ///     before the merge, so no body is built and no write is sent. This rule and the frontier verdicts
 ///     HAVE to live here rather than in `mergeCkpt`: only this function knows which side is durable.
+///   - a contribution `mergeCkpt` rejects (a frontier that skips an epoch, a broken seal invariant) raises
+///     `CORRUPTED_DATA` for an admitted writer, decided before any write. A writer that already lost
+///     admission gets `FencedOut` instead.
 ///   - exhausting the policy under persistent conflict throws the retry-later class. No partial state
 ///     exists to clean up: every attempt either committed the complete merged body or changed nothing.
 CkptPublishOutcome publishCkpt(CasOperation & op, const Layout & layout, const NamespaceLifeId & life,

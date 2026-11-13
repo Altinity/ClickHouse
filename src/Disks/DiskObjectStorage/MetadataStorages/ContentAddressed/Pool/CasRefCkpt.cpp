@@ -287,7 +287,24 @@ CkptPublishOutcome publishCkpt(CasOperation & op, const Layout & layout, const N
         /// created from the contribution as it stands, so a publisher that knows only the checkpoint
         /// creates one that knows only the checkpoint, and the birth transaction's `life_epoch` merges
         /// into it whenever it arrives -- in either order, because the merge is a per-field maximum.
-        const RefCkpt merged = durable ? mergeCkpt(*durable, contribution) : contribution;
+        RefCkpt merged = contribution;
+        if (durable)
+        {
+            /// `durable` already decoded and passed the invariants, so a merge that throws rejects the
+            /// contribution's relation to it. As with the `life_epoch` rule above, the fence picks the
+            /// verdict: a writer that already lost admission is a zombie with a stale contribution.
+            try
+            {
+                merged = mergeCkpt(*durable, contribution);
+            }
+            catch (const Exception & e)
+            {
+                if (e.code() != ErrorCodes::CORRUPTED_DATA || op.admitted())
+                    throw;
+                decline = Decline::Fenced;
+                return std::nullopt;
+            }
+        }
 
         /// Nothing new: write NOTHING. This is not an optimization -- both writers publish on every
         /// snapshot and every seal, and most of those carry a checkpoint the object already has, so
