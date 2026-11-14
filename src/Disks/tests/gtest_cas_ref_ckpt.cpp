@@ -66,6 +66,10 @@ namespace
 const RefTxnId ID_1_1{1, 1};
 const RefTxnId ID_1_2{1, 2};
 const RefTxnId ID_2_1{2, 1};
+const RefTxnId ID_1_3{1, 3};
+const RefTxnId ID_1_4{1, 4};
+const RefTxnId ID_2_2{2, 2};
+const RefTxnId ID_2_3{2, 3};
 
 PoolPtr openPool(const BackendPtr & backend)
 {
@@ -642,7 +646,8 @@ TEST(CASRefCheckpoint, AConflictRereadsAndMergesOntoTheWinner)
         if (interfered)
             return;
         interfered = true;
-        const RefCkpt sealer{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_2_1, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = ID_2_1};
+        /// Epoch 1 closed at `ID_1_3`, above our `ID_1_2`, so our contribution is one that seal covers.
+        const RefCkpt sealer{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_2_1, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = ID_1_3};
         overwriteObject(sealer_op, key, encodeRefCkpt(mergeCkpt(base, sealer)));
     };
 
@@ -653,7 +658,7 @@ TEST(CASRefCheckpoint, AConflictRereadsAndMergesOntoTheWinner)
     const auto sample = readCkpt(op, layout, life);
     ASSERT_TRUE(sample.has_value());
     EXPECT_EQ(sample->ckpt.checkpoint_snapshot_id, ID_1_2) << "our own contribution must land";
-    EXPECT_EQ(sample->ckpt.last_epoch_seal, ID_2_1)
+    EXPECT_EQ(sample->ckpt.last_epoch_seal, ID_1_3)
         << "the concurrent writer's seal must survive our retry -- a retry that reused the body read "
            "before the conflict would silently drop it (TLC `_sab_sealclobbersbase`)";
     EXPECT_EQ(sample->ckpt.life_epoch, 1u);
@@ -674,7 +679,8 @@ TEST(CASRefCheckpoint, AnIdenticalMergedBodyIssuesNoWrite)
     const RootNamespace ns{"srv1/ckpt_noop"};
     const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(ns);
     const String key = layout.refCkptKey(life);
-    const RefCkpt full{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_2_1, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = ID_2_1};
+    /// Epoch 1 closed at `ID_1_3`, so the older contribution below is a straggler that seal covers.
+    const RefCkpt full{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_2_1, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = ID_1_3};
 
     ASSERT_EQ(publishCkpt(op, layout, life, full), CkptPublishOutcome::Published);
     const uint64_t writes_after_create = backend->writes(key);
@@ -855,8 +861,9 @@ TEST(CASRefCheckpoint, AnAmbiguousWriteAcceptsAValidDominatingDurableFrontier)
                        .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
     const RefCkpt contribution{.life_epoch = std::nullopt, .committed_through = ID_1_2,
                                .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    /// The shape an honest successor leaves after our `ID_1_2` landed: epoch 1 sealed above it.
     const RefCkpt dominating{.life_epoch = 1, .committed_through = ID_2_1,
-                             .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = ID_2_1};
+                             .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = ID_1_3};
     ASSERT_TRUE(std::holds_alternative<Committed>(op.create(key, encodeRefCkpt(base), Retry::standard())));
     backend->dominating_bytes = encodeRefCkpt(dominating);
     backend->arm(key, CkptProbeBackend::Fault::CommitThenThrow);
@@ -1045,6 +1052,185 @@ TEST(CASRefCheckpoint, ACorruptCheckpointIsNeverOverwritten)
     ASSERT_TRUE(still_there.has_value());
     EXPECT_EQ(still_there->bytes, garbage) << "corruption must be surfaced, never laundered into a "
                                               "well-formed object";
+}
+
+/// A late append can land in a seal slot that cleanup reclaimed. `mergeCommittedThrough` accepts its
+/// frontier by numeric comparison, so these verdicts are decided before the merge, write nothing, and
+/// must not read as `IdenticalSkip`, which a caller acknowledges.
+namespace
+{
+
+CkptPublishOutcome publishAgainstDurable(const RefCkpt & durable, const RefCkpt & contribution, std::string_view ns_name)
+{
+    auto backend = std::make_shared<CkptProbeBackend>();
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout layout{"p"};
+    const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(RootNamespace{String{ns_name}});
+    const String key = layout.refCkptKey(life);
+    EXPECT_EQ(publishCkpt(op, layout, life, durable), CkptPublishOutcome::Published);
+    const uint64_t writes_before = backend->writes(key);
+
+    const CkptPublishOutcome outcome = publishCkpt(op, layout, life, contribution);
+
+    EXPECT_EQ(backend->writes(key), writes_before) << "no verdict here may write";
+    EXPECT_EQ(readCkptOrFail(op, layout, life), durable);
+    return outcome;
+}
+
+RefCkpt frontierOnly(const RefTxnId & committed_through, const std::optional<RefTxnId> & chain_link = std::nullopt)
+{
+    return RefCkpt{.life_epoch = std::nullopt, .committed_through = committed_through,
+                   .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = chain_link};
+}
+
+}
+
+/// Epoch 2 sealed epoch 1 at `ID_1_3`, appended and snapshotted; cleanup deleted the seal object and the
+/// epoch-1 zombie's create of `ID_1_3` landed in the empty key. The seal is history, the record is not.
+TEST(CASRefCheckpoint, PublishRefusesNonSealAtDurableSeal)
+{
+    const RefCkpt durable{.life_epoch = 1, .committed_through = ID_2_2, .checkpoint_snapshot_id = ID_2_2,
+                          .last_epoch_seal = ID_1_3};
+    EXPECT_EQ(publishAgainstDurable(durable, frontierOnly(ID_1_3), "srv1/ckpt_seal_slot"),
+              CkptPublishOutcome::SuccessorSeal);
+}
+
+/// Three epochs: epoch 3 sealed epoch 2 at `ID_2_3` after cleanup deleted epoch 1's seal at `ID_1_3`.
+/// The durable seal no longer says where epoch 1 closed, so the zombie's `ID_1_3` is neither
+/// acknowledged nor rejected.
+TEST(CASRefCheckpoint, PublishRefusesLowerEpochPastLaterSeal)
+{
+    const RefCkpt durable{.life_epoch = 1, .committed_through = ID_2_3, .checkpoint_snapshot_id = ID_2_2,
+                          .last_epoch_seal = ID_2_3};
+    EXPECT_EQ(publishAgainstDurable(durable, frontierOnly(ID_1_3), "srv1/ckpt_superseded"),
+              CkptPublishOutcome::Superseded);
+}
+
+/// Our first attempt lands and its response is lost; before the resolving read, a successor adopts the
+/// record and a later epoch seals the successor's. The verdict is `Superseded` although our write did
+/// land, which is why that outcome claims nothing about whether this call wrote.
+TEST(CASRefCheckpoint, SupersededAfterOwnAttemptLandedIsUnresolvedNotUnwritten)
+{
+    auto backend = std::make_shared<CkptProbeBackend>();
+    DB::Cas::tests::FakeClock clock;
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    requests.setNowFnForTest(clock.nowFn());
+    requests.setSleepFnForTest(clock.sleepFn());
+    CasOperation op = requests.admit();
+    const Layout layout{"p"};
+    const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(RootNamespace{"srv1/ckpt_superseded_after_landing"});
+    const String key = layout.refCkptKey(life);
+    const RefCkpt base{.life_epoch = 1, .committed_through = ID_1_1,
+                       .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    const RefCkpt resealed{.life_epoch = 1, .committed_through = ID_2_3,
+                           .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = ID_2_3};
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(key, encodeRefCkpt(base), Retry::standard())));
+    backend->dominating_bytes = encodeRefCkpt(resealed);
+    backend->arm(key, CkptProbeBackend::Fault::CommitThenThrow);
+
+    EXPECT_EQ(publishCkpt(op, layout, life, frontierOnly(ID_1_2)), CkptPublishOutcome::Superseded);
+    EXPECT_EQ(backend->journal, (std::vector<String>{"READ", "WRITE", "READ"}))
+        << "the first attempt was sent and committed; only the verdict after the resolving read is Superseded";
+    backend->watched_key.clear();
+    EXPECT_EQ(readCkptOrFail(op, layout, life), resealed);
+}
+
+/// The successor's walk adopted `ID_1_3` before sealing at `ID_1_4`, so `ID_1_3` is history and its late
+/// publication is still a skip. Same for a frontier in the durable epoch.
+TEST(CASRefCheckpoint, PublishStillSkipsAdoptedStraggler)
+{
+    const RefCkpt durable{.life_epoch = 1, .committed_through = ID_2_2, .checkpoint_snapshot_id = std::nullopt,
+                          .last_epoch_seal = ID_1_4};
+    EXPECT_EQ(publishAgainstDurable(durable, frontierOnly(ID_1_3), "srv1/ckpt_straggler"),
+              CkptPublishOutcome::IdenticalSkip);
+    EXPECT_EQ(publishAgainstDurable(durable, frontierOnly(ID_2_1, ID_1_4), "srv1/ckpt_same_epoch"),
+              CkptPublishOutcome::IdenticalSkip);
+}
+
+/// A seal contribution names its own frontier, so it is never refused at the seal it is: a recovery that
+/// republishes the seal it already recorded is a skip, not `SuccessorSeal`.
+TEST(CASRefCheckpoint, PublishStillSkipsARepublishedSeal)
+{
+    const RefCkpt durable{.life_epoch = 1, .committed_through = ID_2_2, .checkpoint_snapshot_id = std::nullopt,
+                          .last_epoch_seal = ID_1_3};
+    EXPECT_EQ(publishAgainstDurable(durable, frontierOnly(ID_1_3, ID_1_3), "srv1/ckpt_seal_republished"),
+              CkptPublishOutcome::IdenticalSkip);
+}
+
+/// Above the seal of its own epoch: epoch 1 closed at `ID_1_3`, so `ID_1_4` is not history. The merge
+/// would reject the pair as `CORRUPTED_DATA`; a deposed writer's late frontier is not corruption, and the
+/// unresolved verdict is enough to keep it unacknowledged.
+TEST(CASRefCheckpoint, PublishRefusesAFrontierAboveItsEpochSeal)
+{
+    const RefCkpt durable{.life_epoch = 1, .committed_through = ID_2_2, .checkpoint_snapshot_id = std::nullopt,
+                          .last_epoch_seal = ID_1_3};
+    EXPECT_EQ(publishAgainstDurable(durable, frontierOnly(ID_1_4), "srv1/ckpt_above_epoch_seal"),
+              CkptPublishOutcome::Superseded);
+}
+
+/// Two epochs behind the durable frontier. The merge would reject the pair as `CORRUPTED_DATA`; a
+/// deposed writer's late frontier is not corruption.
+TEST(CASRefCheckpoint, PublishRefusesAFrontierTwoEpochsBehind)
+{
+    const RefCkpt durable{.life_epoch = 1, .committed_through = RefTxnId{3, 2}, .checkpoint_snapshot_id = std::nullopt,
+                          .last_epoch_seal = ID_2_3};
+    EXPECT_EQ(publishAgainstDurable(durable, frontierOnly(ID_1_3), "srv1/ckpt_two_epochs_behind"),
+              CkptPublishOutcome::Superseded);
+}
+
+/// A frontier from an epoch below the durable body's `life_epoch` predates the life, so one life cannot
+/// produce this pair. With no epoch seal in the body, the contribution is refused as superseded.
+TEST(CASRefCheckpoint, PublishRefusesLowerEpochAtADurableBodyWithoutAnEpochSeal)
+{
+    const RefCkpt durable{.life_epoch = 2, .committed_through = ID_2_2, .checkpoint_snapshot_id = std::nullopt,
+                          .last_epoch_seal = std::nullopt};
+    EXPECT_EQ(publishAgainstDurable(durable, frontierOnly(ID_1_3), "srv1/ckpt_later_epoch_no_seal"),
+              CkptPublishOutcome::Superseded);
+}
+
+/// The refusal rule compares frontiers, so a durable body that records no frontier yet cannot refuse one:
+/// the contribution is merged and written.
+TEST(CASRefCheckpoint, AFrontierContributionIsMergedIntoADurableBodyWithoutAFrontier)
+{
+    auto backend = std::make_shared<CkptProbeBackend>();
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout layout{"p"};
+    const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(RootNamespace{"srv1/ckpt_durable_without_frontier"});
+    const RefCkpt durable{.life_epoch = 1, .committed_through = std::nullopt, .checkpoint_snapshot_id = std::nullopt,
+                          .last_epoch_seal = std::nullopt};
+    ASSERT_EQ(publishCkpt(op, layout, life, durable), CkptPublishOutcome::Published);
+
+    EXPECT_EQ(publishCkpt(op, layout, life, frontierOnly(ID_1_3)), CkptPublishOutcome::Published);
+
+    const RefCkpt expected{.life_epoch = 1, .committed_through = ID_1_3, .checkpoint_snapshot_id = std::nullopt,
+                           .last_epoch_seal = std::nullopt};
+    EXPECT_EQ(readCkptOrFail(op, layout, life), expected);
+}
+
+/// Only the two outcomes after which a caller may act on a contribution are "recorded". The switch has no
+/// `default`, so an added enumerator fails to compile here until its row is decided.
+TEST(CASRefCheckpoint, OnlyPublishedAndIdenticalSkipAreRecorded)
+{
+    for (const CkptPublishOutcome outcome : {CkptPublishOutcome::Published, CkptPublishOutcome::IdenticalSkip,
+                                             CkptPublishOutcome::FencedOut, CkptPublishOutcome::SuccessorSeal,
+                                             CkptPublishOutcome::Superseded})
+    {
+        bool expected = false;
+        switch (outcome)
+        {
+            case CkptPublishOutcome::Published:
+            case CkptPublishOutcome::IdenticalSkip:
+                expected = true;
+                break;
+            case CkptPublishOutcome::FencedOut:
+            case CkptPublishOutcome::SuccessorSeal:
+            case CkptPublishOutcome::Superseded:
+                break;
+        }
+        EXPECT_EQ(ckptContributionRecorded(outcome), expected);
+    }
 }
 
 /// ---------------------------------------------------------------------------------------------

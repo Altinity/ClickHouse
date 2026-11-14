@@ -54,6 +54,8 @@ protected:
     bool is_finished{false};
     bool has_next_batch{true};
     bool deactivated{false};
+    /// When false, the next batch is requested only once the consumer needs it.
+    bool prefetch_next_batch = true;
 
     mutable std::recursive_mutex mutex;
     ThreadPool list_objects_pool;

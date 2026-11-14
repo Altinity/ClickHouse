@@ -31,6 +31,7 @@
 #include <Poco/Util/AbstractConfiguration.h>
 #include <base/sleep.h>
 #include <chrono>
+#include <limits>
 #include <filesystem>
 #include <ctime>
 #include <unordered_set>
@@ -90,6 +91,7 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 gc_bulk_delete_chunk_keys;
     extern const ContentAddressedSettingsUInt64 attempt_timeout_ms;
     extern const ContentAddressedSettingsUInt64 lease_safety_margin_ms;
+    extern const ContentAddressedSettingsUInt64 request_window_ms;
     extern const ContentAddressedSettingsBool blob_hash_allow_new;
 }
 
@@ -315,6 +317,7 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , gc_bulk_delete_chunk_keys(settings_[ContentAddressedSetting::gc_bulk_delete_chunk_keys].value)
     , cas_attempt_timeout_ms(settings_[ContentAddressedSetting::attempt_timeout_ms].value)
     , cas_lease_safety_margin_ms(settings_[ContentAddressedSetting::lease_safety_margin_ms].value)
+    , cas_request_window_ms(settings_[ContentAddressedSetting::request_window_ms].value)
     , staging_backend(settings_.stagingBackend())
     , blob_hash_algo(settings_.blobHashAlgo())
     , blob_hash_allow_new(settings_[ContentAddressedSetting::blob_hash_allow_new].value)
@@ -807,6 +810,7 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     pool_config.gc_bulk_delete_chunk_keys = gc_bulk_delete_chunk_keys;
     pool_config.cas_request_budget.attempt_timeout_ms = cas_attempt_timeout_ms;
     pool_config.cas_request_budget.lease_safety_margin_ms = cas_lease_safety_margin_ms;
+    setCasRequestWindow(pool_config.cas_request_budget, cas_request_window_ms);
     /// Frozen here, once: see `freezeConnectTimeoutCapMs`. A later reload that widens the disk's
     /// connect timeout cannot widen the envelope the lease arithmetic was validated against.
     pool_config.cas_request_budget.connect_timeout_cap_ms = freezeConnectTimeoutCapMs(object_storage, cas_attempt_timeout_ms);
@@ -2205,10 +2209,10 @@ bool ContentAddressedMetadataStorage::ownsNamespace(const String & other_server_
 CasConfirmAnswer ContentAddressedMetadataStorage::confirmExactRef(
     const String & root_namespace, const String & ref_name, const String & manifest_ref_text) const
 {
-    /// Gate 1 of the relink confirm: a thin forward to the ledger, whose declaration
-    /// (`CasRefLedger::confirmExactRef`) carries the six-rule snapshot and the zero-I/O contract. This
-    /// layer adds exactly two things: the token text is decoded here, and the disk's own lifecycle is
-    /// answered as `Unknown` instead of as an exception.
+    /// Gate 1 of the relink confirm: a thin forward to the pool, whose `confirmExactRef` adds the
+    /// mount-slot read to the ledger's six-rule snapshot (`CasRefLedger::confirmExactRef`). This
+    /// layer adds exactly two things: the token text is decoded here, and the disk's own lifecycle and
+    /// a failed slot read are answered as `Unknown` instead of as an exception.
     const auto manifest_ref = Cas::tryParseManifestRef(manifest_ref_text);
     if (!manifest_ref)
     {
@@ -2217,6 +2221,14 @@ CasConfirmAnswer ContentAddressedMetadataStorage::confirmExactRef(
             "the canonical epoch:build:ordinal form", ref_name, root_namespace, manifest_ref_text);
         return CasConfirmAnswer::Unknown;
     }
+
+    const auto unanswerable = [&](const String & reason)
+    {
+        LOG_DEBUG(getLogger("ContentAddressedMetadataStorage"),
+            "Relink confirm for ref '{}' in namespace '{}' is unanswerable on disk '{}': {}",
+            ref_name, root_namespace, disk_name, reason);
+        return CasConfirmAnswer::Unknown;
+    };
 
     Cas::ConfirmAnswer answer = Cas::ConfirmAnswer::Unknown;
     try
@@ -2227,17 +2239,15 @@ CasConfirmAnswer ContentAddressedMetadataStorage::confirmExactRef(
         checkOpAdmitted(CasOpClass::ContentRead);
         answer = store()->confirmExactRef(Cas::RootNamespace{root_namespace}, ref_name, *manifest_ref);
     }
+    /// Only `Yes` authorizes, and no `catch` can produce a `Yes`. The slot read can also fail with a
+    /// transport exception that is not a `DB::Exception`, hence the second clause.
     catch (const Exception & e)
     {
-        /// This is NOT a fallback path: `Unknown` is the typed refusal this primitive is built around,
-        /// not an alternate behavior substituted for a failed one. Nothing consequential happens on it --
-        /// the receiver aborts its prepared relink and retries later -- so swallowing the lifecycle
-        /// refusal costs a retry and can never authorize anything. Only `Yes` authorizes, and no `catch`
-        /// can produce a `Yes`.
-        LOG_DEBUG(getLogger("ContentAddressedMetadataStorage"),
-            "Relink confirm for ref '{}' in namespace '{}' is unanswerable on disk '{}': {}",
-            ref_name, root_namespace, disk_name, e.message());
-        return CasConfirmAnswer::Unknown;
+        return unanswerable(e.message());
+    }
+    catch (...)
+    {
+        return unanswerable(getCurrentExceptionMessage(false));
     }
 
     switch (answer)

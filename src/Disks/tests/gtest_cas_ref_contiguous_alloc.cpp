@@ -303,7 +303,7 @@ TEST(CASPoolMeta, GcShardsIsPersistedAndOverridesMismatchedReopenConfig)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
     const PoolMeta created = PoolMeta::createOrValidate(
         op, layout, /*blob_header_len=*/256, /*gc_shards=*/4,
@@ -360,7 +360,7 @@ TEST(CASRefContiguousAlloc, NeedsRecoveryReplaysBeforeAllocatingTheNextId)
     /// The durable stream itself is dense: `1`, `2`, `3` all exist as objects. `ns` was born through
     /// the REAL append lane (Stage B Task 4-C), so its objects sit at a real catalog-minted incarnation,
     /// not the Stage-A sentinel -- resolve it the same way production discovery does.
-    CasRequests catalog_requests(backend, Fence::open());
+    CasRequests catalog_requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation catalog_op = catalog_requests.admit();
     const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(catalog_op, store->layout(), ns).value();
     for (uint64_t seq = 1; seq <= 3; ++seq)

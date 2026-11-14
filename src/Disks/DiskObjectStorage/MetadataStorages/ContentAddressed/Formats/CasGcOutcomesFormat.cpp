@@ -46,6 +46,15 @@ OutcomeKind outcomeKindFromWireWord(std::string_view w)
     return kOutcomeKindWords.fromWord(w, "CAS outcome log outcome kind");
 }
 
+uint64_t outcomeRowEncodedBound(const OutcomeEntry & entry)
+{
+    /// Field names, quotes and separators, the word fields and a 64-character hex digest, all at their
+    /// longest. The token value is the only free-form field; JSON escaping can grow a byte six-fold.
+    constexpr uint64_t kFixedBound = 192;
+    constexpr uint64_t kMaxEscapedBytesPerChar = 6;
+    return kFixedBound + kMaxEscapedBytesPerChar * entry.token.value.size();
+}
+
 String encodeOutcomeLog(const OutcomeLog & log)
 {
     CasJsonWriter out(256);

@@ -164,6 +164,22 @@ directly (the raw disk, not the cache) was refused with `All parts of partition 
 already on disk 'cas_cache'. (UNKNOWN_DISK)` — a real error message from the run, kept here because
 it is exactly what an operator sees after guessing the wrong disk name.
 
+## Upgrading a pool to the 120 s lease default {#upgrade-lease-default}
+
+The new default lease is 120 s. A server built before the declared-lease rule (before
+`v26.6.8.20003`; in the 26.8 line, before the merge of
+https://github.com/Altinity/ClickHouse/pull/2805) can fence a 120 s holder while it can still write, so
+a pool that still has such a server must be upgraded in these steps:
+
+1. Set `cas_mount_lease_ttl_ms` to `30000` in the disk block of every server you are about to upgrade.
+   This pin is required, not optional.
+2. Upgrade the servers one at a time.
+3. After every server of the pool runs a build with the rule, remove the pin and restart each server.
+4. Set `cas_request_window_ms`, if you need it, only now: older builds refuse the key.
+
+What happens without the pin, and the other upgrade notes, are in
+[upgrading to the 120 s lease](/antalya/cas/configuration#upgrading-lease-defaults).
+
 ## Removing a pool member {#decommission}
 
 A `CAS` pool can be shared by several servers (see [`server_root_id`](/antalya/cas/architecture/mounts-and-leases#server-root-id)).
@@ -211,7 +227,7 @@ that id after the run starts empty. The command claims the slot without waiting
 and trusts no wall clock, so it accepts only a terminal slot in `system.cas_mounts`:
 `state = 'terminated'` (clean stop) or `state = 'fenced'` (GC fenced the lease). A `live` or `expired`
 row is refused with `alive or contended`; a hard-killed member stays `expired` until the disk's GC leader fences it at the start of a GC round, once it has seen the lease unchanged for about one
-`cas_mount_lease_ttl_ms` plus one `cas_mount_renew_period_ms`; the wait can be one GC round longer. `SYSTEM CAS GC RUN` on the leader
+`cas_mount_lease_ttl_ms` plus one `cas_mount_renew_period_ms` (about 136 s with the default 120 s lease: 120 s + 6 s for the 5 % term + 10 s for one renewal period, from the formula, not measured); the wait can be up to two GC intervals longer. `SYSTEM CAS GC RUN` on the leader
 (`is_leader = 1` in `system.cas_mounts`) can trigger the fence, but the run that fences must come at
 least that long after the first run that saw the lease; two back-to-back runs do not fence.
 
@@ -237,7 +253,7 @@ The start rejoins only after the decommission finished:
 | `cannot rejoin` | `epoch` or `mount` is missing: the id was retired by 26.6.4 or the object was deleted by hand. Configure a new `cas_server_root_id` |
 | `decommission is not finished` | finish the decommission under the [rerun rule](#rejoin-rerun-rule) until `member_retired = 1`, then restart |
 | `previous life remains` | the message names the part left, and for catalog rows the first namespaces and their state. Catalog rows or manifests: run `SYSTEM CAS GC RUN '<disk>'` on the GC leader, `is_leader = 1` (it can take several rounds) and restart. A row that stays `removing` for many rounds is held by GC: the leader counts it in `CASGCStuckRemovals` and its stuck-removal warning names the reason. An object under `roots/<server_root_id>/`: delete it by hand and restart |
-| `still running` | a decommission run, a killed run or an interrupted restart holds the slot: wait for the run to finish, or for the lease to lapse and GC to fence it (up to one GC round after the lease threshold), then restart |
+| `still running` | a decommission run, a killed run or an interrupted restart holds the slot: wait for the run to finish, or for the lease to lapse and GC to fence it (up to two GC intervals after the lease threshold), then restart |
 | `kept changing` | other starts or a decommission run kept rewriting the owner or the slot during this start: restart |
 | `no server uuid` | the process (for example `clickhouse disks` before a uuid file exists) has no server uuid and never rejoins: start the server that should own the id |
 
@@ -253,7 +269,7 @@ Rerun `SYSTEM CAS DROP POOL MEMBER` to finish a decommission only while both hol
 - no decommission of that id is running.
 
 A run killed after its tombstone leaves the row `live`, then `expired`, then `retired` with
-`retirement_verified = 0` once GC fences its lease, up to one GC round after the lease threshold. A run killed
+`retirement_verified = 0` once GC fences its lease, up to two GC intervals after the lease threshold. A run killed
 before its tombstone ends `fenced` with the owner not retired. Do not rerun on any other state. `retired` with
 `retirement_verified = 1` is finished: restart the member to rejoin. A `live`, `expired`, `terminated` or
 `fenced` row belongs to whoever owns the id now, a rejoined member included, and a rerun would delete its data.

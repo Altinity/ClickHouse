@@ -21,7 +21,9 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ProfileEvents
@@ -647,4 +649,24 @@ TEST(CASRefSnapshotPublishOrdering, NotReadyRefusalBacksOffAndResetsAfterDurable
     EXPECT_EQ(
         store->newestPublishedSnapshotIdForTest(ns),
         std::make_optional(RefTxnId{store->writerEpoch(), 7}));
+}
+
+TEST(CASRefSnapshotPublishOrdering, LaneStateNamesCoverEveryState)
+{
+    const std::vector<RefLaneState> states{
+        RefLaneState::Ready,
+        RefLaneState::Writing,
+        RefLaneState::Wedged,
+        RefLaneState::NeedsRecovery,
+        RefLaneState::Closed,
+        RefLaneState::Faulted,
+    };
+    std::set<std::string_view> names;
+    for (const auto state : states)
+    {
+        const auto name = refLaneStateName(state);
+        EXPECT_FALSE(name.empty()) << "state " << static_cast<int>(state);
+        names.insert(name);
+    }
+    EXPECT_EQ(names.size(), states.size());
 }

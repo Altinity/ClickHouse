@@ -1,11 +1,13 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <optional>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Common/ProfileEvents.h>
 #include "cas_test_helpers.h"
@@ -1043,8 +1045,8 @@ TEST(CASGCRound, SharedBlobSparedUntilBothRefsDrop)
 /// BEFORE graduation -- a fresh manifest re-references all five (the `CASThreeCursorMerge.RecoverySpares`
 /// shape, scaled up and driven through the real round path): recovery wins unconditionally for every one
 /// of them. `CASGCRetiredSpared` and blob survival prove all five decisions happened regardless of the
-/// budget, but with a budget of 2, only 2 of the 5 get a row in the round's `GcOutcomes` log, so
-/// `RoundReport::spared` (tallied from that log) reports 2, not 5.
+/// budget. With a budget of 2, only 2 of the 5 get a row in the round's `GcOutcomes` log, yet
+/// `RoundReport::spared` counts all 5 and the phase row reports the 3 dropped rows.
 TEST(CASGCRound, OutcomeEntryBudgetCapsSparedLogRowsWithoutRecondemning)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -1084,13 +1086,20 @@ TEST(CASGCRound, OutcomeEntryBudgetCapsSparedLogRowsWithoutRecondemning)
     publishCommittedTransition(*backend, store->layout(), ns, "tbl2", std::nullopt, r2);
 
     const auto spared_events_before = ProfileEvents::global_counters[ProfileEvents::CASGCRetiredSpared];
+    std::optional<std::map<String, UInt64>> pending_metrics;
+    gc.setPhaseSink([&](const GcPhaseRecord & rec)
+    {
+        if (rec.phase == "pending_deletes")
+            pending_metrics = rec.metrics;
+    });
     const RoundReport rep = runRegularRoundReclaiming(gc);
+    gc.setPhaseSink({});
     ASSERT_TRUE(rep.acquired_lease);
-    const uint64_t total_spared_reported = rep.spared;
 
-    /// THE LOAD-BEARING ASSERTION: the audit log under-reports (capped at the budget) while every
-    /// decision it under-reports still happened correctly.
-    EXPECT_EQ(total_spared_reported, 2u)
+    EXPECT_EQ(rep.spared, static_cast<uint64_t>(kBlobs)) << "the counter counts every decision, not every audit row";
+    ASSERT_TRUE(pending_metrics.has_value());
+    ASSERT_TRUE(pending_metrics->contains("outcome_rows_dropped"));
+    EXPECT_EQ(pending_metrics->at("outcome_rows_dropped"), static_cast<uint64_t>(kBlobs) - 2)
         << "GcOutcomes rows must be capped at gc_round_outcome_entry_budget, not one per spared entry";
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRetiredSpared] - spared_events_before, kBlobs)
         << "every spared decision must still happen even when its audit row is capped";
@@ -1100,6 +1109,244 @@ TEST(CASGCRound, OutcomeEntryBudgetCapsSparedLogRowsWithoutRecondemning)
             << "blob " << i << " must survive -- the cap must never re-condemn a spared entry";
         EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(i + 1)), 1);
     }
+}
+
+/// The outcome log of one shard has a byte limit below the format's object cap, accounted per appended
+/// row. Rows past it lose only their audit row: every blob is still deleted, the round succeeds and the
+/// written object decodes within the limit.
+TEST(CASGCRound, OutcomeLogStaysUnderItsByteLimit)
+{
+    constexpr uint64_t kByteLimit = 1500;
+    constexpr int kBlobs = 12;
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Pool::open(backend, PoolConfig{
+        .pool_prefix = "p", .server_root_id = "test",
+        .gc_fold_max_defer_rounds = 0,
+        .gc_outcome_log_byte_limit_for_test = kByteLimit});
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r1 = ref(1, 0xC1);
+
+    std::vector<ManifestEntry> entries;
+    for (int i = 0; i < kBlobs; ++i)
+    {
+        writeBlobBody(*backend, store->layout(), DB::UInt128(i + 1));
+        entries.push_back(blobEntryFor("p" + std::to_string(i), DB::UInt128(i + 1)));
+    }
+    writeManifestRaw(*backend, store->layout(), ns, r1, entries);
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
+
+    Gc gc(store, kGc);
+    driveToFixpoint(*backend, store, gc);
+    dropRefTransition(*backend, store->layout(), ns, "tbl", r1);
+    uint64_t deleted_reported = 0;
+    for (int round = 0; round < 8; ++round)
+    {
+        deleted_reported += runRegularRoundReclaiming(gc).deleted;
+        store->renewWatermarkOnce();
+    }
+
+    for (int i = 0; i < kBlobs; ++i)
+        EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(i + 1)))
+            << "blob " << i << " must still be deleted: the limit drops only audit rows";
+    EXPECT_EQ(deleted_reported, static_cast<uint64_t>(kBlobs)) << "rows past the byte limit are still counted";
+
+    size_t logs = 0;
+    size_t max_rows = 0;
+    String cursor;
+    while (true)
+    {
+        const ListPage page = listOf(*backend, "", cursor, 1000);
+        for (const ListedKey & listed : page.keys)
+        {
+            if (listed.key.find("/outcomes/") == String::npos)
+                continue;
+            const auto object = readOf(*backend, listed.key);
+            ASSERT_TRUE(object.has_value());
+            const String body = openObject(FormatId::GcOutcomes, object->bytes);
+            EXPECT_LE(body.size(), kByteLimit);
+            max_rows = std::max(max_rows, decodeOutcomeLog(body).entries.size());
+            ++logs;
+        }
+        if (page.next_cursor.empty())
+            break;
+        cursor = page.next_cursor;
+    }
+    ASSERT_GT(logs, 0u);
+    EXPECT_GT(max_rows, 0u);
+    EXPECT_LT(max_rows, static_cast<size_t>(kBlobs));
+}
+
+/// The byte limit is per shard: with blobs in two shards, each shard's log is cut at its own limit,
+/// each cut is named by one warning, and the round still counts every delete.
+TEST(CASGCRound, OutcomeLogByteLimitIsPerShardAndWarnsPerShard)
+{
+    constexpr uint64_t kByteLimit = 900;
+    constexpr int kBlobs = 12;
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Pool::open(backend, PoolConfig{
+        .pool_prefix = "p", .server_root_id = "test",
+        .gc_shards = 2,
+        .gc_fold_max_defer_rounds = 0,
+        .gc_outcome_log_byte_limit_for_test = kByteLimit});
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r1 = ref(1, 0xC1);
+
+    std::vector<ManifestEntry> entries;
+    for (int i = 0; i < kBlobs; ++i)
+    {
+        const UInt128 hash = i % 2 == 0 ? UInt128(i + 1) : ((UInt128{1} << 64) | UInt128(i + 1));
+        ASSERT_EQ(blobShard(legacyMetaTestRef(hash), 2), static_cast<uint64_t>(i % 2));
+        writeBlobBody(*backend, store->layout(), hash);
+        entries.push_back(blobEntryFor("p" + std::to_string(i), hash));
+    }
+    writeManifestRaw(*backend, store->layout(), ns, r1, entries);
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
+
+    Gc gc(store, kGc);
+    driveToFixpoint(*backend, store, gc);
+    dropRefTransition(*backend, store->layout(), ns, "tbl", r1);
+
+    uint64_t deleted_reported = 0;
+    uint64_t rows_dropped = 0;
+    gc.setPhaseSink([&](const GcPhaseRecord & rec)
+    {
+        if (rec.phase == "pending_deletes" && rec.metrics.contains("outcome_rows_dropped"))
+            rows_dropped += rec.metrics.at("outcome_rows_dropped");
+    });
+    ScopedLogCapture capture("CasGc", "warning");
+    for (int round = 0; round < 8; ++round)
+    {
+        deleted_reported += runRegularRoundReclaiming(gc).deleted;
+        store->renewWatermarkOnce();
+    }
+    gc.setPhaseSink({});
+
+    std::map<uint64_t, size_t> rows_by_shard;
+    String cursor;
+    while (true)
+    {
+        const ListPage page = listOf(*backend, "", cursor, 1000);
+        for (const ListedKey & listed : page.keys)
+        {
+            if (listed.key.find("/outcomes/") == String::npos)
+                continue;
+            const auto object = readOf(*backend, listed.key);
+            ASSERT_TRUE(object.has_value());
+            const String body = openObject(FormatId::GcOutcomes, object->bytes);
+            EXPECT_LE(body.size(), kByteLimit);
+            for (const OutcomeEntry & row : decodeOutcomeLog(body).entries)
+                ++rows_by_shard[blobShard(row.ref, 2)];
+        }
+        if (page.next_cursor.empty())
+            break;
+        cursor = page.next_cursor;
+    }
+
+    ASSERT_EQ(rows_by_shard.size(), 2u) << "both shards wrote an outcome log";
+    for (const auto & [shard, rows] : rows_by_shard)
+        EXPECT_LT(rows, static_cast<size_t>(kBlobs / 2)) << "shard " << shard << " was cut at its own limit";
+    EXPECT_EQ(deleted_reported, static_cast<uint64_t>(kBlobs));
+    EXPECT_EQ(rows_dropped, kBlobs - rows_by_shard[0] - rows_by_shard[1]);
+    EXPECT_EQ(capture.count("reached its"), 2u) << capture.captured();
+    for (int i = 0; i < kBlobs; ++i)
+    {
+        const UInt128 hash = i % 2 == 0 ? UInt128(i + 1) : ((UInt128{1} << 64) | UInt128(i + 1));
+        EXPECT_FALSE(blobExists(*backend, store->layout(), hash)) << "blob " << i;
+    }
+}
+
+/// The same byte limit applies to the `spared` rows: blobs condemned and then re-referenced before
+/// graduation are all spared, rows past the limit lose only their audit row, and the written log
+/// decodes within the limit.
+TEST(CASGCRound, SparedOutcomeLogStaysUnderItsByteLimit)
+{
+    constexpr uint64_t kByteLimit = 1500;
+    constexpr int kBlobs = 12;
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Pool::open(backend, PoolConfig{
+        .pool_prefix = "p", .server_root_id = "test",
+        .gc_fold_max_defer_rounds = 0,
+        .gc_outcome_log_byte_limit_for_test = kByteLimit});
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r1 = ref(1, 0xC1);
+    const ManifestRef r2 = ref(2, 0xC2);
+
+    std::vector<ManifestEntry> entries;
+    for (int i = 0; i < kBlobs; ++i)
+    {
+        writeBlobBody(*backend, store->layout(), DB::UInt128(i + 1));
+        entries.push_back(blobEntryFor("p" + std::to_string(i), DB::UInt128(i + 1)));
+    }
+    writeManifestRaw(*backend, store->layout(), ns, r1, entries);
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
+
+    Gc gc(store, kGc);
+    driveToFixpoint(*backend, store, gc);
+    dropRefTransition(*backend, store->layout(), ns, "tbl", r1);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    store->renewWatermarkOnce();
+
+    writeManifestRaw(*backend, store->layout(), ns, r2, entries);
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl2", std::nullopt, r2);
+
+    const auto spared_events_before = ProfileEvents::global_counters[ProfileEvents::CASGCRetiredSpared];
+    const RoundReport rep = runRegularRoundReclaiming(gc);
+    ASSERT_TRUE(rep.acquired_lease);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRetiredSpared] - spared_events_before, kBlobs);
+    EXPECT_EQ(rep.spared, static_cast<uint64_t>(kBlobs)) << "rows past the byte limit are still counted";
+
+    size_t spared_rows = 0;
+    size_t logs = 0;
+    String cursor;
+    while (true)
+    {
+        const ListPage page = listOf(*backend, "", cursor, 1000);
+        for (const ListedKey & listed : page.keys)
+        {
+            if (listed.key.find("/outcomes/") == String::npos)
+                continue;
+            const auto object = readOf(*backend, listed.key);
+            ASSERT_TRUE(object.has_value());
+            const String body = openObject(FormatId::GcOutcomes, object->bytes);
+            EXPECT_LE(body.size(), kByteLimit);
+            for (const OutcomeEntry & row : decodeOutcomeLog(body).entries)
+                spared_rows += row.outcome == OutcomeKind::Spared;
+            ++logs;
+        }
+        if (page.next_cursor.empty())
+            break;
+        cursor = page.next_cursor;
+    }
+    ASSERT_GT(logs, 0u);
+    EXPECT_GT(spared_rows, 0u);
+    EXPECT_LT(spared_rows, static_cast<size_t>(kBlobs));
+}
+
+/// The per-row bound the accounting uses never undercounts the real encoded row, for every outcome kind,
+/// token type and hash algorithm, and for tokens that JSON escaping expands.
+TEST(CASGCRound, OutcomeRowSizeBoundCoversTheEncoder)
+{
+    const std::vector<String> token_values = {"", "t", String(1000, 'e'), String(100, '"'), String(100, '\\'), String(100, '\x01')};
+    const String empty = encodeOutcomeLog(OutcomeLog{});
+    for (const auto & token_type : kTokenTypeWords.entries)
+    {
+        for (const BlobHashAlgo algo : {BlobHashAlgo::CityHash128, BlobHashAlgo::XXH3_128, BlobHashAlgo::Sha256})
+        {
+            for (const String & value : token_values)
+            {
+                for (const OutcomeKind kind : {OutcomeKind::Deleted, OutcomeKind::Absent, OutcomeKind::Replaced, OutcomeKind::Spared})
+                {
+                    BlobDigest digest;
+                    std::fill_n(digest.bytes.begin(), blobHashLenFor(algo), static_cast<uint8_t>(0xFF));
+                    OutcomeEntry entry{ObjectKind::Blob, BlobRef{algo, digest}, PersistedEtag{String(token_type.word), value}, kind};
+                    const String one_row = encodeOutcomeLog(OutcomeLog{{entry}});
+                    EXPECT_GE(outcomeRowEncodedBound(entry), one_row.size() - empty.size())
+                        << token_type.word << " " << blobHashAlgoName(algo) << " token size " << value.size();
+                }
+            }
+        }
+    }
+    EXPECT_GE(kOutcomeLogFramingBound, encodeOutcomeLog(OutcomeLog{}).size());
 }
 
 /// Spare-during-the-pass, multi-blob discrimination: a drop condemns two blobs; in the SAME window

@@ -224,6 +224,19 @@ struct GcPhaseRecord
 /// elsewhere (a unit test driving `Gc` directly emits nothing).
 using GcPhaseSink = std::function<void(const GcPhaseRecord &)>;
 
+/// What one `Gc::cleanupRefObjects` pass did and why it ended. All zero when the pass did not run.
+struct RefCleanupPassStats
+{
+    uint64_t objects_planned = 0;
+    uint64_t objects_deleted = 0;
+    /// Namespaces refused because their own catalog row or life changed; the pass went on.
+    uint64_t namespaces_skipped = 0;
+    bool stopped_lease_moved = false;
+    bool stopped_authority_unverified = false;
+    /// Chunks deleted while the catalog etag differed from the fold's cut.
+    uint64_t chunks_under_catalog_change = 0;
+};
+
 /// The round's one hint enumeration of `cas/ns/stream/`, taken before the defer decision and consumed by
 /// everything downstream: the DEFER signal (`changed_shards`), and — on a folding round — the strict
 /// grouping the fold works from (`keys`, regrouped by `groupRefKeys`).
@@ -551,6 +564,9 @@ private:
     /// Catalog-only helping barrier run immediately after lease acquisition. It validates the adopted
     /// parent and delegates deterministic `Removing`-row settlement to `CatalogLifecycleReconciler`.
     /// It performs no physical LIST or delete.
+    /// `completed_erases` is kept current while the drain runs, so it is valid after an exception.
+    CatalogLifecycleReconcileResult drainCompletedRemoving(const GcState & leased_state, uint64_t & completed_erases);
+    /// Same drain for callers that do not need the erase count.
     CatalogLifecycleReconcileResult drainCompletedRemoving(const GcState & leased_state);
 
     /// Run the independently paced physical namespace maintenance: pages from the persisted cursor while
@@ -753,6 +769,19 @@ private:
         std::exception_ptr exception;
     };
 
+    /// The settlement decisions of one shard in a round, counted where each is made: a decision whose
+    /// audit row the outcome-log limits dropped still counts.
+    struct OutcomeTally
+    {
+        uint64_t deleted = 0;
+        uint64_t absent = 0;
+        uint64_t replaced = 0;
+        uint64_t spared = 0;
+
+        void add(OutcomeKind kind);
+        uint64_t total() const { return deleted + absent + replaced + spared; }
+    };
+
     struct RedeleteRoundContext
     {
         uint64_t new_round;
@@ -761,6 +790,7 @@ private:
         GcRoundWorkBudget & round_work_budget;
         RoundReport & report;
         std::map<uint64_t, OutcomeLog> & outcomes;
+        std::map<uint64_t, OutcomeTally> & outcome_tallies;
         uint64_t & jobs_scheduled;
     };
 
@@ -877,13 +907,18 @@ private:
     /// in batches of <=1000 exact keys. A folded terminal's cleanup evidence carries its tail-covering
     /// snapshot id directly on the same ref-life row. Runs post-CAS and only on a clamp-free round.
     ///
+    /// Each chunk is licensed by its namespace's own catalog row and life and by the GC lease. A changed
+    /// own row or life skips that namespace and the pass continues; a moved GC lease, a failed read or an
+    /// ambiguous catalog stops the pass. `stats` reports the outcome and is reset on every call, including
+    /// early returns.
+    ///
     /// A listed `_snap` never licenses cleanup on its own: only `folded.checkpoints` whose exact
     /// same-id `_log` and `_snap` validate through `readCheckpointSnapshotBase` do. Logs and snapshots
     /// are then deletable only strictly BELOW that checkpoint (and logs also at or below the durable
     /// cursor). A namespace with no checkpoint base, or an invalid triple, is leak-only this pass.
     void cleanupRefObjects(
         const FoldResult & folded, const GcLease & adopted_lease, bool suppress_destructive,
-        GcRoundWorkBudget & work_budget);
+        GcRoundWorkBudget & work_budget, RefCleanupPassStats & stats);
 
     /// Emit the sweep's per-pass retention rollup, throttled (see `last_retain_rollup`). Separate from
     /// the pass itself so the phase row and the log line read the SAME counters rather than two

@@ -60,14 +60,16 @@ void IObjectStorageIteratorAsync::nextBatch()
         /// the listing, otherwise objects that live on a subsequent page are silently skipped.
         while (true)
         {
-            chassert(outcome_future.valid());
+            chassert(outcome_future.valid() || !prefetch_next_batch);
+            if (!outcome_future.valid())
+                outcome_future = scheduleBatch();
             BatchAndHasNext result = outcome_future.get();
 
             current_batch = std::move(result.batch);
             current_batch_iterator = current_batch.begin();
             has_next_batch = result.has_next;
 
-            if (has_next_batch)
+            if (has_next_batch && prefetch_next_batch)
                 outcome_future = scheduleBatch();
 
             if (!current_batch.empty())

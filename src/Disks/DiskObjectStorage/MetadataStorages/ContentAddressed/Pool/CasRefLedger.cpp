@@ -15,6 +15,7 @@
 #include <Common/ProfileEvents.h>
 #include <Common/setThreadName.h>
 #include <Common/ThreadPool.h>
+#include <base/defines.h>
 #include <base/sleep.h>
 #include <fmt/format.h>
 #include <algorithm>
@@ -74,6 +75,7 @@ namespace ProfileEvents
     extern const Event CASRefCheckpointPublished;
     extern const Event CASRefCheckpointIdenticalSkip;
     extern const Event CASRefCheckpointNotAdvanced;
+    extern const Event CASRefCheckpointFrontierRefused;
     extern const Event CASRefRecoveryEpochSealed;
     extern const Event CASRefRecoveryEpochSealAdopted;
     extern const Event CASRefRecoveryStragglerAdopted;
@@ -266,6 +268,11 @@ void CasRefLedger::refuseUnlessAdmitted(const CasOperation & op, std::string_vie
 {
     if (op.admitted())
         return;
+    throwNotAdmitted(what);
+}
+
+void CasRefLedger::throwNotAdmitted(std::string_view what) const
+{
     throwCasTransientUnavailable(
         fmt::format("content-addressed pool '{}'", server_root_id),
         fmt::format("{}: the operation is no longer admitted -- the mount lease has too little time left "
@@ -573,49 +580,136 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::lookupRefTableRunti
     return it == ref_name_slots.end() ? nullptr : it->second.current;
 }
 
-std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireRefTableRuntime(
-    const NamespaceLifeId & life, uint64_t admitted_generation)
+CasRefLedger::ColdAdmission::ColdAdmission(
+    CasRefLedger & ledger_, String name_, uint64_t retirements_seen_, uint64_t epoch_) noexcept
+    : ledger(&ledger_)
+    , name(std::move(name_))
+    , retirements_seen(retirements_seen_)
+    , epoch(epoch_)
 {
+}
+
+CasRefLedger::ColdAdmission::ColdAdmission(ColdAdmission && other) noexcept
+    : ledger(std::exchange(other.ledger, nullptr))
+    , name(std::move(other.name))
+    , retirements_seen(other.retirements_seen)
+    , epoch(other.epoch)
+{
+}
+
+CasRefLedger::ColdAdmission::~ColdAdmission()
+{
+    if (!ledger)
+        return;
+    std::lock_guard lock(ledger->ref_queue_mutex);
+    ledger->releaseColdAdmissionLocked(*this);
+}
+
+CasRefLedger::ColdAdmission CasRefLedger::beginColdAdmission(const RootNamespace & ns)
+{
+    String name = ns.string();
+    std::lock_guard lock(ref_queue_mutex);
+    RefNameSlot & slot = ref_name_slots[name];
+    ++slot.admissions_in_flight;
+    return ColdAdmission(*this, std::move(name), slot.retirements, ref_name_slots_epoch);
+}
+
+void CasRefLedger::releaseColdAdmissionLocked(ColdAdmission & admission)
+{
+    admission.ledger = nullptr;
+    /// A remount cleared the slot this admission counted in; a slot of the same name now belongs to
+    /// admissions captured after the remount.
+    if (admission.epoch != ref_name_slots_epoch)
+        return;
+    const auto it = ref_name_slots.find(admission.name);
+    chassert(it != ref_name_slots.end() && it->second.admissions_in_flight > 0);
+    if (it == ref_name_slots.end())
+        return;
+    --it->second.admissions_in_flight;
+    eraseNameSlotIfUnusedLocked(it);
+}
+
+void CasRefLedger::eraseNameSlotIfUnusedLocked(std::map<String, RefNameSlot>::iterator it)
+{
+    if (!it->second.current && it->second.admissions_in_flight == 0)
+        ref_name_slots.erase(it);
+}
+
+std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireRefTableRuntime(
+    const NamespaceLifeId & life, uint64_t admitted_generation, ColdAdmission & admission,
+    RuntimeAdmission kind)
+{
+    chassert(admission.ledger == this && admission.name == life.ns.string());
     refuseUnlessAdmitted(mount_requests.resume(admitted_generation), "ref-table runtime install");
 
     std::shared_ptr<RefTableRuntime> result;
     bool generation_moved = false;
+    bool slots_cleared_by_remount = false;
+    bool retired_since_observation = false;
     bool identity_conflict = false;
     {
         std::lock_guard lock(ref_queue_mutex);
         generation_moved = fence_generation_fn() != admitted_generation;
-        if (!generation_moved)
+        slots_cleared_by_remount = admission.epoch != ref_name_slots_epoch;
+        if (!generation_moved && !slots_cleared_by_remount)
         {
+            /// The admission keeps its slot alive, so a missing one is a bug; as in
+            /// `releaseColdAdmissionLocked`, a release build takes the safe exit and publishes nothing.
             const auto it = ref_name_slots.find(life.ns.string());
-            if (it != ref_name_slots.end() && it->second.current)
+            chassert(it != ref_name_slots.end());
+            /// The catalog row this life came from may have been removed and drained after the caller read
+            /// it; inserting then would publish a runtime for a life the janitor sweeps.
+            retired_since_observation = it == ref_name_slots.end() || it->second.retirements != admission.retirements_seen;
+            if (!retired_since_observation)
             {
-                const auto & current = it->second.current;
-                if (current->life == life
-                    && current->admitted_fence_generation == admitted_generation
-                    && !current->catalog_life_invalidated.load(std::memory_order_acquire)
-                    && !current->superseded_by_remount.load(std::memory_order_acquire))
-                    result = current;
+                RefNameSlot & slot = it->second;
+                if (slot.current)
+                {
+                    const auto & current = slot.current;
+                    if (current->life == life
+                        && current->admitted_fence_generation == admitted_generation
+                        && !current->catalog_life_invalidated.load(std::memory_order_acquire)
+                        && !current->superseded_by_remount.load(std::memory_order_acquire))
+                        result = current;
+                    else
+                        identity_conflict = true;
+                }
                 else
-                    identity_conflict = true;
-            }
-            else
-            {
-                result = std::make_shared<RefTableRuntime>(
-                    next_ref_runtime_id.fetch_add(1, std::memory_order_relaxed) + 1,
-                    life,
-                    admitted_generation);
-                ref_name_slots.emplace(life.ns.string(), RefNameSlot{.current = result});
+                {
+                    result = std::make_shared<RefTableRuntime>(
+                        next_ref_runtime_id.fetch_add(1, std::memory_order_relaxed) + 1,
+                        life,
+                        admitted_generation);
+                    slot.current = result;
+                }
             }
         }
+        releaseColdAdmissionLocked(admission);
     }
 
     if (generation_moved)
         refuseUnlessAdmitted(mount_requests.resume(admitted_generation), "ref-table runtime install");
-    if (identity_conflict)
-        throwCasWriteRetryLater(fmt::format(
-            "CAS namespace '{}': the cached runtime identity changed while publishing catalog life {}; "
+    if (slots_cleared_by_remount)
+        throwNotAdmitted("ref-table runtime install");
+    /// Same retryable class on both planes; a read must not claim a write was attempted.
+    const auto refuseStaleObservation = [&](const String & why)
+    {
+        if (kind != RuntimeAdmission::Write)
+            throwCasTransientUnavailable(fmt::format("CAS namespace '{}'", life.ns.string()), why);
+        throwCasWriteRetryLater(fmt::format("CAS namespace '{}': {}", life.ns.string(), why));
+    };
+    if (retired_since_observation && kind == RuntimeAdmission::PresenceProbe)
+        return nullptr;
+    if (retired_since_observation)
+        refuseStaleObservation(fmt::format(
+            "a life of this name was retired while life {} was being admitted; "
             "retry from a fresh catalog observation",
-            life.ns.string(), renderIncarnation(life.incarnation)));
+            renderIncarnation(life.incarnation)));
+    if (identity_conflict)
+        refuseStaleObservation(fmt::format(
+            "the cached runtime identity changed while publishing catalog life {}; "
+            "retry from a fresh catalog observation",
+            renderIncarnation(life.incarnation)));
     return result;
 }
 
@@ -637,13 +731,14 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireReadableRefT
         }
         if (current->catalog_life_invalidated.load(std::memory_order_acquire)
             || current->superseded_by_remount.load(std::memory_order_acquire))
-            throwCasWriteRetryLater(fmt::format(
-                "CAS namespace '{}': its cached life was detached; retry against a fresh observation",
-                ns.string()));
+            throwCasTransientUnavailable(
+                fmt::format("CAS namespace '{}'", ns.string()),
+                "its cached life was detached; retry against a fresh observation");
         return current;
     }
 
     const uint64_t admitted_generation = fence_generation_fn();
+    ColdAdmission admission = beginColdAdmission(ns);
     CasOperation op = mount_requests.resume(admitted_generation);
     const CasRefCatalog::Snapshot first_catalog = CasRefCatalog::read(op, layout);
     refuseUnlessAdmitted(op, "cold readable runtime admission");
@@ -675,25 +770,27 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireReadableRefT
         [&](const CatalogEntry & entry) { return entry.ns == ns; });
     const bool row_changed = second_it == second_catalog.catalog.entries.end() || !(*second_it == *it);
     if (row_changed)
-        throwCasWriteRetryLater(fmt::format(
-            "CAS namespace '{}': its catalog row changed while a cold reader observed life {}; "
-            "retry from a fresh catalog observation",
-            ns.string(), renderIncarnation(life.incarnation)));
+        throwCasTransientUnavailable(
+            fmt::format("CAS namespace '{}'", ns.string()),
+            fmt::format("its catalog row changed while a cold reader observed life {}; "
+                        "retry from a fresh catalog observation", renderIncarnation(life.incarnation)));
 
-    return acquireRefTableRuntime(life, admitted_generation);
+    return acquireRefTableRuntime(life, admitted_generation, admission, RuntimeAdmission::Read);
 }
 
 std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireMutableRefTableRuntime(
     const RootNamespace & ns)
 {
+    /// Captured before `namespaceLife`, whose answer may come from a runtime retired right after.
+    const uint64_t admitted_generation = fence_generation_fn();
+    ColdAdmission admission = beginColdAdmission(ns);
     const NamespaceLifeId life = namespaceLife(ns);
     if (const auto current = lookupRefTableRuntime(ns))
     {
         if (current->life == life)
             return current;
     }
-    const uint64_t admitted_generation = fence_generation_fn();
-    return acquireRefTableRuntime(life, admitted_generation);
+    return acquireRefTableRuntime(life, admitted_generation, admission, RuntimeAdmission::Write);
 }
 
 void CasRefLedger::invalidateRemovedCatalogLife(const NamespaceLifeId & life)
@@ -701,9 +798,15 @@ void CasRefLedger::invalidateRemovedCatalogLife(const NamespaceLifeId & life)
     std::shared_ptr<RefTableRuntime> rt;
     {
         std::lock_guard lock(ref_queue_mutex);
+        /// No slot: no admission of the name is in flight. After an observation of the removal a later
+        /// admission reads the catalog after it. Before a GC erase the row is still `Removing`, so a later
+        /// presence probe or drop may admit it; the drain calls this again once the erase resolved.
         const auto it = ref_name_slots.find(life.ns.string());
         if (it == ref_name_slots.end())
             return;
+        /// Recorded whatever is resident, a successor included: a cold admission of `life` may be
+        /// between its catalog read and its insertion, and the successor may be evicted before it.
+        ++it->second.retirements;
         rt = it->second.current;
         if (!rt)
             return;
@@ -726,7 +829,10 @@ void CasRefLedger::invalidateRemovedCatalogLife(const NamespaceLifeId & life)
         std::lock_guard queue_lock(ref_queue_mutex);
         const auto it = ref_name_slots.find(life.ns.string());
         if (it != ref_name_slots.end() && it->second.current == rt)
-            ref_name_slots.erase(it);
+        {
+            it->second.current.reset();
+            eraseNameSlotIfUnusedLocked(it);
+        }
     }
     rt->cv.notify_all();
     rt->recovery_cv.notify_all();
@@ -926,10 +1032,11 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
             .last_epoch_seal = refLogTxnIsEpochSeal(txn)
                 ? std::optional<RefTxnId>{txn.txn_id} : txn.prev_epoch_seal};
         checkRecoveryStillAdmitted(ns, rt, cancelled, token);
-        if (publishCkptContribution(op, life, contribution) == CkptPublishOutcome::FencedOut)
+        if (!ckptContributionRecorded(publishCkptContribution(op, life, contribution)))
             throwCasWriteRetryLater(fmt::format(
-                "CAS ref-table recovery for namespace '{}': the mount incarnation moved before the "
-                "checkpoint could record recovered txn {}-{}; nothing is installed",
+                "CAS ref-table recovery for namespace '{}': the mount incarnation moved, or a later epoch "
+                "sealed or passed it, before the checkpoint could record recovered txn {}-{}; nothing is "
+                "installed",
                 ns.string(), txn.txn_id.writer_epoch, txn.txn_id.ref_sequence));
 
         /// `publishCkptContribution` correctly merges a concurrent winner, but recovery's private
@@ -1253,7 +1360,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
                                    .committed_through = last_epoch_seal,
                                    .checkpoint_snapshot_id = std::nullopt,
                                    .last_epoch_seal = last_epoch_seal};
-        if (publishCkptContribution(op, life, contribution) == CkptPublishOutcome::FencedOut)
+        if (!ckptContributionRecorded(publishCkptContribution(op, life, contribution)))
             throwCasWriteRetryLater(fmt::format(
                 "CAS ref-table recovery for namespace '{}': the mount incarnation moved before the "
                 "checkpoint could record the epoch seal {}-{}; the last attempt's fate is unresolved and "
@@ -1783,7 +1890,8 @@ void CasRefLedger::enforceRefTableCacheBudget(const RootNamespace & keep_ns)
             const auto & rt = slot.current;
             if (!rt)
                 continue;
-            if (rt.use_count() != 1 || rt->leader_active || !rt->pending.empty())
+            /// A fresh runtime would reopen a lane that a possibly landing removal write keeps closed.
+            if (rt.use_count() != 1 || rt->leader_active || !rt->pending.empty() || rt->removal_write_may_land)
                 continue;
             cands.push_back(Cand{name, rt->last_touch_tick, weightOf(*rt)});
         }
@@ -1800,6 +1908,7 @@ void CasRefLedger::enforceRefTableCacheBudget(const RootNamespace & keep_ns)
             std::shared_ptr<RefTableRuntime> & rt = it->second.current;
             if (!rt)
                 continue;
+            bool removal_applied = false;
             {
                 /// `use_count() == 1` guarantees no other thread holds the runtime, so this try_lock
                 /// cannot fail; the RAII scope releases `state_mutex` before `rt` is moved out. A wedged
@@ -1809,12 +1918,18 @@ void CasRefLedger::enforceRefTableCacheBudget(const RootNamespace & keep_ns)
                 std::unique_lock<std::mutex> slock(rt->state_mutex, std::try_to_lock);
                 if (!slock.owns_lock() || rt->lane_state != RefLaneState::Ready)
                     continue;
+                removal_applied = rt->state.getLifecycle() != RefLifecycle::Live && rt->state.getRemoveTxnId().has_value();
             }
             if (rt.use_count() != 1 || rt->leader_active || !rt->pending.empty())
                 continue;   /// re-check under the still-held ref_queue_mutex
             total -= c.weight;
+            /// A removed life may be drained by another server's GC leader, which never calls
+            /// `invalidateRemovedCatalogLife` here. Record the removal at eviction so a cold admission
+            /// that read the row earlier is still refused.
+            if (rt->removal_admission_closed || removal_applied)
+                ++it->second.retirements;
             evicted.push_back(std::move(rt));   /// keep alive past the erase and lock release
-            ref_name_slots.erase(it);
+            eraseNameSlotIfUnusedLocked(it);
             ProfileEvents::increment(ProfileEvents::CASRefTableEvictions);
         }
     }
@@ -1871,6 +1986,7 @@ void CasRefLedger::quiesceRefTablesForRemount()
             detached.push_back(rt);
         }
         ref_name_slots.clear();
+        ++ref_name_slots_epoch;
     }
     /// `detached` releases the map's references here (with no lock held); each runtime lives on only as
     /// long as an in-flight leader/caller still holds it.
@@ -2064,6 +2180,19 @@ RefTxnId CasRefLedger::appendRefOps(const RootNamespace & ns, MutationScope scop
 }
 
 
+namespace
+{
+
+/// The row may still be `Live` here, so the text must not claim `Removing`.
+[[noreturn]] void throwRemovalWriteMayLand(const RootNamespace & ns)
+{
+    throwCasWriteRetryLater(fmt::format(
+        "CAS namespace '{}': a removal write may still land, so positive ref mutation admission is "
+        "closed until a retried removal completes or the disk is remounted; retry later", ns.string()));
+}
+
+}
+
 RefTxnId CasRefLedger::appendRefOpsOnRuntime(
     const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt, MutationScope scope,
     std::function<std::vector<RefOp>(const RefTableState &)> build_ops,
@@ -2074,9 +2203,13 @@ RefTxnId CasRefLedger::appendRefOpsOnRuntime(
     {
         std::lock_guard<std::mutex> lock(ref_queue_mutex);
         if (rt->removal_admission_closed && !terminal_removal_authorized)
+        {
+            if (rt->removal_write_may_land)
+                throwRemovalWriteMayLand(ns);
             throwCasWriteRetryLater(fmt::format(
                 "CAS namespace '{}' is Removing: positive ref mutation admission is closed while "
                 "its terminal fold and catalog removal complete; retry later", ns.string()));
+        }
     };
     /// Check before recovery/maintenance so a known-Removing runtime cannot spend an object-store
     /// mutation on behalf of an operation it is already required to refuse.
@@ -2108,9 +2241,13 @@ RefTxnId CasRefLedger::appendRefOpsOnRuntime(
             "CAS store is shutting down — refusing to append ref-log transactions for server_root '{}'",
             config.server_root_id));
     if (rt->removal_admission_closed && !terminal_removal_authorized)
+    {
+        if (rt->removal_write_may_land)
+            throwRemovalWriteMayLand(ns);
         throwCasWriteRetryLater(fmt::format(
             "CAS namespace '{}' is Removing: positive ref mutation admission is closed while its "
             "terminal fold and catalog removal complete; retry later", ns.string()));
+    }
     rt->pending.push_back(item);
 
     while (!item->done)
@@ -2417,8 +2554,10 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
     /// append path, publish its frontier under the SAME admission before the cached table can install
     /// it, return to `Ready`, or wake a surviving caller. This deliberately runs only for `Created` or
     /// byte-identical `Ours`: a successor seal is conclusive evidence that OUR transaction did not land
-    /// and retains the rejection path below without publishing our frontier.
+    /// and retains the rejection path below without publishing our frontier. The publication itself can
+    /// also report that seal, when our create landed in a slot cleanup reclaimed.
     bool same_wedge_before_frontier = false;
+    bool closed_by_successor_seal = occupant == Occupant::SuccessorSeal;
     {
         std::lock_guard lock(rt->state_mutex);
         same_wedge_before_frontier = same_wedge_under_lock();
@@ -2431,6 +2570,18 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
             .checkpoint_snapshot_id = std::nullopt,
             .last_epoch_seal = refLogTxnIsEpochSeal(wedged_txn)
                 ? std::optional<RefTxnId>{wedge.txn_id} : wedged_txn.prev_epoch_seal};
+
+        const auto keep_wedged_for_recovery = [&](std::string_view cause, std::string_view tail, std::string_view recovery_reason)
+        {
+            result.kind = WedgeResolution::StillWedged;
+            result.survivor_error = makeCasWriteRetryLaterExceptionPtr(fmt::format(
+                "CAS ref-log append for namespace '{}': wedged txn {}-{} is durable but was not acknowledged "
+                "({} before checkpoint-frontier publication; the lane needs recovery): {}",
+                ns.string(), wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence, cause, tail));
+            std::lock_guard lock(rt->state_mutex);
+            if (same_wedge_under_lock())
+                requireRecovery(*rt, ns, recovery_reason);
+        };
 
         CkptPublishOutcome frontier_outcome = CkptPublishOutcome::FencedOut;
         try
@@ -2450,18 +2601,21 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
                 requireRecovery(*rt, ns, "wedged-frontier publication");
             return result;
         }
-        if (frontier_outcome == CkptPublishOutcome::FencedOut)
+        if (frontier_outcome == CkptPublishOutcome::SuccessorSeal)
+            closed_by_successor_seal = true;
+        else if (frontier_outcome == CkptPublishOutcome::FencedOut)
         {
-            result.kind = WedgeResolution::StillWedged;
-            result.survivor_error = makeCasWriteRetryLaterExceptionPtr(fmt::format(
-                "CAS ref-log append for namespace '{}': wedged txn {}-{} is durable but was not acknowledged "
-                "(its admitted fence moved before checkpoint-frontier publication; the lane needs "
-                "recovery): {}",
-                ns.string(), wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence, durable_unconfirmed_tail));
-            std::lock_guard lock(rt->state_mutex);
-            if (same_wedge_under_lock())
-                requireRecovery(*rt, ns, "wedged-frontier publication fence");
+            keep_wedged_for_recovery("its admitted fence moved", durable_unconfirmed_tail, "wedged-frontier publication fence");
             return result;
+        }
+        else if (frontier_outcome == CkptPublishOutcome::Superseded)
+        {
+            keep_wedged_for_recovery("a later epoch moved past it", outcome_unknown_tail, "wedged-frontier publication superseded");
+            return result;
+        }
+        else
+        {
+            chassert(ckptContributionRecorded(frontier_outcome));
         }
     }
 
@@ -2495,7 +2649,10 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
         /// because the cost is a comparison and the failure mode is silent data loss.
         const bool same_wedge = same_wedge_under_lock();
 
-        if ((fence_moved || superseded) && same_wedge && exact_attempt_is_durable)
+        /// A record a successor seal closed is below the checkpoint: recovery never installs it, so it
+        /// takes the inert arm below rather than being promised to recovery.
+        const bool installable = exact_attempt_is_durable && !closed_by_successor_seal;
+        if ((fence_moved || superseded) && same_wedge && installable)
         {
             requireRecovery(*rt, ns, "wedged attempt resolved after its fence moved");
             reason = Reason::StaleState;
@@ -2519,12 +2676,14 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
                 ? Reason::RefusedPreAttempt : Reason::ResolveFoundNothing;
             result.kind = WedgeResolution::StillWedged;
         }
-        else if (occupant == Occupant::SuccessorSeal)
+        else if (closed_by_successor_seal)
         {
-            /// THE conclusive rejection (spec INV-2). The ref-log key is write-once and a successor put
-            /// its epoch-closing record there, so our bytes provably never landed and never can. The
-            /// operation was never acknowledged, so nothing is lost by failing it permanently -- and it
-            /// must be permanent, not "retry later": no later attempt in this epoch can ever succeed.
+            /// THE conclusive rejection. Either the ref-log key holds a successor's
+            /// epoch-closing record, so our bytes never landed and never can, or our create landed after
+            /// cleanup reclaimed that seal and `_ckpt` still names the seal at our id, so the bytes are not
+            /// history. The operation was never acknowledged, so nothing is lost by failing it permanently
+            /// -- and it must be permanent, not "retry later": no later attempt in this epoch can ever
+            /// succeed.
             ///
             /// The seal IS this namespace's epoch-closing record, so it is also the `prev_epoch_seal`
             /// that the first transaction of a LATER epoch must name. In this runtime that record is
@@ -2648,10 +2807,11 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
             result.survivor_error = std::make_exception_ptr(Exception(ErrorCodes::INVALID_STATE,
                 "CAS ref-log append for namespace '{}': writer epoch {} was CLOSED by a successor's epoch "
                 "seal at {}-{}, which conclusively rejects the wedged transaction (it was never "
-                "acknowledged): nothing is durable, so a retry cannot duplicate this transaction. This mount's "
+                "acknowledged): {}, so a retry cannot duplicate this transaction. This mount's "
                 "append lane resumes only under a later epoch",
                 ns.string(), wedge.txn_id.writer_epoch,
-                wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence));
+                wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence,
+                exact_attempt_is_durable ? "the record is not part of history" : "nothing is durable"));
             break;
         case WedgeResolution::Corrupted:
             on_impossible_interference(wedge.key,
@@ -3675,9 +3835,10 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     {
         try
         {
-            if (publishCkptContribution(op, rt->life, *prepared->birth_contribution)
-                == CkptPublishOutcome::FencedOut)
+            if (!ckptContributionRecorded(publishCkptContribution(op, rt->life, *prepared->birth_contribution)))
             {
+                /// This contribution has no `committed_through`, so no frontier refusal applies; only
+                /// `FencedOut` lands here.
                 complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
                     "CAS ref-log append for namespace '{}': the mount fence moved while creating the "
                     "namespace's _ckpt, so the birth transaction was not sent", ns.string())));
@@ -3794,6 +3955,27 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
             id.writer_epoch, id.ref_sequence, ns.string(), cause));
     };
 
+    /// A successor's epoch seal closed this epoch at the id this append derived, so the append is
+    /// conclusively rejected and the lane resumes only under a later epoch. No fence recheck here,
+    /// unlike the wedge path: the create-conflict arm closes the lane the same way.
+    const auto reject_append_at_successor_seal = [&]
+    {
+        /// Counted: this writer was deposed, and a lane that keeps landing here is a mount that lost its
+        /// lease and does not know it yet.
+        ProfileEvents::increment(ProfileEvents::CASRefAppendSealRejected);
+        {
+            std::lock_guard lock(rt->state_mutex);
+            rt->last_epoch_seal = id;
+            rt->append_attempt.reset();
+            rt->lane_state = RefLaneState::Closed;
+        }
+        complete_error(chunk_survivors, std::make_exception_ptr(Exception(ErrorCodes::INVALID_STATE,
+            "CAS ref-log append for namespace '{}': writer epoch {} was CLOSED by a successor's epoch "
+            "seal at {}-{}, which conclusively rejects this transaction (it was never acknowledged). "
+            "This mount's append lane resumes only under a later epoch",
+            ns.string(), id.writer_epoch, id.writer_epoch, id.ref_sequence)));
+    };
+
     std::optional<WriteResult> written;
     try
     {
@@ -3894,23 +4076,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         }
         if (occupant == Occupant::SuccessorSeal)
         {
-            /// Conclusive rejection, identical in meaning to the wedge site's: our bytes provably never
-            /// landed and never can, the operation was never acknowledged, and the seal IS this
-            /// namespace's epoch-closing record. No anomaly, no fence -- this is the protocol working.
-            /// Counted anyway: "the protocol working" here means THIS writer was deposed, and a lane that
-            /// keeps landing on this arm is a mount that has lost its lease and does not know it yet.
-            ProfileEvents::increment(ProfileEvents::CASRefAppendSealRejected);
-            {
-                std::lock_guard lock(rt->state_mutex);
-                rt->last_epoch_seal = id;
-                rt->append_attempt.reset();
-                rt->lane_state = RefLaneState::Closed;
-            }
-            complete_error(chunk_survivors, std::make_exception_ptr(Exception(ErrorCodes::INVALID_STATE,
-                "CAS ref-log append for namespace '{}': writer epoch {} was CLOSED by a successor's epoch "
-                "seal at {}-{}, which conclusively rejects this transaction (it was never acknowledged). "
-                "This mount's append lane resumes only under a later epoch",
-                ns.string(), id.writer_epoch, id.writer_epoch, id.ref_sequence)));
+            reject_append_at_successor_seal();
             return false;
         }
         if (occupant != Occupant::Ours)
@@ -4039,12 +4205,12 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     {
         /// The log object is durable -- this call's own attempt committed it, or the conflict above
         /// proved an earlier attempt of this exact transaction already had. Either way it is not yet
-        /// admitted to logical history. Publish its exact frontier
-        /// under the SAME admission generation before any local consequence can make a later id
-        /// observable or wake a waiter. `Published` and `IdenticalSkip` both prove the contribution
-        /// durable. `FencedOut`, contention exhaustion, decode failure, or any other unresolved
-        /// publication leaves the log known durable but uninstalled, which is exactly
-        /// `NeedsRecovery`; recovery owns resolution of that window.
+        /// admitted to logical history. Publish its exact frontier under the SAME admission generation
+        /// before any local consequence can make a later id observable or wake a waiter. `Published` and
+        /// `IdenticalSkip` both prove the contribution durable. `SuccessorSeal` conclusively rejects it.
+        /// `FencedOut`, `Superseded`, contention exhaustion, decode failure, or any other unresolved
+        /// publication leaves the log known durable but uninstalled, which is exactly `NeedsRecovery`;
+        /// recovery owns resolution of that window.
         CkptPublishOutcome frontier_outcome = CkptPublishOutcome::FencedOut;
         try
         {
@@ -4060,6 +4226,21 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                 "publishing its checkpoint frontier was not confirmed: " + getCurrentExceptionMessage(false, false, false, false)});
             return false;
         }
+        if (frontier_outcome == CkptPublishOutcome::SuccessorSeal)
+        {
+            reject_append_at_successor_seal();
+            return false;
+        }
+        if (frontier_outcome == CkptPublishOutcome::Superseded)
+        {
+            {
+                std::lock_guard lock(rt->state_mutex);
+                requireRecovery(*rt, ns, "committed-frontier publication superseded");
+            }
+            complete_error(chunk_survivors, outcome_unknown(ErrorCodes::NETWORK_ERROR,
+                "a later epoch moved past it before the frontier was published"));
+            return false;
+        }
         if (frontier_outcome == CkptPublishOutcome::FencedOut)
         {
             {
@@ -4070,6 +4251,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                 "the mount fence moved before the frontier was published"});
             return false;
         }
+        chassert(ckptContributionRecorded(frontier_outcome));
 
         if (carve_hook_for_test)
             carve_hook_for_test(CarvePhaseForTest::PostDurableInstall);
@@ -4359,6 +4541,26 @@ void CasRefLedger::maybeScheduleSnapshotPublish(const RootNamespace & ns, const 
 }
 
 
+std::string_view refLaneStateName(RefLaneState state)
+{
+    switch (state)
+    {
+        case RefLaneState::Ready:
+            return "Ready";
+        case RefLaneState::Writing:
+            return "Writing";
+        case RefLaneState::Wedged:
+            return "Wedged";
+        case RefLaneState::NeedsRecovery:
+            return "NeedsRecovery";
+        case RefLaneState::Closed:
+            return "Closed";
+        case RefLaneState::Faulted:
+            return "Faulted";
+    }
+    UNREACHABLE();
+}
+
 void CasRefLedger::advancePublishBackoff(RefTableRuntime & rt)
 {
     /// Caller holds `rt.state_mutex`. Double the interval from `initial` up to `max` per consecutive
@@ -4487,6 +4689,8 @@ CkptPublishOutcome CasRefLedger::publishCkptContribution(CasOperation & op, cons
         ProfileEvents::increment(ProfileEvents::CASRefCheckpointPublished);
     else if (outcome == CkptPublishOutcome::IdenticalSkip)
         ProfileEvents::increment(ProfileEvents::CASRefCheckpointIdenticalSkip);
+    else if (outcome == CkptPublishOutcome::SuccessorSeal || outcome == CkptPublishOutcome::Superseded)
+        ProfileEvents::increment(ProfileEvents::CASRefCheckpointFrontierRefused);
     return outcome;
 }
 
@@ -4555,10 +4759,15 @@ bool CasRefLedger::tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntimeImpl(
 
     if (blocked_lane)
     {
-        LOG_WARNING(getLogger("CasPool"),
-            "CAS ref table '{}': refusing snapshot publication while the append lane is not Ready "
-            "(state {})",
-            ns.string(), static_cast<uint8_t>(*blocked_lane));
+        /// `Writing` is the ordinary race with an appender, so only the other states warrant a warning.
+        if (*blocked_lane == RefLaneState::Writing)
+            LOG_DEBUG(getLogger("CasPool"),
+                "CAS ref table '{}': refusing snapshot publication while the append lane is not Ready (state {})",
+                ns.string(), refLaneStateName(*blocked_lane));
+        else
+            LOG_WARNING(getLogger("CasPool"),
+                "CAS ref table '{}': refusing snapshot publication while the append lane is not Ready (state {})",
+                ns.string(), refLaneStateName(*blocked_lane));
         return false;
     }
 
@@ -4658,12 +4867,13 @@ bool CasRefLedger::tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntimeImpl(
         snapshot_before_ckpt_cas_hook_for_test();
     try
     {
-        ckpt_advanced = publishCkptContribution(op, rt->life,
+        /// A snapshot contribution carries a non-seal frontier, so a zombie publisher can also get
+        /// `SuccessorSeal` or `Superseded`; neither advanced the checkpoint.
+        ckpt_advanced = ckptContributionRecorded(publishCkptContribution(op, rt->life,
                                                 RefCkpt{.life_epoch = std::nullopt,
                                                         .committed_through = candidate_x,
                                                         .checkpoint_snapshot_id = candidate_x,
-                                                        .last_epoch_seal = std::nullopt})
-            != CkptPublishOutcome::FencedOut;
+                                                        .last_epoch_seal = std::nullopt}));
     }
     catch (...)
     {
@@ -4986,9 +5196,11 @@ NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
     {
         refuseUnlessAdmitted(mount_requests.resume(rt->admitted_fence_generation), "resident namespace life");
         bool removal_closed = false;
+        bool write_may_land = false;
         {
             std::lock_guard queue_lock(ref_queue_mutex);
             removal_closed = rt->removal_admission_closed;
+            write_may_land = rt->removal_write_may_land;
         }
         if (removal_closed)
         {
@@ -4998,20 +5210,67 @@ NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
             reconcileCatalogCut(CasRefCatalog::read(reconcile_op, layout));
             const auto refreshed = lookupRefTableRuntime(ns);
             if (refreshed == rt)
+            {
+                if (write_may_land)
+                    throwRemovalWriteMayLand(ns);
                 throwCasWriteRetryLater(fmt::format(
                     "CAS namespace '{}' is Removing: creation waits for its terminal fold and catalog "
                     "removal to complete; retry later", ns.string()));
+            }
             rt = refreshed;
         }
         if (rt)
         {
-            ensureRefTableRecovered(ns, *rt);
-            return rt->life;
+            std::exception_ptr recovery_error;
+            try
+            {
+                ensureRefTableRecovered(ns, *rt);
+            }
+            catch (...)
+            {
+                recovery_error = std::current_exception();
+            }
+            bool terminal = false;
+            if (!recovery_error)
+            {
+                std::lock_guard state_lock(rt->state_mutex);
+                terminal = rt->state.getLifecycle() != RefLifecycle::Live && rt->state.getRemoveTxnId().has_value();
+            }
+            if (!recovery_error && !terminal)
+                return rt->life;
+
+            /// Only the removal-closed branch above reconciles, and a GC on another server never
+            /// invalidates here: a terminal life, or one whose checkpoint the janitor swept after its row
+            /// was erased, stays resident. Once the catalog no longer names it, detach it and go cold.
+            bool row_gone = false;
+            try
+            {
+                CasOperation catalog_op = mount_requests.resume(rt->admitted_fence_generation);
+                const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(catalog_op, layout);
+                refuseUnlessAdmitted(catalog_op, "resident namespace life, catalog check");
+                const std::optional<NamespaceLifeId> catalog_life = catalog.life_index.resolve(rt->life.incarnation);
+                row_gone = !catalog_life || *catalog_life != rt->life;
+            }
+            catch (...)
+            {
+                if (recovery_error)
+                    std::rethrow_exception(recovery_error);
+                throw;
+            }
+            if (!row_gone)
+            {
+                if (recovery_error)
+                    std::rethrow_exception(recovery_error);
+                refuseTerminalLife(ns, *rt);
+                return rt->life;
+            }
+            invalidateRemovedCatalogLife(rt->life);
         }
     }
 
     /// A cold mutation observes or births the durable identity before allocating any local state.
     const uint64_t admitted_generation = fence_generation_fn();
+    ColdAdmission admission = beginColdAdmission(ns);
     CasOperation op = mount_requests.resume(admitted_generation);
     const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(op, layout);
     refuseUnlessAdmitted(op, "cold mutable namespace admission");
@@ -5027,9 +5286,21 @@ NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
         ? NamespaceLifeId::fromCatalogEntry(entry_it->ns, entry_it->incarnation)
         : resolveNamespaceLife(ns, admitted_generation, live_epoch_fn());
     refuseUnlessAdmitted(op, "cold mutable namespace admission, after life resolution");
-    rt = acquireRefTableRuntime(life, admitted_generation);
+    rt = acquireRefTableRuntime(life, admitted_generation, admission, RuntimeAdmission::Write);
     ensureRefTableRecovered(ns, *rt);
+    refuseTerminalLife(ns, *rt);
     return rt->life;
+}
+
+void CasRefLedger::refuseTerminalLife(const RootNamespace & ns, RefTableRuntime & rt)
+{
+    /// Bytes written under a removed life are swept by the dead-life janitor, so the caller must not be
+    /// handed one to write into. A never-born stream is also `Removed` but has no `remove_txn_id`.
+    std::lock_guard lock(rt.state_mutex);
+    if (rt.state.getLifecycle() != RefLifecycle::Live && rt.state.getRemoveTxnId().has_value())
+        throwCasWriteRetryLater(fmt::format(
+            "CAS namespace '{}': its resident life {} is already removed; retry after the removal completes",
+            ns.string(), renderIncarnation(rt.life.incarnation)));
 }
 
 std::optional<NamespaceLifeId> CasRefLedger::namespaceFilesLifeIfReadable(const RootNamespace & ns)
@@ -5079,6 +5350,7 @@ bool CasRefLedger::namespaceStillLogicallyPresent(const RootNamespace & ns)
     /// the one answer that must never be manufactured by a race, so it alone is re-confirmed by a
     /// second read of this namespace's row before being trusted.
     const uint64_t admitted_generation = fence_generation_fn();
+    ColdAdmission admission = beginColdAdmission(ns);
     CasOperation op = mount_requests.resume(admitted_generation);
     const CasRefCatalog::Snapshot first_catalog = CasRefCatalog::read(op, layout);
     refuseUnlessAdmitted(op, "namespace presence probe");
@@ -5123,7 +5395,11 @@ bool CasRefLedger::namespaceStillLogicallyPresent(const RootNamespace & ns)
     /// therefore not proof that the CURRENT logical namespace `ns` is absent; a fresh catalog read is
     /// required before answering `false` for the name.
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry->ns, entry->incarnation);
-    const auto rt = acquireRefTableRuntime(life, admitted_generation);
+    const auto rt = acquireRefTableRuntime(life, admitted_generation, admission, RuntimeAdmission::PresenceProbe);
+    /// GC announced the erase of this row during the admission. Throwing would fail
+    /// `DatabaseOnDisk::dropTable`, which calls `existsDirectory` after its rollback scope; `true` is safe.
+    if (!rt)
+        return true;
     ensureRefTableRecovered(ns, *rt);
     bool this_incarnation_terminal = false;
     {
@@ -5162,8 +5438,12 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     /// class shares the bigger complete-table byte budget (encodeRefLogTxn's own `checkBudget`, keyed
     /// off the presence of a `RemoveNamespace` op) and is exempt from the ordinary per-op admission
     /// check (it only ever shrinks state; see `flushRefBatch`'s `state_growing` filter).
+    ColdAdmission admission = beginColdAdmission(ns);
     CasOperation initial_op = mount_requests.admit();
-    const CasRefCatalog::Snapshot initial_catalog = CasRefCatalog::read(initial_op, layout);
+    /// One deadline for every request that leads to the removal decision. The wait for the lane to
+    /// drain and for another removal attempt counts against it but is never cut short.
+    const Retry policy = initial_op.freeze(Retry::standard());
+    const CasRefCatalog::Snapshot initial_catalog = CasRefCatalog::read(initial_op, layout, policy);
     const auto initial_it = std::find_if(initial_catalog.catalog.entries.begin(), initial_catalog.catalog.entries.end(),
         [&](const CatalogEntry & entry) { return entry.ns == ns; });
     if (initial_it == initial_catalog.catalog.entries.end())
@@ -5182,8 +5462,9 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
             [&](const CreatorFence & creator)
             {
                 return isCreatorFenceTerminal(
-                    cancel_op, layout, creator.server_root_id, creator.writer_epoch);
-            }))
+                    cancel_op, layout, creator.server_root_id, creator.writer_epoch, policy);
+            },
+            policy))
         {
             case CasRefCatalog::StalledCreatingCancelOutcome::Cancelled:
                 invalidateRemovedCatalogLife(NamespaceLifeId::fromCatalogEntry(observed.ns, observed.incarnation));
@@ -5206,8 +5487,21 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     const NamespaceLifeId observed_life
         = NamespaceLifeId::fromCatalogEntry(initial_it->ns, initial_it->incarnation);
     const uint64_t runtime_generation = fence_generation_fn();
-    const auto rt = acquireRefTableRuntime(observed_life, runtime_generation);
+    const auto rt = acquireRefTableRuntime(observed_life, runtime_generation, admission, RuntimeAdmission::Write);
     ensureRefTableRecovered(ns, *rt);
+    {
+        std::unique_lock<std::mutex> queue_lock(ref_queue_mutex);
+        rt->cv.wait(queue_lock, [&]
+        {
+            return !rt->removal_attempt_active;
+        });
+        rt->removal_attempt_active = true;
+    }
+    SCOPE_EXIT({
+        std::lock_guard<std::mutex> queue_lock(ref_queue_mutex);
+        rt->removal_attempt_active = false;
+        rt->cv.notify_all();
+    });
     {
         /// A real terminal transaction is idempotent. The representation also calls an empty, never-born
         /// stream `Removed`, but its absent `remove_txn_id` distinguishes that state: a cataloged life may
@@ -5231,15 +5525,19 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
         });
     }
 
+    if (removal_attempt_hook_for_test)
+        removal_attempt_hook_for_test();
+
     const uint64_t admitted_generation = fence_generation_fn();
     CasOperation removal_op = mount_requests.resume(admitted_generation);
     std::optional<CatalogEntry> observed_live;
     if (initial_it->state == NsState::Live)
         observed_live = *initial_it;
     bool removing_durable = false;
+    bool removal_write_outcome_unknown = false;
     try
     {
-        const CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(removal_op, layout);
+        const CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(removal_op, layout, policy);
         const auto entry_it = std::find_if(snapshot.catalog.entries.begin(), snapshot.catalog.entries.end(),
             [&](const CatalogEntry & entry) { return entry.ns == ns; });
         if (entry_it == snapshot.catalog.entries.end())
@@ -5261,14 +5559,22 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
         {
             observed_live = *entry_it;
             uint64_t removal_started_round = 0;
-            if (const auto got = removal_op.read(layout.gcStateKey(), Retry::standard()))
+            if (const auto got = removal_op.read(layout.gcStateKey(), policy))
                 removal_started_round = decodeGcState(got->bytes).round;
 
+            /// The flag turns on at the first sent attempt of the `Live -> Removing` write. Before it nothing
+            /// can land, so a failure may reopen the lane. After it every exception, `FencedOut` and
+            /// `EntryChanged` may follow an attempt that can still land.
+            removal_op.observeRequests(RequestObserver{
+                .on_write_attempt = [&removal_write_outcome_unknown](uint32_t) { removal_write_outcome_unknown = true; },
+                .on_failure = {},
+            });
             switch (CasRefCatalog::beginRemoving(
-                removal_op, layout, *observed_live, removal_started_round))
+                removal_op, layout, *observed_live, removal_started_round, policy))
             {
                 case CasRefCatalog::BeginRemovingOutcome::Transitioned:
                 case CasRefCatalog::BeginRemovingOutcome::AlreadyRemoving:
+                    removal_write_outcome_unknown = false;
                     removing_durable = true;
                     break;
                 case CasRefCatalog::BeginRemovingOutcome::EntryChanged:
@@ -5291,11 +5597,12 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     catch (...)
     {
         /// Resolve an ambiguous transition before deciding whether this lane may reopen. `Removing`
-        /// under the same life is conclusive success. Reopening is permitted only after a fresh exact
-        /// observation still proves the original `Live` row and the same mount fence; every unreadable,
-        /// changed or fenced case remains closed (fail-close) and propagates the original error.
+        /// under the same life is conclusive success. Reopening also needs a fresh exact `Live` row and
+        /// the same mount fence; every other case stays closed and propagates the original error.
         try
         {
+            /// A fresh standard window, not `policy`: an expired policy would fail this read at once and
+            /// leave a healthy table closed.
             const CasRefCatalog::Snapshot fresh = CasRefCatalog::read(removal_op, layout);
             const auto fresh_it = std::find_if(fresh.catalog.entries.begin(), fresh.catalog.entries.end(),
                 [&](const CatalogEntry & entry) { return entry.ns == ns; });
@@ -5310,8 +5617,11 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
             {
                 refuseUnlessAdmitted(removal_op, "reopening the removal lane");
                 std::lock_guard<std::mutex> queue_lock(ref_queue_mutex);
-                rt->removal_admission_closed = false;
-                rt->cv.notify_all();
+                if (!removal_write_outcome_unknown && !rt->removal_write_may_land)
+                {
+                    rt->removal_admission_closed = false;
+                    rt->cv.notify_all();
+                }
             }
         }
         catch (...) // NOLINT(bugprone-empty-catch)
@@ -5320,10 +5630,30 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
             /// `Live` row deliberately leaves admission closed.
         }
         if (!removing_durable)
+        {
+            /// One read showing `Live` does not prove that a sent write never lands, so after an unknown
+            /// outcome the lane stays closed until GC erases the row or a remount replaces the runtime.
+            /// A retried `DROP` completes the removal.
+            if (removal_write_outcome_unknown)
+            {
+                {
+                    std::lock_guard<std::mutex> queue_lock(ref_queue_mutex);
+                    rt->removal_write_may_land = true;
+                }
+                LOG_WARNING(getLogger("CasRefLedger"),
+                    "CAS namespace '{}': the outcome of its Live -> Removing catalog write is unknown; writes "
+                    "stay refused until a retried removal completes or the disk is remounted", ns.string());
+            }
             throw;
+        }
     }
 
     chassert(removing_durable);
+
+    {
+        std::lock_guard<std::mutex> queue_lock(ref_queue_mutex);
+        rt->removal_write_may_land = false;
+    }
 
     /// This call's own removal
     /// transaction named, filled from the SAME `state` the ops below are built from -- a retried

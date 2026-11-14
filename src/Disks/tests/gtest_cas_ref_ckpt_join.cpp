@@ -469,6 +469,135 @@ TEST(CASRefCheckpointJoin, ADecreasingLifeEpochFromAFencedOutWriterIsReportedFen
     EXPECT_EQ(lifeEpochOrFail(reader, layout, life), 9u);
 }
 
+/// The frontier verdicts, unlike the rule above, do not consult admission: they are facts about the
+/// durable body. A writer that loses admission after the read still learns that a successor sealed its
+/// epoch at its frontier, and nothing is written.
+TEST(CASRefCheckpointJoin, AFrontierAtTheDurableSealFromAFencedOutWriterIsStillSuccessorSeal)
+{
+    Layout layout("p");
+    auto backend = std::make_shared<AdmissionHookBackend>(layout);
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation reader = requests.admit();
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(RootNamespace{"a"}, UInt128(42));
+    const String key = layout.refCkptKey(life);
+
+    const RefCkpt durable{.life_epoch = 1, .committed_through = RefTxnId{2, 2}, .checkpoint_snapshot_id = std::nullopt,
+                          .last_epoch_seal = RefTxnId{1, 3}};
+    ASSERT_EQ(publishCkpt(reader, layout, life, durable), CkptPublishOutcome::Published);
+    const uint64_t writes_before = backend->writeTotal();
+
+    backend->withdraw_after_read_of = key;
+    CasOperation deposed_writer = requests.admit([&backend] { return backend->admitted; });
+    const RefCkpt late{.life_epoch = std::nullopt, .committed_through = RefTxnId{1, 3},
+                       .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    EXPECT_EQ(publishCkpt(deposed_writer, layout, life, late), CkptPublishOutcome::SuccessorSeal);
+    backend->withdraw_after_read_of.clear();
+
+    EXPECT_EQ(backend->writeTotal(), writes_before);
+}
+
+/// `Superseded` is a fact about the durable body too: a writer that loses admission after the read still
+/// learns that a later epoch moved past its frontier, and nothing is written.
+TEST(CASRefCheckpointJoin, AFrontierBehindTheDurableEpochFromAFencedOutWriterIsStillSuperseded)
+{
+    Layout layout("p");
+    auto backend = std::make_shared<AdmissionHookBackend>(layout);
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation reader = requests.admit();
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(RootNamespace{"a"}, UInt128(42));
+    const String key = layout.refCkptKey(life);
+
+    const RefCkpt durable{.life_epoch = 1, .committed_through = RefTxnId{2, 3}, .checkpoint_snapshot_id = std::nullopt,
+                          .last_epoch_seal = RefTxnId{2, 3}};
+    ASSERT_EQ(publishCkpt(reader, layout, life, durable), CkptPublishOutcome::Published);
+    const uint64_t writes_before = backend->writeTotal();
+
+    backend->withdraw_after_read_of = key;
+    CasOperation deposed_writer = requests.admit([&backend] { return backend->admitted; });
+    const RefCkpt late{.life_epoch = std::nullopt, .committed_through = RefTxnId{1, 3},
+                       .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    EXPECT_EQ(publishCkpt(deposed_writer, layout, life, late), CkptPublishOutcome::Superseded);
+    backend->withdraw_after_read_of.clear();
+
+    EXPECT_EQ(backend->writeTotal(), writes_before);
+}
+
+/// A contribution the merge rejects is decided like the `life_epoch` decrease: the fence picks the verdict.
+/// The seal below keeps `refuseFrontierAgainstDurable` out of the way, so the rejection comes from `mergeCkpt`
+/// (`mergeCommittedThrough`: a frontier two epochs below the durable one).
+TEST(CASRefCheckpointJoin, NonAdjacentFrontierFromAFencedOutWriterIsReportedFencedOutNotCorruption)
+{
+    Layout layout("p");
+    auto backend = std::make_shared<AdmissionHookBackend>(layout);
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation reader = requests.admit();
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(RootNamespace{"a"}, UInt128(42));
+    const String key = layout.refCkptKey(life);
+
+    const RefCkpt durable{.life_epoch = std::nullopt, .committed_through = RefTxnId{10, 1},
+                          .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = RefTxnId{9, 5}};
+    ASSERT_EQ(publishCkpt(reader, layout, life, durable), CkptPublishOutcome::Published);
+    const uint64_t writes_before = backend->writeTotal();
+
+    backend->withdraw_after_read_of = key;
+    CasOperation deposed_writer = requests.admit([&backend] { return backend->admitted; });
+    const RefCkpt stale{.life_epoch = std::nullopt, .committed_through = RefTxnId{7, 9},
+                        .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = RefTxnId{7, 9}};
+    EXPECT_EQ(publishCkpt(deposed_writer, layout, life, stale), CkptPublishOutcome::FencedOut);
+    backend->withdraw_after_read_of.clear();
+
+    EXPECT_EQ(backend->writeTotal(), writes_before);
+}
+
+/// Same fence rule for the other rejection site: the merged body breaks the seal invariant of
+/// `checkRefCkptInvariants` (a seal of the frontier's own epoch below the frontier).
+TEST(CASRefCheckpointJoin, SealInvariantBreakFromAFencedOutWriterIsReportedFencedOutNotCorruption)
+{
+    Layout layout("p");
+    auto backend = std::make_shared<AdmissionHookBackend>(layout);
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation reader = requests.admit();
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(RootNamespace{"a"}, UInt128(42));
+    const String key = layout.refCkptKey(life);
+
+    const RefCkpt durable{.life_epoch = std::nullopt, .committed_through = RefTxnId{5, 10},
+                          .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = RefTxnId{5, 10}};
+    ASSERT_EQ(publishCkpt(reader, layout, life, durable), CkptPublishOutcome::Published);
+    const uint64_t writes_before = backend->writeTotal();
+
+    backend->withdraw_after_read_of = key;
+    CasOperation deposed_writer = requests.admit([&backend] { return backend->admitted; });
+    const RefCkpt later{.life_epoch = std::nullopt, .committed_through = RefTxnId{5, 12},
+                        .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    EXPECT_EQ(publishCkpt(deposed_writer, layout, life, later), CkptPublishOutcome::FencedOut);
+    backend->withdraw_after_read_of.clear();
+
+    EXPECT_EQ(backend->writeTotal(), writes_before);
+}
+
+/// An admitted writer gets the corruption verdict for the same contribution, and nothing is written.
+TEST(CASRefCheckpointJoin, NonAdjacentFrontierFromAnAdmittedWriterIsCorruption)
+{
+    Layout layout("p");
+    auto backend = std::make_shared<AdmissionHookBackend>(layout);
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(RootNamespace{"a"}, UInt128(42));
+
+    const RefCkpt durable{.life_epoch = std::nullopt, .committed_through = RefTxnId{10, 1},
+                          .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = RefTxnId{9, 5}};
+    ASSERT_EQ(publishCkpt(op, layout, life, durable), CkptPublishOutcome::Published);
+    const uint64_t writes_before = backend->writeTotal();
+
+    const RefCkpt stale{.life_epoch = std::nullopt, .committed_through = RefTxnId{7, 9},
+                        .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = RefTxnId{7, 9}};
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "cross-epoch committed_through", [&]
+    {
+        publishCkpt(op, layout, life, stale);
+    });
+    EXPECT_EQ(backend->writeTotal(), writes_before);
+}
+
 /// `checkpoint_snapshot_id` and `last_epoch_seal` continue to merge by SEMANTIC MAXIMUM. Unlike
 /// `life_epoch` these two genuinely advance over a namespace's life, and the max is what stops a writer
 /// that sampled an older body from regressing the other writer's progress (TLC counterexample

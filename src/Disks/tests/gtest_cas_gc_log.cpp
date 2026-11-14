@@ -10,6 +10,7 @@
 
 #include <condition_variable>
 #include <functional>
+#include <optional>
 #include <thread>
 #include <string>
 #include <vector>
@@ -334,7 +335,7 @@ TEST(CASGCLog, TransientThrowIsClassifiedAborted)
 {
     auto backend = std::make_shared<NetworkThrowingBackend>();
     /// A PERSISTENT transient fault is reissued for the whole retry window, so the window has to run
-    /// on a clock this test advances -- otherwise one read spends ninety real seconds. Heap-owned, not
+    /// on a clock this test advances -- otherwise one read spends a real request window. Heap-owned, not
     /// a plain local: the Pool can outlive this stack frame (a background publish holds
     /// `shared_from_this()`), so a by-reference capture of a local -- even an already-atomic one --
     /// would dangle once the frame returns.
@@ -358,6 +359,111 @@ TEST(CASGCLog, TransientThrowIsClassifiedAborted)
         << "NETWORK_ERROR names a transient condition; the row must not read as a GC defect";
     EXPECT_EQ(round_rows[1].error_code, DB::ErrorCodes::NETWORK_ERROR);
     EXPECT_FALSE(round_rows[1].error.empty());
+}
+
+/// The `Information` line of a finished round, as the scheduler formats it.
+namespace
+{
+String finishLineHead(const Rec & fin, const char * outcome)
+{
+    return fmt::format("GC round finished: round={} outcome={} trigger=Manual duration_ms={} deleted={} condemned={} error_code={}",
+        fin.round, outcome, fin.duration_ms, fin.objects_deleted, fin.entries_condemned, fin.error_code);
+}
+}
+
+TEST(CASGCLog, FinishLogLineMatchesCasGcLogRow)
+{
+    {
+        auto backend = std::make_shared<InMemoryBackend>();
+        auto store = Pool::open(backend,
+            PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0});
+        publishPart(store, "srv1/tbl", "all_0_0_0", "hello-cas-gc-log-line");
+        store->dropRef(RootNamespace{"srv1/tbl"}, "all_0_0_0");
+        store->renewWatermarkOnce();
+        std::vector<Rec> rows;
+        DB::Cas::CasGcScheduler sched(store, std::chrono::seconds(1), "test::gc", "ca", [&](const Rec & r) { rows.push_back(r); });
+
+        DB::Cas::tests::ScopedLogCapture capture("test::gc", "information");
+        ASSERT_TRUE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
+
+        const Rec & fin = rows.back();
+        ASSERT_EQ(fin.event_type, Rec::EventType::Finish);
+        ASSERT_EQ(fin.outcome, Rec::Outcome::Success);
+        EXPECT_EQ(capture.count("GC round finished"), 1u) << capture.captured();
+        EXPECT_EQ(capture.count(finishLineHead(fin, "Success")), 1u) << capture.captured();
+        EXPECT_EQ(capture.count(" keys_listed="), 1u) << capture.captured();
+
+        std::optional<UInt64> defer_keys_listed;
+        for (const Rec & r : rows)
+            if (r.event_type == Rec::EventType::Phase && r.phase == "defer_decision")
+                if (const auto it = r.phase_metrics.find("ref_keys_listed"); it != r.phase_metrics.end())
+                    defer_keys_listed = it->second;
+        ASSERT_TRUE(defer_keys_listed.has_value());
+        EXPECT_GT(*defer_keys_listed, 0u);
+        EXPECT_EQ(capture.count(finishLineHead(fin, "Success") + fmt::format(" keys_listed={}", *defer_keys_listed)), 1u)
+            << capture.captured();
+    }
+    {
+        auto backend = std::make_shared<InMemoryBackend>();
+        auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+        Gc incumbent(store, hexToU128("00000000000000000000000000000abc"));
+        ASSERT_TRUE(incumbent.runRegularRound().acquired_lease);
+
+        std::vector<Rec> rows;
+        DB::Cas::CasGcScheduler sched(store, std::chrono::seconds(1), "test::gc", "ca", [&](const Rec & r) { rows.push_back(r); });
+        DB::Cas::tests::ScopedLogCapture capture("test::gc", "information");
+        EXPECT_FALSE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
+
+        ASSERT_EQ(rows.back().event_type, Rec::EventType::Finish);
+        EXPECT_EQ(rows.back().outcome, Rec::Outcome::NotALeader);
+        EXPECT_EQ(capture.count("GC round finished"), 0u) << capture.captured();
+    }
+}
+
+/// A `Deferred` round completed as leader: it counts as a success for health, and like `NotALeader` it
+/// writes no `Information` line. On an empty pool with the default defer bound the first round defers.
+TEST(CASGCLog, ADeferredRoundCountsAsASuccessAndLogsNoFinishLine)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    std::vector<Rec> rows;
+    DB::Cas::CasGcScheduler sched(store, std::chrono::seconds(1), "test::gc", "ca", [&](const Rec & r) { rows.push_back(r); });
+    ASSERT_FALSE(sched.gcHealth().ever_succeeded);
+
+    DB::Cas::tests::ScopedLogCapture capture("test::gc", "information");
+    const RoundReport rep = sched.runOneRoundNow(Rec::Trigger::Manual);
+    ASSERT_TRUE(rep.acquired_lease);
+    ASSERT_TRUE(rep.deferred);
+
+    ASSERT_EQ(rows.back().event_type, Rec::EventType::Finish);
+    EXPECT_EQ(rows.back().outcome, Rec::Outcome::Deferred);
+    EXPECT_EQ(capture.count("GC round finished"), 0u) << capture.captured();
+    const auto health = sched.gcHealth();
+    EXPECT_TRUE(health.ever_succeeded);
+    EXPECT_TRUE(health.is_leader);
+}
+
+TEST(CASGCLog, AnAbortedRoundLogsExactlyOneFinishLine)
+{
+    auto backend = std::make_shared<NetworkThrowingBackend>();
+    auto engine_now_ms = std::make_shared<std::atomic<uint64_t>>(0);
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    store->setCasRequestNowFnForTest([engine_now_ms] { return engine_now_ms->fetch_add(10'000) + 10'000; });
+    store->setCasRetrySleepForTest([](uint64_t) {});
+
+    std::vector<Rec> rows;
+    DB::Cas::CasGcScheduler sched(store, std::chrono::seconds(1), "test::gc", "ca", [&](const Rec & r) { rows.push_back(r); });
+
+    backend->arm.store(true);
+    DB::Cas::tests::ScopedLogCapture capture("test::gc", "information");
+    EXPECT_THROW(sched.runOneRoundNow(Rec::Trigger::Manual), DB::Exception);
+
+    const Rec & fin = rows.back();
+    ASSERT_EQ(fin.event_type, Rec::EventType::Finish);
+    ASSERT_EQ(fin.outcome, Rec::Outcome::Aborted);
+    ASSERT_NE(fin.error_code, 0);
+    EXPECT_EQ(capture.count("GC round finished"), 1u) << capture.captured();
+    EXPECT_EQ(capture.count(finishLineHead(fin, "Aborted")), 1u) << capture.captured();
 }
 
 /// The classifier itself, pinned direct: the transient list is exact and everything else fails closed.

@@ -498,7 +498,7 @@ TEST(CASRefInstallSafety, OnlySendingNothingMaySkipTheWedge)
     /// Row 1: the caller's own facts refuse before the attempt. Nothing reaches the store.
     {
         auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
-        CasRequests requests(backend, Fence::open());
+        CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
         CasOperation op = requests.admit([] { return false; });
         const WriteResult result = op.create("k", "v", Retry::standard());
         const auto * gave_up = std::get_if<GaveUp>(&result);
@@ -513,7 +513,7 @@ TEST(CASRefInstallSafety, OnlySendingNothingMaySkipTheWedge)
         auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
         uint64_t clock = 0;
         CasRequests requests(backend, Fence::open(),
-                             [&clock]() -> uint64_t { const uint64_t t = clock; clock += 1000; return t; });
+                             [&clock]() -> uint64_t { const uint64_t t = clock; clock += 1000; return t; }, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
         CasOperation op = requests.admit();
         const WriteResult result = op.create("k", "v", Retry::within(500));
         const auto * gave_up = std::get_if<GaveUp>(&result);
@@ -527,7 +527,7 @@ TEST(CASRefInstallSafety, OnlySendingNothingMaySkipTheWedge)
     {
         auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
         backend->injectAmbiguousWrite("k");
-        CasRequests requests(backend, Fence::open());
+        CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
         CasOperation op = requests.admit();
         const WriteResult result = op.create("k", "v", Retry::once());
         const auto * gave_up = std::get_if<GaveUp>(&result);
@@ -542,7 +542,7 @@ TEST(CASRefInstallSafety, OnlySendingNothingMaySkipTheWedge)
         auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
         bool live = true;
         backend->onWriteCommitted("k", [&live] { live = false; });
-        CasRequests requests(backend, Fence::open());
+        CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
         CasOperation op = requests.admit([&live] { return live; });
         const WriteResult result = op.create("k", "v", Retry::standard());
         const auto * gave_up = std::get_if<GaveUp>(&result);
@@ -559,7 +559,7 @@ TEST(CASRefInstallSafety, OnlySendingNothingMaySkipTheWedge)
         uint64_t clock = 0;
         backend->onBeforeWrite("k", [&clock] { clock = 100'000; });
         backend->injectAmbiguousWrite("k");
-        CasRequests requests(backend, Fence::open(), [&clock]() -> uint64_t { return clock; });
+        CasRequests requests(backend, Fence::open(), [&clock]() -> uint64_t { return clock; }, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
         CasOperation op = requests.admit();
         const WriteResult result = op.create("k", "v", Retry::within(1000));
         const auto * gave_up = std::get_if<GaveUp>(&result);

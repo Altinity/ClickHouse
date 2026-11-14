@@ -302,12 +302,13 @@ String describeRequestFailure(std::string_view verb, const String & key, const s
 
 CasRequests::CasRequests(BackendPtr backend_, Fence fence_,
                          std::function<uint64_t()> now_ms_, std::function<void(uint64_t)> sleep_ms_,
-                         CasHotKeys * hot_keys_)
+                         CasHotKeys * hot_keys_, uint64_t default_window_ms_)
     : backend(std::move(backend_))
     , fence(std::move(fence_))
     , now_ms(now_ms_ ? std::move(now_ms_) : std::function<uint64_t()>(bootClockMs))
     , sleep_ms(sleep_ms_ ? std::move(sleep_ms_) : std::function<void(uint64_t)>(sleepForMilliseconds))
     , attempt_reservation_ms(backend->attemptEnvelopeMs())
+    , default_window_ms(default_window_ms_)
     , own_hot_keys(hot_keys_ ? nullptr : std::make_unique<CasHotKeys>(0))
     , hot_keys(hot_keys_ ? hot_keys_ : own_hot_keys.get())
 {
@@ -460,8 +461,20 @@ Retry CasOperation::freeze(const Retry & policy) const
     if (policy.policy_deadline_ms)
         return policy;
     Retry frozen = policy;
-    frozen.policy_deadline_ms = saturatingAdd(owner.now_ms(), policy.window_ms);
+    frozen.policy_deadline_ms = saturatingAdd(owner.now_ms(), policy.window_ms.value_or(owner.default_window_ms));
     return frozen;
+}
+
+std::optional<WriteResult> CasOperation::pauseBeforeRedecide(uint64_t ms, const GaveUp & unresolved, const Retry & policy)
+{
+    WriteState state;
+    state.attempts_sent = unresolved.attempts_sent;
+    state.sent_any = unresolved.sent_any;
+    state.last_seen = unresolved.last_seen;
+    /// Room for the next decision's two requests: its catalog read and its write.
+    constexpr uint32_t envelopes_for_next_decision = 2;
+    return gatedPause(ms, envelopes_for_next_decision, state, owner.bindPolicy(policy), detail::recordReissue,
+                      /*should_sleep=*/true);
 }
 
 bool CasOperation::fits(uint64_t needed_ms, const Retry::Bound & bound) const
@@ -587,17 +600,17 @@ Removal CasOperation::removeUnder(const String & key, const String & expected_va
 
 std::optional<Object> CasOperation::read(const String & key, const Retry & policy)
 {
-    return readUnder(key, policy, policy.bind(owner.now_ms()));
+    return readUnder(key, policy, owner.bindPolicy(policy));
 }
 
 std::optional<Meta> CasOperation::head(const String & key, const Retry & policy)
 {
-    return headUnder(key, policy, policy.bind(owner.now_ms()));
+    return headUnder(key, policy, owner.bindPolicy(policy));
 }
 
 ListPage CasOperation::list(const String & prefix, const String & cursor, size_t limit, const Retry & policy)
 {
-    return listUnder(prefix, cursor, limit, policy, policy.bind(owner.now_ms()));
+    return listUnder(prefix, cursor, limit, policy, owner.bindPolicy(policy));
 }
 
 void CasOperation::forEachListedKey(const String & prefix, const ListedKeyFn & fn, const Retry & per_page,
@@ -626,7 +639,7 @@ void CasOperation::removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, c
             keys.size(), kBulkDeleteMaxKeys);
     if (keys.empty())
         return;
-    const Retry::Bound bound = policy.bind(owner.now_ms());
+    const Retry::Bound bound = owner.bindPolicy(policy);
     const String subject = fmt::format("{} (+{} keys)", keys.front().str(), keys.size() - 1);
     readLoop("removeManyWriteOnce", subject, policy, bound, [&](auto & access)
     {
@@ -637,12 +650,12 @@ void CasOperation::removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, c
 
 Removal CasOperation::remove(const String & key, const Etag & seen, const Retry & policy)
 {
-    return removeUnder(key, owner.valueFor(key, seen), policy, policy.bind(owner.now_ms()));
+    return removeUnder(key, owner.valueFor(key, seen), policy, owner.bindPolicy(policy));
 }
 
 Removal CasOperation::removeCurrent(const String & key, const Retry & policy)
 {
-    const Retry::Bound bound = policy.bind(owner.now_ms());
+    const Retry::Bound bound = owner.bindPolicy(policy);
     for (uint32_t attempt = 1;; ++attempt)
     {
         const std::optional<Meta> seen = headUnder(key, policy, bound);
@@ -678,7 +691,7 @@ Removal CasOperation::removeCurrent(const String & key, const Retry & policy)
 
 SentinelProbeResult CasOperation::probeSentinel(const String & key, const Retry & policy)
 {
-    const Retry::Bound bound = policy.bind(owner.now_ms());
+    const Retry::Bound bound = owner.bindPolicy(policy);
     bool refresh_attempted = false;
     std::optional<SentinelProbeResult> last_probe;
     for (uint32_t attempt = 1;; ++attempt)
@@ -747,7 +760,7 @@ SentinelProbeResult CasOperation::probeSentinel(const String & key, const Retry 
 
 std::unique_ptr<ReadBuffer> CasOperation::stream(const String & key, const Retry & policy)
 {
-    const Retry::Bound bound = policy.bind(owner.now_ms());
+    const Retry::Bound bound = owner.bindPolicy(policy);
     std::unique_ptr<ReadBuffer> body = readLoop("stream", key, policy, bound, [&](auto & access)
     {
         return owner.backend->stream(key, access);
@@ -761,7 +774,7 @@ std::unique_ptr<ReadBuffer> CasOperation::stream(const String & key, const Retry
 
 void CasOperation::publish(const BlobPublishRequest & request, const Retry & policy)
 {
-    const Retry::Bound bound = policy.bind(owner.now_ms());
+    const Retry::Bound bound = owner.bindPolicy(policy);
     readLoop("publish", request.destination_key, policy, bound, [&](auto & access)
     {
         owner.backend->publish(request, access);
@@ -978,7 +991,7 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         bool fuse = false;
         try
         {
-            outcome = owner.withTransportAccess(state.attempts_sent, [&](auto & access)
+            outcome = owner.withTransportAccess(state.attempts_sent + policy.attempts_already_sent, [&](auto & access)
             {
                 return owner.backend->write(key, bytes, expected_value, access);
             });
@@ -1032,7 +1045,7 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
                 ProfileEvents::increment(ProfileEvents::CASRequestConnectFailureHint);
             /// Checked AFTER the hint, so a hinted attempt stays hinted (reissued before its read); a
             /// fuse timeout is reissued after the settle read runs below.
-            fuse = isFirstAttemptFuseTimeout(e, state.attempts_sent);
+            fuse = isFirstAttemptFuseTimeout(e, state.attempts_sent + policy.attempts_already_sent);
             if (fuse && !refresh_owns_reissue)
                 ProfileEvents::increment(ProfileEvents::CASRequestFirstAttemptFuse);
         }
@@ -1074,7 +1087,7 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         /// would meet the same broken condition, so the reissue itself is the cheaper probe: the attempt
         /// stays ambiguous (`any_ambiguous` is set above), and if the reissue meets a refused precondition
         /// the read below settles it.
-        if (connect_hint && !policy.single_attempt)
+        if (connect_hint && !policy.single_attempt && policy.resend_unresolved)
         {
             if (auto given_up = pauseFlat(state, bound))
                 return *given_up;
@@ -1084,8 +1097,9 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         /// Every refused precondition, and every ambiguous attempt that was not reissued on a
         /// connect-failure hint, is settled by ONE exact read, under every policy: a refused
         /// precondition does not say WHO holds the key, and a 404 and a 412 reach here as the same
-        /// answer. A hinted attempt reaches this read only when its reissue meets a refused
-        /// precondition. A refused precondition needs only to know WHAT is there, so a presence-only
+        /// answer. A hinted attempt reaches this read after a reissue that met a refused
+        /// precondition, or at once under a policy that never resends it (`single_attempt`,
+        /// `resend_unresolved = false`). A refused precondition needs only to know WHAT is there, so a presence-only
         /// caller settles it with a HEAD; proving an ambiguous attempt landed needs the bytes, and there
         /// the body read is unavoidable.
         ProfileEvents::increment(ProfileEvents::CASRequestResolveRead);
@@ -1120,7 +1134,7 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         /// all, which proves neither way and leaves this write's ambiguity alive. A reissue is what
         /// settles it, and re-sending the same bytes under the same precondition is safe: it ends at
         /// the store's own answer. A policy with no reissue has to say it settled nothing.
-        if (policy.single_attempt)
+        if (policy.single_attempt || !policy.resend_unresolved)
             return gaveUp(GaveUp::Why::Unresolved, sourceFor(bound), state);
         /// The first attempt met the adaptive first-attempt timeout: a connection-quality answer, not a
         /// store fault. The read above settled nothing new about it, so re-send at once as attempt 2
@@ -1140,18 +1154,18 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
 WriteResult CasOperation::create(const String & key, const String & bytes, const Retry & policy)
 {
     WriteState state;
-    return writeLoop(key, bytes, std::nullopt, policy, policy.bind(owner.now_ms()), state, ResolveWith::Body);
+    return writeLoop(key, bytes, std::nullopt, policy, owner.bindPolicy(policy), state, ResolveWith::Body);
 }
 
 WriteResult CasOperation::replace(const String & key, const String & bytes, const Etag & seen, const Retry & policy)
 {
     WriteState state;
-    return writeLoop(key, bytes, seen, policy, policy.bind(owner.now_ms()), state, ResolveWith::Body);
+    return writeLoop(key, bytes, seen, policy, owner.bindPolicy(policy), state, ResolveWith::Body);
 }
 
 WriteResult CasOperation::readModifyWrite(const String & key, const DecideOnObject & decide, const Retry & policy)
 {
-    const Retry::Bound bound = policy.bind(owner.now_ms());
+    const Retry::Bound bound = owner.bindPolicy(policy);
     WriteState state;
 
     Resolved resolved = observe(key, policy, bound);
@@ -1209,7 +1223,7 @@ WriteResult CasOperation::readModifyWrite(const String & key, const DecideOnObje
 
 WriteResult CasOperation::readModifyWriteOnPresence(const String & key, const DecideOnMeta & decide, const Retry & policy)
 {
-    const Retry::Bound bound = policy.bind(owner.now_ms());
+    const Retry::Bound bound = owner.bindPolicy(policy);
     WriteState state;
 
     Resolved resolved = observePresence(key, policy, bound);

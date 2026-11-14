@@ -47,7 +47,7 @@ sequenceDiagram
     rect rgba(255,190,120,0.15)
     Note over R,Snd: T2 -- confirm
     R->>Snd: POST cas_confirm = token
-    Snd->>Snd: confirmExactRef, zero object-store I/O, never throws
+    Snd->>Snd: confirmExactRef from memory, at most one mount-slot GET, never throws
     Snd-->>R: cookie cas_confirm_answer = yes or unproven
     end
 
@@ -67,9 +67,17 @@ sequenceDiagram
 | 2 | The `relink_confirm` capability | The receiver sends `cas_capabilities=relink_confirm` with the fetch; the sender offers a relink only to a receiver that promised to run the confirm round trip before promoting. The replication protocol version stays upstream's and never selects a relink |
 | 3 | One resolution for two outputs | The manifest bytes and the confirm token come from the **same** view. Two separate calls would allow a repoint in between and hand the receiver a token naming a manifest whose entries it never adopted |
 | 4 | The receiver trusts nothing from the wire but the entry list | The sender's manifest id, namespace and payload digest are ignored; the target namespace and ref come from the receiver's own router, and manifest path hygiene is validated at decode |
-| 5 | The confirm is I/O-free and fail-closed | A cold, evicted, unfenced or terminal mount answers `Unknown`. `No` and `Unknown` both go on the wire as `unproven`, because the fence check is evaluated last, so a `No` cannot be distinguished from "cannot prove it right now" |
+| 5 | The confirm answers from memory and is fail-closed | A cold, evicted, unfenced or terminal mount answers `Unknown`, with no object-store request. `No` and `Unknown` both go on the wire as `unproven`, because the fence check is evaluated last, so a `No` cannot be distinguished from "cannot prove it right now". Before a `Yes`, the sender checks that it still owns its mount slot, and answers `Unknown` unless the check passes (details below the table) |
 | 6 | Only the literal `yes` authorizes promotion | Everything else — including a timeout — is one outcome: throw and retry later |
 | 7 | Promote outcomes are three-way | `Committed` proceeds; a **proven** not-committed state (body-absent precommit, precommit no longer live owner, ref conflict) falls back to a byte fetch; `Unresolved` **throws**, because returning "fall back" there would publish the part twice |
+
+The slot check in gate 5 works like this:
+
+- It reads the mount slot once, through mount admission, which uses the lease budget. It makes one CAS-engine attempt and the confirm never repeats it. On a writable `Native` mount the SDK does not retry it either; in the emulated token modes the storage layer's ordinary retries still apply inside that attempt.
+- A successor's claim, a GC fence-out or a release rewrites the slot first, so the read catches a takeover that the local fence has not seen yet.
+- The answer is `Yes` only if the slot still holds a body this mount's own renewer wrote.
+- A renewal that commits between the read and the check gives `Unknown` (`CASRelinkConfirmRefusedSlotMoved`), as does an absent slot or a pool with no renewer. A renewal that commits before the read gives `Yes`.
+- A failed read counts `CASRelinkConfirmRefusedSlotUnreadable` and answers `Unknown`: `ContentAddressedMetadataStorage::confirmExactRef` turns the failure into `Unknown`, so a confirm never throws at its caller.
 
 The byte-fetch fallback is bounded: it re-invokes the fetch with relink disabled, which stops the
 receiver advertising its pool uuid, which stops the sender offering relink — so the relink path

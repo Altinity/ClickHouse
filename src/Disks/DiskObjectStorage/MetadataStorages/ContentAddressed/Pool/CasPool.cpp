@@ -45,6 +45,8 @@ namespace ProfileEvents
 {
     extern const Event CASPartFolderManifestGets;
     extern const Event CASRemountAttempts;
+    extern const Event CASRelinkConfirmRefusedSlotMoved;
+    extern const Event CASRelinkConfirmRefusedSlotUnreadable;
     extern const Event CASRemountSucceeded;
     extern const Event CASRemountFailed;
     extern const Event CASRemountHeldTransient;
@@ -192,13 +194,13 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
           [this](uint64_t g) { mount_runtime.checkFenceOrThrow(g); }},
           config.boot_ms_fn,
           config.retry_sleep_fn ? config.retry_sleep_fn : mountPlaneSleepFn(),
-          &hot_keys)
+          &hot_keys, config.cas_request_budget.request_window_ms)
     , lease_requests(
           pool_backend,
           Fence::open(),
           config.boot_ms_fn,
           config.retry_sleep_fn ? config.retry_sleep_fn : mountPlaneSleepFn(),
-          &hot_keys)
+          &hot_keys, config.cas_request_budget.request_window_ms)
     /// The open plane's fence is the pool's teardown flag: generation 0 forever, exactly like
     /// `Fence::open`, but `admit` refuses once `beginTeardown` ran. A GC round, an FSCK or a probe in
     /// flight is then refused at its next request instead of running to completion under a disk that
@@ -215,7 +217,7 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
           [](uint64_t) {}},
           config.boot_ms_fn,
           config.retry_sleep_fn ? config.retry_sleep_fn : openPlaneSleepFn(),
-          &hot_keys)
+          &hot_keys, config.cas_request_budget.request_window_ms)
     /// Seed the monotone admitted-algo cache from the pool state `createOrValidate` already
     /// established (fresh create, steady-state member, or a just-completed admission union) --
     /// register-before-first-write means this Pool's own `writeAlgo()` is ALWAYS a
@@ -407,7 +409,9 @@ Pool::LifecycleSnapshot Pool::lifecycleSnapshot() const
 
 PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
 {
-    if (!config.read_only)
+    if (config.read_only)
+        validateCasRequestWindow(config.cas_request_budget);
+    else
         validateWritableMountTiming(config);
 
     /// Wrap the pool backend once, transparently, so EVERY CA S3 op — probe, pool-meta,
@@ -420,7 +424,8 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
     Layout layout(config.pool_prefix);
     /// The whole bootstrap runs on an OPEN fence: there is no mount lease yet, and the claim below is
     /// what establishes one.
-    CasRequests bootstrap_requests(backend, Fence::open(), config.boot_ms_fn);
+    CasRequests bootstrap_requests(
+        backend, Fence::open(), config.boot_ms_fn, {}, nullptr, config.cas_request_budget.request_window_ms);
     bool initialize_empty_catalog = false;
     /// The probe writes and deletes throwaway keys to verify conditional-op enforcement. A read-only
     /// open must never mutate the pool it inspects; fsck only reads, so skip it. (Pool meta below is
@@ -992,7 +997,7 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
     logSkippedCapabilityProbe(
         victim_srid, config.pool_prefix, fmt::format("decommission of pool member '{}'", victim_srid));
     /// The admin claim must be RENEWED like any writable mount: the host disk may be observe-only
-    /// (background_watermark=false), but an unrenewed claim (TTL ~30s) aborts any long drain midway.
+    /// (background_watermark=false), but an unrenewed claim (one mount lease TTL) aborts any long drain midway.
     config.background_watermark = true;
     /// Bounded by the lease, like the startup re-anchor: an admin claim that cannot renew ends rather than
     /// pauses.
@@ -1011,7 +1016,8 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
     /// with `config.boot_ms_fn`: a retry loop bound to a frozen test clock that only a fake sleep
     /// advances would otherwise retry forever against this engine's default REAL sleep, which never
     /// calls it -- the deadline it measures against would never appear to elapse.
-    CasRequests bootstrap_requests(backend, Fence::open(), config.boot_ms_fn, config.retry_sleep_fn);
+    CasRequests bootstrap_requests(
+        backend, Fence::open(), config.boot_ms_fn, config.retry_sleep_fn, nullptr, config.cas_request_budget.request_window_ms);
     CasOperation owner_op = bootstrap_requests.admit();
     std::optional<UInt128> victim_uuid = readOwnerUuid(owner_op, layout, victim_srid);
     if (!victim_uuid)
@@ -2137,6 +2143,41 @@ DropNamespaceStats Pool::dropNamespace(const NamespaceLifeId & life)
     {
         return ref_ledger.dropNamespace(life);
     });
+}
+
+ConfirmAnswer Pool::confirmExactRef(const RootNamespace & ns, const String & ref_name,
+                                    const ManifestRef & manifest_ref) const
+{
+    /// Captured before the ledger snapshot: if a remount lands in between, this older ownership cannot
+    /// hold the new slot, so the mismatch refuses. The order is safety-bearing;
+    /// `RemountBetweenCaptureAndSnapshotAnswersUnknown` pins it.
+    const std::shared_ptr<const MountSlotOwnership> ownership = mount_runtime.slotOwnership();
+    if (confirm_after_ownership_capture_hook_for_test)
+        confirm_after_ownership_capture_hook_for_test();
+    const ConfirmAnswer answer = ref_ledger.confirmExactRef(ns, ref_name, manifest_ref);
+    if (answer != ConfirmAnswer::Yes)
+        return answer;
+    if (confirm_after_ledger_snapshot_hook_for_test)
+        confirm_after_ledger_snapshot_hook_for_test();
+    bool held = false;
+    if (ownership)
+    {
+        try
+        {
+            held = mount_runtime.slotHeldBy(*ownership);
+        }
+        catch (...)
+        {
+            ProfileEvents::increment(ProfileEvents::CASRelinkConfirmRefusedSlotUnreadable);
+            throw;
+        }
+    }
+    if (!held)
+    {
+        ProfileEvents::increment(ProfileEvents::CASRelinkConfirmRefusedSlotMoved);
+        return ConfirmAnswer::Unknown;
+    }
+    return ConfirmAnswer::Yes;
 }
 
 NamespaceLifeId Pool::namespaceLife(const RootNamespace & ns)

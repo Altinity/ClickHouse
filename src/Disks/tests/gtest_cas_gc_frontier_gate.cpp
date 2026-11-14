@@ -82,6 +82,10 @@ const UInt128 kGc = hexToU128("00000000000000000000000000000001");
 /// be said out loud.
 void noAuthorityRefresh() {}
 
+/// The retirement announcement is mandatory for the same reason: a drain that erases without it has to
+/// say so.
+void noRetirementRecord(const NamespaceLifeId &) {}
+
 /// The lying store, shared from `cas_test_helpers.h`: every key is served by exact GET while the
 /// selected ones are HIDDEN from every LIST. That is the only way to build the cross-namespace
 /// scenario -- the hidden namespace's records stay durable and readable, so a round that KNOWS to
@@ -114,6 +118,14 @@ public:
         std::lock_guard lock(control_mutex);
         catalog_key = key;
         conflict_next_catalog_cas = true;
+    }
+
+    /// Lets `allowed` conditional writes of `key` through, then throws from every further one.
+    void failCatalogCasesAfter(const String & key, size_t allowed)
+    {
+        std::lock_guard lock(control_mutex);
+        catalog_key = key;
+        catalog_cas_budget = allowed;
     }
 
     void waitForBlockedCatalogCas()
@@ -195,6 +207,12 @@ public:
                 lose_next_catalog_cas_response = false;
                 lose_response = true;
             }
+            if (conditional && key == catalog_key && catalog_cas_budget)
+            {
+                if (*catalog_cas_budget == 0)
+                    throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected catalog write failure");
+                --*catalog_cas_budget;
+            }
             if (conditional && key == catalog_key && conflict_next_catalog_cas)
             {
                 conflict_next_catalog_cas = false;
@@ -237,6 +255,7 @@ private:
     bool release_catalog_cas = false;
     bool lose_next_catalog_cas_response = false;
     bool conflict_next_catalog_cas = false;
+    std::optional<size_t> catalog_cas_budget;
     String after_read_key;
     std::function<void()> after_read_hook;
 };
@@ -276,7 +295,7 @@ public:
     bool existsIgnoringFault(const String & key)
     {
         bypass_fault = true;
-        CasRequests requests(BackendPtr(std::shared_ptr<void>(), this), Fence::open());
+        CasRequests requests(BackendPtr(std::shared_ptr<void>(), this), Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
         CasOperation op = requests.admit();
         const bool present = op.head(key, Retry::once()).has_value();
         bypass_fault = false;
@@ -2975,14 +2994,14 @@ TEST(CASCatalogLifecycleReconciler, EmptyCatalogReturnsAuthoritativeCompleteCut)
 
     CasFoldSeal parent;
     CatalogLifecycleReconciler reconciler(op, layout, parent);
-    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh);
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh, noRetirementRecord);
 
     EXPECT_EQ(result.authority_status, AuthorityStatus::Authoritative);
     EXPECT_EQ(result.catalog_resolution, CatalogResolution::DrainComplete);
     ASSERT_TRUE(result.final_catalog_cut);
     EXPECT_TRUE(result.final_catalog_cut->catalog.entries.empty());
-    EXPECT_TRUE(result.retired_lives.empty());
-    EXPECT_EQ(result.deleted, 0);
+    EXPECT_TRUE(reconciler.retiredLives().empty());
+    EXPECT_EQ(reconciler.completedErases(), 0);
 }
 
 TEST(CASCatalogLifecycleReconciler, DeletesEligibleRowsFromReturnedResolutionCuts)
@@ -3001,17 +3020,49 @@ TEST(CASCatalogLifecycleReconciler, DeletesEligibleRowsFromReturnedResolutionCut
     backend->resetCounts();
 
     CatalogLifecycleReconciler reconciler(op, layout, parent);
-    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh);
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh, noRetirementRecord);
 
     EXPECT_EQ(result.authority_status, AuthorityStatus::Authoritative);
     EXPECT_EQ(result.catalog_resolution, CatalogResolution::DrainComplete);
-    EXPECT_EQ(result.deleted, deletes);
-    ASSERT_EQ(result.retired_lives.size(), deletes);
+    EXPECT_EQ(reconciler.completedErases(), deletes);
+    ASSERT_EQ(reconciler.retiredLives().size(), deletes);
     ASSERT_TRUE(result.final_catalog_cut);
     EXPECT_TRUE(result.final_catalog_cut->catalog.entries.empty());
     const std::vector<String> journal = backend->journalSnapshot();
     const String catalog_get = "get " + layout.refCatalogKey();
     EXPECT_EQ(std::count(journal.begin(), journal.end(), catalog_get), deletes + 1);
+}
+
+/// The retirement announcement precedes the erase of its row: a record made afterwards leaves a
+/// window in which the life is gone but unrecorded.
+TEST(CASCatalogLifecycleReconciler, AnnouncesEachLifeBeforeItsRowIsErased)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    constexpr size_t deletes = 3;
+    seedCompletedRemovingBatch(op, store, kGc, deletes);
+    const auto parent_object = op.read(layout.foldSealKey(1, 1), Retry::once());
+    ASSERT_TRUE(parent_object);
+    const CasFoldSeal parent = decodeFoldSeal(parent_object->bytes);
+
+    std::vector<NamespaceLifeId> announced;
+    size_t announced_while_cataloged = 0;
+    CatalogLifecycleReconciler reconciler(op, layout, parent);
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(
+        noAuthorityRefresh,
+        [&](const NamespaceLifeId & life)
+        {
+            announced.push_back(life);
+            if (CasRefCatalog::lifeIfCataloged(op, layout, life.ns) == std::optional<NamespaceLifeId>{life})
+                ++announced_while_cataloged;
+        });
+
+    EXPECT_EQ(reconciler.completedErases(), deletes);
+    EXPECT_EQ(announced, reconciler.retiredLives()) << "each life is announced exactly once, in erase order";
+    EXPECT_EQ(announced_while_cataloged, deletes) << "the announcement must precede the erase of its row";
 }
 
 TEST(CASCatalogLifecycleReconciler, ReturnsRetiredLifeWhenAuthorityMovesAfterResolution)
@@ -3038,15 +3089,47 @@ TEST(CASCatalogLifecycleReconciler, ReturnsRetiredLifeWhenAuthorityMovesAfterRes
     });
 
     CatalogLifecycleReconciler reconciler(fenced_op, layout, parent);
-    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh);
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh, noRetirementRecord);
 
     EXPECT_EQ(result.authority_status, AuthorityStatus::FencedOut);
     EXPECT_EQ(result.catalog_resolution, CatalogResolution::ExactRowAbsent);
-    ASSERT_EQ(result.retired_lives.size(), 1);
-    EXPECT_EQ(result.retired_lives.front(),
+    ASSERT_EQ(reconciler.retiredLives().size(), 1);
+    EXPECT_EQ(reconciler.retiredLives().front(),
         NamespaceLifeId::fromCatalogEntry(fixture.ns, fixture.life_id));
-    EXPECT_EQ(result.deleted, 1);
+    EXPECT_EQ(reconciler.completedErases(), 1);
     EXPECT_FALSE(result.final_catalog_cut);
+}
+
+/// The store acknowledged the erase and the resolution read that follows throws: the erase is
+/// counted and its life recorded anyway, because the drain's caller reads both after the throw.
+TEST(CASCatalogLifecycleReconciler, RecordsAnAcknowledgedEraseWhoseResolutionReadThrows)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    const CompletedRemovingFixture fixture = seedCompletedRemoving(op, store, kGc);
+    const auto parent_object = op.read(layout.foldSealKey(1, 1), Retry::once());
+    ASSERT_TRUE(parent_object);
+    const CasFoldSeal parent = decodeFoldSeal(parent_object->bytes);
+
+    /// The first catalog read selects the row; the second is the erase's resolution read.
+    size_t catalog_reads = 0;
+    backend->afterReadOf(layout.refCatalogKey(), [&]
+    {
+        if (++catalog_reads == 2)
+            throw std::runtime_error("injected resolution read failure");
+    });
+
+    CatalogLifecycleReconciler reconciler(op, layout, parent);
+    EXPECT_THROW(reconciler.reconcile(noAuthorityRefresh, noRetirementRecord), std::runtime_error);
+    backend->afterReadOf(layout.refCatalogKey(), {});
+
+    ASSERT_FALSE(CasRefCatalog::lifeIfCataloged(op, layout, fixture.ns)) << "the erase landed";
+    EXPECT_EQ(reconciler.completedErases(), 1u);
+    EXPECT_EQ(reconciler.retiredLives(),
+        std::vector<NamespaceLifeId>{NamespaceLifeId::fromCatalogEntry(fixture.ns, fixture.life_id)});
 }
 
 TEST(CASCatalogLifecycleReconciler, InitialFenceLossReportsEligibleRowStillPresent)
@@ -3068,12 +3151,12 @@ TEST(CASCatalogLifecycleReconciler, InitialFenceLossReportsEligibleRowStillPrese
     backend->afterReadOf(layout.refCatalogKey(), [&] { authority_held = false; });
 
     CatalogLifecycleReconciler reconciler(fenced_op, layout, parent);
-    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh);
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh, noRetirementRecord);
 
     EXPECT_EQ(result.authority_status, AuthorityStatus::FencedOut);
     EXPECT_EQ(result.catalog_resolution, CatalogResolution::ExactRowStillPresent);
-    EXPECT_TRUE(result.retired_lives.empty());
-    EXPECT_EQ(result.deleted, 0);
+    EXPECT_TRUE(reconciler.retiredLives().empty());
+    EXPECT_EQ(reconciler.completedErases(), 0);
     EXPECT_FALSE(result.final_catalog_cut);
     EXPECT_EQ(backend->getCount(layout.refCatalogKey()), 1)
         << "an operation whose admission is gone before the erase reports the selection cut it "
@@ -3099,16 +3182,41 @@ TEST(CASCatalogLifecycleReconciler, RetriesFromTheMandatoryConflictResolutionCut
     backend->conflictNextCatalogCas(layout.refCatalogKey());
 
     CatalogLifecycleReconciler reconciler(op, layout, parent);
-    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh);
+    size_t announcements = 0;
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(
+        noAuthorityRefresh, [&](const NamespaceLifeId &) { ++announcements; });
 
     EXPECT_EQ(result.authority_status, AuthorityStatus::Authoritative);
     EXPECT_EQ(result.catalog_resolution, CatalogResolution::DrainComplete);
-    EXPECT_EQ(result.deleted, 1);
+    EXPECT_EQ(reconciler.completedErases(), 1);
+    EXPECT_EQ(announcements, 1) << "one announcement per life, however many erase attempts it takes";
     const std::vector<String> journal = backend->journalSnapshot();
     const String catalog_get = "get " + layout.refCatalogKey();
     EXPECT_EQ(std::count(journal.begin(), journal.end(), catalog_get), 4)
         << "selection, the refused write's own resolve read, the mandatory resolution cut the retry "
            "reuses, and the committed erase's resolution -- the catalog takes no cut of its own";
+}
+
+/// A failing announcement aborts the drain before any erase is sent: no record means no erase.
+TEST(CASCatalogLifecycleReconciler, AFailingAnnouncementSendsNoErase)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    seedCompletedRemoving(op, store, kGc);
+    const auto parent_object = op.read(layout.foldSealKey(1, 1), Retry::once());
+    ASSERT_TRUE(parent_object);
+    const CasFoldSeal parent = decodeFoldSeal(parent_object->bytes);
+    backend->resetCounts();
+
+    CatalogLifecycleReconciler reconciler(op, layout, parent);
+    EXPECT_THROW(
+        (void)reconciler.reconcile(noAuthorityRefresh, [](const NamespaceLifeId &) { throw std::runtime_error("record failed"); }),
+        std::runtime_error);
+    EXPECT_EQ(backend->putOverwriteCount(layout.refCatalogKey()), 0) << "the erase must not be sent";
+    EXPECT_FALSE(CasRefCatalog::read(op, layout).catalog.entries.empty()) << "the row must still be cataloged";
 }
 
 /// THE DRAIN'S AUTHORITY, end to end. `CatalogLifecycleReconciler` and
@@ -3200,6 +3308,35 @@ TEST(CASGCFrontierGate, ALeaderDeposedBetweenTwoErasesStopsAfterTheFirst)
         << "one row was erased before the deposition; the other survives it";
 }
 
+/// A drain that throws after erasing a row still reports that row: the phase record is what an
+/// operator reads to learn how far the round got.
+TEST(CASGCFrontierGate, AnAbortedDrainReportsTheRowsItErased)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    /// The injected failure is retried until the request window ends; a virtual clock ends it at once.
+    const auto clock = DB::Cas::tests::VirtualRetryClock::installOn(store);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    seedCompletedRemovingBatch(op, store, kGc, /*count=*/2);
+    backend->failCatalogCasesAfter(layout.refCatalogKey(), /*allowed=*/1);
+
+    std::optional<std::map<String, UInt64>> drain_metrics;
+    Gc gc(store, kGc);
+    gc.setPhaseSink([&](const GcPhaseRecord & rec)
+    {
+        if (rec.phase == "pre_fold_ref_drain")
+            drain_metrics = rec.metrics;
+    });
+    EXPECT_THROW(gc.runRegularRound(), DB::Exception);
+    gc.setPhaseSink({});
+
+    ASSERT_TRUE(drain_metrics.has_value()) << "the drain phase emits its record even when it throws";
+    ASSERT_TRUE(drain_metrics->contains("deleted")) << "the aborted drain reports its erase count";
+    EXPECT_EQ(drain_metrics->at("deleted"), 1u);
+}
+
 TEST(CASGCFrontierGate, HealthyRebuildUsesTheCatalogLifecycleReconciler)
 {
     auto backend = std::make_shared<DrainRaceBackend>();
@@ -3209,6 +3346,9 @@ TEST(CASGCFrontierGate, HealthyRebuildUsesTheCatalogLifecycleReconciler)
     const Layout & layout = store->layout();
     const CompletedRemovingFixture fixture = seedCompletedRemoving(op, store, kGc);
     const uint64_t catalog_cas_before = backend->putOverwriteCount(layout.refCatalogKey());
+    /// An admission in flight keeps the name's slot, so each retirement record lands in it.
+    std::optional<CasRefLedger::ColdAdmission> admission = store->beginColdAdmissionForTest(fixture.ns);
+    const uint64_t retirements_before = store->refNameRetirementsForTest(fixture.ns);
 
     Gc gc(store, kGc);
     const RebuildReport result = gc.rebuildBaseline(/*force=*/true);
@@ -3216,6 +3356,8 @@ TEST(CASGCFrontierGate, HealthyRebuildUsesTheCatalogLifecycleReconciler)
     EXPECT_TRUE(result.performed);
     EXPECT_FALSE(CasRefCatalog::lifeIfCataloged(op, layout, fixture.ns));
     EXPECT_EQ(backend->putOverwriteCount(layout.refCatalogKey()), catalog_cas_before + 1);
+    EXPECT_EQ(store->refNameRetirementsForTest(fixture.ns), retirements_before + 2)
+        << "the rebuild drain records the retirement before the erase and again after it";
 }
 
 TEST(CASGCFrontierGate, DamagedStateRebuildDoesNotDeleteCompletedRemovingRows)

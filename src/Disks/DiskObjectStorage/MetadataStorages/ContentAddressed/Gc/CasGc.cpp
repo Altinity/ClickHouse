@@ -64,6 +64,11 @@ namespace ProfileEvents
     extern const Event CASRefManifestBodyFoldGets;
     extern const Event CASRefEmittedEdges;
     extern const Event CASRefCleanupObjectsDeleted;
+    extern const Event CASRefCleanupObjectsPlanned;
+    extern const Event CASRefCleanupNamespacesSkipped;
+    extern const Event CASRefCleanupStoppedLeaseMoved;
+    extern const Event CASRefCleanupStoppedAuthorityUnverified;
+    extern const Event CASRefCleanupChunksUnderCatalogChange;
 }
 
 namespace DB
@@ -417,7 +422,7 @@ void Gc::runNamespaceJanitor(
     {
         CasRequests & requests = store->openRequests();
         const Layout & layout = store->layout();
-        NamespaceJanitor janitor(requests, layout, 1000,
+        NamespaceJanitor janitor(requests, layout, CasOperation::kCasListPageKeys,
             [this](CasOperation & op, const std::vector<WriteOnceKey> & keys, NamespaceJanitorResult & out)
             {
                 removeWriteOnceOnIoPool(op, keys, out);
@@ -615,11 +620,9 @@ void Gc::applyRedeleteOutcome(RedeleteRoundContext & ctx, const RetiredEntry & e
     /// The audit row is observability only -- the delete in `performRedeleteIo` already executed
     /// regardless of this cap. Skipping it here bounds the per-shard `GcOutcomes` body without
     /// skipping or deferring any destructive work.
-    if (ctx.round_work_budget.outcomeEntryAvailable())
-    {
+    ctx.outcome_tallies[ctx.shard].add(outcome_kind);
+    if (ctx.round_work_budget.admitOutcomeRow(ctx.shard, outcome))
         ctx.outcomes[ctx.shard].entries.push_back(std::move(outcome));
-        ++ctx.round_work_budget.outcome_entries_used;
-    }
     ++ctx.report.redeleted;
     ProfileEvents::increment(ProfileEvents::CASGCRetiredRedeleted);
     /// Drop the per-hash meta only on a removal or a proven absence — a mismatch means a
@@ -814,8 +817,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// planner), `pruneSupersededGenerations`, the post-CAS hand-off reclaim (its OWN reserve, never
     /// `pruneSupersededGenerations`' shared remainder), the post-CAS manifest-body cleanup, and
     /// `cleanupRefObjects`. A cap is therefore cumulative over the round, never reset between families or
-    /// shards. See `GcRoundWorkBudget`'s own comment for the fail-closed contract each family applies on
-    /// exhaustion.
+    /// shards, except the outcome log byte limit, which is per shard. See `GcRoundWorkBudget`'s own
+    /// comment for the fail-closed contract each family applies on exhaustion.
     GcRoundWorkBudget round_work_budget;
     round_work_budget.max_graduations = store->poolConfig().gc_round_graduation_budget;
     round_work_budget.max_redeletes = store->poolConfig().gc_round_redelete_budget;
@@ -825,19 +828,21 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     round_work_budget.max_prefix_wholesale_objects = store->poolConfig().gc_round_prefix_wholesale_budget;
     round_work_budget.max_handoff_prefix_wholesale_objects = store->poolConfig().gc_round_handoff_prefix_wholesale_budget;
     round_work_budget.max_outcome_entries = store->poolConfig().gc_round_outcome_entry_budget;
+    if (const auto limit = store->poolConfig().gc_outcome_log_byte_limit_for_test)
+        round_work_budget.max_outcome_log_bytes = *limit;
 
     /// The helping barrier precedes heartbeat work, DEFER, the hot stream LIST, and every successor
     /// artifact. A deferred invocation therefore cannot leave a row the adopted parent already proved
     /// complete, and a folding invocation takes its catalog cut only after the deletion settles.
     {
         GcPhaseTimer t(phase_sink, "pre_fold_ref_drain");
-        const CatalogLifecycleReconcileResult drain_result = drainCompletedRemoving(state);
-        for (const NamespaceLifeId & retired_life : drain_result.retired_lives)
-            store->invalidateRemovedCatalogLife(retired_life);
+        uint64_t completed_erases = 0;
+        /// Declared after `t`, so it runs before the timer emits its record, on a throw too.
+        SCOPE_EXIT({ t.metric("deleted", completed_erases); });
+        const CatalogLifecycleReconcileResult drain_result = drainCompletedRemoving(state, completed_erases);
         if (drain_result.authority_status != AuthorityStatus::Authoritative
             || drain_result.catalog_resolution != CatalogResolution::DrainComplete)
             throwCasWriteRetryLater("CAS GC pre-fold drain lost authority before the catalog settled");
-        t.metric("deleted", drain_result.deleted);
     }
 
     /// Etag-guarded fence-out of dead mounts (liveness only — graduation itself paces on GC
@@ -1063,6 +1068,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             record_redelete_job_metrics();
     });
     std::map<uint64_t, OutcomeLog> outcomes;
+    std::map<uint64_t, OutcomeTally> outcome_tallies;
     for (uint64_t shard = 0; shard < folded.retired_merge.size(); ++shard)
     {
         RetiredMergeResult & merge = folded.retired_merge[shard];
@@ -1090,6 +1096,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             .round_work_budget = round_work_budget,
             .report = report,
             .outcomes = outcomes,
+            .outcome_tallies = outcome_tallies,
             .jobs_scheduled = redelete_jobs_scheduled};
         redeleteBlobs(redelete_ctx, redelete_now, *io_pool, store->poolConfig().gc_io_concurrency, layout, op);
         for (const RetiredEntry & entry : merge.spared)
@@ -1117,12 +1124,11 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             /// The audit row is observability only -- `settleEntry` already unconditionally spared this
             /// entry (INV_NO_LOSS: recovery wins past any budget), so this cap can never re-condemn it;
             /// it only bounds whether the decision gets a `GcOutcomes` row.
-            if (round_work_budget.outcomeEntryAvailable())
-            {
-                outcomes[shard].entries.push_back(OutcomeEntry{.kind = entry.kind, .ref = entry.ref,
-                                                               .token = entry.token, .outcome = OutcomeKind::Spared});
-                ++round_work_budget.outcome_entries_used;
-            }
+            OutcomeEntry spared_row{.kind = entry.kind, .ref = entry.ref,
+                                    .token = entry.token, .outcome = OutcomeKind::Spared};
+            outcome_tallies[shard].add(OutcomeKind::Spared);
+            if (round_work_budget.admitOutcomeRow(shard, spared_row))
+                outcomes[shard].entries.push_back(std::move(spared_row));
             ProfileEvents::increment(ProfileEvents::CASGCRetiredSpared);
             /// A spare does NOT touch the
             /// meta. GC freshness meta is add-only — GC never publishes `Clean`. The in-degree recovered,
@@ -1183,10 +1189,23 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     }
 
     /// Outcome logs: write-once + byte-adopt (observation-bearing HEAD tokens — never the
-    /// deterministic-artifact path). Tally the report from the FINAL durable logs.
+    /// deterministic-artifact path). The report counts this round's decisions, except for a shard whose
+    /// log an earlier attempt of the same round already wrote: that durable log is adopted and counted.
+    uint64_t outcome_rows_recorded = 0;
+    uint64_t outcome_decisions = 0;
+    for (const auto & [shard, log] : outcomes)
+        outcome_rows_recorded += log.entries.size();
+    for (const auto & [shard, tally] : outcome_tallies)
+        outcome_decisions += tally.total();
     for (auto & [shard, log] : outcomes)
     {
         const String key = layout.outcomesKey(generation, attempt, new_round, shard);
+        if (const auto ledger = round_work_budget.outcome_log_ledgers.find(shard);
+            ledger != round_work_budget.outcome_log_ledgers.end() && ledger->second.dropped > 0)
+            LOG_WARNING(logger,
+                "CAS gc: the outcome log of shard {} reached its {}-byte limit; {} audit rows were not recorded "
+                "(the deletes and spares they describe happened)",
+                shard, round_work_budget.max_outcome_log_bytes, ledger->second.dropped);
         const String body = sealObject(FormatId::GcOutcomes, encodeOutcomeLog(log));
         WriteResult written = op.create(key, body, Retry::standard());
         if (const auto * conflict = std::get_if<Conflict>(&written))
@@ -1211,20 +1230,21 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                     throw Exception(ErrorCodes::ABORTED,
                         "CAS gc: undecodable outcome log at {} cannot be adopted: {}", key, e.message());
                 }
+                OutcomeTally adopted;
+                for (const OutcomeEntry & o : log.entries)
+                    adopted.add(o.outcome);
+                outcome_tallies[shard] = adopted;
             }
         }
         else
             orThrow(std::move(written), fmt::format("CAS gc: outcome log at {}", key));
-        for (const OutcomeEntry & o : log.entries)
-        {
-            switch (o.outcome)
-            {
-                case OutcomeKind::Deleted: ++report.deleted; break;
-                case OutcomeKind::Absent: ++report.absent; break;
-                case OutcomeKind::Replaced: ++report.replaced; break;
-                case OutcomeKind::Spared: ++report.spared; break;
-            }
-        }
+    }
+    for (const auto & [shard, tally] : outcome_tallies)
+    {
+        report.deleted += tally.deleted;
+        report.absent += tally.absent;
+        report.replaced += tally.replaced;
+        report.spared += tally.spared;
     }
     pending_deletes_timer->metric("redeleted", report.redeleted - redeleted_before);
     pending_deletes_timer->metric("graduated", report.graduated - graduated_before);
@@ -1233,6 +1253,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     pending_deletes_timer->metric("replaced", report.replaced);
     pending_deletes_timer->metric("spared", report.spared);
     pending_deletes_timer->metric("outcome_logs_written", outcomes.size());
+    pending_deletes_timer->metric("outcome_rows_dropped", outcome_decisions - outcome_rows_recorded);
     record_redelete_job_metrics();
     pending_deletes_timer.reset();   /// emits the `pending_deletes` row
 
@@ -1493,11 +1514,22 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// what a reader of a round that reclaimed nothing needs to see.
     {
         GcPhaseTimer t(phase_sink, "ref_object_cleanup");
+        RefCleanupPassStats cleanup_stats;
+        /// Runs before `t` emits its row, also when a delete chunk throws: the pass has then already
+        /// deleted objects that the row must account for.
+        SCOPE_EXIT_SAFE({
+            t.metric("suppressed", suppress_destructive ? 1 : 0);
+            t.metric("trim_enabled", trim_enabled ? 1 : 0);
+            t.metric("namespaces_planned", folded.ref_tables.size());
+            t.metric("objects_planned", cleanup_stats.objects_planned);
+            t.metric("objects_deleted", cleanup_stats.objects_deleted);
+            t.metric("namespaces_skipped", cleanup_stats.namespaces_skipped);
+            t.metric("stopped_lease_moved", cleanup_stats.stopped_lease_moved ? 1 : 0);
+            t.metric("stopped_authority_unverified", cleanup_stats.stopped_authority_unverified ? 1 : 0);
+            t.metric("chunks_under_catalog_change", cleanup_stats.chunks_under_catalog_change);
+        });
         if (trim_enabled)
-            cleanupRefObjects(folded, state.lease, suppress_destructive, round_work_budget);
-        t.metric("suppressed", suppress_destructive ? 1 : 0);
-        t.metric("trim_enabled", trim_enabled ? 1 : 0);
-        t.metric("namespaces_planned", folded.ref_tables.size());
+            cleanupRefObjects(folded, state.lease, suppress_destructive, round_work_budget, cleanup_stats);
     }
 
     /// Bounded orphan-manifest backstop. The fold already exact-read each candidate, retired its exact
@@ -1806,7 +1838,7 @@ std::optional<std::pair<uint64_t, uint64_t>> Gc::newestFoldSealRef()
         }
         listed_generations.insert(generation);
         return true;
-    }, Retry::standard(), 1000, onGcEnumerationPage);
+    }, Retry::standard(), CasOperation::kCasListPageKeys, onGcEnumerationPage);
     const uint64_t listed_max_generation = listed_generations.empty() ? 0 : *listed_generations.rbegin();
 
     /// STEP DOWN THROUGH THE GENERATIONS THE LISTING ITSELF REPORTED until one carries a seal. The
@@ -1941,7 +1973,7 @@ Gc::GenerationSealProbe Gc::probeGenerationForSeal(uint64_t generation)
         if (!probe.seal_attempt || *probe.seal_attempt < attempt)
             probe.seal_attempt = attempt;
         return true;
-    }, Retry::standard(), 1000, onGcEnumerationPage);
+    }, Retry::standard(), CasOperation::kCasListPageKeys, onGcEnumerationPage);
     return probe;
 }
 
@@ -2782,9 +2814,9 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         /// The hold sits at the position the walk WOULD have read, which is canonical by construction.
         /// A namespace with no such position is a never-folded one whose listing shows no log -- the
         /// `_ckpt`-only "phantom table" `parseRefCkptKey` deliberately admits is exactly this shape --
-        /// and there is no walk to stop; the anomaly alone carries it, because the other consumer is
-        /// `cleanupRefObjects`, whose boundaries an ABSENT checkpoint WIDENS, and only the round's
-        /// destructive gate keeps the snapshot this unreadable object names from being deleted.
+        /// and there is no walk to stop; the anomaly alone carries it. The other consumer,
+        /// `cleanupRefObjects`, does not run this round: the hold or anomaly recorded here sets
+        /// `suppress_destructive`.
         if (!grounding)
         {
             LOG_WARNING(logger,
@@ -3901,10 +3933,36 @@ void Gc::reportSweepRetention(const ManifestSweepResult & result)
     retain_rollup_passes_since_report = 0;
 }
 
+namespace
+{
+/// What the pre-chunk revalidation of `Gc::cleanupRefObjects` allows for the next chunk.
+enum class RefCleanupLicence : uint8_t
+{
+    Delete,
+    /// The namespace's own row or life changed; its plan is stale, other namespaces are unaffected.
+    SkipNamespace,
+    /// `gc/state` was read and its lease owner or sequence differs from the adopted one: no namespace
+    /// may delete any more this pass.
+    StopLeaseMoved,
+    /// A mandatory read failed, `gc/state` is absent, or the catalog is ambiguous: nothing can be
+    /// verified this pass.
+    StopAuthorityUnverified,
+};
+
+struct RefCleanupVerdict
+{
+    RefCleanupLicence licence;
+    /// The catalog read for this verdict has another etag than the fold's cut.
+    bool catalog_etag_differs;
+};
+}
+
 void Gc::cleanupRefObjects(
     const FoldResult & folded, const GcLease & adopted_lease, bool suppress_destructive,
-    GcRoundWorkBudget & work_budget)
+    GcRoundWorkBudget & work_budget, RefCleanupPassStats & stats)
 {
+    stats = RefCleanupPassStats{};
+
     /// A clamp / ref-folding abort this round may leave landed-before-cut edges unfolded behind the clamp,
     /// so a covered-log cleanup could delete a log whose delta is not yet durable -- defer to a clean pass.
     if (suppress_destructive)
@@ -3931,34 +3989,35 @@ void Gc::cleanupRefObjects(
         const CatalogEntry & observed_entry = *entry_it;
         const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry_it->ns, entry_it->incarnation);
 
-        /// Current-life ref cleanup is not the dead-life janitor: every irreversible delete is still
-        /// licensed by the SAME complete catalog observation and GC lease that adopted the fold,
-        /// re-read immediately before the deletes it licenses. The unit
-        /// of licence is one chunk of write-once keys: a `_log` or `_snap` key is published once at a
+        /// Current-life ref cleanup is not the dead-life janitor: every irreversible delete is licensed by
+        /// this namespace's own row and life plus the GC lease, re-read immediately before the chunk. The
+        /// unit of licence is one chunk of write-once keys: a `_log` or `_snap` key is published once at a
         /// life-qualified key and never rewritten, so there is nothing to HEAD, and the plan below is
-        /// derived from durable state a successor leader derives too. A moved incarnation, changed
-        /// row/life, missing or unreadable authority object, or changed owner/sequence stops the whole
-        /// cleanup pass; continuing with another chunk would turn a refusal into a fallback.
-        const auto authorityHolds = [&](const String & first_key) -> bool
+        /// derived from durable state a successor leader derives too. The catalog etag decides nothing; it
+        /// is only compared for `CASRefCleanupChunksUnderCatalogChange`. An ambiguous catalog still stops
+        /// the pass, whichever rows alias. Churn on other namespaces' rows does not touch this life's keys.
+        /// `gc/state` is read last, so the lease check is the observation nearest the delete.
+        bool catalog_etag_differs = false;
+        const auto licenceForChunk = [&](const String & first_key) -> RefCleanupVerdict
         {
             try
             {
                 const CasRefCatalog::Snapshot current_catalog = CasRefCatalog::read(op, layout);
+                catalog_etag_differs = current_catalog.etag != folded.catalog_cut->etag;
                 current_catalog.life_index.throwIfAmbiguous("CAS GC ref cleanup revalidation");
                 const auto current_entry_it = std::lower_bound(
                     current_catalog.catalog.entries.begin(), current_catalog.catalog.entries.end(), ns,
                     [](const CatalogEntry & entry, const RootNamespace & needle) { return entry.ns < needle; });
                 const std::optional<NamespaceLifeId> current_life
                     = current_catalog.life_index.resolve(life.incarnation);
-                if (current_catalog.etag != folded.catalog_cut->etag
-                    || current_entry_it == current_catalog.catalog.entries.end()
+                if (current_entry_it == current_catalog.catalog.entries.end()
                     || current_entry_it->ns != ns || *current_entry_it != observed_entry
                     || !current_life || *current_life != life)
                 {
                     LOG_DEBUG(logger,
-                        "CAS GC ref cleanup stopped before the chunk starting at '{}': catalog observation/life moved",
-                        first_key);
-                    return false;
+                        "CAS GC ref cleanup skips namespace '{}' from the chunk starting at '{}': its catalog row or life moved",
+                        ns_str, first_key);
+                    return {RefCleanupLicence::SkipNamespace, catalog_etag_differs};
                 }
 
                 const auto current_state_object = op.read(layout.gcStateKey(), Retry::standard());
@@ -3967,7 +4026,7 @@ void Gc::cleanupRefObjects(
                     LOG_WARNING(logger,
                         "CAS GC ref cleanup stopped before the chunk starting at '{}': mandatory gc/state is absent",
                         first_key);
-                    return false;
+                    return {RefCleanupLicence::StopAuthorityUnverified, catalog_etag_differs};
                 }
                 const GcState current_state = decodeGcState(current_state_object->bytes);
                 if (current_state.lease.owner != adopted_lease.owner
@@ -3975,7 +4034,7 @@ void Gc::cleanupRefObjects(
                 {
                     LOG_DEBUG(logger,
                         "CAS GC ref cleanup stopped before the chunk starting at '{}': GC fence moved", first_key);
-                    return false;
+                    return {RefCleanupLicence::StopLeaseMoved, catalog_etag_differs};
                 }
             }
             catch (const std::exception & e)
@@ -3983,9 +4042,9 @@ void Gc::cleanupRefObjects(
                 LOG_WARNING(logger,
                     "CAS GC ref cleanup stopped before the chunk starting at '{}': authority revalidation failed: {}",
                     first_key, e.what());
-                return false;
+                return {RefCleanupLicence::StopAuthorityUnverified, catalog_etag_differs};
             }
-            return true;
+            return {RefCleanupLicence::Delete, catalog_etag_differs};
         };
 
         const auto row_it = folded.fold_seal.ref_lives.find(entry_it->incarnation);
@@ -4030,6 +4089,8 @@ void Gc::cleanupRefObjects(
             chassert(snap_id < checkpoint_snapshot_id);
             cohort.push_back(layout.writeOnceRefSnapshotKey(life, snap_id));
         }
+        stats.objects_planned += cohort.size();
+        ProfileEvents::increment(ProfileEvents::CASRefCleanupObjectsPlanned, cohort.size());
 
         const size_t chunk_keys = std::clamp<size_t>(store->poolConfig().gc_bulk_delete_chunk_keys, 1, kBulkDeleteMaxKeys);
         const size_t request_keys = bulkDeleteChunkKeys();
@@ -4044,14 +4105,37 @@ void Gc::cleanupRefObjects(
             if (work_budget.max_ref_cleanup_objects != 0)
                 end = std::min(end, begin + (work_budget.max_ref_cleanup_objects - work_budget.ref_cleanup_objects_used));
             std::vector<WriteOnceKey> chunk(cohort.begin() + begin, cohort.begin() + end);
-            if (!authorityHolds(chunk.front().str()))
+            const RefCleanupVerdict verdict = licenceForChunk(chunk.front().str());
+            if (verdict.licence == RefCleanupLicence::SkipNamespace)
+            {
+                ++stats.namespaces_skipped;
+                ProfileEvents::increment(ProfileEvents::CASRefCleanupNamespacesSkipped);
+                break;
+            }
+            if (verdict.licence == RefCleanupLicence::StopLeaseMoved)
+            {
+                stats.stopped_lease_moved = true;
+                ProfileEvents::increment(ProfileEvents::CASRefCleanupStoppedLeaseMoved);
                 return;
+            }
+            if (verdict.licence == RefCleanupLicence::StopAuthorityUnverified)
+            {
+                stats.stopped_authority_unverified = true;
+                ProfileEvents::increment(ProfileEvents::CASRefCleanupStoppedAuthorityUnverified);
+                return;
+            }
             /// A backend without `DeleteObjects` (GCS) falls back to one admitted delete per key here.
             /// The budget and the profile event below count OBJECTS in `chunk`, which is the same
             /// `chunk.size()` whichever way `removeChunkWriteOnceOrOneByOne` actually sent them.
             removeCohortWriteOnce(op, chunk, request_keys, Retry::standard());
             work_budget.ref_cleanup_objects_used += chunk.size();
             ProfileEvents::increment(ProfileEvents::CASRefCleanupObjectsDeleted, chunk.size());   /// cleanup object deletion
+            stats.objects_deleted += chunk.size();
+            if (verdict.catalog_etag_differs)
+            {
+                ++stats.chunks_under_catalog_change;
+                ProfileEvents::increment(ProfileEvents::CASRefCleanupChunksUnderCatalogChange);
+            }
             /// Advance by what was actually sent, not the nominal chunk size: the budget cap above can
             /// truncate a chunk short of `chunk_keys`, and advancing by the full stride would skip the
             /// untried remainder instead of retrying it next iteration.
@@ -4084,7 +4168,7 @@ uint64_t deletePrefixWholesale(CasOperation & op, const String & prefix, uint64_
 {
     if (out_fully_drained)
         *out_fully_drained = false;
-    static constexpr size_t kListPageLimit = 1000;
+    static constexpr size_t kListPageLimit = CasOperation::kCasListPageKeys;
     uint64_t deleted = 0;
     String cursor;
     while (deleted < bounded_remaining)
@@ -4320,7 +4404,7 @@ RefScanSummary Gc::enumerateRefPrefix()
     CasOperation op = store->openRequests().admit();
 
     RefScanSummary scan;
-    static constexpr size_t kListPageLimit = 1000;
+    static constexpr size_t kListPageLimit = CasOperation::kCasListPageKeys;
     size_t count_in_page = 0;
     op.forEachListedKey(layout.casRefsPrefix(), [&](const ListedKey & lk)
     {
@@ -4571,8 +4655,6 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// zero catalog mutations. Only after that distinction is resolved do we complete the hot LIST and
     /// take the sole fresh work cut.
     const CatalogLifecycleReconcileResult drain_result = drainCompletedRemoving(state);
-    for (const NamespaceLifeId & retired_life : drain_result.retired_lives)
-        store->invalidateRemovedCatalogLife(retired_life);
     if (drain_result.authority_status != AuthorityStatus::Authoritative
         || drain_result.catalog_resolution != CatalogResolution::DrainComplete)
         throwCasWriteRetryLater("CAS GC rebuild lost authority before the catalog settled");
@@ -4601,7 +4683,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
             std::vector<String> table_keys;
             op.forEachListedKey(layout.namespaceStreamPrefix(life),
                 [&](const ListedKey & lk) { table_keys.push_back(lk.key); return true; },
-                Retry::standard(), 1000, onGcEnumerationPage);
+                Retry::standard(), CasOperation::kCasListPageKeys, onGcEnumerationPage);
             std::map<NamespaceLifePhysicalId, RefTableListing> grouped;
             try
             {
@@ -4652,7 +4734,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
                 /// Foreign key shape under `gc/gen` is debris, not a numbering input.
             }
             return true;
-        }, Retry::standard(), 1000, onGcEnumerationPage);
+        }, Retry::standard(), CasOperation::kCasListPageKeys, onGcEnumerationPage);
     }
     const uint64_t generation = max_gen + 1;
     const uint64_t budget = rebuild_edge_budget_override ? rebuild_edge_budget_override
@@ -4854,7 +4936,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
             }
             /// A missing/invalid UNOWNED body is debris (no owner claims it) — skip, never refuse.
             return true;
-        }, Retry::standard(), 1000, onGcEnumerationPage);
+        }, Retry::standard(), CasOperation::kCasListPageKeys, onGcEnumerationPage);
     }
 
     /// A REBUILD CONDEMNS NOTHING (spec §7).
@@ -5182,15 +5264,30 @@ bool Gc::acquireOrRenewLease(GcState & state, std::optional<Etag> & state_etag, 
     return true;
 }
 
+void Gc::OutcomeTally::add(OutcomeKind kind)
+{
+    switch (kind)
+    {
+        case OutcomeKind::Deleted: ++deleted; break;
+        case OutcomeKind::Absent: ++absent; break;
+        case OutcomeKind::Replaced: ++replaced; break;
+        case OutcomeKind::Spared: ++spared; break;
+    }
+}
+
 CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(const GcState & leased_state)
+{
+    uint64_t completed_erases = 0;
+    return drainCompletedRemoving(leased_state, completed_erases);
+}
+
+CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(const GcState & leased_state, uint64_t & completed_erases)
 {
     if (leased_state.snap_generation == 0)
         return {
             .authority_status = AuthorityStatus::Authoritative,
             .catalog_resolution = CatalogResolution::DrainComplete,
-            .retired_lives = {},
-            .final_catalog_cut = std::nullopt,
-            .deleted = 0};
+            .final_catalog_cut = std::nullopt};
 
     const std::optional<CasFoldSeal> parent = readFoldSeal(
         leased_state.snap_generation, leased_state.snap_attempt);
@@ -5208,8 +5305,29 @@ CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(const GcState & lease
     const uint64_t admitted_generation = leased_state.lease.seq;
     refreshAuthority(admitted_generation);
     CasOperation op = store->openRequests().admit([this] { return authority_held; });
-    return CatalogLifecycleReconciler(op, store->layout(), *parent)
-        .reconcile([this, admitted_generation] { refreshAuthority(admitted_generation); });
+    CatalogLifecycleReconciler reconciler(op, store->layout(), *parent);
+    SCOPE_EXIT({ completed_erases = reconciler.completedErases(); });
+    /// The announcement before the erase refuses admissions already in flight; a presence probe or a
+    /// drop that admitted the `Removing` row after it holds a runtime that the second one detaches; without
+    /// it only a writer's catalog check in `namespaceLife` would.
+    const auto invalidate_retired = [&]
+    {
+        for (const NamespaceLifeId & life : reconciler.retiredLives())
+            store->invalidateRemovedCatalogLife(life);
+    };
+    try
+    {
+        CatalogLifecycleReconcileResult result = reconciler.reconcile(
+            [this, admitted_generation] { refreshAuthority(admitted_generation); },
+            [this](const NamespaceLifeId & life) { store->invalidateRemovedCatalogLife(life); });
+        invalidate_retired();
+        return result;
+    }
+    catch (...)
+    {
+        invalidate_retired();
+        throw;
+    }
 }
 
 }

@@ -101,6 +101,20 @@ bool CasMountRuntime::mayMutate() const
         && bootMsNow() < mount_fence.deadline_boot_ms.load(std::memory_order_acquire);
 }
 
+std::shared_ptr<const MountSlotOwnership> CasMountRuntime::slotOwnership() const
+{
+    std::lock_guard lock(driver_mutex);
+    return mount_renewer ? mount_renewer->slotOwnership() : nullptr;
+}
+
+bool CasMountRuntime::slotHeldBy(const MountSlotOwnership & ownership) const
+{
+    /// A fresh read every call: an observation older than the caller's snapshot proves nothing about it.
+    CasOperation op = mount_requests.admit();
+    const std::optional<Object> slot = op.read(layout.mountKey(server_root_id), Retry::once());
+    return slot && ownership.holds(*slot);
+}
+
 void CasMountRuntime::tripMountLost()
 {
     mount_fence.lost.store(true, std::memory_order_release);

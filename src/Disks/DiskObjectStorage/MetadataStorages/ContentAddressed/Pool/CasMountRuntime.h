@@ -67,6 +67,7 @@ using RuntimeWorkerFactory = std::function<ThreadFromGlobalPool(std::function<vo
 /// lower-layer header to describe its own dependencies.
 struct MountConfig
 {
+    /// The values of a pool opened without disk settings (unit tests); a disk defaults to 120000/10000.
     std::chrono::milliseconds mount_lease_ttl_ms{30000};
     std::chrono::milliseconds mount_renew_period{10000};
     /// When false, tests drive `renewWatermarkOnce` explicitly. In production this flag enables both
@@ -194,6 +195,14 @@ public:
     /// ---- local write fence ----
     /// Return whether a mutable operation may start under the locally observed lease state.
     bool mayMutate() const;
+    /// The current renewer's ownership record, or null without a renewer. Takes `driver_mutex` only to
+    /// copy the pointer.
+    std::shared_ptr<const MountSlotOwnership> slotOwnership() const;
+    /// One `GET` of the mount slot, admitted on the mount plane: true when it still holds a body
+    /// `ownership` wrote (`MountSlotOwnership::holds`), false otherwise, including an absent slot.
+    /// A refused admission (lost fence, spent lease budget), a request failure and a decode failure
+    /// propagate.
+    bool slotHeldBy(const MountSlotOwnership & ownership) const;
     /// Permanently latch the local fence as lost for this runtime incarnation.
     void tripMountLost();
     /// Publish the BOOTTIME deadline from a successful lease renewal.

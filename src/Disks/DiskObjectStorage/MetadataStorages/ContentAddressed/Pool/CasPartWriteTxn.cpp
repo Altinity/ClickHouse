@@ -605,6 +605,33 @@ RootNamespace PartWriteTxn::manifestNamespace() const
     return RootNamespace{intended.substr(0, slash)};
 }
 
+String describeManifestPutGiveUp(const GaveUp & gave_up)
+{
+    const bool lease = gave_up.deadline_source == GaveUp::Source::Lease;
+    switch (gave_up.why)
+    {
+        case GaveUp::Why::FenceLost:
+            return "was refused: this server no longer holds the mount it was admitted under";
+        case GaveUp::Why::Deadline:
+            if (gave_up.sent_any)
+                return fmt::format(
+                    "is UNCERTAIN: {} attempt(s) sent, none conclusive by the {} deadline; the body may have landed",
+                    gave_up.attempts_sent, lease ? "lease" : "policy");
+            if (lease)
+                return "was not sent: the mount lease has too little time left, so writes are paused";
+            return "was not sent: the request window ran out before the first attempt";
+        case GaveUp::Why::Unresolved:
+            if (gave_up.sent_any)
+                return fmt::format(
+                    "is UNCERTAIN: {} attempt(s) sent and the resolving read did not complete ({}); the body may have landed",
+                    gave_up.attempts_sent, detail::renderObservation(gave_up.last_seen));
+            return fmt::format(
+                "was not sent: a read of the current object did not complete ({})",
+                detail::renderObservation(gave_up.last_seen));
+    }
+    UNREACHABLE();
+}
+
 ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
 {
     requireAlive();
@@ -694,11 +721,11 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
         /// Unlike the ref-log lane there is nothing to wedge: this id was never named by any owner
         /// transition (`next_manifest_ordinal` is already past it, so no re-stage ever reuses the key),
         /// and a late-landing body is inert unreferenced debris for the orphan-manifest sweep.
-        [&](GaveUp &) -> Etag
+        [&](GaveUp & gave_up) -> Etag
         {
             throwCasWriteRetryLater(fmt::format(
-                "stageManifest: part-manifest PUT at '{}' is UNCERTAIN (retry budget exhausted) — "
-                "nothing conclusive was named; the caller re-stages with a fresh ManifestId", key));
+                "stageManifest: part-manifest PUT at '{}' {}; the caller re-stages with a fresh ManifestId",
+                key, describeManifestPutGiveUp(gave_up)));
         }},
         staged);
 

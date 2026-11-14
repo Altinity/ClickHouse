@@ -54,7 +54,7 @@ void checkDeadline(const Deadline & deadline, std::string_view phase)
 void listAll(CasOperation & op, const String & prefix, std::unordered_map<String, uint64_t> & out,
              const FsckProgress & on_progress, const Deadline & deadline, std::string_view phase)
 {
-    static constexpr size_t kPageLimit = 1000;
+    static constexpr size_t kPageLimit = CasOperation::kCasListPageKeys;
     uint64_t pages = 0;
     size_t count_in_page = 0;
     op.forEachListedKey(prefix, [&](const ListedKey & k)
@@ -318,6 +318,36 @@ void checkRefStream(CasOperation & op, const Layout & layout, const NamespaceLif
     const std::optional<RefCkpt> checkpoint
         = checkpoint_sample ? std::optional<RefCkpt>{checkpoint_sample->ckpt} : std::nullopt;
     const RecoveryGrounding grounding = chooseRecoveryGrounding(catalog_entry, checkpoint);
+    /// Reports a required object found absent or invalid. Only the SAME checkpoint incarnation turns that
+    /// into durable corruption; a changed, absent or unreadable `_ckpt` proves nothing and stays `Unchecked`.
+    const auto adjudicateAgainstSample = [&](const String & key, const String & note,
+                                             std::string_view phase, std::string_view changed_during)
+    {
+        checkDeadline(deadline, phase);
+        try
+        {
+            const std::optional<CkptSample> current = readCkpt(op, layout, life);
+            if (!current || !checkpoint_sample || current->etag != checkpoint_sample->etag)
+            {
+                verdicts.recordUnchecked(report, ns, key,
+                    note + "; checkpoint authority changed " + String(changed_during));
+                return;
+            }
+        }
+        catch (const Exception & revalidation_error)
+        {
+            verdicts.recordUnchecked(report, ns, key,
+                note + "; checkpoint authority could not be revalidated: " + revalidation_error.message());
+            return;
+        }
+        catch (...)
+        {
+            verdicts.recordUnchecked(report, ns, key,
+                note + "; checkpoint authority could not be revalidated");
+            return;
+        }
+        verdicts.recordChainBroken(report, ns, key, note);
+    };
     if (grounding.base)
     {
         try
@@ -338,34 +368,8 @@ void checkRefStream(CasOperation & op, const Layout & layout, const NamespaceLif
             }
 
             /// A concurrent checkpoint advance may retire the sampled base between these exact reads.
-            /// Only the SAME checkpoint incarnation turns a missing/invalid member of its required
-            /// triple into durable corruption. A changed, absent, or unreadable authority proves no
-            /// such thing and remains the honest `Unchecked` answer.
-            checkDeadline(deadline, "checkpoint-base authority revalidation");
-            try
-            {
-                const std::optional<CkptSample> current = readCkpt(op, layout, life);
-                if (!current || !checkpoint_sample || current->etag != checkpoint_sample->etag)
-                {
-                    verdicts.recordUnchecked(report, ns, key,
-                        note + "; checkpoint authority changed while validating its snapshot base");
-                    return;
-                }
-            }
-            catch (const Exception & revalidation_error)
-            {
-                verdicts.recordUnchecked(report, ns, key,
-                    note + "; checkpoint authority could not be revalidated: " + revalidation_error.message());
-                return;
-            }
-            catch (...)
-            {
-                verdicts.recordUnchecked(report, ns, key,
-                    note + "; checkpoint authority could not be revalidated");
-                return;
-            }
-
-            verdicts.recordChainBroken(report, ns, key, note);
+            adjudicateAgainstSample(key, note, "checkpoint-base authority revalidation",
+                "while validating its snapshot base");
             return;
         }
     }
@@ -379,9 +383,13 @@ void checkRefStream(CasOperation & op, const Layout & layout, const NamespaceLif
         const auto got = op.read(layout.refLogKey(life, expected), Retry::standard());
         if (!got)
         {
-            verdicts.recordChainBroken(report, ns, layout.refLogKey(life, expected),
-                "ref stream: checkpoint requires id " + renderId(expected) + " at or below inclusive frontier "
-                + renderId(*grounding.committed_through) + ", but its exact key is absent");
+            const String key = layout.refLogKey(life, expected);
+            const String note = "ref stream: checkpoint requires id " + renderId(expected)
+                + " at or below inclusive frontier " + renderId(*grounding.committed_through)
+                + ", but its exact key is absent";
+
+            /// Ref cleanup may delete a covered log after advancing `_ckpt` past the sampled one.
+            adjudicateAgainstSample(key, note, "tail-log authority revalidation", "while walking the tail");
             return;
         }
 

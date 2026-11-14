@@ -96,7 +96,8 @@ There is no explicit "create namespace" statement; a namespace is born the first
 resolves its ref table (`CasRefLedger::resolveNamespaceLife`, bounded at 32 loop attempts). If the
 catalog has no row for the name at all, the resolving mount admits a `Creating` entry stamped with
 its own creator fence and a freshly minted `life_id`
-(`CasRefCatalog::createNamespace` → `casAdmitEntry`). Two more steps make it usable:
+(`CasRefCatalog::createNamespace` → `createNamespaceStep1`). Each decision mints a new `life_id`. An
+attempt of unknown fate is decided again on a fresh read and is never resent. Two more steps make it usable:
 
 1. **Publish the genesis checkpoint.** The first `_ckpt` ever written for this `life_id` carries
    `life_epoch = creator.writer_epoch` — the only writer that will ever know this namespace's
@@ -124,6 +125,26 @@ currently observed `GC` round), then appends **one** ref-log transaction that re
 committed and precommit binding and ends with a terminal `RemoveNamespace` op. Removal is never
 refused by an admission check — Constraint 13 in the catalog's own spec — it always succeeds once
 the fence holds.
+
+When the drop fails before the row is `Removing`, what happens to the lane depends on whether a write was sent:
+
+- No attempt of the `Live -> Removing` write was sent (for example a failed catalog read or
+  `gc/state` read, a lost lease, or a row that changed before the write): nothing can land. The lane
+  reopens if a fresh read still shows the original `Live` row under the same mount fence, and no
+  earlier attempt on this runtime left a write that may still land.
+- An attempt was sent and the row is not proven `Removing`: the write may have reached the store and
+  may still land. The lane stays closed, even if a fresh read shows the original `Live` row.
+
+A lane closed by an unresolved removal write has two ways out: a retried `DROP TABLE` that completes
+the removal, or a remount of the disk (a server restart, or the self-remount after a lost lease). A
+remount reopens the lane but does not cancel the write: if the write lands afterwards, the row becomes
+`Removing` and later writes to the table fail. Until one of the two happens:
+
+- Writes to the table fail with a retry-later error that says "a removal write may still land".
+- Reads see the table as absent, although the catalog row can still be `Live`.
+- The ref-table cache does not evict the table, because a fresh runtime would start with the lane open.
+- The server logs `the outcome of its Live -> Removing catalog write is unknown` once per drop attempt
+  that ends this way.
 
 Nothing is deleted by the writer at this point. No blob, no manifest, no ref-log object physically
 disappears here — only pointers move, exactly like an ordinary [`DROP TABLE`](/antalya/cas/architecture/part-lifecycle#operation-mapping)

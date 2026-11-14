@@ -53,6 +53,13 @@ struct OutcomeLog
     std::vector<OutcomeEntry> entries;
 };
 
+/// Upper bound of the bytes `encodeOutcomeLog` spends on one entry, cheap enough to evaluate when the
+/// entry is appended. Callers use it to keep a log under a byte limit without encoding it.
+uint64_t outcomeRowEncodedBound(const OutcomeEntry & entry);
+
+/// Upper bound of the header and trailer lines of an encoded log.
+constexpr uint64_t kOutcomeLogFramingBound = 128;
+
 /// Encodes a log as the uncompressed `GcOutcomes` text payload. The caller is responsible for
 /// applying the format registry's compression policy before storing the returned bytes.
 String encodeOutcomeLog(const OutcomeLog & log);

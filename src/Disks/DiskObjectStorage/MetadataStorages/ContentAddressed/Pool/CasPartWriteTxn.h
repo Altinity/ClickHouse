@@ -128,6 +128,9 @@ struct BlobUploadResult
 /// a bare digest or from an independently supplied digest width.
 BlobRef poolContentHash(BlobHashAlgo algo, std::string_view payload);
 
+/// The outcome clause of a `stageManifest` give-up: whether the body may have landed, and why.
+String describeManifestPutGiveUp(const GaveUp & gave_up);
+
 /// Coordinates one part write from manifest staging through blob admission and ref publication. The transaction
 /// owns the in-memory dependency set and the identities of manifests staged by this build; `Pool` owns the
 /// durable object store and ref-log operations. A transaction is normally used by one writer thread, while

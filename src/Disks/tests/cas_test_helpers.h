@@ -125,7 +125,8 @@ private:
 /// Every operation admitted from it holds a reference to it, so it must be named and outlive them.
 inline DB::Cas::CasRequests openRequestsForTest(DB::Cas::BackendPtr backend)
 {
-    return DB::Cas::CasRequests(std::move(backend), DB::Cas::Fence::open());
+    return DB::Cas::CasRequests(
+        std::move(backend), DB::Cas::Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
 }
 
 /// The same, for a fixture holding only a reference. The aliasing `shared_ptr` owns nothing, so the
@@ -185,7 +186,8 @@ class OperationForTest
 {
 public:
     explicit OperationForTest(DB::Cas::BackendPtr backend)
-        : requests(std::move(backend), DB::Cas::Fence::open()), operation(requests.admit())
+        : requests(std::move(backend), DB::Cas::Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs)
+        , operation(requests.admit())
     {
     }
 
@@ -333,7 +335,7 @@ inline DB::ContentAddressedSettings makeSettingsForTest(const std::string & serv
 }
 
 /// A clock that only ever moves when something sleeps on it, plus the record of every sleep it
-/// served. Injected into `CasRequests` so a policy's whole 90-second deadline is exercised in a test
+/// served. Injected into `CasRequests` so a policy's whole request window is exercised in a test
 /// that takes no wall-clock time, and so the schedule itself -- how many pauses, how long -- becomes
 /// an assertion rather than a wait. `now` is atomic and `sleeps` is mutex-guarded because a
 /// decommission session's background mount-lease renewer reads this same clock (via
@@ -845,6 +847,24 @@ inline void injectCondemnedSummarySeal(
         (*operation).create(layout.gcStateKey(), state, DB::Cas::Retry::standard());
     else
         (*operation).replace(layout.gcStateKey(), state, existing_state->etag, DB::Cas::Retry::standard());
+}
+
+/// Runs `CasRefCatalog::deleteCompletedRemovingAtSnapshot` on a fresh catalog read, with no retirement
+/// record: the erase alone. A refused proof returns before any read.
+inline DB::Cas::CasRefCatalog::CompletedRemovingDeleteResult deleteCompletedRemovingForTest(
+    DB::Cas::CasOperation & op, const DB::Cas::Layout & layout, const DB::Cas::CatalogEntry & observed,
+    const DB::Cas::CasFoldSeal & authoritative_parent, const std::function<void()> & refresh_authority)
+{
+    using Outcome = DB::Cas::CasRefCatalog::CompletedRemovingDeleteOutcome;
+    const auto parent_it = authoritative_parent.ref_lives.find(observed.incarnation);
+    if (observed.state != DB::Cas::NsState::Removing || !observed.removal_started_round
+        || parent_it == authoritative_parent.ref_lives.end()
+        || !parent_it->second.cleanup_evidence
+        || parent_it->second.coverage.hold)
+        return {.outcome = Outcome::ProofRefused, .invalidated_life = std::nullopt, .catalog_snapshot = std::nullopt};
+    return DB::Cas::CasRefCatalog::deleteCompletedRemovingAtSnapshot(
+        op, layout, DB::Cas::CasRefCatalog::read(op, layout), observed, authoritative_parent, refresh_authority,
+        /*before_erase=*/{}, /*erase_acknowledged=*/{});
 }
 
 /// Whether blob `hash` is absent from the backend (its exact-token content object is gone).

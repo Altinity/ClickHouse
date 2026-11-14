@@ -1458,8 +1458,8 @@ TEST(CASGCCondemnMarker, SwallowedMarkerWriteCarriesEntryInsteadOfDeleting)
 
     /// THE FAULT IS PERMANENT, so every condemn-marker write runs the engine's WHOLE retry window, and
     /// that window has to run on a clock this test advances. A zeroed sleep alone does not do it: the
-    /// deadline is still measured against the real clock, so the loop would spin hot for ninety real
-    /// seconds per marker write. The sleep therefore moves the clock past its own pause -- plus one
+    /// deadline is still measured against the real clock, so the loop would spin hot for a real
+    /// request window per marker write. The sleep therefore moves the clock past its own pause -- plus one
     /// millisecond, because full-jitter backoff may draw zero and a clock that never moves never closes
     /// the window. Scoped to the GC plane, which is where `writeCondemnedMeta` runs, so the mount
     /// plane's lease-bound policies keep their real clock.

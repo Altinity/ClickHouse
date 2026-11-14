@@ -72,7 +72,7 @@ PoolPtr openPool(const std::shared_ptr<InMemoryBackend> & b)
 
 /// Run the mount plane's request engine on a virtual clock that its own reissue sleep advances -- the
 /// plane every write below is admitted on. A policy that has to be EXHAUSTED then closes in
-/// microseconds of wall clock instead of ninety real seconds, and a policy that merely reissues costs
+/// microseconds of wall clock instead of a real request window, and a policy that merely reissues costs
 /// no sleep at all, so these tests pin retry semantics and never a schedule.
 /// The clock a test installed on the mount plane, handed back so the test can assert that the pacing
 /// really ran on it. It does not make a LOST injection fast -- each fault double's attempt cap does
@@ -86,7 +86,7 @@ struct VirtualRequestClock
 
 /// `step_ms` is a FLOOR on how far each sleep moves the clock. A test that must see a policy exhaust
 /// raises it so the window closes after a countable handful of attempts rather than after however many
-/// near-zero jitter draws fit into ninety seconds.
+/// near-zero jitter draws fit into the request window.
 VirtualRequestClock useVirtualMountRequestClock(const PoolPtr & store, uint64_t step_ms = 0)
 {
     const VirtualRequestClock clock{std::make_shared<std::atomic<uint64_t>>(0),
@@ -916,6 +916,33 @@ TEST(CASPartWriteTxn, AGiveUpReportsHowManyAttemptsItSent)
         << "the reissues were paced on the injected clock, so this exhaustion cost no wall time";
 }
 
+/// The pool's configured request window, not a literal, is what a give-up measures: with a window of
+/// 15 s (just above the two envelopes a write reserves) and a clock that jumps 16 s per pause, the first
+/// deadline check after one pause ends the call. The 120 s lease keeps the lease out of the verdict.
+TEST(CASPartWriteTxn, AGiveUpHonoursTheConfiguredRequestWindow)
+{
+    constexpr uint64_t window_ms = 15'000;
+    constexpr uint64_t step_ms = 16'000;
+    auto b = std::make_shared<AmbiguousMetaWriteBackend>();
+    PoolConfig config{.pool_prefix = "p", .server_root_id = "test"};
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(120'000);
+    config.cas_request_budget.request_window_ms = window_ms;
+    auto s = Pool::open(b, std::move(config));
+    const VirtualRequestClock clock = useVirtualMountRequestClock(s, step_ms);
+    b->attempts = 0;
+
+    const BlobRef ref = idOf("give-up-configured-window");
+    CasOperation op = s->mountRequests().admit();
+    const WriteResult result = putMetaIfAbsent(op, s->layout(), ref, BlobMeta{.state = MetaState::Clean, .size = 7});
+
+    const auto * gave_up = std::get_if<GaveUp>(&result);
+    ASSERT_NE(gave_up, nullptr) << "every attempt was ambiguous and none landed";
+    EXPECT_EQ(gave_up->why, GaveUp::Why::Deadline);
+    EXPECT_EQ(gave_up->deadline_source, GaveUp::Source::Policy);
+    EXPECT_LT(clock.now->load(), 2 * (step_ms + 1)) << "the 15 s window closed at the first deadline check past it";
+    EXPECT_LE(gave_up->attempts_sent, 3u);
+}
+
 /// A persistently-failing freshness-meta write must surface as a controlled retry-later signal, not
 /// silently succeed with the marker left stale. The blob body publication itself is unaffected (only
 /// `.meta` keys are faulted) -- only the meta reconciliation exhausts, and that exhaustion must reach
@@ -1029,7 +1056,7 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupNeverGetsTheDyingObject)
 
     /// The republished body must NOT read back as the incarnation GC condemned -- that compare is the
     /// one GC's redelete makes, so it is the one this asserts.
-    CasRequests probe(b, Fence::open());
+    CasRequests probe(b, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation probe_op = probe.admit();
     const auto after = probe_op.head(blob_key, Retry::standard());
     ASSERT_TRUE(after.has_value());
@@ -2517,7 +2544,7 @@ TEST(CASPartWriteTxnStageManifestRetry, AmbiguousLandedWriteResolvesToCommittedW
     const auto ev = std::find_if(observed_events.begin(), observed_events.end(),
                                  [](const CasEvent & e) { return e.type == CasEventType::ManifestPut; });
     ASSERT_NE(ev, observed_events.end()) << "the stage must still emit its ManifestPut audit event";
-    CasRequests probe(b, Fence::open());
+    CasRequests probe(b, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation probe_op = probe.admit();
     const auto landed = probe_op.head(key, Retry::standard());
     ASSERT_TRUE(landed.has_value());
@@ -2550,7 +2577,7 @@ TEST(CASPartWriteTxnStageManifestRetry, DifferentObjectAtKeyStaysLoudConflict)
 ///
 /// Two things make the BOUND itself observable rather than assumed. The injected clock is advanced by
 /// each reissue's own sleep, so the policy's window closes after a handful of attempts instead of after
-/// ninety real seconds; and the double refuses deterministically past a cap far above that handful, so
+/// a real request window; and the double refuses deterministically past a cap far above that handful, so
 /// a stage whose retries stopped being bounded fails on the wrong error code instead of running until
 /// the suite times out. The exact attempt COUNT belongs to the request policy and is pinned where that
 /// policy lives.
@@ -2777,9 +2804,9 @@ TEST(CASPartWrite, EveryPhysicalPublicationMintsAFreshIncarnationTag)
 }
 
 /// The publication loop captures ONE bound before it starts, and every verb of every iteration shares
-/// it -- so eight iterations cannot spend eight ninety-second windows. Here each ambiguous
-/// publication burns forty seconds of the injected clock, so the third one carries the loop past the
-/// window it captured and the next iteration's HEAD refuses to start. The insert is refused as
+/// it -- so eight iterations cannot spend eight request windows. Here each ambiguous
+/// publication burns four ninths of the window on the injected clock, so the third one carries the loop
+/// past the window it captured and the next iteration's HEAD refuses to start. The insert is refused as
 /// retry-later, which is what a caller can act on; the alternative is a single blob upload sitting on
 /// the request for twenty-five minutes. The eight-attempt cap stays as the secondary bound.
 ///
@@ -2792,7 +2819,7 @@ TEST(CASPartWrite, EnsureBlobPresentIsBoundedByTheOneWindowItCaptured)
     auto now = std::make_shared<std::atomic<uint64_t>>(0);
     s->mountRequests().setNowFnForTest([now] { return now->load(); });
     s->mountRequests().setSleepFnForTest([now](uint64_t ms) { now->fetch_add(ms + 1); });
-    b->on_publish = [now] { now->fetch_add(40'000); };
+    b->on_publish = [now] { now->fetch_add(kDefaultRequestWindowMs * 4 / 9); };
 
     const RootNamespace ns{"srv/tbl"};
     const String payload = "blob-payload-long-loop";
@@ -2808,9 +2835,9 @@ TEST(CASPartWrite, EnsureBlobPresentIsBoundedByTheOneWindowItCaptured)
     });
 
     EXPECT_EQ(b->publish_stream_attempts, 3) << "the fourth iteration must not start a publication";
-    /// The clock is past the captured deadline when the loop stops, which is what stopped it -- the
-    /// third publication ends at 120 s of a window that closed at 90 s.
-    EXPECT_GT(now->load(), 90'000u);
+    /// The clock is past the captured deadline when the loop stops, which is what stopped it: two
+    /// publications leave it inside the window and the third carries it past.
+    EXPECT_GE(now->load(), kDefaultRequestWindowMs);
 }
 
 namespace
@@ -3109,4 +3136,106 @@ TEST(CASPartWriteTxnMarkerRace, PresentBodyWithoutMarkerRepublishesOnce)
     auto second = precommittedBuildForPayload(s, RootNamespace{"srv1/leftover-b"}, "part", payload);
     EXPECT_EQ(uploadOnce(second, ref, payload).diagnostics.action, BlobMaterializationAction::Observed);
     EXPECT_EQ((*op).head(blob_key, Retry::once())->etag, republished->etag);
+}
+
+namespace
+{
+
+String stageManifestFailureText(PartWriteTxn & build)
+{
+    try
+    {
+        build.stageManifest({blobManifestEntry("a.bin", "a")});
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR);
+        return e.message();
+    }
+    ADD_FAILURE() << "expected DB::Exception";
+    return {};
+}
+
+}
+
+/// Every give-up shape of a manifest PUT says whether the body may have landed: only a sent attempt can
+/// make it UNCERTAIN, and a refused or unsent one never claims it might have landed.
+TEST(CASPartWriteTxn, StageManifestGiveUpTextCoversEveryOutcome)
+{
+    using Why = GaveUp::Why;
+    using Source = GaveUp::Source;
+    struct Case
+    {
+        GaveUp gave_up;
+        const char * says;
+        bool uncertain;
+    };
+    const std::vector<Case> cases{
+        {{.why = Why::FenceLost, .deadline_source = Source::Policy, .sent_any = false, .last_seen = NotObserved{}},
+         "was refused: this server no longer holds the mount", false},
+        {{.why = Why::FenceLost, .deadline_source = Source::Policy, .sent_any = true, .last_seen = NotObserved{},
+          .attempts_sent = 2},
+         "was refused: this server no longer holds the mount", false},
+        {{.why = Why::Deadline, .deadline_source = Source::Policy, .sent_any = true, .last_seen = NotObserved{},
+          .attempts_sent = 3},
+         "3 attempt(s) sent, none conclusive by the policy deadline", true},
+        {{.why = Why::Deadline, .deadline_source = Source::Lease, .sent_any = true, .last_seen = NotObserved{},
+          .attempts_sent = 4},
+         "4 attempt(s) sent, none conclusive by the lease deadline", true},
+        {{.why = Why::Deadline, .deadline_source = Source::Lease, .sent_any = false, .last_seen = NotObserved{}},
+         "was not sent: the mount lease has too little time left", false},
+        {{.why = Why::Deadline, .deadline_source = Source::Policy, .sent_any = false, .last_seen = NotObserved{}},
+         "was not sent: the request window ran out before the first attempt", false},
+        {{.why = Why::Unresolved, .deadline_source = Source::Policy, .sent_any = true, .last_seen = NotObserved{},
+          .attempts_sent = 5},
+         "5 attempt(s) sent and the resolving read did not complete (nothing observed)", true},
+        {{.why = Why::Unresolved, .deadline_source = Source::Policy, .sent_any = false, .last_seen = ProvenAbsent{}},
+         "was not sent: a read of the current object did not complete (absent)", false},
+    };
+    for (const Case & c : cases)
+    {
+        const String text = describeManifestPutGiveUp(c.gave_up);
+        EXPECT_NE(text.find(c.says), String::npos) << text;
+        EXPECT_EQ(text.find("UNCERTAIN") != String::npos, c.uncertain) << text;
+        EXPECT_EQ(text.find("may have landed") != String::npos, c.uncertain) << text;
+    }
+}
+
+/// A manifest PUT refused by the lease margin never reached the store, so the text must not claim
+/// the body may have landed.
+TEST(CASPartWriteTxn, StageManifestNotSentUnderDrainedLeaseSaysNotSent)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    const auto boot_ms = std::make_shared<std::atomic<uint64_t>>(0);
+    PoolConfig config{.pool_prefix = "p", .server_root_id = "test"};
+    config.boot_ms_fn = [boot_ms] { return boot_ms->load(); };
+    const uint64_t lease_ms = static_cast<uint64_t>(config.mount_lease_ttl_ms.count());
+    const uint64_t margin_ms = config.cas_request_budget.lease_safety_margin_ms;
+    auto s = Pool::open(b, std::move(config));
+    useVirtualMountRequestClock(s);
+
+    /// Inside the safety margin, still before the lease deadline.
+    boot_ms->store(lease_ms - margin_ms / 2);
+
+    auto build = startBuildFor(s, RootNamespace{"srv/tbl"}, "part_drained");
+    const String text = stageManifestFailureText(*build);
+    EXPECT_NE(text.find("was not sent"), String::npos) << text;
+    EXPECT_EQ(text.find("UNCERTAIN"), String::npos) << text;
+}
+
+/// A manifest PUT that was sent, and whose every answer was lost, may have landed: the text says
+/// so and counts the attempts.
+TEST(CASPartWriteTxn, StageManifestSentThenGaveUpSaysUncertain)
+{
+    auto b = std::make_shared<ManifestPutFaultBackend>();
+    auto s = openPool(b);
+    useVirtualMountRequestClock(s, /*step_ms=*/10'000);
+    b->fault_count = 1000000;
+    b->attempt_cap = 100;
+
+    auto build = startBuildFor(s, RootNamespace{"srv/tbl"}, "part_uncertain");
+    const String text = stageManifestFailureText(*build);
+    ASSERT_GT(b->put_attempts, 1);
+    EXPECT_NE(text.find("UNCERTAIN"), String::npos) << text;
+    EXPECT_NE(text.find(fmt::format("{} attempt(s) sent", b->put_attempts)), String::npos) << text;
 }

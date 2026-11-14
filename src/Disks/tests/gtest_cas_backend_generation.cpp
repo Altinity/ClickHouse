@@ -138,7 +138,13 @@ public:
     {
     }
 
-    std::optional<bool> isBucketVersioningEnabled() const override { return versioned; }
+    std::optional<bool> isBucketVersioningEnabled(const DB::ObjectStorageControlRequest & request) const override
+    {
+        last_request = request;
+        return versioned;
+    }
+
+    mutable DB::ObjectStorageControlRequest last_request;
 
 private:
     const std::optional<bool> versioned;
@@ -302,6 +308,22 @@ TEST(CASBackendGeneration, CheckPoolPreconditionsAcceptsVerifiedDisabledVersioni
     ScopedBackendLogCapture capture;
     EXPECT_NO_THROW(b->checkPoolPreconditions());
     EXPECT_TRUE(capture.captured().empty()) << capture.captured();
+}
+
+/// The versioning probe carries the backend's control-plane request: profile, attempt timeout and connect cap.
+TEST(CASBackendGeneration, CheckPoolPreconditionsProbesVersioningSingleAttemptAndBounded)
+{
+    auto storage = makeVersioningObjectStorageForTest(false);
+    auto b = std::make_shared<ObjectStorageBackend>(
+        storage, ObjectStorageBackend::Mode::Native,
+        /*single_attempt_control_plane_=*/true, /*attempt_timeout_ms_=*/5000, /*connect_timeout_cap_ms_=*/3000);
+    b->setNativeTokenTypeForTest(Dialect::Generation);
+
+    b->checkPoolPreconditions();
+
+    EXPECT_EQ(storage->last_request.profile, DB::ObjectStorageRetryProfile::SingleAttempt);
+    EXPECT_EQ(storage->last_request.attempt_timeout_ms, 5000u);
+    EXPECT_EQ(storage->last_request.connect_timeout_cap_ms, 3000u);
 }
 
 /// The ETag-dialect (AWS-compatible) backend never consults bucket versioning at all — the check is

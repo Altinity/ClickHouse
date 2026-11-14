@@ -117,7 +117,7 @@ struct PoolConfig
     /// (superseded-generation prune) caps, cumulative for the round. `prefix_wholesale_budget` is the
     /// round's shared remainder every prune `deletePrefixWholesale` call draws from, so no single call
     /// passes an unbounded `bounded_remaining`.
-    uint64_t gc_round_ref_cleanup_budget = 5000;
+    uint64_t gc_round_ref_cleanup_budget = 0;
     uint64_t gc_round_prefix_wholesale_budget = 20000;
     /// The post-CAS hand-off reclaim draws from its OWN reserve, never from `prefix_wholesale_budget`
     /// above: the prune safely under-serves and retries next round via its cursor, but the hand-off is a
@@ -217,13 +217,16 @@ struct PoolConfig
 
     std::function<void(const BlobRef &)> gc_redelete_apply_hook_for_test = {};
     std::optional<size_t> gc_io_pool_refuse_at_for_test = std::nullopt;
+    /// TEST SEAM: replaces the default per-shard byte limit of a round's outcome log.
+    std::optional<uint64_t> gc_outcome_log_byte_limit_for_test = std::nullopt;
 
     /// Mount-lease TTL: how long a freshly-renewed mount lease is valid. The local
     /// write fence's monotonic deadline is `renew_time + this`, so a superseded/paused writer is fenced
     /// once `this` elapses with no successful renew. The background renewer runs every
-    /// `mount_renew_period` (default ttl/3) so a healthy mount renews well before expiry.
+    /// `mount_renew_period` so a healthy mount renews well before expiry. These are the values of a
+    /// pool opened without disk settings, which is how unit tests open one; a disk defaults to 120000/10000.
     std::chrono::milliseconds mount_lease_ttl_ms{30000};
-    std::chrono::milliseconds mount_renew_period{10000};   /// = ttl/3 by default
+    std::chrono::milliseconds mount_renew_period{10000};
 
     /// `cas_unsafe_remount_no_delay`: reclaim a same-uuid, different-epoch, uncertified mount slot at
     /// once, with no token-stability observation at all. Unsafe whenever two processes can hold the
@@ -610,12 +613,22 @@ public:
     /// `ResolveAudit`'s doc comment (`CasRefLedger.h`) for the one `Deferred` call site.
     std::optional<Resolved> resolveRef(const RootNamespace & ns, const String & ref_name, bool allow_stale = false,
                                        ResolveAudit audit = ResolveAudit::Emit);
-    /// Gate 1 of the relink confirm -- a thin forward to the ref ledger, whose declaration carries the
-    /// rules (`CasRefLedger::confirmExactRef`). Read-only and object-store-I/O-free by contract.
+    /// Gate 1 of the relink confirm. The ledger (`CasRefLedger::confirmExactRef`) decides from memory;
+    /// only its `Yes` is re-checked, by one `GET` of the mount slot after the ledger locks are
+    /// released, because local fence state cannot see a successor that claimed the slot. A slot this
+    /// mount no longer holds, or no renewer to prove it, turns `Yes` into `Unknown`; a failed read
+    /// throws, and the storage layer answers `Unknown`. Any other ledger answer issues no request.
     ConfirmAnswer confirmExactRef(const RootNamespace & ns, const String & ref_name,
-                                  const ManifestRef & manifest_ref) const
+                                  const ManifestRef & manifest_ref) const;
+    /// TEST SEAM: runs between the ownership capture and the ledger snapshot.
+    void setConfirmAfterOwnershipCaptureHookForTest(std::function<void()> hook)
     {
-        return ref_ledger.confirmExactRef(ns, ref_name, manifest_ref);
+        confirm_after_ownership_capture_hook_for_test = std::move(hook);
+    }
+    /// TEST SEAM: runs between the ledger's `Yes` and the mount-slot read, with no ledger lock held.
+    void setConfirmAfterLedgerSnapshotHookForTest(std::function<void()> hook)
+    {
+        confirm_after_ledger_snapshot_hook_for_test = std::move(hook);
     }
     /// Read the single immutable part manifest named by `id`. Serves the cached decode when the id
     /// is cached (no request); otherwise derives the key via CasLayout::manifestKey, GETs and decodes
@@ -679,8 +692,8 @@ public:
     /// `DirShape::TableDir` case.
     bool namespaceStillLogicallyPresent(const RootNamespace & ns);
 
-    /// GC callback after a proved exact catalog deletion; see `CasRefLedger` for the in-place cached
-    /// runtime invalidation contract.
+    /// GC callback before its first attempt to erase a folded `Removing` row (the erase may not follow)
+    /// and again once the erase resolved; see `CasRefLedger` for the cached runtime invalidation contract.
     void invalidateRemovedCatalogLife(const NamespaceLifeId & life);
 
     /// Reconciles cached removal-closed ref runtimes against a complete catalog cut.
@@ -1060,6 +1073,10 @@ public:
     {
         ref_ledger.setNamespacePresenceProbeAfterFirstReadHookForTest(std::move(hook));
     }
+    void setRemovalAttemptHookForTest(std::function<void()> hook)
+    {
+        ref_ledger.setRemovalAttemptHookForTest(std::move(hook));
+    }
     void setNamespacePresenceProbeAfterTerminalProvenHookForTest(std::function<void()> hook)
     {
         ref_ledger.setNamespacePresenceProbeAfterTerminalProvenHookForTest(std::move(hook));
@@ -1152,6 +1169,17 @@ public:
     {
         return ref_ledger.refTableRuntimeAdmittedFenceGenerationForTest(ns);
     }
+    uint64_t refNameRetirementsForTest(const RootNamespace & ns) const
+    {
+        return ref_ledger.refNameRetirementsForTest(ns);
+    }
+    size_t refNameSlotCountForTest() const { return ref_ledger.refNameSlotCountForTest(); }
+    CasRefLedger::ColdAdmission beginColdAdmissionForTest(const RootNamespace & ns)
+    {
+        return ref_ledger.beginColdAdmissionForTest(ns);
+    }
+    /// The ref-table half of a self-remount alone: the fence generation does not move.
+    void quiesceRefTablesForRemountForTest() { ref_ledger.quiesceRefTablesForRemount(); }
     std::optional<NamespaceLifeId> refTableLifeForTest(const RootNamespace & ns)
     {
         return ref_ledger.refTableLifeForTest(ns);
@@ -1291,6 +1319,11 @@ private:
     /// NO member-order change is introduced. Declared after event_sink_, pool_backend, config and
     /// pool_layout so it is constructed after every dependency it is injected with.
     CasMountRuntime mount_runtime;
+
+    /// TEST SEAM for `setConfirmAfterOwnershipCaptureHookForTest`; set only while no confirm runs.
+    std::function<void()> confirm_after_ownership_capture_hook_for_test = {};
+    /// TEST SEAM for `setConfirmAfterLedgerSnapshotHookForTest`; set only while no confirm runs.
+    std::function<void()> confirm_after_ledger_snapshot_hook_for_test = {};
 
     /// Serializes `tryRemountOnce` (whose claim/recovery ORCHESTRATION stays on Pool). STAYS here with
     /// its guarded critical section: persistent worker ownership, fence atomics, and the build registry

@@ -27,7 +27,7 @@ namespace
 struct Fixture
 {
     std::shared_ptr<InMemoryBackend> backend = std::make_shared<InMemoryBackend>();
-    CasRequests requests{backend, Fence::open(), [] { return uint64_t{100}; }, [](uint64_t) {}};
+    CasRequests requests{backend, Fence::open(), [] { return uint64_t{100}; }, [](uint64_t) {}, nullptr, DB::Cas::kDefaultRequestWindowMs};
     Etag etag = std::get<Committed>(requests.admit().create("k", "v1", Retry::standard())).etag;
     std::vector<String> events;
     CasOperation op = requests.admit();

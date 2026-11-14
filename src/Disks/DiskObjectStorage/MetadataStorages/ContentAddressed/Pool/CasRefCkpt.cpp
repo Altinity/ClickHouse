@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCkpt.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Common/Exception.h>
+#include <Common/logger_useful.h>
 #include <base/defines.h>
 #include <algorithm>
 #include <limits>
@@ -116,6 +117,36 @@ bool lifeEpochWouldDecrease(const RefCkpt & durable, const RefCkpt & contributio
         key, *durable.life_epoch, *contribution.life_epoch, *durable.life_epoch);
 }
 
+/// The epoch-exact refusals `mergeCommittedThrough` cannot make; nullopt means merge. A late create can
+/// land in a seal slot that cleanup already reclaimed, and the merge accepts its frontier because a later
+/// seal is numerically at or above it. These verdicts take precedence over the merge's cross-epoch rule: a
+/// frontier two or more epochs below the durable one, which the merge would reject as `CORRUPTED_DATA`, is
+/// `Superseded` here.
+std::optional<CkptPublishOutcome> refuseFrontierAgainstDurable(const RefCkpt & durable, const RefCkpt & contribution)
+{
+    if (!contribution.committed_through || !durable.committed_through)
+        return std::nullopt;
+    const RefTxnId & frontier = *contribution.committed_through;
+    if (contribution.last_epoch_seal == frontier)
+        return std::nullopt;
+
+    if (durable.last_epoch_seal == frontier)
+        return CkptPublishOutcome::SuccessorSeal;
+
+    if (frontier.writer_epoch < durable.committed_through->writer_epoch)
+    {
+        /// A successor's walk adopts every present id below the slot it seals, so an id below the seal
+        /// of its own epoch is history. Once the seal belongs to a later epoch, adopted and re-landed
+        /// ids look the same.
+        const bool below_own_epoch_seal = durable.last_epoch_seal
+            && durable.last_epoch_seal->writer_epoch == frontier.writer_epoch
+            && frontier < *durable.last_epoch_seal;
+        if (!below_own_epoch_seal)
+            return CkptPublishOutcome::Superseded;
+    }
+    return std::nullopt;
+}
+
 }
 
 RefCkpt mergeCkpt(const RefCkpt & a, const RefCkpt & b)
@@ -205,6 +236,8 @@ CkptPublishOutcome publishCkpt(CasOperation & op, const Layout & layout, const N
         Fenced,
     };
     std::optional<Decline> decline;
+    std::optional<CkptPublishOutcome> refusal;
+    std::optional<RefCkpt> refused_against;
     /// A decline on any decision AFTER the first can only follow a refused attempt of this call, and an
     /// attempt is only ever refused after it was sent. That distinction is what keeps `IdenticalSkip`'s
     /// promise -- no write was issued -- true wherever it is reported.
@@ -214,6 +247,8 @@ CkptPublishOutcome publishCkpt(CasOperation & op, const Layout & layout, const N
     {
         ++decisions;
         decline.reset();
+        refusal.reset();
+        refused_against.reset();
         std::optional<RefCkpt> durable;
         if (current)
             durable = decodeRefCkpt(current->bytes);
@@ -238,11 +273,38 @@ CkptPublishOutcome publishCkpt(CasOperation & op, const Layout & layout, const N
             throwLifeEpochDecrease(*durable, contribution, key);
         }
 
+        /// Also decided before the merge, which would absorb these verdicts into an identical body or
+        /// reject two of their shapes as `CORRUPTED_DATA`. Unlike the rule above, admission is not
+        /// consulted: the verdict is a fact about the durable body, and a zombie whose lease check
+        /// still passes must not be acknowledged either.
+        if (durable && (refusal = refuseFrontierAgainstDurable(*durable, contribution)))
+        {
+            refused_against = durable;
+            return std::nullopt;
+        }
+
         /// ANY writer may create the object; none of them may invent a field. An absent `_ckpt` is
         /// created from the contribution as it stands, so a publisher that knows only the checkpoint
         /// creates one that knows only the checkpoint, and the birth transaction's `life_epoch` merges
         /// into it whenever it arrives -- in either order, because the merge is a per-field maximum.
-        const RefCkpt merged = durable ? mergeCkpt(*durable, contribution) : contribution;
+        RefCkpt merged = contribution;
+        if (durable)
+        {
+            /// `durable` already decoded and passed the invariants, so a merge that throws rejects the
+            /// contribution's relation to it. As with the `life_epoch` rule above, the fence picks the
+            /// verdict: a writer that already lost admission is a zombie with a stale contribution.
+            try
+            {
+                merged = mergeCkpt(*durable, contribution);
+            }
+            catch (const Exception & e)
+            {
+                if (e.code() != ErrorCodes::CORRUPTED_DATA || op.admitted())
+                    throw;
+                decline = Decline::Fenced;
+                return std::nullopt;
+            }
+        }
 
         /// Nothing new: write NOTHING. This is not an optimization -- both writers publish on every
         /// snapshot and every seal, and most of those carry a checkpoint the object already has, so
@@ -261,6 +323,20 @@ CkptPublishOutcome publishCkpt(CasOperation & op, const Layout & layout, const N
         return CkptPublishOutcome::Published;
     if (std::holds_alternative<Declined>(result))
     {
+        if (refusal)
+        {
+            const auto render = [](const std::optional<RefTxnId> & id)
+            {
+                return id ? fmt::format("{}-{}", id->writer_epoch, id->ref_sequence) : String("none");
+            };
+            LOG_WARNING(getLogger("CasPool"),
+                "CAS `_ckpt` for namespace '{}': refusing the frontier {} as `{}`: durable `committed_through` is {}, "
+                "durable `last_epoch_seal` is {}",
+                life.ns.string(), render(contribution.committed_through),
+                *refusal == CkptPublishOutcome::SuccessorSeal ? "SuccessorSeal" : "Superseded",
+                render(refused_against->committed_through), render(refused_against->last_epoch_seal));
+            return *refusal;
+        }
         if (decline == Decline::Fenced)
             return CkptPublishOutcome::FencedOut;
         /// The durable body already carries this contribution and an attempt of this call was sent to

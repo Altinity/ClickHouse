@@ -365,8 +365,9 @@ public:
     /// at ITS `server_root_id` (`liveNamespace` builds every live/detached namespace as
     /// `<server_root_id>/<mirrored table dir>`). Factory-class: I/O-free, ungated, never throws.
     bool ownsNamespace(const String & other_server_root_id, const String & root_namespace) const override;
-    /// Gate 1 of the relink confirm, forwarded to the pool's ref ledger. Answers `Unknown` for an
-    /// unparsable token and for a disk that has not started or has reached a terminal lifecycle.
+    /// Gate 1 of the relink confirm, forwarded to the pool. Answers `Unknown` for an unparsable token,
+    /// for a failed mount-slot read, and for a disk that has not started or has reached a terminal
+    /// lifecycle. A ledger `Yes` costs at most one mount-slot `GET`; every other ledger answer costs none.
     CasConfirmAnswer confirmExactRef(const String & root_namespace, const String & ref_name,
                                      const String & manifest_ref_text) const override;
     /// Returns the canonical encoded manifest for a committed part plus the confirm token minted from
@@ -678,6 +679,7 @@ private:
     /// Startup-only margin validated against the mount lease TTL; feeds
     /// `Cas::PoolConfig::cas_request_budget.lease_safety_margin_ms`.
     const uint64_t cas_lease_safety_margin_ms;
+    const uint64_t cas_request_window_ms;
     /// Configured staging backend; `Local` preserves the existing write path.
     const Cas::StagingBackend staging_backend;
     /// Blob content-hash function passed to `Cas::PoolConfig`.

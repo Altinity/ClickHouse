@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestBudget.h>
 
 #include <limits>
+#include <fmt/format.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
 
@@ -27,6 +28,44 @@ uint64_t CasRequestBudget::attemptEnvelopeMs() const
         : attempt_timeout_ms + connects;
 }
 
+void setCasRequestWindow(CasRequestBudget & budget, uint64_t window_ms)
+{
+    budget.request_window_ms = window_ms;
+    budget.recovery_retry_budget_ms = window_ms > std::numeric_limits<uint64_t>::max() / 2
+        ? std::numeric_limits<uint64_t>::max()
+        : 2 * window_ms;
+}
+
+void validateCasRequestWindow(const CasRequestBudget & budget)
+{
+    const uint64_t envelope = budget.attemptEnvelopeMs();
+    if (budget.request_window_ms <= envelope)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "CAS request budget rejected: request_window_ms (`cas_request_window_ms`, {} ms) must be larger than "
+            "the attempt envelope ({} ms), or no request could be retried inside its window. The disk refuses to "
+            "open with this budget.",
+            budget.request_window_ms, envelope);
+}
+
+namespace
+{
+
+/// `CasOperation::writeLoop` reserves two envelopes before it sends a write.
+void validateWritableCasRequestWindow(const CasRequestBudget & budget)
+{
+    const uint64_t envelope = budget.attemptEnvelopeMs();
+    const uint64_t two_envelope = envelope > std::numeric_limits<uint64_t>::max() / 2
+        ? std::numeric_limits<uint64_t>::max() : 2 * envelope;
+    if (budget.request_window_ms <= two_envelope)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "CAS request budget rejected: request_window_ms (`cas_request_window_ms`, {} ms) must be larger than "
+            "twice the attempt envelope (2 × {} ms = {} ms): a write reserves its attempt and the read that settles "
+            "it, so a smaller window gives up before it sends one. A writable disk refuses to open with this budget.",
+            budget.request_window_ms, envelope, two_envelope);
+}
+
+}
+
 void validateCasRequestBudget(const CasRequestBudget & budget, uint64_t mount_lease_ttl_ms,
                               uint64_t mount_renew_period_ms, bool background_renewal)
 {
@@ -34,6 +73,7 @@ void validateCasRequestBudget(const CasRequestBudget & budget, uint64_t mount_le
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
             "CAS request budget rejected: attempt_timeout_ms must be at least 1; a zero would reserve nothing "
             "while the request keeps the storage's own timeout");
+    validateWritableCasRequestWindow(budget);
     const uint64_t envelope = budget.attemptEnvelopeMs();
     /// Subtractions against the unsigned TTL: the sums could wrap for absurd values and read as small.
     const bool one_envelope_fits = envelope < mount_lease_ttl_ms
@@ -61,11 +101,16 @@ void validateCasRequestBudget(const CasRequestBudget & budget, uint64_t mount_le
                 "lease_safety_margin_ms ({}) must be strictly less than the mount lease TTL ({} ms)",
                 mount_renew_period_ms, envelope, budget.lease_safety_margin_ms, mount_lease_ttl_ms);
     }
+    /// The slack is computed only after the cadence check passed, so it cannot underflow.
+    const uint64_t write_reserve_ms = 2 * envelope + budget.lease_safety_margin_ms;
+    const String renewal_slack = background_renewal
+        ? fmt::format(" renewal_slack_ms={}", mount_lease_ttl_ms - mount_renew_period_ms - write_reserve_ms)
+        : String{};
     LOG_INFO(getLogger("CasRequestBudget"),
         "CAS request budget in effect: attempt_timeout_ms={} connect_timeout_cap_ms={} envelope_ms={} lease_safety_margin_ms={} "
-        "(mount_lease_ttl_ms={} mount_renew_period_ms={})",
+        "write_reserve_ms={}{} (mount_lease_ttl_ms={} mount_renew_period_ms={}) request_window_ms={}",
         budget.attempt_timeout_ms, budget.connect_timeout_cap_ms.value_or(0), envelope, budget.lease_safety_margin_ms,
-        mount_lease_ttl_ms, mount_renew_period_ms);
+        write_reserve_ms, renewal_slack, mount_lease_ttl_ms, mount_renew_period_ms, budget.request_window_ms);
 }
 
 }

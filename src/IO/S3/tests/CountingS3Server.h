@@ -90,6 +90,7 @@ struct Request
     /// `/bucket/key`.
     std::string path;
     std::string body;
+    Poco::URI::QueryParameters query;
 };
 
 using Responder = std::function<void(const Request & request, Poco::Net::HTTPServerResponse & response)>;
@@ -110,12 +111,14 @@ public:
         if (request.hasContentLength())
             Poco::StreamCopier::copyToString64(request.stream(), body);
         const size_t nth = ++counts[static_cast<size_t>(verb)];
+        const Poco::URI uri(request.getURI());
         respond(
             Request{
                 .verb = verb,
                 .nth = nth,
-                .path = Poco::URI(request.getURI()).getPath(),
-                .body = std::move(body)},
+                .path = uri.getPath(),
+                .body = std::move(body),
+                .query = uri.getQueryParameters()},
             response);
     }
 };

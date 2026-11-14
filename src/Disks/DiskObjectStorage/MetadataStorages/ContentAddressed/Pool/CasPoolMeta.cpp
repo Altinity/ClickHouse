@@ -74,7 +74,7 @@ PoolMeta rmwPoolMeta(CasOperation & op, const String & key, std::string_view wha
         [&](const std::optional<Object> & current) -> std::optional<String>
         {
             if (!current)
-                throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS pool meta '{}' vanished during {}", key, what);
+                throw Exception(ErrorCodes::INVALID_STATE, "CAS pool meta '{}' vanished during {}", key, what);
             observed = decodePoolMeta(current->bytes);
             if (!mutate(observed))
                 return std::nullopt;
@@ -177,8 +177,8 @@ PoolMeta PoolMeta::createOrValidate(
     if (std::holds_alternative<Committed>(result))
         return pm;
 
-    /// Lost the race: the winner's object MUST be present now. The loser UNIONS its algo via the SAME
-    /// flag-gated admission path as a reopen, instead of the old unconditional fail-close.
+    /// Lost the race: the winner's object is present unless something removed it since. The loser UNIONS
+    /// its algo via the SAME flag-gated admission path as a reopen.
     if (std::holds_alternative<Conflict>(result))
         return admitOrValidate(op, key, blob_hash_algo, allow_new);
 

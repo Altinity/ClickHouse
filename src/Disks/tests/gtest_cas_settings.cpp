@@ -1,10 +1,14 @@
 #include <gtest/gtest.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestBudget.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Common/Exception.h>
+#include "cas_test_helpers.h"
 #include <Common/logger_useful.h>
 #include <Poco/AutoPtr.h>
 #include <Poco/StreamChannel.h>
 #include <Poco/Util/XMLConfiguration.h>
+#include <limits>
 #include <sstream>
 
 using namespace DB;
@@ -26,7 +30,17 @@ namespace DB::ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 gc_shards;
     extern const ContentAddressedSettingsUInt64 gc_interval_sec;
     extern const ContentAddressedSettingsUInt64 gc_bulk_delete_chunk_keys;
+    extern const ContentAddressedSettingsUInt64 gc_round_graduation_budget;
+    extern const ContentAddressedSettingsUInt64 gc_round_redelete_budget;
+    extern const ContentAddressedSettingsUInt64 gc_round_ref_cleanup_budget;
+    extern const ContentAddressedSettingsUInt64 gc_round_handoff_prefix_wholesale_budget;
+    extern const ContentAddressedSettingsUInt64 gc_round_outcome_entry_budget;
+    extern const ContentAddressedSettingsUInt64 gc_round_sweep_namespace_budget;
+    extern const ContentAddressedSettingsUInt64 gc_round_sweep_recovery_op_budget;
+    extern const ContentAddressedSettingsUInt64 gc_round_prefix_wholesale_budget;
     extern const ContentAddressedSettingsUInt64 mount_lease_ttl_ms;
+    extern const ContentAddressedSettingsUInt64 mount_renew_period_ms;
+    extern const ContentAddressedSettingsUInt64 request_window_ms;
     extern const ContentAddressedSettingsString scratch_path;
     extern const ContentAddressedSettingsBool unsafe_remount_no_delay;
     extern const ContentAddressedSettingsBool allow_packed_parts;
@@ -111,6 +125,29 @@ TEST(CASContentAddressedSettings, DefaultsAndOverridesLand)
     EXPECT_EQ(s[ContentAddressedSetting::gc_interval_sec].value, 60u);          /// table default
     /// Absent key -> the verbatim default (never touches the anchor).
     EXPECT_EQ(s[ContentAddressedSetting::scratch_path].value, "/data/default_scratch");
+}
+
+TEST(CASContentAddressedSettings, GcRoundBudgetsDefaultToUnbounded)
+{
+    auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id>");
+    ContentAddressedSettings s;
+    s.loadFromConfig(*cfg, "disk", "/data", "/data/default_scratch", identity_macros);
+    EXPECT_EQ(s[ContentAddressedSetting::gc_round_graduation_budget].value, 0u);
+    EXPECT_EQ(s[ContentAddressedSetting::gc_round_redelete_budget].value, 0u);
+    EXPECT_EQ(s[ContentAddressedSetting::gc_round_ref_cleanup_budget].value, 0u);
+    EXPECT_EQ(s[ContentAddressedSetting::gc_round_handoff_prefix_wholesale_budget].value, 0u);
+    EXPECT_EQ(s[ContentAddressedSetting::gc_round_outcome_entry_budget].value, 0u);
+
+    const Cas::PoolConfig pool_config;
+    EXPECT_EQ(pool_config.gc_round_graduation_budget, 0u);
+    EXPECT_EQ(pool_config.gc_round_redelete_budget, 0u);
+    EXPECT_EQ(pool_config.gc_round_ref_cleanup_budget, 0u);
+    EXPECT_EQ(pool_config.gc_round_handoff_prefix_wholesale_budget, 0u);
+    EXPECT_EQ(pool_config.gc_round_outcome_entry_budget, 0u);
+
+    EXPECT_EQ(s[ContentAddressedSetting::gc_round_sweep_namespace_budget].value, 20u);
+    EXPECT_EQ(s[ContentAddressedSetting::gc_round_sweep_recovery_op_budget].value, 5000u);
+    EXPECT_EQ(s[ContentAddressedSetting::gc_round_prefix_wholesale_budget].value, 20000u);
 }
 
 TEST(CASContentAddressedSettings, PackedPartsDefaultOffAndOptIn)
@@ -648,4 +685,66 @@ TEST(CASContentAddressedSettings, MountLeaseTtlAtTheMaximumIsKeptSilently)
     s.loadFromConfig(*cfg, "disk", "/data", "/data/scratch", identity_macros);
     EXPECT_EQ(s[ContentAddressedSetting::mount_lease_ttl_ms].value, 600'000u);
     EXPECT_EQ(countOccurrences(capture.captured(), "exceeds the maximum"), 0u) << capture.captured();
+}
+
+TEST(CASContentAddressedSettings, MountLeaseDefaultsSatisfyRequestBudget)
+{
+    ContentAddressedSettings s;
+    EXPECT_EQ(s[ContentAddressedSetting::mount_lease_ttl_ms].value, 120000u);
+    EXPECT_EQ(s[ContentAddressedSetting::mount_renew_period_ms].value, 10000u);
+
+    const Cas::CasRequestBudget budget;
+    const uint64_t ttl = s[ContentAddressedSetting::mount_lease_ttl_ms].value;
+    const uint64_t period = s[ContentAddressedSetting::mount_renew_period_ms].value;
+    EXPECT_NO_THROW(Cas::validateCasRequestBudget(budget, ttl, period, /*background_renewal=*/true));
+
+    const uint64_t write_reserve = 2 * budget.attemptEnvelopeMs() + budget.lease_safety_margin_ms;
+    EXPECT_EQ(ttl - period - write_reserve, 94000u);
+}
+
+TEST(CASContentAddressedSettings, RequestWindowDefaultAndValidation)
+{
+    auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id>");
+    ContentAddressedSettings s;
+    s.loadFromConfig(*cfg, "disk", "/data", "/data/scratch", identity_macros);
+    EXPECT_EQ(s[ContentAddressedSetting::request_window_ms].value, 120'000u);
+
+    /// A writable open needs room for a write's two envelopes, its attempt and its settlement read.
+    DB::Cas::CasRequestBudget budget;
+    budget.request_window_ms = 2 * budget.attemptEnvelopeMs();
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::BAD_ARGUMENTS, "twice the attempt envelope", [&]
+    {
+        DB::Cas::validateCasRequestBudget(budget, /*mount_lease_ttl_ms=*/120'000, /*mount_renew_period_ms=*/10'000,
+                                          /*background_renewal=*/true);
+    });
+    budget.request_window_ms = 2 * budget.attemptEnvelopeMs() + 1;
+    EXPECT_NO_THROW(DB::Cas::validateCasRequestBudget(budget, 120'000, 10'000, /*background_renewal=*/true));
+
+    /// A read-only open sends no write, so one envelope is its bound.
+    budget.request_window_ms = budget.attemptEnvelopeMs();
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::BAD_ARGUMENTS, "larger than the attempt envelope",
+        [&] { DB::Cas::validateCasRequestWindow(budget); });
+    budget.request_window_ms = budget.attemptEnvelopeMs() + 1;
+    EXPECT_NO_THROW(DB::Cas::validateCasRequestWindow(budget));
+
+    EXPECT_EQ(DB::Cas::CasRequestBudget{}.recovery_retry_budget_ms, 240'000u);
+}
+
+TEST(CASContentAddressedSettings, RequestWindowSettingSetsTheWindowAndTwiceTheRecoveryBudget)
+{
+    auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id><cas_request_window_ms>90000</cas_request_window_ms>");
+    ContentAddressedSettings s;
+    s.loadFromConfig(*cfg, "disk", "/data", "/data/scratch", identity_macros);
+
+    DB::Cas::PoolConfig pool_config;
+    DB::Cas::setCasRequestWindow(pool_config.cas_request_budget, s[ContentAddressedSetting::request_window_ms].value);
+    EXPECT_EQ(pool_config.cas_request_budget.request_window_ms, 90'000u);
+    EXPECT_EQ(pool_config.cas_request_budget.recovery_retry_budget_ms, 180'000u);
+
+    constexpr uint64_t max = std::numeric_limits<uint64_t>::max();
+    DB::Cas::setCasRequestWindow(pool_config.cas_request_budget, max / 2);
+    EXPECT_EQ(pool_config.cas_request_budget.recovery_retry_budget_ms, max - 1);
+    DB::Cas::setCasRequestWindow(pool_config.cas_request_budget, max / 2 + 1);
+    EXPECT_EQ(pool_config.cas_request_budget.recovery_retry_budget_ms, max);
+    EXPECT_EQ(pool_config.cas_request_budget.request_window_ms, max / 2 + 1);
 }

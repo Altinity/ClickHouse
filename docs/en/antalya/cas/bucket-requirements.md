@@ -39,7 +39,11 @@ configuration (`storage.buckets.get` on GCS), or the backend cannot report it â€
 proceeds and logs a warning naming what it could not verify, because an unreadable configuration is
 not evidence of a versioned bucket, and refusing on it would turn a missing IAM grant into an outage.
 In that case confirming that versioning is disabled is your responsibility, exactly as soft delete is
-below; grant the permission if you want the mount to verify it for you.
+below; grant the permission if you want the mount to verify it for you. On a writable mount the SDK does
+not retry the probe, and the probe runs under the same per-attempt budget as the mount's other
+control-plane requests (`cas_attempt_timeout_ms`). A probe that timed out counts as one that could not
+answer. A writable mount runs the probe once per start of the disk; a remount after a lost lease does
+not repeat it.
 
 Because that check is part of the mount battery, `skip_access_check = true` is refused on a writable
 generation-token disk. Mount the disk read-only if you need to start before the access check can

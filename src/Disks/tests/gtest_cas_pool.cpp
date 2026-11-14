@@ -202,6 +202,28 @@ ManifestId publishPartWithEntries(
 }
 }
 
+/// The disk's request window reaches every request plane a pool exposes, not only the one a give-up
+/// test happens to use. A plane built with the default window would freeze a 120 s deadline here.
+TEST(CASPool, EveryExposedRequestPlaneTakesTheConfiguredRequestWindow)
+{
+    constexpr uint64_t window_ms = 20'000;
+    auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
+    DB::Cas::PoolConfig config{.pool_prefix = "p", .server_root_id = "test"};
+    config.cas_request_budget.request_window_ms = window_ms;
+    DB::Cas::PoolPtr store = DB::Cas::Pool::open(backend, std::move(config));
+    const auto clock = DB::Cas::tests::VirtualRetryClock::installOn(store);
+
+    const std::vector<std::pair<const char *, DB::Cas::CasRequests *>> planes{
+        {"mount", &store->mountRequests()}, {"lease", &store->leaseRequests()}, {"gc", &store->openRequests()}};
+    for (const auto & [name, plane] : planes)
+    {
+        DB::Cas::CasOperation op = plane->admit();
+        const DB::Cas::Retry frozen = op.freeze(DB::Cas::Retry::standard());
+        ASSERT_TRUE(frozen.policy_deadline_ms) << name;
+        EXPECT_EQ(*frozen.policy_deadline_ms, clock->nowMs() + window_ms) << name;
+    }
+}
+
 TEST(CASPool, ReadOnlyOpenSkipsProbe)
 {
     auto shared = std::make_shared<DB::Cas::InMemoryBackend>();
@@ -2151,8 +2173,9 @@ public:
         : mount(backend, DB::Cas::Fence{
               [this] { return runtime.fenceGeneration(); },
               [this](uint64_t g, uint64_t needed) { return runtime.admit(g, needed); },
-              [this](uint64_t g) { runtime.checkFenceOrThrow(g); }})
-        , lease(backend, DB::Cas::Fence::open())
+              [this](uint64_t g) { runtime.checkFenceOrThrow(g); }},
+              {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs)
+        , lease(backend, DB::Cas::Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs)
         , runtime(backend, mount, lease, std::forward<Args>(args)...)
     {
         /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the
@@ -2524,7 +2547,7 @@ TEST(CASPoolShutdown, UnresolvedWedgeSkipsFarewell)
             *fake_boot += ms;
         }});
     /// The engine's own inter-attempt sleep advances the same clock its deadlines are read from, so the
-    /// retry bound is reached in test time rather than in ninety real seconds.
+    /// retry bound is reached in test time rather than after a real request window.
     store->setCasRetrySleepForTest([fake_boot](uint64_t ms)
     {
         *fake_boot += ms;

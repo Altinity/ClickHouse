@@ -57,6 +57,9 @@ enum class RefLaneState : uint8_t
     Faulted,
 };
 
+/// Stable name of a lane state, for messages and logs.
+std::string_view refLaneStateName(RefLaneState state);
+
 /// The answer of the relink confirm's gate 1 (`CasRefLedger::confirmExactRef`).
 ///
 /// `Yes` is the only answer that AUTHORIZES anything, so it is the only one that must be earned: it is
@@ -156,7 +159,8 @@ public:
     /// Performs ZERO object-store I/O: a cold, evicted or recovering table answers `Unknown` rather
     /// than recovering from storage, and no runtime is created as a side effect of asking. That is a
     /// contract, not an optimization -- the confirm is a read-only interserver query that a remote
-    /// receiver drives, so it must never be able to make this writer do work.
+    /// receiver drives, so the ledger must never do work for it. The one exception is the single mount-slot
+    /// `GET` that `Pool::confirmExactRef` adds after a `Yes`.
     ///
     /// The rules are evaluated as one snapshot spanning both lane mutexes, in this order: table warm
     /// and resident; lane state `Ready` or `Writing`, with no queued or carved mutation whose
@@ -189,7 +193,8 @@ public:
     /// resolution, and the ONLY one that CREATES: recovery's step 0 (`resolveNamespaceLife`) mints a
     /// life when the catalog names none, so the first namespace file a table ever writes births the
     /// namespace exactly as its first ref op would. A read or a removal must not use this -- see the
-    /// sibling below for why that is a correctness matter and not a preference.
+    /// sibling below for why that is a correctness matter and not a preference. Throws retry-later for
+    /// a life whose terminal removal is already applied, since the janitor sweeps whatever is written there.
     NamespaceLifeId namespaceLife(const RootNamespace & ns);
 
     /// The life a READER (or a REMOVER) of this namespace's files must use, or `nullopt` when there are
@@ -230,11 +235,12 @@ public:
     /// re-reads the exact catalog row.
     bool namespaceStillLogicallyPresent(const RootNamespace & ns);
 
-    /// Called after a complete catalog observation proves an exact resident life absent or replaced.
-    /// It does not
-    /// destroy the runtime: existing callers that already captured the old physical life may finish
-    /// with their stale-or-not-found contract. The name slot is detached by exact pointer identity; a
-    /// later name-based touch may publish a distinct successor runtime.
+    /// Called after a complete catalog observation proves an exact resident life absent or replaced,
+    /// and by GC before its first attempt to erase a row whose terminal removal is folded (the erase
+    /// may not follow) and again once the erase resolved. It does not destroy the runtime: existing
+    /// callers that already captured the old physical life may finish with their stale-or-not-found
+    /// contract. The name slot is detached by exact pointer identity; a later name-based touch may
+    /// publish a distinct successor runtime.
     void invalidateRemovedCatalogLife(const NamespaceLifeId & life);
 
     /// Reconciles resident removal-closed runtimes against one complete catalog observation. An exact
@@ -264,6 +270,34 @@ public:
     /// Marks cached runtimes obsolete before a self-remount reopens the append fence. Leaders holding an
     /// orphaned runtime therefore fail closed instead of mutating state from the previous epoch.
     void quiesceRefTablesForRemount();
+
+    /// One cold admission of a name, from the capture of its retirement count before the catalog read
+    /// to the publish of its runtime. Until it is released, and unless a remount clears the map, the name's
+    /// slot and its retirement count stay.
+    /// The destructor takes `ref_queue_mutex`: never destroy one under that mutex or a `state_mutex`.
+    class ColdAdmission
+    {
+    public:
+        ColdAdmission(ColdAdmission && other) noexcept;
+        ColdAdmission & operator=(ColdAdmission &&) = delete;
+        ColdAdmission(const ColdAdmission &) = delete;
+        ColdAdmission & operator=(const ColdAdmission &) = delete;
+        ~ColdAdmission();
+
+    private:
+        friend class CasRefLedger;
+        ColdAdmission(CasRefLedger & ledger_, String name_, uint64_t retirements_seen_, uint64_t epoch_) noexcept;
+
+        /// Null once released or moved from.
+        CasRefLedger * ledger;
+        String name;
+        uint64_t retirements_seen;
+        /// `ref_name_slots_epoch` at capture: the slot this admission counts in.
+        uint64_t epoch;
+    };
+
+    /// Captures a cold admission of `ns` with no catalog read and no runtime.
+    ColdAdmission beginColdAdmissionForTest(const RootNamespace & ns) { return beginColdAdmission(ns); }
 
     /// The self-remount's CANCEL-OR-JOIN barrier over in-flight recoveries (spec §3: "self-remount
     /// cancels or waits out recovery before rearming"). Requests cancellation on every cached table,
@@ -315,6 +349,10 @@ public:
     uint64_t refRecoveryRestartsForTest(const RootNamespace & ns);
     /// Reports whether `ns` currently has an unresolved append `PUT`.
     bool refLaneWedgedForTest(const RootNamespace & ns);
+    /// Installs a hook run by each removal attempt after it closed and drained the positive lane, before
+    /// the post-close catalog read. An attempt that returns early on an already-terminal runtime skips it.
+    /// Set before any removal runs.
+    void setRemovalAttemptHookForTest(std::function<void()> hook) { removal_attempt_hook_for_test = std::move(hook); }
     /// Returns the object key retained for the unresolved append of `ns`.
     String wedgedKeyForTest(const RootNamespace & ns);
     /// Returns the fence generation retained with the unresolved append of `ns` (0 when not wedged).
@@ -474,7 +512,7 @@ public:
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
         const auto it = ref_name_slots.find(ns.string());
-        return it == ref_name_slots.end() ? 0 : it->second.current->pending.size();
+        return it == ref_name_slots.end() || !it->second.current ? 0 : it->second.current->pending.size();
     }
 
     /// Reports whether `ns` currently has an active append-lane leader (the baton). Under the queue mutex.
@@ -482,7 +520,7 @@ public:
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
         const auto it = ref_name_slots.find(ns.string());
-        return it != ref_name_slots.end() && it->second.current->leader_active;
+        return it != ref_name_slots.end() && it->second.current && it->second.current->leader_active;
     }
 
     /// Returns the number of items carved by the current tenure and not yet released by its exit guard.
@@ -491,7 +529,7 @@ public:
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
         const auto it = ref_name_slots.find(ns.string());
-        return it == ref_name_slots.end() ? 0 : it->second.current->carved.size();
+        return it == ref_name_slots.end() || !it->second.current ? 0 : it->second.current->carved.size();
     }
 
     /// Returns whether the `carved` entry for `ref_name` (if any) is already completed. Lets a test
@@ -501,7 +539,7 @@ public:
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
         const auto it = ref_name_slots.find(ns.string());
-        if (it == ref_name_slots.end())
+        if (it == ref_name_slots.end() || !it->second.current)
             return false;
         for (const auto & item : it->second.current->carved)
             if (item->scope.names(ref_name))
@@ -551,6 +589,19 @@ public:
         std::lock_guard<std::mutex> g(ref_queue_mutex);
         const auto it = ref_name_slots.find(ns.string());
         return it == ref_name_slots.end() || !it->second.current ? 0 : it->second.current->admitted_fence_generation;
+    }
+    /// The retirement count of `ns`'s slot; zero when the name has no slot.
+    uint64_t refNameRetirementsForTest(const RootNamespace & ns) const
+    {
+        std::lock_guard<std::mutex> g(ref_queue_mutex);
+        const auto it = ref_name_slots.find(ns.string());
+        return it == ref_name_slots.end() ? 0 : it->second.retirements;
+    }
+    /// Every name slot, with or without a resident runtime.
+    size_t refNameSlotCountForTest() const
+    {
+        std::lock_guard<std::mutex> g(ref_queue_mutex);
+        return ref_name_slots.size();
     }
     /// The physical life currently pinned in the cached runtime, without resolving or recovering it.
     std::optional<NamespaceLifeId> refTableLifeForTest(const RootNamespace & ns)
@@ -888,9 +939,21 @@ private:
         /// New positive mutations check it in the same queue critical section as admission; the one
         /// terminal `DropNamespace` item is the sole exception.
         bool removal_admission_closed = false;
+        /// A `Live -> Removing` catalog write of this runtime ended with an unknown outcome that no read
+        /// has resolved, so it can still land. The lane stays closed and the runtime stays resident until
+        /// a remount replaces it or GC erases the row (`invalidateRemovedCatalogLife`). A later attempt that
+        /// proves the row `Removing` clears the flag; the lane stays closed as `Removing`.
+        /// Guarded by `ref_queue_mutex`.
+        bool removal_write_may_land = false;
+        /// One removal attempt at a time per runtime, so one attempt cannot reopen the lane between
+        /// another's close and its send. Guarded by `ref_queue_mutex`.
+        bool removal_attempt_active = false;
         std::condition_variable cv;
 
-        /// Published after GC commits the exact catalog deletion. The exact cache pointer is detached;
+        /// Published by `invalidateRemovedCatalogLife`: from the GC drain before its first attempt to erase
+        /// the exact catalog row and again once the erase resolved, from `reconcileCatalogCut` once a cut
+        /// shows the life gone, from `namespaceLife` once a catalog read shows it gone, and from the
+        /// stalled-`Creating` cancellation in `dropNamespaceImpl`. The exact cache pointer is detached;
         /// old holders observe the flag and remain a predecessor, never a rebindable name handle.
         std::atomic<bool> catalog_life_invalidated{false};
 
@@ -936,6 +999,13 @@ private:
     struct RefNameSlot
     {
         std::shared_ptr<RefTableRuntime> current;
+        /// Bumped by `invalidateRemovedCatalogLife`, and by the eviction of a runtime that had closed or
+        /// applied its removal: another server's GC leader may drain that life without telling us.
+        /// A slot exists if and only if it has a `current` runtime or `admissions_in_flight > 0`, so
+        /// the count survives as long as a cold admission that captured it may still compare it.
+        uint64_t retirements = 0;
+        /// Live `ColdAdmission`s of this name captured in the current `ref_name_slots_epoch`.
+        uint32_t admissions_in_flight = 0;
     };
     static constexpr size_t kMaxRefBatch = 1000;
     /// Recovery retries at most this many times when an object selected by LIST vanishes before GET.
@@ -957,6 +1027,9 @@ private:
     /// taking a mutex to read consistently does not make the read a mutation.
     mutable std::mutex ref_queue_mutex;
     std::map<String, RefNameSlot> ref_name_slots;
+    /// Bumped with every clear of `ref_name_slots` by a remount, under `ref_queue_mutex`: a
+    /// `ColdAdmission` from before the clear must not release a slot created after it.
+    uint64_t ref_name_slots_epoch = 0;
     /// Monotonic access stamp for whole-table cache LRU eviction, bumped on every table touch and
     /// recorded in `RefTableRuntime::last_touch_tick`.
     std::atomic<uint64_t> ref_table_access_tick{0};
@@ -1030,16 +1103,47 @@ private:
     std::function<void()> wedge_before_slot_occupy_hook_for_test;
     std::function<void()> snapshot_after_capture_hook_for_test;
     std::function<void()> snapshot_before_ckpt_cas_hook_for_test;
+    std::function<void()> removal_attempt_hook_for_test;
 
     /// Non-materializing diagnostic/cache lookup. It never observes the catalog and never creates a
     /// name slot or runtime.
     std::shared_ptr<RefTableRuntime> lookupRefTableRuntime(const RootNamespace & ns) const;
 
+    /// Picks the wording of a stale-observation refusal, which is retryable either way: `Read` for
+    /// non-creating callers (removing a file included), `Write` for the rest. `PresenceProbe` reads,
+    /// and gets no runtime instead of the retired-name refusal.
+    enum class RuntimeAdmission : uint8_t
+    {
+        Read,
+        Write,
+        PresenceProbe,
+    };
+
     /// Publishes or returns one runtime for an exact catalog-observed life and admitted mount-fence
     /// generation. A conflicting attached identity is a stale observation and fails closed rather than
-    /// retargeting either runtime.
+    /// retargeting either runtime. `admission` was begun before the catalog read that produced `life`;
+    /// if a retirement of this name landed since, the observation is stale and the call throws
+    /// retry-later instead of republishing a possibly retired life; a `PresenceProbe` gets `nullptr`
+    /// there. Releases `admission` in its critical
+    /// section; if it throws before that, the caller's guard releases it.
     std::shared_ptr<RefTableRuntime> acquireRefTableRuntime(
-        const NamespaceLifeId & life, uint64_t admitted_generation);
+        const NamespaceLifeId & life, uint64_t admitted_generation, ColdAdmission & admission,
+        RuntimeAdmission kind);
+
+    /// Creates the slot of `ns` if absent and counts the admission in it. Call it before the catalog
+    /// read whose answer the admission publishes.
+    ColdAdmission beginColdAdmission(const RootNamespace & ns);
+
+    /// Disarms `admission` and, when it counts in the current epoch, takes it out of its slot. Caller
+    /// holds `ref_queue_mutex`.
+    void releaseColdAdmissionLocked(ColdAdmission & admission);
+
+    /// Erases the slot at `it` unless it has a runtime or an admission in flight. Caller holds
+    /// `ref_queue_mutex`.
+    void eraseNameSlotIfUnusedLocked(std::map<String, RefNameSlot>::iterator it);
+
+    /// Throws retry-later when `rt` (already recovered) has applied its namespace's terminal removal.
+    void refuseTerminalLife(const RootNamespace & ns, RefTableRuntime & rt);
 
     /// Lookup-first non-minting read acquisition. A cold name consults the catalog and materializes only
     /// an exact `Live` life; absence/`Creating`/`Removing` returns no runtime.
@@ -1234,8 +1338,10 @@ private:
     /// this is only the place that assembles the deadline from the ledger's own injectable boot clock
     /// and CAS budget; the algorithm itself is `publishCkpt`, shared verbatim with every other writer.
     ///
-    /// THREE call sites (corrected here from "two": `runRecoveryWalkOnce`'s own sealer contribution
-    /// below is a third and was missing from this count), and they contribute DISJOINT fields:
+    /// Six call sites. `life_epoch` comes only from the birth chunk and `checkpoint_snapshot_id` only from the
+    /// snapshot publisher; every frontier publisher contributes `committed_through`. `last_epoch_seal` comes
+    /// from the recovery walk, wedge resolution and the append chunk's commit contribution. The sites that
+    /// contribute the other fields:
     ///   - `commitRefChunk`'s namespace-birth transaction contributes `life_epoch` -- it is the only
     ///     writer that knows it (this transaction's own writer epoch), and spec §3 has the `_ckpt`
     ///     created before the namespace becomes Live. The contribution is no longer built at the call
@@ -1243,12 +1349,13 @@ private:
     ///     `commitRefChunk` passes that prepared value here. The split is deliberate -- DECIDING the
     ///     contribution is pure preparation, while THIS call is a birth chunk's first durable effect, so
     ///     the publish had to stay behind when preparation moved out;
-    ///   - `tryPublishSnapshotAndAdvanceCheckpointOnce` contributes `checkpoint_snapshot_id` once the
-    ///     snapshot body is durable, and contributes NOTHING about `life_epoch` (an absence, which the semantic-max
-    ///     merge leaves alone) because the publisher does not know it and must never guess;
+    ///   - `tryPublishSnapshotAndAdvanceCheckpointOnce` contributes `checkpoint_snapshot_id` (and the
+    ///     same id as `committed_through`) once the snapshot body is durable, and contributes NOTHING
+    ///     about `life_epoch` (an absence, which the semantic-max merge leaves alone) because the
+    ///     publisher does not know it and must never guess;
     ///   - `runRecoveryWalkOnce` contributes `last_epoch_seal` once its own CAS-walk minted or adopted
-    ///     one -- it is the only writer that mints seals, so it is the only writer that can record
-    ///     where the chain now ends.
+    ///     one. It is the only writer that mints or adopts a seal. Wedge resolution and the append
+    ///     chunk's commit contribution carry the chain link they already hold and never mint one.
     CkptPublishOutcome publishCkptContribution(CasOperation & op, const NamespaceLifeId & life,
                                                const RefCkpt & contribution);
 
@@ -1258,6 +1365,7 @@ private:
     /// time left, or a caller-supplied liveness term that has since gone false -- because none of them
     /// leaves the caller anything more specific to act on than "this admission no longer holds".
     void refuseUnlessAdmitted(const CasOperation & op, std::string_view what) const;
+    [[noreturn]] void throwNotAdmitted(std::string_view what) const;
 
     /// Common candidate predicate for scheduler admission and execution after capture. Caller holds
     /// `rt.state_mutex`; an epoch seal is not state-bearing and cannot be snapshotted.

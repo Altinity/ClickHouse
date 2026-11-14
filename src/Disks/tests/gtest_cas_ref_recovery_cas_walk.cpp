@@ -91,14 +91,14 @@ ManifestRef manifestRef(uint64_t epoch, uint64_t build_sequence, uint32_t ordina
 std::optional<CkptSample> readCkptForTest(const BackendPtr & backend, const Layout & layout,
                                           const NamespaceLifeId & life)
 {
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
     return readCkpt(op, layout, life);
 }
 
 CasRefCatalog::Snapshot readCatalogForTest(const BackendPtr & backend, const Layout & layout)
 {
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
     return CasRefCatalog::read(op, layout);
 }
@@ -107,7 +107,7 @@ CasRefCatalog::Snapshot readCatalogForTest(const BackendPtr & backend, const Lay
 bool replaceForTest(const BackendPtr & backend, const String & key, const String & bytes,
                     const Etag & expected)
 {
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
     return std::holds_alternative<Committed>(op.replace(key, bytes, expected, Retry::standard()));
 }
@@ -401,7 +401,7 @@ PoolPtr openWalkPool(const std::shared_ptr<BackendT> & backend, PoolConfig confi
 /// the seal chain must cross.
 void burnEpochsUpTo(const BackendPtr & backend, const Layout & layout, uint64_t target_live_epoch)
 {
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
     for (uint64_t e = 1; e < target_live_epoch; ++e)
         allocateWriterEpoch(op, layout, "test", [] { return RefCatalog{}; });
@@ -723,7 +723,7 @@ TEST(CASRefRecoveryCasWalk, ListingShapeDoesNotAffectCheckpointRecovery)
         /// A clone starts empty: constructing the normal fixture would pre-seed independent pool-meta
         /// bytes before this loop could copy the source's identical durable image.
         auto backend = std::make_shared<HidingListBackend>(/*seed_pool_meta=*/false);
-        CasRequests seed_requests(seed, Fence::open());
+        CasRequests seed_requests(seed, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
         CasOperation seed_op = seed_requests.admit();
         String cursor;
         do
