@@ -1,0 +1,12 @@
+one file, under the limit, local
+1	1
+0
+three files, over the limit, cluster
+3	6
+1
+limit 0 keeps the cluster read
+1	1
+1
+s3Cluster under the limit, local
+1	1
+0

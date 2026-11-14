@@ -45,6 +45,8 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         {
             {"iceberg_target_data_file_size_bytes", 536870912, 536870912, "Target file size for Iceberg bin-packing compaction (default 512 MiB)."},
             {"iceberg_min_data_file_size_bytes", 402653184, 402653184, "Files below this size are candidates for Iceberg bin-packing compaction (default 384 MiB)."},
+            {"object_storage_cluster_local_read_max_tasks", 0, 0, "New setting. Read an object-storage cluster query locally when planning can list at most this many tasks (files, or buckets when split granularity is bucket) before the probe budget ends."},
+            {"object_storage_cluster_local_read_probe_ms", 50, 50, "New setting. Time budget in milliseconds for `object_storage_cluster_local_read_max_tasks`."},
         });
         addSettingsChanges(settings_changes_history, "26.10",
         {

@@ -13,6 +13,7 @@
 #include <Processors/Formats/IInputFormat.h>
 #include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
+#include <mutex>
 
 namespace ProfileEvents
 {
@@ -211,6 +212,91 @@ String ObjectInfo::getIdentifierForPath(const String & path, bool include_file_b
     if (include_file_bucket_info && file_bucket_info)
         result += file_bucket_info->getIdentifier();
     return result;
+}
+
+namespace
+{
+
+class ObjectIteratorWithPrefetchedObjects : public IObjectIterator
+{
+public:
+    ObjectIteratorWithPrefetchedObjects(
+        ObjectInfos pulled_,
+        ObjectIterator remaining_,
+        std::optional<UInt64> snapshot_version_)
+        : pulled(std::move(pulled_))
+        , remaining(std::move(remaining_))
+        , snapshot_version(snapshot_version_)
+    {
+    }
+
+    ObjectInfoPtr next(size_t id) override
+    {
+        std::lock_guard lock(mutex);
+        if (index < pulled.size())
+            return pulled[index++];
+
+        if (!remaining)
+            return nullptr;
+
+        return remaining->next(id);
+    }
+
+    size_t estimatedKeysCount() override
+    {
+        if (remaining)
+            return remaining->estimatedKeysCount();
+        return pulled.size();
+    }
+
+    std::optional<UInt64> getSnapshotVersion() const override
+    {
+        if (remaining)
+        {
+            if (auto version = remaining->getSnapshotVersion())
+            {
+                return version;
+            }
+        }
+        return snapshot_version;
+    }
+
+private:
+    ObjectInfos pulled;
+    size_t index = 0;
+    ObjectIterator remaining;
+    std::optional<UInt64> snapshot_version;
+    std::mutex mutex;
+};
+
+}
+
+std::shared_ptr<ObjectStorageClusterReadProbe> findObjectStorageClusterReadProbe(
+    const std::unordered_map<const void *, std::shared_ptr<ObjectStorageClusterReadProbe>> & probes,
+    const void * storage)
+{
+    const auto it = probes.find(storage);
+    if (it == probes.end())
+        return {};
+    return it->second;
+}
+
+ObjectIterator takeObjectStorageClusterReadProbe(const std::shared_ptr<ObjectStorageClusterReadProbe> & probe)
+{
+    if (!probe || probe->consumed)
+        return nullptr;
+
+    probe->consumed = true;
+
+    ObjectInfos pulled = std::move(probe->pulled);
+    ObjectIterator remaining = std::move(probe->iterator);
+    const auto snapshot_version = probe->snapshot_version;
+    probe->pulled.clear();
+    probe->iterator.reset();
+    probe->snapshot_version.reset();
+
+    return std::make_shared<ObjectIteratorWithPrefetchedObjects>(
+        std::move(pulled), std::move(remaining), snapshot_version);
 }
 
 }
