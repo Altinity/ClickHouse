@@ -50,6 +50,10 @@ struct MergeTreeDataPartTTLInfos
 
     TTLInfoMap moves_ttl;
 
+    /// `TTL ... EXPORT TO TABLE`. A part becomes eligible for export once `max` has passed.
+    /// Like moves, it does not affect `part_min_ttl`.
+    TTLInfoMap export_ttl;
+
     TTLInfoMap recompression_ttl;
 
     TTLInfoMap group_by_ttl;
@@ -79,7 +83,8 @@ struct MergeTreeDataPartTTLInfos
     bool empty() const
     {
         /// part_min_ttl in minimum of rows, rows_where and group_by TTLs
-        return !part_min_ttl && moves_ttl.empty() && recompression_ttl.empty() && columns_ttl.empty() && rows_where_ttl.empty() && group_by_ttl.empty();
+        return !part_min_ttl && moves_ttl.empty() && export_ttl.empty() && recompression_ttl.empty() && columns_ttl.empty()
+            && rows_where_ttl.empty() && group_by_ttl.empty();
     }
 };
 

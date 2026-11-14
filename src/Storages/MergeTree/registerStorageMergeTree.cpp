@@ -81,6 +81,7 @@ namespace ServerSetting
 {
     extern const ServerSettingsString default_replica_name;
     extern const ServerSettingsString default_replica_path;
+    extern const ServerSettingsBool allow_experimental_export_merge_tree_partition;
 }
 
 namespace ErrorCodes
@@ -1068,6 +1069,20 @@ static StoragePtr create(const StorageFactory::Arguments & args)
     {
         merging_params.allow_tuple_element_aggregation = false;
     }
+
+    /// Without the setting the table has neither the export index nor the delete gate, so the TTL
+    /// could delete rows that are not exported yet.
+    if (metadata.hasAnyExportTTL()
+        && !args.getContext()->getServerSettings()[ServerSetting::allow_experimental_export_merge_tree_partition])
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+            "Table {} has a `TTL ... EXPORT TO TABLE` expression, which requires the server setting "
+            "`allow_experimental_export_merge_tree_partition`",
+            args.table_id.getNameForLogs());
+
+    /// Before the table is created, e.g. in Keeper.
+    if (args.mode <= LoadingStrictnessLevel::CREATE)
+        MergeTreeData::validateExportTTL(
+            args.table_id, metadata, std::make_shared<const MergeTreeSettings>(*storage_settings), args.getLocalContext());
 
     if (replicated)
     {
