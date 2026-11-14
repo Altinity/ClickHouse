@@ -93,8 +93,13 @@ MountClaimResult racedDoubleStart(const Observation & seen)
 
 uint64_t defaultBootMs()
 {
+#if defined(OS_DARWIN)
+    constexpr clockid_t clock_id = CLOCK_MONOTONIC;
+#else
+    constexpr clockid_t clock_id = CLOCK_BOOTTIME;
+#endif
     struct timespec ts{};
-    clock_gettime(CLOCK_BOOTTIME, &ts);
+    clock_gettime(clock_id, &ts);
     return static_cast<uint64_t>(ts.tv_sec) * 1000 + static_cast<uint64_t>(ts.tv_nsec) / 1000000;
 }
 
