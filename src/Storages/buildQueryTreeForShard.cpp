@@ -42,6 +42,7 @@
 #include <Processors/Transforms/SquashingTransform.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <QueryPipeline/SizeLimits.h>
+#include <Storages/IStorageCluster.h>
 #include <Storages/StorageDistributed.h>
 #include <Storages/StorageDummy.h>
 #include <Storages/StorageSnapshot.h>
@@ -68,7 +69,6 @@ namespace Setting
     extern const SettingsBool enable_alias_marker;
     extern const SettingsInt64 optimize_const_name_size;
     extern const SettingsOverflowMode transfer_overflow_mode;
-    extern const SettingsObjectStorageClusterJoinMode object_storage_cluster_join_mode;
 }
 
 namespace ErrorCodes
@@ -515,7 +515,7 @@ private:
         }
         else if ((distributed_product_mode == DistributedProductMode::GLOBAL ||
             getSettings()[Setting::prefer_global_in_and_join] ||
-            (find_cross_join && getSettings()[Setting::object_storage_cluster_join_mode] == ObjectStorageClusterJoinMode::GLOBAL)) &&
+            (find_cross_join && getEffectiveObjectStorageClusterJoinMode(getSettings()) == ObjectStorageClusterJoinMode::GLOBAL)) &&
             !in_function_or_join_stack.empty())
         {
             auto * in_or_join_node_to_modify = in_function_or_join_stack.back().query_node.get();

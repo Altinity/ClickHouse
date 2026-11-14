@@ -3,6 +3,7 @@
 #include <Storages/IStorage.h>
 #include <Interpreters/ActionsDAG.h>
 #include <QueryPipeline/RemoteQueryExecutor.h>
+#include <Processors/QueryPlan/ISourceStep.h>
 #include <Processors/QueryPlan/SourceStepWithFilter.h>
 
 namespace DB
@@ -10,6 +11,13 @@ namespace DB
 
 class Cluster;
 using ClusterPtr = std::shared_ptr<Cluster>;
+
+struct Settings;
+enum class ObjectStorageClusterJoinMode : uint8_t;
+
+/// The join mode of a query that is not dispatched whole: `distributed` resolves to
+/// `object_storage_cluster_join_mode_fallback`.
+ObjectStorageClusterJoinMode getEffectiveObjectStorageClusterJoinMode(const Settings & settings);
 
 
 /**
@@ -52,6 +60,22 @@ public:
         = 0;
 
     QueryProcessingStage::Enum getQueryProcessingStage(ContextPtr, QueryProcessingStage::Enum, const StorageSnapshotPtr &, SelectQueryInfo &) const override;
+
+    /// Dispatches a prepared query using this storage's cluster and file tasks.
+    /// `ReadFromClusterQuery` returns the query's result at `processed_stage` for the planner to finalize.
+    void readPreparedClusterQuery(
+        QueryPlan & query_plan,
+        const StorageSnapshotPtr & storage_snapshot,
+        SelectQueryInfo & query_info,
+        ContextPtr context,
+        QueryProcessingStage::Enum processed_stage,
+        ASTPtr query_to_send,
+        SharedHeader sample_block,
+        std::shared_ptr<const ActionsDAG> driver_filter);
+
+    /// Builds the worker's table function using the ordinary cluster-read rewrite.
+    /// `read_initiator_file_tasks` selects the `*Cluster` variant; the plain variant reads all files locally.
+    ASTPtr getTableFunctionToSend(const StorageSnapshotPtr & storage_snapshot, const ContextPtr & context, bool read_initiator_file_tasks);
 
     bool isRemote() const final { return true; }
     bool supportsSubcolumns() const override  { return true; }
@@ -236,6 +260,58 @@ private:
 
     void createExtension();
     ContextPtr updateSettings(const Settings & settings);
+};
+
+
+/// Dispatches one already-prepared query to a cluster, giving every node a share of one table's files.
+///
+/// The output describes the query result; `driver_storage` and `driver_snapshot` describe the file-task source.
+/// Keep this separate from `ReadFromCluster`, whose table filters and column mappings do not apply to this output.
+class ReadFromClusterQuery : public ISourceStep
+{
+public:
+    std::string getName() const override { return "ReadFromClusterQuery"; }
+    void initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &) override;
+    void describeActions(FormatSettings & format_settings) const override;
+
+    /// The context sent to workers.
+    ContextPtr createRemoteContext() const;
+
+    ReadFromClusterQuery(
+        SharedHeader output_header_,
+        std::shared_ptr<IStorageCluster> driver_storage_,
+        StorageSnapshotPtr driver_snapshot_,
+        ContextPtr context_,
+        ASTPtr query_to_send_,
+        QueryProcessingStage::Enum processed_stage_,
+        ClusterPtr cluster_,
+        LoggerPtr log_,
+        std::optional<Tables> external_tables_,
+        std::shared_ptr<const ActionsDAG> driver_filter_)
+        : ISourceStep(std::move(output_header_))
+        , driver_storage(std::move(driver_storage_))
+        , driver_snapshot(std::move(driver_snapshot_))
+        , context(std::move(context_))
+        , query_to_send(std::move(query_to_send_))
+        , processed_stage(processed_stage_)
+        , cluster(std::move(cluster_))
+        , log(log_)
+        , external_tables(std::move(external_tables_))
+        , driver_filter(std::move(driver_filter_))
+    {
+    }
+
+private:
+    std::shared_ptr<IStorageCluster> driver_storage;
+    StorageSnapshotPtr driver_snapshot;
+    ContextPtr context;
+    ASTPtr query_to_send;
+    QueryProcessingStage::Enum processed_stage;
+    ClusterPtr cluster;
+    LoggerPtr log;
+    std::optional<Tables> external_tables;
+    /// Predicate over the driver's own columns, used to prune its file listing. Null means list everything.
+    std::shared_ptr<const ActionsDAG> driver_filter;
 };
 
 }

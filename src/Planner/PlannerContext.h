@@ -7,6 +7,7 @@
 #include <Interpreters/PreparedSets.h>
 
 #include <Planner/TableExpressionData.h>
+#include <Planner/findDistributedObjectStorageCandidate.h>
 #include <Interpreters/SelectQueryOptions.h>
 
 namespace DB
@@ -41,11 +42,13 @@ public:
         const QueryNode * parallel_replicas_node_,
         const TableNode * parallel_replicas_table_,
         const UnionNode * parallel_replicas_table_union_,
-        FiltersForTableExpressionMap filters_for_table_expressions_)
+        FiltersForTableExpressionMap filters_for_table_expressions_,
+        std::optional<DistributedObjectStorageCandidate> distributed_object_storage_candidate_ = {})
         : parallel_replicas_node(parallel_replicas_node_)
         , parallel_replicas_table(parallel_replicas_table_)
         , parallel_replicas_table_union(parallel_replicas_table_union_)
         , filters_for_table_expressions(std::move(filters_for_table_expressions_))
+        , distributed_object_storage_candidate(std::move(distributed_object_storage_candidate_))
     {
     }
 
@@ -86,6 +89,9 @@ public:
     const UnionNode * const parallel_replicas_table_union = nullptr;
 
     const FiltersForTableExpressionMap filters_for_table_expressions;
+
+    /// The query dispatched whole by `object_storage_cluster_join_mode='distributed'`, if any.
+    const std::optional<DistributedObjectStorageCandidate> distributed_object_storage_candidate;
 
     /// Generate a unique integer id, used to disambiguate temporary table expressions
     size_t nextUniqueId() { return next_unique_id++; }

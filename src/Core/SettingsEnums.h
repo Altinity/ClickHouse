@@ -173,7 +173,8 @@ enum class ObjectStorageClusterJoinMode : uint8_t
 {
     LOCAL,       /// Legacy alias of ALLOW: initiator-local join
     GLOBAL,      /// Convert to global query
-    ALLOW        /// Initiator-local join when the right table is not on remote nodes
+    ALLOW,       /// Initiator-local join when the right table is not on remote nodes
+    DISTRIBUTED  /// Let a distributed object-storage driver own the whole JOIN and run it on cluster workers
 };
 
 DECLARE_SETTING_ENUM(ObjectStorageClusterJoinMode)
