@@ -315,6 +315,9 @@ namespace ExportPartitionUtils
             context_copy->setSetting("iceberg_partition_timezone", *manifest.iceberg_partition_timezone);
         }
 
+        if (manifest.min_bytes_to_use_direct_io)
+            context_copy->setSetting("min_bytes_to_use_direct_io", *manifest.min_bytes_to_use_direct_io);
+
         return context_copy;
     }
 
