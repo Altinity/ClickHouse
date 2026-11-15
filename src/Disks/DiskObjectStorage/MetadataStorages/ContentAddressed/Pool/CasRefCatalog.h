@@ -287,13 +287,12 @@ public:
     /// note below) -- `op.admitted()` is consulted FIRST, on every fresh read this retry loop performs;
     /// a refusal is reported as `FencedOut`, nothing else. ONLY THEN is the fresh entry for `observed.ns` compared
     /// against `observed` by FULL VALUE equality (`CatalogEntry::operator==`) -- the value-CAS that
-    /// plays the role `publishCkpt`'s object token plays for `_ckpt`, since one catalog object holds
+    /// stands in for an object token, since one catalog object holds
     /// every namespace's entry and there is no separate per-entry token to CAS against. A mismatch
     /// (stolen by a concurrent reconciler, or already carried to `Live`/`Removing`) is `Superseded`,
     /// caught before any CAS is attempted -- not a retry against fresh state, because retrying here
     /// would mean re-deciding against an entry that is no longer `observed`, which is precisely what
-    /// token-exactness forbids. Ordering the fence check before the entry check is deliberate (mirrors
-    /// `publishCkpt`); a caller that manages to make BOTH stale sees `FencedOut`, not `Superseded` --
+    /// token-exactness forbids. Ordering the fence check before the entry check is deliberate; a caller that manages to make BOTH stale sees `FencedOut`, not `Superseded` --
     /// both are truthful refusals of a CAS that was never sent.
     static NamespaceCreationOutcome completeCreation(
         CasOperation & op, const Layout & layout, const CatalogEntry & observed,

@@ -730,7 +730,7 @@ public:
     /// (unreachable for a mounted table, listed so the enumeration does not read closed). See the FAULT
     /// CLASS note on the definition for what changed about WHO catches them.
     ///
-    /// `life` (Stage B, Task 4-C) is `RefTableRuntime::life` -- the caller's already-resolved catalog
+    /// `life` is `RefTableRuntime::life` -- the caller's already-resolved catalog
     /// life, read under the SAME critical section as `id`/`admitted_generation` (a caller with no
     /// resolved life yet has no business preparing a chunk at all: a runtime is constructed for the life
     /// its admission resolved).
@@ -1148,7 +1148,7 @@ private:
     /// The caller must not hold `rt.state_mutex`.
     bool confirmRecoveredLifeOrDetach(RefTableRuntime & rt, uint64_t admitted_generation);
 
-    /// Stage B (spec INV-3, §3): resolves `ns`'s catalog life -- once per cold mutable admission in
+    /// Resolves `ns`'s catalog life -- once per cold mutable admission in
     /// `namespaceLife`, before the runtime exists, never from a per-write path (a per-write
     /// catalog GET is a protocol-step addition and is vetoed). Three cases, closing over the catalog's
     /// own three-state grammar:

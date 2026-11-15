@@ -215,7 +215,7 @@ TEST(CASRefSnapshotPublishOrdering, AdoptionHappensLastAndOnlyAfterBothDurableEf
     const String snapshot_key = store->layout().refSnapshotKey(life, RefTxnId{store->writerEpoch(), 1});
     const String ckpt_key = store->layout().refCkptKey(life);
 
-    /// Refuse the `_ckpt` CAS for as long as `publishCkpt` keeps reissuing, so it ends at its own retry
+    /// Refuse the `_ckpt` CAS for as long as `publishCkptSnapshot` keeps reissuing, so it ends at its own retry
     /// window: the body create still commits, but the checkpoint never advances within this call.
     backend->armWriteConflict(ckpt_key, kFaultsBeyondTheRetryWindow);
     EXPECT_FALSE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns))

@@ -405,4 +405,19 @@ TEST(CASInspect, UndecodableCheckpointCostsOnlyTheStrayLabel)
     const String printed = diagnostics.str();
     EXPECT_NE(printed.find(layout.refCkptKey(life)), String::npos) << printed;
     EXPECT_EQ(std::count(printed.begin(), printed.end(), '\n'), 1) << printed;
+    EXPECT_EQ(std::count(printed.begin(), printed.end(), '\n'), 1) << printed;
+
+    /// A required (`!`-prefixed) key this build does not know raises `UNKNOWN_FORMAT_VERSION`, not `CORRUPTED_DATA`.
+    const NamespaceLifeId critical_life = DB::Cas::tests::fixture::fixtureLife(RootNamespace{"srv1/db/critical"});
+    String with_critical = encodeRefCkptAtGeneration(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .committed_through = RefTxnId{1, 1},
+                                                             .checkpoint_snapshot_id = RefTxnId{1, 1}, .last_epoch_seal = std::nullopt}, 1);
+    with_critical.replace(with_critical.rfind('}'), 1, R"(,"!zz":"1"})");
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(critical_life), with_critical, Retry::standard())));
+    std::ostringstream critical_diagnostics;
+    std::optional<RefTxnId> critical_base;
+    EXPECT_NO_THROW(critical_base = readInspectBaseSnapshotId(op, layout, critical_life, critical_diagnostics));
+    EXPECT_EQ(critical_base, std::nullopt);
+    const String critical_printed = critical_diagnostics.str();
+    EXPECT_NE(critical_printed.find(layout.refCkptKey(critical_life)), String::npos) << critical_printed;
+    EXPECT_EQ(std::count(critical_printed.begin(), critical_printed.end(), '\n'), 1) << critical_printed;
 }

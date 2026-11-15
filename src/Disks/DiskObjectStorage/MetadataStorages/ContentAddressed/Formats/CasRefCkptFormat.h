@@ -24,8 +24,7 @@ namespace DB::Cas
 ///     the base was deleted under a live checkpoint, which is corruption.
 ///
 /// `_ckpt` is created at generation 3 by namespace creation or raised to it by the generation 3 stamp,
-/// and a generation 3 body is replaced only by snapshot publication (`Pool/CasRefCkpt.h`). `mergeCkpt`
-/// and `publishCkpt` are the legacy merge path of generation 1 and 2 bodies; no production code calls them.
+/// and a generation 3 body is replaced only by snapshot publication (`Pool/CasRefCkpt.h`).
 ///
 /// INVARIANT (Constraint 15), and it constrains what may ever be ADDED here, not merely what is here
 /// today: `_ckpt` is a fixed-size product of SCALAR MONOTONE FACTS. Its encoded size is `O(1)` in refs,
@@ -73,8 +72,7 @@ struct RefCkpt
 /// Encode `ckpt` as the canonical `cas_ref_ckpt` text object: a versioned header line followed by one
 /// JSON body object. STRICT IN BOTH DIRECTIONS -- the same `checkRefCkptInvariants` that guards decode
 /// runs here first, so a struct this build would refuse to read can never be written by it either
-/// (`CORRUPTED_DATA`). Encoding is canonical and deterministic, which is what lets `publishCkpt`
-/// compare a merged result against what it read.
+/// (`CORRUPTED_DATA`). Encoding is canonical and deterministic.
 ///
 /// These bytes go to and come from the backend DIRECTLY: this pair bypasses `sealObject`/`openObject`,
 /// which are the identity under this class's `CompressionPolicy::Never` and would add nothing. A

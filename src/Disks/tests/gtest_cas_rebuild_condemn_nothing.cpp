@@ -152,9 +152,8 @@ String publishAtReturningManifestKey(
                                                          .manifest_ordinal = 1}});
 }
 
-/// Publish the exact `_ckpt` that makes a raw fixture recoverable. The real writers go through
-/// `publishCkpt`, which merges by semantic maximum and additionally refuses a `life_epoch` below the
-/// durable one; this helper instead makes the fixture's one admissible recovery frontier explicit.
+/// Publish the exact `_ckpt` that makes a raw fixture recoverable. The real writers are `createCkptAtCreation`
+/// and `publishCkptSnapshot`; this helper instead makes the fixture's one admissible recovery frontier explicit.
 void writeCkptRaw(Backend & backend, const Layout & layout, const RootNamespace & ns, const RefCkpt & ckpt)
 {
     writeRecoverableCkptForRawFixture(backend, layout, ns, ckpt);

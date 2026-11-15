@@ -703,8 +703,8 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
         1, static_cast<uint64_t>(store->config.mount_renew_period.count()) / 2);
     /// routes through `mount_runtime.waitSleep` (which itself routes through
     /// `config.wait_sleep_fn` when a test injected one) rather than a bare `sleep_for` directly, so
-    /// a test intercepting `wait_sleep_fn` observes every wait `open` can block on -- and since the
-    /// post-reclaim materialization grace was retired, this observation poll is the only one left.
+    /// a test intercepting `wait_sleep_fn` observes every wait `open` can block on. This observation poll is
+    /// the only one.
     const auto sleep_ms = [s = store.get()](uint64_t ms) { s->mount_runtime.waitSleep(ms); };
     /// Operator-visible log the moment startup decides to watch a stale-looking self-mount (the
     /// disk-open path blocks up to ~threshold_ms here, so a silent block would be confusing). May
@@ -896,15 +896,12 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     /// enumerator with no proof of clean death must fail the BUILD (a missing `-Wswitch` case), never
     /// silently fall through to "clean".
     ///
-    /// THIS NO LONGER WAITS. The `materialization_grace_ms` (`T_mat`) sleep that used to sit here bought
-    /// one thing: time for that straggler to land (or exhaust its retries) BEFORE this incarnation began
-    /// trusting its recovery LISTINGS. Recovery does not trust listings any more. It walks each ref
-    /// stream from `_ckpt` and closes a chain that ends in an epoch that may have ended uncleanly
-    /// (`last_unclean_epoch`) with a tombstone in the slot after its last record, written as a conditional
-    /// create -- so the straggler's own conditional create loses to an occupied slot no matter when it
-    /// arrives. After a clean end nothing is in flight. A wait can only make startup slower, never safer.
-    /// What survives is the CLASSIFICATION and saying it out loud: an unclean predecessor is worth an
-    /// operator-visible line, and the exhaustive switch is worth keeping as the build-time guard.
+    /// There is no wait here. Recovery does not trust listings: it walks each ref stream from `_ckpt` and
+    /// closes a chain that ends in an epoch that may have ended uncleanly (`last_unclean_epoch`) with a
+    /// tombstone in the slot after its last record, written as a conditional create. A straggler's own
+    /// conditional create then loses to the occupied slot whenever it arrives, and after a clean end
+    /// nothing is in flight. What this classification keeps is an operator-visible line for an unclean
+    /// predecessor, and the exhaustive switch as the build-time guard.
     bool unclean_reclaim = false;
     switch (claimed_prior)
     {
@@ -961,8 +958,7 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
         /// write -- it fails closed (Phase A classification) if anything took the slot meanwhile -- and
         /// arm from the new attempt's anchor (rev.4 Phase B, round-3 finding 2).
         ///
-        /// The unbounded operator-configured wait this guard was written for (`T_mat`) is gone, so
-        /// reaching it now means the claim's adoption write outran the safe lease window
+        /// Reaching this means the claim's adoption write outran the safe lease window
         /// TTL, which `validateCasRequestBudget` already refuses to configure. It stays because a stalled
         /// socket can still outlive a budget, and its recovery is one conditional write that fails closed;
         /// it is LOUD rather than fatal because a slow open under a healthy protocol is not a reason to
@@ -1608,21 +1604,15 @@ bool Pool::tryRemountOnce()
             OwnerExpectation{.server_uuid = our_uuid, .owner_life = recorded_owner_life, .retired = RetiredOwnerPolicy::Refuse},
             writer_epoch, emit_mount_event);
 
-        /// NO WAIT HERE, AND THE ASSERT IS WHAT REPLACES IT. This used to pay `materialization_grace_ms`
-        /// whenever this incarnation's own ref lanes had not provably settled before the fence tripped:
-        /// an unresolved (still-wedged) ref-log conditional `PUT` from the dying epoch could otherwise
-        /// land after recovery began trusting its listings. Recovery no longer trusts listings — it walks
-        /// the chain and closes it with a tombstone in the slot after its last record when the chain ends in
+        /// No wait here: a wedged ref-log conditional `PUT` from the dying epoch loses its create to the
+        /// tombstone that recovery writes in the slot after the chain's last record, when the chain ends in
         /// an epoch at or below `last_unclean_epoch`. This remount claims over its own fenced body, so that
-        /// marker is the dying epoch, and the wedged `PUT` loses its own conditional create to that tombstone.
-        /// The wait bought nothing but latency on every fence recovery.
+        /// marker is the dying epoch.
         ///
-        /// That replacement has ONE precondition, and it is this one: the incarnation we are about to
-        /// install must outrank the dying one. If the epoch did not strictly advance, the straggler's
-        /// chain does not end below the live epoch, recovery writes no tombstone, and the hole the wait used to paper over
-        /// reopens silently. `allocateWriterEpoch` mints from a durable monotone counter, so this holds by
-        /// construction — which is exactly why it is worth asserting rather than assuming: it fails the
-        /// build's own tests the moment someone reuses an epoch across a remount.
+        /// The one precondition is that the incarnation we are about to install outranks the dying one. If
+        /// the epoch did not strictly advance, the straggler's chain does not end below the live epoch and
+        /// recovery writes no tombstone. `allocateWriterEpoch` mints from a durable monotone counter, so
+        /// this holds by construction; the assert makes a reused epoch across a remount fail the tests.
         chassert(writer_epoch > mount_runtime.liveWriterEpoch());
 
         /// The persistent renewal worker is parked before this callback is entered, so renewer

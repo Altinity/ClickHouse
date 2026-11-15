@@ -30,15 +30,7 @@ RecoveryGrounding chooseRecoveryGrounding(const std::optional<CatalogEntry> & ca
 /// The writers of one namespace's `_ckpt` object and what a reader consults when the base it sampled
 /// turns out to be gone. The object itself and its codec live in `Formats/CasRefCkptFormat.h`.
 
-/// The legacy semantic-maximum merge of generation 1 and 2 bodies, used only by `publishCkpt`. Per
-/// field: the greater `life_epoch`, the greater present `checkpoint_snapshot_id`, the greater present
-/// `last_epoch_seal`; an absent optional loses to a present one, and two absents stay absent. A
-/// cross-epoch `committed_through` pair must be numerically adjacent and carry its seal evidence.
-/// It does not hold the `life_epoch` decrease refusal or the frontier refusals: a commutative function
-/// cannot tell which argument is durable, so those live in `publishCkpt`.
-RefCkpt mergeCkpt(const RefCkpt & a, const RefCkpt & b);
-
-/// What one `_ckpt` publication did: `publishCkpt`, `createCkptAtCreation` or `publishCkptSnapshot`.
+/// What one `_ckpt` publication did: `createCkptAtCreation` or `publishCkptSnapshot`.
 enum class CkptPublishOutcome : uint8_t
 {
     Published,      /// the contribution is durable, and this call sent at least one write before it
@@ -47,13 +39,6 @@ enum class CkptPublishOutcome : uint8_t
     FencedOut,      /// this actor's admission is gone. Whether its last attempt landed is UNRESOLVED:
                     /// admission can be lost before the write is sent, and equally after the write is
                     /// proven durable. Re-read before assuming either way
-    SuccessorSeal,  /// CONCLUSIVE rejection of a non-seal frontier: a successor sealed this epoch at that
-                    /// id, so the record is not history even if its object exists. No further write
-                    /// follows the refusal. The late record stays below the checkpoint: no reader visits
-                    /// it, and ref cleanup deletes it
-    Superseded,     /// UNRESOLVED: a later epoch moved past this non-seal frontier, and `_ckpt` cannot tell
-                    /// whether the successor adopted it. No write follows the verdict, but an earlier
-                    /// attempt of this call may have landed. Handle like `FencedOut`
     NotAdvanced,    /// nothing was written and the caller's fact is not in `_ckpt`
 };
 
@@ -62,41 +47,6 @@ inline bool ckptContributionRecorded(CkptPublishOutcome outcome)
 {
     return outcome == CkptPublishOutcome::Published || outcome == CkptPublishOutcome::IdenticalSkip;
 }
-
-/// The legacy publisher of generation 1 and 2 bodies; no production code calls it, and it refuses a
-/// generation 3 body with `CORRUPTED_DATA`. It merges `contribution` into `life`'s `_ckpt` and makes the
-/// result durable, as ONE read-modify-write on `op`; an ABSENT object is created from `contribution`.
-///
-/// The `life_epoch` and identical-body verdicts consult `op.admitted()` before they speak, because a writer
-/// the fence is about to refuse has landed nothing AT THAT POINT: it is told `FencedOut` rather than `IdenticalSkip`
-/// or a corruption verdict. `FencedOut` is returned rather than thrown because it is an expected,
-/// transient control signal. It does NOT promise the object is unchanged -- a lost
-/// admission is also reported for a write already proven durable.
-///
-/// A NON-seal frontier contribution (`committed_through` present and not equal to its own
-/// `last_epoch_seal`) is checked against the durable body before the merge, independently of admission,
-/// because the merge accepts a lower-epoch frontier by numeric comparison alone. Only such a
-/// contribution can get these outcomes; one without `committed_through` never does:
-///   - its `committed_through` equals the durable `last_epoch_seal` -> `SuccessorSeal`;
-///   - its epoch is below the durable frontier's, and the durable seal is not in its epoch strictly
-///     above it -> `Superseded`. An id below the seal of its own epoch was adopted by the successor's
-///     walk and still merges.
-///
-/// FAILS CLOSED, never open:
-///   - an existing `_ckpt` that does not decode PROPAGATES `CORRUPTED_DATA` and is never overwritten.
-///     It is the only record of recovery's base and of what cleanup may delete; replacing it with a
-///     body derived from `contribution` alone would erase the base while leaving a well-formed object
-///     behind -- corruption laundered into something a reader would trust.
-///   - a contribution whose `life_epoch` is BELOW the durable one raises `CORRUPTED_DATA`, decided
-///     before the merge, so no body is built and no write is sent. This rule and the frontier verdicts
-///     HAVE to live here rather than in `mergeCkpt`: only this function knows which side is durable.
-///   - a contribution `mergeCkpt` rejects (a frontier that skips an epoch, a broken seal invariant) raises
-///     `CORRUPTED_DATA` for an admitted writer, decided before any write. A writer that already lost
-///     admission gets `FencedOut` instead.
-///   - exhausting the policy under persistent conflict throws the retry-later class. No partial state
-///     exists to clean up: every attempt either committed the complete merged body or changed nothing.
-CkptPublishOutcome publishCkpt(CasOperation & op, const Layout & layout, const NamespaceLifeId & life,
-                               const RefCkpt & contribution, const Retry & policy = Retry::standard());
 
 /// One observation of a namespace's `_ckpt`: the decoded body and the incarnation it was read at. The
 /// incarnation is what the missing-base revalidation adjudicates against, so a reader that keeps only

@@ -76,7 +76,6 @@ namespace ProfileEvents
     extern const Event CASRefCheckpointPublished;
     extern const Event CASRefCheckpointIdenticalSkip;
     extern const Event CASRefCheckpointNotAdvanced;
-    extern const Event CASRefCheckpointFrontierRefused;
     extern const Event CASRefRecoveryEpochSealed;
     extern const Event CASRefRecoveryEpochSealAdopted;
     extern const Event CASRefRecoveryStragglerAdopted;
@@ -134,7 +133,7 @@ enum class Occupant : uint8_t
 {
     NotOccupied,     /// the create won, or the outcome is unresolved -- nothing was read
     Ours,            /// byte-for-byte the transaction this attempt intended: an earlier attempt landed
-    SuccessorSeal,   /// a tombstone (`EpochSeal`) of this namespace, written by a successor
+    Tombstone,       /// a tombstone (`EpochSeal`) of this namespace, written by a successor
     Foreign,         /// none of the above -- impossible under mount-lease exclusivity
 };
 
@@ -171,7 +170,7 @@ RefLogTxn makeEpochTombstoneTxn(const RootNamespace & ns, const RefTxnId & id, u
 struct ClassifiedOccupant
 {
     Occupant kind;
-    /// Engaged iff `kind` is `SuccessorSeal`: the epoch the tombstone names.
+    /// Engaged iff `kind` is `Tombstone`: the epoch the tombstone names.
     std::optional<RefEpochTransition> transition;
     /// False iff this build could not decode the occupant (`CORRUPTED_DATA` or `UNKNOWN_FORMAT_VERSION`).
     bool decoded = true;
@@ -187,7 +186,7 @@ ClassifiedOccupant classifyRefLogOccupant(const RootNamespace & ns, const RefTxn
         const RefLogTxn occupant = decodeRefLogTxn(openObject(FormatId::RefLog, occupant_bytes), ns.string(), id);
         std::optional<RefEpochTransition> transition = refEpochTransitionOf(occupant);
         if (transition)
-            return {Occupant::SuccessorSeal, transition, true};
+            return {Occupant::Tombstone, transition, true};
         return {Occupant::Foreign, std::nullopt, true};
     }
     catch (const Exception & e)
@@ -1664,7 +1663,7 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
 
     if (life_removed)
         return RefRecoveryOutcome::LifeRemoved;
-    /// A NEW table was just materialized; enforce the whole-table cache budget, protecting this one
+    /// A NEW table was just materialized; enforce the whole-table cache budget, protecting this one.
     /// The pass runs OUTSIDE `rt.state_mutex` (that scope closed above) so
     /// the pass -- which acquires `ref_queue_mutex` and try-locks other tables' `state_mutex` -- never
     /// nests this table's `state_mutex` under `ref_queue_mutex`.
@@ -2464,7 +2463,7 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
 
     /// A successor's tombstone at our key is conclusive evidence that OUR transaction did not land. For a
     /// wedged tombstone only one naming a later epoch than ours is: this writer is then deposed.
-    const bool closed_by_successor_seal = occupant.kind == Occupant::SuccessorSeal
+    const bool closed_by_successor_seal = occupant.kind == Occupant::Tombstone
         && (!wedged_transition || occupant.transition->next_epoch > wedged_transition->next_epoch);
     /// An occupant that does not decode is no record recovery could adopt; it takes the `Foreign` arm.
     const bool tombstone_slot_taken = wedged_transition && occupant_object && occupant.decoded
@@ -3003,7 +3002,7 @@ bool CasRefLedger::ensureEpochOpenForAppend(const RootNamespace & ns, const std:
                 detail::renderObservation(conflict->seen)));
             return false;
         }
-        if (occupant->kind == Occupant::SuccessorSeal && occupant->transition->next_epoch > live_epoch)
+        if (occupant->kind == Occupant::Tombstone && occupant->transition->next_epoch > live_epoch)
         {
             {
                 std::lock_guard lock(rt->state_mutex);
@@ -4163,7 +4162,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                 ns.string(), id.writer_epoch, id.ref_sequence, detail::renderObservation(conflict->seen))));
             return false;
         }
-        if (occupant == Occupant::SuccessorSeal)
+        if (occupant == Occupant::Tombstone)
         {
             reject_append_at_successor_seal();
             return false;

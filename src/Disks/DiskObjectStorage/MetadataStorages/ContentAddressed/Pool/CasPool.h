@@ -274,14 +274,11 @@ struct PoolConfig
     /// routes through this function when set instead of a real `std::this_thread::sleep_for`, so a test
     /// observes every wait without actually blocking. Empty (the production default) sleeps for real.
     ///
-    /// That poll is now the ONLY wait either path can block on. The post-reclaim materialization grace
-    /// (`T_mat`) that used to sit beside it is gone: it existed so a straggler conditional `PUT` from a
-    /// dying epoch would land (or exhaust its retries) before the successor started trusting its recovery
-    /// LISTINGS, and recovery does not trust listings any more -- it walks the chain and, when it ends in
-    /// an epoch that may have ended uncleanly (`last_unclean_epoch`), closes it with a tombstone in the slot
-    /// after its last record, written as a conditional create. The straggler's own conditional create then
-    /// LOSES against that occupied slot, whenever it arrives; after a clean end nothing is in flight. Waiting
-    /// for a race that the protocol already decides is not caution, it is latency.
+    /// That poll is the only wait either path can block on. Recovery does not trust listings: it walks the
+    /// chain and, when it ends in an epoch that may have ended uncleanly (`last_unclean_epoch`), closes it
+    /// with a tombstone in the slot after its last record, written as a conditional create. A straggler's
+    /// own conditional create loses against that occupied slot whenever it arrives; after a clean end
+    /// nothing is in flight.
     std::function<void(uint64_t)> wait_sleep_fn = {};   /// test hook for open/remount waits
     RuntimeWorkerFactory worker_factory = {};           /// internal test seam; never parsed from disk config
     std::function<void()> remount_quiesce_hook_for_test = {};

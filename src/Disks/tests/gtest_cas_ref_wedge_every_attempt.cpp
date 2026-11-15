@@ -61,7 +61,6 @@ extern const Event CASRefAppendSealRejected;
 extern const Event CASRefAppendOccupantUnreadable;
 extern const Event CASRefAppendWedged;
 extern const Event CASRefAppendDefiniteFailure;
-extern const Event CASRefCheckpointFrontierRefused;
 extern const Event CASRefRecoveryRestarts;
 }
 
