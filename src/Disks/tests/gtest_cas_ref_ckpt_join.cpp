@@ -221,7 +221,7 @@ String encodedCkptOfNamespaceWithRefs(const PoolPtr & store, CasOperation & op, 
         ADD_FAILURE() << "expected a _ckpt for namespace '" << ns.string() << "' after its birth transaction";
         return {};
     }
-    return encodeRefCkpt(sample->ckpt);
+    return encodeRefCkptAtGeneration(sample->ckpt, 1);
 }
 
 }
@@ -683,7 +683,7 @@ TEST(CASRefCheckpointJoin, EncodedCkptSizeHasAConstantCeilingAcrossTransactionsA
                         .committed_through = RefTxnId{U64_MAX, U64_MAX},
                         .checkpoint_snapshot_id = RefTxnId{U64_MAX, U64_MAX},
                         .last_epoch_seal = RefTxnId{U64_MAX, U64_MAX}};
-    const size_t worst_bytes = encodeRefCkpt(worst).size();
+    const size_t worst_bytes = encodeRefCkptAtGeneration(worst, 1).size();
 
     /// Pinned as a literal, not merely compared against itself: this is the number Constraint 15's
     /// `O(1)` claim reduces to, and a change to it means a field was added, removed or rewidened.
@@ -695,9 +695,9 @@ TEST(CASRefCheckpointJoin, EncodedCkptSizeHasAConstantCeilingAcrossTransactionsA
     /// to the number of transactions: four orders of magnitude of `ref_sequence` cost four bytes.
     const RefCkpt at_sequence_1{.life_epoch = 1, .committed_through = RefTxnId{1, 1}, .checkpoint_snapshot_id = RefTxnId{1, 1}, .last_epoch_seal = RefTxnId{1, 1}};
     const RefCkpt at_sequence_10k{.life_epoch = 1, .committed_through = RefTxnId{1, 10000}, .checkpoint_snapshot_id = RefTxnId{1, 10000}, .last_epoch_seal = RefTxnId{1, 10000}};
-    EXPECT_EQ(encodeRefCkpt(at_sequence_10k).size(), encodeRefCkpt(at_sequence_1).size() + 12);
-    EXPECT_LE(encodeRefCkpt(at_sequence_10k).size(), worst_bytes);
-    EXPECT_LE(encodeRefCkpt(at_sequence_1).size(), worst_bytes);
+    EXPECT_EQ(encodeRefCkptAtGeneration(at_sequence_10k, 1).size(), encodeRefCkptAtGeneration(at_sequence_1, 1).size() + 12);
+    EXPECT_LE(encodeRefCkptAtGeneration(at_sequence_10k, 1).size(), worst_bytes);
+    EXPECT_LE(encodeRefCkptAtGeneration(at_sequence_1, 1).size(), worst_bytes);
 
     /// And the ceiling is far below the format registry's own object cap, so the cap is what it is
     /// documented to be -- a corruption brake this object cannot approach -- and never the thing that

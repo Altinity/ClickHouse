@@ -361,12 +361,12 @@ CompletedRemovingFixture seedCompletedRemoving(
         .ns = fixture.ns, .state = NsState::Live, .incarnation = fixture.life_id});
     fixture.checkpoint_key = layout.refCkptKey(
         NamespaceLifeId::fromCatalogEntry(fixture.ns, fixture.life_id));
-    fixture.checkpoint_bytes = encodeRefCkpt(RefCkpt{
+    fixture.checkpoint_bytes = encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = std::nullopt,
         .checkpoint_snapshot_id = std::nullopt,
         .last_epoch_seal = std::nullopt,
-    });
+    }, 1);
     op.create(fixture.checkpoint_key, fixture.checkpoint_bytes, Retry::once());
     EXPECT_TRUE(store->namespaceFilesLifeIfReadable(fixture.ns));
     CasRefCatalog::casUpdate(op, layout, [](const RefCatalog & current)
@@ -1757,12 +1757,12 @@ TEST(CASGCFrontierGate, CheckpointFrontierBehindAnInheritedCursorFailsClosed)
     const String checkpoint_key = layout.refCkptKey(life);
     const auto checkpoint_head = op.head(checkpoint_key, Retry::once());
     ASSERT_TRUE(checkpoint_head.has_value());
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(checkpoint_key, encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(checkpoint_key, encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{1, 1},
         .checkpoint_snapshot_id = std::nullopt,
         .last_epoch_seal = std::nullopt,
-    }), checkpoint_head->etag, Retry::once())));
+    }, 1), checkpoint_head->etag, Retry::once())));
 
     std::map<String, UInt64> intake;
     gc.setPhaseSink([&](const GcPhaseRecord & rec)
@@ -1811,12 +1811,12 @@ TEST(CASGCFrontierGate, CheckpointFrontierCrossesAnInheritedEpochSeal)
     const String checkpoint_key = layout.refCkptKey(life);
     const auto checkpoint_head = op.head(checkpoint_key, Retry::once());
     ASSERT_TRUE(checkpoint_head.has_value());
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(checkpoint_key, encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(checkpoint_key, encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{2, 1},
         .checkpoint_snapshot_id = std::nullopt,
         .last_epoch_seal = RefTxnId{1, 2},
-    }), checkpoint_head->etag, Retry::once())));
+    }, 1), checkpoint_head->etag, Retry::once())));
 
     std::map<String, UInt64> intake;
     gc.setPhaseSink([&](const GcPhaseRecord & rec)
@@ -1901,12 +1901,12 @@ TEST(CASGCFrontierGate, AWronglyQuietNamespaceIsWalkedTheSameRound)
     const String checkpoint_key = layout.refCkptKey(life);
     const auto checkpoint_head = op.head(checkpoint_key, Retry::once());
     ASSERT_TRUE(checkpoint_head.has_value());
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(checkpoint_key, encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(checkpoint_key, encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{1, 2},
         .checkpoint_snapshot_id = std::nullopt,
         .last_epoch_seal = std::nullopt,
-    }), checkpoint_head->etag, Retry::once())));
+    }, 1), checkpoint_head->etag, Retry::once())));
     backend->hidePrefix(layout.namespaceStreamPrefix(fixture::fixtureLife(quiet)));
 
     runRegularRoundReclaiming(gc);
@@ -2217,12 +2217,12 @@ TEST(CASGCFrontierGate, EmptyCheckpointFrontierRejectsAnInheritedCursor)
     const String checkpoint_key = layout.refCkptKey(life);
     const auto checkpoint_head = op.head(checkpoint_key, Retry::once());
     ASSERT_TRUE(checkpoint_head.has_value());
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(checkpoint_key, encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(checkpoint_key, encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = std::nullopt,
         .checkpoint_snapshot_id = std::nullopt,
         .last_epoch_seal = std::nullopt,
-    }), checkpoint_head->etag, Retry::once())));
+    }, 1), checkpoint_head->etag, Retry::once())));
 
     std::map<String, UInt64> intake;
     gc.setPhaseSink([&](const GcPhaseRecord & rec)
@@ -2781,12 +2781,12 @@ TEST(CASGCFrontierGate, CleanupEvidenceLeavesRemovedNamespaceCheckpointForJanito
         return next;
     });
     const String ckpt_key = layout.refCkptKey(life);
-    op.create(ckpt_key, encodeRefCkpt(RefCkpt{
+    op.create(ckpt_key, encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{1, 2},
         .checkpoint_snapshot_id = std::nullopt,
         .last_epoch_seal = std::nullopt,
-    }), Retry::once());
+    }, 1), Retry::once());
 
     /// The removal evidence must arise from a replay-valid terminal lifecycle, rather than merely
     /// from a raw terminal record that the recovery state machine refuses.
@@ -2874,12 +2874,12 @@ TEST(CASGCFrontierGate, PostFoldUnreadableDeadCheckpointIsCountedWithoutSuppress
         it->removal_started_round = 1;
         return next;
     });
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(removed_life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(removed_life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{1, 2},
         .checkpoint_snapshot_id = std::nullopt,
         .last_epoch_seal = std::nullopt,
-    }), Retry::once())));
+    }, 1), Retry::once())));
 
     const DB::UInt128 blob(0xfeed);
     const ManifestRef manifest = publish(*backend, layout, progressing, "victim", 1, blob);
@@ -3665,12 +3665,12 @@ TEST_P(CASGCCompletedRemovalFenceRace, FencedLeaderStopsAfterWinnerRemovesOrRepl
         /// Mirror production's publish-then-flip order: the successor life needs a readable `_ckpt`
         /// before its catalog row can read `Live`, or `chooseRecoveryGrounding` rejects it.
         const NamespaceLifeId successor_life = NamespaceLifeId::fromCatalogEntry(fixture.ns, UInt128{178});
-        op.create(layout.refCkptKey(successor_life), encodeRefCkpt(RefCkpt{
+        op.create(layout.refCkptKey(successor_life), encodeRefCkptAtGeneration(RefCkpt{
             .life_epoch = 1,
             .committed_through = std::nullopt,
             .checkpoint_snapshot_id = std::nullopt,
             .last_epoch_seal = std::nullopt,
-        }), Retry::once());
+        }, 1), Retry::once());
     }
     ASSERT_TRUE(observed.etag);
     ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(

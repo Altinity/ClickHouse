@@ -1021,10 +1021,10 @@ TEST(CASRefWriterRuntimeIdentity, ColdReadRejectsCatalogLifeReplacedWithoutLocal
         = replaceCatalogLifeForRuntimeRace(backend, layout, predecessor, UInt128{0xabc002});
     const NamespaceLifeId successor_life
         = NamespaceLifeId::fromCatalogEntry(successor.ns, successor.incarnation);
-    ASSERT_TRUE(createRaw(backend, layout.refCkptKey(successor_life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(createRaw(backend, layout.refCkptKey(successor_life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = store->liveWriterEpoch(),
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt})));
+        .last_epoch_seal = std::nullopt}, 1)));
     {
         std::lock_guard lock(mutex);
         resume = true;
@@ -1062,10 +1062,10 @@ TEST(CASRefWriterRuntimeIdentity, ColdReadRejectsReplacementByExternalPoolActor)
         OperationForTest successor_op(*external_store->poolBackendPtr());
         if (!std::holds_alternative<Committed>((*successor_op).create(
                 external_store->layout().refCkptKey(successor_life),
-                encodeRefCkpt(RefCkpt{
+                encodeRefCkptAtGeneration(RefCkpt{
                     .life_epoch = external_store->liveWriterEpoch(),
                     .checkpoint_snapshot_id = std::nullopt,
-                    .last_epoch_seal = std::nullopt}), Retry::standard())))
+                    .last_epoch_seal = std::nullopt}, 1), Retry::standard())))
             throw std::runtime_error("test failed to publish external successor checkpoint");
     });
 
@@ -1209,11 +1209,11 @@ TEST(CASRefWriterRecovery, BirthOnlyLogNoSnapshotRecoversToEmptyLiveTable)
 
     DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 1}, {namespaceBirthOp()}, std::nullopt});
     const NamespaceLifeId life = *lifeIfCatalogedForTest(backend, layout, ns);
-    ASSERT_TRUE(createRaw(backend, layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(createRaw(backend, layout.refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{1, 1},
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt})));
+        .last_epoch_seal = std::nullopt}, 1)));
 
     auto store = openPool(backend);
     EXPECT_TRUE(store->listRefs(ns).empty());
@@ -1233,11 +1233,11 @@ TEST(CASRefWriterRecovery, BirthPlusPrecommitPromoteAcrossTwoLogsNoSnapshot)
     DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 2},
         {publishCommittedOps("part_1", m1)[1]}, std::nullopt});
     const NamespaceLifeId life = *lifeIfCatalogedForTest(backend, layout, ns);
-    ASSERT_TRUE(createRaw(backend, layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(createRaw(backend, layout.refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{1, 2},
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt})));
+        .last_epoch_seal = std::nullopt}, 1)));
 
     auto store = openPool(backend);
     const auto resolved = store->resolveRef(ns, "part_1");
@@ -1315,11 +1315,11 @@ TEST(CASRefWriterRecovery, SnapshotPlusTailRecovery)
     tail_ops.push_back(publishCommittedOps("b", mb)[1]);
     DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 6}, tail_ops, std::nullopt});
     const NamespaceLifeId life = *lifeIfCatalogedForTest(backend, layout, ns);
-    ASSERT_TRUE(createRaw(backend, layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(createRaw(backend, layout.refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{1, 6},
         .checkpoint_snapshot_id = RefTxnId{1, 5},
-        .last_epoch_seal = std::nullopt})));
+        .last_epoch_seal = std::nullopt}, 1)));
 
     backend->resetCounts();
     auto store = openPool(backend);
@@ -1358,11 +1358,11 @@ TEST(CASRefWriterRecovery, RestartOnVanishConvergesOnNewerSnapshot)
         .ops = publishCommittedOps("a", ma),
         .prev_epoch_seal = std::nullopt});
     writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), snap_x, {committedRow("a", ma)}));
-    ASSERT_TRUE(createRaw(backend, layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(createRaw(backend, layout.refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{1, 10},
         .checkpoint_snapshot_id = snap_x,
-        .last_epoch_seal = std::nullopt})));
+        .last_epoch_seal = std::nullopt}, 1)));
     backend->vanish_once_keys.insert(layout.refSnapshotKey(life, snap_x));
     bool vanish_fired = false;
     backend->on_vanish_fire = [&]
@@ -1379,11 +1379,11 @@ TEST(CASRefWriterRecovery, RestartOnVanishConvergesOnNewerSnapshot)
         ASSERT_TRUE(before);
         CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
         CasOperation op = requests.admit();
-        ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+        ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(layout.refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
             .life_epoch = 1,
             .committed_through = RefTxnId{1, 20},
             .checkpoint_snapshot_id = snap_y,
-            .last_epoch_seal = std::nullopt}), before->etag, Retry::standard())));
+            .last_epoch_seal = std::nullopt}, 1), before->etag, Retry::standard())));
     };
 
     backend->resetCounts();
@@ -1428,11 +1428,11 @@ TEST(CASRefWriterRecovery, DifferentBytesAtSelectedSnapshotIsCorruptionNotRestar
     const String snapshot_key = layout.refSnapshotKey(life, snap_x);
     ASSERT_TRUE(createRaw(backend, snapshot_key,
         DB::Cas::sealObject(DB::Cas::FormatId::RefSnapshot, DB::Cas::encodeRefTableSnapshot(foreign))));
-    ASSERT_TRUE(createRaw(backend, layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(createRaw(backend, layout.refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = snap_x,
         .checkpoint_snapshot_id = snap_x,
-        .last_epoch_seal = std::nullopt})));
+        .last_epoch_seal = std::nullopt}, 1)));
 
     auto store = openPool(backend);
     backend->resetCounts();
@@ -3262,11 +3262,11 @@ TEST(CASRefWriterSnapshotPublish, RecoveredSealAboveThresholdDoesNotRedispatchUn
         auto predecessor = openPoolWithConfig(backend, predecessor_config);
         DB::Cas::tests::fixture::admitLive(*backend, predecessor->layout(), ns);
         const NamespaceLifeId life = *lifeIfCatalogedForTest(backend, predecessor->layout(), ns);
-        ASSERT_TRUE(createRaw(backend, predecessor->layout().refCkptKey(life), encodeRefCkpt(RefCkpt{
+        ASSERT_TRUE(createRaw(backend, predecessor->layout().refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
             .life_epoch = predecessor->liveWriterEpoch(),
             .committed_through = std::nullopt,
             .checkpoint_snapshot_id = std::nullopt,
-            .last_epoch_seal = std::nullopt})));
+            .last_epoch_seal = std::nullopt}, 1)));
         publishEmptyPart(predecessor, ns, "before_seal");
         const auto before = readOf(backend, predecessor->layout().refCkptKey(life));
         ASSERT_TRUE(before);
@@ -3282,7 +3282,7 @@ TEST(CASRefWriterSnapshotPublish, RecoveredSealAboveThresholdDoesNotRedispatchUn
         CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
         CasOperation op = requests.admit();
         ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(
-            predecessor->layout().refCkptKey(life), encodeRefCkpt(recovered_seal), before->etag, Retry::standard())));
+            predecessor->layout().refCkptKey(life), encodeRefCkptAtGeneration(recovered_seal, 1), before->etag, Retry::standard())));
     }
 
     PoolConfig successor_config;
@@ -5989,10 +5989,10 @@ TEST(CASRefWriterNamespaceRemoval, OtherWinnerReplacementInvalidatesExactPredece
         .creator = std::nullopt};
     ASSERT_NE(replacement.incarnation, ready.predecessor.incarnation);
     const NamespaceLifeId replacement_life = NamespaceLifeId::fromCatalogEntry(ns, replacement.incarnation);
-    ASSERT_TRUE(createRaw(backend, layout.refCkptKey(replacement_life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(createRaw(backend, layout.refCkptKey(replacement_life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = ready.writer_epoch,
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt})));
+        .last_epoch_seal = std::nullopt}, 1)));
     backend->catalog_fault_key = layout.refCatalogKey();
     backend->catalog_replacement_bytes = encodeRefCatalog(RefCatalog{.entries = {replacement}});
     backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::OtherWriterReplacement;

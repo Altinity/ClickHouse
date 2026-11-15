@@ -261,7 +261,7 @@ TEST(CASInspect, RendersRefCkptWithEveryFieldPresent)
                        .last_epoch_seal = RefTxnId{6, 4}};
 
     const String json = caInspectToJson(
-        layout, layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns)), encodeRefCkpt(ckpt),
+        layout, layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns)), encodeRefCkptAtGeneration(ckpt, 1),
         DB::Cas::tests::fixture::fixtureLife(ns));
     EXPECT_NE(json.find(R"("object":"ref_ckpt")"), String::npos) << json;
     /// The namespace comes from the KEY: a `_ckpt` body does not name it.
@@ -281,7 +281,7 @@ TEST(CASInspect, RendersRefCkptAbsencesAsExplicitNulls)
     const RootNamespace ns{"srv1/db/fresh"};
 
     const String json = caInspectToJson(
-        layout, layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns)), encodeRefCkpt(RefCkpt{}),
+        layout, layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns)), encodeRefCkptAtGeneration(RefCkpt{}, 1),
         DB::Cas::tests::fixture::fixtureLife(ns));
     EXPECT_NE(json.find(R"("object":"ref_ckpt")"), String::npos) << json;
     EXPECT_NE(json.find(R"("life_epoch":null)"), String::npos) << json;

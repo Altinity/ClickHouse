@@ -195,11 +195,11 @@ void writeFsckCheckpoint(Backend & backend, const Layout & layout, const RootNam
     ASSERT_NE(it, cut.catalog.entries.end());
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(it->ns, it->incarnation);
     const String key = layout.refCkptKey(life);
-    const String body = encodeRefCkpt(RefCkpt{
+    const String body = encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = committed_through.writer_epoch,
         .committed_through = committed_through,
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt});
+        .last_epoch_seal = std::nullopt}, 1);
     const auto current = op.head(key, Retry::once());
     const WriteResult put = current
         ? op.replace(key, body, current->etag, Retry::once())
@@ -215,11 +215,11 @@ void writeFsckCheckpointWithBase(
     CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
     CasOperation op = requests.admit();
     const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(op, layout, ns);
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = committed_through.value_or(base),
         .checkpoint_snapshot_id = base,
-        .last_epoch_seal = last_epoch_seal}), Retry::once())));
+        .last_epoch_seal = last_epoch_seal}, 1), Retry::once())));
 }
 
 void expectCheckpointBaseVerdict(
@@ -856,11 +856,11 @@ TEST(CASFsckAuthority, MissingBurnedEpochSealIsChainBroken)
     ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refLogKey(life, RefTxnId{7, 1}),
         sealObject(FormatId::RefLog, skipped_bytes), Retry::once())));
 
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{7, 1},
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = RefTxnId{6, 1}}), Retry::once())));
+        .last_epoch_seal = RefTxnId{6, 1}}, 1), Retry::once())));
 
     const FsckReport report = runFsck(*store, /*detail=*/true);
     EXPECT_EQ(report.chain_broken, 1u);
@@ -952,11 +952,11 @@ TEST(CASFsckAuthority, CheckpointSnapshotAtOlderEpochSealIsChainBroken)
     CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
     CasOperation op = requests.admit();
     const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(op, layout, ns);
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{2, 1},
         .checkpoint_snapshot_id = RefTxnId{1, 2},
-        .last_epoch_seal = RefTxnId{2, 1}}), Retry::once())));
+        .last_epoch_seal = RefTxnId{2, 1}}, 1), Retry::once())));
 
     const FsckReport report = runFsck(*store, /*detail=*/true);
     EXPECT_EQ(report.ref_records_walked, 0u)
@@ -1022,11 +1022,11 @@ TEST(CASFsckAuthority, CheckpointBaseVanishingAfterAuthorityAdvanceIsUnchecked)
         OperationForTest nested_op(*backend);
         const auto head = (*nested_op).head(ckpt_key, Retry::once());
         ASSERT_TRUE(head.has_value());
-        ASSERT_TRUE(std::holds_alternative<Committed>((*nested_op).replace(ckpt_key, encodeRefCkpt(RefCkpt{
+        ASSERT_TRUE(std::holds_alternative<Committed>((*nested_op).replace(ckpt_key, encodeRefCkptAtGeneration(RefCkpt{
             .life_epoch = 1,
             .committed_through = std::nullopt,
             .checkpoint_snapshot_id = std::nullopt,
-            .last_epoch_seal = std::nullopt}), head->etag, Retry::once())));
+            .last_epoch_seal = std::nullopt}, 1), head->etag, Retry::once())));
     });
 
     const FsckReport report = runFsck(*store, /*detail=*/true);
@@ -1095,11 +1095,11 @@ TEST(CASFsckAuthority, CoveredTailLogVanishingAfterAuthorityAdvanceIsUnchecked)
         const String ckpt_key = layout.refCkptKey(life);
         const auto ckpt_head = (*nested_op).head(ckpt_key, Retry::once());
         ASSERT_TRUE(ckpt_head.has_value());
-        ASSERT_TRUE(std::holds_alternative<Committed>((*nested_op).replace(ckpt_key, encodeRefCkpt(RefCkpt{
+        ASSERT_TRUE(std::holds_alternative<Committed>((*nested_op).replace(ckpt_key, encodeRefCkptAtGeneration(RefCkpt{
             .life_epoch = 1,
             .committed_through = RefTxnId{1, 4},
             .checkpoint_snapshot_id = RefTxnId{1, 1},
-            .last_epoch_seal = std::nullopt}), ckpt_head->etag, Retry::once())));
+            .last_epoch_seal = std::nullopt}, 1), ckpt_head->etag, Retry::once())));
         const auto log_head = (*nested_op).head(tail_key, Retry::once());
         ASSERT_TRUE(log_head.has_value());
         ASSERT_EQ((*nested_op).remove(tail_key, log_head->etag, Retry::once()), Removal::Removed);

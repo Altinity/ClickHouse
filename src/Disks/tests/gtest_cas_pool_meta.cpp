@@ -13,6 +13,7 @@ namespace ErrorCodes
 {
     extern const int INVALID_STATE;
     extern const int NETWORK_ERROR;
+    extern const int UNKNOWN_FORMAT_VERSION;
 }
 }
 
@@ -114,4 +115,24 @@ TEST(CASPoolMeta, PoolMetaVanishingMidAdmissionIsInvalidStateNotLogicalError)
             BlobHashAlgo::XXH3_128, /*allow_new=*/true, /*allow_mint=*/false);
     });
     EXPECT_TRUE(removed);
+}
+
+/// A build that cannot read generation 3 must refuse a pool whose floor is 3 at open.
+TEST(CASPoolMeta, FloorThreeIsRefusedBelowTheChainCeiling)
+{
+    PoolMeta pm;
+    pm.pool_id = hexToU128("00112233445566778899aabbccddeeff");
+    pm.blob_header_len = 256;
+    pm.min_reader_generation = G_REF_CHAIN;
+    pm.algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128)};
+    const String bytes = encodePoolMeta(pm);
+
+    {
+        DB::Cas::tests::ScopedReadCeiling c(2);
+        expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { decodePoolMeta(bytes); });
+    }
+    {
+        DB::Cas::tests::ScopedReadCeiling c(3);
+        EXPECT_EQ(decodePoolMeta(bytes).min_reader_generation, 3u);
+    }
 }

@@ -291,11 +291,11 @@ TEST(CASGCRebuild, FrozenCheckpointFrontierExcludesVisibleUnfrontieredTail)
         RefLogTxn{.ns = ns.string(), .txn_id = RefTxnId{1, 2}, .ops = publishCommittedOps("unfrontiered", unfrontiered),
                   .prev_epoch_seal = std::nullopt});
     ASSERT_TRUE(headObj(*backend, layout.refLogKey(life, RefTxnId{1, 2})).has_value());
-    createObj(*backend, layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    createObj(*backend, layout.refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{1, 1},
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt}));
+        .last_epoch_seal = std::nullopt}, 1));
 
     Gc gc(store, kGc);
     const RebuildReport report = gc.rebuildBaseline(/*force=*/false);
@@ -373,11 +373,11 @@ TEST(CASGCRebuild, CheckpointSnapshotAtOlderEpochSealFailsClosed)
     applyRefLogTxn(through_seal, seal_txn);
     writeRefSnapshotRaw(*backend, layout, snapshotOf(through_seal, ns.string()));
 
-    createObj(*backend, layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    createObj(*backend, layout.refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{2, 1},
         .checkpoint_snapshot_id = RefTxnId{1, 2},
-        .last_epoch_seal = RefTxnId{2, 1}}));
+        .last_epoch_seal = RefTxnId{2, 1}}, 1));
 
     Gc gc(store, kGc);
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)gc.rebuildBaseline(/*force=*/false); });
@@ -406,11 +406,11 @@ TEST(CASGCRebuild, DamagedGenerationZeroStatePerformsNoCatalogDrainMutation)
         next.entries[0].removal_started_round = 1;
         return next;
     });
-    createObj(*backend, layout.refCkptKey(NamespaceLifeId::fromCatalogEntry(ns, life_id)), encodeRefCkpt(RefCkpt{
+    createObj(*backend, layout.refCkptKey(NamespaceLifeId::fromCatalogEntry(ns, life_id)), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = std::nullopt,
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt}));
+        .last_epoch_seal = std::nullopt}, 1));
     const uint64_t catalog_cas_before = backend->putOverwriteCount(layout.refCatalogKey());
     const uint64_t plans_before
         = ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt];

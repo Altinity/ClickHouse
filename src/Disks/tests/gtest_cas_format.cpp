@@ -83,6 +83,15 @@ TEST(CASFormat, ReadCeilingIsAboveTheWriteFloor)
     EXPECT_EQ(G_WRITE_FLOOR, 1u);
 }
 
+/// Pin: replaced when the first generation 3 write is advertised.
+TEST(CASFormat, ChainGenerationIsNotAdvertisedYet)
+{
+    EXPECT_EQ(G_REF_CHAIN, 3u);
+    EXPECT_EQ(G_BUILD, 2u);
+    EXPECT_EQ(currentReadCeiling(), 2u);
+    EXPECT_EQ(changePoints(FormatId::RefLog).back().generation, 2u);
+}
+
 TEST(CASFormat, CheckCompatibilityPassesWhenKnown)
 {
     EXPECT_NO_THROW(checkCompatibility(1u, "manifest"));

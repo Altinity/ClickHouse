@@ -60,11 +60,11 @@ void seedEmptyRecoveryAuthority(InMemoryBackend & backend, const Layout & layout
         [&](const CatalogEntry & candidate) { return candidate.ns == ns; });
     ASSERT_NE(entry, catalog.catalog.entries.end());
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry->ns, entry->incarnation);
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = std::optional<uint64_t>{kWriterEpoch},
         .committed_through = std::nullopt,
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt}), Retry::standard())));
+        .last_epoch_seal = std::nullopt}, 1), Retry::standard())));
 }
 
 /// Replaces the catalog row immediately before its second read after arming. The legacy orphan path
@@ -280,11 +280,11 @@ TEST(CASOrphanManifestSweep, CheckpointSnapshotAtOlderEpochSealSkipsDeletion)
     applyRefLogTxn(through_seal, birth);
     applyRefLogTxn(through_seal, seal_txn);
     writeRefSnapshotRaw(*backend, layout, snapshotOf(through_seal, ns.string()));
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{2, 1},
         .checkpoint_snapshot_id = RefTxnId{1, 2},
-        .last_epoch_seal = RefTxnId{2, 1}}), Retry::standard())));
+        .last_epoch_seal = RefTxnId{2, 1}}, 1), Retry::standard())));
 
     const ManifestRef candidate = ref(5, 0xAC);
     const String candidate_key = layout.manifestKey(ManifestId{ns, candidate});
@@ -792,11 +792,11 @@ TEST(CASOrphanManifestSweep, EpochSealFoldCursorCrossesTailByExactDecodedSuccess
         RefTxnId{6, 1});
     writeSealAt(*backend, store->layout(), ns, RefTxnId{7, 2});
     writeManifestRaw(*backend, store->layout(), ns, unowned, {blobEntryFor("unowned", DB::UInt128(0xA2))});
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(store->layout().refCkptKey(life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(store->layout().refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{7, 2},
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = RefTxnId{7, 2}}), Retry::standard())));
+        .last_epoch_seal = RefTxnId{7, 2}}, 1), Retry::standard())));
     setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 7);
     seedFoldCursorForTest(*backend, store->layout(), ns, RefTxnId{2, 2});
 
@@ -849,11 +849,11 @@ TEST(CASOrphanManifestSweep, MissingImmediateEpochAfterCleanedCursorCannotBeSkip
         .snapshot_id = RefTxnId{7, 1},
         .committed = {committedRow("phantom", phantom)},
         .precommits = {}});
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(store->layout().refCkptKey(life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(store->layout().refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{7, 1},
         .checkpoint_snapshot_id = RefTxnId{7, 1},
-        .last_epoch_seal = RefTxnId{6, 1}}), Retry::standard())));
+        .last_epoch_seal = RefTxnId{6, 1}}, 1), Retry::standard())));
 
     const ManifestRef victim{.writer_epoch = 1, .build_sequence = 5, .manifest_ordinal = 1};
     writeManifestRaw(*backend, store->layout(), ns, victim, {blobEntryFor("victim", DB::UInt128(0xC1))});
@@ -895,11 +895,11 @@ TEST(CASOrphanManifestSweep, CleanedCursorCrossesOnlyThroughExactImmediateEpochH
         {ownerTransitionOp(RefOwnerBinding{RefOwnerKind::Committed, "absent-anchor", absent_anchor}, std::nullopt)});
     writeRefSnapshotRaw(*backend, store->layout(), RefTableSnapshot{
         .ns = ns.string(), .snapshot_id = RefTxnId{3, 2}, .committed = {}, .precommits = {}});
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(store->layout().refCkptKey(life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(store->layout().refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{3, 2},
         .checkpoint_snapshot_id = RefTxnId{3, 2},
-        .last_epoch_seal = cursor}), Retry::standard())));
+        .last_epoch_seal = cursor}, 1), Retry::standard())));
 
     const ManifestRef unowned{.writer_epoch = 1, .build_sequence = 6, .manifest_ordinal = 1};
     writeManifestRaw(*backend, store->layout(), ns, removed, {blobEntryFor("removed", DB::UInt128(0xC2))});

@@ -53,6 +53,19 @@ void checkRefCkptInvariants(const RefCkpt & ckpt, std::string_view what)
     check_id(ckpt.checkpoint_snapshot_id, "checkpoint_snapshot_id");
     check_id(ckpt.last_epoch_seal, "last_epoch_seal");
     check_id(ckpt.committed_through, "committed_through");
+
+    /// Generation 3 carries exactly two facts, the birth epoch and the snapshot; the frontier and the seal
+    /// live in the log chain.
+    if (ckpt.generation >= G_REF_CHAIN)
+    {
+        if (!ckpt.life_epoch)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: a generation {} body requires life_epoch", what, ckpt.generation);
+        if (ckpt.committed_through || ckpt.last_epoch_seal)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS {}: a generation {} body carries neither committed_through nor last_epoch_seal", what, ckpt.generation);
+        return;
+    }
+
     if (!ckpt.committed_through && (ckpt.checkpoint_snapshot_id || ckpt.last_epoch_seal))
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS {}: checkpoint_snapshot_id and last_epoch_seal require committed_through", what);
@@ -92,12 +105,26 @@ void checkRefCkptInvariants(const RefCkpt & ckpt, std::string_view what)
     }
 }
 
+uint32_t refCkptWriteGeneration()
+{
+    return currentCompatibilityVersion();
+}
+
 String encodeRefCkpt(const RefCkpt & ckpt)
 {
-    checkRefCkptInvariants(ckpt, "cas_ref_ckpt encode");
+    return encodeRefCkptAtGeneration(ckpt, refCkptWriteGeneration());
+}
+
+String encodeRefCkptAtGeneration(const RefCkpt & ckpt, uint32_t generation)
+{
+    if (generation < 1 || generation > G_REF_CHAIN)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_ref_ckpt encode: generation {} is outside 1 to {}", generation, G_REF_CHAIN);
+    RefCkpt at_generation = ckpt;
+    at_generation.generation = generation;
+    checkRefCkptInvariants(at_generation, "cas_ref_ckpt encode");
 
     CasJsonWriter out(256);
-    writeHeaderLine(out, FormatId::RefCkpt);
+    writeHeaderLine(out, FormatId::RefCkpt, generation);
     bool first = true;
     /// Every field is encoded WHEN SET and omitted otherwise, so "nobody knows the genesis epoch",
     /// "no checkpoint yet", and "no epoch has been closed yet" are absences on the wire rather than
@@ -129,7 +156,7 @@ String encodeRefCkpt(const RefCkpt & ckpt)
 RefCkpt decodeRefCkpt(std::string_view data)
 {
     ReadBufferFromMemory in(data.data(), data.size());
-    expectHeaderLine(in, FormatId::RefCkpt);
+    const uint32_t generation = expectHeaderLine(in, FormatId::RefCkpt).v;
     const String body = readLine(in, traitsFor(FormatId::RefCkpt).line_cap, "cas_ref_ckpt");
     ReadBufferFromMemory body_in(body.data(), body.size());
     /// A field that changes what cleanup may delete is written `!`-prefixed, so an old reader fails
@@ -137,6 +164,7 @@ RefCkpt decodeRefCkpt(std::string_view data)
     JsonObjectReader r(body_in, "cas_ref_ckpt");
 
     RefCkpt ckpt;
+    ckpt.generation = generation;
     std::optional<uint64_t> snapshot_epoch;
     std::optional<uint64_t> snapshot_seq;
     std::optional<uint64_t> seal_epoch;

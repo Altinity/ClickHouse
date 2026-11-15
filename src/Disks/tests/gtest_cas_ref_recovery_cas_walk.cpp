@@ -454,9 +454,9 @@ void seedTxn(Backend & backend, const Layout & layout, const RootNamespace & ns,
 /// Seeds the `_ckpt` a real namespace birth would have created, so recovery can ground its walk at the
 /// namespace's `life_epoch` without consulting the (untrusted) listing. Raw, because these fixtures
 /// never run a birth through the append lane.
-void seedCkpt(Backend & backend, const Layout & layout, const RootNamespace & ns, const RefCkpt & ckpt)
+void seedCkpt(Backend & backend, const Layout & layout, const RootNamespace & ns, const RefCkpt & ckpt, uint32_t generation = 1)
 {
-    createAt(backend, layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns)), encodeRefCkpt(ckpt));
+    createAt(backend, layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns)), encodeRefCkptAtGeneration(ckpt, generation));
 }
 
 RefCkpt lifeEpochCkpt(uint64_t life_epoch, std::optional<RefTxnId> committed_through = std::nullopt)
@@ -651,11 +651,11 @@ TEST(CASRefRecoveryCasWalk, MissingExactIdAtOrBelowCommittedFrontierIsCorruption
     DB::Cas::tests::fixture::admitLive(*backend, layout, ns);
     const NamespaceLifeId life = catalogLife(backend, layout, ns);
     seedTxn(*backend, layout, ns, RefTxnId{1, 1}, "a", /*birth=*/true);
-    createAt(*backend, layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    createAt(*backend, layout.refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = std::optional<uint64_t>{1},
         .committed_through = frontier,
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt}));
+        .last_epoch_seal = std::nullopt}, 1));
     const auto ckpt_before = readCkptForTest(backend, layout, life);
     ASSERT_TRUE(ckpt_before);
 
@@ -682,11 +682,11 @@ TEST(CASRefRecoveryCasWalk, UncommittedSnapshotIsUnobservedWithoutStreamList)
     writeRefSnapshotRaw(*backend, layout,
         minimalLiveSnapshot(ns.string(), uncommitted_snapshot_id,
             {committedRow("laundered", manifestRef(1, 2, 1))}));
-    createAt(*backend, layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    createAt(*backend, layout.refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = std::optional<uint64_t>{1},
         .committed_through = frontier,
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt}));
+        .last_epoch_seal = std::nullopt}, 1));
 
     auto store = openWalkPool(backend);
     backend->resetCounts();
@@ -873,7 +873,7 @@ TEST(CASRefRecoveryCasWalk, CheckpointAdvanceAfterLastLogProbeRestartsBeforeInst
         ASSERT_TRUE(sampled);
         RefCkpt advanced = sampled->ckpt;
         advanced.committed_through = concurrent_frontier;
-        ASSERT_TRUE(replaceForTest(backend, layout.refCkptKey(life), encodeRefCkpt(advanced), sampled->etag));
+        ASSERT_TRUE(replaceForTest(backend, layout.refCkptKey(life), encodeRefCkptAtGeneration(advanced, 1), sampled->etag));
     };
 
     auto store = openWalkPool(backend);
@@ -1352,7 +1352,7 @@ TEST(CASRefRecoveryCasWalk, RetiredLifePausedInRealRecoveryIoWritesAndInstallsNo
     const CatalogEntry successor = replaceCatalogLifeForTest(backend, layout, predecessor, UInt128{0x5152});
     const NamespaceLifeId successor_life
         = NamespaceLifeId::fromCatalogEntry(successor.ns, successor.incarnation);
-    createAt(*backend, layout.refCkptKey(successor_life), encodeRefCkpt(lifeEpochCkpt(2)));
+    createAt(*backend, layout.refCkptKey(successor_life), encodeRefCkptAtGeneration(lifeEpochCkpt(2), 1));
     const auto successor_ckpt_before = readAt(*backend, layout.refCkptKey(successor_life));
     ASSERT_TRUE(successor_ckpt_before);
     store->invalidateRemovedCatalogLife(predecessor_life);
@@ -1773,7 +1773,7 @@ TEST(CASRefRecoveryCasWalk, WriterRecoveryAdoptsFirstCommittedTxnAboveLifeEpochO
     /// readable checkpoint whose `committed_through` is absent.
     DB::Cas::tests::fixture::admitLive(*backend, layout, ns);
     const NamespaceLifeId life = catalogLife(backend, layout, ns);
-    createAt(*backend, layout.refCkptKey(life), encodeRefCkpt(lifeEpochCkpt(1)));
+    createAt(*backend, layout.refCkptKey(life), encodeRefCkptAtGeneration(lifeEpochCkpt(1), 1));
     ASSERT_TRUE(readCkptForTest(backend, layout, life)->ckpt.life_epoch);
     ASSERT_EQ(readCkptForTest(backend, layout, life)->ckpt.committed_through, std::nullopt);
 
@@ -1846,7 +1846,7 @@ TEST(CASRefRecoveryCasWalk, WriterRecoveryRestartsWhenCheckpointAdvancesPastPriv
                     .checkpoint_snapshot_id = std::nullopt,
                     .last_epoch_seal = std::nullopt});
         ASSERT_TRUE(std::holds_alternative<Committed>(
-            (*op).replace(key, encodeRefCkpt(advanced), current->etag, Retry::once())));
+            (*op).replace(key, encodeRefCkptAtGeneration(advanced, 1), current->etag, Retry::once())));
     };
 
     const auto refs = store->listRefs(ns);

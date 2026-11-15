@@ -28,6 +28,7 @@ namespace RefLogWire
     constexpr WireKey txn_seq{"txn_seq"};
     constexpr WireKey prev_epoch{"!prev_epoch"};
     constexpr WireKey prev_seq{"!prev_seq"};
+    constexpr WireKey next_epoch{"!next_epoch"};
     constexpr WireKey op{"op"};
     constexpr WireKey ref{"ref"};
     constexpr WireKey published_ms{"published_ms"};
@@ -126,14 +127,19 @@ struct BindingFields
 /// `!`-prefixed: `prev_epoch_seal` is INV-2 chain evidence, not cosmetic metadata -- a decoder that
 /// doesn't understand it must refuse the object rather than silently drop the chain link while
 /// otherwise passing the structural grammar (`JsonObjectReader::skipUnknown` rejects any unrecognized
-/// `!`-key with `UNKNOWN_FORMAT_VERSION`).
-void writeLogMeta(CasJsonWriter & out, const String & ns, const RefTxnId & txn_id, const std::optional<RefTxnId> & prev_epoch_seal)
+/// `!`-key with `UNKNOWN_FORMAT_VERSION`). `!next_epoch` follows the same rule: it is the tombstone's
+/// forward link.
+void writeLogMeta(
+    CasJsonWriter & out, const String & ns, const RefTxnId & txn_id, const std::optional<RefTxnId> & prev_epoch_seal,
+    const std::optional<uint64_t> & next_epoch)
 {
     bool first = true;
     writeStringField(out, RefLogWire::ns, ns, first);
     writeRefTxnIdFields(out, first, RefLogWire::txn_epoch, RefLogWire::txn_seq, txn_id);
     if (prev_epoch_seal)
         writeRefTxnIdFields(out, first, RefLogWire::prev_epoch, RefLogWire::prev_seq, *prev_epoch_seal);
+    if (next_epoch)
+        writeU64StringField(out, RefLogWire::next_epoch, *next_epoch, first);
     closeObject(out, first);
     writeChar('\n', out);
 }
@@ -227,7 +233,7 @@ bool refLogTxnIsEpochSeal(const RefLogTxn & txn)
     return txn.ops.size() == 1 && txn.ops.front().kind == RefOpKind::EpochSeal;
 }
 
-void validateEpochSealGrammarStructural(const RefLogTxn & txn)
+void validateEpochSealGrammarStructural(const RefLogTxn & txn, uint32_t header_generation)
 {
     const bool has_seal_op = std::any_of(txn.ops.begin(), txn.ops.end(),
         [](const RefOp & op) { return op.kind == RefOpKind::EpochSeal; });
@@ -236,6 +242,23 @@ void validateEpochSealGrammarStructural(const RefLogTxn & txn)
             "RefLogTxn: a transaction carrying an EpochSeal op must contain exactly that one op, got {} ops",
             txn.ops.size());
 
+    const bool chain = header_generation >= G_REF_CHAIN;
+
+    if (txn.next_epoch)
+    {
+        if (!chain)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "RefLogTxn: next_epoch needs header generation {}, got {}", G_REF_CHAIN, header_generation);
+        if (!has_seal_op)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: next_epoch is only allowed on an EpochSeal transaction");
+        if (*txn.next_epoch <= txn.txn_id.writer_epoch)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "RefLogTxn: next_epoch {} must exceed the transaction's writer_epoch {}",
+                *txn.next_epoch, txn.txn_id.writer_epoch);
+    }
+    else if (chain && has_seal_op)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: a header generation {} EpochSeal transaction must carry next_epoch", header_generation);
+
     if (txn.prev_epoch_seal)
     {
         checkRefTxnIdNonzero(*txn.prev_epoch_seal, "RefLogTxn", "prev_epoch_seal");
@@ -243,16 +266,14 @@ void validateEpochSealGrammarStructural(const RefLogTxn & txn)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "RefLogTxn: prev_epoch_seal is only allowed at sequence 1, got txn_id {}-{}",
                 txn.txn_id.writer_epoch, txn.txn_id.ref_sequence);
-        /// INV-2 materializes every global writer epoch for an existing life. A sequence-1 transaction
-        /// in E therefore chains to the closing seal of exactly E-1, not merely an arbitrary earlier
-        /// epoch. A skip would make a missing intermediate seal look like a proved boundary and let a
-        /// fold or destructive tail walk bypass it. This is a context-free property of one body, so
-        /// reject it in the codec before any walker can interpret the link as evidence.
         if (txn.prev_epoch_seal->writer_epoch >= txn.txn_id.writer_epoch)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "RefLogTxn: prev_epoch_seal writer_epoch {} must be strictly less than this "
                 "transaction's writer_epoch {}", txn.prev_epoch_seal->writer_epoch, txn.txn_id.writer_epoch);
-        if (txn.prev_epoch_seal->writer_epoch + 1 != txn.txn_id.writer_epoch)
+        /// Below generation 3 every epoch is materialized, so a sequence-1 transaction in E chains to the
+        /// closing seal of exactly E-1: a skip would make a missing intermediate seal look like a proved
+        /// boundary. From generation 3 the chain skips epochs that only read, so only the direction is checked.
+        if (!chain && txn.prev_epoch_seal->writer_epoch + 1 != txn.txn_id.writer_epoch)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "RefLogTxn: prev_epoch_seal writer_epoch {} must immediately precede this "
                 "transaction's writer_epoch {}", txn.prev_epoch_seal->writer_epoch, txn.txn_id.writer_epoch);
@@ -285,15 +306,32 @@ bool refLogTxnContainsMove(const RefLogTxn & txn)
     return false;
 }
 
+uint32_t refLogTxnHeaderGeneration(const RefLogTxn & txn)
+{
+    if (txn.next_epoch)
+        return G_REF_CHAIN;
+    return refLogTxnContainsMove(txn) ? G_REF_MOVE : currentCompatibilityVersion();
+}
+
 String encodeRefLogTxn(const RefLogTxn & txn)
 {
+    return encodeRefLogTxnAtGeneration(txn, refLogTxnHeaderGeneration(txn));
+}
+
+String encodeRefLogTxnAtGeneration(const RefLogTxn & txn, uint32_t header_generation)
+{
     checkRefTxnIdNonzero(txn.txn_id, "RefLogTxn", "txn_id");
-    validateEpochSealGrammarStructural(txn);
+    if (header_generation > G_REF_CHAIN)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: header generation {} is above {}", header_generation, G_REF_CHAIN);
+    if (header_generation < refLogTxnHeaderGeneration(txn))
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "RefLogTxn: content needs header generation {}, got {}", refLogTxnHeaderGeneration(txn), header_generation);
+    validateEpochSealGrammarStructural(txn, header_generation);
 
     CasJsonWriter out(512);
-    writeHeaderLine(out, FormatId::RefLog, refLogTxnContainsMove(txn) ? G_REF_MOVE : currentCompatibilityVersion());
+    writeHeaderLine(out, FormatId::RefLog, header_generation);
 
-    writeLogMeta(out, txn.ns, txn.txn_id, txn.prev_epoch_seal);
+    writeLogMeta(out, txn.ns, txn.txn_id, txn.prev_epoch_seal, txn.next_epoch);
 
     for (const RefOp & op : txn.ops)
         writeOp(out, op);
@@ -307,7 +345,7 @@ String encodeRefLogTxn(const RefLogTxn & txn)
 RefLogTxn decodeRefLogTxn(std::string_view data, const String & expected_ns, const RefTxnId & expected_txn_id)
 {
     ReadBufferFromMemory in(data.data(), data.size());
-    expectHeaderLine(in, FormatId::RefLog);
+    const uint32_t header_generation = expectHeaderLine(in, FormatId::RefLog).v;
     const uint64_t line_cap = traitsFor(FormatId::RefLog).line_cap;
 
     RefLogTxn txn;
@@ -322,6 +360,7 @@ RefLogTxn decodeRefLogTxn(std::string_view data, const String & expected_ns, con
         bool saw_txn_seq = false;
         std::optional<uint64_t> prev_epoch;
         std::optional<uint64_t> prev_seq;
+        std::optional<uint64_t> next_epoch;
         String key;
         while (r.nextKey(key))
         {
@@ -344,6 +383,8 @@ RefLogTxn decodeRefLogTxn(std::string_view data, const String & expected_ns, con
                 prev_epoch = r.readU64String();
             else if (key == RefLogWire::prev_seq)
                 prev_seq = r.readU64String();
+            else if (key == RefLogWire::next_epoch)
+                next_epoch = r.readU64String();
             else
                 r.skipUnknown(key);
         }
@@ -357,6 +398,7 @@ RefLogTxn decodeRefLogTxn(std::string_view data, const String & expected_ns, con
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: prev_epoch_seal needs both !prev_epoch and !prev_seq");
             txn.prev_epoch_seal = RefTxnId{*prev_epoch, *prev_seq};
         }
+        txn.next_epoch = next_epoch;
         if (!m.eof())
             throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: junk after meta line");
     }
@@ -409,7 +451,7 @@ RefLogTxn decodeRefLogTxn(std::string_view data, const String & expected_ns, con
     /// Finalization: `txn.ops` is now complete, so the context-free seal grammar (which needs the
     /// full op list) can run. Both directions of the codec enforce the identical rule -- see
     /// `encodeRefLogTxn`.
-    validateEpochSealGrammarStructural(txn);
+    validateEpochSealGrammarStructural(txn, header_generation);
     checkBudget(txn.ops, data.size());
     return txn;
 }
@@ -445,7 +487,7 @@ size_t removalFramingSize(const String & ns, const RefTxnId & txn_id, uint64_t o
     /// including the remove_namespace op (i.e. committed + precommits + 1).
     CasJsonWriter out(256);
     writeHeaderLine(out, FormatId::RefLog);
-    writeLogMeta(out, ns, txn_id, std::nullopt);
+    writeLogMeta(out, ns, txn_id, std::nullopt, std::nullopt);
     RefOp remove_op;
     remove_op.kind = RefOpKind::RemoveNamespace;
     writeOp(out, remove_op);

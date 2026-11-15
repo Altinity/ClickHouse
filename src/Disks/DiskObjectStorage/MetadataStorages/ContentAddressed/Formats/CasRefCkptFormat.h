@@ -89,6 +89,9 @@ struct RefCkpt
     /// a later mount locating the previous epoch's terminating record and by the GC fold crossing
     /// epochs. `nullopt` before this namespace has ever had an epoch closed.
     std::optional<RefTxnId> last_epoch_seal;
+    /// The header generation the body was decoded from; the encoders ignore it. Part of equality, so a
+    /// generation 1 body and a generation 3 body with equal fields differ.
+    uint32_t generation = 1;
 
     bool operator==(const RefCkpt &) const = default;
 };
@@ -106,6 +109,13 @@ struct RefCkpt
 /// fails. That assertion is the tripwire for this shortcut, not an incidental check of the key shape.
 String encodeRefCkpt(const RefCkpt & ckpt);
 
+/// The generation `encodeRefCkpt` writes.
+uint32_t refCkptWriteGeneration();
+
+/// Encodes under an explicit header generation (1 to 3, else CORRUPTED_DATA), checking the invariants of that
+/// generation first.
+String encodeRefCkptAtGeneration(const RefCkpt & ckpt, uint32_t generation);
+
 /// Decode a complete `cas_ref_ckpt` text object. A duplicate key, a truncated object (a missing body
 /// line, or half of an optional id pair), or trailing bytes raise `CORRUPTED_DATA` -- never a
 /// partially-populated struct. An unknown `!`-prefixed key raises `UNKNOWN_FORMAT_VERSION`; an unknown
@@ -118,7 +128,9 @@ RefCkpt decodeRefCkpt(std::string_view data);
 /// frontier is present, its writer epoch may not precede `life_epoch`, and a snapshot may not exceed
 /// it. Its `last_epoch_seal` is either that exact frontier or closes the immediately preceding numeric
 /// writer epoch; without a seal, a known `life_epoch` permits only that genesis epoch. `what`
-/// identifies the direction in the exception message. Exposed so a caller that assembles a `RefCkpt`
+/// identifies the direction in the exception message. The rules above are those of generations 1 and 2;
+/// `ckpt.generation` 3 instead requires `life_epoch` and forbids `committed_through` and `last_epoch_seal`,
+/// so a snapshot without a frontier is valid there. Exposed so a caller that assembles a `RefCkpt`
 /// from several sources can fail closed before it reaches the wire.
 void checkRefCkptInvariants(const RefCkpt & ckpt, std::string_view what);
 

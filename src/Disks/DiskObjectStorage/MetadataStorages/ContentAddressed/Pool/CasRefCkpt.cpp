@@ -162,6 +162,7 @@ RefCkpt mergeCkpt(const RefCkpt & a, const RefCkpt & b)
     merged.committed_through = mergeCommittedThrough(a, b);
     merged.checkpoint_snapshot_id = maxKnown(a.checkpoint_snapshot_id, b.checkpoint_snapshot_id);
     merged.last_epoch_seal = maxKnown(a.last_epoch_seal, b.last_epoch_seal);
+    merged.generation = std::max(a.generation, b.generation);
     /// Contributions may omit independent facts, but the resulting durable shape may not. In
     /// particular, if one writer supplies `life_epoch` and another supplies a later frontier, their
     /// merge must carry the chain evidence before `publishCkpt` can encode it.
@@ -253,6 +254,13 @@ CkptPublishOutcome publishCkpt(CasOperation & op, const Layout & layout, const N
         if (current)
             durable = decodeRefCkpt(current->bytes);
 
+        /// This publisher only knows the old body: merging into a generation 3 one would write the frontier
+        /// and the seal back into a body that must not carry them.
+        if (durable && durable->generation >= G_REF_CHAIN)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS `_ckpt` for namespace '{}': the durable body is generation {}, which this publisher cannot merge into",
+                life.ns.string(), durable->generation);
+
         /// The one rule the commutative merge cannot state, and it has to be decided HERE, before the
         /// merge: the semantic maximum turns a decrease into a body identical to the stored one, which
         /// the identical-skip below would return as a successful no-op. Detecting it after the merge
@@ -315,7 +323,7 @@ CkptPublishOutcome publishCkpt(CasOperation & op, const Layout & layout, const N
             decline = op.admitted() ? Decline::Identical : Decline::Fenced;
             return std::nullopt;
         }
-        return encodeRefCkpt(merged);
+        return encodeRefCkptAtGeneration(merged, 1);
     };
 
     WriteResult result = op.readModifyWrite(key, decide, policy);

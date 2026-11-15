@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
+#include <optional>
 #include <vector>
 
 /// v3 text codec tests for the `EpochSeal` record kind + strict seal grammar added to `cas_ref_log`
@@ -15,6 +16,8 @@
 
 using namespace DB::Cas;
 using DB::Cas::tests::expectThrowsCode;
+using DB::Cas::tests::ScopedReadCeiling;
+using DB::Cas::tests::tombstoneTxn;
 
 namespace
 {
@@ -490,4 +493,115 @@ TEST(CASRefEpochSealFormat, FormatBatteryEpochSeal)
         "{\"namespace\":\"ns\",\"txn_epoch\":\"3\",\"txn_seq\":\"1\",\"!prev_epoch\":\"2\",\"!prev_seq\":\"9\"}\n"
         "{\"op\":\"epoch_seal\"}\n"
         "{\"n\":1}\n"});
+}
+
+/// ===================================================================================
+/// Generation 3: the forward-linked tombstone and the sparse backlink
+/// ===================================================================================
+
+namespace DB::ErrorCodes
+{
+    extern const int UNKNOWN_FORMAT_VERSION;
+}
+
+namespace
+{
+
+RefLogTxn headTxn(const String & ns, RefTxnId id, RefTxnId prev, std::vector<RefOp> ops)
+{
+    return RefLogTxn{ns, id, std::move(ops), prev};
+}
+
+RefOp moveOpForFormat()
+{
+    const ManifestRef mref{.writer_epoch = 1, .build_sequence = 2, .manifest_ordinal = 1};
+    RefOp op;
+    op.kind = RefOpKind::OwnerTransition;
+    op.old_binding = RefOwnerBinding{RefOwnerKind::Committed, "from", mref};
+    op.new_binding = RefOwnerBinding{RefOwnerKind::Committed, "to", mref};
+    return op;
+}
+
+}
+
+TEST(CASRefEpochSealFormat, NextEpochMustExceedOwnEpoch)
+{
+    const String ns = "ns";
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(tombstoneTxn(ns, RefTxnId{5, 3}, 5)); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(tombstoneTxn(ns, RefTxnId{5, 3}, 4)); });
+
+    ScopedReadCeiling c(3);
+    const String bytes = encodeRefLogTxn(tombstoneTxn(ns, RefTxnId{5, 3}, 6));
+    EXPECT_EQ(decodeRefLogTxn(bytes, ns, RefTxnId{5, 3}).next_epoch, std::optional<uint64_t>{6});
+    ASSERT_TRUE(sniffHeaderLine(bytes).has_value());
+    EXPECT_EQ(sniffHeaderLine(bytes)->v, 3u);
+}
+
+TEST(CASRefEpochSealFormat, NextEpochOnlyOnATombstone)
+{
+    RefLogTxn birth{"ns", RefTxnId{5, 3}, {namespaceBirthOp()}, std::nullopt};
+    birth.next_epoch = 6;
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(birth); });
+}
+
+TEST(CASRefEpochSealFormat, HeaderThreeTombstoneRequiresNextEpoch)
+{
+    const String ns = "ns";
+    const RefLogTxn seal = tombstoneTxn(ns, RefTxnId{5, 3}, std::nullopt);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxnAtGeneration(seal, 3); });
+
+    const String bytes = encodeRefLogTxn(seal);
+    ASSERT_TRUE(sniffHeaderLine(bytes).has_value());
+    EXPECT_EQ(sniffHeaderLine(bytes)->v, 1u);
+    ScopedReadCeiling c(2);
+    EXPECT_NO_THROW(decodeRefLogTxn(bytes, ns, RefTxnId{5, 3}));
+}
+
+TEST(CASRefEpochSealFormat, SparseBacklinkNeedsHeaderThree)
+{
+    const String ns = "ns";
+    const RefLogTxn head = headTxn(ns, RefTxnId{7, 1}, RefTxnId{4, 9}, {namespaceBirthOp()});
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxnAtGeneration(head, 1); });
+
+    ScopedReadCeiling c(3);
+    const RefLogTxn back = decodeRefLogTxn(encodeRefLogTxnAtGeneration(head, 3), ns, RefTxnId{7, 1});
+    const std::optional<RefTxnId> expected_prev = RefTxnId{4, 9};
+    EXPECT_EQ(back.prev_epoch_seal, expected_prev);
+}
+
+TEST(CASRefEpochSealFormat, ReadCeilingTwoRejectsHeaderThree)
+{
+    const String ns = "ns";
+    const String bytes = encodeRefLogTxn(tombstoneTxn(ns, RefTxnId{5, 3}, 7));
+    ScopedReadCeiling c(2);
+    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { decodeRefLogTxn(bytes, ns, RefTxnId{5, 3}); });
+}
+
+/// Pin: until the writer switches, a head with a backlink keeps today's header.
+TEST(CASRefEpochSealFormat, BacklinkHeadKeepsItsHeaderBeforeTheWriterCommit)
+{
+    const String ns = "ns";
+    const RefLogTxn head = headTxn(ns, RefTxnId{5, 1}, RefTxnId{4, 2}, {namespaceBirthOp()});
+    EXPECT_EQ(refLogTxnHeaderGeneration(head), 1u);
+    ASSERT_TRUE(sniffHeaderLine(encodeRefLogTxn(head)).has_value());
+    EXPECT_EQ(sniffHeaderLine(encodeRefLogTxn(head))->v, 1u);
+
+    const RefLogTxn with_move = headTxn(ns, RefTxnId{5, 1}, RefTxnId{4, 2}, {moveOpForFormat()});
+    EXPECT_EQ(refLogTxnHeaderGeneration(with_move), 2u);
+    EXPECT_EQ(sniffHeaderLine(encodeRefLogTxn(with_move))->v, 2u);
+}
+
+TEST(CASRefEpochSealFormat, HeaderBelowThreeRejectsNextEpoch)
+{
+    const String ns = "ns";
+    const RefLogTxn tomb = tombstoneTxn(ns, RefTxnId{5, 3}, 7);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxnAtGeneration(tomb, 1); });
+
+    String text = encodeRefLogTxn(tomb);
+    const String needle = "\"v\":3";
+    const auto pos = text.find(needle);
+    ASSERT_NE(pos, String::npos);
+    text.replace(pos, needle.size(), "\"v\":1");
+    ScopedReadCeiling c(3);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefLogTxn(text, ns, RefTxnId{5, 3}); });
 }

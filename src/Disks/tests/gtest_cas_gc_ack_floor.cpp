@@ -177,7 +177,7 @@ TEST(CASSemanticRefFixture, WrapperAdvancesCheckpointWithoutDiscardingSnapshot)
     RefCkpt with_snapshot = before_drop->ckpt;
     with_snapshot.checkpoint_snapshot_id = publish_id;
     ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(
-        store->layout().refCkptKey(life), encodeRefCkpt(with_snapshot), before_drop->etag,
+        store->layout().refCkptKey(life), encodeRefCkptAtGeneration(with_snapshot, 1), before_drop->etag,
         Retry::once())));
 
     const uint64_t drop_sequence = dropRefTransition(*backend, store->layout(), ns, "tbl", manifest);

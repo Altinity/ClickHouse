@@ -433,6 +433,44 @@ TEST(CASGCBoundedWalk, ARawRecordBeyondTheCommittedFrontierCannotSuppressDestruc
         << "the committed frontier must permit reclamation despite the raw record above it";
 }
 
+/// A `_ckpt` this build cannot read (header 3 under read ceiling 2) holds the namespace: the round folds
+/// nothing for it and destroys nothing.
+TEST(CASGCBoundedWalk, HeaderThreeCkptUnderCeilingTwoHoldsTheNamespace)
+{
+    auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/hot@cas@"};
+    const DB::UInt128 blob(0xd00d);
+
+    publishAt(*backend, layout, ns, RefTxnId{1, 1}, "kept", 1, DB::UInt128(0x1), /*birth=*/true);
+    const ManifestRef doomed{.writer_epoch = 1, .build_sequence = 2, .manifest_ordinal = 1};
+    writeBlobBody(*backend, layout, blob);
+    writeManifestRaw(*backend, layout, ns, doomed, {blobEntryFor("data.bin", blob)});
+    writeTxnAt(*backend, layout, ns, RefTxnId{1, 2}, publishCommittedOps("doomed", doomed));
+    dropRefTransition(*backend, layout, ns, "doomed", doomed);
+
+    const String ckpt_key = layout.refCkptKey(fixture::fixtureLife(ns));
+    {
+        OperationForTest op(*backend);
+        const auto head = (*op).head(ckpt_key, Retry::standard());
+        ASSERT_TRUE(head.has_value());
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).replace(
+            ckpt_key, encodeRefCkptAtGeneration(refCkptOf(1), 3), head->etag, Retry::standard())));
+    }
+
+    ScopedReadCeiling c(2);
+    backend->resetCounts();
+    Gc gc(store, kGc);
+    const std::map<String, UInt64> intake = runRoundCapturingIntake(gc, UniversePolicy::Authoritative);
+
+    EXPECT_EQ(metric(intake, "frontier_proven"), 0u);
+    EXPECT_EQ(metric(intake, "frontier_namespaces"), 1u);
+    EXPECT_EQ(backend->deleteTotal(), 0u);
+    OperationForTest head_op(*backend);
+    EXPECT_TRUE((*head_op).head(layout.blobKey(legacyMetaTestRef(blob)), Retry::standard()).has_value());
+}
+
 /// A store that hides a namespace's records from every LIST does not lose them: the namespace goes
 /// QUIET, and a quiet namespace is exactly the shape the exact-key probe at `cursor + 1` exists for. It
 /// has no listed tail at all, and no bound is taken from a listing anyway -- bounding a namespace by a

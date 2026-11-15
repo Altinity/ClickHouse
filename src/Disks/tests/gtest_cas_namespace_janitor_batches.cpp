@@ -373,8 +373,8 @@ TEST(CASNamespaceJanitorBatches, QuietPoolCostsOneListPerRound)
     fixture::admitLive(*backend, layout, live_namespace);
     const NamespaceLifeId live = fixture::fixtureLife(live_namespace);
     createObj(*backend, layout.refCkptKey(live),
-        encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1},
-                              .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt}));
+        encodeRefCkptAtGeneration(RefCkpt{.life_epoch = std::optional<uint64_t>{1},
+                              .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt}, 1));
     std::vector<String> files;
     for (size_t i = 0; i < 1200; ++i)
     {

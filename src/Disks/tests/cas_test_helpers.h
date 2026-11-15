@@ -365,6 +365,39 @@ private:
     std::mutex sleeps_mutex;
 };
 
+/// Raises or lowers the process read ceiling for one scope, so a test can read a generation this build
+/// does not yet advertise, or act as an older reader.
+struct ScopedReadCeiling
+{
+    explicit ScopedReadCeiling(uint32_t ceiling) { setReadCeilingForTest(ceiling); }
+    ~ScopedReadCeiling() { setReadCeilingForTest(std::nullopt); }
+    ScopedReadCeiling(const ScopedReadCeiling &) = delete;
+    ScopedReadCeiling & operator=(const ScopedReadCeiling &) = delete;
+};
+
+/// A `RefCkpt` from named fields; designated initializers must spell every field without a default.
+inline RefCkpt refCkptOf(
+    std::optional<uint64_t> life_epoch, std::optional<RefTxnId> committed_through = std::nullopt,
+    std::optional<RefTxnId> checkpoint_snapshot_id = std::nullopt, std::optional<RefTxnId> last_epoch_seal = std::nullopt)
+{
+    RefCkpt ckpt;
+    ckpt.life_epoch = life_epoch;
+    ckpt.committed_through = committed_through;
+    ckpt.checkpoint_snapshot_id = checkpoint_snapshot_id;
+    ckpt.last_epoch_seal = last_epoch_seal;
+    return ckpt;
+}
+
+/// An epoch-seal transaction (a tombstone when `next_epoch` is set) at `id`.
+inline RefLogTxn tombstoneTxn(const String & ns, RefTxnId id, std::optional<uint64_t> next_epoch, std::optional<RefTxnId> prev = std::nullopt)
+{
+    RefOp seal;
+    seal.kind = RefOpKind::EpochSeal;
+    RefLogTxn txn{ns, id, {seal}, prev};
+    txn.next_epoch = next_epoch;
+    return txn;
+}
+
 /// Run `fn`, expect a DB::Exception with EXACTLY `expected_code` (CORRUPTED_DATA-vs-NOT_IMPLEMENTED
 /// is part of the fail-closed contract: an unknown future format must be NOT_IMPLEMENTED, never
 /// misreported as corruption).
@@ -1473,7 +1506,7 @@ inline void writeRecoverableCkptForRawFixture(
             "raw recovery fixture for namespace '{}' has no catalog entry", ns.string());
 
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(it->ns, it->incarnation);
-    const WriteResult put = (*operation).create(layout.refCkptKey(life), encodeRefCkpt(ckpt),
+    const WriteResult put = (*operation).create(layout.refCkptKey(life), encodeRefCkptAtGeneration(ckpt, 1),
                                                 DB::Cas::Retry::standard());
     if (!std::holds_alternative<DB::Cas::Committed>(put))
         throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
@@ -1509,7 +1542,7 @@ inline void advanceRecoverableCkptForRawFixture(
     RefCkpt advanced = sample->ckpt;
     advanced.committed_through = through;
     if (!std::holds_alternative<DB::Cas::Committed>(
-            (*operation).replace(layout.refCkptKey(life), encodeRefCkpt(advanced), sample->etag,
+            (*operation).replace(layout.refCkptKey(life), encodeRefCkptAtGeneration(advanced, 1), sample->etag,
                                  DB::Cas::Retry::standard())))
         throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
             "raw recovery fixture for namespace '{}' could not advance its checkpoint", ns.string());
@@ -1549,7 +1582,7 @@ inline void replaceRecoverableCkptForRawFixture(
             "raw recovery fixture for namespace '{}' cannot regress its checkpoint frontier", ns.string());
 
     if (!std::holds_alternative<DB::Cas::Committed>(
-            (*operation).replace(layout.refCkptKey(life), encodeRefCkpt(next), existing->etag,
+            (*operation).replace(layout.refCkptKey(life), encodeRefCkptAtGeneration(next, 1), existing->etag,
                                  DB::Cas::Retry::standard())))
         throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
             "raw recovery fixture for namespace '{}' could not replace its checkpoint", ns.string());
@@ -1573,12 +1606,12 @@ inline void publishRecoverableCkptForSemanticWrapper(
     {
         const WriteResult put = (*operation).create(
             layout.refCkptKey(*life),
-            encodeRefCkpt(RefCkpt{
+            encodeRefCkptAtGeneration(RefCkpt{
                 .life_epoch = 1,
                 .committed_through = txn_id,
                 .checkpoint_snapshot_id = std::nullopt,
                 .last_epoch_seal = std::nullopt,
-            }),
+            }, 1),
             DB::Cas::Retry::standard());
         if (std::holds_alternative<DB::Cas::Committed>(put))
             return;

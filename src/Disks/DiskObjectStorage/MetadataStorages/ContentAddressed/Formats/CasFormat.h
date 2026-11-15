@@ -20,6 +20,9 @@ constexpr uint32_t G_BUILD = 2;
 constexpr uint32_t G_WRITE_FLOOR = 1;
 /// The generation that introduced the committed-owner move in the ref log (`OwnerTransitionShape::Move`).
 constexpr uint32_t G_REF_MOVE = 2;
+/// The generation that introduced the forward-linked epoch tombstone (`RefLogTxn::next_epoch`), the sparse
+/// `prev_epoch_seal` backlink and the two-field `_ckpt` body.
+constexpr uint32_t G_REF_CHAIN = 3;
 
 /// Stable identifiers for every self-describing persisted object class. The text registry uses the
 /// corresponding `type` string as the on-disk identity. Numeric values are part of the format history:

@@ -1822,7 +1822,7 @@ TEST(CASRefGc, RefSnaplogLifecycleE2E)
     RefCkpt after_snapshot_publish = before_snapshot_publish.ckpt;
     after_snapshot_publish.checkpoint_snapshot_id = RefTxnId{1, va2};
     ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(
-        layout.refCkptKey(life_a), encodeRefCkpt(after_snapshot_publish),
+        layout.refCkptKey(life_a), encodeRefCkptAtGeneration(after_snapshot_publish, 1),
         before_snapshot_publish.etag, Retry::standard())));
 
     Gc gc(store, kGc);

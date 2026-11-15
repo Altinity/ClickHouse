@@ -2188,12 +2188,12 @@ TEST(CASGCRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     ASSERT_TRUE(old_ckpt.has_value());
     {
         OperationForTest ckpt_op(*backend);
-        ASSERT_TRUE(std::holds_alternative<Committed>((*ckpt_op).replace(ckpt_key, encodeRefCkpt(RefCkpt{
+        ASSERT_TRUE(std::holds_alternative<Committed>((*ckpt_op).replace(ckpt_key, encodeRefCkptAtGeneration(RefCkpt{
             .life_epoch = 1,
             .committed_through = RefTxnId{2, 1},
             .checkpoint_snapshot_id = std::nullopt,
             .last_epoch_seal = RefTxnId{1, 2},
-        }), old_ckpt->etag, Retry::standard())));
+        }, 1), old_ckpt->etag, Retry::standard())));
     }
 
     /// The list budget is one key per round, so reclaiming both debris bodies takes a circuit.

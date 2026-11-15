@@ -727,8 +727,8 @@ TEST(CASNamespaceJanitorIntegration, RegularGcRoundDeletesDeadNamespaceBytes)
     const RootNamespace live_namespace{"00/live@cas@"};
     fixture::admitLive(*backend, layout, live_namespace);
     createObj(*backend, layout.refCkptKey(fixture::fixtureLife(live_namespace)),
-        encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1},
-                              .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt}));
+        encodeRefCkptAtGeneration(RefCkpt{.life_epoch = std::optional<uint64_t>{1},
+                              .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt}, 1));
     const String dead = layout.refCkptKey(life("dead", 151));
     createObj(*backend, dead, "checkpoint");
 
@@ -762,8 +762,8 @@ TEST(CASNamespaceJanitorIntegration, GcRoundListsEveryWalkWithTheOneResponsePage
     const RootNamespace live_namespace{"00/live@cas@"};
     fixture::admitLive(*backend, layout, live_namespace);
     createObj(*backend, layout.refCkptKey(fixture::fixtureLife(live_namespace)),
-        encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1},
-                              .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt}));
+        encodeRefCkptAtGeneration(RefCkpt{.life_epoch = std::optional<uint64_t>{1},
+                              .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt}, 1));
     Gc gc(store, UInt128{152});
     const RoundReport report = runRegularRoundReclaiming(gc);
     ASSERT_TRUE(report.acquired_lease);

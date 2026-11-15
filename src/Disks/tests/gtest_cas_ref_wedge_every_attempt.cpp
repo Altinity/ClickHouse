@@ -717,10 +717,10 @@ TEST(CASRefWedgeEveryAttempt, RetiredLifeRefusesWedgeRetryBeforeAnyRequestOrAdop
         = replaceCatalogLifeForWedgeRace(backend, store->layout(), predecessor, UInt128{0x71f2});
     const NamespaceLifeId successor_life
         = NamespaceLifeId::fromCatalogEntry(successor.ns, successor.incarnation);
-    createObj(*backend, store->layout().refCkptKey(successor_life), encodeRefCkpt(RefCkpt{
+    createObj(*backend, store->layout().refCkptKey(successor_life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = store->liveWriterEpoch(),
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt}));
+        .last_epoch_seal = std::nullopt}, 1));
     store->invalidateRemovedCatalogLife(predecessor_life);
     backend->resetCounts();
 

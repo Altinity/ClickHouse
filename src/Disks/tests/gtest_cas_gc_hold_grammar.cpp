@@ -1033,12 +1033,12 @@ TEST(CASGCHoldGrammar, AnUndecodableCheckpointHoldsOnlyItsOwnNamespace)
     const String good_ckpt_key = layout.refCkptKey(fixture::fixtureLife(good));
     const auto good_ckpt_head = (*corrupt_op).head(good_ckpt_key, Retry::once());
     ASSERT_TRUE(good_ckpt_head.has_value());
-    ASSERT_TRUE(std::holds_alternative<Committed>((*corrupt_op).replace(good_ckpt_key, encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>((*corrupt_op).replace(good_ckpt_key, encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{1, 2},
         .checkpoint_snapshot_id = RefTxnId{1, 2},
         .last_epoch_seal = std::nullopt,
-    }), good_ckpt_head->etag, Retry::once())));
+    }, 1), good_ckpt_head->etag, Retry::once())));
 
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
 
