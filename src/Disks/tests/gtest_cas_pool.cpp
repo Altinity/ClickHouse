@@ -2861,6 +2861,11 @@ TEST(CASMountOpenWaits, PublicationHorizonUsesTheEnvelope)
         auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
         Layout l{"p"};
         DB::Cas::tests::seedPoolMetaForRestart(*b);
+        /// This test measures the horizon of a mount that has no floor raise to do.
+        {
+            DB::Cas::tests::OperationForTest op(*b);
+            PoolMeta::raiseMinReaderGeneration(*op, l, Pool::mount_reader_floor);
+        }
         /// Held in a shared atomic, not a plain local: the hooks below mutate it, and the Pool can
         /// outlive this lambda's own stack frame (a background publish holds `shared_from_this()`), so
         /// a by-reference capture of a local would dangle.
@@ -2895,6 +2900,81 @@ TEST(CASMountOpenWaits, PublicationHorizonUsesTheEnvelope)
     /// equality too, so this must also redo -- reverting the strict comparison to "<=" would make this
     /// case behave like the fits-both case (two writes).
     EXPECT_EQ(mountWriteCount(70), 3u) << "an exact boundary (renewal_window_ms == remaining) must be refused, not accepted";
+}
+
+namespace
+{
+
+/// A pool meta at reader floor 1, as a generation-1 writer leaves it, ready for `Pool::open` with prefix "p".
+void seedFloorOne(DB::Cas::Backend & backend)
+{
+    DB::Cas::tests::seedPoolMetaForRestart(backend);
+}
+
+uint64_t storedFloor(DB::Cas::Backend & backend)
+{
+    return decodePoolMeta(readObj(backend, Layout("p").poolMetaKey()).value().bytes).min_reader_generation;
+}
+
+}
+
+TEST(CASMountOpenWaits, FloorRaiseIsCountedByTheRenewalWindowCheck)
+{
+    /// Same envelope as `PublicationHorizonUsesTheEnvelope` (window 600, safe deadline 950) over a held
+    /// boot clock. The pool-meta write is the raise itself, so `extra_ms` is spent inside it.
+    const auto mountWriteCount = [](uint64_t extra_ms) -> uint64_t
+    {
+        auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
+        Layout l{"p"};
+        seedFloorOne(*b);
+        auto fake_boot = std::make_shared<std::atomic<uint64_t>>(0);
+        b->onBeforeWrite(l.poolMetaKey(), [fake_boot, extra_ms] { *fake_boot += extra_ms; });
+        PoolPtr store = Pool::open(b, PoolConfig{
+            .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "test",
+            .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+            .cas_request_budget = CasRequestBudget{.attempt_timeout_ms = 100, .lease_safety_margin_ms = 50, .connect_timeout_cap_ms = 100},
+            .boot_ms_fn = [fake_boot] { return fake_boot->load(); },
+            .wait_sleep_fn = [fake_boot](uint64_t ms) { *fake_boot += ms; },
+        });
+        EXPECT_EQ(store->poolMeta().min_reader_generation, G_REF_MOVE);
+        return b->putOverwriteCount(l.mountKey("test")) + b->putCount(l.mountKey("test"));
+    };
+
+    EXPECT_EQ(mountWriteCount(0), 2u) << "a raise that costs no time leaves the horizon intact";
+    EXPECT_EQ(mountWriteCount(500), 3u) << "the time the raise took must count against the renewal window";
+}
+
+TEST(CASPool, FloorRaiseLogsTheNewFloor)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    seedFloorOne(*b);
+    DB::Cas::tests::ScopedLoggerCapture capture("CasPool", "warning");
+    PoolPtr store = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    EXPECT_NE(
+        capture.captured().find("min_reader_generation raised 1 -> 2; readers below generation 2 can no longer mount this pool"),
+        String::npos) << capture.captured();
+}
+
+TEST(CASPool, FloorIsRaisedBeforeTheWorkersStart)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    seedFloorOne(*b);
+    auto workers_started = std::make_shared<std::atomic<uint64_t>>(0);
+    auto started_at_raise = std::make_shared<std::atomic<uint64_t>>(~uint64_t{0});
+    b->onBeforeWrite(Layout("p").poolMetaKey(), [workers_started, started_at_raise]
+    {
+        *started_at_raise = workers_started->load();
+        throw std::runtime_error("injected fault: pool meta write refused");
+    });
+    EXPECT_ANY_THROW(Pool::open(b, PoolConfig{
+        .pool_prefix = "p", .server_root_id = "test", .background_watermark = true,
+        .worker_factory = [workers_started](std::function<void()> body)
+        {
+            ++*workers_started;
+            return ThreadFromGlobalPool(std::move(body));
+        }}));
+    EXPECT_EQ(started_at_raise->load(), 0u) << "the raise must be written before any background worker is created";
+    EXPECT_EQ(storedFloor(*b), 1u);
 }
 
 /// Same reservation change as `PublicationHorizonUsesTheEnvelope` above, exercised through the remount

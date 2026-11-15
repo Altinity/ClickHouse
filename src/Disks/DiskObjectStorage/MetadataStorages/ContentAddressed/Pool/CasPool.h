@@ -442,6 +442,9 @@ public:
     /// immediate `ABORTED` refusal; a tombstoned owner of the victim is accepted; a member without an epoch
     /// counter is refused (`CORRUPTED_DATA`). Throws `BAD_ARGUMENTS` when neither owner nor lease exists.
     static PoolPtr openForDecommission(BackendPtr backend, PoolConfig config, const String & victim_srid);
+
+    /// The `min_reader_generation` every writable mount raises the pool to.
+    static constexpr uint64_t mount_reader_floor = G_REF_MOVE;
     /// Stop the mount-renewal and remount activity, drain ref-log work, and release the owned
     /// backend-facing components in their dependency order. Destruction is also the clean-farewell
     /// path for a writable mount, so it must complete before the owning backend is released.
@@ -923,13 +926,18 @@ private:
     };
 
     /// The writable-mount startup tail shared by `open` and `openForDecommission`: owner claim →
-    /// writer_epoch → mount claim (+fence-recovery loop) → `MountLeaseRenewer` start → watermark
-    /// anchor. `our_uuid` is the identity to mount as -- `config.server_id` for a normal open, the
+    /// writer_epoch → mount claim (+fence-recovery loop) → `MountLeaseRenewer` start → reader floor
+    /// raise (`raiseReaderFloor`) → watermark anchor. `our_uuid` is the identity to mount as -- `config.server_id` for a normal open, the
     /// victim's owner uuid for decommission (impersonation). `policy` changes only what happens when
     /// the mount claim does not resolve `Claimed`/`FencedSelf`: `WaitForExpiry` observes a stale-
     /// looking lease and refuses (`mountDoubleStartMessage`) only once it proves genuinely live;
     /// `NoWait` refuses immediately, with no observation wait.
     static void mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy policy);
+
+    /// Raises the stored `min_reader_generation` to `generation` and mirrors it into `meta`; a floor already at
+    /// or above it sends nothing. Called by `mountWritable`, so every writable mount, decommission included,
+    /// passes it.
+    static void raiseReaderFloor(const PoolPtr & store, uint64_t generation);
 
     /// The single serialized, reentrancy-safe event funnel (Task 2). Declared BEFORE `event_sink_` so
     /// it constructs first and destructs last: the forwarder stored in `event_sink_` references it, and

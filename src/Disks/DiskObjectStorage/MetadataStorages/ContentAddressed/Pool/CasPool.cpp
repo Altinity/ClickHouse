@@ -595,20 +595,6 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
     if (!store->config.read_only)
         mountWritable(store, store->config.server_id, MountClaimPolicy::WaitForExpiry);
 
-    if (!store->config.read_only && store->meta.min_reader_generation < G_REF_MOVE)
-    {
-        /// One-way, so it is done only by a node that has actually mounted (identity and lease held) and
-        /// can therefore emit owner moves; from here on a generation-1 build refuses to mount this pool.
-        CasOperation raise_op = store->gc_requests.admit();
-        const uint64_t floor_before = store->meta.min_reader_generation;
-        const PoolMeta raised = PoolMeta::raiseMinReaderGeneration(raise_op, store->pool_layout, G_REF_MOVE);
-        LOG_WARNING(getLogger("CasPool"),
-            "Content-addressed pool '{}': min_reader_generation raised {} -> {}; generation-1 readers can no longer mount this pool",
-            u128ToHex(store->meta.pool_id), floor_before, raised.min_reader_generation);
-        /// Only the floor is written: background workers started by `mountWritable` already read the rest of `meta`.
-        store->meta.min_reader_generation = raised.min_reader_generation;
-    }
-
     return store;
 }
 
@@ -624,12 +610,26 @@ MountIncarnation Pool::captureMountIncarnation() const
     return MountIncarnation{.writer_epoch = writer_epoch, .fence_generation = generation};
 }
 
+void Pool::raiseReaderFloor(const PoolPtr & store, uint64_t generation)
+{
+    if (store->meta.min_reader_generation >= generation)
+        return;
+    CasOperation raise_op = store->gc_requests.admit();
+    const uint64_t floor_before = store->meta.min_reader_generation;
+    const PoolMeta raised = PoolMeta::raiseMinReaderGeneration(raise_op, store->pool_layout, generation);
+    LOG_WARNING(getLogger("CasPool"),
+        "Content-addressed pool '{}': min_reader_generation raised {} -> {}; readers below generation {} can no longer mount this pool",
+        u128ToHex(store->meta.pool_id), floor_before, raised.min_reader_generation, generation);
+    /// Only the floor is written: the rest of `meta` is already what the pool opened with.
+    store->meta.min_reader_generation = raised.min_reader_generation;
+}
+
 void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy policy)
 {
     /// === Mount-safety startup protocol ===
     /// STRICT ORDER: validate id → claim owner (identity) → allocate durable writer_epoch → claim
-    /// the mount lease (liveness) → re-read the owner → install the renewer + arm the local write fence
-    /// → anchor the watermark. owner / epoch / mount / watermark are BOOTSTRAP-CONTROL writes: they
+    /// the mount lease (liveness) → re-read the owner → install the renewer → raise the pool reader floor
+    /// → arm the local write fence → anchor the watermark. owner / epoch / mount / watermark are BOOTSTRAP-CONTROL writes: they
     /// establish the very right to write and run BEFORE the write fence gates ordinary data/ref/manifest
     /// mutations. Fail closed throughout.
     /// Shared by `open` (`policy = WaitForExpiry`, `our_uuid = config.server_id`) and
@@ -879,6 +879,11 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
         }
         break;
     }
+
+    /// One-way, and only after the claim: a node that holds identity and lease can emit owner moves.
+    /// The renewal-window check below counts the time the raise takes. If the claim and the raise outrun
+    /// that window the open fails with the raise already durable, so the next open has no raise to do.
+    raiseReaderFloor(store, mount_reader_floor);
 
     /// A reclaim over a predecessor whose death was NOT proven clean may still have a conditional PUT
     /// from that predecessor in flight -- `Fenced`, `UncleanObserved`, and `UncleanUnsafe` are exactly

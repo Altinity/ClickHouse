@@ -525,6 +525,33 @@ TEST_F(CASDecommission, AlwaysRenewsAdminClaimEvenWhenHostDiskIsObserveOnly)
     EXPECT_TRUE(admin->poolConfig().bounded_background_renewal);
 }
 
+TEST_F(CASDecommission, DecommissionMountRaisesThePoolFloor)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    {
+        auto victim = openVictim(backend);
+    }
+    {
+        OperationForTest op(*backend);
+        const auto current = (*op).read(layout.poolMetaKey(), Retry::once());
+        ASSERT_TRUE(current.has_value());
+        const auto head = (*op).head(layout.poolMetaKey(), Retry::once());
+        ASSERT_TRUE(head.has_value());
+        PoolMeta pm = decodePoolMeta(current->bytes);
+        pm.min_reader_generation = G_WRITE_FLOOR;
+        ASSERT_TRUE(std::holds_alternative<Committed>(
+            (*op).replace(layout.poolMetaKey(), encodePoolMeta(pm), head->etag, Retry::once())));
+    }
+
+    auto admin = Pool::openForDecommission(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
+    ASSERT_TRUE(admin != nullptr);
+
+    OperationForTest op(*backend);
+    const auto stored = (*op).read(layout.poolMetaKey(), Retry::once());
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(decodePoolMeta(stored->bytes).min_reader_generation, G_REF_MOVE);
+}
+
 TEST_F(CASDecommission, OpensOverARetiredOwner)
 {
     auto backend = startVictim();
