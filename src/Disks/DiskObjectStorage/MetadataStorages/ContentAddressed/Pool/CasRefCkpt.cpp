@@ -127,10 +127,14 @@ CkptPublishOutcome publishCkptSnapshot(CasOperation & op, const Layout & layout,
         }
         const RefCkpt durable = decodeRefCkpt(current->bytes);
         /// Below generation 3 the lane's stamp owns the conversion; an old body never names a new snapshot.
-        if (durable.generation < G_REF_CHAIN
-            || (durable.checkpoint_snapshot_id && snapshot_id < *durable.checkpoint_snapshot_id))
+        if (durable.generation < G_REF_CHAIN)
         {
             decline = CkptPublishOutcome::NotAdvanced;
+            return std::nullopt;
+        }
+        if (durable.checkpoint_snapshot_id && snapshot_id < *durable.checkpoint_snapshot_id)
+        {
+            decline = CkptPublishOutcome::Superseded;
             return std::nullopt;
         }
         if (durable.checkpoint_snapshot_id == snapshot_id)

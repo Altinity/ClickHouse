@@ -56,7 +56,7 @@ enum class FsckClass : uint8_t
                    /// not a clean bill of health: the honest third answer, reported so nobody reads a
                    /// silence as a proof.
     LifelessKey,   /// a namespace-tree key the `Layout` parsers refuse (a malformed/non-canonical shape,
-                   /// including the un-incarnated Stage A layout), OR a catalog incarnation that is
+                   /// including the un-incarnated layout), OR a catalog incarnation that is
                    /// ambiguous or otherwise unreadable. Neither a current writer nor the catalog's own
                    /// reverse life index can produce this key's meaning, so it belongs to no namespace
                    /// and no per-namespace verdict can carry it. ERROR

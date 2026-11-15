@@ -394,8 +394,8 @@ class Pool;
 using PoolPtr = std::shared_ptr<Pool>;
 
 /// One listed key `Pool::listNamespaces` could not attribute to a namespace, with the refusal message
-/// that stopped it. Behind Stage B's format bump the only such key is a ref object or a namespace file
-/// that names no LIFE (the un-incarnated Stage A shape), which the `Layout` parsers refuse by name.
+/// that stopped it. The only such key is a ref object or a namespace file that names no LIFE (the
+/// un-incarnated layout), which the `Layout` parsers refuse by name.
 struct UnattributableNamespaceKey
 {
     String key;
@@ -521,7 +521,7 @@ public:
     /// The real boot clock: CLOCK_BOOTTIME in milliseconds. Static so tests can compose it.
     static uint64_t bootMs();
 
-    /// ---- fence-generation admission (rev.7 [C2]/[D1]; owned by `mount_runtime`) ----
+    /// ---- fence-generation admission (owned by `mount_runtime`) ----
     /// Bumped on every `tripMountLost`/`armMountFence`. Forwarders used directly by the S3-native
     /// staging-buffer finalize (`ContentAddressedTransaction::writeFile`) -- the durable-effect site
     /// outside `CasPlainObjects` that needs to capture-then-recheck a fence-generation token across an
@@ -535,14 +535,14 @@ public:
     MountIncarnation captureMountIncarnation() const;
     void setIncarnationCaptureHookForTest(std::function<void()> hook) { incarnation_capture_hook_for_test = std::move(hook); }
 
-    /// ---- pool lifecycle condition (rev.7 §1; owned by `mount_runtime`) ----
+    /// ---- pool lifecycle condition (owned by `mount_runtime`) ----
     /// Atomic read of the current lifecycle condition. Thin forwarder; safe to call from any thread.
     PoolLifecycle lifecycle() const { return mount_runtime.lifecycle(); }
     /// Whether the pool has reached one of the two fully-terminal `Vanished` values
     /// (`VanishedReplaced` / `VanishedForgotten`).
     bool isVanished() const { return mount_runtime.isVanished(); }
     /// Whether the terminal-intent latch is published — a natural `enterVanished`, OR FORGET's early
-    /// (spec §5 step 1) `publishVanishedIntent`, and NEVER `IdentityLost` ([C1]). See
+    /// (spec §5 step 1) `publishVanishedIntent`, and NEVER `IdentityLost`. See
     /// `CasMountRuntime::vanishedIntentPublished`. The GC scheduler consults this ALONGSIDE `isVanished()`
     /// to self-exit its loops the instant the pool is (being driven) terminal, at the earliest signal.
     bool vanishedIntentPublished() const { return mount_runtime.vanishedIntentPublished(); }
@@ -556,7 +556,7 @@ public:
 
     /// A non-gated, I/O-free lifecycle snapshot for `system.cas_mounts` (spec §7,
     /// Factory class). Reads only the runtime's atomics — NO backend op — so it is truthful in EVERY
-    /// state, including the terminal ones the store()-class surface refuses. `detail` is the same [D5]
+    /// state, including the terminal ones the store()-class surface refuses. `detail` is the same
     /// reason text `throwIfLifecycleTerminal` throws (empty while `Live`/`TransientNotLive`), which spec §1
     /// requires appear verbatim in the snapshot; `since` is the wall-clock second the current non-`Live`
     /// state was entered (0 while `Live`). The metadata-storage layer maps `lifecycle` to the operator
@@ -581,10 +581,10 @@ public:
     /// injected because the scheduler is owned above the Pool, a no-op in contexts that run none — and stop
     /// + join both persistent workers; (5) drain the ref lanes (bounded) and retire the renewer WITHOUT an
     /// unearned clean farewell (the lease expires by observation unless the lanes provably drained); then
-    /// (6) publish `Vanished(forgotten)` carrying `reason` (the [D5] message with the operator's decommission
+    /// (6) publish `Vanished(forgotten)` carrying `reason` (the message with the operator's decommission
     /// timestamp). Idempotent: an already-`Vanished` pool returns immediately (first terminal transition
     /// wins). MUST run on the admin/query thread, never a pool (remount/GC) thread — the joins would
-    /// otherwise self-deadlock (hazard C6).
+    /// otherwise self-deadlock.
     void forgetDisk(const std::function<void()> & stop_and_join_gc, const String & reason);
 
     /// Test seam: force the pool lifecycle condition directly to `lc` (see
@@ -595,7 +595,7 @@ public:
 
     /// Test seam: publish the terminal-intent latch WITHOUT settling a terminal state (spec §5 step 1 of
     /// FORGET), so a test can exercise the "FORGET intent published, state still pre-terminal" window — the
-    /// step-0 remount-observer bail (M1) and the GC scheduler's earliest-signal self-exit (C1). Never used
+    /// step-0 remount-observer bail and the GC scheduler's earliest-signal self-exit. Never used
     /// in production; FORGET reaches `publishVanishedIntent` through `forgetDisk`.
     void publishVanishedIntentForTest() { mount_runtime.publishVanishedIntent(); }
 
@@ -890,8 +890,8 @@ public:
     /// Intended only for pre-open wiring or tests with no active mount thread; later installation races emitters.
     /// Every component that emits (this `Pool`, the ref ledger, the manifest reader, the mount
     /// renewer) holds a reference to `event_sink_`, so routing that ONE `std::function` through the
-    /// single `event_dispatcher_` funnels every emitter into serialized, reentrancy-safe delivery
-    /// (stage-1 §1, Task 2). The forwarder is installed only when a real sink is present so
+    /// single `event_dispatcher_` funnels every emitter into serialized, reentrancy-safe delivery.
+    /// The forwarder is installed only when a real sink is present so
     /// `hasEventSink`/`event_sink_` stays a truthful "delivery enabled" predicate and the disabled hot
     /// path still skips constructing events entirely.
     void setEventSink(CasEventSink sink)
@@ -942,7 +942,7 @@ private:
     /// passes it.
     static void raiseReaderFloor(const PoolPtr & store, uint64_t generation);
 
-    /// The single serialized, reentrancy-safe event funnel (Task 2). Declared BEFORE `event_sink_` so
+    /// The single serialized, reentrancy-safe event funnel. Declared BEFORE `event_sink_` so
     /// it constructs first and destructs last: the forwarder stored in `event_sink_` references it, and
     /// reverse-order destruction retires the forwarder before the dispatcher it captures.
     EventDispatcher event_dispatcher_;
@@ -1351,17 +1351,17 @@ private:
     /// ends its remount like any retired owner, but the reason names the run, not a decommissioned server.
     bool decommission_admin = false;
 
-    /// The single home of the [D5] per-lifecycle reason detail (spec §1) — the human-readable text that
+    /// The single home of the per-lifecycle reason detail (spec §1) — the human-readable text that
     /// names the ACTUAL sub-state, WITHOUT the `content-addressed pool '<id>' ` prefix. Both
     /// `throwIfLifecycleTerminal` (which prefixes it and throws) and the non-gated `lifecycleSnapshot`
     /// (which surfaces it verbatim in the system table) read it, so the error message and the introspection
     /// row can never drift. Empty for `Live`/`TransientNotLive` (no terminal detail); for
     /// `VanishedForgotten` it prefers the stored `vanishedReason()` (carrying the operator's decommission
-    /// timestamp) and falls back to the static [D5] text when none was recorded (a forced-for-test state).
+    /// timestamp) and falls back to the static text when none was recorded (a forced-for-test state).
     String lifecycleReasonDetail(PoolLifecycle lc) const;
 
-    /// NOTE (M-C2): the ref-log is never trimmed here — trimming needs GC's fold state
-    /// (`last_folded_ref_id`, INV-JOURNAL-COVERAGE), which is GC state landing in M-C3.
+    /// The ref-log is never trimmed here: trimming needs GC's fold state
+    /// (`last_folded_ref_id`, INV-JOURNAL-COVERAGE).
 };
 
 }

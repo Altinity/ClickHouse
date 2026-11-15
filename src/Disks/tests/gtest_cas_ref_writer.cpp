@@ -56,6 +56,7 @@ extern const Event CASRefSnapshotPutBytes;
 extern const Event CASRefSnapshotTailLogs;
 extern const Event CASRefSnapshotPublishDispatched;
 extern const Event CASRefSnapshotPublishBackoff;
+extern const Event CASRefCheckpointNotAdvanced;
 extern const Event CASRequestFenceLostPostWrite;
 extern const Event CASRefRecoveryEpochSealed;
 extern const Event CASRefRecoveryRetries;
@@ -1705,6 +1706,119 @@ TEST(CASRefWriterRecovery, ReadersOfALifeErasedUnderTheWalkAnswerAbsent)
 namespace
 {
 
+/// Parks the first recovery that reaches its first request, so a second caller of the same runtime
+/// queues behind it. Later recoveries pass through.
+struct ParkedRecovery
+{
+    std::atomic<bool> armed{true};
+    DB::Cas::tests::ManualBarrier barrier;
+    std::atomic<bool> throw_on_release{false};
+
+    static PoolConfig config(const std::shared_ptr<ParkedRecovery> & park)
+    {
+        PoolConfig config;
+        config.recovery_pre_first_request_hook_for_test = [park]
+        {
+            if (!park->armed.exchange(false))
+                return;
+            park->barrier.arriveAndWait();
+            if (park->throw_on_release.load())
+                throw DB::Exception(DB::ErrorCodes::ABORTED, "test: the parked recovery fails");
+        };
+        return config;
+    }
+};
+
+/// Bounded yield-poll; the bound only catches a hang.
+bool recoveryWaiterParked(const PoolPtr & store, const RootNamespace & ns)
+{
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (store->refRecoveryWaitersForTest(ns) == 0)
+    {
+        if (std::chrono::steady_clock::now() > deadline)
+            return false;
+        std::this_thread::yield();
+    }
+    return true;
+}
+
+/// Runs `call` twice on one runtime: the first recovery parks, the second caller waits on it, then
+/// `while_parked` runs and the first recovery resumes. Returns both futures.
+template <typename Call>
+auto runWithAWaiter(const std::shared_ptr<ParkedRecovery> & park, const PoolPtr & store, const RootNamespace & ns,
+                    Call call, const std::function<void()> & while_parked)
+{
+    auto first = std::async(std::launch::async, call);
+    park->barrier.waitUntilArrived();
+    auto second = std::async(std::launch::async, call);
+    const bool parked = recoveryWaiterParked(store, ns);
+    while_parked();
+    park->barrier.release();
+    EXPECT_TRUE(parked) << "the second caller must wait on the first caller's recovery";
+    return std::make_pair(std::move(first), std::move(second));
+}
+
+}
+
+/// A caller that waited on a recovery which found the life erased answers as the recoverer does.
+TEST(CASRefWriterRecovery, WaiterOnARecoveryThatFindsTheLifeErasedAnswersAbsent)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const NamespaceLifeId life = seedRecoverablePart(backend, layout, RootNamespace{"srv1/waiter_erased_read"});
+    const auto park = std::make_shared<ParkedRecovery>();
+    auto store = openPoolWithConfig(backend, ParkedRecovery::config(park));
+
+    /// The objects stay, so the walk succeeds and only the catalog confirmation finds the life gone.
+    auto [first, second] = runWithAWaiter(park, store, life.ns,
+        [&] { return store->resolveRef(life.ns, "part_1"); },
+        [&] { rewriteCatalogRow(backend, layout, life.ns, std::nullopt); });
+    EXPECT_EQ(first.get(), std::nullopt);
+    std::optional<Resolved> waiter_answer;
+    ASSERT_NO_THROW(waiter_answer = second.get());
+    EXPECT_EQ(waiter_answer, std::nullopt);
+}
+
+TEST(CASRefWriterRecovery, PresenceProbeWaitingOnARecoveryThatFindsTheLifeErasedDoesNotThrow)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const NamespaceLifeId life = seedRecoverablePart(backend, layout, RootNamespace{"srv1/waiter_erased_probe"});
+    setCatalogRowRemovingForTest(backend, layout, life);
+    const auto park = std::make_shared<ParkedRecovery>();
+    auto store = openPoolWithConfig(backend, ParkedRecovery::config(park));
+
+    auto [first, second] = runWithAWaiter(park, store, life.ns,
+        [&] { return store->namespaceStillLogicallyPresent(life.ns); },
+        [&] { rewriteCatalogRow(backend, layout, life.ns, std::nullopt); });
+    EXPECT_FALSE(first.get());
+    bool waiter_present = true;
+    ASSERT_NO_THROW(waiter_present = second.get());
+    EXPECT_FALSE(waiter_present);
+}
+
+/// Control: a waiter on a recovery that failed runs a recovery of its own.
+TEST(CASRefWriterRecovery, WaiterOnAFailedRecoveryRecoversItself)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const NamespaceLifeId life = seedRecoverablePart(backend, layout, RootNamespace{"srv1/waiter_failed_recovery"});
+    const auto park = std::make_shared<ParkedRecovery>();
+    park->throw_on_release = true;
+    auto store = openPoolWithConfig(backend, ParkedRecovery::config(park));
+    const uint64_t installs_before = store->recoveryInstallCountForTest();
+
+    auto [first, second] = runWithAWaiter(park, store, life.ns,
+        [&] { return store->resolveRef(life.ns, "part_1"); },
+        [] {});
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { (void)first.get(); });
+    EXPECT_TRUE(second.get().has_value());
+    EXPECT_EQ(store->recoveryInstallCountForTest(), installs_before + 1);
+}
+
+namespace
+{
+
 /// Leaves `part_1`'s lane in `NeedsRecovery`: a `published_at` update becomes durable, then the lease
 /// deadline is reached before its install. The deadline is restored, so the same admission recovers.
 void strandAppendUnderLostDeadline(const PoolPtr & store, const RootNamespace & ns)
@@ -1751,6 +1865,45 @@ TEST(CASRefWriterRecovery, AppendWhoseRecoveryFindsTheLifeErasedRetriesLater)
     EXPECT_TRUE(captured);
     EXPECT_TRUE(erase.fired());
     EXPECT_EQ(store->refTableLifeForTest(life.ns), std::nullopt);
+}
+
+/// A caller that reaches the runtime after its recovery found the life erased, without waiting on it,
+/// answers `LifeRemoved` and sends nothing.
+TEST(CASRefWriterRecovery, CallerAfterARecoveryThatFoundTheLifeErasedStartsNoRecovery)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const NamespaceLifeId life = seedRecoverablePart(backend, layout, RootNamespace{"srv1/after_erased_recovery"});
+    EraseDuringRecovery erase;
+    auto store = openPoolWithConfig(backend, erase.config());
+    ASSERT_TRUE(store->resolveRef(life.ns, "part_1").has_value());
+
+    const auto requests = [&]
+    {
+        return std::vector<uint64_t>{backend->getTotal(), backend->headTotal(), backend->listTotal(),
+                                     backend->writeTotal(), backend->deleteTotal()};
+    };
+
+    /// The append holds its runtime; a nested read recovers that runtime first and finds the life erased.
+    bool captured = false;
+    std::vector<uint64_t> requests_after_nested_read;
+    store->setAppendAfterRuntimeCaptureHookForTest([&]
+    {
+        if (std::exchange(captured, true))
+            return;
+        strandAppendUnderLostDeadline(store, life.ns);
+        erase.arm([&] { eraseLifeForTest(backend, layout, life); });
+        EXPECT_EQ(store->resolveRef(life.ns, "part_1"), std::nullopt);
+        EXPECT_TRUE(erase.fired());
+        requests_after_nested_read = requests();
+    });
+    const uint64_t installs_before = store->recoveryInstallCountForTest();
+    expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "the catalog no longer names life",
+        [&] { store->dropRef(life.ns, "part_1"); });
+    store->setAppendAfterRuntimeCaptureHookForTest(nullptr);
+    ASSERT_TRUE(captured);
+    EXPECT_EQ(requests(), requests_after_nested_read);
+    EXPECT_EQ(store->recoveryInstallCountForTest(), installs_before);
 }
 
 /// A resident life that its recovery finds erased hands the write to cold admission, which births a new life.
@@ -3158,6 +3311,50 @@ TEST(CASRefWriterSnapshotPublish, RepublishAfterAStopBeforeTheCkptPublishMeetsId
     ASSERT_TRUE(published);
     EXPECT_EQ(published->ckpt.checkpoint_snapshot_id, candidate);
     EXPECT_EQ(store->newestPublishedSnapshotIdForTest(ns), candidate);
+}
+
+/// A candidate below the durable snapshot is nothing to publish: no not-advanced count, no backoff, no adoption.
+TEST(CASRefWriterSnapshotPublish, CandidateOlderThanTheDurableSnapshotIsDropped)
+{
+    using ProfileEvents::global_counters;
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    PoolConfig config;
+    config.snapshot_log_count_threshold = 1ULL << 40;
+    config.snapshot_log_bytes_threshold = 1ULL << 40;
+    auto store = openPoolWithConfig(backend, config);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/older_candidate"};
+    publishEmptyPart(store, ns, "a");
+    publishEmptyPart(store, ns, "b");
+    const NamespaceLifeId life = lifeIfCatalogedForTest(backend, layout, ns).value();
+    const std::optional<RefTxnId> candidate = listGreatestLogIdForLifeForTest(*backend, layout, life);
+    ASSERT_TRUE(candidate);
+    const RefTxnId newer{candidate->writer_epoch, candidate->ref_sequence + 1};
+    const std::optional<RefTxnId> base_before = store->newestPublishedSnapshotIdForTest(ns);
+
+    /// Stands in for an overlapping publish of a newer candidate that advanced `_ckpt` first.
+    bool hook_fired = false;
+    store->setSnapshotBeforeCkptCasHookForTest([&]
+    {
+        const auto durable = readCkptForTest(backend, layout, life);
+        ASSERT_TRUE(durable);
+        RefCkpt advanced = durable->ckpt;
+        advanced.checkpoint_snapshot_id = newer;
+        ASSERT_TRUE(replaceForTest(backend, layout.refCkptKey(life), encodeRefCkptAtGeneration(advanced, 3), durable->etag));
+        hook_fired = true;
+    });
+    const auto not_advanced_before = global_counters[ProfileEvents::CASRefCheckpointNotAdvanced];
+    const auto backoff_before = global_counters[ProfileEvents::CASRefSnapshotPublishBackoff];
+    EXPECT_FALSE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
+    store->setSnapshotBeforeCkptCasHookForTest(nullptr);
+
+    ASSERT_TRUE(hook_fired);
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefCheckpointNotAdvanced], not_advanced_before);
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefSnapshotPublishBackoff], backoff_before);
+    EXPECT_EQ(store->newestPublishedSnapshotIdForTest(ns), base_before);
+    const auto durable_after = readCkptForTest(backend, layout, life);
+    ASSERT_TRUE(durable_after);
+    EXPECT_EQ(durable_after->ckpt.checkpoint_snapshot_id, newer);
 }
 
 /// A threshold snapshot publish increments the writer-side observability counters -- snapshot PUT bytes

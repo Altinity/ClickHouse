@@ -372,7 +372,7 @@ std::optional<Resolved> CasRefLedger::resolveRef(const RootNamespace & ns, const
     if (read_before_state_lock_hook_for_test)
         read_before_state_lock_hook_for_test();
 
-    /// Capture the resolved edge under `state_mutex`, but emit AFTER releasing it (Task 2): the audit
+    /// Capture the resolved edge under `state_mutex`, but emit AFTER releasing it: the audit
     /// sink may re-enter a ledger read that itself takes `state_mutex` (e.g. `resolveRef`), so emitting
     /// while holding the lock self-deadlocks that reentrant read on the same thread. The reentrancy-safe
     /// dispatcher additionally serializes delivery, but the same-thread relock is prevented here by the
@@ -1441,12 +1441,17 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
     }
     if (rt.recovered && !needs_rerecovery())
         return RefRecoveryOutcome::Recovered;   /// the caller we waited on already finished it
+    /// Set under this lock before `recovery_in_progress` falls, so no recovery starts on a removed life.
+    if (rt.recovery_ended_life_removed)
+        return RefRecoveryOutcome::LifeRemoved;
 
     rt.recovery_in_progress = true;
     /// Cleared + broadcast on every exit from here, success or exception -- so a parked waiter is never
     /// left hanging, and so the self-remount barrier's JOIN completes on a failed attempt as surely as
     /// on a successful one.
     SCOPE_EXIT({
+        if (life_removed)
+            rt.recovery_ended_life_removed = true;
         rt.recovery_in_progress = false;
         rt.recovery_cv.notify_all();
     });
@@ -1470,7 +1475,7 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
     /// under the decision.
     const LiveEpochPair live = live_epoch_pair_fn();
 
-    /// Outer transient-retry loop (Layer 1 of the stuck-table-load fix): a whole recovery attempt that
+    /// Outer transient-retry loop, so a blip does not fail a table load for good: a whole recovery attempt that
     /// fails with a TRANSIENT object-store transport error (`isTransientRecoveryError` -- `S3_ERROR`/
     /// socket/timeout from the direct LIST/GET backend calls, or a controller `NETWORK_ERROR`) is retried
     /// with capped-exponential backoff until `recovery_retry_budget_ms` is spent, instead of propagating
@@ -2550,7 +2555,7 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
             /// Still uncertain. Do NOT clear the wedge: it describes an object that may well be durable,
             /// and clearing it on a failed read is the one thing this path must never do. There is no
             /// deadline reset and no background loop -- the next caller of this namespace, or a remount,
-            /// retries. That is register R6's ACCEPTED behaviour: a permanently quiet wedged namespace
+            /// retries. That is ACCEPTED behaviour: a permanently quiet wedged namespace
             /// waits, which costs nothing, because the wedged operation was never acknowledged.
             reason = gave_up && !gave_up->sent_any
                 ? Reason::RefusedPreAttempt : Reason::ResolveFoundNothing;
@@ -3856,7 +3861,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     /// is passed once, but a leader can stall between it and here -- in `build_ops`' caller I/O -- across
     /// the whole fence-loss + remount window, then resume after `armMountFence`. Allocating {new_epoch,
     /// seq} now and PUTting it (its live `fence_ok` would pass) would persist a transaction validated
-    /// against this orphaned runtime's STALE cache -- the C1 data-loss class. `superseded_by_remount` is
+    /// against this orphaned runtime's STALE cache and lose data. `superseded_by_remount` is
     /// published before the fence re-arm, so failing closed here (no id, no PUT, no wedge, cache
     /// unchanged) keeps the durable log free of any stale-view transaction. The append `fence_ok`
     /// (which also checks the flag) is the airtight backstop for the narrow window past this point.
@@ -4620,7 +4625,9 @@ void CasRefLedger::settleSnapshotPublish(
         /// decrement means `pending_snapshot_publishes` never transiently reaches 0 across the handoff, so
         /// `waitForSnapshotPublishSettleForTest` never observes a false "settled". A durable publish
         /// already subtracted its captured tail, so this self-terminates once the tail is back at/under
-        /// threshold; a non-durable one armed the backoff, which `admit...` respects -- no PUT storm.
+        /// threshold; a non-durable one armed the backoff, which `admit...` respects -- no PUT storm. A
+        /// `Superseded` one is not durable, arms no backoff and adopts nothing: the next candidate is at
+        /// least the newer durable snapshot, so it publishes or skips as identical.
         rt->pending_snapshot_publishes.fetch_sub(1, std::memory_order_relaxed);
         if (live_mount)
             redispatch = admitSnapshotPublishUnderStateLock(*rt);
@@ -4953,6 +4960,7 @@ bool CasRefLedger::tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntimeImpl(
     /// newest -- suppressing every later publish for it -- while the checkpoint still pointed below it,
     /// leaving recovery replaying from an older base with nothing scheduled to fix it.
     bool ckpt_advanced = false;
+    bool superseded = false;
     if (!runtime_still_admitted())
         return false;
     if (snapshot_before_ckpt_cas_hook_for_test)
@@ -4965,6 +4973,7 @@ bool CasRefLedger::tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntimeImpl(
         else if (outcome == CkptPublishOutcome::IdenticalSkip)
             ProfileEvents::increment(ProfileEvents::CASRefCheckpointIdenticalSkip);
         ckpt_advanced = ckptPublicationDurable(outcome);
+        superseded = outcome == CkptPublishOutcome::Superseded;
     }
     catch (...)
     {
@@ -4978,6 +4987,9 @@ bool CasRefLedger::tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntimeImpl(
             "could not be advanced; the snapshot is not yet cleanup-authoritative and the publish will "
             "be retried");
     }
+    /// `_ckpt` already names a snapshot newer than this candidate: nothing to publish, so no adoption and no backoff.
+    if (superseded)
+        return false;
     if (!ckpt_advanced)
     {
         ProfileEvents::increment(ProfileEvents::CASRefCheckpointNotAdvanced);

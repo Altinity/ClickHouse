@@ -76,7 +76,7 @@ public:
     /// offered an absent catalog to build a replacement authority from, so no mutation can replace
     /// every other namespace with a one-update catalog.
     ///
-    /// This primitive runs NO admission check: Constraint 13 (removal is never refused) means
+    /// This primitive runs NO admission check: removal is never refused, so
     /// whether a candidate must clear the additive predicate is the CALLER's decision, not this
     /// loop's. A caller mutating an entry's state without growing the catalog (a removal transition)
     /// uses this directly.
@@ -97,7 +97,7 @@ public:
     /// `entry` at its canonical (ns-sorted) position and running the SAME bounded `casUpdate` retry
     /// loop. Takes the entry to insert rather than an arbitrary mutation, by design: an admission
     /// entry point that accepted a free-form candidate could be handed a REMOVAL by a future caller
-    /// that reads as correct, silently reopening Constraint 13 (removal is never refused) behind a
+    /// that reads as correct, silently making a removal refusable behind a
     /// name that says "admitting". A namespace `entry.ns` already carries an entry is a bug in the
     /// caller (`createNamespace` below owns checking that first) and surfaces as
     /// `encodeRefCatalog`'s own canonical-order/no-duplicate grammar check, inside

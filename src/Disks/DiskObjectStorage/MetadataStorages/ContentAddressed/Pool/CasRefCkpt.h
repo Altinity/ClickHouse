@@ -40,6 +40,7 @@ enum class CkptPublishOutcome : uint8_t
                     /// admission can be lost before the write is sent, and equally after the write is
                     /// proven durable. Re-read before assuming either way
     NotAdvanced,    /// nothing was written and the caller's fact is not in `_ckpt`
+    Superseded,     /// nothing was written: `_ckpt` already names a newer snapshot than the caller's
 };
 
 /// True when what the call writes is durable in `_ckpt`: the only outcomes after which a caller may act on it.
@@ -67,8 +68,8 @@ CkptPublishOutcome createCkptAtCreation(CasOperation & op, const Layout & layout
                                         uint64_t life_epoch, const Retry & policy = Retry::standard());
 
 /// Conditional replace of a present generation 3 body that raises `checkpoint_snapshot_id`.
-/// Replaced: `Published`. Durable id equal to `snapshot_id`: `IdenticalSkip`. Object absent, below
-/// generation 3, or durable id above `snapshot_id`: `NotAdvanced`. Fence lost: `FencedOut`.
+/// Replaced: `Published`. Durable id equal to `snapshot_id`: `IdenticalSkip`. Durable id above
+/// `snapshot_id`: `Superseded`. Object absent or below generation 3: `NotAdvanced`. Fence lost: `FencedOut`.
 CkptPublishOutcome publishCkptSnapshot(CasOperation & op, const Layout & layout, const NamespaceLifeId & life,
                                        const RefTxnId & snapshot_id, const Retry & policy = Retry::standard());
 

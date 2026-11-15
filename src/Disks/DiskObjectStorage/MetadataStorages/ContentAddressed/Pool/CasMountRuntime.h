@@ -25,7 +25,7 @@ namespace DB::Cas
 class PartWriteTxn;
 using PartWriteTxnPtr = std::shared_ptr<PartWriteTxn>;
 
-/// The pool-level lifecycle condition (rev.7 §1) a `Pool` moves through as its shared backing changes
+/// The pool-level lifecycle condition a `Pool` moves through as its shared backing changes
 /// underfoot. It is distinct from the storage-level `Constructing/Started/ShutDown` lifecycle (a null
 /// published pool -- before `startup`/after `shutdown`) the metadata storage tracks. Ordering of the
 /// enumerators is not significant; membership tests do the work.
@@ -33,8 +33,8 @@ using PartWriteTxnPtr = std::shared_ptr<PartWriteTxn>;
 ///   - `TransientNotLive` — the lease was lost; access is uncertain and a self-remount retries. The §2
 ///                          `Present`+identity-match recovery rule fires only from here (or `Live`).
 ///   - `IdentityLost`     — the pool sentinels are authoritatively absent (both KeyAbsent), or a
-///                          remount found the owner at another life: fail-loud and TERMINAL (rev.8). The remount/GC workers self-exit;
-///                          matching-sentinel reappearance does NOT auto-revive it ([D3]); recovery is a
+///                          remount found the owner at another life: fail-loud and TERMINAL. The remount/GC workers self-exit;
+///                          matching-sentinel reappearance does NOT auto-revive it; recovery is a
 ///                          restart or `SYSTEM CAS FORGET`.
 ///   - `Vanished*`        — fully terminal truth: the data root was replaced by a foreign pool, or the
 ///                          disk was decommissioned by `FORGET`. Store-class access fails loud from here.
@@ -223,7 +223,7 @@ public:
     /// The real boot clock: `CLOCK_BOOTTIME` in milliseconds. Static so tests can compose it.
     static uint64_t bootMs();
 
-    /// ---- fence-generation admission (rev.7 [C2]/[D1]) ----
+    /// ---- fence-generation admission ----
     /// Bumped by EVERY `tripMountLost` (a fence loss) and EVERY `armMountFence` (a re-arm -- a fresh
     /// lease incarnation, e.g. after a self-remount). A durable-effect caller captures this value once
     /// at admission and compares it again immediately before its durable backend call: a DIFFERENT
@@ -240,7 +240,7 @@ public:
     /// admission; the caller's write must never reach the backend in either case.
     void checkFenceOrThrow(uint64_t admitted_generation) const;
 
-    /// ---- pool lifecycle condition (rev.7 §1, spec §§1-3); enum at namespace scope below ----
+    /// ---- pool lifecycle condition (spec §§1-3); enum at namespace scope below ----
     /// Atomic read of the current lifecycle (acquire).
     PoolLifecycle lifecycle() const { return pool_lifecycle.load(std::memory_order_acquire); }
     /// Whether the pool has reached one of the two fully-terminal `Vanished` values
@@ -248,7 +248,7 @@ public:
     bool isVanished() const;
     /// Whether the terminal-intent latch (`vanished_intent`) is published — set by a natural
     /// `enterVanished`, OR EARLY (spec §5 step 1) by FORGET's `publishVanishedIntent`, and NEVER by the
-    /// non-absorbing `IdentityLost` ([C1]). This is the EARLIEST terminal signal: it can already be true
+    /// non-absorbing `IdentityLost`. This is the EARLIEST terminal signal: it can already be true
     /// while the state is still pre-terminal (mid-FORGET). Consulted alongside `isVanished()` by every
     /// background worker that must self-exit the moment the pool is (being driven) terminal — the renewer
     /// callback (`scheduleRemount`), the remount loop, and the GC scheduler.
@@ -262,12 +262,12 @@ public:
     bool noteLeaseLost();
     /// Non-terminal recovery transition: `TransientNotLive -> Live`. Called after a self-remount
     /// reclaimed a fresh incarnation. A compare-exchange FROM `TransientNotLive` only, so it NEVER
-    /// revives `IdentityLost`/`Vanished` ([D3]).
+    /// revives `IdentityLost`/`Vanished`.
     void noteRemounted();
 
     /// One-way terminal transition to `IdentityLost`, from `TransientNotLive` only (a compare-exchange
     /// FROM `TransientNotLive`, so it is idempotent and cannot fire from `Live`/`Vanished`). On the
-    /// transition it emits ONE WARN and one `CASIdentityLost` ProfileEvent. rev.8: `IdentityLost` is a
+    /// transition it emits ONE WARN and one `CASIdentityLost` ProfileEvent. `IdentityLost` is a
     /// fail-loud TERMINAL state — `remountTerminal` reports it, so the remount worker self-exits
     /// (and the GC scheduler self-exits, through `Pool`) at its next boundary; there is no demoted observer.
     /// It deliberately does NOT publish the `vanished_intent` latch (which is reserved for the `Vanished*`
@@ -298,7 +298,7 @@ public:
     /// dedicated latch keyed separately from `vanished_intent`, because FORGET publishes that intent latch
     /// early at step 1). `which` MUST be one of the two `Vanished*` values (`VanishedReplaced` or
     /// `VanishedForgotten`). `reason` is retained and
-    /// surfaced verbatim in the `VanishedForgotten` [D5] error message (see `vanishedReason`). Threads exit
+    /// surfaced verbatim in the `VanishedForgotten` error message (see `vanishedReason`). Threads exit
     /// their own loops; the joins happen in `~Pool` for a natural transition, or synchronously in
     /// `Pool::forgetDisk` for FORGET. Must be called under the caller's remount serialization
     /// (Pool::remount_mutex).
@@ -306,7 +306,7 @@ public:
 
     /// The reason string recorded by the winning `enterVanished`, or empty when none has run (a
     /// forced-for-test terminal state, or a non-terminal pool). `Pool::throwIfLifecycleTerminal` reads it
-    /// to build the `VanishedForgotten` [D5] message (which carries the operator's decommission timestamp
+    /// to build the `VanishedForgotten` message (which carries the operator's decommission timestamp
     /// authored by `forgetDisk`). Safe to read only AFTER observing a terminal state via `lifecycle()`
     /// (acquire): the reason is written once, before the state's release-store, so a reader that
     /// acquire-observes the terminal state also observes the reason (release/acquire handoff).
@@ -565,20 +565,20 @@ private:
     /// is the gate at the ref-append mutation chokepoint.
     MountFence mount_fence;
 
-    /// Fence-generation token (rev.7 [C2]): bumped by `tripMountLost` and `armMountFence`. See
+    /// Fence-generation token: bumped by `tripMountLost` and `armMountFence`. See
     /// `fenceGeneration`/`checkFenceOrThrow`.
     std::atomic<uint64_t> fence_generation{0};
     std::atomic<bool> writes_paused_warned{false};
     std::function<void()> arm_mount_fence_interposition_hook_for_test;
 
-    /// The pool lifecycle condition (rev.7 §1). Starts `Live`. Non-terminal transitions
+    /// The pool lifecycle condition. Starts `Live`. Non-terminal transitions
     /// (`noteLeaseLost`/`noteRemounted`) are lock-free compare-exchanges guarded by their exact
     /// predecessor state; terminal predicate publication is serialized with worker waits by
     /// `driver_mutex`, while the caller's `Pool::remount_mutex` serializes the higher-level remount flow.
     std::atomic<PoolLifecycle> pool_lifecycle{PoolLifecycle::Live};
     /// Terminal-intent latch (spec §3), published before the state store — by `enterVanished` for a
     /// natural transition, or EARLY (step 1) by `publishVanishedIntent` for FORGET. Only the fully-terminal
-    /// `Vanished*` transition sets it — `IdentityLost` deliberately does NOT (rev.8 folds IdentityLost into
+    /// `Vanished*` transition sets it — `IdentityLost` deliberately does NOT (it joins
     /// the worker-exit boundary via `remountTerminal` instead). Consulted (with `IdentityLost`) by
     /// `remountTerminal`, so a terminal pool's runtime consumer never schedules a remount and the remount
     /// loop bails at its next step boundary — no claim/allocate/write after the pool is (being driven) terminal.

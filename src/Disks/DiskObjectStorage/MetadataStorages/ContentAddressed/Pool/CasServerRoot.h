@@ -529,7 +529,7 @@ std::vector<MountInfo> listMounts(CasOperation & op, const Layout & layout, uint
 /// `CasRefCatalog::reconcileStaleCreator` requires before a stalled `Creating` entry may be stolen by a
 /// NEW actor.
 ///
-/// Takes the two scalars rather than a whole `CreatorFence` (review C4): that type lives on the
+/// Takes the two scalars rather than a whole `CreatorFence`: that type lives on the
 /// ref-catalog side (`Formats/CasRefCatalogFormat.h`), and this file is already widely included
 /// through `CasPool.h` (mount/server-root plumbing reaches nearly every CAS translation unit), so
 /// naming that type here would make the mount layer depend on the ref-catalog format instead of the

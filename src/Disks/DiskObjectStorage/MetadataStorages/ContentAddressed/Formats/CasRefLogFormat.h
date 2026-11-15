@@ -182,7 +182,7 @@ bool refLogTxnIsRemovalClass(const std::vector<RefOp> & ops);
 /// is `EpochSeal`. Unlike `refLogTxnIsRemovalClass` (a class predicate that tolerates other ops
 /// alongside `RemoveNamespace`), a seal transaction's grammar forbids any companion op (spec INV-2),
 /// so this checks the exact shape rather than mere presence -- callers that decode untrusted bytes
-/// and branch on "is this a seal" (Task 2's slot-occupy walk) get a precise answer.
+/// and branch on "is this a seal" get a precise answer.
 bool refLogTxnIsEpochSeal(const RefLogTxn & txn);
 
 /// The context-free half of the seal grammar, by `header_generation`. At every generation a transaction

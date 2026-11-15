@@ -608,15 +608,14 @@ private:
         /// ref-object cleanup (covered logs / superseded snapshots) so a second LIST is never issued.
         std::map<String, RefTableListing> ref_tables;
 
-        /// The round's complete immutable post-LIST catalog cut (review C3). Every later consumer in
+        /// The round's complete immutable post-LIST catalog cut. Every later consumer in
         /// the SAME round (`cleanupRefObjects`) must look a namespace up here rather than issuing an
         /// independent catalog re-read, which can see a DIFFERENT answer if the namespace was dropped
         /// and recreated between the fold's walk and the later call -- the exact "delete plan computed
-        /// under one life, applied under another" shape C3 named.
+        /// under one life, applied under another" shape.
         /// Keeping the full cut also preserves the distinction between an absent namespace and a
         /// cataloged but non-walkable `Creating` row; reducing it to a `Live`/`Removing` map loses that
-        /// lifecycle fact. A namespace absent from this cut has no legitimate destructive key space;
-        /// never assume the Stage-A sentinel applies.
+        /// lifecycle fact. A namespace absent from this cut has no legitimate destructive key space.
         std::optional<CasRefCatalog::Snapshot> catalog_cut;
 
         /// The round's per-namespace decoded `_ckpt`, read ONCE by the intake walk (its second,
@@ -920,7 +919,7 @@ private:
     /// independently-derived views of the page.
     void reportSweepRetention(const ManifestSweepResult & result);
 
-    /// Stage B (spec INV-3): the round's universe -- every namespace life the destructive gate may one
+    /// Spec INV-3: the round's universe -- every namespace life the destructive gate may one
     /// day owe a frontier proof for -- is catalog-authoritative, ONE `cas/ref_catalog` `GET` replacing
     /// the pool-wide `LIST(cas/ns/stream/)` this used to run. `Creating` entries are excluded: no publication
     /// can exist yet (spec §3), so there is nothing here for a discovery path to walk; `Live` and

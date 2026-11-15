@@ -440,7 +440,8 @@ TEST(CASRefCheckpoint, GroupRefKeysScopesHotIntakeToTheStreamTree)
 TEST(CASRefCheckpoint, OnlyPublishedAndIdenticalSkipAreRecorded)
 {
     for (const CkptPublishOutcome outcome : {CkptPublishOutcome::Published, CkptPublishOutcome::IdenticalSkip,
-                                             CkptPublishOutcome::FencedOut, CkptPublishOutcome::NotAdvanced})
+                                             CkptPublishOutcome::FencedOut, CkptPublishOutcome::NotAdvanced,
+                                             CkptPublishOutcome::Superseded})
     {
         bool expected = false;
         switch (outcome)
@@ -451,6 +452,7 @@ TEST(CASRefCheckpoint, OnlyPublishedAndIdenticalSkipAreRecorded)
                 break;
             case CkptPublishOutcome::FencedOut:
             case CkptPublishOutcome::NotAdvanced:
+            case CkptPublishOutcome::Superseded:
                 break;
         }
         EXPECT_EQ(ckptPublicationDurable(outcome), expected);
@@ -1024,13 +1026,24 @@ TEST(CASRefCheckpoint, OnlyCreationCreatesAnAbsentCkpt)
         EXPECT_EQ(backend->writeCount(key), writes);
     }
     {
+        /// Below generation 3 the stamp has not run, so a newer snapshot id is still not advanced.
+        const RootNamespace ns{"srv1/ckpt_gen1_newer_snapshot"};
+        const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(ns);
+        const String key = ckptKeyOf(layout, ns);
+        ASSERT_TRUE(std::holds_alternative<Committed>(op.create(key,
+            encodeRefCkptAtGeneration(refCkptOf(2, RefTxnId{2, 3}, RefTxnId{2, 3}), 1), Retry::standard())));
+        const uint64_t writes = backend->writeCount(key);
+        EXPECT_EQ(publishCkptSnapshot(op, layout, life, RefTxnId{2, 2}), CkptPublishOutcome::NotAdvanced);
+        EXPECT_EQ(backend->writeCount(key), writes);
+    }
+    {
         const RootNamespace ns{"srv1/ckpt_gen3"};
         const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(ns);
         const String key = ckptKeyOf(layout, ns);
         ASSERT_TRUE(std::holds_alternative<Committed>(op.create(key,
             encodeRefCkptAtGeneration(refCkptOf(2, std::nullopt, RefTxnId{2, 3}), 3), Retry::standard())));
         const uint64_t writes = backend->writeCount(key);
-        EXPECT_EQ(publishCkptSnapshot(op, layout, life, RefTxnId{2, 2}), CkptPublishOutcome::NotAdvanced);
+        EXPECT_EQ(publishCkptSnapshot(op, layout, life, RefTxnId{2, 2}), CkptPublishOutcome::Superseded);
         EXPECT_EQ(backend->writeCount(key), writes);
         EXPECT_EQ(publishCkptSnapshot(op, layout, life, RefTxnId{2, 3}), CkptPublishOutcome::IdenticalSkip);
         EXPECT_EQ(backend->writeCount(key), writes);

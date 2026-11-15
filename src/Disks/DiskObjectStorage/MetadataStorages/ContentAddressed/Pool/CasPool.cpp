@@ -136,7 +136,7 @@ struct LifecycleGate
 
 /// Authoritative, cache-bypassing evaluation of the §2 verdict table. Reads ONLY; never claims,
 /// allocates, or writes. `expected_pool_id`/`expected_blob_header_len` are the identity this Pool
-/// established at open — the comparison is over those two fields ONLY ([B6]); `algos_used` and
+/// established at open — the comparison is over those two fields ONLY; `algos_used` and
 /// `min_reader_generation` are legally mutable and are deliberately not compared (the format gate is the
 /// decode itself succeeding).
 LifecycleGate probePoolLifecycleGate(
@@ -175,7 +175,7 @@ LifecycleGate probePoolLifecycleGate(
         {
             /// `_pool_meta` is authoritatively gone. Require the OTHER sentinel (the owner anchor) to be
             /// conclusively absent too before declaring identity lost — any surviving sentinel, or an
-            /// undecidable owner probe, keeps us transient (throw-when-uncertain). rev.8: BOTH sentinels
+            /// undecidable owner probe, keeps us transient (throw-when-uncertain). BOTH sentinels
             /// authoritatively absent ⇒ `IdentityLost` (a fail-loud terminal state), regardless of whatever
             /// else remains under the prefix. Erasure is never PROVEN by the system — only asserted by the
             /// operator's `FORGET` — so there is no prefix-emptiness leg here.
@@ -357,7 +357,7 @@ void Pool::armMountFence(UInt128 server_uuid, uint64_t writer_epoch, uint64_t de
 
 String Pool::lifecycleReasonDetail(PoolLifecycle lc) const
 {
-    /// The [D5] per-reason detail (spec §1) — named once here so the typed error and the introspection
+    /// The per-reason detail (spec §1) — named once here so the typed error and the introspection
     /// snapshot always agree. No `content-addressed pool '<id>' ` prefix (callers add it if they want one).
     switch (lc)
     {
@@ -375,7 +375,7 @@ String Pool::lifecycleReasonDetail(PoolLifecycle lc) const
             /// The forgotten detail carries the operator's decommission TIMESTAMP, threaded through
             /// `enterVanished`'s reason by `forgetDisk` (`vanishedReason()`). A forced-for-test
             /// `VanishedForgotten` (no real FORGET ran) has no stored reason, so fall back to the static
-            /// [D5] text — it still names the sub-state and keeps "erasure was NOT verified".
+            /// text — it still names the sub-state and keeps "erasure was NOT verified".
             const String & reason = mount_runtime.vanishedReason();
             if (!reason.empty())
                 return reason;
@@ -447,7 +447,7 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
     /// read-only when the pool already exists; a missing pool meta on a read-only backend fails closed.)
     if (!config.read_only)
     {
-        /// (0) [C4][D2] Zero-write residual check FIRST — before ANY probe write. `pool_prefix` is
+        /// (0) Zero-write residual check FIRST — before ANY probe write. `pool_prefix` is
         /// EXCLUSIVELY CAS-owned; `createOrValidate` below may mint a fresh `_pool_meta` only over a
         /// genuinely empty prefix. The MUTATING capability battery must run AFTER this proof (it writes
         /// `_probe/` debris, which would itself make the prefix look non-empty), and the emptiness
@@ -578,7 +578,7 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
     /// zero-write residual proof above, so minting a missing `_pool_meta` is safe. A read-only/observe
     /// open never ran that proof (and there is no truly-read-only backend — `openPoolView` opens the same
     /// writable object storage and only sets `read_only`), so it must NEVER mint: an absent meta fails
-    /// closed instead (spec §2 [C4][D2]).
+    /// closed instead (spec §2).
     CasOperation meta_op = bootstrap_requests.admit();
     PoolMeta meta = PoolMeta::createOrValidate(
         meta_op, layout, config.blob_header_len, config.gc_shards, config.blob_hash_algo,
@@ -766,7 +766,7 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     uint64_t claimed_last_unclean_epoch = 0;
     /// The pre-I/O boot-clock instant of the claim attempt FINALLY adopted below -- survives the
     /// `break` so the arm below can detect a claim that consumed the lease TTL and re-anchor before
-    /// arming (rev.4 Phase B, round-3 finding 2).
+    /// arming.
     uint64_t claim_anchor_boot_ms = 0;
     constexpr int max_fence_recoveries = 3;
     for (int fence_recovery = 0; ; ++fence_recovery)
@@ -975,8 +975,8 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     {
         /// The claim path outlived the lease TTL: its anchor can no longer authorize an armed fence (a
         /// successor may have legally started reclaiming). Re-anchor with ONE fresh conditional lease
-        /// write -- it fails closed (Phase A classification) if anything took the slot meanwhile -- and
-        /// arm from the new attempt's anchor (rev.4 Phase B, round-3 finding 2).
+        /// write -- it fails closed if anything took the slot meanwhile -- and arm from the new attempt's
+        /// anchor.
         ///
         /// Reaching this means the claim's adoption write outran the safe lease window
         /// TTL, which `validateCasRequestBudget` already refuses to configure. It stays because a stalled
@@ -1073,7 +1073,7 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
     /// Decommission operates on an EXISTING pool member (an owner anchor / mount lease was just found), so
     /// `_pool_meta` must already be present. It never bootstraps: `allow_mint=false` so an absent meta
     /// (a partially-erased pool whose owner anchor survives) fails closed with INVALID_STATE rather than
-    /// minting a fresh identity here (spec §2 [C4][D2]).
+    /// minting a fresh identity here (spec §2).
     CasOperation meta_op = bootstrap_requests.admit();
     PoolMeta meta = PoolMeta::createOrValidate(
         meta_op, layout, config.blob_header_len, config.gc_shards, config.blob_hash_algo, /*allow_new=*/false,   /// a tool never admits a new algorithm
@@ -1254,7 +1254,7 @@ void Pool::setDetachedDrainDeadlineBudgetForTest(const CasRequestBudget & budget
 
 void Pool::forgetDisk(const std::function<void()> & stop_and_join_gc, const String & reason)
 {
-    /// Hazard C6: FORGET joins both mount-runtime workers (and, via `stop_and_join_gc`, the GC threads), so it
+    /// FORGET joins both mount-runtime workers (and, via `stop_and_join_gc`, the GC threads), so it
     /// MUST run on the admin/query thread — never a pool thread, whose join of itself would deadlock. The
     /// guard is a programming-error assertion (a self-join hangs; it never corrupts), so a chassert is the
     /// right severity, not a release fail-close.
@@ -1325,7 +1325,7 @@ void Pool::forgetDisk(const std::function<void()> & stop_and_join_gc, const Stri
 
     /// (6) Publish the terminal state + WARN, under remount serialization — matching the natural-transition
     /// contract. Every pool thread is already joined, so taking `remount_mutex` here cannot self-deadlock.
-    /// `reason` is the [D5] message (with the operator's decommission timestamp) that
+    /// `reason` is the message (with the operator's decommission timestamp) that
     /// `throwIfLifecycleTerminal` surfaces to store-class callers.
     {
         std::lock_guard g(remount_mutex);
@@ -1448,7 +1448,7 @@ bool Pool::tryRemountOnce()
     const uint64_t poll_interval_ms = std::max<uint64_t>(
         1, static_cast<uint64_t>(config.mount_renew_period.count()) / 2);
 
-    /// ==== Step 0 (rev.7 §2): pool lifecycle identity gate — BEFORE any claim/allocate/mount write ====
+    /// ==== Step 0: pool lifecycle identity gate — BEFORE any claim/allocate/mount write ====
     /// A remount attempt means the lease is presumed lost, so first ensure we are at least transient
     /// (production reaches here already transient via `tripMountLost`; a direct/forced call may still be
     /// `Live`). Then authoritatively probe the pool sentinels and dispatch per the §2 verdict table. Only
@@ -1496,13 +1496,13 @@ bool Pool::tryRemountOnce()
         switch (gate.verdict)
         {
             case LifecycleGateVerdict::Recover:
-                /// [D3] no auto-revival: a matching-sentinel observation while `IdentityLost` does NOT
+                /// No auto-revival: a matching-sentinel observation while `IdentityLost` does NOT
                 /// bring the disk back — the state is terminal; only a restart recovers.
                 if (mount_runtime.lifecycle() == PoolLifecycle::IdentityLost)
                     return false;
                 break;   /// fall through to the existing fresh-incarnation recovery.
             case LifecycleGateVerdict::Replaced:
-                /// NOT while a FORGET is in progress (spec §9 rev.8 item 7). `forgetDisk` publishes the
+                /// NOT while a FORGET is in progress (spec §9). `forgetDisk` publishes the
                 /// terminal-intent latch at step 1 (`publishVanishedIntent`), then joins the remount worker;
                 /// a `tryRemountOnce` already IN FLIGHT — one that passed the step-0 `isVanished()` gate
                 /// BEFORE the intent was published, which that gate therefore cannot catch — could otherwise
@@ -1518,7 +1518,7 @@ bool Pool::tryRemountOnce()
                 return false;
             case LifecycleGateVerdict::IdentityLost:
                 /// Both sentinels authoritatively absent. Enter `IdentityLost` once (from `TransientNotLive`);
-                /// a repeat probe while already `IdentityLost` is a no-op. rev.8: `IdentityLost` is a
+                /// a repeat probe while already `IdentityLost` is a no-op. `IdentityLost` is a
                 /// fail-loud TERMINAL state — the remount worker self-exits at its next boundary (see
                 /// `CasMountRuntime::remountTerminal`), so there is no demoted observer.
                 if (mount_runtime.lifecycle() != PoolLifecycle::IdentityLost)

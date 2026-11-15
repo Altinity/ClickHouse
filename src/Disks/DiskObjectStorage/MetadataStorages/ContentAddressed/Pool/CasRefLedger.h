@@ -819,6 +819,9 @@ private:
         /// Both this flag and the condition variable are guarded by `state_mutex`.
         bool recovery_in_progress = false;
         std::condition_variable recovery_cv;
+        /// A recovery of this runtime ended `LifeRemoved`, so every later call answers the same. Never cleared:
+        /// `life` is fixed, and a removed life does not return. Guarded by `state_mutex`.
+        bool recovery_ended_life_removed = false;
         /// The self-remount cancellation request (spec §3: "self-remount cancels or waits out recovery
         /// before rearming"). Set by `cancelRecoveriesAndAwaitQuiescence` from the remount thread and
         /// polled by the recovery walk at EVERY I/O boundary; a recovery that observes it abandons its
@@ -1139,7 +1142,7 @@ private:
     /// `recovery_in_progress`. A walk that raises `CORRUPTED_DATA` is confirmed the same way
     /// before the error leaves. When the catalog no longer names `rt.life` as `Live` or `Removing`, the
     /// walk's result or error is dropped, nothing is installed, the runtime is detached and the call
-    /// returns `LifeRemoved`.
+    /// returns `LifeRemoved`, as does every later call on this runtime.
     [[nodiscard]] RefRecoveryOutcome ensureRefTableRecovered(
         const RootNamespace & ns, RefTableRuntime & rt, const std::optional<DetachedStopToken> & token = {});
 

@@ -665,7 +665,7 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::createNamespace(
     CasOperation & op, const Layout & layout, uint64_t gc_shards,
     const RootNamespace & ns, const CreatorFence & creator, const Retry & policy)
 {
-    /// Read-first, per the Task 2 review's own note on `casAdmitEntry`: a namespace that already
+    /// Read-first: a namespace that already
     /// carries an entry is THIS function's job to notice and report `Superseded` for, not
     /// `casAdmitEntry`'s duplicate-namespace grammar refusal (which would report a `LOGICAL_ERROR` about
     /// canonical order -- true, but useless to a caller whose create merely lost a race). A concurrent

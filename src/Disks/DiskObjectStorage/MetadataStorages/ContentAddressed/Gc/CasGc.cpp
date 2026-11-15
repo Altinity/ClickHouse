@@ -1344,7 +1344,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     round_commit_timer->metric("generation", generation);
     round_commit_timer.reset();   /// emits the `round_commit` row
 
-    /// Task 7: the retire pipeline's REMAINING sizes, read from the seal this round's CAS just
+    /// The retire pipeline's REMAINING sizes, read from the seal this round's CAS just
     /// committed (`folded.fold_seal.condemned_summary` is TOTAL over every gc-shard -- see its own doc
     /// comment in `CasFoldSealFormat.h`). Zero-shard pools (never folded) leave these at 0.
     for (const auto & [shard, summary] : folded.fold_seal.condemned_summary)
@@ -1736,7 +1736,7 @@ Gc::CheckpointWitnesses Gc::readCheckpointWitnesses(GcReadAhead & reads,
     for (const String & ns_str : witness_namespaces)
     {
         const RootNamespace ns{ns_str};
-        /// Review C3: use the SAME complete catalog cut the round's walk resolved, never an independent
+        /// Use the SAME complete catalog cut the round's walk resolved, never an independent
         /// catalog re-read. A namespace absent from the cut, or present only as a non-walkable
         /// `Creating` row, has no admitted witness key to read this round.
         const auto entry_it = std::lower_bound(
@@ -1910,9 +1910,8 @@ std::optional<std::pair<uint64_t, uint64_t>> Gc::newestFoldSealRef()
     ///
     /// No closure exists in the current key shapes, because a fold seal cannot be point-read from its
     /// generation alone. The fix is a derivable per-generation marker that CAN be point-read, and it
-    /// would survive the blackout precisely because it needs no enumeration (see the report and
-    /// `docs/superpowers/cas/BACKLOG.md`). Anything the listing DOES show above its own maximum is
-    /// caught by the refusal above instead.
+    /// would survive the blackout precisely because it needs no enumeration. Anything the listing DOES
+    /// show above its own maximum is caught by the refusal above instead.
     const GenerationSealProbe genesis = probeGenerationForSeal(1);
     if (listed_anything || genesis.generation_exists)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
@@ -2042,7 +2041,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     const RefScanSummary & ref_scan = walk_plan.refScan();
     const std::vector<String> & ref_object_keys = ref_scan.keys;
 
-    /// Stage B (spec INV-3): the round's ONE catalog `GET`. `live_incarnation` names, for every
+    /// The round's ONE catalog `GET` (spec INV-3). `live_incarnation` names, for every
     /// namespace the catalog admits as `Live`/`Removing`, the ONE incarnation the fold may act on --
     /// `Creating` is excluded, matching `discoverUniverse` (no publication can exist yet). This is what
     /// makes the fold catalog-authoritative rather than LIST-authoritative: the pool-wide ref LIST
@@ -2051,7 +2050,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     /// targets, so the round pays this GET once.
     const CasRefCatalog::Snapshot & catalog_snapshot = walk_plan.catalogCut();
     std::map<String, UInt128> live_incarnation;
-    /// Final review F1: a `Creating` life IS named by the catalog -- `live_incarnation` excludes it
+    /// A `Creating` life IS named by the catalog -- `live_incarnation` excludes it
     /// only because it is not yet WALKABLE (spec §3, no publication can exist), not because the
     /// namespace is unaccounted. `completeCreation` publishes `_ckpt` (step 2) strictly BEFORE the
     /// `Creating -> Live` CAS (step 3), so every ordinary namespace creation has a real window --
@@ -2062,7 +2061,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     /// recreates the exact name and drives `reconcileStaleCreator` -- unbounded in the stalled case.
     for (const NamespaceLifeId & life : walk_plan.lives())
         live_incarnation.emplace(life.ns.string(), life.incarnation);
-    /// Carry the complete cut on the result (review C3) so every later consumer this round --
+    /// Carry the complete cut on the result so every later consumer this round --
     /// `cleanupRefObjects` and terminal-evidence attribution -- retains both the chosen incarnation and
     /// the lifecycle/absence distinction instead of re-reading or reducing the catalog independently.
     result.catalog_cut = catalog_snapshot;
@@ -2126,8 +2125,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     /// a SECOND GET of the SAME key at the SAME (generation, attempt) -- the two reads belong on one row
     /// or the redundancy is invisible. Everything between them is I/O-free (a `resize`, three lambda
     /// DEFINITIONS, and plain assignments), so the duration is honestly the two GETs and their decodes.
-    /// Instrumented, NOT fixed: removing the second read is a behaviour change the follow-up study
-    /// decides, and the `redundant_reads` metric is the evidence it will need.
+    /// Instrumented, NOT fixed: removing the second read is a behaviour change, and the `redundant_reads`
+    /// metric is the evidence for deciding it.
     std::optional<GcPhaseTimer> seal_read_timer;
     seal_read_timer.emplace(phase_sink, "fold_seal_read");
     const std::optional<CasFoldSeal> adopted_seal = readFoldSeal(state.snap_generation, state.snap_attempt);
@@ -3989,7 +3988,7 @@ void Gc::cleanupRefObjects(
     for (const auto & [ns_str, listing] : folded.ref_tables)
     {
         const RootNamespace ns{ns_str};
-        /// Review C3: look up the SAME complete cut the round's walk resolved, never re-resolve
+        /// Look up the SAME complete cut the round's walk resolved, never re-resolve
         /// independently. A fresh read here could see a namespace dropped and recreated since the
         /// walk and delete the successor's objects using predecessor bounds. An absent or `Creating`
         /// row is skipped rather than mapped to a fabricated key.
@@ -4363,7 +4362,7 @@ std::vector<NamespaceLifeId> Gc::discoverUniverse()
     /// from the row that is its own authority for both fields, never from a listed key (which could name
     /// a DEAD incarnation of the same namespace name).
     ///
-    /// The filter itself lives in `CasRefCatalog::liveUniverse` (review Important C) -- fsck's own
+    /// The filter itself lives in `CasRefCatalog::liveUniverse` -- fsck's own
     /// reachability walk needed the identical catalog-authoritative set and is not this class, so the
     /// filter moved to where both can share it rather than grow a second copy that could disagree.
     CasOperation op = store->openRequests().admit();
@@ -4546,7 +4545,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
             }
             if (st.snap_generation > 0)
             {
-                /// THE REFUSAL (spec r9-1). The prior seal is where every hold lives, and a rebuild
+                /// THE REFUSAL. The prior seal is where every hold lives, and a rebuild
                 /// rewrites coverage from owner state -- so with no readable seal it would hand back a
                 /// baseline that LOOKS proven while silently discarding holds it cannot even enumerate.
                 /// The alternative, a "pool-wide hold" on the rebuilt baseline, is not representable:
@@ -4964,11 +4963,11 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// The premise was that a full traversal knows every live blob. It does not. BOTH legs of the
     /// traversal above are listing-driven -- the owner replay reads the ref prefix, the trimmed-but-live
     /// pass reads the manifest prefix -- so a store that omits a durable key from one enumeration hides
-    /// a LIVE owner, and this pass would then condemn the very blob that owner pins. That is
-    /// r5-finding-4: one lying enumeration, and acked data is scheduled for deletion. Hiding is not
+    /// a LIVE owner, and this pass would then condemn the very blob that owner pins: one lying
+    /// enumeration, and acked data is scheduled for deletion. Hiding is not
     /// hypothetical here; it is the observed `0x1430c` shape that made every ref walk arithmetic.
     ///
-    /// THE NAMED RESIDUAL this leaves (Stage-A staging contract, register R4): a blob whose manifest no
+    /// The residual this leaves: a blob whose manifest no
     /// longer exists anywhere is unreclaimable -- nothing can enumerate it safely -- until the
     /// build/upload registry can say which uploads are in flight. It is retention, not loss, and it is
     /// bounded by that registry landing. NO substitute reclamation is added in its place: any cheaper

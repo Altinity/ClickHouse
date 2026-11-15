@@ -641,7 +641,7 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
 
         /// THE §6 SAFETY FLOOR, under the watermark eligibility already established above. The
         /// watermark says the build is retired; the premise says the ref stream can be shown not to
-        /// name this body. A refusal is recorded rather than silent (Constraint 10).
+        /// name this body. A refusal is recorded rather than silent.
         String retain_reason;
         if (!manifestDeletionPremise(view, ManifestKey{listed.key, prefix}, &retain_reason))
         {
@@ -906,7 +906,7 @@ ManifestSweepResult planManifestCursorPage(
         if (catalog_entry)
         {
             /// THE §6 SAFETY FLOOR, the same predicate `sweepNamespace` calls, under the same watermark
-            /// eligibility. A refusal is recorded rather than silent (Constraint 10).
+            /// eligibility. A refusal is recorded rather than silent.
             String retain_reason;
             SweepRetainClass retain_class = SweepRetainClass::None;
             if (!manifestDeletionPremise(view_it->second, ManifestKey{parsed->key, parsed->build_prefix},
