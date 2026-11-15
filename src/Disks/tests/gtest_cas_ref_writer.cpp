@@ -1443,6 +1443,236 @@ TEST(CASRefWriterRecovery, DifferentBytesAtSelectedSnapshotIsCorruptionNotRestar
         << "the corruption must come from decoding the required checkpoint snapshot";
 }
 
+namespace
+{
+
+/// A namespace another server's GC erases while this server's recovery walks it. The erase runs in
+/// `recovery_pre_first_request_hook_for_test`: after admission resolved the life, before the walk's first
+/// request. An erase before the call would let cold write admission mint a new life instead.
+class EraseDuringRecovery
+{
+public:
+    EraseDuringRecovery() : slot(std::make_shared<Slot>()) {}
+
+    PoolConfig config() const
+    {
+        PoolConfig config;
+        config.recovery_pre_first_request_hook_for_test = [shared = slot]
+        {
+            std::function<void()> action;
+            {
+                std::lock_guard lock(shared->mutex);
+                action = std::exchange(shared->action, {});
+            }
+            if (action)
+            {
+                action();
+                shared->fired.store(true);
+            }
+        };
+        return config;
+    }
+
+    /// Runs `action` once, inside the next recovery that reaches its first request.
+    void arm(std::function<void()> action)
+    {
+        std::lock_guard lock(slot->mutex);
+        slot->action = std::move(action);
+        slot->fired.store(false);
+    }
+
+    bool fired() const { return slot->fired.load(); }
+
+private:
+    struct Slot
+    {
+        std::mutex mutex;
+        std::function<void()> action;
+        std::atomic<bool> fired{false};
+    };
+    std::shared_ptr<Slot> slot;
+};
+
+/// A cold, recoverable namespace holding the committed ref `part_1`, written without a pool.
+NamespaceLifeId seedRecoverablePart(const BackendPtr & backend, const Layout & layout, const RootNamespace & ns)
+{
+    const ManifestRef m1 = manifestRef(1, 1, 1);
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 1},
+        {namespaceBirthOp(), publishCommittedOps("part_1", m1)[0]}, std::nullopt});
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 2},
+        {publishCommittedOps("part_1", m1)[1]}, std::nullopt});
+    const NamespaceLifeId life = *lifeIfCatalogedForTest(backend, layout, ns);
+    if (!createRaw(backend, layout.refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
+            .life_epoch = 1,
+            .committed_through = RefTxnId{1, 2},
+            .checkpoint_snapshot_id = std::nullopt,
+            .last_epoch_seal = std::nullopt}, 1)))
+        throw std::runtime_error("test failed to seed the checkpoint");
+    return life;
+}
+
+/// Rewrites the catalog without `ns`'s row, then adds `replacement` if given.
+void rewriteCatalogRow(const BackendPtr & backend, const Layout & layout, const RootNamespace & ns,
+                       const std::optional<CatalogEntry> & replacement)
+{
+    const CasRefCatalog::Snapshot before = readCatalogForTest(backend, layout);
+    RefCatalog next = before.catalog;
+    std::erase_if(next.entries, [&](const CatalogEntry & entry) { return entry.ns == ns; });
+    if (replacement)
+        next.entries.push_back(*replacement);
+    std::sort(next.entries.begin(), next.entries.end(),
+        [](const CatalogEntry & a, const CatalogEntry & b) { return a.ns.string() < b.ns.string(); });
+    if (!before.etag || !replaceForTest(backend, layout.refCatalogKey(), encodeRefCatalog(next), *before.etag))
+        throw std::runtime_error("test failed to rewrite the catalog row");
+}
+
+void deleteCkptForTest(const BackendPtr & backend, const Layout & layout, const NamespaceLifeId & life)
+{
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
+    CasOperation op = requests.admit();
+    (void)op.removeCurrent(layout.refCkptKey(life), Retry::standard());
+}
+
+/// What the janitor leaves of an erased life: no `_log`, no `_snap`, no `_ckpt`.
+void deleteLifeObjectsForTest(const BackendPtr & backend, const Layout & layout, const NamespaceLifeId & life)
+{
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
+    CasOperation op = requests.admit();
+    String cursor;
+    for (;;)
+    {
+        const ListPage page = op.list(layout.namespaceStreamPrefix(life), cursor, 1000, Retry::standard());
+        for (const ListedKey & listed : page.keys)
+            (void)op.removeCurrent(listed.key, Retry::standard());
+        if (page.next_cursor.empty())
+            break;
+        cursor = page.next_cursor;
+    }
+    (void)op.removeCurrent(layout.refCkptKey(life), Retry::standard());
+}
+
+void eraseLifeForTest(const BackendPtr & backend, const Layout & layout, const NamespaceLifeId & life)
+{
+    rewriteCatalogRow(backend, layout, life.ns, std::nullopt);
+    deleteLifeObjectsForTest(backend, layout, life);
+}
+
+void setCatalogRowRemovingForTest(const BackendPtr & backend, const Layout & layout, const NamespaceLifeId & life)
+{
+    rewriteCatalogRow(backend, layout, life.ns, CatalogEntry{
+        .ns = life.ns, .state = NsState::Removing, .incarnation = life.incarnation, .removal_started_round = 1});
+}
+
+}
+
+TEST(CASRefWriterRecovery, LifeErasedUnderTheWalkIsRemovedNotInstalled)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const NamespaceLifeId written = seedRecoverablePart(backend, layout, RootNamespace{"srv1/erased_under_write"});
+    const NamespaceLifeId read = seedRecoverablePart(backend, layout, RootNamespace{"srv1/erased_under_read"});
+
+    {
+        EraseDuringRecovery erase;
+        auto store = openPoolWithConfig(backend, erase.config());
+        erase.arm([&] { eraseLifeForTest(backend, layout, written); });
+        expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(written.ns, "part_1"); });
+        EXPECT_TRUE(erase.fired());
+        EXPECT_FALSE(store->refTableRecoveredForTest(written.ns));
+    }
+    {
+        EraseDuringRecovery erase;
+        auto store = openPoolWithConfig(backend, erase.config());
+        erase.arm([&] { eraseLifeForTest(backend, layout, read); });
+        EXPECT_EQ(store->resolveRef(read.ns, "part_1"), std::nullopt);
+        EXPECT_TRUE(erase.fired());
+        EXPECT_TRUE(store->listRefs(read.ns).empty());
+    }
+}
+
+TEST(CASRefWriterRecovery, AbsentCkptOfAnErasedLifeIsNotCorruption)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const NamespaceLifeId erased = seedRecoverablePart(backend, layout, RootNamespace{"srv1/ckpt_gone_row_gone"});
+    const NamespaceLifeId live = seedRecoverablePart(backend, layout, RootNamespace{"srv1/ckpt_gone_row_live"});
+    EraseDuringRecovery erase;
+    auto store = openPoolWithConfig(backend, erase.config());
+
+    erase.arm([&]
+    {
+        rewriteCatalogRow(backend, layout, erased.ns, std::nullopt);
+        deleteCkptForTest(backend, layout, erased);
+    });
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(erased.ns, "part_1"); });
+    EXPECT_TRUE(erase.fired());
+
+    /// Control: the same missing `_ckpt` under a row that still names the life is corruption.
+    erase.arm([&] { deleteCkptForTest(backend, layout, live); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->dropRef(live.ns, "part_1"); });
+    EXPECT_TRUE(erase.fired());
+}
+
+TEST(CASRefWriterRecovery, CreatingRowIsNotAConfirmation)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const NamespaceLifeId life = seedRecoverablePart(backend, layout, RootNamespace{"srv1/row_back_to_creating"});
+    EraseDuringRecovery erase;
+    auto store = openPoolWithConfig(backend, erase.config());
+    const uint64_t installs_before = store->recoveryInstallCountForTest();
+
+    /// The objects stay, so the walk itself succeeds: only the confirmation can refuse the install.
+    erase.arm([&]
+    {
+        rewriteCatalogRow(backend, layout, life.ns, CatalogEntry{
+            .ns = life.ns, .state = NsState::Creating, .incarnation = life.incarnation,
+            .creator = CreatorFence{.server_root_id = "other", .writer_epoch = 1, .fence_generation = 1}});
+    });
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(life.ns, "part_1"); });
+    EXPECT_TRUE(erase.fired());
+    EXPECT_FALSE(store->refTableRecoveredForTest(life.ns));
+    EXPECT_EQ(store->recoveryInstallCountForTest(), installs_before);
+}
+
+TEST(CASRefWriterRecovery, PresenceProbeOverAnErasedLifeDoesNotThrow)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const NamespaceLifeId erased = seedRecoverablePart(backend, layout, RootNamespace{"srv1/probe_erased"});
+    const NamespaceLifeId reborn = seedRecoverablePart(backend, layout, RootNamespace{"srv1/probe_reborn"});
+    setCatalogRowRemovingForTest(backend, layout, erased);
+    setCatalogRowRemovingForTest(backend, layout, reborn);
+    EraseDuringRecovery erase;
+    auto store = openPoolWithConfig(backend, erase.config());
+
+    erase.arm([&] { eraseLifeForTest(backend, layout, erased); });
+    EXPECT_FALSE(store->namespaceStillLogicallyPresent(erased.ns));
+    EXPECT_TRUE(erase.fired());
+
+    erase.arm([&]
+    {
+        eraseLifeForTest(backend, layout, reborn);
+        rewriteCatalogRow(backend, layout, reborn.ns, CatalogEntry{
+            .ns = reborn.ns, .state = NsState::Live, .incarnation = reborn.incarnation + 1});
+    });
+    EXPECT_TRUE(store->namespaceStillLogicallyPresent(reborn.ns));
+    EXPECT_TRUE(erase.fired());
+}
+
+TEST(CASRefWriterRecovery, ConfirmationCostsOneCatalogReadPerInstall)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const NamespaceLifeId life = seedRecoverablePart(backend, layout, RootNamespace{"srv1/confirm_cost"});
+    auto store = openPool(backend);
+
+    const size_t catalog_reads_before = backend->getCount(layout.refCatalogKey());
+    ASSERT_TRUE(store->resolveRef(life.ns, "part_1").has_value());
+    /// Cold read admission reads the catalog twice; the confirmation after the walk is the third.
+    EXPECT_EQ(backend->getCount(layout.refCatalogKey()) - catalog_reads_before, 3u);
+}
+
 /// ===================================================================================
 /// Append lane: request cost + batching (spec §Common Mutation Path / §Local Batching Queue)
 /// ===================================================================================

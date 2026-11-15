@@ -14,6 +14,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <thread>
 
 /// Namespace files are keyed by an opaque LIFE, not by its name: `cas/ns/state/<life_id>/_files/<name>`
@@ -575,6 +576,28 @@ bool runRoundsUntilCheckpointSwept(Gc & gc, CountingBackend & backend, const Lay
     return !op.head(layout.refCkptKey(life), Retry::standard());
 }
 
+/// Every key under `life`'s stream and state prefixes.
+std::set<String> lifeKeys(CountingBackend & backend, const Layout & layout, const NamespaceLifeId & life)
+{
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    std::set<String> keys;
+    for (const String & prefix : {layout.namespaceStreamPrefix(life), layout.namespaceStatePrefix(life)})
+    {
+        String cursor;
+        for (;;)
+        {
+            const ListPage page = op.list(prefix, cursor, 1000, Retry::standard());
+            for (const ListedKey & listed : page.keys)
+                keys.insert(listed.key);
+            if (page.next_cursor.empty())
+                break;
+            cursor = page.next_cursor;
+        }
+    }
+    return keys;
+}
+
 }
 
 /// A presence probe admits the `Removing` row after the local drain announced it and before the erase,
@@ -627,9 +650,8 @@ TEST(CASNsFileIncarnation, ProbeAdmittedBetweenTheAnnouncementAndTheEraseIsDetac
 }
 
 /// The same parked probe when GC runs on another server: nothing is announced or invalidated here. Its
-/// recovery fails on the swept checkpoint, and `namespaceLife` must still detach the resident runtime
-/// once the catalog no longer names its life.
-TEST(CASNsFileIncarnation, NamespaceLifeDetachesAnUnrecoverableResidentLifeWhoseRowARemoteDrainErased)
+/// recovery finds the checkpoint swept and the row gone: the probe answers absent and detaches the runtime.
+TEST(CASNsFileIncarnation, PresenceProbeAnswersAbsentAndDetachesALifeWhoseRowARemoteDrainErased)
 {
     auto backend = std::make_shared<ParkedAdmissionBackend>();
     const RootNamespace ns{kNsString};
@@ -646,7 +668,8 @@ TEST(CASNsFileIncarnation, NamespaceLifeDetachesAnUnrecoverableResidentLifeWhose
     ASSERT_EQ(owner->refTableRuntimeIdentityForTest(ns), 0u);
 
     auto parked = backend->parked.get_future();
-    ParkedReader probe(*backend, [&] { (void)owner->namespaceStillLogicallyPresent(ns); });
+    std::optional<bool> present;
+    ParkedReader probe(*backend, [&] { present = owner->namespaceStillLogicallyPresent(ns); });
     ASSERT_EQ(parked.wait_for(std::chrono::seconds(60)), std::future_status::ready) << "the probe never reached its recovery";
     ASSERT_EQ(owner->refTableLifeForTest(ns), std::optional<NamespaceLifeId>{removed_life});
 
@@ -655,12 +678,15 @@ TEST(CASNsFileIncarnation, NamespaceLifeDetachesAnUnrecoverableResidentLifeWhose
     CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
     CasOperation catalog_op = catalog_requests.admit();
     ASSERT_FALSE(CasRefCatalog::lifeIfCataloged(catalog_op, owner->layout(), ns)) << "the leader must drain the row";
+    const std::set<String> keys_after_sweep = lifeKeys(*backend, owner->layout(), removed_life);
 
     backend->releaseOnce();
     probe.join();
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { std::rethrow_exception(probe.error); });
-    ASSERT_EQ(owner->refTableLifeForTest(ns), std::optional<NamespaceLifeId>{removed_life})
-        << "the unrecoverable runtime stays resident until a writer finds its row gone";
+    EXPECT_FALSE(probe.error) << "a probe over an erased life must not throw";
+    EXPECT_EQ(present, std::optional<bool>{false});
+    ASSERT_EQ(owner->refTableLifeForTest(ns), std::nullopt) << "the recovery detaches the removed life";
+    EXPECT_EQ(lifeKeys(*backend, owner->layout(), removed_life), keys_after_sweep)
+        << "the probe's recovery wrote into the erased life";
 
     const NamespaceLifeId reborn = owner->namespaceLife(ns);
     EXPECT_NE(reborn.incarnation, removed_life.incarnation);
@@ -727,13 +753,16 @@ TEST(CASNsFileIncarnation, ColdWriterCannotWriteIntoALifeFullySweptByARemoteLead
     leader->dropNamespace(ns);
     Gc gc(leader, kGcId);
     ASSERT_TRUE(runRoundsUntilCheckpointSwept(gc, *backend, leader->layout(), swept_life));
+    const std::set<String> keys_after_sweep = lifeKeys(*backend, owner->layout(), swept_life);
 
     backend->releaseOnce();
     writer.join();
     EXPECT_EQ(written_life, std::nullopt) << "a write was acknowledged into the swept life";
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { std::rethrow_exception(writer.error); });
-    EXPECT_EQ(owner->refTableLifeForTest(ns), std::optional<NamespaceLifeId>{swept_life})
-        << "the runtime of the swept life was published and stays resident";
+    ASSERT_TRUE(writer.error) << "the writer must be refused";
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { std::rethrow_exception(writer.error); });
+    EXPECT_EQ(owner->refTableLifeForTest(ns), std::nullopt) << "the recovery detaches the swept life";
+    EXPECT_EQ(lifeKeys(*backend, owner->layout(), swept_life), keys_after_sweep)
+        << "an object was written into the swept life";
     CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
     CasOperation op = requests.admit();
     EXPECT_FALSE(op.head(owner->layout().namespaceFileKey(swept_life, kFile), Retry::standard()));

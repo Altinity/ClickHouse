@@ -78,6 +78,10 @@ std::string_view refLaneStateName(RefLaneState state);
 /// consumer that treats `No` as knowledge; only `Yes` is gated on the fence.
 enum class ConfirmAnswer : uint8_t { Yes, No, Unknown };
 
+/// How a ref-table recovery ended without an exception. `LifeRemoved`: the catalog no longer names the
+/// runtime's exact life after the walk; nothing was installed and the runtime is detached.
+enum class RefRecoveryOutcome : uint8_t { Recovered, LifeRemoved };
+
 /// Coordinates the writer-side ref-log and ref-table protocol for all namespaces in one mounted pool.
 /// It owns the recovered whole-table cache, the flat-combining append lane and its unresolved-`PUT`
 /// wedge, snapshot publication, stale-precommit cleanup, cache-budget eviction, and remount/shutdown
@@ -1158,13 +1162,21 @@ private:
     DropNamespaceStats dropNamespaceImpl(
         const RootNamespace & ns, const std::optional<UInt128> & expected_incarnation);
 
-    /// Lazily recovers `ns` per spec §4: catalog life resolution (first table-open only) -> `_ckpt` ->
-    /// exact-key base snapshot -> ARITHMETIC tail -> seal CAS-walk -> `_ckpt` CAS -> install. It does not
-    /// expose the table as recovered until every dead epoch it discovered is durably closed; concurrent
-    /// callers serialize across the whole unlocked I/O window through `recovery_in_progress`.
-    void ensureRefTableRecovered(
-        const RootNamespace & ns, RefTableRuntime & rt,
-        const std::optional<DetachedStopToken> & token = std::nullopt);
+    /// Lazily recovers `rt` for the life its admission resolved: `_ckpt` -> exact base snapshot ->
+    /// `walkRefChain` over the tail, sealing dead epochs -> one catalog read that confirms `rt.life` ->
+    /// install. It does not expose the table as recovered until every dead epoch it
+    /// discovered is durably closed; concurrent callers serialize across the whole unlocked I/O window
+    /// through `recovery_in_progress`. A walk that raises `CORRUPTED_DATA` is confirmed the same way
+    /// before the error leaves. When the catalog no longer names `rt.life` as `Live` or `Removing`, the
+    /// walk's result or error is dropped, nothing is installed, the runtime is detached and the call
+    /// returns `LifeRemoved`.
+    [[nodiscard]] RefRecoveryOutcome ensureRefTableRecovered(
+        const RootNamespace & ns, RefTableRuntime & rt, const std::optional<DetachedStopToken> & token = {});
+
+    /// One catalog read on `admitted_generation`: true when a `Live` or `Removing` row carries exactly
+    /// `rt.life`. Otherwise detaches the runtime through `invalidateRemovedCatalogLife` and returns false.
+    /// The caller must not hold `rt.state_mutex`.
+    bool confirmRecoveredLifeOrDetach(RefTableRuntime & rt, uint64_t admitted_generation);
 
     /// Stage B (spec INV-3, §3): resolves `ns`'s catalog life -- ONCE per table-open, from inside
     /// `ensureRefTableRecovered`'s transient-retry envelope, never from a per-write path (a per-write
