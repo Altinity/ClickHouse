@@ -250,17 +250,15 @@ TEST(CASGCArithmeticIntake, ChainedEmptyEpochSealsBothConsumedInOneRound)
     EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(1)), 1);
     EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(2)), 1);
 
-    /// THE ASSERTION THAT MAKES THIS TEST ABOUT THE BACK-CHAIN. Every check above is also satisfied by
-    /// an id-ordered walk over the listed keys — which is why this case passed before the change. Two
-    /// crossings can only happen by consuming `seal{1,2}` and then `seal{2,1}`, and `{2,1}` is reachable
-    /// only through `{3,1}`'s `prev_epoch_seal`, since the hint never mentions it.
+    /// THE ASSERTION THAT MAKES THIS TEST ABOUT THE CHAIN. Every check above is also satisfied by an
+    /// id-ordered walk over the listed keys. Two crossings can only happen by consuming `seal{1,2}` and
+    /// then `seal{2,1}`, and the hint never mentions `{2,1}`: only the seal's successor leads there.
     EXPECT_EQ(intake.at("epoch_crossings"), 2u)
         << "the walk must cross TWICE, through a hidden epoch it can only reach by the seal chain";
     EXPECT_EQ(intake.at("logs_accounted"), intake.at("logs_applied"));
     EXPECT_EQ(intake.at("logs_applied"), 4u) << "two records and two seals, all applied";
-    /// The checkpoint names the complete, authoritative frontier, so the bounded walk has no absent
-    /// probes to perform. The hidden epoch remains reachable only through the seal chain.
-    EXPECT_EQ(intake.at("absent_probes"), 0u);
+    /// One absent probe, past `{3,1}`, proves the frontier.
+    EXPECT_EQ(intake.at("absent_probes"), 1u);
 }
 
 /// A round that ends ON a seal (nothing above it yet) leaves the cursor there. The NEXT round must
@@ -403,14 +401,9 @@ TEST(CASGCArithmeticIntake, CrossingFromANonSealRecordIsRefusedEvenWhenTheChainM
         << "the record beyond the unsealed boundary must NOT be folded";
 }
 
-/// The crossing reads the epoch-start record to prove the chain, and the walk then reads it again to
-/// fold it. A record that answers the first read and not the second would make the next iteration
-/// re-derive the SAME crossing from the same unchanged cursor and resolve to the same position -- an
-/// infinite spin inside one namespace's walk. The strict-progress guard turns that into a hold.
-///
-/// The fixture is the only shape that reaches it: a key that alternates present/absent across reads, so
-/// `crossFromSeal` keeps succeeding while the walk's own GET keeps failing.
-TEST(CASGCArithmeticIntake, EpochStartThatAnswersOnlyEveryOtherReadHoldsInsteadOfSpinning)
+/// The walk reads each key once and takes that answer as final. An epoch-start record that answers its
+/// first read and not the next is folded on the first answer; a walk that read it again would stop at it.
+TEST(CASGCArithmeticIntake, EpochStartThatAnswersOnlyEveryOtherReadIsFoldedOnItsFirstAnswer)
 {
     /// Answers `flaky` on odd-numbered reads and 404s on even ones. Nothing else is disturbed.
     class AlternatingGetBackend : public InMemoryBackend
@@ -437,35 +430,28 @@ TEST(CASGCArithmeticIntake, EpochStartThatAnswersOnlyEveryOtherReadHoldsInsteadO
     writeSealAt(*backend, layout, ns, RefTxnId{1, 2});
     publishAt(*backend, layout, ns, RefTxnId{2, 1}, "ref_2", 2, DB::UInt128(2),
               /*birth=*/false, /*prev_epoch_seal=*/RefTxnId{1, 2});
-    /// A THIRD epoch is what keeps the unstable position from reading as a frontier: without a witness
-    /// strictly above it, an absent `{2,1}` is just "the namespace ends here" and the walk stops
-    /// normally. With `{3,1}` listed, the walk must keep trying to cross -- and the chain from `{3,1}`
-    /// leads back to `{2,1}` every time, which is the spin.
+    writeSealAt(*backend, layout, ns, RefTxnId{2, 2});
     publishAt(*backend, layout, ns, RefTxnId{3, 1}, "ref_3", 3, DB::UInt128(3),
-              /*birth=*/false, /*prev_epoch_seal=*/RefTxnId{2, 1});
+              /*birth=*/false, /*prev_epoch_seal=*/RefTxnId{2, 2});
     writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{3, 1},
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = RefTxnId{2, 1},
+        .last_epoch_seal = RefTxnId{2, 2},
     });
 
     /// Arm only after seeding, so the fixture's own writes are undisturbed and the read counter starts
-    /// at the round's first read of this key (`crossFromSeal`'s, which must succeed).
+    /// at the round's first read of this key.
     backend->flaky = layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{2, 1});
 
     Gc gc(store, kGc);
-    ASSERT_TRUE(gc.runRegularRound().acquired_lease);   /// must RETURN -- the spin is the failure mode
-    ASSERT_GE(backend->reads, 3u)
-        << "the crossing must have re-proved the same position after the walk failed to read it; "
-           "fewer reads means the guard was never reached";
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    EXPECT_EQ(backend->reads, 1u) << "the round reads the unstable record exactly once";
 
-    EXPECT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{1, 2}))
-        << "the cursor stops on the seal it consumed and never enters the unstable epoch";
-    EXPECT_EQ(classificationOf(*backend, layout, ns), CoverageClass::Clamped);
-    EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(2)), 0);
-    EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(3)), 0)
-        << "nothing above the unstable position may be folded either";
+    EXPECT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{3, 1}));
+    EXPECT_NE(classificationOf(*backend, layout, ns), CoverageClass::Clamped);
+    EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(2)), 1) << "the record was folded on its first answer";
+    EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(3)), 1);
 }
 
 /// ===================== A PER-NAMESPACE FAILURE IS NOT A ROUND FAILURE =====================
