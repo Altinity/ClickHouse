@@ -934,7 +934,7 @@ void runExpiredMountFenceOutScenario(const PoolConfig & config)
     const String srid2 = "stale-server";
     CasRequests renewer_requests = openRequestsForTest(backend);
     MountLeaseRenewer srid2_renewer(renewer_requests, renewer_requests, layout, srid2, DB::UInt128(0x2222),
-        /*writer_epoch=*/1,
+        /*writer_epoch=*/1, /*last_unclean_epoch=*/0,
         std::chrono::milliseconds(100), [] { return 1000u; }, [] { return 0u; }, {},
         std::chrono::milliseconds(0), [] { return 0u; });
     srid2_renewer.start();
@@ -1077,7 +1077,7 @@ void runSlowWalkSightingScenario(SightingCall sighting_call)
     /// Claims once and never renews: a live-shaped body whose token never changes.
     CasRequests renewer_requests = openRequestsForTest(backend);
     MountLeaseRenewer srid2_renewer(renewer_requests, renewer_requests, layout, srid2, DB::UInt128(0x2222),
-        /*writer_epoch=*/1,
+        /*writer_epoch=*/1, /*last_unclean_epoch=*/0,
         std::chrono::milliseconds(100), [] { return 1000u; }, [] { return 0u; }, {},
         std::chrono::milliseconds(0), [] { return 0u; });
     srid2_renewer.start();
@@ -1134,7 +1134,7 @@ void runLongerDeclaredLeaseScenario(SightingCall early_call)
     const String holder_srid = "long-lease-server";
     CasRequests renewer_requests = openRequestsForTest(backend);
     MountLeaseRenewer holder(renewer_requests, renewer_requests, layout, holder_srid, DB::UInt128(0x3333),
-        /*writer_epoch=*/1, std::chrono::milliseconds(60'000), [] { return 1000u; }, [] { return 0u; }, {},
+        /*writer_epoch=*/1, /*last_unclean_epoch=*/0, std::chrono::milliseconds(60'000), [] { return 1000u; }, [] { return 0u; }, {},
         std::chrono::milliseconds(0), [] { return 0u; });
     holder.start();
     const auto holder_fenced = [&]
@@ -1225,7 +1225,7 @@ TEST(CASGCAckFloor, DefaultMonoClockTracksPoolsInjectedBootClockNotWallClock)
     const String srid2 = "stale-server";
     CasRequests renewer_requests = openRequestsForTest(backend);
     MountLeaseRenewer srid2_renewer(renewer_requests, renewer_requests, layout, srid2, DB::UInt128(0x2222),
-        /*writer_epoch=*/1,
+        /*writer_epoch=*/1, /*last_unclean_epoch=*/0,
         std::chrono::milliseconds(100), [] { return 1000u; },
         [fake_boot]
         {
@@ -1715,7 +1715,7 @@ TEST(CASGCLeaseMismatch, RoundWarnsOnceAboutAHolderWithADifferentLease)
     const String holder_srid = "short-lease-server";
     CasRequests renewer_requests = openRequestsForTest(backend);
     MountLeaseRenewer holder(renewer_requests, renewer_requests, layout, holder_srid, DB::UInt128(0x2222),
-        /*writer_epoch=*/1,
+        /*writer_epoch=*/1, /*last_unclean_epoch=*/0,
         std::chrono::milliseconds(100), [] { return 1000u; }, [] { return 0u; }, {},
         std::chrono::milliseconds(0), [] { return 0u; });
     holder.start();

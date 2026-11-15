@@ -316,6 +316,14 @@ public:
     void rethrow() const override { throw *this; } // NOLINT
 };
 
+/// The `last_unclean_epoch` a claim at `claimer_epoch` writes. `predecessor` is the body the claim replaces,
+/// nullopt when the slot was absent. No slot: `claimer_epoch - 1`. A clean farewell that carries the field
+/// passes its value on. Any other end, and a body without the field, yields the predecessor's `writer_epoch`.
+uint64_t lastUncleanEpochAfter(const std::optional<MountLease> & predecessor, MountPriorState prior, uint64_t claimer_epoch);
+
+/// A fresh mount-lease body for `(uuid, epoch)` with the given `seq`, stamped from `now_ms`.
+MountLease makeMountBody(UInt128 uuid, uint64_t epoch, uint64_t seq, uint64_t now_ms, uint64_t ttl_ms, uint64_t last_unclean_epoch);
+
 /// A caller never claims twice with one `writer_epoch`; a retry allocates a new one. That is why a
 /// body of our own `(uuid, epoch)` found in the slot belongs to another process.
 /// `proven_dead_incarnation`: the incarnation of a same-uuid, different-epoch lease that the CALLER
@@ -633,8 +641,8 @@ public:
     MountLeaseRenewer(
         CasRequests & mount_requests_, CasRequests & open_requests_, const Layout & layout_,
         const String & srid_, UInt128 server_uuid_,
-        uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,
-        std::function<uint64_t()> min_active_build_sequence_fn_,
+        uint64_t writer_epoch_, uint64_t last_unclean_epoch_, std::chrono::milliseconds ttl_,
+        std::function<uint64_t()> now_ms_fn_, std::function<uint64_t()> min_active_build_sequence_fn_,
         CasEventSink event_sink_ = {},
         std::chrono::milliseconds lease_safety_margin_ = std::chrono::milliseconds(2000),
         /// boot-domain clock for the on_renew_ok anchor; empty = real CLOCK_BOOTTIME. Injectable for
@@ -688,6 +696,8 @@ private:
     String srid;
     UInt128 server_uuid;
     uint64_t writer_epoch;
+    /// Written into every body this renewer encodes, the farewell included.
+    uint64_t last_unclean_epoch;
     std::chrono::milliseconds ttl;
     std::function<uint64_t()> now_ms_fn;
     std::function<uint64_t()> min_active_build_sequence_fn;

@@ -376,7 +376,7 @@ TEST(CASEvent, DeepReentrancyPreservesDeterministicPhysicalAttemptTruth)
             *layouts[index],
             server_root_ids[index],
             UInt128(index + 1),
-            7,
+            7, /*last_unclean_epoch=*/0,
             std::chrono::milliseconds(1000),
             [&] { return wall_ms; },
             [] { return uint64_t{0}; },

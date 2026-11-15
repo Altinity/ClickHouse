@@ -314,9 +314,20 @@ void CasMountRuntime::setProcessEpoch(uint64_t v, std::memory_order order)
     process_epoch.store(v, order);
 }
 
-void CasMountRuntime::setLiveWriterEpoch(uint64_t v)
+void CasMountRuntime::setLiveWriterEpoch(uint64_t writer_epoch, uint64_t last_unclean_epoch)
 {
-    live_writer_epoch.store(v, std::memory_order_release);
+    /// The marker goes first: a reader that sees the new epoch then sees its marker. The reverse order would let a
+    /// new epoch pair with the old, lower marker, and recovery would skip a tombstone it needs.
+    live_last_unclean_epoch.store(last_unclean_epoch, std::memory_order_release);
+    live_writer_epoch.store(writer_epoch, std::memory_order_release);
+}
+
+LiveEpochPair CasMountRuntime::liveEpochPair() const
+{
+    /// The epoch first, the mirror of `setLiveWriterEpoch`. An old epoch can pair with a newer, higher marker, which
+    /// costs only a tombstone write.
+    const uint64_t writer_epoch = live_writer_epoch.load(std::memory_order_acquire);
+    return LiveEpochPair{.writer_epoch = writer_epoch, .last_unclean_epoch = live_last_unclean_epoch.load(std::memory_order_acquire)};
 }
 
 CasMountRuntime::DriverLease::DriverLease(CasMountRuntime & runtime_, RenewalDriverState active_)
@@ -422,10 +433,11 @@ CasMountRuntime::AdmittedRenewerCall CasMountRuntime::admitRenewerCall(
 void CasMountRuntime::installRenewer(
     UInt128 our_uuid,
     uint64_t writer_epoch,
+    uint64_t last_unclean_epoch,
     const std::function<uint64_t()> & now_ms)
 {
     auto replacement = std::make_unique<MountLeaseRenewer>(
-        mount_requests, lease_requests, layout, server_root_id, our_uuid, writer_epoch,
+        mount_requests, lease_requests, layout, server_root_id, our_uuid, writer_epoch, last_unclean_epoch,
         config.mount_lease_ttl_ms, now_ms,
         [this] { return minActive(); },
         [this](CasEvent e) { emitEvent(std::move(e)); },

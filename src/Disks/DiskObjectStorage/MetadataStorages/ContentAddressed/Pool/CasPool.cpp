@@ -747,6 +747,8 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     /// (the last iteration's `claim` before `break` -- `claim` itself is loop-scoped). Read after the
     /// loop to classify (and log) an unclean reclaim.
     MountPriorState claimed_prior = MountPriorState::None;
+    /// The `last_unclean_epoch` the adopted claim wrote, published with the epoch below.
+    uint64_t claimed_last_unclean_epoch = 0;
     /// The pre-I/O boot-clock instant of the claim attempt FINALLY adopted below -- survives the
     /// `break` so the arm below can detect a claim that consumed the lease TTL and re-anchor before
     /// arming (rev.4 Phase B, round-3 finding 2).
@@ -844,6 +846,7 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
             throw Exception(ErrorCodes::ABORTED, "{}", mountDoubleStartMessage(srid, claim.body));
         }
         claimed_prior = claim.prior;
+        claimed_last_unclean_epoch = claim.body.value().last_unclean_epoch.value();
 
         /// The owner may have moved since the claim began: a tombstone, a rollback or a rejoin. Nothing
         /// below runs under an owner this process did not start under.
@@ -856,7 +859,7 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
         /// -- which ADOPTS that very (uuid, epoch) slot rather than self-tripping the double-start guard --
         /// AND wires its `minActive` build-watermark reader, its event sink, and the fence-coupling
         /// runtime-owned synchronous renewal driver, all captured on `mount_runtime`.
-        store->mount_runtime.installRenewer(our_uuid, writer_epoch, now_ms);
+        store->mount_runtime.installRenewer(our_uuid, writer_epoch, claimed_last_unclean_epoch, now_ms);
         try
         {
             claim_anchor_boot_ms = store->mount_runtime.startRenewer();
@@ -962,7 +965,7 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
             "fence could be armed; re-writing the lease first", srid, ttl_ms_u);
         claim_anchor_boot_ms = store->mount_runtime.renewRenewerForStartupOnce();
     }
-    store->mount_runtime.setLiveWriterEpoch(writer_epoch);
+    store->mount_runtime.setLiveWriterEpoch(writer_epoch, claimed_last_unclean_epoch);
     store->armMountFence(
         our_uuid,
         writer_epoch,
@@ -1617,7 +1620,8 @@ bool Pool::tryRemountOnce()
         /// The persistent renewal worker is parked before this callback is entered, so renewer
         /// replacement cannot race any synchronous lease operation.
         step = "renewer_install";
-        mount_runtime.installRenewer(our_uuid, writer_epoch, now_ms);
+        const uint64_t last_unclean_epoch = claim.body.value().last_unclean_epoch.value();
+        mount_runtime.installRenewer(our_uuid, writer_epoch, last_unclean_epoch, now_ms);
         step = "renewer_start";
         uint64_t remount_anchor_boot_ms = mount_runtime.startRenewer();
 
@@ -1629,7 +1633,7 @@ bool Pool::tryRemountOnce()
         ///    where the gate is open while the epoch is still stale. Keep `process_epoch` (the identity
         ///    accessors) equal to it.
         step = "publish_writer_epoch";
-        mount_runtime.setLiveWriterEpoch(writer_epoch);
+        mount_runtime.setLiveWriterEpoch(writer_epoch, last_unclean_epoch);
         mount_runtime.setProcessEpoch(writer_epoch, std::memory_order_release);
         /// 2. CANCEL OR JOIN every in-flight ref-table recovery, and BLOCK here until none is left (spec
         ///    §3: "self-remount cancels or waits out recovery before rearming"). A recovery admitted under

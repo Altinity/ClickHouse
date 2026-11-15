@@ -371,6 +371,9 @@ public:
     /// The `writer_epoch` of the live mount incarnation. Bumped by `tryRemountOnce` (self-remount after a
     /// GC fence-out) — a `PartWriteTxn` minted under an older epoch fails closed on its next step.
     uint64_t liveWriterEpoch() const { return live_writer_epoch.load(std::memory_order_acquire); }
+    /// The live epoch with its claim's `last_unclean_epoch`. Pairs a published epoch with its own marker or a
+    /// newer one, never with an older one.
+    LiveEpochPair liveEpochPair() const;
 
     /// ---- build registry ----
     /// Allocate a strictly-increasing `build_seq` and add it to the active set. A sequence is never
@@ -391,11 +394,12 @@ public:
     /// Set `process_epoch` to the durable `writer_epoch`. The caller supplies the memory order because
     /// the initial writable claim and a later self-remount have different publication requirements.
     void setProcessEpoch(uint64_t v, std::memory_order order);
-    /// Publish the live-incarnation `live_writer_epoch` with release ordering.
-    void setLiveWriterEpoch(uint64_t v);
+    /// Publish the live incarnation: the marker first, then the epoch, both with release ordering.
+    void setLiveWriterEpoch(uint64_t writer_epoch, uint64_t last_unclean_epoch);
 
     /// ---- mount-lease renewer and persistent workers ----
-    void installRenewer(UInt128 our_uuid, uint64_t writer_epoch, const std::function<uint64_t()> & now_ms);
+    void installRenewer(UInt128 our_uuid, uint64_t writer_epoch, uint64_t last_unclean_epoch,
+                        const std::function<uint64_t()> & now_ms);
     uint64_t startRenewer();
     uint64_t renewRenewerForStartupOnce();
     uint64_t renewRenewerForRemountOnce();
@@ -531,6 +535,9 @@ private:
     std::unique_ptr<MountLeaseRenewer> mount_renewer;
 
     std::atomic<uint64_t> live_writer_epoch{0};
+    /// Two atomics rather than a lock, so the append path never waits: see `setLiveWriterEpoch` and `liveEpochPair`
+    /// for the order that keeps a new epoch from pairing with an old marker.
+    std::atomic<uint64_t> live_last_unclean_epoch{0};
 
     /// One mutex/condition pair owns driver admission, worker lifecycle, cadence, and the remount
     /// generation latch, and terminal predicates paired with `driver_cv`. It is never held across

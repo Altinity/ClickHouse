@@ -899,10 +899,18 @@ uint64_t allocateWriterEpoch(
     return allocated;
 }
 
-namespace
+uint64_t lastUncleanEpochAfter(const std::optional<MountLease> & predecessor, MountPriorState prior, uint64_t claimer_epoch)
 {
-/// Build a fresh mount-lease body for (uuid, epoch) with the given seq, stamped from `now_ms`.
-MountLease makeMountBody(UInt128 uuid, uint64_t epoch, uint64_t seq, uint64_t now_ms, uint64_t ttl_ms)
+    /// Without a slot nothing tells which earlier epochs ended cleanly, so every one of them counts as unclean.
+    if (!predecessor)
+        return claimer_epoch - 1;
+    if (prior == MountPriorState::Clean && predecessor->last_unclean_epoch)
+        return *predecessor->last_unclean_epoch;
+    return predecessor->writer_epoch;
+}
+
+MountLease makeMountBody(
+    UInt128 uuid, uint64_t epoch, uint64_t seq, uint64_t now_ms, uint64_t ttl_ms, uint64_t last_unclean_epoch)
 {
     return MountLease{
         .server_uuid = uuid,
@@ -913,8 +921,12 @@ MountLease makeMountBody(UInt128 uuid, uint64_t epoch, uint64_t seq, uint64_t no
         .seq = seq,
         .expires_at_ms = now_ms + ttl_ms,
         .write_attempt_id = newMountWriteAttemptId(),
+        .last_unclean_epoch = last_unclean_epoch,
     };
 }
+
+namespace
+{
 
 /// Mirrors `mountDoubleStartMessage`'s identity fields. The mount-audit sink is not yet installed
 /// during `Pool::open`, so at first-open these refusal messages are the only holder-identity
@@ -1001,7 +1013,8 @@ MountClaimResult claimMount(
     /// Absent → fresh claim.
     if (!got)
     {
-        const MountLease body = makeMountBody(our_uuid, our_epoch, /*seq=*/ 1, now_ms, ttl_ms);
+        const MountLease body = makeMountBody(our_uuid, our_epoch, /*seq=*/ 1, now_ms, ttl_ms,
+                                              lastUncleanEpochAfter(std::nullopt, MountPriorState::None, our_epoch));
         if (const std::optional<Observation> raced
                 = conflictOrThrow(op.create(key, encodeMountLease(body), Retry::standard()),
                                   fmt::format("CAS mount slot claim of '{}'", key)))
@@ -1086,7 +1099,12 @@ MountClaimResult claimMount(
     const bool unsafe_authorized = unsafe_reclaim_authorization && *unsafe_reclaim_authorization == got->etag;
     if (existing.gc_fenced || clean_marker || proven_dead || unsafe_authorized)
     {
-        const MountLease body = makeMountBody(our_uuid, our_epoch, existing.seq + 1, now_ms, ttl_ms);
+        const MountPriorState prior = existing.gc_fenced ? MountPriorState::Fenced
+                                     : clean_marker       ? MountPriorState::Clean
+                                     : proven_dead        ? MountPriorState::UncleanObserved
+                                                           : MountPriorState::UncleanUnsafe;
+        const MountLease body = makeMountBody(our_uuid, our_epoch, existing.seq + 1, now_ms, ttl_ms,
+                                              lastUncleanEpochAfter(existing, prior, our_epoch));
         if (const std::optional<Observation> raced
                 = conflictOrThrow(op.replace(key, encodeMountLease(body), got->etag, Retry::standard()),
                                   fmt::format("CAS mount slot reclaim of '{}'", key)))
@@ -1094,10 +1112,6 @@ MountClaimResult claimMount(
             /// reclaim. Fail closed, and report what the write's resolve read observed rather than
             /// `got->etag`, which that mismatch just proved stale.
             return racedDoubleStart(*raced);
-        const MountPriorState prior = existing.gc_fenced ? MountPriorState::Fenced
-                                     : clean_marker       ? MountPriorState::Clean
-                                     : proven_dead        ? MountPriorState::UncleanObserved
-                                                           : MountPriorState::UncleanUnsafe;
         emitMountEvent(sink, CasEventType::MountClaim, srid, "reclaim", &existing,
             existing.server_uuid != our_uuid ? "terminal body of another server_uuid, the owner is ours — reclaimed"
             : existing.gc_fenced ? "same server_uuid, different writer_epoch, GC-fenced — reclaimed"
@@ -1635,8 +1649,8 @@ constexpr uint64_t kFarewellSlackMs = 2'000;
 MountLeaseRenewer::MountLeaseRenewer(
     CasRequests & mount_requests_, CasRequests & open_requests_, const Layout & layout_,
     const String & srid_, UInt128 server_uuid_,
-    uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,
-    std::function<uint64_t()> min_active_build_sequence_fn_,
+    uint64_t writer_epoch_, uint64_t last_unclean_epoch_, std::chrono::milliseconds ttl_,
+    std::function<uint64_t()> now_ms_fn_, std::function<uint64_t()> min_active_build_sequence_fn_,
     CasEventSink event_sink_,
     std::chrono::milliseconds lease_safety_margin_,
     std::function<uint64_t()> boot_ms_fn_)
@@ -1646,6 +1660,7 @@ MountLeaseRenewer::MountLeaseRenewer(
     , srid(srid_)
     , server_uuid(server_uuid_)
     , writer_epoch(writer_epoch_)
+    , last_unclean_epoch(last_unclean_epoch_)
     , ttl(ttl_)
     , now_ms_fn(std::move(now_ms_fn_))
     , min_active_build_sequence_fn(std::move(min_active_build_sequence_fn_))
@@ -1703,6 +1718,7 @@ String MountLeaseRenewer::encodeBody(
         .expires_at_ms = expires_at_ms,
         .min_active_build_sequence = min_active_build_sequence,
         .write_attempt_id = write_attempt_id,
+        .last_unclean_epoch = last_unclean_epoch,
     });
 }
 
@@ -2181,6 +2197,7 @@ void MountLeaseRenewer::terminate(CasOperation & op)
         .expires_at_ms = wall_ms,
         .min_active_build_sequence = std::numeric_limits<uint64_t>::max(),
         .write_attempt_id = newMountWriteAttemptId(),
+        .last_unclean_epoch = last_unclean_epoch,
     });
     /// The farewell is admitted on `open_requests` (see `release`, which calls this via `open_requests.admit()`),
     /// so its own reservation -- attempt plus the read that settles it, `reservedFor(0, 2)` in

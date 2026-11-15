@@ -833,13 +833,17 @@ public:
     /// The writer_epoch of the LIVE mount incarnation. Bumped by `tryRemountOnce` (self-remount
     /// after a GC fence-out) — a `PartWriteTxn` minted under an older epoch fails closed on its next step.
     uint64_t liveWriterEpoch() const { return mount_runtime.liveWriterEpoch(); }
+    LiveEpochPair liveEpochPairForTest() const { return mount_runtime.liveEpochPair(); }
 
     /// Test seam: publish a new live-incarnation writer epoch WITHOUT running a self-remount -- the
     /// epoch half of what `tryRemountOnce` does alongside its fence re-arm. Lets a test drive an epoch
     /// transition's WRITER-side effects (INV-2's `prev_epoch_seal` on the first append of the new epoch)
     /// without the claim machinery and, deliberately, without `quiesceRefTablesForRemount`, so the
     /// cached ref runtimes survive the transition and the effect under test is isolated from recovery.
-    void setLiveWriterEpochForTest(uint64_t writer_epoch) { mount_runtime.setLiveWriterEpoch(writer_epoch); }
+    void setLiveWriterEpochForTest(uint64_t writer_epoch)
+    {
+        mount_runtime.setLiveWriterEpoch(writer_epoch, mount_runtime.liveEpochPair().last_unclean_epoch);
+    }
 
     /// Self-remount after a GC fence-out (liveness counterpart of the fence-out safety rule): the
     /// OLD incarnation may never write again (the renewer never re-mints), but a FRESH incarnation —
