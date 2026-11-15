@@ -1801,7 +1801,7 @@ Gc::CheckpointWitnesses Gc::readCheckpointWitnesses(GcReadAhead & reads,
             out.witnesses.emplace(ns_str, *ckpt.checkpoint_snapshot_id);
         if (ckpt.life_epoch)
             out.life_epochs.emplace(ns_str, *ckpt.life_epoch);
-        out.recovery_checkpoints.emplace(ns_str, std::move(ckpt));
+        out.recovery_checkpoints.emplace(ns_str, CkptSample{std::move(ckpt), got->etag});
     }
     return out;
 }
@@ -2561,7 +2561,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         std::optional<RefCkpt> target_checkpoint;
         if (const auto it = checkpoints.recovery_checkpoints.find(target.ns);
             it != checkpoints.recovery_checkpoints.end())
-            target_checkpoint = it->second;
+            target_checkpoint = it->second.ckpt;
 
         std::optional<RecoveryGrounding> target_grounding;
         try
@@ -2675,7 +2675,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         std::optional<RefCkpt> checkpoint;
         if (const auto checkpoint_it = checkpoints.recovery_checkpoints.find(ns_str);
             checkpoint_it != checkpoints.recovery_checkpoints.end())
-            checkpoint = checkpoint_it->second;
+            checkpoint = checkpoint_it->second.ckpt;
 
         std::optional<RecoveryGrounding> grounding;
         String checkpoint_failure;
@@ -3389,7 +3389,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     /// walk above also held (or recorded an anomaly for) every such namespace, so the round's destructive
     /// gate is shut and `cleanupRefObjects` deletes nothing at all this round. Any future change that
     /// narrows the gate from round-wide to per-namespace must carry this set with it.
-    result.checkpoints = checkpoints.recovery_checkpoints;
+    for (const auto & [ns_str, sample] : checkpoints.recovery_checkpoints)
+        result.checkpoints.emplace(ns_str, sample.ckpt);
 
     /// Folding the terminal record earns positive cleanup evidence directly on the catalog-admitted
     /// life row. It does not claim that any physical debris was removed: `_ckpt`, stream and `_files`
@@ -4816,13 +4817,17 @@ RebuildReport Gc::rebuildBaseline(bool force)
             bad_checkpoint != rebuild_checkpoints.undecodable.end())
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "CAS GC rebuild: catalog life {} has an undecodable checkpoint: {}", ns.string(), bad_checkpoint->second);
-        std::optional<RefCkpt> checkpoint;
+        std::optional<CkptSample> checkpoint;
         if (const auto checkpoint_it = rebuild_checkpoints.recovery_checkpoints.find(ns.string());
             checkpoint_it != rebuild_checkpoints.recovery_checkpoints.end())
             checkpoint = checkpoint_it->second;
-        const RecoveredRefTable recovered = recoverRefTableDetailedFromAuthority(
+        /// The plan is frozen, so a moved base cannot be re-read here; the next attempt plans again.
+        const std::optional<RecoveredRefTable> recovered = recoverRefTableDetailedFromAuthority(
             op, layout, *entry_it, checkpoint);
-        const RefTableState & st = recovered.state;
+        if (!recovered)
+            throwCasWriteRetryLater("CAS GC rebuild: the checkpoint of namespace '" + ns.string()
+                + "' moved while its ref chain was read");
+        const RefTableState & st = recovered->state;
 
         RefCoverage cov;
         cov.classification = CoverageClass::Folded;   /// unless a bodiless precommit clamps it below

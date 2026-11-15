@@ -24,7 +24,12 @@ namespace DB::Cas
 /// decode failure of a matched key (invalid header, corrupted bytes, future format version, ...)
 /// propagates as-is from the underlying `decode*` function (typically `CORRUPTED_DATA` or
 /// `UNKNOWN_FORMAT_VERSION`) — this function performs no fallback decode and swallows nothing.
+///
+/// `base_snapshot_id` is the `checkpoint_snapshot_id` of the life's `_ckpt`, when the caller read it: a
+/// log below it is printed as stored and noted "may be a stray", because cleanup may have emptied that
+/// key and a late create refilled it.
 String caInspectToJson(const Layout & layout, const String & key, std::string_view bytes,
-                       const std::optional<NamespaceLifeId> & resolved_life = std::nullopt);
+                       const std::optional<NamespaceLifeId> & resolved_life = std::nullopt,
+                       const std::optional<RefTxnId> & base_snapshot_id = std::nullopt);
 
 }

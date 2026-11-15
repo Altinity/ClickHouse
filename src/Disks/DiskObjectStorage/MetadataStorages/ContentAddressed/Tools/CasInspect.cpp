@@ -168,12 +168,10 @@ String renderRefTableSnapshot(const RefTableSnapshot & s)
         .str();
 }
 
-/// The namespace's checkpoint. Every field is optional and each absence means something
-/// different an operator needs to see: no `life_epoch` means no writer that knew this namespace's
-/// genesis epoch has written here yet, no `committed_through` means the life has no committed
-/// transaction, no `checkpoint_snapshot_id` means recovery has no snapshot base, and no
-/// `last_epoch_seal` means no epoch of this namespace has been closed. They are rendered as explicit
-/// `null`s rather than omitted keys so all four cases are visible.
+/// The namespace's checkpoint. Absent fields render as explicit `null`s rather than omitted keys: no
+/// `life_epoch` means no writer that knew the genesis epoch has written here, no `checkpoint_snapshot_id`
+/// means recovery has no snapshot base. `committed_through` and `last_epoch_seal` exist only in
+/// generation 1 and 2 bodies and are grouped under `old_format`.
 /// `ns` comes from the KEY -- unlike the log and snapshot objects, a `_ckpt` body does not name its
 /// namespace, so there is no key-to-body binding to cross-check here.
 String renderRefCkpt(const RootNamespace & ns, const RefCkpt & c)
@@ -181,11 +179,14 @@ String renderRefCkpt(const RootNamespace & ns, const RefCkpt & c)
     return JsonObj()
         .add("object", jsonEscape("ref_ckpt"))
         .add("namespace", jsonEscape(ns.string()))
+        .add("generation", jsonUInt(c.generation))
         .add("life_epoch", c.life_epoch ? jsonUInt(*c.life_epoch) : "null")
-        .add("committed_through", c.committed_through ? renderRefTxnIdObj(*c.committed_through) : "null")
         .add("checkpoint_snapshot_id",
              c.checkpoint_snapshot_id ? renderRefTxnIdObj(*c.checkpoint_snapshot_id) : "null")
-        .add("last_epoch_seal", c.last_epoch_seal ? renderRefTxnIdObj(*c.last_epoch_seal) : "null")
+        .add("old_format", JsonObj()
+            .add("committed_through", c.committed_through ? renderRefTxnIdObj(*c.committed_through) : "null")
+            .add("last_epoch_seal", c.last_epoch_seal ? renderRefTxnIdObj(*c.last_epoch_seal) : "null")
+            .str())
         .str();
 }
 
@@ -201,20 +202,25 @@ String renderRefOp(const RefOp & op)
         .str();
 }
 
-String renderRefLogTxn(const RefLogTxn & t)
+/// `below_base`: the log's key lies below the life's snapshot base, where cleanup may have emptied the
+/// slot and a late create refilled it, so the body is not necessarily history.
+String renderRefLogTxn(const RefLogTxn & t, bool below_base)
 {
     std::vector<String> ops;
     ops.reserve(t.ops.size());
     for (const auto & op : t.ops)
         ops.push_back(renderRefOp(op));
 
-    return JsonObj()
-        .add("object", jsonEscape("ref_log"))
+    JsonObj obj;
+    obj.add("object", jsonEscape("ref_log"))
         .add("namespace", jsonEscape(t.ns))
         .add("txn_id", renderRefTxnIdObj(t.txn_id))
         .add("ops", jsonArray(ops))
         .add("prev_epoch_seal", t.prev_epoch_seal ? renderRefTxnIdObj(*t.prev_epoch_seal) : "null")
-        .str();
+        .add("next_epoch", t.next_epoch ? jsonUInt(*t.next_epoch) : "null");
+    if (below_base)
+        obj.add("note", jsonEscape("may be a stray"));
+    return obj.str();
 }
 
 /// `inline_bytes` renders as its LENGTH only, not its content — an inline file's bytes are payload
@@ -482,7 +488,7 @@ String renderBlobTargetRun(const ParsedBlobTargetRunKey & parsed, std::string_vi
 }
 
 String caInspectToJson(const Layout & layout, const String & key, std::string_view bytes,
-                       const std::optional<NamespaceLifeId> & resolved_life)
+                       const std::optional<NamespaceLifeId> & resolved_life, const std::optional<RefTxnId> & base_snapshot_id)
 {
     /// Most-specific first: `cas/manifests/.../NNNNNN.zst` before the pool-wide `cas/ns/stream/`
     /// prefix, the `/mount` and `/fold_seal` suffixes before the pool-wide `gc/state` exact match,
@@ -518,7 +524,8 @@ String caInspectToJson(const Layout & layout, const String & key, std::string_vi
                 openObject(FormatId::RefSnapshot, bytes), life.ns.string(), parsed->txn_id));
         if (parsed->kind == RefObjectKind::Log)
             return renderRefLogTxn(decodeRefLogTxn(
-                openObject(FormatId::RefLog, bytes), life.ns.string(), parsed->txn_id));
+                openObject(FormatId::RefLog, bytes), life.ns.string(), parsed->txn_id),
+                base_snapshot_id && parsed->txn_id < *base_snapshot_id);
         throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "cas-inspect: unhandled ref-object kind for key '{}'", key);
     }
 

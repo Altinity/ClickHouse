@@ -893,7 +893,7 @@ TEST(CASRefGc, RefObjectCleanupRetainsCheckpointPredecessorSealProof)
     ASSERT_NE(entry, cut.catalog.entries.end());
     const std::optional<CkptSample> checkpoint = readCkpt(op, layout, life);
     ASSERT_TRUE(checkpoint);
-    EXPECT_NO_THROW((void)recoverRefTableDetailedFromAuthority(op, layout, *entry, checkpoint->ckpt));
+    EXPECT_TRUE(recoverRefTableDetailedFromAuthority(op, layout, *entry, checkpoint).has_value());
 }
 
 TEST(CASRefGcCleanupAuthority, CatalogTokenMoveBeforeFirstChunkStillDeletesEveryCoveredKey)
@@ -1279,7 +1279,7 @@ TEST(CASRefGcCleanupAuthority, RecoveryAfterCleanupUnderUnrelatedChurn)
 
     OperationForTest op(*backend);
     const RecoveredRefTable before = recoverRefTableDetailedFromAuthority(
-        *op, layout, rowOf(*backend, layout, kNsA), readCkpt(*op, layout, life)->ckpt);
+        *op, layout, rowOf(*backend, layout, kNsA), readCkpt(*op, layout, life)).value();
 
     Gc gc(store, kGc);
     bool hook_fired = false;
@@ -1300,7 +1300,7 @@ TEST(CASRefGcCleanupAuthority, RecoveryAfterCleanupUnderUnrelatedChurn)
     EXPECT_NO_THROW((void)readCheckpointSnapshotBase(*op, layout, life, checkpoint->ckpt));
     std::optional<RecoveredRefTable> after;
     EXPECT_NO_THROW(after = recoverRefTableDetailedFromAuthority(
-        *op, layout, rowOf(*backend, layout, kNsA), checkpoint->ckpt));
+        *op, layout, rowOf(*backend, layout, kNsA), checkpoint));
     ASSERT_TRUE(after);
     EXPECT_TRUE(after->state.getCommitted() == before.state.getCommitted());
     EXPECT_EQ(after->state.getGreatestApplied(), before.state.getGreatestApplied());

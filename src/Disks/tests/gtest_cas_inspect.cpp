@@ -337,3 +337,30 @@ TEST(CASInspect, RefObjectRequiresTheExactCatalogResolution)
         DB::Exception);
     EXPECT_NO_THROW(caInspectToJson(layout, key, bytes, life));
 }
+
+TEST(CASInspect, PrintsGenerationNextEpochAndTheStrayNote)
+{
+    DB::Cas::tests::ScopedReadCeiling c(3);
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/db/tbl"};
+    const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(ns);
+
+    RefCkpt ckpt = DB::Cas::tests::refCkptOf(1, std::nullopt, RefTxnId{5, 1});
+    const String ckpt_json = caInspectToJson(layout, layout.refCkptKey(life), encodeRefCkptAtGeneration(ckpt, 3), life);
+    EXPECT_NE(ckpt_json.find("\"generation\":3"), String::npos) << ckpt_json;
+
+    const RefLogTxn tombstone = DB::Cas::tests::tombstoneTxn(ns.string(), RefTxnId{1, 2}, 5);
+    const String tombstone_json = caInspectToJson(
+        layout, layout.refLogKey(life, tombstone.txn_id), sealObject(FormatId::RefLog, encodeRefLogTxn(tombstone)), life);
+    EXPECT_NE(tombstone_json.find("\"next_epoch\":5"), String::npos) << tombstone_json;
+
+    RefLogTxn below;
+    below.ns = ns.string();
+    below.txn_id = RefTxnId{1, 3};
+    below.ops.push_back(DB::Cas::tests::namespaceBirthOp());
+    const String below_key = layout.refLogKey(life, below.txn_id);
+    const String below_bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(below));
+    const String stray_json = caInspectToJson(layout, below_key, below_bytes, life, RefTxnId{5, 1});
+    EXPECT_NE(stray_json.find("may be a stray"), String::npos) << stray_json;
+    EXPECT_EQ(caInspectToJson(layout, below_key, below_bytes, life, RefTxnId{1, 2}).find("may be a stray"), String::npos);
+}

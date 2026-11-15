@@ -184,22 +184,19 @@ RecoveryGrounding chooseRecoveryGrounding(const std::optional<CatalogEntry> & ca
 
     checkRefCkptInvariants(*ckpt, "recovery grounding");
     RecoveryGrounding result;
-    result.committed_through = ckpt->committed_through;
-    if (!result.committed_through)
+    if (ckpt->generation < G_REF_CHAIN)
     {
-        if (ckpt->checkpoint_snapshot_id || ckpt->last_epoch_seal)
+        result.committed_through = ckpt->committed_through;
+        if (!result.committed_through && (ckpt->checkpoint_snapshot_id || ckpt->last_epoch_seal))
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "CAS recovery grounding: a checkpoint without committed_through cannot name a snapshot or epoch seal");
-        return result;
+        if (ckpt->checkpoint_snapshot_id && ckpt->last_epoch_seal
+            && *ckpt->checkpoint_snapshot_id == *ckpt->last_epoch_seal)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS recovery grounding: checkpoint_snapshot_id must not name last_epoch_seal");
     }
 
-    if (ckpt->checkpoint_snapshot_id && ckpt->last_epoch_seal
-        && *ckpt->checkpoint_snapshot_id == *ckpt->last_epoch_seal)
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS recovery grounding: checkpoint_snapshot_id must not name last_epoch_seal");
-
-    if (ckpt->checkpoint_snapshot_id)
-        result.base = ckpt->checkpoint_snapshot_id;
+    result.base = ckpt->checkpoint_snapshot_id;
     if (result.base)
     {
         if (result.base->ref_sequence == std::numeric_limits<uint64_t>::max())
@@ -207,7 +204,7 @@ RecoveryGrounding chooseRecoveryGrounding(const std::optional<CatalogEntry> & ca
                 "CAS recovery grounding: checkpoint base has no representable successor");
         result.walk_from = RefTxnId{result.base->writer_epoch, result.base->ref_sequence + 1};
     }
-    else if (!result.base)
+    else
     {
         result.walk_from = RefTxnId{*ckpt->life_epoch, 1};
     }

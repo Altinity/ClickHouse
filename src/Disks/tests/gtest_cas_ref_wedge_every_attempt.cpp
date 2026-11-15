@@ -999,8 +999,8 @@ TEST(CASRefWedgeEveryAttempt, SuccessorSealAtTheWedgedKeyRejectsConclusivelyAndS
 }
 
 /// The wire round trip of the same rule, driven from the OTHER producer of `last_epoch_seal`:
-/// recovery's CAS-walk, represented here by its test seam. The point is the encode call
-/// site.
+/// recovery's CAS-walk, which reads the seal that closed the previous epoch. The point is the encode
+/// call site.
 TEST(CASRefWedgeEveryAttempt, OrdinaryFirstAppendAfterASealedTransitionCarriesTheExactPrevEpochSeal)
 {
     auto backend = std::make_shared<CountingBackend>();
@@ -1011,13 +1011,16 @@ TEST(CASRefWedgeEveryAttempt, OrdinaryFirstAppendAfterASealedTransitionCarriesTh
     /// reads that exact key.
     admitProperlyBornEntry(backend, store->layout(), ns);
 
+    /// The previous epoch's history, durable before this runtime first touches the namespace: `x` is
+    /// published, then the epoch is sealed. Recovery at the later epoch replays both, so the seal is on
+    /// the state the first append continues. The fence generation does not move: this test is about
+    /// the wire link, not runtime supersession.
     const uint64_t epoch = store->liveWriterEpoch();
-    publishEmptyPart(store, ns, "x");
-    const RefTxnId seal_id{epoch, 42};
-
-    /// A recovery that walked the dead epoch installs the seal it wrote; model its later epoch without
-    /// moving the mount-fence generation. This test is about the wire link, not runtime supersession.
-    store->setLastEpochSealForTest(ns, seal_id);
+    const RefTxnId seal_id{epoch, 2};
+    DB::Cas::tests::publishAt(*backend, layout, ns, RefTxnId{epoch, 1}, "x", 1, DB::UInt128(0xE1), /*birth=*/true);
+    DB::Cas::tests::writeSealAt(*backend, layout, ns, seal_id);
+    DB::Cas::tests::replaceRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = epoch, .committed_through = seal_id, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = seal_id});
     store->setLiveWriterEpochForTest(epoch + 1);
 
     EXPECT_NO_THROW(store->dropRef(ns, "x"));

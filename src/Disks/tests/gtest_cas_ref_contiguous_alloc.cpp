@@ -292,8 +292,11 @@ TEST(CASRefContiguousAlloc, NonSuccessorIdIsRejectedOnApply)
     ASSERT_EQ(state.getGreatestApplied(), (RefTxnId{kEpoch, 2}));
 
     EXPECT_EQ(nextRefTxnId(state.getGreatestApplied(), kEpoch + 1), (RefTxnId{kEpoch + 1, 1}));
-    /// The id is admissible, but a Live table crossing into a new epoch also owes INV-2's chain link --
-    /// the seal that closed the epoch below, at the slot one past its last durable id.
+    /// A table crosses into a new epoch only over the seal that closed the epoch below, at the slot one
+    /// past its last durable id, and the next head names that seal.
+    RefOp seal;
+    seal.kind = RefOpKind::EpochSeal;
+    EXPECT_NO_THROW(applyRefLogTxn(state, RefLogTxn{ns, RefTxnId{kEpoch, 3}, {seal}, std::nullopt}));
     EXPECT_NO_THROW(applyRefLogTxn(state, RefLogTxn{ns, nextRefTxnId(state.getGreatestApplied(), kEpoch + 1),
         publishCommittedOps("r2", ManifestRef{1, 2, 1}), RefTxnId{kEpoch, 3}}));
     EXPECT_EQ(state.getGreatestApplied(), (RefTxnId{kEpoch + 1, 1}));

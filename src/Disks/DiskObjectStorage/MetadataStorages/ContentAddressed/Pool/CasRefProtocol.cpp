@@ -14,6 +14,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
+    extern const int NOT_IMPLEMENTED;
 }
 }
 
@@ -68,6 +69,84 @@ void CatalogLifeIndex::throwIfAmbiguous(std::string_view consumer) const
     throw Exception(ErrorCodes::CORRUPTED_DATA,
         "{}: catalog life_id {} is shared by current namespaces '{}' and '{}' -- refusing a decision from an ambiguous cut",
         consumer, renderIncarnation(life_id), names[0], names[1]);
+}
+
+bool catalogStillNamesLife(const RefCatalog & catalog, const NamespaceLifeId & life)
+{
+    return std::any_of(catalog.entries.begin(), catalog.entries.end(), [&](const CatalogEntry & entry)
+    {
+        return entry.ns == life.ns && entry.incarnation == life.incarnation
+            && (entry.state == NsState::Live || entry.state == NsState::Removing);
+    });
+}
+
+std::optional<RefTxnId> refChainSuccessor(const RefLogTxn & txn)
+{
+    if (removalTxnId(txn))
+        return std::nullopt;
+    if (const auto transition = refEpochTransitionOf(txn))
+        return RefTxnId{transition->next_epoch, 1};
+    if (txn.txn_id.ref_sequence == std::numeric_limits<uint64_t>::max())
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref chain: log id {}-{} has no representable successor",
+            txn.txn_id.writer_epoch, txn.txn_id.ref_sequence);
+    return RefTxnId{txn.txn_id.writer_epoch, txn.txn_id.ref_sequence + 1};
+}
+
+std::optional<RefEpochTransition> refEpochTransitionOf(const RefLogTxn & txn)
+{
+    if (!refLogTxnIsEpochSeal(txn))
+        return std::nullopt;
+    if (txn.next_epoch)
+        return RefEpochTransition{txn.txn_id, *txn.next_epoch};
+    if (txn.txn_id.writer_epoch == std::numeric_limits<uint64_t>::max())
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref chain: epoch seal {}-{} has no representable successor",
+            txn.txn_id.writer_epoch, txn.txn_id.ref_sequence);
+    return RefEpochTransition{txn.txn_id, txn.txn_id.writer_epoch + 1};
+}
+
+void validateRefChainLink(const std::optional<RefEpochTransition> & open, const RefLogTxn & next)
+{
+    const RefTxnId & id = next.txn_id;
+    if (!open)
+    {
+        if (next.prev_epoch_seal)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS ref chain: {}-{} carries prev_epoch_seal {}-{}, but the record before it is not a tombstone",
+                id.writer_epoch, id.ref_sequence, next.prev_epoch_seal->writer_epoch, next.prev_epoch_seal->ref_sequence);
+        return;
+    }
+    if (id != RefTxnId{open->next_epoch, 1})
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS ref chain: {}-{} follows tombstone {}-{}, whose successor is {}-1",
+            id.writer_epoch, id.ref_sequence, open->seal_id.writer_epoch, open->seal_id.ref_sequence, open->next_epoch);
+    if (next.prev_epoch_seal != open->seal_id)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS ref chain: {}-{} follows tombstone {}-{} but its prev_epoch_seal does not name it",
+            id.writer_epoch, id.ref_sequence, open->seal_id.writer_epoch, open->seal_id.ref_sequence);
+}
+
+bool ckptTokenMoved(CasOperation & op, const Layout & layout, const NamespaceLifeId & life, const Etag & token)
+{
+    const std::optional<Object> current = op.read(layout.refCkptKey(life), Retry::standard());
+    return !current || !(current->etag == token);
+}
+
+RefTxnId RefTableState::chainNextId(uint64_t life_epoch) const
+{
+    if (greatest_applied == RefTxnId{})
+        return RefTxnId{life_epoch, 1};
+    if (open_transition)
+        return RefTxnId{open_transition->next_epoch, 1};
+    return RefTxnId{greatest_applied.writer_epoch, greatest_applied.ref_sequence + 1};
+}
+
+RefNextSlot nextRefSlot(const RefTableState & state, uint64_t life_epoch)
+{
+    const RefTxnId id = state.chainNextId(life_epoch);
+    const auto & open = state.getOpenTransition();
+    if (open && id.ref_sequence == 1)
+        return RefNextSlot{id, open->seal_id};
+    return RefNextSlot{id, std::nullopt};
 }
 
 namespace
@@ -158,6 +237,7 @@ void RefTableState::swap(RefTableState & other) noexcept
     static_assert(std::is_nothrow_swappable_v<RefLifecycle>);
     static_assert(std::is_nothrow_swappable_v<std::optional<RefTxnId>>);
     static_assert(std::is_nothrow_swappable_v<RefTxnId>);
+    static_assert(std::is_nothrow_swappable_v<std::optional<RefEpochTransition>>);
     static_assert(std::is_nothrow_swappable_v<std::set<std::pair<String, ManifestRef>>>);
     static_assert(std::is_nothrow_swappable_v<uint64_t>);
     static_assert(noexcept(std::declval<RefCowMap &>().swap(std::declval<RefCowMap &>())));
@@ -167,6 +247,7 @@ void RefTableState::swap(RefTableState & other) noexcept
     swap(lifecycle, other.lifecycle);
     swap(remove_txn_id, other.remove_txn_id);
     swap(greatest_applied, other.greatest_applied);
+    swap(open_transition, other.open_transition);
     committed.swap(other.committed);
     precommits.swap(other.precommits);
     owned_manifests.swap(other.owned_manifests);
@@ -358,12 +439,13 @@ void RefTableState::applyOp(const RefOp & op, const RefTxnId & txn_id)
     {
         case RefOpKind::NamespaceBirth:
         {
-            /// Namespace birth is legal from an empty runtime admitted under a fresh catalog life,
-            /// never from `Live`. A predecessor still `Removing` is refused before recovery.
+            /// A life is born once. After its terminal record the walk reads no further key, so a birth
+            /// there would be state no reader reaches.
             if (lifecycle == RefLifecycle::Live)
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableState: namespace_birth while already Live");
+            if (remove_txn_id)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableState: namespace_birth after the terminal record");
             lifecycle = RefLifecycle::Live;
-            remove_txn_id.reset();
             return;
         }
         case RefOpKind::OwnerTransition:
@@ -391,23 +473,12 @@ void RefTableState::applyOp(const RefOp & op, const RefTxnId & txn_id)
             return;
         }
         case RefOpKind::EpochSeal:
-            /// INV-2's in-band epoch closure. A seal carries NO table content, and that is its whole
-            /// design: its effect is that it OCCUPIES `{E, T+1}` -- the exact key a dying predecessor's
-            /// in-flight PUT would have taken, so the store's own write-once create becomes the fence --
-            /// and that it advances `greatest_applied`, which `applyTxnInPlace` does after this switch.
-            /// There is deliberately nothing to do here: a seal that changed a row would be a seal that
-            /// can lose one.
-            ///
-            /// `Live` is required because a seal closes the epoch of a LIVE stream. A never-born
-            /// namespace has no stream to close, and a `Removed` one already closed its own with the
-            /// terminal record -- in both cases a seal is a statement about a stream that does not
-            /// exist, i.e. an object built against a different table's history. Recovery's CAS-walk
-            /// enforces the identical gate on the minting side, so this is the read half of ONE rule
-            /// rather than a second one that can drift from it.
-            if (lifecycle != RefLifecycle::Live)
+            /// A seal carries no table content: it only occupies its slot and moves the chain to the
+            /// next epoch. A never-born stream gets one like any first write of an epoch; only a
+            /// terminal stream has no successor to link.
+            if (remove_txn_id)
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
-                    "RefTableState: epoch_seal at {}-{} while the namespace is not Live -- a seal closes the "
-                    "epoch of a live stream, and this table has none",
+                    "RefTableState: epoch_seal at {}-{} after the terminal record",
                     txn_id.writer_epoch, txn_id.ref_sequence);
             return;
     }
@@ -502,59 +573,29 @@ void RefTableState::applyTxnInPlace(const RefLogTxn & txn)
             txn.txn_id.writer_epoch, txn.txn_id.ref_sequence,
             greatest_applied.writer_epoch, greatest_applied.ref_sequence);
 
-    /// INV-1: within `(namespace, epoch)` the DURABLE ids are DENSE, so the only admissible id is the
-    /// one `nextTxnId` derives -- the same rule, on the same state, that the writer mints with. This is
-    /// what turns "these are the log ids I can see" into "this is the whole stream": a reader that finds
-    /// `1..T` knows nothing was lost, which no amount of strict-increase checking could tell it.
-    /// Enforcing it HERE, on the read side, is deliberate -- a hole cannot become durable even if some
-    /// future writer path forgets the rule, because every apply (writer candidate, recovery replay,
-    /// `fsck`'s oracle) runs it.
-    ///
-    /// The strict-increase check above is not subsumed by this one: it rejects an id under an OLDER
-    /// epoch, whose sequence would still look like a legitimate fresh-epoch `1`.
-    if (const RefTxnId expected = nextTxnId(txn.txn_id.writer_epoch); txn.txn_id != expected)
+    /// The chain is dense: a reader that applies every record from the base to the first absent key
+    /// has the whole stream only if each record sits exactly at its predecessor's successor.
+    if (isTerminal())
         throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "RefTableState: txn_id {}-{} does not continue the ref-log stream — the greatest applied id "
-            "is {}-{}, so the only contiguous successor is {}-{}",
+            "RefTableState: txn_id {}-{} follows the terminal record {}-{}",
+            txn.txn_id.writer_epoch, txn.txn_id.ref_sequence,
+            greatest_applied.writer_epoch, greatest_applied.ref_sequence);
+    if (greatest_applied == RefTxnId{})
+    {
+        if (txn.txn_id.ref_sequence != 1)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "RefTableState: the first record of a stream is at sequence 1, not {}-{}",
+                txn.txn_id.writer_epoch, txn.txn_id.ref_sequence);
+    }
+    else if (const RefTxnId expected = chainNextId(txn.txn_id.writer_epoch); txn.txn_id != expected)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "RefTableState: txn_id {}-{} does not continue the ref-log chain -- the greatest applied id "
+            "is {}-{}, so the only successor is {}-{}",
             txn.txn_id.writer_epoch, txn.txn_id.ref_sequence,
             greatest_applied.writer_epoch, greatest_applied.ref_sequence,
             expected.writer_epoch, expected.ref_sequence);
 
-    /// INV-2's CONTEXTUAL seal grammar, on the read side. `prev_epoch_seal` is required on exactly
-    /// sequence 1 of a NON-genesis epoch and forbidden everywhere else; the structural half (shape,
-    /// well-formedness, strictly-earlier epoch) is the codec's, and this is the half that needs to know
-    /// whether this transaction OPENS a life or CONTINUES one across a transition.
-    ///
-    /// THE EQUIVALENCE ARGUMENT, because this is the load-bearing part. The answer is DERIVED from the
-    /// state, exactly and totally -- no `life_epoch` is plumbed in, and there is no optional to
-    /// substitute a zero for (which would demand a chain link on every sequence-1 transaction and reject
-    /// every genesis birth -- the trap task 5's interface note names):
-    ///
-    ///   - state NOT `Live` (never-born, or `Removed`) <=> this transaction can only be a BIRTH <=> the
-    ///     epoch it lands in IS this life's genesis epoch, so a chain link is FORBIDDEN. A link here
-    ///     would name a seal of a previous life this state has no trace of;
-    ///   - state `Live` <=> a prior life is PROVEN to exist below this epoch -- the namespace was applied
-    ///     at `greatest_applied.writer_epoch`, and the density check immediately above just proved this
-    ///     transaction's epoch is above it -- so the transition is non-genesis and a chain link is
-    ///     REQUIRED. Passing `greatest_applied.writer_epoch` yields the same verdict the true
-    ///     `life_epoch` would for EVERY value the true one can hold, since the true one is at or below it
-    ///     and the rule only compares "strictly above / at or below".
-    ///
-    /// The derivation is exact for every reachable state and no default exists anywhere in it.
-    ///
-    /// It is also STRICTLY BETTER than a plumbed-in `life_epoch` would be, and not only because it needs
-    /// no plumbing: `life_epoch` is a property of a LIFE, and a namespace can be removed and recreated.
-    /// A single global value carried alongside the table would answer for the wrong life after a
-    /// rebirth -- it would demand a chain link from a recreated namespace's very first transaction,
-    /// which by definition has none. Reading the lifecycle instead makes per-life semantics fall out for
-    /// free: a `Removed` state receiving a birth makes THAT epoch the NEW life's genesis, with no
-    /// catalog and no extra field to keep in step.
-    ///
-    /// Both arms go through the ONE shared validator rather than re-deriving its rule, so the writer's
-    /// encode-side check and this one cannot drift.
-    if (txn.txn_id.ref_sequence == 1)
-        validateEpochSealGrammarContextual(
-            txn, lifecycle == RefLifecycle::Live ? greatest_applied.writer_epoch : txn.txn_id.writer_epoch);
+    validateRefChainLink(open_transition, txn);
 
     checkRemoveNamespaceOrdering(txn.ops);
 
@@ -567,6 +608,7 @@ void RefTableState::applyTxnInPlace(const RefLogTxn & txn)
     for (const RefOp & op : txn.ops)
         applyOp(op, txn.txn_id);
     greatest_applied = txn.txn_id;
+    open_transition = refEpochTransitionOf(txn);
 #ifdef DEBUG_OR_SANITIZER_BUILD
     /// Reached only on success, where `*this` is fully applied and its incremental body counters and
     /// owned-manifest index are consistent -- the invariant this cross-check defends.
@@ -941,6 +983,220 @@ std::optional<RefTxnId> nextRefLogIdWithinCommittedFrontier(
     return RefTxnId{current.writer_epoch, current.ref_sequence + 1};
 }
 
+RefChainWalk walkRefChain(CasOperation & op, const Layout & layout, const NamespaceLifeId & life,
+                          const RefChainOrigin & origin, const RefChainVisitor & visit, KeyReader * reader)
+{
+    const String & ns = life.ns.string();
+    RefChainWalk walk;
+    walk.open_transition = origin.open_transition;
+    RefTxnId id = origin.first_key;
+
+    /// Hints are taken in order and never cross an epoch, so the outstanding ones are the keys of the
+    /// current epoch from `hinted_from` up to one window.
+    std::optional<RefTxnId> hinted_from;
+    const auto discard_hints = [&]
+    {
+        if (reader && hinted_from)
+            discardRefLogHintsOfEpoch(*reader, layout, life, *hinted_from,
+                                      RefTxnId{hinted_from->writer_epoch, std::numeric_limits<uint64_t>::max()});
+        hinted_from.reset();
+    };
+    SCOPE_EXIT({ discard_hints(); });
+
+    const auto base_moved = [&] { return ckptTokenMoved(op, layout, life, *origin.ckpt_token); };
+    /// A failure of the chain itself is corruption only if `_ckpt` did not move: a moved base means
+    /// cleanup may have emptied the keys this walk read.
+    const auto fail = [&](const String & what) -> RefChainWalk
+    {
+        if (origin.ckpt_token && base_moved())
+        {
+            walk.end = RefChainEnd::BaseMoved;
+            return walk;
+        }
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref chain of namespace '{}': {}", ns, what);
+    };
+    const auto confirm_end = [&](RefChainEnd end) -> RefChainWalk
+    {
+        walk.end = end;
+        if (origin.ckpt_token && origin.confirm_base_after_end && base_moved())
+            walk.end = RefChainEnd::BaseMoved;
+        return walk;
+    };
+    const auto render = [](const RefTxnId & x) { return fmt::format("{}-{}", x.writer_epoch, x.ref_sequence); };
+
+    while (true)
+    {
+        /// Read ahead within the epoch. Under an old frontier only up to it: the logs there are known to
+        /// exist, and a hint past the end of the chain is a wasted request.
+        const RefTxnId epoch_end{id.writer_epoch, std::numeric_limits<uint64_t>::max()};
+        std::optional<RefTxnId> hint_limit;
+        if (!origin.old_frontier)
+            hint_limit = epoch_end;
+        else if (id < *origin.old_frontier)
+            hint_limit = std::min(*origin.old_frontier, epoch_end);
+        if (reader && reader->window() > 0 && hint_limit && id.ref_sequence < std::numeric_limits<uint64_t>::max())
+        {
+            const RefTxnId from{id.writer_epoch, id.ref_sequence + 1};
+            hintRefLogsWithinEpoch(*reader, layout, life, from, *hint_limit);
+            if (!hinted_from)
+                hinted_from = from;
+        }
+        const String key = layout.refLogKey(life, id);
+        const std::optional<Object> got = reader ? reader->take(key) : op.read(key, Retry::standard());
+        if (hinted_from && !(id < *hinted_from))
+            hinted_from = RefTxnId{id.writer_epoch, id.ref_sequence + 1};
+
+        if (!got)
+        {
+            walk.next_key = id;
+            if (origin.old_frontier && !(*origin.old_frontier < id))
+                return fail("log " + render(id) + " is absent at or below the checkpoint frontier "
+                    + render(*origin.old_frontier));
+            return confirm_end(RefChainEnd::AbsentKey);
+        }
+
+        RefLogTxn txn;
+        std::optional<RefTxnId> next;
+        std::optional<RefEpochTransition> transition;
+        try
+        {
+            txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns, id);
+            validateRefChainLink(walk.open_transition, txn);
+            next = refChainSuccessor(txn);
+            transition = refEpochTransitionOf(txn);
+        }
+        catch (const Exception &)
+        {
+            if (origin.ckpt_token && base_moved())
+            {
+                walk.end = RefChainEnd::BaseMoved;
+                return walk;
+            }
+            throw;
+        }
+
+        if (origin.old_frontier && id < *origin.old_frontier)
+        {
+            if (!next)
+                return fail("terminal record " + render(id) + " lies below the checkpoint frontier "
+                    + render(*origin.old_frontier));
+            if (*origin.old_frontier < *next)
+                return fail("the checkpoint frontier " + render(*origin.old_frontier) + " is not on the chain between "
+                    + render(id) + " and " + render(*next));
+        }
+
+        ++walk.records;
+        const bool keep_walking = visit(std::move(txn), got->bytes.size());
+        walk.open_transition = transition;
+        if (!next)
+        {
+            walk.next_key = id;
+            return confirm_end(RefChainEnd::Terminal);
+        }
+        if (!keep_walking)
+        {
+            walk.end = RefChainEnd::Stopped;
+            walk.next_key = *next;
+            return walk;
+        }
+        if (next->writer_epoch != id.writer_epoch)
+            discard_hints();
+        id = *next;
+    }
+}
+
+RefCursorResume resolveRefCursorSuccessor(CasOperation & op, const Layout & layout, const NamespaceLifeId & life,
+                                          const RefTxnId & cursor, const std::optional<RefTxnId> & snapshot_id)
+{
+    const String & ns = life.ns.string();
+    RefCursorResume result;
+    const auto hold = [&](String why)
+    {
+        result.kind = RefCursorResumeKind::Hold;
+        result.detail = std::move(why);
+        return result;
+    };
+    const auto key_at = [&](RefTxnId next, std::optional<RefEpochTransition> open)
+    {
+        result.kind = RefCursorResumeKind::Key;
+        result.next_key = next;
+        result.open_transition = open;
+        return result;
+    };
+    /// Absent: `nullopt` with `undecodable` empty. A body that does not decode is reported, never thrown:
+    /// the caller holds rather than guessing the record's kind.
+    String undecodable;
+    const auto read_record = [&](const RefTxnId & id) -> std::optional<RefLogTxn>
+    {
+        const std::optional<Object> got = op.read(layout.refLogKey(life, id), Retry::standard());
+        if (!got)
+        {
+            ++result.absent_probes;
+            return std::nullopt;
+        }
+        ++result.body_gets;
+        try
+        {
+            return decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns, id);
+        }
+        catch (const Exception & e)
+        {
+            undecodable = e.message();
+            return std::nullopt;
+        }
+    };
+    const auto ordinary_successor = [&]
+    {
+        if (cursor.ref_sequence == std::numeric_limits<uint64_t>::max())
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref chain: cursor {}-{} has no representable successor",
+                cursor.writer_epoch, cursor.ref_sequence);
+        return RefTxnId{cursor.writer_epoch, cursor.ref_sequence + 1};
+    };
+
+    /// Cleanup deletes only below the snapshot id, so a cursor at or above it still holds its own record.
+    if (!snapshot_id || !(cursor < *snapshot_id))
+    {
+        const std::optional<RefLogTxn> got = read_record(cursor);
+        if (!got)
+            return hold(undecodable.empty() ? String("the record at the cursor is absent")
+                                            : "the record at the cursor is undecodable: " + undecodable);
+        const std::optional<RefTxnId> next = refChainSuccessor(*got);
+        if (!next)
+        {
+            result.kind = RefCursorResumeKind::Terminal;
+            return result;
+        }
+        return key_at(*next, refEpochTransitionOf(*got));
+    }
+
+    /// Below the snapshot the cursor's key may hold a stray, so it is not read. Back-chain by sequence-1
+    /// backlinks from the snapshot's epoch: each backlink epoch is strictly lower than its record's, so
+    /// the loop ends at or below the cursor's epoch.
+    uint64_t epoch = snapshot_id->writer_epoch;
+    while (true)
+    {
+        if (epoch == cursor.writer_epoch)
+            return key_at(ordinary_successor(), std::nullopt);
+        const RefTxnId head_id{epoch, 1};
+        const std::optional<RefLogTxn> head = read_record(head_id);
+        if (!head)
+            return hold(undecodable.empty() ? fmt::format("the head {}-1 is absent", epoch)
+                                            : fmt::format("the head {}-1 is undecodable: {}", epoch, undecodable));
+        if (!head->prev_epoch_seal)
+            return hold(fmt::format("the head {}-1 carries no backlink", epoch));
+        const RefTxnId backlink = *head->prev_epoch_seal;
+        if (backlink == cursor)
+            return key_at(head_id, RefEpochTransition{cursor, epoch});
+        if (backlink.writer_epoch < cursor.writer_epoch
+            || (backlink.writer_epoch == cursor.writer_epoch && backlink < cursor))
+            return hold(fmt::format("the head {}-1 links {}-{}, below the cursor", epoch,
+                backlink.writer_epoch, backlink.ref_sequence));
+        if (backlink.writer_epoch == cursor.writer_epoch)
+            return key_at(ordinary_successor(), std::nullopt);
+        epoch = backlink.writer_epoch;
+    }
+}
+
 CheckpointSnapshotBase readCheckpointSnapshotBase(
     CasOperation & op, const Layout & layout, const NamespaceLifeId & life, const RefCkpt & checkpoint)
 {
@@ -977,19 +1233,6 @@ CheckpointSnapshotBase readCheckpointSnapshotBase(
             ns.string(), snapshot_id.writer_epoch, snapshot_id.ref_sequence);
     }
     validateEpochSealGrammarContextual(base_txn, *checkpoint.life_epoch);
-    if (base_txn.prev_epoch_seal && checkpoint.last_epoch_seal && checkpoint.committed_through
-        && checkpoint.committed_through->writer_epoch == snapshot_id.writer_epoch
-        && checkpoint.last_epoch_seal->writer_epoch + 1 == snapshot_id.writer_epoch
-        && *base_txn.prev_epoch_seal != *checkpoint.last_epoch_seal)
-    {
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS recovery for namespace '{}': checkpoint-named base snapshot {}-{} refers to previous "
-            "epoch seal {}-{}, but checkpoint authority names {}-{}",
-            ns.string(), snapshot_id.writer_epoch, snapshot_id.ref_sequence,
-            base_txn.prev_epoch_seal->writer_epoch, base_txn.prev_epoch_seal->ref_sequence,
-            checkpoint.last_epoch_seal->writer_epoch, checkpoint.last_epoch_seal->ref_sequence);
-    }
-
     std::optional<RefTxnId> predecessor_seal_id;
     if (base_txn.prev_epoch_seal)
     {
@@ -1013,6 +1256,15 @@ CheckpointSnapshotBase readCheckpointSnapshotBase(
                 ns.string(), snapshot_id.writer_epoch, snapshot_id.ref_sequence,
                 predecessor_seal_id->writer_epoch, predecessor_seal_id->ref_sequence);
         }
+        if (refEpochTransitionOf(predecessor_txn)->next_epoch != snapshot_id.writer_epoch)
+        {
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS recovery for namespace '{}': checkpoint-named base snapshot {}-{} refers to seal {}-{}, "
+                "whose successor lies in epoch {}",
+                ns.string(), snapshot_id.writer_epoch, snapshot_id.ref_sequence,
+                predecessor_seal_id->writer_epoch, predecessor_seal_id->ref_sequence,
+                refEpochTransitionOf(predecessor_txn)->next_epoch);
+        }
     }
 
     const auto snapshot = op.read(layout.refSnapshotKey(life, snapshot_id), Retry::standard());
@@ -1029,79 +1281,83 @@ CheckpointSnapshotBase readCheckpointSnapshotBase(
         .predecessor_seal_id = predecessor_seal_id};
 }
 
-RecoveredRefTable recoverRefTableDetailedFromAuthority(
+std::optional<RecoveredRefTable> recoverRefTableDetailedFromAuthority(
     CasOperation & op, const Layout & layout, const std::optional<CatalogEntry> & catalog_entry,
-    const std::optional<RefCkpt> & ckpt, KeyReader * reader)
+    const std::optional<CkptSample> & ckpt, KeyReader * reader)
 {
-    /// The frozen catalog row and `_ckpt` supplied by the caller determine every recovery boundary;
-    /// this function must not re-read either mutable object, or enumerate the stream, because that
-    /// would splice unrelated physical observations into the caller's one authority cut.
-    RecoveryGrounding grounding = chooseRecoveryGrounding(catalog_entry, ckpt);
+    /// The frozen catalog row and `_ckpt` sample supplied by the caller ground the walk; this function
+    /// must not re-read the catalog, or enumerate the stream, because that would splice unrelated
+    /// physical observations into the caller's one authority cut.
+    const RecoveryGrounding grounding = chooseRecoveryGrounding(
+        catalog_entry, ckpt ? std::optional<RefCkpt>{ckpt->ckpt} : std::nullopt);
     /// `chooseRecoveryGrounding` has just established that this is a Live/Removing row. Constructing
     /// the life from that SAME value, rather than resolving the name again, preserves the caller's
     /// catalog-cut join.
-    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(
-        catalog_entry->ns, catalog_entry->incarnation);
-    const RootNamespace & ns = life.ns;
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(catalog_entry->ns, catalog_entry->incarnation);
 
-    std::optional<RefTxnId> base_id = grounding.base;
     std::optional<RefTableSnapshot> base_snapshot;
     uint64_t base_snapshot_bytes = 0;
-    if (base_id)
+    if (grounding.base)
     {
-        CheckpointSnapshotBase base = readCheckpointSnapshotBase(op, layout, life, *ckpt);
-        base_snapshot = std::move(base.snapshot);
-        base_snapshot_bytes = base.bytes;
+        try
+        {
+            CheckpointSnapshotBase base = readCheckpointSnapshotBase(op, layout, life, ckpt->ckpt);
+            base_snapshot = std::move(base.snapshot);
+            base_snapshot_bytes = base.bytes;
+        }
+        catch (const Exception & e)
+        {
+            if (e.code() == ErrorCodes::CORRUPTED_DATA && ckptTokenMoved(op, layout, life, ckpt->etag))
+                return std::nullopt;
+            throw;
+        }
     }
 
     RefReplayBuilder builder(std::move(base_snapshot), base_snapshot_bytes);
-    if (grounding.walk_from && grounding.committed_through)
+    bool replay_corrupted = false;
+    const RefChainVisitor apply = [&](RefLogTxn && txn, uint64_t stored_bytes)
     {
-        RefTxnId id = *grounding.walk_from;
-        while (id <= *grounding.committed_through)
+        const int64_t footprint = static_cast<int64_t>(decodedRefLogTxnFootprint(txn));
+        reportReplayMemoryDelta(footprint);
+        SCOPE_EXIT({ reportReplayMemoryDelta(-footprint); });
+        try
         {
-            const String key = layout.refLogKey(life, id);
-            if (reader && id.ref_sequence < std::numeric_limits<uint64_t>::max())
-                hintRefLogsWithinEpoch(*reader, layout, life, RefTxnId{id.writer_epoch, id.ref_sequence + 1},
-                                       *grounding.committed_through);
-            const auto got = reader ? reader->take(key) : op.read(key, Retry::standard());
-            if (!got)
-            {
-                /// `NamespaceLifeId` is opaque and unique to one logical life. A later birth has a
-                /// different stream prefix, so no absent slot at or below this life's exact frontier
-                /// can be explained as a rebirth; it is always durable-data loss.
-                throw Exception(ErrorCodes::CORRUPTED_DATA,
-                    "CAS read-only recovery for namespace '{}': committed log id {}-{} is absent under "
-                    "the supplied immutable checkpoint frontier {}-{}",
-                    ns.string(), id.writer_epoch, id.ref_sequence,
-                    grounding.committed_through->writer_epoch, grounding.committed_through->ref_sequence);
-            }
-
-            RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id);
-            const bool is_seal = refLogTxnIsEpochSeal(txn);
-            const int64_t footprint = static_cast<int64_t>(decodedRefLogTxnFootprint(txn));
-            reportReplayMemoryDelta(footprint);
-            SCOPE_EXIT({ reportReplayMemoryDelta(-footprint); });
-            builder.applyOne(std::move(txn), got->bytes.size());
-
-            if (const std::optional<RefTxnId> next = nextRefLogIdWithinCommittedFrontier(
-                    id, is_seal, *grounding.committed_through))
-            {
-                if (is_seal && reader && id.ref_sequence < std::numeric_limits<uint64_t>::max())
-                    discardRefLogHintsOfEpoch(*reader, layout, life, RefTxnId{id.writer_epoch, id.ref_sequence + 1},
-                                              *grounding.committed_through);
-                id = *next;
-            }
-            else
-                break;
+            builder.applyOne(std::move(txn), stored_bytes);
         }
+        catch (const Exception & e)
+        {
+            replay_corrupted = e.code() == ErrorCodes::CORRUPTED_DATA;
+            throw;
+        }
+        return true;
+    };
+
+    RefChainWalk walk;
+    try
+    {
+        walk = walkRefChain(op, layout, life, RefChainOrigin{
+            .first_key = *grounding.walk_from,
+            .open_transition = std::nullopt,
+            .ckpt_token = ckpt->etag,
+            .confirm_base_after_end = true,
+            .old_frontier = grounding.committed_through}, apply, reader);
     }
+    catch (const Exception &)
+    {
+        if (replay_corrupted && ckptTokenMoved(op, layout, life, ckpt->etag))
+            return std::nullopt;
+        throw;
+    }
+    if (walk.end == RefChainEnd::BaseMoved)
+        return std::nullopt;
 
     RecoveryResult result = std::move(builder).finish();
     return RecoveredRefTable{
         .state = std::move(result.state),
         .newest_snapshot_id = result.newest_snapshot_id,
-        .last_epoch_seal = ckpt->last_epoch_seal};
+        .open_transition = walk.open_transition,
+        .end = walk.end,
+        .next_key = walk.next_key};
 }
 
 }

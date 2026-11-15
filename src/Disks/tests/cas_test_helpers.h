@@ -1664,15 +1664,14 @@ inline DB::Cas::RecoveredRefTable recoverRefTableDetailedAtCatalogCutForTest(
         catalog_entry = *it;
 
     OperationForTest operation(backend);
-    std::optional<RefCkpt> ckpt;
+    std::optional<CkptSample> ckpt;
     if (catalog_entry)
     {
         const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(catalog_entry->ns, catalog_entry->incarnation);
-        if (const std::optional<CkptSample> sample = readCkpt(*operation, layout, life))
-            ckpt = sample->ckpt;
+        ckpt = readCkpt(*operation, layout, life);
     }
 
-    return recoverRefTableDetailedFromAuthority(*operation, layout, catalog_entry, ckpt);
+    return recoverRefTableDetailedFromAuthority(*operation, layout, catalog_entry, ckpt).value();
 }
 
 /// Writes `txn` at `_log/<txn_id>` (create-if-absent). Admits `txn.ns` into the catalog first

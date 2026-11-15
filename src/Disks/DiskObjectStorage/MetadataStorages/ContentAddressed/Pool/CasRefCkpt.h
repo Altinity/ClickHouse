@@ -9,16 +9,19 @@
 namespace DB::Cas
 {
 
-/// The pure, catalog-authoritative input to both recovery entry points. The checkpoint supplies every
-/// recovery boundary; `LIST` cannot supply a base, life epoch, frontier, or stopping condition.
+/// The pure, catalog-authoritative input to both recovery entry points. `LIST` cannot supply a base,
+/// life epoch, frontier, or stopping condition.
 struct RecoveryGrounding
 {
     std::optional<RefTxnId> base;
+    /// Always set for a recoverable life: the base's successor, or `{life_epoch,1}`.
     std::optional<RefTxnId> walk_from;
+    /// Set only from a generation 1 or 2 body: the chain may not end below it.
     std::optional<RefTxnId> committed_through;
 };
 
-/// Choose recovery's finite exact range from catalog lifecycle authority and `_ckpt`. Throws
+/// Choose where recovery starts (the base and the first key to walk) and, for a generation 1 or 2
+/// `_ckpt`, the frontier the chain may not end below, from catalog lifecycle authority and `_ckpt`. Throws
 /// `INVALID_STATE` for absent/Creating names and `CORRUPTED_DATA` when a Live/Removing life lacks
 /// the checkpoint or genesis fact it must have. This helper performs no I/O and never trusts LIST.
 RecoveryGrounding chooseRecoveryGrounding(const std::optional<CatalogEntry> & catalog_state,

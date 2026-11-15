@@ -841,10 +841,10 @@ private:
         /// correctly unproven -- fail-closed on a genuinely unknown genesis, never a guessed one.
         std::map<String, uint64_t> life_epochs;
 
-        /// The complete decoded checkpoint for each catalog-admitted Live/Removing life. `REBUILD`
-        /// passes this exact sample together with the same immutable catalog row to read-only recovery;
-        /// it must not re-read either authority object after its plan has been frozen.
-        std::map<String, RefCkpt> recovery_checkpoints;
+        /// The complete decoded checkpoint and its token for each catalog-admitted Live/Removing life.
+        /// `REBUILD` passes this exact sample together with the same immutable catalog row to read-only
+        /// recovery; it must not re-read either authority object after its plan has been frozen.
+        std::map<String, CkptSample> recovery_checkpoints;
 
         /// namespace -> the decode failure's message, for the namespaces whose `_ckpt` is PRESENT and
         /// UNREADABLE. Separate from an absent entry because the two mean opposite things: an absent

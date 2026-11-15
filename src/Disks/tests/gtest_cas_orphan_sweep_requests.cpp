@@ -267,6 +267,8 @@ TEST(CASOrphanSweepRequests, UnrelatedCatalogChangeDoesNotRetainStableOrphan)
     const Layout & layout = f.store->layout();
     const String key = f.add(1);
     seedFoldCursorForTest(*f.backend, layout, kNs, RefTxnId{2, 1});
+    /// A fold cursor names a record GC read; without a snapshot above it, that record is still there.
+    fixture::writeRefLogRaw(*f.backend, layout, RefLogTxn{kNs.string(), RefTxnId{2, 1}, {}, std::nullopt});
     writeRecoverableCkptForRawFixture(*f.backend, layout, kNs, RefCkpt{
         .life_epoch = 1, .committed_through = std::nullopt,
         .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt});

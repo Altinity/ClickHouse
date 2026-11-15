@@ -46,6 +46,35 @@ private:
     std::map<NamespaceLifePhysicalId, std::vector<String>> ambiguous_names;
 };
 
+/// True iff `catalog` holds a `Live` or `Removing` row with exactly this incarnation. A reader whose
+/// catalog cut can predate an erase calls it after its walk: the janitor deletes only lives a later
+/// catalog read no longer names, so a row still present proves none of the walk's reads saw a delete.
+bool catalogStillNamesLife(const RefCatalog & catalog, const NamespaceLifeId & life);
+
+/// The tombstone a chain last crossed and the epoch its successor lies in.
+struct RefEpochTransition
+{
+    RefTxnId seal_id;
+    uint64_t next_epoch = 0;
+    bool operator==(const RefEpochTransition &) const = default;
+};
+
+/// The key that follows `txn` on its chain: `{e,s+1}` for an ordinary record, `{next_epoch,1}` for a
+/// tombstone, `{e+1,1}` for a tombstone without `next_epoch`. `nullopt` iff `txn` contains
+/// `RemoveNamespace`: the stream ends there and no key after it is read.
+std::optional<RefTxnId> refChainSuccessor(const RefLogTxn & txn);
+
+/// Set iff `txn` is a tombstone: `{txn_id, next_epoch}`, or `{txn_id, writer_epoch + 1}` for one
+/// without the field.
+std::optional<RefEpochTransition> refEpochTransitionOf(const RefLogTxn & txn);
+
+/// `CORRUPTED_DATA` unless: `open` set => `next` is `{open.next_epoch, 1}` and names `open.seal_id` in its
+/// backlink; `open` unset => `next` carries no backlink.
+void validateRefChainLink(const std::optional<RefEpochTransition> & open, const RefLogTxn & next);
+
+/// Re-reads `_ckpt`. True when it is absent or its token differs from `token`.
+bool ckptTokenMoved(CasOperation & op, const Layout & layout, const NamespaceLifeId & life, const Etag & token);
+
 // Shared value types for the ref-ledger writer and the pure ref-log protocol helpers below. They live
 // in this protocol header so the ledger can depend on the carriers without making the pool and ledger
 // headers include one another.
@@ -210,11 +239,8 @@ struct RefLedgerConfig
 /// consume nothing (the next caller derives the same id from the same unchanged state).
 ///
 /// This is the rule itself, applied to an ANCHOR. Callers do not choose the anchor: they go through
-/// `RefTableState::nextTxnId`, which derives from `greatest_applied` -- the writer to
-/// mint an id, every trial preview to stamp its throwaway transaction, and `applyTxnInPlace` to decide
-/// whether a transaction's id is admissible. Sharing one rule is deliberate: an allocator and a checker
-/// that each spell it out separately can drift, and a drift here is either a durable hole or a table
-/// that refuses its own writes.
+/// `RefTableState::nextTxnId`, which derives from `greatest_applied` -- the writer to mint an id and
+/// every trial preview to stamp its throwaway transaction.
 ///
 /// Total by construction (no throw): the one input it cannot serve, an exhausted `ref_sequence` under
 /// the live epoch, would need 2^64 transactions in one incarnation of one table. Should a corrupt
@@ -230,13 +256,8 @@ RefTxnId nextRefTxnId(RefTxnId greatest_applied, uint64_t live_epoch);
 ///
 /// Representation note (never-born vs removed): there is no separate "first birth" flag. Both
 /// "never born" and "Removed" default `lifecycle` to `RefLifecycle::Removed`; they are told apart by
-/// `remove_txn_id`: absent means the namespace has never completed a `remove_namespace` transaction
-/// (either truly never born, or -- from this class's point of view -- indistinguishable from it,
-/// which is fine because a `namespace_birth` op is legal from EITHER case and nothing else is legal
-/// from either). Present means a real removal happened and recorded its `RefTxnId`. `committed` and
-/// `precommits` are always empty while `lifecycle == Removed` (an invariant `applyRefLogTxn`
-/// maintains: `remove_namespace` only fires once both are already empty, and no other operation is
-/// legal until the next `namespace_birth`).
+/// `remove_txn_id`: absent means never born, present means the terminal record was applied and nothing
+/// may follow it. `committed` and `precommits` are always empty while `lifecycle == Removed`.
 class RefTableState
 {
 public:
@@ -257,16 +278,25 @@ public:
     uint64_t getSnapshotBodyBytes() const { return snapshot_body_bytes; }
     uint64_t getRemovalBodyBytes() const { return removal_body_bytes; }
 
-    /// The id this state's next transaction must carry (INV-1) — the ONE derivation, called by the
-    /// writer to mint an id, by every trial preview to stamp its throwaway transaction, and by
-    /// `applyTxnInPlace` to decide whether a transaction's id is admissible. Three callers, one rule:
-    /// an allocator and a checker that each spell it out separately can drift, and a drift here is
-    /// either a durable hole or a table that refuses its own writes.
-    ///
+    /// The id the writer mints for this state's next transaction under `live_epoch`, and the id every
+    /// trial preview stamps on its throwaway transaction.
     RefTxnId nextTxnId(uint64_t live_epoch) const
     {
         return nextRefTxnId(greatest_applied, live_epoch);
     }
+
+    /// The tombstone the last applied record crossed, set until its head is applied.
+    const std::optional<RefEpochTransition> & getOpenTransition() const { return open_transition; }
+
+    /// A `RemoveNamespace` was applied: no record may follow.
+    bool isTerminal() const { return lifecycle != RefLifecycle::Live && remove_txn_id.has_value(); }
+
+    /// The key of the next record on this state's chain: `{life_epoch,1}` when nothing is applied, else
+    /// the chain successor of the last applied record. Meaningless when `isTerminal`.
+    RefTxnId chainNextId(uint64_t life_epoch) const;
+
+    /// The epoch of `chainNextId`.
+    uint64_t chainEpoch(uint64_t life_epoch) const { return chainNextId(life_epoch).writer_epoch; }
 
     /// State-install point only (once per ref-log flush, never per batch item): folds the committed
     /// map's and the owned-manifest index's COW overlays into their bases -- in place when the base is
@@ -289,6 +319,7 @@ private:
     RefLifecycle lifecycle = RefLifecycle::Removed;   /// see representation note above
     std::optional<RefTxnId> remove_txn_id;
     RefTxnId greatest_applied{};                       /// {0, 0} = no transaction applied yet
+    std::optional<RefEpochTransition> open_transition;
 
     RefCowMap committed;                                              /// keyed by ref_name
     std::set<std::pair<String, ManifestRef>> precommits;             /// (ref_name, manifest_ref)
@@ -400,16 +431,17 @@ RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot);
 /// to select the poisoning path.
 ///
 /// Enforced preconditions:
-///  - `txn.txn_id` must be strictly greater than `state.greatest_applied` AND must be exactly the
-///    contiguous successor `RefTableState::nextTxnId` derives (INV-1): the next sequence number within
-///    the same writer epoch, or 1 under a greater one. A hole in a table's DURABLE stream is corruption,
-///    not a tolerated allocation artefact.
+///  - `txn.txn_id` must be strictly greater than `state.greatest_applied`. With nothing applied it is at
+///    sequence 1; otherwise it is exactly `refChainSuccessor` of the last applied record, and nothing
+///    follows a terminal record. `validateRefChainLink` then checks the backlink against the open
+///    transition. A hole in a table's DURABLE stream is corruption, not a tolerated allocation artefact.
 ///  - `remove_namespace`, if present, must be the transaction's FINAL operation, and every earlier
 ///    operation must be an exact owner-removal `owner_transition` (`old_binding` set, `new_binding`
 ///    empty). The codec does not check this shape; this is the one place
 ///    that does.
-///  - `namespace_birth`: legal only while `lifecycle != Live`. Catalog admission guarantees this is
-///    either a never-born runtime or a fresh physical life after predecessor deletion.
+///  - `namespace_birth`: legal only on a never-born state: refused while `Live` and after a terminal
+///    record.
+///  - `epoch_seal`: legal on a never-born or `Live` state, refused after a terminal record.
 ///  - `owner_transition` add (no `old_binding`, `new_binding.kind == Precommit`): namespace must be
 ///    `Live`; the exact `(ref_name, manifest_ref)` pair must be absent from `precommits`; AND no
 ///    existing committed row or precommit binding, under ANY ref_name, may already name the same
@@ -436,9 +468,7 @@ RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot);
 ///  - `remove_namespace`: namespace must be `Live` and both `committed` and `precommits` must already
 ///    be empty at this point in the (in-array-order) replay -- which is only true if the transaction's
 ///    earlier removal ops actually named every owner.
-///  - Any operation other than `namespace_birth` while `lifecycle == Removed` is rejected:
-///    "Any operation other than a valid later namespace_birth while state is
-///    Removed is corruption."
+///  - Any operation other than `namespace_birth` or `epoch_seal` on a never-born state is rejected.
 ///
 /// `CORRUPTED_DATA` throughout: every rejection above uses the same "is corruption" framing,
 /// extended uniformly to every precondition in this section, matching how
@@ -473,6 +503,17 @@ RefTableSnapshot snapshotOf(const RefTableState & state, const String & ns);
 /// wrong-but-plausible-looking state, exactly the class of bug this equation exists to make
 /// impossible.
 RefTableState replay(const std::optional<RefTableSnapshot> & snapshot, std::span<const RefLogTxn> tail);
+
+/// The id of the next record after `state` and the backlink it must carry: the open transition's
+/// `seal_id`, set iff that id is at sequence 1 and a transition is open. The one rule previews and
+/// appends share.
+struct RefNextSlot
+{
+    RefTxnId id;
+    std::optional<RefTxnId> backlink;
+    bool operator==(const RefNextSlot &) const = default;
+};
+RefNextSlot nextRefSlot(const RefTableState & state, uint64_t life_epoch);
 
 /// Everything a successful recovery of one ref table seeds. Produced by streaming replay
 /// (`RefReplayBuilder::finish`) rather than assigned field-by-field into the runtime, so the whole
@@ -764,10 +805,10 @@ struct EpochCrossResult
 /// is an inherited cursor whose record may since have been cleaned, so its kind is unknowable by any
 /// amount of reading here and the crossing rests on chain-trust.
 ///
-/// Terminates: `validateEpochSealGrammarStructural` guarantees `prev_epoch_seal->writer_epoch + 1 ==
-/// txn_id.writer_epoch`, so the target epoch decreases one numeric epoch per link and is bounded below
-/// by `from_seal`'s own epoch. The record it proves is read once more by the caller's own walk: one
-/// redundant `GET` per epoch crossed, and crossings happen once per writer-epoch change.
+/// Terminates: `validateEpochSealGrammarStructural` guarantees a backlink epoch strictly below the
+/// record's own, so the target epoch strictly decreases per link and the loop stops at or below
+/// `from_seal`'s epoch. The record it proves is read once more by the caller's own walk: one redundant
+/// `GET` per epoch crossed, and crossings happen once per writer-epoch change.
 ///
 /// READ-ONLY, and shared deliberately: the GC fold's intake and fsck's audit must not be able to
 /// disagree about when an epoch boundary has been proved -- a rule that says which records a cut
@@ -787,29 +828,111 @@ EpochCrossResult crossEpochFromSeal(CasOperation & op, const Layout & layout, co
 /// decoded record at `current`, or `nullopt` when `current` is the inclusive frontier itself. An
 /// `EpochSeal` ends its numeric epoch, so a strictly-later frontier in that SAME epoch is corrupt:
 /// advancing to `{E+1,1}` and letting ordinary ordering terminate would silently discard the invalid
-/// part of the claimed range. Shared by every checkpoint-bounded reader so recovery, fsck, and the
-/// orphan protection walk cannot disagree about that malformed authority.
+/// part of the claimed range. Shared by writer recovery and the GC fold so they cannot disagree about
+/// that malformed authority.
 std::optional<RefTxnId> nextRefLogIdWithinCommittedFrontier(
     const RefTxnId & current, bool is_epoch_seal, const RefTxnId & committed_through);
 
-/// The result of `recoverRefTableDetailedFromAuthority`: the replayed table state plus the identity of
-/// the snapshot recovery actually selected as its base (`nullopt` when it found no snapshot at all).
+/// Where a chain walk starts.
+struct RefChainOrigin
+{
+    RefTxnId first_key;
+    /// Set when `first_key` follows a tombstone.
+    std::optional<RefEpochTransition> open_transition;
+    /// Unset: a GC round's own cursor; no `_ckpt` re-read, failures propagate.
+    std::optional<Etag> ckpt_token;
+    /// False: the caller re-reads `_ckpt` after its own last request.
+    bool confirm_base_after_end = true;
+    /// `committed_through` of a generation 1 or 2 `_ckpt`: the chain may not end below it.
+    std::optional<RefTxnId> old_frontier;
+};
+
+enum class RefChainEnd : uint8_t
+{
+    AbsentKey,
+    Terminal,
+    Stopped,
+    BaseMoved,
+};
+
+struct RefChainWalk
+{
+    RefChainEnd end = RefChainEnd::AbsentKey;
+    /// AbsentKey: the key read absent. Stopped: the successor of the last visited record. Terminal: the
+    /// terminal record's id.
+    RefTxnId next_key{};
+    /// After the last visited record.
+    std::optional<RefEpochTransition> open_transition;
+    uint64_t records = 0;
+};
+
+/// Returns false to stop the walk after this record (`RefChainEnd::Stopped`).
+using RefChainVisitor = std::function<bool(RefLogTxn && txn, uint64_t stored_bytes)>;
+
+/// The one rule for where history ends. Reads exact keys in successor order from `origin.first_key`,
+/// decodes each record, checks it with `validateRefChainLink` against the walk's own open transition and
+/// hands it to `visit`. Ends at the first absent key, at a terminal record (no key after it is read), or
+/// when `visit` returns false.
+///
+/// With `ckpt_token` set, an end at an absent key or a terminal record re-reads `_ckpt` (unless
+/// `confirm_base_after_end` is false) and returns `BaseMoved` when it moved: cleanup deletes only below a
+/// snapshot id it read from `_ckpt`, so only an unchanged token proves the end was not made by cleanup.
+/// The walk's own decode or link failure and a chain that ends below `old_frontier` re-read it the same
+/// way, and are `CORRUPTED_DATA` only under an unchanged token. Without `ckpt_token` they throw at once.
+/// An exception from `visit` propagates unchanged.
+///
+/// `reader`, when set, fetches the logs and may read ahead inside the current epoch only. Every exit,
+/// a throw included, discards the hints the walk gave it.
+RefChainWalk walkRefChain(CasOperation & op, const Layout & layout, const NamespaceLifeId & life,
+                          const RefChainOrigin & origin, const RefChainVisitor & visit, KeyReader * reader = nullptr);
+
+enum class RefCursorResumeKind : uint8_t
+{
+    Key,
+    Terminal,
+    Hold,
+};
+
+struct RefCursorResume
+{
+    RefCursorResumeKind kind = RefCursorResumeKind::Hold;
+    RefTxnId next_key{};
+    std::optional<RefEpochTransition> open_transition;
+    uint64_t body_gets = 0;
+    uint64_t absent_probes = 0;
+    String detail;
+};
+
+/// Where a walk resumes after a nonzero fold `cursor`. A cursor at or above `snapshot_id` (or with no
+/// snapshot) is read for its kind. A cursor below it may be a key cleanup emptied and a late create
+/// refilled, so it is never read: the walk back-chains from the snapshot's epoch by sequence-1
+/// backlinks, reading only keys above the cursor that the chain leads to. Anything it cannot prove is
+/// `Hold`.
+RefCursorResume resolveRefCursorSuccessor(CasOperation & op, const Layout & layout, const NamespaceLifeId & life,
+                                          const RefTxnId & cursor, const std::optional<RefTxnId> & snapshot_id);
+
+/// The result of `recoverRefTableDetailedFromAuthority`: the replayed table state, the snapshot it
+/// started from (`nullopt` without one) and where its walk ended.
 struct RecoveredRefTable
 {
     RefTableState state;
     std::optional<RefTxnId> newest_snapshot_id;
-    /// The exact lifecycle authority's last sealed epoch. The authoritative read-only entry point
-    /// copies this from its immutable `_ckpt` input.
-    std::optional<RefTxnId> last_epoch_seal;
+    /// The last tombstone the walk crossed, while its successor is absent.
+    std::optional<RefEpochTransition> open_transition;
+    RefChainEnd end = RefChainEnd::AbsentKey;
+    RefTxnId next_key{};
 };
+
+/// How many times a read-only caller re-reads `_ckpt` and recovers again after the base moved.
+constexpr size_t kRefReadOnlyRecoveryMaxRestarts = 3;
 
 /// Exact-read and decode the checkpoint-named recovery base. The anchor is the bounded triple
 /// `_ckpt` + same-id non-seal `_log` + same-id `_snap`: read and decode the log first, reject an
-/// `EpochSeal`, validate its contextual epoch backlink against `_ckpt.life_epoch` and the exact
-/// `_ckpt.last_epoch_seal` when that field describes the base's preceding epoch, exact-read and require
-/// the named predecessor to be an `EpochSeal`, then read the snapshot. This order prevents a forged
-/// snapshot at any historical seal or contextually invalid epoch start from becoming state. Cleanup
-/// retains both the matching log and returned predecessor proof while the checkpoint names this base.
+/// `EpochSeal`, validate its contextual epoch backlink against `_ckpt.life_epoch`, exact-read and require
+/// the named predecessor to be an `EpochSeal` whose successor is the base's epoch, then read the
+/// snapshot. This order prevents a forged snapshot at any historical seal or contextually invalid epoch
+/// start from becoming state. Cleanup retains both the matching log and returned predecessor proof while
+/// the checkpoint names this base.
 /// Every read below is one of `op`'s own requests, so a caller that needs to refuse a later request
 /// mid-walk (a recovery attempt superseded while it runs) folds that fact into `op`'s `Liveness`
 /// predicate at admission rather than passing a callback here -- the operation already re-checks it
@@ -826,23 +949,22 @@ struct CheckpointSnapshotBase
 CheckpointSnapshotBase readCheckpointSnapshotBase(
     CasOperation & op, const Layout & layout, const NamespaceLifeId & life, const RefCkpt & checkpoint);
 
-/// Recover a ref table from ONE immutable lifecycle authority cut supplied by the caller. `catalog_entry`
-/// is either the exact row from that caller's frozen catalog cut or absence from that same cut; `ckpt` is
-/// the exact decoded `_ckpt` that caller read for the row's `NamespaceLifeId`. This function does NOT
-/// GET the catalog or `_ckpt` itself: accepting a later, competing cut would make its result disagree
-/// with the caller's other decisions. `chooseRecoveryGrounding` makes absent/Creating names non-recoverable
-/// and requires a readable `_ckpt` with `life_epoch` for Live/Removing.
+/// Recover a ref table from ONE lifecycle authority cut supplied by the caller. `catalog_entry` is either
+/// the exact row from that caller's frozen catalog cut or absence from that same cut; `ckpt` is the
+/// `_ckpt` sample that caller read for the row's `NamespaceLifeId`. The catalog is never read here: a
+/// later, competing cut would make the result disagree with the caller's other decisions, and the
+/// catalog confirmation after the walk is the caller's. `chooseRecoveryGrounding` makes absent/Creating
+/// names non-recoverable and requires a readable `_ckpt` with `life_epoch` for Live/Removing.
 ///
-/// Recovery performs no stream `LIST`: its replay is exact point GETs from the checkpoint-named base
-/// through inclusive `committed_through`; a missing checkpoint-named base or committed log is corruption
-/// under this immutable authority. In particular, this read-only API never probes or adopts `F+1`. There
-/// is deliberately no self-resolving compatibility overload: every consumer must pass the row from its
-/// frozen catalog cut explicitly.
+/// Recovery performs no stream `LIST`: it loads the checkpoint-named base and replays `walkRefChain`
+/// from its successor (or `{life_epoch,1}`) with `ckpt->etag` as the token. `nullopt`: the base moved
+/// under the base load or the walk; the caller decides whether to re-read `_ckpt`. A corrupt base, chain
+/// or replay under an unchanged token throws `CORRUPTED_DATA`.
 ///
-/// `reader`, when set, fetches the logs; it may prefetch ids of the current epoch and drops them at a
-/// seal. Every decision and every error path is the same with and without it.
-RecoveredRefTable recoverRefTableDetailedFromAuthority(
+/// `reader`, when set, fetches the logs. Every decision and every error path is the same with and
+/// without it.
+std::optional<RecoveredRefTable> recoverRefTableDetailedFromAuthority(
     CasOperation & op, const Layout & layout, const std::optional<CatalogEntry> & catalog_entry,
-    const std::optional<RefCkpt> & ckpt, KeyReader * reader = nullptr);
+    const std::optional<CkptSample> & ckpt, KeyReader * reader = nullptr);
 
 }

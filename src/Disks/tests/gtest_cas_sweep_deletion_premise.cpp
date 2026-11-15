@@ -42,6 +42,14 @@ BuildPrefix buildPrefix(uint64_t seq)
     return BuildPrefix{.writer_epoch = kBuildEpoch, .build_sequence = seq};
 }
 
+/// A fold cursor names a record GC read; without a snapshot above it, that record is still there.
+void seedCursorAt(Backend & backend, const Layout & layout, const RootNamespace & ns, RefTxnId cursor,
+                  std::optional<RefHold> hold = std::nullopt)
+{
+    seedFoldCursorForTest(backend, layout, ns, cursor, hold);
+    fixture::writeRefLogRaw(backend, layout, RefLogTxn{ns.string(), cursor, {}, std::nullopt});
+}
+
 /// A pool with ONE eligible-but-unowned manifest body under build sequence 5: the shape the sweep is
 /// meant to reclaim, so that every test below differs only in the durable fold state.
 struct OrphanFixture
@@ -104,7 +112,7 @@ struct UndecodableOrphanFixture
 TEST(CASSweepDeletionPremise, AnUnconsumedEpochSealRetainsTheBuildsManifests)
 {
     OrphanFixture f;
-    seedFoldCursorForTest(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch, 3});
+    seedCursorAt(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch, 3});
 
     std::vector<String> warnings;
     const uint64_t deleted = sweepNamespace(*f.store, f.ns, buildPrefix(5), &warnings);
@@ -124,7 +132,7 @@ TEST(CASSweepDeletionPremise, AConsumedEpochSealWithACleanTailDeletes)
     OrphanFixture f;
     /// A cursor at `{2, 1}` is in an epoch strictly above the build's. An epoch is left ONLY over its
     /// consumed `EpochSeal`, so this cursor is durable proof that every epoch-1 record is folded.
-    seedFoldCursorForTest(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch + 1, 1});
+    seedCursorAt(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch + 1, 1});
 
     std::vector<String> warnings;
     const uint64_t deleted = sweepNamespace(*f.store, f.ns, buildPrefix(5), &warnings);
@@ -143,7 +151,7 @@ TEST(CASSweepDeletionPremise, AHeldNamespaceRetainsEvenAboveAConsumedSeal)
     const RefHold hold{.reason = HoldReason::GapBelowWitness,
                        .offending_position = RefTxnId{kBuildEpoch + 1, 4},
                        .retry_count = 2, .next_retry_round = 9};
-    seedFoldCursorForTest(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch + 1, 3}, hold);
+    seedCursorAt(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch + 1, 3}, hold);
 
     std::vector<String> warnings;
     const uint64_t deleted = sweepNamespace(*f.store, f.ns, buildPrefix(5), &warnings);
@@ -209,7 +217,7 @@ TEST(CASSweepDeletionPremise, AnUnconsumedTailRemovalRetainsItsTarget)
 TEST(CASSweepDeletionPremise, TheCursorPagePathHonoursTheSamePremise)
 {
     OrphanFixture f;
-    seedFoldCursorForTest(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch, 3});
+    seedCursorAt(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch, 3});
 
     const ManifestSweepResult held = sweepManifestCursorPageForTest(*f.store, "", /*list_budget*/100, /*delete_budget*/10);
     EXPECT_EQ(held.deleted, 0u);
@@ -217,7 +225,7 @@ TEST(CASSweepDeletionPremise, TheCursorPagePathHonoursTheSamePremise)
     EXPECT_TRUE(f.orphanExists());
 
     /// Consume the seal and the very same page deletes it.
-    seedFoldCursorForTest(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch + 1, 1});
+    seedCursorAt(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch + 1, 1});
     const ManifestSweepResult freed = sweepManifestCursorPageForTest(*f.store, "", /*list_budget*/100, /*delete_budget*/10);
     EXPECT_EQ(freed.deleted, 1u);
     EXPECT_FALSE(f.orphanExists());
@@ -227,7 +235,7 @@ TEST(CASSweepDeletionPremise, TheCursorPagePathHonoursTheSamePremise)
 TEST(CASSweepDeletionPremise, AnUndecodableManifestDoesNotWedgeTheCursorPage)
 {
     UndecodableOrphanFixture f;
-    seedFoldCursorForTest(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch + 1, 1});
+    seedCursorAt(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch + 1, 1});
 
     /// A payload-zone banner that no longer matches its entry path: the exact shape the reproducer
     /// produced -- built by hand, because a correct encoder never emits a banner that disagrees with
@@ -314,7 +322,7 @@ TEST(CASSweepDeletionPremise, DistinctRetainReasonsLandInDistinctCounters)
     const ManifestRef ref_a = ref(5, 0xA1);
     casAdmitRecoverableEntry(*backend, layout, ns_a);
     writeManifestRaw(*backend, layout, ns_a, ref_a, {blobEntryFor("a", DB::UInt128(1))});
-    seedFoldCursorForTest(*backend, layout, ns_a, RefTxnId{kBuildEpoch, 3});
+    seedCursorAt(*backend, layout, ns_a, RefTxnId{kBuildEpoch, 3});
 
     /// Namespace B: a HELD row whose cursor is well above the build's epoch, so rule (1) is satisfied
     /// and the hold is demonstrably what retained it.
@@ -325,7 +333,7 @@ TEST(CASSweepDeletionPremise, DistinctRetainReasonsLandInDistinctCounters)
     const RefHold hold{.reason = HoldReason::BodyUndecodable,
                        .offending_position = RefTxnId{kBuildEpoch + 1, 9},
                        .retry_count = 1, .next_retry_round = 4};
-    seedFoldCursorForTest(*backend, layout, ns_b, RefTxnId{kBuildEpoch + 1, 8}, hold);
+    seedCursorAt(*backend, layout, ns_b, RefTxnId{kBuildEpoch + 1, 8}, hold);
 
     setWatermarkMinActive(*backend, layout, kServerRoot, kBuildEpoch, /*min_active_build_sequence*/6);
 
@@ -371,7 +379,7 @@ TEST(CASSweepDeletionPremise, AnExhaustedDeleteBudgetRetainsAndDoesNotStepOverTh
     const ManifestRef third = ref(5, 0xAD);
     writeManifestRaw(*f.backend, f.store->layout(), f.ns, second, {blobEntryFor("b", DB::UInt128(2))});
     writeManifestRaw(*f.backend, f.store->layout(), f.ns, third, {blobEntryFor("c", DB::UInt128(3))});
-    seedFoldCursorForTest(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch + 1, 1});
+    seedCursorAt(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch + 1, 1});
 
     const ManifestSweepResult first = sweepManifestCursorPageForTest(*f.store, "", /*list_budget*/100, /*delete_budget*/1);
     EXPECT_EQ(first.deleted, 1u);
@@ -493,8 +501,8 @@ TEST(CASSweepDeletionPremise, NamespaceWorkBudgetCapsDistinctViewsPerPage)
     writeManifestRaw(*backend, layout, ns_b, ref_b, {blobEntryFor("b", DB::UInt128(2))});
     /// Both namespaces satisfy rule (1) (cursor past the build's own epoch) and have no committed tail
     /// at all (`_ckpt.committed_through` unset), so absent the namespace cap BOTH would delete.
-    seedFoldCursorForTest(*backend, layout, ns_a, RefTxnId{kBuildEpoch + 1, 1});
-    seedFoldCursorForTest(*backend, layout, ns_b, RefTxnId{kBuildEpoch + 1, 1});
+    seedCursorAt(*backend, layout, ns_a, RefTxnId{kBuildEpoch + 1, 1});
+    seedCursorAt(*backend, layout, ns_b, RefTxnId{kBuildEpoch + 1, 1});
     setWatermarkMinActive(*backend, layout, kServerRoot, kBuildEpoch, /*min_active_build_sequence*/6);
 
     GcRoundWorkBudget budget;
