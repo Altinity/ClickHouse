@@ -569,7 +569,7 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
         meta_op, layout, config.blob_header_len, config.gc_shards, config.blob_hash_algo,
         /*allow_new=*/config.blob_hash_allow_new && !config.read_only,   /// an observe open validates, never admits
         /*allow_mint=*/!config.read_only,
-        /*initial_min_reader_generation=*/G_REF_MOVE);
+        /*initial_min_reader_generation=*/mount_reader_floor);
     config.gc_shards = meta.gc_shards;
     const BlobHashAlgo write_algo = config.blob_hash_algo;   /// `config` is moved-from just below
 
@@ -880,7 +880,7 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
         break;
     }
 
-    /// One-way, and only after the claim: a node that holds identity and lease can emit owner moves.
+    /// One-way, and only after the claim: a node that holds identity and lease can write generation 3 objects.
     /// The renewal-window check below counts the time the raise takes. If the claim and the raise outrun
     /// that window the open fails with the raise already durable, so the next open has no raise to do.
     raiseReaderFloor(store, mount_reader_floor);
@@ -898,8 +898,8 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     /// THIS NO LONGER WAITS. The `materialization_grace_ms` (`T_mat`) sleep that used to sit here bought
     /// one thing: time for that straggler to land (or exhaust its retries) BEFORE this incarnation began
     /// trusting its recovery LISTINGS. Recovery does not trust listings any more. It walks each ref
-    /// stream arithmetically from `_ckpt` and closes every dead epoch with an in-band `EpochSeal` at
-    /// `{E, T+1}`, written as a conditional create -- so the straggler's own conditional create loses to
+    /// stream from `_ckpt` and closes a chain that ends below the live epoch with a tombstone in the slot
+    /// after its last record, written as a conditional create -- so the straggler's own conditional create loses to
     /// an occupied slot no matter when it arrives, and a wait can only make startup slower, never safer.
     /// What survives is the CLASSIFICATION and saying it out loud: an unclean predecessor is worth an
     /// operator-visible line, and the exhaustive switch is worth keeping as the build-time guard.
@@ -1610,13 +1610,13 @@ bool Pool::tryRemountOnce()
         /// whenever this incarnation's own ref lanes had not provably settled before the fence tripped:
         /// an unresolved (still-wedged) ref-log conditional `PUT` from the dying epoch could otherwise
         /// land after recovery began trusting its listings. Recovery no longer trusts listings — it walks
-        /// arithmetically and closes every epoch below the live one with an in-band `EpochSeal` at
-        /// `{E, T+1}`, so the wedged `PUT` loses its own conditional create to that seal and the wait
+        /// the chain and closes it, when it ends below the live epoch, with a tombstone in the slot after its
+        /// last record, so the wedged `PUT` loses its own conditional create to that tombstone and the wait
         /// bought nothing but latency on every fence recovery.
         ///
         /// That replacement has ONE precondition, and it is this one: the incarnation we are about to
         /// install must outrank the dying one. If the epoch did not strictly advance, the straggler's
-        /// slot is not "below the live epoch", nothing seals it, and the hole the wait used to paper over
+        /// chain does not end below the live epoch, recovery writes no tombstone, and the hole the wait used to paper over
         /// reopens silently. `allocateWriterEpoch` mints from a durable monotone counter, so this holds by
         /// construction — which is exactly why it is worth asserting rather than assuming: it fails the
         /// build's own tests the moment someone reuses an epoch across a remount.
@@ -1642,8 +1642,8 @@ bool Pool::tryRemountOnce()
         mount_runtime.setProcessEpoch(writer_epoch, std::memory_order_release);
         /// 2. CANCEL OR JOIN every in-flight ref-table recovery, and BLOCK here until none is left (spec
         ///    §3: "self-remount cancels or waits out recovery before rearming"). A recovery admitted under
-        ///    the outgoing incarnation WRITES -- its seal CAS-walk mints epoch seals and advances the
-        ///    `_ckpt` -- so it must be stopped at this boundary rather than caught one site at a time
+        ///    the outgoing incarnation WRITES -- it stamps `_ckpt` and creates a tombstone -- so it must be
+        ///    stopped at this boundary rather than caught one site at a time
         ///    after the incarnation has already changed underneath it. Strictly before the quiesce below
         ///    so a cancelled walk unwinds while its runtime is still attached, and strictly before the
         ///    re-arm so no old-generation write can straddle it.
@@ -2282,11 +2282,6 @@ uint64_t Pool::wedgedAdmittedGenerationForTest(const RootNamespace & ns)
 std::optional<RefTxnId> Pool::lastEpochSealForTest(const RootNamespace & ns)
 {
     return ref_ledger.lastEpochSealForTest(ns);
-}
-
-void Pool::setLastEpochSealForTest(const RootNamespace & ns, const std::optional<RefTxnId> & seal)
-{
-    ref_ledger.setLastEpochSealForTest(ns, seal);
 }
 
 RefLaneState Pool::laneStateForTest(const RootNamespace & ns)

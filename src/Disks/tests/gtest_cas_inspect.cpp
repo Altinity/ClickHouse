@@ -73,7 +73,8 @@ TEST(CASInspect, RendersEpochSealTxnWithPrevEpochSeal)
     txn.ops.push_back(op);
 
     const String key = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), id);
-    const String bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(txn));
+    /// An old-format seal: only a header below 3 carries one without `next_epoch`.
+    const String bytes = sealObject(FormatId::RefLog, encodeRefLogTxnAtGeneration(txn, 1));
 
     const String json = caInspectToJson(layout, key, bytes, DB::Cas::tests::fixture::fixtureLife(ns));
     EXPECT_NE(json.find(R"("kind":"epoch_seal")"), String::npos) << json;

@@ -3,6 +3,7 @@
 #include <Common/Exception.h>
 #include <set>
 #include <string_view>
+#include <utility>
 
 namespace DB::ErrorCodes
 {
@@ -48,7 +49,7 @@ TEST(CASFormat, EveryClassResetToTheBaselineGeneration)
 {
     for (auto id : allRegisteredFormatIds())
     {
-        if (id == FormatId::RefLog)
+        if (id == FormatId::RefLog || id == FormatId::RefCkpt)
             continue;
         const auto cps = changePoints(id);
         ASSERT_EQ(cps.size(), 1u) << "FormatId " << static_cast<int>(id);
@@ -68,28 +69,40 @@ TEST(CASFormat, CurrentVersionsAreGBuild)
     EXPECT_EQ(currentCompatibilityVersion(), G_WRITE_FLOOR);
 }
 
-TEST(CASFormat, RefLogHistoryRecordsTheOwnerMoveGeneration)
+TEST(CASFormat, RefLogAndRefCkptHistoriesRecordGenerationThree)
 {
-    const auto cps = changePoints(FormatId::RefLog);
-    ASSERT_EQ(cps.size(), 2u);
-    EXPECT_EQ(cps.back().generation, 2u);
-    EXPECT_EQ(cps.back().min_reader, 2u) << "a Move-bearing log is meaningless to a generation-1 reader";
+    EXPECT_EQ(G_REF_CHAIN, 3u);
+    EXPECT_EQ(G_BUILD, 3u);
+    EXPECT_EQ(currentReadCeiling(), 3u);
+
+    const auto pair = [](const FormatChangePoint & cp) { return std::make_pair(cp.generation, cp.min_reader); };
+    using Pair = std::pair<uint16_t, uint16_t>;
+
+    const auto log_cps = changePoints(FormatId::RefLog);
+    ASSERT_EQ(log_cps.size(), 3u);
+    EXPECT_EQ(pair(log_cps[1]), Pair(2, 2)) << "a Move-bearing log is meaningless to a generation-1 reader";
+    EXPECT_EQ(pair(log_cps.back()), Pair(3, 3));
+
+    const auto ckpt_cps = changePoints(FormatId::RefCkpt);
+    ASSERT_EQ(ckpt_cps.size(), 2u);
+    EXPECT_EQ(pair(ckpt_cps.front()), Pair(1, 1));
+    EXPECT_EQ(pair(ckpt_cps.back()), Pair(3, 3));
+
+    for (auto id : allRegisteredFormatIds())
+    {
+        if (id == FormatId::RefLog || id == FormatId::RefCkpt)
+            continue;
+        const auto cps = changePoints(id);
+        ASSERT_EQ(cps.size(), 1u) << "FormatId " << static_cast<int>(id);
+        EXPECT_EQ(pair(cps.front()), Pair(1, 1)) << "FormatId " << static_cast<int>(id);
+    }
 }
 
 TEST(CASFormat, ReadCeilingIsAboveTheWriteFloor)
 {
-    EXPECT_EQ(G_BUILD, 2u);
+    EXPECT_EQ(G_BUILD, 3u);
     EXPECT_EQ(currentCompatibilityVersion(), G_WRITE_FLOOR);
     EXPECT_EQ(G_WRITE_FLOOR, 1u);
-}
-
-/// Pin: replaced when the first generation 3 write is advertised.
-TEST(CASFormat, ChainGenerationIsNotAdvertisedYet)
-{
-    EXPECT_EQ(G_REF_CHAIN, 3u);
-    EXPECT_EQ(G_BUILD, 2u);
-    EXPECT_EQ(currentReadCeiling(), 2u);
-    EXPECT_EQ(changePoints(FormatId::RefLog).back().generation, 2u);
 }
 
 TEST(CASFormat, CheckCompatibilityPassesWhenKnown)

@@ -83,16 +83,15 @@ TEST(CASRefEpochSealFormat, RemovalClassIsFalseForEpochSeal)
 
 TEST(CASRefEpochSealFormat, RoundTripSealAtSequenceOneWithPrevEpochSeal)
 {
-    /// An empty dead epoch (3) closes with a sequence-1 seal, which is therefore itself required to
-    /// carry `prev_epoch_seal` chaining to the seal that closed epoch 2 (spec INV-2's grammar: required
-    /// on exactly sequence 1 of every epoch above genesis).
+    /// An old-format sequence-1 seal of an empty epoch (3) carries `prev_epoch_seal` chaining to the seal
+    /// that closed epoch 2. Only a header below 3 carries a seal without `next_epoch`.
     RefLogTxn txn;
     txn.ns = "ns";
     txn.txn_id = RefTxnId{3, 1};
     txn.prev_epoch_seal = RefTxnId{2, 9};
     txn.ops.push_back(epochSealOp());
 
-    const String bytes = encodeRefLogTxn(txn);
+    const String bytes = encodeRefLogTxnAtGeneration(txn, 1);
     const RefLogTxn decoded = decodeRefLogTxn(bytes, txn.ns, txn.txn_id);
     EXPECT_EQ(decoded, txn);
     ASSERT_TRUE(decoded.prev_epoch_seal.has_value());
@@ -126,9 +125,9 @@ TEST(CASRefEpochSealFormat, ByteIdenticalReencodeWithPrevEpochSeal)
     txn.prev_epoch_seal = RefTxnId{2, 9};
     txn.ops.push_back(epochSealOp());
 
-    const String bytes1 = encodeRefLogTxn(txn);
+    const String bytes1 = encodeRefLogTxnAtGeneration(txn, 1);
     const RefLogTxn decoded = decodeRefLogTxn(bytes1, txn.ns, txn.txn_id);
-    const String bytes2 = encodeRefLogTxn(decoded);
+    const String bytes2 = encodeRefLogTxnAtGeneration(decoded, 1);
     EXPECT_EQ(bytes1, bytes2);
 }
 
@@ -268,7 +267,7 @@ TEST(CASRefEpochSealFormat, DecodeRejectsPrevEpochSealMissingPssComponent)
     txn.txn_id = RefTxnId{3, 1};
     txn.prev_epoch_seal = RefTxnId{2, 9};
     txn.ops.push_back(epochSealOp());
-    const String bytes = encodeRefLogTxn(txn);
+    const String bytes = encodeRefLogTxnAtGeneration(txn, 1);
 
     const String needle = R"(,"!prev_seq":"9")";
     const auto pos = bytes.find(needle);
@@ -487,7 +486,7 @@ TEST(CASRefEpochSealFormat, FormatBatteryEpochSeal)
     const String ns = txn.ns;
     const RefTxnId id = txn.txn_id;
     runFormatBattery({FormatId::RefLog,
-        [txn] { return sealObject(FormatId::RefLog, encodeRefLogTxn(txn)); },
+        [txn] { return sealObject(FormatId::RefLog, encodeRefLogTxnAtGeneration(txn, 1)); },
         [ns, id](std::string_view s) { decodeRefLogTxn(openObject(FormatId::RefLog, s), ns, id); },
         "{\"type\":\"cas_ref_log\",\"v\":1}\n"
         "{\"namespace\":\"ns\",\"txn_epoch\":\"3\",\"txn_seq\":\"1\",\"!prev_epoch\":\"2\",\"!prev_seq\":\"9\"}\n"
@@ -577,18 +576,26 @@ TEST(CASRefEpochSealFormat, ReadCeilingTwoRejectsHeaderThree)
     expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { decodeRefLogTxn(bytes, ns, RefTxnId{5, 3}); });
 }
 
-/// Pin: until the writer switches, a head with a backlink keeps today's header.
-TEST(CASRefEpochSealFormat, BacklinkHeadKeepsItsHeaderBeforeTheWriterCommit)
+TEST(CASRefEpochSealFormat, BacklinkHeadIsHeaderThree)
 {
     const String ns = "ns";
     const RefLogTxn head = headTxn(ns, RefTxnId{5, 1}, RefTxnId{4, 2}, {namespaceBirthOp()});
-    EXPECT_EQ(refLogTxnHeaderGeneration(head), 1u);
+    EXPECT_EQ(refLogTxnHeaderGeneration(head), 3u);
     ASSERT_TRUE(sniffHeaderLine(encodeRefLogTxn(head)).has_value());
-    EXPECT_EQ(sniffHeaderLine(encodeRefLogTxn(head))->v, 1u);
+    EXPECT_EQ(sniffHeaderLine(encodeRefLogTxn(head))->v, 3u);
 
     const RefLogTxn with_move = headTxn(ns, RefTxnId{5, 1}, RefTxnId{4, 2}, {moveOpForFormat()});
-    EXPECT_EQ(refLogTxnHeaderGeneration(with_move), 2u);
-    EXPECT_EQ(sniffHeaderLine(encodeRefLogTxn(with_move))->v, 2u);
+    EXPECT_EQ(sniffHeaderLine(encodeRefLogTxn(with_move))->v, 3u);
+
+    RefLogTxn plain;
+    plain.ns = ns;
+    plain.txn_id = RefTxnId{5, 2};
+    plain.ops = {namespaceBirthOp()};
+    EXPECT_EQ(refLogTxnHeaderGeneration(plain), 1u);
+    EXPECT_EQ(sniffHeaderLine(encodeRefLogTxn(plain))->v, 1u);
+
+    /// An old-format head stays encodable below 3: what content needs is not what the encoder stamps.
+    EXPECT_EQ(sniffHeaderLine(encodeRefLogTxnAtGeneration(head, 1))->v, 1u);
 }
 
 TEST(CASRefEpochSealFormat, HeaderBelowThreeRejectsNextEpoch)

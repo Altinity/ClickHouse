@@ -306,11 +306,26 @@ bool refLogTxnContainsMove(const RefLogTxn & txn)
     return false;
 }
 
-uint32_t refLogTxnHeaderGeneration(const RefLogTxn & txn)
+namespace
+{
+
+/// The lowest header that can carry `txn`: a log without a chain construct stays readable below 3.
+uint32_t refLogTxnRequiredGeneration(const RefLogTxn & txn)
 {
     if (txn.next_epoch)
         return G_REF_CHAIN;
     return refLogTxnContainsMove(txn) ? G_REF_MOVE : currentCompatibilityVersion();
+}
+
+}
+
+uint32_t refLogTxnHeaderGeneration(const RefLogTxn & txn)
+{
+    /// A backlink is stamped 3 too: a sparse one is unreadable below 3, and one rule for both shapes
+    /// keeps the header a function of the fields rather than of the epoch arithmetic.
+    if (txn.next_epoch || txn.prev_epoch_seal)
+        return G_REF_CHAIN;
+    return refLogTxnRequiredGeneration(txn);
 }
 
 String encodeRefLogTxn(const RefLogTxn & txn)
@@ -323,9 +338,9 @@ String encodeRefLogTxnAtGeneration(const RefLogTxn & txn, uint32_t header_genera
     checkRefTxnIdNonzero(txn.txn_id, "RefLogTxn", "txn_id");
     if (header_generation > G_REF_CHAIN)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: header generation {} is above {}", header_generation, G_REF_CHAIN);
-    if (header_generation < refLogTxnHeaderGeneration(txn))
+    if (header_generation < refLogTxnRequiredGeneration(txn))
         throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "RefLogTxn: content needs header generation {}, got {}", refLogTxnHeaderGeneration(txn), header_generation);
+            "RefLogTxn: content needs header generation {}, got {}", refLogTxnRequiredGeneration(txn), header_generation);
     validateEpochSealGrammarStructural(txn, header_generation);
 
     CasJsonWriter out(512);

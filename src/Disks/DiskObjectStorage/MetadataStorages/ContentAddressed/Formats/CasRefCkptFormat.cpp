@@ -107,7 +107,7 @@ void checkRefCkptInvariants(const RefCkpt & ckpt, std::string_view what)
 
 uint32_t refCkptWriteGeneration()
 {
-    return currentCompatibilityVersion();
+    return G_REF_CHAIN;
 }
 
 String encodeRefCkpt(const RefCkpt & ckpt)

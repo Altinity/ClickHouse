@@ -27,35 +27,18 @@ struct RecoveryGrounding
 RecoveryGrounding chooseRecoveryGrounding(const std::optional<CatalogEntry> & catalog_state,
                                           const std::optional<RefCkpt> & ckpt);
 
-/// THE update and read algorithms for one namespace's `_ckpt` object (spec INV-4). The object itself
-/// and its codec live in `Formats/CasRefCkptFormat.h`; this header is what WRITES it and what a reader
-/// consults when the base it sampled turns out to be gone.
+/// The writers of one namespace's `_ckpt` object and what a reader consults when the base it sampled
+/// turns out to be gone. The object itself and its codec live in `Formats/CasRefCkptFormat.h`.
 
-/// The one semantic-maximum merge, shared by BOTH `_ckpt` writers (the snapshot publisher and the
-/// sealer). Per field: the greater `life_epoch`, the greater present `checkpoint_snapshot_id`, the
-/// greater present `last_epoch_seal`; an absent optional loses to a present one, and two absents stay
-/// absent.
-///
-/// There is deliberately ONE of these rather than a surgical per-writer update. A `_ckpt` write is a
-/// whole-body read-modify-write, so a writer that wrote back only the field it knows about would carry
-/// its STALE reading of the other field along with it and silently regress the other writer's
-/// progress. That regression is not hypothetical: it is TLC counterexample `_sab_sealclobbersbase`,
-/// where a sealer writing its sampled body back verbatim drops a concurrently published base and the
-/// next recovery loses an ACKED transaction.
-///
-/// Compatible contributions still merge commutatively, but the committed frontier is deliberately not
-/// an unconstrained CRDT maximum: a cross-epoch pair must be numerically adjacent and carry its seal
-/// evidence. That makes arbitrary regrouping of a corrupt historical set invalid, while the actual
-/// publish protocol remains simple: each write merges one contribution with the one durable body it
-/// just read.
-///
-/// It is therefore NOT where `life_epoch`'s may-not-decrease rule or the frontier refusals live, and that
-/// is a placement decision rather than an omission: a commutative function does not know which of its
-/// arguments is the durable one, so it cannot tell a decrease from an increase. Those rules belong to
-/// `publishCkpt`, which does know.
+/// The legacy semantic-maximum merge of generation 1 and 2 bodies, used only by `publishCkpt`. Per
+/// field: the greater `life_epoch`, the greater present `checkpoint_snapshot_id`, the greater present
+/// `last_epoch_seal`; an absent optional loses to a present one, and two absents stay absent. A
+/// cross-epoch `committed_through` pair must be numerically adjacent and carry its seal evidence.
+/// It does not hold the `life_epoch` decrease refusal or the frontier refusals: a commutative function
+/// cannot tell which argument is durable, so those live in `publishCkpt`.
 RefCkpt mergeCkpt(const RefCkpt & a, const RefCkpt & b);
 
-/// What one `publishCkpt` call did.
+/// What one `_ckpt` publication did: `publishCkpt`, `createCkptAtCreation` or `publishCkptSnapshot`.
 enum class CkptPublishOutcome : uint8_t
 {
     Published,      /// the contribution is durable, and this call sent at least one write before it
@@ -71,6 +54,7 @@ enum class CkptPublishOutcome : uint8_t
     Superseded,     /// UNRESOLVED: a later epoch moved past this non-seal frontier, and `_ckpt` cannot tell
                     /// whether the successor adopted it. No write follows the verdict, but an earlier
                     /// attempt of this call may have landed. Handle like `FencedOut`
+    NotAdvanced,    /// nothing was written and the caller's fact is not in `_ckpt`
 };
 
 /// True when the contribution is durable in `_ckpt`: the only outcomes after which a caller may act on it.
@@ -79,19 +63,14 @@ inline bool ckptContributionRecorded(CkptPublishOutcome outcome)
     return outcome == CkptPublishOutcome::Published || outcome == CkptPublishOutcome::IdenticalSkip;
 }
 
-/// Merge `contribution` into `life`'s `_ckpt` and make the result durable, as ONE read-modify-write
-/// on `op`.
-///
-/// An ABSENT object is created from `contribution` as it stands. Every writer may create it and none
-/// may complete it: a publisher that knows only the checkpoint creates one that knows only the
-/// checkpoint, and the field a different writer knows merges in whenever it arrives, in either order.
-/// That is the whole reason each field is optional rather than defaulted.
+/// The legacy publisher of generation 1 and 2 bodies; no production code calls it, and it refuses a
+/// generation 3 body with `CORRUPTED_DATA`. It merges `contribution` into `life`'s `_ckpt` and makes the
+/// result durable, as ONE read-modify-write on `op`; an ABSENT object is created from `contribution`.
 ///
 /// The `life_epoch` and identical-body verdicts consult `op.admitted()` before they speak, because a writer
 /// the fence is about to refuse has landed nothing AT THAT POINT: it is told `FencedOut` rather than `IdenticalSkip`
 /// or a corruption verdict. `FencedOut` is returned rather than thrown because it is an expected,
-/// transient control signal, and the snapshot publisher that calls this sits after a durable PUT where
-/// an exception would be worse than a value. It does NOT promise the object is unchanged -- a lost
+/// transient control signal. It does NOT promise the object is unchanged -- a lost
 /// admission is also reported for a write already proven durable.
 ///
 /// A NON-seal frontier contribution (`committed_through` present and not equal to its own
@@ -131,6 +110,38 @@ struct CkptSample
 /// Point-read of `life`'s `_ckpt`. `nullopt` means the object is absent (a namespace whose creation has
 /// not published one yet); a present-but-undecodable object throws `CORRUPTED_DATA`.
 std::optional<CkptSample> readCkpt(CasOperation & op, const Layout & layout, const NamespaceLifeId & life);
+
+/// Create-if-absent of the generation 3 body `{life_epoch}`; the only production writer that creates `_ckpt`.
+/// Absent -> created: `Published`. Present, whatever it holds, or a lost create race: `IdenticalSkip`,
+/// so a durable `life_epoch` is never replaced. Fence lost: `FencedOut`.
+CkptPublishOutcome createCkptAtCreation(CasOperation & op, const Layout & layout, const NamespaceLifeId & life,
+                                        uint64_t life_epoch, const Retry & policy = Retry::standard());
+
+/// Conditional replace of a present generation 3 body that raises `checkpoint_snapshot_id`.
+/// Replaced: `Published`. Durable id equal to `snapshot_id`: `IdenticalSkip`. Object absent, below
+/// generation 3, or durable id above `snapshot_id`: `NotAdvanced`. Fence lost: `FencedOut`.
+CkptPublishOutcome publishCkptSnapshot(CasOperation & op, const Layout & layout, const NamespaceLifeId & life,
+                                       const RefTxnId & snapshot_id, const Retry & policy = Retry::standard());
+
+enum class CkptStampOutcome : uint8_t
+{
+    Stamped,
+    TokenMismatch,
+    Unresolved,
+};
+
+struct CkptStampResult
+{
+    CkptStampOutcome outcome;
+    /// Set iff `Stamped`: the body now durable and the token it was written under.
+    std::optional<CkptSample> stamped;
+};
+
+/// One conditional replace on `accepted.etag` with `{life_epoch, checkpoint_snapshot_id}` at generation 3.
+/// An absent object or another token: `TokenMismatch`. A write that did not commit for any other reason,
+/// an unknown outcome included: `Unresolved`.
+CkptStampResult stampCkptGeneration3(CasOperation & op, const Layout & layout, const NamespaceLifeId & life,
+                                     const CkptSample & accepted);
 
 /// The verdict of INV-4's three-way revalidation, for the one leg that is not simply "it is there".
 enum class MissingBaseVerdict : uint8_t

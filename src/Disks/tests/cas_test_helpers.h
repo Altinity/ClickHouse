@@ -1695,7 +1695,12 @@ inline void writeRefLogTxnRaw(
     const NamespaceLifeId life
         = CasRefCatalog::lifeIfCataloged(*operation, layout, ns).value_or(fixture::fixtureLife(ns));
     const String key = layout.refLogKey(life, txn.txn_id);
-    (*operation).create(key, DB::Cas::sealObject(DB::Cas::FormatId::RefLog, DB::Cas::encodeRefLogTxn(txn)), DB::Cas::Retry::standard());
+    /// A seal without `next_epoch` is an old-format record, which only a header below 3 can carry: write
+    /// the bytes a build before generation 3 wrote for it.
+    const bool old_format_seal = DB::Cas::refLogTxnIsEpochSeal(txn) && !txn.next_epoch;
+    const String text = old_format_seal ? DB::Cas::encodeRefLogTxnAtGeneration(txn, DB::Cas::G_WRITE_FLOOR)
+                                        : DB::Cas::encodeRefLogTxn(txn);
+    (*operation).create(key, DB::Cas::sealObject(DB::Cas::FormatId::RefLog, text), DB::Cas::Retry::standard());
 }
 
 namespace fixture

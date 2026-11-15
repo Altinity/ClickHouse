@@ -134,8 +134,8 @@ inline constexpr size_t ref_op_max_bytes = 4096;
 /// limit violation over the encoded text.
 String encodeRefLogTxn(const RefLogTxn & txn);
 
-/// The header generation `encodeRefLogTxn` stamps: `G_REF_CHAIN` iff `next_epoch` is set, else `G_REF_MOVE`
-/// iff the transaction has a `Move`, else `currentCompatibilityVersion`.
+/// The header generation `encodeRefLogTxn` stamps: `G_REF_CHAIN` iff `next_epoch` or `prev_epoch_seal` is set,
+/// else `G_REF_MOVE` iff the transaction has a `Move`, else `currentCompatibilityVersion`.
 uint32_t refLogTxnHeaderGeneration(const RefLogTxn & txn);
 
 /// Encodes under an explicit header generation. Throws CORRUPTED_DATA for a generation below what the

@@ -23,21 +23,15 @@ namespace DB::Cas
 ///     advanced token means cleanup moved the base while we read (restart), an unchanged token means
 ///     the base was deleted under a live checkpoint, which is corruption.
 ///
-/// TWO writers update it -- the snapshot publisher and the sealer -- and both run the SAME algorithm
-/// (`mergeCkpt` + `publishCkpt` in `Pool/CasRefCkpt.h`): read the whole body, merge by SEMANTIC
-/// MAXIMUM per field, token-CAS. (`publishCkpt` adds refusals the merge itself cannot express -- a
-/// `life_epoch` BELOW the durable one, and a frontier a successor sealed or moved past -- because only
-/// the publish site knows which side is durable.)
-/// Writing the whole body is what makes a stale field dangerous, and
-/// the merge is what contains it: a writer that skipped it and wrote back the value it sampled
-/// earlier would silently regress the OTHER writer's progress (TLC counterexample
-/// `_sab_sealclobbersbase`, which loses an acked transaction).
+/// `_ckpt` is created at generation 3 by namespace creation or raised to it by the generation 3 stamp,
+/// and a generation 3 body is replaced only by snapshot publication (`Pool/CasRefCkpt.h`). `mergeCkpt`
+/// and `publishCkpt` are the legacy merge path of generation 1 and 2 bodies; no production code calls them.
 ///
 /// INVARIANT (Constraint 15), and it constrains what may ever be ADDED here, not merely what is here
 /// today: `_ckpt` is a fixed-size product of SCALAR MONOTONE FACTS. Its encoded size is `O(1)` in refs,
 /// files, transactions and writer epochs. Maps, collections and cardinality-growing fields belong in a
 /// separate immutable object or ledger -- never in this one, because this one is MUTABLE, is rewritten
-/// whole on every publish by two concurrent writers, and has NO REPAIR PATH: a `_ckpt` that grows with
+/// whole on every publish, and has NO REPAIR PATH: a `_ckpt` that grows with
 /// the table is a body that eventually cannot be rewritten atomically, on the single object that names
 /// recovery's base and gates destructive cleanup.
 ///
@@ -54,29 +48,9 @@ namespace DB::Cas
 /// `std::is_trivially_copyable_v<RefCkpt>` assertion that a heap-owning field would break.
 struct RefCkpt
 {
-    /// The namespace's birth epoch -- the `writer_epoch` of its `NamespaceBirth` record. It is what
-    /// makes the epoch-seal grammar checkable without walking to the beginning of the stream
-    /// (`validateEpochSealGrammarContextual` takes exactly this value).
-    ///
-    /// It is NOT a namespace-lifetime constant, and the previous version of this comment said it was --
-    /// which is how the merge rule below came to be described as "its semantic maximum is itself". TWO
-    /// writers know a `life_epoch` and they derive it from different epochs: `completeCreation` from the
-    /// catalog creator's `writer_epoch`, and `commitRefChunk`'s birth chunk from the `NamespaceBirth`
-    /// record's. Those differ whenever a stalled `Creating` entry is resumed by a later actor over the
-    /// same incarnation, and whenever the mount's writer epoch advances between the creation and the
-    /// first write -- CREATE TABLE, restart, INSERT. The value that must survive is the LATER one (the
-    /// grammar needs the epoch the birth record actually landed at), and it is always the later
-    /// contribution, because writer epochs are durable-monotone per server root. So the semantic maximum
-    /// is right, and what is refused is a DECREASE rather than a disagreement -- by `publishCkpt`, not by
-    /// `mergeCkpt`, since only the publish site can tell which of the two values is the durable one.
-    ///
-    /// OPTIONAL, and the option is load-bearing rather than a convenience. Exactly ONE writer knows
-    /// this value -- the transaction that births the namespace -- and a table recovered from durable
-    /// objects written before it existed has no way to learn it. Every OTHER writer therefore
-    /// contributes `nullopt` and the merge leaves whatever is there alone. Making it mandatory would
-    /// force those writers to supply a number they do not have, and the semantic-max merge can never
-    /// lower a wrong one: a guess here is permanent. A consumer that NEEDS the genesis epoch (Stage B's
-    /// cross-epoch GC fold) must fail closed on `nullopt`, never substitute a floor.
+    /// The namespace's genesis epoch: `{life_epoch,1}` is the first key of its chain, and
+    /// `validateEpochSealGrammarContextual` takes it. Set once, by `completeCreation`; a generation 1 or 2
+    /// body may carry a value an older build's birth raised. Required from generation 3.
     std::optional<uint64_t> life_epoch;
     /// The greatest transaction admitted to durable logical history. Absent means this life has no
     /// committed transaction; a snapshot or epoch seal is then invalid because neither can describe

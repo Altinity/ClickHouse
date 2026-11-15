@@ -524,7 +524,7 @@ RefNextSlot nextRefSlot(const RefTableState & state, uint64_t life_epoch);
 /// `newest_snapshot_id`, `tail_count`, `tail_bytes`, and `base_snapshot_bytes`. The
 /// remaining fields are recovery-context the streaming builder cannot know -- the writer's own recovery
 /// (`CasRefLedger::ensureRefTableRecovered`) fills the admission budgets,
-/// `needs_stale_precommit_sweep` and `last_epoch_seal`, before installing the whole struct under
+/// `needs_stale_precommit_sweep`, `accepted_ckpt` and `chain_epoch`, before installing the whole struct under
 /// `state_mutex` with `recovered` set last. The read-only consumers
 /// (`recoverRefTableDetailedFromAuthority` for the orphan sweep and fsck) read only
 /// `state` (plus `newest_snapshot_id` for the sweep) and leave the rest at default.
@@ -544,12 +544,10 @@ struct RecoveryResult
     uint64_t snapshot_budget = 0;
     uint64_t removal_budget = 0;
     bool needs_stale_precommit_sweep = false;
-    /// The `EpochSeal` that closed the last dead epoch the recovery CAS-walk crossed -- minted by it,
-    /// adopted from a concurrent recoverer, or read out of the durable tail. It is the `prev_epoch_seal`
-    /// this table's next sequence-1 append must carry, and `nullopt` means GENESIS exactly (see
-    /// `CasRefLedger::RefTableRuntime::last_epoch_seal`). Recovery-context rather than replay-derived
-    /// because only the walk knows which epochs were dead.
-    std::optional<RefTxnId> last_epoch_seal;
+    /// The `_ckpt` the installed table rests on; its `life_epoch` names the chain's first key.
+    std::optional<CkptSample> accepted_ckpt;
+    /// The epoch of the chain's next key; 0 for a terminal stream.
+    uint64_t chain_epoch = 0;
 };
 
 /// The streaming generalisation of `replay`: owns a PRIVATE candidate `RefTableState` and

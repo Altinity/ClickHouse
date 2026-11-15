@@ -2936,7 +2936,7 @@ TEST(CASMountOpenWaits, FloorRaiseIsCountedByTheRenewalWindowCheck)
             .boot_ms_fn = [fake_boot] { return fake_boot->load(); },
             .wait_sleep_fn = [fake_boot](uint64_t ms) { *fake_boot += ms; },
         });
-        EXPECT_EQ(store->poolMeta().min_reader_generation, G_REF_MOVE);
+        EXPECT_EQ(store->poolMeta().min_reader_generation, G_REF_CHAIN);
         return b->putOverwriteCount(l.mountKey("test")) + b->putCount(l.mountKey("test"));
     };
 
@@ -2951,7 +2951,71 @@ TEST(CASPool, FloorRaiseLogsTheNewFloor)
     DB::Cas::tests::ScopedLoggerCapture capture("CasPool", "warning");
     PoolPtr store = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     EXPECT_NE(
-        capture.captured().find("min_reader_generation raised 1 -> 2; readers below generation 2 can no longer mount this pool"),
+        capture.captured().find("min_reader_generation raised 1 -> 3; readers below generation 3 can no longer mount this pool"),
+        String::npos) << capture.captured();
+}
+
+TEST(CASPool, WritableMountRaisesTheFloorToThreeBeforeAnyGenerationThreeObject)
+{
+    struct WriteJournalBackend : InMemoryBackend
+    {
+        std::mutex mutex;
+        std::vector<String> written;
+        std::expected<String, Backend::RawConflict> write(const String & key, const String & bytes,
+                                                          const std::optional<String> & expected_value,
+                                                          TransportAccess & access) override
+        {
+            {
+                std::lock_guard lock(mutex);
+                written.push_back(key);
+            }
+            return InMemoryBackend::write(key, bytes, expected_value, access);
+        }
+    };
+    auto b = std::make_shared<WriteJournalBackend>();
+    const Layout l{"p"};
+    seedFloorOne(*b);
+    {
+        DB::Cas::tests::OperationForTest op(*b);
+        PoolMeta::raiseMinReaderGeneration(*op, l, G_REF_MOVE);
+    }
+    ASSERT_EQ(storedFloor(*b), G_REF_MOVE);
+    {
+        std::lock_guard lock(b->mutex);
+        b->written.clear();
+    }
+
+    DB::Cas::tests::ScopedLoggerCapture capture("CasPool", "warning");
+    PoolPtr store = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    const RootNamespace ns{"srv1/floor_three"};
+    store->appendRefOps(ns, MutationScope::ref("a"),
+        [](const RefTableState & state)
+        {
+            std::vector<RefOp> ops;
+            if (state.getLifecycle() != RefLifecycle::Live)
+                ops.push_back(DB::Cas::tests::namespaceBirthOp());
+            return ops;
+        }, RootMutationOrigin::Writer, RootMutationKind::Publish);
+
+    EXPECT_EQ(storedFloor(*b), G_REF_CHAIN);
+    std::vector<String> written;
+    {
+        std::lock_guard lock(b->mutex);
+        written = b->written;
+    }
+    const auto raise = std::find(written.begin(), written.end(), l.poolMetaKey());
+    ASSERT_NE(raise, written.end());
+    size_t ref_writes = 0;
+    for (auto it = written.begin(); it != written.end(); ++it)
+    {
+        if (!it->contains("/_ckpt") && !it->contains("/_log/"))
+            continue;
+        ++ref_writes;
+        EXPECT_GT(it - written.begin(), raise - written.begin()) << *it << " was written before the floor raise";
+    }
+    EXPECT_GE(ref_writes, 2u) << "the creation's _ckpt and the birth log must be among the writes";
+    EXPECT_NE(
+        capture.captured().find("min_reader_generation raised 2 -> 3; readers below generation 3 can no longer mount this pool"),
         String::npos) << capture.captured();
 }
 
@@ -3276,19 +3340,10 @@ TEST(CASRemountWaits, UnresolvedWedgeRemountPaysNoWaitEither)
            "fenced by the recovery seal, not waited out";
 }
 
-/// Sealing is decided by ARITHMETIC -- `epoch < live_epoch` -- and by nothing else. This test used to
-/// pin the opposite ("a table recovered under a later CLEAN boundary must not seal"), which was the
-/// right rule while a seal was a synthetic SNAPSHOT published only to close an unclean handover: such a
-/// seal after a clean shutdown was pure parasitic cost, so it was gated on the per-epoch unclean flag.
-///
-/// INV-2's seal is not that object. It is the chain link that makes a MISSING epoch detectable across a
-/// transition, and a chain that skips every epoch whose mount happened to shut down cleanly is not a
-/// chain -- the next sequence-1 transaction would have no `prev_epoch_seal` to name, and no reader could
-/// tell "epoch 2 was empty" from "epoch 2's records are gone". So a late-touched table now closes EVERY
-/// dead epoch below the live one, however its predecessors died, and this test pins that plus the two
-/// things that must still be true: the seals land IN-BAND (at log keys, at the slot a straggler would
-/// have taken) and no synthetic seal SNAPSHOT is written anywhere.
-TEST(CASRemountWaits, ALateTouchedTableClosesEveryDeadEpochInBandHoweverItsPredecessorsDied)
+/// Closing the chain is decided by arithmetic -- chain epoch below the live one -- and by nothing else: a
+/// late-touched table gets its tombstone however its predecessors died. The tombstone lands IN-BAND, at
+/// the slot a straggler would have taken, names the live epoch, and no epoch between gets an object.
+TEST(CASRemountWaits, ALateTouchedTableIsClosedInBandHoweverItsPredecessorsDied)
 {
     CasRequestBudget budget;
     budget.attempt_timeout_ms = 100;
@@ -3363,13 +3418,16 @@ TEST(CASRemountWaits, ALateTouchedTableClosesEveryDeadEpochInBandHoweverItsPrede
     /// remounts. Its only data is at epoch 1, so epochs 1 and 2 are both dead for it.
     EXPECT_EQ(store->listRefs(ns2).size(), 1u);
 
-    EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryEpochSealed], sealed_before + 2)
-        << "both dead epochs must be closed -- the chain link is what a later reader needs to tell an "
-           "EMPTY epoch from a LOST one, and that is independent of how each mount ended";
-    EXPECT_TRUE(readObj(*backend, layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns2), RefTxnId{1, 2})).has_value())
-        << "epoch 1 closes at the slot right after its last durable id, in-band";
-    EXPECT_TRUE(readObj(*backend, layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns2), RefTxnId{2, 1})).has_value())
-        << "empty epoch 2 closes at its own sequence 1, chained to the epoch-1 seal";
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryEpochSealed], sealed_before + 1)
+        << "one tombstone closes the chain, independent of how each mount ended";
+    /// The part's precommit and promote are `{1,1}` and `{1,2}`.
+    const auto tombstone = readObj(*backend, layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns2), RefTxnId{1, 3}));
+    ASSERT_TRUE(tombstone.has_value()) << "the chain closes at the slot right after its last durable id, in-band";
+    const RefLogTxn closing = decodeRefLogTxn(openObject(FormatId::RefLog, tombstone->bytes), ns2.string(), RefTxnId{1, 3});
+    EXPECT_TRUE(refLogTxnIsEpochSeal(closing));
+    EXPECT_EQ(closing.next_epoch, std::optional<uint64_t>{3});
+    EXPECT_FALSE(readObj(*backend, layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns2), RefTxnId{2, 1})).has_value())
+        << "epoch 2 never wrote the namespace and gets no object";
     const RefTxnId retired_sentinel_id{2, std::numeric_limits<uint64_t>::max()};
     EXPECT_FALSE(readObj(*backend, layout.refSnapshotKey(DB::Cas::tests::fixture::fixtureLife(ns2), retired_sentinel_id)).has_value())
         << "and NO synthetic seal snapshot is written: that shape is retired";

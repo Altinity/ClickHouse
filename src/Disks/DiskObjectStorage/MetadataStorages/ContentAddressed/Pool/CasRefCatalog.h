@@ -278,10 +278,10 @@ public:
     /// folded invisibly into `createNamespace`) because reconciliation resumes exactly HERE, never
     /// re-running step 1.
     ///
-    /// Step 2: `publishCkpt` with a contribution carrying `observed.creator->writer_epoch` as
-    /// `life_epoch` -- INV-4's genesis record; `observed.creator` must be present (i.e. `observed.state
-    /// == Creating`), enforced with `LOGICAL_ERROR` since a caller reaching here with anything else is
-    /// this module's own bug, not a race. A `FencedOut` from `publishCkpt` ends the attempt here.
+    /// Step 2: `createCkptAtCreation` with `observed.creator->writer_epoch` as `life_epoch`;
+    /// `observed.creator` must be present (i.e. `observed.state == Creating`), enforced with
+    /// `LOGICAL_ERROR` since a caller reaching here with anything else is this module's own bug, not a
+    /// race. A `FencedOut` from it ends the attempt here.
     ///
     /// Step 3: `CasRefCatalog::casUpdate`'s `mutate` is the fence re-check point (see the class-level
     /// note below) -- `op.admitted()` is consulted FIRST, on every fresh read this retry loop performs;

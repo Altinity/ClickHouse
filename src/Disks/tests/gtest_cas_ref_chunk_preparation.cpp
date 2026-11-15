@@ -214,52 +214,6 @@ TEST(CASRefChunkPreparation, ChainLinkRequiredExactlyOnSequenceOneOfNonGenesisEp
         << "the link must survive into the bytes that would become durable";
 }
 
-/// The birth `_ckpt` contribution is PREPARED here and published by `commitRefChunk`, because
-/// publishing it is a birth chunk's first durable effect. Preparation therefore owes two things: the
-/// value only for a birth, and the one fact no later writer can recover -- `life_epoch`.
-TEST(CASRefChunkPreparation, BirthContributionSetOnlyForNamespaceBirth)
-{
-    /// A birth chunk at epoch 3: the contribution exists and names THIS transaction's writer epoch.
-    const RefTxnId birth_id{3, 1};
-    const auto born = prepare(RefTableState{}, birth_id, std::nullopt, {birthOp()});
-    ASSERT_TRUE(born.birth_contribution.has_value());
-    ASSERT_TRUE(born.birth_contribution->life_epoch.has_value());
-    EXPECT_EQ(*born.birth_contribution->life_epoch, birth_id.writer_epoch);
-    EXPECT_FALSE(born.birth_contribution->checkpoint_snapshot_id.has_value())
-        << "the birth contributes life_epoch and nothing else -- the publisher owns the checkpoint field";
-    EXPECT_FALSE(born.birth_contribution->last_epoch_seal.has_value());
-
-    /// An ordinary content chunk contributes nothing: a second `_ckpt` write here would be a request the
-    /// append lane does not owe.
-    const auto ordinary = prepare(bornState(), RefTxnId{1, 2}, std::nullopt, {addPrecommitOp("r1", mref(3))});
-    EXPECT_FALSE(ordinary.birth_contribution.has_value());
-
-    /// A birth op mixed into a larger chunk still counts -- the check is over the whole chunk.
-    const auto mixed = prepare(RefTableState{}, RefTxnId{5, 1}, std::nullopt,
-                               {birthOp(), addPrecommitOp("r1", mref(3))});
-    ASSERT_TRUE(mixed.birth_contribution.has_value());
-    EXPECT_EQ(*mixed.birth_contribution->life_epoch, 5u);
-}
-
-TEST(CASRefChunkPreparation, CommitContributionCarriesFrontierAndOnlyMatchingSeal)
-{
-    const RefTxnId ordinary_id{1, 2};
-    const auto ordinary = prepare(bornState(), ordinary_id, std::nullopt,
-                                  {addPrecommitOp("r1", mref(3))});
-    EXPECT_EQ(ordinary.commit_contribution.committed_through, ordinary_id);
-    EXPECT_FALSE(ordinary.commit_contribution.life_epoch.has_value());
-    EXPECT_FALSE(ordinary.commit_contribution.checkpoint_snapshot_id.has_value());
-    EXPECT_FALSE(ordinary.commit_contribution.last_epoch_seal.has_value());
-
-    const RefTxnId seal_id{1, 2};
-    const auto seal = prepare(bornState(), seal_id, std::nullopt, {epochSealOp()});
-    EXPECT_EQ(seal.commit_contribution.committed_through, seal_id);
-    EXPECT_EQ(seal.commit_contribution.last_epoch_seal, seal_id)
-        << "an epoch seal and its committed frontier must be one checkpoint contribution";
-    EXPECT_FALSE(seal.commit_contribution.life_epoch.has_value());
-    EXPECT_FALSE(seal.commit_contribution.checkpoint_snapshot_id.has_value());
-}
-
 /// The attempt exists so that an `Unresolved` PUT -- an object that may be durable -- can be recorded by
 /// a MOVE and nothing else. That only holds if every field is already populated before the request goes
 /// out, so this asserts the whole struct is complete at the end of preparation.

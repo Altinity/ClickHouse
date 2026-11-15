@@ -1216,7 +1216,7 @@ TEST(CASRefCheckpoint, OnlyPublishedAndIdenticalSkipAreRecorded)
 {
     for (const CkptPublishOutcome outcome : {CkptPublishOutcome::Published, CkptPublishOutcome::IdenticalSkip,
                                              CkptPublishOutcome::FencedOut, CkptPublishOutcome::SuccessorSeal,
-                                             CkptPublishOutcome::Superseded})
+                                             CkptPublishOutcome::Superseded, CkptPublishOutcome::NotAdvanced})
     {
         bool expected = false;
         switch (outcome)
@@ -1228,6 +1228,7 @@ TEST(CASRefCheckpoint, OnlyPublishedAndIdenticalSkipAreRecorded)
             case CkptPublishOutcome::FencedOut:
             case CkptPublishOutcome::SuccessorSeal:
             case CkptPublishOutcome::Superseded:
+            case CkptPublishOutcome::NotAdvanced:
                 break;
         }
         EXPECT_EQ(ckptContributionRecorded(outcome), expected);
@@ -1388,8 +1389,7 @@ TEST(CASRefCheckpoint, TheCheckpointIsWrittenOncePerPublicationAndNotOnIdleAttem
     const NamespaceLifeId life = liveLifeOrFail(op, store->layout(), ns);
     const String key = store->layout().refCkptKey(life);
     const uint64_t writes_after_birth = backend->writes(key);
-    EXPECT_EQ(writes_after_birth, 2u)
-        << "birth publishes `life_epoch` before its log, then the durable log's committed frontier";
+    EXPECT_EQ(writes_after_birth, 1u) << "creation writes `_ckpt` once; the birth log writes none";
 
     ASSERT_TRUE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
     EXPECT_EQ(backend->writes(key), writes_after_birth + 1) << "one publication, one checkpoint write";
@@ -1427,11 +1427,10 @@ TEST(CASRefCheckpoint, SnapshotPublisherRefusesEpochSealCandidateWithoutAnyWrite
     const String snapshot_key = store->layout().refSnapshotKey(life, seal_id);
     const String ckpt_key = store->layout().refCkptKey(life);
     ASSERT_EQ(store->lastEpochSealForTest(ns), std::make_optional(seal_id));
-    ASSERT_EQ(readCkptOrFail(op, store->layout(), life).committed_through, std::make_optional(seal_id));
     const uint64_t snapshot_writes_before = backend->writes(snapshot_key);
     const uint64_t ckpt_writes_before = backend->writes(ckpt_key);
 
-    /// Recovery installed the epoch seal as the runtime's greatest applied transaction. The publisher
+    /// Recovery installed its tombstone as the runtime's greatest applied transaction. The publisher
     /// must decline it without reaching either durable write.
     EXPECT_FALSE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
     EXPECT_EQ(backend->writes(snapshot_key), snapshot_writes_before);
@@ -1592,11 +1591,8 @@ TEST(CASRefCheckpoint, CommitRefChunkDurableBytesUnchangedByExtraction)
            "before the extraction";
 }
 
-/// The directive's "preserve backend request counts", asserted rather than assumed: preparation is pure,
-/// so lifting it out must not add or remove a single request. One birth chunk = exactly one write-once
-/// `PUT` at the ref-log key, no read-back, plus the two ordered `_ckpt` CASes required by the protocol:
-/// creation publishes `life_epoch` before the log and the append lane publishes `committed_through`
-/// after the log is durable.
+/// Preparation is pure, so it adds no request. One birth chunk = exactly one write-once `PUT` at the
+/// ref-log key, no read-back; the only `_ckpt` write is the creation's.
 ///
 /// COUNTS per key. Request ORDER is not checked here and cannot be with these counters; the ordering
 /// that matters for a birth -- `_ckpt` before the ref-log `PUT` -- is argued at the call site and would
@@ -1622,9 +1618,7 @@ TEST(CASRefCheckpoint, AppendRequestCountUnchangedByExtraction)
     /// itself, the position the birth chunk is about to occupy. That GET precedes the Committed PUT;
     /// the PUT itself still owes no read-back.
     EXPECT_EQ(backend->getCount(log_key), 1u) << "one grounding probe from recovery, before the birth write";
-    EXPECT_EQ(backend->writes(ckpt_key), 2u)
-        << "the birth contributes `life_epoch` before its log and `committed_through` after the durable "
-           "log; these are two different ordering obligations, not a duplicate publication";
+    EXPECT_EQ(backend->writes(ckpt_key), 1u) << "creation writes `_ckpt`; the append writes none";
 }
 
 /// The post-durable install region is the reason preparation has to happen where it does: once "this
@@ -1774,13 +1768,85 @@ TEST(CASRefCheckpoint, IdenticalSkipComparesGeneration)
     EXPECT_EQ(backend->writeCount(key2), writes2);
 }
 
-/// Pin: replaced when the normal encoder switches to generation 3.
-TEST(CASRefCheckpoint, NormalEncoderWritesTodaysHeaderBeforeTheSwitch)
+TEST(CASRefCheckpoint, NormalEncoderWritesGenerationThree)
 {
-    EXPECT_EQ(refCkptWriteGeneration(), 1u);
-    const String text = encodeRefCkpt(refCkptOf(2));
+    EXPECT_EQ(refCkptWriteGeneration(), 3u);
+    const String text = encodeRefCkpt(RefCkpt{.life_epoch = 2, .committed_through = std::nullopt,
+                                              .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt});
     ASSERT_TRUE(sniffHeaderLine(text).has_value());
-    EXPECT_EQ(sniffHeaderLine(text)->v, 1u);
+    EXPECT_EQ(sniffHeaderLine(text)->v, 3u);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefCkpt(refCkptOf(2, RefTxnId{2, 1})); });
+}
+
+TEST(CASRefCheckpoint, DurableLifeEpochIsNeverReplaced)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout layout{"p"};
+    const RootNamespace ns{"srv1/ckpt_life_epoch_set_once"};
+    const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(ns);
+
+    EXPECT_EQ(createCkptAtCreation(op, layout, life, 2), CkptPublishOutcome::Published);
+    EXPECT_EQ(createCkptAtCreation(op, layout, life, 5), CkptPublishOutcome::IdenticalSkip);
+    ASSERT_TRUE(readCkpt(op, layout, life));
+    EXPECT_EQ(readCkpt(op, layout, life)->ckpt.life_epoch, std::optional<uint64_t>{2});
+
+    EXPECT_EQ(publishCkptSnapshot(op, layout, life, RefTxnId{5, 3}), CkptPublishOutcome::Published);
+    const auto after = readCkpt(op, layout, life);
+    ASSERT_TRUE(after);
+    EXPECT_EQ(after->ckpt.generation, 3u);
+    EXPECT_EQ(after->ckpt.life_epoch, std::optional<uint64_t>{2});
+    EXPECT_EQ(after->ckpt.checkpoint_snapshot_id, std::make_optional(RefTxnId{5, 3}));
+}
+
+TEST(CASRefCheckpoint, OnlyCreationCreatesAnAbsentCkpt)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout layout{"p"};
+
+    {
+        const RootNamespace ns{"srv1/ckpt_absent"};
+        const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(ns);
+        const String key = ckptKeyOf(layout, ns);
+        EXPECT_EQ(publishCkptSnapshot(op, layout, life, RefTxnId{2, 3}), CkptPublishOutcome::NotAdvanced);
+        EXPECT_EQ(backend->writeCount(key), 0u);
+        EXPECT_FALSE(readCkpt(op, layout, life));
+
+        /// A sample whose object is gone: the stamp is a replace and never re-creates it.
+        ASSERT_TRUE(std::holds_alternative<Committed>(
+            op.create(key, encodeRefCkptAtGeneration(refCkptOf(2), 1), Retry::standard())));
+        const auto sampled = readCkpt(op, layout, life);
+        ASSERT_TRUE(sampled);
+        ASSERT_EQ(op.removeCurrent(key, Retry::standard()), Removal::Removed);
+        EXPECT_EQ(stampCkptGeneration3(op, layout, life, *sampled).outcome, CkptStampOutcome::TokenMismatch);
+        EXPECT_FALSE(readCkpt(op, layout, life));
+    }
+    {
+        const RootNamespace ns{"srv1/ckpt_gen1"};
+        const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(ns);
+        const String key = ckptKeyOf(layout, ns);
+        ASSERT_TRUE(std::holds_alternative<Committed>(
+            op.create(key, encodeRefCkptAtGeneration(refCkptOf(2, RefTxnId{2, 3}), 1), Retry::standard())));
+        const uint64_t writes = backend->writeCount(key);
+        EXPECT_EQ(publishCkptSnapshot(op, layout, life, RefTxnId{2, 3}), CkptPublishOutcome::NotAdvanced);
+        EXPECT_EQ(backend->writeCount(key), writes);
+    }
+    {
+        const RootNamespace ns{"srv1/ckpt_gen3"};
+        const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(ns);
+        const String key = ckptKeyOf(layout, ns);
+        ASSERT_TRUE(std::holds_alternative<Committed>(op.create(key,
+            encodeRefCkptAtGeneration(refCkptOf(2, std::nullopt, RefTxnId{2, 3}), 3), Retry::standard())));
+        const uint64_t writes = backend->writeCount(key);
+        EXPECT_EQ(publishCkptSnapshot(op, layout, life, RefTxnId{2, 2}), CkptPublishOutcome::NotAdvanced);
+        EXPECT_EQ(backend->writeCount(key), writes);
+        EXPECT_EQ(publishCkptSnapshot(op, layout, life, RefTxnId{2, 3}), CkptPublishOutcome::IdenticalSkip);
+        EXPECT_EQ(backend->writeCount(key), writes);
+    }
+    EXPECT_FALSE(ckptContributionRecorded(CkptPublishOutcome::NotAdvanced));
 }
 
 TEST(CASRefCheckpoint, PreSwitchPublisherNeverWritesIntoAGenerationThreeBody)

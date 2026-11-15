@@ -914,6 +914,13 @@ private:
     std::set<String> independent_released_keys;
 };
 
+/// Every request the backend served, whatever its verb.
+uint64_t totalRequests(const CountingBackend & backend)
+{
+    return backend.getTotal() + backend.headTotal() + backend.listTotal() + backend.writeTotal()
+        + backend.deleteTotal() + backend.getStreamTotal() + backend.publishTotal();
+}
+
 /// Wedge the lane the way the engine reaches that state: EVERY attempt of the ref-log create is
 /// unresolved, the settling read proves the key still absent, and the call gives up at its own retry
 /// window having sent something -- which is the `sent_any` half of the wedge rule. A one-shot fault
@@ -1677,7 +1684,88 @@ TEST(CASRefWriterRecovery, ConfirmationCostsOneCatalogReadPerInstall)
 /// Append lane: request cost + batching (spec §Common Mutation Path / §Local Batching Queue)
 /// ===================================================================================
 
-TEST(CASRefWriterAppendLane, CommittedChunkPublishesFrontierBeforeInstallAndAck)
+TEST(CASRefWriterAppendLane, PositiveAppendIsOneCatalogReadAndOneCreate)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/one_request_positive"};
+    publishEmptyPart(store, ns, "a");
+    ASSERT_TRUE(store->resolveRef(ns, "a").has_value());
+    const NamespaceLifeId life = lifeIfCatalogedForTest(backend, store->layout(), ns).value();
+    const String ckpt_key = store->layout().refCkptKey(life);
+    const String log_prefix = store->layout().namespaceStreamPrefix(life) + "_log/";
+    const uint64_t ckpt_gets = backend->getCount(ckpt_key);
+    const uint64_t ckpt_writes = backend->writeCount(ckpt_key);
+    const uint64_t total = totalRequests(*backend);
+    backend->clearRequestJournal();
+
+    store->updateRefPublishedAt(ns, "a", [](RefPublishedAtUpdate & update) { update.published_at_ms = 17; });
+
+    EXPECT_EQ(totalRequests(*backend) - total, 2u);
+    const std::vector<String> journal = backend->requestJournal();
+    ASSERT_EQ(journal.size(), 2u);
+    EXPECT_EQ(journal[0], "GET " + store->layout().refCatalogKey());
+    EXPECT_EQ(journal[1].find("PUT " + log_prefix), 0u) << journal[1];
+    EXPECT_EQ(backend->getCount(ckpt_key), ckpt_gets);
+    EXPECT_EQ(backend->writeCount(ckpt_key), ckpt_writes);
+}
+
+TEST(CASRefWriterAppendLane, RefRemovalIsOneRequest)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/one_request_removal"};
+    publishEmptyPart(store, ns, "a");
+    ASSERT_TRUE(store->resolveRef(ns, "a").has_value());
+    const NamespaceLifeId life = lifeIfCatalogedForTest(backend, store->layout(), ns).value();
+    const String log_prefix = store->layout().namespaceStreamPrefix(life) + "_log/";
+    const uint64_t total = totalRequests(*backend);
+    backend->clearRequestJournal();
+
+    store->dropRef(ns, "a");
+
+    EXPECT_EQ(totalRequests(*backend) - total, 1u);
+    const std::vector<String> journal = backend->requestJournal();
+    ASSERT_EQ(journal.size(), 1u);
+    EXPECT_EQ(journal[0].find("PUT " + log_prefix), 0u) << journal[0];
+}
+
+TEST(CASRefWriterAppendLane, PartPublishCostsOneCatalogReadPerLogCreateAndNoCkptRequest)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/one_request_part"};
+    publishEmptyPart(store, ns, "part_1");
+    publishEmptyPart(store, ns, "part_2");
+    const NamespaceLifeId life = lifeIfCatalogedForTest(backend, store->layout(), ns).value();
+    const String ckpt_key = store->layout().refCkptKey(life);
+    const String log_prefix = store->layout().namespaceStreamPrefix(life) + "_log/";
+    const auto log_keys = [&]
+    {
+        size_t n = 0;
+        for (const ListedKey & listed : listForTest(backend, log_prefix, "", 1000).keys)
+            n += listed.key.starts_with(log_prefix) ? 1 : 0;
+        return n;
+    };
+
+    /// The fixture's own catalog admission runs first; the part's requests are counted from here.
+    auto build = startBuildFor(store, ns, "part_3");
+    const size_t logs_before = log_keys();
+    const uint64_t ckpt_gets = backend->getCount(ckpt_key);
+    const uint64_t ckpt_writes = backend->writeCount(ckpt_key);
+    const uint64_t catalog_gets = backend->getCount(store->layout().refCatalogKey());
+    const ManifestId id = build->stageManifest({});
+    build->precommitAdd(ns, "part_3", id);
+    build->promote(ns, "part_3", build->buildId(), id);
+
+    const size_t new_logs = log_keys() - logs_before;
+    EXPECT_EQ(new_logs, 2u);
+    EXPECT_EQ(backend->getCount(store->layout().refCatalogKey()) - catalog_gets, new_logs);
+    EXPECT_EQ(backend->getCount(ckpt_key), ckpt_gets);
+    EXPECT_EQ(backend->writeCount(ckpt_key), ckpt_writes);
+}
+
+TEST(CASRefWriterAppendLane, CommittedChunkInstallsBeforeAck)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -1690,12 +1778,6 @@ TEST(CASRefWriterAppendLane, CommittedChunkPublishesFrontierBeforeInstallAndAck)
     const NamespaceLifeId life = lifeIfCatalogedForTest(backend, store->layout(), ns).value();
     const String log_prefix = store->layout().namespaceStreamPrefix(life) + "_log/";
     const String ckpt_key = store->layout().refCkptKey(life);
-    const auto ckpt_before = readCkptForTest(backend, store->layout(), life);
-    ASSERT_TRUE(ckpt_before);
-    ASSERT_TRUE(ckpt_before->ckpt.committed_through);
-    const RefTxnId expected_frontier{
-        ckpt_before->ckpt.committed_through->writer_epoch,
-        ckpt_before->ckpt.committed_through->ref_sequence + 1};
     backend->clearRequestJournal();
     const uint64_t list_before = backend->listTotal();
     const uint64_t put_before = backend->putTotal();
@@ -1807,149 +1889,14 @@ TEST(CASRefWriterAppendLane, CommittedChunkPublishesFrontierBeforeInstallAndAck)
     EXPECT_FALSE(follower_error);
     EXPECT_EQ(backend->listTotal(), list_before) << "a warm mutation performs no LIST";
     EXPECT_EQ(backend->putTotal(), put_before + 1) << "exactly one body PUT with create-if-absent";
-    EXPECT_EQ(backend->getCount(ckpt_key), ckpt_get_before + 1)
-        << "one committed chunk pays exactly one checkpoint GET";
-    EXPECT_EQ(backend->writeCount(ckpt_key), ckpt_cas_before + 1)
-        << "one committed chunk pays exactly one checkpoint CAS";
+    EXPECT_EQ(backend->getCount(ckpt_key), ckpt_get_before) << "a committed chunk reads no checkpoint";
+    EXPECT_EQ(backend->writeCount(ckpt_key), ckpt_cas_before) << "a committed chunk writes no checkpoint";
 
     const std::vector<String> journal = backend->requestJournal();
-    ASSERT_EQ(journal.size(), 5u);
+    ASSERT_EQ(journal.size(), 3u);
     EXPECT_EQ(journal[0].find("PUT " + log_prefix), 0u) << journal[0];
-    EXPECT_EQ(journal[1], "GET " + ckpt_key);
-    EXPECT_EQ(journal[2], "CAS " + ckpt_key);
-    EXPECT_EQ(journal[3], "INSTALL");
-    EXPECT_EQ(journal[4], "FOLLOWER ACK");
-
-    const auto durable_ckpt = readCkptForTest(backend, store->layout(), life);
-    ASSERT_TRUE(durable_ckpt);
-    EXPECT_EQ(durable_ckpt->ckpt.committed_through, expected_frontier);
-}
-
-TEST(CASRefWriterAppendLane, CheckpointConflictAfterLogCommitRequiresRecoveryWithoutInstall)
-{
-    auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openPool(backend);
-    const RootNamespace ns{"srv1/frontier-conflict"};
-    publishEmptyPart(store, ns, "x");
-    const NamespaceLifeId life = lifeIfCatalogedForTest(backend, store->layout(), ns).value();
-    const String ckpt_key = store->layout().refCkptKey(life);
-    const auto before = readCkptForTest(backend, store->layout(), life);
-    ASSERT_TRUE(before);
-    ASSERT_TRUE(before->ckpt.committed_through);
-    const RefTxnId candidate{before->ckpt.committed_through->writer_epoch,
-                             before->ckpt.committed_through->ref_sequence + 1};
-    const size_t tail_before = store->tailSinceSnapshotCountForTest(ns);
-
-    /// Latched, not counted: the frontier publication re-reads and reissues on every refusal until ITS
-    /// window closes, so a bounded refusal would be outlived and the checkpoint would advance.
-    auto clock = VirtualRetryClock::installOn(store);
-    backend->ckpt_conflict_key = ckpt_key;
-    backend->ckpt_conflict_latched = true;
-    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR,
-        "is durable but was not acknowledged", [&] { store->dropRef(ns, "x"); });
-    backend->disarmFaults();
-
-    EXPECT_GT(clock->pauseCount(), 1u)
-        << "the publication's reissues must pace through the injected sleep, never a real one";
-    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
-    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_before)
-        << "the durable log was not installed or acknowledged";
-    const auto after = readCkptForTest(backend, store->layout(), life);
-    ASSERT_TRUE(after);
-    EXPECT_EQ(after->ckpt.committed_through, before->ckpt.committed_through);
-    EXPECT_TRUE(readOf(backend, store->layout().refLogKey(life, candidate)))
-        << "the log PUT committed before checkpoint publication failed";
-    EXPECT_FALSE(readOf(backend, store->layout().refLogKey(
-        life, RefTxnId{candidate.writer_epoch, candidate.ref_sequence + 1})))
-        << "no later id may be allocated above an unfrontiered durable transaction";
-}
-
-/// The same `_ckpt` failure after the ref-log commit means different things per step: a promoted part
-/// can come back after a restart, a precommitted one is never published. The texts must differ.
-TEST(CASRefWriterAppendLane, DurableUnconfirmedTextNamesPrecommitAndPromoteApart)
-{
-    auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openPool(backend);
-    const RootNamespace ns{"srv1/frontier-conflict-steps"};
-    publishEmptyPart(store, ns, "x");
-    const NamespaceLifeId life = lifeIfCatalogedForTest(backend, store->layout(), ns).value();
-    const String ckpt_key = store->layout().refCkptKey(life);
-    auto clock = VirtualRetryClock::installOn(store);
-
-    auto messageOf = [&](const std::function<void()> & step)
-    {
-        backend->ckpt_conflict_key = ckpt_key;
-        backend->ckpt_conflict_latched = true;
-        String message;
-        try
-        {
-            step();
-        }
-        catch (const DB::Exception & e)
-        {
-            message = e.message();
-        }
-        backend->disarmFaults();
-        return message;
-    };
-
-    auto precommitted = startBuildFor(store, ns, "pre");
-    const ManifestId pre_id = precommitted->stageManifest({});
-    const String precommit_message = messageOf([&] { precommitted->precommitAdd(ns, "pre", pre_id); });
-    precommitted.reset();
-
-    /// Recover the lane so the promote below reaches its own ref-log commit.
-    publishEmptyPart(store, ns, "between");
-
-    auto promoted = startBuildFor(store, ns, "prom");
-    const ManifestId prom_id = promoted->stageManifest({});
-    promoted->precommitAdd(ns, "prom", prom_id);
-    const String promote_message = messageOf([&] { promoted->promote(ns, "prom", promoted->buildId(), prom_id); });
-
-    /// A kind other than promote must not carry the promote-only note.
-    publishEmptyPart(store, ns, "between_again");
-    const String drop_message = messageOf([&] { store->dropRef(ns, "x"); });
-    EXPECT_NE(drop_message.find("is durable but was not acknowledged"), String::npos) << drop_message;
-    EXPECT_EQ(drop_message.find("promoted part returns"), String::npos) << drop_message;
-
-    EXPECT_NE(precommit_message.find("never published"), String::npos) << precommit_message;
-    EXPECT_EQ(precommit_message.find("may still take effect"), String::npos) << precommit_message;
-    EXPECT_NE(promote_message.find("is durable but was not acknowledged"), String::npos) << promote_message;
-    EXPECT_NE(promote_message.find("may still take effect"), String::npos) << promote_message;
-    EXPECT_EQ(promote_message.find("restart"), String::npos) << promote_message;
-    EXPECT_EQ(promote_message.find("never published"), String::npos) << promote_message;
-}
-
-TEST(CASRefWriterAppendLane, FenceMovementAtCheckpointPublicationRequiresRecoveryWithoutInstall)
-{
-    auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openPool(backend);
-    const RootNamespace ns{"srv1/frontier-fenced"};
-    publishEmptyPart(store, ns, "x");
-    const NamespaceLifeId life = lifeIfCatalogedForTest(backend, store->layout(), ns).value();
-    const String ckpt_key = store->layout().refCkptKey(life);
-    const auto before = readCkptForTest(backend, store->layout(), life);
-    ASSERT_TRUE(before);
-    ASSERT_TRUE(before->ckpt.committed_through);
-    const RefTxnId candidate{before->ckpt.committed_through->writer_epoch,
-                             before->ckpt.committed_through->ref_sequence + 1};
-    const size_t tail_before = store->tailSinceSnapshotCountForTest(ns);
-
-    backend->ckpt_get_hook_key = ckpt_key;
-    backend->ckpt_get_hook = [&] { store->tripMountLost(); };
-    SCOPE_EXIT({ backend->ckpt_get_hook = nullptr; });
-    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR,
-        "is durable but was not acknowledged", [&] { store->dropRef(ns, "x"); });
-
-    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
-    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_before)
-        << "the fenced frontier attempt must not install or acknowledge the durable log";
-    const auto after = readCkptForTest(backend, store->layout(), life);
-    ASSERT_TRUE(after);
-    EXPECT_EQ(after->ckpt.committed_through, before->ckpt.committed_through);
-    EXPECT_TRUE(readOf(backend, store->layout().refLogKey(life, candidate)));
-    EXPECT_FALSE(readOf(backend, store->layout().refLogKey(
-        life, RefTxnId{candidate.writer_epoch, candidate.ref_sequence + 1})));
+    EXPECT_EQ(journal[1], "INSTALL");
+    EXPECT_EQ(journal[2], "FOLLOWER ACK");
 }
 
 /// Phase 3 (reftable-cow-map materialization): each of these N
@@ -3042,9 +2989,74 @@ TEST(CASRefWriterRuntimeIdentity, LatePredecessorInvalidationLeavesSuccessorAtta
     EXPECT_EQ(successor_after->manifest_id.ref, successor_ref->manifest_id.ref);
 }
 
-/// Task 13 (spec §implementation-impact): a threshold snapshot publish increments the writer-side
-/// observability counters -- snapshot PUT bytes and the tail-logs-compacted count
-/// (logs-per-table-after-snapshot). Before/after deltas prove both sites fire.
+TEST(CASRefWriterSnapshotPublish, GenerationThreeBodyHasTwoFields)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/gen3_two_fields"};
+    publishEmptyPart(store, ns, "a");
+    publishEmptyPart(store, ns, "b");
+    const NamespaceLifeId life = lifeIfCatalogedForTest(backend, store->layout(), ns).value();
+    const String ckpt_key = store->layout().refCkptKey(life);
+    const std::optional<RefTxnId> candidate = listGreatestLogIdForLifeForTest(*backend, store->layout(), life);
+    ASSERT_TRUE(candidate);
+    const uint64_t total = totalRequests(*backend);
+    backend->clearRequestJournal();
+
+    ASSERT_TRUE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
+
+    EXPECT_EQ(totalRequests(*backend) - total, 3u);
+    const std::vector<String> journal = backend->requestJournal();
+    ASSERT_EQ(journal.size(), 3u);
+    EXPECT_EQ(journal[0], "PUT " + store->layout().refSnapshotKey(life, *candidate));
+    EXPECT_EQ(journal[1], "GET " + ckpt_key);
+    EXPECT_EQ(journal[2], "CAS " + ckpt_key);
+
+    const auto durable = readCkptForTest(backend, store->layout(), life);
+    ASSERT_TRUE(durable);
+    EXPECT_EQ(durable->ckpt.generation, 3u);
+    EXPECT_TRUE(durable->ckpt.life_epoch.has_value());
+    EXPECT_EQ(durable->ckpt.checkpoint_snapshot_id, candidate);
+    EXPECT_EQ(durable->ckpt.committed_through, std::nullopt);
+    EXPECT_EQ(durable->ckpt.last_epoch_seal, std::nullopt);
+}
+
+TEST(CASRefWriterSnapshotPublish, RepublishAfterAStopBeforeTheCkptPublishMeetsIdenticalBytes)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/republish_identical"};
+    publishEmptyPart(store, ns, "a");
+    publishEmptyPart(store, ns, "b");
+    const NamespaceLifeId life = lifeIfCatalogedForTest(backend, store->layout(), ns).value();
+    const std::optional<RefTxnId> candidate = listGreatestLogIdForLifeForTest(*backend, store->layout(), life);
+    ASSERT_TRUE(candidate);
+    const String snap_key = store->layout().refSnapshotKey(life, *candidate);
+
+    store->setSnapshotBeforeCkptCasHookForTest([] { throw std::runtime_error("injected stop before the _ckpt publish"); });
+    EXPECT_ANY_THROW(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
+    store->setSnapshotBeforeCkptCasHookForTest(nullptr);
+
+    ASSERT_TRUE(readOf(backend, snap_key));
+    const auto stopped = readCkptForTest(backend, store->layout(), life);
+    ASSERT_TRUE(stopped);
+    EXPECT_EQ(stopped->ckpt.checkpoint_snapshot_id, std::nullopt);
+    EXPECT_NE(store->newestPublishedSnapshotIdForTest(ns), candidate);
+
+    const uint64_t snap_writes = backend->writeCount(snap_key);
+    const String snap_bytes = readOf(backend, snap_key)->bytes;
+    ASSERT_TRUE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
+    EXPECT_EQ(backend->writeCount(snap_key), snap_writes + 1) << "one refused create of the identical body";
+    EXPECT_EQ(readOf(backend, snap_key)->bytes, snap_bytes);
+    const auto published = readCkptForTest(backend, store->layout(), life);
+    ASSERT_TRUE(published);
+    EXPECT_EQ(published->ckpt.checkpoint_snapshot_id, candidate);
+    EXPECT_EQ(store->newestPublishedSnapshotIdForTest(ns), candidate);
+}
+
+/// A threshold snapshot publish increments the writer-side observability counters -- snapshot PUT bytes
+/// and the tail-logs-compacted count (logs-per-table-after-snapshot). Before/after deltas prove both
+/// sites fire.
 TEST(CASRefWriterSnapshotPublish, PublishIncrementsSnapshotCounters)
 {
     using ProfileEvents::global_counters;
@@ -3475,7 +3487,7 @@ TEST(CASRefWriterSnapshotPublish, C4LatchBoundedUnderSustainedNonCommittedPublis
         << "reads within the backoff window must not re-dispatch a publish (the storm latch is broken)";
 }
 
-/// Recovery can leave the runtime at an epoch seal with a tail already above the threshold. The seal
+/// Recovery can leave the runtime at a tombstone with a tail already above the threshold. The tombstone
 /// is not snapshot-serializable, so admission itself must reject it: letting execution reject it would
 /// make settlement immediately dispatch another identical background attempt. A later ordinary record
 /// must re-enable the same scheduler.
@@ -3498,22 +3510,8 @@ TEST(CASRefWriterSnapshotPublish, RecoveredSealAboveThresholdDoesNotRedispatchUn
             .checkpoint_snapshot_id = std::nullopt,
             .last_epoch_seal = std::nullopt}, 1)));
         publishEmptyPart(predecessor, ns, "before_seal");
-        const auto before = readOf(backend, predecessor->layout().refCkptKey(life));
-        ASSERT_TRUE(before);
-        const RefCkpt before_seal = decodeRefCkpt(before->bytes);
-        ASSERT_TRUE(before_seal.committed_through);
-        const RefTxnId seal_id{before_seal.committed_through->writer_epoch,
-                               before_seal.committed_through->ref_sequence + 1};
-        writeSealAt(*backend, predecessor->layout(), ns, seal_id);
-
-        RefCkpt recovered_seal = before_seal;
-        recovered_seal.committed_through = seal_id;
-        recovered_seal.last_epoch_seal = seal_id;
-        CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
-        CasOperation op = requests.admit();
-        ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(
-            predecessor->layout().refCkptKey(life), encodeRefCkptAtGeneration(recovered_seal, 1), before->etag, Retry::standard())));
     }
+    /// The successor mounts a later epoch, so its recovery ends the chain with a tombstone.
 
     PoolConfig successor_config;
     successor_config.snapshot_log_count_threshold = 0;
@@ -4077,12 +4075,8 @@ std::optional<RefTxnId> listGreatestLogIdForTest(Backend & backend, const Layout
 /// Seed a same-uuid TWIN incarnation that bumped the durable writer_epoch and durably DROPPED `ref_name`
 /// (its committed binding `old_ref`) at `{twin_epoch, 1}` -- an id that sorts strictly above every log a
 /// Pool wrote under its own (lower) open-time epoch. Returns the twin's epoch.
-/// `prev_epoch_seal` is NOT optional decoration here. The twin's drop is sequence 1 of a new epoch, so
-/// INV-2's grammar requires it to name the seal that closed the epoch below -- and the reader enforces
-/// that, so a twin seeded without it describes a stream with an uncertified epoch boundary, which is
-/// exactly what recovery must refuse. The link names the id the recovering pool's own CAS-walk will mint
-/// for the dead epoch: one past that epoch's greatest durable id, which is what `seal_of_previous_epoch`
-/// derives by listing rather than hard-coding, so the fixture cannot drift from the walk's arithmetic.
+/// The twin first closes the chain with its tombstone in the slot after the previous epoch's greatest
+/// id, and its drop names that tombstone: without it the drop is not on the chain.
 uint64_t seedTwinDrop(const BackendPtr & backend, const Layout & layout, const RootNamespace & ns,
                       const String & ref_name, const ManifestRef & old_ref)
 {
@@ -4103,6 +4097,8 @@ uint64_t seedTwinDrop(const BackendPtr & backend, const Layout & layout, const R
     }
 
     const uint64_t twin_epoch = allocateWriterEpochForTest(backend, layout, "test");
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, DB::Cas::tests::tombstoneTxn(
+        ns.string(), RefTxnId{previous_epoch, greatest_in_previous_epoch + 1}, twin_epoch));
     RefLogTxn twin;
     twin.ns = ns.string();
     twin.txn_id = RefTxnId{twin_epoch, 1};
@@ -4115,6 +4111,113 @@ uint64_t seedTwinDrop(const BackendPtr & backend, const Layout & layout, const R
     return twin_epoch;
 }
 
+}
+
+namespace
+{
+
+/// Drops `ref` with the fence generation moved after the log create and before the install: the log is
+/// durable, the drop is not acknowledged and the lane needs recovery.
+void strandDurableDropAfterLostAdmission(const PoolPtr & store, const BackendPtr & backend,
+                                         const RootNamespace & ns, const String & ref)
+{
+    publishEmptyPart(store, ns, ref);
+    ASSERT_TRUE(store->resolveRef(ns, ref).has_value());
+    const NamespaceLifeId life = lifeIfCatalogedForTest(backend, store->layout(), ns).value();
+    const std::optional<RefTxnId> before = listGreatestLogIdForLifeForTest(*backend, store->layout(), life);
+    ASSERT_TRUE(before);
+
+    store->setCarveHookForTest([&store](CasRefLedger::CarvePhaseForTest phase)
+    {
+        if (phase == CasRefLedger::CarvePhaseForTest::PostDurableInstall)
+            DB::Cas::tests::rearmMountFenceAfterAnomalyForTest(store);
+    });
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR,
+        "is durable but was not acknowledged", [&] { store->dropRef(ns, ref); });
+    store->setCarveHookForTest(nullptr);
+
+    const RefTxnId dropped{before->writer_epoch, before->ref_sequence + 1};
+    EXPECT_TRUE(readOf(backend, store->layout().refLogKey(life, dropped))) << "the drop's log is durable";
+    EXPECT_EQ(listGreatestLogIdForLifeForTest(*backend, store->layout(), life), std::make_optional(dropped));
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
+}
+
+}
+
+/// A durable but unacknowledged step means different things per step: a promoted part can come back
+/// after a restart, a precommitted one is never published. The texts must differ.
+TEST(CASRefWriterAppendLane, DurableUnconfirmedTextNamesPrecommitAndPromoteApart)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/durable-unconfirmed-steps"};
+    publishEmptyPart(store, ns, "x");
+
+    /// Moves the fence generation after the step's log is durable, then remounts so the next step runs on
+    /// a fresh runtime.
+    auto messageOf = [&](const std::function<void()> & step)
+    {
+        store->setCarveHookForTest([&store](CasRefLedger::CarvePhaseForTest phase)
+        {
+            if (phase == CasRefLedger::CarvePhaseForTest::PostDurableInstall)
+                DB::Cas::tests::rearmMountFenceAfterAnomalyForTest(store);
+        });
+        String message;
+        try
+        {
+            step();
+        }
+        catch (const DB::Exception & e)
+        {
+            message = e.message();
+        }
+        store->setCarveHookForTest(nullptr);
+        fenceOutRefMount(*backend, store->layout().mountKey("test"));
+        EXPECT_TRUE(store->tryRemountOnce());
+        return message;
+    };
+
+    auto precommitted = startBuildFor(store, ns, "pre");
+    const ManifestId pre_id = precommitted->stageManifest({});
+    const String precommit_message = messageOf([&] { precommitted->precommitAdd(ns, "pre", pre_id); });
+    precommitted.reset();
+
+    auto promoted = startBuildFor(store, ns, "prom");
+    const ManifestId prom_id = promoted->stageManifest({});
+    promoted->precommitAdd(ns, "prom", prom_id);
+    const String promote_message = messageOf([&] { promoted->promote(ns, "prom", promoted->buildId(), prom_id); });
+    promoted.reset();
+
+    /// A kind other than promote must not carry the promote-only note.
+    const String drop_message = messageOf([&] { store->dropRef(ns, "x"); });
+    EXPECT_NE(drop_message.find("is durable but was not acknowledged"), String::npos) << drop_message;
+    EXPECT_EQ(drop_message.find("promoted part returns"), String::npos) << drop_message;
+
+    EXPECT_NE(precommit_message.find("never published"), String::npos) << precommit_message;
+    EXPECT_EQ(precommit_message.find("may still take effect"), String::npos) << precommit_message;
+    EXPECT_NE(promote_message.find("is durable but was not acknowledged"), String::npos) << promote_message;
+    EXPECT_NE(promote_message.find("may still take effect"), String::npos) << promote_message;
+    EXPECT_EQ(promote_message.find("restart"), String::npos) << promote_message;
+    EXPECT_EQ(promote_message.find("never published"), String::npos) << promote_message;
+}
+
+TEST(CASRefWriterAppendLane, LostAdmissionAfterDurablePutNeedsRecoveryAndIsNotAcknowledged)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    strandDurableDropAfterLostAdmission(store, backend, RootNamespace{"srv1/lost_admission"}, "x");
+}
+
+TEST(CASRefWriterAppendLane, DurableUnacknowledgedAppendIsReplayedByRecovery)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/lost_admission_replayed"};
+    strandDurableDropAfterLostAdmission(store, backend, ns, "x");
+
+    fenceOutRefMount(*backend, store->layout().mountKey("test"));
+    ASSERT_TRUE(store->tryRemountOnce());
+    EXPECT_FALSE(store->resolveRef(ns, "x").has_value()) << "a durable log on the chain is history";
 }
 
 /// A fence-loss generation is a rejection marker, not a runtime admission token. If remount then loses
@@ -6536,24 +6639,24 @@ void seedSealFixtureDeadEpochs(const BackendPtr & backend, const Layout & layout
                  publishCommittedOps("a", manifestRef(1, 1, 1))[1]};
     DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, birth);
 
+    /// Epoch 2 opened the namespace with its tombstone at `{1,2}` and wrote `{2,1}`; it ended uncleanly,
+    /// so the recovering mount of epoch 3 must close epoch 2 at `{2,2}`.
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, DB::Cas::tests::tombstoneTxn(ns.string(), RefTxnId{1, 2}, 2));
     RefLogTxn mut;
     mut.ns = ns.string();
     mut.txn_id = RefTxnId{2, 1};
-    /// Sequence 1 of a new epoch names the seal that closed the one below -- `{1,2}`, the slot right
-    /// after epoch 1's only durable id, which is where the recovering mount's CAS-walk puts it. The seal
-    /// OBJECT is deliberately not seeded: this fixture's subject is a recovery that has to mint it.
     mut.prev_epoch_seal = RefTxnId{1, 2};
     mut.ops = {publishCommittedOps("b", manifestRef(2, 1, 1))[0],
                publishCommittedOps("b", manifestRef(2, 1, 1))[1]};
     DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, mut);
-    DB::Cas::tests::writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
-        /// The namespace was born in epoch 1 and only `{1,1}` is fronted initially. Recovery must mint
-        /// the missing required seal `{1,2}` before it may adopt the already durable `{2,1}` successor.
+    /// Epoch 2 wrote under the generation 3 rule, so `_ckpt` is the generation 3 body creation left.
+    const NamespaceLifeId life = lifeIfCatalogedForTest(backend, layout, ns).value();
+    ASSERT_TRUE(createRaw(backend, layout.refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
-        .committed_through = RefTxnId{1, 1},
+        .committed_through = std::nullopt,
         .checkpoint_snapshot_id = std::nullopt,
         .last_epoch_seal = std::nullopt,
-    });
+    }, 3)));
 }
 
 /// Plants a same-uuid, UNCLEAN (crash-style, no farewell) predecessor mount lease at `epoch`: a bare
@@ -6656,10 +6759,8 @@ TEST(CASRefWriterRecoveryRetry, TransientSealFailureIsRetriedThenSucceeds)
     EXPECT_EQ(store->listRefs(ns).size(), 2u) << "recovery must succeed after retrying past the fault";
 
     EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryRetries], retries_before + 1);
-    /// TWO dead epochs (1 and 2) are closed by this walk, and a whole attempt is re-driven per transient
-    /// failure -- so the seals of the epochs the failed attempt already closed are ADOPTED on the retry
-    /// rather than minted again. Exactly two are minted in total.
-    EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryEpochSealed], sealed_before + 2);
+    /// One tombstone closes the chain, minted by the retried attempt.
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryEpochSealed], sealed_before + 1);
 }
 
 TEST(CASRefWriterRecoveryRetry, RecoveryDoesNotEnumerateItsStream)
@@ -6703,8 +6804,8 @@ TEST(CASRefWriterRecoveryRetry, RecoveryDoesNotEnumerateItsStream)
     ASSERT_TRUE(store->namespaceFilesLifeIfReadable(ns));
     EXPECT_EQ(backend->list_fault_count, 2);
     EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryRetries], retries_before);
-    EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryEpochSealed], sealed_before + 2)
-        << "two dead epochs (1 and 2) are closed without enumerating their stream";
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryEpochSealed], sealed_before + 1)
+        << "the chain is closed by one tombstone without enumerating the stream";
 }
 
 TEST(CASRefWriterRecoveryRetry, TransientFailureLongerThanBudgetPropagates)
@@ -6736,9 +6837,8 @@ TEST(CASRefWriterRecoveryRetry, TransientFailureLongerThanBudgetPropagates)
     ASSERT_TRUE(store);
     store->setCasRetrySleepForTest([fake_now](uint64_t ms) { *fake_now += ms; });
 
-    /// The seal is an in-band LOG transaction at the slot after the dead epoch's last durable id, not a
-    /// snapshot at a synthetic id: epoch 1 closes at `{1,2}`, which is the FIRST write the walk attempts.
-    const RefTxnId seal_id{1, 2};
+    /// The tombstone at `{2,2}`, the slot after the chain's last record, is the first log the walk writes.
+    const RefTxnId seal_id{2, 2};
     backend->fault_key_substr = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), seal_id);
     backend->fault_count = 1000;   /// never stops failing within the budget
 
@@ -6768,7 +6868,7 @@ TEST(CASRefWriterRecoveryRetry, NonNetworkErrorIsNotRetried)
 
     /// A foreign writer lands DIFFERENT valid bytes at the seal key; resolve-before-reissue then throws
     /// CORRUPTED_DATA (a real cross-process seal conflict), which must NOT be retried.
-    const RefTxnId seal_id{1, 2};
+    const RefTxnId seal_id{2, 2};
     backend->corrupt_key_substr = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), seal_id);
     backend->corrupt_count = 1;
 
@@ -6858,7 +6958,7 @@ TEST(CASRefWriterRecoveryRetry, ThrowingBackoffSleepDoesNotWedgeRecovery)
         if (sleep_should_throw->load())
             throw std::runtime_error("injected backoff-sleep failure");
     });
-    const RefTxnId seal_id{1, 2};
+    const RefTxnId seal_id{2, 2};
     backend->fault_key_substr = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), seal_id);
     backend->fault_count = 1;
 

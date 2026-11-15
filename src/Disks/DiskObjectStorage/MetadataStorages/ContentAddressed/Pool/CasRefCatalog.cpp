@@ -623,21 +623,15 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::completeCreation(
             "CasRefCatalog::completeCreation: namespace '{}' is not a Creating entry with a creator "
             "fence -- steps 2/3 only ever run over one of those", observed.ns.string());
 
-    /// Step 2 (spec §3): INV-4's first `_ckpt` writer for this incarnation, and the only writer that
-    /// will ever know its genesis epoch -- see `Pool/CasRefCkpt.h`'s `publishCkpt` doc for the merge
-    /// discipline this rides on unchanged. `FencedOut` here ends the attempt without step 3; the
-    /// `_ckpt` itself may or may not have become durable, which is why the entry is left `Creating`
-    /// for whichever actor next reconciles it rather than cleaned up here.
-    const RefCkpt contribution{.life_epoch = std::optional<uint64_t>{observed.creator->writer_epoch},
-                                .committed_through = std::nullopt,
-                                .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
-    if (!ckptContributionRecorded(publishCkpt(op, layout, NamespaceLifeId::fromCatalogEntry(observed.ns, observed.incarnation),
-                                              contribution, policy)))
-        /// This contribution has no `committed_through`, so no frontier refusal applies; only `FencedOut` lands here.
+    /// Step 2: the only writer that creates `_ckpt`, and so the one that sets `life_epoch`. A resumed
+    /// creation meets the body an earlier attempt created and keeps its `life_epoch`. `FencedOut` ends
+    /// the attempt without step 3 and leaves the entry `Creating` for whichever actor reconciles it next.
+    if (!ckptContributionRecorded(createCkptAtCreation(op, layout,
+            NamespaceLifeId::fromCatalogEntry(observed.ns, observed.incarnation), observed.creator->writer_epoch, policy)))
         return NamespaceCreationOutcome::FencedOut;
 
     /// Step 3. `mutate` is the fence re-check point `casUpdate`'s header doc names -- checked FIRST,
-    /// mirroring `publishCkpt`'s own "after the read, before the CAS, on every attempt" placement, so a
+    /// after the read and before the CAS on every attempt, so a
     /// caller stale on BOTH axes between step 2 and here is reported `FencedOut`, never `Superseded`
     /// (both are truthful refusals of a CAS that was never sent; this is only which one speaks first).
     const auto mutate = [&](const RefCatalog & cur) -> RefCatalog

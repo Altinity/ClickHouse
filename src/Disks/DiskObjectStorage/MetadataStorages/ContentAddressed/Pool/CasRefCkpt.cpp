@@ -360,6 +360,107 @@ CkptPublishOutcome publishCkpt(CasOperation & op, const Layout & layout, const N
     UNREACHABLE();
 }
 
+namespace
+{
+
+String encodeGenerationThreeBody(std::optional<uint64_t> life_epoch, std::optional<RefTxnId> checkpoint_snapshot_id)
+{
+    return encodeRefCkptAtGeneration(RefCkpt{.life_epoch = life_epoch, .committed_through = std::nullopt,
+                                             .checkpoint_snapshot_id = checkpoint_snapshot_id,
+                                             .last_epoch_seal = std::nullopt}, G_REF_CHAIN);
+}
+
+[[noreturn]] void throwUnpublished(WriteResult && result, const NamespaceLifeId & life)
+{
+    orThrow(std::move(result), "CAS _ckpt for namespace '" + life.ns.string() + "'");
+    throwCasWriteRetryLater("CAS _ckpt for namespace '" + life.ns.string() + "': the write did not commit");
+}
+
+}
+
+CkptPublishOutcome createCkptAtCreation(CasOperation & op, const Layout & layout, const NamespaceLifeId & life,
+                                        uint64_t life_epoch, const Retry & policy)
+{
+    WriteResult result = op.create(layout.refCkptKey(life), encodeGenerationThreeBody(life_epoch, std::nullopt), policy);
+    if (std::holds_alternative<Committed>(result))
+        return CkptPublishOutcome::Published;
+    if (const auto * conflict = std::get_if<Conflict>(&result))
+    {
+        /// The verdict "already there" speaks only for an admitted writer, as in `publishCkpt`.
+        if (!op.admitted())
+            return CkptPublishOutcome::FencedOut;
+        /// A refused create whose settling read found nothing is a deletion under the create, not a body.
+        if (!std::holds_alternative<ProvenAbsent>(conflict->seen))
+            return CkptPublishOutcome::IdenticalSkip;
+    }
+    if (const auto * gave_up = std::get_if<GaveUp>(&result); gave_up && gave_up->why == GaveUp::Why::FenceLost)
+        return CkptPublishOutcome::FencedOut;
+    throwUnpublished(std::move(result), life);
+}
+
+CkptPublishOutcome publishCkptSnapshot(CasOperation & op, const Layout & layout, const NamespaceLifeId & life,
+                                       const RefTxnId & snapshot_id, const Retry & policy)
+{
+    std::optional<CkptPublishOutcome> decline;
+    size_t decisions = 0;
+    const auto decide = [&](const std::optional<Object> & current) -> std::optional<String>
+    {
+        ++decisions;
+        decline.reset();
+        if (!current)
+        {
+            decline = CkptPublishOutcome::NotAdvanced;
+            return std::nullopt;
+        }
+        const RefCkpt durable = decodeRefCkpt(current->bytes);
+        /// Below generation 3 the lane's stamp owns the conversion; an old body never names a new snapshot.
+        if (durable.generation < G_REF_CHAIN
+            || (durable.checkpoint_snapshot_id && snapshot_id < *durable.checkpoint_snapshot_id))
+        {
+            decline = CkptPublishOutcome::NotAdvanced;
+            return std::nullopt;
+        }
+        if (durable.checkpoint_snapshot_id == snapshot_id)
+        {
+            decline = op.admitted() ? CkptPublishOutcome::IdenticalSkip : CkptPublishOutcome::FencedOut;
+            return std::nullopt;
+        }
+        return encodeGenerationThreeBody(durable.life_epoch, snapshot_id);
+    };
+
+    WriteResult result = op.readModifyWrite(layout.refCkptKey(life), decide, policy);
+    if (std::holds_alternative<Committed>(result))
+        return CkptPublishOutcome::Published;
+    if (std::holds_alternative<Declined>(result))
+    {
+        chassert(decline);
+        /// An identical body after a refused attempt of this call: that attempt or a competitor made it durable.
+        if (*decline == CkptPublishOutcome::IdenticalSkip && decisions > 1)
+            return CkptPublishOutcome::Published;
+        return *decline;
+    }
+    if (const auto * gave_up = std::get_if<GaveUp>(&result); gave_up && gave_up->why == GaveUp::Why::FenceLost)
+        return CkptPublishOutcome::FencedOut;
+    throwUnpublished(std::move(result), life);
+}
+
+CkptStampResult stampCkptGeneration3(CasOperation & op, const Layout & layout, const NamespaceLifeId & life,
+                                     const CkptSample & accepted)
+{
+    RefCkpt stamped{.life_epoch = accepted.ckpt.life_epoch, .committed_through = std::nullopt,
+                    .checkpoint_snapshot_id = accepted.ckpt.checkpoint_snapshot_id, .last_epoch_seal = std::nullopt};
+    stamped.generation = G_REF_CHAIN;
+    /// One attempt: a caller that meets anything but a commit re-derives from a fresh read.
+    const WriteResult result = op.replace(layout.refCkptKey(life),
+        encodeGenerationThreeBody(stamped.life_epoch, stamped.checkpoint_snapshot_id), accepted.etag, Retry::once());
+    if (const auto * committed = std::get_if<Committed>(&result))
+        return CkptStampResult{.outcome = CkptStampOutcome::Stamped,
+                               .stamped = CkptSample{.ckpt = std::move(stamped), .etag = committed->etag}};
+    if (std::holds_alternative<Conflict>(result))
+        return CkptStampResult{.outcome = CkptStampOutcome::TokenMismatch, .stamped = std::nullopt};
+    return CkptStampResult{.outcome = CkptStampOutcome::Unresolved, .stamped = std::nullopt};
+}
+
 MissingBaseVerdict classifyMissingSampledBase(const Etag & sampled, const std::optional<Etag> & current)
 {
     if (current && !(*current == sampled))

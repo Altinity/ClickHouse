@@ -299,21 +299,11 @@ TEST(CASRefCheckpointJoin, CrossEpochFrontierRequiresAnImmediatelyAdjacentSeal)
     EXPECT_THROW(mergeCkpt(older, seal_above_frontier), DB::Exception);
 }
 
-/// THE FIRST OF THE TWO SEQUENCES THAT RAISE `life_epoch` HONESTLY, end to end through the production
-/// primitives rather than at the merge: a creator publishes `_ckpt` at E1 (`completeCreation` step 2)
-/// and dies before its `Creating -> Live` CAS (step 3), and a later actor reconciles the stalled entry
-/// and resumes over the SAME incarnation, contributing E2. Two different present values in one
-/// incarnation, and NOT a conflict -- the stored value must simply become E2, which is also what
-/// `CASNsCreationLifecycle.ReconcileSucceedsTokenExactlyAfterTheOriginalCreatorFenceIsTerminalThenResumesToLive`
-/// already pins from the catalog side ("the RESUMING actor's writer_epoch is the genesis epoch that
-/// actually landed"). Had the directive's literal rule landed, this sequence would raise
-/// `CORRUPTED_DATA` and, since `_ckpt` has no repair path, wedge the namespace forever.
-///
-/// Both fences share ONE `server_root_id` on purpose: every live namespace is rooted at its own pool
-/// member's `server_root_id`, so a creator and its reconciler are always actors of the same server root
-/// and draw from the same durable-monotone epoch counter. That is the whole basis for "contributions
-/// only ever rise", so the fixture must not quietly model two roots.
-TEST(CASRefCheckpointJoin, ResumedCreationRaisesLifeEpochWithoutRefusal)
+/// A creator creates `_ckpt` at E1 (`completeCreation` step 2) and dies before its `Creating -> Live` CAS
+/// (step 3); a later actor reconciles the stalled entry and resumes over the SAME incarnation at E2. The
+/// resumption completes, and `life_epoch` stays E1: it is set once, and the first key of the chain is
+/// `{E1,1}` whoever writes it.
+TEST(CASRefCheckpointJoin, ResumedCreationKeepsTheDurableLifeEpoch)
 {
     Layout layout("p");
     auto backend = std::make_shared<AdmissionHookBackend>(layout);
@@ -348,9 +338,8 @@ TEST(CASRefCheckpointJoin, ResumedCreationRaisesLifeEpochWithoutRefusal)
     resumed.creator = resumer;
     EXPECT_EQ(CasRefCatalog::completeCreation(reader, layout, resumed),
               CasRefCatalog::NamespaceCreationOutcome::Live)
-        << "the resumption must not be refused by the join";
-    EXPECT_EQ(lifeEpochOrFail(reader, layout, life), 9u)
-        << "the genesis epoch that actually landed is the resuming actor's, and the join must let it rise";
+        << "the resumption must not be refused";
+    EXPECT_EQ(lifeEpochOrFail(reader, layout, life), 5u) << "the durable life_epoch is never replaced";
 }
 
 /// THE SECOND SEQUENCE, at the seam where the two `life_epoch`-knowing writers actually meet -- both of

@@ -549,7 +549,7 @@ TEST_F(CASDecommission, DecommissionMountRaisesThePoolFloor)
     OperationForTest op(*backend);
     const auto stored = (*op).read(layout.poolMetaKey(), Retry::once());
     ASSERT_TRUE(stored.has_value());
-    EXPECT_EQ(decodePoolMeta(stored->bytes).min_reader_generation, G_REF_MOVE);
+    EXPECT_EQ(decodePoolMeta(stored->bytes).min_reader_generation, G_REF_CHAIN);
 }
 
 TEST_F(CASDecommission, OpensOverARetiredOwner)

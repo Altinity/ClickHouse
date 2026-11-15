@@ -277,9 +277,9 @@ struct PoolConfig
     /// That poll is now the ONLY wait either path can block on. The post-reclaim materialization grace
     /// (`T_mat`) that used to sit beside it is gone: it existed so a straggler conditional `PUT` from a
     /// dying epoch would land (or exhaust its retries) before the successor started trusting its recovery
-    /// LISTINGS, and recovery does not trust listings any more -- it walks the stream arithmetically and
-    /// closes every dead epoch with an in-band `EpochSeal` at `{E, T+1}`, written as a conditional
-    /// create. The straggler's own conditional create then LOSES against that occupied slot, whenever it
+    /// LISTINGS, and recovery does not trust listings any more -- it walks the chain and closes it, when
+    /// it ends below the live epoch, with a tombstone in the slot after its last record, written as a
+    /// conditional create. The straggler's own conditional create then LOSES against that occupied slot, whenever it
     /// arrives. Waiting for a race that the protocol already decides is not caution, it is latency.
     std::function<void(uint64_t)> wait_sleep_fn = {};   /// test hook for open/remount waits
     RuntimeWorkerFactory worker_factory = {};           /// internal test seam; never parsed from disk config
@@ -290,8 +290,8 @@ struct PoolConfig
     /// either threshold (their count / the sum of their encoded bytes), or right after recovery replays
     /// a tail already above one (the mount-time trigger). Publication is background and never blocks an
     /// append (see `Pool::maybeScheduleSnapshotPublish`). The grace-age holdback this trigger used to
-    /// apply is gone by design: the recovery seal decides a late-arriving predecessor write outright --
-    /// its conditional create loses to the seal already occupying the slot -- so a young txn has nothing
+    /// apply is gone by design: the recovery tombstone decides a late-arriving predecessor write outright --
+    /// its conditional create loses to the tombstone already occupying the slot -- so a young txn has nothing
     /// left to wait out.
     /// The count default trades write-side PUT volume against read-side cold-fold cost: every publish
     /// re-encodes and PUTs the FULL snapshot, so a low threshold under sustained load degenerates into
@@ -443,8 +443,8 @@ public:
     /// counter is refused (`CORRUPTED_DATA`). Throws `BAD_ARGUMENTS` when neither owner nor lease exists.
     static PoolPtr openForDecommission(BackendPtr backend, PoolConfig config, const String & victim_srid);
 
-    /// The `min_reader_generation` every writable mount raises the pool to.
-    static constexpr uint64_t mount_reader_floor = G_REF_MOVE;
+    /// The `min_reader_generation` every writable mount raises the pool to, and a new pool is created at.
+    static constexpr uint64_t mount_reader_floor = G_REF_CHAIN;
     /// Stop the mount-renewal and remount activity, drain ref-log work, and release the owned
     /// backend-facing components in their dependency order. Destruction is also the clean-farewell
     /// path for a writable mount, so it must complete before the owning backend is released.
@@ -1000,10 +1000,8 @@ public:
     /// test seam: the fence generation the current wedge was ADMITTED under (0 when not wedged) -- the
     /// value every later retry of that wedge is gated on. See `CasRefLedger::RefAppendAttempt`.
     uint64_t wedgedAdmittedGenerationForTest(const RootNamespace & ns);
-    /// test seams: this table's `prev_epoch_seal` source -- the seal that closed its previous writer
-    /// epoch, `nullopt` at genesis. The setter stands in for the recovery CAS-walk that produces it.
+    /// test seam: the tombstone the table's last applied record crossed while its head is not applied.
     std::optional<RefTxnId> lastEpochSealForTest(const RootNamespace & ns);
-    void setLastEpochSealForTest(const RootNamespace & ns, const std::optional<RefTxnId> & seal);
     /// Test seam: this table's append lane state.
     RefLaneState laneStateForTest(const RootNamespace & ns);
 

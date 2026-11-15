@@ -395,7 +395,8 @@ CatalogEntry catalogEntryOrThrow(const BackendPtr & backend, const Layout & layo
 /// Wedge tests address raw ref-log keys at Stage A's deterministic sentinel identity, but their
 /// catalog fixture must still use production's `Creating -> _ckpt -> Live` birth order. A fixed
 /// creator identity makes the durable genesis checkpoint deterministic too.
-void admitProperlyBornEntry(const BackendPtr & backend, const Layout & layout, const RootNamespace & ns)
+void admitProperlyBornEntry(const BackendPtr & backend, const Layout & layout, const RootNamespace & ns,
+                            uint64_t creator_epoch = 1)
 {
     CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
@@ -403,7 +404,7 @@ void admitProperlyBornEntry(const BackendPtr & backend, const Layout & layout, c
         .ns = ns,
         .state = NsState::Creating,
         .incarnation = DB::Cas::tests::fixture::fixtureLife(ns).incarnation,
-        .creator = CreatorFence{.server_root_id = "test", .writer_epoch = 1, .fence_generation = 1},
+        .creator = CreatorFence{.server_root_id = "test", .writer_epoch = creator_epoch, .fence_generation = 1},
     };
     CasRefCatalog::casAdmitEntry(op, layout, /*gc_shards=*/1, creating);
 
@@ -464,37 +465,6 @@ String epochSealBytes(const RootNamespace & ns, const RefTxnId & id, std::option
     op.kind = RefOpKind::EpochSeal;
     const RefLogTxn txn{ns.string(), id, {op}, prev_epoch_seal};
     return sealObject(FormatId::RefLog, encodeRefLogTxn(txn));
-}
-
-/// What a successor and GC leave behind by the time this mount's late create of `slot` lands. The
-/// successor sealed `slot`'s epoch at `slot`, appended twice in the next epoch and snapshotted there;
-/// ref cleanup then deleted the seal object, so the key is empty again. With `sealed_again`, a further
-/// epoch also sealed the successor's epoch at its sequence 3, so the checkpoint's seal no longer names
-/// `slot`. Only the seal object and `_ckpt` are written: the late writer's decision reads nothing else.
-void reclaimSealSlotAsSuccessor(const std::shared_ptr<WedgeTestBackend> & backend, const Layout & layout,
-                                const RootNamespace & ns, const RefTxnId & slot, bool sealed_again)
-{
-    const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(ns);
-    const String slot_key = layout.refLogKey(life, slot);
-    const RefTxnId appended{slot.writer_epoch + 1, 2};
-    const RefTxnId later_seal{slot.writer_epoch + 1, 3};
-    const auto frontier = [](const RefTxnId & ct, std::optional<RefTxnId> snap, const RefTxnId & seal)
-    {
-        return RefCkpt{.life_epoch = std::nullopt, .committed_through = ct, .checkpoint_snapshot_id = snap,
-                       .last_epoch_seal = seal};
-    };
-
-    backend->bypass_seams.store(true, std::memory_order_release);
-    SCOPE_EXIT(backend->bypass_seams.store(false, std::memory_order_release));
-    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
-    CasOperation op = requests.admit();
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(slot_key, epochSealBytes(ns, slot), Retry::once())));
-    ASSERT_EQ(publishCkpt(op, layout, life, frontier(slot, std::nullopt, slot)), CkptPublishOutcome::Published);
-    ASSERT_EQ(publishCkpt(op, layout, life, frontier(appended, appended, slot)), CkptPublishOutcome::Published);
-    if (sealed_again)
-        ASSERT_EQ(publishCkpt(op, layout, life, frontier(later_seal, std::nullopt, later_seal)),
-                  CkptPublishOutcome::Published);
-    ASSERT_EQ(op.removeCurrent(slot_key, Retry::once()), Removal::Removed);
 }
 
 /// Re-arm the mount fence WITHOUT a self-remount: the generation moves (twice -- trip, then re-arm)
@@ -626,45 +596,6 @@ TEST(CASRefWedgeEveryAttempt, AmbiguousPutWedgesTheLaneAndTheNextFlushsCreateAdo
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_before + 2)
         << "the adopted wedge and the ordinary commit must each join the tail exactly once";
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
-}
-
-TEST(CASRefWedgeEveryAttempt, DurableCreatedWedgeNeedsRecoveryWhenItsFrontierCannotBePublished)
-{
-    auto backend = std::make_shared<WedgeTestBackend>();
-    auto store = openPool(backend, wedgeTestBudget());
-    auto clock = VirtualRetryClock::installOn(store);
-    const RootNamespace ns{"srv1/wedge_created_frontier_failed"};
-    admitProperlyBornEntry(backend, store->layout(), ns);
-    publishEmptyPart(store, ns, "x");
-    publishEmptyPart(store, ns, "y");
-
-    wedgeLaneOnUnresolvedAppend(*clock, *backend, store, ns, [&] { store->dropRef(ns, "x"); });
-    const String wedged_key = store->wedgedKeyForTest(ns);
-    ASSERT_FALSE(readObj(*backend, wedged_key));
-    const size_t tail_before = store->tailSinceSnapshotCountForTest(ns);
-
-    const NamespaceLifeId life = *store->refTableLifeForTest(ns);
-    const String ckpt_key = store->layout().refCkptKey(life);
-    const RefCkpt ckpt_before = decodeRefCkpt(readObj(*backend, ckpt_key)->bytes);
-    /// Latched, not counted: the frontier publish reissues an ambiguous replace until ITS window
-    /// closes, so a bounded fault would simply be outlived and the publication would succeed.
-    backend->fail_cas_substr = ckpt_key;
-    backend->fail_cas_latched = true;
-    const size_t pauses_before = clock->pauseCount();
-
-    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR,
-        "is durable but was not acknowledged", [&] { store->dropRef(ns, "y"); });
-    backend->fail_cas_latched = false;
-    backend->fail_cas_substr.clear();
-
-    EXPECT_GT(clock->pauseCount(), pauses_before + 1)
-        << "the publication's reissues must pace through the injected sleep, never a real one";
-    EXPECT_TRUE(readObj(*backend, wedged_key)) << "the exact wedged log was proven durable";
-    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery)
-        << "a durable log without a confirmed frontier must not return to Ready";
-    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_before)
-        << "the unfrontiered wedge must not be installed into the resident table";
-    EXPECT_EQ(decodeRefCkpt(readObj(*backend, ckpt_key)->bytes), ckpt_before);
 }
 
 TEST(CASRefWedgeEveryAttempt, RetiredLifeRefusesWedgeRetryBeforeAnyRequestOrAdoption)
@@ -935,9 +866,8 @@ TEST(CASRefWedgeEveryAttempt, ADefiniteRefusalAfterAnAmbiguousAttemptOfTheSameCa
 
 /// The seal is the ONLY thing that can prove our transaction will never be durable: the key is
 /// write-once and a successor put its epoch-closing record there. The operation was never acked, so
-/// its callers get a permanent error; the wedge is cleared; and the seal becomes this namespace's
-/// `prev_epoch_seal`, which the first append of the NEXT epoch carries on the wire.
-TEST(CASRefWedgeEveryAttempt, SuccessorSealAtTheWedgedKeyRejectsConclusivelyAndSourcesPrevEpochSeal)
+/// its callers get a permanent error and the wedge is cleared.
+TEST(CASRefWedgeEveryAttempt, SuccessorSealAtTheWedgedKeyRejectsConclusively)
 {
     auto backend = std::make_shared<WedgeTestBackend>();
     auto store = openPool(backend, wedgeTestBudget());
@@ -970,8 +900,8 @@ TEST(CASRefWedgeEveryAttempt, SuccessorSealAtTheWedgedKeyRejectsConclusivelyAndS
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_before) << "and never joined the tail";
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Closed)
         << "the successor seal closes this epoch's lane";
-    ASSERT_EQ(store->lastEpochSealForTest(ns), std::make_optional(seal_id))
-        << "the observed seal is this namespace's epoch-closing record";
+    EXPECT_EQ(store->lastEpochSealForTest(ns), std::nullopt)
+        << "the rejected attempt is not applied, so the table crossed no tombstone";
 
     /// INV-2's fence, stated as behaviour: a dying lane that observed the seal keeps deriving the SAME
     /// `T+1` and keeps colliding with it -- it never mints `T+2` and writes its stream past the record
@@ -1035,9 +965,9 @@ TEST(CASRefWedgeEveryAttempt, OrdinaryFirstAppendAfterASealedTransitionCarriesTh
         << "prev_epoch_seal is required on sequence 1 of a non-genesis epoch and forbidden everywhere else";
 }
 
-/// GENESIS: `last_epoch_seal` is `nullopt` exactly for a namespace whose stream starts here, and a
-/// genesis birth carries NO `prev_epoch_seal` even though its epoch is far above 1. Nothing about the
-/// global epoch number makes a namespace non-genesis -- only a transition of its OWN stream does.
+/// GENESIS: a namespace created and first written in epoch 5 opens its stream at `{5,1}` and its birth
+/// carries NO `prev_epoch_seal` even though its epoch is far above 1. Nothing about the global epoch
+/// number makes a namespace non-genesis -- only a transition of its OWN stream does.
 TEST(CASRefWedgeEveryAttempt, GenesisBirthAtAHighEpochCarriesNoPrevEpochSeal)
 {
     auto backend = std::make_shared<CountingBackend>();
@@ -1046,7 +976,7 @@ TEST(CASRefWedgeEveryAttempt, GenesisBirthAtAHighEpochCarriesNoPrevEpochSeal)
     const RootNamespace ns{"srv1/genesis_at_five"};
     /// Stage B (Task 4-C): pin to the sentinel before the first real touch -- `readRefLogTxn` above
     /// reads that exact key.
-    admitProperlyBornEntry(backend, store->layout(), ns);
+    admitProperlyBornEntry(backend, store->layout(), ns, /*creator_epoch=*/5);
 
     bumpFenceGeneration(store, 5);
     ASSERT_EQ(store->liveWriterEpoch(), 5u);
@@ -1300,8 +1230,8 @@ TEST(CASRefWedgeEveryAttempt, KnownDurableInstallFailureMovesDirectlyToRecovery)
 /// No wedge is involved here at all: an ordinary append derives its next id and finds a successor's
 /// epoch seal sitting on it. That is not interference — it is INV-2's designed outcome for a lane that
 /// has been deposed without being told, and the lane will keep re-deriving that same id forever. So it
-/// must be adjudicated as the conclusive rejection it is: a permanent error for the callers, the seal
-/// recorded as this namespace's epoch-closing record, and NO fence and NO remount.
+/// must be adjudicated as the conclusive rejection it is: a permanent error for the callers, and NO fence
+/// and NO remount.
 TEST(CASRefWedgeEveryAttempt, AppendSiteMeetingASuccessorSealIsAConclusiveRejectionNotInterference)
 {
     auto backend = std::make_shared<WedgeTestBackend>();
@@ -1326,8 +1256,8 @@ TEST(CASRefWedgeEveryAttempt, AppendSiteMeetingASuccessorSealIsAConclusiveReject
 
     EXPECT_FALSE(store->refLaneWedgedForTest(ns)) << "a conclusive rejection is not an uncertain outcome";
     EXPECT_TRUE(store->resolveRef(ns, "x").has_value()) << "the rejected transaction never applied";
-    EXPECT_EQ(store->lastEpochSealForTest(ns), std::make_optional(next))
-        << "the observed seal IS this namespace's epoch-closing record, whichever site observed it";
+    EXPECT_EQ(store->lastEpochSealForTest(ns), std::nullopt)
+        << "the rejected attempt is not applied, so the table crossed no tombstone";
     EXPECT_TRUE(store->mayMutate()) << "the designed path must not fence the mount";
     EXPECT_EQ(store->scheduleRemountCallCountForTest(), remounts_before) << "nor schedule a remount";
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendSealRejected], sealed_before + 1)
@@ -1335,501 +1265,6 @@ TEST(CASRefWedgeEveryAttempt, AppendSiteMeetingASuccessorSealIsAConclusiveReject
            "that this mount has lost its lease and does not know it";
 }
 
-/// A late append whose create lands in a seal slot cleanup already reclaimed. The key is empty, so
-/// the create succeeds; the checkpoint still names the successor's seal at that id, so the record is
-/// not history and must be rejected exactly as if the seal had been found in the key.
-TEST(CASRefWedgeEveryAttempt, AppendLandingInAReclaimedSealSlotIsRejectedNotAcknowledged)
-{
-    auto backend = std::make_shared<WedgeTestBackend>();
-    auto store = openPool(backend);
-    const Layout & layout = store->layout();
-    const RootNamespace ns{"srv1/append_reclaimed_seal"};
-    admitProperlyBornEntry(backend, store->layout(), ns);
-    publishEmptyPart(store, ns, "x");
-
-    const uint64_t epoch = store->liveWriterEpoch();
-    const RefTxnId next{epoch, 3};
-    const size_t tail_before = store->tailSinceSnapshotCountForTest(ns);
-    const uint64_t refused_before = ProfileEvents::global_counters[ProfileEvents::CASRefCheckpointFrontierRefused];
-    bool reclaimed = false;
-    backend->before_create_key = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), next);
-    backend->before_create = [&]
-    {
-        ASSERT_NO_FATAL_FAILURE(reclaimSealSlotAsSuccessor(backend, layout, ns, next, /*sealed_again=*/false));
-        reclaimed = true;
-    };
-
-    expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&]
-    {
-        store->dropRef(ns, "x");
-    });
-
-    ASSERT_TRUE(reclaimed) << "the late create must have run after the successor reclaimed the slot";
-    EXPECT_TRUE(readObj(*backend, backend->before_create_key).has_value()) << "our bytes did land";
-    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Closed);
-    EXPECT_EQ(store->lastEpochSealForTest(ns), std::make_optional(next));
-    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_before) << "the record was not installed";
-    EXPECT_TRUE(store->resolveRef(ns, "x").has_value()) << "the removal was never acknowledged";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefCheckpointFrontierRefused], refused_before + 1);
-}
-
-/// Three epochs: by the time the late create lands, a further epoch has sealed the successor's, so the
-/// checkpoint no longer says where our epoch closed. Neither an acknowledgement nor a rejection.
-TEST(CASRefWedgeEveryAttempt, AppendLandingPastALaterEpochSealNeedsRecovery)
-{
-    auto backend = std::make_shared<WedgeTestBackend>();
-    auto store = openPool(backend);
-    const Layout & layout = store->layout();
-    const RootNamespace ns{"srv1/append_superseded"};
-    admitProperlyBornEntry(backend, store->layout(), ns);
-    publishEmptyPart(store, ns, "x");
-
-    const uint64_t epoch = store->liveWriterEpoch();
-    const RefTxnId next{epoch, 3};
-    const size_t tail_before = store->tailSinceSnapshotCountForTest(ns);
-    const uint64_t refused_before = ProfileEvents::global_counters[ProfileEvents::CASRefCheckpointFrontierRefused];
-    bool reclaimed = false;
-    backend->before_create_key = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), next);
-    backend->before_create = [&]
-    {
-        ASSERT_NO_FATAL_FAILURE(reclaimSealSlotAsSuccessor(backend, layout, ns, next, /*sealed_again=*/true));
-        reclaimed = true;
-    };
-
-    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "may or may not take effect", [&]
-    {
-        store->dropRef(ns, "x");
-    });
-
-    ASSERT_TRUE(reclaimed);
-    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
-    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_before) << "the record was not installed";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefCheckpointFrontierRefused], refused_before + 1)
-        << "refused by the checkpoint, not by the fence";
-}
-
-/// The wedge retry of the same late create: the first attempt was ambiguous and landed nothing, and the
-/// retry's create lands in the reclaimed slot.
-TEST(CASRefWedgeEveryAttempt, WedgeRetryLandingInAReclaimedSealSlotIsRejectedNotAdopted)
-{
-    auto backend = std::make_shared<WedgeTestBackend>();
-    auto store = openPool(backend, wedgeTestBudget());
-    auto clock = VirtualRetryClock::installOn(store);
-    const Layout & layout = store->layout();
-    const RootNamespace ns{"srv1/wedge_reclaimed_seal"};
-    admitProperlyBornEntry(backend, store->layout(), ns);
-    publishEmptyPart(store, ns, "x");
-    publishEmptyPart(store, ns, "y");
-
-    wedgeLaneOnUnresolvedAppend(*clock, *backend, store, ns, [&]
-    {
-        store->dropRef(ns, "x");
-    });
-    const String wedged_key = store->wedgedKeyForTest(ns);
-    const RefTxnId slot = layout.parseRefObjectKey(wedged_key)->txn_id;
-    const size_t tail_before = store->tailSinceSnapshotCountForTest(ns);
-    bool reclaimed = false;
-    backend->before_create_key = wedged_key;
-    backend->before_create = [&]
-    {
-        ASSERT_NO_FATAL_FAILURE(reclaimSealSlotAsSuccessor(backend, layout, ns, slot, /*sealed_again=*/false));
-        reclaimed = true;
-    };
-
-    String message;
-    try
-    {
-        store->dropRef(ns, "y");
-        FAIL() << "expected DB::Exception";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::INVALID_STATE);
-        message = e.message();
-    }
-
-    ASSERT_TRUE(reclaimed);
-    EXPECT_NE(message.find("the record is not part of history, so a retry cannot duplicate this transaction"), String::npos)
-        << message;
-    EXPECT_EQ(message.find("nothing is durable"), String::npos) << "our log object IS durable here: " << message;
-    EXPECT_FALSE(store->refLaneWedgedForTest(ns));
-    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Closed);
-    EXPECT_EQ(store->lastEpochSealForTest(ns), std::make_optional(slot));
-    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_before) << "the wedged record was not adopted";
-    EXPECT_TRUE(store->resolveRef(ns, "x").has_value()) << "the wedged removal was never acknowledged";
-}
-
-/// The same late retry, but the mount fence moves after the retry's `_ckpt` read returned. The
-/// checkpoint's verdict is conclusive whatever the fence does, so the survivors must not be told that
-/// recovery installs a record the checkpoint rejected.
-TEST(CASRefWedgeEveryAttempt, WedgeRetryLandingInAReclaimedSealSlotUnderAMovedFenceStaysInert)
-{
-    auto backend = std::make_shared<WedgeTestBackend>();
-    auto store = openPool(backend, wedgeTestBudget());
-    auto clock = VirtualRetryClock::installOn(store);
-    const Layout & layout = store->layout();
-    const RootNamespace ns{"srv1/wedge_reclaimed_seal_moved_fence"};
-    admitProperlyBornEntry(backend, store->layout(), ns);
-    publishEmptyPart(store, ns, "x");
-    publishEmptyPart(store, ns, "y");
-
-    wedgeLaneOnUnresolvedAppend(*clock, *backend, store, ns, [&]
-    {
-        store->dropRef(ns, "x");
-    });
-    const String wedged_key = store->wedgedKeyForTest(ns);
-    const RefTxnId slot = layout.parseRefObjectKey(wedged_key)->txn_id;
-    const size_t tail_before = store->tailSinceSnapshotCountForTest(ns);
-    const uint64_t refused_before = ProfileEvents::global_counters[ProfileEvents::CASRefCheckpointFrontierRefused];
-    const uint64_t epoch = store->liveWriterEpoch();
-    bool reclaimed = false;
-    bool fence_moved = false;
-    backend->before_create_key = wedged_key;
-    backend->before_create = [&]
-    {
-        ASSERT_NO_FATAL_FAILURE(reclaimSealSlotAsSuccessor(backend, layout, ns, slot, /*sealed_again=*/false));
-        reclaimed = true;
-        backend->after_read_key = layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns));
-        backend->after_read = [&]
-        {
-            bumpFenceGeneration(store, epoch);
-            fence_moved = true;
-        };
-    };
-
-    String message;
-    try
-    {
-        store->dropRef(ns, "y");
-        FAIL() << "expected DB::Exception";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR);
-        message = e.message();
-    }
-
-    ASSERT_TRUE(reclaimed);
-    ASSERT_TRUE(fence_moved) << "the fence must move after the checkpoint read, or this tests nothing";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefCheckpointFrontierRefused], refused_before + 1)
-        << "the frontier verdict must have fired";
-    EXPECT_NE(message.find("outcome is unknown"), String::npos) << message;
-    EXPECT_EQ(message.find("recovery installs"), String::npos) << message;
-    EXPECT_NE(store->lastEpochSealForTest(ns), std::make_optional(slot));
-    EXPECT_NE(store->laneStateForTest(ns), RefLaneState::Closed);
-    EXPECT_TRUE(store->refLaneWedgedForTest(ns));
-    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_before) << "the wedged record was not adopted";
-    EXPECT_EQ(store->wedgedKeyForTest(ns), wedged_key) << "the lane keeps the same wedge";
-}
-
-/// The wedge retry lands after a further epoch sealed the successor's: unresolved, so the lane needs
-/// recovery and nothing is adopted.
-TEST(CASRefWedgeEveryAttempt, WedgeRetryLandingPastALaterEpochSealNeedsRecovery)
-{
-    auto backend = std::make_shared<WedgeTestBackend>();
-    auto store = openPool(backend, wedgeTestBudget());
-    auto clock = VirtualRetryClock::installOn(store);
-    const Layout & layout = store->layout();
-    const RootNamespace ns{"srv1/wedge_superseded"};
-    admitProperlyBornEntry(backend, store->layout(), ns);
-    publishEmptyPart(store, ns, "x");
-    publishEmptyPart(store, ns, "y");
-
-    wedgeLaneOnUnresolvedAppend(*clock, *backend, store, ns, [&]
-    {
-        store->dropRef(ns, "x");
-    });
-    const String wedged_key = store->wedgedKeyForTest(ns);
-    const RefTxnId slot = layout.parseRefObjectKey(wedged_key)->txn_id;
-    const size_t tail_before = store->tailSinceSnapshotCountForTest(ns);
-    const uint64_t refused_before = ProfileEvents::global_counters[ProfileEvents::CASRefCheckpointFrontierRefused];
-    bool reclaimed = false;
-    backend->before_create_key = wedged_key;
-    backend->before_create = [&]
-    {
-        ASSERT_NO_FATAL_FAILURE(reclaimSealSlotAsSuccessor(backend, layout, ns, slot, /*sealed_again=*/true));
-        reclaimed = true;
-    };
-
-    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "may or may not take effect", [&]
-    {
-        store->dropRef(ns, "y");
-    });
-
-    ASSERT_TRUE(reclaimed);
-    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
-    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_before) << "the wedged record was not adopted";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefCheckpointFrontierRefused], refused_before + 1);
-}
-
-/// A deposed snapshot publisher: between its body PUT and its `_ckpt` publish, a successor sealed this
-/// epoch, appended and snapshotted, and a further epoch sealed the successor's. The snapshot's frontier
-/// is behind that epoch, so it must not become cleanup-authoritative.
-TEST(CASRefWedgeEveryAttempt, SnapshotPublishPastALaterEpochSealDoesNotAdvanceTheCheckpoint)
-{
-    auto backend = std::make_shared<WedgeTestBackend>();
-    auto store = openPool(backend);
-    const Layout & layout = store->layout();
-    const RootNamespace ns{"srv1/snapshot_superseded"};
-    admitProperlyBornEntry(backend, store->layout(), ns);
-    publishEmptyPart(store, ns, "x");
-
-    const RefTxnId next{store->liveWriterEpoch(), 3};
-    const String ckpt_key = layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns));
-    const uint64_t refused_before = ProfileEvents::global_counters[ProfileEvents::CASRefCheckpointFrontierRefused];
-    std::optional<Object> ckpt_after_successor;
-    store->setSnapshotBeforeCkptCasHookForTest([&]
-    {
-        ASSERT_NO_FATAL_FAILURE(reclaimSealSlotAsSuccessor(backend, layout, ns, next, /*sealed_again=*/true));
-        ckpt_after_successor = readObj(*backend, ckpt_key);
-    });
-
-    EXPECT_FALSE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
-    store->setSnapshotBeforeCkptCasHookForTest(nullptr);
-
-    ASSERT_TRUE(ckpt_after_successor.has_value()) << "the successor ran between the snapshot PUT and `_ckpt`";
-    const std::optional<Object> ckpt_now = readObj(*backend, ckpt_key);
-    ASSERT_TRUE(ckpt_now.has_value());
-    EXPECT_EQ(ckpt_now->bytes, ckpt_after_successor->bytes) << "the stale snapshot did not reach `_ckpt`";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefCheckpointFrontierRefused], refused_before + 1);
-}
-
-namespace
-{
-
-/// A recovery that sampled `_ckpt` before a successor ran, then met a late record of the closed epoch in
-/// the seal slot. Reachable when the deposed writer's create is delayed through its retry window (or the
-/// writer resumes after a pause), the successor keeps writing after this recovery sampled `_ckpt`, and ref
-/// cleanup deletes the successor's seal: a validated snapshot above it is the checkpoint base and the
-/// fold cursor is at or above the slot.
-/// The successor here sealed `slot`, opened its epoch at `{e+1, 1}`, and made `{e+1, 2}` the base;
-/// `sealed_again` adds a further seal at `{e+1, 3}`. The walk publishes the record as the one transaction
-/// above its sample, the checkpoint refuses it, and this recovery installs nothing. The next recovery
-/// grounds on the successor's snapshot and never reads the slot.
-void recoveryWalkMeetsALateRecordInAReclaimedSealSlot(const RootNamespace & ns, bool sealed_again)
-{
-    auto backend = std::make_shared<WedgeTestBackend>();
-    const Layout layout("p");
-    const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(ns);
-    const String ckpt_key = layout.refCkptKey(life);
-
-    auto writer = openPool(backend);
-    admitProperlyBornEntry(backend, layout, ns);
-    publishEmptyPart(writer, ns, "x");
-    publishEmptyPart(writer, ns, "y");
-    const ManifestRef x_ref = writer->resolveRef(ns, "x")->manifest_id.ref;
-    const ManifestRef y_ref = writer->resolveRef(ns, "y")->manifest_id.ref;
-    const std::optional<RefTxnId> writer_frontier = decodeRefCkpt(readObj(*backend, ckpt_key)->bytes).committed_through;
-    ASSERT_TRUE(writer_frontier.has_value());
-    ASSERT_EQ(writer_frontier->writer_epoch, writer->liveWriterEpoch());
-    writer.reset();
-
-    const RefTxnId slot{writer_frontier->writer_epoch, writer_frontier->ref_sequence + 1};
-    const String slot_key = layout.refLogKey(life, slot);
-    const uint64_t successor_epoch = [&]
-    {
-        CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
-        CasOperation op = requests.admit();
-        return allocateWriterEpoch(op, layout, "test", [] { return RefCatalog{}; });
-    }();
-    ASSERT_EQ(successor_epoch, slot.writer_epoch + 1);
-    const RefTxnId opened{successor_epoch, 1};
-    const RefTxnId base{successor_epoch, 2};
-    const RefTxnId later_seal{successor_epoch, 3};
-    const ManifestRef s_ref{.writer_epoch = successor_epoch, .build_sequence = 1, .manifest_ordinal = 1};
-    const RefLogTxn late_record{ns.string(), slot,
-        {DB::Cas::tests::ownerTransitionOp(RefOwnerBinding{RefOwnerKind::Committed, "x", x_ref}, std::nullopt)},
-        std::nullopt};
-
-    /// One walk per touch, so the refused walk's own error reaches the caller.
-    CasRequestBudget budget;
-    budget.recovery_retry_budget_ms = 0;
-    auto store = openPool(backend, budget);
-    ASSERT_EQ(store->liveWriterEpoch(), successor_epoch + 1);
-
-    std::optional<Object> ckpt_after_successor;
-    backend->after_read_key = ckpt_key;
-    backend->after_read = [&]
-    {
-        const auto ckpt_body = [](const RefTxnId & ct, std::optional<RefTxnId> snap, const RefTxnId & seal)
-        {
-            return RefCkpt{.life_epoch = std::nullopt, .committed_through = ct, .checkpoint_snapshot_id = snap,
-                           .last_epoch_seal = seal};
-        };
-        backend->bypass_seams.store(true, std::memory_order_release);
-        SCOPE_EXIT(backend->bypass_seams.store(false, std::memory_order_release));
-        CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
-        CasOperation op = requests.admit();
-        ASSERT_TRUE(std::holds_alternative<Committed>(op.create(slot_key, epochSealBytes(ns, slot), Retry::once())));
-        DB::Cas::tests::writeTxnAt(*backend, layout, ns, opened,
-            {DB::Cas::tests::ownerTransitionOp(RefOwnerBinding{RefOwnerKind::Committed, "y", y_ref}, std::nullopt)}, slot);
-        DB::Cas::tests::writeTxnAt(*backend, layout, ns, base, DB::Cas::tests::publishCommittedOps("s", s_ref));
-        DB::Cas::tests::writeRefSnapshotRaw(*backend, layout, DB::Cas::tests::minimalLiveSnapshot(ns.string(), base,
-            {DB::Cas::tests::committedRow("s", s_ref), DB::Cas::tests::committedRow("x", x_ref)}));
-        ASSERT_EQ(publishCkpt(op, layout, life, ckpt_body(slot, std::nullopt, slot)), CkptPublishOutcome::Published);
-        ASSERT_EQ(publishCkpt(op, layout, life, ckpt_body(base, base, slot)), CkptPublishOutcome::Published);
-        if (sealed_again)
-        {
-            ASSERT_TRUE(std::holds_alternative<Committed>(
-                op.create(layout.refLogKey(life, later_seal), epochSealBytes(ns, later_seal), Retry::once())));
-            ASSERT_EQ(publishCkpt(op, layout, life, ckpt_body(later_seal, std::nullopt, later_seal)),
-                      CkptPublishOutcome::Published);
-        }
-        ASSERT_EQ(op.removeCurrent(slot_key, Retry::once()), Removal::Removed);
-        ASSERT_TRUE(std::holds_alternative<Committed>(
-            op.create(slot_key, sealObject(FormatId::RefLog, encodeRefLogTxn(late_record)), Retry::once())));
-        ckpt_after_successor = readObj(*backend, ckpt_key);
-    };
-
-    const uint64_t refused_before = ProfileEvents::global_counters[ProfileEvents::CASRefCheckpointFrontierRefused];
-    const uint64_t restarts_before = ProfileEvents::global_counters[ProfileEvents::CASRefRecoveryRestarts];
-    const uint64_t installs_before = store->recoveryInstallCountForTest();
-    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR,
-        fmt::format("before the checkpoint could record recovered txn {}-{}; nothing is installed",
-                    slot.writer_epoch, slot.ref_sequence),
-        [&] { (void)store->listRefs(ns); });
-
-    ASSERT_TRUE(ckpt_after_successor.has_value()) << "the successor must run after the walk sampled `_ckpt`";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefCheckpointFrontierRefused], refused_before + 1);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefRecoveryRestarts], restarts_before)
-        << "the refusal ends the walk; it does not restart it";
-    const std::optional<Object> ckpt_after_refusal = readObj(*backend, ckpt_key);
-    ASSERT_TRUE(ckpt_after_refusal.has_value());
-    EXPECT_EQ(ckpt_after_refusal->bytes, ckpt_after_successor->bytes);
-    EXPECT_TRUE(ckpt_after_refusal->etag == ckpt_after_successor->etag) << "the refused walk wrote no `_ckpt` body";
-    EXPECT_EQ(store->recoveryInstallCountForTest(), installs_before);
-    EXPECT_FALSE(store->refTableRecoveredForTest(ns));
-
-    const uint64_t slot_reads_before = backend->getCount(slot_key);
-    std::map<String, Resolved> refs;
-    ASSERT_NO_THROW(refs = store->listRefs(ns));
-    std::vector<String> names;
-    for (const auto & [name, resolved] : refs)
-        names.push_back(name);
-    EXPECT_EQ(names, (std::vector<String>{"s", "x"}))
-        << "the successor's snapshot is the recovered state, and the late removal of `x` is not part of it";
-    EXPECT_EQ(store->recoveryInstallCountForTest(), installs_before + 1);
-    EXPECT_EQ(backend->getCount(slot_key), slot_reads_before) << "the second walk starts above the slot";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefCheckpointFrontierRefused], refused_before + 1);
-    EXPECT_TRUE(readObj(*backend, slot_key).has_value()) << "the late record stays below the checkpoint";
-}
-
-}
-
-TEST(CASRefWedgeEveryAttempt, RecoveryWalkMeetingALateRecordInAReclaimedSealSlotInstallsNothing)
-{
-    recoveryWalkMeetsALateRecordInAReclaimedSealSlot(RootNamespace{"srv1/recovery_reclaimed_seal"}, /*sealed_again=*/false);
-}
-
-TEST(CASRefWedgeEveryAttempt, RecoveryWalkMeetingALateRecordPastALaterEpochSealInstallsNothing)
-{
-    recoveryWalkMeetsALateRecordInAReclaimedSealSlot(RootNamespace{"srv1/recovery_superseded"}, /*sealed_again=*/true);
-}
-
-/// A writer's own record is durable but its `_ckpt` publish threw, so the lane waits in `NeedsRecovery`.
-/// Its recovery walk adopts the record and, right after reading the following slot as absent, a successor
-/// epoch adopts the record, seals the slot, appends, snapshots, and a later epoch closes the successor.
-/// The walk's frontier is then behind the durable one, the checkpoint refuses it and nothing is installed.
-TEST(CASRefWedgeEveryAttempt, RecoveryWalkOfAWriterLaneInNeedsRecoveryRefusedBySupersedingEpochsInstallsNothing)
-{
-    auto backend = std::make_shared<WedgeTestBackend>();
-    CasRequestBudget budget = wedgeTestBudget();
-    budget.recovery_retry_budget_ms = 0;
-    auto store = openPool(backend, budget);
-    auto clock = VirtualRetryClock::installOn(store);
-    const RootNamespace ns{"srv1/recovery_writer_lane_superseded"};
-    const Layout layout = store->layout();
-    admitProperlyBornEntry(backend, layout, ns);
-    publishEmptyPart(store, ns, "x");
-    publishEmptyPart(store, ns, "y");
-    const NamespaceLifeId life = *store->refTableLifeForTest(ns);
-    const String ckpt_key = layout.refCkptKey(life);
-    const ManifestRef x_ref = store->resolveRef(ns, "x")->manifest_id.ref;
-    const uint64_t epoch = store->liveWriterEpoch();
-    const std::optional<RefTxnId> frontier_before = decodeRefCkpt(readObj(*backend, ckpt_key)->bytes).committed_through;
-    ASSERT_TRUE(frontier_before.has_value());
-    ASSERT_EQ(frontier_before->writer_epoch, epoch);
-
-    backend->fail_cas_substr = ckpt_key;
-    backend->fail_cas_latched = true;
-    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR,
-        "is durable but was not acknowledged", [&] { store->dropRef(ns, "y"); });
-    backend->fail_cas_latched = false;
-    backend->fail_cas_substr.clear();
-
-    const RefTxnId own{epoch, frontier_before->ref_sequence + 1};
-    const RefTxnId seal{epoch, own.ref_sequence + 1};
-    ASSERT_TRUE(readObj(*backend, layout.refLogKey(life, own)).has_value()) << "the writer's record is durable";
-    ASSERT_FALSE(readObj(*backend, layout.refLogKey(life, seal)).has_value());
-    ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
-    ASSERT_EQ(decodeRefCkpt(readObj(*backend, ckpt_key)->bytes).committed_through, frontier_before)
-        << "the failed publish left `_ckpt` at the old frontier";
-
-    const uint64_t successor_epoch = epoch + 1;
-    const RefTxnId opened{successor_epoch, 1};
-    const RefTxnId base{successor_epoch, 2};
-    const RefTxnId later_seal{successor_epoch, 3};
-    const ManifestRef s_ref{.writer_epoch = successor_epoch, .build_sequence = 1, .manifest_ordinal = 1};
-    const ManifestRef t_ref{.writer_epoch = successor_epoch, .build_sequence = 2, .manifest_ordinal = 1};
-
-    std::optional<Object> ckpt_after_successor;
-    backend->after_read_key = layout.refLogKey(life, seal);
-    backend->after_read = [&]
-    {
-        const auto ckpt_body = [](const RefTxnId & ct, std::optional<RefTxnId> snap, const RefTxnId & last_seal)
-        {
-            return RefCkpt{.life_epoch = std::nullopt, .committed_through = ct, .checkpoint_snapshot_id = snap,
-                           .last_epoch_seal = last_seal};
-        };
-        backend->bypass_seams.store(true, std::memory_order_release);
-        SCOPE_EXIT(backend->bypass_seams.store(false, std::memory_order_release));
-        CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
-        CasOperation op = requests.admit();
-        ASSERT_TRUE(std::holds_alternative<Committed>(
-            op.create(layout.refLogKey(life, seal), epochSealBytes(ns, seal), Retry::once())));
-        DB::Cas::tests::writeTxnAt(*backend, layout, ns, opened, DB::Cas::tests::publishCommittedOps("s", s_ref), seal);
-        DB::Cas::tests::writeTxnAt(*backend, layout, ns, base, DB::Cas::tests::publishCommittedOps("t", t_ref));
-        DB::Cas::tests::writeRefSnapshotRaw(*backend, layout, DB::Cas::tests::minimalLiveSnapshot(ns.string(), base,
-            {DB::Cas::tests::committedRow("s", s_ref), DB::Cas::tests::committedRow("t", t_ref),
-             DB::Cas::tests::committedRow("x", x_ref)}));
-        ASSERT_EQ(publishCkpt(op, layout, life, ckpt_body(seal, std::nullopt, seal)), CkptPublishOutcome::Published);
-        ASSERT_EQ(publishCkpt(op, layout, life, ckpt_body(base, base, seal)), CkptPublishOutcome::Published);
-        ASSERT_TRUE(std::holds_alternative<Committed>(
-            op.create(layout.refLogKey(life, later_seal), epochSealBytes(ns, later_seal), Retry::once())));
-        ASSERT_EQ(publishCkpt(op, layout, life, ckpt_body(later_seal, std::nullopt, later_seal)),
-                  CkptPublishOutcome::Published);
-        ckpt_after_successor = readObj(*backend, ckpt_key);
-    };
-
-    const uint64_t refused_before = ProfileEvents::global_counters[ProfileEvents::CASRefCheckpointFrontierRefused];
-    const uint64_t installs_before = store->recoveryInstallCountForTest();
-    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR,
-        fmt::format("before the checkpoint could record recovered txn {}-{}; nothing is installed",
-                    own.writer_epoch, own.ref_sequence),
-        [&] { (void)store->listRefs(ns); });
-
-    ASSERT_TRUE(ckpt_after_successor.has_value())
-        << "the walk must read the slot after the writer's own record before the successor runs";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefCheckpointFrontierRefused], refused_before + 1);
-    const std::optional<Object> ckpt_after_refusal = readObj(*backend, ckpt_key);
-    ASSERT_TRUE(ckpt_after_refusal.has_value());
-    EXPECT_EQ(ckpt_after_refusal->bytes, ckpt_after_successor->bytes);
-    EXPECT_TRUE(ckpt_after_refusal->etag == ckpt_after_successor->etag) << "the refused walk wrote no `_ckpt` body";
-    EXPECT_EQ(store->recoveryInstallCountForTest(), installs_before);
-    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery)
-        << "a refused walk leaves the lane waiting; it does not claim the old frontier";
-
-    std::map<String, Resolved> refs;
-    ASSERT_NO_THROW(refs = store->listRefs(ns));
-    std::vector<String> names;
-    for (const auto & [name, resolved] : refs)
-        names.push_back(name);
-    EXPECT_EQ(names, (std::vector<String>{"s", "t", "x"}))
-        << "the next recovery grounds on the successor's snapshot, where the writer's own record is history";
-    EXPECT_EQ(store->recoveryInstallCountForTest(), installs_before + 1);
-    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefCheckpointFrontierRefused], refused_before + 1);
-}
 
 /// [CKPT-FAILED-BIRTH-DEBRIS] REVERSED (increment review Critical B; BACKLOG `{#ckpt-failed-birth-debris}`
 /// reopened, `{#ckpt-neverborn-gc-backstop}` filed). This test used to pin the OPPOSITE of what it now
@@ -2131,13 +1566,9 @@ TEST(CASRefWedgeEveryAttempt, WellFormedNonSealOccupantIsStillForeign)
     EXPECT_EQ(store->lastEpochSealForTest(ns), std::nullopt) << "and is emphatically not an epoch seal";
 }
 
-/// The deposed-lane self-pointer. A successor that seals an EMPTY epoch writes its record at sequence 1
-/// of that epoch, and a lane still live there re-derives exactly that id. Stamping the seal as its own
-/// `prev_epoch_seal` would be a self-pointer, which the structural grammar (strictly-less by
-/// construction) refuses at ENCODE — so the lane would fail with a self-inflicted `CORRUPTED_DATA` on
-/// every attempt and never reach the seal collision that is supposed to fence it. The stamp is
-/// therefore conditioned on the seal's epoch being strictly BELOW the id's.
-TEST(CASRefWedgeEveryAttempt, ALiveEpochSealIsNeverStampedAsItsOwnPrevEpochSeal)
+/// A lane whose chain ends below the live epoch builds nothing: its next id would be in the chain epoch,
+/// so it sends no request and leaves the tombstone to recovery.
+TEST(CASRefWedgeEveryAttempt, ChainEpochBelowTheLiveEpochSendsTheLaneToRecoveryWithoutARequest)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPool(backend);
@@ -2147,60 +1578,15 @@ TEST(CASRefWedgeEveryAttempt, ALiveEpochSealIsNeverStampedAsItsOwnPrevEpochSeal)
     publishEmptyPart(store, ns, "x");
 
     const uint64_t epoch = store->liveWriterEpoch();
-    /// Keep this a local wire/encoder test: moving the mount-fence generation would correctly make the
-    /// immutable runtime stale before the self-pointer guard was reached.
+    /// Keep this a local test: moving the mount-fence generation would make the runtime stale first.
     store->setLiveWriterEpochForTest(epoch + 1);
-    /// A seal of the LIVE epoch — the deposed-lane shape the wedge rejection arm can record.
-    store->setLastEpochSealForTest(ns, RefTxnId{epoch + 1, 7});
 
-    /// The lane now holds NOTHING it can legally write. Its next id is sequence 1 of the new epoch, which
-    /// owes a link to the seal that closed the epoch BELOW -- and the only seal it has is of the epoch it
-    /// is trying to open. Stamping that one would be a self-pointer the ENCODER refuses; stamping nothing
-    /// leaves a crossing the READER refuses. So the append fails closed, locally, before anything is sent.
-    ///
-    /// That is a strictly better outcome than the one this test originally pinned (stamp nothing, send,
-    /// and let the successor's seal reject the attempt at the key): the deposed lane spends no request to
-    /// learn what it can already prove about itself. The property the test exists for is unchanged and is
-    /// asserted below in its strongest form -- NO object is written at that id at all, so no self-pointer
-    /// can have been stamped anywhere.
-    /// The refusal must reach the SAME TERMINAL OUTCOME the collision produced, not merely "an error".
-    /// Skipping the request must not skip the conclusion, so all four halves are pinned:
-    ///
-    ///   1. the class is INVALID_STATE -- the conclusive-rejection class the successor-seal arm uses,
-    ///      NOT the retry-later class. This is the one that matters most: a retryable error here would
-    ///      have every caller re-derive the same impossible transaction forever, and the deposition
-    ///      would never surface anywhere;
-    ///   2. the message says the lane resumes only under a later epoch -- that IS the deposition,
-    ///      reported to the caller and the operator in the same words the collision reported it;
-    ///   3. NOTHING is written, so no self-pointer can have been stamped and no request was spent;
-    ///   4. a SECOND flush behaves identically instead of looping or degrading.
-    const uint64_t remounts_before = store->scheduleRemountCallCountForTest();  /// NOLINT(clang-analyzer-deadcode.DeadStores)
-    const size_t puts_before = backend->putCount(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), RefTxnId{epoch + 1, 1}));  /// NOLINT(clang-analyzer-deadcode.DeadStores)
-    try
-    {
-        store->dropRef(ns, "x");
-        FAIL() << "the deposed lane must reject conclusively, not succeed";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::INVALID_STATE) << "got: " << e.message();
-        EXPECT_NE(e.message().find("resumes only under a later epoch"), String::npos)
-            << "the deposition must be surfaced, not just the failure: " << e.message();
-    }
-    EXPECT_FALSE(readObj(*backend, layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), RefTxnId{epoch + 1, 1})).has_value())
-        << "nothing may be written: the lane could not construct a legal transaction, so it sent none";
-    EXPECT_EQ(backend->putCount(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), RefTxnId{epoch + 1, 1})), puts_before)
-        << "and no request was spent learning what the lane could already prove about itself";
-
-    /// The second flush: same conclusive answer, still no traffic. A lane that re-derived and re-sent
-    /// here would be exactly the spin this arm exists to prevent.
-    expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { store->dropRef(ns, "x"); });
-    EXPECT_EQ(backend->putCount(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), RefTxnId{epoch + 1, 1})), puts_before);
-
-    /// NO remount is scheduled, matching the collision arm exactly. A successor closing our epoch is a
-    /// legitimate handover, not an anomaly to react to: the mount lease is what resolves it, and
-    /// scheduling a remount from here would turn every ordinary deposition into a self-inflicted
-    /// re-claim storm.
+    const uint64_t remounts_before = store->scheduleRemountCallCountForTest();
+    const uint64_t writes_before = backend->writeTotal();
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
+    EXPECT_EQ(backend->writeTotal(), writes_before) << "no request may be spent on a record of the wrong epoch";
+    EXPECT_FALSE(readObj(*backend, layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), RefTxnId{epoch + 1, 1})).has_value());
     EXPECT_EQ(store->scheduleRemountCallCountForTest(), remounts_before);
 }
 

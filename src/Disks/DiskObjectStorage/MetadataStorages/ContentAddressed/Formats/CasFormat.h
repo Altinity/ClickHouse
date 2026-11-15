@@ -13,10 +13,11 @@ namespace DB::Cas
 
 /// The highest pool-format generation this build understands: an object is readable iff its
 /// compatibility_version <= G_BUILD. Readers for every lower generation are kept.
-constexpr uint32_t G_BUILD = 2;
+constexpr uint32_t G_BUILD = 3;
 /// The compatibility version stamped on ordinary objects: they carry no generation-2 construct, so
 /// only a Move-bearing ref log is stamped `G_REF_MOVE`. What gates a generation-1 reader is the pool's
-/// `min_reader_generation`, which a writable mount of this build raises to `G_REF_MOVE` before any Move.
+/// `min_reader_generation`, which a writable mount of this build raises to `G_REF_CHAIN` before it writes
+/// any object of generation 2 or 3.
 constexpr uint32_t G_WRITE_FLOOR = 1;
 /// The generation that introduced the committed-owner move in the ref log (`OwnerTransitionShape::Move`).
 constexpr uint32_t G_REF_MOVE = 2;
