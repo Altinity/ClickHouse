@@ -1,9 +1,15 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCkpt.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Common/Exception.h>
+#include <Common/ProfileEvents.h>
 #include <base/defines.h>
 #include <limits>
 #include <variant>
+
+namespace ProfileEvents
+{
+    extern const Event CASRefCheckpointStamped;
+}
 
 namespace DB
 {
@@ -161,8 +167,11 @@ CkptStampResult stampCkptGeneration3(CasOperation & op, const Layout & layout, c
     const WriteResult result = op.replace(layout.refCkptKey(life),
         encodeGenerationThreeBody(stamped.life_epoch, stamped.checkpoint_snapshot_id), accepted.etag, Retry::once());
     if (const auto * committed = std::get_if<Committed>(&result))
+    {
+        ProfileEvents::increment(ProfileEvents::CASRefCheckpointStamped);
         return CkptStampResult{.outcome = CkptStampOutcome::Stamped,
                                .stamped = CkptSample{.ckpt = std::move(stamped), .etag = committed->etag}};
+    }
     if (std::holds_alternative<Conflict>(result))
         return CkptStampResult{.outcome = CkptStampOutcome::TokenMismatch, .stamped = std::nullopt};
     return CkptStampResult{.outcome = CkptStampOutcome::Unresolved, .stamped = std::nullopt};

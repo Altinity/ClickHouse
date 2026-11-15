@@ -277,8 +277,10 @@ struct PoolConfig
     /// That poll is the only wait either path can block on. Recovery does not trust listings: it walks the
     /// chain and, when it ends in an epoch that may have ended uncleanly (`last_unclean_epoch`), closes it
     /// with a tombstone in the slot after its last record, written as a conditional create. A straggler's
-    /// own conditional create loses against that occupied slot whenever it arrives; after a clean end
-    /// nothing is in flight.
+    /// own conditional create loses against that occupied slot whenever it arrives. After a clean end the
+    /// lanes were drained before the farewell; a recovery tombstone may still be in flight, but only into a
+    /// chain at or below `last_unclean_epoch`, which a successor inherits and never lowers, so it seals
+    /// that chain too.
     std::function<void(uint64_t)> wait_sleep_fn = {};   /// test hook for open/remount waits
     RuntimeWorkerFactory worker_factory = {};           /// internal test seam; never parsed from disk config
     std::function<void()> remount_quiesce_hook_for_test = {};

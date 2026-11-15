@@ -26,7 +26,7 @@ namespace DB::Cas
 /// `_ckpt` is created at generation 3 by namespace creation or raised to it by the generation 3 stamp,
 /// and a generation 3 body is replaced only by snapshot publication (`Pool/CasRefCkpt.h`).
 ///
-/// INVARIANT (Constraint 15), and it constrains what may ever be ADDED here, not merely what is here
+/// INVARIANT, and it constrains what may ever be ADDED here, not merely what is here
 /// today: `_ckpt` is a fixed-size product of SCALAR MONOTONE FACTS. Its encoded size is `O(1)` in refs,
 /// files, transactions and writer epochs. Maps, collections and cardinality-growing fields belong in a
 /// separate immutable object or ledger -- never in this one, because this one is MUTABLE, is rewritten
@@ -38,7 +38,7 @@ namespace DB::Cas
 /// invariant is checkable rather than merely believed:
 ///   - refs and files enter in NO form. Two namespaces differing only in how many refs they hold encode
 ///     BYTE-IDENTICAL `_ckpt` bodies.
-///   - transactions and writer epochs enter as the DECIMAL WIDTH of the two id pairs -- four orders of
+///   - transactions and writer epochs enter as the DECIMAL WIDTH of the id pairs -- four orders of
 ///     magnitude of `ref_sequence` cost four bytes. That is `O(1)` because the components are
 ///     `uint64_t`, so the width is ceilinged at twenty digits and the whole object at a constant far
 ///     below `traitsFor(FormatId::RefCkpt).object_cap` (which stays what it is documented to be: a
@@ -51,16 +51,14 @@ struct RefCkpt
     /// `validateEpochSealGrammarContextual` takes it. Set once, by `completeCreation`; a generation 1 or 2
     /// body may carry a value an older build's birth raised. Required from generation 3.
     std::optional<uint64_t> life_epoch;
-    /// The greatest transaction admitted to durable logical history. Absent means this life has no
-    /// committed transaction; a snapshot or epoch seal is then invalid because neither can describe
-    /// history that was never committed.
+    /// Generation 1 and 2 only: read from an older body, never written, absent at generation 3. The
+    /// greatest transaction that body admitted to durable history.
     std::optional<RefTxnId> committed_through = std::nullopt;
     /// The snapshot recovery point-reads as its base, and the floor cleanup deletes strictly below.
     /// `nullopt` until this namespace's first snapshot publication commits.
     std::optional<RefTxnId> checkpoint_snapshot_id;
-    /// The `EpochSeal` transaction that closed the newest epoch known to have been closed. Consumed by
-    /// a later mount locating the previous epoch's terminating record and by the GC fold crossing
-    /// epochs. `nullopt` before this namespace has ever had an epoch closed.
+    /// Generation 1 and 2 only: read from an older body, never written, absent at generation 3. The
+    /// `EpochSeal` that closed the newest epoch that body knew of.
     std::optional<RefTxnId> last_epoch_seal;
     /// The header generation the body was decoded from; the encoders ignore it. Part of equality, so a
     /// generation 1 body and a generation 3 body with equal fields differ.

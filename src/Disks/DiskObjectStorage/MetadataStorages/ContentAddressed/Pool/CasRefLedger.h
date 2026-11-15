@@ -46,7 +46,7 @@ enum class ResolveAudit : uint8_t { Emit, Deferred };
 /// exact attempt before its first possible send. `Wedged` owns that same attempt after an ambiguous
 /// result and certifies nothing. `NeedsRecovery` means a transaction is known durable but cannot be
 /// installed in this cache; it is a hard write and certification fence until replay completes. `Closed`
-/// records a successor's epoch seal, and `Faulted` records foreign or internally inconsistent durable
+/// records a successor's tombstone, and `Faulted` records foreign or internally inconsistent durable
 /// state.
 enum class RefLaneState : uint8_t
 {
@@ -717,7 +717,7 @@ public:
     /// rebuild the whole base, O(table) per chunk, which the install path exists to avoid.
     ///
     /// `id`, `chain_link` and `admitted_generation` are INPUTS, not derived here, because each traces back
-    /// to the SAME critical section that snapshots the state (INV-1): all three are read inside that hold,
+    /// to the SAME critical section that snapshots the state: all three are read inside that hold,
     /// `id` and `chain_link` as one `nextRefSlot` of the state. Deriving the id from a different instant
     /// than the state it is applied to would be deriving it from a different stream. The critical section
     /// therefore stays in `commitRefChunk`, and this is a pure function of its arguments -- what that one
@@ -1020,7 +1020,7 @@ private:
     /// this table is idle.
     std::atomic<bool> shutting_down{false};
 
-    /// The id and backlink `rt`'s next transaction carries (INV-1): `nextRefSlot` of the table's OWN
+    /// The id and backlink `rt`'s next transaction carries: `nextRefSlot` of the table's OWN
     /// state. There is no counter behind this -- the id is a pure function of the state the transaction
     /// will be applied to, which buys two properties a pool-wide counter could not:
     ///   - each namespace's ids are dense `1..T` within one epoch, so a reader holding a table's log
@@ -1158,7 +1158,7 @@ private:
     ///   - an entry already `Live`/`Removing`: adopts its incarnation directly
     ///     (`NamespaceLifeId::fromCatalogEntry`) -- `Removing` is adopted exactly like `Live` because
     ///     this call only needs A life to key objects with; refusing WRITES to a `Removing` namespace
-    ///     is a different mechanism's job (Task 6's read-side contract), not this resolution's;
+    ///     is a different mechanism's job (`removal_admission_closed`), not this resolution's;
     ///   - an entry `Creating`: if its `creator` fence is THIS mount's own (a previous attempt of this
     ///     same open landed step 1 but not steps 2/3, e.g. after a transient error), resumes
     ///     `completeCreation` directly over the observed entry; otherwise reconciles it via
@@ -1208,7 +1208,7 @@ private:
     /// Publishes a completed streaming recovery into the runtime in one atomic step: copies EVERY field
     /// `RecoveryResult` carries into `rt` and sets `recovered` LAST, so a waiter woken after this returns
     /// never observes a partially-installed table. Struct-driven so a future added publication field
-    /// cannot be silently dropped from a scattered assignment list (spec §5). A chain epoch above a
+    /// cannot be silently dropped from a scattered assignment list. A chain epoch above a
     /// nonzero `live_epoch` installs the lane `Closed`. MUST hold `rt.state_mutex`.
     static void installRecoveryResult(RefTableRuntime & rt, RecoveryResult && result, uint64_t live_epoch);
 
@@ -1292,7 +1292,7 @@ private:
     /// candidate under `state_mutex` by a no-throw swap, advances the tail counters, records the
     /// per-transaction metrics, completes exactly `chunk_survivors` with the real id (waking their
     /// waiters), and schedules snapshot publication. Preparation completes BEFORE the ref-log `PUT`, the
-    /// chunk's only durable effect, so that nothing between "durable" and "recorded" can throw (spec §A1);
+    /// chunk's only durable effect, so that nothing between "durable" and "recorded" can throw;
     /// a preparation failure is an ordinary pre-durability rejection. For the same reason the
     /// `RefAppendAttempt` is built COMPLETE before the `PUT` -- the request reads its key and body -- so
     /// the `Unresolved` arm only has to move it into the runtime: the OTHER thing that must be recorded

@@ -626,7 +626,7 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::completeCreation(
     /// Step 2: the only writer that creates `_ckpt`, and so the one that sets `life_epoch`. A resumed
     /// creation meets the body an earlier attempt created and keeps its `life_epoch`. `FencedOut` ends
     /// the attempt without step 3 and leaves the entry `Creating` for whichever actor reconciles it next.
-    if (!ckptContributionRecorded(createCkptAtCreation(op, layout,
+    if (!ckptPublicationDurable(createCkptAtCreation(op, layout,
             NamespaceLifeId::fromCatalogEntry(observed.ns, observed.incarnation), observed.creator->writer_epoch, policy)))
         return NamespaceCreationOutcome::FencedOut;
 

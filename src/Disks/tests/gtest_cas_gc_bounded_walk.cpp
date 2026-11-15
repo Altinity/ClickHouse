@@ -706,6 +706,36 @@ TEST(CASGCBoundedWalk, SliceCutLeavesTheNamespaceUnprovenAndKeepsItsCursor)
     EXPECT_EQ(metric(second, "frontier_proven"), 1u);
 }
 
+/// Deleting objects outside the protocol is unsupported. This records what the walk then does: a tail
+/// above the cursor that vanished between rounds reads as the end of the log, so the namespace is proven,
+/// not held.
+TEST(CASGCBoundedWalk, ATailThatVanishedAboveTheCursorReadsAsTheEndOfTheLog)
+{
+    ScopedReadCeiling c(3);
+    auto backend = std::make_shared<SteppingClock>();
+    auto store = openPoolWithSmallWindow(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/vanished@cas@"};
+    const uint64_t tail = 3 * kWindow;
+    publishRange(*backend, layout, ns, 1, tail);
+    putCkptAtGeneration(*backend, layout, ns, refCkptOf(1), 3);
+    backend->stepAfterGet(logKey(layout, ns, RefTxnId{1, kWindow}));
+
+    Gc gc(store, kGc, {}, backend->monoMsFn());
+    runRoundCapturingIntake(gc);
+    ASSERT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{1, kWindow}));
+
+    for (uint64_t seq = kWindow + 1; seq <= tail; ++seq)
+        removeObject(*backend, logKey(layout, ns, RefTxnId{1, seq}));
+
+    const std::map<String, UInt64> second = runRoundCapturingIntake(gc);
+    const auto cov = coverageOf(*backend, layout, ns);
+    ASSERT_TRUE(cov.has_value());
+    EXPECT_FALSE(cov->hold.has_value());
+    EXPECT_EQ(cov->last_folded_ref_id, (RefTxnId{1, kWindow}));
+    EXPECT_EQ(metric(second, "frontier_proven"), 1u);
+}
+
 /// Pass 1 gives every namespace one read window even after the slice ended. Pass 2 starts at index
 /// `round mod n` of the unfinished namespaces, so no namespace is starved by its place in the order.
 TEST(CASGCBoundedWalk, PassOneIsNeverCutAndPassTwoRotatesByRound)

@@ -202,9 +202,9 @@ Returns one row: `disk`, `reachable`, `dangling`, `unreachable`, `pending_gc`, `
 `referenced_logical_bytes`, `distinct_blobs`, `total_blob_refs`. `dangling` is the one column that
 means data loss — `unreachable`, `pending_gc`, and `awaiting_gc` are objects still
 moving through the normal condemn/graduate/delete pipeline, not a problem on their own.
-`chain_broken` and `corrupted_runs` are the other two hard findings: a ref-log stream whose chain ends
-below a log that is listed above the end, or that holds a corrupt record or link (a corrupt snapshot base included) while `_ckpt` is unchanged, and a
-GC source-edge run that failed its checksum, respectively. `unchecked` means the scan could not prove or
+`chain_broken` and `corrupted_runs` are the other two hard findings. `chain_broken` is a ref-log stream
+whose chain ends below a log listed above that end, or whose snapshot base, records or links are corrupt
+while `_ckpt` is unchanged. `corrupted_runs` is a GC source-edge run that failed its checksum. `unchecked` means the scan could not prove or
 refute a finding, for example because the checkpoint changed during the scan; rerun `fsck` and treat only
 a repeat as a finding. This summary-only form has
 no per-object `--detail` equivalent yet — for that, the offline `cas-fsck --detail` below is still

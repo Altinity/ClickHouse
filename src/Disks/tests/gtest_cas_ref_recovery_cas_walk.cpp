@@ -70,6 +70,8 @@ extern const Event CASRefRecoveryEpochSealAdopted;
 extern const Event CASRefRecoveryStragglerAdopted;
 extern const Event CASRefRecoveryCancelled;
 extern const Event CASRefCheckpointPublished;
+extern const Event CASRefCheckpointStamped;
+extern const Event CASRefAppendTombstoneWritten;
 }
 
 using namespace DB::Cas;
@@ -1960,7 +1962,13 @@ TEST(CASRefRecoveryCasWalk, RecoveryRequestSequenceStampsThenWritesOneTombstone)
     const String ckpt_key = layout.refCkptKey(life);
 
     backend->clearJournal();
+    const uint64_t stamped_before = ProfileEvents::global_counters[ProfileEvents::CASRefCheckpointStamped];
+    const uint64_t sealed_before = ProfileEvents::global_counters[ProfileEvents::CASRefRecoveryEpochSealed];
+    const uint64_t lane_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendTombstoneWritten];
     EXPECT_EQ(store->listRefs(ns).size(), 3u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefCheckpointStamped] - stamped_before, 1u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefRecoveryEpochSealed] - sealed_before, 1u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendTombstoneWritten] - lane_before, 0u);
 
     std::vector<std::pair<String, String>> requests;
     for (const auto & [method, key] : backend->journal())
@@ -3019,14 +3027,18 @@ TEST(CASRefWriterTombstone, AmbiguousTombstoneWedgesAndBlocksTheHead)
     ASSERT_EQ(store->liveEpochPairForTest(), (LiveEpochPair{3, 0}));
     EXPECT_EQ(store->listRefs(ns).size(), 2u);
 
+    const uint64_t lane_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendTombstoneWritten];
     backend->ambiguous_put_substr = layout.refLogKey(life, RefTxnId{1, 3});
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { publishRefForTest(store, ns, "c", manifestRef(3, 1, 1)); });
     EXPECT_GE(backend->ambiguous_put_attempts.load(), 1u);
     EXPECT_TRUE(store->refLaneWedgedForTest(ns));
     EXPECT_TRUE(logIdsInEpochs(*backend, layout, life, 3, 3).empty()) << "no head while the tombstone is unresolved";
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendTombstoneWritten] - lane_before, 0u);
 
     backend->ambiguous_put_substr.clear();
     publishRefForTest(store, ns, "c", manifestRef(3, 1, 1));
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendTombstoneWritten] - lane_before, 1u)
+        << "the tombstone the wedge resolution made durable is the lane's";
     const auto tombstone = readAt(*backend, layout.refLogKey(life, RefTxnId{1, 3}));
     ASSERT_TRUE(tombstone);
     EXPECT_EQ(tombstone->bytes, tombstoneBytes(ns, RefTxnId{1, 3}, 3));
@@ -3224,7 +3236,13 @@ TEST(CASRefWriterTombstone, LaneTombstoneFollowsTheStampOfAnOldCheckpoint)
     EXPECT_EQ(storedCkptHeader(*backend, layout, life), 2u);
 
     backend->clearJournal();
+    const uint64_t stamped_before = ProfileEvents::global_counters[ProfileEvents::CASRefCheckpointStamped];
+    const uint64_t lane_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendTombstoneWritten];
+    const uint64_t sealed_before = ProfileEvents::global_counters[ProfileEvents::CASRefRecoveryEpochSealed];
     publishRefForTest(store, ns, "c", manifestRef(3, 1, 1));
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefCheckpointStamped] - stamped_before, 1u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendTombstoneWritten] - lane_before, 1u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefRecoveryEpochSealed] - sealed_before, 0u);
     const auto journal = backend->journal();
     const auto stamp = journalIndex(journal, "CAS", ckpt_key);
     const auto tombstone = journalIndex(journal, "PUT", layout.refLogKey(life, RefTxnId{1, 3}));
@@ -3234,6 +3252,8 @@ TEST(CASRefWriterTombstone, LaneTombstoneFollowsTheStampOfAnOldCheckpoint)
     ASSERT_TRUE(head);
     EXPECT_LT(*stamp, *tombstone) << "the stamp precedes the tombstone";
     EXPECT_LT(*tombstone, *head);
+    for (size_t i = *tombstone + 1; i < *head; ++i)
+        EXPECT_NE(journal[i], (std::pair<String, String>{"GET", ckpt_key})) << "no `_ckpt` read between the tombstone and the head";
     EXPECT_EQ(storedCkptHeader(*backend, layout, life), 3u);
     EXPECT_TRUE(isTombstoneTo(readLogTxn(*backend, layout, ns, RefTxnId{1, 3}), 3));
 }

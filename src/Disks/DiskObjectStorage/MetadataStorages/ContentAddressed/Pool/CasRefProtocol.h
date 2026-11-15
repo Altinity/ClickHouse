@@ -75,6 +75,20 @@ void validateRefChainLink(const std::optional<RefEpochTransition> & open, const 
 /// Re-reads `_ckpt`. True when it is absent or its token differs from `token`.
 bool ckptTokenMoved(CasOperation & op, const Layout & layout, const NamespaceLifeId & life, const Etag & token);
 
+/// Whether a failure with this code is judged against `_ckpt` at all: only `CORRUPTED_DATA` is.
+bool failureJudgedAgainstCkpt(int error_code);
+
+/// For a failure caught while reading a chain grounded on `_ckpt` `token`: true asks the reader to restart,
+/// false to rethrow. Only `CORRUPTED_DATA` restarts, and only when `_ckpt` moved or is absent, because
+/// cleanup may then have emptied keys the reader relied on; any other code returns false without a
+/// request. When the `_ckpt` re-read itself throws, its store error replaces the caught exception: the
+/// caller fails closed as retry-later and this attempt reports no corruption verdict.
+///
+/// The writer recovery's base load uses `classifyMissingSampledBase` instead: there the sampled base itself
+/// failed to load, so an absent `_ckpt` is not "the base moved" but a base gone with its checkpoint.
+bool restartsOnMovedBase(int error_code, CasOperation & op, const Layout & layout, const NamespaceLifeId & life,
+                         const Etag & token);
+
 // Shared value types for the ref-ledger writer and the pure ref-log protocol helpers below. They live
 // in this protocol header so the ledger can depend on the carriers without making the pool and ledger
 // headers include one another.
@@ -231,23 +245,6 @@ struct RefLedgerConfig
     uint64_t ref_table_cache_bytes = 256ULL << 20;
 };
 
-/// The ONE id-derivation rule (INV-1): the id that continues `greatest_applied`'s stream under
-/// `live_epoch`. Within an epoch a table's ids are dense -- the successor of the greatest applied one --
-/// and an epoch change restarts the sequence at 1, because density is a property of `(namespace, epoch)`
-/// and a fresh incarnation's stream is a fresh stream. There is no counter anywhere: the id is a pure
-/// function of the state it will be applied to, which is what makes an attempt that sent nothing
-/// consume nothing (the next caller derives the same id from the same unchanged state).
-///
-/// This is the rule itself, applied to an ANCHOR. Callers do not choose the anchor: they go through
-/// `RefTableState::nextTxnId`, which derives from `greatest_applied` -- the writer to mint an id and
-/// every trial preview to stamp its throwaway transaction.
-///
-/// Total by construction (no throw): the one input it cannot serve, an exhausted `ref_sequence` under
-/// the live epoch, would need 2^64 transactions in one incarnation of one table. Should a corrupt
-/// persisted snapshot ever seed such a state, the wrap produces a `ref_sequence` of 0, which
-/// `applyTxnInPlace`'s strict-increase precondition rejects before anything is written.
-RefTxnId nextRefTxnId(RefTxnId greatest_applied, uint64_t live_epoch);
-
 /// The in-memory table state: `TableState = Replay(S_X.state, tail(X))`. This class, `applyRefLogTxn`, `snapshotOf`, and
 /// `replay` are the ONE shared implementation of that equation -- used verbatim by the writer, its
 /// own recovery path, `fsck`, and snapshot construction, so every consumer agrees on what a
@@ -278,13 +275,6 @@ public:
     uint64_t getSnapshotBodyBytes() const { return snapshot_body_bytes; }
     uint64_t getRemovalBodyBytes() const { return removal_body_bytes; }
 
-    /// The id the writer mints for this state's next transaction under `live_epoch`, and the id every
-    /// trial preview stamps on its throwaway transaction.
-    RefTxnId nextTxnId(uint64_t live_epoch) const
-    {
-        return nextRefTxnId(greatest_applied, live_epoch);
-    }
-
     /// The tombstone the last applied record crossed, set until its head is applied.
     const std::optional<RefEpochTransition> & getOpenTransition() const { return open_transition; }
 
@@ -292,11 +282,17 @@ public:
     bool isTerminal() const { return lifecycle != RefLifecycle::Live && remove_txn_id.has_value(); }
 
     /// The key of the next record on this state's chain: `{life_epoch,1}` when nothing is applied, else
-    /// the chain successor of the last applied record. Meaningless when `isTerminal`.
+    /// the chain successor of the last applied record. Meaningless when `isTerminal`. `CORRUPTED_DATA`
+    /// when the last applied record is at the maximum sequence.
     RefTxnId chainNextId(uint64_t life_epoch) const;
 
-    /// The epoch of `chainNextId`.
-    uint64_t chainEpoch(uint64_t life_epoch) const { return chainNextId(life_epoch).writer_epoch; }
+    /// The epoch of `chainNextId`; defined at the maximum sequence too.
+    uint64_t chainEpoch(uint64_t life_epoch) const
+    {
+        if (greatest_applied == RefTxnId{})
+            return life_epoch;
+        return open_transition ? open_transition->next_epoch : greatest_applied.writer_epoch;
+    }
 
     /// State-install point only (once per ref-log flush, never per batch item): folds the committed
     /// map's and the owned-manifest index's COW overlays into their bases -- in place when the base is
@@ -575,12 +571,6 @@ public:
     /// `CORRUPTED_DATA` (the non-transient class recovery fails fast on), discarding the candidate.
     void applyOne(RefLogTxn && txn, uint64_t encoded_bytes);
 
-    /// The candidate's lifecycle AS OF the transactions applied so far. Recovery's CAS-walk needs it at
-    /// each epoch boundary it reaches, and it must be the LIVE reading rather than one taken from the
-    /// base snapshot: a removal transaction in the replayed tail is exactly the case where the two
-    /// differ, and it is the case that decides whether the epoch below gets a seal.
-    RefLifecycle lifecycle() const { return candidate.getLifecycle(); }
-
     /// Materialises nothing extra (matches `replay`: the writer's recovery folds the COW overlays via
     /// `materializeCommitted` on the result; the read-only consumers do not) and returns the replay-derived
     /// `RecoveryResult` fields, moving the candidate out. The builder must not be used afterwards.
@@ -805,12 +795,13 @@ using RefChainVisitor = std::function<bool(RefLogTxn && txn, uint64_t stored_byt
 /// With `ckpt_token` set, an end at an absent key or a terminal record re-reads `_ckpt` (unless
 /// `confirm_base_after_end` is false) and returns `BaseMoved` when it moved: cleanup deletes only below a
 /// snapshot id it read from `_ckpt`, so only an unchanged token proves the end was not made by cleanup.
-/// The walk's own decode or link failure and a chain that ends below `old_frontier` re-read it the same
-/// way, and are `CORRUPTED_DATA` only under an unchanged token. Without `ckpt_token` they throw at once.
-/// An exception from `visit` propagates unchanged.
+/// The walk's own `CORRUPTED_DATA` decode or link failure and a chain that ends below `old_frontier`
+/// re-read it the same way, and are `CORRUPTED_DATA` only under an unchanged token. Without `ckpt_token`
+/// they throw at once. Any other exception, and any exception from `visit`, propagates unchanged.
 ///
-/// `reader`, when set, fetches the logs and may read ahead inside the current epoch only. Every exit,
-/// a throw included, discards the hints the walk gave it.
+/// `reader`, when set, fetches the logs and may read ahead inside the current epoch only: up to
+/// `old_frontier` when it is set, else a few keys past the record being read. Every exit, a throw
+/// included, discards the hints the walk gave it.
 RefChainWalk walkRefChain(CasOperation & op, const Layout & layout, const NamespaceLifeId & life,
                           const RefChainOrigin & origin, const RefChainVisitor & visit, KeyReader * reader = nullptr);
 

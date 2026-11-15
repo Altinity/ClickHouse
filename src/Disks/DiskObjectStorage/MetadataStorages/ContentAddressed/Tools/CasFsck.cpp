@@ -501,7 +501,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
 
     /// One immutable cut owns every physical-id join in this walk. `Creating` participates in that
     /// attribution (its physical keys may exist) but is never recovered: only Live/Removing rows have a
-    /// durable publication frontier. A diagnostic records duplicate ids and keeps walking unrelated
+    /// recoverable chain. A diagnostic records duplicate ids and keeps walking unrelated
     /// unique lives.
     const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(op, layout);
     struct FsckWalkLife

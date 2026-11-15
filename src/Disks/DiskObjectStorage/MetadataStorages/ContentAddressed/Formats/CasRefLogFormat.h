@@ -185,7 +185,7 @@ bool refLogTxnIsRemovalClass(const std::vector<RefOp> & ops);
 /// and branch on "is this a seal" (Task 2's slot-occupy walk) get a precise answer.
 bool refLogTxnIsEpochSeal(const RefLogTxn & txn);
 
-/// The context-free half of the INV-2 seal grammar, by `header_generation`. At every generation a transaction
+/// The context-free half of the seal grammar, by `header_generation`. At every generation a transaction
 /// carrying an `EpochSeal` op contains EXACTLY that one op, and `prev_epoch_seal`, when present, is
 /// well-formed (both `RefTxnId` components nonzero), appears ONLY at `txn_id.ref_sequence == 1` and has a
 /// strictly lower `writer_epoch` (a self or forward pointer is rejected). Below generation 3 it must also name

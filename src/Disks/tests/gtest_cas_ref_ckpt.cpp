@@ -435,7 +435,7 @@ TEST(CASRefCheckpoint, GroupRefKeysScopesHotIntakeToTheStreamTree)
         [&] { groupRefKeys(layout, {layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_bogus"}); });
 }
 
-/// Only the two outcomes after which a caller may act on a contribution are "recorded". The switch has no
+/// Only the two outcomes after which a caller may act on the write count as durable. The switch has no
 /// `default`, so an added enumerator fails to compile here until its row is decided.
 TEST(CASRefCheckpoint, OnlyPublishedAndIdenticalSkipAreRecorded)
 {
@@ -453,7 +453,7 @@ TEST(CASRefCheckpoint, OnlyPublishedAndIdenticalSkipAreRecorded)
             case CkptPublishOutcome::NotAdvanced:
                 break;
         }
-        EXPECT_EQ(ckptContributionRecorded(outcome), expected);
+        EXPECT_EQ(ckptPublicationDurable(outcome), expected);
     }
 }
 
@@ -1035,7 +1035,7 @@ TEST(CASRefCheckpoint, OnlyCreationCreatesAnAbsentCkpt)
         EXPECT_EQ(publishCkptSnapshot(op, layout, life, RefTxnId{2, 3}), CkptPublishOutcome::IdenticalSkip);
         EXPECT_EQ(backend->writeCount(key), writes);
     }
-    EXPECT_FALSE(ckptContributionRecorded(CkptPublishOutcome::NotAdvanced));
+    EXPECT_FALSE(ckptPublicationDurable(CkptPublishOutcome::NotAdvanced));
 }
 
 namespace

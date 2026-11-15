@@ -96,9 +96,7 @@ void checkRefCkptInvariants(const RefCkpt & ckpt, std::string_view what)
         }
         else if (ckpt.life_epoch && ckpt.committed_through->writer_epoch > *ckpt.life_epoch)
         {
-            /// With a known genesis epoch, an unsealed later epoch has no chain evidence. Leave the
-            /// unknown-genesis contribution representable: another checkpoint writer may still merge
-            /// the genesis fact before this partial contribution is encoded as durable authority.
+            /// With a known genesis epoch, an unsealed later epoch has no chain evidence.
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "CAS {}: committed_through after life_epoch requires last_epoch_seal", what);
         }

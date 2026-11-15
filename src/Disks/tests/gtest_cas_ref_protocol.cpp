@@ -4,6 +4,11 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCkptFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcKeyReader.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcReadAhead.h>
+#include <Common/CurrentMetrics.h>
+#include <Common/ProfileEvents.h>
+#include <Common/ThreadPool.h>
 #include "cas_test_helpers.h"
 
 #include <functional>
@@ -22,6 +27,19 @@ using DB::Cas::tests::tombstoneTxn;
 namespace DB::ErrorCodes
 {
 extern const int CORRUPTED_DATA;
+extern const int UNKNOWN_FORMAT_VERSION;
+}
+
+namespace CurrentMetrics
+{
+extern const Metric LocalThread;
+extern const Metric LocalThreadActive;
+extern const Metric LocalThreadScheduled;
+}
+
+namespace ProfileEvents
+{
+extern const Event CASGCReadAheadWasted;
 }
 
 namespace
@@ -292,6 +310,26 @@ TEST(CASRefChainWalk, FailedValidationWithAMovedBaseIsARestartNotCorruption)
     EXPECT_EQ(g.backend->getCount(g.ckptKey()), 0u);
 }
 
+/// Only `CORRUPTED_DATA` is judged against `_ckpt`; a record this build cannot read is no restart, even
+/// when the base moved under the walk.
+TEST(CASRefChainWalk, OtherFailureWithAMovedBasePropagatesUnchanged)
+{
+    ChainFixture f;
+    const CkptSample sample = f.putCkpt(generationThreeCkpt(1), 3);
+    f.putLog(birthAt({1, 1}));
+    f.putLog(ordinaryAt({1, 2}), 3);
+    ScopedReadCeiling c(2);
+
+    f.backend->resetCounts();
+    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { walk(f, originAt({1, 1}, sample)); });
+    EXPECT_EQ(f.backend->getCount(f.ckptKey()), 0u);
+
+    f.backend->watched_key = f.logKey({1, 2});
+    f.backend->after_read = [&] { f.replaceCkpt(generationThreeCkpt(1, RefTxnId{1, 1}), 3); };
+    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { walk(f, originAt({1, 1}, sample)); });
+    EXPECT_FALSE(f.backend->after_read) << "the base must have moved under the walk, or this proves nothing";
+}
+
 TEST(CASRefChainWalk, OldFrontierAboveTheEndIsCorruption)
 {
     ScopedReadCeiling c(3);
@@ -424,6 +462,53 @@ TEST(CASRefProtocol, BaseMovedWhileLoadingTheBaseIsARestart)
         expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
             [&] { recoverRefTableDetailedFromAuthority(*op, f.layout, f.catalogEntry(), sample); });
     }
+}
+
+/// A generation 3 chain has no frontier, so a read-ahead walk does not know where the chain ends. It
+/// hints only a few keys past the record it reads, in each epoch it crosses.
+TEST(CASRefProtocol, ReadOnlyRecoveryWithoutAFrontierHintsAFewKeysPastTheEnd)
+{
+    constexpr uint64_t kHintDepth = 4;
+    ScopedReadCeiling c(3);
+    ChainFixture f;
+    f.putLog(birthAt({1, 1}));
+    f.putLog(tombstoneTxn(kWalkNs.string(), {1, 2}, 2));
+    f.putLog(ordinaryAt({2, 1}, RefTxnId{1, 2}), 3);
+    f.putLog(ordinaryAt({2, 2}));
+    const CkptSample sample = f.putCkpt(generationThreeCkpt(1), 3);
+    f.backend->resetCounts();
+
+    ThreadPool pool{CurrentMetrics::LocalThread, CurrentMetrics::LocalThreadActive,
+                    CurrentMetrics::LocalThreadScheduled, /*max_threads*/ 4, /*max_free_threads*/ 4, /*queue_size*/ 0};
+    const uint64_t wasted_before = ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadWasted];
+    std::optional<RecoveredRefTable> recovered;
+    {
+        CasRequests requests = DB::Cas::tests::openRequestsForTest(f.backend);
+        CasOperation op = requests.admit();
+        GcReadAhead reads(op, requests, pool, 16);
+        ReadAheadKeyReader reader(reads);
+        ASSERT_EQ(reader.window(), 64u) << "the default GC window, or this measures the wrong shape";
+        recovered = recoverRefTableDetailedFromAuthority(op, f.layout, f.catalogEntry(), sample, &reader);
+    }
+    const uint64_t wasted = ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadWasted] - wasted_before;
+    ASSERT_TRUE(recovered.has_value());
+    EXPECT_EQ(recovered->next_key, (RefTxnId{2, 3}));
+
+    const auto absent_gets = [&](uint64_t epoch, uint64_t above)
+    {
+        uint64_t n = 0;
+        for (uint64_t s = above + 1; s <= above + 128; ++s)
+            n += f.backend->getCount(f.logKey({epoch, s}));
+        return n;
+    };
+    const uint64_t past_tombstone = absent_gets(1, 2);
+    const uint64_t past_end = absent_gets(2, 2);
+    RecordProperty("absent_gets_past_tombstone", std::to_string(past_tombstone));
+    RecordProperty("absent_gets_past_end", std::to_string(past_end));
+    RecordProperty("read_ahead_wasted", std::to_string(wasted));
+    EXPECT_LE(past_tombstone, kHintDepth) << "absent GETs past the tombstone " << past_tombstone;
+    EXPECT_LE(past_end, 1 + kHintDepth) << "absent GETs past the end " << past_end;
+    EXPECT_LE(wasted, 2 * kHintDepth) << "CASGCReadAheadWasted " << wasted;
 }
 
 namespace

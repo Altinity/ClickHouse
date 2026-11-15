@@ -322,7 +322,7 @@ TEST(CASRecoveryGrounding, RecoveryIsEquivalentUnderFullEmptyPartialAndReordered
             .committed = committedOf(recovered.state),
             .greatest_applied = recovered.state.getGreatestApplied(),
             .open_transition = recovered.open_transition,
-            .next_id = recovered.state.nextTxnId(/*live_epoch=*/3),
+            .next_id = recovered.state.chainNextId(/*life_epoch=*/1),
             .log_gets = log_gets,
             .snapshot_gets = snapshot_gets,
             .list_calls = backend->list_calls});

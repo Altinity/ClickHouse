@@ -1796,8 +1796,8 @@ Gc::CheckpointWitnesses Gc::readCheckpointWitnesses(GcReadAhead & reads,
             out.undecodable.emplace(ns_str, ckpt_key + ": " + e.message());
             continue;
         }
-        /// A checkpoint without `checkpoint_snapshot_id` is silent rather than empty: the object exists
-        /// because some OTHER field (`life_epoch`, `last_epoch_seal`) was published into it first.
+        /// A checkpoint without `checkpoint_snapshot_id` is silent rather than empty: the namespace has
+        /// published no snapshot yet.
         if (ckpt.checkpoint_snapshot_id)
             out.witnesses.emplace(ns_str, *ckpt.checkpoint_snapshot_id);
         out.recovery_checkpoints.emplace(ns_str, CkptSample{std::move(ckpt), got->etag});
@@ -2599,13 +2599,25 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         return nearest;
     };
 
+    /// The label of a hold above the cursor. Never read back, so it saturates at the maximum sequence
+    /// rather than wrapping.
+    const auto label_after = [](const RefTxnId & cursor)
+    {
+        if (cursor.ref_sequence == std::numeric_limits<uint64_t>::max())
+            return cursor;
+        return RefTxnId{cursor.writer_epoch, cursor.ref_sequence + 1};
+    };
+
     /// Record the position an impossible shape was detected at, hold the namespace, and stop walking
     /// it. The reason is a BOUNDED enum because it is persisted in the seal: an operator reading a
-    /// held row learns what stopped the namespace and exactly where, without correlating logs.
-    const auto hold = [&](NamespaceIntake & s, const RefTxnId & at, HoldReason reason, const char * message)
+    /// held row learns what stopped the namespace and exactly where, without correlating logs. The hold
+    /// logs one line; `detail` is the cause the caller observed.
+    const auto hold = [&](NamespaceIntake & s, const RefTxnId & at, HoldReason reason, const char * message,
+                          std::string_view detail = {})
     {
         const String & ns_str = s.target->ns;
         const RootNamespace & ns = s.life.ns;
+        const String life_id = renderIncarnation(s.life.incarnation);
         report.recordAnomaly(ns, 0, ManifestId{ns, {}}, message);
         EventEmitter{*store}.emit([&](CasEvent & ev)
         {
@@ -2616,12 +2628,13 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
             ev.reason = message;
             ev.detail = {{"expected", renderRefTxnId(at)},
                          {"resolved_through",
-                          s.resolved_through == RefTxnId{} ? "none" : renderRefTxnId(s.resolved_through)}};
+                          s.resolved_through == RefTxnId{} ? "none" : renderRefTxnId(s.resolved_through)},
+                         {"life", life_id}};
         });
         LOG_ERROR(logger,
-            "CAS GC ref intake: namespace {} HELD at {} -- {}. The cursor stays at {} and this "
+            "CAS GC ref intake: namespace {} (life {}) HELD at {} -- {}{}{}. The cursor stays at {} and this "
             "namespace folds nothing further this round.",
-            ns_str, renderRefTxnId(at), message,
+            ns_str, life_id, renderRefTxnId(at), message, detail.empty() ? "" : ": ", detail,
             s.resolved_through == RefTxnId{} ? "none" : renderRefTxnId(s.resolved_through));
         s.fired = RefHold{.reason = reason, .offending_position = at,
                           .retry_count = 0, .next_retry_round = 0};   /// retry fields filled in at the seal below
@@ -2766,18 +2779,21 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         /// `suppress_destructive`.
         if (!s.grounding)
         {
-            LOG_WARNING(logger,
-                "CAS GC ref intake: namespace {} has no usable checkpoint -- {}. This namespace "
-                "folds nothing and reclaims nothing until that object is repaired; every other "
-                "namespace folds normally.",
-                ns_str, checkpoint_failure);
             if (s.cursor != RefTxnId{})
-                hold(s, RefTxnId{s.cursor.writer_epoch, s.cursor.ref_sequence + 1}, HoldReason::CheckpointUndecodable,
+                hold(s, label_after(s.cursor), HoldReason::CheckpointUndecodable,
                      "ref intake: the namespace's `_ckpt` is unavailable or invalid -- its durable "
-                     "checkpoint authority cannot be read, so nothing above the cursor is accountable");
+                     "checkpoint authority cannot be read, so nothing above the cursor is accountable",
+                     checkpoint_failure);
             else
+            {
+                LOG_WARNING(logger,
+                    "CAS GC ref intake: namespace {} has no usable checkpoint -- {}. This namespace "
+                    "folds nothing and reclaims nothing until that object is repaired; every other "
+                    "namespace folds normally.",
+                    ns_str, checkpoint_failure);
                 report.recordAnomaly(ns, 0, ManifestId{ns, {}},
                     "ref intake: the catalog life has no usable `_ckpt` (no authoritative walk position)");
+            }
             s.unproven_reason = FoldResult::FrontierUnproven::CheckpointUnusable;
             continue;
         }
@@ -2831,10 +2847,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
                 s.frontier_proven = true;
                 return;
             case RefCursorResumeKind::Hold:
-                LOG_WARNING(logger, "CAS GC ref intake: namespace {} cannot resume after {}: {}",
-                            s.target->ns, renderRefTxnId(s.cursor), resume.detail);
-                hold(s, RefTxnId{s.cursor.writer_epoch, s.cursor.ref_sequence + 1}, HoldReason::UnconsumedSealCrossing,
-                     "ref intake: the successor of the sealed cursor cannot be proved from the chain");
+                hold(s, label_after(s.cursor), HoldReason::UnconsumedSealCrossing,
+                     "ref intake: the successor of the sealed cursor cannot be proved from the chain", resume.detail);
                 return;
         }
     };
@@ -2939,8 +2953,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
             }
             if (invalid_reason)
             {
-                LOG_WARNING(logger, "CAS GC ref intake: log {} invalid: {}", expected_key, invalid_detail);
-                hold(s, log_id, HoldReason::BodyUndecodable, invalid_reason);
+                hold(s, log_id, HoldReason::BodyUndecodable, invalid_reason,
+                     fmt::format("log {}: {}", expected_key, invalid_detail));
                 break;
             }
 

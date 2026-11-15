@@ -46,12 +46,11 @@ enum class FsckClass : uint8_t
                    /// the stored bytes — cataloged so the read-only audit enumerates every finding in one
                    /// pass; deletion-deriving consumers (`fold`, `zeroInDegree`, `previewDeletes`) still
                    /// fail closed on the same mismatch. ERROR
-    /// The two verdicts of the arithmetic ref-stream walk (spec §7). They are about a NAMESPACE, not an
-    /// object; the row's `key` identifies the exact log where the walk stopped or the checkpoint-named
-    /// snapshot base whose required triple could not be validated.
-    ChainBroken,   /// the exact checkpoint authority is durably inconsistent: its required snapshot-base
-                   /// triple is corrupt, or a ref-log id is absent below its confirmed frontier. Ids are
-                   /// dense `1..T` within `(namespace, epoch)` (INV-1), so neither is a stream end. ERROR
+    /// The two verdicts of the ref-stream walk. They are about a NAMESPACE, not an object; the row's `key`
+    /// identifies the exact log where the walk stopped or the checkpoint-named snapshot base whose
+    /// required triple could not be validated.
+    ChainBroken,   /// the chain ends below a listed log, or its snapshot base, a record or a link on it is
+                   /// corrupt while `_ckpt` is unchanged. ERROR
     Unchecked,     /// the walk could not prove this namespace's stream EITHER WAY (an unprovable epoch
                    /// crossing, an undecodable body, or unstable authority/transport). Not a finding and
                    /// not a clean bill of health: the honest third answer, reported so nobody reads a

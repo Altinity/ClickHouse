@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Tags: no-fasttest
-# ^ cas is an object-storage metadata type; keep it off the minimal fasttest image.
+# Tags: no-fasttest, no-random-settings, no-random-merge-tree-settings
+# ^ cas is an object-storage metadata type; keep it off the minimal fasttest image. Randomized settings could
+#   move the requests out of the measured query.
 
 # An ordinary ref-log append is one create of `_log/{epoch,seq}`: no `_ckpt` write, no read of `_ckpt` or of a
-# log. Per query: `_ckpt` writes, `_ckpt` and log reads, and whether every log create was paired with exactly
-# one catalog `GET`. The first insert creates the namespace and is not measured.
+# log. Per query: `_ckpt` writes, `_ckpt` and log reads, root `PUT`s and other `GET`s. A query whose requests
+# were not counted prints zero root `PUT`s and fails the reference.
+# The first insert creates the namespace and is not measured.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -32,7 +34,8 @@ do
     ${CLICKHOUSE_CLIENT} -q "
         SELECT ProfileEvents['CASRootOverwrite'] + ProfileEvents['CASRootCompareSwapConflict'],
                ProfileEvents['CASRootGet'],
-               ProfileEvents['CASRootPut'] = ProfileEvents['CASOtherGet']
+               ProfileEvents['CASRootPut'],
+               ProfileEvents['CASOtherGet']
         FROM system.query_log
         WHERE current_database = currentDatabase() AND query_id = '$q' AND type = 'QueryFinish'"
 done

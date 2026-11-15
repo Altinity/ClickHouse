@@ -131,12 +131,26 @@ bool ckptTokenMoved(CasOperation & op, const Layout & layout, const NamespaceLif
     return !current || !(current->etag == token);
 }
 
+bool failureJudgedAgainstCkpt(int error_code)
+{
+    return error_code == ErrorCodes::CORRUPTED_DATA;
+}
+
+bool restartsOnMovedBase(int error_code, CasOperation & op, const Layout & layout, const NamespaceLifeId & life,
+                         const Etag & token)
+{
+    return failureJudgedAgainstCkpt(error_code) && ckptTokenMoved(op, layout, life, token);
+}
+
 RefTxnId RefTableState::chainNextId(uint64_t life_epoch) const
 {
     if (greatest_applied == RefTxnId{})
         return RefTxnId{life_epoch, 1};
     if (open_transition)
         return RefTxnId{open_transition->next_epoch, 1};
+    if (greatest_applied.ref_sequence == std::numeric_limits<uint64_t>::max())
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref chain: log id {}-{} has no representable successor",
+            greatest_applied.writer_epoch, greatest_applied.ref_sequence);
     return RefTxnId{greatest_applied.writer_epoch, greatest_applied.ref_sequence + 1};
 }
 
@@ -616,13 +630,6 @@ void RefTableState::applyTxnInPlace(const RefLogTxn & txn)
 #endif
 }
 
-RefTxnId nextRefTxnId(RefTxnId greatest_applied, uint64_t live_epoch)
-{
-    return greatest_applied.writer_epoch == live_epoch
-        ? RefTxnId{live_epoch, greatest_applied.ref_sequence + 1}
-        : RefTxnId{live_epoch, 1};
-}
-
 void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn)
 {
     /// The one public apply entry point, ALWAYS the strong exception guarantee: validate and apply the
@@ -886,6 +893,13 @@ RefCleanupPlan planRefCleanup(const RefTableListing & listing, const RefTxnId & 
     return plan;
 }
 
+namespace
+{
+/// Read-ahead depth of a walk with no frontier: it overlaps a short tail, and bounds the keys past the end
+/// fetched for nothing in each epoch the walk ends or leaves.
+constexpr uint64_t kHintDepthWithoutFrontier = 4;
+}
+
 RefChainWalk walkRefChain(CasOperation & op, const Layout & layout, const NamespaceLifeId & life,
                           const RefChainOrigin & origin, const RefChainVisitor & visit, KeyReader * reader)
 {
@@ -904,7 +918,7 @@ RefChainWalk walkRefChain(CasOperation & op, const Layout & layout, const Namesp
                                       RefTxnId{hinted_from->writer_epoch, std::numeric_limits<uint64_t>::max()});
         hinted_from.reset();
     };
-    SCOPE_EXIT({ discard_hints(); });
+    SCOPE_EXIT_MEMORY_SAFE({ discard_hints(); });
 
     const auto base_moved = [&] { return ckptTokenMoved(op, layout, life, *origin.ckpt_token); };
     /// A failure of the chain itself is corruption only if `_ckpt` did not move: a moved base means
@@ -929,12 +943,13 @@ RefChainWalk walkRefChain(CasOperation & op, const Layout & layout, const Namesp
 
     while (true)
     {
-        /// Read ahead within the epoch. Under an old frontier only up to it: the logs there are known to
-        /// exist, and a hint past the end of the chain is a wasted request.
+        /// Read ahead within the epoch. Under an old frontier up to it: the logs there are known to exist.
+        /// Without one the end is unknown, so only a few keys ahead: a hint past the end is a wasted GET.
         const RefTxnId epoch_end{id.writer_epoch, std::numeric_limits<uint64_t>::max()};
         std::optional<RefTxnId> hint_limit;
         if (!origin.old_frontier)
-            hint_limit = epoch_end;
+            hint_limit = id.ref_sequence > epoch_end.ref_sequence - kHintDepthWithoutFrontier
+                ? epoch_end : RefTxnId{id.writer_epoch, id.ref_sequence + kHintDepthWithoutFrontier};
         else if (id < *origin.old_frontier)
             hint_limit = std::min(*origin.old_frontier, epoch_end);
         if (reader && reader->window() > 0 && hint_limit && id.ref_sequence < std::numeric_limits<uint64_t>::max())
@@ -968,9 +983,9 @@ RefChainWalk walkRefChain(CasOperation & op, const Layout & layout, const Namesp
             next = refChainSuccessor(txn);
             transition = refEpochTransitionOf(txn);
         }
-        catch (const Exception &)
+        catch (const Exception & e)
         {
-            if (origin.ckpt_token && base_moved())
+            if (origin.ckpt_token && restartsOnMovedBase(e.code(), op, layout, life, *origin.ckpt_token))
             {
                 walk.end = RefChainEnd::BaseMoved;
                 return walk;
@@ -1210,14 +1225,14 @@ std::optional<RecoveredRefTable> recoverRefTableDetailedFromAuthority(
         }
         catch (const Exception & e)
         {
-            if (e.code() == ErrorCodes::CORRUPTED_DATA && ckptTokenMoved(op, layout, life, ckpt->etag))
+            if (restartsOnMovedBase(e.code(), op, layout, life, ckpt->etag))
                 return std::nullopt;
             throw;
         }
     }
 
     RefReplayBuilder builder(std::move(base_snapshot), base_snapshot_bytes);
-    bool replay_corrupted = false;
+    bool replay_failed = false;
     const RefChainVisitor apply = [&](RefLogTxn && txn, uint64_t stored_bytes)
     {
         const int64_t footprint = static_cast<int64_t>(decodedRefLogTxnFootprint(txn));
@@ -1227,9 +1242,9 @@ std::optional<RecoveredRefTable> recoverRefTableDetailedFromAuthority(
         {
             builder.applyOne(std::move(txn), stored_bytes);
         }
-        catch (const Exception & e)
+        catch (const Exception &)
         {
-            replay_corrupted = e.code() == ErrorCodes::CORRUPTED_DATA;
+            replay_failed = true;
             throw;
         }
         return true;
@@ -1245,9 +1260,9 @@ std::optional<RecoveredRefTable> recoverRefTableDetailedFromAuthority(
             .confirm_base_after_end = true,
             .old_frontier = grounding.committed_through}, apply, reader);
     }
-    catch (const Exception &)
+    catch (const Exception & e)
     {
-        if (replay_corrupted && ckptTokenMoved(op, layout, life, ckpt->etag))
+        if (replay_failed && restartsOnMovedBase(e.code(), op, layout, life, ckpt->etag))
             return std::nullopt;
         throw;
     }

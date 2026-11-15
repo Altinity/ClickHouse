@@ -9,6 +9,7 @@
 #include <base/scope_guard.h>
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <random>
 #include <vector>
@@ -659,7 +660,7 @@ TEST(CASRefStateMachine, WholeTxnAtomicityLastOpFailureLeavesStateUntouched)
 /// ===================================================================================
 
 /// A table's durable ids are DENSE within `(namespace, epoch)`: the only admissible id is the one
-/// `nextRefTxnId` derives from `greatest_applied`, which is also the only id the writer ever mints.
+/// `nextRefSlot` derives from the applied state, which is also the only id the writer ever mints.
 /// Equal, lower, and skipped ids are all corruption -- the last of those is what makes "I can see ids
 /// 1..T" mean "nothing is missing", the property the whole invariant exists to provide.
 TEST(CASRefStateMachine, ContiguousTxnIdsRejectEqualLowerAndSkipped)
@@ -1686,4 +1687,14 @@ TEST(CASRefStateMachine, RecordAtANewEpochWithoutATombstoneIsRefused)
 
     const RefTableState empty;
     EXPECT_EQ(empty.chainNextId(7), (RefTxnId{7, 1}));
+}
+
+TEST(CASRefStateMachine, NoChainSuccessorPastTheMaximumSequence)
+{
+    ScopedReadCeiling c(3);
+    constexpr RefTxnId last{1, std::numeric_limits<uint64_t>::max()};
+    const RefTableState state = stateFromSnapshot(DB::Cas::tests::minimalLiveSnapshot(kNs, last));
+    ASSERT_EQ(state.getGreatestApplied(), last);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { static_cast<void>(state.chainNextId(1)); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { static_cast<void>(nextRefSlot(state, 1)); });
 }

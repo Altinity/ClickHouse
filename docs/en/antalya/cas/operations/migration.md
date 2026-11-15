@@ -188,10 +188,25 @@ that runs an older build, upgrade all of them, then start them.
 
 | Step | What happens |
 |---|---|
-| Floor raise | The first writable mount logs a WARNING: `min_reader_generation raised 1 -> 3; readers below generation 3 can no longer mount this pool` (`2 -> 3` on a pool already at 2). A mount with `readonly` set never raises it |
+| Floor raise | The first writable mount logs a WARNING: `min_reader_generation raised 1 -> 3; readers below generation 3 can no longer mount this pool` (`2 -> 3` on a pool already at 2). `clickhouse-disks cas-drop-member` mounts the pool writable too and raises the floor the same way. A mount with `readonly` set never raises it |
 | Namespace stamp | The first write into a namespace replaces its `_ckpt` with the generation 3 body, once, before the namespace's first tombstone or append. A namespace nothing writes to stays unstamped. A namespace created by this build is stamped at creation |
 | First append of an epoch | One extra `PUT`: the tombstone that links the previous epoch's chain to this one |
 | Steady state | A positive append costs 2 requests instead of 4, and a ref removal 1 instead of 3 |
+| Recovery of a quiet namespace | 6 requests after admission; 7 when the snapshot base carries a backlink to a predecessor's tombstone, which recovery reads too. After an unclean predecessor, recovery also writes one tombstone and, on a namespace not yet stamped, the `_ckpt` stamp before it |
+
+### Counters and tools after the upgrade {#upgrade-generation-3-observability}
+
+Dashboards and scripts that read these names need a look:
+
+| Name | Change |
+|---|---|
+| `CASRefCheckpointPublished` | Counts `_ckpt` writes by snapshot publication only. Earlier builds also counted the `_ckpt` writes of appends and of namespace creation |
+| `CASRefCheckpointIdenticalSkip` | Counts snapshot publications whose snapshot id was already in `_ckpt`. Its ratio to `CASRefCheckpointPublished` no longer describes appends |
+| `CASRefRecoveryEpochSealed` | Counts tombstones written by recovery, which happens only after an unclean predecessor. Earlier builds counted one seal per closed epoch, unwritten epochs included |
+| `CASRefCheckpointFrontierRefused` | Removed |
+| `CASRefCheckpointStamped` | New: `_ckpt` objects replaced by their generation 3 form, about once per namespace an older build created, when it is first written after the upgrade |
+| `CASRefAppendTombstoneWritten` | New: tombstones written by an append lane before the first record of its epoch |
+| `cas-inspect` output | A `_ckpt` body prints `committed_through` and `last_epoch_seal` under `old_format`; both are `null` for a generation 3 body. A ref log prints `next_epoch` |
 
 ### What an older build sees {#upgrade-generation-3-older-builds}
 
@@ -226,8 +241,10 @@ passes while the elapsed time plus the renewal window stays under `cas_mount_lea
 
 Both rows use the defaults: 120 s lease, 2 s safety margin, 10 s renewal period, 5 s attempt timeout.
 
-If the elapsed time is longer, the mount logs a WARNING (`the mount claim consumed the lease TTL (120000 ms) before the
-write fence could be armed; re-writing the lease first`), writes the lease once more and goes on. If that
+If the elapsed time is longer, the mount logs a WARNING that gives the time since the claim and the part of it spent
+in the floor raise (`the open took ... ms since the mount claim, ... ms of it in the reader-floor raise, which left too
+little of the lease TTL (120000 ms) to arm the write fence; re-writing the lease first`), writes the lease once more
+and goes on. If that
 write fails, for example because the slot was taken in the meantime, the open fails closed and the next attempt
 follows the ordinary [mount claim rules](/antalya/cas/architecture/mounts-and-leases#claim-outcomes). The raise is
 already durable by then, so the next attempt has no raise to do.
@@ -256,7 +273,8 @@ SYSTEM CAS DROP POOL MEMBER 'server_root_id' FROM DISK 'disk_name' [ON CLUSTER c
 Both `server_root_id` and `disk_name` are required string literals. The offline CLI twin,
 `clickhouse-disks cas-drop-member <server_root_id>`, does the same work against a disk opened
 read-only — the pool-admin claim happens internally, so the disk it runs against must not be the
-live server's own mount:
+live server's own mount. The claim mounts the pool writable, so on a pool below reader generation 3 it
+raises the floor, as a server does (see [Upgrading a pool to reader generation 3](#upgrade-generation-3)):
 
 ```bash
 clickhouse-disks -C config.xml --disk cas cas-drop-member 'replica-2'

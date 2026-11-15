@@ -284,21 +284,22 @@ TEST(CASRefContiguousAlloc, NonSuccessorIdIsRejectedOnApply)
         applyRefLogTxn(state, RefLogTxn{ns, RefTxnId{kEpoch + 1, 2}, publishCommittedOps("r", ManifestRef{1, 1, 1}), std::nullopt});
     });
 
-    /// The two shapes the allocator can produce are the two the checker admits -- and `nextRefTxnId` is
-    /// the single rule both sides use, so they cannot drift apart.
-    EXPECT_EQ(nextRefTxnId(state.getGreatestApplied(), kEpoch), (RefTxnId{kEpoch, 2}));
-    EXPECT_NO_THROW(applyRefLogTxn(state, RefLogTxn{ns, nextRefTxnId(state.getGreatestApplied(), kEpoch),
-        publishCommittedOps("r", ManifestRef{1, 1, 1}), std::nullopt}));
+    /// The slots the writer mints are the ones the checker admits: both sides use the chain rule.
+    const RefNextSlot second = nextRefSlot(state, kEpoch);
+    EXPECT_EQ(second, (RefNextSlot{RefTxnId{kEpoch, 2}, std::nullopt}));
+    EXPECT_NO_THROW(applyRefLogTxn(state, RefLogTxn{ns, second.id, publishCommittedOps("r", ManifestRef{1, 1, 1}),
+        second.backlink}));
     ASSERT_EQ(state.getGreatestApplied(), (RefTxnId{kEpoch, 2}));
 
-    EXPECT_EQ(nextRefTxnId(state.getGreatestApplied(), kEpoch + 1), (RefTxnId{kEpoch + 1, 1}));
     /// A table crosses into a new epoch only over the seal that closed the epoch below, at the slot one
     /// past its last durable id, and the next head names that seal.
     RefOp seal;
     seal.kind = RefOpKind::EpochSeal;
     EXPECT_NO_THROW(applyRefLogTxn(state, RefLogTxn{ns, RefTxnId{kEpoch, 3}, {seal}, std::nullopt}));
-    EXPECT_NO_THROW(applyRefLogTxn(state, RefLogTxn{ns, nextRefTxnId(state.getGreatestApplied(), kEpoch + 1),
-        publishCommittedOps("r2", ManifestRef{1, 2, 1}), RefTxnId{kEpoch, 3}}));
+    const RefNextSlot head = nextRefSlot(state, kEpoch);
+    EXPECT_EQ(head, (RefNextSlot{RefTxnId{kEpoch + 1, 1}, RefTxnId{kEpoch, 3}}));
+    EXPECT_NO_THROW(applyRefLogTxn(state, RefLogTxn{ns, head.id, publishCommittedOps("r2", ManifestRef{1, 2, 1}),
+        head.backlink}));
     EXPECT_EQ(state.getGreatestApplied(), (RefTxnId{kEpoch + 1, 1}));
 }
 

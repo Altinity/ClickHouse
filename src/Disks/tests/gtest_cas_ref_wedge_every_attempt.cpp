@@ -1583,9 +1583,11 @@ TEST(CASRefWedgeEveryAttempt, ChainEpochBelowTheLiveEpochWritesTheLaneTombstoneB
 
     const uint64_t remounts_before = store->scheduleRemountCallCountForTest();
     const uint64_t writes_before = backend->writeTotal();
+    const uint64_t ckpt_gets_before = backend->getCount(layout.refCkptKey(life));
     store->dropRef(ns, "x");
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
     EXPECT_EQ(backend->writeTotal(), writes_before + 2) << "the tombstone and the record";
+    EXPECT_EQ(backend->getCount(layout.refCkptKey(life)), ckpt_gets_before) << "the lane tombstone reads no `_ckpt`";
     const auto tombstone = readObj(*backend, layout.refLogKey(life, RefTxnId{epoch, 3}));
     ASSERT_TRUE(tombstone.has_value());
     const RefLogTxn closing = decodeRefLogTxn(openObject(FormatId::RefLog, tombstone->bytes), ns.string(), RefTxnId{epoch, 3});

@@ -19,7 +19,7 @@ trailer, followed by a banner-framed raw payload zone for inline file bytes.
 | Key (under the pool prefix) | Object | Codec | Writer |
 |---|---|---|---|
 | `_pool_meta` | pool identity + floors (`pool_id`, `blob_header_len`, `gc_shards`, `min_reader_generation`, `algos_used` array) | `CasPoolMetaFormat` | pool create/admit |
-| `cas/ns/stream/<life_id>/_log/…​.zst` | ref transaction log (`namespace`, `txn_epoch`/`txn_seq`, optional critical `!prev_epoch`/`!prev_seq`; `set_published_at` uses `ref`/`published_ms`) | `CasRefLogFormat` (`.zst`) | writer commit path |
+| `cas/ns/stream/<life_id>/_log/…​.zst` | ref transaction log (`namespace`, `txn_epoch`/`txn_seq`, optional critical `!prev_epoch`/`!prev_seq`, and `!next_epoch` on a tombstone; `set_published_at` uses `ref`/`published_ms`) | `CasRefLogFormat` (`.zst`) | writer commit path |
 | `cas/ns/stream/<life_id>/_snap/…​.zst` | complete live ref table (`namespace`, `snapshot_epoch`/`snapshot_seq`, `lifecycle:"live"`; `kind` is `committed`/`precommit`, with `ref` and committed-only `published_ms`) | `CasRefSnapshotFormat` (`.zst`) | writer/GC fold |
 | `cas/ns/state/<life_id>/_ckpt` | mutable life checkpoint: generation 3 holds `life_epoch` and `snapshot_epoch`/`snapshot_seq`; generations 1 and 2 also `committed_epoch`/`committed_seq`, `seal_epoch`/`seal_seq` (read only) | `CasRefCkptFormat` | namespace creation, snapshot publication, the generation 3 stamp |
 | `cas/ns/state/<life_id>/_files/…​` | namespace-owned raw files | — | upper layers |

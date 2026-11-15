@@ -16,6 +16,7 @@
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
 #include <Common/setThreadName.h>
+#include <Common/Stopwatch.h>
 #include <Common/thread_local_rng.h>
 #include <base/scope_guard.h>
 #include <fmt/format.h>
@@ -78,6 +79,19 @@ namespace
 {
 
 std::atomic<uint64_t> remount_attempt_sequence{0};
+
+/// `claimMount` builds every `Claimed` body with the marker; a body without it fails the mount as an
+/// ordinary refusal instead of escaping as `std::bad_optional_access`.
+uint64_t claimedLastUncleanEpoch(const MountClaimResult & claim, const String & srid)
+{
+    if (!claim.body)
+        throw Exception(ErrorCodes::ABORTED,
+            "CAS mount '{}': the mount claim succeeded but returned no lease body", srid);
+    if (!claim.body->last_unclean_epoch)
+        throw Exception(ErrorCodes::ABORTED,
+            "CAS mount '{}': the claimed mount lease carries no `last_unclean_epoch`", srid);
+    return *claim.body->last_unclean_epoch;
+}
 
 /// What a mount that skipped the capability battery did not prove about its store. Said once per open at
 /// the default level, because nothing else tells an operator the checks did not run.
@@ -847,7 +861,7 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
             throw Exception(ErrorCodes::ABORTED, "{}", mountDoubleStartMessage(srid, claim.body));
         }
         claimed_prior = claim.prior;
-        claimed_last_unclean_epoch = claim.body.value().last_unclean_epoch.value();
+        claimed_last_unclean_epoch = claimedLastUncleanEpoch(claim, srid);
 
         /// The owner may have moved since the claim began: a tombstone, a rollback or a rejoin. Nothing
         /// below runs under an owner this process did not start under.
@@ -883,8 +897,12 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
 
     /// One-way, and only after the claim: a node that holds identity and lease can write generation 3 objects.
     /// The renewal-window check below counts the time the raise takes. If the claim and the raise outrun
-    /// that window the open fails with the raise already durable, so the next open has no raise to do.
+    /// that window, the open logs a warning, re-writes the lease once and continues; it fails only if that
+    /// write fails, and then the raise is already durable, so the next open has no raise to do.
+    /// Timed apart from the boot clock, which the renewal-window check below reads at fixed points.
+    Stopwatch floor_raise_watch;
     raiseReaderFloor(store, mount_reader_floor);
+    const uint64_t floor_raise_ms = floor_raise_watch.elapsedMilliseconds();
 
     /// A reclaim over a predecessor whose death was NOT proven clean may still have a conditional PUT
     /// from that predecessor in flight -- `Fenced`, `UncleanObserved`, and `UncleanUnsafe` are exactly
@@ -899,9 +917,11 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     /// There is no wait here. Recovery does not trust listings: it walks each ref stream from `_ckpt` and
     /// closes a chain that ends in an epoch that may have ended uncleanly (`last_unclean_epoch`) with a
     /// tombstone in the slot after its last record, written as a conditional create. A straggler's own
-    /// conditional create then loses to the occupied slot whenever it arrives, and after a clean end
-    /// nothing is in flight. What this classification keeps is an operator-visible line for an unclean
-    /// predecessor, and the exhaustive switch as the build-time guard.
+    /// conditional create then loses to the occupied slot whenever it arrives. After a clean end the lanes
+    /// were drained before the farewell; a recovery tombstone may still be in flight, but only into a chain
+    /// at or below `last_unclean_epoch`, which this claim inherits and never lowers, so recovery seals that
+    /// chain too. What this classification keeps is an operator-visible line for an unclean predecessor,
+    /// and the exhaustive switch as the build-time guard.
     bool unclean_reclaim = false;
     switch (claimed_prior)
     {
@@ -963,9 +983,11 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
         /// socket can still outlive a budget, and its recovery is one conditional write that fails closed;
         /// it is LOUD rather than fatal because a slow open under a healthy protocol is not a reason to
         /// refuse to start.
+        const uint64_t since_claim_ms = now_boot_ms > claim_anchor_boot_ms ? now_boot_ms - claim_anchor_boot_ms : 0;
         LOG_WARNING(getLogger("CasPool"),
-            "Content-addressed mount {}: the mount claim consumed the lease TTL ({} ms) before the write "
-            "fence could be armed; re-writing the lease first", srid, ttl_ms_u);
+            "Content-addressed mount {}: the open took {} ms since the mount claim, {} ms of it in the reader-floor "
+            "raise, which left too little of the lease TTL ({} ms) to arm the write fence; re-writing the lease first",
+            srid, since_claim_ms, floor_raise_ms, ttl_ms_u);
         claim_anchor_boot_ms = store->mount_runtime.renewRenewerForStartupOnce();
     }
     store->mount_runtime.setLiveWriterEpoch(writer_epoch, claimed_last_unclean_epoch);
@@ -1114,8 +1136,10 @@ Pool::~Pool()
         mount_runtime.stopBackgroundWorkers();
     }, "CAS pool teardown: stopping background workers");
 
-    /// 2. The farewell marker the renewer's `release` writes is a certificate that no in-flight ref-log
-    /// conditional PUT from this incarnation can land after it. A successor treats it as proof of a
+    /// 2. The farewell marker the renewer's `release` writes is a certificate that no append or lane
+    /// tombstone of this incarnation can land after it. A recovery tombstone with an unknown outcome is not
+    /// drained; it targets a chain at or below `last_unclean_epoch`, which the successor inherits and seals
+    /// too. A successor treats the marker as proof of a
     /// clean death (`MountPriorState::Clean`, no observation wait needed). Writing it without an actual
     /// drain would be a protocol-safety bug: an uncertain PUT this incarnation is still resolving could
     /// land after the successor already reclaimed and started mutating. `drainRefLanesForShutdown` is
@@ -1618,7 +1642,7 @@ bool Pool::tryRemountOnce()
         /// The persistent renewal worker is parked before this callback is entered, so renewer
         /// replacement cannot race any synchronous lease operation.
         step = "renewer_install";
-        const uint64_t last_unclean_epoch = claim.body.value().last_unclean_epoch.value();
+        const uint64_t last_unclean_epoch = claimedLastUncleanEpoch(claim, srid);
         mount_runtime.installRenewer(our_uuid, writer_epoch, last_unclean_epoch, now_ms);
         step = "renewer_start";
         uint64_t remount_anchor_boot_ms = mount_runtime.startRenewer();

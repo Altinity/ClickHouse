@@ -277,13 +277,13 @@ catalog `GET` depends on its kind: a positive append (a new binding, `Move`, `Se
 terminal `RemoveNamespace` append read the catalog row first, and a plain ref removal does not. The
 acknowledgement is fenced by the mount lease, checked after the response and again inside the install hold.
 
-| Operation | Requests | Source |
-|---|---|---|
-| Positive append | 2: catalog `GET`, log `PUT` | asserted by a unit test |
-| Ref removal | 1: log `PUT` | asserted by a unit test |
-| Terminal `RemoveNamespace` append | 2: catalog `GET`, log `PUT` | counted from the code |
-| First append of an epoch in a namespace | one more: the tombstone `PUT` | counted from the code |
-| New part without blobs | 8: manifest `PUT` 1, precommit 2, manifest `GET` 1, promote 2, `Move` 2 | counted from the code |
+| Operation | Requests |
+|---|---|
+| Positive append | 2: catalog `GET`, log `PUT` |
+| Ref removal | 1: log `PUT` |
+| Terminal `RemoveNamespace` append | 2: catalog `GET`, log `PUT` |
+| First append of an epoch in a namespace | one more: the tombstone `PUT` |
+| New part without blobs | 8: manifest `PUT` 1, precommit 2, manifest `GET` 1, promote 2, `Move` 2 |
 
 Warm namespace, one writer. Each ref-log mutation that reads the catalog row costs that `GET` plus its log `PUT`.
 
@@ -309,8 +309,7 @@ first slot of epoch `W`. Epochs between `X` and `W` get no object.
   occupies the slot a straggler `PUT` of the dead epoch would need, so that request loses its create
   and is never acknowledged.
 - **Deposed writers.** A writer that meets a later epoch's tombstone in its next slot gets a conflict,
-  closes its lane and rejects the write with `INVALID_STATE`; the message reads `CLOSED by a successor's tombstone` or, where the
-  writer met the tombstone as the occupant of its append, `CLOSED by a successor's epoch seal`.
+  closes its lane and rejects the write with `INVALID_STATE`; the message reads `CLOSED by a successor's tombstone`.
   Cleanup deletes a tombstone like any other covered log.
 
 ### Where history ends {#history-end}
@@ -368,8 +367,7 @@ authoritative objects — there is no `LIST` anywhere in this path:
 A quiet namespace costs 6 reads after admission, and 1 more request, the tombstone `PUT`, after an
 unclean predecessor. The reads are the `_ckpt` twice, the base's log, the snapshot, the absent successor key
 and the catalog confirmation. A snapshot that is the first record of its epoch adds one read: the tombstone
-its backlink names. Asserted by unit tests for a snapshot that is not the first record of its epoch; cold
-admission adds 2 catalog reads that the 6 does not include.
+its backlink names. Cold admission adds 2 catalog reads that the 6 does not include.
 
 For a mounted writer the recovered in-memory table is authoritative for reads of its own
 namespaces — there is no other writer of that namespace. S3 is authoritative for durability:

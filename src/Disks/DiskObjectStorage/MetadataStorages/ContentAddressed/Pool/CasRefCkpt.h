@@ -33,24 +33,23 @@ RecoveryGrounding chooseRecoveryGrounding(const std::optional<CatalogEntry> & ca
 /// What one `_ckpt` publication did: `createCkptAtCreation` or `publishCkptSnapshot`.
 enum class CkptPublishOutcome : uint8_t
 {
-    Published,      /// the contribution is durable, and this call sent at least one write before it
-                    /// was; which write made it durable -- this one or a competitor's -- is not claimed
-    IdenticalSkip,  /// the contribution added nothing to what was already there; NO write was issued
+    Published,      /// what this call writes is durable, and it sent at least one write before it was;
+                    /// which write made it durable -- this one or a competitor's -- is not claimed
+    IdenticalSkip,  /// `_ckpt` already held what this call writes; NO write was issued
     FencedOut,      /// this actor's admission is gone. Whether its last attempt landed is UNRESOLVED:
                     /// admission can be lost before the write is sent, and equally after the write is
                     /// proven durable. Re-read before assuming either way
     NotAdvanced,    /// nothing was written and the caller's fact is not in `_ckpt`
 };
 
-/// True when the contribution is durable in `_ckpt`: the only outcomes after which a caller may act on it.
-inline bool ckptContributionRecorded(CkptPublishOutcome outcome)
+/// True when what the call writes is durable in `_ckpt`: the only outcomes after which a caller may act on it.
+inline bool ckptPublicationDurable(CkptPublishOutcome outcome)
 {
     return outcome == CkptPublishOutcome::Published || outcome == CkptPublishOutcome::IdenticalSkip;
 }
 
-/// One observation of a namespace's `_ckpt`: the decoded body and the incarnation it was read at. The
-/// incarnation is what the missing-base revalidation adjudicates against, so a reader that keeps only
-/// the body cannot apply the rule.
+/// One observation of a namespace's `_ckpt`: the decoded body and the incarnation it was read at. A later
+/// read is compared with the incarnation to tell whether `_ckpt` moved, which the body alone cannot tell.
 struct CkptSample
 {
     RefCkpt ckpt;

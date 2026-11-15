@@ -817,14 +817,15 @@ private:
         const Layout & layout,
         CasOperation & op);
 
-    /// The round's `_ckpt.checkpoint` witness per namespace — the SECOND, hint-independent witness the
-    /// walk decides its absents against. ONE call site, in the fold, right where the hint is grouped.
+    /// The round's `_ckpt.checkpoint_snapshot_id` witness per namespace — the SECOND, hint-independent
+    /// witness the walk decides its absents against. ONE call site, in the fold, right where the hint is
+    /// grouped.
     ///
     /// The listing cannot be the sole witness source: it is a snapshot, so a record that became durable
     /// after the enumeration is invisible to that round's probes, and an absent expected-next then reads
-    /// as a frontier when it is really a gap. `_ckpt.checkpoint` is the namespace's own durable tail,
-    /// read by the fold anyway for cleanup ranges, and it decides the same question without asking the
-    /// listing anything — so it is read by EXACT KEY, never gated on `RefTableListing::has_ckpt`.
+    /// as a frontier when it is really a gap. The snapshot id is a lower bound on the chain's end, not its
+    /// tail: an absent key below it is a gap. It is read by the fold anyway for cleanup ranges, and by
+    /// EXACT KEY, never gated on `RefTableListing::has_ckpt`.
     ///
     /// It takes BOTH of the round's namespace sources because it owes a witness to both: `ref_tables`
     /// is the hint, and `parent_cursors` is where a carried hold names a namespace the hint may have
