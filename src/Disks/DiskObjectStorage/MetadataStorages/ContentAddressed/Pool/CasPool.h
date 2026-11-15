@@ -1317,7 +1317,7 @@ private:
     /// The mount / write-fence / build-watermark / self-remount runtime, extracted
     /// from Pool. Owns the `MountLeaseRenewer`, the local `MountFence`, the per-server
     /// build watermark (`process_epoch` + the `builds_mutex`-guarded seq/registry) and its in-flight-build
-    /// map, the live-incarnation `live_writer_epoch`, the unclean-epoch high-water-mark, and the
+    /// map, the live-incarnation `live_writer_epoch` with its claim's `last_unclean_epoch`, and the
     /// persistent renewal and remount workers (with one driver mutex/condition pair). Injected with backend/layout
     /// the `MountConfig` slice + `server_root_id` + the event-sink reference + the pool `cas_request_budget`
     /// + a `remount_attempt` callback (== `Pool::tryRemountOnce`, which STAYS on Pool: the claim/recovery

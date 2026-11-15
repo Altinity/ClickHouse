@@ -1,10 +1,14 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <base/types.h>
+#include <iosfwd>
+#include <optional>
 #include <string_view>
 
 namespace DB::Cas
 {
+
+class CasOperation;
 
 /// Read-only decode-to-JSON dispatch for `clickhouse-disks cas-inspect` (and its unit tests): given
 /// any key that could live in a content-addressed pool plus the raw bytes stored at it, decode with
@@ -31,5 +35,10 @@ namespace DB::Cas
 String caInspectToJson(const Layout & layout, const String & key, std::string_view bytes,
                        const std::optional<NamespaceLifeId> & resolved_life = std::nullopt,
                        const std::optional<RefTxnId> & base_snapshot_id = std::nullopt);
+
+/// The `checkpoint_snapshot_id` of `life`'s `_ckpt`, for `caInspectToJson`'s `base_snapshot_id`. A `_ckpt`
+/// this build cannot decode costs only the stray label: one line naming it goes to `diagnostics`.
+std::optional<RefTxnId> readInspectBaseSnapshotId(CasOperation & op, const Layout & layout, const NamespaceLifeId & life,
+                                                  std::ostream & diagnostics);
 
 }

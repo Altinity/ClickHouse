@@ -732,8 +732,8 @@ public:
     ///
     /// `life` (Stage B, Task 4-C) is `RefTableRuntime::life` -- the caller's already-resolved catalog
     /// life, read under the SAME critical section as `id`/`admitted_generation` (a caller with no
-    /// resolved life yet has no business preparing a chunk at all: `ensureRefTableRecovered` resolves
-    /// it before this table is exposed as recovered).
+    /// resolved life yet has no business preparing a chunk at all: a runtime is constructed for the life
+    /// its admission resolved).
     static PreparedRefChunk prepareRefChunk(const Layout & layout, const NamespaceLifeId & life,
                                             RefTableState state, const RefTxnId & id,
                                             const std::optional<RefTxnId> & chain_link,
@@ -1131,10 +1131,12 @@ private:
         const RootNamespace & ns, const std::optional<UInt128> & expected_incarnation);
 
     /// Lazily recovers `rt` for the life its admission resolved: `_ckpt` -> exact base snapshot ->
-    /// `walkRefChain` over the tail -> a tombstone naming the live epoch when the chain ends in an earlier
-    /// one -> a `_ckpt` re-read -> one catalog read that confirms `rt.life` -> install. It does not expose
-    /// the table as recovered until that tombstone is durable; concurrent callers serialize across the whole unlocked I/O window
-    /// through `recovery_in_progress`. A walk that raises `CORRUPTED_DATA` is confirmed the same way
+    /// `walkRefChain` over the tail -> a `_ckpt` re-read -> one catalog read that confirms `rt.life` -> install.
+    /// When the chain ends at an absent key in an epoch below the live one and at or below `last_unclean_epoch`,
+    /// the walk first stamps a generation 1 or 2 `_ckpt` to generation 3, then writes a tombstone naming the live
+    /// epoch; it writes no other `_ckpt` body. It does not expose the table as recovered until that
+    /// tombstone is durable. Concurrent callers serialize across the unlocked I/O window through
+    /// `recovery_in_progress`. A walk that raises `CORRUPTED_DATA` is confirmed the same way
     /// before the error leaves. When the catalog no longer names `rt.life` as `Live` or `Removing`, the
     /// walk's result or error is dropped, nothing is installed, the runtime is detached and the call
     /// returns `LifeRemoved`.
@@ -1146,8 +1148,8 @@ private:
     /// The caller must not hold `rt.state_mutex`.
     bool confirmRecoveredLifeOrDetach(RefTableRuntime & rt, uint64_t admitted_generation);
 
-    /// Stage B (spec INV-3, §3): resolves `ns`'s catalog life -- ONCE per table-open, from inside
-    /// `ensureRefTableRecovered`'s transient-retry envelope, never from a per-write path (a per-write
+    /// Stage B (spec INV-3, §3): resolves `ns`'s catalog life -- once per cold mutable admission in
+    /// `namespaceLife`, before the runtime exists, never from a per-write path (a per-write
     /// catalog GET is a protocol-step addition and is vetoed). Three cases, closing over the catalog's
     /// own three-state grammar:
     ///   - no entry at all: this call is the namespace's first-ever opener. Mints one via

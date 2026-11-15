@@ -173,7 +173,7 @@ struct ClassifiedOccupant
     Occupant kind;
     /// Engaged iff `kind` is `SuccessorSeal`: the epoch the tombstone names.
     std::optional<RefEpochTransition> transition;
-    /// False iff the occupant is not a well-formed transaction of this namespace at this id.
+    /// False iff this build could not decode the occupant (`CORRUPTED_DATA` or `UNKNOWN_FORMAT_VERSION`).
     bool decoded = true;
 };
 
@@ -1053,10 +1053,32 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
                     ns.string(), id.writer_epoch, id.ref_sequence);
         }
     };
+    /// As in `walkRefChain`, a record that does not apply is corruption only under an unchanged base: a
+    /// moved one means cleanup may have emptied keys the walk read, so the walk's context, not the record,
+    /// may be wrong. False asks for a restart; any other exception propagates.
+    const auto applied_under_unmoved_base = [&](RefLogTxn && txn, uint64_t encoded_bytes)
+    {
+        try
+        {
+            apply_one(std::move(txn), encoded_bytes);
+        }
+        catch (const Exception & e)
+        {
+            if (e.code() == ErrorCodes::CORRUPTED_DATA && ckptTokenMoved(op, layout, life, accepted.etag))
+                return false;
+            throw;
+        }
+        return true;
+    };
+    bool base_moved_under_apply = false;
     const RefChainVisitor visit = [&](RefLogTxn && txn, uint64_t stored_bytes)
     {
         adjudicate_retained_attempt(txn.txn_id, reader.capturedBytes());
-        apply_one(std::move(txn), stored_bytes);
+        if (!applied_under_unmoved_base(std::move(txn), stored_bytes))
+        {
+            base_moved_under_apply = true;
+            return false;
+        }
         checkRecoveryStillAdmitted(ns, rt, cancelled, token);
         return true;
     };
@@ -1075,7 +1097,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
     {
         checkRecoveryStillAdmitted(ns, rt, cancelled, token);
         const RefChainWalk walk = walkRefChain(op, layout, life, origin, visit, &reader);
-        if (walk.end == RefChainEnd::BaseMoved)
+        if (walk.end == RefChainEnd::BaseMoved || base_moved_under_apply)
             return std::nullopt;
         if (walk.end == RefChainEnd::Terminal)
             break;
@@ -1161,9 +1183,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
                     "to an occupant the settling read could not observe; the table stays unrecovered",
                     ns.string(), id.writer_epoch, id.ref_sequence));
 
-            /// As in `walkRefChain`, an occupant that does not decode or does not chain is corruption only
-            /// under an unchanged base: a moved one means cleanup may have emptied keys the walk read, so the
-            /// walk's context, not the occupant, may be wrong. Any other exception propagates.
+            /// An occupant that does not decode follows the same rule as a record that does not apply.
             std::optional<RefLogTxn> occupant;
             try
             {
@@ -1180,16 +1200,8 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
                 ? ProfileEvents::CASRefRecoveryEpochSealAdopted : ProfileEvents::CASRefRecoveryStragglerAdopted);
             const std::optional<RefTxnId> successor = refChainSuccessor(*occupant);
             const std::optional<RefEpochTransition> transition = refEpochTransitionOf(*occupant);
-            try
-            {
-                apply_one(std::move(*occupant), occupant_object->bytes.size());
-            }
-            catch (const Exception & e)
-            {
-                if (e.code() == ErrorCodes::CORRUPTED_DATA && ckptTokenMoved(op, layout, life, accepted.etag))
-                    return std::nullopt;
-                throw;
-            }
+            if (!applied_under_unmoved_base(std::move(*occupant), occupant_object->bytes.size()))
+                return std::nullopt;
             checkRecoveryStillAdmitted(ns, rt, cancelled, token);
             if (!successor)
                 break;
@@ -1650,12 +1662,12 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
     }
     }
 
+    if (life_removed)
+        return RefRecoveryOutcome::LifeRemoved;
     /// A NEW table was just materialized; enforce the whole-table cache budget, protecting this one
     /// The pass runs OUTSIDE `rt.state_mutex` (that scope closed above) so
     /// the pass -- which acquires `ref_queue_mutex` and try-locks other tables' `state_mutex` -- never
     /// nests this table's `state_mutex` under `ref_queue_mutex`.
-    if (life_removed)
-        return RefRecoveryOutcome::LifeRemoved;
     enforceRefTableCacheBudget(ns);
     return RefRecoveryOutcome::Recovered;
 }

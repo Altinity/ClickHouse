@@ -11,6 +11,9 @@
 #include <IO/WriteBufferFromString.h>
 #include "cas_test_helpers.h"
 
+#include <algorithm>
+#include <sstream>
+
 using namespace DB::Cas;
 
 namespace
@@ -364,4 +367,42 @@ TEST(CASInspect, PrintsGenerationNextEpochAndTheStrayNote)
     const String stray_json = caInspectToJson(layout, below_key, below_bytes, life, RefTxnId{5, 1});
     EXPECT_NE(stray_json.find("may be a stray"), String::npos) << stray_json;
     EXPECT_EQ(caInspectToJson(layout, below_key, below_bytes, life, RefTxnId{1, 2}).find("may be a stray"), String::npos);
+}
+
+TEST(CASInspect, RendersTheMountLeaseLastUncleanEpoch)
+{
+    const Layout layout("p");
+    MountLease lease;
+    lease.server_uuid = DB::UInt128(1);
+    lease.write_attempt_id = DB::UInt128(2);
+    lease.writer_epoch = 7;
+    lease.last_unclean_epoch = 3;
+    const String json = caInspectToJson(layout, layout.mountKey("srv1"), encodeMountLease(lease));
+    EXPECT_NE(json.find("\"last_unclean_epoch\":3"), String::npos) << json;
+
+    lease.last_unclean_epoch.reset();
+    const String older = caInspectToJson(layout, layout.mountKey("srv1"), encodeMountLease(lease));
+    EXPECT_NE(older.find("\"last_unclean_epoch\":null"), String::npos) << older;
+}
+
+TEST(CASInspect, UndecodableCheckpointCostsOnlyTheStrayLabel)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    const Layout layout("p");
+    const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(RootNamespace{"srv1/db/tbl"});
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+
+    std::ostringstream absent_diagnostics;
+    EXPECT_EQ(readInspectBaseSnapshotId(op, layout, life, absent_diagnostics), std::nullopt);
+    EXPECT_TRUE(absent_diagnostics.str().empty());
+
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(life), "not a checkpoint", Retry::standard())));
+    std::ostringstream diagnostics;
+    std::optional<RefTxnId> base;
+    EXPECT_NO_THROW(base = readInspectBaseSnapshotId(op, layout, life, diagnostics));
+    EXPECT_EQ(base, std::nullopt);
+    const String printed = diagnostics.str();
+    EXPECT_NE(printed.find(layout.refCkptKey(life)), String::npos) << printed;
+    EXPECT_EQ(std::count(printed.begin(), printed.end(), '\n'), 1) << printed;
 }

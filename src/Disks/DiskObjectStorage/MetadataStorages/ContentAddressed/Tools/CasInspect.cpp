@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobMeta.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCkpt.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobMetaFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
@@ -17,6 +18,7 @@
 #include <Common/Exception.h>
 #include <fmt/format.h>
 #include <cstdint>
+#include <ostream>
 #include <set>
 #include <vector>
 
@@ -25,6 +27,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
+    extern const int UNKNOWN_FORMAT_VERSION;
 }
 }
 
@@ -267,6 +270,7 @@ String renderMountLease(const MountLease & m)
         .add("min_active_build_sequence", jsonUInt(m.min_active_build_sequence))
         .add("gc_fenced", jsonBool(m.gc_fenced))
         .add("write_attempt_id", jsonHex(m.write_attempt_id))
+        .add("last_unclean_epoch", m.last_unclean_epoch ? jsonUInt(*m.last_unclean_epoch) : "null")
         .str();
 }
 
@@ -558,6 +562,24 @@ String caInspectToJson(const Layout & layout, const String & key, std::string_vi
         "cas-inspect: unrecognized key layout '{}' (recognized: cas/ns/stream, cas/ns/state, cas/manifests, "
         "gc/server-roots/*/mount, gc/state, gc/gen/*/fold_seal, gc/gen/*/attempt/*/blob_target/*/*, "
         "retired, blobs, blobs/*.meta)", key);
+}
+
+std::optional<RefTxnId> readInspectBaseSnapshotId(CasOperation & op, const Layout & layout, const NamespaceLifeId & life,
+                                                  std::ostream & diagnostics)
+{
+    try
+    {
+        const std::optional<CkptSample> ckpt = readCkpt(op, layout, life);
+        return ckpt ? ckpt->ckpt.checkpoint_snapshot_id : std::nullopt;
+    }
+    catch (const DB::Exception & e)
+    {
+        if (e.code() != DB::ErrorCodes::CORRUPTED_DATA && e.code() != DB::ErrorCodes::UNKNOWN_FORMAT_VERSION)
+            throw;
+        diagnostics << "cas-inspect: '" << layout.refCkptKey(life) << "' does not decode, so no log is labelled "
+                    << "\"may be a stray\": " << e.message() << "\n";
+        return std::nullopt;
+    }
 }
 
 }

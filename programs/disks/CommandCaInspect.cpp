@@ -3,7 +3,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCkpt.h>
 #include <Common/Exception.h>
 #include <ICommand.h>
 
@@ -77,8 +76,7 @@ public:
         /// A log below the life's snapshot base may be a stray, so the base is read for the label.
         std::optional<Cas::RefTxnId> base_snapshot_id;
         if (parsed && parsed->kind == Cas::RefObjectKind::Log && resolved_life)
-            if (const std::optional<Cas::CkptSample> ckpt = Cas::readCkpt(op, layout, *resolved_life))
-                base_snapshot_id = ckpt->ckpt.checkpoint_snapshot_id;
+            base_snapshot_id = Cas::readInspectBaseSnapshotId(op, layout, *resolved_life, std::cerr);
 
         std::cout << Cas::caInspectToJson(layout, key, got->bytes, resolved_life, base_snapshot_id) << "\n";
     }

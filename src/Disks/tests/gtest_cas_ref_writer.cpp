@@ -1668,6 +1668,111 @@ TEST(CASRefWriterRecovery, PresenceProbeOverAnErasedLifeDoesNotThrow)
     EXPECT_TRUE(erase.fired());
 }
 
+/// Each reader whose recovery finds the life erased answers as for a name without a row, without an error.
+TEST(CASRefWriterRecovery, ReadersOfALifeErasedUnderTheWalkAnswerAbsent)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    EraseDuringRecovery erase;
+    auto store = openPoolWithConfig(backend, erase.config());
+
+    struct Row
+    {
+        String name;
+        std::function<bool(const RootNamespace &)> answers_absent;
+    };
+    const std::vector<Row> rows{
+        {"list_refs", [&](const RootNamespace & ns) { return store->listRefs(ns).empty(); }},
+        {"has_any_ref_with_prefix", [&](const RootNamespace & ns) { return !store->hasAnyRefWithPrefix(ns, ""); }},
+        {"files_life_if_readable", [&](const RootNamespace & ns) { return !store->namespaceFilesLifeIfReadable(ns); }},
+        {"drop_namespace", [&](const RootNamespace & ns) { return store->dropNamespace(ns).committed_refs == 0; }},
+    };
+    for (const Row & row : rows)
+    {
+        SCOPED_TRACE(row.name);
+        const NamespaceLifeId life = seedRecoverablePart(backend, layout, RootNamespace{"srv1/erased_reader_" + row.name});
+        const uint64_t installs_before = store->recoveryInstallCountForTest();
+        erase.arm([&] { eraseLifeForTest(backend, layout, life); });
+        bool absent = false;
+        ASSERT_NO_THROW(absent = row.answers_absent(life.ns));
+        EXPECT_TRUE(absent);
+        EXPECT_TRUE(erase.fired());
+        EXPECT_EQ(store->recoveryInstallCountForTest(), installs_before);
+        EXPECT_EQ(store->refTableLifeForTest(life.ns), std::nullopt);
+    }
+}
+
+namespace
+{
+
+/// Leaves `part_1`'s lane in `NeedsRecovery`: a `published_at` update becomes durable, then the lease
+/// deadline is reached before its install. The deadline is restored, so the same admission recovers.
+void strandAppendUnderLostDeadline(const PoolPtr & store, const RootNamespace & ns)
+{
+    Pool * const pool = store.get();
+    store->setCarveHookForTest([pool](CasRefLedger::CarvePhaseForTest phase)
+    {
+        if (phase == CasRefLedger::CarvePhaseForTest::PostDurableInstall)
+            pool->setMountDeadline(pool->bootMsNow());
+    });
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+    {
+        store->updateRefPublishedAt(ns, "part_1", [](RefPublishedAtUpdate & update) { update.published_at_ms = 17; });
+    });
+    store->setCarveHookForTest(nullptr);
+    store->setMountDeadline(store->bootMsNow() + 600'000);
+    ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
+}
+
+}
+
+/// An append whose own recovery finds the life erased retries later, naming the removed life.
+TEST(CASRefWriterRecovery, AppendWhoseRecoveryFindsTheLifeErasedRetriesLater)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const NamespaceLifeId life = seedRecoverablePart(backend, layout, RootNamespace{"srv1/append_erased_under_recovery"});
+    EraseDuringRecovery erase;
+    auto store = openPoolWithConfig(backend, erase.config());
+    ASSERT_TRUE(store->resolveRef(life.ns, "part_1").has_value());
+
+    /// After admission resolved the recovered runtime and before the append recovers it again.
+    bool captured = false;
+    store->setAppendAfterRuntimeCaptureHookForTest([&]
+    {
+        if (std::exchange(captured, true))
+            return;
+        strandAppendUnderLostDeadline(store, life.ns);
+        erase.arm([&] { eraseLifeForTest(backend, layout, life); });
+    });
+    expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "the catalog no longer names life",
+        [&] { store->dropRef(life.ns, "part_1"); });
+    store->setAppendAfterRuntimeCaptureHookForTest(nullptr);
+    EXPECT_TRUE(captured);
+    EXPECT_TRUE(erase.fired());
+    EXPECT_EQ(store->refTableLifeForTest(life.ns), std::nullopt);
+}
+
+/// A resident life that its recovery finds erased hands the write to cold admission, which births a new life.
+TEST(CASRefWriterRecovery, ResidentLifeErasedUnderItsRecoveryFallsToColdAdmission)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const NamespaceLifeId life = seedRecoverablePart(backend, layout, RootNamespace{"srv1/resident_erased_under_recovery"});
+    EraseDuringRecovery erase;
+    auto store = openPoolWithConfig(backend, erase.config());
+    ASSERT_TRUE(store->resolveRef(life.ns, "part_1").has_value());
+    strandAppendUnderLostDeadline(store, life.ns);
+
+    erase.arm([&] { eraseLifeForTest(backend, layout, life); });
+    expectThrowsCode(DB::ErrorCodes::FILE_DOESNT_EXIST, [&] { store->dropRef(life.ns, "part_1"); });
+    EXPECT_TRUE(erase.fired());
+    const std::optional<NamespaceLifeId> reborn = lifeIfCatalogedForTest(backend, layout, life.ns);
+    ASSERT_TRUE(reborn);
+    EXPECT_NE(reborn->incarnation, life.incarnation);
+    EXPECT_EQ(store->refTableLifeForTest(life.ns), reborn);
+}
+
 TEST(CASRefWriterRecovery, ConfirmationCostsOneCatalogReadPerInstall)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();

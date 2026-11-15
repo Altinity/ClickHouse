@@ -2035,3 +2035,61 @@ TEST(CASFsckPartial, DeadlineReportsHeldFindingsAsUnchecked)
             && object.reachable_from.front().find("not confirmed before the deadline") != String::npos;
     }));
 }
+
+namespace
+{
+
+/// Once `on_second_blob_head` is set, runs it before the second HEAD of a key under `blobs_prefix`.
+class SecondBlobHeadHookBackend : public InMemoryBackend
+{
+public:
+    String blobs_prefix;
+    std::function<void()> on_second_blob_head;
+
+    std::optional<RawMeta> head(const String & key, TransportAccess & access) override
+    {
+        if (on_second_blob_head && key.starts_with(blobs_prefix) && ++blob_heads == 2)
+            on_second_blob_head();
+        return InMemoryBackend::head(key, access);
+    }
+
+private:
+    size_t blob_heads = 0;
+};
+
+}
+
+/// A dangling blob held for the late catalog confirmation is not dropped by a deadline in the blob loop:
+/// it is reported unchecked.
+TEST(CASFsckPartial, DeadlineInTheBlobLoopReportsHeldDanglingsAsUnchecked)
+{
+    auto backend = std::make_shared<SecondBlobHeadHookBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/blob_loop_deadline@cas@"};
+    const ManifestRef r = ref(1, 0xB1);
+    const ManifestEntry first = blobEntryFor("a", u128Of("fsck-blob-loop-deadline-a"));
+    const ManifestEntry second = blobEntryFor("b", u128Of("fsck-blob-loop-deadline-b"));
+    writeManifestRaw(*backend, layout, ns, r, {first, second});
+    const uint64_t sequence = publishCommittedTransition(*backend, layout, ns, "tbl", std::nullopt, r);
+    writeFsckCheckpoint(*backend, layout, ns, RefTxnId{1, sequence});
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    /// Both blobs are missing. The first is re-resolved and held; the clock runs out before the second
+    /// one's recheck, so the deadline fires inside the blob loop with one dangling held.
+    backend->blobs_prefix = layout.blobsPrefix();
+    backend->on_second_blob_head = [&]
+    {
+        while (std::chrono::steady_clock::now() <= deadline)
+            std::this_thread::yield();
+    };
+
+    const FsckReport report = runFsck(*store, /*detail=*/true, {}, deadline, /*partial_on_deadline=*/true);
+    ASSERT_TRUE(report.partial);
+    EXPECT_EQ(report.dangling, 0u) << "a finding the catalog did not confirm is not reported as corruption";
+    EXPECT_EQ(report.unchecked, 1u);
+    const String note = "late recheck not confirmed before the deadline";
+    EXPECT_NE(uncheckedNoteContains(report, layout.blobKey(first.ref), note),
+              uncheckedNoteContains(report, layout.blobKey(second.ref), note))
+        << "exactly the first blob of the loop was held";
+}

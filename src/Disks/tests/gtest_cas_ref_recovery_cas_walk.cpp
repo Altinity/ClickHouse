@@ -2772,6 +2772,73 @@ TEST(CASRefWriterRecovery, OccupantThatDoesNotDecodeIsCorruptionUnderAnUnchanged
 namespace
 {
 
+/// Chain `{1,1}`, `{1,2}`, then `{1,3}`, a record that chains but carries a second birth, so applying it
+/// fails. With `move_base`, right after the walk reads `{1,3}`, a snapshot at `{1,3}` lands and `_ckpt`
+/// is replaced to name it.
+struct UnappliableWalkedRecord
+{
+    std::shared_ptr<AfterGetHookBackend> backend = std::make_shared<AfterGetHookBackend>();
+    Layout layout{"p"};
+    RootNamespace ns;
+    NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(ns);
+    size_t fired = 0;
+
+    UnappliableWalkedRecord(const String & name, bool move_base)
+        : ns(name)
+    {
+        burnEpochsUpTo(backend, layout, 6);
+        life = seedTwoRecordChain(backend, layout, ns);
+        createTxnAt(*backend, layout, life, makeOrdinaryTxn(ns, RefTxnId{1, 3}, "c", /*birth=*/true));
+        backend->watched_key = layout.refLogKey(life, RefTxnId{1, 3});
+        backend->after_get = [this, move_base]
+        {
+            ++fired;
+            if (!move_base)
+                return;
+            writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), RefTxnId{1, 3},
+                {committedRow("a", manifestRef(1, 1, 1)), committedRow("b", manifestRef(1, 2, 1)),
+                 committedRow("c", manifestRef(1, 3, 1))}));
+            const auto current = readCkptForTest(backend, layout, life);
+            ASSERT_TRUE(current);
+            ASSERT_TRUE(replaceForTest(backend, layout.refCkptKey(life),
+                encodeRefCkptAtGeneration(gen3Ckpt(1, RefTxnId{1, 3}), 3), current->etag));
+        };
+    }
+};
+
+}
+
+TEST(CASRefWriterRecovery, WalkedRecordThatDoesNotApplyRestartsWhenTheBaseMoved)
+{
+    UnappliableWalkedRecord fixture("srv1/unappliable_walked_record_base_moved", /*move_base=*/true);
+    auto store = openWalkPool(fixture.backend);
+    ASSERT_EQ(store->liveWriterEpoch(), 6u);
+
+    std::map<String, Resolved> refs;
+    ASSERT_NO_THROW(refs = store->listRefs(fixture.ns));
+    EXPECT_EQ(fixture.fired, 1u);
+    EXPECT_EQ(store->refRecoveryRestartsForTest(fixture.ns), 1u);
+    EXPECT_TRUE(refs.contains("c"));
+    EXPECT_TRUE(isTombstoneTo(readLogTxn(*fixture.backend, fixture.layout, fixture.ns, RefTxnId{1, 4}), 6))
+        << "the restarted walk closes the chain above the new base";
+}
+
+TEST(CASRefWriterRecovery, WalkedRecordThatDoesNotApplyIsCorruptionUnderAnUnchangedBase)
+{
+    UnappliableWalkedRecord fixture("srv1/unappliable_walked_record_same_base", /*move_base=*/false);
+    auto store = openWalkPool(fixture.backend);
+    ASSERT_EQ(store->liveWriterEpoch(), 6u);
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)store->listRefs(fixture.ns); });
+    EXPECT_EQ(fixture.fired, 1u);
+    EXPECT_EQ(store->refRecoveryRestartsForTest(fixture.ns), 0u) << "an unchanged base is a verdict, not a restart";
+    EXPECT_FALSE(store->refTableRecoveredForTest(fixture.ns));
+    EXPECT_FALSE(readLogTxn(*fixture.backend, fixture.layout, fixture.ns, RefTxnId{1, 4}));
+}
+
+namespace
+{
+
 /// The fixture of `DeadEpochIsSealedInOneWriteWithoutACkptWrite`: `{1,1}`, `{1,2}`, a snapshot at `{1,2}` and a
 /// generation 3 `_ckpt` naming it.
 NamespaceLifeId seedSnapshotBasedChain(const BackendPtr & backend, const Layout & layout, const RootNamespace & ns)
@@ -3242,6 +3309,8 @@ TEST(CASRefWriterTombstone, UndecodableOccupantOfTheSlotFaultsTheLane)
 
         expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { publishRefForTest(store, ns, "c", manifestRef(3, 1, 1)); });
         EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Faulted);
+        EXPECT_FALSE(store->mayMutate()) << "the impossible-interference reaction must fence this mount closed";
+        EXPECT_EQ(store->scheduleRemountCallCountForTest(), 1u);
         EXPECT_EQ(readAt(*backend, layout.refLogKey(life, RefTxnId{1, 3}))->bytes, garbage);
         EXPECT_TRUE(logIdsInEpochs(*backend, layout, life, 3, 3).empty());
     }
