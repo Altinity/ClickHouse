@@ -24,6 +24,7 @@
 #include <condition_variable>
 #include <functional>
 #include <future>
+#include <limits>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -4024,6 +4025,121 @@ TEST(CASRefWriterStalePrecommitSweep, VerifiedCleanSweepClearsFlagWithoutEvents)
     const std::vector<CasEvent> observed = seen->snapshot();
     EXPECT_EQ(std::count_if(observed.begin(), observed.end(),
         [](const CasEvent & e) { return e.type == CasEventType::PrecommitReclaim; }), 0);
+}
+
+namespace
+{
+
+/// Every log id of `ns`'s fixture life, in id order.
+std::vector<RefTxnId> listLogIdsForTest(Backend & backend, const Layout & layout, const RootNamespace & ns)
+{
+    const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(ns);
+    DB::Cas::tests::OperationForTest op(backend);
+    std::vector<RefTxnId> ids;
+    String cursor;
+    do
+    {
+        const ListPage page = (*op).list(layout.namespaceStreamPrefix(life), cursor, 1000, Retry::standard());
+        for (const ListedKey & listed : page.keys)
+        {
+            const auto parsed = layout.parseRefObjectKey(listed.key);
+            if (parsed && parsed->life_id == life.incarnation && parsed->kind == RefObjectKind::Log)
+                ids.push_back(parsed->txn_id);
+        }
+        cursor = page.next_cursor;
+    } while (!cursor.empty());
+    std::sort(ids.begin(), ids.end());
+    return ids;
+}
+
+}
+
+TEST(CASRefWriterStalePrecommitSweep, ReadingEpochWithStalePrecommitsWritesATombstoneAndOneRemoval)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const RootNamespace ns{"srv1/reading_epoch_stale_precommit"};
+    const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(ns);
+
+    {
+        auto predecessor = openPool(backend);
+        ASSERT_EQ(predecessor->liveWriterEpoch(), 1u);
+        auto build = startBuildFor(predecessor, ns, "stale");
+        build->precommitAdd(ns, "stale", build->stageManifest({}));
+    }
+    /// The abandoned build leaves a cleanup duty, so the shutdown skips its farewell. The slot is rewritten as
+    /// the clean farewell this case needs: epoch 1 had no ref-log request in flight.
+    {
+        DB::Cas::tests::OperationForTest op(*backend);
+        const String mount_key = Layout("p").mountKey("test");
+        const auto got = (*op).read(mount_key, Retry::once());
+        ASSERT_TRUE(got.has_value());
+        MountLease farewell = decodeMountLease(got->bytes);
+        ASSERT_EQ(farewell.writer_epoch, 1u);
+        farewell.min_active_build_sequence = std::numeric_limits<uint64_t>::max();
+        farewell.last_unclean_epoch = 0;
+        farewell.seq += 1;
+        ASSERT_TRUE(std::holds_alternative<Committed>(
+            (*op).replace(mount_key, encodeMountLease(farewell), got->etag, Retry::once())));
+    }
+
+    auto reader = openPool(backend);
+    ASSERT_EQ(reader->liveEpochPairForTest(), (LiveEpochPair{2, 0})) << "the read epoch's recovery is lazy";
+    const Layout & layout = reader->layout();
+    const std::vector<RefTxnId> before = listLogIdsForTest(*backend, layout, ns);
+    ASSERT_FALSE(before.empty());
+    const RefTxnId last = before.back();
+    ASSERT_EQ(last.writer_epoch, 1u);
+    const RefTxnId tombstone_id{1, last.ref_sequence + 1};
+    const uint64_t ckpt_writes = backend->writeCount(layout.refCkptKey(life));
+
+    EXPECT_NO_THROW(reader->listRefs(ns));
+
+    std::vector<RefTxnId> expected = before;
+    expected.push_back(tombstone_id);
+    expected.push_back(RefTxnId{2, 1});
+    EXPECT_EQ(listLogIdsForTest(*backend, layout, ns), expected) << "exactly a tombstone and one removal";
+    const auto tombstone = readOf(backend, layout.refLogKey(life, tombstone_id));
+    ASSERT_TRUE(tombstone);
+    const RefLogTxn tombstone_txn = decodeRefLogTxn(openObject(FormatId::RefLog, tombstone->bytes), ns.string(), tombstone_id);
+    EXPECT_TRUE(refLogTxnIsEpochSeal(tombstone_txn));
+    EXPECT_EQ(tombstone_txn.next_epoch, std::optional<uint64_t>{2});
+    const auto removal = readOf(backend, layout.refLogKey(life, RefTxnId{2, 1}));
+    ASSERT_TRUE(removal);
+    const RefLogTxn removal_txn = decodeRefLogTxn(openObject(FormatId::RefLog, removal->bytes), ns.string(), RefTxnId{2, 1});
+    EXPECT_FALSE(refLogTxnIsEpochSeal(removal_txn));
+    EXPECT_EQ(removal_txn.prev_epoch_seal, std::make_optional(tombstone_id));
+    EXPECT_FALSE(reader->needsStalePrecommitSweepForTest(ns));
+    EXPECT_EQ(backend->writeCount(layout.refCkptKey(life)), ckpt_writes);
+}
+
+TEST(CASRefWriterSnapshotPublish, ReadingEpochDoesNotPublish)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const RootNamespace ns{"srv1/reading_epoch_no_publish"};
+    const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(ns);
+
+    {
+        auto writer = openPool(backend);
+        ASSERT_EQ(writer->liveWriterEpoch(), 1u);
+        publishEmptyPart(writer, ns, "a");
+        publishEmptyPart(writer, ns, "b");
+        publishEmptyPart(writer, ns, "c");
+    }   /// a clean farewell; the tail is above the reader's threshold
+
+    PoolConfig config;
+    config.snapshot_log_count_threshold = 1;
+    config.snapshot_log_bytes_threshold = 1ULL << 40;
+    auto reader = openPoolWithConfig(backend, config);
+    ASSERT_EQ(reader->liveEpochPairForTest(), (LiveEpochPair{2, 0})) << "the read epoch's recovery is lazy";
+    const Layout & layout = reader->layout();
+    const uint64_t ckpt_writes = backend->writeCount(layout.refCkptKey(life));
+
+    EXPECT_EQ(reader->listRefs(ns).size(), 3u);
+    EXPECT_GT(reader->tailSinceSnapshotCountForTest(ns), config.snapshot_log_count_threshold);
+    EXPECT_EQ(reader->pendingSnapshotPublishesForTest(ns), 0);
+    reader->waitForSnapshotPublishSettleForTest(ns);
+    EXPECT_FALSE(listGreatestSnapshotIdForTest(*backend, layout, ns).has_value());
+    EXPECT_EQ(backend->writeCount(layout.refCkptKey(life)), ckpt_writes);
 }
 
 /// ===================================================================================

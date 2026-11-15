@@ -157,6 +157,7 @@ public:
               oneAttemptBudget(),
               "test",
               [] { return uint64_t{1}; },
+              [] { return LiveEpochPair{1, 0}; },
               [] { return true; },
               [] { return uint64_t{1}; },
               [] { return uint64_t{0}; },

@@ -1417,6 +1417,8 @@ TEST(CASRefCheckpoint, SnapshotPublisherRefusesEpochSealCandidateWithoutAnyWrite
         predecessor_epoch = predecessor->writerEpoch();
         ASSERT_EQ(publishRef(predecessor, ns, "ref_1", 1), (RefTxnId{predecessor_epoch, 1}));
     }
+    /// Without a mount slot the successor counts the predecessor's epoch as unclean, so recovery seals it.
+    ASSERT_EQ(op.removeCurrent(Layout("p").mountKey("test"), Retry::standard()), Removal::Removed);
 
     auto store = openPool(backend);
     ASSERT_GT(store->writerEpoch(), predecessor_epoch);

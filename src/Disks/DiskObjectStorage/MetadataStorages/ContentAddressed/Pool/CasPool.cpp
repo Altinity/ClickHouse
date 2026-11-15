@@ -248,6 +248,7 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
           mount_requests, pool_layout, config.refLedgerConfig(), event_sink_, config.cas_request_budget,
           config.server_root_id,
           [this] { return liveWriterEpoch(); },
+          [this] { return mount_runtime.liveEpochPair(); },
           [this] { return refAppendFenceOk(); },
           [this] { return mount_runtime.fenceGeneration(); },
           [this] { return bootMsNow(); },
@@ -898,9 +899,10 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     /// THIS NO LONGER WAITS. The `materialization_grace_ms` (`T_mat`) sleep that used to sit here bought
     /// one thing: time for that straggler to land (or exhaust its retries) BEFORE this incarnation began
     /// trusting its recovery LISTINGS. Recovery does not trust listings any more. It walks each ref
-    /// stream from `_ckpt` and closes a chain that ends below the live epoch with a tombstone in the slot
-    /// after its last record, written as a conditional create -- so the straggler's own conditional create loses to
-    /// an occupied slot no matter when it arrives, and a wait can only make startup slower, never safer.
+    /// stream from `_ckpt` and closes a chain that ends in an epoch that may have ended uncleanly
+    /// (`last_unclean_epoch`) with a tombstone in the slot after its last record, written as a conditional
+    /// create -- so the straggler's own conditional create loses to an occupied slot no matter when it
+    /// arrives. After a clean end nothing is in flight. A wait can only make startup slower, never safer.
     /// What survives is the CLASSIFICATION and saying it out loud: an unclean predecessor is worth an
     /// operator-visible line, and the exhaustive switch is worth keeping as the build-time guard.
     bool unclean_reclaim = false;
@@ -1610,9 +1612,10 @@ bool Pool::tryRemountOnce()
         /// whenever this incarnation's own ref lanes had not provably settled before the fence tripped:
         /// an unresolved (still-wedged) ref-log conditional `PUT` from the dying epoch could otherwise
         /// land after recovery began trusting its listings. Recovery no longer trusts listings — it walks
-        /// the chain and closes it, when it ends below the live epoch, with a tombstone in the slot after its
-        /// last record, so the wedged `PUT` loses its own conditional create to that tombstone and the wait
-        /// bought nothing but latency on every fence recovery.
+        /// the chain and closes it with a tombstone in the slot after its last record when the chain ends in
+        /// an epoch at or below `last_unclean_epoch`. This remount claims over its own fenced body, so that
+        /// marker is the dying epoch, and the wedged `PUT` loses its own conditional create to that tombstone.
+        /// The wait bought nothing but latency on every fence recovery.
         ///
         /// That replacement has ONE precondition, and it is this one: the incarnation we are about to
         /// install must outrank the dying one. If the epoch did not strictly advance, the straggler's
@@ -1640,9 +1643,11 @@ bool Pool::tryRemountOnce()
         step = "publish_writer_epoch";
         mount_runtime.setLiveWriterEpoch(writer_epoch, last_unclean_epoch);
         mount_runtime.setProcessEpoch(writer_epoch, std::memory_order_release);
+        if (config.remount_epoch_published_hook_for_test)
+            config.remount_epoch_published_hook_for_test();
         /// 2. CANCEL OR JOIN every in-flight ref-table recovery, and BLOCK here until none is left (spec
         ///    §3: "self-remount cancels or waits out recovery before rearming"). A recovery admitted under
-        ///    the outgoing incarnation WRITES -- it stamps `_ckpt` and creates a tombstone -- so it must be
+        ///    the outgoing incarnation may WRITE -- stamp `_ckpt` and create a tombstone -- so it must be
         ///    stopped at this boundary rather than caught one site at a time
         ///    after the incarnation has already changed underneath it. Strictly before the quiesce below
         ///    so a cancelled walk unwinds while its runtime is still attached, and strictly before the

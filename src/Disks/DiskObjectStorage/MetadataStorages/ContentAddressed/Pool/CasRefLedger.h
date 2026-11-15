@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasWriteResult.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCkpt.h>
@@ -113,6 +114,9 @@ public:
         String server_root_id_,
         /// Callbacks into mount and watermark state owned by `Pool`, bound for this ledger's lifetime:
         std::function<uint64_t()> live_epoch_fn_,
+        /// The live epoch with the `last_unclean_epoch` of the claim that started it, read as one pair:
+        /// recovery decides from both whether it seals the chain before it installs.
+        std::function<LiveEpochPair()> live_epoch_pair_fn_,
         std::function<bool()> fence_ok_fn_,
         /// The fence-GENERATION primitive (`CasMountRuntime::fenceGeneration`), injected exactly as
         /// `CasPlainObjects` takes it. `fence_ok_fn` above answers "may this mount write AT ALL, right
@@ -428,6 +432,8 @@ public:
         PublishPop,
         ValidateFinalOps,
         ChunkReseed,
+        /// After the lane's tombstone is durable, before its install hold.
+        PostDurableTombstoneInstall,
         PostDurableInstall,
         PostInstallPreAck,
     };
@@ -745,6 +751,7 @@ private:
     /// member rather than an injected callback.
     String server_root_id;
     std::function<uint64_t()> live_epoch_fn;
+    std::function<LiveEpochPair()> live_epoch_pair_fn;
     std::function<bool()> fence_ok_fn;
     std::function<uint64_t()> fence_generation_fn;
     std::function<uint64_t()> boot_ms_now_fn;
@@ -1182,7 +1189,7 @@ private:
     /// so without it the transient loop reads the stop as a blip and re-drives the very work the remount
     /// just stopped -- while the barrier blocks waiting for that recovery to finish.
     std::optional<RecoveryResult> runRecoveryWalkOnce(
-        const RootNamespace & ns, RefTableRuntime & rt, uint64_t admitted_generation, uint64_t live_epoch,
+        const RootNamespace & ns, RefTableRuntime & rt, uint64_t admitted_generation, const LiveEpochPair & live,
         const std::optional<RefAppendAttempt> & retained_attempt, std::optional<String> & hole_detail,
         bool & cancelled, const std::optional<DetachedStopToken> & token = std::nullopt);
 
@@ -1232,6 +1239,14 @@ private:
     /// `commitRefChunk` -- each a complete commit boundary.
     void flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
                        std::vector<std::shared_ptr<RefMutationItem>> & owned_items);
+
+    /// The lane's tombstone step, run by `flushRefBatch` before the batch copies its working state.
+    /// True: the chain epoch equals the live epoch, or the stream is terminal, and the batch may proceed.
+    /// False: the function completed every pending item with an error. A chain epoch below the live one
+    /// is closed by a tombstone naming the live epoch, written as a lane attempt; one above it closes
+    /// the lane. MUST NOT hold `rt->state_mutex` or `ref_queue_mutex`.
+    bool ensureEpochOpenForAppend(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
+                                  std::vector<std::shared_ptr<RefMutationItem>> & owned_items);
 
     enum class WedgeResolution : uint8_t
     {
@@ -1294,6 +1309,10 @@ private:
     /// Enters the hard recovery fence after a transaction is known durable but cannot be installed.
     /// The exact attempt is discarded because replay, not another write, is now the only legal owner.
     static void requireRecovery(RefTableRuntime & rt, const RootNamespace & ns, std::string_view region) noexcept;
+
+    /// Enters `NeedsRecovery` when another record holds the slot of the lane's tombstone at `id`: the
+    /// tombstone did not land, and recovery adopts that record. The caller clears the attempt.
+    static void requireRecoveryForTakenTombstoneSlot(RefTableRuntime & rt, const RootNamespace & ns, const RefTxnId & id) noexcept;
 
     /// Leadership-exit guard for `appendRefOps`: under `ref_queue_mutex`, completes every still-unfinished
     /// item this leader owned (with `flush_exception` when unwinding, or a fail-closed `LOGICAL_ERROR`

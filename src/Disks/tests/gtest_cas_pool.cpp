@@ -5824,6 +5824,41 @@ TEST(CASPoolRemount, SelfRemountPublishesTheRemountClaimsMarkerWithTheEpoch)
         << "the body the remount's renewer wrote";
 }
 
+TEST(CASPool, SelfRemountRecoveryUsesTheRemountClaimsMarker)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = DB::Cas::tests::openPoolForTest(backend);
+    const String mount_key = store->layout().mountKey("test");
+    const RootNamespace ns{"srv1/self_remount_marker"};
+    const uint64_t epoch = store->liveWriterEpoch();
+    store->appendRefOps(ns, MutationScope::ref("a"),
+        [](const RefTableState & state)
+        {
+            std::vector<RefOp> ops;
+            if (state.getLifecycle() != RefLifecycle::Live)
+                ops.push_back(DB::Cas::tests::namespaceBirthOp());
+            for (const RefOp & op : DB::Cas::tests::publishCommittedOps("a", ManifestRef{1, 1, 1}))
+                ops.push_back(op);
+            return ops;
+        }, RootMutationOrigin::Writer, RootMutationKind::Publish);
+    const NamespaceLifeId life = store->namespaceLife(ns);
+
+    fenceOutMount(*backend, mount_key);
+    EXPECT_THROW(store->renewWatermarkOnce(), DB::Exception);
+    ASSERT_TRUE(store->tryRemountOnce());
+    const uint64_t remount_epoch = store->liveWriterEpoch();
+    ASSERT_GT(remount_epoch, epoch);
+    EXPECT_EQ(store->liveEpochPairForTest(), (LiveEpochPair{remount_epoch, epoch}))
+        << "a remount claims over a fenced body, so its own epoch ended uncleanly";
+
+    EXPECT_TRUE(store->listRefs(ns).contains("a"));
+    const auto stored = readObj(*backend, store->layout().refLogKey(life, RefTxnId{epoch, 2}));
+    ASSERT_TRUE(stored.has_value()) << "the first read under the new epoch seals the old one";
+    const RefLogTxn tombstone = decodeRefLogTxn(openObject(FormatId::RefLog, stored->bytes), ns.string(), RefTxnId{epoch, 2});
+    EXPECT_TRUE(refLogTxnIsEpochSeal(tombstone));
+    EXPECT_EQ(tombstone.next_epoch, std::optional<uint64_t>{remount_epoch});
+}
+
 TEST(CASPool, OpenPublishesTheClaimsMarkerWithTheEpoch)
 {
     auto backend = std::make_shared<InMemoryBackend>();

@@ -277,13 +277,17 @@ struct PoolConfig
     /// That poll is now the ONLY wait either path can block on. The post-reclaim materialization grace
     /// (`T_mat`) that used to sit beside it is gone: it existed so a straggler conditional `PUT` from a
     /// dying epoch would land (or exhaust its retries) before the successor started trusting its recovery
-    /// LISTINGS, and recovery does not trust listings any more -- it walks the chain and closes it, when
-    /// it ends below the live epoch, with a tombstone in the slot after its last record, written as a
-    /// conditional create. The straggler's own conditional create then LOSES against that occupied slot, whenever it
-    /// arrives. Waiting for a race that the protocol already decides is not caution, it is latency.
+    /// LISTINGS, and recovery does not trust listings any more -- it walks the chain and, when it ends in
+    /// an epoch that may have ended uncleanly (`last_unclean_epoch`), closes it with a tombstone in the slot
+    /// after its last record, written as a conditional create. The straggler's own conditional create then
+    /// LOSES against that occupied slot, whenever it arrives; after a clean end nothing is in flight. Waiting
+    /// for a race that the protocol already decides is not caution, it is latency.
     std::function<void(uint64_t)> wait_sleep_fn = {};   /// test hook for open/remount waits
     RuntimeWorkerFactory worker_factory = {};           /// internal test seam; never parsed from disk config
     std::function<void()> remount_quiesce_hook_for_test = {};
+    /// Test hook: a self-remount runs it right after it publishes the new live epoch and before it
+    /// cancels recoveries and detaches the cached tables.
+    std::function<void()> remount_epoch_published_hook_for_test = {};
 
     /// a table becomes a publish candidate once its retained
     /// tail -- every applied txn strictly above the newest published snapshot, no age filter -- exceeds

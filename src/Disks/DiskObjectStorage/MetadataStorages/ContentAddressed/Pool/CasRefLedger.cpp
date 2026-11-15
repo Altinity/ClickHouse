@@ -168,21 +168,33 @@ RefLogTxn makeEpochTombstoneTxn(const RootNamespace & ns, const RefTxnId & id, u
 /// normalises every malformed-input class to `CORRUPTED_DATA` and passes `UNKNOWN_FORMAT_VERSION`
 /// through (an object this build cannot read is still not a seal it can consume). Everything else
 /// propagates, leaving the caller's lane exactly as it was.
-Occupant classifyRefLogOccupant(const RootNamespace & ns, const RefTxnId & id, const String & occupant_bytes,
-                                const String & expected_bytes)
+struct ClassifiedOccupant
+{
+    Occupant kind;
+    /// Engaged iff `kind` is `SuccessorSeal`: the epoch the tombstone names.
+    std::optional<RefEpochTransition> transition;
+    /// False iff the occupant is not a well-formed transaction of this namespace at this id.
+    bool decoded = true;
+};
+
+ClassifiedOccupant classifyRefLogOccupant(const RootNamespace & ns, const RefTxnId & id, const String & occupant_bytes,
+                                          const String & expected_bytes)
 {
     if (occupant_bytes == expected_bytes)
-        return Occupant::Ours;
+        return {Occupant::Ours, std::nullopt, true};
     try
     {
-        return refLogTxnIsEpochSeal(decodeRefLogTxn(openObject(FormatId::RefLog, occupant_bytes), ns.string(), id))
-            ? Occupant::SuccessorSeal : Occupant::Foreign;
+        const RefLogTxn occupant = decodeRefLogTxn(openObject(FormatId::RefLog, occupant_bytes), ns.string(), id);
+        std::optional<RefEpochTransition> transition = refEpochTransitionOf(occupant);
+        if (transition)
+            return {Occupant::SuccessorSeal, transition, true};
+        return {Occupant::Foreign, std::nullopt, true};
     }
     catch (const Exception & e)
     {
         if (e.code() != ErrorCodes::CORRUPTED_DATA && e.code() != ErrorCodes::UNKNOWN_FORMAT_VERSION)
             throw;
-        return Occupant::Foreign;
+        return {Occupant::Foreign, std::nullopt, false};
     }
 }
 
@@ -226,6 +238,7 @@ CasRefLedger::CasRefLedger(
     CasRequestBudget cas_request_budget_,
     String server_root_id_,
     std::function<uint64_t()> live_epoch_fn_,
+    std::function<LiveEpochPair()> live_epoch_pair_fn_,
     std::function<bool()> fence_ok_fn_,
     std::function<uint64_t()> fence_generation_fn_,
     std::function<uint64_t()> boot_ms_now_fn_,
@@ -242,6 +255,7 @@ CasRefLedger::CasRefLedger(
     , cas_request_budget(cas_request_budget_)
     , server_root_id(std::move(server_root_id_))
     , live_epoch_fn(std::move(live_epoch_fn_))
+    , live_epoch_pair_fn(std::move(live_epoch_pair_fn_))
     , fence_ok_fn(std::move(fence_ok_fn_))
     , fence_generation_fn(std::move(fence_generation_fn_))
     , boot_ms_now_fn(std::move(boot_ms_now_fn_))
@@ -926,7 +940,7 @@ void CasRefLedger::checkRecoveryStillAdmitted(const RootNamespace & ns, RefTable
 }
 
 std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
-    const RootNamespace & ns, RefTableRuntime & rt, uint64_t admitted_generation, uint64_t live_epoch,
+    const RootNamespace & ns, RefTableRuntime & rt, uint64_t admitted_generation, const LiveEpochPair & live,
     const std::optional<RefAppendAttempt> & retained_attempt, std::optional<String> & hole_detail,
     bool & cancelled, const std::optional<DetachedStopToken> & token)
 {
@@ -1032,7 +1046,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
             /// writer never created. A successor's tombstone is the conclusive loss case: it is
             /// replayed as the durable record.
             chassert(stored);
-            if (classifyRefLogOccupant(ns, id, *stored, retained_attempt->bytes) == Occupant::Foreign)
+            if (classifyRefLogOccupant(ns, id, *stored, retained_attempt->bytes).kind == Occupant::Foreign)
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
                     "CAS ref-table recovery for namespace '{}': a DIFFERENT object occupies retained "
                     "writer txn {}-{}; recovery must not install it as that writer's history",
@@ -1092,11 +1106,13 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
             }
         }
 
-        if (chain_epoch >= live_epoch)
+        /// Only an epoch that may have ended with a request in flight is sealed here: after a clean end no
+        /// late create of that epoch can arrive, and the lane writes the tombstone before its first append.
+        if (chain_epoch >= live.writer_epoch || chain_epoch > live.last_unclean_epoch)
             break;
 
-        /// The chain ends in an earlier epoch: close it with a tombstone naming the live epoch, so a late
-        /// create of that epoch meets the tombstone at its slot. A generation 3 `_ckpt` precedes it.
+        /// Close the chain with a tombstone naming the live epoch, so a late create of the chain's epoch
+        /// meets the tombstone at its slot. A generation 3 `_ckpt` precedes it.
         if (accepted.ckpt.generation < G_REF_CHAIN)
         {
             checkRecoveryStillAdmitted(ns, rt, cancelled, token);
@@ -1120,7 +1136,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
 
         /// Everything that can throw is prepared BEFORE the conditional create, so a failure here
         /// happens while the slot is provably untouched.
-        RefLogTxn tombstone = makeEpochTombstoneTxn(ns, id, live_epoch, walk.open_transition);
+        RefLogTxn tombstone = makeEpochTombstoneTxn(ns, id, live.writer_epoch, walk.open_transition);
         validateEpochSealGrammarContextual(tombstone, life_epoch);
         const String tombstone_bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(tombstone));
 
@@ -1421,10 +1437,10 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
     /// Preserve this runtime's exact writer identity across the unlocked walk. The runtime stays in
     /// `NeedsRecovery` until the same lock installs a result, so no later append can replace it here.
     const std::optional<RefAppendAttempt> retained_attempt = rt.append_attempt;
-    /// The live writer epoch, likewise captured once: it decides whether the chain ends in an earlier
-    /// epoch and so whether the walk writes a tombstone. Re-reading it mid-walk would let the boundary
-    /// move under the decision.
-    const uint64_t live_epoch = live_epoch_fn();
+    /// The live writer epoch and its `last_unclean_epoch`, likewise captured once and as one pair: they
+    /// decide whether the walk writes a tombstone. Re-reading them mid-walk would let the boundary move
+    /// under the decision.
+    const LiveEpochPair live = live_epoch_pair_fn();
 
     /// Outer transient-retry loop (Layer 1 of the stuck-table-load fix): a whole recovery attempt that
     /// fails with a TRANSIENT object-store transport error (`isTransientRecoveryError` -- `S3_ERROR`/
@@ -1478,7 +1494,7 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
                 try
                 {
                     walked = runRecoveryWalkOnce(
-                        ns, rt, admitted_generation, live_epoch, retained_attempt, hole_detail, cancelled, token);
+                        ns, rt, admitted_generation, live, retained_attempt, hole_detail, cancelled, token);
                     /// The admission's catalog read precedes the walk, and another server's GC may have
                     /// erased the life and deleted its objects under it.
                     if (walked)
@@ -1527,7 +1543,7 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
                 /// field from the result and sets `recovered` LAST, so no waiter (woken only by the
                 /// function-scope SCOPE_EXIT's `recovery_cv` notify, which runs after this returns) ever
                 /// observes a partially-installed table.
-                installRecoveryResult(rt, std::move(*walked), live_epoch);
+                installRecoveryResult(rt, std::move(*walked), live.writer_epoch);
                 recovery_install_count_for_test.fetch_add(1, std::memory_order_relaxed);
                 break;
             }
@@ -2233,6 +2249,28 @@ void CasRefLedger::completeOwnedItemsAndReleaseLeadership(
     rt->cv.notify_all();
 }
 
+void CasRefLedger::requireRecoveryForTakenTombstoneSlot(
+    RefTableRuntime & rt, const RootNamespace & ns, const RefTxnId & id) noexcept
+{
+    const bool entering = rt.lane_state != RefLaneState::NeedsRecovery;
+    rt.lane_state = RefLaneState::NeedsRecovery;
+    if (!entering)
+        return;
+    ProfileEvents::increment(ProfileEvents::CASRefNeedsRecovery);
+    try
+    {
+        LOG_WARNING(getLogger("CasPool"),
+            "CAS ref table '{}' NEEDS RECOVERY: another record holds slot {}-{} of this lane's tombstone, so the "
+            "tombstone did not land. New writes, snapshots, and confirmations are fenced until recovery adopts "
+            "that record.",
+            ns.string(), id.writer_epoch, id.ref_sequence);
+    }
+    catch (...)   // NOLINT(bugprone-empty-catch)
+    {
+        /// The state transition above is the safety mechanism; logging must not replace it.
+    }
+}
+
 void CasRefLedger::requireRecovery(RefTableRuntime & rt, const RootNamespace & ns, std::string_view region) noexcept
 {
     const bool entering = rt.lane_state != RefLaneState::NeedsRecovery;
@@ -2273,6 +2311,7 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
         RefusedPreAttempt,      /// the bounded attempt sent nothing
         ResolveFoundNothing,    /// it sent an attempt and the follow-up read came up empty
         StaleState,             /// the table advanced under a proven-durable object we cannot install
+        TombstoneSlotTaken,     /// another record holds the wedged tombstone's slot; recovery adopts it
     };
     Reason reason = Reason::None;
     std::optional<RefLaneState> invalid_lane_state;
@@ -2331,6 +2370,9 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
     const RefLogTxn wedged_txn = decodeRefLogTxn(
         openObject(FormatId::RefLog, wedge.bytes), ns.string(), wedge.txn_id);
     applyRefLogTxn(*candidate, wedged_txn);
+    /// A lane tombstone, as opposed to an ordinary append: it loses its slot conclusively only to a
+    /// tombstone naming a later epoch, and any other record there is history recovery adopts.
+    const std::optional<RefEpochTransition> wedged_transition = refEpochTransitionOf(wedged_txn);
 
     /// ---- ONE bounded attempt, admitted under the wedge's ORIGINAL generation ----
     /// Never the CURRENT generation: a retry that "passes" because the mount was re-armed under a new
@@ -2392,11 +2434,11 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
     /// A conflict whose settling read observed nothing is as unresolved as a give-up: the key holds
     /// something this call could not name, so nothing may be adopted or unwedged from it.
     const bool unresolved = gave_up || (conflict && !occupant_object);
-    const Occupant occupant = occupant_object
+    const ClassifiedOccupant occupant = occupant_object
         ? classifyRefLogOccupant(ns, wedge.txn_id, occupant_object->bytes, wedge.bytes)
-        : Occupant::NotOccupied;
+        : ClassifiedOccupant{Occupant::NotOccupied, std::nullopt};
     const bool exact_attempt_is_durable
-        = std::holds_alternative<Committed>(*attempted) || occupant == Occupant::Ours;
+        = std::holds_alternative<Committed>(*attempted) || occupant.kind == Occupant::Ours;
     /// Caller holds `state_mutex`. Keeping the identity predicate in one place is part of the safety
     /// rule: there must be one notion of "same attempt".
     const auto same_wedge_under_lock = [&]
@@ -2408,8 +2450,13 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
             && rt->append_attempt->admitted_fence_generation == wedge.admitted_fence_generation;
     };
 
-    /// A successor's tombstone at our key is conclusive evidence that OUR transaction did not land.
-    const bool closed_by_successor_seal = occupant == Occupant::SuccessorSeal;
+    /// A successor's tombstone at our key is conclusive evidence that OUR transaction did not land. For a
+    /// wedged tombstone only one naming a later epoch than ours is: this writer is then deposed.
+    const bool closed_by_successor_seal = occupant.kind == Occupant::SuccessorSeal
+        && (!wedged_transition || occupant.transition->next_epoch > wedged_transition->next_epoch);
+    /// An occupant that does not decode is no record recovery could adopt; it takes the `Foreign` arm.
+    const bool tombstone_slot_taken = wedged_transition && occupant_object && occupant.decoded
+        && !exact_attempt_is_durable && !closed_by_successor_seal;
 
     /// ---- POST-I/O RECHECK, then act, in ONE hold of `state_mutex` ----
     /// Everything above ran on an I/O result that took an unbounded amount of time to come back. Before
@@ -2477,7 +2524,17 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
             rt->lane_state = RefLaneState::Closed;
             result.kind = WedgeResolution::Rejected;
         }
-        else if (occupant == Occupant::Foreign)
+        else if (tombstone_slot_taken)
+        {
+            /// A late record of the chain's epoch, or an earlier build's recovery tombstone. The attempt is
+            /// cleared so recovery does not adjudicate it as this writer's retained bytes; its walk adopts
+            /// the occupant and the next flush writes the tombstone after it.
+            rt->append_attempt.reset();
+            requireRecoveryForTakenTombstoneSlot(*rt, ns, wedge.txn_id);
+            reason = Reason::TombstoneSlotTaken;
+            result.kind = WedgeResolution::StillWedged;
+        }
+        else if (occupant.kind == Occupant::Foreign)
         {
             /// Impossible under mount-lease exclusivity. The terminal state carries the verdict; no
             /// uncertain attempt remains to be retried.
@@ -2583,12 +2640,13 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
             ProfileEvents::increment(ProfileEvents::CASRefAppendUnwedged);
             break;
         case WedgeResolution::Rejected:
+            /// A wedged tombstone sits in the chain epoch's slot and names this mount's epoch.
             result.survivor_error = std::make_exception_ptr(Exception(ErrorCodes::INVALID_STATE,
                 "CAS ref-log append for namespace '{}': writer epoch {} was CLOSED by a successor's epoch "
                 "seal at {}-{}, which conclusively rejects the wedged transaction (it was never "
                 "acknowledged): nothing is durable, so a retry cannot duplicate this transaction. This mount's "
                 "append lane resumes only under a later epoch",
-                ns.string(), wedge.txn_id.writer_epoch,
+                ns.string(), wedged_transition ? wedged_transition->next_epoch : wedge.txn_id.writer_epoch,
                 wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence));
             break;
         case WedgeResolution::Corrupted:
@@ -2669,14 +2727,22 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
                         "replay re-derives the cache from the durable log",
                         ns.string(), txn);
                     break;
+                case Reason::TombstoneSlotTaken:
+                    why = fmt::format(
+                        "CAS ref-log append for namespace '{}': the slot of wedged tombstone {} holds another "
+                        "record, so the tombstone did not land; the lane NEEDS RECOVERY, which adopts that "
+                        "record, and this write was not attempted",
+                        ns.string(), txn);
+                    break;
                 case Reason::None:
                     why = fmt::format("CAS ref-log append for namespace '{}': txn {} stays wedged",
                                       ns.string(), txn);
                     break;
             }
-            why += reason == Reason::StaleState
-                ? fmt::format("; wedged txn {} is durable but was not acknowledged: {}", txn, durable_unconfirmed_tail)
-                : fmt::format("; wedged txn {} outcome is unknown: {}", txn, outcome_unknown_tail);
+            if (reason == Reason::StaleState)
+                why += fmt::format("; wedged txn {} is durable but was not acknowledged: {}", txn, durable_unconfirmed_tail);
+            else if (reason != Reason::TombstoneSlotTaken)
+                why += fmt::format("; wedged txn {} outcome is unknown: {}", txn, outcome_unknown_tail);
             result.survivor_error = makeCasWriteRetryLaterExceptionPtr(why);
             break;
         }
@@ -2709,6 +2775,355 @@ const String * refNamedOutsideScope(const RefOp & op, const MutationScope & scop
         return &op.ref_name;
     return nullptr;
 }
+}
+
+bool CasRefLedger::ensureEpochOpenForAppend(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
+                                            std::vector<std::shared_ptr<RefMutationItem>> & owned_items)
+{
+    const auto fail_pending = [&](std::exception_ptr e)
+    {
+        std::lock_guard<std::mutex> g(ref_queue_mutex);
+        owned_items.reserve(owned_items.size() + rt->pending.size());
+        for (const auto & item : rt->pending)
+        {
+            item->error = e;
+            item->done = true;
+            owned_items.push_back(item);
+        }
+        rt->pending.clear();
+        rt->cv.notify_all();
+    };
+    const auto runtime_live = [&rt]
+    {
+        return !rt->catalog_life_invalidated.load(std::memory_order_acquire)
+            && !rt->superseded_by_remount.load(std::memory_order_acquire);
+    };
+
+    /// The epoch first, then the flags: a self-remount publishes the new epoch before it detaches this
+    /// runtime, so only the checks after the read keep a detached runtime from naming the new epoch.
+    const uint64_t live_epoch = live_epoch_fn();
+    if (!may_mutate())
+    {
+        fail_pending(makeCasWriteRetryLaterExceptionPtr(fmt::format(
+            "CAS mount lost / lease expired — refusing to append ref-log transactions for server_root '{}'",
+            config.server_root_id)));
+        return false;
+    }
+    if (rt->superseded_by_remount.load(std::memory_order_acquire))
+    {
+        fail_pending(makeCasWriteRetryLaterExceptionPtr(fmt::format(
+            "CAS ref-log append for server_root '{}': this cached table was superseded by a self-remount — "
+            "retry against the fresh mount incarnation",
+            config.server_root_id)));
+        return false;
+    }
+
+    bool terminal = false;
+    uint64_t chain_epoch = 0;
+    bool stamped = false;
+    {
+        std::lock_guard lock(rt->state_mutex);
+        terminal = rt->state.isTerminal();
+        chain_epoch = rt->state.chainEpoch(*rt->accepted_ckpt->ckpt.life_epoch);
+        stamped = rt->accepted_ckpt->ckpt.generation >= G_REF_CHAIN;
+    }
+    if (terminal || chain_epoch == live_epoch)
+        return true;
+
+    if (chain_epoch > live_epoch)
+    {
+        /// A successor's tombstone already named a later epoch: this mount is deposed. Permanent, because no
+        /// later attempt in this epoch can succeed.
+        {
+            std::lock_guard lock(rt->state_mutex);
+            rt->lane_state = RefLaneState::Closed;
+        }
+        ProfileEvents::increment(ProfileEvents::CASRefAppendSealRejected);
+        fail_pending(std::make_exception_ptr(Exception(ErrorCodes::INVALID_STATE,
+            "CAS ref-log append for namespace '{}': writer epoch {} was CLOSED by a successor's tombstone "
+            "naming epoch {}; nothing was sent. This mount's append lane resumes only under a later epoch",
+            ns.string(), live_epoch, chain_epoch)));
+        return false;
+    }
+
+    /// The chain ends in an earlier epoch. This tombstone needs no `_ckpt` re-read: recovery seals before
+    /// install every chain whose epoch may have a request in flight, so no mount of that epoch or of a later
+    /// one below the live epoch appends here, and cleanup deletes only what exists.
+    if (!stamped)
+    {
+        CasOperation stamp_op = mount_requests.resume(rt->admitted_fence_generation, runtime_live);
+        bool stamp_done = false;
+        try
+        {
+            stamp_done = stampBeforeFirstWrite(ns, *rt, stamp_op);
+        }
+        catch (...)
+        {
+            fail_pending(std::current_exception());
+            return false;
+        }
+        if (!stamp_done)
+        {
+            fail_pending(makeCasWriteRetryLaterExceptionPtr(fmt::format(
+                "CAS ref-log append for namespace '{}': the generation 3 stamp of its `_ckpt` met another "
+                "token or did not resolve; the lane needs recovery and nothing was appended", ns.string())));
+            return false;
+        }
+    }
+
+    /// Everything that can throw is prepared before the attempt is armed, so a throw leaves the slot
+    /// untouched; the install after the create then allocates nothing.
+    std::optional<RefTableState> candidate;
+    RefTxnId candidate_base_id;
+    RefAppendAttempt attempt;
+    try
+    {
+        uint64_t life_epoch = 0;
+        RefTxnId id;
+        std::optional<RefEpochTransition> open;
+        {
+            std::lock_guard lock(rt->state_mutex);
+            candidate.emplace(rt->state);
+            life_epoch = *rt->accepted_ckpt->ckpt.life_epoch;
+            id = allocateRefTxnId(*rt).id;
+            open = rt->state.getOpenTransition();
+        }
+        candidate_base_id = candidate->getGreatestApplied();
+        RefLogTxn tombstone = makeEpochTombstoneTxn(ns, id, live_epoch, open);
+        validateEpochSealGrammarContextual(tombstone, life_epoch);
+        applyRefLogTxn(*candidate, tombstone);
+        attempt.txn_id = id;
+        attempt.key = layout.refLogKey(rt->life, id);
+        attempt.admitted_fence_generation = rt->admitted_fence_generation;
+        attempt.bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(tombstone));
+    }
+    catch (...)
+    {
+        fail_pending(std::current_exception());
+        return false;
+    }
+    const RefTxnId id = attempt.txn_id;
+
+    bool armed = false;
+    {
+        std::lock_guard lock(rt->state_mutex);
+        if (rt->lane_state == RefLaneState::Ready && !rt->append_attempt
+            && rt->state.getGreatestApplied() == candidate_base_id)
+        {
+            rt->append_attempt = attempt;
+            rt->lane_state = RefLaneState::Writing;
+            armed = true;
+        }
+    }
+    if (!armed)
+    {
+        /// No lane transition: the lane is not what this attempt expected, so another append may own it.
+        fail_pending(std::make_exception_ptr(Exception(ErrorCodes::LOGICAL_ERROR,
+            "CAS ref-log append for namespace '{}': lane changed before tombstone {}-{} could be armed",
+            ns.string(), id.writer_epoch, id.ref_sequence)));
+        return false;
+    }
+
+    /// Caller holds `state_mutex`.
+    const auto attempt_is_installed = [&]
+    {
+        return rt->append_attempt && rt->append_attempt->txn_id == id && rt->append_attempt->bytes == attempt.bytes;
+    };
+    const auto wedge = [&](const String & cause)
+    {
+        {
+            std::lock_guard lock(rt->state_mutex);
+            if (rt->lane_state == RefLaneState::Writing && attempt_is_installed())
+                rt->lane_state = RefLaneState::Wedged;
+        }
+        ProfileEvents::increment(ProfileEvents::CASRefAppendWedged);
+        fail_pending(makeCasWriteRetryLaterExceptionPtr(fmt::format(
+            "CAS ref-log tombstone {}-{} for namespace '{}' outcome is unknown ({}); the append lane is wedged "
+            "until the same key resolves, and this write was not attempted",
+            id.writer_epoch, id.ref_sequence, ns.string(), cause)));
+    };
+    const auto release_unsent = [&](const String & cause)
+    {
+        {
+            std::lock_guard lock(rt->state_mutex);
+            if (rt->lane_state == RefLaneState::Writing && attempt_is_installed())
+            {
+                rt->append_attempt.reset();
+                rt->lane_state = RefLaneState::Ready;
+            }
+        }
+        fail_pending(makeCasWriteRetryLaterExceptionPtr(fmt::format(
+            "CAS ref-log tombstone {}-{} for namespace '{}' was not written ({}); nothing is durable and this "
+            "write was not attempted", id.writer_epoch, id.ref_sequence, ns.string(), cause)));
+    };
+
+    CasOperation op = mount_requests.resume(attempt.admitted_fence_generation, runtime_live);
+    std::optional<WriteResult> written;
+    try
+    {
+        written = op.create(attempt.key, attempt.bytes, Retry::standard());
+    }
+    catch (...)
+    {
+        wedge(getCurrentExceptionMessage(false, false, false, false));
+        return false;
+    }
+
+    if (const auto * conflict = std::get_if<Conflict>(&*written))
+    {
+        const auto * occupant_object = std::get_if<Object>(&conflict->seen);
+        std::optional<ClassifiedOccupant> occupant;
+        if (occupant_object)
+        {
+            try
+            {
+                occupant = classifyRefLogOccupant(ns, id, occupant_object->bytes, attempt.bytes);
+            }
+            catch (...)   // NOLINT(bugprone-empty-catch)
+            {
+                /// Left unclassified: an occupant this call cannot name is decided by a later read.
+            }
+        }
+        if (!occupant)
+        {
+            ProfileEvents::increment(ProfileEvents::CASRefAppendOccupantUnreadable);
+            wedge(fmt::format("the store refused the create and its occupant could not be named (observed {})",
+                detail::renderObservation(conflict->seen)));
+            return false;
+        }
+        if (occupant->kind == Occupant::SuccessorSeal && occupant->transition->next_epoch > live_epoch)
+        {
+            {
+                std::lock_guard lock(rt->state_mutex);
+                rt->append_attempt.reset();
+                rt->lane_state = RefLaneState::Closed;
+            }
+            ProfileEvents::increment(ProfileEvents::CASRefAppendSealRejected);
+            fail_pending(std::make_exception_ptr(Exception(ErrorCodes::INVALID_STATE,
+                "CAS ref-log append for namespace '{}': writer epoch {} was CLOSED by a successor's tombstone at "
+                "{}-{} naming epoch {}; nothing was sent. This mount's append lane resumes only under a later epoch",
+                ns.string(), live_epoch, id.writer_epoch, id.ref_sequence, occupant->transition->next_epoch)));
+            return false;
+        }
+        if (!occupant->decoded)
+        {
+            /// Not a record recovery could adopt: the anomaly policy, exactly as for an ordinary append.
+            {
+                std::lock_guard lock(rt->state_mutex);
+                rt->append_attempt.reset();
+                rt->lane_state = RefLaneState::Faulted;
+            }
+            const String interference_detail = fmt::format(
+                "ref-log tombstone for namespace '{}' txn {}-{} observed an object at its slot that is not a "
+                "ref-log transaction of this namespace at that id (observed {})",
+                ns.string(), id.writer_epoch, id.ref_sequence, detail::renderObservation(conflict->seen));
+            on_impossible_interference(attempt.key, interference_detail, ns.string());
+            fail_pending(std::make_exception_ptr(Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}", interference_detail)));
+            return false;
+        }
+        if (occupant->kind != Occupant::Ours)
+        {
+            /// A late record of the chain's epoch, or an earlier build's recovery tombstone. The attempt is
+            /// cleared so recovery does not adjudicate it as this writer's retained bytes; its walk adopts
+            /// the occupant and the next flush writes the tombstone after it.
+            {
+                std::lock_guard lock(rt->state_mutex);
+                if (attempt_is_installed())
+                    rt->append_attempt.reset();
+                requireRecoveryForTakenTombstoneSlot(*rt, ns, id);
+            }
+            fail_pending(makeCasWriteRetryLaterExceptionPtr(fmt::format(
+                "CAS ref-log append for namespace '{}': the slot of tombstone {}-{} holds another record; the "
+                "lane needs recovery, which adopts it, and this write was not attempted",
+                ns.string(), id.writer_epoch, id.ref_sequence)));
+            return false;
+        }
+    }
+    else if (const auto * refused = std::get_if<Refused>(&*written))
+    {
+        ProfileEvents::increment(ProfileEvents::CASRefAppendDefiniteFailure);
+        release_unsent(fmt::format("the store refused it: {}", refused->message));
+        return false;
+    }
+    else if (const auto * gave_up = std::get_if<GaveUp>(&*written))
+    {
+        if (!gave_up->sent_any)
+        {
+            ProfileEvents::increment(ProfileEvents::CASRefAppendPreAttemptRefused);
+            release_unsent("it was refused before any request was sent");
+            return false;
+        }
+        wedge(fmt::format("gave up after a request was sent, last observed {}",
+            detail::renderObservation(gave_up->last_seen)));
+        return false;
+    }
+
+    /// The tombstone is durable. It is history, so it is installed only if this admission still holds.
+    if (carve_hook_for_test)
+        carve_hook_for_test(CarvePhaseForTest::PostDurableTombstoneInstall);
+    std::optional<String> install_refusal;
+    {
+        std::lock_guard lock(rt->state_mutex);
+        try
+        {
+            refuseUnlessAdmitted(op, "ref-log tombstone install");
+        }
+        catch (...)
+        {
+            requireRecovery(*rt, ns, "post-create tombstone install admission");
+            install_refusal = getCurrentExceptionMessage(false, false, false, false);
+        }
+        if (!install_refusal)
+        {
+            const bool state_unchanged = rt->lane_state == RefLaneState::Writing && attempt_is_installed()
+                && rt->state.getGreatestApplied() == candidate_base_id;
+            if (!state_unchanged)
+            {
+                requireRecovery(*rt, ns, "lane tombstone install");
+                install_refusal = "the table changed before installation";
+            }
+            else
+            {
+                std::optional<RefAppendAttempt> completed_attempt;
+                try
+                {
+                    DENY_ALLOCATIONS_IN_SCOPE;
+                    rt->state.swap(*candidate);
+                    rt->tail_count_since_snapshot.fetch_add(1, std::memory_order_relaxed);
+                    rt->tail_bytes_since_snapshot.fetch_add(attempt.bytes.size(), std::memory_order_relaxed);
+                    rt->append_attempt.swap(completed_attempt);
+                    rt->lane_state = RefLaneState::Ready;
+                }
+                catch (...)
+                {
+                    requireRecovery(*rt, ns, "lane tombstone install");
+                    throw;
+                }
+                candidate.reset();
+                completed_attempt.reset();
+                try
+                {
+                    rt->state.materializeCommitted();
+                }
+                catch (...)
+                {
+                    tryLogCurrentException(getLogger("CasPool"), fmt::format(
+                        "CAS ref-log append for namespace '{}': tombstone {}-{} was installed, but the overlay fold "
+                        "failed and was retained coherently for the next flush",
+                        ns.string(), id.writer_epoch, id.ref_sequence));
+                }
+            }
+        }
+    }
+    if (install_refusal)
+    {
+        fail_pending(makeCasWriteRetryLaterExceptionPtr(fmt::format(
+            "CAS ref-log append for namespace '{}': tombstone {}-{} is durable but was not installed ({}); the lane "
+            "needs recovery, which replays it, and this write was not attempted",
+            ns.string(), id.writer_epoch, id.ref_sequence, *install_refusal)));
+        return false;
+    }
+    return true;
 }
 
 void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
@@ -2817,6 +3232,9 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
     if (ref_pre_carve_hook_for_test)
         ref_pre_carve_hook_for_test();
 
+    if (!ensureEpochOpenForAppend(ns, rt, owned_items))
+        return;
+
     /// Carve a compatible batch. `lifecycle != Live` forces a solo carve:
     /// `namespace_birth` must run alone, and the flush already KNOWS the table's current lifecycle
     /// before carving (unlike a per-item property, which would need speculative undo).
@@ -2850,42 +3268,6 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
             "before its batch was carved — retry against the fresh mount incarnation",
             config.server_root_id)));
         return;
-    }
-
-    /// The chain epoch against the live one, BEFORE any preview or request: every id below is in the
-    /// chain epoch, so a lane may build nothing unless the two are equal.
-    if (!working.isTerminal())
-    {
-        const uint64_t live_epoch = live_epoch_fn();
-        const uint64_t chain_epoch = working.chainEpoch(life_epoch);
-        if (chain_epoch > live_epoch)
-        {
-            /// A successor's tombstone already named a later epoch: this mount is deposed. Permanent, in the
-            /// class and words of the conflict arm, because no later attempt in this epoch can succeed.
-            {
-                std::lock_guard lock(rt->state_mutex);
-                rt->lane_state = RefLaneState::Closed;
-            }
-            complete_error(carve_all_pending(), std::make_exception_ptr(Exception(ErrorCodes::INVALID_STATE,
-                "CAS ref-log append for namespace '{}': writer epoch {} was CLOSED by a successor's tombstone "
-                "naming epoch {}; nothing was sent. This mount's append lane resumes only under a later epoch",
-                ns.string(), live_epoch, chain_epoch)));
-            ProfileEvents::increment(ProfileEvents::CASRefAppendSealRejected);
-            return;
-        }
-        if (chain_epoch < live_epoch)
-        {
-            /// The chain ends in an earlier epoch: recovery closes it with a tombstone before any append.
-            {
-                std::lock_guard lock(rt->state_mutex);
-                rt->lane_state = RefLaneState::NeedsRecovery;
-            }
-            complete_error(carve_all_pending(), makeCasWriteRetryLaterExceptionPtr(fmt::format(
-                "CAS ref-log append for namespace '{}': the chain ends in epoch {} below the live epoch {}; the "
-                "lane needs recovery before it appends, and nothing was sent",
-                ns.string(), chain_epoch, live_epoch)));
-            return;
-        }
     }
 
     /// Two-phase carve (spec §2). The old carve popped from `pending` while interleaving the allocating
@@ -3738,7 +4120,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         bool classified = false;
         try
         {
-            occupant = classifyRefLogOccupant(ns, id, occupant_object->bytes, active_attempt.bytes);
+            occupant = classifyRefLogOccupant(ns, id, occupant_object->bytes, active_attempt.bytes).kind;
             classified = true;
         }
         catch (...)   // NOLINT(bugprone-empty-catch)
@@ -4030,9 +4412,12 @@ bool CasRefLedger::hasStateBearingSnapshotCandidateUnderStateLock(const RefTable
 {
     /// The newest snapshot must be strictly older than the candidate. A tombstone advances epoch
     /// geometry but carries no table state, so a state that ends in one is never a snapshot candidate.
+    /// A chain in an earlier epoch is not this mount's to publish: the epoch that only reads leaves no object.
     return rt.state.getLifecycle() == RefLifecycle::Live
         && (!rt.newest_snapshot_id || *rt.newest_snapshot_id < rt.state.getGreatestApplied())
-        && !rt.state.getOpenTransition();
+        && !rt.state.getOpenTransition()
+        && rt.accepted_ckpt
+        && rt.state.chainEpoch(*rt.accepted_ckpt->ckpt.life_epoch) == live_epoch_fn();
 }
 
 bool CasRefLedger::admitSnapshotPublishUnderStateLock(RefTableRuntime & rt)

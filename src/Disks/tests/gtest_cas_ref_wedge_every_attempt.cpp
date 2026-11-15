@@ -1566,14 +1566,15 @@ TEST(CASRefWedgeEveryAttempt, WellFormedNonSealOccupantIsStillForeign)
     EXPECT_EQ(store->lastEpochSealForTest(ns), std::nullopt) << "and is emphatically not an epoch seal";
 }
 
-/// A lane whose chain ends below the live epoch builds nothing: its next id would be in the chain epoch,
-/// so it sends no request and leaves the tombstone to recovery.
-TEST(CASRefWedgeEveryAttempt, ChainEpochBelowTheLiveEpochSendsTheLaneToRecoveryWithoutARequest)
+/// A lane whose chain ends below the live epoch writes the tombstone naming the live epoch first, and its
+/// record goes to the live epoch with the backlink to that tombstone.
+TEST(CASRefWedgeEveryAttempt, ChainEpochBelowTheLiveEpochWritesTheLaneTombstoneBeforeTheRecord)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPool(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/live_epoch_seal"};
+    const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(ns);
     admitProperlyBornEntry(backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     publishEmptyPart(store, ns, "x");
 
@@ -1583,10 +1584,18 @@ TEST(CASRefWedgeEveryAttempt, ChainEpochBelowTheLiveEpochSendsTheLaneToRecoveryW
 
     const uint64_t remounts_before = store->scheduleRemountCallCountForTest();
     const uint64_t writes_before = backend->writeTotal();
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
-    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
-    EXPECT_EQ(backend->writeTotal(), writes_before) << "no request may be spent on a record of the wrong epoch";
-    EXPECT_FALSE(readObj(*backend, layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), RefTxnId{epoch + 1, 1})).has_value());
+    store->dropRef(ns, "x");
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
+    EXPECT_EQ(backend->writeTotal(), writes_before + 2) << "the tombstone and the record";
+    const auto tombstone = readObj(*backend, layout.refLogKey(life, RefTxnId{epoch, 3}));
+    ASSERT_TRUE(tombstone.has_value());
+    const RefLogTxn closing = decodeRefLogTxn(openObject(FormatId::RefLog, tombstone->bytes), ns.string(), RefTxnId{epoch, 3});
+    EXPECT_TRUE(refLogTxnIsEpochSeal(closing));
+    EXPECT_EQ(closing.next_epoch, std::optional<uint64_t>{epoch + 1});
+    const auto head = readObj(*backend, layout.refLogKey(life, RefTxnId{epoch + 1, 1}));
+    ASSERT_TRUE(head.has_value());
+    EXPECT_EQ(decodeRefLogTxn(openObject(FormatId::RefLog, head->bytes), ns.string(), RefTxnId{epoch + 1, 1}).prev_epoch_seal,
+              std::make_optional(RefTxnId{epoch, 3}));
     EXPECT_EQ(store->scheduleRemountCallCountForTest(), remounts_before);
 }
 
