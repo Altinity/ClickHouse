@@ -31,6 +31,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 /// Stage A task 6: recovery is `_ckpt` + an ARITHMETIC tail + a seal CAS-walk, and it installs nothing
@@ -355,6 +356,68 @@ public:
         }
         return result;
     }
+};
+
+/// Records `(method, key)` of every exact read, head, write and delete, in order. A write without a
+/// precondition is `PUT`, one with a precondition is `CAS`.
+class JournalingBackend : public HidingListBackend
+{
+public:
+    std::vector<std::pair<String, String>> journal() const
+    {
+        std::lock_guard lock(journal_mutex);
+        return entries;
+    }
+
+    void clearJournal()
+    {
+        std::lock_guard lock(journal_mutex);
+        entries.clear();
+    }
+
+    std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        record("GET", key);
+        return HidingListBackend::read(key, access);
+    }
+
+    std::optional<DB::Cas::Backend::RawMeta> head(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        record("HEAD", key);
+        return HidingListBackend::head(key, access);
+    }
+
+    std::expected<String, DB::Cas::Backend::RawConflict> write(
+        const String & key, const String & bytes, const std::optional<String> & expected_value,
+        DB::Cas::TransportAccess & access) override
+    {
+        record(expected_value ? "CAS" : "PUT", key);
+        return HidingListBackend::write(key, bytes, expected_value, access);
+    }
+
+    DB::Cas::Backend::RawRemoval remove(const String & key, const String & expected_value,
+                                        DB::Cas::TransportAccess & access) override
+    {
+        record("DELETE", key);
+        return HidingListBackend::remove(key, expected_value, access);
+    }
+
+    void removeManyWriteOnce(const std::vector<DB::Cas::WriteOnceKey> & keys, DB::Cas::TransportAccess & access) override
+    {
+        for (const DB::Cas::WriteOnceKey & key : keys)
+            record("DELETE", key.str());
+        HidingListBackend::removeManyWriteOnce(keys, access);
+    }
+
+private:
+    void record(const char * method, const String & key)
+    {
+        std::lock_guard lock(journal_mutex);
+        entries.emplace_back(method, key);
+    }
+
+    mutable std::mutex journal_mutex;
+    std::vector<std::pair<String, String>> entries;
 };
 
 
@@ -2194,3 +2257,69 @@ TEST(CASRefRecoveryCasWalk, RecoveryStartsAtRecreatedLifeGenesisAndLeavesPredece
 /// C++ virtual dispatch), not a claim any production change could falsify. `PutHookBackend` and
 /// `HidingListBackend` are still exercised together, on real recovery-walk scenarios, elsewhere in this
 /// file (search for `PutHookBackend>`).
+
+/// The request sequence of writer recovery over a frontier, one unfrontiered successor and two burned
+/// epochs: the successor's frontier publish, a numeric seal for each dead epoch and the final compare.
+TEST(CASRefRecoveryCasWalk, RecoveryRequestSequenceIsUnchangedByTheSharedWalk)
+{
+    auto backend = std::make_shared<JournalingBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/request_sequence"};
+
+    burnEpochsUpTo(backend, layout, /*target_live_epoch=*/4);
+    seedCkpt(*backend, layout, ns, lifeEpochCkpt(1, RefTxnId{1, 2}));
+    seedTxn(*backend, layout, ns, RefTxnId{1, 1}, "a", /*birth=*/true);
+    seedTxn(*backend, layout, ns, RefTxnId{1, 2}, "b", /*birth=*/false);
+    seedTxn(*backend, layout, ns, RefTxnId{1, 3}, "c", /*birth=*/false);
+
+    auto store = openWalkPool(backend);
+    ASSERT_TRUE(store);
+    ASSERT_EQ(store->liveWriterEpoch(), 4u);
+    const NamespaceLifeId life = catalogLife(backend, layout, ns);
+    const String log_key = layout.refLogKey(life, RefTxnId{1, 1});
+    const String stream_prefix = log_key.substr(0, log_key.find("_log/"));
+    const String ckpt_key = layout.refCkptKey(life);
+
+    backend->clearJournal();
+    EXPECT_EQ(store->listRefs(ns).size(), 3u);
+
+    std::vector<std::pair<String, String>> requests;
+    for (const auto & [method, key] : backend->journal())
+    {
+        if (key == ckpt_key)
+            requests.emplace_back(method, "_ckpt");
+        else if (key.starts_with(stream_prefix))
+            requests.emplace_back(method, key.substr(stream_prefix.size()));
+    }
+    const std::vector<std::pair<String, String>> expected{
+        {"GET", "_ckpt"},
+        {"GET", "_log/0000000000000001-0000000000000001.zst"},
+        {"GET", "_log/0000000000000001-0000000000000002.zst"},
+        {"GET", "_log/0000000000000001-0000000000000003.zst"},
+        {"GET", "_log/0000000000000001-0000000000000004.zst"},
+        {"GET", "_ckpt"},
+        {"CAS", "_ckpt"},
+        {"GET", "_ckpt"},
+        {"GET", "_log/0000000000000001-0000000000000004.zst"},
+        {"PUT", "_log/0000000000000001-0000000000000004.zst"},
+        {"GET", "_ckpt"},
+        {"CAS", "_ckpt"},
+        {"GET", "_ckpt"},
+        {"GET", "_log/0000000000000002-0000000000000001.zst"},
+        {"PUT", "_log/0000000000000002-0000000000000001.zst"},
+        {"GET", "_ckpt"},
+        {"CAS", "_ckpt"},
+        {"GET", "_ckpt"},
+        {"GET", "_log/0000000000000003-0000000000000001.zst"},
+        {"PUT", "_log/0000000000000003-0000000000000001.zst"},
+        {"GET", "_ckpt"},
+        {"CAS", "_ckpt"},
+        {"GET", "_ckpt"},
+        {"GET", "_log/0000000000000004-0000000000000001.zst"},
+        {"GET", "_ckpt"},
+        {"GET", "_ckpt"},
+        {"GET", "_ckpt"},
+    };
+    EXPECT_EQ(requests, expected);
+    EXPECT_EQ(store->refRecoveryRestartsForTest(ns), 0u);
+}

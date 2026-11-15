@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasKeyReader.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasCodecUtil.h>
@@ -202,6 +203,37 @@ Occupant classifyRefLogOccupant(const RootNamespace & ns, const RefTxnId & id, c
         return Occupant::Foreign;
     }
 }
+
+/// Reads like `InlineKeyReader` and keeps the bytes it read at one key: the retained-attempt check
+/// compares stored bytes, and a chain visitor receives only the decoded record.
+class CapturingKeyReader final : public KeyReader
+{
+public:
+    CapturingKeyReader(CasOperation & op_, std::optional<String> watched_key_)
+        : op(op_), watched_key(std::move(watched_key_))
+    {
+    }
+
+    void hint(const String &) override {}
+    std::optional<Object> take(const String & key) override
+    {
+        std::optional<Object> got = op.read(key, Retry::standard());
+        if (watched_key && key == *watched_key)
+            captured = got ? std::optional<String>(got->bytes) : std::nullopt;
+        return got;
+    }
+    void discard(const String &) override {}
+    size_t pending() const override { return 0; }
+    size_t window() const override { return 0; }
+
+    /// The bytes of the last read of the watched key; `nullopt` when it was absent or never read.
+    const std::optional<String> & capturedBytes() const { return captured; }
+
+private:
+    CasOperation & op;
+    const std::optional<String> watched_key;
+    std::optional<String> captured;
+};
 }
 
 CasRefLedger::CasRefLedger(
@@ -1062,139 +1094,143 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
 
     const std::optional<RefTxnId> sampled_frontier = grounding.committed_through;
 
-    /// ---- Steps 5 and 6: the arithmetic tail and the seal CAS-walk, as ONE loop ----
-    /// They are the same walk seen from two sides. Reading `{E, S}` and finding it present is the tail;
-    /// finding it ABSENT is a decision point: the live epoch's stream simply ends there, while a DEAD
-    /// epoch's must be closed at that exact slot before this table may be trusted. Writing them as one
-    /// loop is not brevity -- it is what makes "the seal goes where the ghost's PUT would have gone"
-    /// true by construction rather than by two functions agreeing on an index.
+    /// ---- Steps 5 and 6: the chain walk and the seal CAS-walk, as ONE loop ----
+    /// `walkRefChain` reads the durable tail. Where it ends at an absent key is a decision point: the live
+    /// epoch's stream simply ends there, while a DEAD epoch's must be closed at that exact slot before this
+    /// table may be trusted. Each decision resumes the walk from the next key, which is what makes "the
+    /// seal goes where the ghost's PUT would have gone" true by construction.
     if (walk_from)
     {
-        uint64_t epoch = walk_from->writer_epoch;
-        uint64_t sequence = walk_from->ref_sequence;
         size_t slot_attempts_this_epoch = 0;
+        bool restart_requested = false;
+        CapturingKeyReader reader(op, retained_attempt
+            ? std::optional<String>(layout.refLogKey(life, retained_attempt->txn_id)) : std::nullopt);
+
+        /// At or below the sampled frontier a record is replayed. Above it, it is the one unfrontiered
+        /// successor: replayed, proved to be alone, and frontiered; the walk then stops so that it resumes
+        /// under the checkpoint the publish accepted.
+        const RefChainVisitor visit = [&](RefLogTxn && txn, uint64_t stored_bytes)
+        {
+            const RefTxnId id = txn.txn_id;
+            /// `runRecoveryWalkOnce` is the writer recovery entry point even after a process
+            /// restart, when no in-memory attempt survives. A readable birth checkpoint with no
+            /// committed frontier makes its first `{epoch,1}` log the same one unfrontiered writer
+            /// successor as `F+1`; both are recovered from the exact checkpoint and stream alone.
+            const bool above_sampled_frontier = sampled_ckpt
+                && (!sampled_frontier || *sampled_frontier < id);
+            if (above_sampled_frontier && retained_attempt && retained_attempt->txn_id == id)
+            {
+                /// `NeedsRecovery` retains the writer's complete attempted bytes exactly for this
+                /// adjudication. A storage violation can replace a write-once log object between the
+                /// failed frontier publish and recovery; accepting another ordinary transaction here
+                /// would acknowledge history the admitted writer never created. A successor seal is
+                /// the one conclusive, already-defined loss case: it closes the old writer's epoch
+                /// and is replayed below as the durable stream record.
+                chassert(reader.capturedBytes());
+                const Occupant occupant = classifyRefLogOccupant(
+                    ns, id, *reader.capturedBytes(), retained_attempt->bytes);
+                if (occupant == Occupant::Foreign)
+                    throw Exception(ErrorCodes::CORRUPTED_DATA,
+                        "CAS ref-table recovery for namespace '{}': a DIFFERENT object occupies retained "
+                        "writer txn {}-{} above the exact checkpoint frontier; recovery must not publish "
+                        "or install it as that writer's history",
+                        ns.string(), id.writer_epoch, id.ref_sequence);
+            }
+            const bool is_seal = refLogTxnIsEpochSeal(txn);
+            if (is_seal)
+                slot_attempts_this_epoch = 0;
+            if (!above_sampled_frontier)
+            {
+                apply_one(std::move(txn), stored_bytes);
+                checkRecoveryStillAdmitted(ns, rt, cancelled, token);
+                return true;
+            }
+
+            const RefLogTxn frontier_txn = txn;
+            apply_one(std::move(txn), stored_bytes);
+            /// Before changing the sampled checkpoint, prove that this is the ONLY object above
+            /// it. The append lane cannot allocate a second unfrontiered id. If the checkpoint
+            /// moved while we inspected the second slot, restart from that exact newer cut;
+            /// otherwise two successors are durable corruption and F+1 must not be laundered
+            /// into the frontier first.
+            const RefTxnId following_id = is_seal
+                ? RefTxnId{id.writer_epoch + 1, 1}
+                : RefTxnId{id.writer_epoch, id.ref_sequence + 1};
+            checkRecoveryStillAdmitted(ns, rt, cancelled, token);
+            if (op.read(layout.refLogKey(life, following_id), Retry::standard()))
+            {
+                checkRecoveryStillAdmitted(ns, rt, cancelled, token);
+                const std::optional<CkptSample> current = readCkpt(op, layout, life);
+                if (!sampled_ckpt || !current || current->etag != sampled_ckpt->etag)
+                {
+                    restart_requested = true;
+                    return false;
+                }
+                const String frontier_description = sampled_frontier
+                    ? fmt::format("{}-{}", sampled_frontier->writer_epoch, sampled_frontier->ref_sequence)
+                    : "with only a life epoch";
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS ref-table recovery for namespace '{}': exact checkpoint {} "
+                    "had two durable successors through {}-{} while its incarnation remained "
+                    "unchanged; the append lane permits at most one unfrontiered transaction",
+                    ns.string(), frontier_description,
+                    following_id.writer_epoch, following_id.ref_sequence);
+            }
+
+            /// The sole successor is valid in the private candidate. Publish its frontier under
+            /// this recovery's current admission before exposing the candidate. Publishing F+1 makes
+            /// this transaction admitted history, not the end of the writer walk: a cold writer can
+            /// still be above this epoch and must seal its now-dead stream at the following slot.
+            if (!publish_recovered_frontier(frontier_txn))
+                restart_requested = true;
+            return false;
+        };
+
+        RefChainOrigin origin{
+            .first_key = *walk_from,
+            .open_transition = std::nullopt,
+            .ckpt_token = sampled_ckpt->etag,
+            .confirm_base_after_end = false,
+            .old_frontier = sampled_frontier};
+        /// Past the first walk every key lies above the sampled frontier, and a publish may have
+        /// replaced `_ckpt`, so the walk resumes under the sample accepted last.
+        const auto resume_at = [&](const RefTxnId & next, const std::optional<RefEpochTransition> & open)
+        {
+            origin = RefChainOrigin{
+                .first_key = next,
+                .open_transition = open,
+                .ckpt_token = accepted_ckpt_sample->etag,
+                .confirm_base_after_end = false,
+                .old_frontier = std::nullopt};
+        };
+        /// False when `txn` is terminal: no key follows it.
+        const auto resume_after = [&](const RefLogTxn & txn)
+        {
+            const std::optional<RefTxnId> next = refChainSuccessor(txn);
+            if (!next)
+                return false;
+            resume_at(*next, refEpochTransitionOf(txn));
+            return true;
+        };
 
         for (;;)
         {
             checkRecoveryStillAdmitted(ns, rt, cancelled, token);
-            const RefTxnId id{epoch, sequence};
-
-            if (const auto got = op.read(layout.refLogKey(life, id), Retry::standard()))
+            const RefChainWalk walk = walkRefChain(op, layout, life, origin, visit, &reader);
+            if (restart_requested || walk.end == RefChainEnd::BaseMoved)
+                return std::nullopt;
+            if (walk.end == RefChainEnd::Terminal)
+                break;
+            if (walk.end == RefChainEnd::Stopped)
             {
-                /// `runRecoveryWalkOnce` is the writer recovery entry point even after a process
-                /// restart, when no in-memory attempt survives. A readable birth checkpoint with no
-                /// committed frontier makes its first `{epoch,1}` log the same one unfrontiered writer
-                /// successor as `F+1`; both are recovered from the exact checkpoint and stream alone.
-                const bool above_sampled_frontier = sampled_ckpt
-                    && (!sampled_frontier || *sampled_frontier < id);
-                if (above_sampled_frontier && retained_attempt && retained_attempt->txn_id == id)
-                {
-                    /// `NeedsRecovery` retains the writer's complete attempted bytes exactly for this
-                    /// adjudication. A storage violation can replace a write-once log object between the
-                    /// failed frontier publish and recovery; accepting another ordinary transaction here
-                    /// would acknowledge history the admitted writer never created. A successor seal is
-                    /// the one conclusive, already-defined loss case: it closes the old writer's epoch
-                    /// and is replayed below as the durable stream record.
-                    const Occupant occupant = classifyRefLogOccupant(ns, id, got->bytes, retained_attempt->bytes);
-                    if (occupant == Occupant::Foreign)
-                        throw Exception(ErrorCodes::CORRUPTED_DATA,
-                            "CAS ref-table recovery for namespace '{}': a DIFFERENT object occupies retained "
-                            "writer txn {}-{} above the exact checkpoint frontier; recovery must not publish "
-                            "or install it as that writer's history",
-                            ns.string(), id.writer_epoch, id.ref_sequence);
-                }
-                RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id);
-                const bool is_seal = refLogTxnIsEpochSeal(txn);
-                const std::optional<RefTxnId> next_committed_id
-                    = sampled_frontier && id <= *sampled_frontier
-                    ? nextRefLogIdWithinCommittedFrontier(id, is_seal, *sampled_frontier)
-                    : std::nullopt;
-                const RefLogTxn frontier_txn = txn;
-                apply_one(std::move(txn), got->bytes.size());
-                if (above_sampled_frontier)
-                {
-                    /// Before changing the sampled checkpoint, prove that this is the ONLY object above
-                    /// it. The append lane cannot allocate a second unfrontiered id. If the checkpoint
-                    /// moved while we inspected the second slot, restart from that exact newer cut;
-                    /// otherwise two successors are durable corruption and F+1 must not be laundered
-                    /// into the frontier first.
-                    const RefTxnId following_id = is_seal
-                        ? RefTxnId{id.writer_epoch + 1, 1}
-                        : RefTxnId{id.writer_epoch, id.ref_sequence + 1};
-                    checkRecoveryStillAdmitted(ns, rt, cancelled, token);
-                    if (op.read(layout.refLogKey(life, following_id), Retry::standard()))
-                    {
-                        checkRecoveryStillAdmitted(ns, rt, cancelled, token);
-                        const std::optional<CkptSample> current = readCkpt(op, layout, life);
-                        if (!sampled_ckpt || !current || current->etag != sampled_ckpt->etag)
-                            return std::nullopt;
-                        const String frontier_description = sampled_frontier
-                            ? fmt::format("{}-{}", sampled_frontier->writer_epoch, sampled_frontier->ref_sequence)
-                            : "with only a life epoch";
-                        throw Exception(ErrorCodes::CORRUPTED_DATA,
-                            "CAS ref-table recovery for namespace '{}': exact checkpoint {} "
-                            "had two durable successors through {}-{} while its incarnation remained "
-                            "unchanged; the append lane permits at most one unfrontiered transaction",
-                            ns.string(), frontier_description,
-                            following_id.writer_epoch, following_id.ref_sequence);
-                    }
-
-                    /// The sole successor is valid in the private candidate. Publish its frontier under
-                    /// this recovery's current admission before exposing the candidate.
-                    if (!publish_recovered_frontier(frontier_txn))
-                        return std::nullopt;
-                    /// Publishing F+1 makes this transaction admitted history, not the end of the
-                    /// writer walk. A cold writer can still be above this epoch and must seal its
-                    /// now-dead stream at the following slot before the recovered table is installed.
-                    if (is_seal)
-                    {
-                        ++epoch;
-                        sequence = 1;
-                        slot_attempts_this_epoch = 0;
-                    }
-                    else
-                        ++sequence;
-                    continue;
-                }
-                if (next_committed_id)
-                {
-                    epoch = next_committed_id->writer_epoch;
-                    sequence = next_committed_id->ref_sequence;
-                    slot_attempts_this_epoch = 0;
-                }
-                else if (is_seal)
-                {
-                    /// This epoch is closed. Its stream cannot continue, so the next durable id of this
-                    /// namespace is sequence 1 of the next epoch -- including when that epoch is at or
-                    /// above our own live one, which is what a mount deposed by a higher-epoch successor
-                    /// sees. Reading on is honest (the transactions ARE this namespace's) and harmless:
-                    /// our own appends then collide with the seal and are conclusively rejected, which is
-                    /// exactly how INV-2 tells a deposed writer it has been deposed.
-                    ++epoch;
-                    sequence = 1;
-                    slot_attempts_this_epoch = 0;
-                }
-                else
-                    ++sequence;
+                resume_at(walk.next_key, walk.open_transition);
                 continue;
             }
 
             /// ---- Absent. Hole, end of the live stream, or a dead epoch to close ----
-            if (sampled_frontier && id <= *sampled_frontier)
-            {
-                /// This id belongs to the inclusive committed range. A 404 cannot shorten that range:
-                /// re-read the exact mutable checkpoint to distinguish a concurrent frontier movement
-                /// from durable-data loss under an unchanged authority token.
-                checkRecoveryStillAdmitted(ns, rt, cancelled, token);
-                const std::optional<CkptSample> current = readCkpt(op, layout, life);
-                if (!current || current->etag != sampled_ckpt->etag)
-                    return std::nullopt;
-                throw Exception(ErrorCodes::CORRUPTED_DATA,
-                    "CAS ref-table recovery for namespace '{}': committed log id {}-{} is absent while "
-                    "the exact checkpoint frontier {}-{} and its incarnation remain unchanged",
-                    ns.string(), id.writer_epoch, id.ref_sequence,
-                    sampled_frontier->writer_epoch, sampled_frontier->ref_sequence);
-            }
+            const RefTxnId id = walk.next_key;
+            const uint64_t epoch = id.writer_epoch;
+            const uint64_t sequence = id.ref_sequence;
 
             /// Only the exact checkpoint's recorded seal may witness a same-epoch hole. LIST log names
             /// are diagnostics only; an omitted or stale name cannot change a correctness verdict.
@@ -1235,9 +1271,8 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
             /// grammar forbids a `prev_epoch_seal`), not from a seal over the dead life.
             if (builder.lifecycle() != RefLifecycle::Live)
             {
-                ++epoch;
-                sequence = 1;
                 slot_attempts_this_epoch = 0;
+                resume_at(RefTxnId{epoch + 1, 1}, std::nullopt);
                 continue;
             }
 
@@ -1298,8 +1333,6 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
                     /// as good as ours -- adopt it and continue. Contesting a peer's CORRECT write is
                     /// how two recoverers of the same table turn a designed race into an incident.
                     ProfileEvents::increment(ProfileEvents::CASRefRecoveryEpochSealAdopted);
-                    ++epoch;
-                    sequence = 1;
                     slot_attempts_this_epoch = 0;
                 }
                 else
@@ -1310,8 +1343,9 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
                     /// writing past an occupied slot puts a hole in the durable stream that no later
                     /// reader can distinguish from a lost object.
                     ProfileEvents::increment(ProfileEvents::CASRefRecoveryStragglerAdopted);
-                    ++sequence;
                 }
+                if (!resume_after(frontier_txn))
+                    break;
                 continue;
             }
 
@@ -1344,9 +1378,9 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
             ProfileEvents::increment(ProfileEvents::CASRefRecoveryEpochSealed);
             if (!publish_recovered_frontier(seal_txn))
                 return std::nullopt;
-            ++epoch;
-            sequence = 1;
             slot_attempts_this_epoch = 0;
+            if (!resume_after(seal_txn))
+                break;
         }
     }
 
