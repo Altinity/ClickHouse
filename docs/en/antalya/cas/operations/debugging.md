@@ -202,10 +202,11 @@ Returns one row: `disk`, `reachable`, `dangling`, `unreachable`, `pending_gc`, `
 `referenced_logical_bytes`, `distinct_blobs`, `total_blob_refs`. `dangling` is the one column that
 means data loss — `unreachable`, `pending_gc`, and `awaiting_gc` are objects still
 moving through the normal condemn/graduate/delete pipeline, not a problem on their own.
-`chain_broken` and `corrupted_runs` are the other two hard findings: a hole in a ref-log stream and a
+`chain_broken` and `corrupted_runs` are the other two hard findings: a ref-log stream whose chain ends
+below a log that is listed above the end, or that holds a corrupt record or link (a corrupt snapshot base included) while `_ckpt` is unchanged, and a
 GC source-edge run that failed its checksum, respectively. `unchecked` means the scan could not prove or
 refute a finding, for example because the checkpoint changed during the scan; rerun `fsck` and treat only
-a repeat as a finding. An absent tail log is `chain_broken` only when `_ckpt` is unchanged. This summary-only form has
+a repeat as a finding. This summary-only form has
 no per-object `--detail` equivalent yet — for that, the offline `cas-fsck --detail` below is still
 needed.
 
@@ -304,8 +305,13 @@ decommissioning a pool member is a migration/scale-down operation, not an incide
 A delete request sent before a restart can still reach the object store later and remove a marker GC relies on,
 so a blob can be lost; nothing bounds when such requests stop. Entries the old version already scheduled for
 deletion are deleted by the upgraded GC without a fresh marker read. A downgrade within 26.6.x follows the same
-procedure; a pool whose reader floor was raised to 2 by a writable 26.8 mount cannot be downgraded (see
-[Upgrading a pool from 26.6.x](../configuration.md#upgrading-from-26-6)).
+procedure; a pool whose reader floor was raised to 2 or 3 by a writable 26.8 mount cannot be downgraded (see
+[Upgrading a pool from 26.6.x](../configuration.md#upgrading-from-26-6) and
+[Upgrading a pool to reader generation 3](/antalya/cas/operations/migration#upgrade-generation-3)).
+
+An older GC leader that is still mounted when a generation 3 mount stamps a namespace cannot read that
+namespace's `_ckpt`. It records the namespace as undecodable (the `checkpoint_undecodable` hold), folds
+nothing for it and suppresses every destructive step for the pool until it is stopped or upgraded.
 
 The decommission tool opens the pool with the server's CAS disk configuration and never admits a new
 `cas_blob_hash` into the pool: run it with the algorithm the pool already records.

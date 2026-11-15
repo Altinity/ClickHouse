@@ -84,13 +84,15 @@ live bucket from this codebase, it begins to bite at approximately one mutation 
 single key, and it does not participate in the auto-scaling above — splitting an index range cannot
 help a single name.
 
-That second limit is the one `CAS` meets first, because two of its objects are single fixed names
-written on a hot path:
+That second limit is the one `CAS` meets first, because two of its objects are single fixed names:
 
 | Object | One per | Written on |
 |---|---|---|
-| `cas/ns/state/<namespace>/_ckpt` | table | every durable ref-log transaction, plus namespace birth, epoch seal and snapshot |
 | `cas/ref_catalog` | pool | twice per `CREATE TABLE` and twice per `DROP TABLE` |
+| `cas/ns/state/<namespace>/_ckpt` | table | namespace creation, each snapshot publication, and once when a namespace first receives a generation 3 write (the upgrade stamp). No ref-log transaction writes it |
+
+A ref-log transaction is one create of its own key, `_log/<epoch>-<sequence>`, so a commit never repeats
+a write to a name. Only the catalog is written often enough to meet the per-name limit.
 
 Blob bodies and their metadata sidecars are named by content hash and are therefore spread the way
 Google's own guidance asks for: it recommends "completely random object names" for the best load
@@ -100,10 +102,9 @@ number of tables rather than sharing one index range.
 
 ### What this means for a deployment {#rate-consequences}
 
-- **A single table commits at about one transaction per second** on Google Cloud Storage. Inserts,
-  merges and mutations on that table queue behind the checkpoint write; they do not fail, but the
-  lane's throughput is capped and each flush's tail takes longer than it would on a store without
-  the per-name limit.
+- **A table's commit rate is not capped by the per-name limit.** Each transaction creates a new key,
+  so inserts, merges and mutations on one table do not queue behind a repeated write to one name.
+  Snapshot publication writes `_ckpt` once per snapshot.
 - **A pool performs about one table lifecycle transition per second.** Concurrent `CREATE TABLE` or
   `DROP TABLE` beyond that rate contends on the pool-wide catalog. Test suites that create hundreds
   of tables in parallel are the case that provokes this; ordinary production DDL is not.

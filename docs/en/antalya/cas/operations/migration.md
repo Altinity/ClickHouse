@@ -180,6 +180,58 @@ a pool that still has such a server must be upgraded in these steps:
 What happens without the pin, and the other upgrade notes, are in
 [upgrading to the 120 s lease](/antalya/cas/configuration#upgrading-lease-defaults).
 
+## Upgrading a pool to reader generation 3 {#upgrade-generation-3}
+
+The first writable mount of a build with the one-request ref append raises the pool's `min_reader_generation` to 3.
+The raise is one-way, there is no switch, and a pool at 3 cannot be downgraded. Stop every server of the pool
+that runs an older build, upgrade all of them, then start them.
+
+| Step | What happens |
+|---|---|
+| Floor raise | The first writable mount logs a WARNING: `min_reader_generation raised 1 -> 3; readers below generation 3 can no longer mount this pool` (`2 -> 3` on a pool already at 2). A mount with `readonly` set never raises it |
+| Namespace stamp | The first write into a namespace replaces its `_ckpt` with the generation 3 body, once, before the namespace's first tombstone or append. A namespace nothing writes to stays unstamped. A namespace created by this build is stamped at creation |
+| First append of an epoch | One extra `PUT`: the tombstone that links the previous epoch's chain to this one |
+| Steady state | A positive append costs 2 requests instead of 4, and a ref removal 1 instead of 3 |
+
+### What an older build sees {#upgrade-generation-3-older-builds}
+
+Generation 3 is the read ceiling of this build. 26.6.x builds have ceiling 1, and 26.8 builds without the
+one-request append have ceiling 2. The behavior of those builds below follows from their format gates.
+
+- **A server that mounts after the raise** fails to start the disk with `UNKNOWN_FORMAT_VERSION`:
+  `CAS pool meta: pool requires reader generation 3 but this build supports at most 2` (`at most 1` on 26.6.x).
+- **A server that stays up** cannot remount after a lost mount lease or a fence, and stays unmounted until it is
+  upgraded.
+- **An older GC leader that stays up** holds every stamped namespace and suppresses destructive GC steps; see
+  [Upgrading a pool with GC enabled](/antalya/cas/operations/debugging#upgrade-gc). Disable GC on older servers first.
+- **An older read-only view** keeps serving the table it already recovered.
+
+Mixed versions on one pool are not supported. Fetch-by-relink stays off between versions, as in
+[Upgrading a pool from 26.6.x](/antalya/cas/configuration#upgrading-from-26-6).
+
+### A slow store at the first mount {#upgrade-generation-3-slow-store}
+
+The pool-meta write of the raise runs after the mount claim, and the renewal-window check counts its time. The
+time is measured from the start of the renewer's first lease write, not from the start of the claim. The check
+passes while the elapsed time plus the renewal window stays under `cas_mount_lease_ttl_ms - cas_lease_safety_margin_ms`.
+
+- Attempt envelope = `cas_attempt_timeout_ms + 2 * cap`, where `cap` is the disk's `connect_timeout_ms`, limited to
+  `cas_attempt_timeout_ms`; a `connect_timeout_ms` of `0` means `cap = cas_attempt_timeout_ms`.
+- Renewal window = `cas_mount_renew_period_ms + 2 * envelope` on a server.
+
+| `connect_timeout_ms` of the disk | Envelope | Window | Time allowed from the renewer's first lease write to the check |
+|---|---|---|---|
+| `1000` (the S3 disk default) | 5 s + 2 * 1 s = 7 s | 10 s + 14 s = 24 s | 118 s - 24 s = 94 s |
+| `0`, or `5000` and above | 5 s + 2 * 5 s = 15 s | 10 s + 30 s = 40 s | 118 s - 40 s = 78 s |
+
+Both rows use the defaults: 120 s lease, 2 s safety margin, 10 s renewal period, 5 s attempt timeout.
+
+If the elapsed time is longer, the mount logs a WARNING (`the mount claim consumed the lease TTL (120000 ms) before the
+write fence could be armed; re-writing the lease first`), writes the lease once more and goes on. If that
+write fails, for example because the slot was taken in the meantime, the open fails closed and the next attempt
+follows the ordinary [mount claim rules](/antalya/cas/architecture/mounts-and-leases#claim-outcomes). The raise is
+already durable by then, so the next attempt has no raise to do.
+
 ## Removing a pool member {#decommission}
 
 A `CAS` pool can be shared by several servers (see [`server_root_id`](/antalya/cas/architecture/mounts-and-leases#server-root-id)).

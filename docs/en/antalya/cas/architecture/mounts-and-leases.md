@@ -275,6 +275,28 @@ start or a decommission of this `server_root_id` allocated after this one.
 | `UncleanObserved` | this claimant's own token-stability observation held for the full observation threshold (the longer of the two leases, plus drift and step) |
 | `UncleanUnsafe` | the operator's explicit `cas_unsafe_remount_no_delay` authorization carried the slot's exact token — not a certificate of death |
 
+## The last unclean epoch {#last-unclean-epoch}
+
+The mount lease body carries an optional `last_unclean_epoch`: the highest writer epoch below this
+holder's `writer_epoch` that may have ended without a clean farewell. The claim sets it from the
+predecessor's body, and every renewal, the farewell and a GC fence copy it.
+
+| Predecessor body | New `last_unclean_epoch` |
+|---|---|
+| Clean farewell that carries the field | the predecessor's value |
+| Clean farewell without the field (an older build) | the predecessor's `writer_epoch` |
+| `Fenced`, `UncleanObserved` or `UncleanUnsafe` | the predecessor's `writer_epoch` |
+| No slot | the claimer's epoch minus 1 |
+
+Ref-log recovery uses it to decide whether to write the [epoch tombstone](/antalya/cas/architecture/manifests-and-refs#epoch-tombstone)
+itself. If the last epoch that wrote to a namespace is at or below the value, recovery creates the
+tombstone before it installs the table. Above it, that epoch ended with a clean farewell and recovery
+writes nothing; the new writer's first append creates the tombstone.
+
+A clean farewell is written only after the ref lanes have drained and refuse new appends, so no append
+of the farewell's epoch is in flight. A forced exit writes no farewell, which is what makes the successor
+write the tombstone eagerly.
+
 ## Behavioral mount-slot model {#mount-state-machines}
 
 Two coupled state pictures. Neither is a literal source enum — the durable slot is derived from

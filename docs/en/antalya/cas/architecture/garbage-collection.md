@@ -306,15 +306,15 @@ Reads every new ref-log record of every walkable namespace and the manifests it 
 extracting blob source edges. Usually the dominant read phase on ref-log- and manifest-heavy rounds.
 
 - **Runs on:** fold path only
-- **Reads:** one `_ckpt` per namespace in the universe; `_log` records from each namespace's cursor
-  up to its committed ceiling; one manifest body per folded owner edge; extra `_log` reads when the
-  walk crosses an epoch seal
+- **Reads:** one `_ckpt` per namespace in the universe; `_log` records from the successor of each
+  namespace's cursor to the first absent key or a terminal record; one manifest body per folded owner
+  edge; extra `_log` reads to find the successor of a cursor this GC process does not remember
 - **Writes / deletes:** none (the successor seal's `cleanup_evidence` rows are written between this
   phase's timer and phase 9's)
 - **Safety:** per-namespace failures stay per-namespace — a *hold*, never a whole-round abort. A
-  concurrent writer appending mid-round changes nothing: the ceiling (`committed_through`) is
-  snapshotted once, so the round folds a fixed amount of work. Transactions apply atomically; the
-  durable cursor advances once per fully folded record.
+  concurrent writer appending mid-round changes nothing: the walk is cut at the first key it reads
+  absent, and nothing above that key is folded this round even if it lands later. Transactions apply
+  atomically; the durable cursor advances once per fully folded record.
 - **Fails the round if** (`CORRUPTED_DATA`): a manifest body whose ref / namespace disagrees with its
   key; a table with no sealed cursor whose baseline logs are already gone; a sealed cursor that does
   not close the run the walk produced; a `RemoveNamespace` for a namespace absent from the catalog
@@ -327,10 +327,20 @@ extracting blob source edges. Usually the dominant read phase on ref-log- and ma
 **The universe** is exactly the `Live` and `Removing` rows of the frozen catalog cut. A namespace
 the phase-4 hint omitted, with no carried hold and no `_ckpt`, is walked only while
 `gc_frontier_probe_budget` lasts; once spent, the rest ride their cursors verbatim and the round is
-suppressed. **The walk** starts at `cursor + 1` (or the checkpoint's genesis position) and stops at
-the committed ceiling; a namespace is *proven* only when it reaches the ceiling exactly. Any other
-exit — a hold, an unusable checkpoint, the probe budget — leaves it unproven, which feeds phase 9's
-gate.
+suppressed. **The walk** starts at the successor of the cursor (or at the namespace's first key,
+`{life_epoch, 1}`, when nothing is folded yet) and follows the chain by exact `GET`. A namespace is
+*proven* only when the walk reads an absent key or a terminal record. Any other exit — a hold, an
+unusable checkpoint, the probe budget, the time slice — leaves it unproven, which feeds phase 9's gate.
+
+**The time slice.** The ref intake of one round has a fixed slice of 60 s (`kRefIntakeBudgetMs`). Pass 1
+gives every namespace its start and one read window and is never cut, so every quiet namespace is proven.
+Pass 2 continues the unfinished walks from `round mod n` and starts no read after the slice ends. A
+namespace the slice cuts keeps the cursor it reached and is unproven: the round still folds and seals
+but suppresses every destructive step.
+
+**What a quiet namespace costs.** One `_ckpt` `GET` and one probe of the cursor's successor, which is the
+proof that nothing was appended. When the GC process does not remember the cursor's successor, the cold
+path costs one more `GET`.
 
 **Read-ahead.** The checkpoint, walk-position, manifest-edge and (in phase 9) zero-candidate `HEAD`
 reads are hinted ahead onto a bounded pool (`cas_gc_io_concurrency`, default 16; `1` runs the reads inline) and
@@ -621,8 +631,9 @@ planned in phase 9 and adopted by phase 13's `CAS`.
   body sends no `DELETE`
 - **Safety:** phase 9 exact-read and identity-validated each candidate and computed its source-edge
   retirements; phase 13's `CAS` adopted both those retirements and the sweep cursor, so a post-`CAS`
-  body delete cannot orphan a still-reachable edge. A manifest is deletable only once its epoch's
-  closing seal is consumed and no tail record above the cursor names it; any uncertainty retains.
+  body delete cannot orphan a still-reachable edge. A manifest is deletable only once the sealed fold
+  cursor is in a strictly higher epoch than the manifest's build epoch and no tail record above the
+  cursor names it as a removal; any uncertainty retains.
 - **Fails the round if:** a `TokenMismatch` — an immutable manifest identity must never change token
   (illegal ABA); stricter than every other post-`CAS` delete (`CORRUPTED_DATA`)
 - **Observability:** phase row `orphan_sweep`; metrics `listed`, `floor_lookups` / `floor_reads`
@@ -650,23 +661,22 @@ and the `Finish` row of `system.cas_gc_log`. There are no per-anomaly rows.
 
 | Hold | Meaning | Effect |
 |---|---|---|
-| `gap_below_witness` | a committed record at or below the ceiling is missing | held |
-| `unconsumed_seal_crossing` | an apparent epoch crossing has no consumed `EpochSeal` behind it | held |
+| `gap_below_witness` | the next record on the chain is absent while a same-epoch witness at or above it exists: a listed log, a carried hold position, or the frontier of a generation 1 or 2 `_ckpt` | held |
+| `unconsumed_seal_crossing` | the chain ends below a later epoch's records, or the successor of the sealed cursor cannot be proved from the chain | held |
 | `witness_disappeared` | an epoch-crossing chase resolves back to the absent position | held |
 | `body_undecodable` | a ref-log record exists at the walk position but its body cannot be decoded | held at that position |
 | `manifest_body_missing` | a folded owner edge's manifest body is absent | held below that record; re-read next round |
 | `checkpoint_undecodable` | a live/removing life's `_ckpt` is undecodable, absent, or lacks `life_epoch` | folds nothing; held at `cursor + 1` when the life has a sealed cursor |
 
 **Per-round suppression signals** — not persisted; they force `suppress_destructive` for the
-round. `ref_folding_aborted` and `frontier_unprobed_budget` are `phase_metrics`; the three
-checkpoint states are counted only in the suppression log line's frontier-deficit breakdown:
+round. `ref_folding_aborted` and `frontier_unprobed_budget` are `phase_metrics`; the checkpoint and
+slice states are counted only in the suppression log line's frontier-deficit breakdown:
 
 | Signal | Phase | Meaning |
 |---|---|---|
 | `ref_folding_aborted` | 6 | a ref-object key under the stream prefix is unparseable: no ref delta, no cursor advance |
 | `CheckpointUnusable` | 8 | in-memory frontier state for a `_ckpt` that could not be used, recorded even when there is no cursor position to hold at |
-| `CheckpointFrontierEmpty` | 8 | a checkpoint carries no `committed_through` but the namespace has a nonzero sealed cursor: namespace unproven |
-| `CommittedBelowCursor` | 8 | the sealed cursor is already above the committed ceiling: namespace unproven |
+| `IntakeSliceCut` | 8 | the 60 s ref-intake slice ended before the namespace's walk reached an end: namespace unproven |
 | `frontier_unprobed_budget` | 8 | `gc_frontier_probe_budget` ran out before every hint-less namespace was walked |
 
 **Fatal pre-seal checks** — `CORRUPTED_DATA`, evaluated after phase 9 and before phase 10:
@@ -792,7 +802,7 @@ logs:
 | `LIST cas/ns/stream/` | 1 full enumeration |
 | `LIST gc/server-roots/` | 1, plus 1 `GET` per mount |
 | `GET` the adopted fold seal | 6 on the fold path of an established pool (phases 2, 4, 5, 7); phase 9 orphan planning adds one more. See [per-phase backend cost](#per-phase-cost) |
-| `GET` ref logs | 1 per new log record, plus `_ckpt` reads and epoch-crossing probes |
+| `GET` ref logs | 1 per new log record, one successor probe per walked namespace, plus `_ckpt` reads |
 | `GET` manifests | 1 per folded owner (manifest) edge — a manifest emits many blob edges but is read once per edge event; no manifest-body cache within a round |
 | `PUT` run segments | 1 per non-pure-carry shard, plus 1 fold seal |
 | `HEAD` blobs | 1 per newly condemned |
@@ -925,8 +935,8 @@ phase 9 runs orphan planning it reads the same key once more.
 | Key | Operation | Requests |
 |---|---|---:|
 | `<life_id>/_ckpt` | `GET` | one per namespace life in the universe |
-| `_log` record up to `committed_through` | `GET` | one per record read; none when the cursor already equals the ceiling |
-| `_log` record at an epoch start | `GET` | at least two per crossing, plus one per epoch stepped back and one on a failed crossing |
+| `_log` record from the cursor's successor | `GET` | one per record read, plus one absent probe per namespace that ends at an absent key |
+| `_log` record that resolves a cold cursor | `GET` | at least one more per namespace, only when the GC process does not remember the cursor's successor |
 | manifest body | `GET` | one per folded owner edge |
 
 No writes.
@@ -943,7 +953,7 @@ No writes.
 | manifest candidate body | `GET` | one per nominated candidate (≤ `cas_manifest_sweep_delete_budget_keys`), through the read-ahead; keys decided from their name alone are never read; only when orphan planning runs |
 | `gc/state`, adopted `fold_seal`, catalog | `GET` | one each, only when orphan planning runs |
 | `<server_root_id>/mount` | `GET` | one memoized mount-floor lookup per namespace per page (`floor_lookups` / `floor_reads`), only when orphan planning runs |
-| `_ckpt`, checkpoint-named `_log`, predecessor seal, `_snap`, committed-tail `_log` | `GET` | per namespace on the page (the recovery triple plus the tail), only when orphan planning runs |
+| `_ckpt`, the snapshot's same-id `_log`, the tombstone its backlink names, `_snap`, tail `_log` | `GET` | per namespace on the page (the recovery base plus the tail), only when orphan planning runs |
 
 Also schedules the async `.meta` condemn-marker writes drained by phase 12.
 

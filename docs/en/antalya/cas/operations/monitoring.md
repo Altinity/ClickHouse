@@ -39,12 +39,17 @@ every `CAS*` name, is on [Antalya profile events and metrics](/antalya/metrics-a
 | `CASBlobBodyPutAvoided` | Safe writer observations increment it when a physical body publication is avoided | Compare with query-attributed writer materialization tasks; the aggregate HEAD counters include unrelated callers |
 | `CASRefAppendWedged` | Zero | A ref-log append lane exhausted its retries after an uncertain `PUT`; ref-log progress on that namespace may be stalled |
 | `CASRefNeedsRecovery` | Zero | A ref-append lane could not install a known-durable transaction and now refuses writes, snapshots, and confirmation until durable replay completes |
-| `CASRefAppendSealRejected` | Occasional (a deposed writer losing a race is the protocol working); sustained growth is not | A writer keeps retrying after losing its mount and does not yet know it |
+| `CASRefAppendSealRejected` | Occasional (a deposed writer losing a race is the protocol working); sustained growth is not | A writer met a successor's tombstone in the slot it needed and was rejected; a lane that keeps counting is a writer that lost its mount and does not yet know it |
+| `CASRefRecoveryEpochSealed` | Follows unclean restarts | Recovery wrote a tombstone because the last epoch that wrote to the namespace may have ended without a clean farewell. After a clean farewell the first append of the new epoch writes the tombstone instead |
+| `CASRefCheckpointNotAdvanced` | Zero | A snapshot was published but its `_ckpt` could not be advanced (fenced out, refused, contended or failed); recovery keeps replaying from an older base. Ref-log appends never write `_ckpt` |
 | `CASGCHeartbeatFenceOuts` | Zero on a healthy pool | GC fenced an expired mount; check `system.cas_mounts` for a member that should have cleanly unmounted |
 | `CASGCUnmatchedRemoveDeltas` | Occasional (benign per-key no-op by design) | A persistent nonzero rate means removal deltas are reaching the reducer without their matching activation — a correctness signal worth a look, not an automatic false deletion |
 | `CASGCCondemnMarkerUnconfirmedCarry` | Zero | The graduation read found no `Condemned` marker at the entry's round or later (absent, `Clean`, older round, or unreadable); deletion is postponed and the marker is rewritten, but investigate repeated carries |
 | `CASGCMetaWriteAnomaly` | Zero | The bounded GC metadata pool failed an operation; backend or pool pressure may delay metadata convergence |
 | `CASRefRollbackBestEffortDropFailed` | Zero | A rollback cleanup drop hit a backend failure; refs may remain live and GC may be delayed on that namespace |
+
+`CASRefCheckpointPublished` and `CASRefCheckpointIdenticalSkip` count `_ckpt` writes by snapshot
+publication only.
 
 ### Mount renewal and remount counters {#mount-renewal-remount-counters}
 
