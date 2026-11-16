@@ -1,4 +1,5 @@
 #include <Common/Exception.h>
+#include <Common/checkStackSize.h>
 #include <Common/FieldVisitorDump.h>
 #include <Common/FieldVisitorToString.h>
 #include <Common/FieldVisitorWriteBinary.h>
@@ -386,6 +387,9 @@ static DecimalField<T> readDecimalFieldBinary(ReadBuffer & buf)
 
 Field getBinaryValue(UInt8 type, ReadBuffer & buf)
 {
+    /// Containers are read recursively, and the nesting depth comes from the data.
+    checkStackSize();
+
     switch (static_cast<Field::Types::Which>(type))
     {
         case Field::Types::Null:
