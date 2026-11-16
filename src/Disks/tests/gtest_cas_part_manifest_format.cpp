@@ -2,6 +2,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Common/Exception.h>
+#include <city.h>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -316,9 +318,7 @@ TEST(CASPartManifestFormat, MixedAlgoEntriesRoundTrip)
     EXPECT_EQ(got.entries[1].blob_size, 200u);
 }
 
-/// Builds a single-Blob-entry manifest whose entry path is exactly `path` -- `encodePartManifest`
-/// itself does not validate path shape (only ordering/duplicates), so this lets the negative cases
-/// below reach `decodePartManifest`'s shape check unobstructed.
+/// Builds a single-Blob-entry manifest whose entry path is exactly `path`.
 static PartManifest manifestWithSinglePath(std::string_view path)
 {
     PartManifest m;
@@ -336,17 +336,55 @@ static PartManifest manifestWithSinglePath(std::string_view path)
     return m;
 }
 
-/// T11: manifest bytes arrive over the interserver relink channel, so decode enforces the same path
-/// hygiene as CasLayout::checkNamespace -- relative, no empty/'.'/'..' segments, no leading '/'.
-/// `encodePartManifest` does not itself reject these (see `manifestWithSinglePath`), so each case
-/// must fail closed at decode time instead.
+/// Encodes `manifestWithSinglePath` with a legal placeholder path and `digest`, then splices `path` in.
+/// `path` must need no JSON escaping.
+static String encodeWithSplicedPath(std::string_view path, UInt128 digest)
+{
+    PartManifest m = manifestWithSinglePath("placeholder");
+    m.payload_digest = digest;
+    String text = encodePartManifest(m);
+    const String needle = R"("path":"placeholder")";
+    const size_t pos = text.find(needle);
+    if (pos == String::npos)
+        throw std::logic_error("encodeWithSplicedPath: placeholder path not found");
+    text.replace(pos, needle.size(), "\"path\":\"" + String(path) + "\"");
+    return text;
+}
+
+/// The bytes `manifestWithSinglePath(path)` encodes to, built without handing `path` to the encoder,
+/// which may refuse it. The digest is computed the way `computePayloadDigest` does it: CityHash128 of
+/// the encoding with a zero digest.
+static String forgeSinglePathManifest(std::string_view path)
+{
+    const String probe = encodeWithSplicedPath(path, UInt128{});
+    const auto h = CityHash_v1_0_2::CityHash128(probe.data(), probe.size());
+    return encodeWithSplicedPath(path, (static_cast<UInt128>(h.high64) << 64) | static_cast<UInt128>(h.low64));
+}
+
+/// Manifest bytes arrive over the interserver relink channel, so decode enforces the same path hygiene
+/// as `CasLayout::checkNamespace`: relative, no empty, `.` or `..` segment. The bytes are forged so that
+/// the decoder sees them whatever the encoder accepts, and the digest matches so that only the path
+/// check can refuse them.
 TEST(CASPartManifestFormat, DecodeRejectsMalformedEntryPaths)
 {
+    /// The forge itself is sound: with a legal path it reproduces the encoder's bytes, which decode.
+    EXPECT_EQ(forgeSinglePathManifest("proj.proj/data.bin"), encodePartManifest(manifestWithSinglePath("proj.proj/data.bin")));
+    EXPECT_EQ(decodePartManifest(forgeSinglePathManifest("proj.proj/data.bin")).entries.at(0).path, "proj.proj/data.bin");
+
     for (const char * path : {"../evil", "/abs", "", "a//b", "a/./b"})
     {
         SCOPED_TRACE(path);
-        const String encoded = encodePartManifest(manifestWithSinglePath(path));
-        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePartManifest(encoded); });
+        const String forged = forgeSinglePathManifest(path);
+        try
+        {
+            static_cast<void>(decodePartManifest(forged));
+            ADD_FAILURE() << "expected CORRUPTED_DATA";
+        }
+        catch (const DB::Exception & e)
+        {
+            EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+            EXPECT_NE(e.message().find("invalid entry path"), String::npos) << e.message();
+        }
     }
 }
 
