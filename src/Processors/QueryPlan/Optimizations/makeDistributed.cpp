@@ -809,16 +809,13 @@ void tryMakeDistributedRead(QueryPlan::Node & node, QueryPlan::Nodes & nodes, co
     }
     else if (read_from_object_storage_step)
     {
-#if CLICKHOUSE_CLOUD
         /// Check if table is big enough for distributed read
         /// TODO: implement better logic for choosing number of parallel readers
-        if (read_from_object_storage_step->totalRows() <= optimization_settings.distributed_plan_max_rows_to_broadcast)
+        const auto total_rows = read_from_object_storage_step->totalRows();
+        if (total_rows && *total_rows <= optimization_settings.distributed_plan_max_rows_to_broadcast)
             return;
 
         read_from_object_storage_step->setDistributedRead(bucket_count);
-#else
-        return;
-#endif
     }
 
     auto & new_read_node = nodes.emplace_back();
@@ -1199,11 +1196,9 @@ Strings makeListOfShardsForReadStep(const IQueryPlanStep * read_step)
     if (read_from_mt)
         return read_from_mt->getShardsForDistributedRead();
 
-#if CLICKHOUSE_CLOUD
     const auto * read_from_object_storage = dynamic_cast<const ReadFromObjectStorageStep *>(read_step);
     if (read_from_object_storage)
         return read_from_object_storage->getShardsForDistributedRead();
-#endif
 
     return {"0"};   /// One shard by default if read step is not distributed
 }
