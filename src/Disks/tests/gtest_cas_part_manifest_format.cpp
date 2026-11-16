@@ -343,8 +343,8 @@ static PartManifest manifestWithSinglePath(std::string_view path)
     return m;
 }
 
-/// Encodes `manifestWithSinglePath` with a legal placeholder path and `digest`, then splices `path` in.
-/// `path` must need no JSON escaping.
+/// Encodes `manifestWithSinglePath` with a legal placeholder path and `digest`, then splices `path` in
+/// raw, without JSON escaping.
 static String encodeWithSplicedPath(std::string_view path, UInt128 digest)
 {
     PartManifest m = manifestWithSinglePath("placeholder");
@@ -446,7 +446,8 @@ static String forgeSinglePathManifest(std::string_view path)
 TEST(CASPartManifestFormat, DecodeRejectsMalformedEntryPaths)
 {
     /// The forge itself is sound: with a legal path it reproduces the encoder's bytes, which decode.
-    EXPECT_EQ(forgeSinglePathManifest("proj.proj/data.bin"), encodePartManifest(manifestWithSinglePath("proj.proj/data.bin")));
+    EXPECT_EQ(forgeSinglePathManifest("proj.proj/data.bin"),
+        encodePartManifest(manifestWithSinglePath("proj.proj/data.bin")));
     EXPECT_EQ(decodePartManifest(forgeSinglePathManifest("proj.proj/data.bin")).entries.at(0).path, "proj.proj/data.bin");
 
     for (const char * path : {"../evil", "/abs", "", "a//b", "a/./b"})
@@ -480,6 +481,40 @@ TEST(CASPartManifestFormat, DecodeRejectsARecordLineOverTheLineCap)
     {
         EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
         EXPECT_NE(e.message().find("line exceeds the"), String::npos) << e.message();
+    }
+}
+
+/// The decoder accepts raw control bytes in a string, which the encoder escapes to up to 6 bytes each.
+/// Such a line fits the line cap as stored but not once re-encoded for the digest: still corrupt input.
+TEST(CASPartManifestFormat, DecodeRejectsALineThatReEncodesOverTheLineCap)
+{
+    const size_t line_cap = traitsFor(FormatId::PartManifest).line_cap;
+    /// Each raw 0x01 re-encodes as the 6 bytes `\u0001`.
+    const String raw_controls(line_cap / 6 + 1, '\x01');
+
+    const String record_forged = encodeWithSplicedPath(raw_controls, UInt128{});
+
+    String descriptor_forged = encodePartManifest(manifestWithSinglePath("safe"));
+    const String ns_needle = R"("namespace":"00/ff@cas@")";
+    const size_t ns_pos = descriptor_forged.find(ns_needle);
+    ASSERT_NE(ns_pos, String::npos);
+    descriptor_forged.replace(ns_pos, ns_needle.size(), "\"namespace\":\"" + raw_controls + "\"");
+
+    for (const auto & [line, forged] : std::vector<std::pair<String, String>>{
+             {"entry record", record_forged}, {"descriptor", descriptor_forged}})
+    {
+        SCOPED_TRACE(line);
+        ASSERT_LT(forged.size(), line_cap) << "every stored line must fit the line cap";
+        try
+        {
+            static_cast<void>(decodePartManifest(forged));
+            ADD_FAILURE() << "expected CORRUPTED_DATA";
+        }
+        catch (const DB::Exception & e)
+        {
+            EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA) << e.message();
+            EXPECT_NE(e.message().find("does not re-encode within the line cap"), String::npos) << e.message();
+        }
     }
 }
 

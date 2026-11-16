@@ -2310,8 +2310,8 @@ TEST(CASPartWriteTxn, ManifestCapEncodedBytesJustUnderStagesSuccessfully)
         << "a just-under-cap manifest must actually be written";
 }
 
-/// Boundary case 2/2: a manifest whose encoded size exceeds the cap by one byte throws `LIMIT_EXCEEDED` fail-closed, BEFORE the body write — no manifest object lands in the backend for the
-/// rejected attempt.
+/// Boundary case 2/2: a manifest whose encoded size exceeds the cap by one byte throws `LIMIT_EXCEEDED`
+/// fail-closed, BEFORE the body write — no manifest object lands in the backend for the rejected attempt.
 TEST(CASPartWriteTxn, ManifestCapEncodedBytesOverThrowsBeforeBodyWrite)
 {
     auto b = std::make_shared<InMemoryBackend>();

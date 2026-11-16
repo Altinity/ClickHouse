@@ -324,7 +324,21 @@ PartManifest decodePartManifest(std::string_view data)
     /// builds its own probe copy with payload_digest zeroed before hashing (see below), so calling it
     /// directly here on `m` (whose payload_digest is whatever was read off the wire) is safe and
     /// matches encode's own computation exactly.
-    const UInt128 expected_digest = computePayloadDigest(m);
+    ///
+    /// The decoder accepts strings the encoder would escape longer (a raw control byte), so a line that fit
+    /// the cap as stored can exceed it once re-encoded: these bytes are corrupt, not a writer's limit.
+    UInt128 expected_digest;
+    try
+    {
+        expected_digest = computePayloadDigest(m);
+    }
+    catch (const Exception & e)
+    {
+        if (e.code() != ErrorCodes::LIMIT_EXCEEDED)
+            throw;
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "PartManifest: the decoded manifest does not re-encode within the line cap: {}", e.message());
+    }
     if (expected_digest != m.payload_digest)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "PartManifest: payload_digest mismatch, expected {}, got {}",
