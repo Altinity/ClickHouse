@@ -1849,7 +1849,14 @@ public:
     /// Provides storage disks
     DiskPtr getDisk(const String & name) const;
     using DiskCreator = std::function<DiskPtr(const DisksMap & disks_map)>;
+    /// Returns the disk `name`, creating it with `creator` if it does not exist yet. The creator runs
+    /// without the storage lock and gets a snapshot of the disks. Concurrent calls for the same name
+    /// share one creation: the calling creator gets the disk or rethrows its own exception, the others
+    /// get the disk or a copy of the exception. A failed creation is not remembered. The creator must
+    /// not call `getOrCreateDisk` for its own name: it would wait for itself.
     DiskPtr getOrCreateDisk(const String & name, DiskCreator creator) const;
+    /// For tests: the number of requests waiting for a creation of the disk `name` started by another request.
+    size_t getDiskCreationWaitersForTest(const String & name) const;
 
     StoragePoliciesMap getPoliciesMap() const;
     DisksMap getDisksMap() const;
@@ -2152,6 +2159,8 @@ private:
     StoragePolicySelectorPtr getStoragePolicySelector(std::lock_guard<std::mutex> & lock) const;
 
     DiskSelectorPtr getDiskSelector(std::lock_guard<std::mutex> & lock) const;
+    /// Like `DiskSelector::get`, but says so when the disk is still being created by `getOrCreateDisk`.
+    DiskPtr getDiskOrExplainCreation(std::lock_guard<std::mutex> & lock, const String & name) const;
 
     DisksMap getDisksMap(std::lock_guard<std::mutex> & lock) const;
 

@@ -32,10 +32,9 @@ enum class CasEventType
     GateRevalidate, GateResurrect, WatermarkRenew, MountRemount,
     MountClaim, MountRelease, MountConflict,
     /// Operator-driven erasure of a dead pool member's namespace. `decommissionPoolMember` runs as
-    /// a writer, never as GC: it claims the member's mount, drains its namespaces and debris, and
-    /// deletes the mount slot only after the drain is confirmed. The slot is the interrupted-operation
-    /// resume anchor, so a failed drain leaves it terminated for a later retry. `outcome` is one of
-    /// "begin", "namespace_removed", or "end".
+    /// a writer, never as GC: it claims the member's mount, tombstones its owner, drains its namespaces
+    /// and debris, and keeps the owner, epoch and mount objects. `outcome` is one of "begin",
+    /// "namespace_removed", or "end".
     MemberDecommission,
     /// Incidental-detection reaction to foreign bytes at a ref-log wedge key owned by this mount.
     /// The mount lease makes the key exclusive, so this is impossible under legitimate

@@ -44,7 +44,8 @@ workflow = Workflow.Config(
         *JobConfigs.build_jobs,
         # *JobConfigs.build_llvm_coverage_job,
         JobConfigs.coverage_build_jobs[1],
-        *JobConfigs.release_build_jobs_with_examples,
+        # NOTE (strtgbb): no clickhouse-examples, nothing uses it and it delays the ThinLTO link of clickhouse
+        *JobConfigs.release_build_jobs,
         *JobConfigs.sccache_warmup_build_jobs,
 
         # *[ # NOTE (strtgbb): we don't run special build jobs
@@ -104,7 +105,7 @@ workflow = Workflow.Config(
         *AltinityArtifactConfigs.signed_hashes,
         ArtifactConfigs.fuzzers,
         ArtifactConfigs.fuzzers_corpus,
-        ArtifactConfigs.clickhouse_examples,
+        # ArtifactConfigs.clickhouse_examples,
         # *ArtifactConfigs.llvm_profdata_file,
         # ArtifactConfigs.llvm_coverage_info_file,
     ],
