@@ -8,6 +8,7 @@
 namespace DB::ErrorCodes
 {
     extern const int ARGUMENT_OUT_OF_BOUND;
+    extern const int TOO_DEEP_RECURSION;
 }
 
 using namespace DB;
@@ -172,4 +173,39 @@ GTEST_TEST(Field, RestoreFromDumpDecimalOutOfRangeScaleThrows)
     /// An in-range exponent-form scale still round-trips.
     Field restored = Field::restoreFromDump("Decimal64_'1e-5'");
     ASSERT_EQ(restored.safeGet<DecimalField<Decimal64>>().getScale(), 5u);
+}
+
+
+/// A malformed binary Field that declares an arbitrarily deep nesting must be rejected with
+/// TOO_DEEP_RECURSION, not run the reader past the stack guard page. The bytes are hand-built
+/// because the write side also bounds depth, so a legitimately serialized value cannot be this deep.
+GTEST_TEST(Field, ReadBinaryDeeplyNestedThrowsNotOverflow)
+{
+    WriteBufferFromOwnString wb;
+    for (size_t i = 0; i < 500000; ++i)
+    {
+        writeBinary(UInt8(Field::Types::Array), wb);
+        writeBinary(size_t(1), wb); /// one child
+    }
+    writeBinary(UInt8(Field::Types::Null), wb); /// leaf
+    wb.finalize();
+
+    ReadBufferFromString rb(wb.str());
+    try
+    {
+        readFieldBinary(rb);
+        FAIL() << "expected TOO_DEEP_RECURSION";
+    }
+    catch (const Exception & e)
+    {
+        ASSERT_EQ(e.code(), ErrorCodes::TOO_DEEP_RECURSION);
+    }
+
+    /// A shallow array still round-trips.
+    WriteBufferFromOwnString ok_wb;
+    writeFieldBinary(Field(Array{Field(UInt64(1)), Field(UInt64(2))}), ok_wb);
+    ok_wb.finalize();
+    ReadBufferFromString ok_rb(ok_wb.str());
+    Field roundtrip = readFieldBinary(ok_rb);
+    ASSERT_EQ(roundtrip.safeGet<Array>().size(), 2u);
 }
