@@ -69,7 +69,7 @@ bool isEligibleDriver(const TableNode & table_node, const ContextPtr & context)
         return false;
 
     const auto & storage = static_cast<const IStorageCluster &>(*table_node.getStorage());
-    return !storage.getClusterName(context).empty();
+    return !storage.getClusterName(context).empty() && storage.canDispatchToCluster(context);
 }
 
 /// An aggregate such as `count` needs finalization even without `GROUP BY`.

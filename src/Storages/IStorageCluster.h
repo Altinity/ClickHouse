@@ -54,6 +54,11 @@ public:
 
     QueryProcessingStage::Enum getQueryProcessingStage(ContextPtr, QueryProcessingStage::Enum, const StorageSnapshotPtr &, SelectQueryInfo &) const override;
 
+    /// False if an ordinary read would not use the cluster: `object_storage_cluster_fallback_to_local_if_empty`
+    /// selects a local read for a missing or empty cluster, or the table has no cluster. A whole-query
+    /// dispatch is only built for a table where this is true.
+    bool canDispatchToCluster(ContextPtr context) const;
+
     /// Dispatches a prepared query using this storage's cluster and file tasks.
     /// `ReadFromClusterQuery` returns the query's result at `processed_stage` for the planner to finalize.
     void readPreparedClusterQuery(

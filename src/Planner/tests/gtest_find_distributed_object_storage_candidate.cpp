@@ -59,8 +59,9 @@ private:
 class FakeClusterStorage : public IStorageCluster
 {
 public:
-    FakeClusterStorage(const StorageID & table_id, String cluster_name_)
+    FakeClusterStorage(const StorageID & table_id, String cluster_name_, bool uses_setting_syntax_ = false)
         : IStorageCluster(cluster_name_, table_id, getLogger("test"))
+        , uses_setting_syntax(uses_setting_syntax_)
     {
         StorageInMemoryMetadata metadata;
         metadata.setColumns(ColumnsDescription{testColumns()});
@@ -69,11 +70,17 @@ public:
 
     std::string getName() const override { return "FakeClusterStorage"; }
 
+    /// A table whose cluster comes from `object_storage_cluster`, which can fall back to a local read.
+    bool usesObjectStorageClusterSettingSyntax() const override { return uses_setting_syntax; }
+
     RemoteQueryExecutor::Extension getTaskIteratorExtension(
         const ActionsDAG::Node *, const ActionsDAG *, const ContextPtr &, ClusterPtr, StorageMetadataPtr) const override
     {
         return {};
     }
+
+private:
+    const bool uses_setting_syntax;
 };
 
 /// Modelled on src/Planner/tests/gtest_planner_empty_projection.cpp.
@@ -99,17 +106,19 @@ private:
         static constexpr auto database_name = "find_distributed_object_storage_candidate_test_db";
         DatabasePtr database = std::make_shared<FakeDataLakeDatabase>(database_name, context);
 
-        auto attach_cluster_table = [&](const DatabasePtr & db, const String & table_name, String cluster_name)
+        auto attach_cluster_table = [&](const DatabasePtr & db, const String & table_name, String cluster_name, bool uses_setting_syntax = false)
         {
             db->attachTable(
                 context,
                 table_name,
-                std::make_shared<FakeClusterStorage>(StorageID(db->getDatabaseName(), table_name), std::move(cluster_name)),
+                std::make_shared<FakeClusterStorage>(StorageID(db->getDatabaseName(), table_name), std::move(cluster_name), uses_setting_syntax),
                 {});
         };
 
         /// A distributed driver, e.g. ice.event_page.
         attach_cluster_table(database, "driver", "vig-test");
+        /// A driver whose cluster is not defined, as when `object_storage_cluster` names a missing cluster.
+        attach_cluster_table(database, "driver_in_missing_cluster", "missing-cluster", /*uses_setting_syntax*/ true);
         /// A second DataLake-catalog table under the same cluster -- never an independent driver on the
         /// right of a JOIN, just a plain (if wasteful) safe partner.
         attach_cluster_table(database, "second_datalake_table", "vig-test");
@@ -223,13 +232,29 @@ TEST(FindDistributedObjectStorageCandidate, RejectsOrdinaryLocalTableAsRhs)
     EXPECT_FALSE(findDistributedObjectStorageCandidate(query_tree, state.context).has_value());
 }
 
-TEST(FindDistributedObjectStorageCandidate, RejectsWhenModeIsNotDistributed)
+TEST(FindDistributedObjectStorageCandidate, RejectsWhenDistributedJoinIsNotAllowed)
 {
     const auto & state = State::instance();
     state.context->setSetting("allow_object_storage_cluster_distributed_join", false);
 
     auto query_tree = analyze("SELECT driver.id FROM driver INNER JOIN safe_lookup ON driver.id = safe_lookup.id", state.context);
     EXPECT_FALSE(findDistributedObjectStorageCandidate(query_tree, state.context).has_value());
+}
+
+/// With `object_storage_cluster_fallback_to_local_if_empty`, an ordinary read of a table in a missing cluster
+/// is local, so dispatching it to the cluster would throw where ordinary execution succeeds.
+TEST(FindDistributedObjectStorageCandidate, RejectsDriverReadLocallyByClusterFallback)
+{
+    const auto & state = State::instance();
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
+    state.context->setSetting("object_storage_cluster_fallback_to_local_if_empty", true);
+
+    auto query_tree = analyze(
+        "SELECT driver_in_missing_cluster.id FROM driver_in_missing_cluster INNER JOIN safe_lookup ON driver_in_missing_cluster.id = safe_lookup.id",
+        state.context);
+    EXPECT_FALSE(findDistributedObjectStorageCandidate(query_tree, state.context).has_value());
+
+    state.context->setSetting("object_storage_cluster_fallback_to_local_if_empty", false);
 }
 
 TEST(FindDistributedObjectStorageCandidate, RejectsWhenRemoteInitiatorIsSet)

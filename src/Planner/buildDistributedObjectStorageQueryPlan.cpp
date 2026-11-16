@@ -1,8 +1,10 @@
 #include <Planner/buildDistributedObjectStorageQueryPlan.h>
 
+#include <Analyzer/ColumnNode.h>
 #include <Analyzer/QueryNode.h>
 #include <Analyzer/TableNode.h>
 #include <Common/Exception.h>
+#include <Common/quoteString.h>
 #include <Interpreters/ActionsDAG.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/InterpreterSelectQueryAnalyzer.h>
@@ -19,6 +21,7 @@
 #include <Storages/removeGroupingFunctionSpecializations.h>
 
 #include <map>
+#include <set>
 
 namespace DB
 {
@@ -44,6 +47,38 @@ void collectTableNodes(const QueryTreeNodePtr & node, TableNodesByName & table_n
     for (const auto & child : node->getChildren())
         if (child)
             collectTableNodes(child, table_nodes);
+}
+
+/// The tables the query reads, in every nested subquery and CTE, with the columns read from each. The header
+/// analysis does not plan nested scopes, so their tables do not reach the planner context.
+struct AccessedTable
+{
+    StorageID storage_id = StorageID::createEmpty();
+    std::set<String> columns;
+};
+using AccessedTables = std::map<String, AccessedTable>;
+
+void collectAccessedTables(const QueryTreeNodePtr & node, AccessedTables & accessed_tables)
+{
+    const TableNode * table_node = node->as<TableNode>();
+    if (!table_node)
+        if (const auto * column_node = node->as<ColumnNode>())
+        {
+            auto column_source = column_node->getColumnSourceOrNull();
+            table_node = column_source ? column_source->as<TableNode>() : nullptr;
+            if (table_node)
+                accessed_tables[table_node->getStorageID().getFullTableName()].columns.insert(column_node->getColumnName());
+        }
+
+    if (table_node)
+    {
+        auto & accessed_table = accessed_tables[table_node->getStorageID().getFullTableName()];
+        accessed_table.storage_id = table_node->getStorageID();
+    }
+
+    for (const auto & child : node->getChildren())
+        if (child)
+            collectAccessedTables(child, accessed_tables);
 }
 
 /// Only the driver's `*Cluster` function consumes file tasks; partners use plain table functions.
@@ -100,6 +135,7 @@ std::optional<JoinTreeQueryPlan> buildDistributedObjectStorageQueryPlan(
     const QueryTreeNodePtr & dispatch_boundary_node,
     const DistributedObjectStorageCandidate & candidate,
     const SelectQueryInfo & select_query_info,
+    const SelectQueryOptions & select_query_options,
     const PlannerContextPtr & planner_context)
 {
     const auto context = planner_context->getQueryContext();
@@ -148,6 +184,20 @@ std::optional<JoinTreeQueryPlan> buildDistributedObjectStorageQueryPlan(
         query_to_send,
         remote_header,
         buildDriverFilter(candidate.driver, planner_context));
+
+    /// Workers receive table functions, so the original catalog tables are recorded here. Only after
+    /// the dispatch is built: a declined dispatch is planned, and recorded, by the ordinary path.
+    if (context->hasQueryContext() && !select_query_options.is_internal)
+    {
+        AccessedTables accessed_tables;
+        collectAccessedTables(dispatch_boundary_node, accessed_tables);
+
+        for (const auto & [full_table_name, accessed_table] : accessed_tables)
+            context->getQueryContext()->addQueryAccessInfo(
+                backQuoteIfNeed(accessed_table.storage_id.getDatabaseName()),
+                full_table_name,
+                Names(accessed_table.columns.begin(), accessed_table.columns.end()));
+    }
 
     return result;
 }

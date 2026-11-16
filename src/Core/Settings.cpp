@@ -2338,7 +2338,7 @@ Possible values:
 - `1` — Dispatch an eligible query whole. Any other query is planned as set by `object_storage_cluster_join_mode`.
 
 See [Distributed JOIN](../../sql-reference/statements/select/join.md#allow-object-storage-cluster-distributed-join).
-)", 0) \
+)", EXPERIMENTAL) \
     \
     DECLARE(UInt64, max_concurrent_queries_for_all_users, 0, R"(
 Throw exception if the value of this setting is less or equal than the current number of simultaneously processed queries.

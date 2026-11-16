@@ -2710,7 +2710,8 @@ void Planner::buildPlanForQueryNode()
     std::optional<JoinTreeQueryPlan> dispatched_query_plan;
     const auto & distributed_object_storage_candidate = planner_context->getGlobalPlannerContext()->distributed_object_storage_candidate;
     if (distributed_object_storage_candidate && distributed_object_storage_candidate->dispatch_boundary == &query_node)
-        dispatched_query_plan = buildDistributedObjectStorageQueryPlan(query_tree, *distributed_object_storage_candidate, select_query_info, planner_context);
+        dispatched_query_plan = buildDistributedObjectStorageQueryPlan(
+            query_tree, *distributed_object_storage_candidate, select_query_info, select_query_options, planner_context);
 
     if (dispatched_query_plan)
     {

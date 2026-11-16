@@ -55,6 +55,7 @@
 #include <Parsers/ASTSubquery.h>
 #include <Parsers/ASTTablesInSelectQuery.h>
 #include <Parsers/ASTSetQuery.h>
+#include <Parsers/stripQuerySettings.h>
 
 #include <Common/ProfileEvents.h>
 
@@ -82,7 +83,6 @@ namespace Setting
     extern const SettingsString object_storage_remote_initiator_cluster;
     extern const SettingsString object_storage_cluster;
     extern const SettingsObjectStorageClusterJoinMode object_storage_cluster_join_mode;
-    extern const SettingsBool allow_object_storage_cluster_distributed_join;
     extern const SettingsBool object_storage_cluster_fallback_to_local_if_empty;
 }
 
@@ -141,24 +141,6 @@ ActionsDAG andListingFilterDAGs(ActionsDAG first, ActionsDAG second)
     first.getOutputs() = {&and_node};
     first.removeUnusedActions();
     return first;
-}
-
-}
-
-namespace
-{
-
-/// The query-text half of dropping `allow_object_storage_cluster_distributed_join` in `ReadFromCluster::updateSettings`:
-/// a worker applies the query's own SETTINGS clause on top of the settings it received.
-void removeDistributedJoinFromQuerySettings(ASTPtr & query)
-{
-    auto * select_query = query->as<ASTSelectQuery>();
-    if (!select_query || !select_query->settings())
-        return;
-
-    std::erase_if(
-        select_query->settings()->as<ASTSetQuery &>().changes,
-        [](const SettingChange & change) { return change.name == "allow_object_storage_cluster_distributed_join"; });
 }
 
 }
@@ -851,6 +833,11 @@ ASTPtr IStorageCluster::getTableFunctionToSend(
     return table_function;
 }
 
+bool IStorageCluster::canDispatchToCluster(ContextPtr context) const
+{
+    return !resolveClusterRead(context).fallback_to_pure;
+}
+
 /// The planner has already prepared the query and its header.
 void IStorageCluster::readPreparedClusterQuery(
     QueryPlan & query_plan,
@@ -862,9 +849,16 @@ void IStorageCluster::readPreparedClusterQuery(
     SharedHeader sample_block,
     std::shared_ptr<const ActionsDAG> driver_filter)
 {
-    auto cluster_name_from_settings = getClusterName(context);
-    const auto & settings = context->getSettingsRef();
-    auto cluster = getClusterImpl(context, cluster_name_from_settings, isObjectStorage() ? settings[Setting::object_storage_max_nodes] : 0);
+    /// Honors `object_storage_cluster_fallback_to_local_if_empty` like an ordinary read. A dispatch is
+    /// only built for a cluster that is not read locally (see `canDispatchToCluster`).
+    auto resolved = resolveClusterRead(context);
+    if (resolved.fallback_to_pure)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Whole-query dispatch for table {} that is read locally", getStorageID().getNameForLogs());
+
+    ClusterPtr cluster = resolved.object_storage_cluster;
+    if (!cluster)
+        cluster = getClusterImpl(
+            context, getClusterName(context), isObjectStorage() ? context->getSettingsRef()[Setting::object_storage_max_nodes] : 0);
 
     std::optional<Tables> external_tables = std::nullopt;
     if (query_info.planner_context && query_info.planner_context->getMutableQueryContext())
@@ -1060,7 +1054,11 @@ void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const 
 {
     auto new_context = updateSettings(context->getSettingsRef());
 
-    removeDistributedJoinFromQuerySettings(query_to_send);
+    /// The query-text half of resetting the setting in `updateSettings`: a worker applies the query's own
+    /// SETTINGS clause on top of the settings it received. Drops both `name = value` and `name = DEFAULT`
+    /// and detaches a clause left empty, which would otherwise be sent as a bare `SETTINGS`.
+    static constexpr std::string_view dispatch_only_setting_names[] = {"allow_object_storage_cluster_distributed_join"};
+    removeSettingsFromQuery(query_to_send, dispatch_only_setting_names);
 
     createExtension();
 
@@ -1083,7 +1081,7 @@ ContextPtr ReadFromClusterQuery::createRemoteContext() const
 
     /// A worker runs the dispatched query as sent and must not dispatch it again. Not sending the setting
     /// also keeps a worker that does not know it from rejecting the settings.
-    settings.resetToDefault("allow_object_storage_cluster_distributed_join");
+    settings.setDefaultValue("allow_object_storage_cluster_distributed_join");
     remote_context->setSettings(settings);
 
     /// Cluster table functions should always skip unavailable shards.
@@ -1397,7 +1395,7 @@ ContextPtr ReadFromCluster::updateSettings(const Settings & settings)
 
     /// Whole-query dispatch is decided on the initiator. Workers neither need the setting nor, if they
     /// predate it, recognize it.
-    new_settings.resetToDefault("allow_object_storage_cluster_distributed_join");
+    new_settings.setDefaultValue("allow_object_storage_cluster_distributed_join");
 
     auto new_context = Context::createCopy(context);
     new_context->setSettings(new_settings);

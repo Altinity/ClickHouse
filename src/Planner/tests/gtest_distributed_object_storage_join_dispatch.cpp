@@ -312,7 +312,7 @@ void expectEveryTableSentAsATableFunction(const String & plan_text, size_t partn
 
 /// Core case: the driver is the JOIN's leftmost table, and the whole query dispatches as one
 /// ReadFromCluster step with no local JOIN.
-TEST(DistributedObjectStorageJoinDispatch, DriverOwnsWholeJoinWhenModeIsDistributed)
+TEST(DistributedObjectStorageJoinDispatch, DriverOwnsWholeJoinWhenDistributedJoinIsAllowed)
 {
     auto & state = State::instance();
     state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
@@ -341,7 +341,7 @@ TEST(DistributedObjectStorageJoinDispatch, EveryTableCrossesTheWireAsATableFunct
 }
 
 /// Default mode ('allow'): unaffected, JOIN still executes locally.
-TEST(DistributedObjectStorageJoinDispatch, JoinRunsLocallyWhenModeIsNotDistributed)
+TEST(DistributedObjectStorageJoinDispatch, JoinRunsLocallyWhenDistributedJoinIsNotAllowed)
 {
     auto & state = State::instance();
     state.context->setSetting("allow_object_storage_cluster_distributed_join", false);

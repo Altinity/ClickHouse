@@ -1752,6 +1752,142 @@ def test_distributed_join_dispatch(started_cluster):
         _assert_dispatched_whole(nodes, query_id)
 
 
+def test_distributed_join_dispatch_records_access_info(started_cluster):
+    """A dispatched query names table functions to the workers, so the initiator records the original
+    catalog tables and the columns read from them in system.query_log, for both sides of the JOIN and
+    also for tables inside subqueries and CTEs, which the header analysis does not plan."""
+    node1 = started_cluster.instances["node1"]
+    node2 = started_cluster.instances["node2"]
+
+    fact, dim, _ = _setup_distributed_join_tables(
+        started_cluster, [node1, node2], f"test_distributed_join_access_{uuid.uuid4()}"
+    )
+
+    queries = {
+        "direct tables": f"""
+            SELECT d.city, count() AS c
+            FROM {fact} AS f
+            INNER JOIN {dim} AS d ON f.tag = d.id
+            GROUP BY d.city
+            ORDER BY ALL
+        """,
+        "tables in subqueries": f"""
+            SELECT d.city, count() AS c
+            FROM (SELECT tag FROM {fact}) AS f
+            INNER JOIN (SELECT id, city FROM {dim}) AS d ON f.tag = d.id
+            GROUP BY d.city
+            ORDER BY ALL
+        """,
+        "tables in CTEs": f"""
+            WITH f AS (SELECT tag FROM {fact}), d AS (SELECT id, city FROM {dim})
+            SELECT d.city, count() AS c
+            FROM f
+            INNER JOIN d ON f.tag = d.id
+            GROUP BY d.city
+            ORDER BY ALL
+        """,
+    }
+
+    for name, query in queries.items():
+        query_id = uuid.uuid4().hex
+        node1.query(
+            query,
+            query_id=query_id,
+            settings={
+                "object_storage_cluster": "cluster_simple",
+                "allow_object_storage_cluster_distributed_join": 1,
+            },
+        )
+        _assert_dispatched_whole([node1, node2], query_id)
+
+        node1.query("SYSTEM FLUSH LOGS system.query_log")
+
+        # `columns` holds `table.column` entries, so each side must have recorded at least the columns it was
+        # joined or grouped on.
+        tables = node1.query(
+            f"SELECT arrayStringConcat(tables, ',') FROM system.query_log WHERE type = 'QueryFinish' AND query_id = '{query_id}'"
+        )
+        columns = node1.query(
+            f"SELECT arrayStringConcat(columns, ',') FROM system.query_log WHERE type = 'QueryFinish' AND query_id = '{query_id}'"
+        )
+        for table, used_columns in ((fact, ("tag",)), (dim, ("id", "city"))):
+            assert table in tables, f"{name}: {table} is missing from query_log.tables: {tables!r}"
+            for column in used_columns:
+                assert f"{table}.{column}" in columns or f"{table}`.`{column}" in columns, (
+                    f"{name}: {table}.{column} is missing from query_log.columns: {columns!r}"
+                )
+
+
+def test_distributed_join_dispatch_aggregates_across_workers(started_cluster):
+    """Several workers read different driver files and each contributes to every group, so the initiator
+    has to merge partial aggregate states. count, sum and avg must match ordinary execution."""
+    node1 = started_cluster.instances["node1"]
+    node2 = started_cluster.instances["node2"]
+    nodes = [node1, node2]
+
+    fact, dim, _ = _setup_distributed_join_tables(
+        started_cluster, nodes, f"test_distributed_join_workers_{uuid.uuid4()}"
+    )
+
+    # One INSERT writes one data file. Every file holds every tag, so a worker that reads any file has rows
+    # for both cities, and each city is aggregated from rows read by both workers.
+    insert_settings = {"allow_insert_into_iceberg": 1, "write_full_path_in_iceberg_metadata": 1}
+    extra_files = 19
+    for _ in range(extra_files):
+        node1.query(
+            f"INSERT INTO {fact} VALUES (1, 'john'), (2, 'jack'), (3, 'jill');",
+            settings=insert_settings,
+        )
+    files = extra_files + 1
+
+    query = f"""
+        SELECT d.city, count() AS c, sum(f.tag) AS s, avg(f.tag) AS a
+        FROM {fact} AS f
+        INNER JOIN {dim} AS d ON f.tag = d.id
+        GROUP BY d.city
+        ORDER BY ALL
+    """
+
+    def run(distributed_join, query_id=None):
+        return node1.query(
+            query,
+            query_id=query_id,
+            settings={
+                "object_storage_cluster": "cluster_simple",
+                "allow_object_storage_cluster_distributed_join": distributed_join,
+                # A worker that finishes its files may steal another worker's after this long. The default
+                # (500 ms) lets a fast worker take a slow starter's files, so that one contributes nothing.
+                # A worker only waits this long while the other still has files, so it does not slow the query.
+                "lock_object_storage_task_distribution_ms": 30000,
+            },
+        )
+
+    # berlin joins tags 1 and 3, paris joins tag 2.
+    expected = f"berlin\t{2 * files}\t{4 * files}\t2\nparis\t{files}\t{2 * files}\t2\n"
+    assert run(0) == expected, "oracle result changed"
+
+    query_id = uuid.uuid4().hex
+    assert run(1, query_id=query_id) == expected
+    _assert_dispatched_whole(nodes, query_id)
+
+    # Each worker returned a partial result with a row for both cities, so both of them contributed to
+    # each group. Without files for both workers, this fails instead of passing vacuously.
+    for node in nodes:
+        node.query("SYSTEM FLUSH LOGS system.query_log")
+        partial_rows = node.query(
+            f"""
+            SELECT result_rows
+            FROM system.query_log
+            WHERE type = 'QueryFinish' AND NOT is_initial_query
+              AND initial_query_id = '{query_id}'
+              AND positionCaseInsensitive(query, 'group by') != 0
+            """
+        ).split()
+        assert partial_rows == ["2"], (
+            f"{node.name} did not contribute a partial result for both groups: {partial_rows!r}"
+        )
+
+
 def test_distributed_join_dispatch_falls_back(started_cluster):
     """Tables the dispatch cannot prove safe fall back to ordinary planning instead of failing: a local
     Memory JOIN partner is not resolvable on a worker, so the candidate must be rejected."""
