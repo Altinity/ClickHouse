@@ -503,8 +503,9 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             /// re-publishes the same `incarnation_tag`, so on a content-derived-ETag dialect the
             /// republished body carries the incarnation GC condemned and the exact-incarnation delete
             /// would remove a live body. Every physical publication therefore mints its own envelope --
-            /// each iteration of this loop builds one. The verbatim staged copy is additionally a
-            /// once-only privilege `beginPublication` spends.
+            /// each iteration of this loop builds one. The verbatim staged copy is additionally
+            /// once-only per staging object: `beginPublication` spends a flag that the caller shares
+            /// among every source over that object.
             op.publish(BlobPublishRequest{key, std::move(publication)}, publication_policy);
         }
         catch (const std::exception & error)

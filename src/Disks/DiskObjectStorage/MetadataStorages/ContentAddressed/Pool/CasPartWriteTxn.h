@@ -21,7 +21,8 @@ namespace DB::Cas
 /// `server_side_copy_from` names an already-verified complete staged object that may be copied verbatim
 /// only on this logical source's first publication after an absent observation. Every copy and move of
 /// the source shares `publication_attempted`, so ambiguity or fan-out wrapping cannot re-enable that
-/// staged envelope. Later publications use `open` to stream the same payload under a new envelope.
+/// staged envelope. Sources built separately over one staging object must share one flag too.
+/// Later publications use `open` to stream the same payload under a new envelope.
 struct BlobSource
 {
     uint64_t size = 0;
