@@ -41,7 +41,11 @@ RELEASE_BRANCH_REGEXP = r"\A\d+[.]\d+\Z"
 TAG_REGEXP = (
     r"\Av\d{2}"  # First two digits of major part
     r"([.][1-9]\d*){3}"  # minor.patch.tweak parts
+<<<<<<< HEAD
     fr"[\.-]({'|'.join(VersionType.VALID)})\Z"  # suffix with a version type
+=======
+    fr"(?:-1[.]|[.-])({'|'.join(VersionType.VALID)})\Z" # suffix with a version type
+>>>>>>> aef55661ca7d (Merge pull request #2823 from Altinity/ci/24.8/ci-tag-fix)
 )
 SHA_REGEXP = re.compile(r"\A([0-9]|[a-f]){40}\Z")
 
