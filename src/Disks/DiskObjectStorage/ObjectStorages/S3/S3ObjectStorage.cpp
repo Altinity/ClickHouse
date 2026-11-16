@@ -956,27 +956,38 @@ std::optional<ObjectMetadata> S3ObjectStorage::tryGetObjectMetadataImpl(
 ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool with_tags) const
 {
     /// When the caller only needs identity (size / etag / part offsets, not tags or user metadata) we
-    /// take a fast path: consult the process-wide identity cache to skip the metadata request entirely
-    /// on repeat opens, and on a miss fetch via GetObjectAttributes (one request for size + etag +
-    /// multipart part sizes, with a HEAD fallback) instead of a plain HEAD. This is what removes the
-    /// per-file HEAD on lake scans. The tags path is unchanged. See ObjectStorageIdentityCache.
+    /// take a fast path: consult the identity cache to skip the metadata request entirely on repeat
+    /// opens, and on a miss fetch via GetObjectAttributes (one request for size + etag + multipart
+    /// part sizes, with a HEAD fallback) instead of a plain HEAD. This is what removes the per-file
+    /// HEAD on lake scans. The tags path is unchanged. See ObjectStorageIdentityCache.
+    ///
+    /// The cache is owned by the global Context and sized from server settings. Low-level
+    /// object-storage code can run before a global context exists; a null pointer means "no cache"
+    /// and the request is issued uncached.
     const bool identity_only = !with_tags;
     const String identity_key = uri.bucket + "/" + path;
 
+    ObjectStorageIdentityCachePtr identity_cache;
     if (identity_only)
     {
-        if (auto cached = ObjectStorageIdentityCache::instance().tryGet(identity_key))
+        if (auto global_context = Context::getGlobalContextInstance())
+            identity_cache = global_context->getObjectStorageIdentityCache();
+
+        if (identity_cache)
         {
-            ObjectMetadata result;
-            result.size_bytes = cached->size;
-            result.is_size_known = cached->is_size_known;
-            result.etag = cached->etag;
-            result.part_offsets = cached->part_offsets;
-            /// The cache does not store Last-Modified. Leaving it at the epoch with
-            /// `is_last_modified_known == true` would make schema and count caches treat the object
-            /// as older than every cached entry.
-            result.is_last_modified_known = false;
-            return result;
+            if (auto cached = identity_cache->tryGet(identity_key))
+            {
+                ObjectMetadata result;
+                result.size_bytes = cached->size;
+                result.is_size_known = cached->is_size_known;
+                result.etag = cached->etag;
+                result.part_offsets = cached->part_offsets;
+                /// The cache does not store Last-Modified. Leaving it at the epoch with
+                /// `is_last_modified_known == true` would make schema and count caches treat the object
+                /// as older than every cached entry.
+                result.is_last_modified_known = false;
+                return result;
+            }
         }
     }
 
@@ -1036,8 +1047,8 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
         }
     }
 
-    if (identity_only)
-        ObjectStorageIdentityCache::instance().set(
+    if (identity_cache)
+        identity_cache->set(
             identity_key,
             ObjectStorageIdentity{result.etag, result.size_bytes, result.is_size_known, result.part_offsets});
 

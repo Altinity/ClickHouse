@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageIdentityCache.h>
 
 #include <Common/ProfileEvents.h>
+#include <Common/CurrentMetrics.h>
 
 namespace ProfileEvents
 {
@@ -8,40 +9,41 @@ namespace ProfileEvents
     extern const Event ObjectStorageIdentityCacheMisses;
 }
 
+namespace CurrentMetrics
+{
+    extern const Metric ObjectStorageIdentityCacheBytes;
+    extern const Metric ObjectStorageIdentityCacheCells;
+}
+
 namespace DB
 {
 
-ObjectStorageIdentityCache & ObjectStorageIdentityCache::instance()
+ObjectStorageIdentityCache::ObjectStorageIdentityCache(const String & cache_policy, size_t max_size_in_bytes, double size_ratio)
+    : Base(
+        cache_policy,
+        CurrentMetrics::ObjectStorageIdentityCacheBytes,
+        CurrentMetrics::ObjectStorageIdentityCacheCells,
+        max_size_in_bytes,
+        /*max_count*/ 0,
+        size_ratio)
 {
-    static ObjectStorageIdentityCache cache;
-    return cache;
 }
 
-std::optional<ObjectStorageIdentity> ObjectStorageIdentityCache::tryGet(const String & key) const
+std::optional<ObjectStorageIdentity> ObjectStorageIdentityCache::tryGet(const String & key)
 {
-    std::lock_guard lock(mutex);
-    auto it = map.find(key);
-    if (it == map.end())
+    if (auto mapped = Base::get(key))
     {
-        ProfileEvents::increment(ProfileEvents::ObjectStorageIdentityCacheMisses);
-        return std::nullopt;
+        ProfileEvents::increment(ProfileEvents::ObjectStorageIdentityCacheHits);
+        return *mapped;
     }
-    ProfileEvents::increment(ProfileEvents::ObjectStorageIdentityCacheHits);
-    return it->second;
+
+    ProfileEvents::increment(ProfileEvents::ObjectStorageIdentityCacheMisses);
+    return std::nullopt;
 }
 
 void ObjectStorageIdentityCache::set(const String & key, ObjectStorageIdentity identity)
 {
-    std::lock_guard lock(mutex);
-    if (map.size() >= max_entries)
-        map.clear();
-    map[key] = std::move(identity);
-}
-
-void ObjectStorageIdentityCache::clear()
-{
-    std::lock_guard lock(mutex);
-    map.clear();
+    Base::set(key, std::make_shared<ObjectStorageIdentity>(std::move(identity)));
 }
 
 }

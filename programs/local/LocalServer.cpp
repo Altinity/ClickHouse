@@ -169,6 +169,9 @@ namespace ServerSetting
     extern const ServerSettingsString mark_cache_policy;
     extern const ServerSettingsUInt64 mark_cache_size;
     extern const ServerSettingsDouble mark_cache_size_ratio;
+    extern const ServerSettingsString object_storage_identity_cache_policy;
+    extern const ServerSettingsUInt64 object_storage_identity_cache_size;
+    extern const ServerSettingsDouble object_storage_identity_cache_size_ratio;
     extern const ServerSettingsString unique_key_bitmap_cache_policy;
     extern const ServerSettingsUInt64 unique_key_bitmap_cache_size_bytes;
     extern const ServerSettingsDouble unique_key_bitmap_cache_size_ratio;
@@ -1528,6 +1531,17 @@ void LocalServer::processConfig()
         LOG_INFO(log, "Lowered mark cache size to {} because the system has limited RAM", formatReadableSizeWithBinarySuffix(mark_cache_size));
     }
     global_context->setMarkCache(mark_cache_policy, mark_cache_size, mark_cache_size_ratio);
+
+    String object_storage_identity_cache_policy = server_settings[ServerSetting::object_storage_identity_cache_policy];
+    size_t object_storage_identity_cache_size = server_settings[ServerSetting::object_storage_identity_cache_size];
+    double object_storage_identity_cache_size_ratio = server_settings[ServerSetting::object_storage_identity_cache_size_ratio];
+    if (object_storage_identity_cache_size > max_cache_size)
+    {
+        object_storage_identity_cache_size = max_cache_size;
+        LOG_INFO(log, "Lowered object storage identity cache size to {} because the system has limited RAM", formatReadableSizeWithBinarySuffix(object_storage_identity_cache_size));
+    }
+    global_context->setObjectStorageIdentityCache(
+        object_storage_identity_cache_policy, object_storage_identity_cache_size, object_storage_identity_cache_size_ratio);
 
     /// UNIQUE KEY delete-bitmap cache. Zero size disables.
     String unique_key_bitmap_cache_policy_name = server_settings[ServerSetting::unique_key_bitmap_cache_policy];

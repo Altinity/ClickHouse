@@ -104,6 +104,7 @@ class RefreshSet;
 class Cluster;
 class Compiler;
 class MarkCache;
+class ObjectStorageIdentityCache;
 class UniqueKeyIndexCache;
 class DeleteBitmapCache;
 class PrimaryIndexCache;
@@ -1569,6 +1570,13 @@ public:
     std::shared_ptr<MarkCache> getMarkCache() const;
     void clearMarkCache() const;
     ThreadPool & getLoadMarksThreadpool() const;
+
+    /// Object-storage identity cache (per-object size/ETag/multipart-part-offsets) to avoid a HEAD
+    /// on every object open. A max_size_in_bytes of 0 leaves the cache unset (disabled).
+    void setObjectStorageIdentityCache(const String & cache_policy, size_t max_size_in_bytes, double size_ratio);
+    void updateObjectStorageIdentityCacheConfiguration(const Poco::Util::AbstractConfiguration & config, size_t max_cache_size);
+    std::shared_ptr<ObjectStorageIdentityCache> getObjectStorageIdentityCache() const;
+    void clearObjectStorageIdentityCache() const;
 
     /// UNIQUE KEY index cache: ClickHouse-side `CacheBase` adapter
     /// over the RocksDB block cache used by SST-backed UNIQUE KEY indexes.
