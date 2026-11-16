@@ -3540,10 +3540,11 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     /// it". `catalog_cut_proved_empty` is the supported case: the round's own hot-scan catalog cut,
     /// read once and reused (never a second `GET`), decoded successfully, token-bearing, and holding
     /// zero rows of every lifecycle state including `Creating`. Under this pool's protocol every live or
-    /// live-precommit edge requires an exact `Live` catalog row (INV-3), so that cut is a positive proof
-    /// that no namespace anywhere holds one -- not merely an absence of proof. A catalog holding only
-    /// `Creating` rows produces the SAME `frontier_namespaces == 0` but is a birth in progress, not an
-    /// empty universe, and `catalog_cut_proved_empty` is false for it (see `entries.empty()` above).
+    /// live-precommit edge belongs to a `Live` catalog row or to a `Removing` row without a terminal
+    /// record, so that cut is a positive proof that no namespace anywhere holds one -- not merely an
+    /// absence of proof. A catalog holding only `Creating` rows produces the SAME `frontier_namespaces == 0`
+    /// but is a birth in progress, not an empty universe, and `catalog_cut_proved_empty` is false for it
+    /// (see `entries.empty()` above).
     result.frontier_complete = universe_authoritative
         && result.frontier_proven == result.frontier_namespaces
         && (result.frontier_namespaces > 0 || result.catalog_cut_proved_empty);

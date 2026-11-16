@@ -702,7 +702,7 @@ public:
     /// and again once the erase resolved; see `CasRefLedger` for the cached runtime invalidation contract.
     void invalidateRemovedCatalogLife(const NamespaceLifeId & life);
 
-    /// Reconciles cached removal-closed ref runtimes against a complete catalog cut.
+    /// Reconciles cached ref runtimes against a complete catalog cut; see `CasRefLedger::reconcileCatalogCut`.
     void reconcileRefCatalogCut(const CasRefCatalog::Snapshot & catalog_cut);
 
     /// ==== writer ref-log append lane ====
@@ -1089,6 +1089,14 @@ public:
     void setRemovalAttemptHookForTest(std::function<void()> hook)
     {
         ref_ledger.setRemovalAttemptHookForTest(std::move(hook));
+    }
+    void setRemovalReopenReadHookForTest(std::function<void()> hook)
+    {
+        ref_ledger.setRemovalReopenReadHookForTest(std::move(hook));
+    }
+    void setRemovalRuntimeAcquiredHookForTest(std::function<void()> hook)
+    {
+        ref_ledger.setRemovalRuntimeAcquiredHookForTest(std::move(hook));
     }
     void setNamespacePresenceProbeAfterTerminalProvenHookForTest(std::function<void()> hook)
     {

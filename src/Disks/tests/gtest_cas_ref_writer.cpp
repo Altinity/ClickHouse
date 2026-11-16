@@ -5290,11 +5290,12 @@ TEST(CASRefWriterNamespaceRemoval, AmbiguousBeginRemovingKeepsTheWriteLaneClosed
 
     ASSERT_TRUE(backend->releaseHeldCatalogWrite()) << "the kept write must still apply";
     EXPECT_EQ(catalogEntryOrThrow(backend, store->layout(), ns).state, NsState::Removing);
-    expectPositiveLaneClosed(store, ns);
+    /// The refusal reads the row as `Removing`, which resolves the write that may have landed.
+    expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "is Removing in the catalog", [&] { updatePublishedAt(store, ns); });
 
     /// Creation resolves the namespace life through a different refusal site than a ref mutation does.
     expectThrowsCodeWithMessage(
-        DB::ErrorCodes::NETWORK_ERROR, "a removal write may still land", [&] { (void)store->namespaceLife(ns); });
+        DB::ErrorCodes::NETWORK_ERROR, "is Removing in the catalog", [&] { (void)store->namespaceLife(ns); });
 
     EXPECT_NO_THROW(store->dropNamespace(ns)) << "a retried removal completes";
     EXPECT_FALSE(store->namespaceStillLogicallyPresent(ns));
@@ -5997,6 +5998,376 @@ TEST(CASRefWriterNamespaceRemoval, RemountReopensTheLaneAfterAnAmbiguousBeginRem
     fenceOutRefMount(*backend, store->layout().mountKey("test"));
     ASSERT_TRUE(store->tryRemountOnce());
     EXPECT_NO_THROW(updatePublishedAt(store, ns));
+}
+
+/// A drop whose runtime is superseded by a remount after its drain must not write `Removing`: the runtime
+/// of the new mount, which the drop never closed, already accepts writes.
+TEST(CASRefWriterNamespaceRemoval, DropSupersededAfterItsDrainLeavesTheRowLive)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/drop_superseded_after_drain"};
+    publishEmptyPart(store, ns, "owned");
+    const NamespaceLifeId life = *lifeIfCatalogedForTest(backend, layout, ns);
+
+    DB::Cas::tests::ManualBarrier park;
+    std::atomic<bool> parked_once{false};
+    SCOPE_EXIT({ store->setRemovalAttemptHookForTest({}); });
+    std::future<void> drop;
+    SCOPE_EXIT({ park.release(); });
+
+    store->setRemovalAttemptHookForTest([&]
+    {
+        if (!parked_once.exchange(true))
+            park.arriveAndWait();
+    });
+    drop = std::async(std::launch::async, [&] { store->dropNamespace(ns); });
+    park.waitUntilArrived();
+
+    fenceOutRefMount(*backend, layout.mountKey("test"));
+    ASSERT_TRUE(store->tryRemountOnce());
+    EXPECT_NO_THROW(updatePublishedAt(store, ns));
+
+    park.release();
+    ASSERT_EQ(drop.wait_for(std::chrono::seconds(30)), std::future_status::ready);
+    expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "beginning removal", [&] { drop.get(); });
+    EXPECT_EQ(catalogEntryOrThrow(backend, layout, ns).state, NsState::Live);
+    EXPECT_TRUE(store->resolveRef(ns, "owned"));
+
+    EXPECT_NO_THROW(store->dropNamespace(ns));
+    const CatalogEntry row = catalogEntryOrThrow(backend, layout, ns);
+    EXPECT_EQ(row.state, NsState::Removing);
+    EXPECT_EQ(row.incarnation, life.incarnation);
+    EXPECT_FALSE(store->namespaceStillLogicallyPresent(ns));
+}
+
+namespace
+{
+
+/// Commits ref `owned`, turns the row `Removing` from outside and remounts, so the next caller builds a
+/// fresh runtime for a `Removing` row. Returns the life.
+NamespaceLifeId removingRowAfterRemount(
+    const std::shared_ptr<RefWriterTestBackend> & backend, const PoolPtr & store, const RootNamespace & ns)
+{
+    const Layout & layout = store->layout();
+    publishEmptyPart(store, ns, "owned");
+    const NamespaceLifeId life = *lifeIfCatalogedForTest(backend, layout, ns);
+    setCatalogRowRemovingForTest(backend, layout, life);
+    fenceOutRefMount(*backend, layout.mountKey("test"));
+    if (!store->tryRemountOnce())
+        throw std::runtime_error("test failed to remount");
+    return life;
+}
+
+bool journalHasLogPut(const std::shared_ptr<RefWriterTestBackend> & backend, const String & log_prefix)
+{
+    const std::vector<String> journal = backend->requestJournal();
+    const String log_put = "PUT " + log_prefix;
+    return std::any_of(journal.begin(), journal.end(), [&](const String & entry) { return entry.starts_with(log_put); });
+}
+
+}
+
+/// A presence probe builds the runtime for a `Removing` row; its lane must refuse writes and reads.
+TEST(CASRefWriterNamespaceRemoval, RuntimeAdmittedForARemovingRowRefusesWrites)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/removing_row_probe_runtime"};
+    const NamespaceLifeId life = removingRowAfterRemount(backend, store, ns);
+    ASSERT_FALSE(store->refTableCachedForTest(ns));
+    const String log_prefix = layout.namespaceStreamPrefix(life) + "_log/";
+
+    EXPECT_TRUE(store->namespaceStillLogicallyPresent(ns));
+    EXPECT_FALSE(store->resolveRef(ns, "owned"));
+
+    backend->clearRequestJournal();
+    expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "is Removing in the catalog", [&] { updatePublishedAt(store, ns); });
+    EXPECT_FALSE(journalHasLogPut(backend, log_prefix));
+    EXPECT_TRUE(store->namespaceStillLogicallyPresent(ns));
+
+    EXPECT_NO_THROW(store->dropNamespace(ns));
+    EXPECT_FALSE(store->namespaceStillLogicallyPresent(ns));
+}
+
+/// A resumed `DROP` builds the runtime for a `Removing` row and parks in its recovery; a writer arriving
+/// meanwhile is refused at once instead of waiting on the drop's recovery.
+TEST(CASRefWriterNamespaceRemoval, ResumedDropOverARemovingRowAdmitsNoWriter)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const auto park = std::make_shared<ParkedRecovery>();
+    park->armed = false;
+    auto store = openPoolWithConfig(backend, ParkedRecovery::config(park));
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/removing_row_resumed_drop"};
+    const NamespaceLifeId life = removingRowAfterRemount(backend, store, ns);
+    ASSERT_FALSE(store->refTableCachedForTest(ns));
+    const String log_prefix = layout.namespaceStreamPrefix(life) + "_log/";
+    park->armed = true;
+
+    std::future<void> drop;
+    std::future<String> writer;
+    SCOPE_EXIT({ park->barrier.release(); });
+
+    drop = std::async(std::launch::async, [&] { store->dropNamespace(ns); });
+    park->barrier.waitUntilArrived();
+
+    backend->clearRequestJournal();
+    writer = std::async(std::launch::async, [&]() -> String
+    {
+        try
+        {
+            updatePublishedAt(store, ns);
+            return "committed";
+        }
+        catch (const DB::Exception & e)
+        {
+            return e.message();
+        }
+    });
+    ASSERT_EQ(writer.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+    EXPECT_NE(writer.get().find("is Removing in the catalog"), String::npos);
+    EXPECT_FALSE(journalHasLogPut(backend, log_prefix));
+
+    park->barrier.release();
+    ASSERT_EQ(drop.wait_for(std::chrono::seconds(30)), std::future_status::ready);
+    EXPECT_NO_THROW(drop.get());
+    EXPECT_FALSE(store->namespaceStillLogicallyPresent(ns));
+}
+
+/// A failed drop reopens from a `Live` read taken before its lock; a probe that read `Removing` in between
+/// must keep the lane closed.
+TEST(CASRefWriterNamespaceRemoval, RemovingObservationWinsOverAnEarlierLiveReopenRead)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/removing_wins_over_reopen"};
+    publishEmptyPart(store, ns, "owned");
+    const NamespaceLifeId life = *lifeIfCatalogedForTest(backend, layout, ns);
+    std::optional<bool> probe_answer;
+
+    SCOPE_EXIT({ store->setRemovalReopenReadHookForTest({}); });
+    store->setRemovalReopenReadHookForTest([&]
+    {
+        setCatalogRowRemovingForTest(backend, layout, life);
+        probe_answer = store->namespaceStillLogicallyPresent(ns);
+    });
+    backend->catalog_fault_key = layout.refCatalogKey();
+    backend->catalog_gets_before_fault = 1;   /// initial discovery succeeds; post-close observation fails
+    backend->catalog_get_fault_count = 1;
+    EXPECT_THROW(store->dropNamespace(ns), std::runtime_error);
+
+    ASSERT_TRUE(probe_answer.has_value());
+    EXPECT_TRUE(*probe_answer);
+    expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "is Removing in the catalog", [&] { updatePublishedAt(store, ns); });
+
+    EXPECT_NO_THROW(store->dropNamespace(ns));
+    EXPECT_FALSE(store->namespaceStillLogicallyPresent(ns));
+}
+
+/// A writer holding the runtime when its own pool's drop completes is refused by the closed lane alone.
+TEST(CASRefWriterNamespaceRemoval, OwnDropRefusesAWriterThatHoldsTheRuntimeWithoutACatalogRead)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/own_drop_refuses_held_runtime"};
+    publishEmptyPart(store, ns, "owned");
+    const NamespaceLifeId life = *lifeIfCatalogedForTest(backend, layout, ns);
+    const String log_prefix = layout.namespaceStreamPrefix(life) + "_log/";
+
+    DB::Cas::tests::ManualBarrier park;
+    std::atomic<bool> parked_once{false};
+    SCOPE_EXIT({ store->setAppendAfterRuntimeCaptureHookForTest(nullptr); });
+    std::future<String> writer;
+    SCOPE_EXIT({ park.release(); });
+
+    store->setAppendAfterRuntimeCaptureHookForTest([&]
+    {
+        if (!parked_once.exchange(true))
+            park.arriveAndWait();
+    });
+    writer = std::async(std::launch::async, [&]() -> String
+    {
+        try
+        {
+            updatePublishedAt(store, ns);
+            return "committed";
+        }
+        catch (const DB::Exception & e)
+        {
+            return e.message();
+        }
+    });
+    park.waitUntilArrived();
+
+    EXPECT_NO_THROW(store->dropNamespace(ns));
+    const uint64_t catalog_gets = backend->getCount(layout.refCatalogKey());
+    backend->clearRequestJournal();
+
+    park.release();
+    ASSERT_EQ(writer.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+    EXPECT_NE(writer.get().find("is Removing: positive ref mutation admission is closed"), String::npos);
+    EXPECT_EQ(backend->getCount(layout.refCatalogKey()), catalog_gets);
+    EXPECT_FALSE(journalHasLogPut(backend, log_prefix));
+}
+
+/// A GC round reads the catalog; a resident runtime whose exact row it reads as `Removing` is closed, so a
+/// writer already holding that runtime is refused without a catalog read of its own.
+TEST(CASRefWriterNamespaceRemoval, GcRoundClosesAResidentRuntimeWhoseRowIsRemoving)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/gc_closes_removing_runtime"};
+    const RootNamespace live_ns{"srv1/gc_leaves_live_runtime_open"};
+    publishEmptyPart(store, ns, "owned");
+    publishEmptyPart(store, live_ns, "owned");
+    const NamespaceLifeId life = *lifeIfCatalogedForTest(backend, layout, ns);
+    const String log_prefix = layout.namespaceStreamPrefix(life) + "_log/";
+
+    DB::Cas::tests::ManualBarrier park;
+    std::atomic<bool> parked_once{false};
+    SCOPE_EXIT({ store->setAppendAfterRuntimeCaptureHookForTest(nullptr); });
+    std::future<String> writer;
+    SCOPE_EXIT({ park.release(); });
+
+    store->setAppendAfterRuntimeCaptureHookForTest([&]
+    {
+        if (!parked_once.exchange(true))
+            park.arriveAndWait();
+    });
+    writer = std::async(std::launch::async, [&]() -> String
+    {
+        try
+        {
+            updatePublishedAt(store, ns);
+            return "committed";
+        }
+        catch (const DB::Exception & e)
+        {
+            return e.message();
+        }
+    });
+    park.waitUntilArrived();
+
+    setCatalogRowRemovingForTest(backend, layout, life);
+    Gc gc(store, UInt128{1});
+    EXPECT_TRUE(gc.runRegularRound().acquired_lease);
+
+    const uint64_t catalog_gets = backend->getCount(layout.refCatalogKey());
+    backend->clearRequestJournal();
+    park.release();
+    ASSERT_EQ(writer.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+    EXPECT_NE(writer.get().find("is Removing in the catalog"), String::npos);
+    EXPECT_EQ(backend->getCount(layout.refCatalogKey()), catalog_gets);
+    EXPECT_FALSE(journalHasLogPut(backend, log_prefix));
+    EXPECT_FALSE(store->resolveRef(ns, "owned"));
+
+    EXPECT_NO_THROW(updatePublishedAt(store, live_ns));
+    EXPECT_TRUE(store->resolveRef(live_ns, "owned"));
+}
+
+namespace
+{
+
+/// A fragment of the warning logged when a runtime is closed for a row read as `Removing`.
+constexpr std::string_view kRemovingLatchedWarning = "its catalog row is Removing";
+
+}
+
+/// An ordinary drop closes its own lane first, so the reads of its `Removing` row that follow log nothing.
+TEST(CASRefWriterNamespaceRemoval, OrdinaryDropLogsNoRemovingWarning)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/ordinary_drop_logs_nothing"};
+    publishEmptyPart(store, ns, "owned");
+
+    DB::Cas::tests::ScopedLogCapture capture("CasRefLedger", "warning");
+    store->dropNamespace(ns);
+    EXPECT_FALSE(store->namespaceStillLogicallyPresent(ns));
+    Gc gc(store, UInt128{1});
+    EXPECT_TRUE(gc.runRegularRound().acquired_lease);
+    EXPECT_EQ(capture.count(kRemovingLatchedWarning), 0u) << capture.captured();
+}
+
+/// The same with the GC round first, so the latch of `reconcileCatalogCut` meets the closed lane.
+TEST(CASRefWriterNamespaceRemoval, OrdinaryDropLogsNoRemovingWarningWhenGcReadsTheRowFirst)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/ordinary_drop_gc_first_logs_nothing"};
+    publishEmptyPart(store, ns, "owned");
+
+    DB::Cas::tests::ScopedLogCapture capture("CasRefLedger", "warning");
+    store->dropNamespace(ns);
+    Gc gc(store, UInt128{1});
+    EXPECT_TRUE(gc.runRegularRound().acquired_lease);
+    EXPECT_FALSE(store->namespaceStillLogicallyPresent(ns));
+    EXPECT_EQ(capture.count(kRemovingLatchedWarning), 0u) << capture.captured();
+}
+
+/// A row turned `Removing` under an open lane is the stuck state: closing that lane logs once.
+TEST(CASRefWriterNamespaceRemoval, RowTurnedRemovingUnderAnOpenLaneLogsOnce)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/removing_under_open_lane_logs_once"};
+    publishEmptyPart(store, ns, "owned");
+    setCatalogRowRemovingForTest(backend, layout, *lifeIfCatalogedForTest(backend, layout, ns));
+
+    DB::Cas::tests::ScopedLogCapture capture("CasRefLedger", "warning");
+    Gc gc(store, UInt128{1});
+    EXPECT_TRUE(gc.runRegularRound().acquired_lease);
+    EXPECT_TRUE(store->namespaceStillLogicallyPresent(ns));
+    EXPECT_TRUE(gc.runRegularRound().acquired_lease);
+    EXPECT_EQ(capture.count(kRemovingLatchedWarning), 1u) << capture.captured();
+}
+
+/// A cut read before GC erased life L still shows L `Removing`; it must not close the open runtime of a
+/// successor life of the same name.
+TEST(CASRefWriterNamespaceRemoval, StaleCutDoesNotCloseASuccessorOfTheSameName)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    PoolConfig config;
+    config.gc_fold_max_defer_rounds = 0;
+    config.ref_table_cache_bytes = 0;   /// unbounded: the successor runtime stays resident
+    auto store = openPoolWithConfig(backend, config);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/stale_cut_successor"};
+    publishWithProductionBirth(store, ns, "owned");
+    const NamespaceLifeId predecessor = *lifeIfCatalogedForTest(backend, layout, ns);
+    store->dropNamespace(ns);
+    const CasRefCatalog::Snapshot stale_cut = readCatalogForTest(backend, layout);
+    ASSERT_EQ(catalogEntryOrThrow(backend, layout, ns).state, NsState::Removing);
+
+    store->renewWatermarkOnce();
+    Gc gc(store, UInt128{1});
+    for (int round = 0; round < 16 && lifeIfCatalogedForTest(backend, layout, ns); ++round)
+    {
+        EXPECT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+        store->renewWatermarkOnce();
+    }
+    ASSERT_FALSE(lifeIfCatalogedForTest(backend, layout, ns)) << "GC did not erase the predecessor row";
+
+    publishWithProductionBirth(store, ns, "owned");
+    const NamespaceLifeId successor = *lifeIfCatalogedForTest(backend, layout, ns);
+    ASSERT_NE(successor.incarnation, predecessor.incarnation);
+    ASSERT_EQ(store->refTableLifeForTest(ns), std::optional<NamespaceLifeId>{successor});
+    ASSERT_TRUE(store->refTableCachedForTest(ns));
+    const uint64_t runtime_identity = store->refTableRuntimeIdentityForTest(ns);
+
+    /// A closed successor would also be detached here, since the stale cut lacks its life, and a write would
+    /// then commit through a fresh runtime; the identity tells the two apart.
+    store->reconcileRefCatalogCut(stale_cut);
+    EXPECT_EQ(store->refTableRuntimeIdentityForTest(ns), runtime_identity);
+    EXPECT_NO_THROW(updatePublishedAt(store, ns));
+    EXPECT_TRUE(store->resolveRef(ns, "owned"));
 }
 
 /// spec §Namespace Removal (writer, line 666): "After the transaction is durable, it applies the same

@@ -542,7 +542,7 @@ TEST(CASNsFileIncarnation, NamespaceLifeDetachesAResidentRemovedLifeWhoseRowIsGo
     EXPECT_FALSE(owner->namespaceStillLogicallyPresent(ns));
     ASSERT_EQ(owner->refTableLifeForTest(ns), std::optional<NamespaceLifeId>{removed_life})
         << "the probe must have left the removed life's runtime resident";
-    expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "already removed",
+    expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "is Removing in the catalog",
         [&] { (void)owner->namespaceLife(ns); });
 
     Gc gc(leader, kGcId);
@@ -557,6 +557,67 @@ TEST(CASNsFileIncarnation, NamespaceLifeDetachesAResidentRemovedLifeWhoseRowIsGo
     const NamespaceLifeId reborn = owner->namespaceLife(ns);
     EXPECT_NE(reborn.incarnation, removed_life.incarnation);
     EXPECT_EQ(owner->refTableLifeForTest(ns), std::optional<NamespaceLifeId>{reborn});
+}
+
+/// A runtime recovered from a `Live` row whose stream already holds the terminal stays open and resident.
+/// Once a GC on another server erases the row, `namespaceLife` must detach it and birth a new life.
+TEST(CASNsFileIncarnation, NamespaceLifeDetachesAnOpenTerminalLifeWhoseRowIsGone)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    PoolPtr store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{kNsString};
+    {
+        RefOp remove_op;
+        remove_op.kind = RefOpKind::RemoveNamespace;
+        appendRefLogSeed(*backend, layout, ns, {remove_op});
+    }
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    const auto catalog_life = [&]
+    {
+        CasOperation op = catalog_requests.admit();
+        return CasRefCatalog::lifeIfCataloged(op, layout, ns);
+    };
+    const std::optional<NamespaceLifeId> life = catalog_life();
+    ASSERT_TRUE(life);
+
+    expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "already removed",
+        [&] { (void)store->namespaceLife(ns); });
+    ASSERT_EQ(store->refTableLifeForTest(ns), life) << "the cold call must leave the terminal runtime resident";
+
+    {
+        CasOperation op = catalog_requests.admit();
+        CasRefCatalog::casUpdate(op, layout, [&](const RefCatalog & current)
+        {
+            RefCatalog next = current;
+            for (CatalogEntry & entry : next.entries)
+            {
+                if (entry.ns == ns && entry.incarnation == life->incarnation)
+                {
+                    entry.state = NsState::Removing;
+                    entry.removal_started_round = 0;
+                }
+            }
+            return next;
+        });
+    }
+    PoolPtr leader = Pool::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "leader", .gc_fold_max_defer_rounds = 0});
+    Gc gc(leader, kGcId);
+    (void)runRegularRoundReclaiming(gc);
+    (void)runRegularRoundReclaiming(gc);
+    ASSERT_FALSE(catalog_life()) << "the leader must drain the row";
+    ASSERT_EQ(store->refTableLifeForTest(ns), life) << "a remote drain must not have detached the runtime";
+
+    const NamespaceLifeId reborn = store->namespaceLife(ns);
+    EXPECT_NE(reborn.incarnation, life->incarnation);
+    EXPECT_EQ(store->refTableLifeForTest(ns), std::optional<NamespaceLifeId>{reborn});
 }
 
 namespace

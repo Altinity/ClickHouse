@@ -251,9 +251,10 @@ public:
     /// publish a distinct successor runtime.
     void invalidateRemovedCatalogLife(const NamespaceLifeId & life);
 
-    /// Reconciles resident removal-closed runtimes against one complete catalog observation. An exact
-    /// life absent from or replaced in the cut is invalidated and exactly detached; a matching current
-    /// life stays closed. No runtime is reset or rebound.
+    /// Reconciles resident runtimes against one complete catalog observation. A runtime whose exact life
+    /// reads `Removing` in the cut is closed as `acquireRefTableRuntime` closes it. A removal-closed
+    /// runtime whose exact life is absent from or replaced in the cut is invalidated and exactly detached;
+    /// a matching current life stays closed. No runtime is reset or rebound. Sends no request.
     void reconcileCatalogCut(const CasRefCatalog::Snapshot & catalog_cut);
 
     /// Queues a mutation for flat-combining with compatible callers. `build_ops` runs at most once in
@@ -361,6 +362,15 @@ public:
     /// the post-close catalog read. An attempt that returns early on an already-terminal runtime skips it.
     /// Set before any removal runs.
     void setRemovalAttemptHookForTest(std::function<void()> hook) { removal_attempt_hook_for_test = std::move(hook); }
+    /// Installs a hook run by a failed removal attempt right after its catch-side catalog read returns,
+    /// before it decides whether to reopen the lane. Runs with no lock held. Set before any removal runs.
+    void setRemovalReopenReadHookForTest(std::function<void()> hook) { removal_reopen_read_hook_for_test = std::move(hook); }
+    /// Installs a hook run by `dropNamespaceImpl` right after it acquired the exact runtime, before its
+    /// recovery. Runs with no lock held. Set before any removal runs.
+    void setRemovalRuntimeAcquiredHookForTest(std::function<void()> hook)
+    {
+        removal_runtime_acquired_hook_for_test = std::move(hook);
+    }
     /// Returns the object key retained for the unresolved append of `ns`.
     String wedgedKeyForTest(const RootNamespace & ns);
     /// Returns the fence generation retained with the unresolved append of `ns` (0 when not wedged).
@@ -915,14 +925,19 @@ private:
         /// never an under-refusal.
         std::vector<std::shared_ptr<RefMutationItem>> carved;     /// guarded by ref_queue_mutex
         bool leader_active = false;                               /// guarded by ref_queue_mutex
-        /// Set before the exact `Live -> Removing` catalog CAS and retained until that life is deleted.
-        /// New positive mutations check it in the same queue critical section as admission; the one
-        /// terminal `DropNamespace` item is the sole exception.
+        /// Set by a removal before its `Live -> Removing` catalog write, and wherever `removing_observed` is
+        /// set. New positive mutations check it in the same queue critical section as admission;
+        /// the one terminal `DropNamespace` item is the sole exception.
         bool removal_admission_closed = false;
+        /// The exact row of this runtime was read as `Removing`; a failed removal must not reopen its lane.
+        /// Set by `acquireRefTableRuntime` and `reconcileCatalogCut`; nothing clears it. Guarded by
+        /// `ref_queue_mutex`.
+        bool removing_observed = false;
         /// A `Live -> Removing` catalog write of this runtime ended with an unknown outcome that no read
         /// has resolved, so it can still land. The lane stays closed and the runtime stays resident until
         /// a remount replaces it or GC erases the row (`invalidateRemovedCatalogLife`). A later attempt that
-        /// proves the row `Removing` clears the flag; the lane stays closed as `Removing`.
+        /// proves the row `Removing`, or any read of the row as `Removing` (`latchRemovingLocked`), clears the
+        /// flag; the lane stays closed as `Removing`.
         /// Guarded by `ref_queue_mutex`.
         bool removal_write_may_land = false;
         /// One removal attempt at a time per runtime, so one attempt cannot reopen the lane between
@@ -1079,6 +1094,8 @@ private:
     std::function<void()> snapshot_after_capture_hook_for_test;
     std::function<void()> snapshot_before_ckpt_cas_hook_for_test;
     std::function<void()> removal_attempt_hook_for_test;
+    std::function<void()> removal_reopen_read_hook_for_test;
+    std::function<void()> removal_runtime_acquired_hook_for_test;
 
     /// Non-materializing diagnostic/cache lookup. It never observes the catalog and never creates a
     /// name slot or runtime.
@@ -1099,11 +1116,18 @@ private:
     /// retargeting either runtime. `admission` was begun before the catalog read that produced `life`;
     /// if a retirement of this name landed since, the observation is stale and the call throws
     /// retry-later instead of republishing a possibly retired life; a `PresenceProbe` gets `nullptr`
-    /// there. Releases `admission` in its critical
-    /// section; if it throws before that, the caller's guard releases it.
+    /// there. `observed_removing` is true when the caller read the row of `life` as `Removing`: the
+    /// returned runtime, new or resident, then has its lane closed and `removing_observed` set. Releases
+    /// `admission` in its critical section; if it throws before that, the caller's guard releases it.
     std::shared_ptr<RefTableRuntime> acquireRefTableRuntime(
-        const NamespaceLifeId & life, uint64_t admitted_generation, ColdAdmission & admission,
-        RuntimeAdmission kind);
+        const NamespaceLifeId & life, bool observed_removing, uint64_t admitted_generation,
+        ColdAdmission & admission, RuntimeAdmission kind);
+
+    /// Closes the lane of `rt` for a row read as `Removing`, sets `removing_observed` and clears
+    /// `removal_write_may_land`. Returns true when the lane was open, so the caller logs only a lane this
+    /// call closed: a removal closes its own lane first. Caller holds `ref_queue_mutex`.
+    static bool latchRemovingLocked(RefTableRuntime & rt);
+    static void logRemovingLatched(const NamespaceLifeId & life);
 
     /// Creates the slot of `ns` if absent and counts the admission in it. Call it before the catalog
     /// read whose answer the admission publishes.
@@ -1158,10 +1182,9 @@ private:
     ///   - no entry at all: this call is the namespace's first-ever opener. Mints one via
     ///     `CasRefCatalog::createNamespace` under a `CreatorFence` built from `server_root_id`,
     ///     `live_epoch` and `admitted_generation`;
-    ///   - an entry already `Live`/`Removing`: adopts its incarnation directly
-    ///     (`NamespaceLifeId::fromCatalogEntry`) -- `Removing` is adopted exactly like `Live` because
-    ///     this call only needs A life to key objects with; refusing WRITES to a `Removing` namespace
-    ///     is a different mechanism's job (`removal_admission_closed`), not this resolution's;
+    ///   - an entry `Live`: adopts its incarnation directly (`NamespaceLifeId::fromCatalogEntry`);
+    ///   - an entry `Removing`: throws retry-later (setting `*lifecycle_refusal` when given), because no
+    ///     new life of the name may be born before the removal finishes;
     ///   - an entry `Creating`: if its `creator` fence is THIS mount's own (a previous attempt of this
     ///     same open landed step 1 but not steps 2/3, e.g. after a transient error), resumes
     ///     `completeCreation` directly over the observed entry; otherwise reconciles it via

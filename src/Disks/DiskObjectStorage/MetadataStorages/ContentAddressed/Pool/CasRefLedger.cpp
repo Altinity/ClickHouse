@@ -683,9 +683,26 @@ void CasRefLedger::eraseNameSlotIfUnusedLocked(std::map<String, RefNameSlot>::it
         ref_name_slots.erase(it);
 }
 
+bool CasRefLedger::latchRemovingLocked(RefTableRuntime & rt)
+{
+    const bool was_open = !rt.removal_admission_closed;
+    rt.removal_admission_closed = true;
+    rt.removing_observed = true;
+    /// The row already reads `Removing`, so no removal write of this runtime can still change it.
+    rt.removal_write_may_land = false;
+    return was_open;
+}
+
+void CasRefLedger::logRemovingLatched(const NamespaceLifeId & life)
+{
+    LOG_WARNING(getLogger("CasRefLedger"),
+        "CAS namespace '{}' life {}: its catalog row is Removing, so this server closes it: writes are refused "
+        "and reads see no data", life.ns.string(), renderIncarnation(life.incarnation));
+}
+
 std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireRefTableRuntime(
-    const NamespaceLifeId & life, uint64_t admitted_generation, ColdAdmission & admission,
-    RuntimeAdmission kind)
+    const NamespaceLifeId & life, bool observed_removing, uint64_t admitted_generation,
+    ColdAdmission & admission, RuntimeAdmission kind)
 {
     chassert(admission.ledger == this && admission.name == life.ns.string());
     refuseUnlessAdmitted(mount_requests.resume(admitted_generation), "ref-table runtime install");
@@ -695,6 +712,7 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireRefTableRunt
     bool slots_cleared_by_remount = false;
     bool retired_since_observation = false;
     bool identity_conflict = false;
+    bool latched_now = false;
     {
         std::lock_guard lock(ref_queue_mutex);
         generation_moved = fence_generation_fn() != admitted_generation;
@@ -732,8 +750,13 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireRefTableRunt
                 }
             }
         }
+        /// A resident runtime too: it may have been admitted as `Live` before the row turned.
+        if (result && observed_removing)
+            latched_now = latchRemovingLocked(*result);
         releaseColdAdmissionLocked(admission);
     }
+    if (latched_now)
+        logRemovingLatched(life);
 
     if (generation_moved)
         refuseUnlessAdmitted(mount_requests.resume(admitted_generation), "ref-table runtime install");
@@ -823,7 +846,7 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireReadableRefT
             fmt::format("its catalog row changed while a cold reader observed life {}; "
                         "retry from a fresh catalog observation", renderIncarnation(life.incarnation)));
 
-    return acquireRefTableRuntime(life, admitted_generation, admission, RuntimeAdmission::Read);
+    return acquireRefTableRuntime(life, /*observed_removing=*/false, admitted_generation, admission, RuntimeAdmission::Read);
 }
 
 std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireMutableRefTableRuntime(
@@ -838,7 +861,7 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireMutableRefTa
         if (current->life == life)
             return current;
     }
-    return acquireRefTableRuntime(life, admitted_generation, admission, RuntimeAdmission::Write);
+    return acquireRefTableRuntime(life, /*observed_removing=*/false, admitted_generation, admission, RuntimeAdmission::Write);
 }
 
 void CasRefLedger::invalidateRemovedCatalogLife(const NamespaceLifeId & life)
@@ -891,13 +914,31 @@ void CasRefLedger::reconcileCatalogCut(const CasRefCatalog::Snapshot & catalog_c
 {
     catalog_cut.life_index.throwIfAmbiguous("CAS resident ref-runtime reconciliation");
 
+    /// `Live -> Removing` is one-way, so a `Removing` row read in an older cut is still `Removing`; the
+    /// exact life keeps a successor of the same name open.
+    std::vector<NamespaceLifeId> removing_lives;
+    for (const CatalogEntry & entry : catalog_cut.catalog.entries)
+        if (entry.state == NsState::Removing)
+            removing_lives.push_back(NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation));
+
     std::vector<std::shared_ptr<RefTableRuntime>> closed_runtimes;
+    std::vector<NamespaceLifeId> latched_now;
     {
         std::lock_guard queue_lock(ref_queue_mutex);
         for (const auto & [_, slot] : ref_name_slots)
-            if (slot.current && slot.current->removal_admission_closed)
+        {
+            if (!slot.current)
+                continue;
+            RefTableRuntime & rt = *slot.current;
+            if (std::find(removing_lives.begin(), removing_lives.end(), rt.life) != removing_lives.end()
+                && latchRemovingLocked(rt))
+                latched_now.push_back(rt.life);
+            if (rt.removal_admission_closed)
                 closed_runtimes.push_back(slot.current);
+        }
     }
+    for (const NamespaceLifeId & life : latched_now)
+        logRemovingLatched(life);
 
     for (const auto & rt : closed_runtimes)
     {
@@ -2111,6 +2152,28 @@ namespace
         "closed until a retried removal completes or the disk is remounted; retry later", ns.string()));
 }
 
+/// True whether the removal is still running, done and waiting for GC to erase the row, or stuck; the
+/// remedy for a stuck one depends on the operation that started it, so the text names none.
+[[noreturn]] void throwRemovingObserved(const RootNamespace & ns)
+{
+    throwCasWriteRetryLater(fmt::format(
+        "CAS namespace '{}' is Removing in the catalog: writes are refused and reads see no data until its removal "
+        "completes and GC erases the row; retry later, and if it stays Removing see the CAS troubleshooting page",
+        ns.string()));
+}
+
+/// Flags read under `ref_queue_mutex`.
+[[noreturn]] void throwPositiveAdmissionClosed(const RootNamespace & ns, bool removing_observed, bool write_may_land)
+{
+    if (write_may_land)
+        throwRemovalWriteMayLand(ns);
+    if (removing_observed)
+        throwRemovingObserved(ns);
+    throwCasWriteRetryLater(fmt::format(
+        "CAS namespace '{}' is Removing: positive ref mutation admission is closed while its "
+        "terminal fold and catalog removal complete; retry later", ns.string()));
+}
+
 }
 
 RefTxnId CasRefLedger::appendRefOpsOnRuntime(
@@ -2123,13 +2186,7 @@ RefTxnId CasRefLedger::appendRefOpsOnRuntime(
     {
         std::lock_guard<std::mutex> lock(ref_queue_mutex);
         if (rt->removal_admission_closed && !terminal_removal_authorized)
-        {
-            if (rt->removal_write_may_land)
-                throwRemovalWriteMayLand(ns);
-            throwCasWriteRetryLater(fmt::format(
-                "CAS namespace '{}' is Removing: positive ref mutation admission is closed while "
-                "its terminal fold and catalog removal complete; retry later", ns.string()));
-        }
+            throwPositiveAdmissionClosed(ns, rt->removing_observed, rt->removal_write_may_land);
     };
     /// Check before recovery/maintenance so a known-Removing runtime cannot spend an object-store
     /// mutation on behalf of an operation it is already required to refuse.
@@ -2162,13 +2219,7 @@ RefTxnId CasRefLedger::appendRefOpsOnRuntime(
             "CAS store is shutting down — refusing to append ref-log transactions for server_root '{}'",
             config.server_root_id));
     if (rt->removal_admission_closed && !terminal_removal_authorized)
-    {
-        if (rt->removal_write_may_land)
-            throwRemovalWriteMayLand(ns);
-        throwCasWriteRetryLater(fmt::format(
-            "CAS namespace '{}' is Removing: positive ref mutation admission is closed while its "
-            "terminal fold and catalog removal complete; retry later", ns.string()));
-    }
+        throwPositiveAdmissionClosed(ns, rt->removing_observed, rt->removal_write_may_land);
     rt->pending.push_back(item);
 
     while (!item->done)
@@ -5299,10 +5350,12 @@ NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
     {
         refuseUnlessAdmitted(mount_requests.resume(rt->admitted_fence_generation), "resident namespace life");
         bool removal_closed = false;
+        bool removing_observed = false;
         bool write_may_land = false;
         {
             std::lock_guard queue_lock(ref_queue_mutex);
             removal_closed = rt->removal_admission_closed;
+            removing_observed = rt->removing_observed;
             write_may_land = rt->removal_write_may_land;
         }
         if (removal_closed)
@@ -5314,8 +5367,16 @@ NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
             const auto refreshed = lookupRefTableRuntime(ns);
             if (refreshed == rt)
             {
+                /// Re-read: the reconcile may have latched the runtime and resolved a pending removal write.
+                {
+                    std::lock_guard queue_lock(ref_queue_mutex);
+                    removing_observed = rt->removing_observed;
+                    write_may_land = rt->removal_write_may_land;
+                }
                 if (write_may_land)
                     throwRemovalWriteMayLand(ns);
+                if (removing_observed)
+                    throwRemovingObserved(ns);
                 throwCasWriteRetryLater(fmt::format(
                     "CAS namespace '{}' is Removing: creation waits for its terminal fold and catalog "
                     "removal to complete; retry later", ns.string()));
@@ -5385,16 +5446,14 @@ NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
     const auto entry_it = std::find_if(catalog.catalog.entries.begin(), catalog.catalog.entries.end(),
         [&](const CatalogEntry & entry) { return entry.ns == ns; });
     if (entry_it != catalog.catalog.entries.end() && entry_it->state == NsState::Removing)
-        throwCasWriteRetryLater(fmt::format(
-            "CAS namespace '{}' is Removing: creation waits for its terminal fold and catalog "
-            "removal to complete; retry later", ns.string()));
+        throwRemovingObserved(ns);
 
     const NamespaceLifeId life
         = entry_it != catalog.catalog.entries.end() && entry_it->state == NsState::Live
         ? NamespaceLifeId::fromCatalogEntry(entry_it->ns, entry_it->incarnation)
         : resolveNamespaceLife(ns, admitted_generation, live_epoch_fn());
     refuseUnlessAdmitted(op, "cold mutable namespace admission, after life resolution");
-    rt = acquireRefTableRuntime(life, admitted_generation, admission, RuntimeAdmission::Write);
+    rt = acquireRefTableRuntime(life, /*observed_removing=*/false, admitted_generation, admission, RuntimeAdmission::Write);
     if (ensureRefTableRecovered(ns, *rt) == RefRecoveryOutcome::LifeRemoved)
         throwCasWriteRetryLater(recoveredLifeRemovedMessage(ns, rt->life));
     refuseTerminalLife(ns, *rt);
@@ -5501,7 +5560,8 @@ bool CasRefLedger::namespaceStillLogicallyPresent(const RootNamespace & ns)
     /// it. Neither a proven terminal nor a removed life therefore proves the name `ns` absent; the catalog
     /// read after the recovery decides for the name.
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry->ns, entry->incarnation);
-    const auto rt = acquireRefTableRuntime(life, admitted_generation, admission, RuntimeAdmission::PresenceProbe);
+    const auto rt = acquireRefTableRuntime(
+        life, entry->state == NsState::Removing, admitted_generation, admission, RuntimeAdmission::PresenceProbe);
     /// GC announced the erase of this row during the admission. Throwing would fail
     /// `DatabaseOnDisk::dropTable`, which calls `existsDirectory` after its rollback scope; `true` is safe.
     if (!rt)
@@ -5599,7 +5659,10 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     const NamespaceLifeId observed_life
         = NamespaceLifeId::fromCatalogEntry(initial_it->ns, initial_it->incarnation);
     const uint64_t runtime_generation = fence_generation_fn();
-    const auto rt = acquireRefTableRuntime(observed_life, runtime_generation, admission, RuntimeAdmission::Write);
+    const auto rt = acquireRefTableRuntime(
+        observed_life, initial_it->state == NsState::Removing, runtime_generation, admission, RuntimeAdmission::Write);
+    if (removal_runtime_acquired_hook_for_test)
+        removal_runtime_acquired_hook_for_test();
     if (ensureRefTableRecovered(ns, *rt) == RefRecoveryOutcome::LifeRemoved)
         return {};   /// as for a name without a row
     {
@@ -5641,8 +5704,14 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     if (removal_attempt_hook_for_test)
         removal_attempt_hook_for_test();
 
-    const uint64_t admitted_generation = fence_generation_fn();
-    CasOperation removal_op = mount_requests.resume(admitted_generation);
+    /// Admitted under the runtime this drop closed and drained, not under the current generation: after a
+    /// remount another runtime of this name may be open, and `Removing` must not land under it.
+    const auto runtime_live = [&rt]
+    {
+        return !rt->catalog_life_invalidated.load(std::memory_order_acquire)
+            && !rt->superseded_by_remount.load(std::memory_order_acquire);
+    };
+    CasOperation removal_op = mount_requests.resume(rt->admitted_fence_generation, runtime_live);
     std::optional<CatalogEntry> observed_live;
     if (initial_it->state == NsState::Live)
         observed_live = *initial_it;
@@ -5650,6 +5719,7 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     bool removal_write_outcome_unknown = false;
     try
     {
+        refuseUnlessAdmitted(removal_op, "beginning removal");
         const CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(removal_op, layout, policy);
         const auto entry_it = std::find_if(snapshot.catalog.entries.begin(), snapshot.catalog.entries.end(),
             [&](const CatalogEntry & entry) { return entry.ns == ns; });
@@ -5710,13 +5780,16 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     catch (...)
     {
         /// Resolve an ambiguous transition before deciding whether this lane may reopen. `Removing`
-        /// under the same life is conclusive success. Reopening also needs a fresh exact `Live` row and
-        /// the same mount fence; every other case stays closed and propagates the original error.
+        /// under the same life is conclusive success. Reopening also needs a fresh exact `Live` row, the
+        /// same mount fence and no `Removing` observation of this runtime, which may land after the read;
+        /// every other case stays closed and propagates the original error.
         try
         {
             /// A fresh standard window, not `policy`: an expired policy would fail this read at once and
             /// leave a healthy table closed.
             const CasRefCatalog::Snapshot fresh = CasRefCatalog::read(removal_op, layout);
+            if (removal_reopen_read_hook_for_test)
+                removal_reopen_read_hook_for_test();
             const auto fresh_it = std::find_if(fresh.catalog.entries.begin(), fresh.catalog.entries.end(),
                 [&](const CatalogEntry & entry) { return entry.ns == ns; });
             if (observed_live
@@ -5730,7 +5803,7 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
             {
                 refuseUnlessAdmitted(removal_op, "reopening the removal lane");
                 std::lock_guard<std::mutex> queue_lock(ref_queue_mutex);
-                if (!removal_write_outcome_unknown && !rt->removal_write_may_land)
+                if (!removal_write_outcome_unknown && !rt->removal_write_may_land && !rt->removing_observed)
                 {
                     rt->removal_admission_closed = false;
                     rt->cv.notify_all();
