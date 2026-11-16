@@ -4,12 +4,14 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasNamespaceJanitor.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCkptFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
@@ -60,6 +62,7 @@ extern const Event CASRefCheckpointNotAdvanced;
 extern const Event CASRequestFenceLostPostWrite;
 extern const Event CASRefRecoveryEpochSealed;
 extern const Event CASRefRecoveryRetries;
+extern const Event CASGCStuckRemovals;
 }
 
 using namespace DB::Cas;
@@ -1943,7 +1946,7 @@ TEST(CASRefWriterRecovery, ConfirmationCostsOneCatalogReadPerInstall)
 /// Append lane: request cost + batching (spec §Common Mutation Path / §Local Batching Queue)
 /// ===================================================================================
 
-TEST(CASRefWriterAppendLane, PositiveAppendIsOneCatalogReadAndOneCreate)
+TEST(CASRefWriterAppendLane, PositiveAppendIsOneCreate)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -1955,18 +1958,43 @@ TEST(CASRefWriterAppendLane, PositiveAppendIsOneCatalogReadAndOneCreate)
     const String log_prefix = store->layout().namespaceStreamPrefix(life) + "_log/";
     const uint64_t ckpt_gets = backend->getCount(ckpt_key);
     const uint64_t ckpt_writes = backend->writeCount(ckpt_key);
+    const uint64_t catalog_gets = backend->getCount(store->layout().refCatalogKey());
     const uint64_t total = totalRequests(*backend);
     backend->clearRequestJournal();
 
     store->updateRefPublishedAt(ns, "a", [](RefPublishedAtUpdate & update) { update.published_at_ms = 17; });
 
-    EXPECT_EQ(totalRequests(*backend) - total, 2u);
+    EXPECT_EQ(totalRequests(*backend) - total, 1u);
     const std::vector<String> journal = backend->requestJournal();
-    ASSERT_EQ(journal.size(), 2u);
-    EXPECT_EQ(journal[0], "GET " + store->layout().refCatalogKey());
-    EXPECT_EQ(journal[1].find("PUT " + log_prefix), 0u) << journal[1];
+    ASSERT_EQ(journal.size(), 1u) << ::testing::PrintToString(journal);
+    EXPECT_EQ(journal[0].find("PUT " + log_prefix), 0u) << journal[0];
+    EXPECT_EQ(backend->getCount(store->layout().refCatalogKey()), catalog_gets);
     EXPECT_EQ(backend->getCount(ckpt_key), ckpt_gets);
     EXPECT_EQ(backend->writeCount(ckpt_key), ckpt_writes);
+}
+
+/// The rename of a committed part, one of the appends of every insert.
+TEST(CASRefWriterAppendLane, MoveAppendIsOneCreate)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/one_request_move"};
+    const ManifestId id = publishEmptyPart(store, ns, "tmp_a");
+    const NamespaceLifeId life = lifeIfCatalogedForTest(backend, store->layout(), ns).value();
+    const String log_prefix = store->layout().namespaceStreamPrefix(life) + "_log/";
+    CachedPartFolderAccess access(store);
+    const uint64_t catalog_gets = backend->getCount(store->layout().refCatalogKey());
+    const uint64_t total = totalRequests(*backend);
+    backend->clearRequestJournal();
+
+    EXPECT_TRUE(access.moveRefExact({ns, "tmp_a"}, {ns, "a"}, id.ref));
+
+    EXPECT_EQ(totalRequests(*backend) - total, 1u);
+    const std::vector<String> journal = backend->requestJournal();
+    ASSERT_EQ(journal.size(), 1u) << ::testing::PrintToString(journal);
+    EXPECT_EQ(journal[0].find("PUT " + log_prefix), 0u) << journal[0];
+    EXPECT_EQ(backend->getCount(store->layout().refCatalogKey()), catalog_gets);
+    EXPECT_TRUE(store->resolveRef(ns, "a"));
 }
 
 TEST(CASRefWriterAppendLane, RefRemovalIsOneRequest)
@@ -1989,7 +2017,7 @@ TEST(CASRefWriterAppendLane, RefRemovalIsOneRequest)
     EXPECT_EQ(journal[0].find("PUT " + log_prefix), 0u) << journal[0];
 }
 
-TEST(CASRefWriterAppendLane, PartPublishCostsOneCatalogReadPerLogCreateAndNoCkptRequest)
+TEST(CASRefWriterAppendLane, PartPublishCostsTwoLogCreatesAndNoCatalogOrCkptRequest)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -2019,7 +2047,7 @@ TEST(CASRefWriterAppendLane, PartPublishCostsOneCatalogReadPerLogCreateAndNoCkpt
 
     const size_t new_logs = log_keys() - logs_before;
     EXPECT_EQ(new_logs, 2u);
-    EXPECT_EQ(backend->getCount(store->layout().refCatalogKey()) - catalog_gets, new_logs);
+    EXPECT_EQ(backend->getCount(store->layout().refCatalogKey()) - catalog_gets, 0u);
     EXPECT_EQ(backend->getCount(ckpt_key), ckpt_gets);
     EXPECT_EQ(backend->writeCount(ckpt_key), ckpt_writes);
 }
@@ -4877,87 +4905,81 @@ TEST(CASRefWriterRemount, SupersededLeaderMidFlushFailsClosedCreatesNoObject)
 /// Task 11: namespace removal (spec §Namespace Removal)
 /// ===================================================================================
 
-/// A cached writer paused after its ordinary gates must re-check the exact catalog life immediately
-/// before id allocation. A concurrent `Live -> Removing` transition therefore admits no late owner.
-TEST(CASRefWriterNamespaceRemoval, CachedPositiveWriterCannotAppendAfterRemovingIsPublished)
+/// A catalog write from outside turns the row `Removing` while a writer is past its admission. The writer
+/// commits; GC then neither erases the row nor deletes the table's data, and the next admission that reads
+/// the row refuses.
+TEST(CASRefWriterNamespaceRemoval, RowTurnedRemovingUnderAnOpenLaneKeepsItsAppends)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openPool(backend);
+    auto store = openPoolWithConfig(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_stuck_removal_rounds = 1});
     const Layout & layout = store->layout();
-    const RootNamespace ns{"srv1/removing_blocks_cached_writer"};
+    const RootNamespace ns{"srv1/removing_under_open_lane"};
     publishEmptyPart(store, ns, "existing");
+    const NamespaceLifeId life = *lifeIfCatalogedForTest(backend, layout, ns);
 
-    const CasRefCatalog::Snapshot before = readCatalogForTest(backend, layout);
-    const auto observed = std::find_if(before.catalog.entries.begin(), before.catalog.entries.end(),
-        [&](const CatalogEntry & entry) { return entry.ns == ns; });
-    ASSERT_NE(observed, before.catalog.entries.end());
-    ASSERT_EQ(observed->state, NsState::Live);
-    const CatalogEntry & exact_live = *observed;
-    const auto greatest_before = listGreatestLogIdForTest(*backend, layout, ns);
-    ASSERT_TRUE(greatest_before);
+    DB::Cas::tests::ManualBarrier park;
+    std::atomic<bool> parked_once{false};
+    SCOPE_EXIT({ store->setRefPreCarveHookForTest(nullptr); });
+    std::future<ManifestId> writer;
+    SCOPE_EXIT({ park.release(); });
 
-    std::mutex mutex;
-    std::condition_variable cv;
-    bool entered = false;
-    bool release = false;
-    std::atomic<bool> hook_fired{false};
     store->setRefPreCarveHookForTest([&]
     {
-        if (hook_fired.exchange(true))
-            return;
-        std::unique_lock lock(mutex);
-        entered = true;
-        cv.notify_all();
-        cv.wait(lock, [&] { return release; });
+        if (!parked_once.exchange(true))
+            park.arriveAndWait();
+    });
+    const String payload = "late-blob-body";
+    const BlobRef blob = DB::Cas::tests::idOf(payload);
+    writer = std::async(std::launch::async, [&]
+    {
+        ManifestEntry entry;
+        entry.path = "data.bin";
+        entry.placement = EntryPlacement::Blob;
+        entry.ref = blob;
+        entry.blob_size = payload.size();
+        auto build = startBuildFor(store, ns, "late");
+        const ManifestId id = build->stageManifest({entry});
+        build->precommitAdd(ns, "late", id);
+        build->putBlob(blob, BlobSource::fromString(payload));
+        build->promote(ns, "late", build->buildId(), id);
+        return id;
     });
 
-    auto writer = std::async(std::launch::async, [&]() -> String
-    {
-        try
-        {
-            publishEmptyPart(store, ns, "late");
-            return "committed";
-        }
-        catch (const DB::Exception & e)
-        {
-            return e.message();
-        }
-    });
+    park.waitUntilArrived();
+    rewriteCatalogRow(backend, layout, ns, CatalogEntry{
+        .ns = ns, .state = NsState::Removing, .incarnation = life.incarnation, .removal_started_round = 0});
+    park.release();
 
-    bool writer_parked = false;
-    {
-        std::unique_lock lock(mutex);
-        writer_parked = cv.wait_for(lock, std::chrono::seconds(10), [&] { return entered; });
-    }
-    if (writer_parked)
-    {
-        CasRequests catalog_requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
-        CasOperation catalog_op = catalog_requests.admit();
-        CasRefCatalog::casUpdate(catalog_op, layout, [&](const RefCatalog & current)
-        {
-            RefCatalog next = current;
-            const auto it = std::find(next.entries.begin(), next.entries.end(), exact_live);
-            if (it == next.entries.end())
-                throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "exact Live row changed during test transition");
-            it->state = NsState::Removing;
-            it->removal_started_round = 0;
-            return next;
-        });
-    }
-    {
-        std::lock_guard lock(mutex);
-        release = true;
-    }
-    cv.notify_all();
-
-    EXPECT_TRUE(writer_parked) << "cached writer did not reach the deterministic pre-carve seam";
     ASSERT_EQ(writer.wait_for(std::chrono::seconds(10)), std::future_status::ready);
-    const String result = writer.get();
-    store->setRefPreCarveHookForTest(nullptr);
+    const ManifestId late_id = writer.get();
+    ASSERT_TRUE(store->resolveRef(ns, "late"));
 
-    EXPECT_NE(result, "committed") << "cached positive ownership appended after `Removing` became visible";
+    const std::vector<RefTxnId> logs = listLogIdsForTest(*backend, layout, ns);
+    const auto stuck = ProfileEvents::global_counters[ProfileEvents::CASGCStuckRemovals];
+    Gc gc(store, UInt128{1});
+    for (int i = 0; i < 12; ++i)
+        EXPECT_TRUE(gc.runRegularRound().acquired_lease);
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
+    NamespaceJanitor(requests, layout, 100).runOnePage(false, [] { return true; });
+
+    EXPECT_EQ(catalogEntryOrThrow(backend, layout, ns).state, NsState::Removing);
+    EXPECT_TRUE(readOf(backend, layout.refCkptKey(life)));
+    EXPECT_EQ(listLogIdsForTest(*backend, layout, ns), logs);
+    EXPECT_TRUE(readOf(backend, layout.manifestKey(late_id)));
+    EXPECT_TRUE(readOf(backend, layout.blobKey(blob)));
+    EXPECT_TRUE(readOf(backend, layout.blobMetaKey(blob)));
+    EXPECT_GT(ProfileEvents::global_counters[ProfileEvents::CASGCStuckRemovals], stuck);
+    /// The GC rounds read the row as `Removing` and closed this pool's runtime.
     EXPECT_FALSE(store->resolveRef(ns, "late"));
-    EXPECT_EQ(listGreatestLogIdForTest(*backend, layout, ns), greatest_before);
+
+    fenceOutRefMount(*backend, layout.mountKey("test"));
+    ASSERT_TRUE(store->tryRemountOnce());
+    expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "is Removing in the catalog", [&]
+    {
+        store->updateRefPublishedAt(ns, "late", [](RefPublishedAtUpdate & update) { update.published_at_ms = 17; });
+    });
+    EXPECT_FALSE(store->resolveRef(ns, "late"));
+    EXPECT_TRUE(readOf(backend, layout.manifestKey(late_id)));
 }
 
 /// dropNamespace's ONE body transaction names an exact removal for every committed ref AND every
@@ -5275,7 +5297,7 @@ void expectPositiveLaneClosed(const PoolPtr & store, const RootNamespace & ns)
 }
 
 /// An ambiguous `Live -> Removing` write can still land after the call gave up, so one read showing
-/// `Live` must not reopen the positive lane: a later landing would stop writes at the next append.
+/// `Live` must not reopen the positive lane: a later landing would turn the row `Removing` under an open lane.
 /// The backend keeps the write and applies it on release, after the removal call has returned.
 TEST(CASRefWriterNamespaceRemoval, AmbiguousBeginRemovingKeepsTheWriteLaneClosed)
 {
@@ -6168,6 +6190,97 @@ TEST(CASRefWriterNamespaceRemoval, RemovingObservationWinsOverAnEarlierLiveReope
     EXPECT_FALSE(store->namespaceStillLogicallyPresent(ns));
 }
 
+/// A drop that reads `Removing` closes the lane; the append queued before the close still commits, and the
+/// terminal record comes after it. A positive append reads no catalog row, so the row does not refuse it.
+TEST(CASRefWriterNamespaceRemoval, QueuedAppendDrainsBeforeTheTerminalOfADropThatObservedRemoving)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/queued_append_drains_before_terminal"};
+    publishEmptyPart(store, ns, "owned");
+    const NamespaceLifeId life = *lifeIfCatalogedForTest(backend, layout, ns);
+    auto build = startBuildFor(store, ns, "late");
+    const ManifestId id = build->stageManifest({});
+    build->precommitAdd(ns, "late", id);
+
+    DB::Cas::tests::ManualBarrier append_park;
+    DB::Cas::tests::ManualBarrier drop_park;
+    std::atomic<bool> append_parked_once{false};
+    std::atomic<bool> drop_parked_once{false};
+
+    SCOPE_EXIT({
+        store->setRefPreCarveHookForTest(nullptr);
+        store->setRemovalRuntimeAcquiredHookForTest(nullptr);
+    });
+    std::future<String> promote_result;
+    std::future<DropNamespaceStats> drop;
+    std::future<String> refused;
+    SCOPE_EXIT({
+        append_park.release();
+        drop_park.release();
+    });
+
+    store->setRefPreCarveHookForTest([&]
+    {
+        if (!append_parked_once.exchange(true))
+            append_park.arriveAndWait();
+    });
+    promote_result = std::async(std::launch::async, [&]() -> String
+    {
+        try
+        {
+            build->promote(ns, "late", build->buildId(), id);
+            return "committed";
+        }
+        catch (const DB::Exception & e)
+        {
+            return e.message();
+        }
+    });
+    append_park.waitUntilArrived();
+
+    setCatalogRowRemovingForTest(backend, layout, life);
+    const std::vector<RefTxnId> logs = listLogIdsForTest(*backend, layout, ns);
+    /// The drop stays parked right after its acquisition, so only that acquisition can have closed the lane
+    /// the write below meets.
+    store->setRemovalRuntimeAcquiredHookForTest([&]
+    {
+        if (!drop_parked_once.exchange(true))
+            drop_park.arriveAndWait();
+    });
+    drop = std::async(std::launch::async, [&] { return store->dropNamespace(ns); });
+    drop_park.waitUntilArrived();
+
+    refused = std::async(std::launch::async, [&]() -> String
+    {
+        try
+        {
+            updatePublishedAt(store, ns);
+            return "committed";
+        }
+        catch (const DB::Exception & e)
+        {
+            return e.message();
+        }
+    });
+    ASSERT_EQ(refused.wait_for(std::chrono::seconds(10)), std::future_status::ready)
+        << "the write queued behind the parked append instead of being refused";
+    EXPECT_NE(refused.get().find("is Removing in the catalog"), String::npos);
+    EXPECT_EQ(listLogIdsForTest(*backend, layout, ns), logs);
+
+    drop_park.release();
+    append_park.release();
+    ASSERT_EQ(promote_result.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+    EXPECT_EQ(promote_result.get(), "committed");
+    ASSERT_EQ(drop.wait_for(std::chrono::seconds(30)), std::future_status::ready);
+    const DropNamespaceStats stats = drop.get();
+    EXPECT_EQ(stats.committed_refs, 2u);
+    EXPECT_EQ(stats.precommits, 0u);
+    EXPECT_FALSE(store->resolveRef(ns, "late"));
+    EXPECT_FALSE(store->namespaceStillLogicallyPresent(ns));
+}
+
 /// A writer holding the runtime when its own pool's drop completes is refused by the closed lane alone.
 TEST(CASRefWriterNamespaceRemoval, OwnDropRefusesAWriterThatHoldsTheRuntimeWithoutACatalogRead)
 {
@@ -6368,6 +6481,59 @@ TEST(CASRefWriterNamespaceRemoval, StaleCutDoesNotCloseASuccessorOfTheSameName)
     EXPECT_EQ(store->refTableRuntimeIdentityForTest(ns), runtime_identity);
     EXPECT_NO_THROW(updatePublishedAt(store, ns));
     EXPECT_TRUE(store->resolveRef(ns, "owned"));
+}
+
+/// The way out of a row left `Removing` under an open lane that acknowledged appends: a `DROP` on this pool
+/// finishes the removal, then GC erases the row and deletes the objects of the life.
+TEST(CASRefWriterNamespaceRemoval, DropFinishesARowTurnedRemovingUnderAnOpenLaneAndGcReclaimsIt)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    PoolConfig config;
+    config.gc_fold_max_defer_rounds = 0;
+    auto store = openPoolWithConfig(backend, config);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/drop_finishes_removing_under_open_lane"};
+    const ManifestId owned_id = publishEmptyPart(store, ns, "owned");
+    const NamespaceLifeId life = *lifeIfCatalogedForTest(backend, layout, ns);
+
+    setCatalogRowRemovingForTest(backend, layout, life);
+    const String payload = "late-blob-body";
+    const BlobRef blob = DB::Cas::tests::idOf(payload);
+    ManifestEntry entry;
+    entry.path = "data.bin";
+    entry.placement = EntryPlacement::Blob;
+    entry.ref = blob;
+    entry.blob_size = payload.size();
+    auto build = startBuildFor(store, ns, "late");
+    const ManifestId late_id = build->stageManifest({entry});
+    build->precommitAdd(ns, "late", late_id);
+    build->putBlob(blob, BlobSource::fromString(payload));
+    build->promote(ns, "late", build->buildId(), late_id);
+    build.reset();
+    ASSERT_TRUE(store->resolveRef(ns, "late"));
+
+    DropNamespaceStats stats;
+    ASSERT_NO_THROW(stats = store->dropNamespace(ns));
+    EXPECT_EQ(stats.committed_refs, 2u);
+    EXPECT_FALSE(store->namespaceStillLogicallyPresent(ns));
+
+    store->renewWatermarkOnce();
+    Gc gc(store, UInt128{1});
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
+    for (int round = 0; round < 16; ++round)
+    {
+        EXPECT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+        store->renewWatermarkOnce();
+        NamespaceJanitor(requests, layout, 100).runOnePage(false, [] { return true; });
+    }
+
+    EXPECT_FALSE(lifeIfCatalogedForTest(backend, layout, ns));
+    EXPECT_FALSE(readOf(backend, layout.refCkptKey(life)));
+    EXPECT_TRUE(listLogIdsForTest(*backend, layout, ns).empty());
+    EXPECT_FALSE(readOf(backend, layout.manifestKey(owned_id)));
+    EXPECT_FALSE(readOf(backend, layout.manifestKey(late_id)));
+    EXPECT_FALSE(readOf(backend, layout.blobKey(blob)));
+    EXPECT_FALSE(readOf(backend, layout.blobMetaKey(blob)));
 }
 
 /// spec §Namespace Removal (writer, line 666): "After the transaction is durable, it applies the same

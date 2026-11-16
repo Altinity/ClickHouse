@@ -3820,11 +3820,6 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
             && !rt->superseded_by_remount.load(std::memory_order_acquire);
     };
 
-    const bool positive_append = std::any_of(chunk_ops.begin(), chunk_ops.end(), [](const RefOp & op)
-    {
-        return (op.kind == RefOpKind::OwnerTransition && op.new_binding.has_value())
-            || op.kind == RefOpKind::SetPublishedAt;
-    });
     const bool removal_append = refLogTxnIsRemovalClass(chunk_ops);
 
     /// The local capability prevents callers from reaching this point through the generic API; the
@@ -3864,42 +3859,6 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
                     "CAS namespace removal '{}': terminal append requires its exact catalog life to be Removing",
                     ns.string());
-        }
-        catch (...)
-        {
-            complete_error(chunk_survivors, std::current_exception());
-            return false;
-        }
-    }
-
-    /// The pre-carve seam is above this call, so this is the final catalog admission observation before
-    /// id allocation. It closes the cached-runtime window in which another actor publishes `Removing`
-    /// after this writer's ordinary entry gates. A non-`Live` exact row permanently closes this local
-    /// positive lane; the terminal owner-removal transaction remains the one deliberate exception.
-    if (positive_append)
-    {
-        try
-        {
-            const uint64_t admitted_generation = rt->admitted_fence_generation;
-            CasOperation catalog_op = mount_requests.resume(admitted_generation, runtime_live);
-            const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(catalog_op, layout);
-            refuseUnlessAdmitted(catalog_op, "removal-class append");
-            const NamespaceLifeId & life = rt->life;
-            const auto entry_it = std::find_if(catalog.catalog.entries.begin(), catalog.catalog.entries.end(),
-                [&](const CatalogEntry & entry)
-                {
-                    return entry.ns == ns && entry.incarnation == life.incarnation;
-                });
-            if (entry_it == catalog.catalog.entries.end() || entry_it->state != NsState::Live)
-            {
-                {
-                    std::lock_guard queue_lock(ref_queue_mutex);
-                    rt->removal_admission_closed = true;
-                }
-                throwCasWriteRetryLater(fmt::format(
-                    "CAS ref-log append for namespace '{}': exact catalog life is no longer Live",
-                    ns.string()));
-            }
         }
         catch (...)
         {
