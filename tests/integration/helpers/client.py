@@ -248,6 +248,9 @@ class CommandRequest:
             return stdout, stderr
 
         finally:
+            # A `Timer` is not a daemon thread: one left running keeps the interpreter alive until it fires.
+            if self.timer is not None:
+                self.timer.cancel()
             self.stdin_file.close()
             self.stdout_file.close()
             self.stderr_file.close()
