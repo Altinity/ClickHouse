@@ -8,12 +8,18 @@ on:
     types:
       - completed
     branches:
+      - antalya-26.8
       - antalya-26.6
       - antalya-26.3
       - antalya-25.8
+      - stable-26.8
       - stable-26.3
       - stable-25.8
+      - releases/25.3.14
       - releases/24.8.14
+      - releases/24.3.18
+      - releases/23.8.16
+      - fips-25.3
   # Make sure that any changes to this file is actually tested with PRs
   pull_request:
     types:
@@ -35,17 +41,29 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - branch: antalya-26.8
+            workflow: master.yml
           - branch: antalya-26.6
             workflow: master.yml
           - branch: antalya-26.3
             workflow: master.yml
           - branch: antalya-25.8
             workflow: master.yml
+          - branch: stable-26.8
+            workflow: master.yml
           - branch: stable-26.3
             workflow: master.yml
           - branch: stable-25.8
             workflow: master.yml
+          - branch: releases/25.3.14
+            workflow: release_branches.yml
           - branch: releases/24.8.14
+            workflow: release_branches.yml
+          - branch: releases/24.3.18
+            workflow: release_branches.yml
+          - branch: releases/23.8.16
+            workflow: release_branches.yml
+          - branch: fips-25.3
             workflow: release_branches.yml
     name: ${{ matrix.branch }}
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
