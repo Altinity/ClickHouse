@@ -64,6 +64,9 @@ public:
         response->SetHeader("Content-Length", std::to_string(blob_size));
         response->SetHeader("Content-Range", "bytes 0-" + std::to_string(blob_size - 1) + "/" + std::to_string(blob_size));
         response->SetHeader("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT");
+        /// The Azure SDK pinned on 26.3 requires these headers in a download response.
+        response->SetHeader("x-ms-creation-time", "Wed, 21 Oct 2015 07:28:00 GMT");
+        response->SetHeader("x-ms-server-encrypted", "false");
         response->SetHeader("x-ms-blob-type", "BlockBlob");
         response->SetBodyStream(std::make_unique<OwningBodyStream>(std::vector<uint8_t>(blob_size, 'a')));
         return response;

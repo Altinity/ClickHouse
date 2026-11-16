@@ -635,7 +635,7 @@ def test_timestamp_types_cache_does_not_keep_metadata(started_cluster):
 
     metadata_size = int(
         node.query(
-            f"SELECT max(_size) FROM s3('http://minio1:9001/warehouse-glue/{test_ref}/metadata/*.metadata.json', "
+            f"SELECT max(_size) FROM s3('http://minio:9000/warehouse-glue/{test_ref}/metadata/*.metadata.json', "
             f"'{minio_access_key}', '{minio_secret_key}', 'One')"
         )
     )
