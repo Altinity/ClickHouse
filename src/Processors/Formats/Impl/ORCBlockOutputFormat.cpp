@@ -232,33 +232,6 @@ std::unique_ptr<ORC::Type> ORCBlockOutputFormat::getORCType(const DataTypePtr & 
         }
         case TypeIndex::Tuple:
         {
-<<<<<<< HEAD
-            orc::StructVectorBatch & struct_orc_column = dynamic_cast<orc::StructVectorBatch &>(orc_column);
-            const auto & tuple_column = assert_cast<const ColumnTuple &>(column);
-            auto nested_types = assert_cast<const DataTypeTuple *>(type.get())->getElements();
-            for (size_t i = 0; i != tuple_column.tupleSize(); ++i)
-            {
-                if (null_bytemap && nested_types[i]->isNullable())
-                {
-                    /// When both the struct and the element are nullable, we need to merge the two null bitmaps:
-                    /// a child value is null if either the struct row is null OR the element itself is null.
-                    const auto & nullable_col = assert_cast<const ColumnNullable &>(tuple_column.getColumn(i));
-                    const auto & element_null_map = nullable_col.getNullMapData();
-                    PaddedPODArray<UInt8> merged_null_map(element_null_map.size());
-                    for (size_t j = 0; j < element_null_map.size(); ++j)
-                        merged_null_map[j] = element_null_map[j] | (*null_bytemap)[j];
-
-                    auto nested_type = removeNullable(nested_types[i]);
-                    writeColumn(*struct_orc_column.fields[i], nullable_col.getNestedColumn(), nested_type, &merged_null_map);
-                }
-                else
-                {
-                    /// Propagate the struct-level null_bytemap to children so the ORC library correctly handles
-                    /// null struct rows (child values at null positions must also be marked null).
-                    writeColumn(*struct_orc_column.fields[i], tuple_column.getColumn(i), nested_types[i], null_bytemap);
-                }
-            }
-=======
             const auto * tuple_type = assert_cast<const DataTypeTuple *>(unwrapped.get());
             const auto & nested_names = tuple_type->getElementNames();
             const auto & nested_types = tuple_type->getElements();
@@ -266,7 +239,6 @@ std::unique_ptr<ORC::Type> ORCBlockOutputFormat::getORCType(const DataTypePtr & 
             for (size_t i = 0; i < nested_types.size(); ++i)
                 struct_type->addStructField(nested_names[i], getORCType(nested_types[i], Nested::concatenateName(column_path, nested_names[i])));
             result = std::move(struct_type);
->>>>>>> v26.3.64.3-lts
             break;
         }
         case TypeIndex::Map:

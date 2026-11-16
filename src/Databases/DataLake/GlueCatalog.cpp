@@ -20,11 +20,8 @@
 
 #include <Common/Exception.h>
 #include <Common/CurrentMetrics.h>
-<<<<<<< HEAD
 #include <Common/CurrentThread.h>
-=======
 #include <base/unit.h>
->>>>>>> v26.3.64.3-lts
 #include <Core/Settings.h>
 #include <Interpreters/Context.h>
 

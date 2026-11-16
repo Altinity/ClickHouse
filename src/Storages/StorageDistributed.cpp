@@ -221,12 +221,9 @@ namespace Setting
     extern const SettingsBool prefer_global_in_and_join;
     extern const SettingsBool skip_unavailable_shards;
     extern const SettingsBool enable_global_with_statement;
-<<<<<<< HEAD
     extern const SettingsBool allow_experimental_hybrid_table;
     extern const SettingsBool enable_alias_marker;
-=======
     extern const SettingsMap additional_table_filters;
->>>>>>> v26.3.64.3-lts
 }
 
 namespace DistributedSetting

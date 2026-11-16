@@ -840,36 +840,12 @@ bool FunctionSecretArgumentsFinder::maskAzureConnectionString(ssize_t url_arg_id
 
     if (!url_arg.starts_with("http") && maskAzureConnectionStringSecrets(url_arg))
     {
-<<<<<<< HEAD
-        static re2::RE2 account_key_pattern = "AccountKey=.*?(;|$)";
-        if (RE2::Replace(&url_arg, account_key_pattern, "AccountKey=[HIDDEN]\\1"))
-        {
-            chassert(result.count == 0); /// We shouldn't use replacement with masking other arguments
-            result.start = function->arguments->getRealIndex(url_arg_idx);
-            result.are_named = argument_is_named;
-            result.count = 1;
-            result.replacement = url_arg;
-            return true;
-        }
-
-        static re2::RE2 sas_signature_pattern = "SharedAccessSignature=.*?(;|$)";
-        if (RE2::Replace(&url_arg, sas_signature_pattern, "SharedAccessSignature=[HIDDEN]\\1"))
-        {
-            chassert(result.count == 0); /// We shouldn't use replacement with masking other arguments
-            result.start = function->arguments->getRealIndex(url_arg_idx);
-            result.are_named = argument_is_named;
-            result.count = 1;
-            result.replacement = url_arg;
-            return true;
-        }
-=======
         chassert(result.count == 0); /// We shouldn't use replacement with masking other arguments
-        result.start = url_arg_idx;
+        result.start = function->arguments->getRealIndex(url_arg_idx);
         result.are_named = argument_is_named;
         result.count = 1;
         result.replacement = url_arg;
         return true;
->>>>>>> v26.3.64.3-lts
     }
 
     return false;

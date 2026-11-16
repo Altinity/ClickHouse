@@ -87,7 +87,6 @@ void MultipleFileWriter::finalize()
     output_format->flush();
     output_format->finalize();
     buffer->finalize();
-<<<<<<< HEAD
 
     auto buffer_bytes = buffer->count();
     if (buffer_bytes > 0)
@@ -106,6 +105,9 @@ void MultipleFileWriter::finalize()
 
     per_file_record_counts.push_back(static_cast<Int64>(*current_file_num_rows));
     per_file_stats_list.push_back(current_file_stats);
+
+    /// A finished format can still hold resources: a Parquet one keeps its idle encoder threads.
+    release();
 }
 
 std::vector<IcebergDataFileEntry> MultipleFileWriter::getDataFileEntries() const
@@ -124,12 +126,6 @@ std::vector<IcebergDataFileEntry> MultipleFileWriter::getDataFileEntries() const
             per_file_stats_list[i]);
 
     return entries;
-=======
-    total_bytes += buffer->count();
-
-    /// A finished format can still hold resources: a Parquet one keeps its idle encoder threads.
-    release();
->>>>>>> v26.3.64.3-lts
 }
 
 void MultipleFileWriter::release()

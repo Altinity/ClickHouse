@@ -110,7 +110,6 @@ namespace ErrorCodes
     extern const int FILE_DOESNT_EXIST;
 }
 
-<<<<<<< HEAD
 void logIcebergFileStats(const ObjectInfoPtr & object_info, const LoggerPtr & log)
 {
 #if USE_AVRO
@@ -126,7 +125,8 @@ void logIcebergFileStats(const ObjectInfoPtr & object_info, const LoggerPtr & lo
     UNUSED(object_info);
     UNUSED(log);
 #endif
-=======
+}
+
 namespace
 {
     String getObjectStorageHash(const IObjectStorage & object_storage)
@@ -134,7 +134,6 @@ namespace
         const String description = object_storage.getDescription();
         return sipHash128String(description.substr(0, description.find('?')) + '\0' + object_storage.getObjectsNamespace());
     }
->>>>>>> v26.3.64.3-lts
 }
 
 StorageObjectStorageSource::StorageObjectStorageSource(

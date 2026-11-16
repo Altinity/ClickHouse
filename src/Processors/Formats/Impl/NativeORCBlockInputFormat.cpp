@@ -2685,11 +2685,7 @@ ColumnWithTypeAndName ORCColumnToCHColumn::readColumnFromORCColumn(
     bool skipped = false;
 
     if (!inside_nullable && (orc_column->hasNulls || (type_hint && isNullableOrLowCardinalityNullable(type_hint))) && !orc_column->isEncoded
-<<<<<<< HEAD
-        && (orc_type->getKind() != orc::LIST && orc_type->getKind() != orc::MAP))
-=======
         && (orc_type->getKind() != ORC::LIST && orc_type->getKind() != ORC::MAP && orc_type->getKind() != ORC::UNION))
->>>>>>> v26.3.64.3-lts
     {
         DataTypePtr nested_type_hint;
         if (type_hint)
@@ -3081,11 +3077,7 @@ ColumnWithTypeAndName ORCColumnToCHColumn::readColumnFromORCColumn(
                 : nullptr;
             if (tuple_type)
             {
-<<<<<<< HEAD
-                auto unwrapped = Nested::unwrapNullableTuple({array_data_column, nested_column.type, column_name});
-=======
                 auto unwrapped = unwrapORCNullableTuple({array_data_column, nested_column.type, column_name});
->>>>>>> v26.3.64.3-lts
                 array_data_column = unwrapped.column;
                 const auto & result_tuple = assert_cast<const DataTypeTuple &>(*unwrapped.type);
                 array_type = createNested(result_tuple.getElements(), result_tuple.getElementNames());

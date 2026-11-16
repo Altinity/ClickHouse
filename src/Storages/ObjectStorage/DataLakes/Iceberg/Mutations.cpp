@@ -267,7 +267,6 @@ static std::optional<WriteDataFilesResult> writeDataFiles(
             delete_data_writers[partition_key]->flush();
             delete_data_writers[partition_key]->finalize();
             delete_data_write_buffers[partition_key]->finalize();
-<<<<<<< HEAD
             {
                 auto delete_bytes = delete_data_write_buffers[partition_key]->count();
                 if (delete_bytes == 0)
@@ -275,11 +274,8 @@ static std::optional<WriteDataFilesResult> writeDataFiles(
                         path_resolver.resolve(delete_data_result[partition_key].path), /*with_tags=*/ false).size_bytes;
                 delete_data_result[partition_key].total_bytes = static_cast<Int32>(delete_bytes);
             }
-=======
-            delete_data_result[partition_key].total_bytes = static_cast<Int32>(delete_data_write_buffers[partition_key]->count());
             delete_data_writers[partition_key].reset();
             delete_data_write_buffers[partition_key].reset();
->>>>>>> v26.3.64.3-lts
         }
     }
 
@@ -342,7 +338,6 @@ static std::optional<WriteDataFilesResult> writeDataFiles(
             update_data_writers[partition_key]->flush();
             update_data_writers[partition_key]->finalize();
             update_data_write_buffers[partition_key]->finalize();
-<<<<<<< HEAD
             {
                 auto update_bytes = update_data_write_buffers[partition_key]->count();
                 if (update_bytes == 0)
@@ -350,11 +345,8 @@ static std::optional<WriteDataFilesResult> writeDataFiles(
                         path_resolver.resolve(update_data_result[partition_key].path), /*with_tags=*/ false).size_bytes;
                 update_data_result[partition_key].total_bytes = static_cast<Int32>(update_bytes);
             }
-=======
-            update_data_result[partition_key].total_bytes = static_cast<Int32>(update_data_write_buffers[partition_key]->count());
             update_data_writers[partition_key].reset();
             update_data_write_buffers[partition_key].reset();
->>>>>>> v26.3.64.3-lts
         }
     }
 

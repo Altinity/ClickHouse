@@ -1323,47 +1323,8 @@ namespace DB
                 auto column_type = header_columns[column_i].type;
                 if (!settings.low_cardinality_as_dictionary)
                     column = recursiveRemoveLowCardinality(column);
-<<<<<<< HEAD
-
-                // Generate the unwrapped builder schema (safe for MakeBuilder)
-                bool is_column_nullable = false;
-                auto builder_type = getArrowType(
-                    header_column.type, column, header_column.name, format_name, settings, &is_column_nullable, true /* for_builder */);
-
-                std::unique_ptr<arrow::ArrayBuilder> array_builder;
-                arrow::Status status = MakeBuilder(arrow::default_memory_pool(), builder_type, &array_builder);
-                checkStatus(status, column->getName(), format_name);
-
-                fillArrowArray(
-                    header_column.name,
-                    column,
-                    header_column.type,
-                    nullptr,
-                    array_builder.get(),
-                    format_name,
-                    0,
-                    column->size(),
-                    settings,
-                    dictionary_values);
-
-                std::shared_ptr<arrow::Array> arrow_array;
-                status = array_builder->Finish(&arrow_array);
-                checkStatus(status, column->getName(), format_name);
-
-                // Zero-copy cast to the extension-rich schema (handles infinite nesting)
-                auto target_type = arrow_schema->field(static_cast<int>(column_i))->type();
-                if (!arrow_array->type()->Equals(*target_type))
-                {
-                    auto view_result = arrow_array->View(target_type);
-                    checkStatus(view_result.status(), column->getName(), format_name);
-                    arrow_array = view_result.ValueOrDie();
-                }
-
-                table_data.at(column_i).emplace_back(std::move(arrow_array));
-=======
                 columns[column_i] = std::move(column);
                 column_types[column_i] = std::move(column_type);
->>>>>>> v26.3.64.3-lts
             }
 
             /// The row limit is measured on types matching the columns: without dictionary output the
@@ -1394,8 +1355,13 @@ namespace DB
                     const ColumnWithTypeAndName & header_column = header_columns[column_i];
                     ColumnPtr column = columns[column_i];
 
+                    /// Generate the unwrapped builder schema (safe for MakeBuilder)
+                    bool is_column_nullable = false;
+                    auto builder_type = getArrowType(
+                        header_column.type, column, header_column.name, format_name, settings, &is_column_nullable, true /* for_builder */);
+
                     std::unique_ptr<arrow::ArrayBuilder> array_builder;
-                    arrow::Status status = MakeBuilder(ArrowMemoryPool::instance(), arrow_schema->field(static_cast<int>(column_i))->type(), &array_builder);
+                    arrow::Status status = MakeBuilder(ArrowMemoryPool::instance(), builder_type, &array_builder);
                     checkStatus(status, column->getName(), format_name);
 
                     fillArrowArray(
@@ -1413,6 +1379,15 @@ namespace DB
                     std::shared_ptr<arrow::Array> arrow_array;
                     status = array_builder->Finish(&arrow_array);
                     checkStatus(status, column->getName(), format_name);
+
+                    /// Zero-copy cast to the extension-rich schema (handles infinite nesting)
+                    auto target_type = arrow_schema->field(static_cast<int>(column_i))->type();
+                    if (!arrow_array->type()->Equals(*target_type))
+                    {
+                        auto view_result = arrow_array->View(target_type);
+                        checkStatus(view_result.status(), column->getName(), format_name);
+                        arrow_array = view_result.ValueOrDie();
+                    }
 
                     table_data.at(column_i).emplace_back(std::move(arrow_array));
                 }

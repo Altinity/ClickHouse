@@ -904,7 +904,6 @@ def test_invalid_auth_header_format(started_cluster):
     assert "Invalid auth header format" in str(err.value)
 
 
-<<<<<<< HEAD
 def test_namespace_filter(started_cluster):
     node = started_cluster.instances["node1"]
 
@@ -981,16 +980,6 @@ def test_namespace_filter(started_cluster):
     assert "is filtered by `namespaces` database parameter." in node.query_and_get_error(f"DROP TABLE {CATALOG_NAME}.`{namespace_prefix}alpha.a2.{table_name}`")
 
 
-@pytest.mark.parametrize("join_mode", ["local", "global"])
-def test_cluster_joins(started_cluster, join_mode):
-    node = started_cluster.instances["node1"]
-
-    test_ref = f"test_join_tables_{uuid.uuid4()}"
-    table_name = f"{test_ref}_table"
-    table_name_2 = f"{test_ref}_table_2"
-    table_name_local = f"{test_ref}_table_local"
-
-=======
 def test_writes_mutate_update(started_cluster):
     node = started_cluster.instances["node1"]
 
@@ -1054,30 +1043,20 @@ def test_writes_mutate_delete(started_cluster):
     assert node.query(f"SELECT * FROM {table_ref} ORDER BY ALL") == "456\n890\n"
 
 
-def test_iceberg_file_progress_callback(started_cluster):
-    """
-    Regression test for the `IcebergIterator::next` file-progress callback wiring (PR #105413).
-
-    `IcebergIterator` stored a `FileProgressCallback` but never invoked it, so the
-    per-query `Progress.total_bytes_to_read` stayed at zero for Iceberg scans and
-    the progress bar showed no estimate. The fix invokes the callback with the data
-    file size for every object info returned. The assertion below uses the
-    `FileProgressCallbackInvocations` ProfileEvent, which is incremented inside the
-    callback lambda installed by `TCPHandler::setFileProgressCallback`, so removing
-    the `callback(...)` call in `IcebergIterator::next` makes this event stay at
-    zero for the test query.
-    """
+@pytest.mark.parametrize("join_mode", ["local", "global"])
+def test_cluster_joins(started_cluster, join_mode):
     node = started_cluster.instances["node1"]
 
-    test_ref = f"test_progress_callback_{uuid.uuid4().hex[:8]}"
+    test_ref = f"test_join_tables_{uuid.uuid4()}"
     table_name = f"{test_ref}_table"
->>>>>>> v26.3.64.3-lts
+    table_name_2 = f"{test_ref}_table_2"
+    table_name_local = f"{test_ref}_table_local"
+
     root_namespace = f"{test_ref}_namespace"
 
     catalog = load_catalog_impl(started_cluster)
     catalog.create_namespace(root_namespace)
 
-<<<<<<< HEAD
     schema = Schema(
         NestedField(
             field_id=1,
@@ -1299,7 +1278,30 @@ def test_partitioning_by_string(started_cluster):
     create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
 
     assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{namespace}.{table_name}`") == "a:b,c[d=e/f%g?h\ttest\t12:00:00.000000\n"
-=======
+
+
+def test_iceberg_file_progress_callback(started_cluster):
+    """
+    Regression test for the `IcebergIterator::next` file-progress callback wiring (PR #105413).
+
+    `IcebergIterator` stored a `FileProgressCallback` but never invoked it, so the
+    per-query `Progress.total_bytes_to_read` stayed at zero for Iceberg scans and
+    the progress bar showed no estimate. The fix invokes the callback with the data
+    file size for every object info returned. The assertion below uses the
+    `FileProgressCallbackInvocations` ProfileEvent, which is incremented inside the
+    callback lambda installed by `TCPHandler::setFileProgressCallback`, so removing
+    the `callback(...)` call in `IcebergIterator::next` makes this event stay at
+    zero for the test query.
+    """
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_progress_callback_{uuid.uuid4().hex[:8]}"
+    table_name = f"{test_ref}_table"
+    root_namespace = f"{test_ref}_namespace"
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(root_namespace)
+
     table = create_table(
         catalog,
         root_namespace,
@@ -1710,4 +1712,3 @@ def test_catalog_commit_conflict_reaches_caller_at_once(started_cluster):
     assert int(node.query(f"SELECT count() FROM {table_ref}")) == 4000000
 
     node.query(f"DROP DATABASE IF EXISTS {CATALOG_NAME}")
->>>>>>> v26.3.64.3-lts
