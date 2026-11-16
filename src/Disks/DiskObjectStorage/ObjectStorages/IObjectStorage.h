@@ -153,7 +153,7 @@ struct ObjectMetadata
     /// Cumulative start offsets of the object's multipart-upload parts (part i covers
     /// [part_offsets[i], part_offsets[i+1])). Populated best-effort via GetObjectAttributes; empty
     /// when unknown or single-PUT. Used to align reads to part boundaries.
-    std::vector<uint64_t> part_offsets;
+    std::vector<uint64_t> part_offsets = {};
 
     /// `etag` may be used as a content-cache key (filesystem cache, page cache, Parquet
     /// metadata cache) only when it is present and a strong content identifier. A weak
