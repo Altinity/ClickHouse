@@ -49,7 +49,7 @@ def seed_and_drop(node, disk):
         f"INSERT INTO t_{disk} SELECT number FROM numbers({INSERTS}) SETTINGS max_block_size = 1, "
         "max_insert_block_size = 1, min_insert_block_size_rows = 1, min_insert_block_size_bytes = 0, "
         "max_insert_threads = 1",
-        timeout=1800,
+        timeout=120,
     )
     assert len(stream_keys(disk)) >= INSERTS
     node.query(f"DROP TABLE t_{disk} SYNC")
