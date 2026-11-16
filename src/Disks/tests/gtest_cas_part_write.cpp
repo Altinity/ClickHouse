@@ -3,6 +3,7 @@
 #include <cmath>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <mutex>
 #include <thread>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
@@ -26,6 +27,8 @@
 #include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
 #include <Poco/Exception.h>
+#include <base/defines.h>
+#include "config.h"
 
 namespace ProfileEvents
 {
@@ -54,6 +57,7 @@ extern const int UNKNOWN_EXCEPTION;
 using namespace DB::Cas;
 using DB::Cas::tests::condemnMeta;
 using DB::Cas::tests::expectThrowsCode;
+using DB::Cas::tests::expectThrowsCodeWithMessage;
 using DB::Cas::tests::idOf;
 using DB::Cas::tests::injectRetire;
 using DB::Cas::tests::loadMetaForTest;
@@ -2306,11 +2310,63 @@ ManifestEntry wideBlobManifestEntry(size_t path_len)
     return e;
 }
 
+constexpr size_t kWideEntryPathLen = 60'000;
+
+/// `wideBlobManifestEntry(path_len)` whose path starts with the zero-padded `index`, so the paths are
+/// distinct and already in canonical order.
+ManifestEntry indexedWideBlobManifestEntry(size_t index, size_t path_len)
+{
+    ManifestEntry e = wideBlobManifestEntry(path_len);
+    const String prefix = fmt::format("{:08}", index);
+    e.path.replace(0, prefix.size(), prefix);
+    return e;
 }
 
-/// Boundary case 1/2: a manifest whose encoded size is the LARGEST that still fits under the cap stages
-/// successfully. Proves the cap enforcement isn't overly conservative — a real just-under-the-limit
-/// manifest is not mistakenly rejected.
+size_t manifestEncodedSize(const RootNamespace & ns, const std::vector<ManifestEntry> & entries)
+{
+    PartManifest probe;
+    probe.root_namespace_id = ns;
+    probe.entries = entries;
+    return encodePartManifest(probe).size();
+}
+
+/// Fills `out` with `Blob` entries whose manifest under `ns` encodes to exactly kExpectedManifestEncodedCap
+/// bytes. Every path is at most kWideEntryPathLen + 4096 bytes, so every record line is under 64 KiB.
+void fillEntriesToTheEncodedCap(const RootNamespace & ns, std::vector<ManifestEntry> & out)
+{
+    constexpr size_t path_len = kWideEntryPathLen;
+    constexpr size_t max_extra = 4096;
+    const size_t s1 = manifestEncodedSize(ns, {indexedWideBlobManifestEntry(0, path_len)});
+    const size_t s2 = manifestEncodedSize(
+        ns, {indexedWideBlobManifestEntry(0, path_len), indexedWideBlobManifestEntry(1, path_len)});
+    const size_t entry_cost = s2 - s1;
+    const size_t fixed = s1 - entry_cost;
+
+    const size_t budget = kExpectedManifestEncodedCap - fixed;
+    const size_t count = budget / entry_cost;
+    size_t left = budget - count * entry_cost;
+    out.clear();
+    for (size_t i = 0; i < count; ++i)
+        out.push_back(indexedWideBlobManifestEntry(i, path_len));
+    for (size_t i = 0; left > 0; ++i)
+    {
+        const size_t extra = std::min(max_extra, left);
+        out[i].path.append(extra, 'a');
+        left -= extra;
+    }
+
+    const auto excess
+        = static_cast<int64_t>(manifestEncodedSize(ns, out)) - static_cast<int64_t>(kExpectedManifestEncodedCap);
+    String & last_path = out[count - 1].path;
+    last_path.resize(static_cast<size_t>(static_cast<int64_t>(last_path.size()) - excess), 'a');
+
+    ASSERT_EQ(manifestEncodedSize(ns, out), kExpectedManifestEncodedCap);
+}
+
+}
+
+/// Boundary case 1/2: a manifest whose encoded size is exactly the cap stages successfully. Many entries
+/// reach that size so that every record line stays under the line cap and the body decodes.
 TEST(CASPartWriteTxn, ManifestCapEncodedBytesJustUnderStagesSuccessfully)
 {
     auto b = std::make_shared<InMemoryBackend>();
@@ -2326,22 +2382,20 @@ TEST(CASPartWriteTxn, ManifestCapEncodedBytesJustUnderStagesSuccessfully)
     auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .boot_ms_fn = [] { return uint64_t{0}; }});
     const RootNamespace ns{"srv1/tbl"};
 
-    const size_t path_len_over = findManifestEncodedCapBoundaryPathLen(ns);
-    ASSERT_GT(path_len_over, 1u);
-    const size_t path_len_under = path_len_over - 1;
-    ASSERT_LE(manifestEncodedSizeForPathLen(ns, path_len_under), kExpectedManifestEncodedCap);
+    std::vector<ManifestEntry> entries;
+    ASSERT_NO_FATAL_FAILURE(fillEntriesToTheEncodedCap(ns, entries));
 
     auto build = startBuildFor(s, ns, "wide_part");
-    const ManifestId id = build->stageManifest({wideBlobManifestEntry(path_len_under)});
+    const ManifestId id = build->stageManifest(std::move(entries));
     EXPECT_EQ(id.root_namespace, ns);
     OperationForTest op(*b);
     EXPECT_TRUE((*op).head(s->layout().manifestKey(id), Retry::once()).has_value())
         << "a just-under-cap manifest must actually be written";
 }
 
-/// Boundary case 2/2: a manifest whose encoded size exceeds the cap by the smallest possible margin
-/// (one more path byte than the passing case above) throws `LIMIT_EXCEEDED` fail-closed, BEFORE the body
-/// write — no manifest object lands in the backend for the rejected attempt.
+/// Boundary case 2/2: a one-entry manifest whose encoded size exceeds the cap by the smallest possible margin
+/// throws `LIMIT_EXCEEDED` fail-closed, BEFORE the body write — no manifest object lands in the backend for the
+/// rejected attempt.
 TEST(CASPartWriteTxn, ManifestCapEncodedBytesOverThrowsBeforeBodyWrite)
 {
     auto b = std::make_shared<InMemoryBackend>();
@@ -2374,6 +2428,164 @@ TEST(CASPartWriteTxn, ManifestCapEncodedBytesOverThrowsBeforeBodyWrite)
     EXPECT_EQ(keys_before, keys_after)
         << "stageManifest must fail closed before writing the manifest body, leaving no new objects";
 }
+
+/// The encoder accepts a `..` path segment that every reader rejects; staging must refuse such a body
+/// before it exists.
+TEST(CASPartWriteTxn, StageManifestRefusesAnEntryPathWithDotDot)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openPool(b);
+    const RootNamespace ns{"srv1/tbl"};
+    auto build = startBuildFor(s, ns, "part_1");
+
+    OperationForTest op(*b);
+    const size_t keys_before = (*op).list("", "", 100, Retry::once()).keys.size();
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+    {
+        build->stageManifest({blobManifestEntry("a/../b.bin", "x")});
+    });
+    EXPECT_EQ((*op).list("", "", 100, Retry::once()).keys.size(), keys_before);
+}
+
+/// One record line over 64 KiB, far under the size caps: the encoder writes it, no reader decodes it.
+TEST(CASPartWriteTxn, StageManifestRefusesARecordLineOverTheLineCap)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openPool(b);
+    const RootNamespace ns{"srv1/tbl"};
+    auto build = startBuildFor(s, ns, "part_1");
+
+    OperationForTest op(*b);
+    const size_t keys_before = (*op).list("", "", 100, Retry::once()).keys.size();
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+    {
+        build->stageManifest({wideBlobManifestEntry(70'000)});
+    });
+    EXPECT_EQ((*op).list("", "", 100, Retry::once()).keys.size(), keys_before);
+}
+
+TEST(CASPartWriteTxn, PromoteSendsNoManifestGet)
+{
+    auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
+    auto s = openPool(b);
+    const RootNamespace ns{"srv1/tbl"};
+
+    auto build = startBuildFor(s, ns, "part_1");
+    const ManifestId id = build->stageManifest({blobManifestEntry("data.bin", "payload")});
+    build->precommitAdd(ns, "part_1", id);
+    build->putBlob(idOf("payload"), BlobSource::fromString("payload"));
+    const uint64_t lists_before_promote = b->listTotal();
+    EXPECT_TRUE(build->promote(ns, "part_1", build->buildId(), id));
+    EXPECT_EQ(b->listTotal(), lists_before_promote);
+
+    const String key = s->layout().manifestKey(id);
+    EXPECT_EQ(b->getCount(key), 0u);
+    EXPECT_EQ(b->getStreamCount(key), 0u);
+    EXPECT_EQ(b->headCount(key), 0u);
+    EXPECT_EQ(b->writeCount(key), 1u) << "the counters must observe the manifest key at all";
+    /// After the counts: a reader may read the body.
+    EXPECT_TRUE(s->resolveRef(ns, "part_1").has_value());
+}
+
+namespace
+{
+
+/// `owner` staged and precommitted `id` for ref `part_1`; `other`, a build for the same ref, did not stage it.
+/// The body has no `Blob` entry, so the dependency-proof check has no leaf to refuse.
+struct ForeignStagedManifest
+{
+    std::shared_ptr<InMemoryBackend> backend = std::make_shared<InMemoryBackend>();
+    PoolPtr store = openPool(backend);
+    RootNamespace ns{"srv1/tbl"};
+    PartWriteTxnPtr owner = startBuildFor(store, ns, "part_1");
+    ManifestId id = owner->stageManifest({});
+    PartWriteTxnPtr other;
+
+    explicit ForeignStagedManifest(bool abandon_owner)
+    {
+        owner->precommitAdd(ns, "part_1", id);
+        if (abandon_owner)
+            owner->abandon();
+        other = startBuildFor(store, ns, "part_1");
+    }
+};
+
+}
+
+/// Only the staged-id check stands between a foreign id and a commit.
+#ifndef DEBUG_OR_SANITIZER_BUILD
+TEST(CASPartWriteTxn, PromoteOfAManifestStagedElsewhereIsRefused)
+{
+    ForeignStagedManifest f(/*abandon_owner=*/false);
+
+    const size_t tail = f.store->tailSinceSnapshotCountForTest(f.ns);
+    try
+    {
+        f.other->promote(f.ns, "part_1", f.other->buildId(), f.id);
+        FAIL() << "promote must refuse a manifest this transaction did not stage";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::LOGICAL_ERROR);
+        EXPECT_NE(e.message().find("was not staged by this transaction"), String::npos) << e.message();
+    }
+    EXPECT_EQ(f.store->tailSinceSnapshotCountForTest(f.ns), tail);
+    EXPECT_FALSE(f.store->resolveRef(f.ns, "part_1").has_value());
+
+    EXPECT_TRUE(f.owner->promote(f.ns, "part_1", f.owner->buildId(), f.id)) << "the transaction that staged it still promotes";
+}
+#endif
+
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+TEST(CASPartWriteTxnDeathTest, PromoteOfAManifestStagedElsewhereAborts)
+{
+    ForeignStagedManifest f(/*abandon_owner=*/false);
+
+    EXPECT_DEATH(
+        {
+            f.other->promote(f.ns, "part_1", f.other->buildId(), f.id);
+            std::_Exit(0);
+        },
+        "was not staged by this transaction");
+}
+#endif
+
+/// The staged-id check precedes the live-precommit check: a foreign id whose precommit was abandoned gets the
+/// staged-id refusal, not the retry-later refusal of a lost owner.
+#ifndef DEBUG_OR_SANITIZER_BUILD
+TEST(CASPartWriteTxn, PromoteOfAnAbandonedForeignManifestIsRefusedAsNotStaged)
+{
+    ForeignStagedManifest f(/*abandon_owner=*/true);
+
+    const size_t tail = f.store->tailSinceSnapshotCountForTest(f.ns);
+    try
+    {
+        f.other->promote(f.ns, "part_1", f.other->buildId(), f.id);
+        FAIL() << "promote must refuse a manifest this transaction did not stage";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::LOGICAL_ERROR) << e.message();
+        EXPECT_NE(e.message().find("was not staged by this transaction"), String::npos) << e.message();
+    }
+    EXPECT_EQ(f.store->tailSinceSnapshotCountForTest(f.ns), tail);
+    EXPECT_FALSE(f.store->resolveRef(f.ns, "part_1").has_value());
+}
+#endif
+
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+TEST(CASPartWriteTxnDeathTest, PromoteOfAnAbandonedForeignManifestAbortsAsNotStaged)
+{
+    ForeignStagedManifest f(/*abandon_owner=*/true);
+
+    EXPECT_DEATH(
+        {
+            f.other->promote(f.ns, "part_1", f.other->buildId(), f.id);
+            std::_Exit(0);
+        },
+        "was not staged by this transaction");
+}
+#endif
 
 /// spec §9.9 (mixed-algo pools, Phase 3 T2) — the W-DEP-SET cross-satisfaction crux: a manifest with
 /// two entries carrying the SAME digest VALUE under TWO DIFFERENT algos (`ch128:X` / `xxh3:X`). Only
@@ -2450,6 +2662,7 @@ public:
     /// instead, which every loop here surfaces unchanged. A caller whose retries are no longer bounded
     /// therefore FAILS on the wrong error code rather than running until the suite times out. 0 = off.
     int attempt_cap = 0;
+    int refuse_count = 0;                /// remaining definite refusals of matching body PUTs
 
     /// The fault sits on the write primitive: a staged part-manifest body is a create, which is a
     /// `write` with no precondition.
@@ -2464,6 +2677,14 @@ public:
             throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
                 "ManifestPutFaultBackend: {} attempts exceeded the cap of {}; the caller's retries are "
                 "no longer bounded", put_attempts, attempt_cap);
+#if USE_AWS_S3
+        if (refuse_count > 0)
+        {
+            --refuse_count;
+            throw DB::S3Exception("ManifestPutFaultBackend: simulated malformed request",
+                                  Aws::S3::S3Errors::UNKNOWN, "MalformedXML");
+        }
+#endif
         maybeFault(key, bytes, access);
         return InMemoryBackend::write(key, bytes, expected_value, access);
     }
@@ -2605,6 +2826,26 @@ TEST(CASPartWriteTxnStageManifestRetry, BudgetExhaustionMapsToNetworkError)
     EXPECT_TRUE((*op).list(s->layout().manifestNamespacePrefix(ns), "", 10, Retry::once()).keys.empty())
         << "an exhausted stage names nothing durable";
 }
+
+#if USE_AWS_S3
+/// A definitely refused body PUT throws from `stageManifest`, so no id exists that a `promote` could name.
+TEST(CASPartWriteTxnStageManifestRetry, RefusedPutReturnsNoId)
+{
+    auto b = std::make_shared<ManifestPutFaultBackend>();
+    auto s = openPool(b);
+    const RootNamespace ns{"srv/tbl"};
+
+    auto build = startBuildFor(s, ns, "part_refused");
+    b->refuse_count = 1;
+    expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "definitively failed", [&]
+    {
+        build->stageManifest({blobManifestEntry("a.bin", "a")});
+    });
+    EXPECT_EQ(b->put_attempts, 1);
+    OperationForTest op(*b);
+    EXPECT_TRUE((*op).list(s->layout().manifestNamespacePrefix(ns), "", 10, Retry::once()).keys.empty());
+}
+#endif
 
 /// =====================================================================================
 /// Blob publication retries re-stream from the writer's replayable source. A retry after a failed

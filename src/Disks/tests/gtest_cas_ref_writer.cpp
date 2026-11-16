@@ -6064,6 +6064,60 @@ TEST(CASRefWriterNamespaceRemoval, DropSupersededAfterItsDrainLeavesTheRowLive)
     EXPECT_FALSE(store->namespaceStillLogicallyPresent(ns));
 }
 
+/// A promote passes its liveness checks, stalls across a self-remount, and appends after the stale-precommit
+/// sweep of the new mount removed its precommit: the append is refused and commits nothing.
+TEST(CASRefWriterRemount, PromoteStalledAcrossARemountAfterTheStaleSweepIsRefused)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/promote_stalled_across_remount"};
+    publishEmptyPart(store, ns, "owned");
+    auto build = startBuildFor(store, ns, "late");
+    const ManifestId id = build->stageManifest({});
+    build->precommitAdd(ns, "late", id);
+
+    DB::Cas::tests::ManualBarrier park;
+    std::atomic<bool> parked_once{false};
+    SCOPE_EXIT({ build->setPromoteBeforeAppendHookForTest({}); });
+    std::future<std::pair<int, String>> promote_result;
+    SCOPE_EXIT({ park.release(); });
+
+    build->setPromoteBeforeAppendHookForTest([&]
+    {
+        if (!parked_once.exchange(true))
+            park.arriveAndWait();
+    });
+    promote_result = std::async(std::launch::async, [&]() -> std::pair<int, String>
+    {
+        try
+        {
+            build->promote(ns, "late", build->buildId(), id);
+            return {0, "committed"};
+        }
+        catch (const DB::Exception & e)
+        {
+            return {e.code(), e.message()};
+        }
+    });
+    park.waitUntilArrived();
+
+    fenceOutRefMount(*backend, layout.mountKey("test"));
+    ASSERT_TRUE(store->tryRemountOnce());
+    const uint64_t reclaimed = ProfileEvents::global_counters[ProfileEvents::CASRefStalePrecommitsReclaimed];
+    EXPECT_NO_THROW(updatePublishedAt(store, ns));
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefStalePrecommitsReclaimed] - reclaimed, 1u);
+    const std::vector<RefTxnId> logs = listLogIdsForTest(*backend, layout, ns);
+
+    park.release();
+    ASSERT_EQ(promote_result.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+    const auto [code, message] = promote_result.get();
+    EXPECT_EQ(code, DB::ErrorCodes::NETWORK_ERROR) << message;
+    EXPECT_NE(message.find("is no longer the live owner"), String::npos) << message;
+    EXPECT_EQ(listLogIdsForTest(*backend, layout, ns), logs);
+    EXPECT_FALSE(store->resolveRef(ns, "late"));
+}
+
 namespace
 {
 

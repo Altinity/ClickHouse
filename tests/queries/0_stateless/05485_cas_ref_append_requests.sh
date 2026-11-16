@@ -6,6 +6,7 @@
 # An ordinary ref-log append is one create of `_log/{epoch,seq}`: no `_ckpt` write, no read of `_ckpt` or of a
 # log. Per query: `_ckpt` writes, `_ckpt` and log reads, root `PUT`s and other `GET`s. A query whose requests
 # were not counted prints zero root `PUT`s and fails the reference.
+# The insert also prints its manifest reads and its manifest creates: a part publish reads no manifest back.
 # The first insert creates the namespace and is not measured.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -39,6 +40,12 @@ do
         FROM system.query_log
         WHERE current_database = currentDatabase() AND query_id = '$q' AND type = 'QueryFinish'"
 done
+
+${CLICKHOUSE_CLIENT} -q "
+    SELECT ProfileEvents['CASManifestGet'] + ProfileEvents['CASManifestGetStream'],
+           ProfileEvents['CASManifestPut']
+    FROM system.query_log
+    WHERE current_database = currentDatabase() AND query_id = '$Q1' AND type = 'QueryFinish'"
 
 ${CLICKHOUSE_CLIENT} -q "DROP TABLE t"
 

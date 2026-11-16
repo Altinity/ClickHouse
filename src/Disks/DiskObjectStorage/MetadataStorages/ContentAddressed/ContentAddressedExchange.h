@@ -91,8 +91,9 @@ enum class CaRelinkPrepare : uint8_t
 /// three outcomes and only two of them are knowledge:
 ///  - `Committed` -- the receiver's ref is committed.
 ///  - `MechanismFallbackAllowed` -- the promote is PROVEN to have committed nothing (it was rejected
-///    before its ref-log append: a body-absent precommit, a precommit that is no longer the live owner,
-///    a ref conflict), which leaves the sender's copy the only authority and its bytes a sound recovery.
+///    before its ref-log append: `requireAlive` refused a build that a namespace drop cancelled or whose
+///    mount incarnation was superseded, `NETWORK_ERROR`), which leaves the sender's copy the only authority
+///    and its bytes a sound recovery. A lost owner or a ref conflict is refused inside the append: `Unresolved`.
 ///  - `Unresolved` -- the ref-log append was attempted and did not come back with a verdict, so the ref
 ///    MAY be committed. This is NOT a mechanism fallback and must never be reported as one: fetching
 ///    the bytes after a relink that actually committed publishes the same part twice. The only sound
@@ -220,9 +221,8 @@ public:
     /// nothing about the window that follows it.
     ///
     /// On `MechanismFallbackAllowed` nothing was staged and `out` is null: the manifest did not decode,
-    /// or the local staging hit the retryable class (a body-absent precommit or a precommit that is no
-    /// longer the live owner -- `ABORTED`; a ref already committed with other content -- write-retry-later
-    /// `NETWORK_ERROR`). Any OTHER error propagates, an ownership conflict included.
+    /// or the local staging hit the retryable class (`ABORTED` or `NETWORK_ERROR`). Any OTHER error
+    /// propagates, an ownership conflict included.
     ///
     /// Promotion trusts the adopted references through the durable manifest edge -- it does not re-read
     /// each blob body -- the same interserver trust as an ordinary `ReplicatedMergeTree` fetch. A blob

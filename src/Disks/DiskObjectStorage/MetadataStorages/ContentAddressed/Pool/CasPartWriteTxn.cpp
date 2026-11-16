@@ -668,7 +668,7 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
 
     /// Build the body. payload_digest is integrity/debug only — never a key, never dedup, never
     /// in-degree. The body repeats its own ref + namespace for fail-closed RefMatchesBody /
-    /// ManifestNamespaceMatches at read/fold/promote time.
+    /// ManifestNamespaceMatches at read and fold time.
     const RootNamespace owning_ns = manifestNamespace();
     PartManifest body;
     body.ref = ref;
@@ -677,11 +677,26 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
     body.payload_digest = computePayloadDigest(body);
     /// The cap is measured over the canonical text before sealing, not the compressed PUT bytes.
     /// 256 MiB comfortably bounds the largest realistic manifest, including its JSON structure.
-    const String encoded_text = encodePartManifest(body);
-    if (encoded_text.size() > kMaxManifestEncodedBytes)
-        throw Exception(ErrorCodes::LIMIT_EXCEEDED,
-            "stageManifest: encoded manifest {} bytes exceeds cap {}", encoded_text.size(), kMaxManifestEncodedBytes);
-    const String encoded = sealObject(FormatId::PartManifest, encoded_text);
+    String encoded;
+    {
+        /// Scoped so the text is freed before the decode below.
+        const String encoded_text = encodePartManifest(body);
+        if (encoded_text.size() > kMaxManifestEncodedBytes)
+            throw Exception(ErrorCodes::LIMIT_EXCEEDED,
+                "stageManifest: encoded manifest {} bytes exceeds cap {}", encoded_text.size(), kMaxManifestEncodedBytes);
+        encoded = sealObject(FormatId::PartManifest, encoded_text);
+    }
+
+    /// The encoder accepts bodies the decoder rejects (a `..` path segment, a line over the line cap). Decode
+    /// with the readers' own expression so such a body fails here, before any object exists, and so `promote`
+    /// can take its leaves from here instead of reading the body back.
+    auto leaves = std::make_shared<std::vector<BlobRef>>();
+    {
+        const PartManifest validated = decodePartManifest(openObject(FormatId::PartManifest, encoded));
+        for (const ManifestEntry & e : validated.entries)
+            if (e.placement == EntryPlacement::Blob)
+                leaves->push_back(e.ref);
+    }
 
     const ManifestId id{owning_ns, ref};
     const String key = store->layout().manifestKey(id);
@@ -740,7 +755,7 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
     });
 
     staged_manifests.push_back(id);
-    staged_manifest_ids.insert(id);   /// A3 mint-tightening: `precommitAdd`'s only legal fresh-ownership source
+    staged_manifest_leaves.emplace(id, std::move(leaves));
     return id;
 }
 
@@ -757,17 +772,19 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
 
     /// A3 mint-tightening (ABA barrier for the relink confirm's exact-`ManifestRef` equality): an
     /// unowned `ManifestId` may enter ownership only from the transaction that freshly staged it.
-    /// Evaluated HERE (synchronously, off this transaction's own private `staged_manifest_ids` --
+    /// Evaluated HERE (synchronously, off this transaction's own private `staged_manifest_leaves` --
     /// never mutated concurrently, so no snapshot races) rather than read live inside the closure
     /// below, because it does not depend on ledger state at all. The bool is captured BY VALUE into
     /// the closure -- consistent with every other capture there -- rather than capturing `this`,
     /// which would let a closure that outlives this stack (see the capture comment below) dereference
     /// a dead transaction. Enforcement, however, is NOT done here: see the closure for why.
-    const bool id_staged_by_this_txn = staged_manifest_ids.contains(id);
+    const bool id_staged_by_this_txn = staged_manifest_leaves.contains(id);
 
     /// One `owner_transition` create-precommit op.
-    /// No body HEAD — a missing body is a legal fail-closed, non-activating intent, unchanged from the
-    /// old protocol. Precommit ownership carries NO separate build token: `id.ref` (writer_epoch,
+    /// No body HEAD: a fresh id comes only from this transaction's `stageManifest`, which returns it only
+    /// after the body's create landed. A body deleted later is noticed by GC only while it folds the
+    /// precommit edge, and afterwards by readers and fsck.
+    /// Precommit ownership carries NO separate build token: `id.ref` (writer_epoch,
     /// build_sequence, manifest_ordinal) IS the build identity (the tuple
     /// §Transaction Log Format: "there is no second build token"). `build_ops` is invoked from inside
     /// the per-namespace flush, so it sees the table's CURRENT state including any earlier item of the
@@ -865,20 +882,8 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "promote: manifest namespace '{}' != target namespace '{}'",
             id.root_namespace.string(), target_ns.string());
-
-    /// Read + validate the manifest body ONCE (O(manifest entries), one streaming read). Absent or
-    /// invalid ⇒ fail closed: a committed ref must never name a missing/mismatched manifest.
-    const String manifest_key = store->layout().manifestKey(id);
-    CasOperation op = store->mountRequests().admit();
-    const auto body_got = op.read(manifest_key, Retry::standard());
-    if (!body_got)
-        throwCasWriteRetryLater(fmt::format(
-            "promote: manifest body absent at {} — failing closed (retry with a fresh ManifestId)", manifest_key));
-    const PartManifest body = decodePartManifest(openObject(FormatId::PartManifest, body_got->bytes));
-    if (!refMatchesBody(id.ref, body))
-        throwCasWriteRetryLater(fmt::format("promote: RefMatchesBody failed for {}", manifest_key));
-    if (!manifestNamespaceMatches(target_ns, body))
-        throwCasWriteRetryLater(fmt::format("promote: ManifestNamespaceMatches failed for {}", manifest_key));
+    if (promote_before_append_hook_for_test)
+        promote_before_append_hook_for_test();
 
     /// Blob readiness is checked inside the append closure below, after owner liveness. It consumes
     /// only this build's explicit dependency proofs and performs no backend copy-forward.
@@ -896,6 +901,9 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
     /// or a genuine first-time bind (no committed row -> true). Same in-closure-output pattern as
     /// `repoint_old` immediately below; read by the caller only after `appendRefOps` returns.
     bool created = false;
+    const auto staged_it = staged_manifest_leaves.find(id);
+    std::shared_ptr<const std::vector<BlobRef>> staged_leaves
+        = staged_it == staged_manifest_leaves.end() ? nullptr : staged_it->second;
     /// Recorded BEFORE the append for the same reason `precommitAdd` records its intent before its own:
     /// the append is the point past which failure stops being proof of the negative. Everything above
     /// this line is validation that rejects without publishing anything, so a throw there leaves
@@ -904,13 +912,13 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
     commit_state = CommitState::Uncertain;
     store->appendRefOps(target_ns, MutationScope::ref(final_ref_name),
         /// Capture the closure's INPUTS by value (ref name, manifest id, promote build id, repoint flag,
-        /// and the manifest `body` it revalidates) rather than `[&]`, as defense-in-depth against a
-        /// closure outliving this stack. Unlike `precommitAdd`, this closure cannot be made fully
-        /// self-contained: `dependencyProof` reads this build's `deps` member (so it must
-        /// keep `this`), and `repoint_old`/`created` are OUTPUTS read after the call returns (so they stay
-        /// references). The ref-lane leadership guard is the real fix; both residual by-reference captures
-        /// are safe because the guard guarantees the closure is never invoked after this frame unwinds.
-        [this, final_ref_name, id, promote_build_id, policy, body, &repoint_old, &created]
+        /// staged leaves) rather than `[&]`, as defense-in-depth against a closure outliving this stack.
+        /// Unlike `precommitAdd`, this closure cannot be made fully self-contained: `dependencyProof` reads
+        /// this build's `deps` member (so it must keep `this`), and `repoint_old`/`created` are OUTPUTS
+        /// read after the call returns (so they stay references). The ref-lane leadership guard is the real
+        /// fix; the residual by-reference state is safe because the guard guarantees the closure is never
+        /// invoked after this frame unwinds.
+        [this, final_ref_name, id, promote_build_id, policy, staged_leaves, &repoint_old, &created]
         (const RefTableState & state) -> std::vector<RefOp>
         {
             created = !state.getCommitted().contains(final_ref_name);
@@ -923,6 +931,13 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             if (const auto it = state.getCommitted().find(final_ref_name);
                 it != state.getCommitted().end() && it->second.manifest_ref == id.ref)
                 return {};
+
+            /// The rule of `precommitAdd`, here because the leaves of a foreign id are unknown: without it a
+            /// foreign id whose precommit is live would commit with no leaf checked.
+            if (!staged_leaves)
+                throw Exception(ErrorCodes::LOGICAL_ERROR,
+                    "promote: manifest '{}' was not staged by this transaction and is not the current committed manifest of ref '{}'",
+                    manifestRefDebugString(id.ref), final_ref_name);
 
             if (policy.expected)
             {
@@ -962,16 +977,14 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             /// build's precommit edge is durable — matching the relink trust model (ordinary
             /// ReplicatedMergeTree interserver trust). A genuinely-absent adopted blob is an invariant
             /// violation caught by fsck, not here.
-            for (const ManifestEntry & e : body.entries)
+            for (const BlobRef & leaf : *staged_leaves)
             {
-                if (e.placement != EntryPlacement::Blob)
-                    continue;
-                const auto proof = dependencyProof(e.ref);
+                const auto proof = dependencyProof(leaf);
                 if (!proof)
                     throw Exception(ErrorCodes::LOGICAL_ERROR,
                         "promote: blob leaf {} has no dependency proof at commit — a pending upload "
                         "never completed; failing closed",
-                        store->layout().blobKey(e.ref));
+                        store->layout().blobKey(leaf));
 
                 switch (*proof)
                 {
@@ -993,7 +1006,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
                         {
                             ev.type = CasEventType::BlobReuseAdopt;
                             ev.object_kind = CasEventObjectKind::Blob;
-                            ev.object_hash = blobIdOf(e.ref);
+                            ev.object_hash = blobIdOf(leaf);
                             ev.outcome = "adopt";
                             ev.reason = "manifest-trust";   /// distinguishable trusted-adopt class (empty token)
                         });
@@ -1002,7 +1015,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
 
                 throw Exception(ErrorCodes::LOGICAL_ERROR,
                     "promote: blob leaf {} has an unnamed dependency proof at commit; failing closed",
-                    store->layout().blobKey(e.ref));
+                    store->layout().blobKey(leaf));
             }
 
             /// Refuse to overwrite a live committed ref that names a DIFFERENT manifest: that would orphan the

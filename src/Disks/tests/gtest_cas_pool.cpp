@@ -176,10 +176,10 @@ ManifestRef manifestRefFor(const String & tag)
 }
 
 /// Publish a part holding the given manifest entries verbatim through the real PartWriteTxn. Used by read-path
-/// lookup/list tests that want a precise multi-entry manifest. Each Blob entry's body MUST be present at
-/// promote: the promote gate revalidates EVERY blob leaf with a HEAD and fails closed on an absent body.
-/// So write a blob body for each Blob entry (addressed by its hash) and record it as W-EVIDENCE before
-/// staging. Inline entries need no body. Returns the published ManifestId.
+/// lookup/list tests that want a precise multi-entry manifest. Promote fails closed on a Blob leaf without
+/// a dependency proof, so write a blob body for each Blob entry (addressed by its hash) and record it as
+/// W-EVIDENCE (`adoptEvidence`, a `TrustedManifest` proof) before staging. Inline entries need no body.
+/// Returns the published ManifestId.
 ManifestId publishPartWithEntries(
     const PoolPtr & s, const String & ns, const String & ref, std::vector<ManifestEntry> entries)
 {
@@ -190,8 +190,7 @@ ManifestId publishPartWithEntries(
     for (const auto & e : entries)
         if (e.placement == EntryPlacement::Blob)
         {
-            /// Materialize the blob body so the promote-time HEAD revalidation succeeds, then record the
-            /// tokenless W-EVIDENCE dep (the gate re-observes the current token at promote).
+            /// Write the blob body, then record the W-EVIDENCE dep that promote's dependency-proof check needs.
             DB::Cas::tests::writeBlobBody(*s->poolBackendPtr(), s->layout(), e.ref.digest.toU128());
             build->adoptEvidence(e);
         }
@@ -919,8 +918,8 @@ TEST(CASPool, ReadManifestValidatesBodyAndFailsClosed)
 
     /// (3) a committed ref naming a manifest with NO body present => readManifest throws
     /// FILE_DOESNT_EXIST (INV-NO-DANGLE surfaced on the read path). resolveRef itself SUCCEEDS — refs
-    /// are pure manifest state. A raw ref-log fixture (not the real PartWriteTxn path, which validates the
-    /// body exists at promote) is the only way to construct this state.
+    /// are pure manifest state. A raw ref-log fixture builds this state directly; on the real PartWriteTxn
+    /// path `stageManifest` returns an id only after the body is written.
     {
         const ManifestRef missing_ref = manifestRefFor("never-staged");
         DB::Cas::tests::fixture::writeRefLogRaw(*b, layout, RefLogTxn{ns.string(), RefTxnId{1, 1},
