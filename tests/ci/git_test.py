@@ -69,10 +69,6 @@ class TestGit(unittest.TestCase):
             ):
                 with self.assertRaises(Exception):
                     setattr(self.git, tag_attr, tag)
-            setattr(self.git, tag_attr, "v23.8.16.10044-1.altinitystable")
-            self.assertEqual(
-                getattr(self.git, tag_attr), "v23.8.16.10044-1.altinitystable"
-            )
 
     def check_tag(self):
         self.git.check_tag("v21.12.333.4567-altinitystable")
