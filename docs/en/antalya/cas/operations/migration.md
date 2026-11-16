@@ -191,7 +191,7 @@ that runs an older build, upgrade all of them, then start them.
 | Floor raise | The first writable mount logs a WARNING: `min_reader_generation raised 1 -> 3; readers below generation 3 can no longer mount this pool` (`2 -> 3` on a pool already at 2). `clickhouse-disks cas-drop-member` mounts the pool writable too and raises the floor the same way. A mount with `readonly` set never raises it |
 | Namespace stamp | The first write into a namespace replaces its `_ckpt` with the generation 3 body, once, before the namespace's first tombstone or append. A namespace nothing writes to stays unstamped. A namespace created by this build is stamped at creation |
 | First append of an epoch | One extra `PUT`: the tombstone that links the previous epoch's chain to this one |
-| Steady state | A positive append costs 2 requests instead of 4, and a ref removal 1 instead of 3 |
+| Steady state | A positive append costs 1 request instead of 4, and a ref removal 1 instead of 3 |
 | Recovery of a quiet namespace | 6 requests after admission; 7 when the snapshot base carries a backlink to a predecessor's tombstone, which recovery reads too. After an unclean predecessor, recovery also writes one tombstone and, on a namespace not yet stamped, the `_ckpt` stamp before it |
 
 ### Counters and tools after the upgrade {#upgrade-generation-3-observability}

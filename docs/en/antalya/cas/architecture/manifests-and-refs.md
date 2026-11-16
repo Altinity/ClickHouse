@@ -272,20 +272,19 @@ sealed bytes. The next flush must resolve *that exact key* before it may allocat
 id — an unresolved write can never silently become a gap, and the ledger never double-publishes.
 
 An ordinary append is one create-if-absent of `_log/<epoch>-<sequence>`. A log that is durable on the
-chain is committed history, and no append reads or writes `_ckpt`. Whether a mutation also pays a
-catalog `GET` depends on its kind: a positive append (a new binding, `Move`, `SetPublishedAt`) and the
-terminal `RemoveNamespace` append read the catalog row first, and a plain ref removal does not. The
+chain is committed history, and no append reads or writes `_ckpt`. No ordinary append reads the
+catalog; only the terminal `RemoveNamespace` append reads its catalog row first. The
 acknowledgement is fenced by the mount lease, checked after the response and again inside the install hold.
 
 | Operation | Requests |
 |---|---|
-| Positive append | 2: catalog `GET`, log `PUT` |
+| Positive append | 1: log `PUT` |
 | Ref removal | 1: log `PUT` |
 | Terminal `RemoveNamespace` append | 2: catalog `GET`, log `PUT` |
 | First append of an epoch in a namespace | one more: the tombstone `PUT` |
-| New part without blobs | 8: manifest `PUT` 1, precommit 2, manifest `GET` 1, promote 2, `Move` 2 |
+| New part without blobs | 4: manifest `PUT` 1, precommit 1, promote 1, `Move` 1 |
 
-Warm namespace, one writer. Each ref-log mutation that reads the catalog row costs that `GET` plus its log `PUT`.
+The counts are for a warm namespace and one writer.
 
 If the log is durable but the install is refused, the lane moves to `NeedsRecovery`: the record is
 history and is never acknowledged. If the outcome of the `PUT` is unknown, the lane is wedged and

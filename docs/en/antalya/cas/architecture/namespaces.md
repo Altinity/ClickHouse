@@ -135,16 +135,26 @@ When the drop fails before the row is `Removing`, what happens to the lane depen
 - An attempt was sent and the row is not proven `Removing`: the write may have reached the store and
   may still land. The lane stays closed, even if a fresh read shows the original `Live` row.
 
+A runtime acquired for a row that is already `Removing` (a presence probe, a retried `DROP TABLE`)
+refuses writes from the moment it exists with "is Removing" and serves no reads. A failed removal does
+not reopen it.
+
 A lane closed by an unresolved removal write has two ways out: a retried `DROP TABLE` that completes
 the removal, or a remount of the disk (a server restart, or the self-remount after a lost lease). A
-remount reopens the lane but does not cancel the write: if the write lands afterwards, the row becomes
-`Removing` and later writes to the table fail. Until one of the two happens:
+remount reopens the lane but does not cancel the write. Until one of the two happens:
 
 - Writes to the table fail with a retry-later error that says "a removal write may still land".
 - Reads see the table as absent, although the catalog row can still be `Live`.
 - The ref-table cache does not evict the table, because a fresh runtime would start with the lane open.
 - The server logs `the outcome of its Live -> Removing catalog write is unknown` once per drop attempt
   that ends this way.
+
+If the write lands after a remount, the row becomes `Removing` while the table keeps accepting writes
+and serving reads. The stop comes when an admission reads the row: a restart, a remount, a
+`DROP TABLE`; on the server that is the `GC` leader, also its next `GC` round. An eviction of the
+runtime or a presence probe is not a reliable stop. From then on writes fail with "is Removing" and
+reads see no files. Without a terminal record `GC` does not erase the row and deletes none of the
+table's live data; it still cleans what the table itself dropped, as for a live table.
 
 Nothing is deleted by the writer at this point. No blob, no manifest, no ref-log object physically
 disappears here — only pointers move, exactly like an ordinary [`DROP TABLE`](/antalya/cas/architecture/part-lifecycle#operation-mapping)

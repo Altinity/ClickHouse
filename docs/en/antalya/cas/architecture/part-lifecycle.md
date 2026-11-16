@@ -53,7 +53,6 @@ sequenceDiagram
     end
     PW->>PW: merge upload results on the owning thread, one no-throw swap
     TX->>PW: promote
-    PW->>S3: GET and validate the precommit manifest body
     PW->>S3: append ref-log txn: retire old committed, Precommit to Committed, SetPublishedAt
     Note over PW: commit durable, then retire the build sequence
     end
@@ -71,7 +70,10 @@ one ref-log `Move` of the committed ref (see [replication](replication.md)).
 
 **Step 1 — `stageManifest`.** Caps (see the
 [manifests-and-refs page](/antalya/cas/architecture/manifests-and-refs#part-manifests)) are
-checked before the write; the id is minted as `{epoch, build_seq, ordinal++}`; the body goes out
+checked before the write; the id is minted as `{epoch, build_seq, ordinal++}`. The manifest is
+encoded and then decoded with the readers' own decoder, so a body no reader would accept (a `..`
+path segment, a line over the line cap) fails with `CORRUPTED_DATA` before any object exists. The
+decode also records the blob leaves that `promote` checks. The body goes out
 with a conditional create and no preliminary `HEAD`. Blob publication is different; manifests
 remain small write-once metadata objects. Both a definite failure and an unresolved
 outcome throw retry-later.
@@ -95,7 +97,8 @@ explicit `Materialized` proof. A trusted source manifest instead yields `Trusted
 blob I/O. Pool size is the
 server setting `cas_blob_upload_pool_size` (default 16).
 
-**Step 4 — `promote`.** Reads and revalidates the precommit manifest body once; sets the commit
+**Step 4 — `promote`.** Sends no manifest request: the leaves recorded by `stageManifest` are the
+dependency set. It sets the commit
 state to Uncertain before the append — past that point, failure is no longer proof of the negative
 — then checks that the precommit is still the live owner and validates explicit dependency proofs.
 `Materialized` leaves are edge-protected; `TrustedManifest` leaves are trusted through the durable

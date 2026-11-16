@@ -69,7 +69,7 @@ sequenceDiagram
 | 4 | The receiver trusts nothing from the wire but the entry list | The sender's manifest id, namespace and payload digest are ignored; the target namespace and ref come from the receiver's own router, and manifest path hygiene is validated at decode |
 | 5 | The confirm answers from memory and is fail-closed | A cold, evicted, unfenced or terminal mount answers `Unknown`, with no object-store request. `No` and `Unknown` both go on the wire as `unproven`, because the fence check is evaluated last, so a `No` cannot be distinguished from "cannot prove it right now". Before a `Yes`, the sender checks that it still owns its mount slot, and answers `Unknown` unless the check passes (details below the table) |
 | 6 | Only the literal `yes` authorizes promotion | Everything else — including a timeout — is one outcome: throw and retry later |
-| 7 | Promote outcomes are three-way | `Committed` proceeds; a **proven** not-committed state (body-absent precommit, precommit no longer live owner, ref conflict) falls back to a byte fetch; `Unresolved` **throws**, because returning "fall back" there would publish the part twice |
+| 7 | Promote outcomes are three-way | `Committed` proceeds; a **proven** not-committed state (the build was cancelled or its mount was superseded before the append) falls back to a byte fetch; `Unresolved` **throws**, because returning "fall back" there would publish the part twice. A lost precommit owner or a ref conflict is detected inside the append, so it is `Unresolved` |
 
 The slot check in gate 5 works like this:
 
@@ -109,8 +109,8 @@ is retried by the queue, while a manual `FETCH PART` or `FETCH PARTITION` report
 The part is never quietly placed on another disk instead. This is the behaviour a single-disk
 content-addressed policy always had, and a mixed policy now shares it.
 
-The byte-fetch fallback after a relink that failed for a mechanism reason (a corrupted manifest, a
-body-absent precommit, a ref conflict) re-requests the bytes on the same pool disk, where they
+The byte-fetch fallback after a relink that failed for a mechanism reason (for example a corrupted
+manifest) re-requests the bytes on the same pool disk, where they
 content-address and deduplicate against the pool — the placement outlives the relink. A manifest of a
 newer format generation is not degraded to bytes today (a tracked gap, `[relink-fallback-unknown-format-version]`
 in the backlog).
