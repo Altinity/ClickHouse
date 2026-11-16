@@ -281,8 +281,13 @@ def get_version_from_string(
 
 def get_version_from_tag(tag: str) -> ClickHouseVersion:
     Git.check_tag(tag)
-    tag, description = tag[1:].split("-", 1)
-    version = get_version_from_string(tag)
+    body = tag[1:]
+    # Rebuild tags use "-1." before the version type, e.g. v23.8.16.10044-1.altinitystable
+    if "-1." in body:
+        version_str, description = body.split("-1.", 1)
+    else:
+        version_str, description = body.split("-", 1)
+    version = get_version_from_string(version_str)
     version.with_description(description)
     return version
 
