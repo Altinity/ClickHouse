@@ -6317,20 +6317,53 @@ def test_liquid_clustering_predicate_fallback(started_cluster):
     # the delta-kernel engine predicate). `restrictFilterDAGToInputs` will
     # replace the non-clustering conjunct with constant true, leaving only
     # `a = 42` for the fallback predicate to push for file-level skipping.
-    fallback_query_id = f"{TABLE_NAME}_fallback"
+    # Unsupported nodes alone do not set an exception: the original scan already
+    # prunes on `a = 42` (AND(a = 42, Unknown)) and is kept, so the fallback is not used.
+    noop_query_id = f"{TABLE_NAME}_no_fallback"
     result = instance.query(
         f"SELECT a FROM {TABLE_NAME} WHERE a = 42 AND cityHash64(c) != 0",
-        query_id=fallback_query_id,
+        query_id=noop_query_id,
     )
     assert result.strip() == "42"
 
-    instance.query("SYSTEM FLUSH LOGS")
-    fallback_count = int(
-        instance.query(
-            f"SELECT ProfileEvents['DeltaLakeClusteringPredicateFallbacks'] "
-            f"FROM system.query_log WHERE query_id = '{fallback_query_id}' AND type = 'QueryFinish'"
-        ).strip()
+    # A translation exception makes the fallback scan replace the original one.
+    fallback_query_id = f"{TABLE_NAME}_fallback"
+    instance.query("SYSTEM ENABLE FAILPOINT delta_kernel_fail_literal_visitor")
+    try:
+        result = instance.query(
+            f"SELECT a FROM {TABLE_NAME} WHERE a = 42 AND cityHash64(c) != 0",
+            query_id=fallback_query_id,
+        )
+    finally:
+        instance.query("SYSTEM DISABLE FAILPOINT delta_kernel_fail_literal_visitor")
+    assert result.strip() == "42"
+
+    # Full scan as the baseline for file skipping.
+    full_scan_id = f"{TABLE_NAME}_full_scan"
+    instance.query(
+        f"SELECT count() FROM {TABLE_NAME} SETTINGS optimize_trivial_count_query = 0",
+        query_id=full_scan_id,
     )
-    assert fallback_count >= 1, (
-        f"Expected the clustering predicate fallback to fire, but got {fallback_count} hits"
+
+    instance.query("SYSTEM FLUSH LOGS")
+
+    def profile_event(query_id, event):
+        return int(
+            instance.query(
+                f"SELECT ProfileEvents['{event}'] "
+                f"FROM system.query_log WHERE query_id = '{query_id}' AND type = 'QueryFinish'"
+            ).strip()
+        )
+
+    assert profile_event(noop_query_id, "DeltaLakeClusteringPredicateFallbacks") == 0
+    assert profile_event(fallback_query_id, "DeltaLakeClusteringPredicateFallbacks") >= 1, (
+        "Expected the clustering predicate fallback to fire after a translation exception"
+    )
+
+    # The fallback scan must actually prune files, not just be counted.
+    full_scan_files = profile_event(full_scan_id, "DeltaLakeScannedFiles")
+    fallback_scan_files = profile_event(fallback_query_id, "DeltaLakeScannedFiles")
+    assert fallback_scan_files < full_scan_files, (
+        f"Expected the fallback predicate to enable file skipping: fallback query scanned "
+        f"{fallback_scan_files} files but full scan scanned {full_scan_files} files"
     )

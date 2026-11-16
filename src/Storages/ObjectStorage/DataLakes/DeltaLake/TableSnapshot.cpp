@@ -234,7 +234,9 @@ public:
                 if (has_function)
                 {
                     std::exception_ptr fallback_exception;
-                    auto fallback_predicate = getEnginePredicate(restricted_dag, fallback_exception, nullptr);
+                    /// Translate under the query's format settings (notably `date_time_overflow_behavior`),
+                    /// exactly like the original predicate, so both predicates agree on literal conversion.
+                    auto fallback_predicate = getEnginePredicate(restricted_dag, fallback_exception, getContext());
 
                     /// The predicate is translated inside `ffi::scan`, so its outcome is known only afterwards.
                     KernelScan fallback_scan;
@@ -248,10 +250,11 @@ public:
 
                     if (!fallback_exception && !fallback_predicate->hasUnsupportedNodes())
                     {
-                        ProfileEvents::increment(ProfileEvents::DeltaLakeClusteringPredicateFallbacks);
-
                         if (engine_predicate_exception)
                         {
+                            /// Count only when the fallback scan actually replaces the original one.
+                            ProfileEvents::increment(ProfileEvents::DeltaLakeClusteringPredicateFallbacks);
+
                             /// The original scan's predicate may be in an unreliable state
                             /// after a translation exception; use the restricted predicate.
                             LOG_INFO(
