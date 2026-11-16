@@ -207,27 +207,56 @@ public:
             const bool full_translation_failed = engine_predicate_exception || predicate->hasUnsupportedNodes();
             if (full_translation_failed && enable_clustering_predicate_fallback && !clustering_columns.empty())
             {
-                /// Full predicate translation failed. Try a fallback: restrict the filter
-                /// to only reference clustering columns (which always have per-file min/max stats).
-                /// `restrictFilterDAGToInputs` replaces non-computable AND branches with `true`,
-                /// giving us a weaker but valid predicate for file-level skipping.
+                /// Full predicate translation failed. Try a fallback: keep only the top-level
+                /// conjuncts of the filter that reference nothing but clustering columns
+                /// (which always have per-file min/max stats). A subset of the conjuncts of
+                /// `AND` is always implied by the full filter, so the fallback predicate can
+                /// only skip files the full filter would skip too.
+                /// `restrictFilterDAGToInputs` is not used here: it substitutes a non-computable
+                /// `and` argument with `true` for every parent of that node, so a shared
+                /// subexpression under `not` becomes `false` and the result gets stricter.
                 DB::NameSet clustering_inputs;
                 for (const auto & col : clustering_columns)
                     clustering_inputs.insert(col);
 
-                const auto * filter_output = filter->getOutputs().at(0);
-                auto restricted_dag = filter->restrictFilterDAGToInputs(filter_output, clustering_inputs);
-
-                /// Check if the restricted filter is non-trivial (has at least one function node).
-                /// If restrictFilterDAGToInputs replaced everything with constant `true`,
-                /// the DAG will have no function nodes.
-                bool has_function = false;
-                for (const auto & node : restricted_dag.getNodes())
+                auto references_only_clustering_inputs = [&](const DB::ActionsDAG::Node * root)
                 {
-                    if (node.type == DB::ActionsDAG::ActionType::FUNCTION)
+                    std::vector<const DB::ActionsDAG::Node *> stack{root};
+                    std::unordered_set<const DB::ActionsDAG::Node *> visited;
+                    while (!stack.empty())
                     {
-                        has_function = true;
-                        break;
+                        const auto * node = stack.back();
+                        stack.pop_back();
+                        if (!visited.insert(node).second)
+                            continue;
+                        if (node->type == DB::ActionsDAG::ActionType::INPUT && !clustering_inputs.contains(node->result_name))
+                            return false;
+                        for (const auto * child : node->children)
+                            stack.push_back(child);
+                    }
+                    return true;
+                };
+
+                DB::ActionsDAG::NodeRawConstPtrs clustering_conjuncts;
+                for (const auto * conjunct : DB::ActionsDAG::extractConjunctionAtoms(filter->getOutputs().at(0)))
+                    if (references_only_clustering_inputs(conjunct))
+                        clustering_conjuncts.push_back(conjunct);
+
+                std::optional<DB::ActionsDAG> restricted_dag;
+                if (!clustering_conjuncts.empty())
+                    restricted_dag = DB::ActionsDAG::buildFilterActionsDAG(clustering_conjuncts);
+
+                /// The restricted filter is worth pushing only if it has at least one function node.
+                bool has_function = false;
+                if (restricted_dag)
+                {
+                    for (const auto & node : restricted_dag->getNodes())
+                    {
+                        if (node.type == DB::ActionsDAG::ActionType::FUNCTION)
+                        {
+                            has_function = true;
+                            break;
+                        }
                     }
                 }
 
@@ -236,7 +265,7 @@ public:
                     std::exception_ptr fallback_exception;
                     /// Translate under the query's format settings (notably `date_time_overflow_behavior`),
                     /// exactly like the original predicate, so both predicates agree on literal conversion.
-                    auto fallback_predicate = getEnginePredicate(restricted_dag, fallback_exception, getContext());
+                    auto fallback_predicate = getEnginePredicate(*restricted_dag, fallback_exception, getContext());
 
                     /// The predicate is translated inside `ffi::scan`, so its outcome is known only afterwards.
                     KernelScan fallback_scan;

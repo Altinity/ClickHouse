@@ -6199,6 +6199,28 @@ def test_liquid_clustering(started_cluster):
     assert int(instance.query(f"SELECT sum(a) FROM {TABLE_NAME}")) == sum(range(100))
 
 
+def optimize_into_small_files(spark, delta_path):
+    """Run OPTIMIZE so that a small dataset is split into several files.
+
+    OPTIMIZE targets ~1GB cubes/files by default, which would pack a small
+    dataset into a single file and leave nothing to skip. The size targets are
+    shrunk only for this OPTIMIZE and then unset, because the Spark session is
+    shared by all tests in the module.
+    """
+    small_file_conf = {
+        "spark.databricks.delta.optimize.maxFileSize": "10240",
+        "spark.databricks.delta.optimize.clustering.mergeStrategy.minCubeSize.targetCubeSize": "10240",
+        "spark.databricks.delta.optimize.clustering.mergeStrategy.minCubeSize.threshold": "1024",
+    }
+    try:
+        for key, value in small_file_conf.items():
+            spark.conf.set(key, value)
+        spark.sql(f"OPTIMIZE delta.`{delta_path}`")
+    finally:
+        for key in small_file_conf:
+            spark.conf.unset(key)
+
+
 def test_liquid_clustering_data_skipping(started_cluster):
     """Verify that filtering on a clustering column skips files at the kernel level.
 
@@ -6223,19 +6245,7 @@ def test_liquid_clustering_data_skipping(started_cluster):
             SELECT id + {i * 1000} as a, CAST(id + {i * 1000} AS STRING) as b
             FROM range(1000)
         """)
-    # OPTIMIZE targets ~1GB cubes/files by default, which would pack this small
-    # dataset into a single file and leave nothing to skip. Shrink the cube and
-    # file size targets so several files are produced.
-    spark.conf.set("spark.databricks.delta.optimize.maxFileSize", "10240")
-    spark.conf.set(
-        "spark.databricks.delta.optimize.clustering.mergeStrategy.minCubeSize.targetCubeSize",
-        "10240",
-    )
-    spark.conf.set(
-        "spark.databricks.delta.optimize.clustering.mergeStrategy.minCubeSize.threshold",
-        "1024",
-    )
-    spark.sql(f"OPTIMIZE delta.`{delta_path}`")
+    optimize_into_small_files(spark, delta_path)
 
     files = default_upload_directory(started_cluster, "s3", delta_path, "")
     assert len(files) > 0
@@ -6305,7 +6315,8 @@ def test_liquid_clustering_predicate_fallback(started_cluster):
                    CAST(id + {i * 1000} + 1 AS STRING) as c
             FROM range(1000)
         """)
-    spark.sql(f"OPTIMIZE delta.`{delta_path}`")
+    # Several files are needed so that the fallback predicate has files to skip.
+    optimize_into_small_files(spark, delta_path)
 
     files = default_upload_directory(started_cluster, "s3", delta_path, "")
     assert len(files) > 0
@@ -6337,6 +6348,22 @@ def test_liquid_clustering_predicate_fallback(started_cluster):
     finally:
         instance.query("SYSTEM DISABLE FAILPOINT delta_kernel_fail_literal_visitor")
     assert result.strip() == "42"
+
+    # The fallback predicate must never be stricter than the full filter.
+    # `startsWith(c, '43')` references a non-clustering column and appears both
+    # directly under `and` and under `not`. Dropping it must not turn the second
+    # branch into `false`, which would skip the files holding `a = 4043`
+    # (`c` = '4044'). `a = 42` and `a = 4043` are far apart, so they are in different files.
+    instance.query("SYSTEM ENABLE FAILPOINT delta_kernel_fail_literal_visitor")
+    try:
+        result = instance.query(
+            f"SELECT a FROM {TABLE_NAME} "
+            f"WHERE (a = 42 AND startsWith(c, '43')) OR (a = 4043 AND NOT startsWith(c, '43')) "
+            f"ORDER BY a"
+        )
+    finally:
+        instance.query("SYSTEM DISABLE FAILPOINT delta_kernel_fail_literal_visitor")
+    assert result.split() == ["42", "4043"]
 
     # Full scan as the baseline for file skipping.
     full_scan_id = f"{TABLE_NAME}_full_scan"
