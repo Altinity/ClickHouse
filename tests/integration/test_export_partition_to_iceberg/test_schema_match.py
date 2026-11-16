@@ -841,7 +841,7 @@ def test_export_partition_all_iceberg_types(cluster, source_engine):
     iceberg_table = f"iceberg_all_types_{uid}"
 
     # Scalar source types are strictly narrower than the destination; the export inserts
-    # a positional widening CAST per column (Int8->Int16, UInt32->UInt64, ...). Nested
+    # a positional widening CAST per column (Int8->Int16, UInt32->Int64, ...). Nested
     # columns keep the same type on both sides.
     source_columns = (
         "i16 Int8, u16 UInt8, u32 UInt16, u64 UInt32, "
@@ -852,7 +852,7 @@ def test_export_partition_all_iceberg_types(cluster, source_engine):
         "year Int32"
     )
     dest_columns = (
-        "i16 Int16, u16 UInt16, u32 UInt32, u64 UInt64, "
+        "i16 Int16, u16 UInt16, u32 UInt32, u64 Int64, "
         "id Int32, big Int64, f32 Float32, f64 Float64, "
         "d Date, d32 Date32, dt DateTime, dt64 DateTime64(6), "
         "s String, uid UUID, "
