@@ -318,6 +318,17 @@ std::expected<String, Backend::RawConflict> ObjectStorageBackend::nativeConditio
     auto buf = object_storage->writeObject(
         StoredObject(key), WriteMode::Rewrite, /*attributes=*/std::nullopt, std::max<size_t>(1, bytes.size()), ws);
     buf->write(bytes.data(), bytes.size());
+
+    /// An `If-Match` write of a key that was deleted meanwhile answers 404, which
+    /// `finalizeConditionalWrite` maps to a lost precondition: an ordinary answer, as for the GET in
+    /// `readUnder`. Without the scope the HTTP client logs it at Error, and a stateless test whose
+    /// stderr is checked fails on the log line alone. The request runs on this thread:
+    /// `conditionalWriteSettings` turns the parallel part upload off. An `If-None-Match` write names
+    /// no existing object, so a 404 there stays loud.
+    std::optional<Expect404ResponseScope> absent_key_is_a_lost_precondition;
+    if (!ws.object_storage_write_if_match.empty())
+        absent_key_is_a_lost_precondition.emplace();
+
     if (finalizeConditionalWriteInstrumented(*buf) == detail::ConditionalWriteOutcome::PreconditionLost)
         return std::unexpected(RawConflict{});
 
