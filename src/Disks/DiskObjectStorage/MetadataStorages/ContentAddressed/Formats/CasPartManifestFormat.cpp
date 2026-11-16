@@ -16,6 +16,7 @@ namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
     extern const int LIMIT_EXCEEDED;
+    extern const int LOGICAL_ERROR;
 }
 }
 
@@ -77,16 +78,18 @@ String bannerFor(std::string_view path, uint64_t n)
     return std::move(w).take();
 }
 
-void validateManifestEntryPath(std::string_view path)
+/// `error_code` is `LOGICAL_ERROR` on encode, where a bad path is a bug of the writer, and `CORRUPTED_DATA`
+/// on decode, where it is bad bytes.
+void validateManifestEntryPath(std::string_view path, int error_code)
 {
     if (path.empty() || path.front() == '/')
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS part manifest: invalid entry path '{}'", path);
+        throw Exception(error_code, "CAS part manifest: invalid entry path '{}'", path);
     for (std::string_view rest = path; !rest.empty();)
     {
         const size_t slash = rest.find('/');
         const std::string_view segment = rest.substr(0, slash);
         if (segment.empty() || segment == "." || segment == "..")
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS part manifest: invalid entry path '{}'", path);
+            throw Exception(error_code, "CAS part manifest: invalid entry path '{}'", path);
         rest = slash == std::string_view::npos ? std::string_view{} : rest.substr(slash + 1);
     }
 }
@@ -111,14 +114,14 @@ String encodePartManifest(const PartManifest & m)
     sorted.reserve(m.entries.size());
     for (const auto & e : m.entries)
     {
-        validateManifestEntryPath(e.path);
+        validateManifestEntryPath(e.path, ErrorCodes::LOGICAL_ERROR);
         sorted.push_back(&e);
     }
     std::sort(sorted.begin(), sorted.end(),
               [](const ManifestEntry * a, const ManifestEntry * b) { return a->path < b->path; });
     for (size_t i = 1; i < sorted.size(); ++i)
         if (sorted[i]->path == sorted[i - 1]->path)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: duplicate path '{}'", sorted[i]->path);
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "PartManifest: duplicate path '{}'", sorted[i]->path);
 
     const uint64_t line_cap = traitsFor(FormatId::PartManifest).line_cap;
     const auto check_line_bytes = [&](size_t bytes, std::string_view what)
@@ -131,7 +134,6 @@ String encodePartManifest(const PartManifest & m)
 
     CasJsonWriter out(256);
     writeHeaderLine(out, FormatId::PartManifest);
-    check_line_bytes(out.size() - 1, "header");
 
     /// descriptor meta line: ManifestRef (epoch/build/ord, shared rendering with refsnaplog) + root
     /// namespace + payload digest.
@@ -153,9 +155,7 @@ String encodePartManifest(const PartManifest & m)
         check_line_bytes(out.size() - line_start - 1, "entry record");
     }
 
-    const size_t trailer_start = out.size();
     writeTrailerLine(out, sorted.size());
-    check_line_bytes(out.size() - trailer_start - 1, "trailer");
 
     /// payload zone: one banner + raw bytes + '\n' per Inline entry, in path order. Blob entries
     /// carry no payload-zone bytes (their bytes live in a separately addressed CAS blob).
@@ -246,7 +246,7 @@ PartManifest decodePartManifest(std::string_view data)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: record must start with \"path\"");
         ManifestEntry e;
         e.path = r.readString();
-        validateManifestEntryPath(e.path);
+        validateManifestEntryPath(e.path, ErrorCodes::CORRUPTED_DATA);
 
         std::optional<String> pm;
         BlobRefFields blob_ref;

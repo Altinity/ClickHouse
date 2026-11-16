@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Common/Exception.h>
+#include <base/defines.h>
 #include <city.h>
 #include <stdexcept>
 #include <utility>
@@ -14,6 +15,7 @@ using namespace DB::Cas;
 namespace DB::ErrorCodes
 {
     extern const int LIMIT_EXCEEDED;
+    extern const int LOGICAL_ERROR;
 }
 
 namespace
@@ -491,13 +493,78 @@ TEST(CASPartManifestFormat, DecodeAcceptsLegalProjectionSubdirPath)
     EXPECT_EQ(got.entries[0].path, "proj.proj/data.bin");
 }
 
-TEST(CASPartManifestFormat, DuplicatePathRejectedOnEncode)
+static PartManifest sampleWithDuplicatePath()
 {
     PartManifest m = sample();
     ManifestEntry dup = m.entries[0];   /// same path as an existing entry
     m.entries.push_back(dup);
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodePartManifest(m); });
+    return m;
 }
+
+/// The encoder refuses what no writer may build: a duplicate or malformed path is a bug of the caller.
+#ifndef DEBUG_OR_SANITIZER_BUILD
+TEST(CASPartManifestFormat, DuplicatePathRejectedOnEncode)
+{
+    const PartManifest m = sampleWithDuplicatePath();
+    try
+    {
+        static_cast<void>(encodePartManifest(m));
+        ADD_FAILURE() << "expected LOGICAL_ERROR";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::LOGICAL_ERROR);
+        EXPECT_NE(e.message().find("duplicate path"), String::npos) << e.message();
+    }
+}
+
+TEST(CASPartManifestFormat, EncodeRejectsMalformedEntryPaths)
+{
+    for (const char * path : {"../evil", "/abs", "", "a//b", "a/./b"})
+    {
+        SCOPED_TRACE(path);
+        PartManifest m = manifestWithSinglePath("placeholder");
+        m.entries[0].path = path;
+        try
+        {
+            static_cast<void>(encodePartManifest(m));
+            ADD_FAILURE() << "expected LOGICAL_ERROR";
+        }
+        catch (const DB::Exception & e)
+        {
+            EXPECT_EQ(e.code(), DB::ErrorCodes::LOGICAL_ERROR);
+            EXPECT_NE(e.message().find("invalid entry path"), String::npos) << e.message();
+        }
+    }
+}
+#else
+TEST(CASPartManifestFormatDeathTest, DuplicatePathRejectedOnEncode)
+{
+    const PartManifest m = sampleWithDuplicatePath();
+    EXPECT_DEATH(
+        {
+            static_cast<void>(encodePartManifest(m));
+            std::_Exit(0);
+        },
+        "duplicate path");
+}
+
+TEST(CASPartManifestFormatDeathTest, EncodeRejectsMalformedEntryPaths)
+{
+    for (const char * path : {"../evil", "/abs", "", "a//b", "a/./b"})
+    {
+        SCOPED_TRACE(path);
+        PartManifest m = manifestWithSinglePath("placeholder");
+        m.entries[0].path = path;
+        EXPECT_DEATH(
+            {
+                static_cast<void>(encodePartManifest(m));
+                std::_Exit(0);
+            },
+            "invalid entry path");
+    }
+}
+#endif
 
 /// Hand-forge two valid entry-record LINES swapped out of canonical order (no CRC-patching forge
 /// helpers needed - this is a text format, lines carry no per-line checksum). Both entries are Blob

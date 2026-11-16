@@ -2246,10 +2246,10 @@ TEST(CASPartWriteTxn, AbandonRetryableAfterAppendFailure)
 namespace
 {
 
-/// Mirrors `CasPartWriteTxn.cpp`'s private `kMaxManifestEncodedBytes` (256 MiB). There is no way to read a
-/// file-local `constexpr` from a different translation unit, so this is kept in sync by hand — if that
-/// cap ever changes, update this one to match.
-constexpr uint64_t kExpectedManifestEncodedCap = 256ULL << 20;
+uint64_t manifestObjectCap()
+{
+    return traitsFor(FormatId::PartManifest).object_cap;
+}
 
 PartManifest manifestWithEncodedSize(const RootNamespace & ns, const ManifestRef & ref, size_t encoded_size)
 {
@@ -2265,7 +2265,7 @@ PartManifest manifestWithEncodedSize(const RootNamespace & ns, const ManifestRef
     entry.blob_size = 12345;
     manifest.entries = {entry};
     const size_t entry_overhead = encodePartManifest(manifest).size() - empty_size - entry.path.size();
-    const size_t entry_count = 2 * kExpectedManifestEncodedCap / traitsFor(FormatId::PartManifest).line_cap;
+    const size_t entry_count = 2 * manifestObjectCap() / traitsFor(FormatId::PartManifest).line_cap;
     const size_t framing_size = empty_size + std::to_string(entry_count).size() - 1;
     const size_t path_bytes = encoded_size - framing_size - entry_count * entry_overhead;
 
@@ -2301,8 +2301,8 @@ TEST(CASPartWriteTxn, ManifestCapEncodedBytesJustUnderStagesSuccessfully)
 
     auto build = startBuildFor(s, ns, "wide_part");
     PartManifest manifest = manifestWithEncodedSize(
-        ns, ManifestRef{s->liveWriterEpoch(), build->buildSeq(), 1}, kExpectedManifestEncodedCap);
-    ASSERT_EQ(encodePartManifest(manifest).size(), kExpectedManifestEncodedCap);
+        ns, ManifestRef{s->liveWriterEpoch(), build->buildSeq(), 1}, manifestObjectCap());
+    ASSERT_EQ(encodePartManifest(manifest).size(), manifestObjectCap());
     const ManifestId id = build->stageManifest(std::move(manifest.entries));
     EXPECT_EQ(id.root_namespace, ns);
     OperationForTest op(*b);
@@ -2320,8 +2320,8 @@ TEST(CASPartWriteTxn, ManifestCapEncodedBytesOverThrowsBeforeBodyWrite)
 
     auto build = startBuildFor(s, ns, "wide_part");
     PartManifest manifest = manifestWithEncodedSize(
-        ns, ManifestRef{s->liveWriterEpoch(), build->buildSeq(), 1}, kExpectedManifestEncodedCap + 1);
-    ASSERT_EQ(encodePartManifest(manifest).size(), kExpectedManifestEncodedCap + 1);
+        ns, ManifestRef{s->liveWriterEpoch(), build->buildSeq(), 1}, manifestObjectCap() + 1);
+    ASSERT_EQ(encodePartManifest(manifest).size(), manifestObjectCap() + 1);
 
     OperationForTest op(*b);
     const size_t keys_before = (*op).list("", "", 100, Retry::once()).keys.size();
@@ -2345,8 +2345,8 @@ TEST(CASPartWriteTxn, ManifestCapEncodedBytesOverThrowsBeforeBodyWrite)
         << "stageManifest must fail closed before writing the manifest body, leaving no new objects";
 }
 
-/// The encoder accepts a `..` path segment that every reader rejects; staging must refuse such a body
-/// before it exists.
+/// A `..` path segment is refused before any object exists.
+#ifndef DEBUG_OR_SANITIZER_BUILD
 TEST(CASPartWriteTxn, StageManifestRefusesAnEntryPathWithDotDot)
 {
     auto b = std::make_shared<InMemoryBackend>();
@@ -2356,12 +2356,28 @@ TEST(CASPartWriteTxn, StageManifestRefusesAnEntryPathWithDotDot)
 
     OperationForTest op(*b);
     const size_t keys_before = (*op).list("", "", 100, Retry::once()).keys.size();
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+    expectThrowsCodeWithMessage(DB::ErrorCodes::LOGICAL_ERROR, "invalid entry path", [&]
     {
         build->stageManifest({blobManifestEntry("a/../b.bin", "x")});
     });
     EXPECT_EQ((*op).list("", "", 100, Retry::once()).keys.size(), keys_before);
 }
+#else
+TEST(CASPartWriteTxnDeathTest, StageManifestRefusesAnEntryPathWithDotDot)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openPool(b);
+    const RootNamespace ns{"srv1/tbl"};
+    auto build = startBuildFor(s, ns, "part_1");
+
+    EXPECT_DEATH(
+        {
+            build->stageManifest({blobManifestEntry("a/../b.bin", "x")});
+            std::_Exit(0);
+        },
+        "invalid entry path");
+}
+#endif
 
 TEST(CASPartWriteTxn, StageManifestRejectsOversizedEntryRecordBeforeBodyWrite)
 {
@@ -2374,7 +2390,10 @@ TEST(CASPartWriteTxn, StageManifestRejectsOversizedEntryRecordBeforeBodyWrite)
         auto build = startBuildFor(store, ns, "part");
 
         ManifestEntry entry;
-        entry.path = String(path_char == 'a' ? 65536 : path_char == '"' ? 32768 : 10923, path_char);
+        /// The path alone escapes to at least `line_cap` bytes, so the record line is over the cap.
+        const size_t escaped_char_bytes = path_char == 'a' ? 1 : path_char == '"' ? 2 : 6;
+        const size_t line_cap = traitsFor(FormatId::PartManifest).line_cap;
+        entry.path = String((line_cap + escaped_char_bytes - 1) / escaped_char_bytes, path_char);
         entry.placement = EntryPlacement::Inline;
         entry.inline_bytes = "payload";
         expectThrowsCode(DB::ErrorCodes::LIMIT_EXCEEDED, [&] { build->stageManifest({entry}); });

@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobHashingWriteBuffer.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasByteBudget.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <IO/ReadBufferFromString.h>
@@ -59,7 +60,6 @@ namespace
 
 /// Backpressure caps, enforced fail-closed in stageManifest before the body write returns.
 constexpr uint64_t kMaxManifestEntries = 1048576;
-constexpr uint64_t kMaxManifestEncodedBytes = 256ULL << 20;        /// 256 MiB
 constexpr uint64_t kMaxManifestInlineBytesTotal = 16ULL << 20;     /// 16 MiB
 constexpr uint64_t kMaxLargestInlineEntryBytes = 1ULL << 20;       /// 1 MiB
 
@@ -675,15 +675,16 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
     body.root_namespace_id = owning_ns;
     body.entries = std::move(entries);
     body.payload_digest = computePayloadDigest(body);
-    /// The cap is measured over the canonical text before sealing, not the compressed PUT bytes.
-    /// 256 MiB comfortably bounds the largest realistic manifest, including its JSON structure.
+    /// The cap is the readers' own object cap, measured over the canonical text before sealing, not the
+    /// compressed PUT bytes.
     String encoded;
     {
         /// Scoped so the text is freed before the decode below.
         const String encoded_text = encodePartManifest(body);
-        if (encoded_text.size() > kMaxManifestEncodedBytes)
+        const uint64_t object_cap = traitsFor(FormatId::PartManifest).object_cap;
+        if (!fitsObjectCap(encoded_text.size(), /*entries_reservation*/ 0, object_cap))
             throw Exception(ErrorCodes::LIMIT_EXCEEDED,
-                "stageManifest: encoded manifest {} bytes exceeds cap {}", encoded_text.size(), kMaxManifestEncodedBytes);
+                "stageManifest: encoded manifest {} bytes exceeds cap {}", encoded_text.size(), object_cap);
         encoded = sealObject(FormatId::PartManifest, encoded_text);
     }
 
