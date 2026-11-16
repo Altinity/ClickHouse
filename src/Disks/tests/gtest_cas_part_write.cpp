@@ -2468,6 +2468,8 @@ TEST(CASPartWriteTxn, PromoteOfAManifestStagedElsewhereIsRefused)
     {
         EXPECT_EQ(e.code(), DB::ErrorCodes::LOGICAL_ERROR);
         EXPECT_NE(e.message().find("was not staged by this transaction"), String::npos) << e.message();
+        EXPECT_NE(e.message().find(u128ToHex(f.other->buildId())), String::npos) << e.message();
+        EXPECT_NE(e.message().find("'part_1' in namespace '" + f.ns.string() + "'"), String::npos) << e.message();
     }
     EXPECT_EQ(f.store->tailSinceSnapshotCountForTest(f.ns), tail);
     EXPECT_FALSE(f.store->resolveRef(f.ns, "part_1").has_value());

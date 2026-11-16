@@ -7,7 +7,6 @@
 #include <map>
 #include <memory>
 #include <optional>
-#include <set>
 #include <span>
 #include <vector>
 
@@ -209,9 +208,10 @@ public:
     /// `cas/manifests/<ns>/<writer_epoch>/<build_sequence>/000001.zst` via the pool's shared request
     /// controller. It uses budgeted attempts with resolve-before-reissue and performs no preliminary HEAD,
     /// because `manifest_ordinal` is monotone within this build. It enforces manifest-size caps before the body
-    /// write returns and therefore before any owner transition is published. Before the `PUT` it decodes the
-    /// sealed bytes as every reader does: a body no reader accepts throws `CORRUPTED_DATA` and nothing is
-    /// written. It records the blob leaves of the body for `promote`; the body itself is not retained after a
+    /// write returns and therefore before any owner transition is published. `encodePartManifest` refuses
+    /// what no writer may build: a bad or duplicate entry path throws `LOGICAL_ERROR`, a line over the line
+    /// cap `LIMIT_EXCEEDED`. Before the `PUT` it still decodes the sealed bytes as every reader does: a body
+    /// no reader accepts throws `CORRUPTED_DATA` and nothing is written. It records the blob leaves of the body for `promote`; the body itself is not retained after a
     /// successful write, and on retry the caller re-stages from source. Every call uses a fresh manifest
     /// ordinal. The id is recorded for best-effort `abandon` cleanup.
     ManifestId stageManifest(std::vector<ManifestEntry> entries);

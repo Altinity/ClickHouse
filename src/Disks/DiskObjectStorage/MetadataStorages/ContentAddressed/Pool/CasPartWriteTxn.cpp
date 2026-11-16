@@ -688,9 +688,8 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
         encoded = sealObject(FormatId::PartManifest, encoded_text);
     }
 
-    /// The encoder accepts bodies the decoder rejects (a `..` path segment, a line over the line cap). Decode
-    /// with the readers' own expression so such a body fails here, before any object exists, and so `promote`
-    /// can take its leaves from here instead of reading the body back.
+    /// Decode with the readers' own decoder, so that nothing a reader would reject is written, and so that
+    /// `promote` can take its leaves from here instead of reading the body back.
     auto leaves = std::make_shared<std::vector<BlobRef>>();
     {
         const PartManifest validated = decodePartManifest(openObject(FormatId::PartManifest, encoded));
@@ -812,7 +811,7 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
         /// and manifest id) rather than `[&]`: defense-in-depth so a closure that ever outlives this
         /// stack frame (e.g. if the append lane stranded its item) never dereferences a dead stack. The
         /// ref-lane leadership guard is the real fix; this makes the closure self-contained regardless.
-        [pool = store, target_ns, final_ref_name, id, id_staged_by_this_txn](const RefTableState & state) -> std::vector<RefOp>
+        [pool = store, target_ns, final_ref_name, id, id_staged_by_this_txn, txn_build_id = build_id](const RefTableState & state) -> std::vector<RefOp>
         {
             /// Idempotent re-add: the target ref is ALREADY committed to this EXACT manifest_ref (a
             /// legitimate re-drive calling precommitAdd+promote again for content that is already
@@ -837,9 +836,9 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
                 return {};
             if (!id_staged_by_this_txn)
                 throw Exception(ErrorCodes::LOGICAL_ERROR,
-                    "precommitAdd: manifest '{}' was not staged by this transaction and is not the current "
-                    "committed manifest of ref '{}' -- refusing to re-own a foreign or previously-dropped identity",
-                    manifestRefDebugString(id.ref), final_ref_name);
+                    "precommitAdd: manifest '{}' was not staged by this transaction (build {}) and is not the current "
+                    "committed manifest of ref '{}' in namespace '{}' -- refusing to re-own a foreign or previously-dropped identity",
+                    manifestRefDebugString(id.ref), u128ToHex(txn_build_id), final_ref_name, target_ns.string());
 
             std::vector<RefOp> ops;
             if (state.getLifecycle() != RefLifecycle::Live)
@@ -919,7 +918,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
         /// read after the call returns (so they stay references). The ref-lane leadership guard is the real
         /// fix; the residual by-reference state is safe because the guard guarantees the closure is never
         /// invoked after this frame unwinds.
-        [this, final_ref_name, id, promote_build_id, policy, staged_leaves, &repoint_old, &created]
+        [this, target_ns, final_ref_name, id, promote_build_id, policy, staged_leaves, &repoint_old, &created]
         (const RefTableState & state) -> std::vector<RefOp>
         {
             created = !state.getCommitted().contains(final_ref_name);
@@ -937,8 +936,9 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             /// foreign id whose precommit is live would commit with no leaf checked.
             if (!staged_leaves)
                 throw Exception(ErrorCodes::LOGICAL_ERROR,
-                    "promote: manifest '{}' was not staged by this transaction and is not the current committed manifest of ref '{}'",
-                    manifestRefDebugString(id.ref), final_ref_name);
+                    "promote: manifest '{}' was not staged by this transaction (build {}) and is not the current committed "
+                    "manifest of ref '{}' in namespace '{}'",
+                    manifestRefDebugString(id.ref), u128ToHex(build_id), final_ref_name, target_ns.string());
 
             if (policy.expected)
             {
@@ -1089,7 +1089,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             e.object_hash = manifestRefDebugString(id.ref);
             e.token = u128ToHex(promote_build_id);
             e.outcome = "promoted";
-            e.reason = "promote: atomic owner move precommit(build_id) -> ref(final_ref_name) after fail-closed reval";
+            e.reason = "promote: atomic owner move precommit(build_id) -> ref(final_ref_name)";
             e.detail = {{"build_seq", std::to_string(build_seq)}};
         });
     }

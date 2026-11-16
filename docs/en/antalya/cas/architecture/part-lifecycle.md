@@ -70,10 +70,12 @@ one ref-log `Move` of the committed ref (see [replication](replication.md)).
 
 **Step 1 — `stageManifest`.** Caps (see the
 [manifests-and-refs page](/antalya/cas/architecture/manifests-and-refs#part-manifests)) are
-checked before the write; the id is minted as `{epoch, build_seq, ordinal++}`. The manifest is
-encoded and then decoded with the readers' own decoder, so a body no reader would accept (a `..`
-path segment, a line over the line cap) fails with `CORRUPTED_DATA` before any object exists. The
-decode also records the blob leaves that `promote` checks. The body goes out
+checked before the write; the id is minted as `{epoch, build_seq, ordinal++}`. The encoder refuses
+what no writer may build: a bad or duplicate entry path (such as a `..` segment) fails with
+`LOGICAL_ERROR`, a line over the line cap with `LIMIT_EXCEEDED`. The sealed body is then decoded
+with the readers' own decoder, so nothing a reader would reject is written; such a body fails with
+`CORRUPTED_DATA` before any object exists. The decode also records the blob leaves that `promote`
+checks. The body goes out
 with a conditional create and no preliminary `HEAD`. Blob publication is different; manifests
 remain small write-once metadata objects. Both a definite failure and an unresolved
 outcome throw retry-later.

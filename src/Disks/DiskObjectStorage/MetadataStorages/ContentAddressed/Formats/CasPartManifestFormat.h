@@ -89,7 +89,8 @@ struct PartManifest
 };
 
 /// Deterministic, streaming-capable encode. Entries are written in canonical path order (the encoder
-/// sorts them); a duplicate path throws `CORRUPTED_DATA`. Byte output is reproducible for identical
+/// sorts them). A bad or duplicate entry path throws `LOGICAL_ERROR`, a line over the line cap
+/// `LIMIT_EXCEEDED`. Byte output is reproducible for identical
 /// input (no timestamps, no nondeterministic compression). Returns the canonical TEXT (NOT sealed);
 /// the caller compresses via `sealObject(FormatId::PartManifest, …)` on the persist path
 /// (`CompressionPolicy::Always`).

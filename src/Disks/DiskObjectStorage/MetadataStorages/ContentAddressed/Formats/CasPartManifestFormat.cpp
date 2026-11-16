@@ -78,8 +78,10 @@ String bannerFor(std::string_view path, uint64_t n)
     return std::move(w).take();
 }
 
-/// `error_code` is `LOGICAL_ERROR` on encode, where a bad path is a bug of the writer, and `CORRUPTED_DATA`
-/// on decode, where it is bad bytes.
+/// Manifest bytes also arrive over the interserver relink channel, so no consumer may inherit a path
+/// traversal: relative, no empty, `.` or `..` segment. The check is syntactic, so projection
+/// subdirectories pass. `error_code` is `LOGICAL_ERROR` on encode, where a bad path is a bug of the
+/// writer, and `CORRUPTED_DATA` on decode, where it is bad bytes.
 void validateManifestEntryPath(std::string_view path, int error_code)
 {
     if (path.empty() || path.front() == '/')
