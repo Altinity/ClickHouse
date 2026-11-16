@@ -1361,6 +1361,10 @@ BinPackCommitResult commitMetadata(
     /// must not remove them. Paths that know the snapshot did not land call `cleanup` themselves.
     keep_files_on_error = true;
 
+    /// Test hook for Altinity/ClickHouse#2733: suspend here so a test can land a concurrent commit
+    /// before the metadata file is written and the catalog pointer is updated.
+    FailPointInjection::pauseFailPoint(FailPoints::iceberg_compaction_pause_before_metadata_commit);
+
     /// A transactional catalog writes the metadata file itself and is the source of truth for the
     /// current metadata, so the storage-side metadata file and version hint are not written for it.
     const bool catalog_writes_metadata_file = catalog && catalog->isTransactional();
@@ -1373,10 +1377,6 @@ BinPackCommitResult commitMetadata(
         if (storage_result != BinPackCommitResult::Committed)
             return storage_result;
     }
-
-    /// Test hook for Altinity/ClickHouse#2733: suspend here so a test can land a concurrent commit
-    /// in the window before an unconditional catalog publish (Glue `UpdateTable`).
-    FailPointInjection::pauseFailPoint(FailPoints::iceberg_compaction_pause_before_metadata_commit);
 
     if (catalog)
     {

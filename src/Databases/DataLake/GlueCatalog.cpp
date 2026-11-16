@@ -7,6 +7,7 @@
 #if USE_AWS_S3 && USE_AVRO
 
 #include <aws/glue/GlueClient.h>
+#include <aws/glue/GlueErrors.h>
 #include <aws/glue/model/GetTablesRequest.h>
 #include <aws/glue/model/GetTableRequest.h>
 #include <aws/glue/model/GetDatabaseRequest.h>
@@ -1195,12 +1196,39 @@ bool GlueCatalog::createTable(
     return true;
 }
 
+String GlueCatalog::getTableVersionId(
+    const String & namespace_name,
+    const String & table_name,
+    const DB::ForwardedAuthTokenPtr & auth_token) const
+{
+    auto client = getClient(auth_token);
+
+    Aws::Glue::Model::GetTableRequest request;
+    request.SetDatabaseName(namespace_name);
+    request.SetName(table_name);
+
+    Aws::Glue::Model::GetTableOutcome outcome;
+    {
+        ProfileEvents::increment(ProfileEvents::DataLakeGlueCatalogGetTable);
+        auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeGlueCatalogGetTableMicroseconds);
+        outcome = client.client->GetTable(request);
+    }
+
+    if (outcome.IsSuccess())
+        return outcome.GetResult().GetTable().GetVersionId();
+
+    LOG_WARNING(getLogger("GlueCatalog"),
+        "Failed to fetch VersionId for {}.{}: {}", namespace_name, table_name, outcome.GetError().GetMessage());
+    return {};
+}
+
 bool GlueCatalog::updateTableInGlue(
     const String & namespace_name,
     const String & table_name,
     const String & new_metadata_path,
     const DB::ForwardedAuthTokenPtr & auth_token,
-    const std::vector<Aws::Glue::Model::Column> & columns) const
+    const std::vector<Aws::Glue::Model::Column> & columns,
+    const String & version_id) const
 {
     auto client = getClient(auth_token);
 
@@ -1234,6 +1262,11 @@ bool GlueCatalog::updateTableInGlue(
 
     request.SetTableInput(table_input);
 
+    /// Optimistic concurrency: when a VersionId is supplied, Glue rejects the
+    /// update if the table has been modified since that version was read.
+    if (!version_id.empty())
+        request.SetVersionId(version_id);
+
     Aws::Glue::Model::UpdateTableOutcome response;
 
     {
@@ -1243,14 +1276,26 @@ bool GlueCatalog::updateTableInGlue(
     }
 
     if (!response.IsSuccess())
+    {
+        const auto error_type = response.GetError().GetErrorType();
+        if (error_type == Aws::Glue::GlueErrors::CONCURRENT_MODIFICATION
+            || error_type == Aws::Glue::GlueErrors::VERSION_MISMATCH)
+        {
+            LOG_WARNING(getLogger("GlueCatalog"),
+                "Glue UpdateTable for {}.{} rejected (version conflict): {}",
+                namespace_name, table_name, response.GetError().GetMessage());
+            return false;
+        }
         throw DB::Exception(DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "Can not update metadata in glue catalog {}", response.GetError().GetMessage());
+    }
 
     return true;
 }
 
 bool GlueCatalog::updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr /*new_snapshot*/, const DB::ForwardedAuthTokenPtr & auth_token) const
 {
-    return updateTableInGlue(namespace_name, table_name, new_metadata_path, auth_token);
+    const auto version_id = getTableVersionId(namespace_name, table_name, auth_token);
+    return updateTableInGlue(namespace_name, table_name, new_metadata_path, auth_token, {}, version_id);
 }
 
 bool GlueCatalog::updateSchema(
@@ -1266,7 +1311,8 @@ bool GlueCatalog::updateSchema(
     std::vector<Aws::Glue::Model::Column> columns;
     if (new_schema)
         columns = icebergSchemaToGlueColumns(new_schema);
-    return updateTableInGlue(namespace_name, table_name, new_metadata_path, auth_token, columns);
+    const auto version_id = getTableVersionId(namespace_name, table_name, auth_token);
+    return updateTableInGlue(namespace_name, table_name, new_metadata_path, auth_token, columns, version_id);
 }
 
 void GlueCatalog::dropTable(

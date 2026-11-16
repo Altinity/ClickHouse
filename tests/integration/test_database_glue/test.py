@@ -2239,21 +2239,14 @@ def test_catalog_schema_with_empty_column_name_is_rejected(started_cluster):
     node.query(f"DROP DATABASE IF EXISTS {db_name} SYNC")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="https://github.com/Altinity/ClickHouse/issues/2733: Glue UpdateTable is unconditional, "
-    "so an OPTIMIZE publish still drops a commit that lands in the publish window",
-)
 def test_optimize_bin_pack_concurrent_insert(started_cluster):
-    """Reproducer for https://github.com/Altinity/ClickHouse/issues/2733.
+    """Regression test for https://github.com/Altinity/ClickHouse/issues/2733.
 
-    Bin-pack OPTIMIZE on a Glue-catalog table re-reads Glue's metadata_location
-    and aborts if it changed during the rewrite, but the subsequent Glue
-    UpdateTable replaces the pointer without checking the snapshot. This test
-    pauses the compaction inside commitMetadata right before the catalog
-    publish, lands an INSERT in that window, then releases. Both statements
-    succeed, yet on the current implementation the inserted row is silently
-    dropped from the current snapshot (hence xfail)."""
+    Bin-pack OPTIMIZE on a Glue-catalog table pauses right before the catalog
+    publish via a failpoint. While it is paused an INSERT lands a new commit.
+    When OPTIMIZE resumes, its Glue UpdateTable carries a VersionId that no
+    longer matches, so Glue rejects the publish and OPTIMIZE retries on the
+    fresh snapshot. All three rows must survive."""
     node = started_cluster.instances["node1"]
 
     test_ref = f"test_optimize_race_{uuid.uuid4()}"
@@ -2292,9 +2285,8 @@ def test_optimize_bin_pack_concurrent_insert(started_cluster):
             )
         )
 
-        # 2. Start OPTIMIZE; it rewrites the two small files, re-reads
-        #    metadata_location, writes the new metadata file, then pauses
-        #    right before the unconditional Glue UpdateTable.
+        # 2. Start OPTIMIZE; it rewrites the two small files, then pauses
+        #    before writing the metadata file and updating Glue.
         optimize_future = executor.submit(
             lambda: node.query(
                 f"OPTIMIZE TABLE {table_ref}",
@@ -2316,8 +2308,8 @@ def test_optimize_bin_pack_concurrent_insert(started_cluster):
             settings=write_settings,
         )
 
-        # 4. Release the failpoint; OPTIMIZE publishes its metadata through
-        #    Glue UpdateTable, which does not check the snapshot.
+        # 4. Release the failpoint; OPTIMIZE attempts to publish via Glue
+        #    UpdateTable with a stale VersionId, gets rejected, and retries.
         node.query("SYSTEM DISABLE FAILPOINT iceberg_compaction_pause_before_metadata_commit")
         optimize_future.result(timeout=180)
     finally:

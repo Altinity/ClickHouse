@@ -189,14 +189,24 @@ private:
     Poco::JSON::Object::Ptr getOrFetchMetadataObject(
         const AuthenticatedClient & client, const String & metadata_uri, const TableMetadata & table_metadata) const;
 
+    /// Fetches the current Glue VersionId for a table via GetTable.
+    /// Returns an empty string if the version cannot be determined.
+    String getTableVersionId(
+        const String & namespace_name,
+        const String & table_name,
+        const DB::ForwardedAuthTokenPtr & auth_token) const;
+
     /// Shared implementation for updateMetadata / updateSchema that optionally
     /// sets StorageDescriptor columns in the Glue UpdateTable call.
+    /// When `version_id` is non-empty, the Glue UpdateTable request includes it
+    /// for optimistic concurrency control; a version mismatch returns false.
     bool updateTableInGlue(
         const String & namespace_name,
         const String & table_name,
         const String & new_metadata_path,
         const DB::ForwardedAuthTokenPtr & auth_token,
-        const std::vector<Aws::Glue::Model::Column> & columns = {}) const;
+        const std::vector<Aws::Glue::Model::Column> & columns = {},
+        const String & version_id = {}) const;
 
     mutable DB::CacheBase<String, Poco::JSON::Object::Ptr> metadata_objects;
     mutable DB::CacheBase<String, FieldTypes, std::hash<String>, FieldTypesWeightFunction> current_schema_field_types;
