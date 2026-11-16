@@ -798,10 +798,7 @@ def main():
         if not has_stateful:
             has_stateful_tests = False
 
-    if not info.is_community_pr:
-        targeter = Targeting(info=info)
-    else:
-        targeter = None
+    targeter = Targeting(info=info)
 
     if is_flaky_check or is_bugfix_validation:
         if info.is_local_run:
@@ -845,9 +842,15 @@ def main():
     if is_selected_tests_run:
         assert not args.test, "--test not supposed to be used for a selected tests run"
         try:
-            tests, results_with_info = targeter.get_all_relevant_tests_with_info(
-                include_changed_tests=True
-            )
+            if info.is_community_pr:
+                # NOTE (strtgbb): community PRs have no CI DB secrets, select changed tests only
+                tests, results_with_info = targeter.get_changed_or_new_tests_with_info(
+                    strict=True, include_harness_smoke=True
+                )
+            else:
+                tests, results_with_info = targeter.get_all_relevant_tests_with_info(
+                    include_changed_tests=True
+                )
             results.append(results_with_info)
         except Exception as e:
             # Selecting the tests needs the pull request diff and the coverage
