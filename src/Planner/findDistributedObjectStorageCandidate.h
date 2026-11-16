@@ -17,7 +17,7 @@ using ContextPtr = std::shared_ptr<const Context>;
 
 struct SelectQueryOptions;
 
-/// A whole-query dispatch to the driver's cluster for `object_storage_cluster_join_mode='distributed'`.
+/// A whole-query dispatch to the driver's cluster for `allow_object_storage_cluster_distributed_join`.
 struct DistributedObjectStorageCandidate
 {
     /// Only the `Planner` for this query may dispatch. Nested planners share the candidate.

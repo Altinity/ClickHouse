@@ -90,7 +90,7 @@ public:
 
     const FiltersForTableExpressionMap filters_for_table_expressions;
 
-    /// The query dispatched whole by `object_storage_cluster_join_mode='distributed'`, if any.
+    /// The query dispatched whole by `allow_object_storage_cluster_distributed_join`, if any.
     const std::optional<DistributedObjectStorageCandidate> distributed_object_storage_candidate;
 
     /// Generate a unique integer id, used to disambiguate temporary table expressions

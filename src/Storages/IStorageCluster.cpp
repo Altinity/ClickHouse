@@ -82,7 +82,7 @@ namespace Setting
     extern const SettingsString object_storage_remote_initiator_cluster;
     extern const SettingsString object_storage_cluster;
     extern const SettingsObjectStorageClusterJoinMode object_storage_cluster_join_mode;
-    extern const SettingsObjectStorageClusterJoinMode object_storage_cluster_join_mode_fallback;
+    extern const SettingsBool allow_object_storage_cluster_distributed_join;
     extern const SettingsBool object_storage_cluster_fallback_to_local_if_empty;
 }
 
@@ -145,32 +145,20 @@ ActionsDAG andListingFilterDAGs(ActionsDAG first, ActionsDAG second)
 
 }
 
-ObjectStorageClusterJoinMode getEffectiveObjectStorageClusterJoinMode(const Settings & settings)
-{
-    const ObjectStorageClusterJoinMode mode = settings[Setting::object_storage_cluster_join_mode];
-    if (mode != ObjectStorageClusterJoinMode::DISTRIBUTED)
-        return mode;
-
-    const ObjectStorageClusterJoinMode fallback = settings[Setting::object_storage_cluster_join_mode_fallback];
-    if (fallback == ObjectStorageClusterJoinMode::DISTRIBUTED)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Setting `object_storage_cluster_join_mode_fallback` cannot be `distributed`");
-    return fallback;
-}
-
 namespace
 {
 
-/// The query-text half of the join mode downgrade in ReadFromCluster::updateSettings: a worker applies the
-/// query's own SETTINGS clause on top of the settings it received.
-void downgradeJoinModeInQuerySettings(ASTPtr & query, const String & effective_mode)
+/// The query-text half of dropping `allow_object_storage_cluster_distributed_join` in `ReadFromCluster::updateSettings`:
+/// a worker applies the query's own SETTINGS clause on top of the settings it received.
+void removeDistributedJoinFromQuerySettings(ASTPtr & query)
 {
     auto * select_query = query->as<ASTSelectQuery>();
     if (!select_query || !select_query->settings())
         return;
 
-    for (auto & change : select_query->settings()->as<ASTSetQuery &>().changes)
-        if (change.name == "object_storage_cluster_join_mode" && change.value.safeGet<String>() == "distributed")
-            change.value = Field(effective_mode);
+    std::erase_if(
+        select_query->settings()->as<ASTSetQuery &>().changes,
+        [](const SettingChange & change) { return change.name == "allow_object_storage_cluster_distributed_join"; });
 }
 
 }
@@ -475,10 +463,8 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
     SelectQueryInfo query_info,
     const ContextPtr & context)
 {
-    switch (getEffectiveObjectStorageClusterJoinMode(context->getSettingsRef()))
+    switch (context->getSettingsRef()[Setting::object_storage_cluster_join_mode])
     {
-    case ObjectStorageClusterJoinMode::DISTRIBUTED:
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "The effective object storage cluster join mode cannot be `distributed`");
     case ObjectStorageClusterJoinMode::LOCAL: /// Legacy alias of `allow`
     case ObjectStorageClusterJoinMode::ALLOW:
     {
@@ -1074,7 +1060,7 @@ void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const 
 {
     auto new_context = updateSettings(context->getSettingsRef());
 
-    downgradeJoinModeInQuerySettings(query_to_send, new_context->getSettingsRef()[Setting::object_storage_cluster_join_mode].toString());
+    removeDistributedJoinFromQuerySettings(query_to_send);
 
     createExtension();
 
@@ -1094,6 +1080,10 @@ ContextPtr ReadFromClusterQuery::createRemoteContext() const
     /// Initiator-only settings such as `limit` would cut each worker's partial result, as in `ReadFromCluster`.
     Settings settings = remote_context->getSettingsCopy();
     ClusterProxy::stripInitiatorOnlySettings(settings);
+
+    /// A worker runs the dispatched query as sent and must not dispatch it again. Not sending the setting
+    /// also keeps a worker that does not know it from rejecting the settings.
+    settings.resetToDefault("allow_object_storage_cluster_distributed_join");
     remote_context->setSettings(settings);
 
     /// Cluster table functions should always skip unavailable shards.
@@ -1101,10 +1091,6 @@ ContextPtr ReadFromClusterQuery::createRemoteContext() const
 
     /// Partners read locally. Only the driver's explicit `*Cluster` function consumes the initiator's file tasks.
     remote_context->setSetting("object_storage_cluster", String{});
-
-    /// A worker runs the dispatched query as sent: neither `distributed` nor its fallback applies there.
-    /// This also lets a worker that does not know `distributed` parse the settings.
-    remote_context->setSetting("object_storage_cluster_join_mode", String{"allow"});
 
     return remote_context;
 }
@@ -1360,7 +1346,7 @@ void IStorageCluster::rewriteQueryForInitiatorLocalJoin(
 QueryProcessingStage::Enum IStorageCluster::getQueryProcessingStage(
     ContextPtr context, QueryProcessingStage::Enum to_stage, const StorageSnapshotPtr &, SelectQueryInfo & query_info) const
 {
-    const auto object_storage_cluster_join_mode = getEffectiveObjectStorageClusterJoinMode(context->getSettingsRef());
+    const auto object_storage_cluster_join_mode = context->getSettingsRef()[Setting::object_storage_cluster_join_mode];
     const auto join_info = getQueryJoinInfo(query_info, context);
     /// `global` still fetches columns for `RIGHT`/`FULL`/`PASTE`: those joins stay on the initiator.
     const bool keep_join_on_initiator = object_storage_cluster_join_mode != ObjectStorageClusterJoinMode::GLOBAL
@@ -1409,9 +1395,9 @@ ContextPtr ReadFromCluster::updateSettings(const Settings & settings)
     /// break it (e.g. `format = 'Null'`). This mirrors the `Distributed` fan-out.
     ClusterProxy::stripInitiatorOnlySettings(new_settings);
 
-    /// An ordinary `ReadFromCluster` read sends the mode it ran in, which workers that do not recognize
-    /// `distributed` can also parse.
-    new_settings[Setting::object_storage_cluster_join_mode] = getEffectiveObjectStorageClusterJoinMode(new_settings);
+    /// Whole-query dispatch is decided on the initiator. Workers neither need the setting nor, if they
+    /// predate it, recognize it.
+    new_settings.resetToDefault("allow_object_storage_cluster_distributed_join");
 
     auto new_context = Context::createCopy(context);
     new_context->setSettings(new_settings);

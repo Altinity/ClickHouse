@@ -315,7 +315,7 @@ void expectEveryTableSentAsATableFunction(const String & plan_text, size_t partn
 TEST(DistributedObjectStorageJoinDispatch, DriverOwnsWholeJoinWhenModeIsDistributed)
 {
     auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto plan_text = planAndExplain("SELECT driver.id, safe_lookup.lookup_id FROM driver INNER JOIN safe_lookup ON driver.id = safe_lookup.lookup_id", state.context);
 
@@ -331,7 +331,7 @@ TEST(DistributedObjectStorageJoinDispatch, DriverOwnsWholeJoinWhenModeIsDistribu
 TEST(DistributedObjectStorageJoinDispatch, EveryTableCrossesTheWireAsATableFunction)
 {
     auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto plan_text = planAndExplain(
         "SELECT driver.id, safe_lookup.lookup_id FROM driver INNER JOIN safe_lookup ON driver.id = safe_lookup.lookup_id", state.context);
@@ -344,7 +344,7 @@ TEST(DistributedObjectStorageJoinDispatch, EveryTableCrossesTheWireAsATableFunct
 TEST(DistributedObjectStorageJoinDispatch, JoinRunsLocallyWhenModeIsNotDistributed)
 {
     auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("allow"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", false);
 
     auto plan_text = planAndExplain("SELECT driver.id, safe_lookup.lookup_id FROM driver INNER JOIN safe_lookup ON driver.id = safe_lookup.lookup_id", state.context);
 
@@ -356,7 +356,7 @@ TEST(DistributedObjectStorageJoinDispatch, JoinRunsLocallyWhenModeIsNotDistribut
 TEST(DistributedObjectStorageJoinDispatch, BuriedDriverOwnsWholeOuterQueryWithGroupBy)
 {
     auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto plan_text = planAndExplain(
         "SELECT x.id, count() FROM "
@@ -379,7 +379,7 @@ TEST(DistributedObjectStorageJoinDispatch, BuriedDriverOwnsWholeOuterQueryWithGr
 TEST(DistributedObjectStorageJoinDispatch, ReadFromClusterHeaderCarriesUnmergedAggregateState)
 {
     auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto plan_text = planAndExplain(
         "SELECT x.id, count() FROM "
@@ -406,7 +406,7 @@ TEST(DistributedObjectStorageJoinDispatch, ReadFromClusterHeaderCarriesUnmergedA
 TEST(DistributedObjectStorageJoinDispatch, ComplexProjectionOverBothJoinSidesBuildsSuccessfully)
 {
     auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto plan_text = planAndExplain(
         "SELECT "
@@ -435,7 +435,7 @@ TEST(DistributedObjectStorageJoinDispatch, ComplexProjectionOverBothJoinSidesBui
 TEST(DistributedObjectStorageJoinDispatch, ComplexProjectionWithWhereSurvivesPlanOptimization)
 {
     auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto plan_text = planOptimizeAndExplain(
         "SELECT "
@@ -459,7 +459,7 @@ TEST(DistributedObjectStorageJoinDispatch, ComplexProjectionWithWhereSurvivesPla
 TEST(DistributedObjectStorageJoinDispatch, BuriedDriverWithNestedRightSideBuildsSuccessfully)
 {
     auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto plan_text = planAndExplain(
         "SELECT transaction_event.id, count() FROM "
@@ -483,7 +483,7 @@ TEST(DistributedObjectStorageJoinDispatch, BuriedDriverWithNestedRightSideBuilds
 TEST(DistributedObjectStorageJoinDispatch, BuriedDriverIsTheOnlyClusterFunctionSent)
 {
     auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto plan_text = planAndExplain(
         "SELECT transaction_event.id, count() FROM "
@@ -508,7 +508,7 @@ TEST(DistributedObjectStorageJoinDispatch, BuriedDriverIsTheOnlyClusterFunctionS
 TEST(DistributedObjectStorageJoinDispatch, BuriedDriverWithCommonTableExpressions)
 {
     auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto plan_text = planAndExplain(
         "WITH transaction_event AS (SELECT driver.id FROM driver), "
@@ -538,7 +538,7 @@ TEST(DistributedObjectStorageJoinDispatch, BuriedDriverWithCommonTableExpression
 TEST(DistributedObjectStorageJoinDispatch, DispatchUsesItsOwnSourceStepNotATableRead)
 {
     auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     ParserSelectQuery parser;
     String query =
@@ -569,11 +569,11 @@ TEST(DistributedObjectStorageJoinDispatch, DispatchUsesItsOwnSourceStepNotATable
 TEST(DistributedObjectStorageJoinDispatch, HeaderComputationHandlesQueryLevelModeSetting)
 {
     auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("allow"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", false);
 
     auto plan_text = planAndExplain(
         "SELECT driver.id, count() FROM driver INNER JOIN safe_lookup ON driver.id = safe_lookup.lookup_id "
-        "GROUP BY driver.id SETTINGS object_storage_cluster_join_mode = 'distributed'",
+        "GROUP BY driver.id SETTINGS allow_object_storage_cluster_distributed_join = 1",
         state.context);
 
     EXPECT_NE(plan_text.find("ReadFromCluster"), String::npos) << plan_text;
@@ -585,7 +585,7 @@ TEST(DistributedObjectStorageJoinDispatch, HeaderComputationHandlesQueryLevelMod
 TEST(DistributedObjectStorageJoinDispatch, SelfJoinOnTheDriverIsNotDispatched)
 {
     auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto plan_text = planAndExplain("SELECT a.id FROM driver AS a INNER JOIN driver AS b ON a.id = b.id", state.context);
     EXPECT_EQ(plan_text.find("ReadFromClusterQuery"), String::npos) << plan_text;
@@ -595,7 +595,7 @@ TEST(DistributedObjectStorageJoinDispatch, SelfJoinOnTheDriverIsNotDispatched)
 TEST(DistributedObjectStorageJoinDispatch, LogicalPlanForShardIsNotDispatched)
 {
     auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     SelectQueryOptions options;
     options.build_logical_plan = true;
@@ -610,7 +610,7 @@ TEST(DistributedObjectStorageJoinDispatch, LogicalPlanForShardIsNotDispatched)
 TEST(DistributedObjectStorageJoinDispatch, InitiatorOnlySettingsAreNotSentToWorkers)
 {
     auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
     auto context = Context::createCopy(state.context);
     context->setSetting("limit", UInt64(1));
 
@@ -629,14 +629,14 @@ TEST(DistributedObjectStorageJoinDispatch, InitiatorOnlySettingsAreNotSentToWork
     EXPECT_FALSE(read_from_cluster_query->createRemoteContext()->getSettingsRef().isChanged("limit"));
 }
 
-/// A worker runs the dispatched query as sent: neither `distributed` nor its fallback applies there. Sending
-/// `allow` also lets a worker that does not know `distributed` parse the settings.
-TEST(DistributedObjectStorageJoinDispatch, WorkersRunTheDispatchedQueryInAllowMode)
+/// A worker runs the dispatched query as sent and must not dispatch it again. Leaving the setting unchanged
+/// also keeps a worker that does not know it from rejecting the settings.
+TEST(DistributedObjectStorageJoinDispatch, WorkersDoNotReceiveTheDistributedJoinSetting)
 {
     auto & state = State::instance();
     auto context = Context::createCopy(state.context);
-    context->setSetting("object_storage_cluster_join_mode", String("distributed"));
-    context->setSetting("object_storage_cluster_join_mode_fallback", String("global"));
+    context->setSetting("allow_object_storage_cluster_distributed_join", true);
+    context->setSetting("object_storage_cluster_join_mode", String("global"));
 
     ParserSelectQuery parser;
     ASTPtr ast = parseQuery(
@@ -650,7 +650,5 @@ TEST(DistributedObjectStorageJoinDispatch, WorkersRunTheDispatchedQueryInAllowMo
     auto * read_from_cluster_query = findReadFromClusterQuery(interpreter.getQueryPlan().getRootNode());
     ASSERT_NE(read_from_cluster_query, nullptr);
 
-    EXPECT_EQ(
-        read_from_cluster_query->createRemoteContext()->getSettingsRef().get("object_storage_cluster_join_mode"),
-        Field(String("allow")));
+    EXPECT_FALSE(read_from_cluster_query->createRemoteContext()->getSettingsRef().isChanged("allow_object_storage_cluster_distributed_join"));
 }

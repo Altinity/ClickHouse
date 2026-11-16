@@ -1649,10 +1649,10 @@ def _assert_dispatched_whole(nodes, query_id):
 
 
 def test_distributed_join_dispatch(started_cluster):
-    """object_storage_cluster_join_mode='distributed': a JOIN whose driving table is a DataLake-catalog
+    """allow_object_storage_cluster_distributed_join=1: a JOIN whose driving table is a DataLake-catalog
     table is dispatched whole to the driver's cluster and finalized on the initiator.
 
-    Correctness is checked against the same queries under join_mode='allow' (ordinary local planning),
+    Correctness is checked against the same queries with the setting off (ordinary local planning),
     which is the oracle -- dispatch must not change results, only where the work happens.
     """
     node1 = started_cluster.instances["node1"]
@@ -1663,13 +1663,13 @@ def test_distributed_join_dispatch(started_cluster):
         started_cluster, nodes, f"test_distributed_join_{uuid.uuid4()}"
     )
 
-    def run(query, join_mode, query_id=None):
+    def run(query, distributed_join, query_id=None):
         return node1.query(
             query,
             query_id=query_id,
             settings={
                 "object_storage_cluster": "cluster_simple",
-                "object_storage_cluster_join_mode": join_mode,
+                "allow_object_storage_cluster_distributed_join": distributed_join,
             },
         )
 
@@ -1744,11 +1744,11 @@ def test_distributed_join_dispatch(started_cluster):
         ("buried driver", buried_driver),
         ("buried driver via CTE", buried_driver_cte),
     ):
-        expected = run(query, "allow")
+        expected = run(query, 0)
         assert expected == "berlin\t2\nparis\t1\n", f"{name} oracle result changed: {expected!r}"
 
         query_id = uuid.uuid4().hex
-        assert run(query, "distributed", query_id=query_id) == expected, f"{name} differs under dispatch"
+        assert run(query, 1, query_id=query_id) == expected, f"{name} differs under dispatch"
         _assert_dispatched_whole(nodes, query_id)
 
 
@@ -1772,16 +1772,16 @@ def test_distributed_join_dispatch_falls_back(started_cluster):
         ORDER BY ALL
     """
 
-    def run(join_mode):
+    def run(distributed_join):
         return node1.query(
             query,
             settings={
                 "object_storage_cluster": "cluster_simple",
-                "object_storage_cluster_join_mode": join_mode,
+                "allow_object_storage_cluster_distributed_join": distributed_join,
             },
         )
 
-    assert run("distributed") == run("allow")
+    assert run(1) == run(0)
 
 
 def test_distributed_join_dispatch_ignores_parallel_replicas_settings(started_cluster):
@@ -1815,7 +1815,7 @@ def test_distributed_join_dispatch_ignores_parallel_replicas_settings(started_cl
         query,
         settings={
             "object_storage_cluster": "cluster_simple",
-            "object_storage_cluster_join_mode": "allow",
+            "allow_object_storage_cluster_distributed_join": 0,
         },
     )
     assert expected == "berlin\t2\nparis\t1\n", f"oracle result changed: {expected!r}"
@@ -1826,7 +1826,7 @@ def test_distributed_join_dispatch_ignores_parallel_replicas_settings(started_cl
         query_id=query_id,
         settings={
             "object_storage_cluster": "cluster_simple",
-            "object_storage_cluster_join_mode": "distributed",
+            "allow_object_storage_cluster_distributed_join": 1,
             "parallel_replicas_for_cluster_engines": 1,
             "enable_parallel_replicas": 1,
             "cluster_for_parallel_replicas": "cluster_simple",

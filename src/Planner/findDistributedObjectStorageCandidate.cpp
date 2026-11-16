@@ -21,7 +21,7 @@ namespace DB
 {
 namespace Setting
 {
-    extern const SettingsObjectStorageClusterJoinMode object_storage_cluster_join_mode;
+    extern const SettingsBool allow_object_storage_cluster_distributed_join;
     extern const SettingsBool object_storage_remote_initiator;
     extern const SettingsMap additional_table_filters;
 }
@@ -179,7 +179,7 @@ bool hasNestedSettingsChanges(const QueryTreeNodePtr & node)
 std::optional<DistributedObjectStorageCandidate> findDistributedObjectStorageCandidate(
     const QueryTreeNodePtr & query_node, const ContextPtr & context)
 {
-    if (context->getSettingsRef()[Setting::object_storage_cluster_join_mode] != ObjectStorageClusterJoinMode::DISTRIBUTED)
+    if (!context->getSettingsRef()[Setting::allow_object_storage_cluster_distributed_join])
         return {};
 
     /// Dispatch does not implement the remote-initiator topology from `IStorageCluster::read`.

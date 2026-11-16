@@ -150,6 +150,7 @@ namespace Setting
     extern const SettingsUInt64 max_parser_depth;
     extern const SettingsUInt64 max_query_size;
     extern const SettingsNonZeroUInt64 max_parallel_replicas;
+    extern const SettingsObjectStorageClusterJoinMode object_storage_cluster_join_mode;
     extern const SettingsFloat max_streams_to_max_threads_ratio;
     extern const SettingsMaxThreads max_threads;
     extern const SettingsUInt64 max_threads_min_free_memory_per_thread;
@@ -3731,7 +3732,7 @@ JoinTreeQueryPlan buildJoinTreeQueryPlan(const QueryTreeNodePtr & query_node,
     bool should_wrap_left_table = false;
     const bool has_multiple_tables = table_expressions_stack.size() > 1;
     const bool use_global_join
-        = getEffectiveObjectStorageClusterJoinMode(planner_context->getQueryContext()->getSettingsRef())
+        = planner_context->getQueryContext()->getSettingsRef()[Setting::object_storage_cluster_join_mode]
             == ObjectStorageClusterJoinMode::GLOBAL
         && joins_count > 0
         && !is_right_join

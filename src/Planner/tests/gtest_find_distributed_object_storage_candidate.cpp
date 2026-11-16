@@ -195,7 +195,7 @@ ContextMutablePtr contextWithRowPolicy(const ContextMutablePtr & base_context, c
 TEST(FindDistributedObjectStorageCandidate, AcceptsDriverJoinedWithSafeDataLakeTable)
 {
     const auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto query_tree = analyze("SELECT driver.id FROM driver INNER JOIN safe_lookup ON driver.id = safe_lookup.id", state.context);
 
@@ -208,7 +208,7 @@ TEST(FindDistributedObjectStorageCandidate, AcceptsDriverJoinedWithSafeDataLakeT
 TEST(FindDistributedObjectStorageCandidate, DoesNotInterceptPlainDistributedObjectStorageQuery)
 {
     const auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto query_tree = analyze("SELECT driver.id FROM driver", state.context);
     EXPECT_FALSE(findDistributedObjectStorageCandidate(query_tree, state.context).has_value());
@@ -217,7 +217,7 @@ TEST(FindDistributedObjectStorageCandidate, DoesNotInterceptPlainDistributedObje
 TEST(FindDistributedObjectStorageCandidate, RejectsOrdinaryLocalTableAsRhs)
 {
     const auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto query_tree = analyze("SELECT driver.id FROM driver INNER JOIN local_table ON driver.id = local_table.id", state.context);
     EXPECT_FALSE(findDistributedObjectStorageCandidate(query_tree, state.context).has_value());
@@ -226,7 +226,7 @@ TEST(FindDistributedObjectStorageCandidate, RejectsOrdinaryLocalTableAsRhs)
 TEST(FindDistributedObjectStorageCandidate, RejectsWhenModeIsNotDistributed)
 {
     const auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("allow"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", false);
 
     auto query_tree = analyze("SELECT driver.id FROM driver INNER JOIN safe_lookup ON driver.id = safe_lookup.id", state.context);
     EXPECT_FALSE(findDistributedObjectStorageCandidate(query_tree, state.context).has_value());
@@ -235,7 +235,7 @@ TEST(FindDistributedObjectStorageCandidate, RejectsWhenModeIsNotDistributed)
 TEST(FindDistributedObjectStorageCandidate, RejectsWhenRemoteInitiatorIsSet)
 {
     const auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
     state.context->setSetting("object_storage_remote_initiator", true);
 
     auto query_tree = analyze("SELECT driver.id FROM driver INNER JOIN safe_lookup ON driver.id = safe_lookup.id", state.context);
@@ -251,7 +251,7 @@ TEST(FindDistributedObjectStorageCandidate, RejectsWhenRemoteInitiatorIsSet)
 TEST(FindDistributedObjectStorageCandidate, RejectsWhenAdditionalTableFiltersIsSet)
 {
     const auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
     state.context->setSetting("additional_table_filters", String("{'driver': 'id > 0'}"));
 
     auto query_tree = analyze("SELECT driver.id FROM driver INNER JOIN safe_lookup ON driver.id = safe_lookup.id", state.context);
@@ -268,7 +268,7 @@ TEST(FindDistributedObjectStorageCandidate, RejectsDriverWithoutSelectAccess)
 {
     const auto & state = State::instance();
     auto context = contextWithNoGrants(state.context);
-    context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     /// The analyzer checks access too, so analyze as a user who has it.
     auto query_tree = analyze("SELECT driver.id FROM driver INNER JOIN safe_lookup ON driver.id = safe_lookup.id", state.context);
@@ -282,7 +282,7 @@ TEST(FindDistributedObjectStorageCandidate, RejectsBuriedDriverWithoutSelectAcce
 {
     const auto & state = State::instance();
     auto context = contextWithNoGrants(state.context);
-    context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto query_tree = analyze(
         "SELECT x.id FROM (SELECT driver.id FROM driver INNER JOIN safe_lookup ON driver.id = safe_lookup.id) AS x "
@@ -297,7 +297,7 @@ TEST(FindDistributedObjectStorageCandidate, RejectsDriverWithRowPolicy)
 {
     const auto & state = State::instance();
     auto context = contextWithRowPolicy(state.context, "find_distributed_object_storage_candidate_test_db", "driver");
-    context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto query_tree = analyze("SELECT driver.id FROM driver INNER JOIN safe_lookup ON driver.id = safe_lookup.id", context);
     EXPECT_FALSE(findDistributedObjectStorageCandidate(query_tree, context).has_value());
@@ -309,7 +309,7 @@ TEST(FindDistributedObjectStorageCandidate, RejectsNonDriverPartnerWithRowPolicy
 {
     const auto & state = State::instance();
     auto context = contextWithRowPolicy(state.context, "find_distributed_object_storage_candidate_test_db", "safe_lookup");
-    context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto query_tree = analyze("SELECT driver.id FROM driver INNER JOIN safe_lookup ON driver.id = safe_lookup.id", context);
     EXPECT_FALSE(findDistributedObjectStorageCandidate(query_tree, context).has_value());
@@ -318,7 +318,7 @@ TEST(FindDistributedObjectStorageCandidate, RejectsNonDriverPartnerWithRowPolicy
 TEST(FindDistributedObjectStorageCandidate, AcceptsSecondDataLakeTableAsRhsEvenThoughItIsAlsoDispatchCapable)
 {
     const auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto query_tree
         = analyze("SELECT driver.id FROM driver INNER JOIN second_datalake_table ON driver.id = second_datalake_table.id", state.context);
@@ -333,7 +333,7 @@ TEST(FindDistributedObjectStorageCandidate, AcceptsSecondDataLakeTableAsRhsEvenT
 TEST(FindDistributedObjectStorageCandidate, AcceptsSecondDriverCapableSubqueryAsRhs)
 {
     const auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto query_tree = analyze(
         "SELECT x.id FROM (SELECT driver.id FROM driver) AS x "
@@ -348,7 +348,7 @@ TEST(FindDistributedObjectStorageCandidate, AcceptsSecondDriverCapableSubqueryAs
 TEST(FindDistributedObjectStorageCandidate, RejectsUnsafeClusterTableAsDriver)
 {
     const auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto query_tree
         = analyze("SELECT t.id FROM find_distributed_object_storage_candidate_test_plain_db.unsafe_cluster_table AS t INNER JOIN safe_lookup ON t.id = safe_lookup.id", state.context);
@@ -358,7 +358,7 @@ TEST(FindDistributedObjectStorageCandidate, RejectsUnsafeClusterTableAsDriver)
 TEST(FindDistributedObjectStorageCandidate, RejectsUnsafeIStorageClusterTableAsRhs)
 {
     const auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto query_tree
         = analyze("SELECT driver.id FROM driver INNER JOIN find_distributed_object_storage_candidate_test_plain_db.unsafe_cluster_table AS t ON driver.id = t.id", state.context);
@@ -369,7 +369,7 @@ TEST(FindDistributedObjectStorageCandidate, RejectsUnsafeIStorageClusterTableAsR
 TEST(FindDistributedObjectStorageCandidate, AcceptsDriverInMultiJoinQueryNode)
 {
     const auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto query_tree = analyze(
         "SELECT driver.id FROM driver "
@@ -389,7 +389,7 @@ TEST(FindDistributedObjectStorageCandidate, AcceptsDriverInMultiJoinQueryNode)
 TEST(FindDistributedObjectStorageCandidate, RejectsWhenDriverPathIntermediateSubqueryHasGroupBy)
 {
     const auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto query_tree = analyze(
         "SELECT x.id, x.c FROM "
@@ -405,7 +405,7 @@ TEST(FindDistributedObjectStorageCandidate, RejectsWhenDriverPathIntermediateSub
 TEST(FindDistributedObjectStorageCandidate, RejectsWhenDriverPathIntermediateSubqueryHasLimit)
 {
     const auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto query_tree = analyze(
         "SELECT x.id FROM "
@@ -421,7 +421,7 @@ TEST(FindDistributedObjectStorageCandidate, RejectsWhenDriverPathIntermediateSub
 TEST(FindDistributedObjectStorageCandidate, AcceptsOuterCandidateWhenIntermediateSubqueryIsWhereProjectionOnly)
 {
     const auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto query_tree = analyze(
         "SELECT x.id FROM "
@@ -439,7 +439,7 @@ TEST(FindDistributedObjectStorageCandidate, AcceptsOuterCandidateWhenIntermediat
 TEST(FindDistributedObjectStorageCandidate, RejectsWhenLeftSpineHasNoDriverEvenThoughRhsSubqueryDoes)
 {
     const auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto query_tree = analyze(
         "SELECT x.id FROM safe_lookup LEFT JOIN "
@@ -453,7 +453,7 @@ TEST(FindDistributedObjectStorageCandidate, RejectsWhenLeftSpineHasNoDriverEvenT
 TEST(FindDistributedObjectStorageCandidate, RejectsUnsafeSubqueryInWhereClause)
 {
     const auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto query_tree = analyze(
         "SELECT driver.id FROM driver INNER JOIN safe_lookup ON driver.id = safe_lookup.id "
@@ -465,7 +465,7 @@ TEST(FindDistributedObjectStorageCandidate, RejectsUnsafeSubqueryInWhereClause)
 TEST(FindDistributedObjectStorageCandidate, RejectsCrossJoin)
 {
     const auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto query_tree = analyze("SELECT driver.id FROM driver CROSS JOIN safe_lookup", state.context);
     EXPECT_FALSE(findDistributedObjectStorageCandidate(query_tree, state.context).has_value());
@@ -474,7 +474,7 @@ TEST(FindDistributedObjectStorageCandidate, RejectsCrossJoin)
 TEST(FindDistributedObjectStorageCandidate, RejectsDriverOnTheRightOfRightJoin)
 {
     const auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto query_tree = analyze("SELECT driver.id FROM safe_lookup RIGHT JOIN driver ON safe_lookup.id = driver.id", state.context);
     EXPECT_FALSE(findDistributedObjectStorageCandidate(query_tree, state.context).has_value());
@@ -483,7 +483,7 @@ TEST(FindDistributedObjectStorageCandidate, RejectsDriverOnTheRightOfRightJoin)
 TEST(FindDistributedObjectStorageCandidate, RejectsExplicitClusterTableFunctionAsRhs)
 {
     const auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto query_tree = analyze("SELECT driver.id FROM driver INNER JOIN safe_lookup ON driver.id = safe_lookup.id", state.context);
 
@@ -504,7 +504,7 @@ TEST(FindDistributedObjectStorageCandidate, RejectsExplicitClusterTableFunctionA
 TEST(FindDistributedObjectStorageCandidate, AcceptsBuriedDriverWithSafeOuterJoin)
 {
     const auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto query_tree = analyze(
         "SELECT x.id FROM (SELECT driver.id FROM driver INNER JOIN safe_lookup ON driver.id = safe_lookup.id) AS x "
@@ -522,7 +522,7 @@ TEST(FindDistributedObjectStorageCandidate, AcceptsBuriedDriverWithSafeOuterJoin
 TEST(FindDistributedObjectStorageCandidate, RejectsWhenOuterJoinPartnerIsUnsafe)
 {
     const auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto query_tree = analyze(
         "SELECT x.id FROM (SELECT driver.id FROM driver INNER JOIN safe_lookup ON driver.id = safe_lookup.id) AS x "
@@ -541,7 +541,7 @@ TEST(FindDistributedObjectStorageCandidate, RejectsWhenOuterJoinPartnerIsUnsafe)
 TEST(FindDistributedObjectStorageCandidate, AcceptsBuriedDriverWithNestedRightSide)
 {
     const auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto query_tree = analyze(
         "SELECT transaction_event.id, count() AS c FROM "
@@ -570,7 +570,7 @@ TEST(FindDistributedObjectStorageCandidate, AcceptsBuriedDriverWithNestedRightSi
 TEST(FindDistributedObjectStorageCandidate, AcceptsBuriedDriverInsideCommonTableExpression)
 {
     const auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto query_tree = analyze(
         "WITH transaction_event AS (SELECT driver.id FROM driver), "
@@ -590,7 +590,7 @@ TEST(FindDistributedObjectStorageCandidate, AcceptsBuriedDriverInsideCommonTable
 TEST(FindDistributedObjectStorageCandidate, RejectsAggregatingCommonTableExpressionOnDriverPath)
 {
     const auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto query_tree = analyze(
         "WITH transaction_event AS (SELECT driver.id FROM driver GROUP BY driver.id), "
@@ -606,7 +606,7 @@ TEST(FindDistributedObjectStorageCandidate, RejectsAggregatingCommonTableExpress
 TEST(FindDistributedObjectStorageCandidate, AcceptsDirectDriverWithFilterAndAggregation)
 {
     const auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto query_tree = analyze(
         "SELECT driver.id, count() FROM driver LEFT JOIN safe_lookup ON driver.id = safe_lookup.id "
@@ -622,7 +622,7 @@ TEST(FindDistributedObjectStorageCandidate, AcceptsDirectDriverWithFilterAndAggr
 TEST(FindDistributedObjectStorageCandidate, RejectsAggregateWithoutGroupByOnDriverPath)
 {
     const auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto query_tree = analyze(
         "SELECT x.c FROM (SELECT count() AS c FROM driver) AS x INNER JOIN safe_lookup ON x.c = safe_lookup.id",
@@ -635,7 +635,7 @@ TEST(FindDistributedObjectStorageCandidate, RejectsAggregateWithoutGroupByOnDriv
 TEST(FindDistributedObjectStorageCandidate, RejectsWindowFunctionOnDriverPath)
 {
     const auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto query_tree = analyze(
         "SELECT x.id, x.n FROM (SELECT driver.id AS id, row_number() OVER () AS n FROM driver) AS x "
@@ -651,7 +651,7 @@ TEST(FindDistributedObjectStorageCandidate, RejectsWindowFunctionOnDriverPath)
 TEST(FindDistributedObjectStorageCandidate, RejectsAdditionalTableFiltersInNestedSubquery)
 {
     const auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto query_tree = analyze(
         "SELECT f.id FROM (SELECT driver.id AS id FROM driver SETTINGS additional_table_filters = {'driver': 'id > 0'}) AS f "
@@ -665,7 +665,7 @@ TEST(FindDistributedObjectStorageCandidate, RejectsAdditionalTableFiltersInNeste
 TEST(FindDistributedObjectStorageCandidate, RejectsClusterSetInNestedSubquery)
 {
     const auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto query_tree = analyze(
         "SELECT f.id FROM (SELECT driver.id AS id FROM driver SETTINGS object_storage_cluster = 'other_cluster') AS f "
@@ -679,7 +679,7 @@ TEST(FindDistributedObjectStorageCandidate, RejectsClusterSetInNestedSubquery)
 TEST(FindDistributedObjectStorageCandidate, AcceptsSettingsOnOutermostQuery)
 {
     const auto & state = State::instance();
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto query_tree = analyze(
         "SELECT driver.id FROM driver INNER JOIN safe_lookup ON driver.id = safe_lookup.id SETTINGS max_threads = 1",

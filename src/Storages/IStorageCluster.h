@@ -12,13 +12,6 @@ namespace DB
 class Cluster;
 using ClusterPtr = std::shared_ptr<Cluster>;
 
-struct Settings;
-enum class ObjectStorageClusterJoinMode : uint8_t;
-
-/// The join mode of a query that is not dispatched whole: `distributed` resolves to
-/// `object_storage_cluster_join_mode_fallback`.
-ObjectStorageClusterJoinMode getEffectiveObjectStorageClusterJoinMode(const Settings & settings);
-
 
 /**
  *  Base cluster for Storages used in table functions like s3Cluster and hdfsCluster.
