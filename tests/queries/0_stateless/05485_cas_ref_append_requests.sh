@@ -14,7 +14,7 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$CUR_DIR"/../shell_config.sh
 
 DISK_NAME="${CLICKHOUSE_DATABASE}_05485_cas"
-DISK="disk(type = object_storage, object_storage_type = local, metadata_type = cas,
+DISK="disk(type = object_storage, object_storage_type = local, metadata_type = cas, cas_unsafe_remount_no_delay = 1,
     cas_server_root_id = '${CLICKHOUSE_DATABASE}_05485',
     cas_gc_enabled = 0,
     name = '${DISK_NAME}',
