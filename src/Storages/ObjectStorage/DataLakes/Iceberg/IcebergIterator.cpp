@@ -183,9 +183,13 @@ std::optional<ProcessedManifestFileEntryPtr> SingleThreadIcebergKeysIterator::ne
                 persistent_components,
                 local_context,
                 log,
+<<<<<<< HEAD
                 manifest_list_entry.manifest_file_path,
                 manifest_list_entry.manifest_file_byte_size,
                 *secondary_storages);
+=======
+                mle.manifest_file_path);
+>>>>>>> v26.3.64.3-lts
 
             current_manifest_file_iterator = Iceberg::ManifestFileIterator::create(
                 manifest_file_cacheable_part.deserializer,
