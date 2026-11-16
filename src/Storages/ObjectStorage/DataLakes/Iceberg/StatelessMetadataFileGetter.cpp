@@ -70,7 +70,6 @@ Iceberg::ManifestFileCacheableInfo getManifestFile(
     ContextPtr local_context,
     LoggerPtr log,
     const IcebergPathFromMetadata & filename,
-    size_t bytes_size,
     SecondaryStorages & secondary_storages)
 {
     auto log_level = local_context->getSettingsRef()[Setting::iceberg_metadata_log_level].value;
@@ -123,7 +122,6 @@ Iceberg::ManifestFileIterator::ManifestFileEntriesHandle getManifestFileEntriesH
         local_context,
         log,
         cache_key.manifest_file_path,
-        cache_key.manifest_file_byte_size,
         secondary_storages);
 
     auto iterator = Iceberg::ManifestFileIterator::create(

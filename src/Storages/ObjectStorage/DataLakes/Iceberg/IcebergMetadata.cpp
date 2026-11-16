@@ -330,7 +330,6 @@ void IcebergMetadata::backgroundMetadataPrefetcherThread()
                 auto manifest_file_ptr = Iceberg::getManifestFile(
                     object_storage, persistent_components, ctx, log,
                     entry.manifest_file_path,
-                    entry.manifest_file_byte_size,
                     *secondary_storages);
             }
         }
