@@ -1830,13 +1830,9 @@ bool IcebergStorageSink::initializeMetadata()
                 context,
                 getLogger("IcebergWrites"),
                 compression_method,
-<<<<<<< HEAD
-                persistent_table_components.table_uuid);
+                persistent_table_components.table_uuid));
             partition_spec_id = metadata->getValue<Int64>(Iceberg::f_default_spec_id);
             auto partitions_specs = metadata->getArray(Iceberg::f_partition_specs);
-=======
-                persistent_table_components.table_uuid));
->>>>>>> c1146e5434f9 (Merge pull request #126267 from ClickHouse/iceberg-cache-parsed-metadata-json)
 
             auto new_schema_id = metadata->getValue<Int64>(Iceberg::f_current_schema_id);
             if (new_schema_id != current_schema_id)

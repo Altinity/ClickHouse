@@ -591,9 +591,6 @@ String readMetadataJSONString(
     LoggerPtr log,
     CompressionMethod compression_method)
 {
-    ProfileEvents::increment(ProfileEvents::IcebergMetadataJSONReads);
-    ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::IcebergMetadataJSONReadMicroseconds);
-
     ObjectInfo object_info(metadata_file_path);
 
     auto read_settings = local_context->getReadSettings();
@@ -619,9 +616,8 @@ String readMetadataJSONString(
 
 Poco::JSON::Object::Ptr parseMetadataJSONString(const String & metadata_json_str)
 {
-    ProfileEvents::increment(ProfileEvents::IcebergMetadataJSONParses);
-    ProfileEvents::increment(ProfileEvents::IcebergMetadataJSONParsedBytes, metadata_json_str.size());
-    ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::IcebergMetadataJSONParseMicroseconds);
+    ProfileEvents::increment(ProfileEvents::IcebergJsonFileParsing);
+    ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::IcebergJsonFileParsingMicroseconds);
 
     Poco::JSON::Parser parser; /// For some reason base/base/JSON.h can not parse this json file
     Poco::Dynamic::Var json = parser.parse(metadata_json_str);
@@ -681,44 +677,6 @@ Poco::JSON::Object::Ptr getMetadataJSONObject(
 {
     auto read_fn = [&]()
     {
-<<<<<<< HEAD
-        ObjectInfo object_info(metadata_file_path);
-
-        auto read_settings = local_context->getReadSettings();
-        /// Do not utilize filesystem cache if more precise cache enabled
-        if (metadata_cache)
-            read_settings.enable_filesystem_cache = false;
-
-        auto source_buf = createReadBuffer(object_info.relative_path_with_metadata, object_storage, local_context, log, read_settings);
-
-        std::unique_ptr<ReadBuffer> buf;
-        if (compression_method != CompressionMethod::None)
-            /// Iceberg metadata snappy is always the Hadoop block format (`SnappyMode::Basic`); the
-            /// write path in `writeMessageToFile` pins the same mode. The wire format cannot be
-            /// inferred from the `.snappy.metadata.json` suffix, so both sides must agree statically.
-            buf = wrapReadBufferWithCompressionMethod(std::move(source_buf), compression_method, /*zstd_window_log_max=*/ 0, SnappyMode::Basic);
-        else
-            buf = std::move(source_buf);
-
-        String json_str;
-        readJSONObjectPossiblyInvalid(json_str, *buf);
-        return json_str;
-    };
-
-    ProfileEvents::increment(ProfileEvents::IcebergJsonFileParsing);
-    ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::IcebergJsonFileParsingMicroseconds);
-
-    String metadata_json_str;
-    if (metadata_cache && table_uuid.has_value())
-        metadata_json_str = metadata_cache->getOrSetTableMetadata(
-            IcebergMetadataFilesCache::getKey(*table_uuid, metadata_file_path), create_fn);
-    else
-        metadata_json_str = create_fn();
-
-    Poco::JSON::Parser parser; /// For some reason base/base/JSON.h can not parse this json file
-    Poco::Dynamic::Var json = parser.parse(metadata_json_str);
-    return json.extract<Poco::JSON::Object::Ptr>();
-=======
         return readMetadataJSONString(metadata_file_path, object_storage, metadata_cache != nullptr, local_context, log, compression_method);
     };
 
@@ -732,7 +690,6 @@ Poco::JSON::Object::Ptr getMetadataJSONObject(
             auto metadata_json_str = read_fn();
             return std::make_shared<IcebergMetadataFilesCacheCell>(parseMetadataJSONString(metadata_json_str), metadata_json_str.size());
         });
->>>>>>> c1146e5434f9 (Merge pull request #126267 from ClickHouse/iceberg-cache-parsed-metadata-json)
 }
 
 /// Iceberg stores a decimal as its unscaled value in two's-complement big-endian form, in the

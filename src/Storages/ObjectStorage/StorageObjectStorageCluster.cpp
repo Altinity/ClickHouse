@@ -313,16 +313,13 @@ void StorageObjectStorageCluster::prepareForDrop(ContextPtr query_context)
 
 std::optional<UInt64> StorageObjectStorageCluster::totalRows(ContextPtr query_context) const
 {
-<<<<<<< HEAD
-    if (pure_storage)
-        return pure_storage->totalRows(query_context);
-=======
     return totalRowsInSnapshot(nullptr, query_context);
 }
 
 std::optional<UInt64> StorageObjectStorageCluster::totalRowsInSnapshot(const StorageSnapshotPtr & storage_snapshot, ContextPtr query_context) const
 {
->>>>>>> c1146e5434f9 (Merge pull request #126267 from ClickHouse/iceberg-cache-parsed-metadata-json)
+    if (pure_storage)
+        return pure_storage->totalRowsInSnapshot(storage_snapshot, query_context);
     configuration->lazyInitializeIfNeeded(
         object_storage,
         query_context);

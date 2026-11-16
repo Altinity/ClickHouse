@@ -661,7 +661,7 @@ public:
     bool isDataLakeConfiguration() const override { return getImpl().isDataLakeConfiguration(); }
 
     bool supportsTotalRows(ContextPtr context, ObjectStorageType storage_type) const override { return getImpl().supportsTotalRows(context, storage_type); }
-    std::optional<size_t> totalRows(ContextPtr context) override { return getImpl().totalRows(context); }
+    std::optional<size_t> totalRows(ContextPtr context, const std::optional<DataLakeTableStateSnapshot> & state) override { return getImpl().totalRows(context, state); }
     bool supportsTotalBytes(ContextPtr context, ObjectStorageType storage_type) const override { return getImpl().supportsTotalBytes(context, storage_type); }
     std::optional<size_t> totalBytes(ContextPtr context) override { return getImpl().totalBytes(context); }
     bool isDataSortedBySortingKey(StorageMetadataPtr storage_metadata, ContextPtr context) const override

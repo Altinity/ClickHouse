@@ -39,32 +39,6 @@ namespace DB
 namespace
 {
 
-<<<<<<< HEAD
-Poco::JSON::Object::Ptr deepCopy(Poco::JSON::Object::Ptr obj)
-{
-    std::ostringstream oss; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
-    obj->stringify(oss);
-
-    Poco::JSON::Parser parser;
-    auto result = parser.parse(oss.str());
-    return result.extract<Poco::JSON::Object::Ptr>();
-=======
-/// Only the incremental refreshable-MV append supplies a new cursor; every other snapshot must carry the parent's forward, else the next refresh re-appends already-materialized rows.
-void carryForwardRefreshCursor(
-    Poco::JSON::Object::Ptr summary, Poco::JSON::Object::Ptr parent_snapshot, const std::optional<String> & new_cursor)
-{
-    std::optional<String> cursor = new_cursor;
-    if (!cursor.has_value() && parent_snapshot && parent_snapshot->has(Iceberg::f_summary))
-    {
-        auto parent_summary = parent_snapshot->get(Iceberg::f_summary).extract<Poco::JSON::Object::Ptr>();
-        if (parent_summary->has(Iceberg::f_refresh_cursor))
-            cursor = parent_summary->getValue<String>(Iceberg::f_refresh_cursor);
-    }
-    if (cursor.has_value())
-        summary->set(Iceberg::f_refresh_cursor, *cursor);
->>>>>>> c1146e5434f9 (Merge pull request #126267 from ClickHouse/iceberg-cache-parsed-metadata-json)
-}
-
 /// Read a numeric `total-*` field from the parent snapshot's summary, returning std::nullopt when absent or null.
 std::optional<Int64> readParentTotal(Poco::JSON::Object::Ptr parent_snapshot, const char * field_name)
 {
@@ -793,24 +767,7 @@ void MetadataGenerator::generateDropColumnMetadata(const String & column_name)
 {
     const auto next_schema_id = getNextSchemaId(metadata_object);
 
-<<<<<<< HEAD
-    auto current_schema = deepCopy(getCurrentSchema());
-=======
-    Poco::JSON::Object::Ptr current_schema;
-    auto schemas = metadata_object->getArray(Iceberg::f_schemas);
-    for (UInt32 i = 0; i < schemas->size(); ++i)
-    {
-        if (schemas->getObject(i)->getValue<Int32>(Iceberg::f_schema_id) == current_schema_id)
-        {
-            current_schema = schemas->getObject(i);
-            break;
-        }
-    }
-
-    if (!current_schema)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Not found schema with id {}", current_schema_id);
-    current_schema = Iceberg::deepCopy(current_schema);
->>>>>>> c1146e5434f9 (Merge pull request #126267 from ClickHouse/iceberg-cache-parsed-metadata-json)
+    auto current_schema = Iceberg::deepCopy(getCurrentSchema());
 
     auto fields = current_schema->getArray(Iceberg::f_fields);
     UInt32 index_to_drop = static_cast<UInt32>(fields->size());
@@ -908,7 +865,6 @@ void MetadataGenerator::generateDropColumnMetadata(const String & column_name)
         }
     }
 
-<<<<<<< HEAD
     current_schema->getArray(Iceberg::f_fields)->remove(index_to_drop);
     current_schema->set(Iceberg::f_schema_id, next_schema_id);
     metadata_object->set(Iceberg::f_current_schema_id, next_schema_id);
@@ -922,12 +878,7 @@ void MetadataGenerator::generateAddColumnMetadata(const String & column_name, Da
     Iceberg::checkUnknownTypeAllowed(column_name, type, metadata_object->getValue<Int64>(Iceberg::f_format_version));
     const auto next_schema_id = getNextSchemaId(metadata_object);
 
-    auto current_schema = deepCopy(getCurrentSchema());
-=======
-    if (!current_schema)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Not found schema with id {}", current_schema_id);
-    current_schema = Iceberg::deepCopy(current_schema);
->>>>>>> c1146e5434f9 (Merge pull request #126267 from ClickHouse/iceberg-cache-parsed-metadata-json)
+    auto current_schema = Iceberg::deepCopy(getCurrentSchema());
 
     auto existing_fields = current_schema->getArray(Iceberg::f_fields);
     for (UInt32 i = 0; i < existing_fields->size(); ++i)
@@ -994,23 +945,6 @@ bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name,
         Iceberg::checkUnknownTypeAllowed(column_name, type, metadata_object->getValue<Int64>(Iceberg::f_format_version));
     auto current_schema = getCurrentSchema();
 
-<<<<<<< HEAD
-=======
-    Poco::JSON::Object::Ptr current_schema;
-    auto schemas = metadata_object->getArray(Iceberg::f_schemas);
-    for (UInt32 i = 0; i < schemas->size(); ++i)
-    {
-        if (schemas->getObject(i)->getValue<Int32>(Iceberg::f_schema_id) == current_schema_id)
-        {
-            current_schema = schemas->getObject(i);
-            break;
-        }
-    }
-
-    if (!current_schema)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Not found schema with id {}", current_schema_id);
-    current_schema = Iceberg::deepCopy(current_schema);
->>>>>>> c1146e5434f9 (Merge pull request #126267 from ClickHouse/iceberg-cache-parsed-metadata-json)
     auto last_column_id = metadata_object->getValue<Int32>(Iceberg::f_last_column_id);
     auto format_version = metadata_object->getValue<UInt64>(Iceberg::f_format_version);
     auto schema_fields = current_schema->getArray(Iceberg::f_fields);
@@ -1029,19 +963,12 @@ bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name,
             if (current_field->getValue<String>(Iceberg::f_name) != column_name)
                 continue;
 
-<<<<<<< HEAD
             if (current_field->getValue<bool>(Iceberg::f_required) == new_type.second
                 && icebergTypesEqualIgnoringIds(current_field->get(Iceberg::f_type), new_type.first))
             {
                 Iceberg::IcebergSchemaProcessor schema_processor(
                     context, context->getSettingsRef()[Setting::allow_experimental_geo_types_in_iceberg]);
                 auto current_ch_type = schema_processor.getClickHouseFieldType(current_field, context);
-=======
-            auto old_type = Iceberg::deepCopy(current_field);
-            current_field->set(Iceberg::f_type, new_type.first);
-            if (!current_field->getValue<bool>(Iceberg::f_required) && !type->isNullable())
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Iceberg spec doesn't allow change type from nullable to non-nullable {}", type->getPrettyName());
->>>>>>> c1146e5434f9 (Merge pull request #126267 from ClickHouse/iceberg-cache-parsed-metadata-json)
 
                 if (!current_ch_type->equals(*type))
                     throw Exception(
@@ -1086,7 +1013,7 @@ bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name,
         return false;
 
     const auto next_schema_id = getNextSchemaId(metadata_object);
-    current_schema = deepCopy(current_schema);
+    current_schema = Iceberg::deepCopy(current_schema);
     schema_fields = current_schema->getArray(Iceberg::f_fields);
     auto target_field = schema_fields->getObject(target_index);
 
@@ -1137,26 +1064,7 @@ bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name,
 
 void MetadataGenerator::generateRenameColumnMetadata(const String & column_name, const String & new_column_name)
 {
-<<<<<<< HEAD
-    auto current_schema = deepCopy(getCurrentSchema());
-=======
-    auto current_schema_id = metadata_object->getValue<Int32>(Iceberg::f_current_schema_id);
-
-    Poco::JSON::Object::Ptr current_schema;
-    auto schemas = metadata_object->getArray(Iceberg::f_schemas);
-    for (UInt32 i = 0; i < schemas->size(); ++i)
-    {
-        if (schemas->getObject(i)->getValue<Int32>(Iceberg::f_schema_id) == current_schema_id)
-        {
-            current_schema = schemas->getObject(i);
-            break;
-        }
-    }
-
-    if (!current_schema)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Not found schema with id {}", current_schema_id);
-    current_schema = Iceberg::deepCopy(current_schema);
->>>>>>> c1146e5434f9 (Merge pull request #126267 from ClickHouse/iceberg-cache-parsed-metadata-json)
+    auto current_schema = Iceberg::deepCopy(getCurrentSchema());
 
     auto schema_fields = current_schema->getArray(Iceberg::f_fields);
 

@@ -17,6 +17,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Snapshot.h>
 
 #include <atomic>
+#include <mutex>
 #include <optional>
 #include <base/defines.h>
 
@@ -114,14 +115,9 @@ public:
         LoggerPtr metadata_logger);
 
     bool supportsUpdate() const override { return true; }
-<<<<<<< HEAD
-=======
 
     void update(const ContextPtr & context) override;
 
-    void setExplicitMetadataFilePath(const String & path) override;
-
->>>>>>> c1146e5434f9 (Merge pull request #126267 from ClickHouse/iceberg-cache-parsed-metadata-json)
     bool supportsWrites() const override { return true; }
     bool supportsParallelInsert() const override { return true; }
     bool supportsTruncate() const override { return true; }
@@ -341,17 +337,11 @@ private:
     BackgroundSchedulePoolTaskHolder background_metadata_prefetch_task;
     ObjectIterator prepared_iterator;
 
-<<<<<<< HEAD
-=======
     mutable std::mutex cached_latest_metadata_mutex;
     mutable std::optional<Iceberg::MetadataFileWithInfo> cached_latest_metadata TSA_GUARDED_BY(cached_latest_metadata_mutex);
 
-    Iceberg::MetadataFileWithInfo fetchLatestMetadata(
-        const ContextPtr & context, bool force_fetch_latest_metadata, bool ignore_metadata_pointer_overrides) const;
+    Iceberg::MetadataFileWithInfo fetchLatestMetadata(const ContextPtr & context, bool force_fetch_latest_metadata) const;
 
-    KeyDescription getSortingKey(ContextPtr local_context, Iceberg::TableStateSnapshot actual_table_state_snapshot) const;
-
->>>>>>> c1146e5434f9 (Merge pull request #126267 from ClickHouse/iceberg-cache-parsed-metadata-json)
     void backgroundMetadataPrefetcherThread();
 
     void alterPartitionDropImpl(
