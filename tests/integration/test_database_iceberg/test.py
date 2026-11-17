@@ -992,6 +992,147 @@ def test_optimize_manifest_with_catalog(started_cluster):
     assert rows_after == rows_before
 
 
+def _split_object_path(path):
+    """Split `s3://bucket/key` or `http://host:port/bucket/key` into (bucket, key)."""
+    if path.startswith("s3://"):
+        return path[len("s3://"):].split("/", 1)
+    match = re.match(r"^https?://[^/]+/([^/]+)/(.+)$", path)
+    assert match, f"unexpected object path {path}"
+    return match.group(1), match.group(2)
+
+
+def _read_avro_records(minio_client, path):
+    # pyiceberg rejects the manifest lists written by ClickHouse (no field-ids), so read them directly.
+    import avro.datafile
+    import avro.io
+
+    bucket, key = _split_object_path(path)
+    data = minio_client.get_object(bucket, key).read()
+    with avro.datafile.DataFileReader(io.BytesIO(data), avro.io.DatumReader()) as reader:
+        return list(reader)
+
+
+def _create_table_for_manifest_compaction(started_cluster, node, test_ref, num_inserts=5):
+    table_name = f"{test_ref}_table"
+    root_namespace = f"{test_ref}_namespace"
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(root_namespace)
+    # Unpartitioned table, so every per-insert data manifest can consolidate into a single one.
+    create_table(catalog, root_namespace, table_name, DEFAULT_SCHEMA, PartitionSpec(), DEFAULT_SORT_ORDER)
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+
+    table_ref = f"{CATALOG_NAME}.`{root_namespace}.{table_name}`"
+    for i in range(num_inserts):
+        node.query(
+            f"INSERT INTO {table_ref} VALUES (NULL, 'sym{i}', {100 + i}, {200 + i}, tuple('bot'));",
+            settings={"allow_insert_into_iceberg": 1, "write_full_path_in_iceberg_metadata": 1},
+        )
+    return catalog, f"{root_namespace}.{table_name}", table_ref
+
+
+def _optimize_manifest_with_failpoint(node, table_ref, failpoint):
+    node.query(f"SYSTEM ENABLE FAILPOINT {failpoint}")
+    try:
+        node.query(
+            f"OPTIMIZE TABLE {table_ref} MANIFEST",
+            settings={
+                "allow_experimental_iceberg_compaction": 1,
+                "iceberg_manifest_min_count_to_compact": 2,
+                "allow_insert_into_iceberg": 1,
+                "write_full_path_in_iceberg_metadata": 1,
+            },
+        )
+    finally:
+        node.query(f"SYSTEM DISABLE FAILPOINT {failpoint}")
+
+
+def _check_current_snapshot_files_exist(started_cluster, catalog, table_identifier, num_inserts):
+    """Every manifest and the manifest list named by the current snapshot must still exist."""
+    minio_client = started_cluster.minio_client
+    metadata = catalog.load_table(table_identifier).metadata
+    manifest_list = metadata.snapshot_by_id(metadata.current_snapshot_id).manifest_list
+    manifests = [record["manifest_path"] for record in _read_avro_records(minio_client, manifest_list)]
+    assert 0 < len(manifests) < num_inserts, f"expected consolidated manifests, got {manifests}"
+    for manifest in manifests:
+        minio_client.stat_object(*_split_object_path(manifest))
+
+
+def test_optimize_manifest_commit_state_unknown(started_cluster):
+    """`OPTIMIZE TABLE ... MANIFEST` must not delete the files of a snapshot the catalog has applied.
+
+    The failpoint makes the REST catalog apply the update and then report a retryable failure
+    (commit state unknown, e.g. a proxy turning the response into a 5xx). The compaction must
+    notice that its snapshot is current instead of removing the manifests it names.
+    https://github.com/Altinity/ClickHouse/issues/2416
+    """
+    node = started_cluster.instances["node1"]
+    num_inserts = 5
+    catalog, table_identifier, table_ref = _create_table_for_manifest_compaction(
+        started_cluster, node, f"test_optimize_manifest_unknown_{uuid.uuid4()}", num_inserts
+    )
+
+    metadata_before = catalog.load_table(table_identifier).metadata
+    rows_before = node.query(f"SELECT symbol, bid, ask FROM {table_ref} ORDER BY ALL")
+
+    _optimize_manifest_with_failpoint(node, table_ref, "iceberg_catalog_update_metadata_reported_as_failed")
+
+    metadata_after = catalog.load_table(table_identifier).metadata
+    assert metadata_after.current_snapshot_id != metadata_before.current_snapshot_id
+    # The applied commit is detected, so there is no second `replace` snapshot from a retry.
+    assert len(metadata_after.snapshots) == len(metadata_before.snapshots) + 1
+
+    _check_current_snapshot_files_exist(started_cluster, catalog, table_identifier, num_inserts)
+
+    node.query("SYSTEM DROP ICEBERG METADATA CACHE")
+    assert node.query(f"SELECT symbol, bid, ask FROM {table_ref} ORDER BY ALL") == rows_before
+
+
+def test_optimize_manifest_catalog_conflict_cleans_up(started_cluster):
+    """When the catalog update really does not apply, the compaction removes its files and retries.
+
+    https://github.com/Altinity/ClickHouse/issues/2416
+    """
+    node = started_cluster.instances["node1"]
+    num_inserts = 5
+    catalog, table_identifier, table_ref = _create_table_for_manifest_compaction(
+        started_cluster, node, f"test_optimize_manifest_conflict_{uuid.uuid4()}", num_inserts
+    )
+
+    metadata_before = catalog.load_table(table_identifier).metadata
+    rows_before = node.query(f"SELECT symbol, bid, ask FROM {table_ref} ORDER BY ALL")
+
+    _optimize_manifest_with_failpoint(node, table_ref, "iceberg_catalog_update_metadata_fail")
+
+    table = catalog.load_table(table_identifier)
+    metadata_after = table.metadata
+    assert metadata_after.current_snapshot_id != metadata_before.current_snapshot_id
+    assert len(metadata_after.snapshots) == len(metadata_before.snapshots) + 1
+
+    _check_current_snapshot_files_exist(started_cluster, catalog, table_identifier, num_inserts)
+
+    # The rejected attempt's manifests and manifest list are not referenced by any snapshot, so they must be gone.
+    minio_client = started_cluster.minio_client
+    referenced = set()
+    for snapshot in metadata_after.snapshots:
+        referenced.add(_split_object_path(snapshot.manifest_list)[1])
+        for record in _read_avro_records(minio_client, snapshot.manifest_list):
+            referenced.add(_split_object_path(record["manifest_path"])[1])
+
+    bucket, table_prefix = _split_object_path(table.location())
+    metadata_prefix = table_prefix.rstrip("/") + "/metadata/"
+    avro_objects = {
+        o.object_name
+        for o in minio_client.list_objects(bucket, prefix=metadata_prefix, recursive=True)
+        if o.object_name.endswith(".avro")
+    }
+    orphans = avro_objects - referenced
+    assert not orphans, f"rejected compaction attempt left files behind: {sorted(orphans)}"
+
+    node.query("SYSTEM DROP ICEBERG METADATA CACHE")
+    assert node.query(f"SELECT symbol, bid, ask FROM {table_ref} ORDER BY ALL") == rows_before
+
+
 @pytest.mark.parametrize(
     "fields_to_remove",
     [
