@@ -199,6 +199,12 @@ else()
     list(APPEND LLVM_COMPILE_DEFINITIONS BLAKE3_NO_AVX512 BLAKE3_NO_AVX2 BLAKE3_NO_SSE41 BLAKE3_NO_SSE2)
 endif()
 
+if (APPLE)
+    # Homebrew libc++ does not include <sys/resource.h>, which declares
+    # PRIO_DARWIN_THREAD / PRIO_DARWIN_BG used by CrashRecoveryContext.cpp.
+    add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-include>" "$<$<COMPILE_LANGUAGE:CXX>:sys/resource.h>")
+endif()
+
 #
 # Build llvm-min-tblgen
 #
