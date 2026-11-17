@@ -12,7 +12,7 @@ namespace DB
 {
 
 /// Object-storage "identity": the bits needed to open an object without a fresh HEAD - its size,
-/// ETag, and (if multipart-uploaded) the byte offsets of its parts.
+/// ETag, Last-Modified, and (if multipart-uploaded) the byte offsets of its parts.
 ///
 /// It exists to break the ordering that forces a HEAD before every open: object caches key on
 /// (path, etag), so the etag must be known up front. Here the key is the store plus the path
@@ -27,6 +27,9 @@ struct ObjectStorageIdentity
     /// Cumulative start offset of each multipart part (part i covers [part_offsets[i], part_offsets[i+1])).
     /// Empty when unknown or the object is a single PUT.
     std::vector<UInt64> part_offsets;
+    /// Seconds since epoch. Meaningful only when `is_last_modified_known`.
+    Int64 last_modified = 0;
+    bool is_last_modified_known = false;
     /// Orders stores of this key. A fetch that started earlier must not overwrite one that started later.
     /// Not part of the object's identity.
     UInt64 fetch_seq = 0;

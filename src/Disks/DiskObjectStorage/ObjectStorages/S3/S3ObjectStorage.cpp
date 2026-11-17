@@ -20,6 +20,7 @@
 #include <IO/S3/Client.h>
 #include <IO/S3/Requests.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageIdentityCache.h>
+#include <ctime>
 #include <IO/S3/copyS3File.h>
 #include <IO/S3/deleteFileFromS3.h>
 #include <Interpreters/Context.h>
@@ -1033,10 +1034,10 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
                 result.is_size_known = cached->is_size_known;
                 result.etag = cached->etag;
                 result.part_offsets = cached->part_offsets;
-                /// The cache does not store Last-Modified. Leaving it at the epoch with
-                /// `is_last_modified_known == true` would make schema and count caches treat the object
-                /// as older than every cached entry.
-                result.is_last_modified_known = false;
+                if (cached->is_last_modified_known)
+                    result.last_modified = Poco::Timestamp::fromEpochTime(static_cast<std::time_t>(cached->last_modified));
+                else
+                    result.is_last_modified_known = false;
                 return result;
             }
         }
@@ -1120,10 +1121,15 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
         /// The read that reached this point already holds the identity from before any overwrite that
         /// happened while it was paused. Resuming must not store that identity.
         FailPointInjection::pauseFailPoint(FailPoints::object_storage_identity_cache_pause_before_store);
-        identity_cache->setIfEpoch(
-            identity_key,
-            ObjectStorageIdentity{result.etag, result.size_bytes, result.is_size_known, result.part_offsets},
-            identity_read);
+        ObjectStorageIdentity identity;
+        identity.etag = result.etag;
+        identity.size = result.size_bytes;
+        identity.is_size_known = result.is_size_known;
+        identity.part_offsets = result.part_offsets;
+        identity.is_last_modified_known = result.is_last_modified_known;
+        if (result.is_last_modified_known)
+            identity.last_modified = static_cast<Int64>(result.last_modified.epochTime());
+        identity_cache->setIfEpoch(identity_key, std::move(identity), identity_read);
     }
 
     return result;
