@@ -105,6 +105,9 @@ void MultipleFileWriter::finalize()
 
     per_file_record_counts.push_back(static_cast<Int64>(*current_file_num_rows));
     per_file_stats_list.push_back(current_file_stats);
+
+    /// A finished format can still hold resources: a Parquet one keeps its idle encoder threads.
+    release();
 }
 
 std::vector<IcebergDataFileEntry> MultipleFileWriter::getDataFileEntries() const

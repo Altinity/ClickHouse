@@ -127,6 +127,15 @@ void logIcebergFileStats(const ObjectInfoPtr & object_info, const LoggerPtr & lo
 #endif
 }
 
+namespace
+{
+    String getObjectStorageHash(const IObjectStorage & object_storage)
+    {
+        const String description = object_storage.getDescription();
+        return sipHash128String(description.substr(0, description.find('?')) + '\0' + object_storage.getObjectsNamespace());
+    }
+}
+
 StorageObjectStorageSource::StorageObjectStorageSource(
     const StorageID & storage_id_,
     String name_,
@@ -686,7 +695,7 @@ void StorageObjectStorageSource::addNumRowsToCache(const ObjectInfo & object_inf
     schema_cache.addNumRows(cache_key, num_rows);
 }
 
-StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReader()
+StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReader(bool prefetch_input_format)
 {
     return createReader(
         0,
@@ -702,7 +711,8 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         max_block_size,
         parser_shared_resources,
         format_filter_info,
-        need_only_count);
+        need_only_count,
+        prefetch_input_format);
 }
 
 StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReader(
@@ -719,7 +729,8 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
     size_t max_block_size,
     FormatParserSharedResourcesPtr parser_shared_resources,
     FormatFilterInfoPtr format_filter_info,
-    bool need_only_count)
+    bool need_only_count,
+    bool prefetch_input_format)
 {
     ObjectInfoPtr object_info;
     auto query_settings = configuration->getQuerySettings(context_);
@@ -1203,6 +1214,9 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         if (need_only_count)
             input_format->needOnlyCount();
 
+        if (prefetch_input_format)
+            input_format->prefetch();
+
         builder.init(Pipe(input_format));
 
         configuration->addDeleteTransformers(object_info, builder, format_settings, parser_shared_resources, context_);
@@ -1353,7 +1367,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 
 std::future<StorageObjectStorageSource::ReaderHolder> StorageObjectStorageSource::createReaderAsync()
 {
-    return create_reader_scheduler([=, this] { return createReader(); }, Priority{});
+    return create_reader_scheduler([=, this] { return createReader(/* prefetch_input_format */ true); }, Priority{});
 }
 
 std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
@@ -1475,6 +1489,7 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
         else
         {
             SipHash hash;
+            hash.update(getObjectStorageHash(*object_storage));
             hash.update(object_info.getPath());
             hash.update(object_info.metadata->etag);
 
@@ -1523,7 +1538,9 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
 
     if (use_page_cache)
     {
-        PageCacheKey key = {.path = "s3:" + object_info.getPath(), .file_version = "etag:" + object_info.metadata->etag};
+        PageCacheKey key = {
+            .path = fmt::format("s3:{}:{}", getObjectStorageHash(*object_storage), object_info.getPath()),
+            .file_version = "etag:" + object_info.metadata->etag};
         impl = std::make_unique<CachedInMemoryReadBufferFromFile>(key, effective_read_settings.page_cache, std::move(impl), modified_read_settings);
     }
 

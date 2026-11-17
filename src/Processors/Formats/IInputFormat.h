@@ -138,6 +138,8 @@ public:
 
     virtual std::optional<std::pair<std::vector<size_t>, size_t>> getMatchedBuckets() const { return std::nullopt; }
 
+    virtual void prefetch() {}
+
 protected:
     ReadBuffer & getReadBuffer() const { chassert(in); return *in; }
 

@@ -184,7 +184,6 @@ std::optional<ProcessedManifestFileEntryPtr> SingleThreadIcebergKeysIterator::ne
                 local_context,
                 log,
                 manifest_list_entry.manifest_file_path,
-                manifest_list_entry.manifest_file_byte_size,
                 *secondary_storages);
 
             current_manifest_file_iterator = Iceberg::ManifestFileIterator::create(
