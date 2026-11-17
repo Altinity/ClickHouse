@@ -81,9 +81,11 @@ struct ObjectStorageIdentityEpoch
 /// It is owned by the global Context (see Context::getObjectStorageIdentityCache), sized from server
 /// settings, and cleared by `SYSTEM DROP OBJECT STORAGE IDENTITY CACHE`. A write, copy, or delete by
 /// this server bumps that key's generation and removes the entry, and `SYSTEM DROP` bumps a cache-wide
-/// generation. A fetch stores its result only when both are still the ones it observed before the
-/// request, so a read that started earlier cannot put the old identity back. The next read of that key
-/// requests the metadata again. Low-level
+/// generation. The per-key generations are kept only up to the cache's configured size. Past that, the
+/// map is dropped and the cache-wide generation is bumped, which rejects every fetch already in flight.
+/// A fetch stores its result only when both generations are still the ones it
+/// observed before the request, so a read that started earlier cannot put the old identity back. The
+/// next read of that key requests the metadata again. Low-level
 /// object-storage code reaches the cache via Context::getGlobalContextInstance() and must tolerate a
 /// null pointer (no global context yet) by simply issuing the metadata request uncached.
 class ObjectStorageIdentityCache
@@ -111,12 +113,27 @@ public:
     void clear();
 
 private:
+    /// Bytes of one per-key generation record: the key, its counter, and a hashmap node.
+    static size_t generationRecordBytes(const String & key);
+
+    /// `epoch_mutex` must be held. Forget every per-key generation and bump the cache-wide generation.
+    void forgetPerKeyGenerations();
+
+    /// `epoch_mutex` must be held. When `extra` bytes would take the generation map past the cache's
+    /// configured size, forget the per-key generations first. One new record is then kept even if that
+    /// record alone is larger than the configured size.
+    void reserveGenerationBytes(size_t extra);
+
     mutable std::mutex epoch_mutex;
-    /// Times `clear` ran. Guarded by `epoch_mutex`.
+    /// Times the per-key generations were forgotten, by `clear` or because the map reached its size.
+    /// Guarded by `epoch_mutex`.
     UInt64 clear_epoch = 0;
     /// Generations of keys this server has replaced or deleted. Absent means generation 0.
-    /// Guarded by `epoch_mutex`. An invalidated key stays here so a late fetch can see the bump.
+    /// Guarded by `epoch_mutex`. A key stays here so a fetch that started earlier can see the bump,
+    /// until the map reaches the cache's configured size.
     UnorderedMapWithMemoryTracking<String, UInt64> epoch_by_key;
+    /// `epoch_by_key` accounted with `generationRecordBytes`. Guarded by `epoch_mutex`.
+    size_t generation_bytes = 0;
 };
 
 using ObjectStorageIdentityCachePtr = std::shared_ptr<ObjectStorageIdentityCache>;
