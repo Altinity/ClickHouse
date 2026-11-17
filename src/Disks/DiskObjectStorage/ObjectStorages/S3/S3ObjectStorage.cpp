@@ -62,6 +62,7 @@ namespace CurrentMetrics
 namespace DB::FailPoints
 {
     extern const char object_storage_force_refresh_callback_success[];
+    extern const char object_storage_identity_cache_pause_before_store[];
 }
 
 
@@ -484,7 +485,7 @@ std::unique_ptr<WriteBufferFromFileBase> S3ObjectStorage::writeObject( /// NOLIN
         {
             if (auto global_context = Context::getGlobalContextInstance())
                 if (auto cache = global_context->getObjectStorageIdentityCache())
-                    cache->remove(identity_key);
+                    cache->invalidate(identity_key);
         });
 }
 
@@ -1031,6 +1032,12 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
         }
     }
 
+    /// Captured before the request. `setIfEpoch` stores the result only while this generation still
+    /// matches, so an overwrite that lands during the request cannot be undone by this fetch.
+    UInt64 identity_epoch = 0;
+    if (identity_cache)
+        identity_epoch = identity_cache->epochOf(identity_key);
+
     auto settings_ptr = s3_settings.get();
 
     auto fetch = [&](const S3::Client & c) -> S3::ObjectInfo
@@ -1098,9 +1105,15 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
     }
 
     if (identity_cache)
-        identity_cache->set(
+    {
+        /// The read that reached this point already holds the identity from before any overwrite that
+        /// happened while it was paused. Resuming must not store that identity.
+        FailPointInjection::pauseFailPoint(FailPoints::object_storage_identity_cache_pause_before_store);
+        identity_cache->setIfEpoch(
             identity_key,
-            ObjectStorageIdentity{result.etag, result.size_bytes, result.is_size_known, result.part_offsets});
+            ObjectStorageIdentity{result.etag, result.size_bytes, result.is_size_known, result.part_offsets},
+            identity_epoch);
+    }
 
     return result;
 }
@@ -1431,7 +1444,7 @@ void S3ObjectStorage::invalidateCachedIdentity(const std::string & path) const
     auto cache = global_context->getObjectStorageIdentityCache();
     if (!cache)
         return;
-    cache->remove(makeObjectStorageIdentityCacheKey(uri.endpoint, uri.bucket, path));
+    cache->invalidate(makeObjectStorageIdentityCacheKey(uri.endpoint, uri.bucket, path));
 }
 
 std::shared_ptr<const S3::Client> S3ObjectStorage::clientForRetryProfile(const ObjectStorageControlRequest & request) const

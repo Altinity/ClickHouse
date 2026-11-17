@@ -2,7 +2,9 @@
 
 #include <base/types.h>
 #include <Common/CacheBase.h>
+#include <Common/UnorderedMapWithMemoryTracking.h>
 
+#include <mutex>
 #include <optional>
 #include <string_view>
 #include <vector>
@@ -66,7 +68,9 @@ inline String makeObjectStorageIdentityCacheKey(std::string_view endpoint, std::
 ///
 /// It is owned by the global Context (see Context::getObjectStorageIdentityCache), sized from server
 /// settings, and cleared by `SYSTEM DROP OBJECT STORAGE IDENTITY CACHE`. A write, copy, or delete by
-/// this server removes the entry; the next read of that key requests the metadata again. Low-level
+/// this server bumps that key's generation and removes the entry. A fetch stores its result only when
+/// the generation is still the one it observed before the request, so a read that started earlier
+/// cannot put the old identity back. The next read of that key requests the metadata again. Low-level
 /// object-storage code reaches the cache via Context::getGlobalContextInstance() and must tolerate a
 /// null pointer (no global context yet) by simply issuing the metadata request uncached.
 class ObjectStorageIdentityCache
@@ -80,8 +84,24 @@ public:
     /// Look up an identity by `makeObjectStorageIdentityCacheKey`. Increments the hit/miss ProfileEvents.
     std::optional<ObjectStorageIdentity> tryGet(const String & key);
 
-    /// Insert (or overwrite) the identity for a key.
-    void set(const String & key, ObjectStorageIdentity identity);
+    /// Generation of `key`. A fetch captures this before the request and passes it to `setIfEpoch`.
+    /// Zero when the key has never been invalidated.
+    UInt64 epochOf(const String & key) const;
+
+    /// Store `identity` only when `epoch` is still the generation `epochOf` returned.
+    void setIfEpoch(const String & key, ObjectStorageIdentity identity, UInt64 epoch);
+
+    /// Bump the generation and drop the entry. A fetch already in flight will not put the old identity back.
+    void invalidate(const String & key);
+
+    /// Drop every entry and generation. Hides `CacheBase::clear` so a generation cannot outlive its entry.
+    void clear();
+
+private:
+    mutable std::mutex epoch_mutex;
+    /// Generations of keys this server has replaced or deleted. Absent means generation 0.
+    /// Guarded by `epoch_mutex`. An invalidated key stays here so a late fetch can see the bump.
+    UnorderedMapWithMemoryTracking<String, UInt64> epoch_by_key;
 };
 
 using ObjectStorageIdentityCachePtr = std::shared_ptr<ObjectStorageIdentityCache>;
