@@ -3,7 +3,9 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/tests/cas_test_helpers.h>
+#include <Common/MemoryTracker.h>
 #include <Common/ProfileEvents.h>
+#include <Poco/Exception.h>
 
 #include <atomic>
 #include <chrono>
@@ -93,17 +95,16 @@ private:
     std::atomic<bool> armed{false};
 };
 
-/// Identifies recovery's final authority read without changing the recovery implementation: after the
-/// recovered-frontier CAS, its first checkpoint read verifies that contribution and its second is the
-/// final authority read immediately preceding materialization.
+/// Identifies recovery's final authority read without changing the recovery implementation: once armed,
+/// recovery's first checkpoint read samples the base and its second is the final authority read
+/// immediately preceding materialization.
 class FinalAuthorityBackend : public DB::Cas::tests::OrderedFaultBackend
 {
 public:
     void armFinalAuthorityRead(String checkpoint_key_)
     {
         checkpoint_key = std::move(checkpoint_key_);
-        checkpoint_cas_committed.store(false);
-        gets_after_checkpoint_cas.store(0);
+        checkpoint_gets.store(0);
         final_authority_returned.store(false);
         armed.store(true);
     }
@@ -111,20 +112,8 @@ public:
     std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
         auto result = DB::Cas::tests::OrderedFaultBackend::read(key, access);
-        if (armed.load() && checkpoint_cas_committed.load() && key == checkpoint_key
-            && gets_after_checkpoint_cas.fetch_add(1) + 1 == 2)
+        if (armed.load() && key == checkpoint_key && checkpoint_gets.fetch_add(1) + 1 == 2)
             final_authority_returned.store(true);
-        return result;
-    }
-
-    std::expected<String, RawConflict> write(const String & key, const String & bytes,
-                                             const std::optional<String> & expected_value,
-                                             TransportAccess & access) override
-    {
-        auto result = DB::Cas::tests::OrderedFaultBackend::write(key, bytes, expected_value, access);
-        /// A value is the store's committed incarnation; a `RawConflict` is a refused precondition.
-        if (armed.load() && key == checkpoint_key && result.has_value())
-            checkpoint_cas_committed.store(true);
         return result;
     }
 
@@ -133,8 +122,7 @@ public:
 private:
     String checkpoint_key;
     std::atomic<bool> armed{false};
-    std::atomic<bool> checkpoint_cas_committed{false};
-    std::atomic<uint64_t> gets_after_checkpoint_cas{0};
+    std::atomic<uint64_t> checkpoint_gets{0};
     std::atomic<bool> final_authority_returned{false};
 };
 
@@ -169,6 +157,7 @@ public:
               oneAttemptBudget(),
               "test",
               [] { return uint64_t{1}; },
+              [] { return LiveEpochPair{1, 0}; },
               [] { return true; },
               [] { return uint64_t{1}; },
               [] { return uint64_t{0}; },
@@ -337,6 +326,22 @@ RefTxnId publishRef(CasRefLedger & ledger, const RootNamespace & ns, const Strin
         RootMutationOrigin::Writer, RootMutationKind::Publish);
 }
 
+/// The next ref-log install throws after its log is durable, which leaves the lane `NeedsRecovery`.
+/// Re-allowing allocations for the throw: the install region denies them in debug builds.
+template <typename Target>
+void armOneShotInstallFailure(Target & target)
+{
+    auto planned = std::make_exception_ptr(std::runtime_error("injected install failure"));
+    auto fired = std::make_shared<std::atomic<bool>>(false);
+    target.setInstallRegionProbeForTest([planned, fired]
+    {
+        if (fired->exchange(true))
+            return;
+        ALLOW_ALLOCATIONS_IN_SCOPE;
+        std::rethrow_exception(planned);
+    });
+}
+
 /// Leaves the runtime in `NeedsRecovery` while its first background publisher is held after capture.
 /// Releasing that publisher meets the latched snapshot failure; zero backoff then makes settlement
 /// redispatch the real token-carrying publisher, whose first action is recovery of this exact runtime.
@@ -375,10 +380,10 @@ void preparePendingRecoveryPublisher(
     ASSERT_TRUE(life);
     ckpt_key = store->layout().refCkptKey(*life);
 
-    /// The log lands before the checkpoint conflict, leaving a real unfrontiered durable transaction.
-    backend->armLatchedWriteConflict(ckpt_key);
+    /// The log lands before the install fails, leaving a durable unacknowledged transaction.
+    armOneShotInstallFailure(*store);
     EXPECT_ANY_THROW(store->dropRef(ns, "ref_1"));
-    backend->armLatchedWriteConflict({});
+    store->setInstallRegionProbeForTest(nullptr);
     ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
 }
 
@@ -797,10 +802,10 @@ TEST(CASDetachedWork, StopWakesRecoveryBackoffSleep)
                 std::this_thread::yield();
         });
 
-    /// Exhaust one checkpoint publication inside recovery so the outer retry loop enters backoff.
-    /// Latched: the publication must meet the refusal on every reissue, or it commits and recovery
-    /// never reaches its backoff.
-    backend->armLatchedWriteConflict(ckpt_key);
+    /// Fail recovery's `_ckpt` read on every reissue of its first attempt, so the outer retry loop enters
+    /// backoff.
+    for (int i = 0; i < 1000; ++i)
+        backend->failNextReadWith(ckpt_key, std::make_exception_ptr(Poco::TimeoutException("injected `_ckpt` read timeout")));
     release_first_publisher->open();
     sleeping->wait("sleeping");
 
@@ -998,11 +1003,9 @@ TEST(CASDetachedWork, StopAfterRecoveryMaterializationPreventsFinalInstall)
     CasOperation catalog_op = catalog_requests.admit();
     const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(catalog_op, fixture.layout, ns).value();
     const String ckpt_key = fixture.layout.refCkptKey(life);
-    /// Latched: the checkpoint write is reissued until its retry window closes, so a counted refusal
-    /// the reissues outlive would let this drop commit and leave the lane Ready.
-    fixture.backend->armLatchedWriteConflict(ckpt_key);
+    armOneShotInstallFailure(fixture.ledger);
     EXPECT_ANY_THROW(fixture.ledger.dropRef(ns, "ref_1"));
-    fixture.backend->armLatchedWriteConflict({});
+    fixture.ledger.setInstallRegionProbeForTest(nullptr);
     ASSERT_EQ(fixture.ledger.laneStateForTest(ns), RefLaneState::NeedsRecovery);
 
     auto detached_publisher = fixture.takeDetachedTask();

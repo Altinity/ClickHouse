@@ -1179,7 +1179,7 @@ def test_interleaved_ordinary_and_cas_operations_do_not_leak_mode_or_build_a_cli
     answers a 24-hour expiry, so within this slice a new token fetch means a new client with a new
     token cache. Zero new fetches says the request mode built neither. Would fail if: selecting the
     request mode constructed a third client — the base and single-attempt clients already exist by
-    this point, having been built during the mount and the first conditional write.
+    this point, having been built during the mount and the warm-up round before the counter reset.
 
     The `> 0` preconditions matter three times here. Without the store-traffic check the mode
     assertions would hold over an empty slice; without the per-method check they would hold over a
@@ -1197,11 +1197,7 @@ def test_interleaved_ordinary_and_cas_operations_do_not_leak_mode_or_build_a_cli
         "the metadata server was never asked for a token, so counting new fetches proves nothing"
     )
 
-    first_new_seq = _next_seq()
-    _reset_token_fetches()
-
-    for round_index in range(3):
-        base = 10000 + round_index * 100
+    def run_round(base):
         for disk in (PLAIN_DISK, "cas_gcs_oauth"):
             table = "t_" + disk
             node.query(
@@ -1217,6 +1213,17 @@ def test_interleaved_ordinary_and_cas_operations_do_not_leak_mode_or_build_a_cli
                 int(node.query("SELECT sum(id) FROM {} WHERE id >= {}".format(table, base)))
                 >= base
             )
+
+    # After a node restart, the first blob write builds the single-attempt client for blob writes, and
+    # that client fetches a token. Run the workload once before the reset, so the count below sees only
+    # clients that interleaving itself builds, whatever ran earlier in this module.
+    run_round(9000)
+
+    first_new_seq = _next_seq()
+    _reset_token_fetches()
+
+    for round_index in range(3):
+        run_round(10000 + round_index * 100)
 
     cas_bucket = CAS_DISKS["cas_gcs_oauth"]
     plain = _captured_since(first_new_seq, PLAIN_BUCKET)

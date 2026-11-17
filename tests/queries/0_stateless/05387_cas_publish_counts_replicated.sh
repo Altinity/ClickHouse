@@ -9,8 +9,8 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
 
-DISK_A="disk(type = object_storage, object_storage_type = local, metadata_type = cas, cas_server_root_id = '${CLICKHOUSE_DATABASE}_pc3a', name = '${CLICKHOUSE_DATABASE}_pc3a', path = '${CLICKHOUSE_DATABASE}_pc3a_pool/')"
-DISK_B="disk(type = object_storage, object_storage_type = local, metadata_type = cas, cas_server_root_id = '${CLICKHOUSE_DATABASE}_pc3b', name = '${CLICKHOUSE_DATABASE}_pc3b', path = '${CLICKHOUSE_DATABASE}_pc3b_pool/')"
+DISK_A="disk(type = object_storage, object_storage_type = local, metadata_type = cas, cas_unsafe_remount_no_delay = 1, cas_server_root_id = '${CLICKHOUSE_DATABASE}_pc3a', name = '${CLICKHOUSE_DATABASE}_pc3a', path = '${CLICKHOUSE_DATABASE}_pc3a_pool/')"
+DISK_B="disk(type = object_storage, object_storage_type = local, metadata_type = cas, cas_unsafe_remount_no_delay = 1, cas_server_root_id = '${CLICKHOUSE_DATABASE}_pc3b', name = '${CLICKHOUSE_DATABASE}_pc3b', path = '${CLICKHOUSE_DATABASE}_pc3b_pool/')"
 
 counts() {
     ${CLICKHOUSE_CLIENT} -q "SYSTEM FLUSH LOGS cas_log"
@@ -26,7 +26,8 @@ ${CLICKHOUSE_CLIENT} -q "CREATE TABLE r1 (a UInt64, v UInt64) ENGINE = Replicate
 ${CLICKHOUSE_CLIENT} -q "CREATE TABLE r2 (a UInt64, v UInt64) ENGINE = ReplicatedMergeTree('/clickhouse/{database}/pc3', 'r2') ORDER BY a SETTINGS disk = ${DISK_B}, min_bytes_for_wide_part = 0, min_bytes_for_full_part_storage = 0"
 ${CLICKHOUSE_CLIENT} -q "SYSTEM STOP MERGES r1"
 ${CLICKHOUSE_CLIENT} -q "SYSTEM STOP MERGES r2"
-${CLICKHOUSE_CLIENT} -q "INSERT INTO r1 SELECT number, number FROM numbers(1000)"
+# A retried insert moves the part three times (publish, rollback, publish); the test pins one move.
+${CLICKHOUSE_CLIENT} --insert_keeper_fault_injection_probability=0 -q "INSERT INTO r1 SELECT number, number FROM numbers(1000)"
 ${CLICKHOUSE_CLIENT} -q "SYSTEM SYNC REPLICA r2"
 counts pc3a replicated_insert
 counts pc3b fetch
@@ -35,7 +36,7 @@ counts pc3b fetch
 # the final name (MergeFromLogEntryTask::finalize): one manifest, no owner move. The plain MergeTree merge
 # commits before the rename and moves (05388).
 ${CLICKHOUSE_CLIENT} -q "SYSTEM START MERGES r1"
-${CLICKHOUSE_CLIENT} -q "INSERT INTO r1 SELECT number, number FROM numbers(1000, 1000)"
+${CLICKHOUSE_CLIENT} --insert_keeper_fault_injection_probability=0 -q "INSERT INTO r1 SELECT number, number FROM numbers(1000, 1000)"
 ${CLICKHOUSE_CLIENT} -q "OPTIMIZE TABLE r1 FINAL"
 ${CLICKHOUSE_CLIENT} -q "SYSTEM FLUSH LOGS cas_log"
 # The block numbers are not always consecutive (a retried insert skips one), so take the merged part's name.
