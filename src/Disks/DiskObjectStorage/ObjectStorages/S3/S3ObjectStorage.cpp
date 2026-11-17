@@ -966,7 +966,9 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
     /// object-storage code can run before a global context exists; a null pointer means "no cache"
     /// and the request is issued uncached.
     const bool identity_only = !with_tags;
-    const String identity_key = uri.bucket + "/" + path;
+    /// Bucket and path alone collide when two endpoints reuse a bucket name.
+    const String identity_key = makeObjectStorageIdentityCacheKey(
+        uri.endpoint, client.get()->getRegion(), uri.bucket, path);
 
     ObjectStorageIdentityCachePtr identity_cache;
     if (identity_only)

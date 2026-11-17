@@ -4,6 +4,7 @@
 #include <Common/CacheBase.h>
 
 #include <optional>
+#include <string_view>
 #include <vector>
 
 namespace DB
@@ -13,9 +14,10 @@ namespace DB
 /// ETag, and (if multipart-uploaded) the byte offsets of its parts.
 ///
 /// It exists to break the ordering that forces a HEAD before every open: object caches key on
-/// (path, etag), so the etag must be known up front. Here we key by path and store the etag in the
-/// value, learned once (via GetObjectAttributes / a GET response) and reused. Multipart part offsets
-/// ride along so reads can be aligned to part boundaries without re-probing.
+/// (path, etag), so the etag must be known up front. Here the key is the store plus the path
+/// (`makeObjectStorageIdentityCacheKey`) and the etag is stored in the value, learned once (via
+/// GetObjectAttributes / a GET response) and reused. Multipart part offsets ride along so reads can
+/// be aligned to part boundaries without re-probing.
 struct ObjectStorageIdentity
 {
     String etag;
@@ -43,9 +45,31 @@ struct ObjectStorageIdentityWeight
     }
 };
 
-/// Cache of object-storage identity, keyed by object path, so opening an object does not require a
-/// fresh HEAD / GetObjectAttributes on every read (a lake scan otherwise re-HEADs every candidate
-/// file on every query). Backed by CacheBase (LRU/SLRU) for size-bounded eviction and thread-safety.
+/// One object on one store. Bucket and path are not enough: two S3-compatible endpoints can reuse
+/// the same bucket name, and an explicit region can select a different store behind one endpoint.
+/// Fields are separated by NUL so a slash in the endpoint cannot alias another field.
+inline String makeObjectStorageIdentityCacheKey(
+    std::string_view endpoint,
+    std::string_view region,
+    std::string_view bucket,
+    std::string_view path)
+{
+    String key;
+    key.reserve(endpoint.size() + region.size() + bucket.size() + path.size() + 3);
+    key.append(endpoint);
+    key.push_back('\0');
+    key.append(region);
+    key.push_back('\0');
+    key.append(bucket);
+    key.push_back('\0');
+    key.append(path);
+    return key;
+}
+
+/// Cache of object-storage identity, keyed by endpoint, region, bucket and object path, so opening
+/// an object does not require a fresh HEAD / GetObjectAttributes on every read (a lake scan otherwise
+/// re-HEADs every candidate file on every query). Backed by CacheBase (LRU/SLRU) for size-bounded
+/// eviction and thread-safety.
 ///
 /// It is owned by the global Context (see Context::getObjectStorageIdentityCache), sized from server
 /// settings, and cleared by `SYSTEM DROP OBJECT STORAGE IDENTITY CACHE`. Low-level object-storage
@@ -59,10 +83,10 @@ class ObjectStorageIdentityCache
 public:
     ObjectStorageIdentityCache(const String & cache_policy, size_t max_size_in_bytes, double size_ratio);
 
-    /// Look up an identity by path. Increments the hit/miss ProfileEvents.
+    /// Look up an identity by `makeObjectStorageIdentityCacheKey`. Increments the hit/miss ProfileEvents.
     std::optional<ObjectStorageIdentity> tryGet(const String & key);
 
-    /// Insert (or overwrite) the identity for a path.
+    /// Insert (or overwrite) the identity for a key.
     void set(const String & key, ObjectStorageIdentity identity);
 };
 
