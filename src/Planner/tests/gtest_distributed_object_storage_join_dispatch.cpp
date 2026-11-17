@@ -128,6 +128,8 @@ public:
 
     std::string getName() const override { return "FakeSafeLookupStorage"; }
 
+    bool isSnapshotPinnedByTableFunction(const ASTPtr &) const override { return true; }
+
     RemoteQueryExecutor::Extension getTaskIteratorExtension(
         const ActionsDAG::Node *, const ActionsDAG *, const ContextPtr &, ClusterPtr, StorageMetadataPtr) const override
     {
@@ -155,6 +157,18 @@ protected:
         Pipe pipe(std::make_shared<NullSource>(header));
         query_plan.addStep(std::make_unique<ReadFromPreparedSource>(std::move(pipe)));
     }
+};
+
+/// A partner whose table function does not name the snapshot the initiator resolved, like a Delta Lake or Paimon
+/// table, or an Iceberg table without a catalog metadata location. A worker would resolve its latest snapshot.
+class FakeUnpinnedLookupStorage : public FakeSafeLookupStorage
+{
+public:
+    using FakeSafeLookupStorage::FakeSafeLookupStorage;
+
+    std::string getName() const override { return "FakeUnpinnedLookupStorage"; }
+
+    bool isSnapshotPinnedByTableFunction(const ASTPtr &) const override { return false; }
 };
 
 /// Port 1 is never listening; irrelevant since the test only builds the QueryPlan.
@@ -209,6 +223,7 @@ private:
 
         database->attachTable(context, "safe_lookup", std::make_shared<FakeSafeLookupStorage>(StorageID(database_name, "safe_lookup")), {});
         database->attachTable(context, "dim2", std::make_shared<FakeSafeLookupStorage>(StorageID(database_name, "dim2")), {});
+        database->attachTable(context, "unpinned_lookup", std::make_shared<FakeUnpinnedLookupStorage>(StorageID(database_name, "unpinned_lookup")), {});
 
         DatabaseCatalog::instance().attachDatabase(database->getDatabaseName(), database);
         context->setCurrentDatabase(database_name);
@@ -588,6 +603,20 @@ TEST(DistributedObjectStorageJoinDispatch, SelfJoinOnTheDriverIsNotDispatched)
     state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
 
     auto plan_text = planAndExplain("SELECT a.id FROM driver AS a INNER JOIN driver AS b ON a.id = b.id", state.context);
+    EXPECT_EQ(plan_text.find("ReadFromClusterQuery"), String::npos) << plan_text;
+}
+
+/// Workers resolve a partner on their own, so a commit to it while the query runs would give different driver
+/// files different partner snapshots. A partner that does not carry the initiator's snapshot in its table
+/// function therefore keeps the whole query on the ordinary path, where the partner is read once.
+TEST(DistributedObjectStorageJoinDispatch, PartnerWithoutPinnedSnapshotIsNotDispatched)
+{
+    auto & state = State::instance();
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
+
+    auto plan_text = planAndExplain(
+        "SELECT driver.id, unpinned_lookup.lookup_id FROM driver INNER JOIN unpinned_lookup ON driver.id = unpinned_lookup.lookup_id",
+        state.context);
     EXPECT_EQ(plan_text.find("ReadFromClusterQuery"), String::npos) << plan_text;
 }
 

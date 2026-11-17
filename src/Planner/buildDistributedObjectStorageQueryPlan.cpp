@@ -83,7 +83,10 @@ void collectAccessedTables(const QueryTreeNodePtr & node, AccessedTables & acces
 
 /// Only the driver's `*Cluster` function consumes file tasks; partners use plain table functions.
 /// Count driver references after CTE expansion so repeated uses cannot share one task queue.
-size_t replaceTablesWithTableFunctions(
+/// Returns `std::nullopt` when a partner does not pin the snapshot the initiator resolved: each worker would then
+/// resolve the partner's latest snapshot itself, and a commit during the query would give different driver files
+/// different partner snapshots. The ordinary path reads a partner once, on the initiator.
+std::optional<size_t> replaceTablesWithTableFunctions(
     const ASTPtr & ast, const TableNodesByName & table_nodes, const TableNode & driver, const ContextPtr & context)
 {
     auto * table_expression = ast->as<ASTTableExpression>();
@@ -91,7 +94,12 @@ size_t replaceTablesWithTableFunctions(
     {
         size_t driver_references = 0;
         for (const auto & child : ast->children)
-            driver_references += replaceTablesWithTableFunctions(child, table_nodes, driver, context);
+        {
+            auto child_references = replaceTablesWithTableFunctions(child, table_nodes, driver, context);
+            if (!child_references)
+                return std::nullopt;
+            driver_references += *child_references;
+        }
         return driver_references;
     }
 
@@ -106,6 +114,9 @@ size_t replaceTablesWithTableFunctions(
 
     const bool is_driver = it->second->getStorage() == driver.getStorage();
     auto table_function = storage->getTableFunctionToSend(it->second->getStorageSnapshot(), context, /*read_initiator_file_tasks=*/is_driver);
+    if (!is_driver && !storage->isSnapshotPinnedByTableFunction(table_function))
+        return std::nullopt;
+
     table_function->setAlias(identifier.tryGetAlias());
 
     table_expression->reset(table_expression->database_and_table_name);
@@ -164,7 +175,8 @@ std::optional<JoinTreeQueryPlan> buildDistributedObjectStorageQueryPlan(
     /// Repeated driver references would consume one task queue independently and produce incomplete joins.
     TableNodesByName table_nodes;
     collectTableNodes(dispatch_boundary_node, table_nodes);
-    if (replaceTablesWithTableFunctions(query_to_send, table_nodes, *candidate.driver, context) != 1)
+    const auto driver_references = replaceTablesWithTableFunctions(query_to_send, table_nodes, *candidate.driver, context);
+    if (driver_references != 1)
         return {};
 
     SelectQueryInfo query_info = select_query_info;

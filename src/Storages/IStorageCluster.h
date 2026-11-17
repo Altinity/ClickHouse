@@ -75,6 +75,12 @@ public:
     /// `read_initiator_file_tasks` selects the `*Cluster` variant; the plain variant reads all files locally.
     ASTPtr getTableFunctionToSend(const StorageSnapshotPtr & storage_snapshot, const ContextPtr & context, bool read_initiator_file_tasks);
 
+    /// Whether `table_function`, built by `getTableFunctionToSend`, makes a worker read the snapshot the initiator
+    /// resolved instead of the latest one. A worker resolves a table that is not driven by the initiator's file
+    /// tasks on its own, so an unpinned one can mix snapshots across workers. A storage that cannot say it pins
+    /// the snapshot is treated as not pinning it.
+    virtual bool isSnapshotPinnedByTableFunction(const ASTPtr & /*table_function*/) const { return false; }
+
     bool isRemote() const final { return true; }
     bool supportsSubcolumns() const override  { return true; }
     bool supportsOptimizationToSubcolumns() const override { return false; }

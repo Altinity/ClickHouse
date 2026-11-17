@@ -1594,7 +1594,10 @@ def _assert_dispatched_whole(nodes, query_id):
     2. it names no catalog table: the driver arrives as the one `*Cluster` table function, which reads the
        initiator's file-task queue, and every other table as a plain table function, which reads in full;
     3. every secondary query of this dispatch is that whole query. A partner table fanning out again from
-       a worker would show up as a further secondary query without the JOIN in it.
+       a worker would show up as a further secondary query without the JOIN in it;
+    4. the driver and each partner table function name the metadata file the initiator resolved, through
+       `iceberg_metadata_file_path`. A worker resolves a partner on its own, so without it a commit during the
+       query would give different driver files different partner snapshots.
     """
     for node in nodes:
         node.query("SYSTEM FLUSH LOGS system.query_log")
@@ -1629,6 +1632,21 @@ def _assert_dispatched_whole(nodes, query_id):
         assert misdirected == "", (
             f"query {query_id}: a dispatched query on {node.name} does not have exactly one cluster table "
             f"function, or names a catalog table: {misdirected}"
+        )
+
+        unpinned = node.query(
+            f"""
+            SELECT query
+            FROM system.query_log
+            WHERE type = 'QueryStart' AND NOT is_initial_query
+              AND initial_query_id = '{query_id}'
+              AND positionCaseInsensitive(query, 'join') != 0
+              AND countSubstrings(query, 'iceberg_metadata_file_path') < 2
+            """
+        ).strip()
+        assert unpinned == "", (
+            f"query {query_id}: a dispatched query on {node.name} does not pin both the driver and its partner "
+            f"with `iceberg_metadata_file_path`: {unpinned}"
         )
 
         partner_fanout = int(

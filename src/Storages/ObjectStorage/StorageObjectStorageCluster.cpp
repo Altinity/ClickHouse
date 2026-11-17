@@ -465,6 +465,24 @@ bool StorageObjectStorageCluster::updateQueryForDistributedEngineIfNeeded(ASTPtr
     return true;
 }
 
+bool StorageObjectStorageCluster::isSnapshotPinnedByTableFunction(const ASTPtr & table_function) const
+{
+    if (!configuration->isIcebergConfiguration())
+        return false;
+
+    const auto * function = table_function ? table_function->as<ASTFunction>() : nullptr;
+    const auto * arguments = function && function->arguments ? function->arguments->as<ASTExpressionList>() : nullptr;
+    if (!arguments)
+        return false;
+
+    for (const auto & argument : arguments->children)
+        if (const auto * settings = argument->as<ASTSetQuery>())
+            if (const auto * path = settings->changes.tryGet("iceberg_metadata_file_path"))
+                return !path->safeGet<String>().empty();
+
+    return false;
+}
+
 void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
     ASTPtr & query,
     const DB::StorageSnapshotPtr & storage_snapshot,
