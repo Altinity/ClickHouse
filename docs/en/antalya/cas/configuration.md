@@ -361,7 +361,7 @@ Source: `ServerSettings.cpp`. This setting is process-wide rather than scoped to
 
 | Setting | Default | Description |
 |---|---|---|
-| `cas_blob_upload_pool_size` | `16` | Size of the dedicated server-wide thread pool used to upload blobs in parallel when committing a `CAS` part. Zero is rejected: the pool must have at least one thread |
+| `cas_blob_upload_pool_size` | `64` | Size of the dedicated server-wide thread pool used to upload blobs in parallel when committing a `CAS` part. Zero is rejected: the pool must have at least one thread |
 
 ## `SYSTEM CAS` commands {#system-commands}
 

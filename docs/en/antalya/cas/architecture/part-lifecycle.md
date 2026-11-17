@@ -97,7 +97,7 @@ dependency set on the owning thread, into a copy, committed by one no-throw swap
 task starts with blob `HEAD`; a present body with a `Clean` marker or a completed publication yields an
 explicit `Materialized` proof. A trusted source manifest instead yields `TrustedManifest` without
 blob I/O. Pool size is the
-server setting `cas_blob_upload_pool_size` (default 16).
+server setting `cas_blob_upload_pool_size` (default 64).
 
 **Step 4 — `promote`.** Sends no manifest request: the leaves recorded by `stageManifest` are the
 dependency set. It sets the commit
