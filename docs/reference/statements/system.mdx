@@ -136,7 +136,7 @@ Clears the parquet metadata cache.
 
 ## SYSTEM CLEAR|DROP OBJECT STORAGE IDENTITY CACHE {#drop-object-storage-identity-cache}
 
-Clears the object-storage identity cache, which stores per-object size, ETag and multipart part offsets so that opening an object does not repeat a `HEAD` or `GetObjectAttributes` request. Its size is configured with the server settings `object_storage_identity_cache_size`, `object_storage_identity_cache_policy` and `object_storage_identity_cache_size_ratio`. Entries expire after `object_storage_identity_cache_ttl` seconds. Set `object_storage_identity_cache_size` to `0` to disable the cache. A write by this server stores the new size and ETag immediately. A copy or delete drops that object's entry immediately.
+Clears the object-storage identity cache, which stores per-object size, ETag and multipart part offsets so that opening an object does not repeat a `HEAD` or `GetObjectAttributes` request. Its size is configured with the server settings `object_storage_identity_cache_size`, `object_storage_identity_cache_policy` and `object_storage_identity_cache_size_ratio`. Entries expire after `object_storage_identity_cache_ttl` seconds. Set `object_storage_identity_cache_size` to `0` to disable the cache. `SYSTEM RELOAD CONFIG` with a non-zero size creates it when startup left it disabled. A write by this server stores the new size and ETag immediately. A copy or delete drops that object's entry immediately.
 
 ## SYSTEM CLEAR|DROP PAIMON METADATA CACHE {#drop-paimon-metadata-cache}
 

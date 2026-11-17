@@ -4697,6 +4697,7 @@ void Context::setObjectStorageIdentityCache(const String & cache_policy, size_t 
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Object storage identity cache has been already created.");
 
     /// A zero size disables the cache: leave the pointer unset so callers fall back to uncached reads.
+    /// `updateObjectStorageIdentityCacheConfiguration` creates it later if a reload sets a non-zero size.
     if (max_size_in_bytes == 0)
         return;
 
@@ -4707,14 +4708,26 @@ void Context::updateObjectStorageIdentityCacheConfiguration(const Poco::Util::Ab
 {
     std::lock_guard lock(shared->mutex);
 
-    if (!shared->object_storage_identity_cache)
-        return;
-
     size_t size = config.getUInt64("object_storage_identity_cache_size", 67108864);
     if (size > max_cache_size)
         size = max_cache_size;
+    const auto ttl_seconds = config.getUInt64("object_storage_identity_cache_ttl", 3600);
+
+    /// Startup with size 0 leaves the pointer unset. A reload that raises the size has to create the
+    /// cache here: returning would keep every read uncached until the next process start.
+    if (!shared->object_storage_identity_cache)
+    {
+        if (size == 0)
+            return;
+
+        const String policy = config.getString("object_storage_identity_cache_policy", "SLRU");
+        const double size_ratio = config.getDouble("object_storage_identity_cache_size_ratio", 0.5);
+        shared->object_storage_identity_cache = std::make_shared<ObjectStorageIdentityCache>(policy, size, size_ratio, ttl_seconds);
+        return;
+    }
+
     shared->object_storage_identity_cache->setMaxSizeInBytes(size);
-    shared->object_storage_identity_cache->setTTLSeconds(config.getUInt64("object_storage_identity_cache_ttl", 3600));
+    shared->object_storage_identity_cache->setTTLSeconds(ttl_seconds);
 }
 
 std::shared_ptr<ObjectStorageIdentityCache> Context::getObjectStorageIdentityCache() const
