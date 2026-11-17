@@ -930,8 +930,7 @@ private:
         /// the one terminal `DropNamespace` item is the sole exception.
         bool removal_admission_closed = false;
         /// The exact row of this runtime was read as `Removing`; a failed removal must not reopen its lane.
-        /// Set by `acquireRefTableRuntime` and `reconcileCatalogCut`; nothing clears it. Guarded by
-        /// `ref_queue_mutex`.
+        /// Set through `latchRemovingLocked`; nothing clears it. Guarded by `ref_queue_mutex`.
         bool removing_observed = false;
         /// A `Live -> Removing` catalog write of this runtime ended with an unknown outcome that no read
         /// has resolved, so it can still land. The lane stays closed and the runtime stays resident until
@@ -1171,8 +1170,9 @@ private:
         const RootNamespace & ns, RefTableRuntime & rt, const std::optional<DetachedStopToken> & token = {});
 
     /// One catalog read on `admitted_generation`: true when a `Live` or `Removing` row carries exactly
-    /// `rt.life`. Otherwise detaches the runtime through `invalidateRemovedCatalogLife` and returns false.
-    /// The caller must not hold `rt.state_mutex`.
+    /// `rt.life`; a `Removing` row also closes the lane through `latchRemovingLocked`. Otherwise detaches
+    /// the runtime through `invalidateRemovedCatalogLife` and returns false. The caller must not hold
+    /// `rt.state_mutex`.
     bool confirmRecoveredLifeOrDetach(RefTableRuntime & rt, uint64_t admitted_generation);
 
     /// Resolves `ns`'s catalog life -- once per cold mutable admission in

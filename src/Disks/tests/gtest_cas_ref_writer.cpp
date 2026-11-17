@@ -6496,6 +6496,40 @@ TEST(CASRefWriterNamespaceRemoval, RowTurnedRemovingUnderAnOpenLaneLogsOnce)
     EXPECT_EQ(capture.count(kRemovingLatchedWarning), 1u) << capture.captured();
 }
 
+/// A row that turns `Removing` while a cold write's recovery walks the table: the recovery installs, and its
+/// catalog confirmation closes the lane before the write is queued.
+TEST(CASRefWriterRecovery, RemovingRowSeenByTheConfirmationClosesTheLane)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const NamespaceLifeId life = seedRecoverablePart(backend, layout, RootNamespace{"srv1/removing_under_recovery"});
+    const String log_prefix = layout.namespaceStreamPrefix(life) + "_log/";
+    EraseDuringRecovery erase;
+    auto store = openPoolWithConfig(backend, erase.config());
+    const uint64_t installs_before = store->recoveryInstallCountForTest();
+    const auto update_published_at = [&]
+    {
+        store->updateRefPublishedAt(life.ns, "part_1", [](RefPublishedAtUpdate & update) { update.published_at_ms = 17; });
+    };
+
+    DB::Cas::tests::ScopedLogCapture capture("CasRefLedger", "warning");
+    erase.arm([&] { setCatalogRowRemovingForTest(backend, layout, life); });
+    backend->clearRequestJournal();
+    expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "is Removing in the catalog", update_published_at);
+    EXPECT_TRUE(erase.fired());
+    EXPECT_TRUE(store->refTableRecoveredForTest(life.ns));
+    EXPECT_EQ(store->recoveryInstallCountForTest(), installs_before + 1);
+    EXPECT_FALSE(journalHasLogPut(backend, log_prefix));
+    EXPECT_FALSE(store->resolveRef(life.ns, "part_1"));
+    EXPECT_TRUE(store->listRefs(life.ns).empty());
+
+    expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "is Removing in the catalog", update_published_at);
+    Gc gc(store, UInt128{1});
+    EXPECT_TRUE(gc.runRegularRound().acquired_lease);
+    EXPECT_FALSE(journalHasLogPut(backend, log_prefix));
+    EXPECT_EQ(capture.count(kRemovingLatchedWarning), 1u) << capture.captured();
+}
+
 /// A cut read before GC erased life L still shows L `Removing`; it must not close the open runtime of a
 /// successor life of the same name.
 TEST(CASRefWriterNamespaceRemoval, StaleCutDoesNotCloseASuccessorOfTheSameName)

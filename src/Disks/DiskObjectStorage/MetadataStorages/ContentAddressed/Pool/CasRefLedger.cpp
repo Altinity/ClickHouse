@@ -1739,10 +1739,26 @@ bool CasRefLedger::confirmRecoveredLifeOrDetach(RefTableRuntime & rt, uint64_t a
     CasOperation op = mount_requests.resume(admitted_generation);
     const CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(op, layout);
     refuseUnlessAdmitted(op, "ref recovery catalog confirmation");
-    if (catalogStillNamesLife(snapshot.catalog, rt.life))
-        return true;
-    invalidateRemovedCatalogLife(rt.life);
-    return false;
+    if (!catalogStillNamesLife(snapshot.catalog, rt.life))
+    {
+        invalidateRemovedCatalogLife(rt.life);
+        return false;
+    }
+    const bool removing = std::any_of(snapshot.catalog.entries.begin(), snapshot.catalog.entries.end(),
+        [&](const CatalogEntry & entry)
+        {
+            return entry.ns == rt.life.ns && entry.incarnation == rt.life.incarnation && entry.state == NsState::Removing;
+        });
+    /// A row that turned after admission; `appendRefOpsOnRuntime` re-reads the flag after recovery.
+    bool latched_now = false;
+    if (removing)
+    {
+        std::lock_guard queue_lock(ref_queue_mutex);
+        latched_now = latchRemovingLocked(rt);
+    }
+    if (latched_now)
+        logRemovingLatched(rt.life);
+    return true;
 }
 
 void CasRefLedger::installRecoveryResult(RefTableRuntime & rt, RecoveryResult && result, uint64_t live_epoch)
