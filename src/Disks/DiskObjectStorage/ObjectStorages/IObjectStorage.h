@@ -163,10 +163,6 @@ struct ObjectMetadata
     bool etag_is_strong = true;
     ObjectAttributes tags;
     ObjectAttributes attributes;
-    /// Cumulative start offsets of the object's multipart-upload parts (part i covers
-    /// [part_offsets[i], part_offsets[i+1])). Populated best-effort via GetObjectAttributes; empty
-    /// when unknown or single-PUT. Used to align reads to part boundaries.
-    std::vector<uint64_t> part_offsets = {};
 
     /// `etag` may be used as a content-cache key (filesystem cache, page cache, Parquet
     /// metadata cache) only when it is present and a strong content identifier. A weak
@@ -376,31 +372,12 @@ public:
         return getObjectMetadata(object.getPath(), with_tags);
     }
 
-    /// Same as above, but lets the caller ask for the object's multipart part layout (part_offsets).
-    /// Only S3 populates it, and only on request: it costs a heavier GetObjectAttributes call instead
-    /// of a plain HEAD (both return size + etag; only GetObjectAttributes returns the per-part sizes).
-    /// The default ignores the flag and issues the plain metadata request, so non-S3 storages and
-    /// callers that do not need part-aligned reads pay nothing extra.
-    virtual ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags, bool /*fetch_part_offsets*/) const
-    {
-        return getObjectMetadata(path, with_tags);
-    }
-
-    /// Same request as the string overload, but the object keeps whatever identifies the replica
-    /// (a `url()` shard index). The default calls the two-argument object overload so a backend that
-    /// overrides that one, such as `WebObjectStorage`, still sees the index. Calling the string
-    /// overload instead would probe every shard and could return another shard's size and ETag.
-    virtual ObjectMetadata getObjectMetadata(const RelativePathWithMetadata & object, bool with_tags, bool /*fetch_part_offsets*/) const
-    {
-        return getObjectMetadata(object, with_tags);
-    }
-
     /// Same as `getObjectMetadata`, but do not answer from the identity cache. A content cache (filesystem
     /// cache, page cache) keyed by a cached ETag would otherwise serve a replaced object's old bytes, because
     /// a full hit never issues the GET that compares ETags. The default has no identity cache.
-    virtual ObjectMetadata getObjectMetadataIgnoringIdentityCache(const RelativePathWithMetadata & object, bool with_tags, bool fetch_part_offsets) const
+    virtual ObjectMetadata getObjectMetadataIgnoringIdentityCache(const RelativePathWithMetadata & object, bool with_tags) const
     {
-        return getObjectMetadata(object, with_tags, fetch_part_offsets);
+        return getObjectMetadata(object, with_tags);
     }
 
     /// Same as getObjectMetadata(), but ignores if object does not exist.

@@ -144,23 +144,11 @@ public:
 
     void tagObjects(const StoredObjects & objects, const std::string & tag_key, const std::string & tag_value) override;
 
-    ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags) const override
-    {
-        return getObjectMetadata(path, with_tags, /*fetch_part_offsets=*/ false, /*use_identity_cache=*/ true);
-    }
-    ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags, bool fetch_part_offsets) const override
-    {
-        return getObjectMetadata(path, with_tags, fetch_part_offsets, /*use_identity_cache=*/ true);
-    }
+    ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags) const override;
 
-    ObjectMetadata getObjectMetadata(const RelativePathWithMetadata & object, bool with_tags, bool fetch_part_offsets) const override
+    ObjectMetadata getObjectMetadataIgnoringIdentityCache(const RelativePathWithMetadata & object, bool with_tags) const override
     {
-        return getObjectMetadata(object.getPath(), with_tags, fetch_part_offsets, /*use_identity_cache=*/ true);
-    }
-
-    ObjectMetadata getObjectMetadataIgnoringIdentityCache(const RelativePathWithMetadata & object, bool with_tags, bool fetch_part_offsets) const override
-    {
-        return getObjectMetadata(object.getPath(), with_tags, fetch_part_offsets, /*use_identity_cache=*/ false);
+        return getObjectMetadata(object.getPath(), with_tags, /*use_identity_cache=*/ false);
     }
 
     std::optional<ObjectMetadata> tryGetObjectMetadata(const std::string & path, bool with_tags) const override;
@@ -267,7 +255,7 @@ private:
 
     /// `use_identity_cache` false still stores the result. It only skips the lookup, so a content cache
     /// can key itself on an ETag observed by this request.
-    ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags, bool fetch_part_offsets, bool use_identity_cache) const;
+    ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags, bool use_identity_cache) const;
 
     /// Runs `fn` and, if it failed because the vended credentials expired, refreshes this disk's
     /// client and runs it once more. `fn` must re-read the client itself, so the second run signs

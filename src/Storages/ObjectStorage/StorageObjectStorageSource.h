@@ -314,8 +314,7 @@ public:
         bool ignore_non_existent_files_,
         bool skip_object_metadata_,
         bool with_tags_,
-        std::function<void(FileProgress)> file_progress_callback = {},
-        bool fetch_part_offsets_ = false);
+        std::function<void(FileProgress)> file_progress_callback = {});
 
     ~KeysIterator() override = default;
 
@@ -332,7 +331,6 @@ private:
     const bool ignore_non_existent_files;
     const bool skip_object_metadata;
     const bool with_tags;
-    const bool fetch_part_offsets;
 };
 
 /*

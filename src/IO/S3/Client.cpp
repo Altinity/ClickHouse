@@ -553,12 +553,6 @@ Model::GetBucketVersioningOutcome Client::GetBucketVersioning(GetBucketVersionin
         doRequest(request, [this](const Model::GetBucketVersioningRequest & req) { return GetBucketVersioning(req); }));
 }
 
-Model::GetObjectAttributesOutcome Client::GetObjectAttributes(GetObjectAttributesRequest & request) const
-{
-    return processRequestResult(
-        doRequest(request, [this](const Model::GetObjectAttributesRequest & req) { return GetObjectAttributes(req); }));
-}
-
 Model::ListObjectsV2Outcome Client::ListObjectsV2(ListObjectsV2Request & request) const
 {
     return doRequestWithRetryNetworkErrors</*IsReadMethod*/ true>(

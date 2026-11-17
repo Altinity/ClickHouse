@@ -4,12 +4,10 @@
 # Tag no-parallel: SYSTEM DROP OBJECT STORAGE IDENTITY CACHE clears the process-global cache
 # Tag no-parallel-replicas: per-query S3 request counts change when a read is spread across replicas
 
-# The object-storage identity cache stores size and etag (and multipart part offsets, when
-# requested) so a later open of the same key does not send HEAD or GetObjectAttributes.
-# A cold read misses and issues one metadata request. The next read of that key is a hit
-# and issues none. SYSTEM DROP OBJECT STORAGE IDENTITY CACHE removes the entry, so the
-# following read misses again. object_storage_identity_cache_fetch_part_offsets switches
-# the cold request from HEAD to GetObjectAttributes; a hit still skips both.
+# The object-storage identity cache stores size, etag and Last-Modified so a later open of the same
+# key does not send HEAD. A cold read misses and issues one HEAD. The next read of that key is a hit
+# and issues none. SYSTEM DROP OBJECT STORAGE IDENTITY CACHE removes the entry, so the following read
+# misses again.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -24,17 +22,16 @@ fail()
     exit 1
 }
 
-# $1 label, $2 extra settings (may be empty), $3 head mode (eq0|ge1|any), $4 attrs mode, $5 hits mode, $6 misses mode
+# $1 label, $2 extra settings (may be empty), $3 head mode (eq0|ge1|any), $4 hits mode, $5 misses mode
 read_and_check()
 {
     local label=$1
     local extra=$2
     local head_mode=$3
-    local attrs_mode=$4
-    local hits_mode=$5
-    local misses_mode=$6
+    local hits_mode=$4
+    local misses_mode=$5
     local qid="idcache_${label}_${CLICKHOUSE_DATABASE}"
-    local data settings row head attrs hits misses lists
+    local data settings row head hits misses lists
 
     settings="${READ_SETTINGS}"
     if [[ -n $extra ]]; then
@@ -50,7 +47,6 @@ read_and_check()
     row=$(${CLICKHOUSE_CLIENT} -q "
         SELECT
             ProfileEvents['S3HeadObject'],
-            ProfileEvents['S3GetObjectAttributes'],
             ProfileEvents['ObjectStorageIdentityCacheHits'],
             ProfileEvents['ObjectStorageIdentityCacheMisses'],
             ProfileEvents['S3ListObjects']
@@ -65,9 +61,8 @@ read_and_check()
         FORMAT TabSeparated") || fail "${label}: query_log failed"
     [[ -n $row ]] || fail "${label}: no query_log row"
 
-    IFS=$'\t' read -r head attrs hits misses lists <<< "$row"
+    IFS=$'\t' read -r head hits misses lists <<< "$row"
     check_count "$label" S3HeadObject "$head" "$head_mode"
-    check_count "$label" S3GetObjectAttributes "$attrs" "$attrs_mode"
     check_count "$label" Hits "$hits" "$hits_mode"
     check_count "$label" Misses "$misses" "$misses_mode"
     [[ $lists == "0" ]] || fail "${label}: S3ListObjects=${lists}, expected 0 (row: ${row})"
@@ -94,15 +89,10 @@ ${CLICKHOUSE_CLIENT} -q "
 
 # Drop whatever the INSERT cached, then prove a cold read, a hit, and that DROP really clears.
 ${CLICKHOUSE_CLIENT} -q "SYSTEM CLEAR OBJECT STORAGE IDENTITY CACHE" || fail "clear failed"
-read_and_check cold "" ge1 eq0 eq0 ge1
-read_and_check warm "" eq0 eq0 ge1 eq0
+read_and_check cold "" ge1 eq0 ge1
+read_and_check warm "" eq0 ge1 eq0
 
 ${CLICKHOUSE_CLIENT} -q "SYSTEM DROP OBJECT STORAGE IDENTITY CACHE" || fail "drop failed"
-read_and_check after_drop "" ge1 eq0 eq0 ge1
-
-# GetObjectAttributes is the cold request when part offsets are requested. A following read is a hit.
-${CLICKHOUSE_CLIENT} -q "SYSTEM CLEAR OBJECT STORAGE IDENTITY CACHE" || fail "clear before attributes failed"
-read_and_check attrs_cold "object_storage_identity_cache_fetch_part_offsets = 1" any ge1 eq0 ge1
-read_and_check attrs_warm "object_storage_identity_cache_fetch_part_offsets = 1" eq0 eq0 ge1 eq0
+read_and_check after_drop "" ge1 eq0 ge1
 
 echo OK

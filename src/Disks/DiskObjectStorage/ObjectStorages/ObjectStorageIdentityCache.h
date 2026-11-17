@@ -6,40 +6,33 @@
 #include <mutex>
 #include <optional>
 #include <string_view>
-#include <vector>
 
 namespace DB
 {
 
 /// Object-storage "identity": the bits needed to open an object without a fresh HEAD - its size,
-/// ETag, Last-Modified, and (if multipart-uploaded) the byte offsets of its parts.
+/// ETag and Last-Modified.
 ///
 /// It exists to break the ordering that forces a HEAD before every open: object caches key on
 /// (path, etag), so the etag must be known up front. Here the key is the store plus the path
-/// (`makeObjectStorageIdentityCacheKey`) and the etag is stored in the value, learned once (via
-/// GetObjectAttributes / a GET response) and reused. Multipart part offsets ride along so reads can
-/// be aligned to part boundaries without re-probing.
+/// (`makeObjectStorageIdentityCacheKey`) and the etag is stored in the value, learned once (via a
+/// HEAD or a GET response) and reused. Every entry comes from a HEAD, which always returns
+/// Last-Modified, so `is_last_modified_known` only means "the object has a modification time".
 struct ObjectStorageIdentity
 {
     String etag;
     UInt64 size = 0;
     bool is_size_known = true;
-    /// Cumulative start offset of each multipart part (part i covers [part_offsets[i], part_offsets[i+1])).
-    /// Empty when unknown or the object is a single PUT.
-    std::vector<UInt64> part_offsets;
     /// Seconds since epoch. Meaningful only when `is_last_modified_known`.
     Int64 last_modified = 0;
     bool is_last_modified_known = false;
-    /// False when this entry was stored from `GetObjectAttributes`, which does not return Last-Modified.
-    /// That is not the same as observing that the object has no modification time.
-    bool last_modified_observed = false;
     /// Orders stores of this key. A fetch that started earlier must not overwrite one that started later.
     /// Not part of the object's identity.
     UInt64 fetch_seq = 0;
 
     size_t memoryUsage() const
     {
-        return sizeof(ObjectStorageIdentity) + etag.capacity() + part_offsets.capacity() * sizeof(UInt64);
+        return sizeof(ObjectStorageIdentity) + etag.capacity();
     }
 };
 
@@ -70,7 +63,7 @@ inline String makeObjectStorageIdentityCacheKey(std::string_view endpoint, std::
 }
 
 /// Cache of object-storage identity, keyed by endpoint, bucket and object path, so opening an object
-/// does not require a fresh HEAD / GetObjectAttributes on every read (a lake scan otherwise re-HEADs
+/// does not require a fresh HEAD on every read (a lake scan otherwise re-HEADs
 /// every candidate file on every query). Backed by CacheBase (LRU/SLRU) for size-bounded eviction
 /// and thread-safety.
 ///
@@ -104,7 +97,6 @@ public:
     Read beginFetch();
 
     /// Store `identity` only when `read.epoch` is still current and no later fetch of `key` has stored.
-    /// A HEAD has no part offsets. When its ETag matches the resident entry, those offsets are kept.
     void setIfEpoch(const String & key, ObjectStorageIdentity identity, Read read);
 
     /// Advance the epoch and drop the entry. A fetch already in flight will not put the old identity back.

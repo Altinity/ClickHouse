@@ -391,7 +391,6 @@ namespace Setting
     extern const SettingsBool use_page_cache_for_disks_without_file_cache;
     extern const SettingsBool use_page_cache_for_local_disks;
     extern const SettingsBool use_page_cache_for_object_storage;
-    extern const SettingsBool object_storage_identity_cache_fetch_part_offsets;
     extern const SettingsBool use_page_cache_with_distributed_cache;
     extern const SettingsUInt64 use_structure_from_insertion_table_in_table_functions;
     extern const SettingsString workload;
@@ -620,7 +619,7 @@ struct ContextSharedPart : boost::noncopyable
     mutable ResourceManagerPtr resource_manager;
     mutable UncompressedCachePtr uncompressed_cache TSA_GUARDED_BY(mutex);            /// The cache of decompressed blocks.
     mutable MarkCachePtr mark_cache TSA_GUARDED_BY(mutex);                            /// Cache of marks in compressed files.
-    mutable ObjectStorageIdentityCachePtr object_storage_identity_cache TSA_GUARDED_BY(mutex); /// Cache of object-storage identity (size/etag/part-offsets) to avoid per-open HEADs.
+    mutable ObjectStorageIdentityCachePtr object_storage_identity_cache TSA_GUARDED_BY(mutex); /// Cache of object-storage identity (size/etag/Last-Modified) to avoid per-open HEADs.
     mutable UniqueKeyIndexCachePtr unique_key_index_cache TSA_GUARDED_BY(mutex);               /// RocksDB-compatible block cache over CacheBase for the UNIQUE KEY index (nullptr when RocksDB unavailable or disabled).
     mutable DeleteBitmapCachePtr delete_bitmap_cache TSA_GUARDED_BY(mutex);           /// UNIQUE KEY per-part delete-bitmap cache.
     mutable PrimaryIndexCachePtr primary_index_cache TSA_GUARDED_BY(mutex);
@@ -9050,7 +9049,6 @@ ReadSettings Context::getReadSettings() const
     res.use_page_cache_with_distributed_cache = settings_ref[Setting::use_page_cache_with_distributed_cache];
     res.use_page_cache_for_local_disks = settings_ref[Setting::use_page_cache_for_local_disks];
     res.use_page_cache_for_object_storage = settings_ref[Setting::use_page_cache_for_object_storage];
-    res.object_storage_identity_cache_fetch_part_offsets = settings_ref[Setting::object_storage_identity_cache_fetch_part_offsets];
     res.reader_executor.enabled = settings_ref[Setting::use_reader_executor];
     res.reader_executor.use_long_connections = settings_ref[Setting::reader_executor_use_long_connections];
     res.reader_executor.window_size = settings_ref[Setting::reader_executor_window_size];

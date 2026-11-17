@@ -220,7 +220,6 @@ namespace Setting
     extern const SettingsBool use_object_storage_list_objects_cache;
     extern const SettingsBool allow_experimental_iceberg_read_optimization;
     extern const SettingsBool azure_validate_etag_on_read;
-    extern const SettingsBool object_storage_identity_cache_fetch_part_offsets;
 }
 
 namespace
@@ -459,7 +458,6 @@ std::shared_ptr<IObjectIterator> StorageObjectStorageSource::createFileIterator(
 {
     const bool is_archive = configuration->isArchive();
     const bool match_web_paths_only = configuration->getType() == ObjectStorageType::Web;
-    const bool fetch_part_offsets = local_context->getSettingsRef()[Setting::object_storage_identity_cache_fetch_part_offsets];
 
     if (distributed_processing)
     {
@@ -503,7 +501,7 @@ std::shared_ptr<IObjectIterator> StorageObjectStorageSource::createFileIterator(
         iterator = std::make_unique<KeysIterator>(
             paths, object_storage, virtual_columns, is_archive ? nullptr : read_keys,
             query_settings.ignore_non_existent_file, skip_object_metadata, with_tags,
-            file_progress_callback, fetch_part_offsets);
+            file_progress_callback);
     }
     else if (reading_path.hasGlobs())
     {
@@ -590,8 +588,7 @@ std::shared_ptr<IObjectIterator> StorageObjectStorageSource::createFileIterator(
                 query_settings.ignore_non_existent_file,
                 skip_object_metadata,
                 with_tags,
-                file_progress_callback,
-                fetch_part_offsets);
+                file_progress_callback);
         }
     }
     else if (configuration->supportsFileIterator())
@@ -674,7 +671,7 @@ std::shared_ptr<IObjectIterator> StorageObjectStorageSource::createFileIterator(
         iterator = std::make_unique<KeysIterator>(
             paths, object_storage, virtual_columns, is_archive ? nullptr : read_keys,
             query_settings.ignore_non_existent_file, /*skip_object_metadata=*/false, with_tags,
-            file_progress_callback, fetch_part_offsets);
+            file_progress_callback);
     }
 
     if (is_archive)
@@ -1162,9 +1159,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             }
             else
             {
-                object_info->setObjectMetadata(storage_to_use->getObjectMetadata(
-                    metadata_object, with_tags,
-                    context_->getSettingsRef()[Setting::object_storage_identity_cache_fetch_part_offsets]));
+                object_info->setObjectMetadata(storage_to_use->getObjectMetadata(metadata_object, with_tags));
             }
         }
 
@@ -1993,9 +1988,7 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
 
     if (!object_info.metadata)
     {
-        object_info.metadata = object_storage->getObjectMetadata(
-            object_info, /*with_tags=*/ false,
-            /*fetch_part_offsets=*/ effective_read_settings.object_storage_identity_cache_fetch_part_offsets);
+        object_info.metadata = object_storage->getObjectMetadata(object_info, /*with_tags=*/ false);
     }
     else if (!object_info.metadata->is_fetched && validate_etag_on_read)
     {
@@ -2009,17 +2002,13 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     /// that the object was replaced. Re-read the identity before using its ETag as the cache key.
     /// An unchanged object keeps the same key. A replaced object gets a new key and is read again.
     /// The parquet flag is only a footer-only count: other Parquet reads still check the ETag on GET.
-    /// This refresh is a HEAD. `GetObjectAttributes` does not return Last-Modified, so using it here
-    /// would make this read's `_time` NULL and replace the cached time with "not observed". Part offsets
-    /// already stored for the same ETag are kept by `setIfEpoch`.
     if ((use_filesystem_cache || use_page_cache || revalidate_identity_for_parquet_metadata_cache)
         && object_info.metadata
         && object_info.metadata->is_from_identity_cache
         && object_info.metadata->is_size_known
         && object_info.metadata->isEtagUsableAsCacheKey())
     {
-        object_info.metadata = object_storage->getObjectMetadataIgnoringIdentityCache(
-            object_info, /*with_tags=*/ false, /*fetch_part_offsets=*/ false);
+        object_info.metadata = object_storage->getObjectMetadataIgnoringIdentityCache(object_info, /*with_tags=*/ false);
     }
 
     if (use_page_cache && !object_info.metadata->isEtagUsableAsCacheKey())
@@ -2414,8 +2403,7 @@ StorageObjectStorageSource::KeysIterator::KeysIterator(
     bool ignore_non_existent_files_,
     bool skip_object_metadata_,
     bool with_tags_,
-    std::function<void(FileProgress)> file_progress_callback_,
-    bool fetch_part_offsets_)
+    std::function<void(FileProgress)> file_progress_callback_)
     : object_storage(object_storage_)
     , virtual_columns(virtual_columns_)
     , file_progress_callback(file_progress_callback_)
@@ -2423,7 +2411,6 @@ StorageObjectStorageSource::KeysIterator::KeysIterator(
     , ignore_non_existent_files(ignore_non_existent_files_)
     , skip_object_metadata(skip_object_metadata_)
     , with_tags(with_tags_)
-    , fetch_part_offsets(fetch_part_offsets_)
 {
     if (read_keys_)
     {
@@ -2457,7 +2444,7 @@ ObjectInfoPtr StorageObjectStorageSource::KeysIterator::next(size_t /* processor
                 object_metadata = *metadata;
             }
             else
-                object_metadata = object_storage->getObjectMetadata(key, with_tags, fetch_part_offsets);
+                object_metadata = object_storage->getObjectMetadata(key, with_tags);
         }
         else
         {

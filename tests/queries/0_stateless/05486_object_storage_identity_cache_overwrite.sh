@@ -30,7 +30,7 @@ read_and_check()
     local hits_mode=$4
     local misses_mode=$5
     local qid="idcache_ow_${label}_${CLICKHOUSE_DATABASE}"
-    local data row head attrs hits misses lists
+    local data row head hits misses lists
 
     data=$(${CLICKHOUSE_CLIENT} --query_id "$qid" -q \
         "SELECT n FROM s3('${URL}', 'test', 'testtest', 'TSV', 'n UInt64') ORDER BY n SETTINGS ${READ_SETTINGS} FORMAT TabSeparated") \
@@ -41,7 +41,6 @@ read_and_check()
     row=$(${CLICKHOUSE_CLIENT} -q "
         SELECT
             ProfileEvents['S3HeadObject'],
-            ProfileEvents['S3GetObjectAttributes'],
             ProfileEvents['ObjectStorageIdentityCacheHits'],
             ProfileEvents['ObjectStorageIdentityCacheMisses'],
             ProfileEvents['S3ListObjects']
@@ -56,9 +55,8 @@ read_and_check()
         FORMAT TabSeparated") || fail "${label}: query_log failed"
     [[ -n $row ]] || fail "${label}: no query_log row"
 
-    IFS=$'\t' read -r head attrs hits misses lists <<< "$row"
+    IFS=$'\t' read -r head hits misses lists <<< "$row"
     check_count "$label" S3HeadObject "$head" "$head_mode"
-    check_count "$label" S3GetObjectAttributes "$attrs" eq0
     check_count "$label" Hits "$hits" "$hits_mode"
     check_count "$label" Misses "$misses" "$misses_mode"
     [[ $lists == "0" ]] || fail "${label}: S3ListObjects=${lists}, expected 0 (row: ${row})"
