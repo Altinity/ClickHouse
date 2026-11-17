@@ -86,7 +86,7 @@ def start_cluster():
         GCS_HOST,
         hostname=GCS_HOST,
         image="altinityinfra/python-bottle",
-        tag="latest",
+        tag=os.environ.get("DOCKER_PYTHON_BOTTLE_TAG", "latest"),
         stay_alive=True,
     )
     # The fake GCE metadata server takes the real default hostname `metadata.google.internal` on the
@@ -97,7 +97,7 @@ def start_cluster():
         METADATA_HOST,
         hostname=METADATA_HOST,
         image="altinityinfra/python-bottle",
-        tag="latest",
+        tag=os.environ.get("DOCKER_PYTHON_BOTTLE_TAG", "latest"),
         stay_alive=True,
     )
 
