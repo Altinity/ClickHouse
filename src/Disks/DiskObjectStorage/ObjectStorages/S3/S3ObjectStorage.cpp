@@ -1003,7 +1003,7 @@ std::optional<ObjectMetadata> S3ObjectStorage::tryGetObjectMetadataImpl(
     return result;
 }
 
-ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool with_tags, bool fetch_part_offsets) const
+ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool with_tags, bool fetch_part_offsets, bool use_identity_cache) const
 {
     /// When the caller only needs identity (size / etag / part offsets, not tags or user metadata) we
     /// take a fast path: consult the identity cache to skip the metadata request entirely on repeat
@@ -1025,7 +1025,7 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
         if (auto global_context = Context::getGlobalContextInstance())
             identity_cache = global_context->getObjectStorageIdentityCache();
 
-        if (identity_cache)
+        if (use_identity_cache && identity_cache)
         {
             if (auto cached = identity_cache->tryGet(identity_key))
             {
@@ -1034,6 +1034,7 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
                 result.is_size_known = cached->is_size_known;
                 result.etag = cached->etag;
                 result.part_offsets = cached->part_offsets;
+                result.is_from_identity_cache = true;
                 if (cached->is_last_modified_known)
                 {
                     result.last_modified = Poco::Timestamp::fromEpochTime(static_cast<std::time_t>(cached->last_modified));

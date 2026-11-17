@@ -1991,6 +1991,20 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
         object_info.metadata = object_storage->getObjectMetadata(object_info, /*with_tags=*/ false);
     }
 
+    /// A filesystem or page cache hit never issues the GET, so it cannot notice that the object was
+    /// replaced. Re-read the identity before using its ETag as the cache key. An unchanged object keeps
+    /// the same key and is served from the cache. A replaced object gets a new key and is read again.
+    if ((use_filesystem_cache || use_page_cache)
+        && object_info.metadata
+        && object_info.metadata->is_from_identity_cache
+        && object_info.metadata->is_size_known
+        && object_info.metadata->isEtagUsableAsCacheKey())
+    {
+        object_info.metadata = object_storage->getObjectMetadataIgnoringIdentityCache(
+            object_info, /*with_tags=*/ false,
+            /*fetch_part_offsets=*/ effective_read_settings.object_storage_identity_cache_fetch_part_offsets);
+    }
+
     if (use_page_cache && !object_info.metadata->isEtagUsableAsCacheKey())
     {
         LOG_WARNING(log, "Cannot use page cache, etag is missing or not a strong content identifier");
