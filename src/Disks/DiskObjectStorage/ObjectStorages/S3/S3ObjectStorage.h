@@ -150,6 +150,11 @@ public:
     }
     ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags, bool fetch_part_offsets) const override;
 
+    ObjectMetadata getObjectMetadata(const RelativePathWithMetadata & object, bool with_tags, bool fetch_part_offsets) const override
+    {
+        return getObjectMetadata(object.getPath(), with_tags, fetch_part_offsets);
+    }
+
     std::optional<ObjectMetadata> tryGetObjectMetadata(const std::string & path, bool with_tags) const override;
 
     /// Marks the HEAD request eligible for the typed NativeConditional mode, so the CAS backend's

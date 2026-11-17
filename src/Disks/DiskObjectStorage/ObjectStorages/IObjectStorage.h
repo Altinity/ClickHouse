@@ -373,6 +373,15 @@ public:
         return getObjectMetadata(path, with_tags);
     }
 
+    /// Same request as the string overload, but the object keeps whatever identifies the replica
+    /// (a `url()` shard index). The default calls the two-argument object overload so a backend that
+    /// overrides that one, such as `WebObjectStorage`, still sees the index. Calling the string
+    /// overload instead would probe every shard and could return another shard's size and ETag.
+    virtual ObjectMetadata getObjectMetadata(const RelativePathWithMetadata & object, bool with_tags, bool /*fetch_part_offsets*/) const
+    {
+        return getObjectMetadata(object, with_tags);
+    }
+
     /// Same as getObjectMetadata(), but ignores if object does not exist.
     virtual std::optional<ObjectMetadata> tryGetObjectMetadata(const std::string & path, bool with_tags) const = 0;
     virtual std::optional<ObjectMetadata> tryGetObjectMetadata(const RelativePathWithMetadata & object, bool with_tags) const
