@@ -5,7 +5,7 @@
 # Tag no-parallel-replicas: per-query S3 request counts change when a read is spread across replicas
 
 # A metadata read is paused after its HEAD and before it stores the identity. An overwrite in that
-# window bumps the key's generation. When the read resumes it must not store the identity it fetched,
+# window advances the cache epoch. When the read resumes it must not store the identity it fetched,
 # so the next read misses and returns the new rows.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

@@ -5,7 +5,7 @@
 # Tag no-parallel-replicas: per-query S3 request counts change when a read is spread across replicas
 
 # A metadata read is paused after its HEAD and before it stores the identity. The object is overwritten
-# and then the whole cache is dropped. Dropping the cache forgets the per-key generations, so the key
+# and then the whole cache is dropped. The drop advances the cache epoch, so the read must not store
 # looks untouched again. When the read resumes it must still not store the identity it fetched before
 # the overwrite: the next read misses and returns the new rows.
 
@@ -67,7 +67,7 @@ ${CLICKHOUSE_CLIENT} -q "SYSTEM WAIT FAILPOINT ${FAILPOINT} PAUSE" || fail "wait
 
 insert_values "SELECT 10 UNION ALL SELECT 20 UNION ALL SELECT 30"
 
-# Drops every entry and every per-key generation while the read is still paused.
+# Drops every entry and advances the epoch while the read is still paused.
 ${CLICKHOUSE_CLIENT} -q "SYSTEM CLEAR OBJECT STORAGE IDENTITY CACHE" || fail "clear during fetch failed"
 
 ${CLICKHOUSE_CLIENT} -q "SYSTEM DISABLE FAILPOINT ${FAILPOINT}" || fail "disable failpoint failed"

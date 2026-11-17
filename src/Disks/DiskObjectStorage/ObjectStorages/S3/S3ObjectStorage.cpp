@@ -1032,11 +1032,11 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
         }
     }
 
-    /// Captured before the request. `setIfEpoch` stores the result only while this generation still
-    /// matches, so an overwrite that lands during the request cannot be undone by this fetch.
-    ObjectStorageIdentityEpoch identity_epoch;
+    /// Captured before the request. `setIfEpoch` stores the result only while the epoch is unchanged,
+    /// so a write, copy, delete, or drop that lands during the request cannot be undone by this fetch.
+    UInt64 identity_epoch = 0;
     if (identity_cache)
-        identity_epoch = identity_cache->epochOf(identity_key);
+        identity_epoch = identity_cache->currentEpoch();
 
     auto settings_ptr = s3_settings.get();
 
