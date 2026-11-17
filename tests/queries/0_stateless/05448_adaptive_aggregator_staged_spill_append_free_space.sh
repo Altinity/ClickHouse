@@ -10,7 +10,7 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # makes that check ask for the largest possible size, as for a disk without room, so the query fails with
 # `NOT_ENOUGH_SPACE` for a size that no stream creation asks for. The thresholds are pinned because the runner
 # randomizes them, and clickhouse-local runs the query in a process of its own, so the failpoint affects no other test.
-$CLICKHOUSE_LOCAL --ignore-error --query "
+$CLICKHOUSE_LOCAL --query "
     SET max_threads = 4, max_threads_min_free_memory_per_thread = 0, max_block_size = 8192;
     SET enable_adaptive_aggregator = 1, adaptive_aggregator_disable_thaw = 1, collect_hash_table_stats_during_aggregation = 0;
     SET adaptive_aggregator_freeze_threshold = 1000, adaptive_aggregator_freeze_threshold_bytes = 0;

@@ -27,5 +27,5 @@ $CLICKHOUSE_LOCAL --query "${settings} ${query}; ${spilled};
         (SELECT coalesce(sum(value), 0) FROM system.events WHERE event = 'AdaptiveAggregationFrozenTableSpills');"
 
 echo 'An unattainable minimum of free space'
-$CLICKHOUSE_LOCAL --ignore-error --query "${settings} SET min_free_disk_space_for_temporary_data = 1000000000000000000;
-    ${query}; ${spilled};" 2>&1 | grep -oE "NOT_ENOUGH_SPACE|staged records written to disk.*" | sort -u
+$CLICKHOUSE_LOCAL --query "${settings} SET min_free_disk_space_for_temporary_data = 1000000000000000000;
+    ${query};" 2>&1 | grep -oE "NOT_ENOUGH_SPACE" | sort -u
