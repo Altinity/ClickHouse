@@ -243,7 +243,7 @@ TEST(CASProtocol, RevalidateReObservesStaleTokenAdoptsWhenDisplaced)
     /// GC advanced to round 1 with an EMPTY retired set; fence to 1.
     injectRetire(*b, s->layout(), /*round*/ 1, /*shard*/ 0, {});
 
-    /// promote refreshes ⇒ revalidate X ⇒ HEAD current t1 not condemned ⇒ commit. The dep rides t1.
+    /// promote: X's dependency proof from `putBlob` suffices, with no `HEAD` ⇒ commit.
     build->promote(ns, "part_1", build->buildId(), id);
     assertPartReads(b, s, ns, "part_1", "data.bin", "payload-X");
     EXPECT_EQ(currentIncarnation(*b, blob_key), t1);
@@ -502,7 +502,7 @@ TEST(CASProtocol, DisplacedToLiveTokenCommitsAtCurrentIncarnation)
     injectRetire(*b, s->layout(), /*round*/ 1, /*shard*/ 0,
         {RetiredEntry{.kind = ObjectKind::Blob, .ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("payload-X"))}, .token = PersistedEtag::capture(t0), .size = 9}});
 
-    /// promote: revalidate X ⇒ HEAD current t1 (NOT condemned; only the defunct t0 is) ⇒ commit.
+    /// promote: X's dependency proof from `putBlob` suffices, with no `HEAD` ⇒ commit.
     build->promote(ns, "part_1", build->buildId(), id);
 
     /// The blob lives at t1 (the displacing writer's incarnation) and the part reads.
@@ -654,8 +654,7 @@ TEST(CASProtocol, DISABLED_RevalidateAbsentTreeDepRecreates)
 {
     GTEST_SKIP() << "Obsolete (tree model). The gate's 'absent tree dep recreated from retained "
                     "payload' behavior has no manifest analog: a part manifest body is staged ONCE by "
-                    "stageManifest and promote never re-creates it — an absent/invalid body at promote "
-                    "fails closed (ABORTED). The blob-leaf absent-recreate case is covered by putBlob's "
+                    "stageManifest and promote never re-creates it. The blob-leaf absent-recreate case is covered by putBlob's "
                     "INV-1 re-upload-from-source path, not by the publish gate.";
 }
 

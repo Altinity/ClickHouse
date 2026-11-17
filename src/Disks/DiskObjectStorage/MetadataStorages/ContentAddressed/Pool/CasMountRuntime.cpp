@@ -101,11 +101,25 @@ bool CasMountRuntime::mayMutate() const
         && bootMsNow() < mount_fence.deadline_boot_ms.load(std::memory_order_acquire);
 }
 
+std::shared_ptr<const MountSlotOwnership> CasMountRuntime::slotOwnership() const
+{
+    std::lock_guard lock(driver_mutex);
+    return mount_renewer ? mount_renewer->slotOwnership() : nullptr;
+}
+
+bool CasMountRuntime::slotHeldBy(const MountSlotOwnership & ownership) const
+{
+    /// A fresh read every call: an observation older than the caller's snapshot proves nothing about it.
+    CasOperation op = mount_requests.admit();
+    const std::optional<Object> slot = op.read(layout.mountKey(server_root_id), Retry::once());
+    return slot && ownership.holds(*slot);
+}
+
 void CasMountRuntime::tripMountLost()
 {
     mount_fence.lost.store(true, std::memory_order_release);
     /// A durable-effect caller admitted under the incarnation this trip just ended must never conclude
-    /// the fence is fine again just because a LATER `armMountFence` happens to re-arm it (rev.7 [C2]).
+    /// the fence is fine again just because a LATER `armMountFence` happens to re-arm it.
     fence_generation.fetch_add(1, std::memory_order_acq_rel);
     /// FORGET publishes terminal intent before tripping the fence. That deliberate decommission is not
     /// an operational loss/recovery generation and must not pass through the transient-loss accounting
@@ -122,7 +136,7 @@ void CasMountRuntime::tripFenceWithoutOperationalLoss()
 
 void CasMountRuntime::checkFenceOrThrow(uint64_t admitted_generation) const
 {
-    /// [D5]: tell only what is known here. A tripped fence (or a bumped generation) means this node no
+    /// Tell only what is known here. A tripped fence (or a bumped generation) means this node no
     /// longer holds the mount incarnation the caller was admitted under -- but this same guard trips for a
     /// transient lease blip AND for a deliberate terminal decommission (FORGET) or a lost identity, and this
     /// code cannot tell them apart. So the CONDITION must NOT promise recovery ("temporarily unreachable"
@@ -212,7 +226,7 @@ void CasMountRuntime::armMountFence(UInt128 server_uuid, uint64_t writer_epoch, 
     mount_fence.deadline_boot_ms.store(deadline_boot_ms, std::memory_order_release);
     writes_paused_warned.store(false, std::memory_order_relaxed);
     /// A fresh lease incarnation is a fresh generation too: a durable-effect caller admitted under the
-    /// PRIOR incarnation must re-check and abort rather than ride this re-arm through (rev.7 [C2]).
+    /// PRIOR incarnation must re-check and abort rather than ride this re-arm through.
     fence_generation.fetch_add(1, std::memory_order_acq_rel);
     if (arm_mount_fence_interposition_hook_for_test)
         arm_mount_fence_interposition_hook_for_test();
@@ -300,9 +314,20 @@ void CasMountRuntime::setProcessEpoch(uint64_t v, std::memory_order order)
     process_epoch.store(v, order);
 }
 
-void CasMountRuntime::setLiveWriterEpoch(uint64_t v)
+void CasMountRuntime::setLiveWriterEpoch(uint64_t writer_epoch, uint64_t last_unclean_epoch)
 {
-    live_writer_epoch.store(v, std::memory_order_release);
+    /// The marker goes first: a reader that sees the new epoch then sees its marker. The reverse order would let a
+    /// new epoch pair with the old, lower marker, and recovery would skip a tombstone it needs.
+    live_last_unclean_epoch.store(last_unclean_epoch, std::memory_order_release);
+    live_writer_epoch.store(writer_epoch, std::memory_order_release);
+}
+
+LiveEpochPair CasMountRuntime::liveEpochPair() const
+{
+    /// The epoch first, the mirror of `setLiveWriterEpoch`. An old epoch can pair with a newer, higher marker, which
+    /// costs only a tombstone write.
+    const uint64_t writer_epoch = live_writer_epoch.load(std::memory_order_acquire);
+    return LiveEpochPair{.writer_epoch = writer_epoch, .last_unclean_epoch = live_last_unclean_epoch.load(std::memory_order_acquire)};
 }
 
 CasMountRuntime::DriverLease::DriverLease(CasMountRuntime & runtime_, RenewalDriverState active_)
@@ -408,10 +433,11 @@ CasMountRuntime::AdmittedRenewerCall CasMountRuntime::admitRenewerCall(
 void CasMountRuntime::installRenewer(
     UInt128 our_uuid,
     uint64_t writer_epoch,
+    uint64_t last_unclean_epoch,
     const std::function<uint64_t()> & now_ms)
 {
     auto replacement = std::make_unique<MountLeaseRenewer>(
-        mount_requests, lease_requests, layout, server_root_id, our_uuid, writer_epoch,
+        mount_requests, lease_requests, layout, server_root_id, our_uuid, writer_epoch, last_unclean_epoch,
         config.mount_lease_ttl_ms, now_ms,
         [this] { return minActive(); },
         [this](CasEvent e) { emitEvent(std::move(e)); },
@@ -1001,7 +1027,7 @@ bool CasMountRuntime::noteLeaseLost()
 void CasMountRuntime::noteRemounted()
 {
     /// `TransientNotLive -> Live` on a successful reclaim. A compare-exchange FROM `TransientNotLive`
-    /// never revives `IdentityLost` or a `Vanished` state ([D3]) and is a no-op if already `Live`.
+    /// never revives `IdentityLost` or a `Vanished` state and is a no-op if already `Live`.
     PoolLifecycle expected = PoolLifecycle::TransientNotLive;
     if (pool_lifecycle.compare_exchange_strong(
             expected, PoolLifecycle::Live, std::memory_order_acq_rel, std::memory_order_acquire))
@@ -1032,11 +1058,11 @@ std::unique_lock<std::mutex> CasMountRuntime::lockTerminalPublication()
 void CasMountRuntime::enterIdentityLost(const String & reason)
 {
     /// `TransientNotLive -> IdentityLost`, one way. The compare-exchange FROM `TransientNotLive` gives
-    /// the brief's "from TransientNotLive only" precondition, idempotency (a second call finds the state
+    /// the "from TransientNotLive only" precondition, idempotency (a second call finds the state
     /// already `IdentityLost` and its exchange fails), and safety against a concurrent renewer
     /// `noteLeaseLost` (which only ever moves `Live -> TransientNotLive`, never away from it). It does NOT
     /// set `vanished_intent` (that latch is reserved for the `Vanished*` idempotency/FORGET protocol);
-    /// rev.8 makes `IdentityLost` a fail-loud TERMINAL state through `remountTerminal`, which folds it
+    /// `IdentityLost` is a fail-loud TERMINAL state through `remountTerminal`, which folds it
     /// into the worker-exit boundary alongside `vanished_intent`, so the remount/GC workers
     /// self-exit rather than demote.
     /// `since` for the `identity_lost` snapshot row — the wall-clock instant the observer proved the

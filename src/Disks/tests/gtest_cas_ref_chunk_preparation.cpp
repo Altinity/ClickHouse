@@ -86,6 +86,14 @@ RefTableState bornState()
     return state;
 }
 
+/// The born namespace with epoch 1 closed by a seal at `{1,2}`.
+RefTableState sealedState()
+{
+    RefTableState state = bornState();
+    applyRefLogTxn(state, RefLogTxn{kNs.string(), RefTxnId{1, 2}, {epochSealOp()}, std::nullopt});
+    return state;
+}
+
 /// Asserts that preparation REFUSES with `CORRUPTED_DATA` -- the code every ref-log grammar violation
 /// normalises to -- and that the message names the chain link, so a row cannot pass because some
 /// unrelated validator happened to throw first.
@@ -168,15 +176,13 @@ TEST(CASRefChunkPreparation, CandidateBaseIdIsGreatestApplied)
 /// successor of some stream (INV-1): a row cannot just assert a grammar rule on an id the stream would
 /// never reach.
 ///
-/// Note which validator each row lands on, because the two halves of the rule are DISJOINT and live in
-/// different steps of preparation: the required-iff half is `validateEpochSealGrammarContextual`, run by
-/// the candidate apply; the forbidden-off-sequence-1 half is `validateEpochSealGrammarStructural`, run
-/// by `encodeRefLogTxn` during the seal. Both are inside preparation, which is the point -- a chunk that
-/// passes one and fails the other still fails before any durable effect.
+/// The candidate apply runs `validateRefChainLink`, which refuses a link wherever the record before is
+/// not a tombstone and requires the tombstone's id right after one. Preparation runs it before any
+/// durable effect.
 TEST(CASRefChunkPreparation, ChainLinkRequiredExactlyOnSequenceOneOfNonGenesisEpoch)
 {
     const std::vector<RefOp> ops{addPrecommitOp("r1", mref(3))};
-    const RefTxnId epoch1_seal{1, 5};   /// the seal that closed epoch 1
+    const RefTxnId epoch1_seal{1, 2};   /// the seal that closed epoch 1 in `sealedState`
 
     /// From a namespace born at `1-1` (so `life_epoch == 1`).
     /// Sequence > 1 of the genesis epoch: the link is FORBIDDEN.
@@ -186,9 +192,9 @@ TEST(CASRefChunkPreparation, ChainLinkRequiredExactlyOnSequenceOneOfNonGenesisEp
                          "a link at sequence >1 is forbidden and must be refused before any durable effect");
 
     /// Sequence 1 of an epoch ABOVE genesis: the link is REQUIRED.
-    EXPECT_NO_THROW(prepare(bornState(), RefTxnId{2, 1}, epoch1_seal, ops))
+    EXPECT_NO_THROW(prepare(sealedState(), RefTxnId{2, 1}, epoch1_seal, ops))
         << "seq 1 of a higher epoch names the seal that closed the previous one";
-    expectGrammarRefusal([&] { prepare(bornState(), RefTxnId{2, 1}, std::nullopt, ops); },
+    expectGrammarRefusal([&] { prepare(sealedState(), RefTxnId{2, 1}, std::nullopt, ops); },
                          "seq 1 of a higher epoch without a link must be refused -- 'no seal' is a fact "
                          "about the stream, not a defaulted field");
 
@@ -199,59 +205,13 @@ TEST(CASRefChunkPreparation, ChainLinkRequiredExactlyOnSequenceOneOfNonGenesisEp
                          "a link on the birth transaction itself must be refused");
 
     /// Whatever the grammar admitted, the sealed bytes carry exactly that link and nothing else.
-    const auto linked = prepare(bornState(), RefTxnId{2, 1}, epoch1_seal, ops);
+    const auto linked = prepare(sealedState(), RefTxnId{2, 1}, epoch1_seal, ops);
     ASSERT_TRUE(linked.chunk_txn.prev_epoch_seal.has_value());
     EXPECT_EQ(*linked.chunk_txn.prev_epoch_seal, epoch1_seal);
     const RefLogTxn decoded = decodeRefLogTxn(
         openObject(FormatId::RefLog, linked.prepared_attempt.bytes), kNs.string(), RefTxnId{2, 1});
     EXPECT_EQ(decoded.prev_epoch_seal, linked.chunk_txn.prev_epoch_seal)
         << "the link must survive into the bytes that would become durable";
-}
-
-/// The birth `_ckpt` contribution is PREPARED here and published by `commitRefChunk`, because
-/// publishing it is a birth chunk's first durable effect. Preparation therefore owes two things: the
-/// value only for a birth, and the one fact no later writer can recover -- `life_epoch`.
-TEST(CASRefChunkPreparation, BirthContributionSetOnlyForNamespaceBirth)
-{
-    /// A birth chunk at epoch 3: the contribution exists and names THIS transaction's writer epoch.
-    const RefTxnId birth_id{3, 1};
-    const auto born = prepare(RefTableState{}, birth_id, std::nullopt, {birthOp()});
-    ASSERT_TRUE(born.birth_contribution.has_value());
-    ASSERT_TRUE(born.birth_contribution->life_epoch.has_value());
-    EXPECT_EQ(*born.birth_contribution->life_epoch, birth_id.writer_epoch);
-    EXPECT_FALSE(born.birth_contribution->checkpoint_snapshot_id.has_value())
-        << "the birth contributes life_epoch and nothing else -- the publisher owns the checkpoint field";
-    EXPECT_FALSE(born.birth_contribution->last_epoch_seal.has_value());
-
-    /// An ordinary content chunk contributes nothing: a second `_ckpt` write here would be a request the
-    /// append lane does not owe.
-    const auto ordinary = prepare(bornState(), RefTxnId{1, 2}, std::nullopt, {addPrecommitOp("r1", mref(3))});
-    EXPECT_FALSE(ordinary.birth_contribution.has_value());
-
-    /// A birth op mixed into a larger chunk still counts -- the check is over the whole chunk.
-    const auto mixed = prepare(RefTableState{}, RefTxnId{5, 1}, std::nullopt,
-                               {birthOp(), addPrecommitOp("r1", mref(3))});
-    ASSERT_TRUE(mixed.birth_contribution.has_value());
-    EXPECT_EQ(*mixed.birth_contribution->life_epoch, 5u);
-}
-
-TEST(CASRefChunkPreparation, CommitContributionCarriesFrontierAndOnlyMatchingSeal)
-{
-    const RefTxnId ordinary_id{1, 2};
-    const auto ordinary = prepare(bornState(), ordinary_id, std::nullopt,
-                                  {addPrecommitOp("r1", mref(3))});
-    EXPECT_EQ(ordinary.commit_contribution.committed_through, ordinary_id);
-    EXPECT_FALSE(ordinary.commit_contribution.life_epoch.has_value());
-    EXPECT_FALSE(ordinary.commit_contribution.checkpoint_snapshot_id.has_value());
-    EXPECT_FALSE(ordinary.commit_contribution.last_epoch_seal.has_value());
-
-    const RefTxnId seal_id{1, 2};
-    const auto seal = prepare(bornState(), seal_id, std::nullopt, {epochSealOp()});
-    EXPECT_EQ(seal.commit_contribution.committed_through, seal_id);
-    EXPECT_EQ(seal.commit_contribution.last_epoch_seal, seal_id)
-        << "an epoch seal and its committed frontier must be one checkpoint contribution";
-    EXPECT_FALSE(seal.commit_contribution.life_epoch.has_value());
-    EXPECT_FALSE(seal.commit_contribution.checkpoint_snapshot_id.has_value());
 }
 
 /// The attempt exists so that an `Unresolved` PUT -- an object that may be durable -- can be recorded by

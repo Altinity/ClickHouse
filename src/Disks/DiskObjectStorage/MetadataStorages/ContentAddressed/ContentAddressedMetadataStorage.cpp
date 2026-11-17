@@ -31,6 +31,7 @@
 #include <Poco/Util/AbstractConfiguration.h>
 #include <base/sleep.h>
 #include <chrono>
+#include <limits>
 #include <filesystem>
 #include <ctime>
 #include <unordered_set>
@@ -91,6 +92,7 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 gc_bulk_delete_chunk_keys;
     extern const ContentAddressedSettingsUInt64 attempt_timeout_ms;
     extern const ContentAddressedSettingsUInt64 lease_safety_margin_ms;
+    extern const ContentAddressedSettingsUInt64 request_window_ms;
     extern const ContentAddressedSettingsBool blob_hash_allow_new;
 }
 
@@ -317,6 +319,7 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , gc_bulk_delete_chunk_keys(settings_[ContentAddressedSetting::gc_bulk_delete_chunk_keys].value)
     , cas_attempt_timeout_ms(settings_[ContentAddressedSetting::attempt_timeout_ms].value)
     , cas_lease_safety_margin_ms(settings_[ContentAddressedSetting::lease_safety_margin_ms].value)
+    , cas_request_window_ms(settings_[ContentAddressedSetting::request_window_ms].value)
     , staging_backend(settings_.stagingBackend())
     , blob_hash_algo(settings_.blobHashAlgo())
     , blob_hash_allow_new(settings_[ContentAddressedSetting::blob_hash_allow_new].value)
@@ -810,6 +813,7 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     pool_config.gc_bulk_delete_chunk_keys = gc_bulk_delete_chunk_keys;
     pool_config.cas_request_budget.attempt_timeout_ms = cas_attempt_timeout_ms;
     pool_config.cas_request_budget.lease_safety_margin_ms = cas_lease_safety_margin_ms;
+    setCasRequestWindow(pool_config.cas_request_budget, cas_request_window_ms);
     /// Frozen here, once: see `freezeConnectTimeoutCapMs`. A later reload that widens the disk's
     /// connect timeout cannot widen the envelope the lease arithmetic was validated against.
     pool_config.cas_request_budget.connect_timeout_cap_ms = freezeConnectTimeoutCapMs(object_storage, cas_attempt_timeout_ms);
@@ -2208,10 +2212,10 @@ bool ContentAddressedMetadataStorage::ownsNamespace(const String & other_server_
 CasConfirmAnswer ContentAddressedMetadataStorage::confirmExactRef(
     const String & root_namespace, const String & ref_name, const String & manifest_ref_text) const
 {
-    /// Gate 1 of the relink confirm: a thin forward to the ledger, whose declaration
-    /// (`CasRefLedger::confirmExactRef`) carries the six-rule snapshot and the zero-I/O contract. This
-    /// layer adds exactly two things: the token text is decoded here, and the disk's own lifecycle is
-    /// answered as `Unknown` instead of as an exception.
+    /// Gate 1 of the relink confirm: a thin forward to the pool, whose `confirmExactRef` adds the
+    /// mount-slot read to the ledger's six-rule snapshot (`CasRefLedger::confirmExactRef`). This
+    /// layer adds exactly two things: the token text is decoded here, and the disk's own lifecycle and
+    /// a failed slot read are answered as `Unknown` instead of as an exception.
     const auto manifest_ref = Cas::tryParseManifestRef(manifest_ref_text);
     if (!manifest_ref)
     {
@@ -2220,6 +2224,14 @@ CasConfirmAnswer ContentAddressedMetadataStorage::confirmExactRef(
             "the canonical epoch:build:ordinal form", ref_name, root_namespace, manifest_ref_text);
         return CasConfirmAnswer::Unknown;
     }
+
+    const auto unanswerable = [&](const String & reason)
+    {
+        LOG_DEBUG(getLogger("ContentAddressedMetadataStorage"),
+            "Relink confirm for ref '{}' in namespace '{}' is unanswerable on disk '{}': {}",
+            ref_name, root_namespace, disk_name, reason);
+        return CasConfirmAnswer::Unknown;
+    };
 
     Cas::ConfirmAnswer answer = Cas::ConfirmAnswer::Unknown;
     try
@@ -2230,17 +2242,15 @@ CasConfirmAnswer ContentAddressedMetadataStorage::confirmExactRef(
         checkOpAdmitted(CasOpClass::ContentRead);
         answer = store()->confirmExactRef(Cas::RootNamespace{root_namespace}, ref_name, *manifest_ref);
     }
+    /// Only `Yes` authorizes, and no `catch` can produce a `Yes`. The slot read can also fail with a
+    /// transport exception that is not a `DB::Exception`, hence the second clause.
     catch (const Exception & e)
     {
-        /// This is NOT a fallback path: `Unknown` is the typed refusal this primitive is built around,
-        /// not an alternate behavior substituted for a failed one. Nothing consequential happens on it --
-        /// the receiver aborts its prepared relink and retries later -- so swallowing the lifecycle
-        /// refusal costs a retry and can never authorize anything. Only `Yes` authorizes, and no `catch`
-        /// can produce a `Yes`.
-        LOG_DEBUG(getLogger("ContentAddressedMetadataStorage"),
-            "Relink confirm for ref '{}' in namespace '{}' is unanswerable on disk '{}': {}",
-            ref_name, root_namespace, disk_name, e.message());
-        return CasConfirmAnswer::Unknown;
+        return unanswerable(e.message());
+    }
+    catch (...)
+    {
+        return unanswerable(getCurrentExceptionMessage(false));
     }
 
     switch (answer)
@@ -2345,17 +2355,16 @@ public:
                     ref_name, e.message());
                 return CaRelinkPromote::Unresolved;
             }
-            /// The same retryable class the staging half classifies: a body-absent precommit or a precommit
-            /// binding that is no longer the live owner (`ABORTED`), or a ref already committed with other
-            /// content (write-retry-later `NETWORK_ERROR`; an ownership conflict propagates). `promote` has
-            /// already abandoned the build on its way out, so the `+1` is released and the sender's
-            /// bytes are a sound recovery. Anything else propagates -- it is not a known-safe
+            /// Refused before its append, so nothing committed: `requireAlive`'s retry-later (`NETWORK_ERROR`)
+            /// for a build that a namespace drop cancelled or whose mount incarnation was superseded. A lost
+            /// owner or a ref conflict is refused inside the append and took the `Unresolved` arm above.
+            /// `promote` has already abandoned the build on its way out, so the `+1` is released and the
+            /// sender's bytes are a sound recovery. Anything else propagates -- it is not a known-safe
             /// mechanism failure, and the receiver must not silently turn it into a byte fetch.
-            if (e.code() != ErrorCodes::ABORTED && e.code() != ErrorCodes::NETWORK_ERROR)
+            if (e.code() != ErrorCodes::NETWORK_ERROR)
                 throw;
             LOG_INFO(getLogger("ContentAddressedMetadataStorage"),
-                "Relink of part {} could not be promoted (one of: body-absent precommit, precommit not the live "
-                "owner, a ref already committed with other content, a retry-later backend outcome; code {}): {}; the caller may fetch the bytes from the same source",
+                "Relink of part {} was refused before its promotion append (a cancelled or superseded build; code {}): {}; the caller may fetch the bytes from the same source",
                 ref_name, e.code(), e.message());
             return CaRelinkPromote::MechanismFallbackAllowed;
         }
@@ -2462,11 +2471,8 @@ CaRelinkPrepare ContentAddressedMetadataStorage::prepareAdoptFromManifest(
     }
     catch (const Exception & e)
     {
-        /// `ABORTED` or `NETWORK_ERROR` means a body-absent precommit, a precommit binding that is no
-        /// longer the live owner (`ABORTED`), a ref already committed with other content (write-retry-later
-        /// `NETWORK_ERROR`; an ownership conflict propagates), or — since the transient-classifier round — this node's
-        /// own mount fence refusing the work (`throwCasTransientUnavailable`): all retryable, and the
-        /// sender still has the part, so the caller may fetch its bytes. `prepareEntries` abandons its own
+        /// `ABORTED` or `NETWORK_ERROR` is the retryable class, this node's own mount fence refusing the work
+        /// (`throwCasTransientUnavailable`) included: the sender still has the part, so the caller may fetch its bytes. `prepareEntries` abandons its own
         /// build before propagating, so nothing is staged and no `+1` is left behind. The fence case needs
         /// no special handling and stays fail-close by construction: the byte fetch it falls back to writes
         /// through the SAME fenced disk and is refused in turn, so the fallback cannot smuggle a write past
@@ -2474,8 +2480,8 @@ CaRelinkPrepare ContentAddressedMetadataStorage::prepareAdoptFromManifest(
         /// that a byte fetch would do better.
         if (e.code() != ErrorCodes::ABORTED && e.code() != ErrorCodes::NETWORK_ERROR)
             throw;
-        LOG_INFO(getLogger("ContentAddressedMetadataStorage"), "Relink of part {} deferred (body-absent precommit, "
-            "precommit not the live owner, or a ref already committed with other content): {}; caller falls back to a byte fetch", part_path, e.message());
+        LOG_INFO(getLogger("ContentAddressedMetadataStorage"),
+            "Relink of part {} deferred by a retryable error: {}; caller falls back to a byte fetch", part_path, e.message());
         return CaRelinkPrepare::MechanismFallbackAllowed;
     }
 }

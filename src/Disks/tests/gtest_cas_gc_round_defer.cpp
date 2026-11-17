@@ -431,10 +431,10 @@ TEST(CASGCRoundDefer, DeferredRoundRetriesPartialJanitorPageAtForcedFoldWithoutP
     fixture::admitLive(*backend, layout, live_namespace);
     ASSERT_TRUE(std::holds_alternative<Committed>(op.create(
         layout.refCkptKey(fixture::fixtureLife(live_namespace)),
-        encodeRefCkpt(RefCkpt{
+        encodeRefCkptAtGeneration(RefCkpt{
             .life_epoch = std::optional<uint64_t>{1},
             .checkpoint_snapshot_id = std::nullopt,
-            .last_epoch_seal = std::nullopt}),
+            .last_epoch_seal = std::nullopt}, 1),
         Retry::once())));
 
     seedWaitingSweep(*backend, layout);

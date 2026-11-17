@@ -390,8 +390,8 @@ TEST(CASGCReadAhead, FoldIsIdenticalAtConcurrencyOneAndEight)
     EXPECT_EQ(one.deleted, eight.deleted);
 
     /// THE REQUEST-SET CLAIM. Every namespace here is healthy, so nothing is hinted that the walk
-    /// does not go on to read: the hints stop at the checkpoint ceiling the walk stops at, a quiet
-    /// namespace is not hinted at all, and every decoded log's manifest edges are all folded. So the
+    /// does not go on to read: the hints stop at the listed tail the walk reaches, a walk paused after
+    /// pass 1 hinted only keys it read, and every decoded log's manifest edges are all folded. So the
     /// read-ahead must issue the SAME GETs against the SAME keys, not merely produce the same answer.
     EXPECT_EQ(one.gets, eight.gets);
 

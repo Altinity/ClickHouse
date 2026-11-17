@@ -25,6 +25,7 @@ SETTINGS assign_part_uuids = 1, disk = disk(
     type = object_storage,
     object_storage_type = local,
     metadata_type = cas,
+    cas_unsafe_remount_no_delay = 1,
     cas_server_root_id = '${CLICKHOUSE_DATABASE}_04282',
     name = '${CLICKHOUSE_DATABASE}_04282_cas',
     path = '${CLICKHOUSE_DATABASE}_04282_cas_pool/');

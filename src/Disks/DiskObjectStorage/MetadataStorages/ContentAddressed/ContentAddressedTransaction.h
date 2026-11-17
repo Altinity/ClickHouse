@@ -6,6 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobHashingWriteBuffer.h>
 #include <Disks/WriteMode.h>
 #include <Common/ThreadPool_fwd.h>
+#include <atomic>
 #include <span>
 #include <Core/Defines.h>
 #include <IO/WriteBufferFromFile.h>
@@ -152,7 +153,17 @@ private:
         /// `staging_key` is either a private local temp path or an S3 staging object key returned by
         /// `CaContentWriteBuffer` at finalize. The backend selects the read-your-writes source; both
         /// kinds are removed by this transaction on commit and on abort.
-        struct PendingBlob { Cas::BlobRef ref; std::string staging_key; uint64_t size = 0; Cas::StagingBackend backend = Cas::StagingBackend::Local; };
+        struct PendingBlob
+        {
+            Cas::BlobRef ref;
+            std::string staging_key;
+            uint64_t size = 0;
+            Cas::StagingBackend backend = Cas::StagingBackend::Local;
+            /// The once-only verbatim-copy privilege of the staging object. A hardlink copies this
+            /// record into another part, and the copy shares the flag, so the parts together copy
+            /// the staged envelope at most once.
+            std::shared_ptr<std::atomic<bool>> publication_attempted = std::make_shared<std::atomic<bool>>(false);
+        };
         std::vector<PendingBlob> pending_blobs;    /// Staged blobs uploaded after the manifest edge is precommitted.
     };
 
