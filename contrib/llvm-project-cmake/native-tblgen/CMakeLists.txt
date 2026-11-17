@@ -200,9 +200,12 @@ else()
 endif()
 
 if (APPLE)
-    # Homebrew libc++ does not include <sys/resource.h>, which declares
-    # PRIO_DARWIN_THREAD / PRIO_DARWIN_BG used by CrashRecoveryContext.cpp.
-    add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-include>" "$<$<COMPILE_LANGUAGE:CXX>:sys/resource.h>")
+    # `CrashRecoveryContext.cpp` uses `PRIO_DARWIN_THREAD` / `PRIO_DARWIN_BG` without
+    # including `<sys/resource.h>`. LLVM PR 142733 dropped the include that used to
+    # provide them. LLVM PR 208065 adds the include; drop this once that revision
+    # is in the LLVM submodule.
+    set_source_files_properties(${LLVM_SOURCE_DIR}/lib/Support/CrashRecoveryContext.cpp
+        PROPERTIES COMPILE_OPTIONS "-include;sys/resource.h")
 endif()
 
 #
