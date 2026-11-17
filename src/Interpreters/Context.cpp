@@ -4689,7 +4689,7 @@ void Context::clearMarkCache() const
     JemallocCacheArena::purge();
 }
 
-void Context::setObjectStorageIdentityCache(const String & cache_policy, size_t max_size_in_bytes, double size_ratio, UInt64 ttl_seconds)
+void Context::setObjectStorageIdentityCache(const String & cache_policy, size_t max_size_in_bytes, double size_ratio)
 {
     std::lock_guard lock(shared->mutex);
 
@@ -4701,7 +4701,7 @@ void Context::setObjectStorageIdentityCache(const String & cache_policy, size_t 
     if (max_size_in_bytes == 0)
         return;
 
-    shared->object_storage_identity_cache = std::make_shared<ObjectStorageIdentityCache>(cache_policy, max_size_in_bytes, size_ratio, ttl_seconds);
+    shared->object_storage_identity_cache = std::make_shared<ObjectStorageIdentityCache>(cache_policy, max_size_in_bytes, size_ratio);
 }
 
 void Context::updateObjectStorageIdentityCacheConfiguration(const Poco::Util::AbstractConfiguration & config, size_t max_cache_size)
@@ -4711,7 +4711,6 @@ void Context::updateObjectStorageIdentityCacheConfiguration(const Poco::Util::Ab
     size_t size = config.getUInt64("object_storage_identity_cache_size", 67108864);
     if (size > max_cache_size)
         size = max_cache_size;
-    const auto ttl_seconds = config.getUInt64("object_storage_identity_cache_ttl", 3600);
 
     /// Startup with size 0 leaves the pointer unset. A reload that raises the size has to create the
     /// cache here: returning would keep every read uncached until the next process start.
@@ -4722,12 +4721,11 @@ void Context::updateObjectStorageIdentityCacheConfiguration(const Poco::Util::Ab
 
         const String policy = config.getString("object_storage_identity_cache_policy", "SLRU");
         const double size_ratio = config.getDouble("object_storage_identity_cache_size_ratio", 0.5);
-        shared->object_storage_identity_cache = std::make_shared<ObjectStorageIdentityCache>(policy, size, size_ratio, ttl_seconds);
+        shared->object_storage_identity_cache = std::make_shared<ObjectStorageIdentityCache>(policy, size, size_ratio);
         return;
     }
 
     shared->object_storage_identity_cache->setMaxSizeInBytes(size);
-    shared->object_storage_identity_cache->setTTLSeconds(ttl_seconds);
 }
 
 std::shared_ptr<ObjectStorageIdentityCache> Context::getObjectStorageIdentityCache() const

@@ -468,8 +468,7 @@ std::unique_ptr<WriteBufferFromFileBase> S3ObjectStorage::writeObject( /// NOLIN
         .connect_timeout_cap_ms = write_settings.object_storage_connect_timeout_cap_ms});
 
     /// Captured by value. The buffer can outlive this storage, and the cache itself is process-global.
-    const String identity_key = makeObjectStorageIdentityCacheKey(
-        uri.endpoint, used_client->getRegion(), uri.bucket, object.remote_path);
+    const String identity_key = makeObjectStorageIdentityCacheKey(uri.endpoint, uri.bucket, object.remote_path);
 
     return std::make_unique<WriteBufferFromS3>(
         used_client,
@@ -481,25 +480,11 @@ std::unique_ptr<WriteBufferFromFileBase> S3ObjectStorage::writeObject( /// NOLIN
         attributes,
         std::move(scheduler),
         disk_write_settings,
-        [identity_key](size_t size, std::optional<String> etag)
+        [identity_key]()
         {
-            auto global_context = Context::getGlobalContextInstance();
-            if (!global_context)
-                return;
-            auto cache = global_context->getObjectStorageIdentityCache();
-            if (!cache)
-                return;
-            /// An empty ETag means the upload replaced the object but the counted size must not be cached.
-            if (!etag || etag->empty())
-            {
-                cache->invalidate(identity_key);
-                return;
-            }
-            ObjectStorageIdentity identity;
-            identity.etag = std::move(*etag);
-            identity.size = size;
-            identity.is_size_known = true;
-            cache->replace(identity_key, std::move(identity));
+            if (auto global_context = Context::getGlobalContextInstance())
+                if (auto cache = global_context->getObjectStorageIdentityCache())
+                    cache->remove(identity_key);
         });
 }
 
@@ -1020,8 +1005,7 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
     /// and the request is issued uncached.
     const bool identity_only = !with_tags;
     /// Bucket and path alone collide when two endpoints reuse a bucket name.
-    const String identity_key = makeObjectStorageIdentityCacheKey(
-        uri.endpoint, client.get()->getRegion(), uri.bucket, path);
+    const String identity_key = makeObjectStorageIdentityCacheKey(uri.endpoint, uri.bucket, path);
 
     ObjectStorageIdentityCachePtr identity_cache;
     if (identity_only)
@@ -1046,11 +1030,6 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
             }
         }
     }
-
-    /// Captured after the miss and before the request. `setIfEpoch` refuses the result when a write
-    /// bumps the generation while this request is in flight, so the old size and ETag cannot replace
-    /// the identity published by that write.
-    const UInt64 identity_epoch = identity_cache ? identity_cache->epochOf(identity_key) : 0;
 
     auto settings_ptr = s3_settings.get();
 
@@ -1119,10 +1098,9 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
     }
 
     if (identity_cache)
-        identity_cache->setIfEpoch(
+        identity_cache->set(
             identity_key,
-            ObjectStorageIdentity{result.etag, result.size_bytes, result.is_size_known, result.part_offsets},
-            identity_epoch);
+            ObjectStorageIdentity{result.etag, result.size_bytes, result.is_size_known, result.part_offsets});
 
     return result;
 }
@@ -1453,7 +1431,7 @@ void S3ObjectStorage::invalidateCachedIdentity(const std::string & path) const
     auto cache = global_context->getObjectStorageIdentityCache();
     if (!cache)
         return;
-    cache->invalidate(makeObjectStorageIdentityCacheKey(uri.endpoint, client.get()->getRegion(), uri.bucket, path));
+    cache->remove(makeObjectStorageIdentityCacheKey(uri.endpoint, uri.bucket, path));
 }
 
 std::shared_ptr<const S3::Client> S3ObjectStorage::clientForRetryProfile(const ObjectStorageControlRequest & request) const

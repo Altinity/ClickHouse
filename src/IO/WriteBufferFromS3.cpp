@@ -243,15 +243,14 @@ void WriteBufferFromS3::finalizeImpl()
     }
     catch (...)
     {
-        /// The upload already replaced the object. Tell the caller not to keep the previous identity,
-        /// and not to cache the size this buffer counted.
+        /// The upload already replaced the object. Drop any identity cached for the previous one.
         if (on_upload_complete)
-            on_upload_complete(0, std::nullopt);
+            on_upload_complete();
         throw;
     }
 
     if (on_upload_complete)
-        on_upload_complete(total_size, object_etag);
+        on_upload_complete();
 }
 
 void WriteBufferFromS3::cancelImpl() noexcept

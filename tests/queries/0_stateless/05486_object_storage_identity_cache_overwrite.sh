@@ -4,10 +4,9 @@
 # Tag no-parallel: the identity cache is process-global, and another test may clear it
 # Tag no-parallel-replicas: per-query S3 request counts change when a read is spread across replicas
 
-# Overwriting an object must not leave the previous size and ETag in the identity cache.
-# The upload stores the new size and ETag, so the following read is a hit and does not HEAD.
-# The second insert is longer than the first. s3_validate_etag_on_read is off, so a stale
-# cached size would be the read bound and the new rows would be truncated.
+# Overwriting an object drops its identity-cache entry. The next read misses and HEADs, so it
+# sees the new size. The second insert is longer than the first. s3_validate_etag_on_read is off,
+# so a stale cached size would be the read bound and the new rows would be truncated.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -90,11 +89,12 @@ insert_values()
 ${CLICKHOUSE_CLIENT} -q "SYSTEM CLEAR OBJECT STORAGE IDENTITY CACHE" || fail "clear failed"
 
 insert_values "SELECT 1"
-# The insert published the short object's identity, so this read does not HEAD.
-read_and_check short $'1' eq0 ge1 eq0
+read_and_check short_cold $'1' ge1 eq0 ge1
+read_and_check short_warm $'1' eq0 ge1 eq0
 
-# No CLEAR between the inserts. The cache is holding the short object's size until the upload replaces it.
+# No CLEAR. The upload drops the cached identity, so the next read misses and returns every new row.
 insert_values "SELECT 10 UNION ALL SELECT 20 UNION ALL SELECT 30"
-read_and_check overwritten $'10\n20\n30' eq0 ge1 eq0
+read_and_check overwritten $'10\n20\n30' ge1 eq0 ge1
+read_and_check overwritten_warm $'10\n20\n30' eq0 ge1 eq0
 
 echo OK

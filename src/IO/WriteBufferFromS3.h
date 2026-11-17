@@ -37,9 +37,8 @@ class TaskTracker;
 class WriteBufferFromS3 final : public WriteBufferFromFileBase
 {
 public:
-    /// Called after a successful upload, including when the post-upload size check fails.
-    /// `etag` is empty when the uploaded bytes must not be cached (the size check disagreed).
-    using OnUploadComplete = std::function<void(size_t total_size, std::optional<String> etag)>;
+    /// Called after the upload has replaced the object, including when the post-upload size check fails.
+    using OnUploadComplete = std::function<void()>;
 
     WriteBufferFromS3(
         std::shared_ptr<const S3::Client> client_ptr_,
