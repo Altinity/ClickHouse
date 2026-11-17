@@ -1019,10 +1019,10 @@ std::optional<ObjectMetadata> S3ObjectStorage::tryGetObjectMetadataImpl(
 
 ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool with_tags) const
 {
-    return getObjectMetadata(path, with_tags, /*use_identity_cache=*/ true);
+    return getObjectMetadataImpl(path, with_tags, /*use_identity_cache=*/ true);
 }
 
-ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool with_tags, bool use_identity_cache) const
+ObjectMetadata S3ObjectStorage::getObjectMetadataImpl(const std::string & path, bool with_tags, bool use_identity_cache) const
 {
     /// When the caller only needs identity (size / etag / Last-Modified, not tags or user metadata) we
     /// take a fast path: consult the identity cache to skip the HEAD on repeat opens. A miss issues a
