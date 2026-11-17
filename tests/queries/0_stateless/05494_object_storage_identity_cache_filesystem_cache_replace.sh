@@ -13,7 +13,10 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$CUR_DIR"/../shell_config.sh
 
 URL="http://localhost:11111/test/${CLICKHOUSE_TEST_UNIQUE_NAME}.tsv"
-READ_SETTINGS="max_threads = 1, use_hive_partitioning = 0, parallel_replicas_for_cluster_engines = 0, enable_filesystem_cache = 1, filesystem_cache_name = 'cache_for_readbigat', use_page_cache_for_object_storage = 0, s3_validate_etag_on_read = 1, use_object_storage_list_objects_cache = 0"
+# Pin populate-on-miss. The stateless runner can set
+# `read_from_filesystem_cache_if_exists_otherwise_bypass_cache` to 1, and then a miss is read from
+# S3 and not stored, so the second read still issues a GET.
+READ_SETTINGS="max_threads = 1, use_hive_partitioning = 0, parallel_replicas_for_cluster_engines = 0, enable_filesystem_cache = 1, filesystem_cache_name = 'cache_for_readbigat', read_from_filesystem_cache_if_exists_otherwise_bypass_cache = 0, use_page_cache_for_object_storage = 0, s3_validate_etag_on_read = 1, use_object_storage_list_objects_cache = 0"
 
 fail()
 {
