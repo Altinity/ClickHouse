@@ -780,8 +780,9 @@ bool applyTrivialCountIfPossible(
     /// Set a special flag in query info so the storage will see it and optimize count in read() method.
     select_query_info.optimize_trivial_count = true;
 
-    /// Get number of rows
-    std::optional<UInt64> num_rows = storage->totalRows(query_context);
+    /// Get number of rows in the snapshot this query pinned, so a count does not re-resolve table metadata.
+    const auto & storage_snapshot = table_node ? table_node->getStorageSnapshot() : table_function_node->getStorageSnapshot();
+    std::optional<UInt64> num_rows = storage->totalRowsInSnapshot(storage_snapshot, query_context);
     if (!num_rows)
         return false;
 
