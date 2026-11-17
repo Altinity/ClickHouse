@@ -6,9 +6,13 @@ from helpers.iceberg_utils import (
     execute_spark_query_general,
 )
 
-@pytest.mark.parametrize("join_mode", ["allow", "local", "global", "distributed"])
+@pytest.mark.parametrize(
+    "join_mode, distributed_join",
+    [("allow", 0), ("local", 0), ("global", 0), ("allow", 1)],
+    ids=["allow", "local", "global", "allow-distributed"],
+)
 @pytest.mark.parametrize("storage_type", ["s3", "azure"])
-def test_cluster_joins(started_cluster_iceberg_with_spark, storage_type, join_mode):
+def test_cluster_joins(started_cluster_iceberg_with_spark, storage_type, join_mode, distributed_join):
     instance = started_cluster_iceberg_with_spark.instances["node1"]
     spark = started_cluster_iceberg_with_spark.spark_session
     TABLE_NAME = "test_cluster_joins_" + storage_type + "_" + get_uuid_str()
@@ -88,7 +92,8 @@ def test_cluster_joins(started_cluster_iceberg_with_spark, storage_type, join_mo
             ORDER BY ALL
             SETTINGS
                 object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='{join_mode}'
+                object_storage_cluster_join_mode='{join_mode}',
+                allow_object_storage_cluster_distributed_join={distributed_join}
         """
     )
 
@@ -105,7 +110,8 @@ def test_cluster_joins(started_cluster_iceberg_with_spark, storage_type, join_mo
             ORDER BY ALL
             SETTINGS
                 object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='{join_mode}'
+                object_storage_cluster_join_mode='{join_mode}',
+                allow_object_storage_cluster_distributed_join={distributed_join}
         """
     )
 
@@ -122,7 +128,8 @@ def test_cluster_joins(started_cluster_iceberg_with_spark, storage_type, join_mo
             ORDER BY ALL
             SETTINGS
                 object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='{join_mode}'
+                object_storage_cluster_join_mode='{join_mode}',
+                allow_object_storage_cluster_distributed_join={distributed_join}
         """
     )
 
@@ -138,7 +145,8 @@ def test_cluster_joins(started_cluster_iceberg_with_spark, storage_type, join_mo
             ORDER BY ALL
             SETTINGS
                 object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='{join_mode}'
+                object_storage_cluster_join_mode='{join_mode}',
+                allow_object_storage_cluster_distributed_join={distributed_join}
         """
     )
 
@@ -155,7 +163,8 @@ def test_cluster_joins(started_cluster_iceberg_with_spark, storage_type, join_mo
             ORDER BY ALL
             SETTINGS
                 object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='{join_mode}'
+                object_storage_cluster_join_mode='{join_mode}',
+                allow_object_storage_cluster_distributed_join={distributed_join}
         """
     )
 
@@ -172,7 +181,8 @@ def test_cluster_joins(started_cluster_iceberg_with_spark, storage_type, join_mo
             ORDER BY ALL
             SETTINGS
                 object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='{join_mode}'
+                object_storage_cluster_join_mode='{join_mode}',
+                allow_object_storage_cluster_distributed_join={distributed_join}
         """
     )
 
@@ -187,7 +197,8 @@ def test_cluster_joins(started_cluster_iceberg_with_spark, storage_type, join_mo
             ORDER BY ALL
             SETTINGS
                 object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='{join_mode}'
+                object_storage_cluster_join_mode='{join_mode}',
+                allow_object_storage_cluster_distributed_join={distributed_join}
         """
     )
 
@@ -202,7 +213,8 @@ def test_cluster_joins(started_cluster_iceberg_with_spark, storage_type, join_mo
             ORDER BY ALL
             SETTINGS
                 object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='{join_mode}'
+                object_storage_cluster_join_mode='{join_mode}',
+                allow_object_storage_cluster_distributed_join={distributed_join}
         """
     )
 
@@ -219,7 +231,8 @@ def test_cluster_joins(started_cluster_iceberg_with_spark, storage_type, join_mo
             ORDER BY ALL
             SETTINGS
                 object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='{join_mode}'
+                object_storage_cluster_join_mode='{join_mode}',
+                allow_object_storage_cluster_distributed_join={distributed_join}
         """
     )
 
@@ -236,7 +249,8 @@ def test_cluster_joins(started_cluster_iceberg_with_spark, storage_type, join_mo
             ORDER BY ALL
             SETTINGS
                 object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='{join_mode}'
+                object_storage_cluster_join_mode='{join_mode}',
+                allow_object_storage_cluster_distributed_join={distributed_join}
         """
     )
 
