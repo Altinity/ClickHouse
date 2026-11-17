@@ -16,6 +16,7 @@ def start_cluster():
         image="altinity/clickhouse-server",
         tag=OLD_TAG,
         with_installed_binary=True,
+        installed_binary_supports_cas_logs=True,
         with_rustfs=True,
         stay_alive=True,
     )
