@@ -7,6 +7,7 @@
 # An identity-cache hit still has the previous size and ETag. Two decisions use that metadata and
 # then do not GET: s3_skip_empty_files (default on) skips a cached size of 0, and the query condition
 # cache skips a file whose cached ETag matched no row group. An external replace must still be read.
+# A condition-cache re-HEAD that finds an empty replacement must skip it, not open it.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -129,5 +130,68 @@ qcc_heads=$(${CLICKHOUSE_CLIENT} -q "
 [[ $qcc_heads -ge 1 ]] || fail "qcc replaced did not HEAD (S3HeadObject=${qcc_heads})"
 
 ${CLICKHOUSE_CLIENT} -q "DROP TABLE ${TABLE}" || fail "drop table at end failed"
+
+# --- A condition-cache re-HEAD that finds an empty replacement must skip it, not open it. ---
+
+EMPTY_PARQUET_URL="http://localhost:11111/test/${CLICKHOUSE_TEST_UNIQUE_NAME}_qcc_empty.parquet"
+EMPTY_TABLE="idcache_skip_qcc_empty_${CLICKHOUSE_DATABASE}"
+
+${CLICKHOUSE_CLIENT} -q "SYSTEM CLEAR OBJECT STORAGE IDENTITY CACHE" || fail "clear identity cache before empty parquet failed"
+${CLICKHOUSE_CLIENT} -q "SYSTEM DROP QUERY CONDITION CACHE" || fail "drop query condition cache before empty parquet failed"
+${CLICKHOUSE_CLIENT} -q "DROP TABLE IF EXISTS ${EMPTY_TABLE}" || fail "drop empty parquet table failed"
+
+${CLICKHOUSE_CLIENT} -q "
+    CREATE TABLE ${EMPTY_TABLE} (n UInt64)
+    ENGINE = S3('${EMPTY_PARQUET_URL}', 'test', 'testtest', 'Parquet')" || fail "create empty parquet table failed"
+
+${CLICKHOUSE_CLIENT} -q "
+    INSERT INTO ${EMPTY_TABLE} SELECT toUInt64(1)
+    SETTINGS s3_truncate_on_insert = 1" || fail "empty parquet insert failed"
+
+empty_qcc_first=$(${CLICKHOUSE_CLIENT} -q "
+    SELECT count() FROM ${EMPTY_TABLE} WHERE n = 3 SETTINGS ${FILTER_SETTINGS}") || fail "empty parquet first select failed"
+[[ $empty_qcc_first == "0" ]] || fail "empty parquet first: '${empty_qcc_first}', expected 0"
+
+empty_qcc_warm_qid="idcache_skip_qcc_empty_warm_${CLICKHOUSE_DATABASE}"
+empty_qcc_warm=$(${CLICKHOUSE_CLIENT} --query_id "$empty_qcc_warm_qid" -q "
+    SELECT count() FROM ${EMPTY_TABLE} WHERE n = 3 SETTINGS ${FILTER_SETTINGS}") || fail "empty parquet warm select failed"
+[[ $empty_qcc_warm == "0" ]] || fail "empty parquet warm: '${empty_qcc_warm}', expected 0"
+
+${CLICKHOUSE_CLIENT} -q "SYSTEM FLUSH LOGS query_log" || fail "flush logs before empty parquet hit check failed"
+empty_qcc_hits=$(${CLICKHOUSE_CLIENT} -q "
+    SELECT ProfileEvents['QueryConditionCacheHits']
+    FROM system.query_log
+    WHERE event_date >= yesterday()
+        AND event_time >= now() - 600
+        AND type = 'QueryFinish'
+        AND query_id = '${empty_qcc_warm_qid}'
+        AND current_database = currentDatabase()
+    ORDER BY event_time_microseconds DESC
+    LIMIT 1
+    FORMAT TabSeparated") || fail "empty parquet warm query_log failed"
+[[ $empty_qcc_hits -ge 1 ]] || fail "empty parquet warm was not a condition-cache hit (QueryConditionCacheHits=${empty_qcc_hits})"
+
+curl -fsS -X PUT "$EMPTY_PARQUET_URL" --data-binary '' >/dev/null || fail "empty parquet replace put failed"
+
+empty_qcc_replaced_qid="idcache_skip_qcc_empty_replaced_${CLICKHOUSE_DATABASE}"
+empty_qcc_replaced=$(${CLICKHOUSE_CLIENT} --query_id "$empty_qcc_replaced_qid" -q "
+    SELECT count() FROM ${EMPTY_TABLE} WHERE n = 3 SETTINGS ${FILTER_SETTINGS}") || fail "empty parquet replaced select failed"
+[[ $empty_qcc_replaced == "0" ]] || fail "empty parquet replaced: '${empty_qcc_replaced}', expected 0"
+
+${CLICKHOUSE_CLIENT} -q "SYSTEM FLUSH LOGS query_log" || fail "flush logs after empty parquet replace failed"
+empty_qcc_heads=$(${CLICKHOUSE_CLIENT} -q "
+    SELECT ProfileEvents['S3HeadObject']
+    FROM system.query_log
+    WHERE event_date >= yesterday()
+        AND event_time >= now() - 600
+        AND type = 'QueryFinish'
+        AND query_id = '${empty_qcc_replaced_qid}'
+        AND current_database = currentDatabase()
+    ORDER BY event_time_microseconds DESC
+    LIMIT 1
+    FORMAT TabSeparated") || fail "empty parquet replaced query_log failed"
+[[ $empty_qcc_heads -ge 1 ]] || fail "empty parquet replaced did not HEAD (S3HeadObject=${empty_qcc_heads})"
+
+${CLICKHOUSE_CLIENT} -q "DROP TABLE ${EMPTY_TABLE}" || fail "drop empty parquet table at end failed"
 
 echo OK

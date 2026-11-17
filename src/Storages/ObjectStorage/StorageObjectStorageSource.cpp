@@ -1229,6 +1229,17 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
                     && !configuration->isDataLakeConfiguration())
                 {
                     revalidateIdentityCachedObjectMetadata(*object_info, object_storage);
+
+                    /// The empty-file check above already ran, against the previous size. A replaced
+                    /// object can be empty, and reading it throws for formats such as Parquet.
+                    /// `s3_skip_empty_files` defaults to true.
+                    const auto refreshed = object_info->getObjectMetadata();
+                    if (query_settings.skip_empty_files && refreshed
+                        && refreshed->is_size_known && refreshed->size_bytes == 0)
+                    {
+                        skip_object = true;
+                        break;
+                    }
                     continue;
                 }
 
