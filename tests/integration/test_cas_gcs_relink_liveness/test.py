@@ -46,7 +46,11 @@ def start_cluster():
     for name in NODES:
         cluster.add_instance(name, macros={"replica": name}, with_zookeeper=True, stay_alive=True)
     cluster.add_instance(
-        GCS_HOST, hostname=GCS_HOST, image="altinityinfra/python-bottle", tag="latest", stay_alive=True
+        GCS_HOST,
+        hostname=GCS_HOST,
+        image="altinityinfra/python-bottle",
+        tag=os.environ.get("DOCKER_PYTHON_BOTTLE_TAG", "latest"),
+        stay_alive=True,
     )
     try:
         cluster.start()
