@@ -37,7 +37,8 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     const ContextPtr & context_,
     const LoggerPtr & log,
     const std::optional<ReadSettings> & read_settings = std::nullopt,
-    bool allow_page_cache = true);
+    bool allow_page_cache = true,
+    bool revalidate_identity_for_parquet_metadata_cache = false);
 
 ASTs::iterator getFirstKeyValueArgument(ASTs & args);
 std::unordered_map<std::string, Field> parseKeyValueArguments(const ASTs & function_args, ContextPtr context);

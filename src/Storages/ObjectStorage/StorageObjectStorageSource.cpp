@@ -1462,8 +1462,21 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         {
             ProfileEvents::increment(ProfileEvents::ObjectStorageReadObjects);
             compression_method = chooseCompressionMethod(object_info->getFileName(), configuration->compression_method);
+            /// A Parquet `count()` reads the cached footer and does not GET, so `If-Match` never
+            /// rejects a replaced object. Re-HEAD before that ETag keys the parquet metadata cache.
+            /// A read that does GET still checks the ETag there and does not pay this HEAD.
+            const bool revalidate_identity_for_parquet_metadata_cache =
+                effective_need_only_count
+                && context_->getSettingsRef()[Setting::use_parquet_metadata_cache]
+                && Poco::toLower(format_name) == "parquet";
             read_buf = createReadBuffer(
-                object_info->relative_path_with_metadata, object_info->getResolvedStorage(object_storage), context_, log, std::nullopt, !headers_requested);
+                object_info->relative_path_with_metadata,
+                object_info->getResolvedStorage(object_storage),
+                context_,
+                log,
+                std::nullopt,
+                !headers_requested,
+                revalidate_identity_for_parquet_metadata_cache);
         }
 
         Block initial_header = read_from_format_info.format_header;
@@ -1933,7 +1946,8 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     const ContextPtr & context_,
     const LoggerPtr & log,
     const std::optional<ReadSettings> & read_settings,
-    bool allow_page_cache)
+    bool allow_page_cache,
+    bool revalidate_identity_for_parquet_metadata_cache)
 {
     const auto & settings = context_->getSettingsRef();
     const auto & effective_read_settings = read_settings.has_value() ? read_settings.value() : context_->getReadSettings();
@@ -1991,13 +2005,14 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
         object_info.metadata = object_storage->getObjectMetadata(object_info, /*with_tags=*/ false);
     }
 
-    /// A filesystem or page cache hit never issues the GET, so it cannot notice that the object was
-    /// replaced. Re-read the identity before using its ETag as the cache key. An unchanged object keeps
-    /// the same key and is served from the cache. A replaced object gets a new key and is read again.
+    /// A filesystem, page, or parquet-metadata cache hit never issues the GET, so it cannot notice
+    /// that the object was replaced. Re-read the identity before using its ETag as the cache key.
+    /// An unchanged object keeps the same key. A replaced object gets a new key and is read again.
+    /// The parquet flag is only a footer-only count: other Parquet reads still check the ETag on GET.
     /// This refresh is a HEAD. `GetObjectAttributes` does not return Last-Modified, so using it here
     /// would make this read's `_time` NULL and replace the cached time with "not observed". Part offsets
     /// already stored for the same ETag are kept by `setIfEpoch`.
-    if ((use_filesystem_cache || use_page_cache)
+    if ((use_filesystem_cache || use_page_cache || revalidate_identity_for_parquet_metadata_cache)
         && object_info.metadata
         && object_info.metadata->is_from_identity_cache
         && object_info.metadata->is_size_known
