@@ -8,6 +8,8 @@
     <storage_configuration>
         <policies>
             <cas_tiered>
+                <!-- Placement tests must not depend on the host's free space. -->
+                <move_factor>0</move_factor>
                 <volumes>
                     <hot>
                         <disk>default</disk>
