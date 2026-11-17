@@ -481,6 +481,141 @@ TEST(CASSweepDeletionPremise, RecoveryWorkBudgetRetainsAndConvergesWithoutWedgin
             << "candidate " << i << " must survive: it was never proven safe to delete";
 }
 
+namespace
+{
+
+/// A writer that stays ahead of the reader: every GET of a ref log under `log_prefix` first appends the
+/// next record of epoch 1, until `max_appends`.
+class AppendOnRefLogReadBackend final : public CountingBackend
+{
+public:
+    void arm(Layout layout_, RootNamespace ns_, String log_prefix_, uint64_t next_sequence_, uint64_t max_appends_)
+    {
+        std::lock_guard lock(append_mutex);
+        layout = std::move(layout_);
+        ns = std::move(ns_);
+        log_prefix = std::move(log_prefix_);
+        next_sequence = next_sequence_;
+        max_appends = max_appends_;
+    }
+
+    void disarm()
+    {
+        std::lock_guard lock(append_mutex);
+        log_prefix.clear();
+    }
+
+    uint64_t appends() const
+    {
+        std::lock_guard lock(append_mutex);
+        return appended;
+    }
+
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        /// The append itself reads through this backend; those reads must not append or re-lock.
+        static thread_local bool appending = false;
+        if (!appending)
+        {
+            std::lock_guard lock(append_mutex);
+            if (!log_prefix.empty() && key.starts_with(log_prefix) && appended < max_appends)
+            {
+                const uint64_t sequence = next_sequence++;
+                appending = true;
+                try
+                {
+                    fixture::writeRefLogRaw(*this, *layout, RefLogTxn{ns.string(), RefTxnId{kBuildEpoch, sequence},
+                        publishCommittedOps("live" + std::to_string(sequence), ref(10000 + sequence, 1)), std::nullopt});
+                }
+                catch (...)
+                {
+                    appending = false;
+                    throw;
+                }
+                appending = false;
+                ++appended;
+            }
+        }
+        return CountingBackend::read(key, access);
+    }
+
+private:
+    mutable std::mutex append_mutex;
+    std::optional<Layout> layout;
+    RootNamespace ns{"unset"};
+    String log_prefix;
+    uint64_t next_sequence = 0;
+    uint64_t max_appends = 0;
+    uint64_t appended = 0;
+};
+
+}
+
+/// The owner replay of a generation 3 chain has no stored end and follows records appended while it runs.
+/// The round's recovery budget stops it: the namespace is retained, nothing of it is deleted, and a later
+/// round over a quiet writer completes it.
+TEST(CASSweepDeletionPremise, OwnerReplayRacingAWriterStopsAtTheRecoveryBudget)
+{
+    auto backend = std::make_shared<AppendOnRefLogReadBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef orphan = ref(5, 0xAB);
+    casAdmitEntry(*backend, layout, ns);
+    const NamespaceLifeId life = fixture::fixtureLife(ns);
+
+    /// A tail longer than the read-ahead window, so a hinted GET never runs past the end.
+    constexpr uint64_t kInitialTail = 16;
+    for (uint64_t sequence = 1; sequence <= kInitialTail; ++sequence)
+    {
+        std::vector<RefOp> ops = publishCommittedOps("seed" + std::to_string(sequence), ref(1000 + sequence, 1));
+        if (sequence == 1)
+            ops.insert(ops.begin(), namespaceBirthOp());
+        fixture::writeRefLogRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{kBuildEpoch, sequence}, ops, std::nullopt});
+    }
+    {
+        OperationForTest op(*backend);
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(
+            layout.refCkptKey(life), encodeRefCkptAtGeneration(refCkptOf(kBuildEpoch), G_REF_CHAIN), Retry::standard())));
+    }
+    writeManifestRaw(*backend, layout, ns, orphan, {blobEntryFor("a", DB::UInt128(1))});
+    /// Past epoch 1's seal, so the orphan is deletable once the namespace's view is complete.
+    seedCursorAt(*backend, layout, ns, RefTxnId{kBuildEpoch + 1, 1});
+    setWatermarkMinActive(*backend, layout, kServerRoot, kBuildEpoch, /*min_active_build_sequence*/6);
+    const String orphan_key = layout.manifestKey(ManifestId{ns, orphan});
+    const auto orphan_exists = [&]
+    {
+        OperationForTest op(*backend);
+        return (*op).head(orphan_key, Retry::once()).has_value();
+    };
+
+    /// Far above the budget plus the read-ahead window: reaching it means the walk was not stopped.
+    constexpr uint64_t kMaxAppends = 2000;
+    constexpr uint64_t kRecoveryOps = 50;
+    /// The hinted GETs the reader sends ahead of the record the budget charged.
+    constexpr uint64_t kReadAheadSlack = 8;
+    backend->arm(layout, ns, layout.namespaceStreamPrefix(life) + "_log/", kInitialTail + 1, kMaxAppends);
+    {
+        GcRoundWorkBudget budget;
+        budget.max_sweep_recovery_ops = kRecoveryOps;
+        const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget*/100, /*delete_budget*/10, &budget);
+        EXPECT_LE(backend->appends(), kRecoveryOps + kReadAheadSlack) << "the owner replay read past the round's recovery budget";
+        EXPECT_EQ(result.deleted, 0u);
+        EXPECT_EQ(result.retained_work_budget, 1u);
+        EXPECT_TRUE(orphan_exists());
+    }
+
+    backend->disarm();
+    {
+        GcRoundWorkBudget budget;
+        budget.max_sweep_recovery_ops = kMaxAppends;
+        const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget*/100, /*delete_budget*/10, &budget);
+        EXPECT_EQ(result.retained_work_budget, 0u);
+        EXPECT_EQ(result.deleted, 1u);
+        EXPECT_FALSE(orphan_exists());
+    }
+}
+
 /// The per-page NAMESPACE cap. Two otherwise-independently-deletable
 /// namespaces share one page; with `max_sweep_namespaces = 1`, only the first namespace this page
 /// touches gets a protection view built at all -- the second is retained under the work-budget cause,

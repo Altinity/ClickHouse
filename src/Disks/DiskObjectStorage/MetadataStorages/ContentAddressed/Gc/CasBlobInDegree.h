@@ -293,8 +293,8 @@ struct GcRoundWorkBudget
     /// Orphan-manifest planner (`planManifestCursorPage` / `activeManifestKeys`): how many DISTINCT
     /// namespaces the sweep may build a fresh protection view for in total this round (cumulative
     /// across pages, not per page), and how many ref-log GET/decode
-    /// operations the committed-tail recovery walk may spend in total across every namespace this
-    /// round. Both caps exist because building a namespace's protection view (a catalog-authoritative
+    /// operations the owner recovery and the committed-tail walk may spend in total across every
+    /// namespace this round. Both caps exist because building a namespace's protection view (a catalog-authoritative
     /// table recovery plus a committed-tail walk) is the expensive, potentially-unbounded step the
     /// nomination/list budgets never covered.
     uint64_t max_sweep_namespaces = 0;

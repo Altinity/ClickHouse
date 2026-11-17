@@ -1203,6 +1203,18 @@ std::optional<RecoveredRefTable> recoverRefTableDetailedFromAuthority(
     CasOperation & op, const Layout & layout, const std::optional<CatalogEntry> & catalog_entry,
     const std::optional<CkptSample> & ckpt, KeyReader * reader)
 {
+    BoundedRefRecovery recovery
+        = recoverRefTableDetailedFromAuthorityBounded(op, layout, catalog_entry, ckpt, reader, /*may_read_next=*/{});
+    chassert(recovery.end != BoundedRefRecovery::End::Stopped);
+    if (recovery.end != BoundedRefRecovery::End::Recovered)
+        return std::nullopt;
+    return std::move(recovery.table);
+}
+
+BoundedRefRecovery recoverRefTableDetailedFromAuthorityBounded(
+    CasOperation & op, const Layout & layout, const std::optional<CatalogEntry> & catalog_entry,
+    const std::optional<CkptSample> & ckpt, KeyReader * reader, const std::function<bool()> & may_read_next)
+{
     /// The frozen catalog row and `_ckpt` sample supplied by the caller ground the walk; this function
     /// must not re-read the catalog, or enumerate the stream, because that would splice unrelated
     /// physical observations into the caller's one authority cut.
@@ -1226,7 +1238,7 @@ std::optional<RecoveredRefTable> recoverRefTableDetailedFromAuthority(
         catch (const Exception & e)
         {
             if (restartsOnMovedBase(e.code(), op, layout, life, ckpt->etag))
-                return std::nullopt;
+                return BoundedRefRecovery{.end = BoundedRefRecovery::End::BaseMoved, .table = std::nullopt};
             throw;
         }
     }
@@ -1247,7 +1259,7 @@ std::optional<RecoveredRefTable> recoverRefTableDetailedFromAuthority(
             replay_failed = true;
             throw;
         }
-        return true;
+        return !may_read_next || may_read_next();
     };
 
     RefChainWalk walk;
@@ -1263,19 +1275,23 @@ std::optional<RecoveredRefTable> recoverRefTableDetailedFromAuthority(
     catch (const Exception & e)
     {
         if (replay_failed && restartsOnMovedBase(e.code(), op, layout, life, ckpt->etag))
-            return std::nullopt;
+            return BoundedRefRecovery{.end = BoundedRefRecovery::End::BaseMoved, .table = std::nullopt};
         throw;
     }
     if (walk.end == RefChainEnd::BaseMoved)
-        return std::nullopt;
+        return BoundedRefRecovery{.end = BoundedRefRecovery::End::BaseMoved, .table = std::nullopt};
+    if (walk.end == RefChainEnd::Stopped)
+        return BoundedRefRecovery{.end = BoundedRefRecovery::End::Stopped, .table = std::nullopt};
 
     RecoveryResult result = std::move(builder).finish();
-    return RecoveredRefTable{
-        .state = std::move(result.state),
-        .newest_snapshot_id = result.newest_snapshot_id,
-        .open_transition = walk.open_transition,
-        .end = walk.end,
-        .next_key = walk.next_key};
+    return BoundedRefRecovery{
+        .end = BoundedRefRecovery::End::Recovered,
+        .table = RecoveredRefTable{
+            .state = std::move(result.state),
+            .newest_snapshot_id = result.newest_snapshot_id,
+            .open_transition = walk.open_transition,
+            .end = walk.end,
+            .next_key = walk.next_key}};
 }
 
 }

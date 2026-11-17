@@ -886,4 +886,29 @@ std::optional<RecoveredRefTable> recoverRefTableDetailedFromAuthority(
     CasOperation & op, const Layout & layout, const std::optional<CatalogEntry> & catalog_entry,
     const std::optional<CkptSample> & ckpt, KeyReader * reader = nullptr);
 
+/// How `recoverRefTableDetailedFromAuthorityBounded` ended. Only `Recovered` carries a table: a stopped
+/// walk replayed a prefix of the chain, and a prefix taken for the whole owner set would let a caller
+/// delete an owned manifest.
+struct BoundedRefRecovery
+{
+    enum class End : uint8_t
+    {
+        Recovered,
+        /// The base moved under the base load or the walk; the caller decides whether to re-read `_ckpt`.
+        BaseMoved,
+        /// `may_read_next` returned false.
+        Stopped,
+    };
+    End end = End::Recovered;
+    std::optional<RecoveredRefTable> table;
+};
+
+/// `recoverRefTableDetailedFromAuthority` with a bound for a caller inside a GC round: the chain has no
+/// stored end under generation 3 and the walk follows records appended while it runs. `may_read_next`,
+/// when set, is called after each replayed record; false stops the walk. Reads the reader had already
+/// hinted are discarded, not stopped.
+BoundedRefRecovery recoverRefTableDetailedFromAuthorityBounded(
+    CasOperation & op, const Layout & layout, const std::optional<CatalogEntry> & catalog_entry,
+    const std::optional<CkptSample> & ckpt, KeyReader * reader, const std::function<bool()> & may_read_next);
+
 }

@@ -580,7 +580,7 @@ TEST(CASOrphanSweepRequests, EpochCrossingDiscardsAtMostOneWindowAndTheNewEpochI
     /// mechanics of the ref-log walks a namespace's first candidate triggers, not about the listing.
     EXPECT_EQ(result.listed, 48u);
     /// The SAME reader crosses the epoch twice on this fixture: once inside the recovery walk
-    /// `activeManifestKeys` runs via `recoverRefTableDetailedFromAuthority`, and again in its own
+    /// `activeManifestKeys` runs via `recoverRefTableDetailedFromAuthorityBounded`, and again in its own
     /// committed-tail walk over the same {1,1}..{2,40} range (today's pre-existing double walk, not
     /// something this change introduces) -- so at most two windows are discarded, not one.
     EXPECT_LE(wasted, 128u) << "at most two windows at concurrency 16: one per walk crossing the epoch";

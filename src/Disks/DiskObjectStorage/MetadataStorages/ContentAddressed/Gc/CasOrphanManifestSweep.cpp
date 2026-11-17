@@ -231,7 +231,7 @@ struct NamespaceProtection
 {
     std::set<String> active;
     std::set<String> tail_removal_targets;
-    /// Set when `work_budget`'s recovery-op cap stopped the walk, or was already spent by an earlier
+    /// Set when `work_budget`'s recovery-op cap stopped either walk, or was already spent by an earlier
     /// namespace this round. `active`/`tail_removal_targets` are then a PARTIAL view: the caller retains
     /// every one of this namespace's candidates on the current page.
     bool recovery_incomplete = false;
@@ -254,9 +254,11 @@ struct NamespaceProtection
 /// key. The cursor comes from a seal this sweep sampled itself, so it can lag the round that cleans:
 /// after the walk the seal is sampled again through `gc/state`, and a moved cursor restarts the walk once.
 ///
-/// `work_budget`, when set, is charged one unit for the owner recovery and one per record the removal
-/// walk visits, shared with every other namespace this round touches. A hinting reader may prefetch up to
-/// one window beyond the charged position; those prefetches are discarded, not charged.
+/// `work_budget`, when set, is charged one unit per record the owner recovery replays and the removal walk
+/// visits, shared with every other namespace this round touches. The owner recovery needs the charge: under
+/// generation 3 it follows records appended while it runs, so a writer that stays ahead holds it. A hinting
+/// reader may prefetch up to one window beyond the charged position; those prefetches are discarded, not
+/// charged.
 NamespaceProtection activeManifestKeys(
     CasOperation & op, KeyReader & reader, const Layout & layout, const CasRefCatalog::Snapshot & catalog_cut,
     const CatalogEntry & catalog_entry, const CkptSample & ckpt_sample, const std::optional<FoldSealRef> & seal_ref,
@@ -275,12 +277,28 @@ NamespaceProtection activeManifestKeys(
     /// Current owners = snapshot + replayed chain. The exact row comes from the caller's frozen catalog
     /// cut: a later cut can name a reborn life and turn this old life into an apparent orphan.
     std::optional<CkptSample> sample = ckpt_sample;
+    std::function<bool()> may_read_next;
+    if (work_budget)
+        may_read_next = [work_budget]
+        {
+            ++work_budget->sweep_recovery_ops_used;
+            return work_budget->sweepRecoveryOpAvailable();
+        };
     std::optional<RecoveredRefTable> recovered;
     for (size_t restarts = 0;; ++restarts)
     {
-        recovered = recoverRefTableDetailedFromAuthority(op, layout, catalog_entry, sample, &reader);
-        if (recovered)
+        BoundedRefRecovery recovery
+            = recoverRefTableDetailedFromAuthorityBounded(op, layout, catalog_entry, sample, &reader, may_read_next);
+        if (recovery.end == BoundedRefRecovery::End::Recovered)
+        {
+            recovered = std::move(recovery.table);
             break;
+        }
+        if (recovery.end == BoundedRefRecovery::End::Stopped)
+        {
+            protection.recovery_incomplete = true;
+            return protection;
+        }
         if (restarts == kRefReadOnlyRecoveryMaxRestarts)
         {
             protection.unfinished = true;
@@ -293,8 +311,6 @@ NamespaceProtection activeManifestKeys(
             return protection;
         }
     }
-    if (work_budget)
-        ++work_budget->sweep_recovery_ops_used;
     for (const auto [ref_name, row] : recovered->state.getCommitted())
         protection.active.insert(layout.manifestKey(ManifestId{ns, row.manifest_ref}));
     for (const auto & [ref_name, manifest_ref] : recovered->state.getPrecommits())
@@ -862,12 +878,12 @@ ManifestSweepResult planManifestCursorPage(
                         }
                         else if (protection.recovery_incomplete)
                         {
-                            /// The committed-tail walk stopped early: `active`/`tail_removal_targets`
+                            /// A walk stopped early: `active`/`tail_removal_targets`
                             /// are a PARTIAL view. Discard them and retain the whole namespace on this
                             /// page instead of deciding from an incomplete protection set (fail-closed).
                             LOG_DEBUG(getLogger("CasOrphanManifestSweep"),
-                                "CAS orphan sweep: retaining {} -- committed-tail recovery walk's work "
-                                "budget exhausted before it could confirm the namespace's protection view",
+                                "CAS orphan sweep: retaining {} -- the round's recovery work budget ran out "
+                                "before it could confirm the namespace's protection view",
                                 parsed->key);
                             errored_namespaces.insert(parsed->ns.string());
                             ++result.retained_work_budget;
