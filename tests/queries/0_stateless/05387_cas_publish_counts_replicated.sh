@@ -38,9 +38,11 @@ ${CLICKHOUSE_CLIENT} -q "SYSTEM START MERGES r1"
 ${CLICKHOUSE_CLIENT} -q "INSERT INTO r1 SELECT number, number FROM numbers(1000, 1000)"
 ${CLICKHOUSE_CLIENT} -q "OPTIMIZE TABLE r1 FINAL"
 ${CLICKHOUSE_CLIENT} -q "SYSTEM FLUSH LOGS cas_log"
+# The block numbers are not always consecutive (a retried insert skips one), so take the merged part's name.
+MERGED=$(${CLICKHOUSE_CLIENT} -q "SELECT name FROM system.parts WHERE database = currentDatabase() AND table = 'r1' AND active AND level > 0")
 ${CLICKHOUSE_CLIENT} -q "SELECT 'replicated_merge',
-        countIf(event_type = 'build_publish' AND ref_name = 'all_0_1_1') AS published_under_final_name,
-        countIf(event_type = 'ref_move' AND (ref_name = 'all_0_1_1' OR detail['dst_ref'] = 'all_0_1_1')) AS moves,
+        countIf(event_type = 'build_publish' AND ref_name = '${MERGED}') AS published_under_final_name,
+        countIf(event_type = 'ref_move' AND (ref_name = '${MERGED}' OR detail['dst_ref'] = '${MERGED}')) AS moves,
         countIf(event_type = 'manifest_put') AS manifests_on_disk
     FROM system.cas_log WHERE disk_name = '${CLICKHOUSE_DATABASE}_pc3a'"
 ${CLICKHOUSE_CLIENT} -q "DROP TABLE r1 SYNC"

@@ -16,6 +16,7 @@ def start_cluster():
         image="altinity/clickhouse-server",
         tag=OLD_TAG,
         with_installed_binary=True,
+        installed_binary_supports_cas_logs=True,
         with_rustfs=True,
         stay_alive=True,
     )
@@ -43,6 +44,8 @@ def test_old_pool_floor_and_old_reader(start_cluster):
     # Pool created by the old build (reader floor 1).
     old.query("CREATE TABLE t_old (a UInt64) ENGINE = MergeTree ORDER BY a SETTINGS storage_policy = 'cas_shared'")
     old.query("INSERT INTO t_old SELECT number FROM numbers(100)")
+    # The old build knows the CAS logs, so its instance keeps them (`installed_binary_supports_cas_logs`).
+    assert _count(old, "1") > 0
 
     # The new build mounts it: the first writable mount raises the floor to 2 before any rename, so the
     # new build's first rename is already an owner move. The server is stopped while the disk config lands:

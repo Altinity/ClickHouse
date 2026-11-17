@@ -50,6 +50,7 @@ public:
         std::optional<ObjectAttributes> object_metadata_ = std::nullopt,
         ThreadPoolCallbackRunnerUnsafe<void> schedule_ = {},
         const WriteSettings & write_settings_ = {},
+        std::shared_ptr<const S3::Client> object_creation_client_ = nullptr,
         OnUploadComplete on_upload_complete_ = {});
 
     ~WriteBufferFromS3() override;
@@ -97,6 +98,9 @@ private:
     const S3::S3RequestSettings request_settings;
     const WriteSettings write_settings;
     const std::shared_ptr<const S3::Client> client_ptr;
+    /// Sends `PutObject` and `CompleteMultipartUpload`, the requests that create the object;
+    /// `client_ptr` unless the constructor got a separate one.
+    const std::shared_ptr<const S3::Client> object_creation_client;
     const std::optional<ObjectAttributes> object_metadata;
     /// Set from the PutObject / CompleteMultipartUpload response ETag on a successful upload; read
     /// by getResultObjectETag() after finalize(). Written by the upload worker, read after the

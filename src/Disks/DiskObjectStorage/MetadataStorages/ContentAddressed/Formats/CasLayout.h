@@ -414,6 +414,19 @@ public:
     /// the sole reclaimer of `staging/` debris.
     String blobsPrefix() const { return prefix + "/blobs/"; }
 
+    /// One mount's S3 staging area: `<prefix>/staging/<server_root_id>/`.
+    String stagingPrefix(const String & server_root_id) const { return prefix + "/staging/" + server_root_id + "/"; }
+    /// A staged upload: `<stagingPrefix><writer_epoch>/<leaf>`. The epoch lets a successor's sweep tell a
+    /// predecessor's leftovers from its own in-flight uploads.
+    String stagingKey(const String & server_root_id, uint64_t writer_epoch, const String & leaf) const
+    {
+        return stagingPrefix(server_root_id) + std::to_string(writer_epoch) + "/" + leaf;
+    }
+    /// The writer epoch of a key under `stagingPrefix`, given the part after the prefix: `<epoch>/<leaf>` parses,
+    /// a flat `<leaf>` is epoch 0 (written before keys carried one), anything else belongs to another member
+    /// nested under this prefix.
+    static std::optional<uint64_t> stagedEpochOf(std::string_view rest);
+
     /// Per-server-root control subtree, keyed by the configured `server_root_id`
     /// (validated by `DB::Cas::validateServerRootId`). All four control objects live together under
     /// `<prefix>/gc/server-roots/<server_root_id>/` so a server's mount-safety state is one subtree.

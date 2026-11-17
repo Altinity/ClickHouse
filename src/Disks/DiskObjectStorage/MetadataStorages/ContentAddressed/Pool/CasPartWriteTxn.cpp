@@ -10,23 +10,28 @@
 #include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
+#include <Common/LoggingHelpers.h>
 #include <Common/logger_useful.h>
 #include <Common/ProfileEvents.h>
 #include <Common/thread_local_rng.h>
 #include <Common/config_version.h>
 #include <base/defines.h>
+#include <base/scope_guard.h>
 #include <fmt/format.h>
 #include <algorithm>
 #include <chrono>
+#include <exception>
 
 namespace ProfileEvents
 {
     extern const Event CASBlobBodyPutAvoided;
+    extern const Event CASBlobPublishAttemptFailed;
+    extern const Event CASBlobPublishGaveUp;
     extern const Event CASBlobAdoptTrusted;
     extern const Event CASMetaPut;
     extern const Event CASMetaCompareSwap;
     extern const Event CASMetaCreateClean;
-    extern const Event CASMetaAdoptBackfill;
+    extern const Event CASMetaAbsentRepublish;
     extern const Event CASMetaResurrectClean;
 }
 
@@ -65,6 +70,20 @@ UInt128 mintU128()
     const UInt64 hi = thread_local_rng();
     const UInt64 lo = thread_local_rng();
     return (static_cast<UInt128>(hi) << 64) | lo;
+}
+
+/// Rate-limited, because under an outage every blob of every write fails here; the counter has them all.
+/// The first failure is routine and the next attempt usually succeeds, so only a repeat is a warning.
+void recordFailedPublicationAttempt(
+    const String & key, BlobPublicationTransport transport, int attempt, int max_attempts, const String & error)
+{
+    ProfileEvents::increment(ProfileEvents::CASBlobPublishAttemptFailed);
+    LogSeriesLimiter log(getLogger("CasBlobPublishAttempt"), /*allowed_count=*/5, /*interval_s=*/30);
+    const char * transport_name = transport == BlobPublicationTransport::Streaming ? "streaming" : "server-side copy";
+    if (attempt == 0)
+        LOG_INFO(log, "Publication of CAS blob {} ({}) failed, attempt {} of {}: {}", key, transport_name, attempt + 1, max_attempts, error);
+    else
+        LOG_WARNING(log, "Publication of CAS blob {} ({}) failed, attempt {} of {}: {}", key, transport_name, attempt + 1, max_attempts, error);
 }
 
 bool isDeterministicBlobPublicationFailure(const std::exception & error)
@@ -385,6 +404,14 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
     };
 
     constexpr int max_publication_attempts = 8;
+    /// Every exit by exception after a failed attempt gave up on the blob, the attempt cap and the
+    /// loop's deadline alike.
+    int failed_attempts = 0;
+    const int exceptions_at_entry = std::uncaught_exceptions();
+    SCOPE_EXIT({
+        if (failed_attempts > 0 && std::uncaught_exceptions() > exceptions_at_entry)
+            ProfileEvents::increment(ProfileEvents::CASBlobPublishGaveUp);
+    });
     for (int attempt = 0; attempt < max_publication_attempts; ++attempt)
     {
         requireAlive();
@@ -420,22 +447,10 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             if (loaded)
                 validateMetaSize(loaded->meta);
 
-            if (!loaded || loaded->meta.state == MetaState::Clean)
+            /// Only a `Clean` marker read after the `HEAD` permits adoption. GC deletes the marker right
+            /// after the body, so an absent marker may mean the body this `HEAD` saw is already gone.
+            if (loaded && loaded->meta.state == MetaState::Clean)
             {
-                /// Observation can produce durable metadata and dependency readiness too.
-                requireAdmitted("after the mandatory `HEAD`");
-                if (!loaded)
-                {
-                    /// A backfilled marker is a point-read hint for the next observer, so a competing
-                    /// writer that got there first settles the same question: its outcome is not read.
-                    ProfileEvents::increment(ProfileEvents::CASMetaAdoptBackfill);
-                    putMetaIfAbsent(
-                        op,
-                        store->layout(),
-                        ref,
-                        BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = logical_size},
-                        policy);
-                }
                 requireAdmitted("before the body-put-avoided observation is recorded");
                 ProfileEvents::increment(ProfileEvents::CASBlobBodyPutAvoided);
                 EventEmitter{*store}.emit([&](CasEvent & event)
@@ -445,7 +460,7 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
                     event.object_hash = blobIdOf(ref);
                     event.token = present->etag.render();
                     event.outcome = "observed";
-                    event.reason = "a present non-condemned blob was observed after mandatory `HEAD`";
+                    event.reason = "a present blob with a `Clean` marker was observed after mandatory `HEAD`";
                     event.detail = {{"action", "observed"}, {"size", std::to_string(source.size)}};
                 });
                 requireAdmitted("before the observed dependency proof is returned");
@@ -454,7 +469,10 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
                     BlobDepRecord{ObjectKind::Blob, BlobDependencyProof::Materialized, source.size},
                     BlobUploadDiagnostics{BlobMaterializationAction::Observed, std::nullopt, std::nullopt}};
             }
-            reason = BlobPublicationReason::Condemned;
+            if (loaded)
+                reason = BlobPublicationReason::Condemned;
+            else
+                ProfileEvents::increment(ProfileEvents::CASMetaAbsentRepublish);
         }
 
         const bool first_publication = source.beginPublication();
@@ -495,6 +513,8 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             /// every further request of this operation refuses the same way.
             if (isDeterministicBlobPublicationFailure(error) || !op.admitted())
                 throw;
+            ++failed_attempts;
+            recordFailedPublicationAttempt(key, transport, attempt, max_publication_attempts, error.what());
             if (attempt + 1 == max_publication_attempts)
                 throwCasWriteRetryLater(fmt::format(
                     "PartWriteTxn::ensureBlobPresent: publication of {} remained ambiguous after {} "
@@ -506,6 +526,9 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
         }
         catch (...)
         {
+            ++failed_attempts;
+            recordFailedPublicationAttempt(
+                key, transport, attempt, max_publication_attempts, getCurrentExceptionMessage(/*with_stacktrace=*/false));
             if (attempt + 1 == max_publication_attempts)
                 throwCasWriteRetryLater(fmt::format(
                     "PartWriteTxn::ensureBlobPresent: publication of {} remained ambiguous after {} "
@@ -526,7 +549,7 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             event.object_hash = blobIdOf(ref);
             event.outcome = "published";
             event.reason = reason == BlobPublicationReason::Absent
-                ? "blob was absent after mandatory `HEAD`"
+                ? "blob or its marker was absent after mandatory `HEAD`"
                 : "blob was present but `Condemned` after mandatory `HEAD`";
             event.detail = {
                 {"action", "published"},
