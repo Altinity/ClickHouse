@@ -1,6 +1,6 @@
 #include <Functions/FunctionBase58Conversion.h>
 #include <Functions/FunctionFactory.h>
-#include <Functions/FunctionDocumentation.h> // Added this line
+#include <Common/Documentation.h> // Added this line
 
 namespace DB
 {
