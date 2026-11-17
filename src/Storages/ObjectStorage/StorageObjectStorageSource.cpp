@@ -1163,19 +1163,38 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             }
         }
 
-        if (query_settings.skip_empty_files && object_info->getObjectMetadata()->size_bytes == 0
+        /// The cached size is the previous object's. Re-HEAD before treating it as empty, or a
+        /// replaced object is skipped and never read. `s3_skip_empty_files` defaults to true.
+        const auto cached_metadata = object_info->getObjectMetadata();
+        if (cached_metadata
+            && cached_metadata->is_from_identity_cache
+            && query_settings.skip_empty_files
+            && cached_metadata->is_size_known
+            && cached_metadata->size_bytes == 0)
+            revalidateIdentityCachedObjectMetadata(*object_info, object_storage);
+
+        if (query_settings.skip_empty_files && object_info->getObjectMetadata()
+            && object_info->getObjectMetadata()->size_bytes == 0
             && object_info->getObjectMetadata()->is_size_known)
             continue;
 
+        bool skip_object = false;
         if (query_condition_cache && !object_info->file_bucket_info)
         {
-            const auto query_condition_cache_key = makeQueryConditionCacheKey(*object_info, configuration->isDataLakeConfiguration());
-            std::optional<QueryConditionCache::MatchingMarks> matching_marks;
-            if (query_condition_cache_key)
-                matching_marks = query_condition_cache->read(
-                    storage_id.uuid, *query_condition_cache_key, *format_filter_info->condition_hash);
-            if (matching_marks.has_value())
+            /// A hit that drops every row group never GETs. The key contains the ETag, and an
+            /// identity-cache hit still has the previous one, so confirm it before dropping the file.
+            /// Data-lake keys do not contain the ETag. One confirmation is enough: the HEAD clears
+            /// `is_from_identity_cache`.
+            for (size_t attempt = 0; attempt < 2; ++attempt)
             {
+                const auto query_condition_cache_key = makeQueryConditionCacheKey(*object_info, configuration->isDataLakeConfiguration());
+                std::optional<QueryConditionCache::MatchingMarks> matching_marks;
+                if (query_condition_cache_key)
+                    matching_marks = query_condition_cache->read(
+                        storage_id.uuid, *query_condition_cache_key, *format_filter_info->condition_hash);
+                if (!matching_marks.has_value())
+                    break;
+
                 const auto & marks = *matching_marks;
                 size_t total_row_groups = marks.size();
                 std::vector<size_t> matching_row_groups;
@@ -1191,20 +1210,36 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
                     format_filter_info->filter_actions_dag->dumpNames(),
                     object_info->getFileName());
 
-                if (matching_row_groups.empty())
-                    continue;
-
-                auto file_bucket_info = FormatFactory::instance().getFileBucketInfo(
-                    object_info->getFileFormat().value_or(configuration->getFormat()));
-                if (file_bucket_info)
+                bool drops_object = matching_row_groups.empty();
+                FileBucketInfoPtr filtered;
+                if (!drops_object)
                 {
-                    auto filtered = file_bucket_info->filterByMatchingRowGroups(matching_row_groups);
-                    if (!filtered)
-                        continue;
-                    object_info->file_bucket_info = std::move(filtered);
+                    auto file_bucket_info = FormatFactory::instance().getFileBucketInfo(
+                        object_info->getFileFormat().value_or(configuration->getFormat()));
+                    if (file_bucket_info)
+                    {
+                        filtered = file_bucket_info->filterByMatchingRowGroups(matching_row_groups);
+                        if (!filtered)
+                            drops_object = true;
+                    }
                 }
+
+                const auto metadata_now = object_info->getObjectMetadata();
+                if (drops_object && attempt == 0 && metadata_now && metadata_now->is_from_identity_cache
+                    && !configuration->isDataLakeConfiguration())
+                {
+                    revalidateIdentityCachedObjectMetadata(*object_info, object_storage);
+                    continue;
+                }
+
+                skip_object = drops_object;
+                if (filtered)
+                    object_info->file_bucket_info = std::move(filtered);
+                break;
             }
         }
+        if (skip_object)
+            continue;
         break;
     }
 
@@ -1933,6 +1968,19 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 std::future<StorageObjectStorageSource::ReaderHolder> StorageObjectStorageSource::createReaderAsync()
 {
     return create_reader_scheduler([=, this] { return createReader(); }, Priority{});
+}
+
+void revalidateIdentityCachedObjectMetadata(ObjectInfo & object_info, const ObjectStoragePtr & object_storage)
+{
+    const auto metadata = object_info.getObjectMetadata();
+    if (!metadata || !metadata->is_from_identity_cache)
+        return;
+
+    auto metadata_object = object_info.relative_path_with_metadata;
+    metadata_object.relative_path = object_info.getPathOrPathToArchiveIfArchive();
+    object_info.setObjectMetadata(
+        object_info.getResolvedStorage(object_storage)->getObjectMetadataIgnoringIdentityCache(
+            metadata_object, /*with_tags=*/ false));
 }
 
 std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
