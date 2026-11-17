@@ -172,6 +172,9 @@ static struct InitFiu
     ONCE(iceberg_writes_cleanup) \
     ONCE(iceberg_alter_catalog_update_schema_fail) \
     ONCE(iceberg_alter_catalog_commit_reported_as_failed) \
+    ONCE(iceberg_catalog_update_metadata_fail) \
+    ONCE(iceberg_catalog_update_metadata_reported_as_failed) \
+    ONCE(iceberg_glue_update_table_fail) \
     REGULAR(storage_cluster_read_sleep) \
     ONCE(iceberg_writes_non_retry_cleanup) \
     ONCE(iceberg_writes_post_publish_throw) \

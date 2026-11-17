@@ -75,6 +75,7 @@ namespace DB::ErrorCodes
 namespace DB::FailPoints
 {
     extern const char check_database_datalake_negative[];
+    extern const char iceberg_glue_update_table_fail[];
 }
 
 namespace DB::Setting
@@ -1167,6 +1168,9 @@ bool GlueCatalog::updateTableInGlue(
     table_input.SetParameters(parameters);
 
     request.SetTableInput(table_input);
+
+    /// Simulates Glue rejecting the update, e.g. because of a `VersionId` mismatch with a concurrent commit.
+    fiu_do_on(DB::FailPoints::iceberg_glue_update_table_fail, { return false; });
 
     Aws::Glue::Model::UpdateTableOutcome response;
 

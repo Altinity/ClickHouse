@@ -88,6 +88,8 @@ namespace DB::FailPoints
     extern const char check_database_datalake_negative[];
     extern const char iceberg_alter_catalog_update_schema_fail[];
     extern const char iceberg_alter_catalog_commit_reported_as_failed[];
+    extern const char iceberg_catalog_update_metadata_fail[];
+    extern const char iceberg_catalog_update_metadata_reported_as_failed[];
 }
 
 namespace ProfileEvents
@@ -2382,6 +2384,9 @@ bool RestCatalog::updateMetadata(const String & namespace_name, const String & t
 
     auto request_body = buildUpdateMetadataRequestBody(namespace_name, table_name, new_snapshot);
 
+    /// Simulates a retryable failure where the catalog did not apply the update.
+    fiu_do_on(DB::FailPoints::iceberg_catalog_update_metadata_fail, { return false; });
+
     try
     {
         ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogUpdateTable);
@@ -2399,6 +2404,11 @@ bool RestCatalog::updateMetadata(const String & namespace_name, const String & t
         }
         throw;
     }
+
+    /// Simulates the Iceberg "commit state unknown" case: the catalog applied the update but the
+    /// client observes a failure, e.g. because a proxy turned the response into a 5xx.
+    fiu_do_on(DB::FailPoints::iceberg_catalog_update_metadata_reported_as_failed, { return false; });
+
     return true;
 }
 
