@@ -322,6 +322,7 @@ namespace ServerSetting
     extern const ServerSettingsDouble mark_cache_size_ratio;
     extern const ServerSettingsString object_storage_identity_cache_policy;
     extern const ServerSettingsUInt64 object_storage_identity_cache_size;
+    extern const ServerSettingsUInt64 object_storage_identity_cache_ttl;
     extern const ServerSettingsDouble object_storage_identity_cache_size_ratio;
     extern const ServerSettingsString unique_key_index_cache_policy;
     extern const ServerSettingsUInt64 unique_key_index_cache_size_bytes;
@@ -2480,6 +2481,7 @@ try
 
     String object_storage_identity_cache_policy = server_settings[ServerSetting::object_storage_identity_cache_policy];
     size_t object_storage_identity_cache_size = server_settings[ServerSetting::object_storage_identity_cache_size];
+    UInt64 object_storage_identity_cache_ttl = server_settings[ServerSetting::object_storage_identity_cache_ttl];
     double object_storage_identity_cache_size_ratio = server_settings[ServerSetting::object_storage_identity_cache_size_ratio];
     if (object_storage_identity_cache_size > max_cache_size)
     {
@@ -2487,7 +2489,7 @@ try
         LOG_INFO(log, "Lowered object storage identity cache size to {} because the system has limited RAM", formatReadableSizeWithBinarySuffix(object_storage_identity_cache_size));
     }
     global_context->setObjectStorageIdentityCache(
-        object_storage_identity_cache_policy, object_storage_identity_cache_size, object_storage_identity_cache_size_ratio);
+        object_storage_identity_cache_policy, object_storage_identity_cache_size, object_storage_identity_cache_size_ratio, object_storage_identity_cache_ttl);
 
     String unique_key_index_cache_policy_name = server_settings[ServerSetting::unique_key_index_cache_policy];
     size_t unique_key_index_cache_size = server_settings[ServerSetting::unique_key_index_cache_size_bytes];

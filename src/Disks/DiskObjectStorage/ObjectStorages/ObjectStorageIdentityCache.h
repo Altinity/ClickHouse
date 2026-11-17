@@ -2,7 +2,10 @@
 
 #include <base/types.h>
 #include <Common/CacheBase.h>
+#include <Common/UnorderedMapWithMemoryTracking.h>
 
+#include <atomic>
+#include <mutex>
 #include <optional>
 #include <string_view>
 #include <vector>
@@ -26,6 +29,8 @@ struct ObjectStorageIdentity
     /// Cumulative start offset of each multipart part (part i covers [part_offsets[i], part_offsets[i+1])).
     /// Empty when unknown or the object is a single PUT.
     std::vector<UInt64> part_offsets;
+    /// `steady_clock` nanoseconds when this entry was stored. Zero is already expired when a TTL is set.
+    UInt64 cached_at_ns = 0;
 
     size_t memoryUsage() const
     {
@@ -72,22 +77,52 @@ inline String makeObjectStorageIdentityCacheKey(
 /// eviction and thread-safety.
 ///
 /// It is owned by the global Context (see Context::getObjectStorageIdentityCache), sized from server
-/// settings, and cleared by `SYSTEM DROP OBJECT STORAGE IDENTITY CACHE`. Low-level object-storage
-/// code reaches it via Context::getGlobalContextInstance() and must tolerate a null pointer (no
-/// global context yet) by simply issuing the metadata request uncached.
+/// settings, and cleared by `SYSTEM DROP OBJECT STORAGE IDENTITY CACHE`. Entries expire after
+/// `object_storage_identity_cache_ttl` seconds (zero disables expiry). A write by this server stores
+/// the new size and ETag, and a copy or delete drops the entry, so a replaced object is not read
+/// with its previous size and ETag. Low-level object-storage code reaches the cache via Context::getGlobalContextInstance()
+/// and must tolerate a null pointer (no global context yet) by simply issuing the metadata request
+/// uncached.
 class ObjectStorageIdentityCache
     : public CacheBase<String, ObjectStorageIdentity, std::hash<String>, ObjectStorageIdentityWeight>
 {
     using Base = CacheBase<String, ObjectStorageIdentity, std::hash<String>, ObjectStorageIdentityWeight>;
 
 public:
-    ObjectStorageIdentityCache(const String & cache_policy, size_t max_size_in_bytes, double size_ratio);
+    ObjectStorageIdentityCache(const String & cache_policy, size_t max_size_in_bytes, double size_ratio, UInt64 ttl_seconds);
 
-    /// Look up an identity by `makeObjectStorageIdentityCacheKey`. Increments the hit/miss ProfileEvents.
+    void setTTLSeconds(UInt64 ttl_seconds);
+
+    /// Look up an identity by `makeObjectStorageIdentityCacheKey`. An expired entry is a miss.
+    /// Increments the hit/miss ProfileEvents.
     std::optional<ObjectStorageIdentity> tryGet(const String & key);
 
-    /// Insert (or overwrite) the identity for a key.
-    void set(const String & key, ObjectStorageIdentity identity);
+    /// Generation of `key`. A fetch captures this before the request and passes it to `setIfEpoch`,
+    /// so a write that lands during the request cannot be overwritten by that fetch's old identity.
+    /// Zero when the key has never been invalidated.
+    UInt64 epochOf(const String & key) const;
+
+    /// Store `identity` only when `epoch` is still the generation `epochOf` returned.
+    void setIfEpoch(const String & key, ObjectStorageIdentity identity, UInt64 epoch);
+
+    /// Bump the generation and store `identity`. Used after this server has replaced the object.
+    void replace(const String & key, ObjectStorageIdentity identity);
+
+    /// Bump the generation and drop the entry. A fetch already in flight will not put the old identity back.
+    void invalidate(const String & key);
+
+    /// Drop every entry and generation. Hides `CacheBase::clear` so generations cannot outlive the entries.
+    void clear();
+
+private:
+    /// `epoch_mutex` must be held.
+    void store(const String & key, ObjectStorageIdentity identity);
+
+    mutable std::mutex epoch_mutex;
+    /// Generations of keys this server has replaced or deleted. Absent means generation 0.
+    /// Guarded by `epoch_mutex`.
+    UnorderedMapWithMemoryTracking<String, UInt64> epoch_by_key;
+    std::atomic<UInt64> ttl_seconds;
 };
 
 using ObjectStorageIdentityCachePtr = std::shared_ptr<ObjectStorageIdentityCache>;

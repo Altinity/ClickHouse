@@ -467,6 +467,10 @@ std::unique_ptr<WriteBufferFromFileBase> S3ObjectStorage::writeObject( /// NOLIN
         .attempt_timeout_ms = write_settings.object_storage_attempt_timeout_ms,
         .connect_timeout_cap_ms = write_settings.object_storage_connect_timeout_cap_ms});
 
+    /// Captured by value. The buffer can outlive this storage, and the cache itself is process-global.
+    const String identity_key = makeObjectStorageIdentityCacheKey(
+        uri.endpoint, used_client->getRegion(), uri.bucket, object.remote_path);
+
     return std::make_unique<WriteBufferFromS3>(
         used_client,
         uri.bucket,
@@ -476,7 +480,27 @@ std::unique_ptr<WriteBufferFromFileBase> S3ObjectStorage::writeObject( /// NOLIN
         std::move(blob_storage_log),
         attributes,
         std::move(scheduler),
-        disk_write_settings);
+        disk_write_settings,
+        [identity_key](size_t size, std::optional<String> etag)
+        {
+            auto global_context = Context::getGlobalContextInstance();
+            if (!global_context)
+                return;
+            auto cache = global_context->getObjectStorageIdentityCache();
+            if (!cache)
+                return;
+            /// An empty ETag means the upload replaced the object but the counted size must not be cached.
+            if (!etag || etag->empty())
+            {
+                cache->invalidate(identity_key);
+                return;
+            }
+            ObjectStorageIdentity identity;
+            identity.etag = std::move(*etag);
+            identity.size = size;
+            identity.is_size_known = true;
+            cache->replace(identity_key, std::move(identity));
+        });
 }
 
 
@@ -571,6 +595,7 @@ void S3ObjectStorage::removeObjectImpl(const StoredObject & object, bool if_exis
     deleteFileFromS3(client.get(), uri.bucket, object.remote_path, if_exists,
                       blob_storage_log, object.local_path, object.bytes_size,
                       ProfileEvents::DiskS3DeleteObjects);
+    invalidateCachedIdentity(object.remote_path);
 }
 
 void S3ObjectStorage::removeObjectsImpl(const StoredObjects & objects, bool if_exists)
@@ -600,6 +625,8 @@ void S3ObjectStorage::removeObjectsImpl(const StoredObjects & objects, bool if_e
                       s3_capabilities, settings_ptr->request_settings[S3RequestSetting::objects_chunk_size_to_delete],
                       blob_storage_log, local_paths_for_blob_storage_log, file_sizes_for_blob_storage_log,
                       ProfileEvents::DiskS3DeleteObjects);
+    for (const auto & object : objects)
+        invalidateCachedIdentity(object.remote_path);
 }
 
 void S3ObjectStorage::removeObjectIfExists(const StoredObject & object)
@@ -655,7 +682,10 @@ ConditionalRemoveResult S3ObjectStorage::removeObjectIfTokenMatchesImpl(
                                    outcome.IsSuccess() ? "" : outcome.GetError().GetMessage());
 
     if (outcome.IsSuccess())
+    {
+        invalidateCachedIdentity(object.remote_path);
         return {ConditionalRemoveOutcome::Removed, outcome.GetResult().GetDeleteMarker()};
+    }
 
     const auto & err = outcome.GetError();
 
@@ -663,11 +693,18 @@ ConditionalRemoveResult S3ObjectStorage::removeObjectIfTokenMatchesImpl(
     /// (see `S3::isPreconditionFailedError` for the one policy). Callers treat 'mismatch' and 'gone'
     /// alike (re-validate); a genuine absence is disambiguated downstream by a HEAD re-check.
     if (S3::isPreconditionFailedError(err))
+    {
+        /// The etag we held is not the object's etag, so the cached identity is not this generation.
+        invalidateCachedIdentity(object.remote_path);
         return {ConditionalRemoveOutcome::TokenMismatch, false};
+    }
 
     /// The object no longer exists (404). Protocol callers treat 'mismatch' and 'gone' alike (re-validate).
     if (S3::isNotFoundError(err.GetErrorType()))
+    {
+        invalidateCachedIdentity(object.remote_path);
         return {ConditionalRemoveOutcome::NotFound, false};
+    }
 
     throw S3Exception(err.GetErrorType(),
         "{} (Code: {}, S3 exception: '{}') while conditionally removing object with path {} from S3",
@@ -699,6 +736,7 @@ void S3ObjectStorage::removeObjectsIfExistImpl(
         deleteFileFromS3(used_client, uri.bucket, object.remote_path, /*if_exists=*/ true,
                          BlobStorageLogWriter::create(disk_name), object.local_path, object.bytes_size,
                          ProfileEvents::DiskS3DeleteObjects, attempt_seed);
+        invalidateCachedIdentity(object.remote_path);
         return;
     }
 
@@ -785,6 +823,21 @@ void S3ObjectStorage::removeObjectsIfExistImpl(
             first_error_type = error_type;
             first_error_name = err.GetCode();
         }
+    }
+    /// A key that was deleted, or was already gone, must not keep its previous size and ETag.
+    /// A key whose delete failed is still the object the cache describes.
+    for (const auto & object : objects)
+    {
+        bool delete_failed = false;
+        for (const auto & err : outcome.GetResult().GetErrors())
+        {
+            if (err.GetKey() != object.remote_path)
+                continue;
+            if (!S3::isNotFoundError(classifyDeleteObjectsErrorCode(err.GetCode())))
+                delete_failed = true;
+        }
+        if (!delete_failed)
+            invalidateCachedIdentity(object.remote_path);
     }
     if (first_error_type)
         throw S3Exception(
@@ -994,6 +1047,11 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
         }
     }
 
+    /// Captured after the miss and before the request. `setIfEpoch` refuses the result when a write
+    /// bumps the generation while this request is in flight, so the old size and ETag cannot replace
+    /// the identity published by that write.
+    const UInt64 identity_epoch = identity_cache ? identity_cache->epochOf(identity_key) : 0;
+
     auto settings_ptr = s3_settings.get();
 
     auto fetch = [&](const S3::Client & c) -> S3::ObjectInfo
@@ -1061,9 +1119,10 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
     }
 
     if (identity_cache)
-        identity_cache->set(
+        identity_cache->setIfEpoch(
             identity_key,
-            ObjectStorageIdentity{result.etag, result.size_bytes, result.is_size_known, result.part_offsets});
+            ObjectStorageIdentity{result.etag, result.size_bytes, result.is_size_known, result.part_offsets},
+            identity_epoch);
 
     return result;
 }
@@ -1102,6 +1161,7 @@ void S3ObjectStorage::copyObjectToAnotherObjectStorage( // NOLINT
                 [&, this]{ return readObject(object_from, read_settings_to_use);},
                 object_to_attributes,
                 write_settings.object_storage_copy_mode);
+            dest_s3->invalidateCachedIdentity(object_to.remote_path);
             return;
         }
         catch (S3Exception & exc)
@@ -1175,6 +1235,7 @@ void S3ObjectStorage::copyObject( // NOLINT
         [&, this]{ return readObject(object_from, read_settings_to_use);},
         object_to_attributes,
         write_settings.object_storage_copy_mode);
+    invalidateCachedIdentity(object_to.remote_path);
 }
 
 void S3ObjectStorage::shutdown()
@@ -1382,6 +1443,17 @@ bool S3ObjectStorage::hasSingleAttemptClientForTest(uint64_t request_timeout_ms,
 {
     std::lock_guard lock(single_attempt_client_mutex);
     return single_attempt_clients.contains(std::make_pair(request_timeout_ms, connect_timeout_cap_ms));
+}
+
+void S3ObjectStorage::invalidateCachedIdentity(const std::string & path) const
+{
+    auto global_context = Context::getGlobalContextInstance();
+    if (!global_context)
+        return;
+    auto cache = global_context->getObjectStorageIdentityCache();
+    if (!cache)
+        return;
+    cache->invalidate(makeObjectStorageIdentityCacheKey(uri.endpoint, client.get()->getRegion(), uri.bucket, path));
 }
 
 std::shared_ptr<const S3::Client> S3ObjectStorage::clientForRetryProfile(const ObjectStorageControlRequest & request) const

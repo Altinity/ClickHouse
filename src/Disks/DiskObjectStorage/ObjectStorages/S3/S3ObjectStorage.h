@@ -249,6 +249,10 @@ private:
 
     std::shared_ptr<const S3::Client> clientForRetryProfile(const ObjectStorageControlRequest & request) const;
 
+    /// Drop the identity-cache entry for `path`. The generation bump stops a HEAD that started
+    /// against the previous object from writing that identity back.
+    void invalidateCachedIdentity(const std::string & path) const;
+
     /// Runs `fn` and, if it failed because the vended credentials expired, refreshes this disk's
     /// client and runs it once more. `fn` must re-read the client itself, so the second run signs
     /// with the refreshed one.

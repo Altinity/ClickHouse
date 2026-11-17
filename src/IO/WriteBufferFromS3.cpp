@@ -108,7 +108,8 @@ WriteBufferFromS3::WriteBufferFromS3(
     BlobStorageLogWriterPtr blob_log_,
     std::optional<ObjectAttributes> object_metadata_,
     ThreadPoolCallbackRunnerUnsafe<void> schedule_,
-    const WriteSettings & write_settings_)
+    const WriteSettings & write_settings_,
+    OnUploadComplete on_upload_complete_)
     : WriteBufferFromFileBase(std::min(buf_size_, static_cast<size_t>(DBMS_DEFAULT_BUFFER_SIZE)), nullptr, 0)
     , bucket(bucket_)
     , key(key_)
@@ -116,6 +117,7 @@ WriteBufferFromS3::WriteBufferFromS3(
     , write_settings(write_settings_)
     , client_ptr(std::move(client_ptr_))
     , object_metadata(std::move(object_metadata_))
+    , on_upload_complete(std::move(on_upload_complete_))
     , buffer_allocation_policy(createBufferAllocationPolicy(request_settings))
     , task_tracker(
           std::make_unique<TaskTracker>(
@@ -225,17 +227,31 @@ void WriteBufferFromS3::finalizeImpl()
 
     span.addAttributeIfNotZero("clickhouse.multipart_upload_parts", multipart_tags.size());
 
-    if (request_settings[S3RequestSetting::check_objects_after_upload])
+    try
     {
-        S3::checkObjectExists(*client_ptr, bucket, key, {}, "Immediately after upload");
+        if (request_settings[S3RequestSetting::check_objects_after_upload])
+        {
+            S3::checkObjectExists(*client_ptr, bucket, key, {}, "Immediately after upload");
 
-        size_t actual_size = S3::getObjectSize(*client_ptr, bucket, key, {});
-        if (actual_size != total_size)
-            throw Exception(
-                    ErrorCodes::S3_ERROR,
-                    "Object {} from bucket {} has unexpected size {} after upload, expected size {}, it's a bug in S3 or S3 API.",
-                    key, bucket, actual_size, total_size);
+            size_t actual_size = S3::getObjectSize(*client_ptr, bucket, key, {});
+            if (actual_size != total_size)
+                throw Exception(
+                        ErrorCodes::S3_ERROR,
+                        "Object {} from bucket {} has unexpected size {} after upload, expected size {}, it's a bug in S3 or S3 API.",
+                        key, bucket, actual_size, total_size);
+        }
     }
+    catch (...)
+    {
+        /// The upload already replaced the object. Tell the caller not to keep the previous identity,
+        /// and not to cache the size this buffer counted.
+        if (on_upload_complete)
+            on_upload_complete(0, std::nullopt);
+        throw;
+    }
+
+    if (on_upload_complete)
+        on_upload_complete(total_size, object_etag);
 }
 
 void WriteBufferFromS3::cancelImpl() noexcept

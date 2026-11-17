@@ -1573,7 +1573,7 @@ public:
 
     /// Object-storage identity cache (per-object size/ETag/multipart-part-offsets) to avoid a HEAD
     /// on every object open. A max_size_in_bytes of 0 leaves the cache unset (disabled).
-    void setObjectStorageIdentityCache(const String & cache_policy, size_t max_size_in_bytes, double size_ratio);
+    void setObjectStorageIdentityCache(const String & cache_policy, size_t max_size_in_bytes, double size_ratio, UInt64 ttl_seconds);
     void updateObjectStorageIdentityCacheConfiguration(const Poco::Util::AbstractConfiguration & config, size_t max_cache_size);
     std::shared_ptr<ObjectStorageIdentityCache> getObjectStorageIdentityCache() const;
     void clearObjectStorageIdentityCache() const;

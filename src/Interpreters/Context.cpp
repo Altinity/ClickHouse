@@ -4689,7 +4689,7 @@ void Context::clearMarkCache() const
     JemallocCacheArena::purge();
 }
 
-void Context::setObjectStorageIdentityCache(const String & cache_policy, size_t max_size_in_bytes, double size_ratio)
+void Context::setObjectStorageIdentityCache(const String & cache_policy, size_t max_size_in_bytes, double size_ratio, UInt64 ttl_seconds)
 {
     std::lock_guard lock(shared->mutex);
 
@@ -4700,7 +4700,7 @@ void Context::setObjectStorageIdentityCache(const String & cache_policy, size_t 
     if (max_size_in_bytes == 0)
         return;
 
-    shared->object_storage_identity_cache = std::make_shared<ObjectStorageIdentityCache>(cache_policy, max_size_in_bytes, size_ratio);
+    shared->object_storage_identity_cache = std::make_shared<ObjectStorageIdentityCache>(cache_policy, max_size_in_bytes, size_ratio, ttl_seconds);
 }
 
 void Context::updateObjectStorageIdentityCacheConfiguration(const Poco::Util::AbstractConfiguration & config, size_t max_cache_size)
@@ -4714,6 +4714,7 @@ void Context::updateObjectStorageIdentityCacheConfiguration(const Poco::Util::Ab
     if (size > max_cache_size)
         size = max_cache_size;
     shared->object_storage_identity_cache->setMaxSizeInBytes(size);
+    shared->object_storage_identity_cache->setTTLSeconds(config.getUInt64("object_storage_identity_cache_ttl", 3600));
 }
 
 std::shared_ptr<ObjectStorageIdentityCache> Context::getObjectStorageIdentityCache() const

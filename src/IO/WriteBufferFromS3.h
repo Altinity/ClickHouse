@@ -16,7 +16,9 @@
 #include <Common/BlobStorageLogWriter.h>
 #include <Common/BufferAllocationPolicy.h>
 
+#include <functional>
 #include <memory>
+#include <optional>
 #include <vector>
 #include <list>
 
@@ -35,6 +37,10 @@ class TaskTracker;
 class WriteBufferFromS3 final : public WriteBufferFromFileBase
 {
 public:
+    /// Called after a successful upload, including when the post-upload size check fails.
+    /// `etag` is empty when the uploaded bytes must not be cached (the size check disagreed).
+    using OnUploadComplete = std::function<void(size_t total_size, std::optional<String> etag)>;
+
     WriteBufferFromS3(
         std::shared_ptr<const S3::Client> client_ptr_,
         const String & bucket_,
@@ -44,7 +50,8 @@ public:
         BlobStorageLogWriterPtr blob_log_,
         std::optional<ObjectAttributes> object_metadata_ = std::nullopt,
         ThreadPoolCallbackRunnerUnsafe<void> schedule_ = {},
-        const WriteSettings & write_settings_ = {});
+        const WriteSettings & write_settings_ = {},
+        OnUploadComplete on_upload_complete_ = {});
 
     ~WriteBufferFromS3() override;
     void nextImpl() override;
@@ -96,6 +103,7 @@ private:
     /// by getResultObjectETag() after finalize(). Written by the upload worker, read after the
     /// finalize barrier (happens-before), so no extra synchronization is needed.
     std::optional<String> object_etag;
+    OnUploadComplete on_upload_complete;
     LoggerPtr log = getLogger("WriteBufferFromS3");
     LogSeriesLimiterPtr limited_log = std::make_shared<LogSeriesLimiter>(log, 1, 5);
 
