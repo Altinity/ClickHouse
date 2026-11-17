@@ -128,6 +128,7 @@ namespace
         object_info.size = static_cast<size_t>(result.GetContentLength());
         object_info.is_size_known = result.ContentLengthHasBeenSet();
         object_info.last_modification_time = result.GetLastModified().Seconds();
+        object_info.last_modification_time_observed = true;
         object_info.etag = result.GetETag();
 
         if (with_metadata)

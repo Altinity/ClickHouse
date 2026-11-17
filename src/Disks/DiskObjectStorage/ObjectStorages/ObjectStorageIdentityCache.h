@@ -30,6 +30,9 @@ struct ObjectStorageIdentity
     /// Seconds since epoch. Meaningful only when `is_last_modified_known`.
     Int64 last_modified = 0;
     bool is_last_modified_known = false;
+    /// False when this entry was stored from `GetObjectAttributes`, which does not return Last-Modified.
+    /// That is not the same as observing that the object has no modification time.
+    bool last_modified_observed = false;
     /// Orders stores of this key. A fetch that started earlier must not overwrite one that started later.
     /// Not part of the object's identity.
     UInt64 fetch_seq = 0;

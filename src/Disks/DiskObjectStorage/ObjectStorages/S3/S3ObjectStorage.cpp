@@ -64,6 +64,7 @@ namespace DB::FailPoints
 {
     extern const char object_storage_force_refresh_callback_success[];
     extern const char object_storage_identity_cache_pause_before_store[];
+    extern const char object_storage_identity_cache_skip_last_modified[];
 }
 
 
@@ -1018,6 +1019,11 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
     const bool identity_only = !with_tags;
     /// Bucket and path alone collide when two endpoints reuse a bucket name.
     const String identity_key = makeObjectStorageIdentityCacheKey(uri.endpoint, uri.bucket, path);
+    /// A `GetObjectAttributes` entry has size, ETag and part offsets, but this SDK cannot ask it for
+    /// Last-Modified. Keep those offsets and HEAD for the time instead of caching "time unknown".
+    bool fill_last_modified = false;
+    String preserved_etag;
+    std::vector<UInt64> preserved_part_offsets;
 
     ObjectStorageIdentityCachePtr identity_cache;
     if (identity_only)
@@ -1029,22 +1035,29 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
         {
             if (auto cached = identity_cache->tryGet(identity_key))
             {
-                ObjectMetadata result;
-                result.size_bytes = cached->size;
-                result.is_size_known = cached->is_size_known;
-                result.etag = cached->etag;
-                result.part_offsets = cached->part_offsets;
-                result.is_from_identity_cache = true;
-                if (cached->is_last_modified_known)
+                if (cached->last_modified_observed)
                 {
-                    result.last_modified = Poco::Timestamp::fromEpochTime(static_cast<std::time_t>(cached->last_modified));
-                    /// Real enough for `_time`, but not a freshness proof. The schema and count caches
-                    /// treat an older time as "unchanged" and would keep a replaced object's schema and row count.
-                    result.is_last_modified_fresh = false;
+                    ObjectMetadata result;
+                    result.size_bytes = cached->size;
+                    result.is_size_known = cached->is_size_known;
+                    result.etag = cached->etag;
+                    result.part_offsets = cached->part_offsets;
+                    result.is_from_identity_cache = true;
+                    if (cached->is_last_modified_known)
+                    {
+                        result.last_modified = Poco::Timestamp::fromEpochTime(static_cast<std::time_t>(cached->last_modified));
+                        /// Real enough for `_time`, but not a freshness proof. The schema and count caches
+                        /// treat an older time as "unchanged" and would keep a replaced object's schema and row count.
+                        result.is_last_modified_fresh = false;
+                    }
+                    else
+                        result.is_last_modified_known = false;
+                    return result;
                 }
-                else
-                    result.is_last_modified_known = false;
-                return result;
+
+                fill_last_modified = true;
+                preserved_etag = cached->etag;
+                preserved_part_offsets = std::move(cached->part_offsets);
             }
         }
     }
@@ -1068,7 +1081,10 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
             /// pay the heavier GetObjectAttributes, which also returns per-part sizes; it falls back to
             /// a HEAD internally if the API is unsupported or denied. This keeps a cold, cache-empty
             /// lake scan on the cheap-HEAD path instead of one GetObjectAttributes per file.
-            if (fetch_part_offsets)
+            /// An entry that already has part offsets but no Last-Modified is filled with a HEAD: this
+            /// SDK's GetObjectAttributes cannot request Last-Modified, and storing that as "unknown"
+            /// would make every later `_time` NULL.
+            if (fetch_part_offsets && !fill_last_modified)
                 return S3::getObjectIdentity(c, uri.bucket, path, /*version_id=*/ {});
             return S3::getObjectInfo(c, uri.bucket, path, /*version_id=*/ {}, /*with_metadata=*/ false, /*with_tags=*/ false);
         }
@@ -1107,8 +1123,20 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
     result.etag = object_info.etag;
     result.tags = std::move(object_info.tags);
     result.attributes = object_info.metadata;
+    /// Simulates a `GetObjectAttributes` success, which does not carry Last-Modified. The stored entry
+    /// must not report that as a known absence, or the next `_time` read stays NULL.
+    fiu_do_on(FailPoints::object_storage_identity_cache_skip_last_modified, {
+        object_info.last_modification_time = 0;
+        object_info.last_modification_time_observed = false;
+        result.last_modified = {};
+    });
     if (identity_only)
-        result.is_last_modified_known = object_info.last_modification_time != 0;
+    {
+        if (object_info.last_modification_time_observed)
+            result.is_last_modified_known = object_info.last_modification_time != 0;
+        else
+            result.is_last_modified_known = false;
+    }
 
     /// GetObjectAttributes returns per-part sizes; convert to cumulative start offsets.
     if (!object_info.part_sizes.empty())
@@ -1122,6 +1150,9 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
         }
     }
 
+    if (result.part_offsets.empty() && !preserved_part_offsets.empty() && result.etag == preserved_etag)
+        result.part_offsets = std::move(preserved_part_offsets);
+
     if (identity_cache)
     {
         /// The read that reached this point already holds the identity from before any overwrite that
@@ -1132,8 +1163,9 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
         identity.size = result.size_bytes;
         identity.is_size_known = result.is_size_known;
         identity.part_offsets = result.part_offsets;
-        identity.is_last_modified_known = result.is_last_modified_known;
-        if (result.is_last_modified_known)
+        identity.last_modified_observed = object_info.last_modification_time_observed;
+        identity.is_last_modified_known = identity.last_modified_observed && result.is_last_modified_known;
+        if (identity.is_last_modified_known)
             identity.last_modified = static_cast<Int64>(result.last_modified.epochTime());
         identity_cache->setIfEpoch(identity_key, std::move(identity), identity_read);
     }

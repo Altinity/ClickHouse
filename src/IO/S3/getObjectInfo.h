@@ -18,6 +18,10 @@ struct ObjectInfo
     /// Checks if Content-Length was present in the HEAD response and we can rely on its result
     bool is_size_known = true;
     time_t last_modification_time = 0;
+    /// False when the response did not include Last-Modified. `GetObjectAttributes` in this SDK cannot
+    /// request it, so a successful attributes call leaves the time at 0 without having observed it.
+    /// A HEAD that returns epoch 0 sets this true: the object really has no modification time.
+    bool last_modification_time_observed = false;
     String etag;
     ObjectAttributes tags; // Set only if getObjectInfo() is called with `with_tags = true`
     ObjectAttributes metadata = {}; /// Set only if getObjectInfo() is called with `with_metadata = true`.

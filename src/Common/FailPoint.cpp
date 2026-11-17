@@ -85,6 +85,7 @@ static struct InitFiu
     ONCE(s3_send_request_throw_expired_token) \
     REGULAR(s3_read_inject_etag_mismatch) \
     PAUSEABLE_ONCE(object_storage_identity_cache_pause_before_store) \
+    REGULAR(object_storage_identity_cache_skip_last_modified) \
     REGULAR(azure_inject_forbidden_response) \
     ONCE(azure_inject_forbidden_response_once) \
     REGULAR(azure_inject_auth_failure_on_request) \
