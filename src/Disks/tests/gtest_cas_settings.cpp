@@ -690,7 +690,7 @@ TEST(CASContentAddressedSettings, MountLeaseTtlAtTheMaximumIsKeptSilently)
 TEST(CASContentAddressedSettings, MountLeaseDefaultsSatisfyRequestBudget)
 {
     ContentAddressedSettings s;
-    EXPECT_EQ(s[ContentAddressedSetting::mount_lease_ttl_ms].value, 120000u);
+    EXPECT_EQ(s[ContentAddressedSetting::mount_lease_ttl_ms].value, 40000u);
     EXPECT_EQ(s[ContentAddressedSetting::mount_renew_period_ms].value, 10000u);
 
     const Cas::CasRequestBudget budget;
@@ -699,7 +699,7 @@ TEST(CASContentAddressedSettings, MountLeaseDefaultsSatisfyRequestBudget)
     EXPECT_NO_THROW(Cas::validateCasRequestBudget(budget, ttl, period, /*background_renewal=*/true));
 
     const uint64_t write_reserve = 2 * budget.attemptEnvelopeMs() + budget.lease_safety_margin_ms;
-    EXPECT_EQ(ttl - period - write_reserve, 94000u);
+    EXPECT_EQ(ttl - period - write_reserve, 14000u);
 }
 
 TEST(CASContentAddressedSettings, RequestWindowDefaultAndValidation)

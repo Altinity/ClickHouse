@@ -143,7 +143,7 @@ watermark — there is no separate watermark object. `MountLease` fields: `serve
   The bounded renewals — the startup re-anchor, the remount re-anchor, and the background renewal of a
   pool opened for decommission — stay bounded by the last confirmed lease minus the safety margin.
 - **Cadence.** The runtime normally starts a logical renewal every `cas_mount_renew_period_ms` (default
-  10 s), with TTL `cas_mount_lease_ttl_ms` (default 120 s). The next beat is anchored
+  10 s), with TTL `cas_mount_lease_ttl_ms` (default 40 s). The next beat is anchored
   at the committed body's pre-I/O BOOTTIME start. A slow recovery therefore causes an immediate
   catch-up beat when the nominal cadence has elapsed; it does not wait a fresh full period after the
   response.
@@ -200,16 +200,16 @@ values are safe, and so is changing the value one server at a time in any order.
 lease on one server delays recovery after that server's crash, and the GC leader logs one `WARNING` per
 slot whose declared lease differs from its own. A server built without the rule waits only its own
 lease and can fence a longer-lease holder that can still write; such a pool must pin equal values, see
-[upgrading to the 120 s lease](/antalya/cas/configuration#upgrading-lease-defaults).
+[upgrading to the 40 s lease](/antalya/cas/configuration#upgrading-lease-defaults).
 
-With the defaults (TTL 120 s, period 10 s, margin 2 s), `TTL − margin − period − 2 × envelope = 94 s` is the scheduling-lateness budget before
+With the defaults (TTL 40 s, period 10 s, margin 2 s), `TTL − margin − period − 2 × envelope = 14 s` is the scheduling-lateness budget before
 the first renewal attempt of a period can begin, where `envelope = attempt_timeout + 2 × cap` and
 `cap` is `attempt_timeout` when the disk's `connect_timeout_ms` is `0`, else
 `min(connect_timeout_ms, attempt_timeout)` (7 s with defaults).
 
 The `CAS request budget in effect` line logged at mount carries both figures. `write_reserve_ms` is
 `2 × envelope + cas_lease_safety_margin_ms` (16000 with defaults). `renewal_slack_ms` appears only when background renewal is on and is
-`TTL − period − write_reserve_ms` (94000 with defaults), the lateness budget above. The line also
+`TTL − period − write_reserve_ms` (14000 with defaults), the lateness budget above. The line also
 carries `request_window_ms`, the retry window of `cas_request_window_ms`.
 
 ### Cloning a running server is unsupported {#clone-unsupported}

@@ -164,12 +164,13 @@ directly (the raw disk, not the cache) was refused with `All parts of partition 
 already on disk 'cas_cache'. (UNKNOWN_DISK)` — a real error message from the run, kept here because
 it is exactly what an operator sees after guessing the wrong disk name.
 
-## Upgrading a pool to the 120 s lease default {#upgrade-lease-default}
+## Upgrading a pool to the 40 s lease default {#upgrade-lease-default}
 
-The new default lease is 120 s. A server built before the declared-lease rule (before
+The new default lease is 40 s. A server built before the declared-lease rule (before
 `v26.6.8.20003`; in the 26.8 line, before the merge of
-https://github.com/Altinity/ClickHouse/pull/2805) can fence a 120 s holder while it can still write, so
-a pool that still has such a server must be upgraded in these steps:
+https://github.com/Altinity/ClickHouse/pull/2805) waits only its own lease, so it can fence or reclaim
+a 40 s holder while it can still write. A pool that still has such a server must be upgraded in these
+steps:
 
 1. Set `cas_mount_lease_ttl_ms` to `30000` in the disk block of every server you are about to upgrade.
    This pin is required, not optional.
@@ -178,7 +179,7 @@ a pool that still has such a server must be upgraded in these steps:
 4. Set `cas_request_window_ms`, if you need it, only now: older builds refuse the key.
 
 What happens without the pin, and the other upgrade notes, are in
-[upgrading to the 120 s lease](/antalya/cas/configuration#upgrading-lease-defaults).
+[upgrading to the 40 s lease](/antalya/cas/configuration#upgrading-lease-defaults).
 
 ## Upgrading a pool to reader generation 3 {#upgrade-generation-3}
 
@@ -236,14 +237,14 @@ passes while the elapsed time plus the renewal window stays under `cas_mount_lea
 
 | `connect_timeout_ms` of the disk | Envelope | Window | Time allowed from the renewer's first lease write to the check |
 |---|---|---|---|
-| `1000` (the S3 disk default) | 5 s + 2 * 1 s = 7 s | 10 s + 14 s = 24 s | 118 s - 24 s = 94 s |
-| `0`, or `5000` and above | 5 s + 2 * 5 s = 15 s | 10 s + 30 s = 40 s | 118 s - 40 s = 78 s |
+| `1000` (the S3 disk default) | 5 s + 2 * 1 s = 7 s | 10 s + 14 s = 24 s | 38 s - 24 s = 14 s |
+| `0`, or `4500` and above | at least 5 s + 2 * 4.5 s = 14 s | at least 10 s + 28 s = 38 s | none: the disk does not open writable |
 
-Both rows use the defaults: 120 s lease, 2 s safety margin, 10 s renewal period, 5 s attempt timeout.
+Both rows use the defaults: 40 s lease, 2 s safety margin, 10 s renewal period, 5 s attempt timeout.
 
 If the elapsed time is longer, the mount logs a WARNING that gives the time since the claim and the part of it spent
 in the floor raise (`the open took ... ms since the mount claim, ... ms of it in the reader-floor raise, which left too
-little of the lease TTL (120000 ms) to arm the write fence; re-writing the lease first`), writes the lease once more
+little of the lease TTL (40000 ms) to arm the write fence; re-writing the lease first`), writes the lease once more
 and goes on. If that
 write fails, for example because the slot was taken in the meantime, the open fails closed and the next attempt
 follows the ordinary [mount claim rules](/antalya/cas/architecture/mounts-and-leases#claim-outcomes). The raise is
@@ -297,7 +298,7 @@ that id after the run starts empty. The command claims the slot without waiting
 and trusts no wall clock, so it accepts only a terminal slot in `system.cas_mounts`:
 `state = 'terminated'` (clean stop) or `state = 'fenced'` (GC fenced the lease). A `live` or `expired`
 row is refused with `alive or contended`; a hard-killed member stays `expired` until the disk's GC leader fences it at the start of a GC round, once it has seen the lease unchanged for about one
-`cas_mount_lease_ttl_ms` plus one `cas_mount_renew_period_ms` (about 136 s with the default 120 s lease: 120 s + 6 s for the 5 % term + 10 s for one renewal period, from the formula, not measured); the wait can be up to two GC intervals longer. `SYSTEM CAS GC RUN` on the leader
+`cas_mount_lease_ttl_ms` plus one `cas_mount_renew_period_ms` (about 52 s with the default 40 s lease: 40 s + 2 s for the 5 % term + 10 s for one renewal period, from the formula, not measured); the wait can be up to two GC intervals longer. `SYSTEM CAS GC RUN` on the leader
 (`is_leader = 1` in `system.cas_mounts`) can trigger the fence, but the run that fences must come at
 least that long after the first run that saw the lease; two back-to-back runs do not fence.
 

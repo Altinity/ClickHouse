@@ -202,7 +202,7 @@ token of each `mount` object.
   deletes
 - **Safety:** fences only after this leader's *own* monotonic clock has watched the mount's
   write-token hold unchanged for `L + 5% + cas_mount_renew_period_ms`, where `L` is the longer of this server's
-  `cas_mount_lease_ttl_ms` and the lease the slot's body declares (defaults 120 s and 10 s), and only at the
+  `cas_mount_lease_ttl_ms` and the lease the slot's body declares (defaults 40 s and 10 s), and only at the
   start of a round, so a killed member becomes `fenced` up to two GC intervals later than that; the write is
   guarded by that exact token. A completed fence-out stays valid even if this GC later loses
   leadership. `expires_at_ms` (another host's wall clock) is never trusted.

@@ -224,7 +224,7 @@ struct PoolConfig
     /// write fence's monotonic deadline is `renew_time + this`, so a superseded/paused writer is fenced
     /// once `this` elapses with no successful renew. The background renewer runs every
     /// `mount_renew_period` so a healthy mount renews well before expiry. These are the values of a
-    /// pool opened without disk settings, which is how unit tests open one; a disk defaults to 120000/10000.
+    /// pool opened without disk settings, which is how unit tests open one; a disk defaults to 40000/10000.
     std::chrono::milliseconds mount_lease_ttl_ms{30000};
     std::chrono::milliseconds mount_renew_period{10000};
 
