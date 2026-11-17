@@ -257,6 +257,11 @@ def setup_build_caches_env(info):
             print("NOTE: Using custom AWS credentials for sccache")
         else:
             os.environ["SCCACHE_S3_NO_CREDENTIALS"] = "true"
+            if not os.environ.get("SCCACHE_BUCKET"):
+                # NOTE (strtgbb): fork PRs and local runs have no S3_ARTIFACT_BUCKET
+                print("NOTE: sccache bucket unset, reading altinity-build-artifacts read-only")
+                os.environ["SCCACHE_BUCKET"] = "altinity-build-artifacts"
+                os.environ["SCCACHE_S3_READ_ONLY"] = "true"
         # NOTE (strtgbb): sccache will throw an error if AWS credentials are present with SCCACHE_S3_NO_CREDENTIALS=1
         os.environ.pop("AWS_SECRET_ACCESS_KEY", None)
         os.environ.pop("AWS_ACCESS_KEY_ID", None)
