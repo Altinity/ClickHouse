@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Tags: no-fasttest
+# Tag no-fasttest: `Parquet` is not built in the fast test.
 
 # `PREWHERE` over a Parquet file with many small pages, where some pages lie entirely inside runs of
 # filtered-out rows. Such pages are passed to the page decoders with an all-zero filter, and the decoders
