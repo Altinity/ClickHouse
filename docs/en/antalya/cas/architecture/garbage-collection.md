@@ -239,6 +239,9 @@ returns without a commit. On `fold`, phase 6 reuses this plan and the same `LIST
 `run_orphan_manifest_sweep` requests a new or continued traversal according to
 `cas_orphan_manifest_sweep_interval_sec`. Its first attempt forces a fold even on an idle pool.
 After a suppressed attempt is committed, a leader-local marker names the newly adopted generation.
+An exception from `planManifestCursorPage` instead records the current adopted parent generation
+and propagates: no sweep progress is committed. Other fold errors and a lost round `CAS` do not
+set a new marker.
 While that generation remains current, `force_orphan_manifest_sweep` is false and ordinary bounded
 defer applies. A fold started by any other trigger still plans the requested sweep when its safety
 gates permit it. A committed non-suppressed fold clears the marker, so successful active pages keep

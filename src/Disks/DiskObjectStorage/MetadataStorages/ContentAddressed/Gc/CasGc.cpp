@@ -3586,16 +3586,25 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     std::vector<BlobSourceRetirement> orphan_source_retirements;
     if (run_orphan_manifest_sweep && !suppress_destructive && store->poolConfig().manifest_sweep_list_budget_keys > 0)
     {
-        result.orphan_sweep = planManifestCursorPage(
-            *store,
-            state.manifest_sweep_cursor,
-            store->poolConfig().manifest_sweep_list_budget_keys,
-            store->poolConfig().manifest_sweep_delete_budget_keys,
-            /// The sweep may recover a catalog-named namespace's debris only from the same frozen catalog
-            /// cut and `_ckpt` frontier the round's own universe came from -- which is exactly what an
-            /// authoritative universe means, and is why this is the gate's term and not a separate one.
-            universe_authoritative,
-            &work_budget, io_pool.get(), store->poolConfig().gc_io_concurrency);
+        try
+        {
+            result.orphan_sweep = planManifestCursorPage(
+                *store,
+                state.manifest_sweep_cursor,
+                store->poolConfig().manifest_sweep_list_budget_keys,
+                store->poolConfig().manifest_sweep_delete_budget_keys,
+                /// The sweep may recover a catalog-named namespace's debris only from the same frozen catalog
+                /// cut and `_ckpt` frontier the round's own universe came from -- which is exactly what an
+                /// authoritative universe means, and is why this is the gate's term and not a separate one.
+                universe_authoritative,
+                &work_budget, io_pool.get(), store->poolConfig().gc_io_concurrency);
+        }
+        catch (...)
+        {
+            /// No new generation was adopted; pace retries against the current parent generation.
+            orphan_manifest_sweep_retry_generation = state.snap_generation;
+            throw;
+        }
         for (const ManifestSweepResult::Nomination & nomination : result.orphan_sweep.nominations)
             orphan_source_retirements.insert(
                 orphan_source_retirements.end(),

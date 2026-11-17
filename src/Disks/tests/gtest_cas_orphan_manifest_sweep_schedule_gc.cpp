@@ -240,9 +240,11 @@ TEST(CASOrphanManifestSweepScheduleGc, FailedFoldDoesNotComplete)
 TEST(CASOrphanManifestSweepScheduleGc, LostCasDoesNotAdvanceOrDelete)
 {
     ScheduleFixture f;
-    const RootNamespace ns{"test/orphan"};
+    const RootNamespace ns{"orphan/table"};
     const ManifestRef ref{1, 1, 1};
     writeManifestRaw(*f.backend, f.store->layout(), ns, ref, {});
+    setWatermarkMinActive(*f.backend, f.store->layout(), "orphan", 1, 2);
+    const auto before = f.state();
     bool fired = false;
     f.backend->before_round_commit = [&]
     {
@@ -253,9 +255,22 @@ TEST(CASOrphanManifestSweepScheduleGc, LostCasDoesNotAdvanceOrDelete)
     };
     EXPECT_THROW(f.run(), DB::Exception);
     EXPECT_TRUE(fired);
-    EXPECT_EQ(f.state().orphan_manifest_sweep_completed_at_ms, 0);
+    expectSameSchedule(f.state(), before);
     OperationForTest op(*f.backend);
     EXPECT_TRUE((*op).read(f.store->layout().manifestKey(ManifestId{ns, ref}), Retry::once()).has_value());
+}
+
+TEST(CASOrphanManifestSweepScheduleGc, CommittedRoundDeletesEligibleOrphan)
+{
+    ScheduleFixture f;
+    const RootNamespace ns{"orphan/table"};
+    const ManifestRef ref{1, 1, 1};
+    writeManifestRaw(*f.backend, f.store->layout(), ns, ref, {});
+    setWatermarkMinActive(*f.backend, f.store->layout(), "orphan", 1, 2);
+    ASSERT_TRUE(f.run().acquired_lease);
+    EXPECT_EQ(f.state().orphan_manifest_sweep_completed_at_ms, 1000);
+    OperationForTest op(*f.backend);
+    EXPECT_FALSE((*op).read(f.store->layout().manifestKey(ManifestId{ns, ref}), Retry::once()).has_value());
 }
 
 TEST(CASOrphanManifestSweepScheduleGc, TakeoverResumesCursor)
@@ -368,6 +383,105 @@ TEST(CASOrphanManifestSweepScheduleGc, SuppressedSweepUsesBoundedDeferral)
         adopted = f.state();
     }
     EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 0);
+}
+
+TEST(CASOrphanManifestSweepScheduleGc, FailedSweepUsesBoundedDeferral)
+{
+    ScheduleFixture f(1000, 3600, 2);
+    const RootNamespace ns{"test/checkpoint"};
+    casAdmitRecoverableEntry(*f.backend, f.store->layout(), ns);
+    ASSERT_TRUE(f.run().acquired_lease);
+    const auto adopted = f.state();
+    ASSERT_EQ(adopted.orphan_manifest_sweep_completed_at_ms, 1000);
+    const String checkpoint_key = f.store->layout().refCkptKey(fixture::fixtureLife(ns));
+    f.now = 3601000;
+    size_t attempts = 0;
+    const auto fail_list = [&]
+    {
+        ++attempts;
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "test sweep list failure");
+    };
+    f.backend->before_manifest_list = fail_list;
+    EXPECT_THROW(f.run(), DB::Exception);
+    ASSERT_EQ(attempts, 1);
+
+    for (size_t cycle = 0; cycle < 2; ++cycle)
+    {
+        f.backend->resetCounts();
+        f.backend->before_manifest_list = fail_list;
+        for (size_t tick = 0; tick < 2; ++tick)
+        {
+            const auto deferred = f.run();
+            ASSERT_TRUE(deferred.acquired_lease);
+            ASSERT_TRUE(deferred.deferred);
+            EXPECT_EQ(f.state().snap_generation, adopted.snap_generation);
+            expectSameSchedule(f.state(), adopted);
+        }
+        EXPECT_EQ(attempts, cycle + 1);
+        EXPECT_EQ(f.backend->getCount(checkpoint_key), 0);
+        EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 0);
+        EXPECT_THROW(f.run(), DB::Exception);
+        EXPECT_EQ(attempts, cycle + 2);
+        EXPECT_GT(f.backend->getCount(checkpoint_key), 0);
+        EXPECT_EQ(f.state().snap_generation, adopted.snap_generation);
+        expectSameSchedule(f.state(), adopted);
+    }
+}
+
+TEST(CASOrphanManifestSweepScheduleGc, SuccessfulPageAfterFailureRestoresImmediateContinuation)
+{
+    ScheduleFixture f(1, 3600, 2);
+    f.addKeys();
+    f.backend->before_manifest_list = []
+    {
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "test sweep list failure");
+    };
+    EXPECT_THROW(f.run(), DB::Exception);
+    for (size_t tick = 0; tick < 2; ++tick)
+        ASSERT_TRUE(f.run().deferred);
+    const auto recovered = f.run();
+    ASSERT_TRUE(recovered.acquired_lease);
+    ASSERT_FALSE(recovered.deferred);
+    ASSERT_TRUE(f.state().orphan_manifest_sweep_active);
+    const auto continued = f.run();
+    ASSERT_TRUE(continued.acquired_lease);
+    EXPECT_FALSE(continued.deferred);
+    EXPECT_FALSE(f.state().orphan_manifest_sweep_active);
+    EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 2);
+}
+
+TEST(CASOrphanManifestSweepScheduleGc, ChangedRefsBypassFailedSweepDeferral)
+{
+    ScheduleFixture f(1000, 3600, 2);
+    f.backend->before_manifest_list = []
+    {
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "test sweep list failure");
+    };
+    EXPECT_THROW(f.run(), DB::Exception);
+    const RootNamespace ns{"test/changed"};
+    const ManifestRef ref{1, 1, 1};
+    writeManifestRaw(*f.backend, f.store->layout(), ns, ref, {});
+    publishCommittedTransition(*f.backend, f.store->layout(), ns, "table", std::nullopt, ref);
+    const auto changed = f.run();
+    ASSERT_TRUE(changed.acquired_lease);
+    EXPECT_FALSE(changed.deferred);
+    EXPECT_EQ(f.metric("defer_decision", "changed_shards"), 1);
+    EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 1);
+}
+
+TEST(CASOrphanManifestSweepScheduleGc, FailedSweepWithZeroDeferRetriesImmediately)
+{
+    ScheduleFixture f;
+    f.backend->before_manifest_list = []
+    {
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "test sweep list failure");
+    };
+    EXPECT_THROW(f.run(), DB::Exception);
+    const auto retried = f.run();
+    ASSERT_TRUE(retried.acquired_lease);
+    EXPECT_FALSE(retried.deferred);
+    EXPECT_EQ(f.state().orphan_manifest_sweep_completed_at_ms, 1000);
+    EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 1);
 }
 
 TEST(CASOrphanManifestSweepScheduleGc, CorruptCheckpointLimitsFoldReads)

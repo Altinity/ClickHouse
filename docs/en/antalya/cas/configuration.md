@@ -241,10 +241,12 @@ respect the same schedule. Setting the interval to `0` allows another traversal 
 round; setting the `LIST` budget to `0` pauses progress.
 
 When destructive work is suppressed, the traversal's cursor and timestamps remain unchanged.
-After a suppressed fold is committed, idle retries on that same generation use the existing bounded
-fold cadence: up to eight deferred invocations by default, then another fold. Ref-log changes and
-due blob graduation can force a fold sooner. A new leader may make an immediate attempt. These retry
-controls are internal `PoolConfig` fields, not additional disk settings.
+After a suppressed fold is committed, or the orphan-manifest planner throws an exception, idle
+retries on the same adopted generation use the existing bounded fold cadence: up to eight deferred
+invocations by default, then another fold. A planner exception still fails the round without
+advancing the traversal's cursor or timestamps. Ref-log changes and due blob graduation can force
+a fold sooner. A new leader may make an immediate attempt. These retry controls are internal
+`PoolConfig` fields, not additional disk settings.
 
 Normal blob reclamation and cleanup of manifests whose owners were removed keep their own GC rules;
 the hourly interval applies to the orphan-manifest traversal.
