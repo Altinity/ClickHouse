@@ -53,8 +53,15 @@ void ObjectStorageIdentityCache::setIfEpoch(const String & key, ObjectStorageIde
     if (epoch != read.epoch)
         return;
     /// `Base::get` takes the cache mutex after `epoch_mutex`, the same order as `set` and `remove`.
-    if (auto existing = Base::get(key); existing && existing->fetch_seq > read.seq)
-        return;
+    if (auto existing = Base::get(key))
+    {
+        if (existing->fetch_seq > read.seq)
+            return;
+        /// A HEAD does not return multipart part offsets. Keep the ones already stored when this
+        /// fetch saw the same ETag. A different ETag is a different object, so its offsets are dropped.
+        if (identity.part_offsets.empty() && !existing->part_offsets.empty() && identity.etag == existing->etag)
+            identity.part_offsets = existing->part_offsets;
+    }
     identity.fetch_seq = read.seq;
     Base::set(key, std::make_shared<ObjectStorageIdentity>(std::move(identity)));
 }

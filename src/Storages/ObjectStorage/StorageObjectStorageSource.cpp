@@ -1994,6 +1994,9 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     /// A filesystem or page cache hit never issues the GET, so it cannot notice that the object was
     /// replaced. Re-read the identity before using its ETag as the cache key. An unchanged object keeps
     /// the same key and is served from the cache. A replaced object gets a new key and is read again.
+    /// This refresh is a HEAD. `GetObjectAttributes` does not return Last-Modified, so using it here
+    /// would make this read's `_time` NULL and replace the cached time with "not observed". Part offsets
+    /// already stored for the same ETag are kept by `setIfEpoch`.
     if ((use_filesystem_cache || use_page_cache)
         && object_info.metadata
         && object_info.metadata->is_from_identity_cache
@@ -2001,8 +2004,7 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
         && object_info.metadata->isEtagUsableAsCacheKey())
     {
         object_info.metadata = object_storage->getObjectMetadataIgnoringIdentityCache(
-            object_info, /*with_tags=*/ false,
-            /*fetch_part_offsets=*/ effective_read_settings.object_storage_identity_cache_fetch_part_offsets);
+            object_info, /*with_tags=*/ false, /*fetch_part_offsets=*/ false);
     }
 
     if (use_page_cache && !object_info.metadata->isEtagUsableAsCacheKey())

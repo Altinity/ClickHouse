@@ -104,6 +104,7 @@ public:
     Read beginFetch();
 
     /// Store `identity` only when `read.epoch` is still current and no later fetch of `key` has stored.
+    /// A HEAD has no part offsets. When its ETag matches the resident entry, those offsets are kept.
     void setIfEpoch(const String & key, ObjectStorageIdentity identity, Read read);
 
     /// Advance the epoch and drop the entry. A fetch already in flight will not put the old identity back.
