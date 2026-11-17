@@ -35,7 +35,7 @@ namespace's shape and never interprets its contents.
 | `blobs/<algo>/<hex[0:2]>/<hex>.meta` | blob freshness sidecar | `cas_blob_meta` | dedup/GC |
 | `cas/ns/stream/<life_id>/_log/<epoch-hex>-<seq-hex>.zst` | ref transaction log | `cas_ref_log` | writer commit path |
 | `cas/ns/stream/<life_id>/_snap/<epoch-hex>-<seq-hex>.zst` | complete ref table snapshot | `cas_ref_snap` | writer/GC fold |
-| `cas/ns/state/<life_id>/_ckpt` | mutable per-life checkpoint | `cas_ref_ckpt` | writer/GC fold |
+| `cas/ns/state/<life_id>/_ckpt` | mutable per-life checkpoint | `cas_ref_ckpt` | namespace creation, snapshot publication, generation 3 stamp |
 | `cas/ns/state/<life_id>/_files/<relative-name>` | namespace-owned verbatim file | — (raw passthrough) | upper layers |
 | `cas/manifests/<namespace>/<epoch-hex>-<seq-hex>/<ordinal>.zst` | part manifest | `cas_part_manifest` | part build |
 | `gc/state` | GC state (incl. GC lease) | `cas_gc_state` | GC |
@@ -155,5 +155,12 @@ inline inside the manifest's raw payload zone, not a separate key.
 
 - `cas/ns/state/<life_id>/_ckpt` carries **no** `.zst` suffix: `cas_ref_ckpt`'s compression policy
   is `never`, while its `_log`/`_snap` siblings in the same `cas/ns/` tree compress `always`.
+- A generation 3 `_ckpt` holds two fields: `life_epoch`, set once when the namespace is created, and
+  `checkpoint_snapshot_id`, raised when a snapshot is published. It names the base of recovery and
+  nothing else: no ref-log append writes it, and the end of a stream is found by reading the chain
+  from the base. Bodies of generations 1 and 2 also carry `committed_through` and `last_epoch_seal`;
+  they are read, never written.
+- A ref-log object that is a tombstone (see [the ref table](/antalya/cas/architecture/manifests-and-refs#epoch-tombstone))
+  has the same key shape as any other `_log` object.
 - The namespace-stream tree is `cas/ns/stream/` (immutable `_log`/`_snap` objects) and
   `cas/ns/state/` (mutable `_ckpt`, verbatim `_files/`).

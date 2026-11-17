@@ -4,6 +4,7 @@
 #include <Common/CurrentMetrics.h>
 #include <Common/setThreadName.h>
 
+#include <atomic>
 #include <deque>
 #include <memory>
 #include <string>
@@ -33,14 +34,20 @@ public:
         bool has_next;                    /// whether the backend reports more pages after this one
     };
 
-    explicit ScriptedIteratorAsync(std::deque<Page> pages_)
+    /// `served` counts the pages the iterator has asked this source for, and outlives the iterator.
+    explicit ScriptedIteratorAsync(
+        std::deque<Page> pages_,
+        bool prefetch = true,
+        std::shared_ptr<std::atomic<size_t>> served_ = std::make_shared<std::atomic<size_t>>())
         : IObjectStorageIteratorAsync(
             CurrentMetrics::ObjectStorageAzureThreads,
             CurrentMetrics::ObjectStorageAzureThreadsActive,
             CurrentMetrics::ObjectStorageAzureThreadsScheduled,
             ThreadName::AZURE_LIST_POOL)
         , pages(std::move(pages_))
+        , served(std::move(served_))
     {
+        prefetch_next_batch = prefetch;
     }
 
     ~ScriptedIteratorAsync() override
@@ -52,6 +59,7 @@ public:
 private:
     bool getBatchAndCheckNext(RelativePathsWithMetadata & batch) override
     {
+        ++*served;
         if (pages.empty())
             return false;
 
@@ -65,6 +73,7 @@ private:
     }
 
     std::deque<Page> pages;
+    std::shared_ptr<std::atomic<size_t>> served;
 };
 
 using Pages = std::deque<ScriptedIteratorAsync::Page>;
@@ -123,4 +132,51 @@ TEST(ObjectStorageIteratorAsync, EmptyListingIsFinished)
     auto pages = [] { return Pages{{{}, false}}; };
     EXPECT_TRUE(consumeBatchWise(pages()).empty());
     EXPECT_TRUE(consumeElementWise(pages()).empty());
+}
+
+/// With the prefetch off the source serves a page only when the consumer needs it, so a caller that stops
+/// after one page costs one request. `deactivate` waits for the listing worker, which makes each count final.
+TEST(ObjectStorageIteratorAsync, WithoutPrefetchTheNextBatchIsFetchedOnDemand)
+{
+    const auto pages = [] { return Pages{{{"a", "b"}, true}, {{"c"}, false}}; };
+
+    {
+        auto served = std::make_shared<std::atomic<size_t>>();
+        ScriptedIteratorAsync it(pages(), /*prefetch=*/false, served);
+        ASSERT_TRUE(it.isValid());
+        it.deactivate();
+        EXPECT_EQ(*served, 1u);
+
+        it.next();
+        it.next();
+        ASSERT_TRUE(it.isValid());
+        EXPECT_EQ(it.current()->getPath(), "c");
+        it.deactivate();
+        EXPECT_EQ(*served, 2u);
+    }
+    {
+        auto served = std::make_shared<std::atomic<size_t>>();
+        {
+            ScriptedIteratorAsync it(pages(), /*prefetch=*/false, served);
+            ASSERT_TRUE(it.isValid());
+        }
+        EXPECT_EQ(*served, 1u);
+    }
+    {
+        auto served = std::make_shared<std::atomic<size_t>>();
+        ScriptedIteratorAsync it(pages(), /*prefetch=*/true, served);
+        ASSERT_TRUE(it.isValid());
+        it.deactivate();
+        EXPECT_EQ(*served, 2u);
+    }
+}
+
+/// An empty page that carries a continuation token is followed even when the next page is not prefetched.
+TEST(ObjectStorageIteratorAsync, AnEmptyPageWithoutPrefetchStillFollowsTheToken)
+{
+    ScriptedIteratorAsync it(Pages{{{}, true}, {{"a"}, true}, {{}, true}, {{"b"}, false}}, /*prefetch=*/false);
+    std::vector<std::string> seen;
+    for (; it.isValid(); it.next())
+        seen.push_back(it.current()->getPath());
+    EXPECT_EQ(seen, (std::vector<std::string>{"a", "b"}));
 }

@@ -7,7 +7,6 @@
 #include <map>
 #include <memory>
 #include <optional>
-#include <set>
 #include <span>
 #include <vector>
 
@@ -22,7 +21,8 @@ namespace DB::Cas
 /// `server_side_copy_from` names an already-verified complete staged object that may be copied verbatim
 /// only on this logical source's first publication after an absent observation. Every copy and move of
 /// the source shares `publication_attempted`, so ambiguity or fan-out wrapping cannot re-enable that
-/// staged envelope. Later publications use `open` to stream the same payload under a new envelope.
+/// staged envelope. Sources built separately over one staging object must share one flag too.
+/// Later publications use `open` to stream the same payload under a new envelope.
 struct BlobSource
 {
     uint64_t size = 0;
@@ -128,6 +128,9 @@ struct BlobUploadResult
 /// a bare digest or from an independently supplied digest width.
 BlobRef poolContentHash(BlobHashAlgo algo, std::string_view payload);
 
+/// The outcome clause of a `stageManifest` give-up: whether the body may have landed, and why.
+String describeManifestPutGiveUp(const GaveUp & gave_up);
+
 /// Coordinates one part write from manifest staging through blob admission and ref publication. The transaction
 /// owns the in-memory dependency set and the identities of manifests staged by this build; `Pool` owns the
 /// durable object store and ref-log operations. A transaction is normally used by one writer thread, while
@@ -186,6 +189,9 @@ public:
     /// under injected failure at every application point, not just the first or the last.
     void setMergeHookForTest(std::function<void(size_t applied_so_far)> hook) { merge_hook_for_test = std::move(hook); }
 
+    /// Test-only: runs in `promote` after its liveness checks and before its append. Set before `promote`.
+    void setPromoteBeforeAppendHookForTest(std::function<void()> hook) { promote_before_append_hook_for_test = std::move(hook); }
+
     /// Test-only DEEP snapshot of this build's recorded deps, keyed by `BlobRef`. A plain copy of the
     /// private `deps` map -- lets a test assert the whole build is byte-for-byte untouched after a
     /// rejected or aborted merge, rather than probing one ref at a time via `dependencyProof`.
@@ -202,18 +208,23 @@ public:
     /// Mint a root-local part `ManifestId`, write its body under
     /// `cas/manifests/<ns>/<writer_epoch>/<build_sequence>/000001.zst` via the pool's shared request
     /// controller. It uses budgeted attempts with resolve-before-reissue and performs no preliminary HEAD,
-    /// because `manifest_ordinal` is monotone within this build. It enforces manifest-size caps before the body
-    /// write returns and therefore before any owner transition is published. The body is not retained after a
-    /// successful write; on retry the caller re-stages from source. Every call uses a fresh manifest ordinal.
-    /// The id is recorded for best-effort `abandon` cleanup.
+    /// because `manifest_ordinal` is monotone within this build. It enforces manifest-size caps before the
+    /// body write returns and therefore before any owner transition is published. `encodePartManifest`
+    /// refuses a bad or duplicate entry path, which no writer builds (`LOGICAL_ERROR`), and a line over the
+    /// line cap, which an oversized legal input can produce (`LIMIT_EXCEEDED`). Before the `PUT` it still
+    /// decodes the sealed bytes as every reader does: a body no reader accepts throws `CORRUPTED_DATA` and
+    /// nothing is written. It records the blob leaves of the body for `promote`; the body itself is not
+    /// retained after a successful write, and on retry the caller re-stages from source. Every call uses a
+    /// fresh manifest ordinal. The id is recorded for best-effort `abandon` cleanup.
     ManifestId stageManifest(std::vector<ManifestEntry> entries);
 
     /// Add this transaction's precommit owner intent; there is no `_precommits` namespace. One
     /// `appendRefOps` call appending an OwnerTransition `RefOp` (new_binding = {Precommit,
     /// final_ref_name, id.ref}) to final_ref_name's ref-log entry, so the later promote is an atomic
-    /// owner move over that same entry. Needs NO body-exists HEAD as a safety authority: GC and
-    /// promotion handle a missing precommit manifest body by failing closed (a missing-body precommit
-    /// is a non-activating, non-promotable intent).
+    /// owner move over that same entry. Needs NO body-exists HEAD: a fresh id comes only from this
+    /// transaction's `stageManifest`, which returns it only after the body's create landed (or met these
+    /// exact bytes). A body deleted later is noticed by GC only while it folds the precommit edge, and
+    /// afterwards by readers and fsck.
     ///
     /// A3 mint-tightening: `id` must either be one THIS transaction minted via `stageManifest`, or
     /// already be `final_ref_name`'s current committed manifest (the idempotent re-drive -- see the
@@ -228,16 +239,15 @@ public:
     /// ref-log entry.
     ///  1. `Materialized` leaves are already protected by the durable precommit edge, so no writer-side retired-view
     ///     refresh is needed;
-    ///  2. stream-read the precommit manifest body; validate RefMatchesBody / ManifestNamespaceMatches;
+    ///  2. no manifest request: the blob leaves are the ones `stageManifest` recorded;
     ///  3. `TrustedManifest` leaves use the durable source-manifest edge with no per-file HEAD/loadMeta
     ///     probe; a genuinely absent trusted blob is an invariant violation caught by fsck, not here;
-    ///  4. a body-absent precommit or lost owner-liveness ⇒ ABORTED; a missing dependency proof ⇒
-    ///     LOGICAL_ERROR (fail closed);
+    ///  4. lost owner liveness ⇒ retry later (`NETWORK_ERROR`); a missing dependency proof, or a manifest this
+    ///     transaction did not stage and the ref does not commit ⇒ `LOGICAL_ERROR` (fail closed);
     ///  5. atomically replace precommit(build_id) owner with committed(final_ref_name) owner by appending
     ///     ONE pure-move `RefOp` (old_binding={Precommit,final_ref_name,T}, new_binding={Committed,final_ref_name,T},
     ///     same manifest_ref T) and setting refs[final_ref_name];
-    ///  6. promotion never emits blob deltas. A missing-body precommit
-    ///     is non-activating and was rejected at step 4 (the writer re-stages with a fresh ManifestId).
+    ///  6. promotion never emits blob deltas.
     ///
     /// PROCESS-RESTART INVARIANT: a `PartWriteTxn` is a plain in-memory C++ object owned by the wiring's
     /// `ContentAddressedTransaction` — it is NEVER persisted and NEVER resumed across a process
@@ -319,8 +329,8 @@ public:
     /// that definitely did not commit to "fetch the bytes from the same source instead", and doing that
     /// after a commit that actually landed would publish the same part twice.
     ///
-    ///   `NotAttempted` -- promote failed (or was never called) strictly BEFORE its append: a rejected
-    ///                     validation, an absent body, a lost owner liveness. Proof of the negative.
+    ///   `NotAttempted` -- promote failed (or was never called) strictly BEFORE its append: `requireAlive`
+    ///                     or the namespace check refused it. Proof of the negative.
     ///   `Uncertain`    -- the append was attempted and its outcome is unknown. Conservative: the ref
     ///                     lane collapses `DefiniteFailure` and a pre-attempt refusal into the same
     ///                     retry-later class as a genuinely ambiguous `PUT`, so both are reported here
@@ -384,17 +394,19 @@ private:
 
     std::vector<ManifestId> staged_manifests;             /// for best-effort abandon cleanup
 
-    /// Every `ManifestId` this transaction has minted via `stageManifest`, checked by `precommitAdd`:
-    /// an unowned id may enter ownership only from the transaction that freshly staged it. Kept separate from
-    /// `staged_manifests` above -- that vector's role (best-effort abandon cleanup) is unrelated and
-    /// could change independently; this set exists purely as the ABA barrier's identity check, so it
-    /// stays correct even if the cleanup vector's contents or lifetime ever change.
-    std::set<ManifestId> staged_manifest_ids;
+    /// The `BlobRef` of every `Blob` entry of each manifest this transaction staged, in the body's canonical order.
+    /// Its keys are the ABA barrier of `precommitAdd` and `promote`: an unowned id may enter ownership only from
+    /// the transaction that freshly staged it. Kept separate from `staged_manifests`, whose role (best-effort
+    /// abandon cleanup) is unrelated and could change independently. Shared and immutable, so the `promote`
+    /// closure holds the leaves itself rather than a pointer into this map.
+    std::map<ManifestId, std::shared_ptr<const std::vector<BlobRef>>> staged_manifest_leaves;
 
     std::map<DepKey, BlobDepRecord> deps;                 /// dependencies recorded by this build (blobs only)
 
     /// Backing state for `setMergeHookForTest`; empty (no-op) in production.
     std::function<void(size_t)> merge_hook_for_test;
+    /// Backing state for `setPromoteBeforeAppendHookForTest`; empty in production.
+    std::function<void()> promote_before_append_hook_for_test;
 };
 
 }

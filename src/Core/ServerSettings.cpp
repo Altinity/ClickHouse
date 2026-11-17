@@ -184,7 +184,7 @@ A value of `0` means unlimited.
     DECLARE(UInt64, max_format_parsing_thread_pool_size, 100, R"(
 Maximum total number of threads to use for parsing input.
 )", 0) \
-    DECLARE(UInt64, cas_blob_upload_pool_size, 16, R"(
+    DECLARE(UInt64, cas_blob_upload_pool_size, 64, R"(
 ClickHouse uses threads from this dedicated server-wide pool to upload blobs in parallel when
 committing a content-addressed (CAS) part. `cas_blob_upload_pool_size` limits the
 maximum number of threads in the pool. Zero is rejected: the pool must have at least one thread.

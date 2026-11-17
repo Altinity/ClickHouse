@@ -176,10 +176,10 @@ ManifestRef manifestRefFor(const String & tag)
 }
 
 /// Publish a part holding the given manifest entries verbatim through the real PartWriteTxn. Used by read-path
-/// lookup/list tests that want a precise multi-entry manifest. Each Blob entry's body MUST be present at
-/// promote: the promote gate revalidates EVERY blob leaf with a HEAD and fails closed on an absent body.
-/// So write a blob body for each Blob entry (addressed by its hash) and record it as W-EVIDENCE before
-/// staging. Inline entries need no body. Returns the published ManifestId.
+/// lookup/list tests that want a precise multi-entry manifest. Promote fails closed on a Blob leaf without
+/// a dependency proof, so write a blob body for each Blob entry (addressed by its hash) and record it as
+/// W-EVIDENCE (`adoptEvidence`, a `TrustedManifest` proof) before staging. Inline entries need no body.
+/// Returns the published ManifestId.
 ManifestId publishPartWithEntries(
     const PoolPtr & s, const String & ns, const String & ref, std::vector<ManifestEntry> entries)
 {
@@ -190,8 +190,7 @@ ManifestId publishPartWithEntries(
     for (const auto & e : entries)
         if (e.placement == EntryPlacement::Blob)
         {
-            /// Materialize the blob body so the promote-time HEAD revalidation succeeds, then record the
-            /// tokenless W-EVIDENCE dep (the gate re-observes the current token at promote).
+            /// Write the blob body, then record the W-EVIDENCE dep that promote's dependency-proof check needs.
             DB::Cas::tests::writeBlobBody(*s->poolBackendPtr(), s->layout(), e.ref.digest.toU128());
             build->adoptEvidence(e);
         }
@@ -200,6 +199,28 @@ ManifestId publishPartWithEntries(
     build->promote(nsr, ref, build->buildId(), id);
     return id;
 }
+}
+
+/// The disk's request window reaches every request plane a pool exposes, not only the one a give-up
+/// test happens to use. A plane built with the default window would freeze a 120 s deadline here.
+TEST(CASPool, EveryExposedRequestPlaneTakesTheConfiguredRequestWindow)
+{
+    constexpr uint64_t window_ms = 20'000;
+    auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
+    DB::Cas::PoolConfig config{.pool_prefix = "p", .server_root_id = "test"};
+    config.cas_request_budget.request_window_ms = window_ms;
+    DB::Cas::PoolPtr store = DB::Cas::Pool::open(backend, std::move(config));
+    const auto clock = DB::Cas::tests::VirtualRetryClock::installOn(store);
+
+    const std::vector<std::pair<const char *, DB::Cas::CasRequests *>> planes{
+        {"mount", &store->mountRequests()}, {"lease", &store->leaseRequests()}, {"gc", &store->openRequests()}};
+    for (const auto & [name, plane] : planes)
+    {
+        DB::Cas::CasOperation op = plane->admit();
+        const DB::Cas::Retry frozen = op.freeze(DB::Cas::Retry::standard());
+        ASSERT_TRUE(frozen.policy_deadline_ms) << name;
+        EXPECT_EQ(*frozen.policy_deadline_ms, clock->nowMs() + window_ms) << name;
+    }
 }
 
 TEST(CASPool, ReadOnlyOpenSkipsProbe)
@@ -897,8 +918,8 @@ TEST(CASPool, ReadManifestValidatesBodyAndFailsClosed)
 
     /// (3) a committed ref naming a manifest with NO body present => readManifest throws
     /// FILE_DOESNT_EXIST (INV-NO-DANGLE surfaced on the read path). resolveRef itself SUCCEEDS — refs
-    /// are pure manifest state. A raw ref-log fixture (not the real PartWriteTxn path, which validates the
-    /// body exists at promote) is the only way to construct this state.
+    /// are pure manifest state. A raw ref-log fixture builds this state directly; on the real PartWriteTxn
+    /// path `stageManifest` returns an id only after the body is written.
     {
         const ManifestRef missing_ref = manifestRefFor("never-staged");
         DB::Cas::tests::fixture::writeRefLogRaw(*b, layout, RefLogTxn{ns.string(), RefTxnId{1, 1},
@@ -2151,8 +2172,9 @@ public:
         : mount(backend, DB::Cas::Fence{
               [this] { return runtime.fenceGeneration(); },
               [this](uint64_t g, uint64_t needed) { return runtime.admit(g, needed); },
-              [this](uint64_t g) { runtime.checkFenceOrThrow(g); }})
-        , lease(backend, DB::Cas::Fence::open())
+              [this](uint64_t g) { runtime.checkFenceOrThrow(g); }},
+              {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs)
+        , lease(backend, DB::Cas::Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs)
         , runtime(backend, mount, lease, std::forward<Args>(args)...)
     {
         /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the
@@ -2258,7 +2280,7 @@ void verifyForeignConflictSinkIsNonInterfering(ForeignConflictSinkBehavior behav
         [] { return false; });
     CasMountRuntime & runtime = *runtime_holder;
     runtime_ptr = &runtime;
-    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    runtime.installRenewer(uuid, 1, /*last_unclean_epoch=*/0, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 1000);
 
@@ -2524,7 +2546,7 @@ TEST(CASPoolShutdown, UnresolvedWedgeSkipsFarewell)
             *fake_boot += ms;
         }});
     /// The engine's own inter-attempt sleep advances the same clock its deadlines are read from, so the
-    /// retry bound is reached in test time rather than in ninety real seconds.
+    /// retry bound is reached in test time rather than after a real request window.
     store->setCasRetrySleepForTest([fake_boot](uint64_t ms)
     {
         *fake_boot += ms;
@@ -2838,6 +2860,11 @@ TEST(CASMountOpenWaits, PublicationHorizonUsesTheEnvelope)
         auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
         Layout l{"p"};
         DB::Cas::tests::seedPoolMetaForRestart(*b);
+        /// This test measures the horizon of a mount that has no floor raise to do.
+        {
+            DB::Cas::tests::OperationForTest op(*b);
+            PoolMeta::raiseMinReaderGeneration(*op, l, Pool::mount_reader_floor);
+        }
         /// Held in a shared atomic, not a plain local: the hooks below mutate it, and the Pool can
         /// outlive this lambda's own stack frame (a background publish holds `shared_from_this()`), so
         /// a by-reference capture of a local would dangle.
@@ -2872,6 +2899,145 @@ TEST(CASMountOpenWaits, PublicationHorizonUsesTheEnvelope)
     /// equality too, so this must also redo -- reverting the strict comparison to "<=" would make this
     /// case behave like the fits-both case (two writes).
     EXPECT_EQ(mountWriteCount(70), 3u) << "an exact boundary (renewal_window_ms == remaining) must be refused, not accepted";
+}
+
+namespace
+{
+
+/// A pool meta at reader floor 1, as a generation-1 writer leaves it, ready for `Pool::open` with prefix "p".
+void seedFloorOne(DB::Cas::Backend & backend)
+{
+    DB::Cas::tests::seedPoolMetaForRestart(backend);
+}
+
+uint64_t storedFloor(DB::Cas::Backend & backend)
+{
+    return decodePoolMeta(readObj(backend, Layout("p").poolMetaKey()).value().bytes).min_reader_generation;
+}
+
+}
+
+TEST(CASMountOpenWaits, FloorRaiseIsCountedByTheRenewalWindowCheck)
+{
+    /// Same envelope as `PublicationHorizonUsesTheEnvelope` (window 600, safe deadline 950) over a held
+    /// boot clock. The pool-meta write is the raise itself, so `extra_ms` is spent inside it.
+    const auto mountWriteCount = [](uint64_t extra_ms) -> uint64_t
+    {
+        auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
+        Layout l{"p"};
+        seedFloorOne(*b);
+        auto fake_boot = std::make_shared<std::atomic<uint64_t>>(0);
+        b->onBeforeWrite(l.poolMetaKey(), [fake_boot, extra_ms] { *fake_boot += extra_ms; });
+        PoolPtr store = Pool::open(b, PoolConfig{
+            .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "test",
+            .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+            .cas_request_budget = CasRequestBudget{.attempt_timeout_ms = 100, .lease_safety_margin_ms = 50, .connect_timeout_cap_ms = 100},
+            .boot_ms_fn = [fake_boot] { return fake_boot->load(); },
+            .wait_sleep_fn = [fake_boot](uint64_t ms) { *fake_boot += ms; },
+        });
+        EXPECT_EQ(store->poolMeta().min_reader_generation, G_REF_CHAIN);
+        return b->putOverwriteCount(l.mountKey("test")) + b->putCount(l.mountKey("test"));
+    };
+
+    EXPECT_EQ(mountWriteCount(0), 2u) << "a raise that costs no time leaves the horizon intact";
+    EXPECT_EQ(mountWriteCount(500), 3u) << "the time the raise took must count against the renewal window";
+}
+
+TEST(CASPool, FloorRaiseLogsTheNewFloor)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    seedFloorOne(*b);
+    DB::Cas::tests::ScopedLoggerCapture capture("CasPool", "warning");
+    PoolPtr store = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    EXPECT_NE(
+        capture.captured().find("min_reader_generation raised 1 -> 3; readers below generation 3 can no longer mount this pool"),
+        String::npos) << capture.captured();
+}
+
+TEST(CASPool, WritableMountRaisesTheFloorToThreeBeforeAnyGenerationThreeObject)
+{
+    struct WriteJournalBackend : InMemoryBackend
+    {
+        std::mutex mutex;
+        std::vector<String> written;
+        std::expected<String, Backend::RawConflict> write(const String & key, const String & bytes,
+                                                          const std::optional<String> & expected_value,
+                                                          TransportAccess & access) override
+        {
+            {
+                std::lock_guard lock(mutex);
+                written.push_back(key);
+            }
+            return InMemoryBackend::write(key, bytes, expected_value, access);
+        }
+    };
+    auto b = std::make_shared<WriteJournalBackend>();
+    const Layout l{"p"};
+    seedFloorOne(*b);
+    {
+        DB::Cas::tests::OperationForTest op(*b);
+        PoolMeta::raiseMinReaderGeneration(*op, l, G_REF_MOVE);
+    }
+    ASSERT_EQ(storedFloor(*b), G_REF_MOVE);
+    {
+        std::lock_guard lock(b->mutex);
+        b->written.clear();
+    }
+
+    DB::Cas::tests::ScopedLoggerCapture capture("CasPool", "warning");
+    PoolPtr store = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    const RootNamespace ns{"srv1/floor_three"};
+    store->appendRefOps(ns, MutationScope::ref("a"),
+        [](const RefTableState & state)
+        {
+            std::vector<RefOp> ops;
+            if (state.getLifecycle() != RefLifecycle::Live)
+                ops.push_back(DB::Cas::tests::namespaceBirthOp());
+            return ops;
+        }, RootMutationOrigin::Writer, RootMutationKind::Publish);
+
+    EXPECT_EQ(storedFloor(*b), G_REF_CHAIN);
+    std::vector<String> written;
+    {
+        std::lock_guard lock(b->mutex);
+        written = b->written;
+    }
+    const auto raise = std::find(written.begin(), written.end(), l.poolMetaKey());
+    ASSERT_NE(raise, written.end());
+    size_t ref_writes = 0;
+    for (auto it = written.begin(); it != written.end(); ++it)
+    {
+        if (!it->contains("/_ckpt") && !it->contains("/_log/"))
+            continue;
+        ++ref_writes;
+        EXPECT_GT(it - written.begin(), raise - written.begin()) << *it << " was written before the floor raise";
+    }
+    EXPECT_GE(ref_writes, 2u) << "the creation's _ckpt and the birth log must be among the writes";
+    EXPECT_NE(
+        capture.captured().find("min_reader_generation raised 2 -> 3; readers below generation 3 can no longer mount this pool"),
+        String::npos) << capture.captured();
+}
+
+TEST(CASPool, FloorIsRaisedBeforeTheWorkersStart)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    seedFloorOne(*b);
+    auto workers_started = std::make_shared<std::atomic<uint64_t>>(0);
+    auto started_at_raise = std::make_shared<std::atomic<uint64_t>>(~uint64_t{0});
+    b->onBeforeWrite(Layout("p").poolMetaKey(), [workers_started, started_at_raise]
+    {
+        *started_at_raise = workers_started->load();
+        throw std::runtime_error("injected fault: pool meta write refused");
+    });
+    EXPECT_ANY_THROW(Pool::open(b, PoolConfig{
+        .pool_prefix = "p", .server_root_id = "test", .background_watermark = true,
+        .worker_factory = [workers_started](std::function<void()> body)
+        {
+            ++*workers_started;
+            return ThreadFromGlobalPool(std::move(body));
+        }}));
+    EXPECT_EQ(started_at_raise->load(), 0u) << "the raise must be written before any background worker is created";
+    EXPECT_EQ(storedFloor(*b), 1u);
 }
 
 /// Same reservation change as `PublicationHorizonUsesTheEnvelope` above, exercised through the remount
@@ -3173,19 +3339,10 @@ TEST(CASRemountWaits, UnresolvedWedgeRemountPaysNoWaitEither)
            "fenced by the recovery seal, not waited out";
 }
 
-/// Sealing is decided by ARITHMETIC -- `epoch < live_epoch` -- and by nothing else. This test used to
-/// pin the opposite ("a table recovered under a later CLEAN boundary must not seal"), which was the
-/// right rule while a seal was a synthetic SNAPSHOT published only to close an unclean handover: such a
-/// seal after a clean shutdown was pure parasitic cost, so it was gated on the per-epoch unclean flag.
-///
-/// INV-2's seal is not that object. It is the chain link that makes a MISSING epoch detectable across a
-/// transition, and a chain that skips every epoch whose mount happened to shut down cleanly is not a
-/// chain -- the next sequence-1 transaction would have no `prev_epoch_seal` to name, and no reader could
-/// tell "epoch 2 was empty" from "epoch 2's records are gone". So a late-touched table now closes EVERY
-/// dead epoch below the live one, however its predecessors died, and this test pins that plus the two
-/// things that must still be true: the seals land IN-BAND (at log keys, at the slot a straggler would
-/// have taken) and no synthetic seal SNAPSHOT is written anywhere.
-TEST(CASRemountWaits, ALateTouchedTableClosesEveryDeadEpochInBandHoweverItsPredecessorsDied)
+/// Closing the chain is decided by arithmetic -- chain epoch below the live one -- and by nothing else: a
+/// late-touched table gets its tombstone however its predecessors died. The tombstone lands IN-BAND, at
+/// the slot a straggler would have taken, names the live epoch, and no epoch between gets an object.
+TEST(CASRemountWaits, ALateTouchedTableIsClosedInBandHoweverItsPredecessorsDied)
 {
     CasRequestBudget budget;
     budget.attempt_timeout_ms = 100;
@@ -3260,13 +3417,16 @@ TEST(CASRemountWaits, ALateTouchedTableClosesEveryDeadEpochInBandHoweverItsPrede
     /// remounts. Its only data is at epoch 1, so epochs 1 and 2 are both dead for it.
     EXPECT_EQ(store->listRefs(ns2).size(), 1u);
 
-    EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryEpochSealed], sealed_before + 2)
-        << "both dead epochs must be closed -- the chain link is what a later reader needs to tell an "
-           "EMPTY epoch from a LOST one, and that is independent of how each mount ended";
-    EXPECT_TRUE(readObj(*backend, layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns2), RefTxnId{1, 2})).has_value())
-        << "epoch 1 closes at the slot right after its last durable id, in-band";
-    EXPECT_TRUE(readObj(*backend, layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns2), RefTxnId{2, 1})).has_value())
-        << "empty epoch 2 closes at its own sequence 1, chained to the epoch-1 seal";
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryEpochSealed], sealed_before + 1)
+        << "one tombstone closes the chain, independent of how each mount ended";
+    /// The part's precommit and promote are `{1,1}` and `{1,2}`.
+    const auto tombstone = readObj(*backend, layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns2), RefTxnId{1, 3}));
+    ASSERT_TRUE(tombstone.has_value()) << "the chain closes at the slot right after its last durable id, in-band";
+    const RefLogTxn closing = decodeRefLogTxn(openObject(FormatId::RefLog, tombstone->bytes), ns2.string(), RefTxnId{1, 3});
+    EXPECT_TRUE(refLogTxnIsEpochSeal(closing));
+    EXPECT_EQ(closing.next_epoch, std::optional<uint64_t>{3});
+    EXPECT_FALSE(readObj(*backend, layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns2), RefTxnId{2, 1})).has_value())
+        << "epoch 2 never wrote the namespace and gets no object";
     const RefTxnId retired_sentinel_id{2, std::numeric_limits<uint64_t>::max()};
     EXPECT_FALSE(readObj(*backend, layout.refSnapshotKey(DB::Cas::tests::fixture::fixtureLife(ns2), retired_sentinel_id)).has_value())
         << "and NO synthetic seal snapshot is written: that shape is retired";
@@ -3480,7 +3640,7 @@ TEST(CASPoolRemount, DirectRenewCannotRaceWorkerStartOrRenewerReplacement)
                                      .boot_ms_fn = [&] { return boot_ms; }},
         "test", sink, runtimeRenewBudget(), [] { return false; });
     CasMountRuntime & runtime = *runtime_holder;
-    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    runtime.installRenewer(uuid, 1, /*last_unclean_epoch=*/0, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 1000);
 
@@ -3490,7 +3650,7 @@ TEST(CASPoolRemount, DirectRenewCannotRaceWorkerStartOrRenewerReplacement)
     auto direct = std::async(std::launch::async, [&] { runtime.renewWatermarkOnce(); });
     barrier.waitUntilArrived();
     EXPECT_RUNTIME_STATE_REJECTION(runtime.startBackgroundWorkers(std::chrono::milliseconds(10)));
-    EXPECT_RUNTIME_STATE_REJECTION(runtime.installRenewer(uuid, 2, [&] { return wall_ms; }));
+    EXPECT_RUNTIME_STATE_REJECTION(runtime.installRenewer(uuid, 2, /*last_unclean_epoch=*/0, [&] { return wall_ms; }));
     EXPECT_RUNTIME_STATE_REJECTION(runtime.renewerReset());
     barrier.release();
     EXPECT_NO_THROW(direct.get());
@@ -3521,7 +3681,7 @@ TEST(CASPoolRemount, DueWorkerAdmissionIsReservedBeforeParkRequest)
             return false;
         });
     CasMountRuntime & runtime = *runtime_holder;
-    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    runtime.installRenewer(uuid, 1, /*last_unclean_epoch=*/0, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 1000);
     runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
@@ -3556,7 +3716,7 @@ TEST(CASPoolRemount, DueWorkerAdmissionIsReservedBeforeStop)
             .renewal_admitted_hook_for_test = [&] { admitted.arriveAndWait(); }},
         "test", sink, runtimeRenewBudget(), [] { return false; });
     CasMountRuntime & runtime = *runtime_holder;
-    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    runtime.installRenewer(uuid, 1, /*last_unclean_epoch=*/0, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 1000);
     runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
@@ -3584,7 +3744,7 @@ TEST(CASPoolRemount, DirectRenewIsRefusedForBackgroundConfiguredRuntimeAfterStop
                     .boot_ms_fn = [&] { return boot_ms; }},
         "test", sink, runtimeRenewBudget(), [] { return false; });
     CasMountRuntime & runtime = *runtime_holder;
-    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    runtime.installRenewer(uuid, 1, /*last_unclean_epoch=*/0, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 1000);
     runtime.startBackgroundWorkers(std::chrono::hours(1));
@@ -3618,7 +3778,7 @@ TEST(CASPoolRemount, RemountWaitsForRenewalParkedBeforeReplacement)
             return false;
         });
     CasMountRuntime & runtime = *runtime_holder;
-    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    runtime.installRenewer(uuid, 1, /*last_unclean_epoch=*/0, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 1000);
     backend->barrier = &renewal_barrier;
@@ -3661,7 +3821,7 @@ TEST(CASPoolRemount, TeardownJoinsBothWorkersBeforeRelease)
                     .boot_ms_fn = [&] { return boot_ms; }, .worker_factory = factory},
         "test", sink, runtimeRenewBudget(), [] { return false; });
     CasMountRuntime & runtime = *runtime_holder;
-    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    runtime.installRenewer(uuid, 1, /*last_unclean_epoch=*/0, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 1000);
     runtime.startBackgroundWorkers(std::chrono::hours(1));
@@ -3703,7 +3863,7 @@ TEST(CASMountRuntime, BadAllocInsideTheRenewalStaysTerminal)
     /// parked on the barrier while the runtime's destructor joins it.
     SCOPE_EXIT({ reported.release(); });
     CasMountRuntime & runtime = *runtime_holder;
-    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    runtime.installRenewer(uuid, 1, /*last_unclean_epoch=*/0, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 1000);
     const uint64_t leases_lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost];
@@ -3831,7 +3991,7 @@ TEST(CASMountRuntime, GlobalMemoryLimitDoesNotEndTheLeaseThread)
         second_admission.release();
     });
     CasMountRuntime & runtime = *runtime_holder;
-    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    runtime.installRenewer(uuid, 1, /*last_unclean_epoch=*/0, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 1000);
     const uint64_t leases_lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost];
@@ -3916,7 +4076,7 @@ TEST(CASPoolRemount, NaturalTerminalTransitionMakesBothPersistentWorkersSelfExit
             });
         CasMountRuntime & runtime = *runtime_holder;
         runtime_ptr = &runtime;
-        runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+        runtime.installRenewer(uuid, 1, /*last_unclean_epoch=*/0, [&] { return wall_ms; });
         const uint64_t anchor = runtime.startRenewer();
         runtime.armMountFence(uuid, 1, anchor + 1000);
         runtime.startBackgroundWorkers(std::chrono::hours(1));
@@ -4025,7 +4185,7 @@ TEST(CASPoolRemount, ParkedRenewalCannotMissNaturalTerminalPublication)
             });
         CasMountRuntime & runtime = *runtime_holder;
         runtime_ptr = &runtime;
-        runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+        runtime.installRenewer(uuid, 1, /*last_unclean_epoch=*/0, [&] { return wall_ms; });
         const uint64_t anchor = runtime.startRenewer();
         runtime.armMountFence(uuid, 1, anchor + 1000);
         runtime.startBackgroundWorkers(std::chrono::hours(1));
@@ -4078,7 +4238,7 @@ TEST(CASPoolRemount, VanishedReasonPreparationFailureLeavesTerminalTransitionRet
             }},
         "test", sink, runtimeRenewBudget(), [] { return false; });
     CasMountRuntime & runtime = *runtime_holder;
-    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    runtime.installRenewer(uuid, 1, /*last_unclean_epoch=*/0, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 1000);
     runtime.startBackgroundWorkers(std::chrono::hours(1));
@@ -4130,7 +4290,7 @@ TEST(CASPoolRemount, WorkerConstructionRollbackFailsOpenClosed)
                         .boot_ms_fn = [&] { return boot_ms; }, .worker_factory = factory},
             "test", sink, runtimeRenewBudget(), [] { return false; });
         CasMountRuntime & runtime = *runtime_holder;
-        runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+        runtime.installRenewer(uuid, 1, /*last_unclean_epoch=*/0, [&] { return wall_ms; });
         const uint64_t anchor = runtime.startRenewer();
         runtime.armMountFence(uuid, 1, anchor + 1000);
         EXPECT_THROW(runtime.startBackgroundWorkers(std::chrono::milliseconds(10)), DB::Exception);
@@ -4169,10 +4329,10 @@ TEST(CASPoolRemount, ExternalLossDuringRenewalUsesOneRecoveryGeneration)
             EXPECT_EQ(fresh.kind, MountClaimResult::Claimed);
             if (fresh.kind != MountClaimResult::Claimed)
                 return false;
-            runtime_ptr->installRenewer(uuid, 2, [&] { return wall_ms; });
+            runtime_ptr->installRenewer(uuid, 2, /*last_unclean_epoch=*/0, [&] { return wall_ms; });
             const uint64_t fresh_anchor = runtime_ptr->startRenewer();
             runtime_ptr->setProcessEpoch(2, std::memory_order_release);
-            runtime_ptr->setLiveWriterEpoch(2);
+            runtime_ptr->setLiveWriterEpoch(2, /*last_unclean_epoch=*/0);
             runtime_ptr->armMountFence(uuid, 2, fresh_anchor + 1000);
             runtime_ptr->noteRemounted();
             remount_barrier.arriveAndWait();
@@ -4180,7 +4340,7 @@ TEST(CASPoolRemount, ExternalLossDuringRenewalUsesOneRecoveryGeneration)
         });
     CasMountRuntime & runtime = *runtime_holder;
     runtime_ptr = &runtime;
-    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    runtime.installRenewer(uuid, 1, /*last_unclean_epoch=*/0, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 1000);
     backend->barrier = &renewal_barrier;
@@ -4223,7 +4383,7 @@ TEST(CASPoolRemount, TerminalDepositionDoesNotTouchRenewerAfterReplacement)
             .renewal_terminal_deposited_hook_for_test = [&]
             {
                 runtime_ptr->renewerReset();
-                runtime_ptr->installRenewer(uuid, 2, [&] { return wall_ms; });
+                runtime_ptr->installRenewer(uuid, 2, /*last_unclean_epoch=*/0, [&] { return wall_ms; });
                 runtime_ptr->renewerReset();
                 replaced.store(true, std::memory_order_release);
                 terminal_deposited.arriveAndWait();
@@ -4235,7 +4395,7 @@ TEST(CASPoolRemount, TerminalDepositionDoesNotTouchRenewerAfterReplacement)
         });
     CasMountRuntime & runtime = *runtime_holder;
     runtime_ptr = &runtime;
-    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    runtime.installRenewer(uuid, 1, /*last_unclean_epoch=*/0, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 1000);
     /// A definitive answer ends the worker's renewal; a transient fault would only be retried.
@@ -4273,7 +4433,7 @@ TEST(CASPoolRemount, ConcurrentRemountRequestIsProcessedAfterActiveGeneration)
             return true;
         });
     CasMountRuntime & runtime = *runtime_holder;
-    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    runtime.installRenewer(uuid, 1, /*last_unclean_epoch=*/0, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 1000);
     runtime.startBackgroundWorkers(std::chrono::hours(1));
@@ -4319,7 +4479,7 @@ TEST(CASPoolRemount, ImmediatePostRemountRenewalFailureIsNotDropped)
                 EXPECT_EQ(fresh.kind, MountClaimResult::Claimed);
                 if (fresh.kind != MountClaimResult::Claimed)
                     return false;
-                runtime_ptr->installRenewer(uuid, 2, [&] { return wall_ms; });
+                runtime_ptr->installRenewer(uuid, 2, /*last_unclean_epoch=*/0, [&] { return wall_ms; });
                 const uint64_t fresh_anchor = runtime_ptr->startRenewer();
                 runtime_ptr->armMountFence(uuid, 2, fresh_anchor + 10'000);
                 runtime_ptr->noteRemounted();
@@ -4334,7 +4494,7 @@ TEST(CASPoolRemount, ImmediatePostRemountRenewalFailureIsNotDropped)
         });
     CasMountRuntime & runtime = *runtime_holder;
     runtime_ptr = &runtime;
-    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    runtime.installRenewer(uuid, 1, /*last_unclean_epoch=*/0, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 10'000);
     runtime.startBackgroundWorkers(std::chrono::milliseconds(1000));
@@ -4375,7 +4535,7 @@ public:
         config.boot_ms_fn = [this] { return boot_ms.load(); };
         holder.emplace(backend, layout, std::move(config), "test", sink, runtimeRenewBudget(), std::move(remount));
         CasMountRuntime & opened = runtime();
-        opened.installRenewer(uuid, 1, [this] { return wall_ms; });
+        opened.installRenewer(uuid, 1, /*last_unclean_epoch=*/0, [this] { return wall_ms; });
         anchor = opened.startRenewer();
         opened.armMountFence(uuid, 1, anchor + ttl_ms);
         return opened;
@@ -4433,7 +4593,7 @@ TEST(CASMountRuntime, AnOldEpochRenewalDoesNotMoveTheNewEpochDeadline)
                 *DB::Cas::tests::OperationForTest(renewal.backend), renewal.layout, "test", renewal.uuid, 2,
                 renewal.wall_ms, renewal.ttl_ms);
             EXPECT_EQ(fresh.kind, MountClaimResult::Claimed);
-            renewal.runtime().installRenewer(renewal.uuid, 2, [&] { return renewal.wall_ms; });
+            renewal.runtime().installRenewer(renewal.uuid, 2, /*last_unclean_epoch=*/0, [&] { return renewal.wall_ms; });
             const uint64_t fresh_anchor = renewal.runtime().startRenewer();
             renewal.runtime().armMountFence(renewal.uuid, 2, fresh_anchor + 5 * renewal.ttl_ms);
             renewal.runtime().noteRemounted();
@@ -5005,7 +5165,7 @@ TEST(CASPoolShutdown, PreSendCancellationAllowsFarewellButAmbiguityDoesNot)
                         .boot_ms_fn = [&] { return boot_ms; }},
             "test", sink, runtimeRenewBudget(), [] { return false; });
         CasMountRuntime & runtime = *runtime_holder;
-        runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+        runtime.installRenewer(uuid, 1, /*last_unclean_epoch=*/0, [&] { return wall_ms; });
         const uint64_t anchor = runtime.startRenewer();
         runtime.armMountFence(uuid, 1, anchor + 1000);
         if (ambiguous)
@@ -5052,7 +5212,7 @@ TEST(CASPool, DirectAndStartupTerminalFailuresRethrowTypedExceptions)
                 .renewal_live_for_test = [&] { return renewal_live.load(std::memory_order_acquire); }},
             "test", sink, runtimeRenewBudget(), [] { return false; });
         CasMountRuntime & runtime = *runtime_holder;
-        runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+        runtime.installRenewer(uuid, 1, /*last_unclean_epoch=*/0, [&] { return wall_ms; });
         const uint64_t anchor = runtime.startRenewer();
         runtime.armMountFence(uuid, 1, anchor + 1000);
         if (refusal == Refusal::PreAttemptDeadline)
@@ -5162,7 +5322,7 @@ TEST(CASPool, DeterministicWorkerFailureFencesWithoutWaitingForCadence)
             return false;
         });
     CasMountRuntime & runtime = *runtime_holder;
-    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    runtime.installRenewer(uuid, 1, /*last_unclean_epoch=*/0, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 1000);
     /// A definitive answer ends the worker's renewal; a transient fault would only be retried.
@@ -5440,4 +5600,298 @@ TEST(CASPool, ConcurrentNamespaceCreationsNeverRaceEachOtherOnTheCatalog)
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASHotKeyReadStarts] - lane_reads_mid, 0u)
         << "the next hold starts from what the resolve read saw";
     EXPECT_EQ(backend->writeCount(key) - writes_mid, 3u) << "one refused, two landed";
+}
+
+namespace
+{
+
+constexpr uint64_t kMarkerNowMs = 1000;
+constexpr uint64_t kMarkerTtlMs = 100;
+
+/// A body of uuid 1 at `epoch` that a claim at a higher epoch replaces; `marker` is its `last_unclean_epoch`.
+MountLease predecessorBody(uint64_t epoch, std::optional<uint64_t> marker)
+{
+    return MountLease{
+        .server_uuid = UInt128(1), .writer_epoch = epoch, .hostname = "h", .pid = 1, .started_at_ms = 1, .seq = 1,
+        .expires_at_ms = 100, .min_active_build_sequence = 0, .gc_fenced = false, .write_attempt_id = UInt128(9),
+        .last_unclean_epoch = marker};
+}
+
+MountLease storedSlot(Backend & backend, const Layout & layout, const String & srid)
+{
+    const auto got = readObj(backend, layout.mountKey(srid));
+    if (!got)
+        throw DB::Exception(DB::ErrorCodes::ABORTED, "test fixture: the mount slot of '{}' is absent", srid);
+    return decodeMountLease(got->bytes);
+}
+
+/// Seeds a GC-fenced body at epoch 5 and claims over it at epoch 7, so the claim's marker is 5.
+MountClaimResult claimAtSevenOverFencedFive(const std::shared_ptr<InMemoryBackend> & backend, const Layout & layout)
+{
+    MountLease fenced = predecessorBody(5, 3);
+    fenced.gc_fenced = true;
+    createObj(*backend, layout.mountKey("r"), encodeMountLease(fenced));
+    return claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "r", UInt128(1), 7, kMarkerNowMs, kMarkerTtlMs);
+}
+
+}
+
+TEST(CASPool, ClaimSetsLastUncleanEpoch)
+{
+    enum class Certificate : uint8_t { None, ProvenDead, Unsafe };
+    struct Case
+    {
+        String name;
+        std::optional<MountLease> predecessor;
+        Certificate certificate;
+        uint64_t expected;
+    };
+    MountLease farewell_with_marker = predecessorBody(5, 3);
+    farewell_with_marker.min_active_build_sequence = std::numeric_limits<uint64_t>::max();
+    MountLease farewell_without_marker = predecessorBody(5, std::nullopt);
+    farewell_without_marker.min_active_build_sequence = std::numeric_limits<uint64_t>::max();
+    MountLease fenced = predecessorBody(5, 3);
+    fenced.gc_fenced = true;
+    const std::vector<Case> cases{
+        {"no slot", std::nullopt, Certificate::None, 6},
+        {"clean farewell with the field", farewell_with_marker, Certificate::None, 3},
+        {"clean farewell without the field", farewell_without_marker, Certificate::None, 5},
+        {"gc fenced", fenced, Certificate::None, 5},
+        {"proven dead by its token", predecessorBody(5, 3), Certificate::ProvenDead, 5},
+        {"unsafe reclaim authorization", predecessorBody(5, 3), Certificate::Unsafe, 5},
+    };
+    for (const Case & c : cases)
+    {
+        SCOPED_TRACE(c.name);
+        auto backend = std::make_shared<InMemoryBackend>();
+        const Layout layout("p");
+        std::optional<Etag> token;
+        if (c.predecessor)
+        {
+            createObj(*backend, layout.mountKey("r"), encodeMountLease(*c.predecessor));
+            token = headObj(*backend, layout.mountKey("r"))->etag;
+        }
+        const MountClaimResult claim = claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "r", UInt128(1), 7,
+            kMarkerNowMs, kMarkerTtlMs,
+            /*proven_dead_incarnation=*/c.certificate == Certificate::ProvenDead ? token : std::nullopt, /*sink=*/{},
+            /*unsafe_reclaim_authorization=*/c.certificate == Certificate::Unsafe ? token : std::nullopt);
+        ASSERT_EQ(claim.kind, MountClaimResult::Claimed);
+        ASSERT_TRUE(claim.body.has_value());
+        EXPECT_EQ(claim.body->last_unclean_epoch, c.expected) << "the result carries the written body";
+        EXPECT_EQ(storedSlot(*backend, layout, "r").last_unclean_epoch, c.expected);
+    }
+}
+
+TEST(CASPool, EveryBodyWriterKeepsOrResetsIt)
+{
+    const Layout layout("p");
+    {
+        SCOPED_TRACE("renewer");
+        auto backend = std::make_shared<InMemoryBackend>();
+        const MountClaimResult claim = claimAtSevenOverFencedFive(backend, layout);
+        ASSERT_EQ(claim.kind, MountClaimResult::Claimed);
+        ASSERT_EQ(claim.body.value().last_unclean_epoch, 5u);
+
+        uint64_t now_ms = kMarkerNowMs;
+        uint64_t boot_ms = 100;
+        CasRequests mount = DB::Cas::tests::openRequestsForTest(backend);
+        CasRequests farewell = DB::Cas::tests::openRequestsForTest(backend);
+        for (CasRequests * requests : {&mount, &farewell})
+        {
+            requests->setNowFnForTest([&boot_ms] { return boot_ms; });
+            requests->setSleepFnForTest([&boot_ms](uint64_t ms) { boot_ms += ms; });
+        }
+        MountLeaseRenewer renewer(mount, farewell, layout, "r", UInt128(1), 7, claim.body.value().last_unclean_epoch.value(),
+            std::chrono::milliseconds(kMarkerTtlMs), [&] { return now_ms; }, [] { return uint64_t{0}; }, {},
+            std::chrono::milliseconds(0), [&] { return boot_ms; });
+
+        renewer.start();
+        EXPECT_EQ(storedSlot(*backend, layout, "r").last_unclean_epoch, 5u) << "start";
+
+        now_ms += 10;
+        const MountRenewResult renewed = renewer.renew(MountRenewOperationEnvironment{});
+        ASSERT_EQ(renewed.outcome, MountRenewOutcome::Committed);
+        EXPECT_EQ(storedSlot(*backend, layout, "r").last_unclean_epoch, 5u) << "renewal";
+
+        now_ms += 10;
+        renewer.release();
+        const MountLease released = storedSlot(*backend, layout, "r");
+        ASSERT_TRUE(released.isCleanRelease());
+        EXPECT_EQ(released.last_unclean_epoch, 5u) << "farewell";
+    }
+    {
+        SCOPED_TRACE("fenceOwnClaim");
+        auto backend = std::make_shared<InMemoryBackend>();
+        ASSERT_EQ(claimAtSevenOverFencedFive(backend, layout).kind, MountClaimResult::Claimed);
+        createObj(*backend, layout.ownerKey("r"),
+            encodeOwner(OwnerObject{.server_uuid = UInt128(1), .retired_at_ms = std::nullopt, .owner_life = 2,
+                                    .retirement_verified = false}));
+        DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+        {
+            recheckOwnerAfterClaim(*DB::Cas::tests::OperationForTest(backend), layout, "r",
+                OwnerExpectation{.server_uuid = UInt128(1), .owner_life = 1, .retired = RetiredOwnerPolicy::Refuse}, 7);
+        });
+        const MountLease fenced = storedSlot(*backend, layout, "r");
+        ASSERT_TRUE(fenced.gc_fenced);
+        EXPECT_EQ(fenced.last_unclean_epoch, 5u);
+    }
+    {
+        SCOPED_TRACE("GC fence");
+        auto backend = std::make_shared<InMemoryBackend>();
+        ASSERT_EQ(claimAtSevenOverFencedFive(backend, layout).kind, MountClaimResult::Claimed);
+        MountObservationMap obs;
+        std::set<String> warned;
+        DB::Cas::tests::OperationForTest op(backend);
+        ASSERT_EQ(computeHeartbeatFloor(*op, layout, kMarkerNowMs, [] { return uint64_t{0}; }, 30'000, 1'000, obs, warned)
+                      .fenced_now, 0u);
+        ASSERT_EQ(computeHeartbeatFloor(*op, layout, kMarkerNowMs, [] { return uint64_t{10'000'000}; }, 30'000, 1'000, obs,
+                                        warned).fenced_now, 1u);
+        const MountLease fenced = storedSlot(*backend, layout, "r");
+        ASSERT_TRUE(fenced.gc_fenced);
+        EXPECT_EQ(fenced.last_unclean_epoch, 5u);
+    }
+    {
+        SCOPED_TRACE("rejoin rewrite");
+        auto backend = std::make_shared<InMemoryBackend>();
+        createObj(*backend, layout.ownerKey("r"),
+            encodeOwner(OwnerObject{.server_uuid = UInt128(1), .retired_at_ms = 5, .owner_life = 1, .retirement_verified = true}));
+        createObj(*backend, layout.epochKey("r"), encodeServerEpoch(ServerEpoch{.next_writer_epoch = 8}));
+        MountLease terminal = predecessorBody(6, 4);
+        terminal.min_active_build_sequence = std::numeric_limits<uint64_t>::max();
+        createObj(*backend, layout.mountKey("r"), encodeMountLease(terminal));
+
+        const uint64_t life = claimOwnerOrThrow(*DB::Cas::tests::OperationForTest(backend), layout, "r", UInt128(2),
+            [] { return RefCatalog{}; }, RetiredOwnerPolicy::RejoinIfVerified, {});
+        ASSERT_EQ(life, 2u);
+        const MountLease rewritten = storedSlot(*backend, layout, "r");
+        ASSERT_EQ(rewritten.server_uuid, UInt128(2)) << "the rejoin rewrote the slot";
+        EXPECT_EQ(rewritten.last_unclean_epoch, 4u);
+    }
+}
+
+TEST(CASPool, LeaseBodyWithoutTheFieldDecodesAsAbsent)
+{
+    MountLease with_marker = predecessorBody(7, 5);
+    const String encoded = encodeMountLease(with_marker);
+    EXPECT_NE(encoded.find("\"last_unclean_epoch\":\"5\""), String::npos) << encoded;
+    EXPECT_EQ(decodeMountLease(encoded).last_unclean_epoch, 5u);
+
+    const MountLease without_marker = predecessorBody(7, std::nullopt);
+    const String old_bytes = encodeMountLease(without_marker);
+    EXPECT_EQ(old_bytes.find("last_unclean_epoch"), String::npos) << old_bytes;
+    EXPECT_EQ(old_bytes,
+        "{\"type\":\"cas_mount_lease\",\"v\":1}\n"
+        "{\"server_uuid\":\"00000000000000000000000000000001\",\"writer_epoch\":\"7\",\"hostname\":\"h\",\"pid\":1,"
+        "\"started_at_ms\":1,\"seq\":\"1\",\"expires_at_ms\":100,\"min_active_build_sequence\":\"0\",\"gc_fenced\":false,"
+        "\"write_attempt_id\":\"00000000000000000000000000000009\"}\n")
+        << "a body without the marker keeps the bytes of a build without the field";
+    EXPECT_FALSE(decodeMountLease(old_bytes).last_unclean_epoch.has_value());
+
+    String with_unknown = old_bytes;
+    with_unknown.insert(with_unknown.rfind('}'), ",\"some_future_key\":\"x\"");
+    const MountLease decoded = decodeMountLease(with_unknown);
+    EXPECT_EQ(decoded.writer_epoch, 7u);
+    EXPECT_FALSE(decoded.last_unclean_epoch.has_value());
+}
+
+TEST(CASPoolRemount, SelfRemountPublishesTheRemountClaimsMarkerWithTheEpoch)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = DB::Cas::tests::openPoolForTest(backend);
+    const String mount_key = store->layout().mountKey("test");
+    const uint64_t epoch = store->liveWriterEpoch();
+    ASSERT_EQ(store->liveEpochPairForTest(), (LiveEpochPair{epoch, epoch - 1})) << "a fresh slot";
+
+    fenceOutMount(*backend, mount_key);
+    EXPECT_THROW(store->renewWatermarkOnce(), DB::Exception);
+    /// Burn one epoch, so the remount's correct marker differs from its own epoch minus 1.
+    {
+        DB::Cas::tests::OperationForTest op(backend);
+        const auto counter = (*op).read(store->layout().epochKey("test"), Retry::standard());
+        ASSERT_TRUE(counter.has_value());
+        const ServerEpoch current = decodeServerEpoch(counter->bytes);
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).replace(store->layout().epochKey("test"),
+            encodeServerEpoch(ServerEpoch{.next_writer_epoch = current.next_writer_epoch + 1}), counter->etag,
+            Retry::standard())));
+    }
+    ASSERT_TRUE(store->tryRemountOnce());
+
+    const uint64_t remount_epoch = store->liveWriterEpoch();
+    ASSERT_EQ(remount_epoch, epoch + 2);
+    EXPECT_EQ(store->liveEpochPairForTest(), (LiveEpochPair{remount_epoch, epoch}));
+    EXPECT_EQ(decodeMountLease(readObj(*backend, mount_key)->bytes).last_unclean_epoch, epoch)
+        << "the body the remount's renewer wrote";
+}
+
+TEST(CASPool, SelfRemountRecoveryUsesTheRemountClaimsMarker)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = DB::Cas::tests::openPoolForTest(backend);
+    const String mount_key = store->layout().mountKey("test");
+    const RootNamespace ns{"srv1/self_remount_marker"};
+    const uint64_t epoch = store->liveWriterEpoch();
+    store->appendRefOps(ns, MutationScope::ref("a"),
+        [](const RefTableState & state)
+        {
+            std::vector<RefOp> ops;
+            if (state.getLifecycle() != RefLifecycle::Live)
+                ops.push_back(DB::Cas::tests::namespaceBirthOp());
+            for (const RefOp & op : DB::Cas::tests::publishCommittedOps("a", ManifestRef{1, 1, 1}))
+                ops.push_back(op);
+            return ops;
+        }, RootMutationOrigin::Writer, RootMutationKind::Publish);
+    const NamespaceLifeId life = store->namespaceLife(ns);
+
+    fenceOutMount(*backend, mount_key);
+    EXPECT_THROW(store->renewWatermarkOnce(), DB::Exception);
+    ASSERT_TRUE(store->tryRemountOnce());
+    const uint64_t remount_epoch = store->liveWriterEpoch();
+    ASSERT_GT(remount_epoch, epoch);
+    EXPECT_EQ(store->liveEpochPairForTest(), (LiveEpochPair{remount_epoch, epoch}))
+        << "a remount claims over a fenced body, so its own epoch ended uncleanly";
+
+    EXPECT_TRUE(store->listRefs(ns).contains("a"));
+    const auto stored = readObj(*backend, store->layout().refLogKey(life, RefTxnId{epoch, 2}));
+    ASSERT_TRUE(stored.has_value()) << "the first read under the new epoch seals the old one";
+    const RefLogTxn tombstone = decodeRefLogTxn(openObject(FormatId::RefLog, stored->bytes), ns.string(), RefTxnId{epoch, 2});
+    EXPECT_TRUE(refLogTxnIsEpochSeal(tombstone));
+    EXPECT_EQ(tombstone.next_epoch, std::optional<uint64_t>{remount_epoch});
+}
+
+TEST(CASPool, OpenPublishesTheClaimsMarkerWithTheEpoch)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    const Layout layout("p");
+    DB::Cas::tests::seedPoolMetaForRestart(*backend);
+    /// A clean farewell at 7 that carries 3: the right marker is 3, distinct from both 0 and the new epoch minus 1.
+    MountLease farewell = predecessorBody(7, 3);
+    farewell.min_active_build_sequence = std::numeric_limits<uint64_t>::max();
+    createObj(*backend, layout.mountKey("test"), encodeMountLease(farewell));
+    createObj(*backend, layout.epochKey("test"), encodeServerEpoch(ServerEpoch{.next_writer_epoch = 8}));
+
+    auto store = Pool::open(backend, PoolConfig{
+        .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "test",
+        .mount_lease_ttl_ms = std::chrono::milliseconds(500),
+        .cas_request_budget = CasRequestBudget{
+            .attempt_timeout_ms = 50, .lease_safety_margin_ms = 50, .connect_timeout_cap_ms = std::nullopt},
+        .wait_sleep_fn = [](uint64_t) {},
+    });
+    ASSERT_EQ(store->liveWriterEpoch(), 8u);
+    EXPECT_EQ(store->liveEpochPairForTest(), (LiveEpochPair{8, 3}));
+    EXPECT_EQ(storedSlot(*backend, layout, "test").last_unclean_epoch, 3u) << "the body the mount's renewer wrote";
+}
+
+TEST(CASMountRuntime, LiveEpochPairIsPublishedTogether)
+{
+    auto backend = std::make_shared<RuntimeRenewBackend>();
+    const Layout layout("runtime-pair");
+    CasEventSink sink;
+    RuntimeUnderTest runtime_holder(
+        backend, layout, MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000)},
+        "test", sink, runtimeRenewBudget(), [] { return false; });
+    CasMountRuntime & runtime = *runtime_holder;
+
+    runtime.setLiveWriterEpoch(9, 8);
+    EXPECT_EQ(runtime.liveEpochPair(), (LiveEpochPair{9, 8}));
+    EXPECT_EQ(runtime.liveWriterEpoch(), 9u);
 }

@@ -22,14 +22,17 @@ namespace DB::Cas
 /// moves.
 ///
 /// Why a result may be fetched early: the objects the fold reads are write-once (a present body is
-/// the same body later), an absent position at or below a checkpoint's `committed_through` was
-/// durable before the round began (it is a gap whenever it is read), and a manifest body still being
-/// uploaded when the early read lands yields the same hold a slightly earlier sequential read yields
-/// today. Nothing is hinted above `committed_through`, so no request is issued that the sequential
-/// walk would not issue -- with one bounded exception: a ref-log hinting site does not yet know where
-/// an epoch's closing seal is (it learns that only by decoding the log at that position), so it may
-/// hint ids past the seal, inside the SAME epoch, that turn out not to exist. Those are discarded
-/// rather than taken, overshooting by at most one window per epoch crossing, and counted wasted.
+/// the same body later), a ref log read absent early is still a key read absent during this round,
+/// which is all the fold's cut asks of it, and a manifest body still being uploaded when the early
+/// read lands yields the same hold a slightly earlier sequential read yields.
+///
+/// Only the result TAKEN, in the walk's order, decides anything; a hint never does. So a hint can cost
+/// a wasted read, never change a verdict. The fold's ref-log hints stay inside the epoch of the key
+/// the walk reads next, up to the greatest id the round's listing shows in that epoch, and, while the
+/// walk has a read budget, within it. `walkRefChain`, through `ReadAheadKeyReader`, hints inside the
+/// current epoch, up to a generation 1 or 2 `committed_through` when it has one. A hinted key the walk
+/// never takes -- past a tombstone, past the chain's end, or after a hold -- is discarded and counted
+/// wasted.
 /// A blob marker is not write-once: the fold hints it only after the round's cut, which is all the
 /// graduation gate needs.
 ///
