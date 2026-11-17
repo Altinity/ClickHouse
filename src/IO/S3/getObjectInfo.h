@@ -53,8 +53,9 @@ ObjectInfo getObjectInfo(
 /// Fetches size + etag (+ multipart part sizes) in a single GetObjectAttributes request instead of a
 /// HEAD, so a caller that also wants the multipart layout gets it without a second round-trip. Falls
 /// back to getObjectInfo() (HEAD) if GetObjectAttributes is unsupported, denied, or otherwise errors,
-/// so it is safe against S3-compatible stores that lack the API. `part_sizes` is populated only on
-/// the GetObjectAttributes path for multipart objects; it is empty on the fallback path.
+/// so it is safe against S3-compatible stores that lack the API. The etag is the quoted spelling
+/// `HeadObject` returns, including when GetObjectAttributes omits the quotes. `part_sizes` is
+/// populated only on the GetObjectAttributes path for multipart objects; it is empty on the fallback path.
 ObjectInfo getObjectIdentity(
     const S3::Client & client,
     const String & bucket,

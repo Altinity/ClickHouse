@@ -75,14 +75,18 @@ namespace
         return client.GetObjectAttributes(req);
     }
 
-    /// GetObjectAttributes returns the ETag without surrounding quotes, whereas HeadObject returns it
-    /// quoted. Normalize (strip quotes) so identities are consistent regardless of which path produced
-    /// them - important because they are used as cache keys.
-    String stripQuotes(String s)
+    /// `HeadObject` and `PutObject` spell an ETag as `"abc"` (multipart: `"abc-2"`). `GetObjectAttributes`
+    /// returns that value without the quotes. `If-Match` and the identity cache compare the bytes, so
+    /// both paths store the quoted spelling. A weak validator (`W/"abc"`) is already in HTTP form.
+    String quoteETag(String s)
     {
+        if (s.empty())
+            return s;
         if (s.size() >= 2 && s.front() == '"' && s.back() == '"')
-            s = s.substr(1, s.size() - 2);
-        return s;
+            return s;
+        if (s.starts_with("W/\"") && s.ends_with('"'))
+            return s;
+        return "\"" + s + "\"";
     }
 
     Aws::S3::Model::GetObjectTaggingOutcome getObjectTagging(
@@ -246,7 +250,7 @@ ObjectInfo getObjectIdentity(
             ObjectInfo object_info;
             object_info.size = static_cast<size_t>(result.GetObjectSize());
             object_info.is_size_known = true;
-            object_info.etag = stripQuotes(result.GetETag());
+            object_info.etag = quoteETag(result.GetETag());
             for (const auto & part : result.GetObjectParts().GetParts())
                 object_info.part_sizes.push_back(static_cast<size_t>(part.GetSize()));
             return object_info;
@@ -256,7 +260,7 @@ ObjectInfo getObjectIdentity(
     }
 
     ObjectInfo object_info = getObjectInfo(client, bucket, key, version_id, /*with_metadata=*/ false, /*with_tags=*/ false);
-    object_info.etag = stripQuotes(object_info.etag);
+    object_info.etag = quoteETag(object_info.etag);
     return object_info;
 }
 
