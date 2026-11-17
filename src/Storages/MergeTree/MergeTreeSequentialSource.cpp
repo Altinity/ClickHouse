@@ -162,8 +162,18 @@ MergeTreeSequentialSource::MergeTreeSequentialSource(
     /// It does not make sense to use pthread_threadpool for background merges/mutations
     /// And also to preserve backward compatibility
     read_settings.local_fs_settings.method = LocalFSReadMethod::pread;
-    if (read_with_direct_io)
+
+    if (type == Export)
+    {
+        /// `read_with_direct_io` already encodes the export task's `min_bytes_to_use_direct_io` decision
+        /// for this part. Do not let the server-level value from `storage.getContext()` override it:
+        /// force the threshold in both directions.
+        read_settings.local_fs_settings.direct_io_threshold = read_with_direct_io ? 1 : 0;
+    }
+    else if (read_with_direct_io)
+    {
         read_settings.local_fs_settings.direct_io_threshold = 1;
+    }
 
     /// Configure throttling
     switch (type)
