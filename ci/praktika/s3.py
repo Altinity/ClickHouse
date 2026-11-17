@@ -98,7 +98,8 @@ class S3:
         if client is None:
             client_config = {
                 "max_pool_connections": config.get("download_concurrency", 10),
-                # NOTE (strtgbb): the 60s default is too low for large uploads to hetzner s3
+                # NOTE (strtgbb): the 60s default is too low for large transfers to/from hetzner s3
+                "connect_timeout": 180,
                 "read_timeout": 180,
             }
             if anonymous:
@@ -533,7 +534,11 @@ class S3:
                         raise
                     return False
                 except Exception as e:
-                    print(f"ERROR: Failed to download S3 object [{s3_path}]: {e}")
+                    cause = getattr(e, "last_exception", None)
+                    print(
+                        f"ERROR: Failed to download S3 object [{s3_path}]: {e}"
+                        + (f": {cause}" if cause else "")
+                    )
                     if not no_strict:
                         raise
                     return False
