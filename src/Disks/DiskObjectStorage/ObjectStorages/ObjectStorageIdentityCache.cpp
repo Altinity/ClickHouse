@@ -41,20 +41,18 @@ std::optional<ObjectStorageIdentity> ObjectStorageIdentityCache::tryGet(const St
     return std::nullopt;
 }
 
-UInt64 ObjectStorageIdentityCache::epochOf(const String & key) const
+ObjectStorageIdentityEpoch ObjectStorageIdentityCache::epochOf(const String & key) const
 {
     std::lock_guard lock(epoch_mutex);
     const auto it = epoch_by_key.find(key);
-    if (it == epoch_by_key.end())
-        return 0;
-    return it->second;
+    return {clear_epoch, it == epoch_by_key.end() ? 0 : it->second};
 }
 
-void ObjectStorageIdentityCache::setIfEpoch(const String & key, ObjectStorageIdentity identity, UInt64 epoch)
+void ObjectStorageIdentityCache::setIfEpoch(const String & key, ObjectStorageIdentity identity, ObjectStorageIdentityEpoch epoch)
 {
     std::lock_guard lock(epoch_mutex);
     const auto it = epoch_by_key.find(key);
-    const UInt64 current = it == epoch_by_key.end() ? 0 : it->second;
+    const ObjectStorageIdentityEpoch current{clear_epoch, it == epoch_by_key.end() ? 0 : it->second};
     if (current != epoch)
         return;
     Base::set(key, std::make_shared<ObjectStorageIdentity>(std::move(identity)));
@@ -70,6 +68,7 @@ void ObjectStorageIdentityCache::invalidate(const String & key)
 void ObjectStorageIdentityCache::clear()
 {
     std::lock_guard lock(epoch_mutex);
+    ++clear_epoch;
     epoch_by_key.clear();
     Base::clear();
 }

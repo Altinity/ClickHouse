@@ -61,6 +61,18 @@ inline String makeObjectStorageIdentityCacheKey(std::string_view endpoint, std::
     return key;
 }
 
+/// What a metadata fetch observed before its request. `key` counts the writes, copies, and deletes of
+/// one object. `clear` counts the times the whole cache was dropped: `clear` also forgets every `key`
+/// counter, so without it a key would look untouched again and a fetch in flight across the drop
+/// would store the identity it fetched before the overwrite.
+struct ObjectStorageIdentityEpoch
+{
+    UInt64 clear = 0;
+    UInt64 key = 0;
+
+    bool operator==(const ObjectStorageIdentityEpoch &) const = default;
+};
+
 /// Cache of object-storage identity, keyed by endpoint, bucket and object path, so opening an object
 /// does not require a fresh HEAD / GetObjectAttributes on every read (a lake scan otherwise re-HEADs
 /// every candidate file on every query). Backed by CacheBase (LRU/SLRU) for size-bounded eviction
@@ -68,9 +80,10 @@ inline String makeObjectStorageIdentityCacheKey(std::string_view endpoint, std::
 ///
 /// It is owned by the global Context (see Context::getObjectStorageIdentityCache), sized from server
 /// settings, and cleared by `SYSTEM DROP OBJECT STORAGE IDENTITY CACHE`. A write, copy, or delete by
-/// this server bumps that key's generation and removes the entry. A fetch stores its result only when
-/// the generation is still the one it observed before the request, so a read that started earlier
-/// cannot put the old identity back. The next read of that key requests the metadata again. Low-level
+/// this server bumps that key's generation and removes the entry, and `SYSTEM DROP` bumps a cache-wide
+/// generation. A fetch stores its result only when both are still the ones it observed before the
+/// request, so a read that started earlier cannot put the old identity back. The next read of that key
+/// requests the metadata again. Low-level
 /// object-storage code reaches the cache via Context::getGlobalContextInstance() and must tolerate a
 /// null pointer (no global context yet) by simply issuing the metadata request uncached.
 class ObjectStorageIdentityCache
@@ -85,20 +98,22 @@ public:
     std::optional<ObjectStorageIdentity> tryGet(const String & key);
 
     /// Generation of `key`. A fetch captures this before the request and passes it to `setIfEpoch`.
-    /// Zero when the key has never been invalidated.
-    UInt64 epochOf(const String & key) const;
+    ObjectStorageIdentityEpoch epochOf(const String & key) const;
 
     /// Store `identity` only when `epoch` is still the generation `epochOf` returned.
-    void setIfEpoch(const String & key, ObjectStorageIdentity identity, UInt64 epoch);
+    void setIfEpoch(const String & key, ObjectStorageIdentity identity, ObjectStorageIdentityEpoch epoch);
 
     /// Bump the generation and drop the entry. A fetch already in flight will not put the old identity back.
     void invalidate(const String & key);
 
-    /// Drop every entry and generation. Hides `CacheBase::clear` so a generation cannot outlive its entry.
+    /// Drop every entry and per-key generation, and bump the cache-wide generation. Hides
+    /// `CacheBase::clear` so a fetch in flight across the drop cannot store afterwards.
     void clear();
 
 private:
     mutable std::mutex epoch_mutex;
+    /// Times `clear` ran. Guarded by `epoch_mutex`.
+    UInt64 clear_epoch = 0;
     /// Generations of keys this server has replaced or deleted. Absent means generation 0.
     /// Guarded by `epoch_mutex`. An invalidated key stays here so a late fetch can see the bump.
     UnorderedMapWithMemoryTracking<String, UInt64> epoch_by_key;
