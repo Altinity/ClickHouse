@@ -146,7 +146,7 @@ public:
 
     ALWAYS_INLINE const char * getMediumPtr() const
     {
-        return reinterpret_cast<const char *>(loadLE(rawBytes() + sizeof(uint64_t), PACKED_POINTER_BYTES));
+        return getHeapPtr();
     }
 
     ALWAYS_INLINE uint64_t getLargeSize() const
@@ -156,7 +156,7 @@ public:
 
     ALWAYS_INLINE const char * getLargePtr() const
     {
-        return reinterpret_cast<const char *>(loadLE(rawBytes() + sizeof(uint64_t), PACKED_POINTER_BYTES));
+        return getHeapPtr();
     }
 
     ALWAYS_INLINE uint32_t getHash() const
@@ -178,6 +178,13 @@ public:
         return 0;
     }
 
+    /// The out-of-line bytes of a medium or large string, `heapSize` of them: both encodings
+    /// keep the pointer in the same low 56 bits.
+    ALWAYS_INLINE const char * getHeapPtr() const
+    {
+        return reinterpret_cast<const char *>(loadLE(rawBytes() + sizeof(uint64_t), PACKED_POINTER_BYTES));
+    }
+
     ALWAYS_INLINE explicit operator std::string_view() const
     {
         if (isEmpty())
@@ -189,21 +196,14 @@ public:
         return {getLargePtr(), getLargeSize()};
     }
 
-    /// Set the medium-string pointer (low 56 bits) and clear the tag byte.
-    /// Used by `keyHolderPersistKey` to rebind the key to arena-owned memory.
-    ALWAYS_INLINE void setMediumPointer(const char * ptr)
+    /// Points a medium or large string at a copy of its out-of-line bytes, keeping the encoding,
+    /// which the tag byte holds. Used to rebind a key to memory that outlives the bytes it viewed
+    /// (see `keyHolderPersistKey`).
+    ALWAYS_INLINE void setHeapPointer(const char * ptr)
     {
+        chassert(heapSize() != 0);
         chassert((reinterpret_cast<uintptr_t>(ptr) >> (PACKED_POINTER_BYTES * 8)) == 0);
         storeLE(rawBytes() + sizeof(uint64_t), reinterpret_cast<uintptr_t>(ptr), PACKED_POINTER_BYTES);
-        rawBytes()[TAG_BYTE_OFFSET] = 0;
-    }
-
-    /// Set the large-string pointer (low 56 bits) and set the LARGE tag byte.
-    ALWAYS_INLINE void setLargePointer(const char * ptr)
-    {
-        chassert((reinterpret_cast<uintptr_t>(ptr) >> (PACKED_POINTER_BYTES * 8)) == 0);
-        storeLE(rawBytes() + sizeof(uint64_t), reinterpret_cast<uintptr_t>(ptr), PACKED_POINTER_BYTES);
-        rawBytes()[TAG_BYTE_OFFSET] = LARGE_TAG_BYTE;
     }
 
     /// Build a packed value, computing the 32-bit content hash with `hash_fn(ptr, len)`.
@@ -313,6 +313,7 @@ inline ALWAYS_INLINE bool operator==(PackedStringRef lhs, PackedStringRef rhs)
 
         const char * lhs_ptr = reinterpret_cast<const char *>(lhs.high & PackedStringRef::POINTER_MASK);
         const char * rhs_ptr = reinterpret_cast<const char *>(rhs.high & PackedStringRef::POINTER_MASK);
+        chassert(lhs_ptr && rhs_ptr);
         const size_t size = (lhs_tag & PackedStringRef::LARGE_TAG_BYTE) ? lhs.low : (lhs.low >> 32);
 #if defined(__SSE2__) || (defined(__aarch64__) && defined(__ARM_NEON))
         return memequalWide(lhs_ptr, rhs_ptr, size);

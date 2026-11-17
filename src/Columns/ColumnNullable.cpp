@@ -7,6 +7,7 @@
 #include <Common/SipHash.h>
 #include <Common/assert_cast.h>
 #include <Columns/ColumnNullable.h>
+#include <DataTypes/DataTypeNullable.h>
 #include <Columns/IColumnImpl.h>
 #include <Columns/ColumnConst.h>
 #include <Columns/ColumnCompressed.h>
@@ -1204,6 +1205,12 @@ ColumnPtr removeNullableOrLowCardinalityNullable(const ColumnPtr & column)
     }
 
     return removeNullable(column);
+}
+
+
+void ColumnNullable::fillFromRowStorePtrs(const DataTypePtr & type, const RowStorePointers & row_store_ptrs, size_t field_offset, size_t field_size, size_t begin, size_t count, PaddedPODArray<UInt8> *)
+{
+    getNestedColumn().fillFromRowStorePtrs(removeNullable(type), row_store_ptrs, field_offset, field_size, begin, count, &getNullMapData());
 }
 
 }
