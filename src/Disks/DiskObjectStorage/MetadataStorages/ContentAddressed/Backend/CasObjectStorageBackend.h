@@ -208,6 +208,10 @@ public:
     /// Settings for an unconditional blob publication: each object-creating request goes out at most once.
     WriteSettings blobPublicationWriteSettings() const;
     WriteSettings conditionalWriteSettingsForTest() const { return conditionalWriteSettings(/*attempt_no=*/1); }
+    std::expected<String, RawConflict> nativeConditionalPutForTest(const String & key, const String & bytes, const WriteSettings & ws)
+    {
+        return nativeConditionalPut(key, bytes, ws);
+    }
     /// Override the emulated backend's wall clock for deterministic expiry tests.
     void setEmuNowNsForTest(uint64_t now_ns);
     /// Return the guarded per-key token-state size for expiry tests.

@@ -39,12 +39,19 @@ every `CAS*` name, is on [Antalya profile events and metrics](/antalya/metrics-a
 | `CASBlobBodyPutAvoided` | Safe writer observations increment it when a physical body publication is avoided | Compare with query-attributed writer materialization tasks; the aggregate HEAD counters include unrelated callers |
 | `CASRefAppendWedged` | Zero | A ref-log append lane exhausted its retries after an uncertain `PUT`; ref-log progress on that namespace may be stalled |
 | `CASRefNeedsRecovery` | Zero | A ref-append lane could not install a known-durable transaction and now refuses writes, snapshots, and confirmation until durable replay completes |
-| `CASRefAppendSealRejected` | Occasional (a deposed writer losing a race is the protocol working); sustained growth is not | A writer keeps retrying after losing its mount and does not yet know it |
+| `CASRefAppendSealRejected` | Occasional (a deposed writer losing a race is the protocol working); sustained growth is not | A writer met a successor's tombstone in the slot it needed and was rejected; a lane that keeps counting is a writer that lost its mount and does not yet know it |
+| `CASRefRecoveryEpochSealed` | Follows unclean restarts | Recovery wrote a tombstone because the last epoch that wrote to the namespace may have ended without a clean farewell. After a clean farewell the first append of the new epoch writes the tombstone instead |
+| `CASRefAppendTombstoneWritten` | Follows epoch changes of namespaces that are written | An append lane wrote the tombstone that closes the previous epoch of a namespace before its first record in this epoch |
+| `CASRefCheckpointStamped` | About one per namespace written after an upgrade, then zero | Recovery or an append lane replaced a generation 1 or 2 `_ckpt` with its generation 3 form |
+| `CASRefCheckpointNotAdvanced` | Zero | A snapshot was published but its `_ckpt` could not be advanced (fenced out, refused, contended or failed); recovery keeps replaying from an older base. Ref-log appends never write `_ckpt` |
 | `CASGCHeartbeatFenceOuts` | Zero on a healthy pool | GC fenced an expired mount; check `system.cas_mounts` for a member that should have cleanly unmounted |
 | `CASGCUnmatchedRemoveDeltas` | Occasional (benign per-key no-op by design) | A persistent nonzero rate means removal deltas are reaching the reducer without their matching activation — a correctness signal worth a look, not an automatic false deletion |
 | `CASGCCondemnMarkerUnconfirmedCarry` | Zero | The graduation read found no `Condemned` marker at the entry's round or later (absent, `Clean`, older round, or unreadable); deletion is postponed and the marker is rewritten, but investigate repeated carries |
 | `CASGCMetaWriteAnomaly` | Zero | The bounded GC metadata pool failed an operation; backend or pool pressure may delay metadata convergence |
 | `CASRefRollbackBestEffortDropFailed` | Zero | A rollback cleanup drop hit a backend failure; refs may remain live and GC may be delayed on that namespace |
+
+`CASRefCheckpointPublished` and `CASRefCheckpointIdenticalSkip` count `_ckpt` writes by snapshot
+publication only.
 
 ### Mount renewal and remount counters {#mount-renewal-remount-counters}
 
@@ -129,6 +136,27 @@ A round that is recurring `Aborted` rather than `Error` still deserves attention
 but the underlying transient condition (backend unavailability, a lost lease, a competing leader)
 has not gone away.
 
+Each finished round also writes one `Information` line to the server log, for operators who have only
+the text log:
+
+```text
+GC round finished: round=42 outcome=Success trigger=Scheduled duration_ms=815 deleted=12 condemned=30 error_code=0 keys_listed=1043
+```
+
+The line is written for the outcomes `Success`, `Aborted`, `Error` and `Stopped`, for scheduled rounds and
+for `SYSTEM CAS GC RUN`. A round that ends as `NotALeader` or `Deferred` writes no `Information` line.
+
+| Field | `system.cas_gc_log` column of the `Finish` row |
+|---|---|
+| `round` | `round` |
+| `outcome` | `outcome` |
+| `trigger` | `trigger` |
+| `duration_ms` | `duration_ms` |
+| `deleted` | `objects_deleted` |
+| `condemned` | `entries_condemned` |
+| `error_code` | `error_code` |
+| `keys_listed` | none: the `ref_keys_listed` metric of the `defer_decision` phase row; `0` when the round ends before that phase |
+
 Which phase dominates round duration or the `LIST` budget — reproduced from the
 [per-phase rows](/operations/system-tables/cas_gc_log#per-phase-rows) reference:
 
@@ -156,3 +184,25 @@ ORDER BY disk, server_root_id;
 process-local — `NULL` on every row describing a peer's mount — so this query is only informative
 run against the node whose GC leadership you are checking; run it on each node to see the whole
 pool's view of itself.
+
+`last_success_age_seconds` is `NULL`, and the asynchronous metric `CASGCLastSuccessAgeSeconds_<disk>` is
+absent, until this server's GC completes its first round as leader. The age counts every round that
+completed as leader, a `Deferred` one included; a round that failed with an exception does not count.
+A threshold rule on the age alone reads the missing state as healthy, so alert on the absence of a
+recent age across all servers of the disk:
+
+```yaml
+- alert: CasGcStale
+  # <disk> is the disk name with every character outside [a-zA-Z0-9_:] replaced by "_".
+  expr: absent(ClickHouseAsyncMetrics_CASGCLastSuccessAgeSeconds_<disk> < 900)
+  for: 5m
+```
+
+The rule fires when no server of the disk reports an age below 900 s. Evaluate it over all servers of
+the disk, not per server: a server that led once keeps reporting an age that grows without bound after
+it loses leadership, so a per-server rule fires on every former leader. After a restart of every
+server the expression is true until the first round completes, because no server reports the metric
+before that; the alert fires only if that takes longer than 5 minutes.
+Do not deploy it for a disk whose GC is disabled on every server (`cas_gc_enabled = false`): no server
+ever reports the metric, so the rule fires forever. 900 s is 15 GC intervals at the default
+`cas_gc_interval_sec` of 60; scale it with that setting.
