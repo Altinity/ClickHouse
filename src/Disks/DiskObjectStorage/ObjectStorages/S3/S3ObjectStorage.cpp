@@ -1035,7 +1035,12 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
                 result.etag = cached->etag;
                 result.part_offsets = cached->part_offsets;
                 if (cached->is_last_modified_known)
+                {
                     result.last_modified = Poco::Timestamp::fromEpochTime(static_cast<std::time_t>(cached->last_modified));
+                    /// Real enough for `_time`, but not a freshness proof. The schema and count caches
+                    /// treat an older time as "unchanged" and would keep a replaced object's schema and row count.
+                    result.is_last_modified_fresh = false;
+                }
                 else
                     result.is_last_modified_known = false;
                 return result;

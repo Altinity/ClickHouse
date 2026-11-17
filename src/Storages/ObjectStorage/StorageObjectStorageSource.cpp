@@ -1242,9 +1242,10 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         {
             const auto metadata = object_info->getObjectMetadata();
             /// An unknown modification time (e.g. a web object without a `Last-Modified` header) must not be
-            /// reported as the epoch, otherwise the stale cached row count would always look valid. Reporting
-            /// it as unavailable makes the count cache re-read the file instead.
-            if (!metadata || !metadata->is_last_modified_known)
+            /// reported as the epoch, otherwise the stale cached row count would always look valid. A time
+            /// reused from the identity cache is also not proof the object is unchanged. Reporting either
+            /// as unavailable makes the count cache re-read the file instead.
+            if (!metadata || !metadata->lastModifiedConfirmsUnchanged())
                 return std::nullopt;
             return std::optional<time_t>(metadata->last_modified.epochTime());
         };
