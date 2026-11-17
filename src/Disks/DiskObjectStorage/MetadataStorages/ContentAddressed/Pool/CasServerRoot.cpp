@@ -9,8 +9,10 @@
 #include <Common/ProfileEvents.h>
 #include <Common/setThreadName.h>
 #include <Core/UUID.h>
+#include <base/arithmeticOverflow.h>
 #include <base/getFQDNOrHostName.h>
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 #include <magic_enum.hpp>
 
 #include <algorithm>
@@ -294,7 +296,7 @@ void emitMountRenewEvent(
         event.type = CasEventType::WatermarkRenew;
         event.outcome = String{outcome};
         event.reason = outcome == "recovered"
-            ? "CAS mount renewal recovered before its confirmed lease-safety deadline"
+            ? "CAS mount renewal committed after a retry or a settling read"
             : "CAS mount renewal ended without retained authority and fenced the mount";
         event.detail = {
             {"server_root_id", *context.server_root_id},
@@ -381,12 +383,13 @@ void deliverMountRenewObservability(
                 LOG_INFO(
                     getLogger("CasMountLeaseRenewer"),
                     "CAS mount renewal '{}' recovered after {} physical attempts in {} ms "
-                    "(classification={}, confirmed_deadline_boot_ms={})",
+                    "(classification={}, confirmed_deadline_boot_ms={}, remaining_confirmed_budget_ms={})",
                     *context.server_root_id,
                     context.attempts_sent,
                     elapsedSince(context.observability_start_boot_ms, now_boot_ms),
                     classification,
-                    context.confirmed_deadline_boot_ms);
+                    context.confirmed_deadline_boot_ms,
+                    remainingConfirmedBudget(context, now_boot_ms));
             }
             catch (...)
             {
@@ -408,12 +411,13 @@ void deliverMountRenewObservability(
                 LOG_WARNING(
                     getLogger("CasMountLeaseRenewer"),
                     "CAS mount renewal '{}' fenced after {} physical attempts in {} ms "
-                    "(classification={}, confirmed_deadline_boot_ms={})",
+                    "(classification={}, confirmed_deadline_boot_ms={}, remaining_confirmed_budget_ms={})",
                     *context.server_root_id,
                     context.attempts_sent,
                     elapsedSince(context.observability_start_boot_ms, now_boot_ms),
                     classification,
-                    context.confirmed_deadline_boot_ms);
+                    context.confirmed_deadline_boot_ms,
+                    remainingConfirmedBudget(context, now_boot_ms));
             }
             catch (...)
             {
@@ -426,10 +430,6 @@ void deliverMountRenewObservability(
     }
 }
 
-/// Forward declaration: defined below (same TU-unique anonymous namespace) — `allocateWriterEpoch`
-/// names the current mount holder in its DecommissionRecovery live-refusal message.
-String describeMountHolder(const MountLease & m);
-
 std::optional<OwnerObject> readOwnerObject(CasOperation & op, const Layout & l, const String & server_root_id)
 {
     const auto got = op.read(l.ownerKey(server_root_id), Retry::standard());
@@ -438,17 +438,22 @@ std::optional<OwnerObject> readOwnerObject(CasOperation & op, const Layout & l, 
     return decodeOwner(got->bytes);
 }
 
-void throwIfOwnerRetired(const OwnerObject & owner, const String & srid)
+void throwIfOwnerRetired(const OwnerObject & owner, const String & srid, const String & owner_key)
 {
     if (!owner.retired_at_ms)
         return;
 
+    if (owner.retirement_verified)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS server-root '{}' was decommissioned (owner tombstoned at {} ms, life {}); this process cannot run "
+            "under the retired owner. Restart the server: a server start rejoins a finished decommission as an "
+            "empty member",
+            srid, *owner.retired_at_ms, owner.owner_life);
     throw Exception(ErrorCodes::CORRUPTED_DATA,
-        "CAS server-root '{}' was explicitly decommissioned by an operator (tombstoned at {} ms) "
-        "and is refusing to silently resume — if you genuinely intend to bring this server-root "
-        "back, manually clear the owner object's tombstone field and restart "
-        "(same manual-recovery pattern as an owner anchor lost over existing data)",
-        srid, *owner.retired_at_ms);
+        "CAS server-root '{}' was decommissioned (owner object '{}' retired at {} ms, owner life {}) and the "
+        "decommission is not finished: its retirement is not verified. Finish it with SYSTEM CAS DROP POOL MEMBER under "
+        "the rerun rule of the CAS docs (bringing a member back), then restart this server",
+        srid, owner_key, *owner.retired_at_ms, owner.owner_life);
 }
 }
 
@@ -497,21 +502,27 @@ void deliverDeferredMountRenewObservability(uint64_t remount_attempt_no) noexcep
     deliverMountRenewObservability(completed, remount_attempt_no);
 }
 
-bool serverRootSubtreeEmpty(
+ServerRootLeftover serverRootLeftover(
     CasOperation & op, const Layout & l, const String & srid, const RefCatalog & catalog_observation)
 {
     const String owned_prefix = srid + "/";
     for (const CatalogEntry & entry : catalog_observation.entries)
         if (entry.ns.string() == srid || entry.ns.string().starts_with(owned_prefix))
-            return false;
+            return ServerRootLeftover::CatalogRows;
 
     /// Manifests and loose roots retain logical path identity. Opaque namespace stream/state debris
     /// alone is not evidence that this server root owns live work.
     if (prefixHasAnyKey(op, l.casManifestsServerPrefix(srid)))
-        return false;
+        return ServerRootLeftover::Manifests;
     if (prefixHasAnyKey(op, l.serverRootDataPrefix(srid)))
-        return false;
-    return true;
+        return ServerRootLeftover::RootsObjects;
+    return ServerRootLeftover::None;
+}
+
+bool serverRootSubtreeEmpty(
+    CasOperation & op, const Layout & l, const String & srid, const RefCatalog & catalog_observation)
+{
+    return serverRootLeftover(op, l, srid, catalog_observation) == ServerRootLeftover::None;
 }
 
 std::optional<UInt128> readOwnerUuid(CasOperation & op, const Layout & l, const String & server_root_id)
@@ -522,34 +533,239 @@ std::optional<UInt128> readOwnerUuid(CasOperation & op, const Layout & l, const 
     return owner->server_uuid;
 }
 
-void claimOwnerOrThrow(
+namespace
+{
+/// Every holder-originated mount body gets a random durable identity. UUIDv4 cannot be zero, but
+/// keep the postcondition explicit because zero is reserved as an uninitialized in-memory value.
+UInt128 newMountWriteAttemptId()
+{
+    const UInt128 id = UUIDHelpers::generateV4().toUnderType();
+    chassert(id != UInt128{});
+    return id;
+}
+
+/// The key `IDisk::checkAccess` writes under the disk root, `clickhouse_access_check_<server uuid>`.
+String accessProbeKey(const Layout & l, const String & srid, UInt128 server_uuid)
+{
+    const String hex = u128ToHex(server_uuid);
+    return fmt::format("{}clickhouse_access_check_{}-{}-{}-{}-{}", l.serverRootDataPrefix(srid),
+        hex.substr(0, 8), hex.substr(8, 4), hex.substr(12, 4), hex.substr(16, 4), hex.substr(20));
+}
+
+/// One `MountClaim` event per rejoin write, so the audit trail shows who took the slot and the owner. Delivery
+/// failures are contained: they cannot change the rejoin decision.
+void emitRejoinEvent(const CasEventSink & sink, const String & srid, std::string_view branch, std::string_view reason,
+                     const OwnerObject & retired, UInt128 our_uuid, uint64_t new_life) noexcept
+{
+    try
+    {
+        if (!sink)
+            return;
+        CasEvent e;
+        e.type = CasEventType::MountClaim;
+        e.object_kind = CasEventObjectKind::None;
+        e.outcome = String{branch};
+        e.reason = String{reason};
+        e.detail = {{"server_root_id", srid}, {"branch", String{branch}},
+                    {"retired_uuid", u128ToHex(retired.server_uuid)}, {"retired_life", std::to_string(retired.owner_life)},
+                    {"server_uuid", u128ToHex(our_uuid)}, {"owner_life", std::to_string(new_life)}};
+        sink(std::move(e));
+    }
+    catch (...)   // NOLINT(bugprone-empty-catch)
+    {
+    }
+}
+
+/// The first catalog rows of the retired id's previous life, as `namespace (state)`, for the refusal text.
+String leftoverCatalogRows(const RefCatalog & catalog, const String & srid)
+{
+    constexpr size_t max_named = 5;
+    const String owned_prefix = srid + "/";
+    std::vector<String> named;
+    size_t total = 0;
+    for (const CatalogEntry & entry : catalog.entries)
+    {
+        if (entry.ns.string() != srid && !entry.ns.string().starts_with(owned_prefix))
+            continue;
+        if (++total <= max_named)
+            named.push_back(fmt::format("{} ({})", entry.ns.string(), nsStateToWord(entry.state)));
+    }
+    String text = fmt::format("{}", fmt::join(named, ", "));
+    if (total > max_named)
+        text += fmt::format(" and {} more", total - max_named);
+    return text;
+}
+
+/// Take over the retired `owner` as `our_uuid` at its next life. nullopt: an `If-Match` lost to another
+/// write, and the caller decides again from a fresh owner read.
+std::optional<uint64_t> rejoinRetiredOwner(
+    CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid, const OwnerObject & owner,
+    const Etag & owner_etag, const ObserveRefCatalog & observe_catalog, const CasEventSink & sink)
+{
+    /// Checked before the retirement, so an id retired by 26.6.4 (no `epoch`, no `mount`) is never sent to a
+    /// rerun, which would refuse the absent counter.
+    const std::optional<Object> mount = op.read(l.mountKey(srid), Retry::standard());
+    if (!mount || !op.head(l.epochKey(srid), Retry::standard()))
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS server-root '{}' is retired but its {} object is missing: it was retired by an older version or the "
+            "object was deleted by hand, so it cannot rejoin. Configure a new <cas_server_root_id> for this disk",
+            srid, mount ? "epoch" : "mount");
+    /// A rerun of an unfinished decommission drains whoever owns the id when it starts.
+    if (!owner.retirement_verified)
+        throwIfOwnerRetired(owner, srid, l.ownerKey(srid));
+    const MountLease slot = decodeMountLease(mount->bytes);
+    if (!slot.gc_fenced && !slot.isCleanRelease())
+        throw Exception(ErrorCodes::ABORTED,
+            "CAS server-root '{}' is retired and its mount slot is held (server_uuid={}, writer_epoch={}): a "
+            "decommission run is still running, or its lease has not yet lapsed and been fenced by GC. Restart this "
+            "server later", srid, u128ToHex(slot.server_uuid), slot.writer_epoch);
+
+    /// A late `IDisk::checkAccess` of the old life can land after the drain; nothing else of it may remain.
+    const String probe = accessProbeKey(l, srid, owner.server_uuid);
+    if (const std::optional<Meta> probe_meta = op.head(probe, Retry::standard()))
+        /// A lost `If-Match` leaves the probe in place, and the leftover check below refuses on it.
+        (void)op.remove(probe, probe_meta->etag, Retry::standard());
+    const RefCatalog catalog = observe_catalog();
+    switch (serverRootLeftover(op, l, srid, catalog))
+    {
+        case ServerRootLeftover::None:
+            break;
+        case ServerRootLeftover::CatalogRows:
+            throw Exception(ErrorCodes::ABORTED,
+                "CAS server-root '{}' is retired but data of its previous life remains: catalog rows of the old life are not "
+                "yet removed by GC: {}. Run SYSTEM CAS GC RUN '<disk>' on the GC leader (is_leader = 1 in system.cas_mounts; "
+                "it can take several rounds) and restart this server. A row that stays `removing` for many rounds is held "
+                "by GC: the leader counts it in CASGCStuckRemovals and logs a stuck-removal warning naming the reason",
+                srid, leftoverCatalogRows(catalog, srid));
+        case ServerRootLeftover::Manifests:
+            throw Exception(ErrorCodes::ABORTED,
+                "CAS server-root '{}' is retired but data of its previous life remains: manifests under cas/manifests/{}/ are "
+                "not yet removed by GC. Run SYSTEM CAS GC RUN '<disk>' on the GC leader (is_leader = 1 in system.cas_mounts; "
+                "it can take several rounds) and restart this server", srid, srid);
+        case ServerRootLeftover::RootsObjects:
+            throw Exception(ErrorCodes::ABORTED,
+                "CAS server-root '{}' is retired but data of its previous life remains: an object under roots/{}/ appeared "
+                "after the drain. Delete it by hand and restart this server", srid, srid);
+    }
+
+    /// A uuid other than the retired owner's replaces the terminal body before the owner write, so a 26.6.4
+    /// starter of that owner's uuid loses its `If-Match` and has no claim recheck to fall back on. The owner's
+    /// own uuid writes nothing here: if its owner write then lost, its body would sit under another owner,
+    /// where such a starter could reclaim it.
+    if (our_uuid != owner.server_uuid)
+    {
+        MountLease ours = slot;
+        ours.server_uuid = our_uuid;
+        ours.hostname = getFQDNOrHostName();
+        ours.pid = static_cast<uint64_t>(::getpid());
+        ours.write_attempt_id = newMountWriteAttemptId();
+        ours.gc_fenced = false;
+        ours.min_active_build_sequence = std::numeric_limits<uint64_t>::max();
+        ours.seq += 1;
+        if (conflictOrThrow(
+                op.replace(l.mountKey(srid), encodeMountLease(ours), mount->etag, Retry::standard()),
+                fmt::format("CAS server-root '{}' rejoin mount write", srid)))
+            return std::nullopt;
+        emitRejoinEvent(sink, srid, "rejoin_mount_rewrite", "a rejoin under a new server uuid rewrote the retired terminal body",
+                        owner, our_uuid, owner.owner_life + 1);
+    }
+
+    const uint64_t life = owner.owner_life + 1;
+    if (conflictOrThrow(
+            op.replace(
+                l.ownerKey(srid),
+                encodeOwner(OwnerObject{.server_uuid = our_uuid, .retired_at_ms = std::nullopt, .owner_life = life}),
+                owner_etag, Retry::standard()),
+            fmt::format("CAS server-root '{}' rejoin owner write", srid)))
+        return std::nullopt;
+    emitRejoinEvent(sink, srid, "rejoin_owner", "a server start took over the retired owner at its next life", owner, our_uuid, life);
+    LOG_WARNING(getLogger("CasMountLease"),
+        "CAS server-root '{}': rejoined as an empty member under server_uuid {} at owner life {} (retired life {} of {})",
+        srid, u128ToHex(our_uuid), life, owner.owner_life, u128ToHex(owner.server_uuid));
+    return life;
+}
+}
+
+String remountOwnerRefusal(CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid, uint64_t recorded_life)
+{
+    const std::optional<OwnerObject> owner = readOwnerObject(op, l, srid);
+    if (!owner)
+        return {};
+    if (owner->server_uuid != our_uuid)
+        return fmt::format(
+            "CAS server-root '{}' is owned by a different server since this process started (owner server_uuid={}, "
+            "ours={}); this process cannot resume it", srid, u128ToHex(owner->server_uuid), u128ToHex(our_uuid));
+    if (owner->retired_at_ms)
+        return fmt::format(
+            "CAS server-root '{}' was decommissioned while this process was fenced (owner retired at {} ms, owner "
+            "life {}); this process stops for good and a restart refuses this server_root_id, see the CAS "
+            "troubleshooting docs: a decommissioned member refuses to start",
+            srid, *owner->retired_at_ms, owner->owner_life);
+    if (owner->owner_life != recorded_life)
+        return fmt::format(
+            "CAS server-root '{}': the owner moved from life {} to life {} since this process started (a rejoin or "
+            "a decommission rollback); restart the server to continue under the current life",
+            srid, recorded_life, owner->owner_life);
+    return {};
+}
+
+uint64_t claimOwnerOrThrow(
     CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid,
-    const ObserveRefCatalog & observe_catalog)
+    const ObserveRefCatalog & observe_catalog, RetiredOwnerPolicy retired_policy, const CasEventSink & sink)
 {
     if (!observe_catalog)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS server-root '{}': catalog observer is required", srid);
     const String key = l.ownerKey(srid);
 
-    /// Owner present → it is identity: equal UUID is ok, a different UUID fails closed regardless
-    /// of any lease/clock state.
-    if (const std::optional<OwnerObject> owner = readOwnerObject(op, l, srid))
+    /// A lost rejoin write decides again from a fresh read; an owner or slot that changes on every decision fails
+    /// the start instead of spinning.
+    constexpr size_t max_owner_decisions = 4;
+    const bool may_rejoin = retired_policy == RetiredOwnerPolicy::RejoinIfVerified;
+    for (size_t decision = 1;; ++decision)
     {
-        if (owner->server_uuid == our_uuid)
+        const std::optional<Object> current = op.read(key, Retry::standard());
+        if (!current)
+            break;
+        const OwnerObject owner = decodeOwner(current->bytes);
+        if (owner.retired_at_ms && may_rejoin)
         {
-            throwIfOwnerRetired(*owner, srid);
-            return;
+            if (our_uuid == UInt128{})
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS server-root '{}' is retired (owner tombstoned at {} ms, life {}) and this process has no "
+                    "server uuid, so it does not rejoin it. Only a server start with a server uuid rejoins a retired "
+                    "id: start the server that should own it, or configure a new <cas_server_root_id> for this disk",
+                    srid, *owner.retired_at_ms, owner.owner_life);
+            if (const std::optional<uint64_t> life = rejoinRetiredOwner(op, l, srid, our_uuid, owner, current->etag, observe_catalog, sink))
+                return *life;
+            if (decision == max_owner_decisions)
+                throw Exception(ErrorCodes::ABORTED,
+                    "CAS server-root '{}': the owner or the mount slot kept changing during {} rejoin attempts; "
+                    "restart to try again", srid, max_owner_decisions);
+            continue;
         }
-        /// Mirror mountDoubleStartMessage's operator guidance: the by-far most common cause is a
-        /// REGENERATED local ClickHouse uuid file (wiped /var/lib/clickhouse, a pod rescheduled
-        /// without a persistent volume) while the pool kept the old identity — name it and the
-        /// recovery options instead of a bare refusal.
+        /// Owner present → it is identity: equal UUID is ok, a different UUID fails closed regardless
+        /// of any lease/clock state.
+        if (owner.server_uuid == our_uuid)
+        {
+            if (retired_policy != RetiredOwnerPolicy::AcceptForDecommission)
+                throwIfOwnerRetired(owner, srid, key);
+            return owner.owner_life;
+        }
+        /// The common cause is a regenerated local uuid file (wiped /var/lib/clickhouse, a pod recreated
+        /// without a persistent volume) while the pool kept the old identity; name it and the supported
+        /// ways out, with the hand delete last: it is refused anyway while the subtree holds data.
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS server-root '{}' is owned by a different server (owner server_uuid={}, ours={}) — refusing to claim. "
-            "This usually means THIS server's local uuid file was regenerated (e.g. /var/lib/clickhouse was wiped, "
-            "or the container/pod was recreated without a persistent volume) while the pool kept the old identity. "
-            "Recover by restoring the old local uuid file; or configure a fresh <cas_server_root_id> for this disk; "
-            "or — only after verifying that NO server uses this root — manually delete the owner object '{}' and restart.",
-            srid, u128ToHex(owner->server_uuid), u128ToHex(our_uuid), key);
+            "Either this server's local uuid file was regenerated (/var/lib/clickhouse wiped, or a pod recreated "
+            "without a persistent volume) while the pool kept the old identity, or two servers are configured with "
+            "the same <cas_server_root_id>. Recover by restoring the old uuid file, or by starting this "
+            "server under a new <cas_server_root_id>. To reclaim the old id's data once its owning server is "
+            "permanently gone, decommission it — SYSTEM CAS DROP POOL MEMBER '{}' FROM DISK '<disk>' on a "
+            "surviving member (offline: clickhouse-disks cas-drop-member) — once its slot in system.cas_mounts is "
+            "'terminated' or 'fenced'. "
+            "Deleting the owner object '{}' by hand is a last resort, only after verifying that NO server uses this "
+            "root; it is refused while the subtree still holds data.",
+            srid, u128ToHex(owner.server_uuid), u128ToHex(our_uuid), srid, key);
     }
 
     /// Owner absent. Claiming is allowed ONLY over a provably-empty subtree; an absent owner over
@@ -557,15 +773,16 @@ void claimOwnerOrThrow(
     if (!serverRootSubtreeEmpty(op, l, srid, observe_catalog()))
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS server-root '{}' has no owner anchor but its data subtree is non-empty "
-            "(identity lost over existing data) — refusing to re-claim",
+            "(identity lost over existing data) — refusing to re-claim. Restoring the local uuid file does not help, "
+            "since no owner records a uuid to match. Configure a new <cas_server_root_id> for this disk",
             srid);
 
     const std::optional<Observation> occupant = conflictOrThrow(
-        op.create(key, encodeOwner(OwnerObject{.server_uuid = our_uuid, .retired_at_ms = std::nullopt}),
+        op.create(key, encodeOwner(OwnerObject{.server_uuid = our_uuid, .retired_at_ms = std::nullopt, .owner_life = 1}),
                   Retry::standard()),
         fmt::format("CAS server-root '{}' owner claim", srid));
     if (!occupant)
-        return;
+        return 1;
 
     /// The conditional create conflicted. Recompute the whole catalog + manifest + roots bundle;
     /// no stale emptiness result is carried across the conflict.
@@ -586,8 +803,9 @@ void claimOwnerOrThrow(
             "CAS server-root '{}' owner anchor vanished during claim", srid);
     if (reread->server_uuid == our_uuid)
     {
-        throwIfOwnerRetired(*reread, srid);
-        return;
+        if (retired_policy != RetiredOwnerPolicy::AcceptForDecommission)
+            throwIfOwnerRetired(*reread, srid, key);
+        return reread->owner_life;
     }
     throw Exception(ErrorCodes::CORRUPTED_DATA,
         "CAS server-root '{}' was claimed by a different server during our claim (foreign owner) "
@@ -596,7 +814,7 @@ void claimOwnerOrThrow(
 }
 
 uint64_t allocateWriterEpoch(
-    CasOperation & op, const Layout & l, const String & srid, EpochMintPolicy policy, uint64_t now_ms,
+    CasOperation & op, const Layout & l, const String & srid,
     const ObserveRefCatalog & observe_catalog)
 {
     if (!observe_catalog)
@@ -646,40 +864,12 @@ uint64_t allocateWriterEpoch(
                         break;   /// authoritative absence — fresh-root bootstrap proceeds below
                     case ProbeOutcome::Present:
                     {
-                        if (policy == EpochMintPolicy::DecommissionRecovery)
-                        {
-                            chassert(now_ms != 0);   /// the decommission caller must pass its clock
-                            const MountLease surviving = decodeMountLease(*mount_probe.body);
-                            /// Deliberately weaker than claimMount's reclaim gate, which never trusts a
-                            /// bare wall-clock comparison alone (only gc_fenced / the clean-farewell
-                            /// min_active_build_sequence==UINT64_MAX marker / a caller-proven-dead
-                            /// incarnation justify a reclaim there, because clock skew can misjudge
-                            /// liveness). This is still safe: (a) the mint below is DISTINCT from the
-                            /// survivor's epoch by construction, so no same-(uuid, epoch) pair is ever
-                            /// representable even if this liveness read is wrong; (b) claimMount right
-                            /// after this still applies its own STRONG liveness gate and refuses a
-                            /// genuinely live member regardless of what happens here. So a clock-skewed
-                            /// "terminal" misread can only burn one epoch number on a doomed
-                            /// decommission attempt that aborts at claimMount — it can never admit a
-                            /// claim over a live member.
-                            const bool live = !surviving.gc_fenced && surviving.expires_at_ms > now_ms;
-                            if (live)
-                                throw Exception(ErrorCodes::ABORTED,
-                                    "CAS decommission '{}': epoch object missing but a LIVE mount lease "
-                                    "exists ({}) — refusing to re-mint an epoch under a live member "
-                                    "(stop the server or wait for its lease to lapse)",
-                                    srid, describeMountHolder(surviving));
-                            /// Terminal mount: proceed, but mint an epoch DISTINCT from the survivor's
-                            /// by construction — the same-pair state is unrepresentable on this path.
-                            current.next_writer_epoch = std::max<uint64_t>(1, surviving.writer_epoch + 1);
-                            break;
-                        }
                         throw Exception(ErrorCodes::CORRUPTED_DATA,
                             "CAS server-root '{}' has no durable epoch object but a mount lease exists — "
                             "durable epoch state was lost while a mount is live or recently live; "
-                            "refusing to re-mint epoch 1. If no server is live on this root, "
-                            "decommission it or manually remove the stale mount object '{}'.",
-                            srid, l.mountKey(srid));
+                            "refusing to re-mint epoch 1. If no server uses this root, start with a new "
+                            "server_root_id; a decommission never recreates a counter",
+                            srid);
                     }
                     case ProbeOutcome::ContainerAbsent:
                     case ProbeOutcome::AccessDenied:
@@ -695,7 +885,8 @@ uint64_t allocateWriterEpoch(
             }
 
             allocated = current.next_writer_epoch;
-            return encodeServerEpoch(ServerEpoch{.next_writer_epoch = allocated + 1});
+            return encodeServerEpoch(
+                ServerEpoch{.next_writer_epoch = allocated + 1, .allocation_nonce = UUIDHelpers::generateV4().toUnderType()});
         },
         Retry::standard());
 
@@ -709,15 +900,6 @@ uint64_t allocateWriterEpoch(
 
 namespace
 {
-/// Every holder-originated mount body gets a random durable identity. UUIDv4 cannot be zero, but
-/// keep the postcondition explicit because zero is reserved as an uninitialized in-memory value.
-UInt128 newMountWriteAttemptId()
-{
-    const UInt128 id = UUIDHelpers::generateV4().toUnderType();
-    chassert(id != UInt128{});
-    return id;
-}
-
 /// Build a fresh mount-lease body for (uuid, epoch) with the given seq, stamped from `now_ms`.
 MountLease makeMountBody(UInt128 uuid, uint64_t epoch, uint64_t seq, uint64_t now_ms, uint64_t ttl_ms)
 {
@@ -782,12 +964,35 @@ void emitMountEvent(const CasEventSink & sink, CasEventType type, const String &
         /// allocate or recurse through the same diagnostic machinery at a protocol-critical site.
     }
 }
+
+/// Why `owner` is not the one `expected` names; nullopt when it is.
+std::optional<String> ownerRefusal(const std::optional<OwnerObject> & owner, const String & srid, const OwnerExpectation & expected)
+{
+    if (!owner)
+        return fmt::format("CAS server-root '{}': the owner anchor vanished after the mount claim", srid);
+    if (owner->server_uuid != expected.server_uuid)
+        return fmt::format(
+            "CAS server-root '{}' is owned by a different server since this claim began (owner server_uuid={}, "
+            "ours={}); the mount slot was handed to another server and this claim is withdrawn",
+            srid, u128ToHex(owner->server_uuid), u128ToHex(expected.server_uuid));
+    if (owner->retired_at_ms && expected.retired != RetiredOwnerPolicy::AcceptForDecommission)
+        return fmt::format(
+            "CAS server-root '{}' was decommissioned (tombstoned at {} ms) while this claim was in progress; "
+            "refusing to run under a retired owner", srid, *owner->retired_at_ms);
+    if (owner->owner_life != expected.owner_life)
+        return fmt::format(
+            "CAS server-root '{}': the owner moved from life {} to life {} since this process started (a "
+            "retirement, a rollback or a rejoin happened in between); restart to continue under the current life",
+            srid, expected.owner_life, owner->owner_life);
+    return std::nullopt;
+}
 }
 
 MountClaimResult claimMount(
     CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid, uint64_t our_epoch,
     uint64_t now_ms, uint64_t ttl_ms, const std::optional<Etag> & proven_dead_incarnation,
-    const CasEventSink & sink, const std::optional<Etag> & unsafe_reclaim_authorization)
+    const CasEventSink & sink, const std::optional<Etag> & unsafe_reclaim_authorization,
+    const std::optional<OwnerExpectation> & foreign_reclaim_owner)
 {
     const String key = l.mountKey(srid);
     const auto got = op.read(key, Retry::standard());
@@ -808,19 +1013,40 @@ MountClaimResult claimMount(
 
     const MountLease existing = decodeMountLease(got->bytes);
 
-    /// Foreign owner → fail closed regardless of expiry. (This runs after the owner gate, so a foreign
-    /// mount should not normally exist, but the lease must never be taken across UUIDs.)
+    const bool clean_marker = existing.isCleanRelease();
+
+    /// A live body of another uuid is never taken. A terminal one below our epoch is what a rejoin under a new
+    /// uuid finds; it is reclaimed only once the owner reads as this claimer's own life. The owner is read before
+    /// the write, not only rechecked after it, so a reclaim never lands under somebody else's owner.
     if (existing.server_uuid != our_uuid)
     {
-        emitMountEvent(sink, CasEventType::MountConflict, srid, "foreign_owner", &existing,
-            "mount slot is held by a foreign server_uuid — refusing to take over across identities");
-        return {.kind = MountClaimResult::ForeignOwner, .body = existing, .etag = std::nullopt};
+        const bool reclaimable = (existing.gc_fenced || clean_marker) && existing.writer_epoch < our_epoch
+            && foreign_reclaim_owner && !ownerRefusal(readOwnerObject(op, l, srid), srid, *foreign_reclaim_owner);
+        if (!reclaimable)
+        {
+            emitMountEvent(sink, CasEventType::MountConflict, srid, "foreign_owner", &existing,
+                "mount slot is held by a foreign server_uuid — refusing to take over across identities");
+            return {.kind = MountClaimResult::ForeignOwner, .body = existing, .etag = std::nullopt};
+        }
     }
 
-    /// Same uuid + same epoch: it is OUR OWN claim — but a FENCED body is terminal for this
-    /// (uuid, epoch): the GC dropped its ack from the floor when it fenced. Refreshing it in place
-    /// would reactivate a fenced incarnation — a fence permanently consumes this `(server_uuid,
-    /// writer_epoch)` pair, so the caller must re-open with a fresh `writer_epoch`.
+    /// An older allocation that reached the slot late must not replace a newer incarnation of this
+    /// server: recovery seals only epochs below the live one, so a late write of the newer epoch would
+    /// never be sealed out.
+    if (existing.writer_epoch > our_epoch)
+    {
+        emitMountEvent(sink, CasEventType::MountConflict, srid, "newer_epoch", &existing,
+            "same server_uuid, newer writer_epoch in the mount slot — refusing to replace it");
+        throw Exception(ErrorCodes::ABORTED,
+            "CAS mount slot '{}' holds writer_epoch {} of this server_uuid, newer than the writer_epoch {} "
+            "this claim allocated: another start or a decommission of server_root_id '{}' allocated after "
+            "this one. Refusing to replace the newer incarnation ({})",
+            key, existing.writer_epoch, our_epoch, srid, describeMountHolder(existing));
+    }
+
+    /// Our own `(uuid, epoch)` is in the slot, but this call has written nothing: the engine settles a
+    /// sent attempt inside the write itself. Another process was allocated the same epoch, and its body
+    /// is never replaced. A fenced one is terminal for the pair; the caller takes a fresh epoch.
     if (existing.writer_epoch == our_epoch)
     {
         if (existing.gc_fenced)
@@ -830,20 +1056,12 @@ MountClaimResult claimMount(
                 "recover with a fresh writer_epoch");
             return {.kind = MountClaimResult::FencedSelf, .body = existing, .etag = std::nullopt};
         }
-        const MountLease body = makeMountBody(our_uuid, our_epoch, existing.seq + 1, now_ms, ttl_ms);
-        if (const std::optional<Observation> raced
-                = conflictOrThrow(op.replace(key, encodeMountLease(body), got->etag, Retry::standard()),
-                                  fmt::format("CAS mount slot refresh of '{}'", key)))
-            /// The mount changed under us between the read and the write, so `got->etag` is KNOWN
-            /// STALE -- that mismatch is exactly why the write was refused. What the write's resolve
-            /// read observed is current, and it is that pair that is reported.
-            return racedDoubleStart(*raced);
-        emitMountEvent(sink, CasEventType::MountClaim, srid, "refresh", &existing,
-            "own claim replayed — refreshed seq + expiry");
-        return {.kind = MountClaimResult::Claimed, .body = body, .etag = std::nullopt};
+        emitMountEvent(sink, CasEventType::MountConflict, srid, "same_epoch_occupied", &existing,
+            "own (uuid, epoch) is already in the mount slot, written by another process — refusing to write");
+        return {.kind = MountClaimResult::LiveDoubleStart, .body = existing, .etag = got->etag};
     }
 
-    /// Same uuid, DIFFERENT epoch: reclaim ONLY on a certificate of death that needs no fresh
+    /// Same uuid, OLDER epoch: reclaim ONLY on a certificate of death that needs no fresh
     /// wall-clock trust — never by comparing `expires_at_ms` against `now_ms`:
     ///   - `gc_fenced` → the fence-out is terminal for that incarnation by construction (its renewer's
     ///     every renewal fails the token guard forever, so it can never write again) — there is no
@@ -863,7 +1081,6 @@ MountClaimResult claimMount(
     /// clean-marked, not (yet) proven-dead, not unsafe-authorized lease may simply be a live twin, and
     /// `expires_at_ms` alone can never distinguish that from a dead predecessor across two different
     /// clocks.
-    const bool clean_marker = existing.min_active_build_sequence == std::numeric_limits<uint64_t>::max();
     const bool proven_dead = proven_dead_incarnation && *proven_dead_incarnation == got->etag;
     const bool unsafe_authorized = unsafe_reclaim_authorization && *unsafe_reclaim_authorization == got->etag;
     if (existing.gc_fenced || clean_marker || proven_dead || unsafe_authorized)
@@ -881,7 +1098,8 @@ MountClaimResult claimMount(
                                      : proven_dead        ? MountPriorState::UncleanObserved
                                                            : MountPriorState::UncleanUnsafe;
         emitMountEvent(sink, CasEventType::MountClaim, srid, "reclaim", &existing,
-            existing.gc_fenced ? "same server_uuid, different writer_epoch, GC-fenced — reclaimed"
+            existing.server_uuid != our_uuid ? "terminal body of another server_uuid, the owner is ours — reclaimed"
+            : existing.gc_fenced ? "same server_uuid, different writer_epoch, GC-fenced — reclaimed"
             : clean_marker     ? "same server_uuid, different writer_epoch, clean farewell — reclaimed"
             : proven_dead      ? "same server_uuid, different writer_epoch, observed dead by "
                                  "token-stability observation — reclaimed"
@@ -898,6 +1116,55 @@ MountClaimResult claimMount(
     /// etag (what we just read is what's still there), so it is safe to hand back for the
     /// caller's observation loop to compare across polls without a redundant re-read.
     return {.kind = MountClaimResult::LiveDoubleStart, .body = existing, .etag = got->etag};
+}
+
+namespace
+{
+/// Rewrite the claimer's own live body `gc_fenced`, preserving everything else as the GC fence does. Only
+/// `(our_uuid, our_epoch)`, not yet fenced or farewelled, is touched; anything else in the slot is left alone.
+void fenceOwnClaim(CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid, uint64_t our_epoch,
+                   const CasEventSink & sink)
+{
+    const String key = l.mountKey(srid);
+    WriteResult fenced = op.readModifyWrite(key,
+        [&](const std::optional<Object> & observed) -> std::optional<String>
+        {
+            if (!observed)
+                return std::nullopt;
+            const MountLease body = decodeMountLease(observed->bytes);
+            if (!body.isHeldBy(our_uuid, our_epoch) || body.gc_fenced || body.isCleanRelease())
+                return std::nullopt;
+            return encodeMountLease(body.fencedCopy());
+        },
+        Retry::standard());
+    if (std::holds_alternative<Committed>(fenced))
+        emitMountEvent(sink, CasEventType::MountRelease, srid, "self_fenced", nullptr,
+            "the owner recheck refused this claim; the slot is fenced so a successor need not wait");
+    else if (!std::holds_alternative<Declined>(fenced))
+        LOG_WARNING(getLogger("CasMountLease"),
+            "CAS server-root '{}': the refused claim's mount body could not be fenced; its lease expires on its own", srid);
+}
+}
+
+void recheckOwnerAfterClaim(
+    CasOperation & op, const Layout & l, const String & srid, const OwnerExpectation & expected,
+    uint64_t our_epoch, const CasEventSink & sink)
+{
+    const std::optional<String> refusal = ownerRefusal(readOwnerObject(op, l, srid), srid, expected);
+    if (!refusal)
+        return;
+
+    /// The fence only spares a successor the lease wait; its failure must not replace the owner's reason.
+    try
+    {
+        fenceOwnClaim(op, l, srid, expected.server_uuid, our_epoch, sink);
+    }
+    catch (...)
+    {
+        tryLogCurrentException(getLogger("CasMountLease"),
+            fmt::format("CAS server-root '{}': the refused claim's mount body could not be fenced", srid));
+    }
+    throw Exception(ErrorCodes::CORRUPTED_DATA, "{}", *refusal);
 }
 
 String mountDoubleStartMessage(const String & srid, const std::optional<MountLease> & existing)
@@ -918,9 +1185,8 @@ String mountDoubleStartMessage(const String & srid, const std::optional<MountLea
         " - LIVENESS: this wait judges the holder alive by its write token holding stable on THIS server's\n"
         "   own clock for the full observation threshold; the stamped expires_at_ms above never enters that\n"
         "   judgment on its own -- it is a writer-stamped diagnostic (also shown in system.cas_mounts), not\n"
-        "   an authorization. Every server sharing this pool must run the SAME cas_mount_lease_ttl_ms and\n"
-        "   cas_mount_renew_period_ms: a server configured with a shorter threshold than its peers can fence\n"
-        "   out a healthy one.\n"
+        "   an authorization. The threshold uses the longer of this server's cas_mount_lease_ttl_ms and the\n"
+        "   lease the holder's body declares (expires_at_ms - started_at_ms).\n"
         " - If the local ClickHouse uuid file was regenerated, restore the old uuid file, or remove the stale\n"
         "   owner object gc/server-roots/{}/owner only after verifying no server uses this root.\n"
         " - As a LAST RESORT, after verifying that NO server is writing this root, manually delete the mount\n"
@@ -932,9 +1198,22 @@ String mountDoubleStartMessage(const String & srid, const std::optional<MountLea
         srid, identity, srid, srid);
 }
 
-uint64_t mountObservationThresholdMs(uint64_t ttl_ms, uint64_t cadence_ms)
+uint64_t declaredMountLeaseMs(const MountLease & m)
 {
-    return ttl_ms + ttl_ms / 20 + cadence_ms;
+    if (m.started_at_ms == 0 || m.expires_at_ms <= m.started_at_ms)
+        return 0;
+    return m.expires_at_ms - m.started_at_ms;
+}
+
+uint64_t mountObservationThresholdMs(uint64_t own_lease_ms, uint64_t declared_lease_ms, uint64_t cadence_ms)
+{
+    const uint64_t lease_ms = std::max(own_lease_ms, declared_lease_ms);
+    uint64_t threshold_ms = 0;
+    /// A wrapped sum would fence early; waiting forever is the safe side.
+    if (common::addOverflow(lease_ms, lease_ms / 20, threshold_ms)
+        || common::addOverflow(threshold_ms, cadence_ms, threshold_ms))
+        return std::numeric_limits<uint64_t>::max();
+    return threshold_ms;
 }
 
 MountClaimResult claimMountAwaitingExpiry(
@@ -944,18 +1223,15 @@ MountClaimResult claimMountAwaitingExpiry(
     uint64_t ttl_ms, uint64_t poll_interval_ms,
     const std::function<void(uint64_t)> & sleep_ms_fn,
     const std::function<void(const MountLease &, uint64_t)> & on_wait_start,
-    const CasEventSink & sink)
+    const CasEventSink & sink,
+    const std::optional<OwnerExpectation> & foreign_reclaim_owner)
 {
     /// A zero poll interval would spin; a single-ms floor keeps the loop a real (bounded) wait.
     const uint64_t poll = poll_interval_ms == 0 ? 1 : poll_interval_ms;
 
-    /// Rate-bound observation threshold: the full lease TTL, plus a 5% allowance for clock-rate
-    /// mismatch between the holder's and our own local clock, plus one poll interval for observation
-    /// discreteness. It is measured only with OUR OWN clock (`mono_ms_fn`); no cross-node wall-clock
-    /// comparison participates in this loop. `poll` here is half the renewal period (the caller's own
-    /// poll cadence), so this threshold is close to, but not identical to, GC's heartbeat fence-out
-    /// threshold, which passes the full renewal period into the same shared helper.
-    const uint64_t threshold_ms = mountObservationThresholdMs(ttl_ms, poll);
+    /// Set when an observation starts, from the observed body; one token is one body, so the threshold
+    /// of an observation never changes.
+    uint64_t threshold_ms = 0;
 
     std::optional<Etag> observed;
     uint64_t observed_since = 0;
@@ -965,9 +1241,16 @@ MountClaimResult claimMountAwaitingExpiry(
     {
         const bool threshold_met = observed && mono_ms_fn() - observed_since >= threshold_ms;
         MountClaimResult r = claimMount(op, l, srid, our_uuid, our_epoch, now_ms_fn(), ttl_ms,
-            threshold_met ? observed : std::nullopt, sink, /*unsafe_reclaim_authorization=*/{});
+            threshold_met ? observed : std::nullopt, sink, /*unsafe_reclaim_authorization=*/{}, foreign_reclaim_owner);
         if (r.kind != MountClaimResult::LiveDoubleStart)
             return r;
+        /// Observation certifies only an older epoch dead; a body of our own pair is never replaced,
+        /// so waiting on it could not end.
+        if (r.body && r.body->isHeldBy(our_uuid, our_epoch))
+            return r;
+        /// A raced write observed a newer epoch of ours; the re-read refuses it with the newer-epoch error.
+        if (r.body && r.body->server_uuid == our_uuid && r.body->writer_epoch > our_epoch)
+            return claimMount(op, l, srid, our_uuid, our_epoch, now_ms_fn(), ttl_ms, std::nullopt, sink, {}, foreign_reclaim_owner);
 
         /// `claimMount` already read the current body, and a raced write reports whatever its own
         /// resolve read observed. Reuse `r.etag` whenever it is set instead of re-reading the SAME key
@@ -980,14 +1263,9 @@ MountClaimResult claimMountAwaitingExpiry(
             const auto got = op.read(l.mountKey(srid), Retry::standard());
             if (!got)
             {
-                /// The slot vanished between claimMount's own GET and ours — normally self-resolving
-                /// within one more `claimMount` call (which re-mints fresh on an absent slot), but under
-                /// slot churn (something else concurrently removing/re-minting it) that resolution could
-                /// keep losing the same race. Pace this like every other iteration and
-                /// count it toward the SAME bounded restart budget the incarnation-churn case below
-                /// uses, instead of spinning read/claim/write at backend RTT with no sleep and no bound
-                /// — a persistently vanishing slot is exactly as "alive and contended" as a persistently
-                /// renewing holder.
+                /// The slot vanished between `claimMount`'s read and ours (a 26.6.4 decommission or a hand delete):
+                /// the next `claimMount` re-mints it. Paced and counted like a renewing holder, so a slot that
+                /// keeps vanishing cannot spin read, claim and write at backend RTT.
                 if (++restarts > kMaxObservationRestarts)
                     return r;
                 sleep_ms_fn(poll);
@@ -1005,7 +1283,10 @@ MountClaimResult claimMountAwaitingExpiry(
                 return r;
             observed = *current_etag;
             observed_since = mono_ms_fn();
-            if (on_wait_start && r.body)
+            if (!r.body)
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount '{}': observed a mount token without its body", srid);
+            threshold_ms = mountObservationThresholdMs(ttl_ms, declaredMountLeaseMs(*r.body), poll);
+            if (on_wait_start)
                 on_wait_start(*r.body, threshold_ms);
             LOG_INFO(getLogger("CasMountLease"),
                 "Attempting to mount content-addressed server root {} after node change or hard "
@@ -1022,23 +1303,34 @@ bool MountIncarnationObservation::heldFor(uint64_t threshold_ms, uint64_t sample
     return sample_ms >= first_seen_mono_ms && sample_ms - first_seen_mono_ms >= threshold_ms;
 }
 
+namespace
+{
+/// The setting is local, so different values are legal; a longer one slows recovery after its holder's
+/// crash, which the operator should know about.
+void warnOnceIfHolderLeaseDiffers(
+    const String & srid, const MountLease & holder, uint64_t observer_lease_ms, std::set<String> & warned)
+{
+    const uint64_t declared_ms = declaredMountLeaseMs(holder);
+    if (declared_ms == 0 || declared_ms == observer_lease_ms || !warned.insert(srid).second)
+        return;
+    LOG_WARNING(getLogger("CasHeartbeatFloor"),
+        "This server is configured with cas_mount_lease_ttl_ms={} but the holder of slot {} (hostname={}, pid={}) "
+        "declares a lease of {} ms. Observers wait for the longer of the two; a longer lease on one server "
+        "delays recovery after that server's crash.",
+        observer_lease_ms, srid, holder.hostname, holder.pid, declared_ms);
+}
+}
+
 HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64_t now_ms,
                                      const std::function<uint64_t()> & mono_ms_fn,
-                                     uint64_t stable_threshold_ms, MountObservationMap & obs)
+                                     uint64_t observer_lease_ms, uint64_t cadence_ms, MountObservationMap & obs,
+                                     std::set<String> & lease_mismatch_warned)
 {
     HeartbeatFloor floor;
     /// Taken before any read: it can confirm that a token held, never date a sighting.
     const uint64_t round_start_ms = mono_ms_fn();
 
-    /// `obs` is keyed by every srid this leader has EVER observed, but a
-    /// srid removed from the LIST entirely (its `/mount` key gone -- e.g. `SYSTEM CAS
-    /// DROP POOL MEMBER`) is never visited by the walk below again, so its entry would otherwise linger
-    /// forever (~150-250 B/srid, worse on a long-lived leader across many decommissions). Track every
-    /// srid actually seen THIS pass and prune anything else out of `obs` at the end -- disjoint from the
-    /// mid-walk `obs.erase(srid)` calls below (those fire for a srid seen but now terminal/fenced/gone
-    /// this pass; this is for a srid not seen AT ALL).
     std::set<String> seen_srids;
-
     const String prefix = l.serverRootsPrefix();
     op.forEachListedKey(prefix, [&](const ListedKey & listed)
     {
@@ -1059,6 +1351,7 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
         /// holder's own renewal installed, and the observation check below then sees the new
         /// incarnation and restarts the window -- which counts the slot `live` and declines the write.
         /// That is why no arm that counts a slot ever also asks for a fence-out body.
+        uint64_t threshold_ms = 0;
         WriteResult fenced_out = op.readModifyWrite(key,
             [&](const std::optional<Object> & observed) -> std::optional<String>
             {
@@ -1076,12 +1369,15 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
                     obs.erase(srid);   /// terminal — no further observation needed
                     return std::nullopt;
                 }
-                if (m.min_active_build_sequence == std::numeric_limits<uint64_t>::max())
+                if (m.isCleanRelease())
                 {
                     ++floor.terminated;
                     obs.erase(srid);   /// terminal — no further observation needed
                     return std::nullopt;
                 }
+
+                warnOnceIfHolderLeaseDiffers(srid, m, observer_lease_ms, lease_mismatch_warned);
+                threshold_ms = mountObservationThresholdMs(observer_lease_ms, declaredMountLeaseMs(m), cadence_ms);
 
                 /// Observation-based liveness: stable ONLY if the SAME incarnation was already being
                 /// watched and has now held for the full threshold on our OWN monotonic clock. Anything
@@ -1090,7 +1386,7 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
                 /// counts as `live` this call.
                 const auto it = obs.find(srid);
                 const bool stable = it != obs.end() && it->second.etag == observed->etag
-                    && it->second.heldFor(stable_threshold_ms, round_start_ms);
+                    && it->second.heldFor(threshold_ms, round_start_ms);
 
                 if (!stable)
                 {
@@ -1103,10 +1399,7 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
 
                 /// Stable past the threshold, not yet fenced → fence-out preserving the whole body
                 /// (gc_fenced = true, seq + 1) against the incarnation this decision observed.
-                MountLease fenced = m;
-                fenced.gc_fenced = true;
-                fenced.seq = m.seq + 1;
-                return encodeMountLease(fenced);
+                return encodeMountLease(m.fencedCopy());
             },
             Retry::standard());
 
@@ -1119,7 +1412,7 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
                 "CAS GC fenced out mount lease for content-addressed server root {} at "
                 "wall-clock ms {}: its write incarnation held unchanged for >= {} ms on the GC "
                 "leader's own monotonic clock (token-stability observation)",
-                srid, now_ms, stable_threshold_ms);
+                srid, now_ms, threshold_ms);
             return true;
         }
         /// Declined: the decision above already classified and counted this slot, and asked for no
@@ -1130,9 +1423,10 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
         return true;
     }, Retry::standard());
 
-    /// Prune every `obs` entry for a srid this pass's walk never saw at all.
-    for (auto it = obs.begin(); it != obs.end(); )
-        it = seen_srids.contains(it->first) ? std::next(it) : obs.erase(it);
+    /// A slot deleted by a 26.6.4 decommission or by hand is never listed again; without this its srid would
+    /// stay in both maps forever on a long-lived leader.
+    std::erase_if(obs, [&](const auto & entry) { return !seen_srids.contains(entry.first); });
+    std::erase_if(lease_mismatch_warned, [&](const String & s) { return !seen_srids.contains(s); });
 
     return floor;
 }
@@ -1174,7 +1468,7 @@ std::vector<NonTerminalMountSlot> probeNonTerminalMountSlots(CasOperation & op, 
             return true;
         }
 
-        if (m.gc_fenced || m.min_active_build_sequence == std::numeric_limits<uint64_t>::max())
+        if (m.gc_fenced || m.isCleanRelease())
             return true;   /// terminal: fenced out by GC, or the holder's own graceful farewell.
 
         slots.push_back(NonTerminalMountSlot{srid, fmt::format(
@@ -1216,12 +1510,33 @@ std::vector<MountInfo> listMounts(CasOperation & op, const Layout & layout, uint
         }
         if (info.lease.gc_fenced)
             info.state = "fenced";
-        else if (info.lease.min_active_build_sequence == std::numeric_limits<uint64_t>::max())
+        else if (info.lease.isCleanRelease())
             info.state = "terminated";
         else if (now_ms <= info.lease.expires_at_ms + skew_margin_ms)
             info.state = "live";
         else
             info.state = "expired";
+        /// A decommission keeps the slot; the owner says whether the member behind a terminal row is retired, and
+        /// whether that retirement is verified: a rerun is for an unverified one only.
+        if (info.state == "terminated" || info.state == "fenced")
+        {
+            if (const auto owner_got = op.read(layout.ownerKey(info.srid), Retry::standard()))
+            {
+                try
+                {
+                    const OwnerObject owner = decodeOwner(owner_got->bytes);
+                    if (owner.retired_at_ms)
+                    {
+                        info.state = "retired";
+                        info.retirement_verified = owner.retirement_verified;
+                    }
+                }
+                catch (...)
+                {
+                    info.state = "corrupt";
+                }
+            }
+        }
         out.push_back(std::move(info));
         return true;
     }, Retry::standard());
@@ -1246,7 +1561,7 @@ FenceCertificate classifyFenceCertificate(const MountLease & lease, uint64_t fen
 {
     if (lease.gc_fenced)
         return FenceCertificate::GcFenced;
-    if (lease.min_active_build_sequence == std::numeric_limits<uint64_t>::max())
+    if (lease.isCleanRelease())
         return FenceCertificate::CleanFarewell;
     if (lease.writer_epoch != fence_writer_epoch)
         return FenceCertificate::SupersededEpoch;
@@ -1462,6 +1777,7 @@ uint64_t MountLeaseRenewer::start(Liveness liveness)
 
     seq = 1;
     last_etag = etag;
+    last_body = body;
     last_committed_attempt_start_boot_ms = attempt_start_boot_ms;
     const uint64_t ttl_ms = static_cast<uint64_t>(ttl.count());
     confirmed_deadline_boot_ms = attempt_start_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
@@ -1568,16 +1884,49 @@ MountRenewResult MountLeaseRenewer::terminalResult(MountRenewResult result)
 
 MountRenewResult MountLeaseRenewer::renew(const MountRenewOperationEnvironment & environment)
 {
-    return renewOn(mount_requests, environment);
+    return renewOn(mount_requests, environment, /*until_definitive=*/false);
 }
 
 MountRenewResult MountLeaseRenewer::renewForRemount(const MountRenewOperationEnvironment & environment)
 {
-    return renewOn(open_requests, environment);
+    return renewOn(open_requests, environment, /*until_definitive=*/false);
+}
+
+MountRenewResult MountLeaseRenewer::renewUntilDefinitive(const MountRenewOperationEnvironment & environment)
+{
+    return renewOn(open_requests, environment, /*until_definitive=*/true);
+}
+
+Observation MountLeaseRenewer::readUntilObserved(
+    CasOperation & op, const Retry & policy, const MountRenewOperationEnvironment & environment,
+    uint64_t write_started_boot_ms) const
+{
+    const auto boot_clock = environment.boot_ms ? environment.boot_ms : boot_ms_fn;
+    uint64_t pause_ms = Retry::pauseAfterAttempt(*policy.attempt_spacing_ms, write_started_boot_ms, boot_clock());
+    while (op.admitted())
+    {
+        op.pause(pause_ms);
+        try
+        {
+            std::optional<Object> got = op.read(key, policy);
+            if (!got)
+                return ProvenAbsent{};
+            return std::move(*got);
+        }
+        catch (const Exception & e)
+        {
+            if (isDeterministicLocalFailure(e.code()))
+                throw;
+            /// Without a deadline the read repeats a transport fault itself, so what reaches here is
+            /// the store's refusal or a stop, which `op.admitted` tells apart.
+            pause_ms = environment.refusal_pause_ms;
+        }
+    }
+    return NotObserved{};
 }
 
 MountRenewResult MountLeaseRenewer::renewOn(
-    CasRequests & plane, const MountRenewOperationEnvironment & environment)
+    CasRequests & plane, const MountRenewOperationEnvironment & environment, bool until_definitive)
 {
     const MountRenewObservabilityRegistration observability_registration = beginMountRenewObservabilityCall();
     const MountRenewObservabilityCallGuard observability_guard(observability_registration);
@@ -1590,11 +1939,6 @@ MountRenewResult MountLeaseRenewer::renewOn(
             static_cast<uint32_t>(renewer_state));
 
     const auto boot_clock = environment.boot_ms ? environment.boot_ms : boot_ms_fn;
-    /// Sampled BEFORE the write. A refused admission is reported as "never attempted" only when this
-    /// node had already been asked to stop, and reading the flag afterwards could not tell that apart
-    /// from a flag the refusal itself set.
-    const bool cancelled = environment.cancelled && environment.cancelled();
-
     const uint64_t wall_ms = now_ms_fn();
     const uint64_t attempt_start_boot_ms = boot_clock();
     const uint64_t next_seq = seq + 1;
@@ -1617,17 +1961,69 @@ MountRenewResult MountLeaseRenewer::renewOn(
     result.attempt_start_boot_ms = attempt_start_boot_ms;
 
     CasOperation op = plane.admit(environment.live);
+    /// Counted here rather than taken from one engine call: the background renewal may span several.
+    uint32_t attempts_sent = 0;
+    uint64_t last_attempt_start_boot_ms = attempt_start_boot_ms;
+    op.observeRequests(RequestObserver{
+        .on_write_attempt = [&](uint32_t)
+        {
+            ++attempts_sent;
+            last_attempt_start_boot_ms = boot_clock();
+            if (environment.requests.on_write_attempt)
+                environment.requests.on_write_attempt(attempts_sent);
+        },
+        .on_failure = environment.requests.on_failure,
+    });
+    const Etag expected = precondition();
+    const Retry policy = until_definitive
+        ? Retry::untilDefinitive()
+        : Retry::untilLeaseSafe(confirmed_deadline_boot_ms, static_cast<uint64_t>(lease_safety_margin.count()));
     std::optional<WriteResult> written;
     try
     {
-        written = op.replace(key, body, precondition(),
-            Retry::untilLeaseSafe(confirmed_deadline_boot_ms, static_cast<uint64_t>(lease_safety_margin.count())));
+        written = op.replace(key, body, expected, policy);
+        while (until_definitive)
+        {
+            uint64_t pause_ms = 0;
+            if (std::holds_alternative<Refused>(*written))
+            {
+                /// `writeLoop` refuses only when no attempt of the call is unclear, so no copy of ours
+                /// can land behind a new call with the same tuple.
+                pause_ms = environment.refusal_pause_ms;
+            }
+            else if (Conflict * conflict = std::get_if<Conflict>(&*written))
+            {
+                if (std::holds_alternative<NotObserved>(conflict->seen))
+                    conflict->seen = readUntilObserved(op, policy, environment, last_attempt_start_boot_ms);
+                if (std::holds_alternative<NotObserved>(conflict->seen))
+                {
+                    /// Counted as sent: the refused precondition says the slot may have moved, so a farewell
+                    /// naming our last token could meet a holder entitled to it.
+                    written = GaveUp{GaveUp::Why::FenceLost, GaveUp::Source::Policy, /*sent_any=*/true, NotObserved{}, attempts_sent};
+                    break;
+                }
+                /// Our last confirmed body under the token we named: the slot did not move. A new call is
+                /// safe because a call with an unclear attempt returns `Conflict` only once the token
+                /// moved, so this call left no copy of ours that could land.
+                const Object * seen = std::get_if<Object>(&conflict->seen);
+                if (!seen || seen->etag != expected || seen->bytes != last_body)
+                    break;
+                pause_ms = Retry::pauseAfterAttempt(*policy.attempt_spacing_ms, last_attempt_start_boot_ms, boot_clock());
+            }
+            else
+            {
+                break;
+            }
+            op.pause(pause_ms);
+            written = op.replace(key, body, expected, policy);
+        }
     }
     catch (...)
     {
         /// The engine surfaces a deterministic local failure unchanged rather than reissuing it.
         markMountRenewTermination(MountRenewTerminalClassification::DeterministicFailure);
         result.failure = std::current_exception();
+        result.attempts_sent = attempts_sent;
         return terminalResult(std::move(result));
     }
 
@@ -1635,22 +2031,23 @@ MountRenewResult MountLeaseRenewer::renewOn(
     {
         seq = next_seq;
         last_etag = std::move(committed->etag);
+        last_body = body;
         last_committed_attempt_start_boot_ms = attempt_start_boot_ms;
         const uint64_t ttl_ms = static_cast<uint64_t>(ttl.count());
         confirmed_deadline_boot_ms = attempt_start_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
             ? std::numeric_limits<uint64_t>::max()
             : attempt_start_boot_ms + ttl_ms;
         result.outcome = MountRenewOutcome::Committed;
-        result.attempts_sent = committed->attempts_sent;
+        result.attempts_sent = attempts_sent;
         result.resolved_by_read = committed->resolved_by_read;
-        result.sent_any = committed->attempts_sent != 0;
+        result.sent_any = attempts_sent != 0;
         return result;
     }
 
     if (const Conflict * conflict = std::get_if<Conflict>(&*written))
     {
         result.sent_any = true;
-        result.attempts_sent = conflict->attempts_sent;
+        result.attempts_sent = attempts_sent;
         try
         {
             throwRenewConflict(conflict->seen);
@@ -1665,7 +2062,7 @@ MountRenewResult MountLeaseRenewer::renewOn(
     if (const Refused * refused = std::get_if<Refused>(&*written))
     {
         result.sent_any = true;
-        result.attempts_sent = refused->attempts_sent;
+        result.attempts_sent = attempts_sent;
         markMountRenewTermination(MountRenewTerminalClassification::DeterministicFailure);
         result.failure = std::make_exception_ptr(Exception(
             refused->store_error,
@@ -1675,13 +2072,18 @@ MountRenewResult MountLeaseRenewer::renewOn(
 
     if (const GaveUp * gave_up = std::get_if<GaveUp>(&*written))
     {
-        result.sent_any = gave_up->sent_any;
-        result.attempts_sent = gave_up->attempts_sent;
+        /// Across every engine call of this renewal, not only the call that gave up.
+        result.sent_any = attempts_sent != 0;
+        result.attempts_sent = attempts_sent;
         if (gave_up->why == GaveUp::Why::Deadline)
             result.deadline_source = gave_up->deadline_source;
 
-        /// Nothing was sent and the node was already stopping: the lease is exactly as it was, so this
-        /// is a renewal that never ran, not one that lost its authority.
+        /// Read after the refusal, because a stop that lands mid-renewal is what refused it.
+        const bool cancelled = environment.cancelled && environment.cancelled();
+
+        /// The call that gave up sent nothing, every earlier call of a series ended in a refusal or in a
+        /// read that found the slot as our last commit left it, and the node is stopping: the renewal
+        /// never ran and the farewell may still hand the slot back.
         if (gave_up->why == GaveUp::Why::FenceLost && !gave_up->sent_any && cancelled)
         {
             markMountRenewTermination(MountRenewTerminalClassification::Cancelled);
@@ -1712,7 +2114,7 @@ MountRenewResult MountLeaseRenewer::renewOn(
             "observation: {})",
             key,
             terminalClassificationName(classification),
-            gave_up->sent_any ? "at least one" : "no",
+            result.sent_any ? "at least one" : "no",
             detail::renderObservation(gave_up->last_seen)));
         return terminalResult(std::move(result));
     }
@@ -1770,6 +2172,7 @@ void MountLeaseRenewer::terminate(CasOperation & op)
     {
         seq += 1;
         last_etag = std::move(committed->etag);
+        last_body = body;
         emitMountEvent(
             event_sink, CasEventType::MountRelease, srid, "farewell", nullptr,
             "graceful release -- lease stamped already-expired and watermark retired");
@@ -1809,42 +2212,40 @@ void MountLeaseRenewer::release()
     terminate(op);
 }
 
-void sweepOwnMountStaging(IObjectStorage & object_storage, const String & mount_staging_prefix) noexcept
+void sweepOwnMountStaging(IObjectStorage & object_storage, const String & mount_staging_prefix, uint64_t live_writer_epoch) noexcept
 {
     try
     {
-        /// max_keys=0 asks `listObjects` for the FULL listing under the prefix (it paginates until
-        /// exhausted rather than capping at some default page size) — see `IObjectStorage::listObjects`.
-        /// A mount's own staging debris is bounded (one mount's in-flight + leaked uploads), so a single
-        /// unbounded LIST at startup is acceptable; unlike GC's per-round budgets, this runs once per
-        /// mount, not on a recurring schedule.
+        /// `max_keys=0` lists the whole prefix. One mount's staging debris is bounded and this runs once per
+        /// mount, not on GC's recurring schedule, so an unbounded LIST is acceptable here.
         RelativePathsWithMetadata children;
         object_storage.listObjects(mount_staging_prefix, children, /*max_keys=*/0);
-
         size_t removed = 0;
         for (const auto & child : children)
         {
+            const String & key = child->relative_path;
+            if (!key.starts_with(mount_staging_prefix))
+                continue;
+            const std::optional<uint64_t> epoch = Layout::stagedEpochOf(std::string_view(key).substr(mount_staging_prefix.size()));
+            if (!epoch || *epoch >= live_writer_epoch)
+                continue;   /// the live epoch's own in-flight uploads, or a nested member's keys
             try
             {
-                object_storage.removeObjectIfExists(StoredObject(child->relative_path));
+                object_storage.removeObjectIfExists(StoredObject(key));
                 ++removed;
             }
             catch (...) // NOLINT(bugprone-empty-catch)
             {
-                /// Best-effort: one stubborn key must not abort the sweep of the rest — it is retried
-                /// by a later mount's sweep.
+                /// One stubborn key must not abort the sweep; a later mount retries it.
             }
         }
-
         if (removed)
-            LOG_INFO(getLogger("CasStagingSweeper"),
-                "Reclaimed {} leaked S3 staging object(s) under '{}' at mount start",
-                removed, mount_staging_prefix);
+            LOG_INFO(getLogger("CasStagingSweeper"), "Reclaimed {} staging object(s) below writer epoch {} under '{}' at mount start",
+                     removed, live_writer_epoch, mount_staging_prefix);
     }
     catch (...) // NOLINT(bugprone-empty-catch)
     {
-        /// Best-effort: a LIST failure (a transient backend hiccup) at mount time must never fail the
-        /// mount — any leaked staging objects are bounded debris, reclaimed by a later mount's sweep.
+        /// A LIST failure at mount time must never fail the mount; the debris is bounded and retried later.
     }
 }
 

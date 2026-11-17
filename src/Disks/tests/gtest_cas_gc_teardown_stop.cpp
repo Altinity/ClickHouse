@@ -279,7 +279,7 @@ TEST(CASGCTeardownStop, OpenPlaneSleepReturnsAtOnceOnceTeardownBegan)
     store->beginTeardown();
 
     auto paused = std::async(std::launch::async, [&store] { store->openRequests().pause(60'000); });
-    EXPECT_EQ(paused.wait_for(std::chrono::seconds(10)), std::future_status::ready)
+    ASSERT_EQ(paused.wait_for(std::chrono::seconds(10)), std::future_status::ready)
         << "the open plane's sleep must observe the arm; a plain sleep holds for the full minute";
 
     /// Clearing the seam must put the interruptible sleep back, not the engine's plain one.

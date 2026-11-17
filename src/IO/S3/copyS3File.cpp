@@ -18,9 +18,12 @@
 #include <IO/StdStreamFromReadBuffer.h>
 #include <IO/ReadBufferFromS3.h>
 
+#include <IO/Expect404ResponseScope.h>
 #include <IO/S3/Requests.h>
 
 #include <fmt/ranges.h>
+
+#include <optional>
 
 
 namespace ProfileEvents
@@ -88,8 +91,10 @@ namespace
             const std::optional<ObjectAttributes> & object_metadata_,
             ThreadPoolCallbackRunnerUnsafe<void> schedule_,
             BlobStorageLogWriterPtr blob_storage_log_,
-            const LoggerPtr log_)
+            const LoggerPtr log_,
+            const std::shared_ptr<const S3::Client> & object_creation_client_ = nullptr)
             : client_ptr(client_ptr_)
+            , object_creation_client(object_creation_client_ ? object_creation_client_ : client_ptr_)
             , dest_bucket(dest_bucket_)
             , dest_key(dest_key_)
             , request_settings(request_settings_)
@@ -106,6 +111,8 @@ namespace
 
     protected:
         std::shared_ptr<const S3::Client> client_ptr;
+        /// Sends the requests that create the destination object.
+        std::shared_ptr<const S3::Client> object_creation_client;
         const String & dest_bucket;
         const String & dest_key;
         const S3::S3RequestSettings & request_settings;
@@ -212,7 +219,7 @@ namespace
                     ProfileEvents::increment(ProfileEvents::DiskS3CompleteMultipartUpload);
 
                 Stopwatch watch;
-                auto outcome = client_ptr->CompleteMultipartUpload(request);
+                auto outcome = object_creation_client->CompleteMultipartUpload(request);
                 auto elapsed = watch.elapsedMicroseconds();
 
                 if (blob_storage_log)
@@ -250,6 +257,11 @@ namespace
             abort_request.SetBucket(dest_bucket);
             abort_request.SetKey(dest_key);
             abort_request.SetUploadId(multipart_upload_id);
+
+            /// A lost single-attempt completion may have consumed the upload.
+            std::optional<Expect404ResponseScope> no_such_upload_is_expected;
+            if (object_creation_client->usesSingleAttemptRetryStrategy())
+                no_such_upload_is_expected.emplace();
 
             Stopwatch watch;
             auto outcome = client_ptr->AbortMultipartUpload(abort_request);
@@ -311,7 +323,12 @@ namespace
             }
             catch (...)
             {
-                tryLogCurrentException(log, fmt::format("While performing multipart upload of object {} in bucket {}", dest_key, dest_bucket));
+                /// A caller that sends the completion once resolves a failure and retries itself, failed
+                /// `CreateMultipartUpload` and `UploadPartCopy` included; CAS logs each failed attempt.
+                tryLogCurrentException(
+                    log,
+                    fmt::format("While performing multipart upload of object {} in bucket {}", dest_key, dest_bucket),
+                    object_creation_client->usesSingleAttemptRetryStrategy() ? LogsLevel::debug : LogsLevel::error);
 
                 task_tracker.safeWaitAll();
 
@@ -629,7 +646,8 @@ namespace
             BlobStorageLogWriterPtr blob_storage_log_,
             std::function<void()> fallback_method_,
             bool is_ranged_copy_,
-            bool allow_fallback_ = true)
+            bool allow_fallback_,
+            const std::shared_ptr<const S3::Client> & object_creation_client_)
             : UploadHelper(
                 client_ptr_,
                 dest_bucket_,
@@ -638,7 +656,8 @@ namespace
                 object_metadata_,
                 schedule_,
                 blob_storage_log_,
-                getLogger("copyS3File"))
+                getLogger("copyS3File"),
+                object_creation_client_)
             , src_bucket(src_bucket_)
             , src_key(src_key_)
             , offset(src_offset_)
@@ -740,7 +759,7 @@ namespace
                 if (client_ptr->isClientForDisk())
                     ProfileEvents::increment(ProfileEvents::DiskS3CopyObject);
 
-                auto outcome = client_ptr->CopyObject(request);
+                auto outcome = object_creation_client->CopyObject(request);
                 if (outcome.IsSuccess())
                 {
                     LOG_TRACE(
@@ -934,7 +953,8 @@ namespace
         const CreateReadBuffer & fallback_file_reader,
         const std::optional<ObjectAttributes> & object_metadata,
         bool is_ranged_copy,
-        ObjectStorageCopyMode copy_mode)
+        ObjectStorageCopyMode copy_mode,
+        std::shared_ptr<const S3::Client> object_creation_client)
     {
         if (!dest_s3_client)
             dest_s3_client = src_s3_client;
@@ -982,7 +1002,8 @@ namespace
             blob_storage_log,
             std::move(fallback_method),
             is_ranged_copy,
-            /*allow_fallback=*/copy_mode == ObjectStorageCopyMode::Default};
+            /*allow_fallback=*/copy_mode == ObjectStorageCopyMode::Default,
+            object_creation_client};
         helper.performCopy();
     }
 }
@@ -1001,8 +1022,12 @@ void copyS3File(
     ThreadPoolCallbackRunnerUnsafe<void> schedule,
     const CreateReadBuffer & fallback_file_reader,
     const std::optional<ObjectAttributes> & object_metadata,
-    ObjectStorageCopyMode copy_mode)
+    ObjectStorageCopyMode copy_mode,
+    std::shared_ptr<const S3::Client> object_creation_client)
 {
+    /// The read-write fallback would write through the retrying client.
+    chassert(!object_creation_client || copy_mode == ObjectStorageCopyMode::NativeOnly);
+
     copyS3FileImpl(
         std::move(src_s3_client),
         src_bucket,
@@ -1020,7 +1045,8 @@ void copyS3File(
         fallback_file_reader,
         object_metadata,
         /* is_ranged_copy= */ false,
-        copy_mode);
+        copy_mode,
+        std::move(object_creation_client));
 }
 
 void copyS3FileRange(
@@ -1057,7 +1083,8 @@ void copyS3FileRange(
         fallback_file_reader,
         object_metadata,
         /* is_ranged_copy= */ true,
-        ObjectStorageCopyMode::Default);
+        ObjectStorageCopyMode::Default,
+        /* object_creation_client= */ nullptr);
 }
 
 }

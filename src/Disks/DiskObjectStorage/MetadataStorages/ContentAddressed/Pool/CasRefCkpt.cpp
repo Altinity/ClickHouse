@@ -267,19 +267,13 @@ CkptPublishOutcome publishCkpt(CasOperation & op, const Layout & layout, const N
         /// get there, so the write is resolved rather than skipped.
         return decisions > 1 ? CkptPublishOutcome::Published : CkptPublishOutcome::IdenticalSkip;
     }
-    if (const auto * gave_up = std::get_if<GaveUp>(&result))
-    {
-        /// A lost fence is an expected, transient control signal, so it is a value rather than a
-        /// throw. It says nothing about the object: the engine reports it both before an attempt is
-        /// sent and after one is proven durable, so the caller must re-read rather than assume.
-        /// Every other give-up leaves the contribution unpublished, and the caller must be told that
-        /// rather than left to assume it landed.
-        if (gave_up->why == GaveUp::Why::FenceLost)
-            return CkptPublishOutcome::FencedOut;
-        throwCasWriteRetryLater("CAS _ckpt for namespace '" + life.ns.string()
-            + "': persistent CAS contention, the checkpoint contribution was not published");
-    }
-    /// Only `Conflict` and `Refused` are left, and both are an exception.
+    /// A lost fence is an expected, transient control signal, so it is a value rather than a throw.
+    /// It says nothing about the object: the engine reports it both before an attempt is sent and
+    /// after one is proven durable, so the caller must re-read rather than assume.
+    if (const auto * gave_up = std::get_if<GaveUp>(&result); gave_up && gave_up->why == GaveUp::Why::FenceLost)
+        return CkptPublishOutcome::FencedOut;
+    /// Every other give-up, conflict and refusal leaves the contribution unpublished, and `orThrow`
+    /// tells the caller so with the real reason.
     const String what = "CAS _ckpt for namespace '" + life.ns.string() + "'";
     orThrow(std::move(result), what);
     UNREACHABLE();
