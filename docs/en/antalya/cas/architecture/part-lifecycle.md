@@ -1,5 +1,5 @@
 ---
-description: 'The part-add protocol from local build through blob upload to promote, its nine crash points and their cleaners, and how each MergeTree operation maps onto it.'
+description: 'The part-add protocol from local build through blob upload to promote, its crash points and their cleaners, and how each MergeTree operation maps onto it.'
 sidebar_label: 'Part lifecycle'
 sidebar_position: 6
 slug: /antalya/cas/architecture/part-lifecycle
@@ -90,7 +90,7 @@ calling thread only submits and joins, never occupies a pool slot, so a pool of 
 to a correct serial run and can never deadlock. The contract is merge-nothing: if any task threw,
 nothing is merged and the first error in dispatch order is rethrown. Results are folded into the
 dependency set on the owning thread, into a copy, committed by one no-throw swap. Every physical
-task starts with blob `HEAD`; a present non-condemned body or a completed publication yields an
+task starts with blob `HEAD`; a present body with a `Clean` marker or a completed publication yields an
 explicit `Materialized` proof. A trusted source manifest instead yields `TrustedManifest` without
 blob I/O. Pool size is the
 server setting `cas_blob_upload_pool_size` (default 16).
@@ -106,20 +106,26 @@ manifest never loses an owner, so it is net zero.
 
 ## Crash points and their cleaners {#crash-points}
 
-This table is the single best summary of the design's crash-safety story: every row leaks
-something recoverable; no row loses data or leaves a dangling reference.
+This table is the single best summary of the design's crash-safety story: no row loses committed
+data or leaves a dangling reference. In C6 and C10 the part itself may take effect; C3 and C11
+leave only a precommit binding.
 
 | # | Crash window | Left behind | Who cleans it |
 |---|---|---|---|
-| C1 | During staging | Local temp files, or S3 staging objects | Local: unconditional cleanup plus buffer destructor. S3: the mount's own staging sweep at next mount — never deleted on abort |
+| C1 | During staging | Local temp files, or S3 staging objects | Local: unconditional cleanup plus buffer destructor. S3: the transaction deletes it on commit or abort (best-effort); after a crash, the next mount of the same `server_root_id` sweeps it, or `SYSTEM CAS DROP POOL MEMBER` drains it |
 | C2 | After `stageManifest`, before `precommitAdd` | An unreferenced manifest body | Writer's best-effort exact-token delete; durable backstop is the orphan-manifest sweep |
 | C3 | `precommitAdd` returned Unresolved | A possibly-live precommit binding | Intent recorded pre-append; `abandon` appends the exact removal, tolerating absence. The body is never writer-deleted |
 | C4 | Between `precommitAdd` and `promote` | A live precommit plus uploaded blobs | No resume path exists. Removed by `abandon`, else by a fenced successor's stale-precommit sweep |
 | C5 | Mid blob fan-out | Already-uploaded blobs | Nothing merged; blobs become `GC`-reclaimable debris; the part is not published |
-| C6 | `promote` append Unresolved | The ref may or may not be committed | Commit state Uncertain — the relink layer maps this to "retry the whole fetch", never to a byte fetch |
+| C6 | `promote` append Unresolved | The ref may or may not be committed | Commit state Uncertain — the relink layer maps this to "retry the whole fetch", never to a byte fetch. The client sees `outcome is unknown` |
 | C7 | A later part throws after earlier parts published | A partial multi-part commit | Precise rollback: drop only the refs this call created, matching the exact manifest — never clobbers a concurrent writer's repoint |
 | C8 | Transaction destroyed uncommitted | Open builds | Destructor abandons every build |
 | C9 | Namespace dropped mid-build | — | One atomic flag; every further op fails closed at the alive check |
+| C10 | `promote` ref-log `PUT` committed, then the `_ckpt` frontier publish failed | A durable promotion this server has not installed; the ref lane needs recovery | The next ref-log recovery installs it. The in-memory part was already rolled back, and part cleanup later drops the ref. A restart before that drop brings the part back on `MergeTree`; on `ReplicatedMergeTree` the part has no Keeper entry and startup detaches it as `ignored_<part>`. The client sees `is durable but was not acknowledged`, and the message says the write may still take effect |
+| C11 | `precommitAdd` ref-log `PUT` committed, then the `_ckpt` frontier publish failed | A durable precommit binding this server has not installed | The next ref-log recovery installs the binding; the part is never published. `abandon`, else the stale-precommit sweep, removes it. The client sees `is durable but was not acknowledged` with `the part is never published` |
+
+What each client-visible message means, and when a retry is safe, is in
+[CAS commit errors](/antalya/cas/operations/troubleshooting#cas-commit-errors).
 
 ## The repoint {#repoint}
 

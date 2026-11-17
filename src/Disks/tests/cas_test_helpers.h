@@ -12,6 +12,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
@@ -27,20 +28,27 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.h>
 #include <Common/Exception.h>
+#include <Common/Logger.h>
+#include <Common/logger_useful.h>
 #include <Common/SipHash.h>
 #include <Common/thread_local_rng.h>
 
 #include <base/hex.h>
 #include <city.h>
 
+#include <Poco/StreamChannel.h>
+
 #include <gtest/gtest.h>
+#include <sstream>
 #include <IO/HashingReadBuffer.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteBufferFromString.h>
 /// For `ChunkFaultBackend`'s `DefiniteFailure` mode, which needs a real S3-classified error, and for
 /// the ambiguity it raises otherwise.
 #include <IO/S3Common.h>
+#include <Poco/AutoPtr.h>
 #include <Poco/Exception.h>
+#include <Poco/StreamChannel.h>
 
 #include <algorithm>
 #include <atomic>
@@ -53,8 +61,10 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -80,6 +90,37 @@ namespace DB::ErrorCodes
 namespace DB::Cas::tests
 {
 
+/// Redirects the named logger into a string for the scope, at the given level.
+class ScopedLoggerCapture
+{
+public:
+    ScopedLoggerCapture(const String & logger_name, const String & level)
+        : logger(getLogger(logger_name))
+        , channel(new Poco::StreamChannel(stream))
+        , old_channel(logger->getChannel(), /*shared=*/true)
+        , old_level(logger->getLevel())
+    {
+        logger->setChannel(channel.get());
+        logger->setLevel(level);
+    }
+
+    ~ScopedLoggerCapture()
+    {
+        logger->setChannel(old_channel);
+        logger->setLevel(old_level);
+    }
+
+    String captured() const { return stream.str(); }
+
+private:
+    LoggerPtr logger;
+    std::ostringstream stream; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+    Poco::AutoPtr<Poco::StreamChannel> channel;
+    /// A real reference (shared=true), so the parked previous channel cannot die while ours is installed.
+    Poco::AutoPtr<Poco::Channel> old_channel;
+    int old_level;
+};
+
 /// A `CasRequests` over an always-open fence, for a fixture that has a backend but no mounted pool.
 /// Every operation admitted from it holds a reference to it, so it must be named and outlive them.
 inline DB::Cas::CasRequests openRequestsForTest(DB::Cas::BackendPtr backend)
@@ -93,6 +134,49 @@ inline DB::Cas::CasRequests openRequestsForTest(DB::Cas::Backend & backend)
 {
     return openRequestsForTest(DB::Cas::BackendPtr(std::shared_ptr<void>(), &backend));
 }
+
+/// Routes one logger into memory at `level` for the scope, then restores its channel and level.
+class ScopedLogCapture
+{
+public:
+    ScopedLogCapture(const String & logger_name, const String & level)
+        : logger(getLogger(logger_name))
+        , channel(new Poco::StreamChannel(stream))
+        , old_channel(logger->getChannel(), /*shared=*/true)
+        , old_level(logger->getLevel())
+    {
+        logger->setChannel(channel.get());
+        logger->setLevel(level);
+    }
+
+    ~ScopedLogCapture()
+    {
+        logger->setChannel(old_channel);
+        logger->setLevel(old_level);
+    }
+
+    ScopedLogCapture(const ScopedLogCapture &) = delete;
+    ScopedLogCapture & operator=(const ScopedLogCapture &) = delete;
+
+    String captured() const { return stream.str(); }
+
+    size_t count(std::string_view needle) const
+    {
+        const String haystack = captured();
+        size_t n = 0;
+        for (size_t pos = 0; (pos = haystack.find(needle, pos)) != String::npos; pos += needle.size())
+            ++n;
+        return n;
+    }
+
+private:
+    LoggerPtr logger;
+    std::ostringstream stream; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+    Poco::AutoPtr<Poco::StreamChannel> channel;
+    /// `shared=true`: the parked channel is not ours, so take a reference instead of stealing one.
+    Poco::AutoPtr<Poco::Channel> old_channel;
+    int old_level;
+};
 
 /// An open-fence operation together with the `CasRequests` it refers to, for a fixture that holds a
 /// backend and needs to call a production entry point taking a `CasOperation &`. Neither copyable nor
@@ -2278,6 +2362,32 @@ private:
 
 /// The plain form, over a bare `InMemoryBackend`.
 using HintHoleBackend = HintHoleBackendOn<DB::Cas::InMemoryBackend>;
+
+/// GC's fence-out applied directly to the mount lease: preserve the body, set `gc_fenced`, bump `seq`.
+/// A following `tryRemountOnce` reclaims a fresh incarnation.
+inline void fenceOutMountForTest(DB::Cas::Backend & backend, const String & mount_key)
+{
+    OperationForTest op(backend);
+    const auto got = (*op).read(mount_key, DB::Cas::Retry::once());
+    ASSERT_TRUE(got.has_value());
+    const DB::Cas::MountLease fenced = DB::Cas::decodeMountLease(got->bytes).fencedCopy();
+    const auto put = (*op).replace(mount_key, DB::Cas::encodeMountLease(fenced), got->etag, DB::Cas::Retry::once());
+    ASSERT_TRUE(std::holds_alternative<DB::Cas::Committed>(put));
+}
+
+/// A decommission tombstone by hand: the next owner life, retired, keeping a verified mark of a retired owner;
+/// `verified` also marks it, as a completed run does.
+inline void tombstoneOwnerForTest(DB::Cas::Backend & backend, const String & owner_key, bool verified = false)
+{
+    OperationForTest op(backend);
+    const auto current = (*op).read(owner_key, DB::Cas::Retry::once());
+    ASSERT_TRUE(current.has_value());
+    const DB::Cas::OwnerObject owner = DB::Cas::decodeOwner(current->bytes);
+    const DB::Cas::OwnerObject tombstone = DB::Cas::nextOwnerLife(
+        owner, 1, verified || (owner.retirement_verified && owner.retired_at_ms.has_value()));
+    const auto put = (*op).replace(owner_key, DB::Cas::encodeOwner(tombstone), current->etag, DB::Cas::Retry::once());
+    ASSERT_TRUE(std::holds_alternative<DB::Cas::Committed>(put));
+}
 
 /// Stand in for the self-remount that `Pool::reportImpossibleInterference` schedules. That reaction
 /// trips the local write fence closed AND schedules a remount; a unit-test Pool runs no background

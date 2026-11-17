@@ -608,7 +608,8 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
                         std::vector<String> * warnings)
 {
     const Layout & layout = store.layout();
-    CasOperation op = store.openRequests().admit();
+    /// The decommission drain runs under the admin's lease; a fenced admin must stop deleting.
+    CasOperation op = store.mountRequests().admit();
     if (!buildPrefixEligibleUnderFloorOn(op, layout, ns, prefix))
         return 0;   /// not eligible by the durable watermark fact — delete nothing (controls #8/#9)
 
@@ -705,6 +706,7 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
                 throw;
             warnings->push_back("CAS orphan sweep: " + listed.key + " delete failed: "
                                  + getCurrentExceptionMessage(/*with_stacktrace=*/false));
+            return op.admitted();
         }
         return true;
     }, Retry::standard(), 1000, onGcEnumerationPage);
