@@ -501,26 +501,22 @@ static bool isSnapshotInCatalogMetadata(
     const StorageID & table_id,
     Int64 snapshot_id,
     const PersistentTableComponents & persistent_table_components,
+    const DataLakeStorageSettings & data_lake_settings,
     ObjectStoragePtr object_storage,
     ContextPtr context,
     LoggerPtr log)
 {
-    const auto & [namespace_name, table_name] = DataLake::parseTableName(table_id.getTableName());
-    DataLake::TableMetadata table_metadata = DataLake::TableMetadata().withLocation().withDataLakeSpecificProperties();
-    catalog->getTableMetadata(namespace_name, table_name, context, table_metadata);
-
-    auto table_specific_properties = table_metadata.getDataLakeSpecificProperties();
-    if (!table_specific_properties.has_value() || table_specific_properties->iceberg_metadata_file_location.empty())
-        throw Exception(
-            ErrorCodes::DATALAKE_DATABASE_ERROR,
-            "Catalog didn't return Iceberg metadata location for table {}.{}",
-            namespace_name, table_name);
-
-    String metadata_path = table_metadata.getMetadataLocation(table_specific_properties->iceberg_metadata_file_location);
-    if (!metadata_path.starts_with(persistent_table_components.table_path))
-        metadata_path = std::filesystem::path(persistent_table_components.table_path) / metadata_path;
-
-    const auto metadata_file_info = Iceberg::getMetadataFileAndVersion(metadata_path);
+    const auto metadata_file_info = getLatestMetadataFileAndVersionWithCatalog(
+        object_storage,
+        catalog,
+        table_id.getTableName(),
+        persistent_table_components.table_path,
+        data_lake_settings,
+        persistent_table_components.metadata_cache,
+        context,
+        log.get(),
+        persistent_table_components.table_uuid,
+        persistent_table_components.metadata_compression_method);
     auto metadata_object = getMetadataJSONObject(
         metadata_file_info.path,
         object_storage,
@@ -1120,7 +1116,7 @@ static bool writeConsolidatedManifestFile(
                         published = true;
                         const Int64 new_snapshot_id = new_snapshot.snapshot->getValue<Int64>(Iceberg::f_metadata_snapshot_id);
                         if (isSnapshotInCatalogMetadata(
-                                catalog, table_id, new_snapshot_id, persistent_table_components, object_storage, context, log))
+                                catalog, table_id, new_snapshot_id, persistent_table_components, data_lake_settings, object_storage, context, log))
                         {
                             LOG_INFO(log, "Catalog update for snapshot {} was reported as failed, but the catalog has applied it", new_snapshot_id);
                         }
@@ -1654,17 +1650,19 @@ void compactIcebergManifests(
         if (attempt > 0)
             LOG_INFO(log, "Retrying manifest compaction (attempt {}/{})", attempt + 1, MAX_COMPACTION_RETRIES);
 
-        const auto [metadata_version, metadata_file_path, _] = getLatestOrExplicitMetadataFileAndVersion(
+        /// With a catalog, the catalog names the current metadata file. Listing the storage instead may pick the
+        /// metadata of another table that shares the location, or miss a commit that is visible only in the catalog.
+        const auto [metadata_version, metadata_file_path, _] = getLatestMetadataFileAndVersionWithCatalog(
             object_storage_,
+            catalog,
+            table_id.getTableName(),
             persistent_table_components.table_path,
             data_lake_settings,
             persistent_table_components.metadata_cache,
             context_,
             log.get(),
             persistent_table_components.table_uuid,
-            persistent_table_components.metadata_compression_method,
-            /* force_fetch_latest_metadata */ true,
-            /* ignore_explicit_metadata_file_path */ true);
+            persistent_table_components.metadata_compression_method);
 
         auto metadata_object = getMetadataJSONObject(
             metadata_file_path,

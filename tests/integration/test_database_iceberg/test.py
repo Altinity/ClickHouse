@@ -1012,14 +1012,25 @@ def _read_avro_records(minio_client, path):
         return list(reader)
 
 
-def _create_table_for_manifest_compaction(started_cluster, node, test_ref, num_inserts=5):
-    table_name = f"{test_ref}_table"
+def _create_table_for_manifest_compaction(
+    started_cluster, node, test_ref, num_inserts=5, table_suffix="table", location=None
+):
+    table_name = f"{test_ref}_{table_suffix}"
     root_namespace = f"{test_ref}_namespace"
 
     catalog = load_catalog_impl(started_cluster)
-    catalog.create_namespace(root_namespace)
+    if (root_namespace,) not in catalog.list_namespaces():
+        catalog.create_namespace(root_namespace)
     # Unpartitioned table, so every per-insert data manifest can consolidate into a single one.
-    create_table(catalog, root_namespace, table_name, DEFAULT_SCHEMA, PartitionSpec(), DEFAULT_SORT_ORDER)
+    # Own location by default: `create_table` puts every table at the same location, so files of other tests
+    # would be mixed with the files of this table.
+    catalog.create_table(
+        identifier=f"{root_namespace}.{table_name}",
+        schema=DEFAULT_SCHEMA,
+        location=location or f"s3://warehouse-rest/{table_name}",
+        partition_spec=PartitionSpec(),
+        sort_order=DEFAULT_SORT_ORDER,
+    )
     create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
 
     table_ref = f"{CATALOG_NAME}.`{root_namespace}.{table_name}`"
@@ -1131,6 +1142,57 @@ def test_optimize_manifest_catalog_conflict_cleans_up(started_cluster):
 
     node.query("SYSTEM DROP ICEBERG METADATA CACHE")
     assert node.query(f"SELECT symbol, bid, ask FROM {table_ref} ORDER BY ALL") == rows_before
+
+
+def test_optimize_manifest_uses_catalog_metadata(started_cluster):
+    """`OPTIMIZE TABLE ... MANIFEST` must compact the metadata the catalog names for the table.
+
+    Two tables share one location. The other table has more metadata versions, so the latest metadata file
+    found by listing the storage belongs to it. Compacting the first table must not pick that file.
+    https://github.com/Altinity/ClickHouse/issues/2416
+    """
+    node = started_cluster.instances["node1"]
+    test_ref = f"test_optimize_manifest_shared_location_{uuid.uuid4()}"
+    location = f"s3://warehouse-rest/{test_ref}"
+    num_inserts = 5
+    catalog, table_identifier, table_ref = _create_table_for_manifest_compaction(
+        started_cluster, node, test_ref, num_inserts, table_suffix="table", location=location
+    )
+    _, other_identifier, other_ref = _create_table_for_manifest_compaction(
+        started_cluster, node, test_ref, num_inserts + 3, table_suffix="other", location=location
+    )
+
+    metadata_before = catalog.load_table(table_identifier).metadata
+    other_metadata_before = catalog.load_table(other_identifier).metadata
+    rows_before = node.query(f"SELECT symbol, bid, ask FROM {table_ref} ORDER BY ALL")
+    other_rows_before = node.query(f"SELECT symbol, bid, ask FROM {other_ref} ORDER BY ALL")
+
+    node.query(
+        f"OPTIMIZE TABLE {table_ref} MANIFEST",
+        settings={
+            "allow_experimental_iceberg_compaction": 1,
+            "iceberg_manifest_min_count_to_compact": 2,
+            "allow_insert_into_iceberg": 1,
+            "write_full_path_in_iceberg_metadata": 1,
+        },
+    )
+
+    metadata_after = catalog.load_table(table_identifier).metadata
+    assert metadata_after.current_snapshot_id != metadata_before.current_snapshot_id
+    assert len(metadata_after.snapshots) == len(metadata_before.snapshots) + 1
+    # The new snapshot must descend from this table's own history, not from the other table's.
+    assert (
+        metadata_after.snapshot_by_id(metadata_after.current_snapshot_id).parent_snapshot_id
+        == metadata_before.current_snapshot_id
+    )
+    _check_current_snapshot_files_exist(started_cluster, catalog, table_identifier, num_inserts)
+
+    other_metadata_after = catalog.load_table(other_identifier).metadata
+    assert other_metadata_after.current_snapshot_id == other_metadata_before.current_snapshot_id
+
+    node.query("SYSTEM DROP ICEBERG METADATA CACHE")
+    assert node.query(f"SELECT symbol, bid, ask FROM {table_ref} ORDER BY ALL") == rows_before
+    assert node.query(f"SELECT symbol, bid, ask FROM {other_ref} ORDER BY ALL") == other_rows_before
 
 
 @pytest.mark.parametrize(
