@@ -116,8 +116,6 @@ struct ScheduleFixture
 void expectSameSchedule(const GcState & actual, const GcState & expected)
 {
     EXPECT_EQ(actual.manifest_sweep_cursor, expected.manifest_sweep_cursor);
-    EXPECT_EQ(actual.orphan_manifest_sweep_active, expected.orphan_manifest_sweep_active);
-    EXPECT_EQ(actual.orphan_manifest_sweep_started_at_ms, expected.orphan_manifest_sweep_started_at_ms);
     EXPECT_EQ(actual.orphan_manifest_sweep_completed_at_ms, expected.orphan_manifest_sweep_completed_at_ms);
 }
 
@@ -134,13 +132,12 @@ TEST(CASOrphanManifestSweepScheduleGc, ContinueForcesIdleFold)
 {
     ScheduleFixture f(1, 3600, 1000);
     f.addKeys();
-    auto state = f.state();
-    state.orphan_manifest_sweep_active = true;
-    f.setState(state);
+    ASSERT_TRUE(f.run().acquired_lease);
+    ASSERT_FALSE(f.state().manifest_sweep_cursor.empty());
     const auto report = f.run();
     ASSERT_TRUE(report.acquired_lease);
     EXPECT_FALSE(report.deferred);
-    EXPECT_TRUE(f.state().orphan_manifest_sweep_active);
+    EXPECT_TRUE(f.state().manifest_sweep_cursor.empty());
 }
 
 TEST(CASOrphanManifestSweepScheduleGc, WaitingPreservesOldDeferDecision)
@@ -165,16 +162,43 @@ TEST(CASOrphanManifestSweepScheduleGc, TwoPagesDoNotWaitAnHour)
     f.addKeys();
     ASSERT_TRUE(f.run().acquired_lease);
     const auto first = f.state();
-    EXPECT_TRUE(first.orphan_manifest_sweep_active);
     EXPECT_EQ(first.orphan_manifest_sweep_completed_at_ms, 0);
     EXPECT_FALSE(first.manifest_sweep_cursor.empty());
     ++f.now;
     ASSERT_TRUE(f.run().acquired_lease);
     const auto second = f.state();
-    EXPECT_FALSE(second.orphan_manifest_sweep_active);
     EXPECT_TRUE(second.manifest_sweep_cursor.empty());
-    EXPECT_EQ(second.orphan_manifest_sweep_started_at_ms, 1000);
     EXPECT_EQ(second.orphan_manifest_sweep_completed_at_ms, 1001);
+    EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 2);
+}
+
+TEST(CASOrphanManifestSweepScheduleGc, NominationBudgetPreservesPreviousCompletion)
+{
+    ScheduleFixture f;
+    f.gc.reset();
+    f.store.reset();
+    f.config.manifest_sweep_delete_budget_keys = 1;
+    f.store = Pool::open(f.backend, f.config);
+    f.makeGc();
+
+    const RootNamespace ns{"orphan/table"};
+    writeManifestRaw(*f.backend, f.store->layout(), ns, ManifestRef{1, 1, 1}, {});
+    writeManifestRaw(*f.backend, f.store->layout(), ns, ManifestRef{1, 2, 2}, {});
+    setWatermarkMinActive(*f.backend, f.store->layout(), "orphan", 1, 3);
+    auto state = f.state();
+    state.orphan_manifest_sweep_completed_at_ms = 500;
+    f.setState(state);
+    f.now = 3600500;
+
+    ASSERT_TRUE(f.run().acquired_lease);
+    const auto first = f.state();
+    EXPECT_FALSE(first.manifest_sweep_cursor.empty());
+    EXPECT_EQ(first.orphan_manifest_sweep_completed_at_ms, 500);
+    ++f.now;
+    ASSERT_TRUE(f.run().acquired_lease);
+    const auto second = f.state();
+    EXPECT_TRUE(second.manifest_sweep_cursor.empty());
+    EXPECT_EQ(second.orphan_manifest_sweep_completed_at_ms, f.now);
     EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 2);
 }
 
@@ -204,9 +228,7 @@ TEST(CASOrphanManifestSweepScheduleGc, SkippedResultDoesNotResetCursor)
 {
     ScheduleFixture f(0);
     auto state = f.state();
-    state.orphan_manifest_sweep_active = true;
     state.manifest_sweep_cursor = "cursor";
-    state.orphan_manifest_sweep_started_at_ms = 500;
     f.setState(state);
     ASSERT_TRUE(f.run().acquired_lease);
     expectSameSchedule(f.state(), state);
@@ -219,7 +241,7 @@ TEST(CASOrphanManifestSweepScheduleGc, SuppressedRoundPreservesSchedule)
     f.addKeys();
     ASSERT_TRUE(f.run().acquired_lease);
     const auto before = f.state();
-    ASSERT_TRUE(before.orphan_manifest_sweep_active);
+    ASSERT_FALSE(before.manifest_sweep_cursor.empty());
     ++f.now;
     ASSERT_TRUE(f.run(UniversePolicy::StageA_Suppressed).acquired_lease);
     expectSameSchedule(f.state(), before);
@@ -279,12 +301,13 @@ TEST(CASOrphanManifestSweepScheduleGc, TakeoverResumesCursor)
     f.addKeys();
     ASSERT_TRUE(f.run().acquired_lease);
     const auto first = f.state();
+    ASSERT_FALSE(first.manifest_sweep_cursor.empty());
     f.makeGc(UInt128(0xAC));
     EXPECT_FALSE(f.run().acquired_lease);
     ++f.now;
     ASSERT_TRUE(f.run().acquired_lease);
-    EXPECT_FALSE(f.state().orphan_manifest_sweep_active);
-    EXPECT_EQ(f.state().orphan_manifest_sweep_started_at_ms, first.orphan_manifest_sweep_started_at_ms);
+    EXPECT_TRUE(f.state().manifest_sweep_cursor.empty());
+    EXPECT_EQ(f.state().orphan_manifest_sweep_completed_at_ms, f.now);
     EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 2);
 }
 
@@ -306,14 +329,15 @@ TEST(CASOrphanManifestSweepScheduleGc, RestartReadsCommittedSchedule)
     f.addKeys();
     ASSERT_TRUE(f.run().acquired_lease);
     const auto before = f.state();
+    ASSERT_FALSE(before.manifest_sweep_cursor.empty());
     f.gc.reset();
     f.store.reset();
     f.store = Pool::open(f.backend, f.config);
     f.makeGc();
     ++f.now;
     ASSERT_TRUE(f.run().acquired_lease);
-    EXPECT_FALSE(f.state().orphan_manifest_sweep_active);
-    EXPECT_EQ(f.state().orphan_manifest_sweep_started_at_ms, before.orphan_manifest_sweep_started_at_ms);
+    EXPECT_TRUE(f.state().manifest_sweep_cursor.empty());
+    EXPECT_EQ(f.state().orphan_manifest_sweep_completed_at_ms, f.now);
     EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 2);
 }
 
@@ -324,9 +348,7 @@ TEST(CASOrphanManifestSweepScheduleGc, RebuildMakesNextSweepDue)
     ASSERT_NE(f.state().orphan_manifest_sweep_completed_at_ms, 0);
     ASSERT_TRUE(f.gc->rebuildBaseline(true).performed);
     const auto state = f.state();
-    EXPECT_FALSE(state.orphan_manifest_sweep_active);
     EXPECT_TRUE(state.manifest_sweep_cursor.empty());
-    EXPECT_EQ(state.orphan_manifest_sweep_started_at_ms, 0);
     EXPECT_EQ(state.orphan_manifest_sweep_completed_at_ms, 0);
 }
 
@@ -442,11 +464,11 @@ TEST(CASOrphanManifestSweepScheduleGc, SuccessfulPageAfterFailureRestoresImmedia
     const auto recovered = f.run();
     ASSERT_TRUE(recovered.acquired_lease);
     ASSERT_FALSE(recovered.deferred);
-    ASSERT_TRUE(f.state().orphan_manifest_sweep_active);
+    ASSERT_FALSE(f.state().manifest_sweep_cursor.empty());
     const auto continued = f.run();
     ASSERT_TRUE(continued.acquired_lease);
     EXPECT_FALSE(continued.deferred);
-    EXPECT_FALSE(f.state().orphan_manifest_sweep_active);
+    EXPECT_TRUE(f.state().manifest_sweep_cursor.empty());
     EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 2);
 }
 
@@ -572,11 +594,11 @@ TEST(CASOrphanManifestSweepScheduleGc, SuccessfulPageRestoresImmediateContinuati
     const auto first = f.run();
     ASSERT_TRUE(first.acquired_lease);
     ASSERT_FALSE(first.deferred);
-    ASSERT_TRUE(f.state().orphan_manifest_sweep_active);
+    ASSERT_FALSE(f.state().manifest_sweep_cursor.empty());
     const auto continued = f.run();
     ASSERT_TRUE(continued.acquired_lease);
     EXPECT_FALSE(continued.deferred);
-    EXPECT_FALSE(f.state().orphan_manifest_sweep_active);
+    EXPECT_TRUE(f.state().manifest_sweep_cursor.empty());
     EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 2);
 }
 
@@ -617,14 +639,14 @@ TEST(CASOrphanManifestSweepScheduleGc, NewGenerationRetriesSuppressedSweepImmedi
     ++f.now;
     ASSERT_TRUE(other.runRegularRound({}, true).acquired_lease);
     ASSERT_GT(f.state().snap_generation, suppressed.snap_generation);
-    ASSERT_TRUE(f.state().orphan_manifest_sweep_active);
+    ASSERT_FALSE(f.state().manifest_sweep_cursor.empty());
     ++f.now;
     ASSERT_FALSE(f.run().acquired_lease);
     ++f.now;
     const auto resumed = f.run();
     ASSERT_TRUE(resumed.acquired_lease);
     EXPECT_FALSE(resumed.deferred);
-    EXPECT_FALSE(f.state().orphan_manifest_sweep_active);
+    EXPECT_TRUE(f.state().manifest_sweep_cursor.empty());
     EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 2);
 }
 

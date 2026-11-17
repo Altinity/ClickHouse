@@ -27,7 +27,7 @@ trailer, followed by a banner-framed raw payload zone for inline file bytes.
 | `cas/manifests/<ns>/<epoch-hex>-<seq-hex>/<ordinal>.zst` | part manifest (`namespace`, `payload_digest`; entry `path`, `place`, `size`) | `CasPartManifestFormat` | part build |
 | blob keys (`CasLayout::blobKey`) | blob envelope (`type`, `v`, `tag`, `build`, `time_ms`, `creator`, `op`, `chver`, `ref`) + payload | `CasBlobEnvelopeFormat` | uploads |
 | blob-meta keys (`CasLayout::blobMetaKey`) | freshness sidecar (`state`, `condemn_round`, `size`) | `CasBlobMetaFormat` | dedup/GC |
-| `gc/state`, `gc/hb` | GC state (`round`, `gc_shards`, `snap_generation`, `snap_pruned_through`, `snap_attempt`, `manifest_sweep_cursor`, `orphan_manifest_sweep_active`, `orphan_manifest_sweep_started_at_ms`, `orphan_manifest_sweep_completed_at_ms`, `lease_owner`, `lease_seq`) / heartbeat (`owner`, `hb_seq`) | `CasGcStateFormat` | GC |
+| `gc/state`, `gc/hb` | GC state (`round`, `gc_shards`, `snap_generation`, `snap_pruned_through`, `snap_attempt`, `manifest_sweep_cursor`, `orphan_manifest_sweep_completed_at_ms`, `lease_owner`, `lease_seq`) / heartbeat (`owner`, `hb_seq`) | `CasGcStateFormat` | GC |
 | `gc/maintenance_state` | leak-only namespace-janitor cursor (`janitor_cursor`) | `CasGcMaintenanceStateFormat` | future janitor |
 | `gc/gen/<g>/attempt/<a>/outcomes/…​.zst` | outcome log (`kind`, `outcome`) | `CasGcOutcomesFormat` (`.zst`) | GC |
 | `gc/gen/<g>/attempt/<a>/fold_seal` | fold seal (deterministic; `generation`/`parent_generation`, `kind`: `ref_life`/`blob_run`/`condemned`) | `CasFoldSealFormat` | GC |
@@ -37,17 +37,19 @@ trailer, followed by a banner-framed raw payload zone for inline file bytes.
 
 ## Codec table
 
-The manifest sweep schedule uses a boolean `orphan_manifest_sweep_active` and UTC millisecond timestamps
-`orphan_manifest_sweep_started_at_ms` and `orphan_manifest_sweep_completed_at_ms`, encoded as decimal strings.
-Zero timestamps mean unknown or never recorded. All three fields may be absent in legacy state:
-a nonempty cursor resumes an active sweep, and an empty cursor allows the first sweep immediately.
-A partial schedule group or an inactive sweep with a nonempty cursor is invalid. Older writers may
-drop the new fields; the resulting legacy state can cause an extra sweep but grants no deletion authority.
+The manifest sweep schedule uses the existing `manifest_sweep_cursor` and one new UTC millisecond
+timestamp, `orphan_manifest_sweep_completed_at_ms`, encoded as a decimal string. A nonempty cursor
+means that a traversal is in progress across rounds and leaders; an empty cursor means that no
+traversal is in progress. A zero completion timestamp means unknown or never recorded, so an empty
+cursor permits an immediate traversal. Legacy state without the timestamp reads it as zero. The
+completion timestamp is sampled near the `gc/state` commit and changes only when an accepted page
+reaches EOF. It does not mean that all later manifest body deletions succeeded. A zero LIST budget
+disables the sweep without clearing the cursor or completion timestamp.
 
-An active sweep is an incomplete traversal across rounds and leaders; it can remain active while the
-LIST budget is zero. The start timestamp records the first page's accepted progress, and the completion
-timestamp records the accepted end of traversal. Both timestamps are captured near the `gc/state`
-commit. Completion does not mean that all later manifest body deletions succeeded.
+The previous three-field schedule also stored `orphan_manifest_sweep_active` and
+`orphan_manifest_sweep_started_at_ms`. This reader ignores those keys in old objects and keeps the
+cursor and completion timestamp. The intermediate three-field reader rejects a new completion-only
+object as an incomplete schedule group; rollback to that intermediate reader is unsupported.
 
 Authoritative per-format traits (type string, family, compression policy, caps) live
 in `CasFormat.cpp` (`TRAITS`), asserted complete by `gtest_cas_text_format.cpp`.

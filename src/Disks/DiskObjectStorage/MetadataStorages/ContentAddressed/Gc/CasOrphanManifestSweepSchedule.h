@@ -5,18 +5,18 @@
 namespace DB::Cas
 {
 
-enum class OrphanManifestSweepScheduleDecision
+enum class OrphanManifestSweepDecision
 {
     Disabled,
-    Waiting,
-    Start,
-    Continue,
+    SkipUntilIntervalElapsed,
+    StartSweep,
+    ContinueSweep,
 };
 
-OrphanManifestSweepScheduleDecision orphanManifestSweepDecisionOf(
+OrphanManifestSweepDecision orphanManifestSweepDecisionOf(
     const GcState & state, uint64_t interval_sec, uint64_t list_budget_keys, uint64_t now_ms);
 
 void updateOrphanManifestSweepSchedule(
-    GcState & next, OrphanManifestSweepScheduleDecision decision, bool wrapped, uint64_t progress_at_ms);
+    GcState & next, OrphanManifestSweepDecision decision, bool wrapped, uint64_t progress_at_ms);
 
 }

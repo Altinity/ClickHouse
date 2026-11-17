@@ -238,6 +238,8 @@ returns without a commit. On `fold`, phase 6 reuses this plan and the same `LIST
 
 `run_orphan_manifest_sweep` requests a new or continued traversal according to
 `cas_orphan_manifest_sweep_interval_sec`. Its first attempt forces a fold even on an idle pool.
+`orphan_manifest_sweep_active` is an observation derived from a nonempty accepted
+`manifest_sweep_cursor`; it is not a separate field in `gc/state`.
 After a suppressed attempt is committed, a leader-local marker names the newly adopted generation.
 An exception from `planManifestCursorPage` instead records the current adopted parent generation
 and propagates: no sweep progress is committed. Other fold errors and a lost round `CAS` do not
@@ -669,19 +671,21 @@ checkpoint states are counted only in the suppression log line's frontier-defici
 
 `<pool_prefix>/gc/state` is the durable safety and round-adoption state: `round`, `gc_shards`,
 `snap_generation`, `snap_pruned_through`, `snap_attempt`, `manifest_sweep_cursor`,
-`orphan_manifest_sweep_active`, `orphan_manifest_sweep_started_at_ms`,
 `orphan_manifest_sweep_completed_at_ms`, and the lease. A
 folding round publishes it with exactly one commit `CAS` in phase 13, `round_commit`; the fold
 itself performs no `CAS` of its own, and within a round execution phase 1's lease `CAS` over the
 same object is the only other writer. Outside the round, `SYSTEM CAS GC REBUILD` replaces the
 baseline with a `CAS` of its own.
 
-The orphan-sweep fields control pacing, not deletion authority. The start timestamp records the
-first page's accepted progress; the completion timestamp records the accepted end of traversal.
-They are sampled near the round commit in UTC milliseconds, with `0` meaning unknown or never
-recorded. Legacy state without the three schedule fields resumes a nonempty cursor or permits an
-immediate first traversal for an empty cursor. A partial schedule group is corruption. Renewal and
-takeover preserve these fields; rebuild resets them and the cursor.
+The orphan-sweep cursor and completion timestamp control pacing, not deletion authority. A nonempty
+cursor denotes an unfinished traversal; its next page can run without waiting for the interval.
+An empty cursor means no traversal is in progress. At EOF, the round records a completion time
+sampled near commit in UTC milliseconds; `0` means unknown or never recorded. Legacy state without
+this timestamp resumes a nonempty cursor or permits an immediate first traversal for an empty
+cursor. The reader ignores the former `orphan_manifest_sweep_active` and
+`orphan_manifest_sweep_started_at_ms` keys in three-field state. The intermediate three-field
+reader cannot read completion-only state, so rollback to it is unsupported. Renewal and takeover
+preserve the cursor and timestamp; rebuild resets both.
 
 If a completed traversal has a timestamp ahead of the current leader's clock, another traversal
 waits and `orphan_manifest_sweep_waiting_for_clock` is set. This observation can come from clock

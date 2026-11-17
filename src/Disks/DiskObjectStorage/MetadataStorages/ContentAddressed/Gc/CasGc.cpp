@@ -916,8 +916,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     const auto orphan_manifest_sweep_decision = orphanManifestSweepDecisionOf(
         state, store->poolConfig().orphan_manifest_sweep_interval_sec,
         store->poolConfig().manifest_sweep_list_budget_keys, orphan_manifest_sweep_decision_at_ms);
-    const bool run_orphan_manifest_sweep = orphan_manifest_sweep_decision == OrphanManifestSweepScheduleDecision::Start
-        || orphan_manifest_sweep_decision == OrphanManifestSweepScheduleDecision::Continue;
+    const bool run_orphan_manifest_sweep = orphan_manifest_sweep_decision == OrphanManifestSweepDecision::StartSweep
+        || orphan_manifest_sweep_decision == OrphanManifestSweepDecision::ContinueSweep;
     const bool force_orphan_manifest_sweep = run_orphan_manifest_sweep
         && orphan_manifest_sweep_retry_generation != state.snap_generation;
     {
@@ -940,8 +940,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         t.metric("graduation_due", graduation_due ? 1 : 0);
         t.metric("run_orphan_manifest_sweep", run_orphan_manifest_sweep ? 1 : 0);
         t.metric("force_orphan_manifest_sweep", force_orphan_manifest_sweep ? 1 : 0);
-        t.metric("orphan_manifest_sweep_active", state.orphan_manifest_sweep_active ? 1 : 0);
-        t.metric("orphan_manifest_sweep_waiting_for_clock", orphan_manifest_sweep_decision == OrphanManifestSweepScheduleDecision::Waiting
+        t.metric("orphan_manifest_sweep_active", state.manifest_sweep_cursor.empty() ? 0 : 1);
+        t.metric("orphan_manifest_sweep_waiting_for_clock", orphan_manifest_sweep_decision == OrphanManifestSweepDecision::SkipUntilIntervalElapsed
             && orphan_manifest_sweep_decision_at_ms < state.orphan_manifest_sweep_completed_at_ms ? 1 : 0);
         t.metric("dead_life_debris", ref_scan.dead_life_debris);
         t.metric("walk_plan_builds", 1);
@@ -4959,8 +4959,6 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// family independently of that, and the two reasons are stated apart on purpose — a future reader
     /// must not take this line as evidence that REBUILD still produces condemnations somewhere.
     next.manifest_sweep_cursor = "";
-    next.orphan_manifest_sweep_active = false;
-    next.orphan_manifest_sweep_started_at_ms = 0;
     next.orphan_manifest_sweep_completed_at_ms = 0;
     WriteResult commit = op.replace(layout.gcStateKey(), encodeGcState(next), *state_etag,
                                     Retry::standard());

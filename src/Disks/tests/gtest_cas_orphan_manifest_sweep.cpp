@@ -434,9 +434,15 @@ TEST(CASOrphanManifestSweep, CursorPageRespectsDeleteBudget)
 
     const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget*/100, /*delete_budget*/1);
     EXPECT_EQ(result.deleted, 1u);
+    EXPECT_FALSE(result.wrapped);
+    ASSERT_FALSE(result.next_cursor.empty());
     const bool first_exists = headExists(*backend, store->layout().manifestKey(ManifestId{ns, r1}));
     const bool second_exists = headExists(*backend, store->layout().manifestKey(ManifestId{ns, r2}));
     EXPECT_NE(first_exists, second_exists);
+    const ManifestSweepResult continued = sweepManifestCursorPageForTest(*store, result.next_cursor, /*list_budget*/100, /*delete_budget*/1);
+    EXPECT_TRUE(continued.wrapped);
+    EXPECT_TRUE(continued.next_cursor.empty());
+    EXPECT_EQ(continued.deleted, 1u);
 }
 
 TEST(CASOrphanManifestSweep, CursorPageRetainsRowlessBodyWithoutMountLease)
