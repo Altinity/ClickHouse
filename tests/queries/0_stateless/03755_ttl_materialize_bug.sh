@@ -33,7 +33,7 @@ SETTINGS min_rows_for_wide_part = 10000, materialize_ttl_recalculate_only = 1, i
 # So rewritten data part may have 1 less mark, than original one. However skip indices were not rewritten during mutation,
 # so they still contain marks for original data part. And when we try to read mutated part with skip indices,
 # we can "Too many marks" error. This test is added for patch which forces indices recalculation when we rewrite compact part.
-${CLICKHOUSE_CLIENT} -q 'insert into index_corruption FORMAT TSVWithNamesAndTypes' < $CURDIR/data_zstd/test_03755.tsv.zst
+zstd -d < $CURDIR/data_zstd/test_03755.tsv.zst | ${CLICKHOUSE_CLIENT} -q 'insert into index_corruption FORMAT TSVWithNamesAndTypes'
 
 ${CLICKHOUSE_CLIENT} -q 'ALTER TABLE index_corruption (MODIFY TTL toDateTime(38C3868AC) + toIntervalYear(140));'
 
