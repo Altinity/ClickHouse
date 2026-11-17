@@ -22,6 +22,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -32,8 +33,8 @@ namespace DB::Cas
 ///
 /// A round may destroy only while holding a FRONTIER PROOF for EVERY namespace that can hold a live
 /// edge — because reachability is a property of the whole pool, not of one namespace. The proof per
-/// namespace is cheap and exact (one `GET` at the cursor's arithmetic successor, `CasGc.cpp`'s intake
-/// walk). What those proofs cannot supply is the SET they must cover, and only the catalog supplies it:
+/// namespace is cheap and exact (a read of the chain's first absent key or of a terminal record,
+/// `CasGc.cpp`'s intake walk). What those proofs cannot supply is the SET they must cover, and only the catalog supplies it:
 /// a listing may omit a durable namespace, and a sealed fold cursor names only namespaces some round
 /// already folded, so neither source bounds the set on its own.
 ///
@@ -224,13 +225,26 @@ struct GcPhaseRecord
 /// elsewhere (a unit test driving `Gc` directly emits nothing).
 using GcPhaseSink = std::function<void(const GcPhaseRecord &)>;
 
+/// What one `Gc::cleanupRefObjects` pass did and why it ended. All zero when the pass did not run.
+struct RefCleanupPassStats
+{
+    uint64_t objects_planned = 0;
+    uint64_t objects_deleted = 0;
+    /// Namespaces refused because their own catalog row or life changed; the pass went on.
+    uint64_t namespaces_skipped = 0;
+    bool stopped_lease_moved = false;
+    bool stopped_authority_unverified = false;
+    /// Chunks deleted while the catalog etag differed from the fold's cut.
+    uint64_t chunks_under_catalog_change = 0;
+};
+
 /// The round's one hint enumeration of `cas/ns/stream/`, taken before the defer decision and consumed by
 /// everything downstream: the DEFER signal (`changed_shards`), and — on a folding round — the strict
 /// grouping the fold works from (`keys`, regrouped by `groupRefKeys`).
 ///
-/// It is a HINT, never a census. The fold's intake walks the ref stream ARITHMETICALLY by exact key
-/// (`cursor + 1`, epoch crossings proved through the seal chain), so an id this enumeration omits is
-/// still folded, and the round listing the prefix a second time would buy the intake nothing.
+/// It is a HINT, never a census. The fold's intake walks the ref chain by exact key in successor order
+/// (`refChainSuccessor`), so an id this enumeration omits is still folded, and the round listing the
+/// prefix a second time would buy the intake nothing.
 struct RefScanSummary
 {
     size_t changed_shards = 0;                          /// tables with a log above their sealed cursor
@@ -438,6 +452,10 @@ public:
     Gc(PoolPtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_ = {},
        std::function<uint64_t()> mono_ms_fn_ = {}, LoggerPtr log_ = nullptr);
 
+    /// The time slice of one round's ref intake, on `mono_ms_fn`. A writer appends as fast as the walker
+    /// reads, so only time bounds the walk; one default `gc_interval_sec`.
+    static constexpr uint64_t kRefIntakeBudgetMs = 60'000;
+
     /// One full round. Returns acquired_lease=false (nothing else done) if another leader is alive.
     /// `on_lease_acquired`, if set, is invoked ONCE, synchronously, immediately after the lease is
     /// acquired/renewed and BEFORE the (potentially long) fold begins - the scheduler uses this to
@@ -570,6 +588,9 @@ private:
     /// Catalog-only helping barrier run immediately after lease acquisition. It validates the adopted
     /// parent and delegates deterministic `Removing`-row settlement to `CatalogLifecycleReconciler`.
     /// It performs no physical LIST or delete.
+    /// `completed_erases` is kept current while the drain runs, so it is valid after an exception.
+    CatalogLifecycleReconcileResult drainCompletedRemoving(const GcState & leased_state, uint64_t & completed_erases);
+    /// Same drain for callers that do not need the erase count.
     CatalogLifecycleReconcileResult drainCompletedRemoving(const GcState & leased_state);
 
     /// Run the independently paced physical namespace maintenance: pages from the persisted cursor while
@@ -606,15 +627,14 @@ private:
         /// ref-object cleanup (covered logs / superseded snapshots) so a second LIST is never issued.
         std::map<String, RefTableListing> ref_tables;
 
-        /// The round's complete immutable post-LIST catalog cut (review C3). Every later consumer in
+        /// The round's complete immutable post-LIST catalog cut. Every later consumer in
         /// the SAME round (`cleanupRefObjects`) must look a namespace up here rather than issuing an
         /// independent catalog re-read, which can see a DIFFERENT answer if the namespace was dropped
         /// and recreated between the fold's walk and the later call -- the exact "delete plan computed
-        /// under one life, applied under another" shape C3 named.
+        /// under one life, applied under another" shape.
         /// Keeping the full cut also preserves the distinction between an absent namespace and a
         /// cataloged but non-walkable `Creating` row; reducing it to a `Live`/`Removing` map loses that
-        /// lifecycle fact. A namespace absent from this cut has no legitimate destructive key space;
-        /// never assume the Stage-A sentinel applies.
+        /// lifecycle fact. A namespace absent from this cut has no legitimate destructive key space.
         std::optional<CasRefCatalog::Snapshot> catalog_cut;
 
         /// The round's per-namespace decoded `_ckpt`, read ONCE by the intake walk (its second,
@@ -680,9 +700,9 @@ private:
         {
             Proven,
             CheckpointUnusable,
-            CheckpointFrontierEmpty,
-            CommittedBelowCursor,
             Held,
+            /// The ref intake's time slice ended before the walk reached an end.
+            IntakeSliceCut,
             Unattributed,
         };
 
@@ -695,9 +715,8 @@ private:
         struct FrontierDeficit
         {
             uint64_t checkpoint_unusable = 0;
-            uint64_t checkpoint_frontier_empty = 0;
-            uint64_t committed_below_cursor = 0;
             uint64_t held = 0;
+            uint64_t intake_slice_cut = 0;
             uint64_t probe_budget = 0;
             uint64_t fold_aborted = 0;
             uint64_t unattributed = 0;
@@ -772,6 +791,19 @@ private:
         size_t unsent;
     };
 
+    /// The settlement decisions of one shard in a round, counted where each is made: a decision whose
+    /// audit row the outcome-log limits dropped still counts.
+    struct OutcomeTally
+    {
+        uint64_t deleted = 0;
+        uint64_t absent = 0;
+        uint64_t replaced = 0;
+        uint64_t spared = 0;
+
+        void add(OutcomeKind kind);
+        uint64_t total() const { return deleted + absent + replaced + spared; }
+    };
+
     struct RedeleteRoundContext
     {
         uint64_t new_round;
@@ -780,6 +812,7 @@ private:
         GcRoundWorkBudget & round_work_budget;
         RoundReport & report;
         std::map<uint64_t, OutcomeLog> & outcomes;
+        std::map<uint64_t, OutcomeTally> & outcome_tallies;
         uint64_t & jobs_scheduled;
         uint64_t & delete_batches;
     };
@@ -833,14 +866,15 @@ private:
         const Layout & layout,
         CasOperation & op);
 
-    /// The round's `_ckpt.checkpoint` witness per namespace — the SECOND, hint-independent witness the
-    /// walk decides its absents against. ONE call site, in the fold, right where the hint is grouped.
+    /// The round's `_ckpt.checkpoint_snapshot_id` witness per namespace — the SECOND, hint-independent
+    /// witness the walk decides its absents against. ONE call site, in the fold, right where the hint is
+    /// grouped.
     ///
     /// The listing cannot be the sole witness source: it is a snapshot, so a record that became durable
     /// after the enumeration is invisible to that round's probes, and an absent expected-next then reads
-    /// as a frontier when it is really a gap. `_ckpt.checkpoint` is the namespace's own durable tail,
-    /// read by the fold anyway for cleanup ranges, and it decides the same question without asking the
-    /// listing anything — so it is read by EXACT KEY, never gated on `RefTableListing::has_ckpt`.
+    /// as a frontier when it is really a gap. The snapshot id is a lower bound on the chain's end, not its
+    /// tail: an absent key below it is a gap. It is read by the fold anyway for cleanup ranges, and by
+    /// EXACT KEY, never gated on `RefTableListing::has_ckpt`.
     ///
     /// It takes BOTH of the round's namespace sources because it owes a witness to both: `ref_tables`
     /// is the hint, and `parent_cursors` is where a carried hold names a namespace the hint may have
@@ -851,20 +885,10 @@ private:
         /// namespace -> `_ckpt.checkpoint_snapshot_id`, for the namespaces that published one.
         std::map<String, RefTxnId> witnesses;
 
-        /// namespace -> `_ckpt.life_epoch`, for the namespaces that published one. Stage B (Task 4-C):
-        /// the walk's ONLY use is seeding `expected` for a namespace that has never folded a cursor AND
-        /// whose listing shows no log at all -- a `Live` catalog namespace the round has not yet touched.
-        /// Without this, such a namespace can never leave `expected == nullopt`, so its `while (expected)`
-        /// loop never runs and `frontier_proven` stays false forever, even though nothing above `{life_epoch,
-        /// 1}` can possibly exist yet. A namespace admitted without a `_ckpt` at all (the test-only
-        /// `casAdmitEntry` bridge, not `completeCreation`'s production path) has no entry here and stays
-        /// correctly unproven -- fail-closed on a genuinely unknown genesis, never a guessed one.
-        std::map<String, uint64_t> life_epochs;
-
-        /// The complete decoded checkpoint for each catalog-admitted Live/Removing life. `REBUILD`
-        /// passes this exact sample together with the same immutable catalog row to read-only recovery;
-        /// it must not re-read either authority object after its plan has been frozen.
-        std::map<String, RefCkpt> recovery_checkpoints;
+        /// The complete decoded checkpoint and its token for each catalog-admitted Live/Removing life.
+        /// `REBUILD` passes this exact sample together with the same immutable catalog row to read-only
+        /// recovery; it must not re-read either authority object after its plan has been frozen.
+        std::map<String, CkptSample> recovery_checkpoints;
 
         /// namespace -> the decode failure's message, for the namespaces whose `_ckpt` is PRESENT and
         /// UNREADABLE. Separate from an absent entry because the two mean opposite things: an absent
@@ -927,20 +951,25 @@ private:
     /// in batches of <=1000 exact keys. A folded terminal's cleanup evidence carries its tail-covering
     /// snapshot id directly on the same ref-life row. Runs post-CAS and only on a clamp-free round.
     ///
+    /// Each chunk is licensed by its namespace's own catalog row and life and by the GC lease. A changed
+    /// own row or life skips that namespace and the pass continues; a moved GC lease, a failed read or an
+    /// ambiguous catalog stops the pass. `stats` reports the outcome and is reset on every call, including
+    /// early returns.
+    ///
     /// A listed `_snap` never licenses cleanup on its own: only `folded.checkpoints` whose exact
     /// same-id `_log` and `_snap` validate through `readCheckpointSnapshotBase` do. Logs and snapshots
     /// are then deletable only strictly BELOW that checkpoint (and logs also at or below the durable
     /// cursor). A namespace with no checkpoint base, or an invalid triple, is leak-only this pass.
     void cleanupRefObjects(
         const FoldResult & folded, const GcLease & adopted_lease, bool suppress_destructive,
-        GcRoundWorkBudget & work_budget);
+        GcRoundWorkBudget & work_budget, RefCleanupPassStats & stats);
 
     /// Emit the sweep's per-pass retention rollup, throttled (see `last_retain_rollup`). Separate from
     /// the pass itself so the phase row and the log line read the SAME counters rather than two
     /// independently-derived views of the page.
     void reportSweepRetention(const ManifestSweepResult & result);
 
-    /// Stage B (spec INV-3): the round's universe -- every namespace life the destructive gate may one
+    /// Spec INV-3: the round's universe -- every namespace life the destructive gate may one
     /// day owe a frontier proof for -- is catalog-authoritative, ONE `cas/ref_catalog` `GET` replacing
     /// the pool-wide `LIST(cas/ns/stream/)` this used to run. `Creating` entries are excluded: no publication
     /// can exist yet (spec §3), so there is nothing here for a discovery path to walk; `Live` and
@@ -1029,7 +1058,19 @@ private:
     /// monotonic on this process, injected (tests), defaults to `Pool::bootMs()`. Never compared
     /// against another node's clock; see `computeHeartbeatFloor`.
     std::function<uint64_t()> mono_ms_fn;
-    bool trim_enabled = true;     /// TEST SEAM ONLY: production always trims; see setTrimEnabledForTest
+
+    /// The successor of a fold cursor, remembered from this process's own fold that ended at an absent
+    /// key. In-process only: nothing is persisted and `cas_fold_seal` does not change.
+    struct RefFoldMemo
+    {
+        RefTxnId cursor;
+        RefTxnId successor_key;
+        std::optional<RefEpochTransition> open_transition;
+    };
+    /// Keyed by the physical life id. Consulted only while the durable cursor equals `cursor`.
+    std::unordered_map<UInt128, RefFoldMemo> ref_fold_memo;
+
+    bool trim_enabled = true;    /// TEST SEAM ONLY: production always trims; see setTrimEnabledForTest
     /// TEST SEAM ONLY: see setPostHotScanCatalogReadHookForTest. Empty in production.
     std::function<void()> post_hot_scan_catalog_read_hook_for_test;
     /// Leader-local, in-memory count of consecutive deferred

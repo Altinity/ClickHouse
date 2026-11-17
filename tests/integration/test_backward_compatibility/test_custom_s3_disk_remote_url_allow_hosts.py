@@ -15,6 +15,7 @@ node = cluster.add_instance(
     main_configs=[
         "configs/remote_url_allow_hosts_without_minio.xml",
         "configs/drop_table_delay.xml",
+        "configs/skip_check_for_incorrect_settings.xml",
     ],
     image="clickhouse/clickhouse-server",
     tag="26.8.26.12",
@@ -27,6 +28,7 @@ node_db = cluster.add_instance(
     main_configs=[
         "configs/remote_url_allow_hosts_without_minio.xml",
         "configs/drop_table_delay.xml",
+        "configs/skip_check_for_incorrect_settings.xml",
     ],
     image="clickhouse/clickhouse-server",
     tag="26.8.26.12",

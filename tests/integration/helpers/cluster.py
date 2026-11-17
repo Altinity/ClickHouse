@@ -2258,6 +2258,7 @@ class ClickHouseCluster:
         ipv4_address=None,
         ipv6_address=None,
         with_installed_binary=False,
+        installed_binary_supports_cas_logs=False,
         external_dirs=None,
         tmpfs=None,
         mem_limit=None,
@@ -2290,6 +2291,8 @@ class ClickHouseCluster:
         with_zookeeper - if True, add ZooKeeper configuration to configs and ZooKeeper instances to the cluster.
         with_zookeeper_secure - if True, add ZooKeeper Secure configuration to configs and ZooKeeper instances to the cluster.
         extra_configs - config files cannot put into config.d and users.d
+        installed_binary_supports_cas_logs - with `with_installed_binary`, keep the `cas_log` and `cas_gc_log`
+            sections of the main config. The binaries of other images reject them as unknown elements.
         """
 
         if self.is_up:
@@ -2406,6 +2409,7 @@ class ClickHouseCluster:
             ipv4_address=ipv4_address,
             ipv6_address=ipv6_address,
             with_installed_binary=with_installed_binary,
+            installed_binary_supports_cas_logs=installed_binary_supports_cas_logs,
             external_dirs=external_dirs,
             tmpfs=tmpfs or [],
             mem_limit=mem_limit,
@@ -5191,6 +5195,7 @@ class ClickHouseInstance:
         ipv4_address=None,
         ipv6_address=None,
         with_installed_binary=False,
+        installed_binary_supports_cas_logs=False,
         external_dirs=None,
         tmpfs=None,
         mem_limit=None,
@@ -5365,6 +5370,7 @@ class ClickHouseInstance:
         self.ipv4_address = ipv4_address
         self.ipv6_address = ipv6_address
         self.with_installed_binary = with_installed_binary
+        self.installed_binary_supports_cas_logs = installed_binary_supports_cas_logs
         self.is_up = False
         self.config_root_name = config_root_name
         self.docker_init_flag = use_docker_init_flag
@@ -6571,6 +6577,12 @@ class ClickHouseInstance:
                 write_embedded_config(
                     "0_common_min_cpu_busy_time.xml", self.config_d_dir
                 )
+
+        # The main config comes from this checkout and has the Antalya-only `cas_log` and `cas_gc_log`
+        # sections. The binary of an older or upstream image rejects them as unknown elements and does not start.
+        # The sections stay removed if `restart_with_latest_version` later switches the instance to the tested binary.
+        if self.with_installed_binary and not self.installed_binary_supports_cas_logs:
+            write_embedded_config("0_common_remove_cas_logs.xml", self.config_d_dir)
 
         use_old_analyzer = os.environ.get("CLICKHOUSE_USE_OLD_ANALYZER") is not None
         use_distributed_plan = (

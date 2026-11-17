@@ -144,9 +144,10 @@ public:
     struct GcHealth
     {
         bool is_leader = false;
+        /// A round completed as leader, `Deferred` included; gates every use of the age.
         bool ever_succeeded = false;
         Int64 pending_reclaim = 0;             /// cumulative condemned - executed deletes (this process)
-        UInt64 last_success_age_seconds = 0;   /// seconds since the last led round (0 if never)
+        UInt64 last_success_age_seconds = 0;   /// seconds since the last led round; meaningful only when `ever_succeeded`
         UInt64 wedged_namespace_count = 0;
     };
     /// Takes a consistent-enough atomic snapshot for diagnostics. The returned counters are local

@@ -27,6 +27,7 @@ SETTINGS disk = disk(
     type = object_storage,
     object_storage_type = local,
     metadata_type = cas,
+    cas_unsafe_remount_no_delay = 1,
     cas_server_root_id = '${CLICKHOUSE_DATABASE}_04286',
     name = '${CLICKHOUSE_DATABASE}_04286_cas_rdp',
     path = '${CLICKHOUSE_DATABASE}_04286_cas_rdp_pool/');

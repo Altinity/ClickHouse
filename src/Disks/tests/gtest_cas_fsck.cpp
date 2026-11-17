@@ -15,14 +15,17 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <functional>
 #include <mutex>
 #include <optional>
 #include <string_view>
+#include <thread>
 
 namespace DB::ErrorCodes
 {
+extern const int BAD_ARGUMENTS;
 extern const int INVALID_STATE;
 extern const int NETWORK_ERROR;
 }
@@ -194,11 +197,11 @@ void writeFsckCheckpoint(Backend & backend, const Layout & layout, const RootNam
     ASSERT_NE(it, cut.catalog.entries.end());
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(it->ns, it->incarnation);
     const String key = layout.refCkptKey(life);
-    const String body = encodeRefCkpt(RefCkpt{
+    const String body = encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = committed_through.writer_epoch,
         .committed_through = committed_through,
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt});
+        .last_epoch_seal = std::nullopt}, 1);
     const auto current = op.head(key, Retry::once());
     const WriteResult put = current
         ? op.replace(key, body, current->etag, Retry::once())
@@ -208,16 +211,17 @@ void writeFsckCheckpoint(Backend & backend, const Layout & layout, const RootNam
 
 void writeFsckCheckpointWithBase(
     Backend & backend, const Layout & layout, const RootNamespace & ns, RefTxnId base,
-    std::optional<RefTxnId> last_epoch_seal = std::nullopt)
+    std::optional<RefTxnId> last_epoch_seal = std::nullopt,
+    std::optional<RefTxnId> committed_through = std::nullopt)
 {
     CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
     CasOperation op = requests.admit();
     const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(op, layout, ns);
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
-        .committed_through = base,
+        .committed_through = committed_through.value_or(base),
         .checkpoint_snapshot_id = base,
-        .last_epoch_seal = last_epoch_seal}), Retry::once())));
+        .last_epoch_seal = last_epoch_seal}, 1), Retry::once())));
 }
 
 void expectCheckpointBaseVerdict(
@@ -482,7 +486,7 @@ TEST(CASFsck, CanonicalDeadLifeResidueIsJanitorPendingNotHardFinding)
     /// Simulate a fenced GC's exact-CAS catalog-row deletion: the row is gone, the life-owned physical
     /// object above survives it (the janitor's own job, not GC's own round). `casUpdate` deliberately
     /// refuses to add or delete rows (there is no generic catalog remove-by-name API -- deletion is
-    /// only `deleteCompletedRemoving`/`cancelStalledCreating`, both requiring the full fenced-GC
+    /// only `deleteCompletedRemovingAtSnapshot`/`cancelStalledCreating`, both requiring the full fenced-GC
     /// protocol this fixture is not driving), so inject the post-deletion catalog snapshot directly,
     /// mirroring `DuplicateLifeIdIsReportedWhileAnUnrelatedUniqueNamespaceStillProgresses` below.
     {
@@ -784,9 +788,9 @@ TEST(CASFsckAuthority, StreamListingDoesNotChangeCheckpointBaseVerdict)
     }
 }
 
-/// A durable but unfrontiered F+1 is not part of this fsck cut. Mutation caught: probing one position
-/// beyond `_ckpt.committed_through` walks the visible record and changes both coverage and reachability.
-TEST(CASFsckAuthority, VisibleFPlusOneDoesNotAffectVerdict)
+/// A durable log on the chain is history even above a generation 1 frontier: both fsck legs walk it, so
+/// the owner it adds is audited and the owner it removes no longer makes its blob reachable.
+TEST(CASFsckAuthority, LogAboveTheOldFrontierIsWalked)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -801,10 +805,8 @@ TEST(CASFsckAuthority, VisibleFPlusOneDoesNotAffectVerdict)
         *backend, layout, ns, "tbl", std::nullopt, committed_ref);
     writeFsckCheckpoint(*backend, layout, ns, RefTxnId{1, frontier});
 
-    /// The object is durable and visible, but `_ckpt` is deliberately NOT advanced to it. The semantic
-    /// convenience wrapper advances `_ckpt`, so deposit this unfrontiered F+1 as the raw transaction
-    /// shape that a stopped writer can leave behind. Its missing manifest would become a false dangle if
-    /// either fsck leg adopted F+1.
+    /// `_ckpt` is deliberately NOT advanced to this record: the semantic wrapper would advance it, so
+    /// deposit the raw shape a stopped writer leaves behind. Its manifest is absent.
     std::vector<RefOp> unfrontiered_ops;
     unfrontiered_ops.push_back(ownerTransitionOp(
         RefOwnerBinding{RefOwnerKind::Committed, "tbl", committed_ref}, std::nullopt));
@@ -815,9 +817,9 @@ TEST(CASFsckAuthority, VisibleFPlusOneDoesNotAffectVerdict)
     const FsckReport report = runFsck(*store, /*detail=*/true);
     EXPECT_EQ(report.chain_broken, 0u);
     EXPECT_EQ(report.unchecked, 0u);
-    EXPECT_EQ(report.ref_records_walked, 1u);
-    EXPECT_EQ(report.dangling, 0u);
-    EXPECT_EQ(report.reachable, 1u);
+    EXPECT_EQ(report.ref_records_walked, 2u);
+    EXPECT_EQ(report.dangling, 1u);
+    EXPECT_EQ(report.reachable, 0u);
 }
 
 /// INV-2 materializes every burned global epoch, including an empty one, as a sequence-1 seal. A
@@ -854,11 +856,11 @@ TEST(CASFsckAuthority, MissingBurnedEpochSealIsChainBroken)
     ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refLogKey(life, RefTxnId{7, 1}),
         sealObject(FormatId::RefLog, skipped_bytes), Retry::once())));
 
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{7, 1},
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = RefTxnId{6, 1}}), Retry::once())));
+        .last_epoch_seal = RefTxnId{6, 1}}, 1), Retry::once())));
 
     const FsckReport report = runFsck(*store, /*detail=*/true);
     EXPECT_EQ(report.chain_broken, 1u);
@@ -950,11 +952,11 @@ TEST(CASFsckAuthority, CheckpointSnapshotAtOlderEpochSealIsChainBroken)
     CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
     CasOperation op = requests.admit();
     const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(op, layout, ns);
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{2, 1},
         .checkpoint_snapshot_id = RefTxnId{1, 2},
-        .last_epoch_seal = RefTxnId{2, 1}}), Retry::once())));
+        .last_epoch_seal = RefTxnId{2, 1}}, 1), Retry::once())));
 
     const FsckReport report = runFsck(*store, /*detail=*/true);
     EXPECT_EQ(report.ref_records_walked, 0u)
@@ -997,11 +999,10 @@ TEST(CASFsckAuthority, CheckpointBaseTransportFailureIsUnchecked)
 }
 #endif
 
-/// The sampled checkpoint is immutable input, but cleanup may advance `_ckpt` after that sample and
-/// retire its old base before fsck exact-reads it. The miss is then authority instability, not evidence
-/// that either durable checkpoint incarnation was internally corrupt.
+/// Cleanup may advance `_ckpt` after fsck sampled it and retire the old base before fsck exact-reads it.
+/// The miss is authority instability, so fsck walks again from the new `_ckpt`, which here names no base.
 /// Mutation caught: classifying `CORRUPTED_DATA` without rechecking the sampled checkpoint token.
-TEST(CASFsckAuthority, CheckpointBaseVanishingAfterAuthorityAdvanceIsUnchecked)
+TEST(CASFsckAuthority, CheckpointBaseVanishingAfterAuthorityAdvanceRestartsTheWalk)
 {
     auto backend = std::make_shared<MutateOnFirstGetBackend>();
     auto store = openPoolForTest(backend);
@@ -1020,18 +1021,210 @@ TEST(CASFsckAuthority, CheckpointBaseVanishingAfterAuthorityAdvanceIsUnchecked)
         OperationForTest nested_op(*backend);
         const auto head = (*nested_op).head(ckpt_key, Retry::once());
         ASSERT_TRUE(head.has_value());
-        ASSERT_TRUE(std::holds_alternative<Committed>((*nested_op).replace(ckpt_key, encodeRefCkpt(RefCkpt{
+        ASSERT_TRUE(std::holds_alternative<Committed>((*nested_op).replace(ckpt_key, encodeRefCkptAtGeneration(RefCkpt{
             .life_epoch = 1,
             .committed_through = std::nullopt,
             .checkpoint_snapshot_id = std::nullopt,
-            .last_epoch_seal = std::nullopt}), head->etag, Retry::once())));
+            .last_epoch_seal = std::nullopt}, 1), head->etag, Retry::once())));
     });
 
     const FsckReport report = runFsck(*store, /*detail=*/true);
     EXPECT_EQ(report.ref_records_walked, 0u);
-    expectCheckpointBaseVerdict(
-        report, layout.refSnapshotKey(life, old_base), FsckClass::Unchecked,
-        "checkpoint authority changed while validating its snapshot base");
+    EXPECT_EQ(report.chain_broken, 0u);
+    EXPECT_EQ(report.unchecked, 0u);
+    EXPECT_TRUE(report.clean());
+}
+
+namespace
+{
+
+/// Valid checkpoint triple at `{1,1}`, `_ckpt.committed_through = {1,3}`, tail logs `{1,2}` and `{1,3}`
+/// present: fsck passes the base check and walks the tail by exact key.
+NamespaceLifeId writeFsckFixtureWithTail(Backend & backend, const Layout & layout, const RootNamespace & ns)
+{
+    fixture::admitLive(backend, layout, ns);
+    const RefTxnId base{1, 1};
+    const RefLogTxn birth{
+        .ns = ns.string(), .txn_id = base, .ops = {namespaceBirthOp()}, .prev_epoch_seal = std::nullopt};
+    fixture::writeRefLogRaw(backend, layout, birth);
+    RefTableState state;
+    applyRefLogTxn(state, birth);
+    writeRefSnapshotRaw(backend, layout, snapshotOf(state, ns.string()));
+    for (const uint64_t sequence : {2, 3})
+        fixture::writeRefLogRaw(backend, layout, RefLogTxn{
+            .ns = ns.string(), .txn_id = RefTxnId{1, sequence}, .ops = {}, .prev_epoch_seal = std::nullopt});
+
+    writeFsckCheckpointWithBase(backend, layout, ns, base, std::nullopt, RefTxnId{1, 3});
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    return *CasRefCatalog::lifeIfCataloged(op, layout, ns);
+}
+
+size_t countVerdictsAtKey(const FsckReport & report, const String & key, FsckClass cls)
+{
+    return static_cast<size_t>(std::count_if(report.objects.begin(), report.objects.end(),
+        [&](const FsckObject & object) { return object.key == key && object.cls == cls; }));
+}
+
+bool uncheckedNoteContains(const FsckReport & report, const String & key, const String & text)
+{
+    return std::any_of(report.objects.begin(), report.objects.end(), [&](const FsckObject & object)
+    {
+        return object.key == key && object.cls == FsckClass::Unchecked && !object.reachable_from.empty()
+            && object.reachable_from.front().find(text) != String::npos;
+    });
+}
+
+}
+
+/// Cleanup may advance `_ckpt` to a newer base and delete a tail log below it after fsck sampled the
+/// checkpoint. The miss is authority instability, not a hole: fsck walks again from the new base.
+/// Mutation caught: reporting an absent tail log as chain-broken without re-reading `_ckpt`.
+TEST(CASFsckAuthority, CoveredTailLogVanishingAfterAuthorityAdvanceRestartsTheWalk)
+{
+    auto backend = std::make_shared<MutateOnFirstGetBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/tail_log_advanced@cas@"};
+    const NamespaceLifeId life = writeFsckFixtureWithTail(*backend, layout, ns);
+    const String tail_key = layout.refLogKey(life, RefTxnId{1, 2});
+    backend->armOnFirstGet(tail_key, [&]
+    {
+        RefTableState state;
+        applyRefLogTxn(state, RefLogTxn{
+            .ns = ns.string(), .txn_id = RefTxnId{1, 1}, .ops = {namespaceBirthOp()}, .prev_epoch_seal = std::nullopt});
+        for (const uint64_t sequence : {2, 3})
+            applyRefLogTxn(state, RefLogTxn{
+                .ns = ns.string(), .txn_id = RefTxnId{1, sequence}, .ops = {}, .prev_epoch_seal = std::nullopt});
+        writeRefSnapshotRaw(*backend, layout, snapshotOf(state, ns.string()));
+        OperationForTest nested_op(*backend);
+        const String ckpt_key = layout.refCkptKey(life);
+        const auto ckpt_head = (*nested_op).head(ckpt_key, Retry::once());
+        ASSERT_TRUE(ckpt_head.has_value());
+        ASSERT_TRUE(std::holds_alternative<Committed>((*nested_op).replace(ckpt_key, encodeRefCkptAtGeneration(RefCkpt{
+            .life_epoch = 1,
+            .committed_through = RefTxnId{1, 3},
+            .checkpoint_snapshot_id = RefTxnId{1, 3},
+            .last_epoch_seal = std::nullopt}, 1), ckpt_head->etag, Retry::once())));
+        const auto log_head = (*nested_op).head(tail_key, Retry::once());
+        ASSERT_TRUE(log_head.has_value());
+        ASSERT_EQ((*nested_op).remove(tail_key, log_head->etag, Retry::once()), Removal::Removed);
+    });
+
+    const FsckReport report = runFsck(*store, /*detail=*/true);
+    EXPECT_EQ(report.chain_broken, 0u);
+    EXPECT_EQ(report.unchecked, 0u);
+    EXPECT_EQ(report.ref_records_walked, 0u) << "the new base is the frontier, so the second walk reads only its successor";
+}
+
+/// Cleanup may delete the covered log and `_ckpt` itself. An absent authority proves no hole.
+/// Mutation caught: treating an absent `_ckpt` as the same incarnation during the tail revalidation.
+TEST(CASFsckAuthority, TailLogVanishingTogetherWithCheckpointIsUnchecked)
+{
+    auto backend = std::make_shared<MutateOnFirstGetBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/tail_log_ckpt_gone@cas@"};
+    const NamespaceLifeId life = writeFsckFixtureWithTail(*backend, layout, ns);
+    const String tail_key = layout.refLogKey(life, RefTxnId{1, 2});
+    backend->armOnFirstGet(tail_key, [&]
+    {
+        OperationForTest nested_op(*backend);
+        for (const String & key : {layout.refCkptKey(life), tail_key})
+        {
+            const auto head = (*nested_op).head(key, Retry::once());
+            ASSERT_TRUE(head.has_value());
+            ASSERT_EQ((*nested_op).remove(key, head->etag, Retry::once()), Removal::Removed);
+        }
+    });
+
+    const FsckReport report = runFsck(*store, /*detail=*/true);
+    EXPECT_EQ(report.chain_broken, 0u);
+    EXPECT_EQ(countVerdictsAtKey(report, tail_key, FsckClass::Unchecked), 1u)
+        << "an absent `_ckpt` must leave the absent tail log unchecked";
+    EXPECT_TRUE(uncheckedNoteContains(report, tail_key, "changed"))
+        << "the note must name the absent-authority arm, not the unreadable one";
+}
+
+/// A `_ckpt` re-read that fails cannot confirm the same incarnation, so the absent log stays unchecked.
+/// Mutation caught: letting a failed re-read fall through to a chain-broken verdict.
+TEST(CASFsckAuthority, TailLogVanishingWithUnreadableCheckpointIsUnchecked)
+{
+    auto backend = std::make_shared<MutateOnFirstGetBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/tail_log_ckpt_unreadable@cas@"};
+    const NamespaceLifeId life = writeFsckFixtureWithTail(*backend, layout, ns);
+    const String tail_key = layout.refLogKey(life, RefTxnId{1, 2});
+    backend->armOnFirstGet(tail_key, [&]
+    {
+        OperationForTest nested_op(*backend);
+        const auto head = (*nested_op).head(tail_key, Retry::once());
+        ASSERT_TRUE(head.has_value());
+        ASSERT_EQ((*nested_op).remove(tail_key, head->etag, Retry::once()), Removal::Removed);
+        backend->failNextReadWith(
+            layout.refCkptKey(life), std::make_exception_ptr(std::runtime_error("injected checkpoint read fault")));
+    });
+
+    const FsckReport report = runFsck(*store, /*detail=*/true);
+    EXPECT_EQ(report.chain_broken, 0u);
+    EXPECT_EQ(countVerdictsAtKey(report, tail_key, FsckClass::Unchecked), 1u);
+    EXPECT_TRUE(uncheckedNoteContains(report, tail_key, "could not be revalidated"))
+        << "the verdict note must say the authority could not be revalidated";
+}
+
+/// The same, with a typed `DB::Exception` fault (a code the engine does not retry): its message reaches the verdict note.
+/// Mutation caught: dropping the typed-exception arm, or classifying it chain-broken.
+TEST(CASFsckAuthority, TailLogVanishingWithTypedCheckpointReadFaultIsUnchecked)
+{
+    auto backend = std::make_shared<MutateOnFirstGetBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/tail_log_ckpt_typed_fault@cas@"};
+    const NamespaceLifeId life = writeFsckFixtureWithTail(*backend, layout, ns);
+    const String tail_key = layout.refLogKey(life, RefTxnId{1, 2});
+    backend->armOnFirstGet(tail_key, [&]
+    {
+        OperationForTest nested_op(*backend);
+        const auto head = (*nested_op).head(tail_key, Retry::once());
+        ASSERT_TRUE(head.has_value());
+        ASSERT_EQ((*nested_op).remove(tail_key, head->etag, Retry::once()), Removal::Removed);
+        backend->failNextReadWith(
+            layout.refCkptKey(life),
+            std::make_exception_ptr(DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "injected typed checkpoint fault")));
+    });
+
+    const FsckReport report = runFsck(*store, /*detail=*/true);
+    EXPECT_EQ(report.chain_broken, 0u);
+    EXPECT_EQ(countVerdictsAtKey(report, tail_key, FsckClass::Unchecked), 1u);
+    EXPECT_TRUE(uncheckedNoteContains(report, tail_key, "could not be revalidated: "))
+        << "the typed-exception arm appends the exception message";
+    EXPECT_TRUE(uncheckedNoteContains(report, tail_key, "injected typed checkpoint fault"));
+}
+
+/// With `_ckpt` unchanged, an absent covered tail log is a real hole.
+/// Mutation caught: recording `Unchecked` for every absent tail id.
+TEST(CASFsckAuthority, MissingTailLogUnderUnchangedCheckpointIsChainBroken)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/tail_log_missing@cas@"};
+    const NamespaceLifeId life = writeFsckFixtureWithTail(*backend, layout, ns);
+    const String tail_key = layout.refLogKey(life, RefTxnId{1, 2});
+    {
+        OperationForTest nested_op(*backend);
+        const auto head = (*nested_op).head(tail_key, Retry::once());
+        ASSERT_TRUE(head.has_value());
+        ASSERT_EQ((*nested_op).remove(tail_key, head->etag, Retry::once()), Removal::Removed);
+    }
+
+    const FsckReport report = runFsck(*store, /*detail=*/true);
+    EXPECT_EQ(report.chain_broken, 1u);
+    EXPECT_EQ(report.unchecked, 0u);
+    EXPECT_EQ(countVerdictsAtKey(report, tail_key, FsckClass::ChainBroken), 1u)
+        << "the verdict must name the absent tail log's exact key";
+    EXPECT_EQ(report.ref_records_walked, 0u);
 }
 
 /// A Live catalog row without `_ckpt` is not a recoverable table, even when a listing happens to show a
@@ -1057,15 +1250,9 @@ TEST(CASFsck, LiveNamespaceWithoutCheckpointIsUnchecked)
         << "fsck must not consume refs after the mandatory recovery authority was absent";
 }
 
-/// fsck's missing-manifest recheck runs after its primary walk. If it re-resolves the name from a second
-/// catalog cut, a concurrent rebirth can make the old durable owner disappear from the recheck and hide
-/// a real dangle. The initial cut's row and exact checkpoint must remain the sole authority throughout
-/// the whole fsck call.
-///
-/// Mutation caught: re-resolve `ns` from `manifestStillReferenced`. The first manifest GET changes the
-/// catalog to a fresh, empty life; the second resolution then sees no owner and suppresses the dangle. A
-/// recovery from the original cut continues to see the original owner and reports it.
-TEST(CASFsck, MissingManifestRecheckStaysOnInitialCatalogCut)
+/// A rebirth during the scan replaces the walked life's catalog row. The catalog read after the per-life
+/// loop no longer names that life, so its missing manifest is janitor-pending, not a dangle.
+TEST(CASFsck, MissingManifestOfALifeRebornDuringTheScanIsJanitorPending)
 {
     auto backend = std::make_shared<MutateOnFirstGetBackend>();
     auto store = openPoolForTest(backend);
@@ -1082,8 +1269,8 @@ TEST(CASFsck, MissingManifestRecheckStaysOnInitialCatalogCut)
     });
 
     const FsckReport report = runFsck(*store, /*detail=*/true);
-    EXPECT_GE(report.dangling, 1u)
-        << "the initial catalog-cut owner still names the absent manifest despite a later rebirth";
+    EXPECT_EQ(report.dangling, 0u) << "no finding is reported about a life the catalog no longer names";
+    EXPECT_GE(report.namespace_janitor_pending_lives, 1u);
 }
 
 /// A pre-precommit body in an eligible prefix (no owner) is INFO (Unreachable), not an error.
@@ -1636,4 +1823,273 @@ TEST(CASFsckSummary, PartialFlagAndReasonTravelWithTheCounts)
     const String line = formatFsckSummary(rep);
     EXPECT_NE(line.find("partial=1"), String::npos) << line;
     EXPECT_NE(line.find("reason='deadline exceeded after 180s'"), String::npos) << line;
+}
+
+namespace
+{
+
+void eraseCatalogRowForFsck(Backend & backend, const Layout & layout, const RootNamespace & ns)
+{
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    CasRefCatalog::Snapshot current = CasRefCatalog::read(op, layout);
+    std::erase_if(current.catalog.entries, [&](const CatalogEntry & entry) { return entry.ns == ns; });
+    ASSERT_TRUE(current.etag.has_value());
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        op.replace(layout.refCatalogKey(), encodeRefCatalog(current.catalog), *current.etag, Retry::standard())));
+}
+
+void removeForFsck(Backend & backend, const String & key)
+{
+    OperationForTest op(backend);
+    const auto head = (*op).head(key, Retry::once());
+    ASSERT_TRUE(head.has_value());
+    ASSERT_EQ((*op).remove(key, head->etag, Retry::once()), Removal::Removed);
+}
+
+}
+
+TEST(CASFsck, ChainWithASkippedEpochIsClean)
+{
+    ScopedReadCeiling c(3);
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/fsck_skipped_epoch@cas@"};
+    fixture::admitLive(*backend, layout, ns);
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(op, layout, ns);
+    const auto put = [&](const RefLogTxn & txn)
+    {
+        ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refLogKey(life, txn.txn_id),
+            sealObject(FormatId::RefLog, encodeRefLogTxnAtGeneration(txn, G_REF_CHAIN)), Retry::once())));
+    };
+    put(RefLogTxn{ns.string(), RefTxnId{1, 1}, {namespaceBirthOp()}, std::nullopt});
+    put(tombstoneTxn(ns.string(), RefTxnId{1, 2}, 5));
+    put(RefLogTxn{ns.string(), RefTxnId{5, 1}, {}, RefTxnId{1, 2}});
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        op.create(layout.refCkptKey(life), encodeRefCkptAtGeneration(refCkptOf(1), G_REF_CHAIN), Retry::once())));
+
+    const FsckReport report = runFsck(*store, /*detail=*/true);
+    EXPECT_EQ(report.chain_broken, 0u);
+    EXPECT_EQ(report.unchecked, 0u);
+    EXPECT_EQ(report.dangling, 0u);
+    EXPECT_EQ(report.ref_records_walked, 3u);
+    EXPECT_TRUE(report.clean());
+}
+
+TEST(CASFsck, LifeErasedDuringTheScanIsJanitorPending)
+{
+    auto backend = std::make_shared<MutateOnFirstGetBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/fsck_erased_life@cas@"};
+    const ManifestRef r = ref(1, 0xE7);
+    const uint64_t sequence = publishCommittedTransition(*backend, layout, ns, "tbl", std::nullopt, r);
+    writeFsckCheckpoint(*backend, layout, ns, RefTxnId{1, sequence});
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(op, layout, ns);
+    backend->armOnFirstGet(layout.refCkptKey(life), [&]
+    {
+        eraseCatalogRowForFsck(*backend, layout, ns);
+        for (uint64_t s = 1; s <= sequence; ++s)
+            removeForFsck(*backend, layout.refLogKey(life, RefTxnId{1, s}));
+    });
+
+    const FsckReport report = runFsck(*store, /*detail=*/true);
+    EXPECT_EQ(report.dangling, 0u);
+    EXPECT_EQ(report.namespace_janitor_pending_lives, 1u);
+    EXPECT_EQ(report.chain_broken, 0u);
+    EXPECT_EQ(report.unchecked, 0u);
+}
+
+TEST(CASFsck, LateRecheckOfAnErasedLifeIsNotDangling)
+{
+    auto backend = std::make_shared<RepublishOnListBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/fsck_late_erased@cas@"};
+    const ManifestRef r = ref(1, 0xE8);
+    writeManifestRaw(*backend, layout, ns, r, {blobEntryFor("a", u128Of("fsck-late-erased-blob"))});
+    const uint64_t sequence = publishCommittedTransition(*backend, layout, ns, "tbl", std::nullopt, r);
+    writeFsckCheckpoint(*backend, layout, ns, RefTxnId{1, sequence});
+    backend->armOnFirstList(layout.blobsPrefix(), [&] { eraseCatalogRowForFsck(*backend, layout, ns); });
+
+    const FsckReport report = runFsck(*store, /*detail=*/true);
+    EXPECT_EQ(report.dangling, 0u);
+}
+
+namespace
+{
+
+/// After every read of `watched_key` while armed, replaces `_ckpt` with its own bytes (a new token).
+class FsckCkptChurnBackend : public CountingBackend
+{
+public:
+    String watched_key;
+    String ckpt_key;
+    bool armed = false;
+    String arm_on_key;
+
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        if (!arm_on_key.empty() && key == arm_on_key)
+            armed = true;
+        std::optional<Raw> result = CountingBackend::read(key, access);
+        if (armed && key == watched_key)
+        {
+            const auto current = InMemoryBackend::read(ckpt_key, access);
+            if (!current || !InMemoryBackend::write(ckpt_key, current->bytes, current->value, access).has_value())
+                throw std::runtime_error("test checkpoint churn failed");
+        }
+        return result;
+    }
+};
+
+}
+
+TEST(CASFsckAuthority, CheckpointMovingOnEveryWalkExhaustsTheRestartsAndIsUnchecked)
+{
+    auto backend = std::make_shared<FsckCkptChurnBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/fsck_ckpt_churn@cas@"};
+    const NamespaceLifeId life = writeFsckFixtureWithTail(*backend, layout, ns);
+    backend->ckpt_key = layout.refCkptKey(life);
+    backend->watched_key = layout.refLogKey(life, RefTxnId{1, 1});
+    backend->armed = true;
+    backend->resetCounts();
+
+    const FsckReport report = runFsck(*store, /*detail=*/true);
+    EXPECT_EQ(report.chain_broken, 0u);
+    EXPECT_EQ(report.unchecked, 1u);
+    EXPECT_TRUE(std::any_of(report.objects.begin(), report.objects.end(), [](const FsckObject & object)
+    {
+        return object.cls == FsckClass::Unchecked && !object.reachable_from.empty()
+            && object.reachable_from.front().find("checkpoint authority changed while walking the chain") != String::npos;
+    }));
+    EXPECT_EQ(backend->getCount(layout.refLogKey(life, RefTxnId{1, 1})), kRefReadOnlyRecoveryMaxRestarts + 1)
+        << "the base log is read once per walk: the first and one per restart";
+}
+
+TEST(CASFsck, LateRecheckWhoseCheckpointMovesOnEveryWalkIsUnchecked)
+{
+    auto backend = std::make_shared<FsckCkptChurnBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/fsck_late_churn@cas@"};
+    const ManifestRef r = ref(1, 0xE9);
+    const uint64_t sequence = publishCommittedTransition(*backend, layout, ns, "tbl", std::nullopt, r);
+    writeFsckCheckpoint(*backend, layout, ns, RefTxnId{1, sequence});
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(op, layout, ns);
+    /// The primary walk is quiet; the churn starts at the missing manifest's read, before the late recheck.
+    backend->ckpt_key = layout.refCkptKey(life);
+    backend->watched_key = layout.refLogKey(life, RefTxnId{1, 1});
+    backend->arm_on_key = layout.manifestKey(ManifestId{ns, r});
+    backend->resetCounts();
+
+    const FsckReport report = runFsck(*store, /*detail=*/true);
+    EXPECT_EQ(report.unchecked, 1u);
+    EXPECT_TRUE(std::any_of(report.objects.begin(), report.objects.end(), [](const FsckObject & object)
+    {
+        return object.cls == FsckClass::Unchecked && !object.reachable_from.empty()
+            && object.reachable_from.front().find("kept moving during the walk") != String::npos;
+    }));
+    EXPECT_EQ(backend->getCount(layout.refLogKey(life, RefTxnId{1, 1})), 1 + kRefReadOnlyRecoveryMaxRestarts + 1)
+        << "one primary walk, then the late recheck's first walk and one per restart";
+}
+
+/// Findings held for the catalog confirmation are not dropped by a deadline: they are reported unchecked.
+TEST(CASFsckPartial, DeadlineReportsHeldFindingsAsUnchecked)
+{
+    auto backend = std::make_shared<MutateOnFirstGetBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace broken{"00/a_deadline_broken@cas@"};
+    const RootNamespace later{"00/b_deadline_later@cas@"};
+    const NamespaceLifeId broken_life = writeFsckFixtureWithTail(*backend, layout, broken);
+    writeFsckFixtureWithTail(*backend, layout, later);
+    const String hole = layout.refLogKey(broken_life, RefTxnId{1, 2});
+    removeForFsck(*backend, hole);
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    /// Runs out the clock while the first life's walk meets its hole, so the deadline fires before the
+    /// second life, after the first life's finding is held.
+    backend->armOnFirstGet(hole, [&]
+    {
+        while (std::chrono::steady_clock::now() <= deadline)
+            std::this_thread::yield();
+    });
+
+    const FsckReport report = runFsck(*store, /*detail=*/true, {}, deadline, /*partial_on_deadline=*/true);
+    ASSERT_TRUE(report.partial);
+    EXPECT_EQ(report.chain_broken, 0u) << "a finding the catalog did not confirm is not reported as corruption";
+    EXPECT_EQ(report.unchecked, 1u);
+    EXPECT_TRUE(std::any_of(report.objects.begin(), report.objects.end(), [&](const FsckObject & object)
+    {
+        return object.cls == FsckClass::Unchecked && !object.reachable_from.empty()
+            && object.reachable_from.front().find("not confirmed before the deadline") != String::npos;
+    }));
+}
+
+namespace
+{
+
+/// Once `on_second_blob_head` is set, runs it before the second HEAD of a key under `blobs_prefix`.
+class SecondBlobHeadHookBackend : public InMemoryBackend
+{
+public:
+    String blobs_prefix;
+    std::function<void()> on_second_blob_head;
+
+    std::optional<RawMeta> head(const String & key, TransportAccess & access) override
+    {
+        if (on_second_blob_head && key.starts_with(blobs_prefix) && ++blob_heads == 2)
+            on_second_blob_head();
+        return InMemoryBackend::head(key, access);
+    }
+
+private:
+    size_t blob_heads = 0;
+};
+
+}
+
+/// A dangling blob held for the late catalog confirmation is not dropped by a deadline in the blob loop:
+/// it is reported unchecked.
+TEST(CASFsckPartial, DeadlineInTheBlobLoopReportsHeldDanglingsAsUnchecked)
+{
+    auto backend = std::make_shared<SecondBlobHeadHookBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/blob_loop_deadline@cas@"};
+    const ManifestRef r = ref(1, 0xB1);
+    const ManifestEntry first = blobEntryFor("a", u128Of("fsck-blob-loop-deadline-a"));
+    const ManifestEntry second = blobEntryFor("b", u128Of("fsck-blob-loop-deadline-b"));
+    writeManifestRaw(*backend, layout, ns, r, {first, second});
+    const uint64_t sequence = publishCommittedTransition(*backend, layout, ns, "tbl", std::nullopt, r);
+    writeFsckCheckpoint(*backend, layout, ns, RefTxnId{1, sequence});
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    /// Both blobs are missing. The first is re-resolved and held; the clock runs out before the second
+    /// one's recheck, so the deadline fires inside the blob loop with one dangling held.
+    backend->blobs_prefix = layout.blobsPrefix();
+    backend->on_second_blob_head = [&]
+    {
+        while (std::chrono::steady_clock::now() <= deadline)
+            std::this_thread::yield();
+    };
+
+    const FsckReport report = runFsck(*store, /*detail=*/true, {}, deadline, /*partial_on_deadline=*/true);
+    ASSERT_TRUE(report.partial);
+    EXPECT_EQ(report.dangling, 0u) << "a finding the catalog did not confirm is not reported as corruption";
+    EXPECT_EQ(report.unchecked, 1u);
+    const String note = "late recheck not confirmed before the deadline";
+    EXPECT_NE(uncheckedNoteContains(report, layout.blobKey(first.ref), note),
+              uncheckedNoteContains(report, layout.blobKey(second.ref), note))
+        << "exactly the first blob of the loop was held";
 }

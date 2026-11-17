@@ -40,6 +40,7 @@ namespace MountLeaseWire
     constexpr WireKey min_active_build_sequence{"min_active_build_sequence"};
     constexpr WireKey gc_fenced{"gc_fenced"};
     constexpr WireKey write_attempt_id{"write_attempt_id"};
+    constexpr WireKey last_unclean_epoch{"last_unclean_epoch"};
 }
 
 namespace
@@ -166,6 +167,8 @@ String encodeMountLease(const MountLease & m)
     writeU64StringField(out, MountLeaseWire::min_active_build_sequence, m.min_active_build_sequence, first);
     writeBoolField(out, MountLeaseWire::gc_fenced, m.gc_fenced, first);
     writeHex128Field(out, MountLeaseWire::write_attempt_id, m.write_attempt_id, first);
+    if (m.last_unclean_epoch)
+        writeU64StringField(out, MountLeaseWire::last_unclean_epoch, *m.last_unclean_epoch, first);
     closeObject(out, first);
     writeChar('\n', out);
     return std::move(out).take();
@@ -215,6 +218,8 @@ MountLease decodeMountLease(std::string_view data)
             m.write_attempt_id = r.readHex128();
             saw_write_attempt_id = true;
         }
+        else if (key == MountLeaseWire::last_unclean_epoch)
+            m.last_unclean_epoch = r.readU64String();
         else
             r.skipUnknown(key);
     }

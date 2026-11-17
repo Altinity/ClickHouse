@@ -8,6 +8,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/ProfileEvents.h>
+#include <IO/Expect404ResponseScope.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/ReadHelpers.h>
 #include <IO/ReadSettings.h>
@@ -1210,6 +1211,76 @@ TEST(CASObjectStorageBackend, ConditionalWriteSelectsSingleAttemptAndLocalStorag
     EXPECT_EQ(ws.object_storage_retry_profile, DB::ObjectStorageRetryProfile::SingleAttempt);
     EXPECT_EQ(ws.s3_max_unexpected_write_error_retries_override, 1u);
     EXPECT_FALSE(tests::makeLocalObjectStorageForTest()->supportsRetryProfile(DB::ObjectStorageRetryProfile::SingleAttempt));
+}
+
+namespace
+{
+
+/// Records, at finalize, whether a 404 is declared expected on the calling thread: that is where a
+/// real object store sends the conditional `PUT` and where the HTTP client decides the log level.
+class Expect404RecordingWriteBuffer final : public DB::WriteBufferFromFileBase
+{
+public:
+    explicit Expect404RecordingWriteBuffer(std::vector<bool> & seen_)
+        : DB::WriteBufferFromFileBase(DB::DBMS_DEFAULT_BUFFER_SIZE, nullptr, 0), seen(seen_)
+    {
+    }
+
+    void sync() override { next(); }
+    std::string getFileName() const override { return "expect-404-recording-write-buffer"; }
+
+private:
+    void nextImpl() override {}
+
+    void finalizeImpl() override
+    {
+        next();
+        seen.push_back(DB::Expect404ResponseScope::is404Expected());
+    }
+
+    std::vector<bool> & seen;
+};
+
+class Expect404RecordingLocalObjectStorage final : public DB::LocalObjectStorage
+{
+public:
+    using DB::LocalObjectStorage::LocalObjectStorage;
+
+    std::unique_ptr<DB::WriteBufferFromFileBase> writeObject(
+        const DB::StoredObject &, DB::WriteMode, std::optional<DB::ObjectAttributes>, size_t, const DB::WriteSettings &) override
+    {
+        return std::make_unique<Expect404RecordingWriteBuffer>(expected_404_at_finalize);
+    }
+
+    std::vector<bool> expected_404_at_finalize;
+};
+
+}
+
+/// An `If-Match` write of a key that a concurrent delete removed answers 404, and
+/// `finalizeConditionalWrite` maps that to a lost precondition. The HTTP client logs an undeclared 404
+/// at Error; a stateless test whose stderr is checked then fails on the log line alone (seen when GC
+/// deleted a blob's `.meta` marker between a writer's read and its `If-Match` write). So the request is
+/// sent under `Expect404ResponseScope`. An `If-None-Match` write names no existing object: a 404 there
+/// is not an ordinary answer and stays loud.
+TEST(CASObjectStorageBackend, IfMatchWriteDeclaresAnAbsentKeyExpected)
+{
+    DB::LocalObjectStorageSettings settings("test", tests::makeLocalObjectStorageForTest()->getCommonKeyPrefix(), /*read_only_=*/false);
+    auto storage = std::make_shared<Expect404RecordingLocalObjectStorage>(std::move(settings));
+    auto backend = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
+
+    DB::WriteSettings if_match = backend->conditionalWriteSettingsForTest();
+    if_match.object_storage_write_if_match = "\"etag\"";
+    ASSERT_TRUE(backend->nativeConditionalPutForTest("k/marker", "v", if_match).has_value());
+
+    DB::WriteSettings if_none_match = backend->conditionalWriteSettingsForTest();
+    if_none_match.object_storage_write_if_none_match = "*";
+    ASSERT_TRUE(backend->nativeConditionalPutForTest("k/marker", "v", if_none_match).has_value());
+
+    ASSERT_EQ(storage->expected_404_at_finalize.size(), 2u);
+    EXPECT_TRUE(storage->expected_404_at_finalize[0]);
+    EXPECT_FALSE(storage->expected_404_at_finalize[1]);
+    EXPECT_FALSE(DB::Expect404ResponseScope::is404Expected());
 }
 
 /// The Native conditional-PUT path discriminates a lost precondition by the canonical S3 error code

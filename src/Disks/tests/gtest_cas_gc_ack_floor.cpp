@@ -177,7 +177,7 @@ TEST(CASSemanticRefFixture, WrapperAdvancesCheckpointWithoutDiscardingSnapshot)
     RefCkpt with_snapshot = before_drop->ckpt;
     with_snapshot.checkpoint_snapshot_id = publish_id;
     ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(
-        store->layout().refCkptKey(life), encodeRefCkpt(with_snapshot), before_drop->etag,
+        store->layout().refCkptKey(life), encodeRefCkptAtGeneration(with_snapshot, 1), before_drop->etag,
         Retry::once())));
 
     const uint64_t drop_sequence = dropRefTransition(*backend, store->layout(), ns, "tbl", manifest);
@@ -934,7 +934,7 @@ void runExpiredMountFenceOutScenario(const PoolConfig & config)
     const String srid2 = "stale-server";
     CasRequests renewer_requests = openRequestsForTest(backend);
     MountLeaseRenewer srid2_renewer(renewer_requests, renewer_requests, layout, srid2, DB::UInt128(0x2222),
-        /*writer_epoch=*/1,
+        /*writer_epoch=*/1, /*last_unclean_epoch=*/0,
         std::chrono::milliseconds(100), [] { return 1000u; }, [] { return 0u; }, {},
         std::chrono::milliseconds(0), [] { return 0u; });
     srid2_renewer.start();
@@ -1077,7 +1077,7 @@ void runSlowWalkSightingScenario(SightingCall sighting_call)
     /// Claims once and never renews: a live-shaped body whose token never changes.
     CasRequests renewer_requests = openRequestsForTest(backend);
     MountLeaseRenewer srid2_renewer(renewer_requests, renewer_requests, layout, srid2, DB::UInt128(0x2222),
-        /*writer_epoch=*/1,
+        /*writer_epoch=*/1, /*last_unclean_epoch=*/0,
         std::chrono::milliseconds(100), [] { return 1000u; }, [] { return 0u; }, {},
         std::chrono::milliseconds(0), [] { return 0u; });
     srid2_renewer.start();
@@ -1134,7 +1134,7 @@ void runLongerDeclaredLeaseScenario(SightingCall early_call)
     const String holder_srid = "long-lease-server";
     CasRequests renewer_requests = openRequestsForTest(backend);
     MountLeaseRenewer holder(renewer_requests, renewer_requests, layout, holder_srid, DB::UInt128(0x3333),
-        /*writer_epoch=*/1, std::chrono::milliseconds(60'000), [] { return 1000u; }, [] { return 0u; }, {},
+        /*writer_epoch=*/1, /*last_unclean_epoch=*/0, std::chrono::milliseconds(60'000), [] { return 1000u; }, [] { return 0u; }, {},
         std::chrono::milliseconds(0), [] { return 0u; });
     holder.start();
     const auto holder_fenced = [&]
@@ -1225,7 +1225,7 @@ TEST(CASGCAckFloor, DefaultMonoClockTracksPoolsInjectedBootClockNotWallClock)
     const String srid2 = "stale-server";
     CasRequests renewer_requests = openRequestsForTest(backend);
     MountLeaseRenewer srid2_renewer(renewer_requests, renewer_requests, layout, srid2, DB::UInt128(0x2222),
-        /*writer_epoch=*/1,
+        /*writer_epoch=*/1, /*last_unclean_epoch=*/0,
         std::chrono::milliseconds(100), [] { return 1000u; },
         [fake_boot]
         {
@@ -1458,8 +1458,8 @@ TEST(CASGCCondemnMarker, SwallowedMarkerWriteCarriesEntryInsteadOfDeleting)
 
     /// THE FAULT IS PERMANENT, so every condemn-marker write runs the engine's WHOLE retry window, and
     /// that window has to run on a clock this test advances. A zeroed sleep alone does not do it: the
-    /// deadline is still measured against the real clock, so the loop would spin hot for ninety real
-    /// seconds per marker write. The sleep therefore moves the clock past its own pause -- plus one
+    /// deadline is still measured against the real clock, so the loop would spin hot for a real
+    /// request window per marker write. The sleep therefore moves the clock past its own pause -- plus one
     /// millisecond, because full-jitter backoff may draw zero and a clock that never moves never closes
     /// the window. Scoped to the GC plane, which is where `writeCondemnedMeta` runs, so the mount
     /// plane's lease-bound policies keep their real clock.
@@ -1715,7 +1715,7 @@ TEST(CASGCLeaseMismatch, RoundWarnsOnceAboutAHolderWithADifferentLease)
     const String holder_srid = "short-lease-server";
     CasRequests renewer_requests = openRequestsForTest(backend);
     MountLeaseRenewer holder(renewer_requests, renewer_requests, layout, holder_srid, DB::UInt128(0x2222),
-        /*writer_epoch=*/1,
+        /*writer_epoch=*/1, /*last_unclean_epoch=*/0,
         std::chrono::milliseconds(100), [] { return 1000u; }, [] { return 0u; }, {},
         std::chrono::milliseconds(0), [] { return 0u; });
     holder.start();

@@ -149,10 +149,14 @@
   check_types:
   - asan
 - name: 03572_export_merge_tree_part_limits_and_table_functions
-  reason: 'INVESTIGATE - Unstable on tsan'
+  reason: 'INVESTIGATE - Exceeds its 60 s export wait on the loaded sanitizer cas-s3 lanes (ASan: 2 of
+    2 runs at 600 s; MSan: 2 of 3 runs failed at 482 s). Runs killed at 600 s match the generic
+    sanitizer timeout rule; this one matches only failures whose output shows the export wait line (`timeout: 60s`)'
   message: 'timeout: 60s'
   check_types:
   - tsan
+  - msan
+  - asan
 - name: 00157_cache_dictionary
   reason: 'KNOWN: Timeout on slow Altinity runners (passes upstream)'
   message: 'DB::Exception: Timeout exceeded'

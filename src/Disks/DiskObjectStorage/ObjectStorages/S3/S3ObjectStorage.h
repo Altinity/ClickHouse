@@ -198,7 +198,7 @@ public:
 
     void pinConditionalOpsGenerationDialect(bool expect_generation_tokens) override;
 
-    std::optional<bool> isBucketVersioningEnabled() const override;
+    std::optional<bool> isBucketVersioningEnabled(const ObjectStorageControlRequest & control_request) const override;
 
     bool supportsRetryProfile(ObjectStorageRetryProfile) const override { return true; }
 
