@@ -27,6 +27,9 @@ struct ObjectStorageIdentity
     /// Cumulative start offset of each multipart part (part i covers [part_offsets[i], part_offsets[i+1])).
     /// Empty when unknown or the object is a single PUT.
     std::vector<UInt64> part_offsets;
+    /// Orders stores of this key. A fetch that started earlier must not overwrite one that started later.
+    /// Not part of the object's identity.
+    UInt64 fetch_seq = 0;
 
     size_t memoryUsage() const
     {
@@ -67,9 +70,10 @@ inline String makeObjectStorageIdentityCacheKey(std::string_view endpoint, std::
 ///
 /// It is owned by the global Context (see Context::getObjectStorageIdentityCache), sized from server
 /// settings, and cleared by `SYSTEM DROP OBJECT STORAGE IDENTITY CACHE`. A write, copy, or delete by
-/// this server removes the entry and advances the epoch. A metadata fetch reads the epoch before its
-/// request and stores its result only if the epoch is unchanged, so a fetch that started before a
-/// replacement cannot put the old identity back. The next read of that key requests the metadata again.
+/// this server, and a read that finds the object replaced or missing, removes the entry and advances
+/// the epoch. A metadata fetch takes `beginFetch` before its request and stores its result only if
+/// that epoch is unchanged and no fetch of the same key started later, so an older observation cannot
+/// put a stale identity back. The next read of that key requests the metadata again.
 /// Low-level object-storage code reaches the cache via Context::getGlobalContextInstance() and must
 /// tolerate a null pointer (no global context yet) by simply issuing the metadata request uncached.
 class ObjectStorageIdentityCache
@@ -83,11 +87,18 @@ public:
     /// Look up an identity by `makeObjectStorageIdentityCacheKey`. Increments the hit/miss ProfileEvents.
     std::optional<ObjectStorageIdentity> tryGet(const String & key);
 
-    /// The current epoch. A fetch captures this before the request and passes it to `setIfEpoch`.
-    UInt64 currentEpoch() const;
+    /// Epoch at the start of a metadata fetch, and a sequence that orders that fetch against others.
+    struct Read
+    {
+        UInt64 epoch = 0;
+        UInt64 seq = 0;
+    };
 
-    /// Store `identity` only when `epoch` is still the epoch `currentEpoch` returned.
-    void setIfEpoch(const String & key, ObjectStorageIdentity identity, UInt64 epoch);
+    /// Call before the metadata request and pass the result to `setIfEpoch`.
+    Read beginFetch();
+
+    /// Store `identity` only when `read.epoch` is still current and no later fetch of `key` has stored.
+    void setIfEpoch(const String & key, ObjectStorageIdentity identity, Read read);
 
     /// Advance the epoch and drop the entry. A fetch already in flight will not put the old identity back.
     void invalidate(const String & key);
@@ -101,6 +112,8 @@ private:
     /// Advanced by every `invalidate` and `clear`. Guarded by `epoch_mutex`. It is never reset, so a
     /// fetch in flight can never match a later epoch by accident.
     UInt64 epoch = 0;
+    /// Advanced by every `beginFetch`. Guarded by `epoch_mutex`.
+    UInt64 next_fetch_seq = 0;
 };
 
 using ObjectStorageIdentityCachePtr = std::shared_ptr<ObjectStorageIdentityCache>;

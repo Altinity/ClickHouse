@@ -41,17 +41,21 @@ std::optional<ObjectStorageIdentity> ObjectStorageIdentityCache::tryGet(const St
     return std::nullopt;
 }
 
-UInt64 ObjectStorageIdentityCache::currentEpoch() const
+ObjectStorageIdentityCache::Read ObjectStorageIdentityCache::beginFetch()
 {
     std::lock_guard lock(epoch_mutex);
-    return epoch;
+    return Read{epoch, ++next_fetch_seq};
 }
 
-void ObjectStorageIdentityCache::setIfEpoch(const String & key, ObjectStorageIdentity identity, UInt64 expected_epoch)
+void ObjectStorageIdentityCache::setIfEpoch(const String & key, ObjectStorageIdentity identity, Read read)
 {
     std::lock_guard lock(epoch_mutex);
-    if (epoch != expected_epoch)
+    if (epoch != read.epoch)
         return;
+    /// `Base::get` takes the cache mutex after `epoch_mutex`, the same order as `set` and `remove`.
+    if (auto existing = Base::get(key); existing && existing->fetch_seq > read.seq)
+        return;
+    identity.fetch_seq = read.seq;
     Base::set(key, std::make_shared<ObjectStorageIdentity>(std::move(identity)));
 }
 

@@ -359,6 +359,10 @@ std::unique_ptr<ReadBufferFromFileBase> S3ObjectStorage::readObject( /// NOLINT
         }
     }
 
+    /// The buffer can outlive this storage. A GET that finds the object replaced or missing drops the
+    /// cached identity, so the next read requests the metadata again instead of reusing it.
+    const String identity_key = makeObjectStorageIdentityCacheKey(uri.endpoint, uri.bucket, object.remote_path);
+
     return std::make_unique<ReadBufferFromS3>(
         clientForRetryProfile(ObjectStorageControlRequest{
             .profile = read_settings.object_storage_retry_profile,
@@ -380,7 +384,13 @@ std::unique_ptr<ReadBufferFromFileBase> S3ObjectStorage::readObject( /// NOLINT
         (object.bytes_size && object.bytes_size != StoredObject::UnknownSize) ? std::optional<size_t>(object.bytes_size) : std::nullopt,
         refresh_callback,
         std::move(blob_storage_log),
-        object.etag);
+        object.etag,
+        [identity_key]()
+        {
+            if (auto global_context = Context::getGlobalContextInstance())
+                if (auto cache = global_context->getObjectStorageIdentityCache())
+                    cache->invalidate(identity_key);
+        });
 }
 
 SmallObjectDataWithMetadata S3ObjectStorage::readSmallObjectAndGetObjectMetadata( /// NOLINT
@@ -1032,11 +1042,12 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
         }
     }
 
-    /// Captured before the request. `setIfEpoch` stores the result only while the epoch is unchanged,
-    /// so a write, copy, delete, or drop that lands during the request cannot be undone by this fetch.
-    UInt64 identity_epoch = 0;
+    /// Captured before the request. `setIfEpoch` stores the result only while this epoch is unchanged
+    /// and no later fetch of the same key has stored, so a write, copy, delete, drop, or an older
+    /// observation cannot put a stale identity back.
+    ObjectStorageIdentityCache::Read identity_read;
     if (identity_cache)
-        identity_epoch = identity_cache->currentEpoch();
+        identity_read = identity_cache->beginFetch();
 
     auto settings_ptr = s3_settings.get();
 
@@ -1112,7 +1123,7 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
         identity_cache->setIfEpoch(
             identity_key,
             ObjectStorageIdentity{result.etag, result.size_bytes, result.is_size_known, result.part_offsets},
-            identity_epoch);
+            identity_read);
     }
 
     return result;
