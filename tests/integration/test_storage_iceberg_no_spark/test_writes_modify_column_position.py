@@ -120,7 +120,7 @@ def test_modify_column_unrecordable_type_with_position_rejected(started_cluster_
 
     for clause in ["FIRST", "AFTER a"]:
         error = instance.query_and_get_error(
-            f"ALTER TABLE {TABLE_NAME} MODIFY COLUMN c UInt32 {clause};",
+            f"ALTER TABLE {TABLE_NAME} MODIFY COLUMN c UInt16 {clause};",
             settings=INSERT_SETTINGS,
         )
         assert "BAD_ARGUMENTS" in error, error
@@ -180,7 +180,7 @@ def test_modify_column_complex_type_with_position(started_cluster_iceberg_no_spa
 
     for clause in ["FIRST", "AFTER x"]:
         error = instance.query_and_get_error(
-            f"ALTER TABLE {TABLE_NAME} MODIFY COLUMN t Tuple(a UInt32) {clause};",
+            f"ALTER TABLE {TABLE_NAME} MODIFY COLUMN t Tuple(a UInt16) {clause};",
             settings=INSERT_SETTINGS,
         )
         assert "BAD_ARGUMENTS" in error, error
