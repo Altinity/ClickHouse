@@ -1914,7 +1914,8 @@ def test_distributed_join_dispatch_falls_back(started_cluster):
     test_ref = f"test_distributed_join_fallback_{uuid.uuid4()}"
     fact, _, _ = _setup_distributed_join_tables(started_cluster, [node1], test_ref)
 
-    local_table = f"{test_ref}_local"
+    # `test_ref` carries a UUID with hyphens, which is not a valid unquoted identifier.
+    local_table = f"{test_ref.replace('-', '_')}_local"
     node1.query(f"CREATE TABLE {local_table} (id Int32, city String) ENGINE = Memory()")
     node1.query(f"INSERT INTO {local_table} VALUES (1, 'berlin'), (2, 'paris'), (3, 'berlin')")
 
