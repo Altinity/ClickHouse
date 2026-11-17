@@ -58,7 +58,9 @@ if (ARCH_AARCH64)
     # and the build machine is too old, i.e. doesn't satisfy above modern profile, then these intermediate binaries will not run (dump
     # SIGILL). Even if they could run, the build machine wouldn't be able to run the ClickHouse binary. In that case, suggest to run the
     # build with the compat profile.
-    if (OS_LINUX AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(aarch64.*|AARCH64.*|arm64.*|ARM64.*)" AND NOT NO_ARMV81_OR_HIGHER)
+    # `OS_LINUX` follows the target system, so a Darwin host cross-compiling for Linux matches it too. `/proc/cpuinfo` exists only on a
+    # Linux host, and host tools in that cross build are compiled for the Mac rather than with the target `-march`.
+    if (OS_LINUX AND CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(aarch64.*|AARCH64.*|arm64.*|ARM64.*)" AND NOT NO_ARMV81_OR_HIGHER)
         # CPU features in /proc/cpuinfo and compiler flags don't align :( ... pick an obvious flag contained in the modern but not in the
         # legacy profile (full Graviton 3 /proc/cpuinfo is "fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm
         # jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm ssbs paca pacg dcpodp svei8mm svebf16 i8mm
