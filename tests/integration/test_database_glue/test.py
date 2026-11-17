@@ -2251,3 +2251,104 @@ def test_catalog_schema_with_empty_column_name_is_rejected(started_cluster):
     assert node.query("SELECT 1") == "1\n"
 
     node.query(f"DROP DATABASE IF EXISTS {db_name} SYNC")
+
+
+def test_optimize_manifest_glue_update_fails(started_cluster):
+    """`OPTIMIZE TABLE ... MANIFEST` must not delete the files of a snapshot that is visible in storage.
+
+    For Glue the compacted metadata file is written to storage before the catalog pointer is updated.
+    When Glue then rejects the update (e.g. a `VersionId` mismatch with a concurrent commit), the new
+    snapshot is already the latest one in storage, so its manifests must stay in place.
+    https://github.com/Altinity/ClickHouse/issues/2416
+    """
+    import gzip
+    import io
+    import re
+
+    import avro.datafile
+    import avro.io
+
+    node = started_cluster.instances["node1"]
+    minio_client = started_cluster.minio_client
+    bucket = "warehouse-glue"
+
+    test_ref = f"test_optimize_manifest_glue_{uuid.uuid4()}"
+    table_name = f"{test_ref}_table"
+    root_namespace = f"{test_ref}_namespace"
+    table_ref = f"{CATALOG_NAME}.`{root_namespace}.{table_name}`"
+    write_settings = {"allow_insert_into_iceberg": 1, "write_full_path_in_iceberg_metadata": 1}
+
+    create_clickhouse_glue_database(started_cluster, node, CATALOG_NAME)
+    create_clickhouse_glue_table(started_cluster, node, root_namespace, table_name, "(x String)")
+
+    num_inserts = 5
+    for i in range(num_inserts):
+        node.query(f"INSERT INTO {table_ref} VALUES ('row{i}');", settings=write_settings)
+    rows_before = node.query(f"SELECT x FROM {table_ref} ORDER BY x")
+
+    def object_key(path):
+        if path.startswith("s3://"):
+            path_bucket, key = path[len("s3://"):].split("/", 1)
+        else:
+            match = re.match(r"^https?://[^/]+/([^/]+)/(.+)$", path)
+            assert match, f"unexpected object path {path}"
+            path_bucket, key = match.group(1), match.group(2)
+        assert path_bucket == bucket, path
+        return key
+
+    def latest_metadata():
+        versions = {}
+        for o in minio_client.list_objects(bucket, prefix=f"{table_name}/metadata/", recursive=True):
+            match = re.search(r"/v(\d+)[^/]*\.metadata\.json$", o.object_name)
+            if match:
+                versions[int(match.group(1))] = o.object_name
+        assert versions, f"no metadata files for {table_name}"
+        data = minio_client.get_object(bucket, versions[max(versions)]).read()
+        if data[:2] == b"\x1f\x8b":
+            data = gzip.decompress(data)
+        return json.loads(data)
+
+    def read_avro(path):
+        data = minio_client.get_object(bucket, object_key(path)).read()
+        with avro.datafile.DataFileReader(io.BytesIO(data), avro.io.DatumReader()) as reader:
+            return list(reader)
+
+    snapshot_id_before = latest_metadata()["current-snapshot-id"]
+
+    failpoint = "iceberg_glue_update_table_fail"
+    node.query(f"SYSTEM ENABLE FAILPOINT {failpoint}")
+    try:
+        error = node.query_and_get_error(
+            f"OPTIMIZE TABLE {table_ref} MANIFEST",
+            settings={
+                "allow_experimental_iceberg_compaction": 1,
+                "iceberg_manifest_min_count_to_compact": 2,
+                **write_settings,
+            },
+        )
+    finally:
+        node.query(f"SYSTEM DISABLE FAILPOINT {failpoint}")
+    assert "rejected the update of the table pointer" in error, error
+
+    # The compacted snapshot is the latest one in storage, and every file it names must still exist.
+    metadata = latest_metadata()
+    current_snapshot_id = metadata["current-snapshot-id"]
+    assert current_snapshot_id != snapshot_id_before
+    current_snapshot = next(s for s in metadata["snapshots"] if s["snapshot-id"] == current_snapshot_id)
+    assert current_snapshot["summary"]["operation"] == "replace"
+
+    manifests = [record["manifest_path"] for record in read_avro(current_snapshot["manifest-list"])]
+    assert 0 < len(manifests) < num_inserts, f"expected consolidated manifests, got {manifests}"
+    for manifest in manifests:
+        minio_client.stat_object(bucket, object_key(manifest))
+
+    node.query("SYSTEM DROP ICEBERG METADATA CACHE")
+
+    # Readers of the storage layout see the compacted snapshot.
+    storage_rows = node.query(
+        f"SELECT x FROM icebergS3('http://minio1:9001/{bucket}/{table_name}/', '{minio_access_key}', '{minio_secret_key}') ORDER BY x"
+    )
+    assert storage_rows == rows_before
+
+    # The catalog still names the previous metadata, whose files are untouched.
+    assert node.query(f"SELECT x FROM {table_ref} ORDER BY x") == rows_before
