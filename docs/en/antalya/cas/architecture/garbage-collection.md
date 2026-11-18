@@ -431,9 +431,12 @@ forensic outcome logs.
 - **Fails the round if:** a backend delete marker appears in a response — object versioning on a
   mis-provisioned pool (`LOGICAL_ERROR`)
 - **Observability:** phase row `pending_deletes`; metrics `deleted`, `absent`, `redeleted`,
-  `graduated`, `replaced`, `spared`, `outcome_logs_written`, `outcome_rows_dropped`, `delete_batches`. `delete_batches`
-  counts logical conditional-delete chunks submitted by GC. `DiskS3DeleteObjects` counts physical S3
-  delete attempts, including request retries
+  `graduated`, `replaced`, `spared`, `outcome_logs_written`, `outcome_rows_dropped`, `delete_chunks`. `delete_chunks`
+  counts logical conditional-delete chunks, including sequential execution. `read_blob_jobs_scheduled`
+  and `delete_chunk_jobs_scheduled` count successfully enqueued read jobs and delete chunk jobs,
+  respectively. Jobs that later fail still count; enqueue failures do not. Both counters are zero
+  on the sequential path, including a wave with only one job. `DiskS3DeleteObjects` counts physical
+  S3 delete attempts, including request retries
 
 GC reports read-job failures after all submitted blob-state reads finish, before starting the
 conditional-delete wave. It reports delete-job failures after all submitted delete chunks finish.
@@ -444,9 +447,20 @@ all objects in the chunk remain present.
 Read failures do not prevent deletion of successfully read siblings. After both waves, GC records
 known outcomes and schedules eligible `.meta` cleanup, then rethrows the original job or enqueue
 exception with the lowest input blob index. An unsuccessful round leaves the previously published
-pending entries available to the next round. The existing `jobs_failed` metric and
-`CASGCRetiredRedeleteFailed` event count each failed blob from an executed job, but count an enqueue
-failure once per wave, regardless of the number of unsubmitted blobs reported in its warning.
+pending entries available to the next round.
+
+The `read_blob_jobs_failed` and `delete_chunk_jobs_failed` metrics count jobs that finish with an
+exception, including inline execution. A failed delete chunk contributes one job failure, regardless
+of its number of blobs. The `read_blob_job_schedule_failures` and `delete_chunk_job_schedule_failures`
+metrics each count enqueue refusals, not the number of unsubmitted jobs or blobs. Retries do not
+create extra logical jobs; `Gone` and `Mismatch` are normal outcomes, not job failures. These four
+metrics replace the former `jobs_failed` aggregate and are emitted even when the phase throws.
+Because inline jobs are included only in the execution-failure counters, the scheduling counters
+cannot be used as their denominators for an error rate.
+
+The `RoundReport::redelete_failed` field and `CASGCRetiredRedeleteFailed` event retain their existing
+units: each failed blob from an executed job counts once, while an enqueue failure counts once per
+wave regardless of the number of unsubmitted blobs reported in its warning.
 
 The project RustFS integration backend supports exact-token singleton deletes but does not implement
 AWS per-object `ETag` conditions in `DeleteObjects`. Its mount probe therefore keeps one-key chunks;

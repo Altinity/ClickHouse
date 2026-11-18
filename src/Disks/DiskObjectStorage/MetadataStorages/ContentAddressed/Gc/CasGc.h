@@ -827,7 +827,12 @@ private:
         RoundReport & report;
         std::map<uint64_t, OutcomeLog> & outcomes;
         std::map<uint64_t, OutcomeTally> & outcome_tallies;
-        uint64_t & jobs_scheduled;
+        uint64_t & read_blob_jobs_scheduled;
+        uint64_t & delete_chunk_jobs_scheduled;
+        uint64_t & read_blob_jobs_failed;
+        uint64_t & delete_chunk_jobs_failed;
+        uint64_t & read_blob_job_schedule_failures;
+        uint64_t & delete_chunk_job_schedule_failures;
         uint64_t & delete_chunks;
     };
 

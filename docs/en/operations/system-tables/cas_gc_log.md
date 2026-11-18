@@ -81,7 +81,7 @@ The phases, in execution order:
 | `fold_ref_intake` | Read and fold every new ref log and the manifest bodies its edges name. | one `GET` per new log, one `GET` per manifest edge |
 | `fold_reduce` | The per-shard in-degree merge: condemn, spare, graduate. | prior-run streaming `GET`s, one `HEAD` per zero-transition candidate, run `PUT`s |
 | `fold_seal_write` | Publish the new fold seal. | one `PUT` |
-| `pending_deletes` | The single content-delete site: exact-token deletes of previously published `delete_pending` entries, plus the outcome logs. `phase_metrics` carries `jobs_scheduled` (entries submitted to the parallel observation wave; `0` for no candidates or sequential execution), `jobs_failed`, and `delete_batches` (logical conditional-delete chunks). Unsupported or unprobed storage uses one-key chunks. | one `HEAD` per entry, conditional delete chunks, one outcome-log `PUT` per shard with rows |
+| `pending_deletes` | The single content-delete site: exact-token deletes of previously published `delete_pending` entries, plus the outcome logs. `phase_metrics` carries `read_blob_jobs_scheduled` and `delete_chunk_jobs_scheduled` (read jobs and delete chunk jobs successfully enqueued in the parallel pool), separate execution and enqueue failure counters described below, and `delete_chunks` (logical conditional-delete chunks, including sequential execution). Both scheduling counters are `0` on the sequential path, including waves with at most one job. Unsupported or unprobed storage uses one-key chunks. | one `HEAD` per entry, conditional delete chunks, one outcome-log `PUT` per shard with rows |
 | `meta_pool_wait` | Drain the round's per-hash freshness-meta writes. | none on this thread — see the caveat below |
 | `round_commit` | The generation-retention prune and the round's single `gc/state` compare-and-swap. | prune `LIST`s and deletes, one compare-and-swap |
 | `handoff_reclaim` | Wholesale-reclaim generations a moved run ref stranded below the retention cursor. | prefix `LIST`s and deletes |
@@ -124,6 +124,12 @@ WHERE round_id = '...' AND event_type = 'Phase'
 ORDER BY event_time_microseconds;
 ```
 
+For `pending_deletes`, the former `jobs_scheduled` key is now `read_blob_jobs_scheduled`, and
+`delete_batches` is now `delete_chunks`. The former `jobs_failed` aggregate is replaced by separate
+read/delete execution and enqueue failure counters below. Queries over older rows must use the
+keys written by that server version. Other phases, including
+`meta_pool_wait`, retain their existing keys.
+
 Two caveats when reading these rows:
 
 - Work scheduled onto the GC meta pool runs on other threads, so the `meta_pool_wait` row's
@@ -132,11 +138,18 @@ Two caveats when reading these rows:
 - Requests issued by GC I/O pool workers — the `pending_deletes` fan-out and the fold read-ahead of
   `fold_ref_intake` and `fold_reduce` — also run on other threads and are missing from those phase
   rows' `ProfileEvents`. They still count in `system.events`. On `pending_deletes`, read
-  `phase_metrics` `jobs_scheduled` / `jobs_failed` next to `redeleted`.
-  `jobs_failed` counts failed blobs from executed read/delete jobs, plus one per enqueue failure.
-  A failed chunk with multiple blobs therefore contributes multiple failures, while an unsubmitted
-  tail contributes one enqueue failure. GC warning messages distinguish these cases: read errors
-  are reported after the read wave completes, and delete errors after the delete wave completes.
+  `phase_metrics` `read_blob_jobs_scheduled` / `delete_chunk_jobs_scheduled` next to `redeleted`.
+  The two scheduling counters include enqueued jobs that fail during execution; they exclude jobs
+  whose enqueue failed and jobs executed inline. `read_blob_jobs_failed` and `delete_chunk_jobs_failed`
+  count jobs that finish with an exception, including inline jobs. A failed multi-blob chunk counts
+  once. These execution-failure counters can therefore be nonzero when the scheduling counters are
+  zero; the latter are not error-rate denominators. `read_blob_job_schedule_failures` and
+  `delete_chunk_job_schedule_failures` count enqueue refusals once each, regardless of the number of
+  unsubmitted jobs or blobs. Retries do not multiply logical job counts. All four failure counters
+  are emitted, including zeros and phase exits with an exception. Read errors are reported after
+  the read wave completes, and delete errors after the delete wave completes. The `Finish` row's
+  `entries_redelete_failed` and `CASGCRetiredRedeleteFailed` retain the legacy units: failed blobs
+  from executed jobs plus one per enqueue refusal.
 - Phase durations do not sum to the round's `duration_ms`. The round also performs untimed
   bookkeeping between phases, and the `Finish` row's `duration_ms` remains the authority on total
   round time.

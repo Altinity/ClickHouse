@@ -414,8 +414,12 @@ TEST(CASGCRedeleteConcurrency, ParallelRedeleteReclaimsEveryBlob)
     EXPECT_EQ(redeleted, kBlobs);
     EXPECT_EQ(deleted, kBlobs);
     EXPECT_EQ(redelete_failed, 0u);
-    EXPECT_EQ(rows->total("jobs_scheduled"), kBlobs);
-    EXPECT_EQ(rows->total("jobs_failed"), 0u);
+    EXPECT_EQ(rows->total("read_blob_jobs_scheduled"), kBlobs);
+    EXPECT_EQ(rows->total("delete_chunk_jobs_scheduled"), kBlobs);
+    EXPECT_EQ(rows->total("read_blob_jobs_failed"), 0u);
+    EXPECT_EQ(rows->total("delete_chunk_jobs_failed"), 0u);
+    EXPECT_EQ(rows->total("read_blob_job_schedule_failures"), 0u);
+    EXPECT_EQ(rows->total("delete_chunk_job_schedule_failures"), 0u);
 }
 
 TEST(CASGCRedeleteConcurrency, ConditionalDeleteBatchesAreRecorded)
@@ -434,7 +438,17 @@ TEST(CASGCRedeleteConcurrency, ConditionalDeleteBatchesAreRecorded)
 
     EXPECT_EQ(rep.deleted, kBlobs);
     ASSERT_EQ(rows->rows.size(), 1u);
-    EXPECT_EQ(rows->total("delete_batches"), 3u);
+    EXPECT_EQ(rows->total("read_blob_jobs_scheduled"), kBlobs);
+    EXPECT_EQ(rows->total("delete_chunk_jobs_scheduled"), 3u);
+    EXPECT_EQ(rows->total("delete_chunks"), 3u);
+    ASSERT_TRUE(rows->lastRowHas("read_blob_jobs_failed"));
+    EXPECT_EQ(rows->total("read_blob_jobs_failed"), 0u);
+    ASSERT_TRUE(rows->lastRowHas("delete_chunk_jobs_failed"));
+    EXPECT_EQ(rows->total("delete_chunk_jobs_failed"), 0u);
+    ASSERT_TRUE(rows->lastRowHas("read_blob_job_schedule_failures"));
+    EXPECT_EQ(rows->total("read_blob_job_schedule_failures"), 0u);
+    ASSERT_TRUE(rows->lastRowHas("delete_chunk_job_schedule_failures"));
+    EXPECT_EQ(rows->total("delete_chunk_job_schedule_failures"), 0u);
 }
 
 TEST(CASGCRedeleteConcurrency, DeleteWaveEnqueueRefusalWaitsForSubmittedChunks)
@@ -498,8 +512,19 @@ TEST(CASGCRedeleteConcurrency, ConcurrencyOneDeletesSequentially)
     EXPECT_TRUE(allBlobsAbsent(*backend, *store));
     EXPECT_EQ(backend->blobRemoves(), kBlobs);
     EXPECT_EQ(backend->peakInFlight(), 1u);
-    ASSERT_TRUE(rows->lastRowHas("jobs_scheduled"));
-    EXPECT_EQ(rows->total("jobs_scheduled"), 0u) << "concurrency 1 must not use the pool";
+    ASSERT_TRUE(rows->lastRowHas("read_blob_jobs_scheduled"));
+    ASSERT_TRUE(rows->lastRowHas("delete_chunk_jobs_scheduled"));
+    EXPECT_EQ(rows->total("read_blob_jobs_scheduled"), 0u) << "concurrency 1 must not use the pool";
+    EXPECT_EQ(rows->total("delete_chunk_jobs_scheduled"), 0u);
+    EXPECT_EQ(rows->total("delete_chunks"), kBlobs);
+    ASSERT_TRUE(rows->lastRowHas("read_blob_jobs_failed"));
+    EXPECT_EQ(rows->total("read_blob_jobs_failed"), 0u);
+    ASSERT_TRUE(rows->lastRowHas("delete_chunk_jobs_failed"));
+    EXPECT_EQ(rows->total("delete_chunk_jobs_failed"), 0u);
+    ASSERT_TRUE(rows->lastRowHas("read_blob_job_schedule_failures"));
+    EXPECT_EQ(rows->total("read_blob_job_schedule_failures"), 0u);
+    ASSERT_TRUE(rows->lastRowHas("delete_chunk_job_schedule_failures"));
+    EXPECT_EQ(rows->total("delete_chunk_job_schedule_failures"), 0u);
 }
 
 TEST(CASGCRedeleteConcurrency, WorkerRemoveFaultKeepsSiblingOutcomesAndPoolAlive)
@@ -870,9 +895,12 @@ TEST(CASGCRedeleteConcurrency, TwoWorkerFailuresAreEachCountedAndTheRoundThrowsO
     EXPECT_EQ(progress.redeleted, kBlobs - 2);
     EXPECT_EQ(progress.redelete_failed, 2u);
     ASSERT_EQ(rows->rows.size(), 1u);
-    ASSERT_TRUE(rows->lastRowHas("jobs_failed")) << "the phase metrics must survive the round's exception";
-    EXPECT_EQ(rows->total("jobs_scheduled"), kBlobs);
-    EXPECT_EQ(rows->total("jobs_failed"), 2u);
+    ASSERT_TRUE(rows->lastRowHas("delete_chunk_jobs_failed")) << "the phase metrics must survive the round's exception";
+    EXPECT_EQ(rows->total("read_blob_jobs_scheduled"), kBlobs);
+    EXPECT_EQ(rows->total("read_blob_jobs_failed"), 0u);
+    EXPECT_EQ(rows->total("delete_chunk_jobs_failed"), 2u);
+    EXPECT_EQ(rows->total("read_blob_job_schedule_failures"), 0u);
+    EXPECT_EQ(rows->total("delete_chunk_job_schedule_failures"), 0u);
     expectBodiesPresentOnlyFor(*backend, *store, {kFaultedBlob, kReplacedBlob});
 
     const RoundReport next = runRegularRoundReclaiming(gc);
@@ -945,9 +973,13 @@ TEST(CASGCRedeleteConcurrency, FailuresAreReportedAfterTheirWaveAndRethrowLowest
         EXPECT_EQ(progress.redeleted, 3u);
         EXPECT_EQ(progress.redelete_failed, 3u);
         EXPECT_EQ(failedCounter() - failed_before, 3u);
-        EXPECT_EQ(rows->total("jobs_failed"), 3u);
-        EXPECT_EQ(rows->total("delete_batches"), 3u);
-        EXPECT_EQ(rows->total("jobs_scheduled"), concurrency == 1 ? 0u : kBlobs);
+        EXPECT_EQ(rows->total("read_blob_jobs_failed"), 1u);
+        EXPECT_EQ(rows->total("delete_chunk_jobs_failed"), 1u);
+        EXPECT_EQ(rows->total("read_blob_job_schedule_failures"), 0u);
+        EXPECT_EQ(rows->total("delete_chunk_job_schedule_failures"), 0u);
+        EXPECT_EQ(rows->total("delete_chunks"), 3u);
+        EXPECT_EQ(rows->total("read_blob_jobs_scheduled"), concurrency == 1 ? 0u : kBlobs);
+        EXPECT_EQ(rows->total("delete_chunk_jobs_scheduled"), concurrency == 1 ? 0u : 3u);
         EXPECT_EQ(previewPendingDeletes(gc).size(), kBlobs);
         for (size_t i = 0; i < preview.size(); ++i)
         {
@@ -968,8 +1000,10 @@ TEST(CASGCRedeleteConcurrency, EnqueueFailuresIdentifyWaveAndUnscheduledBlobCoun
         size_t refused_job;
         size_t deleted;
         size_t unscheduled;
+        size_t read_blob_jobs_scheduled;
+        size_t delete_chunk_jobs_scheduled;
     };
-    for (const Case test : {Case{false, 0, 0, 6}, Case{false, 3, 3, 3}, Case{true, 0, 0, 6}, Case{true, 1, 4, 2}})
+    for (const Case test : {Case{false, 0, 0, 6, 0, 0}, Case{false, 3, 3, 3, 3, 0}, Case{true, 0, 0, 6, 6, 0}, Case{true, 1, 4, 2, 6, 1}})
     {
         SCOPED_TRACE(test.delete_wave);
         SCOPED_TRACE(test.refused_job);
@@ -997,7 +1031,14 @@ TEST(CASGCRedeleteConcurrency, EnqueueFailuresIdentifyWaveAndUnscheduledBlobCoun
         EXPECT_EQ(progress.redeleted, test.deleted);
         EXPECT_EQ(progress.redelete_failed, 1u);
         EXPECT_EQ(failedCounter() - failed_before, 1u);
-        EXPECT_EQ(rows->total("jobs_failed"), 1u);
+        ASSERT_TRUE(rows->lastRowHas("read_blob_jobs_scheduled"));
+        ASSERT_TRUE(rows->lastRowHas("delete_chunk_jobs_scheduled"));
+        EXPECT_EQ(rows->total("read_blob_jobs_scheduled"), test.read_blob_jobs_scheduled);
+        EXPECT_EQ(rows->total("delete_chunk_jobs_scheduled"), test.delete_chunk_jobs_scheduled);
+        EXPECT_EQ(rows->total("read_blob_jobs_failed"), 0u);
+        EXPECT_EQ(rows->total("delete_chunk_jobs_failed"), 0u);
+        EXPECT_EQ(rows->total("read_blob_job_schedule_failures"), test.delete_wave ? 0u : 1u);
+        EXPECT_EQ(rows->total("delete_chunk_job_schedule_failures"), test.delete_wave ? 1u : 0u);
         EXPECT_EQ(previewPendingDeletes(gc).size(), kBlobs);
         store->renewWatermarkOnce();
         EXPECT_EQ(runRegularRoundReclaiming(gc).redeleted, kBlobs);
@@ -1026,8 +1067,11 @@ TEST(CASGCRedeleteConcurrency, WorkerHeadFaultIsCountedAndRetriedNextRound)
     EXPECT_EQ(progress.redeleted, kBlobs - 1);
     EXPECT_EQ(progress.redelete_failed, 1u);
     ASSERT_EQ(rows->rows.size(), 1u);
-    EXPECT_EQ(rows->total("jobs_scheduled"), kBlobs);
-    EXPECT_EQ(rows->total("jobs_failed"), 1u);
+    EXPECT_EQ(rows->total("read_blob_jobs_scheduled"), kBlobs);
+    EXPECT_EQ(rows->total("read_blob_jobs_failed"), 1u);
+    EXPECT_EQ(rows->total("delete_chunk_jobs_failed"), 0u);
+    EXPECT_EQ(rows->total("read_blob_job_schedule_failures"), 0u);
+    EXPECT_EQ(rows->total("delete_chunk_job_schedule_failures"), 0u);
     expectBodiesPresentOnlyFor(*backend, *store, {kFaultedBlob});
 
     const RoundReport next = runRegularRoundReclaiming(gc);
@@ -1082,9 +1126,12 @@ TEST(CASGCRedeleteConcurrency, SchedulingFailureAttemptsNothingAndTheNextRoundRe
     EXPECT_EQ(progress.redelete_failed, 1u);
     EXPECT_EQ(failedCounter() - failed_before, 1u);
     ASSERT_EQ(rows->rows.size(), 1u);
-    ASSERT_TRUE(rows->lastRowHas("jobs_scheduled"));
-    EXPECT_EQ(rows->total("jobs_scheduled"), 0u);
-    EXPECT_EQ(rows->total("jobs_failed"), 1u);
+    ASSERT_TRUE(rows->lastRowHas("read_blob_jobs_scheduled"));
+    EXPECT_EQ(rows->total("read_blob_jobs_scheduled"), 0u);
+    EXPECT_EQ(rows->total("read_blob_jobs_failed"), 0u);
+    EXPECT_EQ(rows->total("delete_chunk_jobs_failed"), 0u);
+    EXPECT_EQ(rows->total("read_blob_job_schedule_failures"), 1u);
+    EXPECT_EQ(rows->total("delete_chunk_job_schedule_failures"), 0u);
     expectBodiesPresentOnlyFor(*backend, *store, {1, 2, 3, 4, 5, 6});
 
     const RoundReport next = runRegularRoundReclaiming(gc);
@@ -1122,8 +1169,11 @@ TEST(CASGCRedeleteConcurrency, EnqueueRefusalYieldsToLowerIndexWorkerFailure)
 
     EXPECT_EQ(progress.redelete_failed, 2u);
     EXPECT_EQ(failedCounter() - failed_before, 2u);
-    EXPECT_EQ(rows->total("jobs_scheduled"), 3u);
-    EXPECT_EQ(rows->total("jobs_failed"), 2u);
+    EXPECT_EQ(rows->total("read_blob_jobs_scheduled"), 3u);
+    EXPECT_EQ(rows->total("read_blob_jobs_failed"), 0u);
+    EXPECT_EQ(rows->total("delete_chunk_jobs_failed"), 1u);
+    EXPECT_EQ(rows->total("read_blob_job_schedule_failures"), 1u);
+    EXPECT_EQ(rows->total("delete_chunk_job_schedule_failures"), 0u);
     EXPECT_NE(message.find(first_preview_key), String::npos);
     EXPECT_EQ(message.find("Injected CAS GC re-delete enqueue refusal"), String::npos);
     EXPECT_TRUE(backend->allFired());
@@ -1175,8 +1225,13 @@ TEST(CASGCRedeleteConcurrency, SingletonWorkerFailureIsCountedWithoutScheduling)
     EXPECT_TRUE(backend->allFired());
     EXPECT_EQ(progress.redelete_failed, 1u);
     EXPECT_EQ(failedCounter() - failed_before, 1u);
-    EXPECT_EQ(rows->total("jobs_scheduled"), 0u);
-    EXPECT_EQ(rows->total("jobs_failed"), 1u);
+    EXPECT_EQ(rows->total("read_blob_jobs_scheduled"), 0u);
+    ASSERT_TRUE(rows->lastRowHas("delete_chunk_jobs_scheduled"));
+    EXPECT_EQ(rows->total("delete_chunk_jobs_scheduled"), 0u);
+    EXPECT_EQ(rows->total("read_blob_jobs_failed"), 0u);
+    EXPECT_EQ(rows->total("delete_chunk_jobs_failed"), 1u);
+    EXPECT_EQ(rows->total("read_blob_job_schedule_failures"), 0u);
+    EXPECT_EQ(rows->total("delete_chunk_job_schedule_failures"), 0u);
 }
 
 TEST(CASGCRedeleteConcurrency, ShardedPoolDeletesEveryShard)

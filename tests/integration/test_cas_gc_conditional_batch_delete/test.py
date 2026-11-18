@@ -50,8 +50,11 @@ def gc_pending_delete_rows(node, after_round):
     node.query("SYSTEM FLUSH LOGS")
     rows = (
         node.query(
-            "SELECT p.phase_metrics['redeleted'], p.phase_metrics['delete_batches'], "
-            "p.phase_metrics['jobs_failed'] "
+            "SELECT p.phase_metrics['redeleted'], p.phase_metrics['delete_chunks'], "
+            "p.phase_metrics['read_blob_jobs_failed'], "
+            "p.phase_metrics['delete_chunk_jobs_failed'], "
+            "p.phase_metrics['read_blob_job_schedule_failures'], "
+            "p.phase_metrics['delete_chunk_job_schedule_failures'] "
             "FROM system.cas_gc_log AS p INNER JOIN "
             "(SELECT round_id FROM system.cas_gc_log "
             f"WHERE disk_name = '{DISK_NAME}' AND event_type = 'Finish' "
@@ -109,7 +112,17 @@ def test_rustfs_pending_blob_deletes_use_singleton_fallback():
 
     assert not remaining, f"GC left blob bodies in RustFS: {sorted(remaining)}"
     assert rows, "pending_deletes never reported completed blob redeletes"
-    for redeleted, batches, jobs_failed in rows:
-        assert jobs_failed == 0
-        assert batches == redeleted
+    for (
+        redeleted,
+        delete_chunks,
+        read_blob_jobs_failed,
+        delete_chunk_jobs_failed,
+        read_blob_job_schedule_failures,
+        delete_chunk_job_schedule_failures,
+    ) in rows:
+        assert read_blob_jobs_failed == 0
+        assert delete_chunk_jobs_failed == 0
+        assert read_blob_job_schedule_failures == 0
+        assert delete_chunk_job_schedule_failures == 0
+        assert delete_chunks == redeleted
     assert gc_redeleted_total(node, first_round) >= len(created_blobs)

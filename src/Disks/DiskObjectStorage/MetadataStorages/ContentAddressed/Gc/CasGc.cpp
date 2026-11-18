@@ -807,7 +807,7 @@ void Gc::redeleteBlobs(
         [&](const size_t index, CasOperation & job_op) { readRetiredBlobState(entries[index], layout, job_op, redelete_blob_states[index]); });
 
     if (read_blob_jobs.on_pool)
-        ctx.jobs_scheduled += read_blob_jobs.scheduled;
+        ctx.read_blob_jobs_scheduled += read_blob_jobs.scheduled;
     std::optional<IndexedException> first_error
         = recordReadBlobJobFailures(ctx, entries, layout, redelete_blob_states, read_blob_jobs);
 
@@ -829,6 +829,8 @@ void Gc::redeleteBlobs(
                 redelete_blob_states[delete_chunk.blob_state_indices[pos]].removal_result = removal_results[pos];
         });
 
+    if (delete_chunk_jobs.on_pool)
+        ctx.delete_chunk_jobs_scheduled += delete_chunk_jobs.scheduled;
     ctx.delete_chunks += delete_chunk_jobs.scheduled;
 
     const std::optional<IndexedException> delete_error
@@ -858,12 +860,14 @@ std::optional<Gc::IndexedException> Gc::recordReadBlobJobFailures(
         redelete_blob_states[i].error = error;
         if (!error)
             continue;
+        ++ctx.read_blob_jobs_failed;
         recordRedeleteFailure(ctx, entries[i], layout, RedeleteFailureKind::ReadBlobJob, error);
         if (!first_error || i < first_error->index)
             first_error = IndexedException{i, error};
     }
     if (read_blob_jobs.job_schedule_error)
     {
+        ++ctx.read_blob_job_schedule_failures;
         const IndexedException & error = *read_blob_jobs.job_schedule_error;
         chassert(error.index < entries.size());
         recordRedeleteFailure(ctx, entries[error.index], layout, RedeleteFailureKind::ScheduleReadBlobJob,
@@ -888,6 +892,7 @@ std::optional<Gc::IndexedException> Gc::recordDeleteChunkJobFailures(
         const std::exception_ptr & error = delete_chunk_jobs.scheduled_job_errors[chunk_index];
         if (!error)
             continue;
+        ++ctx.delete_chunk_jobs_failed;
         for (const size_t index : delete_chunks[chunk_index].blob_state_indices)
         {
             redelete_blob_states[index].error = error;
@@ -898,6 +903,7 @@ std::optional<Gc::IndexedException> Gc::recordDeleteChunkJobFailures(
     }
     if (delete_chunk_jobs.job_schedule_error)
     {
+        ++ctx.delete_chunk_job_schedule_failures;
         const size_t first_unscheduled_chunk_index = delete_chunk_jobs.job_schedule_error->index;
         chassert(first_unscheduled_chunk_index < delete_chunks.size());
         size_t unscheduled_delete_blob_count = 0;
@@ -1225,14 +1231,22 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     pending_deletes_timer.emplace(phase_sink, "pending_deletes");
     const uint64_t redeleted_before = report.redeleted;
     const uint64_t graduated_before = report.graduated;
-    const uint64_t redelete_failed_before = report.redelete_failed;
-    uint64_t redelete_jobs_scheduled = 0;
-    uint64_t redelete_chunks = 0;
+    uint64_t read_blob_jobs_scheduled = 0;
+    uint64_t delete_chunk_jobs_scheduled = 0;
+    uint64_t read_blob_jobs_failed = 0;
+    uint64_t delete_chunk_jobs_failed = 0;
+    uint64_t read_blob_job_schedule_failures = 0;
+    uint64_t delete_chunk_job_schedule_failures = 0;
+    uint64_t delete_chunks = 0;
     const auto record_redelete_job_metrics = [&]
     {
-        pending_deletes_timer->metric("jobs_scheduled", redelete_jobs_scheduled);
-        pending_deletes_timer->metric("jobs_failed", report.redelete_failed - redelete_failed_before);
-        pending_deletes_timer->metric("delete_batches", redelete_chunks);
+        pending_deletes_timer->metric("read_blob_jobs_scheduled", read_blob_jobs_scheduled);
+        pending_deletes_timer->metric("delete_chunk_jobs_scheduled", delete_chunk_jobs_scheduled);
+        pending_deletes_timer->metric("read_blob_jobs_failed", read_blob_jobs_failed);
+        pending_deletes_timer->metric("delete_chunk_jobs_failed", delete_chunk_jobs_failed);
+        pending_deletes_timer->metric("read_blob_job_schedule_failures", read_blob_job_schedule_failures);
+        pending_deletes_timer->metric("delete_chunk_job_schedule_failures", delete_chunk_job_schedule_failures);
+        pending_deletes_timer->metric("delete_chunks", delete_chunks);
     };
     SCOPE_EXIT_SAFE({
         if (pending_deletes_timer)
@@ -1268,8 +1282,13 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             .report = report,
             .outcomes = outcomes,
             .outcome_tallies = outcome_tallies,
-            .jobs_scheduled = redelete_jobs_scheduled,
-            .delete_chunks = redelete_chunks};
+            .read_blob_jobs_scheduled = read_blob_jobs_scheduled,
+            .delete_chunk_jobs_scheduled = delete_chunk_jobs_scheduled,
+            .read_blob_jobs_failed = read_blob_jobs_failed,
+            .delete_chunk_jobs_failed = delete_chunk_jobs_failed,
+            .read_blob_job_schedule_failures = read_blob_job_schedule_failures,
+            .delete_chunk_job_schedule_failures = delete_chunk_job_schedule_failures,
+            .delete_chunks = delete_chunks};
 
         redeleteBlobs(redelete_ctx, redelete_now, *io_pool, store->poolConfig().gc_io_concurrency, layout, op);
 
