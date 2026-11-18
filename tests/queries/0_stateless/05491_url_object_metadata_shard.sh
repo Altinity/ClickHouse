@@ -54,9 +54,32 @@ def make_handler(body):
                 self.send_response(404)
                 self.end_headers()
                 return
-            self.send_response(200)
+            # A known size makes url() send Range: bytes=0-(size-1). A 200 for that request is logged
+            # as a warning, and the stateless runner fails the test on any client stderr.
+            total = len(data)
+            start, end, ranged = 0, total - 1, False
+            range_header = self.headers.get('Range') if path == '/data/file.tsv' else None
+            if range_header and total:
+                spec = range_header.split('=', 1)[-1].split(',')[0].strip()
+                left, _, right = spec.partition('-')
+                if left:
+                    start = int(left)
+                if right:
+                    end = int(right)
+                if start < 0 or end < start or start >= total:
+                    self.send_response(416)
+                    self.send_header('Content-Range', 'bytes */' + str(total))
+                    self.end_headers()
+                    return
+                end = min(end, total - 1)
+                data = data[start:end + 1]
+                ranged = True
+            self.send_response(206 if ranged else 200)
             self.send_header('Content-Type', content_type)
+            self.send_header('Accept-Ranges', 'bytes')
             self.send_header('Content-Length', str(len(data)))
+            if ranged:
+                self.send_header('Content-Range', 'bytes ' + str(start) + '-' + str(end) + '/' + str(total))
             self.end_headers()
             if with_body:
                 self.wfile.write(data)

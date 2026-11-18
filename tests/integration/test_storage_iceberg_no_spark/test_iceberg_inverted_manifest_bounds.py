@@ -348,6 +348,9 @@ def test_iceberg_inverted_decimal_manifest_bounds(started_cluster_iceberg_no_spa
     # them, while `id` is still well formed in the same manifest entry and must keep pruning.
     manifests = MinioManifests(cluster.minio_client, cluster.minio_bucket, key_prefix)
     assert _swap_bounds_in_manifests(manifests, only_field_id=2) > 0
+    # `fput_object` replaces the manifest outside ClickHouse. The identity cache still holds the
+    # previous ETag, and the next GET sends it as `If-Match`.
+    instance.query("SYSTEM CLEAR OBJECT STORAGE IDENTITY CACHE")
     assert pruned_files(d_expr) == 0
     assert pruned_files(id_expr) == 1
 
@@ -358,5 +361,6 @@ def test_iceberg_inverted_decimal_manifest_bounds(started_cluster_iceberg_no_spa
     e_expr = "e < toDecimal32(0.5, 1)"
     assert pruned_files(e_expr) == 1
     assert _set_bounds_in_manifests(manifests, 3, b"\x7f\xff\xff\xf0", b"\x7f\xff\xff\xfa") > 0
+    instance.query("SYSTEM CLEAR OBJECT STORAGE IDENTITY CACHE")
     assert pruned_files(e_expr) == 0
     assert pruned_files(id_expr) == 1

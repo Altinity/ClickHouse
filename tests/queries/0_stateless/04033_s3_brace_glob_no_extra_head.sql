@@ -1,5 +1,6 @@
--- Tags: no-fasttest, no-parallel-replicas
+-- Tags: no-fasttest, no-parallel, no-parallel-replicas
 -- Tag no-fasttest: Depends on AWS
+-- Tag no-parallel: the identity cache is process-global, so another test can HEAD these keys first
 -- Tag no-parallel-replicas: test counts exact S3 API calls per query, which differs under parallel replicas
 
 -- Verify that reading from S3 with brace-expansion globs like {a,b,c}.tsv
@@ -8,6 +9,9 @@
 
 SET max_threads = 1;
 SET use_hive_partitioning=1;
+
+-- Drop identities stored by earlier tests. A hit does not send HEAD, so the count below would be 0.
+SYSTEM CLEAR OBJECT STORAGE IDENTITY CACHE;
 
 SELECT * FROM s3('http://localhost:11111/test/{a,b,c}.tsv', 'test', 'testtest', 'TSV', 'c1 UInt64, c2 UInt64, c3 UInt64')
 ORDER BY c1, c2, c3;
