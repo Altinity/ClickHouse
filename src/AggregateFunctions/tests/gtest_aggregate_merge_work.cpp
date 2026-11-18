@@ -97,10 +97,12 @@ TEST(AggregateMergeWork, OrFillKeepsNestedMergeHooks)
 TEST(AggregateMergeWork, VariadicAndTupleArguments)
 {
     const auto type = std::make_shared<DataTypeUInt64>();
+    /// The variadic `uniqExact` of this build has no preparation step of the parallel merge, unlike the one of upstream, which
+    /// got it with https://github.com/ClickHouse/ClickHouse/pull/117153 (not backported), so it reports none.
     const auto variadic = getFunction("uniqExact", {type, type});
-    checkWork(*variadic, *variadic, {values(), values()}, 3);
+    checkWork(*variadic, *variadic, {values(), values()}, 3, /*expected_prepare=*/false);
     const auto tuple = getFunction("uniqExact", {std::make_shared<DataTypeTuple>(DataTypes{type, type})});
-    checkWork(*tuple, *tuple, {ColumnTuple::create(Columns{values(), values()})}, 3);
+    checkWork(*tuple, *tuple, {ColumnTuple::create(Columns{values(), values()})}, 3, /*expected_prepare=*/false);
 }
 
 TEST(AggregateMergeWork, TupleCombinatorStateOffsets)
