@@ -12,7 +12,7 @@ from typing import Tuple
 import docker_images_helper
 from ci_config import CI
 from ci_utils import Shell
-from env_helper import REPO_COPY, S3_BUILDS_BUCKET, TEMP_PATH, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY
+from env_helper import REPO_COPY, S3_BUILDS_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY
 from git_helper import Git, checkout_submodules, unshallow
 from pr_info import PRInfo, EventType
 from report import FAILURE, SUCCESS, JobReport, StatusType
@@ -252,27 +252,6 @@ def main():
         f"sudo chown -R ubuntu:ubuntu {build_output_path}", shell=True
     )
     logging.info("Build finished as %s, log path %s", build_status, log_path)
-
-    s3_helper = S3Helper()
-    s3_path_prefix = "/".join(
-        (
-            get_release_or_pr(pr_info, get_version_from_repo())[0],
-            pr_info.sha,
-            build_name,
-        )
-    )
-    src_path = Path(TEMP_PATH) / "build_source.src.tar.gz"
-    s3_path = s3_path_prefix + "/clickhouse-" + version.string + ".src.tar.gz"
-    logging.info("s3_path %s", s3_path)
-    if src_path.exists():
-        src_url = s3_helper.upload_build_file_to_s3(
-            src_path, s3_path
-        )
-        logging.info("Source tar %s", src_url)
-        print(f"::notice ::Source tar URL: {src_url}")
-    else:
-        logging.info("Source tar doesn't exist")
-        print("Source tar doesn't exist")
 
     if build_status != SUCCESS:
         # We check if docker works, because if it's down, it's infrastructure
