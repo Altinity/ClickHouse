@@ -469,11 +469,16 @@ The `RoundReport::redelete_failed` field and `CASGCRetiredRedeleteFailed` event 
 units: each failed blob from an executed job counts once, while an enqueue failure counts once per
 wave regardless of the number of unsubmitted blobs reported in its warning.
 
-The project RustFS integration backend supports exact-token singleton deletes but does not implement
-AWS per-object `ETag` conditions in `DeleteObjects`. Its mount probe therefore keeps one-key chunks;
-integration coverage verifies this fallback and physical blob reclamation. Positive AWS batching is
-covered by deterministic GC and scripted S3 transport tests. A live AWS run is still required to
-validate the production service boundary end to end.
+Ordinary S3 batch deletion and conditional batch deletion have independent capability flags. Only
+the latter requires the store to enforce a separate `ETag` for each key in `DeleteObjects`. Both
+paths use `objects_chunk_size_to_delete` as a size limit. A request-level `NotImplemented` from
+the optional batch check leaves GC using one-key chunks. A request-level `InvalidRequest` or
+`InvalidArgument` propagates and fails the mount. After a successful probe, a batch request error
+follows the normal request retry policy and does not change the pinned capability.
+
+The integration test on RustFS 1.0.6 mounts two disks with GC chunk limits of one and two. It
+checks the number of storage requests in each pending-delete phase and lists the bucket to verify
+that the blob bodies have disappeared.
 
 Under `suppress_destructive` the `redelete` set is empty by construction, so nothing is deleted, and
 there is no graduation either (would-be graduates are carried unchanged); sparing and superseding
