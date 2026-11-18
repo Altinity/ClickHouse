@@ -1,4 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h>
+#include <base/hex.h>
 
 #include <boost/algorithm/string/trim.hpp>
 
@@ -37,30 +39,41 @@ namespace
 constexpr size_t MAX_TAG_BYTES = 128;
 constexpr size_t MAX_GENERATION_DIGITS = 20;
 
-std::optional<String> opaqueEtagTag(std::string_view raw)
+/// The bytes of a strong ETag between its quotes. A tag may itself start with `W/`: only the unquoted prefix
+/// marks a weak ETag.
+bool isOpaqueEtagTag(std::string_view tag)
 {
-    if (raw.starts_with("W/"))
-        return std::nullopt;
-    if (raw.size() >= 2 && raw.front() == '"' && raw.back() == '"')
-        raw = raw.substr(1, raw.size() - 2);
-    if (raw.empty() || raw.size() > MAX_TAG_BYTES || raw == "*" || raw.front() == ' ' || raw.back() == ' ')
-        return std::nullopt;
-    for (const char c : raw)
+    if (tag.empty() || tag.size() > MAX_TAG_BYTES || tag == "*" || tag.front() == ' ' || tag.back() == ' ')
+        return false;
+    for (const char c : tag)
     {
         const auto byte = static_cast<unsigned char>(c);
         if (c == '"' || c == ',' || byte < 0x20 || byte == 0x7F)
-            return std::nullopt;
+            return false;
     }
-    return String(raw);
+    return true;
 }
 
-std::optional<String> opaqueTag(Dialect dialect, std::string_view raw)
+bool isOpaqueTag(Dialect dialect, std::string_view tag)
 {
     if (dialect != Dialect::Generation)
-        return opaqueEtagTag(raw);
-    if (raw.empty() || raw.size() > MAX_GENERATION_DIGITS || raw.front() == '0')
-        return std::nullopt;
-    if (!std::all_of(raw.begin(), raw.end(), [](char c) { return c >= '0' && c <= '9'; }))
+        return isOpaqueEtagTag(tag);
+    if (tag.empty() || tag.size() > MAX_GENERATION_DIGITS || tag.front() == '0')
+        return false;
+    return std::all_of(tag.begin(), tag.end(), [](char c) { return c >= '0' && c <= '9'; });
+}
+
+/// The opaque tag of a wire value: a weak value is refused, one balanced pair of quotes is removed.
+std::optional<String> opaqueTagOfWireValue(Dialect dialect, std::string_view raw)
+{
+    if (dialect != Dialect::Generation)
+    {
+        if (raw.starts_with("W/"))
+            return std::nullopt;
+        if (raw.size() >= 2 && raw.front() == '"' && raw.back() == '"')
+            raw = raw.substr(1, raw.size() - 2);
+    }
+    if (!isOpaqueTag(dialect, raw))
         return std::nullopt;
     return String(raw);
 }
@@ -71,37 +84,23 @@ constexpr std::string_view HEX_DIGITS = "0123456789abcdef";
 
 std::string_view dialectWord(Dialect dialect)
 {
-    switch (dialect)
-    {
-        case Dialect::ETag: return "etag";
-        case Dialect::Generation: return "generation";
-        case Dialect::Emulated: return "emulated";
-    }
-    UNREACHABLE();
+    return kTokenTypeWords.toWord(dialect, "dialectWord");
 }
 
 std::optional<Dialect> dialectFromWord(std::string_view word)
 {
-    for (const Dialect dialect : {Dialect::ETag, Dialect::Generation, Dialect::Emulated})
-        if (word == dialectWord(dialect))
-            return dialect;
+    for (const auto & entry : kTokenTypeWords.entries)
+        if (word == entry.word)
+            return entry.value;
     return std::nullopt;
 }
 
 std::optional<CanonicalIdentity> canonicalIdentity(Dialect dialect, std::string_view raw_value)
 {
-    auto tag = opaqueTag(dialect, raw_value);
+    auto tag = opaqueTagOfWireValue(dialect, raw_value);
     if (!tag)
         return std::nullopt;
-    String hex;
-    hex.reserve(tag->size() * 2);
-    for (const char c : *tag)
-    {
-        const auto byte = static_cast<unsigned char>(c);
-        hex.push_back(HEX_DIGITS[byte >> 4]);
-        hex.push_back(HEX_DIGITS[byte & 15]);
-    }
-    return CanonicalIdentity{dialect, std::move(hex)};
+    return CanonicalIdentity{dialect, hexString(tag->data(), tag->size())};
 }
 
 std::optional<String> opaqueTagFromHex(Dialect dialect, std::string_view tag_hex)
@@ -118,10 +117,19 @@ std::optional<String> opaqueTagFromHex(Dialect dialect, std::string_view tag_hex
             return std::nullopt;
         tag.push_back(static_cast<char>((hi << 4) | lo));
     }
-    const auto identity = canonicalIdentity(dialect, tag);
-    if (!identity || identity->tag_hex != tag_hex)
+    if (!isOpaqueTag(dialect, tag))
         return std::nullopt;
     return tag;
+}
+
+std::optional<PersistedEtag> persistedTokenOf(const CanonicalIdentity & identity)
+{
+    const std::optional<String> tag = opaqueTagFromHex(identity.dialect, identity.tag_hex);
+    if (!tag)
+        return std::nullopt;
+    /// Quoted: a bare tag that starts with `W/` would read back as a weak ETag.
+    String value = identity.dialect == Dialect::Generation ? *tag : "\"" + *tag + "\"";
+    return PersistedEtag{String(dialectWord(identity.dialect)), std::move(value)};
 }
 
 std::optional<CanonicalIdentity> Etag::canonical() const

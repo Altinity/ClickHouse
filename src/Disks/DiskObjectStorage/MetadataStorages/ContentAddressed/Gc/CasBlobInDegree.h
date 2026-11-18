@@ -40,6 +40,7 @@ struct RetiredEntry
                                   /// it condemned and recreate).
     bool marker_confirmed = false;   /// Written with `delete_pending`, as released builds write it. The
                                      /// graduation gate never reads it: it reads the marker itself.
+    bool standing = false;           /// Implies `delete_pending`. The body of this incarnation is deleted or known absent; the intent still exists.
 };
 
 /// The fold's HEAD hooks (`head_blob`, `peek_head`): the caller issues the request on its own admitted
@@ -73,7 +74,7 @@ void assertValidSourceEdgeId(const UInt128 & source_id);
 /// dialect included, because deletion must remain exact-token guarded. Its fixed prefix is
 /// `[0x02][flags][token_type][round BE64][size BE64][token_len BE16]`, followed by token bytes;
 /// `token_type` is the dialect byte of `CasWireVocab`'s vocabulary.
-/// `flags` bit 0 is `delete_pending`, bit 1 is `marker_confirmed`.
+/// `flags` bit 0 is `delete_pending`, bit 1 is `marker_confirmed`, bit 2 is `standing` (valid only with bit 0).
 struct CondemnedRow
 {
     bool delete_pending = false;
@@ -81,6 +82,7 @@ struct CondemnedRow
     uint64_t size = 0;
     uint64_t condemn_round = 0;
     bool marker_confirmed = false;   // written with `delete_pending`; the graduation gate reads the marker, not this bit
+    bool standing = false;           // implies `delete_pending`; the body of this incarnation is deleted or known absent, the intent still exists
     /// Spelled out rather than defaulted because `PersistedEtag` carries no equality of its
     /// own. A field added above belongs here too.
     bool operator==(const CondemnedRow & o) const
@@ -88,7 +90,7 @@ struct CondemnedRow
         return delete_pending == o.delete_pending
             && token.dialect == o.token.dialect && token.value == o.token.value
             && size == o.size && condemn_round == o.condemn_round
-            && marker_confirmed == o.marker_confirmed;
+            && marker_confirmed == o.marker_confirmed && standing == o.standing;
     }
 };
 

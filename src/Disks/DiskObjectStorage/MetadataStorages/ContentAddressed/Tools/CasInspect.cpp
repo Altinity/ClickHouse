@@ -415,6 +415,7 @@ String renderCondemnedRow(const CondemnedRow & r)
         .add("size", jsonUInt(r.size))
         .add("condemn_round", jsonUInt(r.condemn_round))
         .add("marker_confirmed", jsonBool(r.marker_confirmed))
+        .add("standing", jsonBool(r.standing))
         .str();
 }
 

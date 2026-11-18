@@ -181,22 +181,36 @@ TEST(CASTestSupport, CutCompleteFollowsIntakeAndPrecedesTheFold)
     {
         return e.verb == JournalVerb::Head && e.keys.front().starts_with(layout.blobsPrefix());
     };
+    const auto is_ref_read = [&](const JournalEntry & e)
+    {
+        return e.verb == JournalVerb::Read && e.keys.front().starts_with(layout.casRefsPrefix());
+    };
     const auto is_blob_write = [&](const JournalEntry & e)
     {
         return e.verb == JournalVerb::Write && e.keys.front().starts_with(layout.blobsPrefix());
     };
+    const auto is_blob_delete = [&](const JournalEntry & e)
+    {
+        return (e.verb == JournalVerb::Remove || e.verb == JournalVerb::RemoveMany)
+            && std::ranges::any_of(e.keys, [&](const String & key) { return key.starts_with(layout.blobsPrefix()); });
+    };
 
-    /// Positive controls: the mark, the blob HEADs and the blob writes (condemnation markers) all exist.
-    /// Intake reads are not ordered against the mark: a read-ahead read nobody took can follow it.
+    /// Positive controls: the mark, a ref-log read, the blob HEADs and the blob writes (condemnation
+    /// markers) all exist. Only the FIRST ref-log read is bounded: a read-ahead read nobody took can
+    /// follow the mark, but intake cannot end before it has read anything.
     ASSERT_EQ(std::count_if(journal.begin(), journal.end(), is_mark), 1);
     const size_t mark = firstIndexOf(journal, is_mark);
+    const size_t first_ref_read = firstIndexOf(journal, is_ref_read);
     const size_t first_blob_head = firstIndexOf(journal, is_blob_head);
     const size_t first_blob_write = firstIndexOf(journal, is_blob_write);
+    ASSERT_LT(first_ref_read, journal.size()) << "the round read no ref-log object";
     ASSERT_LT(first_blob_head, journal.size()) << "the round sent no blob HEAD";
     ASSERT_LT(first_blob_write, journal.size()) << "the round sent no blob write";
 
+    EXPECT_LT(first_ref_read, mark);
     EXPECT_LT(mark, first_blob_head);
     EXPECT_LT(mark, first_blob_write);
+    EXPECT_LT(mark, firstIndexOf(journal, is_blob_delete)) << "a blob delete precedes the mark";
 }
 
 TEST(CASTestSupport, PublicationFakeJournalsOneEntryPerBlobRemove)

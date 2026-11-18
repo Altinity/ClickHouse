@@ -24,6 +24,10 @@ constexpr uint32_t G_REF_MOVE = 2;
 /// The generation that introduced the forward-linked epoch tombstone (`RefLogTxn::next_epoch`), the sparse
 /// `prev_epoch_seal` backlink and the two-field `_ckpt` body.
 constexpr uint32_t G_REF_CHAIN = 3;
+/// The generation of the blob deletion-intent protocol: a pool's `token_dialect`, `gc/state` header 4 with
+/// `intent_sweep_cursor`, and the `standing` bit of condemned rows. Codecs read and write it; `G_BUILD` is lower
+/// until the protocol is switched on, so a default-ceiling reader still refuses these objects.
+constexpr uint32_t G_BLOB_INTENTS = 4;
 
 /// Stable identifiers for every self-describing persisted object class. The text registry uses the
 /// corresponding `type` string as the on-disk identity. Numeric values are part of the format history:
@@ -61,6 +65,7 @@ enum class FormatId : uint16_t
     RefCkpt = 23,         /// cas_ref_ckpt    — per-namespace checkpoint (INV-4)
     RefCatalog = 24,      /// cas_ref_catalog — the whole-pool namespace catalog (INV-3)
     GcMaintenanceState = 25, /// cas_gc_maintenance_state — leak-only namespace-janitor cursor
+    BlobIntent = 26,      /// cas_blob_intent — constant record of a blob deletion intent
 };
 
 /// Returns the writer generation stamped on newly written objects. The current pre-roster writer

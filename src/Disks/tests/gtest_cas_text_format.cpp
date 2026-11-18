@@ -67,7 +67,7 @@ TEST(CASFormatTraits, CompleteUniqueAndGated)
                             FormatId::GcOutcomes, FormatId::PartManifest, FormatId::RunFile,
                             FormatId::FoldSeal, FormatId::Owner, FormatId::ServerEpoch, FormatId::MountLease,
                             FormatId::RefLog, FormatId::RefSnapshot, FormatId::BlobMeta, FormatId::GcHeartbeat,
-                            FormatId::RefCkpt, FormatId::RefCatalog, FormatId::GcMaintenanceState};
+                            FormatId::RefCkpt, FormatId::RefCatalog, FormatId::GcMaintenanceState, FormatId::BlobIntent};
     std::set<std::string_view> types;
     for (FormatId id : all)
     {

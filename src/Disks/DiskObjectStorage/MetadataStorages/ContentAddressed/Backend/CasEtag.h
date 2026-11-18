@@ -36,7 +36,8 @@ std::optional<Dialect> dialectFromWord(std::string_view word);
 std::optional<CanonicalIdentity> canonicalIdentity(Dialect dialect, std::string_view raw_value);
 
 /// Inverse of the `tag_hex` spelling, for key parsing: the opaque tag, or nothing when `tag_hex` is not
-/// lowercase even-length hex of a tag that `canonicalIdentity` accepts.
+/// lowercase even-length hex of an opaque tag. It checks the tag, not a wire spelling: `"W/x"` is a strong
+/// ETag whose tag `W/x` must parse back.
 std::optional<String> opaqueTagFromHex(Dialect dialect, std::string_view tag_hex);
 
 /// One backend-observed incarnation of an object: the transport's own value naming that incarnation,
@@ -79,13 +80,7 @@ private:
 
 inline String Etag::render() const
 {
-    switch (dialect_)
-    {
-        case Dialect::ETag: return "etag:" + value_;
-        case Dialect::Generation: return "generation:" + value_;
-        case Dialect::Emulated: return "emulated:" + value_;
-    }
-    UNREACHABLE();
+    return String(dialectWord(dialect_)) + ":" + value_;
 }
 
 /// An incarnation as recorded in a persisted manifest/ref: the dialect word and value, without any
@@ -106,6 +101,10 @@ struct PersistedEtag
 
 /// True when both spellings canonicalise and are equal.
 bool sameIncarnation(const PersistedEtag & row, const Etag & live);
+
+/// A token whose `canonical` is `identity`, in wire spelling: a quoted tag except for `generation`. Nothing when
+/// `tag_hex` names no opaque tag.
+std::optional<PersistedEtag> persistedTokenOf(const CanonicalIdentity & identity);
 
 inline PersistedEtag PersistedEtag::capture(const Etag & live)
 {

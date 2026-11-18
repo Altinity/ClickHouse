@@ -210,7 +210,7 @@ SourceEdgeRecord condemnedRec(UInt128 h, const CondemnedRow & row)
                             .source_id = UInt128{0}, .marker = RunMarker::Condemned,
                             .delete_pending = row.delete_pending, .token = row.token,
                             .size = row.size, .condemn_round = row.condemn_round,
-                            .marker_confirmed = row.marker_confirmed};
+                            .marker_confirmed = row.marker_confirmed, .standing = row.standing};
 }
 
 /// An active-edge record (`RunMarker::Edge`) for `h` at source `sid`.
@@ -841,7 +841,7 @@ TEST(CASCondemnedRow, UnknownFlagBitsFailClosed)
     DB::Cas::CondemnedRow row;
     row.token = DB::Cas::PersistedEtag{"etag", "t"};
     auto bytes = DB::Cas::encodeCondemnedRow(row);
-    bytes[1] = 4;   // flags byte: only bits 0 (delete_pending) and 1 (marker_confirmed) are defined
+    bytes[1] = 8;   // flags byte: bit 3 is not defined
     EXPECT_THROW(DB::Cas::decodeCondemnedRow(bytes), DB::Exception);
 }
 
@@ -1356,4 +1356,96 @@ TEST(CASThreeCursorMerge, ScanAheadKeepsRowAndChecksumValidation)
             EXPECT_FALSE((*op).read(layout.blobTargetRunKey(2, 0, 0, 0), Retry::once()).has_value()) << "a successor run was written";
         }
     }
+}
+
+namespace
+{
+
+CondemnedRow standingRow()
+{
+    CondemnedRow row;
+    row.delete_pending = true;
+    row.marker_confirmed = true;
+    row.standing = true;
+    row.token = PersistedEtag{"emulated", "tok"};
+    row.size = 12;
+    row.condemn_round = 5;
+    return row;
+}
+
+}
+
+TEST(CASBlobInDegree, PackedStandingFlagRoundTrips)
+{
+    const CondemnedRow row = standingRow();
+    const String bytes = encodeCondemnedRow(row);
+    EXPECT_EQ(static_cast<uint8_t>(bytes[1]), 7u);
+    EXPECT_EQ(decodeCondemnedRow(bytes), row);
+
+    CondemnedRow plain = row;
+    plain.standing = false;
+    EXPECT_EQ(static_cast<uint8_t>(encodeCondemnedRow(plain)[1]), 3u);
+    EXPECT_FALSE(decodeCondemnedRow(encodeCondemnedRow(plain)).standing);
+}
+
+TEST(CASBlobInDegree, PackedFlagsAboveSevenAreCorrupted)
+{
+    String bytes = encodeCondemnedRow(standingRow());
+    for (const uint8_t flags : {uint8_t{8}, uint8_t{15}, uint8_t{0x80}})
+    {
+        bytes[1] = static_cast<char>(flags);
+        DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { static_cast<void>(decodeCondemnedRow(bytes)); });
+    }
+}
+
+TEST(CASBlobInDegree, PackedStandingWithoutPendingIsCorrupted)
+{
+    String bytes = encodeCondemnedRow(standingRow());
+    for (const uint8_t flags : {uint8_t{4}, uint8_t{6}})
+    {
+        bytes[1] = static_cast<char>(flags);
+        DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { static_cast<void>(decodeCondemnedRow(bytes)); });
+    }
+}
+
+TEST(CASBlobInDegree, EncodeRefusesStandingWithoutPending)
+{
+    CondemnedRow row = standingRow();
+    row.delete_pending = false;
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { static_cast<void>(encodeCondemnedRow(row)); });
+}
+
+TEST(CASBlobInDegree, RunViewAndRetiredEntryCarryStanding)
+{
+    InMemoryBackend backend;
+    DB::Cas::tests::OperationForTest backend_req(backend);
+    Layout layout{"pool"};
+    const RunRef gen1 = writeSourceEdgeRun(backend, layout, 1, 0, 0,
+        {{b(1), standingRow()}, {b(2), standingRow()}});
+
+    /// The run view hands consumers the packed row: standing survives the NDJSON round trip.
+    {
+        const DecodedRun in_run = decodeRun(*backend_req, gen1);
+        ASSERT_EQ(in_run.condemned.size(), 2u);
+        EXPECT_TRUE(in_run.condemned[0].second.standing);
+    }
+
+    /// One redelete slot: the first entry goes to `redelete`, the second is carried into the next run.
+    GcRoundWorkBudget budget;
+    budget.max_redeletes = 1;
+    std::vector<RunRef> runs2;
+    RetiredMergeResult rmr;
+    foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, 2, 0, 0, {}, runs2,
+        /*current_round*/9, /*condemn_round*/9, /*head_blob*/{}, /*peek_head*/{}, /*confirm_condemned_marker*/{},
+        &rmr, /*suppress_destructive*/false, /*out_applied_by_txn_ordinal*/nullptr,
+        /*source_retirements*/{}, &budget);
+
+    ASSERT_EQ(rmr.redelete.size(), 1u);
+    EXPECT_TRUE(rmr.redelete[0].standing);
+    ASSERT_EQ(rmr.still_retired.size(), 1u);
+    EXPECT_TRUE(rmr.still_retired[0].standing);
+
+    const DecodedRun out = decodeRun(*backend_req, runs2[0]);
+    ASSERT_EQ(out.condemned.size(), 1u);
+    EXPECT_TRUE(out.condemned[0].second.standing);
 }

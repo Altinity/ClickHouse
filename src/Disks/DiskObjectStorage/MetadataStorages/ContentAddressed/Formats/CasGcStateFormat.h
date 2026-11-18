@@ -35,6 +35,10 @@ struct GcState
     uint64_t snap_pruned_through = 0;   /// highest snap generation fully pruned (retention cursor)
     uint64_t snap_attempt = 0;     /// adopted attempt id (folding leader's lease.seq) for snap_generation
     String manifest_sweep_cursor;  /// best-effort orphan part-manifest cleanup cursor; reachability ignores it
+    String intent_sweep_cursor;    /// best-effort orphan blob-intent cleanup cursor; header 4 only
+    /// The header generation: `encodeGcState` stamps it, `decodeGcState` reports it. `G_BLOB_INTENTS` is the
+    /// barrier an older GC refuses; `intent_sweep_cursor` is valid only at that header.
+    uint32_t header_generation = G_WRITE_FLOOR;
     GcLease lease;
 };
 

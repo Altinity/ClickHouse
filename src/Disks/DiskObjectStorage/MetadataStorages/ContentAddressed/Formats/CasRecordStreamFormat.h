@@ -91,6 +91,7 @@ struct SourceEdgeRecord
     uint64_t size = 0;
     uint64_t condemn_round = 0;
     bool marker_confirmed = false;   /// written with `delete_pending`; the graduation gate reads the marker, not this bit
+    bool standing = false;           /// implies `delete_pending`; written only when true. The body of this incarnation is deleted or known absent; the intent still exists.
 };
 
 /// The header-line `kind` word for the only live `cas_run` kind.

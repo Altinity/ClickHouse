@@ -24,6 +24,7 @@ namespace GcStateWire
     constexpr WireKey snap_pruned_through{"snap_pruned_through"};
     constexpr WireKey snap_attempt{"snap_attempt"};
     constexpr WireKey manifest_sweep_cursor{"manifest_sweep_cursor"};
+    constexpr WireKey intent_sweep_cursor{"intent_sweep_cursor"};
     constexpr WireKey lease_owner{"lease_owner"};
     constexpr WireKey lease_seq{"lease_seq"};
 }
@@ -38,8 +39,11 @@ String encodeGcState(const GcState & state)
 {
     if (state.gc_shards < 1)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "encodeGcState: gc_shards must be >= 1 -- refusing to persist an unreadable gc/state");
+    if (!state.intent_sweep_cursor.empty() && state.header_generation < G_BLOB_INTENTS)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS gc/state: intent_sweep_cursor is present at header generation {}", state.header_generation);
     CasJsonWriter out(256);
-    writeHeaderLine(out, FormatId::GcState);
+    writeHeaderLine(out, FormatId::GcState, state.header_generation);
     bool first = true;
     writeU64StringField(out, GcStateWire::round, state.round, first);
     writeNumberField(out, GcStateWire::gc_shards, state.gc_shards, first);
@@ -47,6 +51,8 @@ String encodeGcState(const GcState & state)
     writeU64StringField(out, GcStateWire::snap_pruned_through, state.snap_pruned_through, first);
     writeU64StringField(out, GcStateWire::snap_attempt, state.snap_attempt, first);
     writeStringField(out, GcStateWire::manifest_sweep_cursor, state.manifest_sweep_cursor, first);
+    if (state.header_generation >= G_BLOB_INTENTS)
+        writeStringField(out, GcStateWire::intent_sweep_cursor, state.intent_sweep_cursor, first);
     writeHex128Field(out, GcStateWire::lease_owner, state.lease.owner, first);
     writeU64StringField(out, GcStateWire::lease_seq, state.lease.seq, first);
     closeObject(out, first);
@@ -57,13 +63,15 @@ String encodeGcState(const GcState & state)
 GcState decodeGcState(std::string_view data)
 {
     ReadBufferFromMemory in(data.data(), data.size());
-    expectHeaderLine(in, FormatId::GcState);
+    const TextHeader header = expectHeaderLine(in, FormatId::GcState);
     const String body = readLine(in, traitsFor(FormatId::GcState).line_cap, "gc/state");
     ReadBufferFromMemory body_in(body.data(), body.size());
     JsonObjectReader r(body_in, "gc/state");
 
     GcState state;
+    state.header_generation = header.v;
     bool saw_gcs = false;
+    bool saw_intent_cursor = false;
     String key;
     while (r.nextKey(key))
     {
@@ -82,6 +90,11 @@ GcState decodeGcState(std::string_view data)
             state.snap_attempt = r.readU64String();
         else if (key == GcStateWire::manifest_sweep_cursor)
             state.manifest_sweep_cursor = r.readString();
+        else if (key == GcStateWire::intent_sweep_cursor)
+        {
+            state.intent_sweep_cursor = r.readString();
+            saw_intent_cursor = true;
+        }
         else if (key == GcStateWire::lease_owner)
             state.lease.owner = r.readHex128();
         else if (key == GcStateWire::lease_seq)
@@ -95,6 +108,8 @@ GcState decodeGcState(std::string_view data)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/state: missing gc_shards");
     if (state.gc_shards == 0)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/state: gc_shards must be >= 1");
+    if (saw_intent_cursor && header.v < G_BLOB_INTENTS)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/state: intent_sweep_cursor is present at header generation {}", header.v);
     if (!body_in.eof() || !in.eof())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/state: trailing bytes");
     return state;

@@ -15,9 +15,10 @@ namespace DB::Cas
 /// backends. This backend-level chokepoint is needed because background PUTs are not attributable
 /// through the foreground request that scheduled them.
 
-/// Namespace of a CA key, classified by substring of the key path (6 classes; `Server` is currently
+/// Namespace of a CA key, classified by substring of the key path (7 classes; `Server` is currently
 /// unreachable through this classifier — the per-server control subtree lives under
 /// `/gc/server-roots/<server_root_id>/...` and classifies as Gc).
+///   <prefix>/blob-intents/.. → BlobIntent
 ///   <prefix>/blobs/..        → Blob
 ///   <prefix>/cas/ns/..        → Root  (immutable streams and point/path-addressed namespace state)
 ///   <prefix>/cas/manifests/.. → Manifest
@@ -32,8 +33,9 @@ enum class CasNs : uint8_t
     Gc,
     Server,
     Other,
+    BlobIntent,
 };
-static constexpr size_t CAS_NS_COUNT = 6;
+static constexpr size_t CAS_NS_COUNT = 7;
 
 /// Operation + outcome class, mapped from the `Backend` primitive and its result.
 ///   write, no expected value   → a value ⇒ Put       ; RawConflict ⇒ PutDeduplicated

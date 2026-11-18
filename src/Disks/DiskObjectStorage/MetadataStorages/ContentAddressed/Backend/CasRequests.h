@@ -35,11 +35,12 @@ namespace DB::Cas
 {
 
 /// TRUE when the store's own answer proves this write never applied: a malformed request, an entity
-/// too large, an access denial, or a credential failure. Whether a STALE CREDENTIAL explains it is not
+/// too large, an access denial, or a credential failure; for a local store, `READONLY` or an `errno` of
+/// `EACCES`, `EPERM` or `EROFS`. Whether a STALE CREDENTIAL explains it is not
 /// asked here -- the engine asks the backend for fresh credentials first, and refuses only when no
 /// refresh HELPED: the error was outside the credential class, the one refresh this call is allowed
 /// installed nothing, or there is no reissue left to sign with what it did install. A refresh that
-/// helps re-sends the attempt, which is known not to have applied. A non-S3 exception is never a
+/// helps re-sends the attempt, which is known not to have applied. Any other exception is never a
 /// refusal: an unmodeled error may have landed.
 bool isDefinitelyRefusedWrite(const std::exception & e);
 
@@ -295,6 +296,8 @@ public:
     CasOperation & operator=(const CasOperation &) = delete;
 
     uint64_t generation() const { return admitted_generation; }
+    /// The dialect of the backend this operation was admitted on.
+    Dialect backendDialect() const;
     /// A caller's own inter-iteration wait, paced through the same clock the engine's own sleeps use --
     /// so a test that replaces the sleep sees no real time pass in either. For the hand-written loops
     /// that reissue something the engine must not reissue for them.

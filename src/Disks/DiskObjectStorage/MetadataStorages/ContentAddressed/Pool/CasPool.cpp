@@ -39,6 +39,7 @@ namespace ErrorCodes
     extern const int LIMIT_EXCEEDED;
     extern const int LOGICAL_ERROR;
     extern const int INVALID_STATE;
+    extern const int UNKNOWN_FORMAT_VERSION;
 }
 }
 
@@ -420,6 +421,22 @@ Pool::LifecycleSnapshot Pool::lifecycleSnapshot() const
         }
     }
     return snap;
+}
+
+void requireGeneration4Pool(const PoolMeta & meta, Dialect backend_dialect)
+{
+    if (meta.min_reader_generation < G_BLOB_INTENTS)
+        throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION,
+            "CAS pool meta: pool is at reader generation {}, this build needs {}; "
+            "stop every server of the pool and run 'clickhouse-disks cas-migrate-pool'",
+            meta.min_reader_generation, G_BLOB_INTENTS);
+    if (!meta.token_dialect)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS pool meta: token_dialect is missing at reader generation {}",
+            meta.min_reader_generation);
+    if (*meta.token_dialect != backend_dialect)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "CAS pool records token dialect '{}', this disk uses '{}': identities are not comparable",
+            dialectWord(*meta.token_dialect), dialectWord(backend_dialect));
 }
 
 PoolPtr Pool::open(BackendPtr backend, PoolConfig config)

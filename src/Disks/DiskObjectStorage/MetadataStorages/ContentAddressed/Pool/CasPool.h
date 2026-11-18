@@ -1372,4 +1372,9 @@ private:
     /// (`last_folded_ref_id`, INV-JOURNAL-COVERAGE).
 };
 
+/// Refuses a pool below generation `G_BLOB_INTENTS`, and one whose recorded token dialect differs from
+/// `backend_dialect`. Throws `UNKNOWN_FORMAT_VERSION` for the first, `BAD_ARGUMENTS` for the second, and
+/// `CORRUPTED_DATA` for a meta at generation 4 or above that records no dialect.
+void requireGeneration4Pool(const PoolMeta & meta, Dialect backend_dialect);
+
 }

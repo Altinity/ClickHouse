@@ -764,8 +764,13 @@ TEST(CASPluggableHash, ReaderGenerationFloorIsTheMountFloorAndGatesFailClosed)
         const Layout layout("p");
         OperationForTest meta_op(*backend);
         PoolMeta pm = PoolMeta::createOrValidate(*meta_op, layout, /*blob_header_len*/ 256, BlobHashAlgo::CityHash128, /*allow_new*/ false, /*allow_mint*/ true);
-        pm.min_reader_generation = G_BUILD + 1;
-        ASSERT_TRUE(std::holds_alternative<Committed>((*meta_op).replace(layout.poolMetaKey(), encodePoolMeta(pm), (*meta_op).head(layout.poolMetaKey(), Retry::once())->etag, Retry::once())));
+        /// Edited at the text layer: the encoder refuses a meta at generation 4 or above that has no token dialect.
+        String future_bytes = encodePoolMeta(pm);
+        const String floor_field = "\"min_reader_generation\":" + std::to_string(pm.min_reader_generation);
+        const auto floor_at = future_bytes.find(floor_field);
+        ASSERT_NE(floor_at, String::npos);
+        future_bytes.replace(floor_at, floor_field.size(), "\"min_reader_generation\":" + std::to_string(G_BUILD + 1));
+        ASSERT_TRUE(std::holds_alternative<Committed>((*meta_op).replace(layout.poolMetaKey(), future_bytes, (*meta_op).head(layout.poolMetaKey(), Retry::once())->etag, Retry::once())));
 
         expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&]
         { Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}); });

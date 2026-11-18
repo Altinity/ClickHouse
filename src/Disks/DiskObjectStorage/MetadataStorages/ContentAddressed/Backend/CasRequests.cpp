@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 
 #include <Common/ErrorCodes.h>
+#include <Common/ErrnoException.h>
 #include <Common/Exception.h>
 #include <IO/ReadBuffer.h>
 #include <Common/LoggingHelpers.h>
@@ -20,6 +21,7 @@
 #include <fmt/format.h>
 
 #include <array>
+#include <cerrno>
 #include <ctime>
 #include <limits>
 #include <utility>
@@ -45,6 +47,7 @@ namespace DB::ErrorCodes
     extern const int LOGICAL_ERROR;
     extern const int NETWORK_ERROR;
     extern const int NOT_IMPLEMENTED;
+    extern const int READONLY;
 }
 
 namespace DB::Cas
@@ -232,6 +235,16 @@ bool isDeterministicLocalFailure(int code)
 
 bool isDefinitelyRefusedWrite([[maybe_unused]] const std::exception & e)
 {
+    /// A read-only object storage and a file the process may not create both refuse before anything is
+    /// written, and say so the same way on every reissue.
+    if (const auto * db_e = dynamic_cast<const Exception *>(&e); db_e && db_e->code() == ErrorCodes::READONLY)
+        return true;
+    if (const auto * errno_e = dynamic_cast<const ErrnoException *>(&e))
+    {
+        const int error = errno_e->getErrno();
+        if (error == EACCES || error == EPERM || error == EROFS)
+            return true;
+    }
 #if USE_AWS_S3
     if (const auto * s3 = dynamic_cast<const S3Exception *>(&e))
         /// The refresh class is included rather than left to overlap: the two name lists agree, but
@@ -332,6 +345,11 @@ CasOperation CasRequests::admit(Liveness liveness)
 CasOperation CasRequests::resume(uint64_t admitted_generation, Liveness liveness)
 {
     return CasOperation(*this, admitted_generation, std::move(liveness));
+}
+
+Dialect CasOperation::backendDialect() const
+{
+    return owner.backend->dialect();
 }
 
 std::optional<Etag> CasRequests::tryMint(const String & key, String value) const

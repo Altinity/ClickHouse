@@ -76,6 +76,11 @@ extern const Event CASOtherGet;
 extern const Event CASOtherGetStream;
 extern const Event CASOtherDelete;
 extern const Event CASOtherList;
+
+extern const Event CASBlobIntentGet;
+extern const Event CASBlobIntentPut;
+extern const Event CASBlobIntentDelete;
+extern const Event CASBlobIntentList;
 }
 
 namespace DB::Cas
@@ -114,10 +119,16 @@ static const ProfileEvents::Event cas_event_table[CAS_NS_COUNT][CAS_OP_COUNT] =
                   ProfileEvents::CASOtherCompareSwap, ProfileEvents::CASOtherCompareSwapConflict, ProfileEvents::CASOtherHead,
                   ProfileEvents::CASOtherHeadMiss, ProfileEvents::CASOtherGet, ProfileEvents::CASOtherGetStream,
                   ProfileEvents::CASOtherDelete, ProfileEvents::CASOtherList},
+    /* BlobIntent */ {ProfileEvents::CASBlobIntentPut, ProfileEvents::CASBlobIntentPut, ProfileEvents::CASOtherOverwrite,
+                  ProfileEvents::CASOtherCompareSwap, ProfileEvents::CASOtherCompareSwapConflict, ProfileEvents::CASOtherHead,
+                  ProfileEvents::CASOtherHeadMiss, ProfileEvents::CASBlobIntentGet, ProfileEvents::CASOtherGetStream,
+                  ProfileEvents::CASBlobIntentDelete, ProfileEvents::CASBlobIntentList},
 };
 
 CasNs classifyCasNs(const String & key)
 {
+    if (key.find("/blob-intents/") != String::npos)
+        return CasNs::BlobIntent;
     if (key.find("/blobs/") != String::npos)
         return CasNs::Blob;
     /// Ref streams and namespace-owned state live under `cas/ns/`; part manifests are under

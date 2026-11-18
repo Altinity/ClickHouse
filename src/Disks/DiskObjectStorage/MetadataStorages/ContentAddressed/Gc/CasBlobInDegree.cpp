@@ -261,9 +261,11 @@ void assertValidSourceEdgeId(const UInt128 & source_id)
 
 String encodeCondemnedRow(const CondemnedRow & row)
 {
+    if (row.standing && !row.delete_pending)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS condemned row: standing without delete_pending");
     String out;
     out.push_back(runMarkerByte(RunMarker::Condemned));
-    out.push_back(static_cast<char>((row.delete_pending ? 1 : 0) | (row.marker_confirmed ? 2 : 0)));
+    out.push_back(static_cast<char>((row.delete_pending ? 1 : 0) | (row.marker_confirmed ? 2 : 0) | (row.standing ? 4 : 0)));
     out.push_back(static_cast<char>(dialectByteFromWord(row.token.dialect, "condemned row")));
     auto beU64 = [&](uint64_t v) { for (int i = 7; i >= 0; --i) out += static_cast<char>((v >> (8 * i)) & 0xFF); };
     beU64(row.condemn_round);
@@ -284,10 +286,13 @@ CondemnedRow decodeCondemnedRow(std::string_view p)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS condemned row: malformed header");
     CondemnedRow row;
     const uint8_t flags = static_cast<uint8_t>(p[1]);
-    if (flags > 3)
+    if (flags > 7)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS condemned row: unknown flags 0x{:02x}", flags);
+    if ((flags & 4) && !(flags & 1))
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS condemned row: standing without delete_pending (flags 0x{:02x})", flags);
     row.delete_pending = flags & 1;
     row.marker_confirmed = flags & 2;
+    row.standing = flags & 4;
     row.token.dialect = String(dialectWordFromByte(static_cast<uint8_t>(p[2]), "condemned row"));
     auto beU64 = [&](size_t off) { uint64_t v = 0; for (int i = 0; i < 8; ++i) v = (v << 8) | static_cast<uint8_t>(p[off + i]); return v; };
     row.condemn_round = beU64(3);
@@ -324,7 +329,8 @@ bool SourceEdgeRunView::next(String & key, String & payload)
             payload = encodeCondemnedRow(CondemnedRow{.delete_pending = rec.delete_pending,
                                                       .token = rec.token, .size = rec.size,
                                                       .condemn_round = rec.condemn_round,
-                                                      .marker_confirmed = rec.marker_confirmed});
+                                                      .marker_confirmed = rec.marker_confirmed,
+                                                      .standing = rec.standing});
             break;
     }
     return true;
@@ -496,6 +502,7 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
         e.condemn_round = r.condemn_round;
         e.delete_pending = r.delete_pending;
         e.marker_confirmed = r.marker_confirmed;
+        e.standing = r.standing;
         return e;
     };
     /// THE DELETE-SITE IN-DEGREE RE-READ IS NORMATIVE (spec §5, third arm). It is not an optimization
@@ -661,7 +668,7 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
             writer.append(SourceEdgeRecord{.ref = cur_blob, .source_id = kZeroSourceId, .marker = RunMarker::Condemned,
                                            .delete_pending = e.delete_pending, .token = e.token,
                                            .size = e.size, .condemn_round = e.condemn_round,
-                                           .marker_confirmed = e.marker_confirmed});
+                                           .marker_confirmed = e.marker_confirmed, .standing = e.standing});
         }
         else if (cur_edges == 0 && cur_touched)
             writer.append(SourceEdgeRecord{.ref = cur_blob, .source_id = kZeroSourceId, .marker = RunMarker::Zero});

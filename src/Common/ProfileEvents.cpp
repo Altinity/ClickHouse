@@ -890,6 +890,10 @@ The server successfully detected this situation and will download merged part fr
     M(CASBlobGetStream,  "Number of streaming CAS blob GET requests. Grows with large or streamed blob reads.", ValueType::Number) \
     M(CASBlobDelete,     "Number of CAS blob DELETE requests. Grows with cleanup and GC deletion activity.", ValueType::Number) \
     M(CASBlobList,       "Number of CAS blob LIST requests. Growing values indicate more object enumeration.", ValueType::Number) \
+    M(CASBlobIntentGet,  "Number of CAS blob deletion-intent GET requests.", ValueType::Number) \
+    M(CASBlobIntentPut,  "Number of CAS blob deletion-intent PUT requests. Grows as garbage collection condemns blobs.", ValueType::Number) \
+    M(CASBlobIntentDelete, "Number of CAS blob deletion-intent DELETE requests. Grows as garbage collection removes intents.", ValueType::Number) \
+    M(CASBlobIntentList, "Number of CAS blob deletion-intent LIST requests. Growing values indicate more enumeration of intents.", ValueType::Number) \
     M(CASRefRepoint, "Number of CAS committed-reference repoints that republish a manifest. Growth indicates standalone part updates or removals.", ValueType::Number) \
     M(CASRefMove, "Number of CAS committed-reference renames done as one ref-log owner move, with no manifest republication.", ValueType::Number) \
     M(CASOwnershipConflict, "Number of CAS operations refused with CAS_OWNERSHIP_CONFLICT: the committed reference the writer had read was moved, dropped or repointed before its change landed.", ValueType::Number) \

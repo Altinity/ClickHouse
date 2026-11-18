@@ -217,6 +217,7 @@ TEST(CASInspect, RendersBlobTargetRunEdgeAndCondemnedRows)
     condemned_rec.size = 123;
     condemned_rec.condemn_round = 7;
     condemned_rec.marker_confirmed = true;
+    condemned_rec.standing = true;
 
     SourceEdgeRecord edge_rec;
     edge_rec.ref = bh(2);
@@ -239,6 +240,7 @@ TEST(CASInspect, RendersBlobTargetRunEdgeAndCondemnedRows)
     EXPECT_NE(json.find(R"("kind":"edge")"), String::npos) << json;
     EXPECT_NE(json.find(R"("kind":"condemned")"), String::npos) << json;
     EXPECT_NE(json.find(R"("delete_pending":true)"), String::npos) << json;
+    EXPECT_NE(json.find(R"("standing":true)"), String::npos) << json;
     EXPECT_NE(json.find(R"("condemn_round":7)"), String::npos) << json;
     EXPECT_NE(json.find(R"("value":"etag-1")"), String::npos) << json;
     EXPECT_NE(json.find(R"("type":"emulated")"), String::npos) << json;
