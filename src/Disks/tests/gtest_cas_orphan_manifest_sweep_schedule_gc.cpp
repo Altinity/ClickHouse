@@ -125,6 +125,7 @@ TEST(CASOrphanManifestSweepScheduleGc, DueForcesIdleFold)
 {
     ScheduleFixture f(1000, 3600, 1000);
     EXPECT_FALSE(f.run().deferred);
+    EXPECT_EQ(f.metric("defer_decision", "orphan_manifest_sweep_requires_fold"), 1);
     EXPECT_EQ(f.state().orphan_manifest_sweep_completed_at_ms, 1000);
 }
 
@@ -147,6 +148,7 @@ TEST(CASOrphanManifestSweepScheduleGc, WaitingPreservesOldDeferDecision)
     state.orphan_manifest_sweep_completed_at_ms = 1000;
     f.setState(state);
     EXPECT_TRUE(f.run().deferred);
+    EXPECT_EQ(f.metric("defer_decision", "orphan_manifest_sweep_requires_fold"), 0);
     expectSameSchedule(f.state(), state);
 }
 
@@ -436,6 +438,7 @@ TEST(CASOrphanManifestSweepScheduleGc, FailedSweepUsesBoundedDeferral)
             const auto deferred = f.run();
             ASSERT_TRUE(deferred.acquired_lease);
             ASSERT_TRUE(deferred.deferred);
+            EXPECT_EQ(f.metric("defer_decision", "orphan_manifest_sweep_requires_fold"), 0);
             EXPECT_EQ(f.state().snap_generation, adopted.snap_generation);
             expectSameSchedule(f.state(), adopted);
         }
@@ -443,11 +446,57 @@ TEST(CASOrphanManifestSweepScheduleGc, FailedSweepUsesBoundedDeferral)
         EXPECT_EQ(f.backend->getCount(checkpoint_key), 0);
         EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 0);
         EXPECT_THROW(f.run(), DB::Exception);
+        EXPECT_EQ(f.metric("defer_decision", "orphan_manifest_sweep_requires_fold"), 0);
         EXPECT_EQ(attempts, cycle + 2);
         EXPECT_GT(f.backend->getCount(checkpoint_key), 0);
         EXPECT_EQ(f.state().snap_generation, adopted.snap_generation);
         expectSameSchedule(f.state(), adopted);
     }
+}
+
+TEST(CASOrphanManifestSweepScheduleGc, FailedSweepForcedFoldSuppressionIsClearedByFoldWhileWaiting)
+{
+    ScheduleFixture f(1000, 3600, 2);
+    f.backend->before_manifest_list = []
+    {
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "test sweep list failure");
+    };
+    EXPECT_THROW(f.run(), DB::Exception);
+
+    auto state = f.state();
+    state.orphan_manifest_sweep_completed_at_ms = 1000;
+    f.setState(state);
+    const RootNamespace ns{"test/changed_while_waiting"};
+    const ManifestRef ref{1, 1, 1};
+    writeManifestRaw(*f.backend, f.store->layout(), ns, ref, {});
+    publishCommittedTransition(*f.backend, f.store->layout(), ns, "table", std::nullopt, ref);
+    f.now = 1001;
+    ASSERT_FALSE(f.run().deferred);
+    EXPECT_EQ(f.metric("defer_decision", "run_orphan_manifest_sweep"), 0);
+
+    f.now = 3601000;
+    const auto due = f.run();
+    ASSERT_TRUE(due.acquired_lease);
+    EXPECT_FALSE(due.deferred);
+    EXPECT_EQ(f.metric("defer_decision", "orphan_manifest_sweep_requires_fold"), 1);
+    EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 1);
+}
+
+TEST(CASOrphanManifestSweepScheduleGc, FailedSweepForcedFoldSuppressionIsLeaderLocal)
+{
+    ScheduleFixture f(1000, 3600, 2);
+    f.backend->before_manifest_list = []
+    {
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "test sweep list failure");
+    };
+    EXPECT_THROW(f.run(), DB::Exception);
+    f.makeGc();
+
+    const auto retried = f.run();
+    ASSERT_TRUE(retried.acquired_lease);
+    EXPECT_FALSE(retried.deferred);
+    EXPECT_EQ(f.metric("defer_decision", "orphan_manifest_sweep_requires_fold"), 1);
+    EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 1);
 }
 
 TEST(CASOrphanManifestSweepScheduleGc, SuccessfulPageAfterFailureRestoresImmediateContinuation)

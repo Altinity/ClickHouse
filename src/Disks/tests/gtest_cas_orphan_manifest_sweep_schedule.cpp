@@ -43,6 +43,13 @@ TEST(CASOrphanManifestSweepSchedule, UnfinishedTraversalIgnoresInterval)
     EXPECT_EQ(orphanManifestSweepDecisionOf(state, 3600, 1000, 999), OrphanManifestSweepDecision::ContinueSweep);
 }
 
+TEST(CASOrphanManifestSweepSchedule, UnfinishedTraversalPrecedesImmediateStart)
+{
+    GcState state;
+    state.manifest_sweep_cursor = "cursor";
+    EXPECT_EQ(orphanManifestSweepDecisionOf(state, 0, 1000, 1000), OrphanManifestSweepDecision::ContinueSweep);
+}
+
 TEST(CASOrphanManifestSweepSchedule, WaitsUntilExactIntervalBoundary)
 {
     GcState state;
@@ -65,6 +72,13 @@ TEST(CASOrphanManifestSweepSchedule, DisabledPreservesState)
     state.manifest_sweep_cursor = "cursor";
     EXPECT_EQ(orphanManifestSweepDecisionOf(state, 0, 0, 1000), OrphanManifestSweepDecision::Disabled);
     EXPECT_EQ(state.manifest_sweep_cursor, "cursor");
+}
+
+TEST(CASOrphanManifestSweepSchedule, DisabledPrecedesElapsedInterval)
+{
+    GcState state;
+    state.orphan_manifest_sweep_completed_at_ms = 1000;
+    EXPECT_EQ(orphanManifestSweepDecisionOf(state, 3600, 0, 3601000), OrphanManifestSweepDecision::Disabled);
 }
 
 TEST(CASOrphanManifestSweepSchedule, ClockRegressionWaits)

@@ -41,17 +41,18 @@ void seedWaitingSweep(Backend & backend, const Layout & layout)
 
 TEST(CASGCRoundDefer, PredicateTruthTable)
 {
-    /// threshold=1 (default): defer ONLY when zero shards changed AND no graduation due AND within bound.
-    EXPECT_TRUE (shouldDeferRound(/*changed*/0, /*grad_due*/false, /*since*/0, /*threshold*/1, /*max*/8));
-    EXPECT_FALSE(shouldDeferRound(1, false, 0, 1, 8));   // a shard changed => fold
-    EXPECT_FALSE(shouldDeferRound(0, true,  0, 1, 8));   // graduation due => force fold
-    EXPECT_FALSE(shouldDeferRound(0, false, 8, 1, 8));   // defer bound reached => force fold
+    /// threshold=1 (default): defer ONLY when zero shards changed, no graduation or sweep requires fold, and within bound.
+    EXPECT_TRUE (shouldDeferRound(0, false, 0, 1, 8, false));
+    EXPECT_FALSE(shouldDeferRound(1, false, 0, 1, 8, false));   // a shard changed => fold
+    EXPECT_FALSE(shouldDeferRound(0, true,  0, 1, 8, false));   // graduation due => force fold
+    EXPECT_FALSE(shouldDeferRound(0, false, 0, 1, 8, true));    // orphan sweep due => force fold
+    EXPECT_FALSE(shouldDeferRound(0, false, 8, 1, 8, false));   // defer bound reached => force fold
 
     /// threshold=3 (batching): defer while accumulated changed shards < threshold, no grad, within bound.
-    EXPECT_TRUE (shouldDeferRound(2, false, 0, 3, 8));
-    EXPECT_FALSE(shouldDeferRound(3, false, 0, 3, 8));   // reached threshold => fold
-    EXPECT_FALSE(shouldDeferRound(2, true,  0, 3, 8));   // graduation due => force fold regardless of size
-    EXPECT_FALSE(shouldDeferRound(2, false, 8, 3, 8));   // bound reached => force fold
+    EXPECT_TRUE (shouldDeferRound(2, false, 0, 3, 8, false));
+    EXPECT_FALSE(shouldDeferRound(3, false, 0, 3, 8, false));   // reached threshold => fold
+    EXPECT_FALSE(shouldDeferRound(2, true,  0, 3, 8, false));   // graduation due => force fold regardless of size
+    EXPECT_FALSE(shouldDeferRound(2, false, 8, 3, 8, false));   // bound reached => force fold
 }
 
 /// `graduationDue` reads ZERO-I/O from the adopted seal's `condemned_summary`. An
