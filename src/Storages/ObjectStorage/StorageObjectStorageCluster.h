@@ -199,7 +199,8 @@ private:
         ASTPtr & query,
         const StorageSnapshotPtr & storage_snapshot,
         const ContextPtr & context,
-        bool make_cluster_function) override;
+        bool make_cluster_function,
+        bool add_structure_and_format) override;
 
     bool isClusterSupported() const override;
 
@@ -236,7 +237,7 @@ private:
     to
     SELECT * FROM s3(...) SETTINGS object_storage_cluster='cluster'
     (and optionally to s3Cluster when make_cluster_function is true on the non-deferred path).
-    Returns true if cluster name was added to settings.
+    Returns true if a named engine table was converted to a table function, even if no cluster setting was added.
     */
     bool updateQueryForDistributedEngineIfNeeded(ASTPtr & query, ContextPtr context, bool make_cluster_function);
 
