@@ -421,11 +421,13 @@ TEST(CASGCLog, FinishLogLineMatchesCasGcLogRow)
 }
 
 /// A `Deferred` round completed as leader: it counts as a success for health, and like `NotALeader` it
-/// writes no `Information` line. On an empty pool with the default defer bound the first round defers.
+/// writes no `Information` line. Disable the orphan-manifest sweep so the first empty round can defer;
+/// an initial sweep would otherwise force a fold.
 TEST(CASGCLog, ADeferredRoundCountsAsASuccessAndLogsNoFinishLine)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto store = Pool::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .manifest_sweep_list_budget_keys = 0});
     std::vector<Rec> rows;
     DB::Cas::CasGcScheduler sched(store, std::chrono::seconds(1), "test::gc", "ca", [&](const Rec & r) { rows.push_back(r); });
     ASSERT_FALSE(sched.gcHealth().ever_succeeded);
