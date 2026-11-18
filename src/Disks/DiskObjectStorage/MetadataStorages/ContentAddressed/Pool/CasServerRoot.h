@@ -471,12 +471,30 @@ struct HeartbeatFloor
     size_t already_fenced = 0;
     /// The srids of every mount fenced-out THIS call (one GcFenceOut audit event each).
     std::vector<String> fenced_srids;
+    /// All srids observed as `gc_fenced` (both newly fenced and already fenced), used when
+    /// `cas_auto_forget_fenced_empty_after_sec > 0`.
+    std::vector<String> all_fenced_srids;
 };
 
 HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64_t now_ms,
                                      const std::function<uint64_t()> & mono_ms_fn,
                                      uint64_t observer_lease_ms, uint64_t cadence_ms, MountObservationMap & obs,
                                      std::set<String> & lease_mismatch_warned);
+
+/// Auto-prune `gc_fenced` mount slots whose `expires_at_ms` is at least `after_sec` seconds in the
+/// past, provided the slot owns zero entries in `catalog` (`Creating`, `Live`, or `Removing`) and
+/// zero objects under its manifest, staging, and data prefixes. Deletes `mount`, `epoch`, and `owner`
+/// via exact-token `op.remove`, aborting safely on any `Mismatch`. Never prunes `own_srid`.
+/// Returns the number of mount slots pruned.
+size_t pruneExpiredEmptyFencedServerRoots(
+    CasOperation & op,
+    const Layout & layout,
+    const RefCatalog & catalog,
+    const std::vector<String> & candidate_fenced_srids,
+    const String & own_srid,
+    uint64_t now_ms,
+    uint64_t after_sec,
+    const CasEventSink * event_sink = nullptr);
 
 /// One `gc/server-roots/<srid>/mount` slot whose holder is not provably finished with the prefix.
 struct NonTerminalMountSlot

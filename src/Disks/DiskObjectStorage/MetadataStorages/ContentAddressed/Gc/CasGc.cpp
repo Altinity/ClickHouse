@@ -899,6 +899,33 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         t.metric("terminated", floor.terminated);
         t.metric("fenced_now", floor.fenced_now);
         t.metric("already_fenced", floor.already_fenced);
+
+        const uint64_t auto_prune_after_sec = store->poolConfig().auto_forget_fenced_empty_after_sec;
+        if (auto_prune_after_sec > 0 && !floor.all_fenced_srids.empty())
+        {
+            refreshAuthority(state.lease.seq);
+            if (authority_held)
+            {
+                CasOperation prune_op = store->openRequests().admit([this] { return authority_held; });
+                try
+                {
+                    const CasRefCatalog::Snapshot cat = CasRefCatalog::read(prune_op, layout);
+                    cat.life_index.throwIfAmbiguous("CAS GC fenced mount auto-prune");
+                    const CasEventSink event_sink = [this](CasEvent e) { store->emitEvent(std::move(e)); };
+                    const size_t pruned = pruneExpiredEmptyFencedServerRoots(
+                        prune_op, layout, cat.catalog, floor.all_fenced_srids,
+                        store->poolConfig().server_root_id, now_ms_fn(), auto_prune_after_sec, &event_sink);
+                    t.metric("auto_pruned_fenced", pruned);
+                }
+                catch (const Exception & e)
+                {
+                    if (e.code() == ErrorCodes::CORRUPTED_DATA)
+                        LOG_WARNING(logger, "CAS GC skipped fenced mount auto-prune: {}", e.message());
+                    else
+                        throw;
+                }
+            }
+        }
     }
 
     /// Decide DEFER vs FOLD from cheap pre-fold signals.

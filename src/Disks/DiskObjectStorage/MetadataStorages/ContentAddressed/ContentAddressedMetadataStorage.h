@@ -643,6 +643,7 @@ private:
     const bool gc_enabled;
     const std::chrono::seconds gc_interval;
     const uint64_t gc_snapshot_generations_to_keep;  /// Number of GC snapshots retained (0 means keep all).
+    const uint64_t cas_auto_forget_fenced_empty_after_sec;
     const uint64_t gc_shards;                    /// Blob-hash-prefix reducer shard count, fixed at pool creation.
     const uint64_t manifest_sweep_list_budget_keys;
     const uint64_t manifest_sweep_delete_budget_keys;

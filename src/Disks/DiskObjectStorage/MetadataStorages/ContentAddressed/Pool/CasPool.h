@@ -85,6 +85,9 @@ struct PoolConfig
     /// margin covering any in-flight/resuming leader (a leader more than `keep` generations behind
     /// has lost its lease; its round-commit CAS fails).
     uint64_t gc_snapshot_generations_to_keep = 3;
+    /// Auto-prune fenced mount slots that own zero catalog namespaces and zero manifest/staging/data
+    /// objects after this many seconds past lease expiry. 0 = disabled.
+    uint64_t auto_forget_fenced_empty_after_sec = 0;
     /// Blob target shards for GC. Default 1 (a single shard, i.e. no fan-out). Creation-time only;
     /// the pool is authoritative on reopen. This is the BLOB-HASH-prefix reducer axis.
     uint64_t gc_shards = 1;
