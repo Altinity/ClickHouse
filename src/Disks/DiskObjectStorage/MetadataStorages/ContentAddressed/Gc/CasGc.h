@@ -22,6 +22,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -786,10 +787,22 @@ private:
         std::exception_ptr exception;
     };
 
-    struct RedeleteScheduleFailure
+    enum class RedeleteFailureKind
     {
-        IndexedException error;
-        size_t unscheduled_delete_blob_count{};
+        ReadBlobJob,
+        DeleteChunkJob,
+        ScheduleReadBlobJob,
+        ScheduleDeleteChunkJob,
+    };
+
+    static std::string_view redeleteFailureName(RedeleteFailureKind failure_kind);
+
+    struct IoJobsResult
+    {
+        bool on_pool = false;
+        size_t scheduled = 0;
+        std::vector<std::exception_ptr> scheduled_job_errors;
+        std::optional<IndexedException> job_schedule_error;
     };
 
     /// The settlement decisions of one shard in a round, counted where each is made: a decision whose
@@ -827,29 +840,35 @@ private:
         RedeleteRoundContext & ctx,
         const RetiredEntry & entry,
         const Layout & layout,
+        RedeleteFailureKind failure_kind,
         std::exception_ptr exception,
         std::optional<size_t> unscheduled_blob_count = std::nullopt);
 
-    std::optional<IndexedException> recordRedeleteResults(
+    std::optional<IndexedException> recordReadBlobJobFailures(
         RedeleteRoundContext & ctx,
         const std::vector<RetiredEntry> & entries,
         const Layout & layout,
+        std::vector<RedeleteBlobState> & redelete_blob_states,
+        const IoJobsResult & read_blob_jobs);
+
+    std::optional<IndexedException> recordDeleteChunkJobFailures(
+        RedeleteRoundContext & ctx,
+        const std::vector<RetiredEntry> & entries,
+        const Layout & layout,
+        std::vector<RedeleteBlobState> & redelete_blob_states,
+        const std::vector<ConditionalDeleteChunk> & delete_chunks,
+        const IoJobsResult & delete_chunk_jobs);
+
+    void recordRedeleteSuccesses(
+        RedeleteRoundContext & ctx,
+        const std::vector<RetiredEntry> & entries,
         const std::vector<RedeleteBlobState> & redelete_blob_states,
-        size_t scheduled_blob_head_job_count,
-        const std::vector<RedeleteScheduleFailure> & job_schedule_failures);
+        size_t scheduled_read_blob_job_count);
 
     void scheduleBlobMetaDeletes(
         const std::vector<RetiredEntry> & entries,
         const std::vector<RedeleteBlobState> & redelete_blob_states,
         uint64_t newest_round);
-
-    struct IoJobsResult
-    {
-        bool on_pool = false;
-        size_t scheduled = 0;
-        std::vector<std::exception_ptr> scheduled_job_errors;
-        std::optional<IndexedException> job_schedule_error;
-    };
 
     IoJobsResult runRedeleteIoJobs(
         ThreadPool & pool,

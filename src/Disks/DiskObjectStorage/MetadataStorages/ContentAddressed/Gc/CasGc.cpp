@@ -685,20 +685,34 @@ void Gc::scheduleBlobMetaDeletes(
     }
 }
 
+std::string_view Gc::redeleteFailureName(const RedeleteFailureKind failure_kind)
+{
+    switch (failure_kind)
+    {
+        case RedeleteFailureKind::ReadBlobJob: return "read blob job";
+        case RedeleteFailureKind::DeleteChunkJob: return "delete chunk job";
+        case RedeleteFailureKind::ScheduleReadBlobJob: return "scheduling read blob job";
+        case RedeleteFailureKind::ScheduleDeleteChunkJob: return "scheduling delete chunk job";
+    }
+    UNREACHABLE();
+}
+
 void Gc::recordRedeleteFailure(
     RedeleteRoundContext & ctx,
     const RetiredEntry & entry,
     const Layout & layout,
+    const RedeleteFailureKind failure_kind,
     const std::exception_ptr exception,
     const std::optional<size_t> unscheduled_blob_count)
 {
     ProfileEvents::increment(ProfileEvents::CASGCRetiredRedeleteFailed);
     ++ctx.report.redelete_failed;
     LOG_WARNING(logger,
-        "CAS gc: pending delete of blob {} (key `{}`, condemned at round {}) failed; the entry stays delete_pending "
+        "CAS gc: {} failed for blob {} (key `{}`, condemned at round {}); the entry stays delete_pending "
         "and is retried in the next round: {}{}",
-        blobIdOf(entry.ref), layout.blobKey(entry.ref), entry.condemn_round, getExceptionMessage(exception, false),
-        unscheduled_blob_count ? fmt::format("; {} re-delete entries were not submitted", *unscheduled_blob_count) : String{});
+        redeleteFailureName(failure_kind), blobIdOf(entry.ref), layout.blobKey(entry.ref), entry.condemn_round, getExceptionMessage(exception, false),
+        unscheduled_blob_count ? fmt::format("; {} blob {} were not submitted", *unscheduled_blob_count,
+            failure_kind == RedeleteFailureKind::ScheduleReadBlobJob ? "reads" : "deletions") : String{});
 }
 
 Gc::IoJobsResult Gc::runRedeleteIoJobs(
@@ -794,8 +808,8 @@ void Gc::redeleteBlobs(
 
     if (read_blob_jobs.on_pool)
         ctx.jobs_scheduled += read_blob_jobs.scheduled;
-    for (size_t i = 0; i < read_blob_jobs.scheduled; ++i)
-        redelete_blob_states[i].error = read_blob_jobs.scheduled_job_errors[i];
+    std::optional<IndexedException> first_error
+        = recordReadBlobJobFailures(ctx, entries, layout, redelete_blob_states, read_blob_jobs);
 
     const std::vector<ConditionalDeleteChunk> delete_chunks
         = prepareConditionalDeleteChunks(redelete_blob_states, conditionalDeleteKeysPerChunk());
@@ -816,75 +830,104 @@ void Gc::redeleteBlobs(
         });
 
     ctx.delete_chunks += delete_chunk_jobs.scheduled;
-    for (size_t chunk_index = 0; chunk_index < delete_chunk_jobs.scheduled; ++chunk_index)
-    {
-        if (!delete_chunk_jobs.scheduled_job_errors[chunk_index])
-            continue;
-        for (const size_t index : delete_chunks[chunk_index].blob_state_indices)
-            redelete_blob_states[index].error = delete_chunk_jobs.scheduled_job_errors[chunk_index];
-    }
 
-    std::vector<RedeleteScheduleFailure> job_schedule_failures;
-    if (read_blob_jobs.job_schedule_error)
-        job_schedule_failures.push_back({*read_blob_jobs.job_schedule_error, entries.size() - read_blob_jobs.job_schedule_error->index});
+    const std::optional<IndexedException> delete_error
+        = recordDeleteChunkJobFailures(ctx, entries, layout, redelete_blob_states, delete_chunks, delete_chunk_jobs);
 
-    if (delete_chunk_jobs.job_schedule_error)
-    {
-        size_t unscheduled_delete_blob_count = 0;
-        for (size_t chunk_index = delete_chunk_jobs.job_schedule_error->index; chunk_index < delete_chunks.size(); ++chunk_index)
-            unscheduled_delete_blob_count += delete_chunks[chunk_index].blob_state_indices.size();
-        job_schedule_failures.push_back(
-            {{delete_chunks[delete_chunk_jobs.job_schedule_error->index].blob_state_indices.front(), delete_chunk_jobs.job_schedule_error->exception},
-             unscheduled_delete_blob_count});
-    }
+    if (delete_error && (!first_error || delete_error->index < first_error->index))
+        first_error = delete_error;
 
-    const std::optional<IndexedException> first_error
-        = recordRedeleteResults(ctx, entries, layout, redelete_blob_states, read_blob_jobs.scheduled, job_schedule_failures);
-
+    recordRedeleteSuccesses(ctx, entries, redelete_blob_states, read_blob_jobs.scheduled);
     scheduleBlobMetaDeletes(entries, redelete_blob_states, ctx.new_round - 1);
 
     if (first_error)
         std::rethrow_exception(first_error->exception);
 }
 
-std::optional<Gc::IndexedException> Gc::recordRedeleteResults(
+std::optional<Gc::IndexedException> Gc::recordReadBlobJobFailures(
     RedeleteRoundContext & ctx,
     const std::vector<RetiredEntry> & entries,
     const Layout & layout,
-    const std::vector<RedeleteBlobState> & redelete_blob_states,
-    const size_t scheduled_blob_head_job_count,
-    const std::vector<RedeleteScheduleFailure> & job_schedule_failures)
+    std::vector<RedeleteBlobState> & redelete_blob_states,
+    const IoJobsResult & read_blob_jobs)
 {
     std::optional<IndexedException> first_error;
-    auto keep_first_error = [&](const IndexedException & error)
+    for (size_t i = 0; i < read_blob_jobs.scheduled; ++i)
     {
-        if (!first_error || error.index < first_error->index)
-            first_error = error;
-    };
-
-    for (size_t i = 0; i < scheduled_blob_head_job_count; ++i)
-    {
-        const std::exception_ptr & error = redelete_blob_states[i].error;
+        const std::exception_ptr & error = read_blob_jobs.scheduled_job_errors[i];
+        redelete_blob_states[i].error = error;
         if (!error)
             continue;
-        recordRedeleteFailure(ctx, entries[i], layout, error);
-        keep_first_error({i, error});
+        recordRedeleteFailure(ctx, entries[i], layout, RedeleteFailureKind::ReadBlobJob, error);
+        if (!first_error || i < first_error->index)
+            first_error = IndexedException{i, error};
     }
-    for (const RedeleteScheduleFailure & failure : job_schedule_failures)
+    if (read_blob_jobs.job_schedule_error)
     {
-        recordRedeleteFailure(ctx, entries[failure.error.index], layout, failure.error.exception, failure.unscheduled_delete_blob_count);
-        keep_first_error(failure.error);
+        const IndexedException & error = *read_blob_jobs.job_schedule_error;
+        chassert(error.index < entries.size());
+        recordRedeleteFailure(ctx, entries[error.index], layout, RedeleteFailureKind::ScheduleReadBlobJob,
+            error.exception, entries.size() - error.index);
+        if (!first_error || error.index < first_error->index)
+            first_error = error;
     }
+    return first_error;
+}
 
+std::optional<Gc::IndexedException> Gc::recordDeleteChunkJobFailures(
+    RedeleteRoundContext & ctx,
+    const std::vector<RetiredEntry> & entries,
+    const Layout & layout,
+    std::vector<RedeleteBlobState> & redelete_blob_states,
+    const std::vector<ConditionalDeleteChunk> & delete_chunks,
+    const IoJobsResult & delete_chunk_jobs)
+{
+    std::optional<IndexedException> first_error;
+    for (size_t chunk_index = 0; chunk_index < delete_chunk_jobs.scheduled; ++chunk_index)
+    {
+        const std::exception_ptr & error = delete_chunk_jobs.scheduled_job_errors[chunk_index];
+        if (!error)
+            continue;
+        for (const size_t index : delete_chunks[chunk_index].blob_state_indices)
+        {
+            redelete_blob_states[index].error = error;
+            recordRedeleteFailure(ctx, entries[index], layout, RedeleteFailureKind::DeleteChunkJob, error);
+            if (!first_error || index < first_error->index)
+                first_error = IndexedException{index, error};
+        }
+    }
+    if (delete_chunk_jobs.job_schedule_error)
+    {
+        const size_t first_unscheduled_chunk_index = delete_chunk_jobs.job_schedule_error->index;
+        chassert(first_unscheduled_chunk_index < delete_chunks.size());
+        size_t unscheduled_delete_blob_count = 0;
+        for (size_t chunk_index = first_unscheduled_chunk_index; chunk_index < delete_chunks.size(); ++chunk_index)
+            unscheduled_delete_blob_count += delete_chunks[chunk_index].blob_state_indices.size();
+
+        const size_t index = delete_chunks[first_unscheduled_chunk_index].blob_state_indices.front();
+        const std::exception_ptr & error = delete_chunk_jobs.job_schedule_error->exception;
+        recordRedeleteFailure(ctx, entries[index], layout, RedeleteFailureKind::ScheduleDeleteChunkJob,
+            error, unscheduled_delete_blob_count);
+        if (!first_error || index < first_error->index)
+            first_error = IndexedException{index, error};
+    }
+    return first_error;
+}
+
+void Gc::recordRedeleteSuccesses(
+    RedeleteRoundContext & ctx,
+    const std::vector<RetiredEntry> & entries,
+    const std::vector<RedeleteBlobState> & redelete_blob_states,
+    const size_t scheduled_read_blob_job_count)
+{
     /// Every submitted delete of the batch has already run. If `recordRedeleteSuccess` throws, the batch stays deleted
     /// but unrecorded: the round fails before its outcome logs and `gc/state` commit, every entry stays
     /// `delete_pending`, and the next round records the deleted ones as `Absent`.
-    for (size_t i = 0; i < scheduled_blob_head_job_count; ++i)
+    for (size_t i = 0; i < scheduled_read_blob_job_count; ++i)
     {
         if (!redelete_blob_states[i].error && redelete_blob_states[i].removal_result)
             recordRedeleteSuccess(ctx, entries[i], redelete_blob_states[i]);
     }
-    return first_error;
 }
 
 RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool allow_steal, UniversePolicy policy,
@@ -1227,7 +1270,9 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             .outcome_tallies = outcome_tallies,
             .jobs_scheduled = redelete_jobs_scheduled,
             .delete_chunks = redelete_chunks};
+
         redeleteBlobs(redelete_ctx, redelete_now, *io_pool, store->poolConfig().gc_io_concurrency, layout, op);
+
         for (const RetiredEntry & entry : merge.spared)
         {
             /// A fresh dedup-adopt raced the condemn (see the matching CasGcFold Debug log emitted

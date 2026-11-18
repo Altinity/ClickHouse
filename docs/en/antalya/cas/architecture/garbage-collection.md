@@ -435,6 +435,19 @@ forensic outcome logs.
   counts logical conditional-delete chunks submitted by GC. `DiskS3DeleteObjects` counts physical S3
   delete attempts, including request retries
 
+GC reports read-job failures after all submitted blob-state reads finish, before starting the
+conditional-delete wave. It reports delete-job failures after all submitted delete chunks finish.
+Warnings distinguish read jobs, delete chunk jobs, and failures to enqueue either kind of job.
+A failed delete job can have an unknown or partial storage outcome; its warning does not imply that
+all objects in the chunk remain present.
+
+Read failures do not prevent deletion of successfully read siblings. After both waves, GC records
+known outcomes and schedules eligible `.meta` cleanup, then rethrows the original job or enqueue
+exception with the lowest input blob index. An unsuccessful round leaves the previously published
+pending entries available to the next round. The existing `jobs_failed` metric and
+`CASGCRetiredRedeleteFailed` event count each failed blob from an executed job, but count an enqueue
+failure once per wave, regardless of the number of unsubmitted blobs reported in its warning.
+
 The project RustFS integration backend supports exact-token singleton deletes but does not implement
 AWS per-object `ETag` conditions in `DeleteObjects`. Its mount probe therefore keeps one-key chunks;
 integration coverage verifies this fallback and physical blob reclamation. Positive AWS batching is

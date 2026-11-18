@@ -17,6 +17,7 @@
 #include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
 #include <Common/ThreadPool.h>
+#include <Common/logger_useful.h>
 #include <base/scope_guard.h>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
@@ -118,6 +119,39 @@ private:
     bool only_workers = true;
     std::set<String> remove_keys;
     std::set<String> head_keys;
+};
+
+class RedeleteDiagnosticsBackend : public InMemoryBackend
+{
+public:
+    std::set<String> blob_keys;
+    std::function<void(const String &)> read_blob_hook;
+    std::function<void(const std::vector<RawConditionalRemove> &)> delete_chunk_hook;
+
+    std::optional<RawMeta> head(const String & key, TransportAccess & access) override
+    {
+        if (!read_blob_hook || !blob_keys.contains(key))
+            return InMemoryBackend::head(key, access);
+
+        SCOPE_EXIT({ LOG_WARNING(logger, "Test blob read finished"); });
+        read_blob_hook(key);
+        return InMemoryBackend::head(key, access);
+    }
+
+    std::vector<RawRemoval> removeManyByConditional(
+        const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
+    {
+        if (!delete_chunk_hook)
+            return InMemoryBackend::removeManyByConditional(removals, access);
+
+        LOG_WARNING(logger, "Test delete chunk started");
+        SCOPE_EXIT({ LOG_WARNING(logger, "Test delete chunk finished"); });
+        delete_chunk_hook(removals);
+        return InMemoryBackend::removeManyByConditional(removals, access);
+    }
+
+private:
+    LoggerPtr logger = getLogger("CasGc");
 };
 
 class BlobRemoveWitnessBackend : public InMemoryBackend
@@ -846,6 +880,129 @@ TEST(CASGCRedeleteConcurrency, TwoWorkerFailuresAreEachCountedAndTheRoundThrowsO
     EXPECT_EQ(next.deleted, 2u);
     EXPECT_EQ(next.absent, kBlobs - 2);
     EXPECT_TRUE(allBlobsAbsent(*backend, *store));
+}
+
+TEST(CASGCRedeleteConcurrency, FailuresAreReportedAfterTheirWaveAndRethrowLowestBlobIndex)
+{
+    for (const uint64_t concurrency : {1, 4})
+    {
+        SCOPED_TRACE(concurrency);
+        auto backend = std::make_shared<RedeleteDiagnosticsBackend>();
+        backend->pinConditionalBatchDeleteSupport(true);
+        auto store = openPoolWithIoConcurrency(backend, concurrency, 1, 0, {}, std::nullopt, 2);
+        Gc gc(store, kGc);
+        publishThenDrop(*backend, store, gc);
+        ASSERT_NO_FATAL_FAILURE(driveUntilAllGraduated(*backend, gc, store, kFaultedBlob));
+        const auto preview = previewPendingDeletes(gc);
+        ASSERT_EQ(preview.size(), kBlobs);
+
+        /// Identical messages require the GC diagnostic to identify the operation itself.
+        const auto read_error = std::make_exception_ptr(std::runtime_error("injected job fault"));
+        const auto delete_error = std::make_exception_ptr(std::runtime_error("injected job fault"));
+        backend->blob_keys = allBlobKeys(*store);
+        backend->read_blob_hook = [&](const String & key)
+        {
+            if (key == preview.back().key)
+                std::rethrow_exception(read_error);
+        };
+        backend->delete_chunk_hook = [&](const std::vector<Backend::RawConditionalRemove> & removals)
+        {
+            if (removals.front().key == preview.front().key)
+            {
+                EXPECT_EQ(removals.size(), 2u);
+                std::rethrow_exception(delete_error);
+            }
+        };
+
+        ScopedLogCapture capture("CasGc", "warning");
+        auto rows = std::make_shared<PendingDeletesRows>();
+        gc.setPhaseSink(recordPendingDeletes(rows));
+        const auto failed_before = failedCounter();
+        RoundReport progress;
+        std::exception_ptr error;
+        try
+        {
+            gc.runRegularRound({}, /*allow_steal*/ true, UniversePolicy::Authoritative, &progress);
+        }
+        catch (...)
+        {
+            error = std::current_exception();
+        }
+        backend->read_blob_hook = {};
+        backend->delete_chunk_hook = {};
+
+        const String log = capture.captured();
+        const size_t read_warning = log.find("CAS gc: read blob job failed");
+        const size_t delete_warning = log.find("CAS gc: delete chunk job failed");
+        ASSERT_NE(read_warning, String::npos);
+        ASSERT_NE(delete_warning, String::npos);
+        EXPECT_LT(log.rfind("Test blob read finished"), read_warning);
+        EXPECT_LT(read_warning, log.find("Test delete chunk started"));
+        EXPECT_LT(log.rfind("Test delete chunk finished"), delete_warning);
+        EXPECT_EQ(capture.count("CAS gc: read blob job failed"), 1u);
+        EXPECT_EQ(capture.count("CAS gc: delete chunk job failed"), 2u);
+        EXPECT_EQ(error, delete_error) << "the lower blob index wins even though its wave is logged later";
+        EXPECT_EQ(progress.redeleted, 3u);
+        EXPECT_EQ(progress.redelete_failed, 3u);
+        EXPECT_EQ(failedCounter() - failed_before, 3u);
+        EXPECT_EQ(rows->total("jobs_failed"), 3u);
+        EXPECT_EQ(rows->total("delete_batches"), 3u);
+        EXPECT_EQ(rows->total("jobs_scheduled"), concurrency == 1 ? 0u : kBlobs);
+        EXPECT_EQ(previewPendingDeletes(gc).size(), kBlobs);
+        for (size_t i = 0; i < preview.size(); ++i)
+        {
+            OperationForTest op(*backend);
+            EXPECT_EQ((*op).head(preview[i].key, Retry::once()).has_value(), i < 2 || i == 5);
+        }
+        store->renewWatermarkOnce();
+        EXPECT_EQ(runRegularRoundReclaiming(gc).redeleted, kBlobs);
+        EXPECT_TRUE(allBlobsAbsent(*backend, *store));
+    }
+}
+
+TEST(CASGCRedeleteConcurrency, EnqueueFailuresIdentifyWaveAndUnscheduledBlobCount)
+{
+    struct Case
+    {
+        bool delete_wave;
+        size_t refused_job;
+        size_t deleted;
+        size_t unscheduled;
+    };
+    for (const Case test : {Case{false, 0, 0, 6}, Case{false, 3, 3, 3}, Case{true, 0, 0, 6}, Case{true, 1, 4, 2}})
+    {
+        SCOPED_TRACE(test.delete_wave);
+        SCOPED_TRACE(test.refused_job);
+        auto backend = std::make_shared<InMemoryBackend>();
+        backend->pinConditionalBatchDeleteSupport(true);
+        const size_t refused_index = (test.delete_wave ? kBlobs : 0) + test.refused_job;
+        auto store = openPoolWithIoConcurrency(backend, 4, 1, 0, {}, refused_index, 4);
+        Gc gc(store, kGc);
+        publishThenDrop(*backend, store, gc);
+        ASSERT_NO_FATAL_FAILURE(driveUntilAllGraduated(*backend, gc, store, kFaultedBlob));
+
+        ScopedLogCapture capture("CasGc", "warning");
+        auto rows = std::make_shared<PendingDeletesRows>();
+        gc.setPhaseSink(recordPendingDeletes(rows));
+        const auto failed_before = failedCounter();
+        RoundReport progress;
+        expectThrowsCode(DB::ErrorCodes::CANNOT_SCHEDULE_TASK, [&]
+        {
+            gc.runRegularRound({}, /*allow_steal*/ true, UniversePolicy::Authoritative, &progress);
+        });
+        EXPECT_EQ(capture.count(test.delete_wave
+            ? "CAS gc: scheduling delete chunk job failed" : "CAS gc: scheduling read blob job failed"), 1u);
+        EXPECT_NE(capture.captured().find(std::to_string(test.unscheduled) + (test.delete_wave
+            ? " blob deletions were not submitted" : " blob reads were not submitted")), String::npos);
+        EXPECT_EQ(progress.redeleted, test.deleted);
+        EXPECT_EQ(progress.redelete_failed, 1u);
+        EXPECT_EQ(failedCounter() - failed_before, 1u);
+        EXPECT_EQ(rows->total("jobs_failed"), 1u);
+        EXPECT_EQ(previewPendingDeletes(gc).size(), kBlobs);
+        store->renewWatermarkOnce();
+        EXPECT_EQ(runRegularRoundReclaiming(gc).redeleted, kBlobs);
+        EXPECT_TRUE(allBlobsAbsent(*backend, *store));
+    }
 }
 
 TEST(CASGCRedeleteConcurrency, WorkerHeadFaultIsCountedAndRetriedNextRound)

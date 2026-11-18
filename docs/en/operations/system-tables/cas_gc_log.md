@@ -133,6 +133,10 @@ Two caveats when reading these rows:
   `fold_ref_intake` and `fold_reduce` — also run on other threads and are missing from those phase
   rows' `ProfileEvents`. They still count in `system.events`. On `pending_deletes`, read
   `phase_metrics` `jobs_scheduled` / `jobs_failed` next to `redeleted`.
+  `jobs_failed` counts failed blobs from executed read/delete jobs, plus one per enqueue failure.
+  A failed chunk with multiple blobs therefore contributes multiple failures, while an unsubmitted
+  tail contributes one enqueue failure. GC warning messages distinguish these cases: read errors
+  are reported after the read wave completes, and delete errors after the delete wave completes.
 - Phase durations do not sum to the round's `duration_ms`. The round also performs untimed
   bookkeeping between phases, and the `Finish` row's `duration_ms` remains the authority on total
   round time.
