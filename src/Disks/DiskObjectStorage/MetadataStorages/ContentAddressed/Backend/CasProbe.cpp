@@ -33,12 +33,13 @@ Removal removeOrReportDeleteMarker(CasOperation & op, const String & key, const 
             throw;
         throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
             "CasProbe: remove succeeded but created a versioning delete marker — the bucket has "
-            "object VERSIONING enabled, and a content-addressed pool cannot run on a versioned bucket: "
-            "every GC delete would archive a noncurrent version instead of reclaiming storage (the bucket "
-            "grows forever), and the constantly-rewritten ref objects would pile up versions on every "
-            "commit. Use a bucket where versioning was NEVER enabled; skip_access_check skips this probe "
-            "but does not make a versioned bucket usable — note that merely SUSPENDING versioning is not enough (deletes on a "
-            "versioning-suspended bucket still mint delete markers, so this probe will refuse again)");
+            "object VERSIONING enabled or suspended, and a content-addressed pool cannot run on an "
+            "actively versioned bucket: every GC delete would archive a noncurrent version instead of "
+            "reclaiming storage (the bucket grows forever), and the constantly-rewritten ref objects "
+            "would pile up versions on every commit. Use an unversioned bucket, or — if versioning is "
+            "Suspended (never Enabled) and an ExpiredObjectDeleteMarker lifecycle rule is configured — "
+            "set <cas_allow_versioning_suspended>true</cas_allow_versioning_suspended> on the disk; "
+            "skip_access_check skips this probe but does not bypass delete-marker refusal");
     }
 }
 

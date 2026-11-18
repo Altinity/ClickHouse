@@ -38,6 +38,7 @@ using namespace DB::Cas;
 
 namespace DB::ErrorCodes
 {
+    extern const int CAS_DELETE_MARKER;
     extern const int NOT_IMPLEMENTED;
 }
 
@@ -404,6 +405,101 @@ TEST(CASBackendGeneration, ConditionalWriteSettingsForceSinglePutOnGenerationSto
     EXPECT_EQ(ws2.s3_max_unexpected_write_error_retries_override, 1u);
     ASSERT_TRUE(ws2.s3_check_objects_after_upload_override.has_value());
     EXPECT_FALSE(*ws2.s3_check_objects_after_upload_override);
+}
+
+namespace
+{
+class SuspendedVersioningObjectStorage final : public DB::LocalObjectStorage
+{
+public:
+    SuspendedVersioningObjectStorage(DB::LocalObjectStorageSettings settings_, BucketVersioningStatus status_)
+        : DB::LocalObjectStorage(std::move(settings_)), status(status_)
+    {
+    }
+
+    BucketVersioningStatus getBucketVersioningStatus(const DB::ObjectStorageControlRequest &) const override
+    {
+        return status;
+    }
+
+    DB::ConditionalRemoveResult removeObjectIfTokenMatches(
+        const DB::StoredObject &, const std::string &, const DB::ObjectStorageControlRequest &) override
+    {
+        return {.outcome = DB::ConditionalRemoveOutcome::Removed, .created_delete_marker = true};
+    }
+
+private:
+    const BucketVersioningStatus status;
+};
+
+std::shared_ptr<SuspendedVersioningObjectStorage> makeSuspendedVersioningStorage(
+    DB::IObjectStorage::BucketVersioningStatus status)
+{
+    static std::atomic<uint64_t> counter{0};
+    const auto unique = std::to_string(::getpid()) + "_susp_" + std::to_string(counter.fetch_add(1));
+    const auto root = (std::filesystem::temp_directory_path() / ("cas_unit_susp_" + unique)).string();
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root, ec);
+    DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
+    return std::make_shared<SuspendedVersioningObjectStorage>(std::move(settings), status);
+}
+}
+
+TEST(CASBackendGeneration, S3SuspendedVersioningRequiresOptInAndStillRefusesEnabled)
+{
+    using Status = DB::IObjectStorage::BucketVersioningStatus;
+    auto seed_object = [](const std::shared_ptr<SuspendedVersioningObjectStorage> & storage) -> String
+    {
+        const String key = DB::Cas::tests::nativeKeyUnder(storage, "p/k");
+        auto out = storage->writeObject(
+            DB::StoredObject(key), DB::WriteMode::Rewrite, {}, DB::DBMS_DEFAULT_BUFFER_SIZE, DB::WriteSettings{});
+        DB::writeString(String("v1"), *out);
+        out->finalize();
+        return key;
+    };
+
+    /// Default (allow_versioning_suspended=false): delete marker throws CAS_DELETE_MARKER.
+    {
+        auto storage = makeSuspendedVersioningStorage(Status::Suspended);
+        const String key = seed_object(storage);
+        auto b = std::make_shared<ObjectStorageBackend>(
+            storage, ObjectStorageBackend::Mode::Native, false, 0, 0, /*allow_versioning_suspended=*/false);
+        EXPECT_NO_THROW(b->checkPoolPreconditions());
+        DB::Cas::tests::OperationForTest op(*b);
+        const auto meta = (*op).head(key, Retry::once());
+        ASSERT_TRUE(meta.has_value());
+        DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CAS_DELETE_MARKER,
+            [&] { (void)(*op).remove(key, meta->etag, Retry::once()); });
+    }
+
+    /// Opted in (allow_versioning_suspended=true) on Suspended: checkPoolPreconditions passes and
+    /// delete markers are accepted as Removed.
+    {
+        auto storage = makeSuspendedVersioningStorage(Status::Suspended);
+        const String key = seed_object(storage);
+        auto b = std::make_shared<ObjectStorageBackend>(
+            storage, ObjectStorageBackend::Mode::Native, false, 0, 0, /*allow_versioning_suspended=*/true);
+        EXPECT_NO_THROW(b->checkPoolPreconditions());
+        DB::Cas::tests::OperationForTest op(*b);
+        const auto meta = (*op).head(key, Retry::once());
+        ASSERT_TRUE(meta.has_value());
+        EXPECT_EQ((*op).remove(key, meta->etag, Retry::once()), Removal::Removed);
+    }
+
+    /// Opted in (allow_versioning_suspended=true) on Enabled: checkPoolPreconditions and remove() still refuse.
+    {
+        auto storage = makeSuspendedVersioningStorage(Status::Enabled);
+        const String key = seed_object(storage);
+        auto b = std::make_shared<ObjectStorageBackend>(
+            storage, ObjectStorageBackend::Mode::Native, false, 0, 0, /*allow_versioning_suspended=*/true);
+        expectThrowsNotImplementedSaying("VERSIONING Enabled", [&] { b->checkPoolPreconditions(); });
+        DB::Cas::tests::OperationForTest op(*b);
+        const auto meta = (*op).head(key, Retry::once());
+        ASSERT_TRUE(meta.has_value());
+        expectThrowsNotImplementedSaying("VERSIONING Enabled",
+            [&] { (void)(*op).remove(key, meta->etag, Retry::once()); });
+    }
 }
 
 /// `tokenForHead` and `tokenMatches` were deleted with the `Token` type they built: minting an

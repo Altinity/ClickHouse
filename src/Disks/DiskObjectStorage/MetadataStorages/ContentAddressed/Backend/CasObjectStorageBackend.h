@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestBudget.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
+#include <atomic>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -71,7 +72,8 @@ public:
     /// that opens the pool; the defaults are what a narrow unit test constructing a bare backend gets.
     ObjectStorageBackend(ObjectStoragePtr object_storage_, Mode mode_,
                          bool single_attempt_control_plane_ = false, uint64_t attempt_timeout_ms_ = 0,
-                         uint64_t connect_timeout_cap_ms_ = 0);
+                         uint64_t connect_timeout_cap_ms_ = 0,
+                         bool allow_versioning_suspended_ = false);
 
     /// Read the whole object, or return `nullopt` if it is absent. Native mode reads the incarnation
     /// value out of the GET response itself, so no HEAD precedes it; a not-found race is reported as
@@ -225,6 +227,14 @@ private:
     const bool single_attempt_control_plane;
     const uint64_t attempt_timeout_ms;
     const uint64_t connect_timeout_cap_ms;
+    const bool allow_versioning_suspended;
+    mutable std::atomic<bool> suspended_delete_markers_checked{false};
+    mutable std::atomic<bool> suspended_delete_markers_allowed{false};
+
+    /// Checks `getBucketVersioningStatus` once when `allow_versioning_suspended` is enabled;
+    /// always refuses `BucketVersioningStatus::Enabled` and permits `Suspended` (or `Unknown`
+    /// with an explicit warning) when opted in.
+    bool verifySuspendedVersioningAllowed() const;
     ObjectStorageRetryProfile controlPlaneProfile() const
     {
         return single_attempt_control_plane ? ObjectStorageRetryProfile::SingleAttempt : ObjectStorageRetryProfile::Default;

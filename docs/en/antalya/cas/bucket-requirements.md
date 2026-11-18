@@ -33,6 +33,8 @@ Bucket **versioning is not required** — in fact it must be **disabled** on the
 dialect (see below), because a token-exact delete on a versioned bucket archives a noncurrent
 generation instead of reclaiming storage, silently stopping GC reclamation.
 
+On S3 (`ETag` dialect), an unversioned bucket is the default and recommended setup. If a bucket previously had versioning enabled and is now **`Suspended`**, `DeleteObject` on S3 still creates a `"null"`-version delete marker (`x-amz-delete-marker: true`), which `CasProbe` and GC reject by default (`CAS_DELETE_MARKER` / `NOT_IMPLEMENTED`). When the bucket's versioning status is `Suspended` (never `Enabled`) and an S3 lifecycle rule with `ExpiredObjectDeleteMarker: true` (and `NoncurrentVersionExpiration`) is configured, set `<cas_allow_versioning_suspended>true</cas_allow_versioning_suspended>` on the disk to allow mounting and delete-marker acceptance while still rejecting `Enabled` buckets.
+
 On the generation-token dialect that requirement is checked at mount. A bucket reported as versioned
 refuses the mount. A probe that could not answer — the credential may not read the bucket's versioning
 configuration (`storage.buckets.get` on GCS), or the backend cannot report it — does not: the mount
