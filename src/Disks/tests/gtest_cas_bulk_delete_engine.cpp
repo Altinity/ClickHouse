@@ -20,6 +20,12 @@ using namespace DB::Cas;
 using DB::Cas::tests::CountingBackend;
 using DB::Cas::tests::openRequestsForTest;
 
+namespace DB::ErrorCodes
+{
+    extern const int CAS_DELETE_MARKER;
+    extern const int LOGICAL_ERROR;
+}
+
 namespace
 {
 
@@ -39,6 +45,28 @@ class UnlimitedConditionalBatchBackend : public InMemoryBackend
 {
 public:
     size_t conditionalBatchDeleteKeyLimit() const override { return kBulkDeleteMaxKeys + 1; }
+};
+
+class RecordingConditionalBackend : public InMemoryBackend
+{
+public:
+    std::vector<std::vector<RawConditionalRemove>> attempts;
+    bool lose_first_response = false;
+
+    std::vector<RawRemoval> removeManyByConditional(
+        const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
+    {
+        attempts.push_back(removals);
+        if (lose_first_response && attempts.size() == 1 && removals.size() == 2)
+        {
+            const auto & first = removals[0];
+            const auto & second = removals[1];
+            EXPECT_EQ(remove(first.key, first.expected_token, access), RawRemoval::Removed);
+            EXPECT_TRUE(write(second.key, "replacement", second.expected_token, access).has_value());
+            throw Poco::TimeoutException("lost conditional delete response");
+        }
+        return InMemoryBackend::removeManyByConditional(removals, access);
+    }
 };
 
 }
@@ -104,6 +132,101 @@ TEST(CASConditionalBatchDeleteEngine, ReturnsMixedOutcomesInInputOrder)
     const auto replaced = op.read(replaced_key, Retry::once());
     ASSERT_TRUE(replaced.has_value());
     EXPECT_EQ(replaced->bytes, "v2");
+}
+
+TEST(CASConditionalBatchDeleteEngine, PartialSuccessRetryKeepsOriginalTokens)
+{
+    auto backend = std::make_shared<RecordingConditionalBackend>();
+    backend->pinConditionalBatchDeleteSupport(true);
+    backend->lose_first_response = true;
+    DB::Cas::tests::FakeClock clock;
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), nullptr, kDefaultRequestWindowMs);
+    auto op = requests.admit();
+    const auto first = std::get<Committed>(op.create("a", "first", Retry::once())).etag;
+    const auto second = std::get<Committed>(op.create("b", "second", Retry::once())).etag;
+
+    const auto results = op.removeManyByConditional({{"a", first}, {"b", second}}, Retry::standard());
+
+    EXPECT_EQ(results, (std::vector{Removal::Gone, Removal::Mismatch}));
+    ASSERT_EQ(backend->attempts.size(), 2u);
+    for (const auto & attempt : backend->attempts)
+    {
+        ASSERT_EQ(attempt.size(), 2u);
+        EXPECT_EQ(attempt[0].key, "a");
+        EXPECT_EQ(attempt[0].expected_token, PersistedEtag::capture(first).value);
+        EXPECT_EQ(attempt[1].key, "b");
+        EXPECT_EQ(attempt[1].expected_token, PersistedEtag::capture(second).value);
+    }
+    EXPECT_FALSE(op.head("a", Retry::once()));
+    const auto replacement = op.read("b", Retry::once());
+    ASSERT_TRUE(replacement);
+    EXPECT_EQ(replacement->bytes, "replacement");
+}
+
+TEST(CASConditionalBatchDeleteEngine, DeleteMarkerFailsTheChunk)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    backend->pinConditionalBatchDeleteSupport(true);
+    auto requests = openRequestsForTest(backend);
+    auto op = requests.admit();
+    const auto first = std::get<Committed>(op.create("a", "body", Retry::once())).etag;
+    const auto second = std::get<Committed>(op.create("b", "body", Retry::once())).etag;
+    ASSERT_EQ(op.remove("a", first, Retry::once()), Removal::Removed);
+    backend->setSimulateDeleteMarkers(true);
+
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CAS_DELETE_MARKER, [&]
+    {
+        op.removeManyByConditional({{"a", first}, {"b", second}}, Retry::once());
+    });
+}
+
+TEST(CASConditionalBatchDeleteEngine, EmptyInputMakesNoRequestAndAFullChunkMakesOne)
+{
+    auto backend = std::make_shared<RecordingConditionalBackend>();
+    backend->pinConditionalBatchDeleteSupport(true);
+    auto requests = openRequestsForTest(backend);
+    auto op = requests.admit();
+    EXPECT_TRUE(op.removeManyByConditional({}, Retry::once()).empty());
+    EXPECT_TRUE(backend->attempts.empty());
+
+    std::vector<ConditionalRemove> chunk;
+    for (size_t i = 0; i < kBulkDeleteMaxKeys; ++i)
+    {
+        const String key = std::to_string(i);
+        chunk.push_back({key, std::get<Committed>(op.create(key, "body", Retry::once())).etag});
+    }
+    EXPECT_EQ(op.removeManyByConditional(chunk, Retry::once()), std::vector<Removal>(chunk.size(), Removal::Removed));
+    ASSERT_EQ(backend->attempts.size(), 1u);
+    EXPECT_EQ(backend->attempts.front().size(), chunk.size());
+}
+
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+TEST(CASConditionalBatchDeleteEngineDeathTest, RejectsDuplicateKeysAndForeignTokensBeforeSending)
+#else
+TEST(CASConditionalBatchDeleteEngine, RejectsDuplicateKeysAndForeignTokensBeforeSending)
+#endif
+{
+    auto backend = std::make_shared<RecordingConditionalBackend>();
+    backend->pinConditionalBatchDeleteSupport(true);
+    auto requests = openRequestsForTest(backend);
+    auto op = requests.admit();
+    auto other_requests = openRequestsForTest(std::make_shared<InMemoryBackend>());
+    auto other_op = other_requests.admit();
+    const auto token = std::get<Committed>(op.create("a", "body", Retry::once())).etag;
+    const auto foreign = std::get<Committed>(other_op.create("b", "body", Retry::once())).etag;
+    const ConditionalRemove first{"a", token};
+    for (const auto & invalid : {first, ConditionalRemove{"b", token}, ConditionalRemove{"b", foreign}})
+    {
+        SCOPED_TRACE(invalid.expected_token.render() + " for " + invalid.key);
+        const std::vector<ConditionalRemove> chunk{first, invalid};
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+        EXPECT_DEATH({ op.removeManyByConditional(chunk, Retry::once()); }, "duplicate key|cannot be the precondition");
+#else
+        DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { op.removeManyByConditional(chunk, Retry::once()); });
+#endif
+    }
+    EXPECT_TRUE(backend->attempts.empty());
+    EXPECT_TRUE(op.head("a", Retry::once()));
 }
 
 TEST(CASBulkDeleteEngine, ExactlyOneThousandKeysIsOneRequest)

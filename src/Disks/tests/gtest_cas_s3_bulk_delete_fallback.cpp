@@ -39,6 +39,7 @@
 
 namespace DB::ErrorCodes
 {
+extern const int LOGICAL_ERROR;
 extern const int NOT_IMPLEMENTED;
 }
 
@@ -227,14 +228,16 @@ std::shared_ptr<DB::S3ObjectStorage> makeStorageForTest(
     const std::string & endpoint,
     const DB::S3Capabilities & capabilities,
     std::optional<uint64_t> objects_chunk_size_to_delete = {},
-    const DB::S3ObjectStorage::S3CredentialsRefreshCallback & credentials_refresh_callback = {})
+    const DB::S3ObjectStorage::S3CredentialsRefreshCallback & credentials_refresh_callback = {},
+    unsigned int max_retries = 0)
 {
-    DB::RemoteHostFilter remote_host_filter;
+    /// The configuration retains this reference when the storage clones its single-attempt client.
+    static const DB::RemoteHostFilter remote_host_filter;
     DB::S3::PocoHTTPClientConfiguration cfg = DB::S3::ClientFactory::instance().createClientConfiguration(
         "us-east-1",
         remote_host_filter,
         /* s3_max_redirects = */ 100,
-        DB::S3::PocoHTTPClientConfiguration::RetryStrategy{.max_retries = 0},
+        DB::S3::PocoHTTPClientConfiguration::RetryStrategy{.max_retries = max_retries},
         /* s3_slow_all_threads_after_network_error = */ false,
         /* s3_slow_all_threads_after_retryable_error = */ false,
         /* enable_s3_requests_logging = */ false,
@@ -445,38 +448,107 @@ TEST(CASS3ConditionalBatchDelete, DoesNotTreatMissingBucketAsMissingObject)
     }
 }
 
+TEST(CASS3ConditionalBatchDelete, ReturnsDeleteMarkerOnlyForTheMarkedKey)
+{
+    (void)contextForTest();
+    ScriptedS3Server server([](const Poco::Net::HTTPServerRequest &, Poco::Net::HTTPServerResponse & response)
+    {
+        sendXml(response, Poco::Net::HTTPResponse::HTTP_OK,
+            "<DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+            "<Deleted><Key>marked</Key><DeleteMarker>true</DeleteMarker></Deleted>"
+            "<Deleted><Key>plain</Key></Deleted>"
+            "<Error><Key>absent</Key><Code>NoSuchKey</Code></Error>"
+            "</DeleteResult>");
+    });
+    auto storage = makeStorageForTest(server.getUrl(), DB::S3Capabilities{});
+
+    const auto results = storage->removeObjectsIfTokensMatch(
+        {{DB::StoredObject("absent"), "etag-a"}, {DB::StoredObject("plain"), "etag-p"}, {DB::StoredObject("marked"), "etag-m"}},
+        DB::ObjectStorageControlRequest{});
+
+    ASSERT_EQ(results.size(), 3u);
+    EXPECT_EQ(results[0].outcome, DB::ConditionalRemoveOutcome::NotFound);
+    EXPECT_FALSE(results[0].created_delete_marker);
+    EXPECT_EQ(results[1].outcome, DB::ConditionalRemoveOutcome::Removed);
+    EXPECT_FALSE(results[1].created_delete_marker);
+    EXPECT_EQ(results[2].outcome, DB::ConditionalRemoveOutcome::Removed);
+    EXPECT_TRUE(results[2].created_delete_marker);
+}
+
+namespace
+{
+
+void expectLogicalError(const std::function<void()> & operation, const char * expected_message)
+{
 #if defined(DEBUG_OR_SANITIZER_BUILD)
-TEST(CASS3ConditionalBatchDeleteDeathTest, RejectsDuplicateResponseKey)
+    EXPECT_DEATH(operation(), expected_message);
 #else
-TEST(CASS3ConditionalBatchDelete, RejectsDuplicateResponseKey)
+    try
+    {
+        operation();
+        FAIL() << "expected LOGICAL_ERROR: " << expected_message;
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::LOGICAL_ERROR) << e.message();
+        EXPECT_NE(e.message().find(expected_message), std::string::npos) << e.message();
+    }
 #endif
+}
+
+void expectMalformedConditionalResponse(const std::string & entries, const char * expected_message)
 {
     /// Construct the server in the death-test child rather than forking its running threads.
-    const auto send_duplicate_response = []
+    expectLogicalError([&]
     {
         (void)contextForTest();
-        ScriptedS3Server server([](const Poco::Net::HTTPServerRequest &, Poco::Net::HTTPServerResponse & response)
+        ScriptedS3Server server([&](const Poco::Net::HTTPServerRequest &, Poco::Net::HTTPServerResponse & response)
         {
-            const std::string body =
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
-                "<DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
-                "<Deleted><Key>first</Key></Deleted>"
-                "<Deleted><Key>first</Key></Deleted>"
-                "<Error><Key>second</Key><Code>PreconditionFailed</Code><Message>stale</Message></Error>"
-                "</DeleteResult>";
-            sendXml(response, Poco::Net::HTTPResponse::HTTP_OK, body);
+            sendXml(response, Poco::Net::HTTPResponse::HTTP_OK,
+                "<DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">" + entries + "</DeleteResult>");
         });
         auto storage = makeStorageForTest(server.getUrl(), DB::S3Capabilities{});
 
         storage->removeObjectsIfTokensMatch(
             {{DB::StoredObject("first"), "etag-first"}, {DB::StoredObject("second"), "etag-second"}},
             DB::ObjectStorageControlRequest{});
-    };
+    }, expected_message);
+}
+
+}
+
 #if defined(DEBUG_OR_SANITIZER_BUILD)
-    EXPECT_DEATH(send_duplicate_response(), "unexpected or duplicate key first");
+TEST(CASS3ConditionalBatchDeleteDeathTest, RejectsDuplicateResponseKey)
 #else
-    EXPECT_THROW(send_duplicate_response(), DB::Exception);
+TEST(CASS3ConditionalBatchDelete, RejectsDuplicateResponseKey)
 #endif
+{
+    expectMalformedConditionalResponse(
+        "<Deleted><Key>first</Key></Deleted><Deleted><Key>first</Key></Deleted>"
+        "<Error><Key>second</Key><Code>PreconditionFailed</Code><Message>stale</Message></Error>",
+        "unexpected or duplicate key first");
+}
+
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+TEST(CASS3ConditionalBatchDeleteDeathTest, RejectsMissingResponseKey)
+#else
+TEST(CASS3ConditionalBatchDelete, RejectsMissingResponseKey)
+#endif
+{
+    expectMalformedConditionalResponse("<Deleted><Key>first</Key></Deleted>", "response omitted keys");
+}
+
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+TEST(CASS3ConditionalBatchDeleteDeathTest, RejectsUnexpectedResponseKey)
+#else
+TEST(CASS3ConditionalBatchDelete, RejectsUnexpectedResponseKey)
+#endif
+{
+    for (const std::string entry : {"<Deleted><Key>foreign</Key></Deleted>", "<Error><Key>foreign</Key><Code>NoSuchKey</Code></Error>"})
+    {
+        SCOPED_TRACE(entry);
+        expectMalformedConditionalResponse("<Deleted><Key>first</Key></Deleted>" + entry, "unexpected or duplicate key foreign");
+    }
 }
 
 TEST(S3BulkDeleteFallback, UnsupportedBatchReplyRecordsCapabilityFalseAndThrowsNotImplemented)
@@ -649,6 +721,74 @@ void expectRefusalNamed(const std::function<void()> & remove, const std::string 
 
 const DB::StoredObjects kTwoObjects{DB::StoredObject("key-a"), DB::StoredObject("key-b")};
 
+}
+
+TEST(CASS3ConditionalBatchDelete, SingleAttemptSendsCallerAttemptNumberWithoutRetrying)
+{
+    (void)contextForTest();
+    ScriptedS3Server server([](const Poco::Net::HTTPServerRequest & request, Poco::Net::HTTPServerResponse & response)
+    {
+        EXPECT_EQ(request.getMethod(), "POST");
+        EXPECT_EQ(request.get("clickhouse-request", ""), "attempt=7");
+        sendBatchInternalError(response);
+    });
+    auto storage = makeStorageForTest(server.getUrl(), DB::S3Capabilities{}, {}, {}, /*max_retries=*/2);
+
+    expectRefusalNamed([&]
+    {
+        storage->removeObjectsIfTokensMatch(
+            {{DB::StoredObject("first"), "etag-first"}, {DB::StoredObject("second"), "etag-second"}},
+            {.profile = DB::ObjectStorageRetryProfile::SingleAttempt, .attempt_number = 7});
+    }, "InternalError");
+    EXPECT_EQ(server.countMethod("POST"), 1u);
+    EXPECT_EQ(server.countMethod("DELETE"), 0u);
+}
+
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+TEST(CASConditionalBatchDeleteBackendDeathTest, RejectsMalformedRawTokenBeforeSendingBatch)
+#else
+TEST(CASConditionalBatchDeleteBackend, RejectsMalformedRawTokenBeforeSendingBatch)
+#endif
+{
+    using namespace DB::Cas;
+
+    /// Inject the wildcard after admission, at the raw boundary where a backend decorator can supply a bad token.
+    class MalformedTokenBackend final : public InMemoryBackend
+    {
+    public:
+        explicit MalformedTokenBackend(ObjectStorageBackend & native_) : native(native_)
+        {
+        }
+
+        std::vector<RawRemoval> removeManyByConditional(
+            const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
+        {
+            auto malformed = removals;
+            malformed.back().expected_token = "*";
+            return native.removeManyByConditional(malformed, access);
+        }
+
+    private:
+        ObjectStorageBackend & native;
+    };
+
+    expectLogicalError([]
+    {
+        (void)contextForTest();
+        ScriptedS3Server server([](const Poco::Net::HTTPServerRequest &, Poco::Net::HTTPServerResponse & response)
+        {
+            ADD_FAILURE() << "malformed batch reached S3";
+            sendConditionalDeleteObjectsResult(response);
+        });
+        ObjectStorageBackend native(makeStorageForTest(server.getUrl(), DB::S3Capabilities{}), ObjectStorageBackend::Mode::Native);
+        auto backend = std::make_shared<MalformedTokenBackend>(native);
+        backend->pinConditionalBatchDeleteSupport(true);
+        auto requests = tests::openRequestsForTest(backend);
+        auto op = requests.admit();
+        const auto first = std::get<Committed>(op.create("first", "a", Retry::once())).etag;
+        const auto second = std::get<Committed>(op.create("second", "b", Retry::once())).etag;
+        op.removeManyByConditional({{"first", first}, {"second", second}}, Retry::once());
+    }, "malformed conditional removal token for second");
 }
 
 TEST(CASS3ConditionalBatchDelete, InvalidRequestAndArgumentRemainErrors)

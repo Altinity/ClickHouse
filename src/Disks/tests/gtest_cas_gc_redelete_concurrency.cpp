@@ -36,6 +36,7 @@ extern const Event CASGCRetiredRedeleteFailed;
 namespace DB::ErrorCodes
 {
 extern const int CANNOT_SCHEDULE_TASK;
+extern const int NETWORK_ERROR;
 }
 
 using namespace DB::Cas;
@@ -126,7 +127,7 @@ class RedeleteDiagnosticsBackend : public InMemoryBackend
 public:
     std::set<String> blob_keys;
     std::function<void(const String &)> read_blob_hook;
-    std::function<void(const std::vector<RawConditionalRemove> &)> delete_chunk_hook;
+    std::function<void(const std::vector<RawConditionalRemove> &, TransportAccess &)> delete_chunk_hook;
 
     std::optional<RawMeta> head(const String & key, TransportAccess & access) override
     {
@@ -146,7 +147,7 @@ public:
 
         LOG_WARNING(logger, "Test delete chunk started");
         SCOPE_EXIT({ LOG_WARNING(logger, "Test delete chunk finished"); });
-        delete_chunk_hook(removals);
+        delete_chunk_hook(removals, access);
         return InMemoryBackend::removeManyByConditional(removals, access);
     }
 
@@ -626,53 +627,6 @@ TEST(CASGCRedeleteConcurrency, SameOutcomesAtConcurrencyOneAndFour)
 namespace
 {
 
-class RemoveRaceBackend : public InMemoryBackend
-{
-public:
-    void armAgainstOtherThreads(String key)
-    {
-        raced_key = std::move(key);
-        owner = std::this_thread::get_id();
-        armed.store(true);
-    }
-
-    bool racedOnWorker() const { return raced_on_worker.load(); }
-
-    bool replacementCommitted() const { return replacement_committed.load(); }
-
-    RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override
-    {
-        injectReplacement(key, access);
-        return InMemoryBackend::remove(key, expected_value, access);
-    }
-
-    std::vector<RawRemoval> removeManyByConditional(
-        const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
-    {
-        for (const RawConditionalRemove & removal : removals)
-            injectReplacement(removal.key, access);
-        return InMemoryBackend::removeManyByConditional(removals, access);
-    }
-
-private:
-    void injectReplacement(const String & key, TransportAccess & access)
-    {
-        if (armed.load() && key == raced_key && armed.exchange(false))
-        {
-            raced_on_worker.store(std::this_thread::get_id() != owner);
-            const std::optional<Raw> current = InMemoryBackend::read(key, access);
-            if (current)
-                replacement_committed.store(InMemoryBackend::write(key, current->bytes, current->value, access).has_value());
-        }
-    }
-
-    String raced_key;
-    std::thread::id owner;
-    std::atomic<bool> armed{false};
-    std::atomic<bool> raced_on_worker{false};
-    std::atomic<bool> replacement_committed{false};
-};
-
 BlobRef blobRefOf(uint64_t blob)
 {
     return BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(blobHash(blob))};
@@ -759,18 +713,45 @@ TEST(CASGCRedeleteConcurrency, ReplacedBlobInsideParallelBatchSurvivesWhileSibli
 
 TEST(CASGCRedeleteConcurrency, BlobReplacedBetweenHeadAndDeleteSurvivesWhileSiblingsDelete)
 {
-    auto backend = std::make_shared<RemoveRaceBackend>();
-    auto store = openPoolWithIoConcurrency(backend, 4);
+    auto backend = std::make_shared<RedeleteDiagnosticsBackend>();
+    backend->pinConditionalBatchDeleteSupport(true);
+    auto store = openPoolWithIoConcurrency(backend, 4, 1, 0, {}, std::nullopt, 2);
     Gc gc(store, kGc);
     publishThenDrop(*backend, store, gc);
     ASSERT_NO_FATAL_FAILURE(driveUntilAllGraduated(*backend, gc, store, kReplacedBlob));
 
-    backend->armAgainstOtherThreads(blobKeyOf(*store, kReplacedBlob));
+    const String raced_key = blobKeyOf(*store, kReplacedBlob);
+    const auto blob_keys = allBlobKeys(*store);
+    const auto caller = std::this_thread::get_id();
+    std::optional<String> replacement_token;
+    backend->delete_chunk_hook = [&](const std::vector<Backend::RawConditionalRemove> & removals, TransportAccess & access)
+    {
+        for (const auto & removal : removals)
+        {
+            if (removal.key != raced_key)
+                continue;
+            EXPECT_NE(std::this_thread::get_id(), caller);
+            ASSERT_EQ(removals.size(), 2u);
+            EXPECT_TRUE(std::any_of(removals.begin(), removals.end(), [&](const auto & sibling)
+            {
+                return sibling.key != raced_key && blob_keys.contains(sibling.key);
+            }));
+            const auto original = backend->read(raced_key, access);
+            ASSERT_TRUE(original);
+            const auto written = backend->write(raced_key, original->bytes, removal.expected_token, access);
+            ASSERT_TRUE(written.has_value());
+            replacement_token = *written;
+        }
+    };
     const RoundReport rep = runRegularRoundReclaiming(gc);
+    backend->delete_chunk_hook = {};
     store->renewWatermarkOnce();
 
-    EXPECT_TRUE(backend->replacementCommitted()) << "the race never replaced the blob, so the 412 path is untested";
-    EXPECT_TRUE(backend->racedOnWorker()) << "the raced delete must have run on a pool worker";
+    ASSERT_TRUE(replacement_token);
+    OperationForTest op(*backend);
+    const auto survivor = (*op).head(raced_key, Retry::once());
+    ASSERT_TRUE(survivor);
+    EXPECT_EQ(PersistedEtag::capture(survivor->etag).value, *replacement_token);
     expectOnlyReplacedBlobSurvives(*backend, *store, rep);
 }
 
@@ -933,7 +914,7 @@ TEST(CASGCRedeleteConcurrency, FailuresAreReportedAfterTheirWaveAndRethrowLowest
             if (key == preview.back().key)
                 std::rethrow_exception(read_error);
         };
-        backend->delete_chunk_hook = [&](const std::vector<Backend::RawConditionalRemove> & removals)
+        backend->delete_chunk_hook = [&](const std::vector<Backend::RawConditionalRemove> & removals, TransportAccess &)
         {
             if (removals.front().key == preview.front().key)
             {
@@ -1390,6 +1371,138 @@ TEST(CASGCRedeleteConcurrency, BlobDeleteEventsMatchAppliedEntriesInAFailedRound
     EXPECT_EQ(next_round_count, kBlobs);
     for (uint64_t b = 1; b <= kBlobs; ++b)
         EXPECT_EQ(next_round[blobKeyOf(*store, b)], b == kFaultedBlob ? "deleted" : "absent") << "blob " << b;
+}
+
+TEST(CASGCRedeleteConcurrency, ExhaustedMultiKeyRetryKeepsPublishedPendingState)
+{
+    constexpr size_t chunk_size = 3;
+    auto events = std::make_shared<BlobDeleteEvents>();
+    auto backend = std::make_shared<RedeleteDiagnosticsBackend>();
+    backend->pinConditionalBatchDeleteSupport(true);
+    /// Run chunks inline so expiring one request's virtual deadline cannot expire a sibling in flight.
+    auto store = openPoolWithIoConcurrency(backend, 1, 1, 0, events->sink(), std::nullopt, chunk_size);
+    const auto clock = VirtualRetryClock::installOn(store);
+    Gc gc(store, kGc);
+    ASSERT_NO_FATAL_FAILURE(publishThenDrop(*backend, store, gc));
+    ASSERT_NO_FATAL_FAILURE(driveUntilAllGraduated(*backend, gc, store, kFaultedBlob));
+    const auto pending = previewPendingDeletes(gc);
+    ASSERT_EQ(pending.size(), 2 * chunk_size);
+    OperationForTest op(*backend);
+    const auto & layout = store->layout();
+    const auto read_state = [&] { return decodeGcState((*op).read(layout.gcStateKey(), Retry::once()).value().bytes); };
+    const auto before = read_state();
+    const auto runs_before = runsForShard(*backend, layout, 0);
+    ASSERT_FALSE(runs_before.empty());
+
+    size_t physical_attempts = 0;
+    std::optional<String> replacement_token;
+    backend->delete_chunk_hook = [&](const std::vector<Backend::RawConditionalRemove> & removals, TransportAccess & access)
+    {
+        ++physical_attempts;
+        ASSERT_EQ(removals.size(), chunk_size);
+        if (removals.front().key != pending[0].key)
+            return;
+        for (size_t i = 0; i < chunk_size; ++i)
+        {
+            EXPECT_EQ(removals[i].key, pending[i].key);
+            EXPECT_EQ(removals[i].expected_token, pending[i].token.value);
+        }
+        if (access.attemptNo() == 1)
+        {
+            /// A was deleted when the response was lost. A writer replaced B, and C is still eligible.
+            ASSERT_EQ(backend->remove(removals[0].key, removals[0].expected_token, access), Backend::RawRemoval::Removed);
+            const auto original = backend->read(removals[1].key, access);
+            ASSERT_TRUE(original);
+            const auto written = backend->write(removals[1].key, original->bytes, removals[1].expected_token, access);
+            ASSERT_TRUE(written.has_value());
+            replacement_token = *written;
+        }
+        else
+        {
+            clock->advance(store->poolConfig().cas_request_budget.request_window_ms);
+        }
+        throw Poco::TimeoutException("lost conditional delete response");
+    };
+
+    auto rows = std::make_shared<PendingDeletesRows>();
+    gc.setPhaseSink(recordPendingDeletes(rows));
+    const auto failed_before = failedCounter();
+    RoundReport progress;
+    expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "policy deadline after 2 attempt(s)", [&]
+    {
+        gc.runRegularRound({}, /*allow_steal*/ true, UniversePolicy::Authoritative, &progress);
+    });
+    backend->delete_chunk_hook = {};
+
+    ASSERT_TRUE(replacement_token);
+    EXPECT_EQ(physical_attempts, 3u);
+    ASSERT_EQ(rows->rows.size(), 1u);
+    EXPECT_EQ(rows->total("delete_chunks"), 2u);
+    EXPECT_EQ(rows->total("delete_chunk_jobs_failed"), 1u);
+    EXPECT_EQ(progress.redelete_failed, chunk_size);
+    EXPECT_EQ(failedCounter() - failed_before, chunk_size);
+    EXPECT_EQ(progress.redeleted, chunk_size);
+    /// GC copies per-outcome totals into the report after writing the outcome logs. This round threw before that step.
+    EXPECT_EQ(progress.deleted, 0u);
+    EXPECT_EQ(progress.absent, 0u);
+    EXPECT_EQ(progress.replaced, 0u);
+
+    const auto after = read_state();
+    EXPECT_EQ(after.round, before.round);
+    EXPECT_EQ(after.snap_generation, before.snap_generation);
+    EXPECT_EQ(after.snap_attempt, before.snap_attempt);
+    EXPECT_EQ(runsForShard(*backend, layout, 0), runs_before);
+    const auto still_pending = previewPendingDeletes(gc);
+    ASSERT_EQ(still_pending.size(), pending.size());
+    const auto [reported, count] = events->take();
+    EXPECT_EQ(count, chunk_size);
+    std::map<String, String> expected_events;
+    for (size_t i = 0; i < pending.size(); ++i)
+    {
+        const auto & entry = pending[i];
+        EXPECT_EQ(still_pending[i].key, entry.key);
+        EXPECT_EQ(still_pending[i].token.value, entry.token.value);
+        const auto body = (*op).head(entry.key, Retry::once());
+        EXPECT_EQ(body.has_value(), i == 1 || i == 2) << entry.key;
+        EXPECT_EQ((*op).head(layout.blobMetaKey(entry.ref), Retry::once()).has_value(), i < chunk_size) << entry.key;
+        if (i >= chunk_size)
+            expected_events.emplace(entry.key, "deleted");
+    }
+    EXPECT_EQ(reported, expected_events);
+
+    rows->rows.clear();
+    store->renewWatermarkOnce();
+    const RoundReport next = runRegularRoundReclaiming(gc);
+    EXPECT_EQ(next.redeleted, pending.size());
+    EXPECT_EQ(next.absent, chunk_size + 1);
+    EXPECT_EQ(next.replaced, 1u);
+    EXPECT_EQ(next.deleted, 1u);
+    EXPECT_EQ(next.redelete_failed, 0u);
+    EXPECT_EQ(rows->total("delete_chunks"), 1u);
+    EXPECT_EQ(read_state().round, before.round + 1);
+    EXPECT_TRUE(previewPendingDeletes(gc).empty());
+    expected_events.clear();
+    for (size_t i = 0; i < pending.size(); ++i)
+    {
+        const auto & entry = pending[i];
+        const auto body = (*op).head(entry.key, Retry::once());
+        if (i == 1)
+        {
+            ASSERT_TRUE(body);
+            EXPECT_EQ(PersistedEtag::capture(body->etag).value, *replacement_token);
+        }
+        else
+        {
+            EXPECT_FALSE(body) << entry.key;
+        }
+        EXPECT_EQ((*op).head(layout.blobMetaKey(entry.ref), Retry::once()).has_value(), i == 1) << entry.key;
+        expected_events.emplace(entry.key, "absent");
+    }
+    expected_events.at(pending[1].key) = "replaced";
+    expected_events.at(pending[2].key) = "deleted";
+    const auto [recovered, recovered_count] = events->take();
+    EXPECT_EQ(recovered_count, pending.size());
+    EXPECT_EQ(recovered, expected_events);
 }
 
 TEST(CASGCRedeleteConcurrency, OutcomeBudgetCapsAuditRowsButNotDeletes)
