@@ -1033,13 +1033,8 @@ private:
 
         auto * decrypted = decrypted_result_column_data.data();
 
-<<<<<<< HEAD
-        KeyHolder<mode> key_holder;
-        [[maybe_unused]] CachedKeyState ctx_key_state;
-=======
         KeyHolder<mode> key_holder{};
         CachedKeyState ctx_key_state;
->>>>>>> 3101ef2e89c2 (Merge pull request #131001 from mkmkme/aes-gcm-key-reuse)
 
         for (size_t row_idx = 0; row_idx < input_rows_count; ++row_idx)
         {
