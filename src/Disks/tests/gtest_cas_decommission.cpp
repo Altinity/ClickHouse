@@ -287,7 +287,7 @@ void makeTableWithRefs(Pool & victim, const String & ns_str, uint64_t committed,
     /// A throwaway open-fence operation, for the two `CasRefCatalog` calls below only: this fixture
     /// writes everything else directly against `backend` via the raw-write helpers, unrelated to any
     /// mount fence.
-    CasRequests requests(victim.poolBackendPtr(), Fence::open());
+    CasRequests requests(victim.poolBackendPtr(), Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
 
     /// Final physical ids are pool-wide. The generic raw-write helper intentionally uses one shared
@@ -523,6 +523,33 @@ TEST_F(CASDecommission, AlwaysRenewsAdminClaimEvenWhenHostDiskIsObserveOnly)
     ASSERT_TRUE(admin != nullptr);
     EXPECT_TRUE(admin->poolConfig().background_watermark);
     EXPECT_TRUE(admin->poolConfig().bounded_background_renewal);
+}
+
+TEST_F(CASDecommission, DecommissionMountRaisesThePoolFloor)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    {
+        auto victim = openVictim(backend);
+    }
+    {
+        OperationForTest op(*backend);
+        const auto current = (*op).read(layout.poolMetaKey(), Retry::once());
+        ASSERT_TRUE(current.has_value());
+        const auto head = (*op).head(layout.poolMetaKey(), Retry::once());
+        ASSERT_TRUE(head.has_value());
+        PoolMeta pm = decodePoolMeta(current->bytes);
+        pm.min_reader_generation = G_WRITE_FLOOR;
+        ASSERT_TRUE(std::holds_alternative<Committed>(
+            (*op).replace(layout.poolMetaKey(), encodePoolMeta(pm), head->etag, Retry::once())));
+    }
+
+    auto admin = Pool::openForDecommission(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
+    ASSERT_TRUE(admin != nullptr);
+
+    OperationForTest op(*backend);
+    const auto stored = (*op).read(layout.poolMetaKey(), Retry::once());
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(decodePoolMeta(stored->bytes).min_reader_generation, G_REF_CHAIN);
 }
 
 TEST_F(CASDecommission, OpensOverARetiredOwner)
@@ -1793,8 +1820,8 @@ public:
 };
 
 /// The tombstone write lands, GC fences the admin's body, and the write's answer is lost; the owner then
-/// cannot be read for `unreadable_ms` of the fake clock, longer than the write's own retry window, so the
-/// write gives up after sending.
+/// cannot be read for `unreadable_ms` of the fake clock, longer than the admin's lease that bounds the write's
+/// retries, so the write gives up after sending.
 class OwnerUnreadableAfterTombstoneBackend : public InMemoryBackend
 {
 public:
@@ -2137,7 +2164,7 @@ TEST_F(CASDecommission, TombstoneWriteThatGaveUpAfterSendingIsConfirmed)
     auto backend = startVictim(std::make_shared<OwnerUnreadableAfterTombstoneBackend>());
     auto clock = farClock();
     backend->clock = clock;
-    backend->unreadable_ms = 100'000;   /// longer than the tombstone write retries
+    backend->unreadable_ms = 100'000;   /// longer than the admin lease
 
     EXPECT_THROW(runOnClock("a1", clock), DB::Exception);
 

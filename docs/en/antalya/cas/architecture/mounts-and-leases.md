@@ -107,7 +107,7 @@ of the old life that is still running stops in `IdentityLost` at its next remoun
 | `no server uuid` | `CORRUPTED_DATA` | the process has no server uuid |
 | `cannot rejoin` | `CORRUPTED_DATA` | `epoch` or `mount` is missing: the id was retired by 26.6.4, or the object was deleted by hand |
 | `decommission is not finished` | `CORRUPTED_DATA` | the tombstone is not verified; `system.cas_mounts` shows the id as `retired` with `retirement_verified = 0` once its slot is terminal |
-| `still running` | `ABORTED` | a decommission run holds the slot, or the lease of a killed run or an interrupted restart has not lapsed and been fenced by GC (up to one GC round after the lease threshold) |
+| `still running` | `ABORTED` | a decommission run holds the slot, or the lease of a killed run or an interrupted restart has not lapsed and been fenced by GC (up to two GC intervals after the lease threshold) |
 | `previous life remains` | `ABORTED` | the message names the first part left: catalog rows (with the first namespaces and their state), `cas/manifests/<server_root_id>/` or `roots/<server_root_id>/` |
 | `kept changing` | `ABORTED` | the owner or the slot changed under every rejoin attempt of this start; restart |
 
@@ -143,7 +143,7 @@ watermark — there is no separate watermark object. `MountLease` fields: `serve
   The bounded renewals — the startup re-anchor, the remount re-anchor, and the background renewal of a
   pool opened for decommission — stay bounded by the last confirmed lease minus the safety margin.
 - **Cadence.** The runtime normally starts a logical renewal every `cas_mount_renew_period_ms` (default
-  10 s), with TTL `cas_mount_lease_ttl_ms` (default 30 s, TTL/3 renewal ratio). The next beat is anchored
+  10 s), with TTL `cas_mount_lease_ttl_ms` (default 40 s). The next beat is anchored
   at the committed body's pre-I/O BOOTTIME start. A slow recovery therefore causes an immediate
   catch-up beat when the nominal cadence has elapsed; it does not wait a fresh full period after the
   response.
@@ -195,15 +195,22 @@ anchor plus the TTL, and wall-clock `now` stays audit-only.
 
 `cas_mount_lease_ttl_ms` is local to each server. It is how long this server may write after its last
 confirmed renewal, and every other server waits at least this long before fencing or reclaiming its
-slot. A configured value above 10 minutes (600000 ms) is clamped to 10 minutes with a warning at startup, so no holder declares a longer lease. Mixed values are safe, and so is changing the value one server at a time in any order. A longer
+slot. A configured value above 10 minutes (600000 ms) is clamped to 10 minutes with a warning at startup, so no holder declares a longer lease. When every server of the pool runs a build with this rule, mixed
+values are safe, and so is changing the value one server at a time in any order. A longer
 lease on one server delays recovery after that server's crash, and the GC leader logs one `WARNING` per
-slot whose declared lease differs from its own. A server built without this rule waits only its own
-lease: keep the values equal until every server of the pool runs a build with the rule.
+slot whose declared lease differs from its own. A server built without the rule waits only its own
+lease and can fence a longer-lease holder that can still write; such a pool must pin equal values, see
+[upgrading to the 40 s lease](/antalya/cas/configuration#upgrading-lease-defaults).
 
-With the defaults (TTL 30 s, period 10 s, margin 2 s), `TTL − margin − period − 2 × envelope = 4 s` is the scheduling-lateness budget before
+With the defaults (TTL 40 s, period 10 s, margin 2 s), `TTL − margin − period − 2 × envelope = 14 s` is the scheduling-lateness budget before
 the first renewal attempt of a period can begin, where `envelope = attempt_timeout + 2 × cap` and
 `cap` is `attempt_timeout` when the disk's `connect_timeout_ms` is `0`, else
 `min(connect_timeout_ms, attempt_timeout)` (7 s with defaults).
+
+The `CAS request budget in effect` line logged at mount carries both figures. `write_reserve_ms` is
+`2 × envelope + cas_lease_safety_margin_ms` (16000 with defaults). `renewal_slack_ms` appears only when background renewal is on and is
+`TTL − period − write_reserve_ms` (14000 with defaults), the lateness budget above. The line also
+carries `request_window_ms`, the retry window of `cas_request_window_ms`.
 
 ### Cloning a running server is unsupported {#clone-unsupported}
 
@@ -267,6 +274,28 @@ start or a decommission of this `server_root_id` allocated after this one.
 | `Fenced` | GC's own threshold-gated fence-out (`gc_fenced`) |
 | `UncleanObserved` | this claimant's own token-stability observation held for the full observation threshold (the longer of the two leases, plus drift and step) |
 | `UncleanUnsafe` | the operator's explicit `cas_unsafe_remount_no_delay` authorization carried the slot's exact token — not a certificate of death |
+
+## The last unclean epoch {#last-unclean-epoch}
+
+The mount lease body carries an optional `last_unclean_epoch`: the highest writer epoch below this
+holder's `writer_epoch` that may have ended without a clean farewell. The claim sets it from the
+predecessor's body, and every renewal, the farewell and a GC fence copy it.
+
+| Predecessor body | New `last_unclean_epoch` |
+|---|---|
+| Clean farewell that carries the field | the predecessor's value |
+| Clean farewell without the field (an older build) | the predecessor's `writer_epoch` |
+| `Fenced`, `UncleanObserved` or `UncleanUnsafe` | the predecessor's `writer_epoch` |
+| No slot | the claimer's epoch minus 1 |
+
+Ref-log recovery uses it to decide whether to write the [epoch tombstone](/antalya/cas/architecture/manifests-and-refs#epoch-tombstone)
+itself. If the last epoch that wrote to a namespace is at or below the value, recovery creates the
+tombstone before it installs the table. Above it, that epoch ended with a clean farewell and recovery
+writes nothing; the new writer's first append creates the tombstone.
+
+A clean farewell is written only after the ref lanes have drained and refuse new appends, so no append
+of the farewell's epoch is in flight. A forced exit writes no farewell, which is what makes the successor
+write the tombstone eagerly.
 
 ## Behavioral mount-slot model {#mount-state-machines}
 
@@ -372,7 +401,7 @@ unretired life after the tombstone (a rejoin, or another run's rollback) reports
 the warning `the owner moved on to life N`. Catalog rows GC still has to delete are reported as
 `namespaces_pending_gc`, not as a failure. The operator reruns only after `member_retired = 0`, under the
 [rerun rule](/antalya/cas/operations/migration#rejoin-rerun-rule); a rerun refused as alive or contended
-waits until GC fences the previous run's slot: about one mount lease TTL plus one GC round, with a GC leader
+waits until GC fences the previous run's slot: about one mount lease TTL plus up to two GC intervals, with a GC leader
 running. A later start under that `server_root_id` rejoins it as an empty member once the retirement is
 verified and drained ([rejoin](#rejoin)).
 
@@ -387,7 +416,7 @@ becomes `state = 'corrupt'`, never an exception). Shows every `server_root_id` i
 | `disk`, `server_root_id`, `server_uuid`, `hostname`, `process_id` | identity |
 | `writer_epoch`, `renewal_sequence`, `started_at`, `expires_at`, `min_active_build_sequence`, `gc_fenced` | lease state (`DateTime64(3)` columns; the millisecond-integer field names live only in the internal `MountLease` struct and the on-disk body) |
 | `state` | one of `live`, `expired`, `terminated`, `fenced`, `retired`, `corrupt`; `retired` = terminated or fenced with a tombstoned owner (one more `GET` per terminated or fenced row) |
-| `is_leader`, `pending_reclaim`, `last_success_age_seconds`, `wedged_namespace_count` | GC health, process-local; **`NULL` on every peer row** — a process-local fact must never be stamped onto another server's row |
+| `is_leader`, `pending_reclaim`, `last_success_age_seconds`, `wedged_namespace_count` | GC health, process-local; **`NULL` on every peer row** — a process-local fact must never be stamped onto another server's row. `last_success_age_seconds` is also `NULL` on the local row until this server's GC completes its first round as leader |
 | `lifecycle`, `lifecycle_reason`, `lifecycle_detail`, `lifecycle_since` | the SQL surface for the in-process `PoolLifecycle` runtime above: `lifecycle` is one of `live`, `not_live`, `identity_lost`, `vanished`, `constructing`, `shutdown`; `lifecycle_reason` distinguishes `replaced` from `forgotten` for a `vanished` disk; `lifecycle_detail` carries the full diagnosis text; `lifecycle_since` is when the current non-live state began (`NULL` while live) |
 | `renewal_in_progress`, `renewal_attempts`, `last_renewal_error` | the running (or last) lease renewal: conditional `PUT`s sent so far and the last failed request, updated per attempt; **`NULL` on every peer row** |
 | `retirement_verified` | `1` on a `retired` row whose decommission verified the retirement, else `0`; a rejoin needs `1`, a rerun is for `0` only |

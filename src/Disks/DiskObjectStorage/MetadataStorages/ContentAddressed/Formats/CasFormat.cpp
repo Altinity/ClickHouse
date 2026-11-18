@@ -30,10 +30,17 @@ namespace
 constexpr FormatChangePoint BASELINE[] = {{1, 1}};
 
 /// Generation 2 adds the committed-owner move; a log carrying one is unreadable to a generation-1 reader.
-constexpr FormatChangePoint REF_LOG_HISTORY[] = {{1, 1}, {2, 2}};
-/// `encodeRefLogTxn` stamps `G_REF_MOVE` on a Move-bearing log; the history must say the same.
-static_assert(REF_LOG_HISTORY[std::size(REF_LOG_HISTORY) - 1].min_reader == G_REF_MOVE);
+/// Generation 3 adds the forward-linked tombstone and the sparse backlink.
+constexpr FormatChangePoint REF_LOG_HISTORY[] = {{1, 1}, {2, 2}, {3, 3}};
+/// Generation 3 reduces `_ckpt` to `life_epoch` and `checkpoint_snapshot_id`; an older reader would take
+/// the missing `committed_through` for an empty frontier.
+constexpr FormatChangePoint REF_CKPT_HISTORY[] = {{1, 1}, {3, 3}};
+/// `encodeRefLogTxn` and `encodeRefCkpt` stamp `G_REF_CHAIN` on what generation 3 introduced; the
+/// histories must say the same.
+static_assert(REF_LOG_HISTORY[std::size(REF_LOG_HISTORY) - 1].min_reader == G_REF_CHAIN);
 static_assert(REF_LOG_HISTORY[std::size(REF_LOG_HISTORY) - 1].generation <= G_BUILD);
+static_assert(REF_CKPT_HISTORY[std::size(REF_CKPT_HISTORY) - 1].min_reader == G_REF_CHAIN);
+static_assert(REF_CKPT_HISTORY[std::size(REF_CKPT_HISTORY) - 1].generation <= G_BUILD);
 
 }
 
@@ -43,8 +50,9 @@ std::span<const FormatChangePoint> changePoints(FormatId id)
     {
         case FormatId::RefLog:
             return REF_LOG_HISTORY;
-        case FormatId::RefSnapshot:
         case FormatId::RefCkpt:
+            return REF_CKPT_HISTORY;
+        case FormatId::RefSnapshot:
         case FormatId::RefCatalog:
         case FormatId::GcMaintenanceState:
         case FormatId::PoolMeta:
@@ -128,11 +136,11 @@ constexpr FormatTraits TRAITS[] =
     {FormatId::PoolMeta,     "cas_pool_meta",     TextFamily::Control,       CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},
     {FormatId::RefLog,       "cas_ref_log",       TextFamily::Control,       CompressionPolicy::Always,    64 * kMiB,  64 * kMiB},
     {FormatId::RefSnapshot,  "cas_ref_snap",      TextFamily::Control,       CompressionPolicy::Always,    64 * kMiB,  64 * kMiB},
-    /// `cas_ref_ckpt` is a three-field mutable singleton read by a point GET on every recovery and on
+    /// `cas_ref_ckpt` is a small mutable singleton read by a point GET on every recovery and on
     /// every cleanup decision, so its caps are deliberately TIGHT (64 KiB / 4 KiB rather than the
     /// megabyte scale its Control-family siblings use): nothing legitimate approaches them, and the cap
     /// is the first thing that fires if a foreign object ever lands at the key. Raw (`Never`): a small
-    /// singleton, and `publishCkpt` re-encodes it on every attempt.
+    /// singleton, re-encoded whole on every write.
     {FormatId::RefCkpt,      "cas_ref_ckpt",      TextFamily::Control,       CompressionPolicy::Never,     64 * kKiB,  4 * kKiB},
     /// `cas_ref_catalog` (INV-3): one object for the whole pool, token-CAS like `gc/state`, read on
     /// every fold round and every recovery. Raw (`Never`): the admission gate measures

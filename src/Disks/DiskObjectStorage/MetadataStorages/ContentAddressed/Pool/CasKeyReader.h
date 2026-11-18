@@ -40,16 +40,16 @@ private:
     CasOperation & op;
 };
 
-/// Hints the ref-log ids of `first`'s epoch, from `first` upward, while the reader has window and the
-/// id is within the committed frontier. Only this epoch: past its seal the ids do not exist, and a
-/// walk learns where the seal is only by decoding it.
+/// Hints the ref-log ids of `first`'s epoch, from `first` up to `last`, while the reader has window. The
+/// caller picks `last` in `first`'s epoch: a walk learns where an epoch ends only by reading, so a hint
+/// past the real end is a wasted read that the walk later discards.
 void hintRefLogsWithinEpoch(KeyReader & reader, const Layout & layout, const NamespaceLifeId & life,
-                            RefTxnId first, const RefTxnId & committed_through);
+                            RefTxnId first, const RefTxnId & last);
 
 /// The other half of the rule above, called when a walk crosses an epoch: every hint of the old epoch
 /// from `first` up to one window is dropped, so the window is free for the new epoch. Discarding an
 /// unhinted key is a no-op, so over-asking by a window is harmless.
 void discardRefLogHintsOfEpoch(KeyReader & reader, const Layout & layout, const NamespaceLifeId & life,
-                               RefTxnId first, const RefTxnId & committed_through);
+                               RefTxnId first, const RefTxnId & last);
 
 }
