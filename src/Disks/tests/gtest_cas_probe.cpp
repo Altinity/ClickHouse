@@ -7,6 +7,20 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
+#include <Poco/Exception.h>
+
+#include "config.h"
+#if USE_AWS_S3
+#include <IO/S3Common.h>
+#endif
+
+#include <exception>
+
+namespace DB::ErrorCodes
+{
+extern const int NETWORK_ERROR;
+extern const int NOT_IMPLEMENTED;
+}
 
 using namespace DB::Cas;
 
@@ -90,6 +104,25 @@ public:
     }
 };
 
+class FailingConditionalBatchBackend : public InMemoryBackend
+{
+public:
+    explicit FailingConditionalBatchBackend(const std::exception_ptr & failure_) : failure(failure_)
+    {
+    }
+
+    std::vector<RawRemoval> removeManyByConditional(const std::vector<RawConditionalRemove> &, TransportAccess &) override
+    {
+        ++batch_attempts;
+        std::rethrow_exception(failure);
+    }
+
+    size_t batch_attempts = 0;
+
+private:
+    std::exception_ptr failure;
+};
+
 }
 
 TEST(CASProbe, ReportsConditionalBatchCapability)
@@ -122,6 +155,53 @@ TEST(CASProbe, RequiresGoneForAnAlreadyDeletedKeyInTheBatch)
     auto op = requests.admit();
 
     EXPECT_FALSE(runCapabilityProbe(op, "p/.cas_probe").conditional_batch_delete_supported);
+}
+
+TEST(CASProbe, ExplicitlyUnsupportedConditionalBatchReturnsFalseAndCleansUp)
+{
+    FailingConditionalBatchBackend backend(std::make_exception_ptr(
+        DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "conditional batch delete unsupported")));
+    auto requests = makeRequests(backend);
+    auto op = requests.admit();
+
+    EXPECT_FALSE(runCapabilityProbe(op, "p/.cas_probe").conditional_batch_delete_supported);
+    EXPECT_EQ(backend.batch_attempts, 1u);
+    EXPECT_TRUE(op.list("p/.cas_probe", "", 10, Retry::once()).keys.empty());
+}
+
+#if USE_AWS_S3
+TEST(CASProbe, ConditionalBatchAccessDeniedPropagatesAndCleansUp)
+{
+    FailingConditionalBatchBackend backend(std::make_exception_ptr(
+        DB::S3Exception("conditional batch delete denied", Aws::S3::S3Errors::ACCESS_DENIED)));
+    auto requests = makeRequests(backend);
+    auto op = requests.admit();
+
+    try
+    {
+        runCapabilityProbe(op, "p/.cas_probe");
+        ADD_FAILURE() << "expected S3 access denial";
+    }
+    catch (const DB::S3Exception & e)
+    {
+        EXPECT_EQ(e.getS3ErrorCode(), Aws::S3::S3Errors::ACCESS_DENIED);
+    }
+    EXPECT_EQ(backend.batch_attempts, 1u);
+    EXPECT_TRUE(op.list("p/.cas_probe", "", 10, Retry::once()).keys.empty());
+}
+#endif
+
+TEST(CASProbe, ConditionalBatchTimeoutPropagatesAfterRetriesAndCleansUp)
+{
+    DB::Cas::tests::FakeClock clock;
+    auto backend = std::make_shared<FailingConditionalBatchBackend>(std::make_exception_ptr(Poco::TimeoutException()));
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), nullptr, kDefaultRequestWindowMs);
+    auto op = requests.admit();
+
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "removeManyByConditional",
+        [&] { runCapabilityProbe(op, "p/.cas_probe"); });
+    EXPECT_GT(backend->batch_attempts, 1u);
+    EXPECT_TRUE(op.list("p/.cas_probe", "", 10, Retry::once()).keys.empty());
 }
 
 TEST(CASProbe, FailsClosedOnNonEnforcingDelete)
