@@ -4,6 +4,7 @@
 
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionsAES.h>
+#include <Common/Documentation.h> // Added this line
 
 namespace DB
 {
