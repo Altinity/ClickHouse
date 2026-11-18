@@ -38,9 +38,10 @@ SELECT throwIf(
         <= (SELECT value FROM ping_fail_try_before),
     'Remote shard was not pinged');
 
--- A peer that keeps the socket open and sends no Pong is skipped after the ping. Opening another
--- connection would wait for handshake_timeout_ms and get no Hello either. `ReconnectCount` stays
--- put; `FailTry` still moves. The local shard is not pinged, so it still reads the file.
+-- A peer that keeps the socket open and sends no Pong still reconnects once. The new connection
+-- succeeds here, because this server is up and only the ping was failed. `ReconnectCount` and
+-- `DistributedConnectionUsable` both move: the local shard and the reconnected remote shard are
+-- usable. `FailTry` moves too. A stopped server would stop at the capped handshake instead.
 
 CREATE TEMPORARY TABLE ping_reconnect_before (value UInt64);
 INSERT INTO ping_reconnect_before
@@ -49,6 +50,10 @@ SELECT ifNull((SELECT value FROM system.events WHERE event = 'DistributedConnect
 CREATE TEMPORARY TABLE ping_fail_try_before_timeout (value UInt64);
 INSERT INTO ping_fail_try_before_timeout
 SELECT ifNull((SELECT value FROM system.events WHERE event = 'DistributedConnectionFailTry'), 0);
+
+CREATE TEMPORARY TABLE ping_usable_before (value UInt64);
+INSERT INTO ping_usable_before
+SELECT ifNull((SELECT value FROM system.events WHERE event = 'DistributedConnectionUsable'), 0);
 
 SYSTEM ENABLE FAILPOINT pooled_connection_ping_timeout;
 
@@ -59,10 +64,15 @@ SYSTEM DISABLE FAILPOINT pooled_connection_ping_timeout;
 
 SELECT throwIf(
     ifNull((SELECT value FROM system.events WHERE event = 'DistributedConnectionReconnectCount'), 0)
-        != (SELECT value FROM ping_reconnect_before),
-    'Ping timeout reconnected');
+        <= (SELECT value FROM ping_reconnect_before),
+    'Ping timeout did not reconnect');
 
 SELECT throwIf(
     ifNull((SELECT value FROM system.events WHERE event = 'DistributedConnectionFailTry'), 0)
         <= (SELECT value FROM ping_fail_try_before_timeout),
     'Ping timeout was not applied');
+
+SELECT throwIf(
+    ifNull((SELECT value FROM system.events WHERE event = 'DistributedConnectionUsable'), 0)
+        < (SELECT value FROM ping_usable_before) + 2,
+    'Ping timeout did not bring the remote shard back');

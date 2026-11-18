@@ -924,8 +924,8 @@ bool Connection::ping(const ConnectionTimeouts & timeouts, bool rethrow_on_timeo
         return false;
     });
 
-    /// For tests: a peer that keeps the socket open and sends no `Pong`. Callers that asked to
-    /// see the timeout skip this replica instead of opening another connection.
+    /// For tests: a peer that keeps the socket open and sends no `Pong`. The establisher
+    /// reconnects once, and caps that handshake by `sync_request_timeout`.
     fiu_do_on(FailPoints::pooled_connection_ping_timeout, {
         disconnect();
         throw Exception(ErrorCodes::SOCKET_TIMEOUT, "Injected ping timeout");

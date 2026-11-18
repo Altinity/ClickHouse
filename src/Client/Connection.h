@@ -175,8 +175,8 @@ public:
 
     /// Same round trip as `checkConnected`, but a peer that keeps the socket open and sends no
     /// `Pong` within `sync_request_timeout` throws `SOCKET_TIMEOUT`. A socket the server has
-    /// already closed still returns false. Cluster reads use the difference so a silent peer is
-    /// skipped instead of opening another connection and waiting out `handshake_timeout_ms`.
+    /// already closed still returns false. Cluster reads reconnect either way. After a timeout
+    /// the new handshake is capped by `sync_request_timeout`.
     bool checkConnectedThrowOnTimeout(const ConnectionTimeouts & timeouts)
     {
         return isConnected() && ping(timeouts, /*rethrow_on_timeout=*/ true);

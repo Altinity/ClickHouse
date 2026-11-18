@@ -77,17 +77,28 @@ void ConnectionEstablisher::run(ConnectionEstablisher::TryResult & result, std::
     /// can be stale; a failure of a freshly established one is a genuine replica problem, and
     /// retrying it is left to the caller (with its error accounting).
     bool had_pooled_connection = false;
-    /// Set when `Ping` reached `sync_request_timeout`. The peer kept the socket open, so a new
-    /// handshake would wait for `handshake_timeout_ms` and then fail the same way.
+    /// Set when `Ping` reached `sync_request_timeout` on this attempt.
     bool pooled_ping_timed_out = false;
+    /// The next attempt is the one reconnect after a ping timeout. Its `Hello` wait is capped
+    /// by `sync_request_timeout` so a stopped process does not sit through `handshake_timeout_ms`.
+    bool cap_handshake_after_ping_timeout = false;
 
     auto try_establish = [&]()
     {
         ProfileEvents::increment(ProfileEvents::DistributedConnectionTries);
 
+        ConnectionTimeouts attempt_timeouts = *timeouts;
+        if (cap_handshake_after_ping_timeout)
+        {
+            attempt_timeouts.handshake_timeout = ConnectionTimeouts::saturate(
+                attempt_timeouts.handshake_timeout, attempt_timeouts.sync_request_timeout);
+            cap_handshake_after_ping_timeout = false;
+            LOG_TRACE(log, "Reconnecting after a ping timeout with the handshake capped by `sync_request_timeout`.");
+        }
+
         had_pooled_connection = false;
         pooled_ping_timed_out = false;
-        result.entry = pool->getUnchecked(*timeouts, settings);
+        result.entry = pool->getUnchecked(attempt_timeouts, settings);
         had_pooled_connection = result.entry->isConnected();
 
         AsyncCallbackSetter<Connection> async_setter(&*result.entry, std::move(async_callback));
@@ -110,8 +121,8 @@ void ConnectionEstablisher::run(ConnectionEstablisher::TryResult & result, std::
         /// poll. `Ping` fails when the server stopped without closing the socket; the poll reports
         /// that socket as idle. A connection that is not established yet is connected, and the
         /// handshake is the check. A dead socket is a soft error, so the retry below reconnects
-        /// once. A timeout means the peer kept the socket and sent nothing, and the retry is
-        /// skipped: the next handshake would block for `handshake_timeout_ms`.
+        /// once with the usual handshake timeout. A timeout also reconnects once: the old flow may
+        /// be dead while the server accepts a new connection. That handshake is capped above.
         if (ping_pooled && result.entry->isConnected())
         {
             /// `ping` is private. `checkConnectedThrowOnTimeout` is the wrapper that lets a
@@ -119,14 +130,14 @@ void ConnectionEstablisher::run(ConnectionEstablisher::TryResult & result, std::
             bool answered = false;
             try
             {
-                answered = result.entry->checkConnectedThrowOnTimeout(*timeouts);
+                answered = result.entry->checkConnectedThrowOnTimeout(attempt_timeouts);
             }
             catch (const Exception & e)
             {
                 if (e.code() == ErrorCodes::SOCKET_TIMEOUT)
                 {
                     pooled_ping_timed_out = true;
-                    LOG_TRACE(log, "Pooled connection timed out on ping, will skip it.");
+                    LOG_TRACE(log, "Pooled connection timed out on ping, will reconnect.");
                 }
                 throw;
             }
@@ -138,12 +149,12 @@ void ConnectionEstablisher::run(ConnectionEstablisher::TryResult & result, std::
         }
         else
         {
-            result.entry->forceConnected(*timeouts);
+            result.entry->forceConnected(attempt_timeouts);
         }
 
         UInt64 server_revision = 0;
         if (table_to_check)
-            server_revision = result.entry->getServerRevision(*timeouts);
+            server_revision = result.entry->getServerRevision(attempt_timeouts);
 
         if (!table_to_check || server_revision < DBMS_MIN_REVISION_WITH_TABLES_STATUS)
         {
@@ -158,7 +169,7 @@ void ConnectionEstablisher::run(ConnectionEstablisher::TryResult & result, std::
         TablesStatusRequest status_request;
         status_request.tables.emplace(*table_to_check);
 
-        TablesStatusResponse status_response = result.entry->getTablesStatus(*timeouts, status_request);
+        TablesStatusResponse status_response = result.entry->getTablesStatus(attempt_timeouts, status_request);
         auto table_status_it = status_response.table_states_by_id.find(*table_to_check);
         if (table_status_it == status_response.table_states_by_id.end())
         {
@@ -242,10 +253,13 @@ void ConnectionEstablisher::run(ConnectionEstablisher::TryResult & result, std::
             /// Reconnect and retry once if a previously established (pooled) connection went stale.
             /// The failed request is safe to repeat: it is either a read-only status request, or the
             /// connection was closed before the request reached a live server. A ping that timed out
-            /// is the other case: the peer still holds the socket, and another handshake would wait
-            /// for `handshake_timeout_ms` with the same result, so the replica is skipped here.
-            if (can_reconnect && tries == 0 && had_pooled_connection && !pooled_ping_timed_out)
+            /// is included: a new connection can succeed when the old flow was dropped and the server
+            /// is up. `cap_handshake_after_ping_timeout` limits that `Hello` wait.
+            if (can_reconnect && tries == 0 && had_pooled_connection)
             {
+                if (pooled_ping_timed_out)
+                    cap_handshake_after_ping_timeout = true;
+
                 ProfileEvents::increment(ProfileEvents::DistributedConnectionReconnectCount);
                 continue;
             }
