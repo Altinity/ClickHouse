@@ -237,7 +237,7 @@ class ClickHouseProc:
             return False
         return True
 
-    RUSTFS_VERSION = "1.0.6"
+    RUSTFS_VERSION = "1.0.0-rc.3"
 
     def download_rustfs(self, rustfs_bin):
         machine = platform.machine()
