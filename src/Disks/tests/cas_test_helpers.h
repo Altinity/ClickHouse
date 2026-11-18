@@ -17,6 +17,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPoolMetaFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
@@ -1093,6 +1094,25 @@ inline void seedPoolMetaForRestart(
         (void)DB::Cas::CasRefCatalog::read(*operation, layout);
 }
 
+/// `_pool_meta` at reader floor `floor` with no dialect, written with raw `encodePoolMeta`, and an empty
+/// catalog, as `seedPoolMetaForRestart` does for the current floor.
+inline void seedOlderPoolForTest(
+    DB::Cas::Backend & backend, uint64_t floor, const String & pool_prefix = "p", uint64_t gc_shards = 1)
+{
+    const DB::Cas::Layout layout(pool_prefix);
+    DB::Cas::PoolMeta pm;
+    pm.pool_id = DB::UInt128(0x5eed);
+    pm.blob_header_len = 256;
+    pm.gc_shards = gc_shards;
+    pm.min_reader_generation = floor;
+    pm.algos_used = {static_cast<uint8_t>(DB::Cas::BlobHashAlgo::CityHash128)};
+    OperationForTest operation(backend);
+    const auto written = (*operation).create(layout.poolMetaKey(), DB::Cas::encodePoolMeta(pm), DB::Cas::Retry::standard());
+    if (!std::holds_alternative<DB::Cas::Committed>(written))
+        throw std::runtime_error("seedOlderPoolForTest: _pool_meta already exists or was refused");
+    DB::Cas::CasRefCatalog::initializeEmptyForNewPool(*operation, layout);
+}
+
 /// Write a blob object (envelope + payload) addressed by `hash`, so a HEAD returns a token. The bytes
 /// are arbitrary (GC never reads them); the hash is what the manifest entry references.
 inline void writeBlobBody(
@@ -1858,10 +1878,38 @@ private:
     std::shared_ptr<std::atomic<uint64_t>> largest;
 };
 
+/// The kinds of request `CountingBackend` journals; `Mark` is a test-inserted boundary, not a request.
+enum class JournalVerb : uint8_t { Read, Head, List, Write, Remove, RemoveMany, Publish, Stream, Mark };
+
+/// `keys`: one key, every key of a batch delete, or none for a mark. `detail`: the write condition
+/// (`create` or `replace`) or the mark label.
+struct JournalEntry
+{
+    JournalVerb verb;
+    std::vector<String> keys;
+    String detail;
+};
+
 /// Counts every request per key, for the op-count assertions (Pillar B / A1 tests).
 class CountingBackend : public DB::Cas::InMemoryBackend
 {
 public:
+    /// The requests received, in issue order across threads: an entry is appended before the request
+    /// reaches the inner backend, and a failed or refused request keeps its entry.
+    std::vector<JournalEntry> journal() const
+    {
+        std::lock_guard lock(count_mutex);
+        return journal_entries;
+    }
+
+    void mark(std::string_view label) { append(JournalVerb::Mark, {}, String(label)); }
+
+    void clearJournal()
+    {
+        std::lock_guard lock(count_mutex);
+        journal_entries.clear();
+    }
+
     /// ---- The counters live on the transport primitives, so a request is counted once ----
     ///
     /// Whichever surface a caller used, its request passes through one of the primitives below: a
@@ -1873,12 +1921,14 @@ public:
     /// which no counter below observes.
     std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
     {
+        append(JournalVerb::Read, {key}, {});
         tick(get_counts, get_total, key);
         return InMemoryBackend::read(key, access);
     }
 
     std::optional<DB::Cas::Backend::RawMeta> head(const String & key, DB::Cas::TransportAccess & access) override
     {
+        append(JournalVerb::Head, {key}, {});
         tick(head_counts, head_total, key);
         return InMemoryBackend::head(key, access);
     }
@@ -1886,6 +1936,7 @@ public:
     DB::Cas::Backend::RawListPage list(const String & prefix, const String & cursor, size_t limit,
                                        DB::Cas::TransportAccess & access) override
     {
+        append(JournalVerb::List, {prefix}, {});
         tick(list_counts, list_total, prefix);
         return InMemoryBackend::list(prefix, cursor, limit, access);
     }
@@ -1899,6 +1950,7 @@ public:
     {
         {
             std::lock_guard lock(count_mutex);
+            journal_entries.push_back({JournalVerb::Write, {key}, expected_value ? "replace" : "create"});
             ++write_counts[key];
             ++write_total;
             if (expected_value)
@@ -1922,6 +1974,7 @@ public:
     DB::Cas::Backend::RawRemoval remove(const String & key, const String & expected_value,
                                         DB::Cas::TransportAccess & access) override
     {
+        append(JournalVerb::Remove, {key}, {});
         tick(delete_counts, delete_total, key);
         return InMemoryBackend::remove(key, expected_value, access);
     }
@@ -1931,6 +1984,10 @@ public:
     /// so `deleteCount(key)` reads the same whichever verb deleted it.
     void removeManyWriteOnce(const std::vector<DB::Cas::WriteOnceKey> & keys, DB::Cas::TransportAccess & access) override
     {
+        std::vector<String> names;
+        for (const DB::Cas::WriteOnceKey & key : keys)
+            names.push_back(key.str());
+        append(JournalVerb::RemoveMany, std::move(names), {});
         for (const DB::Cas::WriteOnceKey & key : keys)
             tick(delete_counts, delete_total, key.str());
         InMemoryBackend::removeManyWriteOnce(keys, access);
@@ -1940,12 +1997,14 @@ public:
     /// assertion built only from the primitives above would miss one landing.
     void publish(const DB::Cas::BlobPublishRequest & request, DB::Cas::TransportAccess & access) override
     {
+        append(JournalVerb::Publish, {request.destination_key}, {});
         tick(publish_counts, publish_total, request.destination_key);
         InMemoryBackend::publish(request, access);
     }
 
     std::unique_ptr<DB::ReadBuffer> stream(const String & key, DB::Cas::TransportAccess & access) override
     {
+        append(JournalVerb::Stream, {key}, {});
         tick(get_stream_counts, get_stream_total, key);
         std::unique_ptr<DB::ReadBuffer> opened = InMemoryBackend::stream(key, access);
         const size_t chunk = stream_chunk.load();
@@ -2055,6 +2114,12 @@ public:
     }
 
 private:
+    void append(JournalVerb verb, std::vector<String> keys, String detail)
+    {
+        std::lock_guard lock(count_mutex);
+        journal_entries.push_back({verb, std::move(keys), std::move(detail)});
+    }
+
     std::shared_ptr<std::atomic<uint64_t>> largestChunkSlot(const String & key)
     {
         std::lock_guard lock(count_mutex);
@@ -2091,6 +2156,7 @@ private:
     }
 
     mutable std::mutex count_mutex;
+    std::vector<JournalEntry> journal_entries;
     /// Held by `shared_ptr` so a stream outliving the map entry's rehash still records into its own slot.
     std::map<String, std::shared_ptr<std::atomic<uint64_t>>> largest_stream_chunk;
     std::atomic<size_t> stream_chunk{0};
@@ -2113,6 +2179,145 @@ private:
     uint64_t get_stream_total = 0;
     uint64_t publish_total = 0;
 };
+
+/// Runs a hook once, on the first HEAD of one key after `armOnHead`, before that HEAD is served and with no
+/// backend lock held. A writer that commits there lands after the round's cut and before the redelete
+/// observes the blob.
+class HeadHookBackend : public CountingBackend
+{
+public:
+    void armOnHead(const String & key, std::function<void()> hook)
+    {
+        std::lock_guard lock(hook_mutex);
+        hooked_key = key;
+        on_head = std::move(hook);
+    }
+
+    std::optional<RawMeta> head(const String & key, TransportAccess & access) override
+    {
+        std::function<void()> fire;
+        {
+            std::lock_guard lock(hook_mutex);
+            if (on_head && key == hooked_key)
+                fire = std::exchange(on_head, {});
+        }
+        if (fire)
+            fire();
+        return CountingBackend::head(key, access);
+    }
+
+private:
+    std::mutex hook_mutex;
+    String hooked_key;
+    std::function<void()> on_head;
+};
+
+/// Parks the first redelete apply of `target` until released. The parked leader has removed the body and has
+/// not yet scheduled its marker delete: the window a successor's rounds run in.
+struct ApplyParking
+{
+    std::atomic<bool> armed{false};
+    BlobRef target{};
+    ManualBarrier barrier;
+};
+
+/// Marker etags derived from the bytes, as S3 derives them: equal bytes carry equal etags, so a replaced
+/// marker's etag comes back when the same bytes are written again. Every other key keeps minted values.
+class ContentEtagBackend : public HeadHookBackend
+{
+public:
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        auto raw = HeadHookBackend::read(key, access);
+        if (raw && isMarker(key))
+            raw->value = contentValue(raw->bytes);
+        return raw;
+    }
+
+    std::optional<RawMeta> head(const String & key, TransportAccess & access) override
+    {
+        auto meta = HeadHookBackend::head(key, access);
+        if (meta && isMarker(key))
+            if (const auto raw = InMemoryBackend::read(key, access))
+                meta->value = contentValue(raw->bytes);
+        return meta;
+    }
+
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
+    {
+        RawListPage page = HeadHookBackend::list(prefix, cursor, limit, access);
+        for (RawListedKey & listed : page.keys)
+            if (listed.value && isMarker(listed.key))
+                if (const auto raw = InMemoryBackend::read(listed.key, access))
+                    listed.value = contentValue(raw->bytes);
+        return page;
+    }
+
+    RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override
+    {
+        if (!isMarker(key))
+            return HeadHookBackend::remove(key, expected_value, access);
+        std::lock_guard lock(marker_mutex);
+        const auto current = InMemoryBackend::read(key, access);
+        if (!current)
+            return RawRemoval::Gone;
+        if (contentValue(current->bytes) != expected_value)
+            return RawRemoval::Mismatch;
+        return HeadHookBackend::remove(key, current->value, access);
+    }
+
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value,
+                                             TransportAccess & access) override
+    {
+        if (!isMarker(key))
+            return HeadHookBackend::write(key, bytes, expected_value, access);
+        std::lock_guard lock(marker_mutex);
+        std::optional<String> minted_expected;
+        if (expected_value)
+        {
+            const auto current = InMemoryBackend::read(key, access);
+            if (!current || contentValue(current->bytes) != *expected_value)
+                return std::unexpected(RawConflict{});
+            minted_expected = current->value;
+        }
+        const auto written = HeadHookBackend::write(key, bytes, minted_expected, access);
+        if (!written)
+            return written;
+        return contentValue(bytes);
+    }
+
+private:
+    static bool isMarker(const String & key) { return key.ends_with(".meta"); }
+    static String contentValue(const String & bytes) { return "content-" + hexOf(bytes); }
+
+    std::mutex marker_mutex;
+};
+
+/// A `CountingBackend` that reports the given token dialect instead of `emulated`.
+class DialectOverrideBackend : public CountingBackend
+{
+public:
+    explicit DialectOverrideBackend(DB::Cas::Dialect dialect_) : dialect_value(dialect_) {}
+
+    DB::Cas::Dialect dialect() const override { return dialect_value; }
+
+private:
+    DB::Cas::Dialect dialect_value;
+};
+
+/// Appends `cut_complete` to the journal when the round emits its `fold_ref_intake` row. The row is emitted
+/// on the round thread at the end of intake, so every request issued later, on any thread, follows the mark.
+/// The boundary orders blob `HEAD`s, deletes and writes against the cut; intake reads (a read-ahead read
+/// nobody took) can still be journalled after it. Replaces any phase sink installed on `gc`.
+inline void markCutComplete(DB::Cas::Gc & gc, CountingBackend & backend)
+{
+    gc.setPhaseSink([&backend](const DB::Cas::GcPhaseRecord & record)
+    {
+        if (record.phase == "fold_ref_intake")
+            backend.mark("cut_complete");
+    });
+}
 
 /// The in-memory store with `S3ObjectStorage`'s batch-delete capability. A `removeManyWriteOnce` of more
 /// than one key is refused locally with `NOT_IMPLEMENTED` once the capability is false; a store that rejects

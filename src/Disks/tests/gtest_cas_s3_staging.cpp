@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "cas_test_helpers.h"
+#include "cas_publication_test_support.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
@@ -51,6 +52,8 @@ namespace DB::ErrorCodes
 
 namespace
 {
+
+using DB::Cas::tests::EtagFaithfulPublicationBackend;
 
 /// ---- Small raw-fixture request-engine wrappers shared by the tests below ----
 
@@ -218,98 +221,6 @@ public:
         for (const CopyCall & c : copy_calls)
             n += c.server_side_copy ? 0 : 1;
         return n;
-    }
-};
-
-/// Models an ETag store faithfully enough for the staged-envelope regressions: a blob token is a
-/// deterministic digest of the complete object bytes, so copying the same staging object again would
-/// reproduce the same token. Each script injects a different ambiguity transition from the design.
-class EtagFaithfulPublicationBackend final : public DB::Cas::InMemoryBackend
-{
-public:
-    enum class FaultScript : uint8_t
-    {
-        CopyLandsThenCondemned,
-        CopyLandsThenDeletedBeforeAbsentRetry,
-        FirstCondemnedStreamLandsThenDeleted,
-    };
-
-    explicit EtagFaithfulPublicationBackend(FaultScript script_) : script(script_) {}
-
-    std::optional<DB::Cas::Backend::RawMeta> head(const String & key, DB::Cas::TransportAccess & access) override
-    {
-        std::optional<DB::Cas::Backend::RawMeta> result = DB::Cas::InMemoryBackend::head(key, access);
-        if (result && isBlobBodyKey(key))
-        {
-            const auto body = DB::Cas::InMemoryBackend::read(key, access);
-            chassert(body.has_value());
-            result->value = sipHash128String(body->bytes);
-        }
-        return result;
-    }
-
-    DB::Cas::Backend::RawRemoval remove(const String & key, const String & expected_value,
-                                        DB::Cas::TransportAccess & access) override
-    {
-        if (!isBlobBodyKey(key))
-            return DB::Cas::InMemoryBackend::remove(key, expected_value, access);
-
-        const auto current = head(key, access);
-        if (!current)
-            return DB::Cas::Backend::RawRemoval::Gone;
-        if (current->value != expected_value)
-            return DB::Cas::Backend::RawRemoval::Mismatch;
-        return DB::Cas::InMemoryBackend::remove(key, DB::Cas::InMemoryBackend::head(key, access)->value, access);
-    }
-
-    void publish(const DB::Cas::BlobPublishRequest & request, DB::Cas::TransportAccess & access) override
-    {
-        const bool is_copy = std::holds_alternative<DB::Cas::VerbatimStagedBlobPublication>(request.publication);
-        if (is_copy)
-            ++copy_publications;
-        else
-            ++streaming_publications;
-
-        if (!fault_fired
-            && ((script == FaultScript::CopyLandsThenCondemned && is_copy)
-                || (script == FaultScript::CopyLandsThenDeletedBeforeAbsentRetry && is_copy)
-                || (script == FaultScript::FirstCondemnedStreamLandsThenDeleted && !is_copy)))
-        {
-            fault_fired = true;
-            DB::Cas::InMemoryBackend::publish(request, access);
-            queued_delete_token = head(request.destination_key, access)->value;
-            /// The test wants to replay this exact captured value later as a delete precondition, to
-            /// prove a retag defeats it. `Etag` is never constructible from a raw string, so the only
-            /// way to hold a replayable one is to mint it -- through a nested admitted operation, over
-            /// this same backend instance -- at the exact moment the raw value above was observed.
-            {
-                DB::Cas::tests::OperationForTest mint_op(*this);
-                const auto meta = (*mint_op).head(request.destination_key, DB::Cas::Retry::once());
-                if (meta)
-                    queued_delete_etag = meta->etag;
-            }
-
-            if (script != FaultScript::CopyLandsThenCondemned)
-                first_delete = remove(request.destination_key, queued_delete_token, access);
-
-            throw Poco::TimeoutException("ETag-faithful staged publication response lost");
-        }
-
-        DB::Cas::InMemoryBackend::publish(request, access);
-    }
-
-    FaultScript script;
-    bool fault_fired = false;
-    size_t copy_publications = 0;
-    size_t streaming_publications = 0;
-    String queued_delete_token;
-    std::optional<DB::Cas::Etag> queued_delete_etag;
-    DB::Cas::Backend::RawRemoval first_delete{};
-
-private:
-    static bool isBlobBodyKey(const String & key)
-    {
-        return key.find("/blobs/") != String::npos && !key.ends_with(".meta");
     }
 };
 

@@ -244,47 +244,6 @@ inline uint64_t readAheadWasted()
     return ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadWasted];
 }
 
-/// Runs a hook once, on the first HEAD of one key after `armOnHead`, before that HEAD is served and with no
-/// backend lock held. A writer that commits there lands after the round's cut and before the redelete
-/// observes the blob.
-class HeadHookBackend : public CountingBackend
-{
-public:
-    void armOnHead(const String & key, std::function<void()> hook)
-    {
-        std::lock_guard lock(hook_mutex);
-        hooked_key = key;
-        on_head = std::move(hook);
-    }
-
-    std::optional<RawMeta> head(const String & key, TransportAccess & access) override
-    {
-        std::function<void()> fire;
-        {
-            std::lock_guard lock(hook_mutex);
-            if (on_head && key == hooked_key)
-                fire = std::exchange(on_head, {});
-        }
-        if (fire)
-            fire();
-        return CountingBackend::head(key, access);
-    }
-
-private:
-    std::mutex hook_mutex;
-    String hooked_key;
-    std::function<void()> on_head;
-};
-
-/// Parks the first redelete apply of `target` until released. The parked leader has removed the body and has
-/// not yet scheduled its marker delete: the window a successor's rounds run in.
-struct ApplyParking
-{
-    std::atomic<bool> armed{false};
-    BlobRef target{};
-    ManualBarrier barrier;
-};
-
 /// `target` is set before `armed`, and the hook reads `armed` first, so the two never race.
 inline std::function<void(const BlobRef &)> parkingHook(const std::shared_ptr<ApplyParking> & parking)
 {
@@ -295,78 +254,5 @@ inline std::function<void(const BlobRef &)> parkingHook(const std::shared_ptr<Ap
     };
 }
 
-
-/// Marker etags derived from the bytes, as S3 derives them: equal bytes carry equal etags, so a replaced
-/// marker's etag comes back when the same bytes are written again. Every other key keeps minted values.
-class ContentEtagBackend : public HeadHookBackend
-{
-public:
-    std::optional<Raw> read(const String & key, TransportAccess & access) override
-    {
-        auto raw = HeadHookBackend::read(key, access);
-        if (raw && isMarker(key))
-            raw->value = contentValue(raw->bytes);
-        return raw;
-    }
-
-    std::optional<RawMeta> head(const String & key, TransportAccess & access) override
-    {
-        auto meta = HeadHookBackend::head(key, access);
-        if (meta && isMarker(key))
-            if (const auto raw = InMemoryBackend::read(key, access))
-                meta->value = contentValue(raw->bytes);
-        return meta;
-    }
-
-    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
-    {
-        RawListPage page = HeadHookBackend::list(prefix, cursor, limit, access);
-        for (RawListedKey & listed : page.keys)
-            if (listed.value && isMarker(listed.key))
-                if (const auto raw = InMemoryBackend::read(listed.key, access))
-                    listed.value = contentValue(raw->bytes);
-        return page;
-    }
-
-    RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override
-    {
-        if (!isMarker(key))
-            return HeadHookBackend::remove(key, expected_value, access);
-        std::lock_guard lock(marker_mutex);
-        const auto current = InMemoryBackend::read(key, access);
-        if (!current)
-            return RawRemoval::Gone;
-        if (contentValue(current->bytes) != expected_value)
-            return RawRemoval::Mismatch;
-        return HeadHookBackend::remove(key, current->value, access);
-    }
-
-    std::expected<String, RawConflict> write(const String & key, const String & bytes,
-                                             const std::optional<String> & expected_value,
-                                             TransportAccess & access) override
-    {
-        if (!isMarker(key))
-            return HeadHookBackend::write(key, bytes, expected_value, access);
-        std::lock_guard lock(marker_mutex);
-        std::optional<String> minted_expected;
-        if (expected_value)
-        {
-            const auto current = InMemoryBackend::read(key, access);
-            if (!current || contentValue(current->bytes) != *expected_value)
-                return std::unexpected(RawConflict{});
-            minted_expected = current->value;
-        }
-        const auto written = HeadHookBackend::write(key, bytes, minted_expected, access);
-        if (!written)
-            return written;
-        return contentValue(bytes);
-    }
-
-private:
-    static bool isMarker(const String & key) { return key.ends_with(".meta"); }
-    static String contentValue(const String & bytes) { return "content-" + hexOf(bytes); }
-
-    std::mutex marker_mutex;
-};
 
 }
