@@ -29,9 +29,9 @@ ObjectStorageIdentityCache::ObjectStorageIdentityCache(const String & cache_poli
 {
 }
 
-std::optional<ObjectStorageIdentity> ObjectStorageIdentityCache::tryGet(const String & key)
+std::optional<ObjectStorageIdentity> ObjectStorageIdentityCache::tryGet(const String & key, UInt64 credential_hash)
 {
-    if (auto mapped = Base::get(key))
+    if (auto mapped = Base::get(key); mapped && mapped->credential_hash == credential_hash)
     {
         ProfileEvents::increment(ProfileEvents::ObjectStorageIdentityCacheHits);
         return *mapped;

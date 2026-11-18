@@ -35,6 +35,7 @@
 
 #include <Common/FailPoint.h>
 #include <Common/ProfileEvents.h>
+#include <Common/SipHash.h>
 #include <Common/StringUtils.h>
 #include <Common/logger_useful.h>
 #include <Common/MultiVersion.h>
@@ -69,6 +70,23 @@ namespace DB::FailPoints
 
 namespace DB
 {
+
+/// Distinguishes principals that sign with the same access key and a different secret or session token.
+static UInt64 s3CredentialHash(const S3::Client & client)
+{
+    const auto credentials = client.getCredentials();
+    SipHash hash;
+    const auto update_field = [&](const auto & field)
+    {
+        hash.update(field.data(), field.size());
+        hash.update("\0", 1);
+    };
+    update_field(credentials.GetAWSAccessKeyId());
+    update_field(credentials.GetAWSSecretKey());
+    update_field(credentials.GetSessionToken());
+    return hash.get64();
+}
+
 namespace Setting
 {
     extern const SettingsBool s3_validate_request_settings;
@@ -1054,7 +1072,10 @@ ObjectMetadata S3ObjectStorage::getObjectMetadataImpl(const std::string & path, 
 
         if (use_identity_cache && identity_cache)
         {
-            if (auto cached = identity_cache->tryGet(identity_key))
+            /// Computed only for a lookup. `getCredentials` resolves an assumed role, and a different
+            /// secret must not reuse this entry. The STS test mock returns one access key for every session.
+            const UInt64 credential_hash = s3CredentialHash(*client.get());
+            if (auto cached = identity_cache->tryGet(identity_key, credential_hash))
             {
                 ObjectMetadata result;
                 result.size_bytes = cached->size;
@@ -1140,6 +1161,8 @@ ObjectMetadata S3ObjectStorage::getObjectMetadataImpl(const std::string & path, 
         identity.is_last_modified_known = result.is_last_modified_known;
         if (identity.is_last_modified_known)
             identity.last_modified = static_cast<Int64>(result.last_modified.epochTime());
+        /// After a credential refresh the client that signed the HEAD may not be the one looked up.
+        identity.credential_hash = s3CredentialHash(*client.get());
         identity_cache->setIfEpoch(identity_key, std::move(identity), identity_read);
     }
 

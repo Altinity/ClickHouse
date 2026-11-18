@@ -29,6 +29,10 @@ struct ObjectStorageIdentity
     /// Orders stores of this key. A fetch that started earlier must not overwrite one that started later.
     /// Not part of the object's identity.
     UInt64 fetch_seq = 0;
+    /// SipHash of the access key, secret, and session token that signed the HEAD. Not a secret.
+    /// A hit is only valid for the same principal: the STS mock used in tests returns one access key
+    /// with a different secret per role session, so the access key alone does not separate them.
+    UInt64 credential_hash = 0;
 
     size_t memoryUsage() const
     {
@@ -83,8 +87,9 @@ class ObjectStorageIdentityCache
 public:
     ObjectStorageIdentityCache(const String & cache_policy, size_t max_size_in_bytes, double size_ratio);
 
-    /// Look up an identity by `makeObjectStorageIdentityCacheKey`. Increments the hit/miss ProfileEvents.
-    std::optional<ObjectStorageIdentity> tryGet(const String & key);
+    /// Look up an identity by `makeObjectStorageIdentityCacheKey` for the principal `credential_hash`.
+    /// An entry learned by another principal is a miss and is left in place. Increments the hit/miss ProfileEvents.
+    std::optional<ObjectStorageIdentity> tryGet(const String & key, UInt64 credential_hash);
 
     /// Epoch at the start of a metadata fetch, and a sequence that orders that fetch against others.
     struct Read
