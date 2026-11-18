@@ -324,13 +324,7 @@ namespace ExportPartitionUtils
         const ContextPtr &, const MergeTreePartitionExportTask &);
 
 #if USE_AVRO
-    std::string verifyAndExtractDestinationIcebergMetadataJson(
-        const StorageMetadataPtr & source_metadata,
-        const StorageMetadataPtr & destination_metadata,
-        const StoragePtr & dest_storage,
-        const MergeTreeData::DataPartsVector & parts,
-        const String & partition_id,
-        const ContextPtr & context)
+    std::string getDestinationIcebergMetadataJson(const StoragePtr & dest_storage, const ContextPtr & context)
     {
         if (!context->getSettingsRef()[Setting::allow_insert_into_iceberg])
             throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
@@ -354,15 +348,39 @@ namespace ExportPartitionUtils
 
         const auto metadata_object = iceberg_metadata->getMetadataJSON(context);
 
-        verifyIcebergPartitionCompatibility(
-            metadata_object, source_metadata, destination_metadata, parts, partition_id, context);
-
         std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
         oss.exceptions(std::ios::failbit);
         metadata_object->stringify(oss);
         return oss.str();
     }
+
+    void verifyDestinationIcebergPartitionCompatibility(
+        const std::string & iceberg_metadata_json,
+        const StorageMetadataPtr & source_metadata,
+        const StorageMetadataPtr & destination_metadata,
+        const MergeTreeData::DataPartsVector & parts,
+        const String & partition_id,
+        const ContextPtr & context)
+    {
+        Poco::JSON::Parser parser; /// For some reason base/base/JSON.h can not parse this json file
+        const auto metadata_object = parser.parse(iceberg_metadata_json).extract<Poco::JSON::Object::Ptr>();
+
+        verifyIcebergPartitionCompatibility(
+            metadata_object, source_metadata, destination_metadata, parts, partition_id, context);
+    }
 #endif
+
+    std::optional<std::string> getDestinationIcebergMetadataJsonIfDataLake(const StoragePtr & dest_storage, const ContextPtr & context)
+    {
+        if (!dest_storage->isDataLake())
+            return std::nullopt;
+#if USE_AVRO
+        return getDestinationIcebergMetadataJson(dest_storage, context);
+#else
+        (void)context;
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Data lake export requires Avro support");
+#endif
+    }
 
     IStorage::ExportPartitionCommitInfo commitExportOnDestination(
         const String & transaction_id,

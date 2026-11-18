@@ -2811,6 +2811,21 @@ Poco::JSON::Object::Ptr IcebergMetadata::getMetadataJSON(ContextPtr local_contex
         persistent_components.table_uuid);
 }
 
+NamesAndTypesList IcebergMetadata::getExportDestinationColumns(const std::string & iceberg_metadata_json_string, ContextPtr context) const
+{
+    Poco::JSON::Parser parser; /// For some reason base/base/JSON.h can not parse this json file
+    const auto metadata_json = parser.parse(iceberg_metadata_json_string).extract<Poco::JSON::Object::Ptr>();
+
+    const auto schema_id = metadata_json->getValue<Int64>(Iceberg::f_current_schema_id);
+    const auto schema = lookupSchema(metadata_json, schema_id);
+
+    /// A scratch processor: the live one of the table is not touched. It derives the columns the way a reader does,
+    /// for example `int` is `Int32` and `long` is `Int64`.
+    IcebergSchemaProcessor schema_processor(context, context->getSettingsRef()[Setting::allow_experimental_geo_types_in_iceberg]);
+    schema_processor.addIcebergTableSchema(schema, context);
+    return *schema_processor.getClickHouseTableSchemaById(static_cast<Int32>(schema_id));
+}
+
 }
 
 #endif

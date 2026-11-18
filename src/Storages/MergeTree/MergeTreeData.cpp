@@ -8638,7 +8638,6 @@ void MergeTreeData::exportPartToTable(
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Destination storage {} does not support MergeTree parts or uses unsupported partitioning", dest_storage->getName());
 
     auto source_metadata_ptr = getInMemoryMetadataPtr(query_context, false);
-    auto destination_metadata_ptr = dest_storage->getInMemoryMetadataPtr(query_context, false);
 
     if (dest_storage->isDataLake() && !query_context->getSettingsRef()[Setting::allow_insert_into_iceberg])
     {
@@ -8647,16 +8646,12 @@ void MergeTreeData::exportPartToTable(
             "To allow its usage, enable the setting `allow_insert_into_iceberg`.");
     }
 
-    ExportPartitionUtils::verifyExportSchemaCastable(
-        source_metadata_ptr, destination_metadata_ptr, dest_storage->getStorageID(), query_context);
-
-    auto part = getPartIfExists(part_name, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
-
-    if (!part)
-        throw Exception(ErrorCodes::NO_SUCH_DATA_PART, "No such data part '{}' to export in table '{}'",
-                        part_name, getStorageID().getFullTableName());
-
+    /// The export is validated and run against the destination types that the destination Iceberg metadata defines, not
+    /// against the in-memory columns of the destination table, which differ between nodes until a query reloads them
+    /// from the Iceberg schema. The metadata is the one stored in the export manifest when the export was scheduled by
+    /// `EXPORT PARTITION`, so every replica uses the types the scheduling node validated. Otherwise it is read now.
     std::string iceberg_metadata_json;
+    bool verify_iceberg_partition_compatibility = false;
 
     if (dest_storage->isDataLake())
     {
@@ -8667,42 +8662,40 @@ void MergeTreeData::exportPartToTable(
         }
         else
         {
-            auto * object_storage = dynamic_cast<StorageObjectStorage *>(dest_storage.get());
-            auto * object_storage_cluster = dynamic_cast<StorageObjectStorageCluster *>(dest_storage.get());
+            iceberg_metadata_json = ExportPartitionUtils::getDestinationIcebergMetadataJson(dest_storage, query_context);
+            verify_iceberg_partition_compatibility = true;
+        }
+#else
+        (void)iceberg_metadata_json_;
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Data lake export requires Avro support");
+#endif
+    }
 
-            /// in theory this should never happen, but just in case
-            if (!object_storage && !object_storage_cluster)
-            {
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Destination storage {} is not a StorageObjectStorage", dest_storage->getName());
-            }
+    auto destination_metadata_ptr = dest_storage->getExportDestinationMetadata(
+        dest_storage->isDataLake() ? std::optional<std::string>(iceberg_metadata_json) : std::nullopt, query_context);
 
-            std::shared_ptr<IcebergMetadata> iceberg_metadata;
-            if (object_storage)
-                iceberg_metadata = std::dynamic_pointer_cast<IcebergMetadata>(object_storage->getExternalMetadata(query_context));
-            else if (object_storage_cluster)
-                iceberg_metadata = std::dynamic_pointer_cast<IcebergMetadata>(object_storage_cluster->getExternalMetadata(query_context));
-            if (!iceberg_metadata)
-            {
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Destination storage {} is a data lake but not an iceberg table", dest_storage->getName());
-            }
-    
-            const auto metadata_object = iceberg_metadata->getMetadataJSON(query_context);
-                
-            std::ostringstream oss;
-            metadata_object->stringify(oss);
-            iceberg_metadata_json = oss.str();
+    ExportPartitionUtils::verifyExportSchemaCastable(
+        source_metadata_ptr, destination_metadata_ptr, dest_storage->getStorageID(), query_context);
 
-            ExportPartitionUtils::verifyIcebergPartitionCompatibility(
-                metadata_object,
+    auto part = getPartIfExists(part_name, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
+
+    if (!part)
+        throw Exception(ErrorCodes::NO_SUCH_DATA_PART, "No such data part '{}' to export in table '{}'",
+                        part_name, getStorageID().getFullTableName());
+
+    if (dest_storage->isDataLake())
+    {
+#if USE_AVRO
+        if (verify_iceberg_partition_compatibility)
+        {
+            ExportPartitionUtils::verifyDestinationIcebergPartitionCompatibility(
+                iceberg_metadata_json,
                 source_metadata_ptr,
                 destination_metadata_ptr,
                 {part},
                 part->info.getPartitionId(),
                 query_context);
         }
-#else
-        (void)iceberg_metadata_json_;
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Data lake export requires Avro support");
 #endif
     }
     else

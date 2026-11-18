@@ -8721,8 +8721,13 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     if (!dest_storage->supportsImport(query_context))
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Destination storage {} does not support MergeTree parts or uses unsupported partitioning", dest_storage->getName());
 
+    /// The destination Iceberg metadata is read first: the export is validated, stored in the manifest and run on every
+    /// replica against the destination types that this metadata defines, not against the in-memory columns of the
+    /// destination table, which differ between nodes until a query reloads them from the Iceberg schema.
+    const auto iceberg_metadata_json = ExportPartitionUtils::getDestinationIcebergMetadataJsonIfDataLake(dest_storage, query_context);
+
     auto src_snapshot = getInMemoryMetadataPtr(query_context, false);
-    auto destination_snapshot = dest_storage->getInMemoryMetadataPtr(query_context, false);
+    auto destination_snapshot = dest_storage->getExportDestinationMetadata(iceberg_metadata_json, query_context);
 
     ExportPartitionUtils::verifyExportSchemaCastable(
         src_snapshot, destination_snapshot, dest_storage->getStorageID(), query_context);
@@ -8852,10 +8857,11 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     if (dest_storage->isDataLake())
     {
 #if USE_AVRO
-        manifest.iceberg_metadata_json = ExportPartitionUtils::verifyAndExtractDestinationIcebergMetadataJson(
+        manifest.iceberg_metadata_json = *iceberg_metadata_json;
+        ExportPartitionUtils::verifyDestinationIcebergPartitionCompatibility(
+            manifest.iceberg_metadata_json,
             src_snapshot,
             destination_snapshot,
-            dest_storage,
             parts,
             partition_id,
             query_context);

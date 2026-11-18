@@ -840,6 +840,25 @@ bool StorageObjectStorage::optimize(
     return configuration->optimize(object_storage, metadata_snapshot, context, format_settings, catalog, getStorageID());
 }
 
+StorageMetadataHandle StorageObjectStorage::getExportDestinationMetadata(
+    const std::optional<std::string> & iceberg_metadata_json,
+    ContextPtr local_context) const
+{
+    auto metadata_snapshot = getInMemoryMetadataPtr(local_context, false);
+
+    if (!isDataLake() || !iceberg_metadata_json || iceberg_metadata_json->empty())
+        return metadata_snapshot;
+
+    /// The columns of the table in memory are the ones it was declared with, until a query reloads them from the
+    /// Iceberg schema. They differ between the nodes that run one export, so take them from the table metadata that
+    /// the export was validated against instead.
+    configuration->lazyInitializeIfNeeded(object_storage, local_context);
+    auto export_metadata = std::make_shared<StorageInMemoryMetadata>(*metadata_snapshot);
+    export_metadata->setColumns(
+        ColumnsDescription{configuration->getExternalMetadata()->getExportDestinationColumns(*iceberg_metadata_json, local_context)});
+    return export_metadata;
+}
+
 bool StorageObjectStorage::supportsImport(ContextPtr local_context) const
 {
     if (isDataLake())
@@ -871,7 +890,7 @@ IStorage::ImportResult StorageObjectStorage::import(
     if (isDataLake())
     {
         configuration->lazyInitializeIfNeeded(object_storage, local_context);
-        auto metadata_snapshot = getInMemoryMetadataPtr(local_context, false);
+        auto metadata_snapshot = getExportDestinationMetadata(iceberg_metadata_json_string, local_context);
         return ImportResult::createSink(configuration->getExternalMetadata()->import(
             catalog,
             new_file_path_callback,
@@ -967,7 +986,7 @@ IStorage::ExportPartitionCommitInfo StorageObjectStorage::commitExportPartitionT
         const auto partition_spec_id   = iceberg_metadata->getValue<Int64>(Iceberg::f_default_spec_id);
 
         configuration->lazyInitializeIfNeeded(object_storage, local_context);
-        auto metadata_snapshot = getInMemoryMetadataPtr(local_context, false);
+        auto metadata_snapshot = getExportDestinationMetadata(iceberg_commit_export_partition_arguments.metadata_json_string, local_context);
         return configuration->getExternalMetadata()->commitExportPartitionTransaction(
             catalog,
             storage_id,
