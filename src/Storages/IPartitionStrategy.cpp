@@ -226,6 +226,11 @@ ColumnPtr IPartitionStrategy::computePartitionKey(
     return block_with_partition_by_expr.getByName(partition_key_actions.column_name).column;
 }
 
+ColumnPtr IPartitionStrategy::computePartitionKey(const Chunk & chunk)
+{
+    return computePartitionKey(chunk, getPartitionKeyActions());
+}
+
 std::shared_ptr<IPartitionStrategy> PartitionStrategyFactory::get(StrategyType strategy,
                                                                  ASTPtr partition_by,
                                                                  const NamesAndTypesList & partition_columns,
@@ -278,26 +283,11 @@ WildcardPartitionStrategy::WildcardPartitionStrategy(KeyDescription partition_ke
 {
 }
 
-<<<<<<< HEAD
-ColumnPtr WildcardPartitionStrategy::computePartitionKey(const Chunk & chunk)
+IPartitionStrategy::PartitionExpressionActionsAndColumnName WildcardPartitionStrategy::getPartitionKeyActions()
 {
     ASTs arguments(1, partition_key_description.definition_ast);
     ASTPtr partition_by_string = makeASTFunction("toString", std::move(arguments));
-    auto actions_with_column = getPartitionExpressionActions(partition_by_string);
-
-    Block block_with_partition_by_expr = sample_block.cloneWithoutColumns();
-    block_with_partition_by_expr.setColumns(chunk.getColumns());
-    actions_with_column.actions->execute(block_with_partition_by_expr);
-
-    return block_with_partition_by_expr.getByName(actions_with_column.column_name).column;
-=======
-IPartitionStrategy::PartitionExpressionActionsAndColumnName WildcardPartitionStrategy::getPartitionKeyActions() const
-{
-    return getCachedOrBuildActions(
-        cached_result,
-        *this,
-        [&] { return buildToStringPartitionAST(partition_key_description.definition_ast); });
->>>>>>> 690d3be35e1 (Merge pull request #128217 from groeneai/fix-partition-by-stateful-function-spans-chunks)
+    return getPartitionExpressionActions(partition_by_string);
 }
 
 std::string WildcardPartitionStrategy::getPathForRead(
@@ -367,25 +357,10 @@ std::string HiveStylePartitionStrategy::getPathForWrite(
     return path;
 }
 
-<<<<<<< HEAD
-ColumnPtr HiveStylePartitionStrategy::computePartitionKey(const Chunk & chunk)
+IPartitionStrategy::PartitionExpressionActionsAndColumnName HiveStylePartitionStrategy::getPartitionKeyActions()
 {
     auto hive_ast = buildHivePartitionAST(partition_key_description.definition_ast, getPartitionColumns());
-    auto actions_with_column = getPartitionExpressionActions(hive_ast);
-
-    Block block_with_partition_by_expr = sample_block.cloneWithoutColumns();
-    block_with_partition_by_expr.setColumns(chunk.getColumns());
-    actions_with_column.actions->execute(block_with_partition_by_expr);
-
-    return block_with_partition_by_expr.getByName(actions_with_column.column_name).column;
-=======
-IPartitionStrategy::PartitionExpressionActionsAndColumnName HiveStylePartitionStrategy::getPartitionKeyActions() const
-{
-    return getCachedOrBuildActions(
-        cached_result,
-        *this,
-        [&] { return buildHivePartitionAST(partition_key_description.definition_ast, getPartitionColumns()); });
->>>>>>> 690d3be35e1 (Merge pull request #128217 from groeneai/fix-partition-by-stateful-function-spans-chunks)
+    return getPartitionExpressionActions(hive_ast);
 }
 
 ColumnRawPtrs HiveStylePartitionStrategy::getFormatChunkColumns(const Chunk & chunk)
