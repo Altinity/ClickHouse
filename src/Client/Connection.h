@@ -173,6 +173,15 @@ public:
 
     bool checkConnected(const ConnectionTimeouts & timeouts) override { return isConnected() && ping(timeouts); }
 
+    /// Same round trip as `checkConnected`, but a peer that keeps the socket open and sends no
+    /// `Pong` within `sync_request_timeout` throws `SOCKET_TIMEOUT`. A socket the server has
+    /// already closed still returns false. Cluster reads use the difference so a silent peer is
+    /// skipped instead of opening another connection and waiting out `handshake_timeout_ms`.
+    bool checkConnectedThrowOnTimeout(const ConnectionTimeouts & timeouts)
+    {
+        return isConnected() && ping(timeouts, /*rethrow_on_timeout=*/ true);
+    }
+
     /// Note that a server that went away without closing the connection is not detected here, and
     /// neither is a close that has not arrived yet; that only shows up when the connection is used.
     /// Pinging the server to find out would add a round trip to every query, and a pong that does
@@ -372,7 +381,9 @@ private:
 #if USE_SSL
     void sendClusterNameAndSalt();
 #endif
-    bool ping(const ConnectionTimeouts & timeouts);
+    /// `rethrow_on_timeout` lets `SOCKET_TIMEOUT` out. Other failures still return false after
+    /// `disconnect`, which is what `checkConnected` and the clickhouse-client resync rely on.
+    bool ping(const ConnectionTimeouts & timeouts, bool rethrow_on_timeout = false);
 
     /// Whether the connection can no longer serve a request, checked without a round trip.
     bool isStale();

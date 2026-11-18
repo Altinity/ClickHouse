@@ -85,6 +85,7 @@ namespace FailPoints
     extern const char receive_timeout_on_table_status_response[];
     extern const char unexpected_packet_in_table_status_response[];
     extern const char unresponsive_pooled_connection[];
+    extern const char pooled_connection_ping_timeout[];
 }
 
 namespace ErrorCodes
@@ -914,13 +915,20 @@ void Connection::sendClusterNameAndSalt()
 }
 #endif
 
-bool Connection::ping(const ConnectionTimeouts & timeouts)
+bool Connection::ping(const ConnectionTimeouts & timeouts, bool rethrow_on_timeout)
 {
-    /// For tests: a pooled peer that does not answer. `disconnect` matches the failure path below,
-    /// so the caller reconnects instead of reusing this socket.
+    /// For tests: a pooled socket the server has already closed. `disconnect` matches the failure
+    /// path below, so the caller reconnects instead of reusing this socket.
     fiu_do_on(FailPoints::unresponsive_pooled_connection, {
         disconnect();
         return false;
+    });
+
+    /// For tests: a peer that keeps the socket open and sends no `Pong`. Callers that asked to
+    /// see the timeout skip this replica instead of opening another connection.
+    fiu_do_on(FailPoints::pooled_connection_ping_timeout, {
+        disconnect();
+        throw Exception(ErrorCodes::SOCKET_TIMEOUT, "Injected ping timeout");
     });
 
     try
@@ -950,6 +958,19 @@ bool Connection::ping(const ConnectionTimeouts & timeouts)
 
         if (pong != Protocol::Server::Pong)
             throwUnexpectedPacket(pong, "Pong", &timeout_setter);
+    }
+    catch (const Exception & e)
+    {
+        /// `Exception` extends `Poco::Exception`, so this arm has to come first. A read or write
+        /// that reaches `sync_request_timeout` is `SOCKET_TIMEOUT`. With `rethrow_on_timeout` the
+        /// caller skips the replica. Every other failure still returns false, and `checkConnected`
+        /// keeps its old contract.
+        const bool timed_out = rethrow_on_timeout && e.code() == ErrorCodes::SOCKET_TIMEOUT;
+        disconnect();
+        LOG_TRACE(log_wrapper.get(), fmt::runtime(e.displayText()));
+        if (timed_out)
+            throw;
+        return false;
     }
     catch (const Poco::Exception & e)
     {

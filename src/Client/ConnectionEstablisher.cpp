@@ -77,12 +77,16 @@ void ConnectionEstablisher::run(ConnectionEstablisher::TryResult & result, std::
     /// can be stale; a failure of a freshly established one is a genuine replica problem, and
     /// retrying it is left to the caller (with its error accounting).
     bool had_pooled_connection = false;
+    /// Set when `Ping` reached `sync_request_timeout`. The peer kept the socket open, so a new
+    /// handshake would wait for `handshake_timeout_ms` and then fail the same way.
+    bool pooled_ping_timed_out = false;
 
     auto try_establish = [&]()
     {
         ProfileEvents::increment(ProfileEvents::DistributedConnectionTries);
 
         had_pooled_connection = false;
+        pooled_ping_timed_out = false;
         result.entry = pool->getUnchecked(*timeouts, settings);
         had_pooled_connection = result.entry->isConnected();
 
@@ -105,12 +109,28 @@ void ConnectionEstablisher::run(ConnectionEstablisher::TryResult & result, std::
         /// A pooled connection that the caller asked to ping is checked with `Ping` instead of the
         /// poll. `Ping` fails when the server stopped without closing the socket; the poll reports
         /// that socket as idle. A connection that is not established yet is connected, and the
-        /// handshake is the check. A failed ping is a soft error, so the retry below reconnects once.
+        /// handshake is the check. A dead socket is a soft error, so the retry below reconnects
+        /// once. A timeout means the peer kept the socket and sent nothing, and the retry is
+        /// skipped: the next handshake would block for `handshake_timeout_ms`.
         if (ping_pooled && result.entry->isConnected())
         {
-            /// `ping` is private. `checkConnected` is the public wrapper, and this branch
-            /// already knows the connection is established, so it only runs the ping.
-            if (!result.entry->checkConnected(*timeouts))
+            /// `ping` is private. `checkConnectedThrowOnTimeout` is the wrapper that lets a
+            /// `SOCKET_TIMEOUT` out. This branch already knows the connection is established.
+            bool answered = false;
+            try
+            {
+                answered = result.entry->checkConnectedThrowOnTimeout(*timeouts);
+            }
+            catch (const Exception & e)
+            {
+                if (e.code() == ErrorCodes::SOCKET_TIMEOUT)
+                {
+                    pooled_ping_timed_out = true;
+                    LOG_TRACE(log, "Pooled connection timed out on ping, will skip it.");
+                }
+                throw;
+            }
+            if (!answered)
             {
                 LOG_TRACE(log, "Pooled connection did not answer a ping, will reconnect.");
                 throw Exception(ErrorCodes::SOCKET_TIMEOUT, "Ping of a pooled connection failed");
@@ -221,8 +241,10 @@ void ConnectionEstablisher::run(ConnectionEstablisher::TryResult & result, std::
 
             /// Reconnect and retry once if a previously established (pooled) connection went stale.
             /// The failed request is safe to repeat: it is either a read-only status request, or the
-            /// connection was closed before the request reached a live server.
-            if (can_reconnect && tries == 0 && had_pooled_connection)
+            /// connection was closed before the request reached a live server. A ping that timed out
+            /// is the other case: the peer still holds the socket, and another handshake would wait
+            /// for `handshake_timeout_ms` with the same result, so the replica is skipped here.
+            if (can_reconnect && tries == 0 && had_pooled_connection && !pooled_ping_timed_out)
             {
                 ProfileEvents::increment(ProfileEvents::DistributedConnectionReconnectCount);
                 continue;

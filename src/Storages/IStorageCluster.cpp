@@ -942,7 +942,8 @@ void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const 
         /// this server's own address a real TCP pool too, and `isLocal` is how that shard is told
         /// apart: pinging it cannot discover a dead peer. A remote peer that stopped without
         /// closing the socket otherwise stays in the pipeline and the query waits for
-        /// `receive_timeout`.
+        /// `receive_timeout`. No `Pong` within `sync_request_timeout` skips the shard. The
+        /// establisher does not open a second connection in that case.
         const bool ping_pooled_connection = !shard_info.isLocal();
         auto try_results = shard_info.pool->getMany(
             timeouts,

@@ -55,8 +55,10 @@ public:
       * Connections provide access to different replicas of one shard.
       */
     /// `ping_pooled_connection` pings a connection that the pool returned already established.
-    /// Used by cluster reads of a remote shard: a server that stopped without closing the socket
-    /// is skipped after `sync_request_timeout` instead of blocking the query for `receive_timeout`.
+    /// Used by cluster reads of a remote shard. A server that stopped without closing the socket
+    /// sends no `Pong` within `sync_request_timeout`, and that shard is skipped. A new handshake
+    /// is not attempted: it would wait for `handshake_timeout_ms` and get no `Hello` either.
+    /// A socket the server has already closed still reconnects once.
     std::vector<Entry> getMany(
         const ConnectionTimeouts & timeouts,
         const Settings & settings,
