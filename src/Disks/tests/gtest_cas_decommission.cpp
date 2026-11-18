@@ -525,33 +525,6 @@ TEST_F(CASDecommission, AlwaysRenewsAdminClaimEvenWhenHostDiskIsObserveOnly)
     EXPECT_TRUE(admin->poolConfig().bounded_background_renewal);
 }
 
-TEST_F(CASDecommission, DecommissionMountRaisesThePoolFloor)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    {
-        auto victim = openVictim(backend);
-    }
-    {
-        OperationForTest op(*backend);
-        const auto current = (*op).read(layout.poolMetaKey(), Retry::once());
-        ASSERT_TRUE(current.has_value());
-        const auto head = (*op).head(layout.poolMetaKey(), Retry::once());
-        ASSERT_TRUE(head.has_value());
-        PoolMeta pm = decodePoolMeta(current->bytes);
-        pm.min_reader_generation = G_WRITE_FLOOR;
-        ASSERT_TRUE(std::holds_alternative<Committed>(
-            (*op).replace(layout.poolMetaKey(), encodePoolMeta(pm), head->etag, Retry::once())));
-    }
-
-    auto admin = Pool::openForDecommission(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
-    ASSERT_TRUE(admin != nullptr);
-
-    OperationForTest op(*backend);
-    const auto stored = (*op).read(layout.poolMetaKey(), Retry::once());
-    ASSERT_TRUE(stored.has_value());
-    EXPECT_EQ(decodePoolMeta(stored->bytes).min_reader_generation, G_REF_CHAIN);
-}
-
 TEST_F(CASDecommission, OpensOverARetiredOwner)
 {
     auto backend = startVictim();
@@ -1418,7 +1391,7 @@ TEST_F(CASDecommission, UnconfirmedFarewellIsNotRetired)
 {
     auto backend = startVictim(std::make_shared<FenceBeforeFarewellBackend>());
     backend->arm();
-    DB::Cas::tests::ScopedLoggerCapture capture("CasDecommission", "warning");
+    DB::Cas::tests::ScopedLogCapture capture("CasDecommission", "warning");
 
     const auto report = run("admin");
 
@@ -2035,7 +2008,7 @@ TEST_F(CASDecommission, FencedAdminFailsInsteadOfRemounting)
     tombstoneOwner();
     fenceSlot();
     admin->tripMountLost();   /// what the renewer does when it finds its body fenced
-    DB::Cas::tests::ScopedLoggerCapture capture("CasPool", "warning");
+    DB::Cas::tests::ScopedLogCapture capture("CasPool", "warning");
     EXPECT_FALSE(admin->tryRemountOnce());
     EXPECT_EQ(admin->lifecycle(), PoolLifecycle::IdentityLost);
     EXPECT_NE(capture.captured().find("lost its admin claim and does not remount"), String::npos) << capture.captured();
@@ -2221,7 +2194,7 @@ TEST_F(CASDecommission, OwnerThatMovedOnIsNotReportedRetired)
 TEST_F(CASDecommission, RetirementLogsTheUuidAndLife)
 {
     auto backend = startVictim();
-    DB::Cas::tests::ScopedLoggerCapture capture("CasDecommission", "information");
+    DB::Cas::tests::ScopedLogCapture capture("CasDecommission", "information");
 
     const auto report = run("a1");
 
@@ -2303,7 +2276,7 @@ TEST_F(CASDecommission, FailedConfirmKeepsTheDrainError)
 {
     auto backend = startVictim(std::make_shared<DrainThenConfirmFailBackend>());
     backend->onWriteCommitted(layout.ownerKey("victim"), [&] { backend->arm(); });
-    DB::Cas::tests::ScopedLoggerCapture capture("CasDecommission", "warning");
+    DB::Cas::tests::ScopedLogCapture capture("CasDecommission", "warning");
 
     try
     {
@@ -2322,7 +2295,7 @@ TEST_F(CASDecommission, FailedConfirmKeepsTheDrainError)
 TEST_F(CASDecommission, OpenLogsTheSkippedProbe)
 {
     auto backend = startVictim();
-    DB::Cas::tests::ScopedLoggerCapture capture("CasPool", "information");
+    DB::Cas::tests::ScopedLogCapture capture("CasPool", "information");
     auto admin = Pool::openForDecommission(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "a1"}, "victim");
     EXPECT_NE(capture.captured().find("capability probe was skipped"), String::npos) << capture.captured();
 }

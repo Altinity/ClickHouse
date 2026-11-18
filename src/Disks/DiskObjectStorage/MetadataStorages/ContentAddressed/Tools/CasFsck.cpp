@@ -1,6 +1,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasBoundedRun.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobIntentFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
@@ -11,6 +13,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 
+#include <Common/ErrorCodes.h>
 #include <Common/Exception.h>
 #include <Common/HashTable/Hash.h>
 #include <Common/scope_guard_safe.h>
@@ -27,7 +30,9 @@ namespace DB
 {
 namespace ErrorCodes
 {
+    extern const int BAD_ARGUMENTS;
     extern const int CORRUPTED_DATA;
+    extern const int LOGICAL_ERROR;
     extern const int TIMEOUT_EXCEEDED;
 }
 }
@@ -436,13 +441,265 @@ std::optional<RefTableState> walkRefStream(
     }
 }
 
+/// Counts one read or `HEAD` of an intent that gave no answer, and keeps the first reason, shortened.
+void countIntentUnread(FsckReport & report, String reason)
+{
+    static constexpr size_t kMaxReasonBytes = 200;
+    ++report.intent_unread;
+    if (!report.intent_unread_reason.empty())
+        return;
+    if (reason.size() > kMaxReasonBytes)
+        reason = reason.substr(0, kMaxReasonBytes) + "...";
+    report.intent_unread_reason = std::move(reason);
+}
+
+void countIntentUnread(FsckReport & report, const Exception & e)
+{
+    countIntentUnread(report, String(ErrorCodes::getName(e.code())) + ": " + e.message());
+}
+
+constexpr uint64_t kProgressKeys = 1000;
+
+/// Counts the listed deletion intents. A key that does not parse is `intent_malformed`; every other key is
+/// `intent_listed` and, with `verify`, is also read and compared with its body: one `GET` and one `HEAD` per
+/// intent, each landing in exactly one intent class. A listed key that vanishes before its read is not an
+/// object any more and is not counted. Nothing here decides anything from an absent body: an intent
+/// outlives its body until GC's later round.
+void classifyIntents(CasOperation & op, const Layout & layout, bool verify, bool detail, const FsckProgress & on_progress,
+                     const Deadline & deadline, FsckReport & report)
+{
+    std::unordered_map<String, uint64_t> listed;
+    listAll(op, layout.blobIntentsPrefix(), listed, on_progress, deadline, "listing blob intents");
+    std::vector<std::pair<String, uint64_t>> intents(listed.begin(), listed.end());
+    std::sort(intents.begin(), intents.end());
+    report.intents_verified = verify;
+
+    uint64_t visited = 0;
+    for (const auto & [key, size] : intents)
+    {
+        checkDeadline(deadline, "reading blob intents");
+        if (on_progress && ++visited % kProgressKeys == 0)
+            on_progress(verify ? "verifying blob intents" : "counting blob intents", visited, 0);
+
+        if (layout.isBlobIntentProbeKey(key))
+            continue;   /// the capability probe's scratch object, not an intent
+        const auto parsed = layout.parseBlobIntentKey(key);
+        if (parsed && !verify)
+        {
+            ++report.intent_listed;
+            report.physical_bytes += size;
+            continue;
+        }
+
+        FsckClass cls = FsckClass::IntentMalformed;
+        String note = "the key is not an intent key";
+        if (parsed)
+        {
+            bool counted = false;
+            try
+            {
+                const auto got = op.read(key, Retry::standard());
+                if (!got)
+                    continue;
+                counted = true;
+                ++report.intent_listed;
+                if (!isBlobIntentRecord(got->bytes))
+                {
+                    note = "the bytes are not the intent record";
+                }
+                else if (const std::optional<Meta> body = op.head(layout.blobKey(parsed->ref), Retry::standard()); !body)
+                {
+                    cls = FsckClass::IntentBodyGone;
+                    note = "no body at the blob's key; GC removes the intent in a later round";
+                }
+                else if (const std::optional<CanonicalIdentity> seen = body->etag.canonical(); !seen)
+                {
+                    cls = FsckClass::IntentUnread;
+                    note = "the body's token has no canonical identity";
+                    countIntentUnread(report, "the token of the body at " + layout.blobKey(parsed->ref) + " has no canonical identity");
+                }
+                else if (*seen == parsed->identity)
+                {
+                    cls = FsckClass::IntentCurrent;
+                    note = "the body is the incarnation the intent names";
+                }
+                else
+                {
+                    cls = FsckClass::IntentReplaced;
+                    note = "the body is another incarnation; GC removes the intent later";
+                }
+            }
+            catch (const Exception & e)
+            {
+                if (e.code() == ErrorCodes::TIMEOUT_EXCEEDED || e.code() == ErrorCodes::LOGICAL_ERROR)
+                    throw;
+                report.intent_listed += !counted;
+                cls = FsckClass::IntentUnread;
+                note = "a read failed: " + e.message();
+                countIntentUnread(report, e);
+            }
+        }
+
+        report.physical_bytes += size;
+        switch (cls)
+        {
+            case FsckClass::IntentCurrent:   ++report.intent_current; break;
+            case FsckClass::IntentReplaced:  ++report.intent_replaced; break;
+            case FsckClass::IntentBodyGone:  ++report.intent_body_gone; break;
+            case FsckClass::IntentUnread:    break;   /// counted where it was recorded
+            default:                         ++report.intent_malformed; break;
+        }
+        if (detail)
+            report.objects.push_back(FsckObject{.key = key, .kind = ObjectKind::Blob, .size = size, .cls = cls, .reachable_from = {std::move(note)}});
+    }
+}
+
+/// What the adopted GC snapshot holds about the `wanted` blobs: whether GC knows them at all, the rows it
+/// keeps for them, and with `detail` the source edges still counted on them.
+struct GcSnapshotView
+{
+    bool have_state = false;
+    /// `gc/state`, the seal it names and every run of it were read, and every run matched its checksum.
+    bool complete = false;
+    std::unordered_set<BlobRef, BlobRefHash> in_run_hashes;
+    std::unordered_map<BlobRef, CondemnedRow, BlobRefHash> retired_by_hash;
+    std::unordered_map<BlobRef, std::vector<UInt128>, BlobRefHash> edge_sources;
+    /// Every `pending` row, `wanted` or not: GC deletes its body when its own cut shows no reference, so a reference
+    /// committed after that cut does not stop the delete.
+    std::unordered_map<BlobRef, CondemnedRow, BlobRefHash> pending_rows;
+};
+
+/// Reads `gc/state`, the adopted fold seal and every source-edge run of it, once each. A run whose checksum
+/// disagrees with the seal is counted into `report.corrupted_runs`, and listed there with `detail`.
+GcSnapshotView readGcSnapshot(CasOperation & op, const Layout & layout, const std::unordered_set<BlobRef, BlobRefHash> & wanted,
+                              bool detail, const FsckProgress & on_progress, const Deadline & deadline, FsckReport & report)
+{
+    GcSnapshotView view;
+    const auto state_got = op.read(layout.gcStateKey(), Retry::standard());
+    if (!state_got)
+        return view;
+    view.have_state = true;
+    const GcState gc_state = decodeGcState(state_got->bytes);
+    /// The adopted fold seal names the snapshot runs; resolution is by ref, never by key
+    /// construction. Every row whose hash is in our candidate set marks "known to GC" —
+    /// edges still counted (drop unfolded), an explicit zero-marker mid-pipeline, or a
+    /// `RunMarker::Condemned` sentinel row that carries the condemned state (retired-in-snapshot):
+    /// the `RunMarker::Condemned` rows feed `retired_by_hash` in the same pass.
+    ///
+    /// These sets are keyed by the full `BlobRef`, not a narrowed digest. The run record's own
+    /// `BlobRef` is compared directly with the full identity parsed from the listed blob key. This is required for mixed-algorithm
+    /// pools: a 64-hex digest must not be truncated or compared as though it used the pool's
+    /// local write algorithm, or its true GC state could be hidden as `Unaccounted`.
+    if (gc_state.snap_generation == 0)
+    {
+        view.complete = true;   /// no fold has adopted a seal yet: there are no rows
+        return view;
+    }
+    const auto seal_got = op.read(layout.foldSealKey(gc_state.snap_generation, gc_state.snap_attempt), Retry::standard());
+    if (!seal_got)
+        return view;
+    bool checksums_match = true;
+    uint64_t rows = 0;
+    for (const RunRef & run : decodeFoldSeal(seal_got->bytes, gc_state.snap_generation).blob_target_runs)
+    {
+        checkDeadline(deadline, "reading gc snapshot runs");
+        /// Typed open: the source-edge run reader goes through openSourceEdgeRun (the NDJSON
+        /// header gates type == cas_run + kind == source_edge). Fsck keys off the row's hash
+        /// (the record's own algo-prefixed key, never from pool meta).
+        SourceEdgeRunView reader = openSourceEdgeRun(op, run.key);
+        SourceEdgeRecord rec;
+        while (reader.next(rec))
+        {
+            const BlobRef & ref = rec.ref;
+            const bool is_wanted = wanted.contains(ref);
+            if (is_wanted)
+            {
+                view.in_run_hashes.insert(ref);
+                if (detail && rec.source_id != UInt128{0})
+                    view.edge_sources[ref].push_back(rec.source_id);
+            }
+            if (rec.marker == RunMarker::Condemned)
+            {
+                CondemnedRow row = condemnedRowOf(rec);
+                if (row.delete_pending && !row.standing)
+                    view.pending_rows.emplace(ref, row);
+                if (is_wanted)
+                    view.retired_by_hash.emplace(ref, std::move(row));
+            }
+            if (on_progress && ++rows % 65536 == 0)
+                on_progress("reading gc snapshot runs", view.in_run_hashes.size(), rows);
+        }
+        /// Whole-file seal checksum: compare the drained run's accumulated
+        /// checksum to the seal's `RunRef::checksum`. Fsck is a read-only auditor — instead of
+        /// throwing (which would abort the whole scan on the first corrupt run), catalogue the
+        /// mismatch as a `CorruptedRun` finding (with the run key) and continue so the audit
+        /// enumerates every problem in one pass. The deletion-deriving consumers
+        /// (`fold`/`zeroInDegree`/`previewDeletes`) still fail closed on the same mismatch.
+        if (reader.accumulatedChecksum() != run.checksum)
+        {
+            checksums_match = false;
+            ++report.corrupted_runs;
+            if (detail)
+                report.objects.push_back(FsckObject{.key = run.key, .cls = FsckClass::CorruptedRun, .reachable_from = {}});
+        }
+    }
+    view.complete = checksums_match;
+    return view;
+}
+
+/// The note of a `candidate` or `standing` row over the body it names.
+String retiredNote(const CondemnedRow & row)
+{
+    if (row.standing)
+        return "standing: GC recorded this incarnation as deleted, yet it is present; the intent is present, so a writer "
+               "publishes fresh and GC deletes nothing; investigate if it persists";
+    return "candidate since round " + std::to_string(row.condemn_round)
+        + ": the deletion intent is not confirmed yet; GC creates it in a later round (expected)";
+}
+
+/// `PendingWithoutIntent` is a suspect: a finding once a second read of `gc/state` agrees.
+struct PendingVerdict
+{
+    FsckClass cls = FsckClass::PendingGc;
+    String note;
+};
+
+/// A `pending` row is the one state GC deletes a body from without re-reading the intent, so the intent is read
+/// here. A read that fails is `intent_unread`: not an absent intent, and no verdict.
+PendingVerdict checkPendingRow(CasOperation & op, const Layout & layout, const BlobRef & ref, const CondemnedRow & row, FsckReport & report)
+{
+    const std::optional<CanonicalIdentity> identity = row.token.canonical();
+    if (!identity)
+        return {FsckClass::PendingTokenRejected, "delete_pending: the row's token has no canonical identity, so no intent key exists for it"};
+    try
+    {
+        if (op.read(layout.blobIntentKey(ref, *identity), Retry::standard()))
+            return {FsckClass::PendingGc, "delete_pending: the deletion intent is present; GC deletes the body in a later round (expected)"};
+        const std::optional<Meta> body = op.head(layout.blobKey(ref), Retry::standard());
+        if (body && sameIncarnation(row.token, body->etag))
+            return {FsckClass::PendingWithoutIntent, {}};
+        return {FsckClass::PendingIntentAbsent,
+                "delete_pending: the deletion intent is absent and the body is gone or replaced; the row is about to become "
+                "`standing` or to move, nothing is at risk"};
+    }
+    catch (const Exception & e)
+    {
+        if (e.code() == ErrorCodes::TIMEOUT_EXCEEDED || e.code() == ErrorCodes::LOGICAL_ERROR)
+            throw;
+        countIntentUnread(report, e);
+        return {FsckClass::PendingGc, "delete_pending: the deletion intent could not be read: " + e.message()};
+    }
+}
+
 /// Perform the scan and accumulate into `report`. This helper owns the read-only traversal: it first
 /// recovers authoritative refs, then checks physical objects and GC labels, while preserving the
 /// distinction between a missing live object and expected in-flight cleanup. Deadline exceptions are
 /// intentionally left to `runFsck`, which decides whether partial results were requested.
 void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, const Deadline & deadline,
-                  const String & namespace_prefix, FsckReport & report)
+                  const String & namespace_prefix, bool fix_legacy_markers, bool verify_intents, FsckReport & report)
 {
+    if (fix_legacy_markers && !namespace_prefix.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "fsck: a fix needs a scan of the whole pool, not of namespaces under '{}'", namespace_prefix);
     const Layout & layout = store.layout();
     CasOperation op = store.openRequests().admit();
     /// Path-derived per-object algorithm parsing: every listed blob-tree key -- across every
@@ -889,28 +1146,23 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
     /// pool-wide LIST for what should be O(scoped refs).
     if (namespace_prefix.empty())
     {
-    /// Physical listing: blobs + manifest bodies. The per-hash `.meta` descriptor sibling
-    /// (`blobMetaKey(id) == blobKey(id) + ".meta"`) lives under the SAME
-    /// `blobsPrefix()` as the body, so partition the raw LIST into bodies vs `.meta` objects up
-    /// front — a `.meta` key must never be classified as a content body (it would otherwise be
-    /// misread as an unreferenced blob and fall into the dangling/pending/unaccounted pipeline
-    /// below), and a body must never be misread as a `.meta`.
+    /// Physical listing: blobs + manifest bodies. A legacy `.meta` marker lives under the SAME
+    /// `blobsPrefix()` as its body, so partition the raw LIST into bodies vs markers up front: a marker
+    /// must never be classified as a content body (it would be misread as an unreferenced blob), and a
+    /// `.meta` key that does not parse as a marker's is foreign and left alone.
     std::unordered_map<String, uint64_t> present_all;
     listAll(op, layout.blobsPrefix(), present_all, on_progress, deadline, "listing blobs");
     std::unordered_map<String, uint64_t> present_blobs;
-    std::unordered_set<BlobRef, BlobRefHash> present_meta_hashes;
+    std::vector<std::pair<String, uint64_t>> legacy_markers;
     present_blobs.reserve(present_all.size());
     for (const auto & [key, sz] : present_all)
     {
-        if (key.ends_with(".meta"))
-        {
-            if (const std::optional<BlobRef> ref = layout.parseBlobKey(key))
-                present_meta_hashes.insert(*ref);
-            /// else: foreign key shape under blobs/ — not ours to pair
-        }
-        else
+        if (!Layout::hasLegacyMarkerSuffix(key))
             present_blobs.emplace(key, sz);
+        else if (layout.parseLegacyMarkerKey(key))
+            legacy_markers.emplace_back(key, sz);
     }
+    std::sort(legacy_markers.begin(), legacy_markers.end());
     for (const auto & [_, sz] : present_blobs)
         report.physical_bytes += sz;
 
@@ -964,20 +1216,10 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
     });
 
     /// Present-but-unreferenced blobs: classify through the GC pipeline view instead of one
-    /// suspicious "unreachable" lump (the multi-stage graduation keeps a nonzero churning
+    /// suspicious "unreachable" lump (the deletion pipeline keeps a nonzero churning
     /// set here on ANY active pool, and beta testers read "unreachable" as a leak). The GC state is
     /// read for LABELING ONLY — reachability above never consults it.
-    std::unordered_map<BlobRef, RetiredEntry, BlobRefHash> retired_by_hash;
     std::unordered_set<BlobRef, BlobRefHash> unref_hashes;
-    std::unordered_set<BlobRef, BlobRefHash> in_run_hashes;
-    /// The NON-SENTINEL source edges the snapshot still holds on each unreferenced blob, collected in
-    /// `detail` mode only. `in_run_hashes` alone answers "does GC still see this blob at all"; the
-    /// stale-edge cross-check below needs the edge IDENTITIES so it can ask whether their source
-    /// manifests still exist. Sentinel rows (`source_id == 0` — `RunMarker::Zero`/`RunMarker::Condemned`) are not
-    /// edges and are excluded.
-    std::unordered_map<BlobRef, std::vector<UInt128>, BlobRefHash> unref_edge_sources;
-    bool have_gc_state = false;
-
     for (const auto & [bkey, sz] : present_blobs)
         if (!reachable_blobs.contains(bkey))
         {
@@ -985,78 +1227,17 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                 unref_hashes.insert(*ref);
         }
 
-    if (!unref_hashes.empty())
-    {
-        if (const auto state_got = op.read(layout.gcStateKey(), Retry::standard()))
-        {
-            have_gc_state = true;
-            const GcState gc_state = decodeGcState(state_got->bytes);
-            /// The adopted fold seal names the snapshot runs; resolution is by ref, never by key
-            /// construction. Every row whose hash is in our candidate set marks "known to GC" —
-            /// edges still counted (drop unfolded), an explicit zero-marker mid-pipeline, or a
-            /// `RunMarker::Condemned` sentinel row that carries the condemned state (retired-in-snapshot):
-            /// the `RunMarker::Condemned` rows feed `retired_by_hash` (the `PendingGc` classification) in the
-            /// SAME pass, replacing the removed `retired_refs`/`decodeRetiredSet` loop.
-            ///
-            /// These sets are keyed by the full `BlobRef`, not a narrowed digest. The run's own
-            /// algorithm-prefixed key is parsed by `SourceEdgeKeyCodec` and compared directly with
-            /// the full identity parsed from the listed blob key. This is required for mixed-algorithm
-            /// pools: a 64-hex digest must not be truncated or compared as though it used the pool's
-            /// local write algorithm, or its true GC state could be hidden as `Unaccounted`.
-            if (const auto seal_got = op.read(layout.foldSealKey(gc_state.snap_generation, gc_state.snap_attempt), Retry::standard()))
-            {
-                uint64_t rows = 0;
-                for (const RunRef & run : decodeFoldSeal(seal_got->bytes, gc_state.snap_generation).blob_target_runs)
-                {
-                    checkDeadline(deadline, "reading gc snapshot runs");
-                    /// Typed open: the source-edge run reader goes through openSourceEdgeRun (the NDJSON
-                    /// header gates type == cas_run + kind == source_edge). Fsck keys off the row's hash
-                    /// (the record's own algo-prefixed key, never from pool meta).
-                    SourceEdgeRunView reader = openSourceEdgeRun(op, run.key);
-                    String key;
-                    String payload;
-                    while (reader.next(key, payload))
-                    {
-                        BlobRef ref;
-                        UInt128 source_id;
-                        SourceEdgeKeyCodec::parse(key, ref, source_id);   // throws CORRUPTED_DATA on malformed (fail-closed)
-                        if (unref_hashes.contains(ref))
-                        {
-                            in_run_hashes.insert(ref);
-                            if (detail && source_id != UInt128{0})
-                                unref_edge_sources[ref].push_back(source_id);
-                            if (!payload.empty() && runMarkerFromByte(payload[0], "CAS source-edge run") == RunMarker::Condemned)
-                            {
-                                const CondemnedRow row = decodeCondemnedRow(payload);
-                                RetiredEntry e;
-                                e.kind = ObjectKind::Blob;
-                                e.ref = ref;
-                                e.token = row.token;
-                                e.size = row.size;
-                                e.condemn_round = row.condemn_round;
-                                e.delete_pending = row.delete_pending;
-                                retired_by_hash.emplace(ref, std::move(e));
-                            }
-                        }
-                        if (on_progress && ++rows % 65536 == 0)
-                            on_progress("reading gc snapshot runs", in_run_hashes.size(), rows);
-                    }
-                    /// Whole-file seal checksum: compare the drained run's accumulated
-                    /// checksum to the seal's `RunRef::checksum`. Fsck is a read-only auditor — instead of
-                    /// throwing (which would abort the whole scan on the first corrupt run), catalogue the
-                    /// mismatch as a `CorruptedRun` finding (with the run key) and continue so the audit
-                    /// enumerates every problem in one pass. The deletion-deriving consumers
-                    /// (`fold`/`zeroInDegree`/`previewDeletes`) still fail closed on the same mismatch.
-                    if (reader.accumulatedChecksum() != run.checksum)
-                    {
-                        ++report.corrupted_runs;
-                        if (detail)
-                            report.objects.push_back(FsckObject{.key = run.key, .cls = FsckClass::CorruptedRun, .reachable_from = {}});
-                    }
-                }
-            }
-        }
-    }
+    /// The NON-SENTINEL source edges the snapshot still holds on each unreferenced blob are collected in
+    /// `detail` mode only: the stale-edge cross-check below needs the edge IDENTITIES so it can ask
+    /// whether their source manifests still exist.
+    /// Read whenever a body is present: the `pending` rows over referenced bodies are checked too.
+    GcSnapshotView snapshot;
+    if (!present_blobs.empty())
+        snapshot = readGcSnapshot(op, layout, unref_hashes, detail, on_progress, deadline, report);
+    const bool have_gc_state = snapshot.have_state;
+    const auto & retired_by_hash = snapshot.retired_by_hash;
+    const auto & in_run_hashes = snapshot.in_run_hashes;
+    const auto & unref_edge_sources = snapshot.edge_sources;
 
     /// STALE-EDGE cross-check. A residual `+1` whose matching `-1` never folded pins its blob at
     /// in-degree 1 forever: every GC round recomputes the same nonzero in-degree and never nominates
@@ -1065,10 +1246,9 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
     /// build the set of source ids that every manifest body PRESENT in the pool would contribute, and
     /// treat an edge outside that set as one whose source manifest is gone.
     ///
-    /// COST: one LIST per namespace plus one GET per manifest body. It is therefore gated on `detail`
-    /// — the cheap summary path (the ca-soak fixpoint poll calls it in a loop) must not gain a single
-    /// extra request — and additionally on some unreferenced blob actually carrying a real edge, so a
-    /// pool with nothing to cross-check pays nothing.
+    /// COST: one LIST per namespace plus one GET per manifest body. It is therefore gated on `detail`,
+    /// which the summary path (the soak poll calls it in a loop) never sets, and additionally on some
+    /// unreferenced blob actually carrying a real edge, so a pool with nothing to cross-check pays nothing.
     ///
     /// `stale_edge_check_available` is the fail-closed switch: a manifest body we cannot decode would
     /// silently withhold its edges from the live set and turn every blob it owns into a false hard
@@ -1113,6 +1293,18 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         }
     }
 
+    /// A `pending` row over a present body of its token whose intent is absent. Each is confirmed against a
+    /// second read of `gc/state` below: a round may have committed since the first.
+    struct PendingSuspect
+    {
+        String key;
+        uint64_t size = 0;
+        BlobRef ref;
+        PersistedEtag token;
+        bool referenced = false;   /// a ref names the body: kept out of the backlog counts
+    };
+    std::vector<PendingSuspect> suspects;
+
     for (const auto & [bkey, sz] : present_blobs)
     {
         if (reachable_blobs.contains(bkey))
@@ -1131,16 +1323,38 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         /// HEAD only for a hash the snapshot actually retired, so an unretired blob still costs no request.
         const std::optional<Meta> retired_head
             = rit != retired_by_hash.end() ? op.head(bkey, Retry::standard()) : std::nullopt;
-        if (retired_head && rit->second.token.matches(retired_head->etag))
+        /// GC's own comparison for a token that names an incarnation; the text for one that names none, so such a
+        /// row still lands in its own class.
+        const bool row_names_present = retired_head
+            && (rit->second.token.canonical() ? sameIncarnation(rit->second.token, retired_head->etag)
+                                              : rit->second.token.matches(retired_head->etag));
+        if (row_names_present)
         {
             /// The PRESENT incarnation is the condemned one — deletion is scheduled. A mismatch
             /// means the listed entry belongs to a displaced older incarnation and says
             /// nothing about this object; fall through to the snapshot check.
-            cls = FsckClass::PendingGc;
-            note = rit->second.delete_pending
-                ? "delete_pending: exact-token delete executes next GC round"
-                : "condemned at round " + std::to_string(rit->second.condemn_round)
-                    + "; graduates once every writer acks past it (expected)";
+            const CondemnedRow & row = rit->second;
+            if (row.standing)
+            {
+                cls = FsckClass::StandingPresent;
+                note = retiredNote(row);
+            }
+            else if (!row.delete_pending)
+            {
+                cls = FsckClass::PendingGc;
+                note = retiredNote(row);
+            }
+            else
+            {
+                PendingVerdict verdict = checkPendingRow(op, layout, hash, row, report);
+                if (verdict.cls == FsckClass::PendingWithoutIntent)
+                {
+                    suspects.push_back(PendingSuspect{bkey, sz, hash, row.token});
+                    continue;
+                }
+                cls = verdict.cls;
+                note = std::move(verdict.note);
+            }
         }
         else if (in_run_hashes.contains(hash))
         {
@@ -1187,6 +1401,9 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         switch (cls)
         {
             case FsckClass::PendingGc:   ++report.pending_gc;   break;
+            case FsckClass::PendingIntentAbsent:  ++report.pending_intent_absent; break;
+            case FsckClass::PendingTokenRejected: ++report.pending_token_rejected; break;
+            case FsckClass::StandingPresent:      ++report.standing_present; break;
             case FsckClass::AwaitingGc:  ++report.awaiting_gc;  break;
             case FsckClass::StaleEdge:   ++report.stale_edge;   break;
             default:                     ++report.unaccounted;  break;
@@ -1203,23 +1420,86 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         }
     }
 
-    /// Meta <-> body pairing: a `.meta` object with no
-    /// body is an INV-META-BODY violation (the fixed meta/body lifecycle never leaves a meta
-    /// orphaned of its body) — a real ERROR, distinct from `dangling` (which is reachability-driven).
-    /// A body with no `.meta` is a benign not-yet-adopted (or interrupted-birth) artifact, NOT a dangle
-    /// — it still classifies through the ordinary present-but-unreferenced pipeline above.
-    std::unordered_set<BlobRef, BlobRefHash> present_body_hashes;
-    present_body_hashes.reserve(present_blobs.size());
-    for (const auto & [bkey, _] : present_blobs)
-        if (const std::optional<BlobRef> ref = layout.parseBlobKey(bkey))
-            present_body_hashes.insert(*ref);
-        /// else: foreign key shape under blobs/ — not ours to pair
-    for (const BlobRef & hash : present_meta_hashes)
-        if (!present_body_hashes.contains(hash))
-            ++report.meta_without_body;
-    for (const BlobRef & hash : present_body_hashes)
-        if (!present_meta_hashes.contains(hash))
-            ++report.body_without_meta;
+    /// The same check for a `pending` row whose body a ref names again: a reference committed after GC's cut does not
+    /// stop the delete.
+    for (const auto & [ref, row] : snapshot.pending_rows)
+    {
+        const String bkey = layout.blobKey(ref);
+        if (!reachable_blobs.contains(bkey))
+            continue;
+        checkDeadline(deadline, "checking pending rows over referenced bodies");
+        if (checkPendingRow(op, layout, ref, row, report).cls == FsckClass::PendingWithoutIntent)
+        {
+            const auto it = present_blobs.find(bkey);
+            suspects.push_back(PendingSuspect{bkey, it != present_blobs.end() ? it->second : 0, ref, row.token, /*referenced*/ true});
+        }
+    }
+
+    if (!suspects.empty())
+    {
+        std::unordered_set<BlobRef, BlobRefHash> suspect_refs;
+        for (const PendingSuspect & suspect : suspects)
+            suspect_refs.insert(suspect.ref);
+        FsckReport reread_report;   /// the run checksums were judged by the first read
+        const GcSnapshotView reread = readGcSnapshot(op, layout, suspect_refs, false, on_progress, deadline, reread_report);
+        for (const PendingSuspect & suspect : suspects)
+        {
+            FsckObject o{.key = suspect.key, .kind = ObjectKind::Blob, .size = suspect.size, .cls = FsckClass::PendingWithoutIntent, .reachable_from = {}};
+            /// Only a complete snapshot can show the row moved on; anything less leaves the suspect open.
+            if (!reread.have_state || !reread.complete)
+            {
+                countIntentUnread(report, "inconclusive: the pending row of " + suspect.key + " has no deletion intent, and the second read of "
+                    "`gc/state` was not a complete snapshot, so whether the row moved on is unknown");
+                o.cls = FsckClass::IntentUnread;
+                o.reachable_from = {"delete_pending without its deletion intent; inconclusive: the second read of `gc/state` was incomplete"};
+                report.objects.push_back(std::move(o));
+                continue;
+            }
+            const auto row = reread.retired_by_hash.find(suspect.ref);
+            const bool still_pending = row != reread.retired_by_hash.end() && row->second.delete_pending
+                && !row->second.standing && row->second.token.canonical() == suspect.token.canonical();
+            if (still_pending)
+            {
+                ++report.pending_without_intent;
+                o.reachable_from = {"delete_pending: the deletion intent is absent while the body is present; GC would delete this body "
+                                    "without warning any writer: stop GC on this pool and report it"};
+                report.objects.push_back(std::move(o));
+            }
+            else if (!suspect.referenced)
+            {
+                ++report.pending_intent_absent;
+                o.cls = FsckClass::PendingIntentAbsent;
+                o.reachable_from = {"delete_pending: the row moved on between the scan and the second read of `gc/state`; nothing is at risk"};
+                if (detail)
+                    report.objects.push_back(std::move(o));
+            }
+        }
+    }
+
+    classifyIntents(op, layout, verify_intents, detail, on_progress, deadline, report);
+
+    report.legacy_marker = legacy_markers.size();
+    if (detail)
+        for (const auto & [key, sz] : legacy_markers)
+            report.objects.push_back(FsckObject{.key = key, .kind = ObjectKind::Blob, .size = sz, .cls = FsckClass::LegacyMarker,
+                .reachable_from = {"debris of the marker protocol; nothing reads it"}});
+    if (fix_legacy_markers)
+    {
+        std::vector<String> keys;
+        keys.reserve(legacy_markers.size());
+        for (const auto & [key, _] : legacy_markers)
+            keys.push_back(key);
+        /// One at a time: the fix runs beside live servers, so it adds no load burst, and it stops at the first refusal.
+        const LegacyMarkerRemoval removal = removeLegacyMarkers(store, keys, /*concurrency*/ 1, deadline,
+            [&](uint64_t deleted)
+            {
+                report.legacy_markers_deleted = deleted;
+                if (on_progress)
+                    on_progress("removing legacy markers", deleted, 0);
+            });
+        report.legacy_markers_deleted = removal.removed;
+        report.legacy_markers_changed = removal.changed;
+    }
     }
     else
     {
@@ -1303,12 +1583,12 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
 
 FsckReport runFsck(Pool & store, bool detail, FsckProgress on_progress,
                    std::optional<std::chrono::steady_clock::time_point> deadline,
-                   bool partial_on_deadline, const String & namespace_prefix)
+                   bool partial_on_deadline, const String & namespace_prefix, bool fix_legacy_markers, bool verify_intents)
 {
     FsckReport report;
     try
     {
-        runFsckImpl(store, detail, on_progress, deadline, namespace_prefix, report);
+        runFsckImpl(store, detail, on_progress, deadline, namespace_prefix, fix_legacy_markers, verify_intents, report);
     }
     catch (const Exception & e)
     {
@@ -1318,6 +1598,46 @@ FsckReport runFsck(Pool & store, bool detail, FsckProgress on_progress,
         report.partial_reason = e.message();
     }
     return report;
+}
+
+LegacyMarkerRemoval removeLegacyMarkers(Pool & pool, const std::vector<String> & keys, size_t concurrency,
+                                        const std::optional<std::chrono::steady_clock::time_point> & deadline,
+                                        const std::function<void(uint64_t)> & on_progress)
+{
+    std::vector<const String *> markers;
+    for (const String & key : keys)
+        if (pool.layout().parseLegacyMarkerKey(key))
+            markers.push_back(&key);
+
+    std::atomic<uint64_t> removed{0};
+    std::atomic<uint64_t> changed{0};
+    const uint64_t generation = pool.openRequests().admit().generation();
+    try
+    {
+        for (size_t begin = 0; begin < markers.size(); begin += kProgressKeys)
+        {
+            checkDeadline(deadline, "removing legacy markers");
+            runBounded(concurrency, std::min<size_t>(kProgressKeys, markers.size() - begin), [&](size_t i)
+            {
+                const String & key = *markers[begin + i];
+                CasOperation job = pool.openRequests().resume(generation);
+                const std::optional<Meta> seen = job.head(key, Retry::standard());
+                if (!seen)
+                    return;
+                const Removal removal = job.remove(key, seen->etag, Retry::standard());
+                removed += removal == Removal::Removed;
+                changed += removal == Removal::Mismatch;
+            });
+            if (on_progress)
+                on_progress(removed.load());
+        }
+    }
+    catch (Exception & e)
+    {
+        e.addMessage(fmt::format("{} legacy marker(s) deleted before the stop; run again to continue", removed.load()));
+        throw;
+    }
+    return {removed.load(), changed.load()};
 }
 
 String formatFsckSummary(const FsckReport & report)
@@ -1339,6 +1659,20 @@ String formatFsckSummary(const FsckReport & report)
         << " corrupted_runs=" << report.corrupted_runs
         << " chain_broken=" << report.chain_broken
         << " lifeless_keys=" << report.lifeless_keys
+        << " intent_listed=" << report.intent_listed
+        << " intent_current=" << report.intent_current
+        << " intent_replaced=" << report.intent_replaced
+        << " intent_body_gone=" << report.intent_body_gone
+        << " intent_malformed=" << report.intent_malformed
+        << " intent_unread=" << report.intent_unread
+        << " pending_without_intent=" << report.pending_without_intent
+        << " pending_intent_absent=" << report.pending_intent_absent
+        << " pending_token_rejected=" << report.pending_token_rejected
+        << " standing_present=" << report.standing_present
+        << " intents_verified=" << (report.intents_verified ? 1 : 0)
+        << " legacy_marker=" << report.legacy_marker
+        << " legacy_markers_deleted=" << report.legacy_markers_deleted
+        << " legacy_markers_changed=" << report.legacy_markers_changed
         << " janitor_pending=" << report.namespace_janitor_pending
         << " janitor_pending_bytes=" << report.namespace_janitor_pending_bytes
         << " janitor_pending_lives=" << report.namespace_janitor_pending_lives

@@ -3,6 +3,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
@@ -18,7 +20,9 @@
 #include <chrono>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <mutex>
+#include <set>
 #include <optional>
 #include <string_view>
 #include <thread>
@@ -28,6 +32,8 @@ namespace DB::ErrorCodes
 extern const int BAD_ARGUMENTS;
 extern const int INVALID_STATE;
 extern const int NETWORK_ERROR;
+extern const int NOT_IMPLEMENTED;
+extern const int TIMEOUT_EXCEEDED;
 }
 
 using namespace DB::Cas;
@@ -1309,7 +1315,7 @@ TEST(CASFsck, CondemnedBlobClassifiesPendingGc)
     gc.runRegularRound();
     const uint64_t drop_sequence = dropRefTransition(*backend, store->layout(), ns, "tbl", r);
     writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, drop_sequence});
-    gc.runRegularRound();   /// -1 folds => zero => condemned into the retired list; blob still present
+    gc.runRegularRound();   /// -1 folds => zero => condemned, its intent confirmed (pending); blob still present
 
     const FsckReport rep = runFsck(*store, /*detail*/true);
     EXPECT_TRUE(rep.clean());
@@ -1321,7 +1327,7 @@ TEST(CASFsck, CondemnedBlobClassifiesPendingGc)
         {
             saw = true;
             ASSERT_FALSE(o.reachable_from.empty());
-            EXPECT_NE(o.reachable_from[0].find("condemned at round"), String::npos);
+            EXPECT_NE(o.reachable_from[0].find("delete_pending"), String::npos);
         }
     EXPECT_TRUE(saw);
 }
@@ -1459,43 +1465,1106 @@ TEST(CASFsck, ForeignBlobClassifiesUnaccounted)
     EXPECT_EQ(rep.pending_gc, 0u);
 }
 
-/// A `.meta` descriptor whose body is missing is ADVISORY (meta_without_body), NOT a hard finding:
-/// GC deletes the body FIRST and drops the `.meta` afterwards on a bounded, error-suppressed advisory
-/// pool that may drop the op, so a single raw LIST legitimately observes a body-less `.meta` mid-
-/// graduation and no finite grace makes a persistent one hard evidence. It is still counted/reported;
-/// it must NOT be a `dangling` (nothing referenced it) and NOT one of the present-but-unreferenced blob
-/// pipeline classes (the `.meta` key is excluded from body classification entirely). `clean()` stays TRUE.
-TEST(CASFsck, MetaWithoutBodyIsAdvisoryNotHard)
+namespace
 {
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
-    const DB::UInt128 h = u128Of("meta-without-body");
-    writeMetaClean(*backend, store->layout(), h, /*size*/ 10);   /// meta only, no body written
+/// Injects the faults the intent classes distinguish: a refused read or `HEAD`, a weak token on a body
+/// `HEAD`, and a refused delete. Every other request reaches the in-memory store unchanged. A refused
+/// request is still journalled, as the real request path journals it on entry.
+class FsckFaultBackend : public CountingBackend
+{
+public:
+    std::set<String> refused_reads;
+    std::set<String> refused_read_prefixes;
+    std::set<String> refused_heads;
+    std::set<String> refused_deletes;
+    std::set<String> weak_heads;
+    std::map<String, String> head_values;
 
-    const FsckReport rep = runFsck(*store, /*detail*/true);
-    EXPECT_GE(rep.meta_without_body, 1u);   // still counted and reported in the full report
-    EXPECT_EQ(rep.dangling, 0u);
-    EXPECT_EQ(rep.unreachable, 0u);
-    EXPECT_EQ(rep.pending_gc, 0u);
-    EXPECT_EQ(rep.awaiting_gc, 0u);
-    EXPECT_EQ(rep.unaccounted, 0u);
-    EXPECT_TRUE(rep.clean());   // meta_without_body is advisory — excluded from clean()
+    /// Runs `hook` once, just before the read of `key` that follows `skip` earlier reads of it.
+    void beforeRead(const String & key, size_t skip, std::function<void()> hook)
+    {
+        std::lock_guard lock(hook_mutex);
+        read_hooks[key] = {skip, std::move(hook)};
+    }
+
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        std::function<void()> hook;
+        {
+            std::lock_guard lock(hook_mutex);
+            if (const auto it = read_hooks.find(key); it != read_hooks.end())
+            {
+                if (it->second.first > 0)
+                    --it->second.first;
+                else
+                {
+                    hook = std::move(it->second.second);
+                    read_hooks.erase(it);
+                }
+            }
+        }
+        if (hook)
+            hook();
+        auto got = CountingBackend::read(key, access);
+        if (refused_reads.contains(key))
+            throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "injected refusal of the read of {}", key);
+        for (const String & prefix : refused_read_prefixes)
+            if (key.starts_with(prefix))
+                throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "injected refusal (403) of the read of {}", key);
+        return got;
+    }
+
+    std::optional<RawMeta> head(const String & key, TransportAccess & access) override
+    {
+        auto meta = CountingBackend::head(key, access);
+        if (refused_heads.contains(key))
+            throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "injected refusal of the HEAD of {}", key);
+        if (meta && weak_heads.contains(key))
+            meta->value = "W/\"weak\"";
+        if (meta && head_values.contains(key))
+            meta->value = head_values.at(key);
+        return meta;
+    }
+
+    RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override
+    {
+        if (refused_deletes.contains(key))
+        {
+            /// A value no object holds, so the journalled request deletes nothing before it is refused.
+            (void)CountingBackend::remove(key, expected_value + "#refused", access);
+            throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "injected refusal of the delete of {}", key);
+        }
+        return CountingBackend::remove(key, expected_value, access);
+    }
+
+private:
+    std::mutex hook_mutex;
+    std::map<String, std::pair<size_t, std::function<void()>>> read_hooks;
+};
+
+/// A pool whose bodies, intents and legacy markers the tests plant one by one, with no GC round.
+struct FsckIntentFixture
+{
+    std::shared_ptr<FsckFaultBackend> backend = std::make_shared<FsckFaultBackend>();
+    PoolPtr store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+
+    /// High bits set, so that blobs spread over the shards of a pool with `gc_shards` above one.
+    static CanonicalIdentity staleIdentity(uint64_t b) { return *canonicalIdentity(Dialect::Emulated, std::to_string(900000 + b)); }
+    String bodyKey(uint64_t b) const { return layout.blobKey(blobRefOf(b)); }
+    String markerKey(uint64_t b) const { return layout.blobMetaKey(blobRefOf(b)); }
+
+    void body(uint64_t b) { writeBlobBody(*backend, layout, numberedBlobHash(b)); }
+
+    /// The intent of the body now at blob `b`, as the round that condemned it would have written it.
+    String currentIntent(uint64_t b)
+    {
+        plantIntentForCurrentBody(*backend, layout, blobRefOf(b));
+        return *intentKeyOfCurrentBody(*backend, layout, blobRefOf(b));
+    }
+
+    /// An intent that names an incarnation no body here ever carries.
+    String staleIntent(uint64_t b)
+    {
+        const String key = layout.blobIntentKey(blobRefOf(b), staleIdentity(b));
+        create(key, blobIntentRecord());
+        return key;
+    }
+
+    void create(const String & key, const String & bytes)
+    {
+        OperationForTest op(*backend);
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(key, bytes, Retry::standard()))) << key;
+    }
+
+    void marker(uint64_t b) { writeMetaClean(*backend, layout, numberedBlobHash(b), 1); }
+
+    void removeKey(const String & key)
+    {
+        OperationForTest op(*backend);
+        const auto head = (*op).head(key, Retry::once());
+        ASSERT_TRUE(head.has_value()) << key;
+        ASSERT_EQ((*op).remove(key, head->etag, Retry::once()), Removal::Removed);
+    }
+
+    FsckReport fsck(bool detail = true, bool fix = false, bool verify = false)
+    {
+        return runFsck(*store, detail, {}, {}, false, {}, fix, verify);
+    }
+
+    std::vector<String> allKeys() const
+    {
+        OperationForTest op(*backend);
+        std::vector<String> keys;
+        (*op).forEachListedKey("p/", [&](const ListedKey & k) { keys.push_back(k.key); return true; },
+                               Retry::standard(), CasOperation::kCasListPageKeys);
+        std::sort(keys.begin(), keys.end());
+        return keys;
+    }
+};
+
+size_t countRows(const FsckReport & report, FsckClass cls, const String & key)
+{
+    return static_cast<size_t>(std::count_if(report.objects.begin(), report.objects.end(),
+        [&](const FsckObject & o) { return o.cls == cls && o.key == key; }));
 }
 
-/// A body with no `.meta` sibling is a BENIGN not-yet-adopted (or crashed-birth) artifact — NOT a
-/// dangle, and it must still classify through the ordinary present-but-unreferenced pipeline.
-TEST(CASFsck, BodyWithoutMetaIsBenign)
+bool isMutation(JournalVerb verb)
 {
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
-    const DB::UInt128 h = u128Of("body-without-meta");
-    writeBlobBody(*backend, store->layout(), h);   /// body only, no meta written
+    return verb == JournalVerb::Write || verb == JournalVerb::Remove || verb == JournalVerb::RemoveMany || verb == JournalVerb::Publish;
+}
 
-    const FsckReport rep = runFsck(*store, /*detail*/true);
-    EXPECT_GE(rep.body_without_meta, 1u);
+/// Every key a mutating request of the journal named, with its verb, in order.
+std::vector<std::pair<JournalVerb, String>> mutatedKeys(const std::vector<JournalEntry> & journal)
+{
+    std::vector<std::pair<JournalVerb, String>> out;
+    for (const JournalEntry & entry : journal)
+        if (isMutation(entry.verb))
+            for (const String & key : entry.keys)
+                out.emplace_back(entry.verb, key);
+    return out;
+}
+
+size_t countKeyRequests(const std::vector<JournalEntry> & journal, JournalVerb verb, const String & key)
+{
+    size_t n = 0;
+    for (const JournalEntry & entry : journal)
+        if (entry.verb == verb)
+            n += static_cast<size_t>(std::count(entry.keys.begin(), entry.keys.end(), key));
+    return n;
+}
+}
+
+/// The verdicts that are not a finding and the one that is, each from a fixture that produces exactly that
+/// state: the counter, the detail row, and the clean verdict.
+TEST(CASFsck, IntentClassesCurrentReplacedBodyGoneMalformed)
+{
+    FsckIntentFixture f;
+    f.body(1);
+    f.body(2);
+    f.body(3);
+    f.body(4);
+    const String current = f.currentIntent(1);
+    const String replaced = f.staleIntent(2);
+    const String gone = f.currentIntent(3);
+    f.removeKey(f.bodyKey(3));
+    const String malformed = f.layout.blobIntentKey(blobRefOf(4), FsckIntentFixture::staleIdentity(4));
+    f.create(malformed, "not an intent\n");
+
+    const FsckReport rep = f.fsck(/*detail=*/true, /*fix_legacy_markers=*/ false, /*verify=*/true);
+
+    EXPECT_TRUE(rep.intents_verified);
+    EXPECT_EQ(rep.intent_listed, 4u) << "the key whose bytes are junk parses, so it is listed as well";
+    EXPECT_EQ(rep.intent_current, 1u);
+    EXPECT_EQ(rep.intent_replaced, 1u);
+    EXPECT_EQ(rep.intent_body_gone, 1u);
+    EXPECT_EQ(rep.intent_malformed, 1u);
+    EXPECT_EQ(rep.intent_unread, 0u);
+    EXPECT_EQ(countRows(rep, FsckClass::IntentCurrent, current), 1u);
+    EXPECT_EQ(countRows(rep, FsckClass::IntentReplaced, replaced), 1u);
+    EXPECT_EQ(countRows(rep, FsckClass::IntentBodyGone, gone), 1u);
+    EXPECT_EQ(countRows(rep, FsckClass::IntentMalformed, malformed), 1u);
     EXPECT_EQ(rep.dangling, 0u);
-    EXPECT_EQ(rep.meta_without_body, 0u);
+}
+
+/// A plain scan classifies an intent from its key alone: it counts it and sends no `GET` or `HEAD` for it.
+/// The bytes and the body behind a listed key are looked at only by a verifying scan.
+TEST(CASFsck, PlainScanCountsIntentsFromTheListingAndReadsNone)
+{
+    FsckIntentFixture f;
+    f.body(1);
+    f.body(2);
+    f.body(3);
+    const String current = f.currentIntent(1);
+    const String replaced = f.staleIntent(2);
+    const String junk = f.layout.blobIntentKey(blobRefOf(3), FsckIntentFixture::staleIdentity(3));
+    f.create(junk, "not an intent\n");
+    const String malformed = f.layout.blobIntentsPrefix() + "zz/not-a-blob/etag/00";
+    f.create(malformed, blobIntentRecord());
+    f.backend->clearJournal();
+
+    const FsckReport rep = f.fsck(/*detail=*/true);
+
+    EXPECT_FALSE(rep.intents_verified);
+    EXPECT_EQ(rep.intent_listed, 3u) << "positive control: the well-formed keys were counted";
+    EXPECT_EQ(rep.intent_malformed, 1u) << "only the key the parser refuses; the junk bytes need `verify`";
+    EXPECT_EQ(rep.intent_current + rep.intent_replaced + rep.intent_body_gone + rep.intent_unread, 0u);
+    EXPECT_GE(countKeyRequests(f.backend->journal(), JournalVerb::List, f.layout.blobIntentsPrefix()), 1u)
+        << "positive control: the intent prefix was listed";
+    for (const String & key : {current, replaced, junk, malformed})
+        EXPECT_EQ(countKeyRequests(f.backend->journal(), JournalVerb::Read, key), 0u) << key;
+    for (const uint64_t b : {1, 2, 3})
+        EXPECT_EQ(countKeyRequests(f.backend->journal(), JournalVerb::Head, f.bodyKey(b)), 0u) << b << ": the body is not looked at";
+    EXPECT_FALSE(rep.clean()) << "the key the parser refuses is a hard finding in every scan";
+}
+
+/// What a plain scan does not see, stated by the test: junk bytes under a well-formed key are found only when
+/// verifying, and then the report is unclean.
+TEST(CASFsck, MalformedBytesNeedTheVerifyingScan)
+{
+    FsckIntentFixture f;
+    f.body(1);
+    f.create(f.layout.blobIntentKey(blobRefOf(1), FsckIntentFixture::staleIdentity(1)), "junk");
+
+    const FsckReport plain = f.fsck(/*detail=*/false);
+    EXPECT_EQ(plain.intent_malformed, 0u);
+    EXPECT_TRUE(plain.clean());
+
+    const FsckReport verified = f.fsck(/*detail=*/false, /*fix_legacy_markers=*/ false, /*verify=*/true);
+    EXPECT_EQ(verified.intent_malformed, 1u);
+    EXPECT_FALSE(verified.clean());
+    EXPECT_NE(formatFsckSummary(verified).find("intent_malformed=1"), String::npos) << formatFsckSummary(verified);
+}
+
+/// A key under `blob-intents/` that `parseBlobIntentKey` refuses is malformed, and is not read.
+TEST(CASFsck, MalformedKeyIsIntentMalformed)
+{
+    FsckIntentFixture f;
+    const String key = f.layout.blobIntentsPrefix() + "zz/not-a-blob/etag/00";
+    f.create(key, blobIntentRecord());
+    ASSERT_FALSE(f.layout.parseBlobIntentKey(key).has_value()) << "fixture: the key must be one the parser refuses";
+    f.backend->clearJournal();
+
+    const FsckReport rep = f.fsck();
+
+    EXPECT_EQ(rep.intent_malformed, 1u);
+    EXPECT_EQ(countRows(rep, FsckClass::IntentMalformed, key), 1u);
+    EXPECT_GE(countKeyRequests(f.backend->journal(), JournalVerb::List, f.layout.blobIntentsPrefix()), 1u)
+        << "positive control: the intent prefix was listed";
+    EXPECT_EQ(countKeyRequests(f.backend->journal(), JournalVerb::Read, key), 0u) << "a key that is no intent key is not read";
+}
+
+/// `intent_malformed` is a hard finding: the report is unclean and the summary line carries the count.
+TEST(CASFsck, MalformedIntentMakesTheReportUnclean)
+{
+    FsckIntentFixture f;
+    f.body(1);
+    f.create(f.layout.blobIntentsPrefix() + "zz/not-a-blob/etag/00", blobIntentRecord());
+
+    const FsckReport rep = f.fsck(/*detail=*/false);
+
+    EXPECT_EQ(rep.intent_malformed, 1u);
+    EXPECT_FALSE(rep.clean());
+    EXPECT_NE(formatFsckSummary(rep).find("intent_malformed=1"), String::npos) << formatFsckSummary(rep);
+}
+
+/// An intent over an absent body is the normal state of a deleted blob until GC's later round.
+TEST(CASFsck, BodyGoneIntentKeepsTheReportClean)
+{
+    FsckIntentFixture f;
+    f.body(1);
+    f.currentIntent(1);
+    f.removeKey(f.bodyKey(1));
+
+    const FsckReport rep = f.fsck(/*detail=*/false, /*fix_legacy_markers=*/ false, /*verify=*/true);
+
+    EXPECT_EQ(rep.intent_body_gone, 1u) << "positive control: the intent was classified";
     EXPECT_TRUE(rep.clean());
+    EXPECT_EQ(rep.dangling, 0u);
+}
+
+/// A read of the intent or a `HEAD` of its body that fails is `intent_unread`: a hard finding that carries the
+/// first reason, and nothing is deleted.
+TEST(CASFsck, FailedReadIsUnread)
+{
+    FsckIntentFixture f;
+    f.body(1);
+    f.body(2);
+    const String read_refused = f.currentIntent(1);
+    const String head_refused = f.currentIntent(2);
+    f.backend->refused_reads.insert(read_refused);
+    f.backend->refused_heads.insert(f.bodyKey(2));
+    f.backend->clearJournal();
+
+    const FsckReport rep = f.fsck(/*detail=*/true, /*fix_legacy_markers=*/ false, /*verify=*/true);
+
+    EXPECT_EQ(rep.intent_unread, 2u);
+    EXPECT_EQ(rep.intent_current + rep.intent_replaced + rep.intent_body_gone + rep.intent_malformed, 0u);
+    EXPECT_EQ(countRows(rep, FsckClass::IntentUnread, read_refused), 1u);
+    EXPECT_EQ(countRows(rep, FsckClass::IntentUnread, head_refused), 1u);
+    EXPECT_FALSE(rep.clean());
+    EXPECT_NE(rep.intent_unread_reason.find("NOT_IMPLEMENTED"), String::npos) << rep.intent_unread_reason;
+    EXPECT_NE(rep.intent_unread_reason.find("injected refusal"), String::npos) << rep.intent_unread_reason;
+    EXPECT_TRUE(mutatedKeys(f.backend->journal()).empty());
+}
+
+/// A refusal of everything under `blob-intents/` (a bucket policy without the read grant) must not read as a
+/// clean pool: every intent is unread, the report is unclean and the summary names the count.
+TEST(CASFsck, RefusedIntentPrefixIsAHardFinding)
+{
+    FsckIntentFixture f;
+    f.body(1);
+    f.body(2);
+    f.currentIntent(1);
+    f.currentIntent(2);
+    f.backend->refused_read_prefixes.insert(f.layout.blobIntentsPrefix());
+
+    const FsckReport rep = f.fsck(/*detail=*/false, /*fix_legacy_markers=*/ false, /*verify=*/true);
+
+    EXPECT_EQ(rep.intent_unread, 2u);
+    EXPECT_FALSE(rep.clean());
+    EXPECT_NE(formatFsckSummary(rep).find("intent_unread=2"), String::npos) << formatFsckSummary(rep);
+    EXPECT_FALSE(rep.intent_unread_reason.empty());
+    EXPECT_LE(rep.intent_unread_reason.size(), 300u) << "the reason is shortened";
+
+    const FsckReport plain = f.fsck(/*detail=*/false);
+    EXPECT_EQ(plain.intent_unread, 0u) << "a plain scan reads no intent of its own: nothing to refuse";
+}
+
+/// A body token with no canonical identity cannot be compared with the intent's key.
+TEST(CASFsck, UncanonicalHeadTokenIsUnread)
+{
+    FsckIntentFixture f;
+    f.body(1);
+    const String intent = f.currentIntent(1);
+    f.backend->weak_heads.insert(f.bodyKey(1));
+
+    const FsckReport rep = f.fsck(/*detail=*/true, /*fix_legacy_markers=*/ false, /*verify=*/true);
+
+    EXPECT_EQ(rep.intent_unread, 1u);
+    EXPECT_EQ(countRows(rep, FsckClass::IntentUnread, intent), 1u);
+    EXPECT_EQ(rep.intent_current + rep.intent_replaced + rep.intent_body_gone, 0u) << "no verdict from a token that cannot be compared";
+    EXPECT_FALSE(rep.clean());
+    EXPECT_FALSE(rep.intent_unread_reason.empty());
+}
+
+/// In no mode does a scan write, publish, or delete a body or an intent. The fix run deletes `.meta` keys only.
+TEST(CASFsck, NoIntentIsEverDeleted)
+{
+    FsckIntentFixture f;
+    f.body(1);
+    f.body(2);
+    f.body(3);
+    const String intent_one = f.currentIntent(1);
+    f.staleIntent(2);
+    f.currentIntent(3);
+    f.removeKey(f.bodyKey(3));
+    f.marker(1);
+    f.marker(5);
+    const std::vector<String> before = f.allKeys();
+
+    for (const auto & [fix, verify] : std::vector<std::pair<bool, bool>>{
+             {/*fix_legacy_markers=*/ false, false}, {/*fix_legacy_markers=*/ false, true}, {/*fix_legacy_markers=*/ true, false}, {/*fix_legacy_markers=*/ true, true}})
+    {
+        f.backend->clearJournal();
+        const FsckReport rep = f.fsck(/*detail=*/true, fix, verify);
+
+        EXPECT_EQ(rep.intent_listed, 3u) << "positive control: intents were listed";
+        if (verify)
+        {
+            EXPECT_EQ(rep.intent_current, 1u) << "positive control: intents were classified";
+            EXPECT_EQ(rep.intent_replaced, 1u);
+            EXPECT_EQ(rep.intent_body_gone, 1u);
+        }
+        const auto journal = f.backend->journal();
+        EXPECT_EQ(countKeyRequests(journal, JournalVerb::Read, intent_one) >= 1u, verify) << "positive control: an intent was read only when verifying";
+        for (const auto & [verb, key] : mutatedKeys(journal))
+        {
+            EXPECT_EQ(verb, JournalVerb::Remove) << "the only mutation a scan may send is a single delete: " << key;
+            EXPECT_TRUE(fix == /*fix_legacy_markers=*/ true && key.ends_with(".meta")) << "unexpected mutation of " << key;
+        }
+    }
+
+    const std::vector<String> after = f.allKeys();
+    for (const String & key : before)
+        if (!key.ends_with(".meta"))
+            EXPECT_TRUE(std::binary_search(after.begin(), after.end(), key)) << "deleted " << key;
+}
+
+/// A refused delete stops the run: markers before it are gone, the refused one and those after it stay, and no
+/// key outside `.meta` was deleted.
+TEST(CASFsck, RefusedDeleteStopsTheRun)
+{
+    FsckIntentFixture f;
+    f.body(1);
+    const String intent = f.currentIntent(1);
+    for (const uint64_t b : {11, 12, 13})
+        f.marker(b);
+    std::vector<String> markers{f.markerKey(11), f.markerKey(12), f.markerKey(13)};
+    std::sort(markers.begin(), markers.end());
+    f.backend->refused_deletes.insert(markers[1]);
+    f.backend->clearJournal();
+
+    String message;
+    try
+    {
+        (void)f.fsck(/*detail=*/false, /*fix_legacy_markers=*/ true);
+        FAIL() << "a refused delete must stop the run";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::NOT_IMPLEMENTED);
+        message = e.message();
+    }
+
+    EXPECT_NE(message.find("1 legacy marker(s) deleted before"), String::npos) << message;
+    EXPECT_FALSE(objectPresent(*f.backend, markers[0]));
+    EXPECT_TRUE(objectPresent(*f.backend, markers[1]));
+    EXPECT_TRUE(objectPresent(*f.backend, markers[2])) << "the run stops at the refusal";
+    EXPECT_TRUE(objectPresent(*f.backend, f.bodyKey(1)));
+    EXPECT_TRUE(objectPresent(*f.backend, intent));
+    const auto mutations = mutatedKeys(f.backend->journal());
+    EXPECT_FALSE(mutations.empty()) << "positive control: the fix sent deletes";
+    for (const auto & [verb, key] : mutations)
+        EXPECT_TRUE(key.ends_with(".meta")) << "a failed fix run deleted " << key;
+}
+
+/// A marker on a generation 4 pool is debris: reported, never an error; only the fix removes it, and only keys
+/// that parse as a marker's.
+TEST(CASFsck, LegacyMarkersAreDebrisAndTheFixDeletesThem)
+{
+    FsckIntentFixture f;
+    f.body(1);
+    f.marker(1);
+    f.marker(2);
+    f.marker(3);
+    const String foreign = f.layout.blobsPrefix() + "not-a-blob.meta";
+    f.create(foreign, "x");
+
+    const FsckReport plain = f.fsck();
+    EXPECT_EQ(plain.legacy_marker, 3u);
+    EXPECT_EQ(plain.legacy_markers_deleted, 0u);
+    EXPECT_TRUE(plain.clean());
+    EXPECT_EQ(countRows(plain, FsckClass::LegacyMarker, f.markerKey(1)), 1u);
+    for (const uint64_t b : {1, 2, 3})
+        EXPECT_TRUE(objectPresent(*f.backend, f.markerKey(b))) << "a scan without the fix deletes nothing";
+
+    const FsckReport fixed = f.fsck(/*detail=*/false, /*fix_legacy_markers=*/ true);
+    EXPECT_EQ(fixed.legacy_marker, 3u);
+    EXPECT_EQ(fixed.legacy_markers_deleted, 3u);
+    for (const uint64_t b : {1, 2, 3})
+        EXPECT_FALSE(objectPresent(*f.backend, f.markerKey(b))) << b;
+    EXPECT_TRUE(objectPresent(*f.backend, f.bodyKey(1)));
+    EXPECT_TRUE(objectPresent(*f.backend, foreign)) << "a key that is not a marker's is left alone";
+    EXPECT_NE(formatFsckSummary(fixed).find("legacy_markers_deleted=3"), String::npos) << formatFsckSummary(fixed);
+
+    const FsckReport again = f.fsck(/*detail=*/false, /*fix_legacy_markers=*/ true);
+    EXPECT_EQ(again.legacy_marker, 0u);
+    EXPECT_EQ(again.legacy_markers_deleted, 0u);
+}
+
+/// A fix run has no mount, no lease and no probe: on the read-only open, as `cas-fsck` opens the pool, it
+/// writes nothing, and the store differs afterwards only by the markers it removed.
+TEST(CASFsck, FixRunWritesNothingAndMountsNothing)
+{
+    FsckIntentFixture f;
+    f.body(1);
+    f.currentIntent(1);
+    f.marker(1);
+    f.marker(2);
+    const std::vector<String> before = f.allKeys();
+    f.backend->clearJournal();
+
+    PoolConfig config{.pool_prefix = "p", .server_root_id = "test"};
+    config.read_only = true;
+    const PoolPtr read_only_store = Pool::open(f.backend, config);
+    ASSERT_TRUE(read_only_store->poolConfig().read_only) << "fixture: the pool is open read-only";
+    const FsckReport rep = runFsck(*read_only_store, false, {}, {}, false, {}, /*fix_legacy_markers=*/ true);
+
+    EXPECT_EQ(rep.legacy_markers_deleted, 2u) << "positive control: the fix ran";
+    EXPECT_FALSE(f.backend->journal().empty());
+    for (const JournalEntry & entry : f.backend->journal())
+    {
+        EXPECT_NE(entry.verb, JournalVerb::Write) << "a fix run wrote " << (entry.keys.empty() ? String{} : entry.keys.front());
+        EXPECT_NE(entry.verb, JournalVerb::Publish);
+        EXPECT_NE(entry.verb, JournalVerb::RemoveMany);
+    }
+    std::vector<String> expected;
+    for (const String & key : before)
+        if (!key.ends_with(".meta"))
+            expected.push_back(key);
+    EXPECT_EQ(f.allKeys(), expected);
+}
+
+/// The fix loop honours the scan deadline: an expired deadline stops it before the first delete, and the
+/// markers are untouched.
+TEST(CASFsck, FixLoopHonoursTheDeadline)
+{
+    FsckIntentFixture f;
+    f.marker(1);
+    f.marker(2);
+    const std::vector<String> keys{f.markerKey(1), f.markerKey(2)};
+    uint64_t deleted = 0;
+
+    try
+    {
+        (void)removeLegacyMarkers(*f.store, keys, 1, std::chrono::steady_clock::now() - std::chrono::seconds(1),
+                                  [&](uint64_t n) { deleted = n; });
+        FAIL() << "an expired deadline must stop the fix";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::TIMEOUT_EXCEEDED) << e.message();
+        EXPECT_NE(e.message().find("0 legacy marker(s) deleted before"), String::npos) << e.message();
+    }
+    EXPECT_EQ(deleted, 0u);
+    EXPECT_TRUE(objectPresent(*f.backend, f.markerKey(1)));
+    EXPECT_TRUE(objectPresent(*f.backend, f.markerKey(2)));
+
+    EXPECT_EQ(removeLegacyMarkers(*f.store, keys, 1, std::chrono::steady_clock::now() + std::chrono::hours(1),
+                                  [&](uint64_t n) { deleted = n; }).removed, 2u) << "positive control: with time left the fix deletes";
+    EXPECT_EQ(deleted, 2u) << "the callback reports the running count";
+}
+
+/// Both long loops report progress every thousand keys, so a slow scan is visibly working.
+TEST(CASFsck, IntentAndMarkerLoopsReportProgress)
+{
+    FsckIntentFixture f;
+    for (uint64_t b = 1; b <= 1000; ++b)
+    {
+        f.staleIntent(b);
+        f.marker(b);
+    }
+    std::map<String, std::vector<uint64_t>> seen;
+    const FsckProgress on_progress = [&](std::string_view phase, uint64_t objects, uint64_t)
+    {
+        seen[String(phase)].push_back(objects);
+    };
+
+    const FsckReport rep = runFsck(*f.store, false, on_progress, {}, false, {}, /*fix_legacy_markers=*/ true);
+
+    ASSERT_EQ(rep.intent_listed, 1000u) << "positive control: the loops had keys to walk";
+    ASSERT_EQ(rep.legacy_markers_deleted, 1000u);
+    EXPECT_EQ(seen["counting blob intents"], std::vector<uint64_t>{1000});
+    EXPECT_EQ(seen["removing legacy markers"], std::vector<uint64_t>{1000});
+}
+
+/// A scoped scan lists no markers, so a fix over it would silently do nothing: it is refused.
+TEST(CASFsck, FixNeedsAWholePoolScan)
+{
+    FsckIntentFixture f;
+    f.marker(1);
+    try
+    {
+        (void)runFsck(*f.store, false, {}, {}, false, "00", /*fix_legacy_markers=*/ true);
+        FAIL() << "a fix over a scoped scan must be refused";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::BAD_ARGUMENTS) << e.message();
+    }
+    EXPECT_TRUE(objectPresent(*f.backend, f.markerKey(1)));
+}
+
+/// Intents are objects of the pool: each listed key lands in exactly one intent class, and its bytes are in
+/// `physical_bytes`. They are not blobs, so `unreachable` does not count them.
+TEST(CASFsck, IntentsAreAccountedInTheTotals)
+{
+    FsckIntentFixture f;
+    f.body(1);
+    f.body(2);
+    f.currentIntent(1);
+    f.staleIntent(2);
+    f.staleIntent(3);
+    f.create(f.layout.blobIntentKey(blobRefOf(4), FsckIntentFixture::staleIdentity(4)), "junk");
+
+    uint64_t listed = 0;
+    uint64_t intent_bytes = 0;
+    uint64_t body_bytes = 0;
+    {
+        OperationForTest op(*f.backend);
+        (*op).forEachListedKey(f.layout.blobIntentsPrefix(), [&](const ListedKey & k) { ++listed; intent_bytes += k.size; return true; },
+                               Retry::standard(), CasOperation::kCasListPageKeys);
+        (*op).forEachListedKey(f.layout.blobsPrefix(), [&](const ListedKey & k) { body_bytes += k.size; return true; },
+                               Retry::standard(), CasOperation::kCasListPageKeys);
+    }
+    ASSERT_EQ(listed, 4u);
+
+    const FsckReport rep = f.fsck(/*detail=*/false, /*fix_legacy_markers=*/ false, /*verify=*/true);
+
+    EXPECT_EQ(rep.intent_current + rep.intent_replaced + rep.intent_body_gone + rep.intent_malformed + rep.intent_unread, listed);
+    EXPECT_EQ(rep.physical_bytes, body_bytes + intent_bytes);
+    EXPECT_EQ(rep.unreachable, 2u) << "the two bodies, not the intents";
+
+    const FsckReport plain = f.fsck(/*detail=*/false);
+    EXPECT_EQ(plain.intent_listed + plain.intent_malformed, listed) << "a plain scan accounts for every listed intent too";
+    EXPECT_EQ(plain.physical_bytes, rep.physical_bytes);
+}
+
+namespace
+{
+/// A pool whose GC rounds make the rows, so the report is read over what the protocol itself writes.
+struct FsckGcFixture
+{
+    std::shared_ptr<FsckFaultBackend> backend = std::make_shared<FsckFaultBackend>();
+    PoolPtr store;
+    std::unique_ptr<Gc> gc;
+    RootNamespace ns{"00/aa@cas@"};
+    ManifestRef manifest = ref(1, 0xA1);
+
+    explicit FsckGcFixture(uint64_t create_budget = 0, std::initializer_list<uint64_t> blobs = {1}, uint64_t gc_shards = 1)
+    {
+        PoolConfig config{.pool_prefix = "p", .server_root_id = "test"};
+        config.gc_round_intent_create_budget = create_budget;
+        config.gc_shards = gc_shards;
+        store = Pool::open(backend, config);
+        std::vector<ManifestEntry> entries;
+        for (const uint64_t b : blobs)
+        {
+            writeBlobBody(*backend, store->layout(), numberedBlobHash(b));
+            entries.push_back(blobEntryFor("f" + std::to_string(b), numberedBlobHash(b)));
+        }
+        writeManifestRaw(*backend, store->layout(), ns, manifest, entries);
+        const uint64_t publish_sequence = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, manifest);
+        writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, publish_sequence});
+        gc = std::make_unique<Gc>(store, hexToU128("00000000000000000000000000000001"));
+        gc->runRegularRound();
+    }
+
+    void drop()
+    {
+        const uint64_t drop_sequence = dropRefTransition(*backend, store->layout(), ns, "tbl", manifest);
+        writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, drop_sequence});
+    }
+
+    void round() { gc->runRegularRound(); }
+
+    String bodyKey(uint64_t b) const { return store->layout().blobKey(blobRefOf(b)); }
+
+    /// The key of the intent the round wrote for the body now at blob `b`.
+    String intentKey(uint64_t b) const
+    {
+        return *intentKeyOfCurrentBody(*backend, store->layout(), blobRefOf(b));
+    }
+
+    /// Removes the intent with the raw backend, as nothing in the protocol does while its row is `pending`.
+    void removeBody(uint64_t b)
+    {
+        const String key = bodyKey(b);
+        OperationForTest op(*backend);
+        const auto head = (*op).head(key, Retry::once());
+        ASSERT_TRUE(head.has_value()) << key;
+        ASSERT_EQ((*op).remove(key, head->etag, Retry::once()), Removal::Removed);
+    }
+
+    void removeIntent(uint64_t b)
+    {
+        const String key = intentKey(b);
+        OperationForTest op(*backend);
+        const auto head = (*op).head(key, Retry::once());
+        ASSERT_TRUE(head.has_value()) << "fixture: the round wrote the intent of " << key;
+        ASSERT_EQ((*op).remove(key, head->etag, Retry::once()), Removal::Removed);
+    }
+};
+
+bool anyNoteContains(const FsckReport & report, FsckClass cls, std::string_view text)
+{
+    for (const FsckObject & o : report.objects)
+        if (o.cls == cls)
+            for (const String & note : o.reachable_from)
+                if (note.find(text) != String::npos)
+                    return true;
+    return false;
+}
+}
+
+/// What a healthy pool holds mid-reclaim: a `pending` row with its intent over a present body, then a
+/// `standing` row with its intent over an absent body. All of it is normal: the report is clean and the counts
+/// are informational.
+TEST(CASFsck, HealthyPoolWithRowsAndIntentsOverAbsentBodiesIsClean)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();   /// zero => condemned, intent created, row pending; body present
+
+    const FsckReport pending = runFsck(*f.store, /*detail=*/true, {}, {}, false, {}, /*fix_legacy_markers=*/ false, /*verify_intents=*/true);
+    EXPECT_TRUE(pending.clean());
+    EXPECT_EQ(pending.pending_gc, 1u);
+    EXPECT_EQ(pending.pending_without_intent, 0u);
+    EXPECT_EQ(pending.intent_current, 1u);
+    EXPECT_EQ(pending.intent_body_gone, 0u);
+
+    f.round();   /// the body is deleted; the row is standing and the intent stays
+    const FsckReport standing = runFsck(*f.store, /*detail=*/true, {}, {}, false, {}, /*fix_legacy_markers=*/ false, /*verify_intents=*/true);
+    EXPECT_TRUE(standing.clean());
+    EXPECT_EQ(standing.pending_gc, 0u) << "the body is gone";
+    EXPECT_EQ(standing.intent_body_gone, 1u) << "positive control: the intent outlives its body";
+    EXPECT_EQ(standing.dangling, 0u);
+    EXPECT_EQ(standing.unaccounted, 0u);
+}
+
+/// A `candidate` row has no confirmed intent yet. Its note says so, and no note promises an acknowledgement
+/// by writers, which nothing in the intent protocol waits for.
+TEST(CASFsck, CandidateAndPendingRowsGetTheirOwnNotes)
+{
+    FsckGcFixture f(/*create_budget=*/1, {1, 2});
+    f.drop();
+    f.round();   /// two blobs reach zero, one create fits the budget
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true);
+
+    EXPECT_TRUE(rep.clean());
+    EXPECT_EQ(rep.pending_gc, 2u);
+    EXPECT_TRUE(anyNoteContains(rep, FsckClass::PendingGc, "delete_pending"));
+    EXPECT_TRUE(anyNoteContains(rep, FsckClass::PendingGc, "candidate"));
+    EXPECT_FALSE(anyNoteContains(rep, FsckClass::PendingGc, "graduates"));
+    EXPECT_FALSE(anyNoteContains(rep, FsckClass::PendingGc, "writer"));
+}
+
+/// A `standing` row says the body of this incarnation is deleted. The same token seen on a body again is
+/// reported as its own advisory class, not as a pending delete: GC records it and deletes nothing.
+TEST(CASFsck, StandingRowKeepsItsBitInTheReport)
+{
+    FsckGcFixture f;
+    const String body_key = f.store->layout().blobKey(blobRefOf(1));
+    String token;
+    {
+        OperationForTest op(*f.backend);
+        token = PersistedEtag::capture((*op).head(body_key, Retry::standard())->etag).value;
+    }
+    f.drop();
+    f.round();
+    f.round();   /// standing; the body is deleted
+    ASSERT_FALSE(objectPresent(*f.backend, body_key));
+    writeBlobBody(*f.backend, f.store->layout(), numberedBlobHash(1));
+    f.backend->head_values[body_key] = token;
+
+    f.backend->clearJournal();
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true);
+
+    EXPECT_EQ(rep.standing_present, 1u);
+    EXPECT_EQ(rep.pending_gc, 0u) << "a standing row is not a pending delete";
+    EXPECT_EQ(rep.pending_without_intent, 0u);
+    EXPECT_TRUE(anyNoteContains(rep, FsckClass::StandingPresent, "standing"));
+    EXPECT_NE(formatFsckSummary(rep).find("standing_present=1"), String::npos) << formatFsckSummary(rep);
+    EXPECT_TRUE(rep.clean()) << "advisory: the intent is present, so a writer publishes fresh";
+    EXPECT_EQ(countKeyRequests(f.backend->journal(), JournalVerb::Read, f.intentKey(1)), 0u) << "a standing row's intent is not read";
+}
+
+/// A `pending` row is the one state GC deletes from without re-reading the intent, so a plain scan reads the
+/// intent of each: one `GET` per row, and the row stays an expected backlog when the intent is there.
+TEST(CASFsck, PendingRowWithItsIntentIsExpectedAndCostsOneIntentRead)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    ASSERT_TRUE(objectPresent(*f.backend, f.intentKey(1))) << "fixture: the round wrote the intent";
+    ASSERT_TRUE(objectPresent(*f.backend, f.bodyKey(1)));
+    f.backend->clearJournal();
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true);
+
+    EXPECT_EQ(rep.pending_gc, 1u);
+    EXPECT_EQ(rep.pending_without_intent + rep.pending_intent_absent + rep.pending_token_rejected, 0u);
+    EXPECT_TRUE(rep.clean());
+    EXPECT_TRUE(anyNoteContains(rep, FsckClass::PendingGc, "intent is present"));
+    EXPECT_EQ(countKeyRequests(f.backend->journal(), JournalVerb::Read, f.intentKey(1)), 1u);
+    EXPECT_EQ(countKeyRequests(f.backend->journal(), JournalVerb::Read, f.store->layout().gcStateKey()), 1u)
+        << "no re-read of gc/state without a suspect";
+}
+
+/// The hard case: a `pending` row, its intent gone, the body present with the row's token. GC would delete
+/// this body without warning any writer.
+TEST(CASFsck, PendingRowWithoutItsIntentOverItsBodyIsHard)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    f.removeIntent(1);
+    ASSERT_TRUE(objectPresent(*f.backend, f.bodyKey(1)));
+    f.backend->clearJournal();
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/false);
+
+    EXPECT_EQ(rep.pending_without_intent, 1u);
+    EXPECT_EQ(rep.pending_gc, 0u);
+    EXPECT_FALSE(rep.clean());
+    EXPECT_NE(formatFsckSummary(rep).find("pending_without_intent=1"), String::npos) << formatFsckSummary(rep);
+    EXPECT_EQ(countRows(rep, FsckClass::PendingWithoutIntent, f.bodyKey(1)), 1u) << "the row is listed even without `detail`";
+    EXPECT_TRUE(anyNoteContains(rep, FsckClass::PendingWithoutIntent, "without warning"));
+    const auto journal = f.backend->journal();
+    EXPECT_EQ(countKeyRequests(journal, JournalVerb::Read, f.intentKey(1)), 1u);
+    EXPECT_EQ(countKeyRequests(journal, JournalVerb::Read, f.store->layout().gcStateKey()), 2u) << "the state is re-read once before the verdict";
+    EXPECT_TRUE(mutatedKeys(journal).empty()) << "fsck repairs nothing: it does not recreate the intent";
+    EXPECT_FALSE(objectPresent(*f.backend, f.intentKey(1)));
+}
+
+/// Intent absent and the body gone by the time it is looked at: the row is about to become `standing`.
+/// Nothing is at risk, so the report stays clean.
+TEST(CASFsck, PendingRowWithoutIntentOverAnAbsentBodyIsInformational)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    f.removeIntent(1);
+    const String intent = f.intentKey(1);
+    f.backend->beforeRead(intent, 0, [&] { f.removeBody(1); });
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true);
+
+    EXPECT_EQ(rep.pending_intent_absent, 1u);
+    EXPECT_EQ(rep.pending_without_intent, 0u);
+    EXPECT_TRUE(rep.clean());
+    EXPECT_EQ(countRows(rep, FsckClass::PendingIntentAbsent, f.bodyKey(1)), 1u);
+}
+
+/// Intent absent and another incarnation at the body's key: the row names a body that is gone.
+TEST(CASFsck, PendingRowWithoutIntentOverAnotherTokenIsInformational)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    f.removeIntent(1);
+    const String intent = f.intentKey(1);
+    String before;
+    {
+        OperationForTest op(*f.backend);
+        before = (*op).head(f.bodyKey(1), Retry::standard())->etag.render();
+    }
+    f.backend->beforeRead(intent, 0, [&] { f.removeBody(1); writeBlobBody(*f.backend, f.store->layout(), numberedBlobHash(1)); });
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true);
+
+    {
+        OperationForTest op(*f.backend);
+        ASSERT_NE((*op).head(f.bodyKey(1), Retry::standard())->etag.render(), before) << "fixture: another incarnation is at the key";
+    }
+    EXPECT_EQ(rep.pending_intent_absent, 1u);
+    EXPECT_EQ(rep.pending_without_intent, 0u);
+    EXPECT_TRUE(rep.clean());
+}
+
+/// A round may commit between the scan's read of `gc/state` and the verdict. The verdict is taken after one
+/// more read: a row that moved on is no finding.
+TEST(CASFsck, PendingRowThatMovesBeforeTheRereadIsNoFinding)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    f.removeIntent(1);
+    f.backend->beforeRead(f.store->layout().gcStateKey(), 1, [&]
+    {
+        f.round();   /// the body is deleted and the row becomes `standing`
+    });
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true);
+
+    ASSERT_FALSE(objectPresent(*f.backend, f.bodyKey(1))) << "positive control: the round ran between the scan and the re-read";
+    EXPECT_EQ(rep.pending_without_intent, 0u);
+    EXPECT_EQ(rep.pending_intent_absent, 1u);
+    EXPECT_TRUE(rep.clean());
+}
+
+/// The re-read is not a way out: when the row is still `pending` for the same token, the finding stands.
+TEST(CASFsck, PendingRowStillPendingAtTheRereadStaysHard)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    f.removeIntent(1);
+    bool reread_seen = false;
+    f.backend->beforeRead(f.store->layout().gcStateKey(), 1, [&] { reread_seen = true; });
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/false);
+
+    EXPECT_TRUE(reread_seen) << "positive control: the state was read a second time";
+    EXPECT_EQ(rep.pending_without_intent, 1u);
+    EXPECT_FALSE(rep.clean());
+}
+
+/// Rows live in every shard of the snapshot: the check reads them all.
+TEST(CASFsck, PendingRowsWithoutIntentsAreFoundInEveryGcShard)
+{
+    FsckGcFixture f(/*create_budget=*/0, {1, 2, 3, 4, 5, 6, 7, 8}, /*gc_shards=*/4);
+    f.drop();
+    f.round();
+    uint64_t rows_outside_shard_zero = 0;
+    uint64_t rows = 0;
+    for (uint64_t shard = 0; shard < 4; ++shard)
+        for (const RetiredEntry & row : currentRetiredSet(*f.backend, f.store->layout(), shard))
+        {
+            ASSERT_TRUE(row.delete_pending && !row.standing) << "fixture: every row is pending";
+            ++rows;
+            rows_outside_shard_zero += shard != 0;
+        }
+    ASSERT_EQ(rows, 8u);
+    ASSERT_GT(rows_outside_shard_zero, 0u) << "fixture: some row sits in a shard other than zero";
+    for (const uint64_t b : {1, 2, 3, 4, 5, 6, 7, 8})
+        f.removeIntent(b);
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/false);
+
+    EXPECT_EQ(rep.pending_without_intent, 8u);
+    EXPECT_FALSE(rep.clean());
+}
+
+/// The capability probe's scratch object under `blob-intents/_probe/` is not an intent and no finding.
+TEST(CASFsck, ProbeScratchObjectIsNoIntent)
+{
+    FsckIntentFixture f;
+    f.body(1);
+    f.currentIntent(1);
+    f.create(f.layout.blobIntentsProbePrefix() + "0123456789abcdef0123456789abcdef/intent", blobIntentRecord());
+
+    for (const bool verify : {false, true})
+    {
+        const FsckReport rep = f.fsck(/*detail=*/true, /*fix_legacy_markers=*/ false, verify);
+        EXPECT_EQ(rep.intent_malformed, 0u) << formatFsckSummary(rep);
+        EXPECT_EQ(rep.intent_listed, 1u) << "positive control: the real intent was listed";
+        EXPECT_TRUE(rep.clean()) << formatFsckSummary(rep);
+    }
+}
+
+/// A verifying scan counts an intent as listed only once its read found it: a key that vanished between the
+/// listing and the read is not an object any more.
+TEST(CASFsck, VerifiedIntentIsListedOnlyAfterItsRead)
+{
+    FsckIntentFixture f;
+    f.body(1);
+    f.body(2);
+    const String vanishing = f.currentIntent(1);
+    f.currentIntent(2);
+    f.backend->beforeRead(vanishing, 0, [&] { f.removeKey(vanishing); });
+
+    const FsckReport rep = f.fsck(/*detail=*/true, /*fix_legacy_markers=*/ false, /*verify=*/true);
+
+    EXPECT_EQ(rep.intent_listed, 1u) << "only the intent that was read is counted";
+    EXPECT_EQ(rep.intent_current, 1u) << "positive control: the other intent was read and classified";
+}
+
+/// A writer adopts the body of a `pending` row whose intent is gone: the body is referenced again, and GC would
+/// still delete it. The row is checked whether or not its body is referenced; a referenced body stays out of the
+/// backlog counts.
+TEST(CASFsck, PendingRowOverAReferencedBodyIsCheckedToo)
+{
+    for (const bool remove_intent : {false, true})
+    {
+        SCOPED_TRACE(remove_intent);
+        FsckGcFixture f;
+        f.drop();
+        f.round();
+        const String intent = f.intentKey(1);
+        if (remove_intent)
+            f.removeIntent(1);
+        const ManifestRef adopter = ref(2, 0xA2);
+        writeManifestRaw(*f.backend, f.store->layout(), f.ns, adopter, {blobEntryFor("f1", numberedBlobHash(1))});
+        const uint64_t sequence = publishCommittedTransition(*f.backend, f.store->layout(), f.ns, "adopter", std::nullopt, adopter);
+        writeFsckCheckpoint(*f.backend, f.store->layout(), f.ns, RefTxnId{1, sequence});
+        f.backend->clearJournal();
+
+        const FsckReport rep = runFsck(*f.store, /*detail=*/false);
+
+        EXPECT_EQ(rep.reachable, 1u) << "positive control: the body is referenced again";
+        EXPECT_EQ(countKeyRequests(f.backend->journal(), JournalVerb::Read, intent), 1u) << "the row's intent was read";
+        EXPECT_EQ(rep.pending_gc + rep.pending_intent_absent + rep.unreachable, 0u) << "a referenced body is not backlog";
+        EXPECT_EQ(rep.pending_without_intent, remove_intent ? 1u : 0u);
+        EXPECT_EQ(rep.clean(), !remove_intent);
+    }
+}
+
+/// The row keeps the token as captured, quoted; the store answers the same tag bare. GC compares canonically and
+/// would delete that body, so fsck checks the row's intent the same way.
+TEST(CASFsck, PendingRowTokenIsComparedCanonically)
+{
+    auto backend = std::make_shared<FsckFaultBackend>();
+    PoolPtr store = openPoolForTest(backend);
+    const BlobRef blob = blobRefOf(1);
+    writeBlobBody(*backend, store->layout(), numberedBlobHash(1));
+    const String body_key = store->layout().blobKey(blob);
+    backend->head_values[body_key] = "tag-1";
+    injectRetire(*backend, store->layout(), /*round=*/3, /*shard=*/0, {RetiredEntry{
+        .kind = ObjectKind::Blob, .ref = blob, .token = PersistedEtag{"emulated", "\"tag-1\""},
+        .size = 1, .condemn_round = 3, .delete_pending = true}});
+
+    const FsckReport rep = runFsck(*store, /*detail=*/true);
+
+    EXPECT_EQ(rep.pending_without_intent, 1u) << formatFsckSummary(rep);
+    EXPECT_FALSE(rep.clean());
+    EXPECT_EQ(countRows(rep, FsckClass::PendingWithoutIntent, body_key), 1u);
+}
+
+/// The second read of `gc/state` clears a suspect only when it is a complete snapshot: a seal it names that is
+/// gone, or a run whose checksum disagrees, proves nothing about the row, so the scan is inconclusive.
+TEST(CASFsck, PendingSuspectIsClearedOnlyByACompleteReread)
+{
+    enum class Damage : uint8_t { None, SealMissing, RunChecksum };
+    for (const Damage damage : {Damage::None, Damage::SealMissing, Damage::RunChecksum})
+    {
+        SCOPED_TRACE(static_cast<int>(damage));
+        FsckGcFixture f;
+        f.drop();
+        f.round();
+        f.removeIntent(1);
+        const Layout & layout = f.store->layout();
+        f.backend->beforeRead(layout.gcStateKey(), 1, [&]
+        {
+            f.round();   /// the row moves on: the body is deleted and the row becomes `standing`
+            OperationForTest op(*f.backend);
+            const GcState state = decodeGcState((*op).read(layout.gcStateKey(), Retry::standard())->bytes);
+            const String seal_key = layout.foldSealKey(state.snap_generation, state.snap_attempt);
+            const auto seal = (*op).read(seal_key, Retry::standard());
+            ASSERT_TRUE(seal.has_value());
+            if (damage == Damage::SealMissing)
+                ASSERT_EQ((*op).remove(seal_key, seal->etag, Retry::standard()), Removal::Removed);
+            if (damage == Damage::RunChecksum)
+            {
+                CasFoldSeal decoded = decodeFoldSeal(seal->bytes, state.snap_generation);
+                ASSERT_FALSE(decoded.blob_target_runs.empty());
+                decoded.blob_target_runs.front().checksum += 1;
+                ASSERT_TRUE(std::holds_alternative<Committed>((*op).replace(seal_key, encodeFoldSeal(decoded), seal->etag, Retry::standard())));
+            }
+        });
+
+        const FsckReport rep = runFsck(*f.store, /*detail=*/true);
+
+        ASSERT_FALSE(objectPresent(*f.backend, f.bodyKey(1))) << "positive control: the round ran before the re-read";
+        EXPECT_EQ(rep.pending_without_intent, 0u);
+        if (damage == Damage::None)
+        {
+            EXPECT_EQ(rep.pending_intent_absent, 1u);
+            EXPECT_TRUE(rep.clean()) << formatFsckSummary(rep);
+        }
+        else
+        {
+            EXPECT_EQ(rep.pending_intent_absent, 0u);
+            EXPECT_FALSE(rep.clean()) << formatFsckSummary(rep);
+            EXPECT_NE(rep.intent_unread_reason.find("inconclusive"), String::npos) << rep.intent_unread_reason;
+        }
+    }
+}
+
+/// A `pending` row whose token has no canonical identity names no intent key: its own informational class.
+TEST(CASFsck, PendingRowWithAnUncanonicalTokenIsItsOwnClass)
+{
+    auto backend = std::make_shared<FsckFaultBackend>();
+    PoolPtr store = openPoolForTest(backend);
+    const BlobRef blob = blobRefOf(1);
+    writeBlobBody(*backend, store->layout(), numberedBlobHash(1));
+    const String body_key = store->layout().blobKey(blob);
+    backend->head_values[body_key] = "W/\"weak\"";
+    injectRetire(*backend, store->layout(), /*round=*/3, /*shard=*/0, {RetiredEntry{
+        .kind = ObjectKind::Blob, .ref = blob, .token = PersistedEtag{"emulated", "W/\"weak\""},
+        .size = 1, .condemn_round = 3, .delete_pending = true}});
+    backend->clearJournal();
+
+    const FsckReport rep = runFsck(*store, /*detail=*/true);
+
+    EXPECT_EQ(rep.pending_token_rejected, 1u);
+    EXPECT_EQ(rep.pending_without_intent, 0u);
+    EXPECT_EQ(rep.pending_gc, 0u);
+    EXPECT_TRUE(rep.clean());
+    EXPECT_EQ(countRows(rep, FsckClass::PendingTokenRejected, body_key), 1u);
+    for (const JournalEntry & entry : backend->journal())
+        for (const String & key : entry.keys)
+            EXPECT_FALSE(key.starts_with(store->layout().blobIntentsPrefix()) && entry.verb == JournalVerb::Read) << "no intent key exists: " << key;
+}
+
+/// A refusal of the intent read under a `pending` row is `intent_unread`, a hard finding: the scan could not
+/// tell whether the warning exists.
+TEST(CASFsck, UnreadableIntentOfAPendingRowIsAHardFinding)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    f.backend->refused_reads.insert(f.intentKey(1));
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/false);
+
+    EXPECT_EQ(rep.intent_unread, 1u);
+    EXPECT_FALSE(rep.clean());
+    EXPECT_NE(rep.intent_unread_reason.find("NOT_IMPLEMENTED"), String::npos) << rep.intent_unread_reason;
+    EXPECT_EQ(rep.pending_without_intent, 0u) << "an unanswered read is not an absent intent";
 }
 
 /// A scan whose deadline is already in the past: partial_on_deadline=false keeps the old
@@ -1815,6 +2884,24 @@ TEST(CASFsckSummary, ZeroValuedHardFindingsAreStillPrinted)
 /// A partial scan is a lower bound over the visited subset, so the flag and its reason must travel WITH
 /// the counts -- a consumer that sees the numbers but not `partial=1` reads a truncated walk as the pool
 /// truth.
+/// The advisory counters and the verification flag are on the line too, zeros included: "absent" and "zero"
+/// are different facts to a consumer, and `intents_verified=0` is what says the `intent_*` verdicts were not run.
+TEST(CASFsckSummary, AdvisoryIntentCountersAndTheVerificationFlagArePrinted)
+{
+    FsckReport report;
+    const String plain = formatFsckSummary(report);
+    for (const char * name : {"intent_listed=0", "pending_intent_absent=0", "pending_token_rejected=0", "standing_present=0", "intents_verified=0"})
+        EXPECT_NE(plain.find(name), String::npos) << name << " missing from: " << plain;
+    report.intents_verified = true;
+    report.intent_listed = 5;
+    report.standing_present = 2;
+    const String verified = formatFsckSummary(report);
+    EXPECT_NE(verified.find("intents_verified=1"), String::npos) << verified;
+    EXPECT_NE(verified.find("intent_listed=5"), String::npos) << verified;
+    EXPECT_NE(verified.find("standing_present=2"), String::npos) << verified;
+    EXPECT_TRUE(report.clean()) << "the advisory counters never make a report unclean";
+}
+
 TEST(CASFsckSummary, PartialFlagAndReasonTravelWithTheCounts)
 {
     FsckReport rep;

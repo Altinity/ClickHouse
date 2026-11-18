@@ -46,18 +46,10 @@ bool activeSourceExists(CasOperation & op, const Layout & layout, const UInt128 
     for (const RunRef & run : seal.blob_target_runs)
     {
         SourceEdgeRunView view = openSourceEdgeRun(op, run.key);
-        String key;
-        String payload;
-        while (view.next(key, payload))
-        {
-            if (payload.empty() || runMarkerFromByte(payload[0], "CAS test source-edge run") != RunMarker::Edge)
-                continue;
-            BlobRef ref;
-            UInt128 row_source{};
-            SourceEdgeKeyCodec::parse(key, ref, row_source);
-            if (row_source == source_id)
+        SourceEdgeRecord rec;
+        while (view.next(rec))
+            if (rec.marker == RunMarker::Edge && rec.source_id == source_id)
                 return true;
-        }
         view.verifyAgainst(run.checksum);
     }
     return false;
@@ -72,10 +64,9 @@ size_t condemnedCount(CasOperation & op, const Layout & layout)
     for (const RunRef & run : seal.blob_target_runs)
     {
         SourceEdgeRunView view = openSourceEdgeRun(op, run.key);
-        String key;
-        String payload;
-        while (view.next(key, payload))
-            count += !payload.empty() && runMarkerFromByte(payload[0], "CAS test source-edge run") == RunMarker::Condemned;
+        SourceEdgeRecord rec;
+        while (view.next(rec))
+            count += rec.marker == RunMarker::Condemned;
         view.verifyAgainst(run.checksum);
     }
     return count;

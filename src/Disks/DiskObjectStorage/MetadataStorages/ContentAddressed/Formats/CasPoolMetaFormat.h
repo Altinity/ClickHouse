@@ -66,6 +66,11 @@ struct PoolMeta
     /// writing once the algorithm is admitted.
     static PoolMeta raiseMinReaderGeneration(CasOperation & op, const Layout & layout, uint64_t generation);
 
+    /// Read-modify-write to floor `G_BLOB_INTENTS` with the dialect of `op`'s backend recorded, in one write. A body
+    /// already at that floor with that dialect is left as it is; one with another dialect is refused with
+    /// `BAD_ARGUMENTS`. Returns whether this call wrote.
+    static bool raiseToGeneration4(CasOperation & op, const Layout & layout);
+
     /// Convenience for single-shard callers. Production pool opening passes the configured value to
     /// the explicit overload above; this preserves compact single-shard codec/unit fixtures.
     static PoolMeta createOrValidate(

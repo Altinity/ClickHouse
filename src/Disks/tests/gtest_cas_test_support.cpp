@@ -22,12 +22,6 @@ namespace
 
 const DB::UInt128 kGcId = hexToU128("00000000000000000000000000000001");
 
-DB::UInt128 blobHashOf(uint64_t blob)
-{
-    const DB::UInt128 value(blob);
-    return (value << 64) | value;
-}
-
 size_t firstIndexOf(const std::vector<JournalEntry> & journal, auto && predicate)
 {
     const auto it = std::find_if(journal.begin(), journal.end(), predicate);
@@ -161,8 +155,8 @@ TEST(CASTestSupport, CutCompleteFollowsIntakeAndPrecedesTheFold)
     std::vector<ManifestEntry> entries;
     for (uint64_t blob = 1; blob <= kBlobCount; ++blob)
     {
-        writeBlobBody(*backend, store->layout(), blobHashOf(blob));
-        entries.push_back(blobEntryFor("f" + std::to_string(blob), blobHashOf(blob)));
+        writeBlobBody(*backend, store->layout(), numberedBlobHash(blob));
+        entries.push_back(blobEntryFor("f" + std::to_string(blob), numberedBlobHash(blob)));
     }
     writeManifestRaw(*backend, store->layout(), ns, manifest, entries);
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, manifest);
@@ -187,16 +181,10 @@ TEST(CASTestSupport, CutCompleteFollowsIntakeAndPrecedesTheFold)
     };
     const auto is_blob_write = [&](const JournalEntry & e)
     {
-        return e.verb == JournalVerb::Write && e.keys.front().starts_with(layout.blobsPrefix());
-    };
-    const auto is_blob_delete = [&](const JournalEntry & e)
-    {
-        return (e.verb == JournalVerb::Remove || e.verb == JournalVerb::RemoveMany)
-            && std::ranges::any_of(e.keys, [&](const String & key) { return key.starts_with(layout.blobsPrefix()); });
+        return e.verb == JournalVerb::Write && e.keys.front().starts_with(layout.blobIntentsPrefix());
     };
 
-    /// Positive controls: the mark, a ref-log read, the blob HEADs and the blob writes (condemnation
-    /// markers) all exist. Only the FIRST ref-log read is bounded: a read-ahead read nobody took can
+    /// Positive controls: the mark, a ref-log read, the blob HEADs and the intent creates all exist. Only the FIRST ref-log read is bounded: a read-ahead read nobody took can
     /// follow the mark, but intake cannot end before it has read anything.
     ASSERT_EQ(std::count_if(journal.begin(), journal.end(), is_mark), 1);
     const size_t mark = firstIndexOf(journal, is_mark);
@@ -205,20 +193,19 @@ TEST(CASTestSupport, CutCompleteFollowsIntakeAndPrecedesTheFold)
     const size_t first_blob_write = firstIndexOf(journal, is_blob_write);
     ASSERT_LT(first_ref_read, journal.size()) << "the round read no ref-log object";
     ASSERT_LT(first_blob_head, journal.size()) << "the round sent no blob HEAD";
-    ASSERT_LT(first_blob_write, journal.size()) << "the round sent no blob write";
+    ASSERT_LT(first_blob_write, journal.size()) << "the round sent no intent create";
 
     EXPECT_LT(first_ref_read, mark);
     EXPECT_LT(mark, first_blob_head);
     EXPECT_LT(mark, first_blob_write);
-    EXPECT_LT(mark, firstIndexOf(journal, is_blob_delete)) << "a blob delete precedes the mark";
 }
 
 TEST(CASTestSupport, PublicationFakeJournalsOneEntryPerBlobRemove)
 {
     auto backend = std::make_shared<EtagFaithfulPublicationBackend>(EtagFaithfulPublicationBackend::FaultScript::None);
     const Layout layout("p");
-    writeBlobBody(*backend, layout, blobHashOf(1));
-    const String key = layout.blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(blobHashOf(1))});
+    writeBlobBody(*backend, layout, numberedBlobHash(1));
+    const String key = layout.blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(numberedBlobHash(1))});
 
     OperationForTest op(*backend);
     const auto seen = (*op).head(key, Retry::once());

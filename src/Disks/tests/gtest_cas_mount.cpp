@@ -481,7 +481,7 @@ TEST(CASMountAudit, RenewalDefaultLogsAreBounded)
         auto backend = std::make_shared<RenewalLogBackend>();
         auto boot_ms = std::make_shared<std::atomic<uint64_t>>(100);
         auto store = open_store(backend, boot_ms, "renewal-log-silent");
-        DB::Cas::tests::ScopedLoggerCapture capture("CasMountLeaseRenewer", "information");
+        DB::Cas::tests::ScopedLogCapture capture("CasMountLeaseRenewer", "information");
         EXPECT_NO_THROW(store->renewWatermarkOnce());
         EXPECT_EQ(countRenewalLogText(capture.captured(), "CAS mount renewal"), 0u);
     }
@@ -490,7 +490,7 @@ TEST(CASMountAudit, RenewalDefaultLogsAreBounded)
         auto backend = std::make_shared<RenewalLogBackend>();
         auto boot_ms = std::make_shared<std::atomic<uint64_t>>(100);
         auto store = open_store(backend, boot_ms, "renewal-log-recovered");
-        DB::Cas::tests::ScopedLoggerCapture capture("CasMountLeaseRenewer", "information");
+        DB::Cas::tests::ScopedLogCapture capture("CasMountLeaseRenewer", "information");
         backend->throw_before_next_overwrite = true;
         EXPECT_NO_THROW(store->renewWatermarkOnce());
         const String output = capture.captured();
@@ -503,7 +503,7 @@ TEST(CASMountAudit, RenewalDefaultLogsAreBounded)
         auto backend = std::make_shared<RenewalLogBackend>();
         auto boot_ms = std::make_shared<std::atomic<uint64_t>>(100);
         auto store = open_store(backend, boot_ms, "renewal-log-debug");
-        DB::Cas::tests::ScopedLoggerCapture capture("CasMountLeaseRenewer", "debug");
+        DB::Cas::tests::ScopedLogCapture capture("CasMountLeaseRenewer", "debug");
         backend->throw_before_next_overwrite = true;
         EXPECT_NO_THROW(store->renewWatermarkOnce());
         EXPECT_EQ(countRenewalLogText(capture.captured(), "physical retry attempt 2"), 1u);
@@ -513,7 +513,7 @@ TEST(CASMountAudit, RenewalDefaultLogsAreBounded)
         auto backend = std::make_shared<RenewalLogBackend>();
         auto boot_ms = std::make_shared<std::atomic<uint64_t>>(100);
         auto store = open_store(backend, boot_ms, "renewal-log-fenced");
-        DB::Cas::tests::ScopedLoggerCapture capture("CasMountLeaseRenewer", "information");
+        DB::Cas::tests::ScopedLogCapture capture("CasMountLeaseRenewer", "information");
         /// The lease was claimed at boot 100 with the 1000 ms TTL above, so it expires at 1100. The
         /// fence admits only while the remaining time strictly clears the safety margin plus whatever
         /// the attempt reserves, so exactly `margin` remaining (with the reservation on top) refuses.
@@ -3606,7 +3606,7 @@ void expectRemountStopsForGood(const std::shared_ptr<InMemoryBackend> & b, const
     const String counter_before = ops.op.read(l.epochKey("r"), Retry::standard())->bytes;
     const uint64_t epoch_before = slotBody(*b, l, "r").writer_epoch;
     const uint64_t identity_lost_before = ProfileEvents::global_counters[ProfileEvents::CASIdentityLost];
-    DB::Cas::tests::ScopedLoggerCapture capture("CasPool", "warning");
+    DB::Cas::tests::ScopedLogCapture capture("CasPool", "warning");
 
     EXPECT_FALSE(store->tryRemountOnce());
     EXPECT_EQ(store->lifecycle(), PoolLifecycle::IdentityLost);

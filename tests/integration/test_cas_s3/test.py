@@ -12,7 +12,8 @@ CAS_PUBLICATION_EVENTS = (
     "CASBlobHeadMiss",
     "CASBlobPut",
     "CASBlobUploadFanoutTasks",
-    "CASMetaCreateClean",
+    "CASBlobIntentGet",
+    "CASBlobIntentPut",
 )
 
 
@@ -106,13 +107,10 @@ def test_cas_s3():
     ), fresh
     assert fresh["CASBlobHeadMiss"] == fresh["CASBlobUploadFanoutTasks"], fresh
     assert fresh["CASBlobBodyPutAvoided"] == 0, fresh
-    assert fresh["CASMetaCreateClean"] == fresh["CASBlobUploadFanoutTasks"], fresh
-    # `CASBlobPut` is namespace/path instrumentation: both the body and its `.meta` sibling live
-    # below `/blobs/`, so a fresh publication contributes exactly those two physical PUTs.
-    assert (
-        fresh["CASBlobPut"]
-        == fresh["CASBlobUploadFanoutTasks"] + fresh["CASMetaCreateClean"]
-    ), fresh
+    # A fresh blob costs one `HEAD` and one `PUT`, and no intent request.
+    assert fresh["CASBlobPut"] == fresh["CASBlobUploadFanoutTasks"], fresh
+    assert fresh["CASBlobIntentGet"] == 0, fresh
+    assert fresh["CASBlobIntentPut"] == 0, fresh
 
     expected_sum = (NUM_ROWS - 1) * NUM_ROWS // 2
     assert int(node.query("SELECT count() FROM cas_test")) == NUM_ROWS
@@ -136,7 +134,9 @@ def test_cas_s3():
     assert duplicate["CASBlobHeadMiss"] == 0, duplicate
     assert duplicate["CASBlobPut"] == 0, duplicate
     assert duplicate["CASBlobBodyPutAvoided"] == duplicate["CASBlobHead"], duplicate
-    assert duplicate["CASMetaCreateClean"] == 0, duplicate
+    # A duplicate costs one `HEAD` and one intent `GET` that finds no intent.
+    assert duplicate["CASBlobIntentGet"] == duplicate["CASBlobHead"], duplicate
+    assert duplicate["CASBlobIntentPut"] == 0, duplicate
     assert int(node.query("SELECT count() FROM cas_test")) == 2 * NUM_ROWS
     assert int(node.query("SELECT sum(id) FROM cas_test")) == 2 * expected_sum
 

@@ -81,8 +81,8 @@ TEST(CASFormat, CurrentVersionsAreGBuild)
 TEST(CASFormat, RefLogAndRefCkptHistoriesRecordGenerationThree)
 {
     EXPECT_EQ(G_REF_CHAIN, 3u);
-    EXPECT_EQ(G_BUILD, 3u);
-    EXPECT_EQ(currentReadCeiling(), 3u);
+    EXPECT_EQ(G_BUILD, G_BLOB_INTENTS);
+    EXPECT_EQ(currentReadCeiling(), G_BUILD);
 
     const auto pair = [](const FormatChangePoint & cp) { return std::make_pair(cp.generation, cp.min_reader); };
     using Pair = std::pair<uint16_t, uint16_t>;
@@ -109,7 +109,7 @@ TEST(CASFormat, RefLogAndRefCkptHistoriesRecordGenerationThree)
 
 TEST(CASFormat, ReadCeilingIsAboveTheWriteFloor)
 {
-    EXPECT_EQ(G_BUILD, 3u);
+    EXPECT_EQ(G_BUILD, 4u);
     EXPECT_EQ(currentCompatibilityVersion(), G_WRITE_FLOOR);
     EXPECT_EQ(G_WRITE_FLOOR, 1u);
 }

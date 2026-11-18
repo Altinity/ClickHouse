@@ -743,7 +743,7 @@ TEST(CASPoolMetaFloor, RaiseMinReaderGenerationIsMonotone)
 /// ============================================================================================
 /// CAS reader-generation gate (`CasFormat.h`'s `G_BUILD`). This test's assertions read `G_BUILD`
 /// itself rather than a hardcoded generation number, so a future bump does not silently make them
-/// false. A new pool starts at `G_REF_CHAIN`, and hash admission never raises it past the
+/// false. A new pool starts at `G_BLOB_INTENTS`, and hash admission never raises it past the
 /// algorithm's own requirement. `decodePoolMeta` fail-closes BOTH on a FUTURE `min_reader_generation` AND on a BACKWARD pool whose header
 /// `compatibility_version` is below the format-generation baseline (see `CasPoolMetaFormat.cpp`).
 TEST(CASPluggableHash, ReaderGenerationFloorIsTheMountFloorAndGatesFailClosed)
@@ -752,11 +752,11 @@ TEST(CASPluggableHash, ReaderGenerationFloorIsTheMountFloorAndGatesFailClosed)
     {
         auto backend = std::make_shared<InMemoryBackend>();
         auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-        EXPECT_EQ(store->poolMeta().min_reader_generation, G_REF_CHAIN);
+        EXPECT_EQ(store->poolMeta().min_reader_generation, G_BLOB_INTENTS);
 
         const auto meta_bytes = readAt(*backend, store->layout().poolMetaKey());
         ASSERT_TRUE(meta_bytes.has_value());
-        EXPECT_EQ(decodePoolMeta(meta_bytes->bytes).min_reader_generation, G_REF_CHAIN);
+        EXPECT_EQ(decodePoolMeta(meta_bytes->bytes).min_reader_generation, G_BLOB_INTENTS);
     }
     /// FORWARD gate: a pool-meta carrying `min_reader_generation == G_BUILD + 1` (one generation past
     /// THIS build's floor) fails closed at open -- the startup gate (`decodePoolMeta`) rejects it.
@@ -850,7 +850,8 @@ TEST(CASPluggableHash, TwoAlgoBlobsBothFullyReclaimed)
     runRegularRoundReclaiming(gc);   /// folds both +1s
     dropSeededRef(*store, *backend, ns, /*build_sequence=*/1, "tbl_ch");
     dropSeededRef(*store, *backend, ns, /*build_sequence=*/2, "tbl_sh");
-    runRegularRoundReclaiming(gc);   /// folds both -1s: both condemned in the same round
+    const RoundReport condemning = runRegularRoundReclaiming(gc);   /// folds both -1s: both condemned in the same round
+    EXPECT_EQ(condemning.intent_confirmed, 2u) << "both algos' intents must be confirmed in the condemning round";
 
     /// previewDeletes covers BOTH refs from the adopted seal -- never just one algo.
     {
@@ -863,21 +864,15 @@ TEST(CASPluggableHash, TwoAlgoBlobsBothFullyReclaimed)
         EXPECT_TRUE(refs.count(sh.ref));
     }
 
-    /// Drive the round-paced pipeline to actual physical deletion: the fold condemned both at its
-    /// round; the VERY NEXT round graduates them (unconditionally, round-paced); the round after that
-    /// executes the exact-token delete for both.
+    /// The condemning round created both intents; the next round deletes both bodies.
+    EXPECT_TRUE(existsAt(*backend, ch_key));   // pending: still present after the condemning round
+    EXPECT_TRUE(existsAt(*backend, sh_key));
     {
         const RoundReport rep1 = runRegularRoundReclaiming(gc);
-        EXPECT_EQ(rep1.graduated, 2u) << "both algos' blobs must graduate together in one round";
-        EXPECT_TRUE(existsAt(*backend, ch_key));   // pending: still present this pass
-        EXPECT_TRUE(existsAt(*backend, sh_key));
-    }
-    {
-        const RoundReport rep2 = runRegularRoundReclaiming(gc);
-        EXPECT_EQ(rep2.redeleted, 2u) << "both algos' pending deletes must execute together in one round";
+        EXPECT_EQ(rep1.bodies_deleted, 2u) << "both algos' pending deletes must execute together in one round";
     }
 
-    /// THE CRUX: after graduation the backend holds ZERO blob bodies of EITHER algo.
+    /// THE CRUX: after the body deletes the backend holds ZERO blob bodies of EITHER algo.
     EXPECT_FALSE(existsAt(*backend, ch_key)) << "the ch128 blob must be physically reclaimed";
     EXPECT_FALSE(existsAt(*backend, sh_key)) << "the sha256 blob must be physically reclaimed";
 
@@ -934,7 +929,7 @@ TEST(CASPluggableHash, SameDigestDifferentAlgoDistinctBodiesAndSettlement)
         ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(store->layout().blobKey(ref),
             encodeEnvelopeHeader(header, static_cast<uint32_t>(store->poolMeta().blob_header_len)) + payload, Retry::standard())));
         ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(store->layout().blobMetaKey(ref),
-            encodeBlobMeta(BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = payload.size()}), Retry::standard())));
+            encodeBlobMetaForTest(BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = payload.size()}), Retry::standard())));
     };
 
     PartWriteInfo info_a;

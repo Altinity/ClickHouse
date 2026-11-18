@@ -23,6 +23,8 @@ String toString(CasEventType type)
         case CasEventType::BlobRetireReplaced:    return "blob_retire_replaced";
         case CasEventType::BlobDelete:            return "blob_delete";
         case CasEventType::BlobForget:            return "blob_forget";
+        case CasEventType::BlobIntentAdopt:       return "blob_intent_adopt";
+        case CasEventType::BlobIntentDelete:      return "blob_intent_delete";
         case CasEventType::ManifestPut:           return "manifest_put";
         case CasEventType::ManifestDelete:        return "manifest_delete";
         case CasEventType::RefPublish:            return "ref_publish";

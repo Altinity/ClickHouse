@@ -86,7 +86,8 @@ enum class BlobMaterializationAction : uint8_t
 enum class BlobPublicationReason : uint8_t
 {
     Absent,
-    Condemned,
+    IntentPresent,    /// the body's incarnation has a deletion intent
+    TokenRejected,    /// the body's token names no incarnation, so it cannot be adopted
 };
 
 enum class BlobPublicationTransport : uint8_t
@@ -202,7 +203,8 @@ public:
     std::optional<BlobDependencyProof> dependencyProof(const BlobRef & ref) const;
 
     /// Record `TrustedManifest` directly from a `ManifestEntry` — no HEAD or backend call. Inline
-    /// entries record nothing.
+    /// entries record nothing. The caller keeps the source reference live until this build's precommit
+    /// is durable.
     void adoptEvidence(const ManifestEntry & entry);
 
     /// Mint a root-local part `ManifestId`, write its body under
@@ -240,7 +242,7 @@ public:
     ///  1. `Materialized` leaves are already protected by the durable precommit edge, so no writer-side retired-view
     ///     refresh is needed;
     ///  2. no manifest request: the blob leaves are the ones `stageManifest` recorded;
-    ///  3. `TrustedManifest` leaves use the durable source-manifest edge with no per-file HEAD/loadMeta
+    ///  3. `TrustedManifest` leaves use the durable source-manifest edge with no per-file HEAD
     ///     probe; a genuinely absent trusted blob is an invariant violation caught by fsck, not here;
     ///  4. lost owner liveness ⇒ retry later (`NETWORK_ERROR`); a missing dependency proof, or a manifest this
     ///     transaction did not stage and the ref does not commit ⇒ `LOGICAL_ERROR` (fail closed);

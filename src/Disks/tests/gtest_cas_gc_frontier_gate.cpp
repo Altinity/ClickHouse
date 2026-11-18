@@ -1038,24 +1038,11 @@ TEST(CASGCFrontierGate, ADecodedTokenBearingEmptyCatalogCompletesTheFrontierAndD
     Gc gc(store, kGc);
     backend->resetCounts();
 
-    /// `injectRetire` seeds the condemned entry WITHOUT the durable per-hash `Condemned` meta a real
-    /// condemn round writes (`fold`'s own `scheduleCondemnMarkerWrite` side effect) -- so this fixture's
-    /// round cadence is longer than the textbook condemn->graduate->delete: the lease is UNCLAIMED
-    /// (`injectRetire` writes `gc/state` directly, never through a real acquire), so the first round
-    /// only arms `acquireOrRenewLease`'s two-tick steal-safety window; the graduation gate's own
-    /// `confirm_condemned_marker` then fails its first sighting, schedules the meta write, and CARRIES
-    /// the entry (not yet delete_pending) while `meta_pool_wait` lands it durably by that round's end;
-    /// only the round after that sees the durable meta and actually graduates; and the physical delete
-    /// is the round after THAT. MEASURED (phase-sink instrumentation, not a guess): round 1 arms
-    /// (`saw_fold == false`), round 2 is the first to fold with the gate open while the blob is still
-    /// present (the carry round), round 3 graduates, round 4 executes the delete -- four rounds exactly.
-    /// Bound the drive at that plus one (5): enough slack for the fixture's own cadence to be measured
-    /// without hand-counting rounds against this gate, but tight enough that a real regression in the
-    /// confirm/retry cadence still fails loudly instead of silently absorbing into a generous loop.
+    /// The drive is bounded tightly, so slower pacing fails loudly instead of being absorbed by a generous loop.
     ASSERT_TRUE(op.head(layout.blobKey(blob_ref), Retry::once()).has_value())
         << "the scenario starts with the condemned blob present, or the loop below measures nothing";
 
-    constexpr int kMaxRounds = 5;   /// measured cadence (4) + 1; see the comment above
+    constexpr int kMaxRounds = 5;   /// bound on the drain; see the comment above
     /// Observe the TWO-PHASE PIPELINE explicitly: an open, unsuppressed gate while the blob was still
     /// present (the graduate side), and only a STRICTLY LATER round removing it (the delete side).
     /// Asserting only the final state and the last verdict would pass just as readily if the blob
@@ -1132,11 +1119,6 @@ TEST(CASGCFrontierGate, AZeroWalkableFrontierWithACreatingCatalogRowIsNotProvedE
 
     Gc gc(store, kGc);
     backend->resetCounts();
-    /// `injectRetire` leaves `gc/state`'s lease unclaimed (owner 0); the first round only arms the
-    /// steal-safety window (see `ADecodedTokenBearingEmptyCatalogCompletesTheFrontierAndDrainsRetiredWork`)
-    /// and folds nothing, so it is spent here rather than counted among the assertions below.
-    const GateVerdict warm_up = runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
-    EXPECT_FALSE(warm_up.saw_fold);
     for (int i = 0; i < 6; ++i)
     {
         const GateVerdict v = runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
@@ -1284,11 +1266,6 @@ TEST(CASGCFrontierGate, AProvedEmptyCatalogUnderStageASuppressedStaysSuppressed)
 
     Gc gc(store, kGc);
     backend->resetCounts();
-    /// `injectRetire` leaves `gc/state`'s lease unclaimed (owner 0); the first round only arms the
-    /// steal-safety window (see `ADecodedTokenBearingEmptyCatalogCompletesTheFrontierAndDrainsRetiredWork`)
-    /// and folds nothing, independent of policy -- lease acquisition precedes the destructive gate.
-    const GateVerdict warm_up = runRoundCapturingGate(store, gc, UniversePolicy::StageA_Suppressed);
-    EXPECT_FALSE(warm_up.saw_fold);
     for (int i = 0; i < 6; ++i)
     {
         const GateVerdict v = runRoundCapturingGate(store, gc, UniversePolicy::StageA_Suppressed);
@@ -1341,17 +1318,13 @@ TEST(CASGCFrontierGate, ANamespaceBornAfterTheEmptyCutResurrectsTheCondemnedBlob
     runRegularRoundReclaiming(gc);                                 /// folds the +1 edge
     store->renewWatermarkOnce();
     dropRefTransition(*backend, layout, doomed, "ref_1", mref);
-    runRegularRoundReclaiming(gc);                                 /// condemns: durable Condemned meta
+    runRegularRoundReclaiming(gc);                                 /// condemns: intent confirmed, row pending
     store->renewWatermarkOnce();
     const auto condemned_head = op.head(key, Retry::once());
     ASSERT_TRUE(condemned_head.has_value());
     const Etag condemned_token = condemned_head->etag;
-    const auto condemned_meta = loadMetaForTest(*backend, layout, hash);
-    ASSERT_TRUE(condemned_meta.has_value());
-    ASSERT_EQ(condemned_meta->meta.state, MetaState::Condemned)
-        << "the delete round R is about to execute must be backed by durable Condemned evidence";
-    runRegularRoundReclaiming(gc);                                 /// graduates: publishes delete_pending
-    store->renewWatermarkOnce();
+    ASSERT_TRUE(objectPresent(*backend, layout.blobIntentKey(id, *condemned_token.canonical())))
+        << "the delete round R is about to execute must be backed by a confirmed intent";
 
     /// Remove `doomed` entirely -- the ONLY way the catalog can become genuinely, provably empty. A raw
     /// `RemoveNamespace` op plus the Removing-state CAS mirrors
@@ -1372,7 +1345,7 @@ TEST(CASGCFrontierGate, ANamespaceBornAfterTheEmptyCutResurrectsTheCondemnedBlob
     });
 
     /// A SUPPRESSED round folds `doomed` through its removal terminal and records `cleanup_evidence` in
-    /// the seal, WITHOUT executing the delete_pending the graduate round above published -- suppressed
+    /// the seal, WITHOUT executing the delete of the pending row the condemning round wrote -- suppressed
     /// rounds carry pending deletes forward untouched. `StageA_Suppressed` here is the test's OWN
     /// control over timing, not the scenario under test: it exists only to keep blob X's delete pending
     /// until round R below, rather than letting it drain the ordinary way while `doomed` is still Live.
@@ -1404,7 +1377,7 @@ TEST(CASGCFrontierGate, ANamespaceBornAfterTheEmptyCutResurrectsTheCondemnedBlob
         ASSERT_TRUE(fresh_head.has_value());
         fresh_token = fresh_head->etag;
         EXPECT_NE(*fresh_token, condemned_token)
-            << "the writer must have observed Condemned and resurrected -- a fresh token, not an adopt "
+            << "the writer must have met the intent and resurrected -- a fresh token, not an adopt "
                "of the dying incarnation";
     });
 
@@ -2168,11 +2141,9 @@ TEST(CASGCFrontierGate, ALateEdgeSparesADeletePendingBlobAtTheDeleteSite)
     runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
 
-    /// Condemn it, then graduate it to delete_pending.
+    /// Condemn it: the intent is confirmed and the row pending.
     dropRefTransition(*backend, layout, ns, "ref_1", mref);
     runRegularRoundReclaiming(gc);            /// condemn
-    store->renewWatermarkOnce();
-    runRegularRoundReclaiming(gc);            /// graduate: delete_pending published
     store->renewWatermarkOnce();
 
     /// A new owner appears BEFORE the delete pass. The pass recomputes the in-degree from the merge it
@@ -2191,7 +2162,7 @@ TEST(CASGCFrontierGate, ALateEdgeSparesADeletePendingBlobAtTheDeleteSite)
 }
 
 /// ARM (b): a TOKENED adoption of an already-delete-pending blob. The writer's admit gate reads the
-/// `Condemned` meta, refuses to adopt the dying incarnation, and rematerializes from its own source as
+/// incarnation's intent, refuses to adopt the dying incarnation, and rematerializes from its own source as
 /// a FRESH incarnation -- so the delayed exact-token delete the previous round published finds a
 /// different token and removes nothing. The blob's identity is preserved by re-upload, never by
 /// reviving the condemned object.
@@ -2222,23 +2193,19 @@ TEST(CASGCFrontierGate, AResurrectedIncarnationSurvivesTheDelayedStaleTokenDelet
     runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
     dropRefTransition(*backend, layout, ns, "ref_1", mref);
-    runRegularRoundReclaiming(gc);            /// condemn: writes the durable Condemned meta
-    store->renewWatermarkOnce();
-    runRegularRoundReclaiming(gc);            /// graduate: publishes delete_pending against THIS token
+    runRegularRoundReclaiming(gc);            /// condemn: the intent of THIS token, the row pending
     store->renewWatermarkOnce();
 
     OperationForTest raw_op(*backend);
     const auto condemned_head = (*raw_op).head(key, Retry::once());
     ASSERT_TRUE(condemned_head.has_value());
     const Etag condemned_token = condemned_head->etag;
-    const auto condemned_meta = loadMetaForTest(*backend, layout, hash);
-    ASSERT_TRUE(condemned_meta.has_value());
-    ASSERT_EQ(condemned_meta->meta.state, MetaState::Condemned)
-        << "the delete GC is about to execute must be backed by durable Condemned evidence";
+    ASSERT_TRUE(objectPresent(*backend, layout.blobIntentKey(id, *condemned_token.canonical())))
+        << "the delete GC is about to execute must be backed by a confirmed intent";
 
-    /// A writer now adopts the blob through the REAL admit gate. It point-reads the Condemned meta,
-    /// refuses to adopt the dying incarnation, and rematerializes from its OWN source bytes -- never by
-    /// reading the condemned object. The key ends up holding a DIFFERENT incarnation.
+    /// A writer now adopts the blob through the REAL admit gate. It reads the intent, refuses to adopt the
+    /// dying incarnation, and rematerializes from its OWN source bytes -- never by reading the condemned
+    /// object. The key ends up holding a DIFFERENT incarnation.
     PartWriteInfo info;
     info.intended_ref = ns.string() + "/republished";
     auto build = store->beginPartWrite(info);

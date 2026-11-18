@@ -23,7 +23,6 @@ extern const int NETWORK_ERROR;
 
 namespace ProfileEvents
 {
-extern const Event CASGCMetaOps;
 extern const Event CASGCEnumerationPages;
 extern const Event CASMountExclusivityViolation;
 extern const Event CASGCRetiredSpared;
@@ -656,17 +655,17 @@ TEST(CASGCRound, CondemnRoundSealSummaryCountsCondemned)
     ASSERT_TRUE(condemned) << "blob never condemned into the snapshot run";
     ASSERT_TRUE(seal.condemned_summary.contains(0)) << "seal summary must be total over gc_shards";
     EXPECT_EQ(seal.condemned_summary.at(0).condemned_total, 1u);
-    EXPECT_EQ(seal.condemned_summary.at(0).pending_total, 0u)
-        << "a freshly condemned entry is not yet delete_pending";
-    EXPECT_LT(seal.condemned_summary.at(0).oldest_nonpending_condemn_round,
+    EXPECT_EQ(seal.condemned_summary.at(0).pending_total, 1u)
+        << "a row whose intent the condemning round confirmed is pending";
+    EXPECT_EQ(seal.condemned_summary.at(0).oldest_nonpending_condemn_round,
               std::numeric_limits<uint64_t>::max())
-        << "a non-pending condemned entry records its condemn round";
+        << "no candidate row: nothing non-pending is recorded";
 }
 
-/// retired-in-snapshot T5: `previewDeletes` streams the adopted seal's `RunMarker::Condemned` rows and reports each
-/// with the STORED condemn-time token — `awaiting_graduation` while newly condemned, then `delete_pending`
-/// once graduated, and NOTHING once the exact-token redelete has removed the blob. The preview performs no
-/// HEAD on the condemned rows (the token is durable in-run) and is WRITE-FREE throughout (spec §5 req 1).
+/// `previewDeletes` streams the adopted seal's `RunMarker::Condemned` rows and reports each with the STORED
+/// condemn-time token — `pending` after the condemning round, `standing` once the body is deleted, and NOTHING
+/// once the intent is removed. The preview performs no HEAD on the condemned rows (the token is durable
+/// in-run) and is WRITE-FREE throughout.
 TEST(CASGCRound, PreviewReportsCondemnedRowsAndIsWriteFree)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -683,7 +682,7 @@ TEST(CASGCRound, PreviewReportsCondemnedRowsAndIsWriteFree)
     EXPECT_TRUE(gc.previewDeletes().empty()) << "a live-referenced blob is never previewed for deletion";
 
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
-    runRegularRoundReclaiming(gc);                 /// condemning round: -1 => in-degree 0 => RunMarker::Condemned row (not pending)
+    runRegularRoundReclaiming(gc);                 /// condemning round: -1 => in-degree 0 => pending row, intent confirmed
 
     /// Write-free contract: a full key->incarnation snapshot must be identical across the call.
     CasRequests requests = openRequestsForTest(backend);
@@ -696,20 +695,20 @@ TEST(CASGCRound, PreviewReportsCondemnedRowsAndIsWriteFree)
     ASSERT_EQ(awaiting.size(), 1u) << "exactly the one condemned blob is previewed";
     EXPECT_EQ(awaiting[0].ref, (DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(blob)}));
     EXPECT_EQ(awaiting[0].key, store->layout().blobKey(DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(blob)}));
-    EXPECT_EQ(awaiting[0].reason, "awaiting_graduation");
+    EXPECT_EQ(awaiting[0].reason, "pending");
     EXPECT_FALSE(awaiting[0].token.value.empty()) << "must carry the stored condemn-time incarnation";
     EXPECT_GT(awaiting[0].condemn_round, 0u) << "must carry the stored condemn round";
 
-    runRegularRoundReclaiming(gc);                 /// graduation round: entry becomes delete_pending (blob still present)
-    const std::vector<Gc::PreviewEntry> pending = gc.previewDeletes();
-    ASSERT_EQ(pending.size(), 1u);
-    EXPECT_EQ(pending[0].ref, (DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(blob)}));
-    EXPECT_EQ(pending[0].reason, "delete_pending");
-    EXPECT_FALSE(pending[0].token.value.empty());
-
-    runRegularRoundReclaiming(gc);                 /// redelete round: exact-token delete; entry dropped; blob gone
+    runRegularRoundReclaiming(gc);                 /// body delete round: the row is standing, the blob gone
     EXPECT_FALSE(blobExists(*backend, store->layout(), blob));
-    EXPECT_TRUE(gc.previewDeletes().empty()) << "nothing to preview once the blob is redeleted";
+    const std::vector<Gc::PreviewEntry> standing = gc.previewDeletes();
+    ASSERT_EQ(standing.size(), 1u);
+    EXPECT_EQ(standing[0].ref, (DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(blob)}));
+    EXPECT_EQ(standing[0].reason, "standing");
+    EXPECT_FALSE(standing[0].token.value.empty());
+
+    runRegularRoundReclaiming(gc);                 /// intent removal round: the row leaves
+    EXPECT_TRUE(gc.previewDeletes().empty()) << "nothing to preview once the intent is removed";
 }
 
 /// A fully idle fold pure-carries every shard's authoritative rows verbatim. The parent is first made
@@ -861,7 +860,6 @@ TEST(CASGCRound, RoundSummaryCountsManifestBodyDeletes)
 
     /// §0 introspection: both counters are captured BEFORE the condemn+delete pipeline below, which
     /// drives the round's meta pool (condemn/spare/delete) and its own orphan-sweep cursor pass.
-    const auto meta_ops_before = ProfileEvents::global_counters[ProfileEvents::CASGCMetaOps];
     const auto pages_before = ProfileEvents::global_counters[ProfileEvents::CASGCEnumerationPages];
 
     /// Ack-floor drift: the owner-removed manifest body is deleted in the CONDEMNING round (post-CAS,
@@ -892,10 +890,8 @@ TEST(CASGCRound, RoundSummaryCountsManifestBodyDeletes)
     EXPECT_FALSE(manifestExists(*backend, store->layout(), id));
     EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(3)));
 
-    /// §0 introspection: the exact-token blob delete above scheduled at least one per-hash freshness-meta
-    /// op on the round's bounded meta pool, and every round ran its own orphan-manifest-sweep cursor pass
-    /// (default `manifest_sweep_list_budget_keys` is nonzero), fetching at least one LIST page directly.
-    EXPECT_GE(ProfileEvents::global_counters[ProfileEvents::CASGCMetaOps] - meta_ops_before, 1);
+    /// Every round ran its own orphan-manifest-sweep cursor pass (default `manifest_sweep_list_budget_keys`
+    /// is nonzero), fetching at least one LIST page directly.
     EXPECT_GE(ProfileEvents::global_counters[ProfileEvents::CASGCEnumerationPages] - pages_before, 1);
 }
 
@@ -1139,7 +1135,7 @@ TEST(CASGCRound, OutcomeLogStaysUnderItsByteLimit)
     driveToFixpoint(*backend, store, gc);
     dropRefTransition(*backend, store->layout(), ns, "tbl", r1);
     uint64_t deleted_reported = 0;
-    for (int round = 0; round < 8; ++round)
+    for (int round = 0; round < 8 && deleted_reported < static_cast<uint64_t>(kBlobs); ++round)
     {
         deleted_reported += runRegularRoundReclaiming(gc).deleted;
         store->renewWatermarkOnce();
@@ -1214,7 +1210,7 @@ TEST(CASGCRound, OutcomeLogByteLimitIsPerShardAndWarnsPerShard)
             rows_dropped += rec.metrics.at("outcome_rows_dropped");
     });
     ScopedLogCapture capture("CasGc", "warning");
-    for (int round = 0; round < 8; ++round)
+    for (int round = 0; round < 8 && deleted_reported < static_cast<uint64_t>(kBlobs); ++round)
     {
         deleted_reported += runRegularRoundReclaiming(gc).deleted;
         store->renewWatermarkOnce();

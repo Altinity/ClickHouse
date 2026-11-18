@@ -23,6 +23,7 @@ TEST(CASFormatBattery, GcState)
     s.snap_pruned_through = 7;
     s.snap_attempt = 3;
     s.manifest_sweep_cursor = "";
+    s.header_generation = G_WRITE_FLOOR;
     s.lease = GcLease{UInt128(1), 12};
     runFormatBattery({FormatId::GcState,
         [&] { return sealObject(FormatId::GcState, encodeGcState(s)); },
@@ -201,13 +202,13 @@ GcState stateWithIntentCursor(uint32_t header_generation)
 
 TEST(CASGCStateFormat, EncoderStampsTheHeaderGeneration)
 {
-    EXPECT_EQ(GcState{}.header_generation, currentCompatibilityVersion());
-    /// Pin: the default stamp is today's header, byte for byte.
-    EXPECT_EQ(encodeGcState(GcState{}).substr(0, 29), "{\"type\":\"cas_gc_state\",\"v\":1}");
+    /// Every writer of this build stamps header 4, the barrier an older GC refuses.
+    EXPECT_EQ(GcState{}.header_generation, G_BLOB_INTENTS);
+    EXPECT_EQ(encodeGcState(GcState{}).substr(0, 29), "{\"type\":\"cas_gc_state\",\"v\":4}");
 
     GcState s;
-    s.header_generation = G_BLOB_INTENTS;
-    EXPECT_EQ(encodeGcState(s).substr(0, 29), "{\"type\":\"cas_gc_state\",\"v\":4}");
+    s.header_generation = G_WRITE_FLOOR;
+    EXPECT_EQ(encodeGcState(s).substr(0, 29), "{\"type\":\"cas_gc_state\",\"v\":1}");
 }
 
 TEST(CASGCStateFormat, DecoderReportsTheHeaderGeneration)

@@ -465,7 +465,7 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
     /// ORDERING IS LOAD-BEARING (EDGE-BEFORE-OBSERVE):
     /// precommitAdd's durable closure names EVERY blob hash BEFORE putBlob makes the first backend
     /// observation. This is what lets promote skip re-validating `Materialized` leaves (a condemnation in the
-    /// putBlob→promote window cannot graduate — the next fold sees the edge). Moving putBlob before
+    /// putBlob→promote window cannot delete the body — the next fold sees the edge). Moving putBlob before
     /// precommitAdd would adopt an incarnation with no protecting edge and
     /// trips the durable-precommit guard in `PartWriteTxn::ensureBlobPresent`; the TLA+ order
     /// sabotage (Gate A) is the formal guard.

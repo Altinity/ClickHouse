@@ -4967,7 +4967,6 @@ TEST(CASRefWriterNamespaceRemoval, RowTurnedRemovingUnderAnOpenLaneKeepsItsAppen
     EXPECT_EQ(listLogIdsForTest(*backend, layout, ns), logs);
     EXPECT_TRUE(readOf(backend, layout.manifestKey(late_id)));
     EXPECT_TRUE(readOf(backend, layout.blobKey(blob)));
-    EXPECT_TRUE(readOf(backend, layout.blobMetaKey(blob)));
     EXPECT_GT(ProfileEvents::global_counters[ProfileEvents::CASGCStuckRemovals], stuck);
     /// The GC rounds read the row as `Removing` and closed this pool's runtime.
     EXPECT_FALSE(store->resolveRef(ns, "late"));

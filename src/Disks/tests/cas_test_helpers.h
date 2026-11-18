@@ -6,7 +6,7 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobMeta.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobMetaFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
@@ -28,6 +28,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCkpt.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobIntentFormat.h>
 #include <Common/Exception.h>
 #include <Common/Logger.h>
 #include <Common/logger_useful.h>
@@ -90,37 +91,6 @@ namespace DB::ErrorCodes
 
 namespace DB::Cas::tests
 {
-
-/// Redirects the named logger into a string for the scope, at the given level.
-class ScopedLoggerCapture
-{
-public:
-    ScopedLoggerCapture(const String & logger_name, const String & level)
-        : logger(getLogger(logger_name))
-        , channel(new Poco::StreamChannel(stream))
-        , old_channel(logger->getChannel(), /*shared=*/true)
-        , old_level(logger->getLevel())
-    {
-        logger->setChannel(channel.get());
-        logger->setLevel(level);
-    }
-
-    ~ScopedLoggerCapture()
-    {
-        logger->setChannel(old_channel);
-        logger->setLevel(old_level);
-    }
-
-    String captured() const { return stream.str(); }
-
-private:
-    LoggerPtr logger;
-    std::ostringstream stream; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
-    Poco::AutoPtr<Poco::StreamChannel> channel;
-    /// A real reference (shared=true), so the parked previous channel cannot die while ours is installed.
-    Poco::AutoPtr<Poco::Channel> old_channel;
-    int old_level;
-};
 
 /// A `CasRequests` over an always-open fence, for a fixture that has a backend but no mounted pool.
 /// Every operation admitted from it holds a reference to it, so it must be named and outlive them.
@@ -508,6 +478,20 @@ inline DB::Cas::BlobRef idOf(const String & bytes)
     return DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of(bytes))};
 }
 
+/// The hash of numbered test blob `blob`: the number in both halves, so numbers 1, 2, ... give distinct,
+/// readable and shard-spread hashes.
+inline DB::UInt128 numberedBlobHash(uint64_t blob)
+{
+    const DB::UInt128 value(blob);
+    return (value << 64) | value;
+}
+
+/// The `CityHash128` reference of numbered test blob `blob`.
+inline DB::Cas::BlobRef blobRefOf(uint64_t blob)
+{
+    return DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(numberedBlobHash(blob))};
+}
+
 /// Write a Blob object: a fixed-length (blob_header_len) envelope followed by the raw payload, keyed
 /// by content. Mirrors what PartWriteTxn::putBlob will emit (Task 11).
 inline DB::Cas::BlobRef writeBlobRaw(
@@ -803,8 +787,7 @@ inline void injectRetire(
                     .delete_pending = e.delete_pending,
                     .token = e.token,
                     .size = e.size,
-                    .condemn_round = condemn_round,
-                    .marker_confirmed = e.marker_confirmed});
+                    .condemn_round = condemn_round});
             }
             writer.finish();
             out.finalize();
@@ -846,7 +829,7 @@ inline void injectRetire(
 /// gc/state at it (snap_generation / snap_attempt / gc_shards), bypassing a real GC round. If a seal
 /// already exists at (generation, attempt) it is overwritten with the new summary (its other fields are
 /// preserved); otherwise a fresh minimal seal is created. Read-modify-CAS on gc/state preserves the lease.
-/// Used by graduationDue tests to drive the zero-I/O signal directly off a controlled seal.
+/// Used by rowDecisionDue tests to drive the zero-I/O signal directly off a controlled seal.
 inline void injectCondemnedSummarySeal(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
     uint64_t generation, uint64_t attempt, uint64_t gc_shards,
@@ -922,10 +905,9 @@ inline DB::Cas::RoundReport runRegularRoundReclaiming(DB::Cas::Gc & gc)
 
 /// Reclaim loop (the canonical retired-cursor pipeline driver): run regular rounds, renewing the store's
 /// own heartbeat after each round (`renewWatermarkOnce` — keeps the lease + build-watermark floor
-/// current; unrelated to graduation, which paces on GC rounds alone). A blob condemned at round K is
-/// deleted by round K+2 (condemn at K -> graduate to delete_pending at K+1, unconditionally -> physical
-/// delete at K+2). Returns true as soon as the blob became absent. Reclamation is the whole point of the
-/// loop, so every round it drives is an authoritative one.
+/// current). A blob condemned at round K, with its intent created in that round, loses its body at round
+/// K+1 and its intent at K+2. Returns true as soon as the body became absent. Reclamation is the whole
+/// point of the loop, so every round it drives is an authoritative one.
 inline bool runRoundsUntilAbsent(
     const DB::Cas::PoolPtr & store, DB::Cas::Gc & gc, DB::Cas::Backend & backend,
     const DB::Cas::Layout & layout, const DB::UInt128 & hash, int max_rounds = 8)
@@ -967,24 +949,19 @@ inline std::vector<DB::Cas::RetiredEntry> currentRetiredSet(
         if (run.shard != shard)
             continue;
         auto r = DB::Cas::openSourceEdgeRun(*operation, run.key);
-        String k;
-        String p;
-        while (r.next(k, p))
+        DB::Cas::SourceEdgeRecord rec;
+        while (r.next(rec))
         {
-            if (p.empty() || DB::Cas::runMarkerFromByte(p[0], "CAS test source-edge run") != DB::Cas::RunMarker::Condemned)
+            if (rec.marker != DB::Cas::RunMarker::Condemned)
                 continue;
-            DB::Cas::BlobRef ref;
-            DB::UInt128 source_id{};
-            DB::Cas::SourceEdgeKeyCodec::parse(k, ref, source_id);   // throws CORRUPTED_DATA on malformed (fail-closed)
-            const DB::Cas::CondemnedRow row = DB::Cas::decodeCondemnedRow(p);
             out.push_back(DB::Cas::RetiredEntry{
                 .kind = DB::Cas::ObjectKind::Blob,
-                .ref = ref,
-                .token = row.token,
-                .size = row.size,
-                .condemn_round = row.condemn_round,
-                .delete_pending = row.delete_pending,
-                .marker_confirmed = row.marker_confirmed});
+                .ref = rec.ref,
+                .token = rec.token,
+                .size = rec.size,
+                .condemn_round = rec.condemn_round,
+                .delete_pending = rec.delete_pending,
+                .standing = rec.standing});
         }
     }
     return out;
@@ -1086,7 +1063,8 @@ inline void seedPoolMetaForRestart(
     OperationForTest operation(backend);
     DB::Cas::PoolMeta::createOrValidate(
         *operation, layout, /*blob_header_len=*/256, gc_shards,
-        DB::Cas::BlobHashAlgo::CityHash128, /*allow_new=*/false, /*allow_mint=*/true);
+        DB::Cas::BlobHashAlgo::CityHash128, /*allow_new=*/false, /*allow_mint=*/true,
+        /*initial_min_reader_generation=*/DB::Cas::G_BLOB_INTENTS);
     if (!(*operation).read(layout.refCatalogKey(), DB::Cas::Retry::standard()))
         DB::Cas::CasRefCatalog::initializeEmptyForNewPool(*operation, layout);
     else
@@ -1138,48 +1116,65 @@ inline void writeRawBlobBody(DB::Cas::Backend & backend, const DB::Cas::Layout &
                 DB::Cas::Retry::standard());
 }
 
-/// These `UInt128`-hash meta-op wrappers are the pre-mixed-algo 128-bit-only test convenience surface:
-/// every existing caller operates on a 128-bit (`cityHash128`) test pool, so the ref is built at
-/// `CityHash128` here. The shared `.meta` API (Phase 3 T3) is `BlobRef`-keyed directly and derives its
-/// own codec internally — no codec is threaded from here anymore.
+/// The `CityHash128` blob ref of `hash`, for the legacy-marker helpers below.
 inline DB::Cas::BlobRef legacyMetaTestRef(const DB::UInt128 & hash)
 {
     return DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)};
 }
 
-/// Create a Clean meta descriptor for `hash` directly in a test backend. This setup helper deliberately
-/// stays usable before a `Pool` is open; production writes use `putMetaIfAbsent` through the controller.
+/// Create a Clean legacy marker for `hash` directly in a test backend, as a pool of an older generation holds
+/// it. A setup helper: it stays usable before a `Pool` is open.
 inline void writeMetaClean(DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
                            const DB::UInt128 & hash, uint64_t size)
 {
     const DB::Cas::BlobRef ref = legacyMetaTestRef(hash);
     OperationForTest op(backend);
-    (*op).create(layout.blobMetaKey(ref), DB::Cas::encodeBlobMeta(
+    (*op).create(layout.blobMetaKey(ref), DB::Cas::encodeBlobMetaForTest(
         DB::Cas::BlobMeta{.state = DB::Cas::MetaState::Clean, .condemn_round = 0, .size = size}), DB::Cas::Retry::standard());
 }
 
-/// Transition an existing meta descriptor to Condemned at `condemn_round`, via a read-modify-CAS on
-/// its current token (asserts the meta exists — a direct test setup helper, not production code).
+/// Transition an existing legacy marker to Condemned at `condemn_round`, by a replace over the incarnation just
+/// read (asserts the marker exists).
 inline void condemnMeta(DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
                         const DB::UInt128 & hash, uint64_t condemn_round)
 {
     const DB::Cas::BlobRef ref = legacyMetaTestRef(hash);
     OperationForTest operation(backend);
-    const auto lm = DB::Cas::loadMeta(*operation, layout, ref);
-    ASSERT_TRUE(lm.has_value());
-    DB::Cas::BlobMeta c = lm->meta;
+    const auto current = (*operation).read(layout.blobMetaKey(ref), DB::Cas::Retry::standard());
+    ASSERT_TRUE(current.has_value());
+    DB::Cas::BlobMeta c = DB::Cas::decodeBlobMeta(current->bytes);
     c.state = DB::Cas::MetaState::Condemned;
     c.condemn_round = condemn_round;
     ASSERT_TRUE(std::holds_alternative<DB::Cas::Committed>(
-        DB::Cas::casMeta(*operation, layout, ref, lm->etag, c)));
+        (*operation).replace(layout.blobMetaKey(ref), DB::Cas::encodeBlobMetaForTest(c), current->etag, DB::Cas::Retry::standard())));
 }
 
-/// Load the meta descriptor for `hash` via the shared ops layer (nullopt = absent).
-inline std::optional<DB::Cas::LoadedMeta> loadMetaForTest(DB::Cas::Backend & backend,
-                                                          const DB::Cas::Layout & layout, const DB::UInt128 & hash)
+/// The intent key of the body now at `ref`'s key; nullopt when the body is absent.
+inline std::optional<String> intentKeyOfCurrentBody(DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
+                                                    const DB::Cas::BlobRef & ref)
 {
     OperationForTest operation(backend);
-    return DB::Cas::loadMeta(*operation, layout, legacyMetaTestRef(hash));
+    const auto meta = (*operation).head(layout.blobKey(ref), DB::Cas::Retry::standard());
+    if (!meta)
+        return std::nullopt;
+    return layout.blobIntentKey(ref, *meta->etag.canonical());
+}
+
+/// Creates the deletion intent of the body now at `ref`'s key, as the round that condemned it would.
+inline void plantIntentForCurrentBody(DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::BlobRef & ref)
+{
+    const auto key = intentKeyOfCurrentBody(backend, layout, ref);
+    ASSERT_TRUE(key.has_value()) << "no body at " << layout.blobKey(ref);
+    OperationForTest operation(backend);
+    ASSERT_TRUE(std::holds_alternative<DB::Cas::Committed>(
+        (*operation).create(*key, DB::Cas::blobIntentRecord(), DB::Cas::Retry::standard())));
+}
+
+/// Whether `key` holds an object.
+inline bool objectPresent(DB::Cas::Backend & backend, const String & key)
+{
+    OperationForTest operation(backend);
+    return (*operation).read(key, DB::Cas::Retry::standard()).has_value();
 }
 
 /// The latest GC generation (snap_generation pointer in gc/state), or 0 when absent.
@@ -1240,18 +1235,10 @@ inline int64_t inDegreeInRuns(
     for (const DB::Cas::RunRef & run : runs)
     {
         auto r = DB::Cas::openSourceEdgeRun(*operation, run.key);
-        String k;
-        String p;
-        while (r.next(k, p))
-        {
-            if (p.empty() || DB::Cas::runMarkerFromByte(p[0], "CAS test source-edge run") != DB::Cas::RunMarker::Edge)
-                continue;
-            DB::Cas::BlobRef row_ref;
-            DB::UInt128 source_id{};
-            DB::Cas::SourceEdgeKeyCodec::parse(k, row_ref, source_id);   // throws CORRUPTED_DATA on malformed (fail-closed)
-            if (row_ref == ref)
+        DB::Cas::SourceEdgeRecord rec;
+        while (r.next(rec))
+            if (rec.marker == DB::Cas::RunMarker::Edge && rec.ref == ref)
                 ++degree;
-        }
     }
     return degree;
 }
@@ -2211,88 +2198,6 @@ private:
     std::function<void()> on_head;
 };
 
-/// Parks the first redelete apply of `target` until released. The parked leader has removed the body and has
-/// not yet scheduled its marker delete: the window a successor's rounds run in.
-struct ApplyParking
-{
-    std::atomic<bool> armed{false};
-    BlobRef target{};
-    ManualBarrier barrier;
-};
-
-/// Marker etags derived from the bytes, as S3 derives them: equal bytes carry equal etags, so a replaced
-/// marker's etag comes back when the same bytes are written again. Every other key keeps minted values.
-class ContentEtagBackend : public HeadHookBackend
-{
-public:
-    std::optional<Raw> read(const String & key, TransportAccess & access) override
-    {
-        auto raw = HeadHookBackend::read(key, access);
-        if (raw && isMarker(key))
-            raw->value = contentValue(raw->bytes);
-        return raw;
-    }
-
-    std::optional<RawMeta> head(const String & key, TransportAccess & access) override
-    {
-        auto meta = HeadHookBackend::head(key, access);
-        if (meta && isMarker(key))
-            if (const auto raw = InMemoryBackend::read(key, access))
-                meta->value = contentValue(raw->bytes);
-        return meta;
-    }
-
-    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
-    {
-        RawListPage page = HeadHookBackend::list(prefix, cursor, limit, access);
-        for (RawListedKey & listed : page.keys)
-            if (listed.value && isMarker(listed.key))
-                if (const auto raw = InMemoryBackend::read(listed.key, access))
-                    listed.value = contentValue(raw->bytes);
-        return page;
-    }
-
-    RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override
-    {
-        if (!isMarker(key))
-            return HeadHookBackend::remove(key, expected_value, access);
-        std::lock_guard lock(marker_mutex);
-        const auto current = InMemoryBackend::read(key, access);
-        if (!current)
-            return RawRemoval::Gone;
-        if (contentValue(current->bytes) != expected_value)
-            return RawRemoval::Mismatch;
-        return HeadHookBackend::remove(key, current->value, access);
-    }
-
-    std::expected<String, RawConflict> write(const String & key, const String & bytes,
-                                             const std::optional<String> & expected_value,
-                                             TransportAccess & access) override
-    {
-        if (!isMarker(key))
-            return HeadHookBackend::write(key, bytes, expected_value, access);
-        std::lock_guard lock(marker_mutex);
-        std::optional<String> minted_expected;
-        if (expected_value)
-        {
-            const auto current = InMemoryBackend::read(key, access);
-            if (!current || contentValue(current->bytes) != *expected_value)
-                return std::unexpected(RawConflict{});
-            minted_expected = current->value;
-        }
-        const auto written = HeadHookBackend::write(key, bytes, minted_expected, access);
-        if (!written)
-            return written;
-        return contentValue(bytes);
-    }
-
-private:
-    static bool isMarker(const String & key) { return key.ends_with(".meta"); }
-    static String contentValue(const String & bytes) { return "content-" + hexOf(bytes); }
-
-    std::mutex marker_mutex;
-};
-
 /// A `CountingBackend` that reports the given token dialect instead of `emulated`.
 class DialectOverrideBackend : public CountingBackend
 {
@@ -2902,139 +2807,6 @@ public:
         fail_read_once_key.clear();
     }
 };
-
-/// Fault decorator for the condemn-marker gate tests: while armed, every write against a blob `.meta`
-/// key throws. Every other write passes through. Armed by default; disarm
-/// (`fail_meta_writes = false`) to model the backend healing.
-///
-/// The fault's CLASS is chosen at arming, because the two classes model different failures and the
-/// engine treats them differently. `Propagates` is a local error the write loop rethrows on the first
-/// attempt, so the caller's own handler sees it at once. `Ambiguous` is a timeout the loop cannot
-/// distinguish from a lost response: it resolves by a read and reissues until its policy bound, so a
-/// test arming it against a PERMANENT fault must drive the operation's clock or spend the whole
-/// retry window in real time.
-class MetaWriteFaultBackend : public DB::Cas::InMemoryBackend
-{
-public:
-    enum class FaultKind : uint8_t { Propagates, Ambiguous };
-
-    /// Fault every `.meta` write with `kind`. Construction arms `Propagates`.
-    void armWriteFault(FaultKind kind = FaultKind::Propagates)
-    {
-        fault_kind.store(kind);
-        fail_meta_writes.store(true);
-    }
-
-    std::expected<String, RawConflict> write(const String & key, const String & bytes,
-                                             const std::optional<String> & expected_value,
-                                             DB::Cas::TransportAccess & access) override
-    {
-        if (fail_meta_writes.load() && key.ends_with(".meta"))
-        {
-            if (fault_kind.load() == FaultKind::Ambiguous)
-                throw Poco::TimeoutException("injected fault: blob meta write response lost");
-            throw std::runtime_error("injected fault: blob meta write lost");
-        }
-        return InMemoryBackend::write(key, bytes, expected_value, access);
-    }
-
-    std::atomic<bool> fail_meta_writes{true};
-
-private:
-    std::atomic<FaultKind> fault_kind{FaultKind::Propagates};
-};
-
-/// Blocks INSIDE a blob-meta mutation until `release` is called, so a test can hold a real meta job in
-/// flight and observe that it got there. `entered` is set before blocking.
-///
-/// STARTS DISARMED, and that is load-bearing: the write path itself writes Clean blob meta
-/// (`Pool/CasPartWriteTxn.cpp:314`), so a latch that blocked from construction would block the test's
-/// own fixture instead of the job under test. Call `arm` only once the fixture is built.
-class MetaWriteLatchBackend : public DB::Cas::InMemoryBackend
-{
-public:
-    std::atomic<bool> entered{false};
-
-    void arm()
-    {
-        armed.store(true);
-    }
-
-    void release()
-    {
-        std::lock_guard lock(latch_mutex);
-        released = true;
-        latch_cv.notify_all();
-    }
-
-    std::expected<String, RawConflict> write(const String & key, const String & bytes,
-                                             const std::optional<String> & expected_value,
-                                             DB::Cas::TransportAccess & access) override
-    {
-        waitIfMeta(key);
-        return InMemoryBackend::write(key, bytes, expected_value, access);
-    }
-
-    RawRemoval remove(const String & key, const String & expected_value,
-                      DB::Cas::TransportAccess & access) override
-    {
-        waitIfMeta(key);
-        return InMemoryBackend::remove(key, expected_value, access);
-    }
-
-private:
-    void waitIfMeta(const String & key)
-    {
-        if (!armed.load() || !key.ends_with(".meta"))
-            return;
-        entered.store(true);
-        std::unique_lock lock(latch_mutex);
-        latch_cv.wait(lock, [this] { return released; });
-    }
-
-    std::atomic<bool> armed{false};
-    std::mutex latch_mutex;
-    std::condition_variable latch_cv;
-    bool released = false;
-};
-
-/// Makes a GC round throw at its outcome-log write -- after the round has scheduled its confirmed-meta
-/// delete (`Gc/CasGc.cpp`) and before the round's meta-pool wait. Inherits the `.meta` latch so that
-/// job can be held in flight across the throw. Both the fault and the latch start off.
-class OutcomeLogFaultBackend : public MetaWriteLatchBackend
-{
-public:
-    std::atomic<bool> fail_outcome_logs{false};
-
-    std::expected<String, RawConflict> write(const String & key, const String & bytes,
-                                             const std::optional<String> & expected_value,
-                                             DB::Cas::TransportAccess & access) override
-    {
-        if (fail_outcome_logs.load() && key.contains("outcomes/"))
-            return std::unexpected(RawConflict{});
-        return MetaWriteLatchBackend::write(key, bytes, expected_value, access);
-    }
-
-    std::optional<Raw> read(const String & key, DB::Cas::TransportAccess & access) override
-    {
-        if (fail_outcome_logs.load() && key.contains("outcomes/"))
-            return std::nullopt;
-        return DB::Cas::InMemoryBackend::read(key, access);
-    }
-};
-
-/// Wait until a latched job has provably reached the backend. A bounded wait that FAILS rather than
-/// hangs: a job that never arrives is a broken fixture, and a test that hangs on it reports nothing.
-inline void awaitLatchEntered(MetaWriteLatchBackend & backend)
-{
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (!backend.entered.load())
-    {
-        ASSERT_LT(std::chrono::steady_clock::now(), deadline)
-            << "no meta job reached the backend latch -- the fixture never scheduled one";
-        std::this_thread::yield();
-    }
-}
 
 /// Runs a caller-supplied action ONCE, immediately before the named backend call, so a test can make
 /// the mount slot change inside a window `MountLeaseRenewer::claim` holds open. Each hook clears

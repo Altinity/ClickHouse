@@ -1,6 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasClock.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobHashingWriteBuffer.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
@@ -29,11 +28,8 @@ namespace ProfileEvents
     extern const Event CASBlobPublishAttemptFailed;
     extern const Event CASBlobPublishGaveUp;
     extern const Event CASBlobAdoptTrusted;
-    extern const Event CASMetaPut;
-    extern const Event CASMetaCompareSwap;
-    extern const Event CASMetaCreateClean;
-    extern const Event CASMetaAbsentRepublish;
-    extern const Event CASMetaResurrectClean;
+    extern const Event CASBlobReuseIntentPresent;
+    extern const Event CASBlobReuseTokenRejected;
 }
 
 namespace DB
@@ -70,6 +66,46 @@ UInt128 mintU128()
     const UInt64 hi = thread_local_rng();
     const UInt64 lo = thread_local_rng();
     return (static_cast<UInt128>(hi) << 64) | lo;
+}
+
+/// The exact read of an intent. A failure says which right it needs: without list rights S3 answers an absent key with
+/// 403, so every reuse fails instead of adopting.
+bool readBlobIntent(CasOperation & op, const Layout & layout, const BlobRef & ref, const CanonicalIdentity & identity,
+                    const Retry & policy)
+{
+    const String key = layout.blobIntentKey(ref, identity);
+    try
+    {
+        return op.read(key, policy).has_value();
+    }
+    catch (Exception & e)
+    {
+        e.addMessage("while reading the deletion intent `{}`; a writer needs GET and LIST on `{}`, and a store that denies "
+            "LIST answers 403 for an absent intent", key, layout.blobIntentsPrefix());
+        throw;
+    }
+}
+
+std::string_view publicationReasonWord(BlobPublicationReason reason)
+{
+    switch (reason)
+    {
+        case BlobPublicationReason::Absent: return "absent";
+        case BlobPublicationReason::IntentPresent: return "intent_present";
+        case BlobPublicationReason::TokenRejected: return "token_rejected";
+    }
+    UNREACHABLE();
+}
+
+std::string_view publicationReasonText(BlobPublicationReason reason)
+{
+    switch (reason)
+    {
+        case BlobPublicationReason::Absent: return "blob was absent after mandatory `HEAD`";
+        case BlobPublicationReason::IntentPresent: return "the observed incarnation has a deletion intent";
+        case BlobPublicationReason::TokenRejected: return "the observed token names no incarnation";
+    }
+    UNREACHABLE();
 }
 
 /// Rate-limited, because under an outage every blob of every write fails here; the counter has them all.
@@ -287,7 +323,7 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
     /// a dependency under an incarnation the precommit never saw. The build's own facts -- cancellation
     /// and a superseded writer epoch -- stay in `requireAlive`, where each states which one refused.
     CasOperation op = store->mountRequests().resume(txn_generation);
-    /// ONE bound for the whole publication loop, frozen before it starts: every HEAD and marker write
+    /// ONE bound for the whole publication loop, frozen before it starts: every HEAD and intent read
     /// below shares this deadline, so a body whose publication keeps coming back ambiguous is refused
     /// as retry-later inside one standard window instead of spending a fresh window per verb across
     /// eight iterations. The paced retry is a bare sleep that does not consult the deadline, so the
@@ -301,7 +337,6 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
     const BlobRef & ref = req.ref;
     const BlobSource & source = req.source;
     const String key = store->layout().blobKey(ref);
-    const String meta_key = store->layout().blobMetaKey(ref);
     const PoolMeta & pool_meta = store->poolMeta();
     const PoolConfig & pool_config = store->poolConfig();
 
@@ -330,79 +365,6 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
         return encodeEnvelopeHeader(header, static_cast<uint32_t>(pool_meta.blob_header_len));
     };
 
-    auto validateMetaSize = [&](const BlobMeta & observed)
-    {
-        if (observed.size != source.size)
-            throw Exception(
-                ErrorCodes::CORRUPTED_DATA,
-                "PartWriteTxn::ensureBlobPresent: metadata for {} declares logical size {}, expected {}",
-                key,
-                observed.size,
-                source.size);
-    };
-
-    /// Bring the freshness marker to `Clean`. A publication that followed an ABSENT observation has
-    /// nothing at the marker key to decide from, so its create IS the whole reconciliation; routing it
-    /// through a read-decide-write would spend a GET on every insert to learn what the create settles
-    /// for itself. A resurrect already READ the stale `Condemned` marker before it published, and the
-    /// incarnation that read observed is the precondition its compare-swap needs -- so it spends no
-    /// second GET either. Only a write that loses -- a racing writer's marker, a marker that moved
-    /// under the resurrect -- needs the read, and there the engine's own loop is what bounds the
-    /// retries at the policy's deadline instead of a fixed count of unpaced attempts.
-    auto reconcileMetaClean = [&](const std::optional<LoadedMeta> & loaded, BlobPublicationReason reason)
-    {
-        if (reason == BlobPublicationReason::Absent)
-            ProfileEvents::increment(ProfileEvents::CASMetaCreateClean);
-        else
-            ProfileEvents::increment(ProfileEvents::CASMetaResurrectClean);
-
-        const BlobMeta clean{.state = MetaState::Clean, .condemn_round = 0, .size = source.size};
-        const String what = fmt::format(
-            "PartWriteTxn::ensureBlobPresent: reconciling the freshness metadata of '{}' to `Clean` "
-            "after blob publication", key);
-
-        std::optional<WriteResult> first;
-        if (reason == BlobPublicationReason::Absent)
-        {
-            ProfileEvents::increment(ProfileEvents::CASMetaPut);
-            first = op.create(meta_key, encodeBlobMeta(clean), policy);
-        }
-        else if (loaded)
-        {
-            ProfileEvents::increment(ProfileEvents::CASMetaCompareSwap);
-            first = op.replace(meta_key, encodeBlobMeta(clean), loaded->etag, policy);
-        }
-        /// Anything but a lost race is this call's answer, and `orThrow` maps it exactly as it maps
-        /// the read-decide-write's own result.
-        if (first && !std::holds_alternative<Conflict>(*first))
-        {
-            orThrow(std::move(*first), what);
-            return;
-        }
-
-        orThrow(
-            op.readModifyWrite(
-                meta_key,
-                [&](const std::optional<Object> & current) -> std::optional<String>
-                {
-                    if (current)
-                    {
-                        const BlobMeta observed = decodeBlobMeta(current->bytes);
-                        validateMetaSize(observed);
-                        if (observed.state == MetaState::Clean)
-                            return std::nullopt;
-                        /// The same two choke points the standalone marker writes count on, so a
-                        /// reconciliation stays visible as a marker create or a marker compare-swap.
-                        ProfileEvents::increment(ProfileEvents::CASMetaCompareSwap);
-                    }
-                    else
-                        ProfileEvents::increment(ProfileEvents::CASMetaPut);
-                    return encodeBlobMeta(clean);
-                },
-                policy),
-            what);
-    };
-
     constexpr int max_publication_attempts = 8;
     /// Every exit by exception after a failed attempt gave up on the blob, the attempt cap and the
     /// loop's deadline alike.
@@ -423,7 +385,6 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             op.pause(Retry::backoff(attempt));
         const std::optional<Meta> present = op.head(key, policy);
         BlobPublicationReason reason = BlobPublicationReason::Absent;
-        std::optional<LoadedMeta> loaded;
 
         if (present)
         {
@@ -443,43 +404,64 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
                     logical_size,
                     source.size);
 
-            loaded = loadMeta(op, store->layout(), ref, policy);
-            if (loaded)
-                validateMetaSize(loaded->meta);
-
-            /// Only a `Clean` marker read after the `HEAD` permits adoption. GC deletes the marker right
-            /// after the body, so an absent marker may mean the body this `HEAD` saw is already gone.
-            if (loaded && loaded->meta.state == MetaState::Clean)
+            if (const std::optional<CanonicalIdentity> identity = present->etag.canonical())
             {
-                requireAdmitted("before the body-put-avoided observation is recorded");
-                ProfileEvents::increment(ProfileEvents::CASBlobBodyPutAvoided);
-                EventEmitter{*store}.emit([&](CasEvent & event)
+                /// Sent after this `HEAD` answered. A 404 does not prove no round condemned this incarnation: a transition
+                /// deletes the old intent after condemning. Adopting is safe because the edge was durable before the
+                /// `HEAD`, so the next destructive cut counts it.
+                if (readBlobIntent(op, store->layout(), ref, *identity, policy))
                 {
-                    event.type = CasEventType::BlobReuseAdopt;
-                    event.object_kind = CasEventObjectKind::Blob;
-                    event.object_hash = blobIdOf(ref);
-                    event.token = present->etag.render();
-                    event.outcome = "observed";
-                    event.reason = "a present blob with a `Clean` marker was observed after mandatory `HEAD`";
-                    event.detail = {{"action", "observed"}, {"size", std::to_string(source.size)}};
-                });
-                requireAdmitted("before the observed dependency proof is returned");
-                return BlobUploadResult{
-                    ref,
-                    BlobDepRecord{ObjectKind::Blob, BlobDependencyProof::Materialized, source.size},
-                    BlobUploadDiagnostics{BlobMaterializationAction::Observed, std::nullopt, std::nullopt}};
+                    reason = BlobPublicationReason::IntentPresent;
+                    ProfileEvents::increment(ProfileEvents::CASBlobReuseIntentPresent);
+                    EventEmitter{*store}.emit([&](CasEvent & event)
+                    {
+                        event.type = CasEventType::BlobReuseResurrect;
+                        event.object_kind = CasEventObjectKind::Blob;
+                        event.object_hash = blobIdOf(ref);
+                        event.token = present->etag.render();
+                        event.outcome = "intent_present";
+                        event.reason = "the observed incarnation has a deletion intent; publishing a fresh body";
+                    });
+                }
+                else
+                {
+                    requireAdmitted("before the body-put-avoided observation is recorded");
+                    ProfileEvents::increment(ProfileEvents::CASBlobBodyPutAvoided);
+                    EventEmitter{*store}.emit([&](CasEvent & event)
+                    {
+                        event.type = CasEventType::BlobReuseAdopt;
+                        event.object_kind = CasEventObjectKind::Blob;
+                        event.object_hash = blobIdOf(ref);
+                        event.token = present->etag.render();
+                        event.outcome = "observed";
+                        event.reason = "a present blob whose incarnation has no deletion intent was observed after mandatory `HEAD`";
+                        event.detail = {{"action", "observed"}, {"size", std::to_string(source.size)}};
+                    });
+                    requireAdmitted("before the observed dependency proof is returned");
+                    return BlobUploadResult{
+                        ref,
+                        BlobDepRecord{ObjectKind::Blob, BlobDependencyProof::Materialized, source.size},
+                        BlobUploadDiagnostics{BlobMaterializationAction::Observed, std::nullopt, std::nullopt}};
+                }
             }
-            if (loaded)
-                reason = BlobPublicationReason::Condemned;
             else
-                ProfileEvents::increment(ProfileEvents::CASMetaAbsentRepublish);
+            {
+                reason = BlobPublicationReason::TokenRejected;
+                ProfileEvents::increment(ProfileEvents::CASBlobReuseTokenRejected);
+                if (store->firstBlobTokenRejectionOfMount())
+                    LOG_ERROR(getLogger("CasPartWriteTxn"),
+                        "CAS blob {} has the token {}, which names no incarnation: such a body is never reused, so every "
+                        "write of its content uploads it again. Reported once per mount; CASBlobReuseTokenRejected counts all",
+                        key, present->etag.render());
+            }
         }
 
         const bool first_publication = source.beginPublication();
 
         BlobPublicationTransport transport;
         BlobPublication publication;
-        if (first_publication && reason == BlobPublicationReason::Absent && source.server_side_copy_from)
+        /// The verbatim copy is not hashed, so it never replaces a body this attempt saw.
+        if (first_publication && !present && source.server_side_copy_from)
         {
             transport = BlobPublicationTransport::ServerSideCopy;
             publication = VerbatimStagedBlobPublication{
@@ -539,7 +521,6 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             continue;
         }
 
-        reconcileMetaClean(loaded, reason);
         /// A publication may land just as this mount loses its fence. The bytes are harmless debris,
         /// but they cannot become dependency proof for the fenced transaction.
         requireAdmitted("before the publication is recorded");
@@ -549,12 +530,10 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             event.object_kind = CasEventObjectKind::Blob;
             event.object_hash = blobIdOf(ref);
             event.outcome = "published";
-            event.reason = reason == BlobPublicationReason::Absent
-                ? "blob or its marker was absent after mandatory `HEAD`"
-                : "blob was present but `Condemned` after mandatory `HEAD`";
+            event.reason = String(publicationReasonText(reason));
             event.detail = {
                 {"action", "published"},
-                {"publication_reason", reason == BlobPublicationReason::Absent ? "absent" : "condemned"},
+                {"publication_reason", String(publicationReasonWord(reason))},
                 {"transport", transport == BlobPublicationTransport::Streaming ? "streaming" : "server_side_copy"},
                 {"size", std::to_string(source.size)},
                 {"build_id", u128ToHex(build_id)}};
@@ -971,7 +950,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
 
             /// Blob-leaf revalidation. `Materialized` leaves are
             /// edge-protected — EDGE-BEFORE-OBSERVE: the precommit closure was durable BEFORE putBlob
-            /// observed them, so a condemnation in the putBlob→promote window cannot graduate (the next fold
+            /// observed them, so a condemnation in the putBlob→promote window cannot delete the body (the next fold
             /// sees the edge, d >= 1, spared), and putBlob's gate already validated them against the installed
             /// view under that edge. They are not re-checked here. `TrustedManifest` records a
             /// committed-source adoption. There is no per-file probe on this path: that leaf is trusted via the
@@ -993,14 +972,16 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
                     case BlobDependencyProof::Materialized:
                         continue;   /// edge-protected; putBlob validated under the durable edge
                     case BlobDependencyProof::TrustedManifest:
-                        /// §4 manifest-trust: a `TrustedManifest` leaf is trusted — no HEAD, no loadMeta, no
+                        /// §4 manifest-trust: a `TrustedManifest` leaf is trusted — no HEAD, no
                         /// copy-forward; the durable manifest edge is the liveness evidence. EDGE-BEFORE-TRUST: this
                         /// build's precommit edge was durably appended (`precommitAdd`, the `Precommit`
                         /// `OwnerTransition` above) BEFORE we get here, and the owner-liveness check at the top of this
                         /// closure ("WPromote owner==bld") already re-proved it is the LIVE owner — so the dst manifest
                         /// is a live precommit owner input and GC's fold pins every blob it names at in-degree >= 1
                         /// (the barrier-activated create-precommit +1). GC is the sole deleter and respects
-                        /// in-degree, so a trusted-promote leaf cannot have been condemned/deleted. The backstop for
+                        /// in-degree, so a trusted-promote leaf cannot have been condemned/deleted. That needs the caller
+                        /// of `adoptEvidence` to keep the source reference live until this precommit is durable; a source
+                        /// edge removed first could let a round delete the leaf before this edge exists. The backstop for
                         /// the (production-unreachable) genuinely-absent case is fsck's reachable-but-absent scan
                         /// (`CasFsck.cpp`, `++report.dangling`), not this gate.
                         ProfileEvents::increment(ProfileEvents::CASBlobAdoptTrusted);

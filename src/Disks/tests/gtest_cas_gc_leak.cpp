@@ -300,7 +300,7 @@ TEST(CASGCLeak, DroppedPartFullyReclaimed)
 
 /// NO-LEAK (republish): a blob incarnation A is published, dropped, and condemned by ONE GC
 /// round (retired, NOT yet deleted — it is still mid-pipeline). A fresh build then dedup-hits the SAME
-/// content hash: `putBlob` HEADs A, sees it condemned via the per-hash freshness meta point-read, and —
+/// content hash: `putBlob` HEADs A, finds the intent of A, and —
 /// per INV-1 (revival-from-source) — re-uploads a DISTINCT incarnation B at the same content-addressed key
 /// (fresh `incarnation_tag`, never a GET of the dying object A). B is referenced by a second ref, then
 /// that ref is dropped too. GC must fold B's own activation/removal exactly like any other incarnation
@@ -331,11 +331,8 @@ TEST(CASGCLeak, ResurrectReplacedIncarnationReclaimed)
     /// 3. ONE GC round: A transitions to in-degree 0 and is condemned (retired), NOT yet deleted.
     Gc gc(s, hexToU128("00000000000000000000000000000004"));
     DB::Cas::tests::runRegularRoundReclaiming(gc);
-    {
-        const auto lm = DB::Cas::tests::loadMetaForTest(*b, s->layout(), u128Of(P));
-        ASSERT_TRUE(lm.has_value() && lm->meta.state == MetaState::Condemned)
-            << "precondition: token A must be condemned before republication";
-    }
+    ASSERT_TRUE(DB::Cas::tests::objectPresent(*b, *DB::Cas::tests::intentKeyOfCurrentBody(*b, s->layout(), idOf(P))))
+        << "precondition: token A must be condemned before republication";
     ASSERT_TRUE(blobPresent(b, s->layout(), P)) << "A not yet deleted (still in the pipeline)";
 
     /// 4. RESURRECT: a fresh build dedup-hits P; putBlob sees A condemned -> re-uploads a DISTINCT
@@ -409,18 +406,11 @@ TEST(CASGCLeak, ResurrectReplacedReclaimIsIdempotent)
     EXPECT_EQ(after.dangling, 0u) << "idempotent extra rounds must never lose a reachable object";
 }
 
-/// WRITER-SIDE half of the republication-orphan fold: after the round that folds the replaced
-/// replaced incarnation B's dereference re-condemns B, a fresh writer dedup-hitting the SAME content hash
-/// must see B as condemned via the per-hash freshness meta point-read — never as an adoptable live token.
-/// If GC's bookkeeping instead kept treating B as adopt-eligible (the pre-fix bug), a concurrent writer's
-/// `putBlob` would adopt the being-reclaimed B rather than publish a fresh incarnation, racing the
-/// delete pipeline.
-///
-/// Depending on round timing, by the time the meta is checked B may be (a) still present and visibly
-/// condemned, or (b) already physically deleted by the delete pipeline (meta dropped alongside it) — BOTH
-/// outcomes prove B is never adoptable. The assertion only fails on the pre-fix shape: B present and NOT
-/// condemned.
-TEST(CASGCLeak, ResurrectReplacedTokenIsCondemnedInMeta)
+/// WRITER-SIDE half of the republication-orphan fold: after the round that folds the replaced incarnation
+/// B's dereference, B has an intent, so a fresh writer dedup-hitting the SAME content hash publishes a fresh
+/// incarnation instead of adopting the being-reclaimed B. B may also be gone already; either way it is never
+/// adoptable. The assertion only fails when B is present without an intent.
+TEST(CASGCLeak, ResurrectReplacedTokenHasAnIntent)
 {
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestPool(b);
@@ -448,8 +438,8 @@ TEST(CASGCLeak, ResurrectReplacedTokenIsCondemnedInMeta)
     /// 3. The round that folds B's dereference re-condemns token B.
     gc.runRegularRound();
 
-    const auto lm = DB::Cas::tests::loadMetaForTest(*b, s->layout(), u128Of(P));
-    EXPECT_TRUE((lm.has_value() && lm->meta.state == MetaState::Condemned) || !blobPresent(b, s->layout(), P))
+    const auto intent = DB::Cas::tests::intentKeyOfCurrentBody(*b, s->layout(), idOf(P));
+    EXPECT_TRUE(!intent || DB::Cas::tests::objectPresent(*b, *intent))
         << "the replaced incarnation B must be visible as condemned (or already reclaimed) so a "
            "dedup-hitting writer resurrects, not adopts";
 }

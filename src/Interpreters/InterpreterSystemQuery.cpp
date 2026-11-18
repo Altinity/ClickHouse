@@ -2550,9 +2550,9 @@ ColumnsDescription contentAddressedGcRoundColumns()
         {"objects_spared", std::make_shared<DataTypeUInt64>()},
         {"manifests_deleted", std::make_shared<DataTypeUInt64>()},
         {"entries_condemned", std::make_shared<DataTypeUInt64>()},
-        {"entries_graduated", std::make_shared<DataTypeUInt64>()},
-        {"entries_redeleted", std::make_shared<DataTypeUInt64>()},
-        {"entries_redelete_failed", std::make_shared<DataTypeUInt64>()},
+        {"entries_intent_confirmed", std::make_shared<DataTypeUInt64>()},
+        {"entries_bodies_deleted", std::make_shared<DataTypeUInt64>()},
+        {"entries_body_delete_failed", std::make_shared<DataTypeUInt64>()},
         {"fence_outs", std::make_shared<DataTypeUInt64>()},
         {"anomalies", std::make_shared<DataTypeUInt64>()},
         /// Task 7: the retire pipeline's REMAINING (not this-round-delta) sizes, read from the gc/state
@@ -2578,9 +2578,9 @@ void appendContentAddressedGcRoundRow(MutableColumns & res_columns, const String
     res_columns[i++]->insert(rep.spared);
     res_columns[i++]->insert(rep.manifests_deleted);
     res_columns[i++]->insert(rep.condemned);
-    res_columns[i++]->insert(rep.graduated);
-    res_columns[i++]->insert(rep.redeleted);
-    res_columns[i++]->insert(rep.redelete_failed);
+    res_columns[i++]->insert(rep.intent_confirmed);
+    res_columns[i++]->insert(rep.bodies_deleted);
+    res_columns[i++]->insert(rep.body_delete_failed);
     res_columns[i++]->insert(rep.fence_outs);
     res_columns[i++]->insert(rep.anomalies.size());
     res_columns[i++]->insert(rep.pending_candidates);
@@ -2682,6 +2682,18 @@ ColumnsDescription contentAddressedFsckColumns()
         {"referenced_logical_bytes", std::make_shared<DataTypeUInt64>()},
         {"distinct_blobs", std::make_shared<DataTypeUInt64>()},
         {"total_blob_refs", std::make_shared<DataTypeUInt64>()},
+        /// The deletion-intent counters and the legacy markers. `intent_malformed`, `intent_unread` and
+        /// `pending_without_intent` are terms of `clean`; the others are informational. A SQL scan classifies
+        /// intents from the listing alone: the per-intent verdicts (`intent_current`, `intent_replaced`,
+        /// `intent_body_gone`) and `legacy_markers_deleted` belong to `cas-fsck --verify-intents` and `--fix`.
+        {"intent_listed", std::make_shared<DataTypeUInt64>()},
+        {"intent_malformed", std::make_shared<DataTypeUInt64>()},
+        {"intent_unread", std::make_shared<DataTypeUInt64>()},
+        {"pending_without_intent", std::make_shared<DataTypeUInt64>()},
+        {"pending_intent_absent", std::make_shared<DataTypeUInt64>()},
+        {"pending_token_rejected", std::make_shared<DataTypeUInt64>()},
+        {"standing_present", std::make_shared<DataTypeUInt64>()},
+        {"legacy_marker", std::make_shared<DataTypeUInt64>()},
     }};
 }
 
@@ -2708,6 +2720,14 @@ void appendContentAddressedFsckRow(MutableColumns & res_columns, const String & 
     res_columns[i++]->insert(rep.referenced_logical_bytes);
     res_columns[i++]->insert(rep.distinct_blobs);
     res_columns[i++]->insert(rep.total_blob_refs);
+    res_columns[i++]->insert(rep.intent_listed);
+    res_columns[i++]->insert(rep.intent_malformed);
+    res_columns[i++]->insert(rep.intent_unread);
+    res_columns[i++]->insert(rep.pending_without_intent);
+    res_columns[i++]->insert(rep.pending_intent_absent);
+    res_columns[i++]->insert(rep.pending_token_rejected);
+    res_columns[i++]->insert(rep.standing_present);
+    res_columns[i++]->insert(rep.legacy_marker);
 }
 
 }

@@ -7,6 +7,7 @@
 #include "cas_sweep_test_support.h"
 #include "cas_test_helpers.h"
 
+#include <algorithm>
 #include <vector>
 
 using namespace DB::Cas;
@@ -266,6 +267,42 @@ TEST(CASSweepDeletionPremise, ConsecutiveRoundsSurviveAnOrphanOfAnEmptyRefStream
     /// rounds above reached the premise rather than skipping the sweep.
     const ManifestSweepResult page = sweepManifestCursorPageForTest(*f.store, "", /*list_budget*/100, /*delete_budget*/10);
     EXPECT_EQ(page.retained_unconsumed_seal, 1u);
+}
+
+/// The retention summary's total covers every class the "most of them" figure ranks, the work-budget class
+/// included (otherwise the line reads "2 of 1"), and the `orphan_sweep` phase row reports that class too.
+TEST(CASSweepDeletionPremise, TheRetentionSummaryAndPhaseRowCountTheWorkBudgetClass)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
+                                                .gc_round_sweep_namespace_budget = 1, .gc_fold_max_defer_rounds = 0});
+    const Layout & layout = store->layout();
+    setWatermarkMinActive(*backend, layout, kServerRoot, kBuildEpoch, /*min_active_build_sequence*/6);
+    for (const char * name : {"00/aa@cas@", "00/bb@cas@", "00/cc@cas@"})
+    {
+        const RootNamespace ns{name};
+        casAdmitRecoverableEntry(*backend, layout, ns);
+        writeManifestRaw(*backend, layout, ns, ref(5, 0xAB), {blobEntryFor("a", DB::UInt128(1))});
+    }
+
+    ScopedLogCapture capture("CasGc", "information");
+    Gc gc(store, hexToU128("00000000000000000000000000000001"));
+    std::vector<GcPhaseRecord> phases;
+    gc.setPhaseSink([&](const GcPhaseRecord & phase) { phases.push_back(phase); });
+    const RoundReport report = runRegularRoundReclaiming(gc);
+    ASSERT_TRUE(report.acquired_lease);
+    ASSERT_FALSE(report.deferred);
+
+    /// One namespace gets a view and is retained for lack of coverage; the two beyond the cap are
+    /// retained on the work budget, and the phase row carries both counts.
+    const auto sweep_phase = std::find_if(phases.begin(), phases.end(),
+        [](const GcPhaseRecord & phase) { return phase.phase == "orphan_sweep"; });
+    ASSERT_NE(sweep_phase, phases.end());
+    ASSERT_TRUE(sweep_phase->metrics.contains("retained_work_budget"));
+    EXPECT_EQ(sweep_phase->metrics.at("retained_work_budget"), 2u);
+    EXPECT_EQ(sweep_phase->metrics.at("retained_no_coverage"), 1u);
+    EXPECT_EQ(capture.count("retained 3 manifest body(ies) this pass, most of them (2 of 3) for 'work_budget_exhausted'"), 1u)
+        << capture.captured();
 }
 
 /// Both sweep paths call the ONE predicate: the cursor-paced page must refuse the same body the

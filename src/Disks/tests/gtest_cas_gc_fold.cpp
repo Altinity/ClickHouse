@@ -532,8 +532,8 @@ TEST(CASGCFold, SingleAnomalySuppressesEveryDestructiveActionInTheRound)
     /// The clamp suppresses the WHOLE destructive pipeline this round: no deletes, no redeletes, and
     /// A's `-1` stays unadopted (its body must survive, else the re-fold clamps on it forever).
     EXPECT_EQ(rep.deleted, 0u);
-    EXPECT_EQ(rep.redeleted, 0u);
-    EXPECT_EQ(rep.graduated, 0u);
+    EXPECT_EQ(rep.bodies_deleted, 0u);
+    EXPECT_EQ(rep.intent_confirmed, 0u);
     EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, a})));
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1);
 }
@@ -619,8 +619,8 @@ TEST(CASGCFold, RoundSideAnomalySuppressesRefLogCleanupWhileRemovalDebrisStaysJa
     const RoundReport rep = runRegularRoundReclaiming(gc);
     ASSERT_TRUE(rep.hasAnomaly(ns_clamp, /*shard*/0)) << "the missing B body must clamp this round";
     EXPECT_EQ(rep.deleted, 0u);
-    EXPECT_EQ(rep.redeleted, 0u);
-    EXPECT_EQ(rep.graduated, 0u);
+    EXPECT_EQ(rep.bodies_deleted, 0u);
+    EXPECT_EQ(rep.intent_confirmed, 0u);
 
     /// Removal folding never performs lifecycle-specific physical cleanup, with or without a clamp.
     EXPECT_TRUE(headExists(*backend, debris_manifest_key))

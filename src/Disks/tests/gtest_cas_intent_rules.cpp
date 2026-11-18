@@ -691,3 +691,158 @@ TEST(CASIntentRules, HeadClassification)
     EXPECT_EQ(classifyDecisionHead(std::optional<Meta>(w)).seen(), HeadSeen::Uncanonical);
     EXPECT_EQ(classifyDecisionHead(std::optional<Meta>()).seen(), HeadSeen::Absent);
 }
+
+namespace
+{
+
+const DB::UInt128 kGcId = DB::UInt128(1);
+
+struct IntentDeleteFixture
+{
+    std::shared_ptr<BatchCapabilityBackend> backend = std::make_shared<BatchCapabilityBackend>();
+    PoolPtr store;
+    std::unique_ptr<Gc> gc;
+    std::vector<WriteOnceKey> keys;
+
+    explicit IntentDeleteFixture(size_t key_count, bool create = true)
+    {
+        store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_bulk_delete_chunk_keys = 2});
+        gc = std::make_unique<Gc>(store, kGcId);
+        const CanonicalIdentity identity{Dialect::Emulated, "616263"};
+        OperationForTest op(*backend);
+        for (uint64_t i = 1; i <= key_count; ++i)
+        {
+            keys.push_back(store->layout().writeOnceBlobIntentKey(blobRef(i), identity));
+            if (create)
+                EXPECT_TRUE(std::holds_alternative<Committed>((*op).create(keys.back().str(), blobIntentRecord(), Retry::once())));
+        }
+        backend->clearJournal();
+    }
+
+    std::vector<std::vector<String>> removeRequests() const
+    {
+        std::vector<std::vector<String>> out;
+        for (const auto & entry : backend->journal())
+            if (entry.verb == JournalVerb::RemoveMany)
+                out.push_back(entry.keys);
+        return out;
+    }
+
+    bool anyPresent()
+    {
+        OperationForTest op(*backend);
+        for (const auto & key : keys)
+            if ((*op).head(key.str(), Retry::once()))
+                return true;
+        return false;
+    }
+};
+
+/// Fails every `removeManyWriteOnce` whose first key is `failing_key`, with `error`.
+class FailingChunkBackend : public BatchCapabilityBackend
+{
+public:
+    void failChunkStartingAt(const String & key, std::function<void()> raise)
+    {
+        failing_key = key;
+        raise_error = std::move(raise);
+    }
+
+    void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access) override
+    {
+        if (!keys.empty() && keys.front().str() == failing_key)
+            raise_error();
+        BatchCapabilityBackend::removeManyWriteOnce(keys, access);
+    }
+
+private:
+    String failing_key;
+    std::function<void()> raise_error;
+};
+
+void expectChunkFailureNamesItsKey(const std::function<void()> & raise)
+{
+    auto backend = std::make_shared<FailingChunkBackend>();
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_bulk_delete_chunk_keys = 2});
+    Gc gc(store, kGcId);
+    std::vector<WriteOnceKey> keys;
+    for (uint64_t i = 1; i <= 5; ++i)
+        keys.push_back(store->layout().writeOnceBlobIntentKey(blobRef(i), CanonicalIdentity{Dialect::Emulated, "616263"}));
+    backend->failChunkStartingAt(keys[2].str(), raise);
+
+    FakeClock clock;
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), nullptr, kDefaultRequestWindowMs);
+    CasOperation op = requests.admit();
+    try
+    {
+        gc.sendIntentDeletes(op, keys);
+        FAIL() << "the failed chunk did not throw";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_NE(e.message().find(keys[2].str()), String::npos) << e.message();
+    }
+    EXPECT_EQ(backend->requestSizes(), std::vector<size_t>{2})
+        << "the chunk before the failed one was sent, and none after it";
+}
+
+}
+
+TEST(CASGcIntentDeletes, ChunksShareOneBatchRequest)
+{
+    IntentDeleteFixture f(5);
+    OperationForTest op(*f.backend);
+    f.gc->sendIntentDeletes(*op, f.keys);
+
+    const auto requests = f.removeRequests();
+    ASSERT_EQ(requests.size(), 3u);
+    EXPECT_EQ(requests[0], (std::vector<String>{f.keys[0].str(), f.keys[1].str()}));
+    EXPECT_EQ(requests[1], (std::vector<String>{f.keys[2].str(), f.keys[3].str()}));
+    EXPECT_EQ(requests[2], (std::vector<String>{f.keys[4].str()}));
+    EXPECT_FALSE(f.anyPresent());
+}
+
+TEST(CASGcIntentDeletes, AbsentKeyIsSuccess)
+{
+    IntentDeleteFixture f(3, /*create=*/ false);
+    ASSERT_FALSE(f.anyPresent()) << "positive control: no key exists";
+    OperationForTest op(*f.backend);
+    EXPECT_NO_THROW(f.gc->sendIntentDeletes(*op, f.keys));
+    EXPECT_EQ(f.removeRequests().size(), 2u) << "the deletes were sent";
+}
+
+TEST(CASGcIntentDeletes, RefusedChunkThrowsNamingAKey)
+{
+    expectChunkFailureNamesItsKey([] { throw Poco::TimeoutException("the response was lost"); });
+#if USE_AWS_S3
+    expectChunkFailureNamesItsKey([]
+    {
+        throw DB::S3Exception("simulated denial", Aws::S3::S3Errors::ACCESS_DENIED, "AccessDenied");
+    });
+#endif
+}
+
+TEST(CASGcIntentDeletes, AbsentKeyIsSuccessOneByOne)
+{
+    IntentDeleteFixture f(3, /*create=*/ false);
+    f.backend->setStoreRejectsBatches(true);
+    ASSERT_FALSE(f.anyPresent()) << "positive control: no key exists";
+    OperationForTest op(*f.backend);
+    EXPECT_NO_THROW(f.gc->sendIntentDeletes(*op, f.keys));
+    EXPECT_EQ(f.removeRequests().size(), 3u) << "one delete per key was sent";
+}
+
+TEST(CASGcIntentDeletes, OneByOneOnAStoreWithoutBatchDelete)
+{
+    IntentDeleteFixture f(5);
+    f.backend->setStoreRejectsBatches(true);
+    OperationForTest op(*f.backend);
+    f.gc->sendIntentDeletes(*op, f.keys);
+
+    const auto requests = f.removeRequests();
+    ASSERT_EQ(requests.size(), 5u);
+    for (size_t i = 0; i < requests.size(); ++i)
+        EXPECT_EQ(requests[i], std::vector<String>{f.keys[i].str()});
+    EXPECT_GT(f.backend->callSizes().size(), requests.size()) << "positive control: a batch was refused first";
+    EXPECT_FALSE(f.anyPresent());
+}

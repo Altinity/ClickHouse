@@ -33,7 +33,8 @@ enum class FsckClass : uint8_t
     /// The GC pipeline deletes present-but-unreferenced blobs in explicit stages, so these classes
     /// distinguish expected in-flight work from an object outside the GC view. They are labels only,
     /// never inputs to reachability.
-    PendingGc,     /// listed in the retired set (condemned / delete_pending) — deletion is scheduled; EXPECTED
+    PendingGc,     /// has a `candidate` or `pending` row for the body present now — deletion is scheduled; EXPECTED. A
+                   /// `pending` row is counted here only after its deletion intent was read and found.
     AwaitingGc,    /// edges still in the GC snapshot (drop/reclaim not folded yet) or GC never ran — EXPECTED
     Unaccounted,   /// absent from the whole GC view — transient for a fast create+drop between rounds;
                    /// PERSISTENT occurrences should be impossible (INV-2 reachability-before-content)
@@ -66,6 +67,29 @@ enum class FsckClass : uint8_t
                    /// exact-deleting a `Removing` catalog row and the perpetual `NamespaceJanitor`
                    /// reaching this key on a later bounded page -- inert debris, not damage. Reported
                    /// as a soft finding: NOT in `kFsckHardFindings`, does not fail the report.
+    /// The five verdicts on a deletion intent (`blob-intents/`). The key names the blob incarnation the
+    /// intent warns about; the verdict compares it with the body now at the blob's key. An intent outlives
+    /// its body until GC removes it, so a missing body is the normal state of a deleted blob. The first
+    /// three need the per-intent reads of a verifying scan (`verify_intents`); a plain scan classifies an
+    /// intent from its key alone.
+    IntentCurrent,   /// the body present now is the incarnation the intent names
+    IntentReplaced,  /// the body present now is another incarnation; GC removes this intent later
+    IntentBodyGone,  /// no body at the blob's key; GC removes the intent in a later round
+    IntentMalformed, /// the key is not an intent key, or (verifying scan) the bytes are not the intent record. ERROR
+    IntentUnread,    /// a read or a `HEAD` failed, or the body's token has no canonical identity: the scan could
+                     /// not verify what it was asked to. ERROR
+    /// A `pending` row is the one state in which GC deletes a body without re-reading the intent, so the
+    /// intent of every `pending` row is read.
+    PendingWithoutIntent,  /// a `pending` row, its intent absent, the body present with the row's token: GC would
+                           /// delete a body no writer is warned about. ERROR
+    PendingIntentAbsent,   /// a `pending` row, its intent absent, the body absent or another token: the row is about
+                           /// to become `standing` or to move; nothing is at risk
+    PendingTokenRejected,  /// a `pending` row whose token has no canonical identity: no intent key exists for it
+    StandingPresent,       /// a `standing` row, the body present with the row's token: GC records it and deletes
+                           /// nothing; the intent is present, so a writer publishes fresh
+    /// A `.meta` object left from the marker protocol. Nothing reads it; `cas-migrate-pool` removes it
+    /// and `--fix legacy-markers` can.
+    LegacyMarker,
 };
 
 /// One object or integrity finding emitted in detailed mode, or emitted for every missing reachable
@@ -102,18 +126,37 @@ struct FsckReport
     /// Blobs whose every remaining source edge names a manifest that no longer exists — permanently
     /// stuck at a nonzero in-degree, unreclaimable by the incremental GC. A hard ERROR (see
     /// `FsckClass::StaleEdge`). Populated only in `detail` mode: naming the live sources costs one GET
-    /// per manifest body, and the cheap summary path must stay request-for-request unchanged.
+    /// per manifest body, which the summary path does not pay.
     uint64_t stale_edge = 0;
 
-    /// The per-hash `.meta` descriptor sibling of a blob body:
-    /// pairing check between the `blobs/` physical listing's `.meta` keys and its body keys.
-    /// ADVISORY, not a hard finding: GC deletes the body FIRST and then drops the `.meta` on a bounded,
-    /// error-suppressed advisory pool that runs strictly after (and may drop the op — see `CasGc`), so a
-    /// single raw LIST legitimately observes a body-less `.meta` mid-graduation and NO finite grace makes
-    /// a persistent one hard evidence. Counted and reported; excluded from `clean()`.
-    uint64_t meta_without_body = 0;   /// a `.meta` object with no body — INV-META-BODY advisory
-    uint64_t body_without_meta = 0;   /// a body with no `.meta` — a not-yet-adopted or interrupted-birth
-                                       /// artifact; benign, NOT a dangle
+    /// Deletion intents under `blob-intents/` (see the `Intent*` classes of `FsckClass`). `intent_malformed`
+    /// and `intent_unread` are hard findings; the others are informational. A scan with a namespace scope
+    /// lists no intents and leaves them all at zero.
+    uint64_t intent_listed = 0;      /// intents whose key parses (a plain scan counts them and reads none)
+    uint64_t intent_current = 0;     /// the next three only in a verifying scan
+    uint64_t intent_replaced = 0;
+    uint64_t intent_body_gone = 0;
+    uint64_t intent_malformed = 0;
+    /// Reads or `HEAD`s of a deletion intent or its body that failed. A hard finding: the scan could not
+    /// verify what it was asked to, and a refused prefix would otherwise read as a clean pool.
+    uint64_t intent_unread = 0;
+    String intent_unread_reason;     /// the first failure: error code and message, shortened
+    bool intents_verified = false;   /// the scan ran the per-intent verification
+
+    /// `pending` rows whose present body is the row's incarnation (see the `Pending*` classes of `FsckClass`).
+    /// `pending_without_intent` is a hard finding.
+    uint64_t pending_without_intent = 0;
+    uint64_t pending_intent_absent = 0;
+    uint64_t pending_token_rejected = 0;
+    /// `standing` rows over a body that is present with the row's token. Counted apart from `pending_gc`:
+    /// advisory, the report stays clean.
+    uint64_t standing_present = 0;
+
+    /// `.meta` objects of the marker protocol found under `blobs/`: debris, informational. The pairing
+    /// of bodies with markers no longer exists. `legacy_markers_deleted` counts the ones a fix run removed.
+    uint64_t legacy_marker = 0;
+    uint64_t legacy_markers_deleted = 0;
+    uint64_t legacy_markers_changed = 0;   /// replaced between the fix's `HEAD` and its delete, and left
 
     /// GC source-edge runs whose whole-file seal checksum did not match the stored bytes. Cataloged
     /// with the run key in `objects`; the audit CONTINUES — a read-only auditor
@@ -171,9 +214,8 @@ struct FsckReport
     double dedupRatio() const { return distinct_blobs ? double(total_blob_refs) / double(distinct_blobs) : 0.0; }
 
     /// Return whether the scan found no missing reachable object or hard integrity violation. Expected
-    /// GC backlog classes do not make a report unclean, and `meta_without_body` is advisory (see its
-    /// field: GC's body-then-meta delete ordering makes a body-less `.meta` a legitimate transient with
-    /// no finite hard horizon); a partial report only covers the visited subset. `stale_edge` is a hard
+    /// GC backlog classes do not make a report unclean, and neither do the informational intent classes
+    /// or `legacy_marker`; a partial report only covers the visited subset. `stale_edge` is a hard
     /// finding, but it is only ever nonzero in `detail` mode — a clean summary report says nothing about
     /// stale edges, exactly as a partial report says nothing about the unvisited part of the pool.
     /// `chain_broken` is a hard finding in every mode. `unchecked` deliberately is NOT one: it says the
@@ -207,6 +249,9 @@ inline constexpr std::array kFsckHardFindings{
     FsckHardFinding{"stale_edge", &FsckReport::stale_edge},
     FsckHardFinding{"chain_broken", &FsckReport::chain_broken},
     FsckHardFinding{"lifeless_keys", &FsckReport::lifeless_keys},
+    FsckHardFinding{"intent_malformed", &FsckReport::intent_malformed},
+    FsckHardFinding{"intent_unread", &FsckReport::intent_unread},
+    FsckHardFinding{"pending_without_intent", &FsckReport::pending_without_intent},
 };
 
 /// TRIPWIRE. A hard finding has to reach three CODE surfaces, and each has been forgotten at least once:
@@ -240,7 +285,7 @@ inline constexpr std::array kFsckHardFindings{
 /// than once, about the exit set -- and nothing here can break a build over them. (No count is given,
 /// for the same reason the paragraph above gives none: nobody keeping a tally of restatements can
 /// promise its own count will not go stale next.) They are a fourth surface, unfenced by construction.
-static_assert(kFsckHardFindings.size() == 5,
+static_assert(kFsckHardFindings.size() == 8,
     "A hard finding was added to or removed from `kFsckHardFindings`, which is `FsckReport::clean`. "
     "Before updating this count, render it in ALL THREE code surfaces: `formatFsckSummary`'s line, "
     "`CommandFsck::executeImpl`'s nonzero-exit set, and `contentAddressedFsckColumns` + "
@@ -257,7 +302,12 @@ inline bool FsckReport::clean() const
 }
 
 /// Independently recompute reachability from authoritative refs (never from GC state or snapshots) and
-/// diff it against a raw object listing. The operation is read-only; `detail` populates per-object rows.
+/// diff it against a raw object listing. The operation is read-only unless `fix` is set; `detail`
+/// populates per-object rows. A plain scan classifies deletion intents from the listing alone; it reads
+/// the intent of each `pending` row. `verify_intents` adds, per intent, a `GET` of its bytes and a
+/// `HEAD` of its body (two requests per intent) for the `Intent*` verdicts. `fix_legacy_markers` deletes each legacy
+/// marker found with `removeLegacyMarkers`, through the scan's own read-only open (no mount, no lease), and needs a
+/// scan without `namespace_prefix`. It is the scan's only repair: nothing deletes an intent or a body.
 /// `deadline`, if set, bounds the WHOLE scan: it is checked between list pages and reachability
 /// refs, throwing `TIMEOUT_EXCEEDED` if exceeded (a slow-but-progressing scan surfaces a clear
 /// error instead of an opaque hang) — unless `partial_on_deadline` is set, in which case the
@@ -267,7 +317,8 @@ inline bool FsckReport::clean() const
 /// prefix and skips the pool-wide unreachable classification (dangling-only mode).
 FsckReport runFsck(Pool & store, bool detail, FsckProgress on_progress = {},
                    std::optional<std::chrono::steady_clock::time_point> deadline = {},
-                   bool partial_on_deadline = false, const String & namespace_prefix = {});
+                   bool partial_on_deadline = false, const String & namespace_prefix = {},
+                   bool fix_legacy_markers = false, bool verify_intents = false);
 
 /// Render the single machine-parseable summary line (no trailing newline). This is the ONLY view of a
 /// report most consumers ever get -- the soak harness parses it, CI greps it, an operator reads it -- so
@@ -280,5 +331,20 @@ FsckReport runFsck(Pool & store, bool detail, FsckProgress on_progress = {},
 /// printed, never omitted: "absent" and "zero" are different facts, and consumers (e.g. the harness's
 /// `stale_edge_verdict`) fail closed on absence by design.
 String formatFsckSummary(const FsckReport & report);
+
+struct LegacyMarkerRemoval
+{
+    uint64_t removed = 0;
+    uint64_t changed = 0;   /// replaced between its `HEAD` and the delete, and left
+};
+
+/// The one removal of legacy markers, for `cas-migrate-pool` and `cas-fsck --fix legacy-markers`. Of `keys` it deletes
+/// only those `Layout::parseLegacyMarkerKey` accepts, each by a `HEAD` and a delete conditional on the token that `HEAD`
+/// saw, at most `concurrency` at a time; a marker replaced in between is left and counted. No server of generation 4
+/// reads a marker, so servers may run meanwhile. A refused or unanswered delete, or an expired `deadline`, throws with
+/// the count deleted so far; a rerun continues. `on_progress` gets the running count after each batch.
+LegacyMarkerRemoval removeLegacyMarkers(Pool & pool, const std::vector<String> & keys, size_t concurrency = 1,
+                                        const std::optional<std::chrono::steady_clock::time_point> & deadline = {},
+                                        const std::function<void(uint64_t)> & on_progress = {});
 
 }

@@ -42,15 +42,12 @@ extern const int LOGICAL_ERROR;
 
 using namespace DB::Cas;
 using DB::Cas::tests::blobEntryFor;
-using DB::Cas::tests::condemnMeta;
 using DB::Cas::tests::displaceBlobToken;
 using DB::Cas::tests::idOf;
 using DB::Cas::tests::injectRetire;
-using DB::Cas::tests::loadMetaForTest;
 using DB::Cas::tests::streamingHexOf;
 using DB::Cas::tests::u128Of;
 using DB::Cas::tests::writeBlobRaw;
-using DB::Cas::tests::writeMetaClean;
 
 namespace
 {
@@ -193,7 +190,6 @@ TEST(CASProtocol, RevalidateReObservesStaleTokenKeepsWhenUnchanged)
 
     /// X and its `Clean` marker pre-exist out-of-band; the build dedup-adopts X via putBlob (token t0).
     writeBlobRaw(*b, s->layout(), "payload-X", s->poolMeta().blob_header_len, s->poolMeta().pool_id);
-    writeMetaClean(*b, s->layout(), u128Of("payload-X"), 9);
     const String blob_key = s->layout().blobKey(idOf("payload-X"));
     const Etag t0 = currentIncarnation(*b, blob_key);
 
@@ -226,7 +222,6 @@ TEST(CASProtocol, RevalidateReObservesStaleTokenAdoptsWhenDisplaced)
     const RootNamespace ns{"srv1/tbl"};
 
     writeBlobRaw(*b, s->layout(), "payload-X", s->poolMeta().blob_header_len, s->poolMeta().pool_id);
-    writeMetaClean(*b, s->layout(), u128Of("payload-X"), 9);
     const String blob_key = s->layout().blobKey(idOf("payload-X"));
     const Etag t0 = currentIncarnation(*b, blob_key);
 
@@ -272,7 +267,6 @@ TEST(CASProtocol, RevalidateAdoptsLiveTokenWhenOnlyPhantomCondemnedAtDifferentTo
     {
         auto s0 = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
         writeBlobRaw(*b, s0->layout(), "payload-X", s0->poolMeta().blob_header_len, s0->poolMeta().pool_id);
-        writeMetaClean(*b, s0->layout(), u128Of("payload-X"), 9);
     }
     const String blob_key = layout.blobKey(idOf("payload-X"));
     const Etag t0 = currentIncarnation(*b, blob_key);
@@ -332,8 +326,8 @@ TEST(CASProtocol, EvidenceHitCondemnedPresentBlobCopiesForwardInClosure)
     const ManifestId id = build->stageManifest({entry});
     build->precommitAdd(ns, "part_1", id);
 
-    /// GC condemns X's hash in round 1 via the meta — under §4 the promote gate never reads it.
-    condemnMeta(*b, s->layout(), hexToU128(hex), /*condemn_round*/ 1);
+    /// GC condemns X's incarnation (its intent exists); the promote gate never reads it.
+    DB::Cas::tests::plantIntentForCurrentBody(*b, s->layout(), DB::Cas::tests::legacyMetaTestRef(hexToU128(hex)));
 
     /// promote: the adopted leaf is trusted ⇒ commit, no probe, no displacement.
     EXPECT_NO_THROW(build->promote(ns, "part_1", build->buildId(), id));
@@ -342,10 +336,9 @@ TEST(CASProtocol, EvidenceHitCondemnedPresentBlobCopiesForwardInClosure)
     EXPECT_TRUE(s->resolveRef(ns, "part_1").has_value());
     EXPECT_EQ(currentIncarnation(*b, blob_key), t0) << "trust must not displace the adopted blob";
 
-    /// The meta is untouched — still Condemned (the gate never reads or flips it under trust).
-    const auto lm_after = loadMetaForTest(*b, s->layout(), hexToU128(hex));
-    ASSERT_TRUE(lm_after.has_value());
-    EXPECT_EQ(lm_after->meta.state, MetaState::Condemned) << "trust must not flip the meta";
+    /// The intent is untouched (the gate never reads or removes it under trust).
+    EXPECT_TRUE(DB::Cas::tests::objectPresent(*b, *DB::Cas::tests::intentKeyOfCurrentBody(*b, s->layout(), seeded_ref)))
+        << "trust must not remove the intent";
 }
 
 TEST(CASProtocol, WedgedHeartbeatCondemnedTokenedBlobCommitsWithTokenUnchanged)
@@ -484,7 +477,6 @@ TEST(CASProtocol, DisplacedToLiveTokenCommitsAtCurrentIncarnation)
     const RootNamespace ns{"srv1/tbl"};
 
     writeBlobRaw(*b, s->layout(), "payload-X", s->poolMeta().blob_header_len, s->poolMeta().pool_id);
-    writeMetaClean(*b, s->layout(), u128Of("payload-X"), 9);
     const String blob_key = s->layout().blobKey(idOf("payload-X"));
     const Etag t0 = currentIncarnation(*b, blob_key);
 
@@ -593,7 +585,7 @@ TEST(CASProtocol, FreshEvidenceDepWithViewHitIsResolvedByGate)
     }
     const String blob_key = layout.blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128(hex))});
     const Etag t0 = currentIncarnation(*b, blob_key);
-    condemnMeta(*b, layout, hexToU128(hex), /*condemn_round*/ 1);
+    DB::Cas::tests::plantIntentForCurrentBody(*b, layout, DB::Cas::tests::legacyMetaTestRef(hexToU128(hex)));
 
     auto s = openPool(b);
 

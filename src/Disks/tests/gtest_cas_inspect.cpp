@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobMetaFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCkptFormat.h>
@@ -422,4 +423,28 @@ TEST(CASInspect, UndecodableCheckpointCostsOnlyTheStrayLabel)
     const String critical_printed = critical_diagnostics.str();
     EXPECT_NE(critical_printed.find(layout.refCkptKey(critical_life)), String::npos) << critical_printed;
     EXPECT_EQ(std::count(critical_printed.begin(), critical_printed.end(), '\n'), 1) << critical_printed;
+}
+
+/// A `.meta` key decodes as a legacy blob marker, not as a body: it shares the `blobs/` prefix with the body key.
+TEST(CASInspect, RendersCondemnedMarker)
+{
+    const Layout layout("p");
+    const BlobRef ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::Cas::tests::u128Of("hash-inspect"))};
+    const BlobMeta m{.version = 1, .state = MetaState::Condemned, .condemn_round = 9, .size = 123};
+
+    const String json = caInspectToJson(layout, layout.blobMetaKey(ref), encodeBlobMetaForTest(m));
+    EXPECT_NE(json.find("\"object\":\"blob_meta\""), String::npos);
+    EXPECT_NE(json.find("\"condemned\""), String::npos);
+    EXPECT_NE(json.find("\"condemn_round\":9"), String::npos);
+    EXPECT_NE(json.find("\"size\":123"), String::npos);
+}
+
+TEST(CASInspect, RendersCleanMarker)
+{
+    const Layout layout("p");
+    const BlobRef ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::Cas::tests::u128Of("hash-inspect-clean"))};
+    const BlobMeta m{.version = 1, .state = MetaState::Clean, .condemn_round = 0, .size = 7};
+
+    const String json = caInspectToJson(layout, layout.blobMetaKey(ref), encodeBlobMetaForTest(m));
+    EXPECT_NE(json.find("\"clean\""), String::npos);
 }

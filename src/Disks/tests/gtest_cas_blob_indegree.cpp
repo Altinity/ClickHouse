@@ -12,11 +12,14 @@
 #endif
 #include <Disks/tests/cas_test_helpers.h>
 #include <IO/WriteBufferFromString.h>
+#include <base/defines.h>
 #include <Common/Exception.h>
 
+#include <algorithm>
+#include <cstdlib>
 #include <set>
 
-namespace DB::ErrorCodes { extern const int ABORTED; extern const int CORRUPTED_DATA; extern const int NOT_IMPLEMENTED; }
+namespace DB::ErrorCodes { extern const int ABORTED; extern const int CORRUPTED_DATA; extern const int LOGICAL_ERROR; extern const int NOT_IMPLEMENTED; }
 
 using namespace DB::Cas;
 
@@ -33,6 +36,19 @@ BlobRef bh(uint64_t n) { return BlobRef{BlobHashAlgo::CityHash128, BlobDigest::f
 /// block framing of its own — it only pins the same byte-size scale the (now-deleted, codecs-v3 phase 6)
 /// `CasRunFile` block codec used, so the multi-block-sized fixtures below stay meaningfully large.
 constexpr uint32_t kLegacyBlockSize = 256u * 1024u;
+
+/// The pending `HEAD` hook for merge tests: every pending body reads absent.
+const BlobHeadFn kPendingBodyAbsent = [](const BlobRef &) { return std::optional<Meta>{}; };
+
+/// An intent create hook that counts its calls and confirms the first `confirmed` of them.
+IntentCreateFn countingCreate(size_t & calls, size_t confirmed = std::numeric_limits<size_t>::max())
+{
+    return [&calls, confirmed](const BlobRef &, const CanonicalIdentity &)
+    {
+        ++calls;
+        return calls <= confirmed ? IntentCreateResult{IntentCreate::Created, {}} : IntentCreateResult{IntentCreate::Unconfirmed, "refused"};
+    };
+}
 
 }
 
@@ -294,25 +310,16 @@ DecodedRun decodeRun(CasOperation & op, const RunRef & run)
     auto r = openSourceEdgeRun(op, run.key);
     /// Every run this test helper decodes is CityHash128 (16-byte), so `.toU128()` is a
     /// provably-exact round trip.
-    String k;
-    String p;
-    while (r.next(k, p))
+    SourceEdgeRecord rec;
+    while (r.next(rec))
     {
-        BlobRef bh_ref;
-        UInt128 sid;
-        SourceEdgeKeyCodec::parse(k, bh_ref, sid);   // throws CORRUPTED_DATA on a malformed key (fail-closed)
-        const UInt128 bh = bh_ref.digest.toU128();
-        EXPECT_FALSE(p.empty());
-        if (p.empty())
-            continue;
-        if (runMarkerFromByte(p[0], "CAS test source-edge run") == RunMarker::Condemned)
-            d.condemned.emplace_back(bh, decodeCondemnedRow(p));
-        else if (runMarkerFromByte(p[0], "CAS test source-edge run") == RunMarker::Zero)
-            d.zero_markers.push_back(bh);
-        else if (runMarkerFromByte(p[0], "CAS test source-edge run") == RunMarker::Edge)
-            d.edges.emplace_back(bh, sid);
-        else
-            ADD_FAILURE() << "unknown run row type";
+        const UInt128 bh = rec.ref.digest.toU128();
+        switch (rec.marker)
+        {
+            case RunMarker::Condemned: d.condemned.emplace_back(bh, condemnedRowOf(rec)); break;
+            case RunMarker::Zero: d.zero_markers.push_back(bh); break;
+            case RunMarker::Edge: d.edges.emplace_back(bh, rec.source_id); break;
+        }
     }
     return d;
 }
@@ -355,36 +362,34 @@ TEST(CASBlobInDegree, ZeroInDegreeSealChecksumMismatchFailsClosed)
     EXPECT_THROW(zeroInDegree(*backend_req, runs), DB::Exception);
 }
 
-TEST(CASThreeCursorMerge, FloorBoundary)
+TEST(CASThreeCursorMerge, CandidateRowsAtZeroCreateTheirIntents)
 {
     InMemoryBackend backend;
     DB::Cas::tests::OperationForTest backend_req(backend);
     Layout layout{"pool"};
 
-    /// Gen 1's run holds one unrelated surviving edge (b9) plus the carried RunMarker::Condemned rows for A=b1
-    /// (condemned round 2) and B=b2 (round 3); neither A nor B has any edge (in-degree 0 by definition).
-    /// current_round = 3: strictly-below graduates, at-the-current-round stays.
+    /// Gen 1's run holds one unrelated surviving edge (b9) plus candidate rows for b1 and b2, neither with an
+    /// edge. Both creates are sent; the first is confirmed, the second is not.
     const RunRef gen1 = writeSourceEdgeRun(backend, layout, /*gen*/1, 0, 0,
         {{b(1), condemnedRowFor(2)}, {b(2), condemnedRowFor(3)}}, {{b(9), s(1)}});
 
+    size_t creates = 0;
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
     foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, 2, 0, 0, {}, runs2,
-        /*current_round*/3, /*condemn_round*/4, /*head_blob*/{}, /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr);
+        /*current_round*/4, /*condemn_round*/4, /*head_blob*/{}, /*peek_head*/{}, countingCreate(creates, 1), &rmr);
 
-    /// Two-phase graduation: the floor-passed entry is REPUBLISHED pending (still in the list);
-    /// its physical delete belongs to the NEXT pass.
-    ASSERT_EQ(rmr.graduated.size(), 1u);
-    EXPECT_EQ(rmr.graduated[0].ref, bh(1));
-    EXPECT_TRUE(rmr.graduated[0].delete_pending);
+    EXPECT_EQ(creates, 2u);
+    ASSERT_EQ(rmr.confirmed.size(), 1u);
+    EXPECT_EQ(rmr.confirmed[0].ref, bh(1));
+    EXPECT_EQ(rmr.unconfirmed_creates, 1u);
     ASSERT_EQ(rmr.still_retired.size(), 2u);
-    EXPECT_EQ(rmr.still_retired[0].ref, bh(1));
     EXPECT_TRUE(rmr.still_retired[0].delete_pending);
-    EXPECT_EQ(rmr.still_retired[1].ref, bh(2));
+    EXPECT_EQ(rmr.still_retired[0].condemn_round, 2u);
     EXPECT_FALSE(rmr.still_retired[1].delete_pending);
     EXPECT_EQ(rmr.still_retired[1].condemn_round, 3u);   /// carried unchanged, not re-stamped
     EXPECT_TRUE(rmr.spared.empty());
-    EXPECT_TRUE(rmr.redelete.empty());
+    EXPECT_TRUE(rmr.body_deletes.empty());
 
     /// still_retired mirrors exactly the RunMarker::Condemned rows written into the output run, in order.
     const DecodedRun out = decodeRun(*backend_req, runs2[0]);
@@ -394,31 +399,90 @@ TEST(CASThreeCursorMerge, FloorBoundary)
     EXPECT_EQ(out.condemned[1].first, b(2));
     EXPECT_FALSE(out.condemned[1].second.delete_pending);
     EXPECT_TRUE(out.zero_markers.empty());
+
+    /// Without a create hook no create is sent and both rows carry.
+    std::vector<RunRef> runs3;
+    RetiredMergeResult carried;
+    foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, 3, 0, 0, {}, runs3,
+        /*current_round*/4, /*condemn_round*/4, /*head_blob*/{}, /*peek_head*/{}, /*create_intent*/{}, &carried);
+    ASSERT_EQ(carried.still_retired.size(), 2u);
+    EXPECT_FALSE(carried.still_retired[0].delete_pending);
+    EXPECT_TRUE(carried.confirmed.empty());
 }
 
-TEST(CASThreeCursorMerge, PendingRedeletesAndDrops)
+TEST(CASThreeCursorMerge, PendingRowWhoseHeadShowsItsTokenGoesStandingWithABodyDelete)
 {
     InMemoryBackend backend;
     DB::Cas::tests::OperationForTest backend_req(backend);
     Layout layout{"pool"};
 
-    /// A row the PRIOR pass published as delete_pending (carried on gen 1's run): this pass hands it to
-    /// `redelete` (executed pre-CAS by the caller) and drops it from the output run.
+    /// A pending row whose body still holds the row's incarnation: the row is written `standing` and its
+    /// body delete handed to the caller, conditional on the token the HEAD saw.
+    (*backend_req).create(layout.blobKey(bh(1)), "body", Retry::standard());
+    const Meta body = *(*backend_req).head(layout.blobKey(bh(1)), Retry::standard());
+    CondemnedRow pending = condemnedRowFor(1, "", /*delete_pending*/true);
+    pending.token = PersistedEtag::capture(body.etag);
+    const RunRef gen1 = writeSourceEdgeRun(backend, layout, /*gen*/1, 0, 0, {{b(1), pending}});
+    const BlobHeadFn present = [&](const BlobRef & ref) { return (*backend_req).head(layout.blobKey(ref), Retry::standard()); };
+
+    std::vector<RunRef> runs2;
+    RetiredMergeResult rmr;
+    foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, 2, 0, 0, {}, runs2,
+        /*current_round*/9, /*condemn_round*/9, /*head_blob*/{}, /*peek_head*/{}, /*create_intent*/{}, &rmr,
+        /*suppress_destructive*/false, /*out_applied_by_txn_ordinal*/nullptr, /*source_retirements*/{},
+        /*work_budget*/nullptr, /*pending_hints*/nullptr, present);
+
+    ASSERT_EQ(rmr.body_deletes.size(), 1u);
+    EXPECT_EQ(rmr.body_deletes[0].entry.ref, bh(1));
+    ASSERT_TRUE(rmr.body_deletes[0].observed.has_value());
+    EXPECT_EQ(rmr.body_deletes[0].observed->etag, body.etag);
+    ASSERT_EQ(rmr.still_retired.size(), 1u);
+    EXPECT_TRUE(rmr.still_retired[0].standing);
+    EXPECT_TRUE(rmr.intent_deletes.empty()) << "the intent never leaves with its body";
+
+    const DecodedRun out = decodeRun(*backend_req, runs2[0]);
+    ASSERT_EQ(out.condemned.size(), 1u);
+    EXPECT_TRUE(out.condemned[0].second.standing);
+}
+
+TEST(CASThreeCursorMerge, PendingRowWithAnAbsentBodyGoesStandingWithNoRequest)
+{
+    InMemoryBackend backend;
+    DB::Cas::tests::OperationForTest backend_req(backend);
+    Layout layout{"pool"};
     const RunRef gen1 = writeSourceEdgeRun(backend, layout, /*gen*/1, 0, 0,
         {{b(1), condemnedRowFor(1, "t", /*delete_pending*/true)}});
 
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
     foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, 2, 0, 0, {}, runs2,
-        /*current_round*/9, /*condemn_round*/9, /*head_blob*/{}, /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr);
+        /*current_round*/9, /*condemn_round*/9, /*head_blob*/{}, /*peek_head*/{}, /*create_intent*/{}, &rmr,
+        /*suppress_destructive*/false, /*out_applied_by_txn_ordinal*/nullptr, /*source_retirements*/{},
+        /*work_budget*/nullptr, /*pending_hints*/nullptr, kPendingBodyAbsent);
 
-    ASSERT_EQ(rmr.redelete.size(), 1u);
-    EXPECT_EQ(rmr.redelete[0].ref, bh(1));
-    EXPECT_TRUE(rmr.still_retired.empty());
-    EXPECT_TRUE(rmr.graduated.empty());
+    EXPECT_TRUE(rmr.body_deletes.empty());
+    ASSERT_EQ(rmr.still_retired.size(), 1u);
+    EXPECT_TRUE(rmr.still_retired[0].standing);
     EXPECT_TRUE(rmr.spared.empty());
+}
 
-    /// The redeleted blob leaves the run entirely (no sentinel carried, no zero marker — untouched).
+TEST(CASThreeCursorMerge, StandingRowAtZeroDeletesItsIntentAndLeavesTheRun)
+{
+    InMemoryBackend backend;
+    DB::Cas::tests::OperationForTest backend_req(backend);
+    Layout layout{"pool"};
+    CondemnedRow standing = condemnedRowFor(1, "t", /*delete_pending*/true);
+    standing.standing = true;
+    const RunRef gen1 = writeSourceEdgeRun(backend, layout, /*gen*/1, 0, 0, {{b(1), standing}});
+
+    std::vector<RunRef> runs2;
+    RetiredMergeResult rmr;
+    foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, 2, 0, 0, {}, runs2,
+        /*current_round*/9, /*condemn_round*/9, /*head_blob*/{}, /*peek_head*/{}, /*create_intent*/{}, &rmr);
+
+    ASSERT_EQ(rmr.intent_deletes.size(), 1u);
+    EXPECT_EQ(rmr.intent_deletes[0].str(), layout.blobIntentKey(bh(1), *PersistedEtag{"emulated", "t"}.canonical()));
+    EXPECT_TRUE(rmr.still_retired.empty());
     const DecodedRun out = decodeRun(*backend_req, runs2[0]);
     EXPECT_TRUE(out.condemned.empty());
     EXPECT_TRUE(out.zero_markers.empty());
@@ -430,18 +494,16 @@ TEST(CASThreeCursorMerge, RecoverySpares)
     DB::Cas::tests::OperationForTest backend_req(backend);
     Layout layout{"pool"};
 
-    /// A (=b1) is retired at round 1 and would long since have graduated (current_round = 5) — but this
-    /// pass's delta adds an edge to it: recovery WINS over graduation, the entry is dropped as spared.
+    /// A (=b1) has a row from round 1, and this pass's delta adds an edge to it: the row is dropped as spared.
     const RunRef gen1 = writeSourceEdgeRun(backend, layout, /*gen*/1, 0, 0, {{b(1), condemnedRowFor(1)}});
 
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
     foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, 2, 0, 0, {{bh(1), s(1), false}}, runs2,
-        /*current_round*/5, /*condemn_round*/6, /*head_blob*/{}, /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr);
+        /*current_round*/5, /*condemn_round*/6, /*head_blob*/{}, /*peek_head*/{}, /*create_intent*/{}, &rmr);
 
     ASSERT_EQ(rmr.spared.size(), 1u);
     EXPECT_EQ(rmr.spared[0].ref, bh(1));
-    EXPECT_TRUE(rmr.graduated.empty());
     EXPECT_TRUE(rmr.still_retired.empty());
 
     /// b1 recovered its edge: the output run carries the surviving edge and no sentinel for it.
@@ -465,7 +527,7 @@ TEST(CASThreeCursorMerge, NewCandidateCondemned)
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
     foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/runs1, 2, 0, 0, {{bh(3), s(1), true}}, runs2,
-        /*current_round*/0, /*condemn_round*/7, headPresent(*backend_req, layout, 42), /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr);
+        /*current_round*/0, /*condemn_round*/7, headPresent(*backend_req, layout, 42), /*peek_head*/{}, /*create_intent*/{}, &rmr);
 
     ASSERT_EQ(rmr.still_retired.size(), 1u);
     EXPECT_EQ(rmr.still_retired[0].ref, bh(3));
@@ -474,7 +536,6 @@ TEST(CASThreeCursorMerge, NewCandidateCondemned)
     EXPECT_TRUE(rmr.still_retired[0].token.matches(present->etag));
     EXPECT_EQ(rmr.still_retired[0].size, 42u);
     EXPECT_EQ(rmr.still_retired[0].condemn_round, 7u);
-    EXPECT_TRUE(rmr.graduated.empty());
     EXPECT_TRUE(rmr.spared.empty());
 
     /// The fresh condemn is emitted as a RunMarker::Condemned row (not a zero marker) into the output run.
@@ -500,10 +561,9 @@ TEST(CASThreeCursorMerge, AbsentBlobNotCondemned)
     RetiredMergeResult rmr;
     foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/runs1, 2, 0, 0, {{bh(3), s(1), true}}, runs2,
         /*current_round*/0, /*condemn_round*/7,
-        [](const BlobRef &) -> std::optional<Meta> { return std::nullopt; }, /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr);
+        [](const BlobRef &) -> std::optional<Meta> { return std::nullopt; }, /*peek_head*/{}, /*create_intent*/{}, &rmr);
 
     EXPECT_TRUE(rmr.still_retired.empty());
-    EXPECT_TRUE(rmr.graduated.empty());
     EXPECT_TRUE(rmr.spared.empty());
 
     const DecodedRun out = decodeRun(*backend_req, runs2[0]);
@@ -529,20 +589,21 @@ TEST(CASThreeCursorMerge, SnapshotEdgesUnperturbedByRetired)
         {{bh(1), s(1), false}, {bh(2), s(1), false}, {bh(2), s(2), true}}, r1);
 
     /// Engaged: the SAME deltas, but the prior run carries retired rows for b1 (which the delta re-edges
-    /// => spared) and b5 (no edge => graduates past the floor).
+    /// => spared) and b5 (no edge => its intent is created and confirmed).
     const RunRef prior = writeSourceEdgeRun(engaged, layout, /*gen*/1, 0, 0,
         {{b(1), condemnedRowFor(1)}, {b(5), condemnedRowFor(2)}});
     std::vector<RunRef> r2;
     RetiredMergeResult rmr;
+    size_t creates = 0;
     foldDeltasIntoGeneration(*engaged_req, layout, /*prior_runs*/{prior}, 2, 0, 0,
         {{bh(1), s(1), false}, {bh(2), s(1), false}, {bh(2), s(2), true}}, r2,
-        /*current_round*/9, /*condemn_round*/3, headPresent(*engaged_req, layout, 1), /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr);
+        /*current_round*/9, /*condemn_round*/3, headPresent(*engaged_req, layout, 1), /*peek_head*/{}, countingCreate(creates), &rmr);
 
     const DecodedRun plain_run = decodeRun(*plain_req, r1[0]);
     const DecodedRun engaged_run = decodeRun(*engaged_req, r2[0]);
     EXPECT_EQ(plain_run.edges, engaged_run.edges);   /// edge rows byte-identical
     EXPECT_TRUE(plain_run.condemned.empty());
-    /// The engaged run carries only the retired sentinel(s) on top: b1 spared (no row), b5 graduated.
+    /// The engaged run carries only the retired sentinel(s) on top: b1 spared (no row), b5 pending.
     ASSERT_EQ(engaged_run.condemned.size(), 1u);
     EXPECT_EQ(engaged_run.condemned[0].first, b(5));
     EXPECT_TRUE(engaged_run.condemned[0].second.delete_pending);
@@ -562,7 +623,7 @@ TEST(CASTwoCursorMerge, CarriedSentinelIsNotATouch)
     RetiredMergeResult rmr1;
     foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{}, 1, 0, 0,
         {{bh(2), s(1), false}, {bh(2), s(1), true}}, runs1,
-        /*current_round*/0, /*condemn_round*/5, headPresent(*backend_req, layout, 7), /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr1);
+        /*current_round*/0, /*condemn_round*/5, headPresent(*backend_req, layout, 7), /*peek_head*/{}, /*create_intent*/{}, &rmr1);
     ASSERT_EQ(rmr1.still_retired.size(), 1u);
     {
         const DecodedRun g1 = decodeRun(*backend_req, runs1[0]);
@@ -571,19 +632,18 @@ TEST(CASTwoCursorMerge, CarriedSentinelIsNotATouch)
         EXPECT_TRUE(g1.zero_markers.empty());   /// a condemned blob emits RunMarker::Condemned, never a zero marker
     }
 
-    /// Gen 2: empty deltas, current_round 1 (< 5 => b carries, does not graduate). peek_head must NOT fire.
+    /// Gen 2: empty deltas and no create hook: the candidate carries. peek_head must NOT fire.
     size_t peek_calls = 0;
     auto peek = [&](const BlobRef &) -> std::optional<Meta> { ++peek_calls; return {}; };
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr2;
     foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/runs1, 2, 0, 0, {}, runs2,
-        /*current_round*/1, /*condemn_round*/6, /*head_blob*/{}, peek, /*confirm_condemned_marker*/{}, &rmr2);
+        /*current_round*/1, /*condemn_round*/6, /*head_blob*/{}, peek, /*create_intent*/{}, &rmr2);
 
     EXPECT_EQ(peek_calls, 0u);
     ASSERT_EQ(rmr2.still_retired.size(), 1u);
     EXPECT_EQ(rmr2.still_retired[0].ref, bh(2));
     EXPECT_EQ(rmr2.still_retired[0].condemn_round, 5u);   /// carried unchanged
-    EXPECT_TRUE(rmr2.graduated.empty());
 
     const DecodedRun g2 = decodeRun(*backend_req, runs2[0]);
     ASSERT_EQ(g2.condemned.size(), 1u);
@@ -780,88 +840,7 @@ TEST(CASBlobInDegree, ZeroInDegreeStreamsRunWithoutReadingItWhole)
     /// window for the seam to measure, so resident memory inside the open stream is out of its reach.
 }
 
-/// ==== RunMarker::Condemned row codec + typed source-edge open (retired-in-snapshot T2, spec §2.1) ====
-
-TEST(CASCondemnedRow, RoundTripAllTokenTypes)
-{
-    /// Walked over the vocabulary's own entries rather than a hand-copied list, so a dialect the
-    /// encoder can construct but this test forgot cannot exist.
-    for (const auto & entry : DB::Cas::kTokenTypeWords.entries)
-    {
-        DB::Cas::CondemnedRow row;
-        row.delete_pending = (entry.value == DB::Cas::Dialect::Generation);
-        row.marker_confirmed = (entry.value == DB::Cas::Dialect::Emulated);
-        row.token = DB::Cas::PersistedEtag{String(entry.word), "etag-abc-123"};
-        row.size = 4096;
-        row.condemn_round = 7;
-        const auto bytes = DB::Cas::encodeCondemnedRow(row);
-        ASSERT_EQ(bytes[0], DB::Cas::runMarkerByte(DB::Cas::RunMarker::Condemned));
-        EXPECT_EQ(DB::Cas::decodeCondemnedRow(bytes), row);
-    }
-}
-
-TEST(CASCondemnedRow, UnknownMarkerByteFailsClosedWithCorruptedData)
-{
-    /// This pins the condemned-row decoder's own marker validation.
-    DB::Cas::CondemnedRow row;
-    row.token = DB::Cas::PersistedEtag{"etag", "t"};
-    auto bytes = DB::Cas::encodeCondemnedRow(row);
-    bytes[0] = 0x03;
-
-    try
-    {
-        static_cast<void>(DB::Cas::decodeCondemnedRow(bytes));
-        FAIL() << "expected CORRUPTED_DATA";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
-    }
-}
-
-TEST(CASRecordStream, RunMarkerByteContractFailsClosed)
-{
-    /// This helper is defense-in-depth; upstream word validation means no input path reaches it.
-    for (const auto marker : {DB::Cas::RunMarker::Zero, DB::Cas::RunMarker::Edge, DB::Cas::RunMarker::Condemned})
-        EXPECT_EQ(DB::Cas::runMarkerFromByte(DB::Cas::runMarkerByte(marker), "CAS test"), marker);
-
-    try
-    {
-        static_cast<void>(DB::Cas::runMarkerFromByte(0x03, "CAS test"));
-        FAIL() << "expected CORRUPTED_DATA";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
-    }
-}
-
-TEST(CASCondemnedRow, UnknownFlagBitsFailClosed)
-{
-    DB::Cas::CondemnedRow row;
-    row.token = DB::Cas::PersistedEtag{"etag", "t"};
-    auto bytes = DB::Cas::encodeCondemnedRow(row);
-    bytes[1] = 8;   // flags byte: bit 3 is not defined
-    EXPECT_THROW(DB::Cas::decodeCondemnedRow(bytes), DB::Exception);
-}
-
-TEST(CASCondemnedRow, UnknownTokenTypeFailsClosed)
-{
-    DB::Cas::CondemnedRow row;
-    row.token = DB::Cas::PersistedEtag{"etag", "t"};
-    auto bytes = DB::Cas::encodeCondemnedRow(row);
-    bytes[2] = 99;   // token_type byte (offset: [0]=0x02 [1]=flags [2]=token_type)
-    EXPECT_THROW(DB::Cas::decodeCondemnedRow(bytes), DB::Exception);
-}
-
-TEST(CASCondemnedRow, TruncatedPayloadFailsClosed)
-{
-    DB::Cas::CondemnedRow row;
-    row.token = DB::Cas::PersistedEtag{"etag", "0123456789"};
-    auto bytes = DB::Cas::encodeCondemnedRow(row);
-    bytes.resize(bytes.size() - 3);   // token bytes shorter than declared token_len
-    EXPECT_THROW(DB::Cas::decodeCondemnedRow(bytes), DB::Exception);
-}
+/// ==== Typed source-edge open ====
 
 TEST(CASSourceEdgeRun, SourceEdgeIdZeroIsReserved)
 {
@@ -938,7 +917,7 @@ TEST(CASBlobInDegree, TwoAlgoFoldSettlesBothInOneShardRun)
     RetiredMergeResult rmr;
     foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/runs1, 2, /*attempt*/0, 0,
         {{ch_x, s(1), true}, {sha_y_ref, s(1), true}}, runs2,
-        /*current_round*/0, /*condemn_round*/1, headPresent(*backend_req, layout, 1), /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr);
+        /*current_round*/0, /*condemn_round*/1, headPresent(*backend_req, layout, 1), /*peek_head*/{}, /*create_intent*/{}, &rmr);
 
     ASSERT_EQ(rmr.still_retired.size(), 2u);
     std::vector<BlobRef> condemned_refs{rmr.still_retired[0].ref, rmr.still_retired[1].ref};
@@ -1001,7 +980,7 @@ TEST(CASBlobInDegree, UnmatchedRemovalIsCountedWithAnExample)
     RetiredMergeResult rmr;
     foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/runs1, /*new_generation*/2, /*attempt*/0, /*shard*/0,
         {{bh(1), s(99), true}}, runs2,
-        /*current_round*/0, /*condemn_round*/0, /*head_blob*/{}, /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr);
+        /*current_round*/0, /*condemn_round*/0, /*head_blob*/{}, /*peek_head*/{}, /*create_intent*/{}, &rmr);
 
     /// The run is byte-identical to the no-op test's outcome for the blob's OTHER edges: both survive.
     const DecodedRun out = decodeRun(*backend_req, runs2[0]);
@@ -1044,27 +1023,32 @@ TEST(CASThreeCursorMerge, RedeleteBudgetCapsCohortAndCarriesExcess)
 
     GcRoundWorkBudget budget;
     budget.max_redeletes = 3;
+    size_t heads = 0;
+    const BlobHeadFn absent = [&](const BlobRef &) { ++heads; return std::optional<Meta>{}; };
 
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
     foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, 2, 0, 0, {}, runs2,
-        /*current_round*/9, /*condemn_round*/9, /*head_blob*/{}, /*peek_head*/{}, /*confirm_condemned_marker*/{},
+        /*current_round*/9, /*condemn_round*/9, /*head_blob*/{}, /*peek_head*/{}, /*create_intent*/{},
         &rmr, /*suppress_destructive*/false, /*out_applied_by_txn_ordinal*/nullptr,
-        /*source_retirements*/{}, &budget);
+        /*source_retirements*/{}, &budget, /*pending_hints*/nullptr, absent);
 
-    EXPECT_EQ(rmr.redelete.size(), 3u);
+    EXPECT_EQ(heads, 3u);
     EXPECT_EQ(budget.redeletes_used, 3u);
-    EXPECT_TRUE(rmr.graduated.empty());
     EXPECT_TRUE(rmr.spared.empty());
-    ASSERT_EQ(rmr.still_retired.size(), 7u);
+    ASSERT_EQ(rmr.still_retired.size(), 10u);
+    size_t standing = 0;
     for (const RetiredEntry & e : rmr.still_retired)
-        EXPECT_TRUE(e.delete_pending) << "carried entries stay delete_pending, unexecuted this round";
+    {
+        EXPECT_TRUE(e.delete_pending);
+        standing += e.standing;
+    }
+    EXPECT_EQ(standing, 3u) << "only the rows the budget admitted were decided; the rest carry pending";
 }
 
-/// Mirror test for the graduation cap: entries past `max_graduations` carry unchanged (still
-/// condemned, NOT yet delete_pending) rather than being force-graduated; the floor re-evaluates them
-/// next round.
-TEST(CASThreeCursorMerge, GraduationBudgetCapsCohortAndCarriesExcess)
+/// Mirror test for the create cap: rows past `max_intent_creates` carry unchanged as candidates, and a later
+/// round creates them.
+TEST(CASThreeCursorMerge, CreateBudgetCapsCohortAndCarriesExcess)
 {
     InMemoryBackend backend;
     DB::Cas::tests::OperationForTest backend_req(backend);
@@ -1072,23 +1056,25 @@ TEST(CASThreeCursorMerge, GraduationBudgetCapsCohortAndCarriesExcess)
     const RunRef gen1 = writeSourceEdgeRun(backend, layout, 1, 0, 0, condemnedCohort(10, /*condemn_round*/1, /*delete_pending*/false));
 
     GcRoundWorkBudget budget;
-    budget.max_graduations = 3;
+    budget.max_intent_creates = 3;
+    size_t creates = 0;
 
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
     foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, 2, 0, 0, {}, runs2,
-        /*current_round*/5, /*condemn_round*/6, /*head_blob*/{}, /*peek_head*/{}, /*confirm_condemned_marker*/{},
+        /*current_round*/5, /*condemn_round*/6, /*head_blob*/{}, /*peek_head*/{}, countingCreate(creates),
         &rmr, /*suppress_destructive*/false, /*out_applied_by_txn_ordinal*/nullptr,
-        /*source_retirements*/{}, &budget);
+        /*source_retirements*/{}, &budget, /*pending_hints*/nullptr, kPendingBodyAbsent);
 
-    EXPECT_EQ(rmr.graduated.size(), 3u);
-    EXPECT_EQ(budget.graduations_used, 3u);
+    EXPECT_EQ(creates, 3u);
+    EXPECT_EQ(rmr.confirmed.size(), 3u);
+    EXPECT_EQ(budget.intent_creates_used, 3u);
     ASSERT_EQ(rmr.still_retired.size(), 10u);
     size_t pending_count = 0;
     size_t carried_count = 0;
     for (const RetiredEntry & e : rmr.still_retired)
         e.delete_pending ? ++pending_count : ++carried_count;
-    EXPECT_EQ(pending_count, 3u)  << "only the graduated 3 are republished delete_pending";
+    EXPECT_EQ(pending_count, 3u)  << "only the 3 created rows are pending";
     EXPECT_EQ(carried_count, 7u) << "the rest carry unchanged, still eligible next round";
 }
 
@@ -1102,59 +1088,205 @@ TEST(CASThreeCursorMerge, RedeleteBudgetDrainsCohortToFixpointOverRounds)
     Layout layout{"pool"};
     std::vector<RunRef> priors{writeSourceEdgeRun(backend, layout, 1, 0, 0, condemnedCohort(10, 1, /*delete_pending*/true))};
 
-    uint64_t total_redeleted = 0;
+    /// A row decided in one round is `standing` in its output; the next round removes its intent and the row.
+    uint64_t decided = 0;
     uint64_t rounds = 0;
-    while (rounds < 10)
+    bool pending_left = true;
+    while (rounds < 10 && pending_left)
     {
         GcRoundWorkBudget budget;
         budget.max_redeletes = 3;
         std::vector<RunRef> out_runs;
         RetiredMergeResult rmr;
         foldDeltasIntoGeneration(*backend_req, layout, priors, 2 + rounds, 0, 0, {}, out_runs,
-            /*current_round*/100, /*condemn_round*/100, /*head_blob*/{}, /*peek_head*/{}, /*confirm_condemned_marker*/{},
+            /*current_round*/100, /*condemn_round*/100, /*head_blob*/{}, /*peek_head*/{}, /*create_intent*/{},
             &rmr, /*suppress_destructive*/false, /*out_applied_by_txn_ordinal*/nullptr,
-            /*source_retirements*/{}, &budget);
-        total_redeleted += rmr.redelete.size();
+            /*source_retirements*/{}, &budget, /*pending_hints*/nullptr, kPendingBodyAbsent);
         ++rounds;
-        if (rmr.still_retired.empty())
-            break;
+        decided += std::count_if(rmr.still_retired.begin(), rmr.still_retired.end(), [](const RetiredEntry & e) { return e.standing; });
+        pending_left = std::any_of(rmr.still_retired.begin(), rmr.still_retired.end(), [](const RetiredEntry & e) { return !e.standing; });
         ASSERT_FALSE(out_runs.empty());
         priors = out_runs;
     }
-    EXPECT_EQ(total_redeleted, 10u) << "no entry lost to the cap across the whole drain";
-    EXPECT_EQ(rounds, 4u) << "ceil(10 / 3) rounds to fully drain";
+    EXPECT_EQ(decided, 10u) << "no row lost to the cap across the whole drain";
+    EXPECT_EQ(rounds, 4u) << "ceil(10 / 3) rounds to decide every pending row";
 }
 
-TEST(CASThreeCursorMerge, GraduationBudgetIsCheckedBeforeTheGate)
+TEST(CASThreeCursorMerge, OnlyASentCreateSpendsABudgetSlot)
 {
-    for (const size_t refusals : {size_t{0}, size_t{2}})
+    for (const size_t unconfirmed : {size_t{0}, size_t{2}})
     {
-        SCOPED_TRACE(refusals);
+        SCOPED_TRACE(unconfirmed);
         InMemoryBackend backend;
         DB::Cas::tests::OperationForTest backend_req(backend);
         Layout layout{"pool"};
         const RunRef gen1 = writeSourceEdgeRun(backend, layout, 1, 0, 0, condemnedCohort(10, /*condemn_round*/1, false));
 
         GcRoundWorkBudget budget;
-        budget.max_graduations = 3;
-        size_t gate_calls = 0;
-        const std::function<bool(const RetiredEntry &)> gate = [&](const RetiredEntry &) { return ++gate_calls > refusals; };
+        budget.max_intent_creates = 3;
+        size_t creates = 0;
+        const IntentCreateFn create = [&](const BlobRef &, const CanonicalIdentity &)
+        {
+            return ++creates <= unconfirmed ? IntentCreateResult{} : IntentCreateResult{IntentCreate::Created, {}};
+        };
 
         std::vector<RunRef> runs2;
         RetiredMergeResult rmr;
         foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, 2, 0, 0, {}, runs2,
-            /*current_round*/5, /*condemn_round*/6, /*head_blob*/{}, /*peek_head*/{}, gate,
+            /*current_round*/5, /*condemn_round*/6, /*head_blob*/{}, /*peek_head*/{}, create,
             &rmr, /*suppress_destructive*/false, /*out_applied_by_txn_ordinal*/nullptr,
-            /*source_retirements*/{}, &budget);
+            /*source_retirements*/{}, &budget, /*pending_hints*/nullptr, kPendingBodyAbsent);
 
-        EXPECT_EQ(gate_calls, 3 + refusals) << "the gate read entries the budget had no slot for";
-        EXPECT_EQ(rmr.graduated.size(), 3u);
-        EXPECT_EQ(budget.graduations_used, 3u);
+        EXPECT_EQ(creates, 3u) << "a create was sent without a budget slot";
+        EXPECT_EQ(rmr.confirmed.size(), 3u - unconfirmed) << "an unconfirmed create was counted";
+        EXPECT_EQ(rmr.unconfirmed_creates, unconfirmed);
+        EXPECT_EQ(budget.intent_creates_used, 3u);
         EXPECT_EQ(rmr.still_retired.size(), 10u);
     }
 }
 
-TEST(CASThreeCursorMerge, MarkerConfirmedBitDoesNotSkipTheGate)
+/// Creates answered later than they are sent: the run is the one a synchronous create writes, each row takes its
+/// own create's answer, and the records held behind an unanswered create are bounded.
+TEST(CASThreeCursorMerge, OutstandingCreatesWriteTheSameRunAndBoundWhatIsHeld)
+{
+    constexpr size_t kEdges = 20000;
+    /// Candidates at 1, 3 and 5, then one live edge for each of `kEdges` later blobs.
+    const std::vector<std::pair<UInt128, CondemnedRow>> candidates{
+        {b(1), condemnedRowFor(1, "t1")}, {b(3), condemnedRowFor(1, "t3")}, {b(5), condemnedRowFor(1, "t5")}};
+    std::vector<BlobDelta> deltas;
+    for (size_t i = 0; i < kEdges; ++i)
+        deltas.push_back(BlobDelta{bh(10 + i), s(1), false, static_cast<uint32_t>(i)});
+    /// The second candidate's create is unconfirmed; the other two are confirmed.
+    const auto answerFor = [](const BlobRef & ref)
+    {
+        return ref == bh(3) ? IntentCreateResult{IntentCreate::Unconfirmed, "lost"} : IntentCreateResult{IntentCreate::Created, {}};
+    };
+
+    const auto foldWith = [&](const IntentCreates & creates, std::vector<uint8_t> & applied, RetiredMergeResult & rmr)
+    {
+        InMemoryBackend backend;
+        DB::Cas::tests::OperationForTest backend_req(backend);
+        Layout layout{"pool"};
+        const RunRef gen1 = writeSourceEdgeRun(backend, layout, 1, 0, 0, candidates);
+        applied.assign(kEdges, 0);
+        std::vector<RunRef> runs2;
+        foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, 2, 0, 0, deltas, runs2,
+            /*current_round*/5, /*condemn_round*/6, /*head_blob*/{}, /*peek_head*/{}, creates, &rmr,
+            /*suppress_destructive*/false, &applied);
+        return (*backend_req).read(runs2.at(0).key, Retry::standard())->bytes;
+    };
+
+    std::vector<uint8_t> applied_sync;
+    RetiredMergeResult rmr_sync;
+    const String sync_run = foldWith(IntentCreateFn([&](const BlobRef & ref, const CanonicalIdentity &) { return answerFor(ref); }),
+                                     applied_sync, rmr_sync);
+
+    /// Each answer is taken later; record how far the merge had gone when the first one was taken.
+    std::vector<uint8_t> applied;
+    std::optional<size_t> edges_merged_at_first_answer;
+    size_t started = 0;
+    IntentCreates later;
+    later.window = 64;
+    later.start = [&](const BlobRef & ref, const CanonicalIdentity &) -> IntentCreateAnswer
+    {
+        ++started;
+        return [&, ref]
+        {
+            if (!edges_merged_at_first_answer)
+                edges_merged_at_first_answer = static_cast<size_t>(std::count(applied.begin(), applied.end(), 1));
+            return answerFor(ref);
+        };
+    };
+    RetiredMergeResult rmr;
+    const String run = foldWith(later, applied, rmr);
+
+    EXPECT_EQ(started, 3u);
+    EXPECT_EQ(run, sync_run) << "the run differs from the one written with answers at once";
+    ASSERT_EQ(rmr.still_retired.size(), 3u);
+    EXPECT_TRUE(rmr.still_retired[0].delete_pending);
+    EXPECT_FALSE(rmr.still_retired[1].delete_pending) << "a row took another create's answer";
+    EXPECT_TRUE(rmr.still_retired[2].delete_pending);
+    EXPECT_EQ(rmr.confirmed.size(), 2u);
+    EXPECT_EQ(rmr.unconfirmed_creates, 1u);
+    ASSERT_TRUE(edges_merged_at_first_answer.has_value());
+    EXPECT_LT(*edges_merged_at_first_answer, kEdges) << "every record of the merge was held behind one unanswered create";
+    EXPECT_GT(*edges_merged_at_first_answer, 0u) << "positive control: the merge went on while the answer was outstanding";
+}
+
+namespace
+{
+
+/// Folds one candidate row stamped `row_round` in a pass stamped 6; returns the creates the rules sent.
+size_t foldCandidateStamped(uint64_t row_round)
+{
+    InMemoryBackend backend;
+    DB::Cas::tests::OperationForTest backend_req(backend);
+    Layout layout{"pool"};
+    const RunRef gen1 = writeSourceEdgeRun(backend, layout, 1, 0, 0, {{b(1), condemnedRowFor(row_round, "t1")}});
+    size_t creates = 0;
+    std::vector<RunRef> runs2;
+    RetiredMergeResult rmr;
+    foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, 2, 0, 0, {}, runs2,
+        /*current_round*/6, /*condemn_round*/6, /*head_blob*/{}, /*peek_head*/{}, countingCreate(creates), &rmr);
+    return creates;
+}
+
+}
+
+/// A row the pass itself stamped is never decided again in it: deciding it would act on the cut that minted it.
+#ifndef DEBUG_OR_SANITIZER_BUILD
+TEST(CASThreeCursorMerge, RowStampedByThisPassNeverReachesTheRules)
+{
+    ASSERT_EQ(foldCandidateStamped(5), 1u) << "positive control: a row of an earlier round is decided";
+    try
+    {
+        foldCandidateStamped(6);
+        FAIL() << "a row stamped by this pass reached the rules";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::LOGICAL_ERROR);
+        EXPECT_NE(e.message().find("minted in this pass"), String::npos) << e.message();
+    }
+}
+#else
+TEST(CASThreeCursorMergeDeathTest, RowStampedByThisPassNeverReachesTheRules)
+{
+    EXPECT_DEATH({ foldCandidateStamped(6); std::_Exit(0); }, "minted in this pass");
+}
+#endif
+
+/// The legacy confirmed bit stays decodable but is never written: a confirmed create leaves it clear, and a row
+/// carried from a run that had it set is written with it clear.
+TEST(CASThreeCursorMerge, RowsThisBuildWritesCarryTheLegacyConfirmedBitClear)
+{
+    InMemoryBackend backend;
+    DB::Cas::tests::OperationForTest backend_req(backend);
+    Layout layout{"pool"};
+    CondemnedRow created = condemnedRowFor(/*condemn_round*/1, "t1");
+    created.marker_confirmed = true;
+    CondemnedRow carried = condemnedRowFor(/*condemn_round*/1, "t2", /*delete_pending*/true);
+    carried.marker_confirmed = true;
+    const RunRef gen1 = writeSourceEdgeRun(backend, layout, 1, 0, 0, {{b(1), created}, {b(2), carried}});
+    ASSERT_TRUE(decodeRun(*backend_req, gen1).condemned.at(1).second.marker_confirmed) << "positive control: the bit decodes";
+
+    size_t creates = 0;
+    std::vector<RunRef> runs2;
+    RetiredMergeResult rmr;
+    /// No `pending_head`: the pending row is carried unchanged.
+    foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, 2, 0, 0, {}, runs2,
+        /*current_round*/5, /*condemn_round*/6, /*head_blob*/{}, /*peek_head*/{}, countingCreate(creates), &rmr);
+
+    ASSERT_EQ(creates, 1u);
+    const DecodedRun out = decodeRun(*backend_req, runs2.at(0));
+    ASSERT_EQ(out.condemned.size(), 2u);
+    EXPECT_TRUE(out.condemned[0].second.delete_pending) << "positive control: the create was confirmed";
+    EXPECT_FALSE(out.condemned[0].second.marker_confirmed);
+    EXPECT_TRUE(out.condemned[1].second.delete_pending) << "positive control: the pending row was carried";
+    EXPECT_FALSE(out.condemned[1].second.marker_confirmed);
+}
+
+TEST(CASThreeCursorMerge, LegacyConfirmedBitDoesNotConfirmTheIntent)
 {
     InMemoryBackend backend;
     DB::Cas::tests::OperationForTest backend_req(backend);
@@ -1163,38 +1295,59 @@ TEST(CASThreeCursorMerge, MarkerConfirmedBitDoesNotSkipTheGate)
     row.marker_confirmed = true;
     const RunRef gen1 = writeSourceEdgeRun(backend, layout, 1, 0, 0, {{b(1), row}});
 
-    size_t gate_calls = 0;
-    const std::function<bool(const RetiredEntry &)> refuse = [&](const RetiredEntry &) { ++gate_calls; return false; };
+    size_t creates = 0;
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
     foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, 2, 0, 0, {}, runs2,
-        /*current_round*/5, /*condemn_round*/6, /*head_blob*/{}, /*peek_head*/{}, refuse, &rmr);
+        /*current_round*/5, /*condemn_round*/6, /*head_blob*/{}, /*peek_head*/{}, countingCreate(creates, /*confirmed*/0), &rmr);
 
-    EXPECT_EQ(gate_calls, 1u) << "a non-pending row's bit skipped the gate";
-    EXPECT_TRUE(rmr.graduated.empty());
+    EXPECT_EQ(creates, 1u) << "the bit skipped the create";
+    EXPECT_TRUE(rmr.confirmed.empty());
+    EXPECT_EQ(rmr.unconfirmed_creates, 1u);
     ASSERT_EQ(rmr.still_retired.size(), 1u);
-    EXPECT_FALSE(rmr.still_retired.front().delete_pending);
+    EXPECT_FALSE(rmr.still_retired.front().delete_pending) << "an unconfirmed create made the row pending";
+}
+
+TEST(CASThreeCursorMerge, StandingRowWithoutAnIdentityLeavesWithoutASpare)
+{
+    InMemoryBackend backend;
+    DB::Cas::tests::OperationForTest backend_req(backend);
+    Layout layout{"pool"};
+    CondemnedRow standing = condemnedRowFor(1, "W/\"t\"", /*delete_pending*/true);
+    standing.standing = true;
+    ASSERT_FALSE(standing.token.canonical().has_value()) << "positive control: the token names no incarnation";
+    const RunRef gen1 = writeSourceEdgeRun(backend, layout, /*gen*/1, 0, 0, {{b(1), standing}});
+
+    std::vector<RunRef> runs2;
+    RetiredMergeResult rmr;
+    foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, 2, 0, 0, {}, runs2,
+        /*current_round*/9, /*condemn_round*/9, /*head_blob*/{}, /*peek_head*/{}, /*create_intent*/{}, &rmr);
+
+    EXPECT_TRUE(rmr.still_retired.empty()) << "the row was not dropped";
+    EXPECT_TRUE(rmr.spared.empty()) << "a row dropped at zero was reported as a spare";
+    EXPECT_TRUE(rmr.intent_deletes.empty());
+    EXPECT_EQ(rmr.uncanonical_tokens, 1u);
 }
 
 namespace
 {
 
-GraduationReadHints acceptAllHints(std::vector<BlobRef> & offered)
+PendingHeadHints acceptAllHints(std::vector<BlobRef> & offered)
 {
-    return GraduationReadHints{
-        .admit = [](const BlobRef &) { return true; },
+    return PendingHeadHints{
         .offer = [&offered](const BlobRef & ref, const CondemnedRow &)
         {
             offered.push_back(ref);
             return true;
-        }};
+        },
+        .take_pending = [](const BlobRef &) {}};
 }
 
 std::vector<std::pair<UInt128, CondemnedRow>> condemnedRowsOf(const std::vector<BlobRef> & refs)
 {
     std::vector<std::pair<UInt128, CondemnedRow>> rows;
     for (size_t i = 0; i < refs.size(); ++i)
-        rows.push_back({refs[i].digest.toU128(), condemnedRowFor(1, "t" + std::to_string(i))});
+        rows.push_back({refs[i].digest.toU128(), condemnedRowFor(1, "t" + std::to_string(i), /*delete_pending*/true)});
     return rows;
 }
 
@@ -1205,38 +1358,38 @@ TEST(CASThreeCursorMerge, ScanAheadStopsAtTheRowCap)
     InMemoryBackend backend;
     DB::Cas::tests::OperationForTest backend_req(backend);
     Layout layout{"pool"};
-    const uint64_t n = kGraduationLookaheadRows + 100;
-    const RunRef gen1 = writeSourceEdgeRun(backend, layout, 1, 0, 0, condemnedCohort(n, 1, false));
+    const uint64_t n = kPendingHeadLookaheadRows + 100;
+    const RunRef gen1 = writeSourceEdgeRun(backend, layout, 1, 0, 0, condemnedCohort(n, 1, /*delete_pending*/true));
 
     std::vector<BlobRef> offered;
-    const GraduationReadHints hints = acceptAllHints(offered);
-    std::optional<size_t> offers_at_first_gate;
-    const std::function<bool(const RetiredEntry &)> gate = [&](const RetiredEntry &)
+    const PendingHeadHints hints = acceptAllHints(offered);
+    std::optional<size_t> offers_at_first_head;
+    const BlobHeadFn head = [&](const BlobRef &)
     {
-        if (!offers_at_first_gate)
-            offers_at_first_gate = offered.size();
-        return true;
+        if (!offers_at_first_head)
+            offers_at_first_head = offered.size();
+        return std::optional<Meta>{};
     };
 
     std::vector<RunRef> with_scan;
     RetiredMergeResult scanned;
     foldDeltasIntoGeneration(*backend_req, layout, {gen1}, 2, 0, 0, {}, with_scan, /*current_round*/5,
-        /*condemn_round*/6, {}, {}, gate, &scanned, false, nullptr, {}, nullptr, &hints);
+        /*condemn_round*/6, {}, {}, {}, &scanned, false, nullptr, {}, nullptr, &hints, head);
 
-    ASSERT_TRUE(offers_at_first_gate.has_value());
-    EXPECT_EQ(*offers_at_first_gate, kGraduationLookaheadRows + 1) << "the current row and a full buffer, no more";
+    ASSERT_TRUE(offers_at_first_head.has_value());
+    EXPECT_EQ(*offers_at_first_head, kPendingHeadLookaheadRows + 1) << "the current row and a full buffer, no more";
     EXPECT_EQ(offered.size(), n - 1) << "every row after the first is offered";
     EXPECT_EQ(std::set<BlobRef>(offered.begin(), offered.end()).size(), n - 1) << "a row was offered twice";
 
     /// Same output key: a different run would fail the write-once replay with `CORRUPTED_DATA`.
     std::vector<RunRef> without_scan;
     RetiredMergeResult plain;
-    const std::function<bool(const RetiredEntry &)> accept = [](const RetiredEntry &) { return true; };
-    foldDeltasIntoGeneration(*backend_req, layout, {gen1}, 2, 0, 0, {}, without_scan, 5, 6, {}, {}, accept, &plain);
+    foldDeltasIntoGeneration(*backend_req, layout, {gen1}, 2, 0, 0, {}, without_scan, 5, 6, {}, {}, {}, &plain, false,
+        nullptr, {}, nullptr, nullptr, kPendingBodyAbsent);
     ASSERT_EQ(with_scan.size(), 1u);
     ASSERT_EQ(without_scan.size(), 1u);
     EXPECT_EQ(with_scan.front().checksum, without_scan.front().checksum);
-    EXPECT_EQ(scanned.graduated.size(), plain.graduated.size());
+    EXPECT_EQ(scanned.still_retired.size(), plain.still_retired.size());
 }
 
 TEST(CASThreeCursorMerge, ScanAheadStopsAtTheSegmentEnd)
@@ -1256,39 +1409,39 @@ TEST(CASThreeCursorMerge, ScanAheadStopsAtTheSegmentEnd)
 
     size_t early_offers = 0;
     std::vector<BlobRef> offered;
-    const GraduationReadHints hints{
-        .admit = [](const BlobRef &) { return true; },
+    const PendingHeadHints hints{
         .offer = [&](const BlobRef & ref, const CondemnedRow &)
         {
             if (second_set.contains(ref) && backend.getStreamCount(seg2.key) == 0)
                 ++early_offers;
             offered.push_back(ref);
             return true;
-        }};
-    std::vector<BlobRef> gated;
-    size_t segment_two_opens_at_first_gate = 0;
-    const std::function<bool(const RetiredEntry &)> gate = [&](const RetiredEntry & e)
+        },
+        .take_pending = [](const BlobRef &) {}};
+    std::vector<BlobRef> headed;
+    size_t segment_two_opens_at_first_head = 0;
+    const BlobHeadFn head = [&](const BlobRef & ref)
     {
-        /// The first gate runs right after the scan that offered segment 1's rows, which fit the row cap.
-        if (gated.empty())
-            segment_two_opens_at_first_gate = backend.getStreamCount(seg2.key);
-        gated.push_back(e.ref);
-        return true;
+        /// The first HEAD runs right after the scan that offered segment 1's rows, which fit the row cap.
+        if (headed.empty())
+            segment_two_opens_at_first_head = backend.getStreamCount(seg2.key);
+        headed.push_back(ref);
+        return std::optional<Meta>{};
     };
 
     std::vector<RunRef> with_scan;
-    foldDeltasIntoGeneration(*backend_req, layout, {seg1, seg2}, 2, 0, 0, {}, with_scan, 5, 6, {}, {}, gate,
-        nullptr, false, nullptr, {}, nullptr, &hints);
+    foldDeltasIntoGeneration(*backend_req, layout, {seg1, seg2}, 2, 0, 0, {}, with_scan, 5, 6, {}, {}, {},
+        nullptr, false, nullptr, {}, nullptr, &hints, head);
 
-    EXPECT_EQ(segment_two_opens_at_first_gate, 0u) << "the scan opened segment 2 before the merge reached it";
+    EXPECT_EQ(segment_two_opens_at_first_head, 0u) << "the scan opened segment 2 before the merge reached it";
     EXPECT_EQ(early_offers, 0u) << "a row of segment 2 was offered before the merge opened it";
     EXPECT_EQ(offered.size(), 19u) << "offers resume once the next segment is open";
-    ASSERT_EQ(gated.size(), 20u);
-    EXPECT_EQ(gated[9], first.back()) << "the last entry of segment 1 is still admitted and read";
+    ASSERT_EQ(headed.size(), 20u);
+    EXPECT_EQ(headed[9], first.back()) << "the last row of segment 1 is still read";
 
     std::vector<RunRef> without_scan;
-    const std::function<bool(const RetiredEntry &)> accept = [](const RetiredEntry &) { return true; };
-    foldDeltasIntoGeneration(*backend_req, layout, {seg1, seg2}, 2, 0, 0, {}, without_scan, 5, 6, {}, {}, accept);
+    foldDeltasIntoGeneration(*backend_req, layout, {seg1, seg2}, 2, 0, 0, {}, without_scan, 5, 6, {}, {}, {},
+        nullptr, false, nullptr, {}, nullptr, nullptr, kPendingBodyAbsent);
     EXPECT_EQ(with_scan.front().checksum, without_scan.front().checksum);
 }
 
@@ -1296,8 +1449,7 @@ TEST(CASThreeCursorMerge, ScanAheadKeepsRowAndChecksumValidation)
 {
     Layout layout{"pool"};
     std::vector<BlobRef> unused;
-    const GraduationReadHints hints = acceptAllHints(unused);
-    const std::function<bool(const RetiredEntry &)> accept = [](const RetiredEntry &) { return true; };
+    const PendingHeadHints hints = acceptAllHints(unused);
 
     for (const bool with_scan : {false, true})
     {
@@ -1308,7 +1460,7 @@ TEST(CASThreeCursorMerge, ScanAheadKeepsRowAndChecksumValidation)
             DB::Cas::tests::OperationForTest op(backend);
             std::vector<SourceEdgeRecord> recs;
             for (uint64_t i = 1; i <= 6; ++i)
-                recs.push_back(condemnedRec(b(i), condemnedRowFor(1, "t" + std::to_string(i))));
+                recs.push_back(condemnedRec(b(i), condemnedRowFor(1, "t" + std::to_string(i), /*delete_pending*/true)));
             std::sort(recs.begin(), recs.end(), [](const SourceEdgeRecord & l, const SourceEdgeRecord & r) { return l.ref < r.ref; });
             const SourceEdgeRecord duplicate = recs[2];
             recs.insert(recs.begin() + 3, duplicate);
@@ -1326,8 +1478,8 @@ TEST(CASThreeCursorMerge, ScanAheadKeepsRowAndChecksumValidation)
             std::vector<RunRef> out_runs;
             DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
             {
-                foldDeltasIntoGeneration(*op, layout, {bad}, 2, 0, 0, {}, out_runs, 5, 6, {}, {}, accept, nullptr,
-                    false, nullptr, {}, nullptr, with_scan ? &hints : nullptr);
+                foldDeltasIntoGeneration(*op, layout, {bad}, 2, 0, 0, {}, out_runs, 5, 6, {}, {}, {}, nullptr,
+                    false, nullptr, {}, nullptr, with_scan ? &hints : nullptr, kPendingBodyAbsent);
             });
             EXPECT_TRUE(out_runs.empty());
             EXPECT_FALSE((*op).read(layout.blobTargetRunKey(2, 0, 0, 0), Retry::once()).has_value()) << "a successor run was written";
@@ -1349,8 +1501,8 @@ TEST(CASThreeCursorMerge, ScanAheadKeepsRowAndChecksumValidation)
             std::vector<RunRef> out_runs;
             DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
             {
-                foldDeltasIntoGeneration(*op, layout, {seg1, seg2}, 2, 0, 0, {}, out_runs, 5, 6, {}, {}, accept,
-                    nullptr, false, nullptr, {}, nullptr, with_scan ? &hints : nullptr);
+                foldDeltasIntoGeneration(*op, layout, {seg1, seg2}, 2, 0, 0, {}, out_runs, 5, 6, {}, {}, {},
+                    nullptr, false, nullptr, {}, nullptr, with_scan ? &hints : nullptr, kPendingBodyAbsent);
             });
             EXPECT_TRUE(out_runs.empty());
             EXPECT_FALSE((*op).read(layout.blobTargetRunKey(2, 0, 0, 0), Retry::once()).has_value()) << "a successor run was written";
@@ -1375,46 +1527,6 @@ CondemnedRow standingRow()
 
 }
 
-TEST(CASBlobInDegree, PackedStandingFlagRoundTrips)
-{
-    const CondemnedRow row = standingRow();
-    const String bytes = encodeCondemnedRow(row);
-    EXPECT_EQ(static_cast<uint8_t>(bytes[1]), 7u);
-    EXPECT_EQ(decodeCondemnedRow(bytes), row);
-
-    CondemnedRow plain = row;
-    plain.standing = false;
-    EXPECT_EQ(static_cast<uint8_t>(encodeCondemnedRow(plain)[1]), 3u);
-    EXPECT_FALSE(decodeCondemnedRow(encodeCondemnedRow(plain)).standing);
-}
-
-TEST(CASBlobInDegree, PackedFlagsAboveSevenAreCorrupted)
-{
-    String bytes = encodeCondemnedRow(standingRow());
-    for (const uint8_t flags : {uint8_t{8}, uint8_t{15}, uint8_t{0x80}})
-    {
-        bytes[1] = static_cast<char>(flags);
-        DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { static_cast<void>(decodeCondemnedRow(bytes)); });
-    }
-}
-
-TEST(CASBlobInDegree, PackedStandingWithoutPendingIsCorrupted)
-{
-    String bytes = encodeCondemnedRow(standingRow());
-    for (const uint8_t flags : {uint8_t{4}, uint8_t{6}})
-    {
-        bytes[1] = static_cast<char>(flags);
-        DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { static_cast<void>(decodeCondemnedRow(bytes)); });
-    }
-}
-
-TEST(CASBlobInDegree, EncodeRefusesStandingWithoutPending)
-{
-    CondemnedRow row = standingRow();
-    row.delete_pending = false;
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { static_cast<void>(encodeCondemnedRow(row)); });
-}
-
 TEST(CASBlobInDegree, RunViewAndRetiredEntryCarryStanding)
 {
     InMemoryBackend backend;
@@ -1423,29 +1535,82 @@ TEST(CASBlobInDegree, RunViewAndRetiredEntryCarryStanding)
     const RunRef gen1 = writeSourceEdgeRun(backend, layout, 1, 0, 0,
         {{b(1), standingRow()}, {b(2), standingRow()}});
 
-    /// The run view hands consumers the packed row: standing survives the NDJSON round trip.
+    /// Standing survives the NDJSON round trip.
     {
         const DecodedRun in_run = decodeRun(*backend_req, gen1);
         ASSERT_EQ(in_run.condemned.size(), 2u);
         EXPECT_TRUE(in_run.condemned[0].second.standing);
     }
 
-    /// One redelete slot: the first entry goes to `redelete`, the second is carried into the next run.
-    GcRoundWorkBudget budget;
-    budget.max_redeletes = 1;
+    /// A suppressed pass decides no intent delete: both rows carry into the next run as `standing`.
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
     foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, 2, 0, 0, {}, runs2,
-        /*current_round*/9, /*condemn_round*/9, /*head_blob*/{}, /*peek_head*/{}, /*confirm_condemned_marker*/{},
-        &rmr, /*suppress_destructive*/false, /*out_applied_by_txn_ordinal*/nullptr,
-        /*source_retirements*/{}, &budget);
+        /*current_round*/9, /*condemn_round*/9, /*head_blob*/{}, /*peek_head*/{}, /*create_intent*/{},
+        &rmr, /*suppress_destructive*/true, /*out_applied_by_txn_ordinal*/nullptr,
+        /*source_retirements*/{}, /*work_budget*/nullptr, /*pending_hints*/nullptr, kPendingBodyAbsent);
 
-    ASSERT_EQ(rmr.redelete.size(), 1u);
-    EXPECT_TRUE(rmr.redelete[0].standing);
-    ASSERT_EQ(rmr.still_retired.size(), 1u);
+    EXPECT_TRUE(rmr.intent_deletes.empty());
+    ASSERT_EQ(rmr.still_retired.size(), 2u);
     EXPECT_TRUE(rmr.still_retired[0].standing);
 
     const DecodedRun out = decodeRun(*backend_req, runs2[0]);
-    ASSERT_EQ(out.condemned.size(), 1u);
+    ASSERT_EQ(out.condemned.size(), 2u);
     EXPECT_TRUE(out.condemned[0].second.standing);
 }
+
+namespace
+{
+
+/// One fold of `nominations` over an empty prior generation; `peek_head` reads every body absent.
+void foldNominations(const Layout & layout, std::vector<Layout::ParsedBlobIntentKey> nominations, bool suppressed)
+{
+    InMemoryBackend backend;
+    DB::Cas::tests::OperationForTest backend_req(backend);
+    std::vector<RunRef> runs;
+    foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{}, 1, 0, 0, {}, runs,
+        /*current_round*/2, /*condemn_round*/2, /*head_blob*/{}, /*peek_head*/kPendingBodyAbsent, /*create_intent*/{},
+        /*out_retired*/nullptr, suppressed, /*out_applied_by_txn_ordinal*/nullptr,
+        /*source_retirements*/{}, /*work_budget*/nullptr, /*pending_hints*/nullptr, kPendingBodyAbsent, std::move(nominations));
+}
+
+Layout::ParsedBlobIntentKey nominationOf(uint64_t blob, const CanonicalIdentity & identity)
+{
+    return Layout::ParsedBlobIntentKey{bh(blob), identity};
+}
+
+const CanonicalIdentity kTaggedIdentity = *canonicalIdentity(Dialect::Emulated, "t");
+const CanonicalIdentity kTaglessIdentity{Dialect::Emulated, ""};
+
+}
+
+#ifndef DEBUG_OR_SANITIZER_BUILD
+TEST(CASThreeCursorMerge, NominationWithoutATagIsALogicalError)
+{
+    Layout layout{"pool"};
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
+        [&] { foldNominations(layout, {nominationOf(1, kTaglessIdentity)}, /*suppressed*/false); });
+    EXPECT_NO_THROW(foldNominations(layout, {nominationOf(1, kTaggedIdentity)}, /*suppressed*/false))
+        << "positive control: the same fold takes a tagged nomination";
+}
+
+TEST(CASThreeCursorMerge, NominationInASuppressedRoundIsALogicalError)
+{
+    Layout layout{"pool"};
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
+        [&] { foldNominations(layout, {nominationOf(1, kTaggedIdentity)}, /*suppressed*/true); });
+    EXPECT_NO_THROW(foldNominations(layout, {}, /*suppressed*/true)) << "positive control: no nomination, no refusal";
+}
+#else
+TEST(CASThreeCursorMergeDeathTest, NominationWithoutATagIsALogicalError)
+{
+    Layout layout{"pool"};
+    EXPECT_DEATH({ foldNominations(layout, {nominationOf(1, kTaglessIdentity)}, /*suppressed*/false); }, "carries no tag");
+}
+
+TEST(CASThreeCursorMergeDeathTest, NominationInASuppressedRoundIsALogicalError)
+{
+    Layout layout{"pool"};
+    EXPECT_DEATH({ foldNominations(layout, {nominationOf(1, kTaggedIdentity)}, /*suppressed*/true); }, "suppressed round");
+}
+#endif

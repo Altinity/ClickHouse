@@ -65,8 +65,10 @@ constexpr std::string_view CAS_KEY_PREFIX = "cas_";
     DECLARE(UInt64, gc_snapshot_generations_to_keep, 3, "GC snapshot generations retained", 0) \
     DECLARE(UInt64, gc_shards, 1, "Blob-hash-prefix reducer shards (>= 1); creation-time only", 0) \
     DECLARE(UInt64, manifest_sweep_list_budget_keys, 1000, "Orphan-manifest sweep LIST budget per round", 0) \
+    DECLARE(UInt64, intent_sweep_list_budget_keys, 999, "Keys of blob-intents/ one GC round lists to find deletion intents with no row (>= 1). 999 fits one LIST response; a page of 1000 costs two", 0) \
     DECLARE(UInt64, manifest_sweep_delete_budget_keys, 100, "Orphan-manifest sweep candidate budget per round: keys that pass every retain check, whose bodies are read and decided", 0) \
-    DECLARE(UInt64, gc_round_graduation_budget, 0, "Blob graduation (condemned -> delete_pending) cohort cap per round (0 = unbounded)", 0) \
+    DECLARE(UInt64, gc_round_graduation_budget, 0, "Ignored; gc_round_intent_create_budget bounds the creates of deletion intents", 0) \
+    DECLARE(UInt64, gc_round_intent_create_budget, 0, "Maximum deletion-intent creates per GC round, summed over every GC shard; a blob over the cap stays a candidate and is created in a later round (0 = unbounded)", 0) \
     DECLARE(UInt64, gc_round_redelete_budget, 0, "Blob redelete (exact-token delete of a prior delete_pending row) cohort cap per round (0 = unbounded)", 0) \
     DECLARE(UInt64, gc_round_sweep_namespace_budget, 20, "Orphan-manifest sweep: distinct namespaces per page whose protection view may be built (0 = unbounded)", 0) \
     DECLARE(UInt64, gc_round_sweep_recovery_op_budget, 5000, "Orphan-manifest sweep: committed-tail ref-log GET/decode ops the recovery walk may spend per round (0 = unbounded)", 0) \
@@ -83,8 +85,8 @@ constexpr std::string_view CAS_KEY_PREFIX = "cas_";
     DECLARE(UInt64, part_folder_cache_max_entry_bytes, 16ULL << 20, "Oversized part-folder views bypass retention above this size", 0) \
     DECLARE(Bool,   allow_packed_parts, false, "Allow new MergeTree parts on this disk to use the Packed format", 0) \
     DECLARE(UInt64, manifest_decode_cache_bytes, 128ULL << 20, "Manifest DECODE cache byte budget (0 disables)", 0) \
-    DECLARE(UInt64, gc_meta_pool_size, 16, "Bounded pool size for GC per-hash freshness-meta writes", 0) \
-    DECLARE(UInt64, gc_io_concurrency, 16, "Maximum number of threads in the GC I/O pool. Used for fold and rebuild read-ahead, orphan-manifest sweep planning reads, pending_deletes HEAD plus conditional DELETE, and namespace janitor batch deletes. Per-hash meta writes use gc_meta_pool_size; other GC requests run on the round thread. 1 disables parallel GC I/O", 0) \
+    DECLARE(UInt64, gc_meta_pool_size, 16, "Ignored: GC writes no per-blob metadata objects", 0) \
+    DECLARE(UInt64, gc_io_concurrency, 16, "Maximum number of threads in the GC I/O pool. Used for fold and rebuild read-ahead, deletion-intent creates, orphan-manifest sweep planning reads, pending_deletes HEAD plus conditional DELETE, and namespace janitor batch deletes. Other GC requests run on the round thread. 1 disables parallel GC I/O", 0) \
     DECLARE(UInt64, gc_bulk_delete_chunk_keys, 1000, "Most keys per batch delete request in GC's write-once families (owner-removed manifest bodies, covered ref logs and snapshots, the namespace janitor's dead ref logs and snapshots), capped by the storage's batch-delete limit; 1 to 1000", 0) \
     DECLARE(UInt64, attempt_timeout_ms, 5000, "Budget for one HTTP attempt of a writable Native mount's control-plane requests (read, head, list, remove, conditional write), at least 1. With the connect cap it forms the attempt envelope the lease arithmetic reserves", 0) \
     DECLARE(UInt64, request_window_ms, 120000, "How long a failing request, including the blob publication loop, keeps retrying before it gives up with a retryable error, in milliseconds, measured from the call's start. Must exceed twice the attempt envelope for a writable disk and the envelope for a read-only one, or the disk refuses to open. The ref-table recovery budget is twice this value", 0) \
@@ -227,6 +229,20 @@ void ContentAddressedSettings::loadFromConfig(
             "for now; write them with the `cas_` prefix. Support for the unprefixed spelling will be "
             "removed.", config_prefix, fmt::join(legacy_names, ", "));
 
+    /// Declared only so that an existing configuration still loads; nothing reads them.
+    const ContentAddressedSettings defaults;
+    std::vector<String> ignored;
+    if (candidate[ContentAddressedSetting::gc_meta_pool_size].value != defaults[ContentAddressedSetting::gc_meta_pool_size].value)
+        ignored.push_back("`cas_gc_meta_pool_size`");
+    if (candidate[ContentAddressedSetting::gc_round_graduation_budget].value
+        != defaults[ContentAddressedSetting::gc_round_graduation_budget].value)
+        ignored.push_back("`cas_gc_round_graduation_budget`");
+    if (!ignored.empty())
+        LOG_WARNING(getLogger("ContentAddressedSettings"),
+            "content_addressed disk `{}`: {} {} ignored: GC writes no per-blob metadata objects, and "
+            "`cas_gc_round_intent_create_budget` bounds the deletion-intent creates of a round", config_prefix,
+            fmt::join(ignored, " and "), ignored.size() == 1 ? "is" : "are");
+
     impl.swap(candidate.impl);
 }
 
@@ -247,6 +263,11 @@ void ContentAddressedSettings::validate()
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
             "content_addressed disk: gc_bulk_delete_chunk_keys must be between 1 and 1000 (got {})",
             settings[ContentAddressedSetting::gc_bulk_delete_chunk_keys].value);
+
+    if (settings[ContentAddressedSetting::intent_sweep_list_budget_keys] == 0)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "content_addressed disk: cas_intent_sweep_list_budget_keys must be >= 1 (got {})",
+            settings[ContentAddressedSetting::intent_sweep_list_budget_keys].value);
 
     if (settings[ContentAddressedSetting::attempt_timeout_ms] == 0)
         throw Exception(ErrorCodes::BAD_ARGUMENTS,

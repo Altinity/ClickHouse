@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <atomic>
 #include <memory>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -366,11 +367,8 @@ TEST(CASObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
         const RoundReport rep = gc.runRegularRound();
         ASSERT_TRUE(rep.acquired_lease);
     }
-    {
-        const auto lm = DB::Cas::tests::loadMetaForTest(*b, s->layout(), u128Of(P));
-        ASSERT_TRUE(lm.has_value() && lm->meta.state == MetaState::Condemned)
-            << "precondition: token A must be condemned before republication";
-    }
+    ASSERT_TRUE(DB::Cas::tests::objectPresent(*b, *DB::Cas::tests::intentKeyOfCurrentBody(*b, s->layout(), idOf(P))))
+        << "precondition: token A must be condemned before republication";
 
     /// 2. RESURRECT: r2 dedup-hits P while A is condemned -> mints a fresh incarnation B; drop it too.
     publishOneBlobPart(s, ns, "r2", P);
@@ -428,7 +426,7 @@ TEST(CASObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
 
     /// Size-unit regression guard (audit fix, 2026-07-08): `peek_head` used to return the RAW
     /// `backend.head(...)` size (physical, header-included), while the fresh-condemn hook `head_blob`
-    /// strips the pool's fixed blob header via `retiredLogicalSize` before the size lands in
+    /// strips the pool's fixed blob header before the size lands in
     /// `RetiredEntry.size`. That mismatch meant supersede-minted entries and fresh-condemn entries carried
     /// two different unit conventions in the SAME persisted `RetiredSet`. The superseded entry (now naming
     /// the fresh token B) must carry the LOGICAL size -- i.e. the payload length, with the pool's blob
@@ -650,4 +648,20 @@ TEST(CASObservability, IntentRequestsCountInTheirOwnClass)
     (void)intent_get; (void)intent_put; (void)intent_delete; (void)intent_list;
     (void)blob_get; (void)blob_put; (void)blob_delete; (void)blob_list; (void)other_put_deduplicated;
 #endif
+}
+
+TEST(CASObservability, IntentCountersAreRegistered)
+{
+    const std::vector<std::string_view> names{
+        "CASGCIntentCreated", "CASGCIntentConfirmedExisting", "CASGCIntentUnconfirmedCarry", "CASGCIntentDeleted",
+        "CASGCIntentLeftOnSpare", "CASGCIntentTokenRejected", "CASBlobReuseIntentPresent", "CASBlobReuseTokenRejected"};
+    for (const std::string_view name : names)
+    {
+        std::optional<ProfileEvents::Event> found;
+        for (ProfileEvents::Event event = ProfileEvents::Event(0); event < ProfileEvents::end(); ++event)
+            if (ProfileEvents::getName(event) == name)
+                found = event;
+        ASSERT_TRUE(found.has_value()) << name << " is not a registered ProfileEvent";
+        EXPECT_FALSE(ProfileEvents::getDocumentation(*found).empty()) << name;
+    }
 }

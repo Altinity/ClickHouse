@@ -117,11 +117,9 @@ TEST(CASGCBaselineGuard, AbsentAdoptedSealFailsClosed)
 /// live blob intact, the round minted strictly above the last one seen, and the REBUILT baseline is a
 /// working one — a ref dropped AFTER it is still reclaimed by ordinary rounds.
 ///
-/// A blob dropped BEFORE the rebuild is a different matter, and this test pins it: the rebuild derives
-/// edges from owner state, so a blob no owner names gets no row at all, and a rebuild CONDEMNS NOTHING
-/// (spec §7 — the condemnation that used to catch this case was the r5-finding-4 data-loss vector).
-/// Such a blob is retained until register R4's build/upload registry can enumerate it safely. That is
-/// the NAMED Stage-A residual, and it is asserted here rather than left to be discovered.
+/// A blob dropped BEFORE the rebuild gets no row from the rebuilt baseline, and a rebuild condemns nothing. Here
+/// the drop was condemned before the rebuild, so its deletion intent stands; the intent sweep adopts it and
+/// ordinary rounds reclaim the body.
 TEST(CASGCRebuild, RecoversLostStateAndConverges)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -166,17 +164,15 @@ TEST(CASGCRebuild, RecoversLostStateAndConverges)
     /// Round strictly above the fence/state/generation numbers seen so far.
     EXPECT_GT(rep.round, pre_rebuild_round);
 
-    /// The live blob is intact, and blob 2 — dropped BEFORE the rebuild, so invisible to a baseline
-    /// derived from owner state — is RETAINED. Retention, not loss: the named residual above.
+    /// The live blob is intact, and blob 2, whose intent stood through the rebuild, is reclaimed.
     for (int i = 0; i < 4; ++i)
     {
         runRegularRoundReclaiming(gc2);
         store->renewWatermarkOnce();
     }
     EXPECT_TRUE(headObj(*backend, store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(1))})).has_value());
-    EXPECT_TRUE(headObj(*backend, store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(2))})).has_value())
-        << "a rebuild condemns nothing, so a pre-rebuild drop is retained — never reclaimed by a "
-           "substitute pass, and never lost";
+    EXPECT_FALSE(headObj(*backend, store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(2))})).has_value())
+        << "the intent of the pre-rebuild drop was not adopted";
 
     /// The rebuilt baseline is a WORKING one: a ref published over it and then dropped still folds to
     /// zero and is reclaimed by ordinary rounds. Without this the test would prove only that the
@@ -755,7 +751,6 @@ NamespaceLifeId seedSkippedEpochChain(Backend & backend, const Layout & layout, 
 
 TEST(CASGCRebuild, RebuildFollowsASkippedEpoch)
 {
-    ScopedReadCeiling c(3);
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
     const Layout & layout = store->layout();
@@ -776,7 +771,6 @@ TEST(CASGCRebuild, RebuildFollowsASkippedEpoch)
 
 TEST(CASGCRebuild, RebuildFailsWhenTheBaseMoves)
 {
-    ScopedReadCeiling c(3);
     auto backend = std::make_shared<SweepReadHookBackend>();
     auto store = openPoolForTest(backend);
     const Layout & layout = store->layout();

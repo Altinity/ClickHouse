@@ -38,7 +38,7 @@ struct GcState
     String intent_sweep_cursor;    /// best-effort orphan blob-intent cleanup cursor; header 4 only
     /// The header generation: `encodeGcState` stamps it, `decodeGcState` reports it. `G_BLOB_INTENTS` is the
     /// barrier an older GC refuses; `intent_sweep_cursor` is valid only at that header.
-    uint32_t header_generation = G_WRITE_FLOOR;
+    uint32_t header_generation = G_BLOB_INTENTS;
     GcLease lease;
 };
 

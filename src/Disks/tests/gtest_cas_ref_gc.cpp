@@ -1915,7 +1915,7 @@ TEST(CASRefGc, NonCanonicalLifeKeyAbortsRefFoldingWithoutWedgingTheRound)
     EXPECT_TRUE(rep.hasAnomaly(RootNamespace{}, /*shard*/ 0))
         << "the refusal must surface as the fold's abort anomaly, not vanish";
     EXPECT_EQ(rep.deleted, 0u);
-    EXPECT_EQ(rep.redeleted, 0u);
+    EXPECT_EQ(rep.bodies_deleted, 0u);
 
     /// Same fail-close as (8): no partial delta, no cursor advance.
     EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(1)), 0)

@@ -263,12 +263,15 @@ TEST(CASBlobPublishDigest, S3StagedRestreamIsVerified)
     EnvelopeHeader header;
     header.kind = ObjectKind::Blob;
     header.incarnation_tag = DB::UInt128{101};
+    const String staged_bytes = encodeEnvelopeHeader(header, static_cast<uint32_t>(header_len)) + flipOneByte(payload);
     {
         OperationForTest op(*backend);
-        (*op).create(staging_key, encodeEnvelopeHeader(header, static_cast<uint32_t>(header_len)) + flipOneByte(payload), Retry::standard());
+        (*op).create(staging_key, staged_bytes, Retry::standard());
+        /// The copy will land with this store's content token: its incarnation is under an intent already.
+        const auto identity = canonicalIdentity(Dialect::Emulated, sipHash128String(staged_bytes));
+        ASSERT_TRUE(identity.has_value());
+        (*op).create(pool->layout().blobIntentKey(ref, *identity), blobIntentRecord(), Retry::standard());
     }
-    DB::Cas::tests::writeMetaClean(*backend, pool->layout(), u128Of(payload), payload.size());
-    DB::Cas::tests::condemnMeta(*backend, pool->layout(), u128Of(payload), 31);
     auto build = precommittedBuild(pool, payload);
 
     BlobSource staged;
