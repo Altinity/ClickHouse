@@ -695,20 +695,14 @@ std::vector<ConditionalRemoveResult> S3ObjectStorage::removeObjectsIfTokensMatch
         {
             const auto & error = current_outcome.GetError();
             log_all(static_cast<Int32>(error.GetErrorType()), error.GetMessage());
-            if (error.GetExceptionName() == "InvalidRequest" || error.GetExceptionName() == "InvalidArgument"
-                || error.GetExceptionName() == "NotImplemented")
-            {
-                s3_capabilities.setIsBatchDeleteSupported(false);
-                throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{} does not support DeleteObjects", getName());
-            }
+            if (error.GetExceptionName() == "NotImplemented")
+                throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{} does not support conditional DeleteObjects", getName());
             throw S3Exception(
                 PreformattedMessage::create("{} while conditionally removing objects from S3", error.GetMessage()),
                 error.GetErrorType(), error.GetExceptionName());
         }
         return current_outcome;
     });
-    s3_capabilities.setIsBatchDeleteSupported(true);
-
     std::unordered_set<String> expected_keys;
     expected_keys.reserve(objects.size());
     for (const ConditionalRemoveObject & object : objects)
@@ -954,6 +948,11 @@ size_t S3ObjectStorage::batchDeleteKeyLimit() const
 {
     if (const auto supported = s3_capabilities.isBatchDeleteSupported(); supported.has_value() && !*supported)
         return 1;
+    return configuredBatchDeleteKeyLimit();
+}
+
+size_t S3ObjectStorage::configuredBatchDeleteKeyLimit() const
+{
     return std::max<size_t>(1, s3_settings.get()->request_settings[S3RequestSetting::objects_chunk_size_to_delete]);
 }
 

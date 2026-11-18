@@ -145,6 +145,7 @@ public:
 
     /// `objects_chunk_size_to_delete`, at least 1, while `DeleteObjects` is not known unsupported; 1 after.
     size_t batchDeleteKeyLimit() const override;
+    size_t configuredBatchDeleteKeyLimit() const override;
 
     void tagObjects(const StoredObjects & objects, const std::string & tag_key, const std::string & tag_value) override;
 

@@ -470,6 +470,10 @@ public:
     /// suits a storage without a batch delete.
     virtual size_t batchDeleteKeyLimit() const { return 1; }
 
+    /// The configured key limit for a multi-object delete request, independent of any learned
+    /// capability. A caller that probes conditional delete support can apply its own capability gate.
+    virtual size_t configuredBatchDeleteKeyLimit() const { return 1; }
+
     /// Copy object with different attributes if required
     virtual void copyObject( /// NOLINT
         const StoredObject & object_from,

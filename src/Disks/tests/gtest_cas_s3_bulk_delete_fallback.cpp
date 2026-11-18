@@ -4,8 +4,10 @@
 
 #if USE_AWS_S3
 
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/S3/S3ObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
+#include <Disks/tests/cas_test_helpers.h>
 #include <IO/S3/Client.h>
 #include <IO/S3/S3Capabilities.h>
 #include <IO/S3/URI.h>
@@ -344,13 +346,18 @@ TEST(CASS3ConditionalBatchDelete, ReturnsPerKeyOutcomesInInputOrder)
     EXPECT_NE(server.lastBody().find("<ETag>etag-second</ETag>"), std::string::npos);
 }
 
-TEST(CASS3ConditionalBatchDelete, ConvertsExplicitUnsupportedToNotImplemented)
+TEST(CASS3ConditionalBatchDelete, UnsupportedConditionalRequestDoesNotDisableOrdinaryBatch)
 {
     (void)contextForTest();
 
-    ScriptedS3Server server([](const Poco::Net::HTTPServerRequest &, Poco::Net::HTTPServerResponse & response)
+    std::atomic<size_t> attempts{0};
+    ScriptedS3Server server([&](const Poco::Net::HTTPServerRequest & request, Poco::Net::HTTPServerResponse & response)
     {
-        sendBatchNotImplemented(response);
+        EXPECT_EQ(request.getMethod(), "POST");
+        if (attempts++ == 0)
+            sendBatchNotImplemented(response);
+        else
+            sendDeleteObjectsResult(response, {});
     });
     auto storage = makeStorageForTest(server.getUrl(), DB::S3Capabilities{});
 
@@ -360,7 +367,11 @@ TEST(CASS3ConditionalBatchDelete, ConvertsExplicitUnsupportedToNotImplemented)
             {{DB::StoredObject("first"), "etag-first"}, {DB::StoredObject("second"), "etag-second"}},
             DB::ObjectStorageControlRequest{});
     });
-    EXPECT_EQ(storage->batchDeleteKeyLimit(), 1u);
+    EXPECT_EQ(storage->batchDeleteKeyLimit(), 1000u);
+    EXPECT_NO_THROW(storage->removeObjectsIfExistUnderProfile(
+        {DB::StoredObject("first"), DB::StoredObject("second")}, DB::ObjectStorageControlRequest{}));
+    EXPECT_EQ(server.countMethod("POST"), 2u);
+    EXPECT_EQ(server.countMethod("DELETE"), 0u);
 }
 
 TEST(CASS3ConditionalBatchDelete, RefreshesExpiredCredentialsBeforeReturningFailure)
@@ -630,10 +641,87 @@ void expectRefusalNamed(const std::function<void()> & remove, const std::string 
     {
         EXPECT_EQ(e.getExceptionName(), name) << e.message();
     }
+    catch (const DB::Exception & e)
+    {
+        ADD_FAILURE() << "expected an S3Exception named " << name << ", got " << e.message();
+    }
 }
 
 const DB::StoredObjects kTwoObjects{DB::StoredObject("key-a"), DB::StoredObject("key-b")};
 
+}
+
+TEST(CASS3ConditionalBatchDelete, InvalidRequestAndArgumentRemainErrors)
+{
+    (void)contextForTest();
+    for (const std::string name : {"InvalidRequest", "InvalidArgument"})
+    {
+        SCOPED_TRACE(name);
+        ScriptedS3Server server([&](const Poco::Net::HTTPServerRequest & request, Poco::Net::HTTPServerResponse & response)
+        {
+            EXPECT_EQ(request.getMethod(), "POST");
+            sendSingleDeleteError(response, Poco::Net::HTTPResponse::HTTP_BAD_REQUEST, name, "invalid conditional delete input");
+        });
+        auto storage = makeStorageForTest(server.getUrl(), DB::S3Capabilities{});
+
+        expectRefusalNamed([&]
+        {
+            storage->removeObjectsIfTokensMatch(
+                {{DB::StoredObject("first"), "etag-first"}, {DB::StoredObject("second"), "etag-second"}},
+                DB::ObjectStorageControlRequest{});
+        }, name);
+        EXPECT_EQ(storage->batchDeleteKeyLimit(), 1000u);
+        EXPECT_EQ(server.countMethod("POST"), 1u);
+        EXPECT_EQ(server.countMethod("DELETE"), 0u);
+    }
+}
+
+TEST(CASConditionalBatchDeleteBackend, RuntimeFailureDoesNotDowngradePinnedCapability)
+{
+    using namespace DB::Cas;
+    (void)contextForTest();
+    std::atomic<size_t> delete_attempts{0};
+    ScriptedS3Server server([&](const Poco::Net::HTTPServerRequest & request, Poco::Net::HTTPServerResponse & response)
+    {
+        if (request.getMethod() == "HEAD")
+        {
+            response.setContentLength(1);
+            response.set("ETag", "\"head-etag\"");
+            response.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_OK);
+            response.send();
+            return;
+        }
+        EXPECT_EQ(request.getMethod(), "POST");
+        if (delete_attempts++ < 2)
+            sendBatchNotImplemented(response);
+        else
+            sendConditionalDeleteObjectsResult(response);
+    });
+    auto storage = makeStorageForTest(server.getUrl(), DB::S3Capabilities{}, 7);
+    auto backend = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
+    auto requests = tests::openRequestsForTest(backend);
+    auto op = requests.admit();
+    EXPECT_EQ(backend->conditionalBatchDeleteKeyLimit(), 1u);
+    backend->pinConditionalBatchDeleteSupport(true);
+    ASSERT_EQ(backend->conditionalBatchDeleteKeyLimit(), 7u);
+
+    const auto first = op.head("first", Retry::once());
+    const auto second = op.head("second", Retry::once());
+    ASSERT_TRUE(first && second);
+    const std::vector<ConditionalRemove> removals{{"first", first->etag}, {"second", second->etag}};
+    expectNotImplemented([&] { op.removeManyByConditional(removals, Retry::once()); });
+    ASSERT_EQ(backend->conditionalBatchDeleteKeyLimit(), 7u);
+
+    expectNotImplemented([&]
+    {
+        storage->removeObjectsIfExistUnderProfile(kTwoObjects, DB::ObjectStorageControlRequest{});
+    });
+    EXPECT_EQ(backend->bulkDeleteKeyLimit(), 1u);
+    ASSERT_EQ(backend->conditionalBatchDeleteKeyLimit(), 7u);
+    EXPECT_EQ(op.removeManyByConditional(removals, Retry::once()), (std::vector{Removal::Removed, Removal::Mismatch}));
+    EXPECT_EQ(backend->bulkDeleteKeyLimit(), 1u);
+    EXPECT_EQ(server.countMethod("POST"), 3u);
+    EXPECT_EQ(server.countMethod("DELETE"), 0u);
 }
 
 TEST(CASS3BatchDelete, RefusedDeleteObjectsKeepsTheStoresErrorName)
