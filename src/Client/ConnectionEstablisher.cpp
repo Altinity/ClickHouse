@@ -108,7 +108,9 @@ void ConnectionEstablisher::run(ConnectionEstablisher::TryResult & result, std::
         /// handshake is the check. A failed ping is a soft error, so the retry below reconnects once.
         if (ping_pooled && result.entry->isConnected())
         {
-            if (!result.entry->ping(*timeouts))
+            /// `ping` is private. `checkConnected` is the public wrapper, and this branch
+            /// already knows the connection is established, so it only runs the ping.
+            if (!result.entry->checkConnected(*timeouts))
             {
                 LOG_TRACE(log, "Pooled connection did not answer a ping, will reconnect.");
                 throw Exception(ErrorCodes::SOCKET_TIMEOUT, "Ping of a pooled connection failed");
