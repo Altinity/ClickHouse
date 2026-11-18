@@ -415,6 +415,13 @@ deletes for entries a *previous* round published as `delete_pending`, processing
 `cas_gc_round_redelete_budget` entries per round (the excess is carried unchanged), and writes the
 forensic outcome logs.
 
+In the GC code and metrics, a **chunk** is the group of keys handled by one delete job. A chunk can
+contain a single key. A **batch** is one storage request that carries multiple keys, such as S3
+`DeleteObjects`. The mount probe checks whether the backend supports conditional batches, and GC
+uses one-key chunks when that capability is unavailable. Those jobs can still run concurrently
+according to `cas_gc_io_concurrency`. **Bulk delete** names the overall feature, including the
+sequence of requests needed to process many keys.
+
 - **Runs on:** fold path only
 - **Reads:** one `HEAD` per `redelete` entry — the persisted condemned token cannot itself be a
   precondition, so the round observes the blob first, which also settles the absent case without

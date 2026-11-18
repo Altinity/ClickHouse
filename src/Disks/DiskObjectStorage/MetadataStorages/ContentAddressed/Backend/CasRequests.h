@@ -35,8 +35,6 @@ namespace DB::Cas
 {
 
 class CasOperation;
-struct CapabilityProbeResult;
-CapabilityProbeResult runCapabilityProbe(CasOperation & op, const String & probe_prefix);
 
 /// TRUE when the store's own answer proves this write never applied: a malformed request, an entity
 /// too large, an access denial, or a credential failure. Whether a STALE CREDENTIAL explains it is not
@@ -374,7 +372,7 @@ public:
     WriteResult readModifyWriteOnPresence(const String & key, const DecideOnMeta & decide, const Retry & policy);
 
 private:
-    friend CapabilityProbeResult runCapabilityProbe(CasOperation & op, const String & probe_prefix);
+    friend bool probeConditionalBatchDelete(CasOperation & op, const String & probe_prefix, const ConditionalRemove & absent_key);
 
     std::vector<Removal> removeManyByConditional(
         const std::vector<ConditionalRemove> & removals, const Retry & policy, const size_t limit);
