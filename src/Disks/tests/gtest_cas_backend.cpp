@@ -61,10 +61,11 @@ BlobPublishRequest streamingPublication(
         .publication = StreamingBlobPublication{
             .payload_size = payload_size,
             .fresh_envelope = std::move(fresh_envelope),
-            .open_payload = [stored_payload = std::move(payload)]
+            .open_payload = [stored_payload = payload]
             {
                 return std::make_unique<DB::ReadBufferFromOwnString>(stored_payload);
-            }}};
+            },
+            .expected_ref = DB::Cas::tests::idOf(payload)}};
 }
 
 struct CountingSourceState
@@ -113,7 +114,8 @@ BlobPublishRequest countedLongPublication(
             .open_payload = [source_size, state]
             {
                 return std::make_unique<OneByteAtATimeReadBuffer>(source_size, state);
-            }}};
+            },
+            .expected_ref = DB::Cas::tests::idOf(String(payload_size, 'x'))}};
 }
 
 class PublishCountingInMemoryBackend final : public InMemoryBackend
@@ -348,7 +350,8 @@ TEST(CASInMemory, PublishBlobKeepsThePreviousIncarnationVisibleUntilTheCompleteB
                 if (release.wait_for(20s) != std::future_status::ready)
                     release_wait_expired = true;
                 return std::make_unique<DB::ReadBufferFromOwnString>(String("payload"));
-            }}};
+            },
+            .expected_ref = DB::Cas::tests::idOf("payload")}};
 
     /// `CasOperation` carries mutable per-call state and is single-threaded by design: the publish and
     /// the concurrent read below each admit their OWN operation from the shared `requests` rather than
@@ -1100,6 +1103,31 @@ TEST(CASObjectStorageBackend, PublishBlobCancelsShortAndLongStreamingSourcesBefo
     EXPECT_EQ(storage->finalize_calls, 0u);
     EXPECT_EQ(storage->bytes_at_cancel, 8u);
     EXPECT_EQ(readStorageObject(storage, destination), "old-complete-body");
+}
+
+TEST(CASObjectStorageBackend, PublishBlobCancelsAPayloadThatDoesNotHashToItsKey)
+{
+    auto storage = makePublicationRecordingStorage();
+    auto backend = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const String destination = DB::Cas::tests::nativeKeyUnder(storage, "publish/digest-mismatch");
+    storage->resetRecording();
+    storage->record_cancellation_only = true;
+
+    /// Same length as "payload", other bytes: only the digest check can refuse it.
+    auto request = streamingPublication(destination, "fresh", "paylaod", 7);
+    std::get<StreamingBlobPublication>(request.publication).expected_ref = DB::Cas::tests::idOf("payload");
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { op.publish(request, Retry::once()); });
+    EXPECT_EQ(storage->cancel_calls, 1u);
+    EXPECT_EQ(storage->finalize_calls, 0u);
+    EXPECT_EQ(storage->bytes_at_cancel, String("freshpaylaod").size()) << "the refusal must follow the whole payload";
+
+    /// Positive control: the true payload completes the object.
+    storage->resetRecording();
+    storage->record_cancellation_only = false;
+    op.publish(streamingPublication(destination, "fresh", "payload", 7), Retry::once());
+    EXPECT_EQ(readStorageObject(storage, destination), "freshpayload");
 }
 
 TEST(CASObjectStorageBackend, PublishBlobEmulatedLongSourceReadsOnlyDeclaredPayloadAndOneProbeByte)

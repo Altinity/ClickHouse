@@ -48,6 +48,7 @@
 namespace DB::ErrorCodes
 {
 extern const int BAD_ARGUMENTS;
+extern const int CORRUPTED_DATA;
 extern const int UNKNOWN_FORMAT_VERSION;
 }
 
@@ -908,7 +909,9 @@ TEST(CASPluggableHash, SameDigestDifferentAlgoDistinctBodiesAndSettlement)
 
     /// SAME 16-byte digest VALUE under two different algos -- deliberately NOT derived from either
     /// body's real content hash: the crux under test is identity distinctness (the pair), not hash
-    /// correctness (already covered by the sha256/xxh3 write-path tests above).
+    /// correctness (already covered by the sha256/xxh3 write-path tests above). A streamed
+    /// publication refuses a payload that does not hash to its key, so both bodies and their clean
+    /// markers are planted directly and `putBlob` adopts them.
     const BlobDigest shared_digest = BlobDigest::fromU128(UInt128(0xC0FFEE));
     const BlobRef ref_ch{BlobHashAlgo::CityHash128, shared_digest};
     const BlobRef ref_xx{BlobHashAlgo::XXH3_128, shared_digest};
@@ -922,6 +925,18 @@ TEST(CASPluggableHash, SameDigestDifferentAlgoDistinctBodiesAndSettlement)
 
     const RootNamespace ns{"srv1/tbl"};
 
+    const auto plantBlob = [&](const BlobRef & ref, const std::string & payload)
+    {
+        EnvelopeHeader header;
+        header.kind = ObjectKind::Blob;
+        header.incarnation_tag = UInt128(0x1234);
+        OperationForTest op(*backend);
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(store->layout().blobKey(ref),
+            encodeEnvelopeHeader(header, static_cast<uint32_t>(store->poolMeta().blob_header_len)) + payload, Retry::standard())));
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(store->layout().blobMetaKey(ref),
+            encodeBlobMeta(BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = payload.size()}), Retry::standard())));
+    };
+
     PartWriteInfo info_a;
     info_a.intended_ref = ns.string() + "/part_a";
     auto build_a = store->beginPartWrite(info_a);
@@ -929,6 +944,7 @@ TEST(CASPluggableHash, SameDigestDifferentAlgoDistinctBodiesAndSettlement)
     e_a.path = "a.bin"; e_a.placement = EntryPlacement::Blob; e_a.ref = ref_ch; e_a.blob_size = body_ch.size();
     const ManifestId mid_a = build_a->stageManifest({e_a});
     build_a->precommitAdd(ns, "part_a", mid_a);
+    ASSERT_NO_FATAL_FAILURE(plantBlob(ref_ch, body_ch));
     build_a->putBlob(ref_ch, BlobSource::fromString(body_ch));
     build_a->promote(ns, "part_a", build_a->buildId(), mid_a);
 
@@ -939,6 +955,7 @@ TEST(CASPluggableHash, SameDigestDifferentAlgoDistinctBodiesAndSettlement)
     e_b.path = "b.bin"; e_b.placement = EntryPlacement::Blob; e_b.ref = ref_xx; e_b.blob_size = body_xx.size();
     const ManifestId mid_b = build_b->stageManifest({e_b});
     build_b->precommitAdd(ns, "part_b", mid_b);
+    ASSERT_NO_FATAL_FAILURE(plantBlob(ref_xx, body_xx));
     build_b->putBlob(ref_xx, BlobSource::fromString(body_xx));
     build_b->promote(ns, "part_b", build_b->buildId(), mid_b);
     store->renewWatermarkOnce();
@@ -993,4 +1010,43 @@ TEST(CASPluggableHash, SameDigestDifferentAlgoDistinctBodiesAndSettlement)
     const FsckReport frep = runFsck(*store, /*detail=*/true);
     EXPECT_TRUE(frep.clean());
     EXPECT_EQ(frep.dangling, 0u);
+}
+
+/// A streamed body that does not hash to its key under the pool's own algorithm is refused.
+TEST(CASPluggableHash, WrongDigestIsRefusedForXxh3AndSha256)
+{
+    for (const BlobHashAlgo algo : {BlobHashAlgo::XXH3_128, BlobHashAlgo::Sha256})
+    {
+        SCOPED_TRACE(static_cast<int>(algo));
+        auto backend = std::make_shared<InMemoryBackend>();
+        auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .blob_hash_algo = algo});
+        const RootNamespace ns{"srv1/tbl"};
+        const std::string payload = makeMultiBlockPayload();
+        std::string wrong = payload;
+        wrong[wrong.size() / 2] ^= 1;
+        const BlobRef id{algo, codecFor(algo).fromHex(blobHashHexOneShot(algo, payload))};
+
+        const auto precommitted = [&](const String & part)
+        {
+            PartWriteInfo info;
+            info.intended_ref = ns.string() + "/" + part;
+            auto build = store->beginPartWrite(info);
+            ManifestEntry e;
+            e.path = "data.bin";
+            e.placement = EntryPlacement::Blob;
+            e.ref = id;
+            e.blob_size = payload.size();
+            build->precommitAdd(ns, part, build->stageManifest({e}));
+            return build;
+        };
+
+        auto refused = precommitted("refused");
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { refused->putBlob(id, BlobSource::fromString(wrong)); });
+        EXPECT_FALSE(existsAt(*backend, store->layout().blobKey(id)));
+
+        /// Positive control: the true payload lands at the same key.
+        auto accepted = precommitted("accepted");
+        accepted->putBlob(id, BlobSource::fromString(payload));
+        EXPECT_TRUE(existsAt(*backend, store->layout().blobKey(id)));
+    }
 }

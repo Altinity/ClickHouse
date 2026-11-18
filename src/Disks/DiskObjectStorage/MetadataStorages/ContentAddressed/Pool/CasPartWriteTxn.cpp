@@ -494,7 +494,7 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
                     ErrorCodes::LOGICAL_ERROR,
                     "PartWriteTxn::ensureBlobPresent: streaming source for {} is not re-readable",
                     key);
-            publication = StreamingBlobPublication{source.size, buildHeader(), source.open};
+            publication = StreamingBlobPublication{source.size, buildHeader(), source.open, req.ref};
         }
 
         try

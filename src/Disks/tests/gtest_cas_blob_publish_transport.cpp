@@ -65,7 +65,8 @@ DB::Cas::BlobPublishRequest streamingPublication()
             .open_payload = []
             {
                 return std::make_unique<DB::ReadBufferFromOwnString>(std::string(100, 'p'));
-            }}};
+            },
+            .expected_ref = DB::Cas::tests::idOf(std::string(100, 'p'))}};
 }
 
 /// One engine attempt of the backend's blob publication, so every counted request comes from below it.

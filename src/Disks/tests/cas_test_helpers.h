@@ -479,22 +479,21 @@ inline String nativeKeyUnder(const DB::ObjectStoragePtr & storage, const String 
 /// These produce objects through the SAME codecs the Pool reads — the documented on-storage
 /// interface, not white-box pokes — so a test asserts a real round trip across the format boundary.
 
-/// CityHash128 of bytes, composed into the canonical lowercase-hex id.
-inline String hexOf(const String & bytes)
-{
-    return getHexUIntLowercase(CityHash_v1_0_2::CityHash128(bytes.data(), bytes.size()));
-}
-
 /// The POOL-WIDE streaming content hash (the production `HashingWriteBuffer` convention: chunked
-/// CityHash128, block = DBMS_DEFAULT_HASHING_BLOCK_SIZE). Tests that exercise the copy-forward
-/// VERIFICATION path must mint blob ids with THIS — the plain `idOf`/`u128Of` below are a
-/// test-local convention (fine everywhere hashes are opaque; refused by the verifier).
+/// CityHash128, block = DBMS_DEFAULT_HASHING_BLOCK_SIZE).
 inline String streamingHexOf(const String & payload)
 {
     DB::ReadBufferFromMemory in(payload.data(), payload.size());
     DB::HashingReadBuffer hashing(in);
     hashing.ignoreAll();
     return getHexUIntLowercase(hashing.getHash());
+}
+
+/// The content id of `bytes` as canonical lowercase hex: the streaming hash, because a streamed blob
+/// publication is verified against its key and refuses any other convention.
+inline String hexOf(const String & bytes)
+{
+    return streamingHexOf(bytes);
 }
 
 /// The content id of `bytes` as a UInt128 — definitionally consistent with `idOf` (parses the same hex).

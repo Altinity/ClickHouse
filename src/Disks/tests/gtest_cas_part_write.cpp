@@ -2543,19 +2543,20 @@ TEST(CASPartWriteTxn, WDepSetCrossAlgoSatisfactionFailsClosed)
     auto s = openPool(b);
     const RootNamespace ns{"srv/tbl"};
 
-    const BlobDigest shared_digest = BlobDigest::fromU128(u128Of("shared-digest-value"));
+    const String payload = "shared-digest-value";
+    const BlobDigest shared_digest = BlobDigest::fromU128(u128Of(payload));
 
     ManifestEntry e_ch128;
     e_ch128.path = "a.bin";
     e_ch128.placement = EntryPlacement::Blob;
     e_ch128.ref = BlobRef{BlobHashAlgo::CityHash128, shared_digest};
-    e_ch128.blob_size = 3;
+    e_ch128.blob_size = payload.size();
 
     ManifestEntry e_xxh3;
     e_xxh3.path = "b.bin";
     e_xxh3.placement = EntryPlacement::Blob;
     e_xxh3.ref = BlobRef{BlobHashAlgo::XXH3_128, shared_digest};   /// SAME digest bytes, DIFFERENT algo
-    e_xxh3.blob_size = 3;
+    e_xxh3.blob_size = payload.size();
 
     auto build = startBuildFor(s, ns, "part_mixed");
     const ManifestId id = build->stageManifest({e_ch128, e_xxh3});
@@ -2564,7 +2565,7 @@ TEST(CASPartWriteTxn, WDepSetCrossAlgoSatisfactionFailsClosed)
     /// Only the ch128 leaf's body is ever uploaded — its BlobId hex is the digest at the ch128 width,
     /// which addresses EXACTLY `e_ch128`'s object key (`blobs/ch128/...`), a DISTINCT key from
     /// `e_xxh3`'s (`blobs/xxh3/...`), even though the raw digest bytes are identical.
-    build->putBlob(BlobRef{BlobHashAlgo::CityHash128, shared_digest}, BlobSource::fromString("abc"));
+    build->putBlob(BlobRef{BlobHashAlgo::CityHash128, shared_digest}, BlobSource::fromString(payload));
 
     /// Promotion must fail closed: the xxh3:X leaf has no dependency proof — never silently
     /// satisfied by the ch128:X entry's materialized proof (same digest bytes, distinct object key). §4

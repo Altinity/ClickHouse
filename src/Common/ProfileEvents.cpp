@@ -970,6 +970,7 @@ The server successfully detected this situation and will download merged part fr
     M(CASMetaCompareSwap,          "Number of conditional CAS blob-metadata rewrites, including lost races. Growing values indicate metadata updates or contention.", ValueType::Number) \
     M(CASMetaDelete,       "Number of exact-token CAS blob-metadata delete attempts. Growth indicates GC or cleanup activity.", ValueType::Number) \
     M(CASMetaCreateClean,  "Number of publications after an absent body or an absent marker that entered Clean metadata reconciliation. Counts the reason entry, not a guaranteed metadata creation.", ValueType::Number) \
+    M(CASBlobPublishDigestMismatch, "Number of streamed CAS blob publications refused because the payload did not hash to the blob's key. Any non-zero value means a corrupted or changed source.", ValueType::Number) \
     M(CASMetaAbsentRepublish, "Number of blob publication attempts started because the body was present but its freshness marker was absent; such a body is republished, never adopted. Counts attempts, including ones that fail.", ValueType::Number) \
     M(CASMetaResurrectClean, "Number of condemned-body replacement paths that entered Clean metadata reconciliation. Counts the reason entry, not a guaranteed metadata reset.", ValueType::Number) \
     M(CASGCMetaOps, "Number of per-hash metadata operations executed by CAS GC. Growing values indicate more GC candidates or metadata work.", ValueType::Number) \
