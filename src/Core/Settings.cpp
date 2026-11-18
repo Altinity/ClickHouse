@@ -3126,6 +3126,22 @@ Possible values:
 - 0 — The column name is substituted with the alias.
 - 1 — The column name is not substituted with the alias.
 
+If the column name is ambiguous between joined tables and an alias with the same name exists, the alias is used:
+
+```sql
+SET prefer_column_name_to_alias = 1;
+SELECT t1.id + 10 AS id, id AS x
+FROM (SELECT 1 AS id) AS t1, (SELECT 1 AS k) AS t2, (SELECT 2 AS id) AS t3;
+```
+
+```text
+┌─id─┬──x─┐
+│ 11 │ 11 │
+└────┴────┘
+```
+
+Here `id` in `id AS x` is a column of both `t1` and `t3`, so it resolves to the alias `t1.id + 10`.
+
 **Example**
 
 The difference between enabled and disabled:
@@ -8353,7 +8369,7 @@ Cloud default value: `1`.
 Allow the analyzer.
 )", IMPORTANT, enable_analyzer) \
     DECLARE(Bool, analyzer_compatibility_join_using_top_level_identifier, false, R"(
-Force to resolve identifier in JOIN USING from projection (for example, in `SELECT a + 1 AS b FROM t1 JOIN t2 USING (b)` join will be performed by `t1.a + 1 = t2.b`, rather then `t1.b = t2.b`). Aliases defined on subexpressions inside the SELECT list are also considered (for example, in `SELECT uniqExact(a + 1 AS b) FROM t1 JOIN t2 USING (b)` the join is performed by `t1.a + 1 = t2.b`). When the matching alias is defined on a subexpression inside the SELECT list rather than as a top-level alias, parallel replicas are disabled for the query. For queries sent to remote servers (`Distributed` tables, the `remote` table function), such a query is rejected with an exception only when the identifier cannot be resolved on the remote server at all; if the alias shadows a real column of the left table, the remote server joins by that column instead, so the results may differ from local execution.
+Force to resolve identifier in JOIN USING from projection (for example, in `SELECT a + 1 AS b FROM t1 JOIN t2 USING (b)` join will be performed by `t1.a + 1 = t2.b`, rather then `t1.b = t2.b`). Aliases defined on subexpressions inside the SELECT list are also considered (for example, in `SELECT uniqExact(a + 1 AS b) FROM t1 JOIN t2 USING (b)` the join is performed by `t1.a + 1 = t2.b`). In a query with several `JOIN`s only the outermost `JOIN` resolves its `USING` identifier from an alias; an inner `JOIN` resolves it from its left table, as the old analyzer did. When the matching alias is defined on a subexpression inside the SELECT list rather than as a top-level alias, parallel replicas are disabled for the query. For queries sent to remote servers (`Distributed` tables, the `remote` table function), such a query is rejected with an exception only when the identifier cannot be resolved on the remote server at all; if the alias shadows a real column of the left table, the remote server joins by that column instead, so the results may differ from local execution.
 )", 0) \
     DECLARE(Bool, analyzer_compatibility_allow_compound_identifiers_in_unflatten_nested, true, R"(
 Allow to add compound identifiers to nested. This is a compatibility setting because it changes the query result. When disabled, `SELECT a.b.c FROM table ARRAY JOIN a` does not work, and `SELECT a FROM table` does not include `a.b.c` column into `Nested a` result.
