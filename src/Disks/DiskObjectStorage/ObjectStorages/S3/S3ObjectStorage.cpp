@@ -667,7 +667,7 @@ std::vector<ConditionalRemoveResult> S3ObjectStorage::removeObjectsIfTokensMatch
     request_s3.SetBucket(uri.bucket);
     request_s3.SetDelete(std::move(delete_request));
     if (request.attempt_number != 0)
-        S3::setClickhouseAttemptNumber(request_s3, request.attempt_number);
+        S3::setClickHouseAttemptNumber(request_s3, request.attempt_number);
     auto blob_storage_log = BlobStorageLogWriter::create(disk_name);
     const auto log_object = [&](const StoredObject & object, Int32 error_code, const String & error_message)
     {
