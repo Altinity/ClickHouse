@@ -163,6 +163,7 @@ extern const SettingsBool allow_experimental_iceberg_compaction;
 extern const SettingsBool allow_experimental_geo_types_in_iceberg;
 extern const SettingsBool allow_iceberg_remove_orphan_files;
 extern const SettingsBool allow_experimental_expire_snapshots;
+extern const SettingsBool allow_experimental_iceberg_add_files;
 extern const SettingsSeconds lock_acquire_timeout;
 extern const SettingsSeconds iceberg_compaction_delay_bias;
 extern const SettingsSeconds iceberg_compaction_data_cleanup;
@@ -1118,6 +1119,14 @@ Pipe IcebergMetadata::executeCommand(
     }
     else if (command_name == "add_files")
     {
+        if (!context->getSettingsRef()[Setting::allow_experimental_iceberg_add_files].value)
+        {
+            throw Exception(
+                ErrorCodes::SUPPORT_IS_DISABLED,
+                "Iceberg add_files is experimental. "
+                "To allow its usage, enable setting allow_experimental_iceberg_add_files");
+        }
+
         checkTableRootIsQueriedPath("add_files");
         return Iceberg::executeAddFiles(
             args, context, object_storage_, data_lake_settings, persistent_components,

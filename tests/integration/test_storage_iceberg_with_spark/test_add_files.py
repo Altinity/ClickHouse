@@ -1,5 +1,7 @@
 import io
+import json
 import os
+import re
 import tempfile
 
 import pyarrow as pa
@@ -8,12 +10,14 @@ import pytest
 
 from helpers.iceberg_utils import (
     create_iceberg_table,
+    default_download_directory,
     get_uuid_str,
 )
 
 
 ICEBERG_SETTINGS = {
     "allow_insert_into_iceberg": 1,
+    "allow_experimental_iceberg_add_files": 1,
 }
 
 # Path of the table location in metadata form (with a leading slash); this is the
@@ -410,3 +414,164 @@ def test_add_files_partition_value_needs_statistics(started_cluster_iceberg_with
     assert env.query(f"SELECT count() FROM {env.table_name} WHERE s = 'abc'") == "3\n"
     assert env.query(f"SELECT count() FROM {env.table_name} WHERE s IS NULL") == "2\n"
     assert env.count() == 5
+
+
+@pytest.mark.parametrize("storage_type", ["local", "s3"])
+def test_add_files_requires_setting(started_cluster_iceberg_with_spark, storage_type):
+    """add_files is experimental and gated by its own setting."""
+    env = AddFilesTestEnv(started_cluster_iceberg_with_spark, storage_type, "test_add_setting")
+    env.write_parquet("data/import", "f1.parquet", "SELECT 1 AS x")
+
+    error = env.instance.query_and_get_error(
+        env.add_files_query(env.table_path("data/import", "f1.parquet")),
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    assert "allow_experimental_iceberg_add_files" in error, f"got {error}"
+    assert env.count() == 0
+
+
+@pytest.mark.parametrize("storage_type", ["local", "s3"])
+def test_add_files_rejects_paths_outside_table_location(started_cluster_iceberg_with_spark, storage_type):
+    """Files are read and registered through the table's storage, so only files under the table
+    location may be registered: not the files of another table, not a sibling directory sharing
+    the prefix, and not a path escaping the location with '..'."""
+    env = AddFilesTestEnv(started_cluster_iceberg_with_spark, storage_type, "test_add_outside")
+    other = AddFilesTestEnv(started_cluster_iceberg_with_spark, storage_type, "test_add_outside_other")
+    other.write_parquet("data/import", "f1.parquet", "SELECT 1 AS x")
+
+    for path in [
+        other.table_path("data/import", "f1.parquet"),
+        other.table_path("data/import", ""),
+        f"{TABLE_PREFIX}/{env.table_name}_sibling/data/f1.parquet",
+    ]:
+        error = env.add_files_error(path)
+        assert "is not under the table location" in error, f"{path}: got {error}"
+
+    error = env.add_files_error(env.table_path("data", f"../../{other.table_name}/data/import/f1.parquet"))
+    assert "relative components" in error, f"got {error}"
+
+    assert env.count() == 0
+
+
+@pytest.mark.parametrize("storage_type", ["local", "s3"])
+def test_add_files_empty_directory(started_cluster_iceberg_with_spark, storage_type):
+    """A directory without parquet files is an error instead of an empty snapshot."""
+    env = AddFilesTestEnv(started_cluster_iceberg_with_spark, storage_type, "test_add_empty_dir")
+    env.write_parquet("data/import", ".hidden.parquet", "SELECT 1 AS x")
+
+    error = env.add_files_error(env.table_path("data/import", ""))
+    assert "contains no parquet files" in error, f"got {error}"
+
+    snapshots = env.query(f"SELECT count() FROM system.iceberg_history WHERE table = '{env.table_name}'")
+    assert snapshots == "0\n", f"got {snapshots}"
+
+
+@pytest.mark.parametrize("storage_type", ["local", "s3"])
+def test_add_files_missing_required_column(started_cluster_iceberg_with_spark, storage_type):
+    """A missing column reads as NULL, so allow_missing_columns = 1 does not cover required fields."""
+    env = AddFilesTestEnv(
+        started_cluster_iceberg_with_spark, storage_type, "test_add_missing_required",
+        schema="(x Int32, y Int32)",
+    )
+    env.write_parquet_arrow("data/import", "only_x.parquet", pa.table({"x": pa.array([1], type=pa.int32())}))
+    path = env.table_path("data/import", "only_x.parquet")
+
+    error = env.add_files_error(path, allow_missing_columns=1)
+    assert "required in the table schema" in error, f"got {error}"
+    assert "'y'" in error, f"got {error}"
+    assert env.count() == 0
+
+
+@pytest.mark.parametrize("storage_type", ["local", "s3"])
+def test_add_files_rejects_unsupported_representations(started_cluster_iceberg_with_spark, storage_type):
+    """Decimal columns and millisecond timestamps would need their bounds converted to the Iceberg
+    encoding, so they are rejected rather than registered with wrong bounds."""
+    env_decimal = AddFilesTestEnv(
+        started_cluster_iceberg_with_spark, storage_type, "test_add_decimal",
+        schema="(x Nullable(Decimal(9, 2)))",
+    )
+    env_decimal.write_parquet_arrow("data/import", "decimal.parquet", pa.table({
+        "x": pa.array([1, -2], type=pa.int64()).cast(pa.decimal128(9, 2)),
+    }))
+    error = env_decimal.add_files_error(env_decimal.table_path("data/import", "decimal.parquet"))
+    assert "which add_files does not support yet" in error, f"got {error}"
+    assert env_decimal.count() == 0
+
+    env_ts = AddFilesTestEnv(
+        started_cluster_iceberg_with_spark, storage_type, "test_add_ts_millis",
+        schema="(d Nullable(DateTime64(6)))",
+        partition_by="toRelativeDayNum(d)",
+    )
+    env_ts.write_parquet_arrow("data/import", "millis.parquet", pa.table({
+        "d": pa.array([1704103200000, 1704103201000], type=pa.timestamp("ms")),
+    }), coerce_timestamps="ms")
+    error = env_ts.add_files_error(env_ts.table_path("data/import", "millis.parquet"))
+    assert "does not match the Iceberg type" in error, f"got {error}"
+    assert env_ts.count() == 0
+
+
+@pytest.mark.parametrize("storage_type", ["local", "s3"])
+def test_add_files_truncate_multibyte(started_cluster_iceberg_with_spark, storage_type):
+    """truncate[N] keeps N code points, as a native insert does: a registered file lands in the same
+    partition as natively inserted rows, so partition pruning keeps both."""
+    env = AddFilesTestEnv(
+        started_cluster_iceberg_with_spark, storage_type, "test_add_truncate_utf8",
+        schema="(s Nullable(String))",
+        partition_by="icebergTruncate(2, s)",
+    )
+    env.insert("('äöü')")
+
+    env.write_parquet_arrow("data/import", "same.parquet", pa.table({"s": pa.array(["äöü", "äöx"], type=pa.string())}))
+    counts = env.add_files(env.table_path("data/import", "same.parquet"))
+    assert counts["partitions_touched"] == 1, f"got {counts}"
+
+    # 'äb' and 'äc' share their first 2 bytes, but not their first 2 code points.
+    env.write_parquet_arrow("data/import", "two.parquet", pa.table({"s": pa.array(["äb", "äc"], type=pa.string())}))
+    error = env.add_files_error(env.table_path("data/import", "two.parquet"))
+    assert "spans more than one partition" in error, f"got {error}"
+
+    pruning = {"use_iceberg_partition_pruning": 1}
+    assert env.instance.query(
+        f"SELECT count() FROM {env.table_name} WHERE s = 'äöü'", settings=pruning
+    ) == "2\n"
+    assert env.instance.query(
+        f"SELECT count() FROM {env.table_name} WHERE s = 'äöx'", settings=pruning
+    ) == "1\n"
+    assert env.count() == 3
+
+
+@pytest.mark.parametrize("storage_type", ["local", "s3"])
+def test_add_files_spark_reads_by_name(started_cluster_iceberg_with_spark, storage_type):
+    """Registered files carry no Iceberg field ids. add_files sets the default name mapping, so Spark
+    maps their columns by name, even when the file's column order differs from the schema."""
+    cluster = started_cluster_iceberg_with_spark
+    env = AddFilesTestEnv(
+        cluster, storage_type, "test_add_spark",
+        schema="(a Nullable(Int32), b Nullable(String))",
+    )
+    env.write_parquet_arrow("data/import", "reordered.parquet", pa.table({
+        "b": pa.array(["x", "y"], type=pa.string()),
+        "a": pa.array([1, 2], type=pa.int32()),
+    }))
+    env.add_files(env.table_path("data/import", "reordered.parquet"))
+    assert env.query(f"SELECT a, b FROM {env.table_name} ORDER BY a") == "1\tx\n2\ty\n"
+
+    local_dir = f"/var/lib/clickhouse/user_files/iceberg_data/default/{env.table_name}/"
+    default_download_directory(cluster, storage_type, local_dir, local_dir)
+    metadata_dir = os.path.join(local_dir, "metadata")
+    versions = {}
+    for name in os.listdir(metadata_dir):
+        match = re.match(r"v(\d+)(?:[-.].*)?\.metadata\.json$", name)
+        if match:
+            versions[int(match.group(1))] = name
+    latest = max(versions)
+    with open(os.path.join(metadata_dir, "version-hint.text"), "w") as hint:
+        hint.write(str(latest))
+
+    with open(os.path.join(metadata_dir, versions[latest])) as f:
+        properties = json.load(f).get("properties", {})
+    mapping = json.loads(properties["schema.name-mapping.default"])
+    assert sorted(entry["names"][0] for entry in mapping) == ["a", "b"], f"got {mapping}"
+
+    rows = cluster.spark_session.read.format("iceberg").load(local_dir).collect()
+    assert sorted((row["a"], row["b"]) for row in rows) == [(1, "x"), (2, "y")]

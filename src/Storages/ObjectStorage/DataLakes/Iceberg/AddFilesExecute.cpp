@@ -37,6 +37,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/StatelessMetadataFileGetter.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #include <Storages/StorageInMemoryMetadata.h>
+#include <Common/UTF8Helpers.h>
 #include <Common/logger_useful.h>
 
 #include <Poco/JSON/Object.h>
@@ -66,6 +67,7 @@ namespace ErrorCodes
 extern const int BAD_ARGUMENTS;
 extern const int DATALAKE_DATABASE_ERROR;
 extern const int ICEBERG_SPECIFICATION_VIOLATION;
+extern const int LIMIT_EXCEEDED;
 extern const int LOGICAL_ERROR;
 extern const int METADATA_MISMATCH;
 extern const int SUPPORT_IS_DISABLED;
@@ -136,6 +138,147 @@ bool endsWithParquet(const String & path)
     return Poco::toLower(path).ends_with(".parquet");
 }
 
+/// The files are read and registered through the table's storage and credentials, so only files under
+/// the table location may be registered. Otherwise `IcebergPathResolver::resolve` maps an outside path
+/// to some key of the table's storage, which lets a user expose objects the table does not own, and the
+/// manifest records a path that names a different object than the one ClickHouse read.
+void checkPathUnderTableLocation(const String & path, const String & table_location)
+{
+    if (table_location.empty() || !path.starts_with(table_location) || path.size() <= table_location.size()
+        || path[table_location.size()] != '/')
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "add_files: path '{}' is not under the table location '{}'; only files under the table location can be registered",
+            path, table_location);
+
+    std::string_view rest = std::string_view(path).substr(table_location.size() + 1);
+    while (true)
+    {
+        size_t slash = rest.find('/');
+        std::string_view component = rest.substr(0, slash);
+        if (component == "." || component == "..")
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "add_files: path '{}' contains a '{}' component; give the path without relative components", path, component);
+        if (slash == std::string_view::npos)
+            break;
+        rest = rest.substr(slash + 1);
+    }
+}
+
+/// The Iceberg `truncate[N]` transform of a string keeps the first N code points, as `icebergTruncate` does.
+String truncateToCodePoints(const String & value, size_t code_points)
+{
+    size_t pos = 0;
+    for (size_t i = 0; i < code_points && pos < value.size(); ++i)
+        pos += UTF8::seqLength(static_cast<UInt8>(value[pos]));
+    return value.substr(0, std::min(pos, value.size()));
+}
+
+/// Leaf fields (over nested structs) that must have a value in every row: the field and all its
+/// ancestors are required. A file without such a column cannot be registered.
+std::unordered_set<Int64> collectRequiredFieldIds(Poco::JSON::Array::Ptr schema_fields)
+{
+    std::unordered_set<Int64> result;
+    std::function<void(Poco::JSON::Object::Ptr)> collect;
+    collect = [&](Poco::JSON::Object::Ptr field)
+    {
+        if (!field->has(Iceberg::f_required) || !field->getValue<bool>(Iceberg::f_required))
+            return;
+        auto type_var = field->get(Iceberg::f_type);
+        if (type_var.isString())
+        {
+            result.insert(field->getValue<Int64>(Iceberg::f_id));
+            return;
+        }
+        const auto & type_obj = type_var.extract<Poco::JSON::Object::Ptr>();
+        if (type_obj->getValue<String>(Iceberg::f_type) == "struct")
+        {
+            for (const auto & nested : *type_obj->getArray(Iceberg::f_fields))
+                collect(nested.extract<Poco::JSON::Object::Ptr>());
+        }
+    };
+    for (const auto & field_var : *schema_fields)
+        collect(field_var.extract<Poco::JSON::Object::Ptr>());
+    return result;
+}
+
+/// Iceberg name mapping (`schema.name-mapping.default`) of a type: lets readers that resolve columns by
+/// field id (Spark, Trino, iceberg-java) map the columns of files written without field ids by name.
+/// Mirrors `MappingUtil.create` of iceberg-java: structs map their fields, lists map `element`, maps map
+/// `key` and `value`.
+Poco::JSON::Array::Ptr buildNameMappingOfType(const Poco::Dynamic::Var & type_var)
+{
+    if (type_var.isString())
+        return nullptr;
+
+    const auto & type_obj = type_var.extract<Poco::JSON::Object::Ptr>();
+    const String kind = type_obj->getValue<String>(Iceberg::f_type);
+
+    auto make_entry = [](Int64 id, const String & name, const Poco::JSON::Array::Ptr & nested)
+    {
+        Poco::JSON::Object::Ptr entry = new Poco::JSON::Object;
+        entry->set("field-id", id);
+        Poco::JSON::Array::Ptr names = new Poco::JSON::Array;
+        names->add(name);
+        entry->set("names", names);
+        if (nested)
+            entry->set("fields", nested);
+        return entry;
+    };
+
+    Poco::JSON::Array::Ptr result = new Poco::JSON::Array;
+    if (kind == "struct")
+    {
+        for (const auto & nested_var : *type_obj->getArray(Iceberg::f_fields))
+        {
+            const auto & nested = nested_var.extract<Poco::JSON::Object::Ptr>();
+            result->add(make_entry(
+                nested->getValue<Int64>(Iceberg::f_id), nested->getValue<String>(Iceberg::f_name),
+                buildNameMappingOfType(nested->get(Iceberg::f_type))));
+        }
+    }
+    else if (kind == "list")
+    {
+        result->add(make_entry(
+            type_obj->getValue<Int64>(Iceberg::f_element_id), "element", buildNameMappingOfType(type_obj->get(Iceberg::f_element))));
+    }
+    else if (kind == "map")
+    {
+        result->add(make_entry(type_obj->getValue<Int64>(Iceberg::f_key_id), "key", buildNameMappingOfType(type_obj->get(Iceberg::f_key))));
+        result->add(make_entry(
+            type_obj->getValue<Int64>(Iceberg::f_value_id), "value", buildNameMappingOfType(type_obj->get(Iceberg::f_value))));
+    }
+    else
+    {
+        return nullptr;
+    }
+    return result;
+}
+
+/// Registered files are written by other tools and usually carry no Iceberg field ids. Without a name
+/// mapping, readers that resolve columns by id read them as NULLs or by position. Like `add_files` of
+/// iceberg-java, set the default name mapping from the current schema unless the table already has one.
+void ensureDefaultNameMapping(Poco::JSON::Object::Ptr metadata, const Poco::JSON::Object::Ptr & current_schema)
+{
+    static constexpr auto name_mapping_property = "schema.name-mapping.default";
+
+    Poco::JSON::Object::Ptr properties;
+    if (metadata->has(Iceberg::f_properties) && !metadata->isNull(Iceberg::f_properties))
+        properties = metadata->getObject(Iceberg::f_properties);
+    if (!properties)
+    {
+        properties = new Poco::JSON::Object;
+        metadata->set(Iceberg::f_properties, properties);
+    }
+    if (properties->has(name_mapping_property))
+        return;
+
+    Poco::JSON::Object::Ptr schema_as_struct = new Poco::JSON::Object;
+    schema_as_struct->set(Iceberg::f_type, "struct");
+    schema_as_struct->set(Iceberg::f_fields, current_schema->getArray(Iceberg::f_fields));
+    auto mapping = buildNameMappingOfType(Poco::Dynamic::Var(schema_as_struct));
+    properties->set(name_mapping_property, stringifyJSON(mapping, /* indent */ 0));
+}
+
 /// Expand trailing-slash paths into concrete *.parquet files below them.
 std::vector<String> expandPaths(
     const std::vector<String> & raw_paths,
@@ -146,11 +289,13 @@ std::vector<String> expandPaths(
     std::vector<String> result;
     for (const auto & raw : raw_paths)
     {
+        checkPathUnderTableLocation(raw, resolver.getTableLocation());
         if (!raw.ends_with('/'))
         {
             result.push_back(raw);
             continue;
         }
+        const size_t files_before = result.size();
         RelativePathsWithMetadata children;
         object_storage->listObjects(resolver.resolve(IcebergPathFromMetadata::deserialize(raw)), children, /* max_keys */ 0);
         for (const auto & child : children)
@@ -159,9 +304,14 @@ std::vector<String> expandPaths(
                 continue;
             /// Listed keys are storage paths; convert to the metadata (location-prefixed) form
             /// that native writes register in manifests.
-            result.push_back(resolver.reverseResolve(child->relative_path).serialize());
+            String path = resolver.reverseResolve(child->relative_path).serialize();
+            checkPathUnderTableLocation(path, resolver.getTableLocation());
+            result.push_back(std::move(path));
         }
-        LOG_DEBUG(log, "add_files: path {} expanded to {} parquet file(s)", raw, result.size());
+        /// Registering nothing would commit an empty snapshot; a mistyped directory is the likely cause.
+        if (result.size() == files_before)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "add_files: directory '{}' contains no parquet files", raw);
+        LOG_DEBUG(log, "add_files: path {} expanded to {} parquet file(s)", raw, result.size() - files_before);
     }
     return result;
 }
@@ -666,8 +816,8 @@ PartitionFieldValue derivePartitionField(
     {
         if (bounds.kind == SourceValueKind::String)
         {
-            String lo_trunc = bounds.min_str.substr(0, static_cast<size_t>(transform_argument));
-            String hi_trunc = bounds.max_str.substr(0, static_cast<size_t>(transform_argument));
+            String lo_trunc = truncateToCodePoints(bounds.min_str, static_cast<size_t>(transform_argument));
+            String hi_trunc = truncateToCodePoints(bounds.max_str, static_cast<size_t>(transform_argument));
             if (lo_trunc != hi_trunc)
                 throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
                     "add_files: file {} spans more than one partition: truncated values of column '{}' differ",
@@ -931,22 +1081,24 @@ AddFilesResult addFiles(
     for (const auto & path : paths)
         analyzed_files.push_back(analyzeFile(path, resolver, object_storage, column_path_to_field_id, iceberg_type_by_field_id, context, format_settings));
 
-    /// Validate the file's columns against the table schema.
-    if (!allow_missing_columns)
+    /// Validate the file's columns against the table schema. A missing column reads as NULL, which a
+    /// required field must never return, so `allow_missing_columns` applies to optional fields only.
+    const auto required_field_ids = collectRequiredFieldIds(schema_fields);
+    for (const auto & file : analyzed_files)
     {
-        for (const auto & file : analyzed_files)
+        for (const auto & [field_path, field_id] : column_path_to_field_id)
         {
-            for (const auto & [field_path, field_id] : column_path_to_field_id)
-            {
-                if (iceberg_type_by_field_id.contains(field_id) && !file.bounds_by_field_id.contains(static_cast<Int32>(field_id)))
-                {
-                    /// Column missing from the file entirely (no statistics either way).
-                    throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
-                        "add_files: file {} lacks column '{}' present in the table schema; "
-                        "pass allow_missing_columns = 1 to register it anyway (values will read as the column default)",
-                        file.registration_path, field_path);
-                }
-            }
+            if (!iceberg_type_by_field_id.contains(field_id) || file.bounds_by_field_id.contains(static_cast<Int32>(field_id)))
+                continue;
+            if (required_field_ids.contains(field_id))
+                throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                    "add_files: file {} lacks column '{}', which is required in the table schema",
+                    file.registration_path, field_path);
+            if (!allow_missing_columns)
+                throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                    "add_files: file {} lacks column '{}' present in the table schema; "
+                    "pass allow_missing_columns = 1 to register it anyway (its values will read as NULL)",
+                    file.registration_path, field_path);
         }
     }
 
@@ -1021,7 +1173,6 @@ AddFilesResult addFiles(
     while (true)
     {
         auto metadata_info = filename_generator.generateMetadataPathWithInfo();
-        const auto storage_metadata_name = resolver.resolve(metadata_info.path);
 
         Int64 parent_snapshot = -1;
         if (metadata->has(Iceberg::f_current_snapshot_id) && !metadata->isNull(Iceberg::f_current_snapshot_id))
@@ -1161,6 +1312,7 @@ AddFilesResult addFiles(
             }
 
             {
+                ensureDefaultNameMapping(metadata, lookupSchema(metadata, original_schema_id));
                 std::string json_representation = stringifyJSON(metadata, 4);
 
                 /// A transactional catalog writes the metadata file itself, as for native inserts.
@@ -1173,7 +1325,7 @@ AddFilesResult addFiles(
                     {
                         cleanup(true);
                         if (++retry >= max_retries)
-                            throw Exception(ErrorCodes::BAD_ARGUMENTS, "add_files: too many metadata conflicts, giving up");
+                            throw Exception(ErrorCodes::LIMIT_EXCEEDED, "add_files: too many metadata conflicts, giving up");
                         continue;
                     }
                     /// The metadata file and version hint in storage now name the new snapshot.
@@ -1231,7 +1383,7 @@ AddFilesResult addFiles(
                                     std::rethrow_exception(update_exception);
                                 cleanup(true);
                                 if (++retry >= max_retries)
-                                    throw Exception(ErrorCodes::BAD_ARGUMENTS, "add_files: too many catalog conflicts, giving up");
+                                    throw Exception(ErrorCodes::LIMIT_EXCEEDED, "add_files: too many catalog conflicts, giving up");
                                 continue;
                             }
                         }

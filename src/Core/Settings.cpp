@@ -9246,6 +9246,9 @@ Default age threshold in seconds for orphan file removal in Iceberg tables. File
     DECLARE(Bool, allow_experimental_expire_snapshots, false, R"(
 Allow to execute experimental Iceberg command `ALTER TABLE ... EXECUTE expire_snapshots`.
 )", EXPERIMENTAL) \
+    DECLARE(Bool, allow_experimental_iceberg_add_files, false, R"(
+Allow to execute experimental Iceberg command `ALTER TABLE ... EXECUTE add_files`, which registers existing Parquet files under the table location without rewriting them.
+)", EXPERIMENTAL) \
     DECLARE(Bool, write_full_path_in_iceberg_metadata, false, R"(
 Write full paths (including s3://) into iceberg metadata files.
 )", EXPERIMENTAL) \
