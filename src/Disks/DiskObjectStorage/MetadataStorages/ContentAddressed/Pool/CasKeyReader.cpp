@@ -6,9 +6,9 @@ namespace DB::Cas
 {
 
 void hintRefLogsWithinEpoch(KeyReader & reader, const Layout & layout, const NamespaceLifeId & life,
-                            RefTxnId first, const RefTxnId & committed_through)
+                            RefTxnId first, const RefTxnId & last)
 {
-    while (reader.pending() < reader.window() && first <= committed_through)
+    while (reader.pending() < reader.window() && first <= last)
     {
         reader.hint(layout.refLogKey(life, first));
         if (first.ref_sequence == std::numeric_limits<uint64_t>::max())
@@ -18,9 +18,9 @@ void hintRefLogsWithinEpoch(KeyReader & reader, const Layout & layout, const Nam
 }
 
 void discardRefLogHintsOfEpoch(KeyReader & reader, const Layout & layout, const NamespaceLifeId & life,
-                               RefTxnId first, const RefTxnId & committed_through)
+                               RefTxnId first, const RefTxnId & last)
 {
-    for (size_t n = 0; n < reader.window() && first <= committed_through; ++n)
+    for (size_t n = 0; n < reader.window() && first <= last; ++n)
     {
         reader.discard(layout.refLogKey(life, first));
         if (first.ref_sequence == std::numeric_limits<uint64_t>::max())

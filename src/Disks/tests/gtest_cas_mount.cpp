@@ -1133,7 +1133,7 @@ TEST(CASMountLease, AbsentClaimThenRenewBumpsSeq)
     Ops ops(b, &boot);
     auto r = claimMount(ops.op, l, "r", UInt128(1), /*epoch*/ 7, now, /*ttl*/ 100);
     EXPECT_EQ(r.kind, MountClaimResult::Claimed);
-    MountLeaseRenewer k(ops.mount, ops.farewell, l, "r", UInt128(1), 7, std::chrono::milliseconds(100),
+    MountLeaseRenewer k(ops.mount, ops.farewell, l, "r", UInt128(1), 7, /*last_unclean_epoch=*/0, std::chrono::milliseconds(100),
                        [&] { return now; }, [] { return uint64_t{0}; }, {}, std::chrono::milliseconds(0),
                        [&] { return boot; });
     k.start();
@@ -1153,7 +1153,7 @@ TEST(CASMountLease, HolderBodiesMintFreshAttemptIdsAndFenceCopiesIt)
     const String key = layout.mountKey("r");
     const MountLease claimed = decodeMountLease(ops.op.read(key, Retry::standard())->bytes);
 
-    MountLeaseRenewer renewer(ops.mount, ops.farewell, layout, "r", UInt128{1}, 7, std::chrono::milliseconds(100),
+    MountLeaseRenewer renewer(ops.mount, ops.farewell, layout, "r", UInt128{1}, 7, /*last_unclean_epoch=*/0, std::chrono::milliseconds(100),
                             [&] { return now; }, [] { return uint64_t{0}; }, {}, std::chrono::milliseconds(0),
                             [&] { return boot; });
     renewer.start();
@@ -1209,7 +1209,7 @@ TEST(CASMountLease, VanishedBackingStoreStopsRenewalWithoutLogicalError)
     uint64_t boot = 0;
     Ops ops(b, &boot);
     ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), /*epoch*/ 7, now, /*ttl*/ 100).kind, MountClaimResult::Claimed);
-    MountLeaseRenewer k(ops.mount, ops.farewell, l, "r", UInt128(1), 7, std::chrono::milliseconds(100),
+    MountLeaseRenewer k(ops.mount, ops.farewell, l, "r", UInt128(1), 7, /*last_unclean_epoch=*/0, std::chrono::milliseconds(100),
                        [&] { return now; }, [] { return uint64_t{0}; }, {}, std::chrono::milliseconds(0),
                        [&] { return boot; });
     k.start();
@@ -1252,7 +1252,7 @@ TEST(CASMountLease, TerminateAfterVanishedBackingStoreIsNoOpRelease)
     uint64_t now = 1000;
     Ops ops(b);
     ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), /*epoch*/ 7, now, /*ttl*/ 100).kind, MountClaimResult::Claimed);
-    MountLeaseRenewer k(ops.mount, ops.farewell, l, "r", UInt128(1), 7, std::chrono::milliseconds(100),
+    MountLeaseRenewer k(ops.mount, ops.farewell, l, "r", UInt128(1), 7, /*last_unclean_epoch=*/0, std::chrono::milliseconds(100),
                        [&] { return now; }, [] { return uint64_t{0}; });
     k.start();
 
@@ -1588,7 +1588,7 @@ TEST(CASMountLease, RenewerStartAdoptsOurOwnClaimNotDoubleStart)
     Ops ops(b);
     // The normal flow: claimMount writes the live mount under (uuid=1, epoch=7), THEN renewer.start().
     ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), /*epoch*/ 7, now, /*ttl*/ 100).kind, MountClaimResult::Claimed);
-    MountLeaseRenewer k(ops.mount, ops.farewell, l, "r", UInt128(1), /*epoch*/ 7, std::chrono::milliseconds(100),
+    MountLeaseRenewer k(ops.mount, ops.farewell, l, "r", UInt128(1), /*epoch*/ 7, /*last_unclean_epoch=*/0, std::chrono::milliseconds(100),
                        [&] { return now; }, [] { return uint64_t{0}; });
     EXPECT_NO_THROW(k.start());     // adopts our own live (uuid=1,epoch=7) mount — NOT a double-start
     EXPECT_EQ(decodeMountLease(ops.op.read(l.mountKey("r"), Retry::standard())->bytes).writer_epoch, 7u);
@@ -1818,6 +1818,21 @@ TEST(CASMountStartup, RefusesWritableOpenWithInconsistentCasRequestBudget)
             .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r",
             .mount_lease_ttl_ms = std::chrono::milliseconds(30000),
             .cas_request_budget = bad_budget});
+    });
+}
+
+/// The window check is not specific to writable mounts: a read-only disk binds the same window, and one
+/// at or below the envelope would give up before its first attempt.
+TEST(CASMountStartup, RefusesReadOnlyOpenWithRequestWindowAtTheAttemptEnvelope)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    CasRequestBudget budget;
+    budget.request_window_ms = budget.attemptEnvelopeMs();
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
+    {
+        Pool::open(b, PoolConfig{
+            .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r", .read_only = true,
+            .cas_request_budget = budget});
     });
 }
 
@@ -3006,7 +3021,7 @@ TEST(CASMountObservation, RenewalDuringObservationRestartsIt)
     /// wrote (no seq bump, per the ADOPT RULE), then a synchronous renewal mints a new incarnation
     /// mid-observation.
     uint64_t renewer_wall = 500;
-    MountLeaseRenewer renewer(ops.mount, ops.farewell, l, "r", UInt128(1), 7, std::chrono::milliseconds(500),
+    MountLeaseRenewer renewer(ops.mount, ops.farewell, l, "r", UInt128(1), 7, /*last_unclean_epoch=*/0, std::chrono::milliseconds(500),
                              [&] { return renewer_wall; }, [] { return uint64_t{0}; }, {},
                              std::chrono::milliseconds(0), [&] { return renewer_boot; });
     renewer.start();
@@ -3074,10 +3089,10 @@ TEST(CASMountObservation, GcFencedIsReclaimedInstantlyWithPriorFenced)
     EXPECT_EQ(sleeps, 0);
 }
 
-/// ---- Stage B Task 3: `isCreatorFenceTerminal` -- the cross-process terminality predicate
+/// ---- `isCreatorFenceTerminal` -- the cross-process terminality predicate
 /// `CasRefCatalog::reconcileStaleCreator` gates on. Built from `writer_epoch` plus the SAME two
 /// clock-free certificates `probeNonTerminalMountSlots`/`computeHeartbeatFloor` already use, PLUS a
-/// third certificate available only here: a currently-live DIFFERENT `writer_epoch` at the slot. ----
+/// third certificate available only here: a strictly GREATER `writer_epoch` at the slot. ----
 
 TEST(CASFenceTerminal, AbsentMountSlotIsNotTerminal)
 {
@@ -3126,18 +3141,53 @@ TEST(CASFenceTerminal, CleanFarewellIsTerminal)
     EXPECT_TRUE(isCreatorFenceTerminal(ops.op, l, "r", 7));
 }
 
-TEST(CASFenceTerminal, ADifferentLiveWriterEpochIsTerminalForTheOldOne)
+/// A slot at a greater epoch supersedes the older incarnation whatever that body certifies about its own
+/// epoch: live, GC-fenced or farewelled.
+TEST(CASFenceTerminal, AGreaterWriterEpochIsTerminalForTheOldOne)
 {
-    Ops ops(std::make_shared<InMemoryBackend>());
-    Layout l{"p"};
-    /// Slot now held at epoch 8 -- epoch 7's incarnation is superseded regardless of ITS OWN
-    /// certificate (neither fenced nor farewelled).
-    ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), /*our_epoch=*/8, 1000, 500).kind, MountClaimResult::Claimed);
+    enum class Body : uint8_t { Live, GcFenced, CleanFarewell };
+    for (const Body body : {Body::Live, Body::GcFenced, Body::CleanFarewell})
+    {
+        SCOPED_TRACE(static_cast<int>(body));
+        Ops ops(std::make_shared<InMemoryBackend>());
+        Layout l{"p"};
+        ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), /*our_epoch=*/8, 1000, 500).kind, MountClaimResult::Claimed);
+        auto got = ops.op.read(l.mountKey("r"), Retry::standard());
+        ASSERT_TRUE(got.has_value());
+        MountLease lease = decodeMountLease(got->bytes);
+        lease.gc_fenced = body == Body::GcFenced;
+        if (body == Body::CleanFarewell)
+            lease.min_active_build_sequence = std::numeric_limits<uint64_t>::max();
+        mustCommit(ops.op.replace(l.mountKey("r"), encodeMountLease(lease), got->etag, Retry::standard()), "epoch 8 body");
 
-    EXPECT_TRUE(isCreatorFenceTerminal(ops.op, l, "r", 7))
-        << "a different epoch is currently live at this slot -- epoch 7 can never reclaim it";
-    EXPECT_FALSE(isCreatorFenceTerminal(ops.op, l, "r", 8))
-        << "epoch 8 IS the current live epoch -- not terminal";
+        EXPECT_TRUE(isCreatorFenceTerminal(ops.op, l, "r", 7))
+            << "a greater epoch holds this slot -- epoch 7 can never reclaim it";
+        EXPECT_EQ(isCreatorFenceTerminal(ops.op, l, "r", 8), body != Body::Live)
+            << "epoch 8 is terminal only through its own certificate";
+    }
+}
+
+/// A slot below the fence epoch holds an older incarnation. Whatever that body certifies, live, GC-fenced
+/// or farewelled, is about the older epoch and proves nothing about the higher one.
+TEST(CASFenceTerminal, ALowerWriterEpochIsNotTerminalForTheHigherOne)
+{
+    enum class Body : uint8_t { Live, GcFenced, CleanFarewell };
+    for (const Body body : {Body::Live, Body::GcFenced, Body::CleanFarewell})
+    {
+        SCOPED_TRACE(static_cast<int>(body));
+        Ops ops(std::make_shared<InMemoryBackend>());
+        Layout l{"p"};
+        ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), /*our_epoch=*/7, 1000, 500).kind, MountClaimResult::Claimed);
+        auto got = ops.op.read(l.mountKey("r"), Retry::standard());
+        ASSERT_TRUE(got.has_value());
+        MountLease lease = decodeMountLease(got->bytes);
+        lease.gc_fenced = body == Body::GcFenced;
+        if (body == Body::CleanFarewell)
+            lease.min_active_build_sequence = std::numeric_limits<uint64_t>::max();
+        mustCommit(ops.op.replace(l.mountKey("r"), encodeMountLease(lease), got->etag, Retry::standard()), "epoch 7 body");
+
+        EXPECT_FALSE(isCreatorFenceTerminal(ops.op, l, "r", 8));
+    }
 }
 
 /// A merely EXPIRED lease (wall-clock past `expires_at_ms`, same epoch, no certificate) must NOT be
@@ -3195,7 +3245,7 @@ TEST(CASMountLease, ClaimAdoptIsTwoRequests)
 
     /// The absent-slot mint.
     backend->reads = backend->heads = backend->writes = 0;
-    MountLeaseRenewer minting(ops.mount, ops.farewell, l, "fresh", UInt128(1), 7,
+    MountLeaseRenewer minting(ops.mount, ops.farewell, l, "fresh", UInt128(1), 7, /*last_unclean_epoch=*/0,
                              std::chrono::milliseconds(100), [&] { return now; }, [] { return uint64_t{0}; });
     minting.start();
     EXPECT_EQ(backend->reads, 1u);
@@ -3206,7 +3256,7 @@ TEST(CASMountLease, ClaimAdoptIsTwoRequests)
     ASSERT_EQ(claimMount(ops.op, l, "adopted", UInt128(1), /*epoch*/ 7, now, /*ttl*/ 100).kind,
               MountClaimResult::Claimed);
     backend->reads = backend->heads = backend->writes = 0;
-    MountLeaseRenewer adopting(ops.mount, ops.farewell, l, "adopted", UInt128(1), 7,
+    MountLeaseRenewer adopting(ops.mount, ops.farewell, l, "adopted", UInt128(1), 7, /*last_unclean_epoch=*/0,
                               std::chrono::milliseconds(100), [&] { return now; }, [] { return uint64_t{0}; });
     adopting.start();
     EXPECT_EQ(backend->reads, 1u);
@@ -3234,7 +3284,7 @@ TEST(CASMountLease, FarewellRunsOnAnOpenFenceAfterTheMountFenceIsLost)
         {
             if (fence_lost)
                 throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "mount fence lost");
-        }});
+        }}, {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     mount_requests.setNowFnForTest([&boot] { return boot; });
     mount_requests.setSleepFnForTest([&boot](uint64_t ms) { boot += ms; });
     CasRequests open_requests = openRequestsForTest(backend);
@@ -3245,10 +3295,10 @@ TEST(CASMountLease, FarewellRunsOnAnOpenFenceAfterTheMountFenceIsLost)
     ASSERT_EQ(claimMount(seed, l, "renewing", UInt128(1), 7, now, /*ttl*/ 1000).kind, MountClaimResult::Claimed);
     ASSERT_EQ(claimMount(seed, l, "departing", UInt128(1), 7, now, /*ttl*/ 1000).kind, MountClaimResult::Claimed);
 
-    MountLeaseRenewer renewing(mount_requests, open_requests, l, "renewing", UInt128(1), 7,
+    MountLeaseRenewer renewing(mount_requests, open_requests, l, "renewing", UInt128(1), 7, /*last_unclean_epoch=*/0,
                               std::chrono::milliseconds(1000), [&] { return now; }, [] { return uint64_t{0}; },
                               {}, std::chrono::milliseconds(0), [&] { return boot; });
-    MountLeaseRenewer departing(mount_requests, open_requests, l, "departing", UInt128(1), 7,
+    MountLeaseRenewer departing(mount_requests, open_requests, l, "departing", UInt128(1), 7, /*last_unclean_epoch=*/0,
                                std::chrono::milliseconds(1000), [&] { return now; }, [] { return uint64_t{0}; },
                                {}, std::chrono::milliseconds(0), [&] { return boot; });
     renewing.start();
@@ -3279,14 +3329,14 @@ TEST(CASMountLease, ClaimIsNotAdmittedUnderTheMountFence)
     CasRequests mount_requests(backend, Fence{
         [] { return uint64_t{0}; },
         [](uint64_t, uint64_t) { return Fence::Admit::LostOrRearmed; },
-        [](uint64_t) { throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "mount fence lost"); }});
+        [](uint64_t) { throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "mount fence lost"); }}, {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     mount_requests.setNowFnForTest([&boot] { return boot; });
     mount_requests.setSleepFnForTest([&boot](uint64_t ms) { boot += ms; });
     CasRequests open_requests = openRequestsForTest(backend);
     open_requests.setNowFnForTest([&boot] { return boot; });
     open_requests.setSleepFnForTest([&boot](uint64_t ms) { boot += ms; });
 
-    MountLeaseRenewer renewer(mount_requests, open_requests, l, "r", UInt128(1), 7,
+    MountLeaseRenewer renewer(mount_requests, open_requests, l, "r", UInt128(1), 7, /*last_unclean_epoch=*/0,
                             std::chrono::milliseconds(1000), [&] { return now; }, [] { return uint64_t{0}; },
                             {}, std::chrono::milliseconds(0), [&] { return boot; });
     EXPECT_NO_THROW(renewer.start());
@@ -3368,14 +3418,14 @@ TEST(CASMountLease, RemountRenewalIsAdmittedOffTheMountFence)
     CasRequests mount_requests(backend, Fence{
         [] { return uint64_t{0}; },
         [](uint64_t, uint64_t) { return Fence::Admit::LostOrRearmed; },
-        [](uint64_t) { throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "mount fence lost"); }});
+        [](uint64_t) { throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "mount fence lost"); }}, {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     mount_requests.setNowFnForTest([&boot] { return boot; });
     mount_requests.setSleepFnForTest([&boot](uint64_t ms) { boot += ms; });
     CasRequests open_requests = openRequestsForTest(backend);
     open_requests.setNowFnForTest([&boot] { return boot; });
     open_requests.setSleepFnForTest([&boot](uint64_t ms) { boot += ms; });
 
-    MountLeaseRenewer renewer(mount_requests, open_requests, l, "r", UInt128(1), 7,
+    MountLeaseRenewer renewer(mount_requests, open_requests, l, "r", UInt128(1), 7, /*last_unclean_epoch=*/0,
                             std::chrono::milliseconds(1000), [&] { return now; }, [] { return uint64_t{0}; },
                             {}, std::chrono::milliseconds(0), [&] { return boot; });
     renewer.start();
@@ -3900,4 +3950,135 @@ TEST(CASListMounts, TerminalSlotWithAnUndecodableOwnerIsCorrupt)
     EXPECT_EQ(by_srid.size(), 2u);
     EXPECT_EQ(by_srid["r"], "corrupt");
     EXPECT_EQ(by_srid["other"], "live");
+}
+
+namespace
+{
+/// A slot body at `key` as the backend serves it, replacing whatever is there.
+Object putSlotBody(Ops & ops, const String & key, const MountLease & body)
+{
+    const auto current = ops.op.read(key, Retry::standard());
+    mustCommit(
+        current ? ops.op.replace(key, encodeMountLease(body), current->etag, Retry::standard())
+                : ops.op.create(key, encodeMountLease(body), Retry::standard()),
+        "slot body");
+    return *ops.op.read(key, Retry::standard());
+}
+
+MountLease ownBody(uint64_t seq, UInt128 attempt_id)
+{
+    MountLease body = liveBody(UInt128(1), 7);
+    body.seq = seq;
+    body.write_attempt_id = attempt_id;
+    return body;
+}
+}
+
+TEST(CASMountSlotOwnership, HoldsTheLandedBody)
+{
+    Ops ops(std::make_shared<InMemoryBackend>());
+    const String key = Layout("p").mountKey("r");
+    MountSlotOwnership ownership(UInt128(1), 7);
+    const Object slot = putSlotBody(ops, key, ownBody(1, UInt128(11)));
+    EXPECT_FALSE(ownership.holds(slot)) << "nothing has landed yet";
+    ownership.landed(slot.etag);
+    EXPECT_TRUE(ownership.holds(slot));
+}
+
+TEST(CASMountSlotOwnership, HoldsTheInFlightAttemptBody)
+{
+    Ops ops(std::make_shared<InMemoryBackend>());
+    const String key = Layout("p").mountKey("r");
+    MountSlotOwnership ownership(UInt128(1), 7);
+    ownership.landed(putSlotBody(ops, key, ownBody(1, UInt128(11))).etag);
+    ownership.attempting(UInt128(12));
+    const Object landed_unanswered = putSlotBody(ops, key, ownBody(2, UInt128(12)));
+    EXPECT_TRUE(ownership.holds(landed_unanswered)) << "the ETag is unknown, the attempt id is in flight";
+    EXPECT_FALSE(ownership.holds(putSlotBody(ops, key, ownBody(3, UInt128(13))))) << "another attempt id";
+}
+
+TEST(CASMountSlotOwnership, DoesNotHoldAForeignUuidOrEpoch)
+{
+    Ops ops(std::make_shared<InMemoryBackend>());
+    const String key = Layout("p").mountKey("r");
+    MountSlotOwnership ownership(UInt128(1), 7);
+    ownership.attempting(UInt128(9));
+    MountLease foreign_uuid = liveBody(UInt128(2), 7);
+    MountLease other_epoch = liveBody(UInt128(1), 8);
+    for (const MountLease & body : {foreign_uuid, other_epoch})
+    {
+        const Object slot = putSlotBody(ops, key, body);
+        ownership.landed(slot.etag);
+        EXPECT_FALSE(ownership.holds(slot)) << "the ETag and the attempt id both match, the pair does not";
+    }
+}
+
+TEST(CASMountSlotOwnership, DoesNotHoldAGcFencedOrFarewelledBody)
+{
+    Ops ops(std::make_shared<InMemoryBackend>());
+    const String key = Layout("p").mountKey("r");
+    MountSlotOwnership ownership(UInt128(1), 7);
+    ownership.attempting(UInt128(9));
+    MountLease fenced = ownBody(2, UInt128(9));
+    fenced.gc_fenced = true;
+    MountLease farewell = ownBody(3, UInt128(9));
+    farewell.min_active_build_sequence = std::numeric_limits<uint64_t>::max();
+    for (const MountLease & body : {fenced, farewell})
+    {
+        const Object slot = putSlotBody(ops, key, body);
+        ownership.landed(slot.etag);
+        EXPECT_FALSE(ownership.holds(slot)) << "the ETag and the attempt id both match, the body is revoked";
+    }
+}
+
+TEST(CASMountSlotOwnership, DoesNotHoldTheAttemptBodyAfterTheAttemptEnded)
+{
+    Ops ops(std::make_shared<InMemoryBackend>());
+    const String key = Layout("p").mountKey("r");
+    MountSlotOwnership ownership(UInt128(1), 7);
+    ownership.attempting(UInt128(12));
+    const Object slot = putSlotBody(ops, key, ownBody(2, UInt128(12)));
+    ASSERT_TRUE(ownership.holds(slot));
+    ownership.attemptEnded();
+    EXPECT_FALSE(ownership.holds(slot));
+}
+
+TEST(CASMountSlotOwnership, RenewerRecordsItsStartAndEveryCommittedRenewal)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    Layout layout("p");
+    uint64_t now = 1000;
+    uint64_t boot = 0;
+    Ops ops(backend, &boot);
+    ASSERT_EQ(claimMount(ops.op, layout, "r", UInt128(1), 7, now, 100).kind, MountClaimResult::Claimed);
+    MountLeaseRenewer renewer(ops.mount, ops.farewell, layout, "r", UInt128(1), 7, /*last_unclean_epoch=*/0, std::chrono::milliseconds(100),
+                              [&] { return now; }, [] { return uint64_t{0}; }, {}, std::chrono::milliseconds(0),
+                              [&] { return boot; });
+    const String key = layout.mountKey("r");
+    renewer.start();
+    const std::shared_ptr<const MountSlotOwnership> ownership = renewer.slotOwnership();
+    ASSERT_TRUE(ownership);
+    Object previous = *ops.op.read(key, Retry::standard());
+    EXPECT_TRUE(ownership->holds(previous)) << "after start";
+    std::vector<bool> held_when_committed;
+    backend->onWriteCommitted(key, [&]
+    {
+        held_when_committed.push_back(ownership->holds(*ops.op.read(key, Retry::standard())));
+    });
+    for (int renewal = 1; renewal <= 2; ++renewal)
+    {
+        SCOPED_TRACE(renewal);
+        renewOrThrow(renewer);
+        const Object current = *ops.op.read(key, Retry::standard());
+        EXPECT_TRUE(ownership->holds(current)) << "the committed body";
+        EXPECT_FALSE(ownership->holds(previous)) << "the superseded body";
+        ASSERT_EQ(held_when_committed.size(), static_cast<size_t>(renewal));
+        EXPECT_TRUE(held_when_committed.back()) << "the in-flight attempt covers the body before `landed` runs";
+        previous = current;
+    }
+
+    /// Same pair and attempt id as the last renewal, new incarnation: held only while the attempt is in flight.
+    MountLease late_copy = decodeMountLease(previous.bytes);
+    ++late_copy.seq;
+    EXPECT_FALSE(ownership->holds(putSlotBody(ops, key, late_copy))) << "the attempt ended";
 }

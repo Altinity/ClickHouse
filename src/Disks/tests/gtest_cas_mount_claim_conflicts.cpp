@@ -30,7 +30,7 @@ MountLeaseRenewer makeRenewer(
         Layout("p"),
         "r",
         uuid,
-        epoch,
+        epoch, /*last_unclean_epoch=*/0,
         std::chrono::milliseconds(100),
         [&now] { return now; },
         [] { return uint64_t{0}; });

@@ -54,7 +54,7 @@ void checkDeadline(const Deadline & deadline, std::string_view phase)
 void listAll(CasOperation & op, const String & prefix, std::unordered_map<String, uint64_t> & out,
              const FsckProgress & on_progress, const Deadline & deadline, std::string_view phase)
 {
-    static constexpr size_t kPageLimit = 1000;
+    static constexpr size_t kPageLimit = CasOperation::kCasListPageKeys;
     uint64_t pages = 0;
     size_t count_in_page = 0;
     op.forEachListedKey(prefix, [&](const ListedKey & k)
@@ -113,7 +113,6 @@ struct FsckRecoveryAuthority
 {
     NamespaceLifeId life;
     CatalogEntry catalog_entry;
-    std::optional<RefCkpt> checkpoint;
 };
 
 using FsckRecoveryAuthorities = std::unordered_map<String, FsckRecoveryAuthority>;
@@ -130,15 +129,25 @@ std::optional<RefTableState> recoverLateRefTable(
 {
     try
     {
-        const std::optional<CkptSample> sampled = readCkpt(op, layout, authority.life);
-        if (!sampled)
+        for (size_t restarts = 0;; ++restarts)
         {
-            record_unchecked(authority.life.ns, layout.refCkptKey(authority.life),
-                "late ref recheck: the original life checkpoint is absent");
-            return std::nullopt;
+            const std::optional<CkptSample> sampled = readCkpt(op, layout, authority.life);
+            if (!sampled)
+            {
+                record_unchecked(authority.life.ns, layout.refCkptKey(authority.life),
+                    "late ref recheck: the original life checkpoint is absent");
+                return std::nullopt;
+            }
+            if (std::optional<RecoveredRefTable> recovered
+                    = recoverRefTableDetailedFromAuthority(op, layout, authority.catalog_entry, sampled))
+                return std::move(recovered->state);
+            if (restarts == kRefReadOnlyRecoveryMaxRestarts)
+            {
+                record_unchecked(authority.life.ns, layout.refCkptKey(authority.life),
+                    "late ref recheck: the original life checkpoint kept moving during the walk");
+                return std::nullopt;
+            }
         }
-        return recoverRefTableDetailedFromAuthority(
-            op, layout, authority.catalog_entry, sampled->ckpt).state;
     }
     catch (const Exception & e)
     {
@@ -299,120 +308,130 @@ struct NsVerdicts
         report.chain_broken = chain_broken.size();
         report.unchecked = unchecked.size();
     }
+
+    /// Takes over the verdicts another instance recorded for namespaces this one has not judged.
+    void absorb(const NsVerdicts & other)
+    {
+        for (const String & ns : other.chain_broken)
+        {
+            chain_broken.insert(ns);
+            unchecked.erase(ns);
+        }
+        for (const String & ns : other.unchecked)
+            if (!chain_broken.contains(ns))
+                unchecked.insert(ns);
+    }
 };
 
-/// THE ARITHMETIC STREAM WALK (spec §7). Read-only, one namespace.
-///
-/// The frozen catalog row and exact `_ckpt` define the complete finite walk. LIST supplies no genesis,
-/// witness, frontier or stop condition, and the walker never probes the position after
-/// `_ckpt.committed_through`. Every required id is point-read from the checkpoint base's successor (or
-/// `{life_epoch, 1}`) through that inclusive frontier. A missing required id is therefore a proven hole;
-/// no above-hole listing witness is needed. An epoch seal advances directly to the next epoch's first id,
-/// exactly as authoritative read-only recovery does.
-void checkRefStream(CasOperation & op, const Layout & layout, const NamespaceLifeId & life,
-                    const CatalogEntry & catalog_entry, const std::optional<CkptSample> & checkpoint_sample,
-                    const Deadline & deadline, FsckReport & report, NsVerdicts & verdicts)
+/// Fetches logs inline and remembers what the walk read, so a failure names the key that caused it.
+class RecordingKeyReader final : public KeyReader
+{
+public:
+    explicit RecordingKeyReader(CasOperation & op_) : op(op_) {}
+    void hint(const String &) override {}
+    std::optional<Object> take(const String & key) override
+    {
+        last_key = key;
+        std::optional<Object> got = op.read(key, Retry::standard());
+        if (got)
+            ++present;
+        return got;
+    }
+    void discard(const String &) override {}
+    size_t pending() const override { return 0; }
+    size_t window() const override { return 0; }
+
+    std::optional<String> last_key;
+    uint64_t present = 0;
+
+private:
+    CasOperation & op;
+};
+
+/// THE STREAM AUDIT, one namespace: one walk from the `_ckpt` base to the first absent key, shared with
+/// the owner replay. It reads no key below the base. A walk whose base moved is restarted from a fresh
+/// `_ckpt`, up to `kRefReadOnlyRecoveryMaxRestarts` times; past that the life is unchecked. A corrupt
+/// base or chain under an unchanged `_ckpt` is chain-broken, any other failure unchecked. A hole is
+/// reported only below a generation 1 or 2 frontier (the walk refuses it) or against a listed log above
+/// the walk's end. Returns the replayed table, or `nullopt` after recording a verdict.
+std::optional<RefTableState> walkRefStream(
+    CasOperation & op, const Layout & layout, const NamespaceLifeId & life, const CatalogEntry & catalog_entry,
+    const std::optional<RefTxnId> & greatest_listed_log, const Deadline & deadline, FsckReport & report,
+    NsVerdicts & verdicts)
 {
     checkDeadline(deadline, "ref stream");
     const RootNamespace & ns = life.ns;
-    const std::optional<RefCkpt> checkpoint
-        = checkpoint_sample ? std::optional<RefCkpt>{checkpoint_sample->ckpt} : std::nullopt;
-    const RecoveryGrounding grounding = chooseRecoveryGrounding(catalog_entry, checkpoint);
-    if (grounding.base)
+    std::optional<CkptSample> sample = readCkpt(op, layout, life);
+    for (size_t restarts = 0;; ++restarts)
     {
-        try
+        const RecoveryGrounding grounding = chooseRecoveryGrounding(
+            catalog_entry, sample ? std::optional<RefCkpt>{sample->ckpt} : std::nullopt);
+        RecordingKeyReader reader(op);
+        /// Only a corrupt chain under an unchanged `_ckpt` is a finding; a failed read of the chain or of
+        /// `_ckpt` itself proves nothing either way.
+        const auto record_failure = [&](bool corrupted, const String & message)
         {
-            /// Even when the base IS the frontier and there is no replay tail, a checkpoint may not
-            /// turn an `EpochSeal` into a state snapshot by naming a same-id `_snap`.
-            (void)readCheckpointSnapshotBase(op, layout, life, *checkpoint);
-        }
-        catch (const Exception & e)
-        {
-            const String key = layout.refSnapshotKey(life, *grounding.base);
-            const String note = "ref stream: checkpoint snapshot base " + renderId(*grounding.base)
-                + " is invalid: " + e.message();
-            if (e.code() != ErrorCodes::CORRUPTED_DATA)
+            report.ref_records_walked += reader.present;
+            String key = layout.namespaceStreamPrefix(life);
+            String note = corrupted
+                ? "ref stream: " + message
+                : "ref stream: the chain or its checkpoint authority could not be revalidated: " + message;
+            if (reader.last_key)
+                key = *reader.last_key;
+            else if (grounding.base)
             {
-                verdicts.recordUnchecked(report, ns, key, note);
-                return;
+                key = layout.refSnapshotKey(life, *grounding.base);
+                note = "ref stream: checkpoint snapshot base " + renderId(*grounding.base) + " is invalid: " + message;
             }
-
-            /// A concurrent checkpoint advance may retire the sampled base between these exact reads.
-            /// Only the SAME checkpoint incarnation turns a missing/invalid member of its required
-            /// triple into durable corruption. A changed, absent, or unreadable authority proves no
-            /// such thing and remains the honest `Unchecked` answer.
-            checkDeadline(deadline, "checkpoint-base authority revalidation");
-            try
-            {
-                const std::optional<CkptSample> current = readCkpt(op, layout, life);
-                if (!current || !checkpoint_sample || current->etag != checkpoint_sample->etag)
-                {
-                    verdicts.recordUnchecked(report, ns, key,
-                        note + "; checkpoint authority changed while validating its snapshot base");
-                    return;
-                }
-            }
-            catch (const Exception & revalidation_error)
-            {
-                verdicts.recordUnchecked(report, ns, key,
-                    note + "; checkpoint authority could not be revalidated: " + revalidation_error.message());
-                return;
-            }
-            catch (...)
-            {
-                verdicts.recordUnchecked(report, ns, key,
-                    note + "; checkpoint authority could not be revalidated");
-                return;
-            }
-
-            verdicts.recordChainBroken(report, ns, key, note);
-            return;
-        }
-    }
-    if (!grounding.walk_from || !grounding.committed_through)
-        return;
-
-    RefTxnId expected = *grounding.walk_from;
-    while (expected <= *grounding.committed_through)
-    {
-        checkDeadline(deadline, "ref stream");
-        const auto got = op.read(layout.refLogKey(life, expected), Retry::standard());
-        if (!got)
-        {
-            verdicts.recordChainBroken(report, ns, layout.refLogKey(life, expected),
-                "ref stream: checkpoint requires id " + renderId(expected) + " at or below inclusive frontier "
-                + renderId(*grounding.committed_through) + ", but its exact key is absent");
-            return;
-        }
-
-        bool is_seal = false;
-        try
-        {
-            is_seal = refLogTxnIsEpochSeal(
-                decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), expected));
-        }
-        catch (const Exception & e)
-        {
-            verdicts.recordUnchecked(report, ns, layout.refLogKey(life, expected),
-                "ref stream: the checkpoint-required record at " + renderId(expected)
-                + " could not be decoded: " + e.message());
-            return;
-        }
-        ++report.ref_records_walked;
-
-        try
-        {
-            if (const std::optional<RefTxnId> next = nextRefLogIdWithinCommittedFrontier(
-                    expected, is_seal, *grounding.committed_through))
-                expected = *next;
+            if (corrupted)
+                verdicts.recordChainBroken(report, ns, key, note);
             else
-                break;
+                verdicts.recordUnchecked(report, ns, key, note);
+        };
+        std::optional<RecoveredRefTable> recovered;
+        try
+        {
+            recovered = recoverRefTableDetailedFromAuthority(op, layout, catalog_entry, sample, &reader);
         }
         catch (const Exception & e)
         {
-            verdicts.recordChainBroken(report, ns, layout.refLogKey(life, expected),
-                "ref stream: " + e.message());
-            return;
+            if (e.code() == ErrorCodes::TIMEOUT_EXCEEDED)
+                throw;
+            record_failure(e.code() == ErrorCodes::CORRUPTED_DATA, e.message());
+            return std::nullopt;
+        }
+        catch (...)
+        {
+            record_failure(false, getCurrentExceptionMessage(/*with_stacktrace=*/false));
+            return std::nullopt;
+        }
+
+        if (recovered)
+        {
+            report.ref_records_walked += reader.present;
+            if (recovered->end == RefChainEnd::AbsentKey && greatest_listed_log
+                && recovered->next_key < *greatest_listed_log)
+            {
+                verdicts.recordChainBroken(report, ns, layout.refLogKey(life, *greatest_listed_log),
+                    "ref stream: listed log " + renderId(*greatest_listed_log) + " lies above the end of the chain at "
+                    + renderId(recovered->next_key));
+                return std::nullopt;
+            }
+            return std::move(recovered->state);
+        }
+
+        const String key = reader.last_key.value_or(layout.refCkptKey(life));
+        if (restarts == kRefReadOnlyRecoveryMaxRestarts)
+        {
+            verdicts.recordUnchecked(report, ns, key, "ref stream: checkpoint authority changed while walking the chain");
+            return std::nullopt;
+        }
+        checkDeadline(deadline, "ref stream");
+        sample = readCkpt(op, layout, life);
+        if (!sample)
+        {
+            verdicts.recordUnchecked(report, ns, key, "ref stream: checkpoint authority changed: `_ckpt` is absent");
+            return std::nullopt;
         }
     }
 }
@@ -445,10 +464,14 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
     uint64_t refs_walked = 0;
     NsVerdicts verdicts;
     SCOPE_EXIT({ verdicts.publish(report); });
+    /// Where an unchecked verdict of a late recheck goes: a life's own scratch while its findings wait
+    /// for the catalog confirmation, else the report.
+    NsVerdicts * unchecked_sink = &verdicts;
+    FsckReport * unchecked_report = &report;
     const RecordRecoveryUnchecked record_recovery_unchecked =
         [&](const RootNamespace & ns, const String & key, const String & detail_text)
         {
-            verdicts.recordUnchecked(report, ns, key, detail_text);
+            unchecked_sink->recordUnchecked(*unchecked_report, ns, key, detail_text);
         };
 
     /// RECORD AND CONTINUE for a key that belongs to no namespace at all. fsck is the forensic tool an
@@ -478,7 +501,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
 
     /// One immutable cut owns every physical-id join in this walk. `Creating` participates in that
     /// attribution (its physical keys may exist) but is never recovered: only Live/Removing rows have a
-    /// durable publication frontier. A diagnostic records duplicate ids and keeps walking unrelated
+    /// recoverable chain. A diagnostic records duplicate ids and keeps walking unrelated
     /// unique lives.
     const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(op, layout);
     struct FsckWalkLife
@@ -516,6 +539,10 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
     /// that is absent from a cut taken after the listing cannot be a concurrent birth this listing raced.
     /// A malformed shape (the parser refuses, or the reserved segment names no clean relative file) is
     /// classified immediately as it cannot become residue no matter which cut resolves it.
+    /// Lives a catalog read after the observation no longer names: their findings are janitor-pending.
+    std::unordered_set<UInt128> pending_lives;
+    /// The greatest listed log id of each life, the witness that a walk ended above a hole.
+    std::unordered_map<UInt128, RefTxnId> greatest_listed_log;
     if (namespace_prefix.empty())
     {
         struct CanonicalNamespaceKey
@@ -532,7 +559,15 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             try
             {
                 if (const auto ref_object = layout.parseRefObjectKey(listed.key))
+                {
                     physical_id = ref_object->life_id;
+                    if (ref_object->kind == RefObjectKind::Log)
+                    {
+                        auto [it, inserted] = greatest_listed_log.emplace(ref_object->life_id, ref_object->txn_id);
+                        if (!inserted && it->second < ref_object->txn_id)
+                            it->second = ref_object->txn_id;
+                    }
+                }
                 else if (const auto checkpoint = layout.parseRefCkptKey(listed.key))
                     physical_id = *checkpoint;
                 else if (const auto namespace_file = layout.parseNamespaceFileKey(listed.key))
@@ -557,7 +592,6 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         /// The post-observation cut. All three catalog states -- `Creating`, `Live`, `Removing` --
         /// protect a life for this purpose; only a life absent from every one of them is residue.
         const CasRefCatalog::Snapshot post_listing_cut = CasRefCatalog::read(op, layout);
-        std::unordered_set<UInt128> pending_lives;
         for (const CanonicalNamespaceKey & candidate : canonical_candidates)
         {
             try
@@ -589,130 +623,265 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                                  "janitor-pending, not corruption"};
             report.objects.push_back(std::move(o));
         }
-        report.namespace_janitor_pending_lives = pending_lives.size();
     }
 
-    /// Every replay and late recheck below reuses the same exact catalog row and physical life. The
-    /// primary walk also retains its checkpoint sample; a late recheck exact-reads `_ckpt` again at that
-    /// SAME life so a concurrent same-life drop/repoint is visible without ever accepting a rebirth.
+    /// Every replay and late recheck below reuses the same exact catalog row and physical life. Each walk
+    /// reads `_ckpt` at that SAME life, so a concurrent same-life drop/repoint is visible without ever
+    /// accepting a rebirth.
     FsckRecoveryAuthorities recovery_authorities;
     recovery_authorities.reserve(walk_lives.size());
 
-    for (const FsckWalkLife & walk_life : walk_lives)
+    /// A life's findings, held until a catalog read after the loop confirms the life: a walk that spans
+    /// a janitor's deletes reads a deleted key as the end, which is no finding about a removed life.
+    struct DeferredLifeFindings
     {
-        const NamespaceLifeId & life = walk_life.life;
-        const RootNamespace & ns = life.ns;
-        const String & ns_str = ns.string();
-        /// RECORD AND CONTINUE, NEVER WEDGE. Everything below is per-namespace, and every one of these
-        /// steps can raise `CORRUPTED_DATA` on a namespace whose stream is damaged — the replay refuses a
-        /// non-contiguous tail, the codecs refuse an invalid body. For RECOVERY that throw is the correct
-        /// fail-close; for a read-only diagnostic it is a bug, because the audit then reports NOTHING
-        /// about the namespaces it never reached, including the healthy ones. So one namespace's failure
-        /// becomes that namespace's verdict and the sweep goes on.
-        ///
-        /// `TIMEOUT_EXCEEDED` is deliberately NOT caught: the deadline is a property of the whole scan,
-        /// and `runFsck`'s `partial` handling owns it.
-        try
+        NsVerdicts verdicts;
+        FsckReport scratch;
+    };
+    std::vector<DeferredLifeFindings> deferred(walk_lives.size());
+
+    /// A deadline leaves the held findings unconfirmed: they are reported unchecked, never as corruption.
+    const auto report_held_as_unconfirmed = [&]
+    {
+        unchecked_sink = &verdicts;
+        unchecked_report = &report;
+        for (size_t life_index = 0; life_index < walk_lives.size(); ++life_index)
         {
-            /// One materialized `_ckpt` body is part of this namespace's frozen audit authority. The
-            /// recovery API receives exactly these bytes; `checkRefStream` receives the same decoded
-            /// value, so the two legs cannot quietly choose different frontiers after a concurrent CAS.
-            const std::optional<CkptSample> checkpoint_sample = readCkpt(op, layout, life);
-            const std::optional<RefCkpt> checkpoint
-                = checkpoint_sample ? std::optional<RefCkpt>{checkpoint_sample->ckpt} : std::nullopt;
-            const auto [authority_it, inserted] = recovery_authorities.emplace(
-                ns.string(), FsckRecoveryAuthority{
-                    .life = life, .catalog_entry = walk_life.catalog_entry, .checkpoint = checkpoint});
-            chassert(inserted);
-
-            /// The arithmetic stream audit runs FIRST, so a holed stream gets the verdict that EXPLAINS
-            /// it (`chain-broken`) rather than the downstream `CORRUPTED_DATA` the replay below would
-            /// raise about the same hole.
-            checkRefStream(
-                op, layout, life, walk_life.catalog_entry, checkpoint_sample, deadline, report, verdicts);
-
-            /// This recovery's finite range comes from the original catalog row and exact `_ckpt`, never
-            /// from a stream listing, a self-resolved name, or an F+1 probe.
-            const RefTableState table = recoverRefTableDetailedFromAuthority(
-                op, layout, authority_it->second.catalog_entry, authority_it->second.checkpoint).state;
-            for (const auto [ref_name, row] : table.getCommitted())
+            const DeferredLifeFindings & findings = deferred[life_index];
+            report.ref_records_walked += findings.scratch.ref_records_walked;
+            if (findings.verdicts.chain_broken.empty() && findings.verdicts.unchecked.empty()
+                && findings.scratch.dangling == 0 && findings.scratch.objects.empty())
+                continue;
+            const NamespaceLifeId & life = walk_lives[life_index].life;
+            verdicts.recordUnchecked(report, life.ns, layout.namespaceStreamPrefix(life),
+                "fsck findings for this namespace were not confirmed before the deadline");
+        }
+    };
+    try
+    {
+        for (size_t life_index = 0; life_index < walk_lives.size(); ++life_index)
+        {
+            const FsckWalkLife & walk_life = walk_lives[life_index];
+            const NamespaceLifeId & life = walk_life.life;
+            const RootNamespace & ns = life.ns;
+            const String & ns_str = ns.string();
+            DeferredLifeFindings & findings = deferred[life_index];
+            unchecked_sink = &findings.verdicts;
+            unchecked_report = &findings.scratch;
+            /// RECORD AND CONTINUE, NEVER WEDGE. Everything below is per-namespace, and every one of these
+            /// steps can raise `CORRUPTED_DATA` on a namespace whose stream is damaged — the replay refuses a
+            /// non-contiguous tail, the codecs refuse an invalid body. For RECOVERY that throw is the correct
+            /// fail-close; for a read-only diagnostic it is a bug, because the audit then reports NOTHING
+            /// about the namespaces it never reached, including the healthy ones. So one namespace's failure
+            /// becomes that namespace's verdict and the sweep goes on.
+            ///
+            /// `TIMEOUT_EXCEEDED` is deliberately NOT caught: the deadline is a property of the whole scan,
+            /// and `runFsck`'s `partial` handling owns it.
+            try
             {
-                const ManifestId id{ns, row.manifest_ref};
-                const String mkey = layout.manifestKey(id);
-                owned_manifest_keys.insert(mkey);
-                const String label = ns_str + "/" + ref_name;
+                const auto [authority_it, inserted] = recovery_authorities.emplace(
+                    ns.string(), FsckRecoveryAuthority{.life = life, .catalog_entry = walk_life.catalog_entry});
+                chassert(inserted);
 
-                const auto got = op.read(mkey, Retry::standard());
-                if (!got)
+                /// The stream audit and the owner replay are one walk, so the two legs cannot see different
+                /// histories after a concurrent `_ckpt` write.
+                std::optional<RefTxnId> greatest_listed;
+                if (const auto listed_it = greatest_listed_log.find(life.incarnation); listed_it != greatest_listed_log.end())
+                    greatest_listed = listed_it->second;
+                const std::optional<RefTableState> walked = walkRefStream(
+                    op, layout, life, walk_life.catalog_entry, greatest_listed, deadline, findings.scratch, findings.verdicts);
+                if (!walked)
+                    continue;
+                const RefTableState & table = *walked;
+                for (const auto [ref_name, row] : table.getCommitted())
                 {
-                    /// A committed ref naming a missing manifest body would be an INV-NO-DANGLE violation —
-                    /// but the per-ref GET runs later than the namespace's ref recovery, so a stale captured
-                    /// row plus a legitimate GC delete of a since-superseded manifest can masquerade as one,
-                    /// and a bare GET can lag a present object. Revalidate exactly like the blob `Dangling`
-                    /// recheck below: HEAD the exact object AND re-resolve under the original catalog row
-                    /// plus a fresh checkpoint from its physical life. Count the dangle ONLY when the exact
-                    /// object is HEAD-absent AND that life still names THIS exact manifest — otherwise it is
-                    /// LIST/GET lag or a phantom stale-row, never a loss.
-                    if (!op.head(mkey, Retry::standard())
-                        && manifestStillReferenced(op, layout, ns, recovery_authorities, ref_name, mkey,
-                            deadline, record_recovery_unchecked))
+                    const ManifestId id{ns, row.manifest_ref};
+                    const String mkey = layout.manifestKey(id);
+                    owned_manifest_keys.insert(mkey);
+                    const String label = ns_str + "/" + ref_name;
+
+                    const auto got = op.read(mkey, Retry::standard());
+                    if (!got)
                     {
-                        ++report.dangling;
+                        /// A committed ref naming a missing manifest body would be an INV-NO-DANGLE violation —
+                        /// but the per-ref GET runs later than the namespace's ref recovery, so a stale captured
+                        /// row plus a legitimate GC delete of a since-superseded manifest can masquerade as one,
+                        /// and a bare GET can lag a present object. Revalidate exactly like the blob `Dangling`
+                        /// recheck below: HEAD the exact object AND re-resolve under the original catalog row
+                        /// plus a fresh checkpoint from its physical life. Count the dangle ONLY when the exact
+                        /// object is HEAD-absent AND that life still names THIS exact manifest — otherwise it is
+                        /// LIST/GET lag or a phantom stale-row, never a loss.
+                        if (!op.head(mkey, Retry::standard())
+                            && manifestStillReferenced(op, layout, ns, recovery_authorities, ref_name, mkey,
+                                deadline, record_recovery_unchecked))
+                        {
+                            ++findings.scratch.dangling;
+                            FsckObject o;
+                            o.key = mkey;
+                            o.kind = ObjectKind::Blob;   /// manifests have no ObjectKind; reuse Blob as the generic kind
+                            o.size = 0;
+                            o.cls = FsckClass::Dangling;
+                            o.reachable_from = {label};
+                            findings.scratch.objects.push_back(std::move(o));
+                        }
+                        /// A present object is GET lag. A row not named by the original-life authority is a
+                        /// stale-walk artifact, not a dangle; its original owner cannot contribute blobs.
+                        ++refs_walked;
+                        continue;
+                    }
+
+                    PartManifest body = decodePartManifest(openObject(FormatId::PartManifest, got->bytes));
+                    if (!refMatchesBody(id.ref, body) || !manifestNamespaceMatches(id.root_namespace, body))
+                    {
+                        ++findings.scratch.dangling;
                         FsckObject o;
                         o.key = mkey;
-                        o.kind = ObjectKind::Blob;   /// manifests have no ObjectKind; reuse Blob as the generic kind
-                        o.size = 0;
+                        o.kind = ObjectKind::Blob;
+                        o.size = got->bytes.size();
                         o.cls = FsckClass::Dangling;
                         o.reachable_from = {label};
-                        report.objects.push_back(std::move(o));
-                    }
-                    /// A present object is GET lag. A row not named by the original-life authority is a
-                    /// stale-walk artifact, not a dangle; its original owner cannot contribute blobs.
-                    ++refs_walked;
-                    continue;
-                }
-
-                PartManifest body = decodePartManifest(openObject(FormatId::PartManifest, got->bytes));
-                if (!refMatchesBody(id.ref, body) || !manifestNamespaceMatches(id.root_namespace, body))
-                {
-                    ++report.dangling;
-                    FsckObject o;
-                    o.key = mkey;
-                    o.kind = ObjectKind::Blob;
-                    o.size = got->bytes.size();
-                    o.cls = FsckClass::Dangling;
-                    o.reachable_from = {label};
-                    report.objects.push_back(std::move(o));
-                    ++refs_walked;
-                    continue;
-                }
-
-                for (const ManifestEntry & e : body.entries)
-                {
-                    if (e.placement != EntryPlacement::Blob)
+                        findings.scratch.objects.push_back(std::move(o));
+                        ++refs_walked;
                         continue;
-                    const String bkey = layout.blobKey(e.ref);
-                    reachable_blobs.insert(bkey);
-                    ++report.total_blob_refs;
-                    report.referenced_logical_bytes += e.blob_size;
-                    blob_labels[bkey].push_back(label);
-                }
+                    }
 
-                ++refs_walked;
-                checkDeadline(deadline, "walking refs");
-                if (on_progress && refs_walked % 64 == 0)
-                    on_progress("walking refs", reachable_blobs.size(), refs_walked);
+                    for (const ManifestEntry & e : body.entries)
+                    {
+                        if (e.placement != EntryPlacement::Blob)
+                            continue;
+                        const String bkey = layout.blobKey(e.ref);
+                        reachable_blobs.insert(bkey);
+                        ++report.total_blob_refs;
+                        report.referenced_logical_bytes += e.blob_size;
+                        blob_labels[bkey].push_back(label);
+                    }
+
+                    ++refs_walked;
+                    checkDeadline(deadline, "walking refs");
+                    if (on_progress && refs_walked % 64 == 0)
+                        on_progress("walking refs", reachable_blobs.size(), refs_walked);
+                }
             }
+            catch (const Exception & e)
+            {
+                if (e.code() == ErrorCodes::TIMEOUT_EXCEEDED)
+                    throw;
+                findings.verdicts.recordUnchecked(findings.scratch, ns,
+                    layout.namespaceStreamPrefix(life),
+                    "fsck could not examine this namespace: " + e.message());
+            }
+        }
+    }
+    catch (const Exception & e)
+    {
+        if (e.code() == ErrorCodes::TIMEOUT_EXCEEDED)
+            report_held_as_unconfirmed();
+        throw;
+    }
+    unchecked_sink = &verdicts;
+    unchecked_report = &report;
+
+    /// One catalog read confirms every life walked before it: the janitor deletes only lives that a
+    /// catalog read after its listing does not name, and an erased row never returns.
+    if (!walk_lives.empty())
+    {
+        const CasRefCatalog::Snapshot confirmation_cut = CasRefCatalog::read(op, layout);
+        for (size_t life_index = 0; life_index < walk_lives.size(); ++life_index)
+        {
+            DeferredLifeFindings & findings = deferred[life_index];
+            report.ref_records_walked += findings.scratch.ref_records_walked;
+            if (!catalogStillNamesLife(confirmation_cut.catalog, walk_lives[life_index].life))
+            {
+                pending_lives.insert(walk_lives[life_index].life.incarnation);
+                continue;
+            }
+            verdicts.absorb(findings.verdicts);
+            report.dangling += findings.scratch.dangling;
+            for (FsckObject & object : findings.scratch.objects)
+                report.objects.push_back(std::move(object));
+        }
+    }
+    report.namespace_janitor_pending_lives = pending_lives.size();
+
+    /// A late recheck walks a life again, after the confirmation above. Its `Dangling` verdicts and
+    /// unchecked notes wait for one more batched catalog read that still names the life.
+    struct LateDangling
+    {
+        FsckObject object;
+        std::vector<String> labels;
+    };
+    std::vector<LateDangling> late_danglings;
+    struct LateUnchecked
+    {
+        RootNamespace ns;
+        String key;
+        String note;
+    };
+    std::vector<LateUnchecked> late_unchecked;
+    const RecordRecoveryUnchecked record_late_unchecked =
+        [&](const RootNamespace & ns, const String & key, const String & detail_text)
+        {
+            late_unchecked.push_back(LateUnchecked{ns, key, detail_text});
+        };
+    const auto confirm_late_findings = [&]
+    {
+        if (late_danglings.empty() && late_unchecked.empty())
+            return;
+        const CasRefCatalog::Snapshot late_cut = CasRefCatalog::read(op, layout);
+        /// A label or namespace without a retained authority cannot be shown removed: keep its verdict.
+        const auto still_named = [&](const String & ns_str)
+        {
+            const auto it = recovery_authorities.find(ns_str);
+            return it == recovery_authorities.end() || catalogStillNamesLife(late_cut.catalog, it->second.life);
+        };
+        for (LateUnchecked & unchecked : late_unchecked)
+            if (still_named(unchecked.ns.string()))
+                verdicts.recordUnchecked(report, unchecked.ns, unchecked.key, std::move(unchecked.note));
+        for (LateDangling & dangling : late_danglings)
+        {
+            const bool any_named = dangling.labels.empty() || std::any_of(dangling.labels.begin(), dangling.labels.end(),
+                [&](const String & label)
+                {
+                    const size_t slash = label.rfind('/');
+                    return slash == String::npos || still_named(label.substr(0, slash));
+                });
+            if (!any_named)
+                continue;
+            ++report.dangling;
+            report.objects.push_back(std::move(dangling.object));
+        }
+        late_danglings.clear();
+        late_unchecked.clear();
+    };
+    const auto report_late_as_unconfirmed = [&]
+    {
+        static constexpr std::string_view note = "late recheck not confirmed before the deadline";
+        for (const LateUnchecked & unchecked : late_unchecked)
+            verdicts.recordUnchecked(report, unchecked.ns, unchecked.key, String(note));
+        for (const LateDangling & dangling : late_danglings)
+        {
+            const String & label = dangling.labels.empty() ? String{} : dangling.labels.front();
+            const size_t slash = label.rfind('/');
+            verdicts.recordUnchecked(report, RootNamespace{slash == String::npos ? label : label.substr(0, slash)},
+                dangling.object.key, String(note));
+        }
+        late_danglings.clear();
+        late_unchecked.clear();
+    };
+    const auto confirm_late_findings_or_report_on_deadline = [&](const std::function<void()> & recheck)
+    {
+        try
+        {
+            recheck();
         }
         catch (const Exception & e)
         {
             if (e.code() == ErrorCodes::TIMEOUT_EXCEEDED)
-                throw;
-            verdicts.recordUnchecked(report, ns,
-                layout.namespaceStreamPrefix(life),
-                "fsck could not examine this namespace: " + e.message());
+                report_late_as_unconfirmed();
+            throw;
         }
-    }
+        confirm_late_findings();
+    };
     report.distinct_blobs = reachable_blobs.size();
 
     /// Scoped mode skips the GLOBAL physical classification below: it is meaningless under a
@@ -746,50 +915,53 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         report.physical_bytes += sz;
 
     /// Reachable blobs must be present (HEAD-confirm against LIST lag before declaring loss).
-    for (const String & bkey : reachable_blobs)
+    confirm_late_findings_or_report_on_deadline([&]
     {
-        auto it = present_blobs.find(bkey);
-        bool exists = it != present_blobs.end();
-        uint64_t size = exists ? it->second : 0;
-        if (!exists)
+        for (const String & bkey : reachable_blobs)
         {
-            if (const std::optional<Meta> h = op.head(bkey, Retry::standard()))
+            auto it = present_blobs.find(bkey);
+            bool exists = it != present_blobs.end();
+            uint64_t size = exists ? it->second : 0;
+            if (!exists)
             {
-                exists = true;
-                size = h->size;
-                report.physical_bytes += h->size;
+                if (const std::optional<Meta> h = op.head(bkey, Retry::standard()))
+                {
+                    exists = true;
+                    size = h->size;
+                    report.physical_bytes += h->size;
+                }
             }
-        }
 
-        const auto lit = blob_labels.find(bkey);
-        if (!exists)
-        {
-            /// Before declaring a loss, re-resolve the referencing refs from the original audit
-            /// authority. A later rebirth must not replace the old owner while this verdict is being
-            /// decided.
-            const bool still_referenced = blobStillReferenced(op, store, layout, recovery_authorities, bkey,
-                lit != blob_labels.end() ? lit->second : std::vector<String>{}, deadline,
-                record_recovery_unchecked);
-            if (!still_referenced)
-                continue;   /// stale-walk artifact: neither reachable nor dangling — skip entirely
-        }
+            const auto lit = blob_labels.find(bkey);
+            const std::vector<String> labels = lit != blob_labels.end() ? lit->second : std::vector<String>{};
+            if (!exists)
+            {
+                /// Before declaring a loss, re-resolve the referencing refs from the original audit
+                /// authority. A later rebirth must not replace the old owner while this verdict is being
+                /// decided.
+                const bool still_referenced = blobStillReferenced(op, store, layout, recovery_authorities, bkey,
+                    labels, deadline, record_late_unchecked);
+                if (!still_referenced)
+                    continue;   /// stale-walk artifact: neither reachable nor dangling — skip entirely
+            }
 
-        if (exists)
-            ++report.reachable;
-        else
-            ++report.dangling;
-        if (detail || !exists)
-        {
             FsckObject o;
             o.key = bkey;
             o.kind = ObjectKind::Blob;
             o.size = size;
             o.cls = exists ? FsckClass::Reachable : FsckClass::Dangling;
-            if (detail && lit != blob_labels.end())
-                o.reachable_from = lit->second;
-            report.objects.push_back(std::move(o));
+            if (detail)
+                o.reachable_from = labels;
+            if (!exists)
+            {
+                late_danglings.push_back(LateDangling{std::move(o), labels});
+                continue;
+            }
+            ++report.reachable;
+            if (detail)
+                report.objects.push_back(std::move(o));
         }
-    }
+    });
 
     /// Present-but-unreferenced blobs: classify through the GC pipeline view instead of one
     /// suspicious "unreachable" lump (the multi-stage graduation keeps a nonzero churning
@@ -1054,40 +1226,41 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         /// Scoped mode: dangling-only for the selected namespaces. Each blob named by a scoped ref
         /// is HEAD-verified (O(scoped refs), no pool-wide LIST); the unreachable/pending pipeline
         /// classification needs the whole pool and is intentionally skipped.
-        for (const String & bkey : reachable_blobs)
+        confirm_late_findings_or_report_on_deadline([&]
         {
-            checkDeadline(deadline, "head-checking scoped blobs");
-            const std::optional<Meta> h = op.head(bkey, Retry::standard());
-            const auto lit = blob_labels.find(bkey);
-            const bool exists = h.has_value();
-            if (!exists)
+            for (const String & bkey : reachable_blobs)
             {
-                /// Use the same HEAD-absent re-resolve as the global-mode loop above.
-                const bool still_referenced = blobStillReferenced(op, store, layout, recovery_authorities, bkey,
-                    lit != blob_labels.end() ? lit->second : std::vector<String>{}, deadline,
-                    record_recovery_unchecked);
-                if (!still_referenced)
-                    continue;   /// stale-walk artifact — neither reachable nor dangling
-            }
-            if (exists)
-            {
-                ++report.reachable;
-                report.physical_bytes += h->size;
-            }
-            else
-                ++report.dangling;
-            if (detail || !exists)
-            {
+                checkDeadline(deadline, "head-checking scoped blobs");
+                const std::optional<Meta> h = op.head(bkey, Retry::standard());
+                const auto lit = blob_labels.find(bkey);
+                const std::vector<String> labels = lit != blob_labels.end() ? lit->second : std::vector<String>{};
+                const bool exists = h.has_value();
+                if (!exists)
+                {
+                    /// Use the same HEAD-absent re-resolve as the global-mode loop above.
+                    const bool still_referenced = blobStillReferenced(op, store, layout, recovery_authorities, bkey,
+                        labels, deadline, record_late_unchecked);
+                    if (!still_referenced)
+                        continue;   /// stale-walk artifact — neither reachable nor dangling
+                }
                 FsckObject o;
                 o.key = bkey;
                 o.kind = ObjectKind::Blob;
                 o.size = exists ? h->size : 0;
                 o.cls = exists ? FsckClass::Reachable : FsckClass::Dangling;
-                if (detail && lit != blob_labels.end())
-                    o.reachable_from = lit->second;
-                report.objects.push_back(std::move(o));
+                if (detail)
+                    o.reachable_from = labels;
+                if (!exists)
+                {
+                    late_danglings.push_back(LateDangling{std::move(o), labels});
+                    continue;
+                }
+                ++report.reachable;
+                report.physical_bytes += h->size;
+                if (detail)
+                    report.objects.push_back(std::move(o));
             }
-        }
+        });
     }
 
     /// Pre-precommit manifest debris: a `cas/manifests/` body with no committed owner. An ELIGIBLE prefix's

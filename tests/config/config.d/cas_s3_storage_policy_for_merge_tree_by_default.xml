@@ -14,6 +14,8 @@
                 <!-- Phase 0 (mount safety): required, validated identity of the layout subtree this
                      server owns. Single-server stateless lane → a stable literal id. -->
                 <cas_server_root_id>stateless-ca-s3</cas_server_root_id>
+                <!-- One server process per uuid in the test lanes: a restart after a kill reclaims the slot without waiting out the lease. -->
+                <cas_unsafe_remount_no_delay>1</cas_unsafe_remount_no_delay>
                 <!-- RustFS (M-W D-W8): the CA pool needs ENFORCED conditional ops (exact-token
                      DELETE must 412 on mismatch) - MinIO OSS silently ignores If-Match on DELETE
                      and the fail-closed capability probe rejects it. RustFS runs on a dedicated
@@ -38,6 +40,8 @@
                 <http_keep_alive_timeout>30</http_keep_alive_timeout>
                 <http_keep_alive_max_requests>10000</http_keep_alive_max_requests>
                 <cas_server_root_id>stateless-ca-s3-packed-disabled</cas_server_root_id>
+                <!-- One server process per uuid in the test lanes: a restart after a kill reclaims the slot without waiting out the lease. -->
+                <cas_unsafe_remount_no_delay>1</cas_unsafe_remount_no_delay>
                 <endpoint>http://localhost:11121/test/cas_s3_packed_disabled/</endpoint>
                 <access_key_id>clickhouse</access_key_id>
                 <secret_access_key>clickhouse</secret_access_key>

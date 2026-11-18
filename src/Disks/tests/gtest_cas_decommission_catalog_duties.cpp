@@ -156,14 +156,22 @@ TEST(CASDecommissionCatalogDuties, RemovingWithCheckpointResumesTerminalAndIsVer
     EXPECT_EQ(report.namespaces_pending_gc, 1u);
     EXPECT_TRUE(slotObjectExists(*backend, "owner"));
 
+    /// The admin mount writes in a later epoch than the creation, so the never-born stream first gets a
+    /// tombstone at its creation slot, then the terminal record.
     const ListPage stream = catalog_op.list(Layout("p").namespaceStreamPrefix(*life), "", 100, Retry::standard());
-    ASSERT_EQ(stream.keys.size(), 1u);
-    const auto parsed = Layout("p").parseRefObjectKey(stream.keys.front().key);
-    ASSERT_TRUE(parsed);
-    const auto body = catalog_op.read(stream.keys.front().key, Retry::standard());
-    ASSERT_TRUE(body);
-    const RefLogTxn terminal = decodeRefLogTxn(
-        openObject(FormatId::RefLog, body->bytes), ns.string(), parsed->txn_id);
+    ASSERT_EQ(stream.keys.size(), 2u);
+    const auto decodeAt = [&](size_t index)
+    {
+        const auto parsed = Layout("p").parseRefObjectKey(stream.keys[index].key);
+        EXPECT_TRUE(parsed);
+        const auto body = catalog_op.read(stream.keys[index].key, Retry::standard());
+        EXPECT_TRUE(body);
+        return decodeRefLogTxn(openObject(FormatId::RefLog, body->bytes), ns.string(), parsed->txn_id);
+    };
+    const RefLogTxn genesis = decodeAt(0);
+    EXPECT_TRUE(refLogTxnIsEpochSeal(genesis));
+    const RefLogTxn terminal = decodeAt(1);
+    EXPECT_EQ(terminal.prev_epoch_seal, std::make_optional(genesis.txn_id));
     ASSERT_EQ(terminal.ops.size(), 2u);
     EXPECT_EQ(terminal.ops.front().kind, RefOpKind::NamespaceBirth);
     EXPECT_EQ(terminal.ops.back().kind, RefOpKind::RemoveNamespace);
@@ -209,7 +217,7 @@ TEST(CASDecommissionCatalogDuties, PartialRemovalProgressStillWakesGcWhenLaterNa
     EXPECT_FALSE(readOwnerDuty(*backend).retirement_verified);
     const ListPage progressed_stream
         = catalog_op.list(Layout("p").namespaceStreamPrefix(*progressed_life), "", 100, Retry::standard());
-    ASSERT_EQ(progressed_stream.keys.size(), 1u);
+    ASSERT_EQ(progressed_stream.keys.size(), 2u) << "the creation slot's tombstone and the terminal record";
 }
 
 TEST(CASDecommissionCatalogDuties, VictimEntryAppearingAfterTheCutBlocksTheMark)

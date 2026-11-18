@@ -9,7 +9,7 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
 
-DISK="disk(type = object_storage, object_storage_type = local, metadata_type = cas, cas_server_root_id = '${CLICKHOUSE_DATABASE}_pc2', name = '${CLICKHOUSE_DATABASE}_pc2', path = '${CLICKHOUSE_DATABASE}_pc2_pool/')"
+DISK="disk(type = object_storage, object_storage_type = local, metadata_type = cas, cas_unsafe_remount_no_delay = 1, cas_server_root_id = '${CLICKHOUSE_DATABASE}_pc2', name = '${CLICKHOUSE_DATABASE}_pc2', path = '${CLICKHOUSE_DATABASE}_pc2_pool/')"
 
 # Both ATTACH renames are `ref_move`s whose source is under detached/.
 counts() {

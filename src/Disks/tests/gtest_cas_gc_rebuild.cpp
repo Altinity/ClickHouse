@@ -10,6 +10,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Common/ProfileEvents.h>
+#include "cas_sweep_test_support.h"
 #include "cas_test_helpers.h"
 
 using namespace DB::Cas;
@@ -23,6 +24,7 @@ extern const Event CASGCRefWalkPlansBuilt;
 namespace DB::ErrorCodes
 {
 extern const int CORRUPTED_DATA;
+extern const int NETWORK_ERROR;
 }
 
 namespace
@@ -256,13 +258,9 @@ TEST(CASGCRebuild, HealthyStateRequiresForce)
     EXPECT_NO_THROW(gc.runRegularRound());
 }
 
-/// The post-LIST catalog cut and its exact `_ckpt` are REBUILD's authority. A visible later log is
-/// not admitted merely because a LIST would find it: it may be a durable-but-unfrontiered writer
-/// attempt, and folding its missing manifest would turn a safe rebuild into a false refusal.
-///
-/// This catches a regression back to the legacy `recoverRefTable` overload, whose full LIST-derived
-/// replay consumes the second transaction and therefore refuses on `unfrontiered`'s missing body.
-TEST(CASGCRebuild, FrozenCheckpointFrontierExcludesVisibleUnfrontieredTail)
+/// A durable log on the chain is history: REBUILD walks past the frontier of a generation 1 `_ckpt` to
+/// the first absent key and protects the owner the later log adds.
+TEST(CASGCRebuild, CheckpointFrontierAdmitsAVisibleLogAboveIt)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -285,23 +283,25 @@ TEST(CASGCRebuild, FrozenCheckpointFrontierExcludesVisibleUnfrontieredTail)
     fixture::writeRefLogRaw(*backend, layout,
         RefLogTxn{.ns = ns.string(), .txn_id = RefTxnId{1, 1}, .ops = std::move(first_ops), .prev_epoch_seal = std::nullopt});
 
-    /// This record is real and listable, but the writer never published it through `_ckpt`.
+    /// The writer never published this record through `_ckpt`, but it is on the chain.
     const ManifestRef unfrontiered = ref(2, 0xB2);
+    writeBlobBody(*backend, layout, DB::UInt128(2));
+    writeManifestRaw(*backend, layout, ns, unfrontiered, {blobEntryFor("b", DB::UInt128(2))});
     fixture::writeRefLogRaw(*backend, layout,
         RefLogTxn{.ns = ns.string(), .txn_id = RefTxnId{1, 2}, .ops = publishCommittedOps("unfrontiered", unfrontiered),
                   .prev_epoch_seal = std::nullopt});
     ASSERT_TRUE(headObj(*backend, layout.refLogKey(life, RefTxnId{1, 2})).has_value());
-    createObj(*backend, layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    createObj(*backend, layout.refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{1, 1},
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt}));
+        .last_epoch_seal = std::nullopt}, 1));
 
     Gc gc(store, kGc);
     const RebuildReport report = gc.rebuildBaseline(/*force=*/false);
 
     ASSERT_TRUE(report.performed) << report.refusal;
-    EXPECT_EQ(report.committed_refs, 1u);
+    EXPECT_EQ(report.committed_refs, 2u);
 }
 
 /// A catalog-admitted life without its exact checkpoint has no bounded recovery frontier. REBUILD
@@ -373,11 +373,11 @@ TEST(CASGCRebuild, CheckpointSnapshotAtOlderEpochSealFailsClosed)
     applyRefLogTxn(through_seal, seal_txn);
     writeRefSnapshotRaw(*backend, layout, snapshotOf(through_seal, ns.string()));
 
-    createObj(*backend, layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    createObj(*backend, layout.refCkptKey(life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{2, 1},
         .checkpoint_snapshot_id = RefTxnId{1, 2},
-        .last_epoch_seal = RefTxnId{2, 1}}));
+        .last_epoch_seal = RefTxnId{2, 1}}, 1));
 
     Gc gc(store, kGc);
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)gc.rebuildBaseline(/*force=*/false); });
@@ -406,11 +406,11 @@ TEST(CASGCRebuild, DamagedGenerationZeroStatePerformsNoCatalogDrainMutation)
         next.entries[0].removal_started_round = 1;
         return next;
     });
-    createObj(*backend, layout.refCkptKey(NamespaceLifeId::fromCatalogEntry(ns, life_id)), encodeRefCkpt(RefCkpt{
+    createObj(*backend, layout.refCkptKey(NamespaceLifeId::fromCatalogEntry(ns, life_id)), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = std::nullopt,
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt}));
+        .last_epoch_seal = std::nullopt}, 1));
     const uint64_t catalog_cas_before = backend->putOverwriteCount(layout.refCatalogKey());
     const uint64_t plans_before
         = ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt];
@@ -725,4 +725,76 @@ TEST(CASGCClampSuppression, LandedEdgeBehindClampNeverDeleted)
     store->renewWatermarkOnce();
     dropRefTransition(*backend, store->layout(), ns, "tbl_c", m3, /*shard*/1);
     EXPECT_TRUE(runRoundsUntilAbsent(store, gc, *backend, store->layout(), DB::UInt128(5)));
+}
+
+namespace
+{
+
+/// A catalog-admitted life whose chain is `{1,1}` birth, `T{1,2}->5`, `H{5,1}<-{1,2}`, under a
+/// generation 3 `_ckpt`.
+NamespaceLifeId seedSkippedEpochChain(Backend & backend, const Layout & layout, const RootNamespace & ns,
+                                      const UInt128 & life_id, uint64_t gc_shards)
+{
+    OperationForTest op(backend);
+    CasRefCatalog::casAdmitEntry(*op, layout, gc_shards, CatalogEntry{.ns = ns, .state = NsState::Live, .incarnation = life_id});
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(ns, life_id);
+    const auto put = [&](const RefLogTxn & txn, uint32_t generation)
+    {
+        createObj(backend, layout.refLogKey(life, txn.txn_id),
+            sealObject(FormatId::RefLog, encodeRefLogTxnAtGeneration(txn, generation)));
+    };
+    put(RefLogTxn{ns.string(), RefTxnId{1, 1}, {namespaceBirthOp()}, std::nullopt}, 1);
+    put(tombstoneTxn(ns.string(), RefTxnId{1, 2}, 5), 3);
+    put(RefLogTxn{ns.string(), RefTxnId{5, 1}, {}, RefTxnId{1, 2}}, 3);
+    RefCkpt ckpt = refCkptOf(1);
+    createObj(backend, layout.refCkptKey(life), encodeRefCkptAtGeneration(ckpt, 3));
+    return life;
+}
+
+}
+
+TEST(CASGCRebuild, RebuildFollowsASkippedEpoch)
+{
+    ScopedReadCeiling c(3);
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const UInt128 life_id{0xF101};
+    seedSkippedEpochChain(*backend, layout, RootNamespace{"00/rebuild-skipped-epoch@cas@"}, life_id,
+                          store->poolConfig().gc_shards);
+
+    Gc gc(store, kGc);
+    const RebuildReport report = gc.rebuildBaseline(/*force=*/false);
+    ASSERT_TRUE(report.performed) << report.refusal;
+
+    const GcState st = decodeGcState(readObj(*backend, layout.gcStateKey())->bytes);
+    const CasFoldSeal seal = decodeFoldSeal(readObj(*backend, layout.foldSealKey(st.snap_generation, st.snap_attempt))->bytes);
+    const auto row = seal.ref_lives.find(life_id);
+    ASSERT_NE(row, seal.ref_lives.end());
+    EXPECT_EQ(row->second.coverage.last_folded_ref_id, (RefTxnId{5, 1}));
+}
+
+TEST(CASGCRebuild, RebuildFailsWhenTheBaseMoves)
+{
+    ScopedReadCeiling c(3);
+    auto backend = std::make_shared<SweepReadHookBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const NamespaceLifeId life = seedSkippedEpochChain(
+        *backend, layout, RootNamespace{"00/rebuild-base-moves@cas@"}, UInt128{0xF102}, store->poolConfig().gc_shards);
+    backend->arm(layout.refLogKey(life, RefTxnId{1, 1}), 1, [&]
+    {
+        OperationForTest op(*backend);
+        const auto current = (*op).read(layout.refCkptKey(life), Retry::once());
+        ASSERT_TRUE(current.has_value());
+        ASSERT_TRUE(std::holds_alternative<Committed>(
+            (*op).replace(layout.refCkptKey(life), current->bytes, current->etag, Retry::once())));
+    });
+
+    Gc gc(store, kGc);
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)gc.rebuildBaseline(/*force=*/false); });
+    EXPECT_TRUE(backend->didFire());
+    const auto state = readObj(*backend, layout.gcStateKey());
+    ASSERT_TRUE(state);
+    EXPECT_EQ(decodeGcState(state->bytes).snap_generation, 0u) << "a moved base must not adopt a new baseline";
 }
