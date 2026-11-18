@@ -56,10 +56,32 @@ bool ReplicatedMergeTreeMergeStrategyPicker::isMergeFinishedByReplica(const Stri
 
 bool ReplicatedMergeTreeMergeStrategyPicker::shouldMergeOnSingleReplica(const ReplicatedMergeTreeLogEntryData & entry) const
 {
+    if (entry.type != ReplicatedMergeTreeLogEntry::MERGE_PARTS)
+        return false;
+
     time_t threshold = execute_merges_on_single_replica_time_threshold;
+    time_t remote_threshold = remote_fs_execute_merges_on_single_replica_time_threshold;
+
+    if (remote_threshold > threshold && !entry.source_parts.empty())
+    {
+        bool all_parts_remote_or_cas = true;
+        for (const auto & name : entry.source_parts)
+        {
+            auto part = storage.getPartIfExists(
+                name,
+                {MergeTreeDataPartState::PreActive, MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
+            if (!part || (!part->getDataPartStorage().isContentAddressed() && !part->getDataPartStorage().supportZeroCopyReplication()))
+            {
+                all_parts_remote_or_cas = false;
+                break;
+            }
+        }
+        if (all_parts_remote_or_cas)
+            threshold = remote_threshold;
+    }
+
     return (
         threshold > 0       /// feature turned on
-        && entry.type == ReplicatedMergeTreeLogEntry::MERGE_PARTS /// it is a merge log entry
         && entry.create_time + threshold > time(nullptr)          /// not too much time waited
     );
 }
@@ -101,7 +123,16 @@ void ReplicatedMergeTreeMergeStrategyPicker::refreshState()
     const auto settings = storage.getSettings();
     time_t threshold = (*settings)[MergeTreeSetting::execute_merges_on_single_replica_time_threshold].totalSeconds();
     time_t threshold_init = 0;
-    if ((*settings)[MergeTreeSetting::allow_remote_fs_zero_copy_replication])
+    bool has_cas_disk = false;
+    for (const auto & disk : storage.getDisks())
+    {
+        if (disk && disk->isContentAddressed())
+        {
+            has_cas_disk = true;
+            break;
+        }
+    }
+    if ((*settings)[MergeTreeSetting::allow_remote_fs_zero_copy_replication] || has_cas_disk)
         threshold_init = (*settings)[MergeTreeSetting::remote_fs_execute_merges_on_single_replica_time_threshold].totalSeconds();
 
     if (threshold == 0)
