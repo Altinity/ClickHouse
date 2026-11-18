@@ -331,6 +331,10 @@ class PRInfo:
     def is_release_branch(self) -> bool:
         return self.number == 0
 
+    @property
+    def is_push_event(self) -> bool:
+        return self.event_type == EventType.PUSH
+
     def is_pr(self):
         return self.event_type == EventType.PULL_REQUEST
 
