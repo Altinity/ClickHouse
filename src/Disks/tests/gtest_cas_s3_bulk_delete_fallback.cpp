@@ -13,6 +13,7 @@
 #include <IO/S3Common.h>
 #include <Common/RemoteHostFilter.h>
 #include <Common/tests/gtest_global_context.h>
+#include <base/defines.h>
 
 #include <algorithm>
 #include <atomic>
@@ -433,28 +434,38 @@ TEST(CASS3ConditionalBatchDelete, DoesNotTreatMissingBucketAsMissingObject)
     }
 }
 
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+TEST(CASS3ConditionalBatchDeleteDeathTest, RejectsDuplicateResponseKey)
+#else
 TEST(CASS3ConditionalBatchDelete, RejectsDuplicateResponseKey)
+#endif
 {
-    (void)contextForTest();
-
-    ScriptedS3Server server([](const Poco::Net::HTTPServerRequest &, Poco::Net::HTTPServerResponse & response)
+    /// Construct the server in the death-test child rather than forking its running threads.
+    const auto send_duplicate_response = []
     {
-        const std::string body =
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
-            "<DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
-            "<Deleted><Key>first</Key></Deleted>"
-            "<Deleted><Key>first</Key></Deleted>"
-            "<Error><Key>second</Key><Code>PreconditionFailed</Code><Message>stale</Message></Error>"
-            "</DeleteResult>";
-        sendXml(response, Poco::Net::HTTPResponse::HTTP_OK, body);
-    });
-    auto storage = makeStorageForTest(server.getUrl(), DB::S3Capabilities{});
+        (void)contextForTest();
+        ScriptedS3Server server([](const Poco::Net::HTTPServerRequest &, Poco::Net::HTTPServerResponse & response)
+        {
+            const std::string body =
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+                "<DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+                "<Deleted><Key>first</Key></Deleted>"
+                "<Deleted><Key>first</Key></Deleted>"
+                "<Error><Key>second</Key><Code>PreconditionFailed</Code><Message>stale</Message></Error>"
+                "</DeleteResult>";
+            sendXml(response, Poco::Net::HTTPResponse::HTTP_OK, body);
+        });
+        auto storage = makeStorageForTest(server.getUrl(), DB::S3Capabilities{});
 
-    EXPECT_THROW(
         storage->removeObjectsIfTokensMatch(
             {{DB::StoredObject("first"), "etag-first"}, {DB::StoredObject("second"), "etag-second"}},
-            DB::ObjectStorageControlRequest{}),
-        DB::Exception);
+            DB::ObjectStorageControlRequest{});
+    };
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+    EXPECT_DEATH(send_duplicate_response(), "unexpected or duplicate key first");
+#else
+    EXPECT_THROW(send_duplicate_response(), DB::Exception);
+#endif
 }
 
 TEST(S3BulkDeleteFallback, UnsupportedBatchReplyRecordsCapabilityFalseAndThrowsNotImplemented)

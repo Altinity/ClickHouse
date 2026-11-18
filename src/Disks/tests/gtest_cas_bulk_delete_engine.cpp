@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/ProfileEvents.h>
+#include <base/defines.h>
 
 /// The engine sends one chunk of at most 1000 write-once keys as one request under the ordinary
 /// attempt loop; a failed attempt reissues the whole chunk, which is sound because a key the failed
@@ -125,7 +126,11 @@ TEST(CASBulkDeleteEngineDeathTest, MoreThanOneThousandKeysIsACallerBug)
 }
 #endif
 
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+TEST(CASConditionalBatchDeleteEngineDeathTest, MoreThanOneThousandKeysIsRejectedEvenIfBackendReportsALargerLimit)
+#else
 TEST(CASConditionalBatchDeleteEngine, MoreThanOneThousandKeysIsRejectedEvenIfBackendReportsALargerLimit)
+#endif
 {
     auto backend = std::make_shared<UnlimitedConditionalBatchBackend>();
     backend->pinConditionalBatchDeleteSupport(true);
@@ -139,5 +144,9 @@ TEST(CASConditionalBatchDeleteEngine, MoreThanOneThousandKeysIsRejectedEvenIfBac
         removals.push_back({key, std::get<Committed>(op.create(key, "v", Retry::once())).etag});
     }
 
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+    EXPECT_DEATH({ op.removeManyByConditional(removals, Retry::once()); }, "CAS removeManyByConditional: 1001 keys");
+#else
     EXPECT_THROW(op.removeManyByConditional(removals, Retry::once()), DB::Exception);
+#endif
 }
