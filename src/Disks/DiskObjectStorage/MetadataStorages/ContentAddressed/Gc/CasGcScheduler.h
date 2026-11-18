@@ -237,6 +237,11 @@ private:
     /// critical section a scheduled or manual round runs under) and cleared when it returns, on the
     /// success AND exception paths. Read by `isQuiescent` (the FORGET / GC-STOP join-completion signal).
     std::atomic<bool> round_in_flight{false};
+    /// Set true when a round ends with a transient failure (keeping `i_am_leader` intact), cleared on
+    /// any completed round. `heartbeatLoop()` only pulses `gc/hb` while a round is actively in flight or
+    /// recovering from a transient failure; between healthy idle rounds, the periodic `gc/state` lease
+    /// renewal itself keeps followers from stealing.
+    std::atomic<bool> last_round_failed_transiently{false};
 
     /// rev.7 §3 [C1] test-observation seam: set (under `terminal_exit_mutex`) by `loop`/`heartbeatLoop`
     /// respectively when they SELF-EXIT via the terminal-lifecycle check, NOT when `stop()` flips

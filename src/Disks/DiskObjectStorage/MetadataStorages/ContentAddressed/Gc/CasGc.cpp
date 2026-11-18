@@ -19,6 +19,7 @@
 #include <IO/WriteBufferFromString.h>
 #include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
+#include <Common/SipHash.h>
 #include <Common/logger_useful.h>
 #include <Common/scope_guard_safe.h>
 #include <Common/threadPoolCallbackRunner.h>
@@ -412,13 +413,14 @@ Gc::Gc(PoolPtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_,
     io_pool_refuse_at_for_test = store->poolConfig().gc_io_pool_refuse_at_for_test;
 }
 
-void Gc::runNamespaceJanitor(
+bool Gc::runNamespaceJanitor(
     const GcState & leased_state, bool suppress_destructive, uint64_t cleanup_evidence_rows)
 {
     GcPhaseTimer t(phase_sink, "namespace_cleanup");
     t.metric("evidence_rows", cleanup_evidence_rows);
     NamespaceJanitorResult janitor_result;
     bool budget_exhausted = false;
+    bool threw = false;
     try
     {
         CasRequests & requests = store->openRequests();
@@ -441,6 +443,7 @@ void Gc::runNamespaceJanitor(
             janitor_result.deleted += page.deleted;
             janitor_result.leaked += page.leaked;
             janitor_result.delete_requests += page.delete_requests;
+            janitor_result.has_pending_work = janitor_result.has_pending_work || page.has_pending_work;
             for (const String & anomaly : page.anomalies)
                 LOG_WARNING(logger, "CAS namespace janitor: {}", anomaly);
             if (!page.more)
@@ -454,6 +457,7 @@ void Gc::runNamespaceJanitor(
     }
     catch (const std::exception & e)
     {
+        threw = true;
         LOG_WARNING(logger, "CAS namespace janitor stopped this round: {}", e.what());
     }
     if (janitor_result.leaked)
@@ -464,6 +468,7 @@ void Gc::runNamespaceJanitor(
     t.metric("leaked", janitor_result.leaked);
     t.metric("delete_requests", janitor_result.delete_requests);
     t.metric("budget_exhausted", budget_exhausted ? 1 : 0);
+    return threw || budget_exhausted || janitor_result.has_pending_work;
 }
 
 void Gc::removeWriteOnceOnIoPool(CasOperation & op, const std::vector<WriteOnceKey> & keys, NamespaceJanitorResult & out)
@@ -779,6 +784,13 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// jobs running into the NEXT round, where their confirmations reach a graduation gate that
     /// never scheduled them.
     SCOPE_EXIT({ meta_writer->drainOnExitNoThrow(); });
+    round_seal_cache_active_ = true;
+    round_seal_cache_.reset();
+    round_seal_reads_ = 0;
+    SCOPE_EXIT({
+        round_seal_cache_active_ = false;
+        round_seal_cache_.reset();
+    });
 
     /// PHASE 1/18 `lease`. Also the ONLY phase a `NotALeader` round emits, which is why the phase rows
     /// are correlated by `round_id` and not by the round number a follower never learns.
@@ -813,53 +825,15 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     CasOperation op = store->openRequests().admit();
     const uint64_t new_round = state.round + 1;
 
-    /// ONE budget instance for the WHOLE round, threaded into every destructive-or-observability-write
-    /// family below: `fold` (blob graduation/redelete, the `GcOutcomes` audit rows, the orphan-manifest
-    /// planner), `pruneSupersededGenerations`, the post-CAS hand-off reclaim (its OWN reserve, never
-    /// `pruneSupersededGenerations`' shared remainder), the post-CAS manifest-body cleanup, and
-    /// `cleanupRefObjects`. A cap is therefore cumulative over the round, never reset between families or
-    /// shards, except the outcome log byte limit, which is per shard. See `GcRoundWorkBudget`'s own
-    /// comment for the fail-closed contract each family applies on exhaustion.
-    GcRoundWorkBudget round_work_budget;
-    round_work_budget.max_graduations = store->poolConfig().gc_round_graduation_budget;
-    round_work_budget.max_redeletes = store->poolConfig().gc_round_redelete_budget;
-    round_work_budget.max_sweep_namespaces = store->poolConfig().gc_round_sweep_namespace_budget;
-    round_work_budget.max_sweep_recovery_ops = store->poolConfig().gc_round_sweep_recovery_op_budget;
-    round_work_budget.max_ref_cleanup_objects = store->poolConfig().gc_round_ref_cleanup_budget;
-    round_work_budget.max_prefix_wholesale_objects = store->poolConfig().gc_round_prefix_wholesale_budget;
-    round_work_budget.max_handoff_prefix_wholesale_objects = store->poolConfig().gc_round_handoff_prefix_wholesale_budget;
-    round_work_budget.max_outcome_entries = store->poolConfig().gc_round_outcome_entry_budget;
-    if (const auto limit = store->poolConfig().gc_outcome_log_byte_limit_for_test)
-        round_work_budget.max_outcome_log_bytes = *limit;
-
-    /// The helping barrier precedes heartbeat work, DEFER, the hot stream LIST, and every successor
-    /// artifact. A deferred invocation therefore cannot leave a row the adopted parent already proved
-    /// complete, and a folding invocation takes its catalog cut only after the deletion settles.
-    {
-        GcPhaseTimer t(phase_sink, "pre_fold_ref_drain");
-        uint64_t completed_erases = 0;
-        /// Declared after `t`, so it runs before the timer emits its record, on a throw too.
-        SCOPE_EXIT({ t.metric("deleted", completed_erases); });
-        const CatalogLifecycleReconcileResult drain_result = drainCompletedRemoving(state, completed_erases);
-        if (drain_result.authority_status != AuthorityStatus::Authoritative
-            || drain_result.catalog_resolution != CatalogResolution::DrainComplete)
-            throwCasWriteRetryLater("CAS GC pre-fold drain lost authority before the catalog settled");
-    }
-
-    /// Etag-guarded fence-out of dead mounts (liveness only — graduation itself paces on GC
-    /// rounds via `new_round`, not on heartbeat acks). A slot is fenced only after `mount_obs` has
-    /// watched its token hold unchanged on this leader's own monotonic clock for
-    /// `mountObservationThresholdMs` over the longer of this server's lease and the one the slot
-    /// declares, with the full renewal period as the step.
     const uint64_t ttl_ms = static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count());
     const uint64_t renew_period_ms = static_cast<uint64_t>(store->poolConfig().mount_renew_period.count());
 
-    /// PHASE 3/18 `heartbeat_floor`: one LIST of `gc/server-roots/`, one GET per mount slot, and a fence
-    /// PUT per newly-fenced mount.
+    auto run_heartbeat_floor = [&]
     {
         GcPhaseTimer t(phase_sink, "heartbeat_floor");
-        const HeartbeatFloor floor = computeHeartbeatFloor(op, layout, now_ms_fn(), mono_ms_fn,
-                                                           ttl_ms, renew_period_ms, mount_obs, lease_mismatch_warned);
+        const HeartbeatFloor floor = computeHeartbeatFloor(
+            op, layout, now_ms_fn(), mono_ms_fn,
+            ttl_ms, renew_period_ms, mount_obs, lease_mismatch_warned, &mount_terminal_cache);
         report.fence_outs = floor.fenced_now;
         if (floor.fenced_now > 0)
             ProfileEvents::increment(ProfileEvents::CASGCHeartbeatFenceOuts, floor.fenced_now);
@@ -899,7 +873,98 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         t.metric("terminated", floor.terminated);
         t.metric("fenced_now", floor.fenced_now);
         t.metric("already_fenced", floor.already_fenced);
+    };
+
+    /// Steady-state idle short-circuit: when the previous round settled cleanly (`changed_shards == 0`,
+    /// no pending catalog lifecycle transitions, and a clean janitor sweep) and neither the catalog
+    /// ETag, the `cas/ns/stream/` `(key, etag)` fingerprint, nor `graduationDue` changed, run
+    /// `heartbeat_floor` (with terminal-mount ETag caching) and return `Deferred` without re-reading
+    /// `cas/ref_catalog`, rebuilding `RefPlan`, running `namespace_cleanup`, or counting toward
+    /// `gc_fold_max_defer_rounds`.
+    if (idle_baseline_
+        && idle_baseline_->snap_generation == state.snap_generation
+        && idle_baseline_->snap_attempt == state.snap_attempt
+        && state.manifest_sweep_cursor.empty()
+        && store->poolConfig().gc_fold_max_defer_rounds > 0)
+    {
+        bool still_idle = false;
+        if (!graduationDue(state, new_round))
+        {
+            const std::optional<Meta> cat_head = op.head(layout.refCatalogKey(), Retry::standard());
+            if (cat_head && cat_head->etag == idle_baseline_->catalog_etag)
+            {
+                const RefScanSummary idle_scan = enumerateRefPrefix();
+                if (idle_scan.stream_etags_complete
+                    && idle_scan.stream_fingerprint == idle_baseline_->stream_fingerprint)
+                    still_idle = true;
+            }
+        }
+        if (still_idle)
+        {
+            run_heartbeat_floor();
+            {
+                GcPhaseTimer t(phase_sink, "defer_decision");
+                t.metric("changed_shards", 0);
+                t.metric("deferred", 1);
+                t.metric("idle_short_circuit", 1);
+                t.metric("rounds_deferred_before", rounds_since_last_fold_);
+                t.metric("fold_seal_reads", round_seal_reads_);
+            }
+            report.deferred = true;
+            report.round = state.round;
+            EventEmitter{*store}.emit([&](CasEvent & e)
+            {
+                e.type = CasEventType::GcFence;
+                e.object_kind = CasEventObjectKind::Snap;
+                e.round = state.round;
+                e.gen = state.snap_generation;
+                e.outcome = "deferred";
+                e.reason = "idle-short-circuit: catalog etag and ref stream unchanged; skipping drain, "
+                           "walk-plan, and janitor";
+                e.detail = {{"changed_shards", "0"},
+                            {"rounds_since_last_fold", std::to_string(rounds_since_last_fold_)}};
+            });
+            return report;
+        }
+        idle_baseline_.reset();
     }
+
+    /// ONE budget instance for the WHOLE round, threaded into every destructive-or-observability-write
+    /// family below: `fold` (blob graduation/redelete, the `GcOutcomes` audit rows, the orphan-manifest
+    /// planner), `pruneSupersededGenerations`, the post-CAS hand-off reclaim (its OWN reserve, never
+    /// `pruneSupersededGenerations`' shared remainder), the post-CAS manifest-body cleanup, and
+    /// `cleanupRefObjects`. A cap is therefore cumulative over the round, never reset between families or
+    /// shards, except the outcome log byte limit, which is per shard. See `GcRoundWorkBudget`'s own
+    /// comment for the fail-closed contract each family applies on exhaustion.
+    GcRoundWorkBudget round_work_budget;
+    round_work_budget.max_graduations = store->poolConfig().gc_round_graduation_budget;
+    round_work_budget.max_redeletes = store->poolConfig().gc_round_redelete_budget;
+    round_work_budget.max_sweep_namespaces = store->poolConfig().gc_round_sweep_namespace_budget;
+    round_work_budget.max_sweep_recovery_ops = store->poolConfig().gc_round_sweep_recovery_op_budget;
+    round_work_budget.max_ref_cleanup_objects = store->poolConfig().gc_round_ref_cleanup_budget;
+    round_work_budget.max_prefix_wholesale_objects = store->poolConfig().gc_round_prefix_wholesale_budget;
+    round_work_budget.max_handoff_prefix_wholesale_objects = store->poolConfig().gc_round_handoff_prefix_wholesale_budget;
+    round_work_budget.max_outcome_entries = store->poolConfig().gc_round_outcome_entry_budget;
+    if (const auto limit = store->poolConfig().gc_outcome_log_byte_limit_for_test)
+        round_work_budget.max_outcome_log_bytes = *limit;
+
+    /// The helping barrier precedes heartbeat work, DEFER, the hot stream LIST, and every successor
+    /// artifact. A deferred invocation therefore cannot leave a row the adopted parent already proved
+    /// complete, and a folding invocation takes its catalog cut only after the deletion settles.
+    {
+        GcPhaseTimer t(phase_sink, "pre_fold_ref_drain");
+        uint64_t completed_erases = 0;
+        /// Declared after `t`, so it runs before the timer emits its record, on a throw too.
+        SCOPE_EXIT({ t.metric("deleted", completed_erases); });
+        const CatalogLifecycleReconcileResult drain_result = drainCompletedRemoving(state, completed_erases);
+        if (drain_result.authority_status != AuthorityStatus::Authoritative
+            || drain_result.catalog_resolution != CatalogResolution::DrainComplete)
+            throwCasWriteRetryLater("CAS GC pre-fold drain lost authority before the catalog settled");
+    }
+
+    /// PHASE 3/18 `heartbeat_floor`: one LIST of `gc/server-roots/`, one GET per live mount slot (cached
+    /// terminal slots skip GETs via ETag), and a fence PUT per newly-fenced mount.
+    run_heartbeat_floor();
 
     /// Decide DEFER vs FOLD from cheap pre-fold signals.
     /// A DEFER round re-adopts the sealed generation — no fold, no delete, no gc/state write — so a
@@ -917,9 +982,11 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// same key) -- see `fold_seal_reads` below.
     std::optional<RefPlan> walk_plan;
     bool defer_round = false;
+    bool graduation_due = false;
     {
         GcPhaseTimer t(phase_sink, "defer_decision");
-        const bool graduation_due = graduationDue(state, new_round);
+        const uint64_t seal_reads_before = round_seal_reads_;
+        graduation_due = graduationDue(state, new_round);
         walk_plan.emplace(buildRefWalkPlan(listRefPrefix(state)));
         reportStuckRemovals(*walk_plan, state.round);
         const RefScanSummary & ref_scan = walk_plan->refScan();
@@ -945,10 +1012,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         /// The number of consecutive rounds already deferred BEFORE this one (this round's own verdict is
         /// `deferred` above), so the pair reads unambiguously against `gc_fold_max_defer_rounds`.
         t.metric("rounds_deferred_before", rounds_since_last_fold_);
-        /// `graduationDue` and `listRefPrefix` each GET the adopted fold seal at the SAME
-        /// (generation, attempt). Recorded, not fixed -- see the `fold_seal_read` phase, which records
-        /// the other duplicate pair; the round GETs that one key FIVE times on a folding round.
-        t.metric("fold_seal_reads", 2);
+        t.metric("fold_seal_reads", round_seal_reads_ - seal_reads_before);
 
         if (defer_round)
         {
@@ -988,9 +1052,35 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         /// DEFER has no `FoldResult`, hence no complete global destructive verdict. The janitor still
         /// takes its bounded page and catalog cut, but suppression keeps both deletes and valid-page
         /// cursor progress at the same position for the bounded forced fold to retry.
-        runNamespaceJanitor(state, /*suppress_destructive=*/true, /*cleanup_evidence_rows=*/0);
+        const bool janitor_pending = runNamespaceJanitor(state, /*suppress_destructive=*/true, /*cleanup_evidence_rows=*/0);
+        const CasRefCatalog::Snapshot & cat = walk_plan->catalogCut();
+        const bool has_non_live_catalog_entries = std::any_of(
+            cat.catalog.entries.begin(), cat.catalog.entries.end(),
+            [](const CatalogEntry & entry) { return entry.state != NsState::Live; });
+        if (!janitor_pending
+            && !graduation_due
+            && walk_plan->changedRows() == 0
+            && walk_plan->refScan().dead_life_debris == 0
+            && walk_plan->refScan().stream_etags_complete
+            && cat.etag.has_value()
+            && !has_non_live_catalog_entries
+            && state.manifest_sweep_cursor.empty()
+            && store->poolConfig().gc_fold_max_defer_rounds > 0)
+        {
+            idle_baseline_ = IdleBaseline{
+                state.snap_generation,
+                state.snap_attempt,
+                *cat.etag,
+                walk_plan->refScan().stream_fingerprint};
+        }
+        else
+        {
+            idle_baseline_.reset();
+        }
         return report;   /// no fold, no pre-CAS deletes, no gc/state CAS — sealed generation stays pinned
     }
+
+    idle_baseline_.reset();
 
     /// Emit that the round's single pass begins.
     EventEmitter{*store}.emit([&](CasEvent & e)
@@ -1509,7 +1599,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     uint64_t cleanup_evidence_rows = 0;
     for (const auto & [life_id, ref_life_state] : folded.fold_seal.ref_lives)
         cleanup_evidence_rows += ref_life_state.cleanup_evidence ? 1 : 0;
-    runNamespaceJanitor(state, suppress_destructive, cleanup_evidence_rows);
+    (void)runNamespaceJanitor(state, suppress_destructive, cleanup_evidence_rows);
     /// PHASE 17/18 `ref_object_cleanup`. Emitted even when the whole pass is skipped (`trim_enabled` is
     /// a test seam, `suppressed` gates the deletes), because "this phase did nothing and why" is exactly
     /// what a reader of a round that reclaimed nothing needs to see.
@@ -2129,6 +2219,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     /// metric is the evidence for deciding it.
     std::optional<GcPhaseTimer> seal_read_timer;
     seal_read_timer.emplace(phase_sink, "fold_seal_read");
+    const uint64_t seal_reads_before = round_seal_reads_;
     const std::optional<CasFoldSeal> adopted_seal = readFoldSeal(state.snap_generation, state.snap_attempt);
     if (!adopted_seal && state.snap_generation > 0)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
@@ -2328,8 +2419,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     CasFoldSeal discover_ref_seal;
     if (const auto fold_seal = readFoldSeal(state.snap_generation, state.snap_attempt))
         discover_ref_seal = *fold_seal;
-    seal_read_timer->metric("seal_reads", 2);
-    seal_read_timer->metric("redundant_reads", 1);
+    seal_read_timer->metric("seal_reads", round_seal_reads_ - seal_reads_before);
+    seal_read_timer->metric("redundant_reads", 0);
     seal_read_timer->metric("parent_ref_lives", parent_ref_lives.size());
     seal_read_timer->metric("dropped_parent_ref_lives", dropped_parent_ref_lives);
     seal_read_timer->metric("parent_runs", discover_ref_seal.blob_target_runs.size());
@@ -4316,11 +4407,21 @@ void Gc::pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attemp
 
 std::optional<CasFoldSeal> Gc::readFoldSeal(uint64_t generation, uint64_t attempt)
 {
+    if (generation == 0)
+        return std::nullopt;
+    if (round_seal_cache_active_ && round_seal_cache_ && round_seal_cache_->generation == generation
+        && round_seal_cache_->attempt == attempt)
+        return round_seal_cache_->seal;
+
+    ++round_seal_reads_;
     CasOperation op = store->openRequests().admit();
+    std::optional<CasFoldSeal> decoded;
     if (const auto got = op.read(store->layout().foldSealKey(generation, attempt), Retry::standard()))
-        return decodeFoldSeal(
+        decoded = decodeFoldSeal(
             got->bytes, store->layout(), store->poolConfig().gc_shards, generation);
-    return std::nullopt;
+    if (round_seal_cache_active_)
+        round_seal_cache_ = RoundFoldSealCache{generation, attempt, decoded};
+    return decoded;
 }
 
 namespace
@@ -4417,11 +4518,24 @@ RefScanSummary Gc::enumerateRefPrefix()
     CasOperation op = store->openRequests().admit();
 
     RefScanSummary scan;
+    SipHash fingerprint_hash;
     static constexpr size_t kListPageLimit = CasOperation::kCasListPageKeys;
     size_t count_in_page = 0;
     op.forEachListedKey(layout.casRefsPrefix(), [&](const ListedKey & lk)
     {
         scan.keys.push_back(lk.key);
+        fingerprint_hash.update(lk.key.size());
+        fingerprint_hash.update(lk.key);
+        if (lk.etag)
+        {
+            const String rendered = lk.etag->render();
+            fingerprint_hash.update(rendered.size());
+            fingerprint_hash.update(rendered);
+        }
+        else
+        {
+            scan.stream_etags_complete = false;
+        }
         const auto parsed = parseRefObjectKeyForEnumeration(layout, lk.key);
         if (parsed)
         {
@@ -4441,6 +4555,8 @@ RefScanSummary Gc::enumerateRefPrefix()
         }
         return true;
     }, Retry::standard(), kListPageLimit, onGcEnumerationPage);
+    fingerprint_hash.update(scan.keys.size());
+    scan.stream_fingerprint = fingerprint_hash.get64();
     /// The walk's list lands at least once even for an empty/undersized final page --
     /// count it (one increment per physical LIST call).
     if (count_in_page > 0 || scan.keys.empty())

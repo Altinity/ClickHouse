@@ -473,10 +473,23 @@ struct HeartbeatFloor
     std::vector<String> fenced_srids;
 };
 
+/// Cached terminal mount classification keyed by `server_root_id`. A `gc_fenced` or clean-release
+/// mount slot never mutates again unless a successor reclaims it, which changes the object's ETag.
+/// Passing this cache across GC rounds lets `computeHeartbeatFloor` skip GET/readModifyWrite on
+/// unchanged terminal slots when `LIST` returns the same ETag.
+struct CachedMountSlot
+{
+    Etag etag;
+    bool gc_fenced = false;
+    bool clean_release = false;
+};
+using MountTerminalCache = std::map<String, CachedMountSlot>;
+
 HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64_t now_ms,
                                      const std::function<uint64_t()> & mono_ms_fn,
                                      uint64_t observer_lease_ms, uint64_t cadence_ms, MountObservationMap & obs,
-                                     std::set<String> & lease_mismatch_warned);
+                                     std::set<String> & lease_mismatch_warned,
+                                     MountTerminalCache * terminal_cache = nullptr);
 
 /// One `gc/server-roots/<srid>/mount` slot whose holder is not provably finished with the prefix.
 struct NonTerminalMountSlot

@@ -63,9 +63,11 @@ follower or a deferred round execution returns before that commit.
 
 Phases 2 through 4 run on every leader round; a follower returns after phase 1. Phases 5–15 and
 17–18 run only when phase 4 decides to fold; phase 16 runs after phase 15 on a fold and right after
-phase 4 on a `DEFER`. A `DEFER` verdict is therefore not a bare no-op: it still runs one bounded
-namespace-janitor page with `suppress_destructive = true` — listing and classification only, no
-deletes and no cursor advance — and then returns, publishing no fold artifact and no commit `CAS`.
+phase 4 on a first `DEFER`. Once a `DEFER` round settles with zero changed shards, no non-`Live`
+catalog entries, and a clean janitor sweep, subsequent idle rounds short-circuit when `graduationDue`
+is false and the `cas/ref_catalog` ETag and `cas/ns/stream/` listing fingerprint match — running only
+`lease`, `heartbeat_floor` (which skips `GET`s for cached terminal mount slots), and a short-circuited
+`defer_decision` without forcing periodic empty folds or pulsing `gc/hb` between rounds.
 Its lease `CAS` may already have created or renewed the lease in phase 1:
 
 ```mermaid
