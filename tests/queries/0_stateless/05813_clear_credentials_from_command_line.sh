@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Tags: no-fasttest
-# no-fasttest: `--jwt` and `--oauth-client-secret` need a build with jwt-cpp and SSL.
+# no-fasttest: `--jwt` needs a build with jwt-cpp and SSL.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -56,7 +56,7 @@ function show_credential_options()
     CONNECTIONS=$((CONNECTIONS + 1))
     # A connected program has parsed its options.
     while [ "$(wc -l < "$ACCEPTED_FILE")" -lt "$CONNECTIONS" ] && kill -0 "$pid" 2>/dev/null; do sleep 0.1; done
-    tr '\0' '\n' < "/proc/$pid/cmdline" | grep -E '^--(password|jwt|ssh-key-passphrase|one-time-password|oauth-client-secret|identity)|SECRET'
+    tr '\0' '\n' < "/proc/$pid/cmdline" | grep -E '^--(password|jwt|ssh-key-passphrase|one-time-password|identity)|SECRET'
     kill "$pid" 2>/dev/null
     wait "$pid" 2>/dev/null || true
 }
@@ -65,15 +65,15 @@ JWT='eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.SECRET'
 
 echo "client, separate values"
 show_credential_options ${CLICKHOUSE_CLIENT_BINARY} --host 127.0.0.1 --port "$PORT" --query "SELECT 1" \
-    --jwt "$JWT" --password SECRET --ssh-key-passphrase SECRET --one-time-password SECRET --oauth-client-secret SECRET
+    --jwt "$JWT" --password SECRET --ssh-key-passphrase SECRET --one-time-password SECRET
 
 echo "client, values after ="
 show_credential_options ${CLICKHOUSE_CLIENT_BINARY} --host 127.0.0.1 --port "$PORT" --query "SELECT 1" \
-    --jwt="$JWT" --password=SECRET --ssh-key-passphrase=SECRET --one-time-password=SECRET --oauth-client-secret=SECRET
+    --jwt="$JWT" --password=SECRET --ssh-key-passphrase=SECRET --one-time-password=SECRET
 
 echo "client, values after spaced ="
 show_credential_options ${CLICKHOUSE_CLIENT_BINARY} --host 127.0.0.1 --port "$PORT" --query "SELECT 1" \
-    --jwt = "$JWT" --password = SECRET --ssh-key-passphrase = SECRET --one-time-password = SECRET --oauth-client-secret = SECRET
+    --jwt = "$JWT" --password = SECRET --ssh-key-passphrase = SECRET --one-time-password = SECRET
 
 echo "client, --password without a value"
 show_credential_options ${CLICKHOUSE_CLIENT_BINARY} --host 127.0.0.1 --port "$PORT" --query "SELECT 1" \
