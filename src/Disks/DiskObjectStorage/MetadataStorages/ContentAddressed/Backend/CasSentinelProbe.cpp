@@ -29,12 +29,13 @@ bool isProbeSubtreeDebris(const String & probe_root, const String & key)
 
 }
 
-BootstrapResidual probePoolBootstrapResidual(CasOperation & op, const Layout & layout)
+BootstrapResidual probePoolBootstrapResidual(CasOperation & op, const Layout & layout, std::optional<String> * pool_meta_bytes)
 {
     const String pool_meta_key = layout.poolMetaKey();
     const String catalog_key = layout.refCatalogKey();
     const String prefix = layout.poolPrefix() + "/";
     const String probe_root = layout.poolPrefix() + "/_probe/";
+    const String intent_probe_root = layout.blobIntentsProbePrefix();
 
     /// `_pool_meta` present is decisive on its own, and one exact read of that key answers it without
     /// enumerating anything: a LIST page over a large pool is the most expensive request a store
@@ -46,8 +47,12 @@ BootstrapResidual probePoolBootstrapResidual(CasOperation & op, const Layout & l
     /// key.
     try
     {
-        if (op.read(pool_meta_key, Retry::standard()))
+        if (auto got = op.read(pool_meta_key, Retry::standard()))
+        {
+            if (pool_meta_bytes)
+                *pool_meta_bytes = std::move(got->bytes);
             return BootstrapResidual::PoolMetaPresent;
+        }
     }
     catch (...)
     {
@@ -80,7 +85,7 @@ BootstrapResidual probePoolBootstrapResidual(CasOperation & op, const Layout & l
                 has_pool_meta = true;
                 return false;   /// decisive — the pool is authoritative; stop the walk
             }
-            if (isProbeSubtreeDebris(probe_root, listed.key))
+            if (isProbeSubtreeDebris(probe_root, listed.key) || isProbeSubtreeDebris(intent_probe_root, listed.key))
                 return true;   /// crash leftover / concurrent opener's battery — ignore ([D2])
             if (listed.key == catalog_key)
             {
