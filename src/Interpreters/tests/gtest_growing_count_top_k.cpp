@@ -6,11 +6,21 @@
 #include <vector>
 
 #include <Interpreters/AdaptiveAggregation/GrowingCountTopK.h>
+#include <base/StringViewHash.h>
 
 using namespace DB;
 
 namespace
 {
+
+/// The default string-view based hash function of `PackedStringRef` (this build has no named one).
+struct PackedStringRefHash
+{
+    uint32_t operator()(const char * data, size_t size) const
+    {
+        return static_cast<uint32_t>(StringViewHash()(std::string_view(data, size)));
+    }
+};
 
 /// The tops under test take limits up to 16; only the split of a word into count and index bits depends on it.
 template <typename Key>
