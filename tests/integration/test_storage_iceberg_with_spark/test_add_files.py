@@ -2,6 +2,8 @@ import io
 import os
 import tempfile
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from helpers.iceberg_utils import (
@@ -74,6 +76,25 @@ class AddFilesTestEnv:
                 data = f.read()
             os.remove(host_path)
             self.instance.exec_in_container(["rm", "-f", container_path])
+            self.put_file(subdir, filename, data)
+
+    def write_parquet_arrow(self, subdir, filename, table, **write_options):
+        """Write a parquet file with pyarrow, to get representations that ClickHouse itself
+        does not produce (other timestamp units, missing statistics, ...)."""
+        buffer = io.BytesIO()
+        pq.write_table(table, buffer, **write_options)
+        self.put_file(subdir, filename, buffer.getvalue())
+
+    def put_file(self, subdir, filename, data):
+        if self.storage_type == "local":
+            host_path = os.path.join(tempfile.gettempdir(), f"add_files_tmp_{get_uuid_str()}.parquet")
+            with open(host_path, "wb") as f:
+                f.write(data)
+            target_dir = f"{TABLE_PREFIX}/{self.table_name}/{subdir}"
+            self.instance.exec_in_container(["bash", "-c", f"mkdir -p {target_dir}"])
+            self.instance.copy_file_to_container(host_path, f"{target_dir}/{filename}")
+            os.remove(host_path)
+        else:
             key = f"{S3_KEY_PREFIX}/{self.table_name}/{subdir}/{filename}"
             self.cluster.minio_client.put_object(
                 self.cluster.minio_bucket, key, io.BytesIO(data), len(data),
@@ -308,3 +329,84 @@ def test_add_files_argument_errors(started_cluster_iceberg_with_spark, storage_t
     env_bucket.write_parquet("data/import", "f1.parquet", "SELECT 1 AS x")
     error = env_bucket.add_files_error(env_bucket.table_path("data/import", "f1.parquet"))
     assert "bucket" in error, f"got {error}"
+
+
+@pytest.mark.parametrize("storage_type", ["local", "s3"])
+def test_add_files_rejects_mismatched_types(started_cluster_iceberg_with_spark, storage_type):
+    """Footer statistics are used as Iceberg bounds as they are, so a file whose column is stored
+    differently from the Iceberg type must be rejected. A matching file registers, and filters
+    on its bounds return every matching row."""
+    env = AddFilesTestEnv(
+        started_cluster_iceberg_with_spark, storage_type, "test_add_types",
+        schema="(x Nullable(Int64), d Nullable(DateTime64(6)))",
+    )
+
+    timestamps = [1704103200000000 + i * 1000000 for i in range(10)]  # 2024-01-01 10:00:00 + i seconds
+
+    # INT32 data for an Iceberg `long` column: the bounds would be 4 bytes instead of 8.
+    env.write_parquet_arrow("data/import", "int32.parquet", pa.table({
+        "x": pa.array(range(1, 11), type=pa.int32()),
+        "d": pa.array(timestamps, type=pa.timestamp("us")),
+    }))
+    error = env.add_files_error(env.table_path("data/import", "int32.parquet"))
+    assert "does not match the Iceberg type 'long'" in error, f"got {error}"
+
+    # Nanosecond timestamps: the bounds would be read as microseconds.
+    env.write_parquet_arrow("data/import", "ns.parquet", pa.table({
+        "x": pa.array(range(1, 11), type=pa.int64()),
+        "d": pa.array([t * 1000 for t in timestamps], type=pa.timestamp("ns")),
+    }))
+    error = env.add_files_error(env.table_path("data/import", "ns.parquet"))
+    assert "does not match the Iceberg type" in error, f"got {error}"
+
+    # A string column for an integer field.
+    env.write_parquet_arrow("data/import", "string.parquet", pa.table({
+        "x": pa.array([str(i) for i in range(1, 11)], type=pa.string()),
+        "d": pa.array(timestamps, type=pa.timestamp("us")),
+    }))
+    error = env.add_files_error(env.table_path("data/import", "string.parquet"))
+    assert "does not match the Iceberg type 'long'" in error, f"got {error}"
+
+    assert env.count() == 0
+
+    env.write_parquet_arrow("data/import", "ok.parquet", pa.table({
+        "x": pa.array(range(1, 11), type=pa.int64()),
+        "d": pa.array(timestamps, type=pa.timestamp("us")),
+    }))
+    counts = env.add_files(env.table_path("data/import", "ok.parquet"))
+    assert counts["files_registered"] == 1, f"got {counts}"
+    assert env.query(f"SELECT count() FROM {env.table_name} WHERE x = 5") == "1\n"
+    assert env.query(f"SELECT count() FROM {env.table_name} WHERE x > 8") == "2\n"
+    assert env.query(
+        f"SELECT count() FROM {env.table_name} WHERE d >= toDateTime64('2024-01-01 10:00:08', 6, 'UTC')"
+    ) == "2\n"
+
+
+@pytest.mark.parametrize("storage_type", ["local", "s3"])
+def test_add_files_partition_value_needs_statistics(started_cluster_iceberg_with_spark, storage_type):
+    """The partition value is derived from footer statistics. A file without them must be rejected
+    instead of being registered in the null partition; a file whose values are all null does belong
+    to the null partition."""
+    env = AddFilesTestEnv(
+        started_cluster_iceberg_with_spark, storage_type, "test_add_no_stats",
+        schema="(s Nullable(String))",
+        partition_by="identity(s)",
+    )
+
+    values = pa.table({"s": pa.array(["abc"] * 3, type=pa.string())})
+    env.write_parquet_arrow("data/import", "no_stats.parquet", values, write_statistics=False)
+    error = env.add_files_error(env.table_path("data/import", "no_stats.parquet"))
+    assert "no complete min/max statistics" in error, f"got {error}"
+    assert env.count() == 0
+
+    env.write_parquet_arrow("data/import", "stats.parquet", values)
+    counts = env.add_files(env.table_path("data/import", "stats.parquet"))
+    assert counts["partitions_touched"] == 1, f"got {counts}"
+
+    env.write_parquet_arrow("data/import", "nulls.parquet", pa.table({"s": pa.array([None, None], type=pa.string())}))
+    counts = env.add_files(env.table_path("data/import", "nulls.parquet"))
+    assert counts["partitions_touched"] == 1, f"got {counts}"
+
+    assert env.query(f"SELECT count() FROM {env.table_name} WHERE s = 'abc'") == "3\n"
+    assert env.query(f"SELECT count() FROM {env.table_name} WHERE s IS NULL") == "2\n"
+    assert env.count() == 5

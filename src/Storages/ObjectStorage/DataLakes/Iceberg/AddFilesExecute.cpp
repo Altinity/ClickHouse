@@ -50,8 +50,10 @@
 #include <Processors/Formats/Impl/ArrowBufferedStreams.h>
 #include <Common/FieldVisitorToString.h>
 
+#include <charconv>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <map>
 #include <sstream>
 #include <unordered_set>
@@ -62,6 +64,7 @@ namespace DB
 namespace ErrorCodes
 {
 extern const int BAD_ARGUMENTS;
+extern const int DATALAKE_DATABASE_ERROR;
 extern const int ICEBERG_SPECIFICATION_VIOLATION;
 extern const int LOGICAL_ERROR;
 extern const int METADATA_MISMATCH;
@@ -198,6 +201,8 @@ enum class SourceValueKind
 struct ColumnBounds
 {
     bool has_bounds = false;
+    /// Some row group with non-null values has no min/max, so the bounds do not cover every row.
+    bool incomplete = false;
     /// For Integer bounds: whether the parquet physical type is INT32 (4-byte LE serialization)
     /// rather than INT64 (8-byte). Decided by the physical type, never by the value range.
     bool int_is_32bit = false;
@@ -222,18 +227,76 @@ struct AnalyzedFile
     String registration_path;   /// path form stored in the manifest
     String storage_path;        /// resolved path used for reads
     IcebergSerializedFileStats stats;
+    /// Has an entry for every table column present in the file, with or without statistics.
     std::unordered_map<Int32, ColumnBounds> bounds_by_field_id;
+    /// Field ids whose null count is known for every row group of the file.
+    std::unordered_map<Int32, Int64> complete_null_counts;
 };
+
+/// Check that the parquet column has exactly the representation that the Iceberg type requires,
+/// so that its statistics can be used as Iceberg bounds and partition values as they are.
+/// Other representations (e.g. decimals, millisecond or nanosecond timestamps, INT96, widening
+/// INT32 to long) are rejected rather than converted.
+void checkParquetColumnType(
+    const parquet::ColumnDescriptor & column, const String & iceberg_type, const String & registration_path)
+{
+    const auto physical_type = column.physical_type();
+    const auto & logical_type = column.logical_type();
+    const bool no_logical_type = !logical_type || logical_type->is_none();
+
+    auto is_int_of_width = [&](int bit_width)
+    {
+        if (no_logical_type)
+            return true;
+        if (!logical_type->is_int())
+            return false;
+        const auto & int_type = static_cast<const parquet::IntLogicalType &>(*logical_type);
+        return int_type.bit_width() == bit_width && int_type.is_signed();
+    };
+
+    bool matches = false;
+    if (iceberg_type == "int")
+        matches = physical_type == parquet::Type::INT32 && is_int_of_width(32);
+    else if (iceberg_type == "long")
+        matches = physical_type == parquet::Type::INT64 && is_int_of_width(64);
+    else if (iceberg_type == "string")
+        matches = physical_type == parquet::Type::BYTE_ARRAY && (no_logical_type || logical_type->is_string());
+    else if (iceberg_type == "date")
+        matches = physical_type == parquet::Type::INT32 && logical_type && logical_type->is_date();
+    else if (iceberg_type == "timestamp" || iceberg_type == "timestamptz")
+        matches = physical_type == parquet::Type::INT64 && logical_type && logical_type->is_timestamp()
+            && static_cast<const parquet::TimestampLogicalType &>(*logical_type).time_unit() == parquet::LogicalType::TimeUnit::MICROS;
+    else if (iceberg_type == "boolean")
+        matches = physical_type == parquet::Type::BOOLEAN;
+    else if (iceberg_type == "float")
+        matches = physical_type == parquet::Type::FLOAT;
+    else if (iceberg_type == "double")
+        matches = physical_type == parquet::Type::DOUBLE;
+    else
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+            "add_files: column '{}' of file {} has Iceberg type '{}', which add_files does not support yet",
+            column.path()->ToDotString(), registration_path, iceberg_type);
+
+    if (!matches)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "add_files: column '{}' of file {} is stored as parquet type {} ({}), which does not match the Iceberg type '{}' "
+            "of the table column",
+            column.path()->ToDotString(), registration_path, parquet::TypeToString(physical_type),
+            logical_type ? logical_type->ToString() : "no logical type", iceberg_type);
+}
 
 ColumnBounds aggregateColumnBounds(
     const parquet::ColumnChunkMetaData & column,
     ColumnBounds acc)
 {
-    if (!column.is_stats_set())
-        return acc;
-    auto stats = column.statistics();
+    std::shared_ptr<parquet::Statistics> stats = column.is_stats_set() ? column.statistics() : nullptr;
     if (!stats || !stats->HasMinMax())
+    {
+        /// Only a row group whose values are all null may lack min/max.
+        if (!stats || !stats->HasNullCount() || stats->null_count() != column.num_values())
+            acc.incomplete = true;
         return acc;
+    }
 
     String encoded_min = stats->EncodeMin();
     String encoded_max = stats->EncodeMax();
@@ -267,7 +330,7 @@ ColumnBounds aggregateColumnBounds(
     }
 
     if (kind != acc.kind)
-        return acc;
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "add_files: statistics of one column have different physical types");
 
     if (kind == SourceValueKind::Integer)
     {
@@ -290,6 +353,7 @@ AnalyzedFile analyzeFile(
     const IcebergPathResolver & resolver,
     const ObjectStoragePtr & object_storage,
     const std::unordered_map<String, Int64> & column_path_to_field_id,
+    const std::unordered_map<Int64, String> & iceberg_type_by_field_id,
     const ContextPtr & context,
     const FormatSettings & format_settings)
 {
@@ -323,8 +387,26 @@ AnalyzedFile analyzeFile(
 
     result.stats.record_count = parquet_metadata->num_rows();
 
+    /// Validate the type of every table column present in the file. Columns whose Iceberg type is not
+    /// known here (leaves of lists and maps) are registered without bounds.
+    std::unordered_set<Int32> columns_with_bounds;
+    const auto * parquet_schema = parquet_metadata->schema();
+    for (int col = 0; col < parquet_schema->num_columns(); ++col)
+    {
+        const auto * descriptor = parquet_schema->Column(col);
+        auto field_it = column_path_to_field_id.find(descriptor->path()->ToDotString());
+        if (field_it == column_path_to_field_id.end())
+            continue;
+        auto type_it = iceberg_type_by_field_id.find(field_it->second);
+        if (type_it == iceberg_type_by_field_id.end())
+            continue;
+        checkParquetColumnType(*descriptor, type_it->second, registration_path);
+        columns_with_bounds.insert(static_cast<Int32>(field_it->second));
+    }
+
     std::unordered_map<Int32, Int64> column_sizes;
     std::unordered_map<Int32, Int64> null_value_counts;
+    std::unordered_set<Int32> incomplete_null_counts;
     std::unordered_map<Int32, ColumnBounds> bounds;
 
     for (int rg = 0; rg < parquet_metadata->num_row_groups(); ++rg)
@@ -340,22 +422,32 @@ AnalyzedFile analyzeFile(
             Int32 field_id = static_cast<Int32>(field_it->second);
 
             column_sizes[field_id] += column->total_compressed_size();
-            if (column->is_stats_set())
-            {
-                auto stats = column->statistics();
-                if (stats && stats->HasNullCount())
-                    null_value_counts[field_id] += stats->null_count();
-            }
-            bounds[field_id] = aggregateColumnBounds(*column, std::move(bounds[field_id]));
+            std::shared_ptr<parquet::Statistics> stats = column->is_stats_set() ? column->statistics() : nullptr;
+            if (stats && stats->HasNullCount())
+                null_value_counts[field_id] += stats->null_count();
+            else
+                incomplete_null_counts.insert(field_id);
+
+            if (columns_with_bounds.contains(field_id))
+                bounds[field_id] = aggregateColumnBounds(*column, std::move(bounds[field_id]));
+            else
+                bounds.try_emplace(field_id);
         }
     }
 
     for (const auto & [field_id, size] : column_sizes)
         result.stats.column_sizes.emplace_back(field_id, size);
     for (const auto & [field_id, count] : null_value_counts)
-        result.stats.null_value_counts.emplace_back(field_id, count);
-    for (const auto & [field_id, bound] : bounds)
     {
+        if (incomplete_null_counts.contains(field_id))
+            continue;
+        result.stats.null_value_counts.emplace_back(field_id, count);
+        result.complete_null_counts.emplace(field_id, count);
+    }
+    for (auto & [field_id, bound] : bounds)
+    {
+        if (bound.incomplete)
+            bound.has_bounds = false;
         if (!bound.has_bounds)
             continue;
         if (bound.kind == SourceValueKind::Integer)
@@ -441,7 +533,14 @@ PartitionFieldValue derivePartitionField(
     String transform_name = bracket == String::npos ? transform : transform.substr(0, bracket);
     Int64 transform_argument = 0;
     if (bracket != String::npos)
-        transform_argument = std::stoll(transform.substr(bracket + 1, transform.size() - bracket - 2));
+    {
+        const char * begin = transform.data() + bracket + 1;
+        const char * end = transform.data() + transform.size() - 1;
+        auto [ptr, ec] = std::from_chars(begin, end, transform_argument);
+        if (ec != std::errc() || ptr != end || transform.back() != ']' || transform_argument <= 0)
+            throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                "add_files: partition field '{}' has malformed transform '{}'", field_name, transform);
+    }
 
     if (transform_name == "bucket")
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
@@ -452,9 +551,18 @@ PartitionFieldValue derivePartitionField(
     auto bounds_it = file.bounds_by_field_id.find(static_cast<Int32>(source_id));
     if (bounds_it == file.bounds_by_field_id.end() || !bounds_it->second.has_bounds)
     {
-        /// Column absent from the file's statistics (e.g. all values are null): the partition
-        /// value is null. Note this trusts the file's null-only stats; all-null columns carry
-        /// no min/max by definition.
+        /// The partition value is null only if every row has null in the source column: the column is
+        /// absent from the file (allowed by `allow_missing_columns`), or the footer proves that all of its
+        /// values are null. Missing statistics alone prove nothing (writers drop them, e.g. for long values).
+        if (bounds_it != file.bounds_by_field_id.end())
+        {
+            auto null_count_it = file.complete_null_counts.find(static_cast<Int32>(source_id));
+            if (null_count_it == file.complete_null_counts.end() || null_count_it->second != file.stats.record_count)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "add_files: cannot derive the partition value of file {}: the parquet footer has no complete "
+                    "min/max statistics for the partition source column '{}'",
+                    file.registration_path, source_column.name);
+        }
         result.value = Null();
         result.type = transform_name == "identity" || transform_name == "truncate" ? source_column.type : DataTypePtr(std::make_shared<DataTypeInt32>());
         return result;
@@ -477,9 +585,16 @@ PartitionFieldValue derivePartitionField(
         {
             if (is_date)
             {
-                /// Mirrors the native writer: identity Date partition values are the raw day
-                /// number promoted to UInt64 (ColumnVector<UInt16> -> Field).
-                result.value = Field(UInt64(bounds.min_int));
+                /// Mirrors the native writer: identity Date partition values are the raw day number,
+                /// promoted to UInt64 for `Date` (ColumnVector<UInt16>) and Int64 for `Date32`.
+                if (WhichDataType(removeNullable(source_column.type)).isDate32())
+                    result.value = Field(Int64(bounds.min_int));
+                else if (bounds.min_int >= 0 && bounds.min_int <= std::numeric_limits<UInt16>::max())
+                    result.value = Field(UInt64(bounds.min_int));
+                else
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                        "add_files: date {} of column '{}' in file {} is out of the range of the table column type {}",
+                        bounds.min_int, source_column.name, file.registration_path, source_column.type->getName());
             }
             else if (is_timestamp)
             {
@@ -626,6 +741,49 @@ std::unordered_set<String> listLiveDataFiles(
     return live_paths;
 }
 
+/// Whether the table metadata that `catalog` currently points to contains a snapshot with `snapshot_id`.
+/// Resolves the "commit state unknown" case. Throws if the catalog or the metadata file cannot be read,
+/// so that the caller never treats an unknown state as "not committed".
+bool isSnapshotInCatalogMetadata(
+    const std::shared_ptr<DataLake::ICatalog> & catalog,
+    const String & table_name,
+    Int64 snapshot_id,
+    const PersistentTableComponents & persistent_components,
+    const DataLakeStorageSettings & data_lake_settings,
+    const ObjectStoragePtr & object_storage,
+    const ContextPtr & context,
+    LoggerPtr log)
+{
+    const auto metadata_file_info = getLatestMetadataFileAndVersionWithCatalog(
+        object_storage,
+        catalog,
+        table_name,
+        persistent_components.table_path,
+        data_lake_settings,
+        persistent_components.metadata_cache,
+        context,
+        log.get(),
+        persistent_components.table_uuid,
+        persistent_components.metadata_compression_method);
+    auto metadata = getMetadataJSONObject(
+        metadata_file_info.path,
+        object_storage,
+        persistent_components.metadata_cache,
+        context,
+        log,
+        metadata_file_info.compression_method,
+        persistent_components.table_uuid);
+
+    if (!metadata->has(Iceberg::f_snapshots))
+        return false;
+    for (const auto & snapshot_var : *metadata->getArray(Iceberg::f_snapshots))
+    {
+        if (snapshot_var.extract<Poco::JSON::Object::Ptr>()->getValue<Int64>(Iceberg::f_metadata_snapshot_id) == snapshot_id)
+            return true;
+    }
+    return false;
+}
+
 Pipe resultToPipe(const AddFilesResult & result)
 {
     Block header{
@@ -680,16 +838,25 @@ AddFilesResult addFiles(
         persistent_components.metadata_compression_method,
         write_format);
 
-    auto [last_version, metadata_path, compression_method] = getLatestOrExplicitMetadataFileAndVersion(
-        object_storage,
-        persistent_components.table_path,
-        data_lake_settings,
-        persistent_components.metadata_cache,
-        context,
-        getLogger("IcebergAddFiles").get(),
-        persistent_components.table_uuid,
-        persistent_components.metadata_compression_method,
-        true);
+    /// With a catalog, the catalog names the current metadata file. Listing the storage instead may pick the
+    /// metadata of another table that shares the location, or miss a commit that is visible only in the catalog.
+    auto get_current_metadata_file = [&]()
+    {
+        return getLatestMetadataFileAndVersionWithCatalog(
+            object_storage,
+            catalog,
+            table_name,
+            persistent_components.table_path,
+            data_lake_settings,
+            persistent_components.metadata_cache,
+            context,
+            log.get(),
+            persistent_components.table_uuid,
+            persistent_components.metadata_compression_method,
+            /* ignore_explicit_metadata_file_path */ false);
+    };
+
+    auto [last_version, metadata_path, compression_method] = get_current_metadata_file();
     filename_generator.setVersion(last_version + 1);
 
     Poco::JSON::Object::Ptr metadata = getMetadataJSONObject(
@@ -762,7 +929,7 @@ AddFilesResult addFiles(
     std::vector<AnalyzedFile> analyzed_files;
     analyzed_files.reserve(paths.size());
     for (const auto & path : paths)
-        analyzed_files.push_back(analyzeFile(path, resolver, object_storage, column_path_to_field_id, context, format_settings));
+        analyzed_files.push_back(analyzeFile(path, resolver, object_storage, column_path_to_field_id, iceberg_type_by_field_id, context, format_settings));
 
     /// Validate the file's columns against the table schema.
     if (!allow_missing_columns)
@@ -826,6 +993,13 @@ AddFilesResult addFiles(
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
                     "add_files: file '{}' is listed twice in the input", file.registration_path);
         }
+    }
+
+    /// Repeated on every retry: a concurrent commit may have registered the same files.
+    auto check_files_not_registered = [&]()
+    {
+        if (!check_duplicate_files)
+            return;
         auto live_files = listLiveDataFiles(metadata, resolver, object_storage, format_settings);
         for (const auto & file : analyzed_files)
         {
@@ -833,7 +1007,10 @@ AddFilesResult addFiles(
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
                     "add_files: file '{}' is already registered in the current snapshot", file.registration_path);
         }
-    }
+    };
+    check_files_not_registered();
+
+    const bool catalog_is_transactional = catalog && catalog->isTransactional();
 
     /// Commit: one manifest per partition tuple, one manifest list, one append snapshot.
     AddFilesResult result;
@@ -874,22 +1051,19 @@ AddFilesResult addFiles(
 
         auto cleanup = [&](bool retry_because_of_metadata_conflict)
         {
+            /// The new snapshot may be visible: its files must stay, even if that leaves orphans.
+            if (published)
+            {
+                LOG_INFO(log, "Not removing the new manifest files: the new snapshot may already be visible");
+                return;
+            }
             for (size_t i = 0; i < manifest_paths.size(); ++i)
                 object_storage->removeObjectIfExists(StoredObject(resolver.resolve(manifest_paths[i])));
             object_storage->removeObjectIfExists(StoredObject(storage_manifest_list_name));
 
             if (retry_because_of_metadata_conflict)
             {
-                auto [new_version, new_metadata_path, new_compression] = getLatestOrExplicitMetadataFileAndVersion(
-                    object_storage,
-                    persistent_components.table_path,
-                    data_lake_settings,
-                    persistent_components.metadata_cache,
-                    context,
-                    getLogger("IcebergAddFiles").get(),
-                    persistent_components.table_uuid,
-                    persistent_components.metadata_compression_method,
-                    true);
+                auto [new_version, new_metadata_path, new_compression] = get_current_metadata_file();
                 filename_generator.setVersion(new_version + 1);
                 metadata = getMetadataJSONObject(
                     new_metadata_path, object_storage, persistent_components.metadata_cache,
@@ -901,6 +1075,7 @@ AddFilesResult addFiles(
                 if (metadata->getValue<Int64>(Iceberg::f_default_spec_id) != partition_spec_id)
                     throw Exception(ErrorCodes::METADATA_MISMATCH,
                         "Table partition spec changed during add_files; restart the command");
+                check_files_not_registered();
             }
         };
 
@@ -988,27 +1163,78 @@ AddFilesResult addFiles(
             {
                 std::string json_representation = stringifyJSON(metadata, 4);
 
-                auto hint_path = filename_generator.generateVersionHint();
-                if (!writeMetadataFileAndVersionHint(
-                        resolver, metadata_info, json_representation, hint_path, object_storage, context,
-                        data_lake_settings[DataLakeStorageSetting::iceberg_use_version_hint]))
+                /// A transactional catalog writes the metadata file itself, as for native inserts.
+                if (!catalog_is_transactional)
                 {
-                    cleanup(true);
-                    if (++retry >= max_retries)
-                        throw Exception(ErrorCodes::BAD_ARGUMENTS, "add_files: too many metadata conflicts, giving up");
-                    continue;
+                    auto hint_path = filename_generator.generateVersionHint();
+                    if (!writeMetadataFileAndVersionHint(
+                            resolver, metadata_info, json_representation, hint_path, object_storage, context,
+                            data_lake_settings[DataLakeStorageSetting::iceberg_use_version_hint]))
+                    {
+                        cleanup(true);
+                        if (++retry >= max_retries)
+                            throw Exception(ErrorCodes::BAD_ARGUMENTS, "add_files: too many metadata conflicts, giving up");
+                        continue;
+                    }
+                    /// The metadata file and version hint in storage now name the new snapshot.
+                    published = true;
                 }
 
                 if (catalog)
                 {
                     auto catalog_filename = resolver.resolveForCatalog(metadata_info.path);
                     const auto & [namespace_name, table] = DataLake::parseTableName(table_name);
-                    if (!catalog->updateMetadata(namespace_name, table, catalog_filename, new_snapshot, context->getForwardedAuthToken()))
+
+                    if (!catalog_is_transactional)
                     {
-                        cleanup(true);
-                        if (++retry >= max_retries)
-                            throw Exception(ErrorCodes::BAD_ARGUMENTS, "add_files: too many catalog conflicts, giving up");
-                        continue;
+                        /// The snapshot is already visible through storage: deleting its files would break it, and a
+                        /// retry would build on it. Keep the files and report the error.
+                        if (!catalog->updateMetadata(namespace_name, table, catalog_filename, new_snapshot, context->getForwardedAuthToken()))
+                            throw Exception(
+                                ErrorCodes::DATALAKE_DATABASE_ERROR,
+                                "add_files: Iceberg metadata {} of table {}.{} was committed to storage, but the catalog rejected "
+                                "the update of the table pointer. The table in storage is consistent; the catalog still names "
+                                "the previous metadata",
+                                catalog_filename, namespace_name, table);
+                    }
+                    else
+                    {
+                        bool updated = false;
+                        std::exception_ptr update_exception;
+                        try
+                        {
+                            updated = catalog->updateMetadata(namespace_name, table, catalog_filename, new_snapshot, context->getForwardedAuthToken());
+                        }
+                        catch (...)
+                        {
+                            update_exception = std::current_exception();
+                        }
+
+                        if (!updated)
+                        {
+                            /// Commit state unknown: the catalog may have applied the update although the client saw
+                            /// a failure. Until the catalog proves otherwise, keep the files, even if the check throws.
+                            published = true;
+                            const Int64 new_snapshot_id = new_snapshot->getValue<Int64>(Iceberg::f_metadata_snapshot_id);
+                            if (isSnapshotInCatalogMetadata(
+                                    catalog, table_name, new_snapshot_id, persistent_components, data_lake_settings,
+                                    object_storage, context, log))
+                            {
+                                LOG_INFO(log, "Catalog update for snapshot {} was reported as failed, but the catalog has applied it",
+                                    new_snapshot_id);
+                            }
+                            else
+                            {
+                                /// The update did not land: no snapshot references the new files.
+                                published = false;
+                                if (update_exception)
+                                    std::rethrow_exception(update_exception);
+                                cleanup(true);
+                                if (++retry >= max_retries)
+                                    throw Exception(ErrorCodes::BAD_ARGUMENTS, "add_files: too many catalog conflicts, giving up");
+                                continue;
+                            }
+                        }
                     }
                 }
                 published = true;
