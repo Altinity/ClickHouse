@@ -14,11 +14,7 @@
 #if USE_AZURE_BLOB_STORAGE
 #include <Disks/DiskObjectStorage/ObjectStorages/AzureBlobStorage/AzureObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/AzureBlobStorage/AzureBlobStorageCommon.h>
-<<<<<<< HEAD
-=======
 #include <Disks/IO/WriteBufferFromAzureDataLakeStorage.h>
-#include <Disks/getDiskConfigurationFromAST.h>
->>>>>>> fee38d30170 (Merge pull request #124721 from groeneai/azure-disk-remote-url-allow-hosts)
 #endif
 
 #include <Disks/DiskObjectStorage/ObjectStorages/Web/WebObjectStorage.h>
@@ -249,7 +245,7 @@ static void registerAzureObjectStorage(ObjectStorageFactory & factory)
         const std::string & config_prefix,
         const ContextPtr & context,
         bool /* skip_access_check */,
-        RemoteHostFilterCheck /* remote_host_filter_check */) -> ObjectStoragePtr
+        RemoteHostFilterCheck remote_host_filter_check) -> ObjectStoragePtr
     {
         auto azure_settings = AzureBlobStorage::getRequestSettings(config, config_prefix, context->getSettingsRef());
 
@@ -266,8 +262,6 @@ static void registerAzureObjectStorage(ObjectStorageFactory & factory)
             .client_options = AzureBlobStorage::getClientOptions(context, context->getSettingsRef(), *azure_settings, /*for_disk=*/ true)
         };
 
-<<<<<<< HEAD
-=======
         /// As for S3: a disk loaded from existing metadata is only reported, so that it fails neither
         /// the table load nor the server start.
         if (remote_host_filter_check != RemoteHostFilterCheck::None)
@@ -288,17 +282,6 @@ static void registerAzureObjectStorage(ObjectStorageFactory & factory)
                 check_host(getAdlsGen2Url(params.endpoint, params.auth_method));
         }
 
-        const bool drop_credentials = params.checkOrDropServerManagedCredentials();
-        if (drop_credentials)
-            LOG_WARNING(
-                getLogger("ObjectStorageFactory"),
-                "Loading the dynamic Azure disk {} with a client that has no credentials: it uses the server's own "
-                "identity, which is restricted for user queries (s3_allow_server_credentials_in_user_queries = 0). "
-                "The disk stays inaccessible; set s3_load_table_anonymously_if_credentials_restricted = 0 to fail "
-                "loading instead.",
-                name);
-
->>>>>>> fee38d30170 (Merge pull request #124721 from groeneai/azure-disk-remote-url-allow-hosts)
         return std::make_shared<AzureObjectStorage>(
             name,
             params.auth_method, AzureBlobStorage::getContainerClient(params, /*readonly=*/ false), std::move(azure_settings),
