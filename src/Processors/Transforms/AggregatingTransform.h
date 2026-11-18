@@ -16,6 +16,8 @@
 namespace DB
 {
 
+class AdaptiveSessionSpillable;
+
 class AggregatedChunkInfo final : public ChunkInfoCloneable<AggregatedChunkInfo>
 {
 public:
@@ -76,9 +78,6 @@ struct ManyAggregatedData
 
     /// The number of producers that have to reach the finish barrier in
     /// `AggregatingTransform::initGenerate`, fixed at construction time.
-    /// `variants.size()` cannot be used instead: the last finisher appends the adaptive
-    /// aggregation's early-drain routing table to `variants`, and reading the size of a vector
-    /// that is concurrently grown is a data race.
     const size_t num_producers;
 
     /// Set when the adaptive aggregation is enabled for this aggregation (see
@@ -137,7 +136,6 @@ public:
     void work() override;
     PipelineUpdate updatePipeline() override;
     void setRowsBeforeAggregationCounter(RowsBeforeStepCounterPtr counter) override { rows_before_aggregation.swap(counter); }
-    void onCancel() noexcept override;
 
 protected:
     void consume(Chunk chunk);
@@ -164,7 +162,7 @@ private:
     ManyAggregatedDataPtr many_data;
     AggregatedDataVariants & variants;
 
-    /// Per-transform context of the adaptive aggregation; engaged when the shared state exists
+    /// Per-transform context of the adaptive aggregation, created when the shared state exists
     /// on `many_data`. Held by pointer: the producer's definition stays out of this widely
     /// included header (see `AdaptiveAggregationImpl.h`).
     std::unique_ptr<AdaptiveAggregationProducer> adaptive_context;

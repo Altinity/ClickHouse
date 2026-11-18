@@ -1,3 +1,4 @@
+#include <DataTypes/IDataType.h>
 #include <AggregateFunctions/IAggregateFunction.h>
 #include <Processors/QueryPlan/AggregatingStep.h>
 #include <Processors/QueryPlan/ExpressionStep.h>
@@ -107,7 +108,18 @@ size_t tryPushBucketTopKIntoAggregation(QueryPlan::Node * parent_node, QueryPlan
         const auto & aggregate = params.aggregates[i];
         if (aggregate.column_name != column)
             continue;
-        if (aggregate.function->getName() != "count" || !aggregate.argument_names.empty() || !aggregate.parameters.empty())
+        /// The conversion-stage selection ranks by a count it reads without converting the group: any lone `count`, or
+        /// the exact distinct count `uniqExact` finalizes from its set, also as `uniqExactIf` over the rows its
+        /// condition admits. No parameters: a parametric `count` is another function. The adaptive aggregation also
+        /// bounds these counts by the rows of a group to skip groups (see `AdaptiveTopKPruning`), which an
+        /// approximate `uniq` estimate could exceed, and so could a combinator that takes several values from a row,
+        /// like `-Array`.
+        const auto & function = *aggregate.function;
+        const String name = function.getName();
+        const bool lone_count = name == "count" && aggregate.parameters.empty();
+        const bool distinct_count = (name == "uniqExact" || name == "uniqExactIf") && aggregate.parameters.empty()
+            && WhichDataType(function.getResultType()).isUInt64();
+        if (!lone_count && !distinct_count)
             return 0;
 
         aggregating->enableBucketTopK(n, ascending, i);
