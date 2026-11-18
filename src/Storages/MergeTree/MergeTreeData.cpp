@@ -8651,7 +8651,7 @@ void MergeTreeData::exportPartToTable(
     /// from the Iceberg schema. The metadata is the one stored in the export manifest when the export was scheduled by
     /// `EXPORT PARTITION`, so every replica uses the types the scheduling node validated. Otherwise it is read now.
     std::string iceberg_metadata_json;
-    bool verify_iceberg_partition_compatibility = false;
+    [[maybe_unused]] bool verify_iceberg_partition_compatibility = false;
 
     if (dest_storage->isDataLake())
     {
