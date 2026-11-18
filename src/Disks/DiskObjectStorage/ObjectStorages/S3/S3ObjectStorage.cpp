@@ -718,7 +718,7 @@ std::vector<ConditionalRemoveResult> S3ObjectStorage::removeObjectsIfTokensMatch
     response_keys.reserve(objects.size());
     for (const auto & deleted : outcome.GetResult().GetDeleted())
     {
-        const String key = deleted.GetKey();
+        const auto & key = deleted.GetKey();
         if (!expected_keys.contains(key) || !response_keys.insert(key).second)
         {
             log_all(static_cast<Int32>(Aws::S3::S3Errors::UNKNOWN), "DeleteObjects response has unexpected or duplicate keys");
@@ -727,7 +727,7 @@ std::vector<ConditionalRemoveResult> S3ObjectStorage::removeObjectsIfTokensMatch
     }
     for (const auto & error : outcome.GetResult().GetErrors())
     {
-        const String key = error.GetKey();
+        const auto & key = error.GetKey();
         if (!expected_keys.contains(key) || !response_keys.insert(key).second)
         {
             log_all(static_cast<Int32>(Aws::S3::S3Errors::UNKNOWN), "DeleteObjects response has unexpected or duplicate keys");

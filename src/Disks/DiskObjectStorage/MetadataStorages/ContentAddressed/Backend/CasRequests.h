@@ -376,10 +376,8 @@ public:
 private:
     friend CapabilityProbeResult runCapabilityProbe(CasOperation & op, const String & probe_prefix);
 
-    std::vector<Removal> removeManyByConditionalForProbe(
-        const std::vector<ConditionalRemove> & removals, const Retry & policy);
-    std::vector<Removal> removeManyByConditionalImpl(
-        const std::vector<ConditionalRemove> & removals, const Retry & policy, size_t limit);
+    std::vector<Removal> removeManyByConditional(
+        const std::vector<ConditionalRemove> & removals, const Retry & policy, const size_t limit);
 
     friend class CasRequests;
     /// The lane waits on this operation's own admission and reads and writes through its verbs; it

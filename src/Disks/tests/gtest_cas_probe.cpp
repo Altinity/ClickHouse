@@ -53,6 +53,43 @@ public:
     }
 };
 
+class NoOpConditionalBatchDeleteBackend : public InMemoryBackend
+{
+public:
+    std::vector<RawRemoval> removeManyByConditional(
+        const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
+    {
+        std::vector<RawRemoval> results;
+        results.reserve(removals.size());
+        for (const RawConditionalRemove & removal : removals)
+        {
+            const auto current = InMemoryBackend::head(removal.key, access);
+            if (!current)
+                results.push_back(RawRemoval::Gone);
+            else if (current->value != removal.expected_token)
+                results.push_back(RawRemoval::Mismatch);
+            else
+                results.push_back(RawRemoval::Removed);
+        }
+        return results;
+    }
+};
+
+class ReportsAbsentKeyAsRemovedBackend : public InMemoryBackend
+{
+public:
+    std::vector<RawRemoval> removeManyByConditional(
+        const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
+    {
+        auto results = InMemoryBackend::removeManyByConditional(removals, access);
+        EXPECT_EQ(results, (std::vector{RawRemoval::Removed, RawRemoval::Mismatch, RawRemoval::Removed, RawRemoval::Gone}));
+        for (auto & result : results)
+            if (result == RawRemoval::Gone)
+                result = RawRemoval::Removed;
+        return results;
+    }
+};
+
 }
 
 TEST(CASProbe, ReportsConditionalBatchCapability)
@@ -66,6 +103,25 @@ TEST(CASProbe, ReportsConditionalBatchCapability)
     auto ignores_requests = makeRequests(ignores);
     auto ignores_op = ignores_requests.admit();
     EXPECT_FALSE(runCapabilityProbe(ignores_op, "p/.cas_probe").conditional_batch_delete_supported);
+}
+
+TEST(CASProbe, RejectsConditionalBatchSuccessWithoutDeletion)
+{
+    NoOpConditionalBatchDeleteBackend backend;
+    auto requests = makeRequests(backend);
+    auto op = requests.admit();
+
+    EXPECT_FALSE(runCapabilityProbe(op, "p/.cas_probe").conditional_batch_delete_supported);
+    EXPECT_TRUE(op.list("p/.cas_probe", "", 10, Retry::once()).keys.empty());
+}
+
+TEST(CASProbe, RequiresGoneForAnAlreadyDeletedKeyInTheBatch)
+{
+    ReportsAbsentKeyAsRemovedBackend backend;
+    auto requests = makeRequests(backend);
+    auto op = requests.admit();
+
+    EXPECT_FALSE(runCapabilityProbe(op, "p/.cas_probe").conditional_batch_delete_supported);
 }
 
 TEST(CASProbe, FailsClosedOnNonEnforcingDelete)
@@ -284,7 +340,7 @@ TEST(CASProbe, ReorderedProbePassesOnAllThreeDialects)
         auto op = requests.admit();
         EXPECT_NO_THROW(runCapabilityProbe(op, "p/.cas_probe")) << "dialect " << static_cast<int>(dialect);
         EXPECT_TRUE(op.list("p/.cas_probe", "", 10, Retry::once()).keys.empty()) << "dialect " << static_cast<int>(dialect);
-        EXPECT_EQ(b.write_reached, 7) << "dialect " << static_cast<int>(dialect);
+        EXPECT_EQ(b.write_reached, 8) << "dialect " << static_cast<int>(dialect);
         EXPECT_EQ(b.remove_reached, 3) << "dialect " << static_cast<int>(dialect);
     }
 }

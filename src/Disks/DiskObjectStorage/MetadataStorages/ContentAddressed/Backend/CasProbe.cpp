@@ -51,6 +51,7 @@ CapabilityProbeResult runCapabilityProbe(CasOperation & op, const String & probe
     const String key = probe_prefix + "/token";
     const String first_key = probe_prefix + "/batch-first";
     const String second_key = probe_prefix + "/batch-second";
+    const String third_key = probe_prefix + "/batch-third";
 
     // Best-effort cleanup — runs at function exit regardless of outcome.
     auto cleanup = [&]() noexcept
@@ -61,7 +62,7 @@ CapabilityProbeResult runCapabilityProbe(CasOperation & op, const String & probe
         // constructible here — the gate below is the only way to reach `remove` at all.
         try
         {
-            for (const String * cleanup_key : {&key, &first_key, &second_key})
+            for (const String * cleanup_key : {&key, &first_key, &second_key, &third_key})
             {
                 const auto h = op.head(*cleanup_key, Retry::standard());
                 if (h)
@@ -205,14 +206,21 @@ CapabilityProbeResult runCapabilityProbe(CasOperation & op, const String & probe
         const Etag first_token = std::get<Committed>(op.create(first_key, "probe-batch-first", Retry::standard())).etag;
         const Etag second_token = std::get<Committed>(op.create(second_key, "probe-batch-second-v1", Retry::standard())).etag;
         const Etag second_replacement = std::get<Committed>(op.replace(second_key, "probe-batch-second-v2", second_token, Retry::standard())).etag;
+        const Etag third_token = std::get<Committed>(op.create(third_key, "probe-batch-third", Retry::standard())).etag;
         try
         {
-            const std::vector<Removal> removals = op.removeManyByConditionalForProbe(
-                {{first_key, first_token}, {second_key, second_token}}, Retry::standard());
-            if (removals.size() == 2 && removals[0] == Removal::Removed && removals[1] == Removal::Mismatch)
+            /// Step 7 already deleted `key` using `t2` and verified that it was gone.
+            const std::vector<Removal> removals = op.removeManyByConditional(
+                {{first_key, first_token}, {second_key, second_token}, {third_key, third_token}, {key, t2}},
+                Retry::standard(), kBulkDeleteMaxKeys);
+            if (removals.size() == 4 && removals[0] == Removal::Removed && removals[1] == Removal::Mismatch
+                && removals[2] == Removal::Removed && removals[3] == Removal::Gone)
             {
+                /// Check before cleanup, which would otherwise hide a successful response without deletion.
+                const auto first = op.head(first_key, Retry::standard());
                 const auto second = op.read(second_key, Retry::standard());
-                result.conditional_batch_delete_supported = second && second->bytes == "probe-batch-second-v2";
+                const auto third = op.head(third_key, Retry::standard());
+                result.conditional_batch_delete_supported = !first && !third && second && second->bytes == "probe-batch-second-v2";
             }
         }
         catch (const DB::Exception & e)

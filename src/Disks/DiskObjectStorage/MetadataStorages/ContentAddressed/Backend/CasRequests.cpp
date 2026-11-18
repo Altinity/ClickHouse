@@ -650,20 +650,32 @@ void CasOperation::removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, c
     });
 }
 
+namespace
+{
+Removal toConditionalRemoval(const Backend::RawRemoval raw)
+{
+    switch (raw)
+    {
+        case Backend::RawRemoval::Removed: return Removal::Removed;
+        case Backend::RawRemoval::Gone: return Removal::Gone;
+        case Backend::RawRemoval::Mismatch: return Removal::Mismatch;
+        case Backend::RawRemoval::DeleteMarker:
+            throw Exception(ErrorCodes::CAS_DELETE_MARKER,
+                "CAS conditional batch removal archived a noncurrent version instead of reclaiming an object: "
+                "the bucket has object versioning enabled");
+    }
+    UNREACHABLE();
+}
+}
+
 std::vector<Removal> CasOperation::removeManyByConditional(
     const std::vector<ConditionalRemove> & removals, const Retry & policy)
 {
     const size_t limit = std::min(kBulkDeleteMaxKeys, owner.backend->conditionalBatchDeleteKeyLimit());
-    return removeManyByConditionalImpl(removals, policy, limit);
+    return removeManyByConditional(removals, policy, limit);
 }
 
-std::vector<Removal> CasOperation::removeManyByConditionalForProbe(
-    const std::vector<ConditionalRemove> & removals, const Retry & policy)
-{
-    return removeManyByConditionalImpl(removals, policy, kBulkDeleteMaxKeys);
-}
-
-std::vector<Removal> CasOperation::removeManyByConditionalImpl(
+std::vector<Removal> CasOperation::removeManyByConditional(
     const std::vector<ConditionalRemove> & removals, const Retry & policy, const size_t limit)
 {
     if (removals.size() > limit)
@@ -698,18 +710,7 @@ std::vector<Removal> CasOperation::removeManyByConditionalImpl(
     std::vector<Removal> results;
     results.reserve(raw_results.size());
     for (const Backend::RawRemoval raw : raw_results)
-    {
-        switch (raw)
-        {
-            case Backend::RawRemoval::Removed: results.push_back(Removal::Removed); break;
-            case Backend::RawRemoval::Gone: results.push_back(Removal::Gone); break;
-            case Backend::RawRemoval::Mismatch: results.push_back(Removal::Mismatch); break;
-            case Backend::RawRemoval::DeleteMarker:
-                throw Exception(ErrorCodes::CAS_DELETE_MARKER,
-                    "CAS conditional batch removal archived a noncurrent version instead of reclaiming an object: "
-                    "the bucket has object versioning enabled");
-        }
-    }
+        results.push_back(toConditionalRemoval(raw));
     return results;
 }
 
