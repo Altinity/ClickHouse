@@ -84,6 +84,7 @@ namespace FailPoints
 {
     extern const char receive_timeout_on_table_status_response[];
     extern const char unexpected_packet_in_table_status_response[];
+    extern const char unresponsive_pooled_connection[];
 }
 
 namespace ErrorCodes
@@ -915,6 +916,13 @@ void Connection::sendClusterNameAndSalt()
 
 bool Connection::ping(const ConnectionTimeouts & timeouts)
 {
+    /// For tests: a pooled peer that does not answer. `disconnect` matches the failure path below,
+    /// so the caller reconnects instead of reusing this socket.
+    fiu_do_on(FailPoints::unresponsive_pooled_connection, {
+        disconnect();
+        return false;
+    });
+
     try
     {
         TimeoutSetter timeout_setter(*socket, timeouts.sync_request_timeout, true);
