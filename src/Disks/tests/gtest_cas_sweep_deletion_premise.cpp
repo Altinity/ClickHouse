@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include "cas_sweep_test_support.h"
@@ -59,9 +60,9 @@ struct OrphanFixture
     RootNamespace ns{"00/aa@cas@"};
     ManifestRef orphan = ref(5, 0xAB);
 
-    OrphanFixture()
+    explicit OrphanFixture(uint64_t gc_fold_max_defer_rounds = 8)
     {
-        store = openPoolForTest(backend);
+        store = openPoolForTest(backend, gc_fold_max_defer_rounds);
         /// This fixture has no ref transaction, but it is a normal empty catalog life rather than the
         /// deliberate missing-checkpoint corruption shape. State that empty recovery frontier before
         /// exercising the independent sweep-deletion premise.
@@ -210,6 +211,61 @@ TEST(CASSweepDeletionPremise, AnUnconsumedTailRemovalRetainsItsTarget)
     reason.clear();
     EXPECT_TRUE(manifestDeletionPremise(view, ManifestKey{key, buildPrefix(5)}, &reason));
     EXPECT_TRUE(reason.empty());
+}
+
+/// `{0, 0}` is a legal sealed cursor: the namespace is live and its ref log is still empty. The premise
+/// retains, and its message must say there is no position instead of rendering one.
+TEST(CASSweepDeletionPremise, AnEmptyRefStreamCursorRetainsWithoutAPosition)
+{
+    OrphanFixture f;
+    NamespaceFoldView view;
+    RefCoverage cov;
+    cov.classification = CoverageClass::Unchanged;
+    cov.last_folded_ref_id = RefTxnId{};
+    view.coverage = cov;
+
+    String reason;
+    SweepRetainClass retain_class = SweepRetainClass::None;
+    EXPECT_FALSE(manifestDeletionPremise(view, ManifestKey{f.orphanKey(), buildPrefix(5)}, &reason, &retain_class));
+    EXPECT_EQ(retain_class, SweepRetainClass::UnconsumedSeal);
+    EXPECT_NE(reason.find("sealed cursor is at none"), String::npos) << reason;
+}
+
+TEST(CASSweepDeletionPremise, TheCursorPageRetainsDebrisOfANamespaceThatFoldedNothing)
+{
+    OrphanFixture f;
+    seedFoldCursorForTest(*f.backend, f.store->layout(), f.ns, RefTxnId{});
+
+    const ManifestSweepResult page = sweepManifestCursorPageForTest(*f.store, "", /*list_budget*/100, /*delete_budget*/10);
+    EXPECT_EQ(page.deleted, 0u);
+    EXPECT_EQ(page.retained_unconsumed_seal, 1u);
+    EXPECT_TRUE(f.orphanExists());
+
+    std::vector<String> warnings;
+    EXPECT_EQ(sweepNamespace(*f.store, f.ns, buildPrefix(5), &warnings), 0u);
+    ASSERT_EQ(warnings.size(), 1u);
+    EXPECT_NE(warnings[0].find("not consumed"), String::npos) << warnings[0];
+    EXPECT_TRUE(f.orphanExists());
+}
+
+/// The shape a crash between staging a manifest and the table's first precommit leaves: debris under a
+/// live namespace whose ref log is empty. Every round must complete, not only the first.
+TEST(CASSweepDeletionPremise, ConsecutiveRoundsSurviveAnOrphanOfAnEmptyRefStream)
+{
+    OrphanFixture f(/*gc_fold_max_defer_rounds*/0);
+    Gc gc(f.store, hexToU128("00000000000000000000000000000001"));
+
+    const RoundReport first = runRegularRoundReclaiming(gc);
+    ASSERT_TRUE(first.acquired_lease);
+    ASSERT_FALSE(first.deferred);
+    for (int i = 0; i < 2; ++i)
+        EXPECT_NO_THROW(runRegularRoundReclaiming(gc)) << "round " << i + 2;
+    EXPECT_TRUE(f.orphanExists());
+
+    /// Positive control: the adopted seal carries a zero cursor and the manifest is eligible, so the
+    /// rounds above reached the premise rather than skipping the sweep.
+    const ManifestSweepResult page = sweepManifestCursorPageForTest(*f.store, "", /*list_budget*/100, /*delete_budget*/10);
+    EXPECT_EQ(page.retained_unconsumed_seal, 1u);
 }
 
 /// Both sweep paths call the ONE predicate: the cursor-paced page must refuse the same body the
