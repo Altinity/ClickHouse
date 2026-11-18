@@ -95,15 +95,9 @@ struct WildcardPartitionStrategy : IPartitionStrategy
 {
     WildcardPartitionStrategy(KeyDescription partition_key_description_, const Block & sample_block_, ContextPtr context_);
 
-<<<<<<< HEAD
-    ColumnPtr computePartitionKey(const Chunk & chunk) const override;
+    PartitionExpressionActionsAndColumnName getPartitionKeyActions() const override;
 
     ColumnPtr computePartitionKey(Block & block) const override;
-=======
-    PartitionExpressionActionsAndColumnName getPartitionKeyActions() const override;
-    std::string getPathForRead(const std::string & prefix) override;
-    std::string getPathForWrite(const std::string & prefix, const std::string & partition_key) override;
->>>>>>> 690d3be35e1 (Merge pull request #128217 from groeneai/fix-partition-by-stateful-function-spans-chunks)
 };
 
 /*
@@ -120,15 +114,9 @@ struct HiveStylePartitionStrategy : IPartitionStrategy
         const std::string & file_format_,
         bool partition_columns_in_data_file_);
 
-<<<<<<< HEAD
-    ColumnPtr computePartitionKey(const Chunk & chunk) const override;
+    PartitionExpressionActionsAndColumnName getPartitionKeyActions() const override;
 
     ColumnPtr computePartitionKey(Block & block) const override;
-=======
-    PartitionExpressionActionsAndColumnName getPartitionKeyActions() const override;
-    std::string getPathForRead(const std::string & prefix) override;
-    std::string getPathForWrite(const std::string & prefix, const std::string & partition_key) override;
->>>>>>> 690d3be35e1 (Merge pull request #128217 from groeneai/fix-partition-by-stateful-function-spans-chunks)
 
     ColumnRawPtrs getFormatChunkColumns(const Chunk & chunk) override;
     Block getFormatHeader() override;
