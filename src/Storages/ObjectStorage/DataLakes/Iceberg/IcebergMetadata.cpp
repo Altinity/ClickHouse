@@ -144,6 +144,11 @@ extern const int LIMIT_EXCEEDED;
 extern const int QUERY_WAS_CANCELLED;
 }
 
+namespace FailPoints
+{
+extern const char iceberg_metadata_prefetch_pause[];
+}
+
 namespace Setting
 {
 extern const SettingsNonZeroUInt64 max_block_size;
@@ -379,6 +384,9 @@ void IcebergMetadata::backgroundMetadataPrefetcherThread()
 
     try
     {
+        /// Lets a test hold the refresher before it reads the latest metadata
+        FailPointInjection::pauseFailPoint(FailPoints::iceberg_metadata_prefetch_pause);
+
         if (!Context::getGlobalContextInstance())
         {
             /// Should never happen, but if seen, this is clear indicator that the task should be started/stopped via startup/shutdown mechanism (check TODOs above)
@@ -405,7 +413,6 @@ void IcebergMetadata::backgroundMetadataPrefetcherThread()
                 auto manifest_file_ptr = Iceberg::getManifestFile(
                     object_storage, persistent_components, ctx, log,
                     entry.manifest_file_path,
-                    entry.manifest_file_byte_size,
                     *external_storages);
             }
         }

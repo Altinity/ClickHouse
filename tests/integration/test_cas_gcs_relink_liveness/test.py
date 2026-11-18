@@ -1,9 +1,8 @@
 """Fetch-by-relink liveness on a slow control plane.
 
 Two replicas of one ReplicatedMergeTree table share one CAS pool over the fake GCS service of
-`test_cas_gcs`, with every write to a key containing `_ckpt` delayed. That substring targets the
-ref-lane flush's checkpoint publication, but it also matches namespace creation, recovery, and the GC
-snapshot publisher's checkpoint contribution — all four are slowed, not just the flush. Both replicas
+`test_cas_gcs`, with every write to a key containing `_log/` delayed. That substring targets the
+ref-lane flush's one request, but it also matches recovery's tombstone — both are slowed. Both replicas
 insert continuously, so each is a sender and a receiver at once and each keeps its own lane busy. A
 confirm rule that refuses whenever the sender's lane is busy starves both replication queues here
 (finding F11 of the 2026-09-02 live GCS campaign); the ref-scoped rule lets them drain. The unit tests
@@ -27,9 +26,9 @@ MOCK_DIR = os.path.join(os.path.dirname(__file__), "..", "test_cas_gcs", "gcs_mo
 NODES = ("node1", "node2")
 CA_DISK = "disk_cas_gcs_shared"
 
-# Every `_ckpt` PUT sleeps this long: one second is the real service's own per-object mutation cap
-# (see the module docstring above). A full run at this value takes several minutes.
-CKPT_DELAY_MS = 1000
+# Every `_log/` PUT sleeps this long, one second, the real service's own per-object mutation cap.
+# A full run at this value takes several minutes.
+LOG_DELAY_MS = 1000
 INSERTS_PER_NODE = 80
 ROWS_PER_INSERT = 1000
 DRAIN_TIMEOUT_S = 180
@@ -46,7 +45,11 @@ def start_cluster():
     for name in NODES:
         cluster.add_instance(name, macros={"replica": name}, with_zookeeper=True, stay_alive=True)
     cluster.add_instance(
-        GCS_HOST, hostname=GCS_HOST, image="altinityinfra/python-bottle", tag="latest", stay_alive=True
+        GCS_HOST,
+        hostname=GCS_HOST,
+        image="altinityinfra/python-bottle",
+        tag=os.environ.get("DOCKER_PYTHON_BOTTLE_TAG", "latest"),
+        stay_alive=True,
     )
     try:
         cluster.start()
@@ -176,7 +179,7 @@ def _relink_finished_pattern(table, disk):
     )
 
 
-def test_both_queues_drain_under_slow_checkpoints():
+def test_both_queues_drain_under_slow_ref_log_writes():
     node1 = cluster.instances["node1"]
     node2 = cluster.instances["node2"]
     table = "relink_liveness"
@@ -188,7 +191,7 @@ def test_both_queues_drain_under_slow_checkpoints():
             "ORDER BY id SETTINGS storage_policy = 'cas_gcs_shared'".format(t=table)
         )
 
-    _set_delay("_ckpt", CKPT_DELAY_MS)
+    _set_delay("_log/", LOG_DELAY_MS)
     try:
         errors = []
 
@@ -214,14 +217,14 @@ def test_both_queues_drain_under_slow_checkpoints():
         assert errors == [], errors
 
         # The lever, checked BEFORE the drain assertion: if the delay knob silently stopped
-        # matching (a renamed endpoint, a renamed query param, a `_ckpt` key that stopped matching
+        # matching (a renamed endpoint, a renamed query param, a `_log/` key that stopped matching
         # the substring), the fake would serve every write at full speed and the drain assertion
         # below would pass having exercised nothing. Checking this first means a failure here is
         # never confused with the liveness failure this test exists to catch.
         delayed = _delayed_put_count()
         assert delayed >= 2 * INSERTS_PER_NODE, (
             "the delay knob fired only {} times; expected at least {} — it may have silently "
-            "stopped matching `_ckpt` PUTs, which would make any drain result meaningless".format(
+            "stopped matching `_log/` PUTs, which would make any drain result meaningless".format(
                 delayed, 2 * INSERTS_PER_NODE
             )
         )
@@ -237,7 +240,7 @@ def test_both_queues_drain_under_slow_checkpoints():
         for node in (node1, node2):
             print(node.name, "refusal counters:", _refusal_counters(node))
         assert drained == (True, True), (
-            "replication queues did not drain in {} s with slow checkpoints: node1={} node2={}\n"
+            "replication queues did not drain in {} s with slow ref-log writes: node1={} node2={}\n"
             "node1 queue (type, count, last_exception):\n{}\n"
             "node2 queue (type, count, last_exception):\n{}".format(
                 DRAIN_TIMEOUT_S,
@@ -261,7 +264,7 @@ def test_both_queues_drain_under_slow_checkpoints():
                 "arrived took some route other than fetch-by-relink".format(node.name)
             )
 
-        # No confirm may be refused by lane STATE on a healthy run. These two counters move only on
+        # No confirm may be refused by lane STATE on a healthy run. These counters move only on
         # `confirmExactRef`'s wedge and broken-lane branches — an unresolved append, or a lane in
         # NeedsRecovery, Closed, Faulted, or Writing with nothing carved. This case drives the fake's
         # control plane with a delay and never with a fault, so none of those is reachable here and a
@@ -281,13 +284,21 @@ def test_both_queues_drain_under_slow_checkpoints():
         # `CASRelinkConfirmRefused%` row at all. Requiring it would demand the symptom the ref-scoped
         # rule removes, so it would pass only while the livelock is present. The two things it was
         # meant to show are shown better above: the relink-completion assertion proves confirms were
-        # asked and answered `Yes`, and the delayed-PUT floor proves the checkpoint publications were
-        # slowed, which is the contention itself. Its attribution is pinned in the unit suite, by
+        # asked and answered `Yes`, and the delayed-PUT floor proves the ref-log appends were slowed,
+        # which is the contention itself. Its attribution is pinned in the unit suite, by
         # `CASConfirmExactRef.UntouchedRefConfirmsWhileAnotherRefIsQueued`.
+        #
+        # `SlotUnreadable` is zero because the delay knob matches only `_log/` PUTs: no fault reaches the
+        # mount key, so each slot read succeeds. `CASRelinkConfirmRefusedSlotMoved` is not listed: a renewal
+        # that commits between the read and the ownership check refuses a healthy mount.
         for node in (node1, node2):
-            for event in ("CASRelinkConfirmRefusedLaneWedged", "CASRelinkConfirmRefusedLaneBroken"):
+            for event in (
+                "CASRelinkConfirmRefusedLaneWedged",
+                "CASRelinkConfirmRefusedLaneBroken",
+                "CASRelinkConfirmRefusedSlotUnreadable",
+            ):
                 assert _refusal_counter(node, event) == 0, (
-                    "{} refused a relink confirm by lane state ({}), which no fault was injected to "
+                    "{} refused a relink confirm ({}), which no fault was injected to "
                     "produce. All refusal counters on this node:\n{}".format(
                         node.name, event, _refusal_counters(node)
                     )

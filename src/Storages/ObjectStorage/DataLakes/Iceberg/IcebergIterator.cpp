@@ -430,7 +430,6 @@ Iceberg::ManifestIteratorPtr IcebergIterator::createManifestIterator(const Manif
         local_context,
         logger,
         manifest_list_entry.manifest_file_path,
-        manifest_list_entry.manifest_file_byte_size,
         *external_storages);
 
     return Iceberg::ManifestFileIterator::create(

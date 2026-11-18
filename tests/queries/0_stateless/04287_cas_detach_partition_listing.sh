@@ -20,6 +20,7 @@ SETTINGS disk = disk(
     type = object_storage,
     object_storage_type = local,
     metadata_type = cas,
+    cas_unsafe_remount_no_delay = 1,
     cas_server_root_id = '${CLICKHOUSE_DATABASE}_04287',
     name = '${CLICKHOUSE_DATABASE}_04287_cas_detach',
     path = '${CLICKHOUSE_DATABASE}_04287_cas_detach_pool/');

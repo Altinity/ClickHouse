@@ -10,6 +10,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
+#include <Common/MemoryTracker.h>
 #include <Common/ProfileEvents.h>
 
 #include <Poco/Exception.h>
@@ -21,7 +22,9 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ProfileEvents
@@ -212,7 +215,7 @@ TEST(CASRefSnapshotPublishOrdering, AdoptionHappensLastAndOnlyAfterBothDurableEf
     const String snapshot_key = store->layout().refSnapshotKey(life, RefTxnId{store->writerEpoch(), 1});
     const String ckpt_key = store->layout().refCkptKey(life);
 
-    /// Refuse the `_ckpt` CAS for as long as `publishCkpt` keeps reissuing, so it ends at its own retry
+    /// Refuse the `_ckpt` CAS for as long as `publishCkptSnapshot` keeps reissuing, so it ends at its own retry
     /// window: the body create still commits, but the checkpoint never advances within this call.
     backend->armWriteConflict(ckpt_key, kFaultsBeyondTheRetryWindow);
     EXPECT_FALSE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns))
@@ -251,26 +254,18 @@ TEST(CASRefSnapshotPublishOrdering, AdoptionHappensLastAndOnlyAfterBothDurableEf
 /// This test is the plan's `PoisonedRefusesPublicationAndTriggersReRecovery`, renamed to state the actual
 /// pinned behavior precisely (recovery precedes publication, rather than an outright refusal).
 ///
-/// It is reached here the same way `gtest_cas_ref_writer.cpp`'s
-/// `CASRefWriterAppendLane.CheckpointConflictAfterLogCommitRequiresRecoveryWithoutInstall` reaches it: a
-/// mutation's ref-log body commits durably while its OWN checkpoint-frontier CAS (`commitRefChunk`'s
-/// `commit_contribution`, not the snapshot publisher's) conflicts persistently.
+/// It is reached here by a mutation whose ref-log body commits durably while its install fails.
 ///
 /// The INVARIANT this pins (not a raw write count): a snapshot must never be published FROM AN
 /// UNRECOVERED CACHE -- a durable transaction may be missing from the cached view, and advancing `_ckpt`
 /// onto a snapshot built from that stale view is the data-loss shape `NeedsRecovery` exists to prevent.
 /// `tryPublishSnapshotAndAdvanceCheckpointOnce` calls `ensureRefTableRecovered` unconditionally, and that
 /// function re-walks the durable stream whenever the lane is `NeedsRecovery`, regardless of `recovered`.
-/// Recovery's own `_ckpt` catch-up write is NOT a violation of this invariant -- it is the remedy: it is
-/// how the cache stops being stale before anything is allowed to read it for a snapshot. So a request
-/// against a poisoned lane recovers first and MAY legitimately go on to publish (this table had never
-/// published a snapshot, so once recovered it has a real, uncovered candidate) -- "inert refusal with
-/// zero writes" is NOT what production implements, and recover-then-proceed is the correct behavior, not
-/// a deviation from it. What this test pins is: (a) no snapshot-publish effect (body PUT, publisher's own
-/// checkpoint-advance CAS) can ever appear in the journal before recovery's reconciliation CAS; (b)
-/// re-recovery is an observable state transition, never a silent skip; (c) if a snapshot IS published, it
-/// reflects the RECOVERED frontier -- the durable transaction the stale cache was missing is actually
-/// covered by it, not merely "some snapshot, from whichever view".
+/// So a request against a poisoned lane recovers first and MAY legitimately go on to publish (this table
+/// had never published a snapshot, so once recovered it has a real, uncovered candidate). What this test
+/// pins is: (a) re-recovery is an observable state transition, never a silent skip; (b) the snapshot is
+/// built from the RECOVERED state -- it covers the durable transaction the stale cache was missing --
+/// and its body precedes the publisher's checkpoint write.
 TEST(CASRefSnapshotPublishOrdering, NeedsRecoveryLaneRecoversBeforeAnySnapshotPublication)
 {
     auto backend = std::make_shared<OrderedFaultBackend>();
@@ -285,18 +280,23 @@ TEST(CASRefSnapshotPublishOrdering, NeedsRecoveryLaneRecoversBeforeAnySnapshotPu
     const RefTxnId missing_durable_txn{store->writerEpoch(), 2};
     const String next_snapshot_key = store->layout().refSnapshotKey(life, missing_durable_txn);
 
-    /// Drive the very next mutation's OWN checkpoint-frontier CAS into persistent conflict: the log PUT
-    /// for `missing_durable_txn` commits durably, but its checkpoint never advances within this call, and
-    /// the lane is left `NeedsRecovery` rather than installing an uncertain result -- so the cached view
-    /// still reflects `ref_1` present, while the durable log already reflects it removed.
-    backend->armWriteConflict(ckpt_key, kFaultsBeyondTheRetryWindow);
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "ref_1"); });
-    EXPECT_GT(clock->pauseCount(), 1u)
-        << "the frontier publication's reissues must pace through the injected sleep, never a real one";
+    /// The log PUT for `missing_durable_txn` commits durably and its install fails, so the lane is left
+    /// `NeedsRecovery`: the cached view still reflects `ref_1` present, while the durable log already
+    /// reflects it removed.
+    auto planned = std::make_exception_ptr(std::runtime_error("injected install failure"));
+    auto fired = std::make_shared<std::atomic<bool>>(false);
+    store->setInstallRegionProbeForTest([planned, fired]
+    {
+        if (fired->exchange(true))
+            return;
+        ALLOW_ALLOCATIONS_IN_SCOPE;
+        std::rethrow_exception(planned);
+    });
+    EXPECT_ANY_THROW(store->dropRef(ns, "ref_1"));
+    store->setInstallRegionProbeForTest(nullptr);
     ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
 
     const uint64_t recovery_installs_before = store->recoveryInstallCountForTest();
-    backend->armWriteConflict(ckpt_key, 0);   /// clear the fault so re-recovery's OWN catch-up CAN succeed
     const size_t offset = backend->journalSize();
 
     EXPECT_TRUE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns))
@@ -311,19 +311,12 @@ TEST(CASRefSnapshotPublishOrdering, NeedsRecoveryLaneRecoversBeforeAnySnapshotPu
     EXPECT_GT(store->recoveryInstallCountForTest(), recovery_installs_before)
         << "a re-recovery install must be observable, not indistinguishable from never having run";
 
-    /// ORDER, not a global zero: recovery's OWN checkpoint catch-up CAS is the boundary marker. NO
-    /// snapshot-publish effect (the new snapshot's body PUT, nor the publisher's own checkpoint-advance
-    /// CAS) may appear at or before it.
+    /// Recovery writes no `_ckpt`, so the only checkpoint write is the publisher's, after its own body PUT.
     const auto ckpt_cas_indices = backend->indicesFrom(ckpt_key, offset);
     const auto snap_put_indices = backend->indicesFrom(next_snapshot_key, offset);
-    ASSERT_GE(ckpt_cas_indices.size(), 2u)
-        << "expected one checkpoint CAS from recovery's catch-up and one from the snapshot publisher";
-    const size_t recovery_catchup_index = ckpt_cas_indices.front();
+    ASSERT_EQ(ckpt_cas_indices.size(), 1u) << "the snapshot publisher's checkpoint write";
     const size_t publisher_ckpt_index = ckpt_cas_indices.back();
     ASSERT_FALSE(snap_put_indices.empty()) << "the recovered, uncovered candidate must have been published";
-    for (const size_t snap_put_index : snap_put_indices)
-        EXPECT_GT(snap_put_index, recovery_catchup_index)
-            << "no snapshot-publish body PUT may precede recovery's own checkpoint reconciliation";
     EXPECT_LT(snap_put_indices.front(), publisher_ckpt_index)
         << "the snapshot publisher's own checkpoint CAS still runs after ITS OWN body PUT (INV-4), even "
            "immediately following recovery";
@@ -647,4 +640,24 @@ TEST(CASRefSnapshotPublishOrdering, NotReadyRefusalBacksOffAndResetsAfterDurable
     EXPECT_EQ(
         store->newestPublishedSnapshotIdForTest(ns),
         std::make_optional(RefTxnId{store->writerEpoch(), 7}));
+}
+
+TEST(CASRefSnapshotPublishOrdering, LaneStateNamesCoverEveryState)
+{
+    const std::vector<RefLaneState> states{
+        RefLaneState::Ready,
+        RefLaneState::Writing,
+        RefLaneState::Wedged,
+        RefLaneState::NeedsRecovery,
+        RefLaneState::Closed,
+        RefLaneState::Faulted,
+    };
+    std::set<std::string_view> names;
+    for (const auto state : states)
+    {
+        const auto name = refLaneStateName(state);
+        EXPECT_FALSE(name.empty()) << "state " << static_cast<int>(state);
+        names.insert(name);
+    }
+    EXPECT_EQ(names.size(), states.size());
 }

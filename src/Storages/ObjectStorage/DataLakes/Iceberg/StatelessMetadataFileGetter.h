@@ -28,7 +28,6 @@ Iceberg::ManifestFileCacheableInfo getManifestFile(
     ContextPtr local_context,
     LoggerPtr log,
     const IcebergPathFromMetadata & filename,
-    size_t bytes_size,
     ExternalStorageCache & external_storages);
 
 /// Creates a fully initialized ManifestFileIterator from a cache key.
