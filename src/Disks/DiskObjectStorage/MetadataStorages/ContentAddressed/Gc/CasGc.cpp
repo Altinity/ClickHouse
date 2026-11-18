@@ -351,9 +351,9 @@ uint64_t retiredLogicalSize(ObjectKind kind, uint64_t object_size, uint64_t blob
 }
 
 bool shouldDeferRound(size_t changed_shards, bool graduation_due, uint64_t rounds_since_last_fold,
-                      uint64_t fold_threshold, uint64_t fold_max_defer_rounds, bool force_orphan_manifest_sweep)
+                      uint64_t fold_threshold, uint64_t fold_max_defer_rounds, bool orphan_manifest_sweep_requires_fold)
 {
-    if (graduation_due || force_orphan_manifest_sweep)
+    if (graduation_due || orphan_manifest_sweep_requires_fold)
         return false;
     if (changed_shards >= fold_threshold)
         return false;
@@ -924,8 +924,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         store->poolConfig().manifest_sweep_list_budget_keys, orphan_manifest_sweep_decision_at_ms);
     const bool run_orphan_manifest_sweep = orphan_manifest_sweep_decision == OrphanManifestSweepDecision::StartSweep
         || orphan_manifest_sweep_decision == OrphanManifestSweepDecision::ContinueSweep;
-    const bool force_orphan_manifest_sweep = run_orphan_manifest_sweep
-        && orphan_manifest_sweep_retry_generation != state.snap_generation;
+    const bool orphan_manifest_sweep_requires_fold = run_orphan_manifest_sweep
+        && orphan_manifest_sweep_forced_fold_suppression_generation != state.snap_generation;
     {
         GcPhaseTimer t(phase_sink, "defer_decision");
         const bool graduation_due = graduationDue(state, new_round);
@@ -935,7 +935,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         const size_t changed = walk_plan->changedRows();
         defer_round = shouldDeferRound(changed, graduation_due, rounds_since_last_fold_,
                                        store->poolConfig().gc_fold_threshold,
-                                       store->poolConfig().gc_fold_max_defer_rounds, force_orphan_manifest_sweep);
+                                       store->poolConfig().gc_fold_max_defer_rounds, orphan_manifest_sweep_requires_fold);
         uint64_t ref_log_keys = 0;
         for (const auto & [scanned_life, ids] : ref_scan.logs_by_life)
             ref_log_keys += ids.size();
@@ -945,7 +945,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         t.metric("ref_keys_listed", ref_scan.keys.size());
         t.metric("graduation_due", graduation_due ? 1 : 0);
         t.metric("run_orphan_manifest_sweep", run_orphan_manifest_sweep ? 1 : 0);
-        t.metric("force_orphan_manifest_sweep", force_orphan_manifest_sweep ? 1 : 0);
+        t.metric("orphan_manifest_sweep_requires_fold", orphan_manifest_sweep_requires_fold ? 1 : 0);
         t.metric("orphan_manifest_sweep_active", state.manifest_sweep_cursor.empty() ? 0 : 1);
         t.metric("orphan_manifest_sweep_waiting_for_clock", orphan_manifest_sweep_decision == OrphanManifestSweepDecision::SkipUntilIntervalElapsed
             && orphan_manifest_sweep_decision_at_ms < state.orphan_manifest_sweep_completed_at_ms ? 1 : 0);
@@ -1357,9 +1357,9 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     state_etag = orThrow(std::move(commit), "CAS gc round commit");
     state = std::move(next);
     if (run_orphan_manifest_sweep && suppress_destructive)
-        orphan_manifest_sweep_retry_generation = state.snap_generation;
+        orphan_manifest_sweep_forced_fold_suppression_generation = state.snap_generation;
     else
-        orphan_manifest_sweep_retry_generation.reset();
+        orphan_manifest_sweep_forced_fold_suppression_generation.reset();
     report.round = state.round;
     round_commit_timer->metric("round", report.round);
     round_commit_timer->metric("generation", generation);
@@ -3647,7 +3647,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         catch (...)
         {
             /// No new generation was adopted; pace retries against the current parent generation.
-            orphan_manifest_sweep_retry_generation = state.snap_generation;
+            orphan_manifest_sweep_forced_fold_suppression_generation = state.snap_generation;
             throw;
         }
         for (const ManifestSweepResult::Nomination & nomination : result.orphan_sweep.nominations)

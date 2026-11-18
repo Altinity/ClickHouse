@@ -230,7 +230,7 @@ phase 5 and builds a new in-degree snapshot; `defer` skips generation constructi
 - **Fails the round if:** the plan-building seal read reports an invalid adopted seal
 - **Observability:** phase row `defer_decision`; metrics `changed_shards` (despite the name, the
   number of changed namespace-life rows), `namespaces_seen`, `ref_log_keys_listed`,
-  `run_orphan_manifest_sweep`, `force_orphan_manifest_sweep`, `orphan_manifest_sweep_active`, and
+  `run_orphan_manifest_sweep`, `orphan_manifest_sweep_requires_fold`, `orphan_manifest_sweep_active`, and
   `orphan_manifest_sweep_waiting_for_clock`
 
 The plan has one row per admitted catalog life (`Live` or `Removing`; `Creating` excluded), joining
@@ -238,7 +238,7 @@ its last folded position, its greatest listed `_log` position, and the keys late
 is *changed* when the listed `_log` is newer than the last folded position. Phase 4 chooses `fold`
 if any of: changed rows ≥ `gc_fold_threshold` (default 1); an adopted shard has a published pending
 delete; an adopted shard has a condemned blob due to graduate
-(`oldest_nonpending_condemn_round < round + 1`); `force_orphan_manifest_sweep` is true; or
+(`oldest_nonpending_condemn_round < round + 1`); `orphan_manifest_sweep_requires_fold` is true; or
 `gc_fold_max_defer_rounds` (default 8)
 consecutive defers were reached. Both thresholds are internal `PoolConfig` fields, not disk
 settings. On `defer`, one suppressed namespace-janitor page runs (phase 16's work) and the round
@@ -246,17 +246,19 @@ returns without a commit. On `fold`, phase 6 reuses this plan and the same `LIST
 
 `run_orphan_manifest_sweep` requests a new or continued traversal according to
 `cas_orphan_manifest_sweep_interval_sec`. Its first attempt forces a fold even on an idle pool.
+`orphan_manifest_sweep_requires_fold` reports when that request prevents an otherwise idle round
+from deferring. It does not mean that the sweep page was planned or any manifest was deleted.
 `orphan_manifest_sweep_active` is an observation derived from a nonempty accepted
 `manifest_sweep_cursor`; it is not a separate field in `gc/state`.
 After a suppressed attempt is committed, a leader-local marker names the newly adopted generation.
 An exception from `planManifestCursorPage` instead records the current adopted parent generation
 and propagates: no sweep progress is committed. Other fold errors and a lost round `CAS` do not
 set a new marker.
-While that generation remains current, `force_orphan_manifest_sweep` is false and ordinary bounded
-defer applies. A fold started by any other trigger still plans the requested sweep when its safety
-gates permit it. A committed non-suppressed fold clears the marker, so successful active pages keep
+While that generation remains current, `orphan_manifest_sweep_requires_fold` is false and ordinary
+bounded defer applies. A fold started by any other trigger still plans the requested sweep when its
+safety gates permit it. A committed non-suppressed fold clears the marker, so successful active pages keep
 forcing the next fold. A new generation, rebuild or fresh `Gc` instance does not inherit the old
-generation's retry delay. No retry timestamp or marker is added to `gc/state`.
+generation's suppression of forced folds. No retry timestamp or marker is added to `gc/state`.
 
 ## Phase 5 — parent seal read {#phase-5-parent-seal-read}
 
