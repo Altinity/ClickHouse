@@ -587,7 +587,7 @@ When `disk_name` is given, the round runs on that content-addressed disk only; t
 
 Each round is recorded in [`system.cas_gc_log`](/operations/system-tables/cas_gc_log) as a `Start` and a `Finish` row (with `trigger = 'Manual'`).
 
-The command returns one row per disk it ran on (multiple rows when `disk_name` is omitted), with columns `disk`, `acquired_lease`, `deferred`, `round`, `candidates_marked`, `objects_deleted`, `objects_absent`, `objects_replaced`, `objects_spared`, `manifests_deleted`, `entries_condemned`, `entries_graduated`, `entries_redeleted`, `entries_redelete_failed`, `fence_outs`, `anomalies`, `pending_candidates`, `pending_condemned`, and `pending_retired`, describing the outcome of that round. The `pending_*` columns are the retire pipeline's remaining backlog sizes read from the `gc/state` this round's own commit just published (not this round's own delta, unlike the columns before them) — `0` on a non-authoritative row (`acquired_lease = 0` or `deferred = 1`), same as every other counter.
+The command returns one row per disk it ran on (multiple rows when `disk_name` is omitted), with columns `disk`, `acquired_lease`, `deferred`, `round`, `candidates_marked`, `objects_deleted`, `objects_absent`, `objects_replaced`, `objects_spared`, `manifests_deleted`, `entries_condemned`, `entries_intent_confirmed`, `entries_bodies_deleted`, `entries_body_delete_failed`, `fence_outs`, `anomalies`, `pending_candidates`, `pending_condemned`, and `pending_retired`, describing the outcome of that round. The `pending_*` columns are the retire pipeline's remaining backlog sizes read from the `gc/state` this round's own commit just published (not this round's own delta, unlike the columns before them) — `0` on a non-authoritative row (`acquired_lease = 0` or `deferred = 1`), same as every other counter.
 
 A manual run always executes, regardless of [`SYSTEM CAS GC STOP`](#system-cas-gc-stop-start): `STOP` pauses only the background scheduler on that disk.
 
@@ -669,10 +669,19 @@ SYSTEM CAS FSCK [ON CLUSTER cluster_name] disk_name
 `dangling`, `unreachable`, `pending_gc`, `awaiting_gc`, `unaccounted`, `stale_edge`,
 `corrupted_runs`, `chain_broken`, `unchecked`, `lifeless_keys`, `namespace_janitor_pending`,
 `namespace_janitor_pending_bytes`, `namespace_janitor_pending_lives`, `ref_records_walked`,
-`physical_bytes`, `referenced_logical_bytes`, `distinct_blobs`, and `total_blob_refs`. `dangling` is
-the one column that means data loss; `unreachable`, `pending_gc`, and `awaiting_gc` are objects
-still moving through the normal condemn/graduate/delete pipeline, not a problem on their own. This
-is a summary-only scan; per-object detail requires the offline `clickhouse-disks cas-fsck --detail`.
+`physical_bytes`, `referenced_logical_bytes`, `distinct_blobs`, `total_blob_refs`, `intent_listed`,
+`intent_malformed`, `intent_unread`, `pending_without_intent`, `pending_intent_absent`,
+`pending_token_rejected`, `standing_present`, and `legacy_marker`. `dangling` is the one column that
+means data loss. Three intent columns are findings that make a scan unclean: `intent_malformed` (a key
+under `blob-intents/` that is no intent key), `intent_unread` (a read of a deletion intent failed) and
+`pending_without_intent` (a `pending` GC row whose deletion intent is absent while its body is present:
+GC would delete that body without warning any writer, so stop GC on the pool and report it). The rest
+of the intent and marker columns are normal counts. `unreachable`, `pending_gc`, and
+`awaiting_gc` are objects still moving through the normal pipeline (condemn, delete the body, remove the
+intent), not a problem on their own. The scan counts deletion intents from the listing and reads the
+intent of each `pending` GC row; the per-intent verification (`intent_current`, `intent_replaced`,
+`intent_body_gone`, and the check of an intent's bytes) is available only as `cas-fsck --verify-intents`.
+This is a summary-only scan; per-object detail requires the offline `clickhouse-disks cas-fsck --detail`.
 
 ### SYSTEM CAS FORGET {#system-cas-forget}
 
