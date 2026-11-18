@@ -1047,7 +1047,7 @@ size_t ObjectStorageBackend::conditionalBatchDeleteKeyLimit() const
     return object_storage->batchDeleteKeyLimit();
 }
 
-void ObjectStorageBackend::pinConditionalBatchDeleteSupport(bool supported)
+void ObjectStorageBackend::pinConditionalBatchDeleteSupport(const bool supported)
 {
     conditional_batch_delete_supported.store(supported);
 }

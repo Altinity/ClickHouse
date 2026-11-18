@@ -669,7 +669,7 @@ std::vector<ConditionalRemoveResult> S3ObjectStorage::removeObjectsIfTokensMatch
     if (request.attempt_number != 0)
         S3::setClickHouseAttemptNumber(request_s3, request.attempt_number);
     auto blob_storage_log = BlobStorageLogWriter::create(disk_name);
-    const auto log_object = [&](const StoredObject & object, Int32 error_code, const String & error_message)
+    const auto log_object = [&](const StoredObject & object, const Int32 error_code, const String & error_message)
     {
         if (blob_storage_log)
             blob_storage_log->addEvent(
@@ -682,7 +682,7 @@ std::vector<ConditionalRemoveResult> S3ObjectStorage::removeObjectsIfTokensMatch
                 error_code,
                 error_message);
     };
-    const auto log_all = [&](Int32 error_code, const String & error_message)
+    const auto log_all = [&](const Int32 error_code, const String & error_message)
     {
         for (const auto & object : objects)
             log_object(object.object, error_code, error_message);

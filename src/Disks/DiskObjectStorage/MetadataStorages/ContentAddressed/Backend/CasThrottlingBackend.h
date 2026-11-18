@@ -135,7 +135,7 @@ public:
     uint64_t attemptEnvelopeMs() const override { return inner->attemptEnvelopeMs(); }
     size_t bulkDeleteKeyLimit() const override { return inner->bulkDeleteKeyLimit(); }
     size_t conditionalBatchDeleteKeyLimit() const override { return inner->conditionalBatchDeleteKeyLimit(); }
-    void pinConditionalBatchDeleteSupport(bool supported) override { inner->pinConditionalBatchDeleteSupport(supported); }
+    void pinConditionalBatchDeleteSupport(const bool supported) override { inner->pinConditionalBatchDeleteSupport(supported); }
     bool refreshCredentials() override { return inner->refreshCredentials(); }
     void checkPoolPreconditions() override { inner->checkPoolPreconditions(); }
     void checkSkipAccessCheckSupport() override { inner->checkSkipAccessCheckSupport(); }

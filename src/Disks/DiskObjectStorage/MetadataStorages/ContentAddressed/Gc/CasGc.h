@@ -528,7 +528,7 @@ public:
     /// limit, clamped to [1, `kBulkDeleteMaxKeys`] because an empty request would never advance.
     size_t bulkDeleteChunkKeys() const;
 
-    size_t conditionalDeleteChunkKeys() const;
+    size_t conditionalDeleteKeysPerChunk() const;
 
     void setRebuildEdgeBudgetForTest(uint64_t n) { rebuild_edge_budget_override = n; }
 
@@ -565,18 +565,19 @@ public:
     {
         String blob_key;
         std::optional<Etag> live_token;
-        std::optional<Removal> removal;
+        std::optional<Removal> removal_result;
         std::exception_ptr error;
     };
 
     struct ConditionalDeleteChunk
     {
-        std::vector<size_t> indices;
-        std::vector<ConditionalRemove> removals;
+        /// `conditional_removals[i]` targets `redelete_blob_states[blob_state_indices[i]]`.
+        std::vector<size_t> blob_state_indices;
+        std::vector<ConditionalRemove> conditional_removals;
     };
 
     static std::vector<ConditionalDeleteChunk> prepareConditionalDeleteChunks(
-        const std::vector<RedeleteBlobState> & redelete_blob_states, size_t chunk_keys);
+        const std::vector<RedeleteBlobState> & redelete_blob_states, size_t max_keys_per_chunk);
 
 private:
     /// Lease acquire/renew/steal per the documented observation protocol. On success `state` holds the
@@ -788,7 +789,7 @@ private:
     struct RedeleteScheduleFailure
     {
         IndexedException error;
-        size_t unsent;
+        size_t unscheduled_delete_blob_count{};
     };
 
     /// The settlement decisions of one shard in a round, counted where each is made: a decision whose
@@ -814,10 +815,10 @@ private:
         std::map<uint64_t, OutcomeLog> & outcomes;
         std::map<uint64_t, OutcomeTally> & outcome_tallies;
         uint64_t & jobs_scheduled;
-        uint64_t & delete_batches;
+        uint64_t & delete_chunks;
     };
 
-    static void observeRetiredBlob(
+    static void readRetiredBlobState(
         const RetiredEntry & entry, const Layout & layout, CasOperation & op, RedeleteBlobState & redelete_blob_state);
 
     void recordRedeleteSuccess(RedeleteRoundContext & ctx, const RetiredEntry & entry, const RedeleteBlobState & redelete_blob_state);
@@ -827,15 +828,15 @@ private:
         const RetiredEntry & entry,
         const Layout & layout,
         std::exception_ptr exception,
-        std::optional<size_t> unsent_count = std::nullopt);
+        std::optional<size_t> unscheduled_blob_count = std::nullopt);
 
     std::optional<IndexedException> recordRedeleteResults(
         RedeleteRoundContext & ctx,
         const std::vector<RetiredEntry> & entries,
         const Layout & layout,
         const std::vector<RedeleteBlobState> & redelete_blob_states,
-        size_t observed,
-        const std::vector<RedeleteScheduleFailure> & schedule_failures);
+        size_t scheduled_blob_head_job_count,
+        const std::vector<RedeleteScheduleFailure> & job_schedule_failures);
 
     void scheduleBlobMetaDeletes(
         const std::vector<RetiredEntry> & entries,
@@ -846,14 +847,14 @@ private:
     {
         bool on_pool = false;
         size_t scheduled = 0;
-        std::vector<std::exception_ptr> errors;
-        std::optional<IndexedException> schedule_error;
+        std::vector<std::exception_ptr> scheduled_job_errors;
+        std::optional<IndexedException> job_schedule_error;
     };
 
     IoJobsResult runRedeleteIoJobs(
         ThreadPool & pool,
         size_t concurrency,
-        size_t count,
+        size_t job_count,
         size_t refuse_offset,
         CasOperation & op,
         const std::function<void(size_t, CasOperation &)> & job);

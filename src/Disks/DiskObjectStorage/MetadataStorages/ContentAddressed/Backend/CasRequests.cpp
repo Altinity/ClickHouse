@@ -664,7 +664,7 @@ std::vector<Removal> CasOperation::removeManyByConditionalForProbe(
 }
 
 std::vector<Removal> CasOperation::removeManyByConditionalImpl(
-    const std::vector<ConditionalRemove> & removals, const Retry & policy, size_t limit)
+    const std::vector<ConditionalRemove> & removals, const Retry & policy, const size_t limit)
 {
     if (removals.size() > limit)
         throw Exception(ErrorCodes::LOGICAL_ERROR,

@@ -1251,20 +1251,20 @@ Gc::RedeleteBlobState liveRedeleteBlobState(CasOperation & op, const String & ke
     return redelete_blob_state;
 }
 
-Gc::RedeleteBlobState settledRedeleteBlobState(const String & key, Removal removal)
+Gc::RedeleteBlobState settledRedeleteBlobState(const String & key, const Removal removal_result)
 {
     Gc::RedeleteBlobState redelete_blob_state;
     redelete_blob_state.blob_key = key;
-    redelete_blob_state.removal = removal;
+    redelete_blob_state.removal_result = removal_result;
     return redelete_blob_state;
 }
 
-std::vector<std::vector<size_t>> chunkIndices(const std::vector<Gc::ConditionalDeleteChunk> & chunks)
+std::vector<std::vector<size_t>> chunkBlobStateIndices(const std::vector<Gc::ConditionalDeleteChunk> & chunks)
 {
-    std::vector<std::vector<size_t>> indices;
+    std::vector<std::vector<size_t>> blob_state_indices;
     for (const auto & chunk : chunks)
-        indices.push_back(chunk.indices);
-    return indices;
+        blob_state_indices.push_back(chunk.blob_state_indices);
+    return blob_state_indices;
 }
 
 }
@@ -1285,14 +1285,14 @@ TEST(CASGCConditionalDeleteChunks, OnlyLiveTokensWithoutErrorsAreChunked)
 
     const auto chunks = Gc::prepareConditionalDeleteChunks(redelete_blob_states, 10);
 
-    ASSERT_EQ(chunkIndices(chunks), (std::vector<std::vector<size_t>>{{0, 2, 6}}));
-    const auto & removals = chunks.front().removals;
-    ASSERT_EQ(removals.size(), 3u);
-    for (size_t pos = 0; pos < removals.size(); ++pos)
+    ASSERT_EQ(chunkBlobStateIndices(chunks), (std::vector<std::vector<size_t>>{{0, 2, 6}}));
+    const auto & conditional_removals = chunks.front().conditional_removals;
+    ASSERT_EQ(conditional_removals.size(), 3u);
+    for (size_t pos = 0; pos < conditional_removals.size(); ++pos)
     {
-        const auto & redelete_blob_state = redelete_blob_states[chunks.front().indices[pos]];
-        EXPECT_EQ(removals[pos].key, redelete_blob_state.blob_key);
-        EXPECT_EQ(removals[pos].expected_token, *redelete_blob_state.live_token);
+        const auto & redelete_blob_state = redelete_blob_states[chunks.front().blob_state_indices[pos]];
+        EXPECT_EQ(conditional_removals[pos].key, redelete_blob_state.blob_key);
+        EXPECT_EQ(conditional_removals[pos].expected_token, *redelete_blob_state.live_token);
     }
 }
 
@@ -1305,13 +1305,13 @@ TEST(CASGCConditionalDeleteChunks, ChunksAreBoundedByChunkKeys)
         redelete_blob_states.push_back(liveRedeleteBlobState(*op, key));
 
     EXPECT_EQ(
-        chunkIndices(Gc::prepareConditionalDeleteChunks(redelete_blob_states, 2)),
+        chunkBlobStateIndices(Gc::prepareConditionalDeleteChunks(redelete_blob_states, 2)),
         (std::vector<std::vector<size_t>>{{0, 1}, {2, 3}, {4}}));
     EXPECT_EQ(
-        chunkIndices(Gc::prepareConditionalDeleteChunks(redelete_blob_states, 1)),
+        chunkBlobStateIndices(Gc::prepareConditionalDeleteChunks(redelete_blob_states, 1)),
         (std::vector<std::vector<size_t>>{{0}, {1}, {2}, {3}, {4}}));
     EXPECT_EQ(
-        chunkIndices(Gc::prepareConditionalDeleteChunks(redelete_blob_states, 5)),
+        chunkBlobStateIndices(Gc::prepareConditionalDeleteChunks(redelete_blob_states, 5)),
         (std::vector<std::vector<size_t>>{{0, 1, 2, 3, 4}}));
 }
 
