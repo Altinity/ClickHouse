@@ -3,15 +3,41 @@
 #include <base/defines.h>
 #include <base/types.h>
 #include <cstdint>
+#include <optional>
+#include <string_view>
 
 namespace DB::Cas
 {
 
-/// The per-dialect grammar a response value must meet to be an incarnation. Generation: canonical
+/// Two grammar levels. `isIncarnationValue` is the control-key grammar: what a response value must meet to
+/// be usable as a precondition at all (a weak ETag passes). `canonicalIdentity` is the stricter blob-identity
+/// grammar: what may stand for one incarnation of a blob body, spelled one way.
+///
+/// `isIncarnationValue` per dialect. Generation: canonical
 /// positive decimal (no leading zero, not "0" -- zero is the dialect's absence sentinel). ETag:
 /// non-empty, not "*" after trimming whitespace, no comma (a list matches any member). Emulated:
 /// non-empty. `ObjectStorageBackend::isValidTokenValue` forwards here.
 bool isIncarnationValue(Dialect dialect, const String & value);
+
+/// An incarnation in one spelling: the dialect and the opaque tag in lowercase hex. A quoted and a bare
+/// ETag of the same tag are equal; no case folding.
+struct CanonicalIdentity
+{
+    Dialect dialect;
+    String tag_hex;
+    bool operator==(const CanonicalIdentity &) const = default;
+};
+
+std::string_view dialectWord(Dialect dialect);   /// "etag" | "generation" | "emulated"
+std::optional<Dialect> dialectFromWord(std::string_view word);
+
+/// Nothing for a value that cannot name a blob incarnation (weak, empty, wildcard, list, control bytes,
+/// over 128 bytes; a generation outside `[1-9][0-9]{0,19}`).
+std::optional<CanonicalIdentity> canonicalIdentity(Dialect dialect, std::string_view raw_value);
+
+/// Inverse of the `tag_hex` spelling, for key parsing: the opaque tag, or nothing when `tag_hex` is not
+/// lowercase even-length hex of a tag that `canonicalIdentity` accepts.
+std::optional<String> opaqueTagFromHex(Dialect dialect, std::string_view tag_hex);
 
 /// One backend-observed incarnation of an object: the transport's own value naming that incarnation,
 /// together with the backend and key it was observed against. "Etag" names the ROLE this value plays
@@ -32,6 +58,7 @@ public:
     const String & key() const { return key_; }
     Dialect dialect() const { return dialect_; }
     uint64_t backendId() const { return backend_id_; }
+    std::optional<CanonicalIdentity> canonical() const;
 
 private:
     friend class CasRequests;
@@ -73,7 +100,12 @@ struct PersistedEtag
 
     static PersistedEtag capture(const Etag & live);
     bool matches(const Etag & live) const;
+    /// Nothing for an unknown dialect word or a value that is not an identity.
+    std::optional<CanonicalIdentity> canonical() const;
 };
+
+/// True when both spellings canonicalise and are equal.
+bool sameIncarnation(const PersistedEtag & row, const Etag & live);
 
 inline PersistedEtag PersistedEtag::capture(const Etag & live)
 {
