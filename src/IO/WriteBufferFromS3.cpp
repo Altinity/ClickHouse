@@ -227,12 +227,12 @@ void WriteBufferFromS3::finalizeImpl()
     chassert(offset() == 0);
     chassert(hidden_size == 0);
 
-    task_tracker->waitAll();
-
-    span.addAttributeIfNotZero("clickhouse.multipart_upload_parts", multipart_tags.size());
-
     try
     {
+        task_tracker->waitAll();
+
+        span.addAttributeIfNotZero("clickhouse.multipart_upload_parts", multipart_tags.size());
+
         if (request_settings[S3RequestSetting::check_objects_after_upload])
         {
             S3::checkObjectExists(*client_ptr, bucket, key, {}, "Immediately after upload");
@@ -247,8 +247,11 @@ void WriteBufferFromS3::finalizeImpl()
     }
     catch (...)
     {
-        /// The upload already replaced the object. Drop any identity cached for the previous one.
-        if (on_upload_complete)
+        /// `PutObject` or `CompleteMultipartUpload` may have committed the object even when this
+        /// request failed (a lost response is reported as an error). Drop the cached identity so the
+        /// next read does not send the previous ETag. A part upload that failed before either request
+        /// leaves `object_creation_request_sent` false: the visible object is unchanged.
+        if (object_creation_request_sent && on_upload_complete)
             on_upload_complete();
         throw;
     }
@@ -720,6 +723,9 @@ bool WriteBufferFromS3::completeMultipartUpload()
             ProfileEvents::increment(ProfileEvents::DiskS3CompleteMultipartUpload);
 
         Stopwatch watch;
+        /// Set before the call. A failure after S3 has committed the upload must still be visible to
+        /// `finalizeImpl`, which drops the cached identity only once this request has been sent.
+        object_creation_request_sent = true;
         auto outcome = object_creation_client->CompleteMultipartUpload(req);
         auto elapsed = watch.elapsedMicroseconds();
 
@@ -826,6 +832,8 @@ void WriteBufferFromS3::makeSinglepartUpload(WriteBufferFromS3::PartData && data
             CurrentThread::WriteThrottlingScope write_throttling_scope(write_settings.remote_throttler);
 
             Stopwatch watch;
+            /// Set before the call. A lost `PutObject` response can still have replaced the object.
+            object_creation_request_sent = true;
             auto outcome = object_creation_client->PutObject(request);
             auto elapsed = watch.elapsedMicroseconds();
 

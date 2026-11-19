@@ -107,6 +107,9 @@ private:
     /// finalize barrier (happens-before), so no extra synchronization is needed.
     std::optional<String> object_etag;
     OnUploadComplete on_upload_complete;
+    /// Set by the upload worker immediately before `PutObject` or `CompleteMultipartUpload`. A lost
+    /// response can still have committed the object. Read after `waitAll` (happens-before).
+    bool object_creation_request_sent = false;
     LoggerPtr log = getLogger("WriteBufferFromS3");
     LogSeriesLimiterPtr limited_log = std::make_shared<LogSeriesLimiter>(log, 1, 5);
 

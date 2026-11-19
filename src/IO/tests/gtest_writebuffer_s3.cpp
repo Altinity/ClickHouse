@@ -811,7 +811,10 @@ public:
         return *async_policy;
     }
 
-    std::unique_ptr<WriteBufferFromS3> getWriteBuffer(String file_name = "file", const WriteSettings & write_settings = {})
+    std::unique_ptr<WriteBufferFromS3> getWriteBuffer(
+        String file_name = "file",
+        const WriteSettings & write_settings = {},
+        WriteBufferFromS3::OnUploadComplete on_upload_complete = {})
     {
         S3::S3RequestSettings request_settings;
         request_settings.updateFromSettings(settings, /* if_changed */true, /* validate_settings */false);
@@ -829,7 +832,9 @@ public:
                     nullptr,
                     std::nullopt,
                     getAsyncPolicy().getScheduler(),
-                    write_settings);
+                    write_settings,
+                    nullptr,
+                    std::move(on_upload_complete));
     }
 
     void setInjectionModel(std::shared_ptr<MockS3::InjectionModel> injections_)
@@ -1066,6 +1071,35 @@ TEST_P(SyncAsync, ExceptionOnCreateMPU) {
       }, DB::S3Exception);
 }
 
+
+/// `CompleteMultipartUpload` can commit the object and still report an error (a lost response).
+/// `finalize` must run the upload callback before propagating that error, so the identity cache
+/// does not keep the previous ETag. A part-upload failure never sends the completing request and
+/// must not run the callback.
+TEST_P(SyncAsync, ExceptionOnCompleteMPURunsUploadCallback) {
+    setInjectionModel(std::make_shared<MockS3::CompleteMPUFailIngection>());
+
+    getSettings()[Setting::s3_max_single_part_upload_size] = 0; // no single part
+    getSettings()[Setting::s3_min_upload_part_size] = 1; // small parts are ok
+
+    size_t callbacks = 0;
+    EXPECT_THROW({
+        try {
+            auto buffer = getWriteBuffer("exception_on_complete_mpu_callback", {}, [&]() { ++callbacks; });
+            buffer->write('A');
+
+            getAsyncPolicy().setAutoExecute(true);
+            buffer->finalize();
+        }
+        catch(const DB::Exception & e)
+        {
+            ASSERT_EQ(ErrorCodes::S3_ERROR, e.code());
+            EXPECT_THAT(e.what(), testing::HasSubstr("CompleteMPUFailIngection"));
+            throw;
+        }
+      }, DB::S3Exception);
+    EXPECT_EQ(callbacks, 1u);
+}
 
 TEST_P(SyncAsync, ExceptionOnCompleteMPU) {
     setInjectionModel(std::make_shared<MockS3::CompleteMPUFailIngection>());
