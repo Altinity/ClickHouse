@@ -54,6 +54,11 @@ bool MetadataStorageFromCacheObjectStorage::appliesOperationsEagerly() const
     return underlying->appliesOperationsEagerly();
 }
 
+bool MetadataStorageFromCacheObjectStorage::allowsPackedParts() const
+{
+    return underlying->allowsPackedParts();
+}
+
 bool MetadataStorageFromCacheObjectStorage::areBlobPathsRandom() const
 {
     return underlying->areBlobPathsRandom();

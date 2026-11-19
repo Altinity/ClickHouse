@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <future>
 #include <map>
 #include <set>
 #include <optional>
@@ -69,6 +70,7 @@
 #include <IO/LongConnectionLimit.h>
 #include <IO/ConnectionTimeouts.h>
 #include <IO/S3Settings.h>
+#include <IO/SharedThreadPools.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/AzureBlobStorage/AzureBlobStorageCommon.h>
 #include <Disks/DiskLocal.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
@@ -719,6 +721,13 @@ struct ContextSharedPart : boost::noncopyable
     mutable std::unique_ptr<CompressionCodecSelector> compression_codec_selector;
     /// Storage disk chooser for MergeTree engines
     mutable std::shared_ptr<const DiskSelector> merge_tree_disk_selector TSA_GUARDED_BY(storage_policies_mutex);
+    /// Custom disks being created by `getOrCreateDisk`, by name
+    struct DiskCreation
+    {
+        std::shared_future<DiskPtr> result;
+        size_t waiters = 0;
+    };
+    mutable std::unordered_map<String, DiskCreation> disks_being_created TSA_GUARDED_BY(storage_policies_mutex);
     /// Storage policy chooser for MergeTree engines
     mutable std::shared_ptr<const StoragePolicySelector> merge_tree_storage_policy_selector TSA_GUARDED_BY(storage_policies_mutex);
 
@@ -969,6 +978,10 @@ struct ContextSharedPart : boost::noncopyable
                 tryLogCurrentException(__PRETTY_FUNCTION__);
             }
         }
+
+        /// A cancelled query does not wait for its AI requests. Their memory is tracked under the user trackers in
+        /// `process_list`, which is destroyed after this destructor body.
+        getAIRequestThreadPool().shutdown();
     }
 
     void setConfig(const ConfigurationPtr & config_value)
@@ -1453,6 +1466,7 @@ ContextData::ContextData(const ContextData &o) :
     is_background_operation(o.is_background_operation),
     is_ddl_or_on_cluster_internal(o.is_ddl_or_on_cluster_internal),
     is_recovery_from_stored_metadata(o.is_recovery_from_stored_metadata),
+    is_analyzing_background_expressions(o.is_analyzing_background_expressions),
     is_view_inner_query(o.is_view_inner_query),
     positional_arguments_already_resolved(o.positional_arguments_already_resolved),
     join_analyze_mode(o.join_analyze_mode),
@@ -2399,8 +2413,13 @@ std::shared_ptr<const ContextAccessWrapper> Context::getAccess() const
         /// If setUserID() was never called then this must be the global context with the full access.
         bool full_access = !user_id;
 
+        /// The row policies of the initial user are added to the row policies of the current user. The initiator of
+        /// a secondary query also forwards the current roles of the initial user (after `SET ROLE`); if the initial user
+        /// is the current user, the query still runs with the default roles of the user on a connection without
+        /// an interserver secret, so the row policies of the forwarded roles are needed then too.
         std::optional<UUID> initial_user_id;
-        if (client_info.initial_user != client_info.current_user)
+        if (client_info.initial_user != client_info.current_user
+            || (client_info.query_kind == ClientInfo::QueryKind::SECONDARY_QUERY && client_info.current_roles.has_value()))
             initial_user_id = getAccessControl().find<User>(client_info.initial_user);
 
         return ContextAccessParams{
@@ -3646,6 +3665,13 @@ void Context::clampToSettingsConstraintsWithLock(SettingsChanges & changes, Sett
         doSettingsSanityCheckClamp(*settings, getLogger("SettingsSanity"));
 }
 
+void Context::clampToSettingsConstraintsRejectingInvalidChangesWithLock(SettingsChanges & changes, SettingSource source)
+{
+    getSettingsConstraintsAndCurrentProfilesWithLock()->constraints.clampRejectingInvalidChanges(*settings, changes, source);
+    if (getApplicationType() == ApplicationType::LOCAL || getApplicationType() == ApplicationType::SERVER)
+        doSettingsSanityCheckClamp(*settings, getLogger("SettingsSanity"));
+}
+
 void Context::checkMergeTreeSettingsConstraintsWithLock(const MergeTreeSettings & merge_tree_settings, const SettingsChanges & changes) const
 {
     getSettingsConstraintsAndCurrentProfilesWithLock()->constraints.check(merge_tree_settings, changes);
@@ -3728,6 +3754,21 @@ void Context::clampToSettingsConstraints(SettingsChanges & changes, SettingSourc
 
     SharedLockGuard lock(mutex);
     clampToSettingsConstraintsWithLock(changes, source);
+}
+
+void Context::clampToSettingsConstraintsRejectingInvalidChanges(SettingsChanges & changes, SettingSource source)
+{
+    if (std::ranges::any_of(changes, isProfileChange))
+    {
+        changes = enforceConstraintsAlongProfileChanges(shared_from_this(), changes, [source](Context & context, SettingsChanges & segment)
+        {
+            context.clampToSettingsConstraintsRejectingInvalidChanges(segment, source);
+        });
+        return;
+    }
+
+    SharedLockGuard lock(mutex);
+    clampToSettingsConstraintsRejectingInvalidChangesWithLock(changes, source);
 }
 
 void Context::checkMergeTreeSettingsConstraints(const MergeTreeSettings & merge_tree_settings, const SettingsChanges & changes) const
@@ -5683,7 +5724,7 @@ BackgroundSchedulePoolPtr Context::getBufferFlushSchedulePool() const
         auto created_pool = BackgroundSchedulePool::create(
             shared->server_settings[ServerSetting::background_buffer_flush_schedule_pool_size],
             shared->server_settings[ServerSetting::background_schedule_pool_initial_size],
-            /*max_parallel_tasks_per_type*/ 0,
+            /*max_parallel_tasks_per_type_ratio*/ 0,
             CurrentMetrics::BackgroundBufferFlushSchedulePoolTask,
             CurrentMetrics::BackgroundBufferFlushSchedulePoolSize,
             ThreadName::BACKGROUND_BUFFER_FLUSH_SCHEDULE_POOL);
@@ -5744,9 +5785,6 @@ BackgroundTaskSchedulingSettings Context::getBackgroundStreamingTaskSchedulingSe
 
 BackgroundSchedulePoolPtr Context::getSchedulePool() const
 {
-    size_t max_parallel_tasks_per_type = static_cast<size_t>(
-        static_cast<double>(shared->server_settings[ServerSetting::background_schedule_pool_size])
-        * static_cast<double>(shared->server_settings[ServerSetting::background_schedule_pool_max_parallel_tasks_per_type_ratio]));
     callOnce(
         shared->schedule_pool_initialized,
         [&]
@@ -5754,7 +5792,7 @@ BackgroundSchedulePoolPtr Context::getSchedulePool() const
             auto created_pool = BackgroundSchedulePool::create(
                 shared->server_settings[ServerSetting::background_schedule_pool_size],
                 shared->server_settings[ServerSetting::background_schedule_pool_initial_size],
-                max_parallel_tasks_per_type,
+                static_cast<double>(shared->server_settings[ServerSetting::background_schedule_pool_max_parallel_tasks_per_type_ratio]),
                 CurrentMetrics::BackgroundSchedulePoolTask,
                 CurrentMetrics::BackgroundSchedulePoolSize,
                 DB::ThreadName::BACKGROUND_SCHEDULE_POOL);
@@ -5772,7 +5810,7 @@ BackgroundSchedulePoolPtr Context::getDistributedSchedulePool() const
         auto created_pool = BackgroundSchedulePool::create(
             shared->server_settings[ServerSetting::background_distributed_schedule_pool_size],
             shared->server_settings[ServerSetting::background_schedule_pool_initial_size],
-            /*max_parallel_tasks_per_type*/ 0,
+            /*max_parallel_tasks_per_type_ratio*/ 0,
             CurrentMetrics::BackgroundDistributedSchedulePoolTask,
             CurrentMetrics::BackgroundDistributedSchedulePoolSize,
             DB::ThreadName::DISTRIBUTED_SCHEDULE_POOL);
@@ -5790,7 +5828,7 @@ BackgroundSchedulePoolPtr Context::getMessageBrokerSchedulePool() const
         auto created_pool = BackgroundSchedulePool::create(
             shared->server_settings[ServerSetting::background_message_broker_schedule_pool_size],
             shared->server_settings[ServerSetting::background_schedule_pool_initial_size],
-            /*max_parallel_tasks_per_type*/ 0,
+            /*max_parallel_tasks_per_type_ratio*/ 0,
             CurrentMetrics::BackgroundMessageBrokerSchedulePoolTask,
             CurrentMetrics::BackgroundMessageBrokerSchedulePoolSize,
             DB::ThreadName::MSG_BROKER_SCHEDULE_POOL);
@@ -5808,7 +5846,7 @@ BackgroundSchedulePoolPtr Context::getIcebergSchedulePool() const
         auto created_pool = BackgroundSchedulePool::create(
             shared->server_settings[ServerSetting::iceberg_background_schedule_pool_size],
             shared->server_settings[ServerSetting::background_schedule_pool_initial_size],
-            /*max_parallel_tasks_per_type*/ 0,
+            /*max_parallel_tasks_per_type_ratio*/ 0,
             CurrentMetrics::IcebergSchedulePoolTask,
             CurrentMetrics::IcebergSchedulePoolSize,
             DB::ThreadName::ICEBERG_SCHEDULE_POOL);
@@ -5826,7 +5864,7 @@ BackgroundSchedulePoolPtr Context::getStreamingSchedulePool() const
         auto created_pool = BackgroundSchedulePool::create(
             shared->server_settings[ServerSetting::background_streaming_schedule_pool_size],
             shared->server_settings[ServerSetting::background_schedule_pool_initial_size],
-            /*max_parallel_tasks_per_type*/ 0,
+            /*max_parallel_tasks_per_type_ratio*/ 0,
             CurrentMetrics::BackgroundStreamingSchedulePoolTask,
             CurrentMetrics::BackgroundStreamingSchedulePoolSize,
             DB::ThreadName::BACKGROUND_STREAMING_SCHEDULE_POOL);
@@ -7534,25 +7572,116 @@ DiskPtr Context::getDisk(const String & name) const
 {
     std::lock_guard lock(shared->storage_policies_mutex);
 
+    return getDiskOrExplainCreation(lock, name);
+}
+
+DiskPtr Context::getDiskOrExplainCreation(std::lock_guard<std::mutex> & lock, const String & name) const TSA_REQUIRES(shared->storage_policies_mutex)
+{
     auto disk_selector = getDiskSelector(lock);
+    if (auto disk = disk_selector->tryGet(name))
+        return disk;
+
+    if (shared->disks_being_created.contains(name))
+        throw Exception(ErrorCodes::UNKNOWN_DISK, "Disk {} is being created by another request, retry when it is created", backQuote(name));
 
     return disk_selector->get(name);
 }
 
+namespace
+{
+
+/// All waiters of one creation get the same stored exception. Each rethrows its own copy, so a
+/// caller that modifies its exception (e.g. `addMessage`) does not race with the others.
+DiskPtr getDiskCreationResult(const std::shared_future<DiskPtr> & creation)
+{
+    try
+    {
+        return creation.get();
+    }
+    catch (...)
+    {
+        std::rethrow_exception(copyMutableException(std::current_exception()));
+    }
+}
+
+}
+
 DiskPtr Context::getOrCreateDisk(const String & name, DiskCreator creator) const
 {
-    std::lock_guard lock(shared->storage_policies_mutex);
-
-    auto disk_selector = getDiskSelector(lock);
-
-    auto disk = disk_selector->tryGet(name);
-    if (!disk)
+    std::promise<DiskPtr> promise;
+    std::shared_future<DiskPtr> creation;
+    bool is_creator = false;
+    DisksMap disks_map;
     {
-        disk = creator(getDisksMap(lock));
-        const_cast<DiskSelector *>(disk_selector.get())->addToDiskMap(name, disk);
+        std::lock_guard lock(shared->storage_policies_mutex);
+
+        auto disk_selector = getDiskSelector(lock);
+        if (auto disk = disk_selector->tryGet(name))
+            return disk;
+
+        if (auto it = shared->disks_being_created.find(name); it != shared->disks_being_created.end())
+        {
+            ++it->second.waiters;
+            creation = it->second.result;
+        }
+        else
+        {
+            disks_map = disk_selector->getDisksMap();
+            creation = promise.get_future().share();
+            shared->disks_being_created.emplace(name, ContextSharedPart::DiskCreation{creation, 0});
+            is_creator = true;
+        }
     }
 
+    if (!is_creator)
+        return getDiskCreationResult(creation);
+
+    /// A remote disk's startup can block on the network for a long time, so the creator runs without
+    /// `storage_policies_mutex`. Concurrent requests for the same name wait for this creation rather
+    /// than open the same storage a second time.
+    DiskPtr disk;
+    std::exception_ptr error;
+    try
+    {
+        disk = creator(disks_map);
+    }
+    catch (...)
+    {
+        error = std::current_exception();
+    }
+
+    {
+        std::lock_guard lock(shared->storage_policies_mutex);
+        shared->disks_being_created.erase(name);
+        if (!error)
+        {
+            try
+            {
+                const_cast<DiskSelector *>(getDiskSelector(lock).get())->addToDiskMap(name, disk);
+            }
+            catch (...)
+            {
+                error = std::current_exception();
+            }
+        }
+    }
+
+    /// Waiters get a copy so that the creator can modify its own exception while they read theirs.
+    if (error)
+        promise.set_exception(copyMutableException(error));
+    else
+        promise.set_value(disk);
+
+    if (error)
+        std::rethrow_exception(error);
     return disk;
+}
+
+size_t Context::getDiskCreationWaitersForTest(const String & name) const
+{
+    std::lock_guard lock(shared->storage_policies_mutex);
+    auto it = shared->disks_being_created.find(name);
+    return it == shared->disks_being_created.end() ? 0 : it->second.waiters;
 }
 
 StoragePolicyPtr Context::getStoragePolicy(const String & name) const
@@ -7562,6 +7691,15 @@ StoragePolicyPtr Context::getStoragePolicy(const String & name) const
     auto policy_selector = getStoragePolicySelector(lock);
 
     return policy_selector->get(name);
+}
+
+StoragePolicyPtr Context::tryGetStoragePolicy(const String & name) const
+{
+    std::lock_guard lock(shared->storage_policies_mutex);
+
+    auto policy_selector = getStoragePolicySelector(lock);
+
+    return policy_selector->tryGet(name);
 }
 
 StoragePolicyPtr Context::getStoragePolicyFromDisk(const String & disk_name) const
@@ -7574,8 +7712,7 @@ StoragePolicyPtr Context::getStoragePolicyFromDisk(const String & disk_name) con
 
     if (!storage_policy)
     {
-        auto disk_selector = getDiskSelector(lock);
-        auto disk = disk_selector->get(disk_name);
+        auto disk = getDiskOrExplainCreation(lock, disk_name);
         auto volume = std::make_shared<SingleDiskVolume>("_volume_" + disk_name, disk);
 
         static const auto move_factor_for_single_disk_volume = 0.0;
@@ -7654,16 +7791,21 @@ void Context::updateStorageConfiguration(const Poco::Util::AbstractConfiguration
     {
         std::lock_guard lock(shared->storage_policies_mutex);
         Strings disks_to_reinit;
+        NameSet disks_being_created;
+        for (const auto & [name, _] : shared->disks_being_created)
+            disks_being_created.insert(name);
         if (shared->merge_tree_disk_selector)
-            shared->merge_tree_disk_selector
-                = shared->merge_tree_disk_selector->updateFromConfig(config, "storage_configuration.disks", shared_from_this());
+        {
+            shared->merge_tree_disk_selector = shared->merge_tree_disk_selector->updateFromConfig(
+                config, "storage_configuration.disks", shared_from_this(), disks_being_created);
+        }
 
         if (shared->merge_tree_storage_policy_selector)
         {
             try
             {
                 shared->merge_tree_storage_policy_selector = shared->merge_tree_storage_policy_selector->updateFromConfig(
-                    config, "storage_configuration.policies", shared->merge_tree_disk_selector, disks_to_reinit);
+                    config, "storage_configuration.policies", shared->merge_tree_disk_selector, disks_to_reinit, disks_being_created);
             }
             catch (Exception & e)
             {
@@ -8373,6 +8515,9 @@ void Context::setCurrentAddress(const Poco::Net::SocketAddress & current_address
 
 void Context::setInitialUserName(const String & initial_user_name)
 {
+    /// The forwarded current roles are the roles of the initial user, so they cannot be kept for another user.
+    if (client_info.initial_user != initial_user_name)
+        client_info.current_roles.reset();
     client_info.initial_user = initial_user_name;
     need_recalculate_access = true;
 }
@@ -9226,7 +9371,8 @@ AIQuotaTrackerPtr Context::getAIQuotaTracker() const
             settings_ref[Setting::ai_function_max_input_tokens_per_query],
             settings_ref[Setting::ai_function_max_output_tokens_per_query],
             settings_ref[Setting::ai_function_max_api_calls_per_query],
-            settings_ref[Setting::ai_function_throw_on_quota_exceeded]);
+            settings_ref[Setting::ai_function_throw_on_quota_exceeded],
+            query_context->process_list_elem);
     }
     return query_context->ai_quota_tracker;
 }

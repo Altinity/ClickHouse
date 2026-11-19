@@ -25,6 +25,7 @@ SETTINGS disk = disk(
     type = object_storage,
     object_storage_type = local,
     metadata_type = cas,
+    cas_unsafe_remount_no_delay = 1,
     cas_server_root_id = '${CLICKHOUSE_DATABASE}_05010',
     name = '${CLICKHOUSE_DATABASE}_05010_cas_mounts_gc_health',
     path = '${CLICKHOUSE_DATABASE}_05010_cas_mounts_gc_health_pool/',

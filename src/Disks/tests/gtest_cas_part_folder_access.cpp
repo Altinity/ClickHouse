@@ -273,7 +273,7 @@ TEST(CASPartFolderAccess, GetViewFailsClosedOnMissingBody)
     const auto id = publishPart(store, ns, "part_1", {inlineEntry("checksums.txt", "cs")});
 
     /// Physically delete the live manifest body (a protocol violation). Retention is off and the
-    /// decode cache is cold (promote reads the body through the backend, not the reader), so every
+    /// decode cache is cold (publishing reads nothing through the reader), so every
     /// getView mode reaches the reader's miss path: one GET, no HEAD, FILE_DOESNT_EXIST.
     deleteManifestBody(*backend, layout, id);
     backend->resetCounts();
@@ -1492,6 +1492,28 @@ TEST(CASPartFolderAccess, MoveRefExactAbortsOnDestinationPrecommit)
     expectThrowsCode(DB::ErrorCodes::CAS_OWNERSHIP_CONFLICT, [&] { access.moveRefExact({ns, "src"}, {ns, "dst"}, m); });
     prepared.abort();
     EXPECT_TRUE(access.existsRef({ns, "src"}, Cas::Freshness::ForceFresh));
+}
+
+/// The audit event is emitted after the Move or drop landed; a sink that throws loses the row, never the mutation.
+TEST(CASPartFolderAccess, AuditSinkFailureDoesNotFailTheDurableMoveOrDrop)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store);
+    publishPart(store, ns, "src", {inlineEntry("f", "v1")});
+    const auto m = access.resolve({ns, "src"}, Cas::Freshness::ForceFresh)->manifest_id.ref;
+    std::vector<Cas::CasEventType> seen;
+    store->setEventSink([&](Cas::CasEvent e) { seen.push_back(e.type); throw std::runtime_error("audit sink is down"); });
+
+    EXPECT_TRUE(access.moveRefExact({ns, "src"}, {ns, "dst"}, m));
+    EXPECT_FALSE(access.existsRef({ns, "src"}, Cas::Freshness::ForceFresh));
+    EXPECT_TRUE(access.existsRef({ns, "dst"}, Cas::Freshness::ForceFresh));
+    EXPECT_EQ(access.dropRefExact({ns, "dst"}, m), Cas::Removal::Removed);
+    EXPECT_FALSE(access.existsRef({ns, "dst"}, Cas::Freshness::ForceFresh));
+    EXPECT_EQ(std::ranges::count(seen, Cas::CasEventType::RefMove), 1) << "the move's audit event reached the sink";
+    EXPECT_EQ(std::ranges::count(seen, Cas::CasEventType::RefDrop), 1) << "the drop's audit event reached the sink";
+    store->setEventSink(nullptr);
 }
 
 TEST(CASPartFolderAccess, SecondMoveFailureLeavesFirstMoved)

@@ -295,14 +295,4 @@ void DataPartStorageOnDiskFull::commitTransaction()
     FailPointInjection::pauseFailPoint(FailPoints::part_storage_pause_after_commit_transaction);
 }
 
-void DataPartStorageOnDiskFull::checkpointTransaction()
-{
-    /// A content-addressed part is published once, as a whole, by its final commit: a mid-build
-    /// commit would publish the files written so far as a separate partial part.
-    if (isContentAddressed())
-        return;
-
-    IDataPartStorage::checkpointTransaction();
-}
-
 }

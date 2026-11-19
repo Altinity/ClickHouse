@@ -95,13 +95,17 @@ enum class CasOpAdmission : uint8_t
 ///   - `lifecycle`      — one of `live` / `not_live` / `identity_lost` / `vanished` (a live pool), or
 ///                        `constructing` / `shutdown` (no pool published).
 ///   - `reason`         — the ENUM-CLEAN sub-state word: `replaced` / `forgotten` for a
-///                        `vanished` pool, empty otherwise. Kept a small closed vocabulary so a downstream
+///                        `vanished` pool, `lease_expired` for a `not_live` row whose pool is `Live` but
+///                        whose lease has too little time left to admit a write, empty otherwise. Kept a
+///                        small closed vocabulary so a downstream
 ///                        `lifecycle || '(' || reason || ')'` yields e.g. exactly `vanished(forgotten)` —
 ///                        the [D5] free text lives in `detail`, never here.
 ///   - `detail`         — the full [D5] reason text naming the actual failure (the replaced
 ///                        diagnosis, the timestamped `FORGET` message, or the identity-loss message); spec §1
-///                        requires it appear verbatim in the snapshot. Empty while `live` and for a null pool.
-///   - `since`          — wall-clock second the current non-`live` state was entered; 0 while `live`/no pool.
+///                        requires it appear verbatim in the snapshot. Empty while `live`, for
+///                        `lease_expired`, and for a null pool.
+///   - `since`          — wall-clock second the current non-`live` state was entered (for
+///                        `lease_expired`, when writes paused); 0 while `live`/no pool.
 ///   - `pool_id`        — last-known pool UUID (empty before the first `startup`); the disk stays
 ///                        introspectable under its identity even once the pool is gone.
 ///   - `server_root_id` — this server's node-local root id owning the mount slot.
@@ -361,8 +365,9 @@ public:
     /// at ITS `server_root_id` (`liveNamespace` builds every live/detached namespace as
     /// `<server_root_id>/<mirrored table dir>`). Factory-class: I/O-free, ungated, never throws.
     bool ownsNamespace(const String & other_server_root_id, const String & root_namespace) const override;
-    /// Gate 1 of the relink confirm, forwarded to the pool's ref ledger. Answers `Unknown` for an
-    /// unparsable token and for a disk that has not started or has reached a terminal lifecycle.
+    /// Gate 1 of the relink confirm, forwarded to the pool. Answers `Unknown` for an unparsable token,
+    /// for a failed mount-slot read, and for a disk that has not started or has reached a terminal
+    /// lifecycle. A ledger `Yes` costs at most one mount-slot `GET`; every other ledger answer costs none.
     CasConfirmAnswer confirmExactRef(const String & root_namespace, const String & ref_name,
                                      const String & manifest_ref_text) const override;
     /// Returns the canonical encoded manifest for a committed part plus the confirm token minted from
@@ -398,9 +403,10 @@ public:
     /// Returns the underlying object storage for an S3 staging writer. It is meaningful only when
     /// `stagingBackend` is `S3`.
     const ObjectStoragePtr & objectStorage() const { return object_storage; }
-    /// Returns the physical `pool_prefix/staging/server_root_id` prefix for this mount's staging
-    /// area. Callers append a unique leaf.
+    /// The physical `Cas::Layout::stagingPrefix` of this mount's staging area, with a trailing `/`.
     String stagingKeyPrefix() const;
+    /// The physical `Cas::Layout::stagingKey` of one staged upload of this mount.
+    String stagingKey(uint64_t writer_epoch, const String & leaf) const;
 
     /// Bytes that live INSIDE pool metadata rather than as their own object: an Inline-placement
     /// manifest tree entry, or a verbatim namespace file. nullopt = the path is blob-backed (a real
@@ -673,6 +679,7 @@ private:
     /// Startup-only margin validated against the mount lease TTL; feeds
     /// `Cas::PoolConfig::cas_request_budget.lease_safety_margin_ms`.
     const uint64_t cas_lease_safety_margin_ms;
+    const uint64_t cas_request_window_ms;
     /// Configured staging backend; `Local` preserves the existing write path.
     const Cas::StagingBackend staging_backend;
     /// Blob content-hash function passed to `Cas::PoolConfig`.

@@ -4,29 +4,35 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobHashingWriteBuffer.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasByteBudget.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
+#include <Common/LoggingHelpers.h>
 #include <Common/logger_useful.h>
 #include <Common/ProfileEvents.h>
 #include <Common/thread_local_rng.h>
 #include <Common/config_version.h>
 #include <base/defines.h>
+#include <base/scope_guard.h>
 #include <fmt/format.h>
 #include <algorithm>
 #include <chrono>
+#include <exception>
 
 namespace ProfileEvents
 {
     extern const Event CASBlobBodyPutAvoided;
+    extern const Event CASBlobPublishAttemptFailed;
+    extern const Event CASBlobPublishGaveUp;
     extern const Event CASBlobAdoptTrusted;
     extern const Event CASMetaPut;
     extern const Event CASMetaCompareSwap;
     extern const Event CASMetaCreateClean;
-    extern const Event CASMetaAdoptBackfill;
+    extern const Event CASMetaAbsentRepublish;
     extern const Event CASMetaResurrectClean;
 }
 
@@ -54,7 +60,6 @@ namespace
 
 /// Backpressure caps, enforced fail-closed in stageManifest before the body write returns.
 constexpr uint64_t kMaxManifestEntries = 1048576;
-constexpr uint64_t kMaxManifestEncodedBytes = 256ULL << 20;        /// 256 MiB
 constexpr uint64_t kMaxManifestInlineBytesTotal = 16ULL << 20;     /// 16 MiB
 constexpr uint64_t kMaxLargestInlineEntryBytes = 1ULL << 20;       /// 1 MiB
 
@@ -65,6 +70,20 @@ UInt128 mintU128()
     const UInt64 hi = thread_local_rng();
     const UInt64 lo = thread_local_rng();
     return (static_cast<UInt128>(hi) << 64) | lo;
+}
+
+/// Rate-limited, because under an outage every blob of every write fails here; the counter has them all.
+/// The first failure is routine and the next attempt usually succeeds, so only a repeat is a warning.
+void recordFailedPublicationAttempt(
+    const String & key, BlobPublicationTransport transport, int attempt, int max_attempts, const String & error)
+{
+    ProfileEvents::increment(ProfileEvents::CASBlobPublishAttemptFailed);
+    LogSeriesLimiter log(getLogger("CasBlobPublishAttempt"), /*allowed_count=*/5, /*interval_s=*/30);
+    const char * transport_name = transport == BlobPublicationTransport::Streaming ? "streaming" : "server-side copy";
+    if (attempt == 0)
+        LOG_INFO(log, "Publication of CAS blob {} ({}) failed, attempt {} of {}: {}", key, transport_name, attempt + 1, max_attempts, error);
+    else
+        LOG_WARNING(log, "Publication of CAS blob {} ({}) failed, attempt {} of {}: {}", key, transport_name, attempt + 1, max_attempts, error);
 }
 
 bool isDeterministicBlobPublicationFailure(const std::exception & error)
@@ -385,6 +404,14 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
     };
 
     constexpr int max_publication_attempts = 8;
+    /// Every exit by exception after a failed attempt gave up on the blob, the attempt cap and the
+    /// loop's deadline alike.
+    int failed_attempts = 0;
+    const int exceptions_at_entry = std::uncaught_exceptions();
+    SCOPE_EXIT({
+        if (failed_attempts > 0 && std::uncaught_exceptions() > exceptions_at_entry)
+            ProfileEvents::increment(ProfileEvents::CASBlobPublishGaveUp);
+    });
     for (int attempt = 0; attempt < max_publication_attempts; ++attempt)
     {
         requireAlive();
@@ -420,22 +447,10 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             if (loaded)
                 validateMetaSize(loaded->meta);
 
-            if (!loaded || loaded->meta.state == MetaState::Clean)
+            /// Only a `Clean` marker read after the `HEAD` permits adoption. GC deletes the marker right
+            /// after the body, so an absent marker may mean the body this `HEAD` saw is already gone.
+            if (loaded && loaded->meta.state == MetaState::Clean)
             {
-                /// Observation can produce durable metadata and dependency readiness too.
-                requireAdmitted("after the mandatory `HEAD`");
-                if (!loaded)
-                {
-                    /// A backfilled marker is a point-read hint for the next observer, so a competing
-                    /// writer that got there first settles the same question: its outcome is not read.
-                    ProfileEvents::increment(ProfileEvents::CASMetaAdoptBackfill);
-                    putMetaIfAbsent(
-                        op,
-                        store->layout(),
-                        ref,
-                        BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = logical_size},
-                        policy);
-                }
                 requireAdmitted("before the body-put-avoided observation is recorded");
                 ProfileEvents::increment(ProfileEvents::CASBlobBodyPutAvoided);
                 EventEmitter{*store}.emit([&](CasEvent & event)
@@ -445,7 +460,7 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
                     event.object_hash = blobIdOf(ref);
                     event.token = present->etag.render();
                     event.outcome = "observed";
-                    event.reason = "a present non-condemned blob was observed after mandatory `HEAD`";
+                    event.reason = "a present blob with a `Clean` marker was observed after mandatory `HEAD`";
                     event.detail = {{"action", "observed"}, {"size", std::to_string(source.size)}};
                 });
                 requireAdmitted("before the observed dependency proof is returned");
@@ -454,7 +469,10 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
                     BlobDepRecord{ObjectKind::Blob, BlobDependencyProof::Materialized, source.size},
                     BlobUploadDiagnostics{BlobMaterializationAction::Observed, std::nullopt, std::nullopt}};
             }
-            reason = BlobPublicationReason::Condemned;
+            if (loaded)
+                reason = BlobPublicationReason::Condemned;
+            else
+                ProfileEvents::increment(ProfileEvents::CASMetaAbsentRepublish);
         }
 
         const bool first_publication = source.beginPublication();
@@ -485,8 +503,9 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             /// re-publishes the same `incarnation_tag`, so on a content-derived-ETag dialect the
             /// republished body carries the incarnation GC condemned and the exact-incarnation delete
             /// would remove a live body. Every physical publication therefore mints its own envelope --
-            /// each iteration of this loop builds one. The verbatim staged copy is additionally a
-            /// once-only privilege `beginPublication` spends.
+            /// each iteration of this loop builds one. The verbatim staged copy is additionally
+            /// once-only per staging object: `beginPublication` spends a flag that the caller shares
+            /// among every source over that object.
             op.publish(BlobPublishRequest{key, std::move(publication)}, publication_policy);
         }
         catch (const std::exception & error)
@@ -495,6 +514,8 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             /// every further request of this operation refuses the same way.
             if (isDeterministicBlobPublicationFailure(error) || !op.admitted())
                 throw;
+            ++failed_attempts;
+            recordFailedPublicationAttempt(key, transport, attempt, max_publication_attempts, error.what());
             if (attempt + 1 == max_publication_attempts)
                 throwCasWriteRetryLater(fmt::format(
                     "PartWriteTxn::ensureBlobPresent: publication of {} remained ambiguous after {} "
@@ -506,6 +527,9 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
         }
         catch (...)
         {
+            ++failed_attempts;
+            recordFailedPublicationAttempt(
+                key, transport, attempt, max_publication_attempts, getCurrentExceptionMessage(/*with_stacktrace=*/false));
             if (attempt + 1 == max_publication_attempts)
                 throwCasWriteRetryLater(fmt::format(
                     "PartWriteTxn::ensureBlobPresent: publication of {} remained ambiguous after {} "
@@ -526,7 +550,7 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             event.object_hash = blobIdOf(ref);
             event.outcome = "published";
             event.reason = reason == BlobPublicationReason::Absent
-                ? "blob was absent after mandatory `HEAD`"
+                ? "blob or its marker was absent after mandatory `HEAD`"
                 : "blob was present but `Condemned` after mandatory `HEAD`";
             event.detail = {
                 {"action", "published"},
@@ -582,6 +606,33 @@ RootNamespace PartWriteTxn::manifestNamespace() const
     return RootNamespace{intended.substr(0, slash)};
 }
 
+String describeManifestPutGiveUp(const GaveUp & gave_up)
+{
+    const bool lease = gave_up.deadline_source == GaveUp::Source::Lease;
+    switch (gave_up.why)
+    {
+        case GaveUp::Why::FenceLost:
+            return "was refused: this server no longer holds the mount it was admitted under";
+        case GaveUp::Why::Deadline:
+            if (gave_up.sent_any)
+                return fmt::format(
+                    "is UNCERTAIN: {} attempt(s) sent, none conclusive by the {} deadline; the body may have landed",
+                    gave_up.attempts_sent, lease ? "lease" : "policy");
+            if (lease)
+                return "was not sent: the mount lease has too little time left, so writes are paused";
+            return "was not sent: the request window ran out before the first attempt";
+        case GaveUp::Why::Unresolved:
+            if (gave_up.sent_any)
+                return fmt::format(
+                    "is UNCERTAIN: {} attempt(s) sent and the resolving read did not complete ({}); the body may have landed",
+                    gave_up.attempts_sent, detail::renderObservation(gave_up.last_seen));
+            return fmt::format(
+                "was not sent: a read of the current object did not complete ({})",
+                detail::renderObservation(gave_up.last_seen));
+    }
+    UNREACHABLE();
+}
+
 ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
 {
     requireAlive();
@@ -618,20 +669,35 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
 
     /// Build the body. payload_digest is integrity/debug only — never a key, never dedup, never
     /// in-degree. The body repeats its own ref + namespace for fail-closed RefMatchesBody /
-    /// ManifestNamespaceMatches at read/fold/promote time.
+    /// ManifestNamespaceMatches at read and fold time.
     const RootNamespace owning_ns = manifestNamespace();
     PartManifest body;
     body.ref = ref;
     body.root_namespace_id = owning_ns;
     body.entries = std::move(entries);
     body.payload_digest = computePayloadDigest(body);
-    /// The cap is measured over the canonical text before sealing, not the compressed PUT bytes.
-    /// 256 MiB comfortably bounds the largest realistic manifest, including its JSON structure.
-    const String encoded_text = encodePartManifest(body);
-    if (encoded_text.size() > kMaxManifestEncodedBytes)
-        throw Exception(ErrorCodes::LIMIT_EXCEEDED,
-            "stageManifest: encoded manifest {} bytes exceeds cap {}", encoded_text.size(), kMaxManifestEncodedBytes);
-    const String encoded = sealObject(FormatId::PartManifest, encoded_text);
+    /// The cap is the readers' own object cap, measured over the canonical text before sealing, not the
+    /// compressed PUT bytes.
+    String encoded;
+    {
+        /// Scoped so the text is freed before the decode below.
+        const String encoded_text = encodePartManifest(body);
+        const uint64_t object_cap = traitsFor(FormatId::PartManifest).object_cap;
+        if (!fitsObjectCap(encoded_text.size(), /*entries_reservation*/ 0, object_cap))
+            throw Exception(ErrorCodes::LIMIT_EXCEEDED,
+                "stageManifest: encoded manifest {} bytes exceeds cap {}", encoded_text.size(), object_cap);
+        encoded = sealObject(FormatId::PartManifest, encoded_text);
+    }
+
+    /// Decode with the readers' own decoder, so that nothing a reader would reject is written, and so that
+    /// `promote` can take its leaves from here instead of reading the body back.
+    auto leaves = std::make_shared<std::vector<BlobRef>>();
+    {
+        const PartManifest validated = decodePartManifest(openObject(FormatId::PartManifest, encoded));
+        for (const ManifestEntry & e : validated.entries)
+            if (e.placement == EntryPlacement::Blob)
+                leaves->push_back(e.ref);
+    }
 
     const ManifestId id{owning_ns, ref};
     const String key = store->layout().manifestKey(id);
@@ -671,11 +737,11 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
         /// Unlike the ref-log lane there is nothing to wedge: this id was never named by any owner
         /// transition (`next_manifest_ordinal` is already past it, so no re-stage ever reuses the key),
         /// and a late-landing body is inert unreferenced debris for the orphan-manifest sweep.
-        [&](GaveUp &) -> Etag
+        [&](GaveUp & gave_up) -> Etag
         {
             throwCasWriteRetryLater(fmt::format(
-                "stageManifest: part-manifest PUT at '{}' is UNCERTAIN (retry budget exhausted) — "
-                "nothing conclusive was named; the caller re-stages with a fresh ManifestId", key));
+                "stageManifest: part-manifest PUT at '{}' {}; the caller re-stages with a fresh ManifestId",
+                key, describeManifestPutGiveUp(gave_up)));
         }},
         staged);
 
@@ -690,7 +756,7 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
     });
 
     staged_manifests.push_back(id);
-    staged_manifest_ids.insert(id);   /// A3 mint-tightening: `precommitAdd`'s only legal fresh-ownership source
+    staged_manifest_leaves.emplace(id, std::move(leaves));
     return id;
 }
 
@@ -707,17 +773,19 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
 
     /// A3 mint-tightening (ABA barrier for the relink confirm's exact-`ManifestRef` equality): an
     /// unowned `ManifestId` may enter ownership only from the transaction that freshly staged it.
-    /// Evaluated HERE (synchronously, off this transaction's own private `staged_manifest_ids` --
+    /// Evaluated HERE (synchronously, off this transaction's own private `staged_manifest_leaves` --
     /// never mutated concurrently, so no snapshot races) rather than read live inside the closure
     /// below, because it does not depend on ledger state at all. The bool is captured BY VALUE into
     /// the closure -- consistent with every other capture there -- rather than capturing `this`,
     /// which would let a closure that outlives this stack (see the capture comment below) dereference
     /// a dead transaction. Enforcement, however, is NOT done here: see the closure for why.
-    const bool id_staged_by_this_txn = staged_manifest_ids.contains(id);
+    const bool id_staged_by_this_txn = staged_manifest_leaves.contains(id);
 
     /// One `owner_transition` create-precommit op.
-    /// No body HEAD — a missing body is a legal fail-closed, non-activating intent, unchanged from the
-    /// old protocol. Precommit ownership carries NO separate build token: `id.ref` (writer_epoch,
+    /// No body HEAD: a fresh id comes only from this transaction's `stageManifest`, which returns it only
+    /// after the body's create landed. A body deleted later is noticed by GC only while it folds the
+    /// precommit edge, and afterwards by readers and fsck.
+    /// Precommit ownership carries NO separate build token: `id.ref` (writer_epoch,
     /// build_sequence, manifest_ordinal) IS the build identity (the tuple
     /// §Transaction Log Format: "there is no second build token"). `build_ops` is invoked from inside
     /// the per-namespace flush, so it sees the table's CURRENT state including any earlier item of the
@@ -744,7 +812,7 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
         /// and manifest id) rather than `[&]`: defense-in-depth so a closure that ever outlives this
         /// stack frame (e.g. if the append lane stranded its item) never dereferences a dead stack. The
         /// ref-lane leadership guard is the real fix; this makes the closure self-contained regardless.
-        [pool = store, target_ns, final_ref_name, id, id_staged_by_this_txn](const RefTableState & state) -> std::vector<RefOp>
+        [pool = store, target_ns, final_ref_name, id, id_staged_by_this_txn, txn_build_id = build_id](const RefTableState & state) -> std::vector<RefOp>
         {
             /// Idempotent re-add: the target ref is ALREADY committed to this EXACT manifest_ref (a
             /// legitimate re-drive calling precommitAdd+promote again for content that is already
@@ -769,9 +837,9 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
                 return {};
             if (!id_staged_by_this_txn)
                 throw Exception(ErrorCodes::LOGICAL_ERROR,
-                    "precommitAdd: manifest '{}' was not staged by this transaction and is not the current "
-                    "committed manifest of ref '{}' -- refusing to re-own a foreign or previously-dropped identity",
-                    manifestRefDebugString(id.ref), final_ref_name);
+                    "precommitAdd: manifest '{}' was not staged by this transaction (build {}) and is not the current "
+                    "committed manifest of ref '{}' in namespace '{}' -- refusing to re-own a foreign or previously-dropped identity",
+                    manifestRefDebugString(id.ref), u128ToHex(txn_build_id), final_ref_name, target_ns.string());
 
             std::vector<RefOp> ops;
             if (state.getLifecycle() != RefLifecycle::Live)
@@ -815,20 +883,8 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "promote: manifest namespace '{}' != target namespace '{}'",
             id.root_namespace.string(), target_ns.string());
-
-    /// Read + validate the manifest body ONCE (O(manifest entries), one streaming read). Absent or
-    /// invalid ⇒ fail closed: a committed ref must never name a missing/mismatched manifest.
-    const String manifest_key = store->layout().manifestKey(id);
-    CasOperation op = store->mountRequests().admit();
-    const auto body_got = op.read(manifest_key, Retry::standard());
-    if (!body_got)
-        throwCasWriteRetryLater(fmt::format(
-            "promote: manifest body absent at {} — failing closed (retry with a fresh ManifestId)", manifest_key));
-    const PartManifest body = decodePartManifest(openObject(FormatId::PartManifest, body_got->bytes));
-    if (!refMatchesBody(id.ref, body))
-        throwCasWriteRetryLater(fmt::format("promote: RefMatchesBody failed for {}", manifest_key));
-    if (!manifestNamespaceMatches(target_ns, body))
-        throwCasWriteRetryLater(fmt::format("promote: ManifestNamespaceMatches failed for {}", manifest_key));
+    if (promote_before_append_hook_for_test)
+        promote_before_append_hook_for_test();
 
     /// Blob readiness is checked inside the append closure below, after owner liveness. It consumes
     /// only this build's explicit dependency proofs and performs no backend copy-forward.
@@ -846,6 +902,9 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
     /// or a genuine first-time bind (no committed row -> true). Same in-closure-output pattern as
     /// `repoint_old` immediately below; read by the caller only after `appendRefOps` returns.
     bool created = false;
+    const auto staged_it = staged_manifest_leaves.find(id);
+    std::shared_ptr<const std::vector<BlobRef>> staged_leaves
+        = staged_it == staged_manifest_leaves.end() ? nullptr : staged_it->second;
     /// Recorded BEFORE the append for the same reason `precommitAdd` records its intent before its own:
     /// the append is the point past which failure stops being proof of the negative. Everything above
     /// this line is validation that rejects without publishing anything, so a throw there leaves
@@ -854,13 +913,13 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
     commit_state = CommitState::Uncertain;
     store->appendRefOps(target_ns, MutationScope::ref(final_ref_name),
         /// Capture the closure's INPUTS by value (ref name, manifest id, promote build id, repoint flag,
-        /// and the manifest `body` it revalidates) rather than `[&]`, as defense-in-depth against a
-        /// closure outliving this stack. Unlike `precommitAdd`, this closure cannot be made fully
-        /// self-contained: `dependencyProof` reads this build's `deps` member (so it must
-        /// keep `this`), and `repoint_old`/`created` are OUTPUTS read after the call returns (so they stay
-        /// references). The ref-lane leadership guard is the real fix; both residual by-reference captures
-        /// are safe because the guard guarantees the closure is never invoked after this frame unwinds.
-        [this, final_ref_name, id, promote_build_id, policy, body, &repoint_old, &created]
+        /// staged leaves) rather than `[&]`, as defense-in-depth against a closure outliving this stack.
+        /// Unlike `precommitAdd`, this closure cannot be made fully self-contained: `dependencyProof` reads
+        /// this build's `deps` member (so it must keep `this`), and `repoint_old`/`created` are OUTPUTS
+        /// read after the call returns (so they stay references). The ref-lane leadership guard is the real
+        /// fix; the residual by-reference state is safe because the guard guarantees the closure is never
+        /// invoked after this frame unwinds.
+        [this, target_ns, final_ref_name, id, promote_build_id, policy, staged_leaves, &repoint_old, &created]
         (const RefTableState & state) -> std::vector<RefOp>
         {
             created = !state.getCommitted().contains(final_ref_name);
@@ -873,6 +932,14 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             if (const auto it = state.getCommitted().find(final_ref_name);
                 it != state.getCommitted().end() && it->second.manifest_ref == id.ref)
                 return {};
+
+            /// The rule of `precommitAdd`, here because the leaves of a foreign id are unknown: without it a
+            /// foreign id whose precommit is live would commit with no leaf checked.
+            if (!staged_leaves)
+                throw Exception(ErrorCodes::LOGICAL_ERROR,
+                    "promote: manifest '{}' was not staged by this transaction (build {}) and is not the current committed "
+                    "manifest of ref '{}' in namespace '{}'",
+                    manifestRefDebugString(id.ref), u128ToHex(build_id), final_ref_name, target_ns.string());
 
             if (policy.expected)
             {
@@ -912,16 +979,14 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             /// build's precommit edge is durable — matching the relink trust model (ordinary
             /// ReplicatedMergeTree interserver trust). A genuinely-absent adopted blob is an invariant
             /// violation caught by fsck, not here.
-            for (const ManifestEntry & e : body.entries)
+            for (const BlobRef & leaf : *staged_leaves)
             {
-                if (e.placement != EntryPlacement::Blob)
-                    continue;
-                const auto proof = dependencyProof(e.ref);
+                const auto proof = dependencyProof(leaf);
                 if (!proof)
                     throw Exception(ErrorCodes::LOGICAL_ERROR,
                         "promote: blob leaf {} has no dependency proof at commit — a pending upload "
                         "never completed; failing closed",
-                        store->layout().blobKey(e.ref));
+                        store->layout().blobKey(leaf));
 
                 switch (*proof)
                 {
@@ -943,7 +1008,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
                         {
                             ev.type = CasEventType::BlobReuseAdopt;
                             ev.object_kind = CasEventObjectKind::Blob;
-                            ev.object_hash = blobIdOf(e.ref);
+                            ev.object_hash = blobIdOf(leaf);
                             ev.outcome = "adopt";
                             ev.reason = "manifest-trust";   /// distinguishable trusted-adopt class (empty token)
                         });
@@ -952,7 +1017,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
 
                 throw Exception(ErrorCodes::LOGICAL_ERROR,
                     "promote: blob leaf {} has an unnamed dependency proof at commit; failing closed",
-                    store->layout().blobKey(e.ref));
+                    store->layout().blobKey(leaf));
             }
 
             /// Refuse to overwrite a live committed ref that names a DIFFERENT manifest: that would orphan the
@@ -1025,7 +1090,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             e.object_hash = manifestRefDebugString(id.ref);
             e.token = u128ToHex(promote_build_id);
             e.outcome = "promoted";
-            e.reason = "promote: atomic owner move precommit(build_id) -> ref(final_ref_name) after fail-closed reval";
+            e.reason = "promote: atomic owner move precommit(build_id) -> ref(final_ref_name)";
             e.detail = {{"build_seq", std::to_string(build_seq)}};
         });
     }

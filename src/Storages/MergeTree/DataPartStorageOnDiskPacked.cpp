@@ -581,14 +581,6 @@ void DataPartStorageOnDiskPacked::commitTransaction()
     FailPointInjection::pauseFailPoint(FailPoints::part_storage_pause_after_commit_transaction);
 }
 
-void DataPartStorageOnDiskPacked::checkpointTransaction()
-{
-    if (isContentAddressed())
-        return;
-
-    IDataPartStorage::checkpointTransaction();
-}
-
 #if CLICKHOUSE_CLOUD
 TransactionCommitOutcomeVariant DataPartStorageOnDiskPacked::tryCommitTransaction(const TransactionCommitOptionsVariant & options)
 {
@@ -714,7 +706,8 @@ void DataPartStorageOnDiskPacked::resetReader(const ReadSettings & read_settings
     auto data_path = getRelativeDataPath();
     if (existsFileInTransactionOrDisk(data_path))
     {
-        auto buffer = readArchive(read_settings, std::nullopt);
+        /// Only the archive index is read here; a full-size (prefetching) buffer per part load is waste.
+        auto buffer = readArchive(read_settings.adjustBufferSize(4096), std::nullopt);
         reader.emplace(*buffer);
     }
 }
@@ -750,8 +743,12 @@ std::shared_ptr<const PackedFilesReader> DataPartStorageOnDiskPacked::getSkipInd
         {
             auto inner_archive_buf = reader->readFile(
                 readArchive(data_path, getReadSettings(), std::nullopt), String(SKIP_INDICES_PACKED_FILENAME));
-            auto inner_index = PackedFilesReader::readIndex(*inner_archive_buf);
-            seedSkipIndicesPackedReader(inner_index);
+            auto index = readSkipIndicesPackedIndex(*inner_archive_buf, data_path + "/" + String(SKIP_INDICES_PACKED_FILENAME));
+            {
+                std::lock_guard lock(skip_indices_packed_mutex);
+                skip_indices_packed_unsupported = !index;
+            }
+            seedSkipIndicesPackedReader(index ? *index : PackedFilesIO::Index{});
         }
         catch (const Exception &)
         {

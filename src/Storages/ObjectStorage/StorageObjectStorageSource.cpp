@@ -179,10 +179,16 @@ namespace
         return path.substr(0, position);
     }
 
+    String getObjectStorageHash(const IObjectStorage & object_storage)
+    {
+        const String description = object_storage.getDescription();
+        return sipHash128String(description.substr(0, description.find('?')) + '\0' + object_storage.getObjectsNamespace());
+    }
+
     String getPageCachePathForObjectStorage(const RelativePathWithMetadata & object_info, const ObjectStoragePtr & object_storage)
     {
         if (object_storage->getType() != ObjectStorageType::Web)
-            return "s3:" + object_info.getPath();
+            return fmt::format("s3:{}:{}", getObjectStorageHash(*object_storage), object_info.getPath());
 
         if (!object_info.read_source_index)
             return "web:" + object_info.getPath();
@@ -1074,7 +1080,7 @@ void StorageObjectStorageSource::addNumRowsToCache(const ObjectInfoPtr & object_
     schema_cache.addNumRows(cache_key, num_rows);
 }
 
-StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReader()
+StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReader(bool prefetch_input_format)
 {
     return createReader(
         0,
@@ -1090,7 +1096,8 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         max_block_size,
         parser_shared_resources,
         format_filter_info,
-        need_only_count);
+        need_only_count,
+        prefetch_input_format);
 }
 
 StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReader(
@@ -1107,7 +1114,8 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
     size_t max_block_size,
     FormatParserSharedResourcesPtr parser_shared_resources,
     FormatFilterInfoPtr format_filter_info,
-    bool need_only_count)
+    bool need_only_count,
+    bool prefetch_input_format)
 {
     ObjectInfoPtr object_info;
     auto query_settings = configuration->getQuerySettings(context_);
@@ -1705,6 +1713,9 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         if (effective_need_only_count)
             input_format->needOnlyCount();
 
+        if (prefetch_input_format)
+            input_format->prefetch();
+
         builder.init(Pipe(input_format));
 
         if (!identity_partition_columns.empty())
@@ -1919,7 +1930,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 
 std::future<StorageObjectStorageSource::ReaderHolder> StorageObjectStorageSource::createReaderAsync()
 {
-    return create_reader_scheduler([=, this] { return createReader(); }, Priority{});
+    return create_reader_scheduler([=, this] { return createReader(/* prefetch_input_format */ true); }, Priority{});
 }
 
 std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
@@ -2072,6 +2083,7 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
         else
         {
             SipHash hash;
+            hash.update(getObjectStorageHash(*object_storage));
             hash.update(object_info.getPath());
             hash.update(object_info.metadata->etag);
 

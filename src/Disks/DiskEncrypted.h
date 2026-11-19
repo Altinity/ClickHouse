@@ -330,6 +330,7 @@ public:
     bool isWriteOnce() const override { return delegate->isWriteOnce(); }
     bool isPlain() const override { return delegate->isPlain(); }
     bool allowsPackedParts() const override { return delegate->allowsPackedParts(); }
+    bool isContentAddressed() const override { return delegate->isContentAddressed(); }
 
     ObjectStoragePtr getObjectStorage() override { return delegate->getObjectStorage(); }
 

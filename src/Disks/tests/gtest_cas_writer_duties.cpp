@@ -437,9 +437,17 @@ TEST(CASWriterDuties, PendingDutySkipsCleanFarewellAndSuccessorSweepsTheCrashRem
     EXPECT_EQ(
         successor_store->livePrecommitsForTest(ns),
         (std::set<std::pair<String, ManifestRef>>{{"successor", successor_id.ref}}));
-    const auto seal = successor_store->lastEpochSealForTest(ns);
-    ASSERT_TRUE(seal.has_value());
-    EXPECT_EQ(seal->writer_epoch, predecessor_epoch);
+    /// Recovery closed the predecessor's epoch with a tombstone in it, and the successor's first record
+    /// names that tombstone.
+    {
+        const RefTxnId head_id{successor_store->writerEpoch(), 1};
+        DB::Cas::tests::OperationForTest log_op(*backend);
+        const auto head = (*log_op).read(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), head_id), Retry::once());
+        ASSERT_TRUE(head.has_value());
+        const RefLogTxn decoded = decodeRefLogTxn(openObject(FormatId::RefLog, head->bytes), ns.string(), head_id);
+        ASSERT_TRUE(decoded.prev_epoch_seal.has_value());
+        EXPECT_EQ(decoded.prev_epoch_seal->writer_epoch, predecessor_epoch);
+    }
 
     successor->abandon();
 }
@@ -464,7 +472,7 @@ TEST(CASWriterDuties, RejectedAttemptBodyIsEventuallyNominatedAndSwept)
     /// field alone; pair the two so the mount lease's admission arithmetic sees what the budget claims.
     backend->setAttemptTimeoutMs(budget.attempt_timeout_ms);
     /// Rooted under the POOL's OWN `server_root_id` ("test", unlike this file's other fixtures, which
-    /// stay under "srv1" precisely because they never drive the orphan sweep): `prefixEligible`'s
+    /// stay under "srv1" precisely because they never drive the orphan sweep): `buildPrefixEligibleUnderFloor`'s
     /// watermark floor is looked up by walking the NAMESPACE's own prefix segments for a live mount
     /// lease, so a namespace rooted under any other server-root would find no floor and retain forever
     /// regardless of epoch/coverage.
@@ -558,9 +566,9 @@ TEST(CASWriterDuties, RejectedAttemptBodyIsEventuallyNominatedAndSwept)
     ASSERT_GT(successor_store->writerEpoch(), predecessor_epoch);
     ASSERT_FALSE(waits->empty()) << "the predecessor supplied no clean-death certificate";
 
-    /// An ordinary successor mutation both drains the inherited duty as a no-op (the rejected grant
-    /// was never durable) and forces the predecessor's dead epoch to close with an arithmetic seal --
-    /// the fact rule (1) of the sweep's deletion premise reads.
+    /// An ordinary successor mutation drains the inherited duty as a no-op (the rejected grant was never
+    /// durable); the predecessor's epoch is closed by the tombstone -- the fact rule (1) of the sweep's
+    /// deletion premise reads.
     ManifestId successor_id;
     auto successor = stageEmptyManifest(successor_store, ns, "successor", successor_id);
     successor->precommitAdd(ns, "successor", successor_id);
@@ -568,9 +576,17 @@ TEST(CASWriterDuties, RejectedAttemptBodyIsEventuallyNominatedAndSwept)
     EXPECT_EQ(
         successor_store->livePrecommitsForTest(ns),
         (std::set<std::pair<String, ManifestRef>>{{"successor", successor_id.ref}}));
-    const auto seal = successor_store->lastEpochSealForTest(ns);
-    ASSERT_TRUE(seal.has_value());
-    EXPECT_EQ(seal->writer_epoch, predecessor_epoch);
+    /// Recovery closed the predecessor's epoch with a tombstone in it, and the successor's first record
+    /// names that tombstone.
+    {
+        const RefTxnId head_id{successor_store->writerEpoch(), 1};
+        DB::Cas::tests::OperationForTest log_op(*backend);
+        const auto head = (*log_op).read(successor_store->layout().refLogKey(successor_store->namespaceLife(ns), head_id), Retry::once());
+        ASSERT_TRUE(head.has_value());
+        const RefLogTxn decoded = decodeRefLogTxn(openObject(FormatId::RefLog, head->bytes), ns.string(), head_id);
+        ASSERT_TRUE(decoded.prev_epoch_seal.has_value());
+        EXPECT_EQ(decoded.prev_epoch_seal->writer_epoch, predecessor_epoch);
+    }
 
     Gc gc(successor_store, hexToU128("000000000000000000000000000000e1"));
     DB::Cas::tests::OperationForTest sweep_op(*backend);

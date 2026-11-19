@@ -566,7 +566,7 @@ std::optional<Cas::ManifestRef> CachedPartFolderAccess::renameCommittedRef(
     if (expected && !(resolved->manifest_id.ref == *expected))
         Cas::throwCasOwnershipConflict("renameCommittedRef: source '{}' names another manifest than the one this rename read; "
             "the part must be re-resolved", src.ns.string() + "/" + src.ref);
-    /// A writable mount always admits owner moves (`Pool::open` raises the reader floor first), so inside
+    /// A writable mount always admits owner moves (`mountWritable` raises the reader floor first), so inside
     /// one namespace the only reason to republish is a committed destination: an earlier attempt published
     /// it by republication and crashed before dropping the source. `republishRef` completes that re-drive
     /// when the content is equal and conflicts when it differs.
@@ -615,6 +615,8 @@ bool CachedPartFolderAccess::moveRefExact(const PartRefKey & src, const PartRefK
             if (d != committed.end())
             {
                 /// One manifest has one committed owner (`owned_manifests`); two rows naming `expected` is a broken table.
+                /// `CORRUPTED_DATA`, not a conflict: the ledger is replayed from the ref log, so a damaged log is the
+                /// only way here, and no MergeTree caller keys a rename on this code. Not counted as a conflict.
                 if (s != committed.end() && s->second.manifest_ref == expected && d->second.manifest_ref == expected)
                     throw Exception(ErrorCodes::CORRUPTED_DATA,
                         "moveRefExact: '{}' and '{}' both name manifest {}", src.ns.string() + "/" + src.ref,

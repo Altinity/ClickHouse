@@ -33,9 +33,8 @@ namespace
 ///   - every GC write stamps the round of the attempt that issues it, and replaces an absent marker, `Clean`
 ///     or an older-round `Condemned`;
 ///   - graduation accepts only `Condemned` at the entry's round or newer, read in that round (`Gc::fold`);
-///   - a delete job removes only `Condemned` at its entry's round or older, `If-Match` the etag it read.
-/// While `gc/state` is readable, a later incarnation that can own a job is condemned at a larger round, so no job
-/// removes its marker; a rebuild that regresses rounds breaks this.
+///   - a delete job removes only `Condemned` from a round before the deleting one, `If-Match` the etag it read.
+/// Such a job may remove a later incarnation's marker; that is safe because a writer adopts only on `Clean`.
 ///
 /// GC never writes `Clean`, not even on a spare: a deposed leader that cleared a spare's marker and then lost
 /// its round CAS would leave `Clean` over a still-condemned body, and a stale exact-token redelete would delete
@@ -55,10 +54,10 @@ void writeCondemnedMeta(CasOperation & op, const Layout & layout, const BlobRef 
 /// Rounds only grow while `gc/state` is readable, so a marker at a newer round guards a later incarnation
 /// and `Clean` means a writer displaced the body: both are left alone. `If-Match` the etag read here, so a
 /// marker changed since the read is left alone too.
-void deleteConfirmedMeta(CasOperation & op, const Layout & layout, const BlobRef & ref, uint64_t condemn_round)
+void deleteConfirmedMeta(CasOperation & op, const Layout & layout, const BlobRef & ref, uint64_t newest_round)
 {
     const auto lm = loadMeta(op, layout, ref);
-    if (!lm || lm->meta.state != MetaState::Condemned || lm->meta.condemn_round > condemn_round)
+    if (!lm || lm->meta.state != MetaState::Condemned || lm->meta.condemn_round > newest_round)
         return;
     deleteMetaExact(op, layout, ref, lm->etag);
 }
@@ -127,12 +126,12 @@ void GcMetaWriter::scheduleCondemnMarkerWrite(const BlobRef & ref, uint64_t cond
     });
 }
 
-void GcMetaWriter::scheduleConfirmedMetaDelete(const BlobRef & ref, uint64_t condemn_round)
+void GcMetaWriter::scheduleConfirmedMetaDelete(const BlobRef & ref, uint64_t newest_round)
 {
-    submit([st = state, ref, condemn_round]()
+    submit([st = state, ref, newest_round]()
     {
         CasOperation op = st->store->openRequests().admit();
-        deleteConfirmedMeta(op, st->store->layout(), ref, condemn_round);
+        deleteConfirmedMeta(op, st->store->layout(), ref, newest_round);
     });
 }
 

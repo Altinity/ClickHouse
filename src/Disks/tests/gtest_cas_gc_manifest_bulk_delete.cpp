@@ -129,6 +129,8 @@ TEST(CASGCManifestBulkDelete, AThrowInTheSecondChunkKeepsTheFirstChunksAuditAndA
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                                                 .gc_bulk_delete_chunk_keys = 2, .gc_fold_max_defer_rounds = 0});
+    /// The second chunk throws on every attempt until the request window ends; a virtual clock ends it at once.
+    const auto clock = DB::Cas::tests::VirtualRetryClock::installOn(store);
     const auto ids = seedDroppedManifests(*backend, store->layout(), 5);
 
     std::vector<std::map<String, UInt64>> manifest_phase_rows;
@@ -161,7 +163,7 @@ TEST(CASGCManifestBulkDelete, AThrowInTheSecondChunkKeepsTheFirstChunksAuditAndA
         {
             aborted = true;
         }
-        /// A round that exhausted the full retry window (up to `Retry::standard()`'s 90s) may have
+        /// A round that exhausted the full retry window (up to the request window of `Retry::standard()`) may have
         /// outlasted the mount lease itself, so the aborted round's own lease-renewal attempt can
         /// throw too -- irrelevant to what this test asserts, so skip it once aborted.
         if (!aborted)

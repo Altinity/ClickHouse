@@ -3,6 +3,9 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartPathParser.h>
 #include "cas_test_helpers.h"
+#include <limits>
+#include <optional>
+#include <vector>
 
 using namespace DB::Cas;
 
@@ -379,4 +382,29 @@ TEST(CASLayout, BlobKeyRoundTripsThroughParse)
     EXPECT_EQ(*parsed_body, ref);
     EXPECT_EQ(*parsed_meta, ref);
     EXPECT_FALSE(layout.parseBlobKey("pool0/blobs/unknown-algo/aa/aa00").has_value());  /// foreign => nullopt
+}
+
+TEST(CASLayout, StagingKeyCarriesTheWriterEpoch)
+{
+    const Layout layout("p");
+    EXPECT_EQ(layout.stagingPrefix("a/b"), "p/staging/a/b/");
+    const String key = layout.stagingKey("a/b", 7, "x.tmp");
+    EXPECT_EQ(key, "p/staging/a/b/7/x.tmp");
+    EXPECT_EQ(Layout::stagedEpochOf(std::string_view(key).substr(layout.stagingPrefix("a/b").size())), 7u);
+
+    const std::vector<std::pair<std::string_view, std::optional<uint64_t>>> cases{
+        {"x.tmp", 0},                        /// flat key written before keys carried an epoch
+        {"0/x.tmp", 0},
+        {"007/x.tmp", 7},
+        {"18446744073709551615/x.tmp", std::numeric_limits<uint64_t>::max()},
+        {"18446744073709551616/x.tmp", std::nullopt},   /// overflow
+        {"", std::nullopt},
+        {"7/", std::nullopt},                /// a folder marker
+        {"/x.tmp", std::nullopt},
+        {"a/x.tmp", std::nullopt},           /// a nested member's key
+        {"+7/x.tmp", std::nullopt},
+        {"7/a/x.tmp", std::nullopt},         /// deeper than one epoch directory
+    };
+    for (const auto & [rest, expected] : cases)
+        EXPECT_EQ(Layout::stagedEpochOf(rest), expected) << rest;
 }

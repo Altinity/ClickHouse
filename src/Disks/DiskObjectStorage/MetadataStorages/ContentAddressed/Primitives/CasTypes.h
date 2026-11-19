@@ -275,7 +275,7 @@ enum class Dialect : uint8_t
 
 /// The ordered ref-transaction identifier. A successful writer mount establishes a strictly newer
 /// `writer_epoch`; within an epoch, one namespace's `ref_sequence` values are CONTIGUOUS from 1 --
-/// derived per append from the table's own greatest applied id (`nextRefTxnId`), not drawn from any
+/// derived per append from the table's own applied state (`nextRefSlot`), not drawn from any
 /// counter, so two namespaces of the same mount both count 1, 2, 3... independently. Both fields
 /// are nonzero for a valid id -- {0, 0} is never a real transaction. `writer_epoch` is the primary
 /// ordering component, so tuple order matches the intended timeline even across an epoch restart that

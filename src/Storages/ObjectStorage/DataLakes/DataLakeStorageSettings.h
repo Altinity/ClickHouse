@@ -4,9 +4,11 @@
 #include <Core/FormatFactorySettings.h>
 #include <Core/SettingsEnums.h>
 #include <Core/SettingsFields.h>
+#include <Core/SettingsTierType.h>
 #include <base/unit.h>
 
 #include <limits>
+#include <optional>
 
 
 namespace DB
@@ -189,6 +191,8 @@ struct DataLakeStorageSettings
     bool isChanged(std::string_view name) const;
 
     static bool hasBuiltin(std::string_view name);
+
+    static std::optional<SettingsTierType> tryGetTierOfBuiltin(std::string_view name);
 
     void serialize(WriteBuffer & out) const;
     static DataLakeStorageSettings deserialize(ReadBuffer & in);

@@ -90,22 +90,50 @@ a live precommit would clamp `GC`'s fold barrier forever.
 ### The orphan-manifest sweep {#orphan-sweep}
 
 The cursor-paced, budgeted sweep has two stages (`Gc/CasOrphanManifestSweep.cpp`). During fold
-planning, it freezes candidates with exact `GET`s, opens and decodes their bodies, and derives the
-state changes needed to make deletion safe. Only after the round `CAS` adopts those changes does
+planning, it checks candidates against the mount floor, ownership, fold coverage, and catalog
+lifecycle. It then freezes accepted candidates with exact `GET`s, opens and decodes their bodies,
+and derives the state changes needed to make deletion safe. Only after the round `CAS` adopts those changes does
 phase 18 perform physical deletion. Eligibility comes **exclusively** from the durable watermark
 in the mount lease — there is no age threshold and no time-based grace period anywhere in this
 protocol. No mount lease for the `server_root_id` means no deletion authority means nothing is
 swept for that root.
 
+The page reads an initial catalog cut `K0`. The mount floor applies to every candidate, including
+manifests whose namespace is absent from `K0`: a writer can stage a manifest before its first
+`precommitAdd` creates the catalog row. An active build, or a build above a lagging published floor,
+must therefore be retained even when no row exists.
+
+Ownership recovery and fold coverage use the row from `K0`. After collecting tentative candidates,
+the page reads one more catalog cut, `K1`, after all floor observations and before any candidate body
+is hinted or read. A candidate passes only if its namespace row is absent in both cuts or the full
+`CatalogEntry` is equal in both. A row that appears, disappears, changes incarnation, or changes
+lifecycle state retains that candidate. A change to another namespace does not block it. Recovery
+never switches to a newer row during this page.
+
+The second cut costs one extra catalog `GET` per page with tentative candidates; pages with none,
+including list-only pages, do not read it. The floor is read once per namespace per page. Candidates
+retained by `K1` increment `skipped` without refilling the nomination budget or rolling back the
+decision cursor. A read or decode error, or an ambiguous life index in `K1`, fails planning before
+body reads and before the new cursor can be adopted.
+
 ```mermaid
 flowchart TD
-    A["LIST one page of cas/manifests/<br/>freeze candidates with exact GET"] --> B{"build-prefix eligible?<br/>durable watermark fact only"}
+    A["LIST one page of cas/manifests/<br/>read initial catalog K0"] --> B{"build-prefix eligible?<br/>mount floor, including rowless namespaces"}
     B -->|"epoch less than lease epoch"| ELIG["eligible, old-epoch debris"]
     B -->|"same epoch, min_active_build_sequence clears build_seq"| ELIG
     B -->|"no lease, or epoch ahead, or build may be live"| SKIP["skip"]
-    ELIG --> C["protection view: committed manifests<br/>plus live precommits<br/>plus manifests with an unfolded minus-one"]
+    ELIG --> ROW{"namespace row in K0?"}
+    ROW -->|yes| C["protection view from K0:<br/>committed manifests, live precommits,<br/>and unfolded removal targets"]
+    ROW -->|no| T["tentative candidate"]
     C -->|"key protected"| SKIP2["skip"]
-    C -->|"not protected"| D{"open and decode<br/>frozen body"}
+    C -->|"not protected"| P{"deletion premise:<br/>fold coverage permits deletion?"}
+    P -->|no| SKIP2
+    P -->|yes| T
+    T --> K["read and validate one post-floor<br/>catalog K1 for all tentative candidates"]
+    K --> Q{"namespace row equal in K0 and K1<br/>or absent in both?"}
+    Q -->|no| SKIP2
+    Q -->|yes| GET["freeze candidate with exact GET"]
+    GET --> D{"open and decode<br/>frozen body"}
     D -->|"cannot open or decode"| U["retain; skipped++ and undecodable++<br/>log exact key; advance decision cursor<br/>continue to later candidates"]
     D -->|decoded| I{"body ref and namespace<br/>match key?"}
     I -->|no| BAD["CORRUPTED_DATA<br/>fail-closed round error"]
@@ -189,13 +217,14 @@ holds exactly one transaction, `{namespace, txn_id, ops[]}`; a snapshot object h
 `cas/ns/state/<life_id>/`: the per-life `_ckpt` checkpoint and any namespace-owned `_files/`.
 
 `RefTxnId = {writer_epoch, ref_sequence}` renders as two fixed-width hex fields, so lexical key
-order equals tuple order. Ids are per-namespace and contiguous: within one `(namespace,
-writer_epoch)` they run `1, 2, 3, …` with no holes, and a new mount epoch restarts the sequence at
-`1`. A hole is therefore corruption, not an allocation artifact, and a non-successor id is rejected
-as `CORRUPTED_DATA`.
+order equals tuple order. Within one `(namespace, writer_epoch)` ids run `1, 2, 3, …` with no holes,
+and a new mount epoch restarts the sequence at `1`. A hole inside an epoch is corruption, not an
+allocation artifact. Across epochs the chain is linked explicitly by a [tombstone](#epoch-tombstone),
+so a numeric epoch that wrote nothing leaves no object, and a record that is not the successor of
+the previous one is rejected as `CORRUPTED_DATA`.
 
 The op vocabulary is deliberately tiny: `NamespaceBirth`, `OwnerTransition{old?, new?}`,
-`SetPublishedAt`, `RemoveNamespace`. There are exactly five legal `OwnerTransition` shapes — add
+`SetPublishedAt`, `RemoveNamespace`, and `EpochSeal`, the only op of a tombstone. There are exactly five legal `OwnerTransition` shapes — add
 precommit, remove precommit, remove committed, promote, and move (a committed ref changes its name,
 keeping its manifest; format generation 2) — classified once (`classifyOwnerTransitionShape`) for the
 state machine and for `GC`'s edge extractor, so the two readers of the format cannot drift.
@@ -205,7 +234,9 @@ Logs are pure conditional creates on write-once keys. There is no append-to-obje
 `GC` does, once coverage and a live snapshot both make a log safe to remove.
 
 Snapshots publish in the background, best-effort, one in flight per table, when the tail exceeds a
-log-count or log-byte threshold.
+log-count or log-byte threshold. A publication creates the `_snap` object, then raises
+`checkpoint_snapshot_id` in `_ckpt` with one conditional replace. Until that replace lands, the snapshot
+is durable but cleanup does not rely on it, and recovery keeps starting from the older base.
 
 ## Publishing a ref mutation {#publish-protocol}
 
@@ -221,7 +252,10 @@ flowchart TD
     W -->|yes| WR["resolve the wedge by its exact key first"]
     WR -->|resolved durable| INST0["install candidate, clear wedge"]
     WR -->|still unresolved| FAIL1["fail the queue, stay wedged, never allocate a new id"]
-    W -->|no| CARVE["two-phase carve: plan may throw, publish never throws"]
+    W -->|no| EP{"chain epoch equals the live epoch?"}
+    EP -->|"no, an earlier epoch"| TOMB["create the tombstone of the chain's last epoch first"]
+    EP -->|yes| CARVE
+    TOMB --> CARVE["two-phase carve: plan may throw, publish never throws"]
     CARVE --> VAL["per-item validation: caps, shape, byte budget<br/>a failing item fails alone"]
     VAL --> PREP["build candidate state and the complete wedge before the PUT"]
     PREP --> PUT["putIfAbsent the ref-log key"]
@@ -237,9 +271,66 @@ recording the single conditional `PUT` whose outcome is unknown, complete with t
 sealed bytes. The next flush must resolve *that exact key* before it may allocate a new transaction
 id — an unresolved write can never silently become a gap, and the ledger never double-publishes.
 
+An ordinary append is one create-if-absent of `_log/<epoch>-<sequence>`. A log that is durable on the
+chain is committed history, and no append reads or writes `_ckpt`. No ordinary append reads the
+catalog; only the terminal `RemoveNamespace` append reads its catalog row first. The
+acknowledgement is fenced by the mount lease, checked after the response and again inside the install hold.
+
+| Operation | Requests |
+|---|---|
+| Positive append | 1: log `PUT` |
+| Ref removal | 1: log `PUT` |
+| Terminal `RemoveNamespace` append | 2: catalog `GET`, log `PUT` |
+| First append of an epoch in a namespace | one more: the tombstone `PUT` |
+| New part without blobs | 4: manifest `PUT` 1, precommit 1, promote 1, `Move` 1 |
+
+The counts are for a warm namespace and one writer.
+
+If the log is durable but the install is refused, the lane moves to `NeedsRecovery`: the record is
+history and is never acknowledged. If the outcome of the `PUT` is unknown, the lane is wedged and
+`{epoch, sequence}` stays reserved until the same key and bytes resolve.
+
 Crash points: between the `PUT` and the install, the object is durable and unapplied — the next
 mount's recovery replays it. Between a precommit and its promote, a dangling precommit is reclaimed
 by the successor's stale-precommit sweep, described above.
+
+### The epoch tombstone {#epoch-tombstone}
+
+A tombstone is a log whose only op is `EpochSeal`, carrying the critical field `!next_epoch = W`. It
+sits in the next slot of the last epoch `X` that wrote to the namespace and points forward to the
+first slot of epoch `W`. Epochs between `X` and `W` get no object.
+
+- **Lazy.** A writer of epoch `W` whose chain ends in an earlier epoch `X` creates the tombstone
+  before its first append. Its record `{W, 1}` names that tombstone in `!prev_epoch`/`!prev_seq`.
+- **Eager after an unclean end.** Recovery writes the tombstone itself, before it installs the table,
+  when `X` is at or below `last_unclean_epoch` of the mount lease (see
+  [mounts and leases](/antalya/cas/architecture/mounts-and-leases#last-unclean-epoch)). The tombstone
+  occupies the slot a straggler `PUT` of the dead epoch would need, so that request loses its create
+  and is never acknowledged.
+- **Deposed writers.** A writer that meets a later epoch's tombstone in its next slot gets a conflict,
+  closes its lane and rejects the write with `INVALID_STATE`; the message reads `CLOSED by a successor's tombstone`.
+  Cleanup deletes a tombstone like any other covered log.
+
+### Where history ends {#history-end}
+
+One shared walk, `walkRefChain`, decides where a namespace's history ends. Recovery and the orphan sweep
+call it, and GC intake follows the same successor rule (`refChainSuccessor`).
+
+| Record at `{e, s}` | Successor |
+|---|---|
+| Ordinary | `{e, s+1}` |
+| Tombstone with `!next_epoch = n` | `{n, 1}` |
+| Tombstone without `!next_epoch` (written by generation 1 or 2) | `{e+1, 1}` |
+| Contains `RemoveNamespace` | none: the stream ends and no later key is read |
+
+History ends at the first absent key on this chain, or at a terminal record. Keys are read by exact
+`GET` in successor order. The record after a tombstone must name it in its backlink, and no other record carries a backlink.
+
+Cleanup deletes only logs strictly below the snapshot id read from `_ckpt`, and that id only grows. So a
+walk from a snapshot base re-reads `_ckpt` after its last read: an unchanged token proves that no
+cleanup passed the base while the walk ran, and a changed token restarts the walk. A reader that
+could have started before GC erased the namespace's catalog row also re-reads the catalog afterwards
+and installs nothing for a life that is gone.
 
 ## Recovery {#recovery}
 
@@ -248,24 +339,34 @@ authoritative objects — there is no `LIST` anywhere in this path:
 
 1. **Exact `GET` of `_ckpt`.** The durable checkpoint is the sole source of the recovery grounding:
    `chooseRecoveryGrounding` derives the base (a snapshot id, or genesis if there is none) and the
-   exact transaction to walk from purely from the checkpoint's own fields
-   (`committed_through`/`checkpoint_snapshot_id`/`life_epoch`) — recovery never enumerates its own
-   stream to find them.
+   key to walk from purely from the checkpoint's own fields (`checkpoint_snapshot_id` and
+   `life_epoch`) — recovery never enumerates its own stream to find them. A missing or undecodable
+   `_ckpt` of a namespace the catalog still names is `CORRUPTED_DATA`.
 2. If the grounding names a snapshot, `GET` and decode it as the replay base.
-3. Walk forward by exact key from there, one transaction resident at a time: `GET`
-   `cas/ns/stream/<life_id>/<epoch>-<sequence>`, decode, apply, discard, advance to the next
-   arithmetic id. Every key this walk touches is a dense, deterministic successor of the last —
-   never a listed or guessed one.
-4. **Absence is a decision point, not an error.** Finding a slot empty is either the live epoch's
-   stream legitimately ending there, or — for a dead predecessor epoch — the exact slot where its
-   closing `EpochSeal` must be written before the table may be trusted; the two cases are
-   distinguished by whether the epoch being walked is still live, not by retrying a listing.
-5. Recovery may itself advance `_ckpt` as it replays, each time via a conditional write against the
-   checkpoint it last read; the write is re-verified with a fresh exact `GET` afterward, and a
-   concurrent winner's farther frontier is honored by restarting from that newer checkpoint rather
-   than trusting the write blindly.
-6. Transient network errors retry the whole attempt with capped backoff; corruption and logic
+3. Walk forward by exact key from there with [`walkRefChain`](#history-end), one transaction resident
+   at a time: `GET` `cas/ns/stream/<life_id>/_log/<epoch>-<sequence>`, decode, apply, discard, follow the
+   successor. Every key this walk touches is a deterministic successor of the last — never a listed or
+   guessed one.
+4. **Absence ends the walk.** The first absent key on the chain is the end of history. Whether the
+   chain's last epoch is still live is decided by comparing it with the live epoch.
+5. **Stamp.** If recovery is about to write a tombstone and the `_ckpt` is below generation 3, it first
+   replaces it with the generation 3 body (one conditional write on the token read in step 1); a
+   mismatch restarts the walk. Otherwise the append lane stamps before the namespace's first write.
+6. **Tombstone.** If the stream is not terminal and the chain's last epoch `X` is below the live epoch
+   and at or below `last_unclean_epoch`, recovery creates the tombstone before it installs the table.
+   A conflict adopts the occupant (a predecessor's late record or a tombstone) and the walk continues
+   from it, at most 64 attempts per epoch. Recovery after a clean farewell writes nothing.
+7. Re-read `_ckpt` after the last read or write. A token other than the one read in step 1, or the
+   stamp's, restarts the walk from the new base: the slot a tombstone just filled may have been
+   reclaimed by cleanup.
+8. Confirm in the catalog that the namespace's life still exists. A removed life installs nothing.
+9. Transient network errors retry the whole attempt with capped backoff; corruption and logic
    errors fail fast.
+
+A quiet namespace costs 6 reads after admission, and 1 more request, the tombstone `PUT`, after an
+unclean predecessor. The reads are the `_ckpt` twice, the base's log, the snapshot, the absent successor key
+and the catalog confirmation. A snapshot that is the first record of its epoch adds one read: the tombstone
+its backlink names. Cold admission adds 2 catalog reads that the 6 does not include.
 
 For a mounted writer the recovered in-memory table is authoritative for reads of its own
 namespaces — there is no other writer of that namespace. S3 is authoritative for durability:
@@ -277,11 +378,12 @@ Two cross-process readers see a different, colder view, but only at the discover
 and `cas-fsck` `LIST` once to discover which namespaces exist, staleness-bounded by whatever was
 durable at `LIST` time, so a namespace born after that `LIST` is invisible to this pass. Within
 each discovered namespace, the replay itself is not `LIST`-driven — it is the same exact-`GET`,
-`_ckpt`-grounded arithmetic walk described above, just called from a caller-supplied catalog entry
+`_ckpt`-grounded chain walk described above, just called from a caller-supplied catalog entry
 instead of a live mount. The relink-confirm handshake (see the
-[replication page](/antalya/cas/architecture/replication#relink-gates)) does zero object-store I/O
-and answers `Yes` only against the resident, warm, fence-live in-memory table — `No` is not proof
-of the negative, only `Yes` is fence-gated.
+[replication page](/antalya/cas/architecture/replication#relink-gates)) answers from the resident,
+warm, fence-live in-memory table. It makes no object-store request unless that table says `Yes`.
+Then it reads the mount slot once and answers `Yes` only if the slot is still held. `No` is not
+proof of the negative, only `Yes` is fence-gated.
 
 ## Namespace removal {#namespace-removal}
 

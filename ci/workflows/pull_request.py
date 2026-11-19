@@ -94,7 +94,8 @@ workflow = Workflow.Config(
         ],
         *[
             job.set_run_after(REGULAR_BUILD_NAMES)
-            for job in JobConfigs.release_build_jobs_with_examples
+            # NOTE (strtgbb): no clickhouse-examples, nothing uses it and it delays the ThinLTO link of clickhouse
+            for job in JobConfigs.release_build_jobs
         ],
         # *[ # NOTE (strtgbb): we don't run special build jobs
         #     job.set_run_after(CORE_BLOCKING_JOB_NAMES)
@@ -141,10 +142,14 @@ workflow = Workflow.Config(
         # reproduce) — a reproduction or an inconclusive ERROR does not block.
         # Like the sibling FT/IT jobs, it is deferred behind the core blocking jobs.
         JobConfigs.bugfix_validation_ut_job.set_run_after(CORE_BLOCKING_JOB_NAMES),
+        # The CAS stateless lanes need only their build artifact. Deferring them
+        # behind the blocking jobs makes a red ASan integration shard skip them
+        # silently, so they are not deferred.
         *[
             j.set_run_after(
                 CORE_BLOCKING_JOB_NAMES
                 if j.name not in CORE_BLOCKING_JOB_NAMES
+                and j not in AltinityJobConfigs.cas_functional_tests_jobs
                 else []
             )
             for j in FUNCTIONAL_TESTS_JOBS
@@ -255,7 +260,7 @@ workflow = Workflow.Config(
         ArtifactConfigs.wasm_parser,
         ArtifactConfigs.fuzzers,
         ArtifactConfigs.fuzzers_corpus,
-        ArtifactConfigs.clickhouse_examples,
+        # ArtifactConfigs.clickhouse_examples,
         # *ArtifactConfigs.llvm_profdata_file,
         # ArtifactConfigs.llvm_coverage_info_file,
         ArtifactConfigs.toolchain_pgo_bolt_amd,

@@ -354,6 +354,7 @@ namespace DB::ErrorCodes
 namespace DB::ContentAddressedSetting
 {
     extern const ContentAddressedSettingsString staging_backend;
+    extern const ContentAddressedSettingsUInt64 mount_lease_ttl_ms;
 }
 
 namespace
@@ -541,13 +542,7 @@ TEST(CASWiringRead, BlobViewPlanRidesTheStandardPipeline)
         DB::readStringUntilEOF(manifest_bytes, *buf);
     }
     EXPECT_EQ(manifest_bytes, "u-123");
-    /// Not a `getBlobViewPlan` call on the in-manifest path here (all-tree Task 6/9: uuid.txt is now
-    /// a real Inline manifest entry): `getBlobViewPlan`'s only production caller
-    /// (`DiskObjectStorage::prepareRead`) never reaches it once `prepareInManifestRead` returns true
-    /// above — `getBlobViewPlan`'s precondition is "confirmed not in-manifest-servable," which calling
-    /// it directly on an Inline path violates. Pre-Task-9 this assertion passed only by coincidence
-    /// (uuid.txt was not a manifest entry at all, so `findFile` returned not-found, not because
-    /// `getBlobViewPlan` gracefully handles an Inline entry it does find).
+    EXPECT_FALSE(storage->getBlobViewPlan("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/uuid.txt").has_value());
 
     /// Blob-backed file: a real physical key and a payload-sized window whose extent equals
     /// the object's readable size (a right-bounded read never overshoots the window).
@@ -3321,4 +3316,24 @@ TEST(CASWiringOps, RedriveOverEqualCommittedDestinationCompletesTheMove)
     EXPECT_FALSE(storage->existsDirectory(table + "tmp_X"));
     EXPECT_TRUE(storage->existsDirectory(table + "X"));
     EXPECT_EQ(std::count_if(events.begin(), events.end(), [](const auto & e) { return e.type == DB::Cas::CasEventType::RefMove; }), 0);
+}
+
+/// A pool mounted from a 1-hour `cas_mount_lease_ttl_ms` declares the clamped 10 minutes in its slot.
+TEST(CASWiringMount, OverlongConfiguredLeaseIsDeclaredClamped)
+{
+    auto settings = DB::Cas::tests::makeSettingsForTest(
+        "test", std::filesystem::temp_directory_path() / "ca_wiring_clamp_scratch");
+    settings[DB::ContentAddressedSetting::mount_lease_ttl_ms] = 3'600'000;
+    settings.validate();
+    auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
+        DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "", nullptr, settings);
+    storage->startup();
+
+    const auto pool = storage->store();
+    EXPECT_EQ(pool->poolConfig().mount_lease_ttl_ms.count(), 600'000);
+    DB::Cas::tests::OperationForTest op(*pool->poolBackendPtr());
+    const auto mounts = DB::Cas::listMounts(*op, pool->layout(), /*now_ms=*/0, /*skew_margin_ms=*/0);
+    ASSERT_EQ(mounts.size(), 1u);
+    EXPECT_GT(mounts[0].lease.started_at_ms, 0u);
+    EXPECT_EQ(mounts[0].lease.expires_at_ms - mounts[0].lease.started_at_ms, 600'000u);
 }

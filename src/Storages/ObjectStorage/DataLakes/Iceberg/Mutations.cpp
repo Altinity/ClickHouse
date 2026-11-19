@@ -354,6 +354,8 @@ static std::optional<WriteDataFilesResult> writeDataFiles(
                         path_resolver.resolve(delete_data_result[partition_key].path), /*with_tags=*/ false).size_bytes;
                 delete_data_result[partition_key].total_bytes = static_cast<Int32>(delete_bytes);
             }
+            delete_data_writers[partition_key].reset();
+            delete_data_write_buffers[partition_key].reset();
         }
     }
 
@@ -428,6 +430,8 @@ static std::optional<WriteDataFilesResult> writeDataFiles(
                         path_resolver.resolve(update_data_result[partition_key].path), /*with_tags=*/ false).size_bytes;
                 update_data_result[partition_key].total_bytes = static_cast<Int32>(update_bytes);
             }
+            update_data_writers[partition_key].reset();
+            update_data_write_buffers[partition_key].reset();
         }
     }
 
@@ -980,6 +984,10 @@ void alter(
 
         if (succeeded)
             break;
+
+        metadata_json_generator.appendMetadataLog(
+            persistent_table_components.path_resolver.reverseResolve(metadata_path),
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
 
         const auto new_schema_id = metadata->getValue<Int32>(Iceberg::f_current_schema_id);
         Poco::JSON::Object::Ptr new_schema;

@@ -21,6 +21,12 @@ struct BuildPrefix
     uint64_t build_sequence = 0;
 };
 
+struct BuildFloor
+{
+    uint64_t writer_epoch = 0;
+    uint64_t min_active_build_sequence = 0;
+};
+
 
 /// One manifest object the sweep is considering, carrying both halves the §6 deletion premise needs:
 /// the full object key (what the tail's removal targets are named by) and the build prefix it lives
@@ -177,8 +183,8 @@ struct ManifestSweepResult
 ///
 /// `warnings`, when non-null, opts in to the decommission drain's tolerate-and-continue contract: a
 /// per-key transient failure (a thrown backend exception on `head`/`remove`)
-/// is pushed onto `*warnings` and the sweep continues with the next key, instead of throwing out of
-/// this call; likewise a protection-view-unavailable namespace (the pre-existing corrupt-snapshot skip
+/// is pushed onto `*warnings` and the sweep continues with the next key while `store`'s mount still admits
+/// requests, instead of throwing out of this call; likewise a protection-view-unavailable namespace (the pre-existing corrupt-snapshot skip
 /// below) also pushes a "cannot confirm emptiness" warning, not just a `LOG_WARNING`. `warnings ==
 /// nullptr` (the default, every pre-existing caller) preserves the original behaviour exactly: a
 /// per-key failure propagates as an exception (fail-close default), and the protection-view skip is
@@ -186,21 +192,23 @@ struct ManifestSweepResult
 /// normal "a fresh owner reclaimed it" race the periodic sweep expects, not a failure to warn about.
 /// This direct decommission path relies on the caller's held server-root claim/fence: while that claim
 /// is held, a same-server-root rebirth cannot become live between its catalog cut and exact-token delete.
+/// Every request runs on `store`'s mount plane, so `store` must hold a writable mount; once its fence trips,
+/// the remaining requests are refused.
 /// It still rejects every catalog cut with an ambiguous current life id before making any deletion decision.
 uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix,
                         std::vector<String> * warnings = nullptr);
 
-/// Whether `prefix` is sweep-eligible by the durable watermark fact alone. The floor is read from the
+/// Whether `build_prefix` is sweep-eligible by the durable watermark fact alone. The floor is read from the
 /// mount lease identified by the namespace's server-root prefix, not inferred from the manifest key or a
 /// judged-dead heuristic. A missing lease provides no deletion authority, so the prefix is not eligible.
-bool prefixEligible(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix);
+bool buildPrefixEligibleUnderFloor(Pool & store, const RootNamespace & ns, const BuildPrefix & build_prefix);
 
-/// The pure half of `prefixEligible`: whether `prefix` is retired under one observation of the mount
+/// The pure half of `buildPrefixEligibleUnderFloor`: whether `build_prefix` is retired under one observation of the mount
 /// floor. `nullopt` (no mount body under any prefix of the namespace) admits nothing. Retirement is
 /// permanent -- the epoch and the acknowledgement floor only grow and the farewell is terminal -- so
 /// an admission derived from any observation stays true afterwards, which is what lets a page judge
 /// every build of a namespace against one read.
-bool prefixEligibleUnder(const std::optional<MountLease> & floor, const BuildPrefix & prefix);
+bool buildPrefixEligibleUnderFloor(const std::optional<BuildFloor> & floor, const BuildPrefix & build_prefix);
 
 /// Plan one cursor page without deleting. A key is decided from key-derived facts first; only a
 /// candidate's body is read, after the catalog cut, then decoded and identity-validated; its exact

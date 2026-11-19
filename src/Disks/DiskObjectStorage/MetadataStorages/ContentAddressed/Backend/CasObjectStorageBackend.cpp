@@ -147,17 +147,19 @@ ObjectStorageBackend::ObjectStorageBackend(ObjectStoragePtr object_storage_, Mod
 /// evidence of a versioned bucket, its usual cause is a credential without permission to read the
 /// bucket configuration, and refusing on it would turn a missing IAM grant into a hard outage. The
 /// mount proceeds with a warning that names what was not verified and how the operator can verify it.
+/// The probe uses this backend's control-plane profile, because the default client would retry a failed
+/// attempt with SDK backoff, outside the mount's attempt budget.
 void ObjectStorageBackend::checkPoolPreconditions()
 {
     if (mode != Mode::Native || native_token_type != Dialect::Generation)
         return;
 
-    const auto versioned = object_storage->isBucketVersioningEnabled();
+    const auto versioned = object_storage->isBucketVersioningEnabled(controlRequest(/*attempt_no=*/0));
     if (!versioned.has_value())
     {
         LOG_WARNING(getLogger("CasObjectStorageBackend"),
             "CAS on GCS: could not VERIFY the bucket-versioning precondition (the versioning check "
-            "request failed, e.g. the credential lacks permission to read the bucket configuration, "
+            "request failed, e.g. it timed out or the credential lacks permission to read the bucket configuration, "
             "or this backend cannot answer it). Mounting anyway. If versioning IS enabled on this "
             "bucket, token-exact DELETEs archive noncurrent generations instead of reclaiming storage "
             "and GC silently stops reclaiming space. Confirm by hand that versioning is disabled, or "
@@ -316,6 +318,17 @@ std::expected<String, Backend::RawConflict> ObjectStorageBackend::nativeConditio
     auto buf = object_storage->writeObject(
         StoredObject(key), WriteMode::Rewrite, /*attributes=*/std::nullopt, std::max<size_t>(1, bytes.size()), ws);
     buf->write(bytes.data(), bytes.size());
+
+    /// An `If-Match` write of a key that was deleted meanwhile answers 404, which
+    /// `finalizeConditionalWrite` maps to a lost precondition: an ordinary answer, as for the GET in
+    /// `readUnder`. Without the scope the HTTP client logs it at Error, and a stateless test whose
+    /// stderr is checked fails on the log line alone. The request runs on this thread:
+    /// `conditionalWriteSettings` turns the parallel part upload off. An `If-None-Match` write names
+    /// no existing object, so a 404 there stays loud.
+    std::optional<Expect404ResponseScope> absent_key_is_a_lost_precondition;
+    if (!ws.object_storage_write_if_match.empty())
+        absent_key_is_a_lost_precondition.emplace();
+
     if (finalizeConditionalWriteInstrumented(*buf) == detail::ConditionalWriteOutcome::PreconditionLost)
         return std::unexpected(RawConflict{});
 
@@ -802,10 +815,9 @@ SentinelProbeResult ObjectStorageBackend::probeSentinelUnder(const String & key,
 
 /// Settings for a genuine Native conditional write. Mark the request for the typed conditional
 /// dialect and, on a generation-token store, force a single PUT: GCS does not enforce the condition
-/// on multipart completion. Blob publication never uses these settings; it remains an ordinary
-/// unconditional multipart-capable write. CAS-mutable keys (shard manifests, gc/state, the registry)
-/// also skip the racy post-upload existence/size check; a publish's manifest CAS was observed racing
-/// the GC fence there.
+/// on multipart completion. Blob publication uses `blobPublicationWriteSettings` instead. CAS-mutable
+/// keys (shard manifests, gc/state, the registry) also skip the racy post-upload existence/size check;
+/// a publish's manifest CAS was observed racing the GC fence there.
 WriteSettings ObjectStorageBackend::conditionalWriteSettings(size_t attempt_no) const
 {
     WriteSettings ws;
@@ -875,6 +887,18 @@ std::expected<String, Backend::RawConflict> ObjectStorageBackend::write(
     return emuWrite(key, bytes);
 }
 
+/// On a content-ETag store a resent envelope that lands after GC deleted it restores the condemned
+/// incarnation, and the exact-token delete of that incarnation then removes a live body. Retries belong
+/// to the caller, which re-observes and publishes a fresh envelope. Requests keep the storage's own
+/// request timeout, which a body upload needs.
+WriteSettings ObjectStorageBackend::blobPublicationWriteSettings() const
+{
+    WriteSettings ws;
+    ws.object_storage_single_attempt_object_creation = true;
+    ws.object_storage_connect_timeout_cap_ms = connect_timeout_cap_ms;
+    return ws;
+}
+
 void ObjectStorageBackend::publish(const BlobPublishRequest & request, TransportAccess &)
 {
     if (const auto * streaming = std::get_if<StreamingBlobPublication>(&request.publication))
@@ -894,14 +918,14 @@ void ObjectStorageBackend::publish(const BlobPublishRequest & request, Transport
             return;
         }
 
-        /// Ordinary unconditional rewrite: default request mode, retry profile, and multipart policy.
-        /// In particular, generation stores are not restricted by the conditional single-PUT cap.
+        /// Unconditional rewrite: default request mode and multipart policy, so generation stores are
+        /// not restricted by the conditional single-PUT cap.
         auto out = object_storage->writeObject(
             StoredObject(request.destination_key),
             WriteMode::Rewrite,
             /*attributes=*/std::nullopt,
             DBMS_DEFAULT_BUFFER_SIZE,
-            WriteSettings{});
+            blobPublicationWriteSettings());
         out->write(streaming->fresh_envelope.data(), streaming->fresh_envelope.size());
         blob_publication_detail::BlobPayloadCopyResult copy_result;
         try
@@ -934,7 +958,7 @@ void ObjectStorageBackend::publish(const BlobPublishRequest & request, Transport
             ErrorCodes::NOT_IMPLEMENTED,
             "ObjectStorageBackend::publish: verbatim staged publication requires Native mode");
 
-    WriteSettings write_settings;
+    WriteSettings write_settings = blobPublicationWriteSettings();
     write_settings.object_storage_copy_mode = ObjectStorageCopyMode::NativeOnly;
     if (!object_storage->supportsCopyMode(write_settings.object_storage_copy_mode))
         throw Exception(
@@ -1118,7 +1142,10 @@ Backend::RawListPage ObjectStorageBackend::listUnder(
     static constexpr size_t max_store_page = 1'000'000;
     const size_t store_page = cursor.empty() ? std::min(limit, max_store_page) + 1 : 0;
     RawListPage page;
-    auto it = object_storage->iterate(physical_prefix, /*max_keys=*/store_page, /*with_tags=*/false, start_after, request);
+    /// The page ends at its sentinel; a prefetched next page would be a request nobody reads.
+    ObjectStorageControlRequest page_request = request;
+    page_request.prefetch_next_page = false;
+    auto it = object_storage->iterate(physical_prefix, /*max_keys=*/store_page, /*with_tags=*/false, start_after, page_request);
     for (; it->isValid(); it->next())
     {
         const auto child = it->current();

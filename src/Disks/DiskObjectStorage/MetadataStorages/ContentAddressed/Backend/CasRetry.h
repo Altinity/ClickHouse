@@ -1,28 +1,45 @@
 #pragma once
 #include <cstdint>
+#include <limits>
 #include <optional>
 
 namespace DB::Cas
 {
 
 /// A retry policy for one logical CAS write, expressed WITHOUT touching a clock: `window_ms` is the
-/// policy's own budget measured from the call's start, and `lease_deadline_ms` (already reduced by
-/// the caller's safety margin) is an absolute bound on whatever clock the caller's mount lease is
-/// tracked against. Binding a policy to an absolute deadline is deferred to `bind`, which takes the
-/// caller's own `now_ms` -- `CasRequests` runs on an injected clock in tests, so a `Retry` built at
+/// policy's own budget measured from the call's start (empty: the default window of the request plane),
+/// and `lease_deadline_ms` (already reduced by the caller's safety margin) is an absolute bound on
+/// whatever clock the caller's mount lease is tracked against. Binding a policy to an absolute deadline
+/// is deferred to `bind`, which takes the caller's own `now_ms` -- `CasRequests` runs on an injected clock in tests, so a `Retry` built at
 /// construction time from the real clock could never be exercised deterministically, and `GaveUp`
 /// could not tell a lease-caused deadline from a policy-caused one without recording which bound won.
 struct Retry
 {
-    uint64_t window_ms;
+    std::optional<uint64_t> window_ms;
     std::optional<uint64_t> lease_deadline_ms;
     bool single_attempt;
+    /// Physical attempts that earlier submissions of the same logical operation already sent. Only the
+    /// write path's transport attempt number continues from here (so a re-decided write keeps the
+    /// configured, not the adaptive first-attempt, timeouts); result and observer counts stay per call.
+    uint32_t attempts_already_sent = 0;
+    /// False: after a write attempt whose fate is unknown, never send the same bytes again; return
+    /// `GaveUp::Unresolved` so the caller decides new bytes. For namespace-create step 1, whose catalog
+    /// row must differ per attempt. A clean conflict and a credential reissue are unaffected. Read
+    /// paths ignore it. Clear it only in a loop that decides again on a fresh read (`casUpdateImpl`
+    /// with `CasOperation::pauseBeforeRedecide`); any other caller gets a bare `GaveUp::Unresolved`.
+    bool resend_unresolved = true;
     /// An ABSOLUTE bound on the caller's own clock, replacing `window_ms` in `bind`. A hand-written
     /// loop freezes one before it starts (`CasOperation::freeze`) and shares it across every call it
     /// makes, so the loop as a whole ends when that deadline does instead of granting each of its
     /// iterations a fresh window. Empty for a single verb, which gets its window from where it is
     /// called.
     std::optional<uint64_t> policy_deadline_ms = std::nullopt;
+    /// When set, a reissue in `CasOperation`'s write and read loops waits until a draw from [0.8, 1.2]
+    /// of this has passed since the failed attempt started, instead of the growing backoff. A
+    /// first-attempt fuse timeout is still reissued at once.
+    std::optional<uint64_t> attempt_spacing_ms = std::nullopt;
+
+    static constexpr uint64_t kDefinitiveAttemptSpacingMs = 1'000;
 
     /// Full jitter: uniform(0, min(5000, 200 << (attempt-1))) milliseconds. `attempt` is 1-based;
     /// `attempt == 0` returns 0.
@@ -37,22 +54,40 @@ struct Retry
 
     /// A policy with `ms` milliseconds of its own budget and no lease bound.
     static Retry within(uint64_t ms) { return {.window_ms = ms, .lease_deadline_ms = std::nullopt, .single_attempt = false}; }
-    /// `within(90'000)` -- the default write policy.
-    static Retry standard() { return within(90'000); }
+    /// The default write policy: the window of the request plane it runs on.
+    static Retry standard() { return {.window_ms = std::nullopt, .lease_deadline_ms = std::nullopt, .single_attempt = false}; }
     /// A policy bound by the mount lease: `lease_deadline_ms` minus `margin`, clamped at 0 -- never
     /// risk a write landing after this node's fence may already be gone. `window_ms` defaults to the
-    /// standard 90 s write budget; a caller whose own budget is deliberately much smaller (the
+    /// window of the request plane; a caller whose own budget is deliberately much smaller (the
     /// graceful-shutdown farewell, whose window is derived from what ONE write costs, not from the
     /// standard policy) passes its own window explicitly, and `bind` still takes whichever of the two
     /// bounds is smaller.
-    static Retry untilLeaseSafe(uint64_t lease_deadline_ms, uint64_t margin, uint64_t window_ms = 90'000)
+    static Retry untilLeaseSafe(uint64_t lease_deadline_ms, uint64_t margin,
+                                std::optional<uint64_t> window_ms = std::nullopt)
     {
         return {.window_ms = window_ms,
                 .lease_deadline_ms = lease_deadline_ms > margin ? lease_deadline_ms - margin : 0,
                 .single_attempt = false};
     }
     /// The standard policy, but at most one attempt is ever sent.
-    static Retry once() { return {.window_ms = 90'000, .lease_deadline_ms = std::nullopt, .single_attempt = true}; }
+    static Retry once() { return {.window_ms = std::nullopt, .lease_deadline_ms = std::nullopt, .single_attempt = true}; }
+    /// No window and no lease bound: the operation ends on a definitive answer, or when the fence or the
+    /// caller's liveness refuses. Reissues are spaced by `kDefinitiveAttemptSpacingMs`.
+    static Retry untilDefinitive()
+    {
+        return {.window_ms = std::numeric_limits<uint64_t>::max(), .lease_deadline_ms = std::nullopt,
+                .single_attempt = false, .attempt_spacing_ms = kDefinitiveAttemptSpacingMs};
+    }
+    /// `spacing_draw_ms` minus what the failed attempt took, not below 0. A sample before the start
+    /// counts as no time taken.
+    static uint64_t spacedPause(uint64_t spacing_draw_ms, uint64_t attempt_started_ms, uint64_t now_ms);
+    /// A uniform draw in [0.8, 1.2] of `attempt_spacing_ms_`, saturating at the top of the range.
+    static uint64_t drawSpacing(uint64_t attempt_spacing_ms_);
+    /// The pause before the next attempt under `attempt_spacing_ms`: `spacedPause` of a fresh draw.
+    static uint64_t pauseAfterAttempt(uint64_t attempt_spacing_ms_, uint64_t attempt_started_ms, uint64_t now_ms)
+    {
+        return spacedPause(drawSpacing(attempt_spacing_ms_), attempt_started_ms, now_ms);
+    }
 
     /// This policy, made single-attempt. A frozen loop policy keeps its absolute deadline through it,
     /// which is what lets a loop send an unrepeatable request under the same bound as the rest.
@@ -70,11 +105,11 @@ struct Retry
         uint64_t deadline_ms;
         bool lease_bound;
     };
-    /// Bind this policy to `now_ms`: `deadline_ms = min(policy_deadline_ms ?: now_ms + window_ms,
-    /// lease_deadline_ms)`, `lease_bound` true exactly when the lease bound was the smaller of the
-    /// two. Called once at call entry with the owner's `now_ms()`. A frozen policy therefore keeps
+    /// Bind this policy to `now_ms`: `deadline_ms = min(policy_deadline_ms ?: now_ms + (window_ms ?:
+    /// default_window_ms), lease_deadline_ms)`, `lease_bound` true exactly when the lease bound was the
+    /// smaller of the two. Called once at call entry with the owner's `now_ms()`. A frozen policy therefore keeps
     /// the lease bound honest: the smaller of the two still wins, and still says so.
-    Bound bind(uint64_t now_ms) const;
+    Bound bind(uint64_t now_ms, uint64_t default_window_ms) const;
 };
 
 }
