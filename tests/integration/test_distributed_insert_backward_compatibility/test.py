@@ -9,7 +9,7 @@ node_shard = cluster.add_instance("node1", main_configs=["configs/remote_servers
 node_dist = cluster.add_instance(
     "node2",
     main_configs=["configs/remote_servers.xml"],
-    image="altinity/clickhouse-server",
+    image="clickhouse/clickhouse-server",
     tag=CLICKHOUSE_CI_MIN_TESTED_VERSION,
     stay_alive=True,
     with_installed_binary=True,
