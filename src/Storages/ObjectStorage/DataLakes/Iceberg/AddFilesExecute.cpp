@@ -41,7 +41,6 @@
 #include <Common/logger_useful.h>
 
 #include <Poco/JSON/Object.h>
-#include <Poco/JSON/Parser.h>
 #include <Poco/JSON/Stringifier.h>
 #include <Poco/String.h>
 
@@ -258,54 +257,12 @@ Poco::JSON::Array::Ptr buildNameMappingOfType(const Poco::Dynamic::Var & type_va
 
 constexpr auto name_mapping_property = "schema.name-mapping.default";
 
-/// Names that an existing name mapping gives each field id, over all nesting levels.
-void collectMappedNames(const Poco::JSON::Array::Ptr & mapping, std::unordered_map<Int64, std::vector<String>> & names_by_field_id)
-{
-    for (const auto & entry_var : *mapping)
-    {
-        const auto & entry = entry_var.extract<Poco::JSON::Object::Ptr>();
-        if (entry->has("field-id") && entry->has("names"))
-        {
-            auto & names = names_by_field_id[entry->getValue<Int64>("field-id")];
-            for (const auto & name_var : *entry->getArray("names"))
-                names.push_back(name_var.convert<String>());
-        }
-        if (entry->has("fields"))
-            collectMappedNames(entry->getArray("fields"), names_by_field_id);
-    }
-}
-
-/// Keep the names that the existing mapping gives each field before its own current name: files written
-/// before a rename still carry the old name.
-void mergeMappedNames(const Poco::JSON::Array::Ptr & mapping, const std::unordered_map<Int64, std::vector<String>> & old_names_by_field_id)
-{
-    for (const auto & entry_var : *mapping)
-    {
-        /// A copy of the pointer: the entry itself is modified.
-        Poco::JSON::Object::Ptr entry = entry_var.extract<Poco::JSON::Object::Ptr>();
-        auto old_it = old_names_by_field_id.find(entry->getValue<Int64>("field-id"));
-        if (old_it != old_names_by_field_id.end())
-        {
-            const String current_name = entry->getArray("names")->getElement<String>(0);
-            Poco::JSON::Array::Ptr names = new Poco::JSON::Array;
-            std::unordered_set<String> seen;
-            for (const auto & name : old_it->second)
-                if (seen.insert(name).second)
-                    names->add(name);
-            if (seen.insert(current_name).second)
-                names->add(current_name);
-            entry->set("names", names);
-        }
-        if (entry->has("fields"))
-            mergeMappedNames(entry->getArray("fields"), old_names_by_field_id);
-    }
-}
-
 /// Registered files are written by other tools and usually carry no Iceberg field ids. Without a name
 /// mapping, readers that resolve columns by id read them as NULLs or by position. Like `add_files` of
-/// iceberg-java, set the default name mapping from the current schema. An existing mapping is extended
-/// rather than kept as is: a field added since it was written would otherwise read as NULL from the
-/// registered files. Returns the new value of the property if it changed; `metadata` is updated too.
+/// iceberg-java, set the default name mapping from the current schema unless the table already has one.
+/// An existing mapping is kept as is: keeping it current with schema changes is the job of the schema
+/// update (as `UpdateSchema` does in iceberg-java), not of `add_files`.
+/// Returns the value of the property if it was set; `metadata` is updated too.
 std::optional<String> updateDefaultNameMapping(Poco::JSON::Object::Ptr metadata, const Poco::JSON::Object::Ptr & current_schema)
 {
     Poco::JSON::Object::Ptr properties;
@@ -316,28 +273,15 @@ std::optional<String> updateDefaultNameMapping(Poco::JSON::Object::Ptr metadata,
         properties = new Poco::JSON::Object;
         metadata->set(Iceberg::f_properties, properties);
     }
+    if (properties->has(name_mapping_property))
+        return std::nullopt;
 
     Poco::JSON::Object::Ptr schema_as_struct = new Poco::JSON::Object;
     schema_as_struct->set(Iceberg::f_type, "struct");
     schema_as_struct->set(Iceberg::f_fields, current_schema->getArray(Iceberg::f_fields));
-    auto mapping = buildNameMappingOfType(Poco::Dynamic::Var(schema_as_struct));
-
-    std::optional<String> old_value;
-    if (properties->has(name_mapping_property))
-    {
-        old_value = properties->getValue<String>(name_mapping_property);
-        Poco::JSON::Parser parser;
-        auto old_mapping = parser.parse(*old_value).extract<Poco::JSON::Array::Ptr>();
-        std::unordered_map<Int64, std::vector<String>> old_names_by_field_id;
-        collectMappedNames(old_mapping, old_names_by_field_id);
-        mergeMappedNames(mapping, old_names_by_field_id);
-    }
-
-    String new_value = stringifyJSON(mapping, /* indent */ 0);
-    if (old_value == new_value)
-        return std::nullopt;
-    properties->set(name_mapping_property, new_value);
-    return new_value;
+    String value = stringifyJSON(buildNameMappingOfType(Poco::Dynamic::Var(schema_as_struct)), /* indent */ 0);
+    properties->set(name_mapping_property, value);
+    return value;
 }
 
 /// Expand trailing-slash paths into concrete *.parquet files below them.

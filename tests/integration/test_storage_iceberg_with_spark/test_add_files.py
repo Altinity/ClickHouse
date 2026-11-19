@@ -574,8 +574,7 @@ def name_mapping_of(metadata):
 @pytest.mark.parametrize("storage_type", ["local", "s3"])
 def test_add_files_spark_reads_by_name(started_cluster_iceberg_with_spark, storage_type):
     """Registered files carry no Iceberg field ids. add_files sets the default name mapping, so Spark
-    maps their columns by name, even when the file's column order differs from the schema. A column
-    added later is added to the existing mapping, so Spark reads it from files registered after that."""
+    maps their columns by name, even when the file's column order differs from the schema."""
     cluster = started_cluster_iceberg_with_spark
     env = AddFilesTestEnv(
         cluster, storage_type, "test_add_spark",
@@ -592,20 +591,6 @@ def test_add_files_spark_reads_by_name(started_cluster_iceberg_with_spark, stora
     assert sorted(names[0] for names in name_mapping_of(metadata).values()) == ["a", "b"]
     rows = cluster.spark_session.read.format("iceberg").load(local_dir).collect()
     assert sorted((row["a"], row["b"]) for row in rows) == [(1, "x"), (2, "y")]
-
-    env.query(f"ALTER TABLE {env.table_name} ADD COLUMN c Nullable(String)")
-    env.write_parquet_arrow("data/import", "with_c.parquet", pa.table({
-        "c": pa.array(["p"], type=pa.string()),
-        "a": pa.array([3], type=pa.int32()),
-        "b": pa.array(["z"], type=pa.string()),
-    }))
-    env.add_files(env.table_path("data/import", "with_c.parquet"))
-    assert env.query(f"SELECT a, b, c FROM {env.table_name} ORDER BY a") == "1\tx\t\\N\n2\ty\t\\N\n3\tz\tp\n"
-
-    local_dir, metadata = download_for_spark(cluster, storage_type, env.table_name)
-    assert sorted(names[0] for names in name_mapping_of(metadata).values()) == ["a", "b", "c"]
-    rows = cluster.spark_session.read.format("iceberg").load(local_dir).collect()
-    assert sorted((row["a"], row["b"], row["c"]) for row in rows) == [(1, "x", None), (2, "y", None), (3, "z", "p")]
 
 
 @pytest.mark.parametrize("storage_type", ["local", "s3"])
