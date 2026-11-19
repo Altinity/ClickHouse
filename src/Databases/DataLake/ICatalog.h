@@ -15,6 +15,7 @@
 #include <Poco/JSON/Object.h>
 
 #include <functional>
+#include <map>
 #include <string_view>
 #include <unordered_map>
 
@@ -332,6 +333,18 @@ public:
 
     /// Updates metadata in catalog.
     virtual bool updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr new_snapshot, const DB::ForwardedAuthTokenPtr & auth_token) const;
+
+    /// Like `updateMetadata`, and also sets the table properties `properties_to_set` in the same commit.
+    /// A non-transactional catalog only stores a pointer to `new_metadata_path`, which already holds the
+    /// properties, so the default implementation delegates to `updateMetadata` for it. A transactional
+    /// catalog applies the updates itself and must override this to send the properties.
+    virtual bool updateMetadataAndProperties(
+        const String & namespace_name,
+        const String & table_name,
+        const String & new_metadata_path,
+        Poco::JSON::Object::Ptr new_snapshot,
+        const std::map<String, String> & properties_to_set,
+        const DB::ForwardedAuthTokenPtr & auth_token) const;
 
     /// Commit a schema evolution (ADD/DROP/MODIFY/RENAME COLUMN) to the catalog.
     /// `new_metadata_path` is the path of the freshly written `vN.metadata.json`; it is used by

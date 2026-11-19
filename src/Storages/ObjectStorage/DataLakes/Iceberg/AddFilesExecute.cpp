@@ -41,6 +41,7 @@
 #include <Common/logger_useful.h>
 
 #include <Poco/JSON/Object.h>
+#include <Poco/JSON/Parser.h>
 #include <Poco/JSON/Stringifier.h>
 #include <Poco/String.h>
 
@@ -56,6 +57,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <unordered_set>
 
@@ -254,13 +256,58 @@ Poco::JSON::Array::Ptr buildNameMappingOfType(const Poco::Dynamic::Var & type_va
     return result;
 }
 
+constexpr auto name_mapping_property = "schema.name-mapping.default";
+
+/// Names that an existing name mapping gives each field id, over all nesting levels.
+void collectMappedNames(const Poco::JSON::Array::Ptr & mapping, std::unordered_map<Int64, std::vector<String>> & names_by_field_id)
+{
+    for (const auto & entry_var : *mapping)
+    {
+        const auto & entry = entry_var.extract<Poco::JSON::Object::Ptr>();
+        if (entry->has("field-id") && entry->has("names"))
+        {
+            auto & names = names_by_field_id[entry->getValue<Int64>("field-id")];
+            for (const auto & name_var : *entry->getArray("names"))
+                names.push_back(name_var.convert<String>());
+        }
+        if (entry->has("fields"))
+            collectMappedNames(entry->getArray("fields"), names_by_field_id);
+    }
+}
+
+/// Keep the names that the existing mapping gives each field before its own current name: files written
+/// before a rename still carry the old name.
+void mergeMappedNames(const Poco::JSON::Array::Ptr & mapping, const std::unordered_map<Int64, std::vector<String>> & old_names_by_field_id)
+{
+    for (const auto & entry_var : *mapping)
+    {
+        /// A copy of the pointer: the entry itself is modified.
+        Poco::JSON::Object::Ptr entry = entry_var.extract<Poco::JSON::Object::Ptr>();
+        auto old_it = old_names_by_field_id.find(entry->getValue<Int64>("field-id"));
+        if (old_it != old_names_by_field_id.end())
+        {
+            const String current_name = entry->getArray("names")->getElement<String>(0);
+            Poco::JSON::Array::Ptr names = new Poco::JSON::Array;
+            std::unordered_set<String> seen;
+            for (const auto & name : old_it->second)
+                if (seen.insert(name).second)
+                    names->add(name);
+            if (seen.insert(current_name).second)
+                names->add(current_name);
+            entry->set("names", names);
+        }
+        if (entry->has("fields"))
+            mergeMappedNames(entry->getArray("fields"), old_names_by_field_id);
+    }
+}
+
 /// Registered files are written by other tools and usually carry no Iceberg field ids. Without a name
 /// mapping, readers that resolve columns by id read them as NULLs or by position. Like `add_files` of
-/// iceberg-java, set the default name mapping from the current schema unless the table already has one.
-void ensureDefaultNameMapping(Poco::JSON::Object::Ptr metadata, const Poco::JSON::Object::Ptr & current_schema)
+/// iceberg-java, set the default name mapping from the current schema. An existing mapping is extended
+/// rather than kept as is: a field added since it was written would otherwise read as NULL from the
+/// registered files. Returns the new value of the property if it changed; `metadata` is updated too.
+std::optional<String> updateDefaultNameMapping(Poco::JSON::Object::Ptr metadata, const Poco::JSON::Object::Ptr & current_schema)
 {
-    static constexpr auto name_mapping_property = "schema.name-mapping.default";
-
     Poco::JSON::Object::Ptr properties;
     if (metadata->has(Iceberg::f_properties) && !metadata->isNull(Iceberg::f_properties))
         properties = metadata->getObject(Iceberg::f_properties);
@@ -269,14 +316,28 @@ void ensureDefaultNameMapping(Poco::JSON::Object::Ptr metadata, const Poco::JSON
         properties = new Poco::JSON::Object;
         metadata->set(Iceberg::f_properties, properties);
     }
-    if (properties->has(name_mapping_property))
-        return;
 
     Poco::JSON::Object::Ptr schema_as_struct = new Poco::JSON::Object;
     schema_as_struct->set(Iceberg::f_type, "struct");
     schema_as_struct->set(Iceberg::f_fields, current_schema->getArray(Iceberg::f_fields));
     auto mapping = buildNameMappingOfType(Poco::Dynamic::Var(schema_as_struct));
-    properties->set(name_mapping_property, stringifyJSON(mapping, /* indent */ 0));
+
+    std::optional<String> old_value;
+    if (properties->has(name_mapping_property))
+    {
+        old_value = properties->getValue<String>(name_mapping_property);
+        Poco::JSON::Parser parser;
+        auto old_mapping = parser.parse(*old_value).extract<Poco::JSON::Array::Ptr>();
+        std::unordered_map<Int64, std::vector<String>> old_names_by_field_id;
+        collectMappedNames(old_mapping, old_names_by_field_id);
+        mergeMappedNames(mapping, old_names_by_field_id);
+    }
+
+    String new_value = stringifyJSON(mapping, /* indent */ 0);
+    if (old_value == new_value)
+        return std::nullopt;
+    properties->set(name_mapping_property, new_value);
+    return new_value;
 }
 
 /// Expand trailing-slash paths into concrete *.parquet files below them.
@@ -381,6 +442,8 @@ struct AnalyzedFile
     std::unordered_map<Int32, ColumnBounds> bounds_by_field_id;
     /// Field ids whose null count is known for every row group of the file.
     std::unordered_map<Int32, Int64> complete_null_counts;
+    /// Field ids whose parquet column cannot hold nulls (it and all its parents are `REQUIRED`).
+    std::unordered_set<Int32> non_nullable_field_ids;
 };
 
 /// Check that the parquet column has exactly the representation that the Iceberg type requires,
@@ -552,6 +615,8 @@ AnalyzedFile analyzeFile(
             continue;
         checkParquetColumnType(*descriptor, type_it->second, registration_path);
         columns_with_bounds.insert(static_cast<Int32>(field_it->second));
+        if (descriptor->max_definition_level() == 0)
+            result.non_nullable_field_ids.insert(static_cast<Int32>(field_it->second));
     }
 
     std::unordered_map<Int32, Int64> column_sizes;
@@ -1088,8 +1153,27 @@ AddFilesResult addFiles(
     {
         for (const auto & [field_path, field_id] : column_path_to_field_id)
         {
-            if (!iceberg_type_by_field_id.contains(field_id) || file.bounds_by_field_id.contains(static_cast<Int32>(field_id)))
+            if (!iceberg_type_by_field_id.contains(field_id))
                 continue;
+            if (file.bounds_by_field_id.contains(static_cast<Int32>(field_id)))
+            {
+                /// A required field must have a value in every row. Readers return the type default or fail
+                /// for nulls in it, so the file must prove that the column has none.
+                if (required_field_ids.contains(field_id) && !file.non_nullable_field_ids.contains(static_cast<Int32>(field_id)))
+                {
+                    auto null_count_it = file.complete_null_counts.find(static_cast<Int32>(field_id));
+                    if (null_count_it == file.complete_null_counts.end())
+                        throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                            "add_files: column '{}' of file {} is required in the table schema, but the file may contain "
+                            "nulls in it: the column is optional in the file and the parquet footer has no complete null counts",
+                            field_path, file.registration_path);
+                    if (null_count_it->second != 0)
+                        throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                            "add_files: column '{}' of file {} is required in the table schema, but the file contains {} null(s) in it",
+                            field_path, file.registration_path, null_count_it->second);
+                }
+                continue;
+            }
             if (required_field_ids.contains(field_id))
                 throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
                     "add_files: file {} lacks column '{}', which is required in the table schema",
@@ -1312,7 +1396,10 @@ AddFilesResult addFiles(
             }
 
             {
-                ensureDefaultNameMapping(metadata, lookupSchema(metadata, original_schema_id));
+                /// A transactional catalog builds the new metadata itself, so the changed property is sent with the commit.
+                std::map<String, String> properties_to_set;
+                if (auto name_mapping = updateDefaultNameMapping(metadata, lookupSchema(metadata, original_schema_id)))
+                    properties_to_set.emplace(name_mapping_property, *name_mapping);
                 std::string json_representation = stringifyJSON(metadata, 4);
 
                 /// A transactional catalog writes the metadata file itself, as for native inserts.
@@ -1341,7 +1428,8 @@ AddFilesResult addFiles(
                     {
                         /// The snapshot is already visible through storage: deleting its files would break it, and a
                         /// retry would build on it. Keep the files and report the error.
-                        if (!catalog->updateMetadata(namespace_name, table, catalog_filename, new_snapshot, context->getForwardedAuthToken()))
+                        if (!catalog->updateMetadataAndProperties(
+                                namespace_name, table, catalog_filename, new_snapshot, properties_to_set, context->getForwardedAuthToken()))
                             throw Exception(
                                 ErrorCodes::DATALAKE_DATABASE_ERROR,
                                 "add_files: Iceberg metadata {} of table {}.{} was committed to storage, but the catalog rejected "
@@ -1355,7 +1443,8 @@ AddFilesResult addFiles(
                         std::exception_ptr update_exception;
                         try
                         {
-                            updated = catalog->updateMetadata(namespace_name, table, catalog_filename, new_snapshot, context->getForwardedAuthToken());
+                            updated = catalog->updateMetadataAndProperties(
+                                namespace_name, table, catalog_filename, new_snapshot, properties_to_set, context->getForwardedAuthToken());
                         }
                         catch (...)
                         {

@@ -523,6 +523,20 @@ bool ICatalog::updateMetadata(const String & /*namespace_name*/, const String & 
     throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "updateMetadata is not implemented");
 }
 
+bool ICatalog::updateMetadataAndProperties(
+    const String & namespace_name,
+    const String & table_name,
+    const String & new_metadata_path,
+    Poco::JSON::Object::Ptr new_snapshot,
+    const std::map<String, String> & properties_to_set,
+    const DB::ForwardedAuthTokenPtr & auth_token) const
+{
+    if (!properties_to_set.empty() && isTransactional())
+        throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
+            "Setting table properties together with a snapshot is not implemented for this catalog");
+    return updateMetadata(namespace_name, table_name, new_metadata_path, new_snapshot, auth_token);
+}
+
 bool ICatalog::updateSchema(
     const String & /*namespace_name*/,
     const String & /*table_name*/,

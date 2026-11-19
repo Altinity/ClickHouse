@@ -439,6 +439,21 @@ bool UnityV2Catalog::updateMetadata(
     });
 }
 
+bool UnityV2Catalog::updateMetadataAndProperties(
+    const String & namespace_name,
+    const String & table_name,
+    const String & new_metadata_path,
+    Poco::JSON::Object::Ptr new_snapshot,
+    const std::map<String, String> & properties_to_set,
+    const DB::ForwardedAuthTokenPtr & auth_token) const
+{
+    return requestWithRetry([&](bool force_refresh)
+    {
+        return getIcebergRestCatalog(force_refresh)->updateMetadataAndProperties(
+            namespace_name, table_name, new_metadata_path, new_snapshot, properties_to_set, auth_token);
+    });
+}
+
 bool UnityV2Catalog::updateSchema(
     const String & namespace_name,
     const String & table_name,

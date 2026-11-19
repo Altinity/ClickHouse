@@ -158,7 +158,7 @@ def test_add_files_basic(started_cluster_iceberg_with_spark, storage_type, forma
     """Register one external parquet file into an empty table and read it back."""
     env = AddFilesTestEnv(started_cluster_iceberg_with_spark, storage_type, "test_add_basic", format_version=format_version)
 
-    env.write_parquet("data/import", "f1.parquet", "SELECT number + 1 AS x FROM numbers(3)")
+    env.write_parquet("data/import", "f1.parquet", "SELECT toInt32(number + 1) AS x FROM numbers(3)")
     counts = env.add_files(env.table_path("data/import", "f1.parquet"))
 
     assert counts["files_registered"] == 1, f"got {counts}"
@@ -173,8 +173,8 @@ def test_add_files_array_form_multiple(started_cluster_iceberg_with_spark, stora
     """The array form registers several files in one snapshot."""
     env = AddFilesTestEnv(started_cluster_iceberg_with_spark, storage_type, "test_add_array")
 
-    env.write_parquet("data/import", "f1.parquet", "SELECT number AS x FROM numbers(3)")
-    env.write_parquet("data/import", "f2.parquet", "SELECT number + 10 AS x FROM numbers(3)")
+    env.write_parquet("data/import", "f1.parquet", "SELECT toInt32(number) AS x FROM numbers(3)")
+    env.write_parquet("data/import", "f2.parquet", "SELECT toInt32(number + 10) AS x FROM numbers(3)")
     counts = env.add_files([
         env.table_path("data/import", "f1.parquet"),
         env.table_path("data/import", "f2.parquet"),
@@ -192,7 +192,7 @@ def test_add_files_onto_nonempty_table(started_cluster_iceberg_with_spark, stora
     env = AddFilesTestEnv(started_cluster_iceberg_with_spark, storage_type, "test_add_nonempty")
 
     env.insert("(1), (2)")
-    env.write_parquet("data/import", "f1.parquet", "SELECT number + 100 AS x FROM numbers(3)")
+    env.write_parquet("data/import", "f1.parquet", "SELECT toInt32(number + 100) AS x FROM numbers(3)")
     counts = env.add_files(env.table_path("data/import", "f1.parquet"))
 
     assert counts["files_registered"] == 1, f"got {counts}"
@@ -205,9 +205,9 @@ def test_add_files_trailing_slash_expansion(started_cluster_iceberg_with_spark, 
     """A path ending with '/' registers every *.parquet below it, skipping hidden files."""
     env = AddFilesTestEnv(started_cluster_iceberg_with_spark, storage_type, "test_add_expand")
 
-    env.write_parquet("data/import", "f1.parquet", "SELECT 1 AS x")
-    env.write_parquet("data/import", "f2.parquet", "SELECT 2 AS x")
-    env.write_parquet("data/import", ".hidden.parquet", "SELECT 3 AS x")
+    env.write_parquet("data/import", "f1.parquet", "SELECT toInt32(1) AS x")
+    env.write_parquet("data/import", "f2.parquet", "SELECT toInt32(2) AS x")
+    env.write_parquet("data/import", ".hidden.parquet", "SELECT toInt32(3) AS x")
 
     counts = env.add_files(env.table_path("data/import", ""))
 
@@ -225,17 +225,17 @@ def test_add_files_partitioned_identity(started_cluster_iceberg_with_spark, stor
         partition_by="identity(x)",
     )
 
-    env.write_parquet("data/import", "f7.parquet", "SELECT 7 AS x FROM numbers(3)")
+    env.write_parquet("data/import", "f7.parquet", "SELECT toInt32(7) AS x FROM numbers(3)")
     counts = env.add_files(env.table_path("data/import", "f7.parquet"))
     assert counts["files_registered"] == 1, f"got {counts}"
     assert counts["partitions_touched"] == 1, f"got {counts}"
 
-    env.write_parquet("data/import", "f8.parquet", "SELECT 8 AS x FROM numbers(2)")
+    env.write_parquet("data/import", "f8.parquet", "SELECT toInt32(8) AS x FROM numbers(2)")
     counts = env.add_files(env.table_path("data/import", "f8.parquet"))
     assert counts["partitions_touched"] == 1, f"got {counts}"
     assert env.query(f"SELECT * FROM {env.table_name} ORDER BY x") == "7\n7\n7\n8\n8\n"
 
-    env.write_parquet("data/import", "mixed.parquet", "SELECT 7 AS x UNION ALL SELECT 8 AS x")
+    env.write_parquet("data/import", "mixed.parquet", "SELECT toInt32(7) AS x UNION ALL SELECT toInt32(8) AS x")
     error = env.add_files_error(env.table_path("data/import", "mixed.parquet"))
     assert "spans more than one partition" in error, f"got {error}"
     # The failed registration must not have committed anything.
@@ -277,7 +277,7 @@ def test_add_files_duplicate_detection(started_cluster_iceberg_with_spark, stora
     default; check_duplicate_files = 0 disables the check."""
     env = AddFilesTestEnv(started_cluster_iceberg_with_spark, storage_type, "test_add_dup")
 
-    env.write_parquet("data/import", "f1.parquet", "SELECT 1 AS x")
+    env.write_parquet("data/import", "f1.parquet", "SELECT toInt32(1) AS x")
     path = env.table_path("data/import", "f1.parquet")
 
     counts = env.add_files(path)
@@ -303,7 +303,7 @@ def test_add_files_allow_missing_columns(started_cluster_iceberg_with_spark, sto
         schema="(x Int32, y Nullable(String))",
     )
 
-    env.write_parquet("data/import", "only_x.parquet", "SELECT 1 AS x")
+    env.write_parquet("data/import", "only_x.parquet", "SELECT toInt32(1) AS x")
     path = env.table_path("data/import", "only_x.parquet")
 
     error = env.add_files_error(path)
@@ -330,9 +330,9 @@ def test_add_files_argument_errors(started_cluster_iceberg_with_spark, storage_t
         started_cluster_iceberg_with_spark, storage_type, "test_add_bucket",
         partition_by="icebergBucket(4, x)",
     )
-    env_bucket.write_parquet("data/import", "f1.parquet", "SELECT 1 AS x")
+    env_bucket.write_parquet("data/import", "f1.parquet", "SELECT toInt32(1) AS x")
     error = env_bucket.add_files_error(env_bucket.table_path("data/import", "f1.parquet"))
-    assert "bucket" in error, f"got {error}"
+    assert "bucket transform" in error, f"got {error}"
 
 
 @pytest.mark.parametrize("storage_type", ["local", "s3"])
@@ -420,7 +420,7 @@ def test_add_files_partition_value_needs_statistics(started_cluster_iceberg_with
 def test_add_files_requires_setting(started_cluster_iceberg_with_spark, storage_type):
     """add_files is experimental and gated by its own setting."""
     env = AddFilesTestEnv(started_cluster_iceberg_with_spark, storage_type, "test_add_setting")
-    env.write_parquet("data/import", "f1.parquet", "SELECT 1 AS x")
+    env.write_parquet("data/import", "f1.parquet", "SELECT toInt32(1) AS x")
 
     error = env.instance.query_and_get_error(
         env.add_files_query(env.table_path("data/import", "f1.parquet")),
@@ -437,7 +437,7 @@ def test_add_files_rejects_paths_outside_table_location(started_cluster_iceberg_
     the prefix, and not a path escaping the location with '..'."""
     env = AddFilesTestEnv(started_cluster_iceberg_with_spark, storage_type, "test_add_outside")
     other = AddFilesTestEnv(started_cluster_iceberg_with_spark, storage_type, "test_add_outside_other")
-    other.write_parquet("data/import", "f1.parquet", "SELECT 1 AS x")
+    other.write_parquet("data/import", "f1.parquet", "SELECT toInt32(1) AS x")
 
     for path in [
         other.table_path("data/import", "f1.parquet"),
@@ -457,7 +457,7 @@ def test_add_files_rejects_paths_outside_table_location(started_cluster_iceberg_
 def test_add_files_empty_directory(started_cluster_iceberg_with_spark, storage_type):
     """A directory without parquet files is an error instead of an empty snapshot."""
     env = AddFilesTestEnv(started_cluster_iceberg_with_spark, storage_type, "test_add_empty_dir")
-    env.write_parquet("data/import", ".hidden.parquet", "SELECT 1 AS x")
+    env.write_parquet("data/import", ".hidden.parquet", "SELECT toInt32(1) AS x")
 
     error = env.add_files_error(env.table_path("data/import", ""))
     assert "contains no parquet files" in error, f"got {error}"
@@ -540,10 +540,42 @@ def test_add_files_truncate_multibyte(started_cluster_iceberg_with_spark, storag
     assert env.count() == 3
 
 
+def download_for_spark(cluster, storage_type, table_name):
+    """Copy the table to the host for Spark and point the version hint at the latest metadata file.
+    Returns the local table directory and the parsed latest metadata."""
+    local_dir = f"/var/lib/clickhouse/user_files/iceberg_data/default/{table_name}/"
+    default_download_directory(cluster, storage_type, local_dir, local_dir)
+    metadata_dir = os.path.join(local_dir, "metadata")
+    versions = {}
+    for name in os.listdir(metadata_dir):
+        match = re.match(r"v(\d+)(?:[-.].*)?\.metadata\.json$", name)
+        if match:
+            versions[int(match.group(1))] = name
+    latest = max(versions)
+    with open(os.path.join(metadata_dir, "version-hint.text"), "w") as hint:
+        hint.write(str(latest))
+    with open(os.path.join(metadata_dir, versions[latest])) as f:
+        return local_dir, json.load(f)
+
+
+def name_mapping_of(metadata):
+    """Field id -> names of the default name mapping, over all nesting levels."""
+    result = {}
+
+    def walk(entries):
+        for entry in entries:
+            result[entry["field-id"]] = entry["names"]
+            walk(entry.get("fields", []))
+
+    walk(json.loads(metadata["properties"]["schema.name-mapping.default"]))
+    return result
+
+
 @pytest.mark.parametrize("storage_type", ["local", "s3"])
 def test_add_files_spark_reads_by_name(started_cluster_iceberg_with_spark, storage_type):
     """Registered files carry no Iceberg field ids. add_files sets the default name mapping, so Spark
-    maps their columns by name, even when the file's column order differs from the schema."""
+    maps their columns by name, even when the file's column order differs from the schema. A column
+    added later is added to the existing mapping, so Spark reads it from files registered after that."""
     cluster = started_cluster_iceberg_with_spark
     env = AddFilesTestEnv(
         cluster, storage_type, "test_add_spark",
@@ -556,22 +588,49 @@ def test_add_files_spark_reads_by_name(started_cluster_iceberg_with_spark, stora
     env.add_files(env.table_path("data/import", "reordered.parquet"))
     assert env.query(f"SELECT a, b FROM {env.table_name} ORDER BY a") == "1\tx\n2\ty\n"
 
-    local_dir = f"/var/lib/clickhouse/user_files/iceberg_data/default/{env.table_name}/"
-    default_download_directory(cluster, storage_type, local_dir, local_dir)
-    metadata_dir = os.path.join(local_dir, "metadata")
-    versions = {}
-    for name in os.listdir(metadata_dir):
-        match = re.match(r"v(\d+)(?:[-.].*)?\.metadata\.json$", name)
-        if match:
-            versions[int(match.group(1))] = name
-    latest = max(versions)
-    with open(os.path.join(metadata_dir, "version-hint.text"), "w") as hint:
-        hint.write(str(latest))
-
-    with open(os.path.join(metadata_dir, versions[latest])) as f:
-        properties = json.load(f).get("properties", {})
-    mapping = json.loads(properties["schema.name-mapping.default"])
-    assert sorted(entry["names"][0] for entry in mapping) == ["a", "b"], f"got {mapping}"
-
+    local_dir, metadata = download_for_spark(cluster, storage_type, env.table_name)
+    assert sorted(names[0] for names in name_mapping_of(metadata).values()) == ["a", "b"]
     rows = cluster.spark_session.read.format("iceberg").load(local_dir).collect()
     assert sorted((row["a"], row["b"]) for row in rows) == [(1, "x"), (2, "y")]
+
+    env.query(f"ALTER TABLE {env.table_name} ADD COLUMN c Nullable(String)")
+    env.write_parquet_arrow("data/import", "with_c.parquet", pa.table({
+        "c": pa.array(["p"], type=pa.string()),
+        "a": pa.array([3], type=pa.int32()),
+        "b": pa.array(["z"], type=pa.string()),
+    }))
+    env.add_files(env.table_path("data/import", "with_c.parquet"))
+    assert env.query(f"SELECT a, b, c FROM {env.table_name} ORDER BY a") == "1\tx\t\\N\n2\ty\t\\N\n3\tz\tp\n"
+
+    local_dir, metadata = download_for_spark(cluster, storage_type, env.table_name)
+    assert sorted(names[0] for names in name_mapping_of(metadata).values()) == ["a", "b", "c"]
+    rows = cluster.spark_session.read.format("iceberg").load(local_dir).collect()
+    assert sorted((row["a"], row["b"], row["c"]) for row in rows) == [(1, "x", None), (2, "y", None), (3, "z", "p")]
+
+
+@pytest.mark.parametrize("storage_type", ["local", "s3"])
+def test_add_files_nulls_in_required_column(started_cluster_iceberg_with_spark, storage_type):
+    """A required field must have a value in every row, so a file with nulls in its column, or without
+    the null counts that prove it has none, is rejected. A column that cannot hold nulls needs no counts."""
+    env = AddFilesTestEnv(
+        started_cluster_iceberg_with_spark, storage_type, "test_add_required_nulls",
+        schema="(x Int32)",
+    )
+
+    env.write_parquet_arrow("data/import", "nulls.parquet", pa.table({"x": pa.array([1, None], type=pa.int32())}))
+    error = env.add_files_error(env.table_path("data/import", "nulls.parquet"))
+    assert "contains 1 null(s)" in error, f"got {error}"
+
+    env.write_parquet_arrow(
+        "data/import", "no_stats.parquet", pa.table({"x": pa.array([1, 2], type=pa.int32())}), write_statistics=False)
+    error = env.add_files_error(env.table_path("data/import", "no_stats.parquet"))
+    assert "may contain nulls" in error, f"got {error}"
+    assert env.count() == 0
+
+    required = pa.schema([pa.field("x", pa.int32(), nullable=False)])
+    env.write_parquet_arrow(
+        "data/import", "required.parquet", pa.table({"x": pa.array([1, 2], type=pa.int32())}, schema=required),
+        write_statistics=False)
+    counts = env.add_files(env.table_path("data/import", "required.parquet"))
+    assert counts["files_registered"] == 1, f"got {counts}"
+    assert env.count() == 2
