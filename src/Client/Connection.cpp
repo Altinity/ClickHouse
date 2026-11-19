@@ -962,9 +962,10 @@ bool Connection::ping(const ConnectionTimeouts & timeouts, bool rethrow_on_timeo
     catch (const Exception & e)
     {
         /// `Exception` extends `Poco::Exception`, so this arm has to come first. A read or write
-        /// that reaches `sync_request_timeout` is `SOCKET_TIMEOUT`. With `rethrow_on_timeout` the
-        /// caller skips the replica. Every other failure still returns false, and `checkConnected`
-        /// keeps its old contract.
+        /// that reaches `sync_request_timeout` is `SOCKET_TIMEOUT`. With `rethrow_on_timeout` that
+        /// timeout is rethrown: the cluster-read caller reconnects once and caps that handshake by
+        /// `sync_request_timeout`. The replica is skipped only if the reconnect fails. Every other
+        /// failure still returns false, and `checkConnected` keeps its old contract.
         const bool timed_out = rethrow_on_timeout && e.code() == ErrorCodes::SOCKET_TIMEOUT;
         disconnect();
         LOG_TRACE(log_wrapper.get(), fmt::runtime(e.displayText()));
