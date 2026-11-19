@@ -736,7 +736,14 @@ void IStorageCluster::read(
     {
         /// Re-analyzing the shard AST resolves a `DataLakeCatalog` table again and repeats a remote catalog lookup.
         if (canReuseResolvedQueryTreeForHeader() && resolved_query_tree)
-            sample_block = InterpreterSelectQueryAnalyzer::getSampleBlock(resolved_query_tree, context, SelectQueryOptions(processed_stage));
+        {
+            /// The rewritten left scan keeps the outer alias (`__table2` when this table is not leftmost).
+            /// A shard re-analyzes the sent AST and `createUniqueAliasesIfNecessary` restarts at `__table1`.
+            auto header_tree = resolved_query_tree->clone();
+            createUniqueAliasesIfNecessary(header_tree, context);
+            sample_block = InterpreterSelectQueryAnalyzer::getSampleBlock(
+                header_tree, context, SelectQueryOptions(processed_stage));
+        }
         else if (canReuseResolvedQueryTreeForHeader() && query_to_send == query_info.query && query_info.query_tree)
         {
             /// A shard re-analyzes this query and `createUniqueAliasesIfNecessary` restarts `__tableN` at 1.
