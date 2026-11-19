@@ -2061,11 +2061,16 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     /// that the object was replaced. Re-read the identity before using its ETag as the cache key.
     /// An unchanged object keeps the same key. A replaced object gets a new key and is read again.
     /// The parquet flag is only a footer-only count: other Parquet reads still check the ETag on GET.
-    if ((use_filesystem_cache || use_page_cache || revalidate_identity_for_parquet_metadata_cache)
-        && object_info.metadata
-        && object_info.metadata->is_from_identity_cache
+    ///
+    /// The same re-read is required when this query does not check the ETag at all. `getObjectMetadata`
+    /// skips the hit when the query context carries `s3_validate_etag_on_read = 0`, but a hit taken
+    /// without that context still has the previous size, and a small-file prefetch stops at that size.
+    const bool identity_from_cache = object_info.metadata && object_info.metadata->is_from_identity_cache;
+    const bool revalidate_for_content_cache = identity_from_cache
+        && (use_filesystem_cache || use_page_cache || revalidate_identity_for_parquet_metadata_cache)
         && object_info.metadata->is_size_known
-        && object_info.metadata->isEtagUsableAsCacheKey())
+        && object_info.metadata->isEtagUsableAsCacheKey();
+    if (revalidate_for_content_cache || (identity_from_cache && !validate_etag_on_read))
     {
         object_info.metadata = object_storage->getObjectMetadataIgnoringIdentityCache(object_info, /*with_tags=*/ false);
     }

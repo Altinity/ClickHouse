@@ -1070,7 +1070,22 @@ ObjectMetadata S3ObjectStorage::getObjectMetadataImpl(const std::string & path, 
         if (auto global_context = Context::getGlobalContextInstance())
             identity_cache = global_context->getObjectStorageIdentityCache();
 
-        if (use_identity_cache && identity_cache)
+        /// A cached size is the right bound of a small-file prefetch and the file length for Parquet.
+        /// That is safe when the GET is pinned to the cached ETag. With `s3_validate_etag_on_read` off
+        /// (including `compatibility` before 26.7) nothing checks the ETag, so an external replace would
+        /// be read as the previous generation. Skip the hit and HEAD. The result is still stored, so a
+        /// later read that does check the ETag can hit.
+        bool consult_identity_cache = use_identity_cache;
+        if (consult_identity_cache)
+        {
+            if (auto query_context = CurrentThread::tryGetQueryContext())
+            {
+                if (!query_context->getSettingsRef()[Setting::s3_validate_etag_on_read])
+                    consult_identity_cache = false;
+            }
+        }
+
+        if (consult_identity_cache && identity_cache)
         {
             /// Computed only for a lookup. `getCredentials` resolves an assumed role, and a different
             /// secret must not reuse this entry. The STS test mock returns one access key for every session.
