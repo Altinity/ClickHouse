@@ -9,7 +9,7 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$CUR_DIR"/../shell_config.sh
 
 D="${CLICKHOUSE_DATABASE}_dd1"
-DISK="disk(type = object_storage, object_storage_type = local, metadata_type = cas, cas_server_root_id = '${D}', name = '${D}', path = '${CLICKHOUSE_USER_FILES_UNIQUE}_dd1/', cas_gc_enabled = 0)"
+DISK="disk(type = object_storage, object_storage_type = local, metadata_type = cas, cas_unsafe_remount_no_delay = 1, cas_server_root_id = '${D}', name = '${D}', path = '${CLICKHOUSE_USER_FILES_UNIQUE}_dd1/', cas_gc_enabled = 0)"
 
 ${CLICKHOUSE_CLIENT} -q "DROP TABLE IF EXISTS t_dd1 SYNC"
 ${CLICKHOUSE_CLIENT} -q "CREATE TABLE t_dd1 (a UInt64, v UInt64) ENGINE = MergeTree ORDER BY a

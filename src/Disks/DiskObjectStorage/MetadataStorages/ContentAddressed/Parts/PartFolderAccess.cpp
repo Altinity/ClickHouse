@@ -566,7 +566,7 @@ std::optional<Cas::ManifestRef> CachedPartFolderAccess::renameCommittedRef(
     if (expected && !(resolved->manifest_id.ref == *expected))
         Cas::throwCasOwnershipConflict("renameCommittedRef: source '{}' names another manifest than the one this rename read; "
             "the part must be re-resolved", src.ns.string() + "/" + src.ref);
-    /// A writable mount always admits owner moves (`Pool::open` raises the reader floor first), so inside
+    /// A writable mount always admits owner moves (`mountWritable` raises the reader floor first), so inside
     /// one namespace the only reason to republish is a committed destination: an earlier attempt published
     /// it by republication and crashed before dropping the source. `republishRef` completes that re-drive
     /// when the content is equal and conflicts when it differs.

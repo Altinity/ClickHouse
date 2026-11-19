@@ -79,8 +79,8 @@ PoolPtr openPool(const BackendPtr & backend)
     /// about chunking and op-caps, none about wall-clock lease behaviour, so any of them that runs
     /// long enough simply dies of an unrelated fence trip: `DropNamespaceOverOpCapSucceeds` (5200
     /// refs) takes 43-65s under a sanitizer and failed deterministically on all three sanitizer CI
-    /// builds with `txn is UNCERTAIN (retry budget exhausted)` — the pre-attempt fence reject, not a
-    /// real retry exhaustion. Same artifact, same fix as
+    /// builds with `mount fence tripped` — the pre-attempt fence reject, not a real retry
+    /// exhaustion. Same artifact, same fix as
     /// `CASPartWriteTxn.ManifestCapEncodedBytesJustUnderStagesSuccessfully` (2026-07-18): decouple the
     /// fence from execution speed. The waits in this file are `steady_clock` timeouts on futures and
     /// condvars, which are unaffected by this injection.
@@ -437,7 +437,7 @@ TEST(CASRefWriterChunkedFlush, DropNamespaceOverOpCapSucceeds)
         .checkpoint_snapshot_id = RefTxnId{epoch, 1},
         .last_epoch_seal = std::nullopt,
     });
-    CasRequests catalog_requests(backend, Fence::open());
+    CasRequests catalog_requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation catalog_op = catalog_requests.admit();
     const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(catalog_op, layout, ns).value();
     backend->resetCounts();
@@ -1029,6 +1029,9 @@ TEST(CASRefWriterChunkedFlush, SnapshotPublisherLatchedAcrossChunks)
     auto backend = std::make_shared<ChunkFaultBackend>();
     PoolConfig cfg;
     cfg.snapshot_log_count_threshold = 0;   /// every committed chunk crosses the tail-count threshold
+    /// A setup publisher that meets a `Writing` lane gives up; a backoff armed on the frozen clock would
+    /// then delay the parked `_snap/` PUT this test waits for.
+    cfg.snapshot_publish_backoff_initial_ms = 0;
     auto store = openPoolWith(backend, cfg);
     const DB::Cas::Layout & layout = store->layout();
     const RootNamespace ns{"srv1/chunk_snapshot_coalesce"};
@@ -1060,6 +1063,7 @@ TEST(CASRefWriterChunkedFlush, SnapshotPublisherLatchedAcrossChunks)
     seed_build->promote(ns, "seed", seed_build->buildId(), seed_manifest_id);
     store->waitForSnapshotPublishSettleForTest(ns);   /// drain the seed's publish chain -> tail == 0
     store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns);
+    ASSERT_EQ(store->tailSinceSnapshotCountForTest(ns), 0u) << "the setup must end with a compacted tail";
 
     /// Latch the FIRST `_snap/` PUT (chunk 1's publisher) at its conditional PUT -- i.e. AFTER it has
     /// captured chunk 1's prefix under state_mutex.

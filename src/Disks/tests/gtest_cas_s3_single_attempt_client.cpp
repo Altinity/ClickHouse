@@ -25,6 +25,7 @@
 #include <chrono>
 #include <exception>
 #include <functional>
+#include <algorithm>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -220,12 +221,14 @@ public:
 };
 
 /// A genuine `S3ObjectStorage` pointed at `endpoint`. `base_request_timeout_ms` is the base client's
-/// request AND connect timeout -- comfortably above the server's simulated delay, so a `Default` call
-/// succeeds. No SDK-level retry (`RetryStrategy{.max_retries = 0}`,
-/// `s3_slow_all_threads_after_retryable_error = false`): a retry would blur "the single-attempt clone
-/// made exactly one request" into "the SDK also tried again".
+/// request AND connect timeout. It is usually above the server's simulated delay, so a `Default` call
+/// succeeds; a test that needs the base client to time out passes a smaller one. `adaptive_timeouts`
+/// turns on the first-attempt timeouts, for a test about what a first attempt gets. No SDK-level retry
+/// (`RetryStrategy{.max_retries = 0}`, `s3_slow_all_threads_after_retryable_error = false`): a retry
+/// would blur "the single-attempt clone made exactly one request" into "the SDK also tried again".
 template <typename Storage = DB::S3ObjectStorage>
-std::shared_ptr<Storage> makeDispatchStorageForTest(const std::string & endpoint, long base_request_timeout_ms)
+std::shared_ptr<Storage> makeDispatchStorageForTest(
+    const std::string & endpoint, long base_request_timeout_ms, bool adaptive_timeouts = false)
 {
     DB::RemoteHostFilter remote_host_filter;
     DB::S3::PocoHTTPClientConfiguration cfg = DB::S3::ClientFactory::instance().createClientConfiguration(
@@ -245,8 +248,9 @@ std::shared_ptr<Storage> makeDispatchStorageForTest(const std::string & endpoint
     /// The adaptive-timeout strategy gives the FIRST attempt a much shorter deadline than
     /// `requestTimeoutMs` and only widens it on a later retry -- with SDK retries disabled above, that
     /// first (short) deadline is the only one this client ever gets, which would time out well under
-    /// `server_delay` regardless of `requestTimeoutMs`. Off, so `requestTimeoutMs` governs uniformly.
-    cfg.s3_use_adaptive_timeouts = false;
+    /// `server_delay` regardless of `requestTimeoutMs`. Off, so `requestTimeoutMs` governs uniformly,
+    /// unless the test is about what the first attempt gets.
+    cfg.s3_use_adaptive_timeouts = adaptive_timeouts;
     /// Each `{ }` block below creates and destroys its OWN ephemeral-port server; the default 30 s
     /// keep-alive would let the client pool a persistent connection that can outlive it. If a LATER
     /// block's server happens to be assigned that same now-free port (routine under many back-to-back
@@ -718,6 +722,34 @@ TEST(CASEnvelopeWiring, ProductionDispatchAppliesTheFrozenConnectCapAtConnectTim
     }
 }
 
+/// The mount-time versioning probe has no caller-side reissue, so its one attempt must get the attempt
+/// timeout rather than the adaptive first-attempt one: a versioned bucket that answers later is still
+/// detected. The base request timeout is below the server delay, so a probe that kept it would time out.
+TEST(CASEnvelopeWiring, BucketVersioningProbeSingleAttemptOutlastsTheFirstAttemptTimeouts)
+{
+    (void)contextForTest();
+
+    DelayedResponseServer server(std::chrono::milliseconds(1000), [](Poco::Net::HTTPServerResponse & response)
+    {
+        static const std::string body
+            = "<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Enabled</Status>"
+              "</VersioningConfiguration>";
+        response.setContentType("application/xml");
+        response.setContentLength(body.size());
+        response.setStatus(Poco::Net::HTTPResponse::HTTP_OK);
+        response.send() << body;
+    });
+    auto storage = makeDispatchStorageForTest(server.getUrl(), /*base_request_timeout_ms=*/300, /*adaptive_timeouts=*/true);
+
+    const auto versioned = storage->isBucketVersioningEnabled(DB::ObjectStorageControlRequest{
+        .profile = DB::ObjectStorageRetryProfile::SingleAttempt,
+        .attempt_timeout_ms = 5000,
+        .connect_timeout_cap_ms = 1000});
+    ASSERT_TRUE(versioned.has_value()) << "the probe gave up before the attempt timeout";
+    EXPECT_TRUE(*versioned);
+    EXPECT_EQ(server.requestsSeen(), 1u);
+}
+
 /// `FreezeConnectTimeoutCapSnapshot` above pins the ARITHMETIC of `freezeConnectTimeoutCapMs` in
 /// isolation; `ProductionDispatchAppliesTheFrozenConnectCapAtConnectTime` pins that a cap handed
 /// DIRECTLY to `S3ObjectStorage` reaches the connect phase. Neither proves the composition
@@ -763,7 +795,7 @@ TEST(CASEnvelopeWiring, FreezeConnectTimeoutCapReachesTheBackendOverProductionDi
         storage, DB::Cas::ObjectStorageBackend::Mode::Native,
         /*single_attempt_control_plane_=*/false, /*attempt_timeout_ms_=*/0, /*connect_timeout_cap_ms_=*/0);
     {
-        DB::Cas::CasRequests requests(DB::Cas::BackendPtr(uncapped_backend), DB::Cas::Fence::open());
+        DB::Cas::CasRequests requests(DB::Cas::BackendPtr(uncapped_backend), DB::Cas::Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
         auto op = requests.admit();
         EXPECT_TRUE(op.head("k", DB::Cas::Retry::once()).has_value());
         EXPECT_FALSE(storage->hasSingleAttemptClientForTest(0, 0))
@@ -780,7 +812,7 @@ TEST(CASEnvelopeWiring, FreezeConnectTimeoutCapReachesTheBackendOverProductionDi
     /// only `hasSingleAttemptClientForTest`/`getSingleAttemptClient` below can show.
     EXPECT_EQ(capped_backend->connectTimeoutCapMs(), *cap);
     {
-        DB::Cas::CasRequests requests(DB::Cas::BackendPtr(capped_backend), DB::Cas::Fence::open());
+        DB::Cas::CasRequests requests(DB::Cas::BackendPtr(capped_backend), DB::Cas::Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
         auto op = requests.admit();
         EXPECT_TRUE(op.head("k", DB::Cas::Retry::once()).has_value());
         ASSERT_TRUE(storage->hasSingleAttemptClientForTest(cas_attempt_timeout_ms, *cap))
@@ -801,7 +833,7 @@ TEST(CASBackend, LargeConditionalPutIsOneRequestWithTheWholeBody)
 
     DelayedResponseServer server(std::chrono::milliseconds(0), acceptPut);
     auto backend = conditionalBackendForTest(makeDispatchStorageForTest(server.getUrl(), 10000));
-    DB::Cas::CasRequests requests(DB::Cas::BackendPtr(backend), DB::Cas::Fence::open());
+    DB::Cas::CasRequests requests(DB::Cas::BackendPtr(backend), DB::Cas::Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
 
     const std::string body(3 * 1024 * 1024 + 1, 'L');
     auto op = requests.admit();
@@ -820,7 +852,7 @@ TEST(CASBackend, ConditionalPutRunsOnTheCallingThread)
     auto backend = conditionalBackendForTest(makeDispatchStorageForTest(server.getUrl(), 10000));
     EXPECT_FALSE(backend->conditionalWriteSettingsForTest().s3_allow_parallel_part_upload);
 
-    DB::Cas::CasRequests requests(DB::Cas::BackendPtr(backend), DB::Cas::Fence::open());
+    DB::Cas::CasRequests requests(DB::Cas::BackendPtr(backend), DB::Cas::Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     bool committed = false;
     uint64_t puts_on_calling_thread = 0;
     std::exception_ptr failure;
@@ -856,7 +888,7 @@ TEST(CASBackend, ConditionalPutBufferStartsAtTheBodySize)
     DelayedResponseServer server(std::chrono::milliseconds(0), acceptPut);
     auto storage = makeDispatchStorageForTest<BufferSizeRecordingS3ObjectStorage>(server.getUrl(), 10000);
     auto backend = conditionalBackendForTest(storage);
-    DB::Cas::CasRequests requests(DB::Cas::BackendPtr(backend), DB::Cas::Fence::open());
+    DB::Cas::CasRequests requests(DB::Cas::BackendPtr(backend), DB::Cas::Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
 
     const std::string body(37, 'b');
     {
@@ -887,7 +919,7 @@ TEST(CASBackend, ConditionalMultipartNoSuchUploadIsUnresolved)
     CountingS3::CountingS3Server server(store.responder());
     auto backend = conditionalBackendForTest(
         S3ObjectCreationTestStorage::makeRetryingStorage(server.getUrl(), S3ObjectCreationTestStorage::forceOnePartMultipart));
-    DB::Cas::CasRequests requests(DB::Cas::BackendPtr(backend), DB::Cas::Fence::open());
+    DB::Cas::CasRequests requests(DB::Cas::BackendPtr(backend), DB::Cas::Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     const uint64_t unresolved_before = ProfileEvents::global_counters[ProfileEvents::CASConditionalWriteUnresolved];
 
     auto op = requests.admit();
@@ -897,6 +929,82 @@ TEST(CASBackend, ConditionalMultipartNoSuchUploadIsUnresolved)
         << "variant " << result.index() << "; another writer's object must not be taken for this upload";
     EXPECT_EQ(server.count(CountingS3::Verb::CompleteMultipartUpload), 1u);
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASConditionalWriteUnresolved] - unresolved_before, 1u);
+}
+
+namespace
+{
+
+/// A bucket holding `key_count` sorted keys under `p/`, answering `ListObjectsV2` the way S3 does: at most
+/// 1000 keys per response, `IsTruncated` exactly when keys remain, the continuation token naming the last
+/// key returned. The caller counts requests through `CountingS3Server::count(Verb::Other)`.
+CountingS3::Responder pagedListingResponder(size_t key_count)
+{
+    auto keys = std::make_shared<std::vector<std::string>>();
+    for (size_t i = 0; i < key_count; ++i)
+    {
+        std::string number = std::to_string(i);
+        keys->push_back("p/" + std::string(10 - number.size(), '0') + number);
+    }
+    return [keys](const CountingS3::Request & request, Poco::Net::HTTPServerResponse & response)
+    {
+        std::string after;
+        size_t max_keys = 1000;
+        bool is_listing = false;
+        for (const auto & [name, value] : request.query)
+        {
+            if (name == "list-type")
+                is_listing = true;
+            else if (name == "continuation-token" || (name == "start-after" && after.empty()))
+                after = value;
+            else if (name == "max-keys")
+                max_keys = std::min<size_t>(max_keys, std::stoull(value));
+        }
+        if (!is_listing)
+            return CountingS3::answerOk(request.verb, response);
+
+        auto it = after.empty() ? keys->begin() : std::upper_bound(keys->begin(), keys->end(), after);
+        std::string body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>test-bucket</Name>";
+        std::string last;
+        size_t returned = 0;
+        for (; it != keys->end() && returned < max_keys; ++it, ++returned)
+        {
+            last = *it;
+            body += "<Contents><Key>" + *it + "</Key><LastModified>2026-01-01T00:00:00.000Z</LastModified>"
+                    "<ETag>&quot;etag&quot;</ETag><Size>1</Size></Contents>";
+        }
+        const bool truncated = it != keys->end();
+        body += "<KeyCount>" + std::to_string(returned) + "</KeyCount><IsTruncated>" + (truncated ? "true" : "false") + "</IsTruncated>";
+        if (truncated)
+            body += "<NextContinuationToken>" + last + "</NextContinuationToken>";
+        body += "</ListBucketResult>";
+        CountingS3::sendXml(response, Poco::Net::HTTPResponse::HTTP_OK, body);
+    };
+}
+
+}
+
+/// A walk costs about one request per page; a page that needed a second request to fit its sentinel
+/// would double the bill of every enumeration.
+TEST(CASBackend, AListWalkOfTenThousandKeysStaysWithinItsRequestBound)
+{
+    (void)contextForTest();
+    constexpr size_t key_count = 10000;
+    CountingS3::CountingS3Server server(pagedListingResponder(key_count));
+    auto backend = conditionalBackendForTest(makeDispatchStorageForTest(server.getUrl(), 10000));
+    DB::Cas::CasRequests requests(DB::Cas::BackendPtr(backend), DB::Cas::Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
+
+    std::vector<std::string> seen;
+    auto op = requests.admit();
+    op.forEachListedKey("p/", [&](const DB::Cas::ListedKey & listed)
+    {
+        seen.push_back(listed.key);
+        return true;
+    }, DB::Cas::Retry::standard());
+
+    ASSERT_EQ(seen.size(), key_count);
+    EXPECT_TRUE(std::is_sorted(seen.begin(), seen.end()));
+    EXPECT_EQ(std::adjacent_find(seen.begin(), seen.end()), seen.end()) << "a key was visited twice";
+    EXPECT_LE(server.count(CountingS3::Verb::Other), 11u);
 }
 
 #endif

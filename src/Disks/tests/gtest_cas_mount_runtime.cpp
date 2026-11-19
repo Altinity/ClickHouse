@@ -24,8 +24,9 @@ public:
         , mount(backend, Fence{
               [this] { return runtime.fenceGeneration(); },
               [this](uint64_t g, uint64_t needed) { return runtime.admit(g, needed); },
-              [this](uint64_t g) { runtime.checkFenceOrThrow(g); }})
-        , farewell(backend, Fence::open())
+              [this](uint64_t g) { runtime.checkFenceOrThrow(g); }},
+              {}, {}, nullptr, kDefaultRequestWindowMs)
+        , farewell(backend, Fence::open(), {}, {}, nullptr, kDefaultRequestWindowMs)
         , runtime(
               backend, mount, farewell, layout,
               MountConfig{.boot_ms_fn = [this] { return boot_ms; }},

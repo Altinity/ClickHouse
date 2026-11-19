@@ -285,9 +285,10 @@ void ContentAddressedTransaction::uploadPendingBlobs(PartStaging & st)
     /// a copy of the record) are collapsed by `fanOutBlobUploads`' grouping, which SUBSUMES the former
     /// duplicate-membership filter here — the fan-out launches one task per unique ref and merges one
     /// dep. Local staging re-opens the payload file directly. S3 staging owns a complete
-    /// `[envelope][payload]` object: the first publication after an absent destination may copy that
-    /// object verbatim, while every other publication re-opens it, validates and skips its fixed
-    /// envelope, and streams only the payload under a fresh envelope.
+    /// `[envelope][payload]` object. A record and its hardlink copies in other parts share one
+    /// `publication_attempted` flag, so at most one publication across all of them copies that object
+    /// verbatim: the first one, and only after an absent destination. Every other publication re-opens
+    /// it, validates and skips its fixed envelope, and streams only the payload under a fresh envelope.
     std::vector<Cas::BlobUploadRequest> requests;
     requests.reserve(st.pending_blobs.size());
     for (const auto & pb : st.pending_blobs)
@@ -296,6 +297,7 @@ void ContentAddressedTransaction::uploadPendingBlobs(PartStaging & st)
             continue;   /// The entry was removed by unlinkFile/replaceFile; skip this orphan.
         Cas::BlobSource source;
         source.size = pb.size;
+        source.publication_attempted = pb.publication_attempted;
         if (pb.backend == Cas::StagingBackend::S3)
         {
             source.server_side_copy_from = pb.staging_key;

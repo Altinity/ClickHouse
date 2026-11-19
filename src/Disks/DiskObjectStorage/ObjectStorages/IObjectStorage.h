@@ -551,8 +551,10 @@ public:
     /// Whether the underlying bucket has object versioning enabled; nullopt when unknown or not
     /// applicable. Used by the CAS capability probe on GCS: a bucket verified as versioned refuses
     /// the mount (a token-exact DELETE there archives a noncurrent generation instead of reclaiming
-    /// storage), an unknown answer is logged and tolerated.
-    virtual std::optional<bool> isBucketVersioningEnabled() const { return std::nullopt; }
+    /// storage), an unknown answer is logged and tolerated. `request` selects the retry profile;
+    /// under `SingleAttempt` the SDK does not retry the probe, `request.attempt_timeout_ms` bounds each
+    /// send and receive, and `request.connect_timeout_cap_ms` caps the connect.
+    virtual std::optional<bool> isBucketVersioningEnabled(const ObjectStorageControlRequest & /*request*/) const { return std::nullopt; }
 
     /// True when this object storage can execute writes under the given retry profile.
     /// A caller that sets a non-Default profile on WriteSettings MUST check this first and

@@ -71,7 +71,7 @@ def started_cluster():
             name="sts.amazonaws.com",
             hostname="sts.amazonaws.com",
             image="altinityinfra/python-bottle",
-            tag="latest",
+            tag=os.environ.get("DOCKER_PYTHON_BOTTLE_TAG", "latest"),
             stay_alive=True,
         )
         sts.stop_clickhouse(kill=True)
