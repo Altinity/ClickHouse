@@ -90,6 +90,7 @@ static UInt64 s3CredentialHash(const S3::Client & client)
 namespace Setting
 {
     extern const SettingsBool s3_validate_request_settings;
+    extern const SettingsBool s3_validate_etag_on_read;
 }
 
 namespace S3RequestSetting
