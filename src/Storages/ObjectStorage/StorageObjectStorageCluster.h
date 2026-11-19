@@ -203,6 +203,9 @@ private:
 
     /// Whether this query is served by `pure_storage` instead of being distributed over a cluster.
     bool readsFromPureStorage(ContextPtr context) const;
+    /// Only `DataLakeCatalog` tables may reuse the resolved query tree for the header. Re-analyzing their
+    /// AST resolves the table through the REST catalog again. Other cluster reads keep re-analyzing the AST,
+    /// so their headers do not change.
     bool canReuseResolvedQueryTreeForHeader() const override { return is_datalake_catalog_table; }
 
     void readFallBackToPure(

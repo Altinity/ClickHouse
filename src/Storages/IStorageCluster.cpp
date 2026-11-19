@@ -725,6 +725,13 @@ void IStorageCluster::read(
     storage_snapshot->check(column_names);
 
     /// Calculate the header. This is significant, because some columns could be thrown away in some cases like query with count(*)
+    ///
+    /// The header must match what the shard returns for `query_to_send`. The shard re-analyzes that AST and
+    /// numbers `__tableN` from 1, so both cases below renumber a clone of the resolved tree and avoid a second
+    /// catalog resolution:
+    /// 1. A join stays on the initiator and `query_to_send` was rewritten: use the rewritten left-scan tree.
+    /// 2. `query_to_send` is unchanged: use the original resolved tree. `FetchColumns` plans it directly,
+    ///    and higher stages use `getHeaderForProcessingStage`.
 
     SharedHeader sample_block;
 
