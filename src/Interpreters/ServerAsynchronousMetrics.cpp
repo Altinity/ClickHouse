@@ -410,8 +410,10 @@ void ServerAsynchronousMetrics::updateImpl(TimePoint update_time, TimePoint curr
                             "Whether this server currently holds the content-addressed garbage-collection lease for the disk (1) or not (0, e.g. another replica is leading)." };
                         new_values[fmt::format("CASGCPendingReclaim_{}", name)] = { health->pending_reclaim,
                             "Cumulative content-addressed objects condemned minus objects physically deleted by this process while it has held the GC lease on the disk. A persistently growing value indicates GC is not keeping up with reclaim." };
-                        new_values[fmt::format("CASGCLastSuccessAgeSeconds_{}", name)] = { health->last_success_age_seconds,
-                            "Seconds since this process last completed a successful content-addressed GC round as leader on the disk (0 if it has never led one)." };
+                        /// Absent until the first success: a 0 would read as "just succeeded" for a GC that never ran.
+                        if (health->ever_succeeded)
+                            new_values[fmt::format("CASGCLastSuccessAgeSeconds_{}", name)] = { health->last_success_age_seconds,
+                                "Seconds since this process last completed a successful content-addressed GC round as leader on the disk. Absent until the first such round." };
                         new_values[fmt::format("CASGCWedgedNamespaces_{}", name)] = { health->wedged_namespace_count,
                             "Number of content-addressed namespaces on the disk currently stuck behind a wedged reference lane, unable to make GC progress." };
                     }

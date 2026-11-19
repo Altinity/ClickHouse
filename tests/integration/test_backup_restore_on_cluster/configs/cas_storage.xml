@@ -8,6 +8,8 @@
                 <endpoint>http://rustfs1:11121/test/backup_restore_on_cluster/</endpoint>
                 <access_key_id>clickhouse</access_key_id>
                 <secret_access_key>clickhouse</secret_access_key>
+                <!-- test_shutdown_waits_for_backup kills a node that outlives the stop wait and gives its restart 60 s. One process per server uuid here, so the restart reclaims the slot without waiting out the lease. -->
+                <cas_unsafe_remount_no_delay>1</cas_unsafe_remount_no_delay>
             </cas>
         </disks>
         <policies>

@@ -24,6 +24,7 @@ from praktika.result import Result
 from praktika.utils import Shell, Utils
 
 from praktika._environment import _Environment
+from ci.jobs.scripts.integration_tests_configs import IMAGES_ENV
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -259,6 +260,12 @@ def build_pytest_env(ch_path, timeout_val):
         env[k] = ch_path
     env.setdefault("CLICKHOUSE_TESTS_BASE_CONFIG_DIR", f"{REPO_DIR}/programs/server")
     env["PATH"] = f"{str(Path(ch_path).resolve().parent)}:{env.get('PATH', '')}"
+    # Pin the integration images to this commit's multi-arch digest tags.
+    # Without them, cluster.py falls back to ':latest', which may hold a single arch.
+    for image_name, env_name in IMAGES_ENV.items():
+        tag = Info().docker_tag(image_name)
+        if tag:
+            env[env_name] = tag
     env["KEEPER_METRICS_FILE"] = f"{TEMP_DIR}/keeper_metrics.jsonl"
     env["PYTHONPATH"] = f"{REPO_DIR}:{REPO_DIR}/tests/stress:{REPO_DIR}/ci"
     env["COMMIT_SHA"] = get_commit_sha(env)

@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasFence.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasHotKeys.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestBudget.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRetry.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasWriteResult.h>
 #include <Common/Exception.h>
@@ -198,10 +199,12 @@ public:
     /// envelope (attempt timeout plus its connect caps): it is what the engine reserves before it
     /// starts anything. `hot_keys` is the pool's
     /// write lane, shared by its planes; without one this object owns a private lane with no cache,
-    /// so a write through it costs today's read and write.
+    /// so a write through it costs today's read and write. `default_window_ms` is the window of a
+    /// policy that names none (`Retry::standard`, `Retry::once`); it has no default, so a plane that
+    /// forgets the disk's `cas_request_window_ms` does not compile.
     CasRequests(BackendPtr backend_, Fence fence_,
-                std::function<uint64_t()> now_ms_ = {}, std::function<void(uint64_t)> sleep_ms_ = {},
-                CasHotKeys * hot_keys_ = nullptr);
+                std::function<uint64_t()> now_ms_, std::function<void(uint64_t)> sleep_ms_,
+                CasHotKeys * hot_keys_, uint64_t default_window_ms_);
 
     /// Both may be called concurrently on one `CasRequests`: neither writes a member, and the only
     /// state either reads is the backend and the fence -- whose closures must therefore be thread-safe
@@ -249,6 +252,9 @@ private:
         return std::forward<Fn>(fn)(access);
     }
 
+    /// `policy` bound to this plane's clock and default window.
+    Retry::Bound bindPolicy(const Retry & policy) const { return policy.bind(now_ms(), default_window_ms); }
+
     /// The store's answer for `key`, as an incarnation. Throws `CORRUPTED_DATA` naming the key when
     /// the value fails this backend's dialect grammar.
     Etag mint(const String & key, String value) const;
@@ -265,6 +271,7 @@ private:
     std::function<uint64_t()> now_ms;
     std::function<void(uint64_t)> sleep_ms;
     uint64_t attempt_reservation_ms;
+    uint64_t default_window_ms;
     /// The private lane of a `CasRequests` built without a pool; null when `hot_keys` is the pool's.
     std::unique_ptr<CasHotKeys> own_hot_keys;
     CasHotKeys * hot_keys;
@@ -292,6 +299,10 @@ public:
     /// so a test that replaces the sleep sees no real time pass in either. For the hand-written loops
     /// that reissue something the engine must not reissue for them.
     void pause(uint64_t ms) { owner.sleep_ms(ms); }
+    /// The pause before a loop re-decides after `unresolved`, gated like the engine's own reissue
+    /// pause. Returns the give-up instead of sleeping when the fence is lost or the pause plus two
+    /// attempt reservations (the re-read and the write) do not fit in `policy`.
+    std::optional<WriteResult> pauseBeforeRedecide(uint64_t ms, const GaveUp & unresolved, const Retry & policy);
     /// The verdict point: is this operation still admitted? For the sites that guard a decision rather
     /// than a request.
     bool admitted() const { return gate(0) == Gate::Ok; }
@@ -311,12 +322,15 @@ public:
     std::optional<Object> read(const String & key, const Retry & policy);
     std::optional<Meta>   head(const String & key, const Retry & policy);
     ListPage               list(const String & prefix, const String & cursor, size_t limit, const Retry & policy);
+    /// The store returns at most 1000 keys per request, and a page needs one key more than its size to prove
+    /// the prefix continues, so a page and its sentinel fit one store response.
+    static constexpr size_t kCasListPageKeys = 999;
     /// Walks every key under `prefix` exactly once. The policy governs EACH PAGE, not the walk: a walk
     /// is an unbounded number of requests, and a silently truncated enumeration is the error a
     /// coverage record exists to prevent. `on_page_fetched` fires once per page DELIVERED; a page that
     /// took several reissues still fires once, and `CASRequestAttempt` is the physical count.
     void forEachListedKey(const String & prefix, const ListedKeyFn & fn, const Retry & per_page,
-                          size_t page_limit = 1000, const std::function<void()> & on_page_fetched = {});
+                          size_t page_limit = kCasListPageKeys, const std::function<void()> & on_page_fetched = {});
     Removal remove(const String & key, const Etag & seen, const Retry & policy);
     /// `head` then `remove` of what it saw, repeating on `Mismatch`. `Gone` when the key is already
     /// absent; never returns `Mismatch` -- under `once`, where there is no reissue to resolve one, a

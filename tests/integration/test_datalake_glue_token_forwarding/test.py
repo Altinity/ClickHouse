@@ -44,7 +44,7 @@ def started_cluster():
             name=STS_CONTAINER,
             hostname=STS_CONTAINER,
             image="altinityinfra/python-bottle",
-            tag="latest",
+            tag=os.environ.get("DOCKER_PYTHON_BOTTLE_TAG", "latest"),
             stay_alive=True,
         )
         sts.stop_clickhouse(kill=True)
