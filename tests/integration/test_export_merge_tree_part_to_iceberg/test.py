@@ -1291,7 +1291,7 @@ def test_export_part_unsigned_partition_column_widened_to_signed(cluster):
 
 @pytest.mark.parametrize(
     "source_type,destination_type",
-    [("UInt32", "Int32"), ("UInt64", "Int64")],
+    [("UInt16", "Int16"), ("UInt32", "Int32"), ("UInt64", "Int64")],
 )
 def test_export_part_unsigned_to_same_size_signed_rejected_without_optin(cluster, source_type, destination_type):
     """An unsigned column exported into a signed column of the same size is lossy (values above

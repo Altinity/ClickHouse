@@ -15,7 +15,12 @@
 #include <Columns/ColumnConst.h>
 #include <Columns/ColumnSet.h>
 #include <Core/UUID.h>
+#include <DataTypes/DataTypeArray.h>
+#include <DataTypes/DataTypeLowCardinality.h>
+#include <DataTypes/DataTypeMap.h>
+#include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeSet.h>
+#include <DataTypes/DataTypeTuple.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Formats/FormatFilterInfo.h>
 #include <Formats/FormatParserSharedResources.h>
@@ -2811,19 +2816,105 @@ Poco::JSON::Object::Ptr IcebergMetadata::getMetadataJSON(ContextPtr local_contex
         persistent_components.table_uuid);
 }
 
-NamesAndTypesList IcebergMetadata::getExportDestinationColumns(const std::string & iceberg_metadata_json_string, ContextPtr context) const
+namespace
+{
+
+/// `type` with every `UInt32` that sits over an Iceberg `int` field replaced by `Int32`, recursing through `Nullable`,
+/// `LowCardinality`, `Array`, `Map` and `Tuple` along the Iceberg `list`, `map` and `struct` types.
+/// ClickHouse stored `UInt32` as Iceberg `int` before it was widened to `long`, so a table created by that release can be
+/// declared with `UInt32` over an `int` field, which must not be written as the 8-byte `long` that `UInt32` is now.
+DataTypePtr correctUInt32OverIcebergInt(const DataTypePtr & type, const Poco::Dynamic::Var & iceberg_type)
+{
+    if (const auto * nullable_type = typeid_cast<const DataTypeNullable *>(type.get()))
+        return std::make_shared<DataTypeNullable>(correctUInt32OverIcebergInt(nullable_type->getNestedType(), iceberg_type));
+
+    if (const auto * low_cardinality_type = typeid_cast<const DataTypeLowCardinality *>(type.get()))
+        return std::make_shared<DataTypeLowCardinality>(
+            correctUInt32OverIcebergInt(low_cardinality_type->getDictionaryType(), iceberg_type));
+
+    if (iceberg_type.isString())
+    {
+        if (iceberg_type.convert<String>() == Iceberg::f_int && type->getTypeId() == TypeIndex::UInt32)
+            return std::make_shared<DataTypeInt32>();
+        return type;
+    }
+
+    if (iceberg_type.type() != typeid(Poco::JSON::Object::Ptr))
+        return type;
+
+    const auto iceberg_object = iceberg_type.extract<Poco::JSON::Object::Ptr>();
+    const auto kind = iceberg_object->getValue<String>(Iceberg::f_type);
+
+    if (kind == Iceberg::f_list)
+    {
+        if (const auto * array_type = typeid_cast<const DataTypeArray *>(type.get()))
+            return std::make_shared<DataTypeArray>(
+                correctUInt32OverIcebergInt(array_type->getNestedType(), iceberg_object->get(Iceberg::f_element)));
+    }
+    else if (kind == Iceberg::f_map)
+    {
+        if (const auto * map_type = typeid_cast<const DataTypeMap *>(type.get()))
+            return std::make_shared<DataTypeMap>(
+                correctUInt32OverIcebergInt(map_type->getKeyType(), iceberg_object->get(Iceberg::f_key)),
+                correctUInt32OverIcebergInt(map_type->getValueType(), iceberg_object->get(Iceberg::f_value)));
+    }
+    else if (kind == Iceberg::f_struct)
+    {
+        const auto * tuple_type = typeid_cast<const DataTypeTuple *>(type.get());
+        const auto fields = iceberg_object->getArray(Iceberg::f_fields);
+        if (tuple_type && fields)
+        {
+            DataTypes elements = tuple_type->getElements();
+            for (UInt32 i = 0; i < fields->size(); ++i)
+            {
+                const auto field = fields->getObject(i);
+                const auto field_name = field->getValue<String>(Iceberg::f_name);
+
+                std::optional<size_t> position;
+                if (tuple_type->hasExplicitNames())
+                    position = tuple_type->tryGetPositionByName(field_name);
+                else if (i < elements.size())
+                    position = i;
+
+                if (position)
+                    elements[*position] = correctUInt32OverIcebergInt(elements[*position], field->get(Iceberg::f_type));
+            }
+
+            if (tuple_type->hasExplicitNames())
+                return std::make_shared<DataTypeTuple>(elements, tuple_type->getElementNames());
+            return std::make_shared<DataTypeTuple>(elements);
+        }
+    }
+
+    return type;
+}
+
+}
+
+NamesAndTypesList IcebergMetadata::getExportDestinationColumns(
+    const std::string & iceberg_metadata_json_string, const NamesAndTypesList & declared_columns) const
 {
     Poco::JSON::Parser parser; /// For some reason base/base/JSON.h can not parse this json file
     const auto metadata_json = parser.parse(iceberg_metadata_json_string).extract<Poco::JSON::Object::Ptr>();
+    const auto schema = lookupSchema(metadata_json, metadata_json->getValue<Int64>(Iceberg::f_current_schema_id));
 
-    const auto schema_id = metadata_json->getValue<Int64>(Iceberg::f_current_schema_id);
-    const auto schema = lookupSchema(metadata_json, schema_id);
+    std::unordered_map<String, Poco::Dynamic::Var> iceberg_types_by_name;
+    const auto fields = schema->getArray(Iceberg::f_fields);
+    for (UInt32 i = 0; fields && i < fields->size(); ++i)
+    {
+        const auto field = fields->getObject(i);
+        iceberg_types_by_name.emplace(field->getValue<String>(Iceberg::f_name), field->get(Iceberg::f_type));
+    }
 
-    /// A scratch processor: the live one of the table is not touched. It derives the columns the way a reader does,
-    /// for example `int` is `Int32` and `long` is `Int64`.
-    IcebergSchemaProcessor schema_processor(context, context->getSettingsRef()[Setting::allow_experimental_geo_types_in_iceberg]);
-    schema_processor.addIcebergTableSchema(schema, context);
-    return *schema_processor.getClickHouseTableSchemaById(static_cast<Int32>(schema_id));
+    NamesAndTypesList columns;
+    for (const auto & column : declared_columns)
+    {
+        const auto iceberg_type = iceberg_types_by_name.find(column.name);
+        columns.emplace_back(
+            column.name,
+            iceberg_type == iceberg_types_by_name.end() ? column.type : correctUInt32OverIcebergInt(column.type, iceberg_type->second));
+    }
+    return columns;
 }
 
 }

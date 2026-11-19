@@ -849,13 +849,14 @@ StorageMetadataHandle StorageObjectStorage::getExportDestinationMetadata(
     if (!isDataLake() || !iceberg_metadata_json || iceberg_metadata_json->empty())
         return metadata_snapshot;
 
-    /// The columns of the table in memory are the ones it was declared with, until a query reloads them from the
-    /// Iceberg schema. They differ between the nodes that run one export, so take them from the table metadata that
-    /// the export was validated against instead.
+    /// The columns of the table in memory are the ones it was declared with, until a query reloads them from the Iceberg
+    /// schema. A table created by a release that stored `UInt32` as Iceberg `int` is declared with `UInt32` over an
+    /// `int` field on a node that has not reloaded them yet, but not on the others. The table metadata that the export
+    /// was validated against says which types fit, so every node ends up with the same destination types.
     configuration->lazyInitializeIfNeeded(object_storage, local_context);
     auto export_metadata = std::make_shared<StorageInMemoryMetadata>(*metadata_snapshot);
-    export_metadata->setColumns(
-        ColumnsDescription{configuration->getExternalMetadata()->getExportDestinationColumns(*iceberg_metadata_json, local_context)});
+    export_metadata->setColumns(ColumnsDescription{configuration->getExternalMetadata()->getExportDestinationColumns(
+        *iceberg_metadata_json, metadata_snapshot->getColumns().getAllPhysical())});
     return export_metadata;
 }
 

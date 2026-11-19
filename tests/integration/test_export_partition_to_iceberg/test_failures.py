@@ -334,14 +334,14 @@ def test_export_partition_local_backoff_does_not_block_other_replica(cluster):
     assert count == 3, f"Expected 3 rows after replica2 completed the export, got {count}"
 
 
-def test_export_partition_replica_uses_iceberg_schema_not_its_declared_columns(cluster):
+def test_export_partition_replica_with_uint32_declared_over_iceberg_int(cluster):
     """
-    The destination types of an export come from the Iceberg metadata stored in the export manifest, so every
-    replica casts to the types the scheduling node validated, whatever its own destination table was declared
-    with. replica2 attaches to the Iceberg table with `id UInt32` and never queries it, so its declared column
-    still differs from the Iceberg `int` (`Int32`). The export is scheduled on replica1 (declared `Int32`) and
+    A replica whose destination table is declared `UInt32` over an Iceberg `int` field (as left by a release that
+    stored `UInt32` as `int`, on a node that has not reloaded the columns yet) exports it as the `Int32` the
+    field is, like the scheduling node. replica2 attaches to the Iceberg table with `id UInt32` and never queries
+    it, so its declared column still differs from the Iceberg `int` (`Int32`). The export is scheduled on replica1 (declared `Int32`) and
     replica2 is the only replica that runs it. A negative `Int32` source value could not be cast to the declared
-    `UInt32` without the lossy-cast opt-in, so the export only completes if replica2 uses the Iceberg type.
+    `UInt32` without the lossy-cast opt-in, so the export only completes if replica2 corrects the declared type to the Iceberg one.
     """
     replica1 = cluster.instances["replica1"]
     replica2 = cluster.instances["replica2"]

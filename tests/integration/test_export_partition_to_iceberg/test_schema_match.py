@@ -688,7 +688,7 @@ def test_export_partition_unsigned_partition_column_widened_to_signed(cluster, s
 
 @pytest.mark.parametrize(
     "source_type,destination_type",
-    [("UInt32", "Int32"), ("UInt64", "Int64")],
+    [("UInt16", "Int16"), ("UInt32", "Int32"), ("UInt64", "Int64")],
 )
 def test_export_partition_unsigned_to_same_size_signed_rejected_without_optin(
     cluster, source_engine, source_type, destination_type
@@ -720,11 +720,11 @@ def test_export_partition_unsigned_to_same_size_signed_rejected_without_optin(
     assert count == 0, f"Expected no rows after a rejected export, got {count}"
 
 
-def test_export_partition_casts_to_iceberg_schema_types_not_declared_types(cluster, source_engine):
-    """The destination types of an export come from the Iceberg schema, not from the columns the destination
-    table was declared with. The second table is declared over the path of the first with `id UInt32`, but the
-    Iceberg field is `int`, so the export casts to `Int32`: a negative `Int32` source value is accepted without
-    the lossy-cast opt-in and is stored unchanged, instead of being rejected or turned into an unsigned value."""
+def test_export_partition_uint32_declared_over_iceberg_int_is_exported_as_int32(cluster, source_engine):
+    """A `UInt32` column declared over an Iceberg `int` field (as left by a release that stored `UInt32` as `int`)
+    is exported as the `Int32` the field is. The second table is declared over the path of the first with
+    `id UInt32`, so a negative `Int32` source value is accepted without the lossy-cast opt-in and is stored
+    unchanged, instead of being rejected or turned into an unsigned value."""
     node = cluster.instances["replica1"]
 
     uid = unique_suffix()
@@ -957,11 +957,9 @@ def test_export_partition_all_iceberg_types_lossy(cluster, source_engine):
     mt_table = f"mt_lossy_types_{uid}"
     iceberg_table = f"iceberg_lossy_types_{uid}"
 
-    # Most source columns are wider than the destination, so the export inserts a lossy
+    # Each source column is wider than the destination, so the export inserts a lossy
     # narrowing CAST (allowed only because export_merge_tree_part_allow_lossy_cast=1).
-    # The export casts to the Iceberg types of the destination, not to the declared ones: `mid Int16`
-    # is an Iceberg `int` (`Int32`), `ubig UInt32` is a `long` (`Int64`), and `dt DateTime` is a
-    # microsecond `timestamp`, so `dt` keeps its microseconds.
+    # Int8/UInt8 are not Iceberg-representable, so the narrowest integer dest is Int16.
     source_columns = (
         "big Int64, ubig UInt64, mid Int32, "
         "f Float64, dt DateTime64(6), d Date32, "
@@ -1007,7 +1005,7 @@ def test_export_partition_all_iceberg_types_lossy(cluster, source_engine):
     ).strip()
     expected = "\t".join([
         "1000000", "2000000000", "30000",
-        "2024-01-15", "2024-01-15 12:30:45.123456", "\\N", "100", "2024",
+        "2024-01-15", "2024-01-15 12:30:45.000000", "\\N", "100", "2024",
     ])
     assert result == expected, f"Unexpected lossy round-trip data:\n{result!r}\nexpected:\n{expected!r}"
 
