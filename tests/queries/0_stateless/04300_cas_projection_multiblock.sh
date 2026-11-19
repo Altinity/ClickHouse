@@ -19,7 +19,7 @@ ${CLICKHOUSE_CLIENT} --multiquery <<EOF
 DROP TABLE IF EXISTS t_pmb;
 CREATE TABLE t_pmb (a UInt64, b UInt64, PROJECTION p_by_b (SELECT b, sum(a) GROUP BY b))
 ENGINE = MergeTree ORDER BY a
-SETTINGS disk = disk(type = object_storage, object_storage_type = local, metadata_type = cas,
+SETTINGS disk = disk(type = object_storage, object_storage_type = local, metadata_type = cas, cas_unsafe_remount_no_delay = 1,
     name = '${CLICKHOUSE_DATABASE}_04300_pmb', cas_server_root_id = '${CLICKHOUSE_DATABASE}_04300', path = '${CLICKHOUSE_DATABASE}_04300_pmb_pool/'),
     -- The final check asserts the optimizer SELECTS the projection, which holds only while the
     -- projection reads fewer marks than the base table. Randomized granularity (tiny

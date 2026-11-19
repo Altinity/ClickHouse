@@ -77,6 +77,9 @@ struct MountLease
     /// One holder-originated body identity. Every physical retry of that one logical write reuses
     /// it; a GC fence copies the observed value while every successor holder body mints a new one.
     UInt128 write_attempt_id{};
+    /// The highest epoch below `writer_epoch` that may have ended without a clean farewell, set by the claim
+    /// from the predecessor's end. Absent in bodies of older builds: read it as the predecessor's `writer_epoch`.
+    std::optional<uint64_t> last_unclean_epoch = std::nullopt;
 
     /// The holder released the slot cleanly (its farewell): the `UINT64_MAX` sentinel in the build
     /// watermark. Independent of `gc_fenced`, which callers check first.
@@ -90,6 +93,14 @@ struct MountLease
         fenced.seq += 1;
         return fenced;
     }
+};
+
+/// The live writer epoch with the `last_unclean_epoch` of the claim that started it.
+struct LiveEpochPair
+{
+    uint64_t writer_epoch = 0;
+    uint64_t last_unclean_epoch = 0;
+    bool operator==(const LiveEpochPair &) const = default;
 };
 
 /// Encode the owner anchor as canonical text with the `cas_owner` header and a final newline. The

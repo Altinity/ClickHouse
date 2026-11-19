@@ -334,7 +334,7 @@ TEST(CASPromoteRepublishDeathTest, AbandonEmitsRemovalBeforeRetireAborts)
     build->abandon();
 
     auto rebuild = s->beginPartWrite(PartWriteInfo{.intended_ref = ns.string() + "/" + ref, .intended_namespace = ns});
-    EXPECT_DEATH({ rebuild->precommitAdd(ns, ref, id); }, "");
+    EXPECT_DEATH({ rebuild->precommitAdd(ns, ref, id); }, "was not staged by this transaction");
 }
 #endif
 
@@ -376,6 +376,9 @@ TEST(CASPromoteRepublish, PrecommitAddRejectsAnIdThisTxnDidNotStage)
     catch (const DB::Exception & e)
     {
         EXPECT_EQ(e.code(), DB::ErrorCodes::LOGICAL_ERROR);
+        EXPECT_NE(e.message().find("was not staged by this transaction"), String::npos) << e.message();
+        EXPECT_NE(e.message().find(u128ToHex(txn2->buildId())), String::npos) << e.message();
+        EXPECT_NE(e.message().find("'" + ref + "' in namespace '" + ns.string() + "'"), String::npos) << e.message();
     }
 
     /// Nothing was appended: the ref-log tail is unchanged and `ref` still has no owner at all.
@@ -397,6 +400,6 @@ TEST(CASPromoteRepublishDeathTest, PrecommitAddRejectsAnIdThisTxnDidNotStageAbor
     txn1->abandon();
 
     auto txn2 = s->beginPartWrite(PartWriteInfo{.intended_ref = ns.string() + "/" + ref, .intended_namespace = ns});
-    EXPECT_DEATH({ txn2->precommitAdd(ns, ref, id); }, "");
+    EXPECT_DEATH({ txn2->precommitAdd(ns, ref, id); }, "was not staged by this transaction");
 }
 #endif
