@@ -776,11 +776,6 @@ std::vector<UInt64> deserializeRoaringPositionBitmap(std::string_view bytes, std
             const UInt64 position = positionFromKeyAndSubPosition(static_cast<UInt32>(key), sub_position);
             if (position > static_cast<UInt64>(DELETION_VECTOR_MAX_POSITION))
                 throw Exception(ErrorCodes::BAD_ARGUMENTS, "Deletion vector position {} is out of supported range", position);
-            if (positions.size() >= PUFFIN_DV_MAX_MATERIALIZED_POSITIONS)
-                throw Exception(
-                    ErrorCodes::BAD_ARGUMENTS,
-                    "Deletion vector cardinality exceeds materialization limit {}",
-                    PUFFIN_DV_MAX_MATERIALIZED_POSITIONS);
             positions.push_back(position);
         }
 

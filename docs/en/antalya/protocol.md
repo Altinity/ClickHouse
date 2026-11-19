@@ -38,6 +38,17 @@ If any worker negotiated a lower version, the initiator ignores that setting for
 assigns files immediately, so every task path stays an object key. On `antalya-26.6` these two
 fields used version 2; here version 2 is the absolute-path layout, so the fields are version 3.
 
+## Mixed-version clusters and output-only `schema_transform` {#output-only-schema-transform-mixed-clusters}
+
+A `schema_transform` in the `ReadTaskResponse` payload is only written for cluster-protocol version 2
+and later. An initiator keeps a transform that has no inputs and only adds columns, but a worker
+built before that change drops any transform with no inputs. It treats the transform as absent and
+reads the file without it. The cluster-protocol version is not bumped for this change, so an
+initiator cannot tell such a worker from an updated one. A query can therefore return different
+results for the same table depending on which node reads each file, until every node in the cluster
+runs the updated version. Finish the upgrade of all nodes before running distributed data-lake
+reads over tables whose files need such a transform.
+
 ## Adding an Antalya-only wire change {#adding-a-wire-change}
 
 - Bump `DBMS_ANTALYA_PROTOCOL_VERSION` by one and gate the change on the negotiated value.
