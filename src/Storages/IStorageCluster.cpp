@@ -744,7 +744,14 @@ void IStorageCluster::read(
             auto query_info_for_header = query_info;
             query_info_for_header.query_tree = query_info.query_tree->clone();
             createUniqueAliasesIfNecessary(query_info_for_header.query_tree, context);
-            sample_block = getHeaderForProcessingStage(column_names, storage_snapshot, query_info_for_header, context, processed_stage);
+            /// A `SECONDARY_QUERY` is planned only to `FetchColumns`. `getHeaderForProcessingStage` then
+            /// returns snapshot names (`symbol`), while the shard interpreter returns `__table1.symbol`.
+            /// Planning the resolved tree keeps those identifiers and does not resolve the catalog again.
+            if (processed_stage == QueryProcessingStage::FetchColumns)
+                sample_block = InterpreterSelectQueryAnalyzer::getSampleBlock(
+                    query_info_for_header.query_tree, context, SelectQueryOptions(processed_stage));
+            else
+                sample_block = getHeaderForProcessingStage(column_names, storage_snapshot, query_info_for_header, context, processed_stage);
         }
         else
             sample_block = InterpreterSelectQueryAnalyzer::getSampleBlock(query_to_send, context, SelectQueryOptions(processed_stage));

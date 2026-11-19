@@ -1554,6 +1554,48 @@ def test_object_storage_cluster_right_join_loads_rest_catalog_table_once(started
     )
 
 
+def test_object_storage_cluster_secondary_query_returns_shard_identifiers(started_cluster):
+    node1 = started_cluster.instances["node1"]
+    node2 = started_cluster.instances["node2"]
+
+    test_ref = f"test_object_storage_cluster_secondary_{uuid.uuid4().hex}"
+    table_name = f"{test_ref}_table"
+    namespace = f"{test_ref}_namespace"
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(namespace)
+    table = create_table(catalog, namespace, table_name)
+    table.append(pa.Table.from_pylist([generate_record()]))
+
+    create_clickhouse_iceberg_database(started_cluster, node1, CATALOG_NAME)
+    create_clickhouse_iceberg_database(started_cluster, node2, CATALOG_NAME)
+
+    query_id = f"object_storage_cluster_secondary_{uuid.uuid4().hex}"
+    assert (
+        node1.query(
+            f"SELECT symbol FROM remote('node2', '{CATALOG_NAME}', '{namespace}.{table_name}') "
+            "SETTINGS object_storage_cluster = 'cluster_simple'",
+            query_id=query_id,
+        )
+        == "kek\n"
+    )
+
+    node2.query("SYSTEM FLUSH LOGS system.query_log")
+    assert (
+        node2.query(
+            "SELECT ProfileEvents['DataLakeRestCatalogGetTableMetadata'] "
+            "FROM system.query_log "
+            f"WHERE initial_query_id = '{query_id}' AND type = 'QueryFinish' "
+            "AND startsWith(query, 'SELECT') "
+            "AND position(query, 'iceberg') = 0 "
+            "AND position(query, 'system.query_log') = 0"
+        )
+        == "1\n"
+    )
+
+    node2.query(f"DROP DATABASE IF EXISTS {CATALOG_NAME}")
+
+
 def test_on_cluster_ddl_rejected_for_datalake_catalog(started_cluster):
     node1 = started_cluster.instances["node1"]
     node2 = started_cluster.instances["node2"]
