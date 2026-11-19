@@ -19,6 +19,8 @@
 #include <IO/S3/getObjectInfo.h>
 #include <IO/S3/Client.h>
 #include <IO/S3/Requests.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageIdentityCache.h>
+#include <ctime>
 #include <IO/S3/copyS3File.h>
 #include <IO/S3/deleteFileFromS3.h>
 #include <Interpreters/Context.h>
@@ -33,6 +35,7 @@
 
 #include <Common/FailPoint.h>
 #include <Common/ProfileEvents.h>
+#include <Common/SipHash.h>
 #include <Common/StringUtils.h>
 #include <Common/logger_useful.h>
 #include <Common/MultiVersion.h>
@@ -61,14 +64,33 @@ namespace CurrentMetrics
 namespace DB::FailPoints
 {
     extern const char object_storage_force_refresh_callback_success[];
+    extern const char object_storage_identity_cache_pause_before_store[];
 }
 
 
 namespace DB
 {
+
+/// Distinguishes principals that sign with the same access key and a different secret or session token.
+static UInt64 s3CredentialHash(const S3::Client & client)
+{
+    const auto credentials = client.getCredentials();
+    SipHash hash;
+    const auto update_field = [&](const auto & field)
+    {
+        hash.update(field.data(), field.size());
+        hash.update("\0", 1);
+    };
+    update_field(credentials.GetAWSAccessKeyId());
+    update_field(credentials.GetAWSSecretKey());
+    update_field(credentials.GetSessionToken());
+    return hash.get64();
+}
+
 namespace Setting
 {
     extern const SettingsBool s3_validate_request_settings;
+    extern const SettingsBool s3_validate_etag_on_read;
 }
 
 namespace S3RequestSetting
@@ -380,6 +402,13 @@ std::unique_ptr<ReadBufferFromFileBase> S3ObjectStorage::readObject( /// NOLINT
         }
     }
 
+    /// The buffer can outlive this storage, so the callback keeps its own copy of the key parts.
+    /// A GET that finds the object replaced or missing drops the cached identity, and the next read
+    /// requests the metadata again instead of reusing it.
+    const String endpoint = uri.endpoint;
+    const String bucket = uri.bucket;
+    const String path = object.remote_path;
+
     return std::make_unique<ReadBufferFromS3>(
         clientForRetryProfile(ObjectStorageControlRequest{
             .profile = read_settings.object_storage_retry_profile,
@@ -401,7 +430,11 @@ std::unique_ptr<ReadBufferFromFileBase> S3ObjectStorage::readObject( /// NOLINT
         (object.bytes_size && object.bytes_size != StoredObject::UnknownSize) ? std::optional<size_t>(object.bytes_size) : std::nullopt,
         refresh_callback,
         std::move(blob_storage_log),
-        object.etag);
+        object.etag,
+        [endpoint, bucket, path]()
+        {
+            invalidateObjectStorageIdentityCache(endpoint, bucket, path);
+        });
 }
 
 SmallObjectDataWithMetadata S3ObjectStorage::readSmallObjectAndGetObjectMetadata( /// NOLINT
@@ -481,6 +514,11 @@ std::unique_ptr<WriteBufferFromFileBase> S3ObjectStorage::writeObject( /// NOLIN
         .attempt_timeout_ms = write_settings.object_storage_attempt_timeout_ms,
         .connect_timeout_cap_ms = write_settings.object_storage_connect_timeout_cap_ms});
 
+    /// Captured by value. The buffer can outlive this storage, and the cache itself is process-global.
+    const String endpoint = uri.endpoint;
+    const String bucket = uri.bucket;
+    const String path = object.remote_path;
+
     return std::make_unique<WriteBufferFromS3>(
         used_client,
         uri.bucket,
@@ -491,7 +529,11 @@ std::unique_ptr<WriteBufferFromFileBase> S3ObjectStorage::writeObject( /// NOLIN
         attributes,
         std::move(scheduler),
         disk_write_settings,
-        objectCreationClient(write_settings));
+        objectCreationClient(write_settings),
+        [endpoint, bucket, path]()
+        {
+            invalidateObjectStorageIdentityCache(endpoint, bucket, path);
+        });
 }
 
 
@@ -587,6 +629,7 @@ void S3ObjectStorage::removeObjectImpl(const StoredObject & object, bool if_exis
     deleteFileFromS3(client.get(), uri.bucket, object.remote_path, if_exists,
                       blob_storage_log, object.local_path, object.bytes_size,
                       ProfileEvents::DiskS3DeleteObjects);
+    invalidateCachedIdentity(object.remote_path);
 }
 
 void S3ObjectStorage::removeObjectsImpl(const StoredObjects & objects, bool if_exists)
@@ -616,6 +659,8 @@ void S3ObjectStorage::removeObjectsImpl(const StoredObjects & objects, bool if_e
                       s3_capabilities, settings_ptr->request_settings[S3RequestSetting::objects_chunk_size_to_delete],
                       blob_storage_log, local_paths_for_blob_storage_log, file_sizes_for_blob_storage_log,
                       ProfileEvents::DiskS3DeleteObjects);
+    for (const auto & object : objects)
+        invalidateCachedIdentity(object.remote_path);
 }
 
 void S3ObjectStorage::removeObjectIfExists(const StoredObject & object)
@@ -671,7 +716,10 @@ ConditionalRemoveResult S3ObjectStorage::removeObjectIfTokenMatchesImpl(
                                    outcome.IsSuccess() ? "" : outcome.GetError().GetMessage());
 
     if (outcome.IsSuccess())
+    {
+        invalidateCachedIdentity(object.remote_path);
         return {ConditionalRemoveOutcome::Removed, outcome.GetResult().GetDeleteMarker()};
+    }
 
     const auto & err = outcome.GetError();
 
@@ -679,11 +727,18 @@ ConditionalRemoveResult S3ObjectStorage::removeObjectIfTokenMatchesImpl(
     /// (see `S3::isPreconditionFailedError` for the one policy). Callers treat 'mismatch' and 'gone'
     /// alike (re-validate); a genuine absence is disambiguated downstream by a HEAD re-check.
     if (S3::isPreconditionFailedError(err))
+    {
+        /// The etag we held is not the object's etag, so the cached identity is not this generation.
+        invalidateCachedIdentity(object.remote_path);
         return {ConditionalRemoveOutcome::TokenMismatch, false};
+    }
 
     /// The object no longer exists (404). Protocol callers treat 'mismatch' and 'gone' alike (re-validate).
     if (S3::isNotFoundError(err.GetErrorType()))
+    {
+        invalidateCachedIdentity(object.remote_path);
         return {ConditionalRemoveOutcome::NotFound, false};
+    }
 
     throw S3Exception(err.GetErrorType(),
         "{} (Code: {}, S3 exception: '{}') while conditionally removing object with path {} from S3",
@@ -715,6 +770,7 @@ void S3ObjectStorage::removeObjectsIfExistImpl(
         deleteFileFromS3(used_client, uri.bucket, object.remote_path, /*if_exists=*/ true,
                          BlobStorageLogWriter::create(disk_name), object.local_path, object.bytes_size,
                          ProfileEvents::DiskS3DeleteObjects, attempt_seed);
+        invalidateCachedIdentity(object.remote_path);
         return;
     }
 
@@ -801,6 +857,21 @@ void S3ObjectStorage::removeObjectsIfExistImpl(
             first_error_type = error_type;
             first_error_name = err.GetCode();
         }
+    }
+    /// A key that was deleted, or was already gone, must not keep its previous size and ETag.
+    /// A key whose delete failed is still the object the cache describes.
+    for (const auto & object : objects)
+    {
+        bool delete_failed = false;
+        for (const auto & err : outcome.GetResult().GetErrors())
+        {
+            if (err.GetKey() != object.remote_path)
+                continue;
+            if (!S3::isNotFoundError(classifyDeleteObjectsErrorCode(err.GetCode())))
+                delete_failed = true;
+        }
+        if (!delete_failed)
+            invalidateCachedIdentity(object.remote_path);
     }
     if (first_error_type)
         throw S3Exception(
@@ -979,11 +1050,90 @@ std::optional<ObjectMetadata> S3ObjectStorage::tryGetObjectMetadataImpl(
 
 ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool with_tags) const
 {
+    return getObjectMetadataImpl(path, with_tags, /*use_identity_cache=*/ true);
+}
+
+ObjectMetadata S3ObjectStorage::getObjectMetadataImpl(const std::string & path, bool with_tags, bool use_identity_cache) const
+{
+    /// When the caller only needs identity (size / etag / Last-Modified, not tags or user metadata) we
+    /// take a fast path: consult the identity cache to skip the HEAD on repeat opens. A miss issues a
+    /// plain HEAD. This is what removes the per-file metadata request on lake scans. The tags path is unchanged.
+    /// See ObjectStorageIdentityCache.
+    ///
+    /// The cache is owned by the global Context and sized from server settings. Low-level
+    /// object-storage code can run before a global context exists; a null pointer means "no cache"
+    /// and the request is issued uncached.
+    const bool identity_only = !with_tags;
+    /// Bucket and path alone collide when two endpoints reuse a bucket name.
+    const String identity_key = makeObjectStorageIdentityCacheKey(uri.endpoint, uri.bucket, path);
+    ObjectStorageIdentityCachePtr identity_cache;
+    if (identity_only)
+    {
+        if (auto global_context = Context::getGlobalContextInstance())
+            identity_cache = global_context->getObjectStorageIdentityCache();
+
+        /// A cached size is the right bound of a small-file prefetch and the file length for Parquet.
+        /// That is safe when the GET is pinned to the cached ETag. With `s3_validate_etag_on_read` off
+        /// (including `compatibility` before 26.7) nothing checks the ETag, so an external replace would
+        /// be read as the previous generation. Skip the hit and HEAD. The result is still stored, so a
+        /// later read that does check the ETag can hit.
+        bool consult_identity_cache = use_identity_cache;
+        if (consult_identity_cache)
+        {
+            if (auto query_context = CurrentThread::tryGetQueryContext())
+            {
+                if (!query_context->getSettingsRef()[Setting::s3_validate_etag_on_read])
+                    consult_identity_cache = false;
+            }
+        }
+
+        if (consult_identity_cache && identity_cache)
+        {
+            /// Computed only for a lookup. `getCredentials` resolves an assumed role, and a different
+            /// secret must not reuse this entry. The STS test mock returns one access key for every session.
+            const UInt64 credential_hash = s3CredentialHash(*client.get());
+            if (auto cached = identity_cache->tryGet(identity_key, credential_hash))
+            {
+                ObjectMetadata result;
+                result.size_bytes = cached->size;
+                result.is_size_known = cached->is_size_known;
+                result.etag = cached->etag;
+                result.is_from_identity_cache = true;
+                if (cached->is_last_modified_known)
+                {
+                    result.last_modified = Poco::Timestamp::fromEpochTime(static_cast<std::time_t>(cached->last_modified));
+                    /// Real enough for `_time`, but not a freshness proof. The schema and count caches
+                    /// treat an older time as "unchanged" and would keep a replaced object's schema and row count.
+                    result.is_last_modified_fresh = false;
+                }
+                else
+                    result.is_last_modified_known = false;
+                return result;
+            }
+        }
+    }
+
+    /// Captured before the request. `setIfEpoch` stores the result only while this epoch is unchanged
+    /// and no later fetch of the same key has stored, so a write, copy, delete, drop, or an older
+    /// observation cannot put a stale identity back.
+    ObjectStorageIdentityCache::Read identity_read;
+    if (identity_cache)
+        identity_read = identity_cache->beginFetch();
+
     auto settings_ptr = s3_settings.get();
+
+    auto fetch = [&](const S3::Client & c) -> S3::ObjectInfo
+    {
+        /// A plain HEAD returns size, ETag and Last-Modified, which is everything the identity cache stores.
+        if (identity_only)
+            return S3::getObjectInfo(c, uri.bucket, path, /*version_id=*/ {}, /*with_metadata=*/ false, /*with_tags=*/ false);
+        return S3::getObjectInfo(c, uri.bucket, path, /*version_id=*/ {}, /*with_metadata=*/ true, /*with_tags=*/ with_tags);
+    };
+
     S3::ObjectInfo object_info;
     try
     {
-        object_info = S3::getObjectInfo(*client.get(), uri.bucket, path, /*version_id=*/ {}, /*with_metadata=*/ true, /*with_tags=*/ with_tags);
+        object_info = fetch(*client.get());
     }
     catch (DB::Exception & e)
     {
@@ -994,7 +1144,7 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
             if (new_client)
             {
                 client.set(std::move(new_client));
-                object_info = S3::getObjectInfo(*client.get(), uri.bucket, path, /*version_id=*/ {}, /*with_metadata=*/ true, /*with_tags=*/ with_tags);
+                object_info = fetch(*client.get());
                 updated = true;
             }
         }
@@ -1012,6 +1162,26 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
     result.etag = object_info.etag;
     result.tags = std::move(object_info.tags);
     result.attributes = object_info.metadata;
+    /// Epoch 0 means the response had no Last-Modified. Keep it out of `_time` and the schema and count caches.
+    if (identity_only)
+        result.is_last_modified_known = object_info.last_modification_time != 0;
+
+    if (identity_cache)
+    {
+        /// The read that reached this point already holds the identity from before any overwrite that
+        /// happened while it was paused. Resuming must not store that identity.
+        FailPointInjection::pauseFailPoint(FailPoints::object_storage_identity_cache_pause_before_store);
+        ObjectStorageIdentity identity;
+        identity.etag = result.etag;
+        identity.size = result.size_bytes;
+        identity.is_size_known = result.is_size_known;
+        identity.is_last_modified_known = result.is_last_modified_known;
+        if (identity.is_last_modified_known)
+            identity.last_modified = static_cast<Int64>(result.last_modified.epochTime());
+        /// After a credential refresh the client that signed the HEAD may not be the one looked up.
+        identity.credential_hash = s3CredentialHash(*client.get());
+        identity_cache->setIfEpoch(identity_key, std::move(identity), identity_read);
+    }
 
     return result;
 }
@@ -1055,7 +1225,12 @@ void S3ObjectStorage::copyObjectToAnotherObjectStorage( // NOLINT
                 [&, this]{ return readObject(object_from, read_settings_to_use);},
                 object_to_attributes,
                 write_settings.object_storage_copy_mode,
-                dest_s3->objectCreationClient(write_settings));
+                dest_s3->objectCreationClient(write_settings),
+                [dest_s3, dest_path = object_to.remote_path]()
+                {
+                    dest_s3->invalidateCachedIdentity(dest_path);
+                });
+            dest_s3->invalidateCachedIdentity(object_to.remote_path);
             return;
         }
         catch (S3Exception & exc)
@@ -1134,7 +1309,12 @@ void S3ObjectStorage::copyObject( // NOLINT
         [&, this]{ return readObject(object_from, read_settings_to_use);},
         object_to_attributes,
         write_settings.object_storage_copy_mode,
-        objectCreationClient(write_settings));
+        objectCreationClient(write_settings),
+        [this, dest_path = object_to.remote_path]()
+        {
+            invalidateCachedIdentity(dest_path);
+        });
+    invalidateCachedIdentity(object_to.remote_path);
 }
 
 void S3ObjectStorage::shutdown()
@@ -1345,6 +1525,11 @@ bool S3ObjectStorage::hasSingleAttemptClientForTest(uint64_t request_timeout_ms,
 {
     std::lock_guard lock(single_attempt_client_mutex);
     return single_attempt_clients.contains(std::make_tuple(request_timeout_ms, connect_timeout_cap_ms, false));
+}
+
+void S3ObjectStorage::invalidateCachedIdentity(const std::string & path) const
+{
+    invalidateObjectStorageIdentityCache(uri.endpoint, uri.bucket, path);
 }
 
 std::shared_ptr<const S3::Client> S3ObjectStorage::clientForRetryProfile(const ObjectStorageControlRequest & request) const

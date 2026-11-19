@@ -106,7 +106,8 @@ ReadBufferFromS3::ReadBufferFromS3(
     std::optional<size_t> file_size_,
     const S3CredentialsRefreshCallback & credentials_refresh_callback_,
     BlobStorageLogWriterPtr blob_storage_log_,
-    const String & expected_etag_)
+    const String & expected_etag_,
+    std::function<void()> on_identity_rejected_)
     : ReadBufferFromFileBase()
     , client_ptr(std::move(client_ptr_))
     , bucket(bucket_)
@@ -121,6 +122,7 @@ ReadBufferFromS3::ReadBufferFromS3(
     , restricted_seek(restricted_seek_)
     , credentials_refresh_callback(credentials_refresh_callback_)
     , blob_storage_log(std::move(blob_storage_log_))
+    , on_identity_rejected(std::move(on_identity_rejected_))
 {
     file_size = file_size_;
 }
@@ -669,11 +671,14 @@ Aws::S3::Model::GetObjectResult ReadBufferFromS3::sendRequest(size_t attempt, si
         /// on ETag drift. Skip ?versionId= reads (pinned to an immutable version that expected_etag,
         /// taken from the current version, would falsely mismatch) and empty response ETags.
         if (version_id.empty() && !expected_etag.empty() && !response_etag.empty() && response_etag != expected_etag)
+        {
+            rejectCachedIdentity();
             throw Exception(
                 ErrorCodes::S3_OBJECT_CHANGED_DURING_READ,
                 "S3 object {}/{} was replaced during read (etag changed from {} to {}); "
                 "retry the query, or set s3_validate_etag_on_read=0 to disable this check",
                 bucket, key, expected_etag, response_etag);
+        }
 
         if (blob_storage_log)
         {
@@ -705,13 +710,26 @@ Aws::S3::Model::GetObjectResult ReadBufferFromS3::sendRequest(size_t attempt, si
     /// error: S3Exception keeps only the Aws S3Errors code, not the HTTP 412 status.
     if (version_id.empty() && !expected_etag.empty()
         && error.GetResponseCode() == Aws::Http::HttpResponseCode::PRECONDITION_FAILED)
+    {
+        rejectCachedIdentity();
         throw Exception(
             ErrorCodes::S3_OBJECT_CHANGED_DURING_READ,
             "S3 object {}/{} was replaced during read (If-Match on etag {} failed); "
             "retry the query, or set s3_validate_etag_on_read=0 to disable this check",
             bucket, key, expected_etag);
+    }
+
+    /// A cached size and ETag for a key that is gone would fail the same way on every retry.
+    if (version_id.empty() && S3::isNotFoundError(error.GetErrorType()))
+        rejectCachedIdentity();
 
     throw S3Exception(error.GetMessage(), error.GetErrorType());
+}
+
+void ReadBufferFromS3::rejectCachedIdentity() const
+{
+    if (on_identity_rejected)
+        on_identity_rejected();
 }
 
 ObjectMetadata ReadBufferFromS3::getObjectMetadataFromTheLastRequest() const

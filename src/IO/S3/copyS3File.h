@@ -21,6 +21,12 @@ class StdStreamFromReadBuffer;
 
 using CreateReadBuffer = std::function<std::unique_ptr<SeekableReadBuffer>()>;
 
+/// Invoked when `copyS3File`, `copyS3FileRange`, or `copyDataToS3File` throws after `CopyObject`,
+/// `PutObject`, or `CompleteMultipartUpload` was sent. That request may have committed the
+/// destination. A failure before any of those requests does not call it. A successful copy does
+/// not call it either: the caller drops a cached identity after the function returns.
+using OnObjectCreationFailure = std::function<void()>;
+
 /// Builds the S3 upload request body for the part [offset, offset + size) of the source.
 /// The part is read fully into memory up front, so the returned body has no failable inner
 /// source buffer: the AWS SDK can rewind (clear(); seekg(0)) and resend the body on a retry
@@ -60,7 +66,8 @@ void copyS3File(
     const CreateReadBuffer & fallback_file_reader,
     const std::optional<ObjectAttributes> & object_metadata = std::nullopt,
     ObjectStorageCopyMode copy_mode = ObjectStorageCopyMode::Default,
-    std::shared_ptr<const S3::Client> object_creation_client = nullptr);
+    std::shared_ptr<const S3::Client> object_creation_client = nullptr,
+    OnObjectCreationFailure on_object_creation_failure = {});
 
 /// Copies exactly `[src_offset, src_offset + src_size)` of a LARGER source object of size `src_object_size`.
 ///
@@ -83,7 +90,8 @@ void copyS3FileRange(
     BlobStorageLogWriterPtr blob_storage_log,
     ThreadPoolCallbackRunnerUnsafe<void> schedule,
     const CreateReadBuffer & fallback_file_reader,
-    const std::optional<ObjectAttributes> & object_metadata = std::nullopt);
+    const std::optional<ObjectAttributes> & object_metadata = std::nullopt,
+    OnObjectCreationFailure on_object_creation_failure = {});
 
 /// Copies data from any seekable source to S3.
 /// The same functionality can be done by using the function copyData() and the class WriteBufferFromS3
@@ -100,7 +108,8 @@ void copyDataToS3File(
     const S3::S3RequestSettings & settings,
     BlobStorageLogWriterPtr blob_storage_log,
     ThreadPoolCallbackRunnerUnsafe<void> schedule,
-    const std::optional<ObjectAttributes> & object_metadata = std::nullopt);
+    const std::optional<ObjectAttributes> & object_metadata = std::nullopt,
+    OnObjectCreationFailure on_object_creation_failure = {});
 
 }
 

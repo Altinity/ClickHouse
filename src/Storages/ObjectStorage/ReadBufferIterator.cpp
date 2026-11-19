@@ -93,8 +93,9 @@ std::optional<ColumnsDescription> ReadBufferIterator::tryGetColumnsFromCache(
             /// An unknown modification time (e.g. a web object whose HTTP response has no `Last-Modified`
             /// header) must be reported as unavailable, not as the epoch: the schema cache reuses a cached
             /// entry whenever the modification time is older than the registration time, so a fake epoch-`0`
-            /// would keep a stale schema valid forever. Returning `nullopt` makes the cache skip the entry.
-            if (!metadata || !metadata->is_last_modified_known)
+            /// would keep a stale schema valid forever. A time reused from the identity cache has the same
+            /// effect after an external replace. Returning `nullopt` makes the cache skip the entry.
+            if (!metadata || !metadata->lastModifiedConfirmsUnchanged())
                 return std::nullopt;
             return std::optional<time_t>(metadata->last_modified.epochTime());
         };
@@ -256,6 +257,12 @@ ReadBufferIterator::Data ReadBufferIterator::next()
 
             prev_read_keys_size = read_keys.size();
         }
+
+        if (query_settings.skip_empty_files && current_object_info->getObjectMetadata()
+            && current_object_info->getObjectMetadata()->is_from_identity_cache
+            && current_object_info->getObjectMetadata()->size_bytes == 0
+            && current_object_info->getObjectMetadata()->is_size_known)
+            revalidateIdentityCachedObjectMetadata(*current_object_info, object_storage);
 
         if (query_settings.skip_empty_files && current_object_info->getObjectMetadata()
             && current_object_info->getObjectMetadata()->size_bytes == 0

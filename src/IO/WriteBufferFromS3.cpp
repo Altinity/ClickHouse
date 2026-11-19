@@ -111,7 +111,8 @@ WriteBufferFromS3::WriteBufferFromS3(
     std::optional<ObjectAttributes> object_metadata_,
     ThreadPoolCallbackRunnerUnsafe<void> schedule_,
     const WriteSettings & write_settings_,
-    std::shared_ptr<const S3::Client> object_creation_client_)
+    std::shared_ptr<const S3::Client> object_creation_client_,
+    OnUploadComplete on_upload_complete_)
     : WriteBufferFromFileBase(std::min(buf_size_, static_cast<size_t>(DBMS_DEFAULT_BUFFER_SIZE)), nullptr, 0)
     , bucket(bucket_)
     , key(key_)
@@ -120,6 +121,7 @@ WriteBufferFromS3::WriteBufferFromS3(
     , client_ptr(std::move(client_ptr_))
     , object_creation_client(object_creation_client_ ? std::move(object_creation_client_) : client_ptr)
     , object_metadata(std::move(object_metadata_))
+    , on_upload_complete(std::move(on_upload_complete_))
     , buffer_allocation_policy(createBufferAllocationPolicy(request_settings))
     , task_tracker(
           std::make_unique<TaskTracker>(
@@ -225,21 +227,37 @@ void WriteBufferFromS3::finalizeImpl()
     chassert(offset() == 0);
     chassert(hidden_size == 0);
 
-    task_tracker->waitAll();
-
-    span.addAttributeIfNotZero("clickhouse.multipart_upload_parts", multipart_tags.size());
-
-    if (request_settings[S3RequestSetting::check_objects_after_upload])
+    try
     {
-        S3::checkObjectExists(*client_ptr, bucket, key, {}, "Immediately after upload");
+        task_tracker->waitAll();
 
-        size_t actual_size = S3::getObjectSize(*client_ptr, bucket, key, {});
-        if (actual_size != total_size)
-            throw Exception(
-                    ErrorCodes::S3_ERROR,
-                    "Object {} from bucket {} has unexpected size {} after upload, expected size {}, it's a bug in S3 or S3 API.",
-                    key, bucket, actual_size, total_size);
+        span.addAttributeIfNotZero("clickhouse.multipart_upload_parts", multipart_tags.size());
+
+        if (request_settings[S3RequestSetting::check_objects_after_upload])
+        {
+            S3::checkObjectExists(*client_ptr, bucket, key, {}, "Immediately after upload");
+
+            size_t actual_size = S3::getObjectSize(*client_ptr, bucket, key, {});
+            if (actual_size != total_size)
+                throw Exception(
+                        ErrorCodes::S3_ERROR,
+                        "Object {} from bucket {} has unexpected size {} after upload, expected size {}, it's a bug in S3 or S3 API.",
+                        key, bucket, actual_size, total_size);
+        }
     }
+    catch (...)
+    {
+        /// `PutObject` or `CompleteMultipartUpload` may have committed the object even when this
+        /// request failed (a lost response is reported as an error). Drop the cached identity so the
+        /// next read does not send the previous ETag. A part upload that failed before either request
+        /// leaves `object_creation_request_sent` false: the visible object is unchanged.
+        if (object_creation_request_sent && on_upload_complete)
+            on_upload_complete();
+        throw;
+    }
+
+    if (on_upload_complete)
+        on_upload_complete();
 }
 
 void WriteBufferFromS3::cancelImpl() noexcept
@@ -705,6 +723,9 @@ bool WriteBufferFromS3::completeMultipartUpload()
             ProfileEvents::increment(ProfileEvents::DiskS3CompleteMultipartUpload);
 
         Stopwatch watch;
+        /// Set before the call. A failure after S3 has committed the upload must still be visible to
+        /// `finalizeImpl`, which drops the cached identity only once this request has been sent.
+        object_creation_request_sent = true;
         auto outcome = object_creation_client->CompleteMultipartUpload(req);
         auto elapsed = watch.elapsedMicroseconds();
 
@@ -811,6 +832,8 @@ void WriteBufferFromS3::makeSinglepartUpload(WriteBufferFromS3::PartData && data
             CurrentThread::WriteThrottlingScope write_throttling_scope(write_settings.remote_throttler);
 
             Stopwatch watch;
+            /// Set before the call. A lost `PutObject` response can still have replaced the object.
+            object_creation_request_sent = true;
             auto outcome = object_creation_client->PutObject(request);
             auto elapsed = watch.elapsedMicroseconds();
 

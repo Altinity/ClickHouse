@@ -16,7 +16,9 @@
 #include <Common/BlobStorageLogWriter.h>
 #include <Common/BufferAllocationPolicy.h>
 
+#include <functional>
 #include <memory>
+#include <optional>
 #include <vector>
 #include <list>
 
@@ -35,6 +37,9 @@ class TaskTracker;
 class WriteBufferFromS3 final : public WriteBufferFromFileBase
 {
 public:
+    /// Called after the upload has replaced the object, including when the post-upload size check fails.
+    using OnUploadComplete = std::function<void()>;
+
     WriteBufferFromS3(
         std::shared_ptr<const S3::Client> client_ptr_,
         const String & bucket_,
@@ -45,7 +50,8 @@ public:
         std::optional<ObjectAttributes> object_metadata_ = std::nullopt,
         ThreadPoolCallbackRunnerUnsafe<void> schedule_ = {},
         const WriteSettings & write_settings_ = {},
-        std::shared_ptr<const S3::Client> object_creation_client_ = nullptr);
+        std::shared_ptr<const S3::Client> object_creation_client_ = nullptr,
+        OnUploadComplete on_upload_complete_ = {});
 
     ~WriteBufferFromS3() override;
     void nextImpl() override;
@@ -100,6 +106,10 @@ private:
     /// by getResultObjectETag() after finalize(). Written by the upload worker, read after the
     /// finalize barrier (happens-before), so no extra synchronization is needed.
     std::optional<String> object_etag;
+    OnUploadComplete on_upload_complete;
+    /// Set by the upload worker immediately before `PutObject` or `CompleteMultipartUpload`. A lost
+    /// response can still have committed the object. Read after `waitAll` (happens-before).
+    bool object_creation_request_sent = false;
     LoggerPtr log = getLogger("WriteBufferFromS3");
     LogSeriesLimiterPtr limited_log = std::make_shared<LogSeriesLimiter>(log, 1, 5);
 

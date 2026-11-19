@@ -131,7 +131,9 @@ def test_gcp_auth(started_cluster):
     assert get_num_requests() == 2
     assert node.query("SELECT * FROM s3_table") == "OK\n"
 
-    assert get_num_requests() == 4
+    # The first read stored this object's identity, so this read does not HEAD. One GET fetches one
+    # token. A cold read would HEAD and GET and add two.
+    assert get_num_requests() == 3
     assert (
         node.query(
             "SELECT * FROM s3(gcs_conn, filename='test.txt', format='LineAsString')"

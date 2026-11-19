@@ -7935,6 +7935,7 @@ void QueryFuzzer::fuzz(ASTPtr & ast)
                 Type::CLEAR_ENCRYPTION_HEADERS_CACHE,
                 Type::CLEAR_PAIMON_METADATA_CACHE,
                 Type::CLEAR_PARQUET_METADATA_CACHE,
+                Type::CLEAR_OBJECT_STORAGE_IDENTITY_CACHE,
                 Type::CLEAR_POINT_IN_POLYGON_CACHE,
                 /// `CLEAR_{DISK_METADATA,DISTRIBUTED,FILESYSTEM,FORMAT_SCHEMA,QUERY,SCHEMA}_CACHE`
                 /// are deliberately absent: they carry an operand this rotation would not preserve.

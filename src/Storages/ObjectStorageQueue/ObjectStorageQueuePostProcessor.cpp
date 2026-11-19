@@ -4,6 +4,7 @@
 #include <Common/ThreadPoolTaskTracker.h>
 #include <Disks/IDisk.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/AzureBlobStorage/AzureObjectStorage.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageIdentityCache.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/S3/S3ObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/S3/diskSettings.h>
 #include <IO/AzureBlobStorage/copyAzureBlobStorageFile.h>
@@ -382,6 +383,17 @@ void ObjectStorageQueuePostProcessor::moveS3Objects(const StoredObjects & object
                             object_from.remote_path);
                         auto object_to = applyMovePrefixIfPresent(object_from, move_prefix, settings.after_processing_move_preserve_path);
 
+                        /// This copy does not go through `S3ObjectStorage`, so nothing else drops the
+                        /// destination's cached identity. A lost `CopyObject` or `CompleteMultipartUpload`
+                        /// response can still have replaced the object, so the callback covers that throw.
+                        const String endpoint = dst_uri.endpoint;
+                        const String bucket = dst_uri.bucket;
+                        const String dest_key = object_to.remote_path;
+                        auto invalidate_destination = [endpoint, bucket, dest_key]()
+                        {
+                            invalidateObjectStorageIdentityCache(endpoint, bucket, dest_key);
+                        };
+
                         LOG_INFO(log, "Copying {} ({} Bytes) to bucket {}", object_from.remote_path, object_size, dst_uri.bucket);
                         copyS3File(
                             src_client,
@@ -390,15 +402,20 @@ void ObjectStorageQueuePostProcessor::moveS3Objects(const StoredObjects & object
                             /*src_size=*/ object_size,
                             /*dest_s3_client=*/ dst_client,
                             /*dest_bucket=*/ dst_uri.bucket,
-                            /*dest_key=*/ object_to.remote_path,
+                            /*dest_key=*/ dest_key,
                             /*settings=*/ s3_settings->request_settings,
                             /*read_settings=*/ read_settings_to_use,
                             BlobStorageLogWriter::create(object_storage->getDiskName()),
                             scheduler,
-                            /*fallback_file_reader=*/ [&]{
+                            /*fallback_file_reader=*/ [&]
+                            {
                                 return s3_storage->readObject(object_from, read_settings_to_use);
-                            }
-                            /*object_metadata=*/);
+                            },
+                            /*object_metadata=*/ std::nullopt,
+                            ObjectStorageCopyMode::Default,
+                            /*object_creation_client=*/ nullptr,
+                            invalidate_destination);
+                        invalidate_destination();
 
                         LOG_INFO(log, "Removing object {}", object_from.remote_path);
                         object_storage->removeObjectIfExists(object_from);

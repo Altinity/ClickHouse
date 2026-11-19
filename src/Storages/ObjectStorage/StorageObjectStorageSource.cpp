@@ -1171,19 +1171,38 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             }
         }
 
-        if (query_settings.skip_empty_files && object_info->getObjectMetadata()->size_bytes == 0
+        /// The cached size is the previous object's. Re-HEAD before treating it as empty, or a
+        /// replaced object is skipped and never read. `s3_skip_empty_files` defaults to true.
+        const auto cached_metadata = object_info->getObjectMetadata();
+        if (cached_metadata
+            && cached_metadata->is_from_identity_cache
+            && query_settings.skip_empty_files
+            && cached_metadata->is_size_known
+            && cached_metadata->size_bytes == 0)
+            revalidateIdentityCachedObjectMetadata(*object_info, object_storage);
+
+        if (query_settings.skip_empty_files && object_info->getObjectMetadata()
+            && object_info->getObjectMetadata()->size_bytes == 0
             && object_info->getObjectMetadata()->is_size_known)
             continue;
 
+        bool skip_object = false;
         if (query_condition_cache && !object_info->file_bucket_info)
         {
-            const auto query_condition_cache_key = makeQueryConditionCacheKey(*object_info, configuration->isDataLakeConfiguration());
-            std::optional<QueryConditionCache::MatchingMarks> matching_marks;
-            if (query_condition_cache_key)
-                matching_marks = query_condition_cache->read(
-                    storage_id.uuid, *query_condition_cache_key, *format_filter_info->condition_hash);
-            if (matching_marks.has_value())
+            /// A hit that drops every row group never GETs. The key contains the ETag, and an
+            /// identity-cache hit still has the previous one, so confirm it before dropping the file.
+            /// Data-lake keys do not contain the ETag. One confirmation is enough: the HEAD clears
+            /// `is_from_identity_cache`.
+            for (size_t attempt = 0; attempt < 2; ++attempt)
             {
+                const auto query_condition_cache_key = makeQueryConditionCacheKey(*object_info, configuration->isDataLakeConfiguration());
+                std::optional<QueryConditionCache::MatchingMarks> matching_marks;
+                if (query_condition_cache_key)
+                    matching_marks = query_condition_cache->read(
+                        storage_id.uuid, *query_condition_cache_key, *format_filter_info->condition_hash);
+                if (!matching_marks.has_value())
+                    break;
+
                 const auto & marks = *matching_marks;
                 size_t total_row_groups = marks.size();
                 std::vector<size_t> matching_row_groups;
@@ -1199,20 +1218,47 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
                     format_filter_info->filter_actions_dag->dumpNames(),
                     object_info->getFileName());
 
-                if (matching_row_groups.empty())
-                    continue;
-
-                auto file_bucket_info = FormatFactory::instance().getFileBucketInfo(
-                    object_info->getFileFormat().value_or(configuration->getFormat()));
-                if (file_bucket_info)
+                bool drops_object = matching_row_groups.empty();
+                FileBucketInfoPtr filtered;
+                if (!drops_object)
                 {
-                    auto filtered = file_bucket_info->filterByMatchingRowGroups(matching_row_groups);
-                    if (!filtered)
-                        continue;
-                    object_info->file_bucket_info = std::move(filtered);
+                    auto file_bucket_info = FormatFactory::instance().getFileBucketInfo(
+                        object_info->getFileFormat().value_or(configuration->getFormat()));
+                    if (file_bucket_info)
+                    {
+                        filtered = file_bucket_info->filterByMatchingRowGroups(matching_row_groups);
+                        if (!filtered)
+                            drops_object = true;
+                    }
                 }
+
+                const auto metadata_now = object_info->getObjectMetadata();
+                if (drops_object && attempt == 0 && metadata_now && metadata_now->is_from_identity_cache
+                    && !configuration->isDataLakeConfiguration())
+                {
+                    revalidateIdentityCachedObjectMetadata(*object_info, object_storage);
+
+                    /// The empty-file check above already ran, against the previous size. A replaced
+                    /// object can be empty, and reading it throws for formats such as Parquet.
+                    /// `s3_skip_empty_files` defaults to true.
+                    const auto refreshed = object_info->getObjectMetadata();
+                    if (query_settings.skip_empty_files && refreshed
+                        && refreshed->is_size_known && refreshed->size_bytes == 0)
+                    {
+                        skip_object = true;
+                        break;
+                    }
+                    continue;
+                }
+
+                skip_object = drops_object;
+                if (filtered)
+                    object_info->file_bucket_info = std::move(filtered);
+                break;
             }
         }
+        if (skip_object)
+            continue;
         break;
     }
 
@@ -1245,9 +1291,10 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         {
             const auto metadata = object_info->getObjectMetadata();
             /// An unknown modification time (e.g. a web object without a `Last-Modified` header) must not be
-            /// reported as the epoch, otherwise the stale cached row count would always look valid. Reporting
-            /// it as unavailable makes the count cache re-read the file instead.
-            if (!metadata || !metadata->is_last_modified_known)
+            /// reported as the epoch, otherwise the stale cached row count would always look valid. A time
+            /// reused from the identity cache is also not proof the object is unchanged. Reporting either
+            /// as unavailable makes the count cache re-read the file instead.
+            if (!metadata || !metadata->lastModifiedConfirmsUnchanged())
                 return std::nullopt;
             return std::optional<time_t>(metadata->last_modified.epochTime());
         };
@@ -1464,8 +1511,21 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         {
             ProfileEvents::increment(ProfileEvents::ObjectStorageReadObjects);
             compression_method = chooseCompressionMethod(object_info->getFileName(), configuration->compression_method);
+            /// A Parquet `count()` reads the cached footer and does not GET, so `If-Match` never
+            /// rejects a replaced object. Re-HEAD before that ETag keys the parquet metadata cache.
+            /// A read that does GET still checks the ETag there and does not pay this HEAD.
+            const bool revalidate_identity_for_parquet_metadata_cache =
+                effective_need_only_count
+                && context_->getSettingsRef()[Setting::use_parquet_metadata_cache]
+                && Poco::toLower(format_name) == "parquet";
             read_buf = createReadBuffer(
-                object_info->relative_path_with_metadata, object_info->getResolvedStorage(object_storage), context_, log, std::nullopt, !headers_requested);
+                object_info->relative_path_with_metadata,
+                object_info->getResolvedStorage(object_storage),
+                context_,
+                log,
+                std::nullopt,
+                !headers_requested,
+                revalidate_identity_for_parquet_metadata_cache);
         }
 
         Block initial_header = read_from_format_info.format_header;
@@ -1932,13 +1992,27 @@ std::future<StorageObjectStorageSource::ReaderHolder> StorageObjectStorageSource
     return create_reader_scheduler([=, this] { return createReader(/* prefetch_input_format */ true); }, Priority{});
 }
 
+void revalidateIdentityCachedObjectMetadata(ObjectInfo & object_info, const ObjectStoragePtr & object_storage)
+{
+    const auto metadata = object_info.getObjectMetadata();
+    if (!metadata || !metadata->is_from_identity_cache)
+        return;
+
+    auto metadata_object = object_info.relative_path_with_metadata;
+    metadata_object.relative_path = object_info.getPathOrPathToArchiveIfArchive();
+    object_info.setObjectMetadata(
+        object_info.getResolvedStorage(object_storage)->getObjectMetadataIgnoringIdentityCache(
+            metadata_object, /*with_tags=*/ false));
+}
+
 std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     RelativePathWithMetadata & object_info,
     const ObjectStoragePtr & object_storage,
     const ContextPtr & context_,
     const LoggerPtr & log,
     const std::optional<ReadSettings> & read_settings,
-    bool allow_page_cache)
+    bool allow_page_cache,
+    bool revalidate_identity_for_parquet_metadata_cache)
 {
     const auto & settings = context_->getSettingsRef();
     const auto & effective_read_settings = read_settings.has_value() ? read_settings.value() : context_->getReadSettings();
@@ -1992,6 +2066,24 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
         /// read-time validation (it carries no tags, so the with_tags=false HEAD drops nothing). A real fetch
         /// that merely lacks an ETag (e.g. GCS) has is_fetched=true and is left as-is - no extra HEAD.
         object_info.metadata = object_storage->getObjectMetadata(object_info, /*with_tags=*/ false);
+    }
+
+    /// A filesystem, page, or parquet-metadata cache hit never issues the GET, so it cannot notice
+    /// that the object was replaced. Re-read the identity before using its ETag as the cache key.
+    /// An unchanged object keeps the same key. A replaced object gets a new key and is read again.
+    /// The parquet flag is only a footer-only count: other Parquet reads still check the ETag on GET.
+    ///
+    /// The same re-read is required when this query does not check the ETag at all. `getObjectMetadata`
+    /// skips the hit when the query context carries `s3_validate_etag_on_read = 0`, but a hit taken
+    /// without that context still has the previous size, and a small-file prefetch stops at that size.
+    const bool identity_from_cache = object_info.metadata && object_info.metadata->is_from_identity_cache;
+    const bool revalidate_for_content_cache = identity_from_cache
+        && (use_filesystem_cache || use_page_cache || revalidate_identity_for_parquet_metadata_cache)
+        && object_info.metadata->is_size_known
+        && object_info.metadata->isEtagUsableAsCacheKey();
+    if (revalidate_for_content_cache || (identity_from_cache && !validate_etag_on_read))
+    {
+        object_info.metadata = object_storage->getObjectMetadataIgnoringIdentityCache(object_info, /*with_tags=*/ false);
     }
 
     if (use_page_cache && !object_info.metadata->isEtagUsableAsCacheKey())
