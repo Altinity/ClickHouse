@@ -1223,7 +1223,11 @@ void S3ObjectStorage::copyObjectToAnotherObjectStorage( // NOLINT
                 [&, this]{ return readObject(object_from, read_settings_to_use);},
                 object_to_attributes,
                 write_settings.object_storage_copy_mode,
-                dest_s3->objectCreationClient(write_settings));
+                dest_s3->objectCreationClient(write_settings),
+                [dest_s3, dest_path = object_to.remote_path]()
+                {
+                    dest_s3->invalidateCachedIdentity(dest_path);
+                });
             dest_s3->invalidateCachedIdentity(object_to.remote_path);
             return;
         }
@@ -1303,7 +1307,11 @@ void S3ObjectStorage::copyObject( // NOLINT
         [&, this]{ return readObject(object_from, read_settings_to_use);},
         object_to_attributes,
         write_settings.object_storage_copy_mode,
-        objectCreationClient(write_settings));
+        objectCreationClient(write_settings),
+        [this, dest_path = object_to.remote_path]()
+        {
+            invalidateCachedIdentity(dest_path);
+        });
     invalidateCachedIdentity(object_to.remote_path);
 }
 

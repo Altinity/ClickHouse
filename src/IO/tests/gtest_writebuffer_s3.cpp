@@ -1195,6 +1195,97 @@ TEST_F(WBS3Test, CopyDataToS3FileRetriesInvalidPart) {
     EXPECT_EQ(bStore.objects["copy_data_invalid_part_retry"].size(), payload.size());
 }
 
+/// `CompleteMultipartUpload` can commit the object and still report an error. `copyDataToS3File` must
+/// run the failure callback before propagating that error, so a backup copy drops the cached identity.
+/// An `UploadPart` failure never sends the completing request and must not run the callback.
+TEST_F(WBS3Test, CopyDataToS3FileRunsCallbackWhenCompleteFails)
+{
+    setInjectionModel(std::make_shared<MockS3::CompleteMPUFailIngection>());
+
+    getSettings()[Setting::s3_max_single_part_upload_size] = 0;
+    getSettings()[Setting::s3_min_upload_part_size] = 1;
+    getSettings()[Setting::s3_check_objects_after_upload] = false;
+
+    S3::S3RequestSettings request_settings;
+    request_settings.updateFromSettings(settings, /* if_changed */ true, /* validate_settings */ false);
+
+    const String payload = "copy_complete_fail_payload";
+    auto create_read_buffer = [&]() -> std::unique_ptr<SeekableReadBuffer>
+    {
+        return std::make_unique<ReadBufferFromOwnString>(payload);
+    };
+
+    size_t callbacks = 0;
+    EXPECT_THROW({
+        try
+        {
+            copyDataToS3File(
+                create_read_buffer,
+                /* offset= */ 0,
+                /* size= */ payload.size(),
+                client,
+                bucket,
+                "copy_data_complete_fail_callback",
+                request_settings,
+                /* blob_storage_log= */ nullptr,
+                /* schedule= */ {},
+                /* object_metadata= */ std::nullopt,
+                [&]() { ++callbacks; });
+        }
+        catch (const DB::Exception & e)
+        {
+            ASSERT_EQ(ErrorCodes::S3_ERROR, e.code());
+            EXPECT_THAT(e.what(), testing::HasSubstr("CompleteMPUFailIngection"));
+            throw;
+        }
+    }, DB::S3Exception);
+    EXPECT_EQ(callbacks, 1u);
+}
+
+TEST_F(WBS3Test, CopyDataToS3FileSkipsCallbackWhenPartUploadFails)
+{
+    setInjectionModel(std::make_shared<MockS3::UploadPartFailIngection>());
+
+    getSettings()[Setting::s3_max_single_part_upload_size] = 0;
+    getSettings()[Setting::s3_min_upload_part_size] = 1;
+    getSettings()[Setting::s3_check_objects_after_upload] = false;
+
+    S3::S3RequestSettings request_settings;
+    request_settings.updateFromSettings(settings, /* if_changed */ true, /* validate_settings */ false);
+
+    const String payload = "copy_part_fail_payload";
+    auto create_read_buffer = [&]() -> std::unique_ptr<SeekableReadBuffer>
+    {
+        return std::make_unique<ReadBufferFromOwnString>(payload);
+    };
+
+    size_t callbacks = 0;
+    EXPECT_THROW({
+        try
+        {
+            copyDataToS3File(
+                create_read_buffer,
+                /* offset= */ 0,
+                /* size= */ payload.size(),
+                client,
+                bucket,
+                "copy_data_part_fail_callback",
+                request_settings,
+                /* blob_storage_log= */ nullptr,
+                /* schedule= */ {},
+                /* object_metadata= */ std::nullopt,
+                [&]() { ++callbacks; });
+        }
+        catch (const DB::Exception & e)
+        {
+            ASSERT_EQ(ErrorCodes::S3_ERROR, e.code());
+            EXPECT_THAT(e.what(), testing::HasSubstr("UploadPartFailIngection"));
+            throw;
+        }
+    }, DB::S3Exception);
+    EXPECT_EQ(callbacks, 0u);
+}
+
 /// copyS3File routing between whole-object CopyObject and ranged UploadPartCopy. A small copy would take
 /// CopyObject, which carries no byte range and copies the ENTIRE source; a partial-range copy must therefore
 /// force UploadPartCopy, which sets a CopySourceRange per part -- but only when S3 would accept the source as

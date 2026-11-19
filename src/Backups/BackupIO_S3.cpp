@@ -671,6 +671,14 @@ void BackupWriterS3::copyFileFromDisk(
                 : (copy_encrypted ? src_disk->getEncryptedFileSize(src_path) : src_disk->getFileSize(src_path));
             const bool whole_object = (src_offset == 0) && (length == source_size);
             const String dest_key = fs::path(s3_uri.key) / path_in_backup;
+            /// Runs when the copy throws after `CopyObject`, `PutObject`, or `CompleteMultipartUpload`
+            /// was sent. The success path below invalidates only if the copy returns.
+            const String endpoint = s3_uri.endpoint;
+            const String bucket = s3_uri.bucket;
+            auto on_object_creation_failure = [endpoint, bucket, dest_key]()
+            {
+                invalidateObjectStorageIdentityCache(endpoint, bucket, dest_key);
+            };
 
             if (whole_object)
             {
@@ -687,7 +695,11 @@ void BackupWriterS3::copyFileFromDisk(
                     read_settings,
                     blob_storage_log,
                     runner,
-                    create_read_buffer);
+                    create_read_buffer,
+                    /* object_metadata= */ std::nullopt,
+                    ObjectStorageCopyMode::Default,
+                    /* object_creation_client= */ nullptr,
+                    on_object_creation_failure);
             }
             else
             {
@@ -705,7 +717,9 @@ void BackupWriterS3::copyFileFromDisk(
                     read_settings,
                     blob_storage_log,
                     runner,
-                    create_read_buffer);
+                    create_read_buffer,
+                    /* object_metadata= */ std::nullopt,
+                    on_object_creation_failure);
             }
 
             /// The copy has replaced `dest_key`. A read that cached the previous ETag must not send it as `If-Match`.
@@ -724,6 +738,8 @@ void BackupWriterS3::copyFile(const String & destination, const String & source,
 
     const auto source_key = fs::path(s3_uri.key) / source;
     const String dest_key = fs::path(s3_uri.key) / destination;
+    const String endpoint = s3_uri.endpoint;
+    const String bucket = s3_uri.bucket;
     copyS3File(
         client,
         /* src_bucket */ s3_uri.bucket,
@@ -741,6 +757,13 @@ void BackupWriterS3::copyFile(const String & destination, const String & source,
             LOG_TRACE(log, "Falling back to copy file inside backup from {} to {} through direct buffers", source, destination);
             return std::make_unique<ReadBufferFromS3>(
                 client, s3_uri.bucket, source_key, s3_uri.version_id, s3_settings.request_settings, read_settings);
+        },
+        /* object_metadata= */ std::nullopt,
+        ObjectStorageCopyMode::Default,
+        /* object_creation_client= */ nullptr,
+        [endpoint, bucket, dest_key]()
+        {
+            invalidateObjectStorageIdentityCache(endpoint, bucket, dest_key);
         });
     invalidateObjectStorageIdentityCache(s3_uri.endpoint, s3_uri.bucket, dest_key);
 }
@@ -748,9 +771,16 @@ void BackupWriterS3::copyFile(const String & destination, const String & source,
 void BackupWriterS3::copyDataToFile(const String & path_in_backup, const CreateReadBufferFunction & create_read_buffer, UInt64 start_pos, UInt64 length)
 {
     const String dest_key = fs::path(s3_uri.key) / path_in_backup;
+    const String endpoint = s3_uri.endpoint;
+    const String bucket = s3_uri.bucket;
     copyDataToS3File(create_read_buffer, start_pos, length, client, s3_uri.bucket, dest_key,
                      s3_settings.request_settings, blob_storage_log,
-                     threadPoolCallbackRunnerUnsafe<void>(getBackupsIOThreadPool().get(), ThreadName::S3_BACKUP_WRITER));
+                     threadPoolCallbackRunnerUnsafe<void>(getBackupsIOThreadPool().get(), ThreadName::S3_BACKUP_WRITER),
+                     /* object_metadata= */ std::nullopt,
+                     [endpoint, bucket, dest_key]()
+                     {
+                         invalidateObjectStorageIdentityCache(endpoint, bucket, dest_key);
+                     });
     invalidateObjectStorageIdentityCache(s3_uri.endpoint, s3_uri.bucket, dest_key);
 }
 
