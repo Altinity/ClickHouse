@@ -28,6 +28,7 @@
 #include <unordered_set>
 #include <algorithm>
 #include <deque>
+#include <exception>
 #include <limits>
 #include <optional>
 #include <set>
@@ -1006,6 +1007,18 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         return report;   /// no fold, no pre-CAS deletes, no gc/state CAS — sealed generation stays pinned
     }
 
+    /// `fold` changes `state.snap_generation` before commit, so a failed preparation must use the
+    /// adopted parent generation when pacing the next idle sweep attempt.
+    const uint64_t adopted_generation = state.snap_generation;
+    const int exceptions_at_entry = std::uncaught_exceptions();
+    bool gc_state_commit_started = false;
+    SCOPE_EXIT({
+        if (run_orphan_manifest_sweep
+            && !gc_state_commit_started
+            && std::uncaught_exceptions() > exceptions_at_entry)
+            orphan_manifest_sweep_forced_fold_suppression_generation = adopted_generation;
+    });
+
     /// Emit that the round's single pass begins.
     EventEmitter{*store}.emit([&](CasEvent & e)
     {
@@ -1340,8 +1353,11 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         next.manifest_sweep_cursor = folded.orphan_sweep.next_cursor;
         updateOrphanManifestSweepSchedule(next, orphan_manifest_sweep_decision, folded.orphan_sweep.wrapped, now_ms_fn());
     }
-    WriteResult commit = op.replace(layout.gcStateKey(), encodeGcState(next), *state_etag,
-                                    Retry::standard());
+    const String state_key = layout.gcStateKey();
+    const String state_body = encodeGcState(next);
+    /// A failed or conflicting state CAS must not add retry deferral, including an unknown outcome.
+    gc_state_commit_started = true;
+    WriteResult commit = op.replace(state_key, state_body, *state_etag, Retry::standard());
     if (const auto * conflict = std::get_if<Conflict>(&commit))
     {
         /// A refused precondition whose resolve read settled nothing proves only that this commit did
@@ -3631,25 +3647,16 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     std::vector<BlobSourceRetirement> orphan_source_retirements;
     if (run_orphan_manifest_sweep && !suppress_destructive && store->poolConfig().manifest_sweep_list_budget_keys > 0)
     {
-        try
-        {
-            result.orphan_sweep = planManifestCursorPage(
-                *store,
-                state.manifest_sweep_cursor,
-                store->poolConfig().manifest_sweep_list_budget_keys,
-                store->poolConfig().manifest_sweep_delete_budget_keys,
-                /// The sweep may recover a catalog-named namespace's debris only from the same frozen catalog
-                /// cut and `_ckpt` frontier the round's own universe came from -- which is exactly what an
-                /// authoritative universe means, and is why this is the gate's term and not a separate one.
-                universe_authoritative,
-                &work_budget, io_pool.get(), store->poolConfig().gc_io_concurrency);
-        }
-        catch (...)
-        {
-            /// No new generation was adopted; pace retries against the current parent generation.
-            orphan_manifest_sweep_forced_fold_suppression_generation = state.snap_generation;
-            throw;
-        }
+        result.orphan_sweep = planManifestCursorPage(
+            *store,
+            state.manifest_sweep_cursor,
+            store->poolConfig().manifest_sweep_list_budget_keys,
+            store->poolConfig().manifest_sweep_delete_budget_keys,
+            /// The sweep may recover a catalog-named namespace's debris only from the same frozen catalog
+            /// cut and `_ckpt` frontier the round's own universe came from -- which is exactly what an
+            /// authoritative universe means, and is why this is the gate's term and not a separate one.
+            universe_authoritative,
+            &work_budget, io_pool.get(), store->poolConfig().gc_io_concurrency);
         for (const ManifestSweepResult::Nomination & nomination : result.orphan_sweep.nominations)
             orphan_source_retirements.insert(
                 orphan_source_retirements.end(),

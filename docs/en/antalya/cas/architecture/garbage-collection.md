@@ -251,9 +251,11 @@ from deferring. It does not mean that the sweep page was planned or any manifest
 `orphan_manifest_sweep_active` is an observation derived from a nonempty accepted
 `manifest_sweep_cursor`; it is not a separate field in `gc/state`.
 After a suppressed attempt is committed, a leader-local marker names the newly adopted generation.
-An exception from `planManifestCursorPage` instead records the current adopted parent generation
-and propagates: no sweep progress is committed. Other fold errors and a lost round `CAS` do not
-set a new marker.
+A fold with a requested sweep saves its adopted parent generation before preparing the next
+generation. If planning the page, writing the fold seal, pruning old generations or encoding the next
+state throws, a scope guard records that saved generation in the marker. The exception propagates
+without committing sweep progress. The guard is disabled immediately before sending the round's
+state `CAS`, so a failed or conflicting commit adds no deferral.
 While that generation remains current, `orphan_manifest_sweep_requires_fold` is false and ordinary
 bounded defer applies. A fold started by any other trigger still plans the requested sweep when its
 safety gates permit it. A committed non-suppressed fold clears the marker, so successful active pages keep

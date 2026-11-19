@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include "cas_test_helpers.h"
 
+#include <exception>
 #include <functional>
 #include <map>
 #include <utility>
@@ -24,6 +25,7 @@ class ScheduleBackend : public CountingBackend
 public:
     String manifests_prefix;
     String state_key;
+    String fail_list_prefix;
     std::function<void()> before_manifest_list;
     std::function<void()> before_round_commit;
 
@@ -31,6 +33,11 @@ public:
     {
         if (prefix == manifests_prefix && before_manifest_list)
             std::exchange(before_manifest_list, {})();
+        if (!fail_list_prefix.empty() && prefix == fail_list_prefix)
+        {
+            fail_list_prefix.clear();
+            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "test generation list failure");
+        }
         return CountingBackend::list(prefix, cursor, limit, access);
     }
 
@@ -452,6 +459,95 @@ TEST(CASOrphanManifestSweepScheduleGc, FailedSweepUsesBoundedDeferral)
         EXPECT_EQ(f.state().snap_generation, adopted.snap_generation);
         expectSameSchedule(f.state(), adopted);
     }
+}
+
+TEST(CASOrphanManifestSweepScheduleGc, SealWriteFailureUsesBoundedDeferral)
+{
+    ScheduleFixture f(1000, 3600, 2);
+    ASSERT_TRUE(f.run().acquired_lease);
+    const auto adopted = f.state();
+    f.now = 3601000;
+    String seal_key;
+    f.backend->before_manifest_list = [&]
+    {
+        const auto leased = f.state();
+        seal_key = f.store->layout().foldSealKey(leased.snap_generation + 1, leased.lease.seq);
+        f.backend->failNextWriteWith(seal_key,
+            std::make_exception_ptr(DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "test seal write failure")));
+    };
+    f.backend->resetCounts();
+    EXPECT_THROW(f.run(), DB::Exception);
+    ASSERT_FALSE(seal_key.empty());
+    EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 1);
+    EXPECT_EQ(f.backend->writeCount(seal_key), 1);
+    EXPECT_EQ(f.state().snap_generation, adopted.snap_generation);
+    EXPECT_EQ(f.state().snap_attempt, adopted.snap_attempt);
+    expectSameSchedule(f.state(), adopted);
+
+    f.backend->resetCounts();
+    for (size_t tick = 0; tick < 2; ++tick)
+    {
+        const auto deferred = f.run();
+        ASSERT_TRUE(deferred.acquired_lease);
+        ASSERT_TRUE(deferred.deferred);
+        EXPECT_EQ(f.state().snap_generation, adopted.snap_generation);
+        expectSameSchedule(f.state(), adopted);
+    }
+    EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 0);
+    const auto retried = f.run();
+    ASSERT_TRUE(retried.acquired_lease);
+    EXPECT_FALSE(retried.deferred);
+    EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 1);
+    EXPECT_EQ(f.state().snap_generation, adopted.snap_generation + 1);
+    EXPECT_EQ(f.state().orphan_manifest_sweep_completed_at_ms, f.now);
+}
+
+TEST(CASOrphanManifestSweepScheduleGc, PruneFailureUsesBoundedDeferral)
+{
+    ScheduleFixture f(1000, 3600, 2);
+    for (size_t generation = 0; generation < 3; ++generation)
+    {
+        ASSERT_TRUE(f.run().acquired_lease);
+        f.now += 3600000;
+    }
+    const auto adopted = f.state();
+    ASSERT_EQ(adopted.snap_generation, 3);
+    f.backend->fail_list_prefix = f.store->layout().gcGenPrefix(1);
+    String seal_key;
+    f.backend->before_manifest_list = [&]
+    {
+        const auto leased = f.state();
+        seal_key = f.store->layout().foldSealKey(leased.snap_generation + 1, leased.lease.seq);
+    };
+    f.backend->resetCounts();
+    EXPECT_THROW(f.run(), DB::Exception);
+    EXPECT_TRUE(f.backend->fail_list_prefix.empty());
+    EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 1);
+    ASSERT_FALSE(seal_key.empty());
+    {
+        OperationForTest op(*f.backend);
+        EXPECT_TRUE((*op).head(seal_key, Retry::once()).has_value());
+    }
+    EXPECT_EQ(f.state().snap_generation, adopted.snap_generation);
+    EXPECT_EQ(f.state().snap_attempt, adopted.snap_attempt);
+    expectSameSchedule(f.state(), adopted);
+
+    f.backend->resetCounts();
+    for (size_t tick = 0; tick < 2; ++tick)
+    {
+        const auto deferred = f.run();
+        ASSERT_TRUE(deferred.acquired_lease);
+        ASSERT_TRUE(deferred.deferred);
+        EXPECT_EQ(f.state().snap_generation, adopted.snap_generation);
+        expectSameSchedule(f.state(), adopted);
+    }
+    EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 0);
+    const auto retried = f.run();
+    ASSERT_TRUE(retried.acquired_lease);
+    EXPECT_FALSE(retried.deferred);
+    EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 1);
+    EXPECT_EQ(f.state().snap_generation, adopted.snap_generation + 1);
+    EXPECT_EQ(f.state().orphan_manifest_sweep_completed_at_ms, f.now);
 }
 
 TEST(CASOrphanManifestSweepScheduleGc, FailedSweepForcedFoldSuppressionIsClearedByFoldWhileWaiting)
