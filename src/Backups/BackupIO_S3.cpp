@@ -20,6 +20,7 @@
 #include <Disks/IDisk.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedExchange.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageIdentityCache.h>
 
 #include <Poco/Util/AbstractConfiguration.h>
 
@@ -357,6 +358,26 @@ private:
 
         return res;
     }
+
+    /// Drop the identity cached for `key`. Backup IO writes and deletes through `WriteBufferFromS3`,
+    /// `copyS3File`, and `deleteFileFromS3`, not through `S3ObjectStorage`, so nothing else drops the entry.
+    /// The next read HEADs instead of sending `If-Match` for the previous ETag.
+    void invalidateObjectStorageIdentityCache(const String & endpoint, const String & bucket, const String & key)
+    {
+        auto global_context = Context::getGlobalContextInstance();
+        if (!global_context)
+        {
+            return;
+        }
+
+        auto cache = global_context->getObjectStorageIdentityCache();
+        if (!cache)
+        {
+            return;
+        }
+
+        cache->invalidate(makeObjectStorageIdentityCacheKey(endpoint, bucket, key));
+    }
 }
 
 
@@ -649,6 +670,7 @@ void BackupWriterS3::copyFileFromDisk(
             const size_t source_size = ca_plan ? ca_plan->object.bytes_size
                 : (copy_encrypted ? src_disk->getEncryptedFileSize(src_path) : src_disk->getFileSize(src_path));
             const bool whole_object = (src_offset == 0) && (length == source_size);
+            const String dest_key = fs::path(s3_uri.key) / path_in_backup;
 
             if (whole_object)
             {
@@ -660,7 +682,7 @@ void BackupWriterS3::copyFileFromDisk(
                     length,
                     /* dest_s3_client */ client,
                     /* dest_bucket */ s3_uri.bucket,
-                    /* dest_key */ fs::path(s3_uri.key) / path_in_backup,
+                    /* dest_key */ dest_key,
                     s3_settings.request_settings,
                     read_settings,
                     blob_storage_log,
@@ -678,7 +700,7 @@ void BackupWriterS3::copyFileFromDisk(
                     /* src_object_size= */ source_size,
                     /* dest_s3_client */ client,
                     /* dest_bucket */ s3_uri.bucket,
-                    /* dest_key */ fs::path(s3_uri.key) / path_in_backup,
+                    /* dest_key */ dest_key,
                     s3_settings.request_settings,
                     read_settings,
                     blob_storage_log,
@@ -686,6 +708,8 @@ void BackupWriterS3::copyFileFromDisk(
                     create_read_buffer);
             }
 
+            /// The copy has replaced `dest_key`. A read that cached the previous ETag must not send it as `If-Match`.
+            invalidateObjectStorageIdentityCache(s3_uri.endpoint, s3_uri.bucket, dest_key);
             return; /// copied!
         }
     }
@@ -699,6 +723,7 @@ void BackupWriterS3::copyFile(const String & destination, const String & source,
     LOG_TRACE(log, "Copying file inside backup from {} to {}", source, destination);
 
     const auto source_key = fs::path(s3_uri.key) / source;
+    const String dest_key = fs::path(s3_uri.key) / destination;
     copyS3File(
         client,
         /* src_bucket */ s3_uri.bucket,
@@ -706,7 +731,7 @@ void BackupWriterS3::copyFile(const String & destination, const String & source,
         size,
         /* dest_s3_client= */ client,
         /* dest_bucket= */ s3_uri.bucket,
-        /* dest_key= */ fs::path(s3_uri.key) / destination,
+        /* dest_key= */ dest_key,
         s3_settings.request_settings,
         read_settings,
         blob_storage_log,
@@ -717,13 +742,16 @@ void BackupWriterS3::copyFile(const String & destination, const String & source,
             return std::make_unique<ReadBufferFromS3>(
                 client, s3_uri.bucket, source_key, s3_uri.version_id, s3_settings.request_settings, read_settings);
         });
+    invalidateObjectStorageIdentityCache(s3_uri.endpoint, s3_uri.bucket, dest_key);
 }
 
 void BackupWriterS3::copyDataToFile(const String & path_in_backup, const CreateReadBufferFunction & create_read_buffer, UInt64 start_pos, UInt64 length)
 {
-    copyDataToS3File(create_read_buffer, start_pos, length, client, s3_uri.bucket, fs::path(s3_uri.key) / path_in_backup,
+    const String dest_key = fs::path(s3_uri.key) / path_in_backup;
+    copyDataToS3File(create_read_buffer, start_pos, length, client, s3_uri.bucket, dest_key,
                      s3_settings.request_settings, blob_storage_log,
                      threadPoolCallbackRunnerUnsafe<void>(getBackupsIOThreadPool().get(), ThreadName::S3_BACKUP_WRITER));
+    invalidateObjectStorageIdentityCache(s3_uri.endpoint, s3_uri.bucket, dest_key);
 }
 
 BackupWriterS3::~BackupWriterS3() = default;
@@ -752,38 +780,57 @@ std::unique_ptr<ReadBuffer> BackupWriterS3::readFile(const String & file_name, s
 
 std::unique_ptr<WriteBuffer> BackupWriterS3::writeFile(const String & file_name)
 {
+    /// Captured by value. The buffer can outlive this writer, and the cache itself is process-global.
+    const String endpoint = s3_uri.endpoint;
+    const String bucket = s3_uri.bucket;
+    const String object_key = fs::path(s3_uri.key) / file_name;
     return std::make_unique<WriteBufferFromS3>(
         client,
-        s3_uri.bucket,
-        fs::path(s3_uri.key) / file_name,
+        bucket,
+        object_key,
         DBMS_DEFAULT_BUFFER_SIZE,
         s3_settings.request_settings,
         blob_storage_log,
         std::nullopt,
         threadPoolCallbackRunnerUnsafe<void>(getBackupsIOThreadPool().get(), ThreadName::S3_BACKUP_WRITER),
-        write_settings);
+        write_settings,
+        /* object_creation_client */ nullptr,
+        [endpoint, bucket, object_key]()
+        {
+            invalidateObjectStorageIdentityCache(endpoint, bucket, object_key);
+        });
 }
 
 std::unique_ptr<WriteBuffer> BackupWriterS3::writeFileIfNotExists(const String & file_name)
 {
     WriteSettings conditional_write_settings = write_settings;
     conditional_write_settings.object_storage_write_if_none_match = "*";
+    const String endpoint = s3_uri.endpoint;
+    const String bucket = s3_uri.bucket;
+    const String object_key = fs::path(s3_uri.key) / file_name;
     return std::make_unique<WriteBufferFromS3>(
         client,
-        s3_uri.bucket,
-        fs::path(s3_uri.key) / file_name,
+        bucket,
+        object_key,
         DBMS_DEFAULT_BUFFER_SIZE,
         s3_settings.request_settings,
         blob_storage_log,
         std::nullopt,
         threadPoolCallbackRunnerUnsafe<void>(getBackupsIOThreadPool().get(), ThreadName::S3_BACKUP_WRITER),
-        conditional_write_settings);
+        conditional_write_settings,
+        /* object_creation_client */ nullptr,
+        [endpoint, bucket, object_key]()
+        {
+            invalidateObjectStorageIdentityCache(endpoint, bucket, object_key);
+        });
 }
 
 void BackupWriterS3::removeFile(const String & file_name)
 {
-    deleteFileFromS3(client, s3_uri.bucket, fs::path(s3_uri.key) / file_name, /* if_exists = */ true,
+    const String object_key = fs::path(s3_uri.key) / file_name;
+    deleteFileFromS3(client, s3_uri.bucket, object_key, /* if_exists = */ true,
                      blob_storage_log);
+    invalidateObjectStorageIdentityCache(s3_uri.endpoint, s3_uri.bucket, object_key);
 }
 
 void BackupWriterS3::removeFiles(const Strings & file_names)
@@ -798,6 +845,9 @@ void BackupWriterS3::removeFiles(const Strings & file_names)
 
     deleteFilesFromS3(client, s3_uri.bucket, keys, /* if_exists = */ true,
                       s3_capabilities, batch_size, blob_storage_log);
+    /// A key that was deleted, or was already gone, must not keep its previous size and ETag.
+    for (const auto & key : keys)
+        invalidateObjectStorageIdentityCache(s3_uri.endpoint, s3_uri.bucket, key);
 }
 
 }
