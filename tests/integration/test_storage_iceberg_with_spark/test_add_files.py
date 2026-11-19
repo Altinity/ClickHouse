@@ -3,6 +3,7 @@ import json
 import os
 import re
 import tempfile
+from decimal import Decimal
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -491,7 +492,7 @@ def test_add_files_rejects_unsupported_representations(started_cluster_iceberg_w
         schema="(x Nullable(Decimal(9, 2)))",
     )
     env_decimal.write_parquet_arrow("data/import", "decimal.parquet", pa.table({
-        "x": pa.array([1, -2], type=pa.int64()).cast(pa.decimal128(9, 2)),
+        "x": pa.array([Decimal("1.00"), Decimal("-2.00")], type=pa.decimal128(9, 2)),
     }))
     error = env_decimal.add_files_error(env_decimal.table_path("data/import", "decimal.parquet"))
     assert "which add_files does not support yet" in error, f"got {error}"
