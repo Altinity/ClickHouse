@@ -20,11 +20,12 @@ public:
     /// `ping_pooled_connection` sends a `Ping` on a connection taken from the pool already
     /// established. A zero-timeout poll cannot see a server that stopped without closing the
     /// socket, and a cluster read would then wait for `receive_timeout`. No `Pong` within
-    /// `sync_request_timeout` reconnects once. That handshake is capped by `sync_request_timeout`:
-    /// a live server finishes `Hello` in one round trip, and a stopped server does not wait out
-    /// `handshake_timeout_ms`. A socket the server has already closed also reconnects once, with
-    /// the usual handshake timeout. Callers that can run without this replica (cluster reads of
-    /// a remote shard) pass true. The default keeps the poll, with no round trip.
+    /// `sync_request_timeout` reconnects once. That handshake is capped by `sync_request_timeout`,
+    /// also when `handshake_timeout_ms` is `0`: a live server finishes `Hello` in one round trip,
+    /// and a stopped server stops at the cap. A socket the server has already closed also
+    /// reconnects once, with the usual handshake timeout. Callers that can run without this
+    /// replica (cluster reads of a remote shard) pass true. The default keeps the poll, with no
+    /// round trip.
     ConnectionEstablisher(ConnectionPoolPtr pool_,
                           const ConnectionTimeouts * timeouts_,
                           const Settings & settings_,

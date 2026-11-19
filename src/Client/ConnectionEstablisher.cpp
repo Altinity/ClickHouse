@@ -80,7 +80,7 @@ void ConnectionEstablisher::run(ConnectionEstablisher::TryResult & result, std::
     /// Set when `Ping` reached `sync_request_timeout` on this attempt.
     bool pooled_ping_timed_out = false;
     /// The next attempt is the one reconnect after a ping timeout. Its `Hello` wait is capped
-    /// by `sync_request_timeout` so a stopped process does not sit through `handshake_timeout_ms`.
+    /// by `sync_request_timeout`, including when `handshake_timeout_ms` is `0` (no socket timeout).
     bool cap_handshake_after_ping_timeout = false;
 
     auto try_establish = [&]()
@@ -90,8 +90,20 @@ void ConnectionEstablisher::run(ConnectionEstablisher::TryResult & result, std::
         ConnectionTimeouts attempt_timeouts = *timeouts;
         if (cap_handshake_after_ping_timeout)
         {
-            attempt_timeouts.handshake_timeout = ConnectionTimeouts::saturate(
-                attempt_timeouts.handshake_timeout, attempt_timeouts.sync_request_timeout);
+            /// `saturate` keeps a zero timeout: it is smaller than any positive limit. A zero
+            /// socket timeout never fires, and `handshake_timeout_ms = 0` means no limit, so
+            /// that value is replaced by `sync_request_timeout`. Any other handshake timeout
+            /// is the minimum of the two.
+            const Poco::Timespan & limit = attempt_timeouts.sync_request_timeout;
+            if (attempt_timeouts.handshake_timeout.totalMicroseconds() == 0)
+            {
+                attempt_timeouts.handshake_timeout = limit;
+            }
+            else
+            {
+                attempt_timeouts.handshake_timeout = ConnectionTimeouts::saturate(attempt_timeouts.handshake_timeout, limit);
+            }
+
             cap_handshake_after_ping_timeout = false;
             LOG_TRACE(log, "Reconnecting after a ping timeout with the handshake capped by `sync_request_timeout`.");
         }
