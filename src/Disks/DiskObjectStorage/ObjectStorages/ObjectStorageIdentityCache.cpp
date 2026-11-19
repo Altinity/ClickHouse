@@ -2,6 +2,7 @@
 
 #include <Common/ProfileEvents.h>
 #include <Common/CurrentMetrics.h>
+#include <Interpreters/Context.h>
 
 namespace ProfileEvents
 {
@@ -17,6 +18,19 @@ namespace CurrentMetrics
 
 namespace DB
 {
+
+void invalidateObjectStorageIdentityCache(std::string_view endpoint, std::string_view bucket, std::string_view path)
+{
+    auto global_context = Context::getGlobalContextInstance();
+    if (!global_context)
+        return;
+
+    auto cache = global_context->getObjectStorageIdentityCache();
+    if (!cache)
+        return;
+
+    cache->invalidate(makeObjectStorageIdentityCacheKey(endpoint, bucket, path));
+}
 
 ObjectStorageIdentityCache::ObjectStorageIdentityCache(const String & cache_policy, size_t max_size_in_bytes, double size_ratio)
     : Base(

@@ -401,9 +401,12 @@ std::unique_ptr<ReadBufferFromFileBase> S3ObjectStorage::readObject( /// NOLINT
         }
     }
 
-    /// The buffer can outlive this storage. A GET that finds the object replaced or missing drops the
-    /// cached identity, so the next read requests the metadata again instead of reusing it.
-    const String identity_key = makeObjectStorageIdentityCacheKey(uri.endpoint, uri.bucket, object.remote_path);
+    /// The buffer can outlive this storage, so the callback keeps its own copy of the key parts.
+    /// A GET that finds the object replaced or missing drops the cached identity, and the next read
+    /// requests the metadata again instead of reusing it.
+    const String endpoint = uri.endpoint;
+    const String bucket = uri.bucket;
+    const String path = object.remote_path;
 
     return std::make_unique<ReadBufferFromS3>(
         clientForRetryProfile(ObjectStorageControlRequest{
@@ -427,11 +430,9 @@ std::unique_ptr<ReadBufferFromFileBase> S3ObjectStorage::readObject( /// NOLINT
         refresh_callback,
         std::move(blob_storage_log),
         object.etag,
-        [identity_key]()
+        [endpoint, bucket, path]()
         {
-            if (auto global_context = Context::getGlobalContextInstance())
-                if (auto cache = global_context->getObjectStorageIdentityCache())
-                    cache->invalidate(identity_key);
+            invalidateObjectStorageIdentityCache(endpoint, bucket, path);
         });
 }
 
@@ -513,7 +514,9 @@ std::unique_ptr<WriteBufferFromFileBase> S3ObjectStorage::writeObject( /// NOLIN
         .connect_timeout_cap_ms = write_settings.object_storage_connect_timeout_cap_ms});
 
     /// Captured by value. The buffer can outlive this storage, and the cache itself is process-global.
-    const String identity_key = makeObjectStorageIdentityCacheKey(uri.endpoint, uri.bucket, object.remote_path);
+    const String endpoint = uri.endpoint;
+    const String bucket = uri.bucket;
+    const String path = object.remote_path;
 
     return std::make_unique<WriteBufferFromS3>(
         used_client,
@@ -526,11 +529,9 @@ std::unique_ptr<WriteBufferFromFileBase> S3ObjectStorage::writeObject( /// NOLIN
         std::move(scheduler),
         disk_write_settings,
         objectCreationClient(write_settings),
-        [identity_key]()
+        [endpoint, bucket, path]()
         {
-            if (auto global_context = Context::getGlobalContextInstance())
-                if (auto cache = global_context->getObjectStorageIdentityCache())
-                    cache->invalidate(identity_key);
+            invalidateObjectStorageIdentityCache(endpoint, bucket, path);
         });
 }
 
@@ -1527,13 +1528,7 @@ bool S3ObjectStorage::hasSingleAttemptClientForTest(uint64_t request_timeout_ms,
 
 void S3ObjectStorage::invalidateCachedIdentity(const std::string & path) const
 {
-    auto global_context = Context::getGlobalContextInstance();
-    if (!global_context)
-        return;
-    auto cache = global_context->getObjectStorageIdentityCache();
-    if (!cache)
-        return;
-    cache->invalidate(makeObjectStorageIdentityCacheKey(uri.endpoint, uri.bucket, path));
+    invalidateObjectStorageIdentityCache(uri.endpoint, uri.bucket, path);
 }
 
 std::shared_ptr<const S3::Client> S3ObjectStorage::clientForRetryProfile(const ObjectStorageControlRequest & request) const

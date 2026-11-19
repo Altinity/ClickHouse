@@ -66,6 +66,10 @@ inline String makeObjectStorageIdentityCacheKey(std::string_view endpoint, std::
     return key;
 }
 
+/// Drop the identity cached for this endpoint, bucket, and path. No-op when the global context or the
+/// cache is not set. The next read of the path requests the metadata again.
+void invalidateObjectStorageIdentityCache(std::string_view endpoint, std::string_view bucket, std::string_view path);
+
 /// Cache of object-storage identity, keyed by endpoint, bucket and object path, so opening an object
 /// does not require a fresh HEAD on every read (a lake scan otherwise re-HEADs
 /// every candidate file on every query). Backed by CacheBase (LRU/SLRU) for size-bounded eviction

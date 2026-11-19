@@ -372,15 +372,7 @@ void ObjectStorageQueuePostProcessor::moveS3Objects(const StoredObjects & object
                         const String dest_key = object_to.remote_path;
                         auto invalidate_destination = [endpoint, bucket, dest_key]()
                         {
-                            auto global_context = Context::getGlobalContextInstance();
-                            if (!global_context)
-                                return;
-
-                            auto cache = global_context->getObjectStorageIdentityCache();
-                            if (!cache)
-                                return;
-
-                            cache->invalidate(makeObjectStorageIdentityCacheKey(endpoint, bucket, dest_key));
+                            invalidateObjectStorageIdentityCache(endpoint, bucket, dest_key);
                         };
 
                         LOG_INFO(log, "Copying {} ({} Bytes) to bucket {}", object_from.remote_path, object_size, dst_uri.bucket);

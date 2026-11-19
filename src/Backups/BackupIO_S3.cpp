@@ -358,26 +358,6 @@ private:
 
         return res;
     }
-
-    /// Drop the identity cached for `key`. Backup IO writes and deletes through `WriteBufferFromS3`,
-    /// `copyS3File`, and `deleteFileFromS3`, not through `S3ObjectStorage`, so nothing else drops the entry.
-    /// The next read HEADs instead of sending `If-Match` for the previous ETag.
-    void invalidateObjectStorageIdentityCache(const String & endpoint, const String & bucket, const String & key)
-    {
-        auto global_context = Context::getGlobalContextInstance();
-        if (!global_context)
-        {
-            return;
-        }
-
-        auto cache = global_context->getObjectStorageIdentityCache();
-        if (!cache)
-        {
-            return;
-        }
-
-        cache->invalidate(makeObjectStorageIdentityCacheKey(endpoint, bucket, key));
-    }
 }
 
 
