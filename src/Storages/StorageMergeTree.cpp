@@ -1121,8 +1121,18 @@ MergeMutateSelectedEntryPtr StorageMergeTree::selectPartsToMerge(
     if (isTTLMergeType(future_part->merge_type))
         getContext()->getMergeList().bookMergeWithTTL();
 
-    merging_tagger = std::make_unique<CurrentlyMergingPartsTagger>(future_part, MergeTreeDataMergerMutator::estimateNeededDiskSpace(future_part->parts, true), *this, metadata_snapshot, false);
-    return std::make_shared<MergeMutateSelectedEntry>(future_part, std::move(merging_tagger), std::make_shared<MutationCommands>());
+    try
+    {
+        merging_tagger = std::make_unique<CurrentlyMergingPartsTagger>(future_part, MergeTreeDataMergerMutator::estimateNeededDiskSpace(future_part->parts, true), *this, metadata_snapshot, false);
+        return std::make_shared<MergeMutateSelectedEntry>(future_part, std::move(merging_tagger), std::make_shared<MutationCommands>());
+    }
+    catch (...)
+    {
+        if (isTTLMergeType(future_part->merge_type))
+            getContext()->getMergeList().cancelMergeWithTTL();
+
+        throw;
+    }
 }
 
 bool StorageMergeTree::merge(
