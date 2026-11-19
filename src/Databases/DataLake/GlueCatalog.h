@@ -87,6 +87,14 @@ public:
 
     bool updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr new_snapshot, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
+    bool updateMetadataIfCurrent(
+        const String & namespace_name,
+        const String & table_name,
+        const String & new_metadata_path,
+        Poco::JSON::Object::Ptr new_snapshot,
+        const String & expected_metadata_location,
+        const DB::ForwardedAuthTokenPtr & auth_token) const override;
+
     bool updateSchema(
         const String & namespace_name,
         const String & table_name,
@@ -189,9 +197,15 @@ private:
     Poco::JSON::Object::Ptr getOrFetchMetadataObject(
         const AuthenticatedClient & client, const String & metadata_uri, const TableMetadata & table_metadata) const;
 
-    /// Fetches the current Glue VersionId for a table via GetTable.
-    /// Returns an empty string if the version cannot be determined.
-    String getTableVersionId(
+    struct TableVersion
+    {
+        String version_id;
+        /// The raw `metadata_location` table parameter; empty if the table has none.
+        String metadata_location;
+    };
+
+    /// Reads the table with one `GetTable` call. Throws if the call fails.
+    TableVersion getTableVersion(
         const String & namespace_name,
         const String & table_name,
         const DB::ForwardedAuthTokenPtr & auth_token) const;

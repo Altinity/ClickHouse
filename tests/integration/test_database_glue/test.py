@@ -2253,39 +2253,31 @@ def test_catalog_schema_with_empty_column_name_is_rejected(started_cluster):
     node.query(f"DROP DATABASE IF EXISTS {db_name} SYNC")
 
 
-def test_optimize_bin_pack_concurrent_insert(started_cluster):
+def test_optimize_bin_pack_concurrent_commit(started_cluster):
     """Regression test for https://github.com/Altinity/ClickHouse/issues/2733.
 
-    Bin-pack OPTIMIZE on a Glue-catalog table pauses right before the catalog
-    publish via a failpoint. While it is paused an INSERT lands a new commit.
-    When OPTIMIZE resumes, its Glue UpdateTable carries a VersionId that no
-    longer matches, so Glue rejects the publish and OPTIMIZE retries on the
-    fresh snapshot. All three rows must survive."""
+    Bin-pack OPTIMIZE on a Glue-catalog table pauses right before it publishes its metadata. While it is
+    paused, pyiceberg lands another commit. pyiceberg names its metadata files differently from ClickHouse,
+    so the commit does not collide with OPTIMIZE's metadata file in storage and only the catalog can notice
+    it. When OPTIMIZE resumes, Glue must refuse its update, because the table no longer points at the
+    metadata OPTIMIZE was based on, and OPTIMIZE must retry on the new snapshot. No row may be lost."""
     node = started_cluster.instances["node1"]
 
     test_ref = f"test_optimize_race_{uuid.uuid4()}"
     table_name = f"{test_ref}_table"
     root_namespace = f"{test_ref}_namespace"
     table_ref = f"{CATALOG_NAME}.`{root_namespace}.{table_name}`"
-    write_settings = {
-        "allow_insert_into_iceberg": 1,
-        "write_full_path_in_iceberg_metadata": 1,
-    }
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(root_namespace)
+    table = create_table(catalog, root_namespace, table_name, DEFAULT_SCHEMA, PartitionSpec(), DEFAULT_SORT_ORDER, table_name)
+
+    # Two separate appends produce two small data files, so bin-pack has work.
+    table.append(generate_arrow_data(2))
+    table.append(generate_arrow_data(3))
 
     create_clickhouse_glue_database(started_cluster, node, CATALOG_NAME)
-    node.query(
-        f"CREATE TABLE {table_ref} (x String)",
-        settings={
-            "allow_experimental_database_glue_catalog": 1,
-            "allow_database_glue_catalog": 1,
-            "write_full_path_in_iceberg_metadata": 1,
-        },
-    )
-
-    # Two separate inserts produce two small data files, so bin-pack has work.
-    node.query(f"INSERT INTO {table_ref} VALUES ('before-1');", settings=write_settings)
-    node.query(f"INSERT INTO {table_ref} VALUES ('before-2');", settings=write_settings)
-    assert node.query(f"SELECT count() FROM {table_ref}").strip() == "2"
+    assert node.query(f"SELECT count() FROM {table_ref}").strip() == "5"
 
     node.query("SYSTEM ENABLE FAILPOINT iceberg_compaction_pause_before_metadata_commit")
 
@@ -2299,8 +2291,7 @@ def test_optimize_bin_pack_concurrent_insert(started_cluster):
             )
         )
 
-        # 2. Start OPTIMIZE; it rewrites the two small files, then pauses
-        #    before writing the metadata file and updating Glue.
+        # 2. Start OPTIMIZE; it rewrites the two small files, then pauses before it publishes.
         optimize_future = executor.submit(
             lambda: node.query(
                 f"OPTIMIZE TABLE {table_ref}",
@@ -2313,29 +2304,21 @@ def test_optimize_bin_pack_concurrent_insert(started_cluster):
             )
         )
 
-        # Wait for the pause to actually trigger before doing the concurrent INSERT.
+        # Wait for the pause to actually trigger before the concurrent commit.
         wait_future.result(timeout=120)
 
-        # 3. Session B from the issue: a commit lands in the publish window.
-        node.query(
-            f"INSERT INTO {table_ref} VALUES ('inserted-during-optimize');",
-            settings=write_settings,
-        )
+        # 3. Another writer commits in the publish window.
+        catalog.load_table(f"{root_namespace}.{table_name}").append(generate_arrow_data(4))
 
-        # 4. Release the failpoint; OPTIMIZE attempts to publish via Glue
-        #    UpdateTable with a stale VersionId, gets rejected, and retries.
+        # 4. Release the failpoint; OPTIMIZE's publish must be rejected and retried on the new snapshot.
         node.query("SYSTEM DISABLE FAILPOINT iceberg_compaction_pause_before_metadata_commit")
         optimize_future.result(timeout=180)
     finally:
-        # Always disable the failpoint -- if anything above raised before the
-        # explicit DISABLE ran (e.g. the WAIT timed out), it would otherwise
-        # stay enabled and poison subsequent tests on the same instance.
-        try:
-            node.query("SYSTEM DISABLE FAILPOINT iceberg_compaction_pause_before_metadata_commit")
-        except Exception:
-            pass
+        # Always disable the failpoint, otherwise a failure above leaves it enabled for later tests
+        # on the same instance. The disable is idempotent, so no exception needs to be swallowed.
+        node.query("SYSTEM DISABLE FAILPOINT iceberg_compaction_pause_before_metadata_commit")
         executor.shutdown(wait=False)
 
-    # 5. The row inserted during the publish window must remain in the current snapshot.
-    result = node.query(f"SELECT x FROM {table_ref} ORDER BY x").strip()
-    assert result == "before-1\nbefore-2\ninserted-during-optimize", result
+    # 5. The rows committed during the publish window must remain in the current snapshot.
+    assert catalog.load_table(f"{root_namespace}.{table_name}").scan().to_arrow().num_rows == 9
+    assert node.query(f"SELECT count() FROM {table_ref}").strip() == "9"

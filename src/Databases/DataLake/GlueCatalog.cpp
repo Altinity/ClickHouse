@@ -1196,7 +1196,7 @@ bool GlueCatalog::createTable(
     return true;
 }
 
-String GlueCatalog::getTableVersionId(
+GlueCatalog::TableVersion GlueCatalog::getTableVersion(
     const String & namespace_name,
     const String & table_name,
     const DB::ForwardedAuthTokenPtr & auth_token) const
@@ -1214,12 +1214,19 @@ String GlueCatalog::getTableVersionId(
         outcome = client.client->GetTable(request);
     }
 
-    if (outcome.IsSuccess())
-        return outcome.GetResult().GetTable().GetVersionId();
+    /// Without the version the update would be an unconditional overwrite, so a failure must not be swallowed.
+    if (!outcome.IsSuccess())
+        throw DB::Exception(
+            DB::ErrorCodes::DATALAKE_DATABASE_ERROR,
+            "Exception calling GetTable for table {}.{}: {}",
+            namespace_name, table_name, outcome.GetError().GetMessage());
 
-    LOG_WARNING(getLogger("GlueCatalog"),
-        "Failed to fetch VersionId for {}.{}: {}", namespace_name, table_name, outcome.GetError().GetMessage());
-    return {};
+    const auto & table = outcome.GetResult().GetTable();
+    TableVersion result;
+    result.version_id = table.GetVersionId();
+    if (auto it = table.GetParameters().find("metadata_location"); it != table.GetParameters().end())
+        result.metadata_location = it->second;
+    return result;
 }
 
 bool GlueCatalog::updateTableInGlue(
@@ -1263,7 +1270,8 @@ bool GlueCatalog::updateTableInGlue(
     request.SetTableInput(table_input);
 
     /// Optimistic concurrency: when a VersionId is supplied, Glue rejects the
-    /// update if the table has been modified since that version was read.
+    /// update if the table has been modified since that version was read. It is only sound together
+    /// with a check of `metadata_location` made on the same read (see `updateMetadataIfCurrent`).
     if (!version_id.empty())
         request.SetVersionId(version_id);
 
@@ -1294,8 +1302,30 @@ bool GlueCatalog::updateTableInGlue(
 
 bool GlueCatalog::updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr /*new_snapshot*/, const DB::ForwardedAuthTokenPtr & auth_token) const
 {
-    const auto version_id = getTableVersionId(namespace_name, table_name, auth_token);
-    return updateTableInGlue(namespace_name, table_name, new_metadata_path, auth_token, {}, version_id);
+    /// The caller gave no base metadata, so there is nothing to compare with and the update is unconditional.
+    return updateTableInGlue(namespace_name, table_name, new_metadata_path, auth_token);
+}
+
+bool GlueCatalog::updateMetadataIfCurrent(
+    const String & namespace_name,
+    const String & table_name,
+    const String & new_metadata_path,
+    Poco::JSON::Object::Ptr /*new_snapshot*/,
+    const String & expected_metadata_location,
+    const DB::ForwardedAuthTokenPtr & auth_token) const
+{
+    /// Same order as Iceberg Java's `GlueTableOperations::doCommit`: read the table, check that it still
+    /// points at the writer's base, and send `UpdateTable` with the `VersionId` of that same read. The
+    /// `VersionId` alone would not do, because a read taken after a concurrent commit already includes it.
+    const auto current = getTableVersion(namespace_name, table_name, auth_token);
+    if (current.metadata_location != expected_metadata_location)
+    {
+        LOG_WARNING(getLogger("GlueCatalog"),
+            "Glue table {}.{} points at {} while the commit is based on {}",
+            namespace_name, table_name, current.metadata_location, expected_metadata_location);
+        return false;
+    }
+    return updateTableInGlue(namespace_name, table_name, new_metadata_path, auth_token, {}, current.version_id);
 }
 
 bool GlueCatalog::updateSchema(
@@ -1311,8 +1341,7 @@ bool GlueCatalog::updateSchema(
     std::vector<Aws::Glue::Model::Column> columns;
     if (new_schema)
         columns = icebergSchemaToGlueColumns(new_schema);
-    const auto version_id = getTableVersionId(namespace_name, table_name, auth_token);
-    return updateTableInGlue(namespace_name, table_name, new_metadata_path, auth_token, columns, version_id);
+    return updateTableInGlue(namespace_name, table_name, new_metadata_path, auth_token, columns);
 }
 
 void GlueCatalog::dropTable(
