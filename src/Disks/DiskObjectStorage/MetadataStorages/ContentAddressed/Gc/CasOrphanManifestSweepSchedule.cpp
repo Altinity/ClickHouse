@@ -29,9 +29,9 @@ void updateOrphanManifestSweepSchedule(
     GcState & next, OrphanManifestSweepDecision decision, bool wrapped, uint64_t progress_at_ms)
 {
     if ((decision != OrphanManifestSweepDecision::StartSweep && decision != OrphanManifestSweepDecision::ContinueSweep)
-        || progress_at_ms == 0 || (wrapped != next.manifest_sweep_cursor.empty()))
+        || (wrapped != next.manifest_sweep_cursor.empty()))
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS orphan manifest sweep: invalid progress transition");
-    if (wrapped)
+    if (wrapped && progress_at_ms != 0)
         next.orphan_manifest_sweep_completed_at_ms = progress_at_ms;
 }
 

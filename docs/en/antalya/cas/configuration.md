@@ -276,6 +276,10 @@ space, not that every later manifest-body deletion succeeded. Repeated `SYSTEM C
 respect the same schedule. Setting the interval to `0` allows another traversal on the next eligible
 round; setting the `LIST` budget to `0` pauses progress.
 
+A zero wall-clock sample near commit allows page progress while preserving the previous completion
+timestamp. If no completion time is known, the next traversal can start immediately. A later
+completed traversal with a positive clock sample establishes the interval again.
+
 When destructive work is suppressed, the traversal's cursor and timestamps remain unchanged.
 After a suppressed fold is committed, or a requested sweep's fold fails before the round's state
 `CAS` is sent, idle retries on the same adopted generation use the existing bounded fold cadence:

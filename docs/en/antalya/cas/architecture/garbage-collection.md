@@ -731,6 +731,12 @@ cursor. The reader ignores the former `orphan_manifest_sweep_active` and
 reader cannot read completion-only state, so rollback to it is unsupported. Renewal and takeover
 preserve the cursor and timestamp; rebuild resets both.
 
+A zero clock sample near commit preserves the previous completion timestamp, including an unknown
+value of `0`. The round still adopts the page's cursor through the same state `CAS`. If the page
+reaches EOF and the completion time remains unknown, another traversal is immediately eligible.
+A later EOF with a positive clock sample records a known completion time and restores interval
+pacing. A conflicting state `CAS` adopts neither the cursor nor the timestamp.
+
 If a completed traversal has a timestamp ahead of the current leader's clock, another traversal
 waits and `orphan_manifest_sweep_waiting_for_clock` is set. This observation can come from clock
 skew between leaders or a local clock change. It does not stop an active traversal; interval `0`

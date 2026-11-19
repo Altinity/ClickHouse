@@ -136,8 +136,33 @@ TEST(CASOrphanManifestSweepSchedule, RejectsUnperformedOrInvalidProgress)
     GcState state;
     EXPECT_THROW(updateOrphanManifestSweepSchedule(state, OrphanManifestSweepDecision::SkipUntilIntervalElapsed, true, 1000), DB::Exception);
     EXPECT_THROW(updateOrphanManifestSweepSchedule(state, OrphanManifestSweepDecision::Disabled, true, 1000), DB::Exception);
-    EXPECT_THROW(updateOrphanManifestSweepSchedule(state, OrphanManifestSweepDecision::StartSweep, true, 0), DB::Exception);
+    EXPECT_THROW(updateOrphanManifestSweepSchedule(state, OrphanManifestSweepDecision::SkipUntilIntervalElapsed, true, 0), DB::Exception);
+    EXPECT_THROW(updateOrphanManifestSweepSchedule(state, OrphanManifestSweepDecision::Disabled, true, 0), DB::Exception);
     EXPECT_THROW(updateOrphanManifestSweepSchedule(state, OrphanManifestSweepDecision::StartSweep, false, 1000), DB::Exception);
+    EXPECT_THROW(updateOrphanManifestSweepSchedule(state, OrphanManifestSweepDecision::StartSweep, false, 0), DB::Exception);
     state.manifest_sweep_cursor = "cursor";
     EXPECT_THROW(updateOrphanManifestSweepSchedule(state, OrphanManifestSweepDecision::StartSweep, true, 1000), DB::Exception);
+    EXPECT_THROW(updateOrphanManifestSweepSchedule(state, OrphanManifestSweepDecision::StartSweep, true, 0), DB::Exception);
+}
+
+TEST(CASOrphanManifestSweepSchedule, ZeroClockPreservesCompletion)
+{
+    for (const uint64_t previous_completion : {0, 500})
+    {
+        SCOPED_TRACE(previous_completion);
+        for (const bool wrapped : {false, true})
+        {
+            SCOPED_TRACE(wrapped);
+            for (const auto decision : {OrphanManifestSweepDecision::StartSweep, OrphanManifestSweepDecision::ContinueSweep})
+            {
+                SCOPED_TRACE(static_cast<int>(decision));
+                GcState state;
+                state.orphan_manifest_sweep_completed_at_ms = previous_completion;
+                state.manifest_sweep_cursor = wrapped ? "" : "cursor";
+                ASSERT_NO_THROW(updateOrphanManifestSweepSchedule(state, decision, wrapped, 0));
+                EXPECT_EQ(state.orphan_manifest_sweep_completed_at_ms, previous_completion);
+                EXPECT_EQ(state.manifest_sweep_cursor, wrapped ? "" : "cursor");
+            }
+        }
+    }
 }

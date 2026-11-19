@@ -256,6 +256,130 @@ TEST(CASOrphanManifestSweepScheduleGc, SuppressedRoundPreservesSchedule)
     expectSameSchedule(f.state(), before);
 }
 
+TEST(CASOrphanManifestSweepScheduleGc, ZeroClockCommitsPagesAndResumesInterval)
+{
+    ScheduleFixture f(1, 3600, 1000);
+    f.addKeys();
+    f.backend->before_manifest_list = [&] { f.now = 0; };
+    ASSERT_NO_THROW(f.run());
+    const auto first_page = f.state();
+    EXPECT_EQ(first_page.snap_generation, 1);
+    ASSERT_FALSE(first_page.manifest_sweep_cursor.empty());
+    EXPECT_EQ(first_page.orphan_manifest_sweep_completed_at_ms, 0);
+
+    ASSERT_NO_THROW(f.run());
+    const auto completed = f.state();
+    EXPECT_EQ(completed.snap_generation, 2);
+    EXPECT_TRUE(completed.manifest_sweep_cursor.empty());
+    EXPECT_EQ(completed.orphan_manifest_sweep_completed_at_ms, 0);
+
+    ASSERT_NO_THROW(f.run());
+    EXPECT_EQ(f.state().snap_generation, 3);
+    ASSERT_FALSE(f.state().manifest_sweep_cursor.empty());
+    f.now = 1000;
+    ASSERT_NO_THROW(f.run());
+    const auto timed = f.state();
+    EXPECT_EQ(timed.snap_generation, 4);
+    EXPECT_TRUE(timed.manifest_sweep_cursor.empty());
+    EXPECT_EQ(timed.orphan_manifest_sweep_completed_at_ms, 1000);
+
+    f.backend->resetCounts();
+    ++f.now;
+    EXPECT_TRUE(f.run().deferred);
+    EXPECT_EQ(f.state().snap_generation, timed.snap_generation);
+    expectSameSchedule(f.state(), timed);
+    EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 0);
+}
+
+TEST(CASOrphanManifestSweepScheduleGc, ZeroClockPreservesPreviousCompletion)
+{
+    ScheduleFixture f(1, 3600, 1000);
+    ASSERT_TRUE(f.run().acquired_lease);
+    const auto baseline = f.state();
+    ASSERT_EQ(baseline.orphan_manifest_sweep_completed_at_ms, 1000);
+    f.addKeys();
+    f.now = 3601000;
+    f.backend->before_manifest_list = [&] { f.now = 0; };
+    ASSERT_NO_THROW(f.run());
+    EXPECT_EQ(f.state().snap_generation, baseline.snap_generation + 1);
+    ASSERT_FALSE(f.state().manifest_sweep_cursor.empty());
+    EXPECT_EQ(f.state().orphan_manifest_sweep_completed_at_ms, 1000);
+
+    ASSERT_NO_THROW(f.run());
+    const auto completed = f.state();
+    EXPECT_EQ(completed.snap_generation, baseline.snap_generation + 2);
+    EXPECT_TRUE(completed.manifest_sweep_cursor.empty());
+    EXPECT_EQ(completed.orphan_manifest_sweep_completed_at_ms, 1000);
+    f.backend->resetCounts();
+    EXPECT_TRUE(f.run().deferred);
+    expectSameSchedule(f.state(), completed);
+    EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 0);
+
+    f.now = 3601000;
+    ASSERT_NO_THROW(f.run());
+    ASSERT_FALSE(f.state().manifest_sweep_cursor.empty());
+    EXPECT_EQ(f.state().orphan_manifest_sweep_completed_at_ms, 1000);
+    ++f.now;
+    ASSERT_NO_THROW(f.run());
+    const auto timed = f.state();
+    EXPECT_EQ(timed.snap_generation, baseline.snap_generation + 4);
+    EXPECT_TRUE(timed.manifest_sweep_cursor.empty());
+    EXPECT_EQ(timed.orphan_manifest_sweep_completed_at_ms, 3601001);
+    f.backend->resetCounts();
+    ++f.now;
+    EXPECT_TRUE(f.run().deferred);
+    expectSameSchedule(f.state(), timed);
+    EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 0);
+}
+
+TEST(CASOrphanManifestSweepScheduleGc, ZeroClockWithZeroIntervalPreservesCompletion)
+{
+    ScheduleFixture f(1000, 0, 1000);
+    ASSERT_TRUE(f.run().acquired_lease);
+    const auto baseline = f.state();
+    ASSERT_EQ(baseline.orphan_manifest_sweep_completed_at_ms, 1000);
+    f.backend->resetCounts();
+    f.backend->before_manifest_list = [&] { f.now = 0; };
+    ASSERT_NO_THROW(f.run());
+    EXPECT_EQ(f.state().snap_generation, baseline.snap_generation + 1);
+    EXPECT_EQ(f.state().orphan_manifest_sweep_completed_at_ms, 1000);
+    ASSERT_NO_THROW(f.run());
+    EXPECT_EQ(f.state().snap_generation, baseline.snap_generation + 2);
+    EXPECT_EQ(f.state().orphan_manifest_sweep_completed_at_ms, 1000);
+    EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 2);
+
+    f.now = 1001;
+    ASSERT_NO_THROW(f.run());
+    EXPECT_EQ(f.state().orphan_manifest_sweep_completed_at_ms, 1001);
+}
+
+TEST(CASOrphanManifestSweepScheduleGc, ZeroClockLostCasDoesNotAdvanceCursor)
+{
+    ScheduleFixture f(1, 3600, 1000);
+    f.addKeys();
+    f.backend->before_manifest_list = [&] { f.now = 0; };
+    bool fired = false;
+    f.backend->before_round_commit = [&]
+    {
+        auto state = f.state();
+        ++state.lease.seq;
+        f.setState(state);
+        fired = true;
+    };
+    EXPECT_THROW(f.run(), DB::Exception);
+    ASSERT_TRUE(fired);
+    const auto refused = f.state();
+    EXPECT_EQ(refused.snap_generation, 0);
+    EXPECT_EQ(refused.round, 0);
+    EXPECT_TRUE(refused.manifest_sweep_cursor.empty());
+    EXPECT_EQ(refused.orphan_manifest_sweep_completed_at_ms, 0);
+
+    EXPECT_FALSE(f.run().deferred);
+    EXPECT_EQ(f.state().snap_generation, 1);
+    EXPECT_FALSE(f.state().manifest_sweep_cursor.empty());
+    EXPECT_EQ(f.state().orphan_manifest_sweep_completed_at_ms, 0);
+}
+
 TEST(CASOrphanManifestSweepScheduleGc, FailedFoldDoesNotComplete)
 {
     ScheduleFixture f;
