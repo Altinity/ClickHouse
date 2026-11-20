@@ -361,7 +361,7 @@ Dashboards and scripts that read these names need a look.
 | `CASGCRetiredRedeleted` | Renamed to `CASGCRetiredBodyDeleted`: exact-token deletes of blob bodies of `pending` rows, answered |
 | `CASGCRetiredRedeleteFailed` | Renamed to `CASGCRetiredBodyDeleteFailed`: failed `HEAD` or `DELETE` of such a delete; the round fails |
 | `system.cas_gc_log` `entries_graduated`, `entries_redeleted`, `entries_redelete_failed` | Renamed to `entries_intent_confirmed`, `entries_bodies_deleted`, `entries_body_delete_failed`. The old names stay as `ALIAS` columns of the table, so queries keep working; `SELECT *` does not return them |
-| `SYSTEM CAS GC RUN` output, the same three columns | Renamed as above. The output has no aliases |
+| `SYSTEM CAS GC RUN` output, the same three columns | Renamed as above. The old names stay as extra columns after `pending_retired`, with the same values |
 | `phase_metrics` keys `graduated`, `redeleted`, `redelete_pending`, `graduation_due` | Renamed to `intent_confirmed` (on `fold_reduce` and `pending_deletes`), `bodies_deleted` (on `pending_deletes`), `body_deletes_decided` (on `fold_reduce`), `row_decision_due` (on `defer_decision`) |
 | `CASGCCondemnMarkerUnconfirmedCarry`, `CASGCMetaWriteAnomaly`, `CASGCMetaOps`, `CASMetaPut`, `CASMetaCompareSwap`, `CASMetaDelete`, `CASMetaCreateClean`, `CASMetaAbsentRepublish`, `CASMetaResurrectClean` | Removed: nothing writes or reads a marker |
 | `CASGCRetiredSparedByReref` | Counts a `pending` or `standing` row dropped because a reference returned |

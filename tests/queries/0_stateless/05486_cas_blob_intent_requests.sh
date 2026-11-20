@@ -45,12 +45,15 @@ Q_DUPLICATE="${CLICKHOUSE_DATABASE}_05486_duplicate"
 Q_CONDEMNED="${CLICKHOUSE_DATABASE}_05486_condemned"
 Q_DELETED="${CLICKHOUSE_DATABASE}_05486_deleted"
 
-# One round of `SYSTEM CAS GC RUN`: prints "<acquired_lease> <entries_condemned> <entries_intent_confirmed> <entries_bodies_deleted>".
+# One round of `SYSTEM CAS GC RUN`: prints "<acquired_lease> <entries_condemned> <entries_intent_confirmed> <entries_bodies_deleted>
+# <entries_graduated> <entries_redeleted> <entries_body_delete_failed> <entries_redelete_failed>"; the last three
+# are the compatibility names of the second, third and fourth values.
 gc_round()
 {
     ${CLIENT} -q "SYSTEM CAS GC RUN '${DISK_NAME}'" --format TSVWithNames \
         | awk -F'\t' 'NR == 1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
-                      { print $col["acquired_lease"], $col["entries_condemned"], $col["entries_intent_confirmed"], $col["entries_bodies_deleted"] }'
+                      { print $col["acquired_lease"], $col["entries_condemned"], $col["entries_intent_confirmed"], $col["entries_bodies_deleted"],
+                                    $col["entries_graduated"], $col["entries_redeleted"], $col["entries_body_delete_failed"], $col["entries_redelete_failed"] }'
 }
 
 # 1. New content.
@@ -73,9 +76,10 @@ ${CLIENT} -q "DROP TABLE t1 SYNC"
 CONDEMN_ROUND=""
 for _ in $(seq 1 40)
 do
-    read -r ACQUIRED CONDEMNED GRADUATED REDELETED <<< "$(gc_round)"
+    read -r ACQUIRED CONDEMNED GRADUATED REDELETED OLD_GRADUATED OLD_REDELETED _ _ <<< "$(gc_round)"
     if [ "${CONDEMNED:-0}" -gt 0 ]
     then
+        COMPAT_CONFIRMED="${GRADUATED} ${OLD_GRADUATED}"
         CONDEMN_ROUND="${ACQUIRED} ${CONDEMNED} ${GRADUATED} ${REDELETED}"
         break
     fi
@@ -87,9 +91,14 @@ ${CLIENT} --query_id "${Q_CONDEMNED}" -q "INSERT INTO t2 ${INSERT_SELECT}"
 #    then the round that deletes.
 ${CLIENT} -q "DROP TABLE t2 SYNC"
 DELETED_TOTAL=0
+COMPAT_DELETED=""
 for _ in $(seq 1 40)
 do
-    read -r _ _ _ REDELETED <<< "$(gc_round)"
+    read -r _ _ _ REDELETED _ OLD_REDELETED FAILED OLD_FAILED <<< "$(gc_round)"
+    if [ "${REDELETED:-0}" -gt 0 ] && [ -z "${COMPAT_DELETED}" ]
+    then
+        COMPAT_DELETED="${REDELETED} ${OLD_REDELETED} ${FAILED} ${OLD_FAILED}"
+    fi
     DELETED_TOTAL=$((DELETED_TOTAL + ${REDELETED:-0}))
     if [ "${DELETED_TOTAL}" -ge "${N}" ]
     then
@@ -97,6 +106,8 @@ do
     fi
 done
 echo "bodies deleted by the rounds: $([ "${DELETED_TOTAL}" -ge "${N}" ] && echo ok || echo "${DELETED_TOTAL} of ${N}")"
+# The compatibility names equal the new ones in rounds that confirmed and deleted something (non-zero, not 0 = 0).
+echo "compatibility names: $([ "${COMPAT_CONFIRMED}" = "${N} ${N}" ] && [ "${COMPAT_DELETED}" = "${N} ${N} 0 0" ] && echo ok || echo "confirmed '${COMPAT_CONFIRMED}' deleted '${COMPAT_DELETED}'")"
 ${CLIENT} --query_id "${Q_DELETED}" -q "INSERT INTO t3 ${INSERT_SELECT}"
 
 ${CLIENT} -q "SYSTEM FLUSH LOGS query_log"

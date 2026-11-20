@@ -2561,6 +2561,11 @@ ColumnsDescription contentAddressedGcRoundColumns()
         {"pending_candidates", std::make_shared<DataTypeUInt64>()},
         {"pending_condemned", std::make_shared<DataTypeUInt64>()},
         {"pending_retired", std::make_shared<DataTypeUInt64>()},
+        /// Compatibility names for tools that read the row: same values as `entries_intent_confirmed`,
+        /// `entries_bodies_deleted` and `entries_body_delete_failed`.
+        {"entries_graduated", std::make_shared<DataTypeUInt64>()},
+        {"entries_redeleted", std::make_shared<DataTypeUInt64>()},
+        {"entries_redelete_failed", std::make_shared<DataTypeUInt64>()},
     }};
 }
 
@@ -2586,6 +2591,9 @@ void appendContentAddressedGcRoundRow(MutableColumns & res_columns, const String
     res_columns[i++]->insert(rep.pending_candidates);
     res_columns[i++]->insert(rep.pending_condemned);
     res_columns[i++]->insert(rep.pending_retired);
+    res_columns[i++]->insert(rep.intent_confirmed);
+    res_columns[i++]->insert(rep.bodies_deleted);
+    res_columns[i++]->insert(rep.body_delete_failed);
 }
 
 ColumnsDescription contentAddressedGcRebuildColumns()

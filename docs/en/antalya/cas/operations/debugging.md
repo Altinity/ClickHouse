@@ -276,7 +276,8 @@ never held, and a manual run takes it at once; a lease that was ever held is nev
 One row per disk it ran on: `disk`, `acquired_lease`, `deferred`, `round`, `candidates_marked`,
 `objects_deleted`, `objects_absent`, `objects_replaced`, `objects_spared`, `manifests_deleted`,
 `entries_condemned`, `entries_intent_confirmed`, `entries_bodies_deleted`, `entries_body_delete_failed`, `fence_outs`,
-`anomalies`, `pending_candidates`, `pending_condemned`, `pending_retired`. Omitting
+`anomalies`, `pending_candidates`, `pending_condemned`, `pending_retired`, then the compatibility names `entries_graduated`, `entries_redeleted`,
+`entries_redelete_failed` (same values as the three `entries_*` columns renamed from them). Omitting
 the disk name runs one round on every content-addressed disk on the node. A manual run executes
 regardless of `SYSTEM CAS GC STOP` — `STOP` pauses only the background scheduler.
 
