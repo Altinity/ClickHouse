@@ -90,6 +90,7 @@ constexpr std::string_view CAS_KEY_PREFIX = "cas_";
     DECLARE(UInt64, request_window_ms, 120000, "How long a failing request, including the blob publication loop, keeps retrying before it gives up with a retryable error, in milliseconds, measured from the call's start. Must exceed twice the attempt envelope for a writable disk and the envelope for a read-only one, or the disk refuses to open. The ref-table recovery budget is twice this value", 0) \
     DECLARE(UInt64, lease_safety_margin_ms, 2000, "Startup-only margin validated against the mount lease TTL: attempt envelope + this must be strictly less than the TTL, and renew period + 2 × envelope + this too", 0) \
     DECLARE(String, staging_backend, "local", "Blob staging backend (local | s3); s3 is opt-in", 0) \
+    DECLARE(UInt64, auto_forget_fenced_empty_after_sec, 0, "Automatically prune fenced CAS mount slots that own zero catalog namespaces and zero manifest/staging/data objects after this many seconds past lease expiry (0 disables)", 0) \
 
 DECLARE_SETTINGS_TRAITS(ContentAddressedSettingsTraits, LIST_OF_CONTENT_ADDRESSED_SETTINGS, CONTENT_ADDRESSED_SETTINGS_SUPPORTED_TYPES)
 

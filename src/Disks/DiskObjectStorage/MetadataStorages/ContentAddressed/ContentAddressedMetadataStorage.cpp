@@ -67,6 +67,7 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsBool gc_enabled;
     extern const ContentAddressedSettingsUInt64 gc_interval_sec;
     extern const ContentAddressedSettingsUInt64 gc_snapshot_generations_to_keep;
+    extern const ContentAddressedSettingsUInt64 auto_forget_fenced_empty_after_sec;
     extern const ContentAddressedSettingsUInt64 gc_shards;
     extern const ContentAddressedSettingsUInt64 manifest_sweep_list_budget_keys;
     extern const ContentAddressedSettingsUInt64 manifest_sweep_delete_budget_keys;
@@ -293,6 +294,7 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , gc_enabled(settings_[ContentAddressedSetting::gc_enabled].value)
     , gc_interval(std::chrono::seconds(settings_[ContentAddressedSetting::gc_interval_sec].value))
     , gc_snapshot_generations_to_keep(settings_[ContentAddressedSetting::gc_snapshot_generations_to_keep].value)
+    , cas_auto_forget_fenced_empty_after_sec(settings_[ContentAddressedSetting::auto_forget_fenced_empty_after_sec].value)
     , gc_shards(settings_[ContentAddressedSetting::gc_shards].value)
     , manifest_sweep_list_budget_keys(settings_[ContentAddressedSetting::manifest_sweep_list_budget_keys].value)
     , manifest_sweep_delete_budget_keys(settings_[ContentAddressedSetting::manifest_sweep_delete_budget_keys].value)
@@ -794,6 +796,7 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     pool_config.blob_hash_allow_new = blob_hash_allow_new;
     pool_config.manifest_decode_cache_bytes = manifest_decode_cache_bytes;
     pool_config.gc_snapshot_generations_to_keep = gc_snapshot_generations_to_keep;
+    pool_config.auto_forget_fenced_empty_after_sec = cas_auto_forget_fenced_empty_after_sec;
     pool_config.gc_shards = gc_shards;
     pool_config.manifest_sweep_list_budget_keys = manifest_sweep_list_budget_keys;
     pool_config.manifest_sweep_delete_budget_keys = manifest_sweep_delete_budget_keys;
