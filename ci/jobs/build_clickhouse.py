@@ -88,19 +88,9 @@ def run_shell(name, command, **kwargs):
     print(f"\n<<<< {name}\n")
 
 
-def _cmake_cache_value(cache_path, name):
-    prefix = f"{name}:"
-    with open(cache_path, encoding="utf-8", errors="replace") as cache:
-        for line in cache:
-            if line.startswith(prefix):
-                return line.split("=", 1)[1]
-    return None
-
-
 def check_ppc64le_patches(build_root):
     asm_path = os.path.join(build_root, "contrib/libunwind-cmake/UnwindRegistersSave.S")
     ninja_path = os.path.join(build_root, "build.ninja")
-    cache_path = os.path.join(build_root, "CMakeCache.txt")
 
     try:
         with open(asm_path, encoding="utf-8") as asm_file:
@@ -118,39 +108,37 @@ def check_ppc64le_patches(build_root):
         print(f"ppc64le libunwind patch was not applied to {asm_path}")
         return False
 
-    try:
-        cxx_flags = _cmake_cache_value(cache_path, "CMAKE_CXX_FLAGS")
-    except OSError as error:
-        print(f"Could not read {cache_path}: {error}")
-        return False
-    if cxx_flags is None:
-        print(f"CMAKE_CXX_FLAGS missing from {cache_path}")
-        return False
-    if "-maltivec" not in cxx_flags or (
-        "-mcpu=power8" not in cxx_flags and "-mcpu=power9" not in cxx_flags
-    ):
-        print(f"CMAKE_CXX_FLAGS missing ppc64le AltiVec flags: {cxx_flags}")
-        return False
-    for flag in ("-D__SSE2__", "-DNO_WARN_X86_INTRINSICS"):
-        if flag in cxx_flags:
-            print(f"{flag} is still in CMAKE_CXX_FLAGS")
-            return False
-
+    # CMAKE_CXX_FLAGS in CMakeCache.txt stays empty. The real flags are on the ninja FLAGS lines.
     frame_flag = "-Wframe-larger-than=131072"
     patched_asm = "contrib/libunwind-cmake/UnwindRegistersSave.S"
     found_frame = False
     found_asm = False
+    found_altivec = False
+    found_sse2 = False
     try:
         with open(ninja_path, encoding="utf-8", errors="replace") as ninja:
             for line in ninja:
+                if "FLAGS" not in line and patched_asm not in line:
+                    continue
                 if not found_frame and frame_flag in line:
                     found_frame = True
                 if not found_asm and patched_asm in line:
                     found_asm = True
-                if found_frame and found_asm:
-                    break
+                if "FLAGS" in line:
+                    if "-maltivec" in line and (
+                        "-mcpu=power8" in line or "-mcpu=power9" in line
+                    ):
+                        found_altivec = True
+                    if "-D__SSE2__" in line or "-DNO_WARN_X86_INTRINSICS" in line:
+                        found_sse2 = True
     except OSError as error:
         print(f"Could not read {ninja_path}: {error}")
+        return False
+    if not found_altivec:
+        print(f"{ninja_path} FLAGS lines are missing ppc64le AltiVec flags")
+        return False
+    if found_sse2:
+        print(f"{ninja_path} FLAGS lines still define __SSE2__ or NO_WARN_X86_INTRINSICS")
         return False
     if not found_frame:
         print(f"{frame_flag} is not in {ninja_path}")
