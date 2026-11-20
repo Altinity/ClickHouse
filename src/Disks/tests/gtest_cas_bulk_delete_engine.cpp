@@ -4,7 +4,11 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/tests/cas_test_helpers.h>
+#include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
+#include <Poco/AutoPtr.h>
+#include <Poco/ConsoleChannel.h>
+#include <Poco/Logger.h>
 #include <base/defines.h>
 
 /// The engine sends one chunk of at most 1000 write-once keys as one request under the ordinary
@@ -200,11 +204,7 @@ TEST(CASConditionalBatchDeleteEngine, EmptyInputMakesNoRequestAndAFullChunkMakes
     EXPECT_EQ(backend->attempts.front().size(), chunk.size());
 }
 
-#if defined(DEBUG_OR_SANITIZER_BUILD)
 TEST(CASConditionalBatchDeleteEngineDeathTest, RejectsDuplicateKeysAndForeignTokensBeforeSending)
-#else
-TEST(CASConditionalBatchDeleteEngine, RejectsDuplicateKeysAndForeignTokensBeforeSending)
-#endif
 {
     auto backend = std::make_shared<RecordingConditionalBackend>();
     backend->pinConditionalBatchDeleteSupport(true);
@@ -215,16 +215,33 @@ TEST(CASConditionalBatchDeleteEngine, RejectsDuplicateKeysAndForeignTokensBefore
     const auto token = std::get<Committed>(op.create("a", "body", Retry::once())).etag;
     const auto foreign = std::get<Committed>(other_op.create("b", "body", Retry::once())).etag;
     const ConditionalRemove first{"a", token};
-    for (const auto & invalid : {first, ConditionalRemove{"b", token}, ConditionalRemove{"b", foreign}})
+    const auto expect_rejected = [&](const ConditionalRemove & invalid, const String & expected_message)
     {
-        SCOPED_TRACE(invalid.expected_token.render() + " for " + invalid.key);
+        SCOPED_TRACE(expected_message);
         const std::vector<ConditionalRemove> chunk{first, invalid};
-#if defined(DEBUG_OR_SANITIZER_BUILD)
-        EXPECT_DEATH({ op.removeManyByConditional(chunk, Retry::once()); }, "duplicate key|cannot be the precondition");
-#else
-        DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { op.removeManyByConditional(chunk, Retry::once()); });
+        EXPECT_DEATH(
+            {
+                Poco::AutoPtr<Poco::ConsoleChannel> channel(new Poco::ConsoleChannel(std::cerr));
+                auto & logger = Poco::Logger::root();
+                logger.setChannel(channel);
+                logger.setLevel(Poco::Message::PRIO_FATAL);
+                DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+                op.removeManyByConditional(chunk, Retry::once());
+            },
+            expected_message);
+#if !defined(DEBUG_OR_SANITIZER_BUILD)
+        DB::Cas::tests::expectThrowsCodeWithMessage(
+            DB::ErrorCodes::LOGICAL_ERROR, expected_message, [&] { op.removeManyByConditional(chunk, Retry::once()); });
 #endif
-    }
+    };
+
+    expect_rejected(first, "duplicate key 'a' in one chunk");
+    expect_rejected({"b", token}, fmt::format(
+        "incarnation of 'a' observed on backend {} cannot be the precondition for 'b' on backend {}",
+        token.backendId(), backend->backendId()));
+    expect_rejected({"b", foreign}, fmt::format(
+        "incarnation of 'b' observed on backend {} cannot be the precondition for 'b' on backend {}",
+        foreign.backendId(), backend->backendId()));
     EXPECT_TRUE(backend->attempts.empty());
     EXPECT_TRUE(op.head("a", Retry::once()));
 }
