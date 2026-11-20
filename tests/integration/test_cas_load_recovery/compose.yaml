@@ -1,0 +1,51 @@
+name: cas-load-recovery
+x-clickhouse: &clickhouse
+  image: ${CLICKHOUSE_IMAGE:-altinity/clickhouse-server:26.6.4.20001.altinityantalya@sha256:4403168d63f049700a979876a8075a8ae4d7ae6be7ea7e09f4fbc6a526e420fa}
+  mem_limit: 1536m
+  environment:
+    CLICKHOUSE_SKIP_USER_SETUP: '1'
+  stop_grace_period: 30s
+  depends_on: [keeper, writer-proxy, reader-proxy]
+x-proxy: &proxy
+  image: python:3.12-slim
+  command: [python3, /proxy.py]
+  environment:
+    RUSTFS_UPSTREAM: store:11121
+  volumes: [./.lab/s3_fault_proxy.py:/proxy.py:ro]
+  depends_on: [store]
+  mem_limit: 256m
+services:
+  store:
+    image: rustfs/rustfs:1.0.0-rc.3
+    command: server --address 0.0.0.0:11121
+    environment:
+      RUSTFS_ACCESS_KEY: clickhouse
+      RUSTFS_SECRET_KEY: clickhouse
+      RUSTFS_SCANNER_ENABLED: 'false'
+      RUSTFS_HEAL_ENABLED: 'false'
+    volumes: [store:/data]
+    mem_limit: 768m
+  writer-proxy:
+    <<: *proxy
+  reader-proxy:
+    <<: *proxy
+  keeper:
+    image: altinity/clickhouse-server:26.6.4.20001.altinityantalya@sha256:4403168d63f049700a979876a8075a8ae4d7ae6be7ea7e09f4fbc6a526e420fa
+    entrypoint: [/usr/bin/clickhouse, keeper]
+    command: [--config-file=/etc/keeper.xml]
+    volumes: [./.lab/keeper.xml:/etc/keeper.xml:ro, 'keeper:/var/lib/clickhouse-keeper']
+    mem_limit: 512m
+  writer:
+    <<: *clickhouse
+    volumes: [./.lab/writer.xml:/etc/clickhouse-server/config.d/lab.xml:ro, 'writer:/var/lib/clickhouse']
+  reader:
+    <<: *clickhouse
+    volumes: [./.lab/reader.xml:/etc/clickhouse-server/config.d/lab.xml:ro, 'reader:/var/lib/clickhouse']
+networks:
+  default:
+    internal: true
+volumes:
+  store:
+  keeper:
+  writer:
+  reader:
