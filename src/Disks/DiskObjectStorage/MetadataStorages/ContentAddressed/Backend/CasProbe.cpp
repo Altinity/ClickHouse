@@ -1,5 +1,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.h>
 #include <Common/Exception.h>
+#include <base/scope_guard.h>
+
+#include <initializer_list>
 
 namespace DB
 {
@@ -42,30 +45,77 @@ Removal removeOrReportDeleteMarker(CasOperation & op, const String & key, const 
     }
 }
 
+/// Best-effort cleanup uses a fresh token and skips keys that are already absent.
+void cleanupProbeKeys(CasOperation & op, std::initializer_list<const String *> keys) noexcept
+{
+    try
+    {
+        for (const String * cleanup_key : keys)
+        {
+            const auto current = op.head(*cleanup_key, Retry::standard());
+            if (current)
+                op.remove(*cleanup_key, current->etag, Retry::standard());
+        }
+    }
+    catch (...) {} /// NOLINT(bugprone-empty-catch)
 }
 
-void runCapabilityProbe(CasOperation & op, const String & probe_prefix)
+}
+
+bool probeConditionalBatchDelete(CasOperation & op, const String & probe_prefix, const ConditionalRemove & absent_key)
+{
+    /// The optional batch probe sends S3-compatible XML `DeleteObjects`. GCS rejects per-object `ETag` conditions.
+    /// https://docs.cloud.google.com/storage/docs/object-deletion-overview
+    /// GCS JSON API batch can group separate `DELETE` requests, each with its own `ifGenerationMatch`.
+    /// https://docs.cloud.google.com/storage/docs/batch
+    /// https://docs.cloud.google.com/storage/docs/json_api/v1/objects/delete#parameters
+    if (absent_key.expected_token.dialect() == Dialect::Generation)
+        return false;
+
+    const String first_matching_key = probe_prefix + "/batch-first";
+    const String replaced_key = probe_prefix + "/batch-second";
+    const String second_matching_key = probe_prefix + "/batch-third";
+    SCOPE_EXIT({ cleanupProbeKeys(op, {&first_matching_key, &replaced_key, &second_matching_key}); });
+
+    const Etag first_matching_token = std::get<Committed>(op.create(first_matching_key, "probe-batch-first", Retry::standard())).etag;
+    const Etag stale_token = std::get<Committed>(op.create(replaced_key, "probe-batch-second-v1", Retry::standard())).etag;
+    const String replacement_bytes = "probe-batch-second-v2";
+    (void)std::get<Committed>(op.replace(replaced_key, replacement_bytes, stale_token, Retry::standard()));
+    const Etag second_matching_token = std::get<Committed>(op.create(second_matching_key, "probe-batch-third", Retry::standard())).etag;
+    try
+    {
+        const auto removals = op.removeManyByConditional(
+            {{first_matching_key, first_matching_token}, {replaced_key, stale_token},
+             {second_matching_key, second_matching_token}, absent_key},
+            Retry::standard(), kBulkDeleteMaxKeys);
+        if (removals.size() != 4 || removals[0] != Removal::Removed || removals[1] != Removal::Mismatch
+            || removals[2] != Removal::Removed || removals[3] != Removal::Gone)
+            return false;
+
+        /// Check before cleanup, which would otherwise hide a successful response without deletion.
+        const auto first = op.head(first_matching_key, Retry::standard());
+        const auto replacement = op.read(replaced_key, Retry::standard());
+        const auto second = op.head(second_matching_key, Retry::standard());
+        return !first && !second && replacement && replacement->bytes == replacement_bytes;
+    }
+    catch (const DB::Exception & e)
+    {
+        if (e.code() != DB::ErrorCodes::NOT_IMPLEMENTED)
+            throw;
+        return false;
+    }
+}
+
+CapabilityProbeResult runCapabilityProbe(CasOperation & op, const String & probe_prefix)
 {
     // Sub-directory style ("probe_prefix/token") ensures that list(probe_prefix, …) works for both the
     // in-memory backend (prefix match) and the LocalObjectStorage backend (directory listing).
     const String key = probe_prefix + "/token";
 
     // Best-effort cleanup — runs at function exit regardless of outcome.
-    auto cleanup = [&]() noexcept
-    {
-        // Skip the remove when HEAD says the key is already gone (the happy path: the battery's own
-        // delete already ran). `Etag` can only be minted from an actual HEAD/read observation, so
-        // an unconditional "delete with whatever precondition" this backend never saw is not
-        // constructible here — the gate below is the only way to reach `remove` at all.
-        try
-        {
-            const auto h = op.head(key, Retry::standard());
-            if (h)
-                op.remove(key, h->etag, Retry::standard());
-        }
-        catch (...) {} /// NOLINT(bugprone-empty-catch)
-    };
+    auto cleanup = [&]() noexcept { cleanupProbeKeys(op, {&key}); };
 
+    CapabilityProbeResult result;
     try
     {
         // ---- Step 1: create fresh -> Committed; read-after-write returns the bytes. ----
@@ -195,6 +245,9 @@ void runCapabilityProbe(CasOperation & op, const String & probe_prefix)
                     "CasProbe: list-after-delete failed — the deleted probe key '{}' is still visible in the listing under prefix '{}'",
                     key, probe_prefix);
         }
+
+        /// The single-object delete verified that `key` was gone, so reuse its token for the absent entry.
+        result.conditional_batch_delete_supported = probeConditionalBatchDelete(op, probe_prefix, {key, t2});
     }
     catch (...)
     {
@@ -206,6 +259,7 @@ void runCapabilityProbe(CasOperation & op, const String & probe_prefix)
     // Normal-exit cleanup (the key was already deleted in step 7). Call cleanup anyway to handle any
     // partial state edge cases — it is a no-op if the key is gone.
     cleanup();
+    return result;
 }
 
 }

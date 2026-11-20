@@ -19,9 +19,11 @@
 
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <array>
 #include <ctime>
 #include <limits>
+#include <set>
 #include <utility>
 
 namespace ProfileEvents
@@ -646,6 +648,70 @@ void CasOperation::removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, c
         owner.backend->removeManyWriteOnce(keys, access);
         return true;
     });
+}
+
+namespace
+{
+Removal toConditionalRemoval(const Backend::RawRemoval raw)
+{
+    switch (raw)
+    {
+        case Backend::RawRemoval::Removed: return Removal::Removed;
+        case Backend::RawRemoval::Gone: return Removal::Gone;
+        case Backend::RawRemoval::Mismatch: return Removal::Mismatch;
+        case Backend::RawRemoval::DeleteMarker:
+            throw Exception(ErrorCodes::CAS_DELETE_MARKER,
+                "CAS conditional batch removal archived a noncurrent version instead of reclaiming an object: "
+                "the bucket has object versioning enabled");
+    }
+    UNREACHABLE();
+}
+}
+
+std::vector<Removal> CasOperation::removeManyByConditional(
+    const std::vector<ConditionalRemove> & removals, const Retry & policy)
+{
+    const size_t limit = std::min(kBulkDeleteMaxKeys, owner.backend->conditionalBatchDeleteKeyLimit());
+    return removeManyByConditional(removals, policy, limit);
+}
+
+std::vector<Removal> CasOperation::removeManyByConditional(
+    const std::vector<ConditionalRemove> & removals, const Retry & policy, const size_t limit)
+{
+    if (removals.size() > limit)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CAS removeManyByConditional: {} keys in one chunk, the limit is {}; the consumer chunks its input",
+            removals.size(), limit);
+    if (removals.empty())
+        return {};
+
+    std::set<String> keys;
+    std::vector<Backend::RawConditionalRemove> raw_removals;
+    raw_removals.reserve(removals.size());
+    for (const ConditionalRemove & removal : removals)
+    {
+        if (!keys.emplace(removal.key).second)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "CAS removeManyByConditional: duplicate key '{}' in one chunk", removal.key);
+        raw_removals.push_back({removal.key, owner.valueFor(removal.key, removal.expected_token)});
+    }
+
+    const Retry::Bound bound = owner.bindPolicy(policy);
+    const String subject = fmt::format("{} (+{} keys)", removals.front().key, removals.size() - 1);
+    const std::vector<Backend::RawRemoval> raw_results = readLoop(
+        "removeManyByConditional", subject, policy, bound, [&](auto & access)
+        {
+            return owner.backend->removeManyByConditional(raw_removals, access);
+        });
+    if (raw_results.size() != removals.size())
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CAS removeManyByConditional: backend returned {} results for {} keys", raw_results.size(), removals.size());
+
+    std::vector<Removal> results;
+    results.reserve(raw_results.size());
+    for (const Backend::RawRemoval raw : raw_results)
+        results.push_back(toConditionalRemoval(raw));
+    return results;
 }
 
 Removal CasOperation::remove(const String & key, const Etag & seen, const Retry & policy)

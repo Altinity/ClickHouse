@@ -52,7 +52,7 @@ follower or a deferred round execution returns before that commit.
 | 8 | `fold_ref_intake` | fold | `GET` every new ref-log record and every referenced manifest, extracting blob source edges |
 | 9 | `fold_reduce` | fold | Merge prior edges, new deltas and the parent's condemned rows: spare, condemn, graduate or redelete each candidate; compute `suppress_destructive` |
 | 10 | `fold_seal_write` | fold | Write the new fold seal once, write-once deterministic, adopting a byte-identical replay instead of rewriting it |
-| 11 | `pending_deletes` | fold | The single blob-body delete site: exact-token delete of entries a *previous* round marked `delete_pending`, up to the redelete budget, plus the outcome-log writes |
+| 11 | `pending_deletes` | fold | The single blob-body delete site: `HEAD` each entry a *previous* round marked `delete_pending`, then exact-token conditional delete chunks where the mounted backend proved that capability, plus the outcome-log writes |
 | 12 | `meta_pool_wait` | fold | Drain the bounded pool of async `.meta` condemn-marker writes queued during the fold |
 | 13 | `round_commit` | fold | Retention-prune old generations, then publish the single `gc/state` `CAS` that adopts the whole round |
 | 14 | `handoff_reclaim` | post-`CAS` | Reclaim a generation a ref moved off during this round, which the ordinary retention prune already skipped and will not revisit |
@@ -415,12 +415,22 @@ deletes for entries a *previous* round published as `delete_pending`, processing
 `cas_gc_round_redelete_budget` entries per round (the excess is carried unchanged), and writes the
 forensic outcome logs.
 
+In the GC code and metrics, a **chunk** is the group of keys handled by one delete job. A chunk can
+contain a single key. A **batch** is one storage request that carries multiple keys, such as S3
+`DeleteObjects`. The mount probe checks whether the backend supports conditional batches, and GC
+uses one-key chunks when that capability is unavailable. Those jobs can still run concurrently
+according to `cas_gc_io_concurrency`. **Bulk delete** names the overall feature, including the
+sequence of requests needed to process many keys.
+
 - **Runs on:** fold path only
 - **Reads:** one `HEAD` per `redelete` entry — the persisted condemned token cannot itself be a
   precondition, so the round observes the blob first, which also settles the absent case without
   spending a conditional delete
-- **Writes / deletes:** a `DELETE` conditional on the observed etag for each `redelete` entry whose
-  live etag matches the condemned token; one write-once outcome log per shard with settled entries
+- **Writes / deletes:** conditional delete chunks for entries whose live etag matches the condemned
+  token. A chunk is bounded by `cas_gc_bulk_delete_chunk_keys`, the backend conditional-batch limit,
+  and 1000 keys. An unprobed, unsupported, or `skip_access_check` mount uses one-key chunks. `.meta`
+  cleanup remains one per settled blob; it is not part of the conditional delete request. One
+  write-once outcome log is written per shard with settled entries
 - **Safety:** an entry is deletable only because a previously committed fold seal published it
   `delete_pending` — durable state from an earlier commit, safe at any leader staleness. Exact token
   means a stale leader cannot delete a fresh incarnation; `NotFound` and `TokenMismatch` are
@@ -428,7 +438,56 @@ forensic outcome logs.
 - **Fails the round if:** a backend delete marker appears in a response — object versioning on a
   mis-provisioned pool (`LOGICAL_ERROR`)
 - **Observability:** phase row `pending_deletes`; metrics `deleted`, `absent`, `redeleted`,
-  `graduated`, `replaced`, `spared`, `outcome_logs_written`, `outcome_rows_dropped`
+  `graduated`, `replaced`, `spared`, `outcome_logs_written`, `outcome_rows_dropped`, `delete_chunks`. `delete_chunks`
+  counts logical conditional-delete chunks, including sequential execution. `read_blob_jobs_scheduled`
+  and `delete_chunk_jobs_scheduled` count successfully enqueued read jobs and delete chunk jobs,
+  respectively. Jobs that later fail still count; enqueue failures do not. Both counters are zero
+  on the sequential path, including a wave with only one job. `DiskS3DeleteObjects` counts physical
+  S3 delete attempts, including request retries
+
+GC reports read-job failures after all submitted blob-state reads finish, before starting the
+conditional-delete wave. It reports delete-job failures after all submitted delete chunks finish.
+Warnings distinguish read jobs, delete chunk jobs, and failures to enqueue either kind of job.
+A failed delete job can have an unknown or partial storage outcome; its warning does not imply that
+all objects in the chunk remain present.
+
+Read failures do not prevent deletion of successfully read siblings. After both waves, GC records
+known outcomes and schedules eligible `.meta` cleanup, then rethrows the original job or enqueue
+exception with the lowest input blob index. An unsuccessful round leaves the previously published
+pending entries available to the next round.
+
+The `read_blob_jobs_failed` and `delete_chunk_jobs_failed` metrics count jobs that finish with an
+exception, including inline execution. A failed delete chunk contributes one job failure, regardless
+of its number of blobs. The `read_blob_job_schedule_failures` and `delete_chunk_job_schedule_failures`
+metrics each count enqueue refusals, not the number of unsubmitted jobs or blobs. Retries do not
+create extra logical jobs; `Gone` and `Mismatch` are normal outcomes, not job failures. These four
+metrics replace the former `jobs_failed` aggregate and are emitted even when the phase throws.
+Because inline jobs are included only in the execution-failure counters, the scheduling counters
+cannot be used as their denominators for an error rate.
+
+The `RoundReport::redelete_failed` field and `CASGCRetiredRedeleteFailed` event retain their existing
+units: each failed blob from an executed job counts once, while an enqueue failure counts once per
+wave regardless of the number of unsubmitted blobs reported in its warning.
+
+Ordinary S3 batch deletion and conditional batch deletion have independent capability flags. Only
+the latter requires the store to enforce a separate `ETag` for each key in `DeleteObjects`. Both
+paths use `objects_chunk_size_to_delete` as a size limit. A request-level `NotImplemented` from
+the optional batch check leaves GC using one-key chunks. A request-level `InvalidRequest` or
+`InvalidArgument` propagates and fails the mount. After a successful probe, a batch request error
+follows the normal request retry policy and does not change the pinned capability.
+
+CAS skips the optional conditional batch delete check on Google Cloud Storage in generation-token
+mode. The [S3-compatible XML `DeleteObjects` API](https://docs.cloud.google.com/storage/docs/object-deletion-overview)
+rejects per-object `ETag` conditions. The [GCS JSON batch API](https://docs.cloud.google.com/storage/docs/batch)
+can group individual `DELETE` requests, each with its own
+[`ifGenerationMatch` condition](https://docs.cloud.google.com/storage/docs/json_api/v1/objects/delete#parameters).
+CAS uses the XML API. The mount verifies single-object conditional deletion and GC sends a separate
+`DELETE` for each blob body with
+[`x-goog-if-generation-match`](https://docs.cloud.google.com/storage/docs/xml-api/delete-object#request-headers).
+
+The integration test on RustFS 1.0.6 mounts two disks with GC chunk limits of one and two. It
+checks the number of storage requests in each pending-delete phase and lists the bucket to verify
+that the blob bodies have disappeared.
 
 Under `suppress_destructive` the `redelete` set is empty by construction, so nothing is deleted, and
 there is no graduation either (would-be graduates are carried unchanged); sparing and superseding
@@ -849,7 +908,7 @@ pool sizes and the chunk size reject `0`:
 | `cas_manifest_sweep_delete_budget_keys` | 100 | orphan-manifest sweep `DELETE` budget per round (phases 9, 18) |
 | `cas_gc_round_sweep_namespace_budget` | 20 | namespaces whose protection view the sweep may build per page (phase 9) |
 | `cas_gc_round_sweep_recovery_op_budget` | 5000 | committed-tail ref-log reads the sweep's recovery walk may spend (phase 9) |
-| `cas_gc_bulk_delete_chunk_keys` | 1000 | keys per batch `DELETE` request for write-once families (phases 15, 17); `1` to `1000` |
+| `cas_gc_bulk_delete_chunk_keys` | 1000 | keys per batch `DELETE` request for blob redelete and write-once families (phases 11, 15, 17); `1` to `1000` |
 | `cas_gc_meta_pool_size` | 16 | bounded pool for condemn-marker writes (phase 12) |
 | `cas_gc_io_concurrency` | 16 | bounded pool for the fold's read-ahead of checkpoints, ref logs, manifest bodies and zero-candidate `HEAD`s (phases 8, 9), the graduation `.meta` reads (phase 9), the orphan-sweep planning reads (phase 9), the rebuild read-ahead and the `pending_deletes` `HEAD` + conditional `DELETE` fan-out (phase 11); other GC requests run on the round thread; `1` runs the covered requests sequentially. `cas_gc_read_concurrency` is rejected without an alias; use `cas_gc_io_concurrency` instead |
 

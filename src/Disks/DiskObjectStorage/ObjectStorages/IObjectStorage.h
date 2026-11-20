@@ -297,6 +297,12 @@ struct ConditionalRemoveResult
     bool created_delete_marker = false;   /// backend reported a versioning delete marker
 };
 
+struct ConditionalRemoveObject
+{
+    StoredObject object;
+    std::string expected_token;
+};
+
 /// Base class for all object storages which implement some subset of ordinary filesystem operations.
 ///
 /// Examples of object storages are S3, Azure Blob Storage, HDFS.
@@ -447,6 +453,9 @@ public:
     virtual ConditionalRemoveResult removeObjectIfTokenMatches(
         const StoredObject & object, const std::string & etag, const ObjectStorageControlRequest & request);
 
+    virtual std::vector<ConditionalRemoveResult> removeObjectsIfTokensMatch(
+        const std::vector<ConditionalRemoveObject> & objects, const ObjectStorageControlRequest & request);
+
     /// Removes every object in ONE request with no per-key precondition; an absent object is success.
     /// Content-addressed callers use it for write-once keys only, at most 1000 per call. Throws on a
     /// request-level failure and on any per-key error other than "not found", naming the failed keys.
@@ -460,6 +469,10 @@ public:
     /// Callers cut their batches to this size, so one call stays one storage request. The default
     /// suits a storage without a batch delete.
     virtual size_t batchDeleteKeyLimit() const { return 1; }
+
+    /// The configured key limit for a multi-object delete request, independent of any learned
+    /// capability. A caller that probes conditional delete support can apply its own capability gate.
+    virtual size_t configuredBatchDeleteKeyLimit() const { return 1; }
 
     /// Copy object with different attributes if required
     virtual void copyObject( /// NOLINT
