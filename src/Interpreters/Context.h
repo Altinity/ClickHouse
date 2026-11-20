@@ -1905,10 +1905,13 @@ public:
     bool startSwarmMode();
     /// Return current swarm mode state.
     bool isSwarmModeEnabled() const;
-    /// Shared lock for one swarm task send. The read-task callback holds it only across the
-    /// enabled check and `sendReadTaskRequest`. The response read does not. `stopSwarmMode`
-    /// and `startSwarmMode` take it exclusively.
+    /// Shared lock for one swarm task send. `runWithSwarmTaskAdmission` holds it across the
+    /// enabled check and the send. The response read does not. `stopSwarmMode` and
+    /// `startSwarmMode` take it exclusively.
     std::shared_lock<SharedMutex> lockSwarmMode() const;
+    /// Call `send` while holding the swarm admission lock. Returns false, without calling `send`,
+    /// when the server is cancelled or swarm mode is disabled. The lock is released before return.
+    bool runWithSwarmTaskAdmission(bool server_cancelled, std::function<void()> send) const;
 
     bool isInternalQuery() const { return is_internal_query; }
     void setInternalQuery(bool internal) { is_internal_query = internal; }
