@@ -105,13 +105,13 @@ class AltinityJobConfigs:
                 runs_on=RunnerLabels.AMD_MEDIUM,
                 requires=[ArtifactNames.CH_AMD_TSAN_GH],
             )
-            for total_batches in (2,)
+            for total_batches in (4,)
             for batch in range(1, total_batches + 1)
         ],
         *[
             Job.ParamSet(
                 parameter=f"amd_msan, cas s3 storage, parallel, {batch}/{total_batches}",
-                runs_on=RunnerLabels.FUNC_TESTER_AMD,
+                runs_on=RunnerLabels.AMD_LARGE,
                 requires=[ArtifactNames.CH_AMD_MSAN_GH],
             )
             for total_batches in (3,)
