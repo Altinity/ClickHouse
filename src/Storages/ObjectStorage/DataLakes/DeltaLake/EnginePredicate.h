@@ -48,6 +48,10 @@ public:
             exception = exception_;
     }
 
+    /// Whether some node of the filter could not be translated to a delta-kernel expression.
+    /// Such nodes are dropped from the predicate passed to delta-kernel.
+    bool hasUnsupportedNodes() const { return has_unsupported_nodes; }
+
     const DB::ActionsDAG & getFilterDAG() const { return filter; }
     DB::ContextPtr getContext() const { return context; }
     const DB::FormatSettings & getFormatSettings() const { return format_settings; }
@@ -61,6 +65,7 @@ private:
     /// Exceptions cannot be rethrown as it will cause
     /// panic from rust and server terminate.
     std::exception_ptr & exception;
+    bool has_unsupported_nodes = false;
     /// Context for accessing settings
     DB::ContextPtr context;
     const DB::FormatSettings format_settings;
