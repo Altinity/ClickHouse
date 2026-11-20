@@ -139,6 +139,10 @@ changed shard needing a fold and no deletion was due — a cheap round, not a st
 `Finish` row is worth a steady watch: it is fold clamps surfaced and survived, so a non-zero value
 that persists across rounds is more interesting than an isolated one.
 
+A round that deletes nothing although rows are `pending` or `standing` may be suppressed because its parent
+check failed: the `fold_reduce` row of the round has `parent_unconfirmed = 1` in `phase_metrics`, the server log has
+a WARNING with that name, and `CASGCClampSuppressedPasses` counts the pass. The round does not fail.
+
 A dashboard alert that filters on `outcome = 'Error'` alone misses `Aborted` and `Stopped` rows too
 — see the [`outcome` column](/operations/system-tables/cas_gc_log#columns) for what each one means.
 A round that is recurring `Aborted` rather than `Error` still deserves attention: it keeps retrying,

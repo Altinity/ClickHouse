@@ -10,6 +10,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
 #include <Common/CurrentMetrics.h>
 #include <Common/ProfileEvents.h>
@@ -55,6 +56,7 @@ namespace DB::ErrorCodes
 extern const int ABORTED;
 extern const int BAD_ARGUMENTS;
 extern const int NO_REPLICA_HAS_PART;
+extern const int NETWORK_ERROR;
 extern const int NOT_IMPLEMENTED;
 extern const int READONLY;
 }
@@ -4528,4 +4530,214 @@ TEST(CASSourceLiveness, RepublishRefRefusesASourceDroppedBeforeTheDestinationPre
 
     const FsckReport report = runFsck(*store, /*detail=*/true);
     EXPECT_EQ(report.dangling, 0u) << formatFsckSummary(report);
+}
+
+/// ---- What a round must walk: the intake requirements of the body-delete rule ----
+
+namespace
+{
+
+using IntakeBackend = HintHoleBackendOn<FrontierHookBackend>;
+
+/// A pool that holds `pending(t)` for one blob nobody references, plus an unrelated part in a stable namespace so
+/// that every round has something to walk. A copy of the blob into a namespace the adopted state has never
+/// seen is the event under test: the blob's row can only be carried if the round reads that namespace.
+class IntakePool
+{
+public:
+    explicit IntakePool(const String & ns_old_ = "test/a_old") : ns_old(ns_old_)
+    {
+        PoolConfig config{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0, .gc_io_concurrency = 1};
+        store = Pool::open(backend, std::move(config));
+        body_key = store->layout().blobKey(x);
+        gc = std::make_unique<Gc>(store, kGateLeaderA);
+        EXPECT_EQ(writeOnePart(store, "test/m_stable", "seed", "an unrelated part of the stable namespace"),
+                  BlobMaterializationAction::Published);
+    }
+
+    /// Ends with `pending(t)` and no reference to the blob.
+    void commitPending()
+    {
+        ASSERT_EQ(writeOnePart(store, ns_old, "p0", payload), BlobMaterializationAction::Published);
+        runGateRound(store, *gc);
+        store->dropRef(RootNamespace{ns_old}, "p0");
+        store->renewWatermarkOnce();
+        runGateRound(store, *gc);
+        ASSERT_TRUE(row() && row()->delete_pending && !row()->standing) << "the condemning round did not commit pending(t)";
+        t = row()->token;
+    }
+
+    /// A no-bytes copy of the blob into `ns`, dropped at once: one `+1` and one `-1` of the blob in the first
+    /// records of that namespace. Returns the stream prefix of the namespace's life.
+    String copyAndDrop(const String & ns, const String & ref_name = "c")
+    {
+        backend->clearJournal();
+        copyWithoutBytes(store, ns, ref_name, payload);
+        const String stream = firstWrittenStreamPrefix(*backend);
+        EXPECT_FALSE(stream.empty()) << ns;
+        store->dropRef(RootNamespace{ns}, ref_name);
+        store->renewWatermarkOnce();
+        return stream;
+    }
+
+    /// The round after journal entry `from` carried `pending(t)` and destroyed nothing; later rounds, which fold no
+    /// record of the blob, reclaim it. The last step shows that the carry, not something else, kept the body.
+    void expectCarriedThenReclaimed(size_t from, const RoundReport & round)
+    {
+        expectBodyKept(*backend, *store, body_key, from, round);
+        expectRowOutcome(row(), /*carried=*/true, t);
+        for (int i = 0; i < 6 && bodyStored(); ++i)
+            runGateRound(store, *gc);
+        EXPECT_FALSE(bodyStored()) << "the body was not reclaimed once no round saw a record of it";
+    }
+
+    std::optional<RetiredEntry> row() const { return retiredEntryFor(*backend, store->layout(), x); }
+
+    bool bodyStored() const
+    {
+        OperationForTest op(*backend);
+        return (*op).read(body_key, Retry::standard()).has_value();
+    }
+
+    std::shared_ptr<IntakeBackend> backend = std::make_shared<IntakeBackend>();
+    PoolPtr store;
+    std::unique_ptr<Gc> gc;
+    const String ns_old;
+    const String payload = "intake-requirements-payload";
+    const BlobRef x = idOf(payload);
+    String body_key;
+    PersistedEtag t;
+};
+
+}
+
+/// A namespace with no parent row is read from its first record in the round that first sees it: the `+1` of the
+/// blob in it carries the row. A round that started at the namespace's end would see a zero it had not earned.
+TEST(CASGcIntakeRequirements, LifeWithNoParentRowIsWalkedFromItsFirstRecord)
+{
+    IntakePool pool;
+    ASSERT_NO_FATAL_FAILURE(pool.commitPending());
+    pool.copyAndDrop("test/n_new");
+
+    const size_t from = pool.backend->journal().size();
+    const RoundReport round = runGateRound(pool.store, *pool.gc);
+    pool.expectCarriedThenReclaimed(from, round);
+}
+
+/// The stream listing omits the new namespace's records, the catalog still lists its life: the round walks it by
+/// exact key and carries the row.
+TEST(CASGcIntakeRequirements, LifeTheStreamListingOmitsButTheCatalogListsIsWalked)
+{
+    IntakePool pool;
+    ASSERT_NO_FATAL_FAILURE(pool.commitPending());
+    const String stream = pool.copyAndDrop("test/n_hidden");
+    pool.backend->hidePrefix(stream);
+
+    const size_t from = pool.backend->journal().size();
+    const RoundReport round = runGateRound(pool.store, *pool.gc);
+    EXPECT_GT(pool.backend->holesServed(), 0u) << "positive control: the listing omitted the life";
+    pool.expectCarriedThenReclaimed(from, round);
+}
+
+/// A life that is still `Creating` holds no precommit: an append to it is refused and writes nothing, so a round
+/// has no edge to miss in it.
+TEST(CASGcIntakeRequirements, CreatingLifeRefusesTheAppendOfAPrecommit)
+{
+    IntakePool pool;
+    ASSERT_NO_FATAL_FAILURE(pool.commitPending());
+    const Layout & layout = pool.store->layout();
+    const RootNamespace ns{"test/n_creating"};
+
+    CasRequests requests = openRequestsForTest(pool.backend);
+    CasOperation op = requests.admit();
+    /// A creator whose mount slot never existed is not provably dead, so the birth is refused, not completed.
+    CasRefCatalog::casAdmitEntry(op, layout, /*gc_shards*/ 1, CatalogEntry{
+        .ns = ns, .state = NsState::Creating, .incarnation = hexToU128("00000000000000000000000000000077"),
+        .creator = CreatorFence{.server_root_id = "ghost-server", .writer_epoch = 9, .fence_generation = 1}});
+
+    pool.backend->clearJournal();
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { copyWithoutBytes(pool.store, ns.string(), "c", pool.payload); });
+    for (const JournalEntry & entry : pool.backend->journal())
+        if (entry.verb == JournalVerb::Write)
+            for (const String & key : entry.keys)
+                EXPECT_EQ(key.find("/_log/"), String::npos) << "the refused append left a record: " << key;
+    EXPECT_TRUE(pool.row() && pool.row()->delete_pending) << "the row of the blob changed";
+}
+
+/// A namespace removed and re-created under the same name: the new life has no parent row and starts from its own
+/// first record. The old life is erased from the catalog by the round that decides the blob.
+TEST(CASGcIntakeRequirements, RecreatedNamespaceStartsFromItsOwnFirstRecord)
+{
+    IntakePool pool;
+    const String ns = "test/a_reborn";
+    const String holder = "test/h_holder";
+    const RootNamespace ns_root{ns};
+
+    ASSERT_EQ(writeOnePart(pool.store, ns, "p0", pool.payload), BlobMaterializationAction::Published);
+    copyWithoutBytes(pool.store, holder, "keep", pool.payload);
+    runGateRound(pool.store, *pool.gc);
+
+    /// Round 1 folds the terminal record of the old life; round 2 erases its catalog row, and the drop of the
+    /// holder's copy makes the blob zero in that same round, so round 2 commits `pending(t)`.
+    pool.store->dropNamespace(ns_root);
+    runGateRound(pool.store, *pool.gc);
+    ASSERT_FALSE(pool.row().has_value()) << "the holder's edge should still keep the blob out of the retired set";
+    pool.store->dropRef(RootNamespace{holder}, "keep");
+    pool.store->renewWatermarkOnce();
+    runGateRound(pool.store, *pool.gc);
+    ASSERT_TRUE(pool.row() && pool.row()->delete_pending && !pool.row()->standing) << "round 2 did not commit pending(t)";
+    pool.t = pool.row()->token;
+
+    const std::optional<NamespaceLifeId> old_life = [&]
+    {
+        CasRequests requests = openRequestsForTest(pool.backend);
+        CasOperation op = requests.admit();
+        return CasRefCatalog::lifeIfCataloged(op, pool.store->layout(), ns_root);
+    }();
+    ASSERT_FALSE(old_life.has_value()) << "the old life is still in the catalog";
+
+    pool.copyAndDrop(ns);
+    const size_t from = pool.backend->journal().size();
+    const RoundReport round = runGateRound(pool.store, *pool.gc);
+    pool.expectCarriedThenReclaimed(from, round);
+}
+
+/// The catalog read of a round follows the acquisition of its lease: the round of a leader that steals the
+/// lease from the previous one is checked, twice.
+TEST(CASGcIntakeRequirements, CatalogReadFollowsTheLeaseAcquisition)
+{
+    IntakePool pool;
+    ASSERT_NO_FATAL_FAILURE(pool.commitPending());
+    const Layout & layout = pool.store->layout();
+
+    const auto expectOrder = [&](size_t from, const char * what)
+    {
+        const auto journal = pool.backend->journal();
+        size_t first_lease_write = journal.size();
+        size_t first_catalog_read = journal.size();
+        for (size_t i = from; i < journal.size(); ++i)
+        {
+            const JournalEntry & entry = journal[i];
+            const bool names_state = std::find(entry.keys.begin(), entry.keys.end(), layout.gcStateKey()) != entry.keys.end();
+            const bool names_catalog = std::find(entry.keys.begin(), entry.keys.end(), layout.refCatalogKey()) != entry.keys.end();
+            if (entry.verb == JournalVerb::Write && names_state && first_lease_write == journal.size())
+                first_lease_write = i;
+            if (entry.verb == JournalVerb::Read && names_catalog && first_catalog_read == journal.size())
+                first_catalog_read = i;
+        }
+        ASSERT_LT(first_lease_write, journal.size()) << what << ": positive control: the round acquired its lease";
+        ASSERT_LT(first_catalog_read, journal.size()) << what << ": positive control: the round read the catalog";
+        EXPECT_LT(first_lease_write, first_catalog_read) << what << ": the catalog was read before the lease";
+    };
+
+    for (const UInt128 leader : {kGateLeaderB, hexToU128("000000000000000000000000000000c3")})
+    {
+        /// The first round of a successor only observes the held lease; the second steals it.
+        Gc successor(pool.store, leader);
+        ASSERT_FALSE(runGateRound(pool.store, successor).acquired_lease);
+        const size_t from = pool.backend->journal().size();
+        ASSERT_TRUE(runGateRound(pool.store, successor).acquired_lease);
+        ASSERT_EQ(storedLeaseOwner(*pool.backend, layout), leader);
+        expectOrder(from, "a round that steals the lease");
+    }
 }

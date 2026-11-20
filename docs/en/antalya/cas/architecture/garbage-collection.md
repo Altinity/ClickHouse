@@ -407,11 +407,16 @@ Recomputes the per-shard in-degree snapshot and computes the round's single dest
   `condemned`, `intent_confirmed` (rows committed `pending` this round), `spared`, `body_deletes_decided` (body
   deletes decided), `adopted` (orphan intents given a row), `nominations_waiting` (nominated intents of a
   shard that stayed a pure carry), `read_ahead_blobs` (blobs held to read row `HEAD`s ahead),
-  `suppress_destructive`, `frontier_complete`
+  `suppress_destructive`, `frontier_complete`, `parent_unconfirmed`
 
 `suppress_destructive` is true on any recorded anomaly, any hold in the seal about to be made
-durable, or an incomplete frontier (`frontier_proven ≠ frontier_namespaces`, a universe neither
-non-empty nor proved empty, or a universe policy that is not authoritative). Under it the round
+durable, an incomplete frontier (`frontier_proven ≠ frontier_namespaces`, a universe neither
+non-empty nor proved empty, or a universe policy that is not authoritative), or an unconfirmed parent state. The
+parent check is one uncached `HEAD` of `gc/state`, sent after the intake when the adopted state holds a `pending` or
+`standing` row. It must show the version the round leased. Another version, an absent object or no answer means a
+newer leader may have removed ref-log records this round read as absent, so the round deletes no body and no intent
+and does not fail. The reason is the `parent_unconfirmed` metric of the `fold_reduce` row, a WARNING in the server
+log, and a count in `CASGCClampSuppressedPasses`. Under suppression the round
 still creates intents, records rows, spares and carries, but body deletes, intent deletes, intent
 adoption, orphan-sweep planning and cursor adoption, retention prune, hand-off reclaim, manifest
 deletes and ref-object cleanup do not run, and namespace cleanup lists and classifies one page
@@ -758,7 +763,8 @@ flowchart LR
     C --> B
     P --> D{"round n+1: cut"}
     D -->|"a reference: HEAD"| S["row dropped<br/>DELETE I(B,t) only if the body has another token u"]
-    D -->|"still zero: HEAD"| E{"body now?"}
+    D -->|"still zero, no record of the blob folded: HEAD"| E{"body now?"}
+    D -->|"zero, but a record of the blob was folded"| P
     E -->|"token t"| F["DELETE body If-Match t<br/>row standing(t)"]
     E -->|"absent"| F2["no body request<br/>row standing(t)"]
     E -->|"another token u"| T["PUT intent I(B,u), DELETE I(B,t)<br/>row pending(u)"]
@@ -772,7 +778,8 @@ flowchart LR
 |---|---|---|---|
 | `n` | blob reached zero | `HEAD` of the body; intent `PUT` with `If-None-Match` | `pending(t)` if the create was confirmed, else `candidate(t)`. Nothing is deleted |
 | after `n` (`candidate`) | still zero | the intent `PUT` again | `pending(t)` or still `candidate(t)` |
-| after `n` (`pending`) | still zero | `HEAD`; `DELETE` of the body with `If-Match` on the token the `HEAD` showed | `standing(t)` |
+| after `n` (`pending`) | still zero, and the round folded no record of the blob | `HEAD`; `DELETE` of the body with `If-Match` on the token the `HEAD` showed | `standing(t)` |
+| after `n` (`pending`) | zero, but the round folded a record of the blob | `HEAD` | unchanged: `pending(t)`, the intent stays |
 | after the body delete (`standing`) | still zero | `DELETE` of the intent | dropped |
 | `candidate` | a reference | nothing | dropped; an intent stays |
 | `pending` or `standing` | a reference | `HEAD`; intent `DELETE` for `t` when it shows another token `u` | dropped; the intent stays otherwise |
@@ -813,6 +820,13 @@ state.
 A blob whose in-degree reaches zero in round `n` gets its intent in round `n`, loses its body in round
 `n+1` at the earliest, and loses its intent in round `n+2` at the earliest. A reference folded in any of
 these rounds spares the blob.
+
+**A body is deleted only on an untouched zero.** A `pending` row is carried, not deleted, when the round folded any
+record of the blob, even if the cut shows zero because an addition and a removal cancel. The reason: a no-bytes
+copy of a part into another table adds a reference without reading the body, and the source part may be dropped
+before the cut of the copy's table is read. The cut then shows zero for a blob that a committed part names. A round
+that read the catalog after its lease and folded no record of the blob shows that nothing owned it. A carried row is
+decided again in the next round. A blob that is added and dropped in every round keeps its body while that lasts.
 
 A token that has no canonical form (see [token identity](/antalya/cas/architecture/blob-protocol#token-identity))
 gets no intent and no row: `GC` records nothing for it and never deletes it, and
