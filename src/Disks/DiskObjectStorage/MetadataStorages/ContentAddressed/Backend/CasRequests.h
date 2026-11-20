@@ -321,6 +321,10 @@ public:
     /// of paced retrying. A policy that already carries a deadline is returned unchanged, so freezing
     /// twice cannot extend it.
     Retry freeze(const Retry & policy) const;
+    /// Would a read verb start its first attempt now under a policy frozen to `deadline_ms`? The same test the
+    /// verb applies before it sends, without any lease bound. A caller with a deadline of its own asks first, so
+    /// its running out of time is its own error and not the verb's retry-later give-up.
+    bool oneAttemptFitsBefore(uint64_t deadline_ms) const;
 
     std::optional<Object> read(const String & key, const Retry & policy);
     std::optional<Meta>   head(const String & key, const Retry & policy);

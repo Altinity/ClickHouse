@@ -49,15 +49,22 @@ using Deadline = std::optional<std::chrono::steady_clock::time_point>;
 /// Enforce the optional overall scan deadline between backend operations. A timeout is propagated as
 /// `TIMEOUT_EXCEEDED`; the public `runFsck` wrapper may convert that exception into a partial report when
 /// explicitly requested.
+[[noreturn]] void throwDeadlineExceeded(std::string_view phase)
+{
+    throw Exception(ErrorCodes::TIMEOUT_EXCEEDED,
+        "fsck: exceeded the deadline during '{}' — run against a QUIESCED pool or raise --timeout.", phase);
+}
+
 void checkDeadline(const Deadline & deadline, std::string_view phase)
 {
     if (deadline && std::chrono::steady_clock::now() > *deadline)
-        throw Exception(ErrorCodes::TIMEOUT_EXCEEDED,
-            "fsck: exceeded the deadline during '{}' — run against a QUIESCED pool or raise --timeout.", phase);
+        throwDeadlineExceeded(phase);
 }
 
 /// The policy of one fsck request: refused once the scan deadline has passed, and the standard budget cut to the
-/// time left, so a request started late cannot outlast the deadline on a fresh budget.
+/// time left, so a request started late cannot outlast the deadline on a fresh budget. Time left that cannot hold
+/// one attempt is the scan's timeout: the engine would refuse the request with a retry-later error, which callers
+/// that tolerate a failed read would count as a finding.
 Retry deadlineBound(CasOperation & op, const Deadline & deadline, std::string_view phase)
 {
     checkDeadline(deadline, phase);
@@ -66,7 +73,10 @@ Retry deadlineBound(CasOperation & op, const Deadline & deadline, std::string_vi
     const auto left_ms = std::chrono::duration_cast<std::chrono::milliseconds>(*deadline - std::chrono::steady_clock::now()).count();
     const Retry standard = op.freeze(Retry::standard());
     const Retry bounded = op.freeze(Retry::within(static_cast<uint64_t>(std::max<int64_t>(left_ms, 0))));
-    return *bounded.policy_deadline_ms < *standard.policy_deadline_ms ? bounded : standard;
+    const Retry & chosen = *bounded.policy_deadline_ms < *standard.policy_deadline_ms ? bounded : standard;
+    if (!op.oneAttemptFitsBefore(*chosen.policy_deadline_ms))
+        throwDeadlineExceeded(phase);
+    return chosen;
 }
 
 /// Every key under `prefix`, each page requested under `deadlineBound`.

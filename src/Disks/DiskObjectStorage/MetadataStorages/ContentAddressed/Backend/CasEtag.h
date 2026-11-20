@@ -52,7 +52,10 @@ class Etag
 {
 public:
     Etag() = delete;
-    bool operator==(const Etag &) const = default;
+    /// A write's answer and a read's answer may spell one version differently: compare with `sameVersion`, or with
+    /// `identicalToken` when the spelling cannot differ.
+    bool operator==(const Etag &) const = delete;
+    bool operator!=(const Etag &) const = delete;
 
     /// "etag:<value>" | "generation:<value>" | "emulated:<value>"
     String render() const;
@@ -63,6 +66,7 @@ public:
 
 private:
     friend class CasRequests;
+    friend bool identicalToken(const Etag & a, const Etag & b);
 
     Etag(uint64_t backend_id, String key, Dialect dialect, String value)
         : backend_id_(backend_id), key_(std::move(key)), dialect_(dialect), value_(std::move(value))
@@ -104,8 +108,15 @@ bool sameIncarnation(const PersistedEtag & row, const Etag & live);
 
 /// Whether `read`, from a read of an object, names the version a conditional write of it answered with as `written`:
 /// equal tokens, or equal canonical identities, because the two responses may quote one ETag differently. A token
-/// with no canonical form matches only exactly.
+/// with no canonical form matches only exactly. Throws `LOGICAL_ERROR` for tokens of two keys or two backends: equal
+/// bytes under two keys share an S3 ETag.
 bool sameVersion(const Etag & read, const Etag & written);
+
+/// The same backend, key and transport text. For two tokens from responses of one kind, or a token and its own copy,
+/// which spell one version the same way.
+bool identicalToken(const Etag & a, const Etag & b);
+/// Both absent, or both present and identical.
+bool identicalToken(const std::optional<Etag> & a, const std::optional<Etag> & b);
 
 /// A token whose `canonical` is `identity`, in wire spelling: a quoted tag except for `generation`. Nothing when
 /// `tag_hex` names no opaque tag.

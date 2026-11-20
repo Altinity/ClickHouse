@@ -1376,7 +1376,7 @@ TEST(CASGCFrontierGate, ANamespaceBornAfterTheEmptyCutResurrectsTheCondemnedBlob
         const auto fresh_head = op.head(key, Retry::once());
         ASSERT_TRUE(fresh_head.has_value());
         fresh_token = fresh_head->etag;
-        EXPECT_NE(*fresh_token, condemned_token)
+        EXPECT_NE(tokenText(*fresh_token), tokenText(condemned_token))
             << "the writer must have met the intent and resurrected -- a fresh token, not an adopt "
                "of the dying incarnation";
     });
@@ -1392,7 +1392,7 @@ TEST(CASGCFrontierGate, ANamespaceBornAfterTheEmptyCutResurrectsTheCondemnedBlob
     EXPECT_TRUE(surviving_head.has_value())
         << "the resurrected incarnation must survive round R's delete";
     ASSERT_TRUE(fresh_token.has_value());
-    EXPECT_EQ(surviving_head->etag, *fresh_token) << "and it is still the writer's incarnation";
+    EXPECT_EQ(tokenText(surviving_head->etag), tokenText(*fresh_token)) << "and it is still the writer's incarnation";
     EXPECT_EQ(op.remove(key, condemned_token, Retry::once()), Removal::Mismatch)
         << "the condemned token can never remove the fresh object (INV_NO_LOSS)";
 
@@ -2218,7 +2218,7 @@ TEST(CASGCFrontierGate, AResurrectedIncarnationSurvivesTheDelayedStaleTokenDelet
     const auto fresh_head = (*raw_op).head(key, Retry::once());
     ASSERT_TRUE(fresh_head.has_value());
     const Etag fresh_token = fresh_head->etag;
-    ASSERT_NE(fresh_token, condemned_token) << "republication must displace the condemned incarnation";
+    ASSERT_NE(tokenText(fresh_token), tokenText(condemned_token)) << "republication must displace the condemned incarnation";
 
     /// GC's delayed delete still names the OLD token. It cannot touch the new object.
     drive(store, gc, /*rounds*/ 2, UniversePolicy::Authoritative);
@@ -2226,7 +2226,7 @@ TEST(CASGCFrontierGate, AResurrectedIncarnationSurvivesTheDelayedStaleTokenDelet
     const auto surviving_head = (*raw_op).head(key, Retry::once());
     ASSERT_TRUE(surviving_head.has_value())
         << "the resurrected incarnation survives the delete published against its predecessor";
-    EXPECT_EQ(surviving_head->etag, fresh_token) << "and it is still the writer's incarnation";
+    EXPECT_EQ(tokenText(surviving_head->etag), tokenText(fresh_token)) << "and it is still the writer's incarnation";
     EXPECT_EQ((*raw_op).remove(key, condemned_token, Retry::once()), Removal::Mismatch)
         << "the condemned token can never remove the fresh object (INV-NO-RETURN)";
 }

@@ -879,7 +879,7 @@ TEST(CASGCRebuild, RefusedRebuildGivesBackItsLeaseClaim)
     const auto after_second = readObj(*backend, layout.gcStateKey());
     ASSERT_TRUE(after_second.has_value());
     EXPECT_EQ(after_second->bytes, given_back->bytes);
-    EXPECT_NE(after_second->etag, given_back->etag) << "the claim and the give-back both wrote";
+    EXPECT_NE(tokenText(after_second->etag), tokenText(given_back->etag)) << "the claim and the give-back both wrote";
 
     writeManifestRaw(*backend, layout, missing.root_namespace, missing.ref, {blobEntryFor("b", DB::UInt128(1))});
     Gc retry(store, hexToU128("00000000000000000000000000000013"));

@@ -643,7 +643,7 @@ TEST(CASS3Staging, PromoteOverExistingCleanBlobAdoptsAndNeverOverwrites)
     /// The existing incarnation is untouched: same token, same bytes.
     const auto after = headAt(*backend, blob_key);
     ASSERT_TRUE(after.has_value());
-    EXPECT_EQ(after->etag, before->etag);
+    EXPECT_EQ(tokenText(after->etag), tokenText(before->etag));
 
     /// Observing the existing incarnation records materialized evidence without retaining its token.
     EXPECT_EQ(build->dependencyProof(blob_id), DB::Cas::BlobDependencyProof::Materialized);
@@ -705,7 +705,7 @@ TEST(CASS3Staging, PublishOverCondemnedBlobUsesFreshTagNotVerbatim)
     /// The incarnation token is REFRESHED (a fresh incarnation displaced the condemned one).
     const auto after = headAt(*backend, blob_key);
     ASSERT_TRUE(after.has_value());
-    EXPECT_NE(after->etag, before->etag);
+    EXPECT_NE(tokenText(after->etag), tokenText(before->etag));
 
     const auto got = readAt(*backend, blob_key);
     ASSERT_TRUE(got.has_value());

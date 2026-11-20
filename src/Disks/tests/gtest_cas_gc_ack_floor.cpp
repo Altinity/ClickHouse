@@ -432,7 +432,7 @@ TEST(CASGCRetire, StaleRedeleteAfterSpareDoesNotDeleteLiveReuse)
     /// The live body under t2 survives, stays reachable via the committed r2, and fsck sees no dangle.
     const std::optional<Meta> survivor = op.head(blob_key, Retry::once());
     ASSERT_TRUE(survivor);
-    EXPECT_EQ(survivor->etag, t2->etag);
+    EXPECT_EQ(tokenText(survivor->etag), tokenText(t2->etag));
     replaceRecoverableCkptForRawFixture(
         *backend, store->layout(), ns,
         RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 3},
@@ -479,7 +479,7 @@ TEST(CASGCRetire, CopyForwardedBlobSurvivesWhenRepublished)
     EXPECT_FALSE(currentEntryFor(*backend, store->layout(), DB::UInt128(1)).has_value());
     const auto hr = (*displace).head(blob_key, Retry::standard());
     ASSERT_TRUE(hr.has_value());
-    EXPECT_EQ(hr->etag, res_etag);
+    EXPECT_EQ(tokenText(hr->etag), tokenText(res_etag));
 }
 
 /// Copy-forward aftermath, stale-entry arm: a listed (hash, t0) entry whose incarnation was
@@ -520,7 +520,7 @@ TEST(CASGCRetire, AbandonedCopyForwardMovesTheRowBeforeAnyDelete)
     EXPECT_TRUE(sameIncarnation(moved->token, res_etag)) << "the row still names the stale token";
     const auto hr = (*displace).head(blob_key, Retry::standard());
     ASSERT_TRUE(hr.has_value()) << "the fresh incarnation was deleted under the stale token";
-    EXPECT_EQ(hr->etag, res_etag);
+    EXPECT_EQ(tokenText(hr->etag), tokenText(res_etag));
 
     /// The unreferenced fresh incarnation is then reclaimed under its own condemnation.
     runRegularRoundReclaiming(gc);

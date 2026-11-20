@@ -409,7 +409,7 @@ TEST(CASRefCatalogLifeIndex, AmbiguityStopsCatalogMutationButNotUnrelatedPointLo
     EXPECT_THROW(CasRefCatalog::casUpdate(op, layout, [](const RefCatalog & current) { return current; }), DB::Exception);
     const auto after = op.read(layout.refCatalogKey(), Retry::standard());
     ASSERT_TRUE(after);
-    EXPECT_EQ(after->etag, before->etag);
+    EXPECT_EQ(tokenText(after->etag), tokenText(before->etag));
     EXPECT_EQ(after->bytes, before->bytes);
 
     const auto unique = CasRefCatalog::lifeIfCataloged(op, layout, RootNamespace{"c"});

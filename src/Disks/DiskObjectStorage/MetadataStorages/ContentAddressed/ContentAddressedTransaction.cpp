@@ -268,6 +268,17 @@ void ContentAddressedTransaction::clearEntries(PartStaging & st)
     st.copy_sources.clear();
 }
 
+void ContentAddressedTransaction::markVacatedInBase(
+    const ContentAddressedMetadataStorage::Route & r, PartStaging & st, const std::string & file)
+{
+    if (!st.base_manifest_ref)
+        return;
+    const auto view = metadata_storage.partAccess()->getView(r.refKey(), Cas::Freshness::CachedForLoad);
+    /// A view other than the base cannot tell what the base holds; the mark then sends the publish to its ownership check.
+    if (!view || !(view->manifestId().ref == *st.base_manifest_ref) || view->hasFile(file))
+        st.content_removed.insert(file);
+}
+
 std::shared_ptr<Cas::CopySource> ContentAddressedTransaction::copySourceOf(const PartStaging & st, const std::string & path)
 {
     const auto it = st.copy_sources.find(path);
@@ -1523,7 +1534,10 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
                     path_from, path_to);
             for (auto & entry : st->entries)
                 if (entry.path.starts_with(old_prefix))
+                {
+                    markVacatedInBase(*src, *st, entry.path);
                     rekeyEntry(*st, entry, new_prefix + entry.path.substr(old_prefix.size()));
+                }
             return;
         }
     }
@@ -1764,6 +1778,7 @@ void ContentAddressedTransaction::moveFile(const std::string & path_from, const 
         auto entry = *it;
         auto source = copySourceOf(src_st, src->file);
         eraseEntry(src_st, src->file);
+        markVacatedInBase(*src, src_st, src->file);
         entry.path = dst->file;
         if (&src_st != &dst_st && entry.placement == Cas::EntryPlacement::Blob)
         {
@@ -1814,7 +1829,7 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool if_e
 {
     /// Part file. Two sub-cases:
     ///   1. A file STAGED in this transaction (content entry or legacy mutable bytes): drop the
-    ///      staged state so it never reaches the published tree.
+    ///      staged state so it never reaches the published tree; a committed file it rewrote also gets the mark of 2.
     ///   2. A COMMITTED CONTENT file (not staged here): stage a REMOVAL MARK
     ///      (`content_removed`). The mark is resolved at publish (`publishStaging`): a repoint
     ///      republishes the manifest minus the removed paths, UNLESS this same transaction also
@@ -1848,7 +1863,9 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool if_e
         /// publish upload by the staged-tree-hash check in publishStaging. We do NOT purge it
         /// eagerly because the same hash may still be referenced by another staged entry.
         eraseEntry(st, r->file);
-        if (!staged_here)
+        if (staged_here)
+            markVacatedInBase(*r, st, r->file);
+        else
         {
             /// One fresh resolve per (transaction, ref), not per file: the MergeTree fast-removal path
             /// unlinks every file of the part through THIS transaction right before removeDirectory.

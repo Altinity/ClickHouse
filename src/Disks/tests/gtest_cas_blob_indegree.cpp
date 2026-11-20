@@ -460,7 +460,7 @@ TEST(CASThreeCursorMerge, PendingRowWhoseHeadShowsItsTokenGoesStandingWithABodyD
     ASSERT_EQ(rmr.body_deletes.size(), 1u);
     EXPECT_EQ(rmr.body_deletes[0].entry.ref, bh(1));
     ASSERT_TRUE(rmr.body_deletes[0].observed.has_value());
-    EXPECT_EQ(rmr.body_deletes[0].observed->etag, body.etag);
+    EXPECT_EQ(tokenText(rmr.body_deletes[0].observed->etag), tokenText(body.etag));
     ASSERT_EQ(rmr.still_retired.size(), 1u);
     EXPECT_TRUE(rmr.still_retired[0].standing);
     EXPECT_TRUE(rmr.intent_deletes.empty()) << "the intent never leaves with its body";

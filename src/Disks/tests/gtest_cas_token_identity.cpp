@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/tests/cas_test_helpers.h>
+#include <base/defines.h>
 #include <base/hex.h>
 
 #include <random>
@@ -223,3 +224,32 @@ TEST(CASTokenIdentity, EveryTestBackendTokenCanonicalises)
         DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::EmulatedSingleProcess);
     check(local);
 }
+
+namespace
+{
+
+/// Two keys of one ETag backend whose `HEAD`s both answer `abc`, as two keys holding equal bytes do on S3.
+void compareTokensOfTwoKeys()
+{
+    auto backend = std::make_shared<DB::Cas::tests::HeadValueOverrideBackend>(
+        Dialect::ETag, [](const String &, const String &) { return String("abc"); });
+    auto requests = DB::Cas::tests::openRequestsForTest(*backend);
+    auto op = requests.admit();
+    op.create("k1", "body", Retry::once());
+    op.create("k2", "body", Retry::once());
+    (void)sameVersion(op.head("k1", Retry::once())->etag, op.head("k2", Retry::once())->etag);
+}
+
+}
+
+#ifndef DEBUG_OR_SANITIZER_BUILD
+TEST(CASTokenIdentity, SameVersionOfTwoKeysThrows)
+{
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [] { compareTokensOfTwoKeys(); });
+}
+#else
+TEST(CASTokenIdentityDeathTest, SameVersionOfTwoKeysAborts)
+{
+    EXPECT_DEATH(compareTokensOfTwoKeys(), "sameVersion compares tokens of two objects");
+}
+#endif

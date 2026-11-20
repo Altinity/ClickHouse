@@ -667,7 +667,7 @@ TEST(CASServerRootClaim, FirstClaimWritesLifeOne)
     /// A restart under the same owner writes nothing and reads the same life.
     const Etag before = currentEtag(ops.op, l.ownerKey("r"));
     EXPECT_EQ(claimOwnerOrThrow(ops.op, l, "r", UInt128(1), emptyCatalogObservation()), 1u);
-    EXPECT_EQ(currentEtag(ops.op, l.ownerKey("r")), before);
+    EXPECT_EQ(tokenText(currentEtag(ops.op, l.ownerKey("r"))), tokenText(before));
 }
 
 TEST(CASServerRootClaim, ClaimOverA2664OwnerReadsLifeZero)
@@ -755,8 +755,8 @@ TEST(CASMount, PoolOpenRefusesAnUnverifiedRetirement)
     {
         Pool::open(b, PoolConfig{.pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r"});
     });
-    EXPECT_EQ(currentEtag(ops.op, l.epochKey("r")), epoch_before);
-    EXPECT_EQ(currentEtag(ops.op, l.mountKey("r")), mount_before);
+    EXPECT_EQ(tokenText(currentEtag(ops.op, l.epochKey("r"))), tokenText(epoch_before));
+    EXPECT_EQ(tokenText(currentEtag(ops.op, l.mountKey("r"))), tokenText(mount_before));
 }
 
 /// Each identity refusal names the supported recovery: the decommission verb for a dead foreign owner,
@@ -1729,11 +1729,11 @@ TEST(CASMountStartup, ExistingPoolWithoutCatalogFailsBeforeSlotMutation)
     ASSERT_TRUE(epoch_after.has_value());
     ASSERT_TRUE(mount_after.has_value());
     EXPECT_EQ(owner_after->bytes, owner_before->bytes);
-    EXPECT_EQ(owner_after->etag, owner_before->etag);
+    EXPECT_EQ(tokenText(owner_after->etag), tokenText(owner_before->etag));
     EXPECT_EQ(epoch_after->bytes, epoch_before->bytes);
-    EXPECT_EQ(epoch_after->etag, epoch_before->etag);
+    EXPECT_EQ(tokenText(epoch_after->etag), tokenText(epoch_before->etag));
     EXPECT_EQ(mount_after->bytes, mount_before->bytes);
-    EXPECT_EQ(mount_after->etag, mount_before->etag);
+    EXPECT_EQ(tokenText(mount_after->etag), tokenText(mount_before->etag));
 }
 
 TEST(CASMountReadOnly, ForeignOwnedPoolOpensWithoutMutation)
@@ -2096,14 +2096,14 @@ TEST(CASHeartbeatFloor, RenewalBetweenRoundsRestartsObservation)
 
     renewMount(ops.op, l, "s1");
     const Etag renewed_etag = currentEtag(ops.op, l.mountKey("s1"));
-    EXPECT_NE(renewed_etag, first_etag);
+    EXPECT_NE(tokenText(renewed_etag), tokenText(first_etag));
 
     const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(kStableThresholdMs),
                                                           kObserverLeaseMs, kCadenceMs, obs, warned);
 
     EXPECT_EQ(floor2.fenced_now, 0u);
     ASSERT_TRUE(obs.contains("s1"));
-    EXPECT_EQ(obs.at("s1").etag, renewed_etag);
+    EXPECT_EQ(tokenText(obs.at("s1").etag), tokenText(renewed_etag));
     EXPECT_EQ(obs.at("s1").first_seen_mono_ms, kStableThresholdMs);
 }
 
@@ -2464,7 +2464,7 @@ TEST(CASHeartbeatFloor, RedecisionAfterARefusedFenceCountsFromItsRead)
     ASSERT_FALSE(b->renew_before_next_fence) << "the call never attempted the fence-out";
     ASSERT_EQ(refused.fenced_now, 0u);
     ASSERT_EQ(refused.live, 1u);
-    ASSERT_NE(obs.at("s1").etag, first);
+    ASSERT_NE(tokenText(obs.at("s1").etag), tokenText(first));
 
     /// Nothing reads after the re-decision, so the clock holds the value of the last read.
     const uint64_t reread_at = mono;
@@ -2877,7 +2877,7 @@ TEST(CASClaimMountMonotonicity, TwoClaimersOfOneEpochDoNotShareTheSlot)
     ASSERT_TRUE(ours.body.has_value());
     EXPECT_EQ(ours.body->write_attempt_id, decodeMountLease(competitor->bytes).write_attempt_id);
     ASSERT_TRUE(ours.etag.has_value());
-    EXPECT_TRUE(*ours.etag == competitor->etag);
+    EXPECT_TRUE(identicalToken(*ours.etag, competitor->etag));
     EXPECT_EQ(ops.op.read(l.mountKey("r"), Retry::standard())->bytes, competitor->bytes) << "the slot was written";
 }
 
@@ -3394,7 +3394,7 @@ TEST(CASOwner, DelayedTombstoneAfterRejoinFailsOnLife)
     OwnerObject rejoined = first;
     rejoined.owner_life = 3;
     mustCommit(ops.op.replace(key, encodeOwner(rejoined), currentEtag(ops.op, key), Retry::standard()), "rejoin");
-    ASSERT_NE(currentEtag(ops.op, key), stale) << "the life makes the rejoined bytes differ from the first";
+    ASSERT_NE(tokenText(currentEtag(ops.op, key)), tokenText(stale)) << "the life makes the rejoined bytes differ from the first";
 
     OwnerObject late = first;
     late.retired_at_ms = 2000;
@@ -3717,7 +3717,7 @@ TEST(CASMount, RecheckSelfFenceLeavesAnyOtherBodyAlone)
         const auto after = ops.op.read(l.mountKey("r"), Retry::standard());
         ASSERT_TRUE(after.has_value());
         EXPECT_EQ(after->bytes, before->bytes);
-        EXPECT_EQ(after->etag, before->etag);
+        EXPECT_EQ(tokenText(after->etag), tokenText(before->etag));
     }
 }
 
@@ -3840,7 +3840,7 @@ TEST(CASMount, ForeignReclaimReadsTheOwnerFirst)
         mustCommit(ops.op.create(l.mountKey("r"), encodeMountLease(terminalBody(UInt128(2), 7, false)), Retry::standard()), "slot");
         const auto before = ops.op.read(l.mountKey("r"), Retry::standard());
         EXPECT_EQ(claimMount(ops.op, l, "r", UInt128(1), 8, 1000, 100, {}, {}, {}, c.expected).kind, MountClaimResult::ForeignOwner);
-        EXPECT_EQ(ops.op.read(l.mountKey("r"), Retry::standard())->etag, before->etag);
+        EXPECT_EQ(tokenText(ops.op.read(l.mountKey("r"), Retry::standard())->etag), tokenText(before->etag));
     }
 }
 
@@ -3857,7 +3857,7 @@ TEST(CASMount, ForeignTerminalBodyAtOrAboveOurEpochStaysForeign)
         mustCommit(ops.op.create(l.mountKey("r"), encodeMountLease(terminalBody(UInt128(2), body_epoch, false)), Retry::standard()), "slot");
         const auto before = ops.op.read(l.mountKey("r"), Retry::standard());
         EXPECT_EQ(claimMount(ops.op, l, "r", UInt128(1), 8, 1000, 100, {}, {}, {}, uuid_one_at_life_two).kind, MountClaimResult::ForeignOwner);
-        EXPECT_EQ(ops.op.read(l.mountKey("r"), Retry::standard())->etag, before->etag);
+        EXPECT_EQ(tokenText(ops.op.read(l.mountKey("r"), Retry::standard())->etag), tokenText(before->etag));
     }
 }
 
@@ -3871,7 +3871,7 @@ TEST(CASMount, ForeignLiveBodyStaysForeignOwner)
     mustCommit(ops.op.create(l.mountKey("r"), encodeMountLease(liveBody(UInt128(2), 7)), Retry::standard()), "slot");
     const auto before = ops.op.read(l.mountKey("r"), Retry::standard());
     EXPECT_EQ(claimMount(ops.op, l, "r", UInt128(1), 8, 1000, 100, {}, {}, {}, uuid_one_at_life_two).kind, MountClaimResult::ForeignOwner);
-    EXPECT_EQ(ops.op.read(l.mountKey("r"), Retry::standard())->etag, before->etag);
+    EXPECT_EQ(tokenText(ops.op.read(l.mountKey("r"), Retry::standard())->etag), tokenText(before->etag));
 }
 
 /// A start and a self-remount pass their owner expectation, so both take over a terminal body of another uuid.

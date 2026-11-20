@@ -215,6 +215,8 @@ private:
     /// Renames `entry`, an element of `st.entries`, in place; `new_path` must not be staged.
     static void rekeyEntry(PartStaging & st, Cas::ManifestEntry & entry, std::string new_path);
     static void clearEntries(PartStaging & st);
+    /// Records `file` removed when the part's committed base may hold it, after a staged entry left that path.
+    void markVacatedInBase(const ContentAddressedMetadataStorage::Route & r, PartStaging & st, const std::string & file);
     static std::shared_ptr<Cas::CopySource> copySourceOf(const PartStaging & st, const std::string & path);
     /// The refs of `st`'s pending uploads, collected once per publication.
     using PendingRefs = std::unordered_set<Cas::BlobRef, Cas::BlobRefHash>;

@@ -1686,7 +1686,7 @@ TEST(CASPool, RestartKeepsTheOwnerLife)
     ASSERT_TRUE(before.has_value());
     EXPECT_EQ(DB::Cas::decodeOwner(before->bytes).owner_life, 1u);
     auto again = DB::Cas::tests::openPoolForTest(backend);
-    EXPECT_EQ((*op).read(owner_key, DB::Cas::Retry::once())->etag, before->etag) << "a plain restart writes no owner";
+    EXPECT_EQ(tokenText((*op).read(owner_key, DB::Cas::Retry::once())->etag), tokenText(before->etag)) << "a plain restart writes no owner";
 }
 
 TEST(CASPoolRemount, OldEpochBuildFailsClosedAfterRemount)

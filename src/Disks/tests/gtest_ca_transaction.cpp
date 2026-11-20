@@ -1688,6 +1688,93 @@ TEST(CASTransactionStagedCopies, AFileWrittenAndRemovedInACommittedPartLeavesIts
     EXPECT_TRUE(storage.existsFile(part + "extra.bin"));
 }
 
+namespace
+{
+
+/// The entry of `file` in the committed part `ref`, or nullopt.
+std::optional<DB::Cas::ManifestEntry> committedEntry(DB::ContentAddressedMetadataStorage & storage, const DB::Cas::RootNamespace & ns,
+                                                     const std::string & ref, const std::string & file)
+{
+    const auto view = storage.partAccess()->getView({ns, ref}, DB::Cas::Freshness::ForceFresh);
+    if (!view)
+        return std::nullopt;
+    const auto * entry = DB::Cas::findEntry(view->manifest()->entries, file);
+    if (!entry)
+        return std::nullopt;
+    return *entry;
+}
+
+bool sameContent(DB::Cas::ManifestEntry a, const DB::Cas::ManifestEntry & b)
+{
+    a.path = b.path;
+    return a == b;
+}
+
+}
+
+/// A rewrite of a committed file that is then removed removes the committed file too.
+TEST(CASTransactionStagedCopies, ARewrittenCommittedFileThatIsUnlinkedLeavesTheManifest)
+{
+    auto storage = openTxStorage();
+    const std::string table = kLivenessTable + "/";
+    const std::string part = table + "all_96_96_0/";
+    const DB::Cas::RootNamespace ns = storage->liveNamespace(kLivenessUuid);
+    commitPartTx(*storage, table, "all_96_96_0", {{"data.bin", "committed bytes"}, {"keep.bin", "kept"}});
+    ASSERT_TRUE(committedEntry(*storage, ns, "all_96_96_0", "data.bin"));
+
+    auto tx = storage->createTransaction();
+    writeFileTx(*tx, part + "data.bin", "rewritten bytes");
+    tx->unlinkFile(part + "data.bin", /*if_exists=*/false, /*should_remove_objects=*/false);
+    ASSERT_NO_THROW(tx->commit(DB::NoCommitOptions{}));
+
+    EXPECT_FALSE(committedEntry(*storage, ns, "all_96_96_0", "data.bin"));
+    EXPECT_TRUE(committedEntry(*storage, ns, "all_96_96_0", "keep.bin"));
+}
+
+/// A rewrite of a committed file moved to another part leaves the source without it and the destination with the
+/// rewritten bytes.
+TEST(CASTransactionStagedCopies, ARewrittenCommittedFileMovedOutLeavesItsPart)
+{
+    auto storage = openTxStorage();
+    const std::string table = kLivenessTable + "/";
+    const std::string part = table + "all_96_96_0/";
+    const DB::Cas::RootNamespace ns = storage->liveNamespace(kLivenessUuid);
+    commitPartTx(*storage, table, "all_96_96_0", {{"data.bin", "committed bytes"}, {"keep.bin", "kept"}});
+    commitPartTx(*storage, table, "all_99_99_0", {{"data.bin", "rewritten bytes"}});
+    const auto rewritten = committedEntry(*storage, ns, "all_99_99_0", "data.bin");
+    ASSERT_TRUE(rewritten);
+
+    auto tx = storage->createTransaction();
+    writeFileTx(*tx, part + "data.bin", "rewritten bytes");
+    tx->moveFile(part + "data.bin", table + "tmp_insert_all_97_97_0/data.bin");
+    ASSERT_NO_THROW(tx->commit(DB::NoCommitOptions{}));
+
+    EXPECT_FALSE(committedEntry(*storage, ns, "all_96_96_0", "data.bin"));
+    EXPECT_TRUE(committedEntry(*storage, ns, "all_96_96_0", "keep.bin"));
+    const auto moved = committedEntry(*storage, ns, "tmp_insert_all_97_97_0", "data.bin");
+    ASSERT_TRUE(moved);
+    EXPECT_TRUE(sameContent(*moved, *rewritten));
+}
+
+/// A staged projection directory re-keyed away from a name the committed part holds takes the committed files with it.
+TEST(CASTransactionStagedCopies, ARewrittenCommittedProjectionReKeyedAwayLeavesItsName)
+{
+    auto storage = openTxStorage();
+    const std::string table = kLivenessTable + "/";
+    const std::string part = table + "all_96_96_0/";
+    const DB::Cas::RootNamespace ns = storage->liveNamespace(kLivenessUuid);
+    commitPartTx(*storage, table, "all_96_96_0", {{"data.bin", "committed bytes"}, {"p_1.tmp_proj/data.bin", "committed projection"}});
+    ASSERT_TRUE(committedEntry(*storage, ns, "all_96_96_0", "p_1.tmp_proj/data.bin"));
+
+    auto tx = storage->createTransaction();
+    writeFileTx(*tx, part + "p_1.tmp_proj/data.bin", "rewritten projection");
+    tx->moveDirectory(part + "p_1.tmp_proj", part + "p.proj");
+    ASSERT_NO_THROW(tx->commit(DB::NoCommitOptions{}));
+
+    EXPECT_FALSE(committedEntry(*storage, ns, "all_96_96_0", "p_1.tmp_proj/data.bin"));
+    EXPECT_TRUE(committedEntry(*storage, ns, "all_96_96_0", "p.proj/data.bin"));
+}
+
 /// Every file staged into a committed part moves to new parts: those parts publish, and the committed part keeps its
 /// manifest.
 TEST(CASTransactionStagedCopies, ACommittedPartEmptiedOfItsStagedWritesKeepsItsManifest)

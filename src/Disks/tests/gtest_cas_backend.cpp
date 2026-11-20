@@ -161,7 +161,7 @@ TEST(CASInMemory, PutIfAbsentAndGet)
     auto g = op.read("k", Retry::once());
     ASSERT_TRUE(g.has_value());
     EXPECT_EQ(g->bytes, "v1");
-    EXPECT_EQ(g->etag, t1);
+    EXPECT_EQ(tokenText(g->etag), tokenText(t1));
     EXPECT_FALSE(op.read("absent", Retry::once()).has_value());
 }
 
@@ -181,7 +181,7 @@ TEST(CASInMemory, OverwriteIsTokenExactAndMintsFreshToken)
 
     const WriteResult overwrite = op.replace("k", "v2", t2, Retry::once());
     ASSERT_TRUE(std::holds_alternative<Committed>(overwrite));
-    EXPECT_NE(std::get<Committed>(overwrite).etag, t2);   // tokens never repeat
+    EXPECT_NE(tokenText(std::get<Committed>(overwrite).etag), tokenText(t2));   // tokens never repeat
     expectBytes(b, "k", "v2");
 }
 
@@ -1064,7 +1064,7 @@ TEST(CASObjectStorageBackend, PublishBlobEmulatedWriteFailurePreservesDestinatio
     EXPECT_NE(storage->last_opened_key, physical_key);
     EXPECT_FALSE(storage->exists(DB::StoredObject(storage->last_opened_key)));
     EXPECT_EQ(readStorageObject(storage, physical_key), "old-complete-body");
-    EXPECT_EQ(op.head(key, Retry::once())->etag, old_token);
+    EXPECT_EQ(tokenText(op.head(key, Retry::once())->etag), tokenText(old_token));
 }
 
 TEST(CASObjectStorageBackend, PublishBlobCancelsShortAndLongStreamingSourcesBeforeVisibility)
@@ -1594,7 +1594,7 @@ TEST(CASObjectStorageBackend, EmulatedListTokenMatchesHeadToken)
     const ListPage page = op.list("k/", "", /*limit=*/10, Retry::once());
     ASSERT_EQ(page.keys.size(), 1u);
     ASSERT_TRUE(page.keys.front().etag.has_value());
-    EXPECT_EQ(*page.keys.front().etag, head->etag);
+    EXPECT_EQ(tokenText(*page.keys.front().etag), tokenText(head->etag));
 }
 
 namespace
@@ -1651,7 +1651,7 @@ TEST(CASObjectStorageBackend, EmuTokenDisambiguatesSameEtagRewrite)
     ASSERT_TRUE(std::holds_alternative<Committed>(put2));
     const Etag inc2 = std::get<Committed>(put2).etag;
 
-    EXPECT_NE(inc1, inc2);
+    EXPECT_NE(tokenText(inc1), tokenText(inc2));
     EXPECT_EQ(inc1.dialect(), Dialect::Emulated);
     EXPECT_EQ(inc2.dialect(), Dialect::Emulated);
 
@@ -1676,14 +1676,14 @@ TEST(CASObjectStorageBackend, PublishBlobEmulatedDisambiguatesSameEtagFromStaleD
 
     const auto published = op.head(key, Retry::once());
     ASSERT_TRUE(published.has_value());
-    EXPECT_NE(published->etag, stale_token);
+    EXPECT_NE(tokenText(published->etag), tokenText(stale_token));
     EXPECT_EQ(published->etag.dialect(), Dialect::Emulated);
     EXPECT_EQ(op.remove(key, stale_token, Retry::once()), Removal::Mismatch);
 
     const auto live = op.read(key, Retry::once());
     ASSERT_TRUE(live.has_value());
     EXPECT_EQ(live->bytes, "fresh-envelopepayload");
-    EXPECT_EQ(live->etag, published->etag);
+    EXPECT_EQ(tokenText(live->etag), tokenText(published->etag));
 }
 
 namespace

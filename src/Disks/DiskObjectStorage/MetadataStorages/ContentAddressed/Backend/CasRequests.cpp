@@ -483,6 +483,11 @@ Retry CasOperation::freeze(const Retry & policy) const
     return frozen;
 }
 
+bool CasOperation::oneAttemptFitsBefore(uint64_t deadline_ms) const
+{
+    return fits(reservedFor(0, 1), Retry::Bound{.deadline_ms = deadline_ms, .lease_bound = false});
+}
+
 std::optional<WriteResult> CasOperation::pauseBeforeRedecide(uint64_t ms, const GaveUp & unresolved, const Retry & policy)
 {
     WriteState state;

@@ -4782,6 +4782,40 @@ TEST(CASGcIntents, PausedLeaderOverASealThatUnderstatesItsPendingRowsDeletesNoth
     EXPECT_TRUE(pool.bodyMeta(1).has_value());
 }
 
+/// Of two merged shards, the first is honest and the second's seal understates its `pending` rows: the round fails at
+/// the second shard's run before it deletes the first shard's body, which the same round deletes without the lie.
+TEST(CASGcIntents, SealThatUnderstatesTheSecondShardDeletesNothingOfTheFirst)
+{
+    constexpr uint64_t shards = 2;
+    const uint64_t honest = blobsInShard(0, shards, 1).front();
+    const uint64_t hidden = blobsInShard(1, shards, 1).front();
+    for (const bool lie : {false, true})
+    {
+        SCOPED_TRACE(lie);
+        IntentPool<PausedLeaderBackend> pool(std::make_shared<PausedLeaderBackend>(), {.gc_shards = shards});
+        ASSERT_NO_FATAL_FAILURE(pool.makePending({honest, hidden}));
+        if (!lie)
+        {
+            const RoundReport report = pool.round();
+            EXPECT_FALSE(pool.bodyMeta(honest).has_value()) << "positive control: the round deletes the honest shard's body";
+            EXPECT_GE(report.bodies_deleted, 1u);
+            continue;
+        }
+        const std::optional<RetiredEntry> row = pool.row(hidden);
+        ASSERT_TRUE(row && row->delete_pending);
+        restateAdoptedSummary(*pool.backend, pool.layout(), 1,
+            CondemnedSummary{.condemned_total = 1, .pending_total = 0, .oldest_nonpending_condemn_round = row->condemn_round});
+        pool.backend->clearJournal();
+        const String message = messageOf(DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)pool.round(); });
+        EXPECT_NE(message.find("CAS GC shard 1 ("), String::npos) << message;
+        const auto journal = pool.backend->journal();
+        EXPECT_EQ(countOf(blobRequests(journal), JournalVerb::Remove, pool.bodyKey(honest)), 0u);
+        EXPECT_EQ(countOf(blobRequests(journal), JournalVerb::Remove, pool.bodyKey(hidden)), 0u);
+        EXPECT_TRUE(pool.bodyMeta(honest).has_value());
+        EXPECT_TRUE(pool.bodyMeta(hidden).has_value());
+    }
+}
+
 /// A refusal of the validation read fails the round, as a refusal of any other read of the fold does.
 TEST(CASGcIntents, RefusedValidationReadFailsTheRound)
 {

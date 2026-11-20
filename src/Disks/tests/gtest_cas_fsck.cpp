@@ -2544,6 +2544,89 @@ TEST(CASFsck, DeadlinePassingDuringAVerifiedIntentReadStopsBeforeTheBodyHead)
 namespace
 {
 
+/// The request engine reserves this much per attempt, so it refuses to start one in the last `kFsckEnvelopeMs` before
+/// a policy's deadline.
+constexpr uint64_t kFsckEnvelopeMs = 400;
+
+class EnvelopeFsckFaultBackend : public FsckFaultBackend
+{
+public:
+    uint64_t attemptEnvelopeMs() const override { return kFsckEnvelopeMs; }
+};
+
+class EnvelopeMutateOnFirstGetBackend : public MutateOnFirstGetBackend
+{
+public:
+    uint64_t attemptEnvelopeMs() const override { return kFsckEnvelopeMs; }
+};
+
+bool anyNoteContains(const FsckReport & report, const String & text)
+{
+    return std::any_of(report.objects.begin(), report.objects.end(), [&](const FsckObject & object)
+    {
+        return std::any_of(object.reachable_from.begin(), object.reachable_from.end(),
+            [&](const String & note) { return note.find(text) != String::npos; });
+    });
+}
+
+}
+
+/// A verified intent read that ends with less time left than one attempt ends the scan as partial: the body `HEAD` the
+/// engine would refuse is not counted as an unread intent.
+TEST(CASFsckPartial, TimeLeftShorterThanOneAttemptEndsIntentVerificationAsPartial)
+{
+    auto backend = std::make_shared<EnvelopeFsckFaultBackend>();
+    PoolPtr store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    writeBlobBody(*backend, layout, numberedBlobHash(1));
+    plantIntentForCurrentBody(*backend, layout, blobRefOf(1));
+    const String intent = *intentKeyOfCurrentBody(*backend, layout, blobRefOf(1));
+    const String body = layout.blobKey(blobRefOf(1));
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    backend->beforeRead(intent, 0, [deadline] { spinPast(deadline - std::chrono::milliseconds(kFsckEnvelopeMs / 2)); });
+    backend->clearJournal();
+
+    const FsckReport report = runFsck(*store, /*detail=*/false, {}, deadline, /*partial_on_deadline=*/true, {},
+                                      /*fix_legacy_markers=*/false, /*verify_intents=*/true);
+
+    ASSERT_TRUE(report.partial) << formatFsckSummary(report);
+    EXPECT_NE(report.partial_reason.find("exceeded the deadline during 'reading blob intents'"), String::npos)
+        << report.partial_reason;
+    EXPECT_EQ(report.intent_unread, 0u) << formatFsckSummary(report);
+    const auto journal = backend->journal();
+    EXPECT_EQ(countKeyRequests(journal, JournalVerb::Read, intent), 1u) << "positive control: the intent was read";
+    EXPECT_EQ(countKeyRequests(journal, JournalVerb::Head, body), 0u);
+}
+
+/// A ref stream read that ends with less time left than one attempt ends the scan as partial, not as a namespace fsck
+/// could not examine.
+TEST(CASFsckPartial, TimeLeftShorterThanOneAttemptEndsTheRefWalkAsPartial)
+{
+    auto backend = std::make_shared<EnvelopeMutateOnFirstGetBackend>();
+    PoolPtr store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/envelope_deadline@cas@"};
+    const NamespaceLifeId life = writeFsckFixtureWithTail(*backend, layout, ns);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool spun = false;
+    backend->armOnFirstGet(layout.refLogKey(life, RefTxnId{1, 2}), [&]
+    {
+        spinPast(deadline - std::chrono::milliseconds(kFsckEnvelopeMs / 2));
+        spun = true;
+    });
+
+    const FsckReport report = runFsck(*store, /*detail=*/true, {}, deadline, /*partial_on_deadline=*/true);
+
+    ASSERT_TRUE(spun) << "positive control: the walk read the tail log";
+    ASSERT_TRUE(report.partial) << formatFsckSummary(report);
+    EXPECT_NE(report.partial_reason.find("exceeded the deadline during 'ref stream'"), String::npos) << report.partial_reason;
+    EXPECT_EQ(report.unchecked, 0u) << formatFsckSummary(report);
+    EXPECT_FALSE(anyNoteContains(report, "could not")) << formatFsckSummary(report);
+}
+
+namespace
+{
+
 String adoptedSealKeyOf(FsckGcFixture & f)
 {
     OperationForTest op(*f.backend);

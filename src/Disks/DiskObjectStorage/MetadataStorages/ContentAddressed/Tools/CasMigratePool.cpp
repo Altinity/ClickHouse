@@ -543,7 +543,7 @@ private:
             {
                 Watched & slot = it->second;
                 const std::optional<Object> got = op.read(slot.key, Retry::standard());
-                if (!got || got->etag != slot.etag)
+                if (!got || !identicalToken(got->etag, slot.etag))
                     throwSlotChanged(it->first);
                 if (sample_ms < slot.first_seen_ms || sample_ms - slot.first_seen_ms < slot.threshold_ms)
                 {

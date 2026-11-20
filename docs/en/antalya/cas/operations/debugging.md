@@ -113,7 +113,7 @@ The refusals below fail a round with `CORRUPTED_DATA`, and each message ends wit
 | `CAS GC fold: <n> ref transaction(s) folded and merged into the round buffers but NONE of their blob deltas reached a shard reducer` | A folded transaction reached no reducer |
 | `CAS GC fold: the round sealed coverage over <n> ref log(s) but only <m> fully folded` | The coverage a round would seal exceeds what it folded |
 | ``CAS source-edge run `<key>` of GC shard <n>: the row of blob <b> source <s>`` | A run the adopted fold seal inherits breaks a row rule (a blob of another shard, rows out of order, a sentinel row or an active edge at the wrong key, a condemned row stamped after the parent round); the key, shard and row name what to inspect with `cas-inspect` |
-| ``CAS GC shard <n> (source-edge run `<key>`): its rows hold`` | The condemned rows of a run the adopted fold seal inherits differ from the seal's summary of that shard; the message gives both counts |
+| ``CAS GC shard <n> (source-edge run `<key>`): its rows hold``, ``CAS GC shard <n> (no source-edge run): its rows hold`` | The condemned rows the adopted fold seal inherits for a shard differ from the seal's summary of that shard; the message gives both counts. A shard with several runs lists them as `` `<key>`, `<key>` `` |
 
 No repair for these refusals is available in this build. `gc/state` is present and its lease was held, and
 `cas-gc-rebuild` refuses that with `another GC leader holds the lease`.

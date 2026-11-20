@@ -336,7 +336,7 @@ TEST_P(CASUploadDetachedMatrix, DetachedUploadMatchesPutBlob)
     EXPECT_EQ(build1->dependencyProof(blob), std::nullopt) << "only the attached path records the dependency proof";
     ASSERT_TRUE(headPresent(*b1, key));
     if (cell.condemned)
-        EXPECT_NE((*token_probe).head(key, Retry::standard())->etag, *condemned_token)
+        EXPECT_NE(tokenText((*token_probe).head(key, Retry::standard())->etag), tokenText(*condemned_token))
             << "the condemned incarnation was displaced by a fresh one";
     EXPECT_FALSE(currentBodyHasIntent(*b1, s1->layout(), blob));
     EXPECT_EQ(logicalPayloadAt(*b1, key, s1->poolMeta().blob_header_len), payload);

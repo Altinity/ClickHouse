@@ -1894,9 +1894,9 @@ TEST(CASWiringExchange, AdoptPartFromManifestPublishesFreshLocalManifest)
     EXPECT_FALSE(receiver_ns.string() == sender_ns.string());
 
     /// NO blob body was uploaded: the shared blobs' incarnations are untouched by the adopt.
-    EXPECT_EQ(headIncarnationOf(storage->store(), data_key), data_tok_before)
+    EXPECT_EQ(tokenText(headIncarnationOf(storage->store(), data_key)), tokenText(data_tok_before))
         << "adopt-from-manifest must not re-upload a blob already in the shared pool";
-    EXPECT_EQ(headIncarnationOf(storage->store(), proj_key), proj_tok_before);
+    EXPECT_EQ(tokenText(headIncarnationOf(storage->store(), proj_key)), tokenText(proj_tok_before));
 }
 
 /// B7 fail-closed: if a referenced blob is absent/condemned in the pool, adoptPartFromManifest must
@@ -3105,7 +3105,7 @@ TEST(CASWiringResurrect, PromoteIgnoresCondemnedMaterializedBlobEdgeProtected)
     /// The ref is committed and the blob's token is unchanged — no replacement PUT ran (`Materialized` leaves are
     /// not re-validated: EDGE-BEFORE-OBSERVE guarantees the condemnation is doomed, not the blob).
     EXPECT_TRUE(store->resolveRef(ns, ref).has_value()) << "the ref must resolve after promote";
-    EXPECT_EQ(headIncarnationOf(store, blob_key), t0)
+    EXPECT_EQ(tokenText(headIncarnationOf(store, blob_key)), tokenText(t0))
         << "materialized leaf is edge-protected: promote must not re-upload it (token unchanged)";
 }
 
@@ -3167,7 +3167,7 @@ TEST(CASWiringResurrect, PromoteWithoutLivePrecommitAbortsWithoutResurrect)
 
     /// No blob work ran before the abort: the leaf's token is UNCHANGED (still the condemned one) and its
     /// metadata is still Condemned — the owner check aborts before any blob publication.
-    EXPECT_EQ(headIncarnationOf(store, blob_key), h1.etag)
+    EXPECT_EQ(tokenText(headIncarnationOf(store, blob_key)), tokenText(h1.etag))
         << "the aborting path must perform no PUT — the materialized leaf is untouched";
     EXPECT_TRUE(DB::Cas::tests::objectPresent(*store->poolBackendPtr(),
         *DB::Cas::tests::intentKeyOfCurrentBody(*store->poolBackendPtr(), store->layout(), idOf(P))))

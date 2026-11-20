@@ -198,7 +198,7 @@ TEST(CASBlobPublishDigest, RefusalLeavesAnExistingBodyUntouched)
 
         const auto after = (*op).head(target.key, Retry::once());
         ASSERT_TRUE(after.has_value());
-        EXPECT_EQ(after->etag, earlier->etag) << "a refused publication replaced the body";
+        EXPECT_EQ(tokenText(after->etag), tokenText(earlier->etag)) << "a refused publication replaced the body";
     }
 }
 

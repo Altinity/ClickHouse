@@ -987,7 +987,7 @@ TEST(CASRefWriterNonMinting, ListRefsOnAbsentNamespaceDoesNotMutateCatalog)
     const auto catalog_after = readOf(backend, layout.refCatalogKey());
     ASSERT_TRUE(catalog_after);
     EXPECT_EQ(catalog_after->bytes, catalog_before->bytes);
-    EXPECT_EQ(catalog_after->etag, catalog_before->etag);
+    EXPECT_EQ(tokenText(catalog_after->etag), tokenText(catalog_before->etag));
 }
 
 TEST(CASRefWriterRuntimeIdentity, ColdReadRejectsCatalogLifeReplacedWithoutLocalInvalidation)
@@ -1186,7 +1186,7 @@ TEST(CASRefWriterNonMinting, ResolveRefOnAbsentNamespaceDoesNotMutateCatalog)
     const auto catalog_after = readOf(backend, layout.refCatalogKey());
     ASSERT_TRUE(catalog_after);
     EXPECT_EQ(catalog_after->bytes, catalog_before->bytes);
-    EXPECT_EQ(catalog_after->etag, catalog_before->etag);
+    EXPECT_EQ(tokenText(catalog_after->etag), tokenText(catalog_before->etag));
 }
 
 TEST(CASRefWriterNonMinting, DropNamespaceOnAbsentNamespaceDoesNotMutateCatalog)
@@ -1208,7 +1208,7 @@ TEST(CASRefWriterNonMinting, DropNamespaceOnAbsentNamespaceDoesNotMutateCatalog)
     const auto catalog_after = readOf(backend, layout.refCatalogKey());
     ASSERT_TRUE(catalog_after);
     EXPECT_EQ(catalog_after->bytes, catalog_before->bytes);
-    EXPECT_EQ(catalog_after->etag, catalog_before->etag);
+    EXPECT_EQ(tokenText(catalog_after->etag), tokenText(catalog_before->etag));
 }
 
 /// A table born by a log tail alone (no snapshot yet): `namespace_birth` with nothing else is a legal
@@ -2777,7 +2777,7 @@ TEST(CASRefWriteContract, CommittedSurfacesTheIncarnationFromTheWriteAndFromTheS
     CasOperation reader = requests.admit();
     const auto observed = reader.head("k1", Retry::standard());
     ASSERT_TRUE(observed.has_value());
-    EXPECT_EQ(direct_committed->etag, observed->etag)
+    EXPECT_EQ(tokenText(direct_committed->etag), tokenText(observed->etag))
         << "the direct-commit incarnation is the write's own response";
 
     /// The write of `k2` lands and its response is lost: the settling read proves the commit, and the
@@ -2791,7 +2791,7 @@ TEST(CASRefWriteContract, CommittedSurfacesTheIncarnationFromTheWriteAndFromTheS
     CasOperation second_reader = requests.admit();
     const auto second_observed = second_reader.head("k2", Retry::standard());
     ASSERT_TRUE(second_observed.has_value());
-    EXPECT_EQ(resolved_committed->etag, second_observed->etag)
+    EXPECT_EQ(tokenText(resolved_committed->etag), tokenText(second_observed->etag))
         << "the resolve-commit incarnation is the observed one";
 }
 
@@ -2993,7 +2993,7 @@ TEST(CASRefWriterSnapshotPublish, CapturedPredecessorCannotPublishAfterSameNameR
         << "a stale publisher recreated the retired predecessor snapshot";
     const auto predecessor_ckpt_after_resume = readOf(backend, layout.refCkptKey(predecessor_life));
     ASSERT_TRUE(predecessor_ckpt_after_resume);
-    EXPECT_EQ(predecessor_ckpt_after_resume->etag, predecessor_ckpt_before_resume->etag)
+    EXPECT_EQ(tokenText(predecessor_ckpt_after_resume->etag), tokenText(predecessor_ckpt_before_resume->etag))
         << "a stale publisher replaced the retired predecessor checkpoint";
     EXPECT_EQ(predecessor_ckpt_after_resume->bytes, predecessor_ckpt_before_resume->bytes)
         << "a stale publisher changed the retired predecessor checkpoint";
@@ -3081,7 +3081,7 @@ TEST(CASRefWriterSnapshotPublish, RetiredPredecessorCannotAdvanceCkptAfterSnapsh
 
     const auto predecessor_ckpt_after_resume = readOf(backend, layout.refCkptKey(predecessor_life));
     ASSERT_TRUE(predecessor_ckpt_after_resume);
-    EXPECT_EQ(predecessor_ckpt_after_resume->etag, predecessor_ckpt_before_resume->etag);
+    EXPECT_EQ(tokenText(predecessor_ckpt_after_resume->etag), tokenText(predecessor_ckpt_before_resume->etag));
     EXPECT_EQ(predecessor_ckpt_after_resume->bytes, predecessor_ckpt_before_resume->bytes);
     EXPECT_EQ(store->refTableRuntimeIdentityForTest(ns), successor_runtime);
     EXPECT_TRUE(store->resolveRef(ns, "successor"));
@@ -5183,7 +5183,7 @@ TEST(CASRefWriterNamespaceRemoval, GenericTerminalOnAbsentNamePerformsZeroDurabl
     EXPECT_EQ(backend->writeTotal(), 0u);
     EXPECT_EQ(backend->deleteTotal(), 0u);
     const CasRefCatalog::Snapshot catalog_after = readCatalogForTest(backend, store->layout());
-    EXPECT_EQ(catalog_after.etag, catalog_before.etag);
+    EXPECT_EQ(tokenText(catalog_after.etag), tokenText(catalog_before.etag));
     EXPECT_EQ(catalog_after.catalog, catalog_before.catalog);
     EXPECT_FALSE(store->refTableLifeForTest(ns));
 }

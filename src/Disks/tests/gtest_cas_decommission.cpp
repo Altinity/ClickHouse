@@ -180,10 +180,10 @@ private:
     bool replacement_fired = false;
 };
 
-std::vector<std::tuple<String, String, Etag>> snapshotPrefixObjects(
+std::vector<std::tuple<String, String, String>> snapshotPrefixObjects(
     InMemoryBackend & backend, const String & prefix)
 {
-    std::vector<std::tuple<String, String, Etag>> objects;
+    std::vector<std::tuple<String, String, String>> objects;
     auto requests = openRequestsForTest(backend);
     auto op = requests.admit();
     String cursor;
@@ -195,7 +195,7 @@ std::vector<std::tuple<String, String, Etag>> snapshotPrefixObjects(
             const auto got = op.read(listed.key, Retry::once());
             if (!got)
                 throw std::runtime_error("prefix snapshot fixture: listed object disappeared");
-            objects.emplace_back(listed.key, got->bytes, got->etag);
+            objects.emplace_back(listed.key, got->bytes, tokenText(got->etag));
         }
         if (page.next_cursor.empty())
             return objects;
@@ -380,14 +380,14 @@ protected:
     }
 
     /// The owner, epoch and mount objects, bytes and incarnation.
-    std::vector<std::optional<std::pair<String, Etag>>> controlObjects() const
+    std::vector<std::optional<std::pair<String, String>>> controlObjects() const
     {
         OperationForTest op(*victim_backend);
-        std::vector<std::optional<std::pair<String, Etag>>> objects;
+        std::vector<std::optional<std::pair<String, String>>> objects;
         for (const String & key : {layout.ownerKey("victim"), layout.epochKey("victim"), layout.mountKey("victim")})
         {
             const auto got = (*op).read(key, Retry::once());
-            objects.push_back(got ? std::optional(std::pair(got->bytes, got->etag)) : std::nullopt);
+            objects.push_back(got ? std::optional(std::pair(got->bytes, tokenText(got->etag))) : std::nullopt);
         }
         return objects;
     }
@@ -566,7 +566,7 @@ TEST_F(CASDecommission, RefusesIdWithSlash)
 
     const auto owner_after = (*raw_op).read(layout.ownerKey("shard-01/replica-a"), Retry::once());
     ASSERT_TRUE(owner_after.has_value());
-    EXPECT_EQ(owner_after->etag, owner_before->etag);
+    EXPECT_EQ(tokenText(owner_after->etag), tokenText(owner_before->etag));
     EXPECT_FALSE((*raw_op).head(layout.mountKey("shard-01/replica-a"), Retry::once()).has_value());
     EXPECT_FALSE((*raw_op).head(layout.epochKey("shard-01/replica-a"), Retry::once()).has_value());
 }
@@ -2536,9 +2536,9 @@ TEST(CASRejoin, RefusesWhileDataOfTheOldLifeRemains)
     const auto control_objects = [&](Backend & backend)
     {
         OperationForTest op(backend);
-        std::vector<Etag> etags;
+        std::vector<String> etags;
         for (const String & key : {layout.ownerKey("victim"), layout.epochKey("victim"), layout.mountKey("victim")})
-            etags.push_back((*op).read(key, Retry::once())->etag);
+            etags.push_back(tokenText((*op).read(key, Retry::once())->etag));
         return etags;
     };
     for (const ServerRootLeftover leftover :
@@ -2583,7 +2583,7 @@ TEST(CASRejoin, RefusesWhileDataOfTheOldLifeRemains)
             case ServerRootLeftover::None:
                 FAIL();
         }
-        const std::vector<Etag> before = control_objects(*backend);
+        const std::vector<String> before = control_objects(*backend);
 
         try
         {
@@ -2836,7 +2836,7 @@ TEST(CASRejoin, DelayedLowerEpochClaimAfterRejoinIsRefused)
             expectThrowsCode(ErrorCodes::ABORTED, [&] { claimMount(*op, layout, "victim", victim_uuid, delayed_epoch, 1, 100, {}, {}, {}, old_life); });
         else
             EXPECT_EQ(claimMount(*op, layout, "victim", victim_uuid, delayed_epoch, 1, 100, {}, {}, {}, old_life).kind, MountClaimResult::ForeignOwner);
-        EXPECT_EQ((*op).read(layout.mountKey("victim"), Retry::once())->etag, before->etag);
+        EXPECT_EQ(tokenText((*op).read(layout.mountKey("victim"), Retry::once())->etag), tokenText(before->etag));
     }
 }
 

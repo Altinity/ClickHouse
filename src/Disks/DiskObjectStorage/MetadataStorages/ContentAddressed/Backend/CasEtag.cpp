@@ -1,11 +1,17 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h>
+#include <Common/Exception.h>
 #include <base/hex.h>
 
 #include <boost/algorithm/string/trim.hpp>
 
 #include <algorithm>
+
+namespace DB::ErrorCodes
+{
+extern const int LOGICAL_ERROR;
+}
 
 namespace DB::Cas
 {
@@ -146,10 +152,23 @@ bool sameIncarnation(const PersistedEtag & row, const Etag & live)
 
 bool sameVersion(const Etag & read, const Etag & written)
 {
-    if (read == written)
+    if (read.key() != written.key() || read.backendId() != written.backendId())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "sameVersion compares tokens of two objects: '{}' and '{}'",
+                        read.key(), written.key());
+    if (identicalToken(read, written))
         return true;
     const std::optional<CanonicalIdentity> identity = read.canonical();
     return identity && identity == written.canonical();
+}
+
+bool identicalToken(const Etag & a, const Etag & b)
+{
+    return a.backendId() == b.backendId() && a.key() == b.key() && a.dialect() == b.dialect() && a.value() == b.value();
+}
+
+bool identicalToken(const std::optional<Etag> & a, const std::optional<Etag> & b)
+{
+    return a && b ? identicalToken(*a, *b) : a.has_value() == b.has_value();
 }
 
 }

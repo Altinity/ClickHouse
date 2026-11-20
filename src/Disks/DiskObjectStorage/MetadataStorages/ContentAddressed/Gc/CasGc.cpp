@@ -4230,7 +4230,7 @@ void Gc::cleanupRefObjects(
             try
             {
                 const CasRefCatalog::Snapshot current_catalog = CasRefCatalog::read(op, layout);
-                catalog_etag_differs = current_catalog.etag != folded.catalog_cut->etag;
+                catalog_etag_differs = !identicalToken(current_catalog.etag, folded.catalog_cut->etag);
                 current_catalog.life_index.throwIfAmbiguous("CAS GC ref cleanup revalidation");
                 const auto current_entry_it = std::lower_bound(
                     current_catalog.catalog.entries.begin(), current_catalog.catalog.entries.end(), ns,

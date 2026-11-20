@@ -1095,8 +1095,8 @@ MountClaimResult claimMount(
     /// clean-marked, not (yet) proven-dead, not unsafe-authorized lease may simply be a live twin, and
     /// `expires_at_ms` alone can never distinguish that from a dead predecessor across two different
     /// clocks.
-    const bool proven_dead = proven_dead_incarnation && *proven_dead_incarnation == got->etag;
-    const bool unsafe_authorized = unsafe_reclaim_authorization && *unsafe_reclaim_authorization == got->etag;
+    const bool proven_dead = proven_dead_incarnation && identicalToken(*proven_dead_incarnation, got->etag);
+    const bool unsafe_authorized = unsafe_reclaim_authorization && identicalToken(*unsafe_reclaim_authorization, got->etag);
     if (existing.gc_fenced || clean_marker || proven_dead || unsafe_authorized)
     {
         const MountPriorState prior = existing.gc_fenced ? MountPriorState::Fenced
@@ -1290,7 +1290,7 @@ MountClaimResult claimMountAwaitingExpiry(
             r.body = decodeMountLease(got->bytes);
         }
 
-        if (!observed || *observed != *current_etag)
+        if (!observed || !identicalToken(*observed, *current_etag))
         {
             if (observed && ++restarts > kMaxObservationRestarts)
                 /// The incarnation kept changing across bounded restarts — the holder is genuinely alive
@@ -1400,13 +1400,13 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
                 /// raced against our own fence-out attempt) — (re)starts the observation window and
                 /// counts as `live` this call.
                 const auto it = obs.find(srid);
-                const bool stable = it != obs.end() && it->second.etag == observed->etag
+                const bool stable = it != obs.end() && identicalToken(it->second.etag, observed->etag)
                     && it->second.heldFor(threshold_ms, round_start_ms);
 
                 if (!stable)
                 {
                     /// A sample from before this read would count the walk to the slot as time watched.
-                    if (it == obs.end() || it->second.etag != observed->etag)
+                    if (it == obs.end() || !identicalToken(it->second.etag, observed->etag))
                         obs.insert_or_assign(srid, MountIncarnationObservation{observed->etag, mono_ms_fn()});
                     ++floor.live;
                     return std::nullopt;

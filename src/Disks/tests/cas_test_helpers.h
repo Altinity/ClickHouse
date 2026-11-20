@@ -89,6 +89,23 @@ namespace DB::ErrorCodes
     extern const int NOT_IMPLEMENTED;
 }
 
+namespace DB::Cas
+{
+
+/// A token's backend, key and transport text, for test assertions: two are equal exactly when `identicalToken` holds.
+/// In `DB::Cas` so that argument-dependent lookup finds it from any test.
+inline String tokenText(const Etag & token)
+{
+    return std::to_string(token.backendId()) + "|" + token.key() + "|" + token.render();
+}
+
+inline String tokenText(const std::optional<Etag> & token)
+{
+    return token ? tokenText(*token) : String("<absent>");
+}
+
+}
+
 namespace DB::Cas::tests
 {
 

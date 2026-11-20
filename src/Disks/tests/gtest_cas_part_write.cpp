@@ -422,7 +422,7 @@ TEST(CASPartWriteTxn, PutBlobDedupSecondWriterAdopts)
     /// A's incarnation survives — the second writer adopts, nothing was overwritten.
     const auto head_a_after = (*op).head(s->layout().blobKey(ref_a.ref), Retry::once());
     ASSERT_TRUE(head_a_after.has_value());
-    EXPECT_EQ(head_a_after->etag, token_a);
+    EXPECT_EQ(tokenText(head_a_after->etag), tokenText(token_a));
 }
 
 /// A pre-existing body whose incarnation has no intent is adopted: no re-upload, and the pre-seeded
@@ -461,7 +461,7 @@ TEST(CASPartWriteTxn, PutBlobAdoptsWhenNoIntentExists)
     /// Adopted: the pre-seeded incarnation survives untouched — no putOverwrite/re-upload happened.
     const auto head1 = (*op).head(blob_key, Retry::once());
     ASSERT_TRUE(head1.has_value());
-    EXPECT_EQ(head1->etag, t0);
+    EXPECT_EQ(tokenText(head1->etag), tokenText(t0));
 
 }
 
@@ -525,7 +525,7 @@ TEST(CASPartWriteTxn, PutBlobRepublishesWhenTheIntentIsPresent)
     /// Resurrected: the condemned incarnation was displaced by a fresh one.
     const auto hr = (*op).head(blob_key, Retry::once());
     ASSERT_TRUE(hr.has_value());
-    EXPECT_NE(hr->etag, t0) << "a condemned incarnation must be displaced by a fresh publication";
+    EXPECT_NE(tokenText(hr->etag), tokenText(t0)) << "a condemned incarnation must be displaced by a fresh publication";
     EXPECT_EQ((*op).remove(blob_key, t0, Retry::once()), Removal::Mismatch)
         << "the condemned token must never return (INV-NO-RETURN)";
 
@@ -708,7 +708,7 @@ TEST(CASPartWriteTxn, PutBlobRepublishesVanishedBodyFromHeldSource)
     OperationForTest op(*b);
     const auto hr = (*op).head(blob_key, Retry::once());
     ASSERT_TRUE(hr.has_value());
-    EXPECT_NE(hr->etag, *t0);
+    EXPECT_NE(tokenText(hr->etag), tokenText(*t0));
 
     auto raw = (*op).read(blob_key, Retry::once());
     ASSERT_TRUE(raw.has_value());
@@ -909,7 +909,7 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupPresentNeverGetsTheDyingObject)
     OperationForTest raw_op(*b);
     const auto hr = (*raw_op).head(blob_key, Retry::once());
     ASSERT_TRUE(hr.has_value());
-    EXPECT_NE(hr->etag, *t0) << "condemned incarnation must be displaced by a fresh token";
+    EXPECT_NE(tokenText(hr->etag), tokenText(*t0)) << "condemned incarnation must be displaced by a fresh token";
     const auto raw = (*raw_op).read(blob_key, Retry::once());
     ASSERT_TRUE(raw.has_value());
     const auto hdr = decodeEnvelopeHeader(raw->bytes, raw->bytes.size(), ObjectKind::Blob);
@@ -1142,7 +1142,7 @@ TEST(CASPartWriteTxn, MissingDependencyProofFailsClosed)
     /// The pool blob was never touched (no probe, no displacement).
     const auto head1 = (*op).head(blob_key, Retry::once());
     ASSERT_TRUE(head1.has_value());
-    EXPECT_EQ(head1->etag, t0);
+    EXPECT_EQ(tokenText(head1->etag), tokenText(t0));
 }
 
 TEST(CASPartWriteTxn, PromoteRevalidatesBlobPresenceFailClosed)
@@ -1364,7 +1364,7 @@ TEST(CASPartWriteTxn, PublishIntoSecondNamespaceSameBlob)
     /// The blob object was uploaded once: its token is unchanged after both publishes.
     const auto blob_head1 = (*op).head(blob_key, Retry::once());
     ASSERT_TRUE(blob_head1.has_value());
-    EXPECT_EQ(blob_head1->etag, blob_token);
+    EXPECT_EQ(tokenText(blob_head1->etag), tokenText(blob_token));
 }
 
 /// Task 10: refs are no longer sharded (one whole-table cache per namespace, spec §Table State), so
@@ -2961,7 +2961,7 @@ TEST(CASPartWriteTxnIntentRace, BodyDeletedAfterHeadStillMeetsItsIntent)
     OperationForTest op(*b);
     const auto head = (*op).head(blob_key, Retry::once());
     ASSERT_TRUE(head.has_value()) << "the writer's dependency names an absent body";
-    EXPECT_NE(head->etag, condemned_token);
+    EXPECT_NE(tokenText(head->etag), tokenText(condemned_token));
 
     /// GC's exact-token delete of the condemned incarnation, replayed late, misses the fresh body.
     EXPECT_EQ((*op).remove(blob_key, condemned_token, Retry::once()), Removal::Mismatch);

@@ -326,7 +326,7 @@ TEST(CASRefCatalogBirthWiring, RestartFixturePreservesItsExistingNonemptyCatalog
     const auto after = op.read(layout.refCatalogKey(), Retry::standard());
     ASSERT_TRUE(after);
     EXPECT_EQ(after->bytes, before->bytes);
-    EXPECT_EQ(after->etag, before->etag);
+    EXPECT_EQ(tokenText(after->etag), tokenText(before->etag));
 }
 
 /// A namespace whose catalog entry is ALREADY `Live` (e.g. admitted by an earlier mount that this
