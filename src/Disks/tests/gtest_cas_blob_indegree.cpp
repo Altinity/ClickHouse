@@ -466,6 +466,50 @@ TEST(CASThreeCursorMerge, PendingRowWithAnAbsentBodyGoesStandingWithNoRequest)
     EXPECT_TRUE(rmr.spared.empty());
 }
 
+/// A pending row at zero whose key this pass folded a record of is carried with no body delete, although its `HEAD`
+/// shows the row's token: an unmatched removal alone, or an addition and its removal.
+TEST(CASThreeCursorMerge, PendingRowAtATouchedZeroIsCarried)
+{
+    const std::vector<std::vector<BlobDelta>> windows{
+        {{bh(1), s(99), true}},
+        {{bh(1), s(7), false}, {bh(1), s(7), true}}};
+    for (const auto & window : windows)
+    {
+        SCOPED_TRACE(window.size() == 1 ? "unmatched removal" : "addition and its removal");
+        InMemoryBackend backend;
+        DB::Cas::tests::OperationForTest backend_req(backend);
+        Layout layout{"pool"};
+        (*backend_req).create(layout.blobKey(bh(1)), "body", Retry::standard());
+        const Meta body = *(*backend_req).head(layout.blobKey(bh(1)), Retry::standard());
+        CondemnedRow pending = condemnedRowFor(1, "", /*delete_pending*/true);
+        pending.token = PersistedEtag::capture(body.etag);
+        const RunRef gen1 = writeSourceEdgeRun(backend, layout, /*gen*/1, 0, 0, {{b(1), pending}});
+        size_t heads = 0;
+        const BlobHeadFn present = [&](const BlobRef & ref)
+        {
+            ++heads;
+            return (*backend_req).head(layout.blobKey(ref), Retry::standard());
+        };
+
+        std::vector<RunRef> runs2;
+        RetiredMergeResult rmr;
+        foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, 2, 0, 0, window, runs2,
+            /*current_round*/9, /*condemn_round*/9, /*head_blob*/{}, /*peek_head*/present, /*create_intent*/{}, &rmr,
+            /*suppress_destructive*/false, /*out_applied_by_txn_ordinal*/nullptr, /*source_retirements*/{},
+            /*work_budget*/nullptr, /*pending_hints*/nullptr, present);
+
+        EXPECT_EQ(heads, 1u) << "positive control: the decision HEAD was sent";
+        EXPECT_EQ(rmr.unmatched_removes, window.size() == 1 ? 1u : 0u);
+        EXPECT_TRUE(rmr.body_deletes.empty());
+        EXPECT_TRUE(rmr.intent_deletes.empty());
+        EXPECT_TRUE(rmr.spared.empty());
+        ASSERT_EQ(rmr.still_retired.size(), 1u);
+        EXPECT_TRUE(rmr.still_retired[0].delete_pending);
+        EXPECT_FALSE(rmr.still_retired[0].standing);
+        EXPECT_EQ(rmr.still_retired[0].token.canonical(), body.etag.canonical());
+    }
+}
+
 TEST(CASThreeCursorMerge, StandingRowAtZeroDeletesItsIntentAndLeavesTheRun)
 {
     InMemoryBackend backend;

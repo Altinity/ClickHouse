@@ -294,8 +294,9 @@ Expected expected(const Cell & c)
         case RowState::Pending:
             if (!destruction_allowed || !c.redelete_budget)
                 return {Carry};
+            /// A record of the blob in the round's window may be a reference another namespace's cut missed.
             if (c.head == HeadKind::Same)
-                return {DeleteBody};
+                return {c.touched ? Carry : DeleteBody};
             if (c.head == HeadKind::Absent)
                 return {Standing};
             return {Carry};   /// a token with no identity never shows that the body is gone
@@ -379,7 +380,8 @@ size_t forEachCell(const Observations & o, Visit && visit)
 constexpr size_t kProductCells = (1 + (kRowStates.size() - 1) * 2) * 2 * 2 * 2 * kHeadKinds.size() * 2 * 2 * 2;
 
 /// The cell counts, derived from the dimensions and from which `HEAD` each row state requires, not from `forEachCell`,
-/// `reachable` or `headIsRequired`: a change to the rules has to be argued with this arithmetic.
+/// `reachable` or `headIsRequired`: a change to the rules has to be argued with this arithmetic. The carry of a
+/// touched pending row changes a step, not a required `HEAD`, so it moves no count here.
 struct CellCounts
 {
     size_t reachable = 0;
@@ -517,12 +519,12 @@ TEST(CASIntentRules, EveryReachableCellFollowsTheSpec)
         if (got.new_token && input.head && input.head->observed())
             EXPECT_EQ(got.new_token->value, PersistedEtag::capture(input.head->observed()->etag).value) << where;
 
-        /// The body delete: only a pending row with a canonical token, at an unsuppressed zero cut, within the
-        /// redelete budget, whose HEAD shows its own token.
+        /// The body delete: only a pending row with a canonical token, at an unsuppressed zero cut that folded no
+        /// record of the blob, within the redelete budget, whose HEAD shows its own token.
         if (got.step == IntentStep::DeleteBody)
         {
             ++body_deletes;
-            EXPECT_TRUE(c.row == RowState::Pending && c.canonical_token && c.zero && !c.suppressed
+            EXPECT_TRUE(c.row == RowState::Pending && c.canonical_token && c.zero && !c.touched && !c.suppressed
                         && c.redelete_budget && c.head == HeadKind::Same)
                 << where;
         }
@@ -560,7 +562,8 @@ TEST(CASIntentRules, EveryReachableCellFollowsTheSpec)
         << "transitions of untouched rows whose intent stays without the HEAD";
     EXPECT_EQ(unbuildable, want.unbuildable) << "Same is built only for a canonical row token";
     EXPECT_GT(heads_required, 0u) << "positive control";
-    EXPECT_GT(body_deletes, 0u) << "positive control";
+    /// Every dimension of a body delete is fixed but the create budget.
+    EXPECT_EQ(body_deletes, 2u) << "a body delete of a pending row at an untouched zero, HEAD showing its own token";
     EXPECT_GT(intent_deletes, 0u) << "positive control";
     /// Pending and standing, each over (touched) x (create budget) x (redelete budget).
     EXPECT_EQ(spare_deletes, 2u * 2 * 2 * 2) << "a spare whose HEAD shows another incarnation";
@@ -743,6 +746,31 @@ TEST(CASIntentRules, SpareDeletesTheIntentOnlyOverAnotherIncarnation)
                 EXPECT_FALSE(got.intent_to_delete.has_value()) << where << ", HEAD " << name(kept);
             }
         }
+}
+
+/// A pending row at an unsuppressed zero whose `HEAD` shows its own token deletes the body only when the round
+/// folded no record of the blob; a touched key is carried. The intent removal of a standing row needs no such proof.
+TEST(CASIntentRules, PendingRowAtATouchedZeroIsCarried)
+{
+    const Observations o = Observations::make();
+    const Cell touched{.row = RowState::Pending, .touched = true, .head = HeadKind::Same};
+    EXPECT_EQ(decisionHeadNeed(inputOf(touched, o).value()), DecisionHeadNeed::TouchedKey);
+    const IntentDecision carried = decide(touched, o);
+    EXPECT_EQ(carried.step, IntentStep::Carry) << name(carried.step);
+    EXPECT_FALSE(carried.intent_to_delete.has_value());
+    EXPECT_FALSE(carried.intent_to_create.has_value());
+    EXPECT_FALSE(carried.new_token.has_value());
+
+    Cell untouched = touched;
+    untouched.touched = false;
+    EXPECT_EQ(decisionHeadNeed(inputOf(untouched, o).value()), DecisionHeadNeed::PendingBody);
+    const IntentDecision deletes = decide(untouched, o);
+    EXPECT_EQ(deletes.step, IntentStep::DeleteBody) << name(deletes.step);
+    EXPECT_FALSE(deletes.intent_to_delete.has_value());
+
+    const IntentDecision removes = decide(Cell{.row = RowState::Standing, .touched = true, .head = HeadKind::Absent}, o);
+    EXPECT_EQ(removes.step, IntentStep::DeleteIntent) << name(removes.step);
+    EXPECT_EQ(removes.intent_to_delete, o.canonical_row_token.canonical());
 }
 
 /// No spare `HEAD` for a row that holds no confirmed intent of a canonical token, or in a suppressed round. A

@@ -938,7 +938,8 @@ TEST(CASGcIntents, PendingHeadReadAheadKeepsAtMostAWindowOutstanding)
 TEST(CASGcIntents, TouchedPendingRowSpendsOneRedeleteSlot)
 {
     /// A, T, B, C in run order, a budget of three. T is referenced and released within one window: touched, at
-    /// zero, and decided inline, so the read-ahead must not hand its slot to C.
+    /// zero, and decided inline. Its body is gone, so it goes `standing` and spends a slot the read-ahead must not
+    /// hand to C.
     const std::vector<uint64_t> rows = inRunOrder({1, 2, 3, 4});
     std::vector<std::map<String, size_t>> heads_per_setting;
     for (const uint64_t concurrency : {uint64_t{1}, uint64_t{4}})
@@ -947,6 +948,10 @@ TEST(CASGcIntents, TouchedPendingRowSpendsOneRedeleteSlot)
         auto pool = makePool({.redelete_budget = 3, .io_concurrency = concurrency});
         ASSERT_NO_FATAL_FAILURE(pool.makePending(rows));
         pool.touch({rows[1]});
+        {
+            OperationForTest op(*pool.backend);
+            ASSERT_EQ((*op).remove(pool.bodyKey(rows[1]), pool.bodyMeta(rows[1])->etag, Retry::standard()), Removal::Removed);
+        }
         pool.backend->clearJournal();
 
         const RoundReport report = pool.round();
@@ -959,8 +964,43 @@ TEST(CASGcIntents, TouchedPendingRowSpendsOneRedeleteSlot)
         EXPECT_EQ(heads[pool.bodyKey(rows[1])], 1u) << "T";
         EXPECT_EQ(heads[pool.bodyKey(rows[2])], 1u) << "B";
         EXPECT_EQ(heads[pool.bodyKey(rows[3])], 0u) << "C is over the budget";
-        EXPECT_EQ(report.bodies_deleted, 3u);
+        EXPECT_EQ(report.bodies_deleted, 2u);
+        EXPECT_TRUE(pool.row(rows[1]) && pool.row(rows[1])->standing);
         EXPECT_TRUE(pool.row(rows[3]) && pool.row(rows[3])->delete_pending && !pool.row(rows[3])->standing);
+        heads_per_setting.push_back(heads);
+    }
+    EXPECT_EQ(heads_per_setting[0], heads_per_setting[1]);
+}
+
+TEST(CASGcIntents, CarriedTouchedPendingRowSpendsNoRedeleteSlot)
+{
+    /// A, T, B, C in run order, a budget of three, T touched at zero with its body in place: T is carried and spends
+    /// no slot, so C takes the third.
+    const std::vector<uint64_t> rows = inRunOrder({1, 2, 3, 4});
+    std::vector<std::map<String, size_t>> heads_per_setting;
+    for (const uint64_t concurrency : {uint64_t{1}, uint64_t{4}})
+    {
+        SCOPED_TRACE(concurrency);
+        auto pool = makePool({.redelete_budget = 3, .io_concurrency = concurrency});
+        ASSERT_NO_FATAL_FAILURE(pool.makePending(rows));
+        const PersistedEtag t = pool.row(rows[1])->token;
+        pool.touch({rows[1]});
+        pool.backend->clearJournal();
+
+        const RoundReport report = pool.round();
+
+        const auto requests = blobRequests(pool.backend->journal());
+        std::map<String, size_t> heads;
+        for (uint64_t b : rows)
+            heads[pool.bodyKey(b)] = countOf(requests, JournalVerb::Head, pool.bodyKey(b));
+        for (uint64_t b : rows)
+            EXPECT_EQ(heads[pool.bodyKey(b)], 1u) << "blob " << b;
+        EXPECT_EQ(countOf(requests, JournalVerb::Remove, pool.bodyKey(rows[1])), 0u) << "T";
+        EXPECT_EQ(report.bodies_deleted, 3u);
+        ASSERT_TRUE(pool.row(rows[1]).has_value());
+        EXPECT_TRUE(pool.row(rows[1])->delete_pending && !pool.row(rows[1])->standing);
+        EXPECT_EQ(pool.row(rows[1])->token.canonical(), t.canonical());
+        EXPECT_TRUE(pool.row(rows[3]) && pool.row(rows[3])->standing) << "C";
         heads_per_setting.push_back(heads);
     }
     EXPECT_EQ(heads_per_setting[0], heads_per_setting[1]);
@@ -3440,4 +3480,597 @@ TEST(CASGcIntents, WriterAdoptingAfterASpareDeleteKeepsItsBody)
     const FsckReport dropped = runFsck(*pool.store, /*detail=*/true);
     EXPECT_EQ(dropped.dangling, 0u) << formatFsckSummary(dropped);
     EXPECT_TRUE(dropped.clean()) << formatFsckSummary(dropped);
+}
+
+/// ---- No-bytes copies that a round's cut misses ----
+
+namespace
+{
+
+/// Runs a hook once, after the store answered a ref-log read under `prefix` with absence: the round has
+/// just proved that namespace's frontier. No backend lock is held while the hook runs.
+class FrontierHookBackend : public HeadHookBackend
+{
+public:
+    void armOnAbsentLogRead(const String & prefix, std::function<void()> hook)
+    {
+        std::lock_guard lock(frontier_mutex);
+        frontier_prefix = prefix;
+        on_frontier = std::move(hook);
+    }
+
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        auto got = HeadHookBackend::read(key, access);
+        std::function<void()> fire;
+        {
+            std::lock_guard lock(frontier_mutex);
+            if (!got && on_frontier && key.starts_with(frontier_prefix) && key.find("/_log/") != String::npos)
+                fire = std::exchange(on_frontier, {});
+        }
+        if (fire)
+            fire();
+        return got;
+    }
+
+private:
+    std::mutex frontier_mutex;
+    String frontier_prefix;
+    std::function<void()> on_frontier;
+};
+
+/// The stream prefix (`.../cas/ns/stream/<life>/`) of the first ref log written since the journal was cleared.
+String firstWrittenStreamPrefix(const CountingBackend & backend)
+{
+    for (const JournalEntry & entry : backend.journal())
+        if (entry.verb == JournalVerb::Write)
+            for (const String & key : entry.keys)
+                if (const size_t log = key.find("/_log/"); log != String::npos && key.find("/cas/ns/stream/") != String::npos)
+                    return key.substr(0, log + 1);
+    return {};
+}
+
+/// The `createHardLink` / relink path: a part in `ns` that names `payload`'s blob, with no request on the body.
+void copyWithoutBytes(const PoolPtr & store, const String & ns, const String & ref_name, const String & payload)
+{
+    const RootNamespace root{ns};
+    PartWriteInfo info;
+    info.intended_ref = ns + "/" + ref_name;
+    auto build = store->beginPartWrite(info);
+    ManifestEntry entry;
+    entry.path = "data.bin";
+    entry.placement = EntryPlacement::Blob;
+    entry.ref = idOf(payload);
+    entry.blob_size = payload.size();
+    build->adoptEvidence(entry);
+    const ManifestId id = build->stageManifest({entry});
+    build->precommitAdd(root, ref_name, id);
+    build->promote(root, ref_name, build->buildId(), id);
+}
+
+/// The round that ran after journal entry `from` decided the blob and destroyed nothing a committed part names:
+/// it sent its decision `HEAD` and no body `DELETE`, the body is stored and fsck finds no dangling reference.
+void expectBodyKept(CountingBackend & backend, Pool & store, const String & body_key, size_t from,
+                    const RoundReport & round)
+{
+    const auto journal = backend.journal();
+    const auto requests = blobRequests(std::vector<JournalEntry>(journal.begin() + from, journal.end()));
+    EXPECT_GT(countOf(requests, JournalVerb::Head, body_key), 0u) << "positive control: the round sent its decision HEAD";
+    EXPECT_EQ(countOf(requests, JournalVerb::Remove, body_key) + countOf(requests, JournalVerb::RemoveMany, body_key), 0u)
+        << "the round sent a body DELETE; deleted=" << round.deleted;
+    OperationForTest op(backend);
+    EXPECT_TRUE((*op).read(body_key, Retry::standard()).has_value())
+        << "the round deleted the body that a committed part names; deleted=" << round.deleted;
+    const FsckReport report = runFsck(store, /*detail=*/true);
+    EXPECT_EQ(report.dangling, 0u) << formatFsckSummary(report);
+}
+
+/// A carried row is the `pending` row of `token`, unchanged; a positive cut drops the row.
+void expectRowOutcome(const std::optional<RetiredEntry> & row, bool carried, const PersistedEtag & token)
+{
+    if (!carried)
+    {
+        EXPECT_FALSE(row.has_value()) << "the cut was positive, so the spare drops the row";
+        return;
+    }
+    ASSERT_TRUE(row.has_value()) << "the round dropped the pending row";
+    EXPECT_TRUE(row->delete_pending && !row->standing) << "the row is not pending; standing=" << row->standing;
+    EXPECT_EQ(row->token.canonical(), token.canonical()) << "the carried row changed its token";
+}
+
+struct CrossNamespaceOrder
+{
+    /// The destination's namespace sorts first, so pass 1 proves its frontier before it reads the source.
+    /// Otherwise the source sorts first and the source's records past one read window are read in pass 2.
+    bool destination_first;
+    /// The control: the copy and the drop land before round 2 starts, so its cut holds both.
+    bool before_the_round = false;
+    /// The control: the copy and the drop land at the probe that proves the source's frontier, so the cut holds the
+    /// source's edge.
+    bool source_read_first = false;
+};
+
+String crossNamespaceOrderName(const ::testing::TestParamInfo<CrossNamespaceOrder> & param_info)
+{
+    if (param_info.param.before_the_round)
+        return "BeforeTheRound";
+    if (param_info.param.source_read_first)
+        return "SourceReadBeforeTheDrop";
+    return param_info.param.destination_first ? "DestinationFirst" : "SourceFirst";
+}
+
+const auto kCrossNamespaceOrders = ::testing::Values(
+    CrossNamespaceOrder{.destination_first = true}, CrossNamespaceOrder{.destination_first = false},
+    CrossNamespaceOrder{.destination_first = true, .before_the_round = true},
+    CrossNamespaceOrder{.destination_first = true, .source_read_first = true});
+
+class CASGcIntentsCrossNamespace : public ::testing::TestWithParam<CrossNamespaceOrder>
+{
+};
+
+class CASGcIntentsTransitionSource : public ::testing::TestWithParam<CrossNamespaceOrder>
+{
+};
+
+}
+
+/// Round 1 misses the edge of writer `W`, which adopts body `t`, and commits `pending(t)`. In round 2, after the
+/// round proved the frontier of namespace `L` and before it reads the rest of `W`'s namespace, `L` copies `W`'s
+/// entry with no request on the body while `W`'s edge is live, and then `W`'s part is dropped. The body must
+/// survive: `L` names it.
+TEST_P(CASGcIntentsCrossNamespace, NoBytesCopyBetweenTwoFrontiersKeepsTheBody)
+{
+    auto backend = std::make_shared<FrontierHookBackend>();
+    PoolConfig config{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0, .gc_io_concurrency = 1};
+    auto store = Pool::open(backend, std::move(config));
+    const Layout & layout = store->layout();
+    const bool destination_first = GetParam().destination_first;
+    const bool before_the_round = GetParam().before_the_round;
+    const bool source_read_first = GetParam().source_read_first;
+    const String ns_w = destination_first ? "test/b_source" : "test/a_source";
+    const String ns_l = destination_first ? "test/a_copy" : "test/b_copy";
+    const String payload = "cross-namespace-no-bytes-copy";
+    const BlobRef x = idOf(payload);
+    const String body_key = layout.blobKey(x);
+    const auto row = [&] { return retiredEntryFor(*backend, layout, x); };
+    Gc gc(store, kGateLeaderA);
+
+    backend->clearJournal();
+    ASSERT_EQ(writeOnePart(store, ns_l, "seed", "an unrelated part of the copy's table"), BlobMaterializationAction::Published);
+    const String ns_l_stream = firstWrittenStreamPrefix(*backend);
+    ASSERT_FALSE(ns_l_stream.empty());
+
+    backend->clearJournal();
+    ASSERT_EQ(writeOnePart(store, ns_w, "p0", payload), BlobMaterializationAction::Published);
+    const String ns_w_stream = firstWrittenStreamPrefix(*backend);
+    ASSERT_FALSE(ns_w_stream.empty());
+    runGateRound(store, gc);
+    store->dropRef(RootNamespace{ns_w}, "p0");
+    store->renewWatermarkOnce();
+
+    /// Round 1. `W` writes at the decision `HEAD`, after the cut: its edge is missed, it adopts `t` before the
+    /// intent exists, and the round commits `pending(t)`.
+    std::optional<BlobMaterializationAction> w;
+    backend->armOnHead(body_key, [&] { w = writeOnePart(store, ns_w, "w", payload); });
+    runGateRound(store, gc);
+    ASSERT_EQ(w, BlobMaterializationAction::Observed) << "W did not adopt the stored body";
+    ASSERT_TRUE(row() && row()->delete_pending && !row()->standing) << "round 1 did not commit pending(t)";
+    const PersistedEtag t = row()->token;
+
+    /// Round 2. At the absent probe that proves `L`'s frontier: the copy, then the drop of `W`'s part.
+    bool copied = false;
+    size_t copy_begin = 0;
+    size_t copy_end = 0;
+    const auto copy_then_drop = [&]
+    {
+        copy_begin = backend->journal().size();
+        copyWithoutBytes(store, ns_l, "copy", payload);
+        copy_end = backend->journal().size();
+        store->dropRef(RootNamespace{ns_w}, "w");
+        copied = true;
+    };
+    if (before_the_round)
+        copy_then_drop();
+    else
+        backend->armOnAbsentLogRead(source_read_first ? ns_w_stream : ns_l_stream, copy_then_drop);
+    const size_t round_begin = backend->journal().size();
+    const RoundReport round2 = runGateRound(store, gc);
+    ASSERT_TRUE(copied) << "the round never proved the hooked frontier";
+
+    const auto journal = backend->journal();
+    for (size_t i = copy_begin; i < copy_end; ++i)
+        for (const String & key : journal[i].keys)
+            EXPECT_TRUE(key.find(body_key) == String::npos && key.find("/blob-intents/") == String::npos)
+                << "the copy sent a request on the body or an intent: " << key;
+
+    expectBodyKept(*backend, *store, body_key, round_begin, round2);
+    /// Between the frontiers the cut shows zero with `W`'s records folded; the controls show `L`'s or `W`'s edge.
+    expectRowOutcome(row(), /*carried=*/!before_the_round && !source_read_first, t);
+}
+
+INSTANTIATE_TEST_SUITE_P(CASOrder, CASGcIntentsCrossNamespace, kCrossNamespaceOrders, crossNamespaceOrderName);
+
+namespace
+{
+
+struct NewbornCase
+{
+    /// The destination namespace does not exist at the round's catalog read; otherwise it exists and sorts after
+    /// the source, so the walk reads it after the copy.
+    bool newborn;
+};
+
+class CASGcIntentsNewbornCopy : public ::testing::TestWithParam<NewbornCase>
+{
+};
+
+}
+
+/// Round 1 commits `pending(t)` while writer `W` adopts `t` after the cut. Round 2, right after its catalog read:
+/// a no-bytes copy of `W`'s part into namespace `L`, then the drop of `W`'s part. When `L` is born by that copy,
+/// round 2 does not walk it; the copy's source is walked.
+TEST_P(CASGcIntentsNewbornCopy, NoBytesCopyIntoANamespaceBornAfterTheCatalogReadKeepsTheBody)
+{
+    auto backend = std::make_shared<HeadHookBackend>();
+    PoolConfig config{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0, .gc_io_concurrency = 1};
+    auto store = Pool::open(backend, std::move(config));
+    const Layout & layout = store->layout();
+    const bool newborn = GetParam().newborn;
+    const String ns_w = "test/b_source";
+    const String ns_l = newborn ? "test/z_newborn" : "test/z_copy";
+    const String payload = "newborn-namespace-no-bytes-copy";
+    const BlobRef x = idOf(payload);
+    const String body_key = layout.blobKey(x);
+    const auto row = [&] { return retiredEntryFor(*backend, layout, x); };
+    Gc gc(store, kGateLeaderA);
+
+    if (!newborn)
+        ASSERT_EQ(writeOnePart(store, ns_l, "seed", "an unrelated part of the copy's table"), BlobMaterializationAction::Published);
+    ASSERT_EQ(writeOnePart(store, ns_w, "p0", payload), BlobMaterializationAction::Published);
+    runGateRound(store, gc);
+    store->dropRef(RootNamespace{ns_w}, "p0");
+    store->renewWatermarkOnce();
+
+    std::optional<BlobMaterializationAction> w;
+    backend->armOnHead(body_key, [&] { w = writeOnePart(store, ns_w, "w", payload); });
+    runGateRound(store, gc);
+    ASSERT_EQ(w, BlobMaterializationAction::Observed) << "W did not adopt the stored body";
+    ASSERT_TRUE(row() && row()->delete_pending && !row()->standing) << "round 1 did not commit pending(t)";
+    const PersistedEtag t = row()->token;
+
+    bool fired = false;
+    gc.setPostHotScanCatalogReadHookForTest([&]
+    {
+        copyWithoutBytes(store, ns_l, "copy", payload);
+        store->dropRef(RootNamespace{ns_w}, "w");
+        fired = true;
+    });
+    const size_t round_begin = backend->journal().size();
+    const RoundReport round2 = runGateRound(store, gc);
+    ASSERT_TRUE(fired) << "the catalog-read hook never fired";
+
+    expectBodyKept(*backend, *store, body_key, round_begin, round2);
+    /// The newborn namespace is not walked, so the cut shows zero; the existing one is walked after the copy.
+    expectRowOutcome(row(), /*carried=*/newborn, t);
+}
+
+INSTANTIATE_TEST_SUITE_P(CASCatalog, CASGcIntentsNewbornCopy,
+    ::testing::Values(NewbornCase{.newborn = true}, NewbornCase{.newborn = false}),
+    [](const ::testing::TestParamInfo<NewbornCase> & param_info)
+    {
+        return param_info.param.newborn ? std::string("Newborn") : std::string("ExistingReadAfterTheCopy");
+    });
+
+/// The `pending` row with a live reference comes from the ordinary reuse after condemnation: in round 2 writer `Y`
+/// meets `I(B,t)` after the cut and publishes `u`; the decision `HEAD` shows `u`, so the transition commits
+/// `pending(u)` although `Y`'s edge is not in the cut. In round 3, after the round proved `L`'s frontier, a no-bytes
+/// copy of `Y`'s part into `L` and the drop of `Y`'s part.
+TEST_P(CASGcIntentsTransitionSource, NoBytesCopyOfARepublishedBodyBetweenTwoFrontiersKeepsTheBody)
+{
+    auto backend = std::make_shared<FrontierHookBackend>();
+    PoolConfig config{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0, .gc_io_concurrency = 1};
+    auto store = Pool::open(backend, std::move(config));
+    const Layout & layout = store->layout();
+    const bool destination_first = GetParam().destination_first;
+    const bool before_the_round = GetParam().before_the_round;
+    const bool source_read_first = GetParam().source_read_first;
+    const String ns_w = destination_first ? "test/b_source" : "test/a_source";
+    const String ns_l = destination_first ? "test/a_copy" : "test/b_copy";
+    const String payload = "transition-source-no-bytes-copy";
+    const BlobRef x = idOf(payload);
+    const String body_key = layout.blobKey(x);
+    const auto row = [&] { return retiredEntryFor(*backend, layout, x); };
+    Gc gc(store, kGateLeaderA);
+
+    backend->clearJournal();
+    ASSERT_EQ(writeOnePart(store, ns_l, "seed", "an unrelated part of the copy's table"), BlobMaterializationAction::Published);
+    const String ns_l_stream = firstWrittenStreamPrefix(*backend);
+    ASSERT_FALSE(ns_l_stream.empty());
+
+    backend->clearJournal();
+    ASSERT_EQ(writeOnePart(store, ns_w, "p0", payload), BlobMaterializationAction::Published);
+    const String ns_w_stream = firstWrittenStreamPrefix(*backend);
+    ASSERT_FALSE(ns_w_stream.empty());
+    runGateRound(store, gc);
+    store->dropRef(RootNamespace{ns_w}, "p0");
+    store->renewWatermarkOnce();
+
+    runGateRound(store, gc);
+    ASSERT_TRUE(row() && row()->delete_pending && !row()->standing) << "round 1 did not commit pending(t)";
+    const PersistedEtag t = row()->token;
+
+    std::optional<BlobMaterializationAction> y;
+    backend->armOnHead(body_key, [&] { y = writeOnePart(store, ns_w, "y", payload); });
+    runGateRound(store, gc);
+    ASSERT_EQ(y, BlobMaterializationAction::Published) << "Y did not republish after meeting the intent";
+    ASSERT_TRUE(row() && row()->delete_pending && !row()->standing) << "round 2 did not commit pending(u)";
+    const PersistedEtag u = row()->token;
+    ASSERT_NE(u.canonical(), t.canonical()) << "round 2 did not move the row to Y's incarnation";
+
+    bool copied = false;
+    const auto copy_then_drop = [&]
+    {
+        copyWithoutBytes(store, ns_l, "copy", payload);
+        store->dropRef(RootNamespace{ns_w}, "y");
+        copied = true;
+    };
+    if (before_the_round)
+        copy_then_drop();
+    else
+        backend->armOnAbsentLogRead(source_read_first ? ns_w_stream : ns_l_stream, copy_then_drop);
+    const size_t round_begin = backend->journal().size();
+    const RoundReport round3 = runGateRound(store, gc);
+    ASSERT_TRUE(copied) << "the round never proved the hooked frontier";
+
+    expectBodyKept(*backend, *store, body_key, round_begin, round3);
+    expectRowOutcome(row(), /*carried=*/!before_the_round && !source_read_first, u);
+}
+
+INSTANTIATE_TEST_SUITE_P(CASOrder, CASGcIntentsTransitionSource, kCrossNamespaceOrders, crossNamespaceOrderName);
+
+/// ---- A pending row whose blob the round touched is carried ----
+
+namespace
+{
+
+/// The pool of the no-bytes copy tests: writer `w` in `ns_w` holds body `t` under `pending(t)`, because round 1
+/// missed its edge. Every namespace in `copy_namespaces` has an unrelated seed part, so each round walks it.
+class MissedWriterPool
+{
+public:
+    MissedWriterPool(const String & ns_w_, const std::vector<String> & copy_namespaces, const String & payload_,
+                     uint64_t gc_shards = 1)
+        : ns_w(ns_w_), payload(payload_), x(idOf(payload_))
+    {
+        PoolConfig config{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0, .gc_io_concurrency = 1};
+        config.gc_shards = gc_shards;
+        store = Pool::open(backend, std::move(config));
+        body_key = store->layout().blobKey(x);
+        gc = std::make_unique<Gc>(store, kGateLeaderA);
+        for (const String & ns : copy_namespaces)
+        {
+            backend->clearJournal();
+            EXPECT_EQ(writeOnePart(store, ns, "seed", "an unrelated part of " + ns), BlobMaterializationAction::Published);
+            streams[ns] = firstWrittenStreamPrefix(*backend);
+            EXPECT_FALSE(streams[ns].empty()) << ns;
+        }
+    }
+
+    /// Ends with `pending(t)` while `w` names `t`.
+    void commitPendingUnderAMissedWriter()
+    {
+        backend->clearJournal();
+        ASSERT_EQ(writeOnePart(store, ns_w, "p0", payload), BlobMaterializationAction::Published);
+        streams[ns_w] = firstWrittenStreamPrefix(*backend);
+        ASSERT_FALSE(streams[ns_w].empty());
+        runGateRound(store, *gc);
+        store->dropRef(RootNamespace{ns_w}, "p0");
+        store->renewWatermarkOnce();
+
+        std::optional<BlobMaterializationAction> w;
+        backend->armOnHead(body_key, [&] { w = writeOnePart(store, ns_w, "w", payload); });
+        runGateRound(store, *gc);
+        ASSERT_EQ(w, BlobMaterializationAction::Observed) << "W did not adopt the stored body";
+        ASSERT_TRUE(row() && row()->delete_pending && !row()->standing) << "round 1 did not commit pending(t)";
+        t = row()->token;
+    }
+
+    /// One round; at the absent probe that proves `frontier_ns`'s frontier, `copy_ns` gets a no-bytes copy named
+    /// `copy_ref` and `drop_ns`'s part `drop_ref` is dropped. Expects the body kept by that round.
+    RoundReport relayRound(const String & frontier_ns, const String & copy_ns, const String & copy_ref,
+                           const String & drop_ns, const String & drop_ref)
+    {
+        bool copied = false;
+        backend->armOnAbsentLogRead(streams.at(frontier_ns), [&]
+        {
+            copyWithoutBytes(store, copy_ns, copy_ref, payload);
+            store->dropRef(RootNamespace{drop_ns}, drop_ref);
+            copied = true;
+        });
+        const size_t from = backend->journal().size();
+        const RoundReport report = runGateRound(store, *gc);
+        EXPECT_TRUE(copied) << "the round never proved the frontier of " << frontier_ns;
+        expectBodyKept(*backend, *store, body_key, from, report);
+        return report;
+    }
+
+    std::optional<RetiredEntry> row() const
+    {
+        const uint64_t shards = store->poolMeta().gc_shards;
+        for (const RetiredEntry & entry : currentRetiredSet(*backend, store->layout(), blobShard(x, shards)))
+            if (entry.ref == x)
+                return entry;
+        return std::nullopt;
+    }
+
+    bool bodyStored() const
+    {
+        OperationForTest op(*backend);
+        return (*op).read(body_key, Retry::standard()).has_value();
+    }
+
+    std::shared_ptr<FrontierHookBackend> backend = std::make_shared<FrontierHookBackend>();
+    PoolPtr store;
+    std::unique_ptr<Gc> gc;
+    const String ns_w;
+    const String payload;
+    const BlobRef x;
+    String body_key;
+    std::map<String, String> streams;
+    PersistedEtag t;
+};
+
+
+}
+
+/// A relay over three namespaces: in each round the copy lands behind the frontier of the next namespace and its
+/// source is dropped. The body survives every round, and the last copy keeps it in a quiet round.
+TEST(CASGcIntentsRelay, ThreeNamespaceRelayKeepsTheBody)
+{
+    MissedWriterPool pool("test/c_source", {"test/a_last", "test/b_middle"}, "three-namespace-relay");
+    ASSERT_NO_FATAL_FAILURE(pool.commitPendingUnderAMissedWriter());
+
+    pool.relayRound("test/b_middle", "test/b_middle", "copy", "test/c_source", "w");
+    expectRowOutcome(pool.row(), /*carried=*/true, pool.t);
+    pool.relayRound("test/a_last", "test/a_last", "copy", "test/b_middle", "copy");
+    expectRowOutcome(pool.row(), /*carried=*/true, pool.t);
+
+    const size_t from = pool.backend->journal().size();
+    const RoundReport quiet = runGateRound(pool.store, *pool.gc);
+    expectBodyKept(*pool.backend, *pool.store, pool.body_key, from, quiet);
+    expectRowOutcome(pool.row(), /*carried=*/false, pool.t);
+}
+
+/// A relay over two namespaces whose second copy goes back into the first: the source sorts first, so the first
+/// copy lands behind the destination's frontier while the source's records past one read window wait for pass 2.
+TEST(CASGcIntentsRelay, TwoNamespaceRelayThatCopiesBackKeepsTheBody)
+{
+    MissedWriterPool pool("test/a_source", {"test/b_copy"}, "two-namespace-relay-back");
+    ASSERT_NO_FATAL_FAILURE(pool.commitPendingUnderAMissedWriter());
+
+    pool.relayRound("test/b_copy", "test/b_copy", "copy", "test/a_source", "w");
+    expectRowOutcome(pool.row(), /*carried=*/true, pool.t);
+
+    /// The source namespace now sorts first as the destination of the back copy.
+    pool.relayRound("test/a_source", "test/a_source", "back", "test/b_copy", "copy");
+    expectRowOutcome(pool.row(), /*carried=*/true, pool.t);
+
+    const size_t from = pool.backend->journal().size();
+    const RoundReport quiet = runGateRound(pool.store, *pool.gc);
+    expectBodyKept(*pool.backend, *pool.store, pool.body_key, from, quiet);
+    expectRowOutcome(pool.row(), /*carried=*/false, pool.t);
+}
+
+/// After the copy of the cross-namespace case, the destination part keeps the body: a quiet round sees its edge,
+/// spares the blob and drops the row. Once the destination is dropped the body is reclaimed.
+TEST(CASGcIntentsRelay, DestinationPartKeepsTheBodyUntilItIsDropped)
+{
+    MissedWriterPool pool("test/b_source", {"test/a_copy"}, "destination-keeps-the-body");
+    ASSERT_NO_FATAL_FAILURE(pool.commitPendingUnderAMissedWriter());
+    pool.relayRound("test/a_copy", "test/a_copy", "copy", "test/b_source", "w");
+    expectRowOutcome(pool.row(), /*carried=*/true, pool.t);
+
+    const size_t from = pool.backend->journal().size();
+    const RoundReport quiet = runGateRound(pool.store, *pool.gc);
+    expectBodyKept(*pool.backend, *pool.store, pool.body_key, from, quiet);
+    expectRowOutcome(pool.row(), /*carried=*/false, pool.t);
+
+    pool.store->dropRef(RootNamespace{"test/a_copy"}, "copy");
+    pool.store->renewWatermarkOnce();
+    for (int i = 0; i < 6 && pool.bodyStored(); ++i)
+        runGateRound(pool.store, *pool.gc);
+    EXPECT_FALSE(pool.bodyStored()) << "the body was not reclaimed after the destination part was dropped";
+    const FsckReport report = runFsck(*pool.store, /*detail=*/true);
+    EXPECT_EQ(report.dangling, 0u) << formatFsckSummary(report);
+}
+
+/// The cross-namespace case for a blob of a non-zero shard of four.
+TEST(CASGcIntentsRelay, NoBytesCopyInANonZeroShardKeepsTheBody)
+{
+    constexpr uint64_t shards = 4;
+    String payload;
+    for (size_t i = 0; payload.empty(); ++i)
+        if (const String candidate = "sharded-cross-namespace-" + std::to_string(i); blobShard(idOf(candidate), shards) != 0)
+            payload = candidate;
+    MissedWriterPool pool("test/b_source", {"test/a_copy"}, payload, shards);
+    ASSERT_EQ(pool.store->poolMeta().gc_shards, shards);
+    ASSERT_NO_FATAL_FAILURE(pool.commitPendingUnderAMissedWriter());
+    pool.relayRound("test/a_copy", "test/a_copy", "copy", "test/b_source", "w");
+    expectRowOutcome(pool.row(), /*carried=*/true, pool.t);
+}
+
+/// A reference added and removed in one intake while the row is `pending`: the round carries the row, and the next
+/// round, which folds no record of the blob, deletes the body.
+TEST_P(CASGcIntentsSharded, AddAndDropInOneIntakeCarriesThePendingRow)
+{
+    auto pool = makePool({.gc_shards = shards()});
+    ASSERT_NO_FATAL_FAILURE(pool.makePending({blob()}));
+    const PersistedEtag t = pool.row(blob())->token;
+
+    pool.touch({blob()});
+    pool.backend->clearJournal();
+    pool.round();
+    auto requests = blobRequests(pool.backend->journal());
+    EXPECT_GT(countOf(requests, JournalVerb::Head, pool.bodyKey(blob())), 0u) << "positive control: the decision HEAD";
+    EXPECT_EQ(countOf(requests, JournalVerb::Remove, pool.bodyKey(blob())), 0u) << "the touched round deleted the body";
+    expectRowOutcome(pool.row(blob()), /*carried=*/true, t);
+
+    pool.backend->clearJournal();
+    pool.round();
+    requests = blobRequests(pool.backend->journal());
+    EXPECT_EQ(countOf(requests, JournalVerb::Remove, pool.bodyKey(blob())), 1u) << "the quiet round did not delete the body";
+    EXPECT_FALSE(pool.bodyMeta(blob()).has_value());
+}
+
+/// The carry is per blob: an untouched pending blob of the same shard is deleted in the round that carries the
+/// touched one.
+TEST_P(CASGcIntentsSharded, CarriedRowDoesNotHoldBackAnotherBlobOfItsShard)
+{
+    auto pool = makePool({.gc_shards = shards()});
+    const uint64_t other = shards() == 1 ? 2 : blobsInShard(3, 4, 2).back();
+    ASSERT_NE(other, blob());
+    ASSERT_EQ(blobShard(blobRefOf(other), shards()), blobShard(blobRefOf(blob()), shards()));
+    ASSERT_NO_FATAL_FAILURE(pool.makePending({blob(), other}));
+    const PersistedEtag t = pool.row(blob())->token;
+
+    pool.touch({blob()});
+    pool.backend->clearJournal();
+    const RoundReport report = pool.round();
+    const auto requests = blobRequests(pool.backend->journal());
+    EXPECT_EQ(countOf(requests, JournalVerb::Remove, pool.bodyKey(blob())), 0u) << "the touched blob's body was deleted";
+    EXPECT_EQ(countOf(requests, JournalVerb::Remove, pool.bodyKey(other)), 1u) << "the untouched blob's body was kept";
+    EXPECT_EQ(report.bodies_deleted, 1u);
+    expectRowOutcome(pool.row(blob()), /*carried=*/true, t);
+    ASSERT_TRUE(pool.row(other).has_value());
+    EXPECT_TRUE(pool.row(other)->standing);
+}
+
+/// The same content added and dropped between every two rounds: no body delete while it lasts. After the last
+/// drop, the round that folds it carries the row and the next one deletes the body.
+TEST_P(CASGcIntentsSharded, ChurnOfOneContentDefersTheBodyDelete)
+{
+    auto pool = makePool({.gc_shards = shards()});
+    ASSERT_NO_FATAL_FAILURE(pool.makePending({blob()}));
+    const PersistedEtag t = pool.row(blob())->token;
+
+    pool.backend->clearJournal();
+    for (int i = 0; i < 3; ++i)
+    {
+        pool.touch({blob()});
+        const RoundReport report = pool.round();
+        EXPECT_EQ(report.bodies_deleted, 0u) << "churn round " << i;
+        expectRowOutcome(pool.row(blob()), /*carried=*/true, t);
+    }
+    auto requests = blobRequests(pool.backend->journal());
+    EXPECT_GE(countOf(requests, JournalVerb::Head, pool.bodyKey(blob())), 3u) << "positive control: a decision HEAD per round";
+    EXPECT_EQ(countOf(requests, JournalVerb::Remove, pool.bodyKey(blob())), 0u);
+    ASSERT_TRUE(pool.bodyMeta(blob()).has_value());
+
+    /// An unsuppressed round with the default (unbounded) redelete budget, and no record of the blob.
+    pool.backend->clearJournal();
+    const RoundReport quiet = pool.round();
+    requests = blobRequests(pool.backend->journal());
+    EXPECT_EQ(countOf(requests, JournalVerb::Remove, pool.bodyKey(blob())), 1u);
+    EXPECT_EQ(quiet.bodies_deleted, 1u);
+    EXPECT_FALSE(pool.bodyMeta(blob()).has_value());
 }

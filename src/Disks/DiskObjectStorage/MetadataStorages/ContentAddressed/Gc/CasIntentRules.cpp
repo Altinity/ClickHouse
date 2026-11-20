@@ -141,8 +141,10 @@ IntentDecision decideIntentStep(const IntentRuleInput & input)
     {
         if (!destruction_allowed || !input.redelete_budget_admits)
             return {.step = IntentStep::Carry};
+        /// A record of the blob in this round's window may be a reference another namespace's cut missed; only an
+        /// untouched zero, on a complete intake, proves the blob had no owner when the round read the catalog.
         if (seen == HeadSeen::Same)
-            return {.step = IntentStep::DeleteBody};
+            return {.step = input.key_touched ? IntentStep::Carry : IntentStep::DeleteBody};
         if (seen == HeadSeen::Absent)
             return {.step = IntentStep::Standing};
         /// A token with no identity never shows that the body is gone.

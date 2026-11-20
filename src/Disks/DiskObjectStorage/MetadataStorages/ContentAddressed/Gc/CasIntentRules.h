@@ -93,7 +93,9 @@ struct IntentDecision
 };
 
 /// Every destructive step needs an unsuppressed round, and every one but a spare's intent delete needs zero.
-/// `DeleteBody` also needs the redelete budget and a `HEAD` that shows the row's own token; `DeleteIntent` a
+/// `DeleteBody` also needs the redelete budget, a `HEAD` that shows the row's own token and a key this round did
+/// not touch: only an untouched zero, on a complete intake, proves the blob had no owner at the round's catalog
+/// read, so a touched `pending` row with that `HEAD` is carried. `DeleteIntent` needs a
 /// `standing` row with a canonical token; the `intent_to_delete` of a transition, or of a spared `pending` or
 /// `standing` row, a `HEAD` that shows another incarnation.
 /// Throws `LOGICAL_ERROR` on an input no round produces: a row that is not a blob row, `standing`
