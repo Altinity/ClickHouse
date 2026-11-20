@@ -50,6 +50,7 @@ static struct InitFiu
     ONCE(connection_stale_on_establish) \
     REGULAR(unresponsive_pooled_connection) \
     REGULAR(pooled_connection_ping_timeout) \
+    PAUSEABLE(swarm_mode_before_task_request) \
     REGULAR(cluster_discovery_faults) \
     REGULAR(cluster_discovery_unregister_fail) \
     ONCE(cluster_discovery_retry_signal_fail) \
