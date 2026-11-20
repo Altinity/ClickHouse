@@ -27,7 +27,14 @@ struct IPartitionStrategy
 
     virtual ~IPartitionStrategy() = default;
 
-    virtual ColumnPtr computePartitionKey(const Chunk & chunk) = 0;
+    /// Rebuilt on every call if non-deterministic. A sink calls it once and reuses the result for all its chunks,
+    /// so a stateful function keeps its state across the chunks of one INSERT.
+    virtual PartitionExpressionActionsAndColumnName getPartitionKeyActions() = 0;
+
+    ColumnPtr computePartitionKey(const Chunk & chunk, const PartitionExpressionActionsAndColumnName & partition_key_actions) const;
+
+    /// Convenience overload: builds the actions for this call only.
+    ColumnPtr computePartitionKey(const Chunk & chunk);
 
     virtual std::string getPathForRead(const std::string & prefix) = 0;
     virtual std::string getPathForWrite(const std::string & prefix, const std::string & partition_key) = 0;
@@ -92,7 +99,7 @@ struct WildcardPartitionStrategy : IPartitionStrategy
 {
     WildcardPartitionStrategy(KeyDescription partition_key_description_, const Block & sample_block_, ContextPtr context_);
 
-    ColumnPtr computePartitionKey(const Chunk & chunk) override;
+    PartitionExpressionActionsAndColumnName getPartitionKeyActions() override;
     std::string getPathForRead(const std::string & prefix) override;
     std::string getPathForWrite(const std::string & prefix, const std::string & partition_key) override;
 };
@@ -111,7 +118,7 @@ struct HiveStylePartitionStrategy : IPartitionStrategy
         const std::string & file_format_,
         bool partition_columns_in_data_file_);
 
-    ColumnPtr computePartitionKey(const Chunk & chunk) override;
+    PartitionExpressionActionsAndColumnName getPartitionKeyActions() override;
     std::string getPathForRead(const std::string & prefix) override;
     std::string getPathForWrite(const std::string & prefix, const std::string & partition_key) override;
 
