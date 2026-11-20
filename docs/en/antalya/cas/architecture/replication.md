@@ -163,3 +163,15 @@ different entries throws.
 
 Manifests are therefore per-ref and never moved: a detach creates a new manifest for
 `detached/<part>` and retires the old one, and the blobs' net in-degree is unchanged.
+
+## Single-replica merge coordination {#single-replica-merges}
+
+When `remote_fs_execute_merges_on_single_replica_time_threshold` is positive on a table whose
+storage policy includes a content-addressed disk, `ReplicatedMergeTreeMergeStrategyPicker` applies
+that threshold only to `MERGE_PARTS` entries whose source parts all reside on a content-addressed
+(or zero-copy) disk. The designated replica executes the merge and publishes the resulting manifest
+to the shared pool; peer replicas fetch the merged part by relink (`CA_RELINK_COOKIE`) without
+re-reading or re-merging the source blobs. On a multi-volume policy pairing a local hot disk with a
+content-addressed cold disk, merges whose source parts still reside on the local hot volume continue
+to follow `execute_merges_on_single_replica_time_threshold` (`0` by default), so local hot merges
+are not delayed waiting on a remote peer.
