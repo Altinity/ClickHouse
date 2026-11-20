@@ -64,6 +64,14 @@ void cleanupProbeKeys(CasOperation & op, std::initializer_list<const String *> k
 
 bool probeConditionalBatchDelete(CasOperation & op, const String & probe_prefix, const ConditionalRemove & absent_key)
 {
+    /// The optional batch probe sends S3-compatible XML `DeleteObjects`. GCS rejects per-object `ETag` conditions.
+    /// https://docs.cloud.google.com/storage/docs/object-deletion-overview
+    /// GCS JSON API batch can group separate `DELETE` requests, each with its own `ifGenerationMatch`.
+    /// https://docs.cloud.google.com/storage/docs/batch
+    /// https://docs.cloud.google.com/storage/docs/json_api/v1/objects/delete#parameters
+    if (absent_key.expected_token.dialect() == Dialect::Generation)
+        return false;
+
     const String first_matching_key = probe_prefix + "/batch-first";
     const String replaced_key = probe_prefix + "/batch-second";
     const String second_matching_key = probe_prefix + "/batch-third";
@@ -238,16 +246,8 @@ CapabilityProbeResult runCapabilityProbe(CasOperation & op, const String & probe
                     key, probe_prefix);
         }
 
-        /// The optional batch probe sends S3-compatible XML `DeleteObjects`. GCS rejects per-object `ETag` conditions.
-        /// https://docs.cloud.google.com/storage/docs/object-deletion-overview
-        /// GCS JSON API batch can group separate `DELETE` requests, each with its own `ifGenerationMatch`.
-        /// https://docs.cloud.google.com/storage/docs/batch
-        /// https://docs.cloud.google.com/storage/docs/json_api/v1/objects/delete#parameters
-        if (t2.dialect() != Dialect::Generation)
-        {
-            /// Step 7 verified that `key` was gone, so reuse its token for the absent entry.
-            result.conditional_batch_delete_supported = probeConditionalBatchDelete(op, probe_prefix, {key, t2});
-        }
+        /// The single-object delete verified that `key` was gone, so reuse its token for the absent entry.
+        result.conditional_batch_delete_supported = probeConditionalBatchDelete(op, probe_prefix, {key, t2});
     }
     catch (...)
     {
