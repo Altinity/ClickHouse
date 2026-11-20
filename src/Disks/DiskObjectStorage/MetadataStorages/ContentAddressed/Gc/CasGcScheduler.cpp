@@ -176,7 +176,12 @@ void CasGcScheduler::requestRoundSoon()
 
 void CasGcScheduler::onLeaseAcquired()
 {
-    i_am_leader.store(true, std::memory_order_relaxed);
+    const bool was_leader = i_am_leader.exchange(true, std::memory_order_relaxed);
+    /// Only pulse `gc/hb` synchronously when newly acquiring/stealing the lease. Steady-state
+    /// renewals just bumped `gc/state.lease.seq` (which already proves liveness to followers), and
+    /// `heartbeatLoop` will pulse `gc/hb` if the round stays in flight past `hb_interval`.
+    if (was_leader)
+        return;
     try
     {
         Cas::Gc::pulseHeartbeat(*store, gc_id);
@@ -312,6 +317,7 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
     try
     {
         (void)round_gc.runRegularRound(std::move(on_lease_acquired), allow_steal, Cas::UniversePolicy::kDefault, &rep);
+        last_round_failed_transiently.store(false, std::memory_order_release);
         if (rep.acquired_lease)
         {
             /// Keep health state per scheduler. Process-global gauges cannot distinguish multiple
@@ -340,9 +346,11 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
         fin.error_code = getCurrentExceptionCode();
         /// Non-transient first, so a bug that coincides with a restart is never masked; then the
         /// teardown flag, the only witness of a refused teardown fence (see `Outcome::Stopped`).
-        fin.outcome = !isTransientGcRoundError(fin.error_code) ? Rec::Outcome::Failed
-                    : store->teardownBegun()                    ? Rec::Outcome::Stopped
-                                                                : Rec::Outcome::Aborted;
+        const bool transient = isTransientGcRoundError(fin.error_code);
+        last_round_failed_transiently.store(transient, std::memory_order_release);
+        fin.outcome = !transient            ? Rec::Outcome::Failed
+                    : store->teardownBegun() ? Rec::Outcome::Stopped
+                                             : Rec::Outcome::Aborted;
         fin.error = getCurrentExceptionMessage(false);
         fill_counters(rep);
         fin.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -520,6 +528,9 @@ void CasGcScheduler::heartbeatLoop()
             return;
         }
         if (!i_am_leader.load(std::memory_order_relaxed))
+            continue;
+        if (!round_in_flight.load(std::memory_order_acquire)
+            && !last_round_failed_transiently.load(std::memory_order_acquire))
             continue;
         try
         {

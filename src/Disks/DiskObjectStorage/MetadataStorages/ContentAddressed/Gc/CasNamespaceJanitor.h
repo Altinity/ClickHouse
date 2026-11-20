@@ -20,6 +20,9 @@ struct NamespaceJanitorResult
     /// the next page is worth taking now. After the last page of the stream the next one starts from its
     /// beginning.
     bool more = false;
+    /// True when the page observed any unresolved/un-deleted dead-life key, non-empty cursor,
+    /// ambiguous catalog, leak, or anomaly (used by idle GC short-circuiting).
+    bool has_pending_work = false;
     std::vector<String> anomalies;
 };
 

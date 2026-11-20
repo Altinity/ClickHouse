@@ -654,3 +654,67 @@ TEST(CASGCRoundDefer, BoundedDeferralForcesFoldWithinWindow)
     const RoundReport rep4 = gc.runRegularRound();
     EXPECT_FALSE(rep4.deferred) << "the 4th round hits the defer bound and must force-fold";
 }
+
+/// Steady-state idle short-circuit: once a deferred round settles with zero changed shards, zero
+/// pending catalog transitions, and a clean janitor sweep, subsequent idle rounds skip `cas/ref_catalog`
+/// GETs, `namespace_cleanup` scans, and forced empty folds across `gc_fold_max_defer_rounds`, and a
+/// subsequent publish wakes GC immediately.
+TEST(CASGCRoundDefer, SteadyStateIdleShortCircuitsWithoutForcedEmptyFoldsAndWakesOnPublish)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = Pool::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test",
+                   .gc_fold_threshold = 1, .gc_fold_max_defer_rounds = 2});
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/idle@cas@"};
+    const ManifestRef r1{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 0xAA};
+    writeBlobBody(*backend, layout, UInt128(1));
+    writeManifestRaw(*backend, layout, ns, r1, {blobEntryFor("a", UInt128(1))});
+    publishCommittedTransition(*backend, layout, ns, "tbl", std::nullopt, r1);
+
+    /// Seed a fenced mount slot to confirm terminal-mount ETag caching skips repeated mount GETs.
+    {
+        OperationForTest seed_op(*backend);
+        const MountLease fenced_mount{
+            .server_uuid = UInt128(0xDEAD),
+            .writer_epoch = 1,
+            .hostname = "ephemeral-node",
+            .pid = 42,
+            .started_at_ms = 1,
+            .seq = 1,
+            .expires_at_ms = 2,
+            .min_active_build_sequence = 0,
+            .gc_fenced = true,
+            .write_attempt_id = UInt128(1)};
+        ASSERT_TRUE(std::holds_alternative<Committed>(
+            (*seed_op).create(layout.mountKey("ephemeral-node"), encodeMountLease(fenced_mount), Retry::once())));
+    }
+
+    Gc gc(store, kGc);
+    /// Round 1: folds r1.
+    ASSERT_FALSE(gc.runRegularRound().deferred);
+    /// Round 2: first idle defer runs full defer_decision + janitor and records idle baseline.
+    ASSERT_TRUE(gc.runRegularRound().deferred);
+
+    /// Rounds 3..6 exceed gc_fold_max_defer_rounds=2, yet stay deferred with zero catalog GETs,
+    /// zero namespace_cleanup LISTs, and zero GETs on the cached fenced mount slot.
+    for (int i = 0; i < 4; ++i)
+    {
+        backend->resetCounts();
+        const RoundReport idle_rep = gc.runRegularRound();
+        EXPECT_TRUE(idle_rep.deferred) << "idle round " << (i + 3) << " should remain short-circuited";
+        EXPECT_EQ(backend->getCount(layout.refCatalogKey()), 0u);
+        EXPECT_EQ(backend->listCount(layout.namespaceRootPrefix()), 0u);
+        EXPECT_EQ(backend->getCount(layout.mountKey("ephemeral-node")), 0u);
+    }
+
+    /// Publishing a new manifest immediately invalidates the idle baseline and forces a fold.
+    const ManifestRef r2{.writer_epoch = 1, .build_sequence = 2, .manifest_ordinal = 0xBB};
+    writeBlobBody(*backend, layout, UInt128(2));
+    writeManifestRaw(*backend, layout, ns, r2, {blobEntryFor("b", UInt128(2))});
+    publishCommittedTransition(*backend, layout, ns, "tbl2", std::nullopt, r2);
+
+    const RoundReport active_rep = gc.runRegularRound();
+    EXPECT_FALSE(active_rep.deferred) << "a new ref publish must wake GC from idle short-circuit";
+}
+
