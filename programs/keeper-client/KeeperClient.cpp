@@ -11,6 +11,7 @@
 #include <Common/filesystemHelpers.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
 #include <Parsers/parseQuery.h>
+#include <Common/clearPasswordFromCommandLine.h>
 #include <Poco/Util/HelpFormatter.h>
 
 
@@ -505,6 +506,7 @@ int mainEntryClickHouseKeeperClient(int argc, char ** argv)
     {
         DB::KeeperClient client;
         client.init(argc, argv);
+        clearPasswordFromCommandLine(argc, argv);
         return client.run();
     }
     catch (DB::Exception & e)
