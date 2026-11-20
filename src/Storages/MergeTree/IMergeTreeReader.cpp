@@ -53,10 +53,17 @@ IMergeTreeReader::IMergeTreeReader(
     columns_to_read.reserve(getColumns().size());
     serializations.reserve(getColumns().size());
 
+    const auto & storage_columns = storage_snapshot->metadata->getColumns();
     for (const auto & column : getColumns())
     {
         columns_to_read.emplace_back(getColumnInPart(column));
         serializations.emplace_back(getSerializationInPart(column));
+
+        if (!conversions_need_additional_columns
+            && isNullableOrLowCardinalityNullable(columns_to_read.back().type)
+            && !isNullableOrLowCardinalityNullable(column.type)
+            && storage_columns.hasDefault(column.name))
+            conversions_need_additional_columns = true;
 
         if (column.isSubcolumn())
         {
@@ -300,7 +307,7 @@ SerializationPtr IMergeTreeReader::getSerializationInPart(const NameAndTypePair 
     return IDataType::getSerialization(*column_in_part);
 }
 
-void IMergeTreeReader::performRequiredConversions(Columns & res_columns) const
+void IMergeTreeReader::performRequiredConversions(Columns & res_columns, const Block & additional_columns) const
 {
     try
     {
@@ -330,7 +337,8 @@ void IMergeTreeReader::performRequiredConversions(Columns & res_columns) const
             copy_block.insert({res_columns[pos], column_in_part.type, name_and_type->name});
 
             /// Only Nullable-to-non-Nullable conversions evaluate DEFAULT expressions.
-            if (isNullableOrLowCardinalityNullable(column_in_part.type)
+            if (conversions_need_additional_columns
+                && isNullableOrLowCardinalityNullable(column_in_part.type)
                 && !isNullableOrLowCardinalityNullable(name_and_type->type))
             {
                 if (auto column_default = storage_columns.getDefault(name_and_type->name))
@@ -356,6 +364,13 @@ void IMergeTreeReader::performRequiredConversions(Columns & res_columns) const
                 if (!res_columns[pos] || !default_dependencies.contains(name_and_type->name) || copy_block.has(name_and_type->name))
                     continue;
                 copy_block.insert({res_columns[pos], getColumnInPart(*name_and_type).type, name_and_type->name});
+            }
+
+            /// Inputs read by previous PREWHERE steps are already converted, so they keep their current type
+            for (const auto & dependency : default_dependencies)
+            {
+                if (!copy_block.has(dependency) && additional_columns.has(dependency))
+                    copy_block.insert(additional_columns.getByName(dependency));
             }
         }
 

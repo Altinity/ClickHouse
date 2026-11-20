@@ -65,6 +65,21 @@ bool injectRequiredColumnsRecursively(
                 required_columns.emplace(column_name);
                 injected_columns.emplace(column_name);
             }
+            if (!column_in_storage->isSubcolumn()
+                && isNullableOrLowCardinalityNullable(column_in_part->type)
+                && !isNullableOrLowCardinalityNullable(column_in_storage->type))
+            {
+                if (auto column_default = storage_snapshot->metadata->getColumns().getDefault(column_name))
+                {
+                    IdentifierNameSet identifiers;
+                    column_default->expression->collectIdentifierNames(identifiers);
+
+                    for (const auto & identifier : identifiers)
+                        if (!required_columns.contains(identifier))
+                            injectRequiredColumnsRecursively(identifier, storage_snapshot, alter_conversions, data_part_info_for_reader,
+                                options, columns, required_columns, injected_columns);
+                }
+            }
             return true;
         }
     }

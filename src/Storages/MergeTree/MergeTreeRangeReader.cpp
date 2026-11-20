@@ -1018,17 +1018,24 @@ MergeTreeRangeReader::ReadResult MergeTreeRangeReader::read(size_t max_rows, Mar
                 filterColumns(columns, read_result.final_filter);
             }
 
+            bool perform_conversions = !prewhere_info || prewhere_info->perform_alter_conversions;
+            bool conversions_need_additional_columns = perform_conversions && merge_tree_reader->conversionsNeedAdditionalColumns();
+
+            Block additional_columns;
+            if (conversions_need_additional_columns || should_evaluate_missing_defaults)
+            {
+                additional_columns = prev_reader->getSampleBlock().cloneWithColumns(read_result.columns);
+                for (const auto & col : read_result.additional_columns)
+                    additional_columns.insert(col);
+            }
+
             /// If columns not empty, then apply on-fly alter conversions if any required
-            if (!prewhere_info || prewhere_info->perform_alter_conversions)
-                merge_tree_reader->performRequiredConversions(columns);
+            if (perform_conversions)
+                merge_tree_reader->performRequiredConversions(columns, additional_columns);
 
             /// If some columns absent in part, then evaluate default values
             if (should_evaluate_missing_defaults)
             {
-                Block additional_columns = prev_reader->getSampleBlock().cloneWithColumns(read_result.columns);
-                for (const auto & col : read_result.additional_columns)
-                    additional_columns.insert(col);
-
                 addDummyColumnWithRowCount(additional_columns, read_result.num_rows);
                 merge_tree_reader->evaluateMissingDefaults(additional_columns, columns);
             }
