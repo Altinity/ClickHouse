@@ -1,8 +1,18 @@
 #include <gtest/gtest.h>
 
+#include <Common/Exception.h>
 #include <Core/SettingsFields.h>
 #include <Core/SettingsEnums.h>
 #include <Core/Field.h>
+#include <Core/Settings.h>
+#include <Core/BaseSettings.h>
+#include <IO/ReadBufferFromString.h>
+#include <IO/WriteBufferFromString.h>
+
+namespace DB::ErrorCodes
+{
+    extern const int ARGUMENT_OUT_OF_BOUND;
+}
 
 namespace
 {
@@ -139,4 +149,32 @@ GTEST_TEST(SettingMySQLDataTypesSupport, SetInvalidString)
     EXPECT_NO_THROW(setting = String(", "));
     ASSERT_TRUE(setting.changed);
     ASSERT_EQ(std::vector<MySQLDataTypesSupport>{}, setting.value);
+}
+
+
+GTEST_TEST(Settings, CustomFlaggedDecimalWithOutOfRangeScaleRejected)
+{
+    /// With `STRINGS_WITH_FLAGS`, a built-in setting marked `CUSTOM` is parsed via
+    /// `SettingFieldCustom::parseFromString` -> `Field::restoreFromDump` -> `readQuoted`. An
+    /// exponent-form decimal dump builds a `Decimal` scale that, before the fix, bypassed the binary
+    /// reader's check and reached the decimal text writer (a fixed-size stack buffer) with an
+    /// oversized scale. The scale must be rejected while reading the settings, not formatted later.
+    WriteBufferFromOwnString out;
+    BaseSettingsHelpers::writeString("max_block_size", out);
+    BaseSettingsHelpers::writeFlags(BaseSettingsHelpers::Flags::CUSTOM, out);
+    BaseSettingsHelpers::writeString("Decimal64_'1e-1000'", out);
+    BaseSettingsHelpers::writeString("", out); /// end of settings
+
+    const String wire = out.str();
+    Settings settings;
+    ReadBufferFromString in(wire);
+    try
+    {
+        settings.read(in, SettingsWriteFormat::STRINGS_WITH_FLAGS);
+        FAIL() << "expected ARGUMENT_OUT_OF_BOUND";
+    }
+    catch (const Exception & e)
+    {
+        ASSERT_EQ(e.code(), ErrorCodes::ARGUMENT_OUT_OF_BOUND);
+    }
 }
