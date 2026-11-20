@@ -123,6 +123,14 @@ private:
     std::exception_ptr failure;
 };
 
+class GenerationConditionalBatchBackend : public FailingConditionalBatchBackend
+{
+public:
+    using FailingConditionalBatchBackend::FailingConditionalBatchBackend;
+
+    Dialect dialect() const override { return Dialect::Generation; }
+};
+
 }
 
 TEST(CASProbe, ReportsConditionalBatchCapability)
@@ -136,6 +144,18 @@ TEST(CASProbe, ReportsConditionalBatchCapability)
     auto ignores_requests = makeRequests(ignores);
     auto ignores_op = ignores_requests.admit();
     EXPECT_FALSE(runCapabilityProbe(ignores_op, "p/.cas_probe").conditional_batch_delete_supported);
+}
+
+TEST(CASProbe, SkipsConditionalBatchDeleteForGenerationTokens)
+{
+    GenerationConditionalBatchBackend backend(std::make_exception_ptr(
+        DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "conditional batch delete unsupported")));
+    auto requests = makeRequests(backend);
+    auto op = requests.admit();
+
+    EXPECT_FALSE(runCapabilityProbe(op, "p/.cas_probe").conditional_batch_delete_supported);
+    EXPECT_EQ(backend.batch_attempts, 0u);
+    EXPECT_TRUE(op.list("p/.cas_probe", "", 10, Retry::once()).keys.empty());
 }
 
 TEST(CASProbe, RejectsConditionalBatchSuccessWithoutDeletion)
@@ -420,7 +440,9 @@ TEST(CASProbe, ReorderedProbePassesOnAllThreeDialects)
         auto op = requests.admit();
         EXPECT_NO_THROW(runCapabilityProbe(op, "p/.cas_probe")) << "dialect " << static_cast<int>(dialect);
         EXPECT_TRUE(op.list("p/.cas_probe", "", 10, Retry::once()).keys.empty()) << "dialect " << static_cast<int>(dialect);
-        EXPECT_EQ(b.write_reached, 8) << "dialect " << static_cast<int>(dialect);
-        EXPECT_EQ(b.remove_reached, 3) << "dialect " << static_cast<int>(dialect);
+        /// The optional batch check adds four writes and one cleanup remove when it runs.
+        const bool runs_batch_probe = dialect != Dialect::Generation;
+        EXPECT_EQ(b.write_reached, runs_batch_probe ? 8 : 4) << "dialect " << static_cast<int>(dialect);
+        EXPECT_EQ(b.remove_reached, runs_batch_probe ? 3 : 2) << "dialect " << static_cast<int>(dialect);
     }
 }

@@ -476,6 +476,15 @@ the optional batch check leaves GC using one-key chunks. A request-level `Invali
 `InvalidArgument` propagates and fails the mount. After a successful probe, a batch request error
 follows the normal request retry policy and does not change the pinned capability.
 
+CAS skips the optional conditional batch delete check on Google Cloud Storage in generation-token
+mode. The [S3-compatible XML `DeleteObjects` API](https://docs.cloud.google.com/storage/docs/object-deletion-overview)
+rejects per-object `ETag` conditions. The [GCS JSON batch API](https://docs.cloud.google.com/storage/docs/batch)
+can group individual `DELETE` requests, each with its own
+[`ifGenerationMatch` condition](https://docs.cloud.google.com/storage/docs/json_api/v1/objects/delete#parameters).
+CAS uses the XML API. The mount verifies single-object conditional deletion and GC sends a separate
+`DELETE` for each blob body with
+[`x-goog-if-generation-match`](https://docs.cloud.google.com/storage/docs/xml-api/delete-object#request-headers).
+
 The integration test on RustFS 1.0.6 mounts two disks with GC chunk limits of one and two. It
 checks the number of storage requests in each pending-delete phase and lists the bucket to verify
 that the blob bodies have disappeared.

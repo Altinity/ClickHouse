@@ -238,8 +238,16 @@ CapabilityProbeResult runCapabilityProbe(CasOperation & op, const String & probe
                     key, probe_prefix);
         }
 
-        /// Step 7 verified that `key` was gone, so reuse its token for the absent entry.
-        result.conditional_batch_delete_supported = probeConditionalBatchDelete(op, probe_prefix, {key, t2});
+        /// The optional batch probe sends S3-compatible XML `DeleteObjects`. GCS rejects per-object `ETag` conditions.
+        /// https://docs.cloud.google.com/storage/docs/object-deletion-overview
+        /// GCS JSON API batch can group separate `DELETE` requests, each with its own `ifGenerationMatch`.
+        /// https://docs.cloud.google.com/storage/docs/batch
+        /// https://docs.cloud.google.com/storage/docs/json_api/v1/objects/delete#parameters
+        if (t2.dialect() != Dialect::Generation)
+        {
+            /// Step 7 verified that `key` was gone, so reuse its token for the absent entry.
+            result.conditional_batch_delete_supported = probeConditionalBatchDelete(op, probe_prefix, {key, t2});
+        }
     }
     catch (...)
     {
