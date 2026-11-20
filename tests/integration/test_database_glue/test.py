@@ -2322,3 +2322,56 @@ def test_optimize_bin_pack_concurrent_commit(started_cluster):
     # 5. The rows committed during the publish window must remain in the current snapshot.
     assert catalog.load_table(f"{root_namespace}.{table_name}").scan().to_arrow().num_rows == 9
     assert node.query(f"SELECT count() FROM {table_ref}").strip() == "9"
+
+
+def test_optimize_bin_pack_table_without_metadata_location(started_cluster):
+    """A table registered in Glue by `Location` only has no `metadata_location` parameter, and ClickHouse
+    reads its current metadata from storage. `OPTIMIZE` must still be able to compact it and register the pointer."""
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_optimize_no_metadata_location_{uuid.uuid4()}"
+    table_name = f"{test_ref}_table"
+    root_namespace = f"{test_ref}_namespace"
+    table_ref = f"{CATALOG_NAME}.`{root_namespace}.{table_name}`"
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(root_namespace)
+    table = create_table(catalog, root_namespace, table_name, DEFAULT_SCHEMA, PartitionSpec(), DEFAULT_SORT_ORDER, table_name)
+
+    # Two separate appends produce two small data files, so bin-pack has work.
+    table.append(generate_arrow_data(2))
+    table.append(generate_arrow_data(3))
+
+    glue_client = boto3.client(
+        "glue", region_name="us-east-1", endpoint_url=get_glue_local_url(started_cluster)
+    )
+    table_info = glue_client.get_table(DatabaseName=root_namespace, Name=table_name)["Table"]
+    assert "metadata_location" in table_info["Parameters"], "Test setup failed: metadata_location should exist initially"
+    glue_client.update_table(
+        DatabaseName=root_namespace,
+        TableInput={
+            "Name": table_name,
+            "StorageDescriptor": table_info["StorageDescriptor"],
+            "Parameters": {k: v for k, v in table_info["Parameters"].items() if k != "metadata_location"},
+            "TableType": table_info.get("TableType", "EXTERNAL_TABLE"),
+        },
+    )
+    table_info = glue_client.get_table(DatabaseName=root_namespace, Name=table_name)["Table"]
+    assert "metadata_location" not in table_info["Parameters"], "Failed to remove metadata_location"
+
+    create_clickhouse_glue_database(started_cluster, node, CATALOG_NAME)
+    assert node.query(f"SELECT count() FROM {table_ref}").strip() == "5"
+
+    node.query(
+        f"OPTIMIZE TABLE {table_ref}",
+        settings={
+            "allow_experimental_iceberg_compaction": 1,
+            "iceberg_target_data_file_size_bytes": 10 * 1024 * 1024,
+            "iceberg_min_data_file_size_bytes": 10 * 1024 * 1024,
+        },
+    )
+
+    # The update registered the pointer, and no row was lost.
+    table_info = glue_client.get_table(DatabaseName=root_namespace, Name=table_name)["Table"]
+    assert table_info["Parameters"].get("metadata_location"), table_info["Parameters"]
+    assert node.query(f"SELECT count() FROM {table_ref}").strip() == "5"

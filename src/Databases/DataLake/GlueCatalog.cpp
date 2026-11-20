@@ -1317,8 +1317,13 @@ bool GlueCatalog::updateMetadataIfCurrent(
     /// Same order as Iceberg Java's `GlueTableOperations::doCommit`: read the table, check that it still
     /// points at the writer's base, and send `UpdateTable` with the `VersionId` of that same read. The
     /// `VersionId` alone would not do, because a read taken after a concurrent commit already includes it.
+    ///
+    /// A table registered by `Location` only has no `metadata_location` parameter, and `getTableMetadata` reports
+    /// the newest metadata file found in storage as its location. There is no pointer to compare then: a writer
+    /// that registered one since the base was read makes the parameter non-empty and different, which is rejected
+    /// below, and the `VersionId` guards against a write between this read and the update.
     const auto current = getTableVersion(namespace_name, table_name, auth_token);
-    if (current.metadata_location != expected_metadata_location)
+    if (!current.metadata_location.empty() && current.metadata_location != expected_metadata_location)
     {
         LOG_WARNING(getLogger("GlueCatalog"),
             "Glue table {}.{} points at {} while the commit is based on {}",
