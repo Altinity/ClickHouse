@@ -22,6 +22,7 @@ namespace ErrorCodes
     extern const int ABORTED;
     extern const int LOGICAL_ERROR;
     extern const int NETWORK_ERROR;
+    extern const int NO_REPLICA_HAS_PART;
 }
 }
 
@@ -498,10 +499,9 @@ bool CachedPartFolderAccess::republishRef(const PartRefKey & src, const PartRefK
         const Removal outcome = dropRefExact(src, src_manifest_ref);
         if (outcome == Removal::Removed)
             return;
-        /// Absent: the only writer that removes a part under rename is an identical concurrent rename
-        /// (a queue re-drive) that saw our byte-equal destination and finished the move; MergeTree holds
-        /// a part being renamed, so an independent removal cannot race here. Treat it as completed and
-        /// never compensate — that would delete the other rename's result.
+        /// Absent: removed after the destination was committed, normally by an identical concurrent rename
+        /// (a queue re-drive) that finished the move. Treat it as completed and never compensate — that
+        /// would delete the other rename's result.
         if (outcome == Removal::Gone)
             return;
         /// Mismatch: another writer repointed the source, so a content-equal destination is stale,
@@ -527,12 +527,32 @@ bool CachedPartFolderAccess::republishRef(const PartRefKey & src, const PartRefK
         return true;
     }
 
+    /// Completes the move when an identical move already committed `dst` with the source's content, and
+    /// reports whether it did. `dst` with other content is an ownership conflict, like the pre-publish check.
+    const auto complete_over_equal_destination = [&]
+    {
+        const auto dst_resolved = store->resolveRef(dst.ns, dst.ref);
+        if (!dst_resolved)
+            return false;
+        if (store->readManifestShared(dst_resolved->manifest_id)->entries != src_manifest->entries)
+            throwCasOwnershipConflict("republishRef: destination '{}' is already committed with different content — refusing "
+                "(rename/attach conflict)", dst.ns.string() + "/" + dst.ref);
+        drop_source_or_abort(Cas::CommitOutcome{dst.ns, dst.ref, dst_resolved->manifest_id.ref, /*created=*/true});
+        return true;
+    };
+
     runHookForTest(TestHook::BeforeDestinationPublish);
 
+    const CopySource source{src, src_manifest_ref};
+    std::optional<PreparedPartWrite> prepared;
+    bool source_confirmed = false;
     std::optional<Cas::CommitOutcome> oc;
     try
     {
-        oc = publishEntries(dst, src_manifest->entries, Cas::ProvenanceOp::Other);
+        prepared.emplace(prepareEntries(dst, src_manifest->entries, Cas::ProvenanceOp::Other));
+        source_confirmed = confirmCopySource(source);
+        if (source_confirmed)
+            oc = prepared->promote();
     }
     catch (const Exception & e)
     {
@@ -544,17 +564,48 @@ bool CachedPartFolderAccess::republishRef(const PartRefKey & src, const PartRefK
         /// ownership conflict, like the pre-publish check.
         if (e.code() != ErrorCodes::NETWORK_ERROR)
             throw;
-        const auto dst_resolved = store->resolveRef(dst.ns, dst.ref);
-        if (!dst_resolved)
+        if (!complete_over_equal_destination())
             throw;
-        if (store->readManifestShared(dst_resolved->manifest_id)->entries != src_manifest->entries)
-            throwCasOwnershipConflict("republishRef: destination '{}' is already committed with different content — refusing "
-                "(rename/attach conflict)", dst.ns.string() + "/" + dst.ref);
-        drop_source_or_abort(Cas::CommitOutcome{dst.ns, dst.ref, dst_resolved->manifest_id.ref, /*created=*/true});
         return true;
+    }
+    if (!source_confirmed)
+    {
+        prepared->abort();
+        if (complete_over_equal_destination())
+            return true;
+        throwCopySourceUnconfirmed(source, dst);
     }
     drop_source_or_abort(oc);
     return true;
+}
+
+bool CachedPartFolderAccess::confirmCopySource(const CopySource & source) const
+{
+    try
+    {
+        /// A live source must not be refused because its table is not resident: the confirm reads only memory.
+        store->resolveRef(source.part.ns, source.part.ref);
+        return store->confirmExactRef(source.part.ns, source.part.ref, source.manifest_ref, Cas::ConfirmLockMode::Wait)
+            == Cas::ConfirmAnswer::Yes;
+    }
+    catch (...)
+    {
+        /// The relink confirm answers a failed slot read as unknown, and so does this one: only a `Yes` lets
+        /// the copy promote.
+        tryLogCurrentException(getLogger("CachedPartFolderAccess"),
+            fmt::format("while confirming the copy source '{}/{}'", source.part.ns.string(), source.part.ref),
+            LogsLevel::information);
+        return false;
+    }
+}
+
+void throwCopySourceUnconfirmed(const CopySource & source, const PartRefKey & destination)
+{
+    throw Exception(ErrorCodes::NO_REPLICA_HAS_PART,
+        "CAS copy into '{}/{}' is refused: its source '{}/{}' no longer proves it commits manifest {}, so the copied "
+        "blobs may have lost their owner; the operation must be retried",
+        destination.ns.string(), destination.ref, source.part.ns.string(), source.part.ref,
+        manifestRefDebugString(source.manifest_ref));
 }
 
 std::optional<Cas::ManifestRef> CachedPartFolderAccess::renameCommittedRef(

@@ -2393,7 +2393,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
 
     const uint64_t new_generation = state.snap_generation + 1;
     /// The fold mints THIS round's attempt id from `lease.seq` (the renew/steal paths bump it every
-    /// round, so it is a fresh monotonic per-round id). EVERY fold-artifact WRITE below lands under this
+    /// round; a rebuild's give-back resets it to 0). EVERY fold-artifact WRITE below lands under this
     /// attempt; the PARENT-generation READS keep using `state.snap_attempt` (the attempt the prior round
     /// adopted). The fold-adopt CAS #1 then commits `(new_generation, attempt)` together — a deposed
     /// leader's fold lands under its own unadopted attempt and is invisible to every reader.
@@ -3657,10 +3657,12 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
     /// Ref-log cleanup runs after its round commits a newer `gc/state`, so the leased version, still current
     /// after the last intake read, shows that no newer leader removed a record this round read as absent.
     /// Rounds with no `pending` or `standing` parent row skip the read, so an idle round sends no request.
-    bool parent_has_delete_pending = false;
+    /// That is safe: a delete that acts on a false zero needs such a row, and every other intent delete
+    /// follows a `HEAD` that showed another incarnation.
+    bool parent_has_pending_rows = false;
     for (uint64_t shard = 0; shard < state.gc_shards; ++shard)
-        parent_has_delete_pending = parent_has_delete_pending || summaryOfParent(shard).pending_total != 0;
-    if (!suppressed_by_intake && parent_has_delete_pending)
+        parent_has_pending_rows = parent_has_pending_rows || summaryOfParent(shard).pending_total != 0;
+    if (!suppressed_by_intake && parent_has_pending_rows)
     {
         String seen;
         try
@@ -3674,9 +3676,10 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         catch (const Exception & e)
         {
             /// A read verb that gives up throws `NETWORK_ERROR`; any other failure fails the round, as elsewhere.
+            /// A lost fence or a spent lease budget throws the same code.
             if (e.code() != ErrorCodes::NETWORK_ERROR)
                 throw;
-            seen = "no answer";
+            seen = "no answer (" + e.message() + ")";
         }
         result.parent_unconfirmed = !seen.empty();
         if (result.parent_unconfirmed)
@@ -3835,9 +3838,6 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         std::set<BlobRef> surviving_add;
         for (const auto & [edge, is_remove] : last_verdict_is_remove)
             (is_remove ? removed : surviving_add).insert(edge.first);
-        bool parent_has_pending_rows = false;
-        for (uint64_t shard = 0; shard < state.gc_shards; ++shard)
-            parent_has_pending_rows = parent_has_pending_rows || summaryOfParent(shard).pending_total != 0;
         const bool keep_read_ahead_sets = reads.window() > 0 && !suppress_destructive && parent_has_pending_rows;
         for (const BlobRef & ref : removed)
         {
@@ -4883,8 +4883,8 @@ RebuildReport Gc::rebuildBaseline(bool force)
         rep.refusal = "another GC leader holds the lease";
         return rep;
     }
-    /// A refused rebuild leaves `gc/state` as it found it: a rebuild never steals, so a lease it claimed and
-    /// kept would make every later rebuild, each with a fresh identity, refuse as a competing leader.
+    /// Gives back a lease this call claimed over a never-held one: a rebuild never steals, so a claim it kept
+    /// would make every later rebuild, each with a fresh identity, refuse as a competing leader.
     bool baseline_installed = false;
     SCOPE_EXIT({
         if (claimed_never_held && !baseline_installed)
@@ -5420,8 +5420,9 @@ bool Gc::acquireOrRenewLease(GcState & state, std::optional<Etag> & state_etag, 
             return encodeGcState(next);
         }
 
-        /// Owner 0 is reserved for a lease nobody ever held (the migration tool creates `gc/state` so): no
-        /// incumbent can be alive, so any caller claims it, and the conditional write admits one claimant.
+        /// Owner 0 with seq 0 is a lease nobody holds: the migration tool creates `gc/state` so, and a refused
+        /// rebuild gives its claim back to it. No incumbent can be alive, so any caller claims it, and the
+        /// conditional write admits one claimant.
         if (current.lease.owner == UInt128(0) && current.lease.seq == 0)
         {
             GcState next = current;

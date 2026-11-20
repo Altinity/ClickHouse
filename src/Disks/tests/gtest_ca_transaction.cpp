@@ -1,6 +1,9 @@
 #include <gtest/gtest.h>
+#include <base/defines.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
 #include <Disks/tests/cas_test_helpers.h>
@@ -20,6 +23,8 @@ namespace DB::ErrorCodes
 extern const int NOT_IMPLEMENTED;
 extern const int INVALID_STATE;
 extern const int CAS_OWNERSHIP_CONFLICT;
+extern const int NO_REPLICA_HAS_PART;
+extern const int LOGICAL_ERROR;
 }
 
 /// [TXN-ONE-PIPELINE] CA publish-at-commit lock-scope tests.
@@ -869,4 +874,257 @@ TEST(CASLifecycle, ShutdownDiskProbesFailLoud)
     /// The content/size surface stays fail-close too (unchanged from the transitional behavior).
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { (void)storage->getFileSize(file); });
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { (void)storage->getStorageObjects(file); });
+}
+
+/// ---- No-bytes copies confirm their source after the destination precommit ----
+
+namespace
+{
+
+/// Commits one part `table + part` holding `files` (path -> bytes).
+void commitPartTx(DB::ContentAddressedMetadataStorage & storage, const std::string & table, const std::string & part,
+                  const std::vector<std::pair<std::string, std::string>> & files)
+{
+    auto tx = storage.createTransaction();
+    for (const auto & [name, bytes] : files)
+        writeFileTx(*tx, table + "tmp_insert_" + part + "/" + name, bytes);
+    tx->moveDirectory(table + "tmp_insert_" + part, table + part);
+    tx->commit(DB::NoCommitOptions{});
+}
+
+void dropPartTx(DB::ContentAddressedMetadataStorage & storage, const std::string & part_dir)
+{
+    auto tx = storage.createTransaction();
+    tx->removeRecursive(part_dir, {});
+    tx->commit(DB::NoCommitOptions{});
+}
+
+/// Counts `Pool::confirmExactRef` calls; each call runs the hook once, whatever it answers.
+struct ConfirmCounter
+{
+    DB::Cas::PoolPtr store;
+    size_t calls = 0;
+    std::function<void()> on_call;
+
+    explicit ConfirmCounter(DB::Cas::PoolPtr store_) : store(std::move(store_))
+    {
+        store->setConfirmAfterOwnershipCaptureHookForTest([this]
+        {
+            ++calls;
+            if (on_call)
+                on_call();
+        });
+    }
+    ~ConfirmCounter() { store->setConfirmAfterOwnershipCaptureHookForTest(nullptr); }
+};
+
+const std::string kLivenessTable = "a12/a12a12a1-1212-4121-8121-121212121212";
+const std::string kLivenessUuid = "a12a12a1-1212-4121-8121-121212121212";
+
+}
+
+/// `createHardLink` reads the committed source at call time and the destination precommits only at commit.
+/// A source dropped in between must not let the copy commit.
+TEST(CASTransactionSourceLiveness, HardLinkOfASourceDroppedBeforeCommitIsRefused)
+{
+    auto storage = openTxStorage();
+    const std::string table = kLivenessTable + "/";
+    commitPartTx(*storage, table, "all_71_71_0", {{"data.bin", "source-liveness-hardlink"}});
+    ASSERT_TRUE(storage->existsFile(table + "all_71_71_0/data.bin"));
+
+    auto copy_tx = storage->createTransaction();
+    copy_tx->createHardLink(table + "all_71_71_0/data.bin", table + "tmp_clone_all_72_72_0/data.bin");
+    dropPartTx(*storage, table + "all_71_71_0");
+    ASSERT_FALSE(storage->existsDirectory(table + "all_71_71_0")) << "the source was not dropped";
+
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NO_REPLICA_HAS_PART, [&] { copy_tx->commit(DB::NoCommitOptions{}); });
+    EXPECT_FALSE(storage->existsDirectory(table + "tmp_clone_all_72_72_0")) << "the copy of a dropped source was promoted";
+    const DB::Cas::RootNamespace ns = storage->liveNamespace(kLivenessUuid);
+    for (const auto & [ref, manifest] : storage->store()->livePrecommitsForTest(ns))
+        EXPECT_NE(ref, "tmp_clone_all_72_72_0") << "the refused copy left its precommit";
+}
+
+/// The same window with the source's body reclaimed by GC before the copy commits: the copy is refused and
+/// nothing names the missing body.
+TEST(CASTransactionSourceLiveness, HardLinkWhoseSourceBodyWasReclaimedIsNotPromoted)
+{
+    auto storage = openTxStorage();
+    const std::string table = kLivenessTable + "/";
+    const DB::Cas::RootNamespace ns = storage->liveNamespace(kLivenessUuid);
+    const DB::Cas::PoolPtr store = storage->store();
+    commitPartTx(*storage, table, "all_73_73_0", {{"data.bin", "source-liveness-reclaimed-before-the-copy"}});
+    const auto view = storage->partAccess()->getView({ns, "all_73_73_0"}, DB::Cas::Freshness::ForceFresh);
+    ASSERT_NE(view, nullptr);
+    ASSERT_NE(view->findFile("data.bin"), nullptr);
+    const std::string body_key = store->layout().blobKey(view->findFile("data.bin")->ref);
+    const auto body_present = [&]
+    {
+        auto op = store->mountRequests().admit();
+        return op.head(body_key, DB::Cas::Retry::standard()).has_value();
+    };
+    ASSERT_TRUE(body_present());
+
+    auto copy_tx = storage->createTransaction();
+    copy_tx->createHardLink(table + "all_73_73_0/data.bin", table + "tmp_clone_all_74_74_0/data.bin");
+    dropPartTx(*storage, table + "all_73_73_0");
+    DB::Cas::Gc gc(store, DB::Cas::hexToU128("000000000000000000000000000000c1"));
+    for (size_t round = 0; round < 60 && body_present(); ++round)
+    {
+        gc.runRegularRound();
+        store->renewWatermarkOnce();
+    }
+    ASSERT_FALSE(body_present()) << "GC did not reclaim the dropped source's body";
+
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NO_REPLICA_HAS_PART, [&] { copy_tx->commit(DB::NoCommitOptions{}); });
+    EXPECT_FALSE(storage->existsDirectory(table + "tmp_clone_all_74_74_0"));
+    const DB::Cas::FsckReport report = storage->runFsckNow(/*detail=*/true);
+    EXPECT_EQ(report.dangling, 0u) << DB::Cas::formatFsckSummary(report);
+}
+
+/// A mutation-style copy of many entries from one source confirms that source once, after the destination's
+/// precommit is durable and before its promote. An entry the destination writes itself needs no confirmation.
+TEST(CASTransactionSourceLiveness, ManyEntriesFromOneSourceConfirmItOnceBetweenPrecommitAndPromote)
+{
+    auto storage = openTxStorage();
+    const std::string table = kLivenessTable + "/";
+    const DB::Cas::RootNamespace ns = storage->liveNamespace(kLivenessUuid);
+    std::vector<std::pair<std::string, std::string>> files;
+    for (size_t i = 0; i < 10; ++i)
+        files.emplace_back("c" + std::to_string(i) + ".bin", "column-" + std::to_string(i) + "-of-the-source");
+    commitPartTx(*storage, table, "all_75_75_0", files);
+
+    ConfirmCounter counter(storage->store());
+    bool precommit_live_at_confirm = false;
+    bool committed_at_confirm = true;
+    counter.on_call = [&]
+    {
+        for (const auto & [ref, manifest] : storage->store()->livePrecommitsForTest(ns))
+            precommit_live_at_confirm |= ref == "tmp_mut_all_75_75_0_2";
+        committed_at_confirm = storage->store()->resolveRef(ns, "tmp_mut_all_75_75_0_2").has_value();
+    };
+
+    auto tx = storage->createTransaction();
+    for (const auto & [name, bytes] : files)
+        tx->createHardLink(table + "all_75_75_0/" + name, table + "tmp_mut_all_75_75_0_2/" + name);
+    writeFileTx(*tx, table + "tmp_mut_all_75_75_0_2/new.bin", "a column the mutation wrote");
+    tx->commit(DB::NoCommitOptions{});
+
+    EXPECT_EQ(counter.calls, 1u) << "one source, one confirmation";
+    EXPECT_TRUE(precommit_live_at_confirm) << "the confirmation ran before the destination precommit was durable";
+    EXPECT_FALSE(committed_at_confirm) << "the confirmation ran after the destination promote";
+    EXPECT_TRUE(storage->existsFile(table + "tmp_mut_all_75_75_0_2/c9.bin"));
+}
+
+/// An entry staged earlier in the same transaction is copied and renamed; the copy confirms the committed part
+/// the entry came from, not the staging path it was copied from.
+TEST(CASTransactionSourceLiveness, StagedCopyConfirmsTheOriginalSource)
+{
+    for (const bool drop_source : {false, true})
+    {
+        SCOPED_TRACE(drop_source ? "source dropped" : "source live");
+        auto storage = openTxStorage();
+        const std::string table = kLivenessTable + "/";
+        commitPartTx(*storage, table, "all_76_76_0", {{"data.bin", "the original source of a staged copy"}});
+        ConfirmCounter counter(storage->store());
+
+        auto tx = storage->createTransaction();
+        tx->createHardLink(table + "all_76_76_0/data.bin", table + "tmp_a_all_77_77_0/data.bin");
+        tx->createHardLink(table + "tmp_a_all_77_77_0/data.bin", table + "tmp_b_all_78_78_0/data.bin");
+        tx->moveDirectory(table + "tmp_b_all_78_78_0", table + "all_78_78_0");
+        tx->removeDirectory(table + "tmp_a_all_77_77_0");
+        if (drop_source)
+            dropPartTx(*storage, table + "all_76_76_0");
+
+        if (drop_source)
+        {
+            DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NO_REPLICA_HAS_PART, [&] { tx->commit(DB::NoCommitOptions{}); });
+            EXPECT_FALSE(storage->existsDirectory(table + "all_78_78_0"));
+        }
+        else
+        {
+            tx->commit(DB::NoCommitOptions{});
+            EXPECT_TRUE(storage->existsFile(table + "all_78_78_0/data.bin"));
+        }
+        EXPECT_EQ(counter.calls, 1u) << "the staged copy confirmed its original source once";
+    }
+}
+
+/// A copy whose source the same transaction also writes is refused: `commit` publishes `all_*` before `tmp_*`, so
+/// the source no longer commits the manifest the copy read when the copy confirms it.
+TEST(CASTransactionSourceLiveness, CopyOfASourceTheSameTransactionWritesIsRefused)
+{
+    auto storage = openTxStorage();
+    const std::string table = kLivenessTable + "/";
+    const DB::Cas::RootNamespace ns = storage->liveNamespace(kLivenessUuid);
+    commitPartTx(*storage, table, "all_82_82_0", {{"data.bin", "a source the copying transaction also writes"}});
+
+    auto tx = storage->createTransaction();
+    tx->createHardLink(table + "all_82_82_0/data.bin", table + "tmp_clone_all_83_83_0/data.bin");
+    writeFileTx(*tx, table + "all_82_82_0/txn_version.txt", "written by the copying transaction");
+
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NO_REPLICA_HAS_PART, [&] { tx->commit(DB::NoCommitOptions{}); });
+    EXPECT_FALSE(storage->existsDirectory(table + "tmp_clone_all_83_83_0")) << "the copy was promoted";
+    for (const auto & [ref, manifest] : storage->store()->livePrecommitsForTest(ns))
+        EXPECT_NE(ref, "tmp_clone_all_83_83_0") << "the refused copy left its precommit";
+}
+
+namespace
+{
+
+/// Stages a projection under `<part>/p_1.tmp_proj` and re-keys it to `<part>/p.proj`, with or without a `p.proj`
+/// already staged in the same transaction.
+void rekeyProjection(DB::ContentAddressedMetadataStorage & storage, bool destination_staged)
+{
+    const std::string part = kLivenessTable + "/tmp_insert_all_84_84_0/";
+    auto tx = storage.createTransaction();
+    if (destination_staged)
+        writeFileTx(*tx, part + "p.proj/columns.txt", "a projection directory staged earlier");
+    writeFileTx(*tx, part + "p_1.tmp_proj/checksums.txt", "the projection being renamed");
+    tx->moveDirectory(part + "p_1.tmp_proj", part + "p.proj");
+}
+
+}
+
+#ifndef DEBUG_OR_SANITIZER_BUILD
+/// Re-keying `.tmp_proj` entry by entry onto a staged `.proj` would merge two projection directories, so it fails.
+TEST(CASTransactionOps, ProjectionRekeyOntoAStagedProjectionThrows)
+{
+    auto storage = openTxStorage();
+    EXPECT_NO_THROW(rekeyProjection(*storage, /*destination_staged=*/false)) << "positive control: a free destination";
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
+        [&] { rekeyProjection(*storage, /*destination_staged=*/true); });
+}
+#else
+/// The storage is built inside the child, so the parent of this death suite constructs none.
+TEST(CASTransactionOpsDeathTest, ProjectionRekeyOntoAStagedProjectionAborts)
+{
+    EXPECT_DEATH({
+        auto storage = openTxStorage();
+        rekeyProjection(*storage, /*destination_staged=*/true);
+    }, "");
+}
+#endif
+
+/// Bytes the destination uploads itself need no source: a copy of a pending upload and a copied path that is
+/// then overwritten both commit with no confirmation, even with the hardlinked source gone.
+TEST(CASTransactionSourceLiveness, EntriesTheDestinationUploadsCarryNoSource)
+{
+    auto storage = openTxStorage();
+    const std::string table = kLivenessTable + "/";
+    commitPartTx(*storage, table, "all_79_79_0", {{"data.bin", "a source that is overwritten in the copy"}});
+    ConfirmCounter counter(storage->store());
+
+    auto tx = storage->createTransaction();
+    writeFileTx(*tx, table + "tmp_insert_all_80_80_0/data.bin", "bytes this transaction uploads");
+    tx->createHardLink(table + "tmp_insert_all_80_80_0/data.bin", table + "tmp_clone_all_81_81_0/data.bin");
+    tx->createHardLink(table + "all_79_79_0/data.bin", table + "tmp_clone_all_81_81_0/other.bin");
+    writeFileTx(*tx, table + "tmp_clone_all_81_81_0/other.bin", "the copy's own bytes at the copied path");
+    dropPartTx(*storage, table + "all_79_79_0");
+    tx->commit(DB::NoCommitOptions{});
+
+    EXPECT_EQ(counter.calls, 0u);
+    EXPECT_TRUE(storage->existsFile(table + "tmp_clone_all_81_81_0/data.bin"));
+    EXPECT_TRUE(storage->existsFile(table + "tmp_clone_all_81_81_0/other.bin"));
+    const DB::Cas::FsckReport report = storage->runFsckNow(/*detail=*/true);
+    EXPECT_EQ(report.dangling, 0u) << DB::Cas::formatFsckSummary(report);
 }

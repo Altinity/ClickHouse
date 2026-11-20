@@ -1,5 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <expected>
+#include <stdexcept>
 #include <optional>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
@@ -1007,6 +1010,75 @@ TEST(CASGCRebuild, LivePrecommitWithoutAManifestKeepsItsBodyThroughARebuild)
         << "the body committed part_x names was deleted";
 }
 
+/// A refusal that is thrown, not returned, still reaches the caller when `gc/state` moved after the claim.
+TEST(CASGCRebuild, LostLeaseGiveBackKeepsAThrownRefusalAndWarns)
+{
+    auto backend = std::make_shared<SweepReadHookBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const ManifestRef pre = seedBodilessPrecommitOverReusedBody(*backend, layout);
+    backend->arm(layout.manifestKey(ManifestId{kWriterNs, pre}), 1, [&]
+    {
+        OperationForTest op(*backend);
+        const auto current = (*op).read(layout.gcStateKey(), Retry::once());
+        ASSERT_TRUE(current.has_value());
+        ASSERT_TRUE(std::holds_alternative<Committed>(
+            (*op).replace(layout.gcStateKey(), current->bytes, current->etag, Retry::once())));
+    });
+
+    const UInt128 rebuild_id = hexToU128("00000000000000000000000000000024");
+    ScopedLogCapture capture("CasGc", "warning");
+    Gc gc(store, rebuild_id);
+    expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "live precommit 'part_x'",
+        [&] { (void)gc.rebuildBaseline(/*force*/ false); });
+    ASSERT_TRUE(backend->didFire());
+    EXPECT_EQ(capture.count("could not give back its GC lease"), 1u) << capture.captured();
+    EXPECT_EQ(decodeGcState(readObj(*backend, layout.gcStateKey())->bytes).lease.owner, rebuild_id);
+}
+
+namespace
+{
+
+/// Fails every conditional write to `gc/state` while `fail_gc_state_replace` is set.
+class GcStateReplaceFailsBackend final : public CountingBackend
+{
+public:
+    std::atomic<bool> fail_gc_state_replace{false};
+    String gc_state_key;
+
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value,
+                                             DB::Cas::TransportAccess & access) override
+    {
+        if (fail_gc_state_replace && expected_value && key == gc_state_key)
+            throw std::runtime_error("GcStateReplaceFailsBackend: the give-back write fails");
+        return CountingBackend::write(key, bytes, expected_value, access);
+    }
+};
+
+}
+
+/// The give-back never throws: when its own write fails, the caller still gets the refusal, with a warning.
+TEST(CASGCRebuild, FailingLeaseGiveBackLeavesTheRefusalToTheCaller)
+{
+    auto backend = std::make_shared<GcStateReplaceFailsBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    backend->gc_state_key = layout.gcStateKey();
+    backend->fail_gc_state_replace = true;
+    seedBodilessPrecommitOverReusedBody(*backend, layout);
+
+    const UInt128 rebuild_id = hexToU128("00000000000000000000000000000025");
+    ScopedLogCapture capture("CasGc", "warning");
+    Gc gc(store, rebuild_id);
+    expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "live precommit 'part_x'",
+        [&] { (void)gc.rebuildBaseline(/*force*/ false); });
+    EXPECT_EQ(capture.count("could not give back its GC lease"), 1u) << capture.captured();
+    EXPECT_EQ(capture.count("the give-back write fails"), 1u) << capture.captured();
+    EXPECT_EQ(decodeGcState(readObj(*backend, layout.gcStateKey())->bytes).lease.owner, rebuild_id)
+        << "a failed give-back leaves the claim in place";
+}
+
 /// The refusal is a wait, not a verdict: once the manifest is readable, a rebuild with a fresh GC identity,
 /// as each `SYSTEM CAS GC REBUILD` takes, counts the precommit.
 TEST(CASGCRebuild, RebuildRefusedForAnUnreadableManifestSucceedsOnceItIsReadable)
@@ -1017,7 +1089,8 @@ TEST(CASGCRebuild, RebuildRefusedForAnUnreadableManifestSucceedsOnceItIsReadable
     const ManifestRef pre = seedBodilessPrecommitOverReusedBody(*backend, layout);
 
     Gc refused(store, hexToU128("00000000000000000000000000000022"));
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)refused.rebuildBaseline(/*force*/ false); });
+    expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "live precommit 'part_x'",
+        [&] { (void)refused.rebuildBaseline(/*force*/ false); });
 
     writeManifestRaw(*backend, layout, kWriterNs, pre, {blobEntryFor("x", kReusedBody)});
     /// The refused attempt left a generation-0 `gc/state` with the never-held lease, which looks healthy.

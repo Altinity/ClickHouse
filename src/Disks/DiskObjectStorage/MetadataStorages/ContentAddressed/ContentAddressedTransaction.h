@@ -1,6 +1,7 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobHashingWriteBuffer.h>
@@ -138,6 +139,10 @@ private:
         /// Created lazily when a staged blob, inline entry, or adopted entry first needs publication.
         Cas::PartWriteTxnPtr build;
         std::vector<Cas::ManifestEntry> entries;   /// staged manifest entries (uploads + adoptions)
+        /// The committed source of each entry in `entries` adopted without reading its body, keyed by entry path.
+        /// It follows the entry through staged copies and renames; `confirmCopySources` checks it before promote.
+        /// Written only by `putEntry` and `eraseEntry`, which keep it in step with `entries`.
+        std::map<std::string, Cas::CopySource> copy_sources;
         /// The committed manifest this transaction found under the part's name when it first staged a
         /// write to it; a later commit requires exactly that binding. Empty for a part the transaction
         /// creates (`tmp_*`), where a committed row at commit time is somebody else's part, not ours,
@@ -192,6 +197,15 @@ private:
     /// so the S3 staging object holds `[header][payload]` and the promote
     /// stays a verbatim server-side copy. `build_id` is left 0 (not known at stream time; diagnostic-only).
     std::string buildS3StagingBlobHeader(const ContentAddressedMetadataStorage::Route & route) const;
+
+    /// Replaces the staged entry at `entry.path`; `source` is its committed source when it was adopted from
+    /// another part without its bytes, and nullopt when this transaction uploads or inlines the bytes.
+    static void putEntry(PartStaging & st, Cas::ManifestEntry entry, std::optional<Cas::CopySource> source);
+    static void eraseEntry(PartStaging & st, const std::string & path);
+    static std::optional<Cas::CopySource> copySourceOf(const PartStaging & st, const std::string & path);
+    /// Confirms each distinct committed source of `st`'s adopted entries. Runs after the precommit of
+    /// `st.build` is durable and before its promote; on a refusal it abandons the build and throws.
+    void confirmCopySources(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st);
 
     /// Returns (and, when necessary, creates) the staging state for a routed namespace/ref.
     PartStaging & stagingFor(const ContentAddressedMetadataStorage::Route & r);

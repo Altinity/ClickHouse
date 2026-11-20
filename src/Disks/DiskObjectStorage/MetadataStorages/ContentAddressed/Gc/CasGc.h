@@ -110,7 +110,7 @@ struct RoundAnomaly
 
 /// Outcome of `Gc::rebuildBaseline`: either a live-conservative baseline was published, with its minted
 /// numbering and coverage counters, or the rebuild was refused. Refusal is fail-closed: `refusal` says
-/// why, no partial baseline is committed, and `gc/state` remains untouched.
+/// why and no partial baseline is committed. A lease the rebuild claimed over a never-held one is given back.
 struct RebuildReport
 {
     bool performed = false;

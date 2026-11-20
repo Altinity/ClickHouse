@@ -471,19 +471,19 @@ bool CasRefLedger::hasAnyRefWithPrefix(const RootNamespace & ns, std::string_vie
 
 
 ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const String & ref_name,
-                                           const ManifestRef & manifest_ref) const
+                                           const ManifestRef & manifest_ref, ConfirmLockMode lock_mode) const
 {
-    /// Gate 1 of the relink confirm (spec §confirm-primitive). A `Yes` authorizes a REMOTE receiver to
-    /// promote a manifest whose blobs are protected only by this writer's committed binding of that
+    /// Gate 1 of the relink confirm. A `Yes` authorizes a remote relink receiver, or an in-process copy,
+    /// to promote a manifest whose blobs are protected only by this writer's committed binding of that
     /// exact manifest, so a `Yes` is an assertion about the durable table, not about this cache. Every
     /// rule below exists to make that assertion true; the answer to anything a rule cannot establish is
-    /// `Unknown`, which costs the receiver a retry and costs correctness nothing.
+    /// `Unknown`, which costs the caller a retry or a refused copy and costs correctness nothing.
     ///
     /// Two structural properties, both load-bearing:
     ///
-    ///   ZERO object-store I/O. This runs on an interserver request, so anything it could be made to
-    ///   do is something a remote peer can make this writer do. It therefore reads only what is already
-    ///   resident, never recovers, never resolves a wedge, and -- see the `find` below -- never even
+    ///   ZERO object-store I/O. The relink sender runs this on an interserver request, so anything it
+    ///   could be made to do is something a remote peer can make this writer do. It therefore reads only
+    ///   what is already resident, never recovers, never resolves a wedge, and -- see the `find` below -- never even
     ///   materializes a runtime. Deliberately absent for the same reason: `ensureRefTableRecovered`,
     ///   `sweepStalePrecommitsForRead` and `maybeScheduleSnapshotPublish`, the three maintenance calls
     ///   `resolveRef` performs and all three of which can do I/O.
@@ -538,15 +538,14 @@ ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const Stri
         return ConfirmAnswer::Unknown;
     };
 
-    /// `try_to_lock`, not a blocking acquire: this function already holds `ref_queue_mutex`, which is
-    /// pool-wide append admission, so blocking here would stall EVERY table's lane for as long as
-    /// whoever holds `state_mutex` keeps it. That is the zero-I/O contract broken by proxy: the query
-    /// would not issue a request, it would merely wait on one, and it would hold up admission
-    /// meanwhile. Failing to take the lock is just one more ambiguity, so it answers like every other
-    /// one. (Same technique, and same non-blocking rationale, as `enforceRefTableCacheBudget`'s
-    /// candidate loop.)
-    std::unique_lock<std::mutex> slock(rt.state_mutex, std::try_to_lock);
-    if (!slock.owns_lock())
+    /// `TryLock` for a remote query: this function already holds `ref_queue_mutex`, which is pool-wide
+    /// append admission, and a peer must not make every table's lane wait on this table's state lock.
+    /// Failing to take the lock is one more ambiguity, so it answers like every other one. `Wait` is for
+    /// an in-process copy (see `ConfirmLockMode`): it waits as long as the current holder's in-memory work.
+    std::unique_lock<std::mutex> slock(rt.state_mutex, std::defer_lock);
+    if (lock_mode == ConfirmLockMode::Wait)
+        slock.lock();
+    else if (!slock.try_lock())
         return refuse(ProfileEvents::CASRelinkConfirmRefusedStateLockBusy, "the table's state lock is held");
 
     /// Rule 2 (warm). An unrecovered or mid-recovery runtime has an EMPTY `state`, which would read as

@@ -627,7 +627,7 @@ public:
     /// mount no longer holds, or no renewer to prove it, turns `Yes` into `Unknown`; a failed read
     /// throws, and the storage layer answers `Unknown`. Any other ledger answer issues no request.
     ConfirmAnswer confirmExactRef(const RootNamespace & ns, const String & ref_name,
-                                  const ManifestRef & manifest_ref) const;
+                                  const ManifestRef & manifest_ref, ConfirmLockMode lock_mode) const;
     /// TEST SEAM: runs between the ownership capture and the ledger snapshot.
     void setConfirmAfterOwnershipCaptureHookForTest(std::function<void()> hook)
     {

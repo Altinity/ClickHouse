@@ -238,6 +238,50 @@ ContentAddressedTransaction::findPendingBlob(const PartStaging & st, const Cas::
     return nullptr;
 }
 
+void ContentAddressedTransaction::putEntry(PartStaging & st, Cas::ManifestEntry entry, std::optional<Cas::CopySource> source)
+{
+    eraseEntry(st, entry.path);
+    if (source)
+        st.copy_sources.insert_or_assign(entry.path, std::move(*source));
+    st.entries.push_back(std::move(entry));
+}
+
+void ContentAddressedTransaction::eraseEntry(PartStaging & st, const std::string & path)
+{
+    std::erase_if(st.entries, [&](const Cas::ManifestEntry & e) { return e.path == path; });
+    st.copy_sources.erase(path);
+}
+
+std::optional<Cas::CopySource> ContentAddressedTransaction::copySourceOf(const PartStaging & st, const std::string & path)
+{
+    const auto it = st.copy_sources.find(path);
+    if (it == st.copy_sources.end())
+        return std::nullopt;
+    return it->second;
+}
+
+void ContentAddressedTransaction::confirmCopySources(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st)
+{
+    /// An entry whose bytes this transaction uploads is protected by its own precommit, whatever it was copied from.
+    std::vector<Cas::CopySource> sources;
+    for (const auto & entry : st.entries)
+        if (const auto source = copySourceOf(st, entry.path); source && !findPendingBlob(st, entry.ref)
+            && std::find(sources.begin(), sources.end(), *source) == sources.end())
+            sources.push_back(*source);
+
+    /// A source this transaction changes before it publishes the copy no longer commits the manifest the copy
+    /// read, so it is refused too. `commit` publishes in `(ns, ref)` order, so that is any source sorting first.
+    const auto access = metadata_storage.partAccess();
+    for (const auto & source : sources)
+    {
+        if (access->confirmCopySource(source))
+            continue;
+        st.build->abandon();
+        st.build.reset();
+        Cas::throwCopySourceUnconfirmed(source, {ns, ref});
+    }
+}
+
 void ContentAddressedTransaction::adoptStagedBlob(
     const PartStaging::PendingBlob * pb, const Cas::ManifestEntry & entry,
     PartStaging & dst_st, Cas::PartWriteTxn & dst_build, bool copy_pending)
@@ -417,6 +461,7 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
                 /// gets promoted. A marks-only removal never enters this sub-block (`st.build` is null).
                 const Cas::ManifestId scratch_id = st.build->stageManifest(st.entries);
                 st.build->precommitAdd(ns, ref, scratch_id);
+                confirmCopySources(ns, ref, st);
                 uploadPendingBlobs(st);
             }
 
@@ -471,6 +516,7 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
     /// sabotage (Gate A) is the formal guard.
     const Cas::ManifestId id = st.build->stageManifest(st.entries);
     st.build->precommitAdd(ns, ref, id);
+    confirmCopySources(ns, ref, st);
     uploadPendingBlobs(st);
 
     /// Test-only fault seam (Task 3 TDD): simulate a promote-time backend failure for `ref` right
@@ -777,8 +823,7 @@ void ContentAddressedTransaction::stageBlobPartFile(
     entry.placement = Cas::EntryPlacement::Blob;
     entry.ref = ref;
     entry.blob_size = size;
-    std::erase_if(st.entries, [&](const Cas::ManifestEntry & e) { return e.path == entry.path; });
-    st.entries.push_back(std::move(entry));
+    putEntry(st, std::move(entry), std::nullopt);
 }
 
 std::string ContentAddressedTransaction::buildS3StagingBlobHeader(
@@ -1009,8 +1054,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
                 /// `blob_size` stays 0 (its default) for an Inline entry — matching decode, which never
                 /// fills it for Inline. `entry.size()` is the logical size, derived from `inline_bytes`.
                 entry.inline_bytes = std::move(bytes);
-                std::erase_if(st.entries, [&](const Cas::ManifestEntry & e) { return e.path == entry.path; });
-                st.entries.push_back(std::move(entry));
+                putEntry(st, std::move(entry), std::nullopt);
             }
             else
             {
@@ -1082,7 +1126,11 @@ void ContentAddressedTransaction::removeDirectory(const std::string & path)
         if (auto * st = findStaging(*r))
         {
             st->content_removed.clear();
-            st->entries.clear();
+            while (!st->entries.empty())
+            {
+                const std::string entry_path = st->entries.back().path;
+                eraseEntry(*st, entry_path);
+            }
             st->base_manifest_ref.reset();
             if (st->build)
             {
@@ -1228,20 +1276,23 @@ void ContentAddressedTransaction::createHardLink(const std::string & path_from, 
         if (it != src_st->entries.end())
         {
             entry = *it;
+            /// A copy of an adopted entry confirms the committed part the entry came from.
+            std::optional<Cas::CopySource> source;
             if (entry.placement == Cas::EntryPlacement::Blob)
             {
                 /// Unified adopt dispatch. copy_pending=(&dst_st != src_st) so the pending
                 /// blob record is copied into dst_st only when the destination is a different part
                 /// (hardlink = copy semantics; same-part is a self-ref that shouldn't duplicate the record).
                 const auto * pb = findPendingBlob(*src_st, entry.ref);
+                if (!pb)
+                    source = copySourceOf(*src_st, src->file);
                 adoptStagedBlob(pb, entry, dst_st, buildFor(*dst, dst_st), /*copy_pending=*/(&dst_st != src_st));
             }
             else if (entry.placement != Cas::EntryPlacement::Inline)
                 throw Exception(ErrorCodes::LOGICAL_ERROR,
                     "ContentAddressed: staged hardlink of unsupported placement for {}", path_from);
             entry.path = dst->file;
-            std::erase_if(dst_st.entries, [&](const Cas::ManifestEntry & e) { return e.path == entry.path; });
-            dst_st.entries.push_back(std::move(entry));
+            putEntry(dst_st, std::move(entry), std::move(source));
             return;
         }
     }
@@ -1262,8 +1313,10 @@ void ContentAddressedTransaction::createHardLink(const std::string & path_from, 
     buildFor(*dst, dst_st).adoptEvidence(*src_entry);
     entry = *src_entry;
     entry.path = dst->file;
-    std::erase_if(dst_st.entries, [&](const Cas::ManifestEntry & e) { return e.path == entry.path; });
-    dst_st.entries.push_back(std::move(entry));
+    std::optional<Cas::CopySource> source;
+    if (entry.placement == Cas::EntryPlacement::Blob)
+        source = Cas::CopySource{src->refKey(), view->manifestId().ref};
+    putEntry(dst_st, std::move(entry), std::move(source));
 }
 
 void ContentAddressedTransaction::setLastModified(const std::string &, const Poco::Timestamp &)
@@ -1366,9 +1419,22 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
         {
             const std::string old_prefix = src->file + "/";
             const std::string new_prefix = dst->file + "/";
-            for (auto & entry : st->entries)
+            /// Re-keying entry by entry onto a staged `.proj` would merge the two directories, not replace one.
+            if (std::any_of(st->entries.begin(), st->entries.end(),
+                    [&](const Cas::ManifestEntry & e) { return e.path.starts_with(new_prefix); }))
+                throw Exception(ErrorCodes::LOGICAL_ERROR,
+                    "ContentAddressed: moveDirectory {} -> {}: the destination projection directory is already staged",
+                    path_from, path_to);
+            std::vector<std::pair<Cas::ManifestEntry, std::optional<Cas::CopySource>>> rekeyed;
+            for (const auto & entry : st->entries)
                 if (entry.path.starts_with(old_prefix))
-                    entry.path = new_prefix + entry.path.substr(old_prefix.size());
+                    rekeyed.emplace_back(entry, copySourceOf(*st, entry.path));
+            for (auto & [entry, source] : rekeyed)
+            {
+                eraseEntry(*st, entry.path);
+                entry.path = new_prefix + entry.path.substr(old_prefix.size());
+                putEntry(*st, std::move(entry), std::move(source));
+            }
             return;
         }
     }
@@ -1417,8 +1483,8 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
                         "ContentAddressed: moveDirectory file collision on '{}' ({} -> {}): "
                         "source and destination staged different bytes for the same file",
                         entry.path, src->ref, dst->ref);
-                std::erase_if(dst_st.entries, [&](const Cas::ManifestEntry & e) { return e.path == entry.path; });
-                dst_st.entries.push_back(std::move(entry));
+                std::optional<Cas::CopySource> source = copySourceOf(src_st, entry.path);
+                putEntry(dst_st, std::move(entry), std::move(source));
             }
             /// Carry any staged removal marks forward too — a re-key of the
             /// staging key must not silently drop them.
@@ -1604,8 +1670,9 @@ void ContentAddressedTransaction::moveFile(const std::string & path_from, const 
         [&](const Cas::ManifestEntry & e) { return e.path == src->file; });
     if (it != src_st.entries.end())
     {
-        auto entry = std::move(*it);
-        src_st.entries.erase(it);
+        auto entry = *it;
+        std::optional<Cas::CopySource> source = copySourceOf(src_st, src->file);
+        eraseEntry(src_st, src->file);
         entry.path = dst->file;
         if (&src_st != &dst_st && entry.placement == Cas::EntryPlacement::Blob)
         {
@@ -1621,8 +1688,7 @@ void ContentAddressedTransaction::moveFile(const std::string & path_from, const 
             }
             adoptStagedBlob(findPendingBlob(dst_st, entry.ref), entry, dst_st, buildFor(*dst, dst_st), /*copy_pending=*/false);
         }
-        std::erase_if(dst_st.entries, [&](const Cas::ManifestEntry & e) { return e.path == entry.path; });
-        dst_st.entries.push_back(std::move(entry));
+        putEntry(dst_st, std::move(entry), std::move(source));
         return;
     }
     /// Source not staged in this transaction: this would cover a standalone one-shot rename of a
@@ -1646,7 +1712,7 @@ void ContentAddressedTransaction::replaceFile(const std::string & path_from, con
         /// cleanupPendingTempFiles at commit end, and the orphaned record is filtered out of the
         /// publish upload by the staged-tree-hash check in publishStaging. We do NOT purge it
         /// eagerly because the same hash may still be referenced by another staged entry.
-        std::erase_if(dst_st.entries, [&](const Cas::ManifestEntry & e) { return e.path == dst->file; });
+        eraseEntry(dst_st, dst->file);
     }
     moveFile(path_from, path_to);
 }
@@ -1688,7 +1754,7 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool if_e
         /// cleanupPendingTempFiles at commit end, and the orphaned record is filtered out of the
         /// publish upload by the staged-tree-hash check in publishStaging. We do NOT purge it
         /// eagerly because the same hash may still be referenced by another staged entry.
-        std::erase_if(st.entries, [&](const Cas::ManifestEntry & e) { return e.path == r->file; });
+        eraseEntry(st, r->file);
         if (!staged_here)
         {
             /// One fresh resolve per (transaction, ref), not per file: the MergeTree fast-removal path

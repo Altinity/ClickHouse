@@ -7,6 +7,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
@@ -51,7 +52,9 @@ extern const Event CASGCReadAheadHit;
 
 namespace DB::ErrorCodes
 {
+extern const int ABORTED;
 extern const int BAD_ARGUMENTS;
+extern const int NO_REPLICA_HAS_PART;
 extern const int NOT_IMPLEMENTED;
 extern const int READONLY;
 }
@@ -4251,16 +4254,25 @@ struct PausedLeaderPool
         });
     }
 
-    /// A's parked round. Its commit loses to B, so it may throw; only the store's state is asserted.
+    /// A's parked round. Its commit loses to B and throws `ABORTED`; the round must have reached the validation
+    /// read first, and it saw B's version there.
     void runLeaderA()
     {
+        std::map<String, UInt64> reduce;
+        gc_a->setPhaseSink([&reduce](const GcPhaseRecord & record)
+        {
+            if (record.phase == "fold_reduce")
+                reduce = record.metrics;
+        });
         try
         {
             runGateRound(store, *gc_a);
         }
-        catch (...) // NOLINT(bugprone-empty-catch)
+        catch (const DB::Exception & e)
         {
+            ASSERT_EQ(e.code(), DB::ErrorCodes::ABORTED) << e.message();
         }
+        ASSERT_EQ(metricOr(reduce, "parent_unconfirmed"), 1u) << "A's round never reached the validation read";
     }
 
     void expectDeposedAndCleaned() const
@@ -4309,7 +4321,7 @@ TEST(CASGcIntents, PausedLeaderWhoseLogWasCleanedDeletesNothing)
 
     pool.parkLeaderA([&] { w->promote(); });
     const size_t from = pool.backend->journal().size();
-    pool.runLeaderA();
+    ASSERT_NO_FATAL_FAILURE(pool.runLeaderA());
     ASSERT_NO_FATAL_FAILURE(pool.expectDeposedAndCleaned());
 
     const auto journal = pool.backend->journal();
@@ -4318,7 +4330,7 @@ TEST(CASGcIntents, PausedLeaderWhoseLogWasCleanedDeletesNothing)
         << "the deposed leader deleted the body";
     EXPECT_TRUE(objectPresent(*pool.backend, pool.body_key)) << "W's part names a deleted body";
     const FsckReport report = runFsck(*pool.store, /*detail=*/true);
-    EXPECT_EQ(report.dangling, 0u) << formatFsckSummary(report);
+    EXPECT_TRUE(report.clean()) << formatFsckSummary(report);
 }
 
 /// The same pause over `standing(t)`: W's precommit names the blob, and A must not delete `I(B,t)`.
@@ -4331,17 +4343,29 @@ TEST(CASGcIntents, PausedLeaderWhoseLogWasCleanedDeletesNoIntent)
     ASSERT_TRUE(pool.row() && pool.row()->standing) << "A did not commit standing(t)";
     const String intent_key = pool.store->layout().blobIntentKey(pool.x, *pool.row()->token.canonical());
     ASSERT_TRUE(objectPresent(*pool.backend, intent_key));
+    ASSERT_FALSE(objectPresent(*pool.backend, pool.body_key)) << "the standing round deletes the body first";
 
     SlowWrite w = beginSlowWrite(pool.store, pool.ns_w, "w", pool.payload, /*upload=*/false);
     pool.parkLeaderA([&] { w.promote(); });
     const size_t from = pool.backend->journal().size();
-    pool.runLeaderA();
+    ASSERT_NO_FATAL_FAILURE(pool.runLeaderA());
     ASSERT_NO_FATAL_FAILURE(pool.expectDeposedAndCleaned());
 
     const auto journal = pool.backend->journal();
     const auto requests = blobRequests(std::vector<JournalEntry>(journal.begin() + from, journal.end()));
     EXPECT_EQ(intentDeletes(requests), 0u) << "the deposed leader deleted the intent";
     EXPECT_TRUE(objectPresent(*pool.backend, intent_key));
+    const FsckReport report = runFsck(*pool.store, /*detail=*/true);
+    /// A deleted the body in its `standing` round, before W adopted it without a request, so W's entry is
+    /// the one dangling reference. The intent must not turn up as a second finding.
+    EXPECT_EQ(report.dangling, 1u) << formatFsckSummary(report);
+    for (const FsckObject & object : report.objects)
+        if (object.cls == FsckClass::Dangling)
+            EXPECT_EQ(object.key, pool.body_key);
+    EXPECT_EQ(report.intent_malformed + report.intent_unread + report.pending_without_intent
+                  + report.pending_intent_absent + report.pending_token_rejected + report.stale_edge,
+              0u) << formatFsckSummary(report);
+    EXPECT_EQ(report.intent_listed, 1u) << formatFsckSummary(report);
 }
 
 /// The validation read of `gc/state` answers with absence, or never answers: the round deletes nothing, throws
@@ -4381,6 +4405,31 @@ TEST(CASGcIntents, UnconfirmedLeasedStateSuppressesTheRound)
         EXPECT_EQ(report.bodies_deleted, 1u) << "the confirmed round did not delete the body";
         EXPECT_EQ(metricOr(reduce, "parent_unconfirmed"), 0u);
     }
+}
+
+/// The validation read is sent when the only `pending` row is in a shard other than the first.
+TEST(CASGcIntents, ValidationReadIsSentForAPendingRowInALaterShard)
+{
+    constexpr uint64_t shards = 4;
+    const uint64_t blob = blobsInShard(2, shards, 1).front();
+    IntentPool<PausedLeaderBackend> pool(std::make_shared<PausedLeaderBackend>(), {.gc_shards = shards});
+    ASSERT_NO_FATAL_FAILURE(pool.makePending({blob}));
+    for (uint64_t shard = 0; shard < shards; ++shard)
+        EXPECT_EQ(currentRetiredSet(*pool.backend, pool.layout(), shard).size(), shard == 2 ? 1u : 0u) << "shard " << shard;
+
+    std::map<String, UInt64> reduce;
+    pool.gc->setPhaseSink([&reduce](const GcPhaseRecord & record)
+    {
+        if (record.phase == "fold_reduce")
+            reduce = record.metrics;
+    });
+    pool.backend->state_head = StateHead::Absent;
+    pool.backend->clearJournal();
+    const RoundReport report = pool.round();
+    EXPECT_EQ(stateHeadIndices(pool.backend->journal()).size(), 1u);
+    EXPECT_EQ(metricOr(reduce, "parent_unconfirmed"), 1u);
+    EXPECT_EQ(report.bodies_deleted, 0u);
+    EXPECT_TRUE(pool.bodyMeta(blob).has_value());
 }
 
 /// A refusal of the validation read fails the round, as a refusal of any other read of the fold does.
@@ -4445,4 +4494,38 @@ TEST(CASGcIntents, RoundsWithoutADeletePendingParentRowSendNoValidationRead)
     pool.backend->clearJournal();
     pool.round();
     EXPECT_EQ(stateHeadIndices(pool.backend->journal()).size(), 1u) << "positive control: the round after it";
+}
+
+/// ---- A no-bytes republish whose source is not live ----
+
+/// `republishRef` reads the source, then publishes the destination with no request on the body. A source dropped
+/// and reclaimed before the destination precommit must fail the call, and the call must take back its precommit.
+TEST(CASSourceLiveness, RepublishRefRefusesASourceDroppedBeforeTheDestinationPrecommit)
+{
+    auto backend = std::make_shared<IntentDeleteParkingBackend>();
+    auto store = openGatePool(backend);
+    const String payload = "source-liveness-republish";
+    const String body_key = store->layout().blobKey(idOf(payload));
+    const RootNamespace from{"test/from"};
+    const RootNamespace to{"test/to"};
+
+    ASSERT_EQ(writeOnePart(store, from.string(), "all_1_1_0", payload), BlobMaterializationAction::Published);
+    CachedPartFolderAccess access(store);
+    Gc gc(store, kGateLeaderA);
+    bool reclaimed = false;
+    access.setHookForTest(CachedPartFolderAccess::TestHook::BeforeDestinationPublish, [&]
+    {
+        store->dropRef(from, "all_1_1_0");
+        store->renewWatermarkOnce();
+        runRoundsUntil(store, gc, [&] { return !objectPresent(*backend, body_key); });
+        reclaimed = !objectPresent(*backend, body_key);
+    });
+    expectThrowsCode(DB::ErrorCodes::NO_REPLICA_HAS_PART, [&] { access.republishRef({from, "all_1_1_0"}, {to, "all_1_1_0"}); });
+    access.setHookForTest(CachedPartFolderAccess::TestHook::BeforeDestinationPublish, nullptr);
+    ASSERT_TRUE(reclaimed) << "the source's body was not reclaimed inside the window";
+    EXPECT_FALSE(access.existsRef({to, "all_1_1_0"}, Freshness::ForceFresh)) << "the copy of a dropped source was promoted";
+    EXPECT_TRUE(store->livePrecommitsForTest(to).empty()) << "the refused republish left its precommit";
+
+    const FsckReport report = runFsck(*store, /*detail=*/true);
+    EXPECT_EQ(report.dangling, 0u) << formatFsckSummary(report);
 }

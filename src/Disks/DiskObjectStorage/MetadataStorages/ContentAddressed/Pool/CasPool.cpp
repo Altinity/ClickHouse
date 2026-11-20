@@ -2237,7 +2237,7 @@ DropNamespaceStats Pool::dropNamespace(const NamespaceLifeId & life)
 }
 
 ConfirmAnswer Pool::confirmExactRef(const RootNamespace & ns, const String & ref_name,
-                                    const ManifestRef & manifest_ref) const
+                                    const ManifestRef & manifest_ref, ConfirmLockMode lock_mode) const
 {
     /// Captured before the ledger snapshot: if a remount lands in between, this older ownership cannot
     /// hold the new slot, so the mismatch refuses. The order is safety-bearing;
@@ -2245,7 +2245,7 @@ ConfirmAnswer Pool::confirmExactRef(const RootNamespace & ns, const String & ref
     const std::shared_ptr<const MountSlotOwnership> ownership = mount_runtime.slotOwnership();
     if (confirm_after_ownership_capture_hook_for_test)
         confirm_after_ownership_capture_hook_for_test();
-    const ConfirmAnswer answer = ref_ledger.confirmExactRef(ns, ref_name, manifest_ref);
+    const ConfirmAnswer answer = ref_ledger.confirmExactRef(ns, ref_name, manifest_ref, lock_mode);
     if (answer != ConfirmAnswer::Yes)
         return answer;
     if (confirm_after_ledger_snapshot_hook_for_test)

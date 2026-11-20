@@ -219,7 +219,7 @@ public:
 
     /// Rebuilds the GC baseline for the `SYSTEM` disaster-recovery command. Each invocation uses a
     /// fresh GC identity because `rebuildBaseline` performs its own lease check. A refused rebuild
-    /// (`report.performed == false`) writes nothing; the `SYSTEM` interpreter surfaces the refusal.
+    /// (`report.performed == false`) installs no baseline; the `SYSTEM` interpreter surfaces the refusal.
     /// Throws `BAD_ARGUMENTS` when GC is disabled by read-only mode or configuration.
     Cas::RebuildReport runGcRebuildNow(bool force) const;
 

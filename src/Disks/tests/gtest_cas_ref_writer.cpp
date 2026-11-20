@@ -5394,24 +5394,24 @@ TEST(CASRefWriterNamespaceRemoval, ResolveReadProvingRemovingLeavesNoUnresolvedW
 
     backend->catalog_fault_key = layout.refCatalogKey();
     backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::HoldUncommitted;
-    /// The resolve read follows the loop's last read with no pause in between, so it is the first catalog
-    /// read that finds the clock unmoved since the previous one. The loop's own mismatch re-read can
-    /// also find it unmoved, so the release time is checked against the window below.
-    std::optional<uint64_t> previous_read_ms;
+    /// Inside the loop every catalog read follows a catalog write, so the resolve read in the catch is the first
+    /// catalog read whose previous catalog request is also a read. A pause can separate the two: after its last
+    /// pause the loop may give up without sending anything.
     std::optional<uint64_t> released_at_ms;
     bool applied_by_resolve_read = false;
     backend->read_observer = [&](const String & key)
     {
-        if (key != layout.refCatalogKey() || !backend->catalog_cas_fault_fired)
+        if (key != layout.refCatalogKey() || !backend->catalog_cas_fault_fired || applied_by_resolve_read)
             return;
-        const uint64_t now = clock->nowMs();
-        if (!applied_by_resolve_read && previous_read_ms == now)
-        {
-            applied_by_resolve_read = true;
-            released_at_ms = now;
-            backend->releaseHeldCatalogWrite();
-        }
-        previous_read_ms = now;
+        /// The journal already ends with this read.
+        const std::vector<String> journal = backend->requestJournal();
+        const auto previous = std::find_if(std::next(journal.rbegin()), journal.rend(),
+            [&](const String & request) { return request.ends_with(" " + key); });
+        if (previous == journal.rend() || *previous != "GET " + key)
+            return;
+        applied_by_resolve_read = true;
+        released_at_ms = clock->nowMs();
+        backend->releaseHeldCatalogWrite();
     };
     /// Wedge the terminal append so the runtime stays between `Removing` and the terminal transaction.
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
@@ -5421,9 +5421,11 @@ TEST(CASRefWriterNamespaceRemoval, ResolveReadProvingRemovingLeavesNoUnresolvedW
 
     ASSERT_TRUE(applied_by_resolve_read) << "the kept write was never applied before the resolve read";
     ASSERT_TRUE(released_at_ms.has_value());
-    /// The loop gives up once the next pause no longer fits in the window, so at most one backoff draw
-    /// before its end. An earlier release came from a read inside the loop.
-    EXPECT_GE(*released_at_ms - drop_started_ms, kDefaultRequestWindowMs - kMaxBackoffDrawMs)
+    /// The loop gives up once the next pause plus the room `CasOperation::pauseBeforeRedecide` reserves for the
+    /// next decision's read and write no longer fits in the window. An earlier release came from a read inside the loop.
+    const uint64_t next_decision_reservation_ms = 2 * store->mountRequests().attemptReservationMs();
+    EXPECT_GE(*released_at_ms - drop_started_ms,
+              kDefaultRequestWindowMs - kMaxBackoffDrawMs - next_decision_reservation_ms)
         << "the kept write was released inside the transition's retry loop, before it gave up; "
            "the resolve read in the catch was not what applied it";
     EXPECT_EQ(catalogEntryOrThrow(backend, layout, ns).state, NsState::Removing);

@@ -79,6 +79,11 @@ std::string_view refLaneStateName(RefLaneState state);
 /// consumer that treats `No` as knowledge; only `Yes` is gated on the fence.
 enum class ConfirmAnswer : uint8_t { Yes, No, Unknown };
 
+/// How `confirmExactRef` takes the table's state lock. `TryLock` answers `Unknown` while anyone holds it: a remote
+/// relink query must not hold up append admission. `Wait` blocks for it, for an in-process copy whose own operation
+/// fails on a spurious `Unknown`; no holder of the state lock does store I/O or takes `ref_queue_mutex`.
+enum class ConfirmLockMode : uint8_t { TryLock, Wait };
+
 /// How a ref-table recovery ended without an exception. `LifeRemoved`: the catalog no longer names the
 /// runtime's exact life after the walk; nothing was installed and the runtime is detached.
 enum class RefRecoveryOutcome : uint8_t { Recovered, LifeRemoved };
@@ -166,9 +171,9 @@ public:
     ///
     /// Performs ZERO object-store I/O: a cold, evicted or recovering table answers `Unknown` rather
     /// than recovering from storage, and no runtime is created as a side effect of asking. That is a
-    /// contract, not an optimization -- the confirm is a read-only interserver query that a remote
-    /// receiver drives, so the ledger must never do work for it. The one exception is the single mount-slot
-    /// `GET` that `Pool::confirmExactRef` adds after a `Yes`.
+    /// contract, not an optimization -- the relink sender answers it on a read-only interserver query
+    /// that a remote receiver drives, so the ledger must never do work for it. The one exception is the
+    /// single mount-slot `GET` that `Pool::confirmExactRef` adds after a `Yes`.
     ///
     /// The rules are evaluated as one snapshot spanning both lane mutexes, in this order: table warm
     /// and resident; lane state `Ready` or `Writing`, with no queued or carved mutation whose
@@ -176,7 +181,7 @@ public:
     /// ambiguity answers `Unknown` -- see `ConfirmAnswer`, and the .cpp for why the order and the
     /// two-mutex hold are what make a `Yes` a linearization point rather than a guess.
     ConfirmAnswer confirmExactRef(const RootNamespace & ns, const String & ref_name,
-                                  const ManifestRef & manifest_ref) const;
+                                  const ManifestRef & manifest_ref, ConfirmLockMode lock_mode) const;
 
     /// Appends the transaction that removes one ref and waits for its durable result. A failed append
     /// propagates its exception and does not apply the removal to the in-memory table.

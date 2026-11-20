@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/ProfileEvents.h>
+#include <base/scope_guard.h>
 #include <Poco/Exception.h>
 #include <gtest/gtest.h>
 #include <algorithm>
@@ -24,6 +25,7 @@ namespace DB::ErrorCodes
     extern const int LOGICAL_ERROR;
     extern const int MEMORY_LIMIT_EXCEEDED;
     extern const int NETWORK_ERROR;
+    extern const int NO_REPLICA_HAS_PART;
 }
 
 namespace ProfileEvents
@@ -560,6 +562,141 @@ TEST(CASPartFolderAccess, RepublishRefCompletesWhenIdenticalRenameTakesDestinati
 
     EXPECT_EQ(access.getView({ns, "dst"}, Cas::Freshness::ForceFresh)->inlineBytes("f"), std::optional<String>("same"));
     EXPECT_FALSE(access.existsRef({ns, "src"}, Cas::Freshness::ForceFresh));
+}
+
+/// The source is confirmed once, after the destination's precommit is durable and before its promote; also when
+/// source and destination share a namespace, where the confirm must not deadlock on the table this call writes.
+TEST(CASPartFolderAccess, RepublishRefConfirmsItsSourceBetweenPrecommitAndPromote)
+{
+    for (const bool same_namespace : {false, true})
+    {
+        SCOPED_TRACE(same_namespace ? "same namespace" : "another namespace");
+        auto backend = std::make_shared<CountingBackend>();
+        auto store = openPoolForTest(backend);
+        const Cas::RootNamespace from{"srv/t1"};
+        const Cas::RootNamespace to{same_namespace ? "srv/t1" : "srv/t2"};
+        Cas::CachedPartFolderAccess access(store);
+        publishPart(store, from, "src", {inlineEntry("f", "same")});
+
+        size_t confirmations = 0;
+        bool precommit_live = false;
+        bool committed = true;
+        store->setConfirmAfterOwnershipCaptureHookForTest([&]
+        {
+            ++confirmations;
+            for (const auto & [ref, manifest] : store->livePrecommitsForTest(to))
+                precommit_live |= ref == "dst";
+            committed = store->resolveRef(to, "dst").has_value();
+        });
+        SCOPE_EXIT({ store->setConfirmAfterOwnershipCaptureHookForTest(nullptr); });
+
+        EXPECT_TRUE(access.republishRef({from, "src"}, {to, "dst"}));
+        EXPECT_EQ(confirmations, 1u);
+        EXPECT_TRUE(precommit_live) << "the confirmation ran before the destination precommit was durable";
+        EXPECT_FALSE(committed) << "the confirmation ran after the destination promote";
+        EXPECT_TRUE(access.existsRef({to, "dst"}, Cas::Freshness::ForceFresh));
+        EXPECT_FALSE(access.existsRef({from, "src"}, Cas::Freshness::ForceFresh));
+    }
+}
+
+/// A destination an identical move already committed gets no new source edge, so nothing is confirmed.
+TEST(CASPartFolderAccess, RepublishRefOverAnEqualCommittedDestinationConfirmsNothing)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store);
+    publishPart(store, ns, "src", {inlineEntry("f", "same")});
+    publishPart(store, ns, "dst", {inlineEntry("f", "same")});
+
+    size_t confirmations = 0;
+    store->setConfirmAfterOwnershipCaptureHookForTest([&] { ++confirmations; });
+    SCOPE_EXIT({ store->setConfirmAfterOwnershipCaptureHookForTest(nullptr); });
+
+    EXPECT_TRUE(access.republishRef({ns, "src"}, {ns, "dst"}));
+    EXPECT_EQ(confirmations, 0u);
+    EXPECT_FALSE(access.existsRef({ns, "src"}, Cas::Freshness::ForceFresh));
+}
+
+/// A source repointed before the destination publish no longer names the manifest that was copied: the call
+/// fails, takes back its precommit and leaves the source as the other writer made it.
+TEST(CASPartFolderAccess, RepublishRefRefusesASourceRepointedBeforeThePromote)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace from{"srv/t1"};
+    const Cas::RootNamespace to{"srv/t2"};
+    Cas::CachedPartFolderAccess access(store);
+    publishPart(store, from, "src", {inlineEntry("f", "mine")});
+
+    /// Heap-owned: a background publish can keep the pool, and so the sink, alive past this frame.
+    auto seen = std::make_shared<SharedEventLog>();
+    store->setEventSink([seen](const Cas::CasEvent & e) { seen->push(e); });
+    SCOPE_EXIT({ store->setEventSink(nullptr); });
+    const auto dst_events = [&](Cas::CasEventType type)
+    {
+        const std::vector<Cas::CasEvent> observed = seen->snapshot();
+        return std::count_if(observed.begin(), observed.end(), [&](const Cas::CasEvent & e)
+            { return e.type == type && e.namespace_ == to.string() && e.ref_name == "dst"; });
+    };
+
+    access.setHookForTest(Cas::CachedPartFolderAccess::TestHook::BeforeDestinationPublish, [&]
+    {
+        access.repointRef({from, "src"}, {inlineEntry("f", "newer")}, Cas::ProvenanceOp::Other,
+            access.resolve({from, "src"}, Cas::Freshness::ForceFresh)->manifest_id.ref);
+    });
+    expectThrowsCode(DB::ErrorCodes::NO_REPLICA_HAS_PART, [&] { access.republishRef({from, "src"}, {to, "dst"}); });
+    access.setHookForTest(Cas::CachedPartFolderAccess::TestHook::BeforeDestinationPublish, nullptr);
+
+    EXPECT_EQ(dst_events(Cas::CasEventType::Precommit), 1) << "positive control: the destination was precommitted";
+    EXPECT_EQ(dst_events(Cas::CasEventType::BuildPublish), 0) << "the destination was promoted, if only for a while";
+    EXPECT_EQ(dst_events(Cas::CasEventType::PrecommitRemoved), 1) << "the precommit was not abandoned";
+    EXPECT_FALSE(access.existsRef({to, "dst"}, Cas::Freshness::ForceFresh));
+    EXPECT_TRUE(store->livePrecommitsForTest(to).empty()) << "the refused republish left its precommit";
+    EXPECT_EQ(access.getView({from, "src"}, Cas::Freshness::ForceFresh)->inlineBytes("f"), std::optional<String>("newer"));
+}
+
+/// The confirm reads only a resident table, so a live source whose table was evicted is loaded before it is
+/// confirmed rather than refused.
+TEST(CASPartFolderAccess, ConfirmCopySourceLoadsAnEvictedSourceTable)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = Cas::Pool::open(backend,
+        Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .ref_table_cache_bytes = 1});
+    const Cas::RootNamespace from{"srv/t1"};
+    const Cas::RootNamespace other{"srv/t2"};
+    Cas::CachedPartFolderAccess access(store);
+    const Cas::ManifestId id = publishPart(store, from, "src", {inlineEntry("f", "live")});
+    const auto requests = [&]
+    {
+        return backend->headTotal() + backend->getTotal() + backend->getStreamTotal() + backend->writeTotal()
+            + backend->listTotal() + backend->deleteTotal() + backend->publishTotal();
+    };
+    /// A 1-byte budget is below one table's weight, so touching another table evicts the idle one.
+    const auto evict_source = [&](const String & other_ref)
+    {
+        publishPart(store, other, other_ref, {inlineEntry("f", "other")});
+        ASSERT_FALSE(store->refTableCachedForTest(from)) << "the source table was not evicted";
+    };
+
+    evict_source("y1");
+    backend->resetCounts();
+    ASSERT_TRUE(store->resolveRef(from, "src").has_value());
+    const uint64_t load_requests = requests();
+    ASSERT_GT(load_requests, 0u) << "positive control: loading an evicted table reads the store";
+
+    evict_source("y2");
+    backend->resetCounts();
+    EXPECT_TRUE(access.confirmCopySource(Cas::CopySource{{from, "src"}, id.ref}));
+    EXPECT_EQ(requests(), load_requests + 1) << "an evicted source costs one table load and the mount-slot read";
+    ASSERT_TRUE(store->refTableCachedForTest(from));
+
+    backend->resetCounts();
+    EXPECT_TRUE(access.confirmCopySource(Cas::CopySource{{from, "src"}, id.ref}));
+    EXPECT_EQ(requests(), 1u) << "a resident source costs only the mount-slot read";
+    const Cas::ManifestRef other_manifest{id.ref.writer_epoch, id.ref.build_sequence, id.ref.manifest_ordinal + 1};
+    EXPECT_FALSE(access.confirmCopySource(Cas::CopySource{{from, "src"}, other_manifest}))
+        << "a loaded table still refuses a manifest the source does not commit";
 }
 
 /// Task 7: `publishEntries`'s `catch (...) { build->abandon(); throw; }` must leave no live-epoch

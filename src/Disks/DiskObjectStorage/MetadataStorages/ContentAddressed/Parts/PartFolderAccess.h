@@ -38,6 +38,20 @@ struct PartRefKey
     String cacheKey() const { return ns.string() + '\0' + ref; }
 };
 
+/// The committed part a copy adopted entries from without reading their bodies, and the manifest it read there.
+struct CopySource
+{
+    PartRefKey part;
+    ManifestRef manifest_ref;
+
+    bool operator==(const CopySource & o) const = default;
+};
+
+/// Throws `NO_REPLICA_HAS_PART`, the code of an unconfirmed relink source, for a copy into `destination` whose
+/// source `CachedPartFolderAccess::confirmCopySource` did not confirm. The replication queue and mutations retry
+/// it; a user statement returns it to the client.
+[[noreturn]] void throwCopySourceUnconfirmed(const CopySource & source, const PartRefKey & destination);
+
 /// Exact record of what one commit-shaped primitive (`promoteBuild`/`repointRef`) durably committed,
 /// derived INSIDE the primitive's own `appendRefOps` builder rather than read back with a separate
 /// call afterward -- a post-read would race against a concurrent repoint of the SAME ref and could
@@ -285,11 +299,21 @@ public:
     /// confirm-interposed relink path share one protocol sequence.
     CommitOutcome publishEntries(const PartRefKey & dst, const std::vector<Cas::ManifestEntry> & entries,
                         Cas::ProvenanceOp op, PublishPolicy policy = {});
+    /// Whether `source.part` still commits exactly `source.manifest_ref`, with no mutation of it in flight,
+    /// while this mount holds its slot (`Pool::confirmExactRef`). A copy that adopts entries without reading
+    /// their bodies asks this after its own precommit is durable and before its promote: a match in the
+    /// committed map alone could be a drop that is durable but not yet applied. Loads the source table first
+    /// if it is not resident (`Pool::resolveRef`), then sends one mount-slot read when the ledger confirms.
+    /// A failure of either is logged and answers false. Waits for the source table's state lock
+    /// (`ConfirmLockMode::Wait`), so a busy table is not a refusal. Call it with no ledger lock held.
+    bool confirmCopySource(const CopySource & source) const;
     /// Moves a committed ref by publishing the source entries at `dst` and then dropping `src` only
     /// while it still names the republished manifest. Returns false when the source is absent; a
     /// pre-existing destination with different content is rejected rather than silently discarding the
     /// source. Throws `CAS_OWNERSHIP_CONFLICT` (after taking back a destination this call created) when
-    /// the source was repointed meanwhile.
+    /// the source was repointed meanwhile. A destination this call precommits is promoted only after
+    /// `confirmCopySource`; an unconfirmed source takes the precommit back and throws
+    /// `throwCopySourceUnconfirmed`, unless an identical move already committed `dst` with this content.
     bool republishRef(const PartRefKey & src, const PartRefKey & dst);
     /// Rename of a committed ref inside the table namespace without republishing content: one ref-log
     /// append (`OwnerTransitionShape::Move`). `expected` is the manifest the caller resolved for `src`;
