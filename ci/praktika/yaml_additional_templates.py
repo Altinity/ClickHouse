@@ -63,6 +63,15 @@ class AltinityWorkflowTemplates:
         version: ${{ fromJson(needs.config_workflow.outputs.data).workflow_config.custom_data.version.string }}
 """,
         "RegressionPR": r"""
+  RegressionTestsSelected:
+    needs: [config_workflow, build_amd_binary, build_arm_binary]
+    if: ${{ github.event_name == 'pull_request' && !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.custom_data.ci_exclude_tags, 'regression')}}
+    uses: ./.github/workflows/regression-selected.yml
+    secrets: inherit
+    with:
+      commit: {REGRESSION_HASH}
+      build_sha: ${{ github.event.pull_request.head.sha }}
+      workflow_config: ${{ needs.config_workflow.outputs.data }}
   RegressionTestsRelease:
     needs: [config_workflow, build_amd_binary, stateless_tests_amd_debug_parallel]
     if: ${{  !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.custom_data.ci_exclude_tags, 'regression')}}

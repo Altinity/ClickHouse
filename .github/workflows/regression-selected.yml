@@ -1,0 +1,94 @@
+name: Selected regression
+
+# Pull request regression. select_pr_regression.py lives on the
+# clickhouse-regression ref passed as commit. The suite jobs still install
+# the pull request binary through regression-reusable-suite.yml.
+
+on:
+  workflow_call:
+    inputs:
+      commit:
+        description: clickhouse-regression ref that contains the selector
+        required: true
+        type: string
+      build_sha:
+        description: pull request head sha, used to find the binary build
+        required: true
+        type: string
+      workflow_config:
+        description: workflow config for the run
+        required: true
+        type: string
+
+jobs:
+  select:
+    name: select regression
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
+    timeout-minutes: 40
+    env:
+      REQUIRE_ARM64: ${{ !contains(fromJson(inputs.workflow_config).workflow_config.custom_data.ci_exclude_tags, 'aarch64') }}
+    outputs:
+      jobs: ${{ steps.select.outputs.jobs }}
+      job_count: ${{ steps.select.outputs.job_count }}
+      arches: ${{ steps.arches.outputs.arches }}
+    steps:
+      - name: Checkout clickhouse-regression
+        uses: actions/checkout@v6
+        with:
+          repository: Altinity/clickhouse-regression
+          ref: ${{ inputs.commit }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the selector
+        run: pip install "pyyaml" "boto3" "cursor-sdk==1.3.1"
+
+      - name: Select tests
+        id: select
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+        run: python3 .github/scripts/select_pr_regression.py --pr "${{ github.event.pull_request.number }}"
+
+      - name: Choose architectures
+        id: arches
+        run: |
+          if [ "$REQUIRE_ARM64" = "true" ]; then
+            echo 'arches=["x86","arm64"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'arches=["x86"]' >> "$GITHUB_OUTPUT"
+          fi
+
+  run:
+    needs: select
+    if: ${{ !cancelled() && needs.select.outputs.job_count != '0' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJson(needs.select.outputs.arches) }}
+        job: ${{ fromJson(needs.select.outputs.jobs) }}
+    uses: ./.github/workflows/regression-reusable-suite.yml
+    secrets: inherit
+    with:
+      ref: ${{ inputs.commit }}
+      workflow_config: ${{ inputs.workflow_config }}
+      suite_name: ${{ matrix.job.suite_name }}
+      suite_executable: regression.py
+      output_format: new-fails
+      flags: --with-analyzer
+      extra_args: ""
+      regression_args: ${{ matrix.job.regression_args }}
+      part: ${{ matrix.job.part }}
+      storage_path: ${{ matrix.job.storage_path }}
+      job_name: ${{ matrix.job.job_name }}
+      timeout_minutes: ${{ matrix.job.timeout_minutes || 210 }}
+      runner_type: ${{ matrix.arch == 'arm64' && 'altinity-regression-tester-aarch64' || 'altinity-regression-tester' }}
+      runner_arch: ${{ matrix.arch == 'arm64' && 'aarch64' || 'release' }}
+      build_sha: ${{ inputs.build_sha }}
+      set_commit_status: true
