@@ -35,7 +35,7 @@ Poco::JSON::Object::Ptr parseSchema(const std::string & json)
 DB::ContextMutablePtr contextWithAggregateFunctionStates(bool allow)
 {
     auto context = DB::Context::createCopy(getContext().context);
-    context->setSetting("allow_experimental_aggregate_function_states_in_open_formats", DB::Field(allow));
+    context->setSetting("allow_aggregate_function_states_in_open_formats", DB::Field(allow));
     return context;
 }
 
@@ -602,10 +602,17 @@ TEST(IcebergSchemaProcessor, SchemasKeepTheAnnotationsTheyWereRegisteredWith)
     EXPECT_EQ(dag->getInputs().front()->result_type->getName(), "SimpleAggregateFunction(sum, Int64)");
 }
 
-TEST(IcebergSchemaProcessor, AnnotationNotMatchingTheFieldTypeIsRejected)
+TEST(IcebergSchemaProcessor, AnnotationMustDescribeTheFieldType)
 {
     tryRegisterAggregateFunctions();
     auto schema = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"s","required":true,"type":"long"}]})json");
+
+    /// ClickHouse writes both `Int64` and `UInt64` as `long`.
+    auto context = contextWithAggregateFunctionStates(false);
+    IcebergSchemaProcessor processor(context);
+    processor.addIcebergTableSchema(schema, context, {{1, "SimpleAggregateFunction(sum, UInt64)"}});
+    EXPECT_EQ(processor.getClickHouseTableSchemaById(0)->front().type->getName(), "SimpleAggregateFunction(sum, UInt64)");
+
     expectAnnotatedSchemaRejected(schema, {{1, "AggregateFunction(uniq, UInt64)"}});
     /// Another engine promoted the field from `int` to `long`, leaving the annotation stale.
     expectAnnotatedSchemaRejected(schema, {{1, "SimpleAggregateFunction(max, Int32)"}});
@@ -613,18 +620,6 @@ TEST(IcebergSchemaProcessor, AnnotationNotMatchingTheFieldTypeIsRejected)
     expectAnnotatedSchemaRejected(
         parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"u","required":false,"type":"binary"}]})json"),
         {{1, "AggregateFunction(uniq, UInt64)"}});
-}
-
-/// ClickHouse writes both `Int64` and `UInt64` as `long`.
-TEST(IcebergSchemaProcessor, AnnotationWrittenAsTheSameIcebergTypeIsAccepted)
-{
-    tryRegisterAggregateFunctions();
-    auto schema = parseSchema(
-        R"json({"schema-id":0,"fields":[{"id":1,"name":"s","required":true,"type":"long"}]})json");
-    auto context = contextWithAggregateFunctionStates(false);
-    IcebergSchemaProcessor processor(context);
-    processor.addIcebergTableSchema(schema, context, {{1, "SimpleAggregateFunction(sum, UInt64)"}});
-    EXPECT_EQ(processor.getClickHouseTableSchemaById(0)->front().type->getName(), "SimpleAggregateFunction(sum, UInt64)");
 }
 
 TEST(IcebergSchemaProcessor, RetryAfterRefusedAggregateFunctionStateSchemaSucceeds)
@@ -748,27 +743,15 @@ TEST(IcebergSchemaProcessor, SkippingTheSchemaNeitherAppliesTheGateNorPublishesT
     EXPECT_EQ(columns->front().type->getName(), "AggregateFunction(uniq, UInt64)");
 }
 
-TEST(IcebergSchemaProcessor, PropertyWithClickHouseTypePrefixButNoFieldIdIsNotAnAnnotation)
+/// Per field, the property with the greatest schema id not above the requested one is in effect.
+TEST(IcebergSchemaProcessor, ClickHouseTypeAnnotationsInEffectForSchema)
 {
     Poco::JSON::Parser parser;
     auto metadata = parser
                         .parse(
                             R"json({"properties":{"clickhouse.type.comment":"x","clickhouse.type.1":"x",)json"
                             R"json("clickhouse.type.1.x":"x","clickhouse.type.1.0.1":"x",)json"
-                            R"json("clickhouse.type.1.0":"SimpleAggregateFunction(sum, Int64)"}})json")
-                        .extract<Poco::JSON::Object::Ptr>();
-
-    ClickHouseTypeAnnotations annotations;
-    ASSERT_NO_THROW(annotations = getClickHouseTypeAnnotations(metadata, 0));
-    EXPECT_EQ(annotations, (ClickHouseTypeAnnotations{{1, "SimpleAggregateFunction(sum, Int64)"}}));
-}
-
-TEST(IcebergSchemaProcessor, AnnotationInEffectIsTheOneWithTheGreatestSchemaIdNotAbove)
-{
-    Poco::JSON::Parser parser;
-    auto metadata = parser
-                        .parse(
-                            R"json({"properties":{"clickhouse.type.1.0":"SimpleAggregateFunction(max, Int32)",)json"
+                            R"json("clickhouse.type.1.0":"SimpleAggregateFunction(max, Int32)",)json"
                             R"json("clickhouse.type.1.2":"SimpleAggregateFunction(max, Int64)","clickhouse.type.1.4":"",)json"
                             R"json("clickhouse.type.2.3":"SimpleAggregateFunction(sum, Int64)"}})json")
                         .extract<Poco::JSON::Object::Ptr>();

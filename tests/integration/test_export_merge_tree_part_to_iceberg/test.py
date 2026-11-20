@@ -1522,13 +1522,7 @@ def test_export_part_aggregate_function_states(cluster):
     )
 
     make_mt(node, mt, columns, "k", order_by="k", engine="AggregatingMergeTree()")
-    make_iceberg_s3(
-        node,
-        iceberg,
-        columns,
-        "k",
-        extra_settings="allow_experimental_aggregate_function_states_in_open_formats = 1",
-    )
+    make_iceberg_s3(node, iceberg, columns, "k")
 
     node.query(
         f"INSERT INTO {mt} "
@@ -1537,19 +1531,12 @@ def test_export_part_aggregate_function_states(cluster):
     )
 
     part = get_part(node, mt, "0")
-    export_part(
-        node,
-        mt,
-        part,
-        iceberg,
-        extra_settings="allow_experimental_aggregate_function_states_in_open_formats = 1",
-    )
+    export_part(node, mt, part, iceberg)
     wait_for_export_part(node, mt, part)
     assert_part_log(node, mt, part)
 
     exported = node.query(
-        f"SELECT k, uniqMerge(u), sum(s) FROM {iceberg} GROUP BY k ORDER BY k "
-        f"SETTINGS allow_experimental_aggregate_function_states_in_open_formats = 1"
+        f"SELECT k, uniqMerge(u), sum(s) FROM {iceberg} GROUP BY k ORDER BY k"
     )
     assert exported == node.query(
         f"SELECT k, uniqMerge(u), sum(s) FROM {mt} WHERE k = 0 GROUP BY k ORDER BY k"

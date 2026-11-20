@@ -3987,12 +3987,10 @@ def test_clickhouse_type_annotation_survives_catalog(started_cluster):
         f"""
 CREATE TABLE {CATALOG_NAME}.`{ns}.{tbl}` (id Int64, s SimpleAggregateFunction(sum, Int64))
 ENGINE = IcebergS3('http://minio1:9001/warehouse-rest/{ns}/', '{minio_access_key}', '{minio_secret_key}')
-SETTINGS allow_experimental_aggregate_function_states_in_open_formats = 1
     """,
         settings={
             "allow_experimental_database_iceberg": 1,
             "write_full_path_in_iceberg_metadata": 1,
-            "allow_experimental_aggregate_function_states_in_open_formats": 1,
         },
     )
     catalog = load_catalog_impl(started_cluster)
@@ -4028,7 +4026,7 @@ SETTINGS allow_experimental_aggregate_function_states_in_open_formats = 1
     # 3. ClickHouse still sees the type
     assert "SimpleAggregateFunction" in node.query(f"DESCRIBE {CATALOG_NAME}.`{ns}.{tbl}`")
     # 4. ALTER through the catalog records and removes the annotation
-    alter_settings = {"allow_insert_into_iceberg": 1, "allow_experimental_aggregate_function_states_in_open_formats": 1}
+    alter_settings = {"allow_insert_into_iceberg": 1}
     node.query(
         f"ALTER TABLE {CATALOG_NAME}.`{ns}.{tbl}` ADD COLUMN m SimpleAggregateFunction(max, Nullable(Int64))",
         settings=alter_settings)

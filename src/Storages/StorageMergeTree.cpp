@@ -146,7 +146,7 @@ namespace Setting
     extern const SettingsTimezone iceberg_partition_timezone;
     extern const SettingsMergeTreePartExportSchemaMatchMode export_merge_tree_part_schema_match_mode;
     extern const SettingsBool export_merge_tree_part_ignore_extra_source_columns;
-    extern const SettingsBool allow_experimental_aggregate_function_states_in_open_formats;
+    extern const SettingsBool allow_aggregate_function_states_in_open_formats;
 }
 
 namespace ServerSetting
@@ -4080,7 +4080,7 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
     descriptor.write_full_path_in_iceberg_metadata = query_context->getSettingsRef()[Setting::write_full_path_in_iceberg_metadata];
     descriptor.allow_lossy_cast = query_context->getSettingsRef()[Setting::export_merge_tree_part_allow_lossy_cast];
     descriptor.allow_aggregate_function_states_in_open_formats
-        = query_context->getSettingsRef()[Setting::allow_experimental_aggregate_function_states_in_open_formats];
+        = query_context->getSettingsRef()[Setting::allow_aggregate_function_states_in_open_formats].value;
     descriptor.iceberg_partition_timezone = query_context->getSettingsRef()[Setting::iceberg_partition_timezone].toString();
     descriptor.schema_match_mode = query_context->getSettingsRef()[Setting::export_merge_tree_part_schema_match_mode].value;
     descriptor.ignore_extra_source_columns = query_context->getSettingsRef()[Setting::export_merge_tree_part_ignore_extra_source_columns].value;

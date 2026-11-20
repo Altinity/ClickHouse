@@ -18,12 +18,11 @@ cleanup()
 }
 trap cleanup EXIT
 
-CLIENT="${CLICKHOUSE_CLIENT} --allow_experimental_aggregate_function_states_in_open_formats=1 --allow_insert_into_iceberg=1"
+CLIENT="${CLICKHOUSE_CLIENT} --allow_insert_into_iceberg=1"
 
 ${CLIENT} --query "
     CREATE TABLE ${TABLE} (x SimpleAggregateFunction(max, DateTime64(3, 'UTC')))
-    ENGINE = IcebergLocal('${TABLE_PATH}')
-    SETTINGS allow_experimental_aggregate_function_states_in_open_formats = 1"
+    ENGINE = IcebergLocal('${TABLE_PATH}')"
 ${CLIENT} --query "INSERT INTO ${TABLE} VALUES ('2026-01-01 00:00:00.123')"
 ${CLIENT} --query "SELECT x FROM ${TABLE}"
 ${CLIENT} --query "SELECT count() FROM ${TABLE} WHERE x = toDateTime64('2026-01-01 00:00:00.123', 3, 'UTC')"

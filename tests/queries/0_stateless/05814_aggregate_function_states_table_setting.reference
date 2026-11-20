@@ -1,0 +1,30 @@
+-- Iceberg, setting stored in the table, queries disable it
+1
+0	23	19800
+1	23	20000
+0	23	19800
+1	23	20000
+1	23	20000
+10	23	19800
+-- Iceberg, setting not stored in the table
+refused
+0
+refused
+refused
+refused
+0	23	9900
+1	23	10000
+-- File, setting stored in the table, queries disable it
+0	23	9900
+1	23	10000
+-- File, setting not stored in the table
+refused
+0	23	9900
+1	23	10000
+-- Iceberg, setting 0 stored in the table, queries enable it
+refused
+-- File, setting 0 stored in the table, queries enable it
+refused
+-- File without columns infers the states from the file
+AggregateFunction(uniq, UInt64)
+5

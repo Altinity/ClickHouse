@@ -1260,43 +1260,26 @@ TEST(IcebergMetadataGenerator, ModifyColumnSameComplexTypeWithDocOnlyRepositions
     EXPECT_EQ(stored_fields->getObject(0)->getValue<String>(f_type), "int");
 }
 
-TEST(IcebergMetadataGenerator, ModifyColumnToTheSameSimpleAggregateFunctionAddsNoSchema)
-{
-    tryRegisterAggregateFunctions();
-    auto metadata
-        = makeMetadataWithAnnotatedField("s", "long", /* required */ true, "SimpleAggregateFunction(sum, UInt64)");
-    const auto before = readSchemaState(metadata);
-
-    EXPECT_FALSE(MetadataGenerator(metadata).generateModifyColumnMetadata(
-        "s", DataTypeFactory::instance().get("SimpleAggregateFunction(sum, UInt64)"), getContext().context));
-    expectSchemaUnchanged(metadata, before);
-}
-
-TEST(IcebergMetadataGenerator, ModifyColumnChangingTheSimpleAggregateFunctionRewritesTheAnnotation)
-{
-    tryRegisterAggregateFunctions();
-    auto metadata
-        = makeMetadataWithAnnotatedField("s", "long", /* required */ true, "SimpleAggregateFunction(sum, UInt64)");
-    const auto before = readSchemaState(metadata);
-
-    EXPECT_TRUE(MetadataGenerator(metadata).generateModifyColumnMetadata(
-        "s", DataTypeFactory::instance().get("SimpleAggregateFunction(max, UInt64)"), getContext().context));
-
-    /// The Iceberg schema is the same, so the annotation is rewritten for the current schema id.
-    expectSchemaUnchanged(metadata, before);
-    EXPECT_EQ(findCurrentFieldAnnotation(metadata, "s"), "SimpleAggregateFunction(max, UInt64)");
-}
-
-TEST(IcebergMetadataGenerator, ModifyColumnAddingASimpleAggregateFunctionRecordsTheAnnotation)
+/// The Iceberg type stays, so only the ClickHouse type annotation changes and the schema is kept.
+TEST(IcebergMetadataGenerator, ModifyColumnChangingOnlyTheSimpleAggregateFunctionKeepsTheSchema)
 {
     tryRegisterAggregateFunctions();
     auto metadata = makeMetadataWithField("s", "long", /* required */ true);
-    ASSERT_EQ(findCurrentFieldAnnotation(metadata, "s"), std::nullopt);
+    const auto before = readSchemaState(metadata);
+    auto modify = [&](const String & type)
+    {
+        return MetadataGenerator(metadata).generateModifyColumnMetadata(
+            "s", DataTypeFactory::instance().get(type), getContext().context);
+    };
 
-    EXPECT_TRUE(MetadataGenerator(metadata).generateModifyColumnMetadata(
-        "s", DataTypeFactory::instance().get("SimpleAggregateFunction(sum, Int64)"), getContext().context));
-
+    EXPECT_TRUE(modify("SimpleAggregateFunction(sum, Int64)"));
     EXPECT_EQ(findCurrentFieldAnnotation(metadata, "s"), "SimpleAggregateFunction(sum, Int64)");
+    EXPECT_FALSE(modify("SimpleAggregateFunction(sum, Int64)"));
+    EXPECT_TRUE(modify("SimpleAggregateFunction(max, Int64)"));
+    EXPECT_EQ(findCurrentFieldAnnotation(metadata, "s"), "SimpleAggregateFunction(max, Int64)");
+    EXPECT_TRUE(modify("Int64"));
+    EXPECT_EQ(findCurrentFieldAnnotation(metadata, "s"), std::nullopt);
+    expectSchemaUnchanged(metadata, before);
 }
 
 TEST(IcebergMetadataGenerator, ModifyColumnRejectsChangingTheAggregateFunctionOfAState)

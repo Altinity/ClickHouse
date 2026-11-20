@@ -336,7 +336,6 @@ def make_iceberg_s3(
     url=None,
     s3_retry_attempts=3,
     if_not_exists=False,
-    extra_settings="",
 ):
     """Create an IcebergS3 table at a MinIO prefix.
 
@@ -346,15 +345,12 @@ def make_iceberg_s3(
         url = f"http://minio1:9001/root/data/{name}/"
     ine = "IF NOT EXISTS " if if_not_exists else ""
     pclause = f"PARTITION BY {partition_by}" if partition_by else ""
-    settings = f"s3_retry_attempts = {s3_retry_attempts}"
-    if extra_settings:
-        settings += ", " + extra_settings
     node.query(
         f"""
         CREATE TABLE {ine}{name} ({columns})
         ENGINE = IcebergS3('{url}', '{MINIO_USER}', '{MINIO_PASS}')
         {pclause}
-        SETTINGS {settings}
+        SETTINGS s3_retry_attempts = {s3_retry_attempts}
         """
     )
 

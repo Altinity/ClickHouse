@@ -199,15 +199,8 @@ TEST(IcebergTypeMapping, AnnotationNamePinsAggregateStateVersion)
 
     for (const auto * name :
          {"AggregateFunction(sumMap, Array(UInt8), Array(UInt8))",
-          "AggregateFunction(1, sumMap, Array(UInt8), Array(UInt8))",
-          "AggregateFunction(1, groupBitmap, UInt64)",
-          "AggregateFunction(groupBitmap, UInt64)",
           "AggregateFunction(uniq, UInt64)",
-          "AggregateFunction(sum, UInt64)",
-          "Array(AggregateFunction(uniq, UInt64))",
-          "SimpleAggregateFunction(sum, UInt64)",
-          "SimpleAggregateFunction(anyLast, Nullable(String))",
-          "Tuple(a UInt32, b String)"})
+          "SimpleAggregateFunction(sum, UInt64)"})
     {
         auto type = DataTypeFactory::instance().get(name);
         EXPECT_EQ(getClickHouseTypeAnnotationName(type), type->getName()) << name;

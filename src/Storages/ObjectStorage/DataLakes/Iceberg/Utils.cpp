@@ -349,6 +349,7 @@ namespace DB::DataLakeStorageSetting
     extern const DataLakeStorageSettingsBool iceberg_recent_metadata_file_by_last_updated_ms_field;
     extern const DataLakeStorageSettingsBool iceberg_use_version_hint;
     extern const DataLakeStorageSettingsNonZeroUInt64 iceberg_format_version;
+    extern const DataLakeStorageSettingsBool allow_aggregate_function_states_in_open_formats;
 }
 
 namespace DB::Setting
@@ -1799,6 +1800,14 @@ std::optional<Int32> getMaxMetadataFileVersionInDirectory(const ObjectStoragePtr
             max_version = version;
     }
     return max_version;
+}
+
+std::optional<bool> getTableAllowAggregateFunctionStates(const DataLakeStorageSettings & data_lake_settings)
+{
+    const auto & setting = data_lake_settings[DataLakeStorageSetting::allow_aggregate_function_states_in_open_formats];
+    if (!setting.changed)
+        return std::nullopt;
+    return setting.value;
 }
 
 MetadataFileWithInfo getLatestOrExplicitMetadataFileAndVersion(

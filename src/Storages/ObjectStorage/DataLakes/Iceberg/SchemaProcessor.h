@@ -103,8 +103,13 @@ public:
         ManifestFile,
     };
 
-    explicit IcebergSchemaProcessor(ContextPtr context_, bool allow_geo_parser_ = false)
-        : WithContext(context_), allow_geo_parser(allow_geo_parser_) {}
+    explicit IcebergSchemaProcessor(
+        ContextPtr context_, bool allow_geo_parser_ = false, std::optional<bool> table_allow_aggregate_function_states_ = std::nullopt)
+        : WithContext(context_)
+        , allow_geo_parser(allow_geo_parser_)
+        , table_allow_aggregate_function_states(table_allow_aggregate_function_states_)
+    {
+    }
 
     /// `clickhouse_type_annotations` are the ones in effect for the schema in the table metadata it belongs to.
     void addIcebergTableSchema(
@@ -213,6 +218,8 @@ private:
 
     mutable SharedMutex mutex;
     bool allow_geo_parser = true;
+    /// The table's own `allow_aggregate_function_states_in_open_formats`; when not set, the query's value decides.
+    std::optional<bool> table_allow_aggregate_function_states;
 };
 
 using IcebergSchemaProcessorPtr = std::shared_ptr<IcebergSchemaProcessor>;

@@ -63,7 +63,7 @@ extern const int SUPPORT_IS_DISABLED;
 
 namespace Setting
 {
-extern const SettingsBool allow_experimental_aggregate_function_states_in_open_formats;
+extern const SettingsBool allow_aggregate_function_states_in_open_formats;
 extern const SettingsTimezone iceberg_timezone_for_timestamptz;
 }
 
@@ -451,9 +451,10 @@ std::pair<size_t, size_t> parseDecimal(const String & type_name)
 }
 
 /// Checked on the AST, so that an aggregate function named by table metadata is not resolved while the setting is off.
-void checkAggregateFunctionStateAnnotationAllowed(Int32 field_id, const String & type_name, const ContextPtr & context)
+void checkAggregateFunctionStateAnnotationAllowed(
+    Int32 field_id, const String & type_name, std::optional<bool> table_allow, const ContextPtr & context)
 {
-    if (context->getSettingsRef()[Setting::allow_experimental_aggregate_function_states_in_open_formats])
+    if (table_allow.value_or(context->getSettingsRef()[Setting::allow_aggregate_function_states_in_open_formats]))
         return;
 
     ParserDataType parser;
@@ -463,7 +464,8 @@ void checkAggregateFunctionStateAnnotationAllowed(Int32 field_id, const String &
             ErrorCodes::SUPPORT_IS_DISABLED,
             "Iceberg field with id {} records ClickHouse type {} in table properties `{}.{}.<schema-id>`. Reading aggregate "
             "function states from an Iceberg table is disabled: enable setting "
-            "allow_experimental_aggregate_function_states_in_open_formats to honour the recorded type",
+            "allow_aggregate_function_states_in_open_formats in the table's SETTINGS or, if the table does not set it, in the query "
+            "to honour the recorded type",
             field_id,
             type_name,
             Iceberg::f_clickhouse_type,
@@ -503,9 +505,9 @@ void IcebergSchemaProcessor::addIcebergTableSchema(
 
     auto schema_annotations = getClickHouseTypeAnnotationsOfSchema(schema_ptr, clickhouse_type_annotations);
 
-    /// Checked on every call, including for an already registered schema: the setting belongs to the current query.
+    /// Checked on every call, including for an already registered schema: unless the table sets it, the setting belongs to the current query.
     for (const auto & [field_id, type_name] : schema_annotations)
-        checkAggregateFunctionStateAnnotationAllowed(field_id, type_name, context_);
+        checkAggregateFunctionStateAnnotationAllowed(field_id, type_name, table_allow_aggregate_function_states, context_);
 
     std::unordered_map<String, String> type_mapping;
     if (allow_geo_parser)
@@ -867,7 +869,7 @@ DataTypePtr IcebergSchemaProcessor::getFieldType(
         return derived_type;
 
     const String & annotated_name = annotation_it->second;
-    checkAggregateFunctionStateAnnotationAllowed(field_id, annotated_name, context_);
+    checkAggregateFunctionStateAnnotationAllowed(field_id, annotated_name, table_allow_aggregate_function_states, context_);
     auto annotated_type = DataTypeFactory::instance().get(annotated_name);
 
     /// The annotation is valid only for the Iceberg type ClickHouse writes for it. The format version affects only

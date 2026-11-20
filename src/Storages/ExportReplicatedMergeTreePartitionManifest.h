@@ -174,7 +174,7 @@ struct ExportReplicatedMergeTreePartitionManifest
     String filename_pattern;
     bool write_full_path_in_iceberg_metadata = false;
     bool allow_lossy_cast = false;
-    bool allow_aggregate_function_states_in_open_formats = false;
+    std::optional<bool> allow_aggregate_function_states_in_open_formats;
     String iceberg_metadata_json;
 
     /// Optional because of backwards compatibility
@@ -223,7 +223,8 @@ struct ExportReplicatedMergeTreePartitionManifest
         json.set("task_timeout_seconds", task_timeout_seconds);
         json.set("write_full_path_in_iceberg_metadata", write_full_path_in_iceberg_metadata);
         json.set("allow_lossy_cast", allow_lossy_cast);
-        json.set("allow_aggregate_function_states_in_open_formats", allow_aggregate_function_states_in_open_formats);
+        if (allow_aggregate_function_states_in_open_formats)
+            json.set("allow_aggregate_function_states_in_open_formats", *allow_aggregate_function_states_in_open_formats);
         if (parquet_compression_method)
             json.set("parquet_compression_method", *parquet_compression_method);
         if (output_format_compression_level)

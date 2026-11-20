@@ -180,6 +180,9 @@ std::pair<Poco::JSON::Object::Ptr, String> createEmptyMetadataFile(
     UInt64 format_version = 2,
     bool is_catalog_table = false);
 
+/// The table's own `allow_aggregate_function_states_in_open_formats`, when its `SETTINGS` give one.
+std::optional<bool> getTableAllowAggregateFunctionStates(const DataLakeStorageSettings & data_lake_settings);
+
 MetadataFileWithInfo getLatestOrExplicitMetadataFileAndVersion(
     const ObjectStoragePtr & object_storage,
     const String & table_path,

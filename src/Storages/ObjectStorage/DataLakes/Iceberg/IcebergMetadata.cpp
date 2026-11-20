@@ -166,7 +166,7 @@ extern const SettingsString iceberg_metadata_compression_method;
 extern const SettingsBool allow_insert_into_iceberg;
 extern const SettingsBool allow_experimental_iceberg_compaction;
 extern const SettingsBool allow_experimental_geo_types_in_iceberg;
-extern const SettingsBool allow_experimental_aggregate_function_states_in_open_formats;
+extern const SettingsBool allow_aggregate_function_states_in_open_formats;
 extern const SettingsBool allow_iceberg_remove_orphan_files;
 extern const SettingsBool allow_experimental_expire_snapshots;
 extern const SettingsSeconds lock_acquire_timeout;
@@ -289,7 +289,9 @@ std::pair<Iceberg::PersistentTableComponents, Iceberg::MetadataFileWithInfo> Ice
     auto root_derivation = IcebergPathResolver::deriveTableRoot(table_location, table_path, metadata_file_path);
     PersistentTableComponents persistent_components{
         .schema_processor = std::make_shared<IcebergSchemaProcessor>(
-            context_, context_->getSettingsRef()[Setting::allow_experimental_geo_types_in_iceberg]),
+            context_,
+            context_->getSettingsRef()[Setting::allow_experimental_geo_types_in_iceberg],
+            getTableAllowAggregateFunctionStates(configuration->getDataLakeSettings())),
         .metadata_cache = cache_ptr,
         .format_version = format_version,
         .table_location = table_location,
@@ -682,6 +684,7 @@ bool IcebergMetadata::optimize(
             data_lake_settings,
             context,
             write_format,
+            format_settings,
             catalog,
             storage_id);
 
@@ -1108,18 +1111,20 @@ void IcebergMetadata::alterPartitionDropImpl(
     executor.run();
 }
 
-static void checkAggregateFunctionStatesAllowed(const String & column_name, const DataTypePtr & type, const ContextPtr & context)
+static void checkAggregateFunctionStatesAllowed(
+    const String & column_name, const DataTypePtr & type, const DataLakeStorageSettings & data_lake_settings, const ContextPtr & context)
 {
     if (!type || !needsClickHouseTypeAnnotation(type))
         return;
-    if (context->getSettingsRef()[Setting::allow_experimental_aggregate_function_states_in_open_formats])
+    if (Iceberg::getTableAllowAggregateFunctionStates(data_lake_settings)
+            .value_or(context->getSettingsRef()[Setting::allow_aggregate_function_states_in_open_formats]))
         return;
 
     throw Exception(
         ErrorCodes::SUPPORT_IS_DISABLED,
         "Column '{}' has type {}, which Iceberg cannot express natively: the aggregate state is stored as "
         "binary and its ClickHouse type is recorded in the table properties. To allow this, enable setting "
-        "allow_experimental_aggregate_function_states_in_open_formats",
+        "allow_aggregate_function_states_in_open_formats in the table's SETTINGS or, if the table does not set it, in the query",
         column_name,
         type->getName());
 }
@@ -1139,7 +1144,7 @@ void IcebergMetadata::alter(
     }
 
     for (const auto & command : params)
-        checkAggregateFunctionStatesAllowed(command.column_name, command.data_type, context);
+        checkAggregateFunctionStatesAllowed(command.column_name, command.data_type, data_lake_settings, context);
 
     Iceberg::alter(params, context, storage_id, object_storage, data_lake_settings, persistent_components, write_format, catalog);
 }
@@ -1267,7 +1272,7 @@ void IcebergMetadata::createInitial(
     }
 
     for (const auto & column : columns->getAll())
-        checkAggregateFunctionStatesAllowed(column.name, column.type, local_context);
+        checkAggregateFunctionStatesAllowed(column.name, column.type, configuration_ptr->getDataLakeSettings(), local_context);
 
     String location_path = configuration_ptr->getRawPath().path;
     if (!location_path.contains("://") && !location_path.starts_with('/'))

@@ -1,4 +1,4 @@
--- without the setting writing a state is refused, as it was before Parquet supported states
+-- with the setting disabled writing a state is refused
 1
 -- a SimpleAggregateFunction is an ordinary value of its storage type, so it needs no setting
 s	SimpleAggregateFunction(sum, UInt64)					

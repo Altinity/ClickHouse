@@ -599,13 +599,13 @@ Parquet has no aggregate-state type, so ClickHouse writes an [`AggregateFunction
 
 Neither type can be recovered from the Parquet schema alone: every `AggregateFunction` state is just a binary column, and a `SimpleAggregateFunction` is indistinguishable from its storage type. ClickHouse therefore records the type names in a `clickhouse.column_types` key in the file-level Parquet metadata, as a JSON object `{"version": 1, "columns": {...}}` whose `columns` maps column name to ClickHouse type name. The recorded name includes the state version, which is what pins the serialized layout across server versions.
 
-Both writing an `AggregateFunction` column and reconstructing one from that metadata on read are gated by [`allow_experimental_aggregate_function_states_in_open_formats`](/reference/settings/session-settings/allow-experimental#allow_experimental_aggregate_function_states_in_open_formats), which is disabled by default. A state is an opaque blob passed to the deserializer of whichever aggregate function the file names, so with the setting enabled it is the file, not the query, choosing that deserializer; keep it disabled for files from untrusted sources, where such a file is then rejected rather than read as `String`. With it disabled, writing is refused with `UNKNOWN_TYPE`, exactly as in versions that did not support states in Parquet at all. `SimpleAggregateFunction` is gated in neither direction: it is stored as an ordinary value of its storage type and has always been written that way.
+Both writing an `AggregateFunction` column and reconstructing one from that metadata on read are gated by [`allow_aggregate_function_states_in_open_formats`](/reference/settings/formats/other#allow_aggregate_function_states_in_open_formats), which is enabled by default. A state is an opaque blob passed to the deserializer of whichever aggregate function the file names, so with the setting enabled it is the file, not the query, choosing that deserializer; disable it for files from untrusted sources, where such a file is then rejected rather than read as `String`. With it disabled, writing is refused with `UNKNOWN_TYPE`. `SimpleAggregateFunction` is gated in neither direction: it is stored as an ordinary value of its storage type and has always been written that way.
 
-With the setting enabled the states round-trip without any hint:
+For a table, such as one with the `File`, `URL` or `S3` engine, the setting can also be given in the `SETTINGS` clause of its engine. It is then stored in the table definition and decides for every query on the table, also after a restart, whatever the query sets; a table that does not set it follows the query's setting.
+
+The states round-trip without any hint:
 
 ```sql
-SET allow_experimental_aggregate_function_states_in_open_formats = 1;
-
 INSERT INTO FUNCTION file('states.parquet')
 SELECT k, uniqState(v) AS u, sumSimpleState(v) AS s FROM source GROUP BY k;
 

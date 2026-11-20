@@ -818,6 +818,7 @@ RewriteResult rewriteBins(
     FileNamesGenerator & generator,
     const IcebergPathResolver & path_resolver,
     const String & write_format,
+    const std::optional<FormatSettings> & format_settings,
     UInt64 target_size,
     std::vector<IcebergPathFromMetadata> & new_data_file_paths,
     LoggerPtr log)
@@ -841,7 +842,7 @@ RewriteResult rewriteBins(
             path_resolver,
             object_storage,
             context,
-            std::nullopt, /// format_settings
+            format_settings,
             write_format,
             sample_block,
             [&](const std::string & path)
@@ -1393,6 +1394,7 @@ BinPackCommitResult executeBinPackCompaction(
     const DataLakeStorageSettings & data_lake_settings,
     ContextPtr context,
     const String & write_format,
+    const std::optional<FormatSettings> & format_settings,
     std::shared_ptr<DataLake::ICatalog> catalog,
     const StorageID & storage_id)
 {
@@ -1489,7 +1491,7 @@ BinPackCommitResult executeBinPackCompaction(
         auto rewrite = rewriteBins(
             plan, persistent_table_components, object_storage, secondary_storages, context,
             current_schema, schema_processor, current_schema_id_int, sample_block,
-            current_schema_column_mapper, generator, path_resolver, write_format,
+            current_schema_column_mapper, generator, path_resolver, write_format, format_settings,
             target_size, new_data_file_paths, log);
 
         if (rewrite.bin_results.empty())
