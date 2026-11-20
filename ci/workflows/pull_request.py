@@ -62,6 +62,7 @@ workflow = Workflow.Config(
             job.set_dependency(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
             for job in JobConfigs.special_build_jobs
         ],
+        JobConfigs.smoke_test_ppc64le,
         # *JobConfigs.build_llvm_coverage_job, # NOTE (strtgbb): Not configured yet. Determine if useful first.
         # TODO: stabilize new jobs and remove set_allow_merge_on_failure
         JobConfigs.lightweight_functional_tests_job,

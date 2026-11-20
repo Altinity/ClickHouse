@@ -37,6 +37,7 @@ workflow = Workflow.Config(
             )
             for job in builds_for_release_branch
         ],
+        JobConfigs.smoke_test_ppc64le,
         JobConfigs.docker_server,
         JobConfigs.docker_keeper,
         *JobConfigs.install_check_master_jobs,

@@ -34,6 +34,7 @@ workflow = Workflow.Config(
             )
             for job in JobConfigs.special_build_jobs
         ],
+        JobConfigs.smoke_test_ppc64le,
         # JobConfigs.smoke_tests_macos,
         *JobConfigs.unittest_jobs,
         # *JobConfigs.unittest_llvm_coverage_job, # NOTE (strtgbb): Not configured yet. Determine if useful first.

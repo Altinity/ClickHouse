@@ -354,6 +354,7 @@ class JobNames:
     CI_RESULTS_REVIEW = "CI Results Review"
     FAST_TEST = "Fast test"
     SMOKE_TEST_MACOS = "Smoke test (amd_darwin)"
+    SMOKE_TEST_PPC64LE = "Smoke test (ppc64le)"
     BUILD = "Build"
     UNITTEST = "Unit tests"
     STATELESS = "Stateless tests"

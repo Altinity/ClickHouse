@@ -223,6 +223,18 @@ class JobConfigs:
         ),
         requires=[ArtifactNames.CH_AMD_DARWIN_BIN],
     )
+    smoke_test_ppc64le = Job.Config(
+        name=JobNames.SMOKE_TEST_PPC64LE,
+        runs_on=RunnerLabels.FUNC_TESTER_AMD,
+        command="python3 ./ci/jobs/smoke_test_ppc64le.py",
+        digest_config=Job.CacheDigestConfig(
+            include_paths=[
+                "./ci/jobs/smoke_test_ppc64le.py",
+            ],
+        ),
+        requires=[ArtifactNames.CH_PPC64LE],
+        timeout=900,
+    )
     tidy_build_arm_jobs = common_build_job_config.parametrize(
         Job.ParamSet(
             parameter=BuildTypes.ARM_TIDY,
