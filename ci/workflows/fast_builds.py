@@ -13,7 +13,7 @@ for artifact in ArtifactConfigs.clickhouse_binaries + ArtifactConfigs.clickhouse
 
 builds_for_release_branch = [
     job.unset_provides("unittest")
-    for job in JobConfigs.build_jobs + JobConfigs.release_build_jobs
+    for job in JobConfigs.build_jobs + JobConfigs.release_build_jobs + JobConfigs.special_build_jobs
     if "coverage" not in job.name
 ]
 
