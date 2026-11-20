@@ -473,6 +473,31 @@ bool CasRefLedger::hasAnyRefWithPrefix(const RootNamespace & ns, std::string_vie
 ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const String & ref_name,
                                            const ManifestRef & manifest_ref, ConfirmLockMode lock_mode) const
 {
+    const uint64_t started_ms = boot_ms_now_fn();
+    while (true)
+    {
+        if (const auto answer = confirmExactRefIfStateLockFree(ns, ref_name, manifest_ref))
+            return *answer;
+        if (lock_mode == ConfirmLockMode::TryLock || boot_ms_now_fn() - started_ms >= cas_request_budget.request_window_ms)
+        {
+            ProfileEvents::increment(ProfileEvents::CASRelinkConfirmRefusedStateLockBusy);
+            LOG_TRACE(confirmLogger(), "Relink confirm for ref '{}' in namespace '{}' is unknown: the table's state lock is held",
+                      ref_name, ns.string());
+            return ConfirmAnswer::Unknown;
+        }
+        if (confirm_before_state_lock_wait_hook_for_test)
+            confirm_before_state_lock_wait_hook_for_test();
+        /// Waits holding no other ledger lock, so append admission of every table goes on meanwhile.
+        if (const auto rt = lookupRefTableRuntime(ns))
+        {
+            std::lock_guard<std::mutex> wait_for_holder(rt->state_mutex);
+        }
+    }
+}
+
+std::optional<ConfirmAnswer> CasRefLedger::confirmExactRefIfStateLockFree(const RootNamespace & ns, const String & ref_name,
+                                                                         const ManifestRef & manifest_ref) const
+{
     /// Gate 1 of the relink confirm. A `Yes` authorizes a remote relink receiver, or an in-process copy,
     /// to promote a manifest whose blobs are protected only by this writer's committed binding of that
     /// exact manifest, so a `Yes` is an assertion about the durable table, not about this cache. Every
@@ -538,15 +563,11 @@ ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const Stri
         return ConfirmAnswer::Unknown;
     };
 
-    /// `TryLock` for a remote query: this function already holds `ref_queue_mutex`, which is pool-wide
-    /// append admission, and a peer must not make every table's lane wait on this table's state lock.
-    /// Failing to take the lock is one more ambiguity, so it answers like every other one. `Wait` is for
-    /// an in-process copy (see `ConfirmLockMode`): it waits as long as the current holder's in-memory work.
-    std::unique_lock<std::mutex> slock(rt.state_mutex, std::defer_lock);
-    if (lock_mode == ConfirmLockMode::Wait)
-        slock.lock();
-    else if (!slock.try_lock())
-        return refuse(ProfileEvents::CASRelinkConfirmRefusedStateLockBusy, "the table's state lock is held");
+    /// Only a try-lock: this function holds `ref_queue_mutex`, which is pool-wide append admission, and waiting
+    /// here would make every table's lane wait on this table's state lock.
+    std::unique_lock<std::mutex> slock(rt.state_mutex, std::try_to_lock);
+    if (!slock.owns_lock())
+        return std::nullopt;
 
     /// Rule 2 (warm). An unrecovered or mid-recovery runtime has an EMPTY `state`, which would read as
     /// "the ref does not exist" -- knowledge it does not have. `superseded_by_remount` is the same

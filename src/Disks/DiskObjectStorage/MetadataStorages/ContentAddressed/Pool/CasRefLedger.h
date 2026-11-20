@@ -79,9 +79,10 @@ std::string_view refLaneStateName(RefLaneState state);
 /// consumer that treats `No` as knowledge; only `Yes` is gated on the fence.
 enum class ConfirmAnswer : uint8_t { Yes, No, Unknown };
 
-/// How `confirmExactRef` takes the table's state lock. `TryLock` answers `Unknown` while anyone holds it: a remote
-/// relink query must not hold up append admission. `Wait` blocks for it, for an in-process copy whose own operation
-/// fails on a spurious `Unknown`; no holder of the state lock does store I/O or takes `ref_queue_mutex`.
+/// What `confirmExactRef` does while another thread holds the table's state lock. `TryLock` answers `Unknown`: a
+/// remote relink query must not wait on this writer. `Wait` is for an in-process copy, whose own operation fails on
+/// a spurious `Unknown`: it waits for the lock with no ledger lock held and asks again, until the mount's request
+/// window has passed since the call began.
 enum class ConfirmLockMode : uint8_t { TryLock, Wait };
 
 /// How a ref-table recovery ended without an exception. `LifeRemoved`: the catalog no longer names the
@@ -457,6 +458,12 @@ public:
     /// Installs the negative control for the post-durable install region (see
     /// `install_region_probe_for_test`).
     void setInstallRegionProbeForTest(std::function<void()> probe) { install_region_probe_for_test = std::move(probe); }
+
+    /// Runs when a `ConfirmLockMode::Wait` confirm found the state lock held, before it waits for it.
+    void setConfirmBeforeStateLockWaitHookForTest(std::function<void()> hook)
+    {
+        confirm_before_state_lock_wait_hook_for_test = std::move(hook);
+    }
 
     /// Installs a probe at `ensureRefTableRecovered`'s step 8 -- the LAST admission recheck before a
     /// materialized recovery result installs, after the final authority read and O(N) materialization
@@ -1100,6 +1107,12 @@ private:
     std::function<void()> removal_attempt_hook_for_test;
     std::function<void()> removal_reopen_read_hook_for_test;
     std::function<void()> removal_runtime_acquired_hook_for_test;
+    std::function<void()> confirm_before_state_lock_wait_hook_for_test;
+
+    /// One pass of `confirmExactRef` under `ref_queue_mutex` and a try-lock of the table's state lock; empty when
+    /// that lock is held.
+    std::optional<ConfirmAnswer> confirmExactRefIfStateLockFree(const RootNamespace & ns, const String & ref_name,
+                                                                const ManifestRef & manifest_ref) const;
 
     /// Non-materializing diagnostic/cache lookup. It never observes the catalog and never creates a
     /// name slot or runtime.

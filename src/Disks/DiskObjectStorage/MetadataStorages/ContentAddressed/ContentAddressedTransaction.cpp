@@ -252,6 +252,22 @@ void ContentAddressedTransaction::eraseEntry(PartStaging & st, const std::string
     st.copy_sources.erase(path);
 }
 
+void ContentAddressedTransaction::rekeyEntry(PartStaging & st, Cas::ManifestEntry & entry, std::string new_path)
+{
+    if (auto node = st.copy_sources.extract(entry.path))
+    {
+        node.key() = new_path;
+        st.copy_sources.insert(std::move(node));
+    }
+    entry.path = std::move(new_path);
+}
+
+void ContentAddressedTransaction::clearEntries(PartStaging & st)
+{
+    st.entries.clear();
+    st.copy_sources.clear();
+}
+
 std::optional<Cas::CopySource> ContentAddressedTransaction::copySourceOf(const PartStaging & st, const std::string & path)
 {
     const auto it = st.copy_sources.find(path);
@@ -271,13 +287,37 @@ void ContentAddressedTransaction::confirmCopySources(const Cas::RootNamespace & 
 
     /// A source this transaction changes before it publishes the copy no longer commits the manifest the copy
     /// read, so it is refused too. `commit` publishes in `(ns, ref)` order, so that is any source sorting first.
+    /// The caller hears the refusal or the failed read, not a failed abandon; the transaction's destructor abandons
+    /// a build that is still open.
+    const auto abandon_logging_failure = [&]
+    {
+        try
+        {
+            st.build->abandon();
+            st.build.reset();
+        }
+        catch (...)
+        {
+            tryLogCurrentException(getLogger("ContentAddressedTransaction"),
+                fmt::format("while abandoning the build of {}/{} after its copy source was not confirmed", ns.string(), ref));
+        }
+    };
     const auto access = metadata_storage.partAccess();
     for (const auto & source : sources)
     {
-        if (access->confirmCopySource(source))
+        bool confirmed = false;
+        try
+        {
+            confirmed = access->confirmCopySource(source);
+        }
+        catch (...)
+        {
+            abandon_logging_failure();
+            throw;
+        }
+        if (confirmed)
             continue;
-        st.build->abandon();
-        st.build.reset();
+        abandon_logging_failure();
         Cas::throwCopySourceUnconfirmed(source, {ns, ref});
     }
 }
@@ -1126,11 +1166,7 @@ void ContentAddressedTransaction::removeDirectory(const std::string & path)
         if (auto * st = findStaging(*r))
         {
             st->content_removed.clear();
-            while (!st->entries.empty())
-            {
-                const std::string entry_path = st->entries.back().path;
-                eraseEntry(*st, entry_path);
-            }
+            clearEntries(*st);
             st->base_manifest_ref.reset();
             if (st->build)
             {
@@ -1425,16 +1461,9 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
                 throw Exception(ErrorCodes::LOGICAL_ERROR,
                     "ContentAddressed: moveDirectory {} -> {}: the destination projection directory is already staged",
                     path_from, path_to);
-            std::vector<std::pair<Cas::ManifestEntry, std::optional<Cas::CopySource>>> rekeyed;
-            for (const auto & entry : st->entries)
+            for (auto & entry : st->entries)
                 if (entry.path.starts_with(old_prefix))
-                    rekeyed.emplace_back(entry, copySourceOf(*st, entry.path));
-            for (auto & [entry, source] : rekeyed)
-            {
-                eraseEntry(*st, entry.path);
-                entry.path = new_prefix + entry.path.substr(old_prefix.size());
-                putEntry(*st, std::move(entry), std::move(source));
-            }
+                    rekeyEntry(*st, entry, new_prefix + entry.path.substr(old_prefix.size()));
             return;
         }
     }

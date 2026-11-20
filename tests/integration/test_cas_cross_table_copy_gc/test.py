@@ -8,15 +8,22 @@ background thread. The value of a test is its oracle at the end, not a guarantee
 * every surviving table reads back the recorded `count()` and `sum(cityHash64(*))`;
 * `CHECK TABLE` passes;
 * `SYSTEM CAS FSCK` and `clickhouse disks ... cas-fsck` report no dangling reference or other hard finding;
-* the server logs hold no `LOGICAL_ERROR`, `CORRUPTED_DATA` or missing blob.
+* the server logs, from the start of the test's workload, hold no `LOGICAL_ERROR`, `CORRUPTED_DATA` or missing blob.
+
+The expected value is computed from the generating query alone, without any CAS table, and both the source and
+the destination are compared to it.
 
 A statement may legally fail with `NO_REPLICA_HAS_PART` when its source cannot be confirmed. It is retried a
 bounded number of times and the refusals are counted; a statement that succeeded must leave every row readable.
+That retry path was never taken in any recorded run, so it is not exercised.
+
+`test_fetch_paused_before_confirm_then_source_dropped` is the only test that places an event at a chosen
+point: it parks the receiver of a fetch before the confirm, drops the source and runs GC rounds on the source.
 """
 
 import base64
 import json
-import random
+import re
 import shlex
 import threading
 import time
@@ -115,6 +122,15 @@ def content(seed, p=1):
         "SELECT {p}, number, cityHash64(number, {seed}), toString(cityHash64(number, {seed}, 7)) "
         "FROM numbers({rows})".format(p=p, seed=seed, rows=ROWS)
     )
+
+
+def expected_digest(seed, p=1):
+    """`(count, sum(cityHash64(*)))` of the generated rows, computed without any table."""
+    out = cluster.instances["node1"].query(
+        "SELECT count(), sum(cityHash64(*)) FROM ({})".format(content(seed, p))
+    ).strip()
+    count, total = out.split("\t")
+    return int(count), int(total)
 
 
 def digest(node, table):
@@ -219,8 +235,19 @@ def condemn_content(nodes, seed, rounds):
     gc_rounds(nodes, rounds)
 
 
-def pool_check(nodes):
-    """The pool-level oracle: fsck through SQL and through the offline tool, and the server logs."""
+SERVER_LOG = "/var/log/clickhouse-server/clickhouse-server.log"
+
+
+def log_offsets(nodes):
+    """Current byte size of every node's server log: the start of what a test's workload may be blamed for."""
+    return {
+        node.name: int(node.exec_in_container(["bash", "-c", "stat -c %s {}".format(SERVER_LOG)]).strip())
+        for node in nodes
+    }
+
+
+def pool_check(nodes, offsets):
+    """The pool-level oracle: fsck through SQL and through the offline tool, and the server logs since `offsets`."""
     for node in nodes:
         row = json.loads(node.query("SYSTEM CAS FSCK {}".format(DISK), settings={"default_format": "JSONEachRow"}).strip())
         bad = {k: row[k] for k in FSCK_HARD_FINDINGS if int(row[k]) != 0}
@@ -234,21 +261,25 @@ def pool_check(nodes):
                 "--disk {} --save-logs --query {}".format(RO_DISK, shlex.quote("cas-fsck")),
             ]
         )
-        assert "dangling=0" in offline, offline
+        dangling = re.search(r"dangling=(\d+)", offline)
+        assert dangling, "no `dangling=` in the offline cas-fsck output: {}".format(offline)
+        assert int(dangling.group(1)) == 0, offline
 
+        size = int(node.exec_in_container(["bash", "-c", "stat -c %s {}".format(SERVER_LOG)]).strip())
+        assert size >= offsets[node.name], "the server log of {} was rotated during the test".format(node.name)
         found = node.exec_in_container(
             [
                 "bash",
                 "-c",
-                "grep -a -E {} /var/log/clickhouse-server/clickhouse-server.log | head -20 || true".format(
-                    shlex.quote(BAD_LOG_PATTERN)
+                "tail -c +{} {} | grep -a -E {} | head -20 || true".format(
+                    offsets[node.name] + 1, SERVER_LOG, shlex.quote(BAD_LOG_PATTERN)
                 ),
             ]
         )
         assert not found.strip(), "server log of {} holds bad lines:\n{}".format(node.name, found)
 
 
-def finish(nodes, survivors, stats, gc_loop):
+def finish(nodes, survivors, stats, gc_loop, offsets):
     """The oracle after the workload: drain GC, re-read every survivor, check the pool, drop everything."""
     gc_loop.finish()
     rounds = drain_gc(nodes)
@@ -260,18 +291,22 @@ def finish(nodes, survivors, stats, gc_loop):
         if check != "1":
             wrong.append((table, "CHECK TABLE", check))
     assert not wrong, "tables that read back differently after the workload: {}".format(wrong)
-    pool_check(nodes)
+    pool_check(nodes, offsets)
     for node, table, _ in survivors:
         node.query("DROP TABLE IF EXISTS {} SYNC".format(table))
     drain_gc(nodes)
-    pool_check(nodes)
+    pool_check(nodes, offsets)
     print(
         "{} survivors_checked={} background_rounds={} background_round_errors={} drain_rounds={}".format(
             stats, len(survivors), gc_loop.rounds, len(gc_loop.errors), rounds
         )
     )
     assert stats.iterations > 0
-    assert stats.succeeded > 0, "no statement ever succeeded: the test checked nothing"
+    # Half of the iterations the test reached: refusals are legal but must stay the exception.
+    minimum = max(1, stats.iterations // 2)
+    assert stats.succeeded >= minimum, "only {} statements succeeded in {} iterations".format(
+        stats.succeeded, stats.iterations
+    )
     assert not gc_loop.errors, gc_loop.errors[:3]
 
 
@@ -280,6 +315,7 @@ def run_workload(label, iteration):
     nodes = [cluster.instances["node1"], cluster.instances["node2"]]
     stats = Stats(label)
     survivors = []
+    offsets = log_offsets(nodes)
     gc_loop = GcLoop(nodes)
     gc_loop.start()
     deadline = time.time() + LOOP_SECONDS
@@ -292,12 +328,12 @@ def run_workload(label, iteration):
     except BaseException:
         gc_loop.stopping.set()
         raise
-    finish(nodes, survivors, stats, gc_loop)
+    finish(nodes, survivors, stats, gc_loop, offsets)
 
 
 def offset_rounds(i):
-    """Different offsets between the re-insert and the statement: 0 to 3 synchronous rounds."""
-    return i % 4
+    """Different offsets between the re-insert and the statement: 0 to 5 synchronous rounds."""
+    return i % 6
 
 
 def new_pair(node, seed, dst_rows_seed=None):
@@ -317,7 +353,8 @@ def copy_iteration(statement, preload_destination=False):
         condemn_content(nodes, seed, offset_rounds(i))
         dst_seed = next_seed() if preload_destination else None
         src, dst = new_pair(node, seed, dst_seed)
-        expected = digest(node, src)
+        expected = expected_digest(seed)
+        assert digest(node, src) == expected, "the insert into the source wrote different rows"
         gc_rounds(nodes, offset_rounds(i + 1))
         done = run_statement(node, statement.format(src=src, dst=dst), stats)
         if done:
@@ -356,7 +393,8 @@ def test_clone_as_then_drop_source():
         dst = "dst_{}".format(seed)
         node.query("CREATE TABLE {} {}".format(src, SCHEMA))
         node.query("INSERT INTO {} {}".format(src, content(seed)))
-        expected = digest(node, src)
+        expected = expected_digest(seed)
+        assert digest(node, src) == expected, "the insert into the source wrote different rows"
         gc_rounds(nodes, offset_rounds(i + 1))
         done = run_statement(
             node,
@@ -388,7 +426,8 @@ def test_rename_table_changing_the_namespace():
         src, dst = "ord.src_{}".format(seed), "ord.dst_{}".format(seed)
         node.query("CREATE TABLE {} {}".format(src, SCHEMA))
         node.query("INSERT INTO {} {}".format(src, content(seed)))
-        expected = digest(node, src)
+        expected = expected_digest(seed)
+        assert digest(node, src) == expected, "the insert into the source wrote different rows"
         gc_rounds(nodes, offset_rounds(i + 1))
         # A refused rename is retried as the same statement: the move is re-drivable.
         done = run_statement(node, "RENAME TABLE {} TO {}".format(src, dst), stats)
@@ -402,6 +441,87 @@ def test_rename_table_changing_the_namespace():
         run_workload("RENAME TABLE (Ordinary database, namespace changes)", iteration)
     finally:
         node1.query("DROP DATABASE IF EXISTS ord SYNC")
+
+
+def active_parts(node, table):
+    return node.query(
+        "SELECT name FROM system.parts WHERE database = currentDatabase() AND table = '{}' AND active "
+        "ORDER BY name".format(table)
+    ).split()
+
+
+def create_replicated_pair(name):
+    for node in (cluster.instances["node1"], cluster.instances["node2"]):
+        node.query(
+            "CREATE TABLE {} (p UInt8, id UInt64, v UInt64, s String) "
+            "ENGINE = ReplicatedMergeTree('/clickhouse/tables/xcopy/{}', '{{replica}}') "
+            "PARTITION BY p ORDER BY id SETTINGS storage_policy = '{}'".format(name, name, POLICY)
+        )
+
+
+def poll_until(predicate, what, timeout=120):
+    """Bounded polling: the deadline only turns a hang into a failure, it orders nothing."""
+    deadline = time.time() + timeout
+    while not predicate():
+        assert time.time() < deadline, "timed out waiting for {}".format(what)
+        time.sleep(0.5)
+
+
+def test_fetch_paused_before_confirm_then_source_dropped():
+    """The fetch by relink is parked before its confirm; the source table is dropped and GC runs on the source.
+
+    The source can no longer confirm, so the fetch may fail cleanly or succeed. Either way the receiver must
+    not commit a part whose bodies are gone: whatever it holds reads back in full.
+    """
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+    nodes = [node1, node2]
+    offsets = log_offsets(nodes)
+    seed = next_seed()
+    table = "paused_{}".format(seed)
+    expected = expected_digest(seed)
+    create_replicated_pair(table)
+    node2.query("SYSTEM STOP FETCHES {}".format(table))
+    node1.query("INSERT INTO {} {}".format(table, content(seed)))
+    assert digest(node1, table) == expected
+    part = active_parts(node1, table)
+    assert part
+
+    node2.query("SYSTEM ENABLE FAILPOINT cas_relink_receiver_pause_before_confirm")
+    released = False
+    try:
+        node2.query("SYSTEM START FETCHES {}".format(table))
+        node2.query("SYSTEM WAIT FAILPOINT cas_relink_receiver_pause_before_confirm PAUSE", timeout=120)
+
+        node1.query("DROP TABLE {} SYNC".format(table))
+        # Rounds for longer than the condemn grace of the pool, so an unprotected body would be deleted.
+        deadline = time.time() + 6
+        while time.time() < deadline:
+            gc_round(node1)
+        node2.query("SYSTEM DISABLE FAILPOINT cas_relink_receiver_pause_before_confirm")
+        released = True
+    finally:
+        if not released:
+            node2.query("SYSTEM DISABLE FAILPOINT cas_relink_receiver_pause_before_confirm")
+
+    # The fetch ends in one of two ways: the part is committed, or the source refuses to confirm.
+    refusal = re.compile(r"did not prove it still holds the manifest")
+    poll_until(
+        lambda: active_parts(node2, table) == part
+        or refusal.search(
+            node2.exec_in_container(["bash", "-c", "tail -c +{} {} || true".format(offsets["node2"] + 1, SERVER_LOG)])
+        ),
+        "the paused fetch to commit or be refused",
+    )
+    held = active_parts(node2, table)
+    print("paused fetch: part committed on the receiver = {}".format(held == part))
+    if held:
+        assert digest(node2, table) == expected, "the fetched part is committed but does not read back in full"
+        check = node2.query("CHECK TABLE {}".format(table), settings={"check_query_single_value_result": 1}).strip()
+        assert check == "1", check
+    node2.query("DROP TABLE {} SYNC".format(table))
+    drain_gc(nodes)
+    pool_check(nodes, offsets)
 
 
 def test_fetch_by_relink_then_drop_on_the_first_replica():
@@ -432,10 +552,14 @@ def test_fetch_by_relink_then_drop_on_the_first_replica():
         create_both(second)
         node2.query("SYSTEM STOP FETCHES {}".format(second))
         node1.query("INSERT INTO {} {}".format(second, content(seed)))
-        expected = digest(node1, second)
+        expected = expected_digest(seed)
+        assert digest(node1, second) == expected, "the insert on the first replica wrote different rows"
+        part = active_parts(node1, second)
+        assert part, "the insert on the first replica made no part"
         gc_rounds(nodes, offset_rounds(i + 1))
         node2.query("SYSTEM START FETCHES {}".format(second))
         node2.query("SYSTEM SYNC REPLICA {}".format(second))
+        assert active_parts(node2, second) == part, "the second replica does not hold the part of the first"
         node1.query("DROP TABLE {} SYNC".format(second))
         assert digest(node2, second) == expected, "the fetched part lost data after the drop on the first replica"
         survivors.append((node2, second, expected))

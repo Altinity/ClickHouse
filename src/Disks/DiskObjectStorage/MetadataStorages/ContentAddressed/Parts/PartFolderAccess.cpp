@@ -431,6 +431,13 @@ Cas::CommitOutcome PreparedPartWrite::promote(Cas::PublishPolicy policy)
     }
 }
 
+void PreparedPartWrite::abortLoggingFailure() noexcept
+{
+    chassert(!terminal);
+    if (!terminal)
+        terminal = abandonBuildBestEffort(*build, "aborting a prepared part write for a caller that reports another error");
+}
+
 void PreparedPartWrite::abort()
 {
     if (terminal)
@@ -543,37 +550,59 @@ bool CachedPartFolderAccess::republishRef(const PartRefKey & src, const PartRefK
 
     runHookForTest(TestHook::BeforeDestinationPublish);
 
-    const CopySource source{src, src_manifest_ref};
-    std::optional<PreparedPartWrite> prepared;
-    bool source_confirmed = false;
-    std::optional<Cas::CommitOutcome> oc;
-    try
+    /// `throwCasWriteRetryLater` raises `NETWORK_ERROR` for many causes, so the code alone is not the filter; the
+    /// equality check is. Completion requires `dst` to exist with entries equal to the source manifest, which holds in
+    /// exactly two cases: our promote landed but its response was lost, or an identical concurrent rename promoted its
+    /// content-equal manifest first and our promote refused. Absent `dst` rethrows the original exception; `dst` with
+    /// other content is an ownership conflict, like the pre-publish check.
+    const auto complete_after_write_failure = [&](const Exception & e)
     {
-        prepared.emplace(prepareEntries(dst, src_manifest->entries, Cas::ProvenanceOp::Other));
-        source_confirmed = confirmCopySource(source);
-        if (source_confirmed)
-            oc = prepared->promote();
-    }
-    catch (const Exception & e)
-    {
-        /// `throwCasWriteRetryLater` raises `NETWORK_ERROR` for many causes, so the code alone is not
-        /// the filter; the equality check below is. Completion requires `dst` to exist with entries equal
-        /// to the source manifest, which holds in exactly two cases: our promote landed but its response
-        /// was lost, or an identical concurrent rename promoted its content-equal manifest first and our
-        /// promote refused. Absent `dst` rethrows the original exception; `dst` with other content is an
-        /// ownership conflict, like the pre-publish check.
         if (e.code() != ErrorCodes::NETWORK_ERROR)
             throw;
         if (!complete_over_equal_destination())
             throw;
+    };
+
+    const CopySource source{src, src_manifest_ref};
+    std::optional<PreparedPartWrite> prepared;
+    try
+    {
+        prepared.emplace(prepareEntries(dst, src_manifest->entries, Cas::ProvenanceOp::Other));
+    }
+    catch (const Exception & e)
+    {
+        complete_after_write_failure(e);
         return true;
+    }
+
+    bool source_confirmed = false;
+    try
+    {
+        source_confirmed = confirmCopySource(source);
+    }
+    catch (...)
+    {
+        /// A failed read proves nothing about the source or `dst`: take the precommit back and report the failure.
+        prepared->abortLoggingFailure();
+        throw;
     }
     if (!source_confirmed)
     {
-        prepared->abort();
+        prepared->abortLoggingFailure();
         if (complete_over_equal_destination())
             return true;
         throwCopySourceUnconfirmed(source, dst);
+    }
+
+    std::optional<Cas::CommitOutcome> oc;
+    try
+    {
+        oc = prepared->promote();
+    }
+    catch (const Exception & e)
+    {
+        complete_after_write_failure(e);
+        return true;
     }
     drop_source_or_abort(oc);
     return true;
@@ -581,31 +610,19 @@ bool CachedPartFolderAccess::republishRef(const PartRefKey & src, const PartRefK
 
 bool CachedPartFolderAccess::confirmCopySource(const CopySource & source) const
 {
-    try
-    {
-        /// A live source must not be refused because its table is not resident: the confirm reads only memory.
-        store->resolveRef(source.part.ns, source.part.ref);
-        return store->confirmExactRef(source.part.ns, source.part.ref, source.manifest_ref, Cas::ConfirmLockMode::Wait)
-            == Cas::ConfirmAnswer::Yes;
-    }
-    catch (...)
-    {
-        /// The relink confirm answers a failed slot read as unknown, and so does this one: only a `Yes` lets
-        /// the copy promote.
-        tryLogCurrentException(getLogger("CachedPartFolderAccess"),
-            fmt::format("while confirming the copy source '{}/{}'", source.part.ns.string(), source.part.ref),
-            LogsLevel::information);
-        return false;
-    }
+    /// A live source must not be refused because its table is not resident: the confirm reads only memory.
+    store->resolveRef(source.part.ns, source.part.ref);
+    return store->confirmExactRef(source.part.ns, source.part.ref, source.manifest_ref, Cas::ConfirmLockMode::Wait)
+        == Cas::ConfirmAnswer::Yes;
 }
 
 void throwCopySourceUnconfirmed(const CopySource & source, const PartRefKey & destination)
 {
     throw Exception(ErrorCodes::NO_REPLICA_HAS_PART,
-        "CAS copy into '{}/{}' is refused: its source '{}/{}' no longer proves it commits manifest {}, so the copied "
-        "blobs may have lost their owner; the operation must be retried",
-        destination.ns.string(), destination.ref, source.part.ns.string(), source.part.ref,
-        manifestRefDebugString(source.manifest_ref));
+        "The source part '{}/{}' changed or was removed while it was being copied (it no longer commits manifest {}), "
+        "so nothing was copied into '{}/{}'. Run the statement again",
+        source.part.ns.string(), source.part.ref, manifestRefDebugString(source.manifest_ref),
+        destination.ns.string(), destination.ref);
 }
 
 std::optional<Cas::ManifestRef> CachedPartFolderAccess::renameCommittedRef(

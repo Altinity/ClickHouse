@@ -5205,8 +5205,21 @@ public:
             parked.arriveAndWait();
         const RawRemoval removal = HeadHookBackend::remove(key, expected_value, access);
         if (hold)
+        {
+            {
+                std::lock_guard lock(late_mutex);
+                parked_removal = removal;
+            }
             landed.arriveAndWait();
+        }
         return removal;
+    }
+
+    /// What the store answered the parked delete; empty until it landed.
+    std::optional<RawRemoval> parkedRemoval()
+    {
+        std::lock_guard lock(late_mutex);
+        return parked_removal;
     }
 
     std::optional<Raw> read(const String & key, TransportAccess & access) override
@@ -5225,6 +5238,7 @@ public:
 private:
     std::mutex late_mutex;
     std::optional<String> parked_key;
+    std::optional<RawRemoval> parked_removal;
     String read_key;
     std::function<void()> before_read;
 };
@@ -5298,14 +5312,7 @@ TEST(CASGcRoundPoint, LeaderDeposedAfterTheValidationDeletesOnlyBodiesNobodyName
     });
 
     const size_t from = pool.backend->journal().size();
-    try
-    {
-        runGateRound(pool.store, *pool.gc_a);
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::ABORTED) << e.message();
-    }
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { runGateRound(pool.store, *pool.gc_a); });
     pool.gc_a->setPhaseSink({});
     ASSERT_EQ(deposed.fired(), 1u);
     ASSERT_TRUE(b_observed && b_acquired) << "B did not take the lease inside A's round";
@@ -5357,10 +5364,12 @@ TEST(CASGcRoundPoint, LateBodyDeleteLeavesTheIncarnationAWriterUploaded)
                 leader_a.join();
         });
         pool.backend->parked.waitUntilArrived();
+        bool delete_landed = false;
         const auto landDelete = [&]
         {
             pool.backend->parked.release();
             pool.backend->landed.waitUntilArrived();
+            delete_landed = true;
         };
 
         if (lands_between_head_and_intent_read)
@@ -5368,9 +5377,16 @@ TEST(CASGcRoundPoint, LateBodyDeleteLeavesTheIncarnationAWriterUploaded)
         const BlobMaterializationAction writer = writeOnePart(pool.store, "test/x_writer", "w", payload);
         if (!lands_between_head_and_intent_read)
             landDelete();
+        /// Released here too, so a hook that never fired fails the assertion below instead of holding the leader.
+        pool.backend->parked.release();
         pool.backend->landed.release();
         leader_a.join();
 
+        ASSERT_TRUE(delete_landed) << "the writer never read the intent, so the delete was not placed inside the writer";
+        /// Between the writer's `HEAD` and its intent read the delete still matches the incarnation it was sent for;
+        /// after the writer's upload it does not.
+        EXPECT_EQ(pool.backend->parkedRemoval(),
+                  lands_between_head_and_intent_read ? Backend::RawRemoval::Removed : Backend::RawRemoval::Mismatch);
         EXPECT_EQ(writer, BlobMaterializationAction::Published) << "the writer adopted an incarnation under deletion";
         EXPECT_TRUE(objectPresent(*pool.backend, pool.bodyKey(payload))) << "the late delete removed the writer's body";
         const FsckReport report = runFsck(*pool.store, /*detail=*/true);

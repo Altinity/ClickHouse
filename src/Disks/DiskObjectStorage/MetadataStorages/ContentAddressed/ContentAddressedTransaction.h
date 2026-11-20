@@ -141,7 +141,7 @@ private:
         std::vector<Cas::ManifestEntry> entries;   /// staged manifest entries (uploads + adoptions)
         /// The committed source of each entry in `entries` adopted without reading its body, keyed by entry path.
         /// It follows the entry through staged copies and renames; `confirmCopySources` checks it before promote.
-        /// Written only by `putEntry` and `eraseEntry`, which keep it in step with `entries`.
+        /// Written only by `putEntry`, `eraseEntry`, `rekeyEntry` and `clearEntries`, which keep it in step with `entries`.
         std::map<std::string, Cas::CopySource> copy_sources;
         /// The committed manifest this transaction found under the part's name when it first staged a
         /// write to it; a later commit requires exactly that binding. Empty for a part the transaction
@@ -202,9 +202,13 @@ private:
     /// another part without its bytes, and nullopt when this transaction uploads or inlines the bytes.
     static void putEntry(PartStaging & st, Cas::ManifestEntry entry, std::optional<Cas::CopySource> source);
     static void eraseEntry(PartStaging & st, const std::string & path);
+    /// Renames `entry`, an element of `st.entries`, in place; `new_path` must not be staged.
+    static void rekeyEntry(PartStaging & st, Cas::ManifestEntry & entry, std::string new_path);
+    static void clearEntries(PartStaging & st);
     static std::optional<Cas::CopySource> copySourceOf(const PartStaging & st, const std::string & path);
     /// Confirms each distinct committed source of `st`'s adopted entries. Runs after the precommit of
-    /// `st.build` is durable and before its promote; on a refusal it abandons the build and throws.
+    /// `st.build` is durable and before its promote; on a refusal it abandons the build and throws
+    /// `NO_REPLICA_HAS_PART`, and on a failed read it abandons the build and rethrows.
     void confirmCopySources(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st);
 
     /// Returns (and, when necessary, creates) the staging state for a routed namespace/ref.

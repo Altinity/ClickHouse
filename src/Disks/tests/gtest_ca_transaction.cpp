@@ -25,6 +25,7 @@ extern const int INVALID_STATE;
 extern const int CAS_OWNERSHIP_CONFLICT;
 extern const int NO_REPLICA_HAS_PART;
 extern const int LOGICAL_ERROR;
+extern const int CORRUPTED_DATA;
 }
 
 /// [TXN-ONE-PIPELINE] CA publish-at-commit lock-scope tests.
@@ -1104,6 +1105,102 @@ TEST(CASTransactionOpsDeathTest, ProjectionRekeyOntoAStagedProjectionAborts)
     }, "");
 }
 #endif
+
+/// A confirmation that fails to read is not a refusal: the commit reports that failure, with the copy's precommit
+/// taken back.
+TEST(CASTransactionSourceLiveness, AFailedSourceConfirmationPropagatesItsOwnError)
+{
+    auto storage = openTxStorage();
+    const std::string table = kLivenessTable + "/";
+    const DB::Cas::RootNamespace ns = storage->liveNamespace(kLivenessUuid);
+    commitPartTx(*storage, table, "all_85_85_0", {{"data.bin", "a source whose confirmation fails to read"}});
+    ConfirmCounter counter(storage->store());
+    counter.on_call = []
+    {
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "injected failure of the source confirmation");
+    };
+
+    auto tx = storage->createTransaction();
+    tx->createHardLink(table + "all_85_85_0/data.bin", table + "tmp_clone_all_86_86_0/data.bin");
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { tx->commit(DB::NoCommitOptions{}); });
+    EXPECT_EQ(counter.calls, 1u) << "positive control: the confirmation ran";
+    EXPECT_FALSE(storage->existsDirectory(table + "tmp_clone_all_86_86_0"));
+    for (const auto & [ref, manifest] : storage->store()->livePrecommitsForTest(ns))
+        EXPECT_NE(ref, "tmp_clone_all_86_86_0") << "the failed copy left its precommit";
+}
+
+/// The refusal names what happened to the source and tells the user to run the statement again.
+TEST(CASTransactionSourceLiveness, RefusalSaysTheSourceChangedAndToRunTheStatementAgain)
+{
+    auto storage = openTxStorage();
+    const std::string table = kLivenessTable + "/";
+    commitPartTx(*storage, table, "all_87_87_0", {{"data.bin", "a source dropped while it is copied"}});
+
+    auto tx = storage->createTransaction();
+    tx->createHardLink(table + "all_87_87_0/data.bin", table + "tmp_clone_all_88_88_0/data.bin");
+    dropPartTx(*storage, table + "all_87_87_0");
+    try
+    {
+        tx->commit(DB::NoCommitOptions{});
+        ADD_FAILURE() << "the copy of a dropped source committed";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::NO_REPLICA_HAS_PART) << e.message();
+        EXPECT_NE(e.message().find("changed or was removed while it was being copied"), std::string::npos) << e.message();
+        EXPECT_NE(e.message().find("nothing was copied into"), std::string::npos) << e.message();
+        EXPECT_NE(e.message().find("Run the statement again"), std::string::npos) << e.message();
+    }
+}
+
+/// An abandon that fails after a refusal does not replace the refusal: the caller still gets the code it retries on.
+TEST(CASTransactionSourceLiveness, RefusalSurvivesAFailedAbandon)
+{
+    auto storage = openTxStorage();
+    const std::string table = kLivenessTable + "/";
+    commitPartTx(*storage, table, "all_89_89_0", {{"data.bin", "a source confirmed by a mount that lost its fence"}});
+    ConfirmCounter counter(storage->store());
+    /// A fenced-out mount answers the confirm `Unknown` and refuses the abandon's append.
+    counter.on_call = [&] { storage->store()->tripMountLost(); };
+
+    auto tx = storage->createTransaction();
+    tx->createHardLink(table + "all_89_89_0/data.bin", table + "tmp_clone_all_90_90_0/data.bin");
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NO_REPLICA_HAS_PART, [&] { tx->commit(DB::NoCommitOptions{}); });
+    EXPECT_EQ(counter.calls, 1u) << "positive control: the confirmation ran";
+    EXPECT_FALSE(storage->store()->mayMutate()) << "positive control: the abandon ran on a fenced-out mount";
+}
+
+/// A hardlinked projection file keeps its committed source through the `.tmp_proj` re-key: the copy is still
+/// refused once that source is dropped, and commits while it is live.
+TEST(CASTransactionSourceLiveness, ProjectionRekeyKeepsTheCopySource)
+{
+    for (const bool drop_source : {false, true})
+    {
+        SCOPED_TRACE(drop_source ? "source dropped" : "source live");
+        auto storage = openTxStorage();
+        const std::string table = kLivenessTable + "/";
+        commitPartTx(*storage, table, "all_91_91_0", {{"p.proj/data.bin", "a projection column of the source"}});
+        const std::string part = table + "tmp_mut_all_91_91_0_2/";
+
+        auto tx = storage->createTransaction();
+        tx->createHardLink(table + "all_91_91_0/p.proj/data.bin", part + "p_1.tmp_proj/data.bin");
+        writeFileTx(*tx, part + "p_1.tmp_proj/checksums.txt", "the projection's own file");
+        tx->moveDirectory(part + "p_1.tmp_proj", part + "p.proj");
+        if (drop_source)
+        {
+            dropPartTx(*storage, table + "all_91_91_0");
+            DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NO_REPLICA_HAS_PART, [&] { tx->commit(DB::NoCommitOptions{}); });
+            EXPECT_FALSE(storage->existsDirectory(table + "tmp_mut_all_91_91_0_2"));
+        }
+        else
+        {
+            tx->commit(DB::NoCommitOptions{});
+            EXPECT_TRUE(storage->existsFile(part + "p.proj/data.bin"));
+            EXPECT_TRUE(storage->existsFile(part + "p.proj/checksums.txt"));
+            EXPECT_FALSE(storage->existsFile(part + "p_1.tmp_proj/data.bin"));
+        }
+    }
+}
 
 /// Bytes the destination uploads itself need no source: a copy of a pending upload and a copied path that is
 /// then overwritten both commit with no confirmation, even with the hardlinked source gone.

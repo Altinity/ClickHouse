@@ -23,6 +23,7 @@ namespace DB::ContentAddressedSetting
 {
 extern const ContentAddressedSettingsUInt64 gc_io_concurrency;
 extern const ContentAddressedSettingsUInt64 gc_round_intent_create_budget;
+extern const ContentAddressedSettingsUInt64 gc_shards;
 }
 
 namespace DB::ErrorCodes
@@ -98,6 +99,9 @@ const std::vector<EventPoint> kEventPoints = {
     {.point = RoundInterleavePoint::AfterRequestsBeforeCommit},
 };
 
+/// The GC shard count of a sharded cell; its blob's row is in a shard other than the first.
+constexpr uint64_t kShardedGc = 2;
+
 struct Cell
 {
     CopyPath path;
@@ -106,6 +110,7 @@ struct Cell
     Hops hops;
     /// Ignored for `SourceDrop::BeforeTheRound`.
     EventPoint at;
+    uint64_t gc_shards = 1;
 };
 
 const char * name(CopyPath v)
@@ -168,12 +173,17 @@ String cellName(const Cell & cell)
     String out = fmt::format("{}_{}_{}_{}", name(cell.path), name(cell.drop), name(cell.row), name(cell.hops));
     if (cell.drop != SourceDrop::BeforeTheRound)
         out += "_" + name(cell.at);
+    if (cell.gc_shards != 1)
+        out += fmt::format("_GcShards{}", cell.gc_shards);
     return out;
 }
 
 /// Why a cell of the cross product cannot occur; empty when it can.
 String exclusionReason(const Cell & cell)
 {
+    if (cell.gc_shards != 1 && cell.path != CopyPath::HardLink)
+        return "the shard of a blob's row depends only on its hash, not on the path that copied it, so several GC shards "
+               "run with `HardLink` only";
     if (cell.drop == SourceDrop::BeforeTheRound && cell.hops == Hops::Newborn)
         return "a destination copied before the round exists at the round's catalog read";
     if (cell.drop == SourceDrop::AfterTheRound && cell.path == CopyPath::Republish)
@@ -182,8 +192,6 @@ String exclusionReason(const Cell & cell)
         return "the first copy is refused, so there is nothing to relay";
     if (cell.drop == SourceDrop::ReclaimedInsideTheCopy && cell.path == CopyPath::Republish)
         return "`republishRef` reads and commits in one call, so no round runs between them";
-    if (cell.hops == Hops::Relay && cell.at.point == RoundInterleavePoint::BetweenNamespaces && cell.at.pass == 2)
-        return "the two hops run in consecutive rounds, whose pass 2 starts at opposite namespaces";
     return {};
 }
 
@@ -191,20 +199,22 @@ String exclusionReason(const Cell & cell)
 std::vector<Cell> crossProduct()
 {
     std::vector<Cell> out;
-    for (CopyPath path : {CopyPath::HardLink, CopyPath::Republish, CopyPath::Relink})
-        for (SourceDrop drop : {SourceDrop::BeforeTheRound, SourceDrop::InsideTheCopy, SourceDrop::ReclaimedInsideTheCopy,
-                                SourceDrop::AfterTheCopy, SourceDrop::AfterTheRound})
-            for (RowState row : {RowState::None, RowState::Candidate, RowState::Pending, RowState::Standing})
-                for (Hops hops : {Hops::One, Hops::Relay, Hops::Newborn})
-                {
-                    if (drop == SourceDrop::BeforeTheRound)
+    for (uint64_t gc_shards : {uint64_t{1}, kShardedGc})
+        for (CopyPath path : {CopyPath::HardLink, CopyPath::Republish, CopyPath::Relink})
+            for (SourceDrop drop : {SourceDrop::BeforeTheRound, SourceDrop::InsideTheCopy, SourceDrop::ReclaimedInsideTheCopy,
+                                    SourceDrop::AfterTheCopy, SourceDrop::AfterTheRound})
+                for (RowState row : {RowState::None, RowState::Candidate, RowState::Pending, RowState::Standing})
+                    for (Hops hops : {Hops::One, Hops::Relay, Hops::Newborn})
                     {
-                        out.push_back({.path = path, .drop = drop, .row = row, .hops = hops, .at = kEventPoints.front()});
-                        continue;
+                        if (drop == SourceDrop::BeforeTheRound)
+                        {
+                            out.push_back({.path = path, .drop = drop, .row = row, .hops = hops, .at = kEventPoints.front(),
+                                           .gc_shards = gc_shards});
+                            continue;
+                        }
+                        for (const EventPoint & at : kEventPoints)
+                            out.push_back({.path = path, .drop = drop, .row = row, .hops = hops, .at = at, .gc_shards = gc_shards});
                     }
-                    for (const EventPoint & at : kEventPoints)
-                        out.push_back({.path = path, .drop = drop, .row = row, .hops = hops, .at = at});
-                }
     return out;
 }
 
@@ -246,6 +256,7 @@ public:
         /// One create per round: the decoy takes it, so the blob stays a candidate.
         if (cell.row == RowState::Candidate)
             settings[DB::ContentAddressedSetting::gc_round_intent_create_budget] = 1;
+        settings[DB::ContentAddressedSetting::gc_shards] = cell.gc_shards;
         storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
             makeLocalObjectStorageForTest(), "pool", "srv1", "", nullptr, settings);
         storage->startup();
@@ -359,7 +370,7 @@ public:
 
     std::optional<RetiredEntry> row() const
     {
-        for (const RetiredEntry & entry : currentRetiredSet(*store->poolBackendPtr(), store->layout(), blobShard(blob, 1)))
+        for (const RetiredEntry & entry : currentRetiredSet(*store->poolBackendPtr(), store->layout(), blobShard(blob, cell.gc_shards)))
             if (entry.ref == blob)
                 return entry;
         return std::nullopt;
@@ -499,19 +510,27 @@ public:
                     ADD_FAILURE() << "the sender made no offer for " << from.ref;
                     return [] { return std::optional<Holder>{}; };
                 }
-                return [exchange, offer = *sent, holder = Holder{&to, "tmp-fetch_" + part}]() -> std::optional<Holder>
+                return [this, exchange, offer = *sent, holder = Holder{&to, "tmp-fetch_" + part}]() -> std::optional<Holder>
                 {
                     /// A receiver that cannot adopt the entries falls back to fetching bytes: a refusal, not a copy.
                     std::unique_ptr<DB::ICaPreparedRelink> prepared;
                     if (exchange->prepareAdoptFromManifest(holder.table->dir + holder.ref, offer.manifest_bytes, prepared)
                         != DB::CaRelinkPrepare::Prepared)
-                        return std::nullopt;
-                    const auto token = DB::decodeCasRelinkSourceToken(offer.confirm_token);
-                    const DB::CasConfirmAnswer answer = token
-                        ? exchange->confirmExactRef(token->root_namespace, token->ref_name, token->manifest_ref_text)
-                        : DB::CasConfirmAnswer::Unknown;
-                    if (answer != DB::CasConfirmAnswer::Yes)
                     {
+                        relink_refused_by = RelinkRefusal::Prepare;
+                        return std::nullopt;
+                    }
+                    const auto token = DB::decodeCasRelinkSourceToken(offer.confirm_token);
+                    if (!token)
+                    {
+                        ADD_FAILURE() << "the sender's confirm token does not decode";
+                        prepared->abort();
+                        return std::nullopt;
+                    }
+                    if (exchange->confirmExactRef(token->root_namespace, token->ref_name, token->manifest_ref_text)
+                        != DB::CasConfirmAnswer::Yes)
+                    {
+                        relink_refused_by = RelinkRefusal::Confirm;
                         prepared->abort();
                         return std::nullopt;
                     }
@@ -527,9 +546,21 @@ public:
         return [] { return std::optional<Holder>{}; };
     }
 
-    /// One hop in one round, with the copy and the drop where the cell puts them. Returns the new holder.
-    std::optional<Holder> hop(const Holder & from, const Table & to)
+    /// Where hop `index` lands. The pass-2 order of a pair depends on the round number and the hops of a relay run in
+    /// consecutive rounds, so only the second hop of a relay takes a pass-2 point; the first takes the pass-1 point of
+    /// the same walk order.
+    EventPoint pointOfHop(size_t index) const
     {
+        if (cell.hops == Hops::Relay && index == 0 && cell.at.point == RoundInterleavePoint::BetweenNamespaces)
+            return {.point = cell.at.point, .pass = 1, .destination_first = cell.at.destination_first};
+        return cell.at;
+    }
+
+    /// One hop in one round, with the copy and the drop where the cell puts them. Returns the new holder.
+    std::optional<Holder> hop(size_t index, const Holder & from, const Table & to)
+    {
+        const EventPoint at = pointOfHop(index);
+        const bool pass_two = passTwo(at);
         const auto [walk_first, walk_second] = walkPair(from.table, &to);
 
         /// The copy reads its source before the round; the source is dropped and its body reclaimed before the commit.
@@ -546,7 +577,7 @@ public:
                 return std::nullopt;
             }
             check("after the reclaim of the source's body");
-            if (passTwo() && nextRound() % 2 != 0)
+            if (pass_two && !passTwoWalksThePairInOrder(nextRound()))
             {
                 filler(*walk_first);
                 round();
@@ -556,10 +587,10 @@ public:
         /// Two new records in the source carry its walk into pass 2. The other table of the pair gets them only for
         /// a pass-2 event; otherwise it stays quiet, and pass 1 reads it to its end.
         filler(*walk_first);
-        if (passTwo())
+        if (pass_two)
         {
             filler(*walk_second);
-            EXPECT_EQ(nextRound() % 2, 0u) << "the round of the pass-2 event is odd";
+            EXPECT_TRUE(passTwoWalksThePairInOrder(nextRound())) << "pass 2 of round " << nextRound() << " does not walk the pair in order";
         }
 
         std::optional<Holder> made;
@@ -594,24 +625,29 @@ public:
         else
         {
             RoundInterleaveSelector selector;
-            if (cell.at.point == RoundInterleavePoint::BetweenNamespaces)
+            if (at.point == RoundInterleavePoint::BetweenNamespaces)
             {
                 /// The destination sorts first exactly when `destination_first`, so the pass walks the pair in name order.
                 const bool to_first = walk_second->ns.string() < walk_first->ns.string();
                 selector = {.first = to_first ? walk_second->ns.string() : walk_first->ns.string(),
                             .second = to_first ? walk_first->ns.string() : walk_second->ns.string(),
-                            .pass = cell.at.pass};
+                            .pass = at.pass};
             }
-            const RoundWithCallback scenario = runRoundWithCallback(*gc, cell.at.point, selector, event);
+            const RoundWithCallback scenario = runRoundWithCallback(*gc, at.point, selector, event);
             store->renewWatermarkOnce();
-            EXPECT_EQ(scenario.fired, 1u) << "the round never reached " << name(cell.at);
+            EXPECT_EQ(scenario.fired, 1u) << "the round never reached " << name(at);
         }
         check("after the round of the copy");
         if (!copied)
             return std::nullopt;
 
         if (refusal_expected)
+        {
             EXPECT_FALSE(made.has_value()) << "a copy whose source was dropped before its promote committed";
+            /// A reclaimed body does not fail the receiver's prepare; the sender's confirm refuses both drops.
+            if (cell.path == CopyPath::Relink)
+                EXPECT_EQ(relink_refused_by, RelinkRefusal::Confirm) << "another mechanism refused the relink";
+        }
         else
             EXPECT_TRUE(made.has_value()) << "a copy of a live source was refused";
 
@@ -633,20 +669,25 @@ public:
 
     void run()
     {
-        if (passTwo() && cell.drop != SourceDrop::ReclaimedInsideTheCopy)
+        if (passTwo(cell.at) && cell.drop != SourceDrop::ReclaimedInsideTheCopy)
         {
-            /// Pass 2 starts at index `round mod 2` of the two unfinished walks, so an even round walks the namespace
-            /// that sorts first first. Each round of the row setup commits.
+            /// Each round of the row setup commits, and so does the first hop of a relay.
             const size_t setup_rounds = cell.row == RowState::None ? 1 : (cell.row == RowState::Standing ? 3 : 2);
-            pad((nextRound() + setup_rounds) % 2);
+            const size_t rounds_before_the_pass_two_hop = setup_rounds + (cell.hops == Hops::Relay ? 1 : 0);
+            size_t padding = 0;
+            while (!passTwoWalksThePairInOrder(nextRound() + padding + rounds_before_the_pass_two_hop))
+                ++padding;
+            pad(padding);
         }
         ASSERT_NO_FATAL_FAILURE(prepareRow());
 
         Holder current{&source, "all_1_1_0"};
-        for (const auto & [from, to] : hopTables())
+        const auto hops = hopTables();
+        for (size_t index = 0; index < hops.size(); ++index)
         {
+            const auto & [from, to] = hops[index];
             ASSERT_EQ(from, current.table);
-            const auto made = hop(current, *to);
+            const auto made = hop(index, current, *to);
             if (!made)
                 break;
             current = *made;
@@ -669,10 +710,21 @@ public:
         EXPECT_EQ(body_deletes_while_named.load(), 0u) << "a body DELETE was sent while a part named the blob";
     }
 
-    bool passTwo() const
+    /// Whether pass 2 of `round` walks the pass-2 hop's pair in name order, one right after the other. Pass 2 starts at
+    /// index `round mod n` of the unfinished walks in name order. They are the pair, and for a relay whose first source
+    /// is dropped after that hop's round also that source, whose drop record the pass-2 round reads.
+    bool passTwoWalksThePairInOrder(uint64_t round) const
     {
-        return cell.drop != SourceDrop::BeforeTheRound && cell.at.point == RoundInterleavePoint::BetweenNamespaces
-            && cell.at.pass == 2;
+        const bool three_walks = cell.hops == Hops::Relay && cell.drop == SourceDrop::AfterTheRound;
+        const uint64_t walks = three_walks ? 3 : 2;
+        /// The relay's first source sorts last when the destination is walked first, and first otherwise.
+        const uint64_t first_of_the_pair = three_walks && !cell.at.destination_first ? 1 : 0;
+        return round % walks != (first_of_the_pair + 1) % walks;
+    }
+
+    bool passTwo(const EventPoint & at) const
+    {
+        return cell.drop != SourceDrop::BeforeTheRound && at.point == RoundInterleavePoint::BetweenNamespaces && at.pass == 2;
     }
 
     /// Committed rounds before the row setup.
@@ -686,7 +738,7 @@ public:
     }
 
     const Cell cell;
-    const String payload = "round-interleave-payload";
+    const String payload = payloadInAShardOtherThanTheFirst(cell.gc_shards);
     const BlobRef blob = idOf(payload);
     String body_key;
 
@@ -705,7 +757,19 @@ public:
     std::atomic<uint64_t> body_deletes{0};
     std::atomic<uint64_t> body_deletes_while_named{0};
 
+    enum class RelinkRefusal : uint8_t { None, Prepare, Confirm };
+    RelinkRefusal relink_refused_by = RelinkRefusal::None;
+
 private:
+    static String payloadInAShardOtherThanTheFirst(uint64_t gc_shards)
+    {
+        if (gc_shards == 1)
+            return "round-interleave-payload";
+        for (size_t i = 0;; ++i)
+            if (String candidate = "round-interleave-payload-" + std::to_string(i); blobShard(idOf(candidate), gc_shards) != 0)
+                return candidate;
+    }
+
     Table makeTable(char order, int index)
     {
         const String uuid = fmt::format("{}0000000-0000-4000-8000-{:012}", order, index);
@@ -713,11 +777,13 @@ private:
         return Table{uuid, dir, storage->liveNamespace(uuid)};
     }
 
-    /// A payload whose blob sorts before the cell's blob, so it takes the round's one intent create.
+    /// A payload whose blob comes before the cell's blob in the order the round spends its creates (shard, then
+    /// hash), so it takes the round's one intent create.
     String decoyPayload() const
     {
+        const auto position = [&](const BlobRef & ref) { return std::make_pair(blobShard(ref, cell.gc_shards), ref); };
         for (size_t i = 0;; ++i)
-            if (const String candidate = "round-interleave-decoy-" + std::to_string(i); idOf(candidate) < blob)
+            if (const String candidate = "round-interleave-decoy-" + std::to_string(i); position(idOf(candidate)) < position(blob))
                 return candidate;
     }
 
@@ -739,27 +805,31 @@ TEST_P(CASInterleaveMatrix, CopyAndDropKeepEveryNamedBody)
 INSTANTIATE_TEST_SUITE_P(CASInterleave, CASInterleaveMatrix, ::testing::ValuesIn(generatedCells()),
     [](const ::testing::TestParamInfo<Cell> & param_info) { return cellName(param_info.param); });
 
-/// The cells the matrix runs and the ones it cannot generate, with the reason for each excluded group.
-TEST(CASInterleaveMatrixCells, GeneratedAndExcludedCellsPartitionTheProduct)
+/// The cells the matrix runs and the ones it does not generate, with the reason for each excluded group. The counts
+/// are pinned, so a change to a dimension or to an exclusion shows up here.
+TEST(CASInterleaveMatrixCells, GeneratedAndExcludedCellCounts)
 {
     const std::vector<Cell> product = crossProduct();
     std::map<String, size_t> excluded;
-    size_t generated = 0;
     for (const Cell & cell : product)
-    {
-        const String reason = exclusionReason(cell);
-        if (reason.empty())
-            ++generated;
-        else
+        if (const String reason = exclusionReason(cell); !reason.empty())
             ++excluded[reason];
-    }
-    size_t excluded_total = 0;
     for (const auto & [reason, count] : excluded)
-    {
         std::cout << "[ CASInterleave ] excluded " << count << ": " << reason << '\n';
-        excluded_total += count;
-    }
-    std::cout << "[ CASInterleave ] run " << generated << ", excluded " << excluded_total << ", product " << product.size() << '\n';
-    EXPECT_EQ(generated, generatedCells().size());
-    EXPECT_EQ(generated + excluded_total, product.size());
+
+    EXPECT_EQ(product.size(), 2088u);
+    EXPECT_EQ(generatedCells().size(), 1012u);
+    const auto excludedFor = [&](const Cell & cell) { return excluded[exclusionReason(cell)]; };
+    const EventPoint pass_one{.point = RoundInterleavePoint::BetweenNamespaces, .pass = 1, .destination_first = true};
+    EXPECT_EQ(excludedFor({.path = CopyPath::Relink, .drop = SourceDrop::AfterTheCopy, .row = RowState::None, .hops = Hops::One,
+                           .at = pass_one, .gc_shards = kShardedGc}), 696u);
+    EXPECT_EQ(excludedFor({.path = CopyPath::HardLink, .drop = SourceDrop::BeforeTheRound, .row = RowState::None,
+                           .hops = Hops::Newborn, .at = pass_one}), 16u);
+    EXPECT_EQ(excludedFor({.path = CopyPath::Republish, .drop = SourceDrop::AfterTheRound, .row = RowState::None,
+                           .hops = Hops::One, .at = pass_one}), 84u);
+    EXPECT_EQ(excludedFor({.path = CopyPath::HardLink, .drop = SourceDrop::InsideTheCopy, .row = RowState::None,
+                           .hops = Hops::Relay, .at = pass_one}), 224u);
+    EXPECT_EQ(excludedFor({.path = CopyPath::Republish, .drop = SourceDrop::ReclaimedInsideTheCopy, .row = RowState::None,
+                           .hops = Hops::One, .at = pass_one}), 56u);
+    EXPECT_EQ(excluded.size(), 5u);
 }

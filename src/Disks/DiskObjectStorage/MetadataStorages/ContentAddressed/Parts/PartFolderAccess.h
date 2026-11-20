@@ -190,6 +190,9 @@ public:
     /// released. Propagates an append failure -- the caller may retry, and the destructor is the
     /// backstop if it does not.
     void abort();
+    /// `abort` for a caller that already carries the error it must report: a failed append is logged, not thrown,
+    /// and the destructor tries the abort again.
+    void abortLoggingFailure() noexcept;
 
     /// Whether the owed terminal operation has already completed. A moved-from handle is terminal.
     bool isTerminal() const { return terminal; }
@@ -304,8 +307,9 @@ public:
     /// their bodies asks this after its own precommit is durable and before its promote: a match in the
     /// committed map alone could be a drop that is durable but not yet applied. Loads the source table first
     /// if it is not resident (`Pool::resolveRef`), then sends one mount-slot read when the ledger confirms.
-    /// A failure of either is logged and answers false. Waits for the source table's state lock
-    /// (`ConfirmLockMode::Wait`), so a busy table is not a refusal. Call it with no ledger lock held.
+    /// False is a refusal: the source is not, or cannot be shown to be, the current binding. A failure of either
+    /// read propagates. Waits for the source table's state lock (`ConfirmLockMode::Wait`). Call it with no ledger
+    /// lock held.
     bool confirmCopySource(const CopySource & source) const;
     /// Moves a committed ref by publishing the source entries at `dst` and then dropping `src` only
     /// while it still names the republished manifest. Returns false when the source is absent; a
@@ -313,7 +317,8 @@ public:
     /// source. Throws `CAS_OWNERSHIP_CONFLICT` (after taking back a destination this call created) when
     /// the source was repointed meanwhile. A destination this call precommits is promoted only after
     /// `confirmCopySource`; an unconfirmed source takes the precommit back and throws
-    /// `throwCopySourceUnconfirmed`, unless an identical move already committed `dst` with this content.
+    /// `throwCopySourceUnconfirmed`, unless an identical move already committed `dst` with this content. A failed
+    /// confirmation takes the precommit back and propagates its own error.
     bool republishRef(const PartRefKey & src, const PartRefKey & dst);
     /// Rename of a committed ref inside the table namespace without republishing content: one ref-log
     /// append (`OwnerTransitionShape::Move`). `expected` is the manifest the caller resolved for `src`;

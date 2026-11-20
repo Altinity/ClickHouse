@@ -1117,6 +1117,11 @@ public:
     {
         ref_ledger.setInstallRegionProbeForTest(std::move(probe));
     }
+    /// Test-only: forwards to `CasRefLedger::setConfirmBeforeStateLockWaitHookForTest`.
+    void setConfirmBeforeStateLockWaitHookForTest(std::function<void()> hook)
+    {
+        ref_ledger.setConfirmBeforeStateLockWaitHookForTest(std::move(hook));
+    }
     void setSnapshotAfterCaptureHookForTest(std::function<void()> hook)
     {
         ref_ledger.setSnapshotAfterCaptureHookForTest(std::move(hook));
