@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Tags: no-fasttest
-# no-fasttest: `--jwt` needs a build with jwt-cpp and SSL.
+# no-fasttest: kept from upstream, where the test also passes `--jwt`, which needs a build with jwt-cpp and SSL.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -51,7 +51,7 @@ fi
 CONNECTIONS=0
 function show_credential_options()
 {
-    "$@" > /dev/null 2>&1 &
+    "$@" < /dev/null > /dev/null 2>&1 &
     local pid=$!
     CONNECTIONS=$((CONNECTIONS + 1))
     # A connected program has parsed its options.
@@ -61,23 +61,23 @@ function show_credential_options()
     wait "$pid" 2>/dev/null || true
 }
 
-JWT='eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.SECRET'
+# `--jwt` is not exercised: on this branch the client is built without JWT support (`USE_JWT_CPP` is 0),
+# so it exits with SUPPORT_IS_DISABLED before connecting. Neither is the `--option = value` form, which the
+# client on this branch does not accept.
 
 echo "client, separate values"
 show_credential_options ${CLICKHOUSE_CLIENT_BINARY} --host 127.0.0.1 --port "$PORT" --query "SELECT 1" \
-    --jwt "$JWT" --password SECRET --ssh-key-passphrase SECRET
+    --password SECRET --ssh-key-passphrase SECRET
 
 echo "client, values after ="
 show_credential_options ${CLICKHOUSE_CLIENT_BINARY} --host 127.0.0.1 --port "$PORT" --query "SELECT 1" \
-    --jwt="$JWT" --password=SECRET --ssh-key-passphrase=SECRET
+    --password=SECRET --ssh-key-passphrase=SECRET
 
-echo "client, values after spaced ="
-show_credential_options ${CLICKHOUSE_CLIENT_BINARY} --host 127.0.0.1 --port "$PORT" --query "SELECT 1" \
-    --jwt = "$JWT" --password = SECRET --ssh-key-passphrase = SECRET
-
+# A `--password` without a value makes the client ask for the password; the test runs without a terminal,
+# so it reads an empty one from stdin (/dev/null) and goes on to connect.
 echo "client, --password without a value"
 show_credential_options ${CLICKHOUSE_CLIENT_BINARY} --host 127.0.0.1 --port "$PORT" --query "SELECT 1" \
-    --password --jwt "$JWT"
+    --password --ssh-key-passphrase SECRET
 
 echo "keeper-client"
 show_credential_options ${KEEPER_CLIENT} --host 127.0.0.1 --port "$PORT" --connection-timeout 60 --session-timeout 60 \
