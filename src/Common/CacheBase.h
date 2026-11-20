@@ -269,7 +269,9 @@ public:
         return cache_policy->dump();
     }
 
-    void clear()
+    /// Virtual so a derived cache that keeps state outside `cache_policy` is not skipped
+    /// when the call goes through a `CacheBase` pointer.
+    virtual void clear()
     {
         std::lock_guard lock(mutex);
         insert_tokens.clear();
@@ -333,13 +335,15 @@ public:
         return cache_policy->maxCount();
     }
 
-    void setMaxCount(size_t max_count)
+    /// Virtual for the same reason as `clear`.
+    virtual void setMaxCount(size_t max_count)
     {
         std::lock_guard lock(mutex);
         cache_policy->setMaxCount(max_count);
     }
 
-    void setMaxSizeInBytes(size_t max_size_in_bytes)
+    /// Virtual for the same reason as `clear`.
+    virtual void setMaxSizeInBytes(size_t max_size_in_bytes)
     {
         std::lock_guard lock(mutex);
         cache_policy->setMaxSizeInBytes(max_size_in_bytes);
