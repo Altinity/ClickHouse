@@ -567,6 +567,19 @@ It is currently only implemented in StorageObjectStorage.
       throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Import is not implemented for storage {}", getName());
     }
 
+    /// The metadata an export to this storage is validated and executed against.
+    /// `iceberg_metadata_json` is the destination table metadata that was validated when the export was scheduled
+    /// and is stored in the export manifest. A data lake destination checks its in-memory columns against it, so that
+    /// the scheduling node and every replica that runs the export use the same destination types, whatever state the
+    /// in-memory columns of the destination table on that node are in. Other storages ignore it and use their
+    /// in-memory metadata.
+    virtual StorageMetadataHandle getExportDestinationMetadata(
+        const std::optional<std::string> & /* iceberg_metadata_json */,
+        ContextPtr context) const
+    {
+        return getInMemoryMetadataPtr(context, false);
+    }
+
     struct IcebergCommitExportPartitionArguments
     {
       std::string metadata_json_string;

@@ -221,6 +221,15 @@ public:
         return false;
     }
 
+    /// `declared_columns` (the in-memory columns of the destination table) checked against the table schema in
+    /// `iceberg_metadata_json_string`, the table metadata an export was validated against: a column whose type does not
+    /// fit the Iceberg type of its field is replaced by the type that does.
+    virtual NamesAndTypesList getExportDestinationColumns(
+        const std::string & /* iceberg_metadata_json_string */, const NamesAndTypesList & /* declared_columns */) const
+    {
+        throwNotImplemented("getExportDestinationColumns");
+    }
+
     virtual SinkToStoragePtr import(
         std::shared_ptr<DataLake::ICatalog> /* catalog */,
         const std::function<void(const std::string &)> & /* new_file_path_callback */,

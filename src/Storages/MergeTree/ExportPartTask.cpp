@@ -120,11 +120,14 @@ namespace
     void addExportConvertingActions(
         QueryPlan & plan_for_part,
         const IStorage & destination_storage,
+        const std::optional<std::string> & iceberg_metadata_json,
         const ContextPtr & local_context)
     {
         FailPointInjection::pauseFailPoint(FailPoints::export_part_pause_before_schema_validation);
 
-        const auto destination_metadata = destination_storage.getInMemoryMetadataPtr(local_context, false);
+        /// The destination types come from the destination metadata that the export was validated against, which the
+        /// manifest carries, so every replica casts to the types the scheduling node validated.
+        const auto destination_metadata = destination_storage.getExportDestinationMetadata(iceberg_metadata_json, local_context);
         const auto destination_header = destination_metadata->getSampleBlockNonMaterialized();
         const auto & destination_columns = destination_header.getColumnsWithTypeAndName();
 
@@ -379,7 +382,7 @@ bool ExportPartTask::executeStep()
             /// This is a hack that materializes the columns before the export so they can be exported to tables that have matching columns
             materializeSpecialColumns(plan_for_part.getCurrentHeader(), metadata_snapshot, local_context, plan_for_part);
 
-            addExportConvertingActions(plan_for_part, *destination_storage, local_context);
+            addExportConvertingActions(plan_for_part, *destination_storage, manifest.iceberg_metadata_json, local_context);
 
             QueryPlanOptimizationSettings optimization_settings(local_context);
             auto pipeline_settings = BuildQueryPipelineSettings(local_context);

@@ -720,6 +720,37 @@ def test_export_partition_unsigned_to_same_size_signed_rejected_without_optin(
     assert count == 0, f"Expected no rows after a rejected export, got {count}"
 
 
+def test_export_partition_uint32_declared_over_iceberg_int_is_exported_as_int32(cluster, source_engine):
+    """A `UInt32` column declared over an Iceberg `int` field (as left by a release that stored `UInt32` as `int`)
+    is exported as the `Int32` the field is. The second table is declared over the path of the first with
+    `id UInt32`, so a negative `Int32` source value is accepted without the lossy-cast opt-in and is stored
+    unchanged, instead of being rejected or turned into an unsigned value."""
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_declared_uint32_{uid}"
+    iceberg_table = f"iceberg_declared_uint32_{uid}"
+    declared_table = f"iceberg_declared_uint32_view_{uid}"
+    url = f"http://minio1:9001/root/data/{iceberg_table}/"
+
+    make_source(node, mt_table, "id Int32, year Int32", "year", replica_name="replica1", engine=source_engine)
+    node.query(f"INSERT INTO {mt_table} VALUES (-5, 2020), (7, 2020)")
+
+    # The Iceberg field is `int`. Neither table is queried before the export, so the second
+    # one still has the `UInt32` it is declared with, not the `Int32` of the Iceberg schema.
+    make_iceberg_s3(node, iceberg_table, "id Int32, year Int32", partition_by="year", url=url)
+    make_iceberg_s3(node, declared_table, "id UInt32, year Int32", partition_by="year", url=url, if_not_exists=True)
+
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {declared_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    wait_for_export_status(node, mt_table, declared_table, "2020", "COMPLETED")
+
+    result = node.query(f"SELECT id, toTypeName(id), year FROM {iceberg_table} ORDER BY id").strip()
+    assert result == "-5\tInt32\t2020\n7\tInt32\t2020", f"Unexpected exported data:\n{result}"
+
+
 def test_export_partition_with_castable_narrowing_values_fit(cluster, source_engine):
     """A lossy narrowing (id Int64 -> Int32) succeeds once the user opts in via
     export_merge_tree_part_allow_lossy_cast."""
@@ -841,7 +872,7 @@ def test_export_partition_all_iceberg_types(cluster, source_engine):
     iceberg_table = f"iceberg_all_types_{uid}"
 
     # Scalar source types are strictly narrower than the destination; the export inserts
-    # a positional widening CAST per column (Int8->Int16, UInt32->UInt64, ...). Nested
+    # a positional widening CAST per column (Int8->Int16, UInt32->Int64, ...). Nested
     # columns keep the same type on both sides.
     source_columns = (
         "i16 Int8, u16 UInt8, u32 UInt16, u64 UInt32, "
@@ -852,7 +883,7 @@ def test_export_partition_all_iceberg_types(cluster, source_engine):
         "year Int32"
     )
     dest_columns = (
-        "i16 Int16, u16 UInt16, u32 UInt32, u64 UInt64, "
+        "i16 Int16, u16 UInt16, u32 UInt32, u64 Int64, "
         "id Int32, big Int64, f32 Float32, f64 Float64, "
         "d Date, d32 Date32, dt DateTime, dt64 DateTime64(6), "
         "s String, uid UUID, "

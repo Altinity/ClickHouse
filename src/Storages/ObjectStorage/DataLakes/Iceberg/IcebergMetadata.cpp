@@ -15,7 +15,12 @@
 #include <Columns/ColumnConst.h>
 #include <Columns/ColumnSet.h>
 #include <Core/UUID.h>
+#include <DataTypes/DataTypeArray.h>
+#include <DataTypes/DataTypeLowCardinality.h>
+#include <DataTypes/DataTypeMap.h>
+#include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeSet.h>
+#include <DataTypes/DataTypeTuple.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Formats/FormatFilterInfo.h>
 #include <Formats/FormatParserSharedResources.h>
@@ -230,6 +235,21 @@ bool isExportPartitionTransactionAlreadyCommitted(const Poco::JSON::Object::Ptr 
     }
 
     return false;
+}
+
+void checkNoUInt64(const ColumnsDescription & columns)
+{
+    for (const auto & column : columns.getAllPhysical())
+    {
+        bool has_uint64 = column.type->getTypeId() == TypeIndex::UInt64;
+        column.type->forEachChild([&](const IDataType & child) { has_uint64 |= child.getTypeId() == TypeIndex::UInt64; });
+        if (has_uint64)
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "Column {} of type {} cannot be stored in Iceberg: the widest Iceberg integer type is the signed 64-bit `long`, "
+                "which cannot represent every UInt64 value. Use Int64 or Decimal(20, 0) instead",
+                column.name, column.type->getName());
+    }
 }
 
 }
@@ -1172,6 +1192,9 @@ void IcebergMetadata::createInitial(
     auto configuration_ptr = configuration.lock();
     if (!configuration_ptr)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Trying to create Iceberg table, but storage configuration is expired");
+
+    if (columns)
+        checkNoUInt64(*columns);
 
     const bool catalog_manages_location = catalog && catalog->managesTableLocation();
     /// Either way the catalog writes the first metadata file, so the existence check and the prewrite move to it.
@@ -2836,6 +2859,107 @@ Poco::JSON::Object::Ptr IcebergMetadata::getMetadataJSON(ContextPtr local_contex
         log,
         persistent_components.metadata_compression_method,
         persistent_components.table_uuid);
+}
+
+namespace
+{
+
+/// `type` with every `UInt32` that sits over an Iceberg `int` field replaced by `Int32`, recursing through `Nullable`,
+/// `LowCardinality`, `Array`, `Map` and `Tuple` along the Iceberg `list`, `map` and `struct` types.
+/// ClickHouse stored `UInt32` as Iceberg `int` before it was widened to `long`, so a table created by that release can be
+/// declared with `UInt32` over an `int` field, which must not be written as the 8-byte `long` that `UInt32` is now.
+DataTypePtr correctUInt32OverIcebergInt(const DataTypePtr & type, const Poco::Dynamic::Var & iceberg_type)
+{
+    if (const auto * nullable_type = typeid_cast<const DataTypeNullable *>(type.get()))
+        return std::make_shared<DataTypeNullable>(correctUInt32OverIcebergInt(nullable_type->getNestedType(), iceberg_type));
+
+    if (const auto * low_cardinality_type = typeid_cast<const DataTypeLowCardinality *>(type.get()))
+        return std::make_shared<DataTypeLowCardinality>(
+            correctUInt32OverIcebergInt(low_cardinality_type->getDictionaryType(), iceberg_type));
+
+    if (iceberg_type.isString())
+    {
+        if (iceberg_type.convert<String>() == Iceberg::f_int && type->getTypeId() == TypeIndex::UInt32)
+            return std::make_shared<DataTypeInt32>();
+        return type;
+    }
+
+    if (iceberg_type.type() != typeid(Poco::JSON::Object::Ptr))
+        return type;
+
+    const auto iceberg_object = iceberg_type.extract<Poco::JSON::Object::Ptr>();
+    const auto kind = iceberg_object->getValue<String>(Iceberg::f_type);
+
+    if (kind == Iceberg::f_list)
+    {
+        if (const auto * array_type = typeid_cast<const DataTypeArray *>(type.get()))
+            return std::make_shared<DataTypeArray>(
+                correctUInt32OverIcebergInt(array_type->getNestedType(), iceberg_object->get(Iceberg::f_element)));
+    }
+    else if (kind == Iceberg::f_map)
+    {
+        if (const auto * map_type = typeid_cast<const DataTypeMap *>(type.get()))
+            return std::make_shared<DataTypeMap>(
+                correctUInt32OverIcebergInt(map_type->getKeyType(), iceberg_object->get(Iceberg::f_key)),
+                correctUInt32OverIcebergInt(map_type->getValueType(), iceberg_object->get(Iceberg::f_value)));
+    }
+    else if (kind == Iceberg::f_struct)
+    {
+        const auto * tuple_type = typeid_cast<const DataTypeTuple *>(type.get());
+        const auto fields = iceberg_object->getArray(Iceberg::f_fields);
+        if (tuple_type && fields)
+        {
+            DataTypes elements = tuple_type->getElements();
+            for (UInt32 i = 0; i < fields->size(); ++i)
+            {
+                const auto field = fields->getObject(i);
+                const auto field_name = field->getValue<String>(Iceberg::f_name);
+
+                std::optional<size_t> position;
+                if (tuple_type->hasExplicitNames())
+                    position = tuple_type->tryGetPositionByName(field_name);
+                else if (i < elements.size())
+                    position = i;
+
+                if (position)
+                    elements[*position] = correctUInt32OverIcebergInt(elements[*position], field->get(Iceberg::f_type));
+            }
+
+            if (tuple_type->hasExplicitNames())
+                return std::make_shared<DataTypeTuple>(elements, tuple_type->getElementNames());
+            return std::make_shared<DataTypeTuple>(elements);
+        }
+    }
+
+    return type;
+}
+
+}
+
+NamesAndTypesList IcebergMetadata::getExportDestinationColumns(
+    const std::string & iceberg_metadata_json_string, const NamesAndTypesList & declared_columns) const
+{
+    Poco::JSON::Parser parser; /// For some reason base/base/JSON.h can not parse this json file
+    const auto metadata_json = parser.parse(iceberg_metadata_json_string).extract<Poco::JSON::Object::Ptr>();
+    const auto schema = lookupSchema(metadata_json, metadata_json->getValue<Int64>(Iceberg::f_current_schema_id));
+
+    std::unordered_map<String, Poco::Dynamic::Var> iceberg_types_by_name;
+    const auto fields = schema->getArray(Iceberg::f_fields);
+    for (UInt32 i = 0; fields && i < fields->size(); ++i)
+    {
+        const auto field = fields->getObject(i);
+        iceberg_types_by_name.emplace(field->getValue<String>(Iceberg::f_name), field->get(Iceberg::f_type));
+    }
+
+    NamesAndTypesList columns;
+    for (const auto & column : declared_columns)
+    {
+        const auto iceberg_type = iceberg_types_by_name.find(column.name);
+        columns.emplace_back(
+            column.name,
+            iceberg_type == iceberg_types_by_name.end() ? column.type : correctUInt32OverIcebergInt(column.type, iceberg_type->second));
+    }
+    return columns;
 }
 
 }

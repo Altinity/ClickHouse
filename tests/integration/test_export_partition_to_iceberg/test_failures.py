@@ -3,6 +3,7 @@ import time
 from helpers.export_partition_helpers import (
     make_iceberg_s3,
     make_source,
+    setup_source_tables,
     unique_suffix,
     wait_for_exception_count,
     wait_for_export_status,
@@ -331,6 +332,49 @@ def test_export_partition_local_backoff_does_not_block_other_replica(cluster):
 
     count = int(replica2.query(f"SELECT count() FROM {iceberg_table} WHERE year = 2020").strip())
     assert count == 3, f"Expected 3 rows after replica2 completed the export, got {count}"
+
+
+def test_export_partition_replica_with_uint32_declared_over_iceberg_int(cluster):
+    """
+    A replica whose destination table is declared `UInt32` over an Iceberg `int` field (as left by a release that
+    stored `UInt32` as `int`, on a node that has not reloaded the columns yet) exports it as the `Int32` the
+    field is, like the scheduling node. replica2 attaches to the Iceberg table with `id UInt32` and never queries
+    it, so its declared column still differs from the Iceberg `int` (`Int32`). The export is scheduled on replica1 (declared `Int32`) and
+    replica2 is the only replica that runs it. A negative `Int32` source value could not be cast to the declared
+    `UInt32` without the lossy-cast opt-in, so the export only completes if replica2 corrects the declared type to the Iceberg one.
+    """
+    replica1 = cluster.instances["replica1"]
+    replica2 = cluster.instances["replica2"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_replica_schema_{uid}"
+    iceberg_table = f"iceberg_replica_schema_{uid}"
+
+    setup_source_tables(
+        [replica1, replica2],
+        mt_table,
+        "id Int32, year Int32",
+        "year",
+        "ReplicatedMergeTree",
+        insert_values="(-5, 2020), (7, 2020)",
+        replica_names=["replica1", "replica2"],
+    )
+
+    make_iceberg_s3(replica1, iceberg_table, "id Int32, year Int32", partition_by="year")
+    make_iceberg_s3(replica2, iceberg_table, "id UInt32, year Int32", partition_by="year", if_not_exists=True)
+
+    # Only replica2 runs the export.
+    replica1.query(f"SYSTEM STOP MOVES {mt_table}")
+
+    replica1.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+
+    wait_for_export_status(replica1, mt_table, iceberg_table, "2020", "COMPLETED", timeout=60)
+
+    result = replica1.query(f"SELECT id, toTypeName(id), year FROM {iceberg_table} ORDER BY id").strip()
+    assert result == "-5\tInt32\t2020\n7\tInt32\t2020", f"Unexpected exported data:\n{result}"
 
 
 def test_export_partition_scheduler_skipped_when_moves_stopped(cluster, source_engine):
