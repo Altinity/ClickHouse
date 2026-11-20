@@ -88,6 +88,80 @@ def run_shell(name, command, **kwargs):
     print(f"\n<<<< {name}\n")
 
 
+def _cmake_cache_value(cache_path, name):
+    prefix = f"{name}:"
+    with open(cache_path, encoding="utf-8", errors="replace") as cache:
+        for line in cache:
+            if line.startswith(prefix):
+                return line.split("=", 1)[1]
+    return None
+
+
+def check_ppc64le_patches(build_root):
+    asm_path = os.path.join(build_root, "contrib/libunwind-cmake/UnwindRegistersSave.S")
+    ninja_path = os.path.join(build_root, "build.ninja")
+    cache_path = os.path.join(build_root, "CMakeCache.txt")
+
+    try:
+        with open(asm_path, encoding="utf-8") as asm_file:
+            asm = asm_file.read()
+    except OSError as error:
+        print(f"Could not read patched libunwind source {asm_path}: {error}")
+        return False
+
+    restored = (
+        "  xxswapd n, n            ;\\\n"
+        "  stxvd2x n, 0, 4         ;\\\n"
+        "  xxswapd n, n            ;\\"
+    )
+    if restored not in asm:
+        print(f"ppc64le libunwind patch was not applied to {asm_path}")
+        return False
+
+    try:
+        cxx_flags = _cmake_cache_value(cache_path, "CMAKE_CXX_FLAGS")
+    except OSError as error:
+        print(f"Could not read {cache_path}: {error}")
+        return False
+    if cxx_flags is None:
+        print(f"CMAKE_CXX_FLAGS missing from {cache_path}")
+        return False
+    if "-maltivec" not in cxx_flags or (
+        "-mcpu=power8" not in cxx_flags and "-mcpu=power9" not in cxx_flags
+    ):
+        print(f"CMAKE_CXX_FLAGS missing ppc64le AltiVec flags: {cxx_flags}")
+        return False
+    for flag in ("-D__SSE2__", "-DNO_WARN_X86_INTRINSICS"):
+        if flag in cxx_flags:
+            print(f"{flag} is still in CMAKE_CXX_FLAGS")
+            return False
+
+    frame_flag = "-Wframe-larger-than=131072"
+    patched_asm = "contrib/libunwind-cmake/UnwindRegistersSave.S"
+    found_frame = False
+    found_asm = False
+    try:
+        with open(ninja_path, encoding="utf-8", errors="replace") as ninja:
+            for line in ninja:
+                if not found_frame and frame_flag in line:
+                    found_frame = True
+                if not found_asm and patched_asm in line:
+                    found_asm = True
+                if found_frame and found_asm:
+                    break
+    except OSError as error:
+        print(f"Could not read {ninja_path}: {error}")
+        return False
+    if not found_frame:
+        print(f"{frame_flag} is not in {ninja_path}")
+        return False
+    if not found_asm:
+        print(f"{patched_asm} is not a build input in {ninja_path}")
+        return False
+    print("ppc64le patches are present")
+    return True
+
+
 def main():
     args = parse_args()
 
@@ -243,6 +317,16 @@ def main():
                 shutil.copy2(ninja_log_seed, f"{build_dir}/.ninja_log")
                 print(f"Pre-seeded .ninja_log from {ninja_log_seed}")
             Shell.check("ninja --version", verbose=True)
+
+    if res and build_type == BuildTypes.PPC64LE and JobStages.BUILD in stages:
+        results.append(
+            Result.from_commands_run(
+                name="ppc64le patch check",
+                command=check_ppc64le_patches,
+                command_kwargs={"build_root": build_dir},
+            )
+        )
+        res = results[-1].is_ok()
 
     # Activate FIPS-permissive config for OpenSSL
     os.environ["OPENSSL_CONF"] = "/etc/ssl/openssl.cnf"
