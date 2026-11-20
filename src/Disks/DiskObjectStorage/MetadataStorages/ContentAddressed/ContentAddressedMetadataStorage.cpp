@@ -81,6 +81,7 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 mount_lease_ttl_ms;
     extern const ContentAddressedSettingsUInt64 mount_renew_period_ms;
     extern const ContentAddressedSettingsBool unsafe_remount_no_delay;
+    extern const ContentAddressedSettingsBool allow_versioning_suspended;
     extern const ContentAddressedSettingsUInt64 part_folder_cache_bytes;
     extern const ContentAddressedSettingsUInt64 part_folder_cache_max_entries;
     extern const ContentAddressedSettingsUInt64 part_folder_cache_max_entry_bytes;
@@ -307,6 +308,7 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , mount_lease_ttl(std::chrono::milliseconds(settings_[ContentAddressedSetting::mount_lease_ttl_ms].value))
     , mount_renew_period(std::chrono::milliseconds(settings_[ContentAddressedSetting::mount_renew_period_ms].value))
     , cas_unsafe_remount_no_delay(settings_[ContentAddressedSetting::unsafe_remount_no_delay].value)
+    , cas_allow_versioning_suspended(settings_[ContentAddressedSetting::allow_versioning_suspended].value)
     , cas_part_folder_cache_bytes(settings_[ContentAddressedSetting::part_folder_cache_bytes].value)
     , cas_part_folder_cache_max_entries(settings_[ContentAddressedSetting::part_folder_cache_max_entries].value)
     , cas_part_folder_cache_max_entry_bytes(settings_[ContentAddressedSetting::part_folder_cache_max_entry_bytes].value)
@@ -827,7 +829,8 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
         object_storage, mode,
         /*single_attempt_control_plane_=*/!read_only && mode == Cas::ObjectStorageBackend::Mode::Native,
         pool_config.cas_request_budget.attempt_timeout_ms,
-        pool_config.cas_request_budget.connect_timeout_cap_ms.value_or(0));
+        pool_config.cas_request_budget.connect_timeout_cap_ms.value_or(0),
+        cas_allow_versioning_suspended);
 
     /// A programmer error, not an input one: the handoff above is code, not configuration. The pool's
     /// lease arithmetic was validated against `pool_config.cas_request_budget` alone (never against the

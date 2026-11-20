@@ -548,6 +548,25 @@ public:
     /// Unpinned by default, so an ordinary storage's settings and reload behaviour are unchanged.
     virtual void pinConditionalOpsGenerationDialect(bool /*expect_generation_tokens*/) {}
 
+    /// Bucket object-versioning state reported by object storage backends that expose it.
+    enum class BucketVersioningStatus : uint8_t
+    {
+        Unknown,
+        Disabled,
+        Suspended,
+        Enabled,
+    };
+
+    /// Returns the bucket's object-versioning state when the backend can inspect it.
+    /// Defaults to mapping `isBucketVersioningEnabled(request)` for test stubs that only override it.
+    virtual BucketVersioningStatus getBucketVersioningStatus(const ObjectStorageControlRequest & request) const
+    {
+        const auto enabled = isBucketVersioningEnabled(request);
+        if (!enabled.has_value())
+            return BucketVersioningStatus::Unknown;
+        return *enabled ? BucketVersioningStatus::Enabled : BucketVersioningStatus::Disabled;
+    }
+
     /// Whether the underlying bucket has object versioning enabled; nullopt when unknown or not
     /// applicable. Used by the CAS capability probe on GCS: a bucket verified as versioned refuses
     /// the mount (a token-exact DELETE there archives a noncurrent generation instead of reclaiming

@@ -128,31 +128,74 @@ void recordConditionalWriteOutcome(CasWriteOutcome outcome)
 
 ObjectStorageBackend::ObjectStorageBackend(ObjectStoragePtr object_storage_, Mode mode_,
                                            bool single_attempt_control_plane_, uint64_t attempt_timeout_ms_,
-                                           uint64_t connect_timeout_cap_ms_)
+                                           uint64_t connect_timeout_cap_ms_,
+                                           bool allow_versioning_suspended_)
     : object_storage(std::move(object_storage_))
     , mode(mode_)
     , single_attempt_control_plane(single_attempt_control_plane_)
     , attempt_timeout_ms(attempt_timeout_ms_)
     , connect_timeout_cap_ms(connect_timeout_cap_ms_)
+    , allow_versioning_suspended(allow_versioning_suspended_)
     , emu_root(object_storage->getCommonKeyPrefix())
 {
     if (mode == Mode::Native && object_storage->conditionalOpsUseGenerationTokens())
         native_token_type = Dialect::Generation;
 }
 
-/// See Backend::checkPoolPreconditions. Only the Native, generation-dialect (GCS) combination has
-/// anything to check: a token-exact DELETE on a versioned bucket archives a noncurrent generation
-/// instead of reclaiming storage, so GC "reclaim" would silently stop reclaiming. A bucket VERIFIED
-/// to have versioning enabled refuses the mount. A probe that cannot answer does not: it is not
-/// evidence of a versioned bucket, its usual cause is a credential without permission to read the
-/// bucket configuration, and refusing on it would turn a missing IAM grant into a hard outage. The
-/// mount proceeds with a warning that names what was not verified and how the operator can verify it.
-/// The probe uses this backend's control-plane profile, because the default client would retry a failed
-/// attempt with SDK backoff, outside the mount's attempt budget.
+bool ObjectStorageBackend::verifySuspendedVersioningAllowed() const
+{
+    if (!allow_versioning_suspended || mode != Mode::Native || native_token_type == Dialect::Generation)
+        return false;
+
+    if (suspended_delete_markers_checked.load(std::memory_order_acquire))
+        return suspended_delete_markers_allowed.load(std::memory_order_acquire);
+
+    const auto status = object_storage->getBucketVersioningStatus(controlRequest(/*attempt_no=*/0));
+    if (status == IObjectStorage::BucketVersioningStatus::Enabled)
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "CAS on S3: the bucket has object VERSIONING Enabled. `cas_allow_versioning_suspended=true` "
+            "only permits Suspended (or unversioned) buckets; an Enabled bucket archives noncurrent "
+            "versions on every overwrite and delete forever. Suspend or disable versioning and expire "
+            "noncurrent versions before mounting.");
+    }
+
+    if (status == IObjectStorage::BucketVersioningStatus::Suspended)
+    {
+        LOG_WARNING(getLogger("CasObjectStorageBackend"),
+            "CAS on S3: bucket versioning is Suspended and `cas_allow_versioning_suspended=true`; "
+            "allowing null-version delete markers on conditional deletes. Configure an S3 lifecycle rule "
+            "with `ExpiredObjectDeleteMarker: true` (and expire any prior noncurrent versions) so delete "
+            "markers do not accumulate.");
+    }
+    else if (status == IObjectStorage::BucketVersioningStatus::Unknown)
+    {
+        LOG_WARNING(getLogger("CasObjectStorageBackend"),
+            "CAS on S3: could not verify bucket versioning status (GetBucketVersioning failed or "
+            "unsupported); allowing delete markers because `cas_allow_versioning_suspended=true`. Confirm "
+            "by hand that versioning is Suspended (never Enabled) and configure an "
+            "`ExpiredObjectDeleteMarker: true` lifecycle rule.");
+    }
+
+    suspended_delete_markers_allowed.store(true, std::memory_order_release);
+    suspended_delete_markers_checked.store(true, std::memory_order_release);
+    return true;
+}
+
+/// See Backend::checkPoolPreconditions.
+/// - Native + Generation (GCS): refuses Enabled/Suspended buckets; tolerates Unknown with warning.
+/// - Native + ETag (S3): when `allow_versioning_suspended` is true, verifies the bucket is not
+///   `Enabled` and arms delete-marker acceptance for `Suspended` buckets before the probe runs.
 void ObjectStorageBackend::checkPoolPreconditions()
 {
-    if (mode != Mode::Native || native_token_type != Dialect::Generation)
+    if (mode != Mode::Native)
         return;
+
+    if (native_token_type != Dialect::Generation)
+    {
+        (void)verifySuspendedVersioningAllowed();
+        return;
+    }
 
     const auto versioned = object_storage->isBucketVersioningEnabled(controlRequest(/*attempt_no=*/0));
     if (!versioned.has_value())
@@ -997,9 +1040,12 @@ Backend::RawRemoval ObjectStorageBackend::removeUnder(
         switch (result.outcome)
         {
             case ConditionalRemoveOutcome::Removed:
-                /// A delete marker means the storage archived a noncurrent version instead of
-                /// reclaiming the current object -- a removal that did not reclaim.
-                return result.created_delete_marker ? RawRemoval::DeleteMarker : RawRemoval::Removed;
+                /// A delete marker means the storage archived a noncurrent version (or minted a
+                /// null-version delete marker on a Suspended S3 bucket). Only permit it when
+                /// `cas_allow_versioning_suspended=true` and `Enabled` versioning has been ruled out.
+                if (result.created_delete_marker)
+                    return verifySuspendedVersioningAllowed() ? RawRemoval::Removed : RawRemoval::DeleteMarker;
+                return RawRemoval::Removed;
             case ConditionalRemoveOutcome::TokenMismatch:
                 return RawRemoval::Mismatch;
             case ConditionalRemoveOutcome::NotFound:
