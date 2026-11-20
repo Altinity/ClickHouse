@@ -1531,13 +1531,19 @@ TEST(CASGcIntents, PreviewNamesEachRowState)
     ASSERT_TRUE(pool.row(2) && pool.row(2)->delete_pending && !pool.row(2)->standing);
     ASSERT_TRUE(pool.row(3) && !pool.row(3)->delete_pending);
 
-    std::map<String, String> reasons;
+    std::map<String, Gc::PreviewEntry> entries;
     for (const Gc::PreviewEntry & e : pool.gc->previewDeletes().deletes)
         if (e.reason != "unreachable")
-            reasons[e.key] = e.reason;
-    EXPECT_EQ(reasons[pool.bodyKey(1)], "standing");
-    EXPECT_EQ(reasons[pool.bodyKey(2)], "pending");
-    EXPECT_EQ(reasons[pool.bodyKey(3)], "candidate");
+            entries[e.key] = e;
+    /// The body of a standing row is gone; the next round removes its intent.
+    const String standing_intent = pool.intentKey(1, pool.row(1)->token);
+    ASSERT_TRUE(pool.exists(standing_intent)) << "positive control: the object the preview names is there";
+    EXPECT_FALSE(entries.contains(pool.bodyKey(1)));
+    ASSERT_TRUE(entries.contains(standing_intent));
+    EXPECT_EQ(entries[standing_intent].reason, "standing");
+    EXPECT_EQ(entries[standing_intent].size, blobIntentRecord().size());
+    EXPECT_EQ(entries[pool.bodyKey(2)].reason, "pending");
+    EXPECT_EQ(entries[pool.bodyKey(3)].reason, "candidate");
 }
 
 /// ---- Leader changes and failure schedules ----

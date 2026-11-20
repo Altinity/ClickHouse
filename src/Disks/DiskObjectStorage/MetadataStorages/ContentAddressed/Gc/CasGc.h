@@ -482,7 +482,7 @@ public:
     {
         ObjectKind kind = ObjectKind::Blob;
         BlobRef ref{};
-        String key;
+        String key;             /// the body's key; for "standing", whose body is gone, the key of its deletion intent
         uint64_t size = 0;
         String reason;          /// "unreachable" | "standing" | "pending" | "candidate"
         PersistedEtag token;   /// stored condemn-time incarnation (empty for "unreachable")

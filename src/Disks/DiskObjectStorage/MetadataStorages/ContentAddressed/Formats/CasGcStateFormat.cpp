@@ -10,6 +10,7 @@ namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
     extern const int LOGICAL_ERROR;
+    extern const int UNKNOWN_FORMAT_VERSION;
 }
 }
 
@@ -58,6 +59,13 @@ String encodeGcState(const GcState & state)
     closeObject(out, first);
     writeChar('\n', out);
     return std::move(out).take();
+}
+
+void requireGenerationFourGcState(const GcState & state)
+{
+    if (state.header_generation < G_BLOB_INTENTS)
+        throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION, "gc/state is at generation {} in a generation 4 pool",
+            state.header_generation);
 }
 
 GcState decodeGcState(std::string_view data)

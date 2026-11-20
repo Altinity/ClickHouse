@@ -106,6 +106,7 @@ struct MarkerScan
     std::set<BlobRef> not_clean;
     uint64_t markers = 0;
     uint64_t bodies = 0;
+    uint64_t converted = 0;
     uint64_t elapsed_ms = 0;
 };
 
@@ -120,7 +121,7 @@ struct MarkerScan
 }
 
 /// Whether a legacy marker says `Clean`. Only bytes that do not decode count as not `Clean`, since they may hide a
-/// condemnation; a marker that needs a newer reader, or a failed read, stops the run before any intent.
+/// condemnation; a marker that needs a newer reader, or a failed read, stops the run before the intents of its page.
 bool markerIsClean(const String & key, const String & bytes)
 {
     try
@@ -131,7 +132,7 @@ bool markerIsClean(const String & key, const String & bytes)
     {
         if (e.code() == ErrorCodes::CORRUPTED_DATA)
             return false;
-        e.addMessage("reading the legacy marker `{}` at M4; the run stops before it creates an intent", key);
+        e.addMessage("reading the legacy marker `{}` at M4; the run stops before the intents of its page", key);
         throw;
     }
 }
@@ -209,10 +210,14 @@ public:
             const std::vector<InheritedRow> rows = readCondemnedRows(state, meta);
             stepDone(3);
 
-            const MarkerScan markers = readMarkers();
+            std::atomic<uint64_t> confirmed{0};
+            std::optional<BodyConversion> conversion;
+            if (all_bodies)
+                conversion.emplace(BodyConversion{rows, confirmed});
+            const MarkerScan markers = readMarkers(conversion);
             stepDone(4);
 
-            createIntents(rows, markers, all_bodies);
+            createIntents(rows, markers, confirmed);
             stepDone(5);
 
             std::optional<Etag> state_token = stored_state ? std::optional<Etag>(stored_state->etag) : std::nullopt;
@@ -728,12 +733,27 @@ private:
         return token;
     }
 
-    /// M4: every listed marker read by its exact key, a page at a time, `concurrency` reads in flight.
-    MarkerScan readMarkers()
+    /// What M4 needs to create the intent of each listed body: M5 converts the bodies the rows name.
+    struct BodyConversion
+    {
+        const std::vector<InheritedRow> & rows;
+        std::atomic<uint64_t> & confirmed;
+    };
+
+    /// M4: every listed marker read by its exact key, a page at a time, `concurrency` reads in flight. With
+    /// `conversion`, each listed body that no marker of its page and no row condemns gets its intent before the next
+    /// page: a second listing may omit a body this one saw.
+    MarkerScan readMarkers(const std::optional<BodyConversion> & conversion = std::nullopt)
     {
         MarkerScan scan;
         Meter meter(*this, "M4", "marker(s) read", 0);
+        Meter converted(*this, "M4", "blob(s) converted", 0);
+        std::set<BlobRef> row_refs;
+        if (conversion)
+            for (const InheritedRow & row : conversion->rows)
+                row_refs.insert(row.ref);
         std::vector<std::pair<String, BlobRef>> batch;
+        std::vector<BlobRef> bodies;
         const auto flush = [&]
         {
             std::vector<std::optional<bool>> clean(batch.size());
@@ -752,28 +772,42 @@ private:
                     scan.not_clean.insert(batch[i].second);
             }
             meter.add(batch.size());
+            if (conversion)
+            {
+                std::erase_if(bodies, [&](const BlobRef & ref) { return row_refs.contains(ref) || scan.not_clean.contains(ref); });
+                convert(bodies, conversion->confirmed, converted);
+            }
             batch.clear();
+            bodies.clear();
         };
+        /// A marker key extends its body's key, so it is listed right after the body: a page flushed after a marker or
+        /// before a body holds each body with its marker.
         op.forEachListedKey(layout.blobsPrefix(), [&](const ListedKey & listed)
         {
             if (Layout::hasLegacyMarkerSuffix(listed.key))
             {
                 if (const auto ref = layout.parseLegacyMarkerKey(listed.key))
                     batch.emplace_back(listed.key, *ref);
-                if (batch.size() >= kBatchKeys)
+                if (batch.size() + bodies.size() >= kBatchKeys)
                     flush();
             }
-            else if (layout.parseBlobKey(listed.key))
+            else if (const auto ref = layout.parseBlobKey(listed.key))
             {
+                if (batch.size() + bodies.size() >= kBatchKeys)
+                    flush();
                 ++scan.bodies;
+                if (conversion)
+                    bodies.push_back(*ref);
             }
             return true;
         }, Retry::standard());
         flush();
+        scan.converted = converted.count();
         scan.elapsed_ms = meter.elapsedMs();
         report.markers_read = scan.markers;
         report.bodies_listed = scan.bodies;
-        say(fmt::format("M4: {} marker(s), {} not Clean; {} bod(ies) listed", scan.markers, scan.not_clean.size(), scan.bodies));
+        say(fmt::format("M4: {} marker(s), {} not Clean; {} bod(ies) listed{}", scan.markers, scan.not_clean.size(), scan.bodies,
+            conversion ? fmt::format(", {} of them converted", scan.converted) : String()));
         return scan;
     }
 
@@ -789,7 +823,7 @@ private:
         }
         catch (Exception & e)
         {
-            e.addMessage("M5: an intent create failed; nothing was written after the intents, and a rerun passes only once the "
+            e.addMessage("an intent create failed; nothing was written after the intents, and a rerun passes only once the "
                 "store accepts the create");
             throw;
         }
@@ -823,45 +857,26 @@ private:
         }
     }
 
-    /// M5: an intent for the current token of every blob a marker or a row condemns, and with `all_bodies` of every
-    /// listed body; and for the own token of every pending row whose body is absent or another incarnation. Every
-    /// create is confirmed before the step returns, and the first one that is not stops the run.
-    void createIntents(const std::vector<InheritedRow> & rows, const MarkerScan & markers, bool all_bodies)
+    /// M5: an intent for the current token of every blob a marker or a row condemns, and for the own token of every
+    /// pending row whose body is absent or another incarnation. Every create is confirmed before the step returns, and
+    /// the first one that is not stops the run.
+    void createIntents(const std::vector<InheritedRow> & rows, const MarkerScan & markers, std::atomic<uint64_t> & confirmed)
     {
         std::set<BlobRef> targets = markers.not_clean;
         for (const InheritedRow & row : rows)
             targets.insert(row.ref);
         const std::vector<BlobRef> condemned(targets.begin(), targets.end());
-        /// The condemned bodies are mostly among the listed ones; the larger count is the estimate.
-        const uint64_t expected = all_bodies ? std::max<uint64_t>(markers.bodies, condemned.size()) : condemned.size();
+        const uint64_t expected = condemned.size();
+        /// M4 sent one read per marker and a `HEAD` and a create per converted body.
+        const uint64_t m4_requests = markers.markers + 2 * markers.converted;
         String estimate;
-        if (markers.elapsed_ms > 0 && markers.markers > 0)
-            estimate = fmt::format("; at the M4 rate about {} s", 2 * expected * markers.elapsed_ms / markers.markers / 1000);
+        if (markers.elapsed_ms > 0 && m4_requests > 0)
+            estimate = fmt::format("; at the M4 rate about {} s", 2 * expected * markers.elapsed_ms / m4_requests / 1000);
         say(fmt::format("M5: about {} blob(s), one HEAD and one create each, {} in flight{}", expected, concurrency, estimate));
 
-        std::atomic<uint64_t> confirmed{0};
         Meter meter(*this, "M5", "blob(s) converted", expected);
         std::vector<std::optional<CanonicalIdentity>> current(condemned.size());
         convert(condemned, confirmed, meter, &current);
-
-        if (all_bodies)
-        {
-            /// Listed again rather than kept from M4, so the tool holds one page of the pool, not all of it.
-            std::vector<BlobRef> page;
-            op.forEachListedKey(layout.blobsPrefix(), [&](const ListedKey & listed)
-            {
-                if (!Layout::hasLegacyMarkerSuffix(listed.key))
-                    if (const auto ref = layout.parseBlobKey(listed.key); ref && !targets.contains(*ref))
-                        page.push_back(*ref);
-                if (page.size() >= kBatchKeys)
-                {
-                    convert(page, confirmed, meter);
-                    page.clear();
-                }
-                return true;
-            }, Retry::standard());
-            convert(page, confirmed, meter);
-        }
 
         /// `runBounded` queues every job it is given, so these creates go in batches, as in `convert`.
         std::vector<std::pair<BlobRef, CanonicalIdentity>> own;
@@ -889,7 +904,7 @@ private:
 
         report.intents_confirmed = confirmed.load();
         say(fmt::format("M5: {} intent(s) confirmed for {} blob(s); until M6 an older build can still open and use this pool",
-            report.intents_confirmed, meter.count()));
+            report.intents_confirmed, markers.converted + meter.count()));
     }
 
     /// Right before the floor (M7) and right after it: every slot and both GC pairs as M2 left them, `gc/state` as M6

@@ -35,6 +35,7 @@ namespace ErrorCodes
     extern const int CORRUPTED_DATA;
     extern const int LOGICAL_ERROR;
     extern const int TIMEOUT_EXCEEDED;
+    extern const int UNKNOWN_FORMAT_VERSION;
 }
 }
 
@@ -615,6 +616,8 @@ struct GcSnapshotAttempt
     std::optional<std::pair<uint64_t, uint64_t>> seal_absent;
     /// The refused seal or run and the reason.
     std::vector<std::pair<String, String>> refusals;
+    /// Why every GC round refuses `gc/state` itself; then nothing else was read.
+    std::optional<String> refused_state;
 };
 
 GcSnapshotAttempt readGcSnapshotOnce(CasOperation & op, const Layout & layout, const std::unordered_set<BlobRef, BlobRefHash> & wanted,
@@ -628,6 +631,18 @@ GcSnapshotAttempt readGcSnapshotOnce(CasOperation & op, const Layout & layout, c
     attempt.state_token = state_got->etag;
     view.have_state = true;
     const GcState gc_state = decodeGcState(state_got->bytes);
+    try
+    {
+        requireGenerationFourGcState(gc_state);
+    }
+    catch (const Exception & e)
+    {
+        if (e.code() != ErrorCodes::UNKNOWN_FORMAT_VERSION)
+            throw;
+        attempt.refused_state = e.message();
+        view.unread_all = true;
+        return attempt;
+    }
     view.gc_shards = gc_state.gc_shards;
     /// The adopted fold seal names the snapshot runs; resolution is by ref, never by key
     /// construction. Every row whose hash is in our candidate set marks "known to GC" —
@@ -719,6 +734,12 @@ GcSnapshotView readGcSnapshot(CasOperation & op, const Layout & layout, const st
     for (size_t attempt_no = 1;; ++attempt_no)
     {
         GcSnapshotAttempt attempt = readGcSnapshotOnce(op, layout, wanted, detail, on_progress, deadline);
+        if (attempt.refused_state)
+        {
+            countIntentUnread(report, fmt::format("{}: every GC round refuses it, so the GC snapshot and its pending rows "
+                "were not read", *attempt.refused_state));
+            return std::move(attempt.view);
+        }
         bool moved = false;
         if (attempt.seal_absent)
         {
@@ -815,6 +836,9 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
 {
     if (fix_legacy_markers && !namespace_prefix.empty())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "fsck: a fix needs a scan of the whole pool, not of namespaces under '{}'", namespace_prefix);
+    if (verify_intents && !namespace_prefix.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "fsck: verifying intents needs a scan of the whole pool, not of namespaces under '{}'", namespace_prefix);
     const Layout & layout = store.layout();
     CasOperation op = store.openRequests().admit();
     /// Path-derived per-object algorithm parsing: every listed blob-tree key -- across every

@@ -1827,6 +1827,35 @@ TEST(CASTransactionStagedCopies, ARewrittenCommittedProjectionReKeyedAwayLeavesI
     EXPECT_TRUE(committedEntry(*storage, ns, "all_96_96_0", "p.proj/data.bin"));
 }
 
+/// The rename of a staged projection reads the committed base manifest once, whatever the number of its files.
+TEST(CASTransactionStagedCopies, AProjectionRenameReadsTheBaseManifestOnce)
+{
+    JournaledTxStorage env("ca_tx_projection_rename_reads", /*manifest_decode_cache_bytes=*/0);
+    auto & storage = *env.storage;
+    const std::string table = kLivenessTable + "/";
+    const std::string part = table + "all_96_96_0/";
+    const DB::Cas::RootNamespace ns = storage.liveNamespace(kLivenessUuid);
+    const std::vector<std::string> names{"a.bin", "b.bin", "c.bin"};
+    commitPartTx(storage, table, "all_96_96_0",
+        {{"data.bin", "committed bytes"}, {"p_1.tmp_proj/a.bin", "a"}, {"p_1.tmp_proj/b.bin", "b"}, {"p_1.tmp_proj/c.bin", "c"}});
+    const std::string manifest_key = storage.store()->layout().manifestKey(
+        storage.partAccess()->getView({ns, "all_96_96_0"}, DB::Cas::Freshness::ForceFresh)->manifestId());
+
+    auto tx = storage.createTransaction();
+    for (const auto & name : names)
+        writeFileTx(*tx, part + "p_1.tmp_proj/" + name, "rewritten " + name);
+    env.object_storage->clear();
+    tx->moveDirectory(part + "p_1.tmp_proj", part + "p.proj");
+    EXPECT_EQ(env.object_storage->count(WriteJournalObjectStorage::Verb::Read, manifest_key).first, 1u);
+    ASSERT_NO_THROW(tx->commit(DB::NoCommitOptions{}));
+
+    for (const auto & name : names)
+    {
+        EXPECT_FALSE(committedEntry(storage, ns, "all_96_96_0", "p_1.tmp_proj/" + name)) << "positive control: " << name;
+        EXPECT_TRUE(committedEntry(storage, ns, "all_96_96_0", "p.proj/" + name)) << name;
+    }
+}
+
 /// Every file staged into a committed part moves to new parts: those parts publish, and the committed part keeps its
 /// manifest.
 TEST(CASTransactionStagedCopies, ACommittedPartEmptiedOfItsStagedWritesKeepsItsManifest)

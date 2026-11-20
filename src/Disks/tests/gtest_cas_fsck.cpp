@@ -1456,6 +1456,35 @@ TEST(CASFsck, GcNeverRanClassifiesAwaitingGc)
     EXPECT_EQ(rep.unaccounted, 0u);
 }
 
+/// A `gc/state` below header 4 in a generation 4 pool comes from an older GC; every round of this build refuses it, so
+/// the scan cannot read the GC snapshot through it.
+TEST(CASFsck, GcStateBelowGeneration4IsUnread)
+{
+    for (const uint32_t header : {G_REF_CHAIN, G_BLOB_INTENTS})
+    {
+        SCOPED_TRACE(header);
+        auto backend = std::make_shared<InMemoryBackend>();
+        auto store = openPoolForTest(backend);
+        writeBlobBody(*backend, store->layout(), DB::UInt128(5));
+        GcState state;
+        state.header_generation = header;
+        state.gc_shards = store->poolConfig().gc_shards;
+        OperationForTest op(*backend);
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(store->layout().gcStateKey(), encodeGcState(state), Retry::standard())));
+
+        const FsckReport rep = runFsck(*store, /*detail*/true);
+        if (header == G_BLOB_INTENTS)
+        {
+            EXPECT_TRUE(rep.clean()) << "positive control: the same state at header 4 is read";
+            EXPECT_EQ(rep.intent_unread, 0u);
+            continue;
+        }
+        EXPECT_FALSE(rep.clean());
+        EXPECT_EQ(rep.intent_unread, 1u);
+        EXPECT_NE(rep.intent_unread_reason.find("gc/state is at generation 3"), String::npos) << rep.intent_unread_reason;
+    }
+}
+
 /// A blob outside the WHOLE GC view on a pool where GC runs: Unaccounted — expected only as a
 /// transient (fast create+drop between rounds); persistent occurrences violate INV-2.
 TEST(CASFsck, ForeignBlobClassifiesUnaccounted)
@@ -2158,6 +2187,22 @@ TEST(CASFsck, FixNeedsAWholePoolScan)
         (void)runFsck(*f.store, false, {}, {}, false, "00", /*fix_legacy_markers=*/ true);
     });
     EXPECT_TRUE(objectPresent(*f.backend, f.markerKey(1)));
+}
+
+/// A scoped scan lists no intents, so verifying them over it would verify nothing: it is refused.
+TEST(CASFsck, VerifyIntentsNeedsAWholePoolScan)
+{
+    FsckIntentFixture f;
+    f.body(1);
+    f.currentIntent(1);
+    expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
+    {
+        (void)runFsck(*f.store, false, {}, {}, false, "00", /*fix_legacy_markers=*/ false, /*verify_intents=*/ true);
+    });
+    EXPECT_NO_THROW((void)runFsck(*f.store, false, {}, {}, false, "00", /*fix_legacy_markers=*/ false, /*verify_intents=*/ false))
+        << "positive control: the scoped scan alone runs";
+    EXPECT_TRUE(runFsck(*f.store, false, {}, {}, false, "", false, /*verify_intents=*/ true).intents_verified)
+        << "positive control: the whole-pool scan verifies";
 }
 
 /// Intents are objects of the pool: each listed key lands in exactly one intent class, and its bytes are in

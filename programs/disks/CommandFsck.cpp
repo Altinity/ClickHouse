@@ -47,7 +47,7 @@ public:
                                                 "which adds no load burst beside live servers)")(
             "verify-intents", "also read every deletion intent and `HEAD` its body (two requests per intent): finds intents "
                               "with other bytes than the record, and counts intents over a current, replaced or absent body; "
-                              "without it intents are classified from the listing only");
+                              "without it intents are classified from the listing only; whole-pool scans only");
     }
 
     void executeImpl(const CommandLineOptions & options, DisksClient & client) override
@@ -70,6 +70,8 @@ public:
                 throw Exception(ErrorCodes::BAD_ARGUMENTS, "cas-fsck: --fix legacy-markers needs a scan of the whole pool, not --namespace");
             fix_legacy_markers = true;
         }
+        if (verify_intents && !namespace_prefix.empty())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "cas-fsck: --verify-intents needs a scan of the whole pool, not --namespace");
         auto disk = client.getCurrentDiskWithPath().getDisk();
         auto * ca = &contentAddressedStorageOf(*disk, "cas-fsck");
 

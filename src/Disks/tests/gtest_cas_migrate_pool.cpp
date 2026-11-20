@@ -209,11 +209,26 @@ public:
         hidden_from_listing.insert(key);
     }
 
+    /// The first listing that reaches `key` returns it; every later one leaves it out.
+    void hideFromListingAfterItsFirst(const String & key)
+    {
+        std::lock_guard lock(mutex);
+        listed_once[key] = false;
+    }
+
     RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
     {
         RawListPage page = CountingBackend::list(prefix, cursor, limit, access);
         std::lock_guard lock(mutex);
-        std::erase_if(page.keys, [&](const RawListedKey & listed) { return hidden_from_listing.contains(listed.key); });
+        std::erase_if(page.keys, [&](const RawListedKey & listed)
+        {
+            if (hidden_from_listing.contains(listed.key))
+                return true;
+            const auto once = listed_once.find(listed.key);
+            if (once == listed_once.end())
+                return false;
+            return std::exchange(once->second, true);
+        });
         return page;
     }
 
@@ -236,6 +251,8 @@ private:
     std::set<String> refused_deletes;
     std::set<String> quoted_write_keys;
     std::set<String> hidden_from_listing;
+    /// Whether the first listing of the key has been served.
+    std::map<String, bool> listed_once;
     String after_write_key;
     std::function<void()> after_write;
     String before_head_key;
@@ -967,7 +984,7 @@ TEST(CASMigratePool, KeepMarkersStopsAtTheFloorAndARerunRemovesThem)
     EXPECT_TRUE(f.markers().empty());
 }
 
-/// Long steps report on the tool's clock, a page at a time, with an estimate of the time left.
+/// Long steps report on the tool's clock, a page at a time; M5 starts with an estimate from the rate of M4.
 TEST(CASMigratePool, LongStepsReportProgressWithAnEstimate)
 {
     constexpr uint64_t bodies = 2 * CasOperation::kCasListPageKeys + 10;
@@ -982,9 +999,9 @@ TEST(CASMigratePool, LongStepsReportProgressWithAnEstimate)
     EXPECT_TRUE(contains(lines, "at the M4 rate about"));
     EXPECT_TRUE(std::any_of(lines.begin(), lines.end(), [&](const String & line)
     {
-        return line.starts_with("M5: ") && line.find("blob(s) converted of about " + std::to_string(bodies) + ", about") != String::npos
-            && line.find(" s left") != String::npos;
+        return line.starts_with("M4: ") && line.find("blob(s) converted") != String::npos;
     }));
+    EXPECT_TRUE(contains(lines, "bod(ies) listed, " + std::to_string(bodies) + " of them converted"));
 }
 
 /// A member whose slot moves right after the floor is raised: the pool is migrated and cannot go back, so the run
@@ -1621,6 +1638,23 @@ TEST(CASMigratePool, EveryListedBodyGetsAnIntentUnlessCleanMarkersAreTrusted)
     options.trust_clean_markers = true;
     ASSERT_TRUE(trusted.run(options).completed);
     EXPECT_EQ(trusted.intents(), (std::set<String>{trusted.layout.blobIntentKey(blobRefOf(3), trusted.identity(3))}));
+}
+
+/// A listing may omit a key, so a body M4 listed gets its intent even when a later listing of `blobs/` leaves it out.
+TEST(CASMigratePool, BodyThatALaterListingOmitsStillGetsItsIntent)
+{
+    Fixture f(3);
+    f.body(1);
+    f.cleanMarker(1);
+    f.body(2);
+    f.cleanMarker(2);
+    f.backend->hideFromListingAfterItsFirst(f.layout.blobKey(blobRefOf(1)));
+
+    const MigratePoolReport report = f.run();
+    ASSERT_TRUE(report.completed);
+    EXPECT_EQ(report.bodies_listed, 2u) << "positive control: M4 listed the body";
+    EXPECT_TRUE(f.hasIntent(1, f.identity(1)));
+    EXPECT_TRUE(f.hasIntent(2, f.identity(2))) << "positive control: the body every listing returns";
 }
 
 TEST(CASMigratePool, MarkersAcrossListPagesAreAllRead)

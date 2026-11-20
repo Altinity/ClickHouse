@@ -269,14 +269,15 @@ void ContentAddressedTransaction::clearEntries(PartStaging & st)
 }
 
 void ContentAddressedTransaction::markVacatedInBase(
-    const ContentAddressedMetadataStorage::Route & r, PartStaging & st, const std::string & file)
+    const ContentAddressedMetadataStorage::Route & r, PartStaging & st, const std::vector<std::string> & files)
 {
-    if (!st.base_manifest_ref)
+    if (!st.base_manifest_ref || files.empty())
         return;
     /// The base manifest is immutable, so it answers exactly whatever another writer did to the part since.
     const auto base = metadata_storage.store()->readManifestShared(Cas::ManifestId{r.ns, *st.base_manifest_ref});
-    if (Cas::findEntry(base->entries, file))
-        st.content_removed.insert(file);
+    for (const auto & file : files)
+        if (Cas::findEntry(base->entries, file))
+            st.content_removed.insert(file);
 }
 
 std::shared_ptr<Cas::CopySource> ContentAddressedTransaction::copySourceOf(const PartStaging & st, const std::string & path)
@@ -1532,12 +1533,14 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
                 throw Exception(ErrorCodes::LOGICAL_ERROR,
                     "ContentAddressed: moveDirectory {} -> {}: the destination projection directory is already staged",
                     path_from, path_to);
+            std::vector<std::string> vacated;
+            for (const auto & entry : st->entries)
+                if (entry.path.starts_with(old_prefix))
+                    vacated.push_back(entry.path);
+            markVacatedInBase(*src, *st, vacated);
             for (auto & entry : st->entries)
                 if (entry.path.starts_with(old_prefix))
-                {
-                    markVacatedInBase(*src, *st, entry.path);
                     rekeyEntry(*st, entry, new_prefix + entry.path.substr(old_prefix.size()));
-                }
             return;
         }
     }
@@ -1777,7 +1780,7 @@ void ContentAddressedTransaction::moveFile(const std::string & path_from, const 
     {
         auto entry = *it;
         auto source = copySourceOf(src_st, src->file);
-        markVacatedInBase(*src, src_st, src->file);
+        markVacatedInBase(*src, src_st, {src->file});
         eraseEntry(src_st, src->file);
         entry.path = dst->file;
         if (&src_st != &dst_st && entry.placement == Cas::EntryPlacement::Blob)
@@ -1863,7 +1866,7 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool if_e
         /// publish upload by the staged-tree-hash check in publishStaging. We do NOT purge it
         /// eagerly because the same hash may still be referenced by another staged entry.
         if (staged_here)
-            markVacatedInBase(*r, st, r->file);
+            markVacatedInBase(*r, st, {r->file});
         eraseEntry(st, r->file);
         if (!staged_here)
         {

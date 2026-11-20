@@ -301,8 +301,8 @@ probe. The tool runs this probe, and checks the token form with a `HEAD` of `_po
 |---|---|
 | M1 | Reads `_pool_meta`, runs the capability probe (not with `skip_access_check`), checks the token form, and proves the rights under `blob-intents/`. A pool already at generation 4 goes to M9 |
 | M2 | Reads every mount slot and both GC leases. A slot that is not terminal is watched for the longer of its declared lease and the disk's `cas_mount_lease_ttl_ms`, plus 5 %, plus one poll step of 1 s, then fenced as GC fences a dead mount. Then the grace interval, then everything is read again |
-| M3, M4 | Reads the condemned rows of `gc/state` and every `.meta` marker. Without `gc/state`, M3 first lists one key of `gc/gen/` and sends a `HEAD` for `gc/hb` and `gc/maintenance_state`: any of them means GC ran and the state was lost, and the run stops. A `gc/state` at generation 0 names no fold seal: then M3 lists one key of `gc/gen/`, and any key stops the run. M3 also stops on a `gc/state` whose `gc_shards` differs from `_pool_meta`, and on a fold seal or a source-edge run that GC of this build refuses. M4 lists `blobs/` a page at a time and reads the markers of a page concurrently |
-| M5 | Creates an intent for the current token of every body (with `--trust-clean-markers`, of every body a marker or a row condemns), and for the own token of every pending row. The creates run concurrently. Each create must be confirmed; the first that is not stops the run before M6 |
+| M3, M4 | Reads the condemned rows of `gc/state` and every `.meta` marker. Without `gc/state`, M3 first lists one key of `gc/gen/` and sends a `HEAD` for `gc/hb` and `gc/maintenance_state`: any of them means GC ran and the state was lost, and the run stops. A `gc/state` at generation 0 names no fold seal: then M3 lists one key of `gc/gen/`, and any key stops the run. M3 also stops on a `gc/state` whose `gc_shards` differs from `_pool_meta`, and on a fold seal or a source-edge run that GC of this build refuses. M4 lists `blobs/` a page at a time and reads the markers of a page concurrently. Without `--trust-clean-markers` it then creates the intent of each body of the page that no marker or row condemns, so the intents cover every body this listing returned |
+| M5 | Creates an intent for the current token of every body a marker or a row condemns, and for the own token of every pending row. The creates run concurrently, in M4 as in M5. Each create must be confirmed; the first that is not stops the run before M6 |
 | M6 | Raises a pool below generation 3 to 3, then rewrites `gc/state` at generation 4 |
 | M7 | Reads every mount slot, both GC leases and `gc/state` again |
 | M8 | Raises `_pool_meta` to generation 4 and records the token dialect, then reads every slot and both GC leases once more. A member that moved is an error |
@@ -344,8 +344,8 @@ tool takes the grace interval, plus one mount lease for a slot that did not say 
 
 | Step | Requests |
 |---|---|
-| M4 | one `GET` per marker, and one `LIST` per 1000 keys under `blobs/` |
-| M5 | one `HEAD` and one `PUT` per body (with `--trust-clean-markers`, per condemned body), one more `LIST` per 1000 keys |
+| M4 | one `GET` per marker, and one `LIST` per 1000 keys under `blobs/`; without `--trust-clean-markers` also one `HEAD` and one `PUT` per body no marker or row condemns |
+| M5 | one `HEAD` and one `PUT` per condemned body |
 | M9, after the line | one `HEAD` and one `DELETE` per marker |
 
 With `B` bodies, `K` markers, a request latency `L` and `--concurrency C`, the requests of the downtime take about
@@ -396,8 +396,8 @@ of a pool (see [protocol version and retired settings](/antalya/cas/configuratio
 | `CasProbe: ...` with `grant GET and LIST`, `grant PUT with If-None-Match`, `grant LIST` or `grant DELETE` on `'<pool>/blob-intents/'` | The credential lacks that right under `blob-intents/` | Grant it, run the tool again; see [rights on `blob-intents/`](#migrate-generation-4-rights) |
 | `the store returns a token that cannot serve as a blob identity: <token>` | The probe found that the store's tokens cannot name a body | The store cannot host a generation 4 pool |
 | `the intent of blob ... could not be confirmed` | An intent create got no usable answer, or the key holds other bytes | Run the tool again; nothing past the intents was written |
-| `M5: an intent create failed; ...` | The store refused an intent create | Fix the store's refusal named in the message, then run the tool again |
-| `reading the legacy marker ... at M4` | A marker needs a newer reader, or its read failed | Nothing was written; find out which build wrote the marker before you go on |
+| `an intent create failed; ...` | The store refused an intent create | Fix the store's refusal named in the message, then run the tool again |
+| `reading the legacy marker ... at M4` | A marker needs a newer reader, or its read failed | Nothing but the intents of earlier pages was written; find out which build wrote the marker before you go on |
 | `gc/state changed under the migration ... times` | `gc/state` kept changing: a GC of an older build still runs | Stop it, run the tool again |
 | `M3: gc/state is absent, but GC has run on this pool: ...` | `gc/state` was lost while GC's runs, fold seals, heartbeat or janitor cursor remain. A state created now would name none of GC's runs and holds | See below |
 | `M3: gc/state names no fold seal and GC owner ... holds its lease, but ... exists: ...` | `gc/state` is at generation 0 and holds a GC lease while runs or fold seals remain under `gc/gen/`: an interrupted `cas-gc-rebuild`, or a GC round stopped before its commit | Restore a consistent backup; see below |

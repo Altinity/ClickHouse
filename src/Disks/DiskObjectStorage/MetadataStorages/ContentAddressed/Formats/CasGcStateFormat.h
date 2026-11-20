@@ -53,6 +53,10 @@ String encodeGcState(const GcState & state);
 /// falling back to a default state.
 GcState decodeGcState(std::string_view data);
 
+/// Throws `UNKNOWN_FORMAT_VERSION` for a state below header 4: in a generation 4 pool only an older GC bootstrapping
+/// over a deleted state writes one, and its rows do not follow the intent rules.
+void requireGenerationFourGcState(const GcState & state);
+
 /// Advisory liveness state for the GC leader lease. The leader increments `hb_seq` on a fast cadence
 /// independently of round progress, because its lease renewal counter can remain unchanged during a
 /// long fold. A follower that observes the heartbeat advance backs off from stealing the lease; this

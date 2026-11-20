@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobIntents.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobIntentFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcPhaseTimer.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasNamespaceJanitor.h>
@@ -130,14 +131,10 @@ void countRetired(RetiredCount count)
     }
 }
 
-/// A `gc/state` below header 4 can only come from an older GC bootstrapping over a deleted state; this build
-/// must not run its rows under the intent rules.
 GcState decodeGenerationFourGcState(std::string_view bytes)
 {
     GcState state = decodeGcState(bytes);
-    if (state.header_generation < G_BLOB_INTENTS)
-        throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION, "gc/state is at generation {} in a generation 4 pool",
-            state.header_generation);
+    requireGenerationFourGcState(state);
     return state;
 }
 
@@ -5346,9 +5343,22 @@ Gc::DeletePreview Gc::previewDeletes()
             }
             /// A condemned row carries the incarnation it condemned, so it needs no observation.
             for (const SourceEdgeRecord & rec : rows.condemned)
-                preview.deletes.push_back(PreviewEntry{.kind = ObjectKind::Blob, .ref = rec.ref, .key = layout.blobKey(rec.ref),
-                    .size = rec.size, .reason = rec.standing ? "standing" : rec.delete_pending ? "pending" : "candidate",
+            {
+                if (!rec.standing)
+                {
+                    preview.deletes.push_back(PreviewEntry{.kind = ObjectKind::Blob, .ref = rec.ref, .key = layout.blobKey(rec.ref),
+                        .size = rec.size, .reason = rec.delete_pending ? "pending" : "candidate", .token = rec.token,
+                        .condemn_round = rec.condemn_round});
+                    continue;
+                }
+                /// The body of a standing row is gone: the next round removes the intent of its token, if it names one.
+                const std::optional<CanonicalIdentity> identity = rec.token.canonical();
+                if (!identity)
+                    continue;
+                preview.deletes.push_back(PreviewEntry{.kind = ObjectKind::Blob, .ref = rec.ref,
+                    .key = layout.blobIntentKey(rec.ref, *identity), .size = blobIntentRecord().size(), .reason = "standing",
                     .token = rec.token, .condemn_round = rec.condemn_round});
+            }
         }
         return preview;
     };
