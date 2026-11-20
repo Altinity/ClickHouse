@@ -185,7 +185,7 @@ void AggregateFunctionTuple::add(AggregateDataPtr __restrict place, const IColum
     }
 }
 
-template <bool has_null_map, typename GetPlace>
+template <bool has_null_map, bool all_places_are_non_null, typename GetPlace>
 void AggregateFunctionTuple::addBatchImpl(
     size_t row_begin,
     size_t row_end,
@@ -301,7 +301,9 @@ void AggregateFunctionTuple::addBatchImpl(
                 if (null_map[i])
                     continue;
             }
-            if (AggregateDataPtr place = get_place(i))
+            if constexpr (all_places_are_non_null)
+                add_row(get_place(i), i);
+            else if (AggregateDataPtr place = get_place(i))
                 add_row(place, i);
         }
     }
@@ -314,7 +316,9 @@ void AggregateFunctionTuple::addBatchImpl(
                 if (null_map[i])
                     continue;
             }
-            if (AggregateDataPtr place = get_place(i))
+            if constexpr (all_places_are_non_null)
+                add_row(get_place(i), i);
+            else if (AggregateDataPtr place = get_place(i))
                 add_row(place, i);
         }
     }
@@ -329,8 +333,21 @@ void AggregateFunctionTuple::addBatch( /// NOLINT
     Arena * arena,
     ssize_t if_argument_pos) const
 {
-    addBatchImpl<false>(row_begin, row_end, columns, nullptr, if_argument_pos, arena,
+    addBatchImpl<false, false>(row_begin, row_end, columns, nullptr, if_argument_pos, arena,
         [&](size_t i) { return places[i] ? places[i] + place_offset : nullptr; });
+}
+
+void AggregateFunctionTuple::addBatchWithNonNullPlaces( /// NOLINT
+    size_t row_begin,
+    size_t row_end,
+    AggregateDataPtr * places,
+    size_t place_offset,
+    const IColumn ** columns,
+    Arena * arena,
+    ssize_t if_argument_pos) const
+{
+    addBatchImpl<false, true>(row_begin, row_end, columns, nullptr, if_argument_pos, arena,
+        [&](size_t i) { return places[i] + place_offset; });
 }
 
 void AggregateFunctionTuple::addBatchSinglePlace( /// NOLINT
@@ -341,7 +358,7 @@ void AggregateFunctionTuple::addBatchSinglePlace( /// NOLINT
     Arena * arena,
     ssize_t if_argument_pos) const
 {
-    addBatchImpl<false>(row_begin, row_end, columns, nullptr, if_argument_pos, arena,
+    addBatchImpl<false, true>(row_begin, row_end, columns, nullptr, if_argument_pos, arena,
         [&](size_t) { return place; });
 }
 
@@ -356,7 +373,7 @@ void AggregateFunctionTuple::addBatchSinglePlaceNotNull( /// NOLINT
 {
     /// Reached from `AggregateFunctionNullUnary` for `Nullable(Tuple(...))` inputs: rows whose tuple
     /// is NULL are skipped via the null map.
-    addBatchImpl<true>(row_begin, row_end, columns, null_map, if_argument_pos, arena,
+    addBatchImpl<true, true>(row_begin, row_end, columns, null_map, if_argument_pos, arena,
         [&](size_t) { return place; });
 }
 
@@ -472,9 +489,20 @@ void AggregateFunctionTuple::mergeAndDestroyBatch(
     std::atomic<bool> & is_cancelled,
     Arena * arena) const
 {
-    for (size_t i = 0; i < nested_functions.size(); ++i)
-        nested_functions[i]->mergeAndDestroyBatch(
-            dst_places, rhs_places, size, offset + state_offsets[i], thread_pool, is_cancelled, arena);
+    size_t i = 0;
+    try
+    {
+        for (; i < nested_functions.size(); ++i)
+            nested_functions[i]->mergeAndDestroyBatch(
+                dst_places, rhs_places, size, offset + state_offsets[i], thread_pool, is_cancelled, arena);
+    }
+    catch (...)
+    {
+        /// The function that threw has destroyed its own states of the batch, the following ones are untouched.
+        for (size_t k = i + 1; k < nested_functions.size(); ++k)
+            nested_functions[k]->destroyBatch(0, size, rhs_places, offset + state_offsets[k]);
+        throw;
+    }
 }
 
 void AggregateFunctionTuple::serialize(ConstAggregateDataPtr __restrict place, WriteBuffer & buf, std::optional<size_t> version) const

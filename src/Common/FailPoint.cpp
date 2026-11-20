@@ -34,6 +34,7 @@ static struct InitFiu
 #define APPLY_FOR_FAILPOINTS(ONCE, REGULAR, PAUSEABLE_ONCE, PAUSEABLE) \
     ONCE(replicated_merge_tree_commit_zk_fail_after_op) \
     ONCE(replicated_queue_fail_next_entry) \
+    ONCE(reverse_index_build_index_throw) \
     REGULAR(replicated_queue_unfail_entries) \
     ONCE(transaction_metadata_store_fail) \
     ONCE(transaction_mutation_csn_store_fail) \
@@ -47,6 +48,7 @@ static struct InitFiu
     PAUSEABLE_ONCE(remote_query_executor_receive_packet_pause) \
     PAUSEABLE_ONCE(remote_query_executor_finish_drain_pause) \
     ONCE(connection_stale_on_establish) \
+    PAUSEABLE(swarm_mode_before_task_request) \
     REGULAR(cluster_discovery_faults) \
     REGULAR(cluster_discovery_unregister_fail) \
     ONCE(cluster_discovery_retry_signal_fail) \
@@ -164,6 +166,7 @@ static struct InitFiu
     PAUSEABLE_ONCE(query_metric_log_pause_before_finish) \
     PAUSEABLE_ONCE(replicated_table_remove_zk_before_get_children) \
     PAUSEABLE_ONCE(replicated_table_remove_zk_before_final_multi) \
+    PAUSEABLE_ONCE(rmt_restore_replica_pause_before_metadata_version_raise) \
     PAUSEABLE_ONCE(kafka2_remove_zk_before_get_children) \
     PAUSEABLE_ONCE(kafka2_remove_zk_before_final_multi) \
     PAUSEABLE_ONCE(keeper_map_delete_pause_before_multi) \
@@ -201,8 +204,11 @@ static struct InitFiu
     PAUSEABLE(refresh_mv_pause_after_interrupt_check) \
     REGULAR(refresh_mv_skip_execution) \
     ONCE(column_aggregate_function_ensureOwnership_exception) \
+    ONCE(column_aggregate_function_expand_exception) \
     ONCE(space_saving_copy_arena_throw) \
     ONCE(adaptive_aggregation_drain_create_states_throw) \
+    ONCE(aggregator_merge_collect_states_throw) \
+    ONCE(aggregator_merge_batch_throw) \
     REGULAR(keepermap_fail_drop_data) \
     PAUSEABLE_ONCE(keepermap_create_pause_before_drop_lock_version) \
     REGULAR(keeper_fault_on_watch_request) \
@@ -234,6 +240,7 @@ static struct InitFiu
     REGULAR(database_replicated_delay_recovery) \
     REGULAR(database_replicated_delay_entry_execution) \
     PAUSEABLE(database_replicated_stop_entry_execution) \
+    PAUSEABLE_ONCE(database_replicated_pause_before_initial_query_execution) \
     PAUSEABLE_ONCE(database_replicated_pause_after_reading_log_pointer) \
     PAUSEABLE_ONCE(database_replicated_pause_after_snapshot_identity_check) \
     REGULAR(remove_merge_tree_part_delay) \
@@ -254,6 +261,7 @@ static struct InitFiu
     PAUSEABLE_ONCE(iceberg_drop_partition_pause_after_discovery) \
     ONCE(iceberg_alter_catalog_update_schema_fail) \
     ONCE(iceberg_alter_catalog_commit_reported_as_failed) \
+    PAUSEABLE_ONCE(iceberg_metadata_prefetch_pause) \
     REGULAR(storage_cluster_read_sleep) \
     ONCE(iceberg_writes_non_retry_cleanup) \
     ONCE(iceberg_writes_post_publish_throw) \

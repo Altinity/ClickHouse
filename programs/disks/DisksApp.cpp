@@ -557,11 +557,11 @@ int DisksApp::main(const std::vector<String> & /*args*/)
         /*io_thread_pool_queue_size*/ 10000);
 
     /// `clickhouse-disks` loads no `ServerSettings`, so this can't read
-    /// `cas_blob_upload_pool_size`; 16 mirrors that setting's default
+    /// `cas_blob_upload_pool_size`; 64 mirrors that setting's default
     /// (`src/Core/ServerSettings.cpp`). A `write` command that commits through a
     /// `cas` disk reaches `uploadPendingBlobs`, which calls this pool
     /// unconditionally (see the analogous init in `Server.cpp`/`LocalServer.cpp`).
-    DB::Cas::initializeBlobUploadPool(16);
+    DB::Cas::initializeBlobUploadPool(64);
 
     registerCommands();
 

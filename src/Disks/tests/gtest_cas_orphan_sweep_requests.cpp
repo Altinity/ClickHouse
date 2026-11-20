@@ -2,6 +2,7 @@
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/tests/cas_test_helpers.h>
@@ -267,6 +268,8 @@ TEST(CASOrphanSweepRequests, UnrelatedCatalogChangeDoesNotRetainStableOrphan)
     const Layout & layout = f.store->layout();
     const String key = f.add(1);
     seedFoldCursorForTest(*f.backend, layout, kNs, RefTxnId{2, 1});
+    /// A fold cursor names a record GC read; without a snapshot above it, that record is still there.
+    fixture::writeRefLogRaw(*f.backend, layout, RefLogTxn{kNs.string(), RefTxnId{2, 1}, {}, std::nullopt});
     writeRecoverableCkptForRawFixture(*f.backend, layout, kNs, RefCkpt{
         .life_epoch = 1, .committed_through = std::nullopt,
         .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt});
@@ -577,7 +580,7 @@ TEST(CASOrphanSweepRequests, EpochCrossingDiscardsAtMostOneWindowAndTheNewEpochI
     /// mechanics of the ref-log walks a namespace's first candidate triggers, not about the listing.
     EXPECT_EQ(result.listed, 48u);
     /// The SAME reader crosses the epoch twice on this fixture: once inside the recovery walk
-    /// `activeManifestKeys` runs via `recoverRefTableDetailedFromAuthority`, and again in its own
+    /// `activeManifestKeys` runs via `recoverRefTableDetailedFromAuthorityBounded`, and again in its own
     /// committed-tail walk over the same {1,1}..{2,40} range (today's pre-existing double walk, not
     /// something this change introduces) -- so at most two windows are discarded, not one.
     EXPECT_LE(wasted, 128u) << "at most two windows at concurrency 16: one per walk crossing the epoch";
@@ -586,4 +589,106 @@ TEST(CASOrphanSweepRequests, EpochCrossingDiscardsAtMostOneWindowAndTheNewEpochI
     /// or without read-ahead, not something the hint/discard rule changes.
     for (uint64_t seq = 1; seq <= 40; ++seq)
         EXPECT_EQ(backend->getCount(layout.refLogKey(NamespaceLifeId::fromCatalogEntry(kNs, catalogLifeIdForTest(*backend, layout, kNs)), RefTxnId{2, seq})), 2u) << seq;
+}
+
+/// A quiet generation 3 namespace has no frontier, so neither walk of the page knows where its chain
+/// ends. Each hints only a few keys past the record it reads instead of a whole window.
+TEST(CASOrphanSweepRequests, GenerationThreeTailWalksHintAFewKeysPastTheEnd)
+{
+    constexpr uint64_t kHintDepth = 4;
+    constexpr uint64_t kTail = 3;
+    ScopedReadCeiling c(3);
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
+                                                .manifest_sweep_list_budget_keys = 1000,
+                                                .manifest_sweep_delete_budget_keys = 100,
+                                                .gc_fold_max_defer_rounds = 0});
+    const Layout & layout = store->layout();
+    casAdmitEntry(*backend, layout, kNs);
+    for (uint64_t seq = 1; seq <= kDebrisManifests; ++seq)
+        writeManifestRaw(*backend, layout, kNs, build(seq), {blobEntryFor("a", DB::UInt128(0x100 + seq))});
+    publishAt(*backend, layout, kNs, RefTxnId{2, 1}, "live", /*build_sequence=*/2000, DB::UInt128(0x7001), /*birth=*/true);
+    for (uint64_t seq = 2; seq <= kTail; ++seq)
+        publishAt(*backend, layout, kNs, RefTxnId{2, seq}, "t" + std::to_string(seq), 2000 + seq,
+                  DB::UInt128(0x9000 + seq), /*birth=*/false);
+    NamespaceLifeId life = fixture::fixtureLife(kNs);
+    {
+        OperationForTest op(*backend);
+        life = *CasRefCatalog::lifeIfCataloged(*op, layout, kNs);
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(layout.refCkptKey(life),
+            encodeRefCkptAtGeneration(refCkptOf(2), G_REF_CHAIN), Retry::once())));
+    }
+    seedFoldCursorForTest(*backend, layout, kNs, RefTxnId{2, 1});
+    setWatermarkMinActive(*backend, layout, "test", /*writer_epoch=*/2, /*min_active=*/1);
+    backend->resetCounts();
+
+    ThreadPool pool = makeReadPool(4);
+    const uint64_t wasted_before = ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadWasted];
+    const ManifestSweepResult result = planManifestCursorPage(*store, "", 1000, 100, true, nullptr, &pool, 16);
+    const uint64_t wasted = ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadWasted] - wasted_before;
+    ASSERT_EQ(result.nominations.size(), kDebrisManifests)
+        << "the page must walk the chain for real candidates, or this measures nothing";
+
+    uint64_t past_end = 0;
+    for (uint64_t seq = kTail + 1; seq <= kTail + 128; ++seq)
+        past_end += backend->getCount(layout.refLogKey(life, RefTxnId{2, seq}));
+    /// The page walks this chain twice: the read-only recovery, then the walk above the cursor. Each
+    /// reads the end key once and wastes at most the hint depth.
+    RecordProperty("absent_gets_past_end", std::to_string(past_end));
+    RecordProperty("read_ahead_wasted", std::to_string(wasted));
+    EXPECT_LE(past_end, 2 * (1 + kHintDepth)) << "absent GETs past the end " << past_end;
+    EXPECT_LE(wasted, 2 * kHintDepth) << "CASGCReadAheadWasted " << wasted;
+}
+
+/// The same namespace through whole GC rounds at the default window: the fold reads the first absent key
+/// once per round and hints only listed keys; the sweep's two walks waste at most the hint depth each.
+TEST(CASOrphanSweepRequests, GcRoundsOverAQuietGenerationThreeNamespaceWasteFewReads)
+{
+    constexpr uint64_t kHintDepth = 4;
+    constexpr uint64_t kTail = 3;
+    ScopedReadCeiling c(3);
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
+                                                .manifest_sweep_list_budget_keys = 1000,
+                                                .manifest_sweep_delete_budget_keys = 100,
+                                                .gc_fold_max_defer_rounds = 0});
+    ASSERT_EQ(store->poolConfig().gc_io_concurrency, 16u) << "the default window, or this measures the wrong shape";
+    const Layout & layout = store->layout();
+    casAdmitEntry(*backend, layout, kNs);
+    for (uint64_t seq = 1; seq <= kDebrisManifests; ++seq)
+        writeManifestRaw(*backend, layout, kNs, build(seq), {blobEntryFor("a", DB::UInt128(0x100 + seq))});
+    publishAt(*backend, layout, kNs, RefTxnId{2, 1}, "live", /*build_sequence=*/2000, DB::UInt128(0x7001), /*birth=*/true);
+    for (uint64_t seq = 2; seq <= kTail; ++seq)
+        publishAt(*backend, layout, kNs, RefTxnId{2, seq}, "t" + std::to_string(seq), 2000 + seq,
+                  DB::UInt128(0x9000 + seq), /*birth=*/false);
+    NamespaceLifeId life = fixture::fixtureLife(kNs);
+    {
+        OperationForTest op(*backend);
+        life = *CasRefCatalog::lifeIfCataloged(*op, layout, kNs);
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(layout.refCkptKey(life),
+            encodeRefCkptAtGeneration(refCkptOf(2), G_REF_CHAIN), Retry::once())));
+    }
+    setWatermarkMinActive(*backend, layout, "test", /*writer_epoch=*/2, /*min_active=*/1);
+    backend->resetCounts();
+
+    constexpr uint64_t kRounds = 2;
+    const uint64_t wasted_before = ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadWasted];
+    {
+        Gc gc(store, hexToU128("00000000000000000000000000000001"));
+        for (uint64_t round = 0; round < kRounds; ++round)
+            ASSERT_TRUE(gc.runRegularRound({}, /*allow_steal*/true, UniversePolicy::kDefault).acquired_lease);
+    }
+    const uint64_t wasted = ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadWasted] - wasted_before;
+    /// The fold reads the head once; any further read of it is a sweep walk.
+    ASSERT_GT(backend->getCount(layout.refLogKey(life, RefTxnId{2, 1})), 1u)
+        << "the sweep must walk the chain, or this measures only the fold";
+
+    uint64_t past_end = 0;
+    for (uint64_t seq = kTail + 1; seq <= kTail + 128; ++seq)
+        past_end += backend->getCount(layout.refLogKey(life, RefTxnId{2, seq}));
+    RecordProperty("absent_gets_past_end", std::to_string(past_end));
+    RecordProperty("read_ahead_wasted", std::to_string(wasted));
+    /// Per round: one absent read by the fold, and at most two sweep walks of one end key plus the hint depth.
+    EXPECT_LE(past_end, kRounds * (1 + 2 * (1 + kHintDepth))) << "absent GETs past the end " << past_end;
+    EXPECT_LE(wasted, kRounds * 2 * kHintDepth) << "CASGCReadAheadWasted " << wasted;
 }

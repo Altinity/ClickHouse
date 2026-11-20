@@ -76,6 +76,30 @@ namespace DB::FailPoints
 namespace DeltaLake
 {
 
+namespace
+{
+
+/// A data file with the size its `add` action records.
+struct DataObjectInfo : public DB::ObjectInfo
+{
+    DataObjectInfo(std::string path_, int64_t size_)
+        : DB::ObjectInfo(DB::RelativePathWithMetadata(std::move(path_)))
+        , size(size_)
+    {
+    }
+
+    std::optional<size_t> getFileSizeHint() const override
+    {
+        if (size > 0)
+            return static_cast<size_t>(size);
+        return std::nullopt;
+    }
+
+    const int64_t size;
+};
+
+}
+
 class TableSnapshot::Iterator final : public DB::IObjectIterator, private DB::WithContext
 {
 private:
@@ -106,8 +130,11 @@ public:
         const TableSchema & table_schema_,
         const DB::NameToNameMap & physical_names_map_,
         const DB::Names & partition_columns_,
+<<<<<<< HEAD
         const DB::Names & clustering_columns_,
         DB::ObjectStoragePtr object_storage_,
+=======
+>>>>>>> 92ae848bde78405336963dc68a272c32646310df
         const DB::ActionsDAG * filter_,
         DB::IDataLakeMetadata::FileProgressCallback callback_,
         size_t list_batch_size_,
@@ -125,8 +152,11 @@ public:
         , read_schema(read_schema_)
         , expression_schema(table_schema_)
         , partition_columns(partition_columns_)
+<<<<<<< HEAD
         , clustering_columns(clustering_columns_)
         , object_storage(object_storage_)
+=======
+>>>>>>> 92ae848bde78405336963dc68a272c32646310df
         , callback(callback_)
         , list_batch_size(list_batch_size_)
         , log(log_)
@@ -535,13 +565,9 @@ public:
             }
 
             parseDVHandle(*scan_item, object);
-            object->setObjectMetadata(object_storage->getObjectMetadata(object->getPath(), /*with_tags=*/ false));
 
             if (callback)
-            {
-                chassert(object->getObjectMetadata());
-                callback(DB::FileProgress(0, object->getObjectMetadata()->size_bytes));
-            }
+                callback(DB::FileProgress(0, object->getFileSizeHint().value_or(0)));
             return object;
         }
     }
@@ -715,7 +741,7 @@ public:
 
         std::string full_path = DB::resolvePathInsideTable(
             context->getDataPath(), DB::unescapeForFileName(KernelUtils::fromDeltaString(path)));
-        auto object = std::make_shared<DB::ObjectInfo>(DB::RelativePathWithMetadata(std::move(full_path)));
+        auto object = std::make_shared<DataObjectInfo>(std::move(full_path), size);
         object->data_lake_metadata.emplace();
 
         LOG_TEST(
@@ -759,8 +785,11 @@ private:
     DB::NamesAndTypesList read_schema;
     DB::NamesAndTypesList expression_schema;
     DB::Names partition_columns;
+<<<<<<< HEAD
     DB::Names clustering_columns;
     const DB::ObjectStoragePtr object_storage;
+=======
+>>>>>>> 92ae848bde78405336963dc68a272c32646310df
     const DB::IDataLakeMetadata::FileProgressCallback callback;
     const size_t list_batch_size;
     const LoggerPtr log;
@@ -1122,8 +1151,11 @@ DB::ObjectIterator TableSnapshot::iterate(
         schema->table_schema,
         schema->physical_names_map,
         schema->partition_columns,
+<<<<<<< HEAD
         need_clustering_columns ? *clustering_columns : DB::Names{},
         object_storage,
+=======
+>>>>>>> 92ae848bde78405336963dc68a272c32646310df
         filter_dag,
         callback,
         list_batch_size,

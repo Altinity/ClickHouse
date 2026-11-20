@@ -3,9 +3,10 @@ import os
 import re
 import shlex
 import subprocess
+import tempfile
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 
 import yaml  # NOTE (strtgbb): Used for loading broken tests rules
 
@@ -561,13 +562,21 @@ def get_images_from_compose_files(compose_files: List[Path]) -> List[str]:
 
 
 def prefetch_images(
-    images: List[str], retries: int = 3, pull_timeout: int = 300
+    images: List[str],
+    retries: int = 3,
+    pull_timeout: int = 300,
+    fetched_out: Optional[Set[str]] = None,
 ) -> bool:
     """Pull every image in parallel using `ci/prefetch-integration-test-images`.
 
     Images with no manifest for the current architecture (e.g. amd64-only images
     on arm64 runners) are silently skipped.  Returns True on success, False if any
     image fails to pull for a real reason.
+
+    `fetched_out`, when given, receives the references the script reports as actually
+    pulled. A missing or short report can only leave references out, so a reporting
+    failure costs the skip in `tests/integration/helpers/cluster.py` instead of claiming
+    an image that was never fetched.
     """
     if not images:
         print("No images to pre-fetch.")
@@ -579,11 +588,19 @@ def prefetch_images(
         "PULL_RETRIES": str(retries),
         "PULL_TIMEOUT": str(pull_timeout),
     }
-    return Shell.check(
-        f"{script} {' '.join(images)}",
-        verbose=True,
-        env=env,
-    )
+    report = ""
+    with tempfile.TemporaryDirectory(prefix="prefetch_", dir=temp_path) as report_dir:
+        if fetched_out is not None:
+            report = os.path.join(report_dir, "fetched.txt")
+            env["PREFETCH_FETCHED_FILE"] = report
+        ok = Shell.check(
+            f"{script} {' '.join(images)}",
+            verbose=True,
+            env=env,
+        )
+        if fetched_out is not None and Path(report).is_file():
+            fetched_out.update(Path(report).read_text(errors="replace").split())
+    return ok
 
 
 def parse_args():
@@ -1282,12 +1299,19 @@ tar -czf ./ci/tmp/logs.tar.gz \
         + ", ".join(str(f.name) for f in compose_files)
     )
     images_to_prefetch = get_images_from_compose_files(compose_files)
-    if not prefetch_images(images_to_prefetch):
+    prefetched: Set[str] = set()
+    if not prefetch_images(images_to_prefetch, fetched_out=prefetched):
         Result.create_from(
             status=Result.Status.ERROR,
             info="Failed to pre-pull Docker images needed by the test batch",
             labels=[Result.Label.INFRA],
         ).complete_job()
+    # A batch's compose files need not yield the default server image, but a project's own
+    # enumeration can: it is the default instance image and Keeper's. So prefetch it separately, and
+    # ignore the result: a failed fetch only leaves it out of the export, which turns the skip off.
+    server_image = f"altinityinfra/integration-test:{os.environ['DOCKER_BASE_TAG']}"
+    if server_image not in prefetched:
+        prefetch_images([server_image], fetched_out=prefetched)
 
     test_env = {
         "CLICKHOUSE_TESTS_BASE_CONFIG_DIR": clickhouse_server_config_dir,
@@ -1297,6 +1321,9 @@ tar -czf ./ci/tmp/logs.tar.gz \
         "CLICKHOUSE_USE_OLD_ANALYZER": "1" if use_old_analyzer else "0",
         "CLICKHOUSE_USE_DISTRIBUTED_PLAN": "1" if use_distributed_plan else "0",
         "CLICKHOUSE_USE_DATABASE_DISK": "1" if use_database_disk else "0",
+        # Read by tests/integration/helpers/cluster.py: the references this job pulled. A reference
+        # outside this set was not fetched here and may be a stale floating tag, so it is pulled.
+        "CLICKHOUSE_TESTS_PREFETCHED_IMAGES": " ".join(sorted(prefetched)),
         "PYTEST_CLEANUP_CONTAINERS": "1",
         "JAVA_PATH": java_path,
         # PromQL compliance: deterministic JSON for upload hook (see promql_compliance_upload_hook.py).

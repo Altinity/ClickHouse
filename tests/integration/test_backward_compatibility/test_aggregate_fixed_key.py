@@ -6,7 +6,7 @@ cluster = ClickHouseCluster(__file__)
 node1 = cluster.add_instance(
     "node1",
     with_zookeeper=True,
-    image="altinity/clickhouse-server",
+    image="clickhouse/clickhouse-server",
     tag=CLICKHOUSE_CI_MIN_TESTED_VERSION,
     with_installed_binary=True,
 )

@@ -86,7 +86,8 @@ WHERE event_type = 'Finish' AND disk_name = 'cas'
 ORDER BY event_time DESC LIMIT 10;
 ```
 
-A `0`/`false` `is_leader` means this node never reclaims for this disk — check the peer that holds
+A `NULL` `last_success_age_seconds` means this server's GC has not completed a round as leader since it
+started. A `0`/`false` `is_leader` means this node never reclaims for this disk — check the peer that holds
 leadership instead. A steady `entries_condemned` with `entries_graduated` stuck at `0` means objects
 are being found but never crossing the safety floor (recall the grace period is measured in full
 rounds, not acks — see [condemnation and deletion](/antalya/cas/architecture/garbage-collection#condemn-delete)).
@@ -160,7 +161,7 @@ row followed by a `recovered` one — and the older `unresolved_reason`, `deadli
 - `outcome = 'failed'` carries the decisive `classification`: `external_lease_deadline` (a
   bounded renewal only: the confirmed lease's own safety margin, not the request policy, ran out first — check object-store
   latency or `BOOTTIME` advancement before anything else), `request_deadline` (a bounded
-  renewal only: the ninety-second request policy exhausted first), `unresolved` (every attempt was ambiguous and never settled by
+  renewal only: the configured request window (`cas_request_window_ms`, default 120 s) exhausted first), `unresolved` (every attempt was ambiguous and never settled by
   the time the operation gave up), `conflict` (an exact resolve read found another body — a
   same-pair twin, a GC-fenced body, a successor epoch, or a foreign holder), `cancelled` (a
   renewal in flight was cancelled by shutdown or a remount park request; expected during graceful
@@ -201,9 +202,12 @@ Returns one row: `disk`, `reachable`, `dangling`, `unreachable`, `pending_gc`, `
 `referenced_logical_bytes`, `distinct_blobs`, `total_blob_refs`. `dangling` is the one column that
 means data loss — `unreachable`, `pending_gc`, and `awaiting_gc` are objects still
 moving through the normal condemn/graduate/delete pipeline, not a problem on their own.
-`chain_broken` and `corrupted_runs` are the other two hard findings: a hole in a ref-log stream and a
-GC source-edge run that failed its checksum, respectively. This summary-only form has no
-per-object `--detail` equivalent yet — for that, the offline `cas-fsck --detail` below is still
+`chain_broken` and `corrupted_runs` are the other two hard findings. `chain_broken` is a ref-log stream
+whose chain ends below a log listed above that end, or whose snapshot base, records or links are corrupt
+while `_ckpt` is unchanged. `corrupted_runs` is a GC source-edge run that failed its checksum. `unchecked` means the scan could not prove or
+refute a finding, for example because the checkpoint changed during the scan; rerun `fsck` and treat only
+a repeat as a finding. This summary-only form has
+no per-object `--detail` equivalent yet — for that, the offline `cas-fsck --detail` below is still
 needed.
 
 ### SYSTEM CAS GC RUN {#sql-gc-run}
@@ -301,8 +305,13 @@ decommissioning a pool member is a migration/scale-down operation, not an incide
 A delete request sent before a restart can still reach the object store later and remove a marker GC relies on,
 so a blob can be lost; nothing bounds when such requests stop. Entries the old version already scheduled for
 deletion are deleted by the upgraded GC without a fresh marker read. A downgrade within 26.6.x follows the same
-procedure; a pool whose reader floor was raised to 2 by a writable 26.8 mount cannot be downgraded (see
-[Upgrading a pool from 26.6.x](../configuration.md#upgrading-from-26-6)).
+procedure; a pool whose reader floor was raised to 2 or 3 by a writable 26.8 mount cannot be downgraded (see
+[Upgrading a pool from 26.6.x](../configuration.md#upgrading-from-26-6) and
+[Upgrading a pool to reader generation 3](/antalya/cas/operations/migration#upgrade-generation-3)).
+
+An older GC leader that is still mounted when a generation 3 mount stamps a namespace cannot read that
+namespace's `_ckpt`. It records the namespace as undecodable (the `checkpoint_undecodable` hold), folds
+nothing for it and suppresses every destructive step for the pool until it is stopped or upgraded.
 
 The decommission tool opens the pool with the server's CAS disk configuration and never admits a new
 `cas_blob_hash` into the pool: run it with the algorithm the pool already records.
