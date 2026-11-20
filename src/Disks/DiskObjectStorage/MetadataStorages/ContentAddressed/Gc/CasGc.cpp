@@ -4877,11 +4877,19 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// explicitly rather than rely on that invariant.
     GcState state;
     std::optional<Etag> state_etag;
-    if (!acquireOrRenewLease(state, state_etag, /*allow_steal=*/false))
+    bool claimed_never_held = false;
+    if (!acquireOrRenewLease(state, state_etag, /*allow_steal=*/false, &claimed_never_held))
     {
         rep.refusal = "another GC leader holds the lease";
         return rep;
     }
+    /// A refused rebuild leaves `gc/state` as it found it: a rebuild never steals, so a lease it claimed and
+    /// kept would make every later rebuild, each with a fresh identity, refuse as a competing leader.
+    bool baseline_installed = false;
+    SCOPE_EXIT({
+        if (claimed_never_held && !baseline_installed)
+            giveBackRebuildLease(op, state, *state_etag);
+    });
 
     /// Healthy `FORCE REBUILD` shares the same parent-authorized barrier as an ordinary round. A
     /// damaged-state rebuild has no adopted parent (`snap_generation == 0`) and the barrier performs
@@ -5022,9 +5030,6 @@ RebuildReport Gc::rebuildBaseline(bool force)
     seal.generation = generation;
     seal.parent_generation = state.snap_generation;
     seal.ref_lives = rebuild_walk_plan.successorFoldStates();
-    /// Life ids whose hold this rebuild MINTED (see `minted_here`); they are stamped with the retry
-    /// round once it is known, and nothing else is touched.
-    std::set<UInt128> minted_hold_lives;
     uint64_t max_fence_round = 0;
     std::map<ManifestId, Etag> mf_cleanup_unused;
 
@@ -5061,13 +5066,8 @@ RebuildReport Gc::rebuildBaseline(bool force)
         const RefTableState & st = recovered->state;
 
         RefCoverage cov;
-        cov.classification = CoverageClass::Folded;   /// unless a bodiless precommit clamps it below
+        cov.classification = CoverageClass::Folded;   /// unless the prior seal's hold is carried below
         cov.last_folded_ref_id = st.getGreatestApplied();
-        /// Whether the hold on this row was minted BY THIS REBUILD (and so still owes a retry round)
-        /// rather than carried from the prior seal. Tracked explicitly instead of by looking for a
-        /// `next_retry_round` of 0: 0 is a perfectly good wire value, and a carried hold that happened
-        /// to hold it would have its backoff silently rewritten by the stamping pass.
-        bool minted_here = false;
 
         std::vector<BlobDelta> deltas;
 
@@ -5087,35 +5087,20 @@ RebuildReport Gc::rebuildBaseline(bool force)
             ++rep.committed_refs;
         }
 
-        /// Live precommits: a present body contributes edges; a bodiless one is non-activating and clamps
-        /// (the fold barrier -- the first regular round folds it once the body lands).
+        /// Live precommits: an owner like a committed ref, so its manifest must be readable. A rebuild
+        /// cannot hold the namespace until the body lands: the precommit's log is below the rebuilt cursor,
+        /// no round re-reads it, and its promote emits no edge.
         for (const auto & [ref_name, manifest_ref] : st.getPrecommits())
         {
             const ManifestId id{ns, manifest_ref};
             owned_manifest_keys.insert(layout.manifestKey(id));
-            if (foldManifestEdges(reads, id, +1, deltas, mf_cleanup_unused, /*txn_ordinal=*/0))
-                ++rep.live_precommits;
-            else
-            {
-                /// A bodiless live precommit leaves the rebuilt baseline INCOMPLETE for this namespace:
-                /// nothing can enumerate the blobs it pins, so nothing can protect them. That is a
-                /// durable hold, not a report field -- and it is the one hold the rebuild has to invent
-                /// a position for, because it derives edges from owner STATE and cannot name the log
-                /// that introduced the precommit (that log is below the rebuilt cursor and no round
-                /// re-reads it). It holds at the FIRST POSITION THE NEXT ROUND WILL READ, which makes a
-                /// quiet namespace stay held indefinitely -- the fail-close answer while the body is
-                /// still missing -- and clears once the namespace makes durable progress.
-                /// RESIDUAL, named rather than hidden: progress unrelated to this precommit also clears
-                /// it, and the precommit's edges stay missing until another rebuild.
-                cov.classification = CoverageClass::Clamped;
-                cov.hold = RefHold{.reason = HoldReason::ManifestBodyMissing,
-                                   .offending_position = RefTxnId{cov.last_folded_ref_id.writer_epoch,
-                                                                 cov.last_folded_ref_id.ref_sequence + 1},
-                                   .retry_count = 0,
-                                   .next_retry_round = 0};   /// stamped below, once `round` is minted
-                minted_here = true;
-                ++rep.clamped_shards;
-            }
+            if (!foldManifestEdges(reads, id, +1, deltas, mf_cleanup_unused, /*txn_ordinal=*/0))
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS GC rebuild: namespace '{}' has a live precommit '{}' whose manifest {} is missing or "
+                    "invalid, so the blobs it references cannot be counted. GC refuses to rebuild; retry once "
+                    "the manifest is readable or the precommit is removed.",
+                    ns.string(), ref_name, layout.manifestKey(id));
+            ++rep.live_precommits;
         }
         route_deltas(deltas);
 
@@ -5132,11 +5117,8 @@ RebuildReport Gc::rebuildBaseline(bool force)
             {
                 cov.classification = CoverageClass::Clamped;
                 cov.hold = pit->second.coverage.hold;
-                minted_here = false;   /// a carried hold rides VERBATIM; its retry fields are not ours
             }
         }
-        if (minted_here)
-            minted_hold_lives.insert(life.incarnation);
 
         RefLifeFoldState & row = seal.ref_lives.at(life.incarnation);
         row.coverage = cov;
@@ -5197,15 +5179,6 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// Numbering, part 2: the round above every surviving fence/state/generation number.
     const uint64_t round = std::max({max_fence_round, state.round, max_gen}) + 1;
 
-    /// Stamp the retry round on the holds THIS rebuild minted (the bodiless-precommit ones, left unset
-    /// because the round was not minted yet). Carried holds are named by no key here and are not
-    /// touched: their `next_retry_round` and `retry_count` ride verbatim, since a rebuild retries
-    /// nothing.
-    for (const UInt128 life_id : minted_hold_lives)
-        if (const auto it = seal.ref_lives.find(life_id);
-            it != seal.ref_lives.end() && it->second.coverage.hold)
-            it->second.coverage.hold->next_retry_round = round + 1;
-
     for (uint64_t shard = 0; shard < gc_shards; ++shard)
         flush_shard(shard);   /// real-edge rows only: a rebuild condemns nothing, so it seeds nothing
 
@@ -5255,6 +5228,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
         return rep;
     }
     orThrow(std::move(commit), "CAS gc rebuild: gc/state commit");
+    baseline_installed = true;
 
     rep.performed = true;
     rep.round = round;
@@ -5399,7 +5373,8 @@ void Gc::pulseHeartbeat(Pool & store, UInt128 gc_id)
         op.create(key, body, Retry::once());
 }
 
-bool Gc::acquireOrRenewLease(GcState & state, std::optional<Etag> & state_etag, bool allow_steal)
+bool Gc::acquireOrRenewLease(GcState & state, std::optional<Etag> & state_etag, bool allow_steal,
+                             bool * claimed_never_held)
 {
     CasOperation op = store->openRequests().admit();
     const String key = store->layout().gcStateKey();
@@ -5408,9 +5383,11 @@ bool Gc::acquireOrRenewLease(GcState & state, std::optional<Etag> & state_etag, 
     /// against what the losing write's own resolve read observed, so the last decision is the committed
     /// one, and a competing leader's write makes the next decision see a moved lease tuple.
     GcState decided;
+    bool decided_never_held = false;
     const std::optional<Etag> committed = orThrow(op.readModifyWrite(key,
         [&](const std::optional<Object> & current_object) -> std::optional<String>
     {
+        decided_never_held = false;
         if (!current_object)
         {
             if (has_observation)
@@ -5425,6 +5402,7 @@ bool Gc::acquireOrRenewLease(GcState & state, std::optional<Etag> & state_etag, 
             /// PoolConfig carries the configured value from the disk XML.
             fresh.gc_shards = store->poolConfig().gc_shards;
             decided = fresh;
+            decided_never_held = true;
             return encodeGcState(fresh);
         }
 
@@ -5449,6 +5427,7 @@ bool Gc::acquireOrRenewLease(GcState & state, std::optional<Etag> & state_etag, 
             GcState next = current;
             next.lease = GcLease{gc_id, 1};
             decided = next;
+            decided_never_held = true;
             return encodeGcState(next);
         }
 
@@ -5505,7 +5484,35 @@ bool Gc::acquireOrRenewLease(GcState & state, std::optional<Etag> & state_etag, 
     rememberObservation(decided.lease);
     state = std::move(decided);
     state_etag = committed;
+    if (claimed_never_held)
+        *claimed_never_held = decided_never_held;
     return true;
+}
+
+void Gc::giveBackRebuildLease(CasOperation & op, const GcState & claimed, const Etag & claim_etag) noexcept
+{
+    const auto warn = [&](const String & why)
+    {
+        LOG_WARNING(logger,
+            "CAS GC rebuild refused but could not give back its GC lease (owner {}, seq {}): {}. If gc/state still "
+            "holds that lease, the next rebuild reports 'another GC leader holds the lease'",
+            u128ToHex(claimed.lease.owner), claimed.lease.seq, why);
+    };
+    try
+    {
+        GcState restored = claimed;
+        restored.lease = GcLease{};
+        const WriteResult written = op.replace(store->layout().gcStateKey(), encodeGcState(restored), claim_etag,
+                                               Retry::once());
+        if (std::holds_alternative<Conflict>(written))
+            warn("gc/state changed after the claim");
+        else if (!std::holds_alternative<Committed>(written))
+            warn("the conditional write was not committed");
+    }
+    catch (...)
+    {
+        warn(getCurrentExceptionMessage(/*with_stacktrace=*/false));
+    }
 }
 
 void Gc::OutcomeTally::add(OutcomeKind kind)

@@ -560,8 +560,14 @@ private:
     /// Lease acquire/renew/steal per the documented observation protocol. On success `state` holds the
     /// committed gc/state (with our lease) and `state_etag` the etag that write created.
     /// `allow_steal=false` suppresses only the steal (see runRegularRound's doc comment) — acquiring a
-    /// free lease and renewing our own are unaffected.
-    bool acquireOrRenewLease(GcState & state, std::optional<Etag> & state_etag, bool allow_steal);
+    /// free lease and renewing our own are unaffected. `claimed_never_held`, when given, says whether the
+    /// committed write claimed a lease nobody held (or created an absent `gc/state`).
+    bool acquireOrRenewLease(GcState & state, std::optional<Etag> & state_etag, bool allow_steal,
+                             bool * claimed_never_held = nullptr);
+
+    /// Restores the never-held lease over this rebuild's own claim, with one conditional write. Never
+    /// throws: a lost or unanswered write is logged, and the caller's refusal stands.
+    void giveBackRebuildLease(CasOperation & op, const GcState & claimed, const Etag & claim_etag) noexcept;
 
     /// Catalog-only helping barrier run immediately after lease acquisition. It validates the adopted
     /// parent and delegates deterministic `Removing`-row settlement to `CatalogLifecycleReconciler`.

@@ -337,6 +337,16 @@ clickhouse-disks -C config.xml --disk cas cas-inspect '<raw-object-key>'
 clickhouse-disks -C config.xml --disk cas cas-gc-rebuild --force
 ```
 
+A rebuild refuses when a live precommit's manifest is missing or invalid:
+`CAS GC rebuild: namespace '<ns>' has a live precommit '<ref>' whose manifest <key> is missing or invalid`.
+A writer still uploading that manifest causes it. Run the rebuild again once the manifest is readable or the
+precommit is removed. A refused rebuild gives back the GC lease it claimed, so the command can run again. When
+that write fails, a warning `could not give back its GC lease` names the lease left behind. If the refused attempt
+created `gc/state`, the next attempt can read that state as healthy and then needs `--force`.
+A rebuild cannot start while another GC leader holds the lease. This includes a lease left by a stopped GC leader,
+and the lease of a pool migrated from an older generation whose GC ever ran, because the migration keeps the lease.
+On such a pool the rebuild command does not start.
+
 Exit code of a non-interactive `--query`: 1 when any `cas-*` command in it threw (`cas-fsck` throws on
 `dangling`, `chain_broken`, `corrupted_runs`, `lifeless_keys`, `intent_malformed`, `intent_unread` and `pending_without_intent`; `unreachable` is a soft count that
 includes the GC pipeline and in-flight builds), and so does a `cas-*` command given bad arguments,

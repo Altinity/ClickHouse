@@ -792,3 +792,238 @@ TEST(CASGCRebuild, RebuildFailsWhenTheBaseMoves)
     ASSERT_TRUE(state);
     EXPECT_EQ(decodeGcState(state->bytes).snap_generation, 0u) << "a moved base must not adopt a new baseline";
 }
+
+namespace
+{
+
+bool isWriteRequest(JournalVerb verb)
+{
+    return verb == JournalVerb::Write || verb == JournalVerb::Remove || verb == JournalVerb::RemoveMany
+        || verb == JournalVerb::Publish;
+}
+
+/// The keys written after the last read or `HEAD` of `probed_key`, which must have been read.
+std::vector<String> writesAfterLastProbeOf(const std::vector<JournalEntry> & journal, const String & probed_key)
+{
+    std::optional<size_t> last_probe;
+    for (size_t i = 0; i < journal.size(); ++i)
+        if (!journal[i].keys.empty() && journal[i].keys.front() == probed_key
+            && (journal[i].verb == JournalVerb::Read || journal[i].verb == JournalVerb::Head))
+            last_probe = i;
+    EXPECT_TRUE(last_probe.has_value()) << "the rebuild never read " << probed_key;
+    std::vector<String> written;
+    for (size_t i = last_probe.value_or(journal.size()); i < journal.size(); ++i)
+        if (isWriteRequest(journal[i].verb))
+            written.insert(written.end(), journal[i].keys.begin(), journal[i].keys.end());
+    return written;
+}
+
+/// A pool whose `gc/state` is lost and whose committed `tbl_b` names a manifest that is gone: the rebuild
+/// refuses after its lease claim. Returns the missing manifest's id.
+ManifestId seedLostStateWithMissingCommittedManifest(Backend & backend, const PoolPtr & store)
+{
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef a = ref(1, 0xA1);
+    const ManifestRef b = ref(2, 0xB2);
+    writeBlobBody(backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(backend, store->layout(), ns, a, {blobEntryFor("a", DB::UInt128(1))});
+    writeManifestRaw(backend, store->layout(), ns, b, {blobEntryFor("b", DB::UInt128(1))});
+    publishCommittedTransition(backend, store->layout(), ns, "tbl_a", std::nullopt, a);
+    publishCommittedTransition(backend, store->layout(), ns, "tbl_b", std::nullopt, b);
+    Gc gc(store, kGc);
+    gc.runRegularRound();
+    gc.runRegularRound();
+    const auto st = headObj(backend, store->layout().gcStateKey());
+    EXPECT_TRUE(st.has_value());
+    removeExact(backend, store->layout().gcStateKey(), st->etag);
+    const ManifestId id{ns, b};
+    deleteManifestBody(backend, store->layout(), id);
+    return id;
+}
+
+}
+
+/// Each `SYSTEM CAS GC REBUILD` takes a fresh GC identity and never steals, so a refusal that kept its
+/// lease claim would make every retry refuse as a competing leader.
+TEST(CASGCRebuild, RefusedRebuildGivesBackItsLeaseClaim)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const ManifestId missing = seedLostStateWithMissingCommittedManifest(*backend, store);
+    ASSERT_FALSE(readObj(*backend, layout.gcStateKey()).has_value());
+
+    backend->clearJournal();
+    Gc first(store, hexToU128("00000000000000000000000000000011"));
+    const RebuildReport refused = first.rebuildBaseline(/*force*/ false);
+    ASSERT_FALSE(refused.performed);
+    EXPECT_NE(refused.refusal.find("tbl_b"), String::npos) << refused.refusal;
+    EXPECT_EQ(writesAfterLastProbeOf(backend->journal(), layout.manifestKey(missing)),
+              std::vector<String>{layout.gcStateKey()}) << "the only write after the refusal is the give-back";
+    const auto given_back = readObj(*backend, layout.gcStateKey());
+    ASSERT_TRUE(given_back.has_value()) << "the claim created gc/state, and the give-back keeps the object";
+    const GcState given_back_state = decodeGcState(given_back->bytes);
+    EXPECT_EQ(given_back_state.lease.owner, DB::UInt128(0));
+    EXPECT_EQ(given_back_state.lease.seq, 0u);
+    EXPECT_EQ(given_back_state.snap_generation, 0u);
+
+    /// Over a present state with the never-held lease, a refusal leaves the bytes as they were. That state
+    /// is generation 0 and looks healthy, so from here on the rebuild needs FORCE.
+    Gc second(store, hexToU128("00000000000000000000000000000012"));
+    const RebuildReport refused_again = second.rebuildBaseline(/*force*/ true);
+    ASSERT_FALSE(refused_again.performed);
+    EXPECT_NE(refused_again.refusal.find("tbl_b"), String::npos) << refused_again.refusal;
+    const auto after_second = readObj(*backend, layout.gcStateKey());
+    ASSERT_TRUE(after_second.has_value());
+    EXPECT_EQ(after_second->bytes, given_back->bytes);
+    EXPECT_NE(after_second->etag, given_back->etag) << "the claim and the give-back both wrote";
+
+    writeManifestRaw(*backend, layout, missing.root_namespace, missing.ref, {blobEntryFor("b", DB::UInt128(1))});
+    Gc retry(store, hexToU128("00000000000000000000000000000013"));
+    const RebuildReport rep = retry.rebuildBaseline(/*force*/ true);
+    ASSERT_TRUE(rep.performed) << rep.refusal;
+    EXPECT_EQ(rep.committed_refs, 2u);
+}
+
+/// The give-back is one conditional write: when `gc/state` moved after the claim, it is not retried, the
+/// original refusal stands, and the lease left behind is named in a warning.
+TEST(CASGCRebuild, LostLeaseGiveBackKeepsTheRefusalAndWarns)
+{
+    auto backend = std::make_shared<SweepReadHookBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const ManifestId missing = seedLostStateWithMissingCommittedManifest(*backend, store);
+    backend->arm(layout.manifestKey(missing), 1, [&]
+    {
+        OperationForTest op(*backend);
+        const auto current = (*op).read(layout.gcStateKey(), Retry::once());
+        ASSERT_TRUE(current.has_value());
+        ASSERT_TRUE(std::holds_alternative<Committed>(
+            (*op).replace(layout.gcStateKey(), current->bytes, current->etag, Retry::once())));
+    });
+
+    const UInt128 rebuild_id = hexToU128("00000000000000000000000000000014");
+    ScopedLogCapture capture("CasGc", "warning");
+    Gc gc(store, rebuild_id);
+    const RebuildReport refused = gc.rebuildBaseline(/*force*/ false);
+    ASSERT_TRUE(backend->didFire());
+    EXPECT_FALSE(refused.performed);
+    EXPECT_NE(refused.refusal.find("tbl_b"), String::npos) << refused.refusal;
+    EXPECT_EQ(capture.count("could not give back its GC lease"), 1u) << capture.captured();
+    EXPECT_EQ(decodeGcState(readObj(*backend, layout.gcStateKey())->bytes).lease.owner, rebuild_id)
+        << "a lost give-back leaves the claim in place";
+}
+
+namespace
+{
+
+const RootNamespace kWriterNs{"00/aa@cas@"};
+const UInt128 kReusedBody{7};
+
+/// Writer X has a durable precommit of `part_x` whose manifest is still uploading, and it reused body
+/// `kReusedBody`, which no committed part names.
+ManifestRef seedBodilessPrecommitOverReusedBody(Backend & backend, const Layout & layout)
+{
+    writeBlobBody(backend, layout, kReusedBody);
+    const ManifestRef pre = ref(5, 0xC5);
+    addPrecommitTransition(backend, layout, kWriterNs, /*build_id*/ DB::UInt128(0x55), "part_x", std::nullopt, pre);
+    return pre;
+}
+
+}
+
+/// A rebuild derives edges from owner state, so a live precommit whose manifest it cannot read leaves
+/// blobs uncounted; installing that baseline lets a later zero transition delete a body X still uses.
+TEST(CASGCRebuild, RefusesABaselineThatCannotCountALivePrecommit)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const ManifestRef anchor = ref(1, 0xA1);
+    writeBlobBody(*backend, layout, DB::UInt128(1));
+    writeManifestRaw(*backend, layout, kWriterNs, anchor, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, layout, kWriterNs, "tbl", std::nullopt, anchor);
+    {
+        Gc gc(store, kGc);
+        gc.runRegularRound();
+    }
+    /// An adopted baseline under a lease nobody holds, which a rebuild with a fresh identity can claim.
+    {
+        const auto current = readObj(*backend, layout.gcStateKey());
+        ASSERT_TRUE(current.has_value());
+        GcState freed = decodeGcState(current->bytes);
+        ASSERT_GT(freed.snap_generation, 0u);
+        freed.lease = GcLease{};
+        OperationForTest op(*backend);
+        ASSERT_TRUE(std::holds_alternative<Committed>(
+            (*op).replace(layout.gcStateKey(), encodeGcState(freed), current->etag, Retry::once())));
+    }
+
+    const ManifestRef pre = seedBodilessPrecommitOverReusedBody(*backend, layout);
+    const auto before = readObj(*backend, layout.gcStateKey());
+    ASSERT_TRUE(before.has_value());
+
+    backend->clearJournal();
+    Gc rebuild(store, hexToU128("00000000000000000000000000000021"));
+    expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "live precommit 'part_x'",
+        [&] { (void)rebuild.rebuildBaseline(/*force*/ true); });
+
+    const auto after = readObj(*backend, layout.gcStateKey());
+    ASSERT_TRUE(after.has_value());
+    EXPECT_EQ(after->bytes, before->bytes) << "a refused rebuild changed gc/state";
+    EXPECT_EQ(writesAfterLastProbeOf(backend->journal(), layout.manifestKey(ManifestId{kWriterNs, pre})),
+              std::vector<String>{layout.gcStateKey()}) << "the only write after the refusal is the lease give-back";
+}
+
+/// The loss sequence behind the refusal: the precommit's manifest lands, X promotes, and another part
+/// adds and drops the reused body. The body must survive every round that follows.
+TEST(CASGCRebuild, LivePrecommitWithoutAManifestKeepsItsBodyThroughARebuild)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const Layout & layout = store->layout();
+    const ManifestRef pre = seedBodilessPrecommitOverReusedBody(*backend, layout);
+
+    Gc gc(store, kGc);
+    try
+    {
+        (void)gc.rebuildBaseline(/*force*/ false);
+    }
+    catch (const DB::Exception & e)
+    {
+        ASSERT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA) << e.message();
+    }
+
+    writeManifestRaw(*backend, layout, kWriterNs, pre, {blobEntryFor("x", kReusedBody)});
+    promoteTransition(*backend, layout, kWriterNs, /*build_id*/ DB::UInt128(0x55), "part_x", pre);
+    const ManifestRef other = ref(6, 0xD6);
+    writeManifestRaw(*backend, layout, kWriterNs, other, {blobEntryFor("o", kReusedBody)});
+    publishCommittedTransition(*backend, layout, kWriterNs, "part_other", std::nullopt, other);
+    runRegularRoundReclaiming(gc);
+    store->renewWatermarkOnce();
+    dropRefTransition(*backend, layout, kWriterNs, "part_other", other);
+
+    EXPECT_FALSE(runRoundsUntilAbsent(store, gc, *backend, layout, kReusedBody))
+        << "the body committed part_x names was deleted";
+}
+
+/// The refusal is a wait, not a verdict: once the manifest is readable, a rebuild with a fresh GC identity,
+/// as each `SYSTEM CAS GC REBUILD` takes, counts the precommit.
+TEST(CASGCRebuild, RebuildRefusedForAnUnreadableManifestSucceedsOnceItIsReadable)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const ManifestRef pre = seedBodilessPrecommitOverReusedBody(*backend, layout);
+
+    Gc refused(store, hexToU128("00000000000000000000000000000022"));
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)refused.rebuildBaseline(/*force*/ false); });
+
+    writeManifestRaw(*backend, layout, kWriterNs, pre, {blobEntryFor("x", kReusedBody)});
+    /// The refused attempt left a generation-0 `gc/state` with the never-held lease, which looks healthy.
+    Gc retry(store, hexToU128("00000000000000000000000000000023"));
+    const RebuildReport rep = retry.rebuildBaseline(/*force*/ true);
+    ASSERT_TRUE(rep.performed) << rep.refusal;
+    EXPECT_EQ(rep.live_precommits, 1u);
+    EXPECT_EQ(rep.clamped_shards, 0u);
+}
