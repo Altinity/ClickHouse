@@ -302,8 +302,9 @@ prior coverage view, the mutable successor, the new generation / attempt numbers
 - **Writes / deletes:** none
 - **Safety:** read-only
 - **Fails the round if:** the adopted seal is absent while `snap_generation > 0` — `gc/state` points
-  at a missing artifact; the fix is `clickhouse-disks cas-gc-rebuild` (`CORRUPTED_DATA`). When a `HEAD` of
-  `gc/state` then shows another version or no object, the round ends with `ABORTED` instead and no rebuild is needed
+  at a missing artifact (`CORRUPTED_DATA`), and GC stops reclaiming on this pool (see
+  [GC refuses its bookkeeping](/antalya/cas/operations/debugging#gc-bookkeeping-corrupt)). When a `HEAD` of
+  `gc/state` then shows another version or no object, the round ends with `ABORTED` instead
 - **Observability:** phase row `fold_seal_read`; metrics `parent_ref_lives`, `parent_runs`,
   `parent_cleanup_evidence`, `redundant_reads`
 
@@ -1203,7 +1204,7 @@ folded yet, or `GC` never ran), `unaccounted` (absent from the whole `GC` view) 
 manifest debris. `pending_gc` and `awaiting_gc` are ordinary backlog; `unaccounted` that persists
 across rounds is an anomaly; and two further classes are hard findings rather than backlog:
 `stale_edge` (every remaining source edge on the blob names a missing manifest, so incremental
-`GC` can never reclaim it and a rebuild is needed) and `corrupted_runs` (a source-edge run whose
+`GC` can never reclaim it) and `corrupted_runs` (a source-edge run whose
 checksum disagrees with its seal).
 
 ## Operational surface {#operational-surface}
@@ -1212,7 +1213,7 @@ checksum disagrees with its seal).
 |---|---|
 | `SYSTEM CAS GC RUN [<disk>]` | One synchronous round execution on the contacted node; only the lease holder (the GC leader, `is_leader = 1` in `system.cas_mounts`) makes progress, and on any other node the command does nothing. The disk is optional: without it every content-addressed disk on the node runs one round. It runs even while the scheduler is stopped |
 | `SYSTEM CAS GC STOP <disk>` / `SYSTEM CAS GC START <disk>` | Stop or resume future background rounds on that disk's scheduler, preserving its identity. The disk is required |
-| `SYSTEM CAS GC REBUILD [FORCE] <disk>` (`clickhouse-disks cas-gc-rebuild`) | Fail-closed disaster-recovery path for a lost or corrupt `GC` baseline — the `CORRUPTED_DATA` errors that name it in their message (missing adopted seal, snapshot without a surviving log, cursor/apply mismatch). An `ABORTED` commit conflict or a `LOGICAL_ERROR` delete marker is not a reason to rebuild. It deliberately over-protects — it prefers bounded leaks over risking an under-count — and cannot delete live data directly: deletions it produces still flow through the normal round's intent, body-delete, exact-token path. It resets `intent_sweep_cursor`, so the intent sweep then re-adopts every intent of the pool. The disk is required |
+| `SYSTEM CAS GC REBUILD [FORCE] <disk>` (`clickhouse-disks cas-gc-rebuild`) | Rebuilds the `GC` baseline from raw owner state. It works only on a pool whose `GC` never held the `GC` lease; on any other pool it refuses with `another GC leader holds the lease`, and no repair for such a pool is available in this build (see [GC refuses its bookkeeping](/antalya/cas/operations/debugging#gc-bookkeeping-corrupt)). It deliberately over-protects — it prefers bounded leaks over risking an under-count — and cannot delete live data directly: deletions it produces still flow through the normal round's intent, body-delete, exact-token path. It resets `intent_sweep_cursor`, so the intent sweep then re-adopts every intent of the pool. The disk is required |
 | `clickhouse-disks cas-gc-dryrun` | Opens the disk read-only, constructs a non-leader `GC`, and prints what would be deleted with a reason per entry. Write-free, resolves runs through the seal's references. Documented caveat: it does not fold new owner events, so away from quiescence it can **over-report** — the subset guarantee holds only at quiescence, and its output must never feed a real delete |
 
 `SYSTEM CAS DROP POOL MEMBER '<server_root_id>' FROM DISK '<disk>'` — removal of a dead

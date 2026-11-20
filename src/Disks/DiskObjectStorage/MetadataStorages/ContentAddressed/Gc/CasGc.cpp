@@ -99,6 +99,10 @@ namespace
 /// Soft limit on the namespace janitor's phase: no page starts after it, the page in progress finishes.
 constexpr uint64_t kJanitorBudgetMs = 20'000;
 
+/// Closes a refusal over corrupt GC bookkeeping. It names no command: the rebuild refuses a pool whose GC held the lease.
+constexpr std::string_view kCorruptBookkeeping = "GC bookkeeping is corrupt: GC stops reclaiming on this pool; stored data "
+    "is not affected. See /antalya/cas/operations/debugging#gc-bookkeeping-corrupt in the CAS documentation";
+
 /// Whether a `HEAD` of `gc/state` shows the version this round leased. The exact token is what the round's
 /// conditional commit sends; the canonical identity absorbs a quoting difference between the write's answer
 /// and the `HEAD`. A store whose token has no canonical form still matches by the exact token.
@@ -2181,8 +2185,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
             "CAS GC: the adopted fold seal (generation {}, attempt {}) is missing", state.snap_generation, state.snap_attempt);
         throwIfStateMoved(op, state_etag, missing);
         throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "{} under a live gc/state — GC bookkeeping is corrupt. GC refuses to run; recover with "
-            "`clickhouse-disks cas-gc-rebuild`", missing);
+            "{} under a live gc/state. {}", missing, kCorruptBookkeeping);
     }
     /// Every fold decision below starts from the immutable plan, never from the raw scan that supplied
     /// it. The successor seal owns its mutable copy; this separate const snapshot remains the prior
@@ -2832,9 +2835,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
             if (logs_below_snapshot_gone)
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
                     "CAS GC baseline guard: table {} has snapshot {} but no surviving log at or below it and "
-                    "no sealed fold cursor -- gc/state was lost after cleaning covered logs. GC refuses to "
-                    "run; recover with `clickhouse-disks cas-gc-rebuild`.",
-                    ns_str, renderRefTxnId(newest_snapshot));
+                    "no sealed fold cursor -- gc/state was lost after cleaning covered logs. {}",
+                    ns_str, renderRefTxnId(newest_snapshot), kCorruptBookkeeping);
         }
 
         /// The hold the PARENT seal left on this namespace, if any. It is three things at once: the
@@ -3449,9 +3451,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
                 if (end.writer_epoch != first.writer_epoch || end < first)
                     throw Exception(ErrorCodes::CORRUPTED_DATA,
                         "CAS GC fold: namespace {} sealed a cursor at {} that does not close the run it "
-                        "walked (opened at {}). GC refuses to commit the round; recover with "
-                        "`clickhouse-disks cas-gc-rebuild`.",
-                        ns_str, end == RefTxnId{} ? "none" : renderRefTxnId(end), renderRefTxnId(first));
+                        "walked (opened at {}). {}",
+                        ns_str, end == RefTxnId{} ? "none" : renderRefTxnId(end), renderRefTxnId(first), kCorruptBookkeeping);
                 logs_accounted += end.ref_sequence - first.ref_sequence + 1;
             }
         }
@@ -3994,7 +3995,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         try
         {
             shard_run = foldDeltasIntoGeneration(
-                op, layout, priorRunsFor(shard), new_generation, attempt, shard, std::move(buckets[shard]),
+                op, layout, priorRunsFor(shard), AdoptedRunContext{.gc_shards = state.gc_shards, .parent_round = state.round},
+                new_generation, attempt, shard, std::move(buckets[shard]),
                 ShardFoldOptions{
                     .current_round = current_round,
                     .condemn_round = condemn_round,
@@ -4128,9 +4130,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS GC fold: {} ref transaction(s) folded and merged into the round buffers but NONE of "
             "their blob deltas reached a shard reducer ({}{}). The round would have advanced its "
-            "cursor past a transaction it never applied. GC refuses to commit the round; recover with "
-            "`clickhouse-disks cas-gc-rebuild`.",
-            unapplied_txns.size(), detail, unapplied_txns.size() > 8 ? ", ..." : "");
+            "cursor past a transaction it never applied. {}",
+            unapplied_txns.size(), detail, unapplied_txns.size() > 8 ? ", ..." : "", kCorruptBookkeeping);
     }
 
     /// PROBE B1's comparison. Both terms were derived at the end of the ref intake (see the
@@ -4140,9 +4141,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
     if (logs_accounted_this_round != logs_applied_this_round)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS GC fold: the round sealed coverage over {} ref log(s) but only {} fully folded -- "
-            "a cursor advanced past a log this round never applied. GC refuses to commit the round; "
-            "recover with `clickhouse-disks cas-gc-rebuild`.",
-            logs_accounted_this_round, logs_applied_this_round);
+            "a cursor advanced past a log this round never applied. {}",
+            logs_accounted_this_round, logs_applied_this_round, kCorruptBookkeeping);
 
     /// Phase `fold_seal_write`: one PUT (or, on a deterministic replay, a byte-compare GET).
     {
@@ -5062,8 +5062,9 @@ RebuildReport Gc::rebuildBaseline(bool force)
         if (buckets[shard].empty())
             return;
         /// No applied-delta ledger either: the rebuild derives edges from owner state, not from ref transactions.
-        RunRef run = foldDeltasIntoGeneration(op, layout, prior_runs[shard], generation, ++attempt_of[shard], shard,
-                                              std::move(buckets[shard]));
+        RunRef run = foldDeltasIntoGeneration(op, layout, prior_runs[shard],
+                                              AdoptedRunContext{.gc_shards = gc_shards, .parent_round = state.round},
+                                              generation, ++attempt_of[shard], shard, std::move(buckets[shard]));
         buckets[shard].clear();
         prior_runs[shard] = {std::move(run)};
     };

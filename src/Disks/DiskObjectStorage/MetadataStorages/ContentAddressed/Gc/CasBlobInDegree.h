@@ -172,15 +172,46 @@ private:
 SourceEdgeRunView openSourceEdgeRun(std::string_view bytes);
 SourceEdgeRunView openSourceEdgeRun(CasOperation & op, const String & key);
 
-/// The row rules of one GC shard's source-edge runs, read in order across its segments. `check` throws
-/// `CORRUPTED_DATA` for an edge at the sentinel source id 0, a second sentinel row for one blob, or a sentinel marker
-/// at another source id. The fold's merge applies it to every row it reads.
-class SourceEdgeRowChecker
+/// What the rows of inherited source-edge runs are checked against: the pool's GC shard count, and the round of the
+/// `gc/state` that adopted the fold seal naming the runs.
+struct AdoptedRunContext
+{
+    uint64_t gc_shards = 0;
+    uint64_t parent_round = 0;
+};
+
+/// Reads the source-edge runs a GC shard inherits from its parent fold seal. It opens each run typed,
+/// checks every raw row before the caller sees it, and verifies the seal checksum of each run once it is drained.
+/// A row is refused with `CORRUPTED_DATA` when it is an edge at the sentinel source id 0, a sentinel marker at another
+/// source id, a second sentinel row of one blob, a blob of another shard, below the previous row in
+/// `(BlobRef, source_id)` order, or a condemned row stamped after the parent round.
+class AdoptedRunReader
 {
 public:
-    void check(const SourceEdgeRecord & rec);
+    /// `runs` are the parent seal's runs of `shard`, in seal order; the reader borrows them.
+    AdoptedRunReader(CasOperation & op_, const std::vector<RunRef> & runs_, uint64_t shard_, AdoptedRunContext context_);
+
+    /// The next row of the open run; false once that run's trailer is consumed, or before the first `openNextRun`.
+    bool nextInRun(SourceEdgeRecord & rec);
+    /// Verifies the drained open run against its seal checksum and opens the next one; false when no run is left.
+    bool openNextRun();
+    /// The next row of any run; false once every run is drained and verified.
+    bool next(SourceEdgeRecord & rec);
+    /// The run the last row or refusal came from.
+    const RunRef & currentRun() const;
 
 private:
+    void checkRow(const SourceEdgeRecord & rec);
+
+    CasOperation & op;
+    const std::vector<RunRef> & runs;
+    const uint64_t shard;
+    const AdoptedRunContext context;
+
+    size_t next_run = 0;
+    std::optional<SourceEdgeRunView> view;
+    bool drained = false;
+    std::optional<std::pair<BlobRef, UInt128>> previous_key;
     /// Rows are sorted, so two sentinel rows of one blob are adjacent among the sentinels.
     std::optional<BlobRef> last_sentinel_blob;
 };
@@ -508,7 +539,8 @@ struct ShardFoldOptions
 /// write-once run under `blobTargetRunKey(new_generation, attempt, shard, 0)`, and return its `RunRef`.
 /// Streaming: both inputs are merged in `(blob, source_id)` order, and an edge present twice is one
 /// edge, so a re-fold is idempotent. `prior_runs` are the parent seal's exact references for `shard`; empty is
-/// an empty baseline. A blob whose edge set becomes empty is written as a zero-marker row for `zeroInDegree`.
+/// an empty baseline. They are read through `AdoptedRunReader` with `parent`; a pass that condemns stamps its rows
+/// later than `parent.parent_round`. A blob whose edge set becomes empty is written as a zero-marker row for `zeroInDegree`.
 /// The prior run's `RunMarker::Condemned` rows ride the source-edge run at the zero-sentinel key
 /// (`source_id = 0`), so the prior run is also the retired input.
 /// Each blob is decided when the merge closes it, after the round's cut and before the output run is written,
@@ -529,7 +561,7 @@ struct ShardFoldOptions
 /// The merge comparator is exactly `(ref.algo, ref.digest, source_id)` (that is, `BlobRef::operator<`
 /// followed by `source_id`), which is also the raw key order produced by `SourceEdgeKeyCodec`.
 RunRef foldDeltasIntoGeneration(CasOperation & op, const Layout & layout, const std::vector<RunRef> & prior_runs,
-                                uint64_t new_generation, uint64_t attempt, uint64_t shard,
+                                AdoptedRunContext parent, uint64_t new_generation, uint64_t attempt, uint64_t shard,
                                 std::vector<BlobDelta> scattered, ShardFoldOptions options = {});
 
 /// Stream the sealed in-degree runs named by `runs` (the current seal's `blob_target_runs` filtered to one

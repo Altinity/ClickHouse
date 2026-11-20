@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasIntentRules.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobDigest.h>
@@ -48,24 +49,15 @@ const UInt128 kZeroSourceId{0};
 /// Bounds memory, not requests.
 constexpr size_t kHeldRunRecords = 16384;
 
-/// Streams a shard's prior source-edge run with one block resident, plus up to `kPendingHeadLookaheadRows`
-/// decoded rows while a pending-row scan is buffering: chains the run SEGMENTS the caller resolved from the
-/// parent seal (`blob_target_runs` filtered to one shard) and exposes the next row to the fold merge. The
-/// prior run carries
-/// BOTH surviving edges (`RunMarker::Edge`) AND the retired `RunMarker::Condemned` sentinel rows at the zero source id,
-/// so the cursor stops at edges AND at condemned rows (exposing the type via `rowType`), while zero-marker
-/// sentinels are dropped on carry (per-generation, never carried forward). Row/key invariants are enforced
-/// while streaming: `RunMarker::Edge` never at `source_id = 0`; sentinel rows (`RunMarker::Zero` /
-/// `RunMarker::Condemned`) ONLY at `source_id = 0`; at most one sentinel per blob. Resolution uses the exact object references supplied by the caller, so a run
-/// sealed for generation G that physically lives under an older generation's key is reached
-/// without key construction. An empty `segments` is the fresh-pool / empty baseline. The row stream is
-/// globally sorted by (blob_hash, source_id), so `key()` values are non-decreasing.
+/// Streams a shard's prior source-edge runs for the fold merge, plus up to `kPendingHeadLookaheadRows` decoded rows
+/// while a pending-row scan is buffering. Rows come from `AdoptedRunReader`, which checks them; this cursor only drops
+/// zero markers, which are per-generation and never carried, and exposes surviving edges and condemned rows in
+/// `(blob, source_id)` order. An empty `segments` is the fresh-pool / empty baseline.
 class PriorEdgeCursor
 {
 public:
-    /// The key codec is stateless and self-describing, so a run may freely mix supported hash algorithms.
-    PriorEdgeCursor(CasOperation & op_, const std::vector<RunRef> & segments_)
-        : op(op_), segments(segments_)
+    PriorEdgeCursor(CasOperation & op, const std::vector<RunRef> & segments, uint64_t shard, AdoptedRunContext parent)
+        : runs(op, segments, shard, parent)
     {
         advance();
     }
@@ -78,8 +70,7 @@ public:
     /// The decoded retired sentinel for the current row (only valid when `rowType() == RunMarker::Condemned`).
     const CondemnedRow & condemnedRow() const { return current.condemned; }
 
-    /// Advance to the next surviving edge OR retired sentinel, dropping zero markers, enforcing the
-    /// row/key invariants, and crossing segment boundaries.
+    /// Advance to the next surviving edge OR retired sentinel, crossing run boundaries.
     void advance()
     {
         if (!lookahead.empty())
@@ -95,40 +86,26 @@ public:
         current_offered = false;
         while (true)
         {
-            if (reader)
+            if (auto row = pullRow())
             {
-                if (auto row = pullRow())
-                {
-                    current = std::move(*row);
-                    has_current = true;
-                    return;
-                }
-                /// Segment fully drained: verify its whole-file checksum against
-                /// the seal's RunRef.checksum BEFORE the fold acts on any of its rows. This is the fold —
-                /// the checksum's most important consumer (it decides deletions). Fail-closed on mismatch.
-                reader->verifyAgainst(segments[seg_idx].checksum);
-                reader.reset();
-                ++seg_idx;
+                current = std::move(*row);
+                has_current = true;
+                return;
             }
-
-            /// Open the next resolved segment; the segment list is exhausted => the chain is done.
-            if (seg_idx >= segments.size())
+            /// The drained run's checksum is verified here, before the fold acts on any row of the next one.
+            if (!runs.openNextRun())
             {
                 has_current = false;
                 return;
             }
-            /// Typed open validates the NDJSON header before any row is consumed. Each row carries its
-            /// own algorithm byte, so no separate width gate is needed.
-            reader = openSourceEdgeRun(op, segments[seg_idx].key);
-            reader_drained = false;
         }
     }
 
     /// Offers the condemned rows from the current row onward, in order, each until `offer` accepts it: rows
-    /// of the OPEN segment are decoded into a buffer of at most `max_rows`. Stops when `offer` returns false
-    /// (that row is offered again next time), the buffer is full, or the open segment ends: opening the next segment,
-    /// and verifying the checksum of the one that ends, stay with `advance`. Rows are validated as `advance`
-    /// validates them, so a corrupt row throws here a few rows early.
+    /// of the OPEN run are decoded into a buffer of at most `max_rows`. Stops when `offer` returns false
+    /// (that row is offered again next time), the buffer is full, or the open run ends: opening the next run,
+    /// and verifying the checksum of the one that ends, stay with `advance`. Rows are checked as `advance`
+    /// checks them, so a corrupt row throws here a few rows early.
     void scanAhead(size_t max_rows, const std::function<bool(const BlobRef &, const CondemnedRow &)> & offer)
     {
         if (has_current && !current_offered)
@@ -143,7 +120,7 @@ public:
                 return;
             ++offered_ahead;
         }
-        while (reader && lookahead.size() < max_rows)
+        while (lookahead.size() < max_rows)
         {
             auto row = pullRow();
             if (!row)
@@ -171,51 +148,96 @@ private:
         return offer(row.ref, row.condemned);
     }
 
-    /// The next surviving edge or retired sentinel of the open segment, validated; nullopt once it is drained.
+    /// The next surviving edge or retired sentinel of the open run; nullopt once it is drained.
     std::optional<Row> pullRow()
     {
-        if (reader_drained)
-            return std::nullopt;
         SourceEdgeRecord rec;
-        while (reader->next(rec))
+        while (runs.nextInRun(rec))
         {
-            row_checker.check(rec);
-            if (rec.source_id == kZeroSourceId)
-            {
-                if (rec.marker == RunMarker::Zero)
-                    continue;   // A zero marker is per-generation and is dropped on carry.
-                /// A retired sentinel: surface it (settled at close-out, not an edge).
+            if (rec.marker == RunMarker::Zero)
+                continue;
+            if (rec.marker == RunMarker::Condemned)
                 return Row{.key = SourceEdgeKeyCodec::key(rec.ref, rec.source_id), .ref = rec.ref,
                            .type = RunMarker::Condemned, .condemned = condemnedRowOf(rec)};
-            }
             return Row{.key = SourceEdgeKeyCodec::key(rec.ref, rec.source_id), .ref = rec.ref,
                        .type = RunMarker::Edge, .condemned = {}};
         }
-        reader_drained = true;
         return std::nullopt;
     }
 
-    CasOperation & op;
-    const std::vector<RunRef> & segments;
-
-    size_t seg_idx = 0;
-    std::optional<SourceEdgeRunView> reader;
-    /// The open segment returned its last row; `advance` verifies it and opens the next.
-    bool reader_drained = false;
+    AdoptedRunReader runs;
     Row current;
     bool has_current = false;
     bool current_offered = false;
     /// Rows decoded ahead of `current`; the first `offered_ahead` of them were offered.
     std::deque<Row> lookahead;
     size_t offered_ahead = 0;
-
-    SourceEdgeRowChecker row_checker;
 };
 
 }
 
-void SourceEdgeRowChecker::check(const SourceEdgeRecord & rec)
+AdoptedRunReader::AdoptedRunReader(CasOperation & op_, const std::vector<RunRef> & runs_, uint64_t shard_,
+                                   AdoptedRunContext context_)
+    : op(op_), runs(runs_), shard(shard_), context(context_)
 {
+}
+
+bool AdoptedRunReader::nextInRun(SourceEdgeRecord & rec)
+{
+    if (!view || drained)
+        return false;
+    if (!view->next(rec))
+    {
+        drained = true;
+        return false;
+    }
+    checkRow(rec);
+    return true;
+}
+
+bool AdoptedRunReader::openNextRun()
+{
+    if (view)
+    {
+        chassert(drained);
+        view->verifyAgainst(currentRun().checksum);
+        view.reset();
+    }
+    if (next_run >= runs.size())
+        return false;
+    drained = false;
+    /// Typed open validates the NDJSON header before any row is consumed.
+    view = openSourceEdgeRun(op, runs[next_run++].key);
+    return true;
+}
+
+bool AdoptedRunReader::next(SourceEdgeRecord & rec)
+{
+    while (!nextInRun(rec))
+        if (!openNextRun())
+            return false;
+    return true;
+}
+
+const RunRef & AdoptedRunReader::currentRun() const
+{
+    chassert(next_run > 0);
+    return runs[next_run - 1];
+}
+
+void AdoptedRunReader::checkRow(const SourceEdgeRecord & rec)
+{
+    /// The merge decides a blob from the rows of its own shard alone, and assumes them sorted.
+    if (blobShard(rec.ref, context.gc_shards) != shard)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS source-edge run: blob {} belongs to GC shard {} of {}, not to shard {} whose run holds it",
+            blobIdOf(rec.ref), blobShard(rec.ref, context.gc_shards), context.gc_shards, shard);
+    const std::pair<BlobRef, UInt128> key{rec.ref, rec.source_id};
+    if (previous_key && key < *previous_key)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS source-edge run: the row of blob {} source {} sorts before the row above it",
+            blobIdOf(rec.ref), u128ToHex(rec.source_id));
+    previous_key = key;
     if (rec.source_id == kZeroSourceId)
     {
         /// A sentinel key carries exactly one row per blob and never an edge.
@@ -226,13 +248,18 @@ void SourceEdgeRowChecker::check(const SourceEdgeRecord & rec)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "CAS source-edge run: duplicate sentinel row for one blob");
         last_sentinel_blob = rec.ref;
-        return;
     }
-    /// A non-sentinel key must carry a surviving edge and nothing else.
-    if (rec.marker != RunMarker::Edge)
+    else if (rec.marker != RunMarker::Edge)
+    {
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS source-edge run: sentinel row type 0x{:02x} at a non-sentinel key",
             static_cast<uint8_t>(rec.marker));
+    }
+    /// The parent round stamped every row it condemned; a later stamp would reach the rules on the cut that minted it.
+    if (rec.marker == RunMarker::Condemned && rec.condemn_round > context.parent_round)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS source-edge run: the row of blob {} is stamped with round {}, after the parent round {}",
+            blobIdOf(rec.ref), rec.condemn_round, context.parent_round);
 }
 
 UInt128 sourceEdgeId(const ManifestId & id, const String & path)
@@ -377,7 +404,7 @@ void putDeterministicArtifact(CasOperation & op, const String & key, const Strin
 }
 
 RunRef foldDeltasIntoGeneration(CasOperation & op, const Layout & layout, const std::vector<RunRef> & prior_runs,
-                                uint64_t new_generation, uint64_t attempt, uint64_t shard,
+                                AdoptedRunContext parent, uint64_t new_generation, uint64_t attempt, uint64_t shard,
                                 std::vector<BlobDelta> scattered, ShardFoldOptions options)
 {
     if (options.suppress_destructive && !options.intent_nominations.empty())
@@ -409,7 +436,7 @@ RunRef foldDeltasIntoGeneration(CasOperation & op, const Layout & layout, const 
     std::stable_sort(options.intent_nominations.begin(), options.intent_nominations.end(),
         [](const Layout::ParsedBlobIntentKey & a, const Layout::ParsedBlobIntentKey & b) { return a.ref < b.ref; });
 
-    PriorEdgeCursor cursor(op, prior_runs);
+    PriorEdgeCursor cursor(op, prior_runs, shard, parent);
 
     DB::WriteBufferFromOwnString out;
     SourceEdgeRunWriter writer(out);   // sorted NDJSON; byte-deterministic for write-once adoption
@@ -587,11 +614,6 @@ RunRef foldDeltasIntoGeneration(CasOperation & op, const Layout & layout, const 
     /// drops the row whatever its state, so no row outlives a cut that shows a reference.
     auto settleBlob = [&](const std::optional<RetiredEntry> & row)
     {
-        /// A destructive step on the cut that minted the row could miss a writer's edge.
-        if (row && row->condemn_round >= options.condemn_round)
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "CAS fold: the row of {} is stamped with round {}, not before this pass's round {}: a row minted in this "
-                "pass reached the rules", layout.blobKey(cur_blob), row->condemn_round, options.condemn_round);
         IntentRuleInput input;
         input.row = row;
         input.at_zero = cur_edges == 0;

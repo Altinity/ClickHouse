@@ -733,6 +733,12 @@ inline String encodeMinimalGcState(uint64_t round)
     return DB::Cas::encodeGcState(state);
 }
 
+/// The parent context of a direct `foldDeltasIntoGeneration` call.
+inline DB::Cas::AdoptedRunContext foldParent(uint64_t parent_round, uint64_t gc_shards = 1)
+{
+    return DB::Cas::AdoptedRunContext{.gc_shards = gc_shards, .parent_round = parent_round};
+}
+
 /// Inject condemned bookkeeping + gc/state directly (bypassing a real GC round) so a test can seed the
 /// GC ledger's condemned state at an arbitrary round. The entries are written into the adopted seal's
 /// shard run as `RunMarker::Condemned` sentinel rows at the zero source id -- the shape a real round
@@ -823,6 +829,95 @@ inline void injectRetire(
         (*operation).create(layout.gcStateKey(), state, DB::Cas::Retry::standard());
     else
         (*operation).replace(layout.gcStateKey(), state, existing_state->etag, DB::Cas::Retry::standard());
+}
+
+/// A source-edge run holding `records` in the order given; the writer refuses an unsorted run, so the record lines are
+/// taken from it one by one and joined here.
+inline String sourceEdgeRunBytesInOrder(const std::vector<DB::Cas::SourceEdgeRecord> & records)
+{
+    const auto encode = [](const std::vector<DB::Cas::SourceEdgeRecord> & sorted)
+    {
+        DB::WriteBufferFromOwnString out;
+        DB::Cas::SourceEdgeRunWriter writer(out);
+        for (const DB::Cas::SourceEdgeRecord & rec : sorted)
+            writer.append(rec);
+        writer.finish();
+        out.finalize();
+        return out.str();
+    };
+    const auto lines = [](const String & bytes)
+    {
+        std::vector<String> out;
+        size_t from = 0;
+        for (size_t eol = bytes.find('\n'); eol != String::npos; eol = bytes.find('\n', from))
+        {
+            out.push_back(bytes.substr(from, eol + 1 - from));
+            from = eol + 1;
+        }
+        return out;
+    };
+    const std::vector<String> empty_run = lines(encode({}));
+    const std::vector<String> counted_run = lines(encode(std::vector<DB::Cas::SourceEdgeRecord>(records.size(),
+        DB::Cas::SourceEdgeRecord{.source_id = DB::UInt128{1}})));
+    String bytes = empty_run.front();
+    for (const DB::Cas::SourceEdgeRecord & rec : records)
+        bytes += lines(encode({rec}))[1];
+    return bytes + counted_run.back();
+}
+
+/// Replaces the run of GC shard `shard` in the fold seal `gc/state` adopts by one holding `records` in the order given,
+/// under a new seal that keeps everything else of the adopted one. The shard's condemned summary counts the condemned
+/// records, so a round merges the shard. `gc/state` must exist; its round and lease are kept.
+inline void injectSourceEdgeRun(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, uint64_t shard,
+    const std::vector<DB::Cas::SourceEdgeRecord> & records)
+{
+    OperationForTest operation(backend);
+    const auto state_object = (*operation).read(layout.gcStateKey(), DB::Cas::Retry::standard());
+    if (!state_object)
+        throw std::runtime_error("injectSourceEdgeRun: gc/state is absent");
+    DB::Cas::GcState state = DB::Cas::decodeGcState(state_object->bytes);
+    DB::Cas::CasFoldSeal seal;
+    if (state.snap_generation != 0)
+    {
+        const auto adopted = (*operation).read(layout.foldSealKey(state.snap_generation, state.snap_attempt),
+                                               DB::Cas::Retry::standard());
+        if (!adopted)
+            throw std::runtime_error("injectSourceEdgeRun: the adopted fold seal is absent");
+        seal = DB::Cas::decodeFoldSeal(adopted->bytes);
+    }
+    const uint64_t generation = state.snap_generation + 1;
+    const uint64_t attempt = 1;
+    seal.generation = generation;
+    seal.parent_generation = state.snap_generation;
+
+    const String run_bytes = sourceEdgeRunBytesInOrder(records);
+    const String run_key = layout.blobTargetRunKey(generation, attempt, shard, 0);
+    DB::Cas::orThrow((*operation).create(run_key, run_bytes, DB::Cas::Retry::standard()), "seed the run at " + run_key);
+    std::erase_if(seal.blob_target_runs, [&](const DB::Cas::RunRef & run) { return run.shard == shard; });
+    seal.blob_target_runs.push_back(DB::Cas::RunRef{.key = run_key, .checksum = DB::Cas::sourceEdgeRunChecksum(run_bytes),
+                                                   .shard = shard, .key_generation = generation});
+    for (uint64_t s = 0; s < state.gc_shards; ++s)
+        seal.condemned_summary.try_emplace(s);
+    DB::Cas::CondemnedSummary summary;
+    for (const DB::Cas::SourceEdgeRecord & rec : records)
+    {
+        if (rec.marker != DB::Cas::RunMarker::Condemned)
+            continue;
+        ++summary.condemned_total;
+        if (rec.delete_pending)
+            ++summary.pending_total;
+        else
+            summary.oldest_nonpending_condemn_round = std::min(summary.oldest_nonpending_condemn_round, rec.condemn_round);
+    }
+    seal.condemned_summary[shard] = summary;
+    DB::Cas::orThrow((*operation).create(layout.foldSealKey(generation, attempt), DB::Cas::encodeFoldSeal(seal),
+                                         DB::Cas::Retry::standard()), "seed the fold seal");
+
+    state.snap_generation = generation;
+    state.snap_attempt = attempt;
+    DB::Cas::orThrow((*operation).replace(layout.gcStateKey(), DB::Cas::encodeGcState(state), state_object->etag,
+                                          DB::Cas::Retry::standard()), "point gc/state at the seeded seal");
 }
 
 /// Adopt a fold seal carrying a given per-gc-shard `condemned_summary` and point

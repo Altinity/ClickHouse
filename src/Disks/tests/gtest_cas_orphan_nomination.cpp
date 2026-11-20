@@ -182,7 +182,7 @@ ReadyFixture makeReadyFixture()
     std::vector<RunRef> runs;
     RetiredMergeResult retired;
     runs.push_back(foldDeltasIntoGeneration(
-        seed_op, f.store->layout(), seal.blob_target_runs, new_generation, new_attempt, /*shard=*/0,
+        seed_op, f.store->layout(), seal.blob_target_runs, foldParent(state.round), new_generation, new_attempt, /*shard=*/0,
         std::move(seeded_edges),
         {.current_round = state.round, .condemn_round = state.round, .out_retired = &retired}));
     seal.parent_generation = state.snap_generation;
@@ -336,14 +336,14 @@ TEST(CASOrphanNomination, SourceRetirementIsAccountingNeutral)
     const UInt128 source = UInt128(0xA002);
     std::vector<RunRef> parent_runs;
     parent_runs.push_back(foldDeltasIntoGeneration(
-        op, layout, {}, /*new_generation=*/1, /*attempt=*/1, /*shard=*/0,
+        op, layout, {}, foldParent(0), /*new_generation=*/1, /*attempt=*/1, /*shard=*/0,
         {BlobDelta{.ref = blob, .source_id = source, .remove = false}}));
 
     std::vector<RunRef> next_runs;
     RetiredMergeResult retired;
     std::vector<uint8_t> applied{0x5A};
     next_runs.push_back(foldDeltasIntoGeneration(
-        op, layout, parent_runs, /*new_generation=*/2, /*attempt=*/2, /*shard=*/0, {},
+        op, layout, parent_runs, foldParent(0), /*new_generation=*/2, /*attempt=*/2, /*shard=*/0, {},
         ShardFoldOptions{
             .current_round = 1,
             .condemn_round = 1,

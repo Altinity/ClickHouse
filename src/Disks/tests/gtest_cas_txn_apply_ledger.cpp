@@ -7,6 +7,7 @@
 #include <Disks/tests/cas_test_helpers.h>
 
 using namespace DB::Cas;
+using DB::Cas::tests::foldParent;
 
 namespace
 {
@@ -110,7 +111,7 @@ TEST(CASTxnApplyLedger, ReducerMarksTheOrdinalOfEveryDeltaItConsumes)
     };
     std::vector<RunRef> runs;
     runs.push_back(foldDeltasIntoGeneration(
-        *operation, layout, /*prior_runs*/{}, /*new_generation*/1, /*attempt*/0, /*shard*/0, deltas,
+        *operation, layout, /*prior_runs*/{}, foldParent(0), /*new_generation*/1, /*attempt*/0, /*shard*/0, deltas,
         {.out_applied_by_txn_ordinal = &ledger.applied}));
 
     EXPECT_EQ(ledger.applied[routed], 1) << "the reducer consumed this transaction's deltas but did "
@@ -148,7 +149,7 @@ TEST(CASTxnApplyLedger, ReducerMarksAnUnmatchedRemovalDelta)
     std::vector<RunRef> runs;
     RetiredMergeResult merged;
     runs.push_back(foldDeltasIntoGeneration(
-        *operation, layout, /*prior_runs*/{}, /*new_generation*/1, /*attempt*/0, /*shard*/0, deltas,
+        *operation, layout, /*prior_runs*/{}, foldParent(0), /*new_generation*/1, /*attempt*/0, /*shard*/0, deltas,
         {.out_retired = &merged, .out_applied_by_txn_ordinal = &ledger.applied}));
 
     EXPECT_EQ(merged.unmatched_removes, 1u) << "the fixture must actually stage an unmatched removal";

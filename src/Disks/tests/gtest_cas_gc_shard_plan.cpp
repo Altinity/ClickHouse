@@ -136,9 +136,9 @@ TEST(CASGCShardFold, MergesDeltasToInDegree)
     std::vector<RunRef> runs0;
     std::vector<RunRef> runs1;
     runs0.push_back(foldDeltasIntoGeneration(
-        op, layout, /*prior_runs=*/{}, /*new_generation=*/1, /*attempt=*/0, /*shard=*/0, std::move(buckets[0])));
+        op, layout, /*prior_runs=*/{}, foldParent(0, 2), /*new_generation=*/1, /*attempt=*/0, /*shard=*/0, std::move(buckets[0])));
     runs1.push_back(foldDeltasIntoGeneration(
-        op, layout, /*prior_runs=*/{}, /*new_generation=*/1, /*attempt=*/0, /*shard=*/1, std::move(buckets[1])));
+        op, layout, /*prior_runs=*/{}, foldParent(0, 2), /*new_generation=*/1, /*attempt=*/0, /*shard=*/1, std::move(buckets[1])));
 
     ASSERT_EQ(runs0.size(), 1u) << "shard-0 reduce must produce exactly one RunRef";
     ASSERT_EQ(runs1.size(), 1u) << "shard-1 reduce must produce exactly one RunRef";
@@ -278,7 +278,7 @@ TEST(CASGCShardCoordinator, ShardedFoldRoutesDeltasToOwningShards)
     for (uint64_t shard = 0; shard < kGcShards; ++shard)
     {
         shard_runs[shard].push_back(foldDeltasIntoGeneration(
-            op, layout, /*prior_runs=*/{}, /*new_generation=*/1, /*attempt=*/0, shard, std::move(buckets[shard])));
+            op, layout, /*prior_runs=*/{}, foldParent(0, kGcShards), /*new_generation=*/1, /*attempt=*/0, shard, std::move(buckets[shard])));
     }
 
     EXPECT_EQ(inDegreeInRuns(*backend, shard_runs[0], b0), 1)
@@ -450,13 +450,13 @@ TEST(CASGCShardTwoReplica, DisjointShardsConcurrentPerShardRuns)
     /// Run shard-0 reducer (simulates the shard-0 replica's work).
     std::vector<RunRef> runs0;
     runs0.push_back(foldDeltasIntoGeneration(
-        op, layout, /*prior_runs=*/{}, kNewGen, kAttempt, /*shard=*/0, std::move(bucket0)));
+        op, layout, /*prior_runs=*/{}, foldParent(0, 2), kNewGen, kAttempt, /*shard=*/0, std::move(bucket0)));
     ASSERT_FALSE(runs0.empty()) << "shard-0 reducer must produce at least one RunRef";
 
     /// Run shard-1 reducer (simulates the shard-1 replica's work, interleaved from the test thread).
     std::vector<RunRef> runs1;
     runs1.push_back(foldDeltasIntoGeneration(
-        op, layout, /*prior_runs=*/{}, kNewGen, kAttempt, /*shard=*/1, std::move(bucket1)));
+        op, layout, /*prior_runs=*/{}, foldParent(0, 2), kNewGen, kAttempt, /*shard=*/1, std::move(bucket1)));
     ASSERT_FALSE(runs1.empty()) << "shard-1 reducer must produce at least one RunRef";
 
     /// The blob-target runs for both shards are durably present (the reducer's write-once `putIfAbsent`),

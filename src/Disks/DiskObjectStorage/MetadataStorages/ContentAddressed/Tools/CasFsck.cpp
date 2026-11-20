@@ -666,15 +666,18 @@ struct PendingVerdict
 
 /// A `pending` row is the one state GC deletes a body from without re-reading the intent, so the intent is read
 /// here. A read that fails is `intent_unread`: not an absent intent, and no verdict.
-PendingVerdict checkPendingRow(CasOperation & op, const Layout & layout, const BlobRef & ref, const CondemnedRow & row, FsckReport & report)
+PendingVerdict checkPendingRow(CasOperation & op, const Layout & layout, const BlobRef & ref, const CondemnedRow & row,
+                               const Deadline & deadline, FsckReport & report)
 {
     const std::optional<CanonicalIdentity> identity = row.token.canonical();
     if (!identity)
         return {FsckClass::PendingTokenRejected, "delete_pending: the row's token has no canonical identity, so no intent key exists for it"};
     try
     {
+        checkDeadline(deadline, "checking pending rows");
         if (op.read(layout.blobIntentKey(ref, *identity), Retry::standard()))
             return {FsckClass::PendingGc, "delete_pending: the deletion intent is present; GC deletes the body in a later round (expected)"};
+        checkDeadline(deadline, "checking pending rows");
         const std::optional<Meta> body = op.head(layout.blobKey(ref), Retry::standard());
         if (body && sameIncarnation(row.token, body->etag))
             return {FsckClass::PendingWithoutIntent, {}};
@@ -1320,6 +1323,8 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         FsckClass cls = FsckClass::Unaccounted;
         String note;
         const auto rit = retired_by_hash.find(hash);
+        if (rit != retired_by_hash.end())
+            checkDeadline(deadline, "classifying unreferenced bodies");
         /// HEAD only for a hash the snapshot actually retired, so an unretired blob still costs no request.
         const std::optional<Meta> retired_head
             = rit != retired_by_hash.end() ? op.head(bkey, Retry::standard()) : std::nullopt;
@@ -1347,7 +1352,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             else
             {
                 pending_rows_checked.insert(hash);
-                PendingVerdict verdict = checkPendingRow(op, layout, hash, row, report);
+                PendingVerdict verdict = checkPendingRow(op, layout, hash, row, deadline, report);
                 if (verdict.cls == FsckClass::PendingWithoutIntent)
                 {
                     suspects.push_back(PendingSuspect{bkey, sz, hash, row.token});
@@ -1429,8 +1434,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             continue;
         const String bkey = layout.blobKey(ref);
         const bool referenced = reachable_blobs.contains(bkey);
-        checkDeadline(deadline, "checking pending rows");
-        PendingVerdict verdict = checkPendingRow(op, layout, ref, row, report);
+        PendingVerdict verdict = checkPendingRow(op, layout, ref, row, deadline, report);
         const auto it = present_blobs.find(bkey);
         const uint64_t size = it != present_blobs.end() ? it->second : 0;
         if (verdict.cls == FsckClass::PendingWithoutIntent)

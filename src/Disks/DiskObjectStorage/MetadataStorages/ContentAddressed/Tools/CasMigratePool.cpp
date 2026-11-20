@@ -673,29 +673,26 @@ private:
                     "intent and before the floor", seal_key);
                 throw;
             }
-            /// Each shard's runs are checked in seal order, as GC's merge reads them.
-            std::map<uint64_t, SourceEdgeRowChecker> row_checkers;
+            std::vector<std::vector<RunRef>> runs_of_shard(meta.gc_shards);
             for (const RunRef & run : seal.blob_target_runs)
+                runs_of_shard[run.shard].push_back(run);
+            const AdoptedRunContext parent{.gc_shards = meta.gc_shards, .parent_round = state->round};
+            for (uint64_t shard = 0; shard < meta.gc_shards; ++shard)
             {
+                AdoptedRunReader reader(op, runs_of_shard[shard], shard, parent);
                 try
                 {
-                    SourceEdgeRunView view = openSourceEdgeRun(op, run.key);
-                    SourceEdgeRowChecker & row_checker = row_checkers[run.shard];
                     SourceEdgeRecord rec;
-                    while (view.next(rec))
-                    {
-                        row_checker.check(rec);
+                    while (reader.next(rec))
                         if (rec.marker == RunMarker::Condemned)
                             rows.push_back(InheritedRow{.ref = rec.ref, .token = rec.token, .pending = rec.delete_pending});
-                    }
-                    view.verifyAgainst(run.checksum);
                 }
                 catch (Exception & e)
                 {
                     if (e.code() != ErrorCodes::CORRUPTED_DATA)
                         throw;
                     e.addMessage("M3: GC of this build refuses the source-edge run `{}` of the fold seal that gc/state adopts. The run "
-                        "stopped before any intent and before the floor", run.key);
+                        "stopped before any intent and before the floor", reader.currentRun().key);
                     throw;
                 }
             }

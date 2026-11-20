@@ -2422,6 +2422,46 @@ TEST(CASFsck, PendingRowsWithoutIntentsAreFoundInEveryGcShard)
     EXPECT_FALSE(rep.clean());
 }
 
+/// The deadline is checked before each request for a present `pending` body: one that passes during the first row's
+/// `HEAD` stops the scan before that row's intent read and before any other row's requests.
+TEST(CASFsck, PresentPendingBodiesStopAtTheDeadline)
+{
+    const std::vector<uint64_t> blobs{1, 2, 3, 4};
+    FsckGcFixture f(/*create_budget=*/0, {1, 2, 3, 4});
+    f.drop();
+    f.round();
+    std::vector<String> intent_keys;
+    for (const uint64_t b : blobs)
+    {
+        ASSERT_TRUE(objectPresent(*f.backend, f.bodyKey(b))) << "fixture: the body is present";
+        intent_keys.push_back(f.intentKey(b));
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    /// The deadline is a point on the real steady clock, so the first body `HEAD` waits for that clock to pass it.
+    for (const uint64_t b : blobs)
+        f.backend->beforeHead(f.bodyKey(b), [deadline]
+        {
+            while (std::chrono::steady_clock::now() <= deadline)
+            {
+            }
+        });
+    f.backend->clearJournal();
+
+    expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, "during 'checking pending rows'", [&]
+    {
+        (void)runFsck(*f.store, /*detail=*/false, {}, deadline);
+    });
+    const auto journal = f.backend->journal();
+    size_t body_heads = 0;
+    size_t intent_reads = 0;
+    for (const uint64_t b : blobs)
+        body_heads += countKeyRequests(journal, JournalVerb::Head, f.bodyKey(b));
+    for (const String & key : intent_keys)
+        intent_reads += countKeyRequests(journal, JournalVerb::Read, key);
+    EXPECT_EQ(body_heads, 1u) << "a body HEAD was sent after the deadline";
+    EXPECT_EQ(intent_reads, 0u) << "an intent was read after the deadline";
+}
+
 /// The capability probe's scratch object under `blob-intents/_probe/` is not an intent and no finding.
 TEST(CASFsck, ProbeScratchObjectIsNoIntent)
 {

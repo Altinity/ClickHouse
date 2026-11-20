@@ -100,6 +100,24 @@ the log and in a `corrupt_decode` event of `system.cas_log` (see
 A specific blob's own story — was it ever condemned, spared, or is it not being seen at all — is the
 per-object query in the previous section, filtered to `object_kind = 'blob'`.
 
+### GC refuses its bookkeeping {#gc-bookkeeping-corrupt}
+
+The refusals below fail a round with `CORRUPTED_DATA`, and each message ends with
+`GC bookkeeping is corrupt: GC stops reclaiming on this pool; stored data is not affected`.
+
+| Message starts with | What GC found |
+|---|---|
+| `CAS GC: the adopted fold seal (generation <g>, attempt <a>) is missing under a live gc/state` | `gc/state` names a fold seal that is absent |
+| `CAS GC baseline guard: table <ns> has snapshot <id> but no surviving log` | A table has no sealed fold cursor, and its logs at or below its snapshot are gone |
+| `CAS GC fold: namespace <ns> sealed a cursor at <id> that does not close the run it walked` | A sealed cursor disagrees with the logs the round walked |
+| `CAS GC fold: <n> ref transaction(s) folded and merged into the round buffers but NONE of their blob deltas reached a shard reducer` | A folded transaction reached no reducer |
+| `CAS GC fold: the round sealed coverage over <n> ref log(s) but only <m> fully folded` | The coverage a round would seal exceeds what it folded |
+
+No repair for a pool whose GC has run is available in this build. `cas-gc-rebuild` works only on a pool whose GC
+never held the GC lease; on any other pool it refuses with `another GC leader holds the lease`.
+
+Collect what [What to collect before filing a bug](#filing-a-bug) lists before you change anything on the pool.
+
 ### What one GC round did {#gc-round-detail}
 
 Every round writes a `Start` and a `Finish` row to
@@ -328,7 +346,7 @@ data directory of a server that is running on the local backend.
 | `cas-fsck [--detail] [--timeout N] [--namespace PREFIX] [--partial] [--fix legacy-markers] [--verify-intents]` | The same reachability scan as `SYSTEM CAS FSCK`, offline. `--verify-intents` also reads every deletion intent and sends a `HEAD` for its body (two requests per intent; see [reading the intent classes](#fsck-intent-classes)). `--detail` adds a per-object `<class>\t<key>\t<size>` listing (`reachable`, `dangling`, `unreachable`, `pending-gc`, `awaiting-gc`, `unaccounted`, `stale-edge`, `corrupted-run`, `chain-broken`, `unchecked`, `lifeless-key`, `janitor-pending`, `intent-current`, `intent-replaced`, `intent-body-gone`, `intent-malformed`, `intent-unread`, `pending-without-intent`, `pending-intent-absent`, `pending-token-rejected`, `standing-present`, `legacy-marker`) — the only way to get per-object, not just per-pool, findings. `--timeout`/`--partial` bound a scan on a large pool, the intent loop and the `--fix` loop included; progress goes to stderr every 1000 keys. `--fix legacy-markers` deletes the legacy markers and nothing else; it needs a scan of the whole pool, so it cannot be combined with `--namespace`, and it is refused on a local object storage, where `cas-migrate-pool` removes them |
 | `cas-gc-dryrun` | Previews the next round's deletes, read-only, no lease. Over-reports away from quiescence (does not fold new owner events) — a diagnostic only, never a delete source |
 | `cas-inspect '<raw-object-key>'` | Decodes one raw object-storage key (as printed by `cas-fsck`/`cas-gc-dryrun`) straight to JSON |
-| `cas-gc-rebuild [--force]` | Disaster recovery: rebuilds a `gc/state` baseline from raw owner state after the GC guard has refused every regular round. `--force` bypasses only the healthy-state refusal, never a competing leader or a failed `CAS`. See [`SYSTEM CAS GC REBUILD`](/sql-reference/statements/system#system-cas-gc-rebuild) for the destructive-tool caveats. Before rebuilding a lost `gc/state`, stop or restart every server of the pool; a request sent before a server stopped can still reach the object store afterwards, and this rule does not cover it. |
+| `cas-gc-rebuild [--force]` | Rebuilds a `gc/state` baseline from raw owner state. It works only on a pool whose GC never held the GC lease; on any other pool it refuses with `another GC leader holds the lease` (see [GC refuses its bookkeeping](#gc-bookkeeping-corrupt)). `--force` bypasses only the healthy-state refusal, never a competing leader or a failed `CAS`. Before rebuilding a lost `gc/state`, stop or restart every server of the pool; a request sent before a server stopped can still reach the object store afterwards, and this rule does not cover it. |
 
 ```bash
 clickhouse-disks -C config.xml --disk cas cas-fsck --detail

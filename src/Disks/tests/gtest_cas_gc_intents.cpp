@@ -4553,14 +4553,14 @@ std::pair<int, String> roundWithAdoptedSealGone(StateHead answer, const String &
 }
 
 /// The pre-fold drain and the fold each read the adopted seal once more. A seal gone under a moved `gc/state` is a
-/// lost leadership, which no rebuild repairs; gone under an unchanged one it is corruption.
+/// lost leadership; gone under an unchanged one it is corruption. Neither message advises a command.
 TEST(CASGcIntents, AdoptedSealGoneAtTheDrainOrTheFoldIsALostLeadershipOnlyWhenTheStateMoved)
 {
     struct Site
     {
         const char * hide_after;
         const char * failure;
-        bool advises_rebuild_on_corruption;
+        bool states_the_consequence;
     };
     for (const Site site : {Site{"", "pre-fold drain: adopted parent seal", false},
                             Site{"parent_seal_read", "the adopted fold seal (generation", true}})
@@ -4575,7 +4575,9 @@ TEST(CASGcIntents, AdoptedSealGoneAtTheDrainOrTheFoldIsALostLeadershipOnlyWhenTh
         const auto [same_code, same_message] = roundWithAdoptedSealGone(StateHead::Store, site.hide_after);
         EXPECT_EQ(same_code, DB::ErrorCodes::CORRUPTED_DATA) << same_message;
         EXPECT_NE(same_message.find(site.failure), String::npos) << same_message;
-        EXPECT_EQ(same_message.find("cas-gc-rebuild") != String::npos, site.advises_rebuild_on_corruption) << same_message;
+        EXPECT_EQ(same_message.find("cas-gc-rebuild"), String::npos) << same_message;
+        EXPECT_EQ(same_message.find("GC stops reclaiming on this pool; stored data is not affected") != String::npos,
+                  site.states_the_consequence) << same_message;
     }
 }
 
@@ -5705,4 +5707,121 @@ TEST(CASGcRoundPoint, RebuildBetweenTheTwoRoundsOfARelayKeepsTheBody)
     EXPECT_TRUE(pool.bodyStored());
     const FsckReport report = runFsck(*pool.store, /*detail=*/true);
     EXPECT_EQ(report.dangling, 0u) << formatFsckSummary(report);
+}
+
+namespace
+{
+
+SourceEdgeRecord inheritedEdge(uint64_t b)
+{
+    return SourceEdgeRecord{.ref = blobRefOf(b), .source_id = DB::UInt128{7}, .marker = RunMarker::Edge};
+}
+
+/// A row for the body now at blob `b`, stamped `condemn_round`.
+SourceEdgeRecord inheritedRow(IntentPool<> & pool, uint64_t b, uint64_t condemn_round, bool pending = false)
+{
+    pool.writeBodies({b});
+    return SourceEdgeRecord{.ref = blobRefOf(b), .source_id = DB::UInt128{0}, .marker = RunMarker::Condemned,
+                            .delete_pending = pending, .token = PersistedEtag::capture(pool.bodyMeta(b)->etag), .size = 1,
+                            .condemn_round = condemn_round};
+}
+
+std::vector<SourceEdgeRecord> sortedRecords(std::vector<SourceEdgeRecord> records)
+{
+    std::sort(records.begin(), records.end(), [](const SourceEdgeRecord & l, const SourceEdgeRecord & r)
+    {
+        return std::pair{l.ref, l.source_id} < std::pair{r.ref, r.source_id};
+    });
+    return records;
+}
+
+struct InheritedRunRound
+{
+    int code = 0;
+    String message;
+    std::vector<Request> requests;
+    uint64_t parent_round = 0;
+    uint64_t round_after = 0;
+};
+
+/// One round over a seal whose run of `shard` holds the records `make_records` returns for the committed round.
+InheritedRunRound roundOverInheritedRun(IntentPool<> & pool, uint64_t shard,
+                                        const std::function<std::vector<SourceEdgeRecord>(uint64_t)> & make_records)
+{
+    pool.round();
+    InheritedRunRound result;
+    result.parent_round = committedRound(*pool.backend, pool.layout());
+    injectSourceEdgeRun(*pool.backend, pool.layout(), shard, make_records(result.parent_round));
+    pool.backend->clearJournal();
+    try
+    {
+        pool.round();
+    }
+    catch (const DB::Exception & e)
+    {
+        result.code = e.code();
+        result.message = e.message();
+    }
+    result.requests = blobRequests(pool.backend->journal());
+    result.round_after = committedRound(*pool.backend, pool.layout());
+    return result;
+}
+
+void expectRefusedAsCorrupt(const InheritedRunRound & round, std::string_view what)
+{
+    EXPECT_EQ(round.code, DB::ErrorCodes::CORRUPTED_DATA) << round.message;
+    EXPECT_NE(round.message.find(what), String::npos) << round.message;
+    EXPECT_EQ(round.round_after, round.parent_round) << "the refused round committed";
+    for (const auto & [verb, key] : round.requests)
+        EXPECT_TRUE(verb != JournalVerb::Remove && verb != JournalVerb::RemoveMany) << "the refused round deleted " << key;
+}
+
+}
+
+/// A live edge in the run of a shard that does not own its blob would leave the owning shard at zero.
+TEST(CASGcIntents, InheritedRunWithAMisplacedLiveEdgeIsRefusedAsCorrupt)
+{
+    auto pool = makePool({.gc_shards = 2});
+    const uint64_t own = blobsInShard(1, 2, 1).front();
+    const uint64_t foreign = blobsInShard(0, 2, 1).front();
+    const InheritedRunRound round = roundOverInheritedRun(pool, 1, [&](uint64_t parent_round)
+    {
+        return sortedRecords({inheritedRow(pool, own, parent_round), inheritedEdge(foreign)});
+    });
+    expectRefusedAsCorrupt(round, "belongs to GC shard 0 of 2, not to shard 1");
+}
+
+/// A `pending` row makes a row decision due, so the round merges the shard rather than defer it.
+TEST(CASGcIntents, InheritedRowStampedAfterTheParentRoundIsRefusedAsCorrupt)
+{
+    auto pool = makePool();
+    const InheritedRunRound round = roundOverInheritedRun(pool, 0, [&](uint64_t parent_round)
+    {
+        return std::vector<SourceEdgeRecord>{inheritedRow(pool, 1, parent_round + 1, /*pending*/ true)};
+    });
+    expectRefusedAsCorrupt(round, "after the parent round");
+}
+
+TEST(CASGcIntents, InheritedRowStampedWithTheParentRoundIsDecided)
+{
+    auto pool = makePool();
+    const InheritedRunRound round = roundOverInheritedRun(pool, 0, [&](uint64_t parent_round)
+    {
+        return std::vector<SourceEdgeRecord>{inheritedRow(pool, 1, parent_round)};
+    });
+    EXPECT_EQ(round.code, 0) << round.message;
+    EXPECT_EQ(round.round_after, round.parent_round + 1);
+    EXPECT_TRUE(isPending(pool.row(1))) << "the candidate's intent was created";
+}
+
+TEST(CASGcIntents, InheritedRunInDescendingOrderIsRefusedAsCorrupt)
+{
+    auto pool = makePool();
+    const InheritedRunRound round = roundOverInheritedRun(pool, 0, [&](uint64_t parent_round)
+    {
+        std::vector<SourceEdgeRecord> records = sortedRecords({inheritedRow(pool, 1, parent_round), inheritedEdge(2), inheritedEdge(3)});
+        std::swap(records[1], records[2]);
+        return records;
+    });
+    expectRefusedAsCorrupt(round, "sorts before the row above it");
 }

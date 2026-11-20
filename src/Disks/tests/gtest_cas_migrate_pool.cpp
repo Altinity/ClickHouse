@@ -1867,15 +1867,16 @@ TEST(CASMigratePool, CatalogNamedSilentSlotMissingFromTheListingIsFenced)
     EXPECT_TRUE(f.slotBody("srv-x")->gc_fenced);
 }
 
+/// Blobs 1 and 3 belong to shard 1 of 2.
 TEST(CASMigratePool, RowsOfAShardAboveZeroAreMigrated)
 {
     Fixture f(3, /*gc_shards*/ 2);
     f.editGcState([](GcState & state) { state.gc_shards = 2; });
     f.body(1);
-    f.body(2);
+    f.body(3);
     const RetiredEntry candidate = f.row(1, /*pending*/ false);
-    const RetiredEntry pending_absent = f.row(2, /*pending*/ true);
-    f.removeBody(2);
+    const RetiredEntry pending_absent = f.row(3, /*pending*/ true);
+    f.removeBody(3);
     f.rows({candidate, pending_absent}, G_REF_CHAIN, /*shard*/ 1);
     ASSERT_EQ(currentRetiredSet(*f.backend, f.layout, 1).size(), 2u);
     ASSERT_TRUE(currentRetiredSet(*f.backend, f.layout, 0).empty());
@@ -1884,7 +1885,7 @@ TEST(CASMigratePool, RowsOfAShardAboveZeroAreMigrated)
     ASSERT_TRUE(report.completed);
     EXPECT_EQ(report.condemned_rows, 2u);
     EXPECT_TRUE(f.hasIntent(1, f.identity(1))) << "candidate row of shard 1";
-    EXPECT_TRUE(f.hasIntent(2, *pending_absent.token.canonical())) << "pending row of shard 1 over an absent body";
+    EXPECT_TRUE(f.hasIntent(3, *pending_absent.token.canonical())) << "pending row of shard 1 over an absent body";
     EXPECT_EQ(f.intents().size(), 2u);
     EXPECT_EQ(currentRetiredSet(*f.backend, f.layout, 1).size(), 2u) << "the rows are carried";
 }
@@ -1931,6 +1932,82 @@ TEST(CASMigratePool, RunWithADuplicateCondemnedRowIsRefusedBeforeAnyWrite)
     EXPECT_TRUE(contains(lines, "M2:")) << "positive control: the run reached M3";
     EXPECT_EQ(mutationsOutsideTheProbes(f.backend->journal(), f), std::vector<String>{});
     EXPECT_EQ(objectsOf(f), before);
+}
+
+namespace
+{
+
+SourceEdgeRecord condemnedRecord(const RetiredEntry & row)
+{
+    return SourceEdgeRecord{.ref = row.ref, .source_id = DB::UInt128{0}, .marker = RunMarker::Condemned,
+                            .delete_pending = row.delete_pending, .token = row.token, .size = row.size,
+                            .condemn_round = row.condemn_round};
+}
+
+/// The run stops at M3, before any intent and before the floor, with the pool as it was.
+void expectInheritedRunRefused(Fixture & f, std::string_view what)
+{
+    const auto before = objectsOf(f);
+    f.backend->clearJournal();
+
+    std::vector<String> lines;
+    const String message = messageOf(DB::ErrorCodes::CORRUPTED_DATA, [&] { f.run({}, &lines); });
+
+    EXPECT_NE(message.find(what), String::npos) << message;
+    EXPECT_NE(message.find("M3: GC of this build refuses the source-edge run"), String::npos) << message;
+    EXPECT_TRUE(contains(lines, "M2:")) << "positive control: the run reached M3";
+    EXPECT_EQ(mutationsOutsideTheProbes(f.backend->journal(), f), std::vector<String>{});
+    EXPECT_EQ(objectsOf(f), before);
+}
+
+}
+
+/// Blob 2 belongs to shard 0 of 2, so its live edge in the run of shard 1 is invisible to the shard that decides it.
+TEST(CASMigratePool, MisplacedLiveEdgeIsRefusedBeforeAnyWrite)
+{
+    Fixture f(3, /*gc_shards*/ 2);
+    f.editGcState([](GcState & state) { state.gc_shards = 2; });
+    f.body(1);
+    f.rows({});
+    injectSourceEdgeRun(*f.backend, f.layout, /*shard*/ 1,
+        {condemnedRecord(f.row(1, /*pending*/ true)),
+         SourceEdgeRecord{.ref = blobRefOf(2), .source_id = DB::UInt128{7}, .marker = RunMarker::Edge}});
+    expectInheritedRunRefused(f, "belongs to GC shard 0 of 2, not to shard 1");
+}
+
+/// `gc/state` is at round 5.
+TEST(CASMigratePool, RowStampedAfterTheParentRoundIsRefusedBeforeAnyWrite)
+{
+    Fixture f(3);
+    f.body(1);
+    RetiredEntry row = f.row(1, /*pending*/ true);
+    row.condemn_round = 6;
+    f.rows({row});
+    expectInheritedRunRefused(f, "stamped with round 6, after the parent round 5");
+}
+
+TEST(CASMigratePool, RowStampedWithTheParentRoundIsMigrated)
+{
+    Fixture f(3);
+    f.body(1);
+    RetiredEntry row = f.row(1, /*pending*/ true);
+    row.condemn_round = 5;
+    f.rows({row});
+    const MigratePoolReport report = f.run();
+    ASSERT_TRUE(report.completed);
+    EXPECT_EQ(report.condemned_rows, 1u);
+    EXPECT_TRUE(f.hasIntent(1, f.identity(1)));
+}
+
+TEST(CASMigratePool, RunInDescendingOrderIsRefusedBeforeAnyWrite)
+{
+    Fixture f(3);
+    f.body(1);
+    f.body(2);
+    f.rows({});
+    injectSourceEdgeRun(*f.backend, f.layout, /*shard*/ 0,
+        {condemnedRecord(f.row(2, /*pending*/ true)), condemnedRecord(f.row(1, /*pending*/ true))});
+    expectInheritedRunRefused(f, "sorts before the row above it");
 }
 
 /// A `gc/state` whose shard count disagrees with `_pool_meta` is refused by the GC lease, so the run stops at M3.
