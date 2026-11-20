@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Tags: no-fasttest
-# no-fasttest: `--jwt` and `--oauth-client-secret` need a build with jwt-cpp and SSL.
+# no-fasttest: `--jwt` needs a build with jwt-cpp and SSL.
+# Note: `--oauth-client-secret` (cleared upstream as well) is not an option of clickhouse-client in this branch.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -65,15 +66,15 @@ JWT='eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.SECRET'
 
 echo "client, separate values"
 show_credential_options ${CLICKHOUSE_CLIENT_BINARY} --host 127.0.0.1 --port "$PORT" --query "SELECT 1" \
-    --jwt "$JWT" --password SECRET --ssh-key-passphrase SECRET --one-time-password SECRET --oauth-client-secret SECRET
+    --jwt "$JWT" --password SECRET --ssh-key-passphrase SECRET --one-time-password SECRET
 
 echo "client, values after ="
 show_credential_options ${CLICKHOUSE_CLIENT_BINARY} --host 127.0.0.1 --port "$PORT" --query "SELECT 1" \
-    --jwt="$JWT" --password=SECRET --ssh-key-passphrase=SECRET --one-time-password=SECRET --oauth-client-secret=SECRET
+    --jwt="$JWT" --password=SECRET --ssh-key-passphrase=SECRET --one-time-password=SECRET
 
 echo "client, values after spaced ="
 show_credential_options ${CLICKHOUSE_CLIENT_BINARY} --host 127.0.0.1 --port "$PORT" --query "SELECT 1" \
-    --jwt = "$JWT" --password = SECRET --ssh-key-passphrase = SECRET --one-time-password = SECRET --oauth-client-secret = SECRET
+    --jwt = "$JWT" --password = SECRET --ssh-key-passphrase = SECRET --one-time-password = SECRET
 
 echo "client, --password without a value"
 show_credential_options ${CLICKHOUSE_CLIENT_BINARY} --host 127.0.0.1 --port "$PORT" --query "SELECT 1" \
