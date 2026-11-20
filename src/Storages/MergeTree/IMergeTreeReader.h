@@ -54,7 +54,10 @@ public:
 
     /// If part metadata is not equal to storage metadata,
     /// then try to perform conversions of columns.
-    void performRequiredConversions(Columns & res_columns) const;
+    void performRequiredConversions(Columns & res_columns, const Block & additional_columns = {}) const;
+
+    /// True if a Nullable to non-Nullable conversion may need DEFAULT inputs read by previous steps
+    bool conversionsNeedAdditionalColumns() const { return conversions_need_additional_columns; }
 
     ALWAYS_INLINE const NamesAndTypesList & getColumns() const { return data_part_info_for_read->isWidePart() ? converted_requested_columns : original_requested_columns; }
     size_t numColumnsInResult() const { return getColumns().size(); }
@@ -130,6 +133,8 @@ private:
 
     /// Fields of virtual columns that were filled in previous stages.
     VirtualFields virtual_fields;
+
+    bool conversions_need_additional_columns = false;
 };
 
 }
