@@ -827,19 +827,17 @@ void TCPHandler::runImpl()
 
                     try
                     {
-                        /// Held across the enabled check and `sendReadTaskRequest`. The block ends
-                        /// before the response read, so `stopSwarmMode` does not wait out
-                        /// `receive_timeout`. Releasing the lock before the send would let stop
-                        /// return and then this callback still send one more request.
+                        /// `runWithSwarmTaskAdmission` holds the admission lock across the check and the
+                        /// send, then releases it. The response read below must not hold the lock.
+                        if (query_state->query_context)
                         {
-                            std::shared_lock<SharedMutex> admission;
-                            if (query_state->query_context)
-                            {
-                                admission = query_state->query_context->lockSwarmMode();
-                                if (server.isCancelled() || !query_state->query_context->isSwarmModeEnabled())
-                                    return std::make_shared<ClusterFunctionReadTaskResponse>();
-                            }
-
+                            const bool sent = query_state->query_context->runWithSwarmTaskAdmission(
+                                server.isCancelled(), [this]() TSA_NO_THREAD_SAFETY_ANALYSIS { sendReadTaskRequest(); });
+                            if (!sent)
+                                return std::make_shared<ClusterFunctionReadTaskResponse>();
+                        }
+                        else
+                        {
                             sendReadTaskRequest();
                         }
 
