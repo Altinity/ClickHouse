@@ -31,8 +31,6 @@ else()
     set(RECONFIGURE_MESSAGE_LEVEL WARNING)
 endif()
 
-add_compile_options(-Wframe-larger-than=131072)
-
 include (cmake/arch.cmake)
 include (cmake/target.cmake)
 include (cmake/tools.cmake)
