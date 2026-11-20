@@ -109,11 +109,9 @@ TEST(CASTxnApplyLedger, ReducerMarksTheOrdinalOfEveryDeltaItConsumes)
         {bh(2), s(1), /*remove*/false, routed},
     };
     std::vector<RunRef> runs;
-    foldDeltasIntoGeneration(*operation, layout, /*prior_runs*/{}, /*new_generation*/1, /*attempt*/0,
-                             /*shard*/0, deltas, runs,
-                             /*current_round*/0, /*condemn_round*/0, /*head_blob*/{}, /*peek_head*/{},
-                             /*confirm_condemned_marker*/{}, /*out_retired*/nullptr,
-                             /*suppress_destructive*/false, &ledger.applied);
+    runs.push_back(foldDeltasIntoGeneration(
+        *operation, layout, /*prior_runs*/{}, /*new_generation*/1, /*attempt*/0, /*shard*/0, deltas,
+        {.out_applied_by_txn_ordinal = &ledger.applied}));
 
     EXPECT_EQ(ledger.applied[routed], 1) << "the reducer consumed this transaction's deltas but did "
                                             "not mark its ordinal — probe B2 is inert";
@@ -149,11 +147,9 @@ TEST(CASTxnApplyLedger, ReducerMarksAnUnmatchedRemovalDelta)
     std::vector<BlobDelta> deltas{{bh(1), s(1), /*remove*/true, removal}};
     std::vector<RunRef> runs;
     RetiredMergeResult merged;
-    foldDeltasIntoGeneration(*operation, layout, /*prior_runs*/{}, /*new_generation*/1, /*attempt*/0,
-                             /*shard*/0, deltas, runs,
-                             /*current_round*/0, /*condemn_round*/0, /*head_blob*/{}, /*peek_head*/{},
-                             /*confirm_condemned_marker*/{}, &merged,
-                             /*suppress_destructive*/false, &ledger.applied);
+    runs.push_back(foldDeltasIntoGeneration(
+        *operation, layout, /*prior_runs*/{}, /*new_generation*/1, /*attempt*/0, /*shard*/0, deltas,
+        {.out_retired = &merged, .out_applied_by_txn_ordinal = &ledger.applied}));
 
     EXPECT_EQ(merged.unmatched_removes, 1u) << "the fixture must actually stage an unmatched removal";
     EXPECT_EQ(ledger.applied[removal], 1);

@@ -171,6 +171,23 @@ inline void copyBlobPayloadVerified(ReadBuffer & from, WriteBuffer & to, const S
         throwPayloadDigestMismatch(key);
 }
 
+/// `copyBlobPayloadVerified`, then finalizes `to`. A failed copy cancels `to` and rethrows; a failed finalize
+/// is not followed by a cancel.
+inline void copyVerifiedPayloadAndFinalize(ReadBuffer & from, WriteBuffer & to, const StreamingBlobPublication & publication,
+    const String & key, PayloadSizeMismatchMessage size_mismatch)
+{
+    try
+    {
+        copyBlobPayloadVerified(from, to, publication, key, std::move(size_mismatch));
+    }
+    catch (...)
+    {
+        to.cancel();
+        throw;
+    }
+    to.finalize();
+}
+
 }
 
 /// Etag-aware storage seam used by the content-addressed pool. INCARNATION SEMANTICS ARE THE

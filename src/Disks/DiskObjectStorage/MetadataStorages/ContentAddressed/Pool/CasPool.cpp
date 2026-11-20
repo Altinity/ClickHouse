@@ -479,7 +479,7 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
         /// with zero writes, instead of minting a fresh identity on top of the old objects.
         CasOperation residual_op = bootstrap_requests.admit();
         std::optional<String> pool_meta_bytes;
-        switch (probePoolBootstrapResidual(residual_op, layout, &pool_meta_bytes))
+        switch (probePoolBootstrapResidual(residual_op, layout, pool_meta_bytes))
         {
             case BootstrapResidual::PoolMetaPresent:
                 /// The battery and the algorithm admission below write; a pool this build cannot serve is refused first.
@@ -696,18 +696,19 @@ MountIncarnation Pool::captureMountIncarnation() const
     return MountIncarnation{.writer_epoch = writer_epoch, .fence_generation = generation};
 }
 
-void Pool::raiseReaderFloor(const PoolPtr & store, uint64_t generation)
+void Pool::raiseReaderFloorToRefChain()
 {
-    if (store->meta.min_reader_generation >= generation)
+    constexpr uint64_t generation = G_REF_CHAIN;
+    if (meta.min_reader_generation >= generation)
         return;
-    CasOperation raise_op = store->gc_requests.admit();
-    const uint64_t floor_before = store->meta.min_reader_generation;
-    const PoolMeta raised = PoolMeta::raiseMinReaderGeneration(raise_op, store->pool_layout, generation);
+    CasOperation raise_op = gc_requests.admit();
+    const uint64_t floor_before = meta.min_reader_generation;
+    const PoolMeta raised = PoolMeta::raiseMinReaderGeneration(raise_op, pool_layout, generation);
     LOG_WARNING(getLogger("CasPool"),
         "Content-addressed pool '{}': min_reader_generation raised {} -> {}; readers below generation {} can no longer mount this pool",
-        u128ToHex(store->meta.pool_id), floor_before, raised.min_reader_generation, generation);
+        u128ToHex(meta.pool_id), floor_before, raised.min_reader_generation, generation);
     /// Only the floor is written: the rest of `meta` is already what the pool opened with.
-    store->meta.min_reader_generation = raised.min_reader_generation;
+    meta.min_reader_generation = raised.min_reader_generation;
 }
 
 void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy policy)

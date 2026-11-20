@@ -267,17 +267,6 @@ CondemnedRow condemnedRowOf(const SourceEdgeRecord & rec)
                         .standing = rec.standing};
 }
 
-IntentCreates::IntentCreates(IntentCreateFn create)
-{
-    if (!create)
-        return;
-    start = [fn = std::move(create)](const BlobRef & ref, const CanonicalIdentity & identity) -> IntentCreateAnswer
-    {
-        IntentCreateResult answer = fn(ref, identity);
-        return [result = std::move(answer)] { return result; };
-    };
-}
-
 SourceEdgeRunView::SourceEdgeRunView(std::unique_ptr<ReadBuffer> stream_)
     : stream(std::move(stream_))
     , reader(std::make_unique<SourceEdgeRunReader>(*stream))   /// the reader borrows *stream; both are members
@@ -387,30 +376,15 @@ void putDeterministicArtifact(CasOperation & op, const String & key, const Strin
     orThrow(std::move(result), what);
 }
 
-void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
-                              const std::vector<RunRef> & prior_runs,
-                              uint64_t new_generation, uint64_t attempt,
-                              uint64_t shard,
-                              std::vector<BlobDelta> scattered, std::vector<RunRef> & out_runs,
-                              uint64_t current_round, uint64_t condemn_round,
-                              const BlobHeadFn & head_blob,
-                              const BlobHeadFn & peek_head,
-                              const IntentCreates & create_intent,
-                              RetiredMergeResult * out_retired,
-                              bool suppress_destructive,
-                              std::vector<uint8_t> * out_applied_by_txn_ordinal,
-                              std::vector<BlobSourceRetirement> source_retirements,
-                              GcRoundWorkBudget * work_budget,
-                              const PendingHeadHints * pending_hints,
-                              const BlobHeadFn & pending_head,
-                              std::vector<Layout::ParsedBlobIntentKey> intent_nominations,
-                              const BlobHeadFn & spare_head)
+RunRef foldDeltasIntoGeneration(CasOperation & op, const Layout & layout, const std::vector<RunRef> & prior_runs,
+                                uint64_t new_generation, uint64_t attempt, uint64_t shard,
+                                std::vector<BlobDelta> scattered, ShardFoldOptions options)
 {
-    if (suppress_destructive && !intent_nominations.empty())
+    if (options.suppress_destructive && !options.intent_nominations.empty())
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS fold: orphan intent nominations passed to a suppressed round");
 
     RetiredMergeResult sink;
-    RetiredMergeResult & rmr = out_retired ? *out_retired : sink;
+    RetiredMergeResult & rmr = options.out_retired ? *options.out_retired : sink;
 
     // Deterministic input ordering produces a byte-reproducible run for safe retry and adoption.
     // MUST be stable: for the same (ref, source_id) the journal ordering is
@@ -425,14 +399,14 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
             if (a.ref != b.ref) return a.ref < b.ref;
             return a.source_id < b.source_id;
         });
-    std::sort(source_retirements.begin(), source_retirements.end(),
+    std::sort(options.source_retirements.begin(), options.source_retirements.end(),
         [](const BlobSourceRetirement & a, const BlobSourceRetirement & b)
         {
             if (a.ref != b.ref) return a.ref < b.ref;
             return a.source_id < b.source_id;
         });
     /// Stable, so the first listed intent of a key is the one adopted.
-    std::stable_sort(intent_nominations.begin(), intent_nominations.end(),
+    std::stable_sort(options.intent_nominations.begin(), options.intent_nominations.end(),
         [](const Layout::ParsedBlobIntentKey & a, const Layout::ParsedBlobIntentKey & b) { return a.ref < b.ref; });
 
     PriorEdgeCursor cursor(op, prior_runs);
@@ -476,7 +450,6 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
     {
         IntentCreateAnswer answer;
         size_t row = 0;                    /// in `rmr.still_retired`
-        std::optional<size_t> replaced;    /// in `rmr.replaced`
     };
     struct HeldRecord
     {
@@ -488,7 +461,7 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
     std::deque<HeldRecord> held;
     uint64_t creates_sent = 0;
     uint64_t creates_answered = 0;
-    const size_t create_window = std::max<size_t>(1, create_intent.window);
+    const size_t create_window = std::max<size_t>(1, options.create_intent.window);
 
     auto writable = [&](const HeldRecord & r) { return !r.create || *r.create < creates_answered; };
     auto writeRecord = [&](const HeldRecord & r)
@@ -523,13 +496,7 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
         if (created.confirmed())
             rmr.confirmed.push_back(row);
         else
-        {
-            ++rmr.unconfirmed_creates;
-            if (rmr.unconfirmed_create_example.empty())
-                rmr.unconfirmed_create_example = created.detail;
-        }
-        if (create.replaced)
-            rmr.replaced[*create.replaced].fresh = row;
+            rmr.unconfirmed_creates.note([&] { return created.detail; });
         ++creates_answered;
         writeHeld();
     };
@@ -546,18 +513,18 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
             takeOldestAnswer();
     };
     /// Records `row` as a candidate and sends the create a decision names. Only a sent create spends a budget slot.
-    auto createAndRecord = [&](RetiredEntry row, const CanonicalIdentity & identity, std::optional<size_t> replaced)
+    auto createAndRecord = [&](RetiredEntry row, const CanonicalIdentity & identity)
     {
-        if (work_budget)
+        if (options.work_budget)
         {
-            ++work_budget->intent_creates_used;
-            work_budget->last_create_sent = GcRoundWorkBudget::RunPosition{shard, cur_blob};
+            ++options.work_budget->intent_creates_used;
+            options.work_budget->last_create_sent = GcRoundWorkBudget::RunPosition{shard, cur_blob};
         }
         row.delete_pending = false;
         row.standing = false;
         rmr.still_retired.push_back(std::move(row));
-        outstanding.push_back(OutstandingCreate{.answer = create_intent.start(cur_blob, identity),
-                                                .row = rmr.still_retired.size() - 1, .replaced = replaced});
+        outstanding.push_back(OutstandingCreate{.answer = options.create_intent.start(cur_blob, identity),
+                                                .row = rmr.still_retired.size() - 1});
         cur_row_create = creates_sent++;
         while (outstanding.size() >= create_window)
             takeOldestAnswer();
@@ -571,23 +538,19 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
         row.ref = cur_blob;
         row.token = *decision.new_token;
         row.size = head.observed()->size;
-        row.condemn_round = condemn_round;
+        row.condemn_round = options.condemn_round;
         return row;
     };
 
     auto noteUncanonical = [&]
     {
-        ++rmr.uncanonical_tokens;
-        if (rmr.uncanonical_example.empty())
-            rmr.uncanonical_example = layout.blobKey(cur_blob);
+        rmr.uncanonical_tokens.note([&] { return layout.blobKey(cur_blob); });
         ProfileEvents::increment(ProfileEvents::CASGCIntentTokenRejected);
     };
 
     auto noteUndecodable = [&]
     {
-        ++rmr.undecodable_bodies;
-        if (rmr.undecodable_example.empty())
-            rmr.undecodable_example = layout.blobKey(cur_blob);
+        rmr.undecodable_bodies.note([&] { return layout.blobKey(cur_blob); });
     };
 
     /// A body GC cannot decode is never condemned, adopted or deleted: the row, if any, is carried unchanged.
@@ -606,7 +569,7 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
             LOG_DEBUG(getLogger("CasGcFold"),
                 "CAS gc fold ({}): {} blob {} (condemned at round {}, observed at round {}) is referenced "
                 "again; the row is dropped and {}", layout.poolPrefix(),
-                row.standing ? "standing" : "pending", blobIdOf(row.ref), row.condemn_round, current_round,
+                row.standing ? "standing" : "pending", blobIdOf(row.ref), row.condemn_round, options.current_round,
                 intent_to_delete ? "the body has another incarnation, so its intent is deleted" : "its intent stays");
             ProfileEvents::increment(ProfileEvents::CASGCRetiredSparedByReref);
             if (intent_to_delete)
@@ -625,26 +588,27 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
     auto settleBlob = [&](const std::optional<RetiredEntry> & row)
     {
         /// A destructive step on the cut that minted the row could miss a writer's edge.
-        if (row && row->condemn_round >= condemn_round)
+        if (row && row->condemn_round >= options.condemn_round)
             throw Exception(ErrorCodes::LOGICAL_ERROR,
                 "CAS fold: the row of {} is stamped with round {}, not before this pass's round {}: a row minted in this "
-                "pass reached the rules", layout.blobKey(cur_blob), row->condemn_round, condemn_round);
+                "pass reached the rules", layout.blobKey(cur_blob), row->condemn_round, options.condemn_round);
         IntentRuleInput input;
         input.row = row;
         input.at_zero = cur_edges == 0;
         input.key_touched = cur_touched;
         input.fresh_transition = !row && input.at_zero && cur_touched;
-        input.suppressed = suppress_destructive;
-        input.create_budget_admits = create_intent && (!work_budget || work_budget->intentCreateAdmits(shard, cur_blob));
-        input.redelete_budget_admits = !work_budget || work_budget->redeleteAdmits(shard, cur_blob);
+        input.suppressed = options.suppress_destructive;
+        input.create_budget_admits
+            = options.create_intent && (!options.work_budget || options.work_budget->intentCreateAdmits(shard, cur_blob));
+        input.redelete_budget_admits = !options.work_budget || options.work_budget->redeleteAdmits(shard, cur_blob);
 
         /// A row carried after its `HEAD` keeps its slot, so the budget bounds the round's `HEAD`s of pending rows;
         /// the rotation in `GcRoundWorkBudget` keeps such a row from holding the slot in every round.
         bool redelete_slot_taken = false;
         const auto takeRedeleteSlot = [&]
         {
-            if (work_budget)
-                work_budget->takeRedeleteSlot(shard, cur_blob);
+            if (options.work_budget)
+                options.work_budget->takeRedeleteSlot(shard, cur_blob);
             redelete_slot_taken = true;
         };
         switch (decisionHeadNeed(input))
@@ -653,23 +617,21 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
                 break;
             case DecisionHeadNeed::Spare:
             {
-                if (!spare_head)
+                if (!options.spare_head)
                 {
                     spareRow(*row, std::nullopt);
                     return;
                 }
                 /// Before the take, so the `HEAD`s of the spared rows behind this one are in flight while it waits.
-                if (pending_hints)
+                if (options.pending_hints)
                 {
-                    pending_hints->take_spare(cur_blob);
-                    cursor.scanAhead(kPendingHeadLookaheadRows, pending_hints->offer);
+                    options.pending_hints->take_spare(cur_blob);
+                    cursor.scanAhead(kPendingHeadLookaheadRows, options.pending_hints->offer);
                 }
-                const BlobHead observed = spare_head(cur_blob);
+                const BlobHead observed = options.spare_head(cur_blob);
                 if (observed.undecodable)
                 {
-                    ++rmr.undecodable_spares;
-                    if (rmr.undecodable_spare_example.empty())
-                        rmr.undecodable_spare_example = layout.blobKey(cur_blob);
+                    rmr.undecodable_spares.note([&] { return layout.blobKey(cur_blob); });
                     spareRow(*row, std::nullopt);
                     return;
                 }
@@ -678,7 +640,7 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
             }
             case DecisionHeadNeed::TouchedKey:
             {
-                const BlobHeadFn & hook = row ? peek_head : head_blob;
+                const BlobHeadFn & hook = row ? options.peek_head : options.head_blob;
                 if (!hook)
                 {
                     if (row)
@@ -696,19 +658,19 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
             }
             case DecisionHeadNeed::PendingBody:
             {
-                if (!pending_head)
+                if (!options.pending_head)
                 {
                     rmr.still_retired.push_back(*row);
                     return;
                 }
                 takeRedeleteSlot();
                 /// After the slot is taken, so a look-ahead hint never takes it.
-                if (pending_hints)
+                if (options.pending_hints)
                 {
-                    pending_hints->take_pending(cur_blob);
-                    cursor.scanAhead(kPendingHeadLookaheadRows, pending_hints->offer);
+                    options.pending_hints->take_pending(cur_blob);
+                    cursor.scanAhead(kPendingHeadLookaheadRows, options.pending_hints->offer);
                 }
-                const BlobHead observed = pending_head(cur_blob);
+                const BlobHead observed = options.pending_head(cur_blob);
                 if (observed.undecodable)
                 {
                     carryUndecodable(row);
@@ -732,7 +694,7 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
             case IntentStep::None:
                 return;
             case IntentStep::Create:
-                createAndRecord(row ? *row : observedRow(decision, *input.head), *decision.intent_to_create, std::nullopt);
+                createAndRecord(row ? *row : observedRow(decision, *input.head), *decision.intent_to_create);
                 return;
             case IntentStep::Candidate:
                 rmr.still_retired.push_back(observedRow(decision, *input.head));
@@ -741,9 +703,7 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
                 rmr.still_retired.push_back(*row);
                 return;
             case IntentStep::Anomaly:
-                ++rmr.standing_anomalies;
-                if (rmr.standing_anomaly_example.empty())
-                    rmr.standing_anomaly_example = layout.blobKey(cur_blob);
+                rmr.standing_anomalies.note([&] { return layout.blobKey(cur_blob); });
                 ProfileEvents::increment(ProfileEvents::CASGCIntentStandingAnomaly);
                 rmr.still_retired.push_back(*row);
                 return;
@@ -766,11 +726,11 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
             case IntentStep::TransitionCandidate:
             {
                 RetiredEntry moved = observedRow(decision, *input.head);
-                rmr.replaced.push_back(ReplacedEntry{.fresh = moved, .old_token = row->token});
                 if (decision.step == IntentStep::TransitionCreate)
-                    createAndRecord(std::move(moved), *decision.intent_to_create, rmr.replaced.size() - 1);
+                    createAndRecord(std::move(moved), *decision.intent_to_create);
                 else
                     rmr.still_retired.push_back(std::move(moved));
+                rmr.replaced.push_back(ReplacedEntry{.row = rmr.still_retired.size() - 1, .old_token = row->token});
                 if (decision.intent_to_delete)
                     rmr.intent_deletes.push_back(layout.writeOnceBlobIntentKey(cur_blob, *decision.intent_to_delete));
                 return;
@@ -787,9 +747,9 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
         const std::optional<PersistedEtag> token = persistedTokenOf(nomination.identity);
         if (!token)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS fold: orphan intent nomination of {} carries no tag", layout.blobKey(cur_blob));
-        if (!peek_head)
+        if (!options.peek_head)
             return;
-        const BlobHead observed = peek_head(cur_blob);
+        const BlobHead observed = options.peek_head(cur_blob);
         if (observed.undecodable)
         {
             carryUndecodable(std::nullopt);
@@ -799,7 +759,7 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
         RetiredEntry row;
         row.kind = ObjectKind::Blob;
         row.ref = cur_blob;
-        row.condemn_round = condemn_round;
+        row.condemn_round = options.condemn_round;
         switch (head.seen())
         {
             case HeadSeen::Uncanonical:
@@ -858,7 +818,7 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
         }
     };
 
-    while (cursor.valid() || di < scattered.size() || ri < source_retirements.size() || ni < intent_nominations.size())
+    while (cursor.valid() || di < scattered.size() || ri < options.source_retirements.size() || ni < options.intent_nominations.size())
     {
         // Pick the smallest row key across the prior-run cursor and this round's deltas.
         String key;
@@ -869,24 +829,24 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
             const String dk = SourceEdgeKeyCodec::key(scattered[di].ref, scattered[di].source_id);
             if (!from_prior || dk < key) { key = dk; from_prior = false; }
         }
-        if (ri < source_retirements.size())
+        if (ri < options.source_retirements.size())
         {
-            const String rk = SourceEdgeKeyCodec::key(source_retirements[ri].ref, source_retirements[ri].source_id);
+            const String rk = SourceEdgeKeyCodec::key(options.source_retirements[ri].ref, options.source_retirements[ri].source_id);
             if ((!from_prior && key.empty()) || rk < key) { key = rk; from_prior = false; }
         }
         /// A nomination sits at its blob's sentinel key, so it opens the blob before any edge of it. On a tie with a
         /// prior condemned row the row goes first; the nomination is then taken at the same blob.
         bool from_nomination = false;
-        if (ni < intent_nominations.size())
+        if (ni < options.intent_nominations.size())
         {
-            const String nk = SourceEdgeKeyCodec::key(intent_nominations[ni].ref, kZeroSourceId);
+            const String nk = SourceEdgeKeyCodec::key(options.intent_nominations[ni].ref, kZeroSourceId);
             if ((!from_prior && key.empty()) || nk < key) { key = nk; from_prior = false; from_nomination = true; }
         }
         if (from_nomination)
         {
-            openBlobIfNeeded(intent_nominations[ni].ref);
+            openBlobIfNeeded(options.intent_nominations[ni].ref);
             if (!cur_nomination)
-                cur_nomination = intent_nominations[ni];
+                cur_nomination = options.intent_nominations[ni];
             ++ni;
             continue;
         }
@@ -928,8 +888,8 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
             /// at run flush because the in-degree model is a SET — an unmatched `-1` and a duplicate
             /// `+1` legitimately vanish inside the merge, so a flush-side mark would fire on healthy
             /// rounds. See `Cas::TxnApplyLedger`.
-            if (out_applied_by_txn_ordinal)
-                (*out_applied_by_txn_ordinal)[scattered[di].txn_ordinal] = 1;
+            if (options.out_applied_by_txn_ordinal)
+                (*options.out_applied_by_txn_ordinal)[scattered[di].txn_ordinal] = 1;
             present = scattered[di].remove ? false : true;   // apply in order; last wins
             cur_touched = true;
             ++di;
@@ -938,8 +898,8 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
         /// Orphan nomination retires this exact manifest-source identity after ordinary ref deltas at
         /// the same key. It is accounting-neutral: absence is an idempotent no-op, not an unmatched
         /// ref removal, and there is no transaction ordinal to mark in B2's apply ledger.
-        while (ri < source_retirements.size()
-               && source_retirements[ri].ref == blob_ref && source_retirements[ri].source_id == source_id)
+        while (ri < options.source_retirements.size()
+               && options.source_retirements[ri].ref == blob_ref && options.source_retirements[ri].source_id == source_id)
         {
             present = false;
             cur_touched = true;
@@ -967,8 +927,7 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
     const UInt128 run_checksum = sourceEdgeRunChecksum(run_bytes);
     const String run_key = layout.blobTargetRunKey(new_generation, attempt, shard, 0);
     putDeterministicArtifact(op, run_key, run_bytes);
-    out_runs.push_back(RunRef{.key = run_key, .checksum = run_checksum,
-                              .shard = shard, .key_generation = new_generation});
+    return RunRef{.key = run_key, .checksum = run_checksum, .shard = shard, .key_generation = new_generation};
 }
 
 std::vector<BlobCandidate> zeroInDegree(CasOperation & op, const std::vector<RunRef> & runs)

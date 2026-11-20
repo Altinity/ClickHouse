@@ -283,16 +283,8 @@ TEST(CASProbe, RefusesATokenThatIsNotAnIdentity)
     {
         auto requests = makeRequests(*weak);
         auto op = requests.admit();
-        String message;
-        try
-        {
-            runCapabilityProbe(op, "p/_probe/u");
-        }
-        catch (const DB::Exception & e)
-        {
-            EXPECT_EQ(e.code(), DB::ErrorCodes::NOT_IMPLEMENTED);
-            message = e.message();
-        }
+        const String message
+            = DB::Cas::tests::messageOf(DB::ErrorCodes::NOT_IMPLEMENTED, [&] { runCapabilityProbe(op, "p/_probe/u"); });
         EXPECT_NE(message.find(expected), String::npos) << message;
         EXPECT_NE(message.find("W/\"x\""), String::npos) << message;
     }
@@ -335,18 +327,7 @@ TEST(CASProbe, ReadOnlyStoreIsReportedAtOnce)
     CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), nullptr, DB::Cas::kDefaultRequestWindowMs);
     auto op = requests.admit();
 
-    int code = 0;
-    String message;
-    try
-    {
-        runCapabilityProbe(op, "p/.cas_probe");
-    }
-    catch (const DB::Exception & e)
-    {
-        code = e.code();
-        message = e.message();
-    }
-    EXPECT_EQ(code, DB::ErrorCodes::READONLY) << message;
+    const String message = DB::Cas::tests::messageOf(DB::ErrorCodes::READONLY, [&] { runCapabilityProbe(op, "p/.cas_probe"); });
     EXPECT_NE(message.find("CasProbe: the store refused the create of 'p/.cas_probe/token'"), String::npos) << message;
     EXPECT_NE(message.find("readonly"), String::npos) << message;
     EXPECT_TRUE(clock.sleeps.empty()) << "the refused create was retried " << clock.sleeps.size() << " time(s)";
@@ -360,19 +341,10 @@ TEST(CASProbe, OccupiedProbeKeyKeepsItsMessage)
     auto op = requests.admit();
     ASSERT_TRUE(std::holds_alternative<Committed>(op.create("p/.cas_probe/token", "someone else", Retry::once())));
 
-    int code = 0;
-    String message;
-    try
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NOT_IMPLEMENTED, "CasProbe: create on a fresh key did not commit", [&]
     {
         runCapabilityProbe(op, "p/.cas_probe");
-    }
-    catch (const DB::Exception & e)
-    {
-        code = e.code();
-        message = e.message();
-    }
-    EXPECT_EQ(code, DB::ErrorCodes::NOT_IMPLEMENTED) << message;
-    EXPECT_NE(message.find("CasProbe: create on a fresh key did not commit"), String::npos) << message;
+    });
 }
 
 TEST(CASProbe, LocalRefusalsAreDefinite)

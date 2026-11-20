@@ -2918,7 +2918,7 @@ TEST(CASPool, FloorRaiseLogsTheNewFloor)
     seedFloorOne(*b);
     DB::Cas::tests::ScopedLogCapture capture("CasPool", "warning");
     PoolPtr store = Pool::openForMigration(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    Pool::raiseReaderFloor(store, G_REF_CHAIN);
+    store->raiseReaderFloorToRefChain();
     EXPECT_NE(
         capture.captured().find("min_reader_generation raised 1 -> 3; readers below generation 3 can no longer mount this pool"),
         String::npos) << capture.captured();

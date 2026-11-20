@@ -181,11 +181,10 @@ ReadyFixture makeReadyFixture()
     const uint64_t new_attempt = state.snap_attempt + 1000;
     std::vector<RunRef> runs;
     RetiredMergeResult retired;
-    foldDeltasIntoGeneration(
-        seed_op, f.store->layout(), seal.blob_target_runs,
-        new_generation, new_attempt, /*shard=*/0, std::move(seeded_edges), runs,
-        /*current_round=*/state.round, /*condemn_round=*/state.round,
-        {}, {}, {}, &retired, /*suppress_destructive=*/false, nullptr);
+    runs.push_back(foldDeltasIntoGeneration(
+        seed_op, f.store->layout(), seal.blob_target_runs, new_generation, new_attempt, /*shard=*/0,
+        std::move(seeded_edges),
+        {.current_round = state.round, .condemn_round = state.round, .out_retired = &retired}));
     seal.parent_generation = state.snap_generation;
     seal.generation = new_generation;
     seal.blob_target_runs = std::move(runs);
@@ -336,19 +335,22 @@ TEST(CASOrphanNomination, SourceRetirementIsAccountingNeutral)
     const BlobRef blob = legacyMetaTestRef(UInt128(0xA001));
     const UInt128 source = UInt128(0xA002);
     std::vector<RunRef> parent_runs;
-    foldDeltasIntoGeneration(
+    parent_runs.push_back(foldDeltasIntoGeneration(
         op, layout, {}, /*new_generation=*/1, /*attempt=*/1, /*shard=*/0,
-        {BlobDelta{.ref = blob, .source_id = source, .remove = false}}, parent_runs);
+        {BlobDelta{.ref = blob, .source_id = source, .remove = false}}));
 
     std::vector<RunRef> next_runs;
     RetiredMergeResult retired;
     std::vector<uint8_t> applied{0x5A};
-    foldDeltasIntoGeneration(
-        op, layout, parent_runs, /*new_generation=*/2, /*attempt=*/2, /*shard=*/0,
-        {}, next_runs, /*current_round=*/1, /*condemn_round=*/1,
-        {}, {}, {}, &retired, /*suppress_destructive=*/false, &applied,
-        {BlobSourceRetirement{.ref = blob, .source_id = source},
-         BlobSourceRetirement{.ref = blob, .source_id = UInt128(0xA003)}});
+    next_runs.push_back(foldDeltasIntoGeneration(
+        op, layout, parent_runs, /*new_generation=*/2, /*attempt=*/2, /*shard=*/0, {},
+        ShardFoldOptions{
+            .current_round = 1,
+            .condemn_round = 1,
+            .out_retired = &retired,
+            .out_applied_by_txn_ordinal = &applied,
+            .source_retirements = {BlobSourceRetirement{.ref = blob, .source_id = source},
+                                   BlobSourceRetirement{.ref = blob, .source_id = UInt128(0xA003)}}}));
 
     EXPECT_EQ(inDegreeInRuns(backend, next_runs, blob), 0);
     EXPECT_EQ(retired.unmatched_removes, 0u);

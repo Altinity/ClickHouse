@@ -224,15 +224,7 @@ String overlongKey()
 #ifndef DEBUG_OR_SANITIZER_BUILD
 TEST(CASBlobIntentKey, KeyOver1024BytesIsALogicalError)
 {
-    try
-    {
-        (void)overlongKey();
-        FAIL() << "expected LOGICAL_ERROR";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::LOGICAL_ERROR);
-    }
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [] { (void)overlongKey(); });
 }
 #else
 TEST(CASBlobIntentKeyDeathTest, KeyOver1024BytesIsALogicalError)
@@ -261,15 +253,8 @@ TEST(CASBlobIntentKey, KeyRefusesAHandBuiltNonCanonicalTag)
     ASSERT_EQ(layout.blobIntentKey(fixedRef(), etagIdentity()), kFixedKey) << "positive control";
     for (const auto & identity : kNonCanonicalIdentities)
     {
-        try
-        {
-            (void)layout.blobIntentKey(fixedRef(), identity);
-            ADD_FAILURE() << "expected LOGICAL_ERROR for tag '" << identity.tag_hex << "'";
-        }
-        catch (const DB::Exception & e)
-        {
-            EXPECT_EQ(e.code(), DB::ErrorCodes::LOGICAL_ERROR) << identity.tag_hex;
-        }
+        SCOPED_TRACE(identity.tag_hex);
+        DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { (void)layout.blobIntentKey(fixedRef(), identity); });
     }
 }
 #else
@@ -586,15 +571,8 @@ TEST(CASBlobIntentCreate, LogicalErrorPropagates)
     IntentCreateFixture f;
     ThrowingWriteBackend backend(DB::ErrorCodes::LOGICAL_ERROR);
     OperationForTest op(backend);
-    try
-    {
-        (void)createBlobIntent(*op, f.layout, f.ref, f.identity, Retry::standard());
-        FAIL() << "expected LOGICAL_ERROR";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::LOGICAL_ERROR);
-    }
+    DB::Cas::tests::expectThrowsCode(
+        DB::ErrorCodes::LOGICAL_ERROR, [&] { (void)createBlobIntent(*op, f.layout, f.ref, f.identity, Retry::standard()); });
 }
 #else
 TEST(CASBlobIntentCreateDeathTest, LogicalErrorPropagates)

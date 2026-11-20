@@ -533,16 +533,7 @@ TEST(CASGcIntents, StoreThatRefusesIntentCreatesFailsTheRoundAtOnce)
         pool.backend->refuse_intent_creates = true;
         pool.backend->clearJournal();
 
-        try
-        {
-            pool.round();
-            ADD_FAILURE() << "the round committed over a store that refuses every intent create";
-        }
-        catch (const DB::Exception & e)
-        {
-            EXPECT_EQ(e.code(), DB::ErrorCodes::READONLY) << e.message();
-            EXPECT_NE(e.message().find("the store is read-only"), String::npos) << e.message();
-        }
+        expectThrowsCodeWithMessage(DB::ErrorCodes::READONLY, "the store is read-only", [&] { pool.round(); });
 
         const size_t creates = intentCreates(blobRequests(pool.backend->journal()));
         EXPECT_GE(creates, 1u);
@@ -893,6 +884,60 @@ TEST(CASGcIntents, CreateBudgetIsSharedByEveryShardOfARound)
     EXPECT_EQ(candidates, 5u);
 }
 
+namespace
+{
+
+/// Counts the jobs the round has scheduled since the cut when the first row of `ordered` sends its `HEAD`. That
+/// `HEAD` waits until one of the rows behind it reaches the store, and their workers wait until it is sent, so every
+/// job the scan scheduled is still counted there. `on_cut` runs at the cut.
+class ReadAheadWindowProbe
+{
+public:
+    ReadAheadWindowProbe(IntentPool<> & pool, const std::vector<uint64_t> & ordered, std::function<void()> on_cut = {})
+    {
+        std::set<String> read_ahead;
+        for (size_t i = 1; i < ordered.size(); ++i)
+            read_ahead.insert(pool.bodyKey(ordered[i]));
+        pool.backend->on_blob_head = [workers_ = workers, first_read_ahead_ = first_read_ahead, read_ahead](const String & key)
+        {
+            if (!read_ahead.contains(key))
+                return;
+            first_read_ahead_->open();
+            workers_->wait();
+        };
+        pool.gc->setPhaseSink([this, at_cut = std::move(on_cut)](const GcPhaseRecord & record)
+        {
+            if (record.phase == "fold_ref_intake")
+            {
+                scheduled_at_cut = CurrentMetrics::get(CurrentMetrics::LocalThreadScheduled);
+                if (at_cut)
+                    at_cut();
+            }
+        });
+        pool.backend->armOnHead(pool.bodyKey(ordered.front()), [this]
+        {
+            first_read_ahead->wait();
+            outstanding = CurrentMetrics::get(CurrentMetrics::LocalThreadScheduled) - scheduled_at_cut;
+            workers->open();
+        });
+    }
+
+    ~ReadAheadWindowProbe()
+    {
+        first_read_ahead->open();
+        workers->open();
+    }
+
+    std::optional<int64_t> outstanding;
+
+private:
+    std::shared_ptr<Gate> workers = std::make_shared<Gate>();
+    std::shared_ptr<Gate> first_read_ahead = std::make_shared<Gate>();
+    int64_t scheduled_at_cut = 0;
+};
+
+}
+
 TEST(CASGcIntents, PendingHeadReadAheadKeepsAtMostAWindowOutstanding)
 {
     constexpr uint64_t concurrency = 4;
@@ -903,42 +948,14 @@ TEST(CASGcIntents, PendingHeadReadAheadKeepsAtMostAWindowOutstanding)
     const std::vector<uint64_t> ordered = inRunOrder(cohort);
     auto pool = makePool({.io_concurrency = concurrency});
     ASSERT_NO_FATAL_FAILURE(pool.makePending(cohort));
-
-    /// The first pending row's `HEAD` is scheduled before the rows behind it and waits until one of them reaches the
-    /// store. Their workers wait until that `HEAD` is sent, so every job the scan scheduled is still counted there.
-    std::set<String> read_ahead;
-    for (size_t i = 1; i < ordered.size(); ++i)
-        read_ahead.insert(pool.bodyKey(ordered[i]));
-    auto workers = std::make_shared<Gate>();
-    auto first_read_ahead = std::make_shared<Gate>();
-    pool.backend->on_blob_head = [workers, first_read_ahead, read_ahead](const String & key)
-    {
-        if (!read_ahead.contains(key))
-            return;
-        first_read_ahead->open();
-        workers->wait();
-    };
-    SCOPE_EXIT({ first_read_ahead->open(); workers->open(); });
-    int64_t scheduled_at_cut = 0;
-    std::optional<int64_t> outstanding;
-    pool.gc->setPhaseSink([&](const GcPhaseRecord & record)
-    {
-        if (record.phase == "fold_ref_intake")
-            scheduled_at_cut = CurrentMetrics::get(CurrentMetrics::LocalThreadScheduled);
-    });
-    pool.backend->armOnHead(pool.bodyKey(ordered.front()), [&]
-    {
-        first_read_ahead->wait();
-        outstanding = CurrentMetrics::get(CurrentMetrics::LocalThreadScheduled) - scheduled_at_cut;
-        workers->open();
-    });
+    ReadAheadWindowProbe probe(pool, ordered);
 
     const RoundReport report = pool.round();
 
     EXPECT_EQ(report.bodies_deleted, cohort.size()) << "positive control: every pending row was decided";
-    ASSERT_TRUE(outstanding.has_value()) << "the first pending row never sent its HEAD";
-    EXPECT_GE(*outstanding, 2) << "no pending HEAD was read ahead";
-    EXPECT_LE(*outstanding, window) << "the read-ahead ran past its window";
+    ASSERT_TRUE(probe.outstanding.has_value()) << "the first pending row never sent its HEAD";
+    EXPECT_GE(*probe.outstanding, 2) << "no pending HEAD was read ahead";
+    EXPECT_LE(*probe.outstanding, window) << "the read-ahead ran past its window";
 }
 
 TEST(CASGcIntents, TouchedPendingRowSpendsOneRedeleteSlot)
@@ -1120,6 +1137,43 @@ TEST(CASGcIntents, EachRowIsRecordedFromItsOwnCreate)
     }
 }
 
+namespace
+{
+
+/// Runs a round that fails while `held` parks one of its jobs: once `wait_until_in_flight` returns, the round must
+/// still be running, and it returns its failure only after `held` is released and the parked job is `held_done`.
+void expectThrowingRoundToDrain(IntentPool<> & pool, ManualBarrier & held, const std::atomic<bool> & held_done,
+                                const std::function<void()> & wait_until_in_flight, std::string_view held_job,
+                                std::string_view failure)
+{
+    /// The outcome is returned rather than asserted on the round's thread, where a failure is not reported.
+    auto round = std::async(std::launch::async, [&]
+    {
+        try
+        {
+            pool.round();
+            return false;
+        }
+        catch (...)
+        {
+            return true;
+            /// Ok: a failed round is the outcome this waits for.
+        }
+    });
+    /// Before the future's destructor, which waits for the round.
+    SCOPE_EXIT({ held.release(); });
+    wait_until_in_flight();
+    EXPECT_EQ(round.wait_for(std::chrono::seconds(2)), std::future_status::timeout)
+        << "the round returned while a " << held_job << " was still held";
+    EXPECT_FALSE(held_done.load());
+
+    held.release();
+    EXPECT_TRUE(round.get()) << "the " << failure << " did not fail the round";
+    EXPECT_TRUE(held_done.load());
+}
+
+}
+
 TEST(CASGcIntents, ThrowingRoundDrainsItsCreatesBeforeReturning)
 {
     const std::vector<uint64_t> rows = inRunOrder({1, 2, 3});
@@ -1147,37 +1201,17 @@ TEST(CASGcIntents, ThrowingRoundDrainsItsCreatesBeforeReturning)
         }
     };
 
-    /// The outcome is returned rather than asserted on the round's thread, where a failure is not reported.
-    auto round = std::async(std::launch::async, [&]
+    expectThrowingRoundToDrain(pool, held, held_create_done, [&]
     {
         try
         {
-            pool.round();
-            return false;
+            held.waitUntilArrived();
         }
-        catch (...)
+        catch (...) // Ok: reported as a test failure
         {
-            return true;
-            /// Ok: a failed round is the outcome this waits for.
+            ADD_FAILURE() << "the last create was never in flight beside the first one";
         }
-    });
-    /// Before the future's destructor, which waits for the round.
-    SCOPE_EXIT({ held.release(); });
-    try
-    {
-        held.waitUntilArrived();
-    }
-    catch (...) // Ok: reported as a test failure
-    {
-        ADD_FAILURE() << "the last create was never in flight beside the first one";
-    }
-    EXPECT_EQ(round.wait_for(std::chrono::seconds(2)), std::future_status::timeout)
-        << "the round returned while a create was still held";
-    EXPECT_FALSE(held_create_done.load());
-
-    held.release();
-    EXPECT_TRUE(round.get()) << "the refused create did not fail the round";
-    EXPECT_TRUE(held_create_done.load());
+    }, "create", "refused create");
     EXPECT_EQ(committedRound(*pool.backend, pool.layout()), round_before);
     for (uint64_t b : rows)
         EXPECT_FALSE(pool.row(b).has_value()) << b;
@@ -1606,31 +1640,11 @@ TEST(CASGcIntents, ThrowingRoundDrainsItsDeleteJobsBeforeReturning)
         }
     };
 
-    /// The outcome is returned rather than asserted on the round's thread, where a failure is not reported.
-    auto round = std::async(std::launch::async, [&]
+    expectThrowingRoundToDrain(pool, held, held_job_done, [&]
     {
-        try
-        {
-            pool.round();
-            return false;
-        }
-        catch (...)
-        {
-            return true;
-            /// Ok: a failed round is the outcome this waits for.
-        }
-    });
-    /// Before the future's destructor, which waits for the round.
-    SCOPE_EXIT({ held.release(); });
-    held.waitUntilArrived();
-    failed.waitUntilArrived();
-    EXPECT_EQ(round.wait_for(std::chrono::seconds(2)), std::future_status::timeout)
-        << "the round returned while a delete job was still held";
-    EXPECT_FALSE(held_job_done.load());
-
-    held.release();
-    EXPECT_TRUE(round.get()) << "the failed delete did not fail the round";
-    EXPECT_TRUE(held_job_done.load());
+        held.waitUntilArrived();
+        failed.waitUntilArrived();
+    }, "delete job", "failed delete");
     EXPECT_EQ(committedRound(*pool.backend, pool.layout()), round_before);
     for (uint64_t b : rows)
         EXPECT_TRUE(pool.row(b) && pool.row(b)->delete_pending && !pool.row(b)->standing) << b;
@@ -1712,10 +1726,21 @@ void runRoundsUntil(const PoolPtr & store, Gc & gc, const std::function<bool()> 
     FAIL() << "the condition did not hold within " << max_rounds << " rounds";
 }
 
-/// Writes one part holding `payload` through the writer. `Observed` means the writer adopted the stored
-/// incarnation; `Published` means it uploaded a fresh one.
-BlobMaterializationAction writeOnePart(const PoolPtr & store, const String & ns, const String & ref_name,
-                                       const String & payload)
+/// A part write of `payload` that has precommitted and, with `upload`, materialized its blob; `promote` ends it.
+/// Without `upload` the entry names the blob with no request on the body.
+struct SlowWrite
+{
+    PartWriteTxnPtr build;
+    RootNamespace root;
+    String ref_name;
+    ManifestId id;
+    std::optional<BlobMaterializationAction> action;
+
+    void promote() { build->promote(root, ref_name, build->buildId(), id); }
+};
+
+SlowWrite beginSlowWrite(const PoolPtr & store, const String & ns, const String & ref_name, const String & payload,
+                         bool upload)
 {
     const RootNamespace root{ns};
     PartWriteInfo info;
@@ -1726,13 +1751,29 @@ BlobMaterializationAction writeOnePart(const PoolPtr & store, const String & ns,
     entry.placement = EntryPlacement::Blob;
     entry.ref = idOf(payload);
     entry.blob_size = payload.size();
+    if (!upload)
+        build->adoptEvidence(entry);
     const ManifestId id = build->stageManifest({entry});
     build->precommitAdd(root, ref_name, id);
-    const BlobUploadResult uploaded = build->uploadBlobDetached(BlobUploadRequest{
-        .ref = entry.ref, .source = BlobSource::fromString(payload), .declared_size = payload.size()});
-    build->mergeBlobUploadResults(std::span<const BlobUploadResult>(&uploaded, 1));
-    build->promote(root, ref_name, build->buildId(), id);
-    return uploaded.diagnostics.action;
+    std::optional<BlobMaterializationAction> action;
+    if (upload)
+    {
+        const BlobUploadResult uploaded = build->uploadBlobDetached(BlobUploadRequest{
+            .ref = entry.ref, .source = BlobSource::fromString(payload), .declared_size = payload.size()});
+        build->mergeBlobUploadResults(std::span<const BlobUploadResult>(&uploaded, 1));
+        action = uploaded.diagnostics.action;
+    }
+    return SlowWrite{build, root, ref_name, id, action};
+}
+
+/// Writes one part holding `payload` through the writer. `Observed` means the writer adopted the stored
+/// incarnation; `Published` means it uploaded a fresh one.
+BlobMaterializationAction writeOnePart(const PoolPtr & store, const String & ns, const String & ref_name,
+                                       const String & payload)
+{
+    SlowWrite write = beginSlowWrite(store, ns, ref_name, payload, /*upload=*/true);
+    write.promote();
+    return *write.action;
 }
 
 enum class OldDeleteLands
@@ -3179,9 +3220,7 @@ TEST(CASGcIntents, SparedCandidateSendsNoHead)
     EXPECT_FALSE(pool.row(1).has_value());
 }
 
-/// Every spared row gets one `HEAD`, after the cut. Above concurrency 1 they are read ahead: the first spared row's
-/// `HEAD` is scheduled before the rows behind it and waits until one of them reaches the store; their workers wait
-/// until that `HEAD` is sent.
+/// Every spared row gets one `HEAD`, after the cut. Above concurrency 1 they are read ahead.
 TEST(CASGcIntents, SpareHeadsAreReadAheadAfterTheCut)
 {
     constexpr uint64_t concurrency = 4;
@@ -3198,35 +3237,7 @@ TEST(CASGcIntents, SpareHeadsAreReadAheadAfterTheCut)
     }
     pool.commit("again", cohort);
 
-    std::set<String> read_ahead;
-    for (size_t i = 1; i < ordered.size(); ++i)
-        read_ahead.insert(pool.bodyKey(ordered[i]));
-    auto workers = std::make_shared<Gate>();
-    auto first_read_ahead = std::make_shared<Gate>();
-    pool.backend->on_blob_head = [workers, first_read_ahead, read_ahead](const String & key)
-    {
-        if (!read_ahead.contains(key))
-            return;
-        first_read_ahead->open();
-        workers->wait();
-    };
-    SCOPE_EXIT({ first_read_ahead->open(); workers->open(); });
-    int64_t scheduled_at_cut = 0;
-    std::optional<int64_t> outstanding;
-    pool.gc->setPhaseSink([&](const GcPhaseRecord & record)
-    {
-        if (record.phase == "fold_ref_intake")
-        {
-            scheduled_at_cut = CurrentMetrics::get(CurrentMetrics::LocalThreadScheduled);
-            pool.backend->mark("cut_complete");
-        }
-    });
-    pool.backend->armOnHead(pool.bodyKey(ordered.front()), [&]
-    {
-        first_read_ahead->wait();
-        outstanding = CurrentMetrics::get(CurrentMetrics::LocalThreadScheduled) - scheduled_at_cut;
-        workers->open();
-    });
+    ReadAheadWindowProbe probe(pool, ordered, [&] { pool.backend->mark("cut_complete"); });
     const uint64_t hits_before = counter(ProfileEvents::CASGCReadAheadHit);
     const SpareCounters counters;
     pool.backend->clearJournal();
@@ -3234,9 +3245,9 @@ TEST(CASGcIntents, SpareHeadsAreReadAheadAfterTheCut)
     const RoundReport report = pool.round();
 
     EXPECT_EQ(report.spared, cohort.size());
-    ASSERT_TRUE(outstanding.has_value()) << "the first spared row never sent its HEAD";
-    EXPECT_GE(*outstanding, 2) << "no spare HEAD was read ahead";
-    EXPECT_LE(*outstanding, window) << "the read-ahead ran past its window";
+    ASSERT_TRUE(probe.outstanding.has_value()) << "the first spared row never sent its HEAD";
+    EXPECT_GE(*probe.outstanding, 2) << "no spare HEAD was read ahead";
+    EXPECT_LE(*probe.outstanding, window) << "the read-ahead ran past its window";
     const auto journal = pool.backend->journal();
     const size_t cut = indexOfMark(journal, "cut_complete");
     ASSERT_LT(cut, journal.size()) << "positive control: the cut was marked";
@@ -3598,19 +3609,7 @@ String firstWrittenStreamPrefix(const CountingBackend & backend)
 /// The `createHardLink` / relink path: a part in `ns` that names `payload`'s blob, with no request on the body.
 void copyWithoutBytes(const PoolPtr & store, const String & ns, const String & ref_name, const String & payload)
 {
-    const RootNamespace root{ns};
-    PartWriteInfo info;
-    info.intended_ref = ns + "/" + ref_name;
-    auto build = store->beginPartWrite(info);
-    ManifestEntry entry;
-    entry.path = "data.bin";
-    entry.placement = EntryPlacement::Blob;
-    entry.ref = idOf(payload);
-    entry.blob_size = payload.size();
-    build->adoptEvidence(entry);
-    const ManifestId id = build->stageManifest({entry});
-    build->precommitAdd(root, ref_name, id);
-    build->promote(root, ref_name, build->buildId(), id);
+    beginSlowWrite(store, ns, ref_name, payload, /*upload=*/false).promote();
 }
 
 /// The round that ran after journal entry `from` decided the blob and destroyed nothing a committed part names:
@@ -3643,6 +3642,89 @@ void expectRowOutcome(const std::optional<RetiredEntry> & row, bool carried, con
     EXPECT_EQ(row->token.canonical(), token.canonical()) << "the carried row changed its token";
 }
 
+/// The pool of the no-bytes copy tests: writer `w` in `ns_w` holds body `t` under `pending(t)`, because round 1
+/// missed its edge. Every namespace in `copy_namespaces` has an unrelated seed part, so each round walks it.
+class MissedWriterPool
+{
+public:
+    MissedWriterPool(const String & ns_w_, const std::vector<String> & copy_namespaces, const String & payload_,
+                     uint64_t gc_shards = 1)
+        : ns_w(ns_w_), payload(payload_), x(idOf(payload_))
+    {
+        PoolConfig config{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0, .gc_io_concurrency = 1};
+        config.gc_shards = gc_shards;
+        store = Pool::open(backend, std::move(config));
+        body_key = store->layout().blobKey(x);
+        gc = std::make_unique<Gc>(store, kGateLeaderA);
+        for (const String & ns : copy_namespaces)
+            EXPECT_EQ(writeOnePart(store, ns, "seed", "an unrelated part of " + ns), BlobMaterializationAction::Published);
+    }
+
+    /// Publishes the blob in part `p0` of `ns_w`, folds it, and drops the part.
+    void publishAndDrop()
+    {
+        ASSERT_EQ(writeOnePart(store, ns_w, "p0", payload), BlobMaterializationAction::Published);
+        runGateRound(store, *gc);
+        store->dropRef(RootNamespace{ns_w}, "p0");
+        store->renewWatermarkOnce();
+    }
+
+    /// Ends with `pending(t)` while `w` names `t`.
+    void commitPendingUnderAMissedWriter()
+    {
+        ASSERT_NO_FATAL_FAILURE(publishAndDrop());
+
+        std::optional<BlobMaterializationAction> w;
+        backend->armOnHead(body_key, [&] { w = writeOnePart(store, ns_w, "w", payload); });
+        runGateRound(store, *gc);
+        ASSERT_EQ(w, BlobMaterializationAction::Observed) << "W did not adopt the stored body";
+        ASSERT_TRUE(row() && row()->delete_pending && !row()->standing) << "round 1 did not commit pending(t)";
+        t = row()->token;
+    }
+
+    /// One round; after the walk of `copy_ns`, when the round walks `next_ns` next, `copy_ns` gets a no-bytes copy
+    /// named `copy_ref` and `drop_ns`'s part `drop_ref` is dropped. Expects the body kept by that round.
+    RoundReport relayRound(const String & copy_ns, const String & next_ns, const String & copy_ref,
+                           const String & drop_ns, const String & drop_ref)
+    {
+        const size_t from = backend->journal().size();
+        const RoundWithCallback round = runRoundWithCallback(
+            *gc, RoundInterleavePoint::AfterNamespaceWalk, {.first = copy_ns, .second = next_ns}, [&]
+            {
+                copyWithoutBytes(store, copy_ns, copy_ref, payload);
+                store->dropRef(RootNamespace{drop_ns}, drop_ref);
+            });
+        store->renewWatermarkOnce();
+        EXPECT_EQ(round.fired, 1u) << "the round never walked " << next_ns << " after " << copy_ns;
+        expectBodyKept(*backend, *store, body_key, from, round.report);
+        return round.report;
+    }
+
+    std::optional<RetiredEntry> row() const
+    {
+        const uint64_t shards = store->poolMeta().gc_shards;
+        for (const RetiredEntry & entry : currentRetiredSet(*backend, store->layout(), blobShard(x, shards)))
+            if (entry.ref == x)
+                return entry;
+        return std::nullopt;
+    }
+
+    bool bodyStored() const
+    {
+        OperationForTest op(*backend);
+        return (*op).read(body_key, Retry::standard()).has_value();
+    }
+
+    std::shared_ptr<HeadHookBackend> backend = std::make_shared<HeadHookBackend>();
+    PoolPtr store;
+    std::unique_ptr<Gc> gc;
+    const String ns_w;
+    const String payload;
+    const BlobRef x;
+    String body_key;
+    PersistedEtag t;
+};
+
 struct CrossNamespaceOrder
 {
     /// The destination's namespace sorts first, so pass 1 proves its frontier before it reads the source.
@@ -3668,7 +3750,7 @@ std::unique_ptr<ScopedRoundCallback> armCrossNamespaceEvent(Gc & gc, const Cross
     if (order.source_read_first)
         return std::make_unique<ScopedRoundCallback>(gc, RoundInterleavePoint::AfterIntake, RoundInterleaveSelector{}, event);
     return std::make_unique<ScopedRoundCallback>(
-        gc, RoundInterleavePoint::BetweenNamespaces, RoundInterleaveSelector{.first = ns_l, .second = ns_w}, event);
+        gc, RoundInterleavePoint::AfterNamespaceWalk, RoundInterleaveSelector{.first = ns_l, .second = ns_w}, event);
 }
 
 String crossNamespaceOrderName(const ::testing::TestParamInfo<CrossNamespaceOrder> & param_info)
@@ -3700,35 +3782,24 @@ class CASGcIntentsTransitionSource : public ::testing::TestWithParam<CrossNamesp
 /// request on the body while `W`'s edge is live, and then `W`'s part is dropped. The body must survive: `L` names it.
 TEST_P(CASGcIntentsCrossNamespace, NoBytesCopyBetweenTwoFrontiersKeepsTheBody)
 {
-    auto backend = std::make_shared<HeadHookBackend>();
-    PoolConfig config{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0, .gc_io_concurrency = 1};
-    auto store = Pool::open(backend, std::move(config));
-    const Layout & layout = store->layout();
     const bool destination_first = GetParam().destination_first;
     const bool before_the_round = GetParam().before_the_round;
     const bool source_read_first = GetParam().source_read_first;
     const String ns_w = destination_first ? "test/b_source" : "test/a_source";
     const String ns_l = destination_first ? "test/a_copy" : "test/b_copy";
-    const String payload = "cross-namespace-no-bytes-copy";
-    const BlobRef x = idOf(payload);
-    const String body_key = layout.blobKey(x);
-    const auto row = [&] { return retiredEntryFor(*backend, layout, x); };
-    Gc gc(store, kGateLeaderA);
+    MissedWriterPool pool(ns_w, {}, "cross-namespace-no-bytes-copy");
+    const auto & backend = pool.backend;
+    const PoolPtr & store = pool.store;
+    const String & body_key = pool.body_key;
+    const String & payload = pool.payload;
+    Gc & gc = *pool.gc;
+    const auto row = [&] { return retiredEntryFor(*backend, store->layout(), pool.x); };
 
     ASSERT_EQ(writeOnePart(store, ns_l, "seed", "an unrelated part of the copy's table"), BlobMaterializationAction::Published);
-    ASSERT_EQ(writeOnePart(store, ns_w, "p0", payload), BlobMaterializationAction::Published);
-    runGateRound(store, gc);
-    store->dropRef(RootNamespace{ns_w}, "p0");
-    store->renewWatermarkOnce();
-
     /// Round 1. `W` writes at the decision `HEAD`, after the cut: its edge is missed, it adopts `t` before the
     /// intent exists, and the round commits `pending(t)`.
-    std::optional<BlobMaterializationAction> w;
-    backend->armOnHead(body_key, [&] { w = writeOnePart(store, ns_w, "w", payload); });
-    runGateRound(store, gc);
-    ASSERT_EQ(w, BlobMaterializationAction::Observed) << "W did not adopt the stored body";
-    ASSERT_TRUE(row() && row()->delete_pending && !row()->standing) << "round 1 did not commit pending(t)";
-    const PersistedEtag t = row()->token;
+    ASSERT_NO_FATAL_FAILURE(pool.commitPendingUnderAMissedWriter());
+    const PersistedEtag t = pool.t;
 
     /// Round 2. After the walk of `L`: the copy, then the drop of `W`'s part.
     bool copied = false;
@@ -3781,32 +3852,21 @@ class CASGcIntentsNewbornCopy : public ::testing::TestWithParam<NewbornCase>
 /// round 2 does not walk it; the copy's source is walked.
 TEST_P(CASGcIntentsNewbornCopy, NoBytesCopyIntoANamespaceBornAfterTheCatalogReadKeepsTheBody)
 {
-    auto backend = std::make_shared<HeadHookBackend>();
-    PoolConfig config{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0, .gc_io_concurrency = 1};
-    auto store = Pool::open(backend, std::move(config));
-    const Layout & layout = store->layout();
     const bool newborn = GetParam().newborn;
     const String ns_w = "test/b_source";
     const String ns_l = newborn ? "test/z_newborn" : "test/z_copy";
-    const String payload = "newborn-namespace-no-bytes-copy";
-    const BlobRef x = idOf(payload);
-    const String body_key = layout.blobKey(x);
-    const auto row = [&] { return retiredEntryFor(*backend, layout, x); };
-    Gc gc(store, kGateLeaderA);
+    MissedWriterPool pool(ns_w, {}, "newborn-namespace-no-bytes-copy");
+    const auto & backend = pool.backend;
+    const PoolPtr & store = pool.store;
+    const String & body_key = pool.body_key;
+    const String & payload = pool.payload;
+    Gc & gc = *pool.gc;
+    const auto row = [&] { return retiredEntryFor(*backend, store->layout(), pool.x); };
 
     if (!newborn)
         ASSERT_EQ(writeOnePart(store, ns_l, "seed", "an unrelated part of the copy's table"), BlobMaterializationAction::Published);
-    ASSERT_EQ(writeOnePart(store, ns_w, "p0", payload), BlobMaterializationAction::Published);
-    runGateRound(store, gc);
-    store->dropRef(RootNamespace{ns_w}, "p0");
-    store->renewWatermarkOnce();
-
-    std::optional<BlobMaterializationAction> w;
-    backend->armOnHead(body_key, [&] { w = writeOnePart(store, ns_w, "w", payload); });
-    runGateRound(store, gc);
-    ASSERT_EQ(w, BlobMaterializationAction::Observed) << "W did not adopt the stored body";
-    ASSERT_TRUE(row() && row()->delete_pending && !row()->standing) << "round 1 did not commit pending(t)";
-    const PersistedEtag t = row()->token;
+    ASSERT_NO_FATAL_FAILURE(pool.commitPendingUnderAMissedWriter());
+    const PersistedEtag t = pool.t;
 
     const size_t round_begin = backend->journal().size();
     const RoundWithCallback round2 = runRoundWithCallback(gc, RoundInterleavePoint::AfterCatalogRead, {}, [&]
@@ -3835,26 +3895,21 @@ INSTANTIATE_TEST_SUITE_P(CASCatalog, CASGcIntentsNewbornCopy,
 /// copy of `Y`'s part into `L` and the drop of `Y`'s part.
 TEST_P(CASGcIntentsTransitionSource, NoBytesCopyOfARepublishedBodyBetweenTwoFrontiersKeepsTheBody)
 {
-    auto backend = std::make_shared<HeadHookBackend>();
-    PoolConfig config{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0, .gc_io_concurrency = 1};
-    auto store = Pool::open(backend, std::move(config));
-    const Layout & layout = store->layout();
     const bool destination_first = GetParam().destination_first;
     const bool before_the_round = GetParam().before_the_round;
     const bool source_read_first = GetParam().source_read_first;
     const String ns_w = destination_first ? "test/b_source" : "test/a_source";
     const String ns_l = destination_first ? "test/a_copy" : "test/b_copy";
-    const String payload = "transition-source-no-bytes-copy";
-    const BlobRef x = idOf(payload);
-    const String body_key = layout.blobKey(x);
-    const auto row = [&] { return retiredEntryFor(*backend, layout, x); };
-    Gc gc(store, kGateLeaderA);
+    MissedWriterPool pool(ns_w, {}, "transition-source-no-bytes-copy");
+    const auto & backend = pool.backend;
+    const PoolPtr & store = pool.store;
+    const String & body_key = pool.body_key;
+    const String & payload = pool.payload;
+    Gc & gc = *pool.gc;
+    const auto row = [&] { return retiredEntryFor(*backend, store->layout(), pool.x); };
 
     ASSERT_EQ(writeOnePart(store, ns_l, "seed", "an unrelated part of the copy's table"), BlobMaterializationAction::Published);
-    ASSERT_EQ(writeOnePart(store, ns_w, "p0", payload), BlobMaterializationAction::Published);
-    runGateRound(store, gc);
-    store->dropRef(RootNamespace{ns_w}, "p0");
-    store->renewWatermarkOnce();
+    ASSERT_NO_FATAL_FAILURE(pool.publishAndDrop());
 
     runGateRound(store, gc);
     ASSERT_TRUE(row() && row()->delete_pending && !row()->standing) << "round 1 did not commit pending(t)";
@@ -3887,89 +3942,6 @@ TEST_P(CASGcIntentsTransitionSource, NoBytesCopyOfARepublishedBodyBetweenTwoFron
 INSTANTIATE_TEST_SUITE_P(CASOrder, CASGcIntentsTransitionSource, kCrossNamespaceOrders, crossNamespaceOrderName);
 
 /// ---- A pending row whose blob the round touched is carried ----
-
-namespace
-{
-
-/// The pool of the no-bytes copy tests: writer `w` in `ns_w` holds body `t` under `pending(t)`, because round 1
-/// missed its edge. Every namespace in `copy_namespaces` has an unrelated seed part, so each round walks it.
-class MissedWriterPool
-{
-public:
-    MissedWriterPool(const String & ns_w_, const std::vector<String> & copy_namespaces, const String & payload_,
-                     uint64_t gc_shards = 1)
-        : ns_w(ns_w_), payload(payload_), x(idOf(payload_))
-    {
-        PoolConfig config{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0, .gc_io_concurrency = 1};
-        config.gc_shards = gc_shards;
-        store = Pool::open(backend, std::move(config));
-        body_key = store->layout().blobKey(x);
-        gc = std::make_unique<Gc>(store, kGateLeaderA);
-        for (const String & ns : copy_namespaces)
-            EXPECT_EQ(writeOnePart(store, ns, "seed", "an unrelated part of " + ns), BlobMaterializationAction::Published);
-    }
-
-    /// Ends with `pending(t)` while `w` names `t`.
-    void commitPendingUnderAMissedWriter()
-    {
-        ASSERT_EQ(writeOnePart(store, ns_w, "p0", payload), BlobMaterializationAction::Published);
-        runGateRound(store, *gc);
-        store->dropRef(RootNamespace{ns_w}, "p0");
-        store->renewWatermarkOnce();
-
-        std::optional<BlobMaterializationAction> w;
-        backend->armOnHead(body_key, [&] { w = writeOnePart(store, ns_w, "w", payload); });
-        runGateRound(store, *gc);
-        ASSERT_EQ(w, BlobMaterializationAction::Observed) << "W did not adopt the stored body";
-        ASSERT_TRUE(row() && row()->delete_pending && !row()->standing) << "round 1 did not commit pending(t)";
-        t = row()->token;
-    }
-
-    /// One round; after the walk of `copy_ns`, when the round walks `next_ns` next, `copy_ns` gets a no-bytes copy
-    /// named `copy_ref` and `drop_ns`'s part `drop_ref` is dropped. Expects the body kept by that round.
-    RoundReport relayRound(const String & copy_ns, const String & next_ns, const String & copy_ref,
-                           const String & drop_ns, const String & drop_ref)
-    {
-        const size_t from = backend->journal().size();
-        const RoundWithCallback round = runRoundWithCallback(
-            *gc, RoundInterleavePoint::BetweenNamespaces, {.first = copy_ns, .second = next_ns}, [&]
-            {
-                copyWithoutBytes(store, copy_ns, copy_ref, payload);
-                store->dropRef(RootNamespace{drop_ns}, drop_ref);
-            });
-        store->renewWatermarkOnce();
-        EXPECT_EQ(round.fired, 1u) << "the round never walked " << next_ns << " after " << copy_ns;
-        expectBodyKept(*backend, *store, body_key, from, round.report);
-        return round.report;
-    }
-
-    std::optional<RetiredEntry> row() const
-    {
-        const uint64_t shards = store->poolMeta().gc_shards;
-        for (const RetiredEntry & entry : currentRetiredSet(*backend, store->layout(), blobShard(x, shards)))
-            if (entry.ref == x)
-                return entry;
-        return std::nullopt;
-    }
-
-    bool bodyStored() const
-    {
-        OperationForTest op(*backend);
-        return (*op).read(body_key, Retry::standard()).has_value();
-    }
-
-    std::shared_ptr<HeadHookBackend> backend = std::make_shared<HeadHookBackend>();
-    PoolPtr store;
-    std::unique_ptr<Gc> gc;
-    const String ns_w;
-    const String payload;
-    const BlobRef x;
-    String body_key;
-    PersistedEtag t;
-};
-
-
-}
 
 /// A relay over three namespaces: in each round the copy lands after the walk of its destination and before the
 /// walk of its source, and its source is dropped. The body survives every round, and the last copy keeps it in a quiet round.
@@ -4216,46 +4188,6 @@ std::vector<size_t> stateHeadIndices(const std::vector<JournalEntry> & journal)
     return out;
 }
 
-/// A part write of `payload` that has precommitted and, with `upload`, materialized its blob; `promote` ends it.
-/// Without `upload` the entry names the blob with no request on the body.
-struct SlowWrite
-{
-    PartWriteTxnPtr build;
-    RootNamespace root;
-    String ref_name;
-    ManifestId id;
-    std::optional<BlobMaterializationAction> action;
-
-    void promote() { build->promote(root, ref_name, build->buildId(), id); }
-};
-
-SlowWrite beginSlowWrite(const PoolPtr & store, const String & ns, const String & ref_name, const String & payload,
-                         bool upload)
-{
-    const RootNamespace root{ns};
-    PartWriteInfo info;
-    info.intended_ref = ns + "/" + ref_name;
-    auto build = store->beginPartWrite(info);
-    ManifestEntry entry;
-    entry.path = "data.bin";
-    entry.placement = EntryPlacement::Blob;
-    entry.ref = idOf(payload);
-    entry.blob_size = payload.size();
-    if (!upload)
-        build->adoptEvidence(entry);
-    const ManifestId id = build->stageManifest({entry});
-    build->precommitAdd(root, ref_name, id);
-    std::optional<BlobMaterializationAction> action;
-    if (upload)
-    {
-        const BlobUploadResult uploaded = build->uploadBlobDetached(BlobUploadRequest{
-            .ref = entry.ref, .source = BlobSource::fromString(payload), .declared_size = payload.size()});
-        build->mergeBlobUploadResults(std::span<const BlobUploadResult>(&uploaded, 1));
-        action = uploaded.diagnostics.action;
-    }
-    return SlowWrite{build, root, ref_name, id, action};
-}
-
 /// Leader A holds a row of the blob of `payload` while writer W's precommit is the only record of W's namespace
 /// above A's cursor. A's next round parks after the walk of a quiet namespace and before the walk of W's. Meanwhile
 /// W finishes and publishes a snapshot past that record, and leader B takes the lease, folds W's records, commits
@@ -4315,7 +4247,7 @@ struct PausedLeaderPool
     void parkLeaderA(std::function<void()> finish_writer, const String & precommit_key)
     {
         parked = std::make_unique<ScopedRoundCallback>(
-            *gc_a, RoundInterleavePoint::BetweenNamespaces, RoundInterleaveSelector{.first = ns_quiet, .second = ns_w},
+            *gc_a, RoundInterleavePoint::AfterNamespaceWalk, RoundInterleaveSelector{.first = ns_quiet, .second = ns_w},
             [this, finish = std::move(finish_writer), key = precommit_key]
         {
             parked_key = key;
@@ -5246,13 +5178,13 @@ TEST(CASGcRoundPoint, BetweenNamespacesInPassOneFiresBetweenTheTwoWalks)
 {
     RoundPointPool pool;
     pool.refill("1");
-    const auto journal = pool.roundWithMark(RoundInterleavePoint::BetweenNamespaces, {.first = pool.first, .second = pool.second});
+    const auto journal = pool.roundWithMark(RoundInterleavePoint::AfterNamespaceWalk, {.first = pool.first, .second = pool.second});
     ASSERT_EQ(pool.last.fired, 1u);
     pool.expectMarkBetween(journal, pool.first, pool.second);
 
     pool.refill("2");
     const uint64_t round = committedRound(*pool.backend, pool.store->layout()) + 1;
-    pool.roundWithMark(RoundInterleavePoint::BetweenNamespaces, {.first = pool.second, .second = pool.first});
+    pool.roundWithMark(RoundInterleavePoint::AfterNamespaceWalk, {.first = pool.second, .second = pool.first});
     EXPECT_EQ(pool.last.fired, round % 2 == 0 ? 1u : 0u)
         << "after the last walk of pass 1 the next walk is the first of pass 2, which round " << round << " picks";
 }
@@ -5269,7 +5201,7 @@ TEST(CASGcRoundPoint, BetweenNamespacesInPassTwoFiresInBothOrders)
         const uint64_t round = committedRound(*pool.backend, pool.store->layout()) + 1;
         const String & walked = round % 2 == 0 ? pool.first : pool.second;
         const String & next = round % 2 == 0 ? pool.second : pool.first;
-        const auto journal = pool.roundWithMark(RoundInterleavePoint::BetweenNamespaces, {.first = walked, .second = next, .pass = 2});
+        const auto journal = pool.roundWithMark(RoundInterleavePoint::AfterNamespaceWalk, {.first = walked, .second = next, .pass = 2});
         ASSERT_EQ(pool.last.fired, 1u);
         pool.expectMarkBetween(journal, walked, next);
     }
@@ -5602,7 +5534,7 @@ TEST(CASGcRoundPoint, NamespaceRemovedAndRecreatedBetweenTheReads)
 
     const size_t from = pool.backend->journal().size();
     const RoundWithCallback removed = runRoundWithCallback(
-        *pool.gc, RoundInterleavePoint::BetweenNamespaces, {.first = "test/a_seed", .second = "test/r_table"},
+        *pool.gc, RoundInterleavePoint::AfterNamespaceWalk, {.first = "test/a_seed", .second = "test/r_table"},
         [&] { pool.store->dropNamespace(RootNamespace{"test/r_table"}); });
     pool.store->renewWatermarkOnce();
     ASSERT_EQ(removed.fired, 1u);
@@ -5725,7 +5657,7 @@ TEST(CASGcRoundPoint, IntakeSliceCutByTheTimeBudgetReadsANamespaceOverTwoRounds)
 
     /// After the last walk of pass 1, before pass 2 continues the writer's namespace.
     size_t from = backend->journal().size();
-    const RoundWithCallback cut = runRoundWithCallback(gc, RoundInterleavePoint::BetweenNamespaces, {.first = ns_w, .second = ns_w}, [&]
+    const RoundWithCallback cut = runRoundWithCallback(gc, RoundInterleavePoint::AfterNamespaceWalk, {.first = ns_w, .second = ns_w}, [&]
     {
         mono->fetch_add(Gc::kRefIntakeBudgetMs + 1);
         copyWithoutBytes(store, ns_l, "copy", payload);

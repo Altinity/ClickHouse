@@ -444,9 +444,9 @@ public:
     /// GC: the instance reads, and `migratePool` writes through `openRequests`. Refuses an absent `_pool_meta`.
     static PoolPtr openForMigration(BackendPtr backend, PoolConfig config);
 
-    /// Raises the stored `min_reader_generation` to `generation` and mirrors it into `meta`; a floor already at
+    /// Raises the stored `min_reader_generation` to `G_REF_CHAIN` and mirrors it into `meta`; a floor already at
     /// or above it sends nothing. Only `migratePool` calls it: a mount never raises the floor.
-    static void raiseReaderFloor(const PoolPtr & store, uint64_t generation);
+    void raiseReaderFloorToRefChain();
 
     /// The `min_reader_generation` a pool must already have to be opened, and a new pool is created at.
     static constexpr uint64_t mount_reader_floor = G_BLOB_INTENTS;

@@ -101,25 +101,11 @@ std::vector<Target> streamingTargets()
     return targets;
 }
 
-PoolPtr openPool(const BackendPtr & backend)
-{
-    auto pool = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    auto now = std::make_shared<std::atomic<uint64_t>>(0);
-    pool->mountRequests().setNowFnForTest([now] { return now->load(); });
-    pool->mountRequests().setSleepFnForTest([now](uint64_t ms) { now->fetch_add(ms + 1); });
-    return pool;
-}
+using DB::Cas::tests::openPool;
 
-/// A build with `payload`'s manifest precommitted, ready for `putBlob`.
 PartWriteTxnPtr precommittedBuild(const PoolPtr & pool, const String & payload)
 {
-    const RootNamespace ns{"srv/digest"};
-    PartWriteInfo info;
-    info.intended_ref = ns.string() + "/part";
-    auto build = pool->beginPartWrite(info);
-    const ManifestId id = build->stageManifest({DB::Cas::tests::blobEntryFor("col.bin", u128Of(payload), payload.size())});
-    build->precommitAdd(ns, "part", id);
-    return build;
+    return DB::Cas::tests::precommittedBuild(pool, "srv/digest", payload);
 }
 
 BlobSource sourceOf(const String & bytes, std::atomic<int> & opens)

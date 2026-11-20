@@ -60,20 +60,16 @@ struct BlobHead
 /// The fold's HEAD hooks (`head_blob`, `peek_head`, `pending_head`): the caller issues the request on its own
 /// admitted operation and reports what it saw.
 using BlobHeadFn = std::function<BlobHead(const BlobRef &)>;
-/// Creates the deletion intent of a blob at an identity and reports whether it is known to exist.
-using IntentCreateFn = std::function<IntentCreateResult(const BlobRef &, const CanonicalIdentity &)>;
 /// Waits for the answer of one started create, or rethrows what the create threw.
 using IntentCreateAnswer = std::function<IntentCreateResult()>;
 
 /// The fold's intent creates. `start` sends one create; the fold keeps at most `window` answers outstanding
-/// and writes each row from its own create's answer, in run order. A plain `IntentCreateFn` answers at once.
+/// and writes each row from its own create's answer, in run order.
 struct IntentCreates
 {
     std::function<IntentCreateAnswer(const BlobRef &, const CanonicalIdentity &)> start;
     size_t window = 1;
 
-    IntentCreates() = default;
-    IntentCreates(IntentCreateFn create); /// NOLINT(google-explicit-constructor)
     explicit operator bool() const { return static_cast<bool>(start); }
 };
 
@@ -243,27 +239,11 @@ struct BlobCandidate
     BlobRef ref{};
 };
 
-/// Merge the prior generation's blob source-edge run for `shard` with `scattered` deltas, producing the
-/// new generation's write-once run under blobTargetRunKey(new_generation, attempt, shard, 0). Streaming:
-/// prior run + scattered deltas are sorted by (blob_hash, source_id) and merged via two-cursor scan; the
-/// source-edge set is idempotent under re-fold (identical (blob_hash, source_id) pairs deduplicate). A blob
-/// whose active edge set transitions to exactly empty this generation is written as an explicit zero-marker
-/// row so `zeroInDegree` can stream it; prior-generation zero markers are dropped. Appends the produced
-/// run's `RunRef` (key + footer checksum + `shard` + `new_generation`) to `out_runs` for the fold seal.
-///
-/// `prior_runs` are the parent generation's run segments for this shard, resolved by the caller from the
-/// parent fold seal's `blob_target_runs` (filtered to `shard`). An empty vector is the fresh-pool / empty
-/// baseline. A run sealed for one generation may physically live under an older generation's key, so the
-/// seal's exact reference is authoritative and key construction is not used. `new_generation`, `attempt`,
-/// and `shard` name only the output run's key namespace.
-/// The fresh entry that re-condemns the current
-/// incarnation, paired with the STALE entry's it superseded. Kept as its own struct (rather than a
-/// field bolted onto `RetiredEntry`) so the common merge element stays slim — only replaced entries
-/// carry the extra superseded incarnation.
+/// A row moved to the incarnation now at its key, and the token it held before.
 struct ReplacedEntry
 {
-    RetiredEntry fresh;   /// the freshly condemned CURRENT incarnation (also pushed into still_retired byte-identically)
-    PersistedEtag old_token;   /// the superseded (stale) entry's — what republication replaced
+    size_t row = 0;            /// in `RetiredMergeResult::still_retired`, which is append-only
+    PersistedEtag old_token;   /// what the republication replaced
 };
 
 /// One example of an unmatched-remove delta, kept for the caller's single once-per-round WARNING
@@ -283,6 +263,29 @@ struct BodyDelete
     std::optional<Meta> observed;
 };
 
+/// How often one diagnostic condition occurred, and its first nonempty example for the round's one ERROR line.
+struct CountWithExample
+{
+    uint64_t count = 0;
+    String example;
+
+    /// `make_example` runs only while no nonempty example is kept.
+    template <typename MakeExample>
+    void note(MakeExample && make_example)
+    {
+        ++count;
+        if (example.empty())
+            example = make_example();
+    }
+
+    void merge(const CountWithExample & other)
+    {
+        count += other.count;
+        if (example.empty())
+            example = other.example;
+    }
+};
+
 /// Outcome of the retired merge: the same
 /// streaming pass that folds edges settles every prior retired entry and detects new candidates.
 struct RetiredMergeResult
@@ -297,22 +300,18 @@ struct RetiredMergeResult
     std::vector<WriteOnceKey> spare_intent_deletes;
     std::vector<ReplacedEntry> replaced;  /// rows moved to the incarnation now at their key; caller emits blob_retire_replaced
     std::vector<RetiredEntry> adopted;    /// rows this pass wrote for nominated intents that had no row
-    /// Intent creates that were sent and not confirmed; the row stays a candidate. One example for the caller's ERROR.
-    uint64_t unconfirmed_creates = 0;
-    String unconfirmed_create_example;
-    /// Observations and rows whose token names no incarnation; nothing is created or deleted for them.
-    uint64_t uncanonical_tokens = 0;
-    String uncanonical_example;   /// the first blob key
+    /// Intent creates that were sent and not confirmed; the row stays a candidate. The example is the create's detail.
+    CountWithExample unconfirmed_creates;
+    /// Observations and rows whose token names no incarnation; nothing is created or deleted for them. The examples
+    /// below are blob keys.
+    CountWithExample uncanonical_tokens;
     /// `standing` rows whose `HEAD` showed their own token again: carried, nothing deleted.
-    uint64_t standing_anomalies = 0;
-    String standing_anomaly_example;   /// the first blob key
+    CountWithExample standing_anomalies;
     /// Bodies shorter than the pool's blob envelope: no row is written for them, a row is carried, nothing is
-    /// deleted. The first blob key, for the caller's ERROR.
-    uint64_t undecodable_bodies = 0;
-    String undecodable_example;
+    /// deleted.
+    CountWithExample undecodable_bodies;
     /// Such bodies at spared rows: the row is dropped, its intent kept, nothing deleted.
-    uint64_t undecodable_spares = 0;
-    String undecodable_spare_example;
+    CountWithExample undecodable_spares;
 
     /// Count of `remove == true` deltas that matched no presence for their `(BlobRef, source_id)` key —
     /// neither the prior run nor an earlier delta in the same `scattered` batch had activated it. The
@@ -480,17 +479,40 @@ struct GcRoundWorkBudget
     }
 };
 
-/// Merge the prior generation's source-edge run with new deltas. The prior run's `RunMarker::Condemned` rows ride
-/// the source-edge run at the zero-sentinel key (`source_id = 0`), so the prior run is also the retired input.
+/// The round inputs and outputs of one shard's fold. Default options fold edges only: no row is decided and no
+/// request but the run's own write is sent, as the rebuild needs.
+struct ShardFoldOptions
+{
+    uint64_t current_round = 0;
+    uint64_t condemn_round = 0;
+    /// The decision `HEAD` sources: a fresh transition, a touched key with a row, a pending row's body delete, a
+    /// spared row.
+    BlobHeadFn head_blob = {};
+    BlobHeadFn peek_head = {};
+    BlobHeadFn pending_head = {};
+    BlobHeadFn spare_head = {};
+    IntentCreates create_intent = {};
+    RetiredMergeResult * out_retired = nullptr;
+    bool suppress_destructive = false;
+    /// When set, one byte per consumed delta at `[delta.txn_ordinal]`; the caller sizes it to cover every ordinal
+    /// in the deltas. A vector, not a callback: it is written once per delta.
+    std::vector<uint8_t> * out_applied_by_txn_ordinal = nullptr;
+    std::vector<BlobSourceRetirement> source_retirements = {};
+    /// Shared by every shard's fold of one round, with its create and redelete resume positions; null is unbounded.
+    GcRoundWorkBudget * work_budget = nullptr;
+    const PendingHeadHints * pending_hints = nullptr;
+    std::vector<Layout::ParsedBlobIntentKey> intent_nominations = {};
+};
+
+/// Merge the parent generation's source-edge run segments of `shard` with `scattered` deltas into one
+/// write-once run under `blobTargetRunKey(new_generation, attempt, shard, 0)`, and return its `RunRef`.
+/// Streaming: both inputs are merged in `(blob, source_id)` order, and an edge present twice is one
+/// edge, so a re-fold is idempotent. `prior_runs` are the parent seal's exact references for `shard`; empty is
+/// an empty baseline. A blob whose edge set becomes empty is written as a zero-marker row for `zeroInDegree`.
+/// The prior run's `RunMarker::Condemned` rows ride the source-edge run at the zero-sentinel key
+/// (`source_id = 0`), so the prior run is also the retired input.
 /// Each blob is decided when the merge closes it, after the round's cut and before the output run is written,
-/// by `decideIntentStep` over the blob's post-merge in-degree, its row, whether a delta or retirement touched it,
-/// and the decision `HEAD` of this round:
-///   - a touched key at zero takes its `HEAD` from `head_blob` (no row: a fresh transition) or `peek_head` (a
-///     row), for every rule of that row in this pass;
-///   - an untouched pending row at zero whose body delete may run takes it from `pending_head`;
-///   - a spared `pending` or `standing` row whose token canonicalises, in an unsuppressed round, takes it from
-///     `spare_head`;
-///   - no other row needs a `HEAD`.
+/// by `decideIntentStep`, with the decision `HEAD` that `decisionHeadNeed` names.
 /// A row minted in this pass is written as decided and gets no second decision. A hook that is unset makes the
 /// rows that need it carry unchanged, a spared row is dropped instead, and a fresh transition without `head_blob`
 /// records nothing. Creates go through `create_intent`, one per row, each charging `work_budget`'s create slot when
@@ -506,32 +528,9 @@ struct GcRoundWorkBudget
 /// suppressed round, is a `LOGICAL_ERROR`. Adoption sends no create and no delete; without `peek_head` nothing is adopted.
 /// The merge comparator is exactly `(ref.algo, ref.digest, source_id)` (that is, `BlobRef::operator<`
 /// followed by `source_id`), which is also the raw key order produced by `SourceEdgeKeyCodec`.
-void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
-                              const std::vector<RunRef> & prior_runs,
-                              uint64_t new_generation, uint64_t attempt,
-                              uint64_t shard,
-                              std::vector<BlobDelta> scattered, std::vector<RunRef> & out_runs,
-                              uint64_t current_round = 0, uint64_t condemn_round = 0,
-                              const BlobHeadFn & head_blob = {},
-                              const BlobHeadFn & peek_head = {},
-                              const IntentCreates & create_intent = {},
-                              RetiredMergeResult * out_retired = nullptr,
-                              bool suppress_destructive = false,
-                              /// PROBE B2 (see `Cas::TxnApplyLedger`): when set, one byte is stored per
-                              /// CONSUMED delta at `(*out_applied_by_txn_ordinal)[d.txn_ordinal]`. A raw
-                              /// vector rather than a callback: this runs once per delta over a stream
-                              /// that can reach millions of rows, and a `std::function` call there is
-                              /// not free. Never read by the merge; write-only. The caller must size it
-                              /// to cover every `txn_ordinal` present in `scattered`.
-                              std::vector<uint8_t> * out_applied_by_txn_ordinal = nullptr,
-                              std::vector<BlobSourceRetirement> source_retirements = {},
-                              /// Shared by reference across every shard's call within one round;
-                              /// `nullptr` (default) is unbounded, matching every existing caller.
-                              GcRoundWorkBudget * work_budget = nullptr,
-                              const PendingHeadHints * pending_hints = nullptr,
-                              const BlobHeadFn & pending_head = {},
-                              std::vector<Layout::ParsedBlobIntentKey> intent_nominations = {},
-                              const BlobHeadFn & spare_head = {});
+RunRef foldDeltasIntoGeneration(CasOperation & op, const Layout & layout, const std::vector<RunRef> & prior_runs,
+                                uint64_t new_generation, uint64_t attempt, uint64_t shard,
+                                std::vector<BlobDelta> scattered, ShardFoldOptions options = {});
 
 /// Stream the sealed in-degree runs named by `runs` (the current seal's `blob_target_runs` filtered to one
 /// shard) and return every blob written at in-degree 0 (the candidates that transitioned to zero). An

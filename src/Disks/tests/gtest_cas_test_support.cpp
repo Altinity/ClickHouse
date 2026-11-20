@@ -28,12 +28,6 @@ size_t firstIndexOf(const std::vector<JournalEntry> & journal, auto && predicate
     return static_cast<size_t>(it - journal.begin());
 }
 
-size_t lastIndexOf(const std::vector<JournalEntry> & journal, auto && predicate)
-{
-    const auto it = std::find_if(journal.rbegin(), journal.rend(), predicate);
-    return it == journal.rend() ? journal.size() : static_cast<size_t>(journal.rend() - it) - 1;
-}
-
 /// Two threads take turns in a fixed order; each turn is one request, so the expected journal is the turn order.
 class TurnLatch
 {

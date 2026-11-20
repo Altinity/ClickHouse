@@ -526,17 +526,8 @@ void ObjectStorageBackend::emuPublishBlobAtomically(const String & key, const St
     {
         auto out = object_storage->writeObject(StoredObject(temporary_object), WriteMode::Rewrite);
         out->write(envelope.data(), envelope.size());
-        try
-        {
-            blob_publication_detail::copyBlobPayloadVerified(payload, *out, publication, key,
-                "ObjectStorageBackend::publish: source yielded {}{} payload bytes for {}, declared {} -- nothing was published");
-        }
-        catch (...)
-        {
-            out->cancel();
-            throw;
-        }
-        out->finalize();
+        blob_publication_detail::copyVerifiedPayloadAndFinalize(payload, *out, publication, key,
+            "ObjectStorageBackend::publish: source yielded {}{} payload bytes for {}, declared {} -- nothing was published");
     }
     catch (...)
     {
@@ -925,17 +916,8 @@ void ObjectStorageBackend::publish(const BlobPublishRequest & request, Transport
             DBMS_DEFAULT_BUFFER_SIZE,
             blobPublicationWriteSettings());
         out->write(streaming->fresh_envelope.data(), streaming->fresh_envelope.size());
-        try
-        {
-            blob_publication_detail::copyBlobPayloadVerified(*payload, *out, *streaming, request.destination_key,
-                "ObjectStorageBackend::publish: source yielded {}{} payload bytes for {}, declared {} -- upload aborted, nothing published");
-        }
-        catch (...)
-        {
-            out->cancel();
-            throw;
-        }
-        out->finalize();
+        blob_publication_detail::copyVerifiedPayloadAndFinalize(*payload, *out, *streaming, request.destination_key,
+            "ObjectStorageBackend::publish: source yielded {}{} payload bytes for {}, declared {} -- upload aborted, nothing published");
         return;
     }
 

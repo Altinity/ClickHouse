@@ -100,9 +100,7 @@ struct IntentDecision
 /// `standing` row, a `HEAD` that shows another incarnation.
 /// Throws `LOGICAL_ERROR` on an input no round produces: a row that is not a blob row, `standing`
 /// without `delete_pending`, `fresh_transition` other than "no row, at zero, touched", no `HEAD` where
-/// one is required (a fresh transition, a touched key at zero with a row, a pending row whose body
-/// delete runs, a spare that `decisionHeadNeed` names), or a `HEAD` whose classification against the row's
-/// token gives another result. A `HEAD` that is not required is used like any other.
+/// `decisionHeadNeed` names one, or a `HEAD` whose classification against the row's token gives another result. A `HEAD` that is not required is used like any other.
 IntentDecision decideIntentStep(const IntentRuleInput & input);
 
 }

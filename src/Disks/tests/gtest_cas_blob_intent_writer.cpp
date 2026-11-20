@@ -9,7 +9,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
-#include <IO/ReadBufferFromString.h>
 #include <Common/ProfileEvents.h>
 
 #include <Poco/Exception.h>
@@ -86,32 +85,11 @@ public:
     }
 };
 
-PoolPtr openPool(const BackendPtr & backend)
-{
-    auto pool = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    auto now = std::make_shared<std::atomic<uint64_t>>(0);
-    pool->mountRequests().setNowFnForTest([now] { return now->load(); });
-    pool->mountRequests().setSleepFnForTest([now](uint64_t ms) { now->fetch_add(ms + 1); });
-    return pool;
-}
+using DB::Cas::tests::openPool;
 
-PartWriteTxnPtr precommittedBuild(const PoolPtr & pool, const String & payload, const String & part = "part")
+PartWriteTxnPtr precommittedBuild(const PoolPtr & pool, const String & payload)
 {
-    const RootNamespace ns{"srv/intent-writer"};
-    PartWriteInfo info;
-    info.intended_ref = ns.string() + "/" + part;
-    auto build = pool->beginPartWrite(info);
-    const ManifestId id = build->stageManifest({DB::Cas::tests::blobEntryFor("col.bin", u128Of(payload), payload.size())});
-    build->precommitAdd(ns, part, id);
-    return build;
-}
-
-BlobSource sourceOf(const String & bytes)
-{
-    BlobSource source;
-    source.size = bytes.size();
-    source.open = [bytes]() -> std::unique_ptr<DB::ReadBuffer> { return std::make_unique<DB::ReadBufferFromOwnString>(bytes); };
-    return source;
+    return DB::Cas::tests::precommittedBuild(pool, "srv/intent-writer", payload);
 }
 
 /// Requests on blob and intent keys, in order, as `(verb, key)`.
@@ -167,7 +145,7 @@ TEST(CASBlobIntentWriter, FirstCreationIsHeadAndOnePut)
     auto build = precommittedBuild(pool, payload);
     backend->clearJournal();
 
-    const BlobUploadResult result = upload(*build, idOf(payload), sourceOf(payload));
+    const BlobUploadResult result = upload(*build, idOf(payload), BlobSource::fromString(payload));
 
     const String key = pool->layout().blobKey(idOf(payload));
     EXPECT_EQ(blobRequests(backend->journal()), (Requests{{JournalVerb::Head, key}, {JournalVerb::Publish, key}}));
@@ -185,7 +163,7 @@ TEST(CASBlobIntentWriter, CleanReuseIsHeadAndGet)
     auto build = precommittedBuild(pool, payload);
     backend->clearJournal();
 
-    const BlobUploadResult result = upload(*build, idOf(payload), sourceOf(payload));
+    const BlobUploadResult result = upload(*build, idOf(payload), BlobSource::fromString(payload));
 
     const String key = pool->layout().blobKey(idOf(payload));
     EXPECT_EQ(blobRequests(backend->journal()), (Requests{{JournalVerb::Head, key}, {JournalVerb::Read, intent}}));
@@ -207,7 +185,7 @@ TEST(CASBlobIntentWriter, IntentPresentPublishesFreshOnce)
         backend->clearJournal();
         const uint64_t before = counter(ProfileEvents::CASBlobReuseIntentPresent);
 
-        const BlobUploadResult result = upload(*build, idOf(payload), sourceOf(payload));
+        const BlobUploadResult result = upload(*build, idOf(payload), BlobSource::fromString(payload));
 
         const String key = pool->layout().blobKey(idOf(payload));
         EXPECT_EQ(blobRequests(backend->journal()),
@@ -232,7 +210,7 @@ TEST(CASBlobIntentWriter, NoSecondHeadOnAnyPath)
             plantIntent(*backend, intentKeyOfBody(*backend, pool->layout(), idOf(payload)));
         auto build = precommittedBuild(pool, payload);
         backend->clearJournal();
-        static_cast<void>(build->putBlob(idOf(payload), sourceOf(payload)));
+        static_cast<void>(build->putBlob(idOf(payload), BlobSource::fromString(payload)));
         const auto journal = backend->journal();
         size_t heads = 0;
         for (const auto & [verb, key] : blobRequests(journal))
@@ -253,7 +231,7 @@ TEST(CASBlobIntentWriter, LandedAmbiguousPublicationIsAdoptedInThreeReads)
     backend->land_then_lose_first_publication = true;
     backend->clearJournal();
 
-    const BlobUploadResult result = upload(*build, idOf(payload), sourceOf(payload));
+    const BlobUploadResult result = upload(*build, idOf(payload), BlobSource::fromString(payload));
     const auto journal = backend->journal();
 
     const String key = pool->layout().blobKey(idOf(payload));
@@ -276,7 +254,7 @@ TEST(CASBlobIntentWriter, FailedIntentReadIsNotAbsence)
         backend->intent_read_fault = fault;
         backend->clearJournal();
 
-        EXPECT_ANY_THROW(static_cast<void>(build->putBlob(idOf(payload), sourceOf(payload))));
+        EXPECT_ANY_THROW(static_cast<void>(build->putBlob(idOf(payload), BlobSource::fromString(payload))));
 
         const Requests requests = blobRequests(backend->journal());
         ASSERT_GE(requests.size(), 2u);
@@ -299,7 +277,7 @@ TEST(CASBlobIntentWriter, WriterNeverMutatesIntents)
     auto build = precommittedBuild(pool, payload);
     backend->clearJournal();
 
-    static_cast<void>(build->putBlob(idOf(payload), sourceOf(payload)));
+    static_cast<void>(build->putBlob(idOf(payload), BlobSource::fromString(payload)));
 
     bool intent_read = false;
     for (const JournalEntry & entry : backend->journal())
@@ -337,7 +315,7 @@ TEST(CASBlobIntentWriter, VerbatimCopyIsSelectedOnlyAfterAnAbsentFirstHead)
             plantIntent(*backend, intentKeyOfBody(*backend, pool->layout(), idOf(payload)));
         }
         auto build = precommittedBuild(pool, payload);
-        BlobSource staged = sourceOf(payload);
+        BlobSource staged = BlobSource::fromString(payload);
         staged.server_side_copy_from = staging_key;
 
         static_cast<void>(build->putBlob(idOf(payload), staged));
@@ -357,7 +335,7 @@ TEST(CASBlobIntentWriter, WellFormedUncanonicalTokenPublishesFresh)
     backend->clearJournal();
     const uint64_t before = counter(ProfileEvents::CASBlobReuseTokenRejected);
 
-    const BlobUploadResult result = upload(*build, idOf(payload), sourceOf(payload));
+    const BlobUploadResult result = upload(*build, idOf(payload), BlobSource::fromString(payload));
 
     const String key = pool->layout().blobKey(idOf(payload));
     EXPECT_EQ(blobRequests(backend->journal()), (Requests{{JournalVerb::Head, key}, {JournalVerb::Publish, key}}));
@@ -375,7 +353,7 @@ TEST(CASBlobIntentWriter, MalformedTokenFailsTheRead)
     auto build = precommittedBuild(pool, payload);
     backend->clearJournal();
 
-    EXPECT_ANY_THROW(static_cast<void>(build->putBlob(idOf(payload), sourceOf(payload))));
+    EXPECT_ANY_THROW(static_cast<void>(build->putBlob(idOf(payload), BlobSource::fromString(payload))));
 
     for (const auto & [verb, key] : blobRequests(backend->journal()))
     {
@@ -413,7 +391,7 @@ TEST(CASBlobIntentWriter, AdoptionReadsReachTheStoreAfterAPrimedAbsence)
 
     auto build = precommittedBuild(pool, payload);
     backend->clearJournal();
-    const BlobUploadResult result = upload(*build, ref, sourceOf(payload));
+    const BlobUploadResult result = upload(*build, ref, BlobSource::fromString(payload));
 
     const String key = pool->layout().blobKey(ref);
     EXPECT_EQ(blobRequests(backend->journal()),

@@ -1,10 +1,12 @@
 #pragma once
 
 #include <Disks/tests/cas_test_helpers.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 
 #include <Poco/Exception.h>
 #include <Common/SipHash.h>
 
+#include <atomic>
 #include <optional>
 
 namespace DB::Cas::tests
@@ -110,5 +112,27 @@ private:
         return key.find("/blobs/") != String::npos && !key.ends_with(".meta");
     }
 };
+
+/// A pool whose request clock advances only by its own retry sleeps, so retries never wait.
+inline DB::Cas::PoolPtr openPool(const DB::Cas::BackendPtr & backend)
+{
+    auto pool = DB::Cas::Pool::open(backend, DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto now = std::make_shared<std::atomic<uint64_t>>(0);
+    pool->mountRequests().setNowFnForTest([now] { return now->load(); });
+    pool->mountRequests().setSleepFnForTest([now](uint64_t ms) { now->fetch_add(ms + 1); });
+    return pool;
+}
+
+/// A build of part `part` in `ns` with `payload`'s one-file manifest precommitted, ready for `putBlob`.
+inline DB::Cas::PartWriteTxnPtr precommittedBuild(const DB::Cas::PoolPtr & pool, const String & ns, const String & payload)
+{
+    const DB::Cas::RootNamespace root{ns};
+    DB::Cas::PartWriteInfo info;
+    info.intended_ref = root.string() + "/part";
+    auto build = pool->beginPartWrite(info);
+    const DB::Cas::ManifestId id = build->stageManifest({blobEntryFor("col.bin", u128Of(payload), payload.size())});
+    build->precommitAdd(root, "part", id);
+    return build;
+}
 
 }

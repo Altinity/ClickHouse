@@ -427,21 +427,6 @@ struct Fixture
     }
 };
 
-String messageOf(int code, const std::function<void()> & fn)
-{
-    try
-    {
-        fn();
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), code) << e.message();
-        return e.message();
-    }
-    ADD_FAILURE() << "expected an exception with code " << code;
-    return {};
-}
-
 bool contains(const std::vector<String> & lines, std::string_view text)
 {
     return std::any_of(lines.begin(), lines.end(), [&](const String & line) { return line.find(text) != String::npos; });
@@ -534,6 +519,16 @@ void seedMixedPool(Fixture & f)
     f.heartbeat(4);
     f.slot("srv-silent", liveLease());
     f.slot("srv-gone", farewellLease());
+}
+
+/// Body 1 under a clean marker, body 2 with no marker, body 3 under a condemned marker.
+void seedOneBodyOfEachMarking(Fixture & f)
+{
+    f.body(1);
+    f.cleanMarker(1);
+    f.body(2);
+    f.body(3);
+    f.condemnedMarker(3);
 }
 
 /// What a complete migration leaves, for comparing runs.
@@ -883,25 +878,6 @@ TEST(CASMigratePool, KeepMarkersStopsAtTheFloorAndARerunRemovesThem)
     EXPECT_TRUE(rerun.completed);
     EXPECT_EQ(rerun.markers_removed, 3u);
     EXPECT_TRUE(f.markers().empty());
-}
-
-/// The line that lets servers start precedes every marker delete: removing markers is not part of the downtime.
-TEST(CASMigratePool, ServersMayStartBeforeTheMarkersAreRemoved)
-{
-    Fixture f(3);
-    seedMixedPool(f);
-    f.backend->clearJournal();
-    ASSERT_TRUE(f.run().completed);
-    const auto journal = f.backend->journal();
-    size_t may_start = journal.size();
-    for (size_t i = 0; i < journal.size() && may_start == journal.size(); ++i)
-        if (journal[i].verb == JournalVerb::Mark && journal[i].detail.find("may start now") != String::npos)
-            may_start = i;
-    ASSERT_LT(may_start, journal.size());
-    const auto deletes = markerDeleteIndices(journal);
-    ASSERT_EQ(deletes.size(), 3u) << "positive control: the markers were deleted";
-    EXPECT_GT(deletes.front(), may_start);
-    EXPECT_GT(may_start, writeIndices(journal, f.layout.poolMetaKey()).back()) << "the line follows the floor";
 }
 
 /// Long steps report on the tool's clock, a page at a time, with an estimate of the time left.
@@ -1304,7 +1280,9 @@ TEST(CASMigratePool, RecheckRefusesAMovedGcPair)
     EXPECT_EQ(f.markers().size(), 1u);
 }
 
-TEST(CASMigratePool, FloorIsTheLastProtocolWrite)
+/// One successful run: the last intent write, the `gc/state` write, the floor, the line that lets servers start,
+/// then every marker delete. Removing markers is not part of the downtime.
+TEST(CASMigratePool, SuccessfulRunOrdersItsWritesAndMarkerDeletes)
 {
     Fixture f(3);
     seedMixedPool(f);
@@ -1322,24 +1300,20 @@ TEST(CASMigratePool, FloorIsTheLastProtocolWrite)
     EXPECT_LT(state_writes.front(), meta_writes.front());
     for (size_t i = meta_writes.front() + 1; i < journal.size(); ++i)
         EXPECT_NE(journal[i].verb, JournalVerb::Write) << "a write after the floor: " << journal[i].keys.front();
-    EXPECT_EQ(f.poolMeta().min_reader_generation, G_BLOB_INTENTS);
-    EXPECT_EQ(f.poolMeta().token_dialect, Dialect::Emulated);
-}
 
-TEST(CASMigratePool, NoMarkerIsDeletedBeforeTheFloor)
-{
-    Fixture f(3);
-    seedMixedPool(f);
-    f.backend->clearJournal();
-    ASSERT_TRUE(f.run().completed);
-
-    const auto journal = f.backend->journal();
-    const auto meta_writes = writeIndices(journal, f.layout.poolMetaKey());
-    ASSERT_EQ(meta_writes.size(), 1u);
+    size_t may_start = journal.size();
+    for (size_t i = 0; i < journal.size() && may_start == journal.size(); ++i)
+        if (journal[i].verb == JournalVerb::Mark && journal[i].detail.find("may start now") != String::npos)
+            may_start = i;
+    ASSERT_LT(may_start, journal.size());
+    EXPECT_GT(may_start, meta_writes.front()) << "the line follows the floor";
     const auto deletes = markerDeleteIndices(journal);
     EXPECT_EQ(deletes.size(), 3u) << "positive control: every marker read at M4 is deleted";
     for (const size_t i : deletes)
-        EXPECT_GT(i, meta_writes.front()) << journal[i].keys.front();
+        EXPECT_GT(i, may_start) << journal[i].keys.front();
+
+    EXPECT_EQ(f.poolMeta().min_reader_generation, G_BLOB_INTENTS);
+    EXPECT_EQ(f.poolMeta().token_dialect, Dialect::Emulated);
     EXPECT_TRUE(f.markers().empty());
 }
 
@@ -1620,11 +1594,7 @@ TEST(CASMigratePool, DeferredStartupSendsNoRequest)
 TEST(CASMigratePool, FloorOnePoolIsRaisedAfterM5AndCoversEveryBody)
 {
     Fixture f(1);
-    f.body(1);
-    f.cleanMarker(1);
-    f.body(2);
-    f.body(3);
-    f.condemnedMarker(3);
+    seedOneBodyOfEachMarking(f);
     f.rows({}, G_WRITE_FLOOR);
     f.backend->clearJournal();
 
@@ -1654,11 +1624,7 @@ TEST(CASMigratePool, FloorOnePoolIsRaisedAfterM5AndCoversEveryBody)
 TEST(CASMigratePool, CrashAfterTheRaiseThenRerunCompletes)
 {
     Fixture f(1);
-    f.body(1);
-    f.cleanMarker(1);
-    f.body(2);
-    f.body(3);
-    f.condemnedMarker(3);
+    seedOneBodyOfEachMarking(f);
     f.rows({}, G_WRITE_FLOOR);
     f.backend->refuseWrites(f.layout.gcStateKey(), 1);
     MigratePoolOptions trust;
@@ -1765,11 +1731,7 @@ TEST(CASRemoveLegacyMarkers, ChangedMarkerIsLeftAndCounted)
 TEST(CASMigratePool, FloorOneCrashAfterM5RerunStillCoversEveryBody)
 {
     Fixture f(1);
-    f.body(1);
-    f.cleanMarker(1);
-    f.body(2);
-    f.body(3);
-    f.condemnedMarker(3);
+    seedOneBodyOfEachMarking(f);
     MigratePoolOptions stop;
     stop.stop_after_step_for_test = 5;
     stop.trust_clean_markers = true;

@@ -213,24 +213,32 @@ std::optional<IntentRuleInput> inputOf(const Cell & c, const Observations & o)
 /// The oracle, written from the GC rules and their handling of request failures and uncanonical tokens,
 /// not from the code. First: which inputs a round can produce at all. A HEAD the rules do not require can still
 /// arrive, for example a read-ahead answer shared by two rows of one key.
-bool headIsRequired(const Cell & c)
+DecisionHeadNeed requiredHead(const Cell & c)
 {
+    if (c.zero && c.touched)   /// the supersede HEAD of a touched key, or the condemn HEAD of a fresh transition
+        return DecisionHeadNeed::TouchedKey;
     if (c.row == RowState::None)
-        return c.fresh;   /// the condemn HEAD of a fresh transition
-    if (!c.zero)          /// the spare HEAD of a row with a confirmed intent it may delete
-        return (c.row == RowState::Pending || c.row == RowState::Standing) && c.canonical_token && !c.suppressed;
-    const bool body_delete_head = c.row == RowState::Pending && !c.suppressed && c.redelete_budget;
-    return c.touched || body_delete_head;   /// the supersede HEAD of a touched key, or the body-delete HEAD
+        return DecisionHeadNeed::None;
+    if (!c.zero)               /// the spare HEAD of a row with a confirmed intent it may delete
+        return (c.row == RowState::Pending || c.row == RowState::Standing) && c.canonical_token && !c.suppressed
+            ? DecisionHeadNeed::Spare
+            : DecisionHeadNeed::None;
+    return c.row == RowState::Pending && !c.suppressed && c.redelete_budget ? DecisionHeadNeed::PendingBody
+                                                                            : DecisionHeadNeed::None;
 }
 
-bool reachable(const Cell & c)
+/// A row and a transition flag a round can produce, whether or not the cell carries the HEAD they need.
+bool wellFormed(const Cell & c)
 {
     if (c.row == RowState::NotABlob || c.row == RowState::StandingNotPending)
         return false;
     /// A fresh transition is a touched key reaching zero with no row.
-    if (c.fresh != (c.row == RowState::None && c.zero && c.touched))
-        return false;
-    return c.head != HeadKind::NotSent || !headIsRequired(c);
+    return c.fresh == (c.row == RowState::None && c.zero && c.touched);
+}
+
+bool reachable(const Cell & c)
+{
+    return wellFormed(c) && (c.head != HeadKind::NotSent || requiredHead(c) == DecisionHeadNeed::None);
 }
 
 enum class IntentOf : uint8_t { Nothing, RowToken, Observed };
@@ -379,67 +387,17 @@ size_t forEachCell(const Observations & o, Visit && visit)
 /// redelete budget.
 constexpr size_t kProductCells = (1 + (kRowStates.size() - 1) * 2) * 2 * 2 * 2 * kHeadKinds.size() * 2 * 2 * 2;
 
-/// The cell counts, derived from the dimensions and from which `HEAD` each row state requires, not from `forEachCell`,
-/// `reachable` or `headIsRequired`: a change to the rules has to be argued with this arithmetic. The carry of a
-/// touched pending row changes a step, not a required `HEAD`, so it moves no count here.
+/// Pinned, not computed from `forEachCell`, `reachable` or `requiredHead`: a rule change that moves one of them
+/// has to say why.
 struct CellCounts
 {
-    size_t reachable = 0;
-    size_t required_heads = 0;
-    size_t extra_heads = 0;
-    size_t unbuildable = 0;
-    size_t deletes_shown_by_an_extra_head = 0;
+    size_t reachable = 916;
+    size_t required_heads = 270;
+    size_t extra_heads = 498;
+    size_t unbuildable = 384;   /// `Same` for every row state without a canonical row token
+    /// A candidate (any budget) and a pending row whose redelete budget is spent, untouched at an unsuppressed zero.
+    size_t deletes_shown_by_an_extra_head = 6;
 };
-
-CellCounts expectedCellCounts()
-{
-    constexpr size_t kinds = kHeadKinds.size();
-    constexpr size_t sent_kinds = kinds - 1;             /// all but `NotSent`
-    constexpr size_t suppression_budget_flags = 2 * 2 * 2;   /// suppressed, create budget, redelete budget
-    constexpr size_t zero_touched_fresh_flags = 2 * 2 * 2;
-    /// `Same` needs a canonical row token, so a row without one, and no row, cannot show it.
-    constexpr size_t kinds_without_same = kinds - 1;
-    constexpr size_t sent_kinds_without_same = sent_kinds - 1;
-    /// Of the flags, those whose round sends a pending row's body-delete `HEAD`: unsuppressed, redelete budget admits.
-    constexpr size_t pending_head_flags = 2;   /// either create budget
-    /// Of the flags, those whose round sends a spare `HEAD`: unsuppressed.
-    constexpr size_t spare_head_flags = 2 * 2;   /// either budget
-
-    /// `fresh` is fixed by the other dimensions in a reachable cell, so (at zero, touched) gives one cell each.
-    /// `spare_head`: the row holds a confirmed intent of a canonical token, which a spare may delete.
-    const auto row_cells = [&](size_t head_kinds, size_t sent_head_kinds, bool is_pending, bool spare_head, CellCounts & out)
-    {
-        for (const bool zero : {true, false})
-            for (const bool touched : {true, false})
-            {
-                const size_t required_flags = !zero ? (spare_head ? spare_head_flags : 0)
-                    : touched                      ? suppression_budget_flags
-                    : is_pending                   ? pending_head_flags
-                                                   : 0;
-                const size_t free_flags = suppression_budget_flags - required_flags;
-                out.reachable += required_flags * sent_head_kinds + free_flags * head_kinds;
-                out.required_heads += required_flags * sent_head_kinds;
-                out.extra_heads += free_flags * (head_kinds - 1);
-            }
-    };
-
-    CellCounts counts;
-    row_cells(kinds_without_same, sent_kinds_without_same, false, false, counts);   /// no row
-    /// Candidate, standing, pending; a spare `HEAD` only for the two with a confirmed intent and a canonical token.
-    for (const auto [is_pending, confirmed] : {std::pair{false, false}, std::pair{false, true}, std::pair{true, true}})
-    {
-        row_cells(kinds, sent_kinds, is_pending, confirmed, counts);                                  /// canonical token
-        row_cells(kinds_without_same, sent_kinds_without_same, is_pending, false, counts);   /// uncanonical token
-    }
-
-    counts.unbuildable = kRowStates.size() * zero_touched_fresh_flags * suppression_budget_flags;
-    /// A `HEAD` showing another incarnation deletes the intent of an untouched row at zero that was not going to:
-    /// a candidate (any create or redelete budget) and a pending row whose body-delete `HEAD` was not required
-    /// (redelete budget spent), both unsuppressed.
-    constexpr size_t candidate_flags = 2 * 2;
-    counts.deletes_shown_by_an_extra_head = candidate_flags + pending_head_flags;
-    return counts;
-}
 
 IntentDecision decide(const Cell & c, const Observations & o)
 {
@@ -469,22 +427,16 @@ TEST(CASIntentRules, EveryReachableCellFollowsTheSpec)
     size_t heads_required = 0;
     const size_t unbuildable = forEachCell(o, [&](const Cell & c, const IntentRuleInput & input)
     {
+        /// The fold sends the HEAD this names, and the rules require exactly that one, also before it is sent.
+        const DecisionHeadNeed need = decisionHeadNeed(input);
+        if (wellFormed(c))
+            EXPECT_EQ(need, requiredHead(c)) << describe(c);
         if (!reachable(c))
         {
             ++unreachable_cells;
             return;
         }
         ++reachable_cells;
-        /// The fold sends the HEAD this names, and the rules require exactly that one.
-        const DecisionHeadNeed need = decisionHeadNeed(input);
-        EXPECT_EQ(need != DecisionHeadNeed::None, headIsRequired(c)) << describe(c);
-        if (need == DecisionHeadNeed::TouchedKey)
-            EXPECT_TRUE(c.zero && c.touched) << describe(c);
-        if (need == DecisionHeadNeed::PendingBody)
-            EXPECT_TRUE(c.row == RowState::Pending && c.zero && !c.touched) << describe(c);
-        if (need == DecisionHeadNeed::Spare)
-            EXPECT_TRUE((c.row == RowState::Pending || c.row == RowState::Standing) && !c.zero && c.canonical_token
-                        && !c.suppressed) << describe(c);
         heads_required += need != DecisionHeadNeed::None;
         const IntentDecision got = decideIntentStep(input);
         const Expected want = expected(c);
@@ -492,7 +444,7 @@ TEST(CASIntentRules, EveryReachableCellFollowsTheSpec)
 
         /// An unrequired HEAD never enables a body delete. It enables an intent delete only as a
         /// transition: a HEAD showing another incarnation is itself the evidence that `t` is gone.
-        if (c.head != HeadKind::NotSent && !headIsRequired(c))
+        if (c.head != HeadKind::NotSent && requiredHead(c) == DecisionHeadNeed::None)
         {
             ++extra_heads;
             Cell without = c;
@@ -554,14 +506,13 @@ TEST(CASIntentRules, EveryReachableCellFollowsTheSpec)
     });
 
     EXPECT_EQ(reachable_cells + unreachable_cells + unbuildable, kProductCells);
-    const CellCounts want = expectedCellCounts();
+    const CellCounts want;
     EXPECT_EQ(reachable_cells, want.reachable);
     EXPECT_EQ(heads_required, want.required_heads);
     EXPECT_EQ(extra_heads, want.extra_heads) << "a HEAD that is not required is accepted";
     EXPECT_EQ(deletes_shown_by_an_extra_head, want.deletes_shown_by_an_extra_head)
         << "transitions of untouched rows whose intent stays without the HEAD";
     EXPECT_EQ(unbuildable, want.unbuildable) << "Same is built only for a canonical row token";
-    EXPECT_GT(heads_required, 0u) << "positive control";
     /// Every dimension of a body delete is fixed but the create budget.
     EXPECT_EQ(body_deletes, 2u) << "a body delete of a pending row at an untouched zero, HEAD showing its own token";
     EXPECT_GT(intent_deletes, 0u) << "positive control";
@@ -590,7 +541,7 @@ TEST(CASIntentRules, EveryUnreachableCellThrows)
             EXPECT_EQ(e.code(), DB::ErrorCodes::LOGICAL_ERROR) << describe(c);
         }
     });
-    const CellCounts want = expectedCellCounts();
+    const CellCounts want;
     EXPECT_EQ(unreachable_cells, kProductCells - want.reachable - want.unbuildable);
 }
 #endif
@@ -717,37 +668,6 @@ TEST(CASIntentRules, HeadClassification)
     EXPECT_EQ(classifyDecisionHead(std::optional<Meta>()).seen(), HeadSeen::Absent);
 }
 
-/// A spared `pending` or `standing` row needs its `HEAD`, and deletes the intent of its token only when that `HEAD`
-/// shows another incarnation. The row's own token, an absent body and a token with no identity keep the intent.
-TEST(CASIntentRules, SpareDeletesTheIntentOnlyOverAnotherIncarnation)
-{
-    const Observations o = Observations::make();
-    for (const RowState row : {RowState::Pending, RowState::Standing})
-        for (const bool touched : {false, true})
-        {
-            const Cell base{.row = row, .zero = false, .touched = touched};
-            const String where = describe(base);
-            EXPECT_EQ(decisionHeadNeed(inputOf(base, o).value()), DecisionHeadNeed::Spare) << where;
-
-            Cell other = base;
-            other.head = HeadKind::Other;
-            const IntentDecision deletes = decide(other, o);
-            EXPECT_EQ(deletes.step, IntentStep::Drop) << where;
-            EXPECT_EQ(deletes.intent_to_delete, o.canonical_row_token.canonical()) << where;
-            EXPECT_FALSE(deletes.intent_to_create.has_value()) << where;
-            EXPECT_FALSE(deletes.new_token.has_value()) << where;
-
-            for (const HeadKind kept : {HeadKind::Same, HeadKind::Absent, HeadKind::Uncanonical})
-            {
-                Cell c = base;
-                c.head = kept;
-                const IntentDecision got = decide(c, o);
-                EXPECT_EQ(got.step, IntentStep::Drop) << where << ", HEAD " << name(kept);
-                EXPECT_FALSE(got.intent_to_delete.has_value()) << where << ", HEAD " << name(kept);
-            }
-        }
-}
-
 /// A pending row at an unsuppressed zero whose `HEAD` shows its own token deletes the body only when the round
 /// folded no record of the blob; a touched key is carried. The intent removal of a standing row needs no such proof.
 TEST(CASIntentRules, PendingRowAtATouchedZeroIsCarried)
@@ -771,35 +691,6 @@ TEST(CASIntentRules, PendingRowAtATouchedZeroIsCarried)
     const IntentDecision removes = decide(Cell{.row = RowState::Standing, .touched = true, .head = HeadKind::Absent}, o);
     EXPECT_EQ(removes.step, IntentStep::DeleteIntent) << name(removes.step);
     EXPECT_EQ(removes.intent_to_delete, o.canonical_row_token.canonical());
-}
-
-/// No spare `HEAD` for a row that holds no confirmed intent of a canonical token, or in a suppressed round. A
-/// `HEAD` that arrives anyway deletes nothing there.
-TEST(CASIntentRules, SpareSendsNoHeadWithoutAConfirmedIntentOrInASuppressedRound)
-{
-    const Observations o = Observations::make();
-    const std::vector<Cell> cells{
-        Cell{.row = RowState::Candidate, .zero = false},
-        Cell{.row = RowState::Pending, .canonical_token = false, .zero = false},
-        Cell{.row = RowState::Standing, .canonical_token = false, .zero = false},
-        Cell{.row = RowState::Pending, .zero = false, .suppressed = true},
-        Cell{.row = RowState::Standing, .zero = false, .suppressed = true}};
-    for (const Cell & base : cells)
-    {
-        const String where = describe(base);
-        EXPECT_EQ(decisionHeadNeed(inputOf(base, o).value()), DecisionHeadNeed::None) << where;
-        for (const HeadKind head : kHeadKinds)
-        {
-            Cell c = base;
-            c.head = head;
-            const auto input = inputOf(c, o);
-            if (!input)
-                continue;   /// `Same` needs a canonical row token
-            const IntentDecision got = decideIntentStep(*input);
-            EXPECT_EQ(got.step, IntentStep::Drop) << where << ", HEAD " << name(head);
-            EXPECT_FALSE(got.intent_to_delete.has_value()) << where << ", HEAD " << name(head);
-        }
-    }
 }
 
 /// Two spellings of one token are one incarnation: a spare never reads a respelled row token as another.

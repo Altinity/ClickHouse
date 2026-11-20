@@ -207,17 +207,8 @@ void InMemoryBackend::publish(const BlobPublishRequest & request, TransportAcces
         String body = streaming->fresh_envelope;
         {
             WriteBufferFromString out(body, AppendModeTag{});
-            try
-            {
-                blob_publication_detail::copyBlobPayloadVerified(*payload, out, *streaming, request.destination_key,
-                    "InMemoryBackend::publish: source yielded {}{} payload bytes for {}, declared {} -- nothing was published");
-            }
-            catch (...)
-            {
-                out.cancel();
-                throw;
-            }
-            out.finalize();
+            blob_publication_detail::copyVerifiedPayloadAndFinalize(*payload, out, *streaming, request.destination_key,
+                "InMemoryBackend::publish: source yielded {}{} payload bytes for {}, declared {} -- nothing was published");
         }
 
         std::lock_guard lock(mutex_);

@@ -382,7 +382,7 @@ void expectThrowsCode(int expected_code, F && fn)
     }
     catch (const DB::Exception & e)
     {
-        EXPECT_EQ(e.code(), expected_code);
+        EXPECT_EQ(e.code(), expected_code) << e.message();
     }
 }
 
@@ -2223,32 +2223,24 @@ inline void markCutComplete(DB::Cas::Gc & gc, CountingBackend & backend)
     });
 }
 
-/// A point inside a GC round where a test runs an action.
-enum class RoundInterleavePoint : uint8_t
-{
-    /// After the catalog read that fixes the round's universe, before any namespace is read.
-    AfterCatalogRead,
-    /// After the walk of `RoundInterleaveSelector::first` and before the walk of `second`, in the selected pass.
-    BetweenNamespaces,
-    /// After the last intake read and the `gc/state` validation, before any decision `HEAD`.
-    AfterIntake,
-    /// After the round's deletes, before its `gc/state` commit.
-    AfterRequestsBeforeCommit,
-};
+/// A point inside a GC round where a test runs an action. `AfterNamespaceWalk` is narrowed to one walk by a
+/// `RoundInterleaveSelector`.
+using RoundInterleavePoint = DB::Cas::Gc::RoundPointForTest;
 
 inline const char * roundInterleavePointName(RoundInterleavePoint point)
 {
     switch (point)
     {
         case RoundInterleavePoint::AfterCatalogRead: return "AfterCatalogRead";
-        case RoundInterleavePoint::BetweenNamespaces: return "BetweenNamespaces";
+        /// The name the generated test parameters and their gtest filters use.
+        case RoundInterleavePoint::AfterNamespaceWalk: return "BetweenNamespaces";
         case RoundInterleavePoint::AfterIntake: return "AfterIntake";
         case RoundInterleavePoint::AfterRequestsBeforeCommit: return "AfterRequestsBeforeCommit";
     }
     return "?";
 }
 
-/// The `BetweenNamespaces` site: the walk of `first` in `pass`, when the round walks `second` next, in the same
+/// The `AfterNamespaceWalk` site: the walk of `first` in `pass`, when the round walks `second` next, in the same
 /// pass or as the first walk of pass 2. Namespaces are `RootNamespace` strings. Ignored for the other points.
 struct RoundInterleaveSelector
 {
@@ -2267,24 +2259,13 @@ public:
                         std::function<void()> callback_)
         : gc(gc_)
     {
-        using Point = DB::Cas::Gc::RoundPointForTest;
         gc.setRoundPointHookForTest(
             [this, point, selector = std::move(selector_), callback = std::move(callback_)](
                 const DB::Cas::Gc::RoundPointSiteForTest & site)
             {
-                bool match = false;
-                switch (point)
-                {
-                    case RoundInterleavePoint::AfterCatalogRead: match = site.point == Point::AfterCatalogRead; break;
-                    case RoundInterleavePoint::BetweenNamespaces:
-                        match = site.point == Point::AfterNamespaceWalk && site.pass == selector.pass
-                            && site.walked == selector.first && site.next == selector.second;
-                        break;
-                    case RoundInterleavePoint::AfterIntake: match = site.point == Point::AfterIntake; break;
-                    case RoundInterleavePoint::AfterRequestsBeforeCommit:
-                        match = site.point == Point::AfterRequestsBeforeCommit;
-                        break;
-                }
+                bool match = site.point == point;
+                if (point == RoundInterleavePoint::AfterNamespaceWalk)
+                    match = match && site.pass == selector.pass && site.walked == selector.first && site.next == selector.second;
                 if (!match)
                     return;
                 ++fired_count;
@@ -3016,10 +2997,27 @@ void expectThrowsCodeWithMessage(int expected_code, const String & expected_subs
     }
     catch (const DB::Exception & e)
     {
-        EXPECT_EQ(e.code(), expected_code);
+        EXPECT_EQ(e.code(), expected_code) << e.message();
         EXPECT_NE(e.message().find(expected_substring), String::npos)
             << "wrong branch: " << e.message();
     }
+}
+
+/// The message of the DB::Exception `fn` throws, after expecting EXACTLY `code`; empty if it throws none.
+/// For checking several substrings of one exception without running `fn` again.
+inline String messageOf(int code, const std::function<void()> & fn)
+{
+    try
+    {
+        fn();
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), code) << e.message();
+        return e.message();
+    }
+    ADD_FAILURE() << "expected an exception with code " << code;
+    return {};
 }
 
 }

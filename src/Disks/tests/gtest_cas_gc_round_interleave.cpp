@@ -80,7 +80,7 @@ enum class Hops : uint8_t
     Newborn,
 };
 
-/// Where in the round the copy lands. `pass` and `destination_first` matter only for `BetweenNamespaces`: the walk of
+/// Where in the round the copy lands. `pass` and `destination_first` matter only for `AfterNamespaceWalk`: the walk of
 /// the first namespace of the pair, then the event, then the walk of the second.
 struct EventPoint
 {
@@ -91,10 +91,10 @@ struct EventPoint
 
 const std::vector<EventPoint> kEventPoints = {
     {.point = RoundInterleavePoint::AfterCatalogRead},
-    {.point = RoundInterleavePoint::BetweenNamespaces, .pass = 1, .destination_first = true},
-    {.point = RoundInterleavePoint::BetweenNamespaces, .pass = 1, .destination_first = false},
-    {.point = RoundInterleavePoint::BetweenNamespaces, .pass = 2, .destination_first = true},
-    {.point = RoundInterleavePoint::BetweenNamespaces, .pass = 2, .destination_first = false},
+    {.point = RoundInterleavePoint::AfterNamespaceWalk, .pass = 1, .destination_first = true},
+    {.point = RoundInterleavePoint::AfterNamespaceWalk, .pass = 1, .destination_first = false},
+    {.point = RoundInterleavePoint::AfterNamespaceWalk, .pass = 2, .destination_first = true},
+    {.point = RoundInterleavePoint::AfterNamespaceWalk, .pass = 2, .destination_first = false},
     {.point = RoundInterleavePoint::AfterIntake},
     {.point = RoundInterleavePoint::AfterRequestsBeforeCommit},
 };
@@ -163,7 +163,7 @@ const char * name(Hops v)
 String name(const EventPoint & at)
 {
     String out = roundInterleavePointName(at.point);
-    if (at.point == RoundInterleavePoint::BetweenNamespaces)
+    if (at.point == RoundInterleavePoint::AfterNamespaceWalk)
         out += fmt::format("Pass{}{}", at.pass, at.destination_first ? "DestinationFirst" : "SourceFirst");
     return out;
 }
@@ -300,7 +300,7 @@ public:
         return {};
     }
 
-    /// The pair whose walks the `BetweenNamespaces` event sits between: the hop's tables, or for a newborn
+    /// The pair whose walks the `AfterNamespaceWalk` event sits between: the hop's tables, or for a newborn
     /// destination, which is not walked, the bystander in its place.
     std::pair<const Table *, const Table *> walkPair(const Table * from, const Table * to) const
     {
@@ -551,7 +551,7 @@ public:
     /// the same walk order.
     EventPoint pointOfHop(size_t index) const
     {
-        if (cell.hops == Hops::Relay && index == 0 && cell.at.point == RoundInterleavePoint::BetweenNamespaces)
+        if (cell.hops == Hops::Relay && index == 0 && cell.at.point == RoundInterleavePoint::AfterNamespaceWalk)
             return {.point = cell.at.point, .pass = 1, .destination_first = cell.at.destination_first};
         return cell.at;
     }
@@ -625,7 +625,7 @@ public:
         else
         {
             RoundInterleaveSelector selector;
-            if (at.point == RoundInterleavePoint::BetweenNamespaces)
+            if (at.point == RoundInterleavePoint::AfterNamespaceWalk)
             {
                 /// The destination sorts first exactly when `destination_first`, so the pass walks the pair in name order.
                 const bool to_first = walk_second->ns.string() < walk_first->ns.string();
@@ -724,7 +724,7 @@ public:
 
     bool passTwo(const EventPoint & at) const
     {
-        return cell.drop != SourceDrop::BeforeTheRound && at.point == RoundInterleavePoint::BetweenNamespaces && at.pass == 2;
+        return cell.drop != SourceDrop::BeforeTheRound && at.point == RoundInterleavePoint::AfterNamespaceWalk && at.pass == 2;
     }
 
     /// Committed rounds before the row setup.
@@ -820,7 +820,7 @@ TEST(CASInterleaveMatrixCells, GeneratedAndExcludedCellCounts)
     EXPECT_EQ(product.size(), 2088u);
     EXPECT_EQ(generatedCells().size(), 1012u);
     const auto excludedFor = [&](const Cell & cell) { return excluded[exclusionReason(cell)]; };
-    const EventPoint pass_one{.point = RoundInterleavePoint::BetweenNamespaces, .pass = 1, .destination_first = true};
+    const EventPoint pass_one{.point = RoundInterleavePoint::AfterNamespaceWalk, .pass = 1, .destination_first = true};
     EXPECT_EQ(excludedFor({.path = CopyPath::Relink, .drop = SourceDrop::AfterTheCopy, .row = RowState::None, .hops = Hops::One,
                            .at = pass_one, .gc_shards = kShardedGc}), 696u);
     EXPECT_EQ(excludedFor({.path = CopyPath::HardLink, .drop = SourceDrop::BeforeTheRound, .row = RowState::None,

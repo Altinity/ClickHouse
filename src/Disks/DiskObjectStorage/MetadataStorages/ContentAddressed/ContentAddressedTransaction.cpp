@@ -354,6 +354,17 @@ ContentAddressedTransaction::routeOf(const std::string & path) const
     return metadata_storage.route(*p);
 }
 
+Cas::ManifestId ContentAddressedTransaction::precommitAndUpload(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st)
+{
+    /// Edge before observe: the precommit names every blob before `putBlob` observes one, so a condemnation between
+    /// the upload and the promote cannot delete a body this build relies on.
+    const Cas::ManifestId id = st.build->stageManifest(st.entries);
+    st.build->precommitAdd(ns, ref, id);
+    confirmCopySources(ns, ref, st);
+    uploadPendingBlobs(st);
+    return id;
+}
+
 void ContentAddressedTransaction::uploadPendingBlobs(PartStaging & st)
 {
     /// Build the set of blob hashes actually referenced by the staged manifest. Only Blob
@@ -492,26 +503,10 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
             Cas::throwCasOwnershipConflict("ContentAddressedTransaction: {}/{} was published by another writer while this transaction was staging it", ns.string(), ref);
         if (view)
         {
+            /// `repointRef` promotes through its own build, which adopts existing bodies and uploads none. This build's
+            /// scratch precommit protects the uploads until that promote, then is abandoned, never promoted.
             if (st.build)
-            {
-                /// EDGE-BEFORE-OBSERVE is still load-
-                /// bearing here: a fresh blob's hash must be durably NAMED by a live precommit's
-                /// manifest body before `putBlob` makes its first backend observation. `repointRef`
-                /// below promotes through its OWN internal build (`adoptEvidence`, no `putBlob`) — it
-                /// protects entries whose content ALREADY exists (the carried-forward ones, and this
-                /// transaction's uploads once they land), but cannot itself protect a brand-new upload
-                /// made mid-repoint. So THIS build stages+precommits a SCRATCH manifest over
-                /// `st.entries` (BEFORE it is merged/moved below) — exactly the same closure the normal
-                /// (non-repoint) path further down establishes with `st.build->stageManifest(st.entries)`
-                /// + `precommitAdd`, which already names every hash this transaction is about to upload
-                /// — purely to hold that edge across the upload loop. Once `repointRef`'s own promote
-                /// makes the real (merged) manifest live, this scratch precommit is abandoned; it never
-                /// gets promoted. A marks-only removal never enters this sub-block (`st.build` is null).
-                const Cas::ManifestId scratch_id = st.build->stageManifest(st.entries);
-                st.build->precommitAdd(ns, ref, scratch_id);
-                confirmCopySources(ns, ref, st);
-                uploadPendingBlobs(st);
-            }
+                (void)precommitAndUpload(ns, ref, st);
 
             std::vector<Cas::ManifestEntry> merged;
             for (const auto & e : view->manifest()->entries)
@@ -551,21 +546,8 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "ContentAddressedTransaction: staged entries or removal marks for {}/{} without a Build", ns.string(), ref);
 
-    /// Write path (rev. 15): stage the part manifest body (mints a ManifestId), precommitAdd a
-    /// build-intent owner (closure now protected by reachability), upload the pending blobs, then
-    /// promote — an atomic owner move that validates every blob dependency proof fail-closed.
-    ///
-    /// ORDERING IS LOAD-BEARING (EDGE-BEFORE-OBSERVE):
-    /// precommitAdd's durable closure names EVERY blob hash BEFORE putBlob makes the first backend
-    /// observation. This is what lets promote skip re-validating `Materialized` leaves (a condemnation in the
-    /// putBlob→promote window cannot delete the body — the next fold sees the edge). Moving putBlob before
-    /// precommitAdd would adopt an incarnation with no protecting edge and
-    /// trips the durable-precommit guard in `PartWriteTxn::ensureBlobPresent`; the TLA+ order
-    /// sabotage (Gate A) is the formal guard.
-    const Cas::ManifestId id = st.build->stageManifest(st.entries);
-    st.build->precommitAdd(ns, ref, id);
-    confirmCopySources(ns, ref, st);
-    uploadPendingBlobs(st);
+    /// Promote is an atomic owner move that validates every blob dependency proof.
+    const Cas::ManifestId id = precommitAndUpload(ns, ref, st);
 
     /// Test-only fault seam (Task 3 TDD): simulate a promote-time backend failure for `ref` right
     /// before the durable promote call. A no-op in production (nothing ever arms it).

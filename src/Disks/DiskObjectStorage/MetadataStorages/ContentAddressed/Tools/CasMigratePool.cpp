@@ -228,7 +228,7 @@ public:
                 {
                     say(fmt::format("M6: raising the reader floor to {}; after this write a 26.6 build can no longer open this pool",
                         G_REF_CHAIN));
-                    Pool::raiseReaderFloor(pool.shared_from_this(), G_REF_CHAIN);
+                    pool.raiseReaderFloorToRefChain();
                     ++report.control_objects_written;
                     say(fmt::format("M6: reader floor raised to {}", G_REF_CHAIN));
                 }
@@ -571,10 +571,11 @@ private:
         return {tokens, pairs};
     }
 
-    /// Every slot and both GC pairs read again: each slot has its token, and no slot appeared or vanished.
-    void checkUnchanged(const SlotTokens & tokens, const GcPairs & pairs, Window window)
+    /// Reads every listed slot in order and calls `on_change(srid, gone)` as soon as one differs from `tokens`: a
+    /// present slot with another token or none in `tokens`, then, with `gone`, each slot of `tokens` that is absent.
+    template <typename OnChange>
+    void forEachChangedSlot(const SlotTokens & tokens, OnChange && on_change)
     {
-        checkPairs(pairs, window);
         std::set<String> present;
         for (const String & key : listSlotKeys())
         {
@@ -582,14 +583,21 @@ private:
             const std::optional<Object> got = op.read(key, Retry::standard());
             if (!got)
                 continue;
+            present.insert(srid);
             const auto it = tokens.find(srid);
             if (it == tokens.end() || it->second != got->etag)
-                throwSlotChanged(srid, window);
-            present.insert(srid);
+                on_change(srid, /*gone=*/ false);
         }
         for (const auto & [srid, token] : tokens)
             if (!present.contains(srid))
-                throwSlotChanged(srid, window);
+                on_change(srid, /*gone=*/ true);
+    }
+
+    /// Every slot and both GC pairs read again: each slot has its token, and no slot appeared or vanished.
+    void checkUnchanged(const SlotTokens & tokens, const GcPairs & pairs, Window window)
+    {
+        checkPairs(pairs, window);
+        forEachChangedSlot(tokens, [&](const String & srid, bool /*gone*/) { throwSlotChanged(srid, window); });
     }
 
     /// Holds live only in fold seals under `gc/gen/`, so a `gc/state` that names none must not hide one. An absent state
@@ -891,21 +899,10 @@ private:
     void noteMembersAfterMarkers(const SlotTokens & slots, const GcPairs & pairs, const std::optional<Etag> & state_token)
     {
         std::vector<String> seen;
-        std::set<String> present;
-        for (const String & key : listSlotKeys())
+        forEachChangedSlot(slots, [&](const String & srid, bool gone)
         {
-            const String srid = sridOf(key);
-            const std::optional<Object> got = op.read(key, Retry::standard());
-            if (!got)
-                continue;
-            present.insert(srid);
-            const auto it = slots.find(srid);
-            if (it == slots.end() || it->second != got->etag)
-                seen.push_back(fmt::format("server root '{}'", srid));
-        }
-        for (const auto & [srid, token] : slots)
-            if (!present.contains(srid))
-                seen.push_back(fmt::format("server root '{}' (its slot is gone)", srid));
+            seen.push_back(gone ? fmt::format("server root '{}' (its slot is gone)", srid) : fmt::format("server root '{}'", srid));
+        });
         const std::optional<Object> stored_state = op.read(layout.gcStateKey(), Retry::standard());
         const bool state_moved = stored_state.has_value() != state_token.has_value() || (stored_state && stored_state->etag != *state_token);
         if (const auto owner = gcOwnerThatMoved(pairs); owner || state_moved)

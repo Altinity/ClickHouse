@@ -1072,6 +1072,15 @@ size_t countVerdictsAtKey(const FsckReport & report, const String & key, FsckCla
         [&](const FsckObject & object) { return object.key == key && object.cls == cls; }));
 }
 
+/// Deletes `key` with the raw backend, conditional on the token its `HEAD` shows; `what` prefixes the failure.
+void removeFsckFixtureKey(DB::Cas::Backend & backend, const String & key, std::string_view what = {})
+{
+    OperationForTest op(backend);
+    const auto head = (*op).head(key, Retry::once());
+    ASSERT_TRUE(head.has_value()) << what << key;
+    ASSERT_EQ((*op).remove(key, head->etag, Retry::once()), Removal::Removed);
+}
+
 bool uncheckedNoteContains(const FsckReport & report, const String & key, const String & text)
 {
     return std::any_of(report.objects.begin(), report.objects.end(), [&](const FsckObject & object)
@@ -1598,13 +1607,7 @@ struct FsckIntentFixture
 
     void marker(uint64_t b) { writeMetaClean(*backend, layout, numberedBlobHash(b), 1); }
 
-    void removeKey(const String & key)
-    {
-        OperationForTest op(*backend);
-        const auto head = (*op).head(key, Retry::once());
-        ASSERT_TRUE(head.has_value()) << key;
-        ASSERT_EQ((*op).remove(key, head->etag, Retry::once()), Removal::Removed);
-    }
+    void removeKey(const String & key) { removeFsckFixtureKey(*backend, key); }
 
     FsckReport fsck(bool detail = true, bool fix = false, bool verify = false)
     {
@@ -1621,12 +1624,6 @@ struct FsckIntentFixture
         return keys;
     }
 };
-
-size_t countRows(const FsckReport & report, FsckClass cls, const String & key)
-{
-    return static_cast<size_t>(std::count_if(report.objects.begin(), report.objects.end(),
-        [&](const FsckObject & o) { return o.cls == cls && o.key == key; }));
-}
 
 bool isMutation(JournalVerb verb)
 {
@@ -1679,10 +1676,10 @@ TEST(CASFsck, IntentClassesCurrentReplacedBodyGoneMalformed)
     EXPECT_EQ(rep.intent_body_gone, 1u);
     EXPECT_EQ(rep.intent_malformed, 1u);
     EXPECT_EQ(rep.intent_unread, 0u);
-    EXPECT_EQ(countRows(rep, FsckClass::IntentCurrent, current), 1u);
-    EXPECT_EQ(countRows(rep, FsckClass::IntentReplaced, replaced), 1u);
-    EXPECT_EQ(countRows(rep, FsckClass::IntentBodyGone, gone), 1u);
-    EXPECT_EQ(countRows(rep, FsckClass::IntentMalformed, malformed), 1u);
+    EXPECT_EQ(countVerdictsAtKey(rep, current, FsckClass::IntentCurrent), 1u);
+    EXPECT_EQ(countVerdictsAtKey(rep, replaced, FsckClass::IntentReplaced), 1u);
+    EXPECT_EQ(countVerdictsAtKey(rep, gone, FsckClass::IntentBodyGone), 1u);
+    EXPECT_EQ(countVerdictsAtKey(rep, malformed, FsckClass::IntentMalformed), 1u);
     EXPECT_EQ(rep.dangling, 0u);
 }
 
@@ -1747,7 +1744,7 @@ TEST(CASFsck, MalformedKeyIsIntentMalformed)
     const FsckReport rep = f.fsck();
 
     EXPECT_EQ(rep.intent_malformed, 1u);
-    EXPECT_EQ(countRows(rep, FsckClass::IntentMalformed, key), 1u);
+    EXPECT_EQ(countVerdictsAtKey(rep, key, FsckClass::IntentMalformed), 1u);
     EXPECT_GE(countKeyRequests(f.backend->journal(), JournalVerb::List, f.layout.blobIntentsPrefix()), 1u)
         << "positive control: the intent prefix was listed";
     EXPECT_EQ(countKeyRequests(f.backend->journal(), JournalVerb::Read, key), 0u) << "a key that is no intent key is not read";
@@ -1799,8 +1796,8 @@ TEST(CASFsck, FailedReadIsUnread)
 
     EXPECT_EQ(rep.intent_unread, 2u);
     EXPECT_EQ(rep.intent_current + rep.intent_replaced + rep.intent_body_gone + rep.intent_malformed, 0u);
-    EXPECT_EQ(countRows(rep, FsckClass::IntentUnread, read_refused), 1u);
-    EXPECT_EQ(countRows(rep, FsckClass::IntentUnread, head_refused), 1u);
+    EXPECT_EQ(countVerdictsAtKey(rep, read_refused, FsckClass::IntentUnread), 1u);
+    EXPECT_EQ(countVerdictsAtKey(rep, head_refused, FsckClass::IntentUnread), 1u);
     EXPECT_FALSE(rep.clean());
     EXPECT_NE(rep.intent_unread_reason.find("NOT_IMPLEMENTED"), String::npos) << rep.intent_unread_reason;
     EXPECT_NE(rep.intent_unread_reason.find("injected refusal"), String::npos) << rep.intent_unread_reason;
@@ -1841,7 +1838,7 @@ TEST(CASFsck, UncanonicalHeadTokenIsUnread)
     const FsckReport rep = f.fsck(/*detail=*/true, /*fix_legacy_markers=*/ false, /*verify=*/true);
 
     EXPECT_EQ(rep.intent_unread, 1u);
-    EXPECT_EQ(countRows(rep, FsckClass::IntentUnread, intent), 1u);
+    EXPECT_EQ(countVerdictsAtKey(rep, intent, FsckClass::IntentUnread), 1u);
     EXPECT_EQ(rep.intent_current + rep.intent_replaced + rep.intent_body_gone, 0u) << "no verdict from a token that cannot be compared";
     EXPECT_FALSE(rep.clean());
     EXPECT_FALSE(rep.intent_unread_reason.empty());
@@ -1904,18 +1901,8 @@ TEST(CASFsck, RefusedDeleteStopsTheRun)
     f.backend->refused_deletes.insert(markers[1]);
     f.backend->clearJournal();
 
-    String message;
-    try
-    {
-        (void)f.fsck(/*detail=*/false, /*fix_legacy_markers=*/ true);
-        FAIL() << "a refused delete must stop the run";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::NOT_IMPLEMENTED);
-        message = e.message();
-    }
-
+    const String message
+        = messageOf(DB::ErrorCodes::NOT_IMPLEMENTED, [&] { (void)f.fsck(/*detail=*/false, /*fix_legacy_markers=*/ true); });
     EXPECT_NE(message.find("1 legacy marker(s) deleted before"), String::npos) << message;
     EXPECT_FALSE(objectPresent(*f.backend, markers[0]));
     EXPECT_TRUE(objectPresent(*f.backend, markers[1]));
@@ -1944,7 +1931,7 @@ TEST(CASFsck, LegacyMarkersAreDebrisAndTheFixDeletesThem)
     EXPECT_EQ(plain.legacy_marker, 3u);
     EXPECT_EQ(plain.legacy_markers_deleted, 0u);
     EXPECT_TRUE(plain.clean());
-    EXPECT_EQ(countRows(plain, FsckClass::LegacyMarker, f.markerKey(1)), 1u);
+    EXPECT_EQ(countVerdictsAtKey(plain, f.markerKey(1), FsckClass::LegacyMarker), 1u);
     for (const uint64_t b : {1, 2, 3})
         EXPECT_TRUE(objectPresent(*f.backend, f.markerKey(b))) << "a scan without the fix deletes nothing";
 
@@ -2005,17 +1992,11 @@ TEST(CASFsck, FixLoopHonoursTheDeadline)
     const std::vector<String> keys{f.markerKey(1), f.markerKey(2)};
     uint64_t deleted = 0;
 
-    try
+    expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, "0 legacy marker(s) deleted before", [&]
     {
         (void)removeLegacyMarkers(*f.store, keys, 1, std::chrono::steady_clock::now() - std::chrono::seconds(1),
                                   [&](uint64_t n) { deleted = n; });
-        FAIL() << "an expired deadline must stop the fix";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::TIMEOUT_EXCEEDED) << e.message();
-        EXPECT_NE(e.message().find("0 legacy marker(s) deleted before"), String::npos) << e.message();
-    }
+    });
     EXPECT_EQ(deleted, 0u);
     EXPECT_TRUE(objectPresent(*f.backend, f.markerKey(1)));
     EXPECT_TRUE(objectPresent(*f.backend, f.markerKey(2)));
@@ -2047,16 +2028,10 @@ TEST(CASFsck, FixLoopChecksTheDeadlineBeforeEachRequest)
         f.backend->clearJournal();
         uint64_t reported = 99;
 
-        try
+        expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, fmt::format("{} legacy marker(s) deleted before", slow), [&]
         {
             (void)removeLegacyMarkers(*f.store, keys, 1, deadline, [&](uint64_t n) { reported = n; });
-            ADD_FAILURE() << "the deadline passed during a HEAD and must stop the fix";
-        }
-        catch (const DB::Exception & e)
-        {
-            EXPECT_EQ(e.code(), DB::ErrorCodes::TIMEOUT_EXCEEDED) << e.message();
-            EXPECT_NE(e.message().find(fmt::format("{} legacy marker(s) deleted before", slow)), String::npos) << e.message();
-        }
+        });
         const auto journal = f.backend->journal();
         EXPECT_EQ(countKeyRequests(journal, JournalVerb::Head, keys[slow]), 1u) << "positive control: the slow HEAD was sent";
         EXPECT_EQ(countKeyRequests(journal, JournalVerb::Remove, keys[slow]), 0u) << "deleted after the deadline";
@@ -2096,15 +2071,10 @@ TEST(CASFsck, FixNeedsAWholePoolScan)
 {
     FsckIntentFixture f;
     f.marker(1);
-    try
+    expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
     {
         (void)runFsck(*f.store, false, {}, {}, false, "00", /*fix_legacy_markers=*/ true);
-        FAIL() << "a fix over a scoped scan must be refused";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::BAD_ARGUMENTS) << e.message();
-    }
+    });
     EXPECT_TRUE(objectPresent(*f.backend, f.markerKey(1)));
 }
 
@@ -2190,23 +2160,9 @@ struct FsckGcFixture
     }
 
     /// Removes the intent with the raw backend, as nothing in the protocol does while its row is `pending`.
-    void removeBody(uint64_t b)
-    {
-        const String key = bodyKey(b);
-        OperationForTest op(*backend);
-        const auto head = (*op).head(key, Retry::once());
-        ASSERT_TRUE(head.has_value()) << key;
-        ASSERT_EQ((*op).remove(key, head->etag, Retry::once()), Removal::Removed);
-    }
+    void removeBody(uint64_t b) { removeFsckFixtureKey(*backend, bodyKey(b)); }
 
-    void removeIntent(uint64_t b)
-    {
-        const String key = intentKey(b);
-        OperationForTest op(*backend);
-        const auto head = (*op).head(key, Retry::once());
-        ASSERT_TRUE(head.has_value()) << "fixture: the round wrote the intent of " << key;
-        ASSERT_EQ((*op).remove(key, head->etag, Retry::once()), Removal::Removed);
-    }
+    void removeIntent(uint64_t b) { removeFsckFixtureKey(*backend, intentKey(b), "fixture: the round wrote the intent of "); }
 };
 
 bool anyNoteContains(const FsckReport & report, FsckClass cls, std::string_view text)
@@ -2338,7 +2294,7 @@ TEST(CASFsck, PendingRowWithoutIntentOverABodyGoneBeforeTheScanIsInformational)
         EXPECT_EQ(rep.pending_intent_absent, 1u) << formatFsckSummary(rep);
         EXPECT_EQ(rep.pending_without_intent, 0u);
         EXPECT_TRUE(rep.clean()) << formatFsckSummary(rep);
-        EXPECT_EQ(countRows(rep, FsckClass::PendingIntentAbsent, f.bodyKey(1)), 1u);
+        EXPECT_EQ(countVerdictsAtKey(rep, f.bodyKey(1), FsckClass::PendingIntentAbsent), 1u);
         EXPECT_EQ(countKeyRequests(f.backend->journal(), JournalVerb::Read, intent), 1u)
             << "positive control: the row's intent was read";
     }
@@ -2354,14 +2310,18 @@ TEST(CASFsck, PendingRowWithoutItsIntentOverItsBodyIsHard)
     f.removeIntent(1);
     ASSERT_TRUE(objectPresent(*f.backend, f.bodyKey(1)));
     f.backend->clearJournal();
+    /// The re-read is not a way out: the row is still `pending` for the same token, so the finding stands.
+    bool reread_seen = false;
+    f.backend->beforeRead(f.store->layout().gcStateKey(), 1, [&] { reread_seen = true; });
 
     const FsckReport rep = runFsck(*f.store, /*detail=*/false);
 
+    EXPECT_TRUE(reread_seen) << "positive control: the state was read a second time";
     EXPECT_EQ(rep.pending_without_intent, 1u);
     EXPECT_EQ(rep.pending_gc, 0u);
     EXPECT_FALSE(rep.clean());
     EXPECT_NE(formatFsckSummary(rep).find("pending_without_intent=1"), String::npos) << formatFsckSummary(rep);
-    EXPECT_EQ(countRows(rep, FsckClass::PendingWithoutIntent, f.bodyKey(1)), 1u) << "the row is listed even without `detail`";
+    EXPECT_EQ(countVerdictsAtKey(rep, f.bodyKey(1), FsckClass::PendingWithoutIntent), 1u) << "the row is listed even without `detail`";
     EXPECT_TRUE(anyNoteContains(rep, FsckClass::PendingWithoutIntent, "without warning"));
     const auto journal = f.backend->journal();
     EXPECT_EQ(countKeyRequests(journal, JournalVerb::Read, f.intentKey(1)), 1u);
@@ -2386,7 +2346,7 @@ TEST(CASFsck, PendingRowWithoutIntentOverAnAbsentBodyIsInformational)
     EXPECT_EQ(rep.pending_intent_absent, 1u);
     EXPECT_EQ(rep.pending_without_intent, 0u);
     EXPECT_TRUE(rep.clean());
-    EXPECT_EQ(countRows(rep, FsckClass::PendingIntentAbsent, f.bodyKey(1)), 1u);
+    EXPECT_EQ(countVerdictsAtKey(rep, f.bodyKey(1), FsckClass::PendingIntentAbsent), 1u);
 }
 
 /// Intent absent and another incarnation at the body's key: the row names a body that is gone.
@@ -2434,23 +2394,6 @@ TEST(CASFsck, PendingRowThatMovesBeforeTheRereadIsNoFinding)
     EXPECT_EQ(rep.pending_without_intent, 0u);
     EXPECT_EQ(rep.pending_intent_absent, 1u);
     EXPECT_TRUE(rep.clean());
-}
-
-/// The re-read is not a way out: when the row is still `pending` for the same token, the finding stands.
-TEST(CASFsck, PendingRowStillPendingAtTheRereadStaysHard)
-{
-    FsckGcFixture f;
-    f.drop();
-    f.round();
-    f.removeIntent(1);
-    bool reread_seen = false;
-    f.backend->beforeRead(f.store->layout().gcStateKey(), 1, [&] { reread_seen = true; });
-
-    const FsckReport rep = runFsck(*f.store, /*detail=*/false);
-
-    EXPECT_TRUE(reread_seen) << "positive control: the state was read a second time";
-    EXPECT_EQ(rep.pending_without_intent, 1u);
-    EXPECT_FALSE(rep.clean());
 }
 
 /// Rows live in every shard of the snapshot: the check reads them all.
@@ -2561,7 +2504,7 @@ TEST(CASFsck, PendingRowTokenIsComparedCanonically)
 
     EXPECT_EQ(rep.pending_without_intent, 1u) << formatFsckSummary(rep);
     EXPECT_FALSE(rep.clean());
-    EXPECT_EQ(countRows(rep, FsckClass::PendingWithoutIntent, body_key), 1u);
+    EXPECT_EQ(countVerdictsAtKey(rep, body_key, FsckClass::PendingWithoutIntent), 1u);
 }
 
 /// The second read of `gc/state` clears a suspect only when it is a complete snapshot: a seal it names that is
@@ -2634,7 +2577,7 @@ TEST(CASFsck, PendingRowWithAnUncanonicalTokenIsItsOwnClass)
     EXPECT_EQ(rep.pending_without_intent, 0u);
     EXPECT_EQ(rep.pending_gc, 0u);
     EXPECT_TRUE(rep.clean());
-    EXPECT_EQ(countRows(rep, FsckClass::PendingTokenRejected, body_key), 1u);
+    EXPECT_EQ(countVerdictsAtKey(rep, body_key, FsckClass::PendingTokenRejected), 1u);
     for (const JournalEntry & entry : backend->journal())
         for (const String & key : entry.keys)
             EXPECT_FALSE(key.starts_with(store->layout().blobIntentsPrefix()) && entry.verb == JournalVerb::Read) << "no intent key exists: " << key;

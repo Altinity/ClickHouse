@@ -453,28 +453,12 @@ SourceEdgeRecord standingRecord(const BlobRef & ref)
 
 void expectEncodeRefused(const SourceEdgeRecord & r)
 {
-    try
-    {
-        static_cast<void>(encodeRun({r}));
-        FAIL() << "expected CORRUPTED_DATA";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA) << e.message();
-    }
+    cas_battery_detail::expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { static_cast<void>(encodeRun({r})); }, "encode");
 }
 
 void expectCorruptedRun(const String & bytes)
 {
-    try
-    {
-        static_cast<void>(decodeRun(bytes));
-        FAIL() << "expected CORRUPTED_DATA";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA) << e.message();
-    }
+    cas_battery_detail::expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { static_cast<void>(decodeRun(bytes)); }, "decode");
 }
 
 }
@@ -529,15 +513,7 @@ TEST(CASRecordStream, RefusedAppendLeavesTheWriterUsable)
     writer.append(edge(chRef(1), 10));
     SourceEdgeRecord refused = standingRecord(chRef(3));
     refused.delete_pending = false;
-    try
-    {
-        writer.append(refused);
-        FAIL() << "expected CORRUPTED_DATA";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA) << e.message();
-    }
+    cas_battery_detail::expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { writer.append(refused); }, "append");
     /// Orders after the last accepted record and before the refused one.
     writer.append(edge(chRef(2), 10));
     writer.finish();

@@ -767,32 +767,13 @@ candidate is retained and counted, and a missing adopted fold seal fails the rou
 Every row lives in the condemned sentinel rows of the source-edge run, at `source_id = 0`, with the
 exact token, the condemn round, and the state flags `delete_pending` and `standing`.
 
-```mermaid
-flowchart LR
-    A["round n: cut shows in-degree 0<br/>HEAD -- body has token t"] --> B["PUT intent I(B,t), If-None-Match"]
-    B -->|confirmed| P["row pending(t)"]
-    B -->|"not confirmed, or over budget"| C["row candidate(t), create again next round"]
-    C --> B
-    P --> D{"round n+1: cut"}
-    D -->|"a reference: HEAD"| S["row dropped<br/>DELETE I(B,t) only if the body has another token u"]
-    D -->|"still zero, no record of the blob folded: HEAD"| E{"body now?"}
-    D -->|"zero, but the blob was touched in the round: HEAD"| P
-    E -->|"token t"| F["DELETE body If-Match t<br/>row standing(t)"]
-    E -->|"absent"| F2["no body request<br/>row standing(t)"]
-    E -->|"another token u"| T["PUT intent I(B,u), DELETE I(B,t)<br/>row pending(u)"]
-    F --> G{"round n+2: cut taken after the standing commit"}
-    F2 --> G
-    G -->|"a reference: HEAD"| S
-    G -->|"still zero"| H["DELETE intent I(B,t)<br/>row dropped"]
-```
-
 | Round | Cut shows | `GC` sends | The row afterwards |
 |---|---|---|---|
 | `n` | blob reached zero | `HEAD` of the body; intent `PUT` with `If-None-Match` | `pending(t)` if the create was confirmed, else `candidate(t)`. Nothing is deleted |
 | after `n` (`candidate`) | still zero | the intent `PUT` again | `pending(t)` or still `candidate(t)` |
-| after `n` (`pending`) | still zero, and the round did not touch the blob | `HEAD`; `DELETE` of the body with `If-Match` on the token the `HEAD` showed | `standing(t)` |
+| after `n` (`pending`) | still zero, and the round did not touch the blob | `HEAD`; `DELETE` of the body with `If-Match` on the token the `HEAD` showed, or no body request when the `HEAD` finds no body | `standing(t)` |
 | after `n` (`pending`) | zero, but the round touched the blob (it folded an edge or a delta of it, or retired an orphan source edge) | `HEAD` | `pending(t)` and the intent stay when the body still has token `t`; `standing(t)` when the body is absent; a transition when it has another token |
-| after the body delete (`standing`) | still zero | `DELETE` of the intent | dropped |
+| after the body delete (`standing`) | still zero, in a cut taken after the `standing` commit | `DELETE` of the intent | dropped |
 | `candidate` | a reference | nothing | dropped; an intent stays |
 | `pending` or `standing` | a reference | `HEAD`; intent `DELETE` for `t` when it shows another token `u` | dropped; the intent stays otherwise |
 | any, the `HEAD` shows another token `u` | still zero | intent `PUT` for `u`, intent `DELETE` for `t` | `pending(u)` or `candidate(u)`, in one commit |

@@ -238,6 +238,10 @@ private:
     /// by `cleanupPendingTempFiles`. Used for both new refs and committed-ref repoints.
     void uploadPendingBlobs(PartStaging & st);
 
+    /// Stages `st.entries` as a manifest of `st.build`, precommits it at `ref`, confirms the copy sources and uploads
+    /// the pending blobs, in that order. Returns the staged manifest's id.
+    Cas::ManifestId precommitAndUpload(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st);
+
     /// Adopts a manifest entry into another part while preserving its storage state. For a pending
     /// blob, `copy_pending` controls whether the staging record is copied (hardlink semantics) or
     /// has already been moved by the caller; no dependency exists until its upload succeeds. For

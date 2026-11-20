@@ -29,7 +29,7 @@ bool isProbeSubtreeDebris(const String & probe_root, const String & key)
 
 }
 
-BootstrapResidual probePoolBootstrapResidual(CasOperation & op, const Layout & layout, std::optional<String> * pool_meta_bytes)
+BootstrapResidual probePoolBootstrapResidual(CasOperation & op, const Layout & layout, std::optional<String> & pool_meta_bytes)
 {
     const String pool_meta_key = layout.poolMetaKey();
     const String catalog_key = layout.refCatalogKey();
@@ -49,8 +49,7 @@ BootstrapResidual probePoolBootstrapResidual(CasOperation & op, const Layout & l
     {
         if (auto got = op.read(pool_meta_key, Retry::standard()))
         {
-            if (pool_meta_bytes)
-                *pool_meta_bytes = std::move(got->bytes);
+            pool_meta_bytes = std::move(got->bytes);
             return BootstrapResidual::PoolMetaPresent;
         }
     }

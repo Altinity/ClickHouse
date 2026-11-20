@@ -1157,7 +1157,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         }
         for (const ReplacedEntry & replaced : merge.replaced)
         {
-            const RetiredEntry & entry = replaced.fresh;
+            const RetiredEntry & entry = merge.still_retired[replaced.row];
             ProfileEvents::increment(ProfileEvents::CASGCRetireReplaced);
             /// RESURRECT-REUPLOAD-ORPHAN: the current object token differed from a stale retired entry;
             /// the fold superseded that entry and re-condemned the current token in the same window.
@@ -1178,16 +1178,11 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// After every body delete answered: an intent removal never shares a job with the delete of its body.
     {
         std::vector<WriteOnceKey> intent_deletes;
-        uint64_t unconfirmed_creates = 0;
-        uint64_t uncanonical_tokens = 0;
-        uint64_t standing_anomalies = 0;
-        uint64_t undecodable_bodies = 0;
-        uint64_t undecodable_spares = 0;
-        String unconfirmed_example;
-        String undecodable_example;
-        String undecodable_spare_example;
-        String uncanonical_example;
-        String standing_anomaly_example;
+        CountWithExample unconfirmed_creates;
+        CountWithExample uncanonical_tokens;
+        CountWithExample standing_anomalies;
+        CountWithExample undecodable_bodies;
+        CountWithExample undecodable_spares;
         for (const RetiredMergeResult & merge : folded.retired_merge)
             intent_deletes.insert(intent_deletes.end(), merge.intent_deletes.begin(), merge.intent_deletes.end());
         /// The spares' deletes share the batch and are the tail of it from here on.
@@ -1196,21 +1191,11 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             intent_deletes.insert(intent_deletes.end(), merge.spare_intent_deletes.begin(), merge.spare_intent_deletes.end());
         for (const RetiredMergeResult & merge : folded.retired_merge)
         {
-            unconfirmed_creates += merge.unconfirmed_creates;
-            uncanonical_tokens += merge.uncanonical_tokens;
-            standing_anomalies += merge.standing_anomalies;
-            if (unconfirmed_example.empty())
-                unconfirmed_example = merge.unconfirmed_create_example;
-            undecodable_bodies += merge.undecodable_bodies;
-            if (undecodable_example.empty())
-                undecodable_example = merge.undecodable_example;
-            undecodable_spares += merge.undecodable_spares;
-            if (undecodable_spare_example.empty())
-                undecodable_spare_example = merge.undecodable_spare_example;
-            if (uncanonical_example.empty())
-                uncanonical_example = merge.uncanonical_example;
-            if (standing_anomaly_example.empty())
-                standing_anomaly_example = merge.standing_anomaly_example;
+            unconfirmed_creates.merge(merge.unconfirmed_creates);
+            uncanonical_tokens.merge(merge.uncanonical_tokens);
+            standing_anomalies.merge(merge.standing_anomalies);
+            undecodable_bodies.merge(merge.undecodable_bodies);
+            undecodable_spares.merge(merge.undecodable_spares);
         }
         if (!suppress_destructive && !intent_deletes.empty())
         {
@@ -1240,27 +1225,27 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                 });
         }
         pending_deletes_timer->metric("intent_deletes", suppress_destructive ? 0 : intent_deletes.size());
-        if (unconfirmed_creates)
+        if (unconfirmed_creates.count)
             LOG_ERROR(logger,
                 "CAS gc: {} deletion-intent creates were not confirmed this round; those blobs stay candidates and "
-                "are retried in a later round. First: {}", unconfirmed_creates, unconfirmed_example);
-        if (uncanonical_tokens)
+                "are retried in a later round. First: {}", unconfirmed_creates.count, unconfirmed_creates.example);
+        if (uncanonical_tokens.count)
             LOG_ERROR(logger,
                 "CAS gc: {} blob observations or rows this round carry a token that names no incarnation; GC never "
-                "deletes such a body. First: `{}`", uncanonical_tokens, uncanonical_example);
-        if (standing_anomalies)
+                "deletes such a body. First: `{}`", uncanonical_tokens.count, uncanonical_tokens.example);
+        if (standing_anomalies.count)
             LOG_ERROR(logger,
                 "CAS gc: {} standing rows observed their own token again after their body delete; carried, nothing "
-                "deleted. First: `{}`", standing_anomalies, standing_anomaly_example);
-        if (undecodable_bodies)
+                "deleted. First: `{}`", standing_anomalies.count, standing_anomalies.example);
+        if (undecodable_bodies.count)
             LOG_ERROR(logger,
                 "CAS gc: {} blob bodies this round are shorter than the pool's blob envelope; GC recorded no row for "
-                "them, carried their rows and deleted nothing. First: `{}`", undecodable_bodies, undecodable_example);
-        if (undecodable_spares)
+                "them, carried their rows and deleted nothing. First: `{}`", undecodable_bodies.count, undecodable_bodies.example);
+        if (undecodable_spares.count)
             LOG_ERROR(logger,
                 "CAS gc: {} blob bodies of spared rows this round are shorter than the pool's blob envelope; GC dropped "
-                "their rows, kept their intents and deleted nothing. First: `{}`", undecodable_spares,
-                undecodable_spare_example);
+                "their rows, kept their intents and deleted nothing. First: `{}`", undecodable_spares.count,
+                undecodable_spares.example);
     }
 
     /// Outcome logs: write-once + byte-adopt (observation-bearing HEAD tokens — never the
@@ -3839,23 +3824,10 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
                 nomination.source_retirements.end());
     }
 
-    /// WHICH BLOBS THE MERGE CAN CLOSE AT ZERO. `closeBlob` HEADs under `cur_edges == 0 && cur_touched`:
-    /// no key of the blob ended present, and at least one was touched. Every prior-run edge that survives
-    /// increments `cur_edges`, so reaching zero requires each of them to be killed at its own key by a
-    /// `-1` delta or a source retirement -- which puts a removal-last verdict in the map below -- while
-    /// any activation-last verdict leaves an edge standing and is the exclusion clause. Retirements are
-    /// folded in AFTER the deltas because the merge applies them that way, unconditionally: a key whose
-    /// deltas end in an activation but which a retirement then clears is a candidate too.
-    ///
-    /// IT IS A SUPERSET, AND NOTHING MAY COME TO DEPEND ON IT BEING EXACT. A blob named here that keeps
-    /// an untouched prior edge costs one HEAD the merge never takes; a candidate this set misses is
-    /// HEADed inline, which is simply the behaviour with no read-ahead at all. Both are counted, and
-    /// neither is asserted.
-    ///
-    /// PLACED HERE, not at the top of the phase: `orphan_source_retirements` is decided just above by
-    /// the sweep, and a retirement is a removal like any other. The round's cut is frozen well before
-    /// this point -- intake has finished and `deltas` has taken its final form -- so no HEAD is issued
-    /// before the round knows what it folded.
+    /// The blobs the merge may close at zero: a key whose last verdict is a removal, and none whose last verdict
+    /// is an activation. Retirements count after the deltas, as the merge applies them. The set is a superset, and
+    /// nothing may depend on it being exact: a blob that keeps an untouched prior edge costs one unused `HEAD`, and
+    /// a missed one is decided inline. Built after the sweep decided `orphan_source_retirements`, past the cut.
     ///
     /// The two sets below steer the condemned-row read-ahead and are disjoint. They stay empty when nothing reads
     /// them: on the sequential setting, in a suppressed round, and when no parent row is `pending` or `standing`.
@@ -4016,19 +3988,28 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         }
         /// Empty deltas still settle the `RunMarker::Condemned` rows riding the parent run. Two replicas may
         /// run reducers for DIFFERENT shards concurrently (CasGcScheduler ownership); their run keys never collide.
-        std::vector<RunRef> shard_runs;
         head_hint_shard = shard;
         next_head_hint = 0;
+        RunRef shard_run;
         try
         {
-            foldDeltasIntoGeneration(
-                op, layout, priorRunsFor(shard), new_generation, attempt, shard,
-                std::move(buckets[shard]), shard_runs,
-                current_round, condemn_round, head_blob, peek_head,
-                create_intent,
-                &result.retired_merge[shard], suppress_destructive,
-                &ledger.applied, std::move(retirement_buckets[shard]),
-                &work_budget, pending_hints, pending_head, std::move(intent_nominations[shard]), spare_head);
+            shard_run = foldDeltasIntoGeneration(
+                op, layout, priorRunsFor(shard), new_generation, attempt, shard, std::move(buckets[shard]),
+                ShardFoldOptions{
+                    .current_round = current_round,
+                    .condemn_round = condemn_round,
+                    .head_blob = head_blob,
+                    .peek_head = peek_head,
+                    .pending_head = pending_head,
+                    .spare_head = spare_head,
+                    .create_intent = create_intent,
+                    .out_retired = &result.retired_merge[shard],
+                    .suppress_destructive = suppress_destructive,
+                    .out_applied_by_txn_ordinal = &ledger.applied,
+                    .source_retirements = std::move(retirement_buckets[shard]),
+                    .work_budget = &work_budget,
+                    .pending_hints = pending_hints,
+                    .intent_nominations = std::move(intent_nominations[shard])});
         }
         catch (const Exception & e)
         {
@@ -4038,8 +4019,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
             throw;
         }
         discardReservedReads();
-        for (RunRef & r : shard_runs)
-            result.fold_seal.blob_target_runs.push_back(std::move(r));
+        result.fold_seal.blob_target_runs.push_back(std::move(shard_run));
         result.fold_seal.condemned_summary[shard] = summarize(result.retired_merge[shard].still_retired);
     }
 
@@ -5081,19 +5061,11 @@ RebuildReport Gc::rebuildBaseline(bool force)
     {
         if (buckets[shard].empty())
             return;
-        std::vector<RunRef> out;
-        foldDeltasIntoGeneration(op, layout, prior_runs[shard], generation, ++attempt_of[shard],
-                                 shard, std::move(buckets[shard]), out,
-                                 /*current_round*/0, /*condemn_round*/0, /*head_blob*/{},
-                                 /*peek_head*/{}, /*create_intent*/{},
-                                 /*out_retired*/nullptr, /*suppress_destructive*/false,
-                                 /// Probe B2 does not apply to the rebuild: it derives edges from raw
-                                 /// owner STATE, not from a stream of ref transactions, so there is no
-                                 /// transaction whose deltas could go unapplied and no fold cursor to
-                                 /// advance past one. Every delta it emits carries ordinal 0.
-                                 /*out_applied_by_txn_ordinal*/nullptr);
+        /// No applied-delta ledger either: the rebuild derives edges from owner state, not from ref transactions.
+        RunRef run = foldDeltasIntoGeneration(op, layout, prior_runs[shard], generation, ++attempt_of[shard], shard,
+                                              std::move(buckets[shard]));
         buckets[shard].clear();
-        prior_runs[shard] = std::move(out);
+        prior_runs[shard] = {std::move(run)};
     };
     auto route_deltas = [&](std::vector<BlobDelta> & deltas)
     {
