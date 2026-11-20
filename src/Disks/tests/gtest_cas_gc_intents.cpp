@@ -5742,6 +5742,7 @@ struct InheritedRunRound
     std::vector<Request> requests;
     uint64_t parent_round = 0;
     uint64_t round_after = 0;
+    String run_key;
 };
 
 /// One round over a seal whose run of `shard` holds the records `make_records` returns for the committed round.
@@ -5751,6 +5752,11 @@ InheritedRunRound roundOverInheritedRun(IntentPool<> & pool, uint64_t shard,
     pool.round();
     InheritedRunRound result;
     result.parent_round = committedRound(*pool.backend, pool.layout());
+    {
+        OperationForTest op(*pool.backend);
+        const GcState state = decodeGcState((*op).read(pool.layout().gcStateKey(), Retry::standard())->bytes);
+        result.run_key = pool.layout().blobTargetRunKey(state.snap_generation + 1, /*attempt*/ 1, shard, /*seq*/ 0);
+    }
     injectSourceEdgeRun(*pool.backend, pool.layout(), shard, make_records(result.parent_round));
     pool.backend->clearJournal();
     try
@@ -5776,6 +5782,16 @@ void expectRefusedAsCorrupt(const InheritedRunRound & round, std::string_view wh
         EXPECT_TRUE(verb != JournalVerb::Remove && verb != JournalVerb::RemoveMany) << "the refused round deleted " << key;
 }
 
+/// The refusal is permanent for the pool, so it must name what an operator inspects: the run, the shard and the row.
+void expectRefusalNamesTheRow(const InheritedRunRound & round, uint64_t shard, uint64_t blob, uint64_t source_id)
+{
+    EXPECT_NE(round.message.find("`" + round.run_key + "`"), String::npos) << round.message;
+    EXPECT_NE(round.message.find("of GC shard " + std::to_string(shard) + ":"), String::npos) << round.message;
+    EXPECT_NE(round.message.find("blob " + blobIdOf(blobRefOf(blob)) + " source " + u128ToHex(DB::UInt128{source_id})),
+              String::npos) << round.message;
+    EXPECT_TRUE(round.message.ends_with(kCorruptBookkeeping)) << round.message;
+}
+
 }
 
 /// A live edge in the run of a shard that does not own its blob would leave the owning shard at zero.
@@ -5789,6 +5805,7 @@ TEST(CASGcIntents, InheritedRunWithAMisplacedLiveEdgeIsRefusedAsCorrupt)
         return sortedRecords({inheritedRow(pool, own, parent_round), inheritedEdge(foreign)});
     });
     expectRefusedAsCorrupt(round, "belongs to GC shard 0 of 2, not to shard 1");
+    expectRefusalNamesTheRow(round, /*shard*/ 1, foreign, /*source_id*/ 7);
 }
 
 /// A `pending` row makes a row decision due, so the round merges the shard rather than defer it.
@@ -5800,6 +5817,7 @@ TEST(CASGcIntents, InheritedRowStampedAfterTheParentRoundIsRefusedAsCorrupt)
         return std::vector<SourceEdgeRecord>{inheritedRow(pool, 1, parent_round + 1, /*pending*/ true)};
     });
     expectRefusedAsCorrupt(round, "after the parent round");
+    expectRefusalNamesTheRow(round, /*shard*/ 0, /*blob*/ 1, /*source_id*/ 0);
 }
 
 TEST(CASGcIntents, InheritedRowStampedWithTheParentRoundIsDecided)
@@ -5824,4 +5842,5 @@ TEST(CASGcIntents, InheritedRunInDescendingOrderIsRefusedAsCorrupt)
         return records;
     });
     expectRefusedAsCorrupt(round, "sorts before the row above it");
+    expectRefusalNamesTheRow(round, /*shard*/ 0, /*blob*/ 2, /*source_id*/ 7);
 }

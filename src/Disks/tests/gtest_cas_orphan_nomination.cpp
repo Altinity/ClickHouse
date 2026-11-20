@@ -184,7 +184,7 @@ ReadyFixture makeReadyFixture()
     runs.push_back(foldDeltasIntoGeneration(
         seed_op, f.store->layout(), seal.blob_target_runs, foldParent(state.round), new_generation, new_attempt, /*shard=*/0,
         std::move(seeded_edges),
-        {.current_round = state.round, .condemn_round = state.round, .out_retired = &retired}));
+        {.current_round = state.round, .condemn_round = state.round + 1, .out_retired = &retired}));
     seal.parent_generation = state.snap_generation;
     seal.generation = new_generation;
     seal.blob_target_runs = std::move(runs);

@@ -2462,6 +2462,64 @@ TEST(CASFsck, PresentPendingBodiesStopAtTheDeadline)
     EXPECT_EQ(intent_reads, 0u) << "an intent was read after the deadline";
 }
 
+namespace
+{
+
+void spinPast(std::chrono::steady_clock::time_point deadline)
+{
+    while (std::chrono::steady_clock::now() <= deadline)
+    {
+    }
+}
+
+size_t bodyHeads(FsckGcFixture & f, const std::vector<uint64_t> & blobs)
+{
+    size_t heads = 0;
+    for (const uint64_t b : blobs)
+        heads += countKeyRequests(f.backend->journal(), JournalVerb::Head, f.bodyKey(b));
+    return heads;
+}
+
+}
+
+/// A deadline that passes while one row is classified stops the scan before the next row's retired-body `HEAD`.
+TEST(CASFsck, DeadlinePassingDuringARowStopsBeforeTheNextRowsHead)
+{
+    const std::vector<uint64_t> blobs{1, 2};
+    FsckGcFixture f(/*create_budget=*/0, {1, 2});
+    f.drop();
+    f.round();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    for (const uint64_t b : blobs)
+        f.backend->beforeRead(f.intentKey(b), 0, [deadline] { spinPast(deadline); });
+    f.backend->clearJournal();
+
+    expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, "during 'classifying unreferenced bodies'", [&]
+    {
+        (void)runFsck(*f.store, /*detail=*/false, {}, deadline);
+    });
+    EXPECT_EQ(bodyHeads(f, blobs), 1u) << "the second row's body HEAD was sent after the deadline";
+}
+
+/// A deadline that passes during the intent read stops the scan before the body `HEAD` that follows an absent intent.
+TEST(CASFsck, DeadlinePassingDuringAnAbsentIntentReadStopsBeforeTheBodyHead)
+{
+    FsckGcFixture f(/*create_budget=*/0, {1});
+    f.drop();
+    f.round();
+    const String intent_key = f.intentKey(1);
+    f.removeIntent(1);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    f.backend->beforeRead(intent_key, 0, [deadline] { spinPast(deadline); });
+    f.backend->clearJournal();
+
+    expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, "during 'checking pending rows'", [&]
+    {
+        (void)runFsck(*f.store, /*detail=*/false, {}, deadline);
+    });
+    EXPECT_EQ(bodyHeads(f, {1}), 1u) << "only the retired-body HEAD precedes the deadline; the pending check sent another";
+}
+
 /// The capability probe's scratch object under `blob-intents/_probe/` is not an intent and no finding.
 TEST(CASFsck, ProbeScratchObjectIsNoIntent)
 {

@@ -225,41 +225,39 @@ const RunRef & AdoptedRunReader::currentRun() const
     return runs[next_run - 1];
 }
 
+void AdoptedRunReader::refuseRow(const SourceEdgeRecord & rec, const String & what) const
+{
+    throw Exception(ErrorCodes::CORRUPTED_DATA,
+        "CAS source-edge run `{}` of GC shard {}: the row of blob {} source {} {}. {}",
+        currentRun().key, shard, blobIdOf(rec.ref), u128ToHex(rec.source_id), what, kCorruptBookkeeping);
+}
+
 void AdoptedRunReader::checkRow(const SourceEdgeRecord & rec)
 {
     /// The merge decides a blob from the rows of its own shard alone, and assumes them sorted.
     if (blobShard(rec.ref, context.gc_shards) != shard)
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS source-edge run: blob {} belongs to GC shard {} of {}, not to shard {} whose run holds it",
-            blobIdOf(rec.ref), blobShard(rec.ref, context.gc_shards), context.gc_shards, shard);
+        refuseRow(rec, fmt::format("belongs to GC shard {} of {}, not to shard {} whose run holds it",
+            blobShard(rec.ref, context.gc_shards), context.gc_shards, shard));
     const std::pair<BlobRef, UInt128> key{rec.ref, rec.source_id};
     if (previous_key && key < *previous_key)
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS source-edge run: the row of blob {} source {} sorts before the row above it",
-            blobIdOf(rec.ref), u128ToHex(rec.source_id));
+        refuseRow(rec, "sorts before the row above it");
     previous_key = key;
     if (rec.source_id == kZeroSourceId)
     {
         /// A sentinel key carries exactly one row per blob and never an edge.
         if (rec.marker == RunMarker::Edge)
-            throw Exception(ErrorCodes::CORRUPTED_DATA,
-                "CAS source-edge run: active edge at the reserved sentinel source_id 0");
+            refuseRow(rec, "is an active edge at the reserved sentinel source_id 0");
         if (last_sentinel_blob == rec.ref)
-            throw Exception(ErrorCodes::CORRUPTED_DATA,
-                "CAS source-edge run: duplicate sentinel row for one blob");
+            refuseRow(rec, "is a duplicate sentinel row for one blob");
         last_sentinel_blob = rec.ref;
     }
     else if (rec.marker != RunMarker::Edge)
     {
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS source-edge run: sentinel row type 0x{:02x} at a non-sentinel key",
-            static_cast<uint8_t>(rec.marker));
+        refuseRow(rec, fmt::format("is a sentinel row type 0x{:02x} at a non-sentinel key", static_cast<uint8_t>(rec.marker)));
     }
     /// The parent round stamped every row it condemned; a later stamp would reach the rules on the cut that minted it.
     if (rec.marker == RunMarker::Condemned && rec.condemn_round > context.parent_round)
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS source-edge run: the row of blob {} is stamped with round {}, after the parent round {}",
-            blobIdOf(rec.ref), rec.condemn_round, context.parent_round);
+        refuseRow(rec, fmt::format("is stamped with round {}, after the parent round {}", rec.condemn_round, context.parent_round));
 }
 
 UInt128 sourceEdgeId(const ManifestId & id, const String & path)

@@ -22,6 +22,10 @@
 namespace DB::Cas
 {
 
+/// Closes a refusal over corrupt GC bookkeeping.
+inline constexpr std::string_view kCorruptBookkeeping = "GC bookkeeping is corrupt: GC stops reclaiming on this pool; stored data "
+    "is not affected. See /antalya/cas/operations/debugging#gc-bookkeeping-corrupt in the CAS documentation";
+
 /// In-memory description of a blob incarnation condemned by the in-degree merge. The token and size
 /// come from a `HEAD` of the blob, or from the intent's key when an adopted orphan's body is absent
 /// or replaced; the exact-token deletion is issued later.
@@ -184,7 +188,8 @@ struct AdoptedRunContext
 /// checks every raw row before the caller sees it, and verifies the seal checksum of each run once it is drained.
 /// A row is refused with `CORRUPTED_DATA` when it is an edge at the sentinel source id 0, a sentinel marker at another
 /// source id, a second sentinel row of one blob, a blob of another shard, below the previous row in
-/// `(BlobRef, source_id)` order, or a condemned row stamped after the parent round.
+/// `(BlobRef, source_id)` order, or a condemned row stamped after the parent round. The message names the run's key,
+/// the shard and the row, and ends with `kCorruptBookkeeping`.
 class AdoptedRunReader
 {
 public:
@@ -202,6 +207,7 @@ public:
 
 private:
     void checkRow(const SourceEdgeRecord & rec);
+    [[noreturn]] void refuseRow(const SourceEdgeRecord & rec, const String & what) const;
 
     CasOperation & op;
     const std::vector<RunRef> & runs;

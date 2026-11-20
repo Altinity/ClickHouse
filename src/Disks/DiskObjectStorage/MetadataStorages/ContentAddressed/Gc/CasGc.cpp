@@ -99,10 +99,6 @@ namespace
 /// Soft limit on the namespace janitor's phase: no page starts after it, the page in progress finishes.
 constexpr uint64_t kJanitorBudgetMs = 20'000;
 
-/// Closes a refusal over corrupt GC bookkeeping. It names no command: the rebuild refuses a pool whose GC held the lease.
-constexpr std::string_view kCorruptBookkeeping = "GC bookkeeping is corrupt: GC stops reclaiming on this pool; stored data "
-    "is not affected. See /antalya/cas/operations/debugging#gc-bookkeeping-corrupt in the CAS documentation";
-
 /// Whether a `HEAD` of `gc/state` shows the version this round leased. The exact token is what the round's
 /// conditional commit sends; the canonical identity absorbs a quoting difference between the write's answer
 /// and the `HEAD`. A store whose token has no canonical form still matches by the exact token.
