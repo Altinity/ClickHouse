@@ -1728,6 +1728,90 @@ LegacyMarkerRemoval removeLegacyMarkers(Pool & pool, const std::vector<String> &
     return {removed.load(), changed.load()};
 }
 
+namespace
+{
+
+template <uint64_t FsckReport::* member>
+uint64_t fsckCount(const FsckReport & report)
+{
+    return report.*member;
+}
+
+uint64_t fsckIntentsVerified(const FsckReport & report)
+{
+    return report.intents_verified ? 1 : 0;
+}
+
+/// Every count both surfaces render, in summary-line order. Every term of `FsckReport::clean` is a column: a SQL
+/// consumer sees no other view of the report. `stale_edge` is nonzero only in `detail` mode, which the SQL scan never
+/// runs, and is kept as a column because "absent" and "zero" are different facts. A SQL scan classifies intents from
+/// the listing alone, so the per-intent verdicts and the fix's counts are not columns.
+constexpr std::array kFsckFields{
+    FsckField{"reachable", "reachable", 0, fsckCount<&FsckReport::reachable>},
+    FsckField{"dangling", "dangling", 1, fsckCount<&FsckReport::dangling>},
+    FsckField{"unreachable", "unreachable", 2, fsckCount<&FsckReport::unreachable>},
+    FsckField{"pending_gc", "pending_gc", 3, fsckCount<&FsckReport::pending_gc>},
+    FsckField{"awaiting_gc", "awaiting_gc", 4, fsckCount<&FsckReport::awaiting_gc>},
+    FsckField{"unaccounted", "unaccounted", 5, fsckCount<&FsckReport::unaccounted>},
+    FsckField{"stale_edge", "stale_edge", 6, fsckCount<&FsckReport::stale_edge>},
+    FsckField{"corrupted_runs", "corrupted_runs", 7, fsckCount<&FsckReport::corrupted_runs>},
+    FsckField{"chain_broken", "chain_broken", 8, fsckCount<&FsckReport::chain_broken>},
+    FsckField{"lifeless_keys", "lifeless_keys", 10, fsckCount<&FsckReport::lifeless_keys>},
+    FsckField{"intent_listed", "intent_listed", 19, fsckCount<&FsckReport::intent_listed>},
+    FsckField{"intent_current", "", 0, fsckCount<&FsckReport::intent_current>},
+    FsckField{"intent_replaced", "", 0, fsckCount<&FsckReport::intent_replaced>},
+    FsckField{"intent_body_gone", "", 0, fsckCount<&FsckReport::intent_body_gone>},
+    FsckField{"intent_malformed", "intent_malformed", 20, fsckCount<&FsckReport::intent_malformed>},
+    FsckField{"intent_unread", "intent_unread", 21, fsckCount<&FsckReport::intent_unread>},
+    FsckField{"pending_without_intent", "pending_without_intent", 22, fsckCount<&FsckReport::pending_without_intent>},
+    FsckField{"pending_intent_absent", "pending_intent_absent", 23, fsckCount<&FsckReport::pending_intent_absent>},
+    FsckField{"pending_token_rejected", "pending_token_rejected", 24, fsckCount<&FsckReport::pending_token_rejected>},
+    FsckField{"standing_present", "standing_present", 25, fsckCount<&FsckReport::standing_present>},
+    FsckField{"intents_verified", "", 0, fsckIntentsVerified},
+    FsckField{"legacy_marker", "legacy_marker", 26, fsckCount<&FsckReport::legacy_marker>},
+    FsckField{"legacy_markers_deleted", "", 0, fsckCount<&FsckReport::legacy_markers_deleted>},
+    FsckField{"legacy_markers_changed", "", 0, fsckCount<&FsckReport::legacy_markers_changed>},
+    FsckField{"janitor_pending", "namespace_janitor_pending", 11, fsckCount<&FsckReport::namespace_janitor_pending>},
+    FsckField{"janitor_pending_bytes", "namespace_janitor_pending_bytes", 12, fsckCount<&FsckReport::namespace_janitor_pending_bytes>},
+    FsckField{"janitor_pending_lives", "namespace_janitor_pending_lives", 13, fsckCount<&FsckReport::namespace_janitor_pending_lives>},
+    FsckField{"unchecked", "unchecked", 9, fsckCount<&FsckReport::unchecked>},
+    FsckField{"ref_records_walked", "ref_records_walked", 14, fsckCount<&FsckReport::ref_records_walked>},
+    FsckField{"physical_bytes", "physical_bytes", 15, fsckCount<&FsckReport::physical_bytes>},
+    FsckField{"referenced_logical_bytes", "referenced_logical_bytes", 16, fsckCount<&FsckReport::referenced_logical_bytes>},
+    FsckField{"distinct_blobs", "distinct_blobs", 17, fsckCount<&FsckReport::distinct_blobs>},
+    FsckField{"total_blob_refs", "total_blob_refs", 18, fsckCount<&FsckReport::total_blob_refs>},
+};
+
+/// The SQL positions are 0..n-1, each once.
+constexpr bool sqlPositionsArePermutation()
+{
+    size_t columns = 0;
+    for (const FsckField & field : kFsckFields)
+        columns += !field.sql_column.empty();
+    for (size_t position = 0; position < columns; ++position)
+    {
+        size_t found = 0;
+        for (const FsckField & field : kFsckFields)
+            found += !field.sql_column.empty() && field.sql_position == position;
+        if (found != 1)
+            return false;
+    }
+    return true;
+}
+static_assert(sqlPositionsArePermutation(), "every SQL column of `kFsckFields` needs its own position");
+
+}
+
+std::vector<FsckField> fsckSqlColumns()
+{
+    std::vector<FsckField> columns;
+    for (const FsckField & field : kFsckFields)
+        if (!field.sql_column.empty())
+            columns.push_back(field);
+    std::sort(columns.begin(), columns.end(), [](const FsckField & a, const FsckField & b) { return a.sql_position < b.sql_position; });
+    return columns;
+}
+
 String formatFsckSummary(const FsckReport & report)
 {
     /// Field order is load-bearing for humans only; every consumer parses `key=value` tokens. `partial`
@@ -1737,40 +1821,9 @@ String formatFsckSummary(const FsckReport & report)
     /// formatting the line has always had, `dedup_ratio`'s default double precision included, so
     /// extracting the line from the command changes nothing a parser can observe.
     std::ostringstream out;   // STYLE_CHECK_ALLOW_STD_STRING_STREAM
-    out << "reachable=" << report.reachable
-        << " dangling=" << report.dangling
-        << " unreachable=" << report.unreachable
-        << " pending_gc=" << report.pending_gc
-        << " awaiting_gc=" << report.awaiting_gc
-        << " unaccounted=" << report.unaccounted
-        << " stale_edge=" << report.stale_edge
-        << " corrupted_runs=" << report.corrupted_runs
-        << " chain_broken=" << report.chain_broken
-        << " lifeless_keys=" << report.lifeless_keys
-        << " intent_listed=" << report.intent_listed
-        << " intent_current=" << report.intent_current
-        << " intent_replaced=" << report.intent_replaced
-        << " intent_body_gone=" << report.intent_body_gone
-        << " intent_malformed=" << report.intent_malformed
-        << " intent_unread=" << report.intent_unread
-        << " pending_without_intent=" << report.pending_without_intent
-        << " pending_intent_absent=" << report.pending_intent_absent
-        << " pending_token_rejected=" << report.pending_token_rejected
-        << " standing_present=" << report.standing_present
-        << " intents_verified=" << (report.intents_verified ? 1 : 0)
-        << " legacy_marker=" << report.legacy_marker
-        << " legacy_markers_deleted=" << report.legacy_markers_deleted
-        << " legacy_markers_changed=" << report.legacy_markers_changed
-        << " janitor_pending=" << report.namespace_janitor_pending
-        << " janitor_pending_bytes=" << report.namespace_janitor_pending_bytes
-        << " janitor_pending_lives=" << report.namespace_janitor_pending_lives
-        << " unchecked=" << report.unchecked
-        << " ref_records_walked=" << report.ref_records_walked
-        << " physical_bytes=" << report.physical_bytes
-        << " referenced_logical_bytes=" << report.referenced_logical_bytes
-        << " distinct_blobs=" << report.distinct_blobs
-        << " total_blob_refs=" << report.total_blob_refs
-        << " dedup_ratio=" << report.dedupRatio();
+    for (const FsckField & field : kFsckFields)
+        out << (&field == kFsckFields.data() ? "" : " ") << field.summary_key << "=" << field.value(report);
+    out << " dedup_ratio=" << report.dedupRatio();
     if (report.partial)
         out << " partial=1 reason='" << report.partial_reason << "'";
     return out.str();

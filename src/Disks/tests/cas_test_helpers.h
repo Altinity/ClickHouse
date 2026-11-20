@@ -2354,6 +2354,29 @@ private:
     DB::Cas::Dialect dialect_value;
 };
 
+/// A `DialectOverrideBackend` whose `HEAD` answers `rewrite(key, stored value)` instead of the stored value.
+class HeadValueOverrideBackend : public DialectOverrideBackend
+{
+public:
+    using Rewrite = std::function<String(const String & key, const String & value)>;
+
+    HeadValueOverrideBackend(DB::Cas::Dialect dialect_, Rewrite rewrite_)
+        : DialectOverrideBackend(dialect_), rewrite(std::move(rewrite_))
+    {
+    }
+
+    std::optional<RawMeta> head(const String & key, TransportAccess & access) override
+    {
+        auto meta = DialectOverrideBackend::head(key, access);
+        if (meta)
+            meta->value = rewrite(key, meta->value);
+        return meta;
+    }
+
+private:
+    Rewrite rewrite;
+};
+
 /// Appends `cut_complete` to the journal when the round emits its `fold_ref_intake` row. The row is emitted
 /// on the round thread at the end of intake, so every request issued later, on any thread, follows the mark.
 /// The boundary orders blob `HEAD`s, deletes and writes against the cut; intake reads (a read-ahead read

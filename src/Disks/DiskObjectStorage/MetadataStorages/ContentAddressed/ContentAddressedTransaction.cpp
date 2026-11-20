@@ -327,13 +327,13 @@ void ContentAddressedTransaction::confirmCopySources(const Cas::RootNamespace & 
     }
 }
 
-void ContentAddressedTransaction::retargetBorrow(const Cas::PartRefKey & from, const Cas::PartRefKey & to, const Cas::RefRename & renamed)
+void ContentAddressedTransaction::retargetCopySource(const Cas::PartRefKey & from, const Cas::PartRefKey & to, const Cas::RefRename & renamed)
 {
-    const auto it = borrowed_sources.find(from.cacheKey());
-    if (it == borrowed_sources.end())
+    const auto it = copy_sources_by_part.find(from.cacheKey());
+    if (it == copy_sources_by_part.end())
         return;
     const std::shared_ptr<Cas::CopySource> borrow = it->second;
-    borrowed_sources.erase(it);
+    copy_sources_by_part.erase(it);
     if (!(borrow->manifest_ref == renamed.source))
         return;
     /// A move inside one table keeps the manifest and the table runtime, so the borrow reads nothing after the
@@ -349,7 +349,7 @@ void ContentAddressedTransaction::retargetBorrow(const Cas::PartRefKey & from, c
     }
     borrow->part = to;
     borrow->manifest_ref = renamed.destination;
-    borrowed_sources.try_emplace(to.cacheKey(), borrow);
+    copy_sources_by_part.try_emplace(to.cacheKey(), borrow);
 }
 
 void ContentAddressedTransaction::adoptStagedBlob(
@@ -921,8 +921,8 @@ std::shared_ptr<const Cas::CopySource> ContentAddressedTransaction::borrowedSour
     const auto route = routeOf(part_path);
     if (!route || route->ref.empty() || !route->file.empty())
         throw Exception(ErrorCodes::LOGICAL_ERROR, "ContentAddressed: {} is not a part directory", part_path);
-    const auto it = borrowed_sources.find(route->refKey().cacheKey());
-    return it == borrowed_sources.end() ? nullptr : it->second;
+    const auto it = copy_sources_by_part.find(route->refKey().cacheKey());
+    return it == copy_sources_by_part.end() ? nullptr : it->second;
 }
 
 std::string ContentAddressedTransaction::buildS3StagingBlobHeader(
@@ -1400,7 +1400,7 @@ void ContentAddressedTransaction::createHardLink(const std::string & path_from, 
     if (!resolved)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
             "ContentAddressed: createHardLink source part missing: {}", path_from);
-    auto & borrowed = borrowed_sources[src->refKey().cacheKey()];
+    auto & borrowed = copy_sources_by_part[src->refKey().cacheKey()];
     if (!borrowed || !(borrowed->manifest_ref == resolved->manifest_ref))
         borrowed = std::make_shared<Cas::CopySource>(std::move(*resolved));
     const auto * src_entry = Cas::findEntry(borrowed->manifest->entries, src->file);
@@ -1469,7 +1469,7 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
             {
                 for (const auto & [ref, _] : metadata_storage.store()->listRefs(from_ns))
                     if (const auto renamed = metadata_storage.partAccess()->republishRef({from_ns, ref}, {to_ns, ref}))
-                        retargetBorrow({from_ns, ref}, {to_ns, ref}, *renamed);
+                        retargetCopySource({from_ns, ref}, {to_ns, ref}, *renamed);
                 /// Asymmetric by necessity: the SOURCE is read, so it resolves readably and contributes
                 /// nothing when it has no life; the DESTINATION is written, so it resolves the minting way
                 /// and is born here if the rename is what first creates it. Resolved only once the source
@@ -1643,7 +1643,7 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
                     if (!renamed)
                         Cas::throwCasOwnershipConflict("ContentAddressedTransaction: {} was dropped while a staged part was renamed from it", path_from);
                     parts[dst_key].base_manifest_ref = renamed->destination;
-                    retargetBorrow(src->refKey(), dst->refKey(), *renamed);
+                    retargetCopySource(src->refKey(), dst->refKey(), *renamed);
                     return;
                 }
                 if (metadata_storage.partAccess()->dropRefExact(src->refKey(), committed_ref) == Cas::Removal::Mismatch)
@@ -1657,7 +1657,7 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
         /// staged/tmp move, or a rename of a part whose publish never happened (a rollback's delete_tmp_
         /// rename of an unpublished part) - nothing durable to touch. The facade picks the mechanism.
         if (const auto renamed = metadata_storage.partAccess()->renameCommittedRef(src->refKey(), dst->refKey()))
-            retargetBorrow(src->refKey(), dst->refKey(), *renamed);
+            retargetCopySource(src->refKey(), dst->refKey(), *renamed);
         return;
     }
 

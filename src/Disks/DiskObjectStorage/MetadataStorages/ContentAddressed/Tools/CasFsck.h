@@ -333,6 +333,19 @@ FsckReport runFsck(Pool & store, bool detail, FsckProgress on_progress = {},
 /// `stale_edge_verdict`) fail closed on absence by design.
 String formatFsckSummary(const FsckReport & report);
 
+/// A count of `FsckReport` as both report surfaces render it: its key on the summary line, and its column of
+/// `SYSTEM CAS FSCK`, when it has one, with the column's position after the `disk` column.
+struct FsckField
+{
+    std::string_view summary_key;
+    std::string_view sql_column;   /// empty: not a column
+    size_t sql_position = 0;
+    uint64_t (*value)(const FsckReport &) = nullptr;
+};
+
+/// The `SYSTEM CAS FSCK` columns after `disk`, in column order.
+std::vector<FsckField> fsckSqlColumns();
+
 struct LegacyMarkerRemoval
 {
     uint64_t removed = 0;

@@ -442,8 +442,8 @@ TEST(CASPluggableHash, Sha256BlobSeenByCondemnSweepAndFsckNotSilentlySkipped)
         << "THE CRUX: the sha256 blob must be condemned by the fold -- a silent-leak regression (a "
            "reverted CasGc.cpp codec.fromHex port) leaves this at 0";
 
-    /// previewDeletes streams the SAME adopted seal via the run's own SourceEdgeKeyCodec (never pool
-    /// meta) and must report exactly our blob, at its real 32-byte digest.
+    /// previewDeletes streams the SAME adopted seal from the run's own rows (never pool meta) and must
+    /// report exactly our blob, at its real 32-byte digest.
     const std::vector<Gc::PreviewEntry> preview = gc.previewDeletes();
     ASSERT_EQ(preview.size(), 1u) << "THE CRUX: previewDeletes must surface the condemned sha256 blob";
     EXPECT_EQ(preview[0].ref, id);

@@ -248,8 +248,6 @@ struct RefScanSummary
     /// The validated adopted parent's rows read for this scan. They enrich the one walk plan built
     /// after the catalog cut; the fold consumes that plan instead of reading them into a second one.
     std::map<UInt128, RefLifeFoldState> parent_ref_lives;
-    std::map<UInt128, RefHold> holds;
-    std::map<UInt128, RefTxnId> checkpoint_observations;
     /// Listed ids absent from the `RoundInput` catalog cut are inert dead-life debris.
     size_t dead_life_debris = 0;
 };
@@ -297,8 +295,6 @@ struct RefWalkPlanRow
     RefLifeFoldState fold_state;
     std::optional<uint64_t> removal_started_round;
     bool has_parent_fold_state = false;
-    bool listed_hint = false;
-    std::optional<RefTxnId> checkpoint_observation;
     std::optional<RefTxnId> tail_observation;
 };
 
@@ -332,8 +328,6 @@ public:
     size_t changedRows() const;
     uint64_t droppedParentRows() const { return dropped_parent_rows; }
     uint64_t droppedListedLives() const { return dropped_listed_lives; }
-    uint64_t droppedHolds() const { return dropped_holds; }
-    uint64_t droppedCheckpoints() const { return dropped_checkpoints; }
     uint64_t droppedTails() const { return dropped_tails; }
 
 private:
@@ -348,8 +342,6 @@ private:
     std::map<UInt128, RefWalkPlanRow> rows;
     uint64_t dropped_parent_rows = 0;
     uint64_t dropped_listed_lives = 0;
-    uint64_t dropped_holds = 0;
-    uint64_t dropped_checkpoints = 0;
     uint64_t dropped_tails = 0;
 };
 
@@ -1092,8 +1084,8 @@ private:
     uint64_t rounds_since_last_fold_ = 0;
     /// Where the next round's intent creates and redeletes resume; kept in memory, so a new leader starts from the
     /// first key.
-    std::optional<GcRoundWorkBudget::RunPosition> creates_resume_after_;
-    std::optional<GcRoundWorkBudget::RunPosition> redeletes_resume_after_;
+    std::optional<RotatingBudget::RunPosition> creates_resume_after_;
+    std::optional<RotatingBudget::RunPosition> redeletes_resume_after_;
 
     /// THIS LEADER'S OWN AUTHORITY VERDICT, and the reason it is a cached bool rather than a probe.
     ///

@@ -946,29 +946,13 @@ TEST(CASSourceEdgeKeySchema3, MixedWidthKeysOrderAlgoFirst)
     d32.bytes[1] = 0x01;
     const BlobRef ch{BlobHashAlgo::CityHash128, d16};    /// algo=1, digest all-FF prefix
     const BlobRef sh{BlobHashAlgo::Sha256, d32};         /// algo=3, tiny digest
-    const String k_ch = SourceEdgeKeyCodec::key(ch, UInt128(7));   /// 33 bytes
-    const String k_sh = SourceEdgeKeyCodec::key(sh, UInt128(7));   /// 49 bytes
-    EXPECT_EQ(k_ch.size(), 33u);
-    EXPECT_EQ(k_sh.size(), 49u);
-    /// algo byte decides BEFORE any digest byte can: ch128(1) < sha256(3) even though the ch128
+    const SourceEdgeKey k_ch{ch, UInt128(7)};
+    const SourceEdgeKey k_sh{sh, UInt128(7)};
+    /// algo decides BEFORE any digest byte can: ch128(1) < sha256(3) even though the ch128
     /// digest bytes are all 0xFF and the sha256 digest bytes are almost all zero.
     EXPECT_LT(k_ch, k_sh);
     /// sentinel-first inside one blob group:
-    EXPECT_LT(SourceEdgeKeyCodec::key(ch, UInt128(0)), k_ch);
-}
-
-TEST(CASSourceEdgeKeySchema3, ParseFailsClosed)
-{
-    BlobRef r; UInt128 sid;
-    String k = SourceEdgeKeyCodec::key(BlobRef{BlobHashAlgo::XXH3_128, BlobDigest::fromU128(UInt128(5))}, UInt128(9));
-    SourceEdgeKeyCodec::parse(k, r, sid);
-    EXPECT_EQ(r.algo, BlobHashAlgo::XXH3_128);
-    EXPECT_EQ(r.digest.toU128(), UInt128(5));
-    EXPECT_EQ(sid, UInt128(9));
-    k[0] = static_cast<char>(99);                        /// unknown algo byte
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED, [&]{ SourceEdgeKeyCodec::parse(k, r, sid); });
-    k[0] = static_cast<char>(1);                         /// known algo, wrong length (33 expected, this is 33 — truncate)
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]{ SourceEdgeKeyCodec::parse(std::string_view(k).substr(0, 20), r, sid); });
+    EXPECT_LT((SourceEdgeKey{ch, UInt128(0)}), k_ch);
 }
 
 TEST(CASBlobInDegree, TwoAlgoFoldSettlesBothInOneShardRun)
@@ -1097,7 +1081,7 @@ std::vector<std::pair<UInt128, CondemnedRow>> condemnedCohort(uint64_t n, uint64
 }
 }
 
-/// The redelete cohort is capped at `GcRoundWorkBudget::max_redeletes` per call. Excess
+/// The redelete cohort is capped at `GcRoundWorkBudget::redeletes` per call. Excess
 /// entries stay in `still_retired`, still `delete_pending`, to be redeleted by a later round — the
 /// durable pipeline never loses one to the cap.
 TEST(CASThreeCursorMerge, RedeleteBudgetCapsCohortAndCarriesExcess)
@@ -1108,7 +1092,7 @@ TEST(CASThreeCursorMerge, RedeleteBudgetCapsCohortAndCarriesExcess)
     const RunRef gen1 = writeSourceEdgeRun(backend, layout, 1, 0, 0, condemnedCohort(10, 1, /*delete_pending*/true));
 
     GcRoundWorkBudget budget;
-    budget.max_redeletes = 3;
+    budget.redeletes.cap = 3;
     size_t heads = 0;
     const BlobHeadFn absent = [&](const BlobRef &) { ++heads; return std::optional<Meta>{}; };
 
@@ -1118,7 +1102,7 @@ TEST(CASThreeCursorMerge, RedeleteBudgetCapsCohortAndCarriesExcess)
         {.current_round = 9, .condemn_round = 9, .pending_head = absent, .out_retired = &rmr, .work_budget = &budget}));
 
     EXPECT_EQ(heads, 3u);
-    EXPECT_EQ(budget.redeletes_used, 3u);
+    EXPECT_EQ(budget.redeletes.used, 3u);
     EXPECT_TRUE(rmr.spared.empty());
     ASSERT_EQ(rmr.still_retired.size(), 10u);
     size_t standing = 0;
@@ -1130,7 +1114,7 @@ TEST(CASThreeCursorMerge, RedeleteBudgetCapsCohortAndCarriesExcess)
     EXPECT_EQ(standing, 3u) << "only the rows the budget admitted were decided; the rest carry pending";
 }
 
-/// Mirror test for the create cap: rows past `max_intent_creates` carry unchanged as candidates, and a later
+/// Mirror test for the create cap: rows past `GcRoundWorkBudget::intent_creates` carry unchanged as candidates, and a later
 /// round creates them.
 TEST(CASThreeCursorMerge, CreateBudgetCapsCohortAndCarriesExcess)
 {
@@ -1140,7 +1124,7 @@ TEST(CASThreeCursorMerge, CreateBudgetCapsCohortAndCarriesExcess)
     const RunRef gen1 = writeSourceEdgeRun(backend, layout, 1, 0, 0, condemnedCohort(10, /*condemn_round*/1, /*delete_pending*/false));
 
     GcRoundWorkBudget budget;
-    budget.max_intent_creates = 3;
+    budget.intent_creates.cap = 3;
     size_t creates = 0;
 
     std::vector<RunRef> runs2;
@@ -1156,7 +1140,7 @@ TEST(CASThreeCursorMerge, CreateBudgetCapsCohortAndCarriesExcess)
 
     EXPECT_EQ(creates, 3u);
     EXPECT_EQ(rmr.confirmed.size(), 3u);
-    EXPECT_EQ(budget.intent_creates_used, 3u);
+    EXPECT_EQ(budget.intent_creates.used, 3u);
     ASSERT_EQ(rmr.still_retired.size(), 10u);
     size_t pending_count = 0;
     size_t carried_count = 0;
@@ -1183,7 +1167,7 @@ TEST(CASThreeCursorMerge, RedeleteBudgetDrainsCohortToFixpointOverRounds)
     while (rounds < 10 && pending_left)
     {
         GcRoundWorkBudget budget;
-        budget.max_redeletes = 3;
+        budget.redeletes.cap = 3;
         std::vector<RunRef> out_runs;
         RetiredMergeResult rmr;
         out_runs.push_back(foldDeltasIntoGeneration(*backend_req, layout, priors, foldParentOf(*backend_req, priors, 99), 2 + rounds, 0, 0, {},
@@ -1214,7 +1198,7 @@ TEST(CASThreeCursorMerge, OnlyASentCreateSpendsABudgetSlot)
         const RunRef gen1 = writeSourceEdgeRun(backend, layout, 1, 0, 0, condemnedCohort(10, /*condemn_round*/1, false));
 
         GcRoundWorkBudget budget;
-        budget.max_intent_creates = 3;
+        budget.intent_creates.cap = 3;
         size_t creates = 0;
         const IntentCreateFn create = [&](const BlobRef &, const CanonicalIdentity &)
         {
@@ -1235,7 +1219,7 @@ TEST(CASThreeCursorMerge, OnlyASentCreateSpendsABudgetSlot)
         EXPECT_EQ(creates, 3u) << "a create was sent without a budget slot";
         EXPECT_EQ(rmr.confirmed.size(), 3u - unconfirmed) << "an unconfirmed create was counted";
         EXPECT_EQ(rmr.unconfirmed_creates.count, unconfirmed);
-        EXPECT_EQ(budget.intent_creates_used, 3u);
+        EXPECT_EQ(budget.intent_creates.used, 3u);
         EXPECT_EQ(rmr.still_retired.size(), 10u);
     }
 }

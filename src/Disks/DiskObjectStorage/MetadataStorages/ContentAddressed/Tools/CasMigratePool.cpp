@@ -346,7 +346,7 @@ private:
     {
         const std::optional<Object> stored = op.read(layout.poolMetaKey(), Retry::standard());
         if (!stored)
-            throw Exception(ErrorCodes::INVALID_STATE, "CAS pool meta: _pool_meta is absent, there is no pool to migrate");
+            Pool::throwNoPoolToMigrate(pool.poolConfig());
         return decodePoolMeta(stored->bytes);
     }
 
@@ -378,7 +378,7 @@ private:
     {
         const std::optional<Meta> meta = op.head(layout.poolMetaKey(), Retry::standard());
         if (!meta)
-            throw Exception(ErrorCodes::INVALID_STATE, "CAS pool meta: _pool_meta is absent, there is no pool to migrate");
+            Pool::throwNoPoolToMigrate(pool.poolConfig());
         if (!meta->etag.canonical())
             throw Exception(ErrorCodes::NOT_IMPLEMENTED,
                 "M1: the store returns a token that cannot serve as a blob identity: {}; the pool cannot be migrated to this "

@@ -274,8 +274,6 @@ RefPlan buildRefWalkPlan(RoundInput && round_input)
             .fold_state = {},
             .removal_started_round = entry.removal_started_round,
             .has_parent_fold_state = false,
-            .listed_hint = false,
-            .checkpoint_observation = std::nullopt,
             .tail_observation = std::nullopt});
     }
 
@@ -301,36 +299,8 @@ RefPlan buildRefWalkPlan(RoundInput && round_input)
         it->second.has_parent_fold_state = true;
     }
     for (const UInt128 & life_id : ref_scan.listed_lives)
-    {
-        const auto it = plan.rows.find(life_id);
-        if (it == plan.rows.end())
-        {
+        if (!plan.rows.contains(life_id))
             ++plan.dropped_listed_lives;
-            continue;
-        }
-        it->second.listed_hint = true;
-    }
-    for (const auto & [life_id, hold] : ref_scan.holds)
-    {
-        const auto it = plan.rows.find(life_id);
-        if (it == plan.rows.end())
-        {
-            ++plan.dropped_holds;
-            continue;
-        }
-        it->second.fold_state.coverage.classification = CoverageClass::Clamped;
-        it->second.fold_state.coverage.hold = hold;
-    }
-    for (const auto & [life_id, checkpoint] : ref_scan.checkpoint_observations)
-    {
-        const auto it = plan.rows.find(life_id);
-        if (it == plan.rows.end())
-        {
-            ++plan.dropped_checkpoints;
-            continue;
-        }
-        it->second.checkpoint_observation = checkpoint;
-    }
     for (const auto & [life_id, tail] : ref_scan.max_log_by_life)
     {
         const auto it = plan.rows.find(life_id);
@@ -814,10 +784,10 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// shards, except the outcome log byte limit, which is per shard. See `GcRoundWorkBudget`'s own
     /// comment for the fail-closed contract each family applies on exhaustion.
     GcRoundWorkBudget round_work_budget;
-    round_work_budget.max_intent_creates = store->poolConfig().gc_round_intent_create_budget;
-    round_work_budget.creates_resume_after = creates_resume_after_;
-    round_work_budget.max_redeletes = store->poolConfig().gc_round_redelete_budget;
-    round_work_budget.redeletes_resume_after = redeletes_resume_after_;
+    round_work_budget.intent_creates.cap = store->poolConfig().gc_round_intent_create_budget;
+    round_work_budget.intent_creates.resume_after = creates_resume_after_;
+    round_work_budget.redeletes.cap = store->poolConfig().gc_round_redelete_budget;
+    round_work_budget.redeletes.resume_after = redeletes_resume_after_;
     round_work_budget.max_sweep_namespaces = store->poolConfig().gc_round_sweep_namespace_budget;
     round_work_budget.max_sweep_recovery_ops = store->poolConfig().gc_round_sweep_recovery_op_budget;
     round_work_budget.max_ref_cleanup_objects = store->poolConfig().gc_round_ref_cleanup_budget;
@@ -1367,10 +1337,10 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     }
     state_etag = orThrow(std::move(commit), "CAS gc round commit");
     state = std::move(next);
-    creates_resume_after_ = round_work_budget.nextCreatesResumeAfter();
+    creates_resume_after_ = round_work_budget.intent_creates.nextResumeAfter();
     /// A suppressed round takes no redelete slot, so its empty budget would look like the end of the queue.
     if (!suppress_destructive)
-        redeletes_resume_after_ = round_work_budget.nextRedeletesResumeAfter();
+        redeletes_resume_after_ = round_work_budget.redeletes.nextResumeAfter();
     report.round = state.round;
     round_commit_timer->metric("round", report.round);
     round_commit_timer->metric("generation", generation);
@@ -3851,8 +3821,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
     /// window have room. Hints are issued in the merge, after intake.
     const auto redeleteBudgetFull = [&]
     {
-        return work_budget.max_redeletes != 0
-            && work_budget.redeletes_used + pending_head_reserved.size() >= work_budget.max_redeletes;
+        return work_budget.redeletes.cap != 0
+            && work_budget.redeletes.used + pending_head_reserved.size() >= work_budget.redeletes.cap;
     };
     const auto offerPendingHead = [&](const BlobRef & ref)
     {
@@ -3866,7 +3836,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         if (redeleteBudgetFull())
             return true;
         /// A row the rotation skips this round is carried without its `HEAD`.
-        if (!work_budget.redeleteAdmits(blobShard(ref, state.gc_shards), ref))
+        if (!work_budget.redeletes.admits(blobShard(ref, state.gc_shards), ref))
             return true;
         if (reads.pendingHeads() >= reads.window())
             return false;

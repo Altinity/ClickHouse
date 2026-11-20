@@ -670,9 +670,7 @@ PoolPtr Pool::openForMigration(BackendPtr backend, PoolConfig config)
     CasOperation meta_op = bootstrap_requests.admit();
     const std::optional<Object> stored = meta_op.read(layout.poolMetaKey(), Retry::standard());
     if (!stored)
-        throw Exception(ErrorCodes::INVALID_STATE,
-            "content-addressed pool '{}' (prefix '{}'): no _pool_meta, so there is no pool to migrate",
-            config.server_root_id, config.pool_prefix);
+        throwNoPoolToMigrate(config);
     PoolMeta meta = decodePoolMeta(stored->bytes);
     if (meta.min_reader_generation < G_WRITE_FLOOR)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS pool meta: reader generation {} is below {}",
@@ -682,6 +680,13 @@ PoolPtr Pool::openForMigration(BackendPtr backend, PoolConfig config)
     PoolPtr store(new Pool(std::move(backend), std::move(config), std::move(meta)));
     store->setEventSink(std::move(store->config.event_sink));
     return store;
+}
+
+void Pool::throwNoPoolToMigrate(const PoolConfig & config)
+{
+    throw Exception(ErrorCodes::INVALID_STATE,
+        "content-addressed pool '{}' (prefix '{}'): no _pool_meta, so there is no pool to migrate",
+        config.server_root_id, config.pool_prefix);
 }
 
 MountIncarnation Pool::captureMountIncarnation() const

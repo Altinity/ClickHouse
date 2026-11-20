@@ -443,6 +443,8 @@ public:
     /// The pool `migratePool` works on: `_pool_meta` at floor 1 to 4 is accepted. No probe, mount, slot, writer or
     /// GC: the instance reads, and `migratePool` writes through `openRequests`. Refuses an absent `_pool_meta`.
     static PoolPtr openForMigration(BackendPtr backend, PoolConfig config);
+    /// The refusal of a migration whose pool prefix holds no `_pool_meta`.
+    [[noreturn]] static void throwNoPoolToMigrate(const PoolConfig & config);
 
     /// Raises the stored `min_reader_generation` to `G_REF_CHAIN` and mirrors it into `meta`; a floor already at
     /// or above it sends nothing. Only `migratePool` calls it: a mount never raises the floor.

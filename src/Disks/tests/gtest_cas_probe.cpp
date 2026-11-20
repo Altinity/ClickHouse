@@ -202,10 +202,10 @@ namespace
 /// compare). `write_reached`/`remove_reached` count only the calls that got PAST the gate, so a
 /// regression that reintroduces a synthesized (grammar-invalid-somewhere) precondition drops one of
 /// these counts instead of passing silently.
-class DialectOverrideBackend : public InMemoryBackend
+class DialectGatedBackend : public InMemoryBackend
 {
 public:
-    explicit DialectOverrideBackend(Dialect claimed_dialect_) : claimed_dialect(claimed_dialect_) {}
+    explicit DialectGatedBackend(Dialect claimed_dialect_) : claimed_dialect(claimed_dialect_) {}
     Dialect dialect() const override { return claimed_dialect; }
 
     std::expected<String, RawConflict> write(const String & key, const String & bytes,
@@ -247,7 +247,7 @@ TEST(CASProbe, ReorderedProbePassesOnAllThreeDialects)
 {
     for (const Dialect dialect : {Dialect::ETag, Dialect::Generation, Dialect::Emulated})
     {
-        DialectOverrideBackend b(dialect);
+        DialectGatedBackend b(dialect);
         auto requests = makeRequests(b);
         auto op = requests.admit();
         EXPECT_NO_THROW(runCapabilityProbe(op, "p/.cas_probe")) << "dialect " << static_cast<int>(dialect);
@@ -257,29 +257,13 @@ TEST(CASProbe, ReorderedProbePassesOnAllThreeDialects)
     }
 }
 
-namespace
-{
-
-/// HEAD on a probe key answers with a weak ETag, which no blob incarnation can be named by.
-class WeakTokenOnHeadBackend : public InMemoryBackend
-{
-public:
-    std::optional<RawMeta> head(const String & key, TransportAccess & access) override
-    {
-        auto meta = InMemoryBackend::head(key, access);
-        if (meta && key.find("/_probe/") != String::npos)
-            meta->value = "W/\"x\"";
-        return meta;
-    }
-};
-
-}
-
 TEST(CASProbe, RefusesATokenThatIsNotAnIdentity)
 {
     const String expected = "the store returns a token that cannot serve as a blob identity: ";
 
-    auto weak = std::make_shared<WeakTokenOnHeadBackend>();
+    /// HEAD on a probe key answers with a weak ETag, which no blob incarnation can be named by.
+    auto weak = std::make_shared<DB::Cas::tests::HeadValueOverrideBackend>(Dialect::Emulated,
+        [](const String & key, const String & value) { return key.find("/_probe/") != String::npos ? String("W/\"x\"") : value; });
     {
         auto requests = makeRequests(*weak);
         auto op = requests.admit();

@@ -148,7 +148,7 @@ private:
         /// The committed source of each entry in `entries` adopted without reading its body, keyed by entry path.
         /// It follows the entry through staged copies and renames; `confirmCopySources` checks it before promote.
         /// Written only by `putEntry`, `eraseEntry`, `rekeyEntry` and `clearEntries`, which keep it in step with `entries`.
-        /// Entries borrowed from one source share one handle (`borrowed_sources`).
+        /// Entries borrowed from one source share one handle (`copy_sources_by_part`).
         std::map<std::string, std::shared_ptr<Cas::CopySource>> copy_sources;
         /// The committed manifest this transaction found under the part's name when it first staged a
         /// write to it; a later commit requires exactly that binding. Empty for a part the transaction
@@ -184,7 +184,7 @@ private:
     std::map<std::pair<std::string, std::string>, PartStaging> parts;
     /// The handle of each committed part this transaction borrowed entries from, keyed by `PartRefKey::cacheKey`.
     /// A later borrow of the same manifest shares it, so one confirmation covers every borrower.
-    std::unordered_map<String, std::shared_ptr<Cas::CopySource>> borrowed_sources;
+    std::unordered_map<String, std::shared_ptr<Cas::CopySource>> copy_sources_by_part;
     bool committed = false;
     bool failed = false;
 
@@ -225,7 +225,7 @@ private:
     /// After this transaction renamed `from` to `to`, points the borrow of `from` at `to`, when the rename moved the
     /// manifest the borrow read and `to` still commits the manifest the rename produced. Any other borrow keeps its
     /// source, and its confirmation refuses it.
-    void retargetBorrow(const Cas::PartRefKey & from, const Cas::PartRefKey & to, const Cas::RefRename & renamed);
+    void retargetCopySource(const Cas::PartRefKey & from, const Cas::PartRefKey & to, const Cas::RefRename & renamed);
 
     /// Returns (and, when necessary, creates) the staging state for a routed namespace/ref.
     PartStaging & stagingFor(const ContentAddressedMetadataStorage::Route & r);

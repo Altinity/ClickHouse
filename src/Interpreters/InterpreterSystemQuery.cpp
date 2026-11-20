@@ -2637,68 +2637,11 @@ void appendContentAddressedGcRebuildRow(MutableColumns & res_columns, const Stri
     res_columns[i++]->insert(rep.adopted_seal_generation);
 }
 
-/// One `UInt64` column of SYSTEM CAS FSCK and the report member that fills it.
-struct ContentAddressedFsckColumn
-{
-    const char * name;
-    uint64_t Cas::FsckReport::* member;
-};
-
-/// SYSTEM CAS FSCK's one-row-per-disk summary, after the `disk` column. No DETAIL keyword: the offline
-/// `clickhouse-disks cas-fsck --detail` lists objects. `CommandFsck.cpp`'s `formatFsckSummary` line carries the
-/// same fields.
-constexpr ContentAddressedFsckColumn kContentAddressedFsckColumns[] = {
-    {"reachable", &Cas::FsckReport::reachable},
-    {"dangling", &Cas::FsckReport::dangling},
-    {"unreachable", &Cas::FsckReport::unreachable},
-    {"pending_gc", &Cas::FsckReport::pending_gc},
-    {"awaiting_gc", &Cas::FsckReport::awaiting_gc},
-    {"unaccounted", &Cas::FsckReport::unaccounted},
-    /// Every term of `FsckReport::clean` has a column: this row is a SQL consumer's only view of the report,
-    /// so a hard finding it omits is one no query can see. The `static_assert` on `kFsckHardFindings`
-    /// (`CasFsck.h`) fails when a term is added and names `contentAddressedFsckColumns` among the sites to update.
-    ///
-    /// `stale_edge` is nonzero only in `detail` mode and this row comes from a summary scan, so it reads 0;
-    /// the column is kept because "absent" and "zero" are different facts to a consumer.
-    {"stale_edge", &Cas::FsckReport::stale_edge},
-    {"corrupted_runs", &Cas::FsckReport::corrupted_runs},
-    /// The ref-stream verdicts. `chain_broken` is a HARD finding — it belongs on the row
-    /// for the same reason `dangling` does. `unchecked` is its honest companion: namespaces the audit
-    /// could not prove either way, so a zero here is what makes the other zeros mean something.
-    {"chain_broken", &Cas::FsckReport::chain_broken},
-    {"unchecked", &Cas::FsckReport::unchecked},
-    /// A malformed/non-canonical namespace-tree key, or an ambiguous/unreadable catalog
-    /// incarnation — a term of `clean`.
-    {"lifeless_keys", &Cas::FsckReport::lifeless_keys},
-    /// A COMPLETE, canonical namespace-life key whose life is absent from a catalog cut taken after
-    /// the listing: janitor-pending debris, NOT a term of `clean` (see `FsckClass::JanitorPending`).
-    {"namespace_janitor_pending", &Cas::FsckReport::namespace_janitor_pending},
-    {"namespace_janitor_pending_bytes", &Cas::FsckReport::namespace_janitor_pending_bytes},
-    {"namespace_janitor_pending_lives", &Cas::FsckReport::namespace_janitor_pending_lives},
-    {"ref_records_walked", &Cas::FsckReport::ref_records_walked},
-    {"physical_bytes", &Cas::FsckReport::physical_bytes},
-    {"referenced_logical_bytes", &Cas::FsckReport::referenced_logical_bytes},
-    {"distinct_blobs", &Cas::FsckReport::distinct_blobs},
-    {"total_blob_refs", &Cas::FsckReport::total_blob_refs},
-    /// The deletion-intent counters and the legacy markers. `intent_malformed`, `intent_unread` and
-    /// `pending_without_intent` are terms of `clean`; the others are informational. A SQL scan classifies
-    /// intents from the listing alone: the per-intent verdicts (`intent_current`, `intent_replaced`,
-    /// `intent_body_gone`) and `legacy_markers_deleted` belong to `cas-fsck --verify-intents` and `--fix`.
-    {"intent_listed", &Cas::FsckReport::intent_listed},
-    {"intent_malformed", &Cas::FsckReport::intent_malformed},
-    {"intent_unread", &Cas::FsckReport::intent_unread},
-    {"pending_without_intent", &Cas::FsckReport::pending_without_intent},
-    {"pending_intent_absent", &Cas::FsckReport::pending_intent_absent},
-    {"pending_token_rejected", &Cas::FsckReport::pending_token_rejected},
-    {"standing_present", &Cas::FsckReport::standing_present},
-    {"legacy_marker", &Cas::FsckReport::legacy_marker},
-};
-
 ColumnsDescription contentAddressedFsckColumns()
 {
     NamesAndTypesList columns{{"disk", std::make_shared<DataTypeString>()}};
-    for (const auto & column : kContentAddressedFsckColumns)
-        columns.emplace_back(column.name, std::make_shared<DataTypeUInt64>());
+    for (const Cas::FsckField & column : Cas::fsckSqlColumns())
+        columns.emplace_back(String(column.sql_column), std::make_shared<DataTypeUInt64>());
     return ColumnsDescription{columns};
 }
 
@@ -2706,8 +2649,8 @@ void appendContentAddressedFsckRow(MutableColumns & res_columns, const String & 
 {
     size_t i = 0;
     res_columns[i++]->insert(disk_name);
-    for (const auto & column : kContentAddressedFsckColumns)
-        res_columns[i++]->insert(rep.*column.member);
+    for (const Cas::FsckField & column : Cas::fsckSqlColumns())
+        res_columns[i++]->insert(column.value(rep));
 }
 
 }

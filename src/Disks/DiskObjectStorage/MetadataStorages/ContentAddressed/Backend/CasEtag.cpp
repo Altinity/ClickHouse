@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h>
 #include <base/hex.h>
 
@@ -78,8 +79,6 @@ std::optional<String> opaqueTagOfWireValue(Dialect dialect, std::string_view raw
     return String(raw);
 }
 
-constexpr std::string_view HEX_DIGITS = "0123456789abcdef";
-
 }
 
 std::string_view dialectWord(Dialect dialect)
@@ -105,18 +104,12 @@ std::optional<CanonicalIdentity> canonicalIdentity(Dialect dialect, std::string_
 
 std::optional<String> opaqueTagFromHex(Dialect dialect, std::string_view tag_hex)
 {
-    if (tag_hex.empty() || tag_hex.size() % 2 != 0)
+    if (tag_hex.empty() || tag_hex.size() % 2 != 0 || !std::all_of(tag_hex.begin(), tag_hex.end(), isLowercaseHexChar))
         return std::nullopt;
     String tag;
     tag.reserve(tag_hex.size() / 2);
     for (size_t i = 0; i < tag_hex.size(); i += 2)
-    {
-        const size_t hi = HEX_DIGITS.find(tag_hex[i]);
-        const size_t lo = HEX_DIGITS.find(tag_hex[i + 1]);
-        if (hi == std::string_view::npos || lo == std::string_view::npos)
-            return std::nullopt;
-        tag.push_back(static_cast<char>((hi << 4) | lo));
-    }
+        tag.push_back(static_cast<char>(unhex2(tag_hex.data() + i)));
     if (!isOpaqueTag(dialect, tag))
         return std::nullopt;
     return tag;

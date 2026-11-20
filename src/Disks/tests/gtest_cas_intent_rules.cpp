@@ -18,6 +18,7 @@
 using namespace DB::Cas;
 using DB::Cas::tests::BatchCapabilityBackend;
 using DB::Cas::tests::DialectOverrideBackend;
+using DB::Cas::tests::HeadValueOverrideBackend;
 using DB::Cas::tests::FakeClock;
 using DB::Cas::tests::JournalVerb;
 using DB::Cas::tests::OperationForTest;
@@ -41,28 +42,17 @@ const char * name(IntentStep step)
         case IntentStep::Drop: return "Drop";
         case IntentStep::DeleteBody: return "DeleteBody";
         case IntentStep::Standing: return "Standing";
-        case IntentStep::TransitionCreate: return "TransitionCreate";
-        case IntentStep::TransitionCandidate: return "TransitionCandidate";
         case IntentStep::DeleteIntent: return "DeleteIntent";
         case IntentStep::Anomaly: return "Anomaly";
     }
     return "?";
 }
 
-/// An ETag store that answers every `HEAD` with the weak form of the value: well-formed, but no incarnation.
-class WeakEtagBackend : public DialectOverrideBackend
+/// The weak form of a `HEAD` value: well-formed, but no incarnation.
+String weakValue(const String &, const String & value)
 {
-public:
-    WeakEtagBackend() : DialectOverrideBackend(Dialect::ETag) {}
-
-    std::optional<RawMeta> head(const String & key, TransportAccess & access) override
-    {
-        auto meta = DialectOverrideBackend::head(key, access);
-        if (meta)
-            meta->value = "W/\"" + meta->value + "\"";
-        return meta;
-    }
-};
+    return "W/\"" + value + "\"";
+}
 
 Meta liveHead(Backend & backend, const String & key, const String & bytes)
 {
@@ -96,7 +86,7 @@ struct Observations
     static Observations make()
     {
         DialectOverrideBackend store(Dialect::ETag);
-        WeakEtagBackend weak_store;
+        HeadValueOverrideBackend weak_store(Dialect::ETag, weakValue);
         Meta own = liveHead(store, "p/blobs/a", "x");
         Meta other = liveHead(store, "p/blobs/b", "y");
         Meta weak = liveHead(weak_store, "p/blobs/w", "z");
@@ -285,8 +275,8 @@ Expected expected(const Cell & c)
     {
         const IntentOf remove = !c.suppressed && c.canonical_token ? IntentOf::RowToken : IntentOf::Nothing;
         if (c.create_budget)
-            return {TransitionCreate, IntentOf::Observed, remove, true};
-        return {TransitionCandidate, IntentOf::Nothing, remove, true};
+            return {Create, IntentOf::Observed, remove, true};
+        return {Candidate, IntentOf::Nothing, remove, true};
     }
 
     switch (c.row)
@@ -399,6 +389,12 @@ struct CellCounts
     size_t deletes_shown_by_an_extra_head = 6;
 };
 
+/// A replacement records the observed token beside the row it replaces; a first create or a retry does not.
+bool replacesTheRow(const Cell & c, const IntentDecision & d)
+{
+    return c.row != RowState::None && (d.step == IntentStep::Create || d.step == IntentStep::Candidate) && d.new_token;
+}
+
 IntentDecision decide(const Cell & c, const Observations & o)
 {
     return decideIntentStep(inputOf(c, o).value());
@@ -455,7 +451,7 @@ TEST(CASIntentRules, EveryReachableCellFollowsTheSpec)
             {
                 ++deletes_shown_by_an_extra_head;
                 EXPECT_EQ(c.head, HeadKind::Other) << where;
-                EXPECT_TRUE(got.step == IntentStep::TransitionCreate || got.step == IntentStep::TransitionCandidate) << where;
+                EXPECT_TRUE(replacesTheRow(c, got)) << where;
             }
         }
 
@@ -501,7 +497,7 @@ TEST(CASIntentRules, EveryReachableCellFollowsTheSpec)
         if (c.row != RowState::None && c.zero && c.head == HeadKind::Other)
         {
             ++transitions;
-            EXPECT_TRUE(got.step == IntentStep::TransitionCreate || got.step == IntentStep::TransitionCandidate) << where;
+            EXPECT_TRUE(replacesTheRow(c, got)) << where;
         }
     });
 
@@ -649,7 +645,7 @@ TEST(CASIntentRules, HeadClassification)
     EXPECT_EQ(classifyDecisionHead(row_a, std::nullopt).seen(), HeadSeen::Absent);
     EXPECT_FALSE(classifyDecisionHead(row_a, std::nullopt).observed().has_value());
 
-    WeakEtagBackend weak;
+    HeadValueOverrideBackend weak(Dialect::ETag, weakValue);
     const Meta w = liveHead(weak, "p/blobs/w", "z");
     ASSERT_FALSE(w.etag.canonical().has_value()) << "positive control: the weak token names no incarnation";
     EXPECT_EQ(classifyDecisionHead(row_a, w).seen(), HeadSeen::Uncanonical);

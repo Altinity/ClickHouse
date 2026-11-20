@@ -14,30 +14,11 @@ using namespace DB::Cas;
 namespace
 {
 
-/// A backend whose HEAD answers a fixed value under a fixed dialect, so a live `Etag` can carry any
-/// spelling the grammar admits.
-class FixedHeadBackend : public InMemoryBackend
-{
-public:
-    FixedHeadBackend(Dialect dialect_, String value_) : claimed_dialect(dialect_), value(std::move(value_)) {}
-    Dialect dialect() const override { return claimed_dialect; }
-
-    std::optional<RawMeta> head(const String & key, TransportAccess & access) override
-    {
-        auto meta = InMemoryBackend::head(key, access);
-        if (meta)
-            meta->value = value;
-        return meta;
-    }
-
-private:
-    Dialect claimed_dialect;
-    String value;
-};
-
+/// A live `Etag` whose HEAD answered `value` under `dialect`, so it can carry any spelling the grammar admits.
 Etag liveEtag(Dialect dialect, const String & value)
 {
-    auto backend = std::make_shared<FixedHeadBackend>(dialect, value);
+    auto backend = std::make_shared<DB::Cas::tests::HeadValueOverrideBackend>(
+        dialect, [value](const String &, const String &) { return value; });
     auto requests = DB::Cas::tests::openRequestsForTest(*backend);
     auto op = requests.admit();
     op.create("k", "body", Retry::once());

@@ -54,8 +54,6 @@ enum class IntentStep : uint8_t
     Drop,                /// drop the row; a spare also deletes `intent_to_delete` when it names one
     DeleteBody,          /// row to `standing(t)`, and `DELETE B If-Match` the raw token of `head->observed()`
     Standing,            /// the body is absent: row to `standing(t)`, no request
-    TransitionCreate,    /// create `intent_to_create`; row to `pending(new_token)` if confirmed, else `candidate(new_token)`
-    TransitionCandidate, /// over the create budget: row to `candidate(new_token)`, no create
     DeleteIntent,        /// delete `intent_to_delete`; drop the row after the answer
     Anomaly,             /// `standing(t)` whose `HEAD` shows `t`: carried, nothing deleted, one ERROR
 };
@@ -88,7 +86,8 @@ struct IntentDecision
     std::optional<CanonicalIdentity> intent_to_create = {};
     /// Goes to the delete batch, beside a transition too; never to the job that deletes the body.
     std::optional<CanonicalIdentity> intent_to_delete = {};
-    /// The token of the row this step writes, when it is the observed one rather than the row's own.
+    /// The token of the row this step writes, when it is the observed one rather than the row's own. Beside a row,
+    /// it replaces the row: another incarnation took the key.
     std::optional<PersistedEtag> new_token = {};
 };
 

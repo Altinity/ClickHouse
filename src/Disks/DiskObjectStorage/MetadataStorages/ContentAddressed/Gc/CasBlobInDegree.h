@@ -77,20 +77,20 @@ struct IntentCreates
     explicit operator bool() const { return static_cast<bool>(start); }
 };
 
-/// Backend-independent codec for source-edge keys. A key is `algo` (u8), the digest at that algorithm's
-/// native width, and `source_id` (16 bytes, big-endian). The packed byte order is exactly
-/// `(BlobRef, source_id)` order, which lets the fold merge compare keys directly. The leading algorithm
-/// byte makes the digest width self-describing; supported algorithms may therefore be mixed in one run.
-class SourceEdgeKeyCodec
+/// The order of rows in a source-edge run: by blob (algorithm first, so algorithms may be mixed in one run), then by
+/// `source_id`, so a blob's sentinel row (source id 0) leads it. The fold merge and `AdoptedRunReader` both compare by it.
+struct SourceEdgeKey
 {
-public:
-    SourceEdgeKeyCodec() = delete;
+    BlobRef ref{};
+    UInt128 source_id{};
 
-    /// key = algo(u8) ++ digest[blobHashLenFor(algo)] ++ source_id(16 BE); 33 or 49 bytes.
-    static String key(const BlobRef & ref, const UInt128 & source_id);
-    /// Parse a key. Throws `NOT_IMPLEMENTED` on an unknown algo byte, `CORRUPTED_DATA` on a wrong
-    /// total length for a known algo. Zero-tails the digest (beyond the algo's own width).
-    static void parse(std::string_view key, BlobRef & ref, UInt128 & source_id);
+    bool operator==(const SourceEdgeKey &) const = default;
+    bool operator<(const SourceEdgeKey & other) const
+    {
+        if (ref != other.ref)
+            return ref < other.ref;
+        return source_id < other.source_id;
+    }
 };
 
 /// Deterministic 16-byte id of a source edge (ManifestId, path). Distinctness only — not reconstructable.
@@ -225,7 +225,7 @@ private:
     bool finished = false;
     /// The summary of the condemned rows read so far, in the seal's terms.
     CondemnedSummary counted;
-    std::optional<std::pair<BlobRef, UInt128>> previous_key;
+    std::optional<SourceEdgeKey> previous_key;
     /// Rows are sorted, so two sentinel rows of one blob are adjacent among the sentinels.
     std::optional<BlobRef> last_sentinel_blob;
 };
@@ -387,46 +387,42 @@ struct RetiredMergeResult
 /// safely elsewhere (see each field's own comment). Reusable as-is by a future bounded-parallel-walk: give
 /// each worker an atomic increment (or a partitioned share of a bound) instead of inventing a new
 /// accounting shape.
+/// A per-round cap on slots taken in run order. A round that spends it resumes the next round after the last
+/// (shard, blob) that took a slot, so a row that takes a slot without progress cannot hold it in every round.
+struct RotatingBudget
+{
+    using RunPosition = std::pair<uint64_t, BlobRef>;
+
+    uint64_t cap = 0;   /// 0 is unbounded
+    uint64_t used = 0;
+    std::optional<RunPosition> resume_after;
+    std::optional<RunPosition> last_taken;
+
+    bool available() const { return cap == 0 || used < cap; }
+    bool admits(uint64_t shard, const BlobRef & ref) const
+    {
+        return available() && (!resume_after || *resume_after < RunPosition{shard, ref});
+    }
+    void take(uint64_t shard, const BlobRef & ref)
+    {
+        ++used;
+        last_taken = RunPosition{shard, ref};
+    }
+    /// Where the next round resumes: after the last slot when the budget ran out, else from the start.
+    std::optional<RunPosition> nextResumeAfter() const
+    {
+        return available() ? std::nullopt : last_taken;
+    }
+};
+
 struct GcRoundWorkBudget
 {
-    uint64_t max_intent_creates = 0;
-    uint64_t max_redeletes = 0;
-    uint64_t intent_creates_used = 0;
-    uint64_t redeletes_used = 0;
-    /// (shard, blob) of the last create sent. A round that spent the create budget resumes after it, so a key
-    /// whose create never confirms cannot take the budget ahead of the keys behind it in every round.
-    using RunPosition = std::pair<uint64_t, BlobRef>;
-    std::optional<RunPosition> creates_resume_after;
-    std::optional<RunPosition> last_create_sent;
-    /// (shard, blob) of the last row that took a redelete slot, kept the same way, so a `pending` row carried after
-    /// its `HEAD` cannot take the slot ahead of the rows behind it in every round.
-    std::optional<RunPosition> redeletes_resume_after;
-    std::optional<RunPosition> last_redelete_slot;
-
-    bool intentCreateAvailable() const { return max_intent_creates == 0 || intent_creates_used < max_intent_creates; }
-    bool intentCreateAdmits(uint64_t shard, const BlobRef & ref) const
-    {
-        return intentCreateAvailable() && (!creates_resume_after || *creates_resume_after < RunPosition{shard, ref});
-    }
-    /// Where the next round resumes: after the last create when the budget ran out, else from the start.
-    std::optional<RunPosition> nextCreatesResumeAfter() const
-    {
-        return intentCreateAvailable() ? std::nullopt : last_create_sent;
-    }
-    bool redeleteAvailable() const { return max_redeletes == 0 || redeletes_used < max_redeletes; }
-    bool redeleteAdmits(uint64_t shard, const BlobRef & ref) const
-    {
-        return redeleteAvailable() && (!redeletes_resume_after || *redeletes_resume_after < RunPosition{shard, ref});
-    }
-    void takeRedeleteSlot(uint64_t shard, const BlobRef & ref)
-    {
-        ++redeletes_used;
-        last_redelete_slot = RunPosition{shard, ref};
-    }
-    std::optional<RunPosition> nextRedeletesResumeAfter() const
-    {
-        return redeleteAvailable() ? std::nullopt : last_redelete_slot;
-    }
+    /// A slot is taken when the create is sent, so a key whose create never confirms cannot take the budget ahead
+    /// of the keys behind it in every round.
+    RotatingBudget intent_creates;
+    /// A slot is taken by a `pending` row's body `HEAD`, even when the row is carried after it, so such a row cannot
+    /// take the slot ahead of the rows behind it in every round.
+    RotatingBudget redeletes;
 
     /// Orphan-manifest planner (`planManifestCursorPage` / `activeManifestKeys`): how many DISTINCT
     /// namespaces the sweep may build a fresh protection view for in total this round (cumulative
@@ -572,8 +568,7 @@ struct ShardFoldOptions
 /// `peek_head` for the first nomination of the key: `candidate(t)` when the body shows the intent's token `t`,
 /// `standing(t)` when it is absent or shows another identity. A nomination without a tag, or any nomination in a
 /// suppressed round, is a `LOGICAL_ERROR`. Adoption sends no create and no delete; without `peek_head` nothing is adopted.
-/// The merge comparator is exactly `(ref.algo, ref.digest, source_id)` (that is, `BlobRef::operator<`
-/// followed by `source_id`), which is also the raw key order produced by `SourceEdgeKeyCodec`.
+/// The merge order is `SourceEdgeKey`'s.
 RunRef foldDeltasIntoGeneration(CasOperation & op, const Layout & layout, const std::vector<RunRef> & prior_runs,
                                 AdoptedRunContext parent, uint64_t new_generation, uint64_t attempt, uint64_t shard,
                                 std::vector<BlobDelta> scattered, ShardFoldOptions options = {});

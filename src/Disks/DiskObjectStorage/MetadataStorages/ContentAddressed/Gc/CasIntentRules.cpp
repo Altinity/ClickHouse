@@ -70,14 +70,14 @@ void checkInput(const IntentRuleInput & input)
     }
 }
 
-/// Condemn a body: `Create` within the create budget, else `over_budget`; the row takes the observed token.
-IntentDecision condemnObserved(const IntentRuleInput & input, IntentStep within_budget, IntentStep over_budget)
+/// Condemn a body: `Create` within the create budget, else `Candidate`; the row takes the observed token.
+IntentDecision condemnObserved(const IntentRuleInput & input)
 {
     const Etag & observed = input.head->observed()->etag;
-    IntentDecision out{.step = over_budget, .new_token = PersistedEtag::capture(observed)};
+    IntentDecision out{.step = IntentStep::Candidate, .new_token = PersistedEtag::capture(observed)};
     if (input.create_budget_admits)
     {
-        out.step = within_budget;
+        out.step = IntentStep::Create;
         out.intent_to_create = observed.canonical();
     }
     return out;
@@ -94,7 +94,7 @@ IntentDecision decideIntentStep(const IntentRuleInput & input)
     {
         /// A fresh transition condemns a body whose token canonicalises, in any round.
         if (input.fresh_transition && seen == HeadSeen::Other)
-            return condemnObserved(input, IntentStep::Create, IntentStep::Candidate);
+            return condemnObserved(input);
         return {};
     }
 
@@ -115,7 +115,7 @@ IntentDecision decideIntentStep(const IntentRuleInput & input)
     /// unsuppressed round.
     if (seen == HeadSeen::Other)
     {
-        IntentDecision out = condemnObserved(input, IntentStep::TransitionCreate, IntentStep::TransitionCandidate);
+        IntentDecision out = condemnObserved(input);
         if (!input.suppressed)
             out.intent_to_delete = own;
         return out;

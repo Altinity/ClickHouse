@@ -23,7 +23,6 @@ namespace ProfileEvents
 #include <city.h>
 #include <fmt/ranges.h>
 #include <algorithm>
-#include <cstring>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -34,7 +33,6 @@ namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
     extern const int LOGICAL_ERROR;
-    extern const int NOT_IMPLEMENTED;
 }
 }
 
@@ -45,6 +43,15 @@ namespace
 {
 
 const UInt128 kZeroSourceId{0};
+
+/// A digest wider than its algorithm's own width is a programming bug, not corrupted data: chassert, not throw.
+SourceEdgeKey sourceEdgeKeyOf(const BlobRef & ref, const UInt128 & source_id)
+{
+    const size_t digest_len = blobHashLenFor(ref.algo);
+    for (size_t i = digest_len; i < ref.digest.bytes.size(); ++i)
+        chassert(ref.digest.bytes[i] == 0, fmt::format("source-edge key: non-zero byte at tail position {} (digest_len={})", i, digest_len));
+    return SourceEdgeKey{ref, source_id};
+}
 
 /// Run records held behind a row whose create is unanswered; past this the merge waits for the oldest answer.
 /// Bounds memory, not requests.
@@ -64,7 +71,7 @@ public:
     }
 
     bool valid() const { return has_current; }
-    const String & key() const { return current.key; }
+    const SourceEdgeKey & key() const { return current.key; }
     /// The value byte of the current row: `RunMarker::Edge` (a surviving edge) or `RunMarker::Condemned` (a retired
     /// sentinel row). Zero markers are never surfaced (dropped on carry).
     RunMarker rowType() const { return current.type; }
@@ -136,7 +143,7 @@ public:
 private:
     struct Row
     {
-        String key;
+        SourceEdgeKey key;
         BlobRef ref;
         RunMarker type = RunMarker::Edge;
         CondemnedRow condemned;
@@ -158,9 +165,9 @@ private:
             if (rec.marker == RunMarker::Zero)
                 continue;
             if (rec.marker == RunMarker::Condemned)
-                return Row{.key = SourceEdgeKeyCodec::key(rec.ref, rec.source_id), .ref = rec.ref,
+                return Row{.key = sourceEdgeKeyOf(rec.ref, rec.source_id), .ref = rec.ref,
                            .type = RunMarker::Condemned, .condemned = condemnedRowOf(rec)};
-            return Row{.key = SourceEdgeKeyCodec::key(rec.ref, rec.source_id), .ref = rec.ref,
+            return Row{.key = sourceEdgeKeyOf(rec.ref, rec.source_id), .ref = rec.ref,
                        .type = RunMarker::Edge, .condemned = {}};
         }
         return std::nullopt;
@@ -266,7 +273,7 @@ void AdoptedRunReader::checkRow(const SourceEdgeRecord & rec)
     if (blobShard(rec.ref, context.gc_shards) != shard)
         refuseRow(rec, fmt::format("belongs to GC shard {} of {}, not to shard {} whose run holds it",
             blobShard(rec.ref, context.gc_shards), context.gc_shards, shard));
-    const std::pair<BlobRef, UInt128> key{rec.ref, rec.source_id};
+    const SourceEdgeKey key{rec.ref, rec.source_id};
     if (previous_key && key < *previous_key)
         refuseRow(rec, "sorts before the row above it");
     previous_key = key;
@@ -383,54 +390,6 @@ SourceEdgeRunView openSourceEdgeRun(CasOperation & op, const String & key, const
     return SourceEdgeRunView(std::move(stream));
 }
 
-namespace
-{
-/// len-drift guard (mirrors DigestCodec::checkZeroTail, CasBlobDigest.h): a caller passing a digest
-/// wider than the algo's own width is a programming bug, not corrupted on-disk data — chassert, not
-/// throw.
-void checkZeroTailForAlgo(const BlobDigest & d, uint8_t digest_len, [[maybe_unused]] const char * what)
-{
-    for (size_t i = digest_len; i < d.bytes.size(); ++i)
-        chassert(d.bytes[i] == 0, fmt::format("SourceEdgeKeyCodec::{}: non-zero byte at tail position {} (digest_len={})", what, i, digest_len));
-}
-}
-
-String SourceEdgeKeyCodec::key(const BlobRef & ref, const UInt128 & source_id)
-{
-    const uint8_t digest_len = static_cast<uint8_t>(blobHashLenFor(ref.algo));
-    checkZeroTailForAlgo(ref.digest, digest_len, "key");
-    String out;
-    out.push_back(static_cast<char>(static_cast<uint8_t>(ref.algo)));
-    out += String(reinterpret_cast<const char *>(ref.digest.bytes.data()), digest_len);
-    out += u128ToBytesBE(source_id);
-    return out;
-}
-
-void SourceEdgeKeyCodec::parse(std::string_view key, BlobRef & ref, UInt128 & source_id)
-{
-    if (key.empty())
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS source-edge run: empty key");
-    const uint8_t algo_byte = static_cast<uint8_t>(key[0]);
-    BlobHashAlgo algo{};
-    switch (algo_byte)
-    {
-        case static_cast<uint8_t>(BlobHashAlgo::CityHash128): algo = BlobHashAlgo::CityHash128; break;
-        case static_cast<uint8_t>(BlobHashAlgo::XXH3_128):    algo = BlobHashAlgo::XXH3_128; break;
-        case static_cast<uint8_t>(BlobHashAlgo::Sha256):      algo = BlobHashAlgo::Sha256; break;
-        default:
-            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-                "CAS source-edge run: unknown algo byte {} in key", algo_byte);
-    }
-    const uint8_t digest_len = static_cast<uint8_t>(blobHashLenFor(algo));
-    if (key.size() != 1 + static_cast<size_t>(digest_len) + 16)
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS source-edge run: malformed key ({} bytes, expected {})", key.size(), 1 + digest_len + 16);
-    ref = BlobRef{};
-    ref.algo = algo;
-    memcpy(ref.digest.bytes.data(), key.data() + 1, digest_len);
-    source_id = u128FromBytesBE(String(key.substr(1 + digest_len, 16)), "src-edge run key source_id");
-}
-
 void putDeterministicArtifact(CasOperation & op, const String & key, const String & bytes)
 {
     WriteResult result = op.create(key, bytes, Retry::standard());
@@ -470,20 +429,15 @@ RunRef foldDeltasIntoGeneration(CasOperation & op, const Layout & layout, const 
     // MUST be stable: for the same (ref, source_id) the journal ordering is
     // activation-before-removal; "last wins" then correctly resolves to removal (edge absent).
     // An unstable sort can put removal before activation => last=activation => false positive.
-    // The comparator is exactly (ref.algo, ref.digest, source_id) == BlobRef::operator< then
-    // source_id — the same order the raw keys sort in (`SourceEdgeKeyCodec::key`'s algo
-    // byte decides before any digest byte can), so the merge below stays a plain key comparison.
     std::stable_sort(scattered.begin(), scattered.end(),
         [](const BlobDelta & a, const BlobDelta & b)
         {
-            if (a.ref != b.ref) return a.ref < b.ref;
-            return a.source_id < b.source_id;
+            return SourceEdgeKey{a.ref, a.source_id} < SourceEdgeKey{b.ref, b.source_id};
         });
     std::sort(options.source_retirements.begin(), options.source_retirements.end(),
         [](const BlobSourceRetirement & a, const BlobSourceRetirement & b)
         {
-            if (a.ref != b.ref) return a.ref < b.ref;
-            return a.source_id < b.source_id;
+            return SourceEdgeKey{a.ref, a.source_id} < SourceEdgeKey{b.ref, b.source_id};
         });
     /// Stable, so the first listed intent of a key is the one adopted.
     std::stable_sort(options.intent_nominations.begin(), options.intent_nominations.end(),
@@ -597,8 +551,7 @@ RunRef foldDeltasIntoGeneration(CasOperation & op, const Layout & layout, const 
     {
         if (options.work_budget)
         {
-            ++options.work_budget->intent_creates_used;
-            options.work_budget->last_create_sent = GcRoundWorkBudget::RunPosition{shard, cur_blob};
+            options.work_budget->intent_creates.take(shard, cur_blob);
         }
         row.delete_pending = false;
         row.standing = false;
@@ -674,16 +627,16 @@ RunRef foldDeltasIntoGeneration(CasOperation & op, const Layout & layout, const 
         input.fresh_transition = !row && input.at_zero && cur_touched;
         input.suppressed = options.suppress_destructive;
         input.create_budget_admits
-            = options.create_intent && (!options.work_budget || options.work_budget->intentCreateAdmits(shard, cur_blob));
-        input.redelete_budget_admits = !options.work_budget || options.work_budget->redeleteAdmits(shard, cur_blob);
+            = options.create_intent && (!options.work_budget || options.work_budget->intent_creates.admits(shard, cur_blob));
+        input.redelete_budget_admits = !options.work_budget || options.work_budget->redeletes.admits(shard, cur_blob);
 
         /// A row carried after its `HEAD` keeps its slot, so the budget bounds the round's `HEAD`s of pending rows;
-        /// the rotation in `GcRoundWorkBudget` keeps such a row from holding the slot in every round.
+        /// the rotation in `RotatingBudget` keeps such a row from holding the slot in every round.
         bool redelete_slot_taken = false;
         const auto takeRedeleteSlot = [&]
         {
             if (options.work_budget)
-                options.work_budget->takeRedeleteSlot(shard, cur_blob);
+                options.work_budget->redeletes.take(shard, cur_blob);
             redelete_slot_taken = true;
         };
         switch (decisionHeadNeed(input))
@@ -769,11 +722,19 @@ RunRef foldDeltasIntoGeneration(CasOperation & op, const Layout & layout, const 
             case IntentStep::None:
                 return;
             case IntentStep::Create:
-                createAndRecord(row ? *row : observedRow(decision, *input.head), *decision.intent_to_create);
-                return;
             case IntentStep::Candidate:
-                rmr.still_retired.push_back(observedRow(decision, *input.head));
+            {
+                RetiredEntry next = decision.new_token ? observedRow(decision, *input.head) : *row;
+                if (decision.step == IntentStep::Create)
+                    createAndRecord(std::move(next), *decision.intent_to_create);
+                else
+                    rmr.still_retired.push_back(std::move(next));
+                if (row && decision.new_token)
+                    rmr.replaced.push_back(ReplacedEntry{.row = rmr.still_retired.size() - 1, .old_token = row->token});
+                if (decision.intent_to_delete)
+                    rmr.intent_deletes.push_back(layout.writeOnceBlobIntentKey(cur_blob, *decision.intent_to_delete));
                 return;
+            }
             case IntentStep::Carry:
                 rmr.still_retired.push_back(*row);
                 return;
@@ -795,19 +756,6 @@ RunRef foldDeltasIntoGeneration(CasOperation & op, const Layout & layout, const 
                 rmr.to_standing.push_back(std::move(standing));
                 if (decision.step == IntentStep::DeleteBody)
                     rmr.body_deletes.push_back(BodyDelete{.entry = *row, .observed = input.head->observed()});
-                return;
-            }
-            case IntentStep::TransitionCreate:
-            case IntentStep::TransitionCandidate:
-            {
-                RetiredEntry moved = observedRow(decision, *input.head);
-                if (decision.step == IntentStep::TransitionCreate)
-                    createAndRecord(std::move(moved), *decision.intent_to_create);
-                else
-                    rmr.still_retired.push_back(std::move(moved));
-                rmr.replaced.push_back(ReplacedEntry{.row = rmr.still_retired.size() - 1, .old_token = row->token});
-                if (decision.intent_to_delete)
-                    rmr.intent_deletes.push_back(layout.writeOnceBlobIntentKey(cur_blob, *decision.intent_to_delete));
                 return;
             }
             case IntentStep::DeleteIntent:
@@ -895,27 +843,27 @@ RunRef foldDeltasIntoGeneration(CasOperation & op, const Layout & layout, const 
 
     while (cursor.valid() || di < scattered.size() || ri < options.source_retirements.size() || ni < options.intent_nominations.size())
     {
-        // Pick the smallest row key across the prior-run cursor and this round's deltas.
-        String key;
+        // Pick the smallest row key across the prior-run cursor and this round's deltas; a tie goes to the earlier input.
+        std::optional<SourceEdgeKey> key;
         bool from_prior = false;
         if (cursor.valid()) { key = cursor.key(); from_prior = true; }
         if (di < scattered.size())
         {
-            const String dk = SourceEdgeKeyCodec::key(scattered[di].ref, scattered[di].source_id);
-            if (!from_prior || dk < key) { key = dk; from_prior = false; }
+            const SourceEdgeKey dk = sourceEdgeKeyOf(scattered[di].ref, scattered[di].source_id);
+            if (!key || dk < *key) { key = dk; from_prior = false; }
         }
         if (ri < options.source_retirements.size())
         {
-            const String rk = SourceEdgeKeyCodec::key(options.source_retirements[ri].ref, options.source_retirements[ri].source_id);
-            if ((!from_prior && key.empty()) || rk < key) { key = rk; from_prior = false; }
+            const SourceEdgeKey rk = sourceEdgeKeyOf(options.source_retirements[ri].ref, options.source_retirements[ri].source_id);
+            if (!key || rk < *key) { key = rk; from_prior = false; }
         }
         /// A nomination sits at its blob's sentinel key, so it opens the blob before any edge of it. On a tie with a
         /// prior condemned row the row goes first; the nomination is then taken at the same blob.
         bool from_nomination = false;
         if (ni < options.intent_nominations.size())
         {
-            const String nk = SourceEdgeKeyCodec::key(options.intent_nominations[ni].ref, kZeroSourceId);
-            if ((!from_prior && key.empty()) || nk < key) { key = nk; from_prior = false; from_nomination = true; }
+            const SourceEdgeKey nk = sourceEdgeKeyOf(options.intent_nominations[ni].ref, kZeroSourceId);
+            if (!key || nk < *key) { key = nk; from_prior = false; from_nomination = true; }
         }
         if (from_nomination)
         {
@@ -926,9 +874,8 @@ RunRef foldDeltasIntoGeneration(CasOperation & op, const Layout & layout, const 
             continue;
         }
 
-        BlobRef blob_ref;
-        UInt128 source_id;
-        SourceEdgeKeyCodec::parse(key, blob_ref, source_id);   // throws CORRUPTED_DATA on a malformed key (fail-closed)
+        const BlobRef blob_ref = key->ref;
+        const UInt128 source_id = key->source_id;
         openBlobIfNeeded(blob_ref);
 
         /// A retired sentinel row from the prior run: stash it for close-out settlement. It is not an edge
@@ -942,7 +889,7 @@ RunRef foldDeltasIntoGeneration(CasOperation & op, const Layout & layout, const 
         }
 
         bool present = false;
-        if (from_prior && cursor.key() == key) { present = true; cursor.advance(); cur_touched = true; }
+        if (from_prior && cursor.key() == *key) { present = true; cursor.advance(); cur_touched = true; }
         while (di < scattered.size()
                && scattered[di].ref == blob_ref && scattered[di].source_id == source_id)
         {
