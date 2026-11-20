@@ -85,6 +85,7 @@ namespace ErrorCodes
     extern const int CORRUPTED_DATA;
     extern const int INVALID_STATE;
     extern const int LOGICAL_ERROR;
+    extern const int NETWORK_ERROR;
     extern const int NOT_IMPLEMENTED;
 }
 }
@@ -2053,7 +2054,7 @@ void Gc::FoldResult::FrontierDeficit::count(FrontierUnproven reason)
     }
 }
 
-Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
+Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
                         RoundReport & report,
                         uint64_t current_round, const RefPlan & walk_plan, UniversePolicy policy,
                         GcRoundWorkBudget & work_budget)
@@ -3651,8 +3652,42 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         && (result.frontier_namespaces > 0 || result.catalog_cut_proved_empty);
     const bool frontier_incomplete = !result.frontier_complete;
 
-    result.suppress_destructive =
-        !report.anomalies.empty() || !carried_holds.empty() || frontier_incomplete;
+    const bool suppressed_by_intake = !report.anomalies.empty() || !carried_holds.empty() || frontier_incomplete;
+
+    /// Ref-log cleanup runs after its round commits a newer `gc/state`, so the leased version, still current
+    /// after the last intake read, shows that no newer leader removed a record this round read as absent.
+    /// Rounds with no `pending` or `standing` parent row skip the read, so an idle round sends no request.
+    bool parent_has_delete_pending = false;
+    for (uint64_t shard = 0; shard < state.gc_shards; ++shard)
+        parent_has_delete_pending = parent_has_delete_pending || summaryOfParent(shard).pending_total != 0;
+    if (!suppressed_by_intake && parent_has_delete_pending)
+    {
+        String seen;
+        try
+        {
+            const std::optional<Meta> current = op.head(layout.gcStateKey(), Retry::standard());
+            if (!current)
+                seen = "no object";
+            else if (!state_etag || !current->etag.canonical() || current->etag.canonical() != state_etag->canonical())
+                seen = "another version";
+        }
+        catch (const Exception & e)
+        {
+            /// A read verb that gives up throws `NETWORK_ERROR`; any other failure fails the round, as elsewhere.
+            if (e.code() != ErrorCodes::NETWORK_ERROR)
+                throw;
+            seen = "no answer";
+        }
+        result.parent_unconfirmed = !seen.empty();
+        if (result.parent_unconfirmed)
+            LOG_WARNING(logger,
+                "CAS GC fold: the `HEAD` of `gc/state` after the intake shows {}, not the version this round "
+                "leased (parent_unconfirmed). A newer leader may have removed records this round read as absent; "
+                "no body or intent is deleted this pass.",
+                seen);
+    }
+
+    result.suppress_destructive = suppressed_by_intake || result.parent_unconfirmed;
     const bool suppress_destructive = result.suppress_destructive;
     if (suppress_destructive)
     {
@@ -3670,7 +3705,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         /// A catalog the cut DID prove empty is not a suppression cause at all: it satisfies
         /// `frontier_complete`, so a round reaching this block with one is suppressed by an anomaly or
         /// a hold, never by the frontier term.
-        const bool per_round_cause = !report.anomalies.empty() || !carried_holds.empty()
+        const bool per_round_cause = !report.anomalies.empty() || !carried_holds.empty() || result.parent_unconfirmed
             || result.frontier_proven != result.frontier_namespaces
             || (universe_authoritative && result.frontier_namespaces == 0 && !result.catalog_cut_proved_empty);
         const char * const universe_note =
@@ -3686,21 +3721,22 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         const String deficit_note = result.frontier_deficit.total() == 0
             ? String{}
             : fmt::format("; unproven: {}", result.frontier_deficit.describe());
+        const char * const parent_note = result.parent_unconfirmed ? "; the leased `gc/state` is unconfirmed" : "";
         if (per_round_cause)
             LOG_WARNING(logger,
                 "CAS GC fold: destructive work SUPPRESSED this pass — {} anomaly(ies), {} held "
-                "namespace(s), frontier {} ({} of {} namespace(s) proven{}{}{}). Body deletes, intent removals "
-                "and the intent creates of carried candidates wait for a pass that clears all three; fresh "
+                "namespace(s), frontier {} ({} of {} namespace(s) proven{}{}{}){}. Body deletes, intent removals "
+                "and the intent creates of carried candidates wait for a pass that clears every cause; fresh "
                 "condemnations and transitions still create intents and write `pending` rows.",
                 report.anomalies.size(), carried_holds.size(),
                 result.frontier_complete ? "complete" : "INCOMPLETE",
                 result.frontier_proven, result.frontier_namespaces, universe_note, catalog_empty_note,
-                deficit_note);
+                deficit_note, parent_note);
         else
             LOG_INFO(logger,
                 "CAS GC fold: destructive work SUPPRESSED this pass — {} anomaly(ies), {} held "
                 "namespace(s), frontier {} ({} of {} namespace(s) proven{}{}{}). Body deletes, intent removals "
-                "and the intent creates of carried candidates wait for a pass that clears all three; fresh "
+                "and the intent creates of carried candidates wait for a pass that clears every cause; fresh "
                 "condemnations and transitions still create intents and write `pending` rows.",
                 report.anomalies.size(), carried_holds.size(),
                 result.frontier_complete ? "complete" : "INCOMPLETE",
@@ -4016,6 +4052,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         /// Published separately from `suppress_destructive` so a reader can tell the frontier term apart
         /// from the anomaly and hold terms without re-deriving the formula from the tally.
         reduce_timer->metric("frontier_complete", result.frontier_complete ? 1 : 0);
+        reduce_timer->metric("parent_unconfirmed", result.parent_unconfirmed ? 1 : 0);
         reduce_timer->metric("transactions_unapplied", transactions_unapplied_this_round);
     }
     reduce_timer.reset();   /// emits the `fold_reduce` row

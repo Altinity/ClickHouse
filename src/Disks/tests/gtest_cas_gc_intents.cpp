@@ -4074,3 +4074,375 @@ TEST_P(CASGcIntentsSharded, ChurnOfOneContentDefersTheBodyDelete)
     EXPECT_EQ(quiet.bodies_deleted, 1u);
     EXPECT_FALSE(pool.bodyMeta(blob()).has_value());
 }
+
+/// ---- A leader deposed while its round was paused ----
+
+namespace
+{
+
+/// Runs a hook once before the first `_log` read under a prefix reaches the store, and answers a `HEAD` of
+/// `gc/state` as the test sets it. No backend lock is held while the hook runs.
+class PausedLeaderBackend : public HeadHookBackend
+{
+public:
+    enum class StateHead : uint8_t
+    {
+        Store,
+        Absent,
+        Unanswered,
+        Refused,
+    };
+
+    std::atomic<StateHead> state_head{StateHead::Store};
+
+    void armBeforeLogRead(const String & prefix, std::function<void(const String &)> hook)
+    {
+        std::lock_guard lock(park_mutex);
+        log_prefix = prefix;
+        before_log_read = std::move(hook);
+    }
+
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        std::function<void(const String &)> fire;
+        {
+            std::lock_guard lock(park_mutex);
+            if (before_log_read && key.starts_with(log_prefix) && key.find("/_log/") != String::npos)
+                fire = std::exchange(before_log_read, {});
+        }
+        if (fire)
+            fire(key);
+        return HeadHookBackend::read(key, access);
+    }
+
+    std::optional<RawMeta> head(const String & key, TransportAccess & access) override
+    {
+        auto meta = HeadHookBackend::head(key, access);
+        if (!key.ends_with("/gc/state"))
+            return meta;
+        switch (state_head.load())
+        {
+            case StateHead::Store:
+                return meta;
+            case StateHead::Absent:
+                return std::nullopt;
+            case StateHead::Unanswered:
+                throw Poco::TimeoutException("the gc/state HEAD was never answered");
+            case StateHead::Refused:
+                throw std::runtime_error("the store refused the gc/state HEAD");
+        }
+        return meta;
+    }
+
+private:
+    std::mutex park_mutex;
+    String log_prefix;
+    std::function<void(const String &)> before_log_read;
+};
+
+using StateHead = PausedLeaderBackend::StateHead;
+
+std::vector<size_t> stateHeadIndices(const std::vector<JournalEntry> & journal)
+{
+    std::vector<size_t> out;
+    for (size_t i = 0; i < journal.size(); ++i)
+        if (journal[i].verb == JournalVerb::Head && journal[i].keys.front().ends_with("/gc/state"))
+            out.push_back(i);
+    return out;
+}
+
+/// A part write of `payload` that has precommitted and, with `upload`, materialized its blob; `promote` ends it.
+/// Without `upload` the entry names the blob with no request on the body.
+struct SlowWrite
+{
+    PartWriteTxnPtr build;
+    RootNamespace root;
+    String ref_name;
+    ManifestId id;
+    std::optional<BlobMaterializationAction> action;
+
+    void promote() { build->promote(root, ref_name, build->buildId(), id); }
+};
+
+SlowWrite beginSlowWrite(const PoolPtr & store, const String & ns, const String & ref_name, const String & payload,
+                         bool upload)
+{
+    const RootNamespace root{ns};
+    PartWriteInfo info;
+    info.intended_ref = ns + "/" + ref_name;
+    auto build = store->beginPartWrite(info);
+    ManifestEntry entry;
+    entry.path = "data.bin";
+    entry.placement = EntryPlacement::Blob;
+    entry.ref = idOf(payload);
+    entry.blob_size = payload.size();
+    if (!upload)
+        build->adoptEvidence(entry);
+    const ManifestId id = build->stageManifest({entry});
+    build->precommitAdd(root, ref_name, id);
+    std::optional<BlobMaterializationAction> action;
+    if (upload)
+    {
+        const BlobUploadResult uploaded = build->uploadBlobDetached(BlobUploadRequest{
+            .ref = entry.ref, .source = BlobSource::fromString(payload), .declared_size = payload.size()});
+        build->mergeBlobUploadResults(std::span<const BlobUploadResult>(&uploaded, 1));
+        action = uploaded.diagnostics.action;
+    }
+    return SlowWrite{build, root, ref_name, id, action};
+}
+
+/// Leader A holds a row of the blob of `payload` while writer W's precommit is the only record of W's namespace
+/// above A's cursor. A's next round parks before it reads that record. Meanwhile W finishes and publishes a
+/// snapshot past it, and leader B takes the lease, folds W's records, commits and removes the logs below the
+/// snapshot, the parked record included.
+struct PausedLeaderPool
+{
+    explicit PausedLeaderPool(const String & payload_) : payload(payload_), x(idOf(payload_))
+    {
+        PoolConfig config{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0, .gc_io_concurrency = 1};
+        /// No snapshot covers W's precommit before A parks; W's later parts publish one.
+        config.snapshot_log_count_threshold = 5;
+        store = Pool::open(backend, std::move(config));
+        body_key = store->layout().blobKey(x);
+        gc_a = std::make_unique<Gc>(store, kGateLeaderA);
+        gc_b = std::make_unique<Gc>(store, kGateLeaderB);
+    }
+
+    /// A part of the blob, committed in a round of A and dropped: A's next round condemns it.
+    void seed()
+    {
+        backend->clearJournal();
+        ASSERT_EQ(writeOnePart(store, ns_w, "p0", payload), BlobMaterializationAction::Published);
+        stream = firstWrittenStreamPrefix(*backend);
+        ASSERT_FALSE(stream.empty());
+        runGateRound(store, *gc_a);
+        store->dropRef(RootNamespace{ns_w}, "p0");
+        store->renewWatermarkOnce();
+    }
+
+    std::optional<RetiredEntry> row() const { return retiredEntryFor(*backend, store->layout(), x); }
+
+    bool snapshotAbove(const RefTxnId & id) const
+    {
+        const std::optional<RefTxnId> snapshot = store->newestPublishedSnapshotIdForTest(RootNamespace{ns_w});
+        return snapshot && id < *snapshot;
+    }
+
+    /// Arms A's next round to park before its first `_log` read in W's namespace; `finish_writer` runs there.
+    void parkLeaderA(std::function<void()> finish_writer)
+    {
+        backend->armBeforeLogRead(stream, [this, finish = std::move(finish_writer)](const String & key)
+        {
+            parked_key = key;
+            parked_key_present = objectPresent(*backend, key);
+            const RefTxnId parked_id = store->layout().parseRefObjectKey(key)->txn_id;
+            finish();
+            for (size_t i = 0; i < 8 && !snapshotAbove(parked_id); ++i)
+            {
+                writeOnePart(store, ns_w, "filler" + std::to_string(i), "paused-leader filler " + std::to_string(i));
+                store->waitForSnapshotPublishSettleForTest(RootNamespace{ns_w});
+            }
+            snapshot_above_parked = snapshotAbove(parked_id);
+            successor_observed = !runGateRound(store, *gc_b).acquired_lease;
+            successor_acquired = runGateRound(store, *gc_b).acquired_lease;
+            for (size_t i = 0; i < 4 && objectPresent(*backend, key); ++i)
+                runGateRound(store, *gc_b);
+            parked_key_cleaned = !objectPresent(*backend, key);
+        });
+    }
+
+    /// A's parked round. Its commit loses to B, so it may throw; only the store's state is asserted.
+    void runLeaderA()
+    {
+        try
+        {
+            runGateRound(store, *gc_a);
+        }
+        catch (...) // NOLINT(bugprone-empty-catch)
+        {
+        }
+    }
+
+    void expectDeposedAndCleaned() const
+    {
+        ASSERT_FALSE(parked_key.empty()) << "A never read W's namespace";
+        EXPECT_TRUE(parked_key_present) << "the record after A's cursor was not stored when A parked";
+        EXPECT_TRUE(snapshot_above_parked) << "W published no snapshot past the parked record";
+        EXPECT_TRUE(successor_observed) << "B's first round must only observe A";
+        EXPECT_TRUE(successor_acquired) << "B never took the lease";
+        EXPECT_TRUE(parked_key_cleaned) << "B's cleanup did not remove the parked record";
+        EXPECT_EQ(storedLeaseOwner(*backend, store->layout()), kGateLeaderB);
+    }
+
+    std::shared_ptr<PausedLeaderBackend> backend = std::make_shared<PausedLeaderBackend>();
+    PoolPtr store;
+    std::unique_ptr<Gc> gc_a;
+    std::unique_ptr<Gc> gc_b;
+    const String ns_w = "test/w";
+    const String payload;
+    const BlobRef x;
+    String body_key;
+    String stream;
+
+    String parked_key;
+    bool parked_key_present = false;
+    bool snapshot_above_parked = false;
+    bool successor_observed = false;
+    bool successor_acquired = false;
+    bool parked_key_cleaned = false;
+};
+
+}
+
+/// A commits `pending(t)` while W, which adopted `t` after the cut, has only precommitted. A's next round parks
+/// before it reads W's precommit, which B then removes: A must not read the absence as the end of W's records.
+TEST(CASGcIntents, PausedLeaderWhoseLogWasCleanedDeletesNothing)
+{
+    PausedLeaderPool pool("paused-leader-body");
+    ASSERT_NO_FATAL_FAILURE(pool.seed());
+
+    std::optional<SlowWrite> w;
+    pool.backend->armOnHead(pool.body_key, [&] { w = beginSlowWrite(pool.store, pool.ns_w, "w", pool.payload, /*upload=*/true); });
+    runGateRound(pool.store, *pool.gc_a);
+    ASSERT_TRUE(w && w->action == BlobMaterializationAction::Observed) << "W did not adopt the stored body";
+    ASSERT_TRUE(pool.row() && pool.row()->delete_pending && !pool.row()->standing) << "A did not commit pending(t)";
+
+    pool.parkLeaderA([&] { w->promote(); });
+    const size_t from = pool.backend->journal().size();
+    pool.runLeaderA();
+    ASSERT_NO_FATAL_FAILURE(pool.expectDeposedAndCleaned());
+
+    const auto journal = pool.backend->journal();
+    const auto requests = blobRequests(std::vector<JournalEntry>(journal.begin() + from, journal.end()));
+    EXPECT_EQ(countOf(requests, JournalVerb::Remove, pool.body_key) + countOf(requests, JournalVerb::RemoveMany, pool.body_key), 0u)
+        << "the deposed leader deleted the body";
+    EXPECT_TRUE(objectPresent(*pool.backend, pool.body_key)) << "W's part names a deleted body";
+    const FsckReport report = runFsck(*pool.store, /*detail=*/true);
+    EXPECT_EQ(report.dangling, 0u) << formatFsckSummary(report);
+}
+
+/// The same pause over `standing(t)`: W's precommit names the blob, and A must not delete `I(B,t)`.
+TEST(CASGcIntents, PausedLeaderWhoseLogWasCleanedDeletesNoIntent)
+{
+    PausedLeaderPool pool("paused-leader-intent");
+    ASSERT_NO_FATAL_FAILURE(pool.seed());
+    runGateRound(pool.store, *pool.gc_a);
+    runGateRound(pool.store, *pool.gc_a);
+    ASSERT_TRUE(pool.row() && pool.row()->standing) << "A did not commit standing(t)";
+    const String intent_key = pool.store->layout().blobIntentKey(pool.x, *pool.row()->token.canonical());
+    ASSERT_TRUE(objectPresent(*pool.backend, intent_key));
+
+    SlowWrite w = beginSlowWrite(pool.store, pool.ns_w, "w", pool.payload, /*upload=*/false);
+    pool.parkLeaderA([&] { w.promote(); });
+    const size_t from = pool.backend->journal().size();
+    pool.runLeaderA();
+    ASSERT_NO_FATAL_FAILURE(pool.expectDeposedAndCleaned());
+
+    const auto journal = pool.backend->journal();
+    const auto requests = blobRequests(std::vector<JournalEntry>(journal.begin() + from, journal.end()));
+    EXPECT_EQ(intentDeletes(requests), 0u) << "the deposed leader deleted the intent";
+    EXPECT_TRUE(objectPresent(*pool.backend, intent_key));
+}
+
+/// The validation read of `gc/state` answers with absence, or never answers: the round deletes nothing, throws
+/// nothing and carries the row. The next round, answered honestly, deletes the body.
+TEST(CASGcIntents, UnconfirmedLeasedStateSuppressesTheRound)
+{
+    for (const StateHead answer : {StateHead::Absent, StateHead::Unanswered})
+    {
+        SCOPED_TRACE(answer == StateHead::Absent ? "absent" : "unanswered");
+        IntentPool<PausedLeaderBackend> pool(std::make_shared<PausedLeaderBackend>());
+        ASSERT_NO_FATAL_FAILURE(pool.makePending({1}));
+        std::map<String, UInt64> reduce;
+        pool.gc->setPhaseSink([&reduce](const GcPhaseRecord & record)
+        {
+            if (record.phase == "fold_reduce")
+                reduce = record.metrics;
+        });
+
+        pool.backend->state_head = answer;
+        pool.backend->clearJournal();
+        RoundReport report;
+        ASSERT_NO_THROW(report = pool.round());
+        const auto journal = pool.backend->journal();
+        EXPECT_GE(stateHeadIndices(journal).size(), 1u) << "positive control: the round sent its validation read";
+        const auto requests = blobRequests(journal);
+        EXPECT_EQ(countOf(requests, JournalVerb::Remove, pool.bodyKey(1)), 0u);
+        EXPECT_EQ(intentDeletes(requests), 0u);
+        EXPECT_EQ(report.bodies_deleted, 0u);
+        EXPECT_TRUE(pool.bodyMeta(1).has_value());
+        EXPECT_TRUE(pool.row(1) && pool.row(1)->delete_pending && !pool.row(1)->standing);
+        EXPECT_EQ(metricOr(reduce, "parent_unconfirmed"), 1u);
+        EXPECT_EQ(metricOr(reduce, "suppress_destructive"), 1u);
+
+        pool.backend->state_head = StateHead::Store;
+        reduce.clear();
+        report = pool.round();
+        EXPECT_EQ(report.bodies_deleted, 1u) << "the confirmed round did not delete the body";
+        EXPECT_EQ(metricOr(reduce, "parent_unconfirmed"), 0u);
+    }
+}
+
+/// A refusal of the validation read fails the round, as a refusal of any other read of the fold does.
+TEST(CASGcIntents, RefusedValidationReadFailsTheRound)
+{
+    IntentPool<PausedLeaderBackend> pool(std::make_shared<PausedLeaderBackend>());
+    ASSERT_NO_FATAL_FAILURE(pool.makePending({1}));
+    pool.backend->state_head = StateHead::Refused;
+    pool.backend->clearJournal();
+    EXPECT_ANY_THROW(pool.round());
+    EXPECT_EQ(stateHeadIndices(pool.backend->journal()).size(), 1u);
+    EXPECT_TRUE(pool.bodyMeta(1).has_value());
+    EXPECT_TRUE(pool.row(1) && pool.row(1)->delete_pending && !pool.row(1)->standing);
+}
+
+/// The validation read follows every intake read and the cut, and precedes the first decision `HEAD`.
+TEST(CASGcIntents, ValidationReadSitsBetweenTheCutAndTheFirstDecisionHead)
+{
+    IntentPool<PausedLeaderBackend> pool(std::make_shared<PausedLeaderBackend>());
+    ASSERT_NO_FATAL_FAILURE(pool.makePending({1}));
+    markCutComplete(*pool.gc, *pool.backend);
+    pool.backend->clearJournal();
+    const RoundReport report = pool.round();
+    ASSERT_EQ(report.bodies_deleted, 1u) << "positive control: the round deleted the body";
+
+    const auto journal = pool.backend->journal();
+    const size_t cut = indexOfMark(journal, "cut_complete");
+    ASSERT_LT(cut, journal.size());
+    size_t first_blob_head = journal.size();
+    size_t last_log_read = 0;
+    for (size_t i = 0; i < journal.size(); ++i)
+    {
+        const JournalEntry & entry = journal[i];
+        if (entry.verb == JournalVerb::Head && first_blob_head == journal.size() && entry.keys.front().find("/blobs/") != String::npos)
+            first_blob_head = i;
+        if (entry.verb == JournalVerb::Read && entry.keys.front().find("/_log/") != String::npos)
+            last_log_read = i;
+    }
+    ASSERT_LT(first_blob_head, journal.size());
+    const std::vector<size_t> state_heads = stateHeadIndices(journal);
+    ASSERT_EQ(state_heads.size(), 1u);
+    EXPECT_GT(state_heads.front(), cut);
+    EXPECT_GT(state_heads.front(), last_log_read);
+    EXPECT_LT(state_heads.front(), first_blob_head);
+}
+
+/// A round whose parent holds no `pending` or `standing` row sends no validation read: an idle round and the
+/// round that condemns. The round after the condemnation sends one.
+TEST(CASGcIntents, RoundsWithoutADeletePendingParentRowSendNoValidationRead)
+{
+    IntentPool<PausedLeaderBackend> pool(std::make_shared<PausedLeaderBackend>());
+    pool.backend->clearJournal();
+    pool.round();
+    EXPECT_EQ(stateHeadIndices(pool.backend->journal()).size(), 0u) << "idle round";
+
+    pool.commitThenDrop({1});
+    pool.backend->clearJournal();
+    const RoundReport condemning = pool.round();
+    EXPECT_EQ(condemning.intent_confirmed, 1u) << "positive control: the round condemned";
+    EXPECT_EQ(stateHeadIndices(pool.backend->journal()).size(), 0u) << "condemning round";
+
+    pool.backend->clearJournal();
+    pool.round();
+    EXPECT_EQ(stateHeadIndices(pool.backend->journal()).size(), 1u) << "positive control: the round after it";
+}

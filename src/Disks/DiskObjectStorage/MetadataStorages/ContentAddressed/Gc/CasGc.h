@@ -632,6 +632,7 @@ private:
         ///     suppress_destructive = any anomaly this round
         ///                         OR carriedHolds() is non-empty
         ///                         OR the frontier is incomplete
+        ///                         OR parent_unconfirmed
         ///
         /// The second term is STRUCTURAL, not decorative. Every hold the fold seals also records an
         /// anomaly today, so the first term happens to cover the second — but that is a coincidence of
@@ -649,6 +650,10 @@ private:
         /// gate that carried only the hold set would license destruction against a namespace whose own
         /// checkpoint could not be read.
         bool suppress_destructive = false;
+
+        /// A `HEAD` of `gc/state` after the intake did not show the version this round leased. A newer
+        /// leader may have removed records above this round's cursors, so an absent record proves no end.
+        bool parent_unconfirmed = false;
 
         /// Whether EVERY namespace in this round's universe reached a proven frontier — see
         /// `UniversePolicy` for what the universe is and why the catalog is the only source that can
