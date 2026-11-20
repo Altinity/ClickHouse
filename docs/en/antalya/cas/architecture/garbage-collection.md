@@ -235,8 +235,9 @@ phase 5 and builds a new in-degree snapshot; `defer` skips generation constructi
 - **Safety:** a missing / invalid / incomplete adopted seal cannot produce a quiet defer — the
   deletion-due check refuses to defer and the plan read surfaces the bad state
 - **Fails the round if:** the plan-building seal read reports an invalid adopted seal. When the adopted seal is
-  missing and a `HEAD` of `gc/state` shows another version or no object, a newer leader's retention removed it: the
-  round ends with `ABORTED` ("gc/state moved during the round"), as a lost commit does, and not with `CORRUPTED_DATA`
+  missing and a `HEAD` of `gc/state` shows another version, a newer leader's retention removed it; when it shows no
+  object, the state itself is gone, and this leader's next lease fails with `CORRUPTED_DATA`. Either way the round ends with
+  `ABORTED` ("gc/state moved during the round"), as a lost commit does
 - **Observability:** phase row `defer_decision`; metrics `changed_shards` (despite the name, the
   number of changed namespace-life rows), `namespaces_seen`, `ref_log_keys_listed`
 
@@ -423,8 +424,9 @@ parent check is one uncached `HEAD` of `gc/state`, sent after the intake when th
 `standing` row. A round already suppressed by the intake skips it. The check must show the version the round leased.
 Another version, an absent object or no answer means a newer leader may have removed ref-log records this round read
 as absent, so the round deletes no body and no intent. The check itself does not fail the round. The round's
-`gc/state` commit does when the state moved or is absent: it is refused with `ABORTED`. The reason is the `parent_unconfirmed` metric of the `fold_reduce` row, a WARNING in the server
-log, and a count in `CASGCClampSuppressedPasses`. Under suppression the round
+`gc/state` commit does when the state moved or is absent: it is refused with `ABORTED`. The reason is the
+`parent_unconfirmed` metric of the `fold_reduce` row, a WARNING in the server log, and a count in
+`CASGCClampSuppressedPasses`. Under suppression the round
 still creates the intents of fresh condemnations and transitions, records rows, spares and carries, but body
 deletes, intent deletes, the intent creates of carried `candidate` rows, intent adoption, orphan-sweep planning
 and cursor adoption, retention prune, hand-off reclaim, manifest
@@ -461,8 +463,8 @@ memory* here and made durable only by phase 13's commit `CAS`.
 
 The round's single blob-body delete site, before the commit `CAS`: sends the exact-token body
 deletes the fold decided for `pending` rows, then the deletion-intent deletes, and writes the
-forensic outcome logs. A body delete is processed up to `cas_gc_round_redelete_budget` per round
-(the excess is carried unchanged).
+forensic outcome logs. Body deletes, and the phase 10 `HEAD`s that decide them, are bounded by
+`cas_gc_round_redelete_budget` (the excess is carried unchanged; see [condemnation and deletion](#condemn-delete)).
 
 - **Runs on:** fold path only
 - **Reads:** none here. The `HEAD` that names the body's current token was sent in phase 10, after the
@@ -807,6 +809,13 @@ unbounded); a blob over the budget is a `candidate` too. Under a budget the next
 whose create was sent, so a key that never confirms (other bytes at its intent key) cannot take every slot and starve
 the keys behind it. After a change of GC leader the order starts again from the first key.
 
+`cas_gc_round_redelete_budget` bounds the untouched `pending` rows at zero whose body `HEAD` a round sends (`0` is
+unbounded). Such a row takes its slot with the `HEAD` and keeps it whether the body is deleted, moves to `standing` or
+is carried (a body GC cannot decode, or a token with no canonical form). A touched `pending` row is always read and
+takes a slot only when it moves to `standing`. Under a budget the next round resumes after the last row that took a
+slot, so a row carried in every round cannot starve the rows behind it. After a change of GC leader the order starts
+again from the first row.
+
 A `candidate` whose decision `HEAD` shows no body is dropped without a create: there is nothing to protect, and
 an intent that an earlier attempt left over is an [orphan](#orphan-intents).
 
@@ -939,7 +948,7 @@ logs:
 | `PUT` run segments | 1 per non-pure-carry shard, plus 1 fold seal |
 | `HEAD` blobs | 1 per blob that reached zero, per `pending` row at zero, per transition, per adopted orphan, and per `pending` or `standing` row of a blob referenced again |
 | Intent `PUT` (`If-None-Match`) | 1 per blob condemned, per `candidate` retried and per transition, up to `cas_gc_round_intent_create_budget`; plus 1 `GET` when the intent already exists |
-| Blob body `DELETE` | 1 per `pending` row whose `HEAD` still shows its token, up to `cas_gc_round_redelete_budget` |
+| Blob body `DELETE` | 1 per `pending` row whose `HEAD` still shows its token; the `HEAD`s of untouched `pending` rows are bounded by `cas_gc_round_redelete_budget` |
 | Intent `DELETE` | 1 per `standing` row at zero, per transition, and per row of a blob referenced again whose `HEAD` shows another token, in batch requests of up to `cas_gc_bulk_delete_chunk_keys` keys |
 | `LIST blob-intents/` | 1 page per round whose destruction is not suppressed |
 | `HEAD gc/state` | 1 when the adopted state holds a `pending` or `standing` row and the intake did not suppress destruction; 1 more when the adopted seal is missing or the merge reports `CORRUPTED_DATA` |
@@ -976,7 +985,7 @@ disables the sweep and `cas_manifest_sweep_delete_budget_keys = 0` lists without
 |---|---:|---|
 | `cas_gc_round_intent_create_budget` | 0 | deletion-intent creates per round, summed over every `GC` shard; a blob over the cap stays a `candidate` (phase 10) |
 | `cas_intent_sweep_list_budget_keys` | 999 | keys of `blob-intents/` listed per round to find intents with no row; at least `1` (phase 9) |
-| `cas_gc_round_redelete_budget` | 0 | body deletes processed per round (phase 12) |
+| `cas_gc_round_redelete_budget` | 0 | untouched `pending` rows whose body `HEAD` is sent per round, which bounds body deletes (phases 10 and 12) |
 | `cas_gc_round_outcome_entry_budget` | 0 | outcome-log entries per round (phase 12) |
 | `cas_gc_round_prefix_wholesale_budget` | 20000 | listed objects the retention prune may process per round, gone ones included (phase 13) |
 | `cas_gc_round_handoff_prefix_wholesale_budget` | 0 | listed objects the hand-off reclaim may process per round, reserved separately (phase 14) |
@@ -1090,7 +1099,7 @@ No writes.
 |---|---|---:|
 | `<pool_prefix>/gc/state` | `HEAD` | one, before the phase, when the adopted state holds a `pending` or `standing` row and the intake did not suppress destruction; one more when the merge reports `CORRUPTED_DATA` |
 | referenced parent run segments | streaming `GET` | one per referenced run |
-| `<pool_prefix>/blobs/...` | `HEAD` | one per blob that reached zero, plus one per touched row at zero, per `pending` row whose body delete may run, per adopted orphan, and per `pending` or `standing` row of a blob referenced again (none under `suppress_destructive`) |
+| `<pool_prefix>/blobs/...` | `HEAD` | one per blob that reached zero, plus one per touched row at zero, per `pending` row whose body delete may run, per adopted orphan, and per `pending` or `standing` row of a blob referenced again. Under `suppress_destructive` only the `HEAD`s of blobs that reached zero and of touched rows at zero are sent |
 | `<pool_prefix>/blob-intents/...` | `PUT` (`If-None-Match`) | one per intent created: a blob that reached zero, a `candidate` retried, a transition to a new token (≤ `cas_gc_round_intent_create_budget`); a `GET` follows when the key already exists |
 | new run segments | `PUT` | one per written run |
 | `<pool_prefix>/cas/manifests/` | `LIST` | one bounded page, only when orphan planning runs |

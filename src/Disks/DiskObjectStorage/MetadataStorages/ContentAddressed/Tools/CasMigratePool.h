@@ -12,8 +12,9 @@ class Pool;
 
 struct MigratePoolOptions
 {
-    /// The default is the default `request_window_ms`: a request a stopped member sent may land that late.
-    uint64_t grace_ms = 120'000;
+    /// Unset: the larger of 120 s and the disk's `cas_request_window_ms`, since a request a stopped member sent may land
+    /// that late.
+    std::optional<uint64_t> grace_ms;
     /// An intent only for a body a marker or a GC row condemns, not for every body. Ignored on a pool below
     /// generation 3, whose markers prove nothing.
     bool trust_clean_markers = false;

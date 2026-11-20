@@ -610,9 +610,11 @@ private:
     /// parent and delegates deterministic `Removing`-row settlement to `CatalogLifecycleReconciler`.
     /// It performs no physical LIST or delete.
     /// `completed_erases` is kept current while the drain runs, so it is valid after an exception.
-    CatalogLifecycleReconcileResult drainCompletedRemoving(const GcState & leased_state, uint64_t & completed_erases);
+    /// `leased_etag` tells a deposed leader from a missing parent seal.
+    CatalogLifecycleReconcileResult drainCompletedRemoving(
+        const GcState & leased_state, const std::optional<Etag> & leased_etag, uint64_t & completed_erases);
     /// Same drain for callers that do not need the erase count.
-    CatalogLifecycleReconcileResult drainCompletedRemoving(const GcState & leased_state);
+    CatalogLifecycleReconcileResult drainCompletedRemoving(const GcState & leased_state, const std::optional<Etag> & leased_etag);
 
     /// Run the independently paced physical namespace maintenance: pages from the persisted cursor while
     /// each one deleted dead-life objects, under a soft time budget. The caller supplies
@@ -968,9 +970,8 @@ private:
     /// independently-derived views of the page.
     void reportSweepRetention(const ManifestSweepResult & result);
 
-    /// Spec INV-3: the round's universe -- every namespace life the destructive gate may one
-    /// day owe a frontier proof for -- is catalog-authoritative, ONE `cas/ref_catalog` `GET` replacing
-    /// the pool-wide `LIST(cas/ns/stream/)` this used to run. `Creating` entries are excluded: no publication
+    /// The round's universe -- every namespace life the destructive gate may one day owe a frontier proof
+    /// for -- is catalog-authoritative: ONE `cas/ref_catalog` `GET`, not a `LIST(cas/ns/stream/)`. `Creating` entries are excluded: no publication
     /// can exist yet, so there is nothing here for a discovery path to walk; `Live` and
     /// `Removing` entries are both returned, each minted via `NamespaceLifeId::fromCatalogEntry` directly
     /// from the row that is its own authority for both fields -- never from a listed key, which could
@@ -1089,8 +1090,10 @@ private:
     /// it may fold one round sooner than a long-lived leader would, never later). Reset to 0 whenever
     /// a round folds; incremented on every DEFER. Bounds batching via `gc_fold_max_defer_rounds`.
     uint64_t rounds_since_last_fold_ = 0;
-    /// Where the next round's intent creates resume; kept in memory, so a new leader starts from the first key.
-    std::optional<GcRoundWorkBudget::CreatePosition> creates_resume_after_;
+    /// Where the next round's intent creates and redeletes resume; kept in memory, so a new leader starts from the
+    /// first key.
+    std::optional<GcRoundWorkBudget::RunPosition> creates_resume_after_;
+    std::optional<GcRoundWorkBudget::RunPosition> redeletes_resume_after_;
 
     /// THIS LEADER'S OWN AUTHORITY VERDICT, and the reason it is a cached bool rather than a probe.
     ///

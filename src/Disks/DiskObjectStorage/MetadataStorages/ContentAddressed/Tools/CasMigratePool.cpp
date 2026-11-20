@@ -36,6 +36,7 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
     extern const int CORRUPTED_DATA;
     extern const int INVALID_STATE;
+    extern const int NOT_IMPLEMENTED;
 }
 }
 
@@ -52,6 +53,8 @@ constexpr size_t kMaxRunsAfterGcStateConflict = 3;
 /// The recovery of a lost `gc/state` by a build below generation 4, as an operator types it.
 constexpr std::string_view kGcRebuildCommandLine
     = "clickhouse-disks --config-file READ_ONLY_CONFIG_FILE --disk DISK_NAME --query 'cas-gc-rebuild'";
+
+constexpr uint64_t kDefaultGraceMs = 120'000;
 
 /// Ten seconds on the tool's clock: a long step reports before it looks hung, and seldom enough to stay readable.
 constexpr uint64_t kProgressEveryMs = 10'000;
@@ -143,6 +146,7 @@ public:
         , layout(pool.layout())
         , op(pool.openRequests().admit())
         , concurrency(std::max<size_t>(1, options.concurrency ? options.concurrency : pool.poolConfig().gc_io_concurrency))
+        , grace_ms(options.grace_ms.value_or(std::max(kDefaultGraceMs, pool.poolConfig().cas_request_budget.request_window_ms)))
     {
     }
 
@@ -187,7 +191,7 @@ public:
                        : String("M1: --trust-clean-markers: only a body a marker or a GC row condemns gets an intent"));
 
         if (options.dry_run)
-            return dryRun(all_bodies);
+            return dryRun(all_bodies, meta);
 
         runProbe();
         say(fmt::format("M1: pool at reader generation {}, token dialect {}", meta.min_reader_generation,
@@ -201,7 +205,7 @@ public:
 
             const std::optional<Object> stored_state = op.read(layout.gcStateKey(), Retry::standard());
             const std::optional<GcState> state = stored_state ? std::optional<GcState>(decodeGcState(stored_state->bytes)) : std::nullopt;
-            const std::vector<InheritedRow> rows = readCondemnedRows(state);
+            const std::vector<InheritedRow> rows = readCondemnedRows(state, meta);
             stepDone(3);
 
             const MarkerScan markers = readMarkers();
@@ -320,6 +324,7 @@ private:
     const Layout & layout;
     CasOperation op;
     const size_t concurrency;
+    const uint64_t grace_ms;
     MigratePoolReport report;
 
     void say(const String & line)
@@ -345,7 +350,7 @@ private:
         return decodePoolMeta(stored->bytes);
     }
 
-    /// The gates and the battery a writable `Pool::open` runs before it writes.
+    /// The gates and the battery a writable `Pool::open` runs before it writes, then what the servers need after M8.
     void runProbe()
     {
         Backend & backend = pool.openRequests().backendForCapabilityPredicates();
@@ -353,33 +358,48 @@ private:
         {
             backend.checkSkipAccessCheckSupport();
             backend.checkConditionalWriteSingleAttemptSupport();
-            return;
         }
-        backend.checkPoolPreconditions();
-        backend.checkConditionalWriteSingleAttemptSupport();
-        const UInt128 probe_uid = (static_cast<UInt128>(thread_local_rng()) << 64) | thread_local_rng();
-        runCapabilityProbe(op, layout.poolPrefix() + "/_probe/" + u128ToHex(probe_uid));
-        /// Before the first point of no return: after M8 the servers need these rights, and the pool cannot go back.
+        else
+        {
+            backend.checkPoolPreconditions();
+            backend.checkConditionalWriteSingleAttemptSupport();
+            const UInt128 probe_uid = (static_cast<UInt128>(thread_local_rng()) << 64) | thread_local_rng();
+            runCapabilityProbe(op, layout.poolPrefix() + "/_probe/" + u128ToHex(probe_uid));
+            report.probes_run = 1;
+        }
+        /// Not skipped with `skip_access_check`: the pool cannot go back after M8, and its servers then need both.
+        requireCanonicalTokens();
         runIntentPrefixProbe(op, layout, IntentPrefixRights::ReadWrite);
-        report.probes_run = 1;
     }
 
-    MigratePoolReport dryRun(bool all_bodies)
+    /// The token form the capability battery checks, read from `_pool_meta`: blob identities exist only in the
+    /// canonical spelling, so a store whose tokens have none cannot run the protocol of generation 4.
+    void requireCanonicalTokens()
     {
-        /// A dry run writes nothing durable, so it checks only the read side of the rights the real run proves.
-        if (!pool.poolConfig().skip_access_check)
-        {
-            runIntentPrefixProbe(op, layout, IntentPrefixRights::Read);
-            say(fmt::format("dry run: GET and LIST on {} are allowed; not checked: the conditional create, replace and delete "
-                "rights and the token form, which the run checks at M1 before it writes", layout.blobIntentsPrefix()));
-        }
+        const std::optional<Meta> meta = op.head(layout.poolMetaKey(), Retry::standard());
+        if (!meta)
+            throw Exception(ErrorCodes::INVALID_STATE, "CAS pool meta: _pool_meta is absent, there is no pool to migrate");
+        if (!meta->etag.canonical())
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                "M1: the store returns a token that cannot serve as a blob identity: {}; the pool cannot be migrated to this "
+                "store", meta->etag.render());
+    }
+
+    MigratePoolReport dryRun(bool all_bodies, const PoolMeta & meta)
+    {
+        /// A dry run writes nothing, so it checks only the read side of the rights the real run proves.
+        requireCanonicalTokens();
+        runIntentPrefixProbe(op, layout, IntentPrefixRights::Read);
+        say(fmt::format("dry run: the token form is canonical, and GET and LIST on {} are allowed; not checked: the "
+            "conditional create, replace and delete rights, which the run checks at M1 before it writes",
+            layout.blobIntentsPrefix()));
         const std::vector<NonTerminalMountSlot> held = probeNonTerminalMountSlots(op, layout);
         report.slots_read = listSlotKeys().size();
         for (const NonTerminalMountSlot & slot : held)
             say(fmt::format("M2 (dry run): server root '{}' {}", slot.server_root_id, slot.detail));
         const std::optional<Object> stored_state = op.read(layout.gcStateKey(), Retry::standard());
         const std::vector<InheritedRow> rows
-            = readCondemnedRows(stored_state ? std::optional<GcState>(decodeGcState(stored_state->bytes)) : std::nullopt);
+            = readCondemnedRows(stored_state ? std::optional<GcState>(decodeGcState(stored_state->bytes)) : std::nullopt, meta);
         const MarkerScan markers = readMarkers();
         std::set<BlobRef> targets = markers.not_clean;
         for (const InheritedRow & row : rows)
@@ -543,11 +563,11 @@ private:
             }
         }
 
-        say(fmt::format("M2: waiting {} ms in which no mount slot and no GC lease may move", options.grace_ms));
-        op.pause(options.grace_ms);
+        say(fmt::format("M2: waiting {} ms in which no mount slot and no GC lease may move", grace_ms));
+        op.pause(grace_ms);
         checkUnchanged(tokens, pairs, Window::BeforeFloor);
         say(fmt::format("M2: {} mount slot(s), {} fenced; no slot and no GC lease moved in {} ms", slot_keys.size(), fenced,
-            options.grace_ms));
+            grace_ms));
         return {tokens, pairs};
     }
 
@@ -617,9 +637,14 @@ private:
             "M3: {}, and a gc/state written now would name none of the runs and holds GC left. {}", what, recovery);
     }
 
-    /// M3: every condemned row of the runs the adopted fold seal names.
-    std::vector<InheritedRow> readCondemnedRows(const std::optional<GcState> & state)
+    /// M3: every condemned row of the runs the adopted fold seal names. The state and the seal pass the checks GC of
+    /// this build applies when it adopts them, because after the floor is raised no older build can repair them.
+    std::vector<InheritedRow> readCondemnedRows(const std::optional<GcState> & state, const PoolMeta & meta)
     {
+        if (state && state->gc_shards != meta.gc_shards)
+            throw Exception(ErrorCodes::INVALID_STATE,
+                "M3: gc/state names {} GC shard(s), but _pool_meta names {}; GC of this build refuses such a state. The run "
+                "stopped before any intent and before the floor", state->gc_shards, meta.gc_shards);
         if (!state || state->snap_generation == 0)
             requireNoGcHistory(state);
         std::vector<InheritedRow> rows;
@@ -629,7 +654,17 @@ private:
             const std::optional<Object> seal_bytes = op.read(seal_key, Retry::standard());
             if (!seal_bytes)
                 throw Exception(ErrorCodes::INVALID_STATE, "gc/state names the fold seal `{}`, which is absent", seal_key);
-            const CasFoldSeal seal = decodeFoldSeal(seal_bytes->bytes, state->snap_generation);
+            CasFoldSeal seal;
+            try
+            {
+                seal = decodeFoldSeal(seal_bytes->bytes, layout, meta.gc_shards, state->snap_generation);
+            }
+            catch (Exception & e)
+            {
+                e.addMessage("M3: GC of this build refuses the fold seal `{}` that gc/state adopts. The run stopped before any "
+                    "intent and before the floor", seal_key);
+                throw;
+            }
             for (const RunRef & run : seal.blob_target_runs)
             {
                 SourceEdgeRunView view = openSourceEdgeRun(op, run.key);

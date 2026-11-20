@@ -141,7 +141,8 @@ that persists across rounds is more interesting than an isolated one.
 
 A round that deletes nothing although rows are `pending` or `standing` may be suppressed because its parent
 check failed: the `fold_reduce` row of the round has `parent_unconfirmed = 1` in `phase_metrics`, the server log has
-a WARNING with that name, and `CASGCClampSuppressedPasses` counts the pass. The check does not fail the round, but when `gc/state` moved or is absent the round's commit is refused with `ABORTED`.
+a WARNING with that name, and `CASGCClampSuppressedPasses` counts the pass. The check does not fail the round, but
+when `gc/state` moved or is absent the round's commit is refused with `ABORTED`.
 
 A backlog that rounds carry without deleting shows in `delete_pending_rows` of the `fold_reduce` row: the number of
 `pending` and `standing` rows on file after the round. A value that stays the same over many rounds, with the

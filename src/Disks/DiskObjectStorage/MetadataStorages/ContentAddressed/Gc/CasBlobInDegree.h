@@ -338,21 +338,38 @@ struct GcRoundWorkBudget
     uint64_t redeletes_used = 0;
     /// (shard, blob) of the last create sent. A round that spent the create budget resumes after it, so a key
     /// whose create never confirms cannot take the budget ahead of the keys behind it in every round.
-    using CreatePosition = std::pair<uint64_t, BlobRef>;
-    std::optional<CreatePosition> creates_resume_after;
-    std::optional<CreatePosition> last_create_sent;
+    using RunPosition = std::pair<uint64_t, BlobRef>;
+    std::optional<RunPosition> creates_resume_after;
+    std::optional<RunPosition> last_create_sent;
+    /// (shard, blob) of the last row that took a redelete slot, kept the same way, so a `pending` row carried after
+    /// its `HEAD` cannot take the slot ahead of the rows behind it in every round.
+    std::optional<RunPosition> redeletes_resume_after;
+    std::optional<RunPosition> last_redelete_slot;
 
     bool intentCreateAvailable() const { return max_intent_creates == 0 || intent_creates_used < max_intent_creates; }
     bool intentCreateAdmits(uint64_t shard, const BlobRef & ref) const
     {
-        return intentCreateAvailable() && (!creates_resume_after || *creates_resume_after < CreatePosition{shard, ref});
+        return intentCreateAvailable() && (!creates_resume_after || *creates_resume_after < RunPosition{shard, ref});
     }
     /// Where the next round resumes: after the last create when the budget ran out, else from the start.
-    std::optional<CreatePosition> nextCreatesResumeAfter() const
+    std::optional<RunPosition> nextCreatesResumeAfter() const
     {
         return intentCreateAvailable() ? std::nullopt : last_create_sent;
     }
     bool redeleteAvailable() const { return max_redeletes == 0 || redeletes_used < max_redeletes; }
+    bool redeleteAdmits(uint64_t shard, const BlobRef & ref) const
+    {
+        return redeleteAvailable() && (!redeletes_resume_after || *redeletes_resume_after < RunPosition{shard, ref});
+    }
+    void takeRedeleteSlot(uint64_t shard, const BlobRef & ref)
+    {
+        ++redeletes_used;
+        last_redelete_slot = RunPosition{shard, ref};
+    }
+    std::optional<RunPosition> nextRedeletesResumeAfter() const
+    {
+        return redeleteAvailable() ? std::nullopt : last_redelete_slot;
+    }
 
     /// Orphan-manifest planner (`planManifestCursorPage` / `activeManifestKeys`): how many DISTINCT
     /// namespaces the sweep may build a fresh protection view for in total this round (cumulative

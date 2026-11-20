@@ -341,8 +341,9 @@ struct LegacyMarkerRemoval
 /// The one removal of legacy markers, for `cas-migrate-pool` and `cas-fsck --fix legacy-markers`. Of `keys` it deletes
 /// only those `Layout::parseLegacyMarkerKey` accepts, each by a `HEAD` and a delete conditional on the token that `HEAD`
 /// saw, at most `concurrency` at a time; a marker replaced in between is left and counted. No server of generation 4
-/// reads a marker, so servers may run meanwhile. A refused or unanswered delete, or an expired `deadline`, throws with
-/// the count deleted so far; a rerun continues. `on_progress` gets the running count after each batch.
+/// reads a marker, so servers may run meanwhile. A refused or unanswered delete, or a `deadline` that expired before a
+/// `HEAD` or a delete, throws with the count deleted so far; a rerun continues. `on_progress` gets the running count
+/// after each batch and before a throw.
 LegacyMarkerRemoval removeLegacyMarkers(Pool & pool, const std::vector<String> & keys, size_t concurrency = 1,
                                         const std::optional<std::chrono::steady_clock::time_point> & deadline = {},
                                         const std::function<void(uint64_t)> & on_progress = {});

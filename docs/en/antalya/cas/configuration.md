@@ -257,7 +257,7 @@ counters are unaffected, except for a shard whose log an earlier attempt of the 
 | `cas_gc_bulk_delete_chunk_keys` | `1000` | `1`–`1000` | Most keys per batch delete request in GC's write-once families (owner-removed manifest bodies, covered ref logs and snapshots, the namespace janitor's dead ref logs and snapshots), capped by the storage's batch-delete limit |
 | `cas_gc_round_intent_create_budget` | `0` | `0` = unbounded | Deletion-intent creates per round, summed over every GC shard and counted when a create is sent. The creates of a round run concurrently, at most `cas_gc_io_concurrency` at a time. A blob over the cap stays a `candidate` and its intent is created in a later round. Under a cap, the next round resumes after the last key that was sent, so a key whose create cannot be confirmed does not starve the keys behind it: with `B` as the cap and `N` candidates, every candidate gets a create within `ceil(N / B) + 1` rounds that commit. The resume position is kept in memory: a new GC leader starts from the first key |
 | `cas_intent_sweep_list_budget_keys` | `999` | at least `1` | Keys of `blob-intents/` one GC round lists to find intents that have no GC row. `999` fits one `LIST` response; `1000` costs two. `0` is refused at startup |
-| `cas_gc_round_redelete_budget` | `0` | `0` = unbounded | Body-delete cohort cap for rows whose intent was confirmed in an earlier round, per round |
+| `cas_gc_round_redelete_budget` | `0` | `0` = unbounded | Untouched `pending` rows whose body `HEAD` one GC round sends, summed over every GC shard; this bounds the round's body deletes. A row keeps its slot when it is carried after the `HEAD`. Under a cap, the next round resumes after the last row that took a slot, so a row carried in every round does not starve the rows behind it. The resume position is kept in memory: a new GC leader starts from the first row |
 | `cas_gc_round_sweep_namespace_budget` | `20` | `0` = unbounded | Distinct namespaces per orphan-manifest sweep page whose protection view may be built |
 | `cas_gc_round_sweep_recovery_op_budget` | `5000` | `0` = unbounded | Committed-tail ref-log `GET`/decode operations the orphan-manifest recovery walk may spend per round |
 | `cas_gc_round_ref_cleanup_budget` | `0` | `0` = unbounded | Ref-object cleanup cap for covered log and snapshot deletes per round |
@@ -265,7 +265,7 @@ counters are unaffected, except for a shard whose log an earlier attempt of the 
 | `cas_gc_round_handoff_prefix_wholesale_budget` | `0` | `0` = unbounded | Post-`CAS` hand-off generation-prefix reclaim cap per round, reserved separately so pruning cannot starve the one-shot hand-off. At the cap the rest of the prefix is never revisited; only `cas-fsck` reclaims it. Leave it at `0` |
 | `cas_gc_round_outcome_entry_budget` | `0` | `0` = unbounded | `GcOutcomes` entry cap across the re-delete/spared audit log per round. At `0` the audit log of one shard is still limited: rows are dropped once a conservative estimate of its size reaches 128 MiB per round, so the written log is smaller (about 52 MiB with 34-character S3 ETags and a 128-bit hash). Deletes are unaffected |
 
-### Protocol version and ignored settings {#protocol-version}
+### Protocol version and retired settings {#protocol-version}
 
 A pool at generation 4 uses the [deletion-intent protocol](/antalya/cas/architecture/blob-protocol).
 There are no mixed versions on one pool: a server of this build refuses a pool below generation 4 at every
@@ -273,13 +273,13 @@ open, and a server of an older build refuses a pool at generation 4. An older po
 by `clickhouse-disks cas-migrate-pool` with every server of the pool stopped; see
 [migrating a pool to generation 4](/antalya/cas/operations/migration).
 
-Two settings have no effect. They stay declared so existing configurations still load, and the server logs one
-warning per disk at start when either is set to a value other than its default:
+Two settings are retired. They stay declared so existing configurations still load, and the server logs a warning
+per disk at start when either is set to a value other than its default:
 
-| Setting | Replaced by |
+| Setting | Effect |
 |---|---|
-| `cas_gc_meta_pool_size` | nothing: `GC` writes no per-blob metadata objects |
-| `cas_gc_round_graduation_budget` | `cas_gc_round_intent_create_budget` bounds the creates of deletion intents |
+| `cas_gc_meta_pool_size` | None: `GC` writes no per-blob metadata objects |
+| `cas_gc_round_graduation_budget` | Its value applies to `cas_gc_round_intent_create_budget` when that is not set; when both are set, `cas_gc_round_intent_create_budget` wins. The warning names `cas_gc_round_intent_create_budget` |
 
 Every open of a pool logs one line with the pool's reader generation and token dialect:
 ``CAS pool `<prefix>`: reader generation 4, token dialect etag``. The dialect is `etag`, `generation` or `emulated`. A

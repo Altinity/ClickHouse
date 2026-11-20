@@ -828,6 +828,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     round_work_budget.max_intent_creates = store->poolConfig().gc_round_intent_create_budget;
     round_work_budget.creates_resume_after = creates_resume_after_;
     round_work_budget.max_redeletes = store->poolConfig().gc_round_redelete_budget;
+    round_work_budget.redeletes_resume_after = redeletes_resume_after_;
     round_work_budget.max_sweep_namespaces = store->poolConfig().gc_round_sweep_namespace_budget;
     round_work_budget.max_sweep_recovery_ops = store->poolConfig().gc_round_sweep_recovery_op_budget;
     round_work_budget.max_ref_cleanup_objects = store->poolConfig().gc_round_ref_cleanup_budget;
@@ -845,7 +846,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         uint64_t completed_erases = 0;
         /// Declared after `t`, so it runs before the timer emits its record, on a throw too.
         SCOPE_EXIT({ t.metric("deleted", completed_erases); });
-        const CatalogLifecycleReconcileResult drain_result = drainCompletedRemoving(state, completed_erases);
+        const CatalogLifecycleReconcileResult drain_result = drainCompletedRemoving(state, state_etag, completed_erases);
         if (drain_result.authority_status != AuthorityStatus::Authoritative
             || drain_result.catalog_resolution != CatalogResolution::DrainComplete)
             throwCasWriteRetryLater("CAS GC pre-fold drain lost authority before the catalog settled");
@@ -1393,6 +1394,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     state_etag = orThrow(std::move(commit), "CAS gc round commit");
     state = std::move(next);
     creates_resume_after_ = round_work_budget.nextCreatesResumeAfter();
+    redeletes_resume_after_ = round_work_budget.nextRedeletesResumeAfter();
     report.round = state.round;
     round_commit_timer->metric("round", report.round);
     round_commit_timer->metric("generation", generation);
@@ -2096,7 +2098,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
     const RefScanSummary & ref_scan = walk_plan.refScan();
     const std::vector<String> & ref_object_keys = ref_scan.keys;
 
-    /// The round's ONE catalog `GET` (spec INV-3). `live_incarnation` names, for every
+    /// The round's ONE catalog `GET`. `live_incarnation` names, for every
     /// namespace the catalog admits as `Live`/`Removing`, the ONE incarnation the fold may act on --
     /// `Creating` is excluded, matching `discoverUniverse` (no publication can exist yet). This is what
     /// makes the fold catalog-authoritative rather than LIST-authoritative: the pool-wide ref LIST
@@ -2186,11 +2188,15 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
     seal_read_timer.emplace(phase_sink, "fold_seal_read");
     const std::optional<CasFoldSeal> adopted_seal = readFoldSeal(state.snap_generation, state.snap_attempt);
     if (!adopted_seal && state.snap_generation > 0)
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
+    {
+        const String failure = fmt::format(
             "CAS GC: the adopted fold seal (generation {}, attempt {}) is missing under a live "
             "gc/state — GC bookkeeping is corrupt. GC refuses to run; recover with "
-            "SYSTEM CAS GC REBUILD.",
+            "`clickhouse-disks cas-gc-rebuild`",
             state.snap_generation, state.snap_attempt);
+        throwIfStateMoved(op, state_etag, failure);
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "{}", failure);
+    }
     /// Every fold decision below starts from the immutable plan, never from the raw scan that supplied
     /// it. The successor seal owns its mutable copy; this separate const snapshot remains the prior
     /// coverage/hold view while the successor earns changes later in this fold.
@@ -3898,6 +3904,9 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         /// A row past the budget is carried, or read inline if a reserved row is spared; it must not stop the scan.
         if (redeleteBudgetFull())
             return true;
+        /// A row the rotation skips this round is carried without its `HEAD`.
+        if (!work_budget.redeleteAdmits(blobShard(ref, state.gc_shards), ref))
+            return true;
         if (reads.pendingHeads() >= reads.window())
             return false;
         reads.hintHead(key);
@@ -4607,8 +4616,8 @@ void Gc::throwIfStateMoved(CasOperation & op, const std::optional<Etag> & state_
     if (current && sameStateVersion(current->etag, *state_etag))
         return;
     throw Exception(ErrorCodes::ABORTED,
-        "CAS gc round: gc/state moved during the round (another leader advanced it, observed {}); {}; retry next round",
-        current ? current->etag.render() : String("no object"), failure);
+        "CAS gc round: gc/state moved during the round ({}); {}; retry next round",
+        current ? "another leader advanced it, observed " + current->etag.render() : String("the object is gone"), failure);
 }
 
 namespace
@@ -4971,7 +4980,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// damaged-state rebuild has no adopted parent (`snap_generation == 0`) and the barrier performs
     /// zero catalog mutations. Only after that distinction is resolved do we complete the hot LIST and
     /// take the sole fresh work cut.
-    const CatalogLifecycleReconcileResult drain_result = drainCompletedRemoving(state);
+    const CatalogLifecycleReconcileResult drain_result = drainCompletedRemoving(state, state_etag);
     if (drain_result.authority_status != AuthorityStatus::Authoritative
         || drain_result.catalog_resolution != CatalogResolution::DrainComplete)
         throwCasWriteRetryLater("CAS GC rebuild lost authority before the catalog settled");
@@ -5539,9 +5548,8 @@ bool Gc::acquireOrRenewLease(GcState & state, std::optional<Etag> & state_etag, 
             /// loop's own very next tick treat THIS snapshot as one half of ITS two-observation window,
             /// without the real wall-time gap (>= H) the window's safety argument requires between the
             /// loop's own ticks (a manual command can land microseconds before a scheduled tick). Leaving
-            /// last_seen_* untouched here restores the pre-A7 invariant exactly: the frozen-tuple
-            /// comparison that can actually trigger a steal is only ever between two LOOP observations,
-            /// always >= interval apart.
+            /// last_seen_* untouched here keeps the frozen-tuple comparison that can trigger a steal
+            /// between two LOOP observations only, always >= interval apart.
             if (allow_steal)
             {
                 rememberObservation(current.lease);
@@ -5614,13 +5622,14 @@ void Gc::OutcomeTally::add(OutcomeKind kind)
     }
 }
 
-CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(const GcState & leased_state)
+CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(const GcState & leased_state, const std::optional<Etag> & leased_etag)
 {
     uint64_t completed_erases = 0;
-    return drainCompletedRemoving(leased_state, completed_erases);
+    return drainCompletedRemoving(leased_state, leased_etag, completed_erases);
 }
 
-CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(const GcState & leased_state, uint64_t & completed_erases)
+CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(
+    const GcState & leased_state, const std::optional<Etag> & leased_etag, uint64_t & completed_erases)
 {
     if (leased_state.snap_generation == 0)
         return {
@@ -5631,9 +5640,14 @@ CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(const GcState & lease
     const std::optional<CasFoldSeal> parent = readFoldSeal(
         leased_state.snap_generation, leased_state.snap_attempt);
     if (!parent)
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
+    {
+        const String failure = fmt::format(
             "CAS GC pre-fold drain: adopted parent seal (generation {}, attempt {}) is missing",
             leased_state.snap_generation, leased_state.snap_attempt);
+        CasOperation probe = store->openRequests().admit();
+        throwIfStateMoved(probe, leased_etag, failure);
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "{}", failure);
+    }
 
     /// The drain erases catalog rows, so its operation carries this leader's authority as its
     /// liveness: `CatalogLifecycleReconciler` and `deleteCompletedRemovingAtSnapshot` decide

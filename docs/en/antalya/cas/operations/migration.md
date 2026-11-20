@@ -264,11 +264,11 @@ every refusal exits non-zero.
 
 | Option | Effect |
 |---|---|
-| `--grace-seconds N` | How long no mount slot and no GC lease may move before the tool converts anything. Default 120, at most 604800. Set it to at least twice the `gc/hb` cadence of the older servers, `gc_interval_sec / 4` |
-| `--trust-clean-markers` | An intent only for a body a marker or a GC row condemns, not for every body. By default every body gets an intent, so the first reuse of each old body after the migration publishes it once more. Pass the option only for a pool known never to have run a 26.6.x GC and never to have had `gc/state` rebuilt: a `Clean` marker on another pool proves nothing. After a `cas-gc-rebuild`, run the tool without it. Ignored on a pool below generation 3 |
+| `--grace-seconds N` | How long no mount slot and no GC lease may move before the tool converts anything. Default 120, or the disk's `cas_request_window_ms` in the tool's configuration when that is longer; at most 604800. Set it to at least twice the `gc/hb` cadence of the older servers, `gc_interval_sec / 4`, and to at least their `cas_request_window_ms` |
+| `--trust-clean-markers` | An intent only for a body a marker or a GC row condemns, not for every body. By default every body gets an intent, so the first reuse of each old body after the migration publishes it once more. With the option, a body with a `Clean` marker gets no intent, and a writer of this build reuses it without an upload: a delete of that body that an older build sent and the store applies later leaves a committed ref with no body. Pass the option only for a pool known never to have run a 26.6.x GC and never to have had `gc/state` rebuilt: a `Clean` marker on another pool proves nothing. After a `cas-gc-rebuild`, run the tool without it. Ignored on a pool below generation 3 |
 | `--keep-markers` | Stop once the pool is migrated (after M8) and leave the legacy markers. A rerun, or `cas-fsck --fix legacy-markers`, removes them later |
 | `--concurrency N` | Requests in flight while markers are read (M4), intents are created (M5) and markers are removed (M9). Default: the disk's `cas_gc_io_concurrency` |
-| `--dry-run` | Writes and deletes nothing, on a pool at any generation. On a pool already at generation 4 it reads `_pool_meta` and lists the markers. Below generation 4 it also checks that `GET` and `LIST` are allowed under `blob-intents/`, and reads the mount slots, the reference catalog, `gc/state` with the runs of its fold seal, and the markers. It does not check the rights to create and delete or the store's token form: the run checks those at M1, before it writes anything |
+| `--dry-run` | Writes and deletes nothing, on a pool at any generation. On a pool already at generation 4 it reads `_pool_meta` and lists the markers. Below generation 4 it also checks the store's token form and that `GET` and `LIST` are allowed under `blob-intents/`, also with `skip_access_check`, and reads the mount slots, the reference catalog, `gc/state` with the runs of its fold seal, and the markers. It does not check the rights to create and delete, which need a write: the run checks those at M1, before it writes anything |
 
 Every step can be repeated: after a failure or a crash, run the tool again with the same options. A rerun on a pool
 that is already migrated runs M9 only.
@@ -285,7 +285,8 @@ object storage, which has no such grants), a conditional
 `PUT`, a `LIST` of `_probe/`, a `DELETE`, and a second exact `GET`. Each missing right stops the run with a message that
 names the right, and the probe object is removed again. Every reader skips the `_probe/` prefix, so debris from a
 stopped probe does no harm. A `--dry-run` sends only the first `GET` and the `LIST`s. A read-only open runs no
-probe.
+probe. The tool runs this probe, and checks the token form with a `HEAD` of `_pool_meta`, also when the disk sets
+`skip_access_check`: the servers need both once the pool is at generation 4.
 
 | Message | Missing right |
 |---|---|
@@ -298,9 +299,9 @@ probe.
 
 | Step | What happens |
 |---|---|
-| M1 | Reads `_pool_meta`, runs the capability probe, and proves the rights under `blob-intents/`. A pool already at generation 4 goes to M9 |
+| M1 | Reads `_pool_meta`, runs the capability probe (not with `skip_access_check`), checks the token form, and proves the rights under `blob-intents/`. A pool already at generation 4 goes to M9 |
 | M2 | Reads every mount slot and both GC leases. A slot that is not terminal is watched for the longer of its declared lease and the disk's `cas_mount_lease_ttl_ms`, plus 5 %, plus one poll step of 1 s, then fenced as GC fences a dead mount. Then the grace interval, then everything is read again |
-| M3, M4 | Reads the condemned rows of `gc/state` and every `.meta` marker. Without `gc/state`, M3 first lists one key of `gc/gen/` and sends a `HEAD` for `gc/hb` and `gc/maintenance_state`: any of them means GC ran and the state was lost, and the run stops. A `gc/state` at generation 0 names no fold seal: then M3 lists one key of `gc/gen/`, and any key stops the run. M4 lists `blobs/` a page at a time and reads the markers of a page concurrently |
+| M3, M4 | Reads the condemned rows of `gc/state` and every `.meta` marker. Without `gc/state`, M3 first lists one key of `gc/gen/` and sends a `HEAD` for `gc/hb` and `gc/maintenance_state`: any of them means GC ran and the state was lost, and the run stops. A `gc/state` at generation 0 names no fold seal: then M3 lists one key of `gc/gen/`, and any key stops the run. M3 also stops on a `gc/state` whose `gc_shards` differs from `_pool_meta` and on a fold seal that GC of this build refuses. M4 lists `blobs/` a page at a time and reads the markers of a page concurrently |
 | M5 | Creates an intent for the current token of every body (with `--trust-clean-markers`, of every body a marker or a row condemns), and for the own token of every pending row. The creates run concurrently. Each create must be confirmed; the first that is not stops the run before M6 |
 | M6 | Raises a pool below generation 3 to 3, then rewrites `gc/state` at generation 4 |
 | M7 | Reads every mount slot, both GC leases and `gc/state` again |
@@ -349,6 +350,8 @@ tool takes the grace interval, plus one mount lease for a slot that did not say 
 
 With `B` bodies, `K` markers, a request latency `L` and `--concurrency C`, the requests of the downtime take about
 `(K + 2 * B) * L / C`. For example, 1 000 000 bodies with as many markers at 20 ms and 16 in flight: about 63 minutes.
+The requests of one listed page finish before the next page starts, so a slow request holds back its page: read the
+figure as a lower bound.
 M5 prints its own estimate from the rate M4 measured, and every long step prints its progress.
 
 ### Counters, columns and phases after the migration {#migrate-generation-4-observability}
@@ -374,8 +377,9 @@ Dashboards and scripts that read these names need a look.
 | `read_ahead_blobs` in the `fold_reduce` phase metrics | New: blobs the fold holds to read the `HEAD`s of `pending` and `standing` rows ahead |
 
 A server logs a warning at start when `cas_gc_meta_pool_size` or `cas_gc_round_graduation_budget` is set to a value
-other than its default, and logs one line with the pool's reader generation and token dialect at every open of a pool
-(see [protocol version and ignored settings](/antalya/cas/configuration#protocol-version)).
+other than its default. The value of `cas_gc_round_graduation_budget` applies to `cas_gc_round_intent_create_budget`
+when that is not set. The server also logs one line with the pool's reader generation and token dialect at every open
+of a pool (see [protocol version and retired settings](/antalya/cas/configuration#protocol-version)).
 
 ### Refusals {#migrate-generation-4-refusals}
 
@@ -397,6 +401,8 @@ other than its default, and logs one line with the pool's reader generation and 
 | `gc/state changed under the migration ... times` | `gc/state` kept changing: a GC of an older build still runs | Stop it, run the tool again |
 | `M3: gc/state is absent, but GC has run on this pool: ...` | `gc/state` was lost while GC's runs, fold seals, heartbeat or janitor cursor remain. A state created now would name none of GC's runs and holds | See below |
 | `M3: gc/state names no fold seal and GC owner ... holds its lease, but ... exists: ...` | `gc/state` is at generation 0 and holds a GC lease while runs or fold seals remain under `gc/gen/`: an interrupted `cas-gc-rebuild`, or a GC round stopped before its commit | Restore a consistent backup; see below |
+| `M3: gc/state names <n> GC shard(s), but _pool_meta names <m>; ...` | `gc/state` and `_pool_meta` disagree on the GC shard count; GC of this build refuses such a state | No intent was created and the floor was not raised. Find out which configuration wrote `gc/state` before you go on |
+| `... M3: GC of this build refuses the fold seal ...` | The fold seal `gc/state` adopts fails the checks GC of this build applies, for example a missing shard summary | No intent was created and the floor was not raised. Keep the pool on the build that last ran GC on it until the seal is repaired |
 | `M3: gc/state names no fold seal, but ... exists: ...` | `gc/state` is at generation 0 while runs or fold seals remain under `gc/gen/`: an interrupted `cas-gc-rebuild`, or a GC round stopped before its commit. The state names none of them | See below |
 
 To recover from an `M3` refusal whose `gc/state` is absent or holds no lease, run the build that last ran GC on the pool:

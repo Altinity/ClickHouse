@@ -548,7 +548,7 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
         if (work_budget)
         {
             ++work_budget->intent_creates_used;
-            work_budget->last_create_sent = GcRoundWorkBudget::CreatePosition{shard, cur_blob};
+            work_budget->last_create_sent = GcRoundWorkBudget::RunPosition{shard, cur_blob};
         }
         row.delete_pending = false;
         row.standing = false;
@@ -633,16 +633,16 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
         input.fresh_transition = !row && input.at_zero && cur_touched;
         input.suppressed = suppress_destructive;
         input.create_budget_admits = create_intent && (!work_budget || work_budget->intentCreateAdmits(shard, cur_blob));
-        input.redelete_budget_admits = !work_budget || work_budget->redeleteAvailable();
+        input.redelete_budget_admits = !work_budget || work_budget->redeleteAdmits(shard, cur_blob);
 
+        /// A row carried after its `HEAD` keeps its slot, so the budget bounds the round's `HEAD`s of pending rows;
+        /// the rotation in `GcRoundWorkBudget` keeps such a row from holding the slot in every round.
         bool redelete_slot_taken = false;
-        /// A row carried after its `HEAD` deletes nothing, so it gives its slot back: a row carried every round must
-        /// not keep the rows behind it from their deletes.
-        const auto releaseRedeleteSlot = [&]
+        const auto takeRedeleteSlot = [&]
         {
             if (work_budget)
-                --work_budget->redeletes_used;
-            redelete_slot_taken = false;
+                work_budget->takeRedeleteSlot(shard, cur_blob);
+            redelete_slot_taken = true;
         };
         switch (decisionHeadNeed(input))
         {
@@ -698,9 +698,7 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
                     rmr.still_retired.push_back(*row);
                     return;
                 }
-                if (work_budget)
-                    ++work_budget->redeletes_used;
-                redelete_slot_taken = true;
+                takeRedeleteSlot();
                 /// After the slot is taken, so a look-ahead hint never takes it.
                 if (pending_hints)
                 {
@@ -710,7 +708,6 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
                 const BlobHead observed = pending_head(cur_blob);
                 if (observed.undecodable)
                 {
-                    releaseRedeleteSlot();
                     carryUndecodable(row);
                     return;
                 }
@@ -724,10 +721,8 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
 
         const IntentDecision decision = decideIntentStep(input);
         const bool spends_redelete_slot = decision.step == IntentStep::DeleteBody || decision.step == IntentStep::Standing;
-        if (spends_redelete_slot && !redelete_slot_taken && work_budget)
-            ++work_budget->redeletes_used;
-        if (!spends_redelete_slot && redelete_slot_taken)
-            releaseRedeleteSlot();
+        if (spends_redelete_slot && !redelete_slot_taken)
+            takeRedeleteSlot();
 
         switch (decision.step)
         {

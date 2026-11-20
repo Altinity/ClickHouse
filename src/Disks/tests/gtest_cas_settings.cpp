@@ -152,28 +152,43 @@ TEST(CASContentAddressedSettings, IntentCreateBudgetReachesThePool)
     EXPECT_EQ(pool->poolConfig().gc_round_intent_create_budget, 7u);
 }
 
-TEST(CASContentAddressedSettings, IgnoredGcSettingsStillLoadAndReachNothing)
+namespace
 {
-    const auto scratch = std::filesystem::temp_directory_path() / ("ca_ignored_settings_scratch_" + std::to_string(::getpid()));
-    auto cfg = makeConfig(
-        "<cas_server_root_id>srv1</cas_server_root_id>"
-        "<cas_gc_meta_pool_size>9</cas_gc_meta_pool_size>"
-        "<cas_gc_round_graduation_budget>11</cas_gc_round_graduation_budget>");
+
+/// The pool config a disk configured with `extra` opens with.
+Cas::PoolConfig poolConfigOf(const String & extra, const String & scratch_name)
+{
+    const auto scratch = std::filesystem::temp_directory_path() / (scratch_name + "_" + std::to_string(::getpid()));
+    auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id>" + extra);
     ContentAddressedSettings settings;
     settings.loadFromConfig(*cfg, "disk", scratch.string(), scratch.string(), identity_macros);
-    ASSERT_EQ(settings[ContentAddressedSetting::gc_meta_pool_size].value, 9u) << "the declared key loads";
-    ASSERT_EQ(settings[ContentAddressedSetting::gc_round_graduation_budget].value, 11u) << "the declared key loads";
-
     auto storage = std::make_shared<ContentAddressedMetadataStorage>(
         Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "", nullptr, settings);
     storage->startup();
     const auto pool = storage->poolForTest();
-    ASSERT_NE(pool, nullptr);
+    if (!pool)
+        throw std::runtime_error("the disk opened no pool");
+    return pool->poolConfig();
+}
+
+}
+
+TEST(CASContentAddressedSettings, RetiredGcSettingsStillLoad)
+{
     const Cas::PoolConfig defaults;
-    const Cas::PoolConfig & configured = pool->poolConfig();
+    const Cas::PoolConfig configured = poolConfigOf("<cas_gc_meta_pool_size>9</cas_gc_meta_pool_size>", "ca_retired_settings_scratch");
     EXPECT_EQ(configured.gc_round_intent_create_budget, defaults.gc_round_intent_create_budget);
     EXPECT_EQ(configured.gc_round_redelete_budget, defaults.gc_round_redelete_budget);
     EXPECT_EQ(configured.gc_io_concurrency, defaults.gc_io_concurrency);
+}
+
+TEST(CASContentAddressedSettings, RetiredCreateBudgetAppliesWhenTheNewOneIsNotSet)
+{
+    EXPECT_EQ(poolConfigOf("<cas_gc_round_graduation_budget>11</cas_gc_round_graduation_budget>", "ca_retired_budget_scratch")
+                  .gc_round_intent_create_budget, 11u);
+    EXPECT_EQ(poolConfigOf("<cas_gc_round_graduation_budget>11</cas_gc_round_graduation_budget>"
+                           "<cas_gc_round_intent_create_budget>5</cas_gc_round_intent_create_budget>", "ca_both_budgets_scratch")
+                  .gc_round_intent_create_budget, 5u) << "the new setting wins";
 }
 
 TEST(CASContentAddressedSettings, IntentSweepPageReachesThePool)
@@ -375,7 +390,7 @@ TEST(CASContentAddressedSettings, LegacySpellingStillLoadsDuringMigrationWindow)
     EXPECT_EQ(s[ContentAddressedSetting::gc_shards].value, 4u);
 }
 
-TEST(CASContentAddressedSettings, IgnoredGcSettingsWarnOnlyWhenSetToAnotherValue)
+TEST(CASContentAddressedSettings, RetiredGcSettingsWarnOnlyWhenSetToAnotherValue)
 {
     const auto warningOf = [](const String & extra)
     {
@@ -386,21 +401,24 @@ TEST(CASContentAddressedSettings, IgnoredGcSettingsWarnOnlyWhenSetToAnotherValue
         return capture.captured();
     };
 
-    const String both = warningOf("<cas_gc_meta_pool_size>9</cas_gc_meta_pool_size>"
-                                  "<cas_gc_round_graduation_budget>11</cas_gc_round_graduation_budget>");
-    EXPECT_EQ(countOccurrences(both, "ignored"), 1u) << both;
-    EXPECT_NE(both.find("cas_gc_meta_pool_size"), String::npos) << both;
-    EXPECT_NE(both.find("cas_gc_round_graduation_budget"), String::npos) << both;
-    EXPECT_NE(both.find("cas_gc_round_intent_create_budget"), String::npos) << both;
+    const String meta = warningOf("<cas_gc_meta_pool_size>9</cas_gc_meta_pool_size>");
+    EXPECT_NE(meta.find("`cas_gc_meta_pool_size` is ignored"), String::npos) << meta;
+    EXPECT_EQ(meta.find("cas_gc_round_graduation_budget"), String::npos) << meta;
 
-    const String one = warningOf("<cas_gc_round_graduation_budget>11</cas_gc_round_graduation_budget>");
-    EXPECT_EQ(one.find("cas_gc_meta_pool_size"), String::npos) << one;
-    EXPECT_NE(one.find("cas_gc_round_graduation_budget"), String::npos) << one;
+    const String carried = warningOf("<cas_gc_round_graduation_budget>11</cas_gc_round_graduation_budget>");
+    EXPECT_NE(carried.find("its value 11 applies to `cas_gc_round_intent_create_budget`"), String::npos) << carried;
+    EXPECT_EQ(carried.find("cas_gc_meta_pool_size"), String::npos) << carried;
 
-    EXPECT_EQ(warningOf("<cas_gc_meta_pool_size>16</cas_gc_meta_pool_size>"
-                        "<cas_gc_round_graduation_budget>0</cas_gc_round_graduation_budget>").find("ignored"), String::npos)
-        << "the default values warn";
-    EXPECT_EQ(warningOf("").find("ignored"), String::npos);
+    const String both = warningOf("<cas_gc_round_graduation_budget>11</cas_gc_round_graduation_budget>"
+                                  "<cas_gc_round_intent_create_budget>5</cas_gc_round_intent_create_budget>");
+    EXPECT_NE(both.find("`cas_gc_round_graduation_budget` is retired and ignored, because "
+                        "`cas_gc_round_intent_create_budget` is set"), String::npos) << both;
+
+    const String defaults = warningOf("<cas_gc_meta_pool_size>16</cas_gc_meta_pool_size>"
+                                      "<cas_gc_round_graduation_budget>0</cas_gc_round_graduation_budget>");
+    EXPECT_EQ(defaults.find("cas_gc_meta_pool_size"), String::npos) << "the default values warn: " << defaults;
+    EXPECT_EQ(defaults.find("cas_gc_round_graduation_budget"), String::npos) << "the default values warn: " << defaults;
+    EXPECT_EQ(warningOf("").find("cas_gc_"), String::npos);
 }
 
 TEST(CASContentAddressedSettings, PartialMigrationLoadsAndReportsEveryLegacyKey)

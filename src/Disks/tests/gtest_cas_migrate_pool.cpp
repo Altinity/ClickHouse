@@ -14,6 +14,7 @@
 #include <vector>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestBudget.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobIntentFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPoolMetaFormat.h>
@@ -39,6 +40,7 @@ namespace DB::ErrorCodes
 extern const int ABORTED;
 extern const int BAD_ARGUMENTS;
 extern const int CANNOT_SCHEDULE_TASK;
+extern const int CORRUPTED_DATA;
 extern const int INVALID_STATE;
 extern const int NOT_IMPLEMENTED;
 extern const int READONLY;
@@ -266,6 +268,8 @@ struct Fixture
     std::function<void(uint64_t)> on_sleep;
     String prefix;
     Layout layout;
+    bool skip_access_check = false;
+    std::optional<uint64_t> request_window_ms;
 
     void body(uint64_t b) { writeBlobBody(*backend, layout, numberedBlobHash(b)); }
     void cleanMarker(uint64_t b) { writeMetaClean(*backend, layout, numberedBlobHash(b), 1); }
@@ -362,6 +366,9 @@ struct Fixture
     PoolPtr open()
     {
         PoolConfig config{.pool_prefix = prefix, .server_root_id = "migration-tool"};
+        config.skip_access_check = skip_access_check;
+        if (request_window_ms)
+            setCasRequestWindow(config.cas_request_budget, *request_window_ms);
         config.boot_ms_fn = clock.nowFn();
         config.retry_sleep_fn = [this](uint64_t ms)
         {
@@ -475,6 +482,32 @@ std::vector<size_t> markerDeleteIndices(const std::vector<JournalEntry> & journa
     return out;
 }
 
+/// Every object of the pool with its bytes.
+std::map<String, String> objectsOf(Fixture & f)
+{
+    std::map<String, String> out;
+    OperationForTest op(*f.backend);
+    for (const String & key : f.keysUnder(f.prefix + "/"))
+        out[key] = (*op).read(key, Retry::standard())->bytes;
+    return out;
+}
+
+/// The keys the run wrote or deleted, without the scratch objects of the capability and intent probes.
+std::vector<String> mutationsOutsideTheProbes(const std::vector<JournalEntry> & journal, const Fixture & f)
+{
+    std::vector<String> out;
+    for (const JournalEntry & e : journal)
+    {
+        if (e.verb != JournalVerb::Write && e.verb != JournalVerb::Remove && e.verb != JournalVerb::RemoveMany
+            && e.verb != JournalVerb::Publish)
+            continue;
+        for (const String & key : e.keys)
+            if (!key.starts_with(f.prefix + "/_probe/") && !f.layout.isBlobIntentProbeKey(key))
+                out.push_back(key);
+    }
+    return out;
+}
+
 bool anyMutation(const std::vector<JournalEntry> & journal)
 {
     return std::any_of(journal.begin(), journal.end(), [](const JournalEntry & e)
@@ -579,7 +612,7 @@ TEST(CASMigratePool, FencesASilentSlotAfterTheThreshold)
     uint64_t slept = 0;
     for (const uint64_t ms : f.clock.sleeps)
         slept += ms;
-    EXPECT_GE(slept, threshold + MigratePoolOptions{}.grace_ms) << "fenced before the slot held for the threshold";
+    EXPECT_GE(slept, threshold + 120'000) << "fenced before the slot held for the threshold and the default grace";
 }
 
 TEST(CASMigratePool, RefusesAMovingGcLease)
@@ -1892,6 +1925,134 @@ TEST(CASMigratePool, RowsOfAShardAboveZeroAreMigrated)
     EXPECT_TRUE(f.hasIntent(2, *pending_absent.token.canonical())) << "pending row of shard 1 over an absent body";
     EXPECT_EQ(f.intents().size(), 2u);
     EXPECT_EQ(currentRetiredSet(*f.backend, f.layout, 1).size(), 2u) << "the rows are carried";
+}
+
+/// GC of this build refuses a fold seal that misses a shard's condemned summary. After the floor is raised no older
+/// build can repair it, so the run stops at M3 and leaves the pool as it was.
+TEST(CASMigratePool, SealMissingAShardSummaryIsRefusedBeforeAnyWrite)
+{
+    Fixture f(3, /*gc_shards*/ 2);
+    f.editGcState([](GcState & state) { state.gc_shards = 2; });
+    f.body(1);
+    f.rows({f.row(1, /*pending*/ true)}, G_REF_CHAIN, /*shard*/ 1);
+    injectCondemnedSummarySeal(*f.backend, f.layout, /*generation*/ 1, /*attempt*/ 1, /*gc_shards*/ 2,
+        {{1, CondemnedSummary{.condemned_total = 1, .pending_total = 1}}});
+    const auto before = objectsOf(f);
+    f.backend->clearJournal();
+
+    std::vector<String> lines;
+    const String message = messageOf(DB::ErrorCodes::CORRUPTED_DATA, [&] { f.run({}, &lines); });
+
+    EXPECT_NE(message.find("condemned summary has 1 rows, but exactly 2 shards are required"), String::npos) << message;
+    EXPECT_NE(message.find("M3: GC of this build refuses the fold seal"), String::npos) << message;
+    EXPECT_TRUE(contains(lines, "M2:")) << "positive control: the run reached M3";
+    EXPECT_EQ(mutationsOutsideTheProbes(f.backend->journal(), f), std::vector<String>{});
+    EXPECT_EQ(objectsOf(f), before);
+}
+
+/// A `gc/state` whose shard count disagrees with `_pool_meta` is refused by the GC lease, so the run stops at M3.
+TEST(CASMigratePool, GcStateWithAnotherShardCountIsRefusedBeforeAnyWrite)
+{
+    Fixture f(3, /*gc_shards*/ 2);
+    f.body(1);
+    f.rows({f.row(1, /*pending*/ true)});
+    ASSERT_EQ(f.gcState()->gc_shards, 1u);
+    const auto before = objectsOf(f);
+    f.backend->clearJournal();
+
+    std::vector<String> lines;
+    const String message = messageOf(DB::ErrorCodes::INVALID_STATE, [&] { f.run({}, &lines); });
+
+    EXPECT_NE(message.find("M3: gc/state names 1 GC shard(s), but _pool_meta names 2"), String::npos) << message;
+    EXPECT_TRUE(contains(lines, "M2:")) << "positive control: the run reached M3";
+    EXPECT_EQ(mutationsOutsideTheProbes(f.backend->journal(), f), std::vector<String>{});
+    EXPECT_EQ(objectsOf(f), before);
+}
+
+/// `skip_access_check` skips the capability battery, not the rights on `blob-intents/` or the token form: the
+/// servers need both once the floor is 4.
+TEST(CASMigratePool, SkipAccessCheckStillProbesTheIntentPrefixAndTheTokenForm)
+{
+    {
+        SCOPED_TRACE("no write right on blob-intents/");
+        Fixture f(3);
+        f.skip_access_check = true;
+        f.body(1);
+        f.condemnedMarker(1);
+        f.backend->refuseWritesUnder(f.layout.blobIntentsPrefix());
+        f.backend->clearJournal();
+
+        const String message = messageOf(DB::ErrorCodes::READONLY, [&] { f.run(); });
+        EXPECT_NE(message.find("grant PUT with If-None-Match on 'p/blob-intents/'"), String::npos) << message;
+        const auto journal = f.backend->journal();
+        EXPECT_TRUE(writeIndices(journal, f.prefix + "/_probe/").empty()) << "positive control: the battery was skipped";
+        EXPECT_EQ(mutationsOutsideTheProbes(journal, f), std::vector<String>{});
+    }
+    {
+        SCOPED_TRACE("a token with no canonical form");
+        Fixture f(3);
+        f.skip_access_check = true;
+        f.body(1);
+        f.condemnedMarker(1);
+        f.backend->weakHeadsFor(f.layout.poolMetaKey());
+        f.backend->clearJournal();
+
+        const String message = messageOf(DB::ErrorCodes::NOT_IMPLEMENTED, [&] { f.run(); });
+        EXPECT_NE(message.find("the store returns a token that cannot serve as a blob identity"), String::npos) << message;
+        EXPECT_EQ(mutationsOutsideTheProbes(f.backend->journal(), f), std::vector<String>{});
+    }
+}
+
+/// A dry run checks the token form and the read rights on `blob-intents/` whatever `skip_access_check` says, and writes
+/// nothing.
+TEST(CASMigratePool, DryRunChecksTheTokenFormAndReadRightsUnderSkipAccessCheck)
+{
+    MigratePoolOptions options;
+    options.dry_run = true;
+    {
+        Fixture f(3);
+        f.skip_access_check = true;
+        f.body(1);
+        f.backend->clearJournal();
+        f.run(options);
+        const auto journal = f.backend->journal();
+        EXPECT_FALSE(anyMutation(journal));
+        EXPECT_TRUE(std::any_of(journal.begin(), journal.end(), [&](const JournalEntry & e)
+        {
+            return !e.keys.empty() && e.keys.front().starts_with(f.layout.blobIntentsProbePrefix());
+        })) << "the dry run checks the read rights on blob-intents/";
+    }
+    {
+        Fixture f(3);
+        f.skip_access_check = true;
+        f.body(1);
+        f.backend->weakHeadsFor(f.layout.poolMetaKey());
+        f.backend->clearJournal();
+        const String message = messageOf(DB::ErrorCodes::NOT_IMPLEMENTED, [&] { f.run(options); });
+        EXPECT_NE(message.find("the store returns a token that cannot serve as a blob identity"), String::npos) << message;
+        EXPECT_FALSE(anyMutation(f.backend->journal()));
+    }
+}
+
+/// The default grace covers the disk's request window when that is longer than 120 s; an explicit grace is used as is.
+TEST(CASMigratePool, DefaultGraceCoversALongerRequestWindow)
+{
+    const auto graceLine = [](std::optional<uint64_t> window_ms, std::optional<uint64_t> grace_ms)
+    {
+        Fixture f(3);
+        f.request_window_ms = window_ms;
+        MigratePoolOptions options;
+        options.grace_ms = grace_ms;
+        std::vector<String> lines;
+        f.run(options, &lines);
+        for (const String & line : lines)
+            if (line.starts_with("M2: waiting "))
+                return line;
+        return String();
+    };
+    EXPECT_NE(graceLine(std::nullopt, std::nullopt).find("waiting 120000 ms"), String::npos);
+    EXPECT_NE(graceLine(300'000, std::nullopt).find("waiting 300000 ms"), String::npos);
+    EXPECT_NE(graceLine(300'000, 5'000).find("waiting 5000 ms"), String::npos);
 }
 
 TEST(CASMigratePool, UndecodableSlotIsRefused)

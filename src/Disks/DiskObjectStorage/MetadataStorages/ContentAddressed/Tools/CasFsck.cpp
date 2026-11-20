@@ -1230,10 +1230,8 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
     /// The NON-SENTINEL source edges the snapshot still holds on each unreferenced blob are collected in
     /// `detail` mode only: the stale-edge cross-check below needs the edge IDENTITIES so it can ask
     /// whether their source manifests still exist.
-    /// Read whenever a body is present: the `pending` rows over referenced bodies are checked too.
-    GcSnapshotView snapshot;
-    if (!present_blobs.empty())
-        snapshot = readGcSnapshot(op, layout, unref_hashes, detail, on_progress, deadline, report);
+    /// Read even with no body present: a `pending` row is classified whether its body is present or not.
+    const GcSnapshotView snapshot = readGcSnapshot(op, layout, unref_hashes, detail, on_progress, deadline, report);
     const bool have_gc_state = snapshot.have_state;
     const auto & retired_by_hash = snapshot.retired_by_hash;
     const auto & in_run_hashes = snapshot.in_run_hashes;
@@ -1304,6 +1302,8 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         bool referenced = false;   /// a ref names the body: kept out of the backlog counts
     };
     std::vector<PendingSuspect> suspects;
+    /// The `pending` rows the scan of present bodies classified.
+    std::unordered_set<BlobRef, BlobRefHash> pending_rows_checked;
 
     for (const auto & [bkey, sz] : present_blobs)
     {
@@ -1346,6 +1346,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             }
             else
             {
+                pending_rows_checked.insert(hash);
                 PendingVerdict verdict = checkPendingRow(op, layout, hash, row, report);
                 if (verdict.cls == FsckClass::PendingWithoutIntent)
                 {
@@ -1420,19 +1421,35 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         }
     }
 
-    /// The same check for a `pending` row whose body a ref names again: a reference committed after GC's cut does not
-    /// stop the delete.
+    /// The same check for every other `pending` row: one whose body a ref names again, since a reference committed after
+    /// GC's cut does not stop the delete, and one whose body was gone or replaced before the scan listed it.
     for (const auto & [ref, row] : snapshot.pending_rows)
     {
-        const String bkey = layout.blobKey(ref);
-        if (!reachable_blobs.contains(bkey))
+        if (pending_rows_checked.contains(ref))
             continue;
-        checkDeadline(deadline, "checking pending rows over referenced bodies");
-        if (checkPendingRow(op, layout, ref, row, report).cls == FsckClass::PendingWithoutIntent)
+        const String bkey = layout.blobKey(ref);
+        const bool referenced = reachable_blobs.contains(bkey);
+        checkDeadline(deadline, "checking pending rows");
+        PendingVerdict verdict = checkPendingRow(op, layout, ref, row, report);
+        const auto it = present_blobs.find(bkey);
+        const uint64_t size = it != present_blobs.end() ? it->second : 0;
+        if (verdict.cls == FsckClass::PendingWithoutIntent)
         {
-            const auto it = present_blobs.find(bkey);
-            suspects.push_back(PendingSuspect{bkey, it != present_blobs.end() ? it->second : 0, ref, row.token, /*referenced*/ true});
+            suspects.push_back(PendingSuspect{bkey, size, ref, row.token, referenced});
+            continue;
         }
+        /// A referenced body is not backlog: only a finding about it is reported.
+        if (referenced)
+            continue;
+        if (verdict.cls == FsckClass::PendingIntentAbsent)
+            ++report.pending_intent_absent;
+        else if (verdict.cls == FsckClass::PendingTokenRejected)
+            ++report.pending_token_rejected;
+        else
+            continue;
+        if (detail)
+            report.objects.push_back(FsckObject{.key = bkey, .kind = ObjectKind::Blob, .size = size, .cls = verdict.cls,
+                .reachable_from = {std::move(verdict.note)}});
     }
 
     if (!suspects.empty())
@@ -1621,9 +1638,12 @@ LegacyMarkerRemoval removeLegacyMarkers(Pool & pool, const std::vector<String> &
             {
                 const String & key = *markers[begin + i];
                 CasOperation job = pool.openRequests().resume(generation);
+                /// Per request, not per batch: one slow request must not let the rest of a batch run past the deadline.
+                checkDeadline(deadline, "removing legacy markers");
                 const std::optional<Meta> seen = job.head(key, Retry::standard());
                 if (!seen)
                     return;
+                checkDeadline(deadline, "removing legacy markers");
                 const Removal removal = job.remove(key, seen->etag, Retry::standard());
                 removed += removal == Removal::Removed;
                 changed += removal == Removal::Mismatch;
@@ -1634,6 +1654,8 @@ LegacyMarkerRemoval removeLegacyMarkers(Pool & pool, const std::vector<String> &
     }
     catch (Exception & e)
     {
+        if (on_progress)
+            on_progress(removed.load());
         e.addMessage(fmt::format("{} legacy marker(s) deleted before the stop; run again to continue", removed.load()));
         throw;
     }

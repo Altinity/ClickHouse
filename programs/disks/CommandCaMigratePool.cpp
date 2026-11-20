@@ -28,7 +28,8 @@ public:
                       "needs no downtime. Run it alone in a non-interactive query: clickhouse-disks --config-file <config> "
                       "--disk <disk> --query 'cas-migrate-pool'.";
         options_description.add_options()(
-            "grace-seconds", po::value<UInt64>(), "how long no mount slot and no GC lease may move before the conversion (default 120)")(
+            "grace-seconds", po::value<UInt64>(), "how long no mount slot and no GC lease may move before the conversion (default: "
+                                                  "120, or the disk's `cas_request_window_ms` when that is longer)")(
             "trust-clean-markers", "give an intent only to a body a marker or a GC row condemns, not to every body; only for a "
                                    "pool known never to have run a GC of 26.6 or a rebuild of gc/state; ignored below generation 3")(
             "keep-markers", "stop once the pool is migrated and leave the legacy markers; a rerun, or `cas-fsck --fix "
@@ -50,7 +51,8 @@ public:
                 "first");
 
         Cas::MigratePoolOptions migrate;
-        migrate.grace_ms = Cas::migrateGraceMs(getValueFromCommandLineOptionsWithDefault<UInt64>(options, "grace-seconds", 120));
+        if (options.contains("grace-seconds"))
+            migrate.grace_ms = Cas::migrateGraceMs(options["grace-seconds"].as<UInt64>());
         migrate.trust_clean_markers = options.contains("trust-clean-markers");
         migrate.keep_markers = options.contains("keep-markers");
         migrate.concurrency = getValueFromCommandLineOptionsWithDefault<UInt64>(options, "concurrency", 0);

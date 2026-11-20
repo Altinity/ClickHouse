@@ -67,7 +67,7 @@ constexpr std::string_view CAS_KEY_PREFIX = "cas_";
     DECLARE(UInt64, manifest_sweep_list_budget_keys, 1000, "Orphan-manifest sweep LIST budget per round", 0) \
     DECLARE(UInt64, intent_sweep_list_budget_keys, 999, "Keys of blob-intents/ one GC round lists to find deletion intents with no row (>= 1). 999 fits one LIST response; a page of 1000 costs two", 0) \
     DECLARE(UInt64, manifest_sweep_delete_budget_keys, 100, "Orphan-manifest sweep candidate budget per round: keys that pass every retain check, whose bodies are read and decided", 0) \
-    DECLARE(UInt64, gc_round_graduation_budget, 0, "Ignored; gc_round_intent_create_budget bounds the creates of deletion intents", 0) \
+    DECLARE(UInt64, gc_round_graduation_budget, 0, "Retired; when gc_round_intent_create_budget is not set, its value applies to that setting", 0) \
     DECLARE(UInt64, gc_round_intent_create_budget, 0, "Maximum deletion-intent creates per GC round, summed over every GC shard; a blob over the cap stays a candidate and is created in a later round (0 = unbounded)", 0) \
     DECLARE(UInt64, gc_round_redelete_budget, 0, "Blob redelete (exact-token delete of a prior delete_pending row) cohort cap per round (0 = unbounded)", 0) \
     DECLARE(UInt64, gc_round_sweep_namespace_budget, 20, "Orphan-manifest sweep: distinct namespaces per page whose protection view may be built (0 = unbounded)", 0) \
@@ -229,19 +229,28 @@ void ContentAddressedSettings::loadFromConfig(
             "for now; write them with the `cas_` prefix. Support for the unprefixed spelling will be "
             "removed.", config_prefix, fmt::join(legacy_names, ", "));
 
-    /// Declared only so that an existing configuration still loads; nothing reads them.
+    /// Retired settings, declared so that an existing configuration still loads.
     const ContentAddressedSettings defaults;
-    std::vector<String> ignored;
     if (candidate[ContentAddressedSetting::gc_meta_pool_size].value != defaults[ContentAddressedSetting::gc_meta_pool_size].value)
-        ignored.push_back("`cas_gc_meta_pool_size`");
-    if (candidate[ContentAddressedSetting::gc_round_graduation_budget].value
-        != defaults[ContentAddressedSetting::gc_round_graduation_budget].value)
-        ignored.push_back("`cas_gc_round_graduation_budget`");
-    if (!ignored.empty())
         LOG_WARNING(getLogger("ContentAddressedSettings"),
-            "content_addressed disk `{}`: {} {} ignored: GC writes no per-blob metadata objects, and "
-            "`cas_gc_round_intent_create_budget` bounds the deletion-intent creates of a round", config_prefix,
-            fmt::join(ignored, " and "), ignored.size() == 1 ? "is" : "are");
+            "content_addressed disk `{}`: `cas_gc_meta_pool_size` is ignored: GC writes no per-blob metadata objects",
+            config_prefix);
+    /// The retired cap carries over, so an upgrade does not lift an operator's bound on a round's intent creates.
+    const UInt64 retired_create_budget = candidate[ContentAddressedSetting::gc_round_graduation_budget].value;
+    if (retired_create_budget != defaults[ContentAddressedSetting::gc_round_graduation_budget].value)
+    {
+        if (candidate[ContentAddressedSetting::gc_round_intent_create_budget].changed)
+            LOG_WARNING(getLogger("ContentAddressedSettings"),
+                "content_addressed disk `{}`: `cas_gc_round_graduation_budget` is retired and ignored, because "
+                "`cas_gc_round_intent_create_budget` is set; remove the retired setting", config_prefix);
+        else
+        {
+            candidate[ContentAddressedSetting::gc_round_intent_create_budget] = retired_create_budget;
+            LOG_WARNING(getLogger("ContentAddressedSettings"),
+                "content_addressed disk `{}`: `cas_gc_round_graduation_budget` is retired; its value {} applies to "
+                "`cas_gc_round_intent_create_budget`; write that setting instead", config_prefix, retired_create_budget);
+        }
+    }
 
     impl.swap(candidate.impl);
 }

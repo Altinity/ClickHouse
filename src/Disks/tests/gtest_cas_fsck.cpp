@@ -1514,8 +1514,26 @@ public:
         return got;
     }
 
+    /// Runs `hook` once, just before the first `HEAD` of `key`.
+    void beforeHead(const String & key, std::function<void()> hook)
+    {
+        std::lock_guard lock(hook_mutex);
+        head_hooks[key] = std::move(hook);
+    }
+
     std::optional<RawMeta> head(const String & key, TransportAccess & access) override
     {
+        std::function<void()> hook;
+        {
+            std::lock_guard lock(hook_mutex);
+            if (const auto it = head_hooks.find(key); it != head_hooks.end())
+            {
+                hook = std::move(it->second);
+                head_hooks.erase(it);
+            }
+        }
+        if (hook)
+            hook();
         auto meta = CountingBackend::head(key, access);
         if (refused_heads.contains(key))
             throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "injected refusal of the HEAD of {}", key);
@@ -1540,6 +1558,7 @@ public:
 private:
     std::mutex hook_mutex;
     std::map<String, std::pair<size_t, std::function<void()>>> read_hooks;
+    std::map<String, std::function<void()>> head_hooks;
 };
 
 /// A pool whose bodies, intents and legacy markers the tests plant one by one, with no GC round.
@@ -2006,6 +2025,49 @@ TEST(CASFsck, FixLoopHonoursTheDeadline)
     EXPECT_EQ(deleted, 2u) << "the callback reports the running count";
 }
 
+/// The deadline is checked before every request, not once per batch: a deadline that passes during one marker's `HEAD`
+/// stops the fix before that marker's delete, and the count of markers already deleted is reported.
+TEST(CASFsck, FixLoopChecksTheDeadlineBeforeEachRequest)
+{
+    for (const size_t slow : {size_t{0}, size_t{1}})
+    {
+        SCOPED_TRACE(slow);
+        FsckIntentFixture f;
+        f.marker(1);
+        f.marker(2);
+        const std::vector<String> keys{f.markerKey(1), f.markerKey(2)};
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        /// The deadline is a point on the real steady clock, so the slow `HEAD` waits for that clock to pass it.
+        f.backend->beforeHead(keys[slow], [deadline]
+        {
+            while (std::chrono::steady_clock::now() <= deadline)
+            {
+            }
+        });
+        f.backend->clearJournal();
+        uint64_t reported = 99;
+
+        try
+        {
+            (void)removeLegacyMarkers(*f.store, keys, 1, deadline, [&](uint64_t n) { reported = n; });
+            ADD_FAILURE() << "the deadline passed during a HEAD and must stop the fix";
+        }
+        catch (const DB::Exception & e)
+        {
+            EXPECT_EQ(e.code(), DB::ErrorCodes::TIMEOUT_EXCEEDED) << e.message();
+            EXPECT_NE(e.message().find(fmt::format("{} legacy marker(s) deleted before", slow)), String::npos) << e.message();
+        }
+        const auto journal = f.backend->journal();
+        EXPECT_EQ(countKeyRequests(journal, JournalVerb::Head, keys[slow]), 1u) << "positive control: the slow HEAD was sent";
+        EXPECT_EQ(countKeyRequests(journal, JournalVerb::Remove, keys[slow]), 0u) << "deleted after the deadline";
+        EXPECT_EQ(countKeyRequests(journal, JournalVerb::Head, keys[1]) + countKeyRequests(journal, JournalVerb::Head, keys[0]),
+                  slow + 1) << "a request was sent after the deadline";
+        EXPECT_EQ(reported, slow) << "the partial count reaches the caller";
+        EXPECT_EQ(objectPresent(*f.backend, keys[0]), slow == 0);
+        EXPECT_TRUE(objectPresent(*f.backend, keys[1]));
+    }
+}
+
 /// Both long loops report progress every thousand keys, so a slow scan is visibly working.
 TEST(CASFsck, IntentAndMarkerLoopsReportProgress)
 {
@@ -2252,6 +2314,34 @@ TEST(CASFsck, PendingRowWithItsIntentIsExpectedAndCostsOneIntentRead)
     EXPECT_EQ(countKeyRequests(f.backend->journal(), JournalVerb::Read, f.intentKey(1)), 1u);
     EXPECT_EQ(countKeyRequests(f.backend->journal(), JournalVerb::Read, f.store->layout().gcStateKey()), 1u)
         << "no re-read of gc/state without a suspect";
+}
+
+/// A `pending` row whose intent is absent and whose body was gone or replaced before the scan started is classified
+/// from the row: the body listing never shows it.
+TEST(CASFsck, PendingRowWithoutIntentOverABodyGoneBeforeTheScanIsInformational)
+{
+    for (const bool replaced : {false, true})
+    {
+        SCOPED_TRACE(replaced ? "replaced" : "gone");
+        FsckGcFixture f;
+        f.drop();
+        f.round();
+        const String intent = f.intentKey(1);
+        f.removeIntent(1);
+        f.removeBody(1);
+        if (replaced)
+            writeBlobBody(*f.backend, f.store->layout(), numberedBlobHash(1));
+        f.backend->clearJournal();
+
+        const FsckReport rep = runFsck(*f.store, /*detail=*/true);
+
+        EXPECT_EQ(rep.pending_intent_absent, 1u) << formatFsckSummary(rep);
+        EXPECT_EQ(rep.pending_without_intent, 0u);
+        EXPECT_TRUE(rep.clean()) << formatFsckSummary(rep);
+        EXPECT_EQ(countRows(rep, FsckClass::PendingIntentAbsent, f.bodyKey(1)), 1u);
+        EXPECT_EQ(countKeyRequests(f.backend->journal(), JournalVerb::Read, intent), 1u)
+            << "positive control: the row's intent was read";
+    }
 }
 
 /// The hard case: a `pending` row, its intent gone, the body present with the row's token. GC would delete
