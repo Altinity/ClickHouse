@@ -331,7 +331,7 @@ TEST(CASBlobIntentGeneration, GcStateBelowHeader4FailsTheRoundWithNoRequest)
     writeGcStateAtHeader(*backend, G_REF_CHAIN);
     Gc gc(pool, hexToU128("000000000000000000000000000000bb"));
     backend->clearJournal();
-    expectThrowsCodeWithMessage(DB::ErrorCodes::INVALID_STATE, "cas_gc_state is at generation 3 in a generation 4 pool",
+    expectThrowsCodeWithMessage(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, "gc/state is at generation 3 in a generation 4 pool",
         [&] { static_cast<void>(DB::Cas::tests::runRegularRoundReclaiming(gc)); });
     const auto journal = backend->journal();
     ASSERT_TRUE(std::any_of(journal.begin(), journal.end(), [](const JournalEntry & e)
@@ -350,9 +350,9 @@ TEST(CASBlobIntentGeneration, RebuildAndDryRunRefuseAGcStateBelowHeader4)
     Gc gc(pool, hexToU128("000000000000000000000000000000bb"));
     backend->resetCounts();
     for (const bool force : {false, true})
-        expectThrowsCodeWithMessage(DB::ErrorCodes::INVALID_STATE, "cas_gc_state is at generation 3 in a generation 4 pool",
+        expectThrowsCodeWithMessage(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, "gc/state is at generation 3 in a generation 4 pool",
             [&] { static_cast<void>(gc.rebuildBaseline(force)); });
-    expectThrowsCodeWithMessage(DB::ErrorCodes::INVALID_STATE, "cas_gc_state is at generation 3 in a generation 4 pool",
+    expectThrowsCodeWithMessage(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, "gc/state is at generation 3 in a generation 4 pool",
         [&] { static_cast<void>(gc.previewDeletes()); });
     EXPECT_EQ(backend->deleteTotal(), 0u);
 }

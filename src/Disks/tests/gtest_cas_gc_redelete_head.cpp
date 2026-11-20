@@ -277,7 +277,7 @@ uint64_t committedRound(Backend & backend, const Pool & store)
 std::set<String> pendingKeys(Gc & gc)
 {
     std::set<String> out;
-    for (const Gc::PreviewEntry & entry : gc.previewDeletes())
+    for (const Gc::PreviewEntry & entry : gc.previewDeletes().deletes)
         if (entry.reason == "pending")
             out.insert(entry.key);
     return out;

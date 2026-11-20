@@ -13,6 +13,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
+    extern const int CORRUPTED_DATA;
 }
 
 class CommandCaGcDryRun final : public ICommand
@@ -37,9 +38,17 @@ public:
         Cas::Gc gc(ca->store(), UInt128(1));
         const auto preview = gc.previewDeletes();
 
-        std::cout << "preview_deletes=" << preview.size() << "\n";
-        for (const auto & p : preview)
+        std::cout << "preview_deletes=" << preview.deletes.size() << "\n";
+        for (const auto & p : preview.deletes)
             std::cout << p.reason << "\t" << p.key << "\t" << p.size << "\n";
+        if (preview.refused_shards.empty())
+            return;
+        std::cout << "refused_shards=" << preview.refused_shards.size() << "\n";
+        for (const String & refusal : preview.refused_shards)
+            std::cout << "refused\t" << refusal << "\n";
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "cas-gc-dryrun: a GC round refuses the runs of {} GC shard(s) as corrupt; their rows are not previewed",
+            preview.refused_shards.size());
     }
 };
 

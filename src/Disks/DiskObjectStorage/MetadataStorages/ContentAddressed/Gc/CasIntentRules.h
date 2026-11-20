@@ -17,7 +17,7 @@ enum class HeadSeen : uint8_t
     Same,          /// the row's own incarnation, in any spelling
     Absent,        /// an answered 404
     Other,         /// an incarnation that canonicalises and is not the row's
-    Uncanonical,   /// a well-formed token that names no incarnation: it never shows that `t` is gone
+    TokenRejected, /// a well-formed token that names no incarnation: it never shows that `t` is gone
 };
 
 /// Built only by `classifyDecisionHead`, so every `seen` other than `Absent` carries the token the

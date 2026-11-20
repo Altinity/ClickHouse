@@ -98,29 +98,35 @@ struct PersistedEtag
     String value;
 
     static PersistedEtag capture(const Etag & live);
+    /// A token whose `canonical` is `identity`, in wire spelling: a quoted tag except for `generation`. Nothing when
+    /// `tag_hex` names no opaque tag.
+    static std::optional<PersistedEtag> fromIdentity(const CanonicalIdentity & identity);
+    /// Equal text. Decisions compare with `sameIncarnation` or `sameVersion`.
     bool matches(const Etag & live) const;
     /// Nothing for an unknown dialect word or a value that is not an identity.
     std::optional<CanonicalIdentity> canonical() const;
 };
 
-/// True when both spellings canonicalise and are equal.
+/// The two policies that compare tokens.
+///
+/// Identity, for a blob body: true when both spellings canonicalise and are equal. A token with no canonical form
+/// names no incarnation and matches nothing.
 bool sameIncarnation(const PersistedEtag & row, const Etag & live);
 
-/// Whether `read`, from a read of an object, names the version a conditional write of it answered with as `written`:
-/// equal tokens, or equal canonical identities, because the two responses may quote one ETag differently. A token
-/// with no canonical form matches only exactly. Throws `LOGICAL_ERROR` for tokens of two keys or two backends: equal
-/// bytes under two keys share an S3 ETag.
+/// Version, for a control object or a manifest: whether `read`, from a read of an object, names the version a
+/// conditional write of it answered with as `written`: equal tokens, or equal canonical identities, because the two
+/// responses may quote one ETag differently. A token with no canonical form matches only exactly. Throws
+/// `LOGICAL_ERROR` for tokens of two keys or two backends: equal bytes under two keys share an S3 ETag.
 bool sameVersion(const Etag & read, const Etag & written);
+/// Version, for a token recorded from an earlier read of the object `live` was read from: equal text, or equal
+/// canonical identities.
+bool sameVersion(const PersistedEtag & recorded, const Etag & live);
 
 /// The same backend, key and transport text. For two tokens from responses of one kind, or a token and its own copy,
 /// which spell one version the same way.
 bool identicalToken(const Etag & a, const Etag & b);
 /// Both absent, or both present and identical.
 bool identicalToken(const std::optional<Etag> & a, const std::optional<Etag> & b);
-
-/// A token whose `canonical` is `identity`, in wire spelling: a quoted tag except for `generation`. Nothing when
-/// `tag_hex` names no opaque tag.
-std::optional<PersistedEtag> persistedTokenOf(const CanonicalIdentity & identity);
 
 inline PersistedEtag PersistedEtag::capture(const Etag & live)
 {

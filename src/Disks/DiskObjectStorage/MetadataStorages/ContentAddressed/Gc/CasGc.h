@@ -160,8 +160,7 @@ struct RoundReport
     size_t condemned = 0;         /// entries newly condemned into the retired list this round
     size_t intent_confirmed = 0;  /// rows committed `pending` this round: intent creates confirmed in this round
     size_t bodies_deleted = 0;    /// body deletes answered this round
-    /// Counts one failed `HEAD`, conditional `DELETE`, or refused re-delete enqueue
-    /// per affected `delete_pending` entry.
+    /// Counts one failed `HEAD`, conditional `DELETE`, or refused delete enqueue per affected `pending` row.
     size_t body_delete_failed = 0;
     size_t fence_outs = 0;        /// expired mounts fenced-out by the round's heartbeat floor
     std::vector<RoundAnomaly> anomalies;   /// fold clamps surfaced this round (never wedge the round)
@@ -485,9 +484,16 @@ public:
         BlobRef ref{};
         String key;
         uint64_t size = 0;
-        String reason;          /// "unreachable" | "delete_pending"
+        String reason;          /// "unreachable" | "standing" | "pending" | "candidate"
         PersistedEtag token;   /// stored condemn-time incarnation (empty for "unreachable")
         uint64_t condemn_round = 0;
+    };
+
+    struct DeletePreview
+    {
+        std::vector<PreviewEntry> deletes;
+        /// One message per GC shard whose runs a round would refuse as corrupt; that shard has no row in `deletes`.
+        std::vector<String> refused_shards;
     };
 
     /// WRITE-FREE preview of the next round's deletes, derived from the DURABLE sealed in-degree
@@ -495,7 +501,7 @@ public:
     /// It reads the durable generation WITHOUT folding new owner events, so at NON-QUIESCENCE it can
     /// OVER-REPORT a blob a since-landed publish re-referenced (the real round folds first and spares
     /// it). The {preview} ⊆ {genuinely-unreachable} guarantee holds ONLY at quiescence. No CAS/delete.
-    std::vector<PreviewEntry> previewDeletes();
+    DeletePreview previewDeletes();
 
     /// Raw baseline rebuild — the `gc/state` disaster-recovery command. Recomputes
     /// the in-degree snapshot from raw owner state (committed refs + live precommits + the unowned
@@ -571,9 +577,8 @@ public:
     /// ref logs. GC never invents a ref transition, because doing so could make the fold disagree with the
     /// writer's durable ownership history.
 
-    /// DELETE-SITE INVARIANT: the round's pre-CAS
-    /// redelete phase in `runRegularRound` holds the ONLY content (blob reachability) delete in
-    /// the whole core, restricted to previously-published delete_pending entries.
+    /// DELETE-SITE INVARIANT: the round's `pending_deletes` phase in `runRegularRound` holds the ONLY content (blob
+    /// reachability) delete in the whole core, restricted to rows the adopted state published `pending`.
     /// The recheck's manifest-body exact-token delete (after its decrements are sealed), the retired-set
     /// drop, the resume path (GC metadata), dropNamespace (verbatim files), and the capability probe
     /// (throwaway keys) remove non-content objects they own. Adding a second content-delete site is a

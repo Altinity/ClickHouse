@@ -225,14 +225,14 @@ SYSTEM CAS FSCK cas;
 Returns one row: `disk`, `reachable`, `dangling`, `unreachable`, `pending_gc`, `awaiting_gc`,
 `unaccounted`, `stale_edge`, `corrupted_runs`, `chain_broken`, `unchecked`, `lifeless_keys`,
 `namespace_janitor_pending` (+`_bytes`/`_lives`), `ref_records_walked`, `physical_bytes`,
-`referenced_logical_bytes`, `distinct_blobs`, `total_blob_refs`, and the deletion-intent columns `intent_listed`,
+`referenced_logical_bytes`, `distinct_blobs`, `total_blob_refs`, and the deletion-intent columns `intents_listed`,
 `intent_malformed`, `intent_unread`, `pending_without_intent`, `pending_intent_absent`, `pending_token_rejected`,
 `standing_present` and `legacy_marker` (see [reading the intent classes](#fsck-intent-classes)). `dangling` is the
 one column that means data loss — `unreachable`, `pending_gc`, and `awaiting_gc` are objects still
 moving through the normal intent, body-delete and intent-delete rounds, not a problem on their own.
 `chain_broken`, `corrupted_runs`, `lifeless_keys`, `intent_malformed`, `intent_unread` and `pending_without_intent` are the other hard findings. `chain_broken` is a ref-log stream
 whose chain ends below a log listed above that end, or whose snapshot base, records or links are corrupt
-while `_ckpt` is unchanged. `corrupted_runs` is a GC source-edge run that failed its checksum. `unchecked` means the scan could not prove or
+while `_ckpt` is unchanged. `corrupted_runs` is a GC source-edge run or fold seal that a `GC` round refuses as corrupt; under `--detail` its row names the key and the reason. `unchecked` means the scan could not prove or
 refute a finding, for example because the checkpoint changed during the scan; rerun `fsck` and treat only
 a repeat as a finding. This summary-only form has
 no per-object `--detail` equivalent yet — for that, the offline `cas-fsck --detail` below is still
@@ -241,7 +241,7 @@ needed.
 ### Reading the intent classes {#fsck-intent-classes}
 
 A scan of the whole pool lists `blob-intents/` and classifies each intent from its key alone: it counts the
-keys that parse (`intent_listed`) and flags the ones that do not (`intent_malformed`). It sends no request per
+keys that parse (`intents_listed`) and flags the ones that do not (`intent_malformed`). It sends no request per
 intent. It deletes no intent and no body, and it decides nothing from an absent body: a deletion intent outlives its
 body until a later `GC` round. A scan with `--namespace` lists no intents.
 
@@ -260,7 +260,7 @@ accept an intent with other bytes as a confirmation.
 
 | Class | State | Finding? | Action |
 |---|---|---|---|
-| `intent_listed` | A key under `blob-intents/` that parses | No | None. A count, not a verdict |
+| `intents_listed` | A key under `blob-intents/` that parses | No | None. A count, not a verdict |
 | `intent_current` | `--verify-intents` only. The body now at the blob's key is the incarnation the intent names | No | None. The intent of a `pending` row, or of a blob that is referenced again |
 | `intent_replaced` | `--verify-intents` only. The body now at the key is another incarnation | No | None. `GC` removes the intent in a later round |
 | `intent_body_gone` | `--verify-intents` only. No body at the key | No | None. This is the normal state of a deleted blob until `GC` removes the intent |
@@ -347,8 +347,8 @@ data directory of a server that is running on the local backend.
 
 | Command | Use it for |
 |---|---|
-| `cas-fsck [--detail] [--timeout N] [--namespace PREFIX] [--partial] [--fix legacy-markers] [--verify-intents]` | The same reachability scan as `SYSTEM CAS FSCK`, offline. `--verify-intents` also reads every deletion intent and sends a `HEAD` for its body (two requests per intent; see [reading the intent classes](#fsck-intent-classes)). `--detail` adds a per-object `<class>\t<key>\t<size>` listing (`reachable`, `dangling`, `unreachable`, `pending-gc`, `awaiting-gc`, `unaccounted`, `stale-edge`, `corrupted-run`, `chain-broken`, `unchecked`, `lifeless-key`, `janitor-pending`, `intent-current`, `intent-replaced`, `intent-body-gone`, `intent-malformed`, `intent-unread`, `pending-without-intent`, `pending-intent-absent`, `pending-token-rejected`, `standing-present`, `legacy-marker`) — the only way to get per-object, not just per-pool, findings. `--timeout`/`--partial` bound a scan on a large pool, the intent loop and the `--fix` loop included; progress goes to stderr every 1000 keys. `--fix legacy-markers` deletes the legacy markers and nothing else; it needs a scan of the whole pool, so it cannot be combined with `--namespace`, and it is refused on a local object storage, where `cas-migrate-pool` removes them |
-| `cas-gc-dryrun` | Previews the next round's deletes, read-only, no lease. Over-reports away from quiescence (does not fold new owner events) — a diagnostic only, never a delete source |
+| `cas-fsck [--detail] [--timeout N] [--namespace PREFIX] [--partial] [--fix legacy-markers] [--concurrency N] [--verify-intents]` | The same reachability scan as `SYSTEM CAS FSCK`, offline. `--verify-intents` also reads every deletion intent and sends a `HEAD` for its body (two requests per intent; see [reading the intent classes](#fsck-intent-classes)). `--detail` adds a per-object `<class>\t<key>\t<size>` listing (`reachable`, `dangling`, `unreachable`, `pending-gc`, `awaiting-gc`, `unaccounted`, `stale-edge`, `corrupted-run`, `chain-broken`, `unchecked`, `lifeless-key`, `janitor-pending`, `intent-current`, `intent-replaced`, `intent-body-gone`, `intent-malformed`, `intent-unread`, `pending-without-intent`, `pending-intent-absent`, `pending-token-rejected`, `standing-present`, `legacy-marker`) — the only way to get per-object, not just per-pool, findings. `--timeout`/`--partial` bound a scan on a large pool, the intent loop and the `--fix` loop included; progress goes to stderr every 1000 keys. `--fix legacy-markers` deletes the legacy markers and nothing else, `--concurrency` at a time (default 1); it needs a scan of the whole pool, so it cannot be combined with `--namespace`, and it is refused on a local object storage, where `cas-migrate-pool` removes them |
+| `cas-gc-dryrun` | Previews the next round's deletes, read-only, no lease. Over-reports away from quiescence (does not fold new owner events) — a diagnostic only, never a delete source. A GC shard whose runs a round refuses as corrupt adds no row: it is printed as `refused_shards=N` and one `refused` line each, and the command exits non-zero |
 | `cas-inspect '<raw-object-key>'` | Decodes one raw object-storage key (as printed by `cas-fsck`/`cas-gc-dryrun`) straight to JSON |
 | `cas-gc-rebuild [--force]` | Rebuilds a `gc/state` baseline from raw owner state. It runs when `gc/state` is absent or its lease was never held. A present `gc/state` whose lease was held is refused with `another GC leader holds the lease`; one that names a missing fold seal is refused before the lease is tried, with a message that says the pool must be recreated (see [GC refuses its bookkeeping](#gc-bookkeeping-corrupt)). `--force` bypasses only the healthy-state refusal, never a competing leader or a failed `CAS`. Before rebuilding a lost `gc/state`, stop or restart every server of the pool; a request sent before a server stopped can still reach the object store afterwards, and this rule does not cover it. |
 

@@ -14,7 +14,7 @@ DecisionHead classifyDecisionHead(const PersistedEtag & row_token, const std::op
     if (!observed)
         return {HeadSeen::Absent, observed};
     if (!observed->etag.canonical())
-        return {HeadSeen::Uncanonical, observed};
+        return {HeadSeen::TokenRejected, observed};
     return {sameIncarnation(row_token, observed->etag) ? HeadSeen::Same : HeadSeen::Other, observed};
 }
 
@@ -22,7 +22,7 @@ DecisionHead classifyDecisionHead(const std::optional<Meta> & observed)
 {
     if (!observed)
         return {HeadSeen::Absent, observed};
-    return {observed->etag.canonical() ? HeadSeen::Other : HeadSeen::Uncanonical, observed};
+    return {observed->etag.canonical() ? HeadSeen::Other : HeadSeen::TokenRejected, observed};
 }
 
 DecisionHeadNeed decisionHeadNeed(const IntentRuleInput & input)

@@ -61,11 +61,7 @@ public:
         const Cas::PoolPtr pool = ca->openPoolForMigration();
         const Cas::MigratePoolReport r = Cas::migratePool(*pool, migrate, [](std::string_view line) { std::cout << line << std::endl; });
 
-        std::cout << "floor_read=" << r.floor_read << " probes=" << r.probes_run << " slots=" << r.slots_read
-                  << " condemned_rows=" << r.condemned_rows << " markers=" << r.markers_read << " bodies=" << r.bodies_listed
-                  << " intents=" << r.intents_confirmed << " control_writes=" << r.control_objects_written
-                  << " slots_reread=" << r.slots_reread << " floor_raised=" << r.floor_raised
-                  << " markers_removed=" << r.markers_removed << " markers_changed=" << r.markers_changed << "\n";
+        std::cout << Cas::formatMigratePoolSummary(r) << "\n";
         if (r.completed)
             std::cout << "migration complete" << std::endl;
         else if (r.migrated)

@@ -92,6 +92,18 @@ TEST(CASTokenIdentity, SameIncarnationComparesCanonically)
     EXPECT_FALSE(sameIncarnation(PersistedEtag{"etag", "W/x"}, weak));
 }
 
+/// A recorded token names the version a later read sees when the text is equal, or when the two spellings are one
+/// identity; a token with no canonical form matches only its own text.
+TEST(CASTokenIdentity, SameVersionOfARecordedTokenComparesTextThenIdentity)
+{
+    EXPECT_TRUE(sameVersion(PersistedEtag{"etag", "\"abc\""}, liveEtag(Dialect::ETag, "abc")));
+    EXPECT_TRUE(sameVersion(PersistedEtag{"etag", "abc"}, liveEtag(Dialect::ETag, "abc")));
+    EXPECT_TRUE(sameVersion(PersistedEtag{"etag", "W/\"x\""}, liveEtag(Dialect::ETag, "W/\"x\"")));
+    EXPECT_FALSE(sameVersion(PersistedEtag{"etag", "W/\"x\""}, liveEtag(Dialect::ETag, "W/\"y\"")));
+    EXPECT_FALSE(sameVersion(PersistedEtag{"etag", "abd"}, liveEtag(Dialect::ETag, "abc")));
+    EXPECT_FALSE(sameVersion(PersistedEtag{"emulated", "abc"}, liveEtag(Dialect::ETag, "abc")));
+}
+
 TEST(CASTokenIdentity, OpaqueTagFromHexRoundTrips)
 {
     for (const Dialect dialect : {Dialect::ETag, Dialect::Emulated})
@@ -159,7 +171,7 @@ void expectKeyRoundTrip(const Layout & layout, const BlobRef & ref, Dialect dial
     ASSERT_TRUE(parsed) << key;
     EXPECT_EQ(parsed->identity, *identity) << key;
     EXPECT_EQ(parsed->ref, ref) << key;
-    const auto token = persistedTokenOf(parsed->identity);
+    const auto token = PersistedEtag::fromIdentity(parsed->identity);
     ASSERT_TRUE(token) << key;
     EXPECT_EQ(token->canonical(), identity) << dialectWord(dialect) << " token `" << raw << "` rebuilt as `" << token->value << "`";
 }

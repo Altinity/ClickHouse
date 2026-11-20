@@ -419,11 +419,11 @@ Recomputes the per-shard in-degree snapshot and computes the round's single dest
   reports `CORRUPTED_DATA` and a `HEAD` of `gc/state` then shows another version or no object: the round cannot
   commit, and a newer leader's retention removes the parent runs a deposed leader reads
 - **Observability:** phase row `fold_reduce`; metrics `shards_reduced` / `shards_pure_carry`,
-  `condemned`, `intent_confirmed` (rows committed `pending` this round), `spared`, `body_deletes_decided` (body
+  `condemned`, `intents_confirmed` (rows committed `pending` this round), `spared`, `body_deletes_decided` (body
   deletes decided), `adopted` (orphan intents given a row), `nominations_waiting` (nominated intents of a
   shard that stayed a pure carry), `read_ahead_blobs` (blobs held to read row `HEAD`s ahead),
   `suppress_destructive`, `frontier_complete`, `parent_unconfirmed`, `condemned_rows` (rows the round leaves on
-  file: `candidate`, `pending` and `standing`) and `delete_pending_rows` (`pending` and `standing` rows among them)
+  file: `candidate`, `pending` and `standing`) and `pending_rows` (`pending` and `standing` rows among them)
 
 `suppress_destructive` is true on any recorded anomaly, any hold in the seal about to be made
 durable, an incomplete frontier (`frontier_proven ≠ frontier_namespaces`, a universe neither
@@ -495,7 +495,7 @@ forensic outcome logs. Body deletes, and the phase 10 `HEAD`s that decide them, 
   pool (`LOGICAL_ERROR`). A store that refuses the intent deletes, for example a credential without `DELETE` on
   `blob-intents/`, fails every round that must delete an intent
 - **Observability:** phase row `pending_deletes`; metrics `deleted`, `absent`, `bodies_deleted`,
-  `intent_confirmed`, `replaced`, `spared`, `intent_deletes`, `jobs_scheduled`, `jobs_failed`,
+  `intents_confirmed`, `replaced`, `spared`, `intents_deleted`, `jobs_scheduled`, `jobs_failed`,
   `outcome_logs_written`, `outcome_rows_dropped`
 
 Under `suppress_destructive` no body delete and no intent delete is decided, so nothing is deleted;
@@ -1212,8 +1212,8 @@ folded yet, or `GC` never ran), `unaccounted` (absent from the whole `GC` view) 
 manifest debris. `pending_gc` and `awaiting_gc` are ordinary backlog; `unaccounted` that persists
 across rounds is an anomaly; and two further classes are hard findings rather than backlog:
 `stale_edge` (every remaining source edge on the blob names a missing manifest, so incremental
-`GC` can never reclaim it) and `corrupted_runs` (a source-edge run whose
-checksum disagrees with its seal).
+`GC` can never reclaim it) and `corrupted_runs` (a source-edge run or fold seal
+that a `GC` round refuses as corrupt).
 
 ## Operational surface {#operational-surface}
 
@@ -1222,7 +1222,7 @@ checksum disagrees with its seal).
 | `SYSTEM CAS GC RUN [<disk>]` | One synchronous round execution on the contacted node; only the lease holder (the GC leader, `is_leader = 1` in `system.cas_mounts`) makes progress, and on any other node the command does nothing. The disk is optional: without it every content-addressed disk on the node runs one round. It runs even while the scheduler is stopped |
 | `SYSTEM CAS GC STOP <disk>` / `SYSTEM CAS GC START <disk>` | Stop or resume future background rounds on that disk's scheduler, preserving its identity. The disk is required |
 | `SYSTEM CAS GC REBUILD [FORCE] <disk>` (`clickhouse-disks cas-gc-rebuild`) | Rebuilds the `GC` baseline from raw owner state. It runs when `gc/state` is absent or its lease was never held. A present `gc/state` whose lease was held is refused with `another GC leader holds the lease`; one that names a missing fold seal is refused before the lease is tried, with a message that says the pool must be recreated. No repair for such a pool is available in this build (see [GC refuses its bookkeeping](/antalya/cas/operations/debugging#gc-bookkeeping-corrupt)). It deliberately over-protects — it prefers bounded leaks over risking an under-count — and cannot delete live data directly: deletions it produces still flow through the normal round's intent, body-delete, exact-token path. It resets `intent_sweep_cursor`, so the intent sweep then re-adopts every intent of the pool. The disk is required |
-| `clickhouse-disks cas-gc-dryrun` | Opens the disk read-only, constructs a non-leader `GC`, and prints what would be deleted with a reason per entry. Write-free, resolves runs through the seal's references. Documented caveat: it does not fold new owner events, so away from quiescence it can **over-report** — the subset guarantee holds only at quiescence, and its output must never feed a real delete |
+| `clickhouse-disks cas-gc-dryrun` | Opens the disk read-only, constructs a non-leader `GC`, and prints what would be deleted with a reason per entry. Write-free, resolves runs through the seal's references, and leaves out a GC shard a round refuses as corrupt, naming it instead. Documented caveat: it does not fold new owner events, so away from quiescence it can **over-report** — the subset guarantee holds only at quiescence, and its output must never feed a real delete |
 
 `SYSTEM CAS DROP POOL MEMBER '<server_root_id>' FROM DISK '<disk>'` — removal of a dead
 replica, distinct from ordinary `GC` — is covered on the

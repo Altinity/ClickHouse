@@ -208,12 +208,14 @@ TEST(CASContentAddressedSettings, IntentSweepPageReachesThePool)
     EXPECT_EQ(pool->poolConfig().intent_sweep_list_budget_keys, 7u);
 }
 
-TEST(CASContentAddressedSettings, ZeroIntentSweepPageIsRefused)
+TEST(CASContentAddressedSettings, IntentSweepPageOutsideOneListResponseIsRefused)
 {
-    expectLoadFailureWithExactMessage(
-        "<cas_server_root_id>srv1</cas_server_root_id><cas_intent_sweep_list_budget_keys>0</cas_intent_sweep_list_budget_keys>",
-        ErrorCodes::BAD_ARGUMENTS,
-        "content_addressed disk: cas_intent_sweep_list_budget_keys must be >= 1 (got 0)");
+    for (const String value : {"0", "1000"})
+        expectLoadFailureWithExactMessage(
+            "<cas_server_root_id>srv1</cas_server_root_id><cas_intent_sweep_list_budget_keys>" + value
+                + "</cas_intent_sweep_list_budget_keys>",
+            ErrorCodes::BAD_ARGUMENTS,
+            "content_addressed disk: cas_intent_sweep_list_budget_keys must be between 1 and 999 (got " + value + ")");
 }
 
 TEST(CASContentAddressedSettings, PackedPartsDefaultOffAndOptIn)
@@ -390,7 +392,8 @@ TEST(CASContentAddressedSettings, LegacySpellingStillLoadsDuringMigrationWindow)
     EXPECT_EQ(s[ContentAddressedSetting::gc_shards].value, 4u);
 }
 
-TEST(CASContentAddressedSettings, RetiredGcSettingsWarnOnlyWhenSetToAnotherValue)
+/// A retired key in the configuration warns whatever its value, since the key itself is what the operator removes.
+TEST(CASContentAddressedSettings, RetiredGcSettingsWarnWhenSet)
 {
     const auto warningOf = [](const String & extra)
     {
@@ -416,8 +419,8 @@ TEST(CASContentAddressedSettings, RetiredGcSettingsWarnOnlyWhenSetToAnotherValue
 
     const String defaults = warningOf("<cas_gc_meta_pool_size>16</cas_gc_meta_pool_size>"
                                       "<cas_gc_round_graduation_budget>0</cas_gc_round_graduation_budget>");
-    EXPECT_EQ(defaults.find("cas_gc_meta_pool_size"), String::npos) << "the default values warn: " << defaults;
-    EXPECT_EQ(defaults.find("cas_gc_round_graduation_budget"), String::npos) << "the default values warn: " << defaults;
+    EXPECT_NE(defaults.find("`cas_gc_meta_pool_size` is ignored"), String::npos) << defaults;
+    EXPECT_NE(defaults.find("its value 0 applies to `cas_gc_round_intent_create_budget`"), String::npos) << defaults;
     EXPECT_EQ(warningOf("").find("cas_gc_"), String::npos);
 }
 

@@ -47,8 +47,8 @@ struct MigratePoolReport
     uint64_t control_objects_written = 0;   /// M6: the raise to floor 3 and the `gc/state` rewrite that landed
     uint64_t slots_reread = 0;              /// M7
     bool floor_raised = false;              /// M8 sent the write that raised the floor to 4
-    uint64_t markers_removed = 0;           /// M9
-    uint64_t markers_changed = 0;           /// M9: replaced between their `HEAD` and the delete, and left
+    uint64_t legacy_markers_deleted = 0;    /// M9
+    uint64_t legacy_markers_changed = 0;    /// M9: replaced between their `HEAD` and the delete, and left
     bool migrated = false;                  /// the floor is 4, raised by this run or an earlier one
     bool completed = false;                 /// migrated, and the marker removal ran to its end
 };
@@ -61,5 +61,9 @@ struct MigratePoolReport
 /// delete, at any floor. `progress` receives a line per step and one before each write that cannot be undone.
 MigratePoolReport migratePool(Pool & pool, const MigratePoolOptions & options,
                               const std::function<void(std::string_view)> & progress);
+
+/// The summary line of `cas-migrate-pool`: every count of `report` as `<field>=<value>`, in field order, without a
+/// trailing newline.
+String formatMigratePoolSummary(const MigratePoolReport & report);
 
 }

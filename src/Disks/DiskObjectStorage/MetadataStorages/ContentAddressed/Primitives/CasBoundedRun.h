@@ -19,27 +19,35 @@ namespace CurrentMetrics
 namespace DB::Cas
 {
 
-/// Runs `job(i)` for every `i` below `count`, at most `concurrency` at a time, on threads of its own; the calling thread
-/// only submits and joins. Once a job throws, the jobs not started yet are skipped. Every started job is joined before
-/// the first failure in index order is rethrown, so nothing a job references outlives the call.
+/// The threads one tool run fans its requests out over, `concurrency` at most. Created once per run, so a run of many
+/// batches starts its threads once.
+inline std::unique_ptr<ThreadPool> makeBoundedPool(size_t concurrency)
+{
+    const size_t threads = std::max<size_t>(concurrency, 1);
+    return std::make_unique<ThreadPool>(CurrentMetrics::LocalThread, CurrentMetrics::LocalThreadActive,
+        CurrentMetrics::LocalThreadScheduled, /*max_threads*/ threads, /*max_free_threads*/ threads, /*queue_size*/ 0,
+        /*shutdown_on_exception*/ false);
+}
+
+/// Runs `job(i)` for every `i` below `count` on `pool`, under `thread_name`, at most the pool's thread count at a time;
+/// the calling thread only submits and joins, and runs the jobs itself when the pool has one thread or `count` is 1.
+/// Once a job throws, the jobs not started yet are skipped. Every started job is joined before the first failure in
+/// index order is rethrown, so nothing a job references outlives the call.
 /// A job type with a member `beforeSubmit(i)` has it called on the calling thread before job `i` is submitted; a seam for
 /// tests, which no production job has.
 template <typename Job>
 concept HasBeforeSubmit = requires(const Job & job, size_t i) { job.beforeSubmit(i); };
 
 template <typename Job>
-void runBounded(size_t concurrency, size_t count, const Job & job)
+void runBounded(ThreadPool & pool, ThreadName thread_name, size_t count, const Job & job)
 {
-    if (concurrency <= 1 || count <= 1)
+    if (pool.getMaxThreads() <= 1 || count <= 1)
     {
         for (size_t i = 0; i < count; ++i)
             job(i);
         return;
     }
-    const size_t threads = std::min(concurrency, count);
-    ThreadPool pool(CurrentMetrics::LocalThread, CurrentMetrics::LocalThreadActive, CurrentMetrics::LocalThreadScheduled,
-        /*max_threads*/ threads, /*max_free_threads*/ threads, /*queue_size*/ 0, /*shutdown_on_exception*/ false);
-    ThreadPoolCallbackRunnerLocal<void> runner(pool, ThreadName::UNKNOWN);
+    ThreadPoolCallbackRunnerLocal<void> runner(pool, thread_name);
     /// Declared before the guard that joins the jobs, so it outlives them when a submission throws.
     std::atomic<bool> failed{false};
     std::vector<std::shared_ptr<ThreadPoolCallbackRunnerLocal<void>::Task>> handles;

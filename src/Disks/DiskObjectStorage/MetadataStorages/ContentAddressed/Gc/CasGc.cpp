@@ -84,6 +84,7 @@ namespace ErrorCodes
     extern const int CANNOT_SCHEDULE_TASK;
     extern const int CORRUPTED_DATA;
     extern const int INVALID_STATE;
+    extern const int UNKNOWN_FORMAT_VERSION;
     extern const int LOGICAL_ERROR;
     extern const int NETWORK_ERROR;
     extern const int NOT_IMPLEMENTED;
@@ -105,7 +106,7 @@ GcState decodeGenerationFourGcState(std::string_view bytes)
 {
     GcState state = decodeGcState(bytes);
     if (state.header_generation < G_BLOB_INTENTS)
-        throw Exception(ErrorCodes::INVALID_STATE, "cas_gc_state is at generation {} in a generation 4 pool",
+        throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION, "gc/state is at generation {} in a generation 4 pool",
             state.header_generation);
     return state;
 }
@@ -1138,7 +1139,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     {
         std::vector<WriteOnceKey> intent_deletes;
         CountWithExample unconfirmed_creates;
-        CountWithExample uncanonical_tokens;
+        CountWithExample rejected_tokens;
         CountWithExample standing_anomalies;
         CountWithExample undecodable_bodies;
         CountWithExample undecodable_spares;
@@ -1151,7 +1152,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         for (const RetiredMergeResult & merge : folded.retired_merge)
         {
             unconfirmed_creates.merge(merge.unconfirmed_creates);
-            uncanonical_tokens.merge(merge.uncanonical_tokens);
+            rejected_tokens.merge(merge.rejected_tokens);
             standing_anomalies.merge(merge.standing_anomalies);
             undecodable_bodies.merge(merge.undecodable_bodies);
             undecodable_spares.merge(merge.undecodable_spares);
@@ -1183,15 +1184,15 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                     e.detail = {{"key", key.str()}};
                 });
         }
-        pending_deletes_timer->metric("intent_deletes", suppress_destructive ? 0 : intent_deletes.size());
+        pending_deletes_timer->metric("intents_deleted", suppress_destructive ? 0 : intent_deletes.size());
         if (unconfirmed_creates.count)
-            LOG_ERROR(logger,
+            LOG_WARNING(logger,
                 "CAS gc: {} deletion-intent creates were not confirmed this round; those blobs stay candidates and "
                 "are retried in a later round. First: {}", unconfirmed_creates.count, unconfirmed_creates.example);
-        if (uncanonical_tokens.count)
+        if (rejected_tokens.count)
             LOG_ERROR(logger,
                 "CAS gc: {} blob observations or rows this round carry a token that names no incarnation; GC never "
-                "deletes such a body. First: `{}`", uncanonical_tokens.count, uncanonical_tokens.example);
+                "deletes such a body. First: `{}`", rejected_tokens.count, rejected_tokens.example);
         if (standing_anomalies.count)
             LOG_ERROR(logger,
                 "CAS gc: {} standing rows observed their own token again after their body delete; carried, nothing "
@@ -1266,7 +1267,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         report.spared += tally.spared;
     }
     pending_deletes_timer->metric("bodies_deleted", report.bodies_deleted - bodies_deleted_before);
-    pending_deletes_timer->metric("intent_confirmed", report.intent_confirmed - intent_confirmed_before);
+    pending_deletes_timer->metric("intents_confirmed", report.intent_confirmed - intent_confirmed_before);
     pending_deletes_timer->metric("deleted", report.deleted);
     pending_deletes_timer->metric("absent", report.absent);
     pending_deletes_timer->metric("replaced", report.replaced);
@@ -1544,12 +1545,12 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         ManifestSweepResult & sweep = folded.orphan_sweep;
         for (const ManifestSweepResult::Nomination & nomination : sweep.nominations)
         {
-            /// The nominated incarnation is persisted, so the body is observed and the two renderings
-            /// compared before the removal names a precondition.
+            /// The nominated token was recorded from an earlier read, so the body is observed and compared by version
+            /// before the removal names a precondition.
             const std::optional<Meta> observed = op.head(nomination.key, Retry::standard());
             Removal outcome = Removal::Gone;
             if (observed)
-                outcome = nomination.token.matches(observed->etag)
+                outcome = sameVersion(nomination.token, observed->etag)
                     ? op.remove(nomination.key, observed->etag, Retry::standard())
                     : Removal::Mismatch;
             EventEmitter{*store}.emit([&](CasEvent & e)
@@ -4033,7 +4034,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         reduce_timer->metric("deltas_in", deltas_in);
         reduce_timer->metric("runs_written", result.fold_seal.blob_target_runs.size());
         reduce_timer->metric("condemned", report.condemned - condemned_before);
-        reduce_timer->metric("intent_confirmed", intent_confirmed);
+        reduce_timer->metric("intents_confirmed", intent_confirmed);
         reduce_timer->metric("spared", spared);
         reduce_timer->metric("body_deletes_decided", body_deletes_decided);
         reduce_timer->metric("adopted", adopted);
@@ -4044,14 +4045,14 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         reduce_timer->metric("parent_unconfirmed", result.parent_unconfirmed ? 1 : 0);
         reduce_timer->metric("transactions_unapplied", transactions_unapplied_this_round);
         uint64_t condemned_rows = 0;
-        uint64_t delete_pending_rows = 0;
+        uint64_t pending_rows = 0;
         for (const auto & [shard, summary] : result.fold_seal.condemned_summary)
         {
             condemned_rows += summary.condemned_total;
-            delete_pending_rows += summary.pending_total;
+            pending_rows += summary.pending_total;
         }
         reduce_timer->metric("condemned_rows", condemned_rows);
-        reduce_timer->metric("delete_pending_rows", delete_pending_rows);
+        reduce_timer->metric("pending_rows", pending_rows);
     }
     reduce_timer.reset();   /// emits the `fold_reduce` row
 
@@ -4775,7 +4776,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
             }
         }
         if (decoded && decoded->header_generation < G_BLOB_INTENTS)
-            throw Exception(ErrorCodes::INVALID_STATE, "cas_gc_state is at generation {} in a generation 4 pool",
+            throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION, "gc/state is at generation {} in a generation 4 pool",
                 decoded->header_generation);
         if (decoded)
         {
@@ -5274,14 +5275,15 @@ RebuildReport Gc::rebuildBaseline(bool force)
     return rep;
 }
 
-std::vector<Gc::PreviewEntry> Gc::previewDeletes()
+Gc::DeletePreview Gc::previewDeletes()
 {
-    std::vector<PreviewEntry> out;
+    DeletePreview preview;
+    std::vector<PreviewEntry> & out = preview.deletes;
 
     CasOperation op = store->openRequests().admit();
     const auto state_bytes = op.read(store->layout().gcStateKey(), Retry::standard());
     if (!state_bytes)
-        return out;
+        return preview;
     const GcState state = decodeGenerationFourGcState(state_bytes->bytes);
 
     const Layout & layout = store->layout();
@@ -5291,60 +5293,39 @@ std::vector<Gc::PreviewEntry> Gc::previewDeletes()
     /// live under an older generation's key, and the seal ref is the only authority for the real key.
     /// Group the adopted `blob_target_runs` by the ref's explicit `shard`. Absent seal => no candidates.
     std::map<uint64_t, std::vector<RunRef>> runs_by_shard;
+    std::map<uint64_t, CondemnedSummary> summaries;
     if (const auto adopted = readFoldSeal(state.snap_generation, state.snap_attempt))
+    {
         for (const RunRef & r : adopted->blob_target_runs)
             runs_by_shard[r.shard].push_back(r);
+        summaries = adopted->condemned_summary;
+    }
 
-    /// Scan every blob-target shard (see `retire`): a preview that only looked at shard 0 would miss the
-    /// zero-in-degree candidates owned by shards 1..N under `gc_shards > 1`.
+    /// Every shard, read the way a round reads it: a shard the round would refuse adds no row and is named instead.
     for (uint64_t shard = 0; shard < state.gc_shards; ++shard)
     {
-        const auto it = runs_by_shard.find(shard);
-        static const std::vector<RunRef> kEmptyRuns;
-        const std::vector<RunRef> & shard_runs = it != runs_by_shard.end() ? it->second : kEmptyRuns;
-        for (const BlobCandidate & cand : zeroInDegree(op, shard_runs))
+        const AdoptedShardPreview rows = previewAdoptedShard(op, runs_by_shard[shard], shard,
+            AdoptedRunContext{.gc_shards = state.gc_shards, .parent_round = state.round, .summary = summaries[shard]});
+        if (rows.refusal)
         {
-            const std::optional<Meta> observed = op.head(layout.blobKey(cand.ref), Retry::standard());
+            preview.refused_shards.push_back(rows.refusal->message);
+            continue;
+        }
+        for (const BlobRef & ref : rows.zero)
+        {
+            const std::optional<Meta> observed = op.head(layout.blobKey(ref), Retry::standard());
             if (!observed)
                 continue;
-            PreviewEntry e;
-            e.kind = ObjectKind::Blob;
-            e.ref = cand.ref;
-            e.key = layout.blobKey(cand.ref);
-            e.size = observed->size;
-            e.reason = "unreachable";
-            out.push_back(std::move(e));
+            out.push_back(PreviewEntry{.kind = ObjectKind::Blob, .ref = ref, .key = layout.blobKey(ref), .size = observed->size,
+                                       .reason = "unreachable", .token = {}, .condemn_round = 0});
         }
-
-        /// Retired-in-snapshot: stream the SAME adopted seal runs and emit every `RunMarker::Condemned`
-        /// sentinel row. The stored incarnation IS the authority — no observation here (one would defeat
-        /// the point and cost I/O). A `pending` row's body and a `standing` row's intent are deleted at a later
-        /// zero cut; a `candidate` waits for its intent create. Preview
-        /// stays WRITE-FREE (`openSourceEdgeRun` is a pure reader). Output is a superset of the above.
-        for (const RunRef & run : shard_runs)
-        {
-            SourceEdgeRunView reader = openSourceEdgeRun(op, run.key);
-            SourceEdgeRecord rec;
-            while (reader.next(rec))
-            {
-                if (rec.marker != RunMarker::Condemned)
-                    continue;
-                PreviewEntry e;
-                e.kind = ObjectKind::Blob;
-                e.ref = rec.ref;
-                e.key = layout.blobKey(rec.ref);
-                e.size = rec.size;
-                e.token = rec.token;
-                e.condemn_round = rec.condemn_round;
-                e.reason = rec.standing ? "standing" : rec.delete_pending ? "pending" : "candidate";
-                out.push_back(std::move(e));
-            }
-            /// Whole-file seal-checksum: verify the drained run before its condemned
-            /// rows are trusted in the preview. Fail-closed on mismatch.
-            reader.verifyAgainst(run.checksum);
-        }
+        /// A condemned row carries the incarnation it condemned, so it needs no observation.
+        for (const SourceEdgeRecord & rec : rows.condemned)
+            out.push_back(PreviewEntry{.kind = ObjectKind::Blob, .ref = rec.ref, .key = layout.blobKey(rec.ref), .size = rec.size,
+                                       .reason = rec.standing ? "standing" : rec.delete_pending ? "pending" : "candidate",
+                                       .token = rec.token, .condemn_round = rec.condemn_round});
     }
-    return out;
+    return preview;
 }
 
 void Gc::rememberObservation(const GcLease & lease)

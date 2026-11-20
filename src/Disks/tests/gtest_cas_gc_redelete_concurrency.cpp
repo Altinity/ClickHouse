@@ -310,7 +310,7 @@ GcPhaseSink recordPendingDeletes(std::shared_ptr<PendingDeletesRows> rows, GcPha
 std::vector<Gc::PreviewEntry> previewPendingDeletes(Gc & gc)
 {
     std::vector<Gc::PreviewEntry> result;
-    for (Gc::PreviewEntry entry : gc.previewDeletes())
+    for (Gc::PreviewEntry entry : gc.previewDeletes().deletes)
         if (entry.reason == "pending")
             result.push_back(std::move(entry));
     return result;

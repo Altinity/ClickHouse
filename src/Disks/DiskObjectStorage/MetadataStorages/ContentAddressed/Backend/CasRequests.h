@@ -235,6 +235,9 @@ public:
     /// constant that predates this reservation -- reads it here instead of duplicating the backend call.
     uint64_t attemptReservationMs() const { return attempt_reservation_ms; }
 
+    /// The clock every policy on this plane is bound to.
+    uint64_t nowMs() const { return now_ms(); }
+
 private:
     friend class CasOperation;
     /// `CasOperation::owner` is a `CasRequests &`: `CasOperation`'s own friendship with `CasHotKeys`

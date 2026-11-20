@@ -43,6 +43,8 @@ public:
             "fix", po::value<String>(), "repair: `legacy-markers` deletes the `.meta` markers left from the marker protocol "
                                         "(whole-pool scans only; nothing else is ever deleted; not on a local object "
                                         "storage, where `cas-migrate-pool` removes them)")(
+            "concurrency", po::value<UInt64>(), "requests in flight while `--fix legacy-markers` removes markers (default 1, "
+                                                "which adds no load burst beside live servers)")(
             "verify-intents", "also read every deletion intent and `HEAD` its body (two requests per intent): finds intents "
                               "with other bytes than the record, and counts intents over a current, replaced or absent body; "
                               "without it intents are classified from the listing only");
@@ -55,6 +57,9 @@ public:
         const String namespace_prefix = options.contains("namespace") ? options["namespace"].as<String>() : "";
         const bool partial = options.contains("partial");
         const bool verify_intents = options.contains("verify-intents");
+        const UInt64 concurrency = getValueFromCommandLineOptionsWithDefault<UInt64>(options, "concurrency", 1);
+        if (concurrency == 0)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "cas-fsck: --concurrency must be at least 1");
         bool fix_legacy_markers = false;
         if (options.contains("fix"))
         {
@@ -89,11 +94,14 @@ public:
                 std::cerr << ", " << pages << " pages";
             std::cerr << "\n";
         };
-        std::optional<std::chrono::steady_clock::time_point> deadline;
+        const Cas::PoolPtr store = ca->store();
+        Cas::ToolDeadline deadline;
         if (timeout_sec > 0)
-            deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_sec);
+            deadline = Cas::ToolDeadline(store->openRequests(), std::chrono::seconds(timeout_sec), "fsck",
+                                         "run against a QUIESCED pool or raise --timeout");
 
-        const Cas::FsckReport report = Cas::runFsck(*ca->store(), detail, on_progress, deadline, partial, namespace_prefix, fix_legacy_markers, verify_intents);
+        const Cas::FsckReport report = Cas::runFsck(*store, detail, on_progress, deadline, partial, namespace_prefix, fix_legacy_markers, verify_intents,
+                                                     concurrency);
 
         /// Built by `Cas::formatFsckSummary` rather than here, so the line is reachable from a unit test.
         /// It was assembled inline until 2026-07-26, and in that time `corrupted_runs` was added to the
@@ -127,8 +135,8 @@ public:
                          "under --detail\n";
         /// A deletion intent outlives its body until GC's later round, so a missing body is the normal state
         /// of a deleted blob. Saying so keeps `intent_body_gone` from reading as damage.
-        if (!report.intents_verified && report.intent_listed > 0)
-            std::cout << "note: " << report.intent_listed
+        if (!report.intents_verified && report.intents_listed > 0)
+            std::cout << "note: " << report.intents_listed
                       << " deletion intent(s) were counted from the listing; the bytes of an intent and the body behind it "
                          "are read only with --verify-intents (two requests per intent)\n";
         if (report.intent_body_gone > 0)
@@ -230,16 +238,13 @@ public:
                 "durable id of the same epoch, which contiguity (INV-1) makes impossible without a lost "
                 "record; every transaction above the hole is unreachable (positions are listed as "
                 "`chain-broken` rows under --detail)", report.chain_broken);
-        /// A term of `clean()`, and until 2026-07-26 the only one that neither printed nor exited
-        /// nonzero — so a corrupt run was invisible twice over. A seal-checksum mismatch is not debris:
-        /// `fold`/`zeroInDegree`/`previewDeletes` all fail closed on the same run, so GC cannot make
-        /// progress past it, and the audit deliberately continues only so ONE pass enumerates them all.
+        /// A GC round fails on the same run, so GC cannot advance past it.
         if (report.corrupted_runs > 0)
             throw Exception(
                 ErrorCodes::BAD_ARGUMENTS,
-                "cas-fsck: {} GC source-edge run(s) failed their whole-file seal checksum — the deletion-"
-                "deriving consumers fail closed on these, so GC cannot advance past them (run keys are "
-                "listed as `corrupted-run` rows under --detail)", report.corrupted_runs);
+                "cas-fsck: {} GC source-edge run(s) or fold seal(s) are refused as corrupt by a GC round, so GC "
+                "cannot advance past them (keys and reasons are listed as `corrupted-run` rows under --detail)",
+                report.corrupted_runs);
         /// A key the `Layout` parsers refuse (no current writer can produce it), or a catalog
         /// incarnation that is ambiguous or unreadable, is corruption nothing clears on its own: the
         /// namespace enumeration now reports it instead of aborting, which is what makes an exit code

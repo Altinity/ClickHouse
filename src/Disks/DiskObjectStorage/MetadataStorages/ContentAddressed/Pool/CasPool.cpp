@@ -673,7 +673,7 @@ PoolPtr Pool::openForMigration(BackendPtr backend, PoolConfig config)
         throwNoPoolToMigrate(config);
     PoolMeta meta = decodePoolMeta(stored->bytes);
     if (meta.min_reader_generation < G_WRITE_FLOOR)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS pool meta: reader generation {} is below {}",
+        throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION, "CAS pool meta: reader generation {} is below {}",
             meta.min_reader_generation, G_WRITE_FLOOR);
     config.gc_shards = meta.gc_shards;
 

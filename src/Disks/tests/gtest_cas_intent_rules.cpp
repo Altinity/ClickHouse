@@ -193,7 +193,7 @@ std::optional<IntentRuleInput> inputOf(const Cell & c, const Observations & o)
     const HeadSeen wanted = c.head == HeadKind::Same ? HeadSeen::Same
         : c.head == HeadKind::Absent                 ? HeadSeen::Absent
         : c.head == HeadKind::Other                  ? HeadSeen::Other
-                                                     : HeadSeen::Uncanonical;
+                                                     : HeadSeen::TokenRejected;
     if (head.seen() != wanted)
         return std::nullopt;
     input.head = std::move(head);
@@ -648,8 +648,8 @@ TEST(CASIntentRules, HeadClassification)
     HeadValueOverrideBackend weak(Dialect::ETag, weakValue);
     const Meta w = liveHead(weak, "p/blobs/w", "z");
     ASSERT_FALSE(w.etag.canonical().has_value()) << "positive control: the weak token names no incarnation";
-    EXPECT_EQ(classifyDecisionHead(row_a, w).seen(), HeadSeen::Uncanonical);
-    EXPECT_EQ(classifyDecisionHead(PersistedEtag::capture(w.etag), w).seen(), HeadSeen::Uncanonical)
+    EXPECT_EQ(classifyDecisionHead(row_a, w).seen(), HeadSeen::TokenRejected);
+    EXPECT_EQ(classifyDecisionHead(PersistedEtag::capture(w.etag), w).seen(), HeadSeen::TokenRejected)
         << "a token that names no incarnation never shows the row's own";
 
     /// A row whose token does not canonicalise: a canonical body is another incarnation.
@@ -660,7 +660,7 @@ TEST(CASIntentRules, HeadClassification)
 
     /// With no row there is no own token: a canonical body is another incarnation.
     EXPECT_EQ(classifyDecisionHead(std::optional<Meta>(a)).seen(), HeadSeen::Other);
-    EXPECT_EQ(classifyDecisionHead(std::optional<Meta>(w)).seen(), HeadSeen::Uncanonical);
+    EXPECT_EQ(classifyDecisionHead(std::optional<Meta>(w)).seen(), HeadSeen::TokenRejected);
     EXPECT_EQ(classifyDecisionHead(std::optional<Meta>()).seen(), HeadSeen::Absent);
 }
 

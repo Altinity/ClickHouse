@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBoundedRun.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
@@ -16,6 +17,7 @@
 #include <IO/S3Common.h>
 #endif
 
+#include <Poco/Exception.h>
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
@@ -1336,7 +1338,7 @@ TEST(CASFsck, CondemnedBlobClassifiesPendingGc)
         {
             saw = true;
             ASSERT_FALSE(o.reachable_from.empty());
-            EXPECT_NE(o.reachable_from[0].find("delete_pending"), String::npos);
+            EXPECT_NE(o.reachable_from[0].find("`pending` row"), String::npos);
         }
     EXPECT_TRUE(saw);
 }
@@ -1483,6 +1485,7 @@ class FsckFaultBackend : public CountingBackend
 {
 public:
     std::set<String> refused_reads;
+    std::set<String> timed_out_reads;
     std::set<String> refused_read_prefixes;
     std::set<String> refused_heads;
     std::set<String> refused_deletes;
@@ -1517,6 +1520,8 @@ public:
         auto got = CountingBackend::read(key, access);
         if (refused_reads.contains(key))
             throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "injected refusal of the read of {}", key);
+        if (timed_out_reads.contains(key))
+            throw Poco::TimeoutException("injected timeout of the read of " + key);
         for (const String & prefix : refused_read_prefixes)
             if (key.starts_with(prefix))
                 throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "injected refusal (403) of the read of {}", key);
@@ -1569,6 +1574,27 @@ private:
     std::map<String, std::pair<size_t, std::function<void()>>> read_hooks;
     std::map<String, std::function<void()>> head_hooks;
 };
+
+/// A scan deadline `timeout` from now on the pool's request clock.
+ToolDeadline fsckDeadlineIn(Pool & store, std::chrono::milliseconds timeout)
+{
+    return ToolDeadline(store.openRequests(), timeout, "fsck", "raise --timeout");
+}
+
+void spinPast(const ToolDeadline & deadline)
+{
+    while (!deadline.passed())
+    {
+    }
+}
+
+/// Spins until at most `ms` are left before `deadline`.
+void spinUntilLeft(const ToolDeadline & deadline, uint64_t ms)
+{
+    while (deadline.remainingMs() > ms)
+    {
+    }
+}
 
 /// A pool whose bodies, intents and legacy markers the tests plant one by one, with no GC round.
 struct FsckIntentFixture
@@ -1670,7 +1696,7 @@ TEST(CASFsck, IntentClassesCurrentReplacedBodyGoneMalformed)
     const FsckReport rep = f.fsck(/*detail=*/true, /*fix_legacy_markers=*/ false, /*verify=*/true);
 
     EXPECT_TRUE(rep.intents_verified);
-    EXPECT_EQ(rep.intent_listed, 4u) << "the key whose bytes are junk parses, so it is listed as well";
+    EXPECT_EQ(rep.intents_listed, 4u) << "the key whose bytes are junk parses, so it is listed as well";
     EXPECT_EQ(rep.intent_current, 1u);
     EXPECT_EQ(rep.intent_replaced, 1u);
     EXPECT_EQ(rep.intent_body_gone, 1u);
@@ -1702,7 +1728,7 @@ TEST(CASFsck, PlainScanCountsIntentsFromTheListingAndReadsNone)
     const FsckReport rep = f.fsck(/*detail=*/true);
 
     EXPECT_FALSE(rep.intents_verified);
-    EXPECT_EQ(rep.intent_listed, 3u) << "positive control: the well-formed keys were counted";
+    EXPECT_EQ(rep.intents_listed, 3u) << "positive control: the well-formed keys were counted";
     EXPECT_EQ(rep.intent_malformed, 1u) << "only the key the parser refuses; the junk bytes need `verify`";
     EXPECT_EQ(rep.intent_current + rep.intent_replaced + rep.intent_body_gone + rep.intent_unread, 0u);
     EXPECT_GE(countKeyRequests(f.backend->journal(), JournalVerb::List, f.layout.blobIntentsPrefix()), 1u)
@@ -1865,7 +1891,7 @@ TEST(CASFsck, NoIntentIsEverDeleted)
         f.backend->clearJournal();
         const FsckReport rep = f.fsck(/*detail=*/true, fix, verify);
 
-        EXPECT_EQ(rep.intent_listed, 3u) << "positive control: intents were listed";
+        EXPECT_EQ(rep.intents_listed, 3u) << "positive control: intents were listed";
         if (verify)
         {
             EXPECT_EQ(rep.intent_current, 1u) << "positive control: intents were classified";
@@ -1949,6 +1975,31 @@ TEST(CASFsck, LegacyMarkersAreDebrisAndTheFixDeletesThem)
     EXPECT_EQ(again.legacy_markers_deleted, 0u);
 }
 
+/// The fix removes markers on pool threads with a concurrency above 1, and on the scanning thread by default.
+TEST(CASFsck, FixConcurrencyMovesTheMarkerRemovalOffTheScanningThread)
+{
+    for (const size_t concurrency : {size_t{1}, size_t{4}})
+    {
+        SCOPED_TRACE(concurrency);
+        FsckIntentFixture f;
+        std::mutex mutex;
+        std::set<std::thread::id> threads;
+        for (const uint64_t b : {1, 2, 3, 4})
+        {
+            f.marker(b);
+            f.backend->beforeHead(f.markerKey(b), [&]
+            {
+                std::lock_guard lock(mutex);
+                threads.insert(std::this_thread::get_id());
+            });
+        }
+        const FsckReport report = runFsck(*f.store, false, {}, {}, false, {}, /*fix_legacy_markers=*/ true, false, concurrency);
+        EXPECT_EQ(report.legacy_markers_deleted, 4u) << "positive control: the fix ran";
+        ASSERT_FALSE(threads.empty());
+        EXPECT_EQ(threads.contains(std::this_thread::get_id()), concurrency == 1);
+    }
+}
+
 /// A fix run has no mount, no lease and no probe: on the read-only open, as `cas-fsck` opens the pool, it
 /// writes nothing, and the store differs afterwards only by the markers it removed.
 TEST(CASFsck, FixRunWritesNothingAndMountsNothing)
@@ -1994,15 +2045,15 @@ TEST(CASFsck, FixLoopHonoursTheDeadline)
 
     expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, "0 legacy marker(s) deleted before", [&]
     {
-        (void)removeLegacyMarkers(*f.store, keys, 1, std::chrono::steady_clock::now() - std::chrono::seconds(1),
+        (void)removeLegacyMarkers(*f.store, keys, *makeBoundedPool(1), fsckDeadlineIn(*f.store, std::chrono::milliseconds(0)),
                                   [&](uint64_t n) { deleted = n; });
     });
     EXPECT_EQ(deleted, 0u);
     EXPECT_TRUE(objectPresent(*f.backend, f.markerKey(1)));
     EXPECT_TRUE(objectPresent(*f.backend, f.markerKey(2)));
 
-    EXPECT_EQ(removeLegacyMarkers(*f.store, keys, 1, std::chrono::steady_clock::now() + std::chrono::hours(1),
-                                  [&](uint64_t n) { deleted = n; }).removed, 2u) << "positive control: with time left the fix deletes";
+    EXPECT_EQ(removeLegacyMarkers(*f.store, keys, *makeBoundedPool(1), fsckDeadlineIn(*f.store, std::chrono::hours(1)),
+                                  [&](uint64_t n) { deleted = n; }).deleted, 2u) << "positive control: with time left the fix deletes";
     EXPECT_EQ(deleted, 2u) << "the callback reports the running count";
 }
 
@@ -2017,20 +2068,15 @@ TEST(CASFsck, FixLoopChecksTheDeadlineBeforeEachRequest)
         f.marker(1);
         f.marker(2);
         const std::vector<String> keys{f.markerKey(1), f.markerKey(2)};
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-        /// The deadline is a point on the real steady clock, so the slow `HEAD` waits for that clock to pass it.
-        f.backend->beforeHead(keys[slow], [deadline]
-        {
-            while (std::chrono::steady_clock::now() <= deadline)
-            {
-            }
-        });
+        const ToolDeadline deadline = fsckDeadlineIn(*f.store, std::chrono::seconds(1));
+        /// The pool's clock is the real one, so the slow `HEAD` waits for it to pass the deadline.
+        f.backend->beforeHead(keys[slow], [&deadline] { spinPast(deadline); });
         f.backend->clearJournal();
         uint64_t reported = 99;
 
         expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, fmt::format("{} legacy marker(s) deleted before", slow), [&]
         {
-            (void)removeLegacyMarkers(*f.store, keys, 1, deadline, [&](uint64_t n) { reported = n; });
+            (void)removeLegacyMarkers(*f.store, keys, *makeBoundedPool(1), deadline, [&](uint64_t n) { reported = n; });
         });
         const auto journal = f.backend->journal();
         EXPECT_EQ(countKeyRequests(journal, JournalVerb::Head, keys[slow]), 1u) << "positive control: the slow HEAD was sent";
@@ -2060,7 +2106,7 @@ TEST(CASFsck, IntentAndMarkerLoopsReportProgress)
 
     const FsckReport rep = runFsck(*f.store, false, on_progress, {}, false, {}, /*fix_legacy_markers=*/ true);
 
-    ASSERT_EQ(rep.intent_listed, 1000u) << "positive control: the loops had keys to walk";
+    ASSERT_EQ(rep.intents_listed, 1000u) << "positive control: the loops had keys to walk";
     ASSERT_EQ(rep.legacy_markers_deleted, 1000u);
     EXPECT_EQ(seen["counting blob intents"], std::vector<uint64_t>{1000});
     EXPECT_EQ(seen["removing legacy markers"], std::vector<uint64_t>{1000});
@@ -2109,7 +2155,7 @@ TEST(CASFsck, IntentsAreAccountedInTheTotals)
     EXPECT_EQ(rep.unreachable, 2u) << "the two bodies, not the intents";
 
     const FsckReport plain = f.fsck(/*detail=*/false);
-    EXPECT_EQ(plain.intent_listed + plain.intent_malformed, listed) << "a plain scan accounts for every listed intent too";
+    EXPECT_EQ(plain.intents_listed + plain.intent_malformed, listed) << "a plain scan accounts for every listed intent too";
     EXPECT_EQ(plain.physical_bytes, rep.physical_bytes);
 }
 
@@ -2213,7 +2259,7 @@ TEST(CASFsck, CandidateAndPendingRowsGetTheirOwnNotes)
 
     EXPECT_TRUE(rep.clean());
     EXPECT_EQ(rep.pending_gc, 2u);
-    EXPECT_TRUE(anyNoteContains(rep, FsckClass::PendingGc, "delete_pending"));
+    EXPECT_TRUE(anyNoteContains(rep, FsckClass::PendingGc, "`pending` row"));
     EXPECT_TRUE(anyNoteContains(rep, FsckClass::PendingGc, "candidate"));
     EXPECT_FALSE(anyNoteContains(rep, FsckClass::PendingGc, "graduates"));
     EXPECT_FALSE(anyNoteContains(rep, FsckClass::PendingGc, "writer"));
@@ -2436,15 +2482,10 @@ TEST(CASFsck, PresentPendingBodiesStopAtTheDeadline)
         ASSERT_TRUE(objectPresent(*f.backend, f.bodyKey(b))) << "fixture: the body is present";
         intent_keys.push_back(f.intentKey(b));
     }
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-    /// The deadline is a point on the real steady clock, so the first body `HEAD` waits for that clock to pass it.
+    const ToolDeadline deadline = fsckDeadlineIn(*f.store, std::chrono::seconds(1));
+    /// The pool's clock is the real one, so the first body `HEAD` waits for it to pass the deadline.
     for (const uint64_t b : blobs)
-        f.backend->beforeHead(f.bodyKey(b), [deadline]
-        {
-            while (std::chrono::steady_clock::now() <= deadline)
-            {
-            }
-        });
+        f.backend->beforeHead(f.bodyKey(b), [&deadline] { spinPast(deadline); });
     f.backend->clearJournal();
 
     expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, "during 'checking pending rows'", [&]
@@ -2465,13 +2506,6 @@ TEST(CASFsck, PresentPendingBodiesStopAtTheDeadline)
 namespace
 {
 
-void spinPast(std::chrono::steady_clock::time_point deadline)
-{
-    while (std::chrono::steady_clock::now() <= deadline)
-    {
-    }
-}
-
 size_t bodyHeads(FsckGcFixture & f, const std::vector<uint64_t> & blobs)
 {
     size_t heads = 0;
@@ -2489,9 +2523,9 @@ TEST(CASFsck, DeadlinePassingDuringARowStopsBeforeTheNextRowsHead)
     FsckGcFixture f(/*create_budget=*/0, {1, 2});
     f.drop();
     f.round();
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    const ToolDeadline deadline = fsckDeadlineIn(*f.store, std::chrono::seconds(1));
     for (const uint64_t b : blobs)
-        f.backend->beforeRead(f.intentKey(b), 0, [deadline] { spinPast(deadline); });
+        f.backend->beforeRead(f.intentKey(b), 0, [&deadline] { spinPast(deadline); });
     f.backend->clearJournal();
 
     expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, "during 'classifying unreferenced bodies'", [&]
@@ -2509,8 +2543,8 @@ TEST(CASFsck, DeadlinePassingDuringAnAbsentIntentReadStopsBeforeTheBodyHead)
     f.round();
     const String intent_key = f.intentKey(1);
     f.removeIntent(1);
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-    f.backend->beforeRead(intent_key, 0, [deadline] { spinPast(deadline); });
+    const ToolDeadline deadline = fsckDeadlineIn(*f.store, std::chrono::seconds(1));
+    f.backend->beforeRead(intent_key, 0, [&deadline] { spinPast(deadline); });
     f.backend->clearJournal();
 
     expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, "during 'checking pending rows'", [&]
@@ -2527,8 +2561,8 @@ TEST(CASFsck, DeadlinePassingDuringAVerifiedIntentReadStopsBeforeTheBodyHead)
     FsckIntentFixture f;
     f.body(1);
     const String intent = f.currentIntent(1);
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-    f.backend->beforeRead(intent, 0, [deadline] { spinPast(deadline); });
+    const ToolDeadline deadline = fsckDeadlineIn(*f.store, std::chrono::seconds(1));
+    f.backend->beforeRead(intent, 0, [&deadline] { spinPast(deadline); });
     f.backend->clearJournal();
 
     expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, "during 'reading blob intents'", [&]
@@ -2582,8 +2616,8 @@ TEST(CASFsckPartial, TimeLeftShorterThanOneAttemptEndsIntentVerificationAsPartia
     plantIntentForCurrentBody(*backend, layout, blobRefOf(1));
     const String intent = *intentKeyOfCurrentBody(*backend, layout, blobRefOf(1));
     const String body = layout.blobKey(blobRefOf(1));
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    backend->beforeRead(intent, 0, [deadline] { spinPast(deadline - std::chrono::milliseconds(kFsckEnvelopeMs / 2)); });
+    const ToolDeadline deadline = fsckDeadlineIn(*store, std::chrono::seconds(2));
+    backend->beforeRead(intent, 0, [&deadline] { spinUntilLeft(deadline, kFsckEnvelopeMs / 2); });
     backend->clearJournal();
 
     const FsckReport report = runFsck(*store, /*detail=*/false, {}, deadline, /*partial_on_deadline=*/true, {},
@@ -2598,6 +2632,31 @@ TEST(CASFsckPartial, TimeLeftShorterThanOneAttemptEndsIntentVerificationAsPartia
     EXPECT_EQ(countKeyRequests(journal, JournalVerb::Head, body), 0u);
 }
 
+/// A read that fails when less time is left than one attempt ends the scan as partial: the engine cannot reissue it, and
+/// the failure is the scan's timeout, not an unread intent.
+TEST(CASFsckPartial, AReadFailingWithLessThanOneAttemptLeftEndsTheScanAsPartial)
+{
+    auto backend = std::make_shared<EnvelopeFsckFaultBackend>();
+    PoolPtr store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    writeBlobBody(*backend, layout, numberedBlobHash(1));
+    plantIntentForCurrentBody(*backend, layout, blobRefOf(1));
+    const String intent = *intentKeyOfCurrentBody(*backend, layout, blobRefOf(1));
+    const ToolDeadline deadline = fsckDeadlineIn(*store, std::chrono::seconds(2));
+    backend->timed_out_reads.insert(intent);
+    backend->beforeRead(intent, 0, [&deadline] { spinUntilLeft(deadline, kFsckEnvelopeMs / 2); });
+    backend->clearJournal();
+
+    const FsckReport report = runFsck(*store, /*detail=*/false, {}, deadline, /*partial_on_deadline=*/true, {},
+                                      /*fix_legacy_markers=*/false, /*verify_intents=*/true);
+
+    ASSERT_TRUE(report.partial) << formatFsckSummary(report);
+    EXPECT_NE(report.partial_reason.find("exceeded the deadline during 'reading blob intents'"), String::npos)
+        << report.partial_reason;
+    EXPECT_EQ(report.intent_unread, 0u) << formatFsckSummary(report);
+    EXPECT_EQ(countKeyRequests(backend->journal(), JournalVerb::Read, intent), 1u) << "positive control: the intent read was sent";
+}
+
 /// A ref stream read that ends with less time left than one attempt ends the scan as partial, not as a namespace fsck
 /// could not examine.
 TEST(CASFsckPartial, TimeLeftShorterThanOneAttemptEndsTheRefWalkAsPartial)
@@ -2607,11 +2666,11 @@ TEST(CASFsckPartial, TimeLeftShorterThanOneAttemptEndsTheRefWalkAsPartial)
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/envelope_deadline@cas@"};
     const NamespaceLifeId life = writeFsckFixtureWithTail(*backend, layout, ns);
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    const ToolDeadline deadline = fsckDeadlineIn(*store, std::chrono::seconds(2));
     bool spun = false;
     backend->armOnFirstGet(layout.refLogKey(life, RefTxnId{1, 2}), [&]
     {
-        spinPast(deadline - std::chrono::milliseconds(kFsckEnvelopeMs / 2));
+        spinUntilLeft(deadline, kFsckEnvelopeMs / 2);
         spun = true;
     });
 
@@ -2693,7 +2752,7 @@ TEST(CASFsck, ProbeScratchObjectIsNoIntent)
     {
         const FsckReport rep = f.fsck(/*detail=*/true, /*fix_legacy_markers=*/ false, verify);
         EXPECT_EQ(rep.intent_malformed, 0u) << formatFsckSummary(rep);
-        EXPECT_EQ(rep.intent_listed, 1u) << "positive control: the real intent was listed";
+        EXPECT_EQ(rep.intents_listed, 1u) << "positive control: the real intent was listed";
         EXPECT_TRUE(rep.clean()) << formatFsckSummary(rep);
     }
 }
@@ -2711,7 +2770,7 @@ TEST(CASFsck, VerifiedIntentIsListedOnlyAfterItsRead)
 
     const FsckReport rep = f.fsck(/*detail=*/true, /*fix_legacy_markers=*/ false, /*verify=*/true);
 
-    EXPECT_EQ(rep.intent_listed, 1u) << "only the intent that was read is counted";
+    EXPECT_EQ(rep.intents_listed, 1u) << "only the intent that was read is counted";
     EXPECT_EQ(rep.intent_current, 1u) << "positive control: the other intent was read and classified";
 }
 
@@ -2873,7 +2932,7 @@ TEST(CASFsckPartial, DeadlineReturnsAccumulatedCountsInsteadOfThrowing)
     const uint64_t sequence = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
     writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, sequence});
 
-    const auto past = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    const ToolDeadline past = fsckDeadlineIn(*store, std::chrono::milliseconds(0));
     /// partial_on_deadline=false keeps the old contract:
     EXPECT_THROW(DB::Cas::runFsck(*store, /*detail=*/false, {}, past), DB::Exception);
     /// partial_on_deadline=true returns a flagged report:
@@ -3182,14 +3241,14 @@ TEST(CASFsckSummary, AdvisoryIntentCountersAndTheVerificationFlagArePrinted)
 {
     FsckReport report;
     const String plain = formatFsckSummary(report);
-    for (const char * name : {"intent_listed=0", "pending_intent_absent=0", "pending_token_rejected=0", "standing_present=0", "intents_verified=0"})
+    for (const char * name : {"intents_listed=0", "pending_intent_absent=0", "pending_token_rejected=0", "standing_present=0", "intents_verified=0"})
         EXPECT_NE(plain.find(name), String::npos) << name << " missing from: " << plain;
     report.intents_verified = true;
-    report.intent_listed = 5;
+    report.intents_listed = 5;
     report.standing_present = 2;
     const String verified = formatFsckSummary(report);
     EXPECT_NE(verified.find("intents_verified=1"), String::npos) << verified;
-    EXPECT_NE(verified.find("intent_listed=5"), String::npos) << verified;
+    EXPECT_NE(verified.find("intents_listed=5"), String::npos) << verified;
     EXPECT_NE(verified.find("standing_present=2"), String::npos) << verified;
     EXPECT_TRUE(report.clean()) << "the advisory counters never make a report unclean";
 }
@@ -3395,12 +3454,12 @@ TEST(CASFsckPartial, DeadlineReportsHeldFindingsAsUnchecked)
     const String hole = layout.refLogKey(broken_life, RefTxnId{1, 2});
     removeForFsck(*backend, hole);
 
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    const ToolDeadline deadline = fsckDeadlineIn(*store, std::chrono::seconds(2));
     /// Runs out the clock while the first life's walk meets its hole, so the deadline fires before the
     /// second life, after the first life's finding is held.
     backend->armOnFirstGet(hole, [&]
     {
-        while (std::chrono::steady_clock::now() <= deadline)
+        while (!deadline.passed())
             std::this_thread::yield();
     });
 
@@ -3453,13 +3512,13 @@ TEST(CASFsckPartial, DeadlineInTheBlobLoopReportsHeldDanglingsAsUnchecked)
     const uint64_t sequence = publishCommittedTransition(*backend, layout, ns, "tbl", std::nullopt, r);
     writeFsckCheckpoint(*backend, layout, ns, RefTxnId{1, sequence});
 
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    const ToolDeadline deadline = fsckDeadlineIn(*store, std::chrono::seconds(2));
     /// Both blobs are missing. The first is re-resolved and held; the clock runs out before the second
     /// one's recheck, so the deadline fires inside the blob loop with one dangling held.
     backend->blobs_prefix = layout.blobsPrefix();
     backend->on_second_blob_head = [&]
     {
-        while (std::chrono::steady_clock::now() <= deadline)
+        while (!deadline.passed())
             std::this_thread::yield();
     };
 

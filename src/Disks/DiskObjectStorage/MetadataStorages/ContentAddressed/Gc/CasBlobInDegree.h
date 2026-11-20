@@ -192,12 +192,28 @@ struct AdoptedRunContext
 /// `(BlobRef, source_id)` order, or a condemned row stamped after the parent round. The message names the run's key,
 /// the shard and the row, and ends with `kCorruptBookkeeping`. Once the last run is drained, the condemned rows read
 /// must match the seal's summary of the shard in all three fields, or the reader refuses the same way. Every refusal
-/// names the run's key.
+/// names the run's key. A run that fails to decode, is absent or fails its seal checksum is refused too.
 class AdoptedRunReader
 {
 public:
-    /// `runs` are the parent seal's runs of `shard`, in seal order; the reader borrows them.
-    AdoptedRunReader(CasOperation & op_, const std::vector<RunRef> & runs_, uint64_t shard_, AdoptedRunContext context_);
+    /// `Throw` raises each refusal as `CORRUPTED_DATA`, for the readers that act on the rows. `Report` ends the reading
+    /// at the first refusal and keeps it in `refusal`, for the read-only views that must show what GC would refuse.
+    enum class OnRefusal : uint8_t { Throw, Report };
+
+    struct Refusal
+    {
+        /// The run the refusal names; the last run of the shard for a summary refusal, empty when the shard has none.
+        String run_key;
+        String message;
+    };
+
+    /// The policy each run is opened under, asked once per run so a caller's deadline applies to every open.
+    using RunPolicy = std::function<Retry()>;
+
+    /// `runs` are the parent seal's runs of `shard`, in seal order; the reader borrows them. Without `run_policy_`
+    /// each run is opened under `Retry::standard`.
+    AdoptedRunReader(CasOperation & op_, const std::vector<RunRef> & runs_, uint64_t shard_, AdoptedRunContext context_,
+                     OnRefusal on_refusal_ = OnRefusal::Throw, RunPolicy run_policy_ = {});
 
     /// The next row of the open run; false once that run's trailer is consumed, or before the first `openNextRun`.
     bool nextInRun(SourceEdgeRecord & rec);
@@ -208,8 +224,15 @@ public:
     bool next(SourceEdgeRecord & rec);
     /// The run the last row or refusal came from.
     const RunRef & currentRun() const;
+    /// In `Report` mode, the refusal that ended the reading; empty while every check passed.
+    const std::optional<Refusal> & refusal() const { return refused; }
 
 private:
+    bool nextInRunChecked(SourceEdgeRecord & rec);
+    bool openNextRunChecked();
+    /// Runs `read`; in `Report` mode a `CORRUPTED_DATA` it throws becomes `refused` and ends the reading.
+    template <typename Read>
+    bool reportingRefusal(Read && read);
     void checkRow(const SourceEdgeRecord & rec);
     [[noreturn]] void refuseRow(const SourceEdgeRecord & rec, const String & what) const;
     void checkSummary() const;
@@ -218,6 +241,9 @@ private:
     const std::vector<RunRef> & runs;
     const uint64_t shard;
     const AdoptedRunContext context;
+    const OnRefusal on_refusal;
+    const RunPolicy run_policy;
+    std::optional<Refusal> refused;
 
     size_t next_run = 0;
     std::optional<SourceEdgeRunView> view;
@@ -276,12 +302,6 @@ struct BlobSourceRetirement
 {
     BlobRef ref{};
     UInt128 source_id{};
-};
-
-/// A blob whose active source-edge set became empty this generation — a retire candidate.
-struct BlobCandidate
-{
-    BlobRef ref{};
 };
 
 /// A row moved to the incarnation now at its key, and the token it held before.
@@ -349,7 +369,7 @@ struct RetiredMergeResult
     CountWithExample unconfirmed_creates;
     /// Observations and rows whose token names no incarnation; nothing is created or deleted for them. The examples
     /// below are blob keys.
-    CountWithExample uncanonical_tokens;
+    CountWithExample rejected_tokens;
     /// `standing` rows whose `HEAD` showed their own token again: carried, nothing deleted.
     CountWithExample standing_anomalies;
     /// Bodies shorter than the pool's blob envelope: no row is written for them, a row is carried, nothing is
@@ -550,7 +570,7 @@ struct ShardFoldOptions
 /// Streaming: both inputs are merged in `(blob, source_id)` order, and an edge present twice is one
 /// edge, so a re-fold is idempotent. `prior_runs` are the parent seal's exact references for `shard`; empty is
 /// an empty baseline. They are read through `AdoptedRunReader` with `parent`; a pass that condemns stamps its rows
-/// later than `parent.parent_round`. A blob whose edge set becomes empty is written as a zero-marker row for `zeroInDegree`.
+/// later than `parent.parent_round`. A blob whose edge set becomes empty is written as a zero-marker row.
 /// The prior run's `RunMarker::Condemned` rows ride the source-edge run at the zero-sentinel key
 /// (`source_id = 0`), so the prior run is also the retired input.
 /// Each blob is decided when the merge closes it, after the round's cut and before the output run is written,
@@ -573,10 +593,19 @@ RunRef foldDeltasIntoGeneration(CasOperation & op, const Layout & layout, const 
                                 AdoptedRunContext parent, uint64_t new_generation, uint64_t attempt, uint64_t shard,
                                 std::vector<BlobDelta> scattered, ShardFoldOptions options = {});
 
-/// Stream the sealed in-degree runs named by `runs` (the current seal's `blob_target_runs` filtered to one
-/// shard) and return every blob written at in-degree 0 (the candidates that transitioned to zero). An
-/// empty `runs` is an empty baseline. Each `RunRef` supplies the exact object key, so resolution never
-/// reconstructs a key from generation metadata.
-std::vector<BlobCandidate> zeroInDegree(CasOperation & op, const std::vector<RunRef> & runs);
+/// The rows of one GC shard's adopted runs that a deletion preview shows.
+struct AdoptedShardPreview
+{
+    /// Blobs written at in-degree 0.
+    std::vector<BlobRef> zero;
+    std::vector<SourceEdgeRecord> condemned;
+    /// What a round would refuse in these runs; when set, both lists are empty.
+    std::optional<AdoptedRunReader::Refusal> refusal;
+};
+
+/// Reads the adopted runs of `shard` once, through `AdoptedRunReader` in `Report` mode, and keeps the rows only when
+/// every run and the shard's summary passed its checks.
+AdoptedShardPreview previewAdoptedShard(CasOperation & op, const std::vector<RunRef> & runs, uint64_t shard,
+                                        AdoptedRunContext context);
 
 }

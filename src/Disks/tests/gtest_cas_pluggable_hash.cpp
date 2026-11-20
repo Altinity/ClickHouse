@@ -444,7 +444,7 @@ TEST(CASPluggableHash, Sha256BlobSeenByCondemnSweepAndFsckNotSilentlySkipped)
 
     /// previewDeletes streams the SAME adopted seal from the run's own rows (never pool meta) and must
     /// report exactly our blob, at its real 32-byte digest.
-    const std::vector<Gc::PreviewEntry> preview = gc.previewDeletes();
+    const std::vector<Gc::PreviewEntry> preview = gc.previewDeletes().deletes;
     ASSERT_EQ(preview.size(), 1u) << "THE CRUX: previewDeletes must surface the condemned sha256 blob";
     EXPECT_EQ(preview[0].ref, id);
     EXPECT_EQ(preview[0].key, blob_key);
@@ -672,7 +672,7 @@ TEST(CASPluggableHash, ForeignAlgoSegmentIsDebrisNotOurs)
     runRegularRoundReclaiming(gc);   /// folds both -1s: both transition to zero
 
     /// The fold condemns exactly the two OWN blobs -- never the foreign object.
-    const std::vector<Gc::PreviewEntry> preview = gc.previewDeletes();
+    const std::vector<Gc::PreviewEntry> preview = gc.previewDeletes().deletes;
     ASSERT_EQ(preview.size(), 2u);
     std::unordered_set<BlobRef, BlobRefHash> condemned_refs;
     for (const auto & p : preview)
@@ -855,7 +855,7 @@ TEST(CASPluggableHash, TwoAlgoBlobsBothFullyReclaimed)
 
     /// previewDeletes covers BOTH refs from the adopted seal -- never just one algo.
     {
-        const std::vector<Gc::PreviewEntry> preview = gc.previewDeletes();
+        const std::vector<Gc::PreviewEntry> preview = gc.previewDeletes().deletes;
         ASSERT_EQ(preview.size(), 2u);
         std::unordered_set<BlobRef, BlobRefHash> refs;
         for (const auto & p : preview)

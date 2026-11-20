@@ -30,7 +30,7 @@ namespace
 UInt128 b(uint64_t n) { return UInt128(n); }
 UInt128 s(uint64_t n) { return UInt128(n); }   // source-edge id
 /// A `BlobRef` (CityHash128) for the same literal `n` — every existing test's `BlobDelta.ref` /
-/// `BlobCandidate.ref` / `inDegreeInRuns` argument is a `BlobRef` as of Phase 3 T3.
+/// `inDegreeInRuns` argument is a `BlobRef`.
 BlobRef bh(uint64_t n) { return BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(n))}; }
 
 /// Scale threshold for the "the run genuinely spans several blocks" sanity assertions below. This is
@@ -38,6 +38,15 @@ BlobRef bh(uint64_t n) { return BlobRef{BlobHashAlgo::CityHash128, BlobDigest::f
 /// block framing of its own — it only pins the same byte-size scale the (now-deleted, codecs-v3 phase 6)
 /// `CasRunFile` block codec used, so the multi-block-sized fixtures below stay meaningfully large.
 constexpr uint32_t kLegacyBlockSize = 256u * 1024u;
+
+/// The blobs at in-degree 0 in one shard's runs, as the deletion preview reads them.
+std::vector<BlobRef> zeroRefs(DB::Cas::CasOperation & op, const std::vector<RunRef> & runs)
+{
+    AdoptedShardPreview rows = previewAdoptedShard(op, runs, 0, foldParent(0));
+    if (rows.refusal)
+        ADD_FAILURE() << rows.refusal->message;
+    return std::move(rows.zero);
+}
 
 /// The pending `HEAD` hook for merge tests: every pending body reads absent.
 const BlobHeadFn kPendingBodyAbsent = [](const BlobRef &) { return std::optional<Meta>{}; };
@@ -86,7 +95,7 @@ TEST(CASBlobInDegree, FoldStartsFromEmptyPriorGeneration)
         *backend_req, layout, /*prior_runs*/{}, foldParent(0), /*new*/1, /*attempt*/0, /*shard*/0, deltas));
     ASSERT_FALSE(runs.empty());
 
-    const auto zero = zeroInDegree(*backend_req, runs);
+    const auto zero = zeroRefs(*backend_req, runs);
     EXPECT_TRUE(zero.empty());   /// nothing at zero yet
 }
 
@@ -106,9 +115,9 @@ TEST(CASBlobInDegree, PlusMinusCancelToZeroDetectsCandidate)
     runs2.push_back(foldDeltasIntoGeneration(
         *backend_req, layout, /*prior_runs*/runs1, foldParent(0), /*new*/2, /*attempt*/0, 0, {{bh(1), s(1), true}}));
 
-    const auto zero = zeroInDegree(*backend_req, runs2);
+    const auto zero = zeroRefs(*backend_req, runs2);
     ASSERT_EQ(zero.size(), 1u);
-    EXPECT_EQ(zero[0].ref, bh(1));
+    EXPECT_EQ(zero[0], bh(1));
 }
 
 TEST(CASBlobInDegree, RunsAreByteDeterministic)
@@ -156,7 +165,7 @@ TEST(CASBlobInDegree, SameEdgeActivatedTwiceCountsOnce)
     const int64_t deg = DB::Cas::tests::inDegreeInRuns(backend, runs, bh(1));
     EXPECT_EQ(deg, 1);   /// deduplicated, not 2
 
-    const auto zero = zeroInDegree(*backend_req, runs);
+    const auto zero = zeroRefs(*backend_req, runs);
     EXPECT_TRUE(zero.empty());   /// b1 still has an active edge
 }
 
@@ -372,7 +381,8 @@ TEST(CASBlobInDegree, FoldSealChecksumMismatchFailsClosed)
         DB::Exception);
 }
 
-TEST(CASBlobInDegree, ZeroInDegreeSealChecksumMismatchFailsClosed)
+/// A run that fails its checksum yields no row of the shard, and the refusal names the run.
+TEST(CASBlobInDegree, PreviewOfARunThatFailsItsChecksumIsRefused)
 {
     InMemoryBackend backend;
     DB::Cas::tests::OperationForTest backend_req(backend);
@@ -382,7 +392,13 @@ TEST(CASBlobInDegree, ZeroInDegreeSealChecksumMismatchFailsClosed)
     RunRef bad = good;
     bad.checksum = good.checksum + 1;
     std::vector<RunRef> runs{bad};
-    EXPECT_THROW(zeroInDegree(*backend_req, runs), DB::Exception);
+    AdoptedShardPreview rows;
+    ASSERT_NO_THROW(rows = previewAdoptedShard(*backend_req, runs, 0, foldParent(0)));
+    ASSERT_TRUE(rows.refusal.has_value());
+    EXPECT_EQ(rows.refusal->run_key, bad.key);
+    EXPECT_NE(rows.refusal->message.find("seal-checksum mismatch"), String::npos) << rows.refusal->message;
+    EXPECT_TRUE(rows.zero.empty());
+    EXPECT_TRUE(rows.condemned.empty());
 }
 
 TEST(CASThreeCursorMerge, CandidateRowsAtZeroCreateTheirIntents)
@@ -856,12 +872,12 @@ TEST(CASBlobInDegree, FoldStreamsPriorRunWithoutReadingItWhole)
     /// window for the seam to measure, so resident memory inside the open stream is out of its reach.
 }
 
-/// The preview consumer `zeroInDegree` streams a large run instead of materializing it whole: the
+/// The deletion preview streams a large run instead of materializing it whole: the
 /// backend is never asked to READ the run's key, only to open it as a stream, and the candidate set
 /// equals the pre-change (borrowed-mode) result. Byte-parity against an InMemory oracle is the
 /// load-bearing canary — the scan logic is unchanged; only the byte source moved to the stream.
 /// As above, the buffering inside the open stream is not bounded here; nothing at the seam sees it.
-TEST(CASBlobInDegree, ZeroInDegreeStreamsRunWithoutReadingItWhole)
+TEST(CASBlobInDegree, PreviewStreamsRunWithoutReadingItWhole)
 {
     using DB::Cas::tests::CountingBackend;
     CountingBackend backend;
@@ -900,14 +916,14 @@ TEST(CASBlobInDegree, ZeroInDegreeStreamsRunWithoutReadingItWhole)
     /// delivery, not merely served in one piece: unarmed, `getStream` never installs the recording
     /// wrapper at all.
     backend.setStreamChunkForTest(kLegacyBlockSize / 4);
-    const auto zero_c = zeroInDegree(*backend_req, runs2_c);
-    const auto zero_o = zeroInDegree(*oracle_req, runs2_o);
+    const auto zero_c = zeroRefs(*backend_req, runs2_c);
+    const auto zero_o = zeroRefs(*oracle_req, runs2_o);
 
     /// Equivalence with the borrowed-mode (InMemory oracle) result: same candidates, in the same order.
     ASSERT_EQ(zero_c.size(), zero_o.size());
     ASSERT_EQ(zero_c.size(), 2u);
     for (size_t i = 0; i < zero_c.size(); ++i)
-        EXPECT_EQ(zero_c[i].ref, zero_o[i].ref);
+        EXPECT_EQ(zero_c[i], zero_o[i]);
 
     /// The core assertion: the run is never read whole — the scan reaches it only through the streaming
     /// open, so the seam sees no read of that key at all.
@@ -976,7 +992,7 @@ TEST(CASBlobInDegree, TwoAlgoFoldSettlesBothInOneShardRun)
 
     EXPECT_EQ(DB::Cas::tests::inDegreeInRuns(backend, runs1, ch_x), 1);
     EXPECT_EQ(DB::Cas::tests::inDegreeInRuns(backend, runs1, sha_y_ref), 1);
-    EXPECT_TRUE(zeroInDegree(*backend_req, runs1).empty());
+    EXPECT_TRUE(zeroRefs(*backend_req, runs1).empty());
 
     /// Remove both edges in gen 2: each transitions to zero independently, condemned per its own ref.
     std::vector<RunRef> runs2;
@@ -1022,7 +1038,7 @@ TEST(CASBlobInDegree, UnmatchedRemovalIsAPerKeyNoOpAndSparesSiblingEdges)
     const DecodedRun out = decodeRun(*backend_req, runs2[0]);
     ASSERT_EQ(out.edges.size(), 2u) << "an unmatched removal must not strip sibling edges";
     /// And the blob is NOT a deletion candidate.
-    const auto zero = zeroInDegree(*backend_req, runs2);
+    const auto zero = zeroRefs(*backend_req, runs2);
     EXPECT_TRUE(zero.empty()) << "b1 still has two live source edges";
 }
 
@@ -1450,7 +1466,7 @@ TEST(CASThreeCursorMerge, StandingRowWithoutAnIdentityLeavesWithoutASpare)
     EXPECT_TRUE(rmr.still_retired.empty()) << "the row was not dropped";
     EXPECT_TRUE(rmr.spared.empty()) << "a row dropped at zero was reported as a spare";
     EXPECT_TRUE(rmr.intent_deletes.empty());
-    EXPECT_EQ(rmr.uncanonical_tokens.count, 1u);
+    EXPECT_EQ(rmr.rejected_tokens.count, 1u);
 }
 
 namespace

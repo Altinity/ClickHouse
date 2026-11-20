@@ -26,7 +26,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasMigratePool.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasBoundedRun.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBoundedRun.h>
 #include <Common/ThreadPool.h>
 #include "cas_test_helpers.h"
 
@@ -583,6 +583,28 @@ FinalState finalStateOf(Fixture & f)
 
 }
 
+/// The summary line names every count of the report by its field name, in field order.
+TEST(CASMigratePool, SummaryLineNamesEachCountByItsReportField)
+{
+    MigratePoolReport report;
+    report.floor_read = 1;
+    report.probes_run = 2;
+    report.slots_read = 3;
+    report.condemned_rows = 4;
+    report.markers_read = 5;
+    report.bodies_listed = 6;
+    report.intents_confirmed = 7;
+    report.control_objects_written = 8;
+    report.slots_reread = 9;
+    report.floor_raised = true;
+    report.legacy_markers_deleted = 11;
+    report.legacy_markers_changed = 12;
+
+    EXPECT_EQ(formatMigratePoolSummary(report),
+              "floor_read=1 probes_run=2 slots_read=3 condemned_rows=4 markers_read=5 bodies_listed=6 intents_confirmed=7 "
+              "control_objects_written=8 slots_reread=9 floor_raised=1 legacy_markers_deleted=11 legacy_markers_changed=12");
+}
+
 TEST(CASMigratePool, RefusesASlotThatRenews)
 {
     Fixture f(3);
@@ -941,7 +963,7 @@ TEST(CASMigratePool, KeepMarkersStopsAtTheFloorAndARerunRemovesThem)
 
     const MigratePoolReport rerun = f.run();
     EXPECT_TRUE(rerun.completed);
-    EXPECT_EQ(rerun.markers_removed, 3u);
+    EXPECT_EQ(rerun.legacy_markers_deleted, 3u);
     EXPECT_TRUE(f.markers().empty());
 }
 
@@ -1032,7 +1054,7 @@ TEST(CASMigratePool, RerunOnAMigratedPoolLeavesForeignMetaKeys)
 
     const MigratePoolReport report = f.run();
     ASSERT_TRUE(report.completed);
-    EXPECT_EQ(report.markers_removed, 1u) << "positive control: the real marker was removed";
+    EXPECT_EQ(report.legacy_markers_deleted, 1u) << "positive control: the real marker was removed";
     EXPECT_EQ(f.markers(), (std::set<String>(foreign.begin(), foreign.end())));
 }
 
@@ -1428,7 +1450,7 @@ TEST(CASMigratePool, CrashInsideM9ThenRerunRemovesTheRest)
     f.backend->allowDeletes(refused);
     const MigratePoolReport report = f.run();
     ASSERT_TRUE(report.completed);
-    EXPECT_EQ(report.markers_removed, 1u);
+    EXPECT_EQ(report.legacy_markers_deleted, 1u);
     EXPECT_TRUE(f.markers().empty());
 }
 
@@ -1460,7 +1482,7 @@ TEST(CASMigratePool, RerunOfAMigratedPoolOnlyRemovesMarkers)
 
     const MigratePoolReport report = f.run();
     ASSERT_TRUE(report.completed);
-    EXPECT_EQ(report.markers_removed, 1u);
+    EXPECT_EQ(report.legacy_markers_deleted, 1u);
     EXPECT_TRUE(f.markers().empty());
     const auto journal = f.backend->journal();
     for (const JournalEntry & e : journal)
@@ -1621,7 +1643,7 @@ TEST(CASMigratePool, MarkersAcrossListPagesAreAllRead)
     const MigratePoolReport report = f.run(trust);
     ASSERT_TRUE(report.completed);
     EXPECT_EQ(report.markers_read, blobs);
-    EXPECT_EQ(report.markers_removed, blobs);
+    EXPECT_EQ(report.legacy_markers_deleted, blobs);
     EXPECT_EQ(f.intents(), (std::set<String>{f.layout.blobIntentKey(blobRefOf(last), f.identity(last))}));
     EXPECT_TRUE(f.markers().empty());
 }
@@ -1749,8 +1771,8 @@ TEST(CASRemoveLegacyMarkers, DeletesEveryMarkerKeyAndNothingElse)
     keys.insert(keys.end(), foreign.begin(), foreign.end());
 
     auto pool = f.open();
-    const LegacyMarkerRemoval removal = removeLegacyMarkers(*pool, keys);
-    EXPECT_EQ(removal.removed, 3u) << "an absent key is not counted";
+    const LegacyMarkerRemoval removal = removeLegacyMarkers(*pool, keys, *makeBoundedPool(1));
+    EXPECT_EQ(removal.deleted, 3u) << "an absent key is not counted";
     OperationForTest op(*f.backend);
     for (size_t i = 0; i < 4; ++i)
         EXPECT_FALSE((*op).head(keys[i], Retry::standard()).has_value()) << keys[i];
@@ -1770,7 +1792,7 @@ TEST(CASRemoveLegacyMarkers, RefusedDeleteThrowsWithTheCount)
     std::sort(keys.begin(), keys.end());
     f.backend->refuseDeletes(keys[1]);
     auto pool = f.open();
-    const String message = messageOf(DB::ErrorCodes::NOT_IMPLEMENTED, [&] { removeLegacyMarkers(*pool, keys); });
+    const String message = messageOf(DB::ErrorCodes::NOT_IMPLEMENTED, [&] { removeLegacyMarkers(*pool, keys, *makeBoundedPool(1)); });
     EXPECT_NE(message.find("1 legacy marker(s) deleted before"), String::npos) << message;
     OperationForTest op(*f.backend);
     EXPECT_FALSE((*op).head(keys[0], Retry::standard()).has_value());
@@ -1787,9 +1809,9 @@ TEST(CASRemoveLegacyMarkers, ChangedMarkerIsLeftAndCounted)
     const String changing = f.layout.blobMetaKey(blobRefOf(1));
     f.backend->afterHead(changing, [&] { condemnMeta(*f.backend, f.layout, numberedBlobHash(1), 7); });
     auto pool = f.open();
-    const LegacyMarkerRemoval removal = removeLegacyMarkers(*pool, {changing, f.layout.blobMetaKey(blobRefOf(2))});
+    const LegacyMarkerRemoval removal = removeLegacyMarkers(*pool, {changing, f.layout.blobMetaKey(blobRefOf(2))}, *makeBoundedPool(1));
     EXPECT_EQ(removal.changed, 1u);
-    EXPECT_EQ(removal.removed, 1u) << "positive control: the other marker was removed";
+    EXPECT_EQ(removal.deleted, 1u) << "positive control: the other marker was removed";
     EXPECT_EQ(f.markers(), (std::set<String>{changing}));
 }
 
@@ -1847,7 +1869,7 @@ TEST(CASMigratePool, DryRunOnAMigratedPoolWritesNothing)
     });
     EXPECT_TRUE(listed_blobs) << "positive control: the dry run listed blobs/";
     EXPECT_EQ(report.markers_read, 2u);
-    EXPECT_EQ(report.markers_removed, 0u);
+    EXPECT_EQ(report.legacy_markers_deleted, 0u);
     EXPECT_EQ(f.markers(), markers);
 }
 
@@ -2679,7 +2701,7 @@ TEST(CASBoundedRun, FailedSubmissionJoinsTheQueuedJobs)
         int code = 0;
         try
         {
-            runBounded(2, 4, SubmissionFailsWhileJobsAreQueued{first_started, release, finished});
+            runBounded(*makeBoundedPool(2), DB::ThreadName::UNKNOWN, 4, SubmissionFailsWhileJobsAreQueued{first_started, release, finished});
         }
         catch (const DB::Exception & e)
         {

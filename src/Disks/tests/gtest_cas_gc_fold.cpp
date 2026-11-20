@@ -334,7 +334,7 @@ TEST(CASGCFold, PreviewResolvesCarriedRef)
 
     // The preview resolves the carried ref (a gen-1 physical key) and computes in-degree 1 => blob 1 is
     // not a delete candidate. Resolution-by-ref is the property under test.
-    const auto preview = gc.previewDeletes();
+    const auto preview = gc.previewDeletes().deletes;
     for (const auto & e : preview)
         EXPECT_NE(e.ref, (DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(blob)})) << "still-referenced blob must not be surfaced (carried ref resolved to in-degree 1)";
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), blob), 1)
@@ -362,7 +362,8 @@ String corruptSealedRunChecksum(InMemoryBackend & backend, const Layout & layout
 }
 }
 
-TEST(CASGCFold, PreviewDeletesSealChecksumMismatchFailsClosed)
+/// The preview never lists a row of a run that fails its checksum, and names the run instead.
+TEST(CASGCFold, PreviewLeavesOutAShardWhoseRunFailsItsChecksum)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -376,11 +377,16 @@ TEST(CASGCFold, PreviewDeletesSealChecksumMismatchFailsClosed)
     Gc gc(store, kGc);
     gc.runRegularRound();   // seals gen-1 with one blob_target run
     const auto st = decodeGcState(readOf(*backend, store->layout().gcStateKey())->bytes);
-    ASSERT_FALSE(corruptSealedRunChecksum(*backend, store->layout(), st).empty());
+    const String run_key = corruptSealedRunChecksum(*backend, store->layout(), st);
+    ASSERT_FALSE(run_key.empty());
 
-    // A deletion preview must never be derived from an unverified run: fail closed.
-    Gc gc2(store, kGc);   // fresh read of the corrupted seal
-    EXPECT_THROW(gc2.previewDeletes(), DB::Exception);
+    Gc gc2(store, kGc);
+    Gc::DeletePreview preview;
+    ASSERT_NO_THROW(preview = gc2.previewDeletes());
+    EXPECT_TRUE(preview.deletes.empty());
+    ASSERT_EQ(preview.refused_shards.size(), 1u);
+    EXPECT_NE(preview.refused_shards.front().find(run_key), String::npos) << preview.refused_shards.front();
+    EXPECT_NE(preview.refused_shards.front().find("checksum"), String::npos) << preview.refused_shards.front();
 }
 
 TEST(CASGCFold, FsckSealChecksumMismatchCataloguedAndAuditCompletes)

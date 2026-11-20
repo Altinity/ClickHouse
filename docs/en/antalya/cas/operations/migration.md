@@ -258,7 +258,7 @@ where they are; nothing is copied. Only the conversion is offline; removing the 
 The command must run through `--query`, alone: every content-addressed disk of the process then skips its own pool
 open, which would refuse the pool, so no other command can run in the same query. It prints one line per step,
 progress lines with an estimate of the time left during the long steps, a summary line of counts
-(`floor_read=... markers_removed=...`), and `migration complete` at the end. It exits with `0` after
+(`floor_read=... legacy_markers_changed=...`), and `migration complete` at the end. It exits with `0` after
 `migration complete`, also when it printed the notice of [a member seen after the floor](#migrate-generation-4-late-member);
 every refusal exits non-zero.
 
@@ -365,7 +365,7 @@ Dashboards and scripts that read these names need a look.
 | `CASGCRetiredRedeleteFailed` | Renamed to `CASGCRetiredBodyDeleteFailed`: failed `HEAD` or `DELETE` of such a delete; the round fails |
 | `system.cas_gc_log` `entries_graduated`, `entries_redeleted`, `entries_redelete_failed` | Renamed to `entries_intent_confirmed`, `entries_bodies_deleted`, `entries_body_delete_failed`. The old names stay as `ALIAS` columns of the table, so queries keep working; `SELECT *` does not return them |
 | `SYSTEM CAS GC RUN` output, the same three columns | Renamed as above. The old names stay as extra columns after `pending_retired`, with the same values |
-| `phase_metrics` keys `graduated`, `redeleted`, `redelete_pending`, `graduation_due` | Renamed to `intent_confirmed` (on `fold_reduce` and `pending_deletes`), `bodies_deleted` (on `pending_deletes`), `body_deletes_decided` (on `fold_reduce`), `row_decision_due` (on `defer_decision`) |
+| `phase_metrics` keys `graduated`, `redeleted`, `redelete_pending`, `graduation_due` | Renamed to `intents_confirmed` (on `fold_reduce` and `pending_deletes`), `bodies_deleted` (on `pending_deletes`), `body_deletes_decided` (on `fold_reduce`), `row_decision_due` (on `defer_decision`) |
 | `CASGCCondemnMarkerUnconfirmedCarry`, `CASGCMetaWriteAnomaly`, `CASGCMetaOps`, `CASMetaPut`, `CASMetaCompareSwap`, `CASMetaDelete`, `CASMetaCreateClean`, `CASMetaAbsentRepublish`, `CASMetaResurrectClean` | Removed: nothing writes or reads a marker |
 | `CASGCRetiredSparedByReref` | Counts a `pending` or `standing` row dropped because a reference returned |
 | `meta_pool_wait` phase of `system.cas_gc_log` | Removed |
@@ -376,8 +376,8 @@ Dashboards and scripts that read these names need a look.
 | `nominations_waiting` in the `fold_reduce` phase metrics | New: nominated intents left for a later fold |
 | `read_ahead_blobs` in the `fold_reduce` phase metrics | New: blobs the fold holds to read the `HEAD`s of `pending` and `standing` rows ahead |
 
-A server logs a warning at start when `cas_gc_meta_pool_size` or `cas_gc_round_graduation_budget` is set to a value
-other than its default. The value of `cas_gc_round_graduation_budget` applies to `cas_gc_round_intent_create_budget`
+A server logs a warning at start when `cas_gc_meta_pool_size` or `cas_gc_round_graduation_budget` is set, whatever
+the value. The value of `cas_gc_round_graduation_budget` applies to `cas_gc_round_intent_create_budget`
 when that is not set. The server also logs one line with the pool's reader generation and token dialect at every open
 of a pool (see [protocol version and retired settings](/antalya/cas/configuration#protocol-version)).
 

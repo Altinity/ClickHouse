@@ -420,9 +420,8 @@ String renderCondemnedRow(const CondemnedRow & r)
 
 /// Renders one blob-target source-edge run segment (`Layout::blobTargetRunKey`): every row (edge,
 /// zero-marker, or condemned sentinel), plus a summary. `parsed` carries the run's own coordinates
-/// recovered from the key; `bytes` is decoded with the same typed `SourceEdgeRunView` reader the fold /
-/// `zeroInDegree` / `fsck` consumers use (the memory overload, since `caInspectToJson` is a pure
-/// function of (key, bytes) with no backend access here). A malformed row propagates the reader's
+/// recovered from the key; `bytes` is decoded with the typed `SourceEdgeRunView` reader (the memory overload, since
+/// `caInspectToJson` is a pure function of (key, bytes) with no backend access here). A malformed row propagates the reader's
 /// `CORRUPTED_DATA` -- rows are never silently skipped.
 String renderBlobTargetRun(const ParsedBlobTargetRunKey & parsed, std::string_view bytes)
 {

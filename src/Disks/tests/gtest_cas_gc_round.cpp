@@ -679,7 +679,7 @@ TEST(CASGCRound, PreviewReportsCondemnedRowsAndIsWriteFree)
 
     Gc gc(store, kGc);
     runRegularRoundReclaiming(gc);                 /// round 1: folds the +1; blob referenced
-    EXPECT_TRUE(gc.previewDeletes().empty()) << "a live-referenced blob is never previewed for deletion";
+    EXPECT_TRUE(gc.previewDeletes().deletes.empty()) << "a live-referenced blob is never previewed for deletion";
 
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
     runRegularRoundReclaiming(gc);                 /// condemning round: -1 => in-degree 0 => pending row, intent confirmed
@@ -688,7 +688,7 @@ TEST(CASGCRound, PreviewReportsCondemnedRowsAndIsWriteFree)
     CasRequests requests = openRequestsForTest(backend);
     CasOperation op = requests.admit();
     const auto before = snapshotKeyTokens(op);
-    const std::vector<Gc::PreviewEntry> awaiting = gc.previewDeletes();
+    const std::vector<Gc::PreviewEntry> awaiting = gc.previewDeletes().deletes;
     const auto after = snapshotKeyTokens(op);
     EXPECT_EQ(before, after) << "previewDeletes must perform NO writes";
 
@@ -701,14 +701,14 @@ TEST(CASGCRound, PreviewReportsCondemnedRowsAndIsWriteFree)
 
     runRegularRoundReclaiming(gc);                 /// body delete round: the row is standing, the blob gone
     EXPECT_FALSE(blobExists(*backend, store->layout(), blob));
-    const std::vector<Gc::PreviewEntry> standing = gc.previewDeletes();
+    const std::vector<Gc::PreviewEntry> standing = gc.previewDeletes().deletes;
     ASSERT_EQ(standing.size(), 1u);
     EXPECT_EQ(standing[0].ref, (DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(blob)}));
     EXPECT_EQ(standing[0].reason, "standing");
     EXPECT_FALSE(standing[0].token.value.empty());
 
     runRegularRoundReclaiming(gc);                 /// intent removal round: the row leaves
-    EXPECT_TRUE(gc.previewDeletes().empty()) << "nothing to preview once the intent is removed";
+    EXPECT_TRUE(gc.previewDeletes().deletes.empty()) << "nothing to preview once the intent is removed";
 }
 
 /// A fully idle fold pure-carries every shard's authoritative rows verbatim. The parent is first made
@@ -821,7 +821,7 @@ TEST(CASGCRound, NonAdoptedAttemptSealIgnored)
     ASSERT_GT(st.snap_generation, 0u);
 
     /// Control preview BEFORE the decoy (previewDeletes is write-free, so the result is deterministic).
-    const auto control = gc.previewDeletes();
+    const auto control = gc.previewDeletes().deletes;
 
     /// Plant a decoy fold seal under a DIFFERENT attempt at the SAME generation (a deposed leader's
     /// unadopted artifact). It must be invisible to the adopted-attempt readers.
@@ -830,7 +830,7 @@ TEST(CASGCRound, NonAdoptedAttemptSealIgnored)
 
     /// No reader resolves the non-adopted attempt: no throw, and the preview is unchanged by the decoy.
     std::vector<Gc::PreviewEntry> after;
-    EXPECT_NO_THROW(after = gc.previewDeletes());
+    EXPECT_NO_THROW(after = gc.previewDeletes().deletes);
     EXPECT_EQ(after.size(), control.size())
         << "a non-adopted attempt's fold seal must not influence previewDeletes";
 

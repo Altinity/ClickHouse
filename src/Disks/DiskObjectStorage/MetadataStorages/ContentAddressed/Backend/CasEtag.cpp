@@ -121,7 +121,7 @@ std::optional<String> opaqueTagFromHex(Dialect dialect, std::string_view tag_hex
     return tag;
 }
 
-std::optional<PersistedEtag> persistedTokenOf(const CanonicalIdentity & identity)
+std::optional<PersistedEtag> PersistedEtag::fromIdentity(const CanonicalIdentity & identity)
 {
     const std::optional<String> tag = opaqueTagFromHex(identity.dialect, identity.tag_hex);
     if (!tag)
@@ -159,6 +159,14 @@ bool sameVersion(const Etag & read, const Etag & written)
         return true;
     const std::optional<CanonicalIdentity> identity = read.canonical();
     return identity && identity == written.canonical();
+}
+
+bool sameVersion(const PersistedEtag & recorded, const Etag & live)
+{
+    if (recorded.matches(live))
+        return true;
+    const std::optional<CanonicalIdentity> identity = recorded.canonical();
+    return identity && identity == live.canonical();
 }
 
 bool identicalToken(const Etag & a, const Etag & b)

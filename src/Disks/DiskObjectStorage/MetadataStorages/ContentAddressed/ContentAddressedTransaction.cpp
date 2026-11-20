@@ -273,9 +273,9 @@ void ContentAddressedTransaction::markVacatedInBase(
 {
     if (!st.base_manifest_ref)
         return;
-    const auto view = metadata_storage.partAccess()->getView(r.refKey(), Cas::Freshness::CachedForLoad);
-    /// A view other than the base cannot tell what the base holds; the mark then sends the publish to its ownership check.
-    if (!view || !(view->manifestId().ref == *st.base_manifest_ref) || view->hasFile(file))
+    /// The base manifest is immutable, so it answers exactly whatever another writer did to the part since.
+    const auto base = metadata_storage.store()->readManifestShared(Cas::ManifestId{r.ns, *st.base_manifest_ref});
+    if (Cas::findEntry(base->entries, file))
         st.content_removed.insert(file);
 }
 
@@ -1777,8 +1777,8 @@ void ContentAddressedTransaction::moveFile(const std::string & path_from, const 
     {
         auto entry = *it;
         auto source = copySourceOf(src_st, src->file);
-        eraseEntry(src_st, src->file);
         markVacatedInBase(*src, src_st, src->file);
+        eraseEntry(src_st, src->file);
         entry.path = dst->file;
         if (&src_st != &dst_st && entry.placement == Cas::EntryPlacement::Blob)
         {
@@ -1862,10 +1862,10 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool if_e
         /// cleanupPendingTempFiles at commit end, and the orphaned record is filtered out of the
         /// publish upload by the staged-tree-hash check in publishStaging. We do NOT purge it
         /// eagerly because the same hash may still be referenced by another staged entry.
-        eraseEntry(st, r->file);
         if (staged_here)
             markVacatedInBase(*r, st, r->file);
-        else
+        eraseEntry(st, r->file);
+        if (!staged_here)
         {
             /// One fresh resolve per (transaction, ref), not per file: the MergeTree fast-removal path
             /// unlinks every file of the part through THIS transaction right before removeDirectory.

@@ -3,6 +3,7 @@
 #include <Core/BaseSettings.h>
 #include <Core/BaseSettingsFwdMacrosImpl.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
@@ -65,9 +66,9 @@ constexpr std::string_view CAS_KEY_PREFIX = "cas_";
     DECLARE(UInt64, gc_snapshot_generations_to_keep, 3, "GC snapshot generations retained", 0) \
     DECLARE(UInt64, gc_shards, 1, "Blob-hash-prefix reducer shards (>= 1); creation-time only", 0) \
     DECLARE(UInt64, manifest_sweep_list_budget_keys, 1000, "Orphan-manifest sweep LIST budget per round", 0) \
-    DECLARE(UInt64, intent_sweep_list_budget_keys, 999, "Keys of blob-intents/ one GC round lists to find deletion intents with no row (>= 1). 999 fits one LIST response; a page of 1000 costs two", 0) \
+    DECLARE(UInt64, intent_sweep_list_budget_keys, 999, "Keys of blob-intents/ one GC round lists to find deletion intents with no row, 1 to 999: one LIST response", 0) \
     DECLARE(UInt64, manifest_sweep_delete_budget_keys, 100, "Orphan-manifest sweep candidate budget per round: keys that pass every retain check, whose bodies are read and decided", 0) \
-    DECLARE(UInt64, gc_round_graduation_budget, 0, "Retired; when gc_round_intent_create_budget is not set, its value applies to that setting", 0) \
+    DECLARE(UInt64, gc_round_graduation_budget, 0, "Retired; when gc_round_intent_create_budget is not set, its value applies to that setting", SettingsTierType::OBSOLETE) \
     DECLARE(UInt64, gc_round_intent_create_budget, 0, "Maximum deletion-intent creates per GC round, summed over every GC shard; a blob over the cap stays a candidate and is created in a later round (0 = unbounded)", 0) \
     DECLARE(UInt64, gc_round_redelete_budget, 0, "Maximum pending rows one GC round settles, summed over every GC shard: an untouched pending row whose body it reads to decide its delete, and a touched pending row that moves to standing; a row over the cap waits for a later round (0 = unbounded)", 0) \
     DECLARE(UInt64, gc_round_sweep_namespace_budget, 20, "Orphan-manifest sweep: distinct namespaces per page whose protection view may be built (0 = unbounded)", 0) \
@@ -85,7 +86,7 @@ constexpr std::string_view CAS_KEY_PREFIX = "cas_";
     DECLARE(UInt64, part_folder_cache_max_entry_bytes, 16ULL << 20, "Oversized part-folder views bypass retention above this size", 0) \
     DECLARE(Bool,   allow_packed_parts, false, "Allow new MergeTree parts on this disk to use the Packed format", 0) \
     DECLARE(UInt64, manifest_decode_cache_bytes, 128ULL << 20, "Manifest DECODE cache byte budget (0 disables)", 0) \
-    DECLARE(UInt64, gc_meta_pool_size, 16, "Ignored: GC writes no per-blob metadata objects", 0) \
+    DECLARE(UInt64, gc_meta_pool_size, 16, "Ignored: GC writes no per-blob metadata objects", SettingsTierType::OBSOLETE) \
     DECLARE(UInt64, gc_io_concurrency, 16, "Maximum number of threads in the GC I/O pool. Used for fold and rebuild read-ahead, deletion-intent creates, orphan-manifest sweep planning reads, pending_deletes HEAD plus conditional DELETE, and namespace janitor batch deletes. Other GC requests run on the round thread. 1 disables parallel GC I/O", 0) \
     DECLARE(UInt64, gc_bulk_delete_chunk_keys, 1000, "Most keys per batch delete request in GC's write-once families (owner-removed manifest bodies, covered ref logs and snapshots, the namespace janitor's dead ref logs and snapshots), capped by the storage's batch-delete limit; 1 to 1000", 0) \
     DECLARE(UInt64, attempt_timeout_ms, 5000, "Budget for one HTTP attempt of a writable Native mount's control-plane requests (read, head, list, remove, conditional write), at least 1. With the connect cap it forms the attempt envelope the lease arithmetic reserves", 0) \
@@ -230,14 +231,13 @@ void ContentAddressedSettings::loadFromConfig(
             "removed.", config_prefix, fmt::join(legacy_names, ", "));
 
     /// Retired settings, declared so that an existing configuration still loads.
-    const ContentAddressedSettings defaults;
-    if (candidate[ContentAddressedSetting::gc_meta_pool_size].value != defaults[ContentAddressedSetting::gc_meta_pool_size].value)
+    if (candidate[ContentAddressedSetting::gc_meta_pool_size].changed)
         LOG_WARNING(getLogger("ContentAddressedSettings"),
             "content_addressed disk `{}`: `cas_gc_meta_pool_size` is ignored: GC writes no per-blob metadata objects",
             config_prefix);
     /// The retired cap carries over, so an upgrade does not lift an operator's bound on a round's intent creates.
     const UInt64 retired_create_budget = candidate[ContentAddressedSetting::gc_round_graduation_budget].value;
-    if (retired_create_budget != defaults[ContentAddressedSetting::gc_round_graduation_budget].value)
+    if (candidate[ContentAddressedSetting::gc_round_graduation_budget].changed)
     {
         if (candidate[ContentAddressedSetting::gc_round_intent_create_budget].changed)
             LOG_WARNING(getLogger("ContentAddressedSettings"),
@@ -273,10 +273,12 @@ void ContentAddressedSettings::validate()
             "content_addressed disk: gc_bulk_delete_chunk_keys must be between 1 and 1000 (got {})",
             settings[ContentAddressedSetting::gc_bulk_delete_chunk_keys].value);
 
-    if (settings[ContentAddressedSetting::intent_sweep_list_budget_keys] == 0)
+    /// One store response per round: a larger page costs a second `LIST` for one key.
+    if (settings[ContentAddressedSetting::intent_sweep_list_budget_keys] == 0
+        || settings[ContentAddressedSetting::intent_sweep_list_budget_keys] > Cas::CasOperation::kCasListPageKeys)
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
-            "content_addressed disk: cas_intent_sweep_list_budget_keys must be >= 1 (got {})",
-            settings[ContentAddressedSetting::intent_sweep_list_budget_keys].value);
+            "content_addressed disk: cas_intent_sweep_list_budget_keys must be between 1 and {} (got {})",
+            Cas::CasOperation::kCasListPageKeys, settings[ContentAddressedSetting::intent_sweep_list_budget_keys].value);
 
     if (settings[ContentAddressedSetting::attempt_timeout_ms] == 0)
         throw Exception(ErrorCodes::BAD_ARGUMENTS,

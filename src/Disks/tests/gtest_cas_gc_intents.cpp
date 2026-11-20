@@ -1496,7 +1496,7 @@ TEST(CASGcIntents, PreviewNamesEachRowState)
     ASSERT_TRUE(pool.row(3) && !pool.row(3)->delete_pending);
 
     std::map<String, String> reasons;
-    for (const Gc::PreviewEntry & e : pool.gc->previewDeletes())
+    for (const Gc::PreviewEntry & e : pool.gc->previewDeletes().deletes)
         if (e.reason != "unreachable")
             reasons[e.key] = e.reason;
     EXPECT_EQ(reasons[pool.bodyKey(1)], "standing");
@@ -2687,7 +2687,7 @@ TEST(CASGcIntents, FoldReduceRowCountsTheRowsOnFile)
     ASSERT_EQ(folds.size(), 1u);
     ASSERT_EQ(report.intent_confirmed, 1u) << "positive control: the budget of one create made one row pending";
     EXPECT_EQ(metricOr(folds.front().reduce, "condemned_rows"), 3u);
-    EXPECT_EQ(metricOr(folds.front().reduce, "delete_pending_rows"), 1u);
+    EXPECT_EQ(metricOr(folds.front().reduce, "pending_rows"), 1u);
 }
 
 TEST_P(CASGcIntentsSharded, IdleRoundsWithAnIntentOverAReferencedBlobWriteNoRun)
@@ -2903,7 +2903,8 @@ TEST(CASGcIntents, AStuckCreateDoesNotStarveLaterCandidatesUnderABudget)
         ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(stuck, "not an intent record", Retry::standard())));
     }
     const uint64_t unconfirmed_before = counter(ProfileEvents::CASGCIntentUnconfirmedCarry);
-    ScopedLogCapture capture("CasGc", "error");
+    /// A later round retries the create, so the summary is a warning.
+    ScopedLogCapture capture("CasGc", "warning");
 
     /// A pending row goes on to `standing` in the next round, so each later key is checked when it got there.
     std::set<uint64_t> confirmed;
@@ -4450,7 +4451,7 @@ TEST(CASGcIntents, PausedLeaderWhoseLogWasCleanedDeletesNoIntent)
     EXPECT_EQ(report.intent_malformed + report.intent_unread + report.pending_without_intent
                   + report.pending_intent_absent + report.pending_token_rejected + report.stale_edge,
               0u) << formatFsckSummary(report);
-    EXPECT_EQ(report.intent_listed, 1u) << formatFsckSummary(report);
+    EXPECT_EQ(report.intents_listed, 1u) << formatFsckSummary(report);
 }
 
 /// The same pause at the default retention: B's retention removes the parent runs A's reduce reads. A newer leader
@@ -4814,6 +4815,61 @@ TEST(CASGcIntents, SealThatUnderstatesTheSecondShardDeletesNothingOfTheFirst)
         EXPECT_TRUE(pool.bodyMeta(honest).has_value());
         EXPECT_TRUE(pool.bodyMeta(hidden).has_value());
     }
+}
+
+/// The read-only views agree with the round about a seal that understates a shard: the preview leaves that shard's
+/// rows out and names it, and fsck counts its run as corrupt with the reason.
+TEST(CASGcIntents, PreviewAndFsckRefuseTheShardTheRoundRefuses)
+{
+    constexpr uint64_t shards = 2;
+    const uint64_t honest = blobsInShard(0, shards, 1).front();
+    const uint64_t hidden = blobsInShard(1, shards, 1).front();
+    IntentPool<PausedLeaderBackend> pool(std::make_shared<PausedLeaderBackend>(), {.gc_shards = shards});
+    ASSERT_NO_FATAL_FAILURE(pool.makePending({honest, hidden}));
+    const std::optional<RetiredEntry> row = pool.row(hidden);
+    ASSERT_TRUE(row && row->delete_pending);
+    restateAdoptedSummary(*pool.backend, pool.layout(), 1,
+        CondemnedSummary{.condemned_total = 1, .pending_total = 0, .oldest_nonpending_condemn_round = row->condemn_round});
+
+    const Gc::DeletePreview preview = pool.gc->previewDeletes();
+    std::set<String> keys;
+    for (const Gc::PreviewEntry & e : preview.deletes)
+        keys.insert(e.key);
+    EXPECT_TRUE(keys.contains(pool.bodyKey(honest))) << "positive control: the honest shard is previewed";
+    EXPECT_FALSE(keys.contains(pool.bodyKey(hidden)));
+    ASSERT_EQ(preview.refused_shards.size(), 1u);
+    EXPECT_NE(preview.refused_shards.front().find("CAS GC shard 1 ("), String::npos) << preview.refused_shards.front();
+
+    const FsckReport report = runFsck(*pool.store, /*detail=*/true);
+    EXPECT_EQ(report.corrupted_runs, 1u) << formatFsckSummary(report);
+    size_t corrupt_rows = 0;
+    for (const FsckObject & o : report.objects)
+    {
+        if (o.cls != FsckClass::CorruptedRun)
+            continue;
+        ++corrupt_rows;
+        ASSERT_EQ(o.reachable_from.size(), 1u);
+        EXPECT_NE(o.reachable_from.front().find("CAS GC shard 1 ("), String::npos) << o.reachable_from.front();
+    }
+    EXPECT_EQ(corrupt_rows, 1u);
+}
+
+/// The preview reads each adopted run once.
+TEST(CASGcIntents, PreviewReadsEachRunOnce)
+{
+    constexpr uint64_t shards = 2;
+    IntentPool<PausedLeaderBackend> pool(std::make_shared<PausedLeaderBackend>(), {.gc_shards = shards});
+    ASSERT_NO_FATAL_FAILURE(pool.makePending({blobsInShard(0, shards, 1).front(), blobsInShard(1, shards, 1).front()}));
+    pool.backend->clearJournal();
+    const Gc::DeletePreview preview = pool.gc->previewDeletes();
+    ASSERT_EQ(preview.deletes.size(), 2u) << "positive control: both shards' rows are previewed";
+    std::map<String, size_t> run_reads;
+    for (const JournalEntry & entry : pool.backend->journal())
+        if ((entry.verb == JournalVerb::Stream || entry.verb == JournalVerb::Read) && entry.keys.front().find("/blob_target/") != String::npos)
+            ++run_reads[entry.keys.front()];
+    ASSERT_EQ(run_reads.size(), shards);
+    for (const auto & [key, reads] : run_reads)
+        EXPECT_EQ(reads, 1u) << key;
 }
 
 /// A refusal of the validation read fails the round, as a refusal of any other read of the fold does.

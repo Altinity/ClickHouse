@@ -150,7 +150,7 @@ void runCapabilityProbe(CasOperation & op, const String & probe_prefix)
                 throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
                     "CasProbe: replace with the correct incarnation was rejected — backend does not accept a valid overwrite");
             Etag next = std::get<Committed>(r).etag;
-            if (identicalToken(next, t1))
+            if (sameVersion(next, t1))
                 throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
                     "CasProbe: replace succeeded but did not mint a new incarnation — an incarnation must "
                     "change on every write");

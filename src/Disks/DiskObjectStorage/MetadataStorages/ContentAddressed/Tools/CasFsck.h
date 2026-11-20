@@ -3,6 +3,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasToolDeadline.h>
+#include <Common/ThreadPool_fwd.h>
 
 #include <array>
 #include <chrono>
@@ -43,10 +45,8 @@ enum class FsckClass : uint8_t
                    /// in-degree can never reach zero and the incremental GC can never reclaim it. Only a
                    /// full rebuild of the in-degree state can. ERROR — never an `AwaitingGc` "expected"
                    /// backlog, which is exactly the label that used to hide it.
-    CorruptedRun,  /// a GC source-edge run's whole-file seal checksum (`RunRef::checksum`) disagrees with
-                   /// the stored bytes — cataloged so the read-only audit enumerates every finding in one
-                   /// pass; deletion-deriving consumers (`fold`, `zeroInDegree`, `previewDeletes`) still
-                   /// fail closed on the same mismatch. ERROR
+    CorruptedRun,  /// a GC source-edge run, or the fold seal naming it, that a GC round refuses as corrupt
+                   /// bookkeeping; the note says why. ERROR
     /// The two verdicts of the ref-stream walk. They are about a NAMESPACE, not an object; the row's `key`
     /// identifies the exact log where the walk stopped or the checkpoint-named snapshot base whose
     /// required triple could not be validated.
@@ -132,7 +132,7 @@ struct FsckReport
     /// Deletion intents under `blob-intents/` (see the `Intent*` classes of `FsckClass`). `intent_malformed`
     /// and `intent_unread` are hard findings; the others are informational. A scan with a namespace scope
     /// lists no intents and leaves them all at zero.
-    uint64_t intent_listed = 0;      /// intents whose key parses (a plain scan counts them and reads none)
+    uint64_t intents_listed = 0;      /// intents whose key parses (a plain scan counts them and reads none)
     uint64_t intent_current = 0;     /// the next three only in a verifying scan
     uint64_t intent_replaced = 0;
     uint64_t intent_body_gone = 0;
@@ -308,18 +308,16 @@ inline bool FsckReport::clean() const
 /// the intent of each `pending` row. `verify_intents` adds, per intent, a `GET` of its bytes and a
 /// `HEAD` of its body (two requests per intent) for the `Intent*` verdicts. `fix_legacy_markers` deletes each legacy
 /// marker found with `removeLegacyMarkers`, through the scan's own read-only open (no mount, no lease), and needs a
-/// scan without `namespace_prefix`. It is the scan's only repair: nothing deletes an intent or a body.
-/// `deadline`, if set, bounds the WHOLE scan: it is checked between list pages and reachability
-/// refs, throwing `TIMEOUT_EXCEEDED` if exceeded (a slow-but-progressing scan surfaces a clear
-/// error instead of an opaque hang) — unless `partial_on_deadline` is set, in which case the
-/// accumulated lower-bound counts are returned instead, flagged via `FsckReport::partial`. A single
-/// LIST page stuck in S3-client retries is bounded separately by the disk's S3 retry/timeout
-/// settings, not here. `namespace_prefix`, if non-empty, scopes the scan to namespaces with this
+/// scan without `namespace_prefix`, `fix_concurrency` markers at a time. It is the scan's only repair: nothing deletes an
+/// intent or a body.
+/// `deadline` bounds the WHOLE scan, each request's retries included, and throws `TIMEOUT_EXCEEDED` when it passes —
+/// unless `partial_on_deadline` is set, in which case the accumulated lower-bound counts are returned instead,
+/// flagged via `FsckReport::partial`. `namespace_prefix`, if non-empty, scopes the scan to namespaces with this
 /// prefix and skips the pool-wide unreachable classification (dangling-only mode).
 FsckReport runFsck(Pool & store, bool detail, FsckProgress on_progress = {},
-                   std::optional<std::chrono::steady_clock::time_point> deadline = {},
+                   const ToolDeadline & deadline = {},
                    bool partial_on_deadline = false, const String & namespace_prefix = {},
-                   bool fix_legacy_markers = false, bool verify_intents = false);
+                   bool fix_legacy_markers = false, bool verify_intents = false, size_t fix_concurrency = 1);
 
 /// Render the single machine-parseable summary line (no trailing newline). This is the ONLY view of a
 /// report most consumers ever get -- the soak harness parses it, CI greps it, an operator reads it -- so
@@ -348,18 +346,18 @@ std::vector<FsckField> fsckSqlColumns();
 
 struct LegacyMarkerRemoval
 {
-    uint64_t removed = 0;
+    uint64_t deleted = 0;
     uint64_t changed = 0;   /// replaced between its `HEAD` and the delete, and left
 };
 
 /// The one removal of legacy markers, for `cas-migrate-pool` and `cas-fsck --fix legacy-markers`. Of `keys` it deletes
 /// only those `Layout::parseLegacyMarkerKey` accepts, each by a `HEAD` and a delete conditional on the token that `HEAD`
-/// saw, at most `concurrency` at a time; a marker replaced in between is left and counted. No server of generation 4
+/// saw, as many at a time as `io_pool` has threads; a marker replaced in between is left and counted. No server of generation 4
 /// reads a marker, so servers may run meanwhile. A refused or unanswered delete, or a `deadline` that expired before a
 /// `HEAD` or a delete, throws with the count deleted so far; a rerun continues. `on_progress` gets the running count
 /// after each batch and before a throw.
-LegacyMarkerRemoval removeLegacyMarkers(Pool & pool, const std::vector<String> & keys, size_t concurrency = 1,
-                                        const std::optional<std::chrono::steady_clock::time_point> & deadline = {},
+LegacyMarkerRemoval removeLegacyMarkers(Pool & pool, const std::vector<String> & keys, ThreadPool & io_pool,
+                                        const ToolDeadline & deadline = {},
                                         const std::function<void(uint64_t)> & on_progress = {});
 
 }

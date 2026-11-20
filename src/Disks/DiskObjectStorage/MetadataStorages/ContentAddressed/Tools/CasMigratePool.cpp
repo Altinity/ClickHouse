@@ -14,7 +14,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasBoundedRun.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBoundedRun.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
 #include <Common/Exception.h>
 #include <Common/thread_local_rng.h>
@@ -146,6 +146,7 @@ public:
         , layout(pool.layout())
         , op(pool.openRequests().admit())
         , concurrency(std::max<size_t>(1, options.concurrency ? options.concurrency : pool.poolConfig().gc_io_concurrency))
+        , io_pool(makeBoundedPool(concurrency))
         , grace_ms(options.grace_ms.value_or(std::max(kDefaultGraceMs, pool.poolConfig().cas_request_budget.request_window_ms)))
     {
     }
@@ -324,6 +325,7 @@ private:
     const Layout & layout;
     CasOperation op;
     const size_t concurrency;
+    const std::unique_ptr<ThreadPool> io_pool;
     const uint64_t grace_ms;
     MigratePoolReport report;
 
@@ -661,7 +663,7 @@ private:
             const String seal_key = layout.foldSealKey(state->snap_generation, state->snap_attempt);
             const std::optional<Object> seal_bytes = op.read(seal_key, Retry::standard());
             if (!seal_bytes)
-                throw Exception(ErrorCodes::INVALID_STATE, "gc/state names the fold seal `{}`, which is absent", seal_key);
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "gc/state names the fold seal `{}`, which is absent", seal_key);
             CasFoldSeal seal;
             try
             {
@@ -735,7 +737,7 @@ private:
         const auto flush = [&]
         {
             std::vector<std::optional<bool>> clean(batch.size());
-            runBounded(concurrency, batch.size(), [&](size_t i)
+            runBounded(*io_pool, ThreadName::UNKNOWN, batch.size(), [&](size_t i)
             {
                 CasOperation job = jobOperation();
                 if (const std::optional<Object> got = job.read(batch[i].first, Retry::standard()))
@@ -806,7 +808,7 @@ private:
         for (size_t begin = 0; begin < blobs.size(); begin += kBatchKeys)
         {
             const size_t n = std::min(kBatchKeys, blobs.size() - begin);
-            runBounded(concurrency, n, [&](size_t i)
+            runBounded(*io_pool, ThreadName::UNKNOWN, n, [&](size_t i)
             {
                 CasOperation job = jobOperation();
                 const BlobRef & ref = blobs[begin + i];
@@ -865,7 +867,7 @@ private:
         std::vector<std::pair<BlobRef, CanonicalIdentity>> own;
         const auto create_own = [&]
         {
-            runBounded(concurrency, own.size(), [&](size_t i)
+            runBounded(*io_pool, ThreadName::UNKNOWN, own.size(), [&](size_t i)
             {
                 CasOperation job = jobOperation();
                 createIntent(job, own[i].first, own[i].second, confirmed);
@@ -929,14 +931,14 @@ private:
         {
             try
             {
-                const LegacyMarkerRemoval removal = removeLegacyMarkers(pool, page, concurrency);
-                report.markers_removed += removal.removed;
-                report.markers_changed += removal.changed;
+                const LegacyMarkerRemoval removal = removeLegacyMarkers(pool, page, *io_pool);
+                report.legacy_markers_deleted += removal.deleted;
+                report.legacy_markers_changed += removal.changed;
             }
             catch (Exception & e)
             {
                 e.addMessage("M9: {} marker(s) removed in earlier pages; the pool is migrated, and a rerun or `cas-fsck --fix "
-                    "legacy-markers` removes the rest", report.markers_removed);
+                    "legacy-markers` removes the rest", report.legacy_markers_deleted);
                 throw;
             }
             meter.add(page.size());
@@ -952,7 +954,7 @@ private:
         }, Retry::standard());
         flush();
         say(fmt::format("M9: {} marker(s) removed, {} left because they changed during the removal; a rerun or `cas-fsck "
-            "--fix legacy-markers` removes those", report.markers_removed, report.markers_changed));
+            "--fix legacy-markers` removes those", report.legacy_markers_deleted, report.legacy_markers_changed));
     }
 
     MigratePoolReport countMarkersOfAMigratedPool()
@@ -979,6 +981,16 @@ uint64_t migrateGraceMs(uint64_t seconds)
 MigratePoolReport migratePool(Pool & pool, const MigratePoolOptions & options, const std::function<void(std::string_view)> & progress)
 {
     return Migration(pool, options, progress).run();
+}
+
+String formatMigratePoolSummary(const MigratePoolReport & report)
+{
+    return fmt::format(
+        "floor_read={} probes_run={} slots_read={} condemned_rows={} markers_read={} bodies_listed={} intents_confirmed={} "
+        "control_objects_written={} slots_reread={} floor_raised={} legacy_markers_deleted={} legacy_markers_changed={}",
+        report.floor_read, report.probes_run, report.slots_read, report.condemned_rows, report.markers_read, report.bodies_listed,
+        report.intents_confirmed, report.control_objects_written, report.slots_reread, report.floor_raised ? 1 : 0,
+        report.legacy_markers_deleted, report.legacy_markers_changed);
 }
 
 }

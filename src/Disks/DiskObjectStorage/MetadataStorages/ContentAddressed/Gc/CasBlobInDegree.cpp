@@ -185,12 +185,43 @@ private:
 }
 
 AdoptedRunReader::AdoptedRunReader(CasOperation & op_, const std::vector<RunRef> & runs_, uint64_t shard_,
-                                   AdoptedRunContext context_)
-    : op(op_), runs(runs_), shard(shard_), context(context_)
+                                   AdoptedRunContext context_, OnRefusal on_refusal_, RunPolicy run_policy_)
+    : op(op_), runs(runs_), shard(shard_), context(std::move(context_)), on_refusal(on_refusal_), run_policy(std::move(run_policy_))
 {
 }
 
+template <typename Read>
+bool AdoptedRunReader::reportingRefusal(Read && read)
+{
+    if (refused)
+        return false;
+    if (on_refusal == OnRefusal::Throw)
+        return read();
+    try
+    {
+        return read();
+    }
+    catch (const Exception & e)
+    {
+        if (e.code() != ErrorCodes::CORRUPTED_DATA)
+            throw;
+        refused = Refusal{.run_key = next_run > 0 ? currentRun().key : String{}, .message = e.message()};
+        view.reset();
+        return false;
+    }
+}
+
 bool AdoptedRunReader::nextInRun(SourceEdgeRecord & rec)
+{
+    return reportingRefusal([&] { return nextInRunChecked(rec); });
+}
+
+bool AdoptedRunReader::openNextRun()
+{
+    return reportingRefusal([&] { return openNextRunChecked(); });
+}
+
+bool AdoptedRunReader::nextInRunChecked(SourceEdgeRecord & rec)
 {
     if (!view || drained)
         return false;
@@ -214,7 +245,7 @@ bool AdoptedRunReader::nextInRun(SourceEdgeRecord & rec)
     return true;
 }
 
-bool AdoptedRunReader::openNextRun()
+bool AdoptedRunReader::openNextRunChecked()
 {
     if (view)
     {
@@ -242,7 +273,8 @@ bool AdoptedRunReader::openNextRun()
     }
     drained = false;
     /// Typed open validates the NDJSON header before any row is consumed.
-    view = openSourceEdgeRun(op, runs[next_run++].key);
+    const String & key = runs[next_run++].key;
+    view = openSourceEdgeRun(op, key, run_policy ? run_policy() : Retry::standard());
     return true;
 }
 
@@ -575,9 +607,9 @@ RunRef foldDeltasIntoGeneration(CasOperation & op, const Layout & layout, const 
         return row;
     };
 
-    auto noteUncanonical = [&]
+    auto noteTokenRejected = [&]
     {
-        rmr.uncanonical_tokens.note([&] { return layout.blobKey(cur_blob); });
+        rmr.rejected_tokens.note([&] { return layout.blobKey(cur_blob); });
         ProfileEvents::increment(ProfileEvents::CASGCIntentTokenRejected);
     };
 
@@ -709,8 +741,8 @@ RunRef foldDeltasIntoGeneration(CasOperation & op, const Layout & layout, const 
             }
         }
 
-        if ((input.head && input.head->seen() == HeadSeen::Uncanonical) || (row && !row->token.canonical()))
-            noteUncanonical();
+        if ((input.head && input.head->seen() == HeadSeen::TokenRejected) || (row && !row->token.canonical()))
+            noteTokenRejected();
 
         const IntentDecision decision = decideIntentStep(input);
         const bool spends_redelete_slot = decision.step == IntentStep::DeleteBody || decision.step == IntentStep::Standing;
@@ -767,7 +799,7 @@ RunRef foldDeltasIntoGeneration(CasOperation & op, const Layout & layout, const 
     /// Adopts an intent that has no row. It sends only the `HEAD`, which follows the listing and the cut.
     auto adoptOrphan = [&](const Layout::ParsedBlobIntentKey & nomination)
     {
-        const std::optional<PersistedEtag> token = persistedTokenOf(nomination.identity);
+        const std::optional<PersistedEtag> token = PersistedEtag::fromIdentity(nomination.identity);
         if (!token)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS fold: orphan intent nomination of {} carries no tag", layout.blobKey(cur_blob));
         if (!options.peek_head)
@@ -785,8 +817,8 @@ RunRef foldDeltasIntoGeneration(CasOperation & op, const Layout & layout, const 
         row.condemn_round = options.condemn_round;
         switch (head.seen())
         {
-            case HeadSeen::Uncanonical:
-                noteUncanonical();
+            case HeadSeen::TokenRejected:
+                noteTokenRejected();
                 return;
             case HeadSeen::Same:
                 /// Not pending: no create of this round confirmed the intent.
@@ -952,25 +984,22 @@ RunRef foldDeltasIntoGeneration(CasOperation & op, const Layout & layout, const 
     return RunRef{.key = run_key, .checksum = run_checksum, .shard = shard, .key_generation = new_generation};
 }
 
-std::vector<BlobCandidate> zeroInDegree(CasOperation & op, const std::vector<RunRef> & runs)
+AdoptedShardPreview previewAdoptedShard(CasOperation & op, const std::vector<RunRef> & runs, uint64_t shard,
+                                        AdoptedRunContext context)
 {
-    std::vector<BlobCandidate> result;
-    for (const RunRef & run : runs)
+    AdoptedShardPreview preview;
+    AdoptedRunReader reader(op, runs, shard, std::move(context), AdoptedRunReader::OnRefusal::Report);
+    SourceEdgeRecord rec;
+    while (reader.next(rec))
     {
-        /// The caller passes the exact object key, so a run sealed
-        /// for a later generation but physically living under an older key is reached directly. The run is
-        /// streamed at O(one block) resident memory, never materialized whole. `openSourceEdgeRun` enforces
-        /// the run kind + key schema; `RunMarker::Condemned` sentinel rows are skipped (only `RunMarker::Zero` counts).
-        SourceEdgeRunView r = openSourceEdgeRun(op, run.key);
-        SourceEdgeRecord rec;
-        while (r.next(rec))
-            if (rec.marker == RunMarker::Zero)
-                result.push_back(BlobCandidate{.ref = rec.ref});
-        /// Whole-file checksum: verify the drained run against the seal's
-        /// RunRef.checksum BEFORE its candidates feed a GC delete decision. Fail-closed on mismatch.
-        r.verifyAgainst(run.checksum);
+        if (rec.marker == RunMarker::Zero)
+            preview.zero.push_back(rec.ref);
+        else if (rec.marker == RunMarker::Condemned)
+            preview.condemned.push_back(rec);
     }
-    return result;
+    if (reader.refusal())
+        return AdoptedShardPreview{.zero = {}, .condemned = {}, .refusal = reader.refusal()};
+    return preview;
 }
 
 }

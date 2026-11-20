@@ -1731,6 +1731,58 @@ TEST(CASTransactionStagedCopies, ARewrittenCommittedFileThatIsUnlinkedLeavesTheM
     EXPECT_TRUE(committedEntry(*storage, ns, "all_96_96_0", "keep.bin"));
 }
 
+/// A file the transaction added and removed again changes nothing, even after another writer repointed the part.
+TEST(CASTransactionStagedCopies, ANewFileRemovedFromAPartAnotherWriterRepointedPublishesNothing)
+{
+    auto storage = openTxStorage();
+    const std::string table = kLivenessTable + "/";
+    const std::string part = table + "all_96_96_0/";
+    const DB::Cas::RootNamespace ns = storage->liveNamespace(kLivenessUuid);
+    commitPartTx(*storage, table, "all_96_96_0", {{"data.bin", "committed bytes"}});
+
+    auto tx = storage->createTransaction();
+    writeFileTx(*tx, part + "extra.bin", "staged and removed again");
+    auto other = storage->createTransaction();
+    writeFileTx(*other, part + "data.bin", "another writer's bytes");
+    other->commit(DB::NoCommitOptions{});
+    const auto repointed = storage->partAccess()->getView({ns, "all_96_96_0"}, DB::Cas::Freshness::ForceFresh);
+    ASSERT_NE(repointed, nullptr);
+
+    tx->unlinkFile(part + "extra.bin", /*if_exists=*/false, /*should_remove_objects=*/false);
+    ASSERT_NO_THROW(tx->commit(DB::NoCommitOptions{}));
+
+    const auto after = storage->partAccess()->getView({ns, "all_96_96_0"}, DB::Cas::Freshness::ForceFresh);
+    ASSERT_NE(after, nullptr);
+    EXPECT_EQ(after->manifestId(), repointed->manifestId());
+    EXPECT_FALSE(storage->existsFile(part + "extra.bin"));
+}
+
+/// Removing a rewritten committed file from a part another writer repointed is refused: the base held the file.
+TEST(CASTransactionStagedCopies, ARewrittenCommittedFileRemovedFromARepointedPartIsRefused)
+{
+    auto storage = openTxStorage();
+    const std::string table = kLivenessTable + "/";
+    const std::string part = table + "all_96_96_0/";
+    const DB::Cas::RootNamespace ns = storage->liveNamespace(kLivenessUuid);
+    commitPartTx(*storage, table, "all_96_96_0", {{"data.bin", "committed bytes"}, {"keep.bin", "kept"}});
+
+    auto tx = storage->createTransaction();
+    writeFileTx(*tx, part + "data.bin", "rewritten bytes");
+    auto other = storage->createTransaction();
+    writeFileTx(*other, part + "keep.bin", "another writer's bytes");
+    other->commit(DB::NoCommitOptions{});
+    const auto repointed = storage->partAccess()->getView({ns, "all_96_96_0"}, DB::Cas::Freshness::ForceFresh);
+    ASSERT_NE(repointed, nullptr);
+
+    tx->unlinkFile(part + "data.bin", /*if_exists=*/false, /*should_remove_objects=*/false);
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CAS_OWNERSHIP_CONFLICT, [&] { tx->commit(DB::NoCommitOptions{}); });
+
+    EXPECT_TRUE(committedEntry(*storage, ns, "all_96_96_0", "data.bin"));
+    const auto after = storage->partAccess()->getView({ns, "all_96_96_0"}, DB::Cas::Freshness::ForceFresh);
+    ASSERT_NE(after, nullptr);
+    EXPECT_EQ(after->manifestId(), repointed->manifestId());
+}
+
 /// A rewrite of a committed file moved to another part leaves the source without it and the destination with the
 /// rewritten bytes.
 TEST(CASTransactionStagedCopies, ARewrittenCommittedFileMovedOutLeavesItsPart)
