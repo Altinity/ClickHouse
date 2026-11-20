@@ -69,11 +69,13 @@ Ordered steps in `PartWriteTxn::ensureBlobPresent`:
    of size, provider, staging backend, or whether another writer probably uploaded the same hash.
 3. **Absent body:** publish. No other request.
 4. **Present body:** the size is checked against the envelope and the source (a mismatch is
-   `CORRUPTED_DATA`). The writer then needs the answer to one question: has `GC` condemned this
-   exact incarnation? It sends `GET` for the intent of the token the `HEAD` returned.
-   - **404:** no `GC` round has condemned the incarnation the writer saw. The writer adopts the body
-     and records a `Materialized` dependency proof without retaining the token
-     (event `blob_reuse_adopt`, counter `CASBlobBodyPutAvoided`).
+   `CORRUPTED_DATA`). The writer then needs the answer to one question: does an intent mark this
+   exact incarnation for deletion? It sends `GET` for the intent of the token the `HEAD` returned.
+   - **404:** no intent exists for the incarnation the writer saw. That does not prove no round condemned it: a
+     transition deletes the old intent after condemning the new body. The writer adopts the body, because its
+     precommit edge was durable before the `HEAD`, so the next destructive cut counts it (see
+     [the writer-versus-GC race](#writer-gc-race)). It records a `Materialized` dependency proof without retaining
+     the token (event `blob_reuse_adopt`, counter `CASBlobBodyPutAvoided`).
    - **The intent exists:** the body may be about to be deleted. The writer publishes its own
      source bytes under a fresh `incarnation_tag` (event `blob_reuse_resurrect`, counter
      `CASBlobReuseIntentPresent`). It never reads or revives the condemned body.
@@ -118,7 +120,7 @@ or intent key unless the last column says otherwise.
 | Case | Requests | Other requests |
 |---|---|---|
 | First creation | `HEAD`, body `PUT` | S3 staging: one staging `GET`; staged copy: one staging `HEAD` |
-| Reuse of a blob `GC` never condemned | `HEAD`, intent `GET` (404) | none |
+| Reuse of a body with no intent | `HEAD`, intent `GET` (404) | none |
 | Reuse after condemnation | `HEAD`, intent `GET` (200), body `PUT` | S3 staging: one staging `GET` |
 | A token that has no canonical form | `HEAD`, body `PUT` | S3 staging: one staging `GET` |
 
@@ -235,8 +237,8 @@ Why this closes the race in both directions:
   - The intent was not created yet. The writer's precommit edge was durable before that read, so it
     was durable before the round that created the intent committed. The round that deletes the body
     takes a later cut, sees the edge, and spares the blob.
-  - A spare deleted it, which it does only when its `HEAD`, sent after its cut, shows another token
-    `u`. A token never recurs at a key, so `t` cannot come back and the body the writer adopts is `u`
+  - A spare or a transition deleted it, which each does only when its `HEAD`, sent after its cut, shows another
+    token `u`. A token never recurs at a key, so `t` cannot come back and the body the writer adopts is `u`
     or a later one. The writer's `HEAD` saw `t`, so `u` landed after that `HEAD`, and the writer's
     edge was durable before it. A body `u` is deleted only by a round after the one that observed `u`
     and committed `pending(u)`, so the deleting round's cut is taken after `u` landed. It sees the
@@ -253,8 +255,9 @@ Why this closes the race in both directions:
 - `GC` never removes an intent because a body is absent, and never in the job that deletes the
   body. A request that is refused or unanswered fails the round before its commit and the row keeps
   its state; a missing answer is never read as absence.
-- A round whose destruction is suppressed (an anomaly, a hold, or an incomplete frontier) creates
-  intents and records rows but deletes no body and no intent.
+- A round whose destruction is suppressed (an anomaly, a hold, an incomplete frontier, or a `gc/state` that no
+  longer shows the leased version) deletes no body and no intent. Fresh condemnations and transitions still create
+  intents and write rows; a carried `candidate` row waits for an unsuppressed round to create its intent.
 
 Both directions degrade to a spurious re-upload or a no-op delete. Neither can lose data or leave
 a dangling manifest entry.

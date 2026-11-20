@@ -184,7 +184,7 @@ Day-to-day interpretation is on the [monitoring](/antalya/cas/operations/monitor
 
 | Event | Type | Description |
 | --- | --- | --- |
-| `CASGCClampSuppressedPasses` | `Number` | Number of CAS GC passes that deferred shard row decisions and deletion because reachability was uncertain. In the current stage this is EVERY folding round by construction, not an anomaly: the namespace universe is not yet knowable, so the round's destructive gate is shut unconditionally and this counter tracks folding rounds rather than trouble. What does discriminate is the fold seal's hold set and the tables_held column of the fold_ref_intake phase row -- read those, not this, to tell a healthy suppressed round from a namespace that stopped. |
+| `CASGCClampSuppressedPasses` | `Number` | Number of CAS GC folding passes whose destructive work was suppressed: no body or intent was deleted because of an anomaly, a held namespace, an unproven reference frontier, or a gc/state HEAD that did not show the version the round leased. A healthy round does not count. The cause is in the server log and in the fold_reduce phase row of system.cas_gc_log (suppress_destructive, frontier_complete, parent_unconfirmed). |
 | `CASGCCompareSwap` | `Number` | Number of CAS GC compare-and-swap requests. Grows with GC state updates. |
 | `CASGCCompareSwapConflict` | `Number` | Number of CAS GC compare-and-swap conflicts. A non-zero value indicates concurrent GC or metadata updates. |
 | `CASGCDeadPrecommitSkipped` | `Number` | Number of CAS GC edges skipped for precommits proven dead below the durable watermark. Growing values indicate stale or incomplete ref history. |

@@ -636,6 +636,14 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
         input.redelete_budget_admits = !work_budget || work_budget->redeleteAvailable();
 
         bool redelete_slot_taken = false;
+        /// A row carried after its `HEAD` deletes nothing, so it gives its slot back: a row carried every round must
+        /// not keep the rows behind it from their deletes.
+        const auto releaseRedeleteSlot = [&]
+        {
+            if (work_budget)
+                --work_budget->redeletes_used;
+            redelete_slot_taken = false;
+        };
         switch (decisionHeadNeed(input))
         {
             case DecisionHeadNeed::None:
@@ -702,6 +710,7 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
                 const BlobHead observed = pending_head(cur_blob);
                 if (observed.undecodable)
                 {
+                    releaseRedeleteSlot();
                     carryUndecodable(row);
                     return;
                 }
@@ -714,9 +723,11 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
             noteUncanonical();
 
         const IntentDecision decision = decideIntentStep(input);
-        if ((decision.step == IntentStep::DeleteBody || decision.step == IntentStep::Standing) && !redelete_slot_taken
-            && work_budget)
+        const bool spends_redelete_slot = decision.step == IntentStep::DeleteBody || decision.step == IntentStep::Standing;
+        if (spends_redelete_slot && !redelete_slot_taken && work_budget)
             ++work_budget->redeletes_used;
+        if (!spends_redelete_slot && redelete_slot_taken)
+            releaseRedeleteSlot();
 
         switch (decision.step)
         {

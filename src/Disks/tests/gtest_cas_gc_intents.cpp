@@ -55,6 +55,7 @@ namespace DB::ErrorCodes
 {
 extern const int ABORTED;
 extern const int BAD_ARGUMENTS;
+extern const int CORRUPTED_DATA;
 extern const int NO_REPLICA_HAS_PART;
 extern const int NETWORK_ERROR;
 extern const int NOT_IMPLEMENTED;
@@ -2631,6 +2632,21 @@ void recordFolds(IntentPool<> & pool, std::vector<FoldMetrics> & folds)
 
 }
 
+/// The rows a scheduled round leaves on file are in its `fold_reduce` row, so a backlog carried round after round is
+/// visible in the GC log.
+TEST(CASGcIntents, FoldReduceRowCountsTheRowsOnFile)
+{
+    auto pool = makePool({.create_budget = 1});
+    pool.commitThenDrop({1, 2, 3});
+    std::vector<FoldMetrics> folds;
+    recordFolds(pool, folds);
+    const RoundReport report = pool.round();
+    ASSERT_EQ(folds.size(), 1u);
+    ASSERT_EQ(report.intent_confirmed, 1u) << "positive control: the budget of one create made one row pending";
+    EXPECT_EQ(metricOr(folds.front().reduce, "condemned_rows"), 3u);
+    EXPECT_EQ(metricOr(folds.front().reduce, "delete_pending_rows"), 1u);
+}
+
 TEST_P(CASGcIntentsSharded, IdleRoundsWithAnIntentOverAReferencedBlobWriteNoRun)
 {
     /// Of `max_defer_rounds + 1` consecutive folds, one merges the shard whose only input is a nomination.
@@ -2864,6 +2880,31 @@ TEST(CASGcIntents, AStuckCreateDoesNotStarveLaterCandidatesUnderABudget)
     EXPECT_TRUE(isCandidate(pool.row(ordered[0])));
     EXPECT_GE(counter(ProfileEvents::CASGCIntentUnconfirmedCarry) - unconfirmed_before, 1u);
     EXPECT_NE(capture.captured().find(stuck), String::npos) << capture.captured();
+}
+
+/// A `pending` row over an undecodable body is carried without a delete. It must not keep the only redelete slot of
+/// every round from the rows behind it, and its body is still read every round.
+TEST(CASGcIntents, AnUndecodablePendingBodyDoesNotStarveLaterDeletesUnderABudget)
+{
+    const std::vector<uint64_t> ordered = inRunOrder({1, 2});
+    auto pool = makePool({.redelete_budget = 1});
+    ASSERT_NO_FATAL_FAILURE(pool.makePending(ordered));
+    ASSERT_NO_FATAL_FAILURE(truncateBody(pool, ordered[0]));
+
+    for (size_t round = 0; round < 2; ++round)
+    {
+        SCOPED_TRACE(round);
+        pool.backend->clearJournal();
+        const auto report = roundWithoutThrowing(pool);
+        ASSERT_TRUE(report.has_value());
+        const auto requests = blobRequests(pool.backend->journal());
+        EXPECT_GE(countOf(requests, JournalVerb::Head, pool.bodyKey(ordered[0])), 1u) << "the carried row was not read";
+        EXPECT_EQ(countOf(requests, JournalVerb::Remove, pool.bodyKey(ordered[0])), 0u) << "the short body was deleted";
+        EXPECT_TRUE(isPending(pool.row(ordered[0])));
+        if (round == 0)
+            EXPECT_EQ(report->bodies_deleted, 1u) << "the row behind the undecodable body was not deleted";
+    }
+    EXPECT_FALSE(pool.bodyMeta(ordered[1]).has_value());
 }
 
 /// The capability probe's scratch object under `blob-intents/_probe/` is not an intent: the sweep skips it, counts it
@@ -4049,12 +4090,36 @@ public:
     };
 
     std::atomic<StateHead> state_head{StateHead::Store};
+    /// Every token of `gc/state` is a weak ETag: a valid precondition with no canonical identity.
+    std::atomic<bool> weak_state_tokens{false};
+
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        auto raw = HeadHookBackend::read(key, access);
+        if (raw && weakened(key))
+            raw->value = weak(raw->value);
+        return raw;
+    }
+
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value, TransportAccess & access) override
+    {
+        std::optional<String> stored_form = expected_value;
+        if (stored_form && weakened(key) && stored_form->starts_with("W/\"") && stored_form->ends_with("\""))
+            stored_form = stored_form->substr(3, stored_form->size() - 4);
+        auto written = HeadHookBackend::write(key, bytes, stored_form, access);
+        if (written && weakened(key))
+            return weak(*written);
+        return written;
+    }
 
     std::optional<RawMeta> head(const String & key, TransportAccess & access) override
     {
         auto meta = HeadHookBackend::head(key, access);
         if (!key.ends_with("/gc/state"))
             return meta;
+        if (meta && weakened(key))
+            meta->value = weak(meta->value);
         switch (state_head.load())
         {
             case StateHead::Store:
@@ -4068,6 +4133,10 @@ public:
         }
         return meta;
     }
+
+private:
+    bool weakened(const String & key) const { return weak_state_tokens && key.ends_with("/gc/state"); }
+    static String weak(const String & value) { return "W/\"" + value + "\""; }
 };
 
 using StateHead = PausedLeaderBackend::StateHead;
@@ -4127,14 +4196,15 @@ SlowWrite beginSlowWrite(const PoolPtr & store, const String & ns, const String 
 /// and removes the logs below the snapshot, that record included.
 struct PausedLeaderPool
 {
-    explicit PausedLeaderPool(const String & payload_) : payload(payload_), x(idOf(payload_))
+    /// B commits up to five rounds while A is parked. With the default retention B removes the parent runs A's
+    /// reduce reads; 16 keeps them.
+    explicit PausedLeaderPool(const String & payload_, uint64_t generations_to_keep = 16)
+        : payload(payload_), x(idOf(payload_))
     {
         PoolConfig config{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0, .gc_io_concurrency = 1};
         /// No snapshot covers W's precommit before A parks; W's later parts publish one.
         config.snapshot_log_count_threshold = 5;
-        /// B commits up to five rounds while A is parked; A's reduce then reads its parent's runs, which B's
-        /// retention would otherwise remove.
-        config.gc_snapshot_generations_to_keep = 16;
+        config.gc_snapshot_generations_to_keep = generations_to_keep;
         store = Pool::open(backend, std::move(config));
         body_key = store->layout().blobKey(x);
         gc_a = std::make_unique<Gc>(store, kGateLeaderA);
@@ -4197,6 +4267,12 @@ struct PausedLeaderPool
             for (size_t i = 0; i < 4 && objectPresent(*backend, key); ++i)
                 runGateRound(store, *gc_b);
             parked_key_cleaned = !objectPresent(*backend, key);
+            /// B folds new parts until its retention removes one of these keys.
+            for (size_t i = 0; i < 8 && !prune_until_absent.empty() && !anyAbsent(prune_until_absent); ++i)
+            {
+                writeOnePart(store, ns_w, "successor" + std::to_string(i), "successor part " + std::to_string(i));
+                runGateRound(store, *gc_b);
+            }
             resumed_at = backend->journal().size();
         });
     }
@@ -4222,6 +4298,50 @@ struct PausedLeaderPool
         ASSERT_EQ(parked->fired(), 1u) << "A's round never walked W's namespace after the quiet one";
         parked.reset();
         ASSERT_EQ(metricOr(reduce, "parent_unconfirmed"), 1u) << "A's round never reached the validation read";
+    }
+
+    /// A's parked round when B removed what the round reads: it must end as a lost leadership.
+    void runLeaderAExpectingLostLeadership()
+    {
+        std::optional<int> code;
+        String message;
+        try
+        {
+            runGateRound(store, *gc_a);
+        }
+        catch (const DB::Exception & e)
+        {
+            code = e.code();
+            message = e.message();
+        }
+        ASSERT_EQ(parked->fired(), 1u) << "A's round never reached the point where it parks";
+        parked.reset();
+        ASSERT_TRUE(code.has_value()) << "A's round did not fail";
+        EXPECT_EQ(*code, DB::ErrorCodes::ABORTED) << message;
+        EXPECT_NE(message.find("gc/state moved during the round"), String::npos) << message;
+    }
+
+    /// The key of the fold seal `gc/state` adopts now.
+    String adoptedSealKey() const
+    {
+        OperationForTest op(*backend);
+        const GcState state = decodeGcState((*op).read(store->layout().gcStateKey(), Retry::standard())->bytes);
+        return store->layout().foldSealKey(state.snap_generation, state.snap_attempt);
+    }
+
+    /// The keys of the runs the adopted fold seal names.
+    std::vector<String> adoptedRunKeys() const
+    {
+        OperationForTest op(*backend);
+        std::vector<String> keys;
+        for (const RunRef & run : decodeFoldSeal((*op).read(adoptedSealKey(), Retry::standard())->bytes).blob_target_runs)
+            keys.push_back(run.key);
+        return keys;
+    }
+
+    bool anyAbsent(const std::vector<String> & keys) const
+    {
+        return std::any_of(keys.begin(), keys.end(), [this](const String & key) { return !objectPresent(*backend, key); });
     }
 
     void expectDeposedAndCleaned() const
@@ -4255,6 +4375,7 @@ struct PausedLeaderPool
     String stream;
 
     std::unique_ptr<ScopedRoundCallback> parked;
+    std::vector<String> prune_until_absent;
     size_t resumed_at = 0;
     String parked_key;
     bool parked_key_present = false;
@@ -4333,6 +4454,66 @@ TEST(CASGcIntents, PausedLeaderWhoseLogWasCleanedDeletesNoIntent)
     EXPECT_EQ(report.intent_listed, 1u) << formatFsckSummary(report);
 }
 
+/// The same pause at the default retention: B's retention removes the parent runs A's reduce reads. A newer leader
+/// removing what a deposed one reads is a lost leadership, not corruption, and A deletes nothing.
+TEST(CASGcIntents, PausedLeaderAtTheDefaultRetentionEndsItsRoundAsLostLeadership)
+{
+    PausedLeaderPool pool("paused-leader-default-retention", PoolConfig{}.gc_snapshot_generations_to_keep);
+    ASSERT_NO_FATAL_FAILURE(pool.seed());
+
+    std::optional<SlowWrite> w;
+    String precommit_key;
+    pool.backend->armOnHead(pool.body_key, [&]
+    {
+        w = beginSlowWrite(pool.store, pool.ns_w, "w", pool.payload, /*upload=*/true);
+        precommit_key = pool.lastLogWritten();
+    });
+    runGateRound(pool.store, *pool.gc_a);
+    ASSERT_TRUE(w && w->action == BlobMaterializationAction::Observed) << "W did not adopt the stored body";
+    ASSERT_TRUE(pool.row() && pool.row()->delete_pending && !pool.row()->standing) << "A did not commit pending(t)";
+
+    pool.prune_until_absent = pool.adoptedRunKeys();
+    ASSERT_FALSE(pool.prune_until_absent.empty());
+    pool.parkLeaderA([&] { w->promote(); }, precommit_key);
+    const size_t from = pool.backend->journal().size();
+    ASSERT_NO_FATAL_FAILURE(pool.runLeaderAExpectingLostLeadership());
+    EXPECT_TRUE(pool.anyAbsent(pool.prune_until_absent)) << "B's retention kept the parent runs A reads";
+    ASSERT_NO_FATAL_FAILURE(pool.expectDeposedAndCleaned());
+
+    const auto journal = pool.backend->journal();
+    const auto requests = blobRequests(std::vector<JournalEntry>(journal.begin() + from, journal.end()));
+    EXPECT_EQ(countOf(requests, JournalVerb::Remove, pool.body_key) + countOf(requests, JournalVerb::RemoveMany, pool.body_key), 0u)
+        << "the deposed leader deleted the body";
+    EXPECT_TRUE(objectPresent(*pool.backend, pool.body_key)) << "W's part names a deleted body";
+}
+
+/// A leader parked after its catalog read, while B folds new parts and its retention removes the fold seal A adopted:
+/// A's read of that seal finds nothing, which is a lost leadership, not corruption.
+TEST(CASGcIntents, PausedLeaderWhoseAdoptedSealWasPrunedEndsItsRoundAsLostLeadership)
+{
+    PausedLeaderPool pool("paused-leader-pruned-seal", PoolConfig{}.gc_snapshot_generations_to_keep);
+    ASSERT_NO_FATAL_FAILURE(pool.seed());
+    runGateRound(pool.store, *pool.gc_a);
+
+    const std::vector<String> adopted_keys{pool.adoptedSealKey()};
+    bool b_took_over = false;
+    pool.parked = std::make_unique<ScopedRoundCallback>(
+        *pool.gc_a, RoundInterleavePoint::AfterCatalogRead, RoundInterleaveSelector{}, [&]
+    {
+        EXPECT_FALSE(runGateRound(pool.store, *pool.gc_b).acquired_lease) << "B's first round must only observe A";
+        b_took_over = runGateRound(pool.store, *pool.gc_b).acquired_lease;
+        for (size_t i = 0; i < 8 && objectPresent(*pool.backend, adopted_keys.front()); ++i)
+        {
+            writeOnePart(pool.store, pool.ns_w, "while-a-parks" + std::to_string(i), "while A parks " + std::to_string(i));
+            runGateRound(pool.store, *pool.gc_b);
+        }
+    });
+    ASSERT_NO_FATAL_FAILURE(pool.runLeaderAExpectingLostLeadership());
+    EXPECT_TRUE(b_took_over) << "B never took the lease";
+    EXPECT_FALSE(objectPresent(*pool.backend, adopted_keys.front())) << "B's retention kept the seal A adopted";
+    EXPECT_EQ(storedLeaseOwner(*pool.backend, pool.store->layout()), kGateLeaderB);
+}
+
 /// The validation read of `gc/state` answers with absence, or never answers: the round deletes nothing, throws
 /// nothing and carries the row. The next round, answered honestly, deletes the body.
 TEST(CASGcIntents, UnconfirmedLeasedStateSuppressesTheRound)
@@ -4394,6 +4575,54 @@ TEST(CASGcIntents, ValidationReadIsSentForAPendingRowInALaterShard)
     EXPECT_EQ(stateHeadIndices(pool.backend->journal()).size(), 1u);
     EXPECT_EQ(metricOr(reduce, "parent_unconfirmed"), 1u);
     EXPECT_EQ(report.bodies_deleted, 0u);
+    EXPECT_TRUE(pool.bodyMeta(blob).has_value());
+}
+
+/// A store whose `gc/state` token has no canonical form: the validation read shows the token the lease write
+/// returned, so it confirms the leased version and the body is deleted.
+TEST(CASGcIntents, ValidationReadConfirmsAStateTokenWithoutACanonicalForm)
+{
+    IntentPool<PausedLeaderBackend> pool(std::make_shared<PausedLeaderBackend>());
+    pool.backend->weak_state_tokens = true;
+    ASSERT_NO_FATAL_FAILURE(pool.makePending({1}));
+    std::map<String, UInt64> reduce;
+    pool.gc->setPhaseSink([&reduce](const GcPhaseRecord & record)
+    {
+        if (record.phase == "fold_reduce")
+            reduce = record.metrics;
+    });
+
+    pool.backend->clearJournal();
+    const RoundReport report = pool.round();
+    EXPECT_EQ(stateHeadIndices(pool.backend->journal()).size(), 1u) << "positive control: the round sent its validation read";
+    EXPECT_EQ(metricOr(reduce, "parent_unconfirmed"), 0u);
+    EXPECT_EQ(report.bodies_deleted, 1u);
+    EXPECT_FALSE(pool.bodyMeta(1).has_value());
+}
+
+/// A seal must carry a summary for every shard. One without the summary of the shard that holds a `pending` row
+/// fails the round before any delete, so that row is never deleted without the validation read.
+TEST(CASGcIntents, SealWithoutTheSummaryOfAPendingShardFailsTheRoundBeforeAnyDelete)
+{
+    constexpr uint64_t shards = 4;
+    const uint64_t blob = blobsInShard(2, shards, 1).front();
+    IntentPool<PausedLeaderBackend> pool(std::make_shared<PausedLeaderBackend>(), {.gc_shards = shards});
+    ASSERT_NO_FATAL_FAILURE(pool.makePending({blob}));
+    {
+        OperationForTest op(*pool.backend);
+        const GcState state = decodeGcState((*op).read(pool.layout().gcStateKey(), Retry::standard())->bytes);
+        const String key = pool.layout().foldSealKey(state.snap_generation, state.snap_attempt);
+        const auto sealed = (*op).read(key, Retry::standard());
+        ASSERT_TRUE(sealed.has_value());
+        CasFoldSeal seal = decodeFoldSeal(sealed->bytes);
+        ASSERT_EQ(seal.condemned_summary.at(2).pending_total, 1u);
+        seal.condemned_summary.erase(2);
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).replace(key, encodeFoldSeal(seal), sealed->etag, Retry::standard())));
+    }
+
+    pool.backend->clearJournal();
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)pool.round(); });
+    EXPECT_EQ(countOf(blobRequests(pool.backend->journal()), JournalVerb::Remove, pool.bodyKey(blob)), 0u);
     EXPECT_TRUE(pool.bodyMeta(blob).has_value());
 }
 

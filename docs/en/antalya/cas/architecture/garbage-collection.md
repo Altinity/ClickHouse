@@ -83,11 +83,12 @@ Orderings that are load-bearing:
   published state.
 
 **Clamp suppression.** `suppress_destructive = !anomalies.empty() || !carried_holds.empty() ||
-!frontier_complete` is computed once and threaded into the merge, current-life ref cleanup and the
-perpetual namespace janitor, so they cannot desynchronize. Under suppression no blob body and no
+!frontier_complete || parent_unconfirmed` is computed once and threaded into the merge, current-life ref cleanup
+and the perpetual namespace janitor, so they cannot desynchronize. Under suppression no blob body and no
 deletion intent is deleted, no intent is listed for adoption, and there is no ref or namespace
-deletion; creating intents, recording rows and sparing continue, because none of them removes
-anything a writer relies on.
+deletion. Fresh condemnations and transitions still create intents and write rows, and sparing continues,
+because none of them removes anything a writer relies on. A carried `candidate` row waits for an unsuppressed
+round to create its intent.
 
 **Fail-closed aborts.** A throw before the commit `CAS` means no successor state is adopted (the
 exact-token deletes and prune that earlier phases justified from *previously* published state may
@@ -233,7 +234,9 @@ phase 5 and builds a new in-degree snapshot; `defer` skips generation constructi
 - **Writes / deletes:** none
 - **Safety:** a missing / invalid / incomplete adopted seal cannot produce a quiet defer — the
   deletion-due check refuses to defer and the plan read surfaces the bad state
-- **Fails the round if:** the plan-building seal read reports an invalid adopted seal
+- **Fails the round if:** the plan-building seal read reports an invalid adopted seal. When the adopted seal is
+  missing and a `HEAD` of `gc/state` shows another version or no object, a newer leader's retention removed it: the
+  round ends with `ABORTED` ("gc/state moved during the round"), as a lost commit does, and not with `CORRUPTED_DATA`
 - **Observability:** phase row `defer_decision`; metrics `changed_shards` (despite the name, the
   number of changed namespace-life rows), `namespaces_seen`, `ref_log_keys_listed`
 
@@ -403,11 +406,15 @@ Recomputes the per-shard in-degree snapshot and computes the round's single dest
   and before phase 11's: `transactions_unapplied` (a folded transaction whose deltas reached no
   shard reducer) and `logs_accounted ≠ logs_applied` (the round sealed coverage over more logs than
   it fully folded); either is `CORRUPTED_DATA`
+- **Ends the round with `ABORTED`** ("gc/state moved during the round") instead of `CORRUPTED_DATA` when the merge
+  reports `CORRUPTED_DATA` and a `HEAD` of `gc/state` then shows another version or no object: the round cannot
+  commit, and a newer leader's retention removes the parent runs a deposed leader reads
 - **Observability:** phase row `fold_reduce`; metrics `shards_reduced` / `shards_pure_carry`,
   `condemned`, `intent_confirmed` (rows committed `pending` this round), `spared`, `body_deletes_decided` (body
   deletes decided), `adopted` (orphan intents given a row), `nominations_waiting` (nominated intents of a
   shard that stayed a pure carry), `read_ahead_blobs` (blobs held to read row `HEAD`s ahead),
-  `suppress_destructive`, `frontier_complete`, `parent_unconfirmed`
+  `suppress_destructive`, `frontier_complete`, `parent_unconfirmed`, `condemned_rows` (rows the round leaves on
+  file: `candidate`, `pending` and `standing`) and `delete_pending_rows` (`pending` and `standing` rows among them)
 
 `suppress_destructive` is true on any recorded anomaly, any hold in the seal about to be made
 durable, an incomplete frontier (`frontier_proven ≠ frontier_namespaces`, a universe neither
@@ -418,8 +425,9 @@ Another version, an absent object or no answer means a newer leader may have rem
 as absent, so the round deletes no body and no intent. The check itself does not fail the round. The round's
 `gc/state` commit does when the state moved or is absent: it is refused with `ABORTED`. The reason is the `parent_unconfirmed` metric of the `fold_reduce` row, a WARNING in the server
 log, and a count in `CASGCClampSuppressedPasses`. Under suppression the round
-still creates intents, records rows, spares and carries, but body deletes, intent deletes, intent
-adoption, orphan-sweep planning and cursor adoption, retention prune, hand-off reclaim, manifest
+still creates the intents of fresh condemnations and transitions, records rows, spares and carries, but body
+deletes, intent deletes, the intent creates of carried `candidate` rows, intent adoption, orphan-sweep planning
+and cursor adoption, retention prune, hand-off reclaim, manifest
 deletes and ref-object cleanup do not run, and namespace cleanup lists and classifies one page
 without deleting or advancing its cursor. Per blob the merge decides one of the steps described in
 [condemnation and deletion](#condemn-delete): create the intent (`candidate` when it cannot be
@@ -934,6 +942,7 @@ logs:
 | Blob body `DELETE` | 1 per `pending` row whose `HEAD` still shows its token, up to `cas_gc_round_redelete_budget` |
 | Intent `DELETE` | 1 per `standing` row at zero, per transition, and per row of a blob referenced again whose `HEAD` shows another token, in batch requests of up to `cas_gc_bulk_delete_chunk_keys` keys |
 | `LIST blob-intents/` | 1 page per round whose destruction is not suppressed |
+| `HEAD gc/state` | 1 when the adopted state holds a `pending` or `standing` row and the intake did not suppress destruction; 1 more when the adopted seal is missing or the merge reports `CORRUPTED_DATA` |
 | Successful lease `CAS gc/state` | 1 |
 | Commit `CAS gc/state` | 1 |
 
@@ -942,7 +951,9 @@ edge; that is the dominant variable term, not the whole-round `GET` total, which
 state, seal, catalog, checkpoint, mount, parent-run and cleanup reads listed per phase below. An idle
 folding round is one `LIST` of `cas/ns/stream/`, the heartbeat floor (`LIST` plus `N` `GET`s), the
 seal, catalog and `gc/state` reads of phases 2, 4, 5 and 7, one successful lease `CAS`, and one
-commit `CAS`. A deferred round execution is cheaper: the same `LIST`, the heartbeat floor, phase 2's
+commit `CAS`. When the adopted state holds a `pending` or `standing` row and the intake did not suppress destruction,
+the round also sends one `HEAD` of `gc/state`, even when nothing else changed. A deferred round execution is
+cheaper: the same `LIST`, the heartbeat floor, phase 2's
 seal / catalog / `gc/state` reads, phase 4's two seal reads and catalog read, the lease `GET`/`CAS`,
 and one suppressed namespace-janitor page (its own `LIST` page and reads, no deletes) — no commit
 `CAS` at all.
@@ -1077,6 +1088,7 @@ No writes.
 
 | Key | Operation | Requests |
 |---|---|---:|
+| `<pool_prefix>/gc/state` | `HEAD` | one, before the phase, when the adopted state holds a `pending` or `standing` row and the intake did not suppress destruction; one more when the merge reports `CORRUPTED_DATA` |
 | referenced parent run segments | streaming `GET` | one per referenced run |
 | `<pool_prefix>/blobs/...` | `HEAD` | one per blob that reached zero, plus one per touched row at zero, per `pending` row whose body delete may run, per adopted orphan, and per `pending` or `standing` row of a blob referenced again (none under `suppress_destructive`) |
 | `<pool_prefix>/blob-intents/...` | `PUT` (`If-None-Match`) | one per intent created: a blob that reached zero, a `candidate` retried, a transition to a new token (≤ `cas_gc_round_intent_create_budget`); a `GET` follows when the key already exists |

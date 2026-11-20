@@ -600,6 +600,12 @@ private:
     /// throws: a lost or unanswered write is logged, and the caller's refusal stands.
     void giveBackRebuildLease(CasOperation & op, const GcState & claimed, const Etag & claim_etag) noexcept;
 
+    /// Called when the round finds an object it reads missing or corrupt: a newer leader's retention removes what a
+    /// deposed leader reads. Throws `ABORTED`, as a lost commit does, when a `HEAD` of `gc/state` shows another
+    /// version than `state_etag` or no object. Returns when the state is unchanged, unknown or unreadable, and the
+    /// caller then reports `failure` itself.
+    void throwIfStateMoved(CasOperation & op, const std::optional<Etag> & state_etag, const String & failure);
+
     /// Catalog-only helping barrier run immediately after lease acquisition. It validates the adopted
     /// parent and delegates deterministic `Removing`-row settlement to `CatalogLifecycleReconciler`.
     /// It performs no physical LIST or delete.
@@ -965,7 +971,7 @@ private:
     /// Spec INV-3: the round's universe -- every namespace life the destructive gate may one
     /// day owe a frontier proof for -- is catalog-authoritative, ONE `cas/ref_catalog` `GET` replacing
     /// the pool-wide `LIST(cas/ns/stream/)` this used to run. `Creating` entries are excluded: no publication
-    /// can exist yet (spec §3), so there is nothing here for a discovery path to walk; `Live` and
+    /// can exist yet, so there is nothing here for a discovery path to walk; `Live` and
     /// `Removing` entries are both returned, each minted via `NamespaceLifeId::fromCatalogEntry` directly
     /// from the row that is its own authority for both fields -- never from a listed key, which could
     /// name a DEAD incarnation of the same namespace name. Fresh pool (no catalog entries yet) => empty
@@ -1000,7 +1006,7 @@ private:
     /// The round's ONE hint enumeration (`enumerateRefPrefix`), followed by its one fresh catalog cut
     /// and the validated adopted-parent rows. Its `RoundInput` can only be moved into the authoritative
     /// plan builder; the resulting `RefPlan` owns all three and is the only value that reaches consumers.
-    RoundInput listRefPrefix(const GcState & state);
+    RoundInput listRefPrefix(const GcState & state, const std::optional<Etag> & state_etag);
 
     /// (`reclaimDroppedShards` was removed with the snapshot+log ref model: there is no mutable
     /// per-namespace shard object to tombstone and reclaim; the perpetual janitor owns dead-life bytes.)
@@ -1169,7 +1175,7 @@ public:
     /// Test-only access to the round's ref-prefix enumeration (its `changed_shards` is the defer signal).
     RefScanSummary listRefPrefixForTest(const GcState & state)
     {
-        const RefPlan plan = buildRefWalkPlan(listRefPrefix(state));
+        const RefPlan plan = buildRefWalkPlan(listRefPrefix(state, std::nullopt));
         RefScanSummary scan = plan.refScan();
         scan.changed_shards = plan.changedRows();
         return scan;

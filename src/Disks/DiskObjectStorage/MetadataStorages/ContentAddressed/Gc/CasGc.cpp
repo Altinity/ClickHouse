@@ -99,6 +99,17 @@ namespace
 /// Soft limit on the namespace janitor's phase: no page starts after it, the page in progress finishes.
 constexpr uint64_t kJanitorBudgetMs = 20'000;
 
+/// Whether a `HEAD` of `gc/state` shows the version this round leased. The exact token is what the round's
+/// conditional commit sends; the canonical identity absorbs a quoting difference between the write's answer
+/// and the `HEAD`. A store whose token has no canonical form still matches by the exact token.
+bool sameStateVersion(const Etag & seen, const Etag & leased)
+{
+    if (seen == leased)
+        return true;
+    const std::optional<CanonicalIdentity> identity = seen.canonical();
+    return identity && identity == leased.canonical();
+}
+
 /// A `gc/state` below header 4 can only come from an older GC bootstrapping over a deleted state; this build
 /// must not run its rows under the intent rules.
 GcState decodeGenerationFourGcState(std::string_view bytes)
@@ -914,7 +925,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     {
         GcPhaseTimer t(phase_sink, "defer_decision");
         const bool row_decision_due = rowDecisionDue(state, new_round);
-        walk_plan.emplace(buildRefWalkPlan(listRefPrefix(state)));
+        walk_plan.emplace(buildRefWalkPlan(listRefPrefix(state, state_etag)));
         reportStuckRemovals(*walk_plan, state.round);
         const RefScanSummary & ref_scan = walk_plan->refScan();
         const size_t changed = walk_plan->changedRows();
@@ -1121,7 +1132,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                 e.reason = "in-degree recovered in the pass merge; entry dropped";
             });
             /// The audit row is observability only -- `settleEntry` already unconditionally spared this
-            /// entry (INV_NO_LOSS: recovery wins past any budget), so this cap can never re-condemn it;
+            /// entry (recovery wins past any budget), so this cap can never re-condemn it;
             /// it only bounds whether the decision gets a `GcOutcomes` row.
             OutcomeEntry spared_row{.kind = entry.kind, .ref = entry.ref,
                                     .token = entry.token, .outcome = OutcomeKind::Spared};
@@ -1349,7 +1360,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// ALSO protect every generation the PARENT (currently-adopted, pre-fold) seal references
     /// (`parent_seal_runs`, captured above): this prune runs BEFORE the round's own gc/state CAS below, so
     /// a losing leader must not destroy what the winning leader's already-adopted seal still points at —
-    /// pre-CAS destructive actions may only rely on PREVIOUSLY PUBLISHED state (triage #5).
+    /// pre-CAS destructive actions may only rely on PREVIOUSLY PUBLISHED state.
     for (const RunRef & r : parent_seal_runs)
         referenced_generations.insert(r.key_generation);
     /// Retention floor uses THIS round's (post-fold) `generation`, so `gc_snapshot_generations_to_keep`
@@ -1624,7 +1635,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         t.metric("deleted", sweep.deleted);
         t.metric("skipped", sweep.skipped);
         t.metric("undecodable", sweep.undecodable);
-        /// THE §6 PREMISE'S SHARE OF `skipped`, BY REASON CLASS. Rule (1) is satisfiable only for a
+        /// THE DELETION PREMISE'S SHARE OF `skipped`, BY REASON CLASS. The premise holds only for a
         /// closed-and-folded epoch, so a pass in which everything examined was RETAINED is an ordinary
         /// outcome, and without these numbers it is indistinguishable on the row from a pass that found
         /// nothing to do.
@@ -1829,7 +1840,7 @@ Gc::CheckpointWitnesses Gc::readCheckpointWitnesses(GcReadAhead & reads,
         }
         catch (const Exception & e)
         {
-            /// PER-NAMESPACE, NEVER ROUND-WIDE (spec §5: every per-namespace failure is a clamp or a
+            /// PER-NAMESPACE, NEVER ROUND-WIDE (every per-namespace failure is a clamp or a
             /// hold). This object belongs to exactly one namespace, so it can never be grounds for
             /// refusing to fold another one -- and refusing the whole round is what a single unreadable
             /// 4 KiB object used to do, stopping every namespace's cursor, seal and cleanup for as long
@@ -2095,7 +2106,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
     const CasRefCatalog::Snapshot & catalog_snapshot = walk_plan.catalogCut();
     std::map<String, UInt128> live_incarnation;
     /// A `Creating` life IS named by the catalog -- `live_incarnation` excludes it
-    /// only because it is not yet WALKABLE (spec §3, no publication can exist), not because the
+    /// only because it is not yet WALKABLE (no publication can exist), not because the
     /// namespace is unaccounted. `completeCreation` publishes `_ckpt` (step 2) strictly BEFORE the
     /// `Creating -> Live` CAS (step 3), so every ordinary namespace creation has a real window --
     /// crash-stalled or merely mid-flight -- where a `Creating` entry's own `_ckpt` is durable and
@@ -2472,7 +2483,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
     /// or `{E+1,1}` for one without the field), and the head there must link back to it
     /// (`validateRefChainLink`). A cursor of unknown kind resumes by `resolveRefCursorSuccessor`.
     ///
-    /// PER-NAMESPACE FAILURES ARE PER-NAMESPACE (spec §5): an unreadable or undecodable body belongs to
+    /// PER-NAMESPACE FAILURES ARE PER-NAMESPACE: an unreadable or undecodable body belongs to
     /// exactly one namespace and clamps only it. The whole-round abort survives ONLY for a key that cannot
     /// be attributed to any namespace at all (`groupRefKeys` above), which is why nothing in this loop
     /// sets `ref_folding_aborted` anymore.
@@ -2516,7 +2527,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
     const std::map<String, RefTxnId> & checkpoint_witness = checkpoints.witnesses;
 
     /// WHICH NAMESPACES THIS ROUND WALKS -- i.e. THE ROUND'S UNIVERSE, the set the destructive gate owes
-    /// a frontier proof for (spec §5; `UniversePolicy` for why only the catalog can bound it): EVERY
+    /// a frontier proof for (`UniversePolicy` says why only the catalog can bound it): EVERY
     /// `Live`/`Removing` row of this round's frozen catalog cut, and nothing else.
     ///
     /// The listing is a HINT and cannot change that set in either direction. It cannot SHRINK it -- a
@@ -2868,7 +2879,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
             }
         }
 
-        /// An unavailable or invalid `_ckpt` quarantines its own namespace and nothing else (spec §5). The object
+        /// An unavailable or invalid `_ckpt` quarantines its own namespace and nothing else. The object
         /// belongs to exactly one namespace and both of its consumers are keyed by that namespace --
         /// `witnessAbove` below, and `cleanupRefObjects`' delete boundaries via `result.checkpoints` --
         /// so the damage is confinable, and confining it is the difference between one namespace waiting
@@ -3216,7 +3227,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         RefCoverage cov;
         cov.last_folded_ref_id = resolved_through;
 
-        /// THE CLEARING RULE (spec §5), and the only place it is decided. A hold clears by exactly one
+        /// THE CLEARING RULE, and the only place it is decided. A hold clears by exactly one
         /// event: this walk RESOLVING the offending position -- folding through it and sealing a cursor
         /// at or above it. It never clears by observing another absent, because an absent is precisely
         /// what a lying store produces and precisely what made the hold necessary; and it never clears
@@ -3576,8 +3587,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
     };
     /// The parent seal's summary for a shard, used for the pure-carry DECISION (condemned_total==0) and to skip the
     /// condemned-row read-ahead sets when no parent row is pending, which costs read-ahead only.
-    /// Missing => zero: a fresh pool has no parent entry (correct baseline), and a snap_generation>0 seal
-    /// that is missing an entry we would pure-carry fails closed inside `carryParentRefs` when it copies.
+    /// Missing => zero only on a fresh pool, which has no parent seal: `readFoldSeal` refuses a seal whose summary
+    /// does not cover every shard, so the parent check below sees every shard's `pending_total`.
     auto summaryOfParent = [&](uint64_t shard) -> CondemnedSummary
     {
         const auto it = discover_ref_seal.condemned_summary.find(shard);
@@ -3671,7 +3682,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
 
     /// Ref-log cleanup runs after its round commits a newer `gc/state`, so the leased version, still current
     /// after the last intake read, shows that no newer leader removed a record this round read as absent.
-    /// Rounds with no `pending` or `standing` parent row skip the read, so an idle round sends no request.
+    /// Rounds with no `pending` or `standing` parent row skip the read.
     /// That is safe: a delete that acts on a false zero needs such a row, and every other intent delete
     /// follows a `HEAD` that showed another incarnation.
     bool parent_has_pending_rows = false;
@@ -3685,7 +3696,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
             const std::optional<Meta> current = op.head(layout.gcStateKey(), Retry::standard());
             if (!current)
                 seen = "no object";
-            else if (!state_etag || !current->etag.canonical() || current->etag.canonical() != state_etag->canonical())
+            else if (!state_etag || !sameStateVersion(current->etag, *state_etag))
                 seen = "another version";
         }
         catch (const Exception & e)
@@ -3997,14 +4008,24 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         std::vector<RunRef> shard_runs;
         head_hint_shard = shard;
         next_head_hint = 0;
-        foldDeltasIntoGeneration(
-            op, layout, priorRunsFor(shard), new_generation, attempt, shard,
-            std::move(buckets[shard]), shard_runs,
-            current_round, condemn_round, head_blob, peek_head,
-            create_intent,
-            &result.retired_merge[shard], suppress_destructive,
-            &ledger.applied, std::move(retirement_buckets[shard]),
-            &work_budget, pending_hints, pending_head, std::move(intent_nominations[shard]), spare_head);
+        try
+        {
+            foldDeltasIntoGeneration(
+                op, layout, priorRunsFor(shard), new_generation, attempt, shard,
+                std::move(buckets[shard]), shard_runs,
+                current_round, condemn_round, head_blob, peek_head,
+                create_intent,
+                &result.retired_merge[shard], suppress_destructive,
+                &ledger.applied, std::move(retirement_buckets[shard]),
+                &work_budget, pending_hints, pending_head, std::move(intent_nominations[shard]), spare_head);
+        }
+        catch (const Exception & e)
+        {
+            /// The parent runs this merge streams are what a newer leader's retention removes.
+            if (e.code() == ErrorCodes::CORRUPTED_DATA)
+                throwIfStateMoved(op, state_etag, e.message());
+            throw;
+        }
         discardReservedReads();
         for (RunRef & r : shard_runs)
             result.fold_seal.blob_target_runs.push_back(std::move(r));
@@ -4072,6 +4093,15 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         reduce_timer->metric("frontier_complete", result.frontier_complete ? 1 : 0);
         reduce_timer->metric("parent_unconfirmed", result.parent_unconfirmed ? 1 : 0);
         reduce_timer->metric("transactions_unapplied", transactions_unapplied_this_round);
+        uint64_t condemned_rows = 0;
+        uint64_t delete_pending_rows = 0;
+        for (const auto & [shard, summary] : result.fold_seal.condemned_summary)
+        {
+            condemned_rows += summary.condemned_total;
+            delete_pending_rows += summary.pending_total;
+        }
+        reduce_timer->metric("condemned_rows", condemned_rows);
+        reduce_timer->metric("delete_pending_rows", delete_pending_rows);
     }
     reduce_timer.reset();   /// emits the `fold_reduce` row
 
@@ -4559,6 +4589,28 @@ std::optional<CasFoldSeal> Gc::readFoldSeal(uint64_t generation, uint64_t attemp
     return std::nullopt;
 }
 
+void Gc::throwIfStateMoved(CasOperation & op, const std::optional<Etag> & state_etag, const String & failure)
+{
+    if (!state_etag)
+        return;
+    std::optional<Meta> current;
+    try
+    {
+        current = op.head(store->layout().gcStateKey(), Retry::standard());
+    }
+    catch (...)
+    {
+        /// Without an answer nothing shows a newer leader, so the caller's own error stands.
+        tryLogCurrentException(logger, "CAS GC: could not read gc/state to tell a newer leader from corruption", LogsLevel::warning);
+        return;
+    }
+    if (current && sameStateVersion(current->etag, *state_etag))
+        return;
+    throw Exception(ErrorCodes::ABORTED,
+        "CAS gc round: gc/state moved during the round (another leader advanced it, observed {}); {}; retry next round",
+        current ? current->etag.render() : String("no object"), failure);
+}
+
 namespace
 {
 
@@ -4593,8 +4645,8 @@ std::optional<ParsedRefObjectKey> parseRefObjectKeyForEnumeration(const Layout &
 std::vector<NamespaceLifeId> Gc::discoverUniverse()
 {
     /// One catalog GET replaces the pool-wide `LIST(cas/ns/stream/)` this used to run to
-    /// discover WHICH namespaces exist. `Creating` entries are excluded -- spec §3, "no publication can
-    /// exist" while a namespace is still being created, so there is nothing here for a discovery path to
+    /// discover WHICH namespaces exist. `Creating` entries are excluded -- no publication can
+    /// exist while a namespace is still being created, so there is nothing here for a discovery path to
     /// walk; `Live` and `Removing` entries are both returned. `fromCatalogEntry` mints each life directly
     /// from the row that is its own authority for both fields, never from a listed key (which could name
     /// a DEAD incarnation of the same namespace name).
@@ -4683,7 +4735,7 @@ RefScanSummary Gc::enumerateRefPrefix()
     return scan;
 }
 
-RoundInput Gc::listRefPrefix(const GcState & state)
+RoundInput Gc::listRefPrefix(const GcState & state, const std::optional<Etag> & state_etag)
 {
     /// The round's ONE hint enumeration, followed by the parent coverage and authoritative catalog cut
     /// needed to build the DEFER/FOLD walk plan. The caller computes the DEFER signal from that frozen
@@ -4709,9 +4761,13 @@ RoundInput Gc::listRefPrefix(const GcState & state)
 
     const std::optional<CasFoldSeal> seal = readFoldSeal(state.snap_generation, state.snap_attempt);
     if (!seal && state.snap_generation > 0)
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
+    {
+        const String failure = fmt::format(
             "CAS GC hot scan: adopted fold seal (generation {}, attempt {}) is missing",
             state.snap_generation, state.snap_attempt);
+        throwIfStateMoved(op, state_etag, failure);
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "{}", failure);
+    }
     if (seal)
         scan.parent_ref_lives = seal->ref_lives;
 
@@ -5092,7 +5148,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
         std::vector<BlobDelta> deltas;
 
         /// Committed owners: a missing/invalid body under a committed ref is DATA LOSS the rebuild must
-        /// not bless (INV_NO_DANGLE) -- refuse.
+        /// not bless -- refuse.
         for (const auto [ref_name, row] : st.getCommitted())
         {
             const ManifestId id{ns, row.manifest_ref};
@@ -5115,16 +5171,19 @@ RebuildReport Gc::rebuildBaseline(bool force)
             const ManifestId id{ns, manifest_ref};
             owned_manifest_keys.insert(layout.manifestKey(id));
             if (!foldManifestEdges(reads, id, +1, deltas, mf_cleanup_unused, /*txn_ordinal=*/0))
-                throw Exception(ErrorCodes::CORRUPTED_DATA,
-                    "CAS GC rebuild: namespace '{}' has a live precommit '{}' whose manifest {} is missing or "
-                    "invalid, so the blobs it references cannot be counted. GC refuses to rebuild; retry once "
-                    "the manifest is readable or the precommit is removed.",
-                    ns.string(), ref_name, layout.manifestKey(id));
+            {
+                rep.refusal = "live precommit '" + ns.string() + "/" + ref_name + "' names part manifest "
+                    + layout.manifestKey(id) + ", which cannot be read, so the blobs it references cannot be "
+                      "counted. Its writer is still uploading the manifest or stopped before it did; retry after "
+                      "the writer finishes, or after its server mounts the table again and its stale-precommit "
+                      "sweep removes the precommit";
+                return rep;
+            }
             ++rep.live_precommits;
         }
         route_deltas(deltas);
 
-        /// HOLDS RIDE THROUGH A REBUILD VERBATIM (spec §5/§7). The rebuild derives coverage from owner
+        /// HOLDS RIDE THROUGH A REBUILD VERBATIM. The rebuild derives coverage from owner
         /// state, which knows nothing about a ref-log position that would not resolve -- so without
         /// this every held row would be overwritten by a clean one and the rebuilt baseline would claim
         /// a frontier proof it does not have. `retry_count` and `next_retry_round` ride unchanged too:
@@ -5177,7 +5236,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
         }, Retry::standard(), CasOperation::kCasListPageKeys, onGcEnumerationPage);
     }
 
-    /// A REBUILD CONDEMNS NOTHING (spec §7).
+    /// A REBUILD CONDEMNS NOTHING.
     ///
     /// It used to end here with a LIST of `blobs/`, condemning every listed body its traversal had not
     /// reached ("pipeline blindness repair": the fold discovers candidates by TRANSITIONS to zero, so a
@@ -5532,7 +5591,15 @@ void Gc::giveBackRebuildLease(CasOperation & op, const GcState & claimed, const 
     }
     catch (...)
     {
-        warn(getCurrentExceptionMessage(/*with_stacktrace=*/false));
+        /// The warning allocates, and an exception that escapes this `noexcept` function terminates the process.
+        try
+        {
+            warn(getCurrentExceptionMessage(/*with_stacktrace=*/false));
+        }
+        catch (...)
+        {
+            tryLogCurrentException(logger, "CAS GC rebuild refused but could not give back its GC lease");
+        }
     }
 }
 

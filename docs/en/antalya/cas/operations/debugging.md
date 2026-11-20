@@ -337,11 +337,10 @@ clickhouse-disks -C config.xml --disk cas cas-inspect '<raw-object-key>'
 clickhouse-disks -C config.xml --disk cas cas-gc-rebuild --force
 ```
 
-A rebuild refuses when a live precommit's manifest is missing or invalid:
-`CAS GC rebuild: namespace '<ns>' has a live precommit '<ref>' whose manifest <key> is missing or invalid`.
-A writer still uploading that manifest causes it, and so does a writer that stopped before uploading it. The
-stale-precommit sweep of that writer's server removes the precommit once the server mounts the table again. Run
-the rebuild again once the manifest is readable or the precommit is removed. A refused rebuild gives back the
+A rebuild refuses when a live precommit's manifest cannot be read: the refusal names
+`live precommit '<ns>/<ref>'` and the manifest key. A writer still uploading that manifest causes it, and so does a
+writer that stopped before uploading it. Run the rebuild again after the writer finishes, or after its server mounts
+the table again and its stale-precommit sweep removes the precommit. A refused rebuild gives back the
 GC lease it claimed, so the command can run again. When that write fails, a warning `could not give back its GC lease` names the lease left behind. If the refused attempt
 created `gc/state`, the next attempt can read that state as healthy and then needs `--force`.
 A rebuild cannot start while another GC leader holds the lease. This includes a lease left by a stopped GC leader,
