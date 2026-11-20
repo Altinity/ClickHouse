@@ -8,6 +8,7 @@
 #include <Common/Logger.h>
 #include <Common/Macros.h>
 #include <Formats/FormatSettings.h>
+#include <unordered_map>
 
 namespace DB
 {
@@ -173,5 +174,26 @@ private:
     std::queue<ObjectInfoPtr> pending_objects_info;
     const LoggerPtr log = getLogger("GlobIterator");
 };
+
+/// Files already returned by an object-storage cluster local-read probe, plus the iterator
+/// that produced them. `iterator` is null once the list has ended. `snapshot_version` is kept
+/// even then: a finished Delta iterator is not reusable, but `_data_lake_snapshot_version`
+/// is read from the iterator during the local scan.
+struct ObjectStorageClusterReadProbe
+{
+    ObjectIterator iterator;
+    ObjectInfos pulled;
+    std::optional<UInt64> snapshot_version;
+    bool read_locally = false;
+    bool consumed = false;
+};
+
+/// Hands the probe to one consumer. A second call returns null.
+ObjectIterator takeObjectStorageClusterReadProbe(const std::shared_ptr<ObjectStorageClusterReadProbe> & probe);
+
+/// The probe this storage ran, or null when this storage has not probed yet.
+std::shared_ptr<ObjectStorageClusterReadProbe> findObjectStorageClusterReadProbe(
+    const std::unordered_map<const void *, std::shared_ptr<ObjectStorageClusterReadProbe>> & probes,
+    const void * storage);
 
 }

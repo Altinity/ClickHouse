@@ -30,6 +30,7 @@
 #include <QueryPipeline/RemoteQueryExecutor.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <Storages/IStorage.h>
+#include <Storages/ObjectStorage/IObjectIterator.h>
 #include <Storages/SelectQueryInfo.h>
 #include <Storages/VirtualColumnUtils.h>
 #include <Storages/buildQueryTreeForShard.h>
@@ -173,12 +174,18 @@ void ReadFromCluster::createExtension()
         ? listing_filter_dag.get()
         : (filter_actions_dag ? filter_actions_dag.get() : query_info.filter_actions_dag.get());
     const ActionsDAG::Node * predicate = filter ? filter->getOutputs().at(0) : nullptr;
+
+    /// The probe listed with the filter known at `getQueryProcessingStage`. A filter pushed later still
+    /// applies as a row filter; the iterator is not rebuilt.
+    ObjectIterator probed_iterator = takeObjectStorageClusterReadProbe(findObjectStorageClusterReadProbe(
+        query_info.object_storage_cluster_read_probes, storage->localReadProbeStorageKey()));
     extension = storage->getTaskIteratorExtension(
         predicate,
         filter,
         context,
         cluster,
-        getStorageSnapshot()->metadata);
+        getStorageSnapshot()->metadata,
+        std::move(probed_iterator));
 }
 
 namespace
@@ -657,6 +664,18 @@ void IStorageCluster::read(
     size_t num_streams)
 {
     updateBeforeRead(context);
+
+    /// `getQueryProcessingStage` already returned `FetchColumns` for this decision, so the plan above
+    /// this read is the local one. A distributed plan must not be replaced by a local column scan.
+    /// Publish this storage's probe into the single slot the pure read step consumes. That step copies
+    /// `query_info` and does not know which cluster storage it belongs to.
+    if (const auto probe = findObjectStorageClusterReadProbe(query_info.object_storage_cluster_read_probes, localReadProbeStorageKey());
+        probe && probe->read_locally && processed_stage == QueryProcessingStage::Enum::FetchColumns)
+    {
+        query_info.object_storage_cluster_read_probe = probe;
+        readFallBackToPure(query_plan, column_names, storage_snapshot, query_info, context, processed_stage, max_block_size, num_streams);
+        return;
+    }
 
     if (!isClusterSupported())
     {

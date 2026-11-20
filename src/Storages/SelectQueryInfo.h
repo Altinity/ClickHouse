@@ -9,6 +9,8 @@
 #include <QueryPipeline/StreamLocalLimits.h>
 
 #include <memory>
+#include <optional>
+#include <unordered_map>
 
 namespace DB
 {
@@ -36,6 +38,8 @@ using ClusterPtr = std::shared_ptr<Cluster>;
 
 class PlannerContext;
 using PlannerContextPtr = std::shared_ptr<PlannerContext>;
+
+struct ObjectStorageClusterReadProbe;
 
 class PreparedSets;
 using PreparedSetsPtr = std::shared_ptr<PreparedSets>;
@@ -217,6 +221,14 @@ struct SelectQueryInfo
 
     /// For IStorageSystemOneBlock
     std::vector<UInt8> columns_mask;
+
+    /// Local-read probes keyed by `IStorageCluster::localReadProbeStorageKey`. A `Merge` passes one
+    /// `SelectQueryInfo` to every child; one slot would reuse the first child's decision for the rest.
+    std::unordered_map<const void *, std::shared_ptr<ObjectStorageClusterReadProbe>> object_storage_cluster_read_probes;
+
+    /// The probe `read` publishes for the storage it is reading locally. `ReadFromObjectStorageStep`
+    /// copies `SelectQueryInfo` and has no cluster pointer, so it consumes this slot.
+    std::shared_ptr<ObjectStorageClusterReadProbe> object_storage_cluster_read_probe;
 
     bool isFinal() const;
 
