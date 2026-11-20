@@ -123,7 +123,9 @@ private:
 
     size_t getVersionUnlocked() const TSA_REQUIRES(mutex);
 
-    void initOrUpdateSnapshot() const TSA_REQUIRES(mutex);
+    /// `pinned_version` is used only when `kernel_snapshot_state` is empty (after a reset):
+    /// it keeps the rebuilt snapshot on the version the query already resolved.
+    void initOrUpdateSnapshot(std::optional<size_t> pinned_version = std::nullopt) const TSA_REQUIRES(mutex);
     void initOrUpdateSchemaIfChanged() const TSA_REQUIRES(mutex);
     void initOrUpdateClusteringColumns() const TSA_REQUIRES(mutex);
 

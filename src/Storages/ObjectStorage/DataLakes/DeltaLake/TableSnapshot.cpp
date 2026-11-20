@@ -69,6 +69,8 @@ namespace ProfileEvents
 namespace DB::FailPoints
 {
     extern const char delta_kernel_force_stale_token_error[];
+    extern const char delta_kernel_force_stale_token_error_on_clustering_read[];
+    extern const char delta_kernel_pause_before_clustering_read[];
 }
 
 namespace DeltaLake
@@ -1006,7 +1008,7 @@ bool TableSnapshot::tryRefreshAfterStaleTokenError(
     return true;
 }
 
-void TableSnapshot::initOrUpdateSnapshot() const
+void TableSnapshot::initOrUpdateSnapshot(std::optional<size_t> pinned_version) const
 {
     /// Rebuild when credentials rotate so the engine never outlives its embedded STS token.
     const auto current_credentials_fingerprint = helper->getCredentialsFingerprint();
@@ -1016,7 +1018,7 @@ void TableSnapshot::initOrUpdateSnapshot() const
     /// Pin rebuilds to the already-resolved version so cached latest snapshots don't drift.
     const std::optional<size_t> version_to_build = kernel_snapshot_state
         ? std::optional<size_t>(kernel_snapshot_state->snapshot_version)
-        : snapshot_version_to_read;
+        : (pinned_version ? pinned_version : snapshot_version_to_read);
 
     ProfileEvents::increment(ProfileEvents::DeltaLakeSnapshotInitializations);
 
@@ -1205,6 +1207,13 @@ void TableSnapshot::initOrUpdateClusteringColumns() const
 
     auto read_domain_metadata = [](const KernelSnapshotState & state)
     {
+        fiu_do_on(DB::FailPoints::delta_kernel_force_stale_token_error_on_clustering_read,
+        {
+            throw DB::Exception(
+                DB::ErrorCodes::DELTA_KERNEL_ERROR,
+                "ExpiredToken: forced by delta_kernel_force_stale_token_error_on_clustering_read failpoint");
+        });
+
         return KernelUtils::unwrapResult(
             ffi::get_domain_metadata_internal(
                 state.snapshot.get(),
@@ -1216,6 +1225,8 @@ void TableSnapshot::initOrUpdateClusteringColumns() const
 
     auto state = getKernelSnapshotState();
     const auto pre_fingerprint = kernel_state_credentials_fingerprint;
+    /// Test hook: lets a test commit a newer table version after the snapshot version is resolved.
+    DB::FailPointInjection::pauseFailPoint(DB::FailPoints::delta_kernel_pause_before_clustering_read);
     decltype(read_domain_metadata(*state)) result = nullptr;
     try
     {
@@ -1226,9 +1237,12 @@ void TableSnapshot::initOrUpdateClusteringColumns() const
         if (!tryRefreshAfterStaleTokenError(e, pre_fingerprint, "clustering metadata read"))
             throw;
         /// Invalidate the cached engine so `initOrUpdateSnapshot` rebuilds with the
-        /// freshened credentials, then re-read the domain metadata once.
+        /// freshened credentials, then re-read the domain metadata once. The rebuild is pinned
+        /// to the version already resolved above: the schema is cached for it, and resolving
+        /// "latest" again could move the query to a newer table version.
+        const size_t pinned_version = state->snapshot_version;
         kernel_snapshot_state.reset();
-        initOrUpdateSnapshot();
+        initOrUpdateSnapshot(pinned_version);
         result = read_domain_metadata(*kernel_snapshot_state);
     }
 

@@ -6394,3 +6394,72 @@ def test_liquid_clustering_predicate_fallback(started_cluster):
         f"Expected the fallback predicate to enable file skipping: fallback query scanned "
         f"{fallback_scan_files} files but full scan scanned {full_scan_files} files"
     )
+
+
+def test_clustering_metadata_stale_token_retry_keeps_snapshot_version(started_cluster):
+    """A stale-credentials retry while reading the clustering metadata must stay on the
+    table version the query already resolved.
+
+    The query is paused after its snapshot version is resolved and before the clustering
+    metadata is read. A newer version V+1 is committed while it is paused, then the read
+    fails once with `ExpiredToken` and the snapshot is rebuilt. If the rebuild resolved
+    "latest" again, the query would list V+1's files and return the row added by V+1.
+    """
+    instance = started_cluster.instances["node1"]
+    spark = started_cluster.spark_session
+    TABLE_NAME = randomize_table_name("test_clustering_stale_token_pin")
+
+    delta_path = f"/{TABLE_NAME}"
+    spark.sql(f"""
+        CREATE TABLE delta.`{delta_path}` (a INT, b STRING, c STRING)
+        USING DELTA CLUSTER BY (a)
+    """)
+    spark.sql(f"""
+        INSERT INTO delta.`{delta_path}`
+        SELECT id AS a, CAST(id AS STRING) AS b, CAST(id AS STRING) AS c FROM range(100)
+    """)
+
+    default_upload_directory(started_cluster, "s3", delta_path, "")
+    create_delta_table(instance, "s3", TABLE_NAME, started_cluster)
+
+    pause = "delta_kernel_pause_before_clustering_read"
+    stale = "delta_kernel_force_stale_token_error_on_clustering_read"
+    query_id = f"{TABLE_NAME}_retry"
+    instance.query("SYSTEM ENABLE FAILPOINT object_storage_force_refresh_callback_success")
+    instance.query(f"SYSTEM ENABLE FAILPOINT {stale}")
+    instance.query(f"SYSTEM ENABLE FAILPOINT {pause}")
+    try:
+        # This must be the first filtered read of the table: the clustering columns are cached after it.
+        request = instance.get_query_request(
+            f"SELECT a FROM {TABLE_NAME} WHERE a = 42 ORDER BY a",
+            query_id=query_id,
+        )
+        instance.query(f"SYSTEM WAIT FAILPOINT {pause} PAUSE")
+
+        # Commit V+1 with one more row matching the filter while the query is paused.
+        spark.sql(f"""
+            INSERT INTO delta.`{delta_path}`
+            SELECT 42 AS a, 'new' AS b, 'new' AS c
+        """)
+        default_upload_directory(started_cluster, "s3", delta_path, "")
+
+        instance.query(f"SYSTEM NOTIFY FAILPOINT {pause}")
+        result = request.get_answer()
+    finally:
+        instance.query(f"SYSTEM DISABLE FAILPOINT {pause}")
+        instance.query(f"SYSTEM DISABLE FAILPOINT {stale}")
+        instance.query("SYSTEM DISABLE FAILPOINT object_storage_force_refresh_callback_success")
+
+    # Only V's row. Two rows would mean the retry moved the query to V+1.
+    assert result.split() == ["42"], f"Retry moved the query to a newer table version: {result!r}"
+
+    instance.query("SYSTEM FLUSH LOGS")
+    retry_hits = int(instance.query(
+        "SELECT count() FROM system.text_log "
+        f"WHERE query_id = '{query_id}' "
+        "  AND message ILIKE '%stale credentials during clustering metadata read; rebuilding%'"
+    ).strip())
+    assert retry_hits >= 1, (
+        f"Expected the clustering metadata stale-token retry to fire for query {query_id}, "
+        f"found {retry_hits} hits"
+    )
