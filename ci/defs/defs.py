@@ -436,6 +436,7 @@ class ArtifactNames:
     CH_AMD_UBSAN_GH = "CH_AMD_UBSAN_GH"
     CH_ARM_ASAN_GH = "CH_ARM_ASAN_GH"
     CH_ARM_TSAN_GH = "CH_ARM_TSAN_GH"
+    CH_PPC64LE_GH = "CH_PPC64LE_BIN_GH"
 
     FAST_TEST = "FAST_TEST"
     UNITTEST_AMD_ASAN = "UNITTEST_AMD_ASAN"
@@ -581,6 +582,7 @@ class ArtifactConfigs:
             ArtifactNames.CH_AMD_UBSAN_GH,
             ArtifactNames.CH_ARM_ASAN_GH,
             ArtifactNames.CH_ARM_TSAN_GH,
+            ArtifactNames.CH_PPC64LE_GH,
         ]
     )
     clickhouse_stripped_binaries = Artifact.Config(

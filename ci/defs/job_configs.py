@@ -232,7 +232,7 @@ class JobConfigs:
                 "./ci/jobs/smoke_test_ppc64le.py",
             ],
         ),
-        requires=[ArtifactNames.CH_PPC64LE],
+        requires=[ArtifactNames.CH_PPC64LE_GH],
         timeout=900,
     )
     tidy_build_arm_jobs = common_build_job_config.parametrize(
@@ -413,7 +413,10 @@ class JobConfigs:
         # ),
         Job.ParamSet(
             parameter=BuildTypes.PPC64LE,
-            provides=[ArtifactNames.CH_PPC64LE],
+            provides=[
+                ArtifactNames.CH_PPC64LE,
+                ArtifactNames.CH_PPC64LE_GH,
+            ],
             runs_on=RunnerLabels.BUILDER_AMD,
         ),
         # Job.ParamSet(
