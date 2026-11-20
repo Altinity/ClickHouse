@@ -9,7 +9,7 @@ node2 = cluster.add_instance("node2")
 # An unmarked build predating Antalya protocol negotiation.
 node_old = cluster.add_instance(
     "node_old",
-    image="altinity/clickhouse-server",
+    image="clickhouse/clickhouse-server",
     tag=CLICKHOUSE_CI_MIN_TESTED_VERSION,
     with_installed_binary=True,
 )

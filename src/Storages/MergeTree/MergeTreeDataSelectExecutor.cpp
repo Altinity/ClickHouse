@@ -691,6 +691,24 @@ std::optional<std::unordered_set<String>> MergeTreeDataSelectExecutor::filterPar
     return result;
 }
 
+RangesInDataParts MergeTreeDataSelectExecutor::filterParts(
+    const RangesInDataParts & parts,
+    const ReadFromMergeTree::Indexes & indexes,
+    const StorageMetadataPtr & metadata_snapshot,
+    const MergeTreeData & data,
+    const SelectQueryInfo & query_info,
+    const MergeTreeData::MutationsSnapshotPtr & mutations_snapshot,
+    const ContextPtr & context,
+    const PartitionIdToMaxBlock * max_block_numbers_to_read,
+    LoggerPtr log,
+    ReadFromMergeTree::IndexStats & index_stats)
+{
+    auto res = filterPartsByPartition(
+        parts, indexes.partition_pruner, indexes.minmax_idx_condition, indexes.part_values,
+        metadata_snapshot, data, context, max_block_numbers_to_read, log, index_stats);
+    return filterPartsByStatistics(res, metadata_snapshot, query_info, mutations_snapshot, context, log, index_stats);
+}
+
 RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPartition(
     const RangesInDataParts & parts,
     const std::optional<PartitionPruner> & partition_pruner,
@@ -946,6 +964,33 @@ static bool partHasStaleTopKIndex(
     return false;
 }
 
+void MergeTreeDataSelectExecutor::checkForcedSkipIndexes(const UsefulSkipIndexes & skip_indexes, const Settings & settings)
+{
+    if (!settings[Setting::force_data_skipping_indices].changed)
+        return;
+
+    const auto & indices_str = settings[Setting::force_data_skipping_indices].toString();
+    auto forced_indices = parseIdentifiersOrStringLiterals(indices_str, settings);
+
+    if (forced_indices.empty())
+        throw Exception(ErrorCodes::CANNOT_PARSE_TEXT, "No indices parsed from force_data_skipping_indices ('{}')", indices_str);
+
+    std::unordered_set<std::string> useful_indices_names;
+    for (const auto & useful_index : skip_indexes.useful_indices)
+        useful_indices_names.insert(useful_index.index->index.name);
+
+    for (const auto & index_name : forced_indices)
+    {
+        if (!useful_indices_names.contains(index_name))
+        {
+            throw Exception(
+                ErrorCodes::INDEX_NOT_USED,
+                "Index {} is not used and setting 'force_data_skipping_indices' contains it",
+                backQuote(index_name));
+        }
+    }
+}
+
 RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipIndexes(IndexAnalysisContext & filter_context, RangesInDataParts parts_with_ranges, ReadFromMergeTree::IndexStats & index_stats)
 {
     auto & metadata_snapshot = filter_context.metadata_snapshot;
@@ -973,29 +1018,8 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
     const auto original_num_parts = parts_with_ranges.size();
     const Settings & settings = context->getSettingsRef();
 
-    if (use_skip_indexes && settings[Setting::force_data_skipping_indices].changed)
-    {
-        const auto & indices_str = settings[Setting::force_data_skipping_indices].toString();
-        auto forced_indices = parseIdentifiersOrStringLiterals(indices_str, settings);
-
-        if (forced_indices.empty())
-            throw Exception(ErrorCodes::CANNOT_PARSE_TEXT, "No indices parsed from force_data_skipping_indices ('{}')", indices_str);
-
-        std::unordered_set<std::string> useful_indices_names;
-        for (const auto & useful_index : skip_indexes.useful_indices)
-            useful_indices_names.insert(useful_index.index->index.name);
-
-        for (const auto & index_name : forced_indices)
-        {
-            if (!useful_indices_names.contains(index_name))
-            {
-                throw Exception(
-                    ErrorCodes::INDEX_NOT_USED,
-                    "Index {} is not used and setting 'force_data_skipping_indices' contains it",
-                    backQuote(index_name));
-            }
-        }
-    }
+    if (use_skip_indexes)
+        checkForcedSkipIndexes(skip_indexes, settings);
 
     struct IndexStat
     {
@@ -1886,7 +1910,8 @@ ReadFromMergeTree::AnalysisResultPtr MergeTreeDataSelectExecutor::estimateNumMar
         /*is_parallel_reading_from_replicas*/false,
         use_query_condition_cache,
         /*supports_skip_indexes_on_data_read*/false,
-        /*check_row_limits=*/true);
+        /*check_row_limits=*/true,
+        /*skip_ranges_analysis=*/false);
 }
 
 QueryPlanStepPtr MergeTreeDataSelectExecutor::readFromParts(
