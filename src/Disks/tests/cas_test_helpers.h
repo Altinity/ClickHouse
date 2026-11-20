@@ -2223,6 +2223,105 @@ inline void markCutComplete(DB::Cas::Gc & gc, CountingBackend & backend)
     });
 }
 
+/// A point inside a GC round where a test runs an action.
+enum class RoundInterleavePoint : uint8_t
+{
+    /// After the catalog read that fixes the round's universe, before any namespace is read.
+    AfterCatalogRead,
+    /// After the walk of `RoundInterleaveSelector::first` and before the walk of `second`, in the selected pass.
+    BetweenNamespaces,
+    /// After the last intake read and the `gc/state` validation, before any decision `HEAD`.
+    AfterIntake,
+    /// After the round's deletes, before its `gc/state` commit.
+    AfterRequestsBeforeCommit,
+};
+
+inline const char * roundInterleavePointName(RoundInterleavePoint point)
+{
+    switch (point)
+    {
+        case RoundInterleavePoint::AfterCatalogRead: return "AfterCatalogRead";
+        case RoundInterleavePoint::BetweenNamespaces: return "BetweenNamespaces";
+        case RoundInterleavePoint::AfterIntake: return "AfterIntake";
+        case RoundInterleavePoint::AfterRequestsBeforeCommit: return "AfterRequestsBeforeCommit";
+    }
+    return "?";
+}
+
+/// The `BetweenNamespaces` site: the walk of `first` in `pass`, when the round walks `second` next, in the same
+/// pass or as the first walk of pass 2. Namespaces are `RootNamespace` strings. Ignored for the other points.
+struct RoundInterleaveSelector
+{
+    String first;
+    String second;
+    uint8_t pass = 1;
+};
+
+/// Runs `callback` at `point` of every round `gc` runs while this object lives, and counts the sites it ran at.
+/// The callback runs on the round thread with no GC lock held. A walk of each pass is a site at most once per
+/// round, so each point matches at most once per round.
+class ScopedRoundCallback
+{
+public:
+    ScopedRoundCallback(DB::Cas::Gc & gc_, RoundInterleavePoint point, RoundInterleaveSelector selector_,
+                        std::function<void()> callback_)
+        : gc(gc_)
+    {
+        using Point = DB::Cas::Gc::RoundPointForTest;
+        gc.setRoundPointHookForTest(
+            [this, point, selector = std::move(selector_), callback = std::move(callback_)](
+                const DB::Cas::Gc::RoundPointSiteForTest & site)
+            {
+                bool match = false;
+                switch (point)
+                {
+                    case RoundInterleavePoint::AfterCatalogRead: match = site.point == Point::AfterCatalogRead; break;
+                    case RoundInterleavePoint::BetweenNamespaces:
+                        match = site.point == Point::AfterNamespaceWalk && site.pass == selector.pass
+                            && site.walked == selector.first && site.next == selector.second;
+                        break;
+                    case RoundInterleavePoint::AfterIntake: match = site.point == Point::AfterIntake; break;
+                    case RoundInterleavePoint::AfterRequestsBeforeCommit:
+                        match = site.point == Point::AfterRequestsBeforeCommit;
+                        break;
+                }
+                if (!match)
+                    return;
+                ++fired_count;
+                callback();
+            });
+    }
+
+    ~ScopedRoundCallback() { gc.setRoundPointHookForTest({}); }
+
+    ScopedRoundCallback(const ScopedRoundCallback &) = delete;
+    ScopedRoundCallback & operator=(const ScopedRoundCallback &) = delete;
+
+    size_t fired() const { return fired_count; }
+
+private:
+    DB::Cas::Gc & gc;
+    size_t fired_count = 0;
+};
+
+struct RoundWithCallback
+{
+    DB::Cas::RoundReport report;
+    /// The number of times the callback ran; one when the round reached the point.
+    size_t fired = 0;
+};
+
+/// One regular, reclaiming round of `gc` with `callback` run at `point`.
+inline RoundWithCallback runRoundWithCallback(DB::Cas::Gc & gc, RoundInterleavePoint point,
+                                              const RoundInterleaveSelector & selector, std::function<void()> callback)
+{
+    ScopedRoundCallback scoped(gc, point, selector, std::move(callback));
+    RoundWithCallback result;
+    result.report = runRegularRoundReclaiming(gc);
+    result.fired = scoped.fired();
+    return result;
+}
+
 /// The in-memory store with `S3ObjectStorage`'s batch-delete capability. A `removeManyWriteOnce` of more
 /// than one key is refused locally with `NOT_IMPLEMENTED` once the capability is false; a store that rejects
 /// `DeleteObjects` turns an unknown capability false on its first multi-key request. One key always goes.

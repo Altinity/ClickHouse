@@ -544,6 +544,37 @@ public:
         post_hot_scan_catalog_read_hook_for_test = std::move(hook);
     }
 
+    /// The places inside `runRegularRound` where the round-point test hook runs.
+    enum class RoundPointForTest : uint8_t
+    {
+        /// After the catalog read that fixes the round's universe, before any namespace is walked.
+        AfterCatalogRead,
+        /// After one namespace's walk in pass 1 or pass 2, before the next walk.
+        AfterNamespaceWalk,
+        /// After the last intake read and the `gc/state` validation, before the intent sweep and the reduce.
+        AfterIntake,
+        /// After the round's deletes, before its `gc/state` commit.
+        AfterRequestsBeforeCommit,
+    };
+
+    struct RoundPointSiteForTest
+    {
+        RoundPointForTest point;
+        /// `AfterNamespaceWalk` only: the pass (1 or 2) of the walk, the namespace just walked, and the namespace
+        /// walked next, in the same pass or, after the last walk of pass 1, first in pass 2 (empty when none).
+        uint8_t pass = 0;
+        String walked;
+        String next;
+    };
+
+    /// Runs `hook` synchronously on the round thread at every `RoundPointForTest` of every later round, with no
+    /// lock of this object held, so it may write through the pool or run another leader's round. Empty in
+    /// production.
+    void setRoundPointHookForTest(std::function<void(const RoundPointSiteForTest &)> hook)
+    {
+        round_point_hook_for_test = std::move(hook);
+    }
+
     /// Abandoned-precommit cleanup belongs to the writer: it appends exact `owner_transition` removals in
     /// ref logs. GC never invents a ref transition, because doing so could make the fold disagree with the
     /// writer's durable ownership history.
@@ -1035,6 +1066,18 @@ private:
     bool trim_enabled = true;    /// TEST SEAM ONLY: production always trims; see setTrimEnabledForTest
     /// TEST SEAM ONLY: see setPostHotScanCatalogReadHookForTest. Empty in production.
     std::function<void()> post_hot_scan_catalog_read_hook_for_test;
+    /// TEST SEAM ONLY: see setRoundPointHookForTest. Empty in production.
+    std::function<void(const RoundPointSiteForTest &)> round_point_hook_for_test;
+    /// Calls a copy, so a hook that replaces itself does not destroy the function it is running in.
+    void runRoundPointHookForTest(const RoundPointSiteForTest & site) const
+    {
+        const auto hook = round_point_hook_for_test;
+        hook(site);
+    }
+    void runRoundPointHookForTest(RoundPointForTest point) const
+    {
+        runRoundPointHookForTest({.point = point, .pass = 0, .walked = {}, .next = {}});
+    }
     /// Leader-local, in-memory count of consecutive deferred
     /// rounds since the last FOLD. NOT persisted (a fresh/stolen leader starts at 0 -- conservative:
     /// it may fold one round sooner than a long-lived leader would, never later). Reset to 0 whenever

@@ -141,7 +141,7 @@ that persists across rounds is more interesting than an isolated one.
 
 A round that deletes nothing although rows are `pending` or `standing` may be suppressed because its parent
 check failed: the `fold_reduce` row of the round has `parent_unconfirmed = 1` in `phase_metrics`, the server log has
-a WARNING with that name, and `CASGCClampSuppressedPasses` counts the pass. The round does not fail.
+a WARNING with that name, and `CASGCClampSuppressedPasses` counts the pass. The check does not fail the round, but when `gc/state` moved or is absent the round's commit is refused with `ABORTED`.
 
 A dashboard alert that filters on `outcome = 'Error'` alone misses `Aborted` and `Stopped` rows too
 — see the [`outcome` column](/operations/system-tables/cas_gc_log#columns) for what each one means.

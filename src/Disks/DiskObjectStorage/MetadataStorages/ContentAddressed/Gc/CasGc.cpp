@@ -1363,6 +1363,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     round_commit_timer->metric("generations_visited", next.snap_pruned_through - pruned_through_before);
     round_commit_timer->metric("pruned_through", next.snap_pruned_through);
     round_commit_timer->metric("generations_referenced", referenced_generations.size());
+    if (round_point_hook_for_test)
+        runRoundPointHookForTest(RoundPointForTest::AfterRequestsBeforeCommit);
     WriteResult commit = op.replace(layout.gcStateKey(), encodeGcState(next), *state_etag,
                                     Retry::standard());
     if (const auto * conflict = std::get_if<Conflict>(&commit))
@@ -3302,13 +3304,22 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
 
     /// PASS 1 is never cut: every namespace gets its start resolution and one read window, which proves
     /// every quiet namespace in every round.
-    const size_t pass_one_takes = std::max<size_t>(reads.window(), 1);
-    for (NamespaceIntake & s : intakes)
+    const auto afterWalkHook = [&](uint8_t pass, const NamespaceIntake & walked, const NamespaceIntake * next)
     {
+        if (round_point_hook_for_test)
+            runRoundPointHookForTest({.point = RoundPointForTest::AfterNamespaceWalk, .pass = pass,
+                                      .walked = walked.target->ns, .next = next ? next->target->ns : String{}});
+    };
+    const size_t pass_one_takes = std::max<size_t>(reads.window(), 1);
+    for (size_t i = 0; i < intakes.size(); ++i)
+    {
+        NamespaceIntake & s = intakes[i];
         topUpFirstWalkHints();
         if (s.resolve_start)
             resolveStart(s);
         walkNamespace(s, pass_one_takes, /*sliced=*/false);
+        if (i + 1 < intakes.size())
+            afterWalkHook(1, s, &intakes[i + 1]);
     }
 
     /// PASS 2 continues the unfinished walks from index `round mod n`, so the slice does not always end
@@ -3317,10 +3328,14 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
     for (NamespaceIntake & s : intakes)
         if (s.expected)
             unfinished.push_back(&s);
+    const auto pass_two_at = [&](size_t i) { return unfinished[(current_round + i) % unfinished.size()]; };
+    if (round_point_hook_for_test && !intakes.empty())
+        afterWalkHook(1, intakes.back(), unfinished.empty() ? nullptr : pass_two_at(0));
     for (size_t i = 0; i < unfinished.size(); ++i)
     {
-        NamespaceIntake & s = *unfinished[(current_round + i) % unfinished.size()];
+        NamespaceIntake & s = *pass_two_at(i);
         walkNamespace(s, std::nullopt, /*sliced=*/true);
+        afterWalkHook(2, s, i + 1 < unfinished.size() ? pass_two_at(i + 1) : nullptr);
     }
 
     for (NamespaceIntake & s : intakes)
@@ -3746,6 +3761,9 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
                 result.frontier_proven, result.frontier_namespaces, universe_note, catalog_empty_note,
                 deficit_note);
     }
+
+    if (round_point_hook_for_test)
+        runRoundPointHookForTest(RoundPointForTest::AfterIntake);
 
     /// One page of `blob-intents/` nominates intents that may have no row. It is listed after the cut, so the
     /// adoption `HEAD`s in the merge follow both. A suppressed round lists nothing. A listed key only nominates:
@@ -4684,6 +4702,8 @@ RoundInput Gc::listRefPrefix(const GcState & state)
         std::swap(hook_to_run, post_hot_scan_catalog_read_hook_for_test);
         hook_to_run();
     }
+    if (round_point_hook_for_test)
+        runRoundPointHookForTest(RoundPointForTest::AfterCatalogRead);
     catalog_cut.life_index.throwIfAmbiguous("CAS GC hot scan");
     store->reconcileRefCatalogCut(catalog_cut);
 

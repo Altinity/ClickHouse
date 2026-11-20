@@ -266,11 +266,12 @@ in RAM at a time. Native object storage streams and can use multipart.
 ### Copies that do not read the body {#copies-without-reading}
 
 `GC` deletes a body only when its round saw no owner of the blob: the blob had no source edge in the parent state,
-and the round folded no record of it in any namespace it read after acquiring its lease. A copy of a part that
-reuses the body without reading it (`ATTACH PARTITION FROM`, `MOVE PARTITION TO TABLE`, `RENAME TABLE` across tables,
-a fetch by relink) needs a source that stays live until the copy's own edge is durable, so a chain of such copies
-starts either from an owner that existed at that read, which contradicts "no owner", or from a writer that arrived
-after it. That writer meets the intent while the old body is current and uploads a fresh incarnation, which a delete
+and the round folded no record of it in any namespace it read after acquiring its lease.
+
+A copy of a part that reuses the body without reading it (`ATTACH PARTITION FROM`, `MOVE PARTITION TO TABLE`,
+`RENAME TABLE` across tables, a fetch by relink) needs a source that stays live until the copy's own edge is durable.
+So a chain of such copies starts either from an owner that existed when the round read the catalog, which contradicts
+"no owner", or from a writer that arrived after that read. That writer meets the intent while the old body is current and uploads a fresh incarnation, which a delete
 naming the old token cannot remove. To keep the source live, `createHardLink` and `republishRef` confirm it after the
 destination precommit and before the promote; an unconfirmed source fails the copy with `NO_REPLICA_HAS_PART`, which
 the replication queue and mutations retry and a user statement returns.
