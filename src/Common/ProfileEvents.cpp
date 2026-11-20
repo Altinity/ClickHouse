@@ -974,6 +974,9 @@ The server successfully detected this situation and will download merged part fr
     M(CASGCRetiredIntentConfirmed, "Number of CAS GC rows committed pending after their deletion intent was confirmed. Growth indicates cleanup progress.", ValueType::Number) \
     M(CASGCRetiredBodyDeleted, "Number of CAS GC blob body deletes answered, each conditional on the token the GC observed. Growth indicates physical cleanup activity.", ValueType::Number) \
     M(CASGCRetiredBodyDeleteFailed, "Number of CAS GC pending blob deletes whose HEAD or exact-token DELETE failed. A non-zero value indicates object storage errors; the round fails and the affected blobs are retried in the next round.", ValueType::Number) \
+    M(CASGCRetiredGraduated, "The earlier name of CASGCRetiredIntentConfirmed, incremented together with it.", ValueType::Number) \
+    M(CASGCRetiredRedeleted, "The earlier name of CASGCRetiredBodyDeleted, incremented together with it.", ValueType::Number) \
+    M(CASGCRetiredRedeleteFailed, "The earlier name of CASGCRetiredBodyDeleteFailed, incremented together with it.", ValueType::Number) \
     M(CASGCUnmatchedRemoveDeltas, "Number of CAS GC in-degree removal deltas that matched no existing source edge. The in-degree model is a set, not a counter, so this is a per-key no-op by design and never causes a false deletion — but a persistent nonzero rate means removal deltas are reaching the reducer without their matching activation, which is a correctness signal.", ValueType::Number) \
     M(CASGCHeartbeatFenceOuts, "Number of CAS GC operations fenced out for expired mounts. A non-zero value indicates stale mounts or heartbeat delays.", ValueType::Number) \
     M(CASBlobPublishDigestMismatch, "Number of streamed CAS blob publications refused because the payload did not hash to the blob's key. Any non-zero value means a corrupted or changed source.", ValueType::Number) \

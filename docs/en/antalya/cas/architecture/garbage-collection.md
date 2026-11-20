@@ -972,12 +972,12 @@ and ref-cleanup budgets: each of those phases processes its whole eligible cohor
 round does not clear a backlog: a blob that gets its intent in a round loses its body in a later round, and the
 sweep and prune caps stay finite. A cap on the hand-off leaks the rest of its prefix to `cas-fsck`,
 so leave that one at `0`. Among the sweep keys, `cas_manifest_sweep_list_budget_keys = 0`
-disables the sweep and `cas_manifest_sweep_delete_budget_keys = 0` lists without nominating. `cas_gc_io_concurrency`, `cas_intent_sweep_list_budget_keys` and the chunk size reject `0`:
+disables the sweep and `cas_manifest_sweep_delete_budget_keys = 0` lists without nominating. `cas_gc_io_concurrency` and the chunk size reject `0`, and `cas_intent_sweep_list_budget_keys` rejects a value outside `1` to `999`:
 
 | Setting | Default | Bounds |
 |---|---:|---|
 | `cas_gc_round_intent_create_budget` | 0 | deletion-intent creates per round, summed over every `GC` shard; a blob over the cap stays a `candidate` (phase 10) |
-| `cas_intent_sweep_list_budget_keys` | 999 | keys of `blob-intents/` listed per round to find intents with no row; at least `1` (phase 9) |
+| `cas_intent_sweep_list_budget_keys` | 999 | keys of `blob-intents/` listed per round to find intents with no row; `1` to `999`, one `LIST` response (phase 9) |
 | `cas_gc_round_redelete_budget` | 0 | untouched `pending` rows whose body `HEAD` is sent per round, which bounds body deletes (phases 10 and 12) |
 | `cas_gc_round_outcome_entry_budget` | 0 | outcome-log entries per round (phase 12) |
 | `cas_gc_round_prefix_wholesale_budget` | 20000 | listed objects the retention prune may process per round, gone ones included (phase 13) |

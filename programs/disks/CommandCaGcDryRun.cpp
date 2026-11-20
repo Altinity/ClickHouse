@@ -12,6 +12,7 @@ namespace DB
 
 namespace ErrorCodes
 {
+    extern const int ABORTED;
     extern const int BAD_ARGUMENTS;
     extern const int CORRUPTED_DATA;
 }
@@ -37,6 +38,8 @@ public:
         /// A non-leader, read-only Gc handle: previewDeletes never acquires the lease or writes.
         Cas::Gc gc(ca->store(), UInt128(1));
         const auto preview = gc.previewDeletes();
+        if (!preview.unread.empty())
+            throw Exception(ErrorCodes::ABORTED, "cas-gc-dryrun: {}; run it again", preview.unread);
 
         std::cout << "preview_deletes=" << preview.deletes.size() << "\n";
         for (const auto & p : preview.deletes)

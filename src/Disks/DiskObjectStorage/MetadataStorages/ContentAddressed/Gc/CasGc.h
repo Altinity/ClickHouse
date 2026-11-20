@@ -494,6 +494,8 @@ public:
         std::vector<PreviewEntry> deletes;
         /// One message per GC shard whose runs a round would refuse as corrupt; that shard has no row in `deletes`.
         std::vector<String> refused_shards;
+        /// Why the snapshot was not read: `gc/state` moved at every read. `deletes` and `refused_shards` are empty.
+        String unread;
     };
 
     /// WRITE-FREE preview of the next round's deletes, derived from the DURABLE sealed in-degree

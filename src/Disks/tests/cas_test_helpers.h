@@ -130,7 +130,7 @@ class ScopedLogCapture
 public:
     ScopedLogCapture(const String & logger_name, const String & level)
         : logger(getLogger(logger_name))
-        , channel(new Poco::StreamChannel(stream))
+        , channel(new MemoryChannel)
         , old_channel(logger->getChannel(), /*shared=*/true)
         , old_level(logger->getLevel())
     {
@@ -147,7 +147,14 @@ public:
     ScopedLogCapture(const ScopedLogCapture &) = delete;
     ScopedLogCapture & operator=(const ScopedLogCapture &) = delete;
 
-    String captured() const { return stream.str(); }
+    /// Every captured message, one per line.
+    String captured() const
+    {
+        String out;
+        for (const auto & [priority, text] : channel->messages())
+            out += text + "\n";
+        return out;
+    }
 
     size_t count(std::string_view needle) const
     {
@@ -158,10 +165,40 @@ public:
         return n;
     }
 
+    /// The priorities of the captured messages that contain `needle`, in order. A threshold alone cannot tell a
+    /// warning from an error, which it also lets through.
+    std::vector<Poco::Message::Priority> prioritiesOf(std::string_view needle) const
+    {
+        std::vector<Poco::Message::Priority> out;
+        for (const auto & [priority, text] : channel->messages())
+            if (text.find(needle) != String::npos)
+                out.push_back(priority);
+        return out;
+    }
+
 private:
+    class MemoryChannel : public Poco::Channel
+    {
+    public:
+        void log(const Poco::Message & msg) override
+        {
+            std::lock_guard lock(mutex);
+            captured.emplace_back(msg.getPriority(), msg.getText());
+        }
+
+        std::vector<std::pair<Poco::Message::Priority, String>> messages() const
+        {
+            std::lock_guard lock(mutex);
+            return captured;
+        }
+
+    private:
+        mutable std::mutex mutex;
+        std::vector<std::pair<Poco::Message::Priority, String>> captured;
+    };
+
     LoggerPtr logger;
-    std::ostringstream stream; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
-    Poco::AutoPtr<Poco::StreamChannel> channel;
+    Poco::AutoPtr<MemoryChannel> channel;
     /// `shared=true`: the parked channel is not ours, so take a reference instead of stealing one.
     Poco::AutoPtr<Poco::Channel> old_channel;
     int old_level;

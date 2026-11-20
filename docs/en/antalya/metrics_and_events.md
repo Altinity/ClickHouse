@@ -209,7 +209,10 @@ Day-to-day interpretation is on the [monitoring](/antalya/cas/operations/monitor
 | `CASGCRetiredBodyDeleted` | `Number` | Number of CAS GC blob body deletes answered, each conditional on the token the GC observed. Growth indicates physical cleanup activity. |
 | `CASGCRetiredBodyDeleteFailed` | `Number` | Number of CAS GC pending blob deletes whose `HEAD` or exact-token `DELETE` failed. A non-zero value indicates object storage errors; the round fails and the affected blobs are retried in the next round. |
 | `CASGCRetiredCondemned` | `Number` | Number of CAS GC entries newly condemned into the retired set. Growth indicates objects becoming eligible for later cleanup. |
+| `CASGCRetiredGraduated` | `Number` | The earlier name of `CASGCRetiredIntentConfirmed`, incremented together with it. |
 | `CASGCRetiredIntentConfirmed` | `Number` | Number of CAS GC rows committed `pending` after their deletion intent was confirmed. Growth indicates cleanup progress. |
+| `CASGCRetiredRedeleted` | `Number` | The earlier name of `CASGCRetiredBodyDeleted`, incremented together with it. |
+| `CASGCRetiredRedeleteFailed` | `Number` | The earlier name of `CASGCRetiredBodyDeleteFailed`, incremented together with it. |
 | `CASGCRetiredSpared` | `Number` | Number of CAS GC retired entries spared after references returned. Growing values indicate reference churn or resurrection. |
 | `CASGCRetiredSparedByReref` | `Number` | Number of CAS GC pending or standing rows dropped because the blob was referenced again (an ordinary race, not a fail-closed abort). Subset of CASGCRetiredSpared. |
 | `CASGCStuckRemovals` | `Number` | Number of adopted CAS GC rounds that observed a Removing namespace at or beyond the diagnostic age threshold without terminal cleanup evidence. Incremented and warned every such round; diagnostic only, with no effect on folding, suppression, appends, or deletion. |

@@ -256,6 +256,10 @@ private:
     std::optional<BlobRef> last_sentinel_blob;
 };
 
+/// How many times a read-only view takes the adopted snapshot again after a refusal under a `gc/state` that moved:
+/// a round prunes the runs of a generation a few adoptions later, so a run gone under a newer state is no corruption.
+inline constexpr size_t kAdoptedSnapshotReadAttempts = 3;
+
 /// Store a deterministic write-once artifact (same inputs => byte-identical bytes): the blob in-degree
 /// runs and fold seals. `create`; a `Conflict` means the write was refused, and only what its resolve
 /// read OBSERVED decides what that means: byte-equal bytes are our own deterministic replay (adopt,

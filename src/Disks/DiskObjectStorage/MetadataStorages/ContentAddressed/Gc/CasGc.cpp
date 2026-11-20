@@ -48,6 +48,9 @@ namespace ProfileEvents
     extern const Event CASGCRetiredIntentConfirmed;
     extern const Event CASGCRetiredBodyDeleted;
     extern const Event CASGCRetiredBodyDeleteFailed;
+    extern const Event CASGCRetiredGraduated;
+    extern const Event CASGCRetiredRedeleted;
+    extern const Event CASGCRetiredRedeleteFailed;
     extern const Event CASGCRetireReplaced;
     extern const Event CASGCHeartbeatFenceOuts;
     extern const Event CASGCIntentCreated;
@@ -99,6 +102,33 @@ namespace
 
 /// Soft limit on the namespace janitor's phase: no page starts after it, the page in progress finishes.
 constexpr uint64_t kJanitorBudgetMs = 20'000;
+
+enum class RetiredCount : uint8_t
+{
+    IntentConfirmed,
+    BodyDeleted,
+    BodyDeleteFailed,
+};
+
+/// Each of these counters keeps its released name beside it, for the dashboards and tests that read that name.
+void countRetired(RetiredCount count)
+{
+    switch (count)
+    {
+        case RetiredCount::IntentConfirmed:
+            ProfileEvents::increment(ProfileEvents::CASGCRetiredIntentConfirmed);
+            ProfileEvents::increment(ProfileEvents::CASGCRetiredGraduated);
+            return;
+        case RetiredCount::BodyDeleted:
+            ProfileEvents::increment(ProfileEvents::CASGCRetiredBodyDeleted);
+            ProfileEvents::increment(ProfileEvents::CASGCRetiredRedeleted);
+            return;
+        case RetiredCount::BodyDeleteFailed:
+            ProfileEvents::increment(ProfileEvents::CASGCRetiredBodyDeleteFailed);
+            ProfileEvents::increment(ProfileEvents::CASGCRetiredRedeleteFailed);
+            return;
+    }
+}
 
 /// A `gc/state` below header 4 can only come from an older GC bootstrapping over a deleted state; this build
 /// must not run its rows under the intent rules.
@@ -615,7 +645,7 @@ void Gc::applyRedeleteOutcome(RedeleteRoundContext & ctx, const RetiredEntry & e
     if (ctx.round_work_budget.admitOutcomeRow(ctx.shard, outcome))
         ctx.outcomes[ctx.shard].entries.push_back(std::move(outcome));
     ++ctx.report.bodies_deleted;
-    ProfileEvents::increment(ProfileEvents::CASGCRetiredBodyDeleted);
+    countRetired(RetiredCount::BodyDeleted);
 }
 
 void Gc::reportRedeleteFailure(
@@ -625,7 +655,7 @@ void Gc::reportRedeleteFailure(
     std::exception_ptr exception,
     std::optional<size_t> unsent_count)
 {
-    ProfileEvents::increment(ProfileEvents::CASGCRetiredBodyDeleteFailed);
+    countRetired(RetiredCount::BodyDeleteFailed);
     ++ctx.report.body_delete_failed;
     LOG_WARNING(logger,
         "CAS gc: pending delete of blob {} (key `{}`, condemned at round {}) failed; the round fails before its commit "
@@ -1105,7 +1135,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         for (const RetiredEntry & entry : merge.confirmed)
         {
             ++report.intent_confirmed;
-            ProfileEvents::increment(ProfileEvents::CASGCRetiredIntentConfirmed);
+            countRetired(RetiredCount::IntentConfirmed);
             /// The intent is confirmed; a later round whose cut shows zero deletes the body.
             EventEmitter{*store}.emit([&](CasEvent & e)
             {
@@ -2292,7 +2322,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         }
         catch (...)
         {
-            ProfileEvents::increment(ProfileEvents::CASGCRetiredBodyDeleteFailed);
+            countRetired(RetiredCount::BodyDeleteFailed);
             ++report.body_delete_failed;
             LOG_WARNING(logger,
                 "CAS gc: the HEAD before the pending delete of blob {} (key `{}`) failed; the round fails before its "
@@ -5277,55 +5307,71 @@ RebuildReport Gc::rebuildBaseline(bool force)
 
 Gc::DeletePreview Gc::previewDeletes()
 {
-    DeletePreview preview;
-    std::vector<PreviewEntry> & out = preview.deletes;
-
     CasOperation op = store->openRequests().admit();
-    const auto state_bytes = op.read(store->layout().gcStateKey(), Retry::standard());
-    if (!state_bytes)
-        return preview;
-    const GcState state = decodeGenerationFourGcState(state_bytes->bytes);
-
     const Layout & layout = store->layout();
 
-    /// Resolve the run objects THROUGH the adopted seal's refs, never by
-    /// `blobTargetRunKey` construction: with reference-parent carry a shard's current run may physically
-    /// live under an older generation's key, and the seal ref is the only authority for the real key.
-    /// Group the adopted `blob_target_runs` by the ref's explicit `shard`. Absent seal => no candidates.
-    std::map<uint64_t, std::vector<RunRef>> runs_by_shard;
-    std::map<uint64_t, CondemnedSummary> summaries;
-    if (const auto adopted = readFoldSeal(state.snap_generation, state.snap_attempt))
+    const auto preview_of = [&](const GcState & state)
     {
-        for (const RunRef & r : adopted->blob_target_runs)
-            runs_by_shard[r.shard].push_back(r);
-        summaries = adopted->condemned_summary;
-    }
+        DeletePreview preview;
+        /// Resolve the run objects THROUGH the adopted seal's refs, never by
+        /// `blobTargetRunKey` construction: with reference-parent carry a shard's current run may physically
+        /// live under an older generation's key, and the seal ref is the only authority for the real key.
+        /// Group the adopted `blob_target_runs` by the ref's explicit `shard`. Absent seal => no candidates.
+        std::map<uint64_t, std::vector<RunRef>> runs_by_shard;
+        std::map<uint64_t, CondemnedSummary> summaries;
+        if (const auto adopted = readFoldSeal(state.snap_generation, state.snap_attempt))
+        {
+            for (const RunRef & r : adopted->blob_target_runs)
+                runs_by_shard[r.shard].push_back(r);
+            summaries = adopted->condemned_summary;
+        }
 
-    /// Every shard, read the way a round reads it: a shard the round would refuse adds no row and is named instead.
-    for (uint64_t shard = 0; shard < state.gc_shards; ++shard)
-    {
-        const AdoptedShardPreview rows = previewAdoptedShard(op, runs_by_shard[shard], shard,
-            AdoptedRunContext{.gc_shards = state.gc_shards, .parent_round = state.round, .summary = summaries[shard]});
-        if (rows.refusal)
+        /// Every shard, read the way a round reads it: a shard the round would refuse adds no row and is named instead.
+        for (uint64_t shard = 0; shard < state.gc_shards; ++shard)
         {
-            preview.refused_shards.push_back(rows.refusal->message);
-            continue;
-        }
-        for (const BlobRef & ref : rows.zero)
-        {
-            const std::optional<Meta> observed = op.head(layout.blobKey(ref), Retry::standard());
-            if (!observed)
+            const AdoptedShardPreview rows = previewAdoptedShard(op, runs_by_shard[shard], shard,
+                AdoptedRunContext{.gc_shards = state.gc_shards, .parent_round = state.round, .summary = summaries[shard]});
+            if (rows.refusal)
+            {
+                preview.refused_shards.push_back(rows.refusal->message);
                 continue;
-            out.push_back(PreviewEntry{.kind = ObjectKind::Blob, .ref = ref, .key = layout.blobKey(ref), .size = observed->size,
-                                       .reason = "unreachable", .token = {}, .condemn_round = 0});
+            }
+            for (const BlobRef & ref : rows.zero)
+            {
+                const std::optional<Meta> observed = op.head(layout.blobKey(ref), Retry::standard());
+                if (!observed)
+                    continue;
+                preview.deletes.push_back(PreviewEntry{.kind = ObjectKind::Blob, .ref = ref, .key = layout.blobKey(ref),
+                    .size = observed->size, .reason = "unreachable", .token = {}, .condemn_round = 0});
+            }
+            /// A condemned row carries the incarnation it condemned, so it needs no observation.
+            for (const SourceEdgeRecord & rec : rows.condemned)
+                preview.deletes.push_back(PreviewEntry{.kind = ObjectKind::Blob, .ref = rec.ref, .key = layout.blobKey(rec.ref),
+                    .size = rec.size, .reason = rec.standing ? "standing" : rec.delete_pending ? "pending" : "candidate",
+                    .token = rec.token, .condemn_round = rec.condemn_round});
         }
-        /// A condemned row carries the incarnation it condemned, so it needs no observation.
-        for (const SourceEdgeRecord & rec : rows.condemned)
-            out.push_back(PreviewEntry{.kind = ObjectKind::Blob, .ref = rec.ref, .key = layout.blobKey(rec.ref), .size = rec.size,
-                                       .reason = rec.standing ? "standing" : rec.delete_pending ? "pending" : "candidate",
-                                       .token = rec.token, .condemn_round = rec.condemn_round});
+        return preview;
+    };
+
+    for (size_t attempt = 1;; ++attempt)
+    {
+        const auto state_bytes = op.read(layout.gcStateKey(), Retry::standard());
+        if (!state_bytes)
+            return {};
+        DeletePreview preview = preview_of(decodeGenerationFourGcState(state_bytes->bytes));
+        if (preview.refused_shards.empty())
+            return preview;
+        /// A refusal is the round's only under the `gc/state` it was read under: a newer round may have pruned the run.
+        const std::optional<Meta> state_now = op.head(layout.gcStateKey(), Retry::standard());
+        if (state_now && sameVersion(state_now->etag, state_bytes->etag))
+            return preview;
+        if (attempt == kAdoptedSnapshotReadAttempts)
+        {
+            DeletePreview unread;
+            unread.unread = fmt::format("gc/state moved during each of {} reads of the GC snapshot, so its rows were not read", attempt);
+            return unread;
+        }
     }
-    return preview;
 }
 
 void Gc::rememberObservation(const GcLease & lease)

@@ -49,6 +49,12 @@ extern const Event CASGCIntentDeleted;
 extern const Event CASGCIntentDeletedOnSpare;
 extern const Event CASGCIntentLeftOnSpare;
 extern const Event CASGCReadAheadHit;
+extern const Event CASGCRetiredIntentConfirmed;
+extern const Event CASGCRetiredBodyDeleted;
+extern const Event CASGCRetiredBodyDeleteFailed;
+extern const Event CASGCRetiredGraduated;
+extern const Event CASGCRetiredRedeleted;
+extern const Event CASGCRetiredRedeleteFailed;
 }
 
 namespace DB::ErrorCodes
@@ -1305,6 +1311,36 @@ TEST(CASGcIntents, UnansweredBodyDeleteFailsTheRoundAndKeepsPending)
     pool.backend->lose_body_deletes = false;
     pool.round();
     EXPECT_FALSE(pool.bodyMeta(1).has_value());
+}
+
+/// The released counter names grow with the counters that replaced them: by one round that confirms an intent, one that
+/// fails to delete the body and one that deletes it.
+TEST(CASGcIntents, ReleasedCounterNamesGrowWithTheirSuccessors)
+{
+    using ProfileEvents::Event;
+    const std::vector<std::pair<Event, Event>> pairs = {
+        {ProfileEvents::CASGCRetiredIntentConfirmed, ProfileEvents::CASGCRetiredGraduated},
+        {ProfileEvents::CASGCRetiredBodyDeleted, ProfileEvents::CASGCRetiredRedeleted},
+        {ProfileEvents::CASGCRetiredBodyDeleteFailed, ProfileEvents::CASGCRetiredRedeleteFailed},
+    };
+    std::vector<std::pair<uint64_t, uint64_t>> before;
+    for (const auto & [successor, released] : pairs)
+        before.emplace_back(counter(successor), counter(released));
+
+    auto pool = makePool();
+    ASSERT_NO_FATAL_FAILURE(pool.makePending({1, 2}));
+    pool.backend->lose_body_deletes = true;
+    EXPECT_ANY_THROW(pool.round());
+    pool.backend->lose_body_deletes = false;
+    pool.round();
+    ASSERT_FALSE(pool.bodyMeta(1).has_value()) << "positive control: the body was deleted";
+
+    for (size_t i = 0; i < pairs.size(); ++i)
+    {
+        const uint64_t successor_growth = counter(pairs[i].first) - before[i].first;
+        EXPECT_GE(successor_growth, 1u) << "positive control: pair " << i;
+        EXPECT_EQ(counter(pairs[i].second) - before[i].second, successor_growth) << "pair " << i;
+    }
 }
 
 TEST(CASGcIntents, FailedIntentDeleteFailsTheRound)
@@ -2923,7 +2959,10 @@ TEST(CASGcIntents, AStuckCreateDoesNotStarveLaterCandidatesUnderABudget)
     EXPECT_LE(rounds, 3u);
     EXPECT_TRUE(isCandidate(pool.row(ordered[0])));
     EXPECT_GE(counter(ProfileEvents::CASGCIntentUnconfirmedCarry) - unconfirmed_before, 1u);
-    EXPECT_NE(capture.captured().find(stuck), String::npos) << capture.captured();
+    const std::vector<Poco::Message::Priority> priorities = capture.prioritiesOf(stuck);
+    ASSERT_FALSE(priorities.empty()) << capture.captured();
+    for (const Poco::Message::Priority priority : priorities)
+        EXPECT_EQ(priority, Poco::Message::PRIO_WARNING) << capture.captured();
 }
 
 namespace

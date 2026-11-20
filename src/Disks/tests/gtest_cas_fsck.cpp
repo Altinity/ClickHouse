@@ -2,7 +2,9 @@
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBoundedRun.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
@@ -18,6 +20,7 @@
 #endif
 
 #include <Poco/Exception.h>
+#include <base/scope_guard.h>
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
@@ -1569,10 +1572,43 @@ public:
         return CountingBackend::remove(key, expected_value, access);
     }
 
+    /// Runs `hook` before each stream of a key that contains `fragment`, except the streams the hook itself opens.
+    void beforeEachStream(const String & fragment, std::function<void(const String &)> hook)
+    {
+        std::lock_guard lock(hook_mutex);
+        stream_fragment = fragment;
+        stream_hook = std::move(hook);
+    }
+
+    std::unique_ptr<DB::ReadBuffer> stream(const String & key, TransportAccess & access) override
+    {
+        std::function<void(const String &)> hook;
+        {
+            std::lock_guard lock(hook_mutex);
+            if (stream_hook && !in_stream_hook && key.find(stream_fragment) != String::npos)
+            {
+                hook = stream_hook;
+                in_stream_hook = true;
+            }
+        }
+        if (hook)
+        {
+            SCOPE_EXIT({
+                std::lock_guard lock(hook_mutex);
+                in_stream_hook = false;
+            });
+            hook(key);
+        }
+        return CountingBackend::stream(key, access);
+    }
+
 private:
     std::mutex hook_mutex;
     std::map<String, std::pair<size_t, std::function<void()>>> read_hooks;
     std::map<String, std::function<void()>> head_hooks;
+    String stream_fragment;
+    std::function<void(const String &)> stream_hook;
+    bool in_stream_hook = false;
 };
 
 /// A scan deadline `timeout` from now on the pool's request clock.
@@ -2738,6 +2774,179 @@ TEST(CASFsck, AdoptedSealPrunedUnderAMovedStateIsReadFromTheNewState)
     EXPECT_EQ(rep.intent_unread, 0u) << rep.intent_unread_reason;
     EXPECT_GE(countKeyRequests(f.backend->journal(), JournalVerb::Read, new_seal), 1u) << "the scan did not read the new snapshot";
     EXPECT_TRUE(rep.clean()) << formatFsckSummary(rep);
+}
+
+namespace
+{
+
+std::vector<RunRef> adoptedRunsOf(FsckGcFixture & f)
+{
+    OperationForTest op(*f.backend);
+    const GcState state = decodeGcState((*op).read(f.store->layout().gcStateKey(), Retry::standard())->bytes);
+    const auto seal = (*op).read(f.store->layout().foldSealKey(state.snap_generation, state.snap_attempt), Retry::standard());
+    return decodeFoldSeal(seal->bytes, state.snap_generation).blob_target_runs;
+}
+
+/// What a busy pool does to the run a reader is about to open: a round folds a change to blob `b` into a newer
+/// generation, and the retention of a later round deletes the run.
+void pruneUnderTheReader(FsckGcFixture & f, uint64_t b, const String & run_key)
+{
+    const Layout & layout = f.store->layout();
+    const ManifestRef manifest = ref(1, 0xB0 + b);
+    const String name = "churn" + std::to_string(b);
+    writeManifestRaw(*f.backend, layout, f.ns, manifest, {blobEntryFor("f" + std::to_string(b), numberedBlobHash(b))});
+    publishCommittedTransition(*f.backend, layout, f.ns, name, std::nullopt, manifest);
+    writeFsckCheckpoint(*f.backend, layout, f.ns, RefTxnId{1, dropRefTransition(*f.backend, layout, f.ns, name, manifest)});
+    f.round();
+    if (objectPresent(*f.backend, run_key))
+        removeFsckFixtureKey(*f.backend, run_key);
+}
+
+/// The counts a scan takes from the GC snapshot.
+std::vector<uint64_t> snapshotCountsOf(const FsckReport & rep)
+{
+    return {rep.pending_gc, rep.awaiting_gc, rep.unaccounted, rep.stale_edge, rep.corrupted_runs, rep.intent_unread,
+            rep.pending_without_intent, rep.pending_intent_absent, rep.pending_token_rejected, rep.standing_present};
+}
+
+std::set<String> previewedKeys(const Gc::DeletePreview & preview)
+{
+    std::set<String> keys;
+    for (const Gc::PreviewEntry & e : preview.deletes)
+        keys.insert(e.reason + " " + e.key);
+    return keys;
+}
+
+}
+
+/// A round prunes the run the scan is about to read after `gc/state` moved on: the scan reads the newer snapshot and
+/// counts what a scan of that snapshot counts.
+TEST(CASFsck, RunPrunedUnderAMovedStateIsReadFromTheNewState)
+{
+    FsckGcFixture f;
+    writeBlobBody(*f.backend, f.store->layout(), numberedBlobHash(2));
+    const std::vector<RunRef> old_runs = adoptedRunsOf(f);
+    ASSERT_EQ(old_runs.size(), 1u);
+    size_t pruned = 0;
+    f.backend->beforeEachStream("/blob_target/", [&](const String & key)
+    {
+        if (pruned++ == 0)
+            pruneUnderTheReader(f, 2, key);
+    });
+    f.backend->clearJournal();
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true);
+
+    ASSERT_GE(pruned, 1u) << "the scan never read a run";
+    const std::vector<RunRef> new_runs = adoptedRunsOf(f);
+    ASSERT_EQ(new_runs.size(), 1u);
+    ASSERT_NE(new_runs.front().key, old_runs.front().key) << "positive control: the round wrote a newer run";
+    ASSERT_FALSE(objectPresent(*f.backend, old_runs.front().key)) << "positive control: the old run is gone";
+    EXPECT_EQ(rep.corrupted_runs, 0u) << formatFsckSummary(rep);
+    EXPECT_EQ(rep.intent_unread, 0u) << rep.intent_unread_reason;
+    EXPECT_GE(countKeyRequests(f.backend->journal(), JournalVerb::Stream, new_runs.front().key), 1u);
+    EXPECT_EQ(countVerdictsAtKey(rep, f.bodyKey(2), FsckClass::Unaccounted), 0u) << "only the newer snapshot knows blob 2";
+    f.backend->beforeEachStream("/blob_target/", {});
+    const FsckReport settled = runFsck(*f.store, /*detail=*/true);
+    EXPECT_EQ(snapshotCountsOf(rep), snapshotCountsOf(settled)) << formatFsckSummary(rep) << "\n" << formatFsckSummary(settled);
+}
+
+/// `gc/state` moves before every read of a run: the snapshot is unread, which is a finding, and no run is corrupt.
+TEST(CASFsck, StateMovingAtEveryRunReadLeavesTheSnapshotUnread)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    for (uint64_t b = 2; b < 2 + kAdoptedSnapshotReadAttempts + 1; ++b)
+        writeBlobBody(*f.backend, f.store->layout(), numberedBlobHash(b));
+    size_t pruned = 0;
+    f.backend->beforeEachStream("/blob_target/", [&](const String & key)
+    {
+        pruneUnderTheReader(f, 2 + pruned, key);
+        ++pruned;
+    });
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true);
+
+    EXPECT_EQ(pruned, kAdoptedSnapshotReadAttempts);
+    EXPECT_EQ(rep.corrupted_runs, 0u) << formatFsckSummary(rep);
+    EXPECT_EQ(rep.intent_unread, 1u) << formatFsckSummary(rep);
+    EXPECT_NE(rep.intent_unread_reason.find("gc/state moved"), String::npos) << rep.intent_unread_reason;
+    EXPECT_FALSE(rep.clean());
+    EXPECT_EQ(rep.unaccounted, 0u) << "a blob the unread snapshot cannot speak for is no anomaly";
+    EXPECT_EQ(countVerdictsAtKey(rep, f.bodyKey(2), FsckClass::Unchecked), 1u);
+}
+
+/// The dry run of a pool whose round prunes the run being read lists the rows of the newer snapshot.
+TEST(CASGcPreview, RunPrunedUnderAMovedStateIsPreviewedFromTheNewState)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    writeBlobBody(*f.backend, f.store->layout(), numberedBlobHash(2));
+    size_t pruned = 0;
+    f.backend->beforeEachStream("/blob_target/", [&](const String & key)
+    {
+        if (pruned++ == 0)
+            pruneUnderTheReader(f, 2, key);
+    });
+
+    const Gc::DeletePreview racing = f.gc->previewDeletes();
+
+    ASSERT_GE(pruned, 1u) << "the preview never read a run";
+    EXPECT_TRUE(racing.refused_shards.empty()) << racing.refused_shards.front();
+    EXPECT_TRUE(racing.unread.empty()) << racing.unread;
+    f.backend->beforeEachStream("/blob_target/", {});
+    const Gc::DeletePreview settled = f.gc->previewDeletes();
+    EXPECT_TRUE(previewedKeys(settled).contains("pending " + f.bodyKey(2))) << "positive control: blob 2 is condemned";
+    EXPECT_EQ(previewedKeys(racing), previewedKeys(settled));
+}
+
+/// `gc/state` moves before every read of a run: the dry run is unread, not a refused shard.
+TEST(CASGcPreview, StateMovingAtEveryRunReadLeavesThePreviewUnread)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    for (uint64_t b = 2; b < 2 + kAdoptedSnapshotReadAttempts + 1; ++b)
+        writeBlobBody(*f.backend, f.store->layout(), numberedBlobHash(b));
+    size_t pruned = 0;
+    f.backend->beforeEachStream("/blob_target/", [&](const String & key)
+    {
+        pruneUnderTheReader(f, 2 + pruned, key);
+        ++pruned;
+    });
+
+    const Gc::DeletePreview preview = f.gc->previewDeletes();
+
+    EXPECT_EQ(pruned, kAdoptedSnapshotReadAttempts);
+    EXPECT_TRUE(preview.refused_shards.empty()) << preview.refused_shards.front();
+    EXPECT_TRUE(preview.deletes.empty());
+    EXPECT_NE(preview.unread.find("gc/state moved"), String::npos) << preview.unread;
+}
+
+/// A run absent under an unchanged `gc/state` is one finding; the blobs of its shard are not examined, while the other
+/// shard's blobs are classified as usual.
+TEST(CASFsck, BlobsOfARefusedShardAreNotExamined)
+{
+    constexpr uint64_t shards = 2;
+    uint64_t in_shard[shards] = {0, 0};
+    for (uint64_t b = 1; !in_shard[0] || !in_shard[1]; ++b)
+        if (!in_shard[blobShard(blobRefOf(b), shards)])
+            in_shard[blobShard(blobRefOf(b), shards)] = b;
+    FsckGcFixture f(/*create_budget=*/0, {in_shard[0], in_shard[1]}, shards);
+    f.drop();
+    f.round();
+    for (const RunRef & run : adoptedRunsOf(f))
+        if (run.shard == 1)
+            removeFsckFixtureKey(*f.backend, run.key);
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true);
+
+    EXPECT_EQ(rep.corrupted_runs, 1u) << formatFsckSummary(rep);
+    EXPECT_EQ(rep.unaccounted, 0u) << formatFsckSummary(rep);
+    EXPECT_EQ(countVerdictsAtKey(rep, f.bodyKey(in_shard[1]), FsckClass::Unchecked), 1u);
+    EXPECT_EQ(countVerdictsAtKey(rep, f.bodyKey(in_shard[0]), FsckClass::PendingGc), 1u) << "positive control: shard 0 was read";
 }
 
 /// The capability probe's scratch object under `blob-intents/_probe/` is not an intent and no finding.

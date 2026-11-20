@@ -2149,12 +2149,50 @@ TEST(CASMigratePool, GcStateWithAnotherShardCountIsRefusedBeforeAnyWrite)
     f.backend->clearJournal();
 
     std::vector<String> lines;
-    const String message = messageOf(DB::ErrorCodes::INVALID_STATE, [&] { f.run({}, &lines); });
+    const String message = messageOf(DB::ErrorCodes::CORRUPTED_DATA, [&] { f.run({}, &lines); });
 
     EXPECT_NE(message.find("M3: gc/state names 1 GC shard(s), but _pool_meta names 2"), String::npos) << message;
     EXPECT_TRUE(contains(lines, "M2:")) << "positive control: the run reached M3";
     EXPECT_EQ(mutationsOutsideTheProbes(f.backend->journal(), f), std::vector<String>{});
     EXPECT_EQ(objectsOf(f), before);
+}
+
+/// `gc/state` names a fold seal that is absent: GC refuses such a state as corrupt, so the run stops at M3.
+TEST(CASMigratePool, AbsentAdoptedSealIsRefusedBeforeAnyWrite)
+{
+    Fixture f(3);
+    f.body(1);
+    f.rows({f.row(1, /*pending*/ true)});
+    const GcState state = *f.gcState();
+    ASSERT_NE(state.snap_generation, 0u);
+    const String seal_key = f.layout.foldSealKey(state.snap_generation, state.snap_attempt);
+    {
+        OperationForTest op(*f.backend);
+        const auto seal = (*op).head(seal_key, Retry::standard());
+        ASSERT_TRUE(seal.has_value()) << seal_key;
+        ASSERT_EQ((*op).remove(seal_key, seal->etag, Retry::standard()), Removal::Removed);
+    }
+    const auto before = objectsOf(f);
+    f.backend->clearJournal();
+
+    std::vector<String> lines;
+    const String message = messageOf(DB::ErrorCodes::CORRUPTED_DATA, [&] { f.run({}, &lines); });
+
+    EXPECT_NE(message.find(fmt::format("gc/state names the fold seal `{}`, which is absent", seal_key)), String::npos) << message;
+    EXPECT_TRUE(contains(lines, "M2:")) << "positive control: the run reached M3";
+    EXPECT_EQ(mutationsOutsideTheProbes(f.backend->journal(), f), std::vector<String>{});
+    EXPECT_EQ(objectsOf(f), before);
+}
+
+/// A pool whose reader floor is below the write floor was written by a build too old to migrate from.
+TEST(CASMigratePool, PoolBelowTheWriteFloorIsAnUnknownFormat)
+{
+    Fixture f(G_WRITE_FLOOR - 1);
+    f.backend->clearJournal();
+    const String message = messageOf(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { f.open(); });
+    EXPECT_NE(message.find(fmt::format("reader generation {} is below {}", G_WRITE_FLOOR - 1, G_WRITE_FLOOR)), String::npos)
+        << message;
+    EXPECT_FALSE(anyMutation(f.backend->journal()));
 }
 
 /// `skip_access_check` skips the capability battery, not the rights on `blob-intents/` or the token form: the

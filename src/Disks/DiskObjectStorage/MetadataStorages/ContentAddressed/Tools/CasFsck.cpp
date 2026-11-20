@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBoundedRun.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobIntentFormat.h>
@@ -585,49 +586,49 @@ void classifyIntents(CasOperation & op, const Layout & layout, bool verify, bool
 struct GcSnapshotView
 {
     bool have_state = false;
-    /// `gc/state`, the seal it names and every run of it were read, and every run matched its checksum.
+    /// `gc/state`, the seal it names and every run of it were read, and every run passed the checks a round applies.
     bool complete = false;
+    uint64_t gc_shards = 1;
+    /// No row was read, or none of these shards' rows were: the view cannot speak for their blobs.
+    bool unread_all = false;
+    std::set<uint64_t> unread_shards;
     std::unordered_set<BlobRef, BlobRefHash> in_run_hashes;
     std::unordered_map<BlobRef, CondemnedRow, BlobRefHash> retired_by_hash;
     std::unordered_map<BlobRef, std::vector<UInt128>, BlobRefHash> edge_sources;
     /// Every `pending` row, `wanted` or not: GC deletes its body when its own cut shows no reference, so a reference
     /// committed after that cut does not stop the delete.
     std::unordered_map<BlobRef, CondemnedRow, BlobRefHash> pending_rows;
+
+    bool speaksFor(const BlobRef & ref) const
+    {
+        return !unread_all && !unread_shards.contains(blobShard(ref, gc_shards));
+    }
 };
 
-/// Reads `gc/state`, the adopted fold seal and every source-edge run of it, once each. A run whose checksum
-/// disagrees with the seal is counted into `report.corrupted_runs`, and listed there with `detail`.
-GcSnapshotView readGcSnapshot(CasOperation & op, const Layout & layout, const std::unordered_set<BlobRef, BlobRefHash> & wanted,
-                              bool detail, const FsckProgress & on_progress, const ToolDeadline & deadline, FsckReport & report)
+/// One read of `gc/state` and the snapshot it adopts. Refusals are held apart: they are findings only if `gc/state`
+/// has not moved since.
+struct GcSnapshotAttempt
 {
     GcSnapshotView view;
-    GcState gc_state;
-    std::optional<Object> seal_got;
-    /// A seal missing under a `gc/state` that moved was pruned by a newer round: read that round's snapshot instead.
-    /// Missing under the same `gc/state`, the snapshot is unread and its rows unchecked.
-    std::optional<std::pair<uint64_t, uint64_t>> seal_missing_at;
-    while (true)
-    {
-        const auto state_got = op.read(layout.gcStateKey(), deadline.bound(op, "reading gc snapshot runs"));
-        if (!state_got)
-            return GcSnapshotView{};
-        view.have_state = true;
-        gc_state = decodeGcState(state_got->bytes);
-        if (gc_state.snap_generation == 0)
-            break;
-        const std::pair<uint64_t, uint64_t> adopted{gc_state.snap_generation, gc_state.snap_attempt};
-        const String seal_key = layout.foldSealKey(adopted.first, adopted.second);
-        if (seal_missing_at == adopted)
-        {
-            countIntentUnread(report, fmt::format("the fold seal {} that gc/state adopts is absent, so the GC snapshot and "
-                "its pending rows were not read", seal_key));
-            return view;
-        }
-        seal_got = op.read(seal_key, deadline.bound(op, "reading gc snapshot runs"));
-        if (seal_got)
-            break;
-        seal_missing_at = adopted;
-    }
+    std::optional<Etag> state_token;
+    /// The adopted `(generation, attempt)` when its fold seal is absent.
+    std::optional<std::pair<uint64_t, uint64_t>> seal_absent;
+    /// The refused seal or run and the reason.
+    std::vector<std::pair<String, String>> refusals;
+};
+
+GcSnapshotAttempt readGcSnapshotOnce(CasOperation & op, const Layout & layout, const std::unordered_set<BlobRef, BlobRefHash> & wanted,
+                                     bool detail, const FsckProgress & on_progress, const ToolDeadline & deadline)
+{
+    GcSnapshotAttempt attempt;
+    GcSnapshotView & view = attempt.view;
+    const auto state_got = op.read(layout.gcStateKey(), deadline.bound(op, "reading gc snapshot runs"));
+    if (!state_got)
+        return attempt;
+    attempt.state_token = state_got->etag;
+    view.have_state = true;
+    const GcState gc_state = decodeGcState(state_got->bytes);
+    view.gc_shards = gc_state.gc_shards;
     /// The adopted fold seal names the snapshot runs; resolution is by ref, never by key
     /// construction. Every row whose hash is in our candidate set marks "known to GC" —
     /// edges still counted (drop unfolded), an explicit zero-marker mid-pipeline, or a
@@ -641,14 +642,16 @@ GcSnapshotView readGcSnapshot(CasOperation & op, const Layout & layout, const st
     if (gc_state.snap_generation == 0)
     {
         view.complete = true;   /// no fold has adopted a seal yet: there are no rows
-        return view;
+        return attempt;
     }
-    const auto refuse = [&](const String & key, const String & reason)
+    view.unread_all = true;
+    const String seal_key = layout.foldSealKey(gc_state.snap_generation, gc_state.snap_attempt);
+    const auto seal_got = op.read(seal_key, deadline.bound(op, "reading gc snapshot runs"));
+    if (!seal_got)
     {
-        ++report.corrupted_runs;
-        if (detail)
-            report.objects.push_back(FsckObject{.key = key, .cls = FsckClass::CorruptedRun, .reachable_from = {reason}});
-    };
+        attempt.seal_absent.emplace(gc_state.snap_generation, gc_state.snap_attempt);
+        return attempt;
+    }
     CasFoldSeal seal;
     try
     {
@@ -658,15 +661,15 @@ GcSnapshotView readGcSnapshot(CasOperation & op, const Layout & layout, const st
     {
         if (e.code() != ErrorCodes::CORRUPTED_DATA)
             throw;
-        refuse(layout.foldSealKey(gc_state.snap_generation, gc_state.snap_attempt), e.message());
-        return view;
+        attempt.refusals.emplace_back(seal_key, e.message());
+        return attempt;
     }
+    view.unread_all = false;
     std::map<uint64_t, std::vector<RunRef>> runs_by_shard;
     for (const RunRef & run : seal.blob_target_runs)
         runs_by_shard[run.shard].push_back(run);
     /// Each shard is read the way the GC round reads it, so a run the round refuses is a finding here, and the scan
     /// goes on with the next shard to list every one in a pass.
-    bool all_accepted = true;
     uint64_t rows = 0;
     for (uint64_t shard = 0; shard < gc_state.gc_shards; ++shard)
     {
@@ -698,12 +701,62 @@ GcSnapshotView readGcSnapshot(CasOperation & op, const Layout & layout, const st
         }
         if (const auto & refusal = reader.refusal())
         {
-            all_accepted = false;
-            refuse(refusal->run_key, refusal->message);
+            view.unread_shards.insert(shard);
+            attempt.refusals.emplace_back(refusal->run_key, refusal->message);
         }
     }
-    view.complete = all_accepted;
-    return view;
+    view.complete = attempt.refusals.empty();
+    return attempt;
+}
+
+/// Reads `gc/state`, the adopted fold seal and every source-edge run of it, once each. A seal or run a GC round refuses
+/// is counted into `report.corrupted_runs`, and listed there with `detail`, when `gc/state` has not moved since; under a
+/// moved `gc/state` a round may have pruned it, and the newer snapshot is read instead.
+GcSnapshotView readGcSnapshot(CasOperation & op, const Layout & layout, const std::unordered_set<BlobRef, BlobRefHash> & wanted,
+                              bool detail, const FsckProgress & on_progress, const ToolDeadline & deadline, FsckReport & report)
+{
+    std::optional<std::pair<uint64_t, uint64_t>> seal_absent_before;
+    for (size_t attempt_no = 1;; ++attempt_no)
+    {
+        GcSnapshotAttempt attempt = readGcSnapshotOnce(op, layout, wanted, detail, on_progress, deadline);
+        bool moved = false;
+        if (attempt.seal_absent)
+        {
+            if (attempt.seal_absent == seal_absent_before)
+            {
+                countIntentUnread(report, fmt::format("the fold seal {} that gc/state adopts is absent, so the GC snapshot and "
+                    "its pending rows were not read", layout.foldSealKey(attempt.seal_absent->first, attempt.seal_absent->second)));
+                return std::move(attempt.view);
+            }
+            seal_absent_before = attempt.seal_absent;
+            moved = true;
+        }
+        else if (attempt.refusals.empty())
+            return std::move(attempt.view);
+        else
+        {
+            const auto state_now = op.head(layout.gcStateKey(), deadline.bound(op, "reading gc snapshot runs"));
+            moved = !state_now || !sameVersion(state_now->etag, *attempt.state_token);
+        }
+        if (!moved)
+        {
+            for (const auto & [key, reason] : attempt.refusals)
+            {
+                ++report.corrupted_runs;
+                if (detail)
+                    report.objects.push_back(FsckObject{.key = key, .cls = FsckClass::CorruptedRun, .reachable_from = {reason}});
+            }
+            return std::move(attempt.view);
+        }
+        if (attempt_no == kAdoptedSnapshotReadAttempts)
+        {
+            countIntentUnread(report, fmt::format("gc/state moved during each of {} reads of the GC snapshot, so its rows "
+                "were not read", attempt_no));
+            attempt.view.complete = false;
+            attempt.view.unread_all = true;
+            return std::move(attempt.view);
+        }
+    }
 }
 
 /// The note of a `candidate` or `standing` row over the body it names.
@@ -1382,14 +1435,22 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
 
         FsckClass cls = FsckClass::Unaccounted;
         String note;
+        if (have_gc_state && !snapshot.speaksFor(hash))
+        {
+            /// The refusal or the unread snapshot is the one finding; without rows nothing is known about this body.
+            if (detail)
+                report.objects.push_back(FsckObject{.key = bkey, .kind = ObjectKind::Blob, .size = sz, .cls = FsckClass::Unchecked,
+                    .reachable_from = {fmt::format("not examined: the GC snapshot rows of shard {} were not read",
+                                                   blobShard(hash, snapshot.gc_shards))}});
+            continue;
+        }
         const auto rit = retired_by_hash.find(hash);
         if (rit != retired_by_hash.end())
             deadline.check("classifying unreferenced bodies");
         /// HEAD only for a hash the snapshot actually retired, so an unretired blob still costs no request.
         const std::optional<Meta> retired_head
             = rit != retired_by_hash.end() ? op.head(bkey, deadline.bound(op, "classifying unreferenced bodies")) : std::nullopt;
-        /// GC's comparison. A row whose token names no incarnation is classed by the row, as GC reports it whatever
-        /// the body holds.
+        /// GC's identity comparison. A row whose token names no incarnation is classed by the row: GC deletes no body for it.
         const bool row_names_present = retired_head
             && (!rit->second.token.canonical() || sameIncarnation(rit->second.token, retired_head->etag));
         if (row_names_present)
@@ -1489,7 +1550,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
     /// GC's cut does not stop the delete, and one whose body was gone or replaced before the scan listed it.
     for (const auto & [ref, row] : snapshot.pending_rows)
     {
-        if (pending_rows_checked.contains(ref))
+        if (pending_rows_checked.contains(ref) || !snapshot.speaksFor(ref))
             continue;
         const String bkey = layout.blobKey(ref);
         const bool referenced = reachable_blobs.contains(bkey);

@@ -55,7 +55,8 @@ enum class FsckClass : uint8_t
     Unchecked,     /// the walk could not prove this namespace's stream EITHER WAY (an unprovable epoch
                    /// crossing, an undecodable body, or unstable authority/transport). Not a finding and
                    /// not a clean bill of health: the honest third answer, reported so nobody reads a
-                   /// silence as a proof.
+                   /// silence as a proof. Also an unreferenced blob of a GC shard whose snapshot rows were not
+                   /// read: the refusal or the unread snapshot is the finding, and the blob is not examined.
     LifelessKey,   /// a namespace-tree key the `Layout` parsers refuse (a malformed/non-canonical shape,
                    /// including the un-incarnated layout), OR a catalog incarnation that is
                    /// ambiguous or otherwise unreadable. Neither a current writer nor the catalog's own
@@ -137,8 +138,8 @@ struct FsckReport
     uint64_t intent_replaced = 0;
     uint64_t intent_body_gone = 0;
     uint64_t intent_malformed = 0;
-    /// Reads or `HEAD`s of a deletion intent or its body that failed, and a GC snapshot whose fold seal is absent under
-    /// an unchanged `gc/state`. A hard finding: the scan could not verify what it was asked to, and a refused prefix
+    /// Reads or `HEAD`s of a deletion intent or its body that failed, a GC snapshot whose fold seal is absent under
+    /// an unchanged `gc/state`, and a GC snapshot not read because `gc/state` moved at every read. A hard finding: the scan could not verify what it was asked to, and a refused prefix
     /// would otherwise read as a clean pool.
     uint64_t intent_unread = 0;
     String intent_unread_reason;     /// the first failure: error code and message, shortened
@@ -159,9 +160,9 @@ struct FsckReport
     uint64_t legacy_markers_deleted = 0;
     uint64_t legacy_markers_changed = 0;   /// replaced between the fix's `HEAD` and its delete, and left
 
-    /// GC source-edge runs whose whole-file seal checksum did not match the stored bytes. Cataloged
-    /// with the run key in `objects`; the audit CONTINUES — a read-only auditor
-    /// enumerates all problems in one pass rather than aborting on the first corrupt run.
+    /// Fold seals and GC source-edge runs a GC round refuses as corrupt, under a `gc/state` that did not move while
+    /// they were read. Cataloged with the key and the reason in `objects`. A refused shard is read no further; the
+    /// audit goes on with the next shard.
     uint64_t corrupted_runs = 0;
 
     /// The arithmetic ref-stream walk (spec §7). fsck reads each namespace's stream by EXACT KEY from

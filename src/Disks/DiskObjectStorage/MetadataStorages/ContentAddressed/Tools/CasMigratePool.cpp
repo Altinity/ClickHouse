@@ -652,7 +652,7 @@ private:
     std::vector<InheritedRow> readCondemnedRows(const std::optional<GcState> & state, const PoolMeta & meta)
     {
         if (state && state->gc_shards != meta.gc_shards)
-            throw Exception(ErrorCodes::INVALID_STATE,
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "M3: gc/state names {} GC shard(s), but _pool_meta names {}; GC of this build refuses such a state. The run "
                 "stopped before any intent and before the floor", state->gc_shards, meta.gc_shards);
         if (!state || state->snap_generation == 0)
