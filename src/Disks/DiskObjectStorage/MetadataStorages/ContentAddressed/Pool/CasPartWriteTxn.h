@@ -340,6 +340,9 @@ public:
     ///   `Durable`      -- the append returned; the ref is committed.
     enum class CommitState : uint8_t { NotAttempted, Uncertain, Durable };
     CommitState commitState() const { return commit_state; }
+    /// Whether the last `promote` was refused because its ref already commits another manifest. The refusal keeps
+    /// the retry-later code every caller sees; this tells an occupied destination from a failed append.
+    bool promoteFoundDestinationOccupied() const { return destination_occupied; }
 
 private:
     /// Keyed on the full `BlobRef` pair (algorithm + digest), because a bare digest is not a blob identity.
@@ -383,6 +386,7 @@ private:
     std::atomic<bool> cancelled{false};
     PrecommitState precommit_state = PrecommitState::NotAttempted;
     CommitState commit_state = CommitState::NotAttempted;
+    bool destination_occupied = false;
 
     /// The precommit's target, recorded by `precommitAdd` BEFORE its append and never cleared
     /// afterwards. Two consumers with different lifetimes read them: `abandon` needs them while the

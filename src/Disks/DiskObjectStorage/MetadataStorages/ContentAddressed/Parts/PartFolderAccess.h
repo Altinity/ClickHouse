@@ -38,13 +38,15 @@ struct PartRefKey
     String cacheKey() const { return ns.string() + '\0' + ref; }
 };
 
-/// The committed part a copy adopted entries from without reading their bodies, and the manifest it read there.
+/// The committed part a copy adopted entries from without reading their bodies, the manifest it read there, and the
+/// table runtime that read came from (`CachedPartFolderAccess::resolveCopySource`).
 struct CopySource
 {
     PartRefKey part;
     ManifestRef manifest_ref;
-
-    bool operator==(const CopySource & o) const = default;
+    std::shared_ptr<const PartManifest> manifest;
+    /// Keeps the source table resident until the copy is confirmed.
+    CasRefLedger::TablePin table;
 };
 
 /// Throws `NO_REPLICA_HAS_PART`, the code of an unconfirmed relink source, for a copy into `destination` whose
@@ -68,6 +70,14 @@ struct CommitOutcome
     String ref;
     ManifestRef manifest_ref;
     bool created = false;
+};
+
+/// What a completed rename moved: the source manifest it removed (or found already removed) and the manifest its
+/// destination commits.
+struct RefRename
+{
+    ManifestRef source;
+    ManifestRef destination;
 };
 
 /// Read-freshness policy at the part-folder access boundary. The mutable-read-vs-write-evidence
@@ -203,6 +213,8 @@ public:
     /// interserver relink's byte fallback -- must consult this first: doing that after a commit that
     /// actually landed publishes the same part twice.
     bool commitIsUnresolved() const;
+    /// Whether `promote` was refused because the ref already commits another manifest.
+    bool destinationOccupied() const;
     /// The ref this write will commit to, and the manifest staged for it.
     const PartRefKey & refKey() const { return key; }
     const ManifestId & manifestId() const { return id; }
@@ -302,24 +314,27 @@ public:
     /// confirm-interposed relink path share one protocol sequence.
     CommitOutcome publishEntries(const PartRefKey & dst, const std::vector<Cas::ManifestEntry> & entries,
                         Cas::ProvenanceOp op, PublishPolicy policy = {});
+    /// Resolves `key` fresh and reads its manifest, keeping the table runtime that answered; nullopt when absent.
+    /// A cold table is recovered here, before any destination owes a precommit.
+    std::optional<CopySource> resolveCopySource(const PartRefKey & key) const;
     /// Whether `source.part` still commits exactly `source.manifest_ref`, with no mutation of it in flight,
-    /// while this mount holds its slot (`Pool::confirmExactRef`). A copy that adopts entries without reading
+    /// while this mount holds its slot (`Pool::confirmPinnedRef`). A copy that adopts entries without reading
     /// their bodies asks this after its own precommit is durable and before its promote: a match in the
-    /// committed map alone could be a drop that is durable but not yet applied. Loads the source table first
-    /// if it is not resident (`Pool::resolveRef`), then sends one mount-slot read when the ledger confirms.
-    /// Anything but `Yes` is a refusal: `No` when the source is not the current binding, `Unknown` when it cannot be
-    /// shown to be. A failure of either read propagates. Waits for the source table's state lock
-    /// (`ConfirmLockMode::Wait`) up to the mount's request window. Call it with no ledger lock held.
+    /// committed map alone could be a drop that is durable but not yet applied. Reads the pinned table only, then
+    /// sends one mount-slot read when the ledger confirms. Anything but `Yes` is a refusal: `No` when the source is
+    /// not the current binding, `Unknown` when it cannot be shown to be before the request deadline. A failed read
+    /// propagates. Call it with no ledger lock held.
     ConfirmAnswer confirmCopySource(const CopySource & source) const;
-    /// Moves a committed ref by publishing the source entries at `dst` and then dropping `src` only
-    /// while it still names the republished manifest. Returns false when the source is absent; a
-    /// pre-existing destination with different content is rejected rather than silently discarding the
-    /// source. Throws `CAS_OWNERSHIP_CONFLICT` (after taking back a destination this call created) when
-    /// the source was repointed meanwhile. A destination this call precommits is promoted only after
-    /// `confirmCopySource`; an unconfirmed source takes the precommit back and throws
-    /// `throwCopySourceUnconfirmed`, unless an identical move already committed `dst` with this content. A failed
-    /// confirmation takes the precommit back and propagates its own error.
-    bool republishRef(const PartRefKey & src, const PartRefKey & dst);
+    /// Moves a committed ref by publishing the source entries at `dst` and then dropping `src` only while it still
+    /// names the manifest read. Returns nullopt when the source is absent. Once `dst` commits the source's content,
+    /// whoever committed it, the call removes nothing but that exact source: a source repointed meanwhile throws
+    /// `CAS_OWNERSHIP_CONFLICT` and leaves both bindings, and a destination with other content conflicts as well.
+    /// `expected_source`, when set, is the manifest the caller read for `src`; another binding conflicts.
+    /// A destination this call precommits is promoted only after `confirmCopySource`; a refusal takes the
+    /// precommit back and throws `throwCopySourceUnconfirmed`, unless `dst` already commits this content. A failed
+    /// confirmation or append propagates; cleanup removes only this call's own precommit.
+    std::optional<RefRename> republishRef(const PartRefKey & src, const PartRefKey & dst,
+                                          const std::optional<ManifestRef> & expected_source = std::nullopt);
     /// Rename of a committed ref inside the table namespace without republishing content: one ref-log
     /// append (`OwnerTransitionShape::Move`). `expected` is the manifest the caller resolved for `src`;
     /// any other current binding is a concurrent writer and aborts with `CAS_OWNERSHIP_CONFLICT` (never
@@ -331,9 +346,9 @@ public:
     /// Renames a committed ref, choosing the mechanism: one owner `Move` inside a namespace when the
     /// destination is free, `republishRef` otherwise (another namespace, or a destination an earlier
     /// attempt already published). `expected`, when set, is the manifest the caller read for `src`; any
-    /// other current binding is a concurrent writer and throws `CAS_OWNERSHIP_CONFLICT`. Returns the
-    /// manifest now bound to `dst`, or nullopt when `src` was absent and nothing was renamed.
-    std::optional<Cas::ManifestRef> renameCommittedRef(
+    /// other current binding is a concurrent writer and throws `CAS_OWNERSHIP_CONFLICT`. Returns what moved, or
+    /// nullopt when `src` was absent and nothing was renamed.
+    std::optional<RefRename> renameCommittedRef(
         const PartRefKey & src, const PartRefKey & dst, const std::optional<Cas::ManifestRef> & expected = std::nullopt);
     /// Republishes an already committed part with `entries` (a standalone write or removal on it).
     /// `expected` is the manifest the caller resolved before staging: the repoint throws

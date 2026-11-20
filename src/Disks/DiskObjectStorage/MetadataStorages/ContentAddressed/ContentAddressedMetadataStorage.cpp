@@ -2263,8 +2263,7 @@ CasConfirmAnswer ContentAddressedMetadataStorage::confirmExactRef(
         /// down, is transiently not live, or has reached a terminal lifecycle has no committed view to
         /// speak for -- and `checkOpAdmitted` says so by throwing.
         checkOpAdmitted(CasOpClass::ContentRead);
-        answer = store()->confirmExactRef(Cas::RootNamespace{root_namespace}, ref_name, *manifest_ref,
-            Cas::ConfirmLockMode::TryLock);
+        answer = store()->confirmExactRef(Cas::RootNamespace{root_namespace}, ref_name, *manifest_ref);
     }
     /// Only `Yes` authorizes, and no `catch` can produce a `Yes`. The slot read can also fail with a
     /// transport exception that is not a `DB::Exception`, hence the second clause.

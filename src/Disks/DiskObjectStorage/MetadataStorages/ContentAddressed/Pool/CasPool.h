@@ -621,13 +621,19 @@ public:
     /// `ResolveAudit`'s doc comment (`CasRefLedger.h`) for the one `Deferred` call site.
     std::optional<Resolved> resolveRef(const RootNamespace & ns, const String & ref_name, bool allow_stale = false,
                                        ResolveAudit audit = ResolveAudit::Emit);
+    /// `resolveRef` that also returns the table runtime it read (`CasRefLedger::resolveRefPinned`).
+    std::optional<CasRefLedger::PinnedResolution> resolveRefPinned(const RootNamespace & ns, const String & ref_name);
     /// Gate 1 of the relink confirm. The ledger (`CasRefLedger::confirmExactRef`) decides from memory;
     /// only its `Yes` is re-checked, by one `GET` of the mount slot after the ledger locks are
     /// released, because local fence state cannot see a successor that claimed the slot. A slot this
     /// mount no longer holds, or no renewer to prove it, turns `Yes` into `Unknown`; a failed read
     /// throws, and the storage layer answers `Unknown`. Any other ledger answer issues no request.
-    ConfirmAnswer confirmExactRef(const RootNamespace & ns, const String & ref_name,
-                                  const ManifestRef & manifest_ref, ConfirmLockMode lock_mode) const;
+    ConfirmAnswer confirmExactRef(const RootNamespace & ns, const String & ref_name, const ManifestRef & manifest_ref) const;
+    /// The same gate for an in-process copy, on the table runtime `table` pinned when the source was resolved
+    /// (`CasRefLedger::confirmPinnedRef`). One deadline, the request window from the call's start, bounds the
+    /// ledger's wait for a held state lock and the mount-slot `GET`. A failed read throws.
+    ConfirmAnswer confirmPinnedRef(const CasRefLedger::TablePin & table, const RootNamespace & ns, const String & ref_name,
+                                   const ManifestRef & manifest_ref) const;
     /// TEST SEAM: runs between the ownership capture and the ledger snapshot.
     void setConfirmAfterOwnershipCaptureHookForTest(std::function<void()> hook)
     {
@@ -925,6 +931,10 @@ private:
     /// `open` performs the checks and then moves these values here so no partially validated pool is
     /// exposed to callers.
     Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_);
+
+    /// Captures the slot ownership, takes `ledger_snapshot`, and re-checks a `Yes` with one mount-slot `GET`
+    /// bounded by `deadline_ms` when set.
+    ConfirmAnswer confirmUnderSlot(const std::function<ConfirmAnswer()> & ledger_snapshot, std::optional<uint64_t> deadline_ms) const;
 
     /// Mount-claim policy for `mountWritable`.
     enum class MountClaimPolicy : uint8_t

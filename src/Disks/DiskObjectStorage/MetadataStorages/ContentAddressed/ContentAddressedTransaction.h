@@ -146,7 +146,8 @@ private:
         /// The committed source of each entry in `entries` adopted without reading its body, keyed by entry path.
         /// It follows the entry through staged copies and renames; `confirmCopySources` checks it before promote.
         /// Written only by `putEntry`, `eraseEntry`, `rekeyEntry` and `clearEntries`, which keep it in step with `entries`.
-        std::map<std::string, Cas::CopySource> copy_sources;
+        /// Entries borrowed from one source share one handle (`borrowed_sources`).
+        std::map<std::string, std::shared_ptr<Cas::CopySource>> copy_sources;
         /// The committed manifest this transaction found under the part's name when it first staged a
         /// write to it; a later commit requires exactly that binding. Empty for a part the transaction
         /// creates (`tmp_*`), where a committed row at commit time is somebody else's part, not ours,
@@ -179,6 +180,9 @@ private:
     /// Keyed by (namespace string, ref name) — the routed identity, so live/detached/shadow
     /// stagings never collide.
     std::map<std::pair<std::string, std::string>, PartStaging> parts;
+    /// The handle of each committed part this transaction borrowed entries from, keyed by `PartRefKey::cacheKey`.
+    /// A later borrow of the same manifest shares it, so one confirmation covers every borrower.
+    std::unordered_map<String, std::shared_ptr<Cas::CopySource>> borrowed_sources;
     bool committed = false;
     bool failed = false;
 
@@ -204,16 +208,22 @@ private:
 
     /// Replaces the staged entry at `entry.path`; `source` is its committed source when it was adopted from
     /// another part without its bytes, and nullopt when this transaction uploads or inlines the bytes.
-    static void putEntry(PartStaging & st, Cas::ManifestEntry entry, std::optional<Cas::CopySource> source);
+    static void putEntry(PartStaging & st, Cas::ManifestEntry entry, std::shared_ptr<Cas::CopySource> source);
     static void eraseEntry(PartStaging & st, const std::string & path);
     /// Renames `entry`, an element of `st.entries`, in place; `new_path` must not be staged.
     static void rekeyEntry(PartStaging & st, Cas::ManifestEntry & entry, std::string new_path);
     static void clearEntries(PartStaging & st);
-    static std::optional<Cas::CopySource> copySourceOf(const PartStaging & st, const std::string & path);
-    /// Confirms each distinct committed source of `st`'s adopted entries. Runs after the precommit of
-    /// `st.build` is durable and before its promote; on a refusal it abandons the build and throws
-    /// `NO_REPLICA_HAS_PART`, and on a failed read it abandons the build and rethrows.
-    void confirmCopySources(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st);
+    static std::shared_ptr<Cas::CopySource> copySourceOf(const PartStaging & st, const std::string & path);
+    /// The refs of `st`'s pending uploads, collected once per publication.
+    using PendingRefs = std::unordered_set<Cas::BlobRef, Cas::BlobRefHash>;
+    /// Confirms each distinct committed source of `st`'s adopted entries, skipping entries whose ref is in
+    /// `pending_refs`. Runs after the precommit of `st.build` is durable and before its promote; on a refusal it
+    /// abandons the build and throws `NO_REPLICA_HAS_PART`, and on a failed read it abandons the build and rethrows.
+    void confirmCopySources(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st, const PendingRefs & pending_refs);
+    /// After this transaction renamed `from` to `to`, points the borrow of `from` at `to`, when the rename moved the
+    /// manifest the borrow read and `to` still commits the manifest the rename produced. Any other borrow keeps its
+    /// source, and its confirmation refuses it.
+    void retargetBorrow(const Cas::PartRefKey & from, const Cas::PartRefKey & to, const Cas::RefRename & renamed);
 
     /// Returns (and, when necessary, creates) the staging state for a routed namespace/ref.
     PartStaging & stagingFor(const ContentAddressedMetadataStorage::Route & r);
@@ -240,7 +250,8 @@ private:
 
     /// Stages `st.entries` as a manifest of `st.build`, precommits it at `ref`, confirms the copy sources and uploads
     /// the pending blobs, in that order. Returns the staged manifest's id.
-    Cas::ManifestId precommitAndUpload(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st);
+    Cas::ManifestId precommitAndUpload(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st,
+                                       const PendingRefs & pending_refs);
 
     /// Adopts a manifest entry into another part while preserving its storage state. For a pending
     /// blob, `copy_pending` controls whether the staging record is copied (hardlink semantics) or

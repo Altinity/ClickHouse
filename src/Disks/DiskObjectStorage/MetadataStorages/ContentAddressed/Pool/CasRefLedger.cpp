@@ -345,6 +345,20 @@ void CasRefLedger::setRefRecoveryRetrySleepForTest(
 std::optional<Resolved> CasRefLedger::resolveRef(const RootNamespace & ns, const String & ref_name, bool /*allow_stale*/,
                                                  ResolveAudit audit)
 {
+    auto pinned = resolveRefOnRuntime(ns, ref_name, audit);
+    if (!pinned)
+        return std::nullopt;
+    return pinned->resolved;
+}
+
+std::optional<CasRefLedger::PinnedResolution> CasRefLedger::resolveRefPinned(const RootNamespace & ns, const String & ref_name)
+{
+    return resolveRefOnRuntime(ns, ref_name, ResolveAudit::Emit);
+}
+
+std::optional<CasRefLedger::PinnedResolution> CasRefLedger::resolveRefOnRuntime(
+    const RootNamespace & ns, const String & ref_name, ResolveAudit audit)
+{
     /// The read side of the snapshot+log protocol has one authoritative cached table for this mounted
     /// writer. The `allow_stale` staleness-tolerance knob no longer selects anything: this mounted writer is the
     /// ONLY writer of `ns`'s ref state (no external CAS token to go stale against, unlike the old
@@ -409,10 +423,13 @@ std::optional<Resolved> CasRefLedger::resolveRef(const RootNamespace & ns, const
     }
     if (pending_event)
         emitEvent(std::move(*pending_event));
-    return Resolved{
-        .manifest_id = ManifestId{.root_namespace = ns, .ref = resolved_ref},
-        .manifest_size = 0,
-        .published_at_ms = resolved_published_at_ms,
+    return PinnedResolution{
+        .resolved = Resolved{
+            .manifest_id = ManifestId{.root_namespace = ns, .ref = resolved_ref},
+            .manifest_size = 0,
+            .published_at_ms = resolved_published_at_ms,
+        },
+        .table = TablePin(rt),
     };
 }
 
@@ -470,39 +487,23 @@ bool CasRefLedger::hasAnyRefWithPrefix(const RootNamespace & ns, std::string_vie
 }
 
 
-ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const String & ref_name,
-                                           const ManifestRef & manifest_ref, ConfirmLockMode lock_mode) const
+namespace
 {
-    const uint64_t started_ms = boot_ms_now_fn();
-    /// Held from the wait until the next pass answers: a runtime nobody holds may be evicted, and an evicted table
-    /// answers `Unknown` for a live source.
-    std::shared_ptr<RefTableRuntime> waited_on;
-    while (true)
-    {
-        if (const auto answer = confirmExactRefIfStateLockFree(ns, ref_name, manifest_ref))
-            return *answer;
-        if (lock_mode == ConfirmLockMode::TryLock || boot_ms_now_fn() - started_ms >= cas_request_budget.request_window_ms)
-        {
-            ProfileEvents::increment(ProfileEvents::CASRelinkConfirmRefusedStateLockBusy);
-            LOG_TRACE(confirmLogger(), "Relink confirm for ref '{}' in namespace '{}' is unknown: the table's state lock is held",
-                      ref_name, ns.string());
-            return ConfirmAnswer::Unknown;
-        }
-        if (confirm_before_state_lock_wait_hook_for_test)
-            confirm_before_state_lock_wait_hook_for_test();
-        /// Waits holding no other ledger lock, so append admission of every table goes on meanwhile.
-        waited_on = lookupRefTableRuntime(ns);
-        if (waited_on)
-        {
-            std::lock_guard<std::mutex> wait_for_holder(waited_on->state_mutex);
-        }
-        if (confirm_after_state_lock_wait_hook_for_test)
-            confirm_after_state_lock_wait_hook_for_test();
-    }
+
+/// Every `Unknown` past residency is counted on the node that computed it: `ConfirmAnswer` crosses two interfaces as
+/// a three-value enum, so the counters and this trace line are the only way a live gate can tell load
+/// (`RefMutationInFlight`) from a fault (`LaneWedged`, `LaneBroken`), from contention (`StateLockBusy`), or from this
+/// mount losing its claim to the namespace (`MountCannotSpeak`).
+ConfirmAnswer refuseConfirm(ProfileEvents::Event reason, const RootNamespace & ns, const String & ref_name, std::string_view why)
+{
+    ProfileEvents::increment(reason);
+    LOG_TRACE(confirmLogger(), "Relink confirm for ref '{}' in namespace '{}' is unknown: {}", ref_name, ns.string(), why);
+    return ConfirmAnswer::Unknown;
 }
 
-std::optional<ConfirmAnswer> CasRefLedger::confirmExactRefIfStateLockFree(const RootNamespace & ns, const String & ref_name,
-                                                                         const ManifestRef & manifest_ref) const
+}
+
+ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const String & ref_name, const ManifestRef & manifest_ref) const
 {
     /// Gate 1 of the relink confirm. A `Yes` authorizes a remote relink receiver, or an in-process copy,
     /// to promote a manifest whose blobs are protected only by this writer's committed binding of that
@@ -544,7 +545,7 @@ std::optional<ConfirmAnswer> CasRefLedger::confirmExactRefIfStateLockFree(const 
     ///
     /// These two arms are the ONLY refusals in this function that are deliberately not counted: a table
     /// this mount has never touched, or has dropped under cache-budget pressure, is ordinary cache
-    /// behaviour rather than the lane, mount or load condition each counter below separates. Counting
+    /// behaviour rather than the lane, mount or load condition each counter separates. Counting
     /// it would put a number that moves with cache size next to numbers that describe this writer's
     /// health. There is also no runtime here to attribute the refusal to.
     const auto it = ref_name_slots.find(ns.string());
@@ -554,26 +555,61 @@ std::optional<ConfirmAnswer> CasRefLedger::confirmExactRefIfStateLockFree(const 
         return ConfirmAnswer::Unknown;
     RefTableRuntime & rt = *it->second.current;
 
-    /// Every refusal below is attributed here, on the node that computed it: `ConfirmAnswer` crosses
-    /// two interfaces as a three-value enum and stays that way, so the counters and this trace line are
-    /// the only way a live gate can tell load (`RefMutationInFlight`) from a fault (`LaneWedged`,
-    /// `LaneBroken`), from contention (`StateLockBusy`), or from this mount losing its claim to the
-    /// namespace (`MountCannotSpeak`). The invariant to keep when editing below: every
-    /// `return ConfirmAnswer::Unknown` past this point goes through `refuse`, and the only uncounted
-    /// refusals in this function are the two residency arms above, which say why.
-    const auto refuse = [&](ProfileEvents::Event reason, std::string_view why)
-    {
-        ProfileEvents::increment(reason);
-        LOG_TRACE(confirmLogger(), "Relink confirm for ref '{}' in namespace '{}' is unknown: {}",
-                  ref_name, ns.string(), why);
-        return ConfirmAnswer::Unknown;
-    };
-
     /// Only a try-lock: this function holds `ref_queue_mutex`, which is pool-wide append admission, and waiting
     /// here would make every table's lane wait on this table's state lock.
     std::unique_lock<std::mutex> slock(rt.state_mutex, std::try_to_lock);
     if (!slock.owns_lock())
-        return std::nullopt;
+        return refuseConfirm(ProfileEvents::CASRelinkConfirmRefusedStateLockBusy, ns, ref_name, "the table's state lock is held");
+    return confirmLocked(rt, ns, ref_name, manifest_ref);
+}
+
+ConfirmAnswer CasRefLedger::confirmPinnedRef(const TablePin & table, const RootNamespace & ns, const String & ref_name,
+                                             const ManifestRef & manifest_ref, uint64_t deadline_ms) const
+{
+    if (!table.runtime)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "confirmPinnedRef: ref '{}' in namespace '{}' has no pinned table",
+                        ref_name, ns.string());
+    RefTableRuntime & rt = *table.runtime;
+    const auto refuse_busy = [&]
+    {
+        return refuseConfirm(ProfileEvents::CASRelinkConfirmRefusedStateLockBusy, ns, ref_name,
+                             "the table's state lock was held until the request deadline");
+    };
+    while (true)
+    {
+        {
+            std::lock_guard<std::mutex> qlock(ref_queue_mutex);
+            const auto it = ref_name_slots.find(ns.string());
+            if (it == ref_name_slots.end() || it->second.current != table.runtime)
+                return refuseConfirm(ProfileEvents::CASRelinkConfirmRefusedMountCannotSpeak, ns, ref_name,
+                                     "the table was replaced since the source was resolved");
+            /// A try-lock under the pool lock, as in `confirmExactRef`: the wait below holds no ledger lock.
+            std::unique_lock<std::mutex> slock(rt.state_mutex, std::try_to_lock);
+            if (slock.owns_lock())
+                return confirmLocked(rt, ns, ref_name, manifest_ref);
+        }
+        if (boot_ms_now_fn() >= deadline_ms)
+            return refuse_busy();
+        if (confirm_before_state_lock_wait_hook_for_test)
+            confirm_before_state_lock_wait_hook_for_test();
+        {
+            std::lock_guard<std::mutex> wait_for_holder(rt.state_mutex);
+        }
+        if (confirm_after_state_lock_wait_hook_for_test)
+            confirm_after_state_lock_wait_hook_for_test();
+        if (boot_ms_now_fn() >= deadline_ms)
+            return refuse_busy();
+    }
+}
+
+ConfirmAnswer CasRefLedger::confirmLocked(const RefTableRuntime & rt, const RootNamespace & ns, const String & ref_name,
+                                          const ManifestRef & manifest_ref) const
+{
+    /// Every `return ConfirmAnswer::Unknown` here goes through `refuse`.
+    const auto refuse = [&](ProfileEvents::Event reason, std::string_view why)
+    {
+        return refuseConfirm(reason, ns, ref_name, why);
+    };
 
     /// Rule 2 (warm). An unrecovered or mid-recovery runtime has an EMPTY `state`, which would read as
     /// "the ref does not exist" -- knowledge it does not have. `superseded_by_remount` is the same

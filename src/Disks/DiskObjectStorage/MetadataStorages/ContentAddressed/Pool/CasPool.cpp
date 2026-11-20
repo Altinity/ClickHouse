@@ -2237,8 +2237,29 @@ DropNamespaceStats Pool::dropNamespace(const NamespaceLifeId & life)
     });
 }
 
-ConfirmAnswer Pool::confirmExactRef(const RootNamespace & ns, const String & ref_name,
-                                    const ManifestRef & manifest_ref, ConfirmLockMode lock_mode) const
+std::optional<CasRefLedger::PinnedResolution> Pool::resolveRefPinned(const RootNamespace & ns, const String & ref_name)
+{
+    return ref_ledger.resolveRefPinned(ns, ref_name);
+}
+
+ConfirmAnswer Pool::confirmExactRef(const RootNamespace & ns, const String & ref_name, const ManifestRef & manifest_ref) const
+{
+    return confirmUnderSlot([&] { return ref_ledger.confirmExactRef(ns, ref_name, manifest_ref); }, std::nullopt);
+}
+
+ConfirmAnswer Pool::confirmPinnedRef(const CasRefLedger::TablePin & table, const RootNamespace & ns, const String & ref_name,
+                                     const ManifestRef & manifest_ref) const
+{
+    const uint64_t started_ms = bootMsNow();
+    const uint64_t window_ms = config.cas_request_budget.request_window_ms;
+    const uint64_t deadline_ms = window_ms > std::numeric_limits<uint64_t>::max() - started_ms
+        ? std::numeric_limits<uint64_t>::max() : started_ms + window_ms;
+    return confirmUnderSlot(
+        [&] { return ref_ledger.confirmPinnedRef(table, ns, ref_name, manifest_ref, deadline_ms); }, deadline_ms);
+}
+
+ConfirmAnswer Pool::confirmUnderSlot(const std::function<ConfirmAnswer()> & ledger_snapshot,
+                                     std::optional<uint64_t> deadline_ms) const
 {
     /// Captured before the ledger snapshot: if a remount lands in between, this older ownership cannot
     /// hold the new slot, so the mismatch refuses. The order is safety-bearing;
@@ -2246,7 +2267,7 @@ ConfirmAnswer Pool::confirmExactRef(const RootNamespace & ns, const String & ref
     const std::shared_ptr<const MountSlotOwnership> ownership = mount_runtime.slotOwnership();
     if (confirm_after_ownership_capture_hook_for_test)
         confirm_after_ownership_capture_hook_for_test();
-    const ConfirmAnswer answer = ref_ledger.confirmExactRef(ns, ref_name, manifest_ref, lock_mode);
+    const ConfirmAnswer answer = ledger_snapshot();
     if (answer != ConfirmAnswer::Yes)
         return answer;
     if (confirm_after_ledger_snapshot_hook_for_test)
@@ -2256,7 +2277,7 @@ ConfirmAnswer Pool::confirmExactRef(const RootNamespace & ns, const String & ref
     {
         try
         {
-            held = mount_runtime.slotHeldBy(*ownership);
+            held = mount_runtime.slotHeldBy(*ownership, deadline_ms);
         }
         catch (...)
         {

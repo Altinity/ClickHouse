@@ -391,7 +391,7 @@ TEST(CASConfirmExactRef, TryLockAnswersUnknownWhileTheStateLockIsHeld)
             return;
         ALLOW_ALLOCATIONS_IN_SCOPE;
         const uint64_t before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedStateLockBusy);
-        std::thread([&] { answer_while_held = store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock); }).join();
+        std::thread([&] { answer_while_held = store->confirmExactRef(ns, "x", id.ref); }).join();
         busy_refusals = refusalCount(ProfileEvents::CASRelinkConfirmRefusedStateLockBusy) - before;
     });
     SCOPE_EXIT({ store->setInstallRegionProbeForTest(nullptr); });
@@ -400,7 +400,7 @@ TEST(CASConfirmExactRef, TryLockAnswersUnknownWhileTheStateLockIsHeld)
     ASSERT_TRUE(fired->load()) << "the install region never ran";
     EXPECT_EQ(answer_while_held, std::optional<ConfirmAnswer>(ConfirmAnswer::Unknown));
     EXPECT_EQ(busy_refusals, 1u);
-    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes) << "positive control: the lock is free again";
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes) << "positive control: the lock is free again";
 }
 
 /// Rule 5, the affirmative case: a warm, quiescent, `Ready`, fenced table whose committed row for
@@ -416,15 +416,15 @@ TEST(CASConfirmExactRef, QuiescentExactMatchIsYes)
 
     const ManifestId id = publishEmptyPart(store, ns, "x");
 
-    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);
 
     /// Same name, a manifest this ref never named.
     ManifestRef other = id.ref;
     ++other.manifest_ordinal;
-    EXPECT_EQ(store->confirmExactRef(ns, "x", other, ConfirmLockMode::TryLock), ConfirmAnswer::No);
+    EXPECT_EQ(store->confirmExactRef(ns, "x", other), ConfirmAnswer::No);
 
     /// A name with no committed row at all -- on a warm table that is knowledge, not ambiguity.
-    EXPECT_EQ(store->confirmExactRef(ns, "no_such_ref", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::No);
+    EXPECT_EQ(store->confirmExactRef(ns, "no_such_ref", id.ref), ConfirmAnswer::No);
 }
 
 
@@ -438,13 +438,13 @@ TEST(CASConfirmExactRef, RepointedRefIsNo)
     const RootNamespace ns{"srv1/confirm_repoint"};
 
     const ManifestId first = publishEmptyPart(store, ns, "x");
-    ASSERT_EQ(store->confirmExactRef(ns, "x", first.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    ASSERT_EQ(store->confirmExactRef(ns, "x", first.ref), ConfirmAnswer::Yes);
 
     const ManifestId second = publishEmptyPart(store, ns, "x", /*replace=*/true);
     ASSERT_NE(first.ref, second.ref) << "a repoint must mint a fresh ManifestRef (the ABA barrier)";
 
-    EXPECT_EQ(store->confirmExactRef(ns, "x", first.ref, ConfirmLockMode::TryLock), ConfirmAnswer::No);
-    EXPECT_EQ(store->confirmExactRef(ns, "x", second.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    EXPECT_EQ(store->confirmExactRef(ns, "x", first.ref), ConfirmAnswer::No);
+    EXPECT_EQ(store->confirmExactRef(ns, "x", second.ref), ConfirmAnswer::Yes);
 }
 
 
@@ -458,16 +458,16 @@ TEST(CASConfirmExactRef, DroppedAndRecreatedRefIsNo)
     const RootNamespace ns{"srv1/confirm_recreate"};
 
     const ManifestId first = publishEmptyPart(store, ns, "x");
-    ASSERT_EQ(store->confirmExactRef(ns, "x", first.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    ASSERT_EQ(store->confirmExactRef(ns, "x", first.ref), ConfirmAnswer::Yes);
 
     store->dropRef(ns, "x");
-    EXPECT_EQ(store->confirmExactRef(ns, "x", first.ref, ConfirmLockMode::TryLock), ConfirmAnswer::No)
+    EXPECT_EQ(store->confirmExactRef(ns, "x", first.ref), ConfirmAnswer::No)
         << "a dropped ref cannot authorize anything";
 
     const ManifestId second = publishEmptyPart(store, ns, "x");
     ASSERT_NE(first.ref, second.ref);
-    EXPECT_EQ(store->confirmExactRef(ns, "x", first.ref, ConfirmLockMode::TryLock), ConfirmAnswer::No);
-    EXPECT_EQ(store->confirmExactRef(ns, "x", second.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    EXPECT_EQ(store->confirmExactRef(ns, "x", first.ref), ConfirmAnswer::No);
+    EXPECT_EQ(store->confirmExactRef(ns, "x", second.ref), ConfirmAnswer::Yes);
 }
 
 
@@ -487,7 +487,7 @@ TEST(CASConfirmExactRef, ColdTableIsUnknownWithZeroBackendRequests)
     const size_t cached_before = store->refTablesCachedCountForTest();
     backend->resetCounts();
 
-    EXPECT_EQ(store->confirmExactRef(cold, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Unknown);
+    EXPECT_EQ(store->confirmExactRef(cold, "x", id.ref), ConfirmAnswer::Unknown);
 
     EXPECT_EQ(backendRequests(*backend), 0u)
         << "a cold table must answer Unknown without recovering from storage";
@@ -508,14 +508,14 @@ TEST(CASConfirmExactRef, EvictedTableIsUnknownWithZeroBackendRequests)
     const RootNamespace ns_b{"srv1/confirm_evict_b"};
 
     const ManifestId id_a = publishEmptyPart(store, ns_a, "x");
-    ASSERT_EQ(store->confirmExactRef(ns_a, "x", id_a.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    ASSERT_EQ(store->confirmExactRef(ns_a, "x", id_a.ref), ConfirmAnswer::Yes);
 
     /// A 1-byte budget is below one table's weight, so touching another table evicts the idle one.
     publishEmptyPart(store, ns_b, "y");
     ASSERT_FALSE(store->refTableCachedForTest(ns_a)) << "ns_a must have been evicted";
 
     backend->resetCounts();
-    EXPECT_EQ(store->confirmExactRef(ns_a, "x", id_a.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Unknown);
+    EXPECT_EQ(store->confirmExactRef(ns_a, "x", id_a.ref), ConfirmAnswer::Unknown);
     EXPECT_EQ(backendRequests(*backend), 0u)
         << "an evicted table must answer Unknown without re-recovering";
     EXPECT_FALSE(store->refTableCachedForTest(ns_a))
@@ -546,7 +546,7 @@ TEST(CASConfirmExactRef, UnrecoveredResidentTableIsUnknownWithZeroBackendRequest
     /// for the namespace, and the live gate must be able to tell those apart.
     const uint64_t cannot_speak_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedMountCannotSpeak);
     const uint64_t broken_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneBroken);
-    EXPECT_EQ(store->confirmExactRef(ns, "x", ManifestRef{1, 1, 1}, ConfirmLockMode::TryLock), ConfirmAnswer::Unknown);
+    EXPECT_EQ(store->confirmExactRef(ns, "x", ManifestRef{1, 1, 1}), ConfirmAnswer::Unknown);
     EXPECT_EQ(refusalCount(ProfileEvents::CASRelinkConfirmRefusedMountCannotSpeak) - cannot_speak_before, 1u)
         << "an unrecovered view must be reported as this mount being unable to speak for the table";
     EXPECT_EQ(refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneBroken) - broken_before, 0u)
@@ -589,7 +589,7 @@ TEST(CASConfirmExactRef, RecoveryInProgressIsUnknownWithZeroBackendRequests)
     /// somebody else's recovery while holding pool-wide append admission. The elapsed bound is what
     /// pins that -- it is an order of magnitude below the park, so it cannot pass by luck.
     const auto started = std::chrono::steady_clock::now();
-    const ConfirmAnswer answer = store->confirmExactRef(ns, "x", ManifestRef{1, 1, 1}, ConfirmLockMode::TryLock);
+    const ConfirmAnswer answer = store->confirmExactRef(ns, "x", ManifestRef{1, 1, 1});
     const auto elapsed = std::chrono::steady_clock::now() - started;
     const uint64_t requests = backendRequests(*backend);
 
@@ -632,7 +632,7 @@ TEST(CASConfirmExactRef, InFlightAppendIsUnknown)
     const RootNamespace ns{"srv1/confirm_inflight"};
 
     const ManifestId id = publishEmptyPart(store, ns, "x");
-    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);
 
     LeaderLatch latch;
     latch.arm(store);
@@ -644,7 +644,7 @@ TEST(CASConfirmExactRef, InFlightAppendIsUnknown)
     /// test.
     const bool leader_active = store->refLeaderActiveForTest(ns);
     const RefLaneState apply_state = store->laneStateForTest(ns);
-    const ConfirmAnswer while_in_flight = store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock);
+    const ConfirmAnswer while_in_flight = store->confirmExactRef(ns, "x", id.ref);
 
     latch.release();
     dropper.join();
@@ -656,7 +656,7 @@ TEST(CASConfirmExactRef, InFlightAppendIsUnknown)
     EXPECT_EQ(while_in_flight, ConfirmAnswer::Unknown)
         << "an admitted mutation of THIS ref makes its committed row provisional";
 
-    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::No);
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::No);
 }
 
 
@@ -674,7 +674,7 @@ TEST(CASConfirmExactRef, UntouchedRefConfirmsMidTenure)
     const RootNamespace ns{"srv1/confirm_mid_tenure"};
 
     const ManifestId id = publishEmptyPart(store, ns, "seed");
-    ASSERT_EQ(store->confirmExactRef(ns, "seed", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    ASSERT_EQ(store->confirmExactRef(ns, "seed", id.ref), ConfirmAnswer::Yes);
 
     std::atomic<int> boundaries{0};
     std::atomic<int> yes_for_seed_at_boundary{0};
@@ -687,16 +687,16 @@ TEST(CASConfirmExactRef, UntouchedRefConfirmsMidTenure)
             return;
         boundaries.fetch_add(1);
         const uint64_t before = backendRequests(*backend);
-        if (store->confirmExactRef(ns, "seed", id.ref, ConfirmLockMode::TryLock) == ConfirmAnswer::Yes)
+        if (store->confirmExactRef(ns, "seed", id.ref) == ConfirmAnswer::Yes)
             yes_for_seed_at_boundary.fetch_add(1);
         /// "aaa_" has no committed row (rule 5 would say `No`), so an `Unknown` here can only come from
         /// rule 3 reading the carved item's scope.
-        if (store->confirmExactRef(ns, "aaa_", id.ref, ConfirmLockMode::TryLock) == ConfirmAnswer::Unknown)
+        if (store->confirmExactRef(ns, "aaa_", id.ref) == ConfirmAnswer::Unknown)
             unknown_for_carved_ref_at_boundary.fetch_add(1);
         /// "bbb_" is the mirror's SECOND entry and likewise has no committed row, so this is the same
         /// assertion made about an entry a rule that stopped at the front of `carved` would never
         /// reach.
-        if (store->confirmExactRef(ns, "bbb_", id.ref, ConfirmLockMode::TryLock) == ConfirmAnswer::Unknown)
+        if (store->confirmExactRef(ns, "bbb_", id.ref) == ConfirmAnswer::Unknown)
             unknown_for_second_carved_ref_at_boundary.fetch_add(1);
         requests_at_boundary.fetch_add(static_cast<int>(backendRequests(*backend) - before));
     });
@@ -754,7 +754,7 @@ TEST(CASConfirmExactRef, UntouchedRefConfirmsMidTenure)
         << "only the seed's Yes may issue a request, and only its one mount-slot read";
 
     /// The tenure is over: the seed ref confirms as before.
-    EXPECT_EQ(store->confirmExactRef(ns, "seed", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    EXPECT_EQ(store->confirmExactRef(ns, "seed", id.ref), ConfirmAnswer::Yes);
 }
 
 
@@ -769,14 +769,14 @@ TEST(CASConfirmExactRef, WedgedLaneIsUnknown)
     DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns);
 
     const ManifestId id = publishEmptyPart(store, ns, "x");
-    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);
 
     store->forceWedgeForTest(ns, /*writer_epoch=*/1, /*ref_sequence=*/9999,
                              store->layout().refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), RefTxnId{1, 9999}), "synthetic");
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
 
     backend->resetCounts();
-    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Unknown);
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Unknown);
     EXPECT_EQ(backendRequests(*backend), 0u)
         << "a wedged lane must answer Unknown without trying to resolve the wedge";
 }
@@ -811,8 +811,8 @@ TEST(CASConfirmExactRef, WedgedTransactionRefusesEveryRef)
 
     const ManifestId id_x = publishEmptyPart(store, ns, "x");
     const ManifestId id_other = publishEmptyPart(store, ns, "other");
-    ASSERT_EQ(store->confirmExactRef(ns, "x", id_x.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
-    ASSERT_EQ(store->confirmExactRef(ns, "other", id_other.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    ASSERT_EQ(store->confirmExactRef(ns, "x", id_x.ref), ConfirmAnswer::Yes);
+    ASSERT_EQ(store->confirmExactRef(ns, "other", id_other.ref), ConfirmAnswer::Yes);
 
     backend->fault_substr = store->layout().namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::Unresolved;
@@ -838,8 +838,8 @@ TEST(CASConfirmExactRef, WedgedTransactionRefusesEveryRef)
     /// the broken-lane branch answered for it.
     const uint64_t wedged_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneWedged);
     const uint64_t broken_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneBroken);
-    EXPECT_EQ(store->confirmExactRef(ns, "x", id_x.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Unknown) << "x's removal may be durable";
-    EXPECT_EQ(store->confirmExactRef(ns, "other", id_other.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Unknown)
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id_x.ref), ConfirmAnswer::Unknown) << "x's removal may be durable";
+    EXPECT_EQ(store->confirmExactRef(ns, "other", id_other.ref), ConfirmAnswer::Unknown)
         << "a wedge refuses table-wide: no per-ref record of the wedged transaction survives the tenure";
     EXPECT_EQ(backendRequests(*backend), 0u) << "a wedged lane must answer without trying to resolve the wedge";
     EXPECT_EQ(refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneWedged) - wedged_before, 2u)
@@ -937,7 +937,7 @@ TEST(CASConfirmExactRef, MisScopedItemFailsBeforeAnythingIsDurable)
     /// fence still holds if the durable step ever changes shape.
     EXPECT_EQ(backend->writeTotal(), writes_before) << "the refusal must happen before any object is written";
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready) << "a validation failure is not a lane fault";
-    EXPECT_EQ(store->confirmExactRef(ns, "seed", seed.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes)
+    EXPECT_EQ(store->confirmExactRef(ns, "seed", seed.ref), ConfirmAnswer::Yes)
         << "the failed item must leave the table exactly as it was";
 }
 #endif
@@ -1048,7 +1048,7 @@ TEST(CASConfirmExactRef, NeedsRecoveryIsUnknown)
     const RootNamespace ns{"srv1/confirm_poison"};
 
     const ManifestId keep = publishEmptyPart(store, ns, "keep");
-    ASSERT_EQ(store->confirmExactRef(ns, "keep", keep.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    ASSERT_EQ(store->confirmExactRef(ns, "keep", keep.ref), ConfirmAnswer::Yes);
 
     armOneShotInstallFailure(store);
     EXPECT_THROW(publishEmptyPart(store, ns, "other"), DB::Exception);
@@ -1062,7 +1062,7 @@ TEST(CASConfirmExactRef, NeedsRecoveryIsUnknown)
     /// `LaneBroken` is FOR, so this is the one refusal that must be reported as one.
     const uint64_t broken_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneBroken);
     const uint64_t wedged_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneWedged);
-    EXPECT_EQ(store->confirmExactRef(ns, "keep", keep.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Unknown)
+    EXPECT_EQ(store->confirmExactRef(ns, "keep", keep.ref), ConfirmAnswer::Unknown)
         << "a table that may be missing a durable transaction cannot confirm ANY of its rows";
     EXPECT_EQ(refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneBroken) - broken_before, 1u)
         << "a NeedsRecovery lane is exactly what LaneBroken reports";
@@ -1081,7 +1081,7 @@ TEST(CASConfirmExactRef, LostMountFenceIsUnknown)
     const RootNamespace ns{"srv1/confirm_fence"};
 
     const ManifestId id = publishEmptyPart(store, ns, "x");
-    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);
 
     store->tripMountLost();
 
@@ -1091,7 +1091,7 @@ TEST(CASConfirmExactRef, LostMountFenceIsUnknown)
     /// The other arm of the same counter: rule 6's fence check. Losing the mount is the most
     /// safety-relevant refusal this function has, so it must not be the silent one.
     const uint64_t cannot_speak_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedMountCannotSpeak);
-    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Unknown);
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Unknown);
     EXPECT_EQ(refusalCount(ProfileEvents::CASRelinkConfirmRefusedMountCannotSpeak) - cannot_speak_before, 1u)
         << "a refusal for a lost mount fence must be counted, not invisible";
     EXPECT_EQ(backendRequests(*backend), 0u);
@@ -1102,7 +1102,7 @@ TEST(CASConfirmExactRef, LostMountFenceIsUnknown)
     /// keeps a future reordering of the rules from changing the answer silently.
     ManifestRef other = id.ref;
     ++other.manifest_ordinal;
-    EXPECT_EQ(store->confirmExactRef(ns, "x", other, ConfirmLockMode::TryLock), ConfirmAnswer::No);
+    EXPECT_EQ(store->confirmExactRef(ns, "x", other), ConfirmAnswer::No);
 }
 
 
@@ -1122,7 +1122,7 @@ TEST(CASConfirmExactRef, ConcurrentAppendIsOrderedAfterTheSnapshot)
     const RootNamespace ns{"srv1/confirm_race"};
 
     const ManifestId id = publishEmptyPart(store, ns, "x");
-    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes) << "phase 1: before admission";
+    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes) << "phase 1: before admission";
 
     LeaderLatch latch;
     latch.arm(store);
@@ -1136,7 +1136,7 @@ TEST(CASConfirmExactRef, ConcurrentAppendIsOrderedAfterTheSnapshot)
     int saw_yes = 0;
     for (int i = 0; i < 64; ++i)
     {
-        const ConfirmAnswer a = store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock);
+        const ConfirmAnswer a = store->confirmExactRef(ns, "x", id.ref);
         if (a != ConfirmAnswer::Unknown)
             ++not_unknown;
         if (a == ConfirmAnswer::Yes)
@@ -1151,7 +1151,7 @@ TEST(CASConfirmExactRef, ConcurrentAppendIsOrderedAfterTheSnapshot)
     EXPECT_EQ(not_unknown, 0) << "phase 2: an admitted append makes the committed view provisional";
 
     /// Phase 3: durable and applied.
-    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::No) << "phase 3: after the removal";
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::No) << "phase 3: after the removal";
 }
 
 
@@ -1172,7 +1172,7 @@ TEST(CASConfirmExactRef, UntouchedRefConfirmsWhileAnotherRefIsQueued)
     const ManifestId id_x = publishEmptyPart(store, ns, "x");
     const ManifestId id_other = publishEmptyPart(store, ns, "other");
     const ManifestId id_third = publishEmptyPart(store, ns, "third");
-    ASSERT_EQ(store->confirmExactRef(ns, "x", id_x.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    ASSERT_EQ(store->confirmExactRef(ns, "x", id_x.ref), ConfirmAnswer::Yes);
 
     LeaderLatch latch;
     latch.arm(store);
@@ -1194,13 +1194,13 @@ TEST(CASConfirmExactRef, UntouchedRefConfirmsWhileAnotherRefIsQueued)
     /// lane state.
     const uint64_t in_flight_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight);
     const uint64_t broken_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneBroken);
-    const ConfirmAnswer untouched = store->confirmExactRef(ns, "x", id_x.ref, ConfirmLockMode::TryLock);
+    const ConfirmAnswer untouched = store->confirmExactRef(ns, "x", id_x.ref);
     const uint64_t in_flight_after_untouched
         = refusalCount(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight);
-    const ConfirmAnswer touched = store->confirmExactRef(ns, "other", id_other.ref, ConfirmLockMode::TryLock);
+    const ConfirmAnswer touched = store->confirmExactRef(ns, "other", id_other.ref);
     const uint64_t in_flight_after_touched
         = refusalCount(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight);
-    const ConfirmAnswer touched_behind_the_front = store->confirmExactRef(ns, "third", id_third.ref, ConfirmLockMode::TryLock);
+    const ConfirmAnswer touched_behind_the_front = store->confirmExactRef(ns, "third", id_third.ref);
     const uint64_t in_flight_after_behind_the_front
         = refusalCount(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight);
     const uint64_t broken_after = refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneBroken);
@@ -1227,9 +1227,9 @@ TEST(CASConfirmExactRef, UntouchedRefConfirmsWhileAnotherRefIsQueued)
         << "the queued ref's own row is provisional";
     EXPECT_EQ(touched_behind_the_front, ConfirmAnswer::Unknown)
         << "rule 3 must scan the whole pending queue, not only its front item";
-    EXPECT_EQ(store->confirmExactRef(ns, "x", id_x.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
-    EXPECT_EQ(store->confirmExactRef(ns, "other", id_other.ref, ConfirmLockMode::TryLock), ConfirmAnswer::No);
-    EXPECT_EQ(store->confirmExactRef(ns, "third", id_third.ref, ConfirmLockMode::TryLock), ConfirmAnswer::No);
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id_x.ref), ConfirmAnswer::Yes);
+    EXPECT_EQ(store->confirmExactRef(ns, "other", id_other.ref), ConfirmAnswer::No);
+    EXPECT_EQ(store->confirmExactRef(ns, "third", id_third.ref), ConfirmAnswer::No);
 }
 
 
@@ -1243,7 +1243,7 @@ TEST(CASConfirmExactRef, ConfirmExactRefIsNotRefusedByAMoveOnOtherRefs)
 
     const ManifestId id_a = publishEmptyPart(store, ns, "a");
     const ManifestId id_c = publishEmptyPart(store, ns, "c");
-    ASSERT_EQ(store->confirmExactRef(ns, "c", id_c.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    ASSERT_EQ(store->confirmExactRef(ns, "c", id_c.ref), ConfirmAnswer::Yes);
 
     LeaderLatch latch;
     latch.arm(store);
@@ -1263,10 +1263,10 @@ TEST(CASConfirmExactRef, ConfirmExactRefIsNotRefusedByAMoveOnOtherRefs)
     latch.awaitEntered();
 
     const uint64_t in_flight_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight);
-    const ConfirmAnswer other = store->confirmExactRef(ns, "c", id_c.ref, ConfirmLockMode::TryLock);
+    const ConfirmAnswer other = store->confirmExactRef(ns, "c", id_c.ref);
     const uint64_t in_flight_after_other = refusalCount(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight);
-    const ConfirmAnswer source = store->confirmExactRef(ns, "a", id_a.ref, ConfirmLockMode::TryLock);
-    const ConfirmAnswer destination = store->confirmExactRef(ns, "b", id_a.ref, ConfirmLockMode::TryLock);
+    const ConfirmAnswer source = store->confirmExactRef(ns, "a", id_a.ref);
+    const ConfirmAnswer destination = store->confirmExactRef(ns, "b", id_a.ref);
     const uint64_t in_flight_after_both = refusalCount(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight);
 
     latch.release();
@@ -1278,7 +1278,7 @@ TEST(CASConfirmExactRef, ConfirmExactRefIsNotRefusedByAMoveOnOtherRefs)
     EXPECT_EQ(source, ConfirmAnswer::Unknown);
     EXPECT_EQ(destination, ConfirmAnswer::Unknown);
     EXPECT_EQ(in_flight_after_both - in_flight_after_other, 2u);
-    EXPECT_EQ(store->confirmExactRef(ns, "b", id_a.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    EXPECT_EQ(store->confirmExactRef(ns, "b", id_a.ref), ConfirmAnswer::Yes);
 }
 
 #ifndef DEBUG_OR_SANITIZER_BUILD
@@ -1307,7 +1307,7 @@ TEST(CASConfirmExactRef, MoveOpsOutsideTheirScopeFailTheFlushCheck)
         EXPECT_EQ(e.code(), DB::ErrorCodes::LOGICAL_ERROR);
     }
     EXPECT_EQ(backend->writeTotal(), writes_before) << "the refusal must happen before any object is written";
-    EXPECT_EQ(store->confirmExactRef(ns, "a", id_a.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    EXPECT_EQ(store->confirmExactRef(ns, "a", id_a.ref), ConfirmAnswer::Yes);
 }
 #else
 TEST(CASConfirmExactRefDeathTest, MoveOpsOutsideTheirScopeFailTheFlushCheckAborts)
@@ -1343,7 +1343,7 @@ TEST(CASConfirmExactRef, WholeShardScopedMutationRefusesAnUntouchedRef)
 
     const ManifestId id_x = publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "other");
-    ASSERT_EQ(store->confirmExactRef(ns, "x", id_x.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    ASSERT_EQ(store->confirmExactRef(ns, "x", id_x.ref), ConfirmAnswer::Yes);
 
     LeaderLatch latch;
     latch.arm(store);
@@ -1351,7 +1351,7 @@ TEST(CASConfirmExactRef, WholeShardScopedMutationRefusesAnUntouchedRef)
     latch.awaitEntered();
 
     /// Sampled while parked, asserted after the join (a failed assertion here would skip the release).
-    const ConfirmAnswer before_whole_shard = store->confirmExactRef(ns, "x", id_x.ref, ConfirmLockMode::TryLock);
+    const ConfirmAnswer before_whole_shard = store->confirmExactRef(ns, "x", id_x.ref);
 
     /// Queued BEHIND the parked leader's own `Ref`-scoped item. The ops are an add/remove precommit
     /// pair on a ref of its own, so the item is ordinary work that happens to declare no ref -- the
@@ -1369,7 +1369,7 @@ TEST(CASConfirmExactRef, WholeShardScopedMutationRefusesAnUntouchedRef)
 
     const uint64_t in_flight_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight);
     const uint64_t broken_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneBroken);
-    const ConfirmAnswer with_whole_shard = store->confirmExactRef(ns, "x", id_x.ref, ConfirmLockMode::TryLock);
+    const ConfirmAnswer with_whole_shard = store->confirmExactRef(ns, "x", id_x.ref);
     const uint64_t in_flight_after = refusalCount(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight);
     const uint64_t broken_after = refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneBroken);
 
@@ -1389,7 +1389,7 @@ TEST(CASConfirmExactRef, WholeShardScopedMutationRefusesAnUntouchedRef)
         << "the lane is Ready here: a refusal attributed to a broken lane would misreport a fault";
 
     /// The tenure is over and the whole-shard item is applied: 'x' confirms again.
-    EXPECT_EQ(store->confirmExactRef(ns, "x", id_x.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id_x.ref), ConfirmAnswer::Yes);
 }
 
 
@@ -1404,7 +1404,7 @@ TEST(CASConfirmExactRef, SameRefRepointDurableButNotInstalledIsUnknown)
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/confirm_stale_row"};
     const ManifestId m1 = publishEmptyPart(store, ns, "x");
-    ASSERT_EQ(store->confirmExactRef(ns, "x", m1.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    ASSERT_EQ(store->confirmExactRef(ns, "x", m1.ref), ConfirmAnswer::Yes);
 
     struct Hold
     {
@@ -1441,7 +1441,7 @@ TEST(CASConfirmExactRef, SameRefRepointDurableButNotInstalledIsUnknown)
     /// loop -- the only place where its attribution can be pinned.
     const uint64_t in_flight_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight);
     const uint64_t broken_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneBroken);
-    const ConfirmAnswer stale = store->confirmExactRef(ns, "x", m1.ref, ConfirmLockMode::TryLock);
+    const ConfirmAnswer stale = store->confirmExactRef(ns, "x", m1.ref);
     const uint64_t in_flight_delta
         = refusalCount(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight) - in_flight_before;
     const uint64_t broken_delta = refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneBroken) - broken_before;
@@ -1463,8 +1463,8 @@ TEST(CASConfirmExactRef, SameRefRepointDurableButNotInstalledIsUnknown)
         << "a refusal read off the carved mirror is a mutation in flight, not a lane fault";
     EXPECT_EQ(broken_delta, 0u)
         << "the lane is Writing with a carved item -- the healthy shape, not a broken one";
-    EXPECT_EQ(store->confirmExactRef(ns, "x", m1.ref, ConfirmLockMode::TryLock), ConfirmAnswer::No) << "installed: m1 is no longer x's binding";
-    EXPECT_EQ(store->confirmExactRef(ns, "x", m2.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    EXPECT_EQ(store->confirmExactRef(ns, "x", m1.ref), ConfirmAnswer::No) << "installed: m1 is no longer x's binding";
+    EXPECT_EQ(store->confirmExactRef(ns, "x", m2.ref), ConfirmAnswer::Yes);
 }
 
 
@@ -1968,13 +1968,13 @@ TEST(CASConfirmExactRef, ForeignClaimWhileFenceLiveAnswersUnknown)
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/confirm_slot_foreign"};
     const ManifestId id = publishEmptyPart(store, ns, "x");
-    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);
 
     rewriteMountSlot(*backend, mountSlotKey(store), [](MountLease & lease) { lease.server_uuid += 1; });
     ASSERT_TRUE(store->mayMutate()) << "the local fence must still say live, or the fence answers instead";
 
     const uint64_t moved_before = slotMovedCount();
-    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Unknown);
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Unknown);
     EXPECT_EQ(slotMovedCount() - moved_before, 1u);
 }
 
@@ -1985,12 +1985,12 @@ TEST(CASConfirmExactRef, SamePairNewAttemptAnswersUnknown)
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/confirm_slot_same_pair"};
     const ManifestId id = publishEmptyPart(store, ns, "x");
-    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);
 
     rewriteMountSlot(*backend, mountSlotKey(store), [](MountLease & lease) { lease.write_attempt_id += 1; });
 
     const uint64_t moved_before = slotMovedCount();
-    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Unknown);
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Unknown);
     EXPECT_EQ(slotMovedCount() - moved_before, 1u);
 }
 
@@ -2000,14 +2000,14 @@ TEST(CASConfirmExactRef, SlotDeletedAnswersUnknown)
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/confirm_slot_deleted"};
     const ManifestId id = publishEmptyPart(store, ns, "x");
-    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);
 
     CasRequests requests = DB::Cas::tests::openRequestsForTest(*backend);
     CasOperation op = requests.admit();
     ASSERT_EQ(op.removeCurrent(mountSlotKey(store), Retry::standard()), Removal::Removed);
 
     const uint64_t moved_before = slotMovedCount();
-    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Unknown);
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Unknown);
     EXPECT_EQ(slotMovedCount() - moved_before, 1u);
 }
 
@@ -2020,7 +2020,7 @@ TEST(CASConfirmExactRef, SlotMovedBetweenSnapshotAndGetAnswersUnknown)
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/confirm_slot_moved_late"};
     const ManifestId id = publishEmptyPart(store, ns, "x");
-    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);
 
     const String key = mountSlotKey(store);
     bool moved = false;
@@ -2036,7 +2036,7 @@ TEST(CASConfirmExactRef, SlotMovedBetweenSnapshotAndGetAnswersUnknown)
         moved = true;
     });
 
-    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Unknown);
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Unknown);
     store->setConfirmAfterLedgerSnapshotHookForTest(nullptr);
     ASSERT_TRUE(moved);
     EXPECT_EQ(slot_reads_before_boundary, 0u) << "the slot was read before the ledger snapshot";
@@ -2050,7 +2050,7 @@ TEST(CASConfirmExactRef, RemountBetweenSnapshotAndGetAnswersUnknown)
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/confirm_slot_remount"};
     const ManifestId id = publishEmptyPart(store, ns, "x");
-    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);
 
     const String key = mountSlotKey(store);
     const uint64_t epoch_before = store->liveWriterEpoch();
@@ -2066,14 +2066,14 @@ TEST(CASConfirmExactRef, RemountBetweenSnapshotAndGetAnswersUnknown)
     });
 
     const uint64_t moved_before = slotMovedCount();
-    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Unknown);
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Unknown);
     store->setConfirmAfterLedgerSnapshotHookForTest(nullptr);
     ASSERT_TRUE(remounted) << "the remount must complete inside the window";
     ASSERT_NE(store->liveWriterEpoch(), epoch_before);
     EXPECT_EQ(slotMovedCount() - moved_before, 1u);
 
     ASSERT_TRUE(store->resolveRef(ns, "x").has_value());
-    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);
 }
 
 /// A remount between the ownership capture and the ledger snapshot: the snapshot then comes from the
@@ -2085,7 +2085,7 @@ TEST(CASConfirmExactRef, RemountBetweenCaptureAndSnapshotAnswersUnknown)
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/confirm_capture_remount"};
     const ManifestId id = publishEmptyPart(store, ns, "x");
-    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);
 
     const String key = mountSlotKey(store);
     bool remounted = false;
@@ -2101,11 +2101,11 @@ TEST(CASConfirmExactRef, RemountBetweenCaptureAndSnapshotAnswersUnknown)
     });
 
     const uint64_t moved_before = slotMovedCount();
-    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Unknown);
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Unknown);
     store->setConfirmAfterOwnershipCaptureHookForTest(nullptr);
     ASSERT_TRUE(remounted) << "the remount must complete inside the window";
     EXPECT_EQ(slotMovedCount() - moved_before, 1u);
-    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes)
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes)
         << "the ledger alone answers Yes after the remount; only the slot check refuses";
 }
 
@@ -2127,7 +2127,7 @@ TEST(CASConfirmExactRef, GcFenceOverInFlightRenewalAnswersUnknown)
             lease.gc_fenced = true;
             lease.seq += 1;
         });
-        answer = store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock);
+        answer = store->confirmExactRef(ns, "x", id.ref);
     });
 
     EXPECT_EQ(answer, ConfirmAnswer::Unknown);
@@ -2146,11 +2146,11 @@ TEST(CASConfirmExactRef, OwnRenewInFlightAnswersYes)
     std::optional<ConfirmAnswer> answer;
     whileRenewalLandedUnanswered(*backend, store, [&]
     {
-        answer = store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock);
+        answer = store->confirmExactRef(ns, "x", id.ref);
     });
 
     EXPECT_EQ(answer, ConfirmAnswer::Yes);
-    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes) << "and after the response";
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes) << "and after the response";
 }
 
 TEST(CASConfirmExactRef, OwnSlotAnswersYesWithOneRead)
@@ -2161,7 +2161,7 @@ TEST(CASConfirmExactRef, OwnSlotAnswersYesWithOneRead)
     const ManifestId id = publishEmptyPart(store, ns, "x");
 
     backend->resetCounts();
-    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);
     EXPECT_EQ(backend->getCount(mountSlotKey(store)), 1u);
     EXPECT_EQ(backendRequests(*backend), 1u) << "the slot read is the only request a Yes may cost";
 }
@@ -2184,7 +2184,7 @@ TEST(CASConfirmExactRef, FailedSlotReadThrowsAndIsCounted)
     };
     tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
     {
-        (void)store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock);
+        (void)store->confirmExactRef(ns, "x", id.ref);
     });
     EXPECT_EQ(slotUnreadableCount() - unreadable_before, 1u);
 
@@ -2196,7 +2196,7 @@ TEST(CASConfirmExactRef, FailedSlotReadThrowsAndIsCounted)
     ASSERT_TRUE(std::holds_alternative<Committed>(garbled));
     tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
     {
-        (void)store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock);
+        (void)store->confirmExactRef(ns, "x", id.ref);
     });
     /// Put a decodable body back, so the pool's farewell at teardown meets an ordinary conflict.
     ASSERT_TRUE(std::holds_alternative<Committed>(
@@ -2280,7 +2280,7 @@ TEST(CASConfirmExactRef, FenceLostAfterTheSnapshotThrowsAndIsCounted)
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/confirm_slot_fence_lost_late"};
     const ManifestId id = publishEmptyPart(store, ns, "x");
-    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);
 
     store->setConfirmAfterLedgerSnapshotHookForTest([&]
     {
@@ -2291,7 +2291,7 @@ TEST(CASConfirmExactRef, FenceLostAfterTheSnapshotThrowsAndIsCounted)
     const uint64_t moved_before = slotMovedCount();
     tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
     {
-        (void)store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock);
+        (void)store->confirmExactRef(ns, "x", id.ref);
     });
     store->setConfirmAfterLedgerSnapshotHookForTest(nullptr);
 
@@ -2313,7 +2313,7 @@ TEST(CASConfirmExactRef, LeaseBudgetSpentAfterTheSnapshotThrowsAndIsCounted)
     auto store = openPoolWithConfig(backend, std::move(config));
     const RootNamespace ns{"srv1/confirm_slot_budget_spent"};
     const ManifestId id = publishEmptyPart(store, ns, "x");
-    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);
 
     store->setConfirmAfterLedgerSnapshotHookForTest([&]
     {
@@ -2323,7 +2323,7 @@ TEST(CASConfirmExactRef, LeaseBudgetSpentAfterTheSnapshotThrowsAndIsCounted)
     const uint64_t unreadable_before = slotUnreadableCount();
     tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
     {
-        (void)store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock);
+        (void)store->confirmExactRef(ns, "x", id.ref);
     });
     store->setConfirmAfterLedgerSnapshotHookForTest(nullptr);
 
@@ -2338,7 +2338,7 @@ TEST(CASConfirmExactRef, FarewellAfterTheSnapshotAnswersUnknown)
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/confirm_slot_farewell"};
     const ManifestId id = publishEmptyPart(store, ns, "x");
-    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);
 
     const String key = mountSlotKey(store);
     store->setConfirmAfterLedgerSnapshotHookForTest([&]
@@ -2350,7 +2350,7 @@ TEST(CASConfirmExactRef, FarewellAfterTheSnapshotAnswersUnknown)
         });
     });
     const uint64_t moved_before = slotMovedCount();
-    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Unknown);
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Unknown);
     store->setConfirmAfterLedgerSnapshotHookForTest(nullptr);
     EXPECT_EQ(slotMovedCount() - moved_before, 1u);
 }
@@ -2371,7 +2371,7 @@ TEST(CASConfirmExactRef, NoRenewerAnswersUnknownWithoutARead)
 
     backend->resetCounts();
     const uint64_t moved_before = slotMovedCount();
-    EXPECT_EQ(reader->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Unknown);
+    EXPECT_EQ(reader->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Unknown);
     EXPECT_EQ(backendRequests(*backend), 0u);
     EXPECT_EQ(slotMovedCount() - moved_before, 1u) << "the ledger said Yes and the missing proof refused it";
 }
@@ -2384,7 +2384,7 @@ TEST(CASConfirmExactRef, RenewalCommittedBetweenGetAndCheckAnswersUnknown)
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/confirm_slot_renewal_after_get"};
     const ManifestId id = publishEmptyPart(store, ns, "x");
-    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes);
+    ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);
 
     backend->watched_key = mountSlotKey(store);
     bool renewed = false;
@@ -2394,9 +2394,9 @@ TEST(CASConfirmExactRef, RenewalCommittedBetweenGetAndCheckAnswersUnknown)
         renewed = true;
     };
     const uint64_t moved_before = slotMovedCount();
-    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Unknown);
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Unknown);
     ASSERT_TRUE(renewed);
     EXPECT_EQ(slotMovedCount() - moved_before, 1u);
 
-    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref, ConfirmLockMode::TryLock), ConfirmAnswer::Yes) << "the next confirm reads the new body";
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes) << "the next confirm reads the new body";
 }

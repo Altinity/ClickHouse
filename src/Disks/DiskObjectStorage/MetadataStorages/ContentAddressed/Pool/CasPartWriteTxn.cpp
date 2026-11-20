@@ -890,6 +890,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
     /// `NotAttempted` -- and a caller may safely conclude the ref was not committed. From here on it
     /// may not.
     commit_state = CommitState::Uncertain;
+    destination_occupied = false;
     store->appendRefOps(target_ns, MutationScope::ref(final_ref_name),
         /// Capture the closure's INPUTS by value (ref name, manifest id, promote build id, repoint flag,
         /// staged leaves) rather than `[&]`, as defense-in-depth against a closure outliving this stack.
@@ -902,6 +903,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
         (const RefTableState & state) -> std::vector<RefOp>
         {
             created = !state.getCommitted().contains(final_ref_name);
+            destination_occupied = false;
 
             /// Idempotent re-promote: the target ref is ALREADY committed to this EXACT manifest_ref --
             /// a legitimate re-drive (a crash/retry between a prior promote and its caller's own
@@ -1014,9 +1016,12 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
                 it != state.getCommitted().end() && !(it->second.manifest_ref == id.ref))
             {
                 if (!policy.expected)
+                {
+                    destination_occupied = true;
                     throwCasWriteRetryLater(fmt::format(
                         "promote: ref '{}' already names a different committed manifest — refusing to overwrite "
                         "(unique-ref invariant; an intended repoint goes through repointRef)", final_ref_name));
+                }
                 repoint_old = it->second.manifest_ref;
             }
 

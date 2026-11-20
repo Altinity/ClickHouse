@@ -201,8 +201,8 @@ public:
     /// One `GET` of the mount slot, admitted on the mount plane: true when it still holds a body
     /// `ownership` wrote (`MountSlotOwnership::holds`), false otherwise, including an absent slot.
     /// A refused admission (lost fence, spent lease budget), a request failure and a decode failure
-    /// propagate.
-    bool slotHeldBy(const MountSlotOwnership & ownership) const;
+    /// propagate. `deadline_ms`, when set, bounds the request on the mount plane's clock instead of a fresh window.
+    bool slotHeldBy(const MountSlotOwnership & ownership, std::optional<uint64_t> deadline_ms = std::nullopt) const;
     /// Permanently latch the local fence as lost for this runtime incarnation.
     void tripMountLost();
     /// Publish the BOOTTIME deadline from a successful lease renewal.

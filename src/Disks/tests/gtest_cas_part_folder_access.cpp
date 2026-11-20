@@ -69,6 +69,13 @@ Cas::ManifestId publishPart(const Cas::PoolPtr & store, const Cas::RootNamespace
     return id;
 }
 
+/// The manifest `key` commits now, or nullopt when it commits none.
+std::optional<Cas::ManifestId> committedManifest(const Cas::CachedPartFolderAccess & access, const Cas::PartRefKey & key)
+{
+    const auto resolved = access.resolve(key, Cas::Freshness::ForceFresh);
+    return resolved ? std::optional<Cas::ManifestId>(resolved->manifest_id) : std::nullopt;
+}
+
 Cas::CachedPartFolderAccess::CacheParams cacheOn()
 {
     return {.cache_bytes = 64ULL << 20, .max_entries = 10000, .max_entry_bytes = 16ULL << 20,
@@ -425,7 +432,7 @@ TEST(CASPartFolderAccess, DropRefExactDistinguishesRemovedGoneMismatch)
     EXPECT_EQ(access.dropRefExact({ns, "p"}, m2), Cas::Removal::Gone);
 }
 
-TEST(CASPartFolderAccess, RepublishRefAbortsAndCompensatesWhenSourceRepointedAfterPublish)
+TEST(CASPartFolderAccess, RepublishRefKeepsItsDestinationWhenSourceRepointedAfterPublish)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -433,18 +440,21 @@ TEST(CASPartFolderAccess, RepublishRefAbortsAndCompensatesWhenSourceRepointedAft
     Cas::CachedPartFolderAccess access(store);
 
     publishPart(store, ns, "src", {inlineEntry("f", "same")});
+    std::optional<Cas::ManifestId> dst_committed;
     access.setHookForTest(Cas::CachedPartFolderAccess::TestHook::BeforeSourceDrop, [&]
     {
+        dst_committed = committedManifest(access, {ns, "dst"});
         access.repointRef({ns, "src"}, {inlineEntry("f", "newer")}, Cas::ProvenanceOp::Other, access.resolve({ns, "src"}, Cas::Freshness::ForceFresh)->manifest_id.ref);
     });
     expectThrowsCode(DB::ErrorCodes::CAS_OWNERSHIP_CONFLICT, [&] { access.republishRef({ns, "src"}, {ns, "dst"}); });
     access.setHookForTest(Cas::CachedPartFolderAccess::TestHook::BeforeSourceDrop, nullptr);
 
-    EXPECT_FALSE(access.existsRef({ns, "dst"}, Cas::Freshness::ForceFresh)) << "the destination this call created must be compensated";
+    ASSERT_TRUE(dst_committed.has_value());
+    EXPECT_EQ(committedManifest(access, {ns, "dst"}), dst_committed);
     EXPECT_EQ(access.getView({ns, "src"}, Cas::Freshness::ForceFresh)->inlineBytes("f"), std::optional<String>("newer"));
 }
 
-TEST(CASPartFolderAccess, RepublishRefCompensatesPreexistingEqualDestinationOnMismatch)
+TEST(CASPartFolderAccess, RepublishRefKeepsAPreexistingEqualDestinationOnMismatch)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -452,7 +462,7 @@ TEST(CASPartFolderAccess, RepublishRefCompensatesPreexistingEqualDestinationOnMi
     Cas::CachedPartFolderAccess access(store);
 
     publishPart(store, ns, "src", {inlineEntry("f", "same")});
-    publishPart(store, ns, "dst", {inlineEntry("f", "same")});   /// a previous attempt already promoted dst
+    const Cas::ManifestId dst_committed = publishPart(store, ns, "dst", {inlineEntry("f", "same")});
     access.setHookForTest(Cas::CachedPartFolderAccess::TestHook::BeforeSourceDrop, [&]
     {
         access.repointRef({ns, "src"}, {inlineEntry("f", "newer")}, Cas::ProvenanceOp::Other, access.resolve({ns, "src"}, Cas::Freshness::ForceFresh)->manifest_id.ref);
@@ -460,9 +470,72 @@ TEST(CASPartFolderAccess, RepublishRefCompensatesPreexistingEqualDestinationOnMi
     expectThrowsCode(DB::ErrorCodes::CAS_OWNERSHIP_CONFLICT, [&] { access.republishRef({ns, "src"}, {ns, "dst"}); });
     access.setHookForTest(Cas::CachedPartFolderAccess::TestHook::BeforeSourceDrop, nullptr);
 
-    EXPECT_FALSE(access.existsRef({ns, "dst"}, Cas::Freshness::ForceFresh))
-        << "a content-equal destination is stale once the source was repointed, whoever created it";
+    EXPECT_EQ(committedManifest(access, {ns, "dst"}), dst_committed);
     EXPECT_EQ(access.getView({ns, "src"}, Cas::Freshness::ForceFresh)->inlineBytes("f"), std::optional<String>("newer"));
+}
+
+/// Rename A commits `dst`, rename B completes the move over that equal `dst` and drops `src`, and a third writer
+/// binds the name `src` again. A then finds `src` naming another manifest: the conflict must leave B's result.
+TEST(CASPartFolderAccess, RepublishRefNeverDropsADestinationAnotherRenameCompletedOver)
+{
+    for (const auto hook : {Cas::CachedPartFolderAccess::TestHook::BeforeSourceDrop,
+                            Cas::CachedPartFolderAccess::TestHook::BeforeDestinationPublish})
+    {
+        const bool after_promote = hook == Cas::CachedPartFolderAccess::TestHook::BeforeSourceDrop;
+        SCOPED_TRACE(after_promote ? "A promoted dst itself" : "B committed dst before A's precommit");
+        auto backend = std::make_shared<CountingBackend>();
+        auto store = openPoolForTest(backend);
+        const Cas::RootNamespace from{"srv/t1"};
+        const Cas::RootNamespace to{"srv/t2"};
+        Cas::CachedPartFolderAccess a(store);
+        Cas::CachedPartFolderAccess b(store);
+        publishPart(store, from, "src", {inlineEntry("f", "same")});
+
+        std::optional<Cas::ManifestId> dst_committed;
+        a.setHookForTest(hook, [&]
+        {
+            EXPECT_TRUE(b.republishRef({from, "src"}, {to, "dst"}));
+            dst_committed = committedManifest(a, {to, "dst"});
+            publishPart(store, from, "src", {inlineEntry("f", "reused")});
+        });
+        expectThrowsCode(DB::ErrorCodes::CAS_OWNERSHIP_CONFLICT, [&] { a.republishRef({from, "src"}, {to, "dst"}); });
+        a.setHookForTest(hook, nullptr);
+
+        ASSERT_TRUE(dst_committed.has_value());
+        EXPECT_EQ(committedManifest(a, {to, "dst"}), dst_committed);
+        EXPECT_EQ(a.getView({from, "src"}, Cas::Freshness::ForceFresh)->inlineBytes("f"), std::optional<String>("reused"));
+        EXPECT_TRUE(store->livePrecommitsForTest(to).empty());
+    }
+}
+
+/// A rename that failed after committing its destination is driven again by its caller: the second call meets that
+/// destination, completes the move over it and mints no second manifest.
+TEST(CASPartFolderAccess, RenameDrivenAgainAfterAFailedSourceDropCompletesOverItsOwnDestination)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace from{"srv/t1"};
+    const Cas::RootNamespace to{"srv/t2"};
+    Cas::CachedPartFolderAccess access(store);
+    publishPart(store, from, "src", {inlineEntry("f", "same")});
+
+    std::optional<Cas::ManifestId> dst_committed;
+    access.setHookForTest(Cas::CachedPartFolderAccess::TestHook::BeforeSourceDrop, [&]
+    {
+        dst_committed = committedManifest(access, {to, "dst"});
+        throw Exception(ErrorCodes::NETWORK_ERROR, "injected failure of the source drop");
+    });
+    expectThrowsCode(ErrorCodes::NETWORK_ERROR, [&] { access.renameCommittedRef({from, "src"}, {to, "dst"}); });
+    access.setHookForTest(Cas::CachedPartFolderAccess::TestHook::BeforeSourceDrop, nullptr);
+    ASSERT_TRUE(dst_committed.has_value());
+    EXPECT_EQ(committedManifest(access, {to, "dst"}), dst_committed);
+    EXPECT_TRUE(access.existsRef({from, "src"}, Cas::Freshness::ForceFresh));
+
+    const auto renamed = access.renameCommittedRef({from, "src"}, {to, "dst"});
+    ASSERT_TRUE(renamed.has_value());
+    EXPECT_TRUE(renamed->destination == dst_committed->ref);
+    EXPECT_EQ(committedManifest(access, {to, "dst"}), dst_committed);
+    EXPECT_FALSE(access.existsRef({from, "src"}, Cas::Freshness::ForceFresh));
 }
 
 /// With no destination to complete, the retry-later exception reaches the caller unchanged.
@@ -721,9 +794,9 @@ TEST(CASPartFolderAccess, RepublishRefRefusalSurvivesAFailedAbort)
     EXPECT_TRUE(store->livePrecommitsForTest(to).empty()) << "nothing took the precommit back";
 }
 
-/// The confirm reads only a resident table, so a live source whose table was evicted is loaded before it is
-/// confirmed rather than refused.
-TEST(CASPartFolderAccess, ConfirmCopySourceLoadsAnEvictedSourceTable)
+/// The confirm reads only the table its source resolution pinned, so a live source whose table was evicted is loaded
+/// when it is resolved, and its confirmation costs only the mount-slot read.
+TEST(CASPartFolderAccess, CopySourceOfAnEvictedTableIsLoadedWhenResolved)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = Cas::Pool::open(backend,
@@ -752,28 +825,33 @@ TEST(CASPartFolderAccess, ConfirmCopySourceLoadsAnEvictedSourceTable)
 
     evict_source("y2");
     backend->resetCounts();
-    EXPECT_EQ(access.confirmCopySource(Cas::CopySource{{from, "src"}, id.ref}), Cas::ConfirmAnswer::Yes);
-    EXPECT_EQ(requests(), load_requests + 1) << "an evicted source costs one table load and the mount-slot read";
+    auto source = access.resolveCopySource({from, "src"});
+    ASSERT_TRUE(source.has_value());
+    EXPECT_TRUE(source->manifest_ref == id.ref);
+    EXPECT_GE(requests(), load_requests) << "an evicted source is loaded when it is resolved";
     ASSERT_TRUE(store->refTableCachedForTest(from));
 
     backend->resetCounts();
-    EXPECT_EQ(access.confirmCopySource(Cas::CopySource{{from, "src"}, id.ref}), Cas::ConfirmAnswer::Yes);
-    EXPECT_EQ(requests(), 1u) << "a resident source costs only the mount-slot read";
-    const Cas::ManifestRef other_manifest{id.ref.writer_epoch, id.ref.build_sequence, id.ref.manifest_ordinal + 1};
-    EXPECT_EQ(access.confirmCopySource(Cas::CopySource{{from, "src"}, other_manifest}), Cas::ConfirmAnswer::No)
+    EXPECT_EQ(access.confirmCopySource(*source), Cas::ConfirmAnswer::Yes);
+    EXPECT_EQ(requests(), 1u) << "a resolved source costs only the mount-slot read";
+    source->manifest_ref = Cas::ManifestRef{id.ref.writer_epoch, id.ref.build_sequence, id.ref.manifest_ordinal + 1};
+    EXPECT_EQ(access.confirmCopySource(*source), Cas::ConfirmAnswer::No)
         << "a loaded table still refuses a manifest the source does not commit";
 }
 
-/// The confirm a copy uses (`ConfirmLockMode::Wait`) meets the source table's state lock held by a commit: it does not
-/// refuse, and it waits for the lock with no ledger lock held, so an append to another table completes meanwhile.
+/// The confirm a copy uses meets the source table's state lock held by a commit: it does not refuse, and it waits for
+/// the lock with no ledger lock held, so an append to another table completes meanwhile.
 TEST(CASPartFolderAccess, CopyConfirmWaitsForAHeldStateLockOutsideThePoolLock)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
     const Cas::RootNamespace ns{"srv/t1"};
     const Cas::RootNamespace other{"srv/t2"};
-    const Cas::ManifestId id = publishPart(store, ns, "src", {inlineEntry("f", "live")});
+    Cas::CachedPartFolderAccess access(store);
+    publishPart(store, ns, "src", {inlineEntry("f", "live")});
     publishPart(store, other, "seed", {inlineEntry("f", "seed")});
+    const auto source = access.resolveCopySource({ns, "src"});
+    ASSERT_TRUE(source.has_value());
 
     std::promise<void> waiting;
     auto waiting_future = waiting.get_future();
@@ -807,7 +885,7 @@ TEST(CASPartFolderAccess, CopyConfirmWaitsForAHeldStateLockOutsideThePoolLock)
             return;
         ALLOW_ALLOCATIONS_IN_SCOPE;
         const uint64_t before = ProfileEvents::global_counters[ProfileEvents::CASRelinkConfirmRefusedStateLockBusy];
-        confirmer = std::thread([&] { confirmed.set_value(store->confirmExactRef(ns, "src", id.ref, Cas::ConfirmLockMode::Wait)); });
+        confirmer = std::thread([&] { confirmed.set_value(access.confirmCopySource(*source)); });
         /// Bounded so that a confirm that never waits, or an append stuck behind it, fails the assertions below
         /// instead of hanging this commit.
         parked = waiting_future.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
@@ -833,8 +911,8 @@ TEST(CASPartFolderAccess, CopyConfirmWaitsForAHeldStateLockOutsideThePoolLock)
     EXPECT_EQ(busy_refusals, 0u);
 }
 
-/// After the wait for the source table's state lock, the copy confirm keeps the table until its next pass answers, so
-/// an eviction in between cannot turn a live source into a refusal.
+/// After the wait for the source table's state lock, the copy confirm still holds the table its source resolution
+/// pinned, so an eviction before the next pass cannot turn a live source into a refusal.
 TEST(CASPartFolderAccess, CopyConfirmKeepsTheSourceTableBetweenTheWaitAndTheNextPass)
 {
     auto backend = std::make_shared<CountingBackend>();
@@ -843,7 +921,10 @@ TEST(CASPartFolderAccess, CopyConfirmKeepsTheSourceTableBetweenTheWaitAndTheNext
         Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .ref_table_cache_bytes = 1});
     const Cas::RootNamespace ns{"srv/t1"};
     const Cas::RootNamespace other{"srv/t2"};
-    const Cas::ManifestId id = publishPart(store, ns, "src", {inlineEntry("f", "live")});
+    Cas::CachedPartFolderAccess access(store);
+    publishPart(store, ns, "src", {inlineEntry("f", "live")});
+    const auto source = access.resolveCopySource({ns, "src"});
+    ASSERT_TRUE(source.has_value());
 
     std::promise<void> waiting;
     auto waiting_future = waiting.get_future();
@@ -885,7 +966,7 @@ TEST(CASPartFolderAccess, CopyConfirmKeepsTheSourceTableBetweenTheWaitAndTheNext
         if (fired->exchange(true))
             return;
         ALLOW_ALLOCATIONS_IN_SCOPE;
-        confirmer = std::thread([&] { confirmed.set_value(store->confirmExactRef(ns, "src", id.ref, Cas::ConfirmLockMode::Wait)); });
+        confirmer = std::thread([&] { confirmed.set_value(access.confirmCopySource(*source)); });
         parked = waiting_future.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
     });
     SCOPE_EXIT({ store->setInstallRegionProbeForTest(nullptr); });
@@ -899,6 +980,102 @@ TEST(CASPartFolderAccess, CopyConfirmKeepsTheSourceTableBetweenTheWaitAndTheNext
     EXPECT_EQ(passes_after_wait.load(), 1u);
     EXPECT_FALSE(evicted) << "the source table was evicted between the wait and the next pass";
     EXPECT_EQ(confirmed_future.get(), Cas::ConfirmAnswer::Yes) << "the copy confirm refused a live source";
+}
+
+/// Cache pressure between the capture of a copy source and its first confirmation does not evict the source table:
+/// the confirmation finds it resident and costs only the mount-slot read.
+TEST(CASPartFolderAccess, CopySourceSurvivesCachePressureBeforeItsConfirmation)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    /// A 1-byte budget is below one table's weight, so touching another table evicts every idle one.
+    auto store = Cas::Pool::open(backend,
+        Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .ref_table_cache_bytes = 1});
+    const Cas::RootNamespace from{"srv/t1"};
+    const Cas::RootNamespace other{"srv/t2"};
+    Cas::CachedPartFolderAccess access(store);
+    publishPart(store, from, "src", {inlineEntry("f", "live")});
+    const auto source = access.resolveCopySource({from, "src"});
+    ASSERT_TRUE(source.has_value());
+
+    publishPart(store, other, "pressure", {inlineEntry("f", "other")});
+    const Cas::RootNamespace third{"srv/t3"};
+    publishPart(store, third, "pressure", {inlineEntry("f", "third")});
+    ASSERT_FALSE(store->refTableCachedForTest(other)) << "positive control: the budget evicts an idle table";
+    EXPECT_TRUE(store->refTableCachedForTest(from));
+
+    backend->resetCounts();
+    EXPECT_EQ(access.confirmCopySource(*source), Cas::ConfirmAnswer::Yes);
+    EXPECT_EQ(backend->headTotal() + backend->getTotal() + backend->getStreamTotal() + backend->writeTotal()
+            + backend->listTotal() + backend->deleteTotal() + backend->publishTotal(), 1u);
+}
+
+/// The request deadline passes while the copy confirm waits for a source table's state lock held by a commit: once
+/// the lock is free the confirm refuses at the deadline instead of answering from a later pass.
+TEST(CASPartFolderAccess, CopyConfirmRefusesWhenItsDeadlinePassesDuringTheStateLockWait)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto boot_ms = std::make_shared<std::atomic<uint64_t>>(1'000'000);
+    Cas::PoolConfig config{.pool_prefix = "p", .server_root_id = "test"};
+    config.boot_ms_fn = [boot_ms] { return boot_ms->load(); };
+    /// Long enough that passing the request deadline leaves the mount fence open.
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(600'000);
+    auto store = Cas::Pool::open(backend, std::move(config));
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store);
+    publishPart(store, ns, "src", {inlineEntry("f", "live")});
+    const auto source = access.resolveCopySource({ns, "src"});
+    ASSERT_TRUE(source.has_value());
+    const uint64_t window_ms = store->poolConfig().cas_request_budget.request_window_ms;
+
+    std::promise<void> waiting;
+    auto waiting_future = waiting.get_future();
+    std::atomic<size_t> waits{0};
+    store->setConfirmBeforeStateLockWaitHookForTest([&]
+    {
+        if (waits++ == 0)
+            waiting.set_value();
+    });
+    SCOPE_EXIT({ store->setConfirmBeforeStateLockWaitHookForTest(nullptr); });
+
+    std::promise<Cas::ConfirmAnswer> confirmed;
+    auto confirmed_future = confirmed.get_future();
+    std::thread confirmer;
+    SCOPE_EXIT({
+        if (confirmer.joinable())
+            confirmer.join();
+    });
+    bool parked = false;
+    uint64_t busy_before = 0;
+    auto fired = std::make_shared<std::atomic<bool>>(false);
+    store->setInstallRegionProbeForTest([&, fired]
+    {
+        if (fired->exchange(true))
+            return;
+        ALLOW_ALLOCATIONS_IN_SCOPE;
+        busy_before = ProfileEvents::global_counters[ProfileEvents::CASRelinkConfirmRefusedStateLockBusy];
+        confirmer = std::thread([&]
+        {
+            try
+            {
+                confirmed.set_value(access.confirmCopySource(*source));
+            }
+            catch (...)
+            {
+                confirmed.set_exception(std::current_exception());
+            }
+        });
+        parked = waiting_future.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+        boot_ms->fetch_add(window_ms);
+    });
+    SCOPE_EXIT({ store->setInstallRegionProbeForTest(nullptr); });
+
+    publishPart(store, ns, "y", {inlineEntry("f", "y")});
+    ASSERT_TRUE(fired->load()) << "the install region never ran";
+    ASSERT_TRUE(parked) << "the confirm did not find the state lock held";
+    confirmer.join();
+    EXPECT_EQ(confirmed_future.get(), Cas::ConfirmAnswer::Unknown);
+    EXPECT_EQ(waits.load(), 1u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRelinkConfirmRefusedStateLockBusy] - busy_before, 1u);
 }
 
 /// Task 7: `publishEntries`'s `catch (...) { build->abandon(); throw; }` must leave no live-epoch
@@ -1815,7 +1992,7 @@ TEST(CASPartFolderAccess, RenameCommittedRefConflictsWhenSourceNamesAnotherManif
     /// With the manifest the source really names the rename is one Move and returns that manifest.
     const auto renamed = access.renameCommittedRef({ns, "src"}, {ns, "dst"}, m_src);
     ASSERT_TRUE(renamed.has_value());
-    EXPECT_TRUE(*renamed == m_src);
+    EXPECT_TRUE(renamed->destination == m_src);
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefMove], moves_before + 1);
 }
 

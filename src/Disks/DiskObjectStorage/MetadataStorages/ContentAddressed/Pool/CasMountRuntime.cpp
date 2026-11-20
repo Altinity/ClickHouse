@@ -107,11 +107,13 @@ std::shared_ptr<const MountSlotOwnership> CasMountRuntime::slotOwnership() const
     return mount_renewer ? mount_renewer->slotOwnership() : nullptr;
 }
 
-bool CasMountRuntime::slotHeldBy(const MountSlotOwnership & ownership) const
+bool CasMountRuntime::slotHeldBy(const MountSlotOwnership & ownership, std::optional<uint64_t> deadline_ms) const
 {
     /// A fresh read every call: an observation older than the caller's snapshot proves nothing about it.
     CasOperation op = mount_requests.admit();
-    const std::optional<Object> slot = op.read(layout.mountKey(server_root_id), Retry::once());
+    Retry policy = Retry::once();
+    policy.policy_deadline_ms = deadline_ms;
+    const std::optional<Object> slot = op.read(layout.mountKey(server_root_id), policy);
     return slot && ownership.holds(*slot);
 }
 

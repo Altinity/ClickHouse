@@ -238,11 +238,11 @@ ContentAddressedTransaction::findPendingBlob(const PartStaging & st, const Cas::
     return nullptr;
 }
 
-void ContentAddressedTransaction::putEntry(PartStaging & st, Cas::ManifestEntry entry, std::optional<Cas::CopySource> source)
+void ContentAddressedTransaction::putEntry(PartStaging & st, Cas::ManifestEntry entry, std::shared_ptr<Cas::CopySource> source)
 {
     eraseEntry(st, entry.path);
     if (source)
-        st.copy_sources.insert_or_assign(entry.path, std::move(*source));
+        st.copy_sources.insert_or_assign(entry.path, std::move(source));
     st.entries.push_back(std::move(entry));
 }
 
@@ -268,22 +268,27 @@ void ContentAddressedTransaction::clearEntries(PartStaging & st)
     st.copy_sources.clear();
 }
 
-std::optional<Cas::CopySource> ContentAddressedTransaction::copySourceOf(const PartStaging & st, const std::string & path)
+std::shared_ptr<Cas::CopySource> ContentAddressedTransaction::copySourceOf(const PartStaging & st, const std::string & path)
 {
     const auto it = st.copy_sources.find(path);
     if (it == st.copy_sources.end())
-        return std::nullopt;
+        return nullptr;
     return it->second;
 }
 
-void ContentAddressedTransaction::confirmCopySources(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st)
+void ContentAddressedTransaction::confirmCopySources(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st,
+                                                     const PendingRefs & pending_refs)
 {
     /// An entry whose bytes this transaction uploads is protected by its own precommit, whatever it was copied from.
-    std::vector<Cas::CopySource> sources;
+    std::vector<std::shared_ptr<Cas::CopySource>> sources;
+    const auto listed = [&](const Cas::CopySource & source)
+    {
+        return std::any_of(sources.begin(), sources.end(), [&](const auto & s)
+            { return s->part == source.part && s->manifest_ref == source.manifest_ref; });
+    };
     for (const auto & entry : st.entries)
-        if (const auto source = copySourceOf(st, entry.path); source && !findPendingBlob(st, entry.ref)
-            && std::find(sources.begin(), sources.end(), *source) == sources.end())
-            sources.push_back(*source);
+        if (auto source = copySourceOf(st, entry.path); source && !pending_refs.contains(entry.ref) && !listed(*source))
+            sources.push_back(std::move(source));
 
     /// A source this transaction changes before it publishes the copy no longer commits the manifest the copy
     /// read, so it is refused too. `commit` publishes in `(ns, ref)` order, so that is any source sorting first.
@@ -308,7 +313,7 @@ void ContentAddressedTransaction::confirmCopySources(const Cas::RootNamespace & 
         Cas::ConfirmAnswer answer = Cas::ConfirmAnswer::Unknown;
         try
         {
-            answer = access->confirmCopySource(source);
+            answer = access->confirmCopySource(*source);
         }
         catch (...)
         {
@@ -318,8 +323,26 @@ void ContentAddressedTransaction::confirmCopySources(const Cas::RootNamespace & 
         if (answer == Cas::ConfirmAnswer::Yes)
             continue;
         abandon_logging_failure();
-        Cas::throwCopySourceUnconfirmed(source, {ns, ref}, answer);
+        Cas::throwCopySourceUnconfirmed(*source, {ns, ref}, answer);
     }
+}
+
+void ContentAddressedTransaction::retargetBorrow(const Cas::PartRefKey & from, const Cas::PartRefKey & to, const Cas::RefRename & renamed)
+{
+    const auto it = borrowed_sources.find(from.cacheKey());
+    if (it == borrowed_sources.end())
+        return;
+    const std::shared_ptr<Cas::CopySource> borrow = it->second;
+    borrowed_sources.erase(it);
+    if (!(borrow->manifest_ref == renamed.source))
+        return;
+    auto moved = metadata_storage.partAccess()->resolveCopySource(to);
+    if (!moved || !(moved->manifest_ref == renamed.destination))
+        return;
+    borrow->part = to;
+    borrow->manifest_ref = renamed.destination;
+    borrow->table = std::move(moved->table);
+    borrowed_sources.try_emplace(to.cacheKey(), borrow);
 }
 
 void ContentAddressedTransaction::adoptStagedBlob(
@@ -354,13 +377,14 @@ ContentAddressedTransaction::routeOf(const std::string & path) const
     return metadata_storage.route(*p);
 }
 
-Cas::ManifestId ContentAddressedTransaction::precommitAndUpload(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st)
+Cas::ManifestId ContentAddressedTransaction::precommitAndUpload(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st,
+                                                                const PendingRefs & pending_refs)
 {
     /// Edge before observe: the precommit names every blob before `putBlob` observes one, so a condemnation between
     /// the upload and the promote cannot delete a body this build relies on.
     const Cas::ManifestId id = st.build->stageManifest(st.entries);
     st.build->precommitAdd(ns, ref, id);
-    confirmCopySources(ns, ref, st);
+    confirmCopySources(ns, ref, st, pending_refs);
     uploadPendingBlobs(st);
     return id;
 }
@@ -463,10 +487,21 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
         return;
     }
 
+    /// The build would promote over the committed manifest with an empty delta, which the unique-ref guard refuses on
+    /// every retry.
+    if (st.build && st.entries.empty() && st.content_removed.empty() && st.base_manifest_ref)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "ContentAddressedTransaction: committed part {}/{} has an open build and nothing to publish: every write staged "
+            "into it was moved or removed", ns.string(), ref);
+
+    PendingRefs pending_refs;
+    for (const auto & pb : st.pending_blobs)
+        pending_refs.insert(pb.ref);
+
     /// A blob entry's body is either uploaded by this part or confirmed at its committed source; a part may be
     /// promoted before any other part of this transaction publishes, so nothing else can supply the body.
     for (const auto & entry : st.entries)
-        if (entry.placement == Cas::EntryPlacement::Blob && !findPendingBlob(st, entry.ref) && !copySourceOf(st, entry.path))
+        if (entry.placement == Cas::EntryPlacement::Blob && !pending_refs.contains(entry.ref) && !copySourceOf(st, entry.path))
             throw Exception(ErrorCodes::LOGICAL_ERROR,
                 "ContentAddressedTransaction: staged blob '{}' of {}/{} has neither a pending upload nor a copy source",
                 entry.path, ns.string(), ref);
@@ -506,7 +541,7 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
             /// `repointRef` promotes through its own build, which adopts existing bodies and uploads none. This build's
             /// scratch precommit protects the uploads until that promote, then is abandoned, never promoted.
             if (st.build)
-                (void)precommitAndUpload(ns, ref, st);
+                (void)precommitAndUpload(ns, ref, st, pending_refs);
 
             std::vector<Cas::ManifestEntry> merged;
             for (const auto & e : view->manifest()->entries)
@@ -547,7 +582,7 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
             "ContentAddressedTransaction: staged entries or removal marks for {}/{} without a Build", ns.string(), ref);
 
     /// Promote is an atomic owner move that validates every blob dependency proof.
-    const Cas::ManifestId id = precommitAndUpload(ns, ref, st);
+    const Cas::ManifestId id = precommitAndUpload(ns, ref, st, pending_refs);
 
     /// Test-only fault seam (Task 3 TDD): simulate a promote-time backend failure for `ref` right
     /// before the durable promote call. A no-op in production (nothing ever arms it).
@@ -853,7 +888,7 @@ void ContentAddressedTransaction::stageBlobPartFile(
     entry.placement = Cas::EntryPlacement::Blob;
     entry.ref = ref;
     entry.blob_size = size;
-    putEntry(st, std::move(entry), std::nullopt);
+    putEntry(st, std::move(entry), nullptr);
 }
 
 void ContentAddressedTransaction::stageUnprovenBlobEntryForTest(const std::string & path, const Cas::BlobRef & ref, uint64_t size)
@@ -868,7 +903,7 @@ void ContentAddressedTransaction::stageUnprovenBlobEntryForTest(const std::strin
     entry.placement = Cas::EntryPlacement::Blob;
     entry.ref = ref;
     entry.blob_size = size;
-    putEntry(st, std::move(entry), std::nullopt);
+    putEntry(st, std::move(entry), nullptr);
 }
 
 std::string ContentAddressedTransaction::buildS3StagingBlobHeader(
@@ -1099,7 +1134,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
                 /// `blob_size` stays 0 (its default) for an Inline entry — matching decode, which never
                 /// fills it for Inline. `entry.size()` is the logical size, derived from `inline_bytes`.
                 entry.inline_bytes = std::move(bytes);
-                putEntry(st, std::move(entry), std::nullopt);
+                putEntry(st, std::move(entry), nullptr);
             }
             else
             {
@@ -1318,7 +1353,7 @@ void ContentAddressedTransaction::createHardLink(const std::string & path_from, 
         {
             entry = *it;
             /// A copy of an adopted entry confirms the committed part the entry came from.
-            std::optional<Cas::CopySource> source;
+            std::shared_ptr<Cas::CopySource> source;
             if (entry.placement == Cas::EntryPlacement::Blob)
             {
                 /// Unified adopt dispatch. copy_pending=(&dst_st != src_st) so the pending
@@ -1338,25 +1373,25 @@ void ContentAddressedTransaction::createHardLink(const std::string & path_from, 
         }
     }
 
-    /// Carry forward from the COMMITTED source part: read the source manifest, find the named entry,
-    /// record a TOKENLESS W-EVIDENCE dep for its blob (no HEAD before precommit; promote re-proves it).
-    /// ForceFresh getView == resolveRef(allow_stale=false) + readManifestShared; the decode is served
-    /// from the manifest cache when warm, so a burst of hardlinks from one source part costs no
+    /// Carry forward from the COMMITTED source part: resolve it fresh, find the named entry, record a
+    /// TOKENLESS W-EVIDENCE dep for its blob (no HEAD before precommit; promote re-proves it). The decode is
+    /// served from the manifest cache when warm, so a burst of hardlinks from one source part costs no
     /// manifest request after the first.
-    auto view = metadata_storage.partAccess()->getView(src->refKey(), Cas::Freshness::ForceFresh);
-    if (!view)
+    auto resolved = metadata_storage.partAccess()->resolveCopySource(src->refKey());
+    if (!resolved)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
             "ContentAddressed: createHardLink source part missing: {}", path_from);
-    const auto * src_entry = view->findFile(src->file);
+    auto & borrowed = borrowed_sources[src->refKey().cacheKey()];
+    if (!borrowed || !(borrowed->manifest_ref == resolved->manifest_ref))
+        borrowed = std::make_shared<Cas::CopySource>(std::move(*resolved));
+    const auto * src_entry = Cas::findEntry(borrowed->manifest->entries, src->file);
     if (!src_entry)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
             "ContentAddressed: createHardLink source file missing in manifest: {}", path_from);
     buildFor(*dst, dst_st).adoptEvidence(*src_entry);
     entry = *src_entry;
     entry.path = dst->file;
-    std::optional<Cas::CopySource> source;
-    if (entry.placement == Cas::EntryPlacement::Blob)
-        source = Cas::CopySource{src->refKey(), view->manifestId().ref};
+    auto source = entry.placement == Cas::EntryPlacement::Blob ? borrowed : nullptr;
     putEntry(dst_st, std::move(entry), std::move(source));
 }
 
@@ -1414,7 +1449,8 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
             try
             {
                 for (const auto & [ref, _] : metadata_storage.store()->listRefs(from_ns))
-                    metadata_storage.partAccess()->republishRef({from_ns, ref}, {to_ns, ref});
+                    if (const auto renamed = metadata_storage.partAccess()->republishRef({from_ns, ref}, {to_ns, ref}))
+                        retargetBorrow({from_ns, ref}, {to_ns, ref}, *renamed);
                 /// Asymmetric by necessity: the SOURCE is read, so it resolves readably and contributes
                 /// nothing when it has no life; the DESTINATION is written, so it resolves the minting way
                 /// and is born here if the rename is what first creates it. Resolved only once the source
@@ -1517,7 +1553,7 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
                         "ContentAddressed: moveDirectory file collision on '{}' ({} -> {}): "
                         "source and destination staged different bytes for the same file",
                         entry.path, src->ref, dst->ref);
-                std::optional<Cas::CopySource> source = copySourceOf(src_st, entry.path);
+                auto source = copySourceOf(src_st, entry.path);
                 putEntry(dst_st, std::move(entry), std::move(source));
             }
             /// Carry any staged removal marks forward too — a re-key of the
@@ -1587,7 +1623,8 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
                     const auto renamed = metadata_storage.partAccess()->renameCommittedRef(src->refKey(), dst->refKey(), committed_ref);
                     if (!renamed)
                         Cas::throwCasOwnershipConflict("ContentAddressedTransaction: {} was dropped while a staged part was renamed from it", path_from);
-                    parts[dst_key].base_manifest_ref = *renamed;
+                    parts[dst_key].base_manifest_ref = renamed->destination;
+                    retargetBorrow(src->refKey(), dst->refKey(), *renamed);
                     return;
                 }
                 if (metadata_storage.partAccess()->dropRefExact(src->refKey(), committed_ref) == Cas::Removal::Mismatch)
@@ -1600,7 +1637,8 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
         /// delete_tmp_ rename, an early-committed child ref being renamed away). Absent = a pure
         /// staged/tmp move, or a rename of a part whose publish never happened (a rollback's delete_tmp_
         /// rename of an unpublished part) - nothing durable to touch. The facade picks the mechanism.
-        metadata_storage.partAccess()->renameCommittedRef(src->refKey(), dst->refKey());
+        if (const auto renamed = metadata_storage.partAccess()->renameCommittedRef(src->refKey(), dst->refKey()))
+            retargetBorrow(src->refKey(), dst->refKey(), *renamed);
         return;
     }
 
@@ -1705,7 +1743,7 @@ void ContentAddressedTransaction::moveFile(const std::string & path_from, const 
     if (it != src_st.entries.end())
     {
         auto entry = *it;
-        std::optional<Cas::CopySource> source = copySourceOf(src_st, src->file);
+        auto source = copySourceOf(src_st, src->file);
         eraseEntry(src_st, src->file);
         entry.path = dst->file;
         if (&src_st != &dst_st && entry.placement == Cas::EntryPlacement::Blob)

@@ -79,12 +79,6 @@ std::string_view refLaneStateName(RefLaneState state);
 /// consumer that treats `No` as knowledge; only `Yes` is gated on the fence.
 enum class ConfirmAnswer : uint8_t { Yes, No, Unknown };
 
-/// What `confirmExactRef` does while another thread holds the table's state lock. `TryLock` answers `Unknown`: a
-/// remote relink query must not wait on this writer. `Wait` is for an in-process copy, whose own operation fails on
-/// a spurious `Unknown`: it waits for the lock with no ledger lock held and asks again, until the mount's request
-/// window has passed since the call began.
-enum class ConfirmLockMode : uint8_t { TryLock, Wait };
-
 /// How a ref-table recovery ended without an exception. `LifeRemoved`: the catalog no longer names the
 /// runtime's exact life after the walk; nothing was installed and the runtime is detached.
 enum class RefRecoveryOutcome : uint8_t { Recovered, LifeRemoved };
@@ -103,7 +97,29 @@ enum class RefRecoveryOutcome : uint8_t { Recovered, LifeRemoved };
 /// forwards its existing public operations to this component.
 class CasRefLedger
 {
+    struct RefTableRuntime;
+
 public:
+    /// A strong reference to the table runtime one `resolveRefPinned` read. Eviction skips a runtime anybody holds,
+    /// so the table stays resident, and `confirmPinnedRef` answers only while this exact runtime is the current one.
+    /// It authorizes nothing by itself.
+    class TablePin
+    {
+    public:
+        TablePin() = default;
+
+    private:
+        friend class CasRefLedger;
+        explicit TablePin(std::shared_ptr<RefTableRuntime> runtime_) : runtime(std::move(runtime_)) {}
+        std::shared_ptr<RefTableRuntime> runtime;
+    };
+
+    struct PinnedResolution
+    {
+        Resolved resolved;
+        TablePin table;
+    };
+
     CasRefLedger(
         /// The mount plane. Every request this ledger makes is admitted on it, so a ref-lane write and
         /// a mount-lease renewal are measured against the same fence and the same clock.
@@ -154,6 +170,9 @@ public:
     /// `Deferred` suppresses the emit for a caller that re-emits it conditionally itself.
     std::optional<Resolved> resolveRef(const RootNamespace & ns, const String & ref_name, bool allow_stale = false,
                                        ResolveAudit audit = ResolveAudit::Emit);
+    /// `resolveRef` that also returns the table runtime it read, for a later `confirmPinnedRef`. Recovery of a cold
+    /// table happens here.
+    std::optional<PinnedResolution> resolveRefPinned(const RootNamespace & ns, const String & ref_name);
 
     /// Recovers `ns` on first access and returns every committed ref in canonical name order. Read-side
     /// maintenance may schedule snapshot publication and stale-precommit cleanup, but those actions do
@@ -181,8 +200,17 @@ public:
     /// `MutationScope` covers the ref; exact committed-row equality; mount fence live last. Every
     /// ambiguity answers `Unknown` -- see `ConfirmAnswer`, and the .cpp for why the order and the
     /// two-mutex hold are what make a `Yes` a linearization point rather than a guess.
-    ConfirmAnswer confirmExactRef(const RootNamespace & ns, const String & ref_name,
-                                  const ManifestRef & manifest_ref, ConfirmLockMode lock_mode) const;
+    ///
+    /// Only try-locks the table's state lock and answers `Unknown` when it is held: a remote relink query must not
+    /// wait on this writer.
+    ConfirmAnswer confirmExactRef(const RootNamespace & ns, const String & ref_name, const ManifestRef & manifest_ref) const;
+
+    /// The same snapshot for an in-process copy, on the runtime `table` pinned when the source was resolved: an
+    /// evicted table cannot refuse a live source. `Unknown` when that runtime is no longer the current one. A held
+    /// state lock is waited for with no ledger lock held, and the answer is `Unknown` once `deadline_ms` (on
+    /// `boot_ms_now_fn`) has passed. The wait itself is not bounded: `state_mutex` has no timed lock.
+    ConfirmAnswer confirmPinnedRef(const TablePin & table, const RootNamespace & ns, const String & ref_name,
+                                   const ManifestRef & manifest_ref, uint64_t deadline_ms) const;
 
     /// Appends the transaction that removes one ref and waits for its durable result. A failed append
     /// propagates its exception and does not apply the removal to the in-memory table.
@@ -459,7 +487,7 @@ public:
     /// `install_region_probe_for_test`).
     void setInstallRegionProbeForTest(std::function<void()> probe) { install_region_probe_for_test = std::move(probe); }
 
-    /// Runs when a `ConfirmLockMode::Wait` confirm found the state lock held, before it waits for it.
+    /// Runs when a `confirmPinnedRef` found the state lock held, before it waits for it.
     void setConfirmBeforeStateLockWaitHookForTest(std::function<void()> hook)
     {
         confirm_before_state_lock_wait_hook_for_test = std::move(hook);
@@ -1116,10 +1144,11 @@ private:
     std::function<void()> confirm_before_state_lock_wait_hook_for_test;
     std::function<void()> confirm_after_state_lock_wait_hook_for_test;
 
-    /// One pass of `confirmExactRef` under `ref_queue_mutex` and a try-lock of the table's state lock; empty when
-    /// that lock is held.
-    std::optional<ConfirmAnswer> confirmExactRefIfStateLockFree(const RootNamespace & ns, const String & ref_name,
-                                                                const ManifestRef & manifest_ref) const;
+    /// The confirm's rules after residency, on `rt` with `ref_queue_mutex` and `rt.state_mutex` held.
+    ConfirmAnswer confirmLocked(const RefTableRuntime & rt, const RootNamespace & ns, const String & ref_name,
+                                const ManifestRef & manifest_ref) const;
+
+    std::optional<PinnedResolution> resolveRefOnRuntime(const RootNamespace & ns, const String & ref_name, ResolveAudit audit);
 
     /// Non-materializing diagnostic/cache lookup. It never observes the catalog and never creates a
     /// name slot or runtime.
