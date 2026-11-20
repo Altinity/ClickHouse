@@ -93,7 +93,7 @@ DeltaLakePartitionedSink::DeltaLakePartitionedSink(
 
 void DeltaLakePartitionedSink::consume(Chunk & chunk)
 {
-    const ColumnPtr partition_by_result_column = partition_strategy->computePartitionKey(chunk);
+    const ColumnPtr partition_by_result_column = partition_strategy->computePartitionKey(chunk, partition_strategy->getPartitionKeyActions());
 
     /// Not all columns are serialized using the format writer
     /// (e.g, hive partitioning stores partition columns in the file path)
