@@ -137,8 +137,9 @@ struct FsckReport
     uint64_t intent_replaced = 0;
     uint64_t intent_body_gone = 0;
     uint64_t intent_malformed = 0;
-    /// Reads or `HEAD`s of a deletion intent or its body that failed. A hard finding: the scan could not
-    /// verify what it was asked to, and a refused prefix would otherwise read as a clean pool.
+    /// Reads or `HEAD`s of a deletion intent or its body that failed, and a GC snapshot whose fold seal is absent under
+    /// an unchanged `gc/state`. A hard finding: the scan could not verify what it was asked to, and a refused prefix
+    /// would otherwise read as a clean pool.
     uint64_t intent_unread = 0;
     String intent_unread_reason;     /// the first failure: error code and message, shortened
     bool intents_verified = false;   /// the scan ran the per-intent verification

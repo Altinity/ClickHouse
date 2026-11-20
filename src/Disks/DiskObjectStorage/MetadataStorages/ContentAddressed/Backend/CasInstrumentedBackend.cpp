@@ -125,23 +125,36 @@ static const ProfileEvents::Event cas_event_table[CAS_NS_COUNT][CAS_OP_COUNT] =
                   ProfileEvents::CASBlobIntentDelete, ProfileEvents::CASBlobIntentList},
 };
 
-CasNs classifyCasNs(const String & key)
+CasNs classifyCasNs(const String & key, std::string_view pool_prefix)
 {
-    if (key.find("/blob-intents/") != String::npos)
+    std::string_view rest = key;
+    if (!rest.starts_with(pool_prefix) || !rest.substr(pool_prefix.size()).starts_with('/'))
+        return CasNs::Other;
+    rest.remove_prefix(pool_prefix.size() + 1);
+    const auto component = [&rest]
+    {
+        const std::string_view first = rest.substr(0, rest.find('/'));
+        rest.remove_prefix(std::min(rest.size(), first.size() + 1));
+        return first;
+    };
+    const std::string_view first = component();
+    if (first == "blob-intents")
         return CasNs::BlobIntent;
-    if (key.find("/blobs/") != String::npos)
+    if (first == "blobs")
         return CasNs::Blob;
-    /// Ref streams and namespace-owned state live under `cas/ns/`; part manifests are under
-    /// `cas/manifests/<namespace>/`. These paths must be classified before
-    /// the generic `roots/` and `Other` cases, otherwise the ref and manifest operation counters
-    /// silently accumulate in the wrong namespace.
-    if (key.find("/cas/ns/") != String::npos)
+    if (first == "cas")
+    {
+        /// Ref streams and namespace-owned state live under `cas/ns/`, part manifests under `cas/manifests/`.
+        const std::string_view second = component();
+        if (second == "ns")
+            return CasNs::Root;
+        if (second == "manifests")
+            return CasNs::Manifest;
+        return CasNs::Other;
+    }
+    if (first == "roots")
         return CasNs::Root;
-    if (key.find("/cas/manifests/") != String::npos)
-        return CasNs::Manifest;
-    if (key.find("/roots/") != String::npos)
-        return CasNs::Root;
-    if (key.find("/gc/") != String::npos)
+    if (first == "gc")
         return CasNs::Gc;
     return CasNs::Other;
 }
@@ -154,7 +167,7 @@ void incrementCasEvent(CasNs ns, CasOp op)
 void InstrumentedBackend::publish(const BlobPublishRequest & request, TransportAccess & access)
 {
     inner->publish(request, access);
-    incrementCasEvent(classifyCasNs(request.destination_key), CasOp::Put);
+    incrementCasEvent(classifyCasNs(request.destination_key, pool_prefix), CasOp::Put);
 }
 
 void InstrumentedBackend::removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access)
@@ -162,7 +175,7 @@ void InstrumentedBackend::removeManyWriteOnce(const std::vector<WriteOnceKey> & 
     inner->removeManyWriteOnce(keys, access);
     ProfileEvents::increment(ProfileEvents::CASBulkDeleteRequests);
     for (const WriteOnceKey & key : keys)
-        incrementCasEvent(classifyCasNs(key.str()), CasOp::Delete);
+        incrementCasEvent(classifyCasNs(key.str(), pool_prefix), CasOp::Delete);
 }
 
 }

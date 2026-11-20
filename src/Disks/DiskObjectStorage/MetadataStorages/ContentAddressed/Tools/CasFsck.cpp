@@ -56,13 +56,43 @@ void checkDeadline(const Deadline & deadline, std::string_view phase)
             "fsck: exceeded the deadline during '{}' — run against a QUIESCED pool or raise --timeout.", phase);
 }
 
+/// The policy of one fsck request: refused once the scan deadline has passed, and the standard budget cut to the
+/// time left, so a request started late cannot outlast the deadline on a fresh budget.
+Retry deadlineBound(CasOperation & op, const Deadline & deadline, std::string_view phase)
+{
+    checkDeadline(deadline, phase);
+    if (!deadline)
+        return Retry::standard();
+    const auto left_ms = std::chrono::duration_cast<std::chrono::milliseconds>(*deadline - std::chrono::steady_clock::now()).count();
+    const Retry standard = op.freeze(Retry::standard());
+    const Retry bounded = op.freeze(Retry::within(static_cast<uint64_t>(std::max<int64_t>(left_ms, 0))));
+    return *bounded.policy_deadline_ms < *standard.policy_deadline_ms ? bounded : standard;
+}
+
+/// Every key under `prefix`, each page requested under `deadlineBound`.
+void forEachListedKeyBounded(CasOperation & op, const String & prefix, const Deadline & deadline, std::string_view phase,
+                             const ListedKeyFn & fn)
+{
+    String cursor;
+    for (;;)
+    {
+        ListPage page = op.list(prefix, cursor, CasOperation::kCasListPageKeys, deadlineBound(op, deadline, phase));
+        for (const ListedKey & entry : page.keys)
+            if (!fn(entry))
+                return;
+        if (page.next_cursor.empty())
+            return;
+        cursor = std::move(page.next_cursor);
+    }
+}
+
 void listAll(CasOperation & op, const String & prefix, std::unordered_map<String, uint64_t> & out,
              const FsckProgress & on_progress, const Deadline & deadline, std::string_view phase)
 {
     static constexpr size_t kPageLimit = CasOperation::kCasListPageKeys;
     uint64_t pages = 0;
     size_t count_in_page = 0;
-    op.forEachListedKey(prefix, [&](const ListedKey & k)
+    forEachListedKeyBounded(op, prefix, deadline, phase, [&](const ListedKey & k)
     {
         out[k.key] = k.size;
         if (++count_in_page == kPageLimit)
@@ -74,7 +104,7 @@ void listAll(CasOperation & op, const String & prefix, std::unordered_map<String
                 on_progress(phase, out.size(), pages);
         }
         return true;
-    }, Retry::standard(), kPageLimit);
+    });
     /// The walk's own list lands at least once even for an empty/undersized final page --
     /// check it here, mirroring the original per-page loop (deadline checked after every physical page).
     if (count_in_page > 0 || pages == 0)
@@ -332,12 +362,12 @@ struct NsVerdicts
 class RecordingKeyReader final : public KeyReader
 {
 public:
-    explicit RecordingKeyReader(CasOperation & op_) : op(op_) {}
+    RecordingKeyReader(CasOperation & op_, const Deadline & deadline_) : op(op_), deadline(deadline_) {}
     void hint(const String &) override {}
     std::optional<Object> take(const String & key) override
     {
         last_key = key;
-        std::optional<Object> got = op.read(key, Retry::standard());
+        std::optional<Object> got = op.read(key, deadlineBound(op, deadline, "ref stream"));
         if (got)
             ++present;
         return got;
@@ -351,6 +381,7 @@ public:
 
 private:
     CasOperation & op;
+    const Deadline deadline;
 };
 
 /// THE STREAM AUDIT, one namespace: one walk from the `_ckpt` base to the first absent key, shared with
@@ -371,7 +402,7 @@ std::optional<RefTableState> walkRefStream(
     {
         const RecoveryGrounding grounding = chooseRecoveryGrounding(
             catalog_entry, sample ? std::optional<RefCkpt>{sample->ckpt} : std::nullopt);
-        RecordingKeyReader reader(op);
+        RecordingKeyReader reader(op, deadline);
         /// Only a corrupt chain under an unchanged `_ckpt` is a finding; a failed read of the chain or of
         /// `_ckpt` itself proves nothing either way.
         const auto record_failure = [&](bool corrupted, const String & message)
@@ -468,13 +499,30 @@ constexpr uint64_t kProgressKeys = 1000;
 void classifyIntents(CasOperation & op, const Layout & layout, bool verify, bool detail, const FsckProgress & on_progress,
                      const Deadline & deadline, FsckReport & report)
 {
+    report.intents_verified = verify;
+    uint64_t visited = 0;
+    /// A summary needs only counts, so it counts each key as the listing returns it.
+    if (!verify && !detail)
+    {
+        forEachListedKeyBounded(op, layout.blobIntentsPrefix(), deadline, "listing blob intents", [&](const ListedKey & k)
+        {
+            if (on_progress && ++visited % kProgressKeys == 0)
+                on_progress("counting blob intents", visited, 0);
+            if (layout.isBlobIntentProbeKey(k.key))
+                return true;
+            ++(layout.parseBlobIntentKey(k.key) ? report.intent_listed : report.intent_malformed);
+            report.physical_bytes += k.size;
+            return true;
+        });
+        return;
+    }
+
     std::unordered_map<String, uint64_t> listed;
     listAll(op, layout.blobIntentsPrefix(), listed, on_progress, deadline, "listing blob intents");
     std::vector<std::pair<String, uint64_t>> intents(listed.begin(), listed.end());
-    std::sort(intents.begin(), intents.end());
-    report.intents_verified = verify;
-
-    uint64_t visited = 0;
+    /// The detail rows are listed in key order.
+    if (detail)
+        std::sort(intents.begin(), intents.end());
     for (const auto & [key, size] : intents)
     {
         checkDeadline(deadline, "reading blob intents");
@@ -498,7 +546,7 @@ void classifyIntents(CasOperation & op, const Layout & layout, bool verify, bool
             bool counted = false;
             try
             {
-                const auto got = op.read(key, Retry::standard());
+                const auto got = op.read(key, deadlineBound(op, deadline, "reading blob intents"));
                 if (!got)
                     continue;
                 counted = true;
@@ -507,7 +555,8 @@ void classifyIntents(CasOperation & op, const Layout & layout, bool verify, bool
                 {
                     note = "the bytes are not the intent record";
                 }
-                else if (const std::optional<Meta> body = op.head(layout.blobKey(parsed->ref), Retry::standard()); !body)
+                else if (const std::optional<Meta> body = op.head(layout.blobKey(parsed->ref), deadlineBound(op, deadline, "reading blob intents"));
+                         !body)
                 {
                     cls = FsckClass::IntentBodyGone;
                     note = "no body at the blob's key; GC removes the intent in a later round";
@@ -575,11 +624,33 @@ GcSnapshotView readGcSnapshot(CasOperation & op, const Layout & layout, const st
                               bool detail, const FsckProgress & on_progress, const Deadline & deadline, FsckReport & report)
 {
     GcSnapshotView view;
-    const auto state_got = op.read(layout.gcStateKey(), Retry::standard());
-    if (!state_got)
-        return view;
-    view.have_state = true;
-    const GcState gc_state = decodeGcState(state_got->bytes);
+    GcState gc_state;
+    std::optional<Object> seal_got;
+    /// A seal missing under a `gc/state` that moved was pruned by a newer round: read that round's snapshot instead.
+    /// Missing under the same `gc/state`, the snapshot is unread and its rows unchecked.
+    std::optional<std::pair<uint64_t, uint64_t>> seal_missing_at;
+    while (true)
+    {
+        const auto state_got = op.read(layout.gcStateKey(), deadlineBound(op, deadline, "reading gc snapshot runs"));
+        if (!state_got)
+            return GcSnapshotView{};
+        view.have_state = true;
+        gc_state = decodeGcState(state_got->bytes);
+        if (gc_state.snap_generation == 0)
+            break;
+        const std::pair<uint64_t, uint64_t> adopted{gc_state.snap_generation, gc_state.snap_attempt};
+        const String seal_key = layout.foldSealKey(adopted.first, adopted.second);
+        if (seal_missing_at == adopted)
+        {
+            countIntentUnread(report, fmt::format("the fold seal {} that gc/state adopts is absent, so the GC snapshot and "
+                "its pending rows were not read", seal_key));
+            return view;
+        }
+        seal_got = op.read(seal_key, deadlineBound(op, deadline, "reading gc snapshot runs"));
+        if (seal_got)
+            break;
+        seal_missing_at = adopted;
+    }
     /// The adopted fold seal names the snapshot runs; resolution is by ref, never by key
     /// construction. Every row whose hash is in our candidate set marks "known to GC" —
     /// edges still counted (drop unfolded), an explicit zero-marker mid-pipeline, or a
@@ -595,18 +666,14 @@ GcSnapshotView readGcSnapshot(CasOperation & op, const Layout & layout, const st
         view.complete = true;   /// no fold has adopted a seal yet: there are no rows
         return view;
     }
-    const auto seal_got = op.read(layout.foldSealKey(gc_state.snap_generation, gc_state.snap_attempt), Retry::standard());
-    if (!seal_got)
-        return view;
     bool checksums_match = true;
     uint64_t rows = 0;
     for (const RunRef & run : decodeFoldSeal(seal_got->bytes, gc_state.snap_generation).blob_target_runs)
     {
-        checkDeadline(deadline, "reading gc snapshot runs");
         /// Typed open: the source-edge run reader goes through openSourceEdgeRun (the NDJSON
         /// header gates type == cas_run + kind == source_edge). Fsck keys off the row's hash
         /// (the record's own algo-prefixed key, never from pool meta).
-        SourceEdgeRunView reader = openSourceEdgeRun(op, run.key);
+        SourceEdgeRunView reader = openSourceEdgeRun(op, run.key, deadlineBound(op, deadline, "reading gc snapshot runs"));
         SourceEdgeRecord rec;
         while (reader.next(rec))
         {
@@ -674,11 +741,9 @@ PendingVerdict checkPendingRow(CasOperation & op, const Layout & layout, const B
         return {FsckClass::PendingTokenRejected, "delete_pending: the row's token has no canonical identity, so no intent key exists for it"};
     try
     {
-        checkDeadline(deadline, "checking pending rows");
-        if (op.read(layout.blobIntentKey(ref, *identity), Retry::standard()))
+        if (op.read(layout.blobIntentKey(ref, *identity), deadlineBound(op, deadline, "checking pending rows")))
             return {FsckClass::PendingGc, "delete_pending: the deletion intent is present; GC deletes the body in a later round (expected)"};
-        checkDeadline(deadline, "checking pending rows");
-        const std::optional<Meta> body = op.head(layout.blobKey(ref), Retry::standard());
+        const std::optional<Meta> body = op.head(layout.blobKey(ref), deadlineBound(op, deadline, "checking pending rows"));
         if (body && sameIncarnation(row.token, body->etag))
             return {FsckClass::PendingWithoutIntent, {}};
         return {FsckClass::PendingIntentAbsent,
@@ -813,7 +878,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         };
         std::vector<CanonicalNamespaceKey> canonical_candidates;
 
-        op.forEachListedKey(layout.namespaceRootPrefix(), [&](const ListedKey & listed)
+        forEachListedKeyBounded(op, layout.namespaceRootPrefix(), deadline, "listing namespaces", [&](const ListedKey & listed)
         {
             std::optional<NamespaceLifePhysicalId> physical_id;
             try
@@ -847,7 +912,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             }
             canonical_candidates.push_back(CanonicalNamespaceKey{listed.key, listed.size, *physical_id});
             return true;
-        }, Retry::standard());
+        });
 
         /// The post-observation cut. All three catalog states -- `Creating`, `Live`, `Removing` --
         /// protect a life for this purpose; only a life absent from every one of them is residue.
@@ -960,7 +1025,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                     owned_manifest_keys.insert(mkey);
                     const String label = ns_str + "/" + ref_name;
 
-                    const auto got = op.read(mkey, Retry::standard());
+                    const auto got = op.read(mkey, deadlineBound(op, deadline, "walking refs"));
                     if (!got)
                     {
                         /// A committed ref naming a missing manifest body would be an INV-NO-DANGLE violation —
@@ -971,7 +1036,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                         /// plus a fresh checkpoint from its physical life. Count the dangle ONLY when the exact
                         /// object is HEAD-absent AND that life still names THIS exact manifest — otherwise it is
                         /// LIST/GET lag or a phantom stale-row, never a loss.
-                        if (!op.head(mkey, Retry::standard())
+                        if (!op.head(mkey, deadlineBound(op, deadline, "walking refs"))
                             && manifestStillReferenced(op, layout, ns, recovery_authorities, ref_name, mkey,
                                 deadline, record_recovery_unchecked))
                         {
@@ -1179,7 +1244,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             uint64_t size = exists ? it->second : 0;
             if (!exists)
             {
-                if (const std::optional<Meta> h = op.head(bkey, Retry::standard()))
+                if (const std::optional<Meta> h = op.head(bkey, deadlineBound(op, deadline, "head-checking reachable blobs")))
                 {
                     exists = true;
                     size = h->size;
@@ -1273,7 +1338,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                 const std::optional<ManifestId> id = layout.parseManifestKey(mkey);
                 if (!id)
                     continue;   /// foreign/malformed key under `manifests/` — contributes no source edge
-                const auto got = op.read(mkey, Retry::standard());
+                const auto got = op.read(mkey, deadlineBound(op, deadline, "reading manifests for the stale-edge check"));
                 if (!got)
                     continue;   /// gone between the LIST and the read — genuinely not a live source
                 try
@@ -1327,7 +1392,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             checkDeadline(deadline, "classifying unreferenced bodies");
         /// HEAD only for a hash the snapshot actually retired, so an unretired blob still costs no request.
         const std::optional<Meta> retired_head
-            = rit != retired_by_hash.end() ? op.head(bkey, Retry::standard()) : std::nullopt;
+            = rit != retired_by_hash.end() ? op.head(bkey, deadlineBound(op, deadline, "classifying unreferenced bodies")) : std::nullopt;
         /// GC's own comparison for a token that names an incarnation; the text for one that names none, so such a
         /// row still lands in its own class.
         const bool row_names_present = retired_head
@@ -1531,8 +1596,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         {
             for (const String & bkey : reachable_blobs)
             {
-                checkDeadline(deadline, "head-checking scoped blobs");
-                const std::optional<Meta> h = op.head(bkey, Retry::standard());
+                const std::optional<Meta> h = op.head(bkey, deadlineBound(op, deadline, "head-checking scoped blobs"));
                 const auto lit = blob_labels.find(bkey);
                 const std::vector<String> labels = lit != blob_labels.end() ? lit->second : std::vector<String>{};
                 const bool exists = h.has_value();
@@ -1643,12 +1707,10 @@ LegacyMarkerRemoval removeLegacyMarkers(Pool & pool, const std::vector<String> &
                 const String & key = *markers[begin + i];
                 CasOperation job = pool.openRequests().resume(generation);
                 /// Per request, not per batch: one slow request must not let the rest of a batch run past the deadline.
-                checkDeadline(deadline, "removing legacy markers");
-                const std::optional<Meta> seen = job.head(key, Retry::standard());
+                const std::optional<Meta> seen = job.head(key, deadlineBound(job, deadline, "removing legacy markers"));
                 if (!seen)
                     return;
-                checkDeadline(deadline, "removing legacy markers");
-                const Removal removal = job.remove(key, seen->etag, Retry::standard());
+                const Removal removal = job.remove(key, seen->etag, deadlineBound(job, deadline, "removing legacy markers"));
                 removed += removal == Removal::Removed;
                 changed += removal == Removal::Mismatch;
             });

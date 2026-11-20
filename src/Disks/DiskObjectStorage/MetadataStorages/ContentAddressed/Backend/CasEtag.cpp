@@ -151,4 +151,12 @@ bool sameIncarnation(const PersistedEtag & row, const Etag & live)
     return persisted && persisted == live.canonical();
 }
 
+bool sameVersion(const Etag & read, const Etag & written)
+{
+    if (read == written)
+        return true;
+    const std::optional<CanonicalIdentity> identity = read.canonical();
+    return identity && identity == written.canonical();
+}
+
 }

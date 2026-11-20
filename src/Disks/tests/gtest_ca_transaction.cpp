@@ -24,6 +24,7 @@ extern const Event CASRefRepoint;
 namespace DB::ContentAddressedSetting
 {
 extern const ContentAddressedSettingsBool gc_enabled;
+extern const ContentAddressedSettingsUInt64 manifest_decode_cache_bytes;
 }
 
 namespace DB::ErrorCodes
@@ -1348,8 +1349,6 @@ struct StagedCopyShape
     const char * name;
     std::function<void(DB::IMetadataTransaction &, const std::string & p, const std::string & q1, const std::string & q2)> apply;
     std::vector<std::string> kept;
-    /// Whether the commit is refused at `q1`. Without a file staged in it, a committed `p` may fail first.
-    bool q1_refuses = true;
 };
 
 std::vector<StagedCopyShape> stagedCopyShapes()
@@ -1369,8 +1368,7 @@ std::vector<StagedCopyShape> stagedCopyShapes()
              tx.moveFile(p + "data.bin", q1 + "data.bin");
              tx.moveFile(p + "kept.bin", q2 + "kept.bin");
          },
-         {},
-         /*q1_refuses=*/false},
+         {}},
         {"hardlinked twice, the original is moved",
          [](DB::IMetadataTransaction & tx, const std::string & p, const std::string & q1, const std::string &)
          {
@@ -1431,9 +1429,6 @@ TEST(CASTransactionStagedCopies, ACommittedPartUploadsWhatItKeepsWhenTheOtherPar
 {
     for (const auto & shape : stagedCopyShapes())
     {
-        /// A committed part left with no staged file is a logic error, tested on its own.
-        if (shape.kept.empty())
-            continue;
         SCOPED_TRACE(shape.name);
         auto storage = openTxStorage();
         const std::string table = kLivenessTable + "/";
@@ -1456,8 +1451,7 @@ TEST(CASTransactionStagedCopies, ACommittedPartUploadsWhatItKeepsWhenTheOtherPar
         }
         catch (const DB::Exception & e)
         {
-            if (shape.q1_refuses)
-                EXPECT_EQ(e.code(), DB::ErrorCodes::NO_REPLICA_HAS_PART) << e.message();
+            EXPECT_EQ(e.code(), DB::ErrorCodes::NO_REPLICA_HAS_PART) << e.message();
         }
 
         EXPECT_FALSE(storage->existsDirectory(table + "tmp_q1_all_101_101_0"));
@@ -1493,13 +1487,13 @@ TEST(CASTransactionStagedCopies, ANewPartPublishesWhatItKeeps)
 namespace
 {
 
-/// Records, in order, the existence checks and the object writes a local object storage receives.
+/// Records, in order, every request a local object storage receives from the CAS backend.
 class WriteJournalObjectStorage : public DB::LocalObjectStorage
 {
 public:
     using DB::LocalObjectStorage::LocalObjectStorage;
 
-    enum class Verb : uint8_t { Exists, Write, Mark };
+    enum class Verb : uint8_t { Exists, Write, Read, Metadata, Remove, List, Copy, Mark };
 
     bool exists(const DB::StoredObject & object) const override
     {
@@ -1515,7 +1509,82 @@ public:
         return DB::LocalObjectStorage::writeObject(object, mode, attributes, buf_size, write_settings);
     }
 
+    std::unique_ptr<DB::ReadBufferFromFileBase> readObject(
+        const DB::StoredObject & object, const DB::ReadSettings & read_settings, std::optional<size_t> read_hint,
+        bool use_external_buffer, bool restrict_seek) const override
+    {
+        record(Verb::Read, object.remote_path);
+        return DB::LocalObjectStorage::readObject(object, read_settings, read_hint, use_external_buffer, restrict_seek);
+    }
+
+    DB::ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags) const override
+    {
+        record(Verb::Metadata, path);
+        return DB::LocalObjectStorage::getObjectMetadata(path, with_tags);
+    }
+
+    std::optional<DB::ObjectMetadata> tryGetObjectMetadata(const std::string & path, bool with_tags) const override
+    {
+        record(Verb::Metadata, path);
+        return DB::LocalObjectStorage::tryGetObjectMetadata(path, with_tags);
+    }
+
+    void removeObjectIfExists(const DB::StoredObject & object) override
+    {
+        record(Verb::Remove, object.remote_path);
+        DB::LocalObjectStorage::removeObjectIfExists(object);
+    }
+
+    void removeObjectsIfExist(const DB::StoredObjects & objects) override
+    {
+        for (const DB::StoredObject & object : objects)
+            record(Verb::Remove, object.remote_path);
+        DB::LocalObjectStorage::removeObjectsIfExist(objects);
+    }
+
+    void listObjects(const std::string & path, DB::RelativePathsWithMetadata & children, size_t max_keys) const override
+    {
+        record(Verb::List, path);
+        DB::LocalObjectStorage::listObjects(path, children, max_keys);
+    }
+
+    bool existsOrHasAnyChild(const std::string & path) const override
+    {
+        record(Verb::List, path);
+        return DB::LocalObjectStorage::existsOrHasAnyChild(path);
+    }
+
+    void copyObject(
+        const DB::StoredObject & object_from, const DB::StoredObject & object_to, const DB::ReadSettings & read_settings,
+        const DB::WriteSettings & write_settings, std::optional<DB::ObjectAttributes> object_to_attributes) override
+    {
+        record(Verb::Copy, object_to.remote_path);
+        DB::LocalObjectStorage::copyObject(object_from, object_to, read_settings, write_settings, object_to_attributes);
+    }
+
     void mark() { record(Verb::Mark, {}); }
+
+    void clear()
+    {
+        std::lock_guard lock(mutex);
+        journal.clear();
+    }
+
+    /// The paths of every request after the first mark, in order.
+    std::vector<std::string> pathsAfterMark() const
+    {
+        std::lock_guard lock(mutex);
+        std::vector<std::string> paths;
+        bool marked = false;
+        for (const auto & [v, path] : journal)
+        {
+            if (v == Verb::Mark)
+                marked = true;
+            else if (marked)
+                paths.push_back(path);
+        }
+        return paths;
+    }
 
     /// Requests whose path contains `needle`, counted before and after the first mark.
     std::pair<size_t, size_t> count(Verb verb, const std::string & needle) const
@@ -1544,6 +1613,152 @@ private:
     mutable std::vector<std::pair<Verb, std::string>> journal;
 };
 
+/// A started storage with GC off over a journaled local object storage in a fresh directory, removed at destruction.
+struct JournaledTxStorage
+{
+    explicit JournaledTxStorage(const std::string & name, std::optional<uint64_t> manifest_decode_cache_bytes = std::nullopt)
+        : root(std::filesystem::temp_directory_path() / (name + "_" + std::to_string(::getpid())))
+    {
+        std::filesystem::remove_all(root);
+        std::filesystem::create_directories(root);
+        object_storage = std::make_shared<WriteJournalObjectStorage>(
+            DB::LocalObjectStorageSettings("test", (root / "store").string(), /*read_only_=*/false));
+        auto settings = DB::Cas::tests::makeSettingsForTest("test", root / "scratch");
+        settings[DB::ContentAddressedSetting::gc_enabled] = false;
+        if (manifest_decode_cache_bytes)
+            settings[DB::ContentAddressedSetting::manifest_decode_cache_bytes] = *manifest_decode_cache_bytes;
+        storage = std::make_shared<DB::ContentAddressedMetadataStorage>(object_storage, "pool", "srv1", "", nullptr, settings);
+        storage->startup();
+    }
+
+    ~JournaledTxStorage()
+    {
+        storage.reset();
+        std::filesystem::remove_all(root);
+    }
+
+    std::filesystem::path root;
+    std::shared_ptr<WriteJournalObjectStorage> object_storage;
+    std::shared_ptr<DB::ContentAddressedMetadataStorage> storage;
+};
+
+std::string joinPaths(const std::vector<std::string> & paths)
+{
+    std::string out;
+    for (const auto & path : paths)
+        out += path + "\n";
+    return out;
+}
+
+}
+
+/// A file written into a committed part and removed again in the same transaction changes nothing: the commit sends no
+/// request and the part keeps its manifest.
+TEST(CASTransactionStagedCopies, AFileWrittenAndRemovedInACommittedPartLeavesItsManifest)
+{
+    JournaledTxStorage env("ca_tx_write_unlink");
+    auto & storage = *env.storage;
+    const std::string table = kLivenessTable + "/";
+    const std::string part = table + "all_96_96_0/";
+    const DB::Cas::RootNamespace ns = storage.liveNamespace(kLivenessUuid);
+    commitPartTx(storage, table, "all_96_96_0", {{"data.bin", "a committed part"}});
+    const auto before = storage.partAccess()->getView({ns, "all_96_96_0"}, DB::Cas::Freshness::ForceFresh);
+    ASSERT_NE(before, nullptr);
+
+    auto tx = storage.createTransaction();
+    writeFileTx(*tx, part + "extra.bin", "staged into the committed part and removed again");
+    tx->unlinkFile(part + "extra.bin", /*if_exists=*/false, /*should_remove_objects=*/false);
+    env.object_storage->mark();
+    ASSERT_NO_THROW(tx->commit(DB::NoCommitOptions{}));
+
+    const std::vector<std::string> sent = env.object_storage->pathsAfterMark();
+    EXPECT_TRUE(sent.empty()) << joinPaths(sent);
+    const auto after = storage.partAccess()->getView({ns, "all_96_96_0"}, DB::Cas::Freshness::ForceFresh);
+    ASSERT_NE(after, nullptr);
+    EXPECT_EQ(after->manifestId(), before->manifestId());
+    EXPECT_EQ(*after->manifest(), *before->manifest());
+    EXPECT_FALSE(storage.existsFile(part + "extra.bin"));
+
+    env.object_storage->clear();
+    env.object_storage->mark();
+    auto kept = storage.createTransaction();
+    writeFileTx(*kept, part + "extra.bin", "staged into the committed part and kept");
+    kept->commit(DB::NoCommitOptions{});
+    EXPECT_FALSE(env.object_storage->pathsAfterMark().empty()) << "positive control: the same write without the removal publishes";
+    EXPECT_TRUE(storage.existsFile(part + "extra.bin"));
+}
+
+/// Every file staged into a committed part moves to new parts: those parts publish, and the committed part keeps its
+/// manifest.
+TEST(CASTransactionStagedCopies, ACommittedPartEmptiedOfItsStagedWritesKeepsItsManifest)
+{
+    auto storage = openTxStorage();
+    const std::string table = kLivenessTable + "/";
+    const std::string part = table + "all_96_96_0/";
+    const DB::Cas::RootNamespace ns = storage->liveNamespace(kLivenessUuid);
+    commitPartTx(*storage, table, "all_96_96_0", {{"data.bin", "a committed part"}});
+    const auto before = storage->partAccess()->getView({ns, "all_96_96_0"}, DB::Cas::Freshness::ForceFresh);
+    ASSERT_NE(before, nullptr);
+
+    auto tx = storage->createTransaction();
+    writeFileTx(*tx, part + "extra.bin", "staged into the committed part");
+    tx->createHardLink(part + "extra.bin", part + "extra_copy.bin");
+    tx->moveFile(part + "extra.bin", table + "tmp_insert_all_97_97_0/extra.bin");
+    tx->moveFile(part + "extra_copy.bin", table + "tmp_insert_all_98_98_0/extra.bin");
+    ASSERT_NO_THROW(tx->commit(DB::NoCommitOptions{}));
+
+    EXPECT_TRUE(storage->existsFile(table + "tmp_insert_all_97_97_0/extra.bin"));
+    EXPECT_TRUE(storage->existsFile(table + "tmp_insert_all_98_98_0/extra.bin"));
+    const auto after = storage->partAccess()->getView({ns, "all_96_96_0"}, DB::Cas::Freshness::ForceFresh);
+    ASSERT_NE(after, nullptr);
+    EXPECT_EQ(after->manifestId(), before->manifestId());
+    EXPECT_EQ(*after->manifest(), *before->manifest());
+    const DB::Cas::FsckReport report = storage->runFsckNow(/*detail=*/true);
+    EXPECT_EQ(report.dangling, 0u) << DB::Cas::formatFsckSummary(report);
+}
+
+/// A borrow follows its source through the transaction's rename of it. Inside one table the move keeps the manifest, so
+/// following it reads nothing; into another table the borrow takes the manifest the moved part commits.
+TEST(CASTransactionSourceLiveness, ABorrowFollowsTheRenameOfItsSourceWithItsManifest)
+{
+    for (const bool other_table : {false, true})
+    {
+        SCOPED_TRACE(other_table ? "renamed into another table" : "renamed within the table");
+        JournaledTxStorage env("ca_tx_borrow_rename", /*manifest_decode_cache_bytes=*/0);
+        auto & storage = *env.storage;
+        const std::string table = kLivenessTable + "/";
+        const std::string renamed = other_table ? "b12/b12b12b1-1212-4121-8121-121212121212/all_91_91_0"
+                                                : table + "detached/all_91_91_0";
+        const DB::Cas::RootNamespace ns = storage.liveNamespace(kLivenessUuid);
+        commitPartTx(storage, table, "all_91_91_0", {{"data.bin", "a source renamed by the copying transaction"}});
+        const DB::Cas::ManifestId source_manifest
+            = storage.partAccess()->getView({ns, "all_91_91_0"}, DB::Cas::Freshness::ForceFresh)->manifestId();
+        const std::string source_manifest_key = storage.store()->layout().manifestKey(source_manifest);
+
+        auto tx = storage.createTransaction();
+        auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+        tx->createHardLink(table + "all_91_91_0/data.bin", table + "tmp_clone_all_92_92_0/data.bin");
+        env.object_storage->clear();
+        tx->moveDirectory(table + "all_91_91_0", renamed);
+        const size_t source_manifest_reads = env.object_storage->count(WriteJournalObjectStorage::Verb::Read, source_manifest_key).first;
+
+        const auto borrow = ca_tx.borrowedSourceForTest(renamed);
+        ASSERT_NE(borrow, nullptr) << "the borrow did not follow the rename";
+        EXPECT_EQ(borrow->manifest->ref, borrow->manifest_ref) << "the borrow holds a manifest it does not name";
+        EXPECT_EQ(borrow->manifest->root_namespace_id.string(), borrow->part.ns.string());
+        if (other_table)
+        {
+            EXPECT_FALSE(borrow->manifest_ref == source_manifest.ref);
+            EXPECT_GE(source_manifest_reads, 1u) << "positive control: the republication reads the source manifest";
+        }
+        else
+        {
+            EXPECT_TRUE(borrow->manifest_ref == source_manifest.ref);
+            EXPECT_EQ(source_manifest_reads, 0u) << "a move within the table read the manifest after the rename";
+        }
+        tx->commit(DB::NoCommitOptions{});
+        EXPECT_TRUE(storage.existsFile(table + "tmp_clone_all_92_92_0/data.bin"));
+    }
 }
 
 /// Both parts that name the staged bytes publish them: the first uploads the body once, the second only reads that it
@@ -1598,52 +1813,6 @@ void commitUnprovenBlobEntry(DB::ContentAddressedMetadataStorage & storage)
 }
 
 }
-
-namespace
-{
-
-/// Commits `all_96_96_0`, then in one transaction stages a file and a hardlink of it inside that part and moves both
-/// to new parts, so the committed part keeps an open build with nothing staged.
-void commitAPartEmptiedOfItsStagedWrites(DB::ContentAddressedMetadataStorage & storage)
-{
-    const std::string table = kLivenessTable + "/";
-    commitPartTx(storage, table, "all_96_96_0", {{"data.bin", "a committed part"}});
-    auto tx = storage.createTransaction();
-    writeFileTx(*tx, table + "all_96_96_0/extra.bin", "staged into the committed part");
-    tx->createHardLink(table + "all_96_96_0/extra.bin", table + "all_96_96_0/extra_copy.bin");
-    tx->moveFile(table + "all_96_96_0/extra.bin", table + "tmp_insert_all_97_97_0/extra.bin");
-    tx->moveFile(table + "all_96_96_0/extra_copy.bin", table + "tmp_insert_all_98_98_0/extra.bin");
-    tx->commit(DB::NoCommitOptions{});
-}
-
-}
-
-#ifndef DEBUG_OR_SANITIZER_BUILD
-/// A committed part whose staged writes all moved away cannot be published, and retrying cannot change that.
-TEST(CASTransactionStagedCopies, ACommittedPartEmptiedOfItsStagedWritesThrows)
-{
-    auto storage = openTxStorage();
-    try
-    {
-        commitAPartEmptiedOfItsStagedWrites(*storage);
-        ADD_FAILURE() << "a committed part with an open build and nothing staged was published";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::LOGICAL_ERROR) << e.message();
-        EXPECT_NE(e.message().find("has an open build and nothing to publish"), std::string::npos) << e.message();
-    }
-}
-#else
-/// The storage is built inside the child, so the parent of this death suite constructs none.
-TEST(CASTransactionStagedCopiesDeathTest, ACommittedPartEmptiedOfItsStagedWritesAborts)
-{
-    EXPECT_DEATH({
-        auto storage = openTxStorage();
-        commitAPartEmptiedOfItsStagedWrites(*storage);
-    }, "has an open build and nothing to publish");
-}
-#endif
 
 #ifndef DEBUG_OR_SANITIZER_BUILD
 /// A blob entry whose body nothing uploads or confirms is refused before its part precommits.

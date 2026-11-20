@@ -412,8 +412,9 @@ Recomputes the per-shard in-degree snapshot and computes the round's single dest
 - **Fails the round if** (`CORRUPTED_DATA`): a source-edge run the adopted fold seal inherits does not match the
   seal's checksum, or has a row that breaks a rule: a blob of another shard, rows out of order, an active edge at the
   sentinel source id or a sentinel row at another key, a second sentinel row of one blob, or a condemned row stamped
-  after the parent round. Every round reads the same run, so the refusal stops reclamation on the pool; the message
-  names the run, the shard and the row
+  after the parent round; or its condemned rows differ from the seal's summary of the shard in count, pending count
+  or oldest non-pending round. Every round reads the same run, so the refusal stops reclamation on the pool; the
+  message names the run and the shard, and the row when a row breaks a rule
 - **Ends the round with `ABORTED`** ("gc/state moved during the round") instead of `CORRUPTED_DATA` when the merge
   reports `CORRUPTED_DATA` and a `HEAD` of `gc/state` then shows another version or no object: the round cannot
   commit, and a newer leader's retention removes the parent runs a deposed leader reads
@@ -428,7 +429,9 @@ Recomputes the per-shard in-degree snapshot and computes the round's single dest
 durable, an incomplete frontier (`frontier_proven ≠ frontier_namespaces`, a universe neither
 non-empty nor proved empty, or a universe policy that is not authoritative), or an unconfirmed parent state. The
 parent check is one uncached `HEAD` of `gc/state`, sent after the intake when the adopted state holds a `pending` or
-`standing` row. A round already suppressed by the intake skips it. The check must show the version the round leased.
+`standing` row. The seal's per-shard summary decides that before the merge; the merge reads the whole run of
+every shard it merges, and refuses one whose rows differ from the summary, before any body or intent delete of the round. A round
+already suppressed by the intake skips it. The check must show the version the round leased.
 Another version, an absent object or no answer means a newer leader may have removed ref-log records this round read
 as absent, so the round deletes no body and no intent. The check itself does not fail the round. The round's
 `gc/state` commit does when the state moved or is absent: it is refused with `ABORTED`. The reason is the

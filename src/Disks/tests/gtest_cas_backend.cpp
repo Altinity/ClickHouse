@@ -530,26 +530,26 @@ extern const Event CASGCPut;
 TEST(CASInstrumentedBackend, ClassifierAndPerNamespaceOpEvents)
 {
     /// Namespace classification by substring.
-    EXPECT_EQ(classifyCasNs("pool/blobs/ab/abcdef"), CasNs::Blob);
-    EXPECT_EQ(classifyCasNs("pool/gc/registry"), CasNs::Gc);   /// gc/ prefix covers GC state (state, retired sets, etc.)
-    EXPECT_EQ(classifyCasNs("pool/roots/default/_files/x"), CasNs::Root);
-    EXPECT_EQ(classifyCasNs("pool/gc/state"), CasNs::Gc);
+    EXPECT_EQ(classifyCasNs("pool/blobs/ab/abcdef", "pool"), CasNs::Blob);
+    EXPECT_EQ(classifyCasNs("pool/gc/registry", "pool"), CasNs::Gc);   /// gc/ prefix covers GC state (state, retired sets, etc.)
+    EXPECT_EQ(classifyCasNs("pool/roots/default/_files/x", "pool"), CasNs::Root);
+    EXPECT_EQ(classifyCasNs("pool/gc/state", "pool"), CasNs::Gc);
     /// D3: the old per-server-control key shapes (`_watermark`, `_precommits/<n>`) have no producer
     /// anymore -- control state now lives under `/gc/server-roots/...` (classifies as Gc). A key of
     /// this legacy shape, if it ever showed up, would fall through to the generic /roots/ rule.
-    EXPECT_EQ(classifyCasNs("pool/roots/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/_watermark"), CasNs::Root);
-    EXPECT_EQ(classifyCasNs("pool/roots/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/_precommits/3"), CasNs::Root);
-    EXPECT_EQ(classifyCasNs("pool/_pool_meta"), CasNs::Other);
+    EXPECT_EQ(classifyCasNs("pool/roots/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/_watermark", "pool"), CasNs::Root);
+    EXPECT_EQ(classifyCasNs("pool/roots/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/_precommits/3", "pool"), CasNs::Root);
+    EXPECT_EQ(classifyCasNs("pool/_pool_meta", "pool"), CasNs::Other);
     /// Final opaque-life layout: both immutable streams and point/path-addressed state remain Root
     /// instrumentation, while part manifests remain Manifest. None may fall into Other (the
     /// 2026-07-03 operator-stand CREATE storm misread as CASOtherHeadMiss=102 because of this).
-    EXPECT_EQ(classifyCasNs("pool/cas/ns/stream/00000000000000000000000000000017/_log/1-1.zst"), CasNs::Root);
-    EXPECT_EQ(classifyCasNs("pool/cas/ns/state/00000000000000000000000000000017/_ckpt.zst"), CasNs::Root);
-    EXPECT_EQ(classifyCasNs("pool/cas/ns/state/00000000000000000000000000000017/_files/format_version.txt"), CasNs::Root);
-    EXPECT_EQ(classifyCasNs("pool/cas/manifests/0/srv/store/d18/uuid@cas@/24/1/000001.proto"), CasNs::Manifest);
+    EXPECT_EQ(classifyCasNs("pool/cas/ns/stream/00000000000000000000000000000017/_log/1-1.zst", "pool"), CasNs::Root);
+    EXPECT_EQ(classifyCasNs("pool/cas/ns/state/00000000000000000000000000000017/_ckpt.zst", "pool"), CasNs::Root);
+    EXPECT_EQ(classifyCasNs("pool/cas/ns/state/00000000000000000000000000000017/_files/format_version.txt", "pool"), CasNs::Root);
+    EXPECT_EQ(classifyCasNs("pool/cas/manifests/0/srv/store/d18/uuid@cas@/24/1/000001.proto", "pool"), CasNs::Manifest);
 
     auto inner = std::make_shared<InMemoryBackend>();
-    auto instrumented = std::make_shared<InstrumentedBackend>(inner);
+    auto instrumented = std::make_shared<InstrumentedBackend>(inner, "pool");
     CasRequests requests = openRequestsForTest(instrumented);
     CasOperation op = requests.admit();
 
@@ -589,7 +589,7 @@ TEST(CASInstrumentedBackend, ClassifierAndPerNamespaceOpEvents)
 TEST(CASInstrumentedBackend, PublishBlobDelegatesOnceAndRecordsOnePhysicalBlobWrite)
 {
     auto inner = std::make_shared<PublishCountingInMemoryBackend>();
-    auto backend = std::make_shared<InstrumentedBackend>(inner);
+    auto backend = std::make_shared<InstrumentedBackend>(inner, "pool");
     CasRequests requests = openRequestsForTest(backend);
     CasOperation op = requests.admit();
 

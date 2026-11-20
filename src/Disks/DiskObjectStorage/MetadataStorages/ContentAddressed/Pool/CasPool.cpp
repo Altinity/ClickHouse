@@ -453,7 +453,7 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
     /// Wrap the pool backend once, transparently, so EVERY CA S3 op — probe, pool-meta,
     /// writer, GC, watermark — flows through the per-namespace/op ProfileEvents chokepoint. The
     /// decorator only delegates and counts; it changes no behavior (read-only opens stay write-free).
-    backend = std::make_shared<InstrumentedBackend>(std::move(backend));
+    backend = std::make_shared<InstrumentedBackend>(std::move(backend), config.pool_prefix);
 
     /// FAIL-CLOSED: the capability probe throws NOT_IMPLEMENTED on any failed check, and
     /// PoolMeta::createOrValidate is pool-authoritative — the config constants apply only at creation.
@@ -662,7 +662,7 @@ PoolPtr Pool::openForMigration(BackendPtr backend, PoolConfig config)
     validateCasRequestWindow(config.cas_request_budget);
     config.read_only = true;
     config.background_watermark = false;
-    backend = std::make_shared<InstrumentedBackend>(std::move(backend));
+    backend = std::make_shared<InstrumentedBackend>(std::move(backend), config.pool_prefix);
 
     const Layout layout(config.pool_prefix);
     CasRequests bootstrap_requests(
@@ -1073,7 +1073,7 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
 
 PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const String & victim_srid)
 {
-    backend = std::make_shared<InstrumentedBackend>(std::move(backend));
+    backend = std::make_shared<InstrumentedBackend>(std::move(backend), config.pool_prefix);
     validateServerRootId(victim_srid);
 
     config.server_root_id = victim_srid;

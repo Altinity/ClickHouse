@@ -630,8 +630,9 @@ public:
     /// throws, and the storage layer answers `Unknown`. Any other ledger answer issues no request.
     ConfirmAnswer confirmExactRef(const RootNamespace & ns, const String & ref_name, const ManifestRef & manifest_ref) const;
     /// The same gate for an in-process copy, on the table runtime `table` pinned when the source was resolved
-    /// (`CasRefLedger::confirmPinnedRef`). One deadline, the request window from the call's start, bounds the
-    /// ledger's wait for a held state lock and the mount-slot `GET`. A failed read throws.
+    /// (`CasRefLedger::confirmPinnedRef`). One deadline, the request window from the call's start, decides whether the
+    /// ledger waits for a held state lock again and bounds the mount-slot `GET`; one wait for the lock is not bounded.
+    /// A failed read throws.
     ConfirmAnswer confirmPinnedRef(const CasRefLedger::TablePin & table, const RootNamespace & ns, const String & ref_name,
                                    const ManifestRef & manifest_ref) const;
     /// TEST SEAM: runs between the ownership capture and the ledger snapshot.

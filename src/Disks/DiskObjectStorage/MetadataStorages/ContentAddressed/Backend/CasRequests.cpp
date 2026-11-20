@@ -199,8 +199,8 @@ bool preconditionStillSatisfiable(const Observation & seen, const std::optional<
         /// be alive. Reporting a conflict on it would name an occupant nobody observed.
         [](const NotObserved &) { return true; },
         [&](const ProvenAbsent &) { return !expected.has_value(); },
-        [&](const Meta & m) { return expected.has_value() && m.etag == *expected; },
-        [&](const Object & o) { return expected.has_value() && o.etag == *expected; }},
+        [&](const Meta & m) { return expected.has_value() && sameVersion(m.etag, *expected); },
+        [&](const Object & o) { return expected.has_value() && sameVersion(o.etag, *expected); }},
         seen);
 }
 

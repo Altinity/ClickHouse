@@ -585,7 +585,7 @@ private:
                 continue;
             present.insert(srid);
             const auto it = tokens.find(srid);
-            if (it == tokens.end() || it->second != got->etag)
+            if (it == tokens.end() || !sameVersion(got->etag, it->second))
                 on_change(srid, /*gone=*/ false);
         }
         for (const auto & [srid, token] : tokens)
@@ -676,9 +676,10 @@ private:
             std::vector<std::vector<RunRef>> runs_of_shard(meta.gc_shards);
             for (const RunRef & run : seal.blob_target_runs)
                 runs_of_shard[run.shard].push_back(run);
-            const AdoptedRunContext parent{.gc_shards = meta.gc_shards, .parent_round = state->round};
             for (uint64_t shard = 0; shard < meta.gc_shards; ++shard)
             {
+                const AdoptedRunContext parent{.gc_shards = meta.gc_shards, .parent_round = state->round,
+                                               .summary = seal.condemned_summary.at(shard)};
                 AdoptedRunReader reader(op, runs_of_shard[shard], shard, parent);
                 try
                 {
@@ -691,8 +692,8 @@ private:
                 {
                     if (e.code() != ErrorCodes::CORRUPTED_DATA)
                         throw;
-                    e.addMessage("M3: GC of this build refuses the source-edge run `{}` of the fold seal that gc/state adopts. The run "
-                        "stopped before any intent and before the floor", reader.currentRun().key);
+                    e.addMessage("M3: GC of this build refuses a source-edge run of the fold seal that gc/state adopts. The run "
+                        "stopped before any intent and before the floor");
                     throw;
                 }
             }
@@ -860,7 +861,17 @@ private:
             convert(page, confirmed, meter);
         }
 
+        /// `runBounded` queues every job it is given, so these creates go in batches, as in `convert`.
         std::vector<std::pair<BlobRef, CanonicalIdentity>> own;
+        const auto create_own = [&]
+        {
+            runBounded(concurrency, own.size(), [&](size_t i)
+            {
+                CasOperation job = jobOperation();
+                createIntent(job, own[i].first, own[i].second, confirmed);
+            });
+            own.clear();
+        };
         for (const InheritedRow & row : rows)
         {
             if (!row.pending)
@@ -869,12 +880,10 @@ private:
             const size_t at = std::lower_bound(condemned.begin(), condemned.end(), row.ref) - condemned.begin();
             if (identity && current[at] != identity)
                 own.emplace_back(row.ref, *identity);
+            if (own.size() >= kBatchKeys)
+                create_own();
         }
-        runBounded(concurrency, own.size(), [&](size_t i)
-        {
-            CasOperation job = jobOperation();
-            createIntent(job, own[i].first, own[i].second, confirmed);
-        });
+        create_own();
 
         report.intents_confirmed = confirmed.load();
         say(fmt::format("M5: {} intent(s) confirmed for {} blob(s); until M6 an older build can still open and use this pool",
@@ -886,7 +895,7 @@ private:
     void recheck(const SlotTokens & slots, const GcPairs & pairs, const std::optional<Etag> & state_token, Window window)
     {
         const std::optional<Object> stored_state = op.read(layout.gcStateKey(), Retry::standard());
-        if (stored_state.has_value() != state_token.has_value() || (stored_state && stored_state->etag != *state_token))
+        if (stored_state.has_value() != state_token.has_value() || (stored_state && !sameVersion(stored_state->etag, *state_token)))
             throwGcMoved(stored_state ? decodeGcState(stored_state->bytes).lease.owner : pairs.lease.owner, window);
         checkUnchanged(slots, pairs, window);
     }
@@ -901,7 +910,8 @@ private:
             seen.push_back(gone ? fmt::format("server root '{}' (its slot is gone)", srid) : fmt::format("server root '{}'", srid));
         });
         const std::optional<Object> stored_state = op.read(layout.gcStateKey(), Retry::standard());
-        const bool state_moved = stored_state.has_value() != state_token.has_value() || (stored_state && stored_state->etag != *state_token);
+        const bool state_moved = stored_state.has_value() != state_token.has_value()
+            || (stored_state && !sameVersion(stored_state->etag, *state_token));
         if (const auto owner = gcOwnerThatMoved(pairs); owner || state_moved)
             seen.push_back(owner ? fmt::format("GC lease of owner {}", u128ToHex(*owner)) : String("a change of gc/state"));
         if (seen.empty())

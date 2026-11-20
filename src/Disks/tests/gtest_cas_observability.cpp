@@ -594,15 +594,45 @@ TEST(CASObservability, IntentKeysClassifyAsBlobIntent)
     const Layout layout("p");
     const BlobRef ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(7))};
     const CanonicalIdentity identity{Dialect::ETag, "616263"};
-    EXPECT_EQ(classifyCasNs(layout.blobIntentKey(ref, identity)), CasNs::BlobIntent);
-    EXPECT_EQ(classifyCasNs(layout.blobIntentsPrefix()), CasNs::BlobIntent);
-    EXPECT_EQ(classifyCasNs(layout.blobKey(ref)), CasNs::Blob) << "positive control";
+    EXPECT_EQ(classifyCasNs(layout.blobIntentKey(ref, identity), layout.poolPrefix()), CasNs::BlobIntent);
+    EXPECT_EQ(classifyCasNs(layout.blobIntentsPrefix(), layout.poolPrefix()), CasNs::BlobIntent);
+    EXPECT_EQ(classifyCasNs(layout.blobKey(ref), layout.poolPrefix()), CasNs::Blob) << "positive control";
     EXPECT_EQ(CAS_NS_COUNT, 7u);
+}
+
+/// A pool prefix may contain the name of a key family; only the components after the prefix classify a key.
+TEST(CASObservability, KeysClassifyByTheComponentAfterThePoolPrefix)
+{
+    const Layout layout("tenant/blob-intents/archive");
+    const BlobRef ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(7))};
+    const CanonicalIdentity identity{Dialect::ETag, "616263"};
+    const String & prefix = layout.poolPrefix();
+    EXPECT_EQ(classifyCasNs(layout.blobKey(ref), prefix), CasNs::Blob);
+    EXPECT_EQ(classifyCasNs(layout.blobsPrefix(), prefix), CasNs::Blob);
+    EXPECT_EQ(classifyCasNs(layout.gcStateKey(), prefix), CasNs::Gc);
+    EXPECT_EQ(classifyCasNs(layout.namespaceRootPrefix(), prefix), CasNs::Root);
+    EXPECT_EQ(classifyCasNs(layout.poolMetaKey(), prefix), CasNs::Other);
+    EXPECT_EQ(classifyCasNs(layout.blobIntentKey(ref, identity), prefix), CasNs::BlobIntent) << "positive control";
+
+    auto instrumented = std::make_shared<InstrumentedBackend>(std::make_shared<InMemoryBackend>(), prefix);
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(instrumented);
+    CasOperation op = requests.admit();
+    using ProfileEvents::global_counters;
+    const uint64_t blob_put = global_counters[ProfileEvents::CASBlobPut];
+    const uint64_t intent_put = global_counters[ProfileEvents::CASBlobIntentPut];
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.blobKey(ref), "x", Retry::once())));
+#if !WITH_COVERAGE
+    EXPECT_EQ(global_counters[ProfileEvents::CASBlobPut] - blob_put, 1u);
+    EXPECT_EQ(global_counters[ProfileEvents::CASBlobIntentPut] - intent_put, 0u);
+#else
+    (void)blob_put;
+    (void)intent_put;
+#endif
 }
 
 TEST(CASObservability, IntentRequestsCountInTheirOwnClass)
 {
-    auto instrumented = std::make_shared<InstrumentedBackend>(std::make_shared<InMemoryBackend>());
+    auto instrumented = std::make_shared<InstrumentedBackend>(std::make_shared<InMemoryBackend>(), "p");
     CasRequests requests = DB::Cas::tests::openRequestsForTest(instrumented);
     CasOperation op = requests.admit();
 

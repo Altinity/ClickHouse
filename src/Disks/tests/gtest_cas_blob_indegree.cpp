@@ -23,6 +23,7 @@ namespace DB::ErrorCodes { extern const int ABORTED; extern const int CORRUPTED_
 
 using namespace DB::Cas;
 using DB::Cas::tests::foldParent;
+using DB::Cas::tests::foldParentOf;
 
 namespace
 {
@@ -398,7 +399,7 @@ TEST(CASThreeCursorMerge, CandidateRowsAtZeroCreateTheirIntents)
     size_t creates = 0;
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
-    runs2.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, foldParent(3), 2, 0, 0, {},
+    runs2.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, foldParentOf(*backend_req, {gen1}, 3), 2, 0, 0, {},
         ShardFoldOptions{
             .current_round = 4,
             .condemn_round = 4,
@@ -429,7 +430,7 @@ TEST(CASThreeCursorMerge, CandidateRowsAtZeroCreateTheirIntents)
     /// Without a create hook no create is sent and both rows carry.
     std::vector<RunRef> runs3;
     RetiredMergeResult carried;
-    runs3.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, foldParent(3), 3, 0, 0, {},
+    runs3.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, foldParentOf(*backend_req, {gen1}, 3), 3, 0, 0, {},
         {.current_round = 4, .condemn_round = 4, .out_retired = &carried}));
     ASSERT_EQ(carried.still_retired.size(), 2u);
     EXPECT_FALSE(carried.still_retired[0].delete_pending);
@@ -453,7 +454,7 @@ TEST(CASThreeCursorMerge, PendingRowWhoseHeadShowsItsTokenGoesStandingWithABodyD
 
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
-    runs2.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, foldParent(8), 2, 0, 0, {},
+    runs2.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, foldParentOf(*backend_req, {gen1}, 8), 2, 0, 0, {},
         {.current_round = 9, .condemn_round = 9, .pending_head = present, .out_retired = &rmr}));
 
     ASSERT_EQ(rmr.body_deletes.size(), 1u);
@@ -479,7 +480,7 @@ TEST(CASThreeCursorMerge, PendingRowWithAnAbsentBodyGoesStandingWithNoRequest)
 
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
-    runs2.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, foldParent(8), 2, 0, 0, {},
+    runs2.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, foldParentOf(*backend_req, {gen1}, 8), 2, 0, 0, {},
         {.current_round = 9, .condemn_round = 9, .pending_head = kPendingBodyAbsent, .out_retired = &rmr}));
 
     EXPECT_TRUE(rmr.body_deletes.empty());
@@ -515,7 +516,7 @@ TEST(CASThreeCursorMerge, PendingRowAtATouchedZeroIsCarried)
 
         std::vector<RunRef> runs2;
         RetiredMergeResult rmr;
-        runs2.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, foldParent(8), 2, 0, 0, window,
+        runs2.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, foldParentOf(*backend_req, {gen1}, 8), 2, 0, 0, window,
             ShardFoldOptions{
                 .current_round = 9,
                 .condemn_round = 9,
@@ -546,7 +547,7 @@ TEST(CASThreeCursorMerge, StandingRowAtZeroDeletesItsIntentAndLeavesTheRun)
 
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
-    runs2.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, foldParent(8), 2, 0, 0, {},
+    runs2.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, foldParentOf(*backend_req, {gen1}, 8), 2, 0, 0, {},
         {.current_round = 9, .condemn_round = 9, .out_retired = &rmr}));
 
     ASSERT_EQ(rmr.intent_deletes.size(), 1u);
@@ -569,7 +570,7 @@ TEST(CASThreeCursorMerge, RecoverySpares)
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
     runs2.push_back(foldDeltasIntoGeneration(
-        *backend_req, layout, /*prior_runs*/{gen1}, foldParent(5), 2, 0, 0, {{bh(1), s(1), false}},
+        *backend_req, layout, /*prior_runs*/{gen1}, foldParentOf(*backend_req, {gen1}, 5), 2, 0, 0, {{bh(1), s(1), false}},
         {.current_round = 5, .condemn_round = 6, .out_retired = &rmr}));
 
     ASSERT_EQ(rmr.spared.size(), 1u);
@@ -671,7 +672,7 @@ TEST(CASThreeCursorMerge, SnapshotEdgesUnperturbedByRetired)
     RetiredMergeResult rmr;
     size_t creates = 0;
     r2.push_back(foldDeltasIntoGeneration(
-        *engaged_req, layout, /*prior_runs*/{prior}, foldParent(2), 2, 0, 0,
+        *engaged_req, layout, /*prior_runs*/{prior}, foldParentOf(*engaged_req, {prior}, 2), 2, 0, 0,
         {{bh(1), s(1), false}, {bh(2), s(1), false}, {bh(2), s(2), true}},
         ShardFoldOptions{
             .current_round = 9,
@@ -718,7 +719,7 @@ TEST(CASTwoCursorMerge, CarriedSentinelIsNotATouch)
     auto peek = [&](const BlobRef &) -> std::optional<Meta> { ++peek_calls; return {}; };
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr2;
-    runs2.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/runs1, foldParent(5), 2, 0, 0, {},
+    runs2.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/runs1, foldParentOf(*backend_req, runs1, 5), 2, 0, 0, {},
         {.current_round = 1, .condemn_round = 6, .peek_head = peek, .out_retired = &rmr2}));
 
     EXPECT_EQ(peek_calls, 0u);
@@ -1113,7 +1114,7 @@ TEST(CASThreeCursorMerge, RedeleteBudgetCapsCohortAndCarriesExcess)
 
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
-    runs2.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, foldParent(8), 2, 0, 0, {},
+    runs2.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, foldParentOf(*backend_req, {gen1}, 8), 2, 0, 0, {},
         {.current_round = 9, .condemn_round = 9, .pending_head = absent, .out_retired = &rmr, .work_budget = &budget}));
 
     EXPECT_EQ(heads, 3u);
@@ -1144,7 +1145,7 @@ TEST(CASThreeCursorMerge, CreateBudgetCapsCohortAndCarriesExcess)
 
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
-    runs2.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, foldParent(5), 2, 0, 0, {},
+    runs2.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, foldParentOf(*backend_req, {gen1}, 5), 2, 0, 0, {},
         ShardFoldOptions{
             .current_round = 5,
             .condemn_round = 6,
@@ -1185,7 +1186,7 @@ TEST(CASThreeCursorMerge, RedeleteBudgetDrainsCohortToFixpointOverRounds)
         budget.max_redeletes = 3;
         std::vector<RunRef> out_runs;
         RetiredMergeResult rmr;
-        out_runs.push_back(foldDeltasIntoGeneration(*backend_req, layout, priors, foldParent(99), 2 + rounds, 0, 0, {},
+        out_runs.push_back(foldDeltasIntoGeneration(*backend_req, layout, priors, foldParentOf(*backend_req, priors, 99), 2 + rounds, 0, 0, {},
             ShardFoldOptions{
                 .current_round = 100,
                 .condemn_round = 100,
@@ -1222,7 +1223,7 @@ TEST(CASThreeCursorMerge, OnlyASentCreateSpendsABudgetSlot)
 
         std::vector<RunRef> runs2;
         RetiredMergeResult rmr;
-        runs2.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, foldParent(5), 2, 0, 0, {},
+        runs2.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, foldParentOf(*backend_req, {gen1}, 5), 2, 0, 0, {},
             ShardFoldOptions{
                 .current_round = 5,
                 .condemn_round = 6,
@@ -1264,7 +1265,7 @@ TEST(CASThreeCursorMerge, OutstandingCreatesWriteTheSameRunAndBoundWhatIsHeld)
         const RunRef gen1 = writeSourceEdgeRun(backend, layout, 1, 0, 0, candidates);
         applied.assign(kEdges, 0);
         std::vector<RunRef> runs2;
-        runs2.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, foldParent(5), 2, 0, 0, deltas,
+        runs2.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, foldParentOf(*backend_req, {gen1}, 5), 2, 0, 0, deltas,
             ShardFoldOptions{
                 .current_round = 5,
                 .condemn_round = 6,
@@ -1324,7 +1325,7 @@ size_t foldCandidateStamped(uint64_t row_round)
     size_t creates = 0;
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
-    runs2.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, foldParent(5), 2, 0, 0, {},
+    runs2.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, foldParentOf(*backend_req, {gen1}, 5), 2, 0, 0, {},
         ShardFoldOptions{
             .current_round = 6,
             .condemn_round = 6,
@@ -1341,6 +1342,50 @@ TEST(CASThreeCursorMerge, RowStampedAfterTheParentRoundIsRefused)
     EXPECT_EQ(foldCandidateStamped(5), 1u) << "a row of the parent round itself is decided";
     DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "after the parent round 5",
         [] { foldCandidateStamped(6); });
+}
+
+/// Once the last run of a shard is drained, the reader compares what the rows hold with the parent seal's summary of
+/// the shard: a summary that misstates the condemned rows, the pending rows or the oldest non-pending round is refused.
+TEST(CASThreeCursorMerge, ShardSummaryThatMisstatesItsRunsIsRefused)
+{
+    InMemoryBackend backend;
+    DB::Cas::tests::OperationForTest op(backend);
+    Layout layout{"pool"};
+    const RunRef run = writeSourceEdgeRun(backend, layout, 1, 0, 0,
+        {{b(1), condemnedRowFor(3)}, {b(2), condemnedRowFor(4, "t2", /*delete_pending*/ true)}, {b(4), condemnedRowFor(5, "t4")}},
+        {{b(3), s(1)}});
+    const auto drain = [&](const std::vector<RunRef> & runs, const CondemnedSummary & stated)
+    {
+        AdoptedRunReader reader(*op, runs, 0, AdoptedRunContext{.gc_shards = 1, .parent_round = 5, .summary = stated});
+        SourceEdgeRecord rec;
+        size_t rows = 0;
+        while (reader.next(rec))
+            ++rows;
+        return rows;
+    };
+
+    EXPECT_EQ(drain({run}, CondemnedSummary{.condemned_total = 3, .pending_total = 1, .oldest_nonpending_condemn_round = 3}), 4u);
+    EXPECT_EQ(drain({}, CondemnedSummary{}), 0u);
+    for (const CondemnedSummary & stated : {
+             CondemnedSummary{.condemned_total = 2, .pending_total = 1, .oldest_nonpending_condemn_round = 3},
+             CondemnedSummary{.condemned_total = 3, .pending_total = 0, .oldest_nonpending_condemn_round = 3},
+             CondemnedSummary{.condemned_total = 3, .pending_total = 1, .oldest_nonpending_condemn_round = 4}})
+    {
+        SCOPED_TRACE(fmt::format("{} condemned, {} pending, oldest {}", stated.condemned_total, stated.pending_total,
+                                 stated.oldest_nonpending_condemn_round));
+        const String message = DB::Cas::tests::messageOf(DB::ErrorCodes::CORRUPTED_DATA, [&] { drain({run}, stated); });
+        EXPECT_NE(message.find(run.key), String::npos) << message;
+        EXPECT_NE(message.find("GC shard 0"), String::npos) << message;
+        EXPECT_NE(message.find("hold 3 condemned, 1 pending, oldest non-pending round 3"), String::npos) << message;
+        EXPECT_NE(message.find(fmt::format("states {} condemned, {} pending", stated.condemned_total, stated.pending_total)),
+                  String::npos) << message;
+        EXPECT_NE(message.find("GC bookkeeping is corrupt"), String::npos) << message;
+    }
+    const String message = DB::Cas::tests::messageOf(DB::ErrorCodes::CORRUPTED_DATA, [&]
+    {
+        drain({}, CondemnedSummary{.condemned_total = 1, .pending_total = 1});
+    });
+    EXPECT_NE(message.find("no source-edge run"), String::npos) << message;
 }
 
 /// The legacy confirmed bit stays decodable but is never written: a confirmed create leaves it clear, and a row
@@ -1361,7 +1406,7 @@ TEST(CASThreeCursorMerge, RowsThisBuildWritesCarryTheLegacyConfirmedBitClear)
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
     /// No `pending_head`: the pending row is carried unchanged.
-    runs2.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, foldParent(5), 2, 0, 0, {},
+    runs2.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, foldParentOf(*backend_req, {gen1}, 5), 2, 0, 0, {},
         ShardFoldOptions{
             .current_round = 5,
             .condemn_round = 6,
@@ -1389,7 +1434,7 @@ TEST(CASThreeCursorMerge, LegacyConfirmedBitDoesNotConfirmTheIntent)
     size_t creates = 0;
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
-    runs2.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, foldParent(5), 2, 0, 0, {},
+    runs2.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, foldParentOf(*backend_req, {gen1}, 5), 2, 0, 0, {},
         ShardFoldOptions{
             .current_round = 5,
             .condemn_round = 6,
@@ -1415,7 +1460,7 @@ TEST(CASThreeCursorMerge, StandingRowWithoutAnIdentityLeavesWithoutASpare)
 
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
-    runs2.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, foldParent(8), 2, 0, 0, {},
+    runs2.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, foldParentOf(*backend_req, {gen1}, 8), 2, 0, 0, {},
         {.current_round = 9, .condemn_round = 9, .out_retired = &rmr}));
 
     EXPECT_TRUE(rmr.still_retired.empty()) << "the row was not dropped";
@@ -1469,7 +1514,7 @@ TEST(CASThreeCursorMerge, ScanAheadStopsAtTheRowCap)
 
     std::vector<RunRef> with_scan;
     RetiredMergeResult scanned;
-    with_scan.push_back(foldDeltasIntoGeneration(*backend_req, layout, {gen1}, foldParent(5), 2, 0, 0, {},
+    with_scan.push_back(foldDeltasIntoGeneration(*backend_req, layout, {gen1}, foldParentOf(*backend_req, {gen1}, 5), 2, 0, 0, {},
         ShardFoldOptions{
             .current_round = 5,
             .condemn_round = 6,
@@ -1485,7 +1530,7 @@ TEST(CASThreeCursorMerge, ScanAheadStopsAtTheRowCap)
     /// Same output key: a different run would fail the write-once replay with `CORRUPTED_DATA`.
     std::vector<RunRef> without_scan;
     RetiredMergeResult plain;
-    without_scan.push_back(foldDeltasIntoGeneration(*backend_req, layout, {gen1}, foldParent(5), 2, 0, 0, {},
+    without_scan.push_back(foldDeltasIntoGeneration(*backend_req, layout, {gen1}, foldParentOf(*backend_req, {gen1}, 5), 2, 0, 0, {},
         {.current_round = 5, .condemn_round = 6, .pending_head = kPendingBodyAbsent, .out_retired = &plain}));
     ASSERT_EQ(with_scan.size(), 1u);
     ASSERT_EQ(without_scan.size(), 1u);
@@ -1507,6 +1552,9 @@ TEST(CASThreeCursorMerge, ScanAheadStopsAtTheSegmentEnd)
     const RunRef seg1 = writeSourceEdgeRun(backend, layout, 1, 0, 0, condemnedRowsOf(first));
     const RunRef seg2 = writeSourceEdgeRun(backend, layout, 1, 1, 0, condemnedRowsOf(second));
     const std::set<BlobRef> second_set(second.begin(), second.end());
+    /// Counted before the folds: the counts below are of the folds' own opens.
+    const AdoptedRunContext parent = foldParentOf(*backend_req, {seg1, seg2}, 5);
+    backend.resetCounts();
 
     size_t early_offers = 0;
     std::vector<BlobRef> offered;
@@ -1532,7 +1580,7 @@ TEST(CASThreeCursorMerge, ScanAheadStopsAtTheSegmentEnd)
     };
 
     std::vector<RunRef> with_scan;
-    with_scan.push_back(foldDeltasIntoGeneration(*backend_req, layout, {seg1, seg2}, foldParent(5), 2, 0, 0, {},
+    with_scan.push_back(foldDeltasIntoGeneration(*backend_req, layout, {seg1, seg2}, parent, 2, 0, 0, {},
         {.current_round = 5, .condemn_round = 6, .pending_head = head, .pending_hints = &hints}));
 
     EXPECT_EQ(segment_two_opens_at_first_head, 0u) << "the scan opened segment 2 before the merge reached it";
@@ -1542,7 +1590,7 @@ TEST(CASThreeCursorMerge, ScanAheadStopsAtTheSegmentEnd)
     EXPECT_EQ(headed[9], first.back()) << "the last row of segment 1 is still read";
 
     std::vector<RunRef> without_scan;
-    without_scan.push_back(foldDeltasIntoGeneration(*backend_req, layout, {seg1, seg2}, foldParent(5), 2, 0, 0, {},
+    without_scan.push_back(foldDeltasIntoGeneration(*backend_req, layout, {seg1, seg2}, parent, 2, 0, 0, {},
         {.current_round = 5, .condemn_round = 6, .pending_head = kPendingBodyAbsent}));
     EXPECT_EQ(with_scan.front().checksum, without_scan.front().checksum);
 }
@@ -1655,7 +1703,7 @@ TEST(CASBlobInDegree, RunViewAndRetiredEntryCarryStanding)
     /// A suppressed pass decides no intent delete: both rows carry into the next run as `standing`.
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
-    runs2.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, foldParent(8), 2, 0, 0, {},
+    runs2.push_back(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, foldParentOf(*backend_req, {gen1}, 8), 2, 0, 0, {},
         ShardFoldOptions{
             .current_round = 9,
             .condemn_round = 9,

@@ -102,6 +102,11 @@ struct PersistedEtag
 /// True when both spellings canonicalise and are equal.
 bool sameIncarnation(const PersistedEtag & row, const Etag & live);
 
+/// Whether `read`, from a read of an object, names the version a conditional write of it answered with as `written`:
+/// equal tokens, or equal canonical identities, because the two responses may quote one ETag differently. A token
+/// with no canonical form matches only exactly.
+bool sameVersion(const Etag & read, const Etag & written);
+
 /// A token whose `canonical` is `identity`, in wire spelling: a quoted tag except for `generation`. Nothing when
 /// `tag_hex` names no opaque tag.
 std::optional<PersistedEtag> persistedTokenOf(const CanonicalIdentity & identity);

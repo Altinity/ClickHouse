@@ -1352,7 +1352,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
     /// it read from `_ckpt`, so an unchanged token proves none of those keys was emptied under the walk.
     checkRecoveryStillAdmitted(ns, rt, cancelled, token);
     const std::optional<CkptSample> final_ckpt = readCkpt(op, layout, life);
-    if (!final_ckpt || final_ckpt->etag != accepted.etag || final_ckpt->ckpt != accepted.ckpt)
+    if (!final_ckpt || !sameVersion(final_ckpt->etag, accepted.etag) || final_ckpt->ckpt != accepted.ckpt)
         return std::nullopt;
     checkRecoveryStillAdmitted(ns, rt, cancelled, token);
 

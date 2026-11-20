@@ -161,7 +161,7 @@ public:
 
 private:
     friend SourceEdgeRunView openSourceEdgeRun(std::string_view bytes);
-    friend SourceEdgeRunView openSourceEdgeRun(CasOperation & op, const String & key);
+    friend SourceEdgeRunView openSourceEdgeRun(CasOperation & op, const String & key, const Retry & policy);
     /// Keep the underlying stream alive for the reader, which borrows it rather than owning it.
     explicit SourceEdgeRunView(std::unique_ptr<ReadBuffer> stream_);
 
@@ -171,17 +171,18 @@ private:
 
 /// Open a typed source-edge run. The NDJSON header must identify a `cas_run` of kind `source_edge`;
 /// otherwise opening fails closed. The memory overload borrows caller-owned bytes. The backend overload
-/// streams the write-once object: the reader itself holds one record-sized buffer, but the open stream
+/// streams the write-once object under `policy`: the reader itself holds one record-sized buffer, but the open stream
 /// underneath it buffers on its own terms, unbounded and unmeasured here.
 SourceEdgeRunView openSourceEdgeRun(std::string_view bytes);
-SourceEdgeRunView openSourceEdgeRun(CasOperation & op, const String & key);
+SourceEdgeRunView openSourceEdgeRun(CasOperation & op, const String & key, const Retry & policy = Retry::standard());
 
-/// What the rows of inherited source-edge runs are checked against: the pool's GC shard count, and the round of the
-/// `gc/state` that adopted the fold seal naming the runs.
+/// What the rows of inherited source-edge runs of one shard are checked against: the pool's GC shard count, the round
+/// of the `gc/state` that adopted the fold seal naming the runs, and that seal's condemned summary of the shard.
 struct AdoptedRunContext
 {
     uint64_t gc_shards = 0;
     uint64_t parent_round = 0;
+    CondemnedSummary summary;
 };
 
 /// Reads the source-edge runs a GC shard inherits from its parent fold seal. It opens each run typed,
@@ -189,7 +190,9 @@ struct AdoptedRunContext
 /// A row is refused with `CORRUPTED_DATA` when it is an edge at the sentinel source id 0, a sentinel marker at another
 /// source id, a second sentinel row of one blob, a blob of another shard, below the previous row in
 /// `(BlobRef, source_id)` order, or a condemned row stamped after the parent round. The message names the run's key,
-/// the shard and the row, and ends with `kCorruptBookkeeping`.
+/// the shard and the row, and ends with `kCorruptBookkeeping`. Once the last run is drained, the condemned rows read
+/// must match the seal's summary of the shard in all three fields, or the reader refuses the same way. Every refusal
+/// names the run's key.
 class AdoptedRunReader
 {
 public:
@@ -198,7 +201,8 @@ public:
 
     /// The next row of the open run; false once that run's trailer is consumed, or before the first `openNextRun`.
     bool nextInRun(SourceEdgeRecord & rec);
-    /// Verifies the drained open run against its seal checksum and opens the next one; false when no run is left.
+    /// Verifies the drained open run against its seal checksum and opens the next one; false when no run is left, after
+    /// the summary check.
     bool openNextRun();
     /// The next row of any run; false once every run is drained and verified.
     bool next(SourceEdgeRecord & rec);
@@ -208,6 +212,7 @@ public:
 private:
     void checkRow(const SourceEdgeRecord & rec);
     [[noreturn]] void refuseRow(const SourceEdgeRecord & rec, const String & what) const;
+    void checkSummary() const;
 
     CasOperation & op;
     const std::vector<RunRef> & runs;
@@ -217,6 +222,9 @@ private:
     size_t next_run = 0;
     std::optional<SourceEdgeRunView> view;
     bool drained = false;
+    bool finished = false;
+    /// The summary of the condemned rows read so far, in the seal's terms.
+    CondemnedSummary counted;
     std::optional<std::pair<BlobRef, UInt128>> previous_key;
     /// Rows are sorted, so two sentinel rows of one blob are adjacent among the sentinels.
     std::optional<BlobRef> last_sentinel_blob;

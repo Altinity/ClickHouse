@@ -127,6 +127,8 @@ public:
     /// Test-only: stages the part file `path` as a blob entry naming `ref` with no pending upload and no copy
     /// source, a shape no operation produces.
     void stageUnprovenBlobEntryForTest(const std::string & path, const Cas::BlobRef & ref, uint64_t size);
+    /// Test-only: the copy source shared by this transaction's borrows from the committed part `part_path`, or null.
+    std::shared_ptr<const Cas::CopySource> borrowedSourceForTest(const std::string & part_path) const;
 
     /// Abandons open builds and cleans owned staging without publishing an uncommitted ref.
     ~ContentAddressedTransaction() override;

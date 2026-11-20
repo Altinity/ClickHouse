@@ -733,10 +733,59 @@ inline String encodeMinimalGcState(uint64_t round)
     return DB::Cas::encodeGcState(state);
 }
 
-/// The parent context of a direct `foldDeltasIntoGeneration` call.
+/// The parent context of a direct `foldDeltasIntoGeneration` call whose parent seal states no condemned row.
 inline DB::Cas::AdoptedRunContext foldParent(uint64_t parent_round, uint64_t gc_shards = 1)
 {
-    return DB::Cas::AdoptedRunContext{.gc_shards = gc_shards, .parent_round = parent_round};
+    return DB::Cas::AdoptedRunContext{.gc_shards = gc_shards, .parent_round = parent_round, .summary = DB::Cas::CondemnedSummary{}};
+}
+
+/// The condemned summary a fold seal naming `runs` states, counted from their rows.
+inline DB::Cas::CondemnedSummary condemnedSummaryOfRuns(DB::Cas::CasOperation & op, const std::vector<DB::Cas::RunRef> & runs)
+{
+    DB::Cas::CondemnedSummary summary;
+    for (const DB::Cas::RunRef & run : runs)
+    {
+        auto view = DB::Cas::openSourceEdgeRun(op, run.key);
+        DB::Cas::SourceEdgeRecord rec;
+        while (view.next(rec))
+        {
+            if (rec.marker != DB::Cas::RunMarker::Condemned)
+                continue;
+            ++summary.condemned_total;
+            if (rec.delete_pending)
+                ++summary.pending_total;
+            else
+                summary.oldest_nonpending_condemn_round = std::min(summary.oldest_nonpending_condemn_round, rec.condemn_round);
+        }
+    }
+    return summary;
+}
+
+/// The parent context of a direct `foldDeltasIntoGeneration` call over `prior_runs`, whose seal states their summary.
+inline DB::Cas::AdoptedRunContext foldParentOf(
+    DB::Cas::CasOperation & op, const std::vector<DB::Cas::RunRef> & prior_runs, uint64_t parent_round, uint64_t gc_shards = 1)
+{
+    return DB::Cas::AdoptedRunContext{
+        .gc_shards = gc_shards, .parent_round = parent_round, .summary = condemnedSummaryOfRuns(op, prior_runs)};
+}
+
+/// Rewrites the condemned summary of GC shard `shard` in the fold seal `gc/state` adopts; the runs stay as they are.
+inline void restateAdoptedSummary(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, uint64_t shard, const DB::Cas::CondemnedSummary & summary)
+{
+    OperationForTest operation(backend);
+    const auto state_object = (*operation).read(layout.gcStateKey(), DB::Cas::Retry::standard());
+    if (!state_object)
+        throw std::runtime_error("restateAdoptedSummary: gc/state is absent");
+    const DB::Cas::GcState state = DB::Cas::decodeGcState(state_object->bytes);
+    const String key = layout.foldSealKey(state.snap_generation, state.snap_attempt);
+    const auto sealed = (*operation).read(key, DB::Cas::Retry::standard());
+    if (!sealed)
+        throw std::runtime_error("restateAdoptedSummary: the adopted fold seal is absent");
+    DB::Cas::CasFoldSeal seal = DB::Cas::decodeFoldSeal(sealed->bytes);
+    seal.condemned_summary[shard] = summary;
+    DB::Cas::orThrow((*operation).replace(key, DB::Cas::encodeFoldSeal(seal), sealed->etag, DB::Cas::Retry::standard()),
+                     "restate the adopted fold seal");
 }
 
 /// Inject condemned bookkeeping + gc/state directly (bypassing a real GC round) so a test can seed the

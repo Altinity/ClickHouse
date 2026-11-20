@@ -593,16 +593,23 @@ TEST(CASGCRoundDefer, DueGraduationIsSoleFoldTriggerAtHighThreshold)
 
     writeBlobBody(*backend, layout, blob);
 
-    /// Seed the adopted fold seal's condemned_summary with B already `delete_pending` (pending_total = 1).
-    /// `rowDecisionDue`
-    /// reads this summary ZERO-I/O from the adopted seal — a `delete_pending` entry forces
-    /// it true regardless of the round. At `gc_fold_threshold = 1000` a real condemn -> graduate pipeline of
-    /// `runRegularRound` calls is not usable to set this up: every round before graduation would ITSELF
-    /// defer (nothing due yet, and changed_shards never nears 1000), so the due-pending summary is injected
-    /// directly instead of driven through real rounds.
-    injectCondemnedSummarySeal(*backend, layout, /*generation*/1, /*attempt*/1, /*gc_shards*/1,
-        {{0, CondemnedSummary{.condemned_total = 1, .pending_total = 1,
-                              .oldest_nonpending_condemn_round = std::numeric_limits<uint64_t>::max()}}});
+    /// Seed the adopted fold seal with B already `delete_pending`: a run holding its row, and a summary that counts it
+    /// (pending_total = 1). `rowDecisionDue` reads this summary ZERO-I/O from the adopted seal — a `delete_pending`
+    /// entry forces it true regardless of the round. At `gc_fold_threshold = 1000` a real condemn -> graduate pipeline
+    /// of `runRegularRound` calls is not usable to set this up: every round before graduation would ITSELF defer
+    /// (nothing due yet, and changed_shards never nears 1000), so the due-pending row is injected directly instead of
+    /// driven through real rounds.
+    {
+        const BlobRef blob_ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(blob)};
+        OperationForTest op(*backend);
+        const std::optional<Meta> body = (*op).head(layout.blobKey(blob_ref), Retry::standard());
+        ASSERT_TRUE(body.has_value());
+        const GcState state = decodeGcState((*op).read(layout.gcStateKey(), Retry::standard())->bytes);
+        injectSourceEdgeRun(*backend, layout, /*shard*/ 0,
+            {SourceEdgeRecord{.ref = blob_ref, .source_id = DB::UInt128{0}, .marker = RunMarker::Condemned,
+                              .delete_pending = true, .token = PersistedEtag::capture(body->etag), .size = 1,
+                              .condemn_round = state.round}});
+    }
 
     /// The +1: a fresh manifest re-references B while it sits `delete_pending` -- one changed shard,
     /// far below the threshold of 1000.

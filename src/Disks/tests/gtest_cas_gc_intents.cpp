@@ -4725,6 +4725,63 @@ TEST(CASGcIntents, SealWithoutTheSummaryOfAPendingShardFailsTheRoundBeforeAnyDel
     EXPECT_TRUE(pool.bodyMeta(blob).has_value());
 }
 
+namespace
+{
+
+/// Restates the adopted seal's summary of shard 0 with the one `pending` row of blob 1 as a candidate, and runs a round
+/// whose `HEAD` of `gc/state` answers `answer`. The summary states no `pending` row, so the round skips its validation
+/// read and merges the shard. Returns the round's error code and message.
+std::pair<int, String> roundOverASealThatUnderstatesItsPendingRows(IntentPool<PausedLeaderBackend> & pool, StateHead answer)
+{
+    const std::optional<RetiredEntry> row = pool.row(1);
+    if (!row || !row->delete_pending)
+        throw std::runtime_error("the row of blob 1 is not pending");
+    restateAdoptedSummary(*pool.backend, pool.layout(), 0,
+        CondemnedSummary{.condemned_total = 1, .pending_total = 0, .oldest_nonpending_condemn_round = row->condemn_round});
+    pool.backend->state_head = answer;
+    pool.backend->clearJournal();
+    try
+    {
+        pool.round();
+    }
+    catch (const DB::Exception & e)
+    {
+        return {e.code(), e.message()};
+    }
+    return {0, ""};
+}
+
+}
+
+/// The adopted seal understates the `pending` rows of a shard the round merges: the round fails as corrupt bookkeeping
+/// once it has read that shard's run, and deletes nothing.
+TEST(CASGcIntents, SealThatUnderstatesThePendingRowsOfAMergedShardFailsTheRoundBeforeAnyDelete)
+{
+    IntentPool<PausedLeaderBackend> pool(std::make_shared<PausedLeaderBackend>());
+    ASSERT_NO_FATAL_FAILURE(pool.makePending({1}));
+    const auto [code, message] = roundOverASealThatUnderstatesItsPendingRows(pool, StateHead::Store);
+    EXPECT_EQ(code, DB::ErrorCodes::CORRUPTED_DATA) << message;
+    EXPECT_NE(message.find("hold 1 condemned, 1 pending"), String::npos) << message;
+    EXPECT_NE(message.find("states 1 condemned, 0 pending"), String::npos) << message;
+    EXPECT_NE(message.find("GC stops reclaiming on this pool"), String::npos) << message;
+    EXPECT_EQ(countOf(blobRequests(pool.backend->journal()), JournalVerb::Remove, pool.bodyKey(1)), 0u);
+    EXPECT_TRUE(pool.bodyMeta(1).has_value());
+    EXPECT_TRUE(pool.row(1) && pool.row(1)->delete_pending && !pool.row(1)->standing);
+}
+
+/// The same seal under a leader whose `gc/state` moved: without the validation read nothing else would stop its
+/// delete. The round ends as a lost leadership and deletes nothing.
+TEST(CASGcIntents, PausedLeaderOverASealThatUnderstatesItsPendingRowsDeletesNothing)
+{
+    IntentPool<PausedLeaderBackend> pool(std::make_shared<PausedLeaderBackend>());
+    ASSERT_NO_FATAL_FAILURE(pool.makePending({1}));
+    const auto [code, message] = roundOverASealThatUnderstatesItsPendingRows(pool, StateHead::Absent);
+    EXPECT_EQ(code, DB::ErrorCodes::ABORTED) << message;
+    EXPECT_NE(message.find("gc/state moved during the round"), String::npos) << message;
+    EXPECT_EQ(countOf(blobRequests(pool.backend->journal()), JournalVerb::Remove, pool.bodyKey(1)), 0u);
+    EXPECT_TRUE(pool.bodyMeta(1).has_value());
+}
+
 /// A refusal of the validation read fails the round, as a refusal of any other read of the fold does.
 TEST(CASGcIntents, RefusedValidationReadFailsTheRound)
 {

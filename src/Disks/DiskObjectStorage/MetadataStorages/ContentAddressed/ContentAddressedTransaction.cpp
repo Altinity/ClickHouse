@@ -336,12 +336,19 @@ void ContentAddressedTransaction::retargetBorrow(const Cas::PartRefKey & from, c
     borrowed_sources.erase(it);
     if (!(borrow->manifest_ref == renamed.source))
         return;
-    auto moved = metadata_storage.partAccess()->resolveCopySource(to);
-    if (!moved || !(moved->manifest_ref == renamed.destination))
-        return;
+    /// A move inside one table keeps the manifest and the table runtime, so the borrow reads nothing after the
+    /// durable rename.
+    const bool moved_in_place = from.ns.string() == to.ns.string() && renamed.destination == renamed.source;
+    if (!moved_in_place)
+    {
+        auto moved = metadata_storage.partAccess()->resolveCopySource(to);
+        if (!moved || !(moved->manifest_ref == renamed.destination))
+            return;
+        borrow->manifest = std::move(moved->manifest);
+        borrow->table = std::move(moved->table);
+    }
     borrow->part = to;
     borrow->manifest_ref = renamed.destination;
-    borrow->table = std::move(moved->table);
     borrowed_sources.try_emplace(to.cacheKey(), borrow);
 }
 
@@ -487,12 +494,15 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
         return;
     }
 
-    /// The build would promote over the committed manifest with an empty delta, which the unique-ref guard refuses on
-    /// every retry.
+    /// Every write staged into this committed part was moved out or removed again, so its committed manifest is already
+    /// the result. The build never precommitted, so abandoning it sends nothing.
     if (st.build && st.entries.empty() && st.content_removed.empty() && st.base_manifest_ref)
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "ContentAddressedTransaction: committed part {}/{} has an open build and nothing to publish: every write staged "
-            "into it was moved or removed", ns.string(), ref);
+    {
+        st.build->abandon();
+        st.build.reset();
+        st.published = true;
+        return;
+    }
 
     PendingRefs pending_refs;
     for (const auto & pb : st.pending_blobs)
@@ -904,6 +914,15 @@ void ContentAddressedTransaction::stageUnprovenBlobEntryForTest(const std::strin
     entry.ref = ref;
     entry.blob_size = size;
     putEntry(st, std::move(entry), nullptr);
+}
+
+std::shared_ptr<const Cas::CopySource> ContentAddressedTransaction::borrowedSourceForTest(const std::string & part_path) const
+{
+    const auto route = routeOf(part_path);
+    if (!route || route->ref.empty() || !route->file.empty())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "ContentAddressed: {} is not a part directory", part_path);
+    const auto it = borrowed_sources.find(route->refKey().cacheKey());
+    return it == borrowed_sources.end() ? nullptr : it->second;
 }
 
 std::string ContentAddressedTransaction::buildS3StagingBlobHeader(

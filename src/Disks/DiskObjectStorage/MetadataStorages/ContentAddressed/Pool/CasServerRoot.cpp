@@ -1697,7 +1697,7 @@ bool MountSlotOwnership::holds(const Object & slot) const
         return false;
     /// The pair alone is not enough: another writer of the same pair leaves a different ETag.
     std::lock_guard lock(mutex);
-    return (last_etag && slot.etag == *last_etag)
+    return (last_etag && sameVersion(slot.etag, *last_etag))
         || (in_flight_attempt_id && lease.write_attempt_id == *in_flight_attempt_id);
 }
 
@@ -2061,7 +2061,7 @@ MountRenewResult MountLeaseRenewer::renewOn(
                 /// safe because a call with an unclear attempt returns `Conflict` only once the token
                 /// moved, so this call left no copy of ours that could land.
                 const Object * seen = std::get_if<Object>(&conflict->seen);
-                if (!seen || seen->etag != expected || seen->bytes != last_body)
+                if (!seen || !sameVersion(seen->etag, expected) || seen->bytes != last_body)
                     break;
                 pause_ms = Retry::pauseAfterAttempt(*policy.attempt_spacing_ms, last_attempt_start_boot_ms, boot_clock());
             }

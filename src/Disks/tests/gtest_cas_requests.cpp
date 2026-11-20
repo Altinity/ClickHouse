@@ -3425,7 +3425,7 @@ TEST(CASRequests, ReservationIsTheEnvelopeThroughInstrumentedBackend)
     };
     FakeClock clock;
     auto inner = std::make_shared<EnvelopeBackend>();
-    auto wrapped = std::make_shared<InstrumentedBackend>(inner);
+    auto wrapped = std::make_shared<InstrumentedBackend>(inner, "p");
     ASSERT_EQ(wrapped->attemptTimeoutMs(), 5000u);
     ASSERT_EQ(wrapped->attemptEnvelopeMs(), 7000u) << "InstrumentedBackend must forward the envelope, not fall back to the bare attempt timeout";
     auto requests = makeRequests(wrapped, clock);

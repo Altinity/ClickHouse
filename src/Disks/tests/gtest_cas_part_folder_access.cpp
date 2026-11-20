@@ -828,7 +828,7 @@ TEST(CASPartFolderAccess, CopySourceOfAnEvictedTableIsLoadedWhenResolved)
     auto source = access.resolveCopySource({from, "src"});
     ASSERT_TRUE(source.has_value());
     EXPECT_TRUE(source->manifest_ref == id.ref);
-    EXPECT_GE(requests(), load_requests) << "an evicted source is loaded when it is resolved";
+    EXPECT_EQ(requests(), load_requests + 1) << "an evicted source is loaded, and its manifest read, when it is resolved";
     ASSERT_TRUE(store->refTableCachedForTest(from));
 
     backend->resetCounts();
@@ -1075,6 +1075,72 @@ TEST(CASPartFolderAccess, CopyConfirmRefusesWhenItsDeadlinePassesDuringTheStateL
     confirmer.join();
     EXPECT_EQ(confirmed_future.get(), Cas::ConfirmAnswer::Unknown);
     EXPECT_EQ(waits.load(), 1u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRelinkConfirmRefusedStateLockBusy] - busy_before, 1u);
+}
+
+/// The request deadline has passed when the copy confirm first finds the source table's state lock held: it refuses
+/// without waiting for the lock.
+TEST(CASPartFolderAccess, CopyConfirmRefusesWithoutWaitingWhenItsDeadlinePassedBeforeTheStateLockWait)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto boot_ms = std::make_shared<std::atomic<uint64_t>>(1'000'000);
+    Cas::PoolConfig config{.pool_prefix = "p", .server_root_id = "test"};
+    config.boot_ms_fn = [boot_ms] { return boot_ms->load(); };
+    /// Long enough that passing the request deadline leaves the mount fence open.
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(600'000);
+    auto store = Cas::Pool::open(backend, std::move(config));
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store);
+    publishPart(store, ns, "src", {inlineEntry("f", "live")});
+    const auto source = access.resolveCopySource({ns, "src"});
+    ASSERT_TRUE(source.has_value());
+    const uint64_t window_ms = store->poolConfig().cas_request_budget.request_window_ms;
+
+    std::atomic<size_t> waits{0};
+    store->setConfirmBeforeStateLockWaitHookForTest([&] { ++waits; });
+    SCOPE_EXIT({ store->setConfirmBeforeStateLockWaitHookForTest(nullptr); });
+    /// Runs after the confirm froze its deadline and before it tries the state lock.
+    store->setConfirmAfterOwnershipCaptureHookForTest([&] { boot_ms->fetch_add(window_ms); });
+    SCOPE_EXIT({ store->setConfirmAfterOwnershipCaptureHookForTest(nullptr); });
+
+    std::promise<Cas::ConfirmAnswer> confirmed;
+    auto confirmed_future = confirmed.get_future();
+    std::thread confirmer;
+    SCOPE_EXIT({
+        if (confirmer.joinable())
+            confirmer.join();
+    });
+    bool answered_under_the_lock = false;
+    uint64_t busy_before = 0;
+    auto fired = std::make_shared<std::atomic<bool>>(false);
+    store->setInstallRegionProbeForTest([&, fired]
+    {
+        if (fired->exchange(true))
+            return;
+        ALLOW_ALLOCATIONS_IN_SCOPE;
+        busy_before = ProfileEvents::global_counters[ProfileEvents::CASRelinkConfirmRefusedStateLockBusy];
+        confirmer = std::thread([&]
+        {
+            try
+            {
+                confirmed.set_value(access.confirmCopySource(*source));
+            }
+            catch (...)
+            {
+                confirmed.set_exception(std::current_exception());
+            }
+        });
+        /// Bounded so that a confirm that waits for this held lock fails the assertions below instead of hanging.
+        answered_under_the_lock = confirmed_future.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+    });
+    SCOPE_EXIT({ store->setInstallRegionProbeForTest(nullptr); });
+
+    publishPart(store, ns, "y", {inlineEntry("f", "y")});
+    ASSERT_TRUE(fired->load()) << "the install region never ran";
+    confirmer.join();
+    EXPECT_TRUE(answered_under_the_lock) << "the confirm waited for the state lock after its deadline";
+    EXPECT_EQ(confirmed_future.get(), Cas::ConfirmAnswer::Unknown);
+    EXPECT_EQ(waits.load(), 0u);
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRelinkConfirmRefusedStateLockBusy] - busy_before, 1u);
 }
 

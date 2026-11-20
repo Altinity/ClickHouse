@@ -2520,6 +2520,84 @@ TEST(CASFsck, DeadlinePassingDuringAnAbsentIntentReadStopsBeforeTheBodyHead)
     EXPECT_EQ(bodyHeads(f, {1}), 1u) << "only the retired-body HEAD precedes the deadline; the pending check sent another";
 }
 
+/// With intent verification, a deadline that passes during an intent's read stops the scan before that intent's body
+/// `HEAD`.
+TEST(CASFsck, DeadlinePassingDuringAVerifiedIntentReadStopsBeforeTheBodyHead)
+{
+    FsckIntentFixture f;
+    f.body(1);
+    const String intent = f.currentIntent(1);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    f.backend->beforeRead(intent, 0, [deadline] { spinPast(deadline); });
+    f.backend->clearJournal();
+
+    expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, "during 'reading blob intents'", [&]
+    {
+        (void)runFsck(*f.store, /*detail=*/false, {}, deadline, /*partial_on_deadline=*/false, {},
+                      /*fix_legacy_markers=*/false, /*verify_intents=*/true);
+    });
+    const auto journal = f.backend->journal();
+    EXPECT_EQ(countKeyRequests(journal, JournalVerb::Read, intent), 1u) << "positive control: the intent was read";
+    EXPECT_EQ(countKeyRequests(journal, JournalVerb::Head, f.bodyKey(1)), 0u) << "the body HEAD was sent after the deadline";
+}
+
+namespace
+{
+
+String adoptedSealKeyOf(FsckGcFixture & f)
+{
+    OperationForTest op(*f.backend);
+    const GcState state = decodeGcState((*op).read(f.store->layout().gcStateKey(), Retry::standard())->bytes);
+    return f.store->layout().foldSealKey(state.snap_generation, state.snap_attempt);
+}
+
+}
+
+/// `gc/state` names a fold seal that is gone, and `gc/state` has not moved: the GC snapshot is unread. That is a hard
+/// finding, not a pool with no `pending` rows.
+TEST(CASFsck, AdoptedSealMissingUnderAnUnchangedStateIsAnUnreadSnapshot)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    f.removeIntent(1);
+    ASSERT_TRUE(objectPresent(*f.backend, f.bodyKey(1))) << "fixture: a pending row without its intent over its body";
+    const String seal_key = adoptedSealKeyOf(f);
+    removeFsckFixtureKey(*f.backend, seal_key);
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/false);
+
+    EXPECT_EQ(rep.intent_unread, 1u) << formatFsckSummary(rep);
+    EXPECT_NE(rep.intent_unread_reason.find(seal_key), String::npos) << rep.intent_unread_reason;
+    EXPECT_FALSE(rep.clean()) << formatFsckSummary(rep);
+}
+
+/// A round prunes the fold seal of the `gc/state` the scan read before the scan reads the seal: the scan reads the
+/// snapshot of the `gc/state` that moved.
+TEST(CASFsck, AdoptedSealPrunedUnderAMovedStateIsReadFromTheNewState)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    const String old_seal = adoptedSealKeyOf(f);
+    String new_seal;
+    f.backend->beforeRead(old_seal, 0, [&]
+    {
+        f.round();
+        new_seal = adoptedSealKeyOf(f);
+        removeFsckFixtureKey(*f.backend, old_seal);
+    });
+    f.backend->clearJournal();
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/false);
+
+    ASSERT_FALSE(new_seal.empty()) << "the scan never read the seal";
+    ASSERT_NE(new_seal, old_seal) << "positive control: the round moved gc/state";
+    EXPECT_EQ(rep.intent_unread, 0u) << rep.intent_unread_reason;
+    EXPECT_GE(countKeyRequests(f.backend->journal(), JournalVerb::Read, new_seal), 1u) << "the scan did not read the new snapshot";
+    EXPECT_TRUE(rep.clean()) << formatFsckSummary(rep);
+}
+
 /// The capability probe's scratch object under `blob-intents/_probe/` is not an intent and no finding.
 TEST(CASFsck, ProbeScratchObjectIsNoIntent)
 {

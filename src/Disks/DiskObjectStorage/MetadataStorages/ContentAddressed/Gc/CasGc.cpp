@@ -99,17 +99,6 @@ namespace
 /// Soft limit on the namespace janitor's phase: no page starts after it, the page in progress finishes.
 constexpr uint64_t kJanitorBudgetMs = 20'000;
 
-/// Whether a `HEAD` of `gc/state` shows the version this round leased. The exact token is what the round's
-/// conditional commit sends; the canonical identity absorbs a quoting difference between the write's answer
-/// and the `HEAD`. A store whose token has no canonical form still matches by the exact token.
-bool sameStateVersion(const Etag & seen, const Etag & leased)
-{
-    if (seen == leased)
-        return true;
-    const std::optional<CanonicalIdentity> identity = seen.canonical();
-    return identity && identity == leased.canonical();
-}
-
 /// A `gc/state` below header 4 can only come from an older GC bootstrapping over a deleted state; this build
 /// must not run its rows under the intent rules.
 GcState decodeGenerationFourGcState(std::string_view bytes)
@@ -3674,7 +3663,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
     /// after the last intake read, shows that no newer leader removed a record this round read as absent.
     /// Rounds with no `pending` or `standing` parent row skip the read.
     /// That is safe: a delete that acts on a false zero needs such a row, and every other intent delete
-    /// follows a `HEAD` that showed another incarnation.
+    /// follows a `HEAD` that showed another incarnation. The summary decides it before the merge: the reader refuses
+    /// a merged shard whose rows disagree with its summary, and every body and intent delete runs after the merge.
     bool parent_has_pending_rows = false;
     for (uint64_t shard = 0; shard < state.gc_shards; ++shard)
         parent_has_pending_rows = parent_has_pending_rows || summaryOfParent(shard).pending_total != 0;
@@ -3686,7 +3676,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
             const std::optional<Meta> current = op.head(layout.gcStateKey(), Retry::standard());
             if (!current)
                 seen = "no object";
-            else if (!state_etag || !sameStateVersion(current->etag, *state_etag))
+            else if (!state_etag || !sameVersion(current->etag, *state_etag))
                 seen = "another version";
         }
         catch (const Exception & e)
@@ -3991,7 +3981,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         try
         {
             shard_run = foldDeltasIntoGeneration(
-                op, layout, priorRunsFor(shard), AdoptedRunContext{.gc_shards = state.gc_shards, .parent_round = state.round},
+                op, layout, priorRunsFor(shard),
+                AdoptedRunContext{.gc_shards = state.gc_shards, .parent_round = state.round, .summary = summaryOfParent(shard)},
                 new_generation, attempt, shard, std::move(buckets[shard]),
                 ShardFoldOptions{
                     .current_round = current_round,
@@ -4591,7 +4582,7 @@ void Gc::throwIfStateMoved(CasOperation & op, const std::optional<Etag> & state_
         tryLogCurrentException(logger, "CAS GC: could not read gc/state to tell a newer leader from corruption", LogsLevel::warning);
         return;
     }
-    if (current && sameStateVersion(current->etag, *state_etag))
+    if (current && sameVersion(current->etag, *state_etag))
         return;
     throw Exception(ErrorCodes::ABORTED,
         "CAS gc round: gc/state moved during the round ({}); {}; retry next round",
@@ -5059,7 +5050,8 @@ RebuildReport Gc::rebuildBaseline(bool force)
             return;
         /// No applied-delta ledger either: the rebuild derives edges from owner state, not from ref transactions.
         RunRef run = foldDeltasIntoGeneration(op, layout, prior_runs[shard],
-                                              AdoptedRunContext{.gc_shards = gc_shards, .parent_round = state.round},
+                                              AdoptedRunContext{.gc_shards = gc_shards, .parent_round = state.round,
+                                                                .summary = CondemnedSummary{}},
                                               generation, ++attempt_of[shard], shard, std::move(buckets[shard]));
         buckets[shard].clear();
         prior_runs[shard] = {std::move(run)};

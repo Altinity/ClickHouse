@@ -357,7 +357,7 @@ TEST(CASSentinelProbe, InstrumentedBackendForwardsToInnerClassification)
     auto storage = std::static_pointer_cast<ThrowingS3ObjectStorage>(makeThrowingS3StorageForTest());
     storage->throwOnObjectAccess(Aws::S3::S3Errors::NO_SUCH_BUCKET);
     auto inner = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
-    InstrumentedBackend instrumented(inner);
+    InstrumentedBackend instrumented(inner, "pool");
 
     auto requests = makeRequests(instrumented);
     auto op = requests.admit();

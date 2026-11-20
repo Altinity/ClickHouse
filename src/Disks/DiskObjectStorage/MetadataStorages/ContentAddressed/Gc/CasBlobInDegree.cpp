@@ -21,6 +21,7 @@ namespace ProfileEvents
     extern const Event CASGCIntentStandingAnomaly;
 }
 #include <city.h>
+#include <fmt/ranges.h>
 #include <algorithm>
 #include <cstring>
 #include <deque>
@@ -186,7 +187,18 @@ bool AdoptedRunReader::nextInRun(SourceEdgeRecord & rec)
 {
     if (!view || drained)
         return false;
-    if (!view->next(rec))
+    bool got = false;
+    try
+    {
+        got = view->next(rec);
+    }
+    catch (Exception & e)
+    {
+        if (e.code() == ErrorCodes::CORRUPTED_DATA)
+            e.addMessage(fmt::format("in CAS source-edge run `{}` of GC shard {}", currentRun().key, shard));
+        throw;
+    }
+    if (!got)
     {
         drained = true;
         return false;
@@ -200,11 +212,27 @@ bool AdoptedRunReader::openNextRun()
     if (view)
     {
         chassert(drained);
-        view->verifyAgainst(currentRun().checksum);
+        try
+        {
+            view->verifyAgainst(currentRun().checksum);
+        }
+        catch (Exception & e)
+        {
+            if (e.code() == ErrorCodes::CORRUPTED_DATA)
+                e.addMessage(fmt::format("in CAS source-edge run `{}` of GC shard {}", currentRun().key, shard));
+            throw;
+        }
         view.reset();
     }
     if (next_run >= runs.size())
+    {
+        if (!finished)
+        {
+            finished = true;
+            checkSummary();
+        }
         return false;
+    }
     drained = false;
     /// Typed open validates the NDJSON header before any row is consumed.
     view = openSourceEdgeRun(op, runs[next_run++].key);
@@ -258,6 +286,33 @@ void AdoptedRunReader::checkRow(const SourceEdgeRecord & rec)
     /// The parent round stamped every row it condemned; a later stamp would reach the rules on the cut that minted it.
     if (rec.marker == RunMarker::Condemned && rec.condemn_round > context.parent_round)
         refuseRow(rec, fmt::format("is stamped with round {}, after the parent round {}", rec.condemn_round, context.parent_round));
+    if (rec.marker == RunMarker::Condemned)
+    {
+        ++counted.condemned_total;
+        if (rec.delete_pending)
+            ++counted.pending_total;
+        else
+            counted.oldest_nonpending_condemn_round = std::min(counted.oldest_nonpending_condemn_round, rec.condemn_round);
+    }
+}
+
+void AdoptedRunReader::checkSummary() const
+{
+    /// A round decides from the summary whether to confirm `gc/state` before it deletes, and a carried shard keeps its
+    /// summary unread, so a summary that differs from its rows must not be acted on.
+    if (counted == context.summary)
+        return;
+    const auto round = [](uint64_t r) { return r == std::numeric_limits<uint64_t>::max() ? String("none") : std::to_string(r); };
+    std::vector<String> keys;
+    for (const RunRef & run : runs)
+        keys.push_back(run.key);
+    throw Exception(ErrorCodes::CORRUPTED_DATA,
+        "CAS GC shard {} ({}): its rows hold {} condemned, {} pending, oldest non-pending round {}, but the parent fold "
+        "seal's summary states {} condemned, {} pending, oldest non-pending round {}. {}",
+        shard, keys.empty() ? String("no source-edge run") : fmt::format("source-edge run `{}`", fmt::join(keys, "`, `")),
+        counted.condemned_total, counted.pending_total, round(counted.oldest_nonpending_condemn_round),
+        context.summary.condemned_total, context.summary.pending_total, round(context.summary.oldest_nonpending_condemn_round),
+        kCorruptBookkeeping);
 }
 
 UInt128 sourceEdgeId(const ManifestId & id, const String & path)
@@ -318,11 +373,11 @@ SourceEdgeRunView openSourceEdgeRun(std::string_view bytes)
     return SourceEdgeRunView(std::make_unique<ReadBufferFromMemory>(bytes.data(), bytes.size()));
 }
 
-SourceEdgeRunView openSourceEdgeRun(CasOperation & op, const String & key)
+SourceEdgeRunView openSourceEdgeRun(CasOperation & op, const String & key, const Retry & policy)
 {
     /// Streaming: a forward-only read of the write-once run — nothing is materialized whole
     /// (cas_run is object_cap = 0). Absent object => fail-closed.
-    auto stream = op.stream(key, Retry::standard());
+    auto stream = op.stream(key, policy);
     if (!stream)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS source-edge run: object {} is absent", key);
     return SourceEdgeRunView(std::move(stream));

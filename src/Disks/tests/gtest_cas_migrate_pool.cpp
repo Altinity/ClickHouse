@@ -101,6 +101,14 @@ public:
         refused_deletes.erase(key);
     }
 
+    /// The answer to every write of `key` quotes its token, as a store may quote an ETag in a write's answer and not in a
+    /// read's; a precondition spelled that way reaches the store unquoted.
+    void quoteWriteAnswersOf(const String & key)
+    {
+        std::lock_guard lock(mutex);
+        quoted_write_keys.insert(key);
+    }
+
     /// Runs `hook` once, after the first write to `key` lands.
     void afterWrite(const String & key, std::function<void()> hook)
     {
@@ -165,7 +173,17 @@ public:
                 if (key.starts_with(prefix))
                     throw DB::Exception(DB::ErrorCodes::READONLY, "injected 403 on the write to {}", key);
         }
-        auto result = CountingBackend::write(key, bytes, expected_value, access);
+        bool quoted = false;
+        {
+            std::lock_guard lock(mutex);
+            quoted = quoted_write_keys.contains(key);
+        }
+        std::optional<String> sent = expected_value;
+        if (quoted && sent && sent->size() >= 2 && sent->front() == '"' && sent->back() == '"')
+            sent = sent->substr(1, sent->size() - 2);
+        auto result = CountingBackend::write(key, bytes, sent, access);
+        if (quoted && result)
+            result = "\"" + *result + "\"";
         std::function<void()> fire;
         {
             std::lock_guard lock(mutex);
@@ -216,6 +234,7 @@ private:
     std::map<String, size_t> refused_writes;
     std::vector<String> refused_write_prefixes;
     std::set<String> refused_deletes;
+    std::set<String> quoted_write_keys;
     std::set<String> hidden_from_listing;
     String after_write_key;
     std::function<void()> after_write;
@@ -608,6 +627,52 @@ TEST(CASMigratePool, FencesASilentSlotAfterTheThreshold)
     for (const uint64_t ms : f.clock.sleeps)
         slept += ms;
     EXPECT_GE(slept, threshold + 120'000) << "fenced before the slot held for the threshold and the default grace";
+}
+
+/// The store quotes the token in its answer to the rewrite of `gc/state` and not in a read of it: the recheck around
+/// the floor still sees the version the rewrite made.
+TEST(CASMigratePool, GcStateWhoseWriteAnswerIsQuotedPassesTheRecheck)
+{
+    Fixture f(3);
+    f.body(1);
+    f.rows({f.row(1, /*pending*/ true)});
+    f.backend->quoteWriteAnswersOf(f.layout.gcStateKey());
+    const MigratePoolReport report = f.run();
+    EXPECT_TRUE(report.completed);
+    EXPECT_EQ(f.gcState()->header_generation, G_BLOB_INTENTS) << "positive control: the rewrite of gc/state landed";
+}
+
+/// The same for the fence of a silent slot: the recheck sees the version the fence wrote.
+TEST(CASMigratePool, FencedSlotWhoseWriteAnswerIsQuotedPassesTheRecheck)
+{
+    Fixture f(3);
+    f.slot("srv-a", liveLease());
+    f.backend->quoteWriteAnswersOf(f.layout.mountKey("srv-a"));
+    const MigratePoolReport report = f.run();
+    EXPECT_TRUE(report.completed);
+    const auto slot = f.slotBody("srv-a");
+    ASSERT_TRUE(slot);
+    EXPECT_TRUE(slot->gc_fenced) << "positive control: the slot was fenced";
+}
+
+/// More inherited `pending` rows over absent bodies than one batch holds: each gets the intent of its own token.
+TEST(CASMigratePool, PendingRowsOverAbsentBodiesBeyondOneBatchAllGetTheirIntents)
+{
+    constexpr uint64_t kRows = CasOperation::kCasListPageKeys + 2;
+    Fixture f(3);
+    std::vector<RetiredEntry> rows;
+    for (uint64_t b = 1; b <= kRows; ++b)
+    {
+        f.body(b);
+        rows.push_back(f.row(b, /*pending*/ true));
+        f.removeBody(b);
+    }
+    f.rows(rows);
+    const MigratePoolReport report = f.run();
+    ASSERT_TRUE(report.completed);
+    EXPECT_EQ(f.intents().size(), kRows);
+    for (uint64_t b = 1; b <= kRows; ++b)
+        EXPECT_TRUE(f.hasIntent(b, *rows[b - 1].token.canonical())) << "blob " << b;
 }
 
 TEST(CASMigratePool, RefusesAMovingGcLease)
@@ -1928,7 +1993,7 @@ TEST(CASMigratePool, RunWithADuplicateCondemnedRowIsRefusedBeforeAnyWrite)
     const String message = messageOf(DB::ErrorCodes::CORRUPTED_DATA, [&] { f.run({}, &lines); });
 
     EXPECT_NE(message.find("duplicate sentinel row for one blob"), String::npos) << message;
-    EXPECT_NE(message.find("M3: GC of this build refuses the source-edge run"), String::npos) << message;
+    EXPECT_NE(message.find("M3: GC of this build refuses a source-edge run"), String::npos) << message;
     EXPECT_TRUE(contains(lines, "M2:")) << "positive control: the run reached M3";
     EXPECT_EQ(mutationsOutsideTheProbes(f.backend->journal(), f), std::vector<String>{});
     EXPECT_EQ(objectsOf(f), before);
@@ -1944,17 +2009,46 @@ SourceEdgeRecord condemnedRecord(const RetiredEntry & row)
                             .condemn_round = row.condemn_round};
 }
 
-/// The run stops at M3, before any intent and before the floor, with the pool as it was.
+size_t occurrencesOf(const String & text, const String & needle)
+{
+    size_t count = 0;
+    for (size_t at = text.find(needle); at != String::npos; at = text.find(needle, at + needle.size()))
+        ++count;
+    return count;
+}
+
+/// The keys of the runs the fold seal `gc/state` adopts names.
+std::vector<String> adoptedRunKeysOf(Fixture & f)
+{
+    OperationForTest op(*f.backend);
+    const GcState state = decodeGcState((*op).read(f.layout.gcStateKey(), Retry::standard())->bytes);
+    const auto sealed = (*op).read(f.layout.foldSealKey(state.snap_generation, state.snap_attempt), Retry::standard());
+    std::vector<String> keys;
+    for (const RunRef & run : decodeFoldSeal(sealed->bytes).blob_target_runs)
+        keys.push_back(run.key);
+    return keys;
+}
+
+/// The run stops at M3, before any intent and before the floor, with the pool as it was. The message names the refused
+/// run once.
 void expectInheritedRunRefused(Fixture & f, std::string_view what)
 {
     const auto before = objectsOf(f);
+    const std::vector<String> run_keys = adoptedRunKeysOf(f);
     f.backend->clearJournal();
 
     std::vector<String> lines;
     const String message = messageOf(DB::ErrorCodes::CORRUPTED_DATA, [&] { f.run({}, &lines); });
 
     EXPECT_NE(message.find(what), String::npos) << message;
-    EXPECT_NE(message.find("M3: GC of this build refuses the source-edge run"), String::npos) << message;
+    EXPECT_NE(message.find("M3: GC of this build refuses a source-edge run"), String::npos) << message;
+    size_t named = 0;
+    for (const String & key : run_keys)
+    {
+        EXPECT_LE(occurrencesOf(message, key), 1u) << key << " in " << message;
+        named += occurrencesOf(message, key);
+    }
+    EXPECT_EQ(named, 1u) << message;
     EXPECT_TRUE(contains(lines, "M2:")) << "positive control: the run reached M3";
     EXPECT_EQ(mutationsOutsideTheProbes(f.backend->journal(), f), std::vector<String>{});
     EXPECT_EQ(objectsOf(f), before);
@@ -1997,6 +2091,18 @@ TEST(CASMigratePool, RowStampedWithTheParentRoundIsMigrated)
     ASSERT_TRUE(report.completed);
     EXPECT_EQ(report.condemned_rows, 1u);
     EXPECT_TRUE(f.hasIntent(1, f.identity(1)));
+}
+
+/// The fold seal states no `pending` row for the shard whose run holds one.
+TEST(CASMigratePool, SealThatUnderstatesThePendingRowsOfItsRunIsRefusedBeforeAnyWrite)
+{
+    Fixture f(3);
+    f.body(1);
+    const RetiredEntry row = f.row(1, /*pending*/ true);
+    f.rows({row});
+    injectCondemnedSummarySeal(*f.backend, f.layout, /*generation*/ 1, /*attempt*/ 1, /*gc_shards*/ 1,
+        {{0, CondemnedSummary{.condemned_total = 1, .pending_total = 0, .oldest_nonpending_condemn_round = row.condemn_round}}});
+    expectInheritedRunRefused(f, "states 1 condemned, 0 pending");
 }
 
 TEST(CASMigratePool, RunInDescendingOrderIsRefusedBeforeAnyWrite)

@@ -113,6 +113,7 @@ The refusals below fail a round with `CORRUPTED_DATA`, and each message ends wit
 | `CAS GC fold: <n> ref transaction(s) folded and merged into the round buffers but NONE of their blob deltas reached a shard reducer` | A folded transaction reached no reducer |
 | `CAS GC fold: the round sealed coverage over <n> ref log(s) but only <m> fully folded` | The coverage a round would seal exceeds what it folded |
 | ``CAS source-edge run `<key>` of GC shard <n>: the row of blob <b> source <s>`` | A run the adopted fold seal inherits breaks a row rule (a blob of another shard, rows out of order, a sentinel row or an active edge at the wrong key, a condemned row stamped after the parent round); the key, shard and row name what to inspect with `cas-inspect` |
+| ``CAS GC shard <n> (source-edge run `<key>`): its rows hold`` | The condemned rows of a run the adopted fold seal inherits differ from the seal's summary of that shard; the message gives both counts |
 
 No repair for these refusals is available in this build. `gc/state` is present and its lease was held, and
 `cas-gc-rebuild` refuses that with `another GC leader holds the lease`.
@@ -249,7 +250,9 @@ body without reading the intent again. For each `pending` row whose body is pres
 by a ref or not, the scan sends one `GET` of the intent. When the intent is absent it sends a `HEAD` of the body and,
 if the body is still there, reads `gc/state` once more before it reports. Only a complete second read clears the
 row: when the seal it names is missing or a run fails its checksum, the scan reports `intent_unread` with the reason
-`inconclusive`. A referenced body is not counted in the backlog classes. A default scan does not see an intent whose bytes are not the
+`inconclusive`. The first read of the `GC` snapshot reads `gc/state` again when the fold seal it names is absent: a
+`gc/state` that moved is read anew, and one that did not is counted in `intent_unread`, because its `pending` rows were
+not checked. A referenced body is not counted in the backlog classes. A default scan does not see an intent whose bytes are not the
 intent record, nor an intent over a replaced or absent body: those need `cas-fsck --verify-intents`, which sends a
 `GET` and a `HEAD` for every intent (two requests per intent; raise `--timeout` for a large pool). `GC` does not
 accept an intent with other bytes as a confirmation.
@@ -262,7 +265,7 @@ accept an intent with other bytes as a confirmation.
 | `intent_replaced` | `--verify-intents` only. The body now at the key is another incarnation | No | None. `GC` removes the intent in a later round |
 | `intent_body_gone` | `--verify-intents` only. No body at the key | No | None. This is the normal state of a deleted blob until `GC` removes the intent |
 | `intent_malformed` | The key is not an intent key; with `--verify-intents` also: the bytes are not the intent record | **Yes**: the report is unclean and `cas-fsck` exits 1 | No build writes such an object. Keep the key from the `--detail` output and file a bug; do not delete it by hand while `GC` runs |
-| `intent_unread` | A read of an intent (a `pending` row's, or any with `--verify-intents`) or a `HEAD` of its body failed, or the body's token has no canonical identity | **Yes**: the report is unclean and `cas-fsck` exits 1, naming the first failure | The scan could not check what it was asked to. A refused `blob-intents/` prefix (a 403) lands here. Fix the store or the credential's rights and run again |
+| `intent_unread` | A read of an intent (a `pending` row's, or any with `--verify-intents`) or a `HEAD` of its body failed, the body's token has no canonical identity, or the fold seal `gc/state` names is absent, so the `pending` rows were not checked | **Yes**: the report is unclean and `cas-fsck` exits 1, naming the first failure | The scan could not check what it was asked to. A refused `blob-intents/` prefix (a 403) lands here. Fix the store or the credential's rights and run again |
 | `pending_without_intent` | A `pending` row, its intent absent, its body present with the row's token | **Yes**: the report is unclean and `cas-fsck` exits 1 | `GC` would delete this body without warning any writer. Stop `GC` on this pool and report it with the `--detail` output. The scan repairs nothing |
 | `pending_intent_absent` | A `pending` row, its intent absent, and its body gone or replaced (or the row moved on while the scan ran) | No | None. The row is about to become `standing` or to move; nothing is at risk |
 | `pending_token_rejected` | A `pending` row whose token has no canonical identity, so no intent key exists for it | No | None. `GC` never deletes such a body |
