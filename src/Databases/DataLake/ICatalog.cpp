@@ -537,6 +537,17 @@ bool ICatalog::updateMetadataAndProperties(
     return updateMetadata(namespace_name, table_name, new_metadata_path, new_snapshot, auth_token);
 }
 
+bool ICatalog::updateMetadataIfCurrent(
+    const String & namespace_name,
+    const String & table_name,
+    const String & new_metadata_path,
+    Poco::JSON::Object::Ptr new_snapshot,
+    const String & /*expected_metadata_location*/,
+    const DB::ForwardedAuthTokenPtr & auth_token) const
+{
+    return updateMetadata(namespace_name, table_name, new_metadata_path, new_snapshot, auth_token);
+}
+
 bool ICatalog::updateSchema(
     const String & /*namespace_name*/,
     const String & /*table_name*/,

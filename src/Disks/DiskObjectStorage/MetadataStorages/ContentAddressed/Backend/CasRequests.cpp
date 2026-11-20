@@ -124,7 +124,12 @@ namespace
 /// rather than shared because `Backend/` does not depend on the mount plane.
 uint64_t bootClockMs()
 {
-    return clock_gettime_ns(CLOCK_BOOTTIME) / 1000000;
+#if defined(OS_DARWIN)
+    constexpr clockid_t clock_id = CLOCK_MONOTONIC;
+#else
+    constexpr clockid_t clock_id = CLOCK_BOOTTIME;
+#endif
+    return clock_gettime_ns(clock_id) / 1000000;
 }
 
 uint64_t saturatingAdd(uint64_t lhs, uint64_t rhs)
