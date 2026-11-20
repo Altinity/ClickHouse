@@ -1,0 +1,9 @@
+CREATE TABLE t\n(\n    `d` DateTime\n)\nENGINE = MergeTree\nORDER BY d\nTTL d + toIntervalDay(1) EXPORT TO TABLE dst, d + toIntervalDay(2)
+ALTER TABLE t\n    (MODIFY TTL d + toIntervalDay(1) EXPORT TO TABLE db.dst)
+ALTER TABLE t\n    (MODIFY TTL d EXPORT TO TABLE `my db`.`my.table`)
+TTL t + toIntervalYear(10) EXPORT TO TABLE export_ttl_destination, t + toIntervalYear(20) SETTINGS
+TTL t + toIntervalYear(5) EXPORT TO TABLE export_ttl_destination SETTINGS
+0
+
+TTL t + toIntervalYear(10) EXPORT TO TABLE export_ttl_by_year SETTINGS
+TTL t + toIntervalYear(10) EXPORT TO TABLE export_ttl_by_year SETTINGS

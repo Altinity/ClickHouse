@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Interpreters/StorageID.h>
+#include <Storages/MergeTree/ExportBlockNumberRanges.h>
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
 #include <Storages/StorageSnapshot.h>
 #include <QueryPipeline/QueryPipeline.h>
@@ -77,6 +78,9 @@ struct MergeTreePartExportManifest
     StorageMetadataPtr metadata_snapshot;
 
     String iceberg_metadata_json;
+
+    /// The blocks whose rows are exported. Empty for every row of the part.
+    ExportBlockNumberRanges block_ranges;
 
     std::function<void(CompletionCallbackResult)> completion_callback;
 

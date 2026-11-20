@@ -2,6 +2,7 @@ import time
 import uuid
 
 from helpers.export_partition_helpers import (
+    commit_marker_lines,
     setup_source_tables,
     skip_if_remote_database_disk_enabled,
     wait_for_exception_count,
@@ -81,7 +82,7 @@ def test_kill_export(cluster, source_engine):
         
         # Kill only 2020 while S3 is blocked - retry mechanism keeps exports alive
         # ZooKeeper operations (KILL) proceed quickly since only S3 is blocked
-        node.query(f"KILL EXPORT PARTITION WHERE partition_id = '2020' and source_table = '{mt_table}' and destination_table = '{s3_table}'")
+        node.query(f"KILL EXPORT WHERE partition_id = '2020' and source_table = '{mt_table}' and destination_table = '{s3_table}'")
 
         # sleep for a while to let the kill to be processed
         time.sleep(2)
@@ -90,19 +91,19 @@ def test_kill_export(cluster, source_engine):
     wait_for_export_status(node, mt_table, s3_table, "2021", "COMPLETED")
 
     # checking for the commit file because maybe the data file was too fast?
-    assert node.query(f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_2020_*', format=LineAsString)") == '0\n', "Partition 2020 was written to S3, it was not killed as expected"
-    assert node.query(f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_2021_*', format=LineAsString)") != f'0\n', "Partition 2021 was not written to S3, but it should have been"
+    assert commit_marker_lines(node, mt_table, s3_table, "2020") == 0, "Partition 2020 was written to S3, it was not killed as expected"
+    assert commit_marker_lines(node, mt_table, s3_table, "2021") != 0, "Partition 2021 was not written to S3, but it should have been"
 
-    # check system.partition_exports for the export, status should be KILLED
-    assert node.query(f"SELECT status FROM system.partition_exports WHERE partition_id = '2020' and source_table = '{mt_table}' and destination_table = '{s3_table}'") == 'KILLED\n', "Partition 2020 was not killed as expected"
-    assert node.query(f"SELECT status FROM system.partition_exports WHERE partition_id = '2021' and source_table = '{mt_table}' and destination_table = '{s3_table}'") == 'COMPLETED\n', "Partition 2021 was not completed, this is unexpected"
+    # check system.distributed_exports for the export, status should be KILLED
+    assert node.query(f"SELECT status FROM system.distributed_exports WHERE partition_id = '2020' and source_table = '{mt_table}' and destination_table = '{s3_table}'") == 'KILLED\n', "Partition 2020 was not killed as expected"
+    assert node.query(f"SELECT status FROM system.distributed_exports WHERE partition_id = '2021' and source_table = '{mt_table}' and destination_table = '{s3_table}'") == 'COMPLETED\n', "Partition 2021 was not completed, this is unexpected"
 
     # check the data did not land on s3
     assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020") == '0\n', "Partition 2020 was written to S3, it was not killed as expected"
 
 
 def test_kill_export_resilient_to_status_handling_failure(cluster):
-    """KILL EXPORT PARTITION must eventually take effect even when the first
+    """KILL EXPORT must eventually take effect even when the first
     attempt to handle the ZK status-change event throws (simulated via a ONCE
     failpoint).  The re-queue + reschedule mechanism retries after ~5 s and
     the second attempt succeeds because the ONCE failpoint has already fired."""
@@ -142,7 +143,7 @@ def test_kill_export_resilient_to_status_handling_failure(cluster):
         node.query("SYSTEM ENABLE FAILPOINT export_partition_status_change_throw")
 
         node.query(
-            f"KILL EXPORT PARTITION WHERE partition_id = '2020'"
+            f"KILL EXPORT WHERE partition_id = '2020'"
             f" AND source_table = '{mt_table}' AND destination_table = '{s3_table}'")
 
         # sleep for a while to let the kill to be processed
@@ -155,7 +156,7 @@ def test_kill_export_resilient_to_status_handling_failure(cluster):
 
     assert (
         node.query(
-            f"SELECT status FROM system.partition_exports"
+            f"SELECT status FROM system.distributed_exports"
             f" WHERE partition_id = '2020'"
             f"   AND source_table = '{mt_table}'"
             f"   AND destination_table = '{s3_table}'"
@@ -254,12 +255,8 @@ def test_concurrent_exports_to_different_targets(cluster):
     assert node.query(f"SELECT count() FROM {s3_table_b} WHERE year = 2020") == '3\n', "Second target did not receive expected rows"
 
     # And both should have a commit marker
-    assert node.query(
-        f"SELECT count() FROM s3(s3_conn, filename='{s3_table_a}/commit_2020_*', format=LineAsString)"
-    ) != '0\n', "Commit file missing for first target"
-    assert node.query(
-        f"SELECT count() FROM s3(s3_conn, filename='{s3_table_b}/commit_2020_*', format=LineAsString)"
-    ) != '0\n', "Commit file missing for second target"
+    assert commit_marker_lines(node, mt_table, s3_table_a, "2020") != 0, "Commit file missing for first target"
+    assert commit_marker_lines(node, mt_table, s3_table_b, "2020") != 0, "Commit file missing for second target"
 
 
 def test_failure_is_logged_in_system_table(cluster):
@@ -303,7 +300,7 @@ def test_failure_is_logged_in_system_table(cluster):
         # so the test does not wait for the default (a day).
         node.query(
             f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}"
-            f" SETTINGS export_merge_tree_partition_task_timeout_seconds = 5;"
+            f" SETTINGS export_merge_tree_task_timeout_seconds = 5;"
         )
 
         # Wait for the timeout to kill the stuck task. The KILL is a Keeper operation
@@ -316,7 +313,7 @@ def test_failure_is_logged_in_system_table(cluster):
     # Also verify we captured at least one exception and no commit file exists
     status = node.query(
         f"""
-        SELECT status FROM system.partition_exports
+        SELECT status FROM system.distributed_exports
         WHERE source_table = '{mt_table}'
           AND destination_table = '{s3_table}'
           AND partition_id = '2020'
@@ -327,18 +324,16 @@ def test_failure_is_logged_in_system_table(cluster):
 
     exception_count = node.query(
         f"""
-        SELECT any(exception_count) FROM system.partition_exports
+        SELECT any(exception_count) FROM system.distributed_exports
         WHERE source_table = '{mt_table}'
           AND destination_table = '{s3_table}'
           AND partition_id = '2020'
         """
     )
-    assert int(exception_count.strip()) > 0, "Expected non-zero exception_count in system.partition_exports"
+    assert int(exception_count.strip()) > 0, "Expected non-zero exception_count in system.distributed_exports"
 
     # No commit should have been produced for this partition
-    assert node.query(
-        f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_2020_*', format=LineAsString)"
-    ) == '0\n', "Commit file exists despite forced S3 failures"
+    assert commit_marker_lines(node, mt_table, s3_table, "2020") == 0, "Commit file exists despite forced S3 failures"
 
 
 def test_inject_short_living_failures(cluster):
@@ -383,7 +378,7 @@ def test_inject_short_living_failures(cluster):
         )
 
         # wait for at least one exception to occur, but not enough to finish the export.
-        # Use the helper default (>= one manifest-updater poll cycle): system.partition_exports
+        # Use the helper default (>= one manifest-updater poll cycle): system.distributed_exports
         # is served from the in-memory mirror, and while the task stays PENDING the mirror only
         # picks up new exception leaves on the next poll tick (~30s) — see helper docstring.
         wait_for_exception_count(node, mt_table, s3_table, "2020", min_exception_count=1)
@@ -393,12 +388,12 @@ def test_inject_short_living_failures(cluster):
 
     # Assert the export succeeded
     assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020") == '3\n', "Export did not succeed"
-    assert node.query(f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_2020_*', format=LineAsString)") == '1\n', "Export did not succeed"
+    assert commit_marker_lines(node, mt_table, s3_table, "2020") == 1, "Export did not succeed"
 
-    # check system.partition_exports for the export
+    # check system.distributed_exports for the export
     assert node.query(
         f"""
-        SELECT status FROM system.partition_exports
+        SELECT status FROM system.distributed_exports
         WHERE source_table = '{mt_table}'
           AND destination_table = '{s3_table}'
           AND partition_id = '2020'
@@ -407,7 +402,7 @@ def test_inject_short_living_failures(cluster):
 
     exception_count = node.query(
         f"""
-        SELECT exception_count FROM system.partition_exports
+        SELECT exception_count FROM system.distributed_exports
         WHERE source_table = '{mt_table}'
           AND destination_table = '{s3_table}'
           AND partition_id = '2020'
@@ -464,8 +459,8 @@ def test_export_partition_retry_backoff(cluster, source_engine):
 
         node.query(
             f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} "
-            f"SETTINGS export_merge_tree_partition_retry_initial_backoff_seconds = {initial_backoff_seconds}, "
-            f"export_merge_tree_partition_retry_max_backoff_seconds = {max_backoff_seconds}"
+            f"SETTINGS export_merge_tree_retry_initial_backoff_seconds = {initial_backoff_seconds}, "
+            f"export_merge_tree_retry_max_backoff_seconds = {max_backoff_seconds}"
         )
 
         # Wait until the first failure is recorded.
@@ -479,7 +474,7 @@ def test_export_partition_retry_backoff(cluster, source_engine):
         # the back-off is pacing retries.
         time.sleep(25)
         count_during_backoff = int(node.query(
-            f"SELECT exception_count FROM system.partition_exports"
+            f"SELECT exception_count FROM system.distributed_exports"
             f" WHERE source_table = '{mt_table}'"
             f"   AND destination_table = '{s3_table}'"
             f"   AND partition_id = '2020'"
@@ -620,7 +615,7 @@ def test_export_partition_scheduler_skipped_when_moves_stopped(cluster, source_e
     time.sleep(10)
 
     status = node.query(
-        f"SELECT status FROM system.partition_exports"
+        f"SELECT status FROM system.distributed_exports"
         f" WHERE source_table = '{mt_table}' AND destination_table = '{s3_table}'"
         f" AND partition_id = '2020'"
     ).strip()
@@ -664,7 +659,7 @@ def test_export_partition_resumes_after_stop_moves(cluster, source_engine):
     time.sleep(5)
 
     status = node.query(
-        f"SELECT status FROM system.partition_exports"
+        f"SELECT status FROM system.distributed_exports"
         f" WHERE source_table = '{mt_table}' AND destination_table = '{s3_table}'"
         f" AND partition_id = '2020'"
     ).strip()
@@ -726,7 +721,7 @@ def test_export_partition_resumes_after_stop_moves_during_export(cluster, source
         time.sleep(3)
 
         status = node.query(
-            f"SELECT status FROM system.partition_exports"
+            f"SELECT status FROM system.distributed_exports"
             f" WHERE source_table = '{mt_table}' AND destination_table = '{s3_table}'"
             f" AND partition_id = '2020'"
         ).strip()
@@ -761,7 +756,7 @@ def test_dispatch_fails_when_destination_dropped(cluster):
         wait_for_export_to_start(node, mt_table, s3_table, "2020")
 
         status = node.query(
-            f"SELECT status FROM system.partition_exports"
+            f"SELECT status FROM system.distributed_exports"
             f" WHERE source_table = '{mt_table}' AND destination_table = '{s3_table}'"
             f" AND partition_id = '2020'"
         ).strip()
@@ -773,7 +768,7 @@ def test_dispatch_fails_when_destination_dropped(cluster):
         wait_for_export_status(node, mt_table, s3_table, "2020", "FAILED", timeout=60)
 
         last_exceptions = node.query(
-            f"SELECT last_exception_per_replica FROM system.partition_exports"
+            f"SELECT last_exception_per_replica FROM system.distributed_exports"
             f" WHERE source_table = '{mt_table}'"
             f"   AND destination_table = '{s3_table}'"
             f"   AND partition_id = '2020'"
@@ -811,7 +806,7 @@ def test_dispatch_fails_when_destination_schema_incompatible(cluster):
         wait_for_export_status(node, mt_table, s3_table, "2020", "FAILED", timeout=60)
 
         last_exceptions = node.query(
-            f"SELECT last_exception_per_replica FROM system.partition_exports"
+            f"SELECT last_exception_per_replica FROM system.distributed_exports"
             f" WHERE source_table = '{mt_table}'"
             f"   AND destination_table = '{s3_table}'"
             f"   AND partition_id = '2020'"
@@ -856,13 +851,13 @@ def test_export_task_timeout_kills_stuck_pending_task(cluster, source_engine):
 
         node.query(
             f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}"
-            f" SETTINGS export_merge_tree_partition_task_timeout_seconds = 5"
+            f" SETTINGS export_merge_tree_task_timeout_seconds = 5"
         )
 
         wait_for_export_status(node, mt_table, s3_table, "2020", "KILLED", timeout=90)
 
     last_exceptions = node.query(
-        f"SELECT last_exception_per_replica FROM system.partition_exports"
+        f"SELECT last_exception_per_replica FROM system.distributed_exports"
         f" WHERE source_table = '{mt_table}'"
         f"   AND destination_table = '{s3_table}'"
         f"   AND partition_id = '2020'"
@@ -871,7 +866,5 @@ def test_export_task_timeout_kills_stuck_pending_task(cluster, source_engine):
         f"Expected the recorded exception to mention the timeout reason, got: {last_exceptions!r}"
     )
 
-    assert node.query(
-        f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_2020_*', format=LineAsString)"
-    ) == "0\n", "Commit file exists despite the task timeout"
+    assert commit_marker_lines(node, mt_table, s3_table, "2020") == 0, "Commit file exists despite the task timeout"
     assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020") == "0\n"

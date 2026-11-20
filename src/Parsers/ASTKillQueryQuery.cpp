@@ -27,8 +27,8 @@ void ASTKillQueryQuery::formatQueryImpl(WriteBuffer & ostr, const FormatSettings
         case Type::Transaction:
             ostr << "TRANSACTION";
             break;
-        case Type::ExportPartition:
-            ostr << "EXPORT PARTITION";
+        case Type::Export:
+            ostr << "EXPORT";
             break;
     }
 

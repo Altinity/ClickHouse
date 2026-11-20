@@ -3,6 +3,8 @@
 #include <Storages/MergeTree/Compaction/MergePredicates/DistributedMergePredicate.h>
 #include <Storages/MergeTree/ReplicatedMergeTreeQueue.h>
 #include <Storages/MergeTree/Compaction/PartProperties.h>
+#include <Storages/MergeTree/ExportTTLDeleteGate.h>
+#include <Storages/MergeTree/ExportedBlocks.h>
 
 namespace DB
 {
@@ -24,6 +26,10 @@ protected:
 
     /// Quorum state taken at some later time than prev_virtual_parts.
     const String * inprogress_quorum_part_ptr = nullptr;
+
+    /// This replica's copy of the exported blocks: an older one only makes the delete gate hold more parts.
+    ExportedBlocksPtr exported_blocks;
+    ExportTTLDeleteGate delete_gate;
 };
 
 /// Lightweight version of ReplicatedMergeTreeZooKeeperMergePredicate that do not make any ZooKeeper requests,
