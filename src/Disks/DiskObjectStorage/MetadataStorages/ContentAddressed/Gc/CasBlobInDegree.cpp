@@ -179,30 +179,15 @@ private:
         SourceEdgeRecord rec;
         while (reader->next(rec))
         {
-            const RunMarker v = rec.marker;
+            row_checker.check(rec);
             if (rec.source_id == kZeroSourceId)
             {
-                /// A sentinel key carries exactly one row per blob and never an edge.
-                if (v == RunMarker::Edge)
-                    throw Exception(ErrorCodes::CORRUPTED_DATA,
-                        "CAS source-edge run: active edge at the reserved sentinel source_id 0");
-                if (have_sentinel_blob && sentinel_blob == rec.ref)
-                    throw Exception(ErrorCodes::CORRUPTED_DATA,
-                        "CAS source-edge run: duplicate sentinel row for one blob");
-                have_sentinel_blob = true;
-                sentinel_blob = rec.ref;
-                if (v == RunMarker::Zero)
+                if (rec.marker == RunMarker::Zero)
                     continue;   // A zero marker is per-generation and is dropped on carry.
                 /// A retired sentinel: surface it (settled at close-out, not an edge).
                 return Row{.key = SourceEdgeKeyCodec::key(rec.ref, rec.source_id), .ref = rec.ref,
                            .type = RunMarker::Condemned, .condemned = condemnedRowOf(rec)};
             }
-
-            /// A non-sentinel key must carry a surviving edge and nothing else.
-            if (v != RunMarker::Edge)
-                throw Exception(ErrorCodes::CORRUPTED_DATA,
-                    "CAS source-edge run: sentinel row type 0x{:02x} at a non-sentinel key",
-                    static_cast<uint8_t>(v));
             return Row{.key = SourceEdgeKeyCodec::key(rec.ref, rec.source_id), .ref = rec.ref,
                        .type = RunMarker::Edge, .condemned = {}};
         }
@@ -224,12 +209,30 @@ private:
     std::deque<Row> lookahead;
     size_t offered_ahead = 0;
 
-    /// Duplicate-sentinel guard: the last blob for which a sentinel row was seen (across skipped zero
-    /// markers too). Rows are globally sorted, so two sentinels for one blob are adjacent.
-    bool have_sentinel_blob = false;
-    BlobRef sentinel_blob{};
+    SourceEdgeRowChecker row_checker;
 };
 
+}
+
+void SourceEdgeRowChecker::check(const SourceEdgeRecord & rec)
+{
+    if (rec.source_id == kZeroSourceId)
+    {
+        /// A sentinel key carries exactly one row per blob and never an edge.
+        if (rec.marker == RunMarker::Edge)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS source-edge run: active edge at the reserved sentinel source_id 0");
+        if (last_sentinel_blob == rec.ref)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS source-edge run: duplicate sentinel row for one blob");
+        last_sentinel_blob = rec.ref;
+        return;
+    }
+    /// A non-sentinel key must carry a surviving edge and nothing else.
+    if (rec.marker != RunMarker::Edge)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS source-edge run: sentinel row type 0x{:02x} at a non-sentinel key",
+            static_cast<uint8_t>(rec.marker));
 }
 
 UInt128 sourceEdgeId(const ManifestId & id, const String & path)

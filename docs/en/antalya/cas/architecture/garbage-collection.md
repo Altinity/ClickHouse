@@ -179,8 +179,8 @@ evidence from the fold running now.
 - **Safety:** a row is dropped only if the adopted parent seal carries `cleanup_evidence` for the
   *same* `incarnation` and that life has no coverage hold; each write is token-guarded and bracketed
   by two `gc/state` re-reads
-- **Fails the round if:** `gc/state` points at a missing parent seal (`CORRUPTED_DATA`); leadership
-  changes mid-drain (`NETWORK_ERROR`, an `Aborted` finish that the next round retries — a write
+- **Fails the round if:** `gc/state` points at a missing parent seal (`CORRUPTED_DATA`, or `ABORTED` when a `HEAD`
+  of `gc/state` then shows another version or no object: the leadership was lost); leadership changes mid-drain (`NETWORK_ERROR`, an `Aborted` finish that the next round retries — a write
   already sent stays safe, authorized by the parent seal and the catalog token)
 - **Retry order:** when an erase is refused because the catalog changed, the drain pauses first
   (full-jitter backoff, growing to 5 s), then re-reads the catalog, then sends the next erase against
@@ -302,7 +302,8 @@ prior coverage view, the mutable successor, the new generation / attempt numbers
 - **Writes / deletes:** none
 - **Safety:** read-only
 - **Fails the round if:** the adopted seal is absent while `snap_generation > 0` — `gc/state` points
-  at a missing artifact; the fix is `SYSTEM CAS GC REBUILD` (`CORRUPTED_DATA`)
+  at a missing artifact; the fix is `clickhouse-disks cas-gc-rebuild` (`CORRUPTED_DATA`). When a `HEAD` of
+  `gc/state` then shows another version or no object, the round ends with `ABORTED` instead and no rebuild is needed
 - **Observability:** phase row `fold_seal_read`; metrics `parent_ref_lives`, `parent_runs`,
   `parent_cleanup_evidence`, `redundant_reads`
 
@@ -805,15 +806,17 @@ round with the store's error, and the rows of the round are not committed.
 
 The creates of one round run concurrently, at most `cas_gc_io_concurrency` at a time, and each row is written after
 its own create was answered. `cas_gc_round_intent_create_budget` bounds the creates sent in one round (`0` is
-unbounded); a blob over the budget is a `candidate` too. Under a budget the next round resumes after the last key
-whose create was sent, so a key that never confirms (other bytes at its intent key) cannot take every slot and starve
-the keys behind it. After a change of GC leader the order starts again from the first key.
+unbounded); a blob over the budget is a `candidate` too. When a round sends its whole budget, the next round resumes
+after the last key whose create was sent, so a key that never confirms (other bytes at its intent key) cannot take
+every slot and starve the keys behind it. A round that sends fewer creates starts the next one from the first key. After a change of GC leader the order starts again from the first key.
 
 `cas_gc_round_redelete_budget` bounds the untouched `pending` rows at zero whose body `HEAD` a round sends (`0` is
 unbounded). Such a row takes its slot with the `HEAD` and keeps it whether the body is deleted, moves to `standing` or
 is carried (a body GC cannot decode, or a token with no canonical form). A touched `pending` row is always read and
-takes a slot only when it moves to `standing`. Under a budget the next round resumes after the last row that took a
-slot, so a row carried in every round cannot starve the rows behind it. After a change of GC leader the order starts
+takes a slot only when it moves to `standing`. When a round uses its whole budget, the next round resumes after the
+last row that took a slot, so a row carried in every round cannot starve the rows behind it. A round that uses less
+starts the next one from the first row; a round whose destructive work is suppressed takes no slot and keeps the
+position. After a change of GC leader the order starts
 again from the first row.
 
 A `candidate` whose decision `HEAD` shows no body is dropped without a create: there is nothing to protect, and

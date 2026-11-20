@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <base/defines.h>
+#include <base/scope_guard.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
@@ -12,10 +13,17 @@
 #include <IO/ReadSettings.h>
 #include <algorithm>
 #include <filesystem>
+#include <functional>
+#include <mutex>
 
 namespace ProfileEvents
 {
 extern const Event CASRefRepoint;
+}
+
+namespace DB::ContentAddressedSetting
+{
+extern const ContentAddressedSettingsBool gc_enabled;
 }
 
 namespace DB::ErrorCodes
@@ -1153,6 +1161,33 @@ TEST(CASTransactionSourceLiveness, RefusalSaysTheSourceChangedAndToRunTheStateme
     }
 }
 
+/// A source this server cannot confirm, here because its mount lost its fence, is not reported as changed: the message
+/// says it could not be confirmed, with the same code and advice.
+TEST(CASTransactionSourceLiveness, RefusalOfAnUnconfirmableSourceDoesNotSayItChanged)
+{
+    auto storage = openTxStorage();
+    const std::string table = kLivenessTable + "/";
+    commitPartTx(*storage, table, "all_110_110_0", {{"data.bin", "a source this mount can no longer vouch for"}});
+    ConfirmCounter counter(storage->store());
+    counter.on_call = [&] { storage->store()->tripMountLost(); };
+
+    auto tx = storage->createTransaction();
+    tx->createHardLink(table + "all_110_110_0/data.bin", table + "tmp_clone_all_111_111_0/data.bin");
+    try
+    {
+        tx->commit(DB::NoCommitOptions{});
+        ADD_FAILURE() << "the copy of an unconfirmed source committed";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::NO_REPLICA_HAS_PART) << e.message();
+        EXPECT_EQ(e.message().find("changed or was removed"), std::string::npos) << e.message();
+        EXPECT_NE(e.message().find("could not be confirmed"), std::string::npos) << e.message();
+        EXPECT_NE(e.message().find("Run the statement again"), std::string::npos) << e.message();
+    }
+    EXPECT_EQ(counter.calls, 1u) << "positive control: the confirmation ran";
+}
+
 /// An abandon that fails after a refusal does not replace the refusal: the caller still gets the code it retries on.
 TEST(CASTransactionSourceLiveness, RefusalSurvivesAFailedAbandon)
 {
@@ -1225,3 +1260,293 @@ TEST(CASTransactionSourceLiveness, EntriesTheDestinationUploadsCarryNoSource)
     const DB::Cas::FsckReport report = storage->runFsckNow(/*detail=*/true);
     EXPECT_EQ(report.dangling, 0u) << DB::Cas::formatFsckSummary(report);
 }
+
+/// ---- A file staged in one part, hardlinked inside it, and moved to another part ----
+
+namespace
+{
+
+const std::string kStagedBytes = "bytes staged in P and hardlinked inside it";
+
+/// One way a staged file and its hardlink in part `p` are split or reduced. `kept` lists the files left in `p` that
+/// must name the staged bytes after the commit.
+struct StagedCopyShape
+{
+    const char * name;
+    std::function<void(DB::IMetadataTransaction &, const std::string & p, const std::string & q1, const std::string & q2)> apply;
+    std::vector<std::string> kept;
+    /// Whether the commit is refused at `q1`. Without a file staged in it, a committed `p` may fail first.
+    bool q1_refuses = true;
+};
+
+std::vector<StagedCopyShape> stagedCopyShapes()
+{
+    return {
+        {"the original is moved, the hardlink stays",
+         [](DB::IMetadataTransaction & tx, const std::string & p, const std::string & q1, const std::string &)
+         { tx.moveFile(p + "data.bin", q1 + "data.bin"); },
+         {"kept.bin"}},
+        {"the hardlink is moved, the original stays",
+         [](DB::IMetadataTransaction & tx, const std::string & p, const std::string & q1, const std::string &)
+         { tx.moveFile(p + "kept.bin", q1 + "kept.bin"); },
+         {"data.bin"}},
+        {"both are moved to two parts",
+         [](DB::IMetadataTransaction & tx, const std::string & p, const std::string & q1, const std::string & q2)
+         {
+             tx.moveFile(p + "data.bin", q1 + "data.bin");
+             tx.moveFile(p + "kept.bin", q2 + "kept.bin");
+         },
+         {},
+         /*q1_refuses=*/false},
+        {"hardlinked twice, the original is moved",
+         [](DB::IMetadataTransaction & tx, const std::string & p, const std::string & q1, const std::string &)
+         {
+             tx.createHardLink(p + "data.bin", p + "again.bin");
+             tx.moveFile(p + "data.bin", q1 + "data.bin");
+         },
+         {"kept.bin", "again.bin"}},
+        {"the original is removed",
+         [](DB::IMetadataTransaction & tx, const std::string & p, const std::string &, const std::string &)
+         { tx.unlinkFile(p + "data.bin", /*if_exists=*/false, /*should_remove_objects=*/false); },
+         {"kept.bin"}},
+        {"the original is replaced",
+         [](DB::IMetadataTransaction & tx, const std::string & p, const std::string &, const std::string &)
+         {
+             writeFileTx(tx, p + "other.bin", "other bytes that replace the original");
+             tx.replaceFile(p + "other.bin", p + "data.bin");
+         },
+         {"kept.bin"}},
+    };
+}
+
+/// Stages `data.bin` in `p`, hardlinks it to `kept.bin` in `p`, then applies `shape`.
+void stageCopyShape(DB::IMetadataTransaction & tx, const StagedCopyShape & shape, const std::string & p,
+                    const std::string & q1, const std::string & q2)
+{
+    writeFileTx(tx, p + "data.bin", kStagedBytes);
+    tx.createHardLink(p + "data.bin", p + "kept.bin");
+    shape.apply(tx, p, q1, q2);
+}
+
+bool bodyPresent(const DB::Cas::PoolPtr & store, const DB::Cas::BlobRef & ref)
+{
+    auto op = store->mountRequests().admit();
+    return op.head(store->layout().blobKey(ref), DB::Cas::Retry::standard()).has_value();
+}
+
+/// Every file of `kept` in `part` is committed and names a body that is present.
+void expectKeptFilesHaveBodies(DB::ContentAddressedMetadataStorage & storage, const DB::Cas::RootNamespace & ns,
+                               const std::string & part, const std::vector<std::string> & kept)
+{
+    if (kept.empty())
+        return;
+    const auto view = storage.partAccess()->getView({ns, part}, DB::Cas::Freshness::ForceFresh);
+    ASSERT_NE(view, nullptr) << part << " is not committed";
+    for (const auto & name : kept)
+    {
+        const auto * entry = view->findFile(name);
+        ASSERT_NE(entry, nullptr) << name << " is missing from " << part;
+        EXPECT_TRUE(bodyPresent(storage.store(), entry->ref)) << part << "/" << name << " names a body that was never uploaded";
+    }
+}
+
+}
+
+/// A committed part publishes before the part a staged file moved to, and that part then fails before its upload.
+/// The committed part stays, so it must have uploaded every body it names itself.
+TEST(CASTransactionStagedCopies, ACommittedPartUploadsWhatItKeepsWhenTheOtherPartFails)
+{
+    for (const auto & shape : stagedCopyShapes())
+    {
+        SCOPED_TRACE(shape.name);
+        auto storage = openTxStorage();
+        const std::string table = kLivenessTable + "/";
+        const DB::Cas::RootNamespace ns = storage->liveNamespace(kLivenessUuid);
+        commitPartTx(*storage, table, "all_100_100_0", {{"base.bin", "the committed base of P"}});
+        commitPartTx(*storage, table, "all_103_103_0", {{"source.bin", "a source dropped before the commit"}});
+        const std::string p = table + "all_100_100_0/";
+        const std::string q1 = table + "tmp_q1_all_101_101_0/";
+        const std::string q2 = table + "tmp_q2_all_102_102_0/";
+
+        auto tx = storage->createTransaction();
+        stageCopyShape(*tx, shape, p, q1, q2);
+        /// `q1` sorts after `p` and is refused at its source confirmation, which runs before its upload.
+        tx->createHardLink(table + "all_103_103_0/source.bin", q1 + "source.bin");
+        dropPartTx(*storage, table + "all_103_103_0");
+        try
+        {
+            tx->commit(DB::NoCommitOptions{});
+            ADD_FAILURE() << "the commit succeeded with a refused source";
+        }
+        catch (const DB::Exception & e)
+        {
+            if (shape.q1_refuses)
+                EXPECT_EQ(e.code(), DB::ErrorCodes::NO_REPLICA_HAS_PART) << e.message();
+        }
+
+        EXPECT_FALSE(storage->existsDirectory(table + "tmp_q1_all_101_101_0"));
+        ASSERT_NO_FATAL_FAILURE(expectKeptFilesHaveBodies(*storage, ns, "all_100_100_0", shape.kept));
+        const DB::Cas::FsckReport report = storage->runFsckNow(/*detail=*/true);
+        EXPECT_EQ(report.dangling, 0u) << DB::Cas::formatFsckSummary(report);
+    }
+}
+
+/// The same shapes with a new source part: every part commits and names only bodies that are present.
+TEST(CASTransactionStagedCopies, ANewPartPublishesWhatItKeeps)
+{
+    for (const auto & shape : stagedCopyShapes())
+    {
+        SCOPED_TRACE(shape.name);
+        auto storage = openTxStorage();
+        const std::string table = kLivenessTable + "/";
+        const DB::Cas::RootNamespace ns = storage->liveNamespace(kLivenessUuid);
+        const std::string p = table + "tmp_p_all_104_104_0/";
+        const std::string q1 = table + "tmp_q1_all_105_105_0/";
+        const std::string q2 = table + "tmp_q2_all_106_106_0/";
+
+        auto tx = storage->createTransaction();
+        stageCopyShape(*tx, shape, p, q1, q2);
+        ASSERT_NO_THROW(tx->commit(DB::NoCommitOptions{}));
+
+        ASSERT_NO_FATAL_FAILURE(expectKeptFilesHaveBodies(*storage, ns, "tmp_p_all_104_104_0", shape.kept));
+        const DB::Cas::FsckReport report = storage->runFsckNow(/*detail=*/true);
+        EXPECT_EQ(report.dangling, 0u) << DB::Cas::formatFsckSummary(report);
+    }
+}
+
+namespace
+{
+
+/// Records, in order, the existence checks and the object writes a local object storage receives.
+class WriteJournalObjectStorage : public DB::LocalObjectStorage
+{
+public:
+    using DB::LocalObjectStorage::LocalObjectStorage;
+
+    enum class Verb : uint8_t { Exists, Write, Mark };
+
+    bool exists(const DB::StoredObject & object) const override
+    {
+        record(Verb::Exists, object.remote_path);
+        return DB::LocalObjectStorage::exists(object);
+    }
+
+    std::unique_ptr<DB::WriteBufferFromFileBase> writeObject(
+        const DB::StoredObject & object, DB::WriteMode mode, std::optional<DB::ObjectAttributes> attributes,
+        size_t buf_size, const DB::WriteSettings & write_settings) override
+    {
+        record(Verb::Write, object.remote_path);
+        return DB::LocalObjectStorage::writeObject(object, mode, attributes, buf_size, write_settings);
+    }
+
+    void mark() { record(Verb::Mark, {}); }
+
+    /// Requests whose path contains `needle`, counted before and after the first mark.
+    std::pair<size_t, size_t> count(Verb verb, const std::string & needle) const
+    {
+        std::lock_guard lock(mutex);
+        std::pair<size_t, size_t> counts{0, 0};
+        bool marked = false;
+        for (const auto & [v, path] : journal)
+        {
+            if (v == Verb::Mark)
+                marked = true;
+            else if (v == verb && path.find(needle) != std::string::npos)
+                ++(marked ? counts.second : counts.first);
+        }
+        return counts;
+    }
+
+private:
+    void record(Verb verb, const std::string & path) const
+    {
+        std::lock_guard lock(mutex);
+        journal.emplace_back(verb, path);
+    }
+
+    mutable std::mutex mutex;
+    mutable std::vector<std::pair<Verb, std::string>> journal;
+};
+
+}
+
+/// Both parts that name the staged bytes publish them: the first uploads the body once, the second only reads that it
+/// is present.
+TEST(CASTransactionStagedCopies, TheSecondPartThatNamesAStagedBodyChecksItAndDoesNotUploadIt)
+{
+    const auto root = std::filesystem::temp_directory_path() / ("ca_tx_staged_copy_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root);
+    SCOPE_EXIT({ std::filesystem::remove_all(root); });
+    auto object_storage = std::make_shared<WriteJournalObjectStorage>(
+        DB::LocalObjectStorageSettings("test", (root / "store").string(), /*read_only_=*/false));
+    auto settings = DB::Cas::tests::makeSettingsForTest("test", root / "scratch");
+    settings[DB::ContentAddressedSetting::gc_enabled] = false;
+    auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(object_storage, "pool", "srv1", "", nullptr, settings);
+    storage->startup();
+
+    const std::string table = kLivenessTable + "/";
+    const DB::Cas::RootNamespace ns = storage->liveNamespace(kLivenessUuid);
+    const std::string p = table + "tmp_p_all_107_107_0/";
+    const std::string q = table + "tmp_q_all_108_108_0/";
+    auto tx = storage->createTransaction();
+    writeFileTx(*tx, p + "data.bin", kStagedBytes);
+    tx->createHardLink(p + "data.bin", p + "kept.bin");
+    tx->moveFile(p + "data.bin", q + "data.bin");
+    storage->setAfterPromoteHookForTest({ns, "tmp_p_all_107_107_0"}, [&] { object_storage->mark(); });
+    ASSERT_NO_THROW(tx->commit(DB::NoCommitOptions{}));
+
+    const auto view = storage->partAccess()->getView({ns, "tmp_p_all_107_107_0"}, DB::Cas::Freshness::ForceFresh);
+    ASSERT_NE(view, nullptr);
+    ASSERT_NE(view->findFile("kept.bin"), nullptr);
+    const std::string body_key = storage->store()->layout().blobKey(view->findFile("kept.bin")->ref);
+    const auto [writes_by_p, writes_by_q] = object_storage->count(WriteJournalObjectStorage::Verb::Write, body_key);
+    const auto [checks_by_p, checks_by_q] = object_storage->count(WriteJournalObjectStorage::Verb::Exists, body_key);
+    EXPECT_EQ(writes_by_p, 1u) << "the first part did not upload the body once";
+    EXPECT_GE(checks_by_p, 1u) << "the first part uploaded without checking the body first";
+    EXPECT_EQ(writes_by_q, 0u) << "the second part uploaded the body again";
+    EXPECT_GE(checks_by_q, 1u) << "the second part did not check the body";
+    EXPECT_TRUE(storage->existsFile(q + "data.bin"));
+}
+
+namespace
+{
+
+/// Commits a part holding a blob entry with no pending upload and no copy source.
+void commitUnprovenBlobEntry(DB::ContentAddressedMetadataStorage & storage)
+{
+    auto tx = storage.createTransaction();
+    dynamic_cast<DB::ContentAddressedTransaction &>(*tx).stageUnprovenBlobEntryForTest(
+        kLivenessTable + "/tmp_p_all_109_109_0/data.bin", DB::Cas::tests::blobRefOf(1), 16);
+    tx->commit(DB::NoCommitOptions{});
+}
+
+}
+
+#ifndef DEBUG_OR_SANITIZER_BUILD
+/// A blob entry whose body nothing uploads or confirms is refused before its part precommits.
+TEST(CASTransactionStagedCopies, ABlobEntryWithNoUploadAndNoSourceThrows)
+{
+    auto storage = openTxStorage();
+    try
+    {
+        commitUnprovenBlobEntry(*storage);
+        ADD_FAILURE() << "a blob entry with no upload and no source was committed";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::LOGICAL_ERROR) << e.message();
+        EXPECT_NE(e.message().find("has neither a pending upload nor a copy source"), std::string::npos) << e.message();
+    }
+    EXPECT_TRUE(storage->store()->livePrecommitsForTest(storage->liveNamespace(kLivenessUuid)).empty());
+}
+#else
+/// The storage is built inside the child, so the parent of this death suite constructs none.
+TEST(CASTransactionStagedCopiesDeathTest, ABlobEntryWithNoUploadAndNoSourceAborts)
+{
+    EXPECT_DEATH({
+        auto storage = openTxStorage();
+        commitUnprovenBlobEntry(*storage);
+    }, "has neither a pending upload nor a copy source");
+}
+#endif

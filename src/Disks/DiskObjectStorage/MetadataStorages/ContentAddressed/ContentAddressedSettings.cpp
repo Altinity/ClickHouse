@@ -69,7 +69,7 @@ constexpr std::string_view CAS_KEY_PREFIX = "cas_";
     DECLARE(UInt64, manifest_sweep_delete_budget_keys, 100, "Orphan-manifest sweep candidate budget per round: keys that pass every retain check, whose bodies are read and decided", 0) \
     DECLARE(UInt64, gc_round_graduation_budget, 0, "Retired; when gc_round_intent_create_budget is not set, its value applies to that setting", 0) \
     DECLARE(UInt64, gc_round_intent_create_budget, 0, "Maximum deletion-intent creates per GC round, summed over every GC shard; a blob over the cap stays a candidate and is created in a later round (0 = unbounded)", 0) \
-    DECLARE(UInt64, gc_round_redelete_budget, 0, "Blob redelete (exact-token delete of a prior delete_pending row) cohort cap per round (0 = unbounded)", 0) \
+    DECLARE(UInt64, gc_round_redelete_budget, 0, "Maximum untouched pending rows whose body one GC round reads to decide its delete, summed over every GC shard; a row over the cap waits for a later round (0 = unbounded)", 0) \
     DECLARE(UInt64, gc_round_sweep_namespace_budget, 20, "Orphan-manifest sweep: distinct namespaces per page whose protection view may be built (0 = unbounded)", 0) \
     DECLARE(UInt64, gc_round_sweep_recovery_op_budget, 5000, "Orphan-manifest sweep: committed-tail ref-log GET/decode ops the recovery walk may spend per round (0 = unbounded)", 0) \
     DECLARE(UInt64, gc_round_ref_cleanup_budget, 0, "Ref-object cleanup (covered log/snapshot deletes) cap per round (0 = unbounded)", 0) \

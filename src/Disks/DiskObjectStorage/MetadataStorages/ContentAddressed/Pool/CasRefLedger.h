@@ -465,6 +465,12 @@ public:
         confirm_before_state_lock_wait_hook_for_test = std::move(hook);
     }
 
+    /// Runs when that confirm got the state lock and released it, before it asks again.
+    void setConfirmAfterStateLockWaitHookForTest(std::function<void()> hook)
+    {
+        confirm_after_state_lock_wait_hook_for_test = std::move(hook);
+    }
+
     /// Installs a probe at `ensureRefTableRecovered`'s step 8 -- the LAST admission recheck before a
     /// materialized recovery result installs, after the final authority read and O(N) materialization
     /// have already run. A test pausing here and then latching a stop token observes whether that stop
@@ -1108,6 +1114,7 @@ private:
     std::function<void()> removal_reopen_read_hook_for_test;
     std::function<void()> removal_runtime_acquired_hook_for_test;
     std::function<void()> confirm_before_state_lock_wait_hook_for_test;
+    std::function<void()> confirm_after_state_lock_wait_hook_for_test;
 
     /// One pass of `confirmExactRef` under `ref_queue_mutex` and a try-lock of the table's state lock; empty when
     /// that lock is held.

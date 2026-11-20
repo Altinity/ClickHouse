@@ -176,6 +176,19 @@ private:
 SourceEdgeRunView openSourceEdgeRun(std::string_view bytes);
 SourceEdgeRunView openSourceEdgeRun(CasOperation & op, const String & key);
 
+/// The row rules of one GC shard's source-edge runs, read in order across its segments. `check` throws
+/// `CORRUPTED_DATA` for an edge at the sentinel source id 0, a second sentinel row for one blob, or a sentinel marker
+/// at another source id. The fold's merge applies it to every row it reads.
+class SourceEdgeRowChecker
+{
+public:
+    void check(const SourceEdgeRecord & rec);
+
+private:
+    /// Rows are sorted, so two sentinel rows of one blob are adjacent among the sentinels.
+    std::optional<BlobRef> last_sentinel_blob;
+};
+
 /// Store a deterministic write-once artifact (same inputs => byte-identical bytes): the blob in-degree
 /// runs and fold seals. `create`; a `Conflict` means the write was refused, and only what its resolve
 /// read OBSERVED decides what that means: byte-equal bytes are our own deterministic replay (adopt,

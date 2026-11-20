@@ -474,6 +474,9 @@ ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const Stri
                                            const ManifestRef & manifest_ref, ConfirmLockMode lock_mode) const
 {
     const uint64_t started_ms = boot_ms_now_fn();
+    /// Held from the wait until the next pass answers: a runtime nobody holds may be evicted, and an evicted table
+    /// answers `Unknown` for a live source.
+    std::shared_ptr<RefTableRuntime> waited_on;
     while (true)
     {
         if (const auto answer = confirmExactRefIfStateLockFree(ns, ref_name, manifest_ref))
@@ -488,10 +491,13 @@ ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const Stri
         if (confirm_before_state_lock_wait_hook_for_test)
             confirm_before_state_lock_wait_hook_for_test();
         /// Waits holding no other ledger lock, so append admission of every table goes on meanwhile.
-        if (const auto rt = lookupRefTableRuntime(ns))
+        waited_on = lookupRefTableRuntime(ns);
+        if (waited_on)
         {
-            std::lock_guard<std::mutex> wait_for_holder(rt->state_mutex);
+            std::lock_guard<std::mutex> wait_for_holder(waited_on->state_mutex);
         }
+        if (confirm_after_state_lock_wait_hook_for_test)
+            confirm_after_state_lock_wait_hook_for_test();
     }
 }
 

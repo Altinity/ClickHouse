@@ -124,6 +124,10 @@ public:
     /// Truncation is not representable without rewriting the content and is unsupported.
     void truncateFile(const std::string & path, size_t size) override;
 
+    /// Test-only: stages the part file `path` as a blob entry naming `ref` with no pending upload and no copy
+    /// source, a shape no operation produces.
+    void stageUnprovenBlobEntryForTest(const std::string & path, const Cas::BlobRef & ref, uint64_t size);
+
     /// Abandons open builds and cleans owned staging without publishing an uncommitted ref.
     ~ContentAddressedTransaction() override;
 

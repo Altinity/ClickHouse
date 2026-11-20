@@ -305,20 +305,20 @@ void ContentAddressedTransaction::confirmCopySources(const Cas::RootNamespace & 
     const auto access = metadata_storage.partAccess();
     for (const auto & source : sources)
     {
-        bool confirmed = false;
+        Cas::ConfirmAnswer answer = Cas::ConfirmAnswer::Unknown;
         try
         {
-            confirmed = access->confirmCopySource(source);
+            answer = access->confirmCopySource(source);
         }
         catch (...)
         {
             abandon_logging_failure();
             throw;
         }
-        if (confirmed)
+        if (answer == Cas::ConfirmAnswer::Yes)
             continue;
         abandon_logging_failure();
-        Cas::throwCopySourceUnconfirmed(source, {ns, ref});
+        Cas::throwCopySourceUnconfirmed(source, {ns, ref}, answer);
     }
 }
 
@@ -451,6 +451,14 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
         st.published = true;
         return;
     }
+
+    /// A blob entry's body is either uploaded by this part or confirmed at its committed source; a part may be
+    /// promoted before any other part of this transaction publishes, so nothing else can supply the body.
+    for (const auto & entry : st.entries)
+        if (entry.placement == Cas::EntryPlacement::Blob && !findPendingBlob(st, entry.ref) && !copySourceOf(st, entry.path))
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "ContentAddressedTransaction: staged blob '{}' of {}/{} has neither a pending upload nor a copy source",
+                entry.path, ns.string(), ref);
 
     /// For committed-ref standalone writes and removal marks, `st.entries` holds only the
     /// CHANGED/ADDED entries (see stageBlobPartFile / the inline writeFile path) — never the whole
@@ -860,6 +868,21 @@ void ContentAddressedTransaction::stageBlobPartFile(
 
     Cas::ManifestEntry entry;
     entry.path = route.file;
+    entry.placement = Cas::EntryPlacement::Blob;
+    entry.ref = ref;
+    entry.blob_size = size;
+    putEntry(st, std::move(entry), std::nullopt);
+}
+
+void ContentAddressedTransaction::stageUnprovenBlobEntryForTest(const std::string & path, const Cas::BlobRef & ref, uint64_t size)
+{
+    const auto route = routeOf(path);
+    if (!route || route->file.empty())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "ContentAddressed: {} is not a part file", path);
+    auto & st = stagingFor(*route);
+    (void)buildFor(*route, st);
+    Cas::ManifestEntry entry;
+    entry.path = route->file;
     entry.placement = Cas::EntryPlacement::Blob;
     entry.ref = ref;
     entry.blob_size = size;
@@ -1705,15 +1728,17 @@ void ContentAddressedTransaction::moveFile(const std::string & path_from, const 
         entry.path = dst->file;
         if (&src_st != &dst_st && entry.placement == Cas::EntryPlacement::Blob)
         {
-            /// Unified adopt dispatch. MOVE semantics — physically move the pending blob
-            /// record from src_st to dst_st FIRST (so dst_st owns the upload), then call adoptStagedBlob
-            /// with copy_pending=false (the record is already in dst_st; no additional copy needed).
+            /// The record of a pending upload follows the entry. A hardlink left in the source still names the blob,
+            /// so the source keeps a copy: each part publishes every body it names, and may publish first.
             auto pb_it = std::find_if(src_st.pending_blobs.begin(), src_st.pending_blobs.end(),
                 [&](const PartStaging::PendingBlob & pb) { return pb.ref == entry.ref; });
             if (pb_it != src_st.pending_blobs.end())
             {
-                dst_st.pending_blobs.push_back(std::move(*pb_it));
-                src_st.pending_blobs.erase(pb_it);
+                const bool still_named_in_source = std::any_of(src_st.entries.begin(), src_st.entries.end(),
+                    [&](const Cas::ManifestEntry & e) { return e.placement == Cas::EntryPlacement::Blob && e.ref == entry.ref; });
+                dst_st.pending_blobs.push_back(*pb_it);
+                if (!still_named_in_source)
+                    src_st.pending_blobs.erase(pb_it);
             }
             adoptStagedBlob(findPendingBlob(dst_st, entry.ref), entry, dst_st, buildFor(*dst, dst_st), /*copy_pending=*/false);
         }

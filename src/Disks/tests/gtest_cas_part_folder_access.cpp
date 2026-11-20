@@ -752,15 +752,15 @@ TEST(CASPartFolderAccess, ConfirmCopySourceLoadsAnEvictedSourceTable)
 
     evict_source("y2");
     backend->resetCounts();
-    EXPECT_TRUE(access.confirmCopySource(Cas::CopySource{{from, "src"}, id.ref}));
+    EXPECT_EQ(access.confirmCopySource(Cas::CopySource{{from, "src"}, id.ref}), Cas::ConfirmAnswer::Yes);
     EXPECT_EQ(requests(), load_requests + 1) << "an evicted source costs one table load and the mount-slot read";
     ASSERT_TRUE(store->refTableCachedForTest(from));
 
     backend->resetCounts();
-    EXPECT_TRUE(access.confirmCopySource(Cas::CopySource{{from, "src"}, id.ref}));
+    EXPECT_EQ(access.confirmCopySource(Cas::CopySource{{from, "src"}, id.ref}), Cas::ConfirmAnswer::Yes);
     EXPECT_EQ(requests(), 1u) << "a resident source costs only the mount-slot read";
     const Cas::ManifestRef other_manifest{id.ref.writer_epoch, id.ref.build_sequence, id.ref.manifest_ordinal + 1};
-    EXPECT_FALSE(access.confirmCopySource(Cas::CopySource{{from, "src"}, other_manifest}))
+    EXPECT_EQ(access.confirmCopySource(Cas::CopySource{{from, "src"}, other_manifest}), Cas::ConfirmAnswer::No)
         << "a loaded table still refuses a manifest the source does not commit";
 }
 
@@ -831,6 +831,74 @@ TEST(CASPartFolderAccess, CopyConfirmWaitsForAHeldStateLockOutsideThePoolLock)
     confirmer.join();
     EXPECT_EQ(confirmed_future.get(), Cas::ConfirmAnswer::Yes) << "the copy confirm refused a live source whose state lock was released";
     EXPECT_EQ(busy_refusals, 0u);
+}
+
+/// After the wait for the source table's state lock, the copy confirm keeps the table until its next pass answers, so
+/// an eviction in between cannot turn a live source into a refusal.
+TEST(CASPartFolderAccess, CopyConfirmKeepsTheSourceTableBetweenTheWaitAndTheNextPass)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    /// A 1-byte budget is below one table's weight, so touching another table evicts every idle one.
+    auto store = Cas::Pool::open(backend,
+        Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .ref_table_cache_bytes = 1});
+    const Cas::RootNamespace ns{"srv/t1"};
+    const Cas::RootNamespace other{"srv/t2"};
+    const Cas::ManifestId id = publishPart(store, ns, "src", {inlineEntry("f", "live")});
+
+    std::promise<void> waiting;
+    auto waiting_future = waiting.get_future();
+    std::atomic<size_t> waits{0};
+    store->setConfirmBeforeStateLockWaitHookForTest([&]
+    {
+        if (waits++ == 0)
+            waiting.set_value();
+    });
+    SCOPE_EXIT({ store->setConfirmBeforeStateLockWaitHookForTest(nullptr); });
+
+    std::promise<void> publish_returned;
+    auto publish_returned_future = publish_returned.get_future();
+    std::atomic<size_t> passes_after_wait{0};
+    bool publisher_released = false;
+    bool evicted = false;
+    store->setConfirmAfterStateLockWaitHookForTest([&]
+    {
+        if (passes_after_wait++ != 0)
+            return;
+        /// Once the commit that held the lock has returned, the confirm is the only possible holder of the table.
+        publisher_released = publish_returned_future.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+        publishPart(store, other, "evictor", {inlineEntry("f", "other")});
+        evicted = !store->refTableCachedForTest(ns);
+    });
+    SCOPE_EXIT({ store->setConfirmAfterStateLockWaitHookForTest(nullptr); });
+
+    std::promise<Cas::ConfirmAnswer> confirmed;
+    auto confirmed_future = confirmed.get_future();
+    std::thread confirmer;
+    SCOPE_EXIT({
+        if (confirmer.joinable())
+            confirmer.join();
+    });
+    bool parked = false;
+    auto fired = std::make_shared<std::atomic<bool>>(false);
+    store->setInstallRegionProbeForTest([&, fired]
+    {
+        if (fired->exchange(true))
+            return;
+        ALLOW_ALLOCATIONS_IN_SCOPE;
+        confirmer = std::thread([&] { confirmed.set_value(store->confirmExactRef(ns, "src", id.ref, Cas::ConfirmLockMode::Wait)); });
+        parked = waiting_future.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+    });
+    SCOPE_EXIT({ store->setInstallRegionProbeForTest(nullptr); });
+
+    publishPart(store, ns, "y", {inlineEntry("f", "y")});
+    publish_returned.set_value();
+    ASSERT_TRUE(fired->load()) << "the install region never ran";
+    ASSERT_TRUE(parked) << "the confirm did not find the state lock held";
+    confirmer.join();
+    EXPECT_TRUE(publisher_released) << "the commit holding the lock did not return";
+    EXPECT_EQ(passes_after_wait.load(), 1u);
+    EXPECT_FALSE(evicted) << "the source table was evicted between the wait and the next pass";
+    EXPECT_EQ(confirmed_future.get(), Cas::ConfirmAnswer::Yes) << "the copy confirm refused a live source";
 }
 
 /// Task 7: `publishEntries`'s `catch (...) { build->abandon(); throw; }` must leave no live-epoch

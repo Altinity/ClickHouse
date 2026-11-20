@@ -1950,6 +1950,27 @@ TEST(CASMigratePool, SealMissingAShardSummaryIsRefusedBeforeAnyWrite)
     EXPECT_EQ(objectsOf(f), before);
 }
 
+/// GC of this build refuses a run whose rows break the run's row rules, here two condemned rows for one blob. The run
+/// passes its checksum, so only those rules catch it, and the migration stops at M3 with the pool as it was.
+TEST(CASMigratePool, RunWithADuplicateCondemnedRowIsRefusedBeforeAnyWrite)
+{
+    Fixture f(3);
+    f.body(1);
+    const RetiredEntry row = f.row(1, /*pending*/ true);
+    f.rows({row, row});
+    const auto before = objectsOf(f);
+    f.backend->clearJournal();
+
+    std::vector<String> lines;
+    const String message = messageOf(DB::ErrorCodes::CORRUPTED_DATA, [&] { f.run({}, &lines); });
+
+    EXPECT_NE(message.find("duplicate sentinel row for one blob"), String::npos) << message;
+    EXPECT_NE(message.find("M3: GC of this build refuses the source-edge run"), String::npos) << message;
+    EXPECT_TRUE(contains(lines, "M2:")) << "positive control: the run reached M3";
+    EXPECT_EQ(mutationsOutsideTheProbes(f.backend->journal(), f), std::vector<String>{});
+    EXPECT_EQ(objectsOf(f), before);
+}
+
 /// A `gc/state` whose shard count disagrees with `_pool_meta` is refused by the GC lease, so the run stops at M3.
 TEST(CASMigratePool, GcStateWithAnotherShardCountIsRefusedBeforeAnyWrite)
 {

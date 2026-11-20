@@ -1394,7 +1394,9 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     state_etag = orThrow(std::move(commit), "CAS gc round commit");
     state = std::move(next);
     creates_resume_after_ = round_work_budget.nextCreatesResumeAfter();
-    redeletes_resume_after_ = round_work_budget.nextRedeletesResumeAfter();
+    /// A suppressed round takes no redelete slot, so its empty budget would look like the end of the queue.
+    if (!suppress_destructive)
+        redeletes_resume_after_ = round_work_budget.nextRedeletesResumeAfter();
     report.round = state.round;
     round_commit_timer->metric("round", report.round);
     round_commit_timer->metric("generation", generation);
@@ -2189,13 +2191,13 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
     const std::optional<CasFoldSeal> adopted_seal = readFoldSeal(state.snap_generation, state.snap_attempt);
     if (!adopted_seal && state.snap_generation > 0)
     {
-        const String failure = fmt::format(
-            "CAS GC: the adopted fold seal (generation {}, attempt {}) is missing under a live "
-            "gc/state — GC bookkeeping is corrupt. GC refuses to run; recover with "
-            "`clickhouse-disks cas-gc-rebuild`",
-            state.snap_generation, state.snap_attempt);
-        throwIfStateMoved(op, state_etag, failure);
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "{}", failure);
+        /// A deposed leader hears only the fact: a rebuild does not repair a lost leadership.
+        const String missing = fmt::format(
+            "CAS GC: the adopted fold seal (generation {}, attempt {}) is missing", state.snap_generation, state.snap_attempt);
+        throwIfStateMoved(op, state_etag, missing);
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "{} under a live gc/state — GC bookkeeping is corrupt. GC refuses to run; recover with "
+            "`clickhouse-disks cas-gc-rebuild`", missing);
     }
     /// Every fold decision below starts from the immutable plan, never from the raw scan that supplied
     /// it. The successor seal owns its mutable copy; this separate const snapshot remains the prior
@@ -2846,7 +2848,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
                     "CAS GC baseline guard: table {} has snapshot {} but no surviving log at or below it and "
                     "no sealed fold cursor -- gc/state was lost after cleaning covered logs. GC refuses to "
-                    "run; recover with SYSTEM CAS GC REBUILD.",
+                    "run; recover with `clickhouse-disks cas-gc-rebuild`.",
                     ns_str, renderRefTxnId(newest_snapshot));
         }
 
@@ -3463,7 +3465,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
                     throw Exception(ErrorCodes::CORRUPTED_DATA,
                         "CAS GC fold: namespace {} sealed a cursor at {} that does not close the run it "
                         "walked (opened at {}). GC refuses to commit the round; recover with "
-                        "SYSTEM CAS GC REBUILD.",
+                        "`clickhouse-disks cas-gc-rebuild`.",
                         ns_str, end == RefTxnId{} ? "none" : renderRefTxnId(end), renderRefTxnId(first));
                 logs_accounted += end.ref_sequence - first.ref_sequence + 1;
             }
@@ -4147,7 +4149,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
             "CAS GC fold: {} ref transaction(s) folded and merged into the round buffers but NONE of "
             "their blob deltas reached a shard reducer ({}{}). The round would have advanced its "
             "cursor past a transaction it never applied. GC refuses to commit the round; recover with "
-            "SYSTEM CAS GC REBUILD.",
+            "`clickhouse-disks cas-gc-rebuild`.",
             unapplied_txns.size(), detail, unapplied_txns.size() > 8 ? ", ..." : "");
     }
 
@@ -4159,7 +4161,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS GC fold: the round sealed coverage over {} ref log(s) but only {} fully folded -- "
             "a cursor advanced past a log this round never applied. GC refuses to commit the round; "
-            "recover with SYSTEM CAS GC REBUILD.",
+            "recover with `clickhouse-disks cas-gc-rebuild`.",
             logs_accounted_this_round, logs_applied_this_round);
 
     /// Phase `fold_seal_write`: one PUT (or, on a deterministic replay, a byte-compare GET).

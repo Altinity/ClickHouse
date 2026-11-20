@@ -575,10 +575,10 @@ bool CachedPartFolderAccess::republishRef(const PartRefKey & src, const PartRefK
         return true;
     }
 
-    bool source_confirmed = false;
+    ConfirmAnswer source_answer = ConfirmAnswer::Unknown;
     try
     {
-        source_confirmed = confirmCopySource(source);
+        source_answer = confirmCopySource(source);
     }
     catch (...)
     {
@@ -586,12 +586,12 @@ bool CachedPartFolderAccess::republishRef(const PartRefKey & src, const PartRefK
         prepared->abortLoggingFailure();
         throw;
     }
-    if (!source_confirmed)
+    if (source_answer != ConfirmAnswer::Yes)
     {
         prepared->abortLoggingFailure();
         if (complete_over_equal_destination())
             return true;
-        throwCopySourceUnconfirmed(source, dst);
+        throwCopySourceUnconfirmed(source, dst, source_answer);
     }
 
     std::optional<Cas::CommitOutcome> oc;
@@ -608,19 +608,25 @@ bool CachedPartFolderAccess::republishRef(const PartRefKey & src, const PartRefK
     return true;
 }
 
-bool CachedPartFolderAccess::confirmCopySource(const CopySource & source) const
+ConfirmAnswer CachedPartFolderAccess::confirmCopySource(const CopySource & source) const
 {
     /// A live source must not be refused because its table is not resident: the confirm reads only memory.
     store->resolveRef(source.part.ns, source.part.ref);
-    return store->confirmExactRef(source.part.ns, source.part.ref, source.manifest_ref, Cas::ConfirmLockMode::Wait)
-        == Cas::ConfirmAnswer::Yes;
+    return store->confirmExactRef(source.part.ns, source.part.ref, source.manifest_ref, Cas::ConfirmLockMode::Wait);
 }
 
-void throwCopySourceUnconfirmed(const CopySource & source, const PartRefKey & destination)
+void throwCopySourceUnconfirmed(const CopySource & source, const PartRefKey & destination, ConfirmAnswer answer)
 {
+    if (answer == ConfirmAnswer::No)
+        throw Exception(ErrorCodes::NO_REPLICA_HAS_PART,
+            "The source part '{}/{}' changed or was removed while it was being copied (it no longer commits manifest {}), "
+            "so nothing was copied into '{}/{}'. Run the statement again",
+            source.part.ns.string(), source.part.ref, manifestRefDebugString(source.manifest_ref),
+            destination.ns.string(), destination.ref);
     throw Exception(ErrorCodes::NO_REPLICA_HAS_PART,
-        "The source part '{}/{}' changed or was removed while it was being copied (it no longer commits manifest {}), "
-        "so nothing was copied into '{}/{}'. Run the statement again",
+        "The source part '{}/{}' could not be confirmed as still committing manifest {} while it was being copied: its "
+        "table was busy, loading or being changed, or this server lost its claim on it. Nothing was copied into '{}/{}'. "
+        "Run the statement again",
         source.part.ns.string(), source.part.ref, manifestRefDebugString(source.manifest_ref),
         destination.ns.string(), destination.ref);
 }

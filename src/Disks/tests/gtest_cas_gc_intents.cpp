@@ -2501,7 +2501,8 @@ namespace
 {
 
 /// Replaces the body of `b` with bytes shorter than the pool's blob envelope.
-void truncateBody(IntentPool<> & pool, uint64_t b)
+template <typename B>
+void truncateBody(IntentPool<B> & pool, uint64_t b)
 {
     OperationForTest op(*pool.backend);
     if (const auto meta = (*op).head(pool.bodyKey(b), Retry::standard()))
@@ -2510,7 +2511,8 @@ void truncateBody(IntentPool<> & pool, uint64_t b)
 }
 
 /// Runs a round and fails the test, not the binary, when it throws.
-std::optional<RoundReport> roundWithoutThrowing(IntentPool<> & pool)
+template <typename B>
+std::optional<RoundReport> roundWithoutThrowing(IntentPool<B> & pool)
 {
     try
     {
@@ -2922,8 +2924,8 @@ TEST(CASGcIntents, ACarriedPendingRowDoesNotStarveLaterDeletesUnderABudget)
     EXPECT_GE(carried_heads, 1u) << "positive control: the carried row took the slot";
 }
 
-/// With a budget of B, a round sends at most B decision `HEAD`s for `pending` rows, read-ahead included, and the rows
-/// behind a carried row are still reclaimed.
+/// With a budget of B, a round sends at most B decision `HEAD`s for `pending` rows, read-ahead included. The rows behind
+/// a carried row are reclaimed in three rounds, one fewer than a budget that restarts at the carried row every round.
 TEST(CASGcIntents, RedeleteBudgetBoundsThePendingHeadsOfARound)
 {
     const std::vector<uint64_t> ordered = inRunOrder({1, 2, 3, 4, 5});
@@ -2941,7 +2943,7 @@ TEST(CASGcIntents, RedeleteBudgetBoundsThePendingHeadsOfARound)
         };
         size_t rounds = 0;
         uint64_t deleted = 0;
-        for (; rounds < 4 && anyHealthyBody(); ++rounds)
+        for (; rounds < 3 && anyHealthyBody(); ++rounds)
         {
             SCOPED_TRACE(rounds);
             pool.backend->clearJournal();
@@ -4619,26 +4621,29 @@ std::pair<int, String> roundWithAdoptedSealGone(StateHead answer, const String &
 }
 
 /// The pre-fold drain and the fold each read the adopted seal once more. A seal gone under a moved `gc/state` is a
-/// lost leadership; gone under an unchanged one it is corruption.
+/// lost leadership, which no rebuild repairs; gone under an unchanged one it is corruption.
 TEST(CASGcIntents, AdoptedSealGoneAtTheDrainOrTheFoldIsALostLeadershipOnlyWhenTheStateMoved)
 {
     struct Site
     {
         const char * hide_after;
         const char * failure;
+        bool advises_rebuild_on_corruption;
     };
-    for (const Site site : {Site{"", "pre-fold drain: adopted parent seal"},
-                            Site{"parent_seal_read", "the adopted fold seal (generation"}})
+    for (const Site site : {Site{"", "pre-fold drain: adopted parent seal", false},
+                            Site{"parent_seal_read", "the adopted fold seal (generation", true}})
     {
         SCOPED_TRACE(site.failure);
         const auto [moved_code, moved_message] = roundWithAdoptedSealGone(StateHead::Absent, site.hide_after);
         EXPECT_EQ(moved_code, DB::ErrorCodes::ABORTED) << moved_message;
         EXPECT_NE(moved_message.find("gc/state moved during the round"), String::npos) << moved_message;
         EXPECT_NE(moved_message.find(site.failure), String::npos) << moved_message;
+        EXPECT_EQ(moved_message.find("cas-gc-rebuild"), String::npos) << moved_message;
 
         const auto [same_code, same_message] = roundWithAdoptedSealGone(StateHead::Store, site.hide_after);
         EXPECT_EQ(same_code, DB::ErrorCodes::CORRUPTED_DATA) << same_message;
         EXPECT_NE(same_message.find(site.failure), String::npos) << same_message;
+        EXPECT_EQ(same_message.find("cas-gc-rebuild") != String::npos, site.advises_rebuild_on_corruption) << same_message;
     }
 }
 
@@ -4679,6 +4684,38 @@ TEST(CASGcIntents, UnconfirmedLeasedStateSuppressesTheRound)
         EXPECT_EQ(report.bodies_deleted, 1u) << "the confirmed round did not delete the body";
         EXPECT_EQ(metricOr(reduce, "parent_unconfirmed"), 0u);
     }
+}
+
+/// A round whose destructive work is suppressed takes no redelete slot, so it keeps the position the previous round
+/// left: the round after it still starts behind the carried row.
+TEST(CASGcIntents, ASuppressedRoundKeepsTheRedeletePosition)
+{
+    IntentPool<PausedLeaderBackend> pool(std::make_shared<PausedLeaderBackend>(), {.redelete_budget = 1});
+    const std::vector<uint64_t> ordered = inRunOrder({1, 2});
+    ASSERT_NO_FATAL_FAILURE(pool.makePending(ordered));
+    ASSERT_NO_FATAL_FAILURE(truncateBody(pool, ordered[0]));
+    std::map<String, UInt64> reduce;
+    pool.gc->setPhaseSink([&reduce](const GcPhaseRecord & record)
+    {
+        if (record.phase == "fold_reduce")
+            reduce = record.metrics;
+    });
+
+    ASSERT_TRUE(roundWithoutThrowing(pool).has_value());
+    ASSERT_TRUE(isPending(pool.row(ordered[0])));
+    ASSERT_TRUE(pool.bodyMeta(ordered[1]).has_value()) << "positive control: the carried row took the only slot";
+
+    pool.backend->state_head = StateHead::Absent;
+    ASSERT_TRUE(roundWithoutThrowing(pool).has_value());
+    ASSERT_EQ(metricOr(reduce, "suppress_destructive"), 1u) << "positive control: the round was suppressed";
+    ASSERT_TRUE(pool.bodyMeta(ordered[1]).has_value());
+
+    pool.backend->state_head = StateHead::Store;
+    pool.backend->clearJournal();
+    ASSERT_TRUE(roundWithoutThrowing(pool).has_value());
+    const auto requests = blobRequests(pool.backend->journal());
+    EXPECT_EQ(countOf(requests, JournalVerb::Head, pool.bodyKey(ordered[0])), 0u) << "the round started at the carried row";
+    EXPECT_FALSE(pool.bodyMeta(ordered[1]).has_value()) << "the row behind the carried row was not reclaimed";
 }
 
 /// The validation read is sent when the only `pending` row is in a shard other than the first.

@@ -1122,6 +1122,11 @@ public:
     {
         ref_ledger.setConfirmBeforeStateLockWaitHookForTest(std::move(hook));
     }
+    /// Test-only: forwards to `CasRefLedger::setConfirmAfterStateLockWaitHookForTest`.
+    void setConfirmAfterStateLockWaitHookForTest(std::function<void()> hook)
+    {
+        ref_ledger.setConfirmAfterStateLockWaitHookForTest(std::move(hook));
+    }
     void setSnapshotAfterCaptureHookForTest(std::function<void()> hook)
     {
         ref_ledger.setSnapshotAfterCaptureHookForTest(std::move(hook));

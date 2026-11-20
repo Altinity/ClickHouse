@@ -637,8 +637,8 @@ private:
             "M3: {}, and a gc/state written now would name none of the runs and holds GC left. {}", what, recovery);
     }
 
-    /// M3: every condemned row of the runs the adopted fold seal names. The state and the seal pass the checks GC of
-    /// this build applies when it adopts them, because after the floor is raised no older build can repair them.
+    /// M3: every condemned row of the runs the adopted fold seal names. The state, the seal and the runs pass the checks
+    /// GC of this build applies when it adopts them, because after the floor is raised no older build can repair them.
     std::vector<InheritedRow> readCondemnedRows(const std::optional<GcState> & state, const PoolMeta & meta)
     {
         if (state && state->gc_shards != meta.gc_shards)
@@ -665,14 +665,31 @@ private:
                     "intent and before the floor", seal_key);
                 throw;
             }
+            /// Each shard's runs are checked in seal order, as GC's merge reads them.
+            std::map<uint64_t, SourceEdgeRowChecker> row_checkers;
             for (const RunRef & run : seal.blob_target_runs)
             {
-                SourceEdgeRunView view = openSourceEdgeRun(op, run.key);
-                SourceEdgeRecord rec;
-                while (view.next(rec))
-                    if (rec.marker == RunMarker::Condemned)
-                        rows.push_back(InheritedRow{.ref = rec.ref, .token = rec.token, .pending = rec.delete_pending});
-                view.verifyAgainst(run.checksum);
+                try
+                {
+                    SourceEdgeRunView view = openSourceEdgeRun(op, run.key);
+                    SourceEdgeRowChecker & row_checker = row_checkers[run.shard];
+                    SourceEdgeRecord rec;
+                    while (view.next(rec))
+                    {
+                        row_checker.check(rec);
+                        if (rec.marker == RunMarker::Condemned)
+                            rows.push_back(InheritedRow{.ref = rec.ref, .token = rec.token, .pending = rec.delete_pending});
+                    }
+                    view.verifyAgainst(run.checksum);
+                }
+                catch (Exception & e)
+                {
+                    if (e.code() != ErrorCodes::CORRUPTED_DATA)
+                        throw;
+                    e.addMessage("M3: GC of this build refuses the source-edge run `{}` of the fold seal that gc/state adopts. The run "
+                        "stopped before any intent and before the floor", run.key);
+                    throw;
+                }
             }
         }
         size_t pending = 0;

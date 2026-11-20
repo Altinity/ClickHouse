@@ -48,9 +48,9 @@ struct CopySource
 };
 
 /// Throws `NO_REPLICA_HAS_PART`, the code of an unconfirmed relink source, for a copy into `destination` whose
-/// source `CachedPartFolderAccess::confirmCopySource` did not confirm. The replication queue and mutations retry
-/// it; a user statement returns it to the client.
-[[noreturn]] void throwCopySourceUnconfirmed(const CopySource & source, const PartRefKey & destination);
+/// source `CachedPartFolderAccess::confirmCopySource` answered `answer`, `No` or `Unknown`; the message says which.
+/// The replication queue and mutations retry it; a user statement returns it to the client.
+[[noreturn]] void throwCopySourceUnconfirmed(const CopySource & source, const PartRefKey & destination, ConfirmAnswer answer);
 
 /// Exact record of what one commit-shaped primitive (`promoteBuild`/`repointRef`) durably committed,
 /// derived INSIDE the primitive's own `appendRefOps` builder rather than read back with a separate
@@ -307,10 +307,10 @@ public:
     /// their bodies asks this after its own precommit is durable and before its promote: a match in the
     /// committed map alone could be a drop that is durable but not yet applied. Loads the source table first
     /// if it is not resident (`Pool::resolveRef`), then sends one mount-slot read when the ledger confirms.
-    /// False is a refusal: the source is not, or cannot be shown to be, the current binding. A failure of either
-    /// read propagates. Waits for the source table's state lock (`ConfirmLockMode::Wait`). Call it with no ledger
-    /// lock held.
-    bool confirmCopySource(const CopySource & source) const;
+    /// Anything but `Yes` is a refusal: `No` when the source is not the current binding, `Unknown` when it cannot be
+    /// shown to be. A failure of either read propagates. Waits for the source table's state lock
+    /// (`ConfirmLockMode::Wait`) up to the mount's request window. Call it with no ledger lock held.
+    ConfirmAnswer confirmCopySource(const CopySource & source) const;
     /// Moves a committed ref by publishing the source entries at `dst` and then dropping `src` only
     /// while it still names the republished manifest. Returns false when the source is absent; a
     /// pre-existing destination with different content is rejected rather than silently discarding the
