@@ -59,10 +59,10 @@ blobs. `object_kind` is `blob`, `object_hash` is the blob's hash and `round` is 
 
 | `event_type` | `outcome` | Meaning |
 |---|---|---|
-| `blob_intent_delete` | `deleted` | An intent was removed after the incarnation it names was gone from the key. `detail['key']` is the intent's key; `token` is the incarnation |
+| `blob_intent_delete` | `deleted` | An intent was removed after the incarnation it names was gone from the key; when the blob was referenced again and its body had another incarnation, `reason` says so. `detail['key']` is the intent's key; `token` is the incarnation |
 | `blob_intent_adopt` | `candidate` or `standing` | The sweep gave a row to an intent that had none. `candidate`: the body shows the intent's token; `standing`: the body is absent or has another token. `detail['key']` is the intent's key |
 | `gc_recheck_verdict` | `standing` | A `pending` row moved to `standing` after its body delete was answered or the body was absent |
-| `corrupt_decode` | `carried` | `GC` met a blob body shorter than the pool's blob envelope, and recorded nothing for it. `detail` carries `key`, `size` and `envelope` |
+| `corrupt_decode` | `carried` or `spared` | `GC` met a blob body shorter than the pool's blob envelope, and recorded nothing for it. `spared`: the blob is referenced again, so its row was dropped and its intent kept. `detail` carries `key`, `size` and `envelope` |
 
 ## Example {#example}
 

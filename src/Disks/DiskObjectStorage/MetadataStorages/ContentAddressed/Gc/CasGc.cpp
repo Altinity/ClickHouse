@@ -54,6 +54,7 @@ namespace ProfileEvents
     extern const Event CASGCIntentConfirmedExisting;
     extern const Event CASGCIntentUnconfirmedCarry;
     extern const Event CASGCIntentDeleted;
+    extern const Event CASGCIntentDeletedOnSpare;
     extern const Event CASGCUndecodableBlobBody;
     extern const Event CASGCEnumerationPages;
     extern const Event CASGCRefWalkPlansBuilt;
@@ -1168,13 +1169,20 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         uint64_t uncanonical_tokens = 0;
         uint64_t standing_anomalies = 0;
         uint64_t undecodable_bodies = 0;
+        uint64_t undecodable_spares = 0;
         String unconfirmed_example;
         String undecodable_example;
+        String undecodable_spare_example;
         String uncanonical_example;
         String standing_anomaly_example;
         for (const RetiredMergeResult & merge : folded.retired_merge)
-        {
             intent_deletes.insert(intent_deletes.end(), merge.intent_deletes.begin(), merge.intent_deletes.end());
+        /// The spares' deletes share the batch and are the tail of it from here on.
+        const size_t first_spare_delete = intent_deletes.size();
+        for (const RetiredMergeResult & merge : folded.retired_merge)
+            intent_deletes.insert(intent_deletes.end(), merge.spare_intent_deletes.begin(), merge.spare_intent_deletes.end());
+        for (const RetiredMergeResult & merge : folded.retired_merge)
+        {
             unconfirmed_creates += merge.unconfirmed_creates;
             uncanonical_tokens += merge.uncanonical_tokens;
             standing_anomalies += merge.standing_anomalies;
@@ -1183,6 +1191,9 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             undecodable_bodies += merge.undecodable_bodies;
             if (undecodable_example.empty())
                 undecodable_example = merge.undecodable_example;
+            undecodable_spares += merge.undecodable_spares;
+            if (undecodable_spare_example.empty())
+                undecodable_spare_example = merge.undecodable_spare_example;
             if (uncanonical_example.empty())
                 uncanonical_example = merge.uncanonical_example;
             if (standing_anomaly_example.empty())
@@ -1192,9 +1203,11 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         {
             sendIntentDeletes(op, intent_deletes);
             ProfileEvents::increment(ProfileEvents::CASGCIntentDeleted, intent_deletes.size());
-            for (const WriteOnceKey & key : intent_deletes)
+            ProfileEvents::increment(ProfileEvents::CASGCIntentDeletedOnSpare, intent_deletes.size() - first_spare_delete);
+            for (size_t i = 0; i < intent_deletes.size(); ++i)
                 EventEmitter{*store}.emit([&](CasEvent & e)
                 {
+                    const WriteOnceKey & key = intent_deletes[i];
                     e.type = CasEventType::BlobIntentDelete;
                     e.object_kind = CasEventObjectKind::Blob;
                     if (const auto parsed = layout.parseBlobIntentKey(key.str()))
@@ -1206,7 +1219,10 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                     e.round = new_round;
                     e.gen = generation;
                     e.outcome = "deleted";
-                    e.reason = "the incarnation the intent names is gone from the key; the deletion intent is removed";
+                    e.reason = i >= first_spare_delete
+                        ? "the blob is referenced again and its body has another incarnation than the intent names; the "
+                          "deletion intent is removed"
+                        : "the incarnation the intent names is gone from the key; the deletion intent is removed";
                     e.detail = {{"key", key.str()}};
                 });
         }
@@ -1227,6 +1243,11 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             LOG_ERROR(logger,
                 "CAS gc: {} blob bodies this round are shorter than the pool's blob envelope; GC recorded no row for "
                 "them, carried their rows and deleted nothing. First: `{}`", undecodable_bodies, undecodable_example);
+        if (undecodable_spares)
+            LOG_ERROR(logger,
+                "CAS gc: {} blob bodies of spared rows this round are shorter than the pool's blob envelope; GC dropped "
+                "their rows, kept their intents and deleted nothing. First: `{}`", undecodable_spares,
+                undecodable_spare_example);
     }
 
     /// Outcome logs: write-once + byte-adopt (observation-bearing HEAD tokens — never the
@@ -2199,7 +2220,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     /// A body shorter than the pool's envelope is not a blob GC can account for: counted and recorded, and the
     /// fold neither condemns, adopts nor deletes it, so one bad object cannot stop every round.
     const uint64_t blob_header_len = store->poolMeta().blob_header_len;
-    const auto undecodableHead = [&](const BlobRef & ref, const Meta & observed) -> BlobHead
+    const auto undecodableHead = [&](const BlobRef & ref, const Meta & observed, bool spared) -> BlobHead
     {
         ProfileEvents::increment(ProfileEvents::CASGCUndecodableBlobBody);
         EventEmitter{*store}.emit([&](CasEvent & e)
@@ -2210,20 +2231,23 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
             e.token = observed.etag.render();
             e.round = condemn_round;
             e.gen = state.snap_generation + 1;
-            e.outcome = "carried";
-            e.reason = "the body is shorter than the pool's blob envelope; GC neither condemns nor deletes it";
+            e.outcome = spared ? "spared" : "carried";
+            e.reason = spared
+                ? "the body is shorter than the pool's blob envelope; the blob is referenced again, so GC drops its row, "
+                  "keeps its intent and deletes nothing"
+                : "the body is shorter than the pool's blob envelope; GC neither condemns nor deletes it";
             e.detail = {{"key", layout.blobKey(ref)}, {"size", std::to_string(observed.size)},
                         {"envelope", std::to_string(blob_header_len)}};
         });
         return BlobHead::undecodableBody();
     };
     /// GC accounts a blob by its payload size, without the pool's envelope.
-    const auto blobHeadOf = [&](const BlobRef & ref, std::optional<Meta> observed) -> BlobHead
+    const auto blobHeadOf = [&](const BlobRef & ref, std::optional<Meta> observed, bool spared = false) -> BlobHead
     {
         if (!observed)
             return std::nullopt;
         if (observed->size < blob_header_len)
-            return undecodableHead(ref, *observed);
+            return undecodableHead(ref, *observed, spared);
         observed->size -= blob_header_len;
         return std::move(*observed);
     };
@@ -2283,6 +2307,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
 
     /// Blob keys of pending rows whose `HEAD` is hinted and not yet taken.
     std::unordered_set<String> pending_head_reserved;
+    /// Blob keys of spared rows whose `HEAD` is hinted and not yet taken.
+    std::unordered_set<String> spare_head_reserved;
     /// The pending row whose redelete slot the fold has taken and whose `HEAD` it takes next.
     std::optional<String> settling_pending_head;
 
@@ -2306,6 +2332,25 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
                 "CAS gc: the HEAD before the pending delete of blob {} (key `{}`) failed; the round fails before its "
                 "commit and the row stays pending: {}",
                 blobIdOf(ref), key, getCurrentExceptionMessage(false));
+            throw;
+        }
+    };
+
+    /// The `HEAD` of a spared row, sent in the merge, so after the round's cut. Only an answer of this round may
+    /// show that the row's token is gone: one read earlier can predate the body the row names.
+    const auto spare_head = [&](const BlobRef & ref) -> BlobHead
+    {
+        const String key = layout.blobKey(ref);
+        spare_head_reserved.erase(key);
+        try
+        {
+            return blobHeadOf(ref, reads.takeHead(key), /*spared*/ true);
+        }
+        catch (...)
+        {
+            LOG_WARNING(logger,
+                "CAS gc: the HEAD of spared blob {} (key `{}`) failed; the round fails before its commit and the row "
+                "keeps its state: {}", blobIdOf(ref), key, getCurrentExceptionMessage(false));
             throw;
         }
     };
@@ -3513,7 +3558,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         }
         return s;
     };
-    /// The parent seal's summary for a shard, used ONLY for the pure-carry DECISION (condemned_total==0).
+    /// The parent seal's summary for a shard, used for the pure-carry DECISION (condemned_total==0) and to skip the
+    /// condemned-row read-ahead sets when no parent row is pending, which costs read-ahead only.
     /// Missing => zero: a fresh pool has no parent entry (correct baseline), and a snap_generation>0 seal
     /// that is missing an entry we would pure-carry fails closed inside `carryParentRefs` when it copies.
     auto summaryOfParent = [&](uint64_t shard) -> CondemnedSummary
@@ -3734,7 +3780,14 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     /// the sweep, and a retirement is a removal like any other. The round's cut is frozen well before
     /// this point -- intake has finished and `deltas` has taken its final form -- so no HEAD is issued
     /// before the round knows what it folded.
+    ///
+    /// The two sets below steer the condemned-row read-ahead and are disjoint. They stay empty when nothing reads
+    /// them: on the sequential setting, in a suppressed round, and when no parent row is `pending` or `standing`.
+    /// Blobs touched only by removals: their rows may be decided inline at zero.
     std::set<BlobRef> touched_blobs;
+    /// Blobs that end this merge with a reference, from an activation that is the last verdict at its key; their
+    /// rows are spared.
+    std::set<BlobRef> referenced_blobs;
     {
         std::map<std::pair<BlobRef, UInt128>, bool> last_verdict_is_remove;
         for (const BlobDelta & delta : deltas)
@@ -3745,15 +3798,21 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         std::set<BlobRef> removed;
         std::set<BlobRef> surviving_add;
         for (const auto & [edge, is_remove] : last_verdict_is_remove)
-        {
-            /// Only the pending-row read-ahead reads the set; the sequential setting has none.
-            if (reads.window() > 0)
-                touched_blobs.insert(edge.first);
             (is_remove ? removed : surviving_add).insert(edge.first);
-        }
+        bool parent_has_pending_rows = false;
+        for (uint64_t shard = 0; shard < state.gc_shards; ++shard)
+            parent_has_pending_rows = parent_has_pending_rows || summaryOfParent(shard).pending_total != 0;
+        const bool keep_read_ahead_sets = reads.window() > 0 && !suppress_destructive && parent_has_pending_rows;
         for (const BlobRef & ref : removed)
-            if (!surviving_add.contains(ref))
-                head_candidates[blobShard(ref, state.gc_shards)].push_back(ref);
+        {
+            if (surviving_add.contains(ref))
+                continue;
+            head_candidates[blobShard(ref, state.gc_shards)].push_back(ref);
+            if (keep_read_ahead_sets)
+                touched_blobs.insert(ref);
+        }
+        if (keep_read_ahead_sets)
+            referenced_blobs = std::move(surviving_add);
     }
 
     /// Pending-row read-ahead: hints the body `HEAD` of an untouched pending row while the redelete budget and the
@@ -3766,7 +3825,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     const auto offerPendingHead = [&](const BlobRef & ref)
     {
         /// A touched row may be spared or superseded inline; reserving past it would let later rows take its slot.
-        if (touched_blobs.contains(ref))
+        if (touched_blobs.contains(ref) || referenced_blobs.contains(ref))
             return false;
         const String key = layout.blobKey(ref);
         if (key == settling_pending_head || pending_head_reserved.contains(key))
@@ -3780,18 +3839,45 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         pending_head_reserved.insert(key);
         return true;
     };
+    /// A spared row takes no redelete slot, so the scan goes on past it.
+    const auto offerSpareHead = [&](const BlobRef & ref, const CondemnedRow & row)
+    {
+        if (!row.token.canonical())
+            return true;
+        const String key = layout.blobKey(ref);
+        if (spare_head_reserved.contains(key))
+            return true;
+        if (reads.pendingHeads() >= reads.window())
+            return false;
+        reads.hintHead(key);
+        spare_head_reserved.insert(key);
+        return true;
+    };
     const PendingHeadHints pending_head_hints{
         .offer = [&](const BlobRef & ref, const CondemnedRow & row)
         {
-            if (suppress_destructive || !row.delete_pending || row.standing)
+            if (suppress_destructive || !row.delete_pending)
+                return true;
+            if (referenced_blobs.contains(ref))
+                return offerSpareHead(ref, row);
+            if (row.standing)
                 return true;
             return offerPendingHead(ref);
         },
+        /// The settling row's `HEAD` goes to the pool before the scan hints the rows behind it: sent inline beside a
+        /// full pool, it would be one request over `gc_io_concurrency`.
         .take_pending = [&](const BlobRef & ref)
         {
             const String key = layout.blobKey(ref);
-            pending_head_reserved.erase(key);
+            if (pending_head_reserved.erase(key) == 0)
+                reads.hintHead(key);
             settling_pending_head = key;
+        },
+        .take_spare = [&](const BlobRef & ref)
+        {
+            const String key = layout.blobKey(ref);
+            if (spare_head_reserved.insert(key).second)
+                reads.hintHead(key);
         }};
     const PendingHeadHints * pending_hints = reads.window() > 0 ? &pending_head_hints : nullptr;
     /// A reservation left after a shard's merge belongs to no settlement.
@@ -3800,6 +3886,9 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         for (const String & key : pending_head_reserved)
             reads.discardHead(key);
         pending_head_reserved.clear();
+        for (const String & key : spare_head_reserved)
+            reads.discardHead(key);
+        spare_head_reserved.clear();
     };
 
     /// A nomination alone does not take a shard off the pure carry, or an idle pool with one intent left over a
@@ -3861,7 +3950,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
             create_intent,
             &result.retired_merge[shard], suppress_destructive,
             &ledger.applied, std::move(retirement_buckets[shard]),
-            &work_budget, pending_hints, pending_head, std::move(intent_nominations[shard]));
+            &work_budget, pending_hints, pending_head, std::move(intent_nominations[shard]), spare_head);
         discardReservedReads();
         for (RunRef & r : shard_runs)
             result.fold_seal.blob_target_runs.push_back(std::move(r));
@@ -3915,6 +4004,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         reduce_timer->metric("shards_pure_carry", shards_pure_carry);
         reduce_timer->metric("shards_reduced", state.gc_shards - shards_pure_carry);
         reduce_timer->metric("nominations_waiting", nominations_waiting);
+        reduce_timer->metric("read_ahead_blobs", touched_blobs.size() + referenced_blobs.size());
         reduce_timer->metric("deltas_in", deltas_in);
         reduce_timer->metric("runs_written", result.fold_seal.blob_target_runs.size());
         reduce_timer->metric("condemned", report.condemned - condemned_before);

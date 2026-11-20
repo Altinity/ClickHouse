@@ -700,23 +700,8 @@ TEST(CASGcRedeleteHead, BodyReplacedAfterTheDeleteHeadIsKeptByTheTokenCondition)
     EXPECT_TRUE(exists(*backend, blobKeyOf(*store, replaced)));
 }
 
-namespace
-{
-
-/// The blob numbers of `count` blobs in the order their rows sit in one shard's run.
-std::vector<uint64_t> blobsInRunOrder(uint64_t count)
-{
-    std::vector<uint64_t> blobs;
-    for (uint64_t b = 1; b <= count; ++b)
-        blobs.push_back(b);
-    std::sort(blobs.begin(), blobs.end(), [](uint64_t a, uint64_t b) { return blobRefOf(a) < blobRefOf(b); });
-    return blobs;
-}
-
-}
-
 /// The settling row's slot is counted once: with the window smaller than the redelete budget, every `HEAD`
-/// within the budget is read ahead except the first row's, which settles before any scan reaches it.
+/// within the budget goes to the pool, the first row's included.
 TEST(CASGcRedeleteHead, ReadAheadFillsTheRedeleteBudget)
 {
     constexpr uint64_t blobs = 12;
@@ -736,7 +721,7 @@ TEST(CASGcRedeleteHead, ReadAheadFillsTheRedeleteBudget)
     for (const auto & [key, verbs] : blobVerbs(backend->journal(), blobKeys(*store, blobs)))
         heads += std::count(verbs.begin(), verbs.end(), JournalVerb::Head);
     EXPECT_EQ(heads, budget) << "no HEAD past the budget";
-    EXPECT_EQ(backend->inlineHeads(blobKeys(*store, blobs)), std::vector<String>{blobKeyOf(*store, blobsInRunOrder(blobs).front())})
-        << "a HEAD within the budget was not read ahead";
+    EXPECT_EQ(backend->inlineHeads(blobKeys(*store, blobs)), std::vector<String>{})
+        << "a HEAD within the budget was sent inline";
 }
 

@@ -124,17 +124,21 @@ struct CondemnedRow
 /// The condemned fields of a `RunMarker::Condemned` record.
 CondemnedRow condemnedRowOf(const SourceEdgeRecord & rec);
 
-/// Look-ahead for the body `HEAD` of pending rows, supplied by the GC round. The fold still decides on the
-/// value it takes; only the moment of the fetch moves.
+/// Look-ahead for the body `HEAD` of pending rows and the `HEAD` of spared rows, supplied by the GC round. The fold
+/// still decides on the value it takes; only the moment of the fetch moves.
 struct PendingHeadHints
 {
-    /// Reserves and hints the body `HEAD` of a later pending row. Skips a row whose body delete will not run. False:
-    /// the window is full, or the row's blob was touched this round and must be decided inline; the scan stops and
-    /// offers the row again later.
+    /// Reserves and hints the `HEAD` of a later row: the body `HEAD` of a pending row, or the spare `HEAD` of a row
+    /// whose blob gains a reference this round. Skips a row that needs neither. False: the window is full, or the
+    /// row's blob was touched this round and may be decided inline at zero; the scan stops and offers the row again
+    /// later.
     std::function<bool(const BlobRef &, const CondemnedRow &)> offer;
     /// Called after the fold takes a pending row's redelete slot and before it scans ahead: the row's own
     /// reservation is released and the row is not hinted again, so its slot is counted once.
     std::function<void(const BlobRef &)> take_pending;
+    /// Called before the fold scans ahead of a spared row. Like `take_pending`, it sends the row's own `HEAD` to the
+    /// pool if no scan hinted it, so it counts against `gc_io_concurrency`.
+    std::function<void(const BlobRef &)> take_spare;
 };
 
 /// Rows the merge decodes ahead of its position to find pending rows. Bounds memory, not requests.
@@ -272,10 +276,12 @@ struct RetiredMergeResult
 {
     std::vector<RetiredEntry> still_retired;   /// every row the output run holds, in run order
     std::vector<RetiredEntry> confirmed;       /// rows this pass wrote `pending` after a confirmed intent create
-    std::vector<RetiredEntry> spared;          /// in-degree above zero: row dropped, its intent stays
+    std::vector<RetiredEntry> spared;          /// in-degree above zero: row dropped
     std::vector<BodyDelete> body_deletes;      /// rows written `standing` whose body the caller deletes before the commit
     std::vector<RetiredEntry> to_standing;     /// rows this pass moved to `standing`: body delete sent, or body absent
     std::vector<WriteOnceKey> intent_deletes;  /// intents of incarnations observed gone; the caller deletes them before the commit
+    /// Of `spared`, the intents whose `HEAD` showed another incarnation; deleted in the same batch as `intent_deletes`.
+    std::vector<WriteOnceKey> spare_intent_deletes;
     std::vector<ReplacedEntry> replaced;  /// rows moved to the incarnation now at their key; caller emits blob_retire_replaced
     std::vector<RetiredEntry> adopted;    /// rows this pass wrote for nominated intents that had no row
     /// Intent creates that were sent and not confirmed; the row stays a candidate. One example for the caller's ERROR.
@@ -291,6 +297,9 @@ struct RetiredMergeResult
     /// deleted. The first blob key, for the caller's ERROR.
     uint64_t undecodable_bodies = 0;
     String undecodable_example;
+    /// Such bodies at spared rows: the row is dropped, its intent kept, nothing deleted.
+    uint64_t undecodable_spares = 0;
+    String undecodable_spare_example;
 
     /// Count of `remove == true` deltas that matched no presence for their `(BlobRef, source_id)` key —
     /// neither the prior run nor an earlier delta in the same `scattered` batch had activated it. The
@@ -449,14 +458,17 @@ struct GcRoundWorkBudget
 ///   - a touched key at zero takes its `HEAD` from `head_blob` (no row: a fresh transition) or `peek_head` (a
 ///     row), for every rule of that row in this pass;
 ///   - an untouched pending row at zero whose body delete may run takes it from `pending_head`;
+///   - a spared `pending` or `standing` row whose token canonicalises, in an unsuppressed round, takes it from
+///     `spare_head`;
 ///   - no other row needs a `HEAD`.
 /// A row minted in this pass is written as decided and gets no second decision. A hook that is unset makes the
-/// rows that need it carry unchanged, and a fresh transition without `head_blob` records nothing. Creates go
-/// through `create_intent`, one per row, each charging `work_budget`'s create slot when it is sent; up to its
+/// rows that need it carry unchanged, a spared row is dropped instead, and a fresh transition without `head_blob`
+/// records nothing. Creates go through `create_intent`, one per row, each charging `work_budget`'s create slot when
+/// it is sent; up to its
 /// window of them are outstanding while the merge goes on, and the run is written in order once each row's own
 /// answer is in. Without `create_intent` no create is sent. A create that throws fails the fold. With
 /// `suppress_destructive` no body or intent delete is decided.
-/// `pending_hints`, when set, lets the merge hint the body `HEAD`s of later pending rows of the open segment.
+/// `pending_hints`, when set, lets the merge hint the `HEAD`s of later pending and spared rows of the open segment.
 /// `intent_nominations` are listed intents of this shard. They visit their key without touching it, and are adopted
 /// after the key's own rules: a key with no row in the prior run, none from this pass, at zero, gets a row from
 /// `peek_head` for the first nomination of the key: `candidate(t)` when the body shows the intent's token `t`,
@@ -488,7 +500,8 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
                               GcRoundWorkBudget * work_budget = nullptr,
                               const PendingHeadHints * pending_hints = nullptr,
                               const BlobHeadFn & pending_head = {},
-                              std::vector<Layout::ParsedBlobIntentKey> intent_nominations = {});
+                              std::vector<Layout::ParsedBlobIntentKey> intent_nominations = {},
+                              const BlobHeadFn & spare_head = {});
 
 /// Stream the sealed in-degree runs named by `runs` (the current seal's `blob_target_runs` filtered to one
 /// shard) and return every blob written at in-degree 0 (the candidates that transitioned to zero). An

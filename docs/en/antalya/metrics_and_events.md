@@ -291,7 +291,8 @@ decisions that read them. The four `CASBlobIntent*` counters count requests on `
 | `CASGCIntentConfirmedExisting` | `Number` | Number of CAS deletion-intent creates the GC confirmed by finding the record already present. |
 | `CASGCIntentCreated` | `Number` | Number of CAS deletion intents whose create the GC confirmed by an answered success, or by reading the record after an unanswered attempt. |
 | `CASGCIntentDeleted` | `Number` | Number of CAS deletion intents the GC deleted after their blob body was gone or replaced. |
-| `CASGCIntentLeftOnSpare` | `Number` | Number of CAS GC rows dropped because the blob was referenced again; the deletion intent stays for a later round to adopt. |
+| `CASGCIntentLeftOnSpare` | `Number` | Number of CAS GC rows dropped because the blob was referenced again whose deletion intent stays for a later round to adopt. An intent deleted at the spare is counted in `CASGCIntentDeletedOnSpare` instead. |
+| `CASGCIntentDeletedOnSpare` | `Number` | Number of CAS deletion intents the GC deleted when the blob was referenced again and its `HEAD` showed another incarnation than the row's. Included in `CASGCIntentDeleted`. |
 | `CASGCIntentStandingAnomaly` | `Number` | Number of CAS GC `standing` rows whose decision `HEAD` showed their own token again after their body delete was answered. The row is carried and nothing is deleted. |
 | `CASGCIntentTokenRejected` | `Number` | Number of CAS GC blob observations whose token names no incarnation, so no deletion intent can be keyed by it. Such a body is never deleted by the GC. |
 | `CASGCIntentUnconfirmedCarry` | `Number` | Number of CAS deletion-intent creates the GC could not confirm; the blob stays a candidate and is retried in a later round. Sustained growth indicates object storage errors or foreign bytes at an intent key. |

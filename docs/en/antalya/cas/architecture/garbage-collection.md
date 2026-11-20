@@ -406,7 +406,8 @@ Recomputes the per-shard in-degree snapshot and computes the round's single dest
 - **Observability:** phase row `fold_reduce`; metrics `shards_reduced` / `shards_pure_carry`,
   `condemned`, `intent_confirmed` (rows committed `pending` this round), `spared`, `body_deletes_decided` (body
   deletes decided), `adopted` (orphan intents given a row), `nominations_waiting` (nominated intents of a
-  shard that stayed a pure carry), `suppress_destructive`, `frontier_complete`
+  shard that stayed a pure carry), `read_ahead_blobs` (blobs held to read row `HEAD`s ahead),
+  `suppress_destructive`, `frontier_complete`
 
 `suppress_destructive` is true on any recorded anomaly, any hold in the seal about to be made
 durable, or an incomplete frontier (`frontier_proven ≠ frontier_namespaces`, a universe neither
@@ -756,14 +757,14 @@ flowchart LR
     B -->|"not confirmed, or over budget"| C["row candidate(t), create again next round"]
     C --> B
     P --> D{"round n+1: cut"}
-    D -->|"a reference"| S["row dropped, intent stays"]
+    D -->|"a reference: HEAD"| S["row dropped<br/>DELETE I(B,t) only if the body has another token u"]
     D -->|"still zero: HEAD"| E{"body now?"}
     E -->|"token t"| F["DELETE body If-Match t<br/>row standing(t)"]
     E -->|"absent"| F2["no body request<br/>row standing(t)"]
     E -->|"another token u"| T["PUT intent I(B,u), DELETE I(B,t)<br/>row pending(u)"]
     F --> G{"round n+2: cut taken after the standing commit"}
     F2 --> G
-    G -->|"a reference"| S
+    G -->|"a reference: HEAD"| S
     G -->|"still zero"| H["DELETE intent I(B,t)<br/>row dropped"]
 ```
 
@@ -773,7 +774,8 @@ flowchart LR
 | after `n` (`candidate`) | still zero | the intent `PUT` again | `pending(t)` or still `candidate(t)` |
 | after `n` (`pending`) | still zero | `HEAD`; `DELETE` of the body with `If-Match` on the token the `HEAD` showed | `standing(t)` |
 | after the body delete (`standing`) | still zero | `DELETE` of the intent | dropped |
-| any | a reference | nothing | dropped; the intent stays |
+| `candidate` | a reference | nothing | dropped; an intent stays |
+| `pending` or `standing` | a reference | `HEAD`; intent `DELETE` for `t` when it shows another token `u` | dropped; the intent stays otherwise |
 | any, the `HEAD` shows another token `u` | still zero | intent `PUT` for `u`, intent `DELETE` for `t` | `pending(u)` or `candidate(u)`, in one commit |
 
 A create is **confirmed** when it answered success, or when the intent was already there with exactly
@@ -793,8 +795,20 @@ A `candidate` whose decision `HEAD` shows no body is dropped without a create: t
 an intent that an earlier attempt left over is an [orphan](#orphan-intents).
 
 Why each step is safe against a concurrent writer is shown in
-[the writer-versus-GC race](/antalya/cas/architecture/blob-protocol#writer-gc-race). A blob referenced again keeps
-its intent, which is handled as an [orphan](#orphan-intents) when the blob reaches zero again.
+[the writer-versus-GC race](/antalya/cas/architecture/blob-protocol#writer-gc-race).
+
+A blob referenced again loses its row. For a `pending` or `standing` row the round sends a `HEAD` of the body after
+its cut, on the I/O pool, up to `cas_gc_io_concurrency` at a time:
+
+- Another token `u`: a writer that met the intent replaced `t`, so `t` cannot come back. The intent of `t` is
+  deleted with the round's other intent deletes, counted in `CASGCIntentDeletedOnSpare`.
+- The token `t`, an absent body, a token with no canonical form, or a body `GC` cannot decode: the intent stays,
+  counted in `CASGCIntentLeftOnSpare`, and is handled as an [orphan](#orphan-intents) when the blob reaches zero
+  again. An absent body never removes the intent: a writer that saw `t` may not have read the intent yet.
+
+A `candidate` row, a row whose token has no canonical form, and any row in a round that suppresses destruction get
+no `HEAD`. A `HEAD` or intent `DELETE` without an answer fails the round before its commit, and the row keeps its
+state.
 
 A blob whose in-degree reaches zero in round `n` gets its intent in round `n`, loses its body in round
 `n+1` at the earliest, and loses its intent in round `n+2` at the earliest. A reference folded in any of
@@ -807,7 +821,7 @@ gets no intent and no row: `GC` records nothing for it and never deletes it, and
 ### Orphan intents {#orphan-intents}
 
 An intent can exist with no row: a leader died between the create and its commit, a blob was
-referenced again after a round condemned it (the row was dropped, the intent stayed), or a rebuild
+referenced again after a round condemned it (the row was dropped and the intent kept), or a rebuild
 cleared the state. Each round that does not suppress destruction lists one page of `blob-intents/` from
 `intent_sweep_cursor` (phase 9) and gives the nominated blobs a row:
 
@@ -840,12 +854,14 @@ A blob body shorter than the pool's blob envelope cannot be read for its size. `
 let one such object stop every round:
 
 - at a key with no row, it creates none and takes no decision;
-- at a key with a row, it carries the row unchanged and deletes nothing;
+- at a key with a row, it carries the row unchanged and deletes nothing; a row of a blob referenced again is
+  dropped, as every such row is, and its intent stays;
 - under an orphan intent, it adopts nothing, and the sweep cursor moves on.
 
 Each one is counted in `CASGCUndecodableBlobBody`, logged as an error naming the blob's key (the first key of the
 round and the count), and written to `system.cas_log` as a `corrupt_decode` event with `object_kind` `blob`, `outcome`
-`carried` and the key, size and envelope size in `detail`. `GC` never reclaims such an object: it stays until an
+`carried` and the key, size and envelope size in `detail`. At a row of a blob referenced again, the outcome is
+`spared` and the error line says the rows were dropped. `GC` never reclaims such an object: it stays until an
 operator removes it, and the key is in the log line and in the event.
 
 ## Sharding {#sharding}
@@ -897,10 +913,10 @@ logs:
 | `GET` ref logs | 1 per new log record, one successor probe per walked namespace, plus `_ckpt` reads |
 | `GET` manifests | 1 per folded owner (manifest) edge — a manifest emits many blob edges but is read once per edge event; no manifest-body cache within a round |
 | `PUT` run segments | 1 per non-pure-carry shard, plus 1 fold seal |
-| `HEAD` blobs | 1 per blob that reached zero, per `pending` row at zero, per transition, and per adopted orphan |
+| `HEAD` blobs | 1 per blob that reached zero, per `pending` row at zero, per transition, per adopted orphan, and per `pending` or `standing` row of a blob referenced again |
 | Intent `PUT` (`If-None-Match`) | 1 per blob condemned, per `candidate` retried and per transition, up to `cas_gc_round_intent_create_budget`; plus 1 `GET` when the intent already exists |
 | Blob body `DELETE` | 1 per `pending` row whose `HEAD` still shows its token, up to `cas_gc_round_redelete_budget` |
-| Intent `DELETE` | 1 per `standing` row at zero and per transition, in batch requests of up to `cas_gc_bulk_delete_chunk_keys` keys |
+| Intent `DELETE` | 1 per `standing` row at zero, per transition, and per row of a blob referenced again whose `HEAD` shows another token, in batch requests of up to `cas_gc_bulk_delete_chunk_keys` keys |
 | `LIST blob-intents/` | 1 page per round whose destruction is not suppressed |
 | Successful lease `CAS gc/state` | 1 |
 | Commit `CAS gc/state` | 1 |
@@ -1046,7 +1062,7 @@ No writes.
 | Key | Operation | Requests |
 |---|---|---:|
 | referenced parent run segments | streaming `GET` | one per referenced run |
-| `<pool_prefix>/blobs/...` | `HEAD` | one per blob that reached zero, plus one per touched row at zero, per `pending` row whose body delete may run, and per adopted orphan |
+| `<pool_prefix>/blobs/...` | `HEAD` | one per blob that reached zero, plus one per touched row at zero, per `pending` row whose body delete may run, per adopted orphan, and per `pending` or `standing` row of a blob referenced again (none under `suppress_destructive`) |
 | `<pool_prefix>/blob-intents/...` | `PUT` (`If-None-Match`) | one per intent created: a blob that reached zero, a `candidate` retried, a transition to a new token (≤ `cas_gc_round_intent_create_budget`); a `GET` follows when the key already exists |
 | new run segments | `PUT` | one per written run |
 | `<pool_prefix>/cas/manifests/` | `LIST` | one bounded page, only when orphan planning runs |
@@ -1068,7 +1084,7 @@ No `CAS`.
 | Key | Operation | Requests |
 |---|---|---:|
 | blob body | conditional `DELETE` | one per `pending` row whose `HEAD` in phase 10 still showed its token (≤ `cas_gc_round_redelete_budget`) |
-| `<pool_prefix>/blob-intents/...` | `DELETE` | one key per `standing` row at zero and per transition; batch requests of up to `cas_gc_bulk_delete_chunk_keys` keys |
+| `<pool_prefix>/blob-intents/...` | `DELETE` | one key per `standing` row at zero, per transition, and per row of a blob referenced again whose `HEAD` in phase 10 showed another token; batch requests of up to `cas_gc_bulk_delete_chunk_keys` keys |
 | per-shard outcome log | `PUT` | one per shard with at least one budget-admitted delete or spare outcome; a replay adds one byte-compare `GET` |
 
 Under `suppress_destructive` nothing is deleted.
@@ -1147,7 +1163,7 @@ from `Error` so a flaky backend is distinguishable from a broken pool. Every `GC
 `CASGCRetiredBodyDeleted` (body deletes answered), `CASGCClampSuppressedPasses`,
 `CASGCHeartbeatFenceOuts`. The deletion-intent counters are `CASGCIntentCreated`,
 `CASGCIntentConfirmedExisting`, `CASGCIntentUnconfirmedCarry`, `CASGCIntentDeleted`,
-`CASGCIntentLeftOnSpare`, `CASGCIntentAdopted`, `CASGCIntentStandingAnomaly` (a `standing` row whose body is back
+`CASGCIntentLeftOnSpare`, `CASGCIntentDeletedOnSpare`, `CASGCIntentAdopted`, `CASGCIntentStandingAnomaly` (a `standing` row whose body is back
 under its own token; the row is carried and nothing is deleted), `CASGCUndecodableBlobBody` and
 `CASGCIntentTokenRejected`; the request counters
 are `CASBlobIntentGet`, `CASBlobIntentPut`, `CASBlobIntentDelete` and `CASBlobIntentList`.

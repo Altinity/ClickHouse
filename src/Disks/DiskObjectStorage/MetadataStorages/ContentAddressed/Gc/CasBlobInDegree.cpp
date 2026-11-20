@@ -400,7 +400,8 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
                               GcRoundWorkBudget * work_budget,
                               const PendingHeadHints * pending_hints,
                               const BlobHeadFn & pending_head,
-                              std::vector<Layout::ParsedBlobIntentKey> intent_nominations)
+                              std::vector<Layout::ParsedBlobIntentKey> intent_nominations,
+                              const BlobHeadFn & spare_head)
 {
     if (suppress_destructive && !intent_nominations.empty())
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS fold: orphan intent nominations passed to a suppressed round");
@@ -579,14 +580,38 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
         ProfileEvents::increment(ProfileEvents::CASGCIntentTokenRejected);
     };
 
-    /// A body GC cannot decode is never condemned, adopted or deleted: the row, if any, is carried unchanged.
-    auto carryUndecodable = [&](const std::optional<RetiredEntry> & row)
+    auto noteUndecodable = [&]
     {
         ++rmr.undecodable_bodies;
         if (rmr.undecodable_example.empty())
             rmr.undecodable_example = layout.blobKey(cur_blob);
+    };
+
+    /// A body GC cannot decode is never condemned, adopted or deleted: the row, if any, is carried unchanged.
+    auto carryUndecodable = [&](const std::optional<RetiredEntry> & row)
+    {
+        noteUndecodable();
         if (row)
             rmr.still_retired.push_back(*row);
+    };
+
+    /// A spare drops the row and never carries it, so no row sits beside live edges of its blob.
+    auto spareRow = [&](const RetiredEntry & row, const std::optional<CanonicalIdentity> & intent_to_delete)
+    {
+        if (row.delete_pending)
+        {
+            LOG_DEBUG(getLogger("CasGcFold"),
+                "CAS gc fold ({}): {} blob {} (condemned at round {}, observed at round {}) is referenced "
+                "again; the row is dropped and {}", layout.poolPrefix(),
+                row.standing ? "standing" : "pending", blobIdOf(row.ref), row.condemn_round, current_round,
+                intent_to_delete ? "the body has another incarnation, so its intent is deleted" : "its intent stays");
+            ProfileEvents::increment(ProfileEvents::CASGCRetiredSparedByReref);
+            if (intent_to_delete)
+                rmr.spare_intent_deletes.push_back(layout.writeOnceBlobIntentKey(cur_blob, *intent_to_delete));
+            else
+                ProfileEvents::increment(ProfileEvents::CASGCIntentLeftOnSpare);
+        }
+        rmr.spared.push_back(row);
     };
 
     /// Settles the blob being closed: builds the one `IntentRuleInput` from this pass's facts and acts on the
@@ -615,6 +640,31 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
         {
             case DecisionHeadNeed::None:
                 break;
+            case DecisionHeadNeed::Spare:
+            {
+                if (!spare_head)
+                {
+                    spareRow(*row, std::nullopt);
+                    return;
+                }
+                /// Before the take, so the `HEAD`s of the spared rows behind this one are in flight while it waits.
+                if (pending_hints)
+                {
+                    pending_hints->take_spare(cur_blob);
+                    cursor.scanAhead(kPendingHeadLookaheadRows, pending_hints->offer);
+                }
+                const BlobHead observed = spare_head(cur_blob);
+                if (observed.undecodable)
+                {
+                    ++rmr.undecodable_spares;
+                    if (rmr.undecodable_spare_example.empty())
+                        rmr.undecodable_spare_example = layout.blobKey(cur_blob);
+                    spareRow(*row, std::nullopt);
+                    return;
+                }
+                input.head = classifyDecisionHead(row->token, observed.meta);
+                break;
+            }
             case DecisionHeadNeed::TouchedKey:
             {
                 const BlobHeadFn & hook = row ? peek_head : head_blob;
@@ -690,19 +740,7 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
                 return;
             case IntentStep::Drop:
                 if (!input.at_zero)
-                {
-                    if (row->delete_pending)
-                    {
-                        LOG_DEBUG(getLogger("CasGcFold"),
-                            "CAS gc fold ({}): {} blob {} (condemned at round {}, observed at round {}) is referenced "
-                            "again; the row is dropped and its intent stays", layout.poolPrefix(),
-                            row->standing ? "standing" : "pending", blobIdOf(row->ref), row->condemn_round,
-                            current_round);
-                        ProfileEvents::increment(ProfileEvents::CASGCRetiredSparedByReref);
-                        ProfileEvents::increment(ProfileEvents::CASGCIntentLeftOnSpare);
-                    }
-                    rmr.spared.push_back(*row);
-                }
+                    spareRow(*row, decision.intent_to_delete);
                 return;
             case IntentStep::DeleteBody:
             case IntentStep::Standing:

@@ -367,10 +367,11 @@ Dashboards and scripts that read these names need a look.
 | `CASGCRetiredSparedByReref` | Counts a `pending` or `standing` row dropped because a reference returned |
 | `meta_pool_wait` phase of `system.cas_gc_log` | Removed |
 | `intent_sweep_list` phase | New: one `LIST` page of `blob-intents/` per round whose destruction is not suppressed |
-| `CASBlobIntentGet`, `CASBlobIntentPut`, `CASBlobIntentDelete`, `CASBlobIntentList`, `CASGCIntentCreated`, `CASGCIntentConfirmedExisting`, `CASGCIntentUnconfirmedCarry`, `CASGCIntentDeleted`, `CASGCIntentLeftOnSpare`, `CASGCIntentAdopted`, `CASGCIntentTokenRejected`, `CASBlobReuseIntentPresent`, `CASBlobReuseTokenRejected`, `CASBlobPublishDigestMismatch` | New: see [Antalya profile events](/antalya/metrics-and-events#cas-deletion-intents) |
+| `CASBlobIntentGet`, `CASBlobIntentPut`, `CASBlobIntentDelete`, `CASBlobIntentList`, `CASGCIntentCreated`, `CASGCIntentConfirmedExisting`, `CASGCIntentUnconfirmedCarry`, `CASGCIntentDeleted`, `CASGCIntentLeftOnSpare`, `CASGCIntentDeletedOnSpare`, `CASGCIntentAdopted`, `CASGCIntentTokenRejected`, `CASBlobReuseIntentPresent`, `CASBlobReuseTokenRejected`, `CASBlobPublishDigestMismatch` | New: see [Antalya profile events](/antalya/metrics-and-events#cas-deletion-intents) |
 | `CASGCIntentStandingAnomaly`, `CASGCUndecodableBlobBody` | New: a `standing` row whose body is back under its own token, and a body shorter than the blob envelope. Both are logged with the blob's key; see [a body `GC` cannot decode](/antalya/cas/architecture/garbage-collection#undecodable-body) |
 | `system.cas_log` events `blob_intent_adopt`, `blob_intent_delete`, `corrupt_decode` on a blob, and `gc_recheck_verdict` with outcome `standing` | New: see [GC decisions on deletion intents](/operations/system-tables/cas_log#gc-intent-events) |
 | `nominations_waiting` in the `fold_reduce` phase metrics | New: nominated intents left for a later fold |
+| `read_ahead_blobs` in the `fold_reduce` phase metrics | New: blobs the fold holds to read the `HEAD`s of `pending` and `standing` rows ahead |
 
 A server logs a warning at start when `cas_gc_meta_pool_size` or `cas_gc_round_graduation_budget` is set to a value
 other than its default, and logs one line with the pool's reader generation and token dialect at every open of a pool

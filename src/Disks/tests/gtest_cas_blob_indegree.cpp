@@ -1340,7 +1340,8 @@ PendingHeadHints acceptAllHints(std::vector<BlobRef> & offered)
             offered.push_back(ref);
             return true;
         },
-        .take_pending = [](const BlobRef &) {}};
+        .take_pending = [](const BlobRef &) {},
+        .take_spare = [](const BlobRef &) {}};
 }
 
 std::vector<std::pair<UInt128, CondemnedRow>> condemnedRowsOf(const std::vector<BlobRef> & refs)
@@ -1417,7 +1418,8 @@ TEST(CASThreeCursorMerge, ScanAheadStopsAtTheSegmentEnd)
             offered.push_back(ref);
             return true;
         },
-        .take_pending = [](const BlobRef &) {}};
+        .take_pending = [](const BlobRef &) {},
+        .take_spare = [](const BlobRef &) {}};
     std::vector<BlobRef> headed;
     size_t segment_two_opens_at_first_head = 0;
     const BlobHeadFn head = [&](const BlobRef & ref)

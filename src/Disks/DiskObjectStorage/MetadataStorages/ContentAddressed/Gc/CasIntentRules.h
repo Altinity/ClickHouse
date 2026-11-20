@@ -51,7 +51,7 @@ enum class IntentStep : uint8_t
     Create,              /// create `intent_to_create`; the row is `pending` if the create is confirmed, else `candidate`
     Candidate,           /// over the create budget: record `candidate(new_token)`, send no request
     Carry,               /// keep the row unchanged
-    Drop,                /// drop the row, send no request
+    Drop,                /// drop the row; a spare also deletes `intent_to_delete` when it names one
     DeleteBody,          /// row to `standing(t)`, and `DELETE B If-Match` the raw token of `head->observed()`
     Standing,            /// the body is absent: row to `standing(t)`, no request
     TransitionCreate,    /// create `intent_to_create`; row to `pending(new_token)` if confirmed, else `candidate(new_token)`
@@ -71,12 +71,14 @@ struct IntentRuleInput
 };
 
 /// The decision `HEAD` an input needs before `decideIntentStep`, from everything but `head`: the `HEAD` of a
-/// touched key at zero, which serves every rule of the key, or the `HEAD` before a pending row's body delete.
+/// touched key at zero, which serves every rule of the key, the `HEAD` before a pending row's body delete, or
+/// the `HEAD` of a spared `pending` or `standing` row whose token canonicalises, in an unsuppressed round.
 enum class DecisionHeadNeed : uint8_t
 {
     None,
     TouchedKey,
     PendingBody,
+    Spare,
 };
 DecisionHeadNeed decisionHeadNeed(const IntentRuleInput & input);
 
@@ -90,14 +92,15 @@ struct IntentDecision
     std::optional<PersistedEtag> new_token = {};
 };
 
-/// Every destructive step needs zero and an unsuppressed round. `DeleteBody` also needs the redelete
-/// budget and a `HEAD` that shows the row's own token; `DeleteIntent` a `standing` row with a canonical
-/// token; a transition's `intent_to_delete` a `HEAD` that shows another incarnation.
+/// Every destructive step needs an unsuppressed round, and every one but a spare's intent delete needs zero.
+/// `DeleteBody` also needs the redelete budget and a `HEAD` that shows the row's own token; `DeleteIntent` a
+/// `standing` row with a canonical token; the `intent_to_delete` of a transition, or of a spared `pending` or
+/// `standing` row, a `HEAD` that shows another incarnation.
 /// Throws `LOGICAL_ERROR` on an input no round produces: a row that is not a blob row, `standing`
 /// without `delete_pending`, `fresh_transition` other than "no row, at zero, touched", no `HEAD` where
 /// one is required (a fresh transition, a touched key at zero with a row, a pending row whose body
-/// delete runs), or a `HEAD` whose classification against the row's token gives another result. A
-/// `HEAD` that is not required is used like any other.
+/// delete runs, a spare that `decisionHeadNeed` names), or a `HEAD` whose classification against the row's
+/// token gives another result. A `HEAD` that is not required is used like any other.
 IntentDecision decideIntentStep(const IntentRuleInput & input);
 
 }

@@ -55,6 +55,7 @@ every `CAS*` name, is on [Antalya profile events and metrics](/antalya/metrics-a
 | `CASGCIntentStandingAnomaly` | Zero | A `standing` row, whose body `GC` had deleted, saw its own token at the key again. The row is carried and nothing is deleted; the log names the first blob |
 | `CASGCUndecodableBlobBody` | Zero | A body at a blob key is shorter than the pool's blob envelope. `GC` records nothing for it and deletes nothing; the key is in the log and in a `corrupt_decode` event (see [a body `GC` cannot decode](/antalya/cas/architecture/garbage-collection#undecodable-body)) |
 | `CASGCIntentLeftOnSpare` | Follows how often condemned blobs are referenced again | A row dropped because a reference returned; its intent stays until the blob is unreferenced again |
+| `CASGCIntentDeletedOnSpare` | Follows how often condemned content is written again and then referenced | A row dropped because a reference returned, whose body a writer had already replaced; the intent of the replaced body was deleted. Included in `CASGCIntentDeleted` |
 | `CASBlobPublishDigestMismatch` | Zero | A streamed publication was refused because the payload did not hash to the blob's key: a corrupted or changed source |
 | `CASRefRollbackBestEffortDropFailed` | Zero | A rollback cleanup drop hit a backend failure; refs may remain live and GC may be delayed on that namespace |
 

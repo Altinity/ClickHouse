@@ -9,6 +9,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
 #include <Common/CurrentMetrics.h>
 #include <Common/ProfileEvents.h>
 
@@ -42,6 +43,10 @@ extern const Event CASGCIntentTokenRejected;
 extern const Event CASGCIntentUnconfirmedCarry;
 extern const Event CASGCUndecodableBlobBody;
 extern const Event CASGCIntentStandingAnomaly;
+extern const Event CASGCIntentDeleted;
+extern const Event CASGCIntentDeletedOnSpare;
+extern const Event CASGCIntentLeftOnSpare;
+extern const Event CASGCReadAheadHit;
 }
 
 namespace DB::ErrorCodes
@@ -101,6 +106,16 @@ public:
     std::function<void(const String &)> on_blob_head;
     /// Runs before every intent create reaches the store; it may block or throw.
     std::function<void(const String &)> on_intent_create;
+    /// Runs once before the first read of an intent key reaches the store.
+    std::function<void(const String &)> before_intent_read;
+
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        if (key.find("/blob-intents/") != String::npos)
+            if (auto hook = takeOnce(before_intent_read))
+                hook(key);
+        return HeadHookBackend::read(key, access);
+    }
 
     std::optional<RawMeta> head(const String & key, TransportAccess & access) override
     {
@@ -115,7 +130,7 @@ public:
             meta->value = "\"" + meta->value + "\"";
         if (meta && blob_head_value)
             meta->value = *blob_head_value;
-        if (auto hook = std::exchange(after_first_blob_head, {}))
+        if (auto hook = takeOnce(after_first_blob_head))
             hook(key);
         return meta;
     }
@@ -144,7 +159,7 @@ public:
     {
         if (!isBody(key))
             return HeadHookBackend::remove(key, expected_value, access);
-        if (auto hook = std::exchange(before_body_delete, {}))
+        if (auto hook = takeOnce(before_body_delete))
             hook(key);
         if (on_body_delete)
             on_body_delete(key);
@@ -175,6 +190,15 @@ public:
     }
 
 private:
+    /// Requests of a round arrive on several threads: clearing a once-hook is a write they must not race.
+    std::function<void(const String &)> takeOnce(std::function<void(const String &)> & hook)
+    {
+        std::lock_guard lock(once_hook_mutex);
+        return std::exchange(hook, {});
+    }
+
+    std::mutex once_hook_mutex;
+
     static bool isBody(const String & key) { return key.find("/blobs/") != String::npos && !key.ends_with(".meta"); }
     static String contentValue(const String & bytes) { return "c" + hexOf(bytes); }
 };
@@ -642,12 +666,14 @@ TEST(CASGcIntents, SuppressedRoundDeletesNoIntent)
     EXPECT_FALSE(pool.bodyMeta(2).has_value());
 }
 
+/// The body is absent: a writer between its `HEAD` and its intent read may still rely on the intent.
 TEST(CASGcIntents, SpareDropsStandingAndLeavesAnOrphanIntent)
 {
     auto pool = makePool();
     ASSERT_NO_FATAL_FAILURE(pool.makeStanding({1}));
     const String intent = pool.intentKey(1, pool.row(1)->token);
     pool.commit("again", {1});
+    const uint64_t kept_before = counter(ProfileEvents::CASGCIntentLeftOnSpare);
     pool.backend->clearJournal();
 
     const RoundReport report = pool.round();
@@ -656,7 +682,8 @@ TEST(CASGcIntents, SpareDropsStandingAndLeavesAnOrphanIntent)
     EXPECT_EQ(report.spared, 1u);
     EXPECT_FALSE(pool.row(1).has_value());
     EXPECT_TRUE(pool.exists(intent));
-    EXPECT_TRUE(requests.empty()) << "a spare sends no request";
+    EXPECT_EQ(requests, (std::vector<Request>{{JournalVerb::Head, pool.bodyKey(1)}})) << "an absent body deletes no intent";
+    EXPECT_EQ(counter(ProfileEvents::CASGCIntentLeftOnSpare) - kept_before, 1u);
 }
 
 TEST(CASGcIntents, SpareDropsPendingAndKeepsTheIntent)
@@ -673,7 +700,7 @@ TEST(CASGcIntents, SpareDropsPendingAndKeepsTheIntent)
     EXPECT_FALSE(pool.row(1).has_value());
     EXPECT_TRUE(pool.exists(intent));
     EXPECT_TRUE(pool.bodyMeta(1).has_value());
-    EXPECT_TRUE(requests.empty()) << "a spare sends no request";
+    EXPECT_EQ(requests, (std::vector<Request>{{JournalVerb::Head, pool.bodyKey(1)}})) << "the row's own token deletes no intent";
 }
 
 TEST(CASGcIntents, StandingRowWhoseHeadShowsItsTokenIsCarried)
@@ -871,18 +898,21 @@ TEST(CASGcIntents, PendingHeadReadAheadKeepsAtMostAWindowOutstanding)
     auto pool = makePool({.io_concurrency = concurrency});
     ASSERT_NO_FATAL_FAILURE(pool.makePending(cohort));
 
-    /// The first pending row hints the rows behind it, then sends its own `HEAD` inline. The read-ahead workers
-    /// wait until that `HEAD` is sent, so every job the scan scheduled is still counted as scheduled there.
+    /// The first pending row's `HEAD` is scheduled before the rows behind it and waits until one of them reaches the
+    /// store. Their workers wait until that `HEAD` is sent, so every job the scan scheduled is still counted there.
     std::set<String> read_ahead;
     for (size_t i = 1; i < ordered.size(); ++i)
         read_ahead.insert(pool.bodyKey(ordered[i]));
     auto workers = std::make_shared<Gate>();
-    pool.backend->on_blob_head = [workers, read_ahead](const String & key)
+    auto first_read_ahead = std::make_shared<Gate>();
+    pool.backend->on_blob_head = [workers, first_read_ahead, read_ahead](const String & key)
     {
-        if (read_ahead.contains(key))
-            workers->wait();
+        if (!read_ahead.contains(key))
+            return;
+        first_read_ahead->open();
+        workers->wait();
     };
-    SCOPE_EXIT({ workers->open(); });
+    SCOPE_EXIT({ first_read_ahead->open(); workers->open(); });
     int64_t scheduled_at_cut = 0;
     std::optional<int64_t> outstanding;
     pool.gc->setPhaseSink([&](const GcPhaseRecord & record)
@@ -892,6 +922,7 @@ TEST(CASGcIntents, PendingHeadReadAheadKeepsAtMostAWindowOutstanding)
     });
     pool.backend->armOnHead(pool.bodyKey(ordered.front()), [&]
     {
+        first_read_ahead->wait();
         outstanding = CurrentMetrics::get(CurrentMetrics::LocalThreadScheduled) - scheduled_at_cut;
         workers->open();
     });
@@ -2811,4 +2842,602 @@ TEST(CASGcIntents, SweepSkipsTheProbeScratchObject)
     EXPECT_EQ(metricOr(folds[0].sweep, "nominated"), 1u) << "positive control: the orphan was nominated";
     EXPECT_EQ(metricOr(folds[0].sweep, "unparsed"), 0u) << "the scratch object is skipped, not counted as unparsed";
     EXPECT_TRUE(pool.exists(scratch));
+}
+
+/// ---- A spare that sees another incarnation ----
+
+namespace
+{
+
+enum class SparedRow : uint8_t { Pending, Standing };
+
+const char * name(SparedRow state)
+{
+    return state == SparedRow::Pending ? "pending" : "standing";
+}
+
+/// `b` gets a `pending(t)` or `standing(t)` row with `I(B,t)`, a writer that met the intent replaces the body with
+/// `u`, and a new reference to `b` is committed: the next round spares the row. `old_intent` is `I(B,t)`.
+void prepareSpare(IntentPool<> & pool, uint64_t b, SparedRow state, String & old_intent)
+{
+    if (state == SparedRow::Pending)
+        ASSERT_NO_FATAL_FAILURE(pool.makePending({b}));
+    else
+        ASSERT_NO_FATAL_FAILURE(pool.makeStanding({b}));
+    old_intent = pool.intentKey(b, pool.row(b)->token);
+    if (state == SparedRow::Pending)
+        displaceBlobToken(*pool.backend, pool.layout(), blobRefOf(b));
+    else
+        pool.writeBodies({b});
+    ASSERT_NE(pool.currentIntentKey(b), old_intent) << "fixture: the body has another incarnation";
+    pool.commit("again", {b});
+}
+
+size_t indexOfRequest(const std::vector<JournalEntry> & journal, JournalVerb verb, const String & key)
+{
+    for (size_t i = 0; i < journal.size(); ++i)
+        if (journal[i].verb == verb && std::find(journal[i].keys.begin(), journal[i].keys.end(), key) != journal[i].keys.end())
+            return i;
+    return journal.size();
+}
+
+size_t indexOfLastRequest(const std::vector<JournalEntry> & journal, JournalVerb verb, const String & key)
+{
+    for (size_t i = journal.size(); i > 0; --i)
+        if (journal[i - 1].verb == verb && std::find(journal[i - 1].keys.begin(), journal[i - 1].keys.end(), key) != journal[i - 1].keys.end())
+            return i - 1;
+    return journal.size();
+}
+
+/// Counter deltas over one scope: intents deleted at a spare, all intents deleted, intents kept at a spare.
+struct SpareCounters
+{
+    uint64_t deleted_on_spare = counter(ProfileEvents::CASGCIntentDeletedOnSpare);
+    uint64_t deleted = counter(ProfileEvents::CASGCIntentDeleted);
+    uint64_t kept = counter(ProfileEvents::CASGCIntentLeftOnSpare);
+
+    uint64_t deletedOnSpare() const { return counter(ProfileEvents::CASGCIntentDeletedOnSpare) - deleted_on_spare; }
+    uint64_t deletedAll() const { return counter(ProfileEvents::CASGCIntentDeleted) - deleted; }
+    uint64_t keptOnSpare() const { return counter(ProfileEvents::CASGCIntentLeftOnSpare) - kept; }
+};
+
+}
+
+/// The spare `HEAD` is sent after the cut and shows `u`: `I(B,t)` is deleted before the commit; no row is written,
+/// and no intent is created for `u`.
+TEST_P(CASGcIntentsSharded, SpareOverAnotherIncarnationDeletesTheIntent)
+{
+    for (const SparedRow state : {SparedRow::Pending, SparedRow::Standing})
+    {
+        SCOPED_TRACE(name(state));
+        auto pool = makePool({.gc_shards = shards()});
+        String old_intent;
+        ASSERT_NO_FATAL_FAILURE(prepareSpare(pool, blob(), state, old_intent));
+        const String body = pool.bodyKey(blob());
+        const String new_intent = pool.currentIntentKey(blob());
+        const SpareCounters counters;
+        markCutComplete(*pool.gc, *pool.backend);
+        pool.backend->clearJournal();
+
+        const RoundReport report = pool.round();
+
+        const auto journal = pool.backend->journal();
+        EXPECT_EQ(blobRequests(journal), (std::vector<Request>{{JournalVerb::Head, body}, {JournalVerb::RemoveMany, old_intent}}));
+        const size_t cut = indexOfMark(journal, "cut_complete");
+        const size_t head = indexOfRequest(journal, JournalVerb::Head, body);
+        const size_t remove = indexOfRequest(journal, JournalVerb::RemoveMany, old_intent);
+        const size_t commit = indexOfLastRequest(journal, JournalVerb::Write, pool.layout().gcStateKey());
+        ASSERT_LT(cut, journal.size()) << "positive control: the cut was marked";
+        ASSERT_LT(commit, journal.size()) << "positive control: the round committed";
+        EXPECT_LT(cut, head) << "the spare HEAD was sent before the cut";
+        EXPECT_LT(head, remove);
+        EXPECT_LT(remove, commit) << "the intent delete was sent after the commit";
+        EXPECT_EQ(report.spared, 1u);
+        EXPECT_FALSE(pool.row(blob()).has_value());
+        EXPECT_FALSE(pool.exists(old_intent));
+        EXPECT_FALSE(pool.exists(new_intent));
+        EXPECT_TRUE(pool.bodyMeta(blob()).has_value());
+        EXPECT_EQ(counters.deletedOnSpare(), 1u);
+        EXPECT_EQ(counters.deletedAll(), 1u);
+        EXPECT_EQ(counters.keptOnSpare(), 0u);
+    }
+}
+
+TEST(CASGcIntents, SpareOverATokenWithNoIdentityKeepsTheIntent)
+{
+    auto pool = makePool();
+    ASSERT_NO_FATAL_FAILURE(pool.makePending({1}));
+    const String intent = pool.intentKey(1, pool.row(1)->token);
+    pool.commit("again", {1});
+    pool.backend->blob_head_value = "W/\"x\"";
+    const SpareCounters counters;
+    pool.backend->clearJournal();
+
+    const RoundReport report = pool.round();
+
+    EXPECT_EQ(blobRequests(pool.backend->journal()), (std::vector<Request>{{JournalVerb::Head, pool.bodyKey(1)}}));
+    EXPECT_EQ(report.spared, 1u);
+    EXPECT_FALSE(pool.row(1).has_value());
+    EXPECT_TRUE(pool.exists(intent));
+    EXPECT_EQ(counters.deletedOnSpare(), 0u);
+    EXPECT_EQ(counters.keptOnSpare(), 1u);
+}
+
+/// A body shorter than the envelope decides nothing, but a spare never carries its row: the row is dropped beside the
+/// live edge, the intent stays, and the body is counted.
+TEST(CASGcIntents, SpareOverAShortBodyDropsTheRow)
+{
+    for (const SparedRow state : {SparedRow::Pending, SparedRow::Standing})
+    {
+        SCOPED_TRACE(name(state));
+        auto pool = makePool();
+        if (state == SparedRow::Pending)
+            ASSERT_NO_FATAL_FAILURE(pool.makePending({1}));
+        else
+            ASSERT_NO_FATAL_FAILURE(pool.makeStanding({1}));
+        const String intent = pool.intentKey(1, pool.row(1)->token);
+        ASSERT_NO_FATAL_FAILURE(truncateBody(pool, 1));
+        pool.commit("again", {1});
+        const uint64_t undecodable_before = counter(ProfileEvents::CASGCUndecodableBlobBody);
+        const SpareCounters counters;
+        const auto events = recordEvents(pool);
+        pool.backend->clearJournal();
+        std::optional<RoundReport> report;
+        String errors;
+        {
+            ScopedLogCapture capture("CasGc", "error");
+            report = roundWithoutThrowing(pool);
+            errors = capture.captured();
+        }
+
+        ASSERT_TRUE(report.has_value());
+        EXPECT_EQ(blobRequests(pool.backend->journal()), (std::vector<Request>{{JournalVerb::Head, pool.bodyKey(1)}}));
+        EXPECT_EQ(report->spared, 1u);
+        EXPECT_FALSE(pool.row(1).has_value()) << "the spared row was carried";
+        EXPECT_TRUE(pool.exists(intent));
+        EXPECT_TRUE(pool.exists(pool.bodyKey(1)));
+        EXPECT_EQ(counter(ProfileEvents::CASGCUndecodableBlobBody) - undecodable_before, 1u);
+        EXPECT_EQ(counters.keptOnSpare(), 1u);
+        EXPECT_EQ(counters.deletedOnSpare(), 0u);
+        const auto decodes = eventsOf(*events, CasEventType::CorruptDecode, 1);
+        ASSERT_EQ(decodes.size(), 1u);
+        EXPECT_EQ(decodes.front().outcome, "spared");
+        EXPECT_NE(errors.find("dropped their rows"), String::npos) << errors;
+        EXPECT_NE(errors.find(pool.bodyKey(1)), String::npos) << errors;
+        EXPECT_EQ(errors.find("carried their rows"), String::npos) << errors;
+    }
+}
+
+TEST(CASGcIntents, SuppressedRoundSparesWithNoRequest)
+{
+    auto pool = makePool();
+    String old_intent;
+    ASSERT_NO_FATAL_FAILURE(prepareSpare(pool, 1, SparedRow::Pending, old_intent));
+    pool.backend->clearJournal();
+
+    const RoundReport report = pool.round(UniversePolicy::StageA_Suppressed);
+
+    EXPECT_EQ(report.spared, 1u) << "positive control: the round spared the row";
+    EXPECT_TRUE(blobRequests(pool.backend->journal()).empty());
+    EXPECT_FALSE(pool.row(1).has_value());
+    EXPECT_TRUE(pool.exists(old_intent));
+}
+
+TEST(CASGcIntents, SparedCandidateSendsNoHead)
+{
+    auto pool = makePool();
+    pool.commitThenDrop({1});
+    pool.backend->lose_intent_creates = true;
+    pool.round();
+    pool.backend->lose_intent_creates = false;
+    ASSERT_TRUE(isCandidate(pool.row(1)));
+    displaceBlobToken(*pool.backend, pool.layout(), blobRefOf(1));
+    pool.commit("again", {1});
+    pool.backend->clearJournal();
+
+    const RoundReport report = pool.round();
+
+    EXPECT_EQ(report.spared, 1u) << "positive control: the round spared the row";
+    EXPECT_TRUE(blobRequests(pool.backend->journal()).empty());
+    EXPECT_FALSE(pool.row(1).has_value());
+}
+
+/// Every spared row gets one `HEAD`, after the cut. Above concurrency 1 they are read ahead: the first spared row's
+/// `HEAD` is scheduled before the rows behind it and waits until one of them reaches the store; their workers wait
+/// until that `HEAD` is sent.
+TEST(CASGcIntents, SpareHeadsAreReadAheadAfterTheCut)
+{
+    constexpr uint64_t concurrency = 4;
+    constexpr int64_t window = 4 * concurrency;
+    const std::vector<uint64_t> cohort{1, 2, 3, 4, 5, 6, 7, 8};
+    const std::vector<uint64_t> ordered = inRunOrder(cohort);
+    auto pool = makePool({.io_concurrency = concurrency});
+    ASSERT_NO_FATAL_FAILURE(pool.makePending(cohort));
+    std::vector<String> old_intents;
+    for (uint64_t b : cohort)
+    {
+        old_intents.push_back(pool.intentKey(b, pool.row(b)->token));
+        displaceBlobToken(*pool.backend, pool.layout(), blobRefOf(b));
+    }
+    pool.commit("again", cohort);
+
+    std::set<String> read_ahead;
+    for (size_t i = 1; i < ordered.size(); ++i)
+        read_ahead.insert(pool.bodyKey(ordered[i]));
+    auto workers = std::make_shared<Gate>();
+    auto first_read_ahead = std::make_shared<Gate>();
+    pool.backend->on_blob_head = [workers, first_read_ahead, read_ahead](const String & key)
+    {
+        if (!read_ahead.contains(key))
+            return;
+        first_read_ahead->open();
+        workers->wait();
+    };
+    SCOPE_EXIT({ first_read_ahead->open(); workers->open(); });
+    int64_t scheduled_at_cut = 0;
+    std::optional<int64_t> outstanding;
+    pool.gc->setPhaseSink([&](const GcPhaseRecord & record)
+    {
+        if (record.phase == "fold_ref_intake")
+        {
+            scheduled_at_cut = CurrentMetrics::get(CurrentMetrics::LocalThreadScheduled);
+            pool.backend->mark("cut_complete");
+        }
+    });
+    pool.backend->armOnHead(pool.bodyKey(ordered.front()), [&]
+    {
+        first_read_ahead->wait();
+        outstanding = CurrentMetrics::get(CurrentMetrics::LocalThreadScheduled) - scheduled_at_cut;
+        workers->open();
+    });
+    const uint64_t hits_before = counter(ProfileEvents::CASGCReadAheadHit);
+    const SpareCounters counters;
+    pool.backend->clearJournal();
+
+    const RoundReport report = pool.round();
+
+    EXPECT_EQ(report.spared, cohort.size());
+    ASSERT_TRUE(outstanding.has_value()) << "the first spared row never sent its HEAD";
+    EXPECT_GE(*outstanding, 2) << "no spare HEAD was read ahead";
+    EXPECT_LE(*outstanding, window) << "the read-ahead ran past its window";
+    const auto journal = pool.backend->journal();
+    const size_t cut = indexOfMark(journal, "cut_complete");
+    ASSERT_LT(cut, journal.size()) << "positive control: the cut was marked";
+    const auto requests = blobRequests(journal);
+    for (uint64_t b : cohort)
+    {
+        EXPECT_EQ(countOf(requests, JournalVerb::Head, pool.bodyKey(b)), 1u) << b;
+        EXPECT_GT(indexOfRequest(journal, JournalVerb::Head, pool.bodyKey(b)), cut) << "blob " << b << ": HEAD before the cut";
+    }
+    for (const String & intent : old_intents)
+        EXPECT_FALSE(pool.exists(intent)) << intent;
+    EXPECT_GE(counter(ProfileEvents::CASGCReadAheadHit) - hits_before, cohort.size() - 1);
+    EXPECT_EQ(counters.deletedOnSpare(), cohort.size());
+}
+
+/// Parks blob `HEAD`s at the store and records the peak number parked at once. They are released when the pool is
+/// full with `front` on a worker, or when one more than `concurrency` arrive: a `HEAD` sent beside a full pool.
+class InFlightHeadLatch
+{
+public:
+    InFlightHeadLatch(String front_, size_t concurrency_) : front(std::move(front_)), concurrency(concurrency_) {}
+
+    void enter(const String & key)
+    {
+        std::unique_lock lock(mutex);
+        ++in_flight;
+        peak = std::max(peak, in_flight);
+        if (key == front && std::this_thread::get_id() != round_thread)
+            front_on_worker = true;
+        if (in_flight > concurrency || (in_flight == concurrency && front_on_worker))
+            released = true;
+        cv.notify_all();
+        if (!cv.wait_for(lock, std::chrono::seconds(20), [this] { return released; }))
+        {
+            timed_out = true;
+            released = true;
+            cv.notify_all();
+        }
+        --in_flight;
+    }
+
+    void release()
+    {
+        std::lock_guard lock(mutex);
+        released = true;
+        cv.notify_all();
+    }
+
+    size_t peakInFlight() const
+    {
+        std::lock_guard lock(mutex);
+        return peak;
+    }
+
+    bool timedOut() const
+    {
+        std::lock_guard lock(mutex);
+        return timed_out;
+    }
+
+private:
+    const String front;
+    const size_t concurrency;
+    const std::thread::id round_thread = std::this_thread::get_id();
+    mutable std::mutex mutex;
+    std::condition_variable cv;
+    size_t in_flight = 0;
+    size_t peak = 0;
+    bool front_on_worker = false;
+    bool released = false;
+    bool timed_out = false;
+};
+
+/// The first row of a stretch counts against `gc_io_concurrency` like the rows read ahead behind it, for spared rows
+/// and for pending rows at zero.
+TEST(CASGcIntents, SpareAndPendingHeadsStayWithinTheIoConcurrency)
+{
+    constexpr uint64_t concurrency = 4;
+    const std::vector<uint64_t> cohort{1, 2, 3, 4, 5, 6, 7, 8};
+    const std::vector<uint64_t> ordered = inRunOrder(cohort);
+    for (const bool spare : {true, false})
+    {
+        SCOPED_TRACE(spare ? "spared rows" : "pending rows at zero");
+        auto pool = makePool({.io_concurrency = concurrency});
+        ASSERT_NO_FATAL_FAILURE(pool.makePending(cohort));
+        if (spare)
+            pool.commit("again", cohort);
+        auto latch = std::make_shared<InFlightHeadLatch>(pool.bodyKey(ordered.front()), concurrency);
+        pool.backend->on_blob_head = [latch](const String & key) { latch->enter(key); };
+        SCOPE_EXIT({ latch->release(); });
+        pool.backend->clearJournal();
+
+        const RoundReport report = pool.round();
+
+        if (spare)
+            EXPECT_EQ(report.spared, cohort.size()) << "positive control: every row was spared";
+        else
+            EXPECT_EQ(report.bodies_deleted, cohort.size()) << "positive control: every pending row was decided";
+        const auto requests = blobRequests(pool.backend->journal());
+        for (uint64_t b : cohort)
+            EXPECT_EQ(countOf(requests, JournalVerb::Head, pool.bodyKey(b)), 1u) << b;
+        EXPECT_FALSE(latch->timedOut());
+        EXPECT_LE(latch->peakInFlight(), concurrency) << "more HEADs were in flight than gc_io_concurrency";
+        EXPECT_EQ(latch->peakInFlight(), concurrency) << "positive control: the HEADs filled the pool";
+    }
+}
+
+/// The fold keeps blob sets for the condemned-row read-ahead only when a parent row can use them, and keeps each blob
+/// once: a fold of additions over a parent with no `pending` or `standing` row keeps none.
+TEST(CASGcIntents, ReadAheadBlobSetsAreKeptOnlyForPendingParentRows)
+{
+    constexpr uint64_t concurrency = 4;
+    const std::vector<uint64_t> cohort{1, 2, 3, 4, 5, 6};
+    for (const uint64_t shards : {uint64_t{1}, uint64_t{4}})
+    {
+        SCOPED_TRACE(shards);
+        {
+            SCOPED_TRACE("additions over no condemned row");
+            auto pool = makePool({.gc_shards = shards, .io_concurrency = concurrency});
+            pool.writeBodies(cohort);
+            pool.commit("tbl", cohort);
+            std::vector<FoldMetrics> folds;
+            recordFolds(pool, folds);
+
+            pool.round();
+
+            ASSERT_EQ(folds.size(), 1u);
+            EXPECT_GE(metricOr(folds[0].reduce, "deltas_in"), cohort.size()) << "positive control: the additions were folded";
+            EXPECT_EQ(metricOr(folds[0].reduce, "read_ahead_blobs"), 0u);
+        }
+        {
+            SCOPED_TRACE("additions over pending rows");
+            auto pool = makePool({.gc_shards = shards, .io_concurrency = concurrency});
+            ASSERT_NO_FATAL_FAILURE(pool.makePending(cohort));
+            pool.commit("again", cohort);
+            std::vector<FoldMetrics> folds;
+            recordFolds(pool, folds);
+            const uint64_t hits_before = counter(ProfileEvents::CASGCReadAheadHit);
+
+            const RoundReport report = pool.round();
+
+            EXPECT_EQ(report.spared, cohort.size());
+            ASSERT_EQ(folds.size(), 1u);
+            EXPECT_EQ(metricOr(folds[0].reduce, "read_ahead_blobs"), cohort.size()) << "each referenced blob once";
+            EXPECT_GE(counter(ProfileEvents::CASGCReadAheadHit) - hits_before, cohort.size()) << "the spare HEADs were not read ahead";
+        }
+    }
+}
+
+/// A spare `HEAD` without an answer fails the round before its commit: the adopted state keeps `pending(t)` and
+/// its intent, and the next round decides again.
+TEST(CASGcIntents, FailedSpareHeadFailsTheRoundAndKeepsPending)
+{
+    for (const uint64_t concurrency : {uint64_t{1}, uint64_t{4}})
+    {
+        SCOPED_TRACE(concurrency);
+        auto pool = makePool({.io_concurrency = concurrency});
+        String old_intent;
+        ASSERT_NO_FATAL_FAILURE(prepareSpare(pool, 1, SparedRow::Pending, old_intent));
+        const RetiredEntry pending = *pool.row(1);
+        const uint64_t round_before = committedRound(*pool.backend, pool.layout());
+        const String body = pool.bodyKey(1);
+        auto attempts = std::make_shared<std::atomic<size_t>>(0);
+        pool.backend->on_blob_head = [body, attempts](const String & key)
+        {
+            if (key != body)
+                return;
+            ++*attempts;
+            throw Poco::TimeoutException("the spare HEAD was never answered");
+        };
+        pool.backend->clearJournal();
+
+        EXPECT_ANY_THROW(pool.round());
+
+        EXPECT_GE(attempts->load(), 1u) << "positive control: the spare HEAD was sent";
+        EXPECT_EQ(intentDeletes(blobRequests(pool.backend->journal())), 0u);
+        EXPECT_EQ(committedRound(*pool.backend, pool.layout()), round_before);
+        ASSERT_TRUE(isPending(pool.row(1)));
+        EXPECT_EQ(pool.row(1)->token.value, pending.token.value);
+        EXPECT_TRUE(pool.exists(old_intent));
+
+        pool.backend->on_blob_head = {};
+        pool.round();
+        EXPECT_FALSE(pool.exists(old_intent)) << "positive control: the next round deleted the intent";
+    }
+}
+
+/// The intent delete lands and the round fails before its commit: the adopted state holds `pending(t)` with no
+/// intent over body `u`. The next round spares again, where the absent intent is a success, or, at zero, moves the
+/// row to `u`. Neither sends a body delete.
+TEST(CASGcIntents, SpareIntentDeleteLandsAndTheRoundFails)
+{
+    for (const bool zero_next : {false, true})
+    {
+        SCOPED_TRACE(zero_next ? "next round at zero" : "next round referenced");
+        auto pool = makePool();
+        String old_intent;
+        ASSERT_NO_FATAL_FAILURE(prepareSpare(pool, 1, SparedRow::Pending, old_intent));
+        const RetiredEntry pending = *pool.row(1);
+        const String body = pool.bodyKey(1);
+        const String state_key = pool.layout().gcStateKey();
+        pool.backend->before_write = [&pool, state_key, old_intent](const String & key)
+        {
+            if (key != state_key)
+                return;
+            const auto journal = pool.backend->journal();
+            if (indexOfRequest(journal, JournalVerb::RemoveMany, old_intent) != journal.size())
+                throw DB::Exception(DB::ErrorCodes::READONLY, "the store refused the commit");
+        };
+
+        EXPECT_ANY_THROW(pool.round());
+        pool.backend->before_write = {};
+
+        ASSERT_FALSE(pool.exists(old_intent)) << "positive control: the intent delete landed";
+        ASSERT_TRUE(isPending(pool.row(1))) << "the adopted state no longer holds the row";
+        EXPECT_EQ(pool.row(1)->token.value, pending.token.value);
+
+        /// The missing intent is a finding only over the row's own token; over a referenced body it is not listed.
+        const FsckReport referenced = runFsck(*pool.store, /*detail=*/true);
+        EXPECT_EQ(referenced.pending_without_intent, 0u) << formatFsckSummary(referenced);
+        EXPECT_EQ(referenced.pending_intent_absent, 0u) << formatFsckSummary(referenced);
+        EXPECT_TRUE(referenced.clean()) << formatFsckSummary(referenced);
+
+        if (zero_next)
+        {
+            pool.drop("again");
+            /// The row names `t`, not the body `u`, so the body is awaiting GC.
+            const FsckReport unreferenced = runFsck(*pool.store, /*detail=*/true);
+            EXPECT_EQ(unreferenced.pending_without_intent, 0u) << formatFsckSummary(unreferenced);
+            EXPECT_EQ(unreferenced.awaiting_gc, 1u) << formatFsckSummary(unreferenced);
+            EXPECT_TRUE(unreferenced.clean()) << formatFsckSummary(unreferenced);
+        }
+        const String new_intent = pool.currentIntentKey(1);
+        pool.backend->clearJournal();
+
+        pool.round();
+
+        const auto requests = blobRequests(pool.backend->journal());
+        EXPECT_EQ(countOf(requests, JournalVerb::Remove, body), 0u) << "a body delete after the intent was gone";
+        EXPECT_TRUE(pool.bodyMeta(1).has_value());
+        if (zero_next)
+        {
+            EXPECT_EQ(requests, (std::vector<Request>{
+                {JournalVerb::Head, body}, {JournalVerb::Write, new_intent}, {JournalVerb::RemoveMany, old_intent}}));
+            ASSERT_TRUE(isPending(pool.row(1)));
+            EXPECT_TRUE(sameIncarnation(pool.row(1)->token, pool.bodyMeta(1)->etag));
+        }
+        else
+        {
+            EXPECT_EQ(requests, (std::vector<Request>{{JournalVerb::Head, body}, {JournalVerb::RemoveMany, old_intent}}));
+            EXPECT_FALSE(pool.row(1).has_value());
+        }
+    }
+}
+
+TEST(CASGcIntents, SpareIntentDeleteReachesTheEventLog)
+{
+    auto pool = makePool();
+    const auto events = recordEvents(pool);
+    String old_intent;
+    ASSERT_NO_FATAL_FAILURE(prepareSpare(pool, 1, SparedRow::Pending, old_intent));
+
+    pool.round();
+
+    ASSERT_FALSE(pool.exists(old_intent)) << "positive control: the spare deleted the intent";
+    const auto deletes = eventsOf(*events, CasEventType::BlobIntentDelete, 1);
+    ASSERT_EQ(deletes.size(), 1u);
+    EXPECT_EQ(deletes.front().outcome, "deleted");
+    EXPECT_EQ(deletes.front().detail.at("key"), old_intent);
+    EXPECT_NE(deletes.front().reason.find("referenced again"), String::npos) << deletes.front().reason;
+}
+
+/// A writer whose `HEAD` saw `t` reads `I(B,t)` after a spare deleted it over `u`, and adopts `u`. GC never deletes
+/// that body while the writer's reference lives, and reclaims it once the reference is dropped.
+TEST(CASGcIntents, WriterAdoptingAfterASpareDeleteKeepsItsBody)
+{
+    auto pool = makePool();
+    const uint64_t b = 1;
+    ASSERT_NO_FATAL_FAILURE(pool.makePending({b}));
+    const String old_intent = pool.intentKey(b, pool.row(b)->token);
+    const String body = pool.bodyKey(b);
+    const SpareCounters counters;
+
+    const String part = "writer";
+    PartWriteInfo info;
+    info.intended_ref = pool.ns.string() + "/" + part;
+    auto build = pool.store->beginPartWrite(info);
+    const ManifestId id = build->stageManifest({blobEntryFor("f1", numberedBlobHash(b))});
+    build->precommitAdd(pool.ns, part, id);
+
+    /// Between the writer's `HEAD` and its intent read: another writer replaces the body, and a round that sees this
+    /// writer's precommit edge spares the row.
+    std::optional<RoundReport> spare_round;
+    pool.backend->before_intent_read = [&](const String &)
+    {
+        displaceBlobToken(*pool.backend, pool.layout(), blobRefOf(b));
+        spare_round = pool.round();
+    };
+    pool.backend->clearJournal();
+    try
+    {
+        build->putBlob(blobRefOf(b), BlobSource::fromString("x"));
+    }
+    catch (const DB::Exception & e)
+    {
+        /// The payload does not hash to the key, so only an adoption succeeds.
+        FAIL() << "the writer did not adopt the body: " << e.message();
+    }
+    build->promote(pool.ns, part, build->buildId(), id);
+    pool.store->renewWatermarkOnce();
+
+    ASSERT_TRUE(spare_round.has_value()) << "the writer never read the intent";
+    EXPECT_EQ(spare_round->spared, 1u);
+    ASSERT_EQ(counters.deletedOnSpare(), 1u) << "the spare did not delete I(B,t)";
+    const auto journal = pool.backend->journal();
+    const size_t spare_delete = indexOfRequest(journal, JournalVerb::RemoveMany, old_intent);
+    const size_t writer_read = indexOfLastRequest(journal, JournalVerb::Read, old_intent);
+    ASSERT_LT(writer_read, journal.size());
+    EXPECT_LT(spare_delete, writer_read) << "the writer read the intent before the spare deleted it";
+    EXPECT_EQ(indexOfRequest(journal, JournalVerb::Publish, body), journal.size()) << "the writer published instead of adopting";
+    const std::optional<CanonicalIdentity> adopted = pool.bodyMeta(b)->etag.canonical();
+
+    for (int i = 0; i < 3; ++i)
+    {
+        pool.round();
+        ASSERT_TRUE(pool.bodyMeta(b).has_value()) << "round " << i << ": the adopted body was deleted under a live reference";
+        EXPECT_EQ(pool.bodyMeta(b)->etag.canonical(), adopted) << "round " << i;
+    }
+    const FsckReport live = runFsck(*pool.store, /*detail=*/true);
+    EXPECT_EQ(live.dangling, 0u) << formatFsckSummary(live);
+    EXPECT_TRUE(live.clean()) << formatFsckSummary(live);
+
+    pool.store->dropRef(pool.ns, part);
+    pool.store->renewWatermarkOnce();
+    for (int i = 0; i < 6 && pool.bodyMeta(b).has_value(); ++i)
+        pool.round();
+    EXPECT_FALSE(pool.bodyMeta(b).has_value()) << "positive control: the body was reclaimed after the reference was dropped";
+    const FsckReport dropped = runFsck(*pool.store, /*detail=*/true);
+    EXPECT_EQ(dropped.dangling, 0u) << formatFsckSummary(dropped);
+    EXPECT_TRUE(dropped.clean()) << formatFsckSummary(dropped);
 }

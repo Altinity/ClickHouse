@@ -30,6 +30,9 @@ DecisionHeadNeed decisionHeadNeed(const IntentRuleInput & input)
     if (input.at_zero && input.key_touched)
         return DecisionHeadNeed::TouchedKey;
     const RetiredEntry * row = input.row ? &*input.row : nullptr;
+    if (row && !input.at_zero)
+        return row->delete_pending && row->token.canonical() && !input.suppressed ? DecisionHeadNeed::Spare
+                                                                                  : DecisionHeadNeed::None;
     if (row && input.at_zero && row->delete_pending && !row->standing && !input.suppressed && input.redelete_budget_admits)
         return DecisionHeadNeed::PendingBody;
     return DecisionHeadNeed::None;
@@ -96,10 +99,17 @@ IntentDecision decideIntentStep(const IntentRuleInput & input)
     }
 
     const RetiredEntry & row = *input.row;
-    if (!input.at_zero)
-        return {.step = IntentStep::Drop};
-
     const std::optional<CanonicalIdentity> own = row.token.canonical();
+    if (!input.at_zero)
+    {
+        /// The row's token was observed before this round, so another incarnation now proves it gone for good. An
+        /// absent body proves nothing: a writer between its `HEAD` and its intent read may still rely on the intent.
+        IntentDecision out{.step = IntentStep::Drop};
+        if (row.delete_pending && !input.suppressed && seen == HeadSeen::Other)
+            out.intent_to_delete = own;
+        return out;
+    }
+
     /// The transition first: a plain intent delete first can spend the round that folded the key's
     /// last transition, and then the new incarnation is never condemned. Its intent delete waits for an
     /// unsuppressed round.

@@ -654,7 +654,8 @@ TEST(CASObservability, IntentCountersAreRegistered)
 {
     const std::vector<std::string_view> names{
         "CASGCIntentCreated", "CASGCIntentConfirmedExisting", "CASGCIntentUnconfirmedCarry", "CASGCIntentDeleted",
-        "CASGCIntentLeftOnSpare", "CASGCIntentTokenRejected", "CASBlobReuseIntentPresent", "CASBlobReuseTokenRejected"};
+        "CASGCIntentLeftOnSpare", "CASGCIntentDeletedOnSpare", "CASGCIntentTokenRejected", "CASBlobReuseIntentPresent",
+        "CASBlobReuseTokenRejected"};
     for (const std::string_view name : names)
     {
         std::optional<ProfileEvents::Event> found;

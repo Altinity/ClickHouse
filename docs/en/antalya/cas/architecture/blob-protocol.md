@@ -164,14 +164,15 @@ per condemned incarnation:
 An intent names one incarnation, so a body replaced by a writer is not covered by the old
 intent: the replacement has another token and therefore another intent key.
 
-**An intent can outlive its body, and must.** `GC` removes it only after the body is gone and after a
-later round whose reference cut still shows no reference. A writer that observed the body before it
-was deleted, and reads the intent afterwards, would otherwise find nothing and adopt a body that no
-longer exists. An intent can also outlive a *live* body: a blob that is referenced again after `GC`
-condemned it keeps its intent, and the next writer that finds the body uploads it once more instead
-of adopting it. Such an intent with no `GC` state is an
-[orphan](/antalya/cas/architecture/garbage-collection#orphan-intents) that a later round adopts and
-removes once the blob is unreferenced again.
+**An intent can outlive its body, and must.** `GC` removes it only after the incarnation it names is
+gone from the key: once the body is gone and a later round's reference cut still shows no reference,
+or, for a blob referenced again, once a `HEAD` sent after the round's cut shows another token. A
+writer that observed the body before it was deleted, and reads the intent afterwards, would otherwise
+find nothing and adopt a body that no longer exists. An intent can also outlive a *live* body: a blob
+that is referenced again while its body still has the condemned token keeps its intent, and the next
+writer that finds the body uploads it once more instead of adopting it. Such an intent with no `GC`
+state is an [orphan](/antalya/cas/architecture/garbage-collection#orphan-intents) that a later round
+adopts and removes once the blob is unreferenced again.
 
 ## The writer-versus-GC race {#writer-gc-race}
 
@@ -230,20 +231,28 @@ trusts a body it did not itself just write.
 
 Why this closes the race in both directions:
 
-- A writer that **adopts** a present body read no intent, so its read came before the intent was
-  created. Its precommit edge was durable before that read, so it was durable before the round that
-  created the intent committed. The round that deletes the body takes a later cut, sees the edge,
-  and spares the blob.
+- A writer that **adopts** a present body read the intent of `t` as absent, for one of two reasons:
+  - The intent was not created yet. The writer's precommit edge was durable before that read, so it
+    was durable before the round that created the intent committed. The round that deletes the body
+    takes a later cut, sees the edge, and spares the blob.
+  - A spare deleted it, which it does only when its `HEAD`, sent after its cut, shows another token
+    `u`. A token never recurs at a key, so `t` cannot come back and the body the writer adopts is `u`
+    or a later one. The writer's `HEAD` saw `t`, so `u` landed after that `HEAD`, and the writer's
+    edge was durable before it. A body `u` is deleted only by a round after the one that observed `u`
+    and committed `pending(u)`, so the deleting round's cut is taken after `u` landed. It sees the
+    edge and spares the blob.
+- A spare whose `HEAD` shows **no body** keeps the intent. A writer whose `HEAD` saw `t` before the
+  body was deleted may not have read the intent yet; without it, the writer would adopt a body that
+  is gone. Another token proves `t` was replaced; an absent body does not.
 - A writer that **replaces a condemned incarnation** changes the token. A stale exact-token delete
   of `t1` then answers `Mismatch` and reclaims nothing — the delete names an exact incarnation,
   never "the object at this key". The next round sees the new token `t2` at zero in-degree and
   condemns it, with its own intent.
 - The intent outlives the body until a cut taken after `standing` was committed still shows no
-  reference. Any writer that read the old body has its edge in that cut, so the blob would be
-  spared and no intent removed.
-- `GC` never removes an intent because a body is absent or because a blob is referenced, and
-  never in the job that deletes the body. A request that is refused or unanswered fails the round
-  before its commit and the row keeps its state; a missing answer is never read as absence.
+  reference. Any writer that read the old body has its edge in that cut, so the blob is spared.
+- `GC` never removes an intent because a body is absent, and never in the job that deletes the
+  body. A request that is refused or unanswered fails the round before its commit and the row keeps
+  its state; a missing answer is never read as absence.
 - A round whose destruction is suppressed (an anomaly, a hold, or an incomplete frontier) creates
   intents and records rows but deletes no body and no intent.
 
