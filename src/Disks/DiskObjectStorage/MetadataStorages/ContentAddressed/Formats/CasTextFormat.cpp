@@ -8,6 +8,7 @@
 #include <base/hex.h>
 #include <base/scope_guard.h>
 #include <algorithm>
+#include <charconv>
 #include <cstring>
 #include <limits>
 #include <zstd.h>
@@ -274,10 +275,9 @@ uint64_t JsonObjectReader::readU64String()
     return guarded([&]
     {
         const std::string_view s = readStringIntoScratch();
-        ReadBufferFromMemory buf(s.data(), s.size());
         uint64_t v = 0;
-        readIntText(v, buf);
-        if (s.empty() || !buf.eof())
+        const auto [end, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+        if (s.empty() || ec != std::errc{} || end != s.data() + s.size())
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: expected decimal u64 string, got '{}'", what, s);
         return v;
     });
