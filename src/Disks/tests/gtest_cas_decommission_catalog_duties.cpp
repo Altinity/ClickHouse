@@ -54,6 +54,15 @@ bool slotObjectExists(Backend & backend, const String & leaf)
     return (*op).head("p/gc/server-roots/victim/" + leaf, Retry::standard()).has_value();
 }
 
+OwnerObject readOwnerDuty(Backend & backend)
+{
+    DB::Cas::tests::OperationForTest op(backend);
+    const auto current = (*op).read("p/gc/server-roots/victim/owner", Retry::standard());
+    if (!current)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "fixture owner is absent");
+    return decodeOwner(current->bytes);
+}
+
 class AddVictimEntryDuringRootDrainBackend final : public InMemoryBackend
 {
 public:
@@ -87,60 +96,7 @@ private:
     bool added = false;
 };
 
-/// Admits the late catalog entry between the retirement tail's two exact catalog reads
-/// (`retirement_catalog_cut`, then `fresh_retirement_catalog`), never before. The mountpoint drain's
-/// `list("p/roots/victim/", ...)` is the last LIST call in `decommissionPoolMember` before either
-/// read, so it orders the two `read("p/cas/ref_catalog")` calls that follow it: the first is
-/// `retirement_catalog_cut`, the second is `fresh_retirement_catalog`. Mutating on the second call
-/// makes that read observe a catalog the first read did not.
-class MutateCatalogBetweenRetirementReadsBackend final : public InMemoryBackend
-{
-public:
-    /// Unhide the legacy `list` overloads the primitive override below would otherwise hide.
-    using Backend::list;
-    void arm() { armed = true; }
-    bool fired() const { return added; }
-
-    /// Both hooks sit on the PRIMITIVES, which every legacy forwarder reaches too, so the ordering
-    /// they observe is the physical request order whichever surface issued each request.
-    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
-    {
-        RawListPage page = InMemoryBackend::list(prefix, cursor, limit, access);
-        if (armed && !past_mountpoint_drain && prefix == "p/roots/victim/" && cursor.empty())
-            past_mountpoint_drain = true;
-        return page;
-    }
-
-    std::optional<Raw> read(const String & key, TransportAccess & access) override
-    {
-        if (armed && past_mountpoint_drain && !added && key == "p/cas/ref_catalog")
-        {
-            if (!seen_retirement_catalog_cut)
-                seen_retirement_catalog_cut = true;
-            else
-            {
-                added = true;
-                CasRequests requests = DB::Cas::tests::openRequestsForTest(*this);
-                CasOperation op = requests.admit();
-                CasRefCatalog::casAdmitEntry(
-                    op, Layout("p"), 1,
-                    CatalogEntry{
-                        .ns = RootNamespace("victim/db/late"),
-                        .state = NsState::Live,
-                        .incarnation = UInt128{707}});
-            }
-        }
-        return InMemoryBackend::read(key, access);
-    }
-
-private:
-    bool armed = false;
-    bool past_mountpoint_drain = false;
-    bool seen_retirement_catalog_cut = false;
-    bool added = false;
-};
-
-TEST(CASDecommissionCatalogDuties, RemovingWithoutCheckpointIsCorruptionAndKeepsSlot)
+TEST(CASDecommissionCatalogDuties, RemovingWithoutCheckpointIsCorruptionAndLeavesAnUnverifiedTombstone)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
@@ -166,11 +122,13 @@ TEST(CASDecommissionCatalogDuties, RemovingWithoutCheckpointIsCorruptionAndKeeps
     EXPECT_TRUE(slotObjectExists(*backend, "owner"));
     EXPECT_TRUE(slotObjectExists(*backend, "epoch"));
     EXPECT_TRUE(slotObjectExists(*backend, "mount"));
+    EXPECT_TRUE(readOwnerDuty(*backend).retired_at_ms.has_value());
+    EXPECT_FALSE(readOwnerDuty(*backend).retirement_verified);
     EXPECT_EQ(catalogEntry(catalog_op, Layout("p"), RootNamespace("victim/db/missing_ckpt")).state,
         NsState::Removing);
 }
 
-TEST(CASDecommissionCatalogDuties, RemovingWithCheckpointResumesTerminalAndKeepsSlotForGc)
+TEST(CASDecommissionCatalogDuties, RemovingWithCheckpointResumesTerminalAndIsVerifiedWithTheRowPendingGc)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
@@ -193,18 +151,27 @@ TEST(CASDecommissionCatalogDuties, RemovingWithCheckpointResumesTerminalAndKeeps
 
     EXPECT_EQ(report.namespaces_already_removed, 1u);
     EXPECT_EQ(wake_requests.load(), 1u);
-    EXPECT_FALSE(report.slot_removed);
-    EXPECT_FALSE(report.warnings.empty());
+    EXPECT_TRUE(report.member_retired);
+    EXPECT_TRUE(report.warnings.empty());
+    EXPECT_EQ(report.namespaces_pending_gc, 1u);
     EXPECT_TRUE(slotObjectExists(*backend, "owner"));
 
+    /// The admin mount writes in a later epoch than the creation, so the never-born stream first gets a
+    /// tombstone at its creation slot, then the terminal record.
     const ListPage stream = catalog_op.list(Layout("p").namespaceStreamPrefix(*life), "", 100, Retry::standard());
-    ASSERT_EQ(stream.keys.size(), 1u);
-    const auto parsed = Layout("p").parseRefObjectKey(stream.keys.front().key);
-    ASSERT_TRUE(parsed);
-    const auto body = catalog_op.read(stream.keys.front().key, Retry::standard());
-    ASSERT_TRUE(body);
-    const RefLogTxn terminal = decodeRefLogTxn(
-        openObject(FormatId::RefLog, body->bytes), ns.string(), parsed->txn_id);
+    ASSERT_EQ(stream.keys.size(), 2u);
+    const auto decodeAt = [&](size_t index)
+    {
+        const auto parsed = Layout("p").parseRefObjectKey(stream.keys[index].key);
+        EXPECT_TRUE(parsed);
+        const auto body = catalog_op.read(stream.keys[index].key, Retry::standard());
+        EXPECT_TRUE(body);
+        return decodeRefLogTxn(openObject(FormatId::RefLog, body->bytes), ns.string(), parsed->txn_id);
+    };
+    const RefLogTxn genesis = decodeAt(0);
+    EXPECT_TRUE(refLogTxnIsEpochSeal(genesis));
+    const RefLogTxn terminal = decodeAt(1);
+    EXPECT_EQ(terminal.prev_epoch_seal, std::make_optional(genesis.txn_id));
     ASSERT_EQ(terminal.ops.size(), 2u);
     EXPECT_EQ(terminal.ops.front().kind, RefOpKind::NamespaceBirth);
     EXPECT_EQ(terminal.ops.back().kind, RefOpKind::RemoveNamespace);
@@ -246,12 +213,14 @@ TEST(CASDecommissionCatalogDuties, PartialRemovalProgressStillWakesGcWhenLaterNa
     EXPECT_EQ(wake_requests.load(), 1u)
         << "progress already made for an earlier life must wake GC even when a later life fails closed";
     EXPECT_TRUE(slotObjectExists(*backend, "owner"));
+    EXPECT_TRUE(readOwnerDuty(*backend).retired_at_ms.has_value());
+    EXPECT_FALSE(readOwnerDuty(*backend).retirement_verified);
     const ListPage progressed_stream
         = catalog_op.list(Layout("p").namespaceStreamPrefix(*progressed_life), "", 100, Retry::standard());
-    ASSERT_EQ(progressed_stream.keys.size(), 1u);
+    ASSERT_EQ(progressed_stream.keys.size(), 2u) << "the creation slot's tombstone and the terminal record";
 }
 
-TEST(CASDecommissionCatalogDuties, VictimEntryAppearingBeforeTheOwnershipCutKeepsSlot)
+TEST(CASDecommissionCatalogDuties, VictimEntryAppearingAfterTheCutBlocksTheMark)
 {
     auto backend = std::make_shared<AddVictimEntryDuringRootDrainBackend>();
     CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
@@ -263,31 +232,11 @@ TEST(CASDecommissionCatalogDuties, VictimEntryAppearingBeforeTheOwnershipCutKeep
         backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
 
     EXPECT_TRUE(backend->fired());
-    EXPECT_FALSE(report.slot_removed);
+    EXPECT_FALSE(report.member_retired);
     ASSERT_FALSE(report.warnings.empty());
-    EXPECT_NE(report.warnings.front().find("pool member decommission underway: 1 namespace(s)"), String::npos)
-        << report.warnings.front();
-    EXPECT_TRUE(slotObjectExists(*backend, "owner"));
-    EXPECT_EQ(catalogEntry(catalog_op, Layout("p"), RootNamespace("victim/db/late")).state, NsState::Live);
-}
-
-TEST(CASDecommissionCatalogDuties, CatalogTokenMovedBetweenOwnershipCutAndRetirementKeepsSlot)
-{
-    auto backend = std::make_shared<MutateCatalogBetweenRetirementReadsBackend>();
-    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
-    CasOperation catalog_op = catalog_requests.admit();
-    { auto victim = openVictim(backend); }
-    backend->arm();
-
-    const DecommissionReport report = decommissionPoolMember(
-        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
-
-    EXPECT_TRUE(backend->fired());
-    EXPECT_FALSE(report.slot_removed);
-    ASSERT_FALSE(report.warnings.empty());
-    EXPECT_NE(report.warnings.front().find("catalog changed after the victim ownership check"), String::npos)
-        << report.warnings.front();
-    EXPECT_TRUE(slotObjectExists(*backend, "owner"));
+    EXPECT_NE(report.warnings.front().find("appeared after"), String::npos) << report.warnings.front();
+    EXPECT_TRUE(readOwnerDuty(*backend).retired_at_ms.has_value());
+    EXPECT_FALSE(readOwnerDuty(*backend).retirement_verified);
     EXPECT_EQ(catalogEntry(catalog_op, Layout("p"), RootNamespace("victim/db/late")).state, NsState::Live);
 }
 
@@ -325,7 +274,9 @@ TEST(CASDecommissionCatalogDuties, FoldedTerminalRemainsGcOwnedAndOnlyRequestsAn
 
     EXPECT_EQ(wake_requests.load(), 1u);
     EXPECT_EQ(report.namespaces_already_removed, 1u);
-    EXPECT_FALSE(report.slot_removed);
+    EXPECT_TRUE(report.member_retired);
+    EXPECT_TRUE(report.warnings.empty());
+    EXPECT_EQ(report.namespaces_pending_gc, 1u);
     EXPECT_EQ(catalogEntry(catalog_op, Layout("p"), ns).state, NsState::Removing);
     std::vector<String> stream_after;
     for (const ListedKey & key : catalog_op.list(Layout("p").namespaceStreamPrefix(*life), "", 100, Retry::standard()).keys)
@@ -350,7 +301,7 @@ TEST(CASDecommissionCatalogDuties, OpaqueLifeDebrisWithoutCatalogOwnershipDoesNo
         backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
 
     EXPECT_TRUE(report.warnings.empty());
-    EXPECT_TRUE(report.slot_removed);
+    EXPECT_TRUE(report.member_retired);
     EXPECT_TRUE(catalog_op.head(debris_key, Retry::standard()).has_value());
 }
 

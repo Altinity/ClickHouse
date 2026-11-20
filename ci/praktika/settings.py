@@ -128,9 +128,9 @@ class _Settings:
     # Optional: upstream report bucket to merge issue catalogs from (e.g. "clickhouse-test-reports")
     S3_UPSTREAM_REPORT_BUCKET: str = ""
     HTML_PAGE_FILE: str = "./ci/praktika/json.html"
-    S3_BUCKET_TO_HTTP_ENDPOINT: Optional[Dict[str, str]] = None
-    # Non-AWS buckets: {bucket: {endpoint_url, region, access_key_env, secret_key_env, public_read, download_concurrency}}
-    # The keys are read from the named env vars; with public_read, jobs without them read unsigned.
+    # {bucket: {http_endpoint, endpoint_url?, region?, access_key_env?, secret_key_env?, public_read?, download_concurrency?}}
+    # http_endpoint is the public host spliced into links. endpoint_url marks a non-AWS bucket.
+    # Keys are read from the named env vars; with public_read, jobs without them read unsigned.
     # download_concurrency (optional): parallel ranged GETs, for links with a low rate per connection.
     S3_EXTERNAL_BUCKETS: Optional[Dict[str, Dict[str, Any]]] = None
     TEXT_CONTENT_EXTENSIONS: Iterable[str] = frozenset([".txt", ".log"])
@@ -182,7 +182,6 @@ _USER_DEFINED_SETTINGS = [
     "CLOUD_INFRASTRUCTURE_CONFIG_PATH",
     "EVENT_FEED_S3_PATH",
     "AWS_REGION",
-    "S3_BUCKET_TO_HTTP_ENDPOINT",
     "S3_EXTERNAL_BUCKETS",
     "SUBMODULE_CACHE_S3_PATH",
     "TEXT_CONTENT_EXTENSIONS",

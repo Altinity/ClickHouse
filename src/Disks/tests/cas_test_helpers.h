@@ -12,6 +12,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
@@ -27,20 +28,27 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.h>
 #include <Common/Exception.h>
+#include <Common/Logger.h>
+#include <Common/logger_useful.h>
 #include <Common/SipHash.h>
 #include <Common/thread_local_rng.h>
 
 #include <base/hex.h>
 #include <city.h>
 
+#include <Poco/StreamChannel.h>
+
 #include <gtest/gtest.h>
+#include <sstream>
 #include <IO/HashingReadBuffer.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteBufferFromString.h>
 /// For `ChunkFaultBackend`'s `DefiniteFailure` mode, which needs a real S3-classified error, and for
 /// the ambiguity it raises otherwise.
 #include <IO/S3Common.h>
+#include <Poco/AutoPtr.h>
 #include <Poco/Exception.h>
+#include <Poco/StreamChannel.h>
 
 #include <algorithm>
 #include <atomic>
@@ -53,8 +61,10 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -80,11 +90,43 @@ namespace DB::ErrorCodes
 namespace DB::Cas::tests
 {
 
+/// Redirects the named logger into a string for the scope, at the given level.
+class ScopedLoggerCapture
+{
+public:
+    ScopedLoggerCapture(const String & logger_name, const String & level)
+        : logger(getLogger(logger_name))
+        , channel(new Poco::StreamChannel(stream))
+        , old_channel(logger->getChannel(), /*shared=*/true)
+        , old_level(logger->getLevel())
+    {
+        logger->setChannel(channel.get());
+        logger->setLevel(level);
+    }
+
+    ~ScopedLoggerCapture()
+    {
+        logger->setChannel(old_channel);
+        logger->setLevel(old_level);
+    }
+
+    String captured() const { return stream.str(); }
+
+private:
+    LoggerPtr logger;
+    std::ostringstream stream; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+    Poco::AutoPtr<Poco::StreamChannel> channel;
+    /// A real reference (shared=true), so the parked previous channel cannot die while ours is installed.
+    Poco::AutoPtr<Poco::Channel> old_channel;
+    int old_level;
+};
+
 /// A `CasRequests` over an always-open fence, for a fixture that has a backend but no mounted pool.
 /// Every operation admitted from it holds a reference to it, so it must be named and outlive them.
 inline DB::Cas::CasRequests openRequestsForTest(DB::Cas::BackendPtr backend)
 {
-    return DB::Cas::CasRequests(std::move(backend), DB::Cas::Fence::open());
+    return DB::Cas::CasRequests(
+        std::move(backend), DB::Cas::Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
 }
 
 /// The same, for a fixture holding only a reference. The aliasing `shared_ptr` owns nothing, so the
@@ -94,6 +136,49 @@ inline DB::Cas::CasRequests openRequestsForTest(DB::Cas::Backend & backend)
     return openRequestsForTest(DB::Cas::BackendPtr(std::shared_ptr<void>(), &backend));
 }
 
+/// Routes one logger into memory at `level` for the scope, then restores its channel and level.
+class ScopedLogCapture
+{
+public:
+    ScopedLogCapture(const String & logger_name, const String & level)
+        : logger(getLogger(logger_name))
+        , channel(new Poco::StreamChannel(stream))
+        , old_channel(logger->getChannel(), /*shared=*/true)
+        , old_level(logger->getLevel())
+    {
+        logger->setChannel(channel.get());
+        logger->setLevel(level);
+    }
+
+    ~ScopedLogCapture()
+    {
+        logger->setChannel(old_channel);
+        logger->setLevel(old_level);
+    }
+
+    ScopedLogCapture(const ScopedLogCapture &) = delete;
+    ScopedLogCapture & operator=(const ScopedLogCapture &) = delete;
+
+    String captured() const { return stream.str(); }
+
+    size_t count(std::string_view needle) const
+    {
+        const String haystack = captured();
+        size_t n = 0;
+        for (size_t pos = 0; (pos = haystack.find(needle, pos)) != String::npos; pos += needle.size())
+            ++n;
+        return n;
+    }
+
+private:
+    LoggerPtr logger;
+    std::ostringstream stream; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+    Poco::AutoPtr<Poco::StreamChannel> channel;
+    /// `shared=true`: the parked channel is not ours, so take a reference instead of stealing one.
+    Poco::AutoPtr<Poco::Channel> old_channel;
+    int old_level;
+};
+
 /// An open-fence operation together with the `CasRequests` it refers to, for a fixture that holds a
 /// backend and needs to call a production entry point taking a `CasOperation &`. Neither copyable nor
 /// movable: the operation points at the member beside it.
@@ -101,7 +186,8 @@ class OperationForTest
 {
 public:
     explicit OperationForTest(DB::Cas::BackendPtr backend)
-        : requests(std::move(backend), DB::Cas::Fence::open()), operation(requests.admit())
+        : requests(std::move(backend), DB::Cas::Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs)
+        , operation(requests.admit())
     {
     }
 
@@ -249,7 +335,7 @@ inline DB::ContentAddressedSettings makeSettingsForTest(const std::string & serv
 }
 
 /// A clock that only ever moves when something sleeps on it, plus the record of every sleep it
-/// served. Injected into `CasRequests` so a policy's whole 90-second deadline is exercised in a test
+/// served. Injected into `CasRequests` so a policy's whole request window is exercised in a test
 /// that takes no wall-clock time, and so the schedule itself -- how many pauses, how long -- becomes
 /// an assertion rather than a wait. `now` is atomic and `sleeps` is mutex-guarded because a
 /// decommission session's background mount-lease renewer reads this same clock (via
@@ -278,6 +364,39 @@ struct FakeClock
 private:
     std::mutex sleeps_mutex;
 };
+
+/// Raises or lowers the process read ceiling for one scope, so a test can read a generation this build
+/// does not yet advertise, or act as an older reader.
+struct ScopedReadCeiling
+{
+    explicit ScopedReadCeiling(uint32_t ceiling) { setReadCeilingForTest(ceiling); }
+    ~ScopedReadCeiling() { setReadCeilingForTest(std::nullopt); }
+    ScopedReadCeiling(const ScopedReadCeiling &) = delete;
+    ScopedReadCeiling & operator=(const ScopedReadCeiling &) = delete;
+};
+
+/// A `RefCkpt` from named fields; designated initializers must spell every field without a default.
+inline RefCkpt refCkptOf(
+    std::optional<uint64_t> life_epoch, std::optional<RefTxnId> committed_through = std::nullopt,
+    std::optional<RefTxnId> checkpoint_snapshot_id = std::nullopt, std::optional<RefTxnId> last_epoch_seal = std::nullopt)
+{
+    RefCkpt ckpt;
+    ckpt.life_epoch = life_epoch;
+    ckpt.committed_through = committed_through;
+    ckpt.checkpoint_snapshot_id = checkpoint_snapshot_id;
+    ckpt.last_epoch_seal = last_epoch_seal;
+    return ckpt;
+}
+
+/// An epoch-seal transaction (a tombstone when `next_epoch` is set) at `id`.
+inline RefLogTxn tombstoneTxn(const String & ns, RefTxnId id, std::optional<uint64_t> next_epoch, std::optional<RefTxnId> prev = std::nullopt)
+{
+    RefOp seal;
+    seal.kind = RefOpKind::EpochSeal;
+    RefLogTxn txn{ns, id, {seal}, prev};
+    txn.next_epoch = next_epoch;
+    return txn;
+}
 
 /// Run `fn`, expect a DB::Exception with EXACTLY `expected_code` (CORRUPTED_DATA-vs-NOT_IMPLEMENTED
 /// is part of the fail-closed contract: an unknown future format must be NOT_IMPLEMENTED, never
@@ -761,6 +880,24 @@ inline void injectCondemnedSummarySeal(
         (*operation).create(layout.gcStateKey(), state, DB::Cas::Retry::standard());
     else
         (*operation).replace(layout.gcStateKey(), state, existing_state->etag, DB::Cas::Retry::standard());
+}
+
+/// Runs `CasRefCatalog::deleteCompletedRemovingAtSnapshot` on a fresh catalog read, with no retirement
+/// record: the erase alone. A refused proof returns before any read.
+inline DB::Cas::CasRefCatalog::CompletedRemovingDeleteResult deleteCompletedRemovingForTest(
+    DB::Cas::CasOperation & op, const DB::Cas::Layout & layout, const DB::Cas::CatalogEntry & observed,
+    const DB::Cas::CasFoldSeal & authoritative_parent, const std::function<void()> & refresh_authority)
+{
+    using Outcome = DB::Cas::CasRefCatalog::CompletedRemovingDeleteOutcome;
+    const auto parent_it = authoritative_parent.ref_lives.find(observed.incarnation);
+    if (observed.state != DB::Cas::NsState::Removing || !observed.removal_started_round
+        || parent_it == authoritative_parent.ref_lives.end()
+        || !parent_it->second.cleanup_evidence
+        || parent_it->second.coverage.hold)
+        return {.outcome = Outcome::ProofRefused, .invalidated_life = std::nullopt, .catalog_snapshot = std::nullopt};
+    return DB::Cas::CasRefCatalog::deleteCompletedRemovingAtSnapshot(
+        op, layout, DB::Cas::CasRefCatalog::read(op, layout), observed, authoritative_parent, refresh_authority,
+        /*before_erase=*/{}, /*erase_acknowledged=*/{});
 }
 
 /// Whether blob `hash` is absent from the backend (its exact-token content object is gone).
@@ -1264,7 +1401,7 @@ inline uint64_t foldCursorOf(
 
 /// Set a server root's durable floor (so orphan-sweep eligibility can be driven). After the ack-floor
 /// merge the floor rides the mount lease body (`mountKey`), so this seeds a MountLease carrying
-/// `{writer_epoch, min_active_build_sequence}` — exactly what `prefixEligible` reads.
+/// `{writer_epoch, min_active_build_sequence}` — exactly what `buildPrefixEligibleUnderFloor` reads.
 inline void setWatermarkMinActive(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const String & server_root_id,
     uint64_t writer_epoch, uint64_t min_active_build_sequence)
@@ -1369,7 +1506,7 @@ inline void writeRecoverableCkptForRawFixture(
             "raw recovery fixture for namespace '{}' has no catalog entry", ns.string());
 
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(it->ns, it->incarnation);
-    const WriteResult put = (*operation).create(layout.refCkptKey(life), encodeRefCkpt(ckpt),
+    const WriteResult put = (*operation).create(layout.refCkptKey(life), encodeRefCkptAtGeneration(ckpt, 1),
                                                 DB::Cas::Retry::standard());
     if (!std::holds_alternative<DB::Cas::Committed>(put))
         throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
@@ -1405,7 +1542,7 @@ inline void advanceRecoverableCkptForRawFixture(
     RefCkpt advanced = sample->ckpt;
     advanced.committed_through = through;
     if (!std::holds_alternative<DB::Cas::Committed>(
-            (*operation).replace(layout.refCkptKey(life), encodeRefCkpt(advanced), sample->etag,
+            (*operation).replace(layout.refCkptKey(life), encodeRefCkptAtGeneration(advanced, 1), sample->etag,
                                  DB::Cas::Retry::standard())))
         throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
             "raw recovery fixture for namespace '{}' could not advance its checkpoint", ns.string());
@@ -1445,7 +1582,7 @@ inline void replaceRecoverableCkptForRawFixture(
             "raw recovery fixture for namespace '{}' cannot regress its checkpoint frontier", ns.string());
 
     if (!std::holds_alternative<DB::Cas::Committed>(
-            (*operation).replace(layout.refCkptKey(life), encodeRefCkpt(next), existing->etag,
+            (*operation).replace(layout.refCkptKey(life), encodeRefCkptAtGeneration(next, 1), existing->etag,
                                  DB::Cas::Retry::standard())))
         throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
             "raw recovery fixture for namespace '{}' could not replace its checkpoint", ns.string());
@@ -1469,12 +1606,12 @@ inline void publishRecoverableCkptForSemanticWrapper(
     {
         const WriteResult put = (*operation).create(
             layout.refCkptKey(*life),
-            encodeRefCkpt(RefCkpt{
+            encodeRefCkptAtGeneration(RefCkpt{
                 .life_epoch = 1,
                 .committed_through = txn_id,
                 .checkpoint_snapshot_id = std::nullopt,
                 .last_epoch_seal = std::nullopt,
-            }),
+            }, 1),
             DB::Cas::Retry::standard());
         if (std::holds_alternative<DB::Cas::Committed>(put))
             return;
@@ -1527,15 +1664,14 @@ inline DB::Cas::RecoveredRefTable recoverRefTableDetailedAtCatalogCutForTest(
         catalog_entry = *it;
 
     OperationForTest operation(backend);
-    std::optional<RefCkpt> ckpt;
+    std::optional<CkptSample> ckpt;
     if (catalog_entry)
     {
         const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(catalog_entry->ns, catalog_entry->incarnation);
-        if (const std::optional<CkptSample> sample = readCkpt(*operation, layout, life))
-            ckpt = sample->ckpt;
+        ckpt = readCkpt(*operation, layout, life);
     }
 
-    return recoverRefTableDetailedFromAuthority(*operation, layout, catalog_entry, ckpt);
+    return recoverRefTableDetailedFromAuthority(*operation, layout, catalog_entry, ckpt).value();
 }
 
 /// Writes `txn` at `_log/<txn_id>` (create-if-absent). Admits `txn.ns` into the catalog first
@@ -1559,7 +1695,12 @@ inline void writeRefLogTxnRaw(
     const NamespaceLifeId life
         = CasRefCatalog::lifeIfCataloged(*operation, layout, ns).value_or(fixture::fixtureLife(ns));
     const String key = layout.refLogKey(life, txn.txn_id);
-    (*operation).create(key, DB::Cas::sealObject(DB::Cas::FormatId::RefLog, DB::Cas::encodeRefLogTxn(txn)), DB::Cas::Retry::standard());
+    /// A seal without `next_epoch` is an old-format record, which only a header below 3 can carry: write
+    /// the bytes a build before generation 3 wrote for it.
+    const bool old_format_seal = DB::Cas::refLogTxnIsEpochSeal(txn) && !txn.next_epoch;
+    const String text = old_format_seal ? DB::Cas::encodeRefLogTxnAtGeneration(txn, DB::Cas::G_WRITE_FLOOR)
+                                        : DB::Cas::encodeRefLogTxn(txn);
+    (*operation).create(key, DB::Cas::sealObject(DB::Cas::FormatId::RefLog, text), DB::Cas::Retry::standard());
 }
 
 namespace fixture
@@ -2278,6 +2419,32 @@ private:
 
 /// The plain form, over a bare `InMemoryBackend`.
 using HintHoleBackend = HintHoleBackendOn<DB::Cas::InMemoryBackend>;
+
+/// GC's fence-out applied directly to the mount lease: preserve the body, set `gc_fenced`, bump `seq`.
+/// A following `tryRemountOnce` reclaims a fresh incarnation.
+inline void fenceOutMountForTest(DB::Cas::Backend & backend, const String & mount_key)
+{
+    OperationForTest op(backend);
+    const auto got = (*op).read(mount_key, DB::Cas::Retry::once());
+    ASSERT_TRUE(got.has_value());
+    const DB::Cas::MountLease fenced = DB::Cas::decodeMountLease(got->bytes).fencedCopy();
+    const auto put = (*op).replace(mount_key, DB::Cas::encodeMountLease(fenced), got->etag, DB::Cas::Retry::once());
+    ASSERT_TRUE(std::holds_alternative<DB::Cas::Committed>(put));
+}
+
+/// A decommission tombstone by hand: the next owner life, retired, keeping a verified mark of a retired owner;
+/// `verified` also marks it, as a completed run does.
+inline void tombstoneOwnerForTest(DB::Cas::Backend & backend, const String & owner_key, bool verified = false)
+{
+    OperationForTest op(backend);
+    const auto current = (*op).read(owner_key, DB::Cas::Retry::once());
+    ASSERT_TRUE(current.has_value());
+    const DB::Cas::OwnerObject owner = DB::Cas::decodeOwner(current->bytes);
+    const DB::Cas::OwnerObject tombstone = DB::Cas::nextOwnerLife(
+        owner, 1, verified || (owner.retirement_verified && owner.retired_at_ms.has_value()));
+    const auto put = (*op).replace(owner_key, DB::Cas::encodeOwner(tombstone), current->etag, DB::Cas::Retry::once());
+    ASSERT_TRUE(std::holds_alternative<DB::Cas::Committed>(put));
+}
 
 /// Stand in for the self-remount that `Pool::reportImpossibleInterference` schedules. That reaction
 /// trips the local write fence closed AND schedules a remount; a unit-test Pool runs no background

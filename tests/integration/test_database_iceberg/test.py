@@ -2036,6 +2036,44 @@ def test_create_table_with_engine_unsupported_clauses(started_cluster):
     assert "PRIMARY KEY, SAMPLE BY, TTL, and UNIQUE KEY are not supported" in err
 
 
+def test_create_table_with_engine_settings(started_cluster):
+    # A table-level setting that would be lost when the table is reopened must be rejected.
+    node = started_cluster.instances["node1"]
+    namespace = f"engine_settings_{uuid.uuid4().hex[:8]}"
+
+    def create_table(name, settings):
+        return (
+            f"CREATE TABLE {CATALOG_NAME}.`{namespace}.{name}` (id Int64) "
+            f"ENGINE = IcebergS3('http://minio1:9001/warehouse-rest/{namespace}/{name}/', "
+            f"'{minio_access_key}', '{minio_secret_key}') SETTINGS {settings}"
+        )
+
+    query_settings = {"allow_database_iceberg": 1, "write_full_path_in_iceberg_metadata": 1}
+
+    create_clickhouse_iceberg_database(
+        started_cluster, node, CATALOG_NAME, {"iceberg_recent_metadata_file_by_last_updated_ms_field": 1}
+    )
+
+    err = node.query_and_get_error(
+        create_table("by_last_updated", "iceberg_recent_metadata_file_by_last_updated_ms_field = 0"), settings=query_settings
+    )
+    assert "Table setting `iceberg_recent_metadata_file_by_last_updated_ms_field` differs from its value in this DataLakeCatalog" in err
+
+    err = node.query_and_get_error(create_table("block_size", "input_format_parquet_max_block_size = 1234"), settings=query_settings)
+    assert "Table setting `input_format_parquet_max_block_size` is not kept by a DataLakeCatalog table" in err
+
+    # A value equal to the database one is kept, the format version is written into the table metadata,
+    # and an obsolete setting does nothing.
+    node.query(
+        create_table(
+            "created",
+            "iceberg_recent_metadata_file_by_last_updated_ms_field = 1, iceberg_format_version = 1, "
+            "allow_dynamic_metadata_for_data_lakes = 0",
+        ),
+        settings=query_settings,
+    )
+
+
 @pytest.mark.parametrize("explicit_engine", [False, True])
 def test_create_table_ignore_unsupported_properties(started_cluster, explicit_engine):
     node = started_cluster.instances["node1"]

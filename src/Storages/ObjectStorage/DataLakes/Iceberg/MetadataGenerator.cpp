@@ -40,16 +40,6 @@ namespace DB
 namespace
 {
 
-Poco::JSON::Object::Ptr deepCopy(Poco::JSON::Object::Ptr obj)
-{
-    std::ostringstream oss; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
-    obj->stringify(oss);
-
-    Poco::JSON::Parser parser;
-    auto result = parser.parse(oss.str());
-    return result.extract<Poco::JSON::Object::Ptr>();
-}
-
 /// Read a numeric `total-*` field from the parent snapshot's summary, returning std::nullopt when absent or null.
 std::optional<Int64> readParentTotal(Poco::JSON::Object::Ptr parent_snapshot, const char * field_name)
 {
@@ -220,6 +210,16 @@ bool isFieldAtRequestedPosition(
     if (!after_column.empty() && after_column != column_name)
         return index > 0 && fields->getObject(index - 1)->getValue<String>(Iceberg::f_name) == after_column;
     return true;
+}
+
+/// `last-column-id` written by some writers does not count nested field ids, so the ids of all schemas are taken into account too.
+Int32 getLastAssignedFieldId(const Poco::JSON::Object::Ptr & metadata_object)
+{
+    Int64 result = metadata_object->getValue<Int32>(Iceberg::f_last_column_id);
+    auto schemas = metadata_object->getArray(Iceberg::f_schemas);
+    for (UInt32 i = 0; i < schemas->size(); ++i)
+        result = std::max(result, Iceberg::IcebergSchemaProcessor::getMaxFieldId(schemas->getObject(i)->getArray(Iceberg::f_fields)));
+    return static_cast<Int32>(result);
 }
 
 }
@@ -393,6 +393,14 @@ Poco::JSON::Object::Ptr MetadataGenerator::getParentSnapshot(Int64 parent_snapsh
     return nullptr;
 }
 
+void MetadataGenerator::appendMetadataLog(const Iceberg::IcebergPathFromMetadata & previous_metadata_file_path, Int64 timestamp_ms)
+{
+    Poco::JSON::Object::Ptr new_metadata_item = new Poco::JSON::Object;
+    new_metadata_item->set(Iceberg::f_metadata_file, previous_metadata_file_path.serialize());
+    new_metadata_item->set(Iceberg::f_timestamp_ms, timestamp_ms);
+    getOrCreateArray(metadata_object, Iceberg::f_metadata_log)->add(new_metadata_item);
+}
+
 MetadataGenerator::NextMetadataResult MetadataGenerator::generateNextMetadata(
     FileNamesGenerator & generator,
     const Iceberg::IcebergPathFromMetadata & previous_metadata_file_path,
@@ -531,12 +539,7 @@ MetadataGenerator::NextMetadataResult MetadataGenerator::generateNextMetadata(
         metadata_object->getObject(Iceberg::f_refs)->getObject(Iceberg::f_main)->set(Iceberg::f_metadata_snapshot_id, snapshot_id);
 
     if (!previous_metadata_file_path.empty())
-    {
-        Poco::JSON::Object::Ptr new_metadata_item = new Poco::JSON::Object;
-        new_metadata_item->set(Iceberg::f_metadata_file, previous_metadata_file_path.serialize());
-        new_metadata_item->set(Iceberg::f_timestamp_ms, timestamp);
-        getOrCreateArray(metadata_object, Iceberg::f_metadata_log)->add(new_metadata_item);
-    }
+        appendMetadataLog(previous_metadata_file_path, timestamp);
     {
         Poco::JSON::Object::Ptr new_snapshot_item = new Poco::JSON::Object;
         new_snapshot_item->set(Iceberg::f_metadata_snapshot_id, snapshot_id);
@@ -639,12 +642,7 @@ MetadataGenerator::NextMetadataResult MetadataGenerator::appendReplaceSnapshot(
         metadata_object->getObject(Iceberg::f_refs)->getObject(Iceberg::f_main)->set(Iceberg::f_metadata_snapshot_id, snapshot_id);
     }
 
-    {
-        Poco::JSON::Object::Ptr new_metadata_item = new Poco::JSON::Object;
-        new_metadata_item->set(Iceberg::f_metadata_file, metadata_file_path.serialize());
-        new_metadata_item->set(Iceberg::f_timestamp_ms, timestamp);
-        metadata_object->getArray(Iceberg::f_metadata_log)->add(new_metadata_item);
-    }
+    appendMetadataLog(metadata_file_path, timestamp);
     {
         Poco::JSON::Object::Ptr new_snapshot_item = new Poco::JSON::Object;
         new_snapshot_item->set(Iceberg::f_metadata_snapshot_id, snapshot_id);
@@ -722,7 +720,7 @@ void MetadataGenerator::generateDropColumnMetadata(const String & column_name)
 {
     const auto next_schema_id = getNextSchemaId(metadata_object);
 
-    auto current_schema = deepCopy(getCurrentSchema());
+    auto current_schema = Iceberg::deepCopy(getCurrentSchema());
 
     auto fields = current_schema->getArray(Iceberg::f_fields);
     UInt32 index_to_drop = static_cast<UInt32>(fields->size());
@@ -831,7 +829,7 @@ void MetadataGenerator::generateAddColumnMetadata(const String & column_name, Da
     Iceberg::checkUnknownTypeAllowed(column_name, type, metadata_object->getValue<Int64>(Iceberg::f_format_version));
     const auto next_schema_id = getNextSchemaId(metadata_object);
 
-    auto current_schema = deepCopy(getCurrentSchema());
+    auto current_schema = Iceberg::deepCopy(getCurrentSchema());
 
     auto existing_fields = current_schema->getArray(Iceberg::f_fields);
     for (UInt32 i = 0; i < existing_fields->size(); ++i)
@@ -840,12 +838,11 @@ void MetadataGenerator::generateAddColumnMetadata(const String & column_name, Da
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Column {} already exists", column_name);
     }
 
-    auto last_column_id = metadata_object->getValue<Int32>(Iceberg::f_last_column_id);
     /// The new top-level field takes the next id; nested tuple/array/map
     /// children (when `type` is complex) take the ids after it via the shared
     /// `iter`. After getIcebergType `iter` is the max assigned id, which is what
     /// last-column-id must record so every added child gets a globally unique id.
-    Int32 new_field_id = last_column_id + 1;
+    Int32 new_field_id = getLastAssignedFieldId(metadata_object) + 1;
     Int32 iter = new_field_id;
     auto format_version = metadata_object->getValue<UInt64>(Iceberg::f_format_version);
     auto new_type = Iceberg::getIcebergType(type, iter, format_version);
@@ -992,7 +989,7 @@ bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name,
     }
 
     const auto next_schema_id = getNextSchemaId(metadata_object);
-    current_schema = deepCopy(current_schema);
+    current_schema = Iceberg::deepCopy(current_schema);
     schema_fields = current_schema->getArray(Iceberg::f_fields);
     auto target_field = schema_fields->getObject(target_index);
 
@@ -1043,7 +1040,7 @@ bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name,
 
 void MetadataGenerator::generateRenameColumnMetadata(const String & column_name, const String & new_column_name)
 {
-    auto current_schema = deepCopy(getCurrentSchema());
+    auto current_schema = Iceberg::deepCopy(getCurrentSchema());
 
     auto schema_fields = current_schema->getArray(Iceberg::f_fields);
 

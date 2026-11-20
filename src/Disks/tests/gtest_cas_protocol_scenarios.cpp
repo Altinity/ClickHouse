@@ -50,6 +50,7 @@ using DB::Cas::tests::loadMetaForTest;
 using DB::Cas::tests::streamingHexOf;
 using DB::Cas::tests::u128Of;
 using DB::Cas::tests::writeBlobRaw;
+using DB::Cas::tests::writeMetaClean;
 
 namespace
 {
@@ -190,8 +191,9 @@ TEST(CASProtocol, RevalidateReObservesStaleTokenKeepsWhenUnchanged)
     auto s = openPool(b);
     const RootNamespace ns{"srv1/tbl"};
 
-    /// X pre-exists out-of-band; the build dedup-adopts it via putBlob (records the current token t0).
+    /// X and its `Clean` marker pre-exist out-of-band; the build dedup-adopts X via putBlob (token t0).
     writeBlobRaw(*b, s->layout(), "payload-X", s->poolMeta().blob_header_len, s->poolMeta().pool_id);
+    writeMetaClean(*b, s->layout(), u128Of("payload-X"), 9);
     const String blob_key = s->layout().blobKey(idOf("payload-X"));
     const Etag t0 = currentIncarnation(*b, blob_key);
 
@@ -199,7 +201,7 @@ TEST(CASProtocol, RevalidateReObservesStaleTokenKeepsWhenUnchanged)
     auto build = startBuildFor(s, ns, "part_1");
     const ManifestId id = build->stageManifest({blobEntry("data.bin", "payload-X")});
     build->precommitAdd(ns, "part_1", id);
-    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts t0
+    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// adopts t0 on its `Clean` marker
 
     /// GC advanced the round to 1 with an EMPTY retired set; fence to 1. X is NOT condemned and its
     /// token is unchanged.
@@ -224,6 +226,7 @@ TEST(CASProtocol, RevalidateReObservesStaleTokenAdoptsWhenDisplaced)
     const RootNamespace ns{"srv1/tbl"};
 
     writeBlobRaw(*b, s->layout(), "payload-X", s->poolMeta().blob_header_len, s->poolMeta().pool_id);
+    writeMetaClean(*b, s->layout(), u128Of("payload-X"), 9);
     const String blob_key = s->layout().blobKey(idOf("payload-X"));
     const Etag t0 = currentIncarnation(*b, blob_key);
 
@@ -231,7 +234,7 @@ TEST(CASProtocol, RevalidateReObservesStaleTokenAdoptsWhenDisplaced)
     /// Wiring order (EDGE-BEFORE-OBSERVE): stageManifest -> precommitAdd -> putBlob.
     const ManifestId id = build->stageManifest({blobEntry("data.bin", "payload-X")});
     build->precommitAdd(ns, "part_1", id);
-    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts t0
+    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// adopts t0 on its `Clean` marker
 
     /// Another writer displaces X out-of-band ⇒ a new current token t1 (same payload, fresh tag).
     const Etag t1 = displaceBlobToken(*b, s->layout(), idOf("payload-X"));
@@ -240,7 +243,7 @@ TEST(CASProtocol, RevalidateReObservesStaleTokenAdoptsWhenDisplaced)
     /// GC advanced to round 1 with an EMPTY retired set; fence to 1.
     injectRetire(*b, s->layout(), /*round*/ 1, /*shard*/ 0, {});
 
-    /// promote refreshes ⇒ revalidate X ⇒ HEAD current t1 not condemned ⇒ commit. The dep rides t1.
+    /// promote: X's dependency proof from `putBlob` suffices, with no `HEAD` ⇒ commit.
     build->promote(ns, "part_1", build->buildId(), id);
     assertPartReads(b, s, ns, "part_1", "data.bin", "payload-X");
     EXPECT_EQ(currentIncarnation(*b, blob_key), t1);
@@ -269,6 +272,7 @@ TEST(CASProtocol, RevalidateAdoptsLiveTokenWhenOnlyPhantomCondemnedAtDifferentTo
     {
         auto s0 = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
         writeBlobRaw(*b, s0->layout(), "payload-X", s0->poolMeta().blob_header_len, s0->poolMeta().pool_id);
+        writeMetaClean(*b, s0->layout(), u128Of("payload-X"), 9);
     }
     const String blob_key = layout.blobKey(idOf("payload-X"));
     const Etag t0 = currentIncarnation(*b, blob_key);
@@ -285,7 +289,7 @@ TEST(CASProtocol, RevalidateAdoptsLiveTokenWhenOnlyPhantomCondemnedAtDifferentTo
     auto build = startBuildFor(s, ns, "part_1");
     const ManifestId id = build->stageManifest({blobEntry("data.bin", "payload-X")});
     build->precommitAdd(ns, "part_1", id);
-    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts t0
+    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// adopts t0 on its `Clean` marker
 
     /// promote: the materialized leaf is edge-protected (not re-observed) ⇒ commit. Lands. t0 untouched.
     build->promote(ns, "part_1", build->buildId(), id);
@@ -480,6 +484,7 @@ TEST(CASProtocol, DisplacedToLiveTokenCommitsAtCurrentIncarnation)
     const RootNamespace ns{"srv1/tbl"};
 
     writeBlobRaw(*b, s->layout(), "payload-X", s->poolMeta().blob_header_len, s->poolMeta().pool_id);
+    writeMetaClean(*b, s->layout(), u128Of("payload-X"), 9);
     const String blob_key = s->layout().blobKey(idOf("payload-X"));
     const Etag t0 = currentIncarnation(*b, blob_key);
 
@@ -487,7 +492,7 @@ TEST(CASProtocol, DisplacedToLiveTokenCommitsAtCurrentIncarnation)
     /// Wiring order (EDGE-BEFORE-OBSERVE): stageManifest -> precommitAdd -> putBlob.
     const ManifestId id = build->stageManifest({blobEntry("data.bin", "payload-X")});
     build->precommitAdd(ns, "part_1", id);
-    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts t0
+    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// adopts t0 on its `Clean` marker
 
     /// Another writer displaces X to t1 (uncondemned) before our gate runs.
     const Etag t1 = displaceBlobToken(*b, s->layout(), idOf("payload-X"));
@@ -497,7 +502,7 @@ TEST(CASProtocol, DisplacedToLiveTokenCommitsAtCurrentIncarnation)
     injectRetire(*b, s->layout(), /*round*/ 1, /*shard*/ 0,
         {RetiredEntry{.kind = ObjectKind::Blob, .ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("payload-X"))}, .token = PersistedEtag::capture(t0), .size = 9}});
 
-    /// promote: revalidate X ⇒ HEAD current t1 (NOT condemned; only the defunct t0 is) ⇒ commit.
+    /// promote: X's dependency proof from `putBlob` suffices, with no `HEAD` ⇒ commit.
     build->promote(ns, "part_1", build->buildId(), id);
 
     /// The blob lives at t1 (the displacing writer's incarnation) and the part reads.
@@ -649,8 +654,7 @@ TEST(CASProtocol, DISABLED_RevalidateAbsentTreeDepRecreates)
 {
     GTEST_SKIP() << "Obsolete (tree model). The gate's 'absent tree dep recreated from retained "
                     "payload' behavior has no manifest analog: a part manifest body is staged ONCE by "
-                    "stageManifest and promote never re-creates it — an absent/invalid body at promote "
-                    "fails closed (ABORTED). The blob-leaf absent-recreate case is covered by putBlob's "
+                    "stageManifest and promote never re-creates it. The blob-leaf absent-recreate case is covered by putBlob's "
                     "INV-1 re-upload-from-source path, not by the publish gate.";
 }
 

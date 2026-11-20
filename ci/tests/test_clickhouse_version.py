@@ -180,7 +180,7 @@ def test_version_log_mirrors_version_into_workflow_custom_data(monkeypatch):
     version_log._add_build_to_version_history()
 
     assert stored["kv"] == config.custom_data["version"]
-    assert stored["cidb"][0] == "version_history"
+    assert "cidb" not in stored
 
 
 def test_source_upload_prefers_pipeline_version(monkeypatch):

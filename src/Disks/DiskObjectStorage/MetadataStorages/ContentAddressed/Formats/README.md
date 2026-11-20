@@ -19,9 +19,9 @@ trailer, followed by a banner-framed raw payload zone for inline file bytes.
 | Key (under the pool prefix) | Object | Codec | Writer |
 |---|---|---|---|
 | `_pool_meta` | pool identity + floors (`pool_id`, `blob_header_len`, `gc_shards`, `min_reader_generation`, `algos_used` array) | `CasPoolMetaFormat` | pool create/admit |
-| `cas/ns/stream/<life_id>/_log/…​.zst` | ref transaction log (`namespace`, `txn_epoch`/`txn_seq`, optional critical `!prev_epoch`/`!prev_seq`; `set_published_at` uses `ref`/`published_ms`) | `CasRefLogFormat` (`.zst`) | writer commit path |
+| `cas/ns/stream/<life_id>/_log/…​.zst` | ref transaction log (`namespace`, `txn_epoch`/`txn_seq`, optional critical `!prev_epoch`/`!prev_seq`, and `!next_epoch` on a tombstone; `set_published_at` uses `ref`/`published_ms`) | `CasRefLogFormat` (`.zst`) | writer commit path |
 | `cas/ns/stream/<life_id>/_snap/…​.zst` | complete live ref table (`namespace`, `snapshot_epoch`/`snapshot_seq`, `lifecycle:"live"`; `kind` is `committed`/`precommit`, with `ref` and committed-only `published_ms`) | `CasRefSnapshotFormat` (`.zst`) | writer/GC fold |
-| `cas/ns/state/<life_id>/_ckpt` | mutable life checkpoint (`life_epoch`, `committed_epoch`/`committed_seq`, `snapshot_epoch`/`snapshot_seq`, `seal_epoch`/`seal_seq`) | `CasRefCkptFormat` | writer/GC fold |
+| `cas/ns/state/<life_id>/_ckpt` | mutable life checkpoint: generation 3 holds `life_epoch` and `snapshot_epoch`/`snapshot_seq`; generations 1 and 2 also `committed_epoch`/`committed_seq`, `seal_epoch`/`seal_seq` (read only) | `CasRefCkptFormat` | namespace creation, snapshot publication, the generation 3 stamp |
 | `cas/ns/state/<life_id>/_files/…​` | namespace-owned raw files | — | upper layers |
 | `cas/ref_catalog` | namespace lifecycle catalog (`kind:"entry"`, `ns`, `state`, `life`, `remove_round`, `creator`, `creator_epoch`, `creator_fence`) | `CasRefCatalogFormat` | namespace admission/removal |
 | `cas/manifests/<ns>/<epoch-hex>-<seq-hex>/<ordinal>.zst` | part manifest (`namespace`, `payload_digest`; entry `path`, `place`, `size`) | `CasPartManifestFormat` | part build |
@@ -32,7 +32,7 @@ trailer, followed by a banner-framed raw payload zone for inline file bytes.
 | `gc/gen/<g>/attempt/<a>/outcomes/…​.zst` | outcome log (`kind`, `outcome`) | `CasGcOutcomesFormat` (`.zst`) | GC |
 | `gc/gen/<g>/attempt/<a>/fold_seal` | fold seal (deterministic; `generation`/`parent_generation`, `kind`: `ref_life`/`blob_run`/`condemned`) | `CasFoldSealFormat` | GC |
 | `gc/gen/<g>/…​/runs` | GC source-edge record-stream runs (`ref`, `src`, `mark`; condemned: `pending`, `size`, `condemn_round`, `confirmed`) | `CasRecordStreamFormat` | GC |
-| `gc/server-roots/<srid>/{owner,epoch,mount}` | server-root singletons (`server_uuid`, optional `retired_at_ms`; `next_writer_epoch`; `server_uuid`, `writer_epoch`, `hostname`, `pid`, `started_at_ms`, `seq`, `expires_at_ms`, `min_active_build_sequence`, `gc_fenced`, `write_attempt_id`) | `CasServerRootFormats` | mount |
+| `gc/server-roots/<srid>/{owner,epoch,mount}` | server-root singletons (`server_uuid`, optional `retired_at_ms`, optional `owner_life` (u64 decimal string; absent in 26.6.4 bodies, read as 0; additive, no `v` bump), optional `retirement_verified` (bool; absent = false); `next_writer_epoch`, optional `allocation_nonce` (32 lowercase hex, drawn once per allocation decision; absent in 26.6.4 bodies, which still decode; additive ordinary key, no `v` bump); `server_uuid`, `writer_epoch`, `hostname`, `pid`, `started_at_ms`, `seq`, `expires_at_ms`, `min_active_build_sequence`, `gc_fenced`, `write_attempt_id`) | `CasServerRootFormats` | mount |
 | `roots/…` | raw passthrough (verbatim) | — (never interpreted) | upper layers |
 
 ## Codec table
@@ -90,7 +90,8 @@ use the corresponding `old_*` and `new_*` key bundles.
 ## Generation history {#generation-history}
 
 The generation history starts at a flat `{1, 1}` baseline (reset before 26.6.4, the first release whose
-pools persist). Current generations: `G_BUILD == 2` (the highest a reader accepts), `G_WRITE_FLOOR == 1` (stamped on
-ordinary objects). Only ref-log transactions that carry a `Move` op are stamped 2.
+pools persist). Current generations: `G_BUILD == 3` (the highest a reader accepts), `G_WRITE_FLOOR == 1` (stamped on
+ordinary objects). A ref-log transaction with `!next_epoch` or `!prev_epoch` and every `_ckpt` are stamped 3; any other
+ref-log transaction that carries a `Move` op is stamped 2.
 Every class's `changePoints` begins at generation 1; a future breaking change appends a real entry to
 that class's own array and bumps `G_BUILD`, the same way it always has.

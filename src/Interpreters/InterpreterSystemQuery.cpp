@@ -588,8 +588,7 @@ BlockIO InterpreterSystemQuery::execute()
             getContext()->checkAccess(AccessType::SYSTEM_DROP_COMPILED_EXPRESSION_CACHE);
             if (auto * cache = CompiledExpressionCacheFactory::instance().tryGetCache())
                 cache->clear();
-            /// Drop the static CHJIT slots so persistent LLVM state (`TargetMachine`, `Subtarget`,
-            /// `LLVMContext`-interned types/constants accumulated across compiles) is reclaimed too.
+            /// Drop the static CHJIT slots so persistent LLVM state (`TargetMachine`, `Subtarget`) is reclaimed too.
             /// Each in-flight compile and each cache holder retains its own `shared_ptr<CHJIT>`, so
             /// concurrent operations are not affected: the actual CHJIT survives until every user
             /// has released its handle. After the cache->clear() above, the only remaining
@@ -1212,8 +1211,9 @@ BlockIO InterpreterSystemQuery::execute()
                 {"manifest_debris_removed", std::make_shared<DataTypeUInt64>()},
                 {"staging_objects_removed", std::make_shared<DataTypeUInt64>()},
                 {"mountpoint_objects_removed", std::make_shared<DataTypeUInt64>()},
-                {"slot_removed", std::make_shared<DataTypeUInt8>()},
+                {"member_retired", std::make_shared<DataTypeUInt8>()},
                 {"warnings", std::make_shared<DataTypeString>()},
+                {"namespaces_pending_gc", std::make_shared<DataTypeUInt64>()},
             }};
             Block sample_block;
             for (const auto & column : columns)
@@ -1229,8 +1229,9 @@ BlockIO InterpreterSystemQuery::execute()
             res_columns[i++]->insert(report.manifest_debris_removed);
             res_columns[i++]->insert(report.staging_objects_removed);
             res_columns[i++]->insert(report.mountpoint_objects_removed);
-            res_columns[i++]->insert(static_cast<UInt8>(report.slot_removed));
+            res_columns[i++]->insert(static_cast<UInt8>(report.member_retired));
             res_columns[i++]->insert(fmt::format("{}", fmt::join(report.warnings, "; ")));
+            res_columns[i++]->insert(report.namespaces_pending_gc);
 
             size_t num_rows = res_columns[0]->size();
             auto source = std::make_shared<SourceFromSingleChunk>(std::make_shared<const Block>(std::move(sample_block)), Chunk(std::move(res_columns), num_rows));

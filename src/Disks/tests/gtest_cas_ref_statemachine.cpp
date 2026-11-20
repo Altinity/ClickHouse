@@ -9,6 +9,7 @@
 #include <base/scope_guard.h>
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <random>
 #include <vector>
@@ -217,19 +218,6 @@ TEST(CASRefStateMachine, BirthWhileLiveRejectedAndStateUnchanged)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {birthOp()})); });
     expectStatesEqual(before, state);
-}
-
-TEST(CASRefStateMachine, BirthAfterRemovalAccepts)
-{
-    RefTableState state;
-    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp()}));
-    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {removeNamespaceOp()}));
-    ASSERT_EQ(state.getLifecycle(), RefLifecycle::Removed);
-    ASSERT_TRUE(state.getRemoveTxnId().has_value());
-
-    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 3}, {birthOp()}));
-    EXPECT_EQ(state.getLifecycle(), RefLifecycle::Live);
-    EXPECT_FALSE(state.getRemoveTxnId().has_value());
 }
 
 /// ===================================================================================
@@ -672,7 +660,7 @@ TEST(CASRefStateMachine, WholeTxnAtomicityLastOpFailureLeavesStateUntouched)
 /// ===================================================================================
 
 /// A table's durable ids are DENSE within `(namespace, epoch)`: the only admissible id is the one
-/// `nextRefTxnId` derives from `greatest_applied`, which is also the only id the writer ever mints.
+/// `nextRefSlot` derives from the applied state, which is also the only id the writer ever mints.
 /// Equal, lower, and skipped ids are all corruption -- the last of those is what makes "I can see ids
 /// 1..T" mean "nothing is missing", the property the whole invariant exists to provide.
 TEST(CASRefStateMachine, ContiguousTxnIdsRejectEqualLowerAndSkipped)
@@ -704,12 +692,17 @@ TEST(CASRefStateMachine, ContiguousTxnIdsRejectEqualLowerAndSkipped)
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {addPrecommitOp("a", manifestRef(1, 1, 1))}));
     EXPECT_EQ(state.getGreatestApplied(), (RefTxnId{1, 2}));
 
-    /// Crossing into a new epoch needs INV-2's chain link as well as INV-1's id: without it the reader
-    /// cannot tell an EMPTY epoch from a lost one, so a sequence-1 transaction that names no seal is
-    /// refused on a Live table. Both halves are pinned, since either alone would be silently weaker.
+    /// Crossing into a new epoch needs the seal that closes epoch 1 applied first, and the next head
+    /// must name it: without both the reader cannot tell an EMPTY epoch from a lost one.
     RefLogTxn crossing = makeTxn(kNs, RefTxnId{2, 1}, {addPrecommitOp("b", manifestRef(2, 1, 1))});
+    crossing.prev_epoch_seal = RefTxnId{1, 3};
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { applyRefLogTxn(state, crossing); });
-    crossing.prev_epoch_seal = RefTxnId{1, 3};   /// the seal that closed epoch 1, one past its last id
+    RefOp seal;
+    seal.kind = RefOpKind::EpochSeal;
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 3}, {seal}));
+    crossing.prev_epoch_seal.reset();
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { applyRefLogTxn(state, crossing); });
+    crossing.prev_epoch_seal = RefTxnId{1, 3};
     applyRefLogTxn(state, crossing);
     EXPECT_EQ(state.getGreatestApplied(), (RefTxnId{2, 1}));
 }
@@ -1577,4 +1570,131 @@ TEST(CASRefIntake, ManifestEdgesMoveEmitsNone)
     const auto m = manifestRef(1, 1, 1);
     const auto edges = manifestEdgesOfTxn(makeTxn(kNs, RefTxnId{1, 2}, {moveOp("tmp_a", "a", m)}));
     EXPECT_TRUE(edges.empty());
+}
+
+/// ===================================================================================
+/// Chain replay: successor rule and backlinks
+/// ===================================================================================
+
+namespace
+{
+
+using DB::Cas::tests::ScopedReadCeiling;
+using DB::Cas::tests::tombstoneTxn;
+
+RefLogTxn headTxn(RefTxnId id, std::optional<RefTxnId> backlink, std::vector<RefOp> ops)
+{
+    RefLogTxn txn = makeTxn(kNs, id, std::move(ops));
+    txn.prev_epoch_seal = backlink;
+    return txn;
+}
+
+RefTableState bornAt11ThenTombstoneTo4()
+{
+    RefTableState state;
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp()}));
+    applyRefLogTxn(state, tombstoneTxn(kNs, RefTxnId{1, 2}, 4));
+    return state;
+}
+
+}
+
+TEST(CASRefStateMachine, ReplayRejectsHeadThatDoesNotNameItsTombstone)
+{
+    ScopedReadCeiling c(3);
+    RefTableState state = bornAt11ThenTombstoneTo4();
+    const RefTableState before = state;
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { applyRefLogTxn(state, headTxn(RefTxnId{4, 1}, RefTxnId{1, 1}, {addPrecommitOp("a", manifestRef(4, 1, 1))})); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { applyRefLogTxn(state, headTxn(RefTxnId{4, 1}, std::nullopt, {addPrecommitOp("a", manifestRef(4, 1, 1))})); });
+    expectStatesEqual(before, state);
+
+    applyRefLogTxn(state, headTxn(RefTxnId{4, 1}, RefTxnId{1, 2}, {addPrecommitOp("a", manifestRef(4, 1, 1))}));
+    EXPECT_EQ(state.getOpenTransition(), std::nullopt);
+    EXPECT_EQ(state.getGreatestApplied(), (RefTxnId{4, 1}));
+}
+
+TEST(CASRefStateMachine, ReplayRejectsRecordAfterTombstoneInTheSameEpoch)
+{
+    ScopedReadCeiling c(3);
+    RefTableState state = bornAt11ThenTombstoneTo4();
+    const auto m = manifestRef(1, 3, 1);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 3}, {addPrecommitOp("a", m)})); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { applyRefLogTxn(state, headTxn(RefTxnId{3, 1}, RefTxnId{1, 2}, {addPrecommitOp("a", m)})); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { applyRefLogTxn(state, headTxn(RefTxnId{5, 1}, RefTxnId{1, 2}, {addPrecommitOp("a", m)})); });
+}
+
+TEST(CASRefStateMachine, TombstoneIsLegalBeforeBirthAndRefusedAfterTerminal)
+{
+    ScopedReadCeiling c(3);
+    RefTableState state;
+    applyRefLogTxn(state, tombstoneTxn(kNs, RefTxnId{2, 1}, 5));
+    EXPECT_EQ(state.getOpenTransition(), (RefEpochTransition{RefTxnId{2, 1}, 5}));
+    EXPECT_NE(state.getLifecycle(), RefLifecycle::Live);
+    EXPECT_EQ(nextRefSlot(state, 2), (RefNextSlot{RefTxnId{5, 1}, RefTxnId{2, 1}}));
+
+    applyRefLogTxn(state, headTxn(RefTxnId{5, 1}, RefTxnId{2, 1}, {birthOp()}));
+    EXPECT_EQ(state.getLifecycle(), RefLifecycle::Live);
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{5, 2}, {removeNamespaceOp()}));
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { applyRefLogTxn(state, tombstoneTxn(kNs, RefTxnId{5, 3}, 7)); });
+}
+
+TEST(CASRefStateMachine, BirthAfterTerminalIsRefused)
+{
+    ScopedReadCeiling c(3);
+    RefTableState state;
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{5, 1}, {birthOp()}));
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{5, 2}, {removeNamespaceOp()}));
+    const RefTableState before = state;
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{5, 3}, {birthOp()})); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{6, 1}, {birthOp()})); });
+    expectStatesEqual(before, state);
+    EXPECT_TRUE(state.isTerminal());
+}
+
+TEST(CASRefStateMachine, OldSealIsFollowedByTheNextNumericEpoch)
+{
+    ScopedReadCeiling c(3);
+    RefTableState state;
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp()}));
+    applyRefLogTxn(state, tombstoneTxn(kNs, RefTxnId{1, 2}, std::nullopt));
+    RefTableState second = state;
+    applyRefLogTxn(state, headTxn(RefTxnId{2, 1}, RefTxnId{1, 2}, {addPrecommitOp("a", manifestRef(2, 1, 1))}));
+    EXPECT_EQ(state.getGreatestApplied(), (RefTxnId{2, 1}));
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { applyRefLogTxn(second, headTxn(RefTxnId{3, 1}, RefTxnId{1, 2}, {addPrecommitOp("a", manifestRef(3, 1, 1))})); });
+}
+
+TEST(CASRefStateMachine, RecordAtANewEpochWithoutATombstoneIsRefused)
+{
+    ScopedReadCeiling c(3);
+    RefTableState state;
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp()}));
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { applyRefLogTxn(state, headTxn(RefTxnId{2, 1}, RefTxnId{1, 1}, {addPrecommitOp("a", manifestRef(2, 1, 1))})); });
+    EXPECT_EQ(state.chainNextId(1), (RefTxnId{1, 2}));
+    EXPECT_EQ(state.chainEpoch(1), 1u);
+    EXPECT_EQ(nextRefSlot(state, 1), (RefNextSlot{RefTxnId{1, 2}, std::nullopt}));
+
+    const RefTableState empty;
+    EXPECT_EQ(empty.chainNextId(7), (RefTxnId{7, 1}));
+}
+
+TEST(CASRefStateMachine, NoChainSuccessorPastTheMaximumSequence)
+{
+    ScopedReadCeiling c(3);
+    constexpr RefTxnId last{1, std::numeric_limits<uint64_t>::max()};
+    const RefTableState state = stateFromSnapshot(DB::Cas::tests::minimalLiveSnapshot(kNs, last));
+    ASSERT_EQ(state.getGreatestApplied(), last);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { static_cast<void>(state.chainNextId(1)); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { static_cast<void>(nextRefSlot(state, 1)); });
 }

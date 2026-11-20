@@ -85,6 +85,7 @@ def export_cluster():
                 "configs/config.d/allow_export_partition.xml",
             ],
             user_configs=[
+                "configs/users.d/users.xml",
                 "configs/users.d/allow_export_partition.xml",
             ],
             with_minio=True,
@@ -100,6 +101,7 @@ def export_cluster():
                     "configs/config.d/allow_export_partition.xml",
                 ],
                 user_configs=[
+                    "configs/users.d/users.xml",
                     "configs/users.d/allow_export_partition.xml",
                 ],
                 stay_alive=True,

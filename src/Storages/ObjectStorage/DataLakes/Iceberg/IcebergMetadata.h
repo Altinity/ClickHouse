@@ -17,6 +17,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Snapshot.h>
 
 #include <atomic>
+#include <mutex>
 #include <optional>
 #include <base/defines.h>
 
@@ -74,7 +75,8 @@ public:
         ObjectStoragePtr object_storage_,
         StorageObjectStorageConfigurationPtr configuration_,
         Iceberg::PersistentTableComponents && persistent_components_,
-        ContextPtr context_);
+        ContextPtr context_,
+        std::optional<Iceberg::MetadataFileWithInfo> cached_latest_metadata_ = std::nullopt);
 
     ~IcebergMetadata() override;
 
@@ -120,6 +122,9 @@ public:
         SchemaParsing schema_parsing = SchemaParsing::Parse);
 
     bool supportsUpdate() const override { return true; }
+
+    void update(const ContextPtr & context) override;
+
     bool supportsWrites() const override { return true; }
     bool supportsParallelInsert() const override { return true; }
     bool supportsTruncate() const override { return true; }
@@ -135,7 +140,7 @@ public:
         ContextPtr local_context) const;
 
     static bool supportsTotalRows(ContextPtr, ObjectStorageType) { return true; }
-    std::optional<size_t> totalRows(ContextPtr Local_context) const override;
+    std::optional<size_t> totalRows(ContextPtr local_context, const std::optional<DataLakeTableStateSnapshot> & state) const override;
     static bool supportsTotalBytes(ContextPtr, ObjectStorageType) { return true; }
     std::optional<size_t> totalBytes(ContextPtr Local_context) const override;
 
@@ -277,7 +282,7 @@ public:
     std::optional<String> sortingKey(ContextPtr) const override;
 
 private:
-    static Iceberg::PersistentTableComponents initializePersistentTableComponents(
+    static std::pair<Iceberg::PersistentTableComponents, Iceberg::MetadataFileWithInfo> initializePersistentTableComponents(
         ObjectStoragePtr object_storage,
         StorageObjectStorageConfigurationPtr configuration,
         IcebergMetadataFilesCachePtr cache_ptr,
@@ -306,6 +311,7 @@ private:
     std::optional<IStorage::ExportPartitionCommitInfo> commitImportPartitionTransactionImpl(
         FileNamesGenerator & filename_generator,
         Poco::JSON::Object::Ptr & metadata,
+        String & metadata_file_path,
         Poco::JSON::Object::Ptr & partition_spec,
         const String & transaction_id,
         Int64 original_schema_id,
@@ -341,6 +347,11 @@ private:
     const String write_format;
     BackgroundSchedulePoolTaskHolder background_metadata_prefetch_task;
     ObjectIterator prepared_iterator;
+
+    mutable std::mutex cached_latest_metadata_mutex;
+    mutable std::optional<Iceberg::MetadataFileWithInfo> cached_latest_metadata TSA_GUARDED_BY(cached_latest_metadata_mutex);
+
+    Iceberg::MetadataFileWithInfo fetchLatestMetadata(const ContextPtr & context, bool force_fetch_latest_metadata) const;
 
     void backgroundMetadataPrefetcherThread();
 

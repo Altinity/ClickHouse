@@ -105,7 +105,7 @@ const Object * conflictObject(const WriteResult & result)
 TEST(CASSlotOccupy, AbsentKeyCommitsWithOneRequest)
 {
     auto backend = std::make_shared<CountingBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
 
     const WriteResult result = op.create("k", "payload", Retry::once());
@@ -127,7 +127,7 @@ TEST(CASSlotOccupy, AbsentKeyCommitsWithOneRequest)
 TEST(CASSlotOccupy, PreExistingKeyConflictsWithExactBytesAndIncarnationInTwoRequests)
 {
     auto backend = std::make_shared<CountingBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
 
     CasOperation seeder = requests.admit();
     const WriteResult seeded = seeder.create("k", "occupant-bytes", Retry::once());
@@ -158,7 +158,7 @@ TEST(CASSlotOccupy, AmbiguousWriteThatLandedNothingGivesUpHavingSentOne)
 {
     auto backend = std::make_shared<CountingBackend>();
     backend->injectAmbiguousWrite("k");
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
 
     const WriteResult result = op.create("k", "payload", Retry::once());
@@ -177,7 +177,7 @@ TEST(CASSlotOccupy, AmbiguousWriteThatLandedNothingGivesUpHavingSentOne)
 TEST(CASSlotOccupy, ConflictThenVanishGivesUpRatherThanFabricatingACommit)
 {
     auto backend = std::make_shared<VanishOnConflictBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
 
     CasOperation seeder = requests.admit();
     ASSERT_TRUE(std::holds_alternative<Committed>(seeder.create("k", "occupant-bytes", Retry::once())));
@@ -198,7 +198,7 @@ TEST(CASSlotOccupy, ConflictThenVanishGivesUpRatherThanFabricatingACommit)
 TEST(CASSlotOccupy, LivenessRefusalBeforeTheAttemptSendsNothing)
 {
     auto backend = std::make_shared<CountingBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit([] { return false; });
 
     const WriteResult result = op.create("k", "payload", Retry::once());
@@ -209,7 +209,7 @@ TEST(CASSlotOccupy, LivenessRefusalBeforeTheAttemptSendsNothing)
 
     EXPECT_EQ(backend->writeTotal(), 0u);
     EXPECT_EQ(backend->getTotal(), 0u);
-    CasRequests open_requests(backend, Fence::open());
+    CasRequests open_requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation reader = open_requests.admit();
     EXPECT_FALSE(reader.head("k", Retry::once()).has_value()) << "never a lie of committed -- the key must be untouched";
 }
@@ -221,7 +221,7 @@ TEST(CASSlotOccupy, ExhaustedPolicyDeadlineRefusesBeforeTheAttempt)
     auto backend = std::make_shared<CountingBackend>();
     uint64_t clock = 0;
     CasRequests requests(backend, Fence::open(),
-                         [&clock]() -> uint64_t { const uint64_t t = clock; clock += 1000; return t; });
+                         [&clock]() -> uint64_t { const uint64_t t = clock; clock += 1000; return t; }, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     requests.setAttemptReservationForTest(50);
     CasOperation op = requests.admit();
 
@@ -246,7 +246,7 @@ TEST(CASSlotOccupy, DefiniteStoreRefusalIsAValueAndSettlesNothing)
     auto backend = std::make_shared<CountingBackend>();
     backend->failNextWriteWith("k", std::make_exception_ptr(
         DB::S3Exception("simulated malformed request", Aws::S3::S3Errors::UNKNOWN, "MalformedXML")));
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
 
     const WriteResult result = op.create("k", "payload", Retry::once());
@@ -260,7 +260,7 @@ TEST(CASSlotOccupy, DefiniteStoreRefusalIsAValueAndSettlesNothing)
 TEST(CASSlotOccupy, DeterministicLocalFailurePropagatesWithoutSettling)
 {
     auto backend = std::make_shared<LocalFailureOnceBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit();
 
     bool threw = false;
@@ -288,7 +288,7 @@ TEST(CASSlotOccupy, AdmissionLostAfterTheWriteIsNeverReportedCommitted)
     auto backend = std::make_shared<CountingBackend>();
     bool live = true;
     backend->onWriteCommitted("k", [&live] { live = false; });
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit([&live] { return live; });
 
     const WriteResult result = op.create("k", "payload", Retry::once());
@@ -298,7 +298,7 @@ TEST(CASSlotOccupy, AdmissionLostAfterTheWriteIsNeverReportedCommitted)
     EXPECT_TRUE(gave_up->sent_any) << "the write was sent, and it landed -- the caller must resolve the key";
 
     /// The object IS durable; only the claim about it is refused.
-    CasRequests open_requests(backend, Fence::open());
+    CasRequests open_requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation reader = open_requests.admit();
     const auto landed = reader.read("k", Retry::once());
     ASSERT_TRUE(landed.has_value());
@@ -310,12 +310,12 @@ TEST(CASSlotOccupy, AdmissionLostAfterTheWriteIsNeverReportedCommitted)
 TEST(CASSlotOccupy, AdmissionLostAfterAConflictPreventsTheSettlingRead)
 {
     auto backend = std::make_shared<WithdrawAdmissionOnConflictBackend>();
-    CasRequests seed_requests(backend, Fence::open());
+    CasRequests seed_requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation seeder = seed_requests.admit();
     ASSERT_TRUE(std::holds_alternative<Committed>(seeder.create("k", "existing", Retry::once())));
     backend->resetCounts();
 
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     CasOperation op = requests.admit([&backend] { return backend->live; });
     const WriteResult result = op.create("k", "attempt", Retry::once());
     const auto * gave_up = std::get_if<GaveUp>(&result);
@@ -334,7 +334,7 @@ TEST(CASSlotOccupy, OwnLandedAmbiguousWriteIsObservedOnTheNextAttempt)
 {
     auto backend = std::make_shared<CountingBackend>();
     backend->injectAmbiguousLandedWrite("k");
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
 
     CasOperation first_op = requests.admit();
     const WriteResult first = first_op.create("k", "my-bytes", Retry::once());

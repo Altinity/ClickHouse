@@ -13,13 +13,17 @@ namespace DB::Cas
 
 /// The highest pool-format generation this build understands: an object is readable iff its
 /// compatibility_version <= G_BUILD. Readers for every lower generation are kept.
-constexpr uint32_t G_BUILD = 2;
+constexpr uint32_t G_BUILD = 3;
 /// The compatibility version stamped on ordinary objects: they carry no generation-2 construct, so
 /// only a Move-bearing ref log is stamped `G_REF_MOVE`. What gates a generation-1 reader is the pool's
-/// `min_reader_generation`, which a writable mount of this build raises to `G_REF_MOVE` before any Move.
+/// `min_reader_generation`, which a writable mount of this build raises to `G_REF_CHAIN` before it writes
+/// any object of generation 2 or 3.
 constexpr uint32_t G_WRITE_FLOOR = 1;
 /// The generation that introduced the committed-owner move in the ref log (`OwnerTransitionShape::Move`).
 constexpr uint32_t G_REF_MOVE = 2;
+/// The generation that introduced the forward-linked epoch tombstone (`RefLogTxn::next_epoch`), the sparse
+/// `prev_epoch_seal` backlink and the two-field `_ckpt` body.
+constexpr uint32_t G_REF_CHAIN = 3;
 
 /// Stable identifiers for every self-describing persisted object class. The text registry uses the
 /// corresponding `type` string as the on-disk identity. Numeric values are part of the format history:
@@ -45,7 +49,7 @@ enum class FormatId : uint16_t
     /// Value 15 is retired: the fold seal is the sole per-generation coverage record after the
     /// one-pass GC round. The following three classes are per-server-root mount-safety objects.
     Owner = 16,           /// `cas_owner` anchor from server-root ID to server UUID.
-    ServerEpoch = 17,     /// `cas_epoch` writer-epoch fence carrying `next_writer_epoch`.
+    ServerEpoch = 17,     /// `cas_epoch` writer-epoch fence carrying `next_writer_epoch` and an optional `allocation_nonce`.
     MountLease = 18,      /// Live `cas_mount_lease` object.
     /// These identifiers cover objects that were added to the registry after their initial codecs:
     /// the ref transaction log, complete ref snapshot, blob freshness sidecar, and GC heartbeat.

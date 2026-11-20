@@ -217,7 +217,7 @@ static Plan getPlan(
         persistent_table_components.metadata_compression_method);
 
     Poco::JSON::Object::Ptr initial_metadata_object
-        = getMetadataJSONObject(metadata_file_path, object_storage, persistent_table_components.metadata_cache, context, log, compression_method, persistent_table_components.table_uuid);
+        = deepCopy(getMetadataJSONObject(metadata_file_path, object_storage, persistent_table_components.metadata_cache, context, log, compression_method, persistent_table_components.table_uuid));
 
     /// Exactly version 2: v1 lacks the sequence-number machinery the rewrite relies on, and
     /// a v3 table must not be accepted either -- writeMetadataFiles rebuilds the metadata
@@ -493,6 +493,7 @@ static void writeDataFiles(
 
 static bool writeConsolidatedManifestFile(
     int metadata_version,
+    const String & metadata_file_path,
     Poco::JSON::Object::Ptr metadata_object,
     const PersistentTableComponents & persistent_table_components,
     ObjectStoragePtr object_storage, ContextPtr context,
@@ -822,7 +823,7 @@ static bool writeConsolidatedManifestFile(
     // Manifest-only rewrite: use a snapshot type that carries all total-* counters forward unchanged, since passing deltas would inflate the totals.
     auto new_snapshot = metadata_generator.generateManifestOnlySnapshot(
         generator,
-        generated_metadata_info.path,
+        path_resolver.reverseResolve(metadata_file_path),
         current_snapshot_id);
 
     // Write one manifest file per (partition spec, partition value) group.
@@ -1551,14 +1552,14 @@ void compactIcebergManifests(
             /* force_fetch_latest_metadata */ true,
             /* ignore_explicit_metadata_file_path */ true);
 
-        auto metadata_object = getMetadataJSONObject(
+        auto metadata_object = deepCopy(getMetadataJSONObject(
             metadata_file_path,
             object_storage_,
             persistent_table_components.metadata_cache,
             context_,
             log,
             persistent_table_components.metadata_compression_method,
-            persistent_table_components.table_uuid);
+            persistent_table_components.table_uuid));
 
         /// Validate the format version on the freshly-fetched metadata (before the threshold early-return), since the table may have been upgraded to v3 by another writer after this table object was created.
         const Int32 format_version = metadata_object->getValue<Int32>(Iceberg::f_format_version);
@@ -1583,6 +1584,7 @@ void compactIcebergManifests(
 
         if (writeConsolidatedManifestFile(
                 metadata_version,
+                metadata_file_path,
                 metadata_object,
                 persistent_table_components,
                 object_storage_,

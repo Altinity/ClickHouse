@@ -111,7 +111,7 @@ TEST(CASGCMaintenanceStateFormat, RejectsMalformedAndBoundsCursor)
 TEST(CASGCMaintenanceState, ReadsAndCasWithoutAdoptingConflicts)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     const Layout layout("p");
     const String key = layout.gcMaintenanceStateKey();
     auto op = requests.admit();
@@ -146,7 +146,7 @@ TEST(CASGCMaintenanceState, ReadsAndCasWithoutAdoptingConflicts)
 TEST(CASGCMaintenanceState, ClassifiesCorruptionAndResetsOnlyExactToken)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     const Layout layout("p");
     const String key = layout.gcMaintenanceStateKey();
     auto op = requests.admit();
@@ -165,7 +165,7 @@ TEST(CASGCMaintenanceState, ClassifiesCorruptionAndResetsOnlyExactToken)
 TEST(CASGCMaintenanceState, UsesExactlyOneReadOrCasAttempt)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     const Layout layout("p");
     const String key = layout.gcMaintenanceStateKey();
     auto op = requests.admit();
@@ -205,7 +205,7 @@ TEST(CASGCMaintenanceState, UsesExactlyOneReadOrCasAttempt)
 TEST(CASGCMaintenanceState, FutureVersionPropagatesInsteadOfResetting)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     const Layout layout("p");
     const String key = layout.gcMaintenanceStateKey();
     auto op = requests.admit();
@@ -222,7 +222,7 @@ TEST(CASGCMaintenanceState, FutureVersionPropagatesInsteadOfResetting)
     EXPECT_EQ(backend->writeTotal(), 0u);
 
     auto failing = std::make_shared<FailingMaintenanceReadBackend>();
-    CasRequests failing_requests(failing, Fence::open());
+    CasRequests failing_requests(failing, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     auto failing_op = failing_requests.admit();
     EXPECT_THROW((void)readGcMaintenanceState(failing_op, layout), std::runtime_error);
 }
@@ -230,7 +230,7 @@ TEST(CASGCMaintenanceState, FutureVersionPropagatesInsteadOfResetting)
 TEST(CASGCMaintenanceState, LosingCorruptResetPreservesConcurrentWinner)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
-    CasRequests requests(backend, Fence::open());
+    CasRequests requests(backend, Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
     const Layout layout("p");
     const String key = layout.gcMaintenanceStateKey();
     auto op = requests.admit();

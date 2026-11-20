@@ -64,7 +64,7 @@ WriteResult CasHotKeys::submit(const String & key, CasOperation & op, const Retr
     /// Frozen here so that the queue wait and the write share one deadline; a policy already frozen
     /// by the caller's loop is returned unchanged.
     const Retry frozen = op.freeze(policy);
-    const Retry::Bound bound = frozen.bind(op.owner.now_ms());
+    const Retry::Bound bound = op.owner.bindPolicy(frozen);
     const uint64_t entered_ms = op.owner.now_ms();
 
     Item item{};

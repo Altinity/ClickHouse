@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasWriteResult.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCkpt.h>
@@ -45,7 +46,7 @@ enum class ResolveAudit : uint8_t { Emit, Deferred };
 /// exact attempt before its first possible send. `Wedged` owns that same attempt after an ambiguous
 /// result and certifies nothing. `NeedsRecovery` means a transaction is known durable but cannot be
 /// installed in this cache; it is a hard write and certification fence until replay completes. `Closed`
-/// records a successor's epoch seal, and `Faulted` records foreign or internally inconsistent durable
+/// records a successor's tombstone, and `Faulted` records foreign or internally inconsistent durable
 /// state.
 enum class RefLaneState : uint8_t
 {
@@ -56,6 +57,9 @@ enum class RefLaneState : uint8_t
     Closed,
     Faulted,
 };
+
+/// Stable name of a lane state, for messages and logs.
+std::string_view refLaneStateName(RefLaneState state);
 
 /// The answer of the relink confirm's gate 1 (`CasRefLedger::confirmExactRef`).
 ///
@@ -74,6 +78,10 @@ enum class RefLaneState : uint8_t
 /// `SourceProofFailed` (spec §failure-taxonomy) -- so nothing is authorized by either. Do not build a
 /// consumer that treats `No` as knowledge; only `Yes` is gated on the fence.
 enum class ConfirmAnswer : uint8_t { Yes, No, Unknown };
+
+/// How a ref-table recovery ended without an exception. `LifeRemoved`: the catalog no longer names the
+/// runtime's exact life after the walk; nothing was installed and the runtime is detached.
+enum class RefRecoveryOutcome : uint8_t { Recovered, LifeRemoved };
 
 /// Coordinates the writer-side ref-log and ref-table protocol for all namespaces in one mounted pool.
 /// It owns the recovered whole-table cache, the flat-combining append lane and its unresolved-`PUT`
@@ -106,6 +114,9 @@ public:
         String server_root_id_,
         /// Callbacks into mount and watermark state owned by `Pool`, bound for this ledger's lifetime:
         std::function<uint64_t()> live_epoch_fn_,
+        /// The live epoch with the `last_unclean_epoch` of the claim that started it, read as one pair:
+        /// recovery decides from both whether it seals the chain before it installs.
+        std::function<LiveEpochPair()> live_epoch_pair_fn_,
         std::function<bool()> fence_ok_fn_,
         /// The fence-GENERATION primitive (`CasMountRuntime::fenceGeneration`), injected exactly as
         /// `CasPlainObjects` takes it. `fence_ok_fn` above answers "may this mount write AT ALL, right
@@ -156,7 +167,8 @@ public:
     /// Performs ZERO object-store I/O: a cold, evicted or recovering table answers `Unknown` rather
     /// than recovering from storage, and no runtime is created as a side effect of asking. That is a
     /// contract, not an optimization -- the confirm is a read-only interserver query that a remote
-    /// receiver drives, so it must never be able to make this writer do work.
+    /// receiver drives, so the ledger must never do work for it. The one exception is the single mount-slot
+    /// `GET` that `Pool::confirmExactRef` adds after a `Yes`.
     ///
     /// The rules are evaluated as one snapshot spanning both lane mutexes, in this order: table warm
     /// and resident; lane state `Ready` or `Writing`, with no queued or carved mutation whose
@@ -189,7 +201,8 @@ public:
     /// resolution, and the ONLY one that CREATES: recovery's step 0 (`resolveNamespaceLife`) mints a
     /// life when the catalog names none, so the first namespace file a table ever writes births the
     /// namespace exactly as its first ref op would. A read or a removal must not use this -- see the
-    /// sibling below for why that is a correctness matter and not a preference.
+    /// sibling below for why that is a correctness matter and not a preference. Throws retry-later for
+    /// a life whose terminal removal is already applied, since the janitor sweeps whatever is written there.
     NamespaceLifeId namespaceLife(const RootNamespace & ns);
 
     /// The life a READER (or a REMOVER) of this namespace's files must use, or `nullopt` when there are
@@ -230,16 +243,18 @@ public:
     /// re-reads the exact catalog row.
     bool namespaceStillLogicallyPresent(const RootNamespace & ns);
 
-    /// Called after a complete catalog observation proves an exact resident life absent or replaced.
-    /// It does not
-    /// destroy the runtime: existing callers that already captured the old physical life may finish
-    /// with their stale-or-not-found contract. The name slot is detached by exact pointer identity; a
-    /// later name-based touch may publish a distinct successor runtime.
+    /// Called after a complete catalog observation proves an exact resident life absent or replaced,
+    /// and by GC before its first attempt to erase a row whose terminal removal is folded (the erase
+    /// may not follow) and again once the erase resolved. It does not destroy the runtime: existing
+    /// callers that already captured the old physical life may finish with their stale-or-not-found
+    /// contract. The name slot is detached by exact pointer identity; a later name-based touch may
+    /// publish a distinct successor runtime.
     void invalidateRemovedCatalogLife(const NamespaceLifeId & life);
 
-    /// Reconciles resident removal-closed runtimes against one complete catalog observation. An exact
-    /// life absent from or replaced in the cut is invalidated and exactly detached; a matching current
-    /// life stays closed. No runtime is reset or rebound.
+    /// Reconciles resident runtimes against one complete catalog observation. A runtime whose exact life
+    /// reads `Removing` in the cut is closed as `acquireRefTableRuntime` closes it. A removal-closed
+    /// runtime whose exact life is absent from or replaced in the cut is invalidated and exactly detached;
+    /// a matching current life stays closed. No runtime is reset or rebound. Sends no request.
     void reconcileCatalogCut(const CasRefCatalog::Snapshot & catalog_cut);
 
     /// Queues a mutation for flat-combining with compatible callers. `build_ops` runs at most once in
@@ -265,6 +280,34 @@ public:
     /// orphaned runtime therefore fail closed instead of mutating state from the previous epoch.
     void quiesceRefTablesForRemount();
 
+    /// One cold admission of a name, from the capture of its retirement count before the catalog read
+    /// to the publish of its runtime. Until it is released, and unless a remount clears the map, the name's
+    /// slot and its retirement count stay.
+    /// The destructor takes `ref_queue_mutex`: never destroy one under that mutex or a `state_mutex`.
+    class ColdAdmission
+    {
+    public:
+        ColdAdmission(ColdAdmission && other) noexcept;
+        ColdAdmission & operator=(ColdAdmission &&) = delete;
+        ColdAdmission(const ColdAdmission &) = delete;
+        ColdAdmission & operator=(const ColdAdmission &) = delete;
+        ~ColdAdmission();
+
+    private:
+        friend class CasRefLedger;
+        ColdAdmission(CasRefLedger & ledger_, String name_, uint64_t retirements_seen_, uint64_t epoch_) noexcept;
+
+        /// Null once released or moved from.
+        CasRefLedger * ledger;
+        String name;
+        uint64_t retirements_seen;
+        /// `ref_name_slots_epoch` at capture: the slot this admission counts in.
+        uint64_t epoch;
+    };
+
+    /// Captures a cold admission of `ns` with no catalog read and no runtime.
+    ColdAdmission beginColdAdmissionForTest(const RootNamespace & ns) { return beginColdAdmission(ns); }
+
     /// The self-remount's CANCEL-OR-JOIN barrier over in-flight recoveries (spec §3: "self-remount
     /// cancels or waits out recovery before rearming"). Requests cancellation on every cached table,
     /// then WAITS until no recovery attempt is in flight anywhere, then clears the request. Returns only
@@ -272,13 +315,13 @@ public:
     ///
     /// Why this exists on top of the install recheck: the recheck protects the INSTALL, the barrier
     /// protects the WINDOW. A recovery admitted under the outgoing incarnation would otherwise keep
-    /// issuing writes (its seal CAS-walk WRITES) across the whole re-arm, and each one would have to be
+    /// issuing writes (its stamp and its tombstone) across the whole re-arm, and each one would have to be
     /// caught individually at its own site; here it is stopped once, at the boundary, before the
     /// incarnation changes underneath it.
     ///
     /// The narrow window it does NOT close -- a recovery that starts after this returns and before the
     /// fence is re-armed -- is closed by the other two members of the same guard: the re-arm bumps the
-    /// generation, so that recovery's `_ckpt` CAS and its install both refuse; and
+    /// generation, so that recovery's writes and its install all refuse; and
     /// `quiesceRefTablesForRemount` (which the caller runs next, BEFORE the re-arm) publishes
     /// `superseded_by_remount`, which the walk polls at every I/O boundary.
     void cancelRecoveriesAndAwaitQuiescence();
@@ -315,6 +358,19 @@ public:
     uint64_t refRecoveryRestartsForTest(const RootNamespace & ns);
     /// Reports whether `ns` currently has an unresolved append `PUT`.
     bool refLaneWedgedForTest(const RootNamespace & ns);
+    /// Installs a hook run by each removal attempt after it closed and drained the positive lane, before
+    /// the post-close catalog read. An attempt that returns early on an already-terminal runtime skips it.
+    /// Set before any removal runs.
+    void setRemovalAttemptHookForTest(std::function<void()> hook) { removal_attempt_hook_for_test = std::move(hook); }
+    /// Installs a hook run by a failed removal attempt right after its catch-side catalog read returns,
+    /// before it decides whether to reopen the lane. Runs with no lock held. Set before any removal runs.
+    void setRemovalReopenReadHookForTest(std::function<void()> hook) { removal_reopen_read_hook_for_test = std::move(hook); }
+    /// Installs a hook run by `dropNamespaceImpl` right after it acquired the exact runtime, before its
+    /// recovery. Runs with no lock held. Set before any removal runs.
+    void setRemovalRuntimeAcquiredHookForTest(std::function<void()> hook)
+    {
+        removal_runtime_acquired_hook_for_test = std::move(hook);
+    }
     /// Returns the object key retained for the unresolved append of `ns`.
     String wedgedKeyForTest(const RootNamespace & ns);
     /// Returns the fence generation retained with the unresolved append of `ns` (0 when not wedged).
@@ -325,13 +381,9 @@ public:
     void forceWedgeForTest(const RootNamespace & ns, uint64_t writer_epoch, uint64_t ref_sequence,
                            const String & key, const String & bytes,
                            std::optional<uint64_t> admitted_generation = std::nullopt);
-    /// Returns the seal that closed `ns`'s previous writer epoch -- the `prev_epoch_seal` its next
-    /// sequence-1 append will carry (`nullopt` at genesis). See `RefTableRuntime::last_epoch_seal`.
+    /// Returns the tombstone the table's last applied record crossed while its head is not applied --
+    /// the backlink its next sequence-1 append will carry. `nullopt` otherwise.
     std::optional<RefTxnId> lastEpochSealForTest(const RootNamespace & ns);
-    /// Installs `seal` as `ns`'s last epoch seal, standing in for the recovery CAS-walk that produces it
-    /// in production (Task 6). Lets a writer-side test drive the ordinary post-transition append without
-    /// a whole recovery.
-    void setLastEpochSealForTest(const RootNamespace & ns, const std::optional<RefTxnId> & seal);
     /// Returns the append lane state of `ns` without forcing recovery.
     RefLaneState laneStateForTest(const RootNamespace & ns);
     /// Reports whether recovery or a prior incomplete sweep requires stale-precommit cleanup.
@@ -390,6 +442,8 @@ public:
         PublishPop,
         ValidateFinalOps,
         ChunkReseed,
+        /// After the lane's tombstone is durable, before its install hold.
+        PostDurableTombstoneInstall,
         PostDurableInstall,
         PostInstallPreAck,
     };
@@ -474,7 +528,7 @@ public:
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
         const auto it = ref_name_slots.find(ns.string());
-        return it == ref_name_slots.end() ? 0 : it->second.current->pending.size();
+        return it == ref_name_slots.end() || !it->second.current ? 0 : it->second.current->pending.size();
     }
 
     /// Reports whether `ns` currently has an active append-lane leader (the baton). Under the queue mutex.
@@ -482,7 +536,7 @@ public:
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
         const auto it = ref_name_slots.find(ns.string());
-        return it != ref_name_slots.end() && it->second.current->leader_active;
+        return it != ref_name_slots.end() && it->second.current && it->second.current->leader_active;
     }
 
     /// Returns the number of items carved by the current tenure and not yet released by its exit guard.
@@ -491,7 +545,7 @@ public:
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
         const auto it = ref_name_slots.find(ns.string());
-        return it == ref_name_slots.end() ? 0 : it->second.current->carved.size();
+        return it == ref_name_slots.end() || !it->second.current ? 0 : it->second.current->carved.size();
     }
 
     /// Returns whether the `carved` entry for `ref_name` (if any) is already completed. Lets a test
@@ -501,7 +555,7 @@ public:
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
         const auto it = ref_name_slots.find(ns.string());
-        if (it == ref_name_slots.end())
+        if (it == ref_name_slots.end() || !it->second.current)
             return false;
         for (const auto & item : it->second.current->carved)
             if (item->scope.names(ref_name))
@@ -551,6 +605,19 @@ public:
         std::lock_guard<std::mutex> g(ref_queue_mutex);
         const auto it = ref_name_slots.find(ns.string());
         return it == ref_name_slots.end() || !it->second.current ? 0 : it->second.current->admitted_fence_generation;
+    }
+    /// The retirement count of `ns`'s slot; zero when the name has no slot.
+    uint64_t refNameRetirementsForTest(const RootNamespace & ns) const
+    {
+        std::lock_guard<std::mutex> g(ref_queue_mutex);
+        const auto it = ref_name_slots.find(ns.string());
+        return it == ref_name_slots.end() ? 0 : it->second.retirements;
+    }
+    /// Every name slot, with or without a resident runtime.
+    size_t refNameSlotCountForTest() const
+    {
+        std::lock_guard<std::mutex> g(ref_queue_mutex);
+        return ref_name_slots.size();
     }
     /// The physical life currently pinned in the cached runtime, without resolving or recovering it.
     std::optional<NamespaceLifeId> refTableLifeForTest(const RootNamespace & ns)
@@ -642,19 +709,10 @@ public:
         RefTxnId candidate_base_id;      /// greatest-applied of the state prepared FROM
         RefLogTxn chunk_txn;             /// includes INV-2's chain link
         RefAppendAttempt prepared_attempt;  /// COMPLETE: txn id, canonical key, sealed bytes, admitted generation
-        /// Set iff this chunk births the namespace. The VALUE only: `commitRefChunk` still publishes it,
-        /// because for a birth chunk that publish IS the first durable effect and preparation is by
-        /// definition everything strictly before it.
-        std::optional<RefCkpt> birth_contribution;
-        /// Published after the log object commits and before this candidate may be installed or
-        /// acknowledged. Every transaction advances `committed_through`; an epoch-seal transaction
-        /// contributes the same id as `last_epoch_seal` in this one atomic checkpoint merge.
-        RefCkpt commit_contribution;
     };
 
     /// The pure half of `commitRefChunk`: derive the candidate state, the transaction, the canonical key
-    /// and sealed bytes, the complete attempt, a namespace birth's pre-log `_ckpt` contribution, and
-    /// the post-log committed-frontier contribution -- all decided before anything can be durable.
+    /// and sealed bytes and the complete attempt -- all decided before anything can be durable.
     ///
     /// `static` on purpose, and it is load-bearing rather than stylistic: with no `this` no MEMBER backend
     /// is reachable, and `static` is what removes the injected one -- so "backend-free" is
@@ -669,12 +727,11 @@ public:
     /// rebuild the whole base, O(table) per chunk, which the install path exists to avoid.
     ///
     /// `id`, `chain_link` and `admitted_generation` are INPUTS, not derived here, because each traces back
-    /// to the SAME critical section that snapshots the state (INV-1): `id` and `admitted_generation` are
-    /// read inside that hold, and `chain_link` is derived just outside it from the `last_epoch_seal` read
-    /// inside it. Deriving the id from a different instant than the state it is applied to would be
-    /// deriving it from a different stream. The critical section therefore stays in `commitRefChunk`, and
-    /// this is a pure function of its arguments -- what that one atomic reading saw, plus `layout`,
-    /// `life` and `ops`.
+    /// to the SAME critical section that snapshots the state: all three are read inside that hold,
+    /// `id` and `chain_link` as one `nextRefSlot` of the state. Deriving the id from a different instant
+    /// than the state it is applied to would be deriving it from a different stream. The critical section
+    /// therefore stays in `commitRefChunk`, and this is a pure function of its arguments -- what that one
+    /// atomic reading saw, plus `layout`, `life` and `ops`.
     ///
     /// Every throw out of here is an ordinary PRE-durability rejection: no object exists, the cache is
     /// untouched, and the id is simply never used (the next attempt re-derives it from the same unchanged
@@ -683,10 +740,10 @@ public:
     /// (unreachable for a mounted table, listed so the enumeration does not read closed). See the FAULT
     /// CLASS note on the definition for what changed about WHO catches them.
     ///
-    /// `life` (Stage B, Task 4-C) is `RefTableRuntime::life` -- the caller's already-resolved catalog
+    /// `life` is `RefTableRuntime::life` -- the caller's already-resolved catalog
     /// life, read under the SAME critical section as `id`/`admitted_generation` (a caller with no
-    /// resolved life yet has no business preparing a chunk at all: `ensureRefTableRecovered` resolves
-    /// it before this table is exposed as recovered).
+    /// resolved life yet has no business preparing a chunk at all: a runtime is constructed for the life
+    /// its admission resolved).
     static PreparedRefChunk prepareRefChunk(const Layout & layout, const NamespaceLifeId & life,
                                             RefTableState state, const RefTxnId & id,
                                             const std::optional<RefTxnId> & chain_link,
@@ -704,6 +761,7 @@ private:
     /// member rather than an injected callback.
     String server_root_id;
     std::function<uint64_t()> live_epoch_fn;
+    std::function<LiveEpochPair()> live_epoch_pair_fn;
     std::function<bool()> fence_ok_fn;
     std::function<uint64_t()> fence_generation_fn;
     std::function<uint64_t()> boot_ms_now_fn;
@@ -765,12 +823,15 @@ private:
 
         std::mutex state_mutex;
         bool recovered = false;
-        /// Gates the recovery-seal I/O that runs outside `state_mutex`. A second caller waits on
+        /// Gates the recovery I/O that runs outside `state_mutex`. A second caller waits on
         /// `recovery_cv` and rechecks `recovered` after the first caller finishes; otherwise it could
-        /// perform a competing LIST/replay/seal and misclassify the losing conditional `PUT` as failure.
+        /// perform a competing walk and tombstone and misclassify the losing conditional `PUT` as failure.
         /// Both this flag and the condition variable are guarded by `state_mutex`.
         bool recovery_in_progress = false;
         std::condition_variable recovery_cv;
+        /// A recovery of this runtime ended `LifeRemoved`, so every later call answers the same. Never cleared:
+        /// `life` is fixed, and a removed life does not return. Guarded by `state_mutex`.
+        bool recovery_ended_life_removed = false;
         /// The self-remount cancellation request (spec §3: "self-remount cancels or waits out recovery
         /// before rearming"). Set by `cancelRecoveriesAndAwaitQuiescence` from the remount thread and
         /// polled by the recovery walk at EVERY I/O boundary; a recovery that observes it abandons its
@@ -793,30 +854,10 @@ private:
         /// indistinguishable ordinary recovery transaction.
         std::optional<RefAppendAttempt> append_attempt;
         RefLaneState lane_state = RefLaneState::Ready;
-        /// The `EpochSeal` transaction that closed this namespace's PREVIOUS writer epoch -- exactly the
-        /// `prev_epoch_seal` that this table's next sequence-1 transaction must carry (INV-2's grammar:
-        /// required on sequence 1 of every epoch above the namespace's genesis, forbidden everywhere
-        /// else). Guarded by `state_mutex`, and read in the SAME hold that derives the id, so the field
-        /// and the sequence number it qualifies are one reading.
-        ///
-        /// `nullopt` means GENESIS, and it means it exactly: the namespace's recovered state contains no
-        /// seal and its `greatest_applied.writer_epoch` is its own `life_epoch`, so its first
-        /// transaction opens the stream rather than continuing one across a transition. A namespace born
-        /// at global epoch 5 therefore appends `{5, 1}` with NO `prev_epoch_seal`; its first transition
-        /// (5 -> 6) seals `{5, T+1}`, and the `{6, 1}` that follows carries that seal.
-        ///
-        /// THREE producers set it, and only one of them is the one `commitRefChunk` normally reads from.
-        /// Recovery's CAS-walk installs the last seal of the chain it walked (Task 6): that is the
-        /// production path, because a real epoch change arrives with a self-remount, which DISCARDS every
-        /// cached runtime (`quiesceRefTablesForRemount`) and hands the fresh one its chain link through
-        /// recovery. The other two are the conclusive-rejection arms -- `resolveWedgeOnce`'s and
-        /// `commitRefChunk`'s -- which record a seal this runtime observed with its own eyes at a key it
-        /// owns. Within THIS runtime that record is mostly introspection (the seal it saw closes the
-        /// epoch it is still living in, so the stamp guard correctly suppresses it); it is written anyway
-        /// because it is durable evidence nothing else holds, and because it becomes the right answer the
-        /// moment the live epoch advances past the seal's. Nothing else writes it: a seal is durable
-        /// evidence, never a local guess.
-        std::optional<RefTxnId> last_epoch_seal;
+        /// The `_ckpt` the installed table rests on: its `life_epoch` names the chain's first key, and its
+        /// token is what the lane's stamp replaces conditionally. Set by recovery's install and by the
+        /// lane's stamp; engaged once `recovered` is.
+        std::optional<CkptSample> accepted_ckpt;
         uint64_t recovery_restarts = 0;           /// diagnostic: exact-GET restarts forced by a vanished object
         /// Per-table admission budgets: raw configured limits minus the table's `4 + ns.size()` wire
         /// overhead and the fixed safety margin, computed once at recovery.
@@ -884,13 +925,29 @@ private:
         /// never an under-refusal.
         std::vector<std::shared_ptr<RefMutationItem>> carved;     /// guarded by ref_queue_mutex
         bool leader_active = false;                               /// guarded by ref_queue_mutex
-        /// Set before the exact `Live -> Removing` catalog CAS and retained until that life is deleted.
-        /// New positive mutations check it in the same queue critical section as admission; the one
-        /// terminal `DropNamespace` item is the sole exception.
+        /// Set by a removal before its `Live -> Removing` catalog write, and wherever `removing_observed` is
+        /// set. New positive mutations check it in the same queue critical section as admission;
+        /// the one terminal `DropNamespace` item is the sole exception.
         bool removal_admission_closed = false;
+        /// The exact row of this runtime was read as `Removing`; a failed removal must not reopen its lane.
+        /// Set through `latchRemovingLocked`; nothing clears it. Guarded by `ref_queue_mutex`.
+        bool removing_observed = false;
+        /// A `Live -> Removing` catalog write of this runtime ended with an unknown outcome that no read
+        /// has resolved, so it can still land. The lane stays closed and the runtime stays resident until
+        /// a remount replaces it or GC erases the row (`invalidateRemovedCatalogLife`). A later attempt that
+        /// proves the row `Removing`, or any read of the row as `Removing` (`latchRemovingLocked`), clears the
+        /// flag; the lane stays closed as `Removing`.
+        /// Guarded by `ref_queue_mutex`.
+        bool removal_write_may_land = false;
+        /// One removal attempt at a time per runtime, so one attempt cannot reopen the lane between
+        /// another's close and its send. Guarded by `ref_queue_mutex`.
+        bool removal_attempt_active = false;
         std::condition_variable cv;
 
-        /// Published after GC commits the exact catalog deletion. The exact cache pointer is detached;
+        /// Published by `invalidateRemovedCatalogLife`: from the GC drain before its first attempt to erase
+        /// the exact catalog row and again once the erase resolved, from `reconcileCatalogCut` once a cut
+        /// shows the life gone, from `namespaceLife` once a catalog read shows it gone, and from the
+        /// stalled-`Creating` cancellation in `dropNamespaceImpl`. The exact cache pointer is detached;
         /// old holders observe the flag and remain a predecessor, never a rebindable name handle.
         std::atomic<bool> catalog_life_invalidated{false};
 
@@ -936,13 +993,19 @@ private:
     struct RefNameSlot
     {
         std::shared_ptr<RefTableRuntime> current;
+        /// Bumped by `invalidateRemovedCatalogLife`, and by the eviction of a runtime that had closed or
+        /// applied its removal: another server's GC leader may drain that life without telling us.
+        /// A slot exists if and only if it has a `current` runtime or `admissions_in_flight > 0`, so
+        /// the count survives as long as a cold admission that captured it may still compare it.
+        uint64_t retirements = 0;
+        /// Live `ColdAdmission`s of this name captured in the current `ref_name_slots_epoch`.
+        uint32_t admissions_in_flight = 0;
     };
     static constexpr size_t kMaxRefBatch = 1000;
-    /// Recovery retries at most this many times when an object selected by LIST vanishes before GET.
-    /// A failed recovery-seal `PUT` is separate: it leaves `recovered` false and the next touch starts
-    /// a fresh LIST/replay/seal attempt rather than resuming this bounded vanish-retry loop.
+    /// Recovery restarts at most this many times when its base moves under it. A failed tombstone `PUT`
+    /// is separate: it leaves `recovered` false and goes to the transient-retry loop.
     static constexpr size_t kRefRecoveryMaxRestarts = 3;
-    /// How many times the CAS-walk may lose the SAME dead epoch's seal slot to a straggler before it
+    /// How many times recovery's tombstone may lose its slot in the SAME epoch to a straggler before it
     /// fails closed. Not an arbitrary round number: INV-1's every-attempt rule permits AT MOST ONE
     /// in-flight conditional create per (table, writer), and there is one writer per mount, so an honest
     /// run needs ONE retry. The margin covers a dying writer whose lane held several attempts across
@@ -957,6 +1020,9 @@ private:
     /// taking a mutex to read consistently does not make the read a mutation.
     mutable std::mutex ref_queue_mutex;
     std::map<String, RefNameSlot> ref_name_slots;
+    /// Bumped with every clear of `ref_name_slots` by a remount, under `ref_queue_mutex`: a
+    /// `ColdAdmission` from before the clear must not release a slot created after it.
+    uint64_t ref_name_slots_epoch = 0;
     /// Monotonic access stamp for whole-table cache LRU eviction, bumped on every table touch and
     /// recorded in `RefTableRuntime::last_touch_tick`.
     std::atomic<uint64_t> ref_table_access_tick{0};
@@ -971,10 +1037,9 @@ private:
     /// this table is idle.
     std::atomic<bool> shutting_down{false};
 
-    /// The id `rt`'s next transaction carries (INV-1): `RefTableState::nextTxnId` of the table's OWN
-    /// state under the live writer epoch. There is no counter behind this -- the id is a pure function
-    /// of the state the transaction will be applied to, which buys two properties a pool-wide counter
-    /// could not:
+    /// The id and backlink `rt`'s next transaction carries: `nextRefSlot` of the table's OWN
+    /// state. There is no counter behind this -- the id is a pure function of the state the transaction
+    /// will be applied to, which buys two properties a pool-wide counter could not:
     ///   - each namespace's ids are dense `1..T` within one epoch, so a reader holding a table's log
     ///     ids can tell a COMPLETE stream from a truncated one without consulting anything else;
     ///   - an attempt that provably sent nothing consumes nothing: the state it derived from is
@@ -983,18 +1048,15 @@ private:
     /// A post-durable install failure moves the lane to `NeedsRecovery`, so this function is not called
     /// again until replay has installed that durable transaction and advanced `greatest_applied`.
     ///
-    /// The epoch component is the live mount incarnation's writer epoch, not the open-time
-    /// `process_epoch`: a self-remount allocates a strictly-greater durable writer_epoch, so every ref
-    /// transaction stamped after the remount sorts strictly ABOVE any (dead-incarnation or twin) log
-    /// still durable under an older epoch. `RefTxnId` compares epoch first, so the epoch bump alone
-    /// guarantees that a new log is never inserted at or below an already durable table log id.
+    /// The epoch is the chain epoch; `flushRefBatch` refuses a lane whose chain epoch is not the live
+    /// writer epoch before it builds any preview.
     ///
     /// MUST be called with `rt.state_mutex` held, and the caller must apply the transaction to the SAME
     /// state it read here: an id derived from one snapshot of a table and applied to another is not that
     /// table's successor, and the apply-side density check would (correctly) reject it.
-    RefTxnId allocateRefTxnId(const RefTableRuntime & rt) const
+    static RefNextSlot allocateRefTxnId(const RefTableRuntime & rt)
     {
-        return rt.state.nextTxnId(live_epoch_fn());
+        return nextRefSlot(rt.state, *rt.accepted_ckpt->ckpt.life_epoch);
     }
 
     /// Test-only hook called before a compatible append batch is carved; null in production.
@@ -1030,16 +1092,56 @@ private:
     std::function<void()> wedge_before_slot_occupy_hook_for_test;
     std::function<void()> snapshot_after_capture_hook_for_test;
     std::function<void()> snapshot_before_ckpt_cas_hook_for_test;
+    std::function<void()> removal_attempt_hook_for_test;
+    std::function<void()> removal_reopen_read_hook_for_test;
+    std::function<void()> removal_runtime_acquired_hook_for_test;
 
     /// Non-materializing diagnostic/cache lookup. It never observes the catalog and never creates a
     /// name slot or runtime.
     std::shared_ptr<RefTableRuntime> lookupRefTableRuntime(const RootNamespace & ns) const;
 
+    /// Picks the wording of a stale-observation refusal, which is retryable either way: `Read` for
+    /// non-creating callers (removing a file included), `Write` for the rest. `PresenceProbe` reads,
+    /// and gets no runtime instead of the retired-name refusal.
+    enum class RuntimeAdmission : uint8_t
+    {
+        Read,
+        Write,
+        PresenceProbe,
+    };
+
     /// Publishes or returns one runtime for an exact catalog-observed life and admitted mount-fence
     /// generation. A conflicting attached identity is a stale observation and fails closed rather than
-    /// retargeting either runtime.
+    /// retargeting either runtime. `admission` was begun before the catalog read that produced `life`;
+    /// if a retirement of this name landed since, the observation is stale and the call throws
+    /// retry-later instead of republishing a possibly retired life; a `PresenceProbe` gets `nullptr`
+    /// there. `observed_removing` is true when the caller read the row of `life` as `Removing`: the
+    /// returned runtime, new or resident, then has its lane closed and `removing_observed` set. Releases
+    /// `admission` in its critical section; if it throws before that, the caller's guard releases it.
     std::shared_ptr<RefTableRuntime> acquireRefTableRuntime(
-        const NamespaceLifeId & life, uint64_t admitted_generation);
+        const NamespaceLifeId & life, bool observed_removing, uint64_t admitted_generation,
+        ColdAdmission & admission, RuntimeAdmission kind);
+
+    /// Closes the lane of `rt` for a row read as `Removing`, sets `removing_observed` and clears
+    /// `removal_write_may_land`. Returns true when the lane was open, so the caller logs only a lane this
+    /// call closed: a removal closes its own lane first. Caller holds `ref_queue_mutex`.
+    static bool latchRemovingLocked(RefTableRuntime & rt);
+    static void logRemovingLatched(const NamespaceLifeId & life);
+
+    /// Creates the slot of `ns` if absent and counts the admission in it. Call it before the catalog
+    /// read whose answer the admission publishes.
+    ColdAdmission beginColdAdmission(const RootNamespace & ns);
+
+    /// Disarms `admission` and, when it counts in the current epoch, takes it out of its slot. Caller
+    /// holds `ref_queue_mutex`.
+    void releaseColdAdmissionLocked(ColdAdmission & admission);
+
+    /// Erases the slot at `it` unless it has a runtime or an admission in flight. Caller holds
+    /// `ref_queue_mutex`.
+    void eraseNameSlotIfUnusedLocked(std::map<String, RefNameSlot>::iterator it);
+
+    /// Throws retry-later when `rt` (already recovered) has applied its namespace's terminal removal.
+    void refuseTerminalLife(const RootNamespace & ns, RefTableRuntime & rt);
 
     /// Lookup-first non-minting read acquisition. A cold name consults the catalog and materializes only
     /// an exact `Live` life; absence/`Creating`/`Removing` returns no runtime.
@@ -1054,25 +1156,35 @@ private:
     DropNamespaceStats dropNamespaceImpl(
         const RootNamespace & ns, const std::optional<UInt128> & expected_incarnation);
 
-    /// Lazily recovers `ns` per spec §4: catalog life resolution (first table-open only) -> `_ckpt` ->
-    /// exact-key base snapshot -> ARITHMETIC tail -> seal CAS-walk -> `_ckpt` CAS -> install. It does not
-    /// expose the table as recovered until every dead epoch it discovered is durably closed; concurrent
-    /// callers serialize across the whole unlocked I/O window through `recovery_in_progress`.
-    void ensureRefTableRecovered(
-        const RootNamespace & ns, RefTableRuntime & rt,
-        const std::optional<DetachedStopToken> & token = std::nullopt);
+    /// Lazily recovers `rt` for the life its admission resolved: `_ckpt` -> exact base snapshot ->
+    /// `walkRefChain` over the tail -> a `_ckpt` re-read -> one catalog read that confirms `rt.life` -> install.
+    /// When the chain ends at an absent key in an epoch below the live one and at or below `last_unclean_epoch`,
+    /// the walk first stamps a generation 1 or 2 `_ckpt` to generation 3, then writes a tombstone naming the live
+    /// epoch; it writes no other `_ckpt` body. It does not expose the table as recovered until that
+    /// tombstone is durable. Concurrent callers serialize across the unlocked I/O window through
+    /// `recovery_in_progress`. A walk that raises `CORRUPTED_DATA` is confirmed the same way
+    /// before the error leaves. When the catalog no longer names `rt.life` as `Live` or `Removing`, the
+    /// walk's result or error is dropped, nothing is installed, the runtime is detached and the call
+    /// returns `LifeRemoved`, as does every later call on this runtime.
+    [[nodiscard]] RefRecoveryOutcome ensureRefTableRecovered(
+        const RootNamespace & ns, RefTableRuntime & rt, const std::optional<DetachedStopToken> & token = {});
 
-    /// Stage B (spec INV-3, §3): resolves `ns`'s catalog life -- ONCE per table-open, from inside
-    /// `ensureRefTableRecovered`'s transient-retry envelope, never from a per-write path (a per-write
+    /// One catalog read on `admitted_generation`: true when a `Live` or `Removing` row carries exactly
+    /// `rt.life`; a `Removing` row also closes the lane through `latchRemovingLocked`. Otherwise detaches
+    /// the runtime through `invalidateRemovedCatalogLife` and returns false. The caller must not hold
+    /// `rt.state_mutex`.
+    bool confirmRecoveredLifeOrDetach(RefTableRuntime & rt, uint64_t admitted_generation);
+
+    /// Resolves `ns`'s catalog life -- once per cold mutable admission in
+    /// `namespaceLife`, before the runtime exists, never from a per-write path (a per-write
     /// catalog GET is a protocol-step addition and is vetoed). Three cases, closing over the catalog's
     /// own three-state grammar:
     ///   - no entry at all: this call is the namespace's first-ever opener. Mints one via
     ///     `CasRefCatalog::createNamespace` under a `CreatorFence` built from `server_root_id`,
     ///     `live_epoch` and `admitted_generation`;
-    ///   - an entry already `Live`/`Removing`: adopts its incarnation directly
-    ///     (`NamespaceLifeId::fromCatalogEntry`) -- `Removing` is adopted exactly like `Live` because
-    ///     this call only needs A life to key objects with; refusing WRITES to a `Removing` namespace
-    ///     is a different mechanism's job (Task 6's read-side contract), not this resolution's;
+    ///   - an entry `Live`: adopts its incarnation directly (`NamespaceLifeId::fromCatalogEntry`);
+    ///   - an entry `Removing`: throws retry-later (setting `*lifecycle_refusal` when given), because no
+    ///     new life of the name may be born before the removal finishes;
     ///   - an entry `Creating`: if its `creator` fence is THIS mount's own (a previous attempt of this
     ///     same open landed step 1 but not steps 2/3, e.g. after a transient error), resumes
     ///     `completeCreation` directly over the observed entry; otherwise reconciles it via
@@ -1105,7 +1217,7 @@ private:
     /// so without it the transient loop reads the stop as a blip and re-drives the very work the remount
     /// just stopped -- while the barrier blocks waiting for that recovery to finish.
     std::optional<RecoveryResult> runRecoveryWalkOnce(
-        const RootNamespace & ns, RefTableRuntime & rt, uint64_t admitted_generation, uint64_t live_epoch,
+        const RootNamespace & ns, RefTableRuntime & rt, uint64_t admitted_generation, const LiveEpochPair & live,
         const std::optional<RefAppendAttempt> & retained_attempt, std::optional<String> & hole_detail,
         bool & cancelled, const std::optional<DetachedStopToken> & token = std::nullopt);
 
@@ -1122,8 +1234,15 @@ private:
     /// Publishes a completed streaming recovery into the runtime in one atomic step: copies EVERY field
     /// `RecoveryResult` carries into `rt` and sets `recovered` LAST, so a waiter woken after this returns
     /// never observes a partially-installed table. Struct-driven so a future added publication field
-    /// cannot be silently dropped from a scattered assignment list (spec §5). MUST hold `rt.state_mutex`.
-    void installRecoveryResult(RefTableRuntime & rt, RecoveryResult && result);
+    /// cannot be silently dropped from a scattered assignment list. A chain epoch above a
+    /// nonzero `live_epoch` installs the lane `Closed`. MUST hold `rt.state_mutex`.
+    static void installRecoveryResult(RefTableRuntime & rt, RecoveryResult && result, uint64_t live_epoch);
+
+    /// Replaces a `_ckpt` below generation 3 by the generation 3 body before the lane's first write, on
+    /// the token its installed recovery accepted. True: `rt.accepted_ckpt` holds the generation 3 sample.
+    /// False: the stamp met another token or did not resolve, and the lane is `NeedsRecovery`; the caller
+    /// fails the batch retry-later and writes nothing. The caller must not hold `rt.state_mutex`.
+    bool stampBeforeFirstWrite(const RootNamespace & ns, RefTableRuntime & rt, CasOperation & op);
 
     /// Evicts least-recently-touched, idle whole-table runtimes until the configured cache budget is met,
     /// retaining `keep_ns` even when it is the next candidate.
@@ -1148,6 +1267,14 @@ private:
     /// `commitRefChunk` -- each a complete commit boundary.
     void flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
                        std::vector<std::shared_ptr<RefMutationItem>> & owned_items);
+
+    /// The lane's tombstone step, run by `flushRefBatch` before the batch copies its working state.
+    /// True: the chain epoch equals the live epoch, or the stream is terminal, and the batch may proceed.
+    /// False: the function completed every pending item with an error. A chain epoch below the live one
+    /// is closed by a tombstone naming the live epoch, written as a lane attempt; one above it closes
+    /// the lane. MUST NOT hold `rt->state_mutex` or `ref_queue_mutex`.
+    bool ensureEpochOpenForAppend(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
+                                  std::vector<std::shared_ptr<RefMutationItem>> & owned_items);
 
     enum class WedgeResolution : uint8_t
     {
@@ -1187,12 +1314,11 @@ private:
 
     /// Commits ONE chunk of a `flushRefBatch` tenure as a complete ref-log transaction: allocates the
     /// real transaction id, PREPARES the chunk (`prepareRefChunk` -- candidate, transaction, key, sealed
-    /// bytes, complete attempt, birth contribution), durably `PUT`s the sealed bytes, installs the
+    /// bytes, complete attempt), durably `PUT`s the sealed bytes, installs the
     /// candidate under `state_mutex` by a no-throw swap, advances the tail counters, records the
     /// per-transaction metrics, completes exactly `chunk_survivors` with the real id (waking their
-    /// waiters), and schedules snapshot publication. Preparation completes BEFORE the first durable
-    /// effect of EITHER chunk shape -- an ordinary chunk's ref-log `PUT`, and a `NamespaceBirth` chunk's
-    /// earlier `_ckpt` publish -- so that nothing between "durable" and "recorded" can throw (spec §A1);
+    /// waiters), and schedules snapshot publication. Preparation completes BEFORE the ref-log `PUT`, the
+    /// chunk's only durable effect, so that nothing between "durable" and "recorded" can throw;
     /// a preparation failure is an ordinary pre-durability rejection. For the same reason the
     /// `RefAppendAttempt` is built COMPLETE before the `PUT` -- the request reads its key and body -- so
     /// the `Unresolved` arm only has to move it into the runtime: the OTHER thing that must be recorded
@@ -1212,6 +1338,10 @@ private:
     /// The exact attempt is discarded because replay, not another write, is now the only legal owner.
     static void requireRecovery(RefTableRuntime & rt, const RootNamespace & ns, std::string_view region) noexcept;
 
+    /// Enters `NeedsRecovery` when another record holds the slot of the lane's tombstone at `id`: the
+    /// tombstone did not land, and recovery adopts that record. The caller clears the attempt.
+    static void requireRecoveryForTakenTombstoneSlot(RefTableRuntime & rt, const RootNamespace & ns, const RefTxnId & id) noexcept;
+
     /// Leadership-exit guard for `appendRefOps`: under `ref_queue_mutex`, completes every still-unfinished
     /// item this leader owned (with `flush_exception` when unwinding, or a fail-closed `LOGICAL_ERROR`
     /// otherwise), removes each owned item from `pending` so no future leader can carve it, clears
@@ -1229,28 +1359,6 @@ private:
     /// dispatch is fenced and the detached task retains the owner pin until it finishes.
     void maybeScheduleSnapshotPublish(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
 
-    /// Merges one contribution into `life`'s `_ckpt` (spec INV-4), presenting `admitted_generation` back
-    /// through the pool's fence callback on every CAS attempt. The ledger owns no `CasMountRuntime`, so
-    /// this is only the place that assembles the deadline from the ledger's own injectable boot clock
-    /// and CAS budget; the algorithm itself is `publishCkpt`, shared verbatim with every other writer.
-    ///
-    /// THREE call sites (corrected here from "two": `runRecoveryWalkOnce`'s own sealer contribution
-    /// below is a third and was missing from this count), and they contribute DISJOINT fields:
-    ///   - `commitRefChunk`'s namespace-birth transaction contributes `life_epoch` -- it is the only
-    ///     writer that knows it (this transaction's own writer epoch), and spec §3 has the `_ckpt`
-    ///     created before the namespace becomes Live. The contribution is no longer built at the call
-    ///     site: `prepareRefChunk` returns it as `PreparedRefChunk::birth_contribution` and
-    ///     `commitRefChunk` passes that prepared value here. The split is deliberate -- DECIDING the
-    ///     contribution is pure preparation, while THIS call is a birth chunk's first durable effect, so
-    ///     the publish had to stay behind when preparation moved out;
-    ///   - `tryPublishSnapshotAndAdvanceCheckpointOnce` contributes `checkpoint_snapshot_id` once the
-    ///     snapshot body is durable, and contributes NOTHING about `life_epoch` (an absence, which the semantic-max
-    ///     merge leaves alone) because the publisher does not know it and must never guess;
-    ///   - `runRecoveryWalkOnce` contributes `last_epoch_seal` once its own CAS-walk minted or adopted
-    ///     one -- it is the only writer that mints seals, so it is the only writer that can record
-    ///     where the chain now ends.
-    CkptPublishOutcome publishCkptContribution(CasOperation & op, const NamespaceLifeId & life,
-                                               const RefCkpt & contribution);
 
     /// The verdict points that guard a DECISION rather than a request: the engine refuses a request on
     /// its own, but a result already in hand must not be acted on once `op` has stopped being admitted.
@@ -1258,6 +1366,7 @@ private:
     /// time left, or a caller-supplied liveness term that has since gone false -- because none of them
     /// leaves the caller anything more specific to act on than "this admission no longer holds".
     void refuseUnlessAdmitted(const CasOperation & op, std::string_view what) const;
+    [[noreturn]] void throwNotAdmitted(std::string_view what) const;
 
     /// Common candidate predicate for scheduler admission and execution after capture. Caller holds
     /// `rt.state_mutex`; an epoch seal is not state-bearing and cannot be snapshotted.
