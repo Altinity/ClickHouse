@@ -357,6 +357,8 @@ jobs:
           echo "Done. Triggered $rerun_count rerun(s)."
 
   fix-stuck-auto-merge:
+    # Auto-merge is off on this repository, and there is no merge queue to rejoin.
+    if: false
     runs-on: ubuntu-latest
     steps:
       - name: Fix PRs stuck with auto-merge enabled but not queued
