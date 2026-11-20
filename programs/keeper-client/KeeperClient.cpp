@@ -10,13 +10,8 @@
 #include <Common/ZooKeeper/ZooKeeperArgs.h>
 #include <Common/filesystemHelpers.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
-<<<<<<< HEAD
 #include <Parsers/parseQuery.h>
-=======
-#include <Common/ErrnoException.h>
 #include <Common/clearPasswordFromCommandLine.h>
-#include <Parsers/TokenIterator.h>
->>>>>>> eb82d5647e8 (Merge pull request #131963 from groeneai/clear-credential-options-from-command-line)
 #include <Poco/Util/HelpFormatter.h>
 
 
