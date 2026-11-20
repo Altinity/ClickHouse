@@ -5,6 +5,9 @@
 #include <gtest/gtest.h>
 
 #include <Common/Exception.h>
+#include <Common/assert_cast.h>
+#include <Common/tests/gtest_global_register.h>
+#include <DataTypes/DataTypeAggregateFunction.h>
 #include <DataTypes/DataTypeFactory.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypesDecimal.h>
@@ -174,6 +177,34 @@ TEST(IcebergTypeMapping, DecimalPrecisionAboveSpecLimitIsRejected)
 TEST(IcebergTypeMapping, NullableDecimalPrecisionAboveSpecLimitIsRejected)
 {
     expectIcebergTypeRejected(makeNullable(createDecimal<DataTypeDecimal>(76, 1)));
+}
+
+TEST(IcebergTypeMapping, AnnotationNamePinsAggregateStateVersion)
+{
+    tryRegisterAggregateFunctions();
+
+    auto v0 = DataTypeFactory::instance().get("AggregateFunction(0, sumMap, Array(UInt8), Array(UInt8))");
+    EXPECT_EQ(v0->getName(), "AggregateFunction(sumMap, Array(UInt8), Array(UInt8))");
+    EXPECT_EQ(getClickHouseTypeAnnotationName(v0), "AggregateFunction(0, sumMap, Array(UInt8), Array(UInt8))");
+    EXPECT_EQ(
+        assert_cast<const DataTypeAggregateFunction &>(
+            *DataTypeFactory::instance().get(getClickHouseTypeAnnotationName(v0)))
+            .getVersion(),
+        0u);
+
+    EXPECT_EQ(
+        getClickHouseTypeAnnotationName(
+            DataTypeFactory::instance().get("Array(AggregateFunction(0, sumMap, Array(UInt8), Array(UInt8)))")),
+        "Array(AggregateFunction(0, sumMap, Array(UInt8), Array(UInt8)))");
+
+    for (const auto * name :
+         {"AggregateFunction(sumMap, Array(UInt8), Array(UInt8))",
+          "AggregateFunction(uniq, UInt64)",
+          "SimpleAggregateFunction(sum, UInt64)"})
+    {
+        auto type = DataTypeFactory::instance().get(name);
+        EXPECT_EQ(getClickHouseTypeAnnotationName(type), type->getName()) << name;
+    }
 }
 
 #endif

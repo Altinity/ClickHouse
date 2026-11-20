@@ -80,6 +80,8 @@ createStorageObjectStorage(const StorageFactory::Arguments & args, StorageObject
         format_settings = getFormatSettings(context);
     }
 
+    setTableAllowAggregateFunctionStates(*format_settings, args.storage_def->settings ? &args.storage_def->settings->changes : nullptr);
+
     ASTPtr partition_by;
     if (args.storage_def->partition_by)
         partition_by = args.storage_def->partition_by->clone();
@@ -1256,6 +1258,70 @@ Writes use the inverse mapping: `DateTime64(9)` is stored as `timestamp_ns`, and
 | `list` | `Array` |
 | `map` | `Map` |
 | `struct` | `Tuple` |
+
+### Aggregate function states {#aggregate-function-states}
+
+Iceberg has no aggregate-state type, so ClickHouse stores the two aggregate-state types as ordinary
+Iceberg values and records the ClickHouse type name in the table property `clickhouse.type.<field-id>.<schema-id>`,
+where `<field-id>` is the Iceberg field id of the column. The type applies to the schemas with an id not
+below `<schema-id>`, up to the next such property of the field; an empty value means no type. So older
+schemas keep the type their data was written with. Catalogs and other engines that commit to the
+table keep table properties:
+
+| ClickHouse type | Iceberg type | Stored as |
+|---|---|---|
+| `AggregateFunction(f, T...)` | `binary` | The serialized state, the same bytes `f` writes with the `-State` combinator |
+| `SimpleAggregateFunction(f, T)` | whatever `T` maps to | An ordinary value of type `T` |
+
+Other query engines ignore the property and see a plain `binary` (or `T`-typed) column.
+
+Creating such a table needs
+[`allow_aggregate_function_states_in_open_formats`](/reference/settings/formats/other#allow_aggregate_function_states_in_open_formats),
+which is enabled by default, and so does every query that reads a column whose `clickhouse.type` property names an
+`AggregateFunction` - an `INSERT`, an `ALTER TABLE ... UPDATE`, an `OPTIMIZE TABLE` or an `ALTER TABLE ... EXPORT PART`
+as much as a `SELECT` - and every query that writes such a column. A state is an opaque blob handed
+to the deserializer of the aggregate function the table's metadata names, so with the setting enabled
+it is that metadata, not the query, which chooses the deserializer; disable it for tables from
+untrusted sources, where such a field is then rejected rather than read as `String`. A
+`SimpleAggregateFunction` column is not gated on read, holding ordinary values of its storage type.
+
+The setting can be given in two places:
+
+- In the table's `SETTINGS` clause. It is stored in the table definition and decides for every query on the
+  table, also after a restart, whatever the query sets. Setting it to `0` refuses the states of a table from an
+  untrusted source.
+- On the query, with a session `SET` or the query's own `SETTINGS` clause. It decides for a table that does not
+  set it, for a table function such as `icebergS3`, and for a table of a `DataLakeCatalog` database, which has no
+  stored definition.
+
+A table that sets it and is read on a cluster (`object_storage_cluster`) sends its value to the other nodes, so
+every node of that cluster must run a version that knows the setting.
+
+```sql
+CREATE TABLE agg (k UInt32, u AggregateFunction(uniq, UInt64), s SimpleAggregateFunction(sum, UInt64))
+ENGINE = IcebergLocal('/path/to/table/')
+PARTITION BY k
+SETTINGS allow_aggregate_function_states_in_open_formats = 1;
+
+-- The states merge exactly as they do in an AggregatingMergeTree table.
+SELECT k, uniqMerge(u), sum(s) FROM agg GROUP BY k;
+```
+
+`ALTER TABLE ... EXPORT PART` and `ALTER TABLE ... EXPORT PARTITION` from an `AggregatingMergeTree`
+table into such an Iceberg table work as well, so a partition of pre-aggregated states can be moved
+into the lake without finalizing it. Like any other query, they follow the destination table's `SETTINGS`
+or, if the table does not set it, the `ALTER` query's own setting. `EXPORT PARTITION`, which only `ReplicatedMergeTree` implements,
+records the query's value in its manifest, so every replica executing the task applies it in place of its own profile.
+
+```sql
+ALTER TABLE mt EXPORT PART 'all_1_1_0' TO TABLE agg;
+ALTER TABLE rmt EXPORT PARTITION ID '1' TO TABLE agg;
+```
+
+The Parquet footer of each data file carries the same information, so `DESCRIBE file('data.parquet')`
+reports the aggregate types too; that path goes through Parquet schema inference, gated by the same
+setting. See
+[aggregate function states in Parquet](/reference/formats/Parquet/Parquet#aggregate-function-states).
 
 ## Schema and write compatibility limitations {#schema-and-write-compatibility-limitations}
 

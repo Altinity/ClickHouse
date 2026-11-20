@@ -310,6 +310,10 @@ namespace ExportPartitionUtils
         /// schema drifts to a lossy target between scheduling and execution.
         context_copy->setSetting("export_merge_tree_part_allow_lossy_cast", manifest.allow_lossy_cast);
 
+        if (manifest.allow_aggregate_function_states_in_open_formats)
+            context_copy->setSetting(
+                "allow_aggregate_function_states_in_open_formats", *manifest.allow_aggregate_function_states_in_open_formats);
+
         if (manifest.iceberg_partition_timezone)
         {
             context_copy->setSetting("iceberg_partition_timezone", *manifest.iceberg_partition_timezone);

@@ -1388,10 +1388,11 @@ void StorageFile::setStorageMetadata(CommonArguments args)
         }
         else
         {
+            const auto inference_format_settings = getTableFormatSettingsForQuery(format_settings, args.getContext());
             if (format_name == "auto")
-                std::tie(columns, format_name) = getTableStructureAndFormatFromFile(paths, compression_method, format_settings, args.getContext(), archive_info);
+                std::tie(columns, format_name) = getTableStructureAndFormatFromFile(paths, compression_method, inference_format_settings, args.getContext(), archive_info);
             else
-                columns = getTableStructureFromFile(format_name, paths, compression_method, format_settings, args.getContext(), archive_info);
+                columns = getTableStructureFromFile(format_name, paths, compression_method, inference_format_settings, args.getContext(), archive_info);
 
             if (!args.columns.empty() && args.columns != columns)
                 throw Exception(ErrorCodes::INCOMPATIBLE_COLUMNS, "Table structure and file structure are different");
@@ -1401,7 +1402,8 @@ void StorageFile::setStorageMetadata(CommonArguments args)
     else
     {
         if (format_name == "auto")
-            format_name = getTableStructureAndFormatFromFile(paths, compression_method, format_settings, args.getContext(), archive_info).second;
+            format_name = getTableStructureAndFormatFromFile(
+                paths, compression_method, getTableFormatSettingsForQuery(format_settings, args.getContext()), args.getContext(), archive_info).second;
         /// We don't allow special columns in File storage.
         if (!args.columns.hasOnlyOrdinary())
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Table engine File doesn't support special columns like MATERIALIZED, ALIAS or EPHEMERAL");
@@ -2872,6 +2874,8 @@ SinkToStoragePtr StorageFile::write(
     ContextPtr context,
     bool /*async_insert*/)
 {
+    const auto query_format_settings = getTableFormatSettingsForQuery(format_settings, context);
+
     if (!use_table_fd && archive_info.has_value())
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Writing to archives is not supported");
 
@@ -2910,7 +2914,7 @@ SinkToStoragePtr StorageFile::write(
             base_path,
             path_for_partitioned_write,
             chooseCompressionMethod(path_for_partitioned_write, compression_method),
-            format_settings,
+            query_format_settings,
             format_name,
             context,
             flags);
@@ -2974,7 +2978,7 @@ SinkToStoragePtr StorageFile::write(
         base_path,
         path,
         chooseCompressionMethod(path, compression_method),
-        format_settings,
+        query_format_settings,
         format_name,
         context,
         flags);
@@ -3099,6 +3103,8 @@ void registerStorageFile(StorageFactory & factory)
             {
                 storage_args.format_settings = getFormatSettings(factory_args.getContext());
             }
+            setTableAllowAggregateFunctionStates(
+                *storage_args.format_settings, factory_args.storage_def->settings ? &factory_args.storage_def->settings->changes : nullptr);
 
             if (engine_args_ast.size() == 1) /// Table in database
                 return std::make_shared<StorageFile>(factory_args.relative_data_path, storage_args);

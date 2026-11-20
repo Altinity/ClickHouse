@@ -231,6 +231,7 @@ def make_mt(
     columns,
     partition_by,
     order_by="tuple()",
+    engine="MergeTree()",
     extra_settings="",
 ):
     """Create a MergeTree table with block-number settings."""
@@ -238,7 +239,7 @@ def make_mt(
     node.query(
         f"""
         CREATE TABLE {name} ({columns})
-        ENGINE = MergeTree()
+        ENGINE = {engine}
         PARTITION BY {partition_by}
         ORDER BY {order_by}
         SETTINGS {settings}

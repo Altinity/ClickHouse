@@ -126,6 +126,8 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
         cluster_name_, table_id_, getLogger(fmt::format("{}({})", configuration_->getEngineName(), table_id_.table_name)))
     , configuration{configuration_}
     , object_storage(object_storage_)
+    , table_allow_aggregate_function_states(
+          format_settings_ ? format_settings_->parquet.table_allow_aggregate_function_states : std::nullopt)
 {
     configuration->initPartitionStrategy(partition_by, columns_in_table_or_function_definition, context_);
     configuration->check(context_);
@@ -191,7 +193,8 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
 
     std::string sample_path;
     if (need_resolve_columns_or_format)
-        resolveSchemaAndFormat(columns, object_storage, configuration, {}, sample_path, context_);
+        resolveSchemaAndFormat(
+            columns, object_storage, configuration, getTableFormatSettingsForQuery(format_settings_, context_), sample_path, context_);
     else
         validateSupportedColumns(columns, *configuration);
 
@@ -432,6 +435,14 @@ bool StorageObjectStorageCluster::updateQueryForDistributedEngineIfNeeded(ASTPtr
     function_ast->name = table_function_name;
 
     function_ast->arguments = configuration->createArgsWithAccessData();
+    /// The table function has no engine `SETTINGS`, so the table's own value is passed as its `SETTINGS` argument.
+    if (table_allow_aggregate_function_states)
+    {
+        auto table_settings = make_intrusive<ASTSetQuery>();
+        table_settings->is_standalone = false;
+        table_settings->changes.setSetting("allow_aggregate_function_states_in_open_formats", *table_allow_aggregate_function_states);
+        function_ast->arguments->children.push_back(std::move(table_settings));
+    }
     function_ast->children.push_back(function_ast->arguments);
     function_ast->setAlias(table_alias);
 

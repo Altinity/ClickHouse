@@ -245,6 +245,8 @@ private:
     const String engine_name;
     StorageObjectStorageConfigurationPtr configuration;
     const ObjectStoragePtr object_storage;
+    /// The table's own `allow_aggregate_function_states_in_open_formats`, when its `SETTINGS` give one.
+    const std::optional<bool> table_allow_aggregate_function_states;
     /// True for explicit *Cluster(...); false for SETTINGS / ENGINE / DataLake paths.
     bool cluster_name_from_function_argument = false;
 

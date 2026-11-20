@@ -385,6 +385,9 @@ Pipe executeRemoveOrphanFiles(
         params.location = parsed.getAs<String>("location");
     params.dry_run = parsed.getAs<UInt64>("dry_run") != 0;
 
+    /// Register the metadata.json schemas before the manifest headers carry copies of them without the type annotations.
+    addIcebergTableSchemasFromMetadata(latest_metadata, *persistent_components.schema_processor, context);
+
     auto result = removeOrphanFiles(params, context, object_storage, data_lake_settings, persistent_components, external_storages);
 
     return resultToPipe(result);

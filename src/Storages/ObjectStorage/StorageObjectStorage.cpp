@@ -242,7 +242,7 @@ StorageObjectStorage::StorageObjectStorage(
     }
 
     if (need_resolve_columns_or_format)
-        resolveSchemaAndFormat(columns, object_storage, configuration, format_settings, sample_path, context);
+        resolveSchemaAndFormat(columns, object_storage, configuration, getTableFormatSettingsForQuery(format_settings, context), sample_path, context);
     else
         validateSupportedColumns(columns, *configuration);
 
@@ -740,7 +740,7 @@ void StorageObjectStorage::read(
         && settings[Setting::optimize_count_from_files]
         && !VirtualColumnUtils::hasRowDependentVirtualColumns(read_from_format_info.requested_virtual_columns);
 
-    auto modified_format_settings{format_settings};
+    auto modified_format_settings = getTableFormatSettingsForQuery(format_settings, local_context);
     if (!modified_format_settings.has_value())
         modified_format_settings.emplace(getFormatSettings(local_context));
 
@@ -777,7 +777,7 @@ SinkToStoragePtr StorageObjectStorage::write(
         configuration->update(object_storage, local_context);
     }
 
-    return createSink(configuration, object_storage, storage_id, format_settings, catalog, metadata_snapshot, local_context);
+    return createSink(configuration, object_storage, storage_id, getTableFormatSettingsForQuery(format_settings, local_context), catalog, metadata_snapshot, local_context);
 }
 
 SinkToStoragePtr StorageObjectStorage::createSink(
@@ -849,7 +849,7 @@ bool StorageObjectStorage::optimize(
     bool /*cleanup*/,
     [[maybe_unused]] ContextPtr context)
 {
-    return configuration->optimize(object_storage, metadata_snapshot, context, format_settings, catalog, getStorageID());
+    return configuration->optimize(object_storage, metadata_snapshot, context, getTableFormatSettingsForQuery(format_settings, context), catalog, getStorageID());
 }
 
 bool StorageObjectStorage::supportsImport(ContextPtr local_context) const
@@ -880,6 +880,11 @@ IStorage::ImportResult StorageObjectStorage::import(
     const std::optional<FormatSettings> & format_settings_,
     ContextPtr local_context)
 {
+    /// The export brings its own format settings, but the table's own `allow_aggregate_function_states_in_open_formats` decides over them.
+    auto import_format_settings = format_settings_ ? format_settings_ : getTableFormatSettingsForQuery(format_settings, local_context);
+    if (format_settings_ && format_settings && format_settings->parquet.table_allow_aggregate_function_states)
+        import_format_settings->parquet.allow_aggregate_function_states = *format_settings->parquet.table_allow_aggregate_function_states;
+
     if (isDataLake())
     {
         configuration->lazyInitializeIfNeeded(object_storage, local_context);
@@ -889,7 +894,7 @@ IStorage::ImportResult StorageObjectStorage::import(
             new_file_path_callback,
             std::make_shared<const Block>(metadata_snapshot->getSampleBlock()),
             *iceberg_metadata_json_string,
-            format_settings_ ? format_settings_ : format_settings,
+            import_format_settings,
             local_context));
     }
 
@@ -952,7 +957,7 @@ IStorage::ImportResult StorageObjectStorage::import(
         max_rows_per_file,
         /* overwrite_existing_data_files= */ file_already_exists_policy != MergeTreePartExportFileAlreadyExistsPolicy::error,
         new_file_path_callback,
-        format_settings_ ? format_settings_ : format_settings,
+        import_format_settings,
         std::make_shared<const Block>(metadata_snapshot->getSampleBlock()),
         local_context));
 }
@@ -1273,7 +1278,7 @@ void StorageObjectStorage::mutate([[maybe_unused]] const MutationCommands & comm
     updateExternalDynamicMetadataIfExists(context_);
     auto metadata_snapshot = getInMemoryMetadataPtr(context_, false);
     auto storage = getStorageID();
-    configuration->mutate(commands, context_, shared_from_this(), storage, metadata_snapshot, catalog, format_settings);
+    configuration->mutate(commands, context_, shared_from_this(), storage, metadata_snapshot, catalog, getTableFormatSettingsForQuery(format_settings, context_));
 }
 
 void StorageObjectStorage::checkMutationIsPossible(const MutationCommands & commands, const Settings & /* settings */) const

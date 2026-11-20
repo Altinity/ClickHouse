@@ -105,6 +105,29 @@ FormatSettings getFormatSettings(const ContextPtr & context)
     return getFormatSettings(context, settings);
 }
 
+void setTableAllowAggregateFunctionStates(FormatSettings & table_format_settings, const SettingsChanges * table_settings)
+{
+    table_format_settings.parquet.table_allow_aggregate_function_states.reset();
+    if (table_settings)
+    {
+        if (const auto * value = table_settings->tryGet("allow_aggregate_function_states_in_open_formats"))
+            table_format_settings.parquet.table_allow_aggregate_function_states = SettingFieldBool(*value).value;
+    }
+    table_format_settings.parquet.allow_aggregate_function_states
+        = table_format_settings.parquet.table_allow_aggregate_function_states.value_or(false);
+}
+
+std::optional<FormatSettings> getTableFormatSettingsForQuery(const std::optional<FormatSettings> & table_format_settings, const ContextPtr & context)
+{
+    if (!table_format_settings)
+        return std::nullopt;
+
+    auto result = table_format_settings;
+    result->parquet.allow_aggregate_function_states = result->parquet.table_allow_aggregate_function_states.value_or(
+        context->getSettingsRef()[Setting::allow_aggregate_function_states_in_open_formats]);
+    return result;
+}
+
 FormatSettings getFormatSettings(const ContextPtr & context, const Settings & settings)
 {
     FormatSettings format_settings;
@@ -265,6 +288,7 @@ FormatSettings getFormatSettings(const ContextPtr & context, const Settings & se
     format_settings.parquet.verify_checksums = settings[Setting::input_format_parquet_verify_checksums];
     format_settings.parquet.local_time_as_utc = settings[Setting::input_format_parquet_local_time_as_utc];
     format_settings.parquet.allow_geoparquet_parser = settings[Setting::input_format_parquet_allow_geoparquet_parser];
+    format_settings.parquet.allow_aggregate_function_states = settings[Setting::allow_aggregate_function_states_in_open_formats];
     format_settings.parquet.detect_variant_by_structure = settings[Setting::input_format_parquet_detect_variant_by_structure];
     format_settings.parquet.write_geometadata = settings[Setting::output_format_parquet_geometadata];
     if (auto memory_limit = total_memory_tracker.getHardLimit(); memory_limit > 0)

@@ -212,17 +212,19 @@ IStorageURLBase::IStorageURLBase(
     if (columns_.empty())
     {
         ColumnsDescription columns;
+        const auto inference_format_settings = getTableFormatSettingsForQuery(format_settings, context_);
         if (format_name == "auto")
-            std::tie(columns, format_name) = getTableStructureAndFormatFromData(uri, compression_method, headers, format_settings, context_);
+            std::tie(columns, format_name) = getTableStructureAndFormatFromData(uri, compression_method, headers, inference_format_settings, context_);
         else
-            columns = getTableStructureFromData(format_name, uri, compression_method, headers, format_settings, context_);
+            columns = getTableStructureFromData(format_name, uri, compression_method, headers, inference_format_settings, context_);
 
         storage_metadata.setColumns(columns);
     }
     else
     {
         if (format_name == "auto")
-            format_name = getTableStructureAndFormatFromData(uri, compression_method, headers, format_settings, context_).second;
+            format_name = getTableStructureAndFormatFromData(
+                uri, compression_method, headers, getTableFormatSettingsForQuery(format_settings, context_), context_).second;
 
         /// We don't allow special columns in URL storage.
         if (!columns_.hasOnlyOrdinary())
@@ -1500,6 +1502,8 @@ void StorageURLWithFailover::read(
 
 SinkToStoragePtr IStorageURLBase::write(const ASTPtr & query, const StorageMetadataPtr & metadata_snapshot, ContextPtr context, bool /*async_insert*/)
 {
+    const auto query_format_settings = getTableFormatSettingsForQuery(format_settings, context);
+
     if (http_method.empty())
         http_method = Poco::Net::HTTPRequest::HTTP_POST;
 
@@ -1524,7 +1528,7 @@ SinkToStoragePtr IStorageURLBase::write(const ASTPtr & query, const StorageMetad
             partition_strategy,
             uri,
             format_name,
-            format_settings,
+            query_format_settings,
             metadata_snapshot->getSampleBlock(),
             context,
             getHTTPTimeouts(context),
@@ -1538,7 +1542,7 @@ SinkToStoragePtr IStorageURLBase::write(const ASTPtr & query, const StorageMetad
     return std::make_shared<StorageURLSink>(
         uri,
         format_name,
-        format_settings,
+        query_format_settings,
         metadata_snapshot->getSampleBlock(),
         context,
         getHTTPTimeouts(context),
@@ -1655,6 +1659,7 @@ FormatSettings StorageURL::getFormatSettingsFromArgs(const StorageFactory::Argum
     {
         format_settings = getFormatSettings(args.getContext());
     }
+    setTableAllowAggregateFunctionStates(format_settings, args.storage_def->settings ? &args.storage_def->settings->changes : nullptr);
 
     return format_settings;
 }

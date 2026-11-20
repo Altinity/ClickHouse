@@ -447,12 +447,14 @@ bool UnityV2Catalog::updateSchema(
     Int32 previous_schema_id,
     Int32 new_last_column_id,
     Poco::JSON::Object::Ptr metadata,
+    Poco::JSON::Object::Ptr previous_properties,
     const DB::ForwardedAuthTokenPtr & auth_token) const
 {
     return requestWithRetry([&](bool force_refresh)
     {
         return getIcebergRestCatalog(force_refresh)->updateSchema(
-            namespace_name, table_name, new_metadata_path, new_schema, previous_schema_id, new_last_column_id, metadata, auth_token);
+            namespace_name, table_name, new_metadata_path, new_schema, previous_schema_id, new_last_column_id, metadata,
+            previous_properties, auth_token);
     });
 }
 

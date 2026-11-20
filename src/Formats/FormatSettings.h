@@ -430,6 +430,10 @@ struct FormatSettings
         bool allow_geoparquet_parser = true;
         bool detect_variant_by_structure = true;
         bool spatial_filter_push_down = true;
+        bool allow_aggregate_function_states = false;
+        /// Set for a table whose own `SETTINGS` give `allow_aggregate_function_states_in_open_formats`: it then decides
+        /// over the query's value.
+        std::optional<bool> table_allow_aggregate_function_states;
         bool write_geometadata = true;
         size_t max_dictionary_size = 1024 * 1024;
     } parquet{};
