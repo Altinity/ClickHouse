@@ -470,8 +470,8 @@ def poll_until(predicate, what, timeout=120):
 def test_fetch_paused_before_confirm_then_source_dropped():
     """The fetch by relink is parked before its confirm; the source table is dropped and GC runs on the source.
 
-    The source can no longer confirm, so the fetch may fail cleanly or succeed. Either way the receiver must
-    not commit a part whose bodies are gone: whatever it holds reads back in full.
+    The source can no longer confirm, so the fetch may be refused or succeed. A refused fetch commits no rows;
+    a fetch that commits reads back in full.
     """
     node1 = cluster.instances["node1"]
     node2 = cluster.instances["node2"]
@@ -504,18 +504,36 @@ def test_fetch_paused_before_confirm_then_source_dropped():
         if not released:
             node2.query("SYSTEM DISABLE FAILPOINT cas_relink_receiver_pause_before_confirm")
 
-    # The fetch ends in one of two ways: the part is committed, or the source refuses to confirm.
     refusal = re.compile(r"did not prove it still holds the manifest")
-    poll_until(
-        lambda: active_parts(node2, table) == part
-        or refusal.search(
-            node2.exec_in_container(["bash", "-c", "tail -c +{} {} || true".format(offsets["node2"] + 1, SERVER_LOG)])
-        ),
-        "the paused fetch to commit or be refused",
-    )
-    held = active_parts(node2, table)
-    print("paused fetch: part committed on the receiver = {}".format(held == part))
-    if held:
+
+    def refused():
+        log = node2.exec_in_container(["bash", "-c", "tail -c +{} {} || true".format(offsets["node2"] + 1, SERVER_LOG)])
+        return refusal.search(log) is not None
+
+    def active_rows():
+        return int(
+            node2.query(
+                "SELECT sum(rows) FROM system.parts WHERE database = currentDatabase() AND table = '{}' AND active".format(
+                    table
+                )
+            ).strip()
+        )
+
+    # The fetch ends in one of two ways: it commits the part with its rows, or the source refuses to confirm.
+    poll_until(lambda: refused() or active_rows() > 0, "the paused fetch to commit or be refused")
+    was_refused = refused()
+    print("paused fetch: refused by the source = {}".format(was_refused))
+    if was_refused:
+        # The part-check thread may then replace the lost part with an empty part of the same name.
+        assert active_rows() == 0, "a refused fetch committed rows: {}".format(active_parts(node2, table))
+        assert int(node2.query("SELECT count() FROM {}".format(table)).strip()) == 0
+        node2.query("SYSTEM FLUSH LOGS")
+        downloaded = node2.query(
+            "SELECT count() FROM system.part_log WHERE database = currentDatabase() AND table = '{}' "
+            "AND event_type = 'DownloadPart' AND rows > 0".format(table)
+        ).strip()
+        assert downloaded == "0", "a refused fetch logged a downloaded part with rows"
+    else:
         assert digest(node2, table) == expected, "the fetched part is committed but does not read back in full"
         check = node2.query("CHECK TABLE {}".format(table), settings={"check_query_single_value_result": 1}).strip()
         assert check == "1", check
