@@ -13,17 +13,20 @@ namespace DB::Cas
 
 /// The highest pool-format generation this build understands: an object is readable iff its
 /// compatibility_version <= G_BUILD. Readers for every lower generation are kept.
-constexpr uint32_t G_BUILD = 3;
+constexpr uint32_t G_BUILD = 4;
 /// The compatibility version stamped on ordinary objects: they carry no generation-2 construct, so
-/// only a Move-bearing ref log is stamped `G_REF_MOVE`. What gates a generation-1 reader is the pool's
-/// `min_reader_generation`, which a writable mount of this build raises to `G_REF_CHAIN` before it writes
-/// any object of generation 2 or 3.
+/// only a Move-bearing ref log is stamped `G_REF_MOVE`. What gates an older reader is the pool's
+/// `min_reader_generation`.
 constexpr uint32_t G_WRITE_FLOOR = 1;
 /// The generation that introduced the committed-owner move in the ref log (`OwnerTransitionShape::Move`).
 constexpr uint32_t G_REF_MOVE = 2;
 /// The generation that introduced the forward-linked epoch tombstone (`RefLogTxn::next_epoch`), the sparse
 /// `prev_epoch_seal` backlink and the two-field `_ckpt` body.
 constexpr uint32_t G_REF_CHAIN = 3;
+/// The generation of the blob deletion-intent protocol: a pool's `token_dialect`, `gc/state` header 4 with
+/// `intent_sweep_cursor`, and the `standing` bit of condemned rows. This build opens only pools at this floor;
+/// `clickhouse-disks cas-migrate-pool` raises an older pool to it.
+constexpr uint32_t G_BLOB_INTENTS = 4;
 
 /// Stable identifiers for every self-describing persisted object class. The text registry uses the
 /// corresponding `type` string as the on-disk identity. Numeric values are part of the format history:
@@ -52,15 +55,16 @@ enum class FormatId : uint16_t
     ServerEpoch = 17,     /// `cas_epoch` writer-epoch fence carrying `next_writer_epoch` and an optional `allocation_nonce`.
     MountLease = 18,      /// Live `cas_mount_lease` object.
     /// These identifiers cover objects that were added to the registry after their initial codecs:
-    /// the ref transaction log, complete ref snapshot, blob freshness sidecar, and GC heartbeat.
+    /// the ref transaction log, complete ref snapshot, legacy blob marker, and GC heartbeat.
     /// Their values are frozen and must never be reused.
     RefLog = 19,          /// cas_ref_log     — ref transaction log object
     RefSnapshot = 20,     /// cas_ref_snap    — complete per-namespace ref table
-    BlobMeta = 21,        /// cas_blob_meta   — per-blob freshness sidecar
+    BlobMeta = 21,        /// cas_blob_meta   — legacy per-blob marker
     GcHeartbeat = 22,     /// cas_gc_hb       — GC leader heartbeat
     RefCkpt = 23,         /// cas_ref_ckpt    — per-namespace checkpoint (INV-4)
     RefCatalog = 24,      /// cas_ref_catalog — the whole-pool namespace catalog (INV-3)
     GcMaintenanceState = 25, /// cas_gc_maintenance_state — leak-only namespace-janitor cursor
+    BlobIntent = 26,      /// cas_blob_intent — constant record of a blob deletion intent
 };
 
 /// Returns the writer generation stamped on newly written objects. The current pre-roster writer

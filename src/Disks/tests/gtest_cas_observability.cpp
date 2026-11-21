@@ -8,11 +8,13 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h>
 #include <Common/ProfileEvents.h>
 #include <Poco/Exception.h>
 #include <algorithm>
 #include <atomic>
 #include <memory>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -25,6 +27,15 @@ extern const Event CASMountRenewalRetries;
 extern const Event CASMountRenewalResolved;
 extern const Event CASMountRenewalRecovered;
 extern const Event CASMountRenewalDeadlineExceeded;
+extern const Event CASBlobIntentGet;
+extern const Event CASBlobIntentPut;
+extern const Event CASBlobIntentDelete;
+extern const Event CASBlobIntentList;
+extern const Event CASBlobGet;
+extern const Event CASBlobPut;
+extern const Event CASBlobDelete;
+extern const Event CASBlobList;
+extern const Event CASOtherPutDeduplicated;
 }
 
 using namespace DB::Cas;
@@ -356,11 +367,8 @@ TEST(CASObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
         const RoundReport rep = gc.runRegularRound();
         ASSERT_TRUE(rep.acquired_lease);
     }
-    {
-        const auto lm = DB::Cas::tests::loadMetaForTest(*b, s->layout(), u128Of(P));
-        ASSERT_TRUE(lm.has_value() && lm->meta.state == MetaState::Condemned)
-            << "precondition: token A must be condemned before republication";
-    }
+    ASSERT_TRUE(DB::Cas::tests::objectPresent(*b, *DB::Cas::tests::intentKeyOfCurrentBody(*b, s->layout(), idOf(P))))
+        << "precondition: token A must be condemned before republication";
 
     /// 2. RESURRECT: r2 dedup-hits P while A is condemned -> mints a fresh incarnation B; drop it too.
     publishOneBlobPart(s, ns, "r2", P);
@@ -418,7 +426,7 @@ TEST(CASObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
 
     /// Size-unit regression guard (audit fix, 2026-07-08): `peek_head` used to return the RAW
     /// `backend.head(...)` size (physical, header-included), while the fresh-condemn hook `head_blob`
-    /// strips the pool's fixed blob header via `retiredLogicalSize` before the size lands in
+    /// strips the pool's fixed blob header before the size lands in
     /// `RetiredEntry.size`. That mismatch meant supersede-minted entries and fresh-condemn entries carried
     /// two different unit conventions in the SAME persisted `RetiredSet`. The superseded entry (now naming
     /// the fresh token B) must carry the LOGICAL size -- i.e. the payload length, with the pool's blob
@@ -579,4 +587,112 @@ TEST(CASObservability, CaInspectUnknownKeyThrows)
 {
     Layout layout("p");
     EXPECT_THROW(caInspectToJson(layout, "p/not/a/ca/object", "xxxx"), DB::Exception);   /// BAD_ARGUMENTS
+}
+
+TEST(CASObservability, IntentKeysClassifyAsBlobIntent)
+{
+    const Layout layout("p");
+    const BlobRef ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(7))};
+    const CanonicalIdentity identity{Dialect::ETag, "616263"};
+    EXPECT_EQ(classifyCasNs(layout.blobIntentKey(ref, identity), layout.poolPrefix()), CasNs::BlobIntent);
+    EXPECT_EQ(classifyCasNs(layout.blobIntentsPrefix(), layout.poolPrefix()), CasNs::BlobIntent);
+    EXPECT_EQ(classifyCasNs(layout.blobKey(ref), layout.poolPrefix()), CasNs::Blob) << "positive control";
+    EXPECT_EQ(CAS_NS_COUNT, 7u);
+}
+
+/// A pool prefix may contain the name of a key family; only the components after the prefix classify a key.
+TEST(CASObservability, KeysClassifyByTheComponentAfterThePoolPrefix)
+{
+    const Layout layout("tenant/blob-intents/archive");
+    const BlobRef ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(7))};
+    const CanonicalIdentity identity{Dialect::ETag, "616263"};
+    const String & prefix = layout.poolPrefix();
+    EXPECT_EQ(classifyCasNs(layout.blobKey(ref), prefix), CasNs::Blob);
+    EXPECT_EQ(classifyCasNs(layout.blobsPrefix(), prefix), CasNs::Blob);
+    EXPECT_EQ(classifyCasNs(layout.gcStateKey(), prefix), CasNs::Gc);
+    EXPECT_EQ(classifyCasNs(layout.namespaceRootPrefix(), prefix), CasNs::Root);
+    EXPECT_EQ(classifyCasNs(layout.poolMetaKey(), prefix), CasNs::Other);
+    EXPECT_EQ(classifyCasNs(layout.blobIntentKey(ref, identity), prefix), CasNs::BlobIntent) << "positive control";
+
+    auto instrumented = std::make_shared<InstrumentedBackend>(std::make_shared<InMemoryBackend>(), prefix);
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(instrumented);
+    CasOperation op = requests.admit();
+    using ProfileEvents::global_counters;
+    const uint64_t blob_put = global_counters[ProfileEvents::CASBlobPut];
+    const uint64_t intent_put = global_counters[ProfileEvents::CASBlobIntentPut];
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.blobKey(ref), "x", Retry::once())));
+#if !WITH_COVERAGE
+    EXPECT_EQ(global_counters[ProfileEvents::CASBlobPut] - blob_put, 1u);
+    EXPECT_EQ(global_counters[ProfileEvents::CASBlobIntentPut] - intent_put, 0u);
+#else
+    (void)blob_put;
+    (void)intent_put;
+#endif
+}
+
+TEST(CASObservability, IntentRequestsCountInTheirOwnClass)
+{
+    auto instrumented = std::make_shared<InstrumentedBackend>(std::make_shared<InMemoryBackend>(), "p");
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(instrumented);
+    CasOperation op = requests.admit();
+
+    const Layout layout("p");
+    const BlobRef ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(7))};
+    const CanonicalIdentity identity{Dialect::ETag, "616263"};
+    const String key = layout.blobIntentKey(ref, identity);
+
+    using ProfileEvents::global_counters;
+    const auto count = [](ProfileEvents::Event event) -> uint64_t { return global_counters[event]; };
+    const auto intent_get = count(ProfileEvents::CASBlobIntentGet);
+    const auto intent_put = count(ProfileEvents::CASBlobIntentPut);
+    const auto intent_delete = count(ProfileEvents::CASBlobIntentDelete);
+    const auto intent_list = count(ProfileEvents::CASBlobIntentList);
+    const auto blob_get = count(ProfileEvents::CASBlobGet);
+    const auto blob_put = count(ProfileEvents::CASBlobPut);
+    const auto blob_delete = count(ProfileEvents::CASBlobDelete);
+    const auto blob_list = count(ProfileEvents::CASBlobList);
+    const auto other_put_deduplicated = count(ProfileEvents::CASOtherPutDeduplicated);
+
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(key, "x", Retry::once())));
+    /// An equal-occupant create: a 412 the protocol sends routinely, then the resolve read.
+    const WriteResult again = op.create(key, "x", Retry::once());
+    const auto * conflict = std::get_if<Conflict>(&again);
+    ASSERT_NE(conflict, nullptr);
+    ASSERT_TRUE(std::holds_alternative<Object>(conflict->seen)) << "positive control: the occupant was read";
+    ASSERT_TRUE(op.read(key, Retry::once()).has_value());
+    ASSERT_EQ(op.list(layout.blobIntentsPrefix(), "", 10, Retry::once()).keys.size(), 1u);
+    op.removeManyWriteOnce({layout.writeOnceBlobIntentKey(ref, identity)}, Retry::once());
+    EXPECT_FALSE(op.read(key, Retry::once()).has_value()) << "positive control: the delete happened";
+
+#if !WITH_COVERAGE
+    EXPECT_EQ(count(ProfileEvents::CASBlobIntentPut) - intent_put, 2u);
+    EXPECT_EQ(count(ProfileEvents::CASBlobIntentGet) - intent_get, 3u);
+    EXPECT_EQ(count(ProfileEvents::CASOtherPutDeduplicated) - other_put_deduplicated, 0u);
+    EXPECT_EQ(count(ProfileEvents::CASBlobIntentList) - intent_list, 1u);
+    EXPECT_EQ(count(ProfileEvents::CASBlobIntentDelete) - intent_delete, 1u);
+    EXPECT_EQ(count(ProfileEvents::CASBlobGet) - blob_get, 0u);
+    EXPECT_EQ(count(ProfileEvents::CASBlobPut) - blob_put, 0u);
+    EXPECT_EQ(count(ProfileEvents::CASBlobDelete) - blob_delete, 0u);
+    EXPECT_EQ(count(ProfileEvents::CASBlobList) - blob_list, 0u);
+#else
+    (void)intent_get; (void)intent_put; (void)intent_delete; (void)intent_list;
+    (void)blob_get; (void)blob_put; (void)blob_delete; (void)blob_list; (void)other_put_deduplicated;
+#endif
+}
+
+TEST(CASObservability, IntentCountersAreRegistered)
+{
+    const std::vector<std::string_view> names{
+        "CASGCIntentCreated", "CASGCIntentConfirmedExisting", "CASGCIntentUnconfirmedCarry", "CASGCIntentDeleted",
+        "CASGCIntentLeftOnSpare", "CASGCIntentDeletedOnSpare", "CASGCIntentTokenRejected", "CASBlobReuseIntentPresent",
+        "CASBlobReuseTokenRejected"};
+    for (const std::string_view name : names)
+    {
+        std::optional<ProfileEvents::Event> found;
+        for (ProfileEvents::Event event = ProfileEvents::Event(0); event < ProfileEvents::end(); ++event)
+            if (ProfileEvents::getName(event) == name)
+                found = event;
+        ASSERT_TRUE(found.has_value()) << name << " is not a registered ProfileEvent";
+        EXPECT_FALSE(ProfileEvents::getDocumentation(*found).empty()) << name;
+    }
 }

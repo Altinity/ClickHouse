@@ -30,12 +30,11 @@ every present key has exactly one current incarnation identified by an opaque `T
 
 `deleteExact`, `putIfAbsent`, and `putOverwrite`/`casPut` are safety-critical for exact deletion,
 write-once metadata/control objects, and mutual exclusion. Blob-body publication deliberately has
-different semantics: `PartWriteTxn::ensureBlobPresent` owns `HEAD`, freshness metadata, and proof;
+different semantics: `PartWriteTxn::ensureBlobPresent` owns `HEAD`, the read of the deletion intent, and proof;
 `publishBlob` only moves the selected bytes.
 
 Writer readiness is represented by `BlobDependencyProof`, not by token presence. `Materialized`
-means the writer observed a present body with a `Clean` marker or completed publication and metadata
-reconciliation. `TrustedManifest` means a durable source manifest proves the blob and requires no
+means the writer observed a present body whose deletion intent is absent, or completed publication. `TrustedManifest` means a durable source manifest proves the blob and requires no
 blob I/O. Pending state and writer tokens are not stored in the dependency record.
 
 **`TOKEN ⟹ CONTENT`** is the one contract item the capability probe cannot check: a token must

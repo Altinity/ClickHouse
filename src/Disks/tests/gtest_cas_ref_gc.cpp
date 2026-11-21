@@ -1783,7 +1783,7 @@ TEST(CASRefGc, RefIntakeIncrementsObservabilityCounters)
 /// lifecycle over real wire-format objects and real GC rounds -- publish committed refs across two
 /// tables, replace one (dropping a blob), publish a covering snapshot, drive GC to a fixpoint, and
 /// assert the fold + ref-object cleanup + snapshot lifecycle plus the two read-only consumers:
-/// `runFsck(*store).clean()` (the fsck CLI's verdict, oracle included) and `gc.previewDeletes().empty()`
+/// `runFsck(*store).clean()` (the fsck CLI's verdict, oracle included) and `gc.previewDeletes().deletes.empty()`
 /// (what `cas-gc-dryrun` reports). This is the deterministic permanent twin the unit sweep keeps running.
 TEST(CASRefGc, RefSnaplogLifecycleE2E)
 {
@@ -1842,7 +1842,7 @@ TEST(CASRefGc, RefSnaplogLifecycleE2E)
     const FsckReport rep = runFsck(*store, /*detail*/true);
     EXPECT_TRUE(rep.clean());
     EXPECT_EQ(rep.dangling, 0u);
-    EXPECT_TRUE(gc.previewDeletes().empty()) << "cas-gc-dryrun equivalent: no pending content deletes";
+    EXPECT_TRUE(gc.previewDeletes().deletes.empty()) << "cas-gc-dryrun equivalent: no pending content deletes";
 }
 
 /// (8) A malformed/adversarial ref key aborts ref folding for the round: no partial delta, no cursor
@@ -1915,7 +1915,7 @@ TEST(CASRefGc, NonCanonicalLifeKeyAbortsRefFoldingWithoutWedgingTheRound)
     EXPECT_TRUE(rep.hasAnomaly(RootNamespace{}, /*shard*/ 0))
         << "the refusal must surface as the fold's abort anomaly, not vanish";
     EXPECT_EQ(rep.deleted, 0u);
-    EXPECT_EQ(rep.redeleted, 0u);
+    EXPECT_EQ(rep.bodies_deleted, 0u);
 
     /// Same fail-close as (8): no partial delta, no cursor advance.
     EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(1)), 0)

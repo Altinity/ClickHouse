@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "cas_test_helpers.h"
+#include "cas_publication_test_support.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
@@ -51,6 +52,8 @@ namespace DB::ErrorCodes
 
 namespace
 {
+
+using DB::Cas::tests::EtagFaithfulPublicationBackend;
 
 /// ---- Small raw-fixture request-engine wrappers shared by the tests below ----
 
@@ -221,98 +224,6 @@ public:
     }
 };
 
-/// Models an ETag store faithfully enough for the staged-envelope regressions: a blob token is a
-/// deterministic digest of the complete object bytes, so copying the same staging object again would
-/// reproduce the same token. Each script injects a different ambiguity transition from the design.
-class EtagFaithfulPublicationBackend final : public DB::Cas::InMemoryBackend
-{
-public:
-    enum class FaultScript : uint8_t
-    {
-        CopyLandsThenCondemned,
-        CopyLandsThenDeletedBeforeAbsentRetry,
-        FirstCondemnedStreamLandsThenDeleted,
-    };
-
-    explicit EtagFaithfulPublicationBackend(FaultScript script_) : script(script_) {}
-
-    std::optional<DB::Cas::Backend::RawMeta> head(const String & key, DB::Cas::TransportAccess & access) override
-    {
-        std::optional<DB::Cas::Backend::RawMeta> result = DB::Cas::InMemoryBackend::head(key, access);
-        if (result && isBlobBodyKey(key))
-        {
-            const auto body = DB::Cas::InMemoryBackend::read(key, access);
-            chassert(body.has_value());
-            result->value = sipHash128String(body->bytes);
-        }
-        return result;
-    }
-
-    DB::Cas::Backend::RawRemoval remove(const String & key, const String & expected_value,
-                                        DB::Cas::TransportAccess & access) override
-    {
-        if (!isBlobBodyKey(key))
-            return DB::Cas::InMemoryBackend::remove(key, expected_value, access);
-
-        const auto current = head(key, access);
-        if (!current)
-            return DB::Cas::Backend::RawRemoval::Gone;
-        if (current->value != expected_value)
-            return DB::Cas::Backend::RawRemoval::Mismatch;
-        return DB::Cas::InMemoryBackend::remove(key, DB::Cas::InMemoryBackend::head(key, access)->value, access);
-    }
-
-    void publish(const DB::Cas::BlobPublishRequest & request, DB::Cas::TransportAccess & access) override
-    {
-        const bool is_copy = std::holds_alternative<DB::Cas::VerbatimStagedBlobPublication>(request.publication);
-        if (is_copy)
-            ++copy_publications;
-        else
-            ++streaming_publications;
-
-        if (!fault_fired
-            && ((script == FaultScript::CopyLandsThenCondemned && is_copy)
-                || (script == FaultScript::CopyLandsThenDeletedBeforeAbsentRetry && is_copy)
-                || (script == FaultScript::FirstCondemnedStreamLandsThenDeleted && !is_copy)))
-        {
-            fault_fired = true;
-            DB::Cas::InMemoryBackend::publish(request, access);
-            queued_delete_token = head(request.destination_key, access)->value;
-            /// The test wants to replay this exact captured value later as a delete precondition, to
-            /// prove a retag defeats it. `Etag` is never constructible from a raw string, so the only
-            /// way to hold a replayable one is to mint it -- through a nested admitted operation, over
-            /// this same backend instance -- at the exact moment the raw value above was observed.
-            {
-                DB::Cas::tests::OperationForTest mint_op(*this);
-                const auto meta = (*mint_op).head(request.destination_key, DB::Cas::Retry::once());
-                if (meta)
-                    queued_delete_etag = meta->etag;
-            }
-
-            if (script != FaultScript::CopyLandsThenCondemned)
-                first_delete = remove(request.destination_key, queued_delete_token, access);
-
-            throw Poco::TimeoutException("ETag-faithful staged publication response lost");
-        }
-
-        DB::Cas::InMemoryBackend::publish(request, access);
-    }
-
-    FaultScript script;
-    bool fault_fired = false;
-    size_t copy_publications = 0;
-    size_t streaming_publications = 0;
-    String queued_delete_token;
-    std::optional<DB::Cas::Etag> queued_delete_etag;
-    DB::Cas::Backend::RawRemoval first_delete{};
-
-private:
-    static bool isBlobBodyKey(const String & key)
-    {
-        return key.find("/blobs/") != String::npos && !key.ends_with(".meta");
-    }
-};
-
 DB::Cas::PoolPtr openStagingPool(const std::shared_ptr<RecordingStagingBackend> & b)
 {
     return DB::Cas::Pool::open(b, DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
@@ -389,8 +300,12 @@ TEST(CASS3Staging, StagedCopyCondemnedRetryRetagsBeforeQueuedDelete)
     const String staging_key = "p/staging/mount1/etag-condemned.tmp";
     const String staging_bytes = stagedBytes(store->poolMeta().blob_header_len, payload, DB::UInt128{101});
     createAt(*backend, staging_key, staging_bytes);
-    DB::Cas::tests::writeMetaClean(*backend, store->layout(), DB::Cas::tests::u128Of(payload), payload.size());
-    DB::Cas::tests::condemnMeta(*backend, store->layout(), DB::Cas::tests::u128Of(payload), 31);
+    {
+        /// The copy will land with this store's content token, and that incarnation is already condemned.
+        const auto identity = DB::Cas::canonicalIdentity(DB::Cas::Dialect::Emulated, sipHash128String(staging_bytes));
+        ASSERT_TRUE(identity.has_value());
+        createAt(*backend, store->layout().blobIntentKey(ref, *identity), DB::Cas::blobIntentRecord());
+    }
     auto build = precommittedBuildFor(
         store, DB::Cas::RootNamespace{"srv1/etag-condemned"}, "part",
         DB::Cas::tests::u128Of(payload), payload.size());
@@ -461,8 +376,7 @@ TEST(CASS3Staging, FirstCondemnedAttemptThenAbsentRetryNeverRecopies)
     const String staging_bytes = stagedBytes(store->poolMeta().blob_header_len, payload, DB::UInt128{303});
     createAt(*backend, staging_key, staging_bytes);
     createAt(*backend, store->layout().blobKey(ref), staging_bytes);
-    DB::Cas::tests::writeMetaClean(*backend, store->layout(), DB::Cas::tests::u128Of(payload), payload.size());
-    DB::Cas::tests::condemnMeta(*backend, store->layout(), DB::Cas::tests::u128Of(payload), 37);
+    DB::Cas::tests::plantIntentForCurrentBody(*backend, store->layout(), DB::Cas::tests::legacyMetaTestRef(DB::Cas::tests::u128Of(payload)));
     /// Captured through a real admitted operation, so it is a genuinely replayable `Etag` -- never
     /// constructible from a bare raw value -- for the later mismatch check below.
     DB::Cas::Etag original_staged_etag = [&]
@@ -691,7 +605,7 @@ TEST(CASS3Staging, PromoteViaServerSideCopyCreatesFreshBlobMaterializedProof)
     EXPECT_EQ(got->bytes, staging_bytes);
 }
 
-/// (b) Blob key already exists and is `Clean` ⇒ the writer observes it without publication.
+/// (b) Blob key already exists with no intent ⇒ the writer observes it without publication.
 TEST(CASS3Staging, PromoteOverExistingCleanBlobAdoptsAndNeverOverwrites)
 {
     auto backend = std::make_shared<RecordingStagingBackend>();
@@ -714,7 +628,6 @@ TEST(CASS3Staging, PromoteOverExistingCleanBlobAdoptsAndNeverOverwrites)
         *backend,
         blob_key,
         stagedBytes(store->poolMeta().blob_header_len, payload, DB::UInt128{0xBB}));
-    DB::Cas::tests::writeMetaClean(*backend, store->layout(), hash, payload.size());
     const auto before = headAt(*backend, blob_key);
     ASSERT_TRUE(before.has_value());
 
@@ -730,13 +643,13 @@ TEST(CASS3Staging, PromoteOverExistingCleanBlobAdoptsAndNeverOverwrites)
     /// The existing incarnation is untouched: same token, same bytes.
     const auto after = headAt(*backend, blob_key);
     ASSERT_TRUE(after.has_value());
-    EXPECT_EQ(after->etag, before->etag);
+    EXPECT_EQ(tokenText(after->etag), tokenText(before->etag));
 
     /// Observing the existing incarnation records materialized evidence without retaining its token.
     EXPECT_EQ(build->dependencyProof(blob_id), DB::Cas::BlobDependencyProof::Materialized);
 }
 
-/// (c) Blob key exists but is CONDEMNED ⇒ the writer republishes its OWN staging PAYLOAD
+/// (c) Blob key exists and its incarnation has an intent ⇒ the writer republishes its OWN staging PAYLOAD
 /// under a FRESH-tagged envelope header — NEVER a read/copy of the condemned blob key
 /// and the replacement body DIFFERS from the condemned incarnation
 /// (INV-NO-RETURN: a verbatim copy would reproduce identical bytes ⇒ identical ETag ⇒ the queued
@@ -769,8 +682,7 @@ TEST(CASS3Staging, PublishOverCondemnedBlobUsesFreshTagNotVerbatim)
     /// produced (the writer's OWN create, later observed condemned). This is the adversarial shape: a
     /// verbatim republication WOULD reproduce these identical bytes ⇒ identical ETag ⇒ collision.
     createAt(*backend, blob_key, staging_bytes);
-    DB::Cas::tests::writeMetaClean(*backend, store->layout(), hash, /*size=*/payload.size());
-    DB::Cas::tests::condemnMeta(*backend, store->layout(), hash, /*condemn_round=*/5);
+    DB::Cas::tests::plantIntentForCurrentBody(*backend, store->layout(), DB::Cas::tests::legacyMetaTestRef(hash));
     const auto before = headAt(*backend, blob_key);
     ASSERT_TRUE(before.has_value());
 
@@ -779,7 +691,7 @@ TEST(CASS3Staging, PublishOverCondemnedBlobUsesFreshTagNotVerbatim)
         blob_id,
         reReadableStagedSource(backend, staging_key, payload.size(), store->poolMeta().blob_header_len));
 
-    /// A present `Condemned` destination selects exactly one retagged streaming publication. It never
+    /// A present destination under an intent selects exactly one retagged streaming publication. It never
     /// attempts the verbatim-copy transport.
     ASSERT_EQ(backend->copy_calls.size(), 1u);
     EXPECT_FALSE(backend->copy_calls[0].server_side_copy);
@@ -793,7 +705,7 @@ TEST(CASS3Staging, PublishOverCondemnedBlobUsesFreshTagNotVerbatim)
     /// The incarnation token is REFRESHED (a fresh incarnation displaced the condemned one).
     const auto after = headAt(*backend, blob_key);
     ASSERT_TRUE(after.has_value());
-    EXPECT_NE(after->etag, before->etag);
+    EXPECT_NE(tokenText(after->etag), tokenText(before->etag));
 
     const auto got = readAt(*backend, blob_key);
     ASSERT_TRUE(got.has_value());
@@ -810,11 +722,9 @@ TEST(CASS3Staging, PublishOverCondemnedBlobUsesFreshTagNotVerbatim)
     EXPECT_EQ(got->bytes.substr(header_len), payload);              /// payload preserved
     EXPECT_NE(got->bytes.substr(0, header_len), staging_header);    /// header freshly re-tagged
 
-    /// The republication recorded materialized evidence and flipped the meta back to `Clean`.
+    /// The republication recorded materialized evidence; the fresh incarnation has no intent.
     EXPECT_EQ(build->dependencyProof(blob_id), DB::Cas::BlobDependencyProof::Materialized);
-    const auto lm = DB::Cas::tests::loadMetaForTest(*backend, store->layout(), hash);
-    ASSERT_TRUE(lm.has_value());
-    EXPECT_EQ(lm->meta.state, DB::Cas::MetaState::Clean);
+    EXPECT_FALSE(DB::Cas::tests::objectPresent(*backend, *DB::Cas::tests::intentKeyOfCurrentBody(*backend, store->layout(), blob_id)));
 }
 
 /// ===========================================================================================

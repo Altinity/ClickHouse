@@ -32,7 +32,7 @@ namespace's shape and never interprets its contents.
 |---|---|---|---|
 | `_pool_meta` | pool identity + floors | `cas_pool_meta` | pool create/admit |
 | `blobs/<algo>/<hex[0:2]>/<hex>` | blob envelope + payload | `cas_blob` | uploads |
-| `blobs/<algo>/<hex[0:2]>/<hex>.meta` | blob freshness sidecar | `cas_blob_meta` | dedup/GC |
+| `blob-intents/<algo>/<hex[0:2]>/<hex>/<dialect>/<tag-hex>` | deletion intent of one body incarnation | `cas_blob_intent` | GC |
 | `cas/ns/stream/<life_id>/_log/<epoch-hex>-<seq-hex>.zst` | ref transaction log | `cas_ref_log` | writer commit path |
 | `cas/ns/stream/<life_id>/_snap/<epoch-hex>-<seq-hex>.zst` | complete ref table snapshot | `cas_ref_snap` | writer/GC fold |
 | `cas/ns/state/<life_id>/_ckpt` | mutable per-life checkpoint | `cas_ref_ckpt` | namespace creation, snapshot publication, generation 3 stamp |
@@ -50,13 +50,18 @@ namespace's shape and never interprets its contents.
 | `roots/<key>` | loose mountpoint object, verbatim | — (never interpreted) | upper layers |
 | `staging/<server_root_id>/…` | S3-native upload staging scratch | — | writer, own mount only |
 
+`blob-intents/` holds the [deletion intents](/antalya/cas/architecture/blob-protocol#deletion-intent):
+the first four segments mirror the blob's own key, and `<dialect>/<tag-hex>` is the lowercase hex of the
+body's token, as the pool's token dialect (`etag`, `generation` or `emulated`, recorded in `_pool_meta`)
+renders it. Only `GC` and `cas-migrate-pool` create intents, and only `GC` deletes them.
+
 `<algo>` is `ch128`, `xxh3`, or `sha256` — the hash algorithm is a path segment because one pool may
 legally hold blobs under several algorithms at once. `<hex[0:2]>` is a flat two-character S3 key
 shard for request-fan-out, unrelated to the separate `cas_gc_shards` GC-internal reduction fan-out
 (which appears only inside `gc/gen/…` keys and routes by the digest's high 64 bits, read
 big-endian). Discovery LISTs use fixed prefixes: `cas/ns/stream/`, `cas/ns/`, `cas/manifests/`,
 `blobs/` (deliberately without the algorithm segment, so one recursive LIST covers every
-algorithm), `roots/`, `gc/server-roots/`. `staging/` is a top-level sibling that no GC LIST ever
+algorithm), `blob-intents/`, `roots/`, `gc/server-roots/`. `staging/` is a top-level sibling that no GC LIST ever
 touches — it is reclaimed only by its own server's next mount.
 
 ## Envelope format {#envelope-format}
@@ -129,7 +134,7 @@ ca-pool/cas/ns/state/0123456789abcdef0123456789abcdef/_ckpt
 ca-pool/cas/manifests/srv1/store/3f2/3f2a1b7c-…-abcdefabcdef@cas@/0000000000000001-0000000000000003/000001.zst
 
 ca-pool/blobs/xxh3/a1/a1b2c3d4e5f60708b1c2d3e4f5061728
-ca-pool/blobs/xxh3/a1/a1b2c3d4e5f60708b1c2d3e4f5061728.meta
+ca-pool/blob-intents/xxh3/a1/a1b2c3d4e5f60708b1c2d3e4f5061728/etag/613162326333
 
 ca-pool/roots/srv1/clickhouse_access_check_8f3a1c2d
 
