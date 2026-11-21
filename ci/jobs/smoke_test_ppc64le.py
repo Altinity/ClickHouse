@@ -15,8 +15,14 @@ from ci.praktika.utils import Shell, Utils
 
 TEMP_DIR = Path(f"{Utils.cwd()}/ci/tmp")
 BINARY_PATH = TEMP_DIR / "clickhouse"
-DEBIAN_IMAGE = "debian:bookworm"
-QEMU_IMAGE = "multiarch/qemu-user-static"
+DEBIAN_IMAGE = (
+    "debian:bookworm"
+    "@sha256:268fb24c39bca92d326dd83ea3abebe4a3f7751c804ffef23bb6d857dd343ff8"
+)
+QEMU_IMAGE = (
+    "tonistiigi/binfmt:qemu-v10.2.3"
+    "@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0"
+)
 
 
 def main():
@@ -40,7 +46,7 @@ def main():
         test_results.append(
             Result.from_commands_run(
                 name="Register qemu-ppc64le",
-                command=f"docker run --rm --privileged {QEMU_IMAGE} --reset -p yes",
+                command=f"docker run --rm --privileged {QEMU_IMAGE} --install ppc64le",
             )
         )
 
