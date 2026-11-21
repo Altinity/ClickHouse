@@ -1580,9 +1580,14 @@ def test_a_first_attempt_timeout_is_reissued_as_attempt_two():
     the ordinary `cas_gcs_hmac` disk and never throw at all. `FUSE_DISK` is a second CAS disk
     the fixture mounts alongside it (own `cas_server_root_id`, own physical prefix under the same
     bucket, so it shares no keys with `cas_gcs_hmac`'s traffic) with `attempt_timeout_ms` tightened
-    to 1000 -- the only way to make a 3000 ms delay a genuine transport timeout without touching the
-    engine's C++ default. The margin between the two (rather than the earlier 200 ms / 300 ms pair)
-    is what keeps the reissue observable under a sanitizer build's own slowdown of the request path.
+    to 1000 -- the only way to make a 3000 ms delay a genuine transport timeout for the LIST
+    without touching the engine's C++ default.
+
+    The conditional `PUT` is bounded by a different timeout: the first-attempt receive timeout of
+    a `PUT` is 3000 ms (`ConnectionTimeouts`), and `attempt_timeout_ms` caps only the connect.
+    Its delay is 6000 ms so the client always times out first and the settlement `GET` finds the
+    key empty. A delay equal to the timeout makes the delayed `PUT` race the `GET`; when it lands
+    first the engine settles by reading back its own bytes and sends no attempt 2.
     `attempt_timeout_ms` is frozen at pool-open time (mount-time), not reloadable, hence a dedicated
     disk rather than a temporary `SYSTEM RELOAD CONFIG` on the existing one.
     """
@@ -1643,7 +1648,7 @@ def test_a_first_attempt_timeout_is_reissued_as_attempt_two():
         seq = _next_seq()
         resolve_reads_before = _resolve_reads(node)
         delayed_before = _counters().get("DelayedRequest", 0)
-        assert _control_post("/_control/delay?substr=blob-intents&ms=3000&method=PUT&once=1")["method"] == "PUT"
+        assert _control_post("/_control/delay?substr=blob-intents&ms=6000&method=PUT&once=1")["method"] == "PUT"
         # The round that folds the drop condemns; a round before it may only fold.
         for _ in range(10):
             node.query("SYSTEM CAS GC RUN '{}'".format(disk))
