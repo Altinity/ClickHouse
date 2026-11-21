@@ -28,12 +28,13 @@ workflow = Workflow.Config(
         # *JobConfigs.build_llvm_coverage_job, # NOTE (strtgbb): Not configured yet. Determine if useful first.
         *JobConfigs.coverage_build_jobs,
         *JobConfigs.release_build_jobs,
-        # *[ # NOTE (strtgbb): we don't run special build jobs
-        #     job.set_dependency(
-        #         REGULAR_BUILD_NAMES  # + [JobConfigs.tidy_build_arm_jobs[0].name]  # NOTE (strtgbb): we don't run tidy build jobs
-        #     )
-        #     for job in JobConfigs.special_build_jobs
-        # ],
+        *[
+            job.set_dependency(
+                REGULAR_BUILD_NAMES  # + [JobConfigs.tidy_build_arm_jobs[0].name]  # NOTE (strtgbb): we don't run tidy build jobs
+            )
+            for job in JobConfigs.special_build_jobs
+        ],
+        JobConfigs.smoke_test_ppc64le,
         # JobConfigs.smoke_tests_macos,
         *JobConfigs.unittest_jobs,
         # *JobConfigs.unittest_llvm_coverage_job, # NOTE (strtgbb): Not configured yet. Determine if useful first.

@@ -17,6 +17,29 @@ set(LIBUNWIND_ASM_SOURCES
     "${LIBUNWIND_SOURCE_DIR}/src/UnwindRegistersRestore.S"
     "${LIBUNWIND_SOURCE_DIR}/src/UnwindRegistersSave.S")
 
+# stxvd2x stores VSX doublewords swapped on ppc64le. The first xxswapd fixes the
+# saved image and leaves the live register swapped; the patch swaps it back.
+if(ARCH_PPC64LE)
+    find_program(LIBUNWIND_PATCH_EXECUTABLE patch REQUIRED)
+    set(LIBUNWIND_REGISTERS_SAVE_ASM "${CMAKE_CURRENT_BINARY_DIR}/UnwindRegistersSave.S")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${LIBUNWIND_SOURCE_DIR}/src/UnwindRegistersSave.S"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ppc64le-vsx-register-save.patch")
+    execute_process(
+        COMMAND "${LIBUNWIND_PATCH_EXECUTABLE}" -o "${LIBUNWIND_REGISTERS_SAVE_ASM}"
+            "${LIBUNWIND_SOURCE_DIR}/src/UnwindRegistersSave.S"
+            "${CMAKE_CURRENT_SOURCE_DIR}/ppc64le-vsx-register-save.patch"
+        RESULT_VARIABLE LIBUNWIND_PATCH_RESULT
+        OUTPUT_VARIABLE LIBUNWIND_PATCH_OUTPUT
+        ERROR_VARIABLE LIBUNWIND_PATCH_ERROR
+    )
+    if(NOT LIBUNWIND_PATCH_RESULT EQUAL 0)
+        message(FATAL_ERROR "Failed to apply ppc64le-vsx-register-save.patch\n${LIBUNWIND_PATCH_OUTPUT}\n${LIBUNWIND_PATCH_ERROR}")
+    endif()
+    list(REMOVE_ITEM LIBUNWIND_ASM_SOURCES "${LIBUNWIND_SOURCE_DIR}/src/UnwindRegistersSave.S")
+    list(APPEND LIBUNWIND_ASM_SOURCES "${LIBUNWIND_REGISTERS_SAVE_ASM}")
+endif()
+
 enable_language(ASM)
 
 set(LIBUNWIND_SOURCES
