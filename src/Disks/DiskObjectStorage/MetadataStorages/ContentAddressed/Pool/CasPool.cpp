@@ -2250,7 +2250,9 @@ std::optional<CasRefLedger::PinnedResolution> Pool::resolveRefPinned(const RootN
 ConfirmAnswer Pool::confirmExactRef(const RootNamespace & ns, const String & ref_name, const ManifestRef & manifest_ref) const
 {
     /// One attempt: the peer that asked waits on its own timeout and retries the fetch from its queue.
-    return confirmUnderSlot([&] { return ref_ledger.confirmExactRef(ns, ref_name, manifest_ref); }, Retry::once());
+    return confirmUnderSlot(
+               ns, ref_name, [&] { return ConfirmVerdict{ref_ledger.confirmExactRef(ns, ref_name, manifest_ref)}; }, Retry::once())
+        .answer;
 }
 
 ConfirmAnswer Pool::confirmPinnedRef(const CasRefLedger::TablePin & table, const RootNamespace & ns, const String & ref_name,
@@ -2260,14 +2262,42 @@ ConfirmAnswer Pool::confirmPinnedRef(const CasRefLedger::TablePin & table, const
     const uint64_t window_ms = config.cas_request_budget.request_window_ms;
     const uint64_t deadline_ms = window_ms > std::numeric_limits<uint64_t>::max() - started_ms
         ? std::numeric_limits<uint64_t>::max() : started_ms + window_ms;
-    /// The copy's statement has no retry of its own, so a transient slot-read failure is reissued here.
-    return confirmUnderSlot(
-        [&] { return ref_ledger.confirmPinnedRef(table, ns, ref_name, manifest_ref, deadline_ms); },
-        Retry::standard().cappedAt(deadline_ms));
+    /// Every pass repeats the ownership capture, the ledger snapshot and the slot read. The destination's reference is durable
+    /// before the first pass and GC deletes a body only on an untouched zero of a complete cut, so a later full pass proves the
+    /// same ownership overlap as an earlier one. An exact name and token may legitimately reappear after a move away and back.
+    const Retry slot_read_policy = Retry::standard().cappedAt(deadline_ms);
+    for (uint32_t pass = 1;; ++pass)
+    {
+        throwIfConfirmTornDown(ns, ref_name);
+        const ConfirmVerdict verdict = confirmUnderSlot(
+            ns, ref_name, [&] { return ref_ledger.confirmPinnedRef(table, ns, ref_name, manifest_ref, deadline_ms); },
+            slot_read_policy);
+        if (verdict.answer != ConfirmAnswer::Unknown || verdict.refusal == ConfirmVerdict::Refusal::OneWay
+            || ref_ledger.pinnedTableRetired(table, ns))
+            return verdict.answer;
+        const uint64_t now_ms = bootMsNow();
+        if (now_ms >= deadline_ms)
+            return verdict.answer;
+        throwIfConfirmTornDown(ns, ref_name);
+        /// Teardown does not wake this pause, and no query cancellation reaches this layer.
+        mount_requests.pause(std::min(Retry::backoff(pass), deadline_ms - now_ms));
+        /// A pass whose slot read could not finish by the deadline would fail on the read instead of refusing.
+        if (!mount_requests.admit().oneAttemptFitsBefore(deadline_ms))
+            return verdict.answer;
+    }
 }
 
-ConfirmAnswer Pool::confirmUnderSlot(const std::function<ConfirmAnswer()> & ledger_snapshot,
-                                     const Retry & slot_read_policy) const
+void Pool::throwIfConfirmTornDown(const RootNamespace & ns, const String & ref_name) const
+{
+    if (teardownBegun())
+        throw Exception(ErrorCodes::ABORTED,
+            "CAS copy-source confirm of ref '{}' in namespace '{}': teardown began while waiting to confirm it",
+            ref_name, ns.string());
+}
+
+ConfirmVerdict Pool::confirmUnderSlot(const RootNamespace & ns, const String & ref_name,
+                                      const std::function<ConfirmVerdict()> & ledger_snapshot,
+                                      const Retry & slot_read_policy) const
 {
     /// Captured before the ledger snapshot: if a remount lands in between, this older ownership cannot
     /// hold the new slot, so the mismatch refuses. The order is safety-bearing;
@@ -2275,9 +2305,9 @@ ConfirmAnswer Pool::confirmUnderSlot(const std::function<ConfirmAnswer()> & ledg
     const std::shared_ptr<const MountSlotOwnership> ownership = mount_runtime.slotOwnership();
     if (confirm_after_ownership_capture_hook_for_test)
         confirm_after_ownership_capture_hook_for_test();
-    const ConfirmAnswer answer = ledger_snapshot();
-    if (answer != ConfirmAnswer::Yes)
-        return answer;
+    const ConfirmVerdict verdict = ledger_snapshot();
+    if (verdict.answer != ConfirmAnswer::Yes)
+        return verdict;
     if (confirm_after_ledger_snapshot_hook_for_test)
         confirm_after_ledger_snapshot_hook_for_test();
     bool held = false;
@@ -2285,20 +2315,26 @@ ConfirmAnswer Pool::confirmUnderSlot(const std::function<ConfirmAnswer()> & ledg
     {
         try
         {
-            held = mount_runtime.slotHeldBy(*ownership, slot_read_policy);
+            held = mount_runtime.slotHeldBy(*ownership, slot_read_policy, [this] { return !teardownBegun(); });
         }
         catch (...)
         {
+            throwIfConfirmTornDown(ns, ref_name);
             ProfileEvents::increment(ProfileEvents::CASRelinkConfirmRefusedSlotUnreadable);
             throw;
         }
+        /// A read that finished after teardown began answers for a mount that is going away.
+        throwIfConfirmTornDown(ns, ref_name);
     }
     if (!held)
     {
         ProfileEvents::increment(ProfileEvents::CASRelinkConfirmRefusedSlotMoved);
-        return ConfirmAnswer::Unknown;
+        static const LoggerPtr log = getLogger("CasRefLedger");
+        LOG_TRACE(log, "Relink confirm for ref '{}' in namespace '{}' is unknown: the mount slot read does not show this "
+                  "mount's current lease", ref_name, ns.string());
+        return {ConfirmAnswer::Unknown, ConfirmVerdict::Refusal::Transient};
     }
-    return ConfirmAnswer::Yes;
+    return {ConfirmAnswer::Yes};
 }
 
 NamespaceLifeId Pool::namespaceLife(const RootNamespace & ns)

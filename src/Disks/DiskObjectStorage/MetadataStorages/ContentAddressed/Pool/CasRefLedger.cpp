@@ -494,11 +494,12 @@ namespace
 /// a three-value enum, so the counters and this trace line are the only way a live gate can tell load
 /// (`RefMutationInFlight`) from a fault (`LaneWedged`, `LaneBroken`), from contention (`StateLockBusy`), or from this
 /// mount losing its claim to the namespace (`MountCannotSpeak`).
-ConfirmAnswer refuseConfirm(ProfileEvents::Event reason, const RootNamespace & ns, const String & ref_name, std::string_view why)
+ConfirmVerdict refuseConfirm(ProfileEvents::Event reason, const RootNamespace & ns, const String & ref_name, std::string_view why,
+                             ConfirmVerdict::Refusal refusal)
 {
     ProfileEvents::increment(reason);
     LOG_TRACE(confirmLogger(), "Relink confirm for ref '{}' in namespace '{}' is unknown: {}", ref_name, ns.string(), why);
-    return ConfirmAnswer::Unknown;
+    return {ConfirmAnswer::Unknown, refusal};
 }
 
 }
@@ -559,12 +560,13 @@ ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const Stri
     /// here would make every table's lane wait on this table's state lock.
     std::unique_lock<std::mutex> slock(rt.state_mutex, std::try_to_lock);
     if (!slock.owns_lock())
-        return refuseConfirm(ProfileEvents::CASRelinkConfirmRefusedStateLockBusy, ns, ref_name, "the table's state lock is held");
-    return confirmLocked(rt, ns, ref_name, manifest_ref);
+        return refuseConfirm(ProfileEvents::CASRelinkConfirmRefusedStateLockBusy, ns, ref_name, "the table's state lock is held",
+                             ConfirmVerdict::Refusal::Transient).answer;
+    return confirmLocked(rt, ns, ref_name, manifest_ref).answer;
 }
 
-ConfirmAnswer CasRefLedger::confirmPinnedRef(const TablePin & table, const RootNamespace & ns, const String & ref_name,
-                                             const ManifestRef & manifest_ref, uint64_t deadline_ms) const
+ConfirmVerdict CasRefLedger::confirmPinnedRef(const TablePin & table, const RootNamespace & ns, const String & ref_name,
+                                              const ManifestRef & manifest_ref, uint64_t deadline_ms) const
 {
     if (!table.runtime)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "confirmPinnedRef: ref '{}' in namespace '{}' has no pinned table",
@@ -573,7 +575,7 @@ ConfirmAnswer CasRefLedger::confirmPinnedRef(const TablePin & table, const RootN
     const auto refuse_busy = [&]
     {
         return refuseConfirm(ProfileEvents::CASRelinkConfirmRefusedStateLockBusy, ns, ref_name,
-                             "the table's state lock was held until the request deadline");
+                             "the table's state lock was held until the request deadline", ConfirmVerdict::Refusal::Transient);
     };
     while (true)
     {
@@ -582,7 +584,7 @@ ConfirmAnswer CasRefLedger::confirmPinnedRef(const TablePin & table, const RootN
             const auto it = ref_name_slots.find(ns.string());
             if (it == ref_name_slots.end() || it->second.current != table.runtime)
                 return refuseConfirm(ProfileEvents::CASRelinkConfirmRefusedMountCannotSpeak, ns, ref_name,
-                                     "the table was replaced since the source was resolved");
+                                     "the table was replaced since the source was resolved", ConfirmVerdict::Refusal::OneWay);
             /// A try-lock under the pool lock, as in `confirmExactRef`: the wait below holds no ledger lock.
             std::unique_lock<std::mutex> slock(rt.state_mutex, std::try_to_lock);
             if (slock.owns_lock())
@@ -602,13 +604,36 @@ ConfirmAnswer CasRefLedger::confirmPinnedRef(const TablePin & table, const RootN
     }
 }
 
-ConfirmAnswer CasRefLedger::confirmLocked(const RefTableRuntime & rt, const RootNamespace & ns, const String & ref_name,
-                                          const ManifestRef & manifest_ref) const
+bool CasRefLedger::pinnedTableRetired(const TablePin & table, const RootNamespace & ns) const
 {
-    /// Every `return ConfirmAnswer::Unknown` here goes through `refuse`.
-    const auto refuse = [&](ProfileEvents::Event reason, std::string_view why)
+    if (!table.runtime)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "pinnedTableRetired: namespace '{}' has no pinned table", ns.string());
+    const RefTableRuntime & rt = *table.runtime;
+    /// A runtime writes only under the generation it was admitted with, and every re-arm of the fence follows a
+    /// remount that supersedes all resident runtimes. A late renewal leaves the generation as it is.
+    if (rt.catalog_life_invalidated.load(std::memory_order_acquire)
+        || rt.superseded_by_remount.load(std::memory_order_acquire)
+        || fence_generation_fn() != rt.admitted_fence_generation)
+        return true;
+    /// A slot is only ever given a freshly made runtime, and a pinned one is never evicted.
+    std::lock_guard<std::mutex> qlock(ref_queue_mutex);
+    const auto it = ref_name_slots.find(ns.string());
+    return it == ref_name_slots.end() || it->second.current != table.runtime;
+}
+
+ConfirmVerdict CasRefLedger::confirmLocked(const RefTableRuntime & rt, const RootNamespace & ns, const String & ref_name,
+                                           const ManifestRef & manifest_ref) const
+{
+    /// Every `Unknown` here goes through `refuse`. `OneWay` only where no code path leads this runtime out of the state.
+    using enum ConfirmVerdict::Refusal;
+    const auto refuse = [&](ProfileEvents::Event reason, std::string_view why, ConfirmVerdict::Refusal refusal)
     {
-        return refuseConfirm(reason, ns, ref_name, why);
+        return refuseConfirm(reason, ns, ref_name, why, refusal);
+    };
+    /// Both flags are only ever set, never cleared.
+    const auto retired = [&]
+    {
+        return rt.catalog_life_invalidated.load(std::memory_order_acquire) || rt.superseded_by_remount.load(std::memory_order_acquire);
     };
 
     /// Rule 2 (warm). An unrecovered or mid-recovery runtime has an EMPTY `state`, which would read as
@@ -616,11 +641,11 @@ ConfirmAnswer CasRefLedger::confirmLocked(const RefTableRuntime & rt, const Root
     /// class: this runtime was detached by a self-remount and its view belongs to a dead incarnation.
     /// Recovery publishes atomically (`installRecoveryResult` sets `recovered` LAST under this mutex),
     /// so there is no half-recovered view to catch in between.
-    if (!rt.recovered || rt.recovery_in_progress
-        || rt.catalog_life_invalidated.load(std::memory_order_acquire)
-        || rt.superseded_by_remount.load(std::memory_order_acquire))
-        return refuse(ProfileEvents::CASRelinkConfirmRefusedMountCannotSpeak,
-                      "the table is unrecovered, recovering, retired or superseded by a remount");
+    if (retired())
+        return refuse(ProfileEvents::CASRelinkConfirmRefusedMountCannotSpeak, "the table is retired or superseded by a remount",
+                      OneWay);
+    if (!rt.recovered || rt.recovery_in_progress)
+        return refuse(ProfileEvents::CASRelinkConfirmRefusedMountCannotSpeak, "the table is unrecovered or recovering", Transient);
 
     /// Rule 3 (no admitted mutation of THIS ref). The hazard is a committed row that lags a transaction
     /// of the asked-about ref: the leader does not hold `state_mutex` across the `PUT`, so between
@@ -638,21 +663,25 @@ ConfirmAnswer CasRefLedger::confirmLocked(const RefTableRuntime & rt, const Root
     /// that -- and `NeedsRecovery`, `Closed`, `Faulted` are fences on the whole view.
     /// `Writing` with nothing carved cannot happen; it fails closed.
     if (rt.lane_state == RefLaneState::Wedged)
-        return refuse(ProfileEvents::CASRelinkConfirmRefusedLaneWedged, "the lane holds an unresolved append");
-    if (rt.lane_state != RefLaneState::Ready && rt.lane_state != RefLaneState::Writing)
-        return refuse(ProfileEvents::CASRelinkConfirmRefusedLaneBroken, "the lane is neither Ready nor Writing");
+        return refuse(ProfileEvents::CASRelinkConfirmRefusedLaneWedged, "the lane holds an unresolved append", Transient);
+    /// Terminal: only `Ready` arms an append, `resolveWedgeOnce` refuses these states, and recovery reruns only from `NeedsRecovery`.
+    if (rt.lane_state == RefLaneState::Closed || rt.lane_state == RefLaneState::Faulted)
+        return refuse(ProfileEvents::CASRelinkConfirmRefusedLaneBroken, "the lane is closed or faulted", OneWay);
+    if (rt.lane_state == RefLaneState::NeedsRecovery)
+        return refuse(ProfileEvents::CASRelinkConfirmRefusedLaneBroken, "the lane needs recovery", Transient);
+    /// A lane tombstone holds the lane `Writing` before anything is carved.
     if (rt.lane_state == RefLaneState::Writing && rt.carved.empty())
-        return refuse(ProfileEvents::CASRelinkConfirmRefusedLaneBroken, "the lane is Writing with nothing carved");
+        return refuse(ProfileEvents::CASRelinkConfirmRefusedLaneBroken, "the lane is Writing with nothing carved", Transient);
     const auto covers = [&](const MutationScope & scope)
     {
         return scope.kind == MutationScope::Kind::WholeShard || scope.names(ref_name);
     };
     for (const auto & item : rt.pending)
         if (covers(item->scope))
-            return refuse(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight, "a queued mutation names this ref");
+            return refuse(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight, "a queued mutation names this ref", Transient);
     for (const auto & item : rt.carved)
         if (covers(item->scope))
-            return refuse(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight, "a carved mutation names this ref");
+            return refuse(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight, "a carved mutation names this ref", Transient);
 
     /// Rule 5 (exact row equality) -- the only rule that can answer `No` at all. On a table that passed
     /// rules 2-4 the committed map is this writer's view, so a missing row or a different `ManifestRef`
@@ -664,7 +693,7 @@ ConfirmAnswer CasRefLedger::confirmLocked(const RefTableRuntime & rt, const Root
     const auto & committed = rt.state.getCommitted();
     const auto row = committed.find(ref_name);
     if (row == committed.end() || !(row->second.manifest_ref == manifest_ref))
-        return ConfirmAnswer::No;
+        return {ConfirmAnswer::No};
 
     /// Rule 6 (mount fence), LAST and still under both locks -- the order the spec fixes. Everything
     /// above describes what this process believes; this is the check that it is still entitled to
@@ -674,13 +703,15 @@ ConfirmAnswer CasRefLedger::confirmLocked(const RefTableRuntime & rt, const Root
     /// `SourceProofFailed`, spec §failure-taxonomy), and only `Yes` is gated on the fence.
     /// Both monotone runtime-invalidations are folded in exactly as the mutation gates fold them: a
     /// retired or remount-superseded runtime can never authorize a remote promotion.
-    if (!fence_ok_fn()
-        || rt.catalog_life_invalidated.load(std::memory_order_acquire)
-        || rt.superseded_by_remount.load(std::memory_order_acquire))
+    if (retired())
         return refuse(ProfileEvents::CASRelinkConfirmRefusedMountCannotSpeak,
-                      "this mount no longer holds the namespace's write fence");
+                      "this mount no longer holds the namespace's write fence", OneWay);
+    /// A low lease budget clears with the next renewal; a moved fence generation is `pinnedTableRetired`'s to judge.
+    if (!fence_ok_fn())
+        return refuse(ProfileEvents::CASRelinkConfirmRefusedMountCannotSpeak,
+                      "this mount no longer holds the namespace's write fence", Transient);
 
-    return ConfirmAnswer::Yes;
+    return {ConfirmAnswer::Yes};
 }
 
 std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::lookupRefTableRuntime(const RootNamespace & ns) const

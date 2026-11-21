@@ -635,6 +635,10 @@ public:
     /// (`CasRefLedger::confirmPinnedRef`). One deadline, the request window from the call's start, decides whether the
     /// ledger waits for a held state lock again and bounds the mount-slot read, which reissues a transient transport failure until then;
     /// any other failure propagates at once. One wait for the lock is not bounded.
+    /// A pass that answers `Unknown` is asked again, paced by `Retry::backoff`, until `Yes`, `No`, the deadline, a
+    /// refusal of a state the pinned runtime cannot leave, or a pin that can never confirm
+    /// (`CasRefLedger::pinnedTableRetired`). No ledger lock is held between passes. Throws `ABORTED` once the pool's
+    /// teardown has begun.
     ConfirmAnswer confirmPinnedRef(const CasRefLedger::TablePin & table, const RootNamespace & ns, const String & ref_name,
                                    const ManifestRef & manifest_ref) const;
     /// TEST SEAM: runs between the ownership capture and the ledger snapshot.
@@ -936,8 +940,11 @@ private:
     Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_);
 
     /// Captures the slot ownership, takes `ledger_snapshot`, and re-checks a `Yes` with a mount-slot read under
-    /// `slot_read_policy`.
-    ConfirmAnswer confirmUnderSlot(const std::function<ConfirmAnswer()> & ledger_snapshot, const Retry & slot_read_policy) const;
+    /// `slot_read_policy`. `ns` and `ref_name` only name the ref in the log.
+    ConfirmVerdict confirmUnderSlot(const RootNamespace & ns, const String & ref_name,
+                                    const std::function<ConfirmVerdict()> & ledger_snapshot, const Retry & slot_read_policy) const;
+    /// Throws `ABORTED` once teardown began.
+    void throwIfConfirmTornDown(const RootNamespace & ns, const String & ref_name) const;
 
     /// Mount-claim policy for `mountWritable`.
     enum class MountClaimPolicy : uint8_t

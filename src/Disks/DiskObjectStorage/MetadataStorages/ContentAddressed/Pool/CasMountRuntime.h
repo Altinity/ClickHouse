@@ -202,8 +202,9 @@ public:
     /// One `GET` of the mount slot, admitted on the mount plane: true when it still holds a body
     /// `ownership` wrote (`MountSlotOwnership::holds`), false otherwise, including an absent slot.
     /// A refused admission (lost fence, spent lease budget), a request failure and a decode failure
-    /// propagate. `policy` decides whether a failed read is reissued and until when, on the mount plane's clock.
-    bool slotHeldBy(const MountSlotOwnership & ownership, const Retry & policy) const;
+    /// propagate. `policy` decides whether a failed read is reissued and until when, on the mount plane's clock;
+    /// `liveness` refuses each attempt like a lost fence once it turns false.
+    bool slotHeldBy(const MountSlotOwnership & ownership, const Retry & policy, Liveness liveness) const;
     /// Permanently latch the local fence as lost for this runtime incarnation.
     void tripMountLost();
     /// Publish the BOOTTIME deadline from a successful lease renewal.

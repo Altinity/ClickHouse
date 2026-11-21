@@ -79,6 +79,15 @@ std::string_view refLaneStateName(RefLaneState state);
 /// consumer that treats `No` as knowledge; only `Yes` is gated on the fence.
 enum class ConfirmAnswer : uint8_t { Yes, No, Unknown };
 
+/// A confirm answer and, for `Unknown`, whether the refusing state can still change on the same table runtime.
+/// Only the copy confirm reads `refusal`: it asks again after a `Transient` refusal and stops after a `OneWay` one.
+struct ConfirmVerdict
+{
+    enum class Refusal : uint8_t { Transient, OneWay };
+    ConfirmAnswer answer;
+    Refusal refusal = Refusal::Transient;
+};
+
 /// How a ref-table recovery ended without an exception. `LifeRemoved`: the catalog no longer names the
 /// runtime's exact life after the walk; nothing was installed and the runtime is detached.
 enum class RefRecoveryOutcome : uint8_t { Recovered, LifeRemoved };
@@ -206,11 +215,16 @@ public:
     ConfirmAnswer confirmExactRef(const RootNamespace & ns, const String & ref_name, const ManifestRef & manifest_ref) const;
 
     /// The same snapshot for an in-process copy, on the runtime `table` pinned when the source was resolved: an
-    /// evicted table cannot refuse a live source. `Unknown` when that runtime is no longer the current one. A held
+    /// evicted table cannot refuse a live source. `Unknown` when that runtime is no longer the current one; each
+    /// `Unknown` says whether its state can change (`ConfirmVerdict::Refusal`). A held
     /// state lock is waited for with no ledger lock held, and the answer is `Unknown` once `deadline_ms` (on
     /// `boot_ms_now_fn`) has passed. The wait itself is not bounded: `state_mutex` has no timed lock.
-    ConfirmAnswer confirmPinnedRef(const TablePin & table, const RootNamespace & ns, const String & ref_name,
-                                   const ManifestRef & manifest_ref, uint64_t deadline_ms) const;
+    ConfirmVerdict confirmPinnedRef(const TablePin & table, const RootNamespace & ns, const String & ref_name,
+                                    const ManifestRef & manifest_ref, uint64_t deadline_ms) const;
+    /// Whether `confirmPinnedRef` on `table` can never answer `Yes` again: the runtime is no longer the current one,
+    /// it was retired or superseded, or the mount fence moved past the generation it was admitted under. Each of
+    /// these is one-way.
+    bool pinnedTableRetired(const TablePin & table, const RootNamespace & ns) const;
 
     /// Appends the transaction that removes one ref and waits for its durable result. A failed append
     /// propagates its exception and does not apply the removal to the in-memory table.
@@ -1145,8 +1159,8 @@ private:
     std::function<void()> confirm_after_state_lock_wait_hook_for_test;
 
     /// The confirm's rules after residency, on `rt` with `ref_queue_mutex` and `rt.state_mutex` held.
-    ConfirmAnswer confirmLocked(const RefTableRuntime & rt, const RootNamespace & ns, const String & ref_name,
-                                const ManifestRef & manifest_ref) const;
+    ConfirmVerdict confirmLocked(const RefTableRuntime & rt, const RootNamespace & ns, const String & ref_name,
+                                 const ManifestRef & manifest_ref) const;
 
     std::optional<PinnedResolution> resolveRefOnRuntime(const RootNamespace & ns, const String & ref_name, ResolveAudit audit);
 
