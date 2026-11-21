@@ -67,7 +67,7 @@ CLIENT=("$CH" client --host 127.0.0.1 --port {TCP_PORT})
 # Unpack the self-extracting binary before launching server + client processes.
 "$CH" --version
 
-CLICKHOUSE_WATCHDOG_ENABLE=0 TZ= "$CH" server \\
+CLICKHOUSE_WATCHDOG_ENABLE=0 "$CH" server \\
     --config-file=/workspace/smoke/conf/config.xml \\
     >/workspace/smoke/log/server.stderr.log 2>&1 &
 SERVER_PID=$!
