@@ -43,7 +43,7 @@ struct MigratePoolReport
     uint64_t condemned_rows = 0;            /// M3
     uint64_t markers_read = 0;              /// M4
     uint64_t bodies_listed = 0;             /// M4
-    uint64_t intents_confirmed = 0;         /// M5
+    uint64_t intents_confirmed = 0;         /// M4 and M5
     uint64_t control_objects_written = 0;   /// M6: the raise to floor 3 and the `gc/state` rewrite that landed
     uint64_t slots_reread = 0;              /// M7
     bool floor_raised = false;              /// M8 sent the write that raised the floor to 4

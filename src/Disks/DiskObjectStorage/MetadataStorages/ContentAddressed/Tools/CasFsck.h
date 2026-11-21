@@ -77,8 +77,8 @@ enum class FsckClass : uint8_t
     IntentReplaced,  /// the body present now is another incarnation; GC removes this intent later
     IntentBodyGone,  /// no body at the blob's key; GC removes the intent in a later round
     IntentMalformed, /// the key is not an intent key, or (verifying scan) the bytes are not the intent record. ERROR
-    IntentUnread,    /// a read or a `HEAD` failed, or the body's token has no canonical identity: the scan could
-                     /// not verify what it was asked to. ERROR
+    IntentUnread,    /// a read or a `HEAD` failed, the body's token has no canonical identity, or a `pending` row stayed
+                     /// inconclusive: the scan could not verify what it was asked to. ERROR
     /// A `pending` row is the one state in which GC deletes a body without re-reading the intent, so the
     /// intent of every `pending` row is read.
     PendingWithoutIntent,  /// a `pending` row, its intent absent, the body present with the row's token: GC would

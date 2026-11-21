@@ -5351,7 +5351,7 @@ Gc::DeletePreview Gc::previewDeletes()
                         .condemn_round = rec.condemn_round});
                     continue;
                 }
-                /// The body of a standing row is gone: the next round removes the intent of its token, if it names one.
+                /// The next round removes the intent of a standing row's token, if it names one; no `HEAD` is sent here.
                 const std::optional<CanonicalIdentity> identity = rec.token.canonical();
                 if (!identity)
                     continue;

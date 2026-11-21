@@ -106,6 +106,8 @@ struct MarkerScan
     std::set<BlobRef> not_clean;
     uint64_t markers = 0;
     uint64_t bodies = 0;
+    /// Bodies handed to the intent creation, counted per page as the run converts them.
+    uint64_t candidates = 0;
     uint64_t converted = 0;
     uint64_t elapsed_ms = 0;
 };
@@ -211,10 +213,10 @@ public:
             stepDone(3);
 
             std::atomic<uint64_t> confirmed{0};
-            std::optional<BodyConversion> conversion;
+            std::optional<BodyCandidates> candidates;
             if (all_bodies)
-                conversion.emplace(BodyConversion{rows, confirmed});
-            const MarkerScan markers = readMarkers(conversion);
+                candidates.emplace(BodyCandidates{rows, &confirmed});
+            const MarkerScan markers = readMarkers(candidates);
             stepDone(4);
 
             createIntents(rows, markers, confirmed);
@@ -407,12 +409,16 @@ private:
         const std::optional<Object> stored_state = op.read(layout.gcStateKey(), Retry::standard());
         const std::vector<InheritedRow> rows
             = readCondemnedRows(stored_state ? std::optional<GcState>(decodeGcState(stored_state->bytes)) : std::nullopt, meta);
-        const MarkerScan markers = readMarkers();
+        std::optional<BodyCandidates> candidates;
+        if (all_bodies)
+            candidates.emplace(BodyCandidates{rows, nullptr});
+        const MarkerScan markers = readMarkers(candidates);
         std::set<BlobRef> targets = markers.not_clean;
         for (const InheritedRow & row : rows)
             targets.insert(row.ref);
-        say(fmt::format("dry run: {} mount slot(s) not terminal, {} bod(ies) listed, about {} would get an intent; nothing was "
-            "written", held.size(), markers.bodies, all_bodies ? std::max<uint64_t>(markers.bodies, targets.size()) : targets.size()));
+        say(fmt::format("dry run: {} mount slot(s) not terminal, {} bod(ies) listed, about {} blob(s) would get an intent if "
+            "present: {}; nothing was written", held.size(), markers.bodies, markers.candidates + targets.size(),
+            all_bodies ? "each listed body, each blob a marker names and each condemned blob" : "each condemned blob"));
         return report;
     }
 
@@ -659,7 +665,7 @@ private:
         if (state && state->gc_shards != meta.gc_shards)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "M3: gc/state names {} GC shard(s), but _pool_meta names {}; GC of this build refuses such a state. The run "
-                "stopped before any intent and before the floor", state->gc_shards, meta.gc_shards);
+                "stopped before the floor was raised to 4", state->gc_shards, meta.gc_shards);
         if (!state || state->snap_generation == 0)
             requireNoGcHistory(state);
         std::vector<InheritedRow> rows;
@@ -676,8 +682,8 @@ private:
             }
             catch (Exception & e)
             {
-                e.addMessage("M3: GC of this build refuses the fold seal `{}` that gc/state adopts. The run stopped before any "
-                    "intent and before the floor", seal_key);
+                e.addMessage("M3: GC of this build refuses the fold seal `{}` that gc/state adopts. The run stopped before the "
+                    "floor was raised to 4", seal_key);
                 throw;
             }
             std::vector<std::vector<RunRef>> runs_of_shard(meta.gc_shards);
@@ -700,7 +706,7 @@ private:
                     if (e.code() != ErrorCodes::CORRUPTED_DATA)
                         throw;
                     e.addMessage("M3: GC of this build refuses a source-edge run of the fold seal that gc/state adopts. The run "
-                        "stopped before any intent and before the floor");
+                        "stopped before the floor was raised to 4");
                     throw;
                 }
             }
@@ -733,24 +739,25 @@ private:
         return token;
     }
 
-    /// What M4 needs to create the intent of each listed body: M5 converts the bodies the rows name.
-    struct BodyConversion
+    /// What M4 needs to take each body it lists or a marker names as a candidate: M5 converts the bodies the rows name.
+    /// Without `confirmed`, as in a dry run, the candidates are only counted.
+    struct BodyCandidates
     {
         const std::vector<InheritedRow> & rows;
-        std::atomic<uint64_t> & confirmed;
+        std::atomic<uint64_t> * confirmed;
     };
 
     /// M4: every listed marker read by its exact key, a page at a time, `concurrency` reads in flight. With
-    /// `conversion`, each listed body that no marker of its page and no row condemns gets its intent before the next
-    /// page: a second listing may omit a body this one saw.
-    MarkerScan readMarkers(const std::optional<BodyConversion> & conversion = std::nullopt)
+    /// `candidates`, each body the page lists or a marker of the page names gets its intent before the next page,
+    /// unless a marker or a row condemns it: a listing may omit a body, and a second listing may omit one this one saw.
+    MarkerScan readMarkers(const std::optional<BodyCandidates> & candidates = std::nullopt)
     {
         MarkerScan scan;
         Meter meter(*this, "M4", "marker(s) read", 0);
         Meter converted(*this, "M4", "blob(s) converted", 0);
         std::set<BlobRef> row_refs;
-        if (conversion)
-            for (const InheritedRow & row : conversion->rows)
+        if (candidates)
+            for (const InheritedRow & row : candidates->rows)
                 row_refs.insert(row.ref);
         std::vector<std::pair<String, BlobRef>> batch;
         std::vector<BlobRef> bodies;
@@ -772,10 +779,16 @@ private:
                     scan.not_clean.insert(batch[i].second);
             }
             meter.add(batch.size());
-            if (conversion)
+            if (candidates)
             {
+                for (const auto & marker : batch)
+                    bodies.push_back(marker.second);
+                std::sort(bodies.begin(), bodies.end());
+                bodies.erase(std::unique(bodies.begin(), bodies.end()), bodies.end());
                 std::erase_if(bodies, [&](const BlobRef & ref) { return row_refs.contains(ref) || scan.not_clean.contains(ref); });
-                convert(bodies, conversion->confirmed, converted);
+                scan.candidates += bodies.size();
+                if (candidates->confirmed)
+                    convert(bodies, *candidates->confirmed, converted);
             }
             batch.clear();
             bodies.clear();
@@ -796,7 +809,7 @@ private:
                 if (batch.size() + bodies.size() >= kBatchKeys)
                     flush();
                 ++scan.bodies;
-                if (conversion)
+                if (candidates)
                     bodies.push_back(*ref);
             }
             return true;
@@ -807,7 +820,7 @@ private:
         report.markers_read = scan.markers;
         report.bodies_listed = scan.bodies;
         say(fmt::format("M4: {} marker(s), {} not Clean; {} bod(ies) listed{}", scan.markers, scan.not_clean.size(), scan.bodies,
-            conversion ? fmt::format(", {} of them converted", scan.converted) : String()));
+            candidates && candidates->confirmed ? fmt::format("; {} blob(s) converted", scan.converted) : String()));
         return scan;
     }
 

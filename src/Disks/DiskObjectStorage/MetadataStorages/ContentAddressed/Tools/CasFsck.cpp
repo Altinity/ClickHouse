@@ -450,7 +450,7 @@ std::optional<RefTableState> walkRefStream(
     }
 }
 
-/// Counts one read or `HEAD` of an intent that gave no answer, and keeps the first reason, shortened.
+/// Counts one check the scan could not make, of an intent or of the GC snapshot, and keeps the first reason, shortened.
 void countIntentUnread(FsckReport & report, String reason)
 {
     static constexpr size_t kMaxReasonBytes = 200;

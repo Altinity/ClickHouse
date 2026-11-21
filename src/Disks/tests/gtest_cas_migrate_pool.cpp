@@ -945,6 +945,55 @@ TEST(CASMigratePool, MarkerOfANewerFormatStopsTheRunBeforeAnyIntent)
     EXPECT_EQ(f.markers().size(), 1u);
 }
 
+/// A marker that needs a newer reader on a later page stops the run after the intents of earlier pages, before any
+/// write of M6; a rerun once the marker is gone completes.
+TEST(CASMigratePool, MarkerOfANewerFormatOnALaterPageLeavesOnlyIntentsAndFences)
+{
+    constexpr uint64_t blobs = CasOperation::kCasListPageKeys + 2;
+    Fixture f(3);
+    std::map<String, uint64_t> marker_of;
+    for (uint64_t b = 1; b <= blobs; ++b)
+    {
+        f.body(b);
+        marker_of[f.layout.blobMetaKey(blobRefOf(b))] = b;
+    }
+    const uint64_t last = marker_of.rbegin()->second;
+    for (uint64_t b = 1; b <= blobs; ++b)
+        if (b != last)
+            f.cleanMarker(b);
+    String bytes = encodeBlobMetaForTest(BlobMeta{.state = MetaState::Clean});
+    const size_t version = bytes.find("\"v\":1");
+    ASSERT_NE(version, String::npos) << bytes;
+    bytes.replace(version, 5, "\"v\":99");
+    f.rawMarker(last, bytes);
+    f.slot("srv-silent", liveLease());
+    f.backend->clearJournal();
+
+    const String message = messageOf(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { f.run(); });
+    EXPECT_NE(message.find("reading the legacy marker"), String::npos) << message;
+    const auto journal = f.backend->journal();
+    const std::set<String> intents = f.intents();
+    EXPECT_FALSE(intents.empty()) << "positive control: the earlier pages wrote their intents";
+    EXPECT_FALSE(f.hasIntent(last, f.identity(last)));
+    for (const String & key : mutationsOutsideTheProbes(journal, f))
+        EXPECT_TRUE(intents.contains(key) || key == f.layout.mountKey("srv-silent")) << key;
+    ASSERT_TRUE(f.slotBody("srv-silent"));
+    EXPECT_TRUE(f.slotBody("srv-silent")->gc_fenced) << "positive control: M2 fenced the silent slot";
+    EXPECT_EQ(f.poolMeta().min_reader_generation, 3u);
+    EXPECT_FALSE(f.gcState().has_value());
+    EXPECT_EQ(f.markers().size(), blobs);
+
+    {
+        OperationForTest op(*f.backend);
+        ASSERT_EQ((*op).removeCurrent(f.layout.blobMetaKey(blobRefOf(last)), Retry::standard()), Removal::Removed);
+    }
+    ASSERT_TRUE(f.run().completed);
+    EXPECT_EQ(f.poolMeta().min_reader_generation, G_BLOB_INTENTS);
+    EXPECT_EQ(f.intents().size(), blobs);
+    for (uint64_t b = 1; b <= blobs; ++b)
+        EXPECT_TRUE(f.hasIntent(b, f.identity(b))) << "blob " << b;
+}
+
 /// The probe proves the rights on `blob-intents/` before any point of no return, and names the one that is missing.
 TEST(CASMigratePool, MissingRightOnTheIntentPrefixRefusesAtM1)
 {
@@ -1001,7 +1050,7 @@ TEST(CASMigratePool, LongStepsReportProgressWithAnEstimate)
     {
         return line.starts_with("M4: ") && line.find("blob(s) converted") != String::npos;
     }));
-    EXPECT_TRUE(contains(lines, "bod(ies) listed, " + std::to_string(bodies) + " of them converted"));
+    EXPECT_TRUE(contains(lines, "bod(ies) listed; " + std::to_string(bodies) + " blob(s) converted"));
 }
 
 /// A member whose slot moves right after the floor is raised: the pool is migrated and cannot go back, so the run
@@ -1655,6 +1704,66 @@ TEST(CASMigratePool, BodyThatALaterListingOmitsStillGetsItsIntent)
     EXPECT_EQ(report.bodies_listed, 2u) << "positive control: M4 listed the body";
     EXPECT_TRUE(f.hasIntent(1, f.identity(1)));
     EXPECT_TRUE(f.hasIntent(2, f.identity(2))) << "positive control: the body every listing returns";
+}
+
+/// A listing may omit a body whose marker it returns: the marker names the body, which gets its intent before the floor.
+TEST(CASMigratePool, BodyThatOnlyItsMarkerNamesGetsItsIntent)
+{
+    Fixture f(3);
+    f.body(1);
+    f.cleanMarker(1);
+    f.body(2);
+    f.cleanMarker(3);
+    f.backend->hideFromListing(f.layout.blobKey(blobRefOf(1)));
+    f.backend->clearJournal();
+
+    const MigratePoolReport report = f.run();
+    ASSERT_TRUE(report.completed);
+    EXPECT_EQ(report.bodies_listed, 1u) << "positive control: the listing omitted body 1";
+    EXPECT_EQ(report.markers_read, 2u);
+    EXPECT_TRUE(f.hasIntent(1, f.identity(1)));
+    EXPECT_TRUE(f.hasIntent(2, f.identity(2))) << "positive control: the listed body";
+    EXPECT_EQ(f.intents().size(), 2u) << "the marker of the absent body 3 adds no intent";
+    const auto journal = f.backend->journal();
+    const std::vector<size_t> intent_writes = intentWriteIndices(journal, f.layout);
+    const std::vector<size_t> floor_writes = writeIndices(journal, f.layout.poolMetaKey());
+    ASSERT_FALSE(intent_writes.empty());
+    ASSERT_FALSE(floor_writes.empty());
+    EXPECT_LT(intent_writes.back(), floor_writes.front());
+}
+
+/// The dry run estimates the intents from the same candidates as the run: a body that only its marker names counts.
+TEST(CASMigratePool, DryRunCountsTheBodyThatOnlyItsMarkerNames)
+{
+    const auto seed = [](Fixture & f)
+    {
+        f.body(1);
+        f.cleanMarker(1);
+        f.body(2);
+        f.backend->hideFromListing(f.layout.blobKey(blobRefOf(1)));
+    };
+    Fixture f(3);
+    seed(f);
+    MigratePoolOptions options;
+    options.dry_run = true;
+    std::vector<String> lines;
+    const MigratePoolReport dry = f.run(options, &lines);
+    ASSERT_EQ(dry.bodies_listed, 1u) << "positive control: the listing omitted body 1";
+    ASSERT_EQ(dry.markers_read, 1u);
+    std::optional<uint64_t> estimated;
+    for (const String & line : lines)
+    {
+        const size_t at = line.find("about ");
+        if (line.starts_with("dry run: ") && at != String::npos)
+            estimated = std::stoull(line.substr(at + 6));
+    }
+    ASSERT_TRUE(estimated.has_value()) << "the dry run printed no estimate";
+
+    Fixture real(3);
+    seed(real);
+    ASSERT_TRUE(real.run().completed);
+    ASSERT_EQ(real.intents().size(), 2u) << "positive control: the run gave both bodies an intent";
+    EXPECT_EQ(*estimated, real.intents().size());
 }
 
 TEST(CASMigratePool, MarkersAcrossListPagesAreAllRead)

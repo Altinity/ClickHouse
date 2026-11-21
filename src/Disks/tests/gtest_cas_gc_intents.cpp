@@ -5986,6 +5986,28 @@ void expectRefusalNamesTheRow(const InheritedRunRound & round, uint64_t shard, u
 
 }
 
+/// A `standing` row whose token has no canonical identity names no intent, so the next round deletes nothing for it.
+TEST(CASGcIntents, PreviewOmitsAStandingRowWithoutACanonicalToken)
+{
+    auto pool = makePool();
+    pool.round();
+    const uint64_t parent_round = committedRound(*pool.backend, pool.layout());
+    SourceEdgeRecord canonical = inheritedRow(pool, 1, parent_round, /*pending*/ true);
+    canonical.standing = true;
+    SourceEdgeRecord uncanonical = inheritedRow(pool, 2, parent_round, /*pending*/ true);
+    uncanonical.standing = true;
+    uncanonical.token.value = "W/\"weak\"";
+    ASSERT_FALSE(uncanonical.token.canonical().has_value());
+    injectSourceEdgeRun(*pool.backend, pool.layout(), 0, sortedRecords({canonical, uncanonical}));
+
+    std::vector<Gc::PreviewEntry> standing;
+    for (const Gc::PreviewEntry & e : pool.gc->previewDeletes().deletes)
+        if (e.reason == "standing")
+            standing.push_back(e);
+    ASSERT_EQ(standing.size(), 1u);
+    EXPECT_EQ(standing.front().key, pool.intentKey(1, canonical.token)) << "positive control: the canonical standing row";
+}
+
 /// A live edge in the run of a shard that does not own its blob would leave the owning shard at zero.
 TEST(CASGcIntents, InheritedRunWithAMisplacedLiveEdgeIsRefusedAsCorrupt)
 {
