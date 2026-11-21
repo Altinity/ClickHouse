@@ -130,11 +130,7 @@ public:
         const TableSchema & table_schema_,
         const DB::NameToNameMap & physical_names_map_,
         const DB::Names & partition_columns_,
-<<<<<<< HEAD
         const DB::Names & clustering_columns_,
-        DB::ObjectStoragePtr object_storage_,
-=======
->>>>>>> 92ae848bde78405336963dc68a272c32646310df
         const DB::ActionsDAG * filter_,
         DB::IDataLakeMetadata::FileProgressCallback callback_,
         size_t list_batch_size_,
@@ -152,11 +148,7 @@ public:
         , read_schema(read_schema_)
         , expression_schema(table_schema_)
         , partition_columns(partition_columns_)
-<<<<<<< HEAD
         , clustering_columns(clustering_columns_)
-        , object_storage(object_storage_)
-=======
->>>>>>> 92ae848bde78405336963dc68a272c32646310df
         , callback(callback_)
         , list_batch_size(list_batch_size_)
         , log(log_)
@@ -785,11 +777,7 @@ private:
     DB::NamesAndTypesList read_schema;
     DB::NamesAndTypesList expression_schema;
     DB::Names partition_columns;
-<<<<<<< HEAD
     DB::Names clustering_columns;
-    const DB::ObjectStoragePtr object_storage;
-=======
->>>>>>> 92ae848bde78405336963dc68a272c32646310df
     const DB::IDataLakeMetadata::FileProgressCallback callback;
     const size_t list_batch_size;
     const LoggerPtr log;
@@ -1151,11 +1139,7 @@ DB::ObjectIterator TableSnapshot::iterate(
         schema->table_schema,
         schema->physical_names_map,
         schema->partition_columns,
-<<<<<<< HEAD
         need_clustering_columns ? *clustering_columns : DB::Names{},
-        object_storage,
-=======
->>>>>>> 92ae848bde78405336963dc68a272c32646310df
         filter_dag,
         callback,
         list_batch_size,
