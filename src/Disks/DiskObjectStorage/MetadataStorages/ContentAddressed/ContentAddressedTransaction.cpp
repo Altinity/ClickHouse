@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
@@ -62,6 +63,11 @@ bool hasSuffix(std::string_view s, std::string_view suffix)
     return s.size() >= suffix.size() && s.substr(s.size() - suffix.size()) == suffix;
 }
 
+}
+
+std::unique_ptr<ReadBuffer> openLocalStagedBlobPayload(const std::string & path, uint64_t payload_size)
+{
+    return std::make_unique<ReadBufferFromFile>(path, blob_publication_detail::blobTransferBufferSize(payload_size));
 }
 
 bool partFileMustStayBlob(std::string_view file_name)
@@ -472,9 +478,10 @@ void ContentAddressedTransaction::uploadPendingBlobs(PartStaging & st)
         else
         {
             const std::string staging_key = pb.staging_key;
-            source.open = [staging_key]() -> std::unique_ptr<ReadBuffer>
+            const uint64_t payload_size = pb.size;
+            source.open = [staging_key, payload_size]() -> std::unique_ptr<ReadBuffer>
             {
-                return std::make_unique<ReadBufferFromFile>(staging_key);
+                return Cas::openLocalStagedBlobPayload(staging_key, payload_size);
             };
         }
         /// `declared_size` mirrors `source.size` (both are `pb.size`); the fan-out fail-closes if they

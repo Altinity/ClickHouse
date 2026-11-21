@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 #include <IO/ReadBufferFromString.h>
+#include <IO/ReadHelpers.h>
+#include <IO/WriteBufferFromFile.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
@@ -21,6 +23,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
+#include <filesystem>
 #include <latch>
 #include <map>
 #include <mutex>
@@ -1004,4 +1008,38 @@ TEST(CASUploadFanout, TrackingSeamThrowStillDrains)
     EXPECT_TRUE(headExists(*b, s->layout().blobKey(idOf(smaller))))
         << "an already-scheduled task was not drained before the stack unwound";
     EXPECT_EQ(build->depsSnapshotForTest().size(), 0u) << "merge-nothing on a tracking-seam throw";
+}
+
+/// A part's uploads run concurrently and each holds its payload reader until it finishes, so a small
+/// staged payload must not pin a full default-sized read buffer.
+TEST(CASUploadFanout, LocalStagedPayloadReaderIsSizedToThePayload)
+{
+    /// `mkdtemp` creates the directory exclusively, so the cleanup below removes only what this test made.
+    std::string dir_template = (std::filesystem::temp_directory_path() / "cas_staged_payload_reader_XXXXXX").string();
+    ASSERT_NE(::mkdtemp(dir_template.data()), nullptr) << "cannot create a directory from " << dir_template;
+    const std::filesystem::path dir = dir_template;
+    SCOPE_EXIT({ std::filesystem::remove_all(dir); });
+
+    const auto stage = [&](const std::string & name, const std::string & bytes)
+    {
+        const std::string path = (dir / name).string();
+        DB::WriteBufferFromFile out(path);
+        out.write(bytes.data(), bytes.size());
+        out.finalize();
+        return path;
+    };
+
+    const std::string small = "payload";
+    auto small_reader = openLocalStagedBlobPayload(stage("small", small), small.size());
+    EXPECT_EQ(small_reader->internalBuffer().size(), small.size());
+    std::string small_read;
+    DB::readStringUntilEOF(small_read, *small_reader);
+    EXPECT_EQ(small_read, small);
+
+    const std::string large(DB::DBMS_DEFAULT_BUFFER_SIZE + 1, 'x');
+    auto large_reader = openLocalStagedBlobPayload(stage("large", large), large.size());
+    EXPECT_EQ(large_reader->internalBuffer().size(), DB::DBMS_DEFAULT_BUFFER_SIZE);
+    std::string large_read;
+    DB::readStringUntilEOF(large_read, *large_reader);
+    EXPECT_EQ(large_read, large);
 }

@@ -840,6 +840,7 @@ public:
     {
         ++write_calls;
         last_opened_key = object.remote_path;
+        last_buf_size = buf_size;
         last_write_mode = mode;
         last_write_settings = write_settings;
         if (record_cancellation_only)
@@ -904,6 +905,7 @@ public:
         cancel_calls = 0;
         finalize_calls = 0;
         bytes_at_cancel = 0;
+        last_buf_size = 0;
         last_write_mode.reset();
         last_write_settings.reset();
         last_copy_settings.reset();
@@ -921,6 +923,7 @@ public:
     size_t finalize_calls = 0;
     size_t bytes_at_cancel = 0;
     String last_opened_key;
+    size_t last_buf_size = 0;
     std::optional<DB::WriteMode> last_write_mode;
     std::optional<DB::WriteSettings> last_write_settings;
     std::optional<DB::WriteSettings> last_copy_settings;
@@ -975,6 +978,46 @@ TEST(CASObjectStorageBackend, PublishBlobStreamingSettingsRequestSingleCreation)
     EXPECT_EQ(storage->native_metadata_calls, 0u)
         << "tokenless publication must not issue a response-token HEAD";
     EXPECT_EQ(readStorageObject(storage, destination), "fresh-envelopepayload");
+}
+
+/// A part's uploads run concurrently and each holds its write buffer until it finishes, so a small
+/// blob must not pin a full default-sized buffer.
+TEST(CASObjectStorageBackend, PublishBlobSizesTheWriteBufferToASmallBlob)
+{
+    for (const auto mode : {ObjectStorageBackend::Mode::Native, ObjectStorageBackend::Mode::EmulatedSingleProcess})
+    {
+        SCOPED_TRACE(mode == ObjectStorageBackend::Mode::Native ? "Native" : "EmulatedSingleProcess");
+        auto storage = makePublicationRecordingStorage();
+        auto backend = std::make_shared<ObjectStorageBackend>(storage, mode);
+        CasRequests requests = openRequestsForTest(backend);
+        CasOperation op = requests.admit();
+        const String key = mode == ObjectStorageBackend::Mode::Native
+            ? DB::Cas::tests::nativeKeyUnder(storage, "publish/small-buffer")
+            : String("publish/small-buffer");
+        const String envelope = "fresh-envelope";
+        const String payload = "payload";
+
+        op.publish(streamingPublication(key, envelope, payload, payload.size()), Retry::once());
+
+        ASSERT_EQ(storage->write_calls, 1u);
+        EXPECT_EQ(storage->last_buf_size, envelope.size() + payload.size() + 1);
+    }
+}
+
+TEST(CASObjectStorageBackend, PublishBlobKeepsTheDefaultWriteBufferForALargeBlob)
+{
+    auto storage = makePublicationRecordingStorage();
+    auto backend = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const String key = DB::Cas::tests::nativeKeyUnder(storage, "publish/large-buffer");
+    const String payload(DB::DBMS_DEFAULT_BUFFER_SIZE + 1, 'x');
+
+    op.publish(streamingPublication(key, "fresh-envelope", payload, payload.size()), Retry::once());
+
+    ASSERT_EQ(storage->write_calls, 1u);
+    EXPECT_EQ(storage->last_buf_size, DB::DBMS_DEFAULT_BUFFER_SIZE);
+    EXPECT_EQ(readStorageObject(storage, key), "fresh-envelope" + payload);
 }
 
 TEST(CASObjectStorageBackend, PublishBlobEmulatedKeepsDestinationCompleteUntilAtomicReplacement)

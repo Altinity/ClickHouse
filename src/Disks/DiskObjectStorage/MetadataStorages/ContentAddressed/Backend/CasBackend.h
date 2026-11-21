@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobHashingWriteBuffer.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasWriteOnceKey.h>
+#include <Core/Defines.h>
 #include <IO/ReadBuffer.h>
 #include <IO/WriteBuffer.h>
 #include <Common/Exception.h>
@@ -94,6 +95,20 @@ struct BlobPublishRequest
 
 namespace blob_publication_detail
 {
+
+/// Buffer size for moving `bytes` of a blob body. A part's uploads run concurrently and each holds its
+/// buffers until it finishes, so a small blob gets a buffer no larger than itself.
+inline size_t blobTransferBufferSize(uint64_t bytes)
+{
+    return static_cast<size_t>(std::clamp<uint64_t>(bytes, 1, DBMS_DEFAULT_BUFFER_SIZE));
+}
+
+/// `blobTransferBufferSize` for writing a body of `bytes`, one byte larger: a body that fills its buffer exactly is
+/// flushed while the buffer is full, and the S3 and Azure buffers double a full first buffer before the upload.
+inline size_t blobWriteBufferSize(uint64_t bytes)
+{
+    return blobTransferBufferSize(bytes + 1);
+}
 
 struct BlobPayloadCopyResult
 {

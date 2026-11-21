@@ -299,6 +299,10 @@ namespace DB::Cas
 /// Everything else (the small eager metadata files) is an inline candidate, subject to INLINE_CAP.
 bool partFileMustStayBlob(std::string_view file_name);
 
+/// Opens a locally staged blob payload of `payload_size` bytes for upload, with a read buffer no larger
+/// than the payload.
+std::unique_ptr<ReadBuffer> openLocalStagedBlobPayload(const std::string & path, uint64_t payload_size);
+
 /// Test-only fault-injection seams for the intra-part blob-upload fan-out. Inert in production
 /// (`ContentAddressedTransaction::uploadPendingBlobs` passes `nullptr`).
 struct BlobUploadFanoutHooksForTest

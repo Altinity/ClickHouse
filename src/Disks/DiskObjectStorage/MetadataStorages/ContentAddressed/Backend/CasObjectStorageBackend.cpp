@@ -524,7 +524,11 @@ void ObjectStorageBackend::emuPublishBlobAtomically(const String & key, const St
     /// or long source aborts on the temporary file, which is then removed.
     try
     {
-        auto out = object_storage->writeObject(StoredObject(temporary_object), WriteMode::Rewrite);
+        auto out = object_storage->writeObject(
+            StoredObject(temporary_object),
+            WriteMode::Rewrite,
+            /*attributes=*/std::nullopt,
+            blob_publication_detail::blobWriteBufferSize(envelope.size() + publication.payload_size));
         out->write(envelope.data(), envelope.size());
         blob_publication_detail::copyVerifiedPayloadAndFinalize(payload, *out, publication, key,
             "ObjectStorageBackend::publish: source yielded {}{} payload bytes for {}, declared {} -- nothing was published");
@@ -913,7 +917,7 @@ void ObjectStorageBackend::publish(const BlobPublishRequest & request, Transport
             StoredObject(request.destination_key),
             WriteMode::Rewrite,
             /*attributes=*/std::nullopt,
-            DBMS_DEFAULT_BUFFER_SIZE,
+            blob_publication_detail::blobWriteBufferSize(streaming->fresh_envelope.size() + streaming->payload_size),
             blobPublicationWriteSettings());
         out->write(streaming->fresh_envelope.data(), streaming->fresh_envelope.size());
         blob_publication_detail::copyVerifiedPayloadAndFinalize(*payload, *out, *streaming, request.destination_key,
