@@ -1271,7 +1271,7 @@ bool GlueCatalog::updateTableInGlue(
 
     /// Optimistic concurrency: when a VersionId is supplied, Glue rejects the
     /// update if the table has been modified since that version was read. It is only sound together
-    /// with a check of `metadata_location` made on the same read (see `updateMetadataIfCurrent`).
+    /// with a check of `metadata_location` made on the same read (see `updateMetadata` with a base location).
     if (!version_id.empty())
         request.SetVersionId(version_id);
 
@@ -1306,12 +1306,12 @@ bool GlueCatalog::updateMetadata(const String & namespace_name, const String & t
     return updateTableInGlue(namespace_name, table_name, new_metadata_path, auth_token);
 }
 
-bool GlueCatalog::updateMetadataIfCurrent(
+bool GlueCatalog::updateMetadata(
     const String & namespace_name,
     const String & table_name,
     const String & new_metadata_path,
+    const String & base_catalog_metadata_location,
     Poco::JSON::Object::Ptr /*new_snapshot*/,
-    const String & expected_metadata_location,
     const DB::ForwardedAuthTokenPtr & auth_token) const
 {
     /// Same order as Iceberg Java's `GlueTableOperations::doCommit`: read the table, check that it still
@@ -1323,11 +1323,11 @@ bool GlueCatalog::updateMetadataIfCurrent(
     /// that registered one since the base was read makes the parameter non-empty and different, which is rejected
     /// below, and the `VersionId` guards against a write between this read and the update.
     const auto current = getTableVersion(namespace_name, table_name, auth_token);
-    if (!current.metadata_location.empty() && current.metadata_location != expected_metadata_location)
+    if (!current.metadata_location.empty() && current.metadata_location != base_catalog_metadata_location)
     {
         LOG_WARNING(getLogger("GlueCatalog"),
             "Glue table {}.{} points at {} while the commit is based on {}",
-            namespace_name, table_name, current.metadata_location, expected_metadata_location);
+            namespace_name, table_name, current.metadata_location, base_catalog_metadata_location);
         return false;
     }
     return updateTableInGlue(namespace_name, table_name, new_metadata_path, auth_token, {}, current.version_id);

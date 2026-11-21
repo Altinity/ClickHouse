@@ -87,12 +87,12 @@ public:
 
     bool updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr new_snapshot, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
-    bool updateMetadataIfCurrent(
+    bool updateMetadata(
         const String & namespace_name,
         const String & table_name,
         const String & new_metadata_path,
+        const String & base_catalog_metadata_location,
         Poco::JSON::Object::Ptr new_snapshot,
-        const String & expected_metadata_location,
         const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     bool updateSchema(

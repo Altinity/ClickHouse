@@ -333,17 +333,18 @@ public:
     /// Updates metadata in catalog.
     virtual bool updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr new_snapshot, const DB::ForwardedAuthTokenPtr & auth_token) const;
 
-    /// Like `updateMetadata`, but the update must only take effect if the catalog still points at
-    /// `expected_metadata_location`, the metadata file the new snapshot was built on. It is the value the
+    /// Like the overload above, but the update must only take effect if the catalog still points at
+    /// `base_catalog_metadata_location`, the metadata file the new snapshot was built on. It is the value the
     /// catalog reported in `DataLakeSpecificProperties::iceberg_metadata_file_location`, unmodified.
     /// Returns false if the catalog moved on in the meantime. A catalog that is itself a compare-and-swap
     /// (REST) enforces the base through the update requirements and uses this default, which ignores it.
-    virtual bool updateMetadataIfCurrent(
+    /// Same parameter name and meaning as upstream's `updateMetadata`, which takes the base on every call.
+    virtual bool updateMetadata(
         const String & namespace_name,
         const String & table_name,
         const String & new_metadata_path,
+        const String & base_catalog_metadata_location,
         Poco::JSON::Object::Ptr new_snapshot,
-        const String & expected_metadata_location,
         const DB::ForwardedAuthTokenPtr & auth_token) const;
 
     /// Commit a schema evolution (ADD/DROP/MODIFY/RENAME COLUMN) to the catalog.
