@@ -38,6 +38,9 @@ if(ARCH_PPC64LE)
     endif()
     list(REMOVE_ITEM LIBUNWIND_ASM_SOURCES "${LIBUNWIND_SOURCE_DIR}/src/UnwindRegistersSave.S")
     list(APPEND LIBUNWIND_ASM_SOURCES "${LIBUNWIND_REGISTERS_SAVE_ASM}")
+    # "assembly.h" is included from the directory of the .S file.
+    set_source_files_properties("${LIBUNWIND_REGISTERS_SAVE_ASM}" PROPERTIES
+        COMPILE_FLAGS "-I${LIBUNWIND_SOURCE_DIR}/src")
 endif()
 
 enable_language(ASM)
