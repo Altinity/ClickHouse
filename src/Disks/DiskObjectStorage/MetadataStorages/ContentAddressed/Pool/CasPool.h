@@ -633,8 +633,8 @@ public:
     ConfirmAnswer confirmExactRef(const RootNamespace & ns, const String & ref_name, const ManifestRef & manifest_ref) const;
     /// The same gate for an in-process copy, on the table runtime `table` pinned when the source was resolved
     /// (`CasRefLedger::confirmPinnedRef`). One deadline, the request window from the call's start, decides whether the
-    /// ledger waits for a held state lock again and bounds the mount-slot `GET`; one wait for the lock is not bounded.
-    /// A failed read throws.
+    /// ledger waits for a held state lock again and bounds the mount-slot read, which reissues a transient transport failure until then;
+    /// any other failure propagates at once. One wait for the lock is not bounded.
     ConfirmAnswer confirmPinnedRef(const CasRefLedger::TablePin & table, const RootNamespace & ns, const String & ref_name,
                                    const ManifestRef & manifest_ref) const;
     /// TEST SEAM: runs between the ownership capture and the ledger snapshot.
@@ -935,9 +935,9 @@ private:
     /// exposed to callers.
     Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_);
 
-    /// Captures the slot ownership, takes `ledger_snapshot`, and re-checks a `Yes` with one mount-slot `GET`
-    /// bounded by `deadline_ms` when set.
-    ConfirmAnswer confirmUnderSlot(const std::function<ConfirmAnswer()> & ledger_snapshot, std::optional<uint64_t> deadline_ms) const;
+    /// Captures the slot ownership, takes `ledger_snapshot`, and re-checks a `Yes` with a mount-slot read under
+    /// `slot_read_policy`.
+    ConfirmAnswer confirmUnderSlot(const std::function<ConfirmAnswer()> & ledger_snapshot, const Retry & slot_read_policy) const;
 
     /// Mount-claim policy for `mountWritable`.
     enum class MountClaimPolicy : uint8_t

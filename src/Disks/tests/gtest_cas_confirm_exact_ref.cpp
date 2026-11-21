@@ -2400,3 +2400,190 @@ TEST(CASConfirmExactRef, RenewalCommittedBetweenGetAndCheckAnswersUnknown)
 
     EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes) << "the next confirm reads the new body";
 }
+
+namespace
+{
+
+/// Fails the next `failures_left` reads of `watched_key` with a transport timeout, as an S3 client does, and
+/// records the clock at every read of it, failed or served.
+class TimingOutSlotReadBackend : public CountingBackend
+{
+public:
+    String watched_key;
+    std::atomic<uint64_t> failures_left{0};
+    std::function<uint64_t()> now_ms;
+
+    std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        if (key == watched_key)
+        {
+            {
+                std::lock_guard lock(times_mutex);
+                read_times.push_back(now_ms());
+            }
+            if (failures_left.load() > 0)
+            {
+                failures_left.fetch_sub(1);
+                throw Poco::TimeoutException("injected slot read timeout");
+            }
+        }
+        return CountingBackend::read(key, access);
+    }
+
+    std::vector<uint64_t> slotReadTimes() const
+    {
+        std::lock_guard lock(times_mutex);
+        return read_times;
+    }
+
+private:
+    mutable std::mutex times_mutex;
+    std::vector<uint64_t> read_times;
+};
+
+constexpr uint64_t kSlotReadFailsForever = std::numeric_limits<uint64_t>::max();
+
+PoolPtr openPoolOnClock(const std::shared_ptr<TimingOutSlotReadBackend> & backend, tests::FakeClock & clock,
+                        std::chrono::milliseconds lease_ttl = std::chrono::milliseconds(30000))
+{
+    backend->now_ms = clock.nowFn();
+    PoolConfig config;
+    config.boot_ms_fn = clock.nowFn();
+    config.retry_sleep_fn = clock.sleepFn();
+    config.mount_lease_ttl_ms = lease_ttl;
+    return openPoolWithConfig(backend, std::move(config));
+}
+
+struct ConfirmOutcome
+{
+    std::optional<ConfirmAnswer> answer;
+    /// Empty when the confirm answered; -1 for an exception that is not a `DB::Exception`.
+    std::optional<int> error_code;
+    String error_message;
+};
+
+ConfirmOutcome confirmPinned(const PoolPtr & store, const CasRefLedger::PinnedResolution & pinned, const RootNamespace & ns,
+                             const ManifestId & id)
+{
+    ConfirmOutcome outcome;
+    try
+    {
+        outcome.answer = store->confirmPinnedRef(pinned.table, ns, "x", id.ref);
+    }
+    catch (const DB::Exception & e)
+    {
+        outcome.error_code = e.code();
+        outcome.error_message = e.message();
+    }
+    catch (...)
+    {
+        outcome.error_code = -1;
+        outcome.error_message = DB::getCurrentExceptionMessage(false);
+    }
+    return outcome;
+}
+
+}
+
+/// A copy confirms inside the user's statement, which has no retry of its own: one transport timeout on the
+/// slot read is reissued with a fresh read, not turned into the statement's failure.
+TEST(CASConfirmExactRef, CopyConfirmRetriesATransientSlotReadTimeout)
+{
+    tests::FakeClock clock;
+    auto backend = std::make_shared<TimingOutSlotReadBackend>();
+    auto store = openPoolOnClock(backend, clock);
+    const RootNamespace ns{"srv1/confirm_copy_slot_transient"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    const auto pinned = store->resolveRefPinned(ns, "x");
+    ASSERT_TRUE(pinned.has_value());
+
+    backend->watched_key = mountSlotKey(store);
+    backend->failures_left = 1;
+    const uint64_t unreadable_before = slotUnreadableCount();
+    const ConfirmOutcome outcome = confirmPinned(store, *pinned, ns, id);
+
+    EXPECT_FALSE(outcome.error_code.has_value()) << "the confirm threw: " << outcome.error_message;
+    EXPECT_EQ(outcome.answer, std::optional<ConfirmAnswer>(ConfirmAnswer::Yes));
+    EXPECT_EQ(backend->slotReadTimes().size(), 2u) << "one failed read, then one fresh read";
+    EXPECT_EQ(slotUnreadableCount() - unreadable_before, 0u);
+}
+
+/// A slot that stays unreadable proves nothing: after the retries the error propagates, counted once.
+TEST(CASConfirmExactRef, CopyConfirmPropagatesAPersistentSlotReadFailureCountedOnce)
+{
+    tests::FakeClock clock;
+    auto backend = std::make_shared<TimingOutSlotReadBackend>();
+    auto store = openPoolOnClock(backend, clock);
+    const RootNamespace ns{"srv1/confirm_copy_slot_persistent"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    const auto pinned = store->resolveRefPinned(ns, "x");
+    ASSERT_TRUE(pinned.has_value());
+
+    backend->watched_key = mountSlotKey(store);
+    backend->failures_left = kSlotReadFailsForever;
+    const uint64_t unreadable_before = slotUnreadableCount();
+    const uint64_t moved_before = slotMovedCount();
+    const ConfirmOutcome outcome = confirmPinned(store, *pinned, ns, id);
+    backend->failures_left = 0;
+
+    EXPECT_FALSE(outcome.answer.has_value()) << "a confirm whose slot read failed must not answer";
+    EXPECT_EQ(outcome.error_code, std::optional<int>(DB::ErrorCodes::NETWORK_ERROR)) << outcome.error_message;
+    EXPECT_GT(backend->slotReadTimes().size(), 1u) << "the failure was retried before it propagated";
+    EXPECT_EQ(slotUnreadableCount() - unreadable_before, 1u);
+    EXPECT_EQ(slotMovedCount() - moved_before, 0u) << "a failed read is not a moved slot";
+}
+
+/// The retries end at the deadline the confirm took at its start, not at a fresh window from the read: half the
+/// window is spent before the read, so a fresh window would keep reading past the caller's deadline.
+TEST(CASConfirmExactRef, CopyConfirmStopsRetryingTheSlotReadAtTheCallersDeadline)
+{
+    tests::FakeClock clock;
+    auto backend = std::make_shared<TimingOutSlotReadBackend>();
+    /// A lease far longer than the window, so the policy deadline and not the lease ends the retries.
+    auto store = openPoolOnClock(backend, clock, std::chrono::minutes(10));
+    const RootNamespace ns{"srv1/confirm_copy_slot_deadline"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+    const auto pinned = store->resolveRefPinned(ns, "x");
+    ASSERT_TRUE(pinned.has_value());
+
+    const uint64_t window_ms = PoolConfig{}.cas_request_budget.request_window_ms;
+    const uint64_t deadline_ms = clock.now.load() + window_ms;
+    store->setConfirmAfterLedgerSnapshotHookForTest([&]
+    {
+        clock.now.fetch_add(window_ms / 2);
+    });
+    backend->watched_key = mountSlotKey(store);
+    backend->failures_left = kSlotReadFailsForever;
+    const ConfirmOutcome outcome = confirmPinned(store, *pinned, ns, id);
+    backend->failures_left = 0;
+    store->setConfirmAfterLedgerSnapshotHookForTest(nullptr);
+
+    EXPECT_FALSE(outcome.answer.has_value());
+    EXPECT_EQ(outcome.error_code, std::optional<int>(DB::ErrorCodes::NETWORK_ERROR)) << outcome.error_message;
+    EXPECT_NE(outcome.error_message.find("policy deadline"), String::npos) << outcome.error_message;
+    const std::vector<uint64_t> times = backend->slotReadTimes();
+    ASSERT_GT(times.size(), 1u) << "the failure was retried";
+    EXPECT_LT(times.back(), deadline_ms) << "a read was sent at or after the caller's deadline";
+    /// The loop stops only when the next pause plus attempt no longer fits; a pause is at most 5000 ms.
+    EXPECT_GE(clock.now.load() + 5000 + backend->attemptEnvelopeMs(), deadline_ms) << "the retries stopped short of the deadline";
+}
+
+/// The confirm a peer asks for makes one attempt at the slot read: the peer times out and retries from its own queue.
+TEST(CASConfirmExactRef, PeerConfirmMakesOneAttemptAtTheSlotRead)
+{
+    tests::FakeClock clock;
+    auto backend = std::make_shared<TimingOutSlotReadBackend>();
+    auto store = openPoolOnClock(backend, clock);
+    const RootNamespace ns{"srv1/confirm_peer_single_attempt"};
+    const ManifestId id = publishEmptyPart(store, ns, "x");
+
+    backend->watched_key = mountSlotKey(store);
+    backend->failures_left = kSlotReadFailsForever;
+    const uint64_t unreadable_before = slotUnreadableCount();
+    /// One attempt leaves the transport timeout as it came; a retrying policy would end in `NETWORK_ERROR`.
+    EXPECT_THROW((void)store->confirmExactRef(ns, "x", id.ref), Poco::TimeoutException);
+    backend->failures_left = 0;
+
+    EXPECT_EQ(backend->slotReadTimes().size(), 1u) << "the peer's confirm reissued the slot read";
+    EXPECT_EQ(slotUnreadableCount() - unreadable_before, 1u);
+}

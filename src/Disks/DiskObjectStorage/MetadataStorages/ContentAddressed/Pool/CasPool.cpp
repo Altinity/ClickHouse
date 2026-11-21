@@ -2249,7 +2249,8 @@ std::optional<CasRefLedger::PinnedResolution> Pool::resolveRefPinned(const RootN
 
 ConfirmAnswer Pool::confirmExactRef(const RootNamespace & ns, const String & ref_name, const ManifestRef & manifest_ref) const
 {
-    return confirmUnderSlot([&] { return ref_ledger.confirmExactRef(ns, ref_name, manifest_ref); }, std::nullopt);
+    /// One attempt: the peer that asked waits on its own timeout and retries the fetch from its queue.
+    return confirmUnderSlot([&] { return ref_ledger.confirmExactRef(ns, ref_name, manifest_ref); }, Retry::once());
 }
 
 ConfirmAnswer Pool::confirmPinnedRef(const CasRefLedger::TablePin & table, const RootNamespace & ns, const String & ref_name,
@@ -2259,12 +2260,14 @@ ConfirmAnswer Pool::confirmPinnedRef(const CasRefLedger::TablePin & table, const
     const uint64_t window_ms = config.cas_request_budget.request_window_ms;
     const uint64_t deadline_ms = window_ms > std::numeric_limits<uint64_t>::max() - started_ms
         ? std::numeric_limits<uint64_t>::max() : started_ms + window_ms;
+    /// The copy's statement has no retry of its own, so a transient slot-read failure is reissued here.
     return confirmUnderSlot(
-        [&] { return ref_ledger.confirmPinnedRef(table, ns, ref_name, manifest_ref, deadline_ms); }, deadline_ms);
+        [&] { return ref_ledger.confirmPinnedRef(table, ns, ref_name, manifest_ref, deadline_ms); },
+        Retry::standard().cappedAt(deadline_ms));
 }
 
 ConfirmAnswer Pool::confirmUnderSlot(const std::function<ConfirmAnswer()> & ledger_snapshot,
-                                     std::optional<uint64_t> deadline_ms) const
+                                     const Retry & slot_read_policy) const
 {
     /// Captured before the ledger snapshot: if a remount lands in between, this older ownership cannot
     /// hold the new slot, so the mismatch refuses. The order is safety-bearing;
@@ -2282,7 +2285,7 @@ ConfirmAnswer Pool::confirmUnderSlot(const std::function<ConfirmAnswer()> & ledg
     {
         try
         {
-            held = mount_runtime.slotHeldBy(*ownership, deadline_ms);
+            held = mount_runtime.slotHeldBy(*ownership, slot_read_policy);
         }
         catch (...)
         {

@@ -321,9 +321,10 @@ public:
     /// while this mount holds its slot (`Pool::confirmPinnedRef`). A copy that adopts entries without reading
     /// their bodies asks this after its own precommit is durable and before its promote: a match in the
     /// committed map alone could be a drop that is durable but not yet applied. Reads the pinned table only, then
-    /// sends one mount-slot read when the ledger confirms. Anything but `Yes` is a refusal: `No` when the source is
-    /// not the current binding, `Unknown` when it cannot be shown to be before the request deadline. A failed read
-    /// propagates. Call it with no ledger lock held.
+    /// reads the mount slot when the ledger confirms. Anything but `Yes` is a refusal: `No` when the source is
+    /// not the current binding, `Unknown` when it cannot be shown to be before the request deadline. A transient
+    /// transport failure of the slot read is reissued until that deadline; any other failure propagates at once.
+    /// Call it with no ledger lock held.
     ConfirmAnswer confirmCopySource(const CopySource & source) const;
     /// Moves a committed ref by publishing the source entries at `dst` and then dropping `src` only while it still
     /// names the manifest read. Returns nullopt when the source is absent. Once `dst` commits the source's content,
