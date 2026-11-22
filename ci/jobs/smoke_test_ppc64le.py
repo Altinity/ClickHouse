@@ -67,6 +67,10 @@ CLIENT=("$CH" client --host 127.0.0.1 --port {TCP_PORT})
 # Unpack the self-extracting binary before launching server + client processes.
 "$CH" --version
 
+# The data directory is created on the host. The server refuses to run as root
+# when that directory belongs to another user.
+chown -R "$(id -u):$(id -g)" /workspace/smoke/data
+
 CLICKHOUSE_WATCHDOG_ENABLE=0 "$CH" server \\
     --config-file=/workspace/smoke/conf/config.xml \\
     >/workspace/smoke/log/server.stderr.log 2>&1 &
