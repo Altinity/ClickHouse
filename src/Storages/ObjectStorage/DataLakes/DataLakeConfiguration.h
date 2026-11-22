@@ -242,7 +242,9 @@ public:
 
     void check(ContextPtr context) override
     {
-        if (ready_object_storage && ready_object_storage->getType() == ObjectStorageType::S3)
+        if (ready_object_storage
+            && (ready_object_storage->getType() == ObjectStorageType::S3
+                || ready_object_storage->getType() == ObjectStorageType::Azure))
             this->checkFormat();
         else
             BaseStorageConfiguration::check(context);
@@ -263,9 +265,9 @@ public:
         return DataLakeMetadata::supportsTotalRows(context, storage_type);
     }
 
-    std::optional<size_t> totalRows(ContextPtr local_context) override
+    std::optional<size_t> totalRows(ContextPtr local_context, const std::optional<DataLakeTableStateSnapshot> & state) override
     {
-        return getMetadata()->totalRows(local_context);
+        return getMetadata()->totalRows(local_context, state);
     }
 
     bool supportsTotalBytes(ContextPtr context, ObjectStorageType storage_type) const override
@@ -661,7 +663,7 @@ public:
     bool isDataLakeConfiguration() const override { return getImpl().isDataLakeConfiguration(); }
 
     bool supportsTotalRows(ContextPtr context, ObjectStorageType storage_type) const override { return getImpl().supportsTotalRows(context, storage_type); }
-    std::optional<size_t> totalRows(ContextPtr context) override { return getImpl().totalRows(context); }
+    std::optional<size_t> totalRows(ContextPtr context, const std::optional<DataLakeTableStateSnapshot> & state) override { return getImpl().totalRows(context, state); }
     bool supportsTotalBytes(ContextPtr context, ObjectStorageType storage_type) const override { return getImpl().supportsTotalBytes(context, storage_type); }
     std::optional<size_t> totalBytes(ContextPtr context) override { return getImpl().totalBytes(context); }
     bool isDataSortedBySortingKey(StorageMetadataPtr storage_metadata, ContextPtr context) const override

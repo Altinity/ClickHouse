@@ -7,6 +7,7 @@
 #if USE_AWS_S3 && USE_AVRO
 
 #include <aws/glue/GlueClient.h>
+#include <aws/glue/GlueErrors.h>
 #include <aws/glue/model/GetTablesRequest.h>
 #include <aws/glue/model/GetTableRequest.h>
 #include <aws/glue/model/GetDatabaseRequest.h>
@@ -1196,12 +1197,46 @@ bool GlueCatalog::createTable(
     return true;
 }
 
+GlueCatalog::TableVersion GlueCatalog::getTableVersion(
+    const String & namespace_name,
+    const String & table_name,
+    const DB::ForwardedAuthTokenPtr & auth_token) const
+{
+    auto client = getClient(auth_token);
+
+    Aws::Glue::Model::GetTableRequest request;
+    request.SetDatabaseName(namespace_name);
+    request.SetName(table_name);
+
+    Aws::Glue::Model::GetTableOutcome outcome;
+    {
+        ProfileEvents::increment(ProfileEvents::DataLakeGlueCatalogGetTable);
+        auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeGlueCatalogGetTableMicroseconds);
+        outcome = client.client->GetTable(request);
+    }
+
+    /// Without the version the update would be an unconditional overwrite, so a failure must not be swallowed.
+    if (!outcome.IsSuccess())
+        throw DB::Exception(
+            DB::ErrorCodes::DATALAKE_DATABASE_ERROR,
+            "Exception calling GetTable for table {}.{}: {}",
+            namespace_name, table_name, outcome.GetError().GetMessage());
+
+    const auto & table = outcome.GetResult().GetTable();
+    TableVersion result;
+    result.version_id = table.GetVersionId();
+    if (auto it = table.GetParameters().find("metadata_location"); it != table.GetParameters().end())
+        result.metadata_location = it->second;
+    return result;
+}
+
 bool GlueCatalog::updateTableInGlue(
     const String & namespace_name,
     const String & table_name,
     const String & new_metadata_path,
     const DB::ForwardedAuthTokenPtr & auth_token,
-    const std::vector<Aws::Glue::Model::Column> & columns) const
+    const std::vector<Aws::Glue::Model::Column> & columns,
+    const String & version_id) const
 {
     auto client = getClient(auth_token);
 
@@ -1238,6 +1273,12 @@ bool GlueCatalog::updateTableInGlue(
     /// Simulates Glue rejecting the update, e.g. because of a `VersionId` mismatch with a concurrent commit.
     fiu_do_on(DB::FailPoints::iceberg_glue_update_table_fail, { return false; });
 
+    /// Optimistic concurrency: when a VersionId is supplied, Glue rejects the
+    /// update if the table has been modified since that version was read. It is only sound together
+    /// with a check of `metadata_location` made on the same read (see `updateMetadataIfCurrent`).
+    if (!version_id.empty())
+        request.SetVersionId(version_id);
+
     Aws::Glue::Model::UpdateTableOutcome response;
 
     {
@@ -1247,14 +1288,53 @@ bool GlueCatalog::updateTableInGlue(
     }
 
     if (!response.IsSuccess())
+    {
+        const auto error_type = response.GetError().GetErrorType();
+        if (error_type == Aws::Glue::GlueErrors::CONCURRENT_MODIFICATION
+            || error_type == Aws::Glue::GlueErrors::VERSION_MISMATCH)
+        {
+            LOG_WARNING(getLogger("GlueCatalog"),
+                "Glue UpdateTable for {}.{} rejected (version conflict): {}",
+                namespace_name, table_name, response.GetError().GetMessage());
+            return false;
+        }
         throw DB::Exception(DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "Can not update metadata in glue catalog {}", response.GetError().GetMessage());
+    }
 
     return true;
 }
 
 bool GlueCatalog::updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr /*new_snapshot*/, const DB::ForwardedAuthTokenPtr & auth_token) const
 {
+    /// The caller gave no base metadata, so there is nothing to compare with and the update is unconditional.
     return updateTableInGlue(namespace_name, table_name, new_metadata_path, auth_token);
+}
+
+bool GlueCatalog::updateMetadataIfCurrent(
+    const String & namespace_name,
+    const String & table_name,
+    const String & new_metadata_path,
+    Poco::JSON::Object::Ptr /*new_snapshot*/,
+    const String & expected_metadata_location,
+    const DB::ForwardedAuthTokenPtr & auth_token) const
+{
+    /// Same order as Iceberg Java's `GlueTableOperations::doCommit`: read the table, check that it still
+    /// points at the writer's base, and send `UpdateTable` with the `VersionId` of that same read. The
+    /// `VersionId` alone would not do, because a read taken after a concurrent commit already includes it.
+    ///
+    /// A table registered by `Location` only has no `metadata_location` parameter, and `getTableMetadata` reports
+    /// the newest metadata file found in storage as its location. There is no pointer to compare then: a writer
+    /// that registered one since the base was read makes the parameter non-empty and different, which is rejected
+    /// below, and the `VersionId` guards against a write between this read and the update.
+    const auto current = getTableVersion(namespace_name, table_name, auth_token);
+    if (!current.metadata_location.empty() && current.metadata_location != expected_metadata_location)
+    {
+        LOG_WARNING(getLogger("GlueCatalog"),
+            "Glue table {}.{} points at {} while the commit is based on {}",
+            namespace_name, table_name, current.metadata_location, expected_metadata_location);
+        return false;
+    }
+    return updateTableInGlue(namespace_name, table_name, new_metadata_path, auth_token, {}, current.version_id);
 }
 
 bool GlueCatalog::updateSchema(

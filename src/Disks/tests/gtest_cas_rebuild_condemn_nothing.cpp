@@ -152,9 +152,8 @@ String publishAtReturningManifestKey(
                                                          .manifest_ordinal = 1}});
 }
 
-/// Publish the exact `_ckpt` that makes a raw fixture recoverable. The real writers go through
-/// `publishCkpt`, which merges by semantic maximum and additionally refuses a `life_epoch` below the
-/// durable one; this helper instead makes the fixture's one admissible recovery frontier explicit.
+/// Publish the exact `_ckpt` that makes a raw fixture recoverable. The real writers are `createCkptAtCreation`
+/// and `publishCkptSnapshot`; this helper instead makes the fixture's one admissible recovery frontier explicit.
 void writeCkptRaw(Backend & backend, const Layout & layout, const RootNamespace & ns, const RefCkpt & ckpt)
 {
     writeRecoverableCkptForRawFixture(backend, layout, ns, ckpt);
@@ -613,9 +612,9 @@ TEST(CASRebuildCondemnNothingFsck, ExactFrontierMakesAnUnsealedEpochCrossingChai
     {
         return object.cls == FsckClass::ChainBroken && object.key == missing_key;
     }), 1u) << "the present ordinary 1-3 cannot close epoch 1, so arithmetic continuation requires 1-4";
-    EXPECT_GE(rowsMentioning(rep, FsckClass::ChainBroken, "checkpoint requires id 1-4"), 1u)
+    EXPECT_GE(rowsMentioning(rep, FsckClass::ChainBroken, "log 1-4 is absent"), 1u)
         << "the verdict must expose that the claimed ordinary predecessor did not authorize a crossing";
-    EXPECT_GE(rowsMentioning(rep, FsckClass::ChainBroken, "inclusive frontier 2-1"), 1u)
+    EXPECT_GE(rowsMentioning(rep, FsckClass::ChainBroken, "checkpoint frontier 2-1"), 1u)
         << "the verdict must name the authority that made the absence a proven chain break";
 }
 

@@ -51,7 +51,14 @@ def _assert_fsck_clean(node):
     # dropped temporary ref leaves unreachable blobs that GC has not retired yet), then audit.
     def drained():
         rows = _cli_rows(node, f"SYSTEM CAS GC RUN '{DISK}'")
-        return rows and rows[0]["pending_condemned"] == "0"
+        # A row without the GC lease (or a deferred one) reports zero pending counters by construction.
+        # While a killed incarnation still holds the lease, only an authoritative row proves anything.
+        return (
+            rows
+            and rows[0]["acquired_lease"] == "1"
+            and rows[0]["deferred"] == "0"
+            and rows[0]["pending_condemned"] == "0"
+        )
 
     _wait(drained, timeout=60, desc="GC retire pipeline drained")
     rows = _cli_rows(node, f"SYSTEM CAS FSCK '{DISK}'")

@@ -24,7 +24,6 @@ class AltinityArtifactConfigs:
 
 class AltinityJobNames:
     SIGN_RELEASE = "Sign release"
-    SOURCE_UPLOAD = "Source upload"
 
 
 class AltinityJobConfigs:
@@ -62,15 +61,6 @@ class AltinityJobConfigs:
             provides=[AltinityArtifactNames.SIGNED_ARM_RELEASE],
         ),
     )
-    # No digest_config: the job tars the whole source tree, which changes every
-    # commit, so it must never be skipped by the content-addressed CI cache.
-    source_upload_job = Job.Config(
-        name=AltinityJobNames.SOURCE_UPLOAD,
-        runs_on=RunnerLabels.STYLE_CHECK_AMD,
-        command="python3 ./ci/jobs/source_upload.py",
-        timeout=3600,
-        needs_submodules=True,
-    )
     # Stateless tests with a content-addressed disk as the default MergeTree storage.
     cas_functional_tests_jobs = common_ft_job_config.parametrize(
         # CAS over S3: RustFS, not MinIO OSS, because the incarnation pool needs
@@ -85,7 +75,15 @@ class AltinityJobConfigs:
         *[
             Job.ParamSet(
                 parameter=f"amd_asan_ubsan, cas s3 storage, parallel, {batch}/{total_batches}",
-                runs_on=RunnerLabels.AMD_MEDIUM_CPU,
+                # Under ASan the server RSS is mostly per-thread runtime state (fake
+                # stacks, thread stacks, allocator regions), not query memory, and it
+                # grows with the number of pool threads for the life of the process.
+                # On the 32 GiB runner a shard crosses the 0.8 memory-pressure
+                # threshold of clickhouse-test after ~2 h, and shedding workers does
+                # not lower RSS, so the shard drains to one worker and hits the job
+                # timeout. Same remedy as the plain ASan parallel lane: the LARGE
+                # runner has the same 16 vCPU and twice the RAM.
+                runs_on=RunnerLabels.AMD_LARGE,
                 requires=[ArtifactNames.CH_AMD_ASAN_UBSAN_GH],
             )
             for total_batches in (2,)

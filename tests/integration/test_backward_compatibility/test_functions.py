@@ -15,7 +15,7 @@ cluster = ClickHouseCluster(__file__)
 upstream = cluster.add_instance("upstream", use_old_analyzer=True)
 backward = cluster.add_instance(
     "backward",
-    image="altinity/clickhouse-server",
+    image="clickhouse/clickhouse-server",
     tag=CLICKHOUSE_CI_MIN_TESTED_VERSION,
     with_installed_binary=True,
 )

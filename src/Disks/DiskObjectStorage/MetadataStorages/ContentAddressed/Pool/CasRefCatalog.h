@@ -76,7 +76,7 @@ public:
     /// offered an absent catalog to build a replacement authority from, so no mutation can replace
     /// every other namespace with a one-update catalog.
     ///
-    /// This primitive runs NO admission check: Constraint 13 (removal is never refused) means
+    /// This primitive runs NO admission check: removal is never refused, so
     /// whether a candidate must clear the additive predicate is the CALLER's decision, not this
     /// loop's. A caller mutating an entry's state without growing the catalog (a removal transition)
     /// uses this directly.
@@ -97,11 +97,12 @@ public:
     /// `entry` at its canonical (ns-sorted) position and running the SAME bounded `casUpdate` retry
     /// loop. Takes the entry to insert rather than an arbitrary mutation, by design: an admission
     /// entry point that accepted a free-form candidate could be handed a REMOVAL by a future caller
-    /// that reads as correct, silently reopening Constraint 13 (removal is never refused) behind a
+    /// that reads as correct, silently making a removal refusable behind a
     /// name that says "admitting". A namespace `entry.ns` already carries an entry is a bug in the
     /// caller (`createNamespace` below owns checking that first) and surfaces as
     /// `encodeRefCatalog`'s own canonical-order/no-duplicate grammar check, inside
-    /// `checkCatalogAdmission`.
+    /// `checkCatalogAdmission`. Used by tests only. It resends the caller's fixed row after an attempt of
+    /// unknown fate, so lifecycle creation goes through `createNamespace`.
     static RefCatalog casAdmitEntry(
         CasOperation & op, const Layout & layout, uint64_t gc_shards, const CatalogEntry & entry);
 
@@ -117,9 +118,10 @@ public:
     /// every catalog retry, and `op`'s admission is checked after every fresh read and before its
     /// write. A row already `Removing` under the same namespace/life resolves an ambiguous or
     /// concurrent transition positively; no caller may change its recorded start round afterward.
+    /// A `policy` carrying a deadline bounds the update and the read of its mismatch branch together.
     static BeginRemovingOutcome beginRemoving(
         CasOperation & op, const Layout & layout, const CatalogEntry & observed,
-        uint64_t removal_started_round);
+        uint64_t removal_started_round, const Retry & policy = Retry::standard());
 
     /// Outcome of the only fold-authorized catalog deletion. A refusal never writes the catalog.
     enum class CompletedRemovingDeleteOutcome : uint8_t
@@ -150,26 +152,31 @@ public:
     /// adopted parent carries cleanup evidence, but no hold, in the row keyed by the same opaque life
     /// id. The whole parent seal is consumed so a caller cannot separate the life id from its proof or
     /// reduce the proof to a caller-computed boolean. `op`'s admission is checked after every fresh
-    /// catalog read and before every attempted erase.
+    /// catalog read and before every attempted erase. The erase is conditioned on the incarnation of
+    /// `catalog_snapshot`, and the mandatory resolution snapshot is returned in the result so a
+    /// catalog-only drain can select the next row without an intervening read.
     ///
     /// `refresh_authority` runs at the top of every attempt, before the checks that decide whether to
     /// send one. It is not a verdict -- the verdict stays `op.admitted()` -- but that liveness may be
     /// a cached flag its holder refreshes from a fact this loop cannot see, and one reading taken
-    /// before the first erase must not authorise the rest. Mandatory: a caller whose liveness needs no
-    /// refresh passes a no-op and says so, instead of erasing unrefreshed because the argument was
-    /// easy to omit.
-    static CompletedRemovingDeleteResult deleteCompletedRemoving(
-        CasOperation & op, const Layout & layout, const CatalogEntry & observed,
-        const CasFoldSeal & authoritative_parent,
-        const std::function<void()> & refresh_authority);
-
-    /// Same exact deletion, using the caller's complete selected catalog snapshot and its incarnation
-    /// for the one erase attempt. Its mandatory resolution snapshot is returned in the result so a
-    /// catalog-only drain can select the next row without an intervening read.
+    /// before the first erase must not authorise the rest. A caller whose liveness needs no refresh
+    /// passes a no-op and says so.
+    ///
+    /// `before_erase`, when set, receives the life once, after admission is confirmed and before the
+    /// first erase is sent. It lets a caller record the retirement while the row still exists: a
+    /// record made after the erase leaves a window in which the life is gone but unrecorded. An
+    /// exception from it propagates and no erase is sent. A caller that records nothing passes an empty
+    /// function and says so.
+    ///
+    /// `erase_acknowledged`, when set, receives the life once the store acknowledged its erase, before
+    /// the resolution read: that read may throw, or the call may end `FencedOut` or `EntryChanged`, and
+    /// a caller counting completed erases must not lose this one.
     static CompletedRemovingDeleteResult deleteCompletedRemovingAtSnapshot(
         CasOperation & op, const Layout & layout, Snapshot catalog_snapshot,
         const CatalogEntry & observed, const CasFoldSeal & authoritative_parent,
-        const std::function<void()> & refresh_authority);
+        const std::function<void()> & refresh_authority,
+        const std::function<void(const NamespaceLifeId &)> & before_erase,
+        const std::function<void(const NamespaceLifeId &)> & erase_acknowledged);
 
     /// Outcome of exact stalled-creation cancellation, the only other exported deletion shape.
     enum class StalledCreatingCancelOutcome : uint8_t
@@ -182,9 +189,11 @@ public:
 
     /// Exact-CAS-deletes one observed `Creating` row only after its complete creator fence is proven
     /// terminal. This performs no `_ckpt` or other physical cleanup; debris belongs to the janitor.
+    /// `policy` bounds the update; pass it to the predicate's own reads to bound those as well.
     static StalledCreatingCancelOutcome cancelStalledCreating(
         CasOperation & op, const Layout & layout, const CatalogEntry & observed,
-        const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal);
+        const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal,
+        const Retry & policy = Retry::standard());
 
     /// === The creation lifecycle, built on the two primitives above ===
 
@@ -269,22 +278,21 @@ public:
     /// folded invisibly into `createNamespace`) because reconciliation resumes exactly HERE, never
     /// re-running step 1.
     ///
-    /// Step 2: `publishCkpt` with a contribution carrying `observed.creator->writer_epoch` as
-    /// `life_epoch` -- INV-4's genesis record; `observed.creator` must be present (i.e. `observed.state
-    /// == Creating`), enforced with `LOGICAL_ERROR` since a caller reaching here with anything else is
-    /// this module's own bug, not a race. A `FencedOut` from `publishCkpt` ends the attempt here.
+    /// Step 2: `createCkptAtCreation` with `observed.creator->writer_epoch` as `life_epoch`;
+    /// `observed.creator` must be present (i.e. `observed.state == Creating`), enforced with
+    /// `LOGICAL_ERROR` since a caller reaching here with anything else is this module's own bug, not a
+    /// race. A `FencedOut` from it ends the attempt here.
     ///
     /// Step 3: `CasRefCatalog::casUpdate`'s `mutate` is the fence re-check point (see the class-level
     /// note below) -- `op.admitted()` is consulted FIRST, on every fresh read this retry loop performs;
     /// a refusal is reported as `FencedOut`, nothing else. ONLY THEN is the fresh entry for `observed.ns` compared
     /// against `observed` by FULL VALUE equality (`CatalogEntry::operator==`) -- the value-CAS that
-    /// plays the role `publishCkpt`'s object token plays for `_ckpt`, since one catalog object holds
+    /// stands in for an object token, since one catalog object holds
     /// every namespace's entry and there is no separate per-entry token to CAS against. A mismatch
     /// (stolen by a concurrent reconciler, or already carried to `Live`/`Removing`) is `Superseded`,
     /// caught before any CAS is attempted -- not a retry against fresh state, because retrying here
     /// would mean re-deciding against an entry that is no longer `observed`, which is precisely what
-    /// token-exactness forbids. Ordering the fence check before the entry check is deliberate (mirrors
-    /// `publishCkpt`); a caller that manages to make BOTH stale sees `FencedOut`, not `Superseded` --
+    /// token-exactness forbids. Ordering the fence check before the entry check is deliberate; a caller that manages to make BOTH stale sees `FencedOut`, not `Superseded` --
     /// both are truthful refusals of a CAS that was never sent.
     static NamespaceCreationOutcome completeCreation(
         CasOperation & op, const Layout & layout, const CatalogEntry & observed,

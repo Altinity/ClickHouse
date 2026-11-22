@@ -89,15 +89,17 @@ struct PartManifest
 };
 
 /// Deterministic, streaming-capable encode. Entries are written in canonical path order (the encoder
-/// sorts them); a duplicate path throws `CORRUPTED_DATA`. Byte output is reproducible for identical
-/// input (no timestamps, no nondeterministic compression). Returns the canonical TEXT (NOT sealed);
-/// the caller compresses via `sealObject(FormatId::PartManifest, …)` on the persist path
-/// (`CompressionPolicy::Always`).
+/// sorts them). A bad or duplicate entry path, which no writer builds, throws `LOGICAL_ERROR`; a line
+/// over the line cap, which an oversized legal input can produce, throws `LIMIT_EXCEEDED`. Byte output
+/// is reproducible for identical input (no timestamps, no nondeterministic compression). Returns the
+/// canonical TEXT (NOT sealed); the caller compresses via `sealObject(FormatId::PartManifest, …)` on
+/// the persist path (`CompressionPolicy::Always`).
 String encodePartManifest(const PartManifest & m);
 
 /// Decode the canonical TEXT (the caller `openObject`s a stored `.zst` first). Throws `CORRUPTED_DATA`
-/// on a malformed header/descriptor/record/trailer/payload-zone shape or an unknown placement word;
-/// `UNKNOWN_FORMAT_VERSION` for a header `v` above this build.
+/// on a malformed header/descriptor/record/trailer/payload-zone shape, an unknown placement word, or a
+/// body that does not re-encode within the line cap; `UNKNOWN_FORMAT_VERSION` for a header `v` above
+/// this build.
 PartManifest decodePartManifest(std::string_view data);
 
 /// Content digest of the canonical encoded body, using the CAS content-hash primitive
@@ -105,7 +107,8 @@ PartManifest decodePartManifest(std::string_view data);
 /// primitive). Callers set `PartManifest.payload_digest` from this. It is
 /// integrity/debug ONLY - never a key, never dedup, never in-degree. Stable for identical bodies;
 /// changes when any byte of the canonical encoding does, and is independent of the `payload_digest`
-/// field itself (computed with it zeroed).
+/// field itself (computed with it zeroed). It encodes `m`, so it throws what `encodePartManifest`
+/// throws.
 UInt128 computePayloadDigest(const PartManifest & m);
 
 /// Fail-closed identity checks used when reading or folding a manifest. The journal `ManifestRef`
