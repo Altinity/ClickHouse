@@ -223,6 +223,18 @@ class JobConfigs:
         ),
         requires=[ArtifactNames.CH_AMD_DARWIN_BIN],
     )
+    smoke_test_ppc64le = Job.Config(
+        name=JobNames.SMOKE_TEST_PPC64LE,
+        runs_on=RunnerLabels.FUNC_TESTER_AMD,
+        command="python3 ./ci/jobs/smoke_test_ppc64le.py",
+        digest_config=Job.CacheDigestConfig(
+            include_paths=[
+                "./ci/jobs/smoke_test_ppc64le.py",
+            ],
+        ),
+        requires=[ArtifactNames.CH_PPC64LE_GH],
+        timeout=900,
+    )
     tidy_build_arm_jobs = common_build_job_config.parametrize(
         Job.ParamSet(
             parameter=BuildTypes.ARM_TIDY,
@@ -379,61 +391,64 @@ class JobConfigs:
             # "python3 ./ci/jobs/scripts/job_hooks/build_profile_hook.py",
         ],
     ).parametrize(
-        Job.ParamSet(
-            parameter=BuildTypes.AMD_DARWIN,
-            provides=[ArtifactNames.CH_AMD_DARWIN_BIN],
-            runs_on=RunnerLabels.BUILDER_AMD,  # cannot crosscompile on arm
-        ),
-        Job.ParamSet(
-            parameter=BuildTypes.ARM_DARWIN,
-            provides=[ArtifactNames.CH_ARM_DARWIN_BIN],
-            runs_on=RunnerLabels.ARM_LARGE,
-        ),
-        Job.ParamSet(
-            parameter=BuildTypes.ARM_V80COMPAT,
-            provides=[ArtifactNames.CH_ARM_V80COMPAT],
-            runs_on=RunnerLabels.ARM_LARGE,
-        ),
-        Job.ParamSet(
-            parameter=BuildTypes.AMD_FREEBSD,
-            provides=[ArtifactNames.CH_AMD_FREEBSD],
-            runs_on=RunnerLabels.BUILDER_AMD,
-        ),
+        # Job.ParamSet(
+        #     parameter=BuildTypes.AMD_DARWIN,
+        #     provides=[ArtifactNames.CH_AMD_DARWIN_BIN],
+        #     runs_on=RunnerLabels.BUILDER_AMD,  # cannot crosscompile on arm
+        # ),
+        # Job.ParamSet(
+        #     parameter=BuildTypes.ARM_DARWIN,
+        #     provides=[ArtifactNames.CH_ARM_DARWIN_BIN],
+        #     runs_on=RunnerLabels.ARM_LARGE,
+        # ),
+        # Job.ParamSet(
+        #     parameter=BuildTypes.ARM_V80COMPAT,
+        #     provides=[ArtifactNames.CH_ARM_V80COMPAT],
+        #     runs_on=RunnerLabels.ARM_LARGE,
+        # ),
+        # Job.ParamSet(
+        #     parameter=BuildTypes.AMD_FREEBSD,
+        #     provides=[ArtifactNames.CH_AMD_FREEBSD],
+        #     runs_on=RunnerLabels.BUILDER_AMD,
+        # ),
         Job.ParamSet(
             parameter=BuildTypes.PPC64LE,
-            provides=[ArtifactNames.CH_PPC64LE],
+            provides=[
+                ArtifactNames.CH_PPC64LE,
+                ArtifactNames.CH_PPC64LE_GH,
+            ],
             runs_on=RunnerLabels.BUILDER_AMD,
         ),
-        Job.ParamSet(
-            parameter=BuildTypes.AMD_COMPAT,
-            provides=[ArtifactNames.CH_AMD_COMPAT],
-            runs_on=RunnerLabels.BUILDER_AMD,
-        ),
-        Job.ParamSet(
-            parameter=BuildTypes.AMD_MUSL,
-            provides=[ArtifactNames.CH_AMD_MUSL],
-            runs_on=RunnerLabels.BUILDER_AMD,
-        ),
-        Job.ParamSet(
-            parameter=BuildTypes.RISCV64,
-            provides=[ArtifactNames.CH_RISCV64],
-            runs_on=RunnerLabels.BUILDER_AMD,
-        ),
-        Job.ParamSet(
-            parameter=BuildTypes.S390X,
-            provides=[ArtifactNames.CH_S390X],
-            runs_on=RunnerLabels.BUILDER_AMD,
-        ),
-        Job.ParamSet(
-            parameter=BuildTypes.LOONGARCH64,
-            provides=[ArtifactNames.CH_LOONGARCH64],
-            runs_on=RunnerLabels.BUILDER_AMD,
-        ),
-        Job.ParamSet(
-            parameter=BuildTypes.ARM_FUZZERS,
-            provides=[],
-            runs_on=RunnerLabels.ARM_LARGE,
-        ),
+        # Job.ParamSet(
+        #     parameter=BuildTypes.AMD_COMPAT,
+        #     provides=[ArtifactNames.CH_AMD_COMPAT],
+        #     runs_on=RunnerLabels.BUILDER_AMD,
+        # ),
+        # Job.ParamSet(
+        #     parameter=BuildTypes.AMD_MUSL,
+        #     provides=[ArtifactNames.CH_AMD_MUSL],
+        #     runs_on=RunnerLabels.BUILDER_AMD,
+        # ),
+        # Job.ParamSet(
+        #     parameter=BuildTypes.RISCV64,
+        #     provides=[ArtifactNames.CH_RISCV64],
+        #     runs_on=RunnerLabels.BUILDER_AMD,
+        # ),
+        # Job.ParamSet(
+        #     parameter=BuildTypes.S390X,
+        #     provides=[ArtifactNames.CH_S390X],
+        #     runs_on=RunnerLabels.BUILDER_AMD,
+        # ),
+        # Job.ParamSet(
+        #     parameter=BuildTypes.LOONGARCH64,
+        #     provides=[ArtifactNames.CH_LOONGARCH64],
+        #     runs_on=RunnerLabels.BUILDER_AMD,
+        # ),
+        # Job.ParamSet(
+        #     parameter=BuildTypes.ARM_FUZZERS,
+        #     provides=[],
+        #     runs_on=RunnerLabels.ARM_LARGE,
+        # ),
     )
     install_check_jobs = Job.Config(
         name=JobNames.INSTALL_TEST,

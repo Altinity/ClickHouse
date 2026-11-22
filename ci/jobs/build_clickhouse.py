@@ -88,6 +88,68 @@ def run_shell(name, command, **kwargs):
     print(f"\n<<<< {name}\n")
 
 
+def check_ppc64le_patches(build_root):
+    asm_path = os.path.join(build_root, "contrib/libunwind-cmake/UnwindRegistersSave.S")
+    ninja_path = os.path.join(build_root, "build.ninja")
+
+    try:
+        with open(asm_path, encoding="utf-8") as asm_file:
+            asm = asm_file.read()
+    except OSError as error:
+        print(f"Could not read patched libunwind source {asm_path}: {error}")
+        return False
+
+    restored = (
+        "  xxswapd n, n            ;\\\n"
+        "  stxvd2x n, 0, 4         ;\\\n"
+        "  xxswapd n, n            ;\\"
+    )
+    if restored not in asm:
+        print(f"ppc64le libunwind patch was not applied to {asm_path}")
+        return False
+
+    # CMAKE_CXX_FLAGS in CMakeCache.txt stays empty. The real flags are on the ninja FLAGS lines.
+    frame_flag = "-Wframe-larger-than=131072"
+    patched_asm = "contrib/libunwind-cmake/UnwindRegistersSave.S"
+    found_frame = False
+    found_asm = False
+    found_altivec = False
+    found_sse2 = False
+    try:
+        with open(ninja_path, encoding="utf-8", errors="replace") as ninja:
+            for line in ninja:
+                if "FLAGS" not in line and patched_asm not in line:
+                    continue
+                if not found_frame and frame_flag in line:
+                    found_frame = True
+                if not found_asm and patched_asm in line:
+                    found_asm = True
+                if "FLAGS" in line:
+                    if "-maltivec" in line and (
+                        "-mcpu=power8" in line or "-mcpu=power9" in line
+                    ):
+                        found_altivec = True
+                    if "-D__SSE2__" in line or "-DNO_WARN_X86_INTRINSICS" in line:
+                        found_sse2 = True
+    except OSError as error:
+        print(f"Could not read {ninja_path}: {error}")
+        return False
+    if not found_altivec:
+        print(f"{ninja_path} FLAGS lines are missing ppc64le AltiVec flags")
+        return False
+    if found_sse2:
+        print(f"{ninja_path} FLAGS lines still define __SSE2__ or NO_WARN_X86_INTRINSICS")
+        return False
+    if not found_frame:
+        print(f"{frame_flag} is not in {ninja_path}")
+        return False
+    if not found_asm:
+        print(f"{patched_asm} is not a build input in {ninja_path}")
+        return False
+    print("ppc64le patches are present")
+    return True
+
+
 def main():
     args = parse_args()
 
@@ -243,6 +305,16 @@ def main():
                 shutil.copy2(ninja_log_seed, f"{build_dir}/.ninja_log")
                 print(f"Pre-seeded .ninja_log from {ninja_log_seed}")
             Shell.check("ninja --version", verbose=True)
+
+    if res and build_type == BuildTypes.PPC64LE and JobStages.BUILD in stages:
+        results.append(
+            Result.from_commands_run(
+                name="ppc64le patch check",
+                command=check_ppc64le_patches,
+                command_kwargs={"build_root": build_dir},
+            )
+        )
+        res = results[-1].is_ok()
 
     # Activate FIPS-permissive config for OpenSSL
     os.environ["OPENSSL_CONF"] = "/etc/ssl/openssl.cnf"
