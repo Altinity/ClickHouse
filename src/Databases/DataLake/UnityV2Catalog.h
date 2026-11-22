@@ -83,6 +83,9 @@ public:
     /// Without this, a write would leave metadata files in the table location before failing.
     bool isTransactional() const override { return true; }
 
+    /// Keep the overload that takes the base metadata location visible next to the override below.
+    using ICatalog::updateMetadata;
+
     /// Iceberg commits are forwarded to the Iceberg REST endpoint. Delta writes commit through `_delta_log` and never get here.
     bool updateMetadata(
         const String & namespace_name,

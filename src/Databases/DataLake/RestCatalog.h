@@ -119,6 +119,9 @@ public:
         bool if_not_exists,
         const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
+    /// Keep the overload that takes the base metadata location visible next to the override below.
+    using ICatalog::updateMetadata;
+
     bool updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr new_snapshot, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     bool updateSchema(
