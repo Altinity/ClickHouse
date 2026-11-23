@@ -98,8 +98,7 @@ uint64_t removeChunkWriteOnceOrOneByOne(CasOperation & op, const std::vector<Wri
 
 /// Pure skip-unchanged decision. Returns true iff the current round may be
 /// DEFERRED (re-adopt the sealed generation, no fold/delete). A round MUST fold when: enough shards
-/// changed (>= fold_threshold), OR a destructive decision is due (graduation_due), OR an
-/// orphan-manifest sweep requires a fold, OR the defer bound is reached
+/// changed (>= fold_threshold), OR a destructive decision is due (graduation_due), OR the defer bound is reached
 /// (rounds_since_last_fold >= fold_max_defer_rounds). The graduation_due term is the
 /// load-bearing safety guard: no destructive decision ever runs on a not-fully-folded snapshot.
 bool shouldDeferRound(size_t changed_shards, bool graduation_due, uint64_t rounds_since_last_fold,
