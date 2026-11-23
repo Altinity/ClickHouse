@@ -1524,11 +1524,17 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             continue;
         ++report.unreachable;
 
-        /// A foreign/malformed key (`parseBlobKey` -> `nullopt`) falls back to the default `BlobRef{}`,
-        /// which cannot match a real `retired_by_hash`/`in_run_hashes` entry — it lands in the generic
-        /// `Unaccounted` bucket below, exactly the "debris, not ours" classification `parseBlobKey`
-        /// documents: foreign algorithm segments are debris, not pool objects.
-        const BlobRef hash = layout.parseBlobKey(bkey).value_or(BlobRef{});
+        /// A key that is no blob key has no GC identity: it is classified before any snapshot lookup or request.
+        const std::optional<BlobRef> parsed = layout.parseBlobKey(bkey);
+        if (!parsed)
+        {
+            ++report.unaccounted;
+            if (detail)
+                report.objects.push_back(FsckObject{.key = bkey, .kind = ObjectKind::Blob, .size = sz, .cls = FsckClass::Unaccounted,
+                    .reachable_from = {"Malformed blob key under `blobs/`. No GC identity."}});
+            continue;
+        }
+        const BlobRef & hash = *parsed;
 
         FsckClass cls = FsckClass::Unaccounted;
         String note;

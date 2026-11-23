@@ -172,7 +172,8 @@ public:
             std::cout << "note: " << report.unaccounted
                       << " object(s) are outside the current GC view — normal only as a transient "
                          "(created+dropped between GC rounds); re-run cas-fsck after the next round and "
-                         "investigate any that persist\n";
+                         "investigate any that persist; a malformed key under `blobs/` also counts here "
+                         "(`--detail` names it; keys ending in `.meta` are not examined by this class)\n";
         /// Not a finding: a canonical namespace-life key whose life is absent from the catalog is the
         /// protocol-produced interval between a fenced GC exact-deleting a `Removing` row and the
         /// perpetual namespace janitor reaching it on a later bounded page (its own deletes are

@@ -3846,6 +3846,210 @@ TEST(CASFsck, PendingRowTokenIsComparedCanonically)
     EXPECT_EQ(countVerdictsAtKey(rep, body_key, FsckClass::PendingWithoutIntent), 1u);
 }
 
+namespace
+{
+/// An object listed under the blobs prefix that `Layout::parseBlobKey` refuses.
+String foreignBlobKey(const Layout & layout, std::string_view tail = "md5/aa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+{
+    const String key = layout.blobsPrefix() + String(tail);
+    EXPECT_FALSE(layout.parseBlobKey(key).has_value()) << "fixture: the key must be one the parser refuses";
+    return key;
+}
+
+void plantForeignBody(Backend & backend, const String & key)
+{
+    OperationForTest op(backend);
+    ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(key, "x", Retry::standard())));
+}
+
+const FsckObject * rowAt(const FsckReport & report, const String & key)
+{
+    for (const FsckObject & o : report.objects)
+        if (o.key == key)
+            return &o;
+    return nullptr;
+}
+
+/// The scan names the key `Unaccounted` with the fixed note and no other class.
+void expectForeignRow(const FsckReport & report, const String & key)
+{
+    const FsckObject * row = rowAt(report, key);
+    ASSERT_NE(row, nullptr) << key;
+    EXPECT_EQ(row->cls, FsckClass::Unaccounted) << key;
+    EXPECT_EQ(row->size, 1u) << key;
+    ASSERT_FALSE(row->reachable_from.empty()) << key;
+    EXPECT_NE(row->reachable_from[0].find("Malformed blob key"), String::npos) << row->reachable_from[0];
+    EXPECT_EQ(std::count_if(report.objects.begin(), report.objects.end(),
+        [&](const FsckObject & o) { return o.key == key; }), 1) << "exactly one row for the key";
+}
+}
+
+/// An unparsable key beside the zero-byte body, which the all-zero digest keys, is its own `Unaccounted` row and leaves
+/// the zero body's verdict alone.
+TEST(CASFsck, UnparsableBlobKeyIsNotTheZeroBodyAwaitingGc)
+{
+    ASSERT_EQ(blobRefOf(0), BlobRef{});
+    ASSERT_EQ(idOf(String()), BlobRef{});
+    for (const bool detail : {true, false})
+    {
+        SCOPED_TRACE(detail);
+        FsckGcFixture f(0, {0});
+        f.drop();
+        const String zero_key = f.bodyKey(0);
+        const String foreign = foreignBlobKey(f.store->layout());
+        const FsckReport before = runFsck(*f.store, detail);
+        ASSERT_EQ(before.awaiting_gc, 1u) << "positive control: the zero body awaits GC";
+
+        plantForeignBody(*f.backend, foreign);
+        const FsckReport after = runFsck(*f.store, detail);
+
+        EXPECT_EQ(after.unreachable, before.unreachable + 1);
+        EXPECT_EQ(after.unaccounted, before.unaccounted + 1);
+        EXPECT_EQ(after.awaiting_gc, 1u);
+        if (detail)
+        {
+            expectForeignRow(after, foreign);
+            EXPECT_EQ(countVerdictsAtKey(after, zero_key, FsckClass::AwaitingGc), 1u);
+        }
+    }
+}
+
+/// The zero body's own stale edge is hard and is reported once; the foreign key does not repeat it.
+TEST(CASFsck, UnparsableBlobKeyIsNotTheZeroBodyStaleEdge)
+{
+    ASSERT_EQ(blobRefOf(0), BlobRef{});
+    for (const bool detail : {true, false})
+    {
+        SCOPED_TRACE(detail);
+        FsckGcFixture f(0, {0});
+        f.drop();
+        deleteManifestBody(*f.backend, f.store->layout(), f.manifest_id);
+        f.round();
+        const String zero_key = f.bodyKey(0);
+        const String foreign = foreignBlobKey(f.store->layout());
+        const FsckReport before = runFsck(*f.store, detail);
+        ASSERT_EQ(before.stale_edge, detail ? 1u : 0u);
+
+        plantForeignBody(*f.backend, foreign);
+        const FsckReport after = runFsck(*f.store, detail);
+
+        EXPECT_EQ(after.unaccounted, before.unaccounted + 1);
+        EXPECT_EQ(after.stale_edge, before.stale_edge);
+        EXPECT_EQ(after.stale_edge_superseded, 0u);
+        EXPECT_EQ(after.awaiting_gc, before.awaiting_gc);
+        if (detail)
+        {
+            EXPECT_FALSE(after.clean());
+            EXPECT_EQ(countVerdictsAtKey(after, zero_key, FsckClass::StaleEdge), 1u) << "the genuine body stays a hard finding";
+            expectForeignRow(after, foreign);
+        }
+    }
+}
+
+/// No `gc/state` made every unreferenced body `AwaitingGc`, the foreign key included.
+TEST(CASFsck, UnparsableBlobKeyWithNoGcStateIsUnaccounted)
+{
+    const std::array<String, 3> tails = {
+        "md5/aa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "ch128/00/ff" + String(30, '0'),
+        "ch128/aa/aabbcc",
+    };
+    for (const String & tail : tails)
+        for (const bool detail : {true, false})
+        {
+            SCOPED_TRACE(tail);
+            SCOPED_TRACE(detail);
+            auto backend = std::make_shared<InMemoryBackend>();
+            auto store = openPoolForTest(backend);
+            writeBlobBody(*backend, store->layout(), numberedBlobHash(5));
+            const String foreign = foreignBlobKey(store->layout(), tail);
+            plantForeignBody(*backend, foreign);
+
+            const FsckReport rep = runFsck(*store, detail);
+
+            EXPECT_EQ(rep.unreachable, 2u);
+            EXPECT_EQ(rep.unaccounted, 1u);
+            EXPECT_EQ(rep.awaiting_gc, 1u) << "positive control: body 5 awaits GC";
+            if (detail)
+            {
+                expectForeignRow(rep, foreign);
+                EXPECT_EQ(countVerdictsAtKey(rep, store->layout().blobKey(blobRefOf(5)), FsckClass::AwaitingGc), 1u);
+            }
+        }
+}
+
+/// A `gc/state` the scan cannot read leaves real bodies `Unchecked`; a key that is no blob key is not one of them.
+TEST(CASFsck, UnparsableBlobKeyUnderAnUnreadSnapshotIsUnaccountedNotUnchecked)
+{
+    for (const bool detail : {true, false})
+    {
+        SCOPED_TRACE(detail);
+        auto backend = std::make_shared<InMemoryBackend>();
+        auto store = openPoolForTest(backend);
+        writeBlobBody(*backend, store->layout(), numberedBlobHash(5));
+        GcState state;
+        state.header_generation = G_REF_CHAIN;
+        state.gc_shards = store->poolConfig().gc_shards;
+        {
+            OperationForTest op(*backend);
+            ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(store->layout().gcStateKey(), encodeGcState(state), Retry::standard())));
+        }
+        const String foreign = foreignBlobKey(store->layout());
+        plantForeignBody(*backend, foreign);
+
+        const FsckReport rep = runFsck(*store, detail);
+
+        EXPECT_EQ(rep.unaccounted, 1u);
+        EXPECT_EQ(rep.intent_unread, 1u);
+        EXPECT_FALSE(rep.clean());
+        if (detail)
+        {
+            expectForeignRow(rep, foreign);
+            EXPECT_EQ(countVerdictsAtKey(rep, foreign, FsckClass::Unchecked), 0u);
+            EXPECT_EQ(countVerdictsAtKey(rep, store->layout().blobKey(blobRefOf(5)), FsckClass::Unchecked), 1u)
+                << "positive control: the real refusal is still reported";
+        }
+    }
+}
+
+/// The retired zero body gets the `HEAD` and the intent read; the foreign key gets neither.
+TEST(CASFsck, UnparsableBlobKeyIsNeverLookedUpAgainstARetiredZeroBody)
+{
+    ASSERT_EQ(blobRefOf(0), BlobRef{});
+    for (const bool detail : {true, false})
+    {
+        SCOPED_TRACE(detail);
+        auto backend = std::make_shared<FsckFaultBackend>();
+        PoolPtr store = openPoolForTest(backend);
+        const Layout & layout = store->layout();
+        const BlobRef blob = blobRefOf(0);
+        writeBlobBody(*backend, layout, numberedBlobHash(0));
+        const String zero_key = layout.blobKey(blob);
+        const PersistedEtag token{"emulated", "\"tag-1\""};
+        backend->head_values[zero_key] = "tag-1";
+        injectRetire(*backend, layout, /*round=*/3, /*shard=*/0, {RetiredEntry{
+            .kind = ObjectKind::Blob, .ref = blob, .token = token,
+            .size = 1, .condemn_round = 3, .delete_pending = true}});
+        const String intent = layout.blobIntentKey(blob, *token.canonical());
+        const String foreign = foreignBlobKey(layout);
+        const FsckReport before = runFsck(*store, detail);
+        ASSERT_EQ(before.pending_without_intent, 1u) << "positive control: the zero body's row has no intent";
+
+        plantForeignBody(*backend, foreign);
+        backend->head_values[foreign] = "tag-1";
+        backend->clearJournal();
+        const FsckReport after = runFsck(*store, detail);
+
+        EXPECT_EQ(countKeyRequests(backend->journal(), JournalVerb::Head, foreign), 0u);
+        EXPECT_EQ(countKeyRequests(backend->journal(), JournalVerb::Read, intent), 1u);
+        EXPECT_EQ(after.pending_without_intent, 1u);
+        EXPECT_EQ(after.unaccounted, before.unaccounted + 1);
+        EXPECT_EQ(countVerdictsAtKey(after, zero_key, FsckClass::PendingWithoutIntent), 1u);
+        if (detail)
+            expectForeignRow(after, foreign);
+    }
+}
+
 /// The second read of `gc/state` clears a suspect only when it is a complete snapshot: a seal it names that is
 /// gone, or a run whose checksum disagrees, proves nothing about the row, so the scan is inconclusive.
 TEST(CASFsck, PendingSuspectIsClearedOnlyByACompleteReread)

@@ -39,7 +39,8 @@ enum class FsckClass : uint8_t
                    /// `pending` row is counted here only after its deletion intent was read and found.
     AwaitingGc,    /// edges still in the GC snapshot (drop/reclaim not folded yet) or GC never ran — EXPECTED
     Unaccounted,   /// absent from the whole GC view — transient for a fast create+drop between rounds;
-                   /// PERSISTENT occurrences should be impossible (INV-2 reachability-before-content)
+                   /// PERSISTENT occurrences should be impossible (INV-2 reachability-before-content).
+                   /// Also a key under `blobs/` that is not a blob key of this pool
     StaleEdge,     /// every source edge the GC snapshot still holds on this blob names a manifest that no
                    /// longer exists anywhere in the pool, so the matching `-1` can never fold: the blob's
                    /// in-degree can never reach zero and the incremental GC can never reclaim it. Only a
@@ -135,7 +136,7 @@ struct FsckReport
     uint64_t unreachable = 0;
     uint64_t pending_gc = 0;     /// blobs in the retired set — deletion scheduled (expected)
     uint64_t awaiting_gc = 0;    /// blobs whose drop is not folded yet / GC never ran (expected)
-    uint64_t unaccounted = 0;    /// blobs outside the GC view (transient or anomaly)
+    uint64_t unaccounted = 0;    /// blobs outside the GC view (transient or anomaly), and keys under `blobs/` that are no blob key
     /// Blobs whose every remaining source edge names a manifest that no longer exists — permanently
     /// stuck at a nonzero in-degree, unreclaimable by the incremental GC. A hard ERROR (see
     /// `FsckClass::StaleEdge`). Populated only in `detail` mode: naming the live sources costs one GET
