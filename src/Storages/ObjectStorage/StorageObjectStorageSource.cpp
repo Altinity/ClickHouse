@@ -1190,8 +1190,11 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         bool skip_object = false;
         if (query_condition_cache && !object_info->file_bucket_info)
         {
-            /// A hit that drops every row group never GETs. The key contains the ETag, and an
-            /// identity-cache hit still has the previous one, so confirm it before dropping the file.
+            /// The key contains the ETag, and an identity-cache hit still has the previous one. A hit
+            /// then describes the previous object: dropping the file would skip a replaced object, and
+            /// keeping only some row groups would apply the previous object's row-group selection to the
+            /// replaced one once a later step re-reads the ETag. Confirm it with a HEAD before using any
+            /// hit, then look the marks up again under the confirmed ETag.
             /// Data-lake keys do not contain the ETag. One confirmation is enough: the HEAD clears
             /// `is_from_identity_cache`.
             for (size_t attempt = 0; attempt < 2; ++attempt)
@@ -1203,6 +1206,25 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
                         storage_id.uuid, *query_condition_cache_key, *format_filter_info->condition_hash);
                 if (!matching_marks.has_value())
                     break;
+
+                const auto metadata_now = object_info->getObjectMetadata();
+                if (attempt == 0 && metadata_now && metadata_now->is_from_identity_cache
+                    && !configuration->isDataLakeConfiguration())
+                {
+                    revalidateIdentityCachedObjectMetadata(*object_info, object_storage);
+
+                    /// The empty-file check above already ran, against the previous size. A replaced
+                    /// object can be empty, and reading it throws for formats such as Parquet.
+                    /// `s3_skip_empty_files` defaults to true.
+                    const auto refreshed = object_info->getObjectMetadata();
+                    if (query_settings.skip_empty_files && refreshed
+                        && refreshed->is_size_known && refreshed->size_bytes == 0)
+                    {
+                        skip_object = true;
+                        break;
+                    }
+                    continue;
+                }
 
                 const auto & marks = *matching_marks;
                 size_t total_row_groups = marks.size();
@@ -1231,25 +1253,6 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
                         if (!filtered)
                             drops_object = true;
                     }
-                }
-
-                const auto metadata_now = object_info->getObjectMetadata();
-                if (drops_object && attempt == 0 && metadata_now && metadata_now->is_from_identity_cache
-                    && !configuration->isDataLakeConfiguration())
-                {
-                    revalidateIdentityCachedObjectMetadata(*object_info, object_storage);
-
-                    /// The empty-file check above already ran, against the previous size. A replaced
-                    /// object can be empty, and reading it throws for formats such as Parquet.
-                    /// `s3_skip_empty_files` defaults to true.
-                    const auto refreshed = object_info->getObjectMetadata();
-                    if (query_settings.skip_empty_files && refreshed
-                        && refreshed->is_size_known && refreshed->size_bytes == 0)
-                    {
-                        skip_object = true;
-                        break;
-                    }
-                    continue;
                 }
 
                 skip_object = drops_object;
