@@ -1,5 +1,27 @@
 #include <Utils.h>
 
+#include <Disks/DiskObjectStorage/DiskObjectStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
+#include <Common/Exception.h>
+
+#include <boost/program_options/parsers.hpp>
+
+namespace DB::ErrorCodes
+{
+extern const int BAD_ARGUMENTS;
+}
+
+DB::ContentAddressedMetadataStorage & DB::contentAddressedStorageOf(IDisk & disk, std::string_view command)
+{
+    auto * dos = dynamic_cast<DiskObjectStorage *>(&disk);
+    if (!dos)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "{}: '{}' is not an object-storage disk", command, disk.getName());
+    auto * ca = dynamic_cast<ContentAddressedMetadataStorage *>(dos->getMetadataStorage().get());
+    if (!ca)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "{}: disk '{}' is not content-addressed", command, disk.getName());
+    return *ca;
+}
+
 std::vector<std::string> splitOnUnquotedSemicolons(const std::string & input)
 {
     std::vector<std::string> results;
@@ -66,4 +88,21 @@ std::vector<std::string> splitOnUnquotedSemicolons(const std::string & input)
     }
 
     return results;
+}
+
+bool queryRunsCasMigratePool(const std::string & query)
+{
+    size_t commands = 0;
+    bool runs_tool = false;
+    for (const auto & subquery : splitOnUnquotedSemicolons(query))
+    {
+        const auto words = boost::program_options::split_unix(subquery, std::string(disks_word_break_characters));
+        commands += !words.empty();
+        runs_tool = runs_tool || (!words.empty() && words.front() == "cas-migrate-pool");
+    }
+    if (runs_tool && commands > 1)
+        throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+            "cas-migrate-pool must be the only command of --query: it keeps every content-addressed disk of the process "
+            "from opening its pool, so no other command can run beside it");
+    return runs_tool;
 }

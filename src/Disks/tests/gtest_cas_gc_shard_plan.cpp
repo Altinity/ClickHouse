@@ -69,7 +69,7 @@ TEST(CASGCShardScatter, DisjointCoverageOverManyHashes)
         EXPECT_TRUE(seen[s]) << "shard " << s << " received no hashes (dead shard)";
 }
 
-/// ---- ShardReducer tests (Phase 4, Task 4) ----
+/// ---- per-shard fold tests (Phase 4, Task 4) ----
 
 /// Build two blob hashes that route to DIFFERENT shards under gc_shards=2.
 /// Returns {hash_for_shard0, hash_for_shard1}.
@@ -84,13 +84,13 @@ static std::pair<BlobRef, BlobRef> makeTwoShardHashes()
             BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(h1)}};
 }
 
-/// `ShardReducer::reduce` merges deltas into the correct per-shard in-degree run.
+/// `foldDeltasIntoGeneration` merges each shard's deltas into that shard's in-degree run.
 ///
 /// Scenario: scatter (+1 b1, +1 b1, -1 b1, +1 b2) across two shards.
 ///   - b1 routes to shard 0; net = +2 - 1 = 1; in-degree after reduce = 1.
 ///   - b2 routes to shard 1; net = +1; in-degree after reduce = 1.
 ///   - Each reducer touches ONLY its own shard's key space.
-TEST(CASGCShardReducer, MergesDeltasToInDegree)
+TEST(CASGCShardFold, MergesDeltasToInDegree)
 {
     const auto [b1, b2] = makeTwoShardHashes();
     ASSERT_EQ(blobShard(b1, 2), 0u) << "b1 must route to shard 0";
@@ -133,18 +133,12 @@ TEST(CASGCShardReducer, MergesDeltasToInDegree)
     CasOperation op = requests.admit();
     const Layout layout("p");
 
-    ShardReducer r0(0, 2);
-    ShardReducer r1(1, 2);
-
-    EXPECT_TRUE(r0.owns(b1)) << "r0 must own b1";
-    EXPECT_FALSE(r0.owns(b2)) << "r0 must not own b2";
-    EXPECT_TRUE(r1.owns(b2)) << "r1 must own b2";
-    EXPECT_FALSE(r1.owns(b1)) << "r1 must not own b1";
-
-    const auto runs0 = r0.reduce(op, layout, /*prior_runs=*/{}, /*new_generation=*/1, /*attempt=*/0,
-                                 std::move(buckets[0]));
-    const auto runs1 = r1.reduce(op, layout, /*prior_runs=*/{}, /*new_generation=*/1, /*attempt=*/0,
-                                 std::move(buckets[1]));
+    std::vector<RunRef> runs0;
+    std::vector<RunRef> runs1;
+    runs0.push_back(foldDeltasIntoGeneration(
+        op, layout, /*prior_runs=*/{}, foldParent(0, 2), /*new_generation=*/1, /*attempt=*/0, /*shard=*/0, std::move(buckets[0])));
+    runs1.push_back(foldDeltasIntoGeneration(
+        op, layout, /*prior_runs=*/{}, foldParent(0, 2), /*new_generation=*/1, /*attempt=*/0, /*shard=*/1, std::move(buckets[1])));
 
     ASSERT_EQ(runs0.size(), 1u) << "shard-0 reduce must produce exactly one RunRef";
     ASSERT_EQ(runs1.size(), 1u) << "shard-1 reduce must produce exactly one RunRef";
@@ -163,32 +157,6 @@ TEST(CASGCShardReducer, MergesDeltasToInDegree)
         << "shard-0 run must not mention b2";
     EXPECT_EQ(inDegreeInRuns(*backend, runs1, b1), 0)
         << "shard-1 run must not mention b1";
-}
-
-/// `ShardReducer::owns` partitions the blob hash space: for any hash, exactly ONE reducer among
-/// {r0, r1} owns it (union == all, intersection == empty).
-TEST(CASGCShardReducer, TwoReducersCoverDisjointShards)
-{
-    constexpr uint64_t kNumHashes = 4096;
-    constexpr uint64_t kGcShards = 2;
-
-    ShardReducer r0(0, kGcShards);
-    ShardReducer r1(1, kGcShards);
-
-    for (uint64_t i = 0; i < kNumHashes; ++i)
-    {
-        const UInt128 h = (static_cast<UInt128>(i * 0x9e3779b97f4a7c15ULL) << 64)
-                        | static_cast<UInt128>(i * 0x6c62272e07bb0142ULL);
-        const BlobRef href{BlobHashAlgo::CityHash128, BlobDigest::fromU128(h)};
-        const bool o0 = r0.owns(href);
-        const bool o1 = r1.owns(href);
-
-        /// Exactly one of the two reducers must own every hash.
-        ASSERT_TRUE(o0 || o1)
-            << "hash " << i << " is owned by neither shard (gap in coverage)";
-        ASSERT_FALSE(o0 && o1)
-            << "hash " << i << " is owned by BOTH shards (overlap in coverage)";
-    }
 }
 
 /// ---- manifestCleanupShard tests (Phase 4, Task 5) ----
@@ -278,9 +246,9 @@ TEST(CASGCShardCleanup, DisjointWorkerCoverage)
 }
 
 /// The sharded fold (gc_shards > 1) partitions a flat `BlobDelta` stream by `blobShard` and folds
-/// each bucket via its own `ShardReducer`, exactly as `Gc::fold` does. This test replicates that
-/// partition-and-reduce step over `gc_shards = 2` and asserts each blob's in-degree lands in its
-/// owning shard's run and nowhere else. (The full two-replica round is covered by Task 8.)
+/// each bucket via `foldDeltasIntoGeneration` for its shard, exactly as `Gc::fold` does. This test
+/// replicates that partition-and-reduce step over `gc_shards = 2` and asserts each blob's in-degree
+/// lands in its owning shard's run and nowhere else. (The full two-replica round is covered by Task 8.)
 TEST(CASGCShardCoordinator, ShardedFoldRoutesDeltasToOwningShards)
 {
     constexpr uint64_t kGcShards = 2;
@@ -309,9 +277,8 @@ TEST(CASGCShardCoordinator, ShardedFoldRoutesDeltasToOwningShards)
     std::vector<std::vector<RunRef>> shard_runs(kGcShards);
     for (uint64_t shard = 0; shard < kGcShards; ++shard)
     {
-        ShardReducer reducer{shard, kGcShards};
-        shard_runs[shard] = reducer.reduce(op, layout, /*prior_runs=*/{}, /*new_generation=*/1, /*attempt=*/0,
-                                           std::move(buckets[shard]));
+        shard_runs[shard].push_back(foldDeltasIntoGeneration(
+            op, layout, /*prior_runs=*/{}, foldParent(0, kGcShards), /*new_generation=*/1, /*attempt=*/0, shard, std::move(buckets[shard])));
     }
 
     EXPECT_EQ(inDegreeInRuns(*backend, shard_runs[0], b0), 1)
@@ -441,10 +408,9 @@ TEST(CASGCShardEquivalence, SingleShardMatchesPhase1dInDegree)
 /// ---- Phase 4, Task 8: two-replica disjoint-shard concurrency ----
 ///
 /// With gc_shards=2 over a shared `InMemoryBackend`:
-///   (a) DISJOINTNESS: a shard-0 reducer's product covers only hashes routing to shard 0; shard-1
-///       covers only hashes routing to shard 1 (`owns` check).
+///   (a) DISJOINTNESS: each blob routes to exactly one shard (`blobShard` check).
 ///   (b) PER-SHARD RUNS: each reducer writes its own write-once blob-target run; the runs for the two
-///       shards are disjoint object keys and durably present after each `ShardReducer::reduce`.
+///       shards are disjoint object keys and durably present after each shard's fold.
 ///   (c) MERGED IN-DEGREE: the merged in-degrees across both shards equal the expected edge multiset,
 ///       and each blob is absent from the other shard's run (cross-shard disjointness).
 ///
@@ -467,15 +433,6 @@ TEST(CASGCShardTwoReplica, DisjointShardsConcurrentPerShardRuns)
     CasOperation op = requests.admit();
     const Layout layout("p");
 
-    /// (a) DISJOINTNESS — verify `owns` predicate before any reduce.
-    ShardReducer r0(0, kGcShards);
-    ShardReducer r1(1, kGcShards);
-
-    EXPECT_TRUE(r0.owns(b0))  << "shard-0 reducer must own b0";
-    EXPECT_FALSE(r0.owns(b1)) << "shard-0 reducer must NOT own b1";
-    EXPECT_TRUE(r1.owns(b1))  << "shard-1 reducer must own b1";
-    EXPECT_FALSE(r1.owns(b1) && r0.owns(b1)) << "no hash may be owned by both reducers";
-
     /// Construct disjoint delta streams: b0 gets net +2 in shard 0; b1 gets net +1 in shard 1.
     /// In production these buckets are produced by `foldManifestEdges` and partitioned by `blobShard`
     /// (two distinct manifests both referencing b0 contribute two source edges; one manifest
@@ -491,19 +448,23 @@ TEST(CASGCShardTwoReplica, DisjointShardsConcurrentPerShardRuns)
     /// (b) PER-SHARD RUNS — drive both reducers.
     ///
     /// Run shard-0 reducer (simulates the shard-0 replica's work).
-    const auto runs0 = r0.reduce(op, layout, /*prior_runs=*/{}, kNewGen, kAttempt, std::move(bucket0));
+    std::vector<RunRef> runs0;
+    runs0.push_back(foldDeltasIntoGeneration(
+        op, layout, /*prior_runs=*/{}, foldParent(0, 2), kNewGen, kAttempt, /*shard=*/0, std::move(bucket0)));
     ASSERT_FALSE(runs0.empty()) << "shard-0 reducer must produce at least one RunRef";
 
     /// Run shard-1 reducer (simulates the shard-1 replica's work, interleaved from the test thread).
-    const auto runs1 = r1.reduce(op, layout, /*prior_runs=*/{}, kNewGen, kAttempt, std::move(bucket1));
+    std::vector<RunRef> runs1;
+    runs1.push_back(foldDeltasIntoGeneration(
+        op, layout, /*prior_runs=*/{}, foldParent(0, 2), kNewGen, kAttempt, /*shard=*/1, std::move(bucket1)));
     ASSERT_FALSE(runs1.empty()) << "shard-1 reducer must produce at least one RunRef";
 
     /// The blob-target runs for both shards are durably present (the reducer's write-once `putIfAbsent`),
     /// at disjoint object keys.
     EXPECT_TRUE(op.head(layout.blobTargetRunKey(kNewGen, kAttempt, /*shard=*/0, /*seq=*/0), Retry::once()).has_value())
-        << "shard-0 blob-target run must be durably written by r0.reduce";
+        << "shard-0 blob-target run must be durably written by the shard-0 fold";
     EXPECT_TRUE(op.head(layout.blobTargetRunKey(kNewGen, kAttempt, /*shard=*/1, /*seq=*/0), Retry::once()).has_value())
-        << "shard-1 blob-target run must be durably written by r1.reduce";
+        << "shard-1 blob-target run must be durably written by the shard-1 fold";
 
     /// (c) MERGED IN-DEGREE — the merged in-degrees across both shards equal the expected edge multiset.
     EXPECT_EQ(inDegreeInRuns(*backend, runs0, b0), 2)
@@ -520,7 +481,7 @@ TEST(CASGCShardTwoReplica, DisjointShardsConcurrentPerShardRuns)
 /// ---- Phase 4 regression: gc_shards>1 retire-drain (High #1) ----
 ///
 /// A FULL round-protocol regression that drives publish -> drop -> reclaim end-to-end under
-/// `gc_shards = 2` with a droppable blob owned by a NON-zero shard. The fold/`ShardReducer` write one
+/// `gc_shards = 2` with a droppable blob owned by a NON-zero shard. The per-shard folds write one
 /// in-degree run PER shard, so a zero-in-degree blob owned by shard 1..N is only ever retired (and
 /// then exact-token deleted) if `retire`/`previewDeletes` scan EVERY blob-target shard. Before
 /// `5f5fa5f7906` both hardcoded shard 0: a shard-1 candidate was never scanned, never retired, and

@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestBudget.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Common/Exception.h>
@@ -8,8 +9,10 @@
 #include <Poco/AutoPtr.h>
 #include <Poco/StreamChannel.h>
 #include <Poco/Util/XMLConfiguration.h>
+#include <filesystem>
 #include <limits>
 #include <sstream>
+#include <unistd.h>
 
 using namespace DB;
 
@@ -31,6 +34,8 @@ namespace DB::ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 gc_interval_sec;
     extern const ContentAddressedSettingsUInt64 gc_bulk_delete_chunk_keys;
     extern const ContentAddressedSettingsUInt64 gc_round_graduation_budget;
+    extern const ContentAddressedSettingsUInt64 gc_meta_pool_size;
+    extern const ContentAddressedSettingsUInt64 gc_round_intent_create_budget;
     extern const ContentAddressedSettingsUInt64 gc_round_redelete_budget;
     extern const ContentAddressedSettingsUInt64 gc_round_ref_cleanup_budget;
     extern const ContentAddressedSettingsUInt64 gc_round_handoff_prefix_wholesale_budget;
@@ -38,6 +43,7 @@ namespace DB::ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 gc_round_sweep_namespace_budget;
     extern const ContentAddressedSettingsUInt64 gc_round_sweep_recovery_op_budget;
     extern const ContentAddressedSettingsUInt64 gc_round_prefix_wholesale_budget;
+    extern const ContentAddressedSettingsUInt64 intent_sweep_list_budget_keys;
     extern const ContentAddressedSettingsUInt64 mount_lease_ttl_ms;
     extern const ContentAddressedSettingsUInt64 mount_renew_period_ms;
     extern const ContentAddressedSettingsUInt64 request_window_ms;
@@ -56,39 +62,10 @@ Poco::AutoPtr<Poco::Util::XMLConfiguration> makeConfig(const std::string & inner
 
 const auto identity_macros = [](const std::string & s) { return s; };
 
-class ScopedCasSettingsLogCapture
+/// Every capture of this file reads the settings logger at `warning`.
+struct ScopedCasSettingsLogCapture : Cas::tests::ScopedLogCapture
 {
-public:
-    ScopedCasSettingsLogCapture()
-        : logger(getLogger("ContentAddressedSettings"))
-        , channel(new Poco::StreamChannel(stream))
-        , old_channel(logger->getChannel(), /*shared=*/true)
-        , old_level(logger->getLevel())
-    {
-        logger->setChannel(channel.get());
-        logger->setLevel("warning");
-    }
-
-    ~ScopedCasSettingsLogCapture()
-    {
-        logger->setChannel(old_channel);
-        logger->setLevel(old_level);
-    }
-
-    String captured() const
-    {
-        return stream.str();
-    }
-
-private:
-    LoggerPtr logger;
-    std::ostringstream stream;
-    Poco::AutoPtr<Poco::StreamChannel> channel;
-    /// `shared=true` above is load-bearing: `AutoPtr(ptr)` would STEAL a reference the fixture
-    /// never owned, undercounting the previous channel once per capture. The extra reference also
-    /// keeps the parked channel alive while the capture channel is installed.
-    Poco::AutoPtr<Poco::Channel> old_channel;
-    int old_level;
+    ScopedCasSettingsLogCapture() : ScopedLogCapture("ContentAddressedSettings", "warning") {}
 };
 
 size_t countOccurrences(const String & haystack, const String & needle)
@@ -139,7 +116,7 @@ TEST(CASContentAddressedSettings, GcRoundBudgetsDefaultToUnbounded)
     EXPECT_EQ(s[ContentAddressedSetting::gc_round_outcome_entry_budget].value, 0u);
 
     const Cas::PoolConfig pool_config;
-    EXPECT_EQ(pool_config.gc_round_graduation_budget, 0u);
+    EXPECT_EQ(pool_config.gc_round_intent_create_budget, 0u);
     EXPECT_EQ(pool_config.gc_round_redelete_budget, 0u);
     EXPECT_EQ(pool_config.gc_round_ref_cleanup_budget, 0u);
     EXPECT_EQ(pool_config.gc_round_handoff_prefix_wholesale_budget, 0u);
@@ -148,6 +125,97 @@ TEST(CASContentAddressedSettings, GcRoundBudgetsDefaultToUnbounded)
     EXPECT_EQ(s[ContentAddressedSetting::gc_round_sweep_namespace_budget].value, 20u);
     EXPECT_EQ(s[ContentAddressedSetting::gc_round_sweep_recovery_op_budget].value, 5000u);
     EXPECT_EQ(s[ContentAddressedSetting::gc_round_prefix_wholesale_budget].value, 20000u);
+}
+
+TEST(CASContentAddressedSettings, IntentCreateBudgetDefaultsToUnbounded)
+{
+    auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id>");
+    ContentAddressedSettings s;
+    s.loadFromConfig(*cfg, "disk", "/data", "/data/default_scratch", identity_macros);
+    EXPECT_EQ(s[ContentAddressedSetting::gc_round_intent_create_budget].value, 0u);
+    EXPECT_EQ(Cas::PoolConfig{}.gc_round_intent_create_budget, 0u);
+}
+
+TEST(CASContentAddressedSettings, IntentCreateBudgetReachesThePool)
+{
+    const auto scratch = std::filesystem::temp_directory_path() / ("ca_intent_budget_scratch_" + std::to_string(::getpid()));
+    auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id><cas_gc_round_intent_create_budget>7</cas_gc_round_intent_create_budget>");
+    ContentAddressedSettings settings;
+    settings.loadFromConfig(*cfg, "disk", scratch.string(), scratch.string(), identity_macros);
+    ASSERT_EQ(settings[ContentAddressedSetting::gc_round_intent_create_budget].value, 7u) << "the external key loads";
+
+    auto storage = std::make_shared<ContentAddressedMetadataStorage>(
+        Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "", nullptr, settings);
+    storage->startup();
+    const auto pool = storage->poolForTest();
+    ASSERT_NE(pool, nullptr);
+    EXPECT_EQ(pool->poolConfig().gc_round_intent_create_budget, 7u);
+}
+
+namespace
+{
+
+/// The pool config a disk configured with `extra` opens with.
+Cas::PoolConfig poolConfigOf(const String & extra, const String & scratch_name)
+{
+    const auto scratch = std::filesystem::temp_directory_path() / (scratch_name + "_" + std::to_string(::getpid()));
+    auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id>" + extra);
+    ContentAddressedSettings settings;
+    settings.loadFromConfig(*cfg, "disk", scratch.string(), scratch.string(), identity_macros);
+    auto storage = std::make_shared<ContentAddressedMetadataStorage>(
+        Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "", nullptr, settings);
+    storage->startup();
+    const auto pool = storage->poolForTest();
+    if (!pool)
+        throw std::runtime_error("the disk opened no pool");
+    return pool->poolConfig();
+}
+
+}
+
+TEST(CASContentAddressedSettings, RetiredGcSettingsStillLoad)
+{
+    const Cas::PoolConfig defaults;
+    const Cas::PoolConfig configured = poolConfigOf("<cas_gc_meta_pool_size>9</cas_gc_meta_pool_size>", "ca_retired_settings_scratch");
+    EXPECT_EQ(configured.gc_round_intent_create_budget, defaults.gc_round_intent_create_budget);
+    EXPECT_EQ(configured.gc_round_redelete_budget, defaults.gc_round_redelete_budget);
+    EXPECT_EQ(configured.gc_io_concurrency, defaults.gc_io_concurrency);
+}
+
+TEST(CASContentAddressedSettings, RetiredCreateBudgetAppliesWhenTheNewOneIsNotSet)
+{
+    EXPECT_EQ(poolConfigOf("<cas_gc_round_graduation_budget>11</cas_gc_round_graduation_budget>", "ca_retired_budget_scratch")
+                  .gc_round_intent_create_budget, 11u);
+    EXPECT_EQ(poolConfigOf("<cas_gc_round_graduation_budget>11</cas_gc_round_graduation_budget>"
+                           "<cas_gc_round_intent_create_budget>5</cas_gc_round_intent_create_budget>", "ca_both_budgets_scratch")
+                  .gc_round_intent_create_budget, 5u) << "the new setting wins";
+}
+
+TEST(CASContentAddressedSettings, IntentSweepPageReachesThePool)
+{
+    const auto scratch = std::filesystem::temp_directory_path() / ("ca_intent_sweep_scratch_" + std::to_string(::getpid()));
+    auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id><cas_intent_sweep_list_budget_keys>7</cas_intent_sweep_list_budget_keys>");
+    ContentAddressedSettings settings;
+    settings.loadFromConfig(*cfg, "disk", scratch.string(), scratch.string(), identity_macros);
+    ASSERT_EQ(settings[ContentAddressedSetting::intent_sweep_list_budget_keys].value, 7u) << "the external key loads";
+    EXPECT_NE(Cas::PoolConfig{}.intent_sweep_list_budget_keys, 7u) << "the default would hide a lost value";
+
+    auto storage = std::make_shared<ContentAddressedMetadataStorage>(
+        Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "", nullptr, settings);
+    storage->startup();
+    const auto pool = storage->poolForTest();
+    ASSERT_NE(pool, nullptr);
+    EXPECT_EQ(pool->poolConfig().intent_sweep_list_budget_keys, 7u);
+}
+
+TEST(CASContentAddressedSettings, IntentSweepPageOutsideOneListResponseIsRefused)
+{
+    for (const String value : {"0", "1000"})
+        expectLoadFailureWithExactMessage(
+            "<cas_server_root_id>srv1</cas_server_root_id><cas_intent_sweep_list_budget_keys>" + value
+                + "</cas_intent_sweep_list_budget_keys>",
+            ErrorCodes::BAD_ARGUMENTS,
+            "content_addressed disk: cas_intent_sweep_list_budget_keys must be between 1 and 999 (got " + value + ")");
 }
 
 TEST(CASContentAddressedSettings, PackedPartsDefaultOffAndOptIn)
@@ -322,6 +390,38 @@ TEST(CASContentAddressedSettings, LegacySpellingStillLoadsDuringMigrationWindow)
     ContentAddressedSettings s;
     s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros);
     EXPECT_EQ(s[ContentAddressedSetting::gc_shards].value, 4u);
+}
+
+/// A retired key in the configuration warns whatever its value, since the key itself is what the operator removes.
+TEST(CASContentAddressedSettings, RetiredGcSettingsWarnWhenSet)
+{
+    const auto warningOf = [](const String & extra)
+    {
+        auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id>" + extra);
+        ContentAddressedSettings s;
+        ScopedCasSettingsLogCapture capture;
+        s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros);
+        return capture.captured();
+    };
+
+    const String meta = warningOf("<cas_gc_meta_pool_size>9</cas_gc_meta_pool_size>");
+    EXPECT_NE(meta.find("`cas_gc_meta_pool_size` is ignored"), String::npos) << meta;
+    EXPECT_EQ(meta.find("cas_gc_round_graduation_budget"), String::npos) << meta;
+
+    const String carried = warningOf("<cas_gc_round_graduation_budget>11</cas_gc_round_graduation_budget>");
+    EXPECT_NE(carried.find("its value 11 applies to `cas_gc_round_intent_create_budget`"), String::npos) << carried;
+    EXPECT_EQ(carried.find("cas_gc_meta_pool_size"), String::npos) << carried;
+
+    const String both = warningOf("<cas_gc_round_graduation_budget>11</cas_gc_round_graduation_budget>"
+                                  "<cas_gc_round_intent_create_budget>5</cas_gc_round_intent_create_budget>");
+    EXPECT_NE(both.find("`cas_gc_round_graduation_budget` is retired and ignored, because "
+                        "`cas_gc_round_intent_create_budget` is set"), String::npos) << both;
+
+    const String defaults = warningOf("<cas_gc_meta_pool_size>16</cas_gc_meta_pool_size>"
+                                      "<cas_gc_round_graduation_budget>0</cas_gc_round_graduation_budget>");
+    EXPECT_NE(defaults.find("`cas_gc_meta_pool_size` is ignored"), String::npos) << defaults;
+    EXPECT_NE(defaults.find("its value 0 applies to `cas_gc_round_intent_create_budget`"), String::npos) << defaults;
+    EXPECT_EQ(warningOf("").find("cas_gc_"), String::npos);
 }
 
 TEST(CASContentAddressedSettings, PartialMigrationLoadsAndReportsEveryLegacyKey)

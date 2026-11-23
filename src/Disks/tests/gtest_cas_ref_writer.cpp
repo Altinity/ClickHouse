@@ -987,7 +987,7 @@ TEST(CASRefWriterNonMinting, ListRefsOnAbsentNamespaceDoesNotMutateCatalog)
     const auto catalog_after = readOf(backend, layout.refCatalogKey());
     ASSERT_TRUE(catalog_after);
     EXPECT_EQ(catalog_after->bytes, catalog_before->bytes);
-    EXPECT_EQ(catalog_after->etag, catalog_before->etag);
+    EXPECT_EQ(tokenText(catalog_after->etag), tokenText(catalog_before->etag));
 }
 
 TEST(CASRefWriterRuntimeIdentity, ColdReadRejectsCatalogLifeReplacedWithoutLocalInvalidation)
@@ -1186,7 +1186,7 @@ TEST(CASRefWriterNonMinting, ResolveRefOnAbsentNamespaceDoesNotMutateCatalog)
     const auto catalog_after = readOf(backend, layout.refCatalogKey());
     ASSERT_TRUE(catalog_after);
     EXPECT_EQ(catalog_after->bytes, catalog_before->bytes);
-    EXPECT_EQ(catalog_after->etag, catalog_before->etag);
+    EXPECT_EQ(tokenText(catalog_after->etag), tokenText(catalog_before->etag));
 }
 
 TEST(CASRefWriterNonMinting, DropNamespaceOnAbsentNamespaceDoesNotMutateCatalog)
@@ -1208,7 +1208,7 @@ TEST(CASRefWriterNonMinting, DropNamespaceOnAbsentNamespaceDoesNotMutateCatalog)
     const auto catalog_after = readOf(backend, layout.refCatalogKey());
     ASSERT_TRUE(catalog_after);
     EXPECT_EQ(catalog_after->bytes, catalog_before->bytes);
-    EXPECT_EQ(catalog_after->etag, catalog_before->etag);
+    EXPECT_EQ(tokenText(catalog_after->etag), tokenText(catalog_before->etag));
 }
 
 /// A table born by a log tail alone (no snapshot yet): `namespace_birth` with nothing else is a legal
@@ -2777,7 +2777,7 @@ TEST(CASRefWriteContract, CommittedSurfacesTheIncarnationFromTheWriteAndFromTheS
     CasOperation reader = requests.admit();
     const auto observed = reader.head("k1", Retry::standard());
     ASSERT_TRUE(observed.has_value());
-    EXPECT_EQ(direct_committed->etag, observed->etag)
+    EXPECT_EQ(tokenText(direct_committed->etag), tokenText(observed->etag))
         << "the direct-commit incarnation is the write's own response";
 
     /// The write of `k2` lands and its response is lost: the settling read proves the commit, and the
@@ -2791,7 +2791,7 @@ TEST(CASRefWriteContract, CommittedSurfacesTheIncarnationFromTheWriteAndFromTheS
     CasOperation second_reader = requests.admit();
     const auto second_observed = second_reader.head("k2", Retry::standard());
     ASSERT_TRUE(second_observed.has_value());
-    EXPECT_EQ(resolved_committed->etag, second_observed->etag)
+    EXPECT_EQ(tokenText(resolved_committed->etag), tokenText(second_observed->etag))
         << "the resolve-commit incarnation is the observed one";
 }
 
@@ -2993,7 +2993,7 @@ TEST(CASRefWriterSnapshotPublish, CapturedPredecessorCannotPublishAfterSameNameR
         << "a stale publisher recreated the retired predecessor snapshot";
     const auto predecessor_ckpt_after_resume = readOf(backend, layout.refCkptKey(predecessor_life));
     ASSERT_TRUE(predecessor_ckpt_after_resume);
-    EXPECT_EQ(predecessor_ckpt_after_resume->etag, predecessor_ckpt_before_resume->etag)
+    EXPECT_EQ(tokenText(predecessor_ckpt_after_resume->etag), tokenText(predecessor_ckpt_before_resume->etag))
         << "a stale publisher replaced the retired predecessor checkpoint";
     EXPECT_EQ(predecessor_ckpt_after_resume->bytes, predecessor_ckpt_before_resume->bytes)
         << "a stale publisher changed the retired predecessor checkpoint";
@@ -3081,7 +3081,7 @@ TEST(CASRefWriterSnapshotPublish, RetiredPredecessorCannotAdvanceCkptAfterSnapsh
 
     const auto predecessor_ckpt_after_resume = readOf(backend, layout.refCkptKey(predecessor_life));
     ASSERT_TRUE(predecessor_ckpt_after_resume);
-    EXPECT_EQ(predecessor_ckpt_after_resume->etag, predecessor_ckpt_before_resume->etag);
+    EXPECT_EQ(tokenText(predecessor_ckpt_after_resume->etag), tokenText(predecessor_ckpt_before_resume->etag));
     EXPECT_EQ(predecessor_ckpt_after_resume->bytes, predecessor_ckpt_before_resume->bytes);
     EXPECT_EQ(store->refTableRuntimeIdentityForTest(ns), successor_runtime);
     EXPECT_TRUE(store->resolveRef(ns, "successor"));
@@ -4967,7 +4967,6 @@ TEST(CASRefWriterNamespaceRemoval, RowTurnedRemovingUnderAnOpenLaneKeepsItsAppen
     EXPECT_EQ(listLogIdsForTest(*backend, layout, ns), logs);
     EXPECT_TRUE(readOf(backend, layout.manifestKey(late_id)));
     EXPECT_TRUE(readOf(backend, layout.blobKey(blob)));
-    EXPECT_TRUE(readOf(backend, layout.blobMetaKey(blob)));
     EXPECT_GT(ProfileEvents::global_counters[ProfileEvents::CASGCStuckRemovals], stuck);
     /// The GC rounds read the row as `Removing` and closed this pool's runtime.
     EXPECT_FALSE(store->resolveRef(ns, "late"));
@@ -5184,7 +5183,7 @@ TEST(CASRefWriterNamespaceRemoval, GenericTerminalOnAbsentNamePerformsZeroDurabl
     EXPECT_EQ(backend->writeTotal(), 0u);
     EXPECT_EQ(backend->deleteTotal(), 0u);
     const CasRefCatalog::Snapshot catalog_after = readCatalogForTest(backend, store->layout());
-    EXPECT_EQ(catalog_after.etag, catalog_before.etag);
+    EXPECT_EQ(tokenText(catalog_after.etag), tokenText(catalog_before.etag));
     EXPECT_EQ(catalog_after.catalog, catalog_before.catalog);
     EXPECT_FALSE(store->refTableLifeForTest(ns));
 }
@@ -5395,24 +5394,24 @@ TEST(CASRefWriterNamespaceRemoval, ResolveReadProvingRemovingLeavesNoUnresolvedW
 
     backend->catalog_fault_key = layout.refCatalogKey();
     backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::HoldUncommitted;
-    /// The resolve read follows the loop's last read with no pause in between, so it is the first catalog
-    /// read that finds the clock unmoved since the previous one. The loop's own mismatch re-read can
-    /// also find it unmoved, so the release time is checked against the window below.
-    std::optional<uint64_t> previous_read_ms;
+    /// Inside the loop every catalog read follows a catalog write, so the resolve read in the catch is the first
+    /// catalog read whose previous catalog request is also a read. A pause can separate the two: after its last
+    /// pause the loop may give up without sending anything.
     std::optional<uint64_t> released_at_ms;
     bool applied_by_resolve_read = false;
     backend->read_observer = [&](const String & key)
     {
-        if (key != layout.refCatalogKey() || !backend->catalog_cas_fault_fired)
+        if (key != layout.refCatalogKey() || !backend->catalog_cas_fault_fired || applied_by_resolve_read)
             return;
-        const uint64_t now = clock->nowMs();
-        if (!applied_by_resolve_read && previous_read_ms == now)
-        {
-            applied_by_resolve_read = true;
-            released_at_ms = now;
-            backend->releaseHeldCatalogWrite();
-        }
-        previous_read_ms = now;
+        /// The journal already ends with this read.
+        const std::vector<String> journal = backend->requestJournal();
+        const auto previous = std::find_if(std::next(journal.rbegin()), journal.rend(),
+            [&](const String & request) { return request.ends_with(" " + key); });
+        if (previous == journal.rend() || *previous != "GET " + key)
+            return;
+        applied_by_resolve_read = true;
+        released_at_ms = clock->nowMs();
+        backend->releaseHeldCatalogWrite();
     };
     /// Wedge the terminal append so the runtime stays between `Removing` and the terminal transaction.
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
@@ -5422,9 +5421,11 @@ TEST(CASRefWriterNamespaceRemoval, ResolveReadProvingRemovingLeavesNoUnresolvedW
 
     ASSERT_TRUE(applied_by_resolve_read) << "the kept write was never applied before the resolve read";
     ASSERT_TRUE(released_at_ms.has_value());
-    /// The loop gives up once the next pause no longer fits in the window, so at most one backoff draw
-    /// before its end. An earlier release came from a read inside the loop.
-    EXPECT_GE(*released_at_ms - drop_started_ms, kDefaultRequestWindowMs - kMaxBackoffDrawMs)
+    /// The loop gives up once the next pause plus the room `CasOperation::pauseBeforeRedecide` reserves for the
+    /// next decision's read and write no longer fits in the window. An earlier release came from a read inside the loop.
+    const uint64_t next_decision_reservation_ms = 2 * store->mountRequests().attemptReservationMs();
+    EXPECT_GE(*released_at_ms - drop_started_ms,
+              kDefaultRequestWindowMs - kMaxBackoffDrawMs - next_decision_reservation_ms)
         << "the kept write was released inside the transition's retry loop, before it gave up; "
            "the resolve read in the catch was not what applied it";
     EXPECT_EQ(catalogEntryOrThrow(backend, layout, ns).state, NsState::Removing);

@@ -71,6 +71,17 @@ GCS_MOCK_NAMESPACE = runpy.run_path(
 )
 
 
+# The key and the record of a deletion intent as `gtest_cas_blob_intent.cpp` pins them
+# (`GoldenIntentKeyAndRecordMatchTheGcsMock`). Change one side and the other fails.
+GOLDEN_INTENT_POOL = "p"
+GOLDEN_INTENT_BLOB = "ch128/00/00112233445566778899aabbccddeeff"
+GOLDEN_INTENT_GENERATION = "1699999999999999"
+GOLDEN_INTENT_KEY = (
+    "p/blob-intents/ch128/00/00112233445566778899aabbccddeeff/generation/31363939393939393939393939393939"
+)
+GOLDEN_INTENT_RECORD = b'{"type":"cas_blob_intent","v":4}\n{}\n'
+
+
 @pytest.fixture(scope="module", autouse=True)
 def start_cluster():
     # The storage configuration is deliberately NOT passed as a main config: a CAS disk mounts at
@@ -293,8 +304,8 @@ def _minted():
 def _quiesce_merges(node, table):
     """Stop background merges of `table` and wait for the running ones to finish.
 
-    A merge publishes blobs and `.meta` markers of its own; a capture that must attribute every
-    marker create to one query has to keep merges out of the window.
+    A merge publishes blobs of its own; a capture that must attribute every blob publication to one
+    query has to keep merges out of the window.
     """
     node.query("SYSTEM STOP MERGES {}".format(table))
     for _ in range(300):
@@ -359,8 +370,30 @@ def _blob_publications(records, key=None):
     return publications
 
 
-def _meta_requests(records, blob_key):
-    return [record for record in records if record["key"] == blob_key + ".meta"]
+def _intent_prefix(blob_key):
+    """The key prefix of every deletion intent of one blob body key."""
+    return blob_key.replace("/blobs/", "/blob-intents/", 1) + "/"
+
+
+def _intent_requests(records, blob_key):
+    return [record for record in records if record["key"].startswith(_intent_prefix(blob_key))]
+
+
+def _intent_key(blob_key, generation):
+    """The intent of the incarnation `generation` of a blob: the tag is the hex of the decimal digits."""
+    return _intent_prefix(blob_key) + "generation/" + generation.encode().hex()
+
+
+def _assert_head_then_intent_get(blob_key, heads, intent_requests, status):
+    """One body `HEAD`, then one `GET` of the intent of the incarnation that `HEAD` answered, answered `status`."""
+    assert len(heads) == 1, (blob_key, heads)
+    assert len(intent_requests) == 1, (blob_key, intent_requests)
+    assert intent_requests[0]["method"] == "GET", intent_requests[0]
+    assert intent_requests[0]["key"] == _intent_key(blob_key, heads[0]["response_generation"]), (
+        blob_key, heads[0], intent_requests[0]
+    )
+    assert intent_requests[0]["status"] == status, intent_requests[0]
+    assert heads[0]["arrival_seq"] < intent_requests[0]["arrival_seq"], (heads[0], intent_requests[0])
 
 
 def _assert_default_blob_publication(record):
@@ -412,7 +445,7 @@ def _looks_default_on_oauth(record):
     return "x-amz-api-version" in record["headers"]
 
 
-@pytest.mark.parametrize("request_class", ("blob_meta", "cas_control"))
+@pytest.mark.parametrize("request_class", ("blob_intent", "cas_control"))
 @pytest.mark.parametrize(
     "method,query,headers,expected",
     (
@@ -476,14 +509,17 @@ def test_blob_publication_request_budget_and_default_mode(disk):
     """Pin the fresh and cold-duplicate request shapes for one real blob key per CAS disk.
 
     The OAuth disk publishes from local staging with an unconditional body PUT. The GOOG4 disk uses
-    explicit S3 staging and publishes with a native-only, unconditional copy. Repeating byte-identical
-    data then selects a blob that both inserts touched and proves the cold path uses one body `HEAD`,
-    one metadata GET, and no publication. The mock proves syntax, routing, and count isolation only;
-    live GCS acceptance belongs to the credential-gated Task 10 lane.
+    explicit S3 staging and publishes with a native-only, unconditional copy. A fresh blob costs one
+    `HEAD` that finds nothing and one publication, and no request on its deletion intents. Repeating
+    byte-identical data then selects a blob that both inserts touched and proves the cold path uses one
+    body `HEAD`, one `GET` of the intent of the incarnation that `HEAD` answered (absent), and no
+    publication. A blob whose incarnation has an intent is published again after the same two reads.
+    The mock proves syntax, routing, and count isolation only; live GCS acceptance belongs to the
+    credential-gated lane.
 
-    Would fail if: the mandatory blob `HEAD` were skipped or duplicated, fresh publication read meta
-    before writing, a fresh body regained a conditional request mode, `Clean` metadata stopped being
-    created, or a cold duplicate issued another body PUT/copy.
+    Would fail if: the mandatory blob `HEAD` were skipped or duplicated, fresh publication read or wrote
+    an intent, a fresh body regained a conditional request mode, a cold duplicate issued another body
+    PUT/copy or read an intent of another incarnation, or a writer wrote an intent or a `.meta` marker.
     """
     node = cluster.instances["node"]
     bucket = CAS_DISKS[disk]
@@ -520,19 +556,8 @@ def test_blob_publication_request_budget_and_default_mode(disk):
         assert len(_blob_publications(fresh, key)) == 1, (key, _blob_publications(fresh, key))
         _assert_default_blob_publication(publication)
 
-        meta = _meta_requests(fresh, key)
-        publication_seq = publication["seq"]
-        assert not [
-            r for r in meta if r["method"] == "GET" and r["seq"] < publication_seq
-        ], (key, meta)
-        creates = [
-            r
-            for r in meta
-            if r["method"] == "PUT"
-            and r["headers"].get("x-goog-if-generation-match") == "0"
-            and '"state":"clean"' in r["request_body"]
-        ]
-        assert len(creates) == 1, (key, meta)
+        assert not _intent_requests(fresh, key), (key, _intent_requests(fresh, key))
+        assert not [r for r in fresh if r["key"] == key + ".meta"], key
 
     duplicate_seq = _next_seq()
     node.query(insert)
@@ -542,52 +567,52 @@ def test_blob_publication_request_budget_and_default_mode(disk):
         heads = [
             r for r in duplicate if r["key"] == key and r["operation"] == "native_token_head"
         ]
-        meta_gets = [r for r in _meta_requests(duplicate, key) if r["method"] == "GET"]
-        if heads and meta_gets:
-            assert len(heads) == 1, (key, heads)
+        intent_requests = _intent_requests(duplicate, key)
+        if heads and intent_requests:
+            # The intent of the incarnation the `HEAD` answered does not exist.
+            _assert_head_then_intent_get(key, heads, intent_requests, 404)
             assert heads[0]["status"] == 200, heads[0]
-            assert len(meta_gets) == 1, (key, meta_gets)
             assert not _blob_publications(duplicate, key), (key, _blob_publications(duplicate, key))
             reusable.append(key)
     assert reusable, "no fresh blob was observed as a cold duplicate on the second insert"
 
     if disk == "cas_gcs_hmac":
         target = sorted(reusable)[0]
-        condemned = _condemn_blob(bucket, target)
-        assert condemned["state"] == "condemned", condemned
+        # The seam creates an intent GC did not: while it stands, a round would adopt it as an orphan and send
+        # a `HEAD` of its own on the target. The disk's GC is stopped for the window.
+        node.query("SYSTEM CAS GC STOP '{}'".format(disk))
+        try:
+            condemned = _condemn_blob(bucket, target)
+            assert condemned["state"] == "condemned", condemned
 
-        retry_seq = _next_seq()
-        node.query(insert)
-        retry = _captured_since(retry_seq, bucket)
+            retry_seq = _next_seq()
+            node.query(insert)
+            retry = _captured_since(retry_seq, bucket)
 
-        target_heads = [
-            r for r in retry if r["key"] == target and r["operation"] == "native_token_head"
-        ]
-        target_meta_gets = [r for r in _meta_requests(retry, target) if r["method"] == "GET"]
-        staging_gets = [
-            r for r in retry if r["request_class"] == "staging" and r["method"] == "GET"
-        ]
-        retagged_puts = [
-            r for r in retry if r["key"] == target and r["operation"] == "blob_put"
-        ]
-        conditional_copies = [r for r in retry if r["operation"] == "conditional_copy"]
+            target_heads = [
+                r for r in retry if r["key"] == target and r["operation"] == "native_token_head"
+            ]
+            target_intent_requests = _intent_requests(retry, target)
+            staging_gets = [
+                r for r in retry if r["request_class"] == "staging" and r["method"] == "GET"
+            ]
+            retagged_puts = [
+                r for r in retry if r["key"] == target and r["operation"] == "blob_put"
+            ]
+            conditional_copies = [r for r in retry if r["operation"] == "conditional_copy"]
 
-        assert len(target_heads) == 1, target_heads
-        assert len(target_meta_gets) == 1, target_meta_gets
-        assert len(staging_gets) == 1, staging_gets
-        assert len(retagged_puts) == 1, retagged_puts
-        assert not conditional_copies, conditional_copies
-        _assert_default_blob_publication(retagged_puts[0])
-        assert retagged_puts[0]["response_generation"] != target_heads[0]["response_generation"]
+            # The intent of the incarnation the `HEAD` answered exists, so the body is published again.
+            _assert_head_then_intent_get(target, target_heads, target_intent_requests, 200)
+            assert len(staging_gets) == 1, staging_gets
+            assert len(retagged_puts) == 1, retagged_puts
+            assert not conditional_copies, conditional_copies
+            _assert_default_blob_publication(retagged_puts[0])
+            assert retagged_puts[0]["response_generation"] != target_heads[0]["response_generation"]
 
-        clean_cas = [
-            r
-            for r in _meta_requests(retry, target)
-            if r["method"] == "PUT"
-            and r["headers"].get("x-goog-if-generation-match", "0") != "0"
-            and '"state":"clean"' in r["request_body"]
-        ]
-        assert len(clean_cas) == 1, clean_cas
+            # The writer writes no marker.
+            assert not [r for r in retry if r["key"] == target + ".meta"], target
+        finally:
+            node.query("SYSTEM CAS GC START '{}'".format(disk))
 
     node.query("DROP TABLE {} SYNC".format(table))
 
@@ -633,7 +658,7 @@ def test_default_blob_multipart_is_allowed_but_mutable_cas_stays_single_part():
         r
         for r in records
         if r["operation"] == "conditional_put"
-        and r["request_class"] in ("blob_meta", "cas_control")
+        and r["request_class"] in ("blob_intent", "cas_control")
     ]
     assert conditional_puts, "the insert issued no classified mutable conditional PUT"
     assert all("uploads" not in r["query"] and "uploadId" not in r["query"] for r in conditional_puts)
@@ -900,7 +925,7 @@ def test_ordinary_goog4_traffic_keeps_upstream_semantics():
 def test_marked_and_default_gets_partition_one_oauth_disk():
     """Per-request marking, observed on ONE disk, for ONE method, in ONE bucket.
 
-    The CAS `gcp_oauth` disk issues GETs of both kinds: CAS reads of control objects and blob metadata
+    The CAS `gcp_oauth` disk issues GETs of both kinds: CAS reads of control objects and deletion intents
     are marked, so GCS answers them with a generation, while a query reading a part's data goes
     through the disk's ordinary read path and fetches the blob body unmarked. Marking deletes
     `x-amz-api-version`, so the two kinds are distinguishable on the wire even though they are the
@@ -951,9 +976,9 @@ def test_marked_and_default_gets_partition_one_oauth_disk():
     )
     # The partition is exact: a CAS read is marked and a body read is not, with no exceptions in
     # either direction.
-    assert all(r["request_class"] in ("cas_control", "blob_meta") for r in marked_gets), (
-        "a marked GET reached something other than a CAS control object or a blob marker: {}".format(
-            [r["key"] for r in marked_gets if r["request_class"] not in ("cas_control", "blob_meta")]
+    assert all(r["request_class"] in ("cas_control", "blob_intent") for r in marked_gets), (
+        "a marked GET reached something other than a CAS control object or a deletion intent: {}".format(
+            [r["key"] for r in marked_gets if r["request_class"] not in ("cas_control", "blob_intent")]
         )
     )
     assert all(r["request_class"] == "blob_body" for r in default_gets), (
@@ -1272,50 +1297,64 @@ def test_a_write_whose_response_carries_no_generation_is_settled_by_an_exact_rea
     whatever incarnation happens to be current, which on a lost race is somebody else's — and it must
     not refuse the write outright either: the object may be there.
 
+    The write that rides on it is the conditional create of a deletion intent by a GC round: a writer
+    creates no conditional object on the blob path. A round after the table is dropped condemns every
+    body of the table and creates one intent per body, each with a create-if-absent. Every one of those
+    keys is touched by this round alone.
+
     The discriminator is the request that follows the ungenerated PUT: a body `GET` of the same key,
     never a `HEAD`. Had the engine adopted the current incarnation via HEAD, the read would be a HEAD;
-    had it refused, the INSERT would have FAILED. It succeeded, and every selected `.meta` create was
-    followed by a GET of its own key.
+    had it refused, the round could not have confirmed the intent. It did: the round reports the rows
+    it committed as pending, and a row is pending only for a confirmed create.
 
-    The per-key assertion is made only on the `.meta` creates of blobs whose body this INSERT itself
-    published in the captured slice: those keys are touched by this query alone, and their settle read
-    has completed by the time the query returns. Control-plane keys (`_ckpt`, `_log`, manifests, the
-    mount lease) are shared with the renewer, and GC writes `.meta` markers of its own, so a request
-    on any other key cannot be causally tied to the PUT before it. GC is stopped on the disk and the
-    table's merges are stopped and drained for the window on top of that, so no other publisher of
-    blobs or markers interleaves in the bucket. The mode is global while it is on, so a CAS operation
-    of the other disk can be settled during the window too; the `CASRequestResolveRead` bound is `>=`
-    for that reason. The restored-mode INSERT at the end is what says the disk is healthy again.
+    The per-key assertion is made only on the intent creates of this round. Control-plane keys
+    (`_ckpt`, `_log`, manifests, the mount lease) are shared with the renewer, so a request on any
+    other key cannot be causally tied to the PUT before it. The disk's GC is stopped so that only the
+    explicit round writes intents, and the table's merges are stopped and drained before the drop. The
+    mode is global while it is on, so a CAS operation of the other disk can be settled during the window
+    too; the `CASRequestResolveRead` bound is `>=` for that reason. The INSERT at the end is what says
+    the disk is healthy again.
 
     Would fail if: the engine adopted the current incarnation from a HEAD instead of proving its own
     bytes with a GET, or if it refused an unattributed write instead of settling it.
     """
     node = cluster.instances["node"]
-    table = "t_cas_gcs_oauth"
-    cas_bucket = CAS_DISKS["cas_gcs_oauth"]
+    table = "t_cas_gcs_oauth_unattributed"
+    disk = "cas_gcs_oauth"
+    cas_bucket = CAS_DISKS[disk]
 
-    node.query("SYSTEM CAS GC STOP 'cas_gcs_oauth'")
-    _quiesce_merges(node, table)
+    node.query("DROP TABLE IF EXISTS {} SYNC".format(table))
+    node.query(
+        "CREATE TABLE {} (id UInt64, data String) ENGINE = MergeTree ORDER BY id "
+        "SETTINGS storage_policy = '{}'".format(table, disk)
+    )
+    node.query("SYSTEM CAS GC STOP '{}'".format(disk))
     try:
+        _quiesce_merges(node, table)
+        node.query(
+            "INSERT INTO {} SELECT number, concat('unattributed-', toString(number)) FROM numbers(50)".format(table)
+        )
+        node.query("DROP TABLE {} SYNC".format(table))
+
         first_new_seq = _next_seq()
         resolve_reads_before = _resolve_reads(node)
         try:
             assert _set_omit_generation(True)["omit_generation"] is True
-            node.query(
-                "INSERT INTO {} SELECT number, toString(number) FROM numbers(20000, 50)".format(table)
-            )
+            # The round that folds the drop condemns; a round before it may only fold.
+            confirmed = 0
+            for _ in range(10):
+                confirmed += int(node.query("SYSTEM CAS GC RUN '{}'".format(disk), parse="dict")[0]["entries_intent_confirmed"])
+                if confirmed > 0:
+                    break
         finally:
             assert _set_omit_generation(False)["omit_generation"] is False
         captured = _captured_since(first_new_seq, cas_bucket)
     finally:
-        node.query("SYSTEM START MERGES {}".format(table))
-        node.query("SYSTEM CAS GC START 'cas_gcs_oauth'")
-
-    assert int(node.query("SELECT count() FROM {} WHERE id >= 20000 AND id < 20050".format(table))) == 50
+        node.query("SYSTEM CAS GC START '{}'".format(disk))
 
     # Positive proof that the fake actually produced the condition under test: a successful object
     # write really did answer without a generation. Without this the assertions below could be
-    # satisfied by an INSERT that never met the condition, and a mode switch that silently stopped
+    # satisfied by a round that never met the condition, and a mode switch that silently stopped
     # working would look like a pass.
     ungenerated = [
         r
@@ -1325,23 +1364,22 @@ def test_a_write_whose_response_carries_no_generation_is_settled_by_an_exact_rea
     assert ungenerated, "the mode was on but no successful PUT answered without a generation"
 
     # Only the conditional lane attributes a write to an incarnation, so only its PUTs have anything
-    # to settle. Blob-body publication is unconditional and consumes no response generation; an
-    # ungenerated answer to it is nothing the engine has to resolve. Of the conditional PUTs, only
-    # the `.meta` creates of blobs this INSERT published itself are query-owned, and only a
-    # query-owned key can be tied to its settle read by capture order alone.
-    published_bodies = {r["key"] for r in _blob_publications(captured)}
+    # to settle. Of the conditional PUTs, only the intent creates of this round are round-owned, and
+    # only a round-owned key can be tied to its settle read by capture order alone.
     unattributed = [
         r
         for r in ungenerated
         if r["operation"] == "conditional_put"
-        and r["request_class"] == "blob_meta"
+        and r["request_class"] == "blob_intent"
         and r["headers"].get("x-goog-if-generation-match") == "0"
-        and r["key"][: -len(".meta")] in published_bodies
     ]
     assert unattributed, (
-        "no `.meta` create of a freshly published blob answered without a generation, so nothing "
-        "query-owned was unattributed"
+        "no intent create answered without a generation, so nothing round-owned was unattributed: "
+        "the round condemned nothing"
     )
+
+    # The settled creates were confirmed: the round committed their rows as pending.
+    assert confirmed >= len(unattributed), (confirmed, len(unattributed))
 
     # Every unattributed write is settled by a body read of ITS OWN key -- a GET, not a HEAD.
     for put in unattributed:
@@ -1357,15 +1395,17 @@ def test_a_write_whose_response_carries_no_generation_is_settled_by_an_exact_rea
                 put["key"], settling["method"]
             )
         )
-
     assert _resolve_reads(node) - resolve_reads_before >= len(unattributed), (
         "the engine did not account a resolve read for every unattributed write"
     )
 
     # Restoring the mode must restore the disk, or the success above was something other than the
     # settled write.
+    node.query("CREATE TABLE {} (id UInt64, data String) ENGINE = MergeTree ORDER BY id "
+               "SETTINGS storage_policy = '{}'".format(table, disk))
     node.query("INSERT INTO {} SELECT number, toString(number) FROM numbers(30000, 50)".format(table))
     assert int(node.query("SELECT count() FROM {} WHERE id >= 30000 AND id < 30050".format(table))) == 50
+    node.query("DROP TABLE {} SYNC".format(table))
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -1531,8 +1571,8 @@ def test_a_first_attempt_timeout_is_reissued_as_attempt_two():
 
     The fake's `/_control/delay` knob delays the first matching request past the first-attempt
     fuse; the engine's zero-pause reissue must show up as a second request carrying
-    `clickhouse-request: ...attempt=2` — for a LIST issued directly by a GC round, and for a
-    conditional PUT of an INSERT's `.meta` marker, which settles with a `GET` before its own
+    `clickhouse-request: ...attempt=2` — for a LIST issued directly by a GC round, and for the
+    conditional create of a deletion intent by a GC round, which settles with a `GET` before its own
     attempt 2 and counts as a `CASRequestResolveRead`.
 
     The fuse only trips on a real transport timeout, and `content_addressed`'s
@@ -1540,9 +1580,14 @@ def test_a_first_attempt_timeout_is_reissued_as_attempt_two():
     the ordinary `cas_gcs_hmac` disk and never throw at all. `FUSE_DISK` is a second CAS disk
     the fixture mounts alongside it (own `cas_server_root_id`, own physical prefix under the same
     bucket, so it shares no keys with `cas_gcs_hmac`'s traffic) with `attempt_timeout_ms` tightened
-    to 1000 -- the only way to make a 3000 ms delay a genuine transport timeout without touching the
-    engine's C++ default. The margin between the two (rather than the earlier 200 ms / 300 ms pair)
-    is what keeps the reissue observable under a sanitizer build's own slowdown of the request path.
+    to 1000 -- the only way to make a 3000 ms delay a genuine transport timeout for the LIST
+    without touching the engine's C++ default.
+
+    The conditional `PUT` is bounded by a different timeout: the first-attempt receive timeout of
+    a `PUT` is 3000 ms (`ConnectionTimeouts`), and `attempt_timeout_ms` caps only the connect.
+    Its delay is 6000 ms so the client always times out first and the settlement `GET` finds the
+    key empty. A delay equal to the timeout makes the delayed `PUT` race the `GET`; when it lands
+    first the engine settles by reading back its own bytes and sends no attempt 2.
     `attempt_timeout_ms` is frozen at pool-open time (mount-time), not reloadable, hence a dedicated
     disk rather than a temporary `SYSTEM RELOAD CONFIG` on the existing one.
     """
@@ -1596,20 +1641,32 @@ def test_a_first_attempt_timeout_is_reissued_as_attempt_two():
         ), pair
         assert list1["arrival_seq"] < list2["arrival_seq"], (list1, list2)
 
-        # Conditional PUT: delay the first `.meta` PUT of the next insert; expect a settlement GET
-        # arriving strictly between PUT(1) and its reissue PUT(2), and one settlement read counted.
+        # Conditional PUT: drop the table, delay the first intent create of the round that condemns its
+        # blobs; expect a settlement GET arriving strictly between PUT(1) and its reissue PUT(2), and one
+        # settlement read counted.
+        node.query("DROP TABLE fuse_probe SYNC")
         seq = _next_seq()
         resolve_reads_before = _resolve_reads(node)
         delayed_before = _counters().get("DelayedRequest", 0)
-        assert _control_post("/_control/delay?substr=.meta&ms=3000&method=PUT&once=1")["method"] == "PUT"
-        node.query("INSERT INTO fuse_probe VALUES (2)")
+        assert _control_post("/_control/delay?substr=blob-intents&ms=6000&method=PUT&once=1")["method"] == "PUT"
+        # The round that folds the drop condemns; a round before it may only fold.
+        for _ in range(10):
+            node.query("SYSTEM CAS GC RUN '{}'".format(disk))
+            if _counters().get("DelayedRequest", 0) > delayed_before:
+                break
         assert _wait_for_delayed_request_count(delayed_before) - delayed_before == 1, (
             "the PUT delay must fire exactly once"
         )
-        rows = [r for r in _captured_since(seq, FUSE_BUCKET) if r["key"].endswith(".meta")]
-        assert rows, "no `.meta` PUT reached the fake, so this test would be vacuous"
-        meta_key = rows[0]["key"]
-        same_key = [r for r in rows if r["key"] == meta_key]
+        rows = [r for r in _captured_since(seq, FUSE_BUCKET) if "/blob-intents/" in r["key"]]
+        assert rows, "no intent request reached the fake, so this test would be vacuous"
+        # The round creates one intent per blob and only the first PUT is delayed: the key with two PUTs is
+        # the delayed one.
+        by_key = {}
+        for r in rows:
+            by_key.setdefault(r["key"], []).append(r)
+        retried = {key: group for key, group in by_key.items() if len([r for r in group if r["method"] == "PUT"]) >= 2}
+        assert len(retried) == 1, by_key
+        same_key = next(iter(retried.values()))
         puts = [r for r in same_key if r["method"] == "PUT"]
         gets = [r for r in same_key if r["method"] == "GET"]
         assert len(puts) >= 2, same_key
@@ -1652,3 +1709,15 @@ def test_multipart_remained_confined_to_default_blob_publication_during_the_whol
     assert [r for r in multipart if r["operation"] == "blob_multipart_complete"], multipart
     assert all(r["request_class"] == "blob_body" for r in multipart), multipart
     assert all(not _is_translated(r) for r in multipart), multipart
+
+
+def test_mock_intent_key_and_record_match_the_cpp_golden():
+    """The fake's intent key, record and request class agree with what the C++ layout produces."""
+    assert (
+        GCS_MOCK_NAMESPACE["_blob_intent_key"](
+            GOLDEN_INTENT_POOL, GOLDEN_INTENT_BLOB, GOLDEN_INTENT_GENERATION
+        )
+        == GOLDEN_INTENT_KEY
+    )
+    assert GCS_MOCK_NAMESPACE["_BLOB_INTENT_RECORD"] == GOLDEN_INTENT_RECORD
+    assert GCS_MOCK_NAMESPACE["_request_class"]("oauthbucket", GOLDEN_INTENT_KEY) == "blob_intent"
