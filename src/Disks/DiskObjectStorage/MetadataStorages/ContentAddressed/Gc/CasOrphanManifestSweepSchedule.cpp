@@ -1,9 +1,10 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweepSchedule.h>
 #include <Common/Exception.h>
+#include <magic_enum.hpp>
 
 namespace DB::ErrorCodes
 {
-    extern const int CORRUPTED_DATA;
+    extern const int LOGICAL_ERROR;
 }
 
 namespace DB::Cas
@@ -30,7 +31,9 @@ void updateOrphanManifestSweepSchedule(
 {
     if ((decision != OrphanManifestSweepDecision::StartSweep && decision != OrphanManifestSweepDecision::ContinueSweep)
         || (wrapped != next.manifest_sweep_cursor.empty()))
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS orphan manifest sweep: invalid progress transition");
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "Invalid CAS orphan manifest sweep progress: decision={}, wrapped={}, cursor_empty={}, progress_at_ms={}",
+            magic_enum::enum_name(decision), wrapped, next.manifest_sweep_cursor.empty(), progress_at_ms);
     if (wrapped && progress_at_ms != 0)
         next.orphan_manifest_sweep_completed_at_ms = progress_at_ms;
 }

@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Common/Exception.h>
+#include <fmt/format.h>
 
 #include <limits>
 
@@ -134,15 +135,23 @@ TEST(CASOrphanManifestSweepSchedule, NonemptyCursorContinuesWithoutActiveFlag)
 TEST(CASOrphanManifestSweepSchedule, RejectsUnperformedOrInvalidProgress)
 {
     GcState state;
-    EXPECT_THROW(updateOrphanManifestSweepSchedule(state, OrphanManifestSweepDecision::SkipUntilIntervalElapsed, true, 1000), DB::Exception);
-    EXPECT_THROW(updateOrphanManifestSweepSchedule(state, OrphanManifestSweepDecision::Disabled, true, 1000), DB::Exception);
-    EXPECT_THROW(updateOrphanManifestSweepSchedule(state, OrphanManifestSweepDecision::SkipUntilIntervalElapsed, true, 0), DB::Exception);
-    EXPECT_THROW(updateOrphanManifestSweepSchedule(state, OrphanManifestSweepDecision::Disabled, true, 0), DB::Exception);
-    EXPECT_THROW(updateOrphanManifestSweepSchedule(state, OrphanManifestSweepDecision::StartSweep, false, 1000), DB::Exception);
-    EXPECT_THROW(updateOrphanManifestSweepSchedule(state, OrphanManifestSweepDecision::StartSweep, false, 0), DB::Exception);
+    const auto expect_rejected = [&](OrphanManifestSweepDecision decision, bool wrapped, std::string_view expected_fields)
+    {
+        for (const uint64_t progress_at_ms : {0, 1000})
+        {
+            EXPECT_DEATH(
+                {
+                    DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+                    updateOrphanManifestSweepSchedule(state, decision, wrapped, progress_at_ms);
+                },
+                fmt::format("{}, progress_at_ms={}", expected_fields, progress_at_ms));
+        }
+    };
+    expect_rejected(OrphanManifestSweepDecision::SkipUntilIntervalElapsed, true, "decision=SkipUntilIntervalElapsed, wrapped=true, cursor_empty=true");
+    expect_rejected(OrphanManifestSweepDecision::Disabled, true, "decision=Disabled, wrapped=true, cursor_empty=true");
+    expect_rejected(OrphanManifestSweepDecision::StartSweep, false, "decision=StartSweep, wrapped=false, cursor_empty=true");
     state.manifest_sweep_cursor = "cursor";
-    EXPECT_THROW(updateOrphanManifestSweepSchedule(state, OrphanManifestSweepDecision::StartSweep, true, 1000), DB::Exception);
-    EXPECT_THROW(updateOrphanManifestSweepSchedule(state, OrphanManifestSweepDecision::StartSweep, true, 0), DB::Exception);
+    expect_rejected(OrphanManifestSweepDecision::StartSweep, true, "decision=StartSweep, wrapped=true, cursor_empty=false");
 }
 
 TEST(CASOrphanManifestSweepSchedule, ZeroClockPreservesCompletion)
