@@ -1,0 +1,8 @@
+guard off
+120000	960000
+guard on
+120000	960000
+1	0
+0	1
+invalid ratio
+BAD_ARGUMENTS

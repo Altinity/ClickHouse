@@ -182,6 +182,8 @@ private:
     size_t file_size{};
     size_t min_bytes_for_seek{};
     size_t bytes_per_read_task{};
+    /// Anti-amplification guard for coalescing, see `fillRatioWouldBreak`. 0 = off.
+    double read_min_fill_ratio = 0;
 
     std::shared_ptr<ShutdownHelper> shutdown = std::make_shared<ShutdownHelper>();
 
@@ -205,6 +207,14 @@ private:
     /// (splitAndPrefetchRange), and only subrange [subrange_start, subrange_end) needs to be read.
     void pickRangesAndCreateTaskIfNotExists(RequestState *, const PrefetchHandle &, bool splitting, size_t start_offset, size_t end_offset, std::unique_lock<std::mutex> lock);
     static void decreaseTaskRefcount(Task * task, size_t amount);
+
+    /// Gaps smaller than this are always bridged by coalescing, regardless of `read_min_fill_ratio`.
+    static constexpr size_t small_gap_floor_for_fill_ratio = 64 << 10;
+
+    /// Whether extending a coalesced task with range `r` should be refused because the task would
+    /// end up less than `read_min_fill_ratio` wanted (wanted bytes / span). `wanted_bytes` is the
+    /// total length of the ranges already in the task, `[start_offset, end_offset)` is its span.
+    bool fillRatioWouldBreak(size_t wanted_bytes, size_t start_offset, size_t end_offset, const RangeState & r) const;
     void scheduleTask(Task * task);
     Task::State runTask(Task * task);
     [[noreturn]] void rethrowException(Task * task);

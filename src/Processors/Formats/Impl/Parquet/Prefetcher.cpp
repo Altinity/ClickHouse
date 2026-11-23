@@ -12,6 +12,7 @@
 
 namespace DB::ErrorCodes
 {
+    extern const int BAD_ARGUMENTS;
     extern const int INCORRECT_DATA;
     extern const int LOGICAL_ERROR;
 }
@@ -22,6 +23,7 @@ namespace ProfileEvents
     extern const Event ParquetPrefetcherReadRandomRead;
     extern const Event ParquetPrefetcherReadSeekAndRead;
     extern const Event ParquetPrefetcherReadEntireFile;
+    extern const Event ParquetPrefetcherFillRatioLimitedTasks;
 }
 
 namespace DB::Parquet
@@ -31,6 +33,10 @@ void Prefetcher::init(ReadBuffer * reader_, const ReadOptions & options, FormatP
 {
     min_bytes_for_seek = options.min_bytes_for_seek;
     bytes_per_read_task = options.bytes_per_read_task;
+    read_min_fill_ratio = options.format.parquet.read_min_fill_ratio;
+    if (!(read_min_fill_ratio >= 0 && read_min_fill_ratio <= 1))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "input_format_parquet_read_min_fill_ratio must be in [0, 1], got {}", read_min_fill_ratio);
     parser_shared_resources = parser_shared_resources_;
     determineReadModeAndFileSize(reader_, options);
     range_sets.resize(1);
@@ -93,6 +99,32 @@ void Prefetcher::determineReadModeAndFileSize(ReadBuffer * reader_, const ReadOp
         read_mode = ReadMode::EntireFileIsInMemory;
         file_size = entire_file.size();
     }
+}
+
+bool Prefetcher::fillRatioWouldBreak(size_t wanted_bytes, size_t start_offset, size_t end_offset, const RangeState & r) const
+{
+    if (read_min_fill_ratio <= 0)
+        return false;
+
+    /// Gap that would be bridged to include `r` in the task (0 if `r` overlaps the task).
+    size_t gap = 0;
+    if (r.start >= end_offset)
+        gap = r.start - end_offset;
+    else if (start_offset >= r.end)
+        gap = start_offset - r.end;
+
+    /// Small gaps are always bridged: a request costs more than reading a few extra bytes, and
+    /// dense reads (fill close to 1) must never be split.
+    if (gap < small_gap_floor_for_fill_ratio)
+        return false;
+
+    const size_t new_span = std::max(end_offset, r.end) - std::min(start_offset, r.start);
+    const size_t new_wanted = wanted_bytes + r.length();
+    if (static_cast<double>(new_wanted) >= read_min_fill_ratio * static_cast<double>(new_span))
+        return false;
+
+    ProfileEvents::increment(ProfileEvents::ParquetPrefetcherFillRatioLimitedTasks);
+    return true;
 }
 
 void Prefetcher::readSync(char * to, size_t n, size_t offset)
@@ -336,6 +368,10 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
         const auto s = r.request->state.load(std::memory_order_relaxed);
         if (s == RequestState::State::HasRange)
         {
+            /// Don't let the task degrade into mostly filler bytes.
+            if (fillRatioWouldBreak(total_length_of_covered_ranges, start_offset, end_offset, r))
+                break;
+
             /// Include this range in the task.
             start_idx = idx - 1;
             total_length_of_covered_ranges += r.length();
@@ -371,6 +407,9 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
         const auto s = r.request->state.load(std::memory_order_relaxed);
         if (s == RequestState::State::HasRange)
         {
+            if (fillRatioWouldBreak(total_length_of_covered_ranges, start_offset, end_offset, r))
+                break;
+
             end_idx = idx + 1;
             total_length_of_covered_ranges += r.length();
             end_offset = std::max(end_offset, r.end);
