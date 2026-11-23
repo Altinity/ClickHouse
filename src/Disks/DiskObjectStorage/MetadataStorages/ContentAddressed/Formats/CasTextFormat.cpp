@@ -8,7 +8,6 @@
 #include <base/hex.h>
 #include <base/scope_guard.h>
 #include <algorithm>
-#include <charconv>
 #include <cstring>
 #include <limits>
 #include <zstd.h>
@@ -275,9 +274,10 @@ uint64_t JsonObjectReader::readU64String()
     return guarded([&]
     {
         const std::string_view s = readStringIntoScratch();
+        ReadBufferFromMemory buf(s);
         uint64_t v = 0;
-        const auto [end, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
-        if (s.empty() || ec != std::errc{} || end != s.data() + s.size())
+        /// The wire format uses unsigned decimal digits; `tryReadIntText` also accepts a leading plus.
+        if (s.starts_with('+') || !tryReadIntText<ReadIntTextCheckOverflow::CHECK_OVERFLOW>(v, buf) || !buf.eof())
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: expected decimal u64 string, got '{}'", what, s);
         return v;
     });

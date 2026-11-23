@@ -139,6 +139,27 @@ TEST(CASJsonVocab, WriteAndReadBack)
     EXPECT_FALSE(r.nextKey(key));
 }
 
+TEST(CASJsonVocab, DecimalUInt64String)
+{
+    const auto read = [](std::string_view digits)
+    {
+        const String json = fmt::format(R"({{"seq":"{}"}})", digits);
+        DB::ReadBufferFromMemory in(json);
+        JsonObjectReader reader(in, "test");
+        String key;
+        EXPECT_TRUE(reader.nextKey(key));
+        return reader.readU64String();
+    };
+
+    EXPECT_EQ(read("007"), 7u);
+    EXPECT_EQ(read("18446744073709551615"), 18446744073709551615ULL);
+    for (const auto * invalid : {"", "+5", "-0", "5x", "18446744073709551616"})
+    {
+        SCOPED_TRACE(invalid);
+        expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { read(invalid); });
+    }
+}
+
 TEST(CASJsonVocab, WordArrayFieldAndReaderRejectInvalidValues)
 {
     CasJsonWriter out;
