@@ -224,3 +224,7 @@ before that; the alert fires only if that takes longer than 5 minutes.
 Do not deploy it for a disk whose GC is disabled on every server (`cas_gc_enabled = false`): no server
 ever reports the metric, so the rule fires forever. 900 s is 15 GC intervals at the default
 `cas_gc_interval_sec` of 60; scale it with that setting.
+
+Fold begin and end events in `system.cas_log` carry the candidate round number. A fold can emit begin alone,
+or both events, before its commit fails. A later successful attempt can use the same number. Filtering `Finish` to
+`Success` still admits events from both attempts. `round_id` correlates rows within `system.cas_gc_log` only.

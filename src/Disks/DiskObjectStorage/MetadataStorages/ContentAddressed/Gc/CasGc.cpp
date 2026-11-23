@@ -996,7 +996,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     {
         e.type = CasEventType::GcFoldBegin;
         e.object_kind = CasEventObjectKind::Snap;
-        e.round = state.round;
+        e.round = new_round;
         e.gen = state.snap_generation;
         e.reason = "R2: one-pass fold (edges x deltas x retired) into a new durable generation";
     });
@@ -1033,7 +1033,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     {
         e.type = CasEventType::GcFoldEnd;
         e.object_kind = CasEventObjectKind::Snap;
-        e.round = state.round;
+        e.round = new_round;
         e.gen = state.snap_generation;
         e.outcome = "ok";
         e.reason = "R2 complete";
