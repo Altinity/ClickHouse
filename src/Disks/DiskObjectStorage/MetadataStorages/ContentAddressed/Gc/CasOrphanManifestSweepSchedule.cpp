@@ -20,7 +20,13 @@ OrphanManifestSweepDecision orphanManifestSweepDecisionOf(
     if (interval_sec == 0 || state.orphan_manifest_sweep_completed_at_ms == 0)
         return OrphanManifestSweepDecision::StartSweep;
     if (now_ms < state.orphan_manifest_sweep_completed_at_ms)
+    {
+        const uint64_t ahead_ms = state.orphan_manifest_sweep_completed_at_ms - now_ms;
+        /// Subtract one millisecond for a strict comparison without multiplying `interval_sec`.
+        if (now_ms != 0 && (ahead_ms - 1) / 1000 >= interval_sec)
+            return OrphanManifestSweepDecision::StartSweep;
         return OrphanManifestSweepDecision::SkipUntilIntervalElapsed;
+    }
     return (now_ms - state.orphan_manifest_sweep_completed_at_ms) / 1000 >= interval_sec
         ? OrphanManifestSweepDecision::StartSweep
         : OrphanManifestSweepDecision::SkipUntilIntervalElapsed;

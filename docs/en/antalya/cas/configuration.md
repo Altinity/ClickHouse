@@ -254,7 +254,7 @@ counters are unaffected, except for a shard whose log an earlier attempt of the 
 
 | Setting | Default | Bounds | Description |
 |---|---|---|---|
-| `cas_orphan_manifest_sweep_interval_sec` | `3600` | `UInt64` | Minimum wait after a completed orphan-manifest traversal before starting another; `0` means no wait |
+| `cas_orphan_manifest_sweep_interval_sec` | `3600` | `UInt64` | Wait after a completed orphan-manifest traversal. See [clock-skew handling](#orphan-manifest-sweep-schedule). `0` means no wait |
 | `cas_manifest_sweep_list_budget_keys` | `1000` | `UInt64` | Orphan-manifest sweep `LIST` budget per permitted round; `0` pauses the traversal without losing its cursor |
 | `cas_manifest_sweep_delete_budget_keys` | `100` | `UInt64` | Orphan-manifest sweep candidate budget per page; `0` lists without nominating deletions |
 | `cas_gc_bulk_delete_chunk_keys` | `1000` | `1`–`1000` | Most keys per batch delete request in GC's write-once families (owner-removed manifest bodies, covered ref logs and snapshots, the namespace janitor's dead ref logs and snapshots), capped by the storage's batch-delete limit |
@@ -287,6 +287,11 @@ the current traversal, waits for the interval, and reaches the key in the next t
 A zero wall-clock sample near commit allows page progress while preserving the previous completion
 timestamp. If no completion time is known, the next traversal can start on the next ordinary fold. A later
 completed traversal with a positive clock sample establishes the interval again.
+
+With a positive clock reading, the next ordinary fold may start a new traversal if the saved
+completion time is more than one interval ahead of the GC leader's clock. A zero clock reading at
+the scheduling decision keeps waiting when the interval is positive, a completion time is known,
+and the cursor is empty.
 
 When destructive work is suppressed, the traversal's cursor and timestamps remain unchanged.
 An exception while planning the page, writing the fold seal or pruning old generations fails the

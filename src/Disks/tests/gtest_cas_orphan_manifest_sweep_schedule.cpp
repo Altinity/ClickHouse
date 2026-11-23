@@ -82,11 +82,13 @@ TEST(CASOrphanManifestSweepSchedule, DisabledPrecedesElapsedInterval)
     EXPECT_EQ(orphanManifestSweepDecisionOf(state, 3600, 0, 3601000), OrphanManifestSweepDecision::Disabled);
 }
 
-TEST(CASOrphanManifestSweepSchedule, ClockRegressionWaits)
+TEST(CASOrphanManifestSweepSchedule, FutureCompletionStartsOnlyBeyondInterval)
 {
     GcState state;
-    state.orphan_manifest_sweep_completed_at_ms = 1000;
-    EXPECT_EQ(orphanManifestSweepDecisionOf(state, 3600, 1000, 999), OrphanManifestSweepDecision::SkipUntilIntervalElapsed);
+    state.orphan_manifest_sweep_completed_at_ms = 3601000;
+    EXPECT_EQ(orphanManifestSweepDecisionOf(state, 3600, 1000, 1001), OrphanManifestSweepDecision::SkipUntilIntervalElapsed);
+    EXPECT_EQ(orphanManifestSweepDecisionOf(state, 3600, 1000, 1000), OrphanManifestSweepDecision::SkipUntilIntervalElapsed);
+    EXPECT_EQ(orphanManifestSweepDecisionOf(state, 3600, 1000, 999), OrphanManifestSweepDecision::StartSweep);
 }
 
 TEST(CASOrphanManifestSweepSchedule, IntervalComparisonDoesNotOverflow)
@@ -98,6 +100,9 @@ TEST(CASOrphanManifestSweepSchedule, IntervalComparisonDoesNotOverflow)
     state.orphan_manifest_sweep_completed_at_ms = max - 1000;
     EXPECT_EQ(orphanManifestSweepDecisionOf(state, 1, 1000, max - 1), OrphanManifestSweepDecision::SkipUntilIntervalElapsed);
     EXPECT_EQ(orphanManifestSweepDecisionOf(state, 1, 1000, max), OrphanManifestSweepDecision::StartSweep);
+    state.orphan_manifest_sweep_completed_at_ms = max;
+    EXPECT_EQ(orphanManifestSweepDecisionOf(state, max, 1000, 1), OrphanManifestSweepDecision::SkipUntilIntervalElapsed);
+    EXPECT_EQ(orphanManifestSweepDecisionOf(state, 1, 1000, max - 1001), OrphanManifestSweepDecision::StartSweep);
 }
 
 TEST(CASOrphanManifestSweepSchedule, CompletionIsRecordedOnlyAtEndOfTraversal)

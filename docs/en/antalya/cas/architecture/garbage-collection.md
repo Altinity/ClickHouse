@@ -639,8 +639,9 @@ from the catalog.
 
 The last phase: executes the [orphan-manifest sweep](/antalya/cas/architecture/manifests-and-refs#orphan-sweep)
 planned in phase 9 and adopted by phase 13's `CAS`. Planning runs only when the schedule requests
-it and the destructive gate permits it. The default minimum wait between completed traversals is
-one hour; successful pages of an active traversal continue without that wait.
+it and the destructive gate permits it. The default wait before starting another traversal is
+one hour, subject to the clock-skew rule below. Successful pages of an active traversal continue
+without that wait.
 
 - **Runs on:** post-`CAS` (fold path)
 - **Reads / writes:** one `HEAD` per nomination, then a `DELETE` conditional on the observed etag
@@ -731,10 +732,11 @@ reaches EOF and the completion time remains unknown, another traversal can start
 A later EOF with a positive clock sample records a known completion time and restores interval
 pacing. A conflicting state `CAS` adopts neither the cursor nor the timestamp.
 
-If a completed traversal has a timestamp ahead of the current leader's clock, another traversal
-waits and `orphan_manifest_sweep_waiting_for_clock` is set. This observation can come from clock
-skew between leaders or a local clock change. It does not stop an active traversal; interval `0`
-also permits a new traversal without waiting for that timestamp.
+With a positive clock reading, the next ordinary fold may start a new traversal if the current
+leader's clock is behind the saved completion time by more than one configured interval.
+A positive gap of at most one interval keeps waiting and sets `orphan_manifest_sweep_waiting_for_clock`.
+A zero clock sample at the scheduling decision also keeps waiting when the completion time is
+known and the interval is positive. An active traversal or interval `0` bypasses the time check.
 
 **The fold seal *is* the coverage record**: generation, parent generation, one `ref_lives` row per
 catalog-admitted opaque life (coverage plus optional cleanup evidence), references to the
@@ -889,7 +891,7 @@ pool sizes and the chunk size reject `0`:
 | `cas_gc_round_prefix_wholesale_budget` | 20000 | listed objects the retention prune may process per round, gone ones included (phase 13) |
 | `cas_gc_round_handoff_prefix_wholesale_budget` | 0 | listed objects the hand-off reclaim may process per round, reserved separately (phase 14) |
 | `cas_gc_round_ref_cleanup_budget` | 0 | covered `_log` / `_snap` deletes per round (phase 17) |
-| `cas_orphan_manifest_sweep_interval_sec` | 3600 | minimum wait after a completed traversal before starting another; `0` removes the wait |
+| `cas_orphan_manifest_sweep_interval_sec` | 3600 | Wait after a completed traversal, subject to the clock-skew rule above. `0` removes the wait |
 | `cas_manifest_sweep_list_budget_keys` | 1000 | orphan-manifest sweep `LIST` budget in keys per permitted round; `0` disables the sweep without clearing its cursor (phase 9) |
 | `cas_manifest_sweep_delete_budget_keys` | 100 | orphan-manifest sweep candidate budget per page; `0` lists without nominations (phases 9, 18) |
 | `cas_gc_round_sweep_namespace_budget` | 20 | namespaces whose protection view the sweep may build per page (phase 9) |

@@ -235,6 +235,34 @@ TEST(CASOrphanManifestSweepScheduleGc, WaitingDoesNoSweepIo)
     expectSameSchedule(f.state(), before);
 }
 
+TEST(CASOrphanManifestSweepScheduleGc, FutureCompletionRecoversOnOrdinaryFold)
+{
+    ScheduleFixture f(1000, 3600, 1);
+    auto state = f.state();
+    state.orphan_manifest_sweep_completed_at_ms = 3601001;
+    f.setState(state);
+
+    for (const uint64_t now : {0, 1001})
+    {
+        SCOPED_TRACE(now);
+        f.now = now;
+        ASSERT_TRUE(f.run().deferred);
+        ASSERT_FALSE(f.run().deferred);
+        EXPECT_EQ(f.metric("defer_decision", "orphan_manifest_sweep_waiting_for_clock"), 1);
+        EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 0);
+        expectSameSchedule(f.state(), state);
+    }
+
+    f.now = 1000;
+    ASSERT_TRUE(f.run().deferred);
+    EXPECT_EQ(f.metric("defer_decision", "run_orphan_manifest_sweep"), 1);
+    EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 0);
+    ASSERT_FALSE(f.run().deferred);
+    EXPECT_EQ(f.metric("defer_decision", "orphan_manifest_sweep_waiting_for_clock"), 0);
+    EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 1);
+    EXPECT_EQ(f.state().orphan_manifest_sweep_completed_at_ms, f.now);
+}
+
 TEST(CASOrphanManifestSweepScheduleGc, ZeroIntervalRestoresCadence)
 {
     ScheduleFixture f(1000, 0);
