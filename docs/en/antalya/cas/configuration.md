@@ -279,6 +279,11 @@ fold; setting the `LIST` budget to `0` pauses progress. Fold timing follows ref-
 graduation and the ordinary bounded deferral. An idle pool defers eight invocations by default before
 each fold, including folds that start or continue a traversal.
 
+A manifest can remain in storage for longer than the configured interval. For example, the sweep
+may pass a manifest while its writer's build is still active. If the writer then stops before
+`precommitAdd` records an owner for that manifest, the sweep will revisit the key after it finishes
+the current traversal, waits for the interval, and reaches the key in the next traversal.
+
 A zero wall-clock sample near commit allows page progress while preserving the previous completion
 timestamp. If no completion time is known, the next traversal can start on the next ordinary fold. A later
 completed traversal with a positive clock sample establishes the interval again.
@@ -293,6 +298,13 @@ and due blob graduation can cause that fold to run sooner. The fold thresholds a
 
 Normal blob reclamation and cleanup of manifests whose owners were removed keep their own GC rules;
 the hourly interval applies to the orphan-manifest traversal.
+
+During a rolling upgrade, set `cas_orphan_manifest_sweep_interval_sec` explicitly only after
+all servers that read the disk configuration support it. Older versions reject the unknown setting
+when loading the disk. An older GC leader preserves `manifest_sweep_cursor` when rewriting
+`gc/state`, but omits `orphan_manifest_sweep_completed_at_ms`. A newer leader resumes an unfinished
+traversal from that cursor. If the cursor is empty, the missing timestamp makes a new traversal
+eligible on the next ordinary fold, even if the previous traversal completed recently.
 
 ## Migration from unprefixed keys {#migration-from-unprefixed-keys}
 
