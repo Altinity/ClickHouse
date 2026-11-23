@@ -1421,6 +1421,73 @@ TEST(CASFsck, LiveNamespaceWithoutCheckpointIsUnchecked)
         << "fsck must not consume refs after the mandatory recovery authority was absent";
 }
 
+/// Hooks that run at the first `_ckpt` read of a walked life, standing for GC erasing the row of a dropped
+/// table and the namespace janitor deleting the life's `_ckpt`, both after the catalog cut.
+namespace
+{
+void eraseCatalogRow(Backend & backend, const Layout & layout, const RootNamespace & ns)
+{
+    OperationForTest op(backend);
+    CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(*op, layout);
+    const auto it = std::find_if(snapshot.catalog.entries.begin(), snapshot.catalog.entries.end(),
+        [&](const CatalogEntry & entry) { return entry.ns == ns; });
+    ASSERT_NE(it, snapshot.catalog.entries.end());
+    snapshot.catalog.entries.erase(it);
+    ASSERT_TRUE(snapshot.etag.has_value());
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        (*op).replace(layout.refCatalogKey(), encodeRefCatalog(snapshot.catalog), *snapshot.etag, Retry::standard())));
+}
+
+void removeCheckpoint(Backend & backend, const Layout & layout, const NamespaceLifeId & life)
+{
+    OperationForTest op(backend);
+    const auto head = (*op).head(layout.refCkptKey(life), Retry::once());
+    ASSERT_TRUE(head.has_value());
+    ASSERT_EQ((*op).remove(layout.refCkptKey(life), head->etag, Retry::once()), Removal::Removed);
+}
+}
+
+/// The walk's `_ckpt` read finds the key deleted and the catalog row erased since the cut. The life is
+/// janitor-pending, and no `CORRUPTED_DATA` exception is constructed: its destructor would log an error.
+TEST(CASFsck, CheckpointDeletedWithTheRowErasedAfterTheCutIsJanitorPendingAndLogsNothing)
+{
+    auto backend = std::make_shared<MutateOnFirstGetBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/ckpt_gone_row_erased@cas@"};
+    const NamespaceLifeId life = writeFsckFixtureWithTail(*backend, layout, ns);
+    backend->armOnFirstGet(layout.refCkptKey(life), [&]
+    {
+        eraseCatalogRow(*backend, layout, ns);
+        removeCheckpoint(*backend, layout, life);
+    });
+
+    ScopedLogCapture capture("ForcedCriticalErrorsLogger", "error");
+    const FsckReport report = runFsck(*store, /*detail=*/true);
+
+    EXPECT_EQ(report.namespace_janitor_pending_lives, 1u) << "the hook ran and the life is janitor-pending";
+    EXPECT_EQ(report.unchecked, 0u);
+    EXPECT_EQ(report.chain_broken, 0u);
+    EXPECT_EQ(capture.count("CORRUPTED_DATA"), 0u) << capture.captured();
+}
+
+/// Control: with the row still named at confirmation, a Live life without `_ckpt` is reported.
+TEST(CASFsck, CheckpointDeletedWhileTheRowStaysIsReportedUnchecked)
+{
+    auto backend = std::make_shared<MutateOnFirstGetBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/ckpt_gone_row_stays@cas@"};
+    const NamespaceLifeId life = writeFsckFixtureWithTail(*backend, layout, ns);
+    backend->armOnFirstGet(layout.refCkptKey(life), [&] { removeCheckpoint(*backend, layout, life); });
+
+    const FsckReport report = runFsck(*store, /*detail=*/true);
+
+    EXPECT_EQ(report.namespace_janitor_pending_lives, 0u);
+    EXPECT_EQ(report.unchecked, 1u);
+    EXPECT_EQ(countVerdictsAtKey(report, layout.namespaceStreamPrefix(life), FsckClass::Unchecked), 1u);
+}
+
 /// A rebirth during the scan replaces the walked life's catalog row. The catalog read after the per-life
 /// loop no longer names that life, so its missing manifest is janitor-pending, not a dangle.
 TEST(CASFsck, MissingManifestOfALifeRebornDuringTheScanIsJanitorPending)

@@ -376,10 +376,19 @@ std::optional<RefTableState> walkRefStream(
     deadline.check("ref stream");
     const RootNamespace & ns = life.ns;
     std::optional<CkptSample> sample = readCkpt(op, layout, life);
+    if (!sample)
+    {
+        /// Deferred like every finding of a walked life: a janitor that deleted this `_ckpt` after the catalog cut
+        /// leaves a life the confirmation cut no longer names. No exception is built for it, because the destructor
+        /// of a `CORRUPTED_DATA` logs an error whether or not anyone catches it.
+        verdicts.recordUnchecked(report, ns, layout.namespaceStreamPrefix(life),
+            "fsck could not examine this namespace: CAS recovery grounding: a Live or Removing namespace requires a "
+            "readable _ckpt with life_epoch");
+        return std::nullopt;
+    }
     for (size_t restarts = 0;; ++restarts)
     {
-        const RecoveryGrounding grounding = chooseRecoveryGrounding(
-            catalog_entry, sample ? std::optional<RefCkpt>{sample->ckpt} : std::nullopt);
+        const RecoveryGrounding grounding = chooseRecoveryGrounding(catalog_entry, std::optional<RefCkpt>{sample->ckpt});
         RecordingKeyReader reader(op, deadline);
         /// Only a corrupt chain under an unchanged `_ckpt` is a finding; a failed read of the chain or of
         /// `_ckpt` itself proves nothing either way.
