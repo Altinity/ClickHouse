@@ -23,6 +23,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <functional>
+#include <limits>
 #include <future>
 #include <map>
 #include <memory>
@@ -5028,10 +5029,11 @@ using IntakeBackend = HintHoleBackendOn<HeadHookBackend>;
 class IntakePool
 {
 public:
-    explicit IntakePool(const String & ns_old_ = "test/a_old", uint64_t snapshot_log_count_threshold = 256) : ns_old(ns_old_)
+    explicit IntakePool(const String & ns_old_ = "test/a_old") : ns_old(ns_old_)
     {
         PoolConfig config{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0, .gc_io_concurrency = 1};
-        config.snapshot_log_count_threshold = snapshot_log_count_threshold;
+        /// Snapshots are published only by `publishSnapshotAbove`, so no background publisher races the staging.
+        config.snapshot_log_count_threshold = std::numeric_limits<uint64_t>::max();
         store = Pool::open(backend, std::move(config));
         body_key = store->layout().blobKey(x);
         gc = std::make_unique<Gc>(store, kGateLeaderA);
@@ -5064,17 +5066,13 @@ public:
         return stream;
     }
 
-    /// Writes parts into `ns` until the writer publishes a snapshot past everything written so far.
+    /// Publishes a snapshot of `ns` that covers every transaction applied so far.
     void publishSnapshotAbove(const String & ns)
     {
         const RootNamespace root{ns};
-        const std::optional<RefTxnId> before = store->newestPublishedSnapshotIdForTest(root);
-        for (size_t i = 0; i < 8 && store->newestPublishedSnapshotIdForTest(root) == before; ++i)
-        {
-            writeOnePart(store, ns, "filler" + std::to_string(i), "snapshot filler " + std::to_string(i));
-            store->waitForSnapshotPublishSettleForTest(root);
-        }
-        ASSERT_NE(store->newestPublishedSnapshotIdForTest(root), before) << "positive control: a snapshot was published";
+        ASSERT_TRUE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(root)) << "positive control: the publish did not commit";
+        ASSERT_TRUE(store->newestPublishedSnapshotIdForTest(root).has_value());
+        ASSERT_EQ(store->tailSinceSnapshotCountForTest(root), 0u) << "positive control: the snapshot does not cover the whole log";
         store->renewWatermarkOnce();
     }
 
@@ -5126,7 +5124,7 @@ TEST(CASGcIntakeRequirements, LifeWithNoParentRowIsWalkedFromItsFirstRecord)
 /// still starts at the life's first record, not at the snapshot, so it sees the add and carries the row.
 TEST(CASGcIntakeRequirements, LifeWithAPublishedSnapshotIsWalkedFromItsFirstRecord)
 {
-    IntakePool pool("test/a_old", /*snapshot_log_count_threshold*/ 2);
+    IntakePool pool;
     ASSERT_NO_FATAL_FAILURE(pool.commitPending());
     pool.copyAndDrop("test/n_snapshotted");
     ASSERT_NO_FATAL_FAILURE(pool.publishSnapshotAbove("test/n_snapshotted"));
@@ -5767,7 +5765,8 @@ TEST(CASGcRoundPoint, SnapshotOverAnUnreadAddAndDropTakesNoDestructiveStep)
 {
     auto backend = std::make_shared<HeadHookBackend>();
     PoolConfig config{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0, .gc_io_concurrency = 1};
-    config.snapshot_log_count_threshold = 2;
+    /// The snapshot is published explicitly below, so no background publisher races the staging.
+    config.snapshot_log_count_threshold = std::numeric_limits<uint64_t>::max();
     auto store = Pool::open(backend, std::move(config));
     const RootNamespace ns{"test/r_table"};
     const String payload = "snapshot-over-add-and-drop";
@@ -5783,16 +5782,12 @@ TEST(CASGcRoundPoint, SnapshotOverAnUnreadAddAndDropTakesNoDestructiveStep)
     ASSERT_TRUE(row() && row()->delete_pending && !row()->standing);
     const PersistedEtag t = row()->token;
 
-    /// A copy of the blob and its drop, then parts until a snapshot is published past both.
-    const std::optional<RefTxnId> before = store->newestPublishedSnapshotIdForTest(ns);
+    /// A copy of the blob and its drop, then a snapshot that covers both.
     copyWithoutBytes(store, ns.string(), "c", payload);
     store->dropRef(ns, "c");
-    for (size_t i = 0; i < 8 && store->newestPublishedSnapshotIdForTest(ns) == before; ++i)
-    {
-        writeOnePart(store, ns.string(), "filler" + std::to_string(i), "snapshot filler " + std::to_string(i));
-        store->waitForSnapshotPublishSettleForTest(ns);
-    }
-    ASSERT_NE(store->newestPublishedSnapshotIdForTest(ns), before) << "positive control: a snapshot past the drop";
+    ASSERT_TRUE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns)) << "positive control: the publish did not commit";
+    ASSERT_TRUE(store->newestPublishedSnapshotIdForTest(ns).has_value());
+    ASSERT_EQ(store->tailSinceSnapshotCountForTest(ns), 0u) << "positive control: the snapshot does not cover the drop";
     store->renewWatermarkOnce();
 
     const size_t from = backend->journal().size();
