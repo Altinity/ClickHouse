@@ -34,10 +34,15 @@ ${CLICKHOUSE_CLIENT} -q "
     ENGINE = S3('${PARQUET_URL}', 'test', 'testtest', 'Parquet')" || fail "create table failed"
 
 # Four row groups of 1000 rows: the filter below matches only the last one, so the condition-cache
-# entry keeps one row group and drops three. It must not drop the whole file.
+# entry keeps one row group and drops three. It must not drop the whole file. The table function takes
+# the Parquet format settings from this INSERT, while a table engine keeps the ones from CREATE TABLE.
 ${CLICKHOUSE_CLIENT} -q "
-    INSERT INTO ${TABLE} SELECT number FROM numbers(4000)
-    SETTINGS s3_truncate_on_insert = 1, output_format_parquet_row_group_size = 1000, max_block_size = 1000000" || fail "insert failed"
+    INSERT INTO FUNCTION s3('${PARQUET_URL}', 'test', 'testtest', 'Parquet', 'n UInt64') SELECT number FROM numbers(4000)
+    SETTINGS s3_truncate_on_insert = 1, output_format_parquet_row_group_size = 1000, max_block_size = 1000, min_insert_block_size_rows = 1000" || fail "insert failed"
+
+row_groups=$(${CLICKHOUSE_CLIENT} -q "
+    SELECT num_row_groups FROM s3('${PARQUET_URL}', 'test', 'testtest', 'ParquetMetadata') FORMAT TabSeparated") || fail "row group count failed"
+[[ $row_groups == "4" ]] || fail "object has ${row_groups} row groups, expected 4"
 
 cold=$(${CLICKHOUSE_CLIENT} -q "
     SELECT count() FROM ${TABLE} WHERE n = 3500 SETTINGS ${READ_SETTINGS}") || fail "cold select failed"
