@@ -489,12 +489,24 @@ public:
         uint64_t condemn_round = 0;
     };
 
+    /// What the preview learned about the adopted snapshot, so an empty preview can be told from an unread or damaged one.
+    enum class SnapshotVerdict : uint8_t
+    {
+        NoBaseline,    /// gc/state absent, or generation 0 with no seal
+        Adopted,       /// the seal gc/state names was read (any generation)
+        SealMissing,   /// the seal read absent between two matching gc/state tokens
+        Unread,        /// gc/state moved at every attempt, vanished, or went back a generation; `unread` says which
+    };
+
     struct DeletePreview
     {
+        SnapshotVerdict snapshot = SnapshotVerdict::NoBaseline;
+        /// Set only with `SealMissing`.
+        String missing_seal;
         std::vector<PreviewEntry> deletes;
         /// One message per GC shard whose runs a round would refuse as corrupt; that shard has no row in `deletes`.
         std::vector<String> refused_shards;
-        /// Why the snapshot was not read: `gc/state` moved at every read. `deletes` and `refused_shards` are empty.
+        /// Why the snapshot was not read: `gc/state` moved at every read, or vanished while a read was confirmed. `deletes` and `refused_shards` are empty.
         String unread;
     };
 

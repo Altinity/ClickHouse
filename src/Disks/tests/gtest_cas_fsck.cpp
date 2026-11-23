@@ -3318,6 +3318,7 @@ TEST(CASGcPreview, RunPrunedUnderAMovedStateIsPreviewedFromTheNewState)
     ASSERT_GE(pruned, 1u) << "the preview never read a run";
     EXPECT_TRUE(racing.refused_shards.empty()) << racing.refused_shards.front();
     EXPECT_TRUE(racing.unread.empty()) << racing.unread;
+    EXPECT_EQ(racing.snapshot, Gc::SnapshotVerdict::Adopted);
     f.backend->beforeEachStream("/blob_target/", {});
     const Gc::DeletePreview settled = f.gc->previewDeletes();
     EXPECT_TRUE(previewedKeys(settled).contains("pending " + f.bodyKey(2))) << "positive control: blob 2 is condemned";
@@ -3367,6 +3368,314 @@ TEST(CASGcPreview, StateMovingAtEveryRunReadLeavesThePreviewUnread)
     EXPECT_TRUE(preview.refused_shards.empty()) << preview.refused_shards.front();
     EXPECT_TRUE(preview.deletes.empty());
     EXPECT_NE(preview.unread.find("gc/state moved"), String::npos) << preview.unread;
+    EXPECT_EQ(preview.snapshot, Gc::SnapshotVerdict::Unread);
+}
+
+/// No `gc/state`, and a generation-0 `gc/state` with no seal, are a pool with no baseline: nothing was adopted.
+TEST(CASGcPreview, NoStateAndGenerationZeroWithoutSealAreNoBaseline)
+{
+    FsckIntentFixture f;
+    Gc gc(f.store, DB::UInt128(1));
+    const auto expect_no_baseline = [&](const Gc::DeletePreview & preview)
+    {
+        EXPECT_EQ(preview.snapshot, Gc::SnapshotVerdict::NoBaseline);
+        EXPECT_TRUE(preview.deletes.empty());
+        EXPECT_TRUE(preview.refused_shards.empty());
+        EXPECT_TRUE(preview.unread.empty()) << preview.unread;
+        EXPECT_TRUE(preview.missing_seal.empty()) << preview.missing_seal;
+    };
+    expect_no_baseline(gc.previewDeletes());
+
+    GcState state;
+    state.header_generation = G_BLOB_INTENTS;
+    state.gc_shards = f.store->poolConfig().gc_shards;
+    OperationForTest op(*f.backend);
+    ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(f.layout.gcStateKey(), encodeGcState(state), Retry::standard())));
+    expect_no_baseline(gc.previewDeletes());
+}
+
+/// A read snapshot is `Adopted` also when it holds no row to delete.
+TEST(CASGcPreview, ReadSnapshotIsAdoptedAlsoWhenEmpty)
+{
+    FsckGcFixture f;
+    const Gc::DeletePreview live = f.gc->previewDeletes();
+    EXPECT_EQ(live.snapshot, Gc::SnapshotVerdict::Adopted);
+    EXPECT_TRUE(live.deletes.empty());
+
+    f.drop();
+    f.round();
+    const Gc::DeletePreview dropped = f.gc->previewDeletes();
+    EXPECT_EQ(dropped.snapshot, Gc::SnapshotVerdict::Adopted);
+    EXPECT_TRUE(previewedKeys(dropped).contains("pending " + f.bodyKey(1))) << "positive control: the dropped blob is condemned";
+}
+
+/// The seal `gc/state` names is absent and `gc/state` did not move: damage, confirmed by one `HEAD` of `gc/state`.
+TEST(CASGcPreview, MissingSealUnderUnchangedStateIsReported)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    const String seal_key = adoptedSealKeyOf(f);
+    removeFsckFixtureKey(*f.backend, seal_key);
+    f.backend->clearJournal();
+
+    const Gc::DeletePreview preview = f.gc->previewDeletes();
+
+    EXPECT_EQ(preview.snapshot, Gc::SnapshotVerdict::SealMissing);
+    EXPECT_TRUE(preview.deletes.empty());
+    EXPECT_TRUE(preview.unread.empty()) << preview.unread;
+    EXPECT_TRUE(preview.refused_shards.empty());
+    EXPECT_NE(preview.missing_seal.find(seal_key), String::npos) << preview.missing_seal;
+    EXPECT_NE(preview.missing_seal.find("generation"), String::npos) << preview.missing_seal;
+    EXPECT_EQ(countKeyRequests(f.backend->journal(), JournalVerb::Head, f.store->layout().gcStateKey()), 1u);
+}
+
+/// The confirming `HEAD` of `gc/state` fails: the error propagates, no verdict is returned.
+TEST(CASGcPreview, ConfirmationHeadErrorPropagates)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    removeFsckFixtureKey(*f.backend, adoptedSealKeyOf(f));
+    f.backend->refused_heads.insert(f.store->layout().gcStateKey());
+
+    EXPECT_THROW(static_cast<void>(f.gc->previewDeletes()), DB::Exception);
+}
+
+/// A round prunes the seal being read and moves `gc/state`: the preview reads the seal of the new state.
+TEST(CASGcPreview, MissingSealPrunedUnderAMovedStateIsReadFromTheNewState)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    writeBlobBody(*f.backend, f.store->layout(), numberedBlobHash(2));
+    const String old_seal = adoptedSealKeyOf(f);
+    String new_seal;
+    bool fired = false;
+    f.backend->beforeRead(old_seal, 0, [&]
+    {
+        fired = true;
+        pruneUnderTheReader(f, 2, old_seal);
+        new_seal = adoptedSealKeyOf(f);
+    });
+    f.backend->clearJournal();
+
+    const Gc::DeletePreview preview = f.gc->previewDeletes();
+
+    ASSERT_TRUE(fired) << "the preview never read the seal";
+    ASSERT_NE(new_seal, old_seal) << "positive control: the round moved gc/state";
+    ASSERT_FALSE(objectPresent(*f.backend, old_seal)) << "positive control: the old seal is gone";
+    EXPECT_EQ(preview.snapshot, Gc::SnapshotVerdict::Adopted);
+    EXPECT_TRUE(preview.missing_seal.empty()) << preview.missing_seal;
+    EXPECT_GE(countKeyRequests(f.backend->journal(), JournalVerb::Read, new_seal), 1u);
+}
+
+/// `gc/state` moves before every read of the seal and the seal just read is gone each time: unread, not damaged.
+TEST(CASGcPreview, MissingSealUnderAStateMovingAtEveryReadIsUnread)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    for (uint64_t b = 2; b < 2 + kAdoptedSnapshotReadAttempts + 1; ++b)
+        writeBlobBody(*f.backend, f.store->layout(), numberedBlobHash(b));
+    size_t fired = 0;
+    std::function<void(const String &)> arm = [&](const String & seal)
+    {
+        f.backend->beforeRead(seal, 0, [&, seal]
+        {
+            pruneUnderTheReader(f, 2 + fired, seal);
+            ++fired;
+            const String next = adoptedSealKeyOf(f);
+            ASSERT_NE(next, seal) << "the round did not move gc/state";
+            arm(next);
+        });
+    };
+    arm(adoptedSealKeyOf(f));
+
+    const Gc::DeletePreview preview = f.gc->previewDeletes();
+
+    EXPECT_EQ(fired, kAdoptedSnapshotReadAttempts);
+    EXPECT_EQ(preview.snapshot, Gc::SnapshotVerdict::Unread);
+    EXPECT_NE(preview.unread.find("gc/state moved"), String::npos) << preview.unread;
+    EXPECT_TRUE(preview.missing_seal.empty()) << preview.missing_seal;
+    EXPECT_TRUE(preview.deletes.empty());
+}
+
+/// `gc/state` vanishes together with the seal while the preview confirms: unread, never "no baseline".
+TEST(CASGcPreview, StateVanishingWhileConfirmingIsUnread)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    const String seal = adoptedSealKeyOf(f);
+    bool fired = false;
+    f.backend->beforeRead(seal, 0, [&]
+    {
+        fired = true;
+        removeFsckFixtureKey(*f.backend, seal);
+        removeFsckFixtureKey(*f.backend, f.store->layout().gcStateKey());
+    });
+
+    const Gc::DeletePreview preview = f.gc->previewDeletes();
+
+    ASSERT_TRUE(fired) << "the preview never read the seal";
+    EXPECT_EQ(preview.snapshot, Gc::SnapshotVerdict::Unread);
+    EXPECT_NE(preview.unread.find("vanished"), String::npos) << preview.unread;
+    EXPECT_TRUE(preview.deletes.empty());
+}
+
+namespace
+{
+/// Arms `f` so that the next read of `gc/state` finds a fresh generation-zero state: a new GC leader's first write.
+void recreateGenerationZeroStateOnNextRead(FsckGcFixture & f)
+{
+    f.backend->beforeRead(f.store->layout().gcStateKey(), 0, [&f]
+    {
+        GcState fresh;
+        fresh.header_generation = G_BLOB_INTENTS;
+        fresh.gc_shards = f.store->poolConfig().gc_shards;
+        OperationForTest op(*f.backend);
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(f.store->layout().gcStateKey(), encodeGcState(fresh), Retry::standard())));
+    });
+}
+}
+
+/// `gc/state` vanishes and a fresh generation-zero state appears before the next read: this dry run saw a live state
+/// disappear, so the result is unread, never "no baseline".
+TEST(CASGcPreview, StateVanishingAndRecreatedAfterAMissingSealIsUnread)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    const String seal = adoptedSealKeyOf(f);
+    bool fired = false;
+    f.backend->beforeRead(seal, 0, [&]
+    {
+        fired = true;
+        removeFsckFixtureKey(*f.backend, seal);
+        removeFsckFixtureKey(*f.backend, f.store->layout().gcStateKey());
+        recreateGenerationZeroStateOnNextRead(f);
+    });
+
+    const Gc::DeletePreview preview = f.gc->previewDeletes();
+
+    ASSERT_TRUE(fired) << "the preview never read the seal";
+    EXPECT_EQ(preview.snapshot, Gc::SnapshotVerdict::Unread);
+    EXPECT_NE(preview.unread.find("vanished"), String::npos) << preview.unread;
+    EXPECT_TRUE(preview.deletes.empty());
+}
+
+/// Same schedule with a refused shard instead of a missing seal.
+TEST(CASGcPreview, StateVanishingAndRecreatedAfterARefusedShardIsUnread)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    bool fired = false;
+    f.backend->beforeEachStream("/blob_target/", [&](const String & key)
+    {
+        if (fired)
+            return;
+        fired = true;
+        removeFsckFixtureKey(*f.backend, key);
+        removeFsckFixtureKey(*f.backend, f.store->layout().gcStateKey());
+        recreateGenerationZeroStateOnNextRead(f);
+    });
+
+    const Gc::DeletePreview preview = f.gc->previewDeletes();
+
+    ASSERT_TRUE(fired) << "the preview never read a run";
+    EXPECT_EQ(preview.snapshot, Gc::SnapshotVerdict::Unread);
+    EXPECT_NE(preview.unread.find("vanished"), String::npos) << preview.unread;
+    EXPECT_TRUE(preview.refused_shards.empty());
+}
+
+namespace
+{
+/// Replaces `gc/state` with a fresh generation-zero state at once: a new GC leader's first write landing between two requests.
+void replaceStateWithGenerationZero(FsckGcFixture & f)
+{
+    removeFsckFixtureKey(*f.backend, f.store->layout().gcStateKey());
+    GcState fresh;
+    fresh.header_generation = G_BLOB_INTENTS;
+    fresh.gc_shards = f.store->poolConfig().gc_shards;
+    OperationForTest op(*f.backend);
+    ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(f.store->layout().gcStateKey(), encodeGcState(fresh), Retry::standard())));
+}
+}
+
+/// A fresh generation-zero `gc/state` appears before the confirming `HEAD`, so the `HEAD` sees a present, different
+/// token: the preview already read a positive generation, so a lower one is unread, never "no baseline".
+TEST(CASGcPreview, StateRecreatedAtGenerationZeroBeforeTheConfirmationIsUnread)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    const String seal = adoptedSealKeyOf(f);
+    bool fired = false;
+    f.backend->beforeRead(seal, 0, [&]
+    {
+        fired = true;
+        removeFsckFixtureKey(*f.backend, seal);
+        f.backend->beforeHead(f.store->layout().gcStateKey(), [&] { replaceStateWithGenerationZero(f); });
+    });
+
+    const Gc::DeletePreview preview = f.gc->previewDeletes();
+
+    ASSERT_TRUE(fired) << "the preview never read the seal";
+    EXPECT_EQ(preview.snapshot, Gc::SnapshotVerdict::Unread);
+    EXPECT_NE(preview.unread.find("generation"), String::npos) << preview.unread;
+    EXPECT_TRUE(preview.deletes.empty());
+}
+
+/// Same schedule with a refused shard instead of a missing seal.
+TEST(CASGcPreview, StateRecreatedAtGenerationZeroBeforeTheRefusalConfirmationIsUnread)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    bool fired = false;
+    f.backend->beforeEachStream("/blob_target/", [&](const String & key)
+    {
+        if (fired)
+            return;
+        fired = true;
+        removeFsckFixtureKey(*f.backend, key);
+        f.backend->beforeHead(f.store->layout().gcStateKey(), [&] { replaceStateWithGenerationZero(f); });
+    });
+
+    const Gc::DeletePreview preview = f.gc->previewDeletes();
+
+    ASSERT_TRUE(fired) << "the preview never read a run";
+    EXPECT_EQ(preview.snapshot, Gc::SnapshotVerdict::Unread);
+    EXPECT_NE(preview.unread.find("generation"), String::npos) << preview.unread;
+    EXPECT_TRUE(preview.refused_shards.empty());
+}
+
+/// Control: a seal that is present but undecodable keeps its own `CORRUPTED_DATA`; only absence is labelled `SealMissing`.
+TEST(CASGcPreview, UndecodableSealStillPropagates)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    const String seal_key = adoptedSealKeyOf(f);
+    {
+        OperationForTest op(*f.backend);
+        const auto current = (*op).read(seal_key, Retry::standard());
+        ASSERT_TRUE(current.has_value());
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).replace(seal_key, "truncated", current->etag, Retry::once())));
+    }
+
+    try
+    {
+        static_cast<void>(f.gc->previewDeletes());
+        FAIL() << "an undecodable seal did not throw";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA) << e.message();
+        EXPECT_NE(e.message().find("line without terminator"), String::npos) << e.message();
+    }
 }
 
 /// A run absent under an unchanged `gc/state` is one finding; the blobs of its shard are not examined, while the other

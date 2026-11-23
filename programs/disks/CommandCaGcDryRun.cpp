@@ -24,7 +24,8 @@ public:
     {
         command_name = "cas-gc-dryrun";
         exits_nonzero_on_error = true;
-        description = "Preview the next GC round's deletes for a content-addressed pool (read-only, no deletes).";
+        description = "Preview the next GC round's deletes for a content-addressed pool (read-only, no deletes). "
+            "Prints `preview_deletes=N` and `snapshot=none|adopted`, then the rows; exits with status 1 on failure.";
     }
 
     void executeImpl(const CommandLineOptions &, DisksClient & client) override
@@ -41,7 +42,12 @@ public:
         if (!preview.unread.empty())
             throw Exception(ErrorCodes::ABORTED, "cas-gc-dryrun: {}; run it again", preview.unread);
 
+        if (preview.snapshot == Cas::Gc::SnapshotVerdict::SealMissing)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "cas-gc-dryrun: {}. Details: /antalya/cas/operations/debugging#gc-bookkeeping-corrupt", preview.missing_seal);
+
         std::cout << "preview_deletes=" << preview.deletes.size() << "\n";
+        std::cout << "snapshot=" << (preview.snapshot == Cas::Gc::SnapshotVerdict::Adopted ? "adopted" : "none") << "\n";
         for (const auto & p : preview.deletes)
             std::cout << p.reason << "\t" << p.key << "\t" << p.size << "\n";
         if (preview.refused_shards.empty())

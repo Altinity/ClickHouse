@@ -5334,14 +5334,23 @@ Gc::DeletePreview Gc::previewDeletes()
         /// Resolve the run objects THROUGH the adopted seal's refs, never by
         /// `blobTargetRunKey` construction: with reference-parent carry a shard's current run may physically
         /// live under an older generation's key, and the seal ref is the only authority for the real key.
-        /// Group the adopted `blob_target_runs` by the ref's explicit `shard`. Absent seal => no candidates.
+        /// Group the adopted `blob_target_runs` by the ref's explicit `shard`. No seal at generation 0 => no candidates.
         std::map<uint64_t, std::vector<RunRef>> runs_by_shard;
         std::map<uint64_t, CondemnedSummary> summaries;
         if (const auto adopted = readFoldSeal(state.snap_generation, state.snap_attempt))
         {
+            preview.snapshot = SnapshotVerdict::Adopted;
             for (const RunRef & r : adopted->blob_target_runs)
                 runs_by_shard[r.shard].push_back(r);
             summaries = adopted->condemned_summary;
+        }
+        else if (state.snap_generation > 0)
+        {
+            preview.snapshot = SnapshotVerdict::SealMissing;
+            preview.missing_seal = fmt::format(
+                "CAS GC: the adopted fold seal (generation {}, attempt {}) is missing under a live gc/state; expected key {}",
+                state.snap_generation, state.snap_attempt, layout.foldSealKey(state.snap_generation, state.snap_attempt));
+            return preview;
         }
 
         /// Every shard, read the way a round reads it: a shard the round would refuse adds no row and is named instead.
@@ -5384,24 +5393,43 @@ Gc::DeletePreview Gc::previewDeletes()
         return preview;
     };
 
+    const auto unread_result = [](String why)
+    {
+        DeletePreview unread;
+        unread.snapshot = SnapshotVerdict::Unread;
+        unread.unread = std::move(why);
+        return unread;
+    };
+
+    uint64_t highest_generation_seen = 0;
     for (size_t attempt = 1;; ++attempt)
     {
         const auto state_bytes = op.read(layout.gcStateKey(), Retry::standard());
         if (!state_bytes)
-            return {};
-        DeletePreview preview = preview_of(decodeGenerationFourGcState(state_bytes->bytes));
-        if (preview.refused_shards.empty())
+        {
+            if (attempt == 1)
+                return {};
+            return unread_result("gc/state vanished while the GC snapshot was being confirmed");
+        }
+        const GcState state = decodeGenerationFourGcState(state_bytes->bytes);
+        /// A round never lowers the generation; a lower one means the snapshot this invocation started from is gone.
+        if (state.snap_generation < highest_generation_seen)
+            return unread_result(fmt::format(
+                "gc/state went from snapshot generation {} back to {} while the GC snapshot was being confirmed",
+                highest_generation_seen, state.snap_generation));
+        highest_generation_seen = state.snap_generation;
+        DeletePreview preview = preview_of(state);
+        if (preview.refused_shards.empty() && preview.snapshot != SnapshotVerdict::SealMissing)
             return preview;
-        /// A refusal is the round's only under the `gc/state` it was read under: a newer round may have pruned the run.
+        /// A refusal or an absent seal is the round's only under the `gc/state` it was read under: a newer round may have pruned it.
         const std::optional<Meta> state_now = op.head(layout.gcStateKey(), Retry::standard());
-        if (state_now && sameVersion(state_now->etag, state_bytes->etag))
+        if (!state_now)
+            return unread_result("gc/state vanished while the GC snapshot was being confirmed");
+        if (sameVersion(state_now->etag, state_bytes->etag))
             return preview;
         if (attempt == kAdoptedSnapshotReadAttempts)
-        {
-            DeletePreview unread;
-            unread.unread = fmt::format("gc/state moved during each of {} reads of the GC snapshot, so its rows were not read", attempt);
-            return unread;
-        }
+            return unread_result(fmt::format(
+                "gc/state moved during each of {} reads of the GC snapshot, so its rows were not read", attempt));
     }
 }
 

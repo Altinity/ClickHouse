@@ -1842,7 +1842,9 @@ TEST(CASRefGc, RefSnaplogLifecycleE2E)
     const FsckReport rep = runFsck(*store, /*detail*/true);
     EXPECT_TRUE(rep.clean());
     EXPECT_EQ(rep.dangling, 0u);
-    EXPECT_TRUE(gc.previewDeletes().deletes.empty()) << "cas-gc-dryrun equivalent: no pending content deletes";
+    const Gc::DeletePreview dry_run = gc.previewDeletes();
+    EXPECT_EQ(dry_run.snapshot, Gc::SnapshotVerdict::Adopted);
+    EXPECT_TRUE(dry_run.deletes.empty()) << "cas-gc-dryrun equivalent: no pending content deletes";
 }
 
 /// (8) A malformed/adversarial ref key aborts ref folding for the round: no partial delta, no cursor
