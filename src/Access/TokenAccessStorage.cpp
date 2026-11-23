@@ -1,4 +1,5 @@
 #include <Access/TokenAccessStorage.h>
+#include <Access/AccessChangesNotifier.h>
 #include <Access/AccessControl.h>
 #include <Access/ExternalAuthenticators.h>
 #include <Access/User.h>
