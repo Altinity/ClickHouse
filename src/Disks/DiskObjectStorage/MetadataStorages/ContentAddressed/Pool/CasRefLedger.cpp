@@ -5687,7 +5687,7 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     const auto initial_it = std::find_if(initial_catalog.catalog.entries.begin(), initial_catalog.catalog.entries.end(),
         [&](const CatalogEntry & entry) { return entry.ns == ns; });
     if (initial_it == initial_catalog.catalog.entries.end())
-        return {};
+        return {.already_absent = true};
     if (expected_incarnation && initial_it->incarnation != *expected_incarnation)
         throwCasWriteRetryLater(fmt::format(
             "CAS namespace '{}': exact removal life {} differs from current catalog life {}",
@@ -5704,6 +5704,8 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
                 return isCreatorFenceTerminal(
                     cancel_op, layout, creator.server_root_id, creator.writer_epoch, policy);
             },
+            /// The mount fence `cancel_op` checks is read live, so there is nothing to refresh.
+            [](const Retry &) {},
             policy))
         {
             case CasRefCatalog::StalledCreatingCancelOutcome::Cancelled:
@@ -5714,9 +5716,16 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
                     "CAS namespace removal '{}': its catalog entry is still Creating under a creator "
                     "fence that is not yet provably terminal; retry later", ns.string()));
             case CasRefCatalog::StalledCreatingCancelOutcome::EntryChanged:
+            {
+                /// Another actor, such as the GC leader, cancelled the row first: the same answer as no row.
+                const CasRefCatalog::Snapshot after = CasRefCatalog::read(initial_op, layout, policy);
+                if (std::none_of(after.catalog.entries.begin(), after.catalog.entries.end(),
+                        [&](const CatalogEntry & entry) { return entry.ns == ns; }))
+                    return {.already_absent = true};
                 throwCasWriteRetryLater(fmt::format(
                     "CAS namespace removal '{}': exact Creating row changed before cancellation; retry later",
                     ns.string()));
+            }
             case CasRefCatalog::StalledCreatingCancelOutcome::FencedOut:
                 throwCasWriteRetryLater(fmt::format(
                     "CAS namespace removal '{}': mount fence moved before stalled creation cancellation",

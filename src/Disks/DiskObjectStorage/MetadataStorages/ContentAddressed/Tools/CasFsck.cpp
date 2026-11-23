@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBoundedRun.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobIntentFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
@@ -832,7 +833,7 @@ PendingVerdict checkPendingRow(CasOperation & op, const Layout & layout, const B
 /// intentionally left to `runFsck`, which decides whether partial results were requested.
 void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, const ToolDeadline & deadline,
                   const String & namespace_prefix, bool fix_legacy_markers, bool verify_intents, size_t fix_concurrency,
-                  FsckReport & report)
+                  bool read_creator_slots, FsckReport & report)
 {
     if (fix_legacy_markers && !namespace_prefix.empty())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "fsck: a fix needs a scan of the whole pool, not of namespaces under '{}'", namespace_prefix);
@@ -907,12 +908,49 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
     };
     std::vector<FsckWalkLife> walk_lives;
     walk_lives.reserve(catalog_cut.catalog.entries.size());
+    /// One mount-slot read per creator root and writer epoch, kept with its error: rows can share a creator,
+    /// and each read of a slot that keeps failing costs a whole request window.
+    struct CreatorSlotRead
+    {
+        std::optional<CreatorSlotStatus> slot;
+        String error;
+    };
+    std::map<std::pair<String, uint64_t>, CreatorSlotRead> creator_slot_reads;
+    report.catalog_has_no_walkable_row = !catalog_cut.catalog.entries.empty()
+        && std::all_of(catalog_cut.catalog.entries.begin(), catalog_cut.catalog.entries.end(),
+                       [](const CatalogEntry & entry) { return entry.state == NsState::Creating; });
     for (const CatalogEntry & entry : catalog_cut.catalog.entries)
     {
         if (!entry.ns.string().starts_with(namespace_prefix))
             continue;
-        if (entry.state == NsState::Creating)
+        if (entry.state == NsState::Creating && !read_creator_slots)
             continue;
+        if (entry.state == NsState::Creating)
+        {
+            const auto [slot_read, first] = creator_slot_reads.try_emplace(
+                std::pair{entry.creator->server_root_id, entry.creator->writer_epoch});
+            if (first)
+            {
+                try
+                {
+                    slot_read->second.slot = probeCreatorSlot(op, layout, entry.creator->server_root_id,
+                        entry.creator->writer_epoch, deadline.bound(op, "reading creator mount slots"));
+                }
+                catch (const Exception & e)
+                {
+                    if (e.code() == ErrorCodes::TIMEOUT_EXCEEDED || e.code() == ErrorCodes::LOGICAL_ERROR)
+                        throw;
+                    deadline.rethrowIfOutOfTime(op, e, "reading creator mount slots");
+                    slot_read->second.error = e.message();
+                }
+            }
+            FsckCreatingRow row{.ns = entry.ns.string(), .creator_root = entry.creator->server_root_id,
+                .writer_epoch = entry.creator->writer_epoch, .slot = slot_read->second.slot,
+                .slot_read_error = slot_read->second.error};
+            ++(row.slot == CreatorSlotStatus::Terminal ? report.stalled_creating : report.creating_unproven);
+            report.creating_rows.push_back(std::move(row));
+            continue;
+        }
         try
         {
             if (const auto life = catalog_cut.life_index.resolve(entry.incarnation))
@@ -1748,13 +1786,13 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
 FsckReport runFsck(Pool & store, bool detail, FsckProgress on_progress,
                    const ToolDeadline & deadline,
                    bool partial_on_deadline, const String & namespace_prefix, bool fix_legacy_markers, bool verify_intents,
-                   size_t fix_concurrency)
+                   size_t fix_concurrency, bool read_creator_slots)
 {
     FsckReport report;
     try
     {
         runFsckImpl(store, detail, on_progress, deadline, namespace_prefix, fix_legacy_markers, verify_intents, fix_concurrency,
-                    report);
+                    read_creator_slots, report);
     }
     catch (const Exception & e)
     {
@@ -1823,8 +1861,8 @@ uint64_t fsckIntentsVerified(const FsckReport & report)
     return report.intents_verified ? 1 : 0;
 }
 
-/// Every count both surfaces render, in summary-line order. Every term of `FsckReport::clean` is a column: a SQL
-/// consumer sees no other view of the report. `stale_edge` is nonzero only in `detail` mode, which the SQL scan never
+/// Every count both surfaces render, in summary-line order; a field with an empty SQL column name is on the summary
+/// line only. Every term of `FsckReport::clean` is a column: a SQL consumer sees no other view of the report. `stale_edge` is nonzero only in `detail` mode, which the SQL scan never
 /// runs, and is kept as a column because "absent" and "zero" are different facts. A SQL scan classifies intents from
 /// the listing alone, so the per-intent verdicts and the fix's counts are not columns.
 constexpr std::array kFsckFields{
@@ -1855,6 +1893,8 @@ constexpr std::array kFsckFields{
     FsckField{"janitor_pending", "namespace_janitor_pending", 11, fsckCount<&FsckReport::namespace_janitor_pending>},
     FsckField{"janitor_pending_bytes", "namespace_janitor_pending_bytes", 12, fsckCount<&FsckReport::namespace_janitor_pending_bytes>},
     FsckField{"janitor_pending_lives", "namespace_janitor_pending_lives", 13, fsckCount<&FsckReport::namespace_janitor_pending_lives>},
+    FsckField{"stalled_creating", "", 0, fsckCount<&FsckReport::stalled_creating>},
+    FsckField{"creating_unproven", "", 0, fsckCount<&FsckReport::creating_unproven>},
     FsckField{"unchecked", "unchecked", 9, fsckCount<&FsckReport::unchecked>},
     FsckField{"ref_records_walked", "ref_records_walked", 14, fsckCount<&FsckReport::ref_records_walked>},
     FsckField{"physical_bytes", "physical_bytes", 15, fsckCount<&FsckReport::physical_bytes>},
@@ -1908,6 +1948,48 @@ String formatFsckSummary(const FsckReport & report)
     if (report.partial)
         out << " partial=1 reason='" << report.partial_reason << "'";
     return out.str();
+}
+
+String formatFsckPipelineNote(const FsckReport & report)
+{
+    const uint64_t in_pipeline = report.pending_gc + report.awaiting_gc;
+    if (in_pipeline == 0)
+        return {};
+    /// GC suppresses every delete while it has no namespace to walk and the catalog is not empty.
+    const char * const verdict = report.catalog_has_no_walkable_row
+        ? "GC deletes none of them while every catalog row is `Creating`; `stalled_creating` counts the rows GC cancels"
+        : "expected, no action needed";
+    return fmt::format(
+        "note: {} unreferenced object(s) are inside the normal GC deletion pipeline "
+        "(condemn and create the intent -> delete the body -> remove the intent takes ~3 rounds) — {}",
+        in_pipeline, verdict);
+}
+
+String formatFsckCreatingRow(const FsckCreatingRow & row)
+{
+    if (!row.slot)
+        return fmt::format("note: namespace '{}' is `Creating` under creator '{}' at writer epoch {}; its mount slot is "
+                           "unreadable ({}): GC keeps the row while the slot cannot be read",
+                           row.ns, row.creator_root, row.writer_epoch, row.slot_read_error);
+    const char * verdict = "";
+    switch (*row.slot)
+    {
+        case CreatorSlotStatus::Terminal:
+            verdict = "terminal: the next GC round cancels the row";
+            break;
+        case CreatorSlotStatus::Live:
+            verdict = "live: the creator may still finish; GC cancels the row once that server remounts or GC fences "
+                      "its unrenewed mount slot";
+            break;
+        case CreatorSlotStatus::Absent:
+            verdict = "absent on this read: GC does not cancel the row while the slot is absent";
+            break;
+        case CreatorSlotStatus::Undecodable:
+            verdict = "undecodable: GC cannot cancel the row while the slot does not decode";
+            break;
+    }
+    return fmt::format("note: namespace '{}' is `Creating` under creator '{}' at writer epoch {}; its mount slot is {}",
+                       row.ns, row.creator_root, row.writer_epoch, verdict);
 }
 
 }

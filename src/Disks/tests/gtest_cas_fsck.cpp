@@ -482,6 +482,157 @@ TEST(CASFsck, LifelessKeyIsRecordedAndTheHealthyNamespaceIsStillReported)
     EXPECT_EQ(rep.dangling, 0u);
 }
 
+namespace
+{
+/// A summary scan configured as `cas-fsck` runs it: it reads the creator slot of each `Creating` row.
+FsckReport runFsckReadingCreatorSlots(Pool & store)
+{
+    return runFsck(store, /*detail=*/false, {}, {}, /*partial_on_deadline=*/false, /*namespace_prefix=*/{},
+                   /*fix_legacy_markers=*/false, /*verify_intents=*/false, /*fix_concurrency=*/1, /*read_creator_slots=*/true);
+}
+}
+
+/// Every `Creating` row is reported with its creator and what the creator's slot says, in summary mode too:
+/// a higher epoch or a farewell is terminal, a slot at the row's epoch is live, no slot is absent, and a
+/// slot that does not decode is undecodable. Only the terminal ones count as `stalled_creating`.
+TEST(CASFsck, EveryCreatingRowIsReportedWithItsCreatorSlot)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    CasOperation op = store->openRequests().admit();
+    store->namespaceLife(RootNamespace{"00/live@cas@"});
+    const auto admit_creating = [&](const String & ns, UInt128 incarnation, const String & root)
+    {
+        CasRefCatalog::casAdmitEntry(op, layout, store->poolConfig().gc_shards, CatalogEntry{
+            .ns = RootNamespace{ns}, .state = NsState::Creating, .incarnation = incarnation,
+            .creator = CreatorFence{.server_root_id = root, .writer_epoch = 1, .fence_generation = 1}});
+    };
+    admit_creating("00/superseded@cas@", UInt128{0xa1}, "moved-creator");
+    admit_creating("00/farewell@cas@", UInt128{0xa2}, "retired-creator");
+    admit_creating("00/unproven@cas@", UInt128{0xa3}, "never-mounted");
+    admit_creating("00/running@cas@", UInt128{0xa4}, "running-creator");
+    admit_creating("00/garbled@cas@", UInt128{0xa5}, "garbled-creator");
+    setWatermarkMinActive(*backend, layout, "moved-creator", /*writer_epoch*/ 2, std::numeric_limits<uint64_t>::max());
+    setWatermarkMinActive(*backend, layout, "retired-creator", /*writer_epoch*/ 1, std::numeric_limits<uint64_t>::max());
+    setWatermarkMinActive(*backend, layout, "running-creator", /*writer_epoch*/ 1, /*min_active_build_sequence*/ 1);
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.mountKey("garbled-creator"), "not-a-lease", Retry::once())));
+
+    const FsckReport rep = runFsckReadingCreatorSlots(*store);
+
+    EXPECT_EQ(rep.stalled_creating, 2u) << formatFsckSummary(rep);
+    EXPECT_EQ(rep.creating_unproven, 3u) << formatFsckSummary(rep);
+    EXPECT_NE(formatFsckSummary(rep).find("stalled_creating=2"), String::npos) << formatFsckSummary(rep);
+    EXPECT_NE(formatFsckSummary(rep).find("creating_unproven=3"), String::npos) << formatFsckSummary(rep);
+    std::map<String, std::pair<String, CreatorSlotStatus>> rows;
+    for (const FsckCreatingRow & row : rep.creating_rows)
+    {
+        EXPECT_EQ(row.writer_epoch, 1u);
+        ASSERT_TRUE(row.slot) << row.ns << ": " << row.slot_read_error;
+        rows.emplace(row.ns, std::pair{row.creator_root, *row.slot});
+    }
+    EXPECT_EQ(rows, (std::map<String, std::pair<String, CreatorSlotStatus>>{
+        {"00/superseded@cas@", {"moved-creator", CreatorSlotStatus::Terminal}},
+        {"00/farewell@cas@", {"retired-creator", CreatorSlotStatus::Terminal}},
+        {"00/unproven@cas@", {"never-mounted", CreatorSlotStatus::Absent}},
+        {"00/running@cas@", {"running-creator", CreatorSlotStatus::Live}},
+        {"00/garbled@cas@", {"garbled-creator", CreatorSlotStatus::Undecodable}}}));
+    EXPECT_TRUE(rep.clean()) << "a `Creating` row is not a hard finding";
+    EXPECT_FALSE(rep.catalog_has_no_walkable_row) << "the `Live` namespace is walkable";
+}
+
+/// The line `cas-fsck` prints for a `Creating` row names the namespace, the creator, the epoch, and the
+/// slot status with what GC does about it.
+TEST(CASFsck, TheCreatingRowNoteSaysWhatGcDoesForEachSlotStatus)
+{
+    const auto note = [](CreatorSlotStatus slot)
+    {
+        return formatFsckCreatingRow(FsckCreatingRow{.ns = "00/t@cas@", .creator_root = "srv", .writer_epoch = 7, .slot = slot,
+            .slot_read_error = {}});
+    };
+    for (const CreatorSlotStatus slot :
+         {CreatorSlotStatus::Terminal, CreatorSlotStatus::Live, CreatorSlotStatus::Absent, CreatorSlotStatus::Undecodable})
+        EXPECT_NE(note(slot).find("namespace '00/t@cas@' is `Creating` under creator 'srv' at writer epoch 7"), String::npos)
+            << note(slot);
+    EXPECT_NE(note(CreatorSlotStatus::Terminal).find("terminal: the next GC round cancels"), String::npos);
+    EXPECT_NE(note(CreatorSlotStatus::Live).find("live: "), String::npos);
+    EXPECT_NE(note(CreatorSlotStatus::Absent).find("absent on this read: "), String::npos);
+    EXPECT_NE(note(CreatorSlotStatus::Undecodable).find("undecodable: "), String::npos);
+    const String unreadable = formatFsckCreatingRow(FsckCreatingRow{.ns = "00/t@cas@", .creator_root = "srv",
+        .writer_epoch = 7, .slot = std::nullopt, .slot_read_error = "injected"});
+    EXPECT_NE(unreadable.find("namespace '00/t@cas@' is `Creating` under creator 'srv' at writer epoch 7"), String::npos)
+        << unreadable;
+    EXPECT_NE(unreadable.find("unreadable (injected)"), String::npos) << unreadable;
+}
+
+#if USE_AWS_S3
+/// A store error reading one creator's mount slot marks that row unreadable and the scan goes on: the other
+/// `Creating` row is still classified.
+TEST(CASFsck, AnUnreadableCreatorSlotMarksItsRowAndTheScanGoesOn)
+{
+    auto backend = std::make_shared<FailExactGetBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    CasOperation op = store->openRequests().admit();
+    const auto admit_creating = [&](const String & ns, UInt128 incarnation, const String & root)
+    {
+        CasRefCatalog::casAdmitEntry(op, layout, store->poolConfig().gc_shards, CatalogEntry{
+            .ns = RootNamespace{ns}, .state = NsState::Creating, .incarnation = incarnation,
+            .creator = CreatorFence{.server_root_id = root, .writer_epoch = 1, .fence_generation = 1}});
+        setWatermarkMinActive(*backend, layout, root, /*writer_epoch*/ 1, /*min_active_build_sequence*/ 1);
+    };
+    admit_creating("00/a-unreadable@cas@", UInt128{0xb1}, "unreadable-creator");
+    admit_creating("00/b-running@cas@", UInt128{0xb2}, "running-creator");
+    backend->fail(layout.mountKey("unreadable-creator"));
+
+    FsckReport rep;
+    ASSERT_NO_THROW(rep = runFsckReadingCreatorSlots(*store));
+
+    ASSERT_EQ(rep.creating_rows.size(), 2u);
+    EXPECT_EQ(rep.stalled_creating, 0u);
+    EXPECT_EQ(rep.creating_unproven, 2u);
+    for (const FsckCreatingRow & row : rep.creating_rows)
+    {
+        if (row.creator_root == "unreadable-creator")
+        {
+            EXPECT_FALSE(row.slot);
+            EXPECT_NE(row.slot_read_error.find("injected access denial"), String::npos) << row.slot_read_error;
+        }
+        else
+        {
+            EXPECT_EQ(row.slot, std::optional<CreatorSlotStatus>{CreatorSlotStatus::Live});
+        }
+    }
+}
+#endif
+
+/// GC deletes nothing only while the catalog has rows and none of them is walkable, so only then does the
+/// note on the deletion pipeline stop calling the backlog "no action needed".
+TEST(CASFsck, ThePipelineNoteSaysNoActionNeededUnlessNoCatalogRowIsWalkable)
+{
+    FsckReport rep;
+    rep.pending_gc = 3;
+    rep.stalled_creating = 1;
+    EXPECT_NE(formatFsckPipelineNote(rep).find("no action needed"), String::npos) << formatFsckPipelineNote(rep);
+    rep.catalog_has_no_walkable_row = true;
+    const String note = formatFsckPipelineNote(rep);
+    EXPECT_EQ(note.find("no action needed"), String::npos) << note;
+    EXPECT_NE(note.find("Creating"), String::npos) << note;
+}
+
+TEST(CASFsck, ACatalogOfOnlyCreatingRowsHasNoWalkableRow)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    CasOperation op = store->openRequests().admit();
+    EXPECT_FALSE(runFsck(*store, /*detail*/ false).catalog_has_no_walkable_row) << "an empty catalog is proved empty";
+    CasRefCatalog::casAdmitEntry(op, layout, store->poolConfig().gc_shards, CatalogEntry{
+        .ns = RootNamespace{"00/only@cas@"}, .state = NsState::Creating, .incarnation = UInt128{0xb1},
+        .creator = CreatorFence{.server_root_id = "never-mounted", .writer_epoch = 1, .fence_generation = 1}});
+    EXPECT_TRUE(runFsck(*store, /*detail*/ false).catalog_has_no_walkable_row);
+}
+
 /// A COMPLETE, canonical namespace-life key (a real `_files` write under a real admitted life) whose
 /// catalog row is then removed entirely -- exactly what a fenced GC's exact-CAS row deletion leaves
 /// behind, before the perpetual namespace janitor's next page reaches it -- must classify as
@@ -3056,6 +3207,78 @@ TEST(CASFsck, PendingRowOverAReferencedBodyIsCheckedToo)
         EXPECT_EQ(rep.pending_without_intent, remove_intent ? 1u : 0u);
         EXPECT_EQ(rep.clean(), !remove_intent);
     }
+}
+
+/// `Creating` rows of one creator root and writer epoch share one read of its mount slot, a failed one
+/// too: a slot that keeps failing would otherwise cost a request window per row. Every row is reported.
+TEST(CASFsck, CreatingRowsOfOneCreatorShareOneFailedSlotRead)
+{
+    auto backend = std::make_shared<FsckFaultBackend>();
+    PoolPtr store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    CasOperation op = store->openRequests().admit();
+    const auto admit_creating = [&](const String & ns, UInt128 incarnation, const String & root)
+    {
+        CasRefCatalog::casAdmitEntry(op, layout, store->poolConfig().gc_shards, CatalogEntry{
+            .ns = RootNamespace{ns}, .state = NsState::Creating, .incarnation = incarnation,
+            .creator = CreatorFence{.server_root_id = root, .writer_epoch = 1, .fence_generation = 1}});
+    };
+    admit_creating("00/a-first@cas@", UInt128{0xc1}, "shared-creator");
+    admit_creating("00/b-second@cas@", UInt128{0xc2}, "shared-creator");
+    admit_creating("00/c-third@cas@", UInt128{0xc3}, "shared-creator");
+    admit_creating("00/d-other@cas@", UInt128{0xc4}, "other-creator");
+    backend->refused_reads.insert(layout.mountKey("shared-creator"));
+    backend->refused_reads.insert(layout.mountKey("other-creator"));
+
+    FsckReport rep;
+    ASSERT_NO_THROW(rep = runFsckReadingCreatorSlots(*store));
+
+    EXPECT_EQ(backend->getCount(layout.mountKey("shared-creator")), 1u) << "three rows of one creator, one slot read";
+    EXPECT_EQ(backend->getCount(layout.mountKey("other-creator")), 1u) << "control: another creator costs its own read";
+    ASSERT_EQ(rep.creating_rows.size(), 4u);
+    EXPECT_EQ(rep.creating_unproven, 4u);
+    for (const FsckCreatingRow & row : rep.creating_rows)
+    {
+        EXPECT_FALSE(row.slot) << row.ns;
+        EXPECT_NE(row.slot_read_error.find("injected refusal of the read of " + layout.mountKey(row.creator_root)),
+                  String::npos) << row.ns << ": " << row.slot_read_error;
+    }
+}
+
+/// `SYSTEM CAS FSCK` has no column for `Creating` rows, so its scan reads no creator's mount slot; the scan
+/// `cas-fsck` runs reads each one and reports the rows.
+TEST(CASFsck, OnlyTheCliScanReadsCreatorSlots)
+{
+    auto backend = std::make_shared<FsckFaultBackend>();
+    PoolPtr store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    CasOperation op = store->openRequests().admit();
+    const auto admit_creating = [&](const String & ns, UInt128 incarnation, const String & root)
+    {
+        CasRefCatalog::casAdmitEntry(op, layout, store->poolConfig().gc_shards, CatalogEntry{
+            .ns = RootNamespace{ns}, .state = NsState::Creating, .incarnation = incarnation,
+            .creator = CreatorFence{.server_root_id = root, .writer_epoch = 1, .fence_generation = 1}});
+        setWatermarkMinActive(*backend, layout, root, /*writer_epoch*/ 1, /*min_active_build_sequence*/ 1);
+    };
+    admit_creating("00/a@cas@", UInt128{0xd1}, "creator-a");
+    admit_creating("00/b@cas@", UInt128{0xd2}, "creator-b");
+    const auto slot_reads = [&]
+    {
+        return backend->getCount(layout.mountKey("creator-a")) + backend->getCount(layout.mountKey("creator-b"));
+    };
+
+    const FsckReport sql = runFsck(*store, /*detail*/ false);
+
+    EXPECT_EQ(slot_reads(), 0u);
+    EXPECT_TRUE(sql.creating_rows.empty());
+    EXPECT_EQ(sql.stalled_creating + sql.creating_unproven, 0u);
+    EXPECT_TRUE(sql.catalog_has_no_walkable_row) << "the catalog is still read";
+
+    const FsckReport cli = runFsckReadingCreatorSlots(*store);
+
+    EXPECT_EQ(slot_reads(), 2u) << "one read per creator";
+    EXPECT_EQ(cli.creating_rows.size(), 2u);
+    EXPECT_EQ(cli.creating_unproven, 2u);
 }
 
 /// The row keeps the token as captured, quoted; the store answers the same tag bare. GC compares canonically and

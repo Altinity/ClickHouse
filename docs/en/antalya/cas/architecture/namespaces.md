@@ -115,6 +115,20 @@ dead (the same mount-lease terminality check `GC`'s heartbeat floor uses) does
 `reconcileStaleCreator` let a fresh opener steal the row onto its own fence and finish the two steps
 above itself.
 
+A failed cold admission (any first mutating access that wrote the `Creating` row) often has no opener
+coming back for its row. The `GC` leader therefore also removes a `Creating` row whose creator's mount
+slot certifies that the creator's writer epoch cannot finish it (a later writer epoch, a `GC` fence or a clean farewell). It does so in
+the catalog cleanup each round runs before its fold (from a pool's second round on), with one exact
+compare-and-swap on the catalog. Nothing can be published under
+a `Creating` row, so the row owns no data; its `_ckpt` is left to the namespace janitor. An opener that
+takes the row over at a later epoch, or a `DROP` that cancels it, wins the swap first, and the
+cleanup leaves the row to it.
+
+A cold admission that fails after it wrote the row, on a server that keeps running, leaves the row under
+that server's live writer epoch. A retry on that server that resolves the same namespace finds its own
+fence and finishes the creation. No certificate covers that epoch, so `GC` keeps an abandoned row until the
+server restarts or `GC` fences its mount slot; see [`Creating` rows in the catalog](/antalya/cas/operations/debugging#creating-catalog-rows).
+
 ### Removal {#removal}
 
 Dropping a table (`DROP TABLE`, and every operation that reduces to it) calls

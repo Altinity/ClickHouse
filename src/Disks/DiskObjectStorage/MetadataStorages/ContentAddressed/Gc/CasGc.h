@@ -606,13 +606,16 @@ private:
     void throwIfStateMoved(CasOperation & op, const std::optional<Etag> & state_etag, const String & failure);
 
     /// Catalog-only helping barrier run immediately after lease acquisition. It validates the adopted
-    /// parent and delegates deterministic `Removing`-row settlement to `CatalogLifecycleReconciler`.
+    /// parent and delegates deterministic settlement of completed `Removing` rows and stalled `Creating`
+    /// rows to `CatalogLifecycleReconciler`. A round without an adopted parent runs none of it.
     /// It performs no physical LIST or delete.
-    /// `completed_erases` is kept current while the drain runs, so it is valid after an exception.
-    /// `leased_etag` tells a deposed leader from a missing parent seal.
+    /// `completed_erases` (`Removing` rows) and `cancelled_creating` are kept current while the drain
+    /// runs, so they are valid after an exception. `leased_etag` tells a deposed leader from a missing
+    /// parent seal.
     CatalogLifecycleReconcileResult drainCompletedRemoving(
-        const GcState & leased_state, const std::optional<Etag> & leased_etag, uint64_t & completed_erases);
-    /// Same drain for callers that do not need the erase count.
+        const GcState & leased_state, const std::optional<Etag> & leased_etag, uint64_t & completed_erases,
+        uint64_t & cancelled_creating);
+    /// Same drain for callers that do not need the counts.
     CatalogLifecycleReconcileResult drainCompletedRemoving(const GcState & leased_state, const std::optional<Etag> & leased_etag);
 
     /// Run the independently paced physical namespace maintenance: pages from the persisted cursor while
@@ -1040,8 +1043,9 @@ private:
     void rememberObservation(const GcLease & lease);
 
     /// Re-read `gc/state` and record whether this leader still holds the lease it was admitted under.
-    /// Fail-closed: an absent, unreadable or undecodable state reads as deposed.
-    void refreshAuthority(uint64_t admitted_generation);
+    /// Fail-closed: an absent, unreadable or undecodable state reads as deposed, as does a read that
+    /// `policy` ends first.
+    void refreshAuthority(uint64_t admitted_generation, const Retry & policy = Retry::standard());
 
     PoolPtr store;
     /// Where `GcPhaseTimer` sends one record per GC phase. Empty unless a `CasGcScheduler` installed one

@@ -93,6 +93,18 @@ enum class FsckClass : uint8_t
     LegacyMarker,
 };
 
+/// One `Creating` catalog row, left by an interrupted or in-progress cold admission of its namespace, and
+/// what its creator's mount slot says about it. GC cancels the row only when the slot is `Terminal`.
+struct FsckCreatingRow
+{
+    String ns;
+    String creator_root;
+    uint64_t writer_epoch = 0;
+    /// No value when the slot read failed; `slot_read_error` then says why.
+    std::optional<CreatorSlotStatus> slot;
+    String slot_read_error;
+};
+
 /// One object or integrity finding emitted in detailed mode, or emitted for every missing reachable
 /// object even in summary mode. `key` identifies the physical or logical object; `size` is its listed
 /// size and is zero for a missing object. `reachable_from` contains `"namespace/ref"` owners for
@@ -199,6 +211,16 @@ struct FsckReport
     uint64_t namespace_janitor_pending = 0;
     uint64_t namespace_janitor_pending_bytes = 0;
     uint64_t namespace_janitor_pending_lives = 0;   /// distinct life ids counted above
+
+    /// Every `Creating` row in the scan's scope, listed in summary mode too, as there are few. Soft.
+    std::vector<FsckCreatingRow> creating_rows;
+    /// The `creating_rows` whose slot is `Terminal`: the next GC round cancels them.
+    uint64_t stalled_creating = 0;
+    /// The other `creating_rows`: GC does not cancel them while their slot says what it says.
+    uint64_t creating_unproven = 0;
+    /// The whole catalog, whatever the namespace scope, holds rows and every one is `Creating`. GC then has
+    /// no namespace to walk and deletes nothing.
+    bool catalog_has_no_walkable_row = false;
 
     uint64_t physical_bytes = 0;
     uint64_t referenced_logical_bytes = 0;
@@ -314,11 +336,14 @@ inline bool FsckReport::clean() const
 /// `deadline` bounds the WHOLE scan, each request's retries included, and throws `TIMEOUT_EXCEEDED` when it passes —
 /// unless `partial_on_deadline` is set, in which case the accumulated lower-bound counts are returned instead,
 /// flagged via `FsckReport::partial`. `namespace_prefix`, if non-empty, scopes the scan to namespaces with this
-/// prefix and skips the pool-wide unreachable classification (dangling-only mode).
+/// prefix and skips the pool-wide unreachable classification (dangling-only mode). `read_creator_slots` reads the
+/// mount slot of each `Creating` row's creator, once per creator and epoch, to fill `creating_rows`,
+/// `stalled_creating` and `creating_unproven`; without it they stay empty and no slot is read.
 FsckReport runFsck(Pool & store, bool detail, FsckProgress on_progress = {},
                    const ToolDeadline & deadline = {},
                    bool partial_on_deadline = false, const String & namespace_prefix = {},
-                   bool fix_legacy_markers = false, bool verify_intents = false, size_t fix_concurrency = 1);
+                   bool fix_legacy_markers = false, bool verify_intents = false, size_t fix_concurrency = 1,
+                   bool read_creator_slots = false);
 
 /// Render the single machine-parseable summary line (no trailing newline). This is the ONLY view of a
 /// report most consumers ever get -- the soak harness parses it, CI greps it, an operator reads it -- so
@@ -331,6 +356,12 @@ FsckReport runFsck(Pool & store, bool detail, FsckProgress on_progress = {},
 /// printed, never omitted: "absent" and "zero" are different facts, and consumers (e.g. the harness's
 /// `stale_edge_verdict`) fail closed on absence by design.
 String formatFsckSummary(const FsckReport & report);
+
+/// The note on blobs inside the normal GC deletion pipeline, or empty when there are none. No trailing newline.
+String formatFsckPipelineNote(const FsckReport & report);
+
+/// The note on one `Creating` row: its creator, the slot status and what GC does about it. No trailing newline.
+String formatFsckCreatingRow(const FsckCreatingRow & row);
 
 /// A count of `FsckReport` as both report surfaces render it: its key on the summary line, and its column of
 /// `SYSTEM CAS FSCK`, when it has one, with the column's position after the `disk` column.

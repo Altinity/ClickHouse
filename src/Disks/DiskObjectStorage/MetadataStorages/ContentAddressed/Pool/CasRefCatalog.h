@@ -189,10 +189,18 @@ public:
 
     /// Exact-CAS-deletes one observed `Creating` row only after its complete creator fence is proven
     /// terminal. This performs no `_ckpt` or other physical cleanup; debris belongs to the janitor.
+    /// `refresh_authority` runs in every attempt, inside the catalog's hot-key lane and before `op`'s
+    /// admission is checked, for a caller whose liveness is a cached flag; a caller whose liveness needs
+    /// no refresh passes a no-op. Its reads hold the lane, so it receives the cancel's own frozen policy to
+    /// bound them; a refresh that cannot finish in time must leave `op` unadmitted. The predicate runs
+    /// there too, on the catalog the attempt writes over.
+    /// A cancel whose response is lost returns `Cancelled` while the catalog still holds the bytes it wrote,
+    /// and `EntryChanged` once a later write replaced them.
     /// `policy` bounds the update; pass it to the predicate's own reads to bound those as well.
     static StalledCreatingCancelOutcome cancelStalledCreating(
         CasOperation & op, const Layout & layout, const CatalogEntry & observed,
         const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal,
+        const std::function<void(const Retry &)> & refresh_authority,
         const Retry & policy = Retry::standard());
 
     /// === The creation lifecycle, built on the two primitives above ===

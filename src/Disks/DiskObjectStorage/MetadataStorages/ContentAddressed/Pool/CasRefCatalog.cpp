@@ -581,7 +581,8 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
 
 CasRefCatalog::StalledCreatingCancelOutcome CasRefCatalog::cancelStalledCreating(
     CasOperation & op, const Layout & layout, const CatalogEntry & observed,
-    const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal, const Retry & policy)
+    const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal,
+    const std::function<void(const Retry &)> & refresh_authority, const Retry & policy)
 {
     if (observed.state != NsState::Creating || !observed.creator)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
@@ -589,8 +590,13 @@ CasRefCatalog::StalledCreatingCancelOutcome CasRefCatalog::cancelStalledCreating
             "creator fence",
             observed.ns.string());
 
+    /// One deadline for the cancel and its in-lane authority check, so a slow check cannot hold the lane
+    /// after the cancel could no longer write.
+    const Retry frozen = op.freeze(policy);
     const auto mutate = [&](const RefCatalog & cur) -> RefCatalog
     {
+        /// Inside the lane: a leader deposed while it queued must not write on a reading taken before.
+        refresh_authority(frozen);
         if (!op.admitted())
             throw CatalogFenceMovedMarker{};
 
@@ -605,9 +611,11 @@ CasRefCatalog::StalledCreatingCancelOutcome CasRefCatalog::cancelStalledCreating
         return next;
     };
 
+    /// A resend after the lease is lost is harmless: it lands only on the unchanged catalog, so on this same life, and a
+    /// creator certified terminal cannot finish it, because writer epochs are never reissued.
     try
     {
-        casUpdateImpl(op, layout, mutate, [](const RefCatalog & c) { return encodeRefCatalog(c); }, policy);
+        casUpdateImpl(op, layout, mutate, [](const RefCatalog & c) { return encodeRefCatalog(c); }, frozen);
     }
     catch (const CatalogFenceMovedMarker &) { return StalledCreatingCancelOutcome::FencedOut; }
     catch (const CatalogEntryMismatchMarker &) { return StalledCreatingCancelOutcome::EntryChanged; }

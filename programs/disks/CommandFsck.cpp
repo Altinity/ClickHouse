@@ -103,7 +103,7 @@ public:
                                          "run against a QUIESCED pool or raise --timeout");
 
         const Cas::FsckReport report = Cas::runFsck(*store, detail, on_progress, deadline, partial, namespace_prefix, fix_legacy_markers, verify_intents,
-                                                     concurrency);
+                                                     concurrency, /*read_creator_slots=*/true);
 
         /// Built by `Cas::formatFsckSummary` rather than here, so the line is reachable from a unit test.
         /// It was assembled inline until 2026-07-26, and in that time `corrupted_runs` was added to the
@@ -115,11 +115,8 @@ public:
         /// deliberately NOT part of this sentence: those blobs look exactly like an `AwaitingGc`
         /// backlog but will never drain, and being swept into "expected, no action needed" is what
         /// hid them.
-        if (report.pending_gc + report.awaiting_gc > 0)
-            std::cout << "note: " << report.pending_gc + report.awaiting_gc
-                      << " unreferenced object(s) are inside the normal GC deletion pipeline "
-                         "(condemn and create the intent -> delete the body -> remove the intent takes ~3 rounds) — "
-                         "expected, no action needed\n";
+        if (const String note = Cas::formatFsckPipelineNote(report); !note.empty())
+            std::cout << note << "\n";
         if (report.stale_edge > 0)
             std::cout << "note: " << report.stale_edge
                       << " unreferenced object(s) carry ONLY source edges naming manifests that no longer "
@@ -169,6 +166,8 @@ public:
         if (report.legacy_markers_changed > 0)
             std::cout << "note: " << report.legacy_markers_changed
                       << " legacy `.meta` marker(s) changed between their `HEAD` and the delete and were left; run the fix again\n";
+        for (const Cas::FsckCreatingRow & row : report.creating_rows)
+            std::cout << Cas::formatFsckCreatingRow(row) << "\n";
         if (report.unaccounted > 0)
             std::cout << "note: " << report.unaccounted
                       << " object(s) are outside the current GC view — normal only as a transient "

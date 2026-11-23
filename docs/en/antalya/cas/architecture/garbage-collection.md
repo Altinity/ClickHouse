@@ -43,7 +43,7 @@ follower or a deferred round execution returns before that commit.
 | # | Phase (`GcPhaseTimer` name) | Runs on | What it does |
 |---|---|---|---|
 | 1 | `lease` | always | Create, renew, observe or steal the lease inside `gc/state`. The only phase a `NotALeader` round emits |
-| 2 | `pre_fold_ref_drain` | leader | Resolve catalog `Removing` rows whose cleanup evidence the adopted parent already sealed; drop the completed ones before defer or new fold work |
+| 2 | `pre_fold_ref_drain` | leader | Resolve catalog `Removing` rows whose cleanup evidence the adopted parent already sealed; drop the completed ones, and cancel `Creating` rows whose creator's mount slot proves it cannot finish, before defer or new fold work |
 | 3 | `heartbeat_floor` | leader | One `LIST` of `gc/server-roots/`, one `GET` per mount slot, fence-out `PUT` for any mount whose write-token has held stable past the threshold |
 | 4 | `defer_decision` | leader | One full `LIST` of `cas/ns/stream/`, build the catalog-keyed ref walk plan; decide `DEFER` (fewer changed rows than the fold threshold, no deletion due, defer limit not reached) or continue to a full fold |
 | 5 | `parent_seal_read` | fold | Capture the parent fold seal's run references before the fold mutates the in-memory generation/attempt |
@@ -190,7 +190,8 @@ evidence from the fold running now.
   every attempt on that row.
 - **Observability:** phase row `pre_fold_ref_drain`; metric `deleted` (erases the store acknowledged,
   counted before the resolution read so a drain that throws still reports them, plus erases a
-  resolution read proved)
+  resolution read proved); metric `cancelled_creating` (the `Creating` rows the drain cancelled;
+  see [`Creating` rows in the catalog](/antalya/cas/operations/debugging#creating-catalog-rows))
 
 On a fresh pool (`snap_generation = 0`) phase 2 is a no-op that still emits its phase row; it can
 first remove a row only in a leader round *after* some earlier fold committed a generation. Phase 3

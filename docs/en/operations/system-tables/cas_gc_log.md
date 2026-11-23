@@ -84,7 +84,7 @@ The phases, in execution order:
 | `phase` | What it covers | Dominant I/O |
 |---|---|---|
 | `lease` | Acquire, renew, or observe the GC lease. The only phase a `NotALeader` round emits. | `gc/state` `GET` + compare-and-swap |
-| `pre_fold_ref_drain` | Resolve catalog rows whose terminal fold evidence is already adopted before this invocation publishes or defers. `phase_metrics` carries `deleted`, the rows erased; it is filled for a drain that throws as well. | catalog `GET` + exact compare-and-swap |
+| `pre_fold_ref_drain` | Resolve catalog rows whose terminal fold evidence is already adopted, and cancel `Creating` rows whose creator's mount slot proves it cannot finish, before this invocation publishes or defers. `phase_metrics` carries `deleted`, the rows erased, filled for a drain that throws as well, and `cancelled_creating`, the `Creating` rows cancelled. | catalog `GET` + exact compare-and-swap; one mount-slot `GET` per creator and writer epoch of a `Creating` row |
 | `heartbeat_floor` | Classify every mount slot and fence out the dead ones. | `LIST` of the mount prefix, one `GET` per mount, one `PUT` per fence |
 | `defer_decision` | The skip-unchanged decision: deletion-due check plus the round's one enumeration of the ref prefix. | one full ref-prefix `LIST`, two fold-seal `GET`s |
 | `parent_seal_read` | Capture the pre-fold seal's run refs for the hand-off reclaim. | one fold-seal `GET` |

@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <deque>
 #include <limits>
+#include <map>
 #include <optional>
 #include <set>
 #include <variant>
@@ -831,9 +832,14 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     {
         GcPhaseTimer t(phase_sink, "pre_fold_ref_drain");
         uint64_t completed_erases = 0;
+        uint64_t cancelled_creating = 0;
         /// Declared after `t`, so it runs before the timer emits its record, on a throw too.
-        SCOPE_EXIT({ t.metric("deleted", completed_erases); });
-        const CatalogLifecycleReconcileResult drain_result = drainCompletedRemoving(state, state_etag, completed_erases);
+        SCOPE_EXIT({
+            t.metric("deleted", completed_erases);
+            t.metric("cancelled_creating", cancelled_creating);
+        });
+        const CatalogLifecycleReconcileResult drain_result
+            = drainCompletedRemoving(state, state_etag, completed_erases, cancelled_creating);
         if (drain_result.authority_status != AuthorityStatus::Authoritative
             || drain_result.catalog_resolution != CatalogResolution::DrainComplete)
             throwCasWriteRetryLater("CAS GC pre-fold drain lost authority before the catalog settled");
@@ -3719,10 +3725,18 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
             universe_authoritative ? "" : "; the caller supplied no universe";
         /// Names the real reason a `Creating`-only (or otherwise unprovable) catalog is not an empty
         /// universe, so the operator does not read a suppressed round with rows on file as "empty".
-        const String catalog_empty_note =
-            (universe_authoritative && result.frontier_namespaces == 0 && !result.catalog_cut_proved_empty)
-                ? fmt::format("; catalog holds {} row(s), none walkable/provable", catalog_snapshot.catalog.entries.size())
-                : String{};
+        String catalog_empty_note;
+        if (universe_authoritative && result.frontier_namespaces == 0 && !result.catalog_cut_proved_empty)
+        {
+            std::map<NsState, size_t> by_state;
+            for (const CatalogEntry & entry : catalog_snapshot.catalog.entries)
+                ++by_state[entry.state];
+            catalog_empty_note = fmt::format(
+                "; catalog holds {} row(s), none walkable/provable: {} `Creating`, {} `Live`, {} `Removing`; "
+                "`cas-fsck` names the creator of each `Creating` row and what its mount slot says",
+                catalog_snapshot.catalog.entries.size(), by_state[NsState::Creating], by_state[NsState::Live],
+                by_state[NsState::Removing]);
+        }
         /// The per-cause breakdown of the unproven namespaces. Without it "N of M proven" names a
         /// deficit but not its cause, and the causes want opposite operator responses.
         const String deficit_note = result.frontier_deficit.total() == 0
@@ -5391,14 +5405,14 @@ void Gc::rememberObservation(const GcLease & lease)
     last_seen_seq = lease.seq;
 }
 
-void Gc::refreshAuthority(uint64_t admitted_generation)
+void Gc::refreshAuthority(uint64_t admitted_generation, const Retry & policy)
 {
     /// Fail-closed first, so every early exit below leaves this leader deposed.
     authority_held = false;
     try
     {
         CasOperation op = store->openRequests().admit();
-        const auto got = op.read(store->layout().gcStateKey(), Retry::standard());
+        const auto got = op.read(store->layout().gcStateKey(), policy);
         if (!got)
             return;
         const GcState current = decodeGcState(got->bytes);
@@ -5595,12 +5609,16 @@ void Gc::OutcomeTally::add(OutcomeKind kind)
 CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(const GcState & leased_state, const std::optional<Etag> & leased_etag)
 {
     uint64_t completed_erases = 0;
-    return drainCompletedRemoving(leased_state, leased_etag, completed_erases);
+    uint64_t cancelled_creating = 0;
+    return drainCompletedRemoving(leased_state, leased_etag, completed_erases, cancelled_creating);
 }
 
 CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(
-    const GcState & leased_state, const std::optional<Etag> & leased_etag, uint64_t & completed_erases)
+    const GcState & leased_state, const std::optional<Etag> & leased_etag, uint64_t & completed_erases,
+    uint64_t & cancelled_creating)
 {
+    /// Without an adopted parent this drain does not run, so a stalled `Creating` row also waits for the
+    /// first round that has one. It owns no edges, so the wait costs that round and no safety.
     if (leased_state.snap_generation == 0)
         return {
             .authority_status = AuthorityStatus::Authoritative,
@@ -5628,11 +5646,19 @@ CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(
     const uint64_t admitted_generation = leased_state.lease.seq;
     refreshAuthority(admitted_generation);
     CasOperation op = store->openRequests().admit([this] { return authority_held; });
-    CatalogLifecycleReconciler reconciler(op, store->layout(), *parent);
-    SCOPE_EXIT({ completed_erases = reconciler.completedErases(); });
+    CatalogLifecycleReconciler reconciler(op, store->layout(), *parent,
+        [this, &op](const CreatorFence & creator)
+        {
+            return probeCreatorSlot(op, store->layout(), creator.server_root_id, creator.writer_epoch);
+        });
+    SCOPE_EXIT({
+        completed_erases = reconciler.completedErases();
+        cancelled_creating = reconciler.cancelledCreating();
+    });
     /// The announcement before the erase refuses admissions already in flight; a presence probe or a
     /// drop that admitted the `Removing` row after it holds a runtime that the second one detaches; without
-    /// it only a writer's catalog check in `namespaceLife` would.
+    /// it only a writer's catalog check in `namespaceLife` would. A cancelled `Creating` life is recorded
+    /// only by this, after its cancel returned, because an opener on this server may take it over first.
     const auto invalidate_retired = [&]
     {
         for (const NamespaceLifeId & life : reconciler.retiredLives())
@@ -5641,7 +5667,7 @@ CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(
     try
     {
         CatalogLifecycleReconcileResult result = reconciler.reconcile(
-            [this, admitted_generation] { refreshAuthority(admitted_generation); },
+            [this, admitted_generation](const Retry & policy) { refreshAuthority(admitted_generation, policy); },
             [this](const NamespaceLifeId & life) { store->invalidateRemovedCatalogLife(life); });
         invalidate_retired();
         return result;

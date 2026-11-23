@@ -100,6 +100,47 @@ the log and in a `corrupt_decode` event of `system.cas_log` (see
 A specific blob's own story — was it ever condemned, spared, or is it not being seen at all — is the
 per-object query in the previous section, filtered to `object_kind = 'blob'`.
 
+A round that logs `destructive work SUPPRESSED this pass ... frontier INCOMPLETE (0 of 0 namespace(s) proven;
+catalog holds N row(s), none walkable/provable: N `Creating`, ...)` found only `Creating` rows in `cas/ref_catalog`:
+see [`Creating` rows in the catalog](#creating-catalog-rows).
+
+### `Creating` rows in the catalog {#creating-catalog-rows}
+
+The first mutating access to a namespace (`CREATE TABLE`, an `INSERT`, a `FREEZE`, a part move) adds its row
+to `cas/ref_catalog` as `Creating` and flips it to `Live` once the namespace is created. A row left `Creating`
+owns no data, but it stays in the catalog. Once every table of a pool is dropped, such rows alone keep `GC`
+from deleting anything: an emptied pool is proven empty only by a catalog with no rows.
+
+`cas-fsck` prints one line per `Creating` row: the namespace, the creator's `server_root_id` and writer epoch,
+and what the creator's mount slot says; a slot it cannot read is listed as `unreadable` with the error, and the
+scan goes on. `stalled_creating` counts the `terminal` rows, `creating_unproven` the others. The `GC` leader
+cancels a row in the catalog cleanup each round runs before its fold. For each cancel it observes as successful
+it writes one INFO line and counts it in `CASGCStalledCreatingCancelled`; this is not an exact audit of which
+actor removed each row.
+
+| Mount slot | What `GC` does | Operator action |
+|---|---|---|
+| `terminal`: a slot at a later writer epoch than the row's, or at the row's own epoch a `GC` fence or a clean farewell | The next round cancels the row. | None. |
+| `live`: a slot at the row's own epoch with no fence or farewell, or at an older epoch, fenced or not (an older slot says nothing about this creator) | Nothing yet. The row turns `terminal` when the creator's server mounts again, which takes a new writer epoch, or when the leader fences its slot at the row's own epoch after watching it unrenewed for longer than the mount lease. | None for a server that comes back or is gone; for a server that keeps running, see below. To clear the rows of a server retired for good at once, drop the member with [`SYSTEM CAS DROP POOL MEMBER`](/antalya/cas/operations/migration#decommission), or offline with `clickhouse-disks cas-drop-member <server_root_id>`: it takes a later writer epoch, which makes those rows `terminal`, and cancels the rows under that server's namespaces itself. |
+| `absent` on this read | Does not cancel the row while the slot is absent. | None. |
+| `undecodable` | Never cancels the row while the slot does not decode, and warns once per creator per round. | Decode the slot with `cas-inspect '<pool prefix>/gc/server-roots/<server_root_id>/mount'`. |
+
+A store error reading one creator's slot keeps that creator's rows for the round, with one warning, and the
+cleanup goes on with the other rows.
+
+A cold admission that fails after it wrote the row, on a server that keeps running, leaves the row `live`.
+`cas-fsck` lists the row with its slot `live`. When no other row is walkable, the `GC` warning
+`destructive work SUPPRESSED` counts it among the `Creating` rows. What to do depends on whether the namespace
+is still wanted:
+
+- **Still wanted.** Run the statement again on the same server. The retry finds the row under its own writer
+  epoch and finishes the creation. This holds for an `INSERT` into the same table and for a `FREEZE` with the
+  same `WITH NAME`: each resolves the same namespace again.
+- **Abandoned.** A retried `CREATE TABLE` without a `UUID` clause gets a new table UUID, and a `FREEZE` without
+  `WITH NAME` takes the next backup number, so each retry writes a new namespace and leaves the old row. `GC`
+  does not cancel that row until the server restarts or `GC` fences its slot. To clear it, restart that server;
+  when the server is gone for good, drop the member as in the table above.
+
 ### GC refuses its bookkeeping {#gc-bookkeeping-corrupt}
 
 The refusals below fail a round with `CORRUPTED_DATA`, and each message ends with

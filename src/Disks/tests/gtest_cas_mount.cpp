@@ -3204,6 +3204,20 @@ TEST(CASFenceTerminal, ExpiredButSameEpochAndUncertifiedIsNotTerminal)
         << "expiry alone is never a certificate of death, exactly like claimMount's own discipline";
 }
 
+/// The four answers `probeCreatorSlot` gives, which the GC drain logs and `cas-fsck` reports.
+TEST(CASFenceTerminal, TheSlotProbeTellsAbsentUndecodableLiveAndTerminalApart)
+{
+    Ops ops(std::make_shared<InMemoryBackend>());
+    Layout l{"p"};
+    EXPECT_EQ(probeCreatorSlot(ops.op, l, "never-mounted", 1), CreatorSlotStatus::Absent);
+    mustCommit(ops.op.create(l.mountKey("garbled"), "garbage-not-a-lease", Retry::standard()), "undecodable lease");
+    EXPECT_EQ(probeCreatorSlot(ops.op, l, "garbled", 1), CreatorSlotStatus::Undecodable);
+    ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), /*our_epoch=*/7, 1000, 500).kind, MountClaimResult::Claimed);
+    EXPECT_EQ(probeCreatorSlot(ops.op, l, "r", 7), CreatorSlotStatus::Live);
+    EXPECT_EQ(probeCreatorSlot(ops.op, l, "r", 8), CreatorSlotStatus::Live) << "a lower epoch in the slot certifies nothing";
+    EXPECT_EQ(probeCreatorSlot(ops.op, l, "r", 6), CreatorSlotStatus::Terminal);
+}
+
 /// The absent-epoch path's post-conflict recheck is a CHECK, not a blanket refusal, and both halves
 /// have to hold: work that became visible across the conflict must block the allocation, and an
 /// unchanged, still-empty subtree must let it proceed from the winner's own epoch state. Dropping the

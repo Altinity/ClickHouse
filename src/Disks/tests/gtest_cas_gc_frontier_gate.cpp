@@ -16,8 +16,12 @@
 #include <Poco/StreamChannel.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
+#include <latch>
+#include <map>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -68,6 +72,7 @@ namespace ProfileEvents
 extern const Event CASGCRefWalkPlansBuilt;
 extern const Event CASGCUnmatchedAdoptedParentLives;
 extern const Event CASGCNamespaceCleanupLeaks;
+extern const Event CASGCStalledCreatingCancelled;
 }
 
 namespace
@@ -85,6 +90,12 @@ void noAuthorityRefresh() {}
 /// The retirement announcement is mandatory for the same reason: a drain that erases without it has to
 /// say so.
 void noRetirementRecord(const NamespaceLifeId &) {}
+
+/// For the suites whose catalog holds no `Creating` row: no creator is ever proved terminal.
+CreatorSlotStatus noCreatorProvedTerminal(const CreatorFence &) { return CreatorSlotStatus::Live; }
+
+/// For the suites that are not about the probe: every creator is proved terminal.
+CreatorSlotStatus everyCreatorTerminal(const CreatorFence &) { return CreatorSlotStatus::Terminal; }
 
 /// The lying store, shared from `cas_test_helpers.h`: every key is served by exact GET while the
 /// selected ones are HIDDEN from every LIST. That is the only way to build the cross-namespace
@@ -310,14 +321,14 @@ private:
 class ScopedCasGcLogCapture
 {
 public:
-    ScopedCasGcLogCapture()
-        : logger(getLogger("CasGc"))
+    explicit ScopedCasGcLogCapture(const String & name = "CasGc", const String & level = "warning")
+        : logger(getLogger(name))
         , channel(new Poco::StreamChannel(stream))
         , old_channel(logger->getChannel(), /*shared=*/true)
         , old_level(logger->getLevel())
     {
         logger->setChannel(channel.get());
-        logger->setLevel("warning");
+        logger->setLevel(level);
     }
 
     ~ScopedCasGcLogCapture()
@@ -538,6 +549,10 @@ struct GateVerdict
     uint64_t frontier_unprobed_budget = 0;
     uint64_t catalog_entries = 0;
     bool catalog_proved_empty = false;
+    /// `Removing` rows the pre-fold drain erased this round.
+    uint64_t drain_erased = 0;
+    /// `Creating` rows the pre-fold drain cancelled this round.
+    uint64_t drain_cancelled = 0;
 };
 
 GateVerdict runRoundCapturingGate(const PoolPtr & store, Gc & gc, UniversePolicy policy)
@@ -550,7 +565,14 @@ GateVerdict runRoundCapturingGate(const PoolPtr & store, Gc & gc, UniversePolicy
             const auto it = rec.metrics.find(name);
             return it == rec.metrics.end() ? std::nullopt : std::optional<UInt64>{it->second};
         };
-        if (rec.phase == "fold_reduce")
+        if (rec.phase == "pre_fold_ref_drain")
+        {
+            if (const auto erased = value("deleted"))
+                verdict.drain_erased = *erased;
+            if (const auto cancelled = value("cancelled_creating"))
+                verdict.drain_cancelled = *cancelled;
+        }
+        else if (rec.phase == "fold_reduce")
         {
             if (const auto complete = value("frontier_complete"))
             {
@@ -593,6 +615,60 @@ void expectEveryDeleteFamilyInert(const CountingBackend & backend, const char * 
         << where << ": covered-log / superseded-snapshot cleanup";
     EXPECT_EQ(backend.deleteTotal(), 0u)
         << where << ": a family not named above also ran. Deleted:" << deletedKeysMessage(backend);
+}
+
+/// The row an interrupted cold admission leaves: `Creating`, under the fence of the server that ran it.
+CatalogEntry seedStalledCreating(
+    CasOperation & op, const PoolPtr & store, const String & ns, const UInt128 & incarnation,
+    const CreatorFence & creator)
+{
+    const CatalogEntry entry{
+        .ns = RootNamespace{ns}, .state = NsState::Creating, .incarnation = incarnation, .creator = creator};
+    CasRefCatalog::casAdmitEntry(op, store->layout(), store->poolConfig().gc_shards, entry);
+    return entry;
+}
+
+/// The checkpoint a stalled creation wrote in its step 2, before the flip that never came.
+String seedStalledCheckpoint(CasOperation & op, const Layout & layout, const CatalogEntry & entry)
+{
+    const String key = layout.refCkptKey(NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation));
+    EXPECT_TRUE(std::holds_alternative<Committed>(op.create(key, encodeRefCkptAtGeneration(RefCkpt{
+        .life_epoch = entry.creator->writer_epoch,
+        .committed_through = std::nullopt,
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    }, 1), Retry::once())));
+    return key;
+}
+
+/// A clean farewell at `epoch` in `root`'s mount slot. It certifies every lower epoch of `root` terminal.
+void retireCreatorRootAt(Backend & backend, const Layout & layout, const String & root, uint64_t epoch)
+{
+    setWatermarkMinActive(backend, layout, root, epoch, std::numeric_limits<uint64_t>::max());
+}
+
+std::optional<CatalogEntry> catalogRow(CasOperation & op, const Layout & layout, const RootNamespace & ns)
+{
+    for (const CatalogEntry & entry : CasRefCatalog::read(op, layout).catalog.entries)
+        if (entry.ns == ns)
+            return entry;
+    return std::nullopt;
+}
+
+/// A namespace's first append through the real lane, which is what resolves its catalog life.
+RefTxnId publishBirth(const PoolPtr & store, const RootNamespace & ns, const String & ref, uint64_t build_sequence = 1)
+{
+    return store->appendRefOps(ns, MutationScope::ref(ref),
+        [&ref, build_sequence](const RefTableState & state)
+        {
+            std::vector<RefOp> ops;
+            if (state.getLifecycle() != RefLifecycle::Live)
+                ops.push_back(namespaceBirthOp());
+            for (const RefOp & op : publishCommittedOps(ref, ManifestRef{1, build_sequence, 1}))
+                ops.push_back(op);
+            return ops;
+        },
+        RootMutationOrigin::Writer, RootMutationKind::Publish);
 }
 
 }
@@ -1132,6 +1208,462 @@ TEST(CASGCFrontierGate, AZeroWalkableFrontierWithACreatingCatalogRowIsNotProvedE
     }
     expectEveryDeleteFamilyInert(*backend, "Creating-only catalog");
     EXPECT_TRUE(op.head(layout.blobKey(blob_ref), Retry::once()).has_value());
+}
+
+/// The wedge after drop-all: every table is dropped, and the catalog holds only the `Creating` row of a
+/// `CREATE TABLE` whose server has since moved to a higher writer epoch. The condemned blob's seeded run gives
+/// the first round an adopted parent, so that round cancels the row, proves its own cut empty, and the
+/// blob drains.
+TEST(CASGCFrontierGate, AStalledCreatingRowWhoseCreatorMovedToAHigherEpochIsCancelledAndTheBlobDrains)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    const DB::UInt128 blob(0xbead);
+
+    writeBlobBody(*backend, layout, blob);
+    const BlobRef blob_ref = legacyMetaTestRef(blob);
+    const std::optional<Meta> blob_observed = op.head(layout.blobKey(blob_ref), Retry::once());
+    ASSERT_TRUE(blob_observed);
+    injectRetire(*backend, layout, /*round*/ 1, /*shard*/ 0,
+        {RetiredEntry{.kind = ObjectKind::Blob, .ref = blob_ref, .token = PersistedEtag::capture(blob_observed->etag), .size = 0}});
+    store->renewWatermarkOnce();
+
+    const CatalogEntry stalled = seedStalledCreating(op, store, "00/stalled@cas@",
+        hexToU128("00000000000000000000000000000042"),
+        CreatorFence{.server_root_id = "moved-creator", .writer_epoch = 1, .fence_generation = 1});
+    const String stalled_ckpt = seedStalledCheckpoint(op, layout, stalled);
+    retireCreatorRootAt(*backend, layout, "moved-creator", /*epoch*/ 2);
+
+    Gc gc(store, kGc);
+    const GateVerdict cancelling = runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
+    ASSERT_TRUE(cancelling.saw_fold);
+    EXPECT_EQ(cancelling.drain_cancelled, 1u);
+    EXPECT_EQ(cancelling.drain_erased, 0u) << "a cancel is not an erase of a `Removing` row";
+    EXPECT_FALSE(catalogRow(op, layout, stalled.ns));
+    EXPECT_TRUE(cancelling.catalog_proved_empty) << "the cut the same round takes after its drain is empty";
+    EXPECT_TRUE(cancelling.frontier_complete);
+    EXPECT_FALSE(cancelling.suppress_destructive);
+
+    constexpr int kMaxRounds = 6;
+    for (int i = 0; i < kMaxRounds && (op.head(layout.blobKey(blob_ref), Retry::once()) || op.head(stalled_ckpt, Retry::once())); ++i)
+        EXPECT_FALSE(runRoundCapturingGate(store, gc, UniversePolicy::Authoritative).suppress_destructive);
+    EXPECT_FALSE(op.head(layout.blobKey(blob_ref), Retry::once())) << "the condemned blob drains";
+    EXPECT_FALSE(op.head(stalled_ckpt, Retry::once())) << "the namespace janitor reclaims the cancelled life's checkpoint";
+}
+
+/// Generation zero has no adopted parent and runs no pre-fold drain, so the bootstrap round leaves a
+/// certified row and the first round with a parent cancels it.
+TEST(CASGCFrontierGate, AStalledCreatingRowWaitsOutTheBootstrapRound)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    const CatalogEntry stalled = seedStalledCreating(op, store, "00/stalled@cas@",
+        hexToU128("00000000000000000000000000000043"),
+        CreatorFence{.server_root_id = "moved-creator", .writer_epoch = 1, .fence_generation = 1});
+    retireCreatorRootAt(*backend, layout, "moved-creator", /*epoch*/ 2);
+
+    Gc gc(store, kGc);
+    const GateVerdict bootstrap = runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
+    ASSERT_TRUE(bootstrap.saw_fold);
+    EXPECT_EQ(bootstrap.drain_cancelled, 0u);
+    EXPECT_FALSE(bootstrap.catalog_proved_empty);
+    EXPECT_EQ(catalogRow(op, layout, stalled.ns), std::optional<CatalogEntry>{stalled});
+
+    const GateVerdict next = runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
+    EXPECT_EQ(next.drain_cancelled, 1u);
+    EXPECT_FALSE(catalogRow(op, layout, stalled.ns));
+    EXPECT_TRUE(next.catalog_proved_empty);
+}
+
+/// A creator alive at the epoch it recorded holds no certificate, so its row is never touched. The
+/// certified sibling in the same catalog shows the drain did consider `Creating` rows.
+TEST(CASGCFrontierGate, AStalledCreatingRowWhoseCreatorIsAliveIsNotTouched)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+
+    const CatalogEntry alive = seedStalledCreating(op, store, "00/alive@cas@",
+        hexToU128("00000000000000000000000000000051"),
+        CreatorFence{.server_root_id = store->poolConfig().server_root_id, .writer_epoch = store->writerEpoch(), .fence_generation = 1});
+    const CatalogEntry certified = seedStalledCreating(op, store, "00/certified@cas@",
+        hexToU128("00000000000000000000000000000052"),
+        CreatorFence{.server_root_id = "moved-creator", .writer_epoch = 1, .fence_generation = 1});
+    retireCreatorRootAt(*backend, layout, "moved-creator", /*epoch*/ 2);
+
+    Gc gc(store, kGc);
+    uint64_t erased = 0;
+    for (int i = 0; i < 4; ++i)
+    {
+        const GateVerdict v = runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
+        erased += v.drain_cancelled;
+        EXPECT_TRUE(v.suppress_destructive) << "the alive creator's row is still a birth in progress";
+        EXPECT_EQ(catalogRow(op, layout, alive.ns), std::optional<CatalogEntry>{alive}) << "round " << i;
+    }
+    EXPECT_EQ(erased, 1u);
+    EXPECT_FALSE(catalogRow(op, layout, certified.ns)) << "positive control: the certified row went";
+}
+
+/// One certified and one uncertified `Creating` row: only the certified one goes, and the frontier stays
+/// suppressed while the uncertified one remains. An absent mount slot is no certificate.
+TEST(CASGCFrontierGate, OnlyTheCertifiedOfTwoStalledCreatingRowsIsCancelledAndTheSuppressionStays)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    const DB::UInt128 blob(0xbead);
+
+    writeBlobBody(*backend, layout, blob);
+    const BlobRef blob_ref = legacyMetaTestRef(blob);
+    const std::optional<Meta> blob_observed = op.head(layout.blobKey(blob_ref), Retry::once());
+    ASSERT_TRUE(blob_observed);
+    injectRetire(*backend, layout, /*round*/ 1, /*shard*/ 0,
+        {RetiredEntry{.kind = ObjectKind::Blob, .ref = blob_ref, .token = PersistedEtag::capture(blob_observed->etag), .size = 0}});
+    store->renewWatermarkOnce();
+
+    const CatalogEntry certified = seedStalledCreating(op, store, "00/certified@cas@",
+        hexToU128("00000000000000000000000000000061"),
+        CreatorFence{.server_root_id = "moved-creator", .writer_epoch = 1, .fence_generation = 1});
+    const CatalogEntry uncertified = seedStalledCreating(op, store, "00/uncertified@cas@",
+        hexToU128("00000000000000000000000000000062"),
+        CreatorFence{.server_root_id = "never-mounted", .writer_epoch = 1, .fence_generation = 1});
+    retireCreatorRootAt(*backend, layout, "moved-creator", /*epoch*/ 2);
+
+    Gc gc(store, kGc);
+    backend->resetCounts();
+    uint64_t erased = 0;
+    for (int i = 0; i < 4; ++i)
+    {
+        const GateVerdict v = runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
+        erased += v.drain_cancelled;
+        ASSERT_TRUE(v.saw_fold);
+        EXPECT_EQ(v.frontier_namespaces, 0u);
+        EXPECT_FALSE(v.catalog_proved_empty);
+        EXPECT_TRUE(v.suppress_destructive);
+    }
+    EXPECT_EQ(erased, 1u);
+    EXPECT_FALSE(catalogRow(op, layout, certified.ns));
+    EXPECT_EQ(catalogRow(op, layout, uncertified.ns), std::optional<CatalogEntry>{uncertified});
+    EXPECT_EQ(backend->deleteCountForKeysContaining("/blobs/"), 0u);
+    EXPECT_TRUE(op.head(layout.blobKey(blob_ref), Retry::once()).has_value());
+}
+
+/// With tables present the frontier is complete either way, but the row would still leak. It is cancelled,
+/// and the `Live` row beside it is left exactly as it was.
+TEST(CASGCFrontierGate, AStalledCreatingRowBesideALiveNamespaceIsCancelledAndNothingElseChanges)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+
+    const RootNamespace live_ns{"00/live@cas@"};
+    store->namespaceLife(live_ns);
+    const std::optional<CatalogEntry> live = catalogRow(op, layout, live_ns);
+    ASSERT_TRUE(live && live->state == NsState::Live);
+    const CatalogEntry stalled = seedStalledCreating(op, store, "00/stalled@cas@",
+        hexToU128("00000000000000000000000000000071"),
+        CreatorFence{.server_root_id = "moved-creator", .writer_epoch = 1, .fence_generation = 1});
+    retireCreatorRootAt(*backend, layout, "moved-creator", /*epoch*/ 2);
+
+    Gc gc(store, kGc);
+    uint64_t erased = 0;
+    for (int i = 0; i < 3; ++i)
+    {
+        const GateVerdict v = runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
+        erased += v.drain_cancelled;
+        EXPECT_EQ(v.frontier_namespaces, 1u);
+    }
+    EXPECT_EQ(erased, 1u);
+    EXPECT_EQ(CasRefCatalog::read(op, layout).catalog.entries, std::vector<CatalogEntry>{*live});
+}
+
+namespace
+{
+
+/// A mount slot of `root` at `epoch` that is neither fenced nor a farewell, unless asked.
+void writeCreatorSlot(Backend & backend, const Layout & layout, const String & root, uint64_t epoch, bool gc_fenced)
+{
+    MountLease lease;
+    lease.writer_epoch = epoch;
+    lease.min_active_build_sequence = 1;
+    lease.gc_fenced = gc_fenced;
+    lease.seq = 1;
+    lease.write_attempt_id = UInt128{1};
+    OperationForTest op(backend);
+    ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(layout.mountKey(root), encodeMountLease(lease), Retry::once())));
+}
+
+}
+
+/// A foreign creator whose slot still holds the row's epoch, and one whose slot holds a LOWER epoch, carry
+/// no certificate: their rows stay. The certified row beside them shows the drain considered all three.
+TEST(CASGCFrontierGate, AForeignCreatorAliveAtItsEpochOrBelowItKeepsItsRow)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+
+    const CatalogEntry alive = seedStalledCreating(op, store, "00/alive@cas@", UInt128{0x101},
+        CreatorFence{.server_root_id = "alive-creator", .writer_epoch = 3, .fence_generation = 1});
+    const CatalogEntry lower = seedStalledCreating(op, store, "00/lower@cas@", UInt128{0x102},
+        CreatorFence{.server_root_id = "lower-creator", .writer_epoch = 3, .fence_generation = 1});
+    const CatalogEntry certified = seedStalledCreating(op, store, "00/certified@cas@", UInt128{0x103},
+        CreatorFence{.server_root_id = "moved-creator", .writer_epoch = 1, .fence_generation = 1});
+    writeCreatorSlot(*backend, layout, "alive-creator", /*epoch*/ 3, /*gc_fenced*/ false);
+    writeCreatorSlot(*backend, layout, "lower-creator", /*epoch*/ 2, /*gc_fenced*/ true);
+    retireCreatorRootAt(*backend, layout, "moved-creator", /*epoch*/ 2);
+
+    Gc gc(store, kGc);
+    uint64_t erased = 0;
+    for (int i = 0; i < 3; ++i)
+        erased += runRoundCapturingGate(store, gc, UniversePolicy::Authoritative).drain_cancelled;
+    EXPECT_EQ(erased, 1u);
+    EXPECT_FALSE(catalogRow(op, layout, certified.ns)) << "positive control";
+    EXPECT_EQ(catalogRow(op, layout, alive.ns), std::optional<CatalogEntry>{alive});
+    EXPECT_EQ(catalogRow(op, layout, lower.ns), std::optional<CatalogEntry>{lower})
+        << "a fence on an older epoch says nothing about this one";
+}
+
+/// Each certificate through a real round: a `GC` fence and a clean farewell, both at the row's own epoch.
+TEST(CASGCFrontierGate, AGcFenceOrAFarewellAtTheCreatorsEpochCancelsItsRow)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+
+    const CatalogEntry fenced = seedStalledCreating(op, store, "00/fenced@cas@", UInt128{0x111},
+        CreatorFence{.server_root_id = "fenced-creator", .writer_epoch = 4, .fence_generation = 1});
+    const CatalogEntry farewell = seedStalledCreating(op, store, "00/farewell@cas@", UInt128{0x112},
+        CreatorFence{.server_root_id = "farewell-creator", .writer_epoch = 4, .fence_generation = 1});
+    writeCreatorSlot(*backend, layout, "fenced-creator", /*epoch*/ 4, /*gc_fenced*/ true);
+    retireCreatorRootAt(*backend, layout, "farewell-creator", /*epoch*/ 4);
+
+    Gc gc(store, kGc);
+    runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
+    EXPECT_EQ(runRoundCapturingGate(store, gc, UniversePolicy::Authoritative).drain_cancelled, 2u);
+    EXPECT_FALSE(catalogRow(op, layout, fenced.ns));
+    EXPECT_FALSE(catalogRow(op, layout, farewell.ns));
+}
+
+/// The suppression warning of a catalog with no walkable row breaks its rows down by state and points at
+/// `cas-fsck` for the creators.
+TEST(CASGCFrontierGate, TheNoWalkableRowWarningBreaksTheRowsDownByState)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    seedStalledCreating(op, store, "00/a@cas@", UInt128{0x141},
+        CreatorFence{.server_root_id = "never-mounted", .writer_epoch = 1, .fence_generation = 1});
+    seedStalledCreating(op, store, "00/b@cas@", UInt128{0x142},
+        CreatorFence{.server_root_id = "never-mounted", .writer_epoch = 1, .fence_generation = 1});
+
+    Gc gc(store, kGc);
+    ScopedCasGcLogCapture capture;
+    for (int i = 0; i < 2; ++i)
+        ASSERT_TRUE(runRoundCapturingGate(store, gc, UniversePolicy::Authoritative).suppress_destructive);
+    const String log = capture.captured();
+    EXPECT_NE(log.find("catalog holds 2 row(s), none walkable/provable: 2 `Creating`, 0 `Live`, 0 `Removing`; "
+                       "`cas-fsck` names the creator"), String::npos) << log;
+}
+
+/// A creator killed and never started again: its mount slot stops changing, the leader's heartbeat floor
+/// fences it once it has watched the slot unchanged long enough, and the next drain cancels the row.
+TEST(CASGCFrontierGate, ACreatorThatStopsRenewingIsFencedAndItsRowCancelled)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    const CatalogEntry stalled = seedStalledCreating(op, store, "00/killed@cas@", UInt128{0x131},
+        CreatorFence{.server_root_id = "killed-creator", .writer_epoch = 1, .fence_generation = 1});
+    writeCreatorSlot(*backend, layout, "killed-creator", /*epoch*/ 1, /*gc_fenced*/ false);
+
+    uint64_t mono_ms = 1'000'000;
+    Gc gc(store, kGc, {}, [&] { return mono_ms; });
+    const GateVerdict first = runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
+    ASSERT_TRUE(first.saw_fold);
+    ASSERT_EQ(catalogRow(op, layout, stalled.ns), std::optional<CatalogEntry>{stalled})
+        << "positive control: a slot not yet watched long enough certifies nothing";
+    uint64_t cancelled = 0;
+    for (int i = 0; i < 6 && catalogRow(op, layout, stalled.ns); ++i)
+    {
+        mono_ms += 3'600'000;
+        cancelled += runRoundCapturingGate(store, gc, UniversePolicy::Authoritative).drain_cancelled;
+    }
+    EXPECT_FALSE(catalogRow(op, layout, stalled.ns));
+    EXPECT_EQ(cancelled, 1u);
+    const auto slot = op.read(layout.mountKey("killed-creator"), Retry::once());
+    ASSERT_TRUE(slot);
+    EXPECT_TRUE(decodeMountLease(slot->bytes).gc_fenced);
+}
+
+namespace
+{
+
+/// Reopened once, so this server's mount slot holds a later epoch than the one its first open recorded.
+PoolPtr openPoolAtSecondEpoch(const std::shared_ptr<DrainRaceBackend> & backend)
+{
+    {
+        auto first = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    }
+    return openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+}
+
+}
+
+/// A `CREATE` retried on the leader's own server after its remount takes its old `Creating` row over at the
+/// later epoch, between the drain's selection read and its cancel. The cancel loses the exact swap, and the
+/// opener keeps its life: the same incarnation, a runtime it installed, and appends that land.
+TEST(CASGCFrontierGate, AnOpenerThatTakesTheStalledRowOverBeforeTheCancelKeepsItsLife)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    PoolPtr store = openPoolAtSecondEpoch(backend);
+    ASSERT_GT(store->writerEpoch(), 1u);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    const String & root = store->poolConfig().server_root_id;
+    Gc gc(store, kGc);
+    runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
+
+    const CatalogEntry stalled = seedStalledCreating(op, store, "00/retried@cas@",
+        hexToU128("00000000000000000000000000000081"),
+        CreatorFence{.server_root_id = root, .writer_epoch = store->writerEpoch() - 1, .fence_generation = 1});
+
+    bool opener_ran = false;
+    size_t opener_done_at = 0;
+    backend->afterReadOf(layout.refCatalogKey(), [&]
+    {
+        backend->afterReadOf(layout.refCatalogKey(), {});
+        opener_ran = true;
+        publishBirth(store, stalled.ns, "a");
+        opener_done_at = backend->journalSnapshot().size();
+    });
+    const GateVerdict v = runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
+    ASSERT_TRUE(opener_ran);
+    EXPECT_EQ(v.drain_cancelled, 0u);
+
+    /// Positive control: after the takeover, the drain still probed the creator of the row it had selected,
+    /// before the round's next listing.
+    const std::vector<String> journal = backend->journalSnapshot();
+    const auto next_list = std::find_if(journal.begin() + opener_done_at, journal.end(),
+        [](const String & entry) { return entry.starts_with("list "); });
+    EXPECT_NE(std::find(journal.begin() + opener_done_at, next_list, "get " + layout.mountKey(root)), next_list)
+        << "the drain never considered the row it selected before the takeover";
+
+    const std::optional<CatalogEntry> row = catalogRow(op, layout, stalled.ns);
+    ASSERT_TRUE(row);
+    EXPECT_EQ(row->state, NsState::Live);
+    EXPECT_EQ(row->incarnation, stalled.incarnation) << "the takeover keeps the incarnation";
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(stalled.ns, stalled.incarnation);
+    EXPECT_EQ(store->namespaceLife(stalled.ns), life);
+    RefTxnId second{};
+    EXPECT_NO_THROW(second = publishBirth(store, stalled.ns, "b", 2)) << "the winner's runtime stays usable";
+    EXPECT_TRUE(op.head(layout.refLogKey(life, second), Retry::once()).has_value());
+}
+
+/// The other order: the opener read the stalled row, then the drain cancels it before the takeover is
+/// sent. The takeover finds the row gone, and the opener creates a fresh life and appends under it. Its
+/// first call may end retry-later, because the cancel's retirement record lands inside its admission.
+TEST(CASGCFrontierGate, ACancelThatWinsTheRaceLeavesTheOpenerAFreshLife)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    PoolPtr store = openPoolAtSecondEpoch(backend);
+    ASSERT_GT(store->writerEpoch(), 1u);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    Gc gc(store, kGc);
+    runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
+
+    const CatalogEntry stalled = seedStalledCreating(op, store, "00/retried@cas@",
+        hexToU128("00000000000000000000000000000082"),
+        CreatorFence{.server_root_id = store->poolConfig().server_root_id, .writer_epoch = store->writerEpoch() - 1, .fence_generation = 1});
+
+    size_t opener_catalog_reads = 0;
+    GateVerdict cancelling;
+    backend->afterReadOf(layout.refCatalogKey(), [&]
+    {
+        if (++opener_catalog_reads != 2)
+            return;
+        backend->afterReadOf(layout.refCatalogKey(), {});
+        cancelling = runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
+    });
+    try
+    {
+        publishBirth(store, stalled.ns, "a");
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR) << e.message();
+    }
+    EXPECT_EQ(cancelling.drain_cancelled, 1u);
+
+    const std::optional<CatalogEntry> fresh = catalogRow(op, layout, stalled.ns);
+    ASSERT_TRUE(fresh);
+    EXPECT_EQ(fresh->state, NsState::Live);
+    EXPECT_NE(fresh->incarnation, stalled.incarnation) << "the cancelled life is never reused";
+    const NamespaceLifeId fresh_life = NamespaceLifeId::fromCatalogEntry(stalled.ns, fresh->incarnation);
+    RefTxnId id{};
+    ASSERT_NO_THROW(id = publishBirth(store, stalled.ns, "b", 2));
+    EXPECT_TRUE(op.head(layout.refLogKey(fresh_life, id), Retry::once()).has_value());
+    EXPECT_EQ(store->namespaceLife(stalled.ns), fresh_life);
+}
+
+/// The stalled creator's step 2 lands after the cancel, beside a rebirth of the same name. The late
+/// checkpoint names the cancelled incarnation, so it is janitor debris and the new life is untouched.
+TEST(CASGCFrontierGate, ALateCheckpointOfACancelledLifeLeavesTheRebornNamespaceIntact)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+
+    const CatalogEntry stalled = seedStalledCreating(op, store, "00/reborn@cas@",
+        hexToU128("00000000000000000000000000000091"),
+        CreatorFence{.server_root_id = "moved-creator", .writer_epoch = 1, .fence_generation = 1});
+    retireCreatorRootAt(*backend, layout, "moved-creator", /*epoch*/ 2);
+
+    Gc gc(store, kGc);
+    runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
+    ASSERT_EQ(runRoundCapturingGate(store, gc, UniversePolicy::Authoritative).drain_cancelled, 1u);
+
+    const NamespaceLifeId reborn_life = store->namespaceLife(stalled.ns);
+    ASSERT_NE(reborn_life.incarnation, stalled.incarnation);
+    store->putNamespaceFile(reborn_life, "format_version.txt", "1\n");
+    const std::optional<CatalogEntry> reborn = catalogRow(op, layout, stalled.ns);
+    ASSERT_TRUE(reborn && reborn->state == NsState::Live);
+    const String reborn_file = layout.namespaceFileKey(reborn_life, "format_version.txt");
+    ASSERT_TRUE(op.head(reborn_file, Retry::once()));
+
+    const String late_ckpt = seedStalledCheckpoint(op, layout, stalled);
+    for (int i = 0; i < 6 && op.head(late_ckpt, Retry::once()); ++i)
+        EXPECT_FALSE(runRoundCapturingGate(store, gc, UniversePolicy::Authoritative).suppress_destructive);
+
+    EXPECT_FALSE(op.head(late_ckpt, Retry::once())) << "the namespace janitor reclaims the late checkpoint";
+    EXPECT_EQ(catalogRow(op, layout, stalled.ns), reborn);
+    EXPECT_TRUE(op.head(layout.refCkptKey(reborn_life), Retry::once())) << "the reborn life's checkpoint survives";
+    EXPECT_TRUE(op.head(reborn_file, Retry::once())) << "and so do its files";
+    EXPECT_EQ(store->namespaceLife(stalled.ns), reborn_life);
 }
 
 /// The bootstrap-only absent-as-empty representation (`initializeEmptyForNewPool`) must never leak into
@@ -2654,7 +3186,7 @@ TEST(CASCatalogLifecycleReconciler, EmptyCatalogReturnsAuthoritativeCompleteCut)
     ASSERT_TRUE(CasRefCatalog::initializeEmptyForNewPool(op, layout).catalog.entries.empty());
 
     CasFoldSeal parent;
-    CatalogLifecycleReconciler reconciler(op, layout, parent);
+    CatalogLifecycleReconciler reconciler(op, layout, parent, noCreatorProvedTerminal);
     const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh, noRetirementRecord);
 
     EXPECT_EQ(result.authority_status, AuthorityStatus::Authoritative);
@@ -2680,7 +3212,7 @@ TEST(CASCatalogLifecycleReconciler, DeletesEligibleRowsFromReturnedResolutionCut
     backend->clearJournal();
     backend->resetCounts();
 
-    CatalogLifecycleReconciler reconciler(op, layout, parent);
+    CatalogLifecycleReconciler reconciler(op, layout, parent, noCreatorProvedTerminal);
     const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh, noRetirementRecord);
 
     EXPECT_EQ(result.authority_status, AuthorityStatus::Authoritative);
@@ -2711,7 +3243,7 @@ TEST(CASCatalogLifecycleReconciler, AnnouncesEachLifeBeforeItsRowIsErased)
 
     std::vector<NamespaceLifeId> announced;
     size_t announced_while_cataloged = 0;
-    CatalogLifecycleReconciler reconciler(op, layout, parent);
+    CatalogLifecycleReconciler reconciler(op, layout, parent, noCreatorProvedTerminal);
     const CatalogLifecycleReconcileResult result = reconciler.reconcile(
         noAuthorityRefresh,
         [&](const NamespaceLifeId & life)
@@ -2749,7 +3281,7 @@ TEST(CASCatalogLifecycleReconciler, ReturnsRetiredLifeWhenAuthorityMovesAfterRes
             authority_held = false;
     });
 
-    CatalogLifecycleReconciler reconciler(fenced_op, layout, parent);
+    CatalogLifecycleReconciler reconciler(fenced_op, layout, parent, noCreatorProvedTerminal);
     const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh, noRetirementRecord);
 
     EXPECT_EQ(result.authority_status, AuthorityStatus::FencedOut);
@@ -2783,7 +3315,7 @@ TEST(CASCatalogLifecycleReconciler, RecordsAnAcknowledgedEraseWhoseResolutionRea
             throw std::runtime_error("injected resolution read failure");
     });
 
-    CatalogLifecycleReconciler reconciler(op, layout, parent);
+    CatalogLifecycleReconciler reconciler(op, layout, parent, noCreatorProvedTerminal);
     EXPECT_THROW(reconciler.reconcile(noAuthorityRefresh, noRetirementRecord), std::runtime_error);
     backend->afterReadOf(layout.refCatalogKey(), {});
 
@@ -2811,7 +3343,7 @@ TEST(CASCatalogLifecycleReconciler, InitialFenceLossReportsEligibleRowStillPrese
     CasOperation fenced_op = requests.admit([&] { return authority_held; });
     backend->afterReadOf(layout.refCatalogKey(), [&] { authority_held = false; });
 
-    CatalogLifecycleReconciler reconciler(fenced_op, layout, parent);
+    CatalogLifecycleReconciler reconciler(fenced_op, layout, parent, noCreatorProvedTerminal);
     const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh, noRetirementRecord);
 
     EXPECT_EQ(result.authority_status, AuthorityStatus::FencedOut);
@@ -2842,7 +3374,7 @@ TEST(CASCatalogLifecycleReconciler, RetriesFromTheMandatoryConflictResolutionCut
     backend->resetCounts();
     backend->conflictNextCatalogCas(layout.refCatalogKey());
 
-    CatalogLifecycleReconciler reconciler(op, layout, parent);
+    CatalogLifecycleReconciler reconciler(op, layout, parent, noCreatorProvedTerminal);
     size_t announcements = 0;
     const CatalogLifecycleReconcileResult result = reconciler.reconcile(
         noAuthorityRefresh, [&](const NamespaceLifeId &) { ++announcements; });
@@ -2872,12 +3404,583 @@ TEST(CASCatalogLifecycleReconciler, AFailingAnnouncementSendsNoErase)
     const CasFoldSeal parent = decodeFoldSeal(parent_object->bytes);
     backend->resetCounts();
 
-    CatalogLifecycleReconciler reconciler(op, layout, parent);
+    CatalogLifecycleReconciler reconciler(op, layout, parent, noCreatorProvedTerminal);
     EXPECT_THROW(
         (void)reconciler.reconcile(noAuthorityRefresh, [](const NamespaceLifeId &) { throw std::runtime_error("record failed"); }),
         std::runtime_error);
     EXPECT_EQ(backend->putOverwriteCount(layout.refCatalogKey()), 0) << "the erase must not be sent";
     EXPECT_FALSE(CasRefCatalog::read(op, layout).catalog.entries.empty()) << "the row must still be cataloged";
+}
+
+/// The leader is deposed after its first cancel. Its cached authority still reads true when it selects
+/// the second row, so only the refresh at the top of the second cancel's attempt can stop that erase.
+TEST(CASCatalogLifecycleReconciler, ALeaderDeposedBetweenTwoCancelsSendsNoSecond)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    const CatalogEntry first = seedStalledCreating(op, store, "00/first@cas@",
+        hexToU128("000000000000000000000000000000a1"), CreatorFence{.server_root_id = "gone", .writer_epoch = 1, .fence_generation = 1});
+    const CatalogEntry second = seedStalledCreating(op, store, "00/second@cas@",
+        hexToU128("000000000000000000000000000000a2"), CreatorFence{.server_root_id = "gone", .writer_epoch = 1, .fence_generation = 1});
+    backend->resetCounts();
+
+    bool authority_held = true;
+    size_t refreshes = 0;
+    CasOperation leader_op = requests.admit([&] { return authority_held; });
+    const CasFoldSeal parent;
+    CatalogLifecycleReconciler reconciler(leader_op, layout, parent, everyCreatorTerminal);
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(
+        [&] { authority_held = ++refreshes < 2; }, noRetirementRecord);
+
+    EXPECT_EQ(result.authority_status, AuthorityStatus::FencedOut);
+    EXPECT_EQ(backend->putOverwriteCount(layout.refCatalogKey()), 1u) << "no cancel is sent after the deposition";
+    EXPECT_FALSE(catalogRow(op, layout, first.ns));
+    EXPECT_EQ(catalogRow(op, layout, second.ns), std::optional<CatalogEntry>{second});
+    EXPECT_EQ(reconciler.cancelledCreating(), 1u);
+    EXPECT_EQ(reconciler.retiredLives(),
+        std::vector<NamespaceLifeId>{NamespaceLifeId::fromCatalogEntry(first.ns, first.incarnation)});
+}
+
+/// The cancel lands and its response is lost. The write loop settles it from the store, so the cancel is
+/// counted once and never resent.
+TEST(CASCatalogLifecycleReconciler, ALostCancelResponseIsSettledFromTheStore)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    const CatalogEntry stalled = seedStalledCreating(op, store, "00/lost@cas@",
+        hexToU128("000000000000000000000000000000b1"), CreatorFence{.server_root_id = "gone", .writer_epoch = 1, .fence_generation = 1});
+    backend->clearJournal();
+    backend->loseNextCatalogCasResponse(layout.refCatalogKey());
+
+    const CasFoldSeal parent;
+    CatalogLifecycleReconciler reconciler(op, layout, parent, everyCreatorTerminal);
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh, noRetirementRecord);
+
+    EXPECT_EQ(result.authority_status, AuthorityStatus::Authoritative);
+    EXPECT_EQ(result.catalog_resolution, CatalogResolution::DrainComplete);
+    ASSERT_TRUE(result.final_catalog_cut);
+    EXPECT_TRUE(result.final_catalog_cut->catalog.entries.empty());
+    EXPECT_EQ(reconciler.cancelledCreating(), 1u);
+    EXPECT_EQ(reconciler.retiredLives(),
+        std::vector<NamespaceLifeId>{NamespaceLifeId::fromCatalogEntry(stalled.ns, stalled.incarnation)});
+    const std::vector<String> journal = backend->journalSnapshot();
+    EXPECT_EQ(std::count(journal.begin(), journal.end(), "cas_response_lost " + layout.refCatalogKey()), 1)
+        << "positive control: the response was lost";
+    EXPECT_EQ(std::count(journal.begin(), journal.end(), "cas_begin " + layout.refCatalogKey()), 1)
+        << "a landed cancel is not resent";
+}
+
+/// An opener takes the row over after the drain selected it. The cancel loses the exact swap; the drain
+/// neither throws nor retires the life, and leaves the row to its new creator.
+TEST(CASCatalogLifecycleReconciler, ARowTakenOverDuringTheCancelIsLeftAndTheDrainCompletes)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    const CatalogEntry stalled = seedStalledCreating(op, store, "00/taken@cas@",
+        hexToU128("000000000000000000000000000000c1"), CreatorFence{.server_root_id = "gone", .writer_epoch = 1, .fence_generation = 1});
+    const CreatorFence opener{.server_root_id = "opener", .writer_epoch = 5, .fence_generation = 1};
+    backend->afterReadOf(layout.refCatalogKey(), [&]
+    {
+        backend->afterReadOf(layout.refCatalogKey(), {});
+        ASSERT_EQ(CasRefCatalog::reconcileStaleCreator(op, layout, stalled, opener, [](const CreatorFence &) { return true; }),
+            CasRefCatalog::ReconcileCreatorOutcome::Reconciled);
+    });
+
+    const CasFoldSeal parent;
+    size_t probes = 0;
+    CatalogLifecycleReconciler reconciler(op, layout, parent,
+        [&](const CreatorFence & creator)
+        {
+            ++probes;
+            return creator.server_root_id == "gone" ? CreatorSlotStatus::Terminal : CreatorSlotStatus::Live;
+        });
+    CatalogLifecycleReconcileResult result;
+    ASSERT_NO_THROW(result = reconciler.reconcile(noAuthorityRefresh, noRetirementRecord));
+
+    EXPECT_GE(probes, 1u) << "positive control: the drain selected the row before the takeover";
+    EXPECT_EQ(result.authority_status, AuthorityStatus::Authoritative);
+    EXPECT_EQ(result.catalog_resolution, CatalogResolution::DrainComplete);
+    EXPECT_EQ(reconciler.cancelledCreating(), 0u);
+    EXPECT_TRUE(reconciler.retiredLives().empty());
+    const std::optional<CatalogEntry> row = catalogRow(op, layout, stalled.ns);
+    ASSERT_TRUE(row && row->creator);
+    EXPECT_EQ(*row->creator, opener);
+}
+
+/// The first cancel attempt loses its swap, and the leader is deposed before the second. Only a refresh
+/// taken before EACH attempt sees that, so the second attempt sends nothing.
+TEST(CASCatalogLifecycleReconciler, TheAuthorityIsRefreshedBeforeEveryCancelAttempt)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    const CatalogEntry stalled = seedStalledCreating(op, store, "00/refreshed@cas@",
+        hexToU128("000000000000000000000000000000d1"), CreatorFence{.server_root_id = "gone", .writer_epoch = 1, .fence_generation = 1});
+    backend->clearJournal();
+    backend->conflictNextCatalogCas(layout.refCatalogKey());
+
+    bool authority_held = true;
+    size_t refreshes = 0;
+    CasOperation leader_op = requests.admit([&] { return authority_held; });
+    const CasFoldSeal parent;
+    CatalogLifecycleReconciler reconciler(leader_op, layout, parent, everyCreatorTerminal);
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(
+        [&] { authority_held = ++refreshes < 2; }, noRetirementRecord);
+
+    const std::vector<String> journal = backend->journalSnapshot();
+    EXPECT_EQ(std::count(journal.begin(), journal.end(), "cas_forced_conflict " + layout.refCatalogKey()), 1)
+        << "positive control: the first attempt was sent and lost its swap";
+    EXPECT_EQ(std::count(journal.begin(), journal.end(), "cas_begin " + layout.refCatalogKey()), 1)
+        << "no second attempt after the deposition";
+    EXPECT_EQ(result.authority_status, AuthorityStatus::FencedOut);
+    EXPECT_EQ(reconciler.cancelledCreating(), 0u);
+    EXPECT_EQ(catalogRow(op, layout, stalled.ns), std::optional<CatalogEntry>{stalled});
+}
+
+/// Polls until `key`'s lane holds `depth` items, the holder included. False when `stop` turns true or a
+/// minute passes first, so a writer that never queues fails the test instead of hanging it.
+namespace
+{
+bool waitForLaneDepth(const CasOperation & op, const String & key, size_t depth, const std::atomic<bool> & stop)
+{
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(1);
+    while (op.hotKeys().queueDepthForTest(key) < depth)
+    {
+        if (stop || std::chrono::steady_clock::now() >= deadline)
+            return false;
+        std::this_thread::yield();
+    }
+    return true;
+}
+}
+
+/// The leader queues for the catalog lane behind another writer of this server and is deposed while it
+/// waits. Its authority is read again once it holds the lane, so it sends no cancel.
+TEST(CASCatalogLifecycleReconciler, ALeaderDeposedWhileQueuedForTheCatalogLaneSendsNoCancel)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    const String catalog_key = layout.refCatalogKey();
+    const CatalogEntry stalled = seedStalledCreating(op, store, "00/queued@cas@",
+        hexToU128("000000000000000000000000000000d4"), CreatorFence{.server_root_id = "gone", .writer_epoch = 1, .fence_generation = 1});
+    backend->clearJournal();
+
+    std::latch holding(1);
+    std::latch release(1);
+    std::thread other_writer([&]
+    {
+        CasOperation other_op = requests.admit();
+        (void)other_op.hotKeys().submit(catalog_key, other_op, other_op.freeze(Retry::standard()),
+            [&](const std::optional<Object> &) -> std::optional<String>
+            {
+                holding.count_down();
+                release.wait();
+                return std::nullopt;
+            });
+    });
+    holding.wait();
+
+    /// `lease_moved` stands for the store's `gc/state`; only a refresh reads it into `authority_held`.
+    std::atomic<bool> lease_moved = false;
+    std::atomic<bool> authority_held = true;
+    CasOperation leader_op = requests.admit([&] { return authority_held.load(); });
+    const CasFoldSeal parent;
+    CatalogLifecycleReconciler reconciler(leader_op, layout, parent, everyCreatorTerminal);
+    CatalogLifecycleReconcileResult result;
+    std::atomic<bool> leader_returned = false;
+    std::thread leader([&]
+    {
+        result = reconciler.reconcile([&] { authority_held = !lease_moved; }, noRetirementRecord);
+        leader_returned = true;
+    });
+    /// The leader has selected the row and waits behind the holder.
+    const bool leader_queued = waitForLaneDepth(op, catalog_key, 2, leader_returned);
+    lease_moved = true;
+    release.count_down();
+    leader.join();
+    other_writer.join();
+    ASSERT_TRUE(leader_queued) << "the leader returned, or did not queue for the catalog lane within a minute";
+
+    const std::vector<String> journal = backend->journalSnapshot();
+    EXPECT_EQ(std::count(journal.begin(), journal.end(), "cas_begin " + catalog_key), 0) << "no cancel is sent";
+    EXPECT_EQ(result.authority_status, AuthorityStatus::FencedOut);
+    EXPECT_EQ(reconciler.cancelledCreating(), 0u);
+    EXPECT_EQ(catalogRow(op, layout, stalled.ns), std::optional<CatalogEntry>{stalled});
+}
+
+/// The leader reaches the catalog lane with a quarter of its cancel's window left, and every read of
+/// `gc/state` fails retryably. The authority check ends by the cancel's deadline: no cancel is sent, the
+/// row stays, and the writer queued behind gets the lane by then.
+TEST(CASCatalogLifecycleReconciler, AnAuthorityReadFailingInTheCatalogLaneEndsByTheCancelDeadline)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    FakeClock clock;
+    requests.setNowFnForTest(clock.nowFn());
+    requests.setSleepFnForTest(clock.sleepFn());
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    const String catalog_key = layout.refCatalogKey();
+    const String gc_state_key = layout.gcStateKey();
+    const CatalogEntry stalled = seedStalledCreating(op, store, "00/slow-authority@cas@",
+        hexToU128("000000000000000000000000000000d5"), CreatorFence{.server_root_id = "gone", .writer_epoch = 1, .fence_generation = 1});
+    backend->clearJournal();
+    backend->afterReadOf(gc_state_key, [] { throw Poco::TimeoutException("injected timeout of the gc/state read"); });
+
+    std::latch holding(1);
+    std::latch release(1);
+    std::thread other_writer([&]
+    {
+        CasOperation other_op = requests.admit();
+        (void)other_op.hotKeys().submit(catalog_key, other_op, other_op.freeze(Retry::standard()),
+            [&](const std::optional<Object> &) -> std::optional<String>
+            {
+                holding.count_down();
+                release.wait();
+                return std::nullopt;
+            });
+    });
+    holding.wait();
+
+    /// Fail-closed like the GC leader's own refresh: authority is held only after a completed read.
+    std::atomic<bool> authority_held = true;
+    const auto refresh = [&](const Retry & bound)
+    {
+        authority_held = false;
+        try
+        {
+            CasOperation read_op = requests.admit();
+            (void)read_op.read(gc_state_key, bound);
+            authority_held = true;
+        }
+        catch (...)
+        {
+            authority_held = false;
+        }
+    };
+    CasOperation leader_op = requests.admit([&] { return authority_held.load(); });
+    /// The cancel freezes `Retry::standard` before it queues; no fake time passes before that.
+    const uint64_t cancel_deadline = clock.now.load() + DB::Cas::kDefaultRequestWindowMs;
+    const CasFoldSeal parent;
+    CatalogLifecycleReconciler reconciler(leader_op, layout, parent, everyCreatorTerminal);
+    CatalogLifecycleReconcileResult result;
+    std::atomic<bool> leader_returned = false;
+    std::thread leader([&]
+    {
+        result = reconciler.reconcile(refresh, noRetirementRecord);
+        leader_returned = true;
+    });
+    const bool leader_queued = waitForLaneDepth(op, catalog_key, 2, leader_returned);
+
+    std::atomic<uint64_t> lane_reached_at = 0;
+    std::atomic<bool> queued_writer_returned = false;
+    std::optional<std::thread> queued_writer;
+    bool writer_queued = false;
+    if (leader_queued)
+    {
+        /// Three quarters of the cancel's window pass while it waits for the lane.
+        clock.now.fetch_add(DB::Cas::kDefaultRequestWindowMs * 3 / 4);
+        queued_writer.emplace([&]
+        {
+            CasOperation queued_op = requests.admit();
+            (void)queued_op.hotKeys().submit(catalog_key, queued_op,
+                queued_op.freeze(Retry::within(10 * DB::Cas::kDefaultRequestWindowMs)),
+                [&](const std::optional<Object> &) -> std::optional<String>
+                {
+                    lane_reached_at = clock.now.load();
+                    return std::nullopt;
+                });
+            queued_writer_returned = true;
+        });
+        writer_queued = waitForLaneDepth(op, catalog_key, 3, queued_writer_returned);
+    }
+    release.count_down();
+    leader.join();
+    if (queued_writer)
+        queued_writer->join();
+    other_writer.join();
+    ASSERT_TRUE(leader_queued) << "the leader returned, or did not queue for the catalog lane within a minute";
+    ASSERT_TRUE(writer_queued) << "the second writer did not queue behind the leader within a minute";
+
+    const std::vector<String> journal = backend->journalSnapshot();
+    EXPECT_GE(std::count(journal.begin(), journal.end(), "get " + gc_state_key), 2)
+        << "positive control: the authority check ran in the lane and retried its read";
+    EXPECT_EQ(std::count(journal.begin(), journal.end(), "cas_begin " + catalog_key), 0) << "no cancel is sent";
+    EXPECT_EQ(result.authority_status, AuthorityStatus::FencedOut);
+    EXPECT_EQ(reconciler.cancelledCreating(), 0u);
+    EXPECT_EQ(catalogRow(op, layout, stalled.ns), std::optional<CatalogEntry>{stalled});
+    ASSERT_NE(lane_reached_at.load(), 0u) << "the writer queued behind the leader got the lane";
+    EXPECT_LE(lane_reached_at.load(), cancel_deadline)
+        << "the lane was held " << lane_reached_at.load() - cancel_deadline << " ms past the cancel's deadline";
+}
+
+/// One creator root has rows at two writer epochs, and its slot is live at the later one. The earlier
+/// epoch's row is cancelled and the later epoch's row stays: each epoch is judged on its own.
+TEST(CASCatalogLifecycleReconciler, OneCreatorAtTwoEpochsHasEachEpochJudgedOnItsOwn)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    const CatalogEntry superseded = seedStalledCreating(op, store, "00/a-epoch-1@cas@",
+        hexToU128("000000000000000000000000000000f1"), CreatorFence{.server_root_id = "restarted", .writer_epoch = 1, .fence_generation = 1});
+    const CatalogEntry current = seedStalledCreating(op, store, "00/b-epoch-2@cas@",
+        hexToU128("000000000000000000000000000000f2"), CreatorFence{.server_root_id = "restarted", .writer_epoch = 2, .fence_generation = 1});
+    setWatermarkMinActive(*backend, layout, "restarted", /*writer_epoch*/ 2, /*min_active_build_sequence*/ 1);
+    ASSERT_EQ(probeCreatorSlot(op, layout, "restarted", 2), CreatorSlotStatus::Live);
+    ASSERT_EQ(probeCreatorSlot(op, layout, "restarted", 1), CreatorSlotStatus::Terminal);
+
+    const CasFoldSeal parent;
+    CatalogLifecycleReconciler reconciler(op, layout, parent,
+        [&](const CreatorFence & fence) { return probeCreatorSlot(op, layout, fence.server_root_id, fence.writer_epoch); });
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh, noRetirementRecord);
+
+    EXPECT_EQ(result.catalog_resolution, CatalogResolution::DrainComplete);
+    EXPECT_EQ(reconciler.cancelledCreating(), 1u);
+    EXPECT_FALSE(catalogRow(op, layout, superseded.ns));
+    EXPECT_EQ(catalogRow(op, layout, current.ns), std::optional<CatalogEntry>{current});
+}
+
+/// `Creating` rows on both sides of `Removing` rows in one catalog: one drain settles all of them, and
+/// only the `Removing` lives are announced before their erase.
+TEST(CASCatalogLifecycleReconciler, CreatingRowsBesideRemovingRowsDrainTogetherAndOnlyRemovingIsAnnounced)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    constexpr size_t removing = 2;
+    seedCompletedRemovingBatch(op, store, kGc, removing);
+    const CatalogEntry before = seedStalledCreating(op, store, "00/a-creating@cas@",
+        hexToU128("000000000000000000000000000000d2"), CreatorFence{.server_root_id = "gone", .writer_epoch = 1, .fence_generation = 1});
+    const CatalogEntry after = seedStalledCreating(op, store, "00/z-creating@cas@",
+        hexToU128("000000000000000000000000000000d3"), CreatorFence{.server_root_id = "gone", .writer_epoch = 1, .fence_generation = 1});
+    const auto parent_object = op.read(layout.foldSealKey(1, 1), Retry::once());
+    ASSERT_TRUE(parent_object);
+    const CasFoldSeal parent = decodeFoldSeal(parent_object->bytes);
+
+    std::vector<NamespaceLifeId> announced;
+    CatalogLifecycleReconciler reconciler(op, layout, parent, everyCreatorTerminal);
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(
+        noAuthorityRefresh, [&](const NamespaceLifeId & life) { announced.push_back(life); });
+
+    EXPECT_EQ(result.catalog_resolution, CatalogResolution::DrainComplete);
+    ASSERT_TRUE(result.final_catalog_cut);
+    EXPECT_TRUE(result.final_catalog_cut->catalog.entries.empty());
+    EXPECT_EQ(reconciler.completedErases(), removing);
+    EXPECT_EQ(reconciler.cancelledCreating(), 2u);
+    const NamespaceLifeId before_life = NamespaceLifeId::fromCatalogEntry(before.ns, before.incarnation);
+    const NamespaceLifeId after_life = NamespaceLifeId::fromCatalogEntry(after.ns, after.incarnation);
+    EXPECT_EQ(announced.size(), removing);
+    EXPECT_EQ(std::count(announced.begin(), announced.end(), before_life), 0);
+    EXPECT_EQ(std::count(announced.begin(), announced.end(), after_life), 0);
+    const std::vector<NamespaceLifeId> & retired = reconciler.retiredLives();
+    EXPECT_EQ(retired.size(), removing + 2);
+    EXPECT_EQ(std::count(retired.begin(), retired.end(), before_life), 1);
+    EXPECT_EQ(std::count(retired.begin(), retired.end(), after_life), 1);
+}
+
+/// Three rows of one creator cost one read of its mount slot.
+TEST(CASCatalogLifecycleReconciler, RowsOfOneCreatorCostOneSlotRead)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    const CreatorFence creator{.server_root_id = "moved-creator", .writer_epoch = 1, .fence_generation = 1};
+    for (size_t i = 0; i < 3; ++i)
+        seedStalledCreating(op, store, fmt::format("00/row-{}@cas@", i), UInt128{0xe0 + i}, creator);
+    retireCreatorRootAt(*backend, layout, "moved-creator", /*epoch*/ 2);
+    backend->clearJournal();
+
+    const CasFoldSeal parent;
+    CatalogLifecycleReconciler reconciler(op, layout, parent,
+        [&](const CreatorFence & fence) { return probeCreatorSlot(op, layout, fence.server_root_id, fence.writer_epoch); });
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh, noRetirementRecord);
+
+    EXPECT_EQ(reconciler.cancelledCreating(), 3u) << "positive control: every row was probed terminal and cancelled";
+    ASSERT_TRUE(result.final_catalog_cut);
+    EXPECT_TRUE(result.final_catalog_cut->catalog.entries.empty());
+    const std::vector<String> journal = backend->journalSnapshot();
+    EXPECT_EQ(std::count(journal.begin(), journal.end(), "get " + layout.mountKey("moved-creator")), 1);
+}
+
+/// A creator whose slot read throws and one whose slot does not decode keep their rows for this drain,
+/// each with one warning however many rows it has. The drain goes on: a certified creator's row and a
+/// `Removing` row after them are settled.
+TEST(CASCatalogLifecycleReconciler, AnUnreadableOrUndecodableSlotKeepsItsRowsAndTheDrainGoesOn)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    seedCompletedRemovingBatch(op, store, kGc, 1);
+    const CreatorFence unreadable{.server_root_id = "unreadable", .writer_epoch = 1, .fence_generation = 1};
+    const CreatorFence garbled{.server_root_id = "garbled", .writer_epoch = 1, .fence_generation = 1};
+    const CreatorFence gone{.server_root_id = "gone", .writer_epoch = 1, .fence_generation = 1};
+    const std::vector<CatalogEntry> kept{
+        seedStalledCreating(op, store, "00/a-unreadable@cas@", UInt128{0xf1}, unreadable),
+        seedStalledCreating(op, store, "00/b-unreadable@cas@", UInt128{0xf2}, unreadable),
+        seedStalledCreating(op, store, "00/c-garbled@cas@", UInt128{0xf3}, garbled),
+        seedStalledCreating(op, store, "00/c-garbled-too@cas@", UInt128{0xf4}, garbled)};
+    const CatalogEntry certified = seedStalledCreating(op, store, "00/c-gone@cas@", UInt128{0xf5}, gone);
+    const auto parent_object = op.read(layout.foldSealKey(1, 1), Retry::once());
+    ASSERT_TRUE(parent_object);
+    const CasFoldSeal parent = decodeFoldSeal(parent_object->bytes);
+
+    std::map<String, size_t> probes;
+    ScopedCasGcLogCapture capture("CatalogLifecycleReconciler");
+    CatalogLifecycleReconciler reconciler(op, layout, parent,
+        [&](const CreatorFence & fence)
+        {
+            ++probes[fence.server_root_id];
+            if (fence.server_root_id == "unreadable")
+                throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected mount slot read failure");
+            return fence.server_root_id == "garbled" ? CreatorSlotStatus::Undecodable : CreatorSlotStatus::Terminal;
+        });
+    CatalogLifecycleReconcileResult result;
+    ASSERT_NO_THROW(result = reconciler.reconcile(noAuthorityRefresh, noRetirementRecord));
+
+    EXPECT_EQ(result.authority_status, AuthorityStatus::Authoritative);
+    EXPECT_EQ(result.catalog_resolution, CatalogResolution::DrainComplete);
+    EXPECT_EQ(reconciler.completedErases(), 1u) << "the `Removing` row";
+    EXPECT_EQ(reconciler.cancelledCreating(), 1u) << "the certified row";
+    EXPECT_FALSE(catalogRow(op, layout, certified.ns));
+    EXPECT_FALSE(catalogRow(op, layout, RootNamespace{"00/drain-batch-0@cas@"}));
+    for (const CatalogEntry & entry : kept)
+        EXPECT_EQ(catalogRow(op, layout, entry.ns), std::optional<CatalogEntry>{entry}) << entry.ns.string();
+    EXPECT_EQ(probes, (std::map<String, size_t>{{"unreadable", 1}, {"garbled", 1}, {"gone", 1}}));
+    const String log = capture.captured();
+    const auto lines_naming = [&](const String & root)
+    {
+        size_t lines = 0;
+        for (size_t at = log.find("creator '" + root + "'"); at != String::npos; at = log.find("creator '" + root + "'", at + 1))
+            ++lines;
+        return lines;
+    };
+    EXPECT_EQ(lines_naming("unreadable"), 1u) << log;
+    EXPECT_EQ(lines_naming("garbled"), 1u) << log;
+    EXPECT_EQ(lines_naming("gone"), 0u) << log;
+}
+
+/// A leader that is deposed once its selection cut is read probes no creator.
+TEST(CASCatalogLifecycleReconciler, ADeposedLeaderProbesNoCreator)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    const CatalogEntry stalled = seedStalledCreating(op, store, "00/deposed@cas@",
+        hexToU128("000000000000000000000000000000d4"), CreatorFence{.server_root_id = "gone", .writer_epoch = 1, .fence_generation = 1});
+
+    bool authority_held = true;
+    CasOperation leader_op = requests.admit([&] { return authority_held; });
+    backend->afterReadOf(layout.refCatalogKey(), [&] { authority_held = false; });
+    size_t probes = 0;
+    const CasFoldSeal parent;
+    CatalogLifecycleReconciler reconciler(leader_op, layout, parent,
+        [&](const CreatorFence &)
+        {
+            ++probes;
+            return CreatorSlotStatus::Terminal;
+        });
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh, noRetirementRecord);
+    backend->afterReadOf(layout.refCatalogKey(), {});
+
+    EXPECT_EQ(result.authority_status, AuthorityStatus::FencedOut);
+    EXPECT_EQ(probes, 0u);
+    EXPECT_EQ(catalogRow(op, layout, stalled.ns), std::optional<CatalogEntry>{stalled});
+}
+
+/// Each cancel writes one INFO line naming the namespace and its creator, and counts its own event.
+TEST(CASCatalogLifecycleReconciler, EachCancelLogsOneLineAndCountsItsOwnEvent)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    seedStalledCreating(op, store, "00/logged-a@cas@", UInt128{0x121},
+        CreatorFence{.server_root_id = "gone", .writer_epoch = 1, .fence_generation = 1});
+    seedStalledCreating(op, store, "00/logged-b@cas@", UInt128{0x122},
+        CreatorFence{.server_root_id = "gone", .writer_epoch = 1, .fence_generation = 1});
+    const uint64_t events_before = ProfileEvents::global_counters[ProfileEvents::CASGCStalledCreatingCancelled];
+
+    String log;
+    {
+        ScopedCasGcLogCapture capture("CatalogLifecycleReconciler", "information");
+        const CasFoldSeal parent;
+        CatalogLifecycleReconciler reconciler(op, layout, parent, everyCreatorTerminal);
+        reconciler.reconcile(noAuthorityRefresh, noRetirementRecord);
+        EXPECT_EQ(reconciler.cancelledCreating(), 2u);
+        EXPECT_EQ(reconciler.completedErases(), 0u);
+        log = capture.captured();
+    }
+
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCStalledCreatingCancelled] - events_before, 2u);
+    EXPECT_NE(log.find("'00/logged-a@cas@'"), String::npos) << log;
+    EXPECT_NE(log.find("'00/logged-b@cas@'"), String::npos) << log;
+    EXPECT_NE(log.find("creator 'gone' at writer epoch 1"), String::npos) << log;
+}
+
+/// Two leaders cancel the same row: the first one's swap is held in flight while the second drains. The
+/// row goes once, only the winner counts it, and the loser writes nothing more.
+TEST(CASCatalogLifecycleReconciler, TwoLeadersRacingOneCancelRemoveTheRowOnce)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    const CatalogEntry stalled = seedStalledCreating(op, store, "00/raced@cas@",
+        hexToU128("000000000000000000000000000000d5"), CreatorFence{.server_root_id = "gone", .writer_epoch = 1, .fence_generation = 1});
+    backend->clearJournal();
+    backend->blockNextCatalogCas(layout.refCatalogKey());
+
+    const CasFoldSeal parent;
+    CasRequests first_requests = openRequestsForTest(backend);
+    CasOperation first_op = first_requests.admit();
+    CatalogLifecycleReconciler first(first_op, layout, parent, everyCreatorTerminal);
+    CatalogLifecycleReconcileResult first_result;
+    std::thread first_leader([&] { first_result = first.reconcile(noAuthorityRefresh, noRetirementRecord); });
+    backend->waitForBlockedCatalogCas();
+
+    CasRequests second_requests = openRequestsForTest(backend);
+    CasOperation second_op = second_requests.admit();
+    CatalogLifecycleReconciler second(second_op, layout, parent, everyCreatorTerminal);
+    const CatalogLifecycleReconcileResult second_result = second.reconcile(noAuthorityRefresh, noRetirementRecord);
+    backend->releaseBlockedCatalogCas();
+    first_leader.join();
+
+    EXPECT_EQ(second.cancelledCreating(), 1u);
+    EXPECT_EQ(first.cancelledCreating(), 0u);
+    EXPECT_TRUE(first.retiredLives().empty());
+    EXPECT_EQ(first_result.catalog_resolution, CatalogResolution::DrainComplete);
+    EXPECT_EQ(second_result.catalog_resolution, CatalogResolution::DrainComplete);
+    EXPECT_FALSE(catalogRow(op, layout, stalled.ns));
+    const std::vector<String> journal = backend->journalSnapshot();
+    EXPECT_EQ(std::count(journal.begin(), journal.end(), "cas_begin " + layout.refCatalogKey()), 2)
+        << "one swap per leader: the loser does not write again";
 }
 
 /// THE DRAIN'S AUTHORITY, end to end. `CatalogLifecycleReconciler` and
