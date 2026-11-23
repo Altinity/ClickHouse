@@ -877,7 +877,10 @@ TEST_F(ResolvePoolTest, LatencyAwareSelectionPrefersFastAddress)
 
     std::map<String, size_t> results;
     for (size_t i = 0; i < 3000; ++i)
-        ++results[*resolver->resolve()];
+    {
+        auto entry = resolver->resolve();
+        ++results[*entry];
+    }
 
     ASSERT_EQ(size_t(3), results.size());
     ASSERT_GT(results["127.0.0.1"], 3 * results["127.0.0.2"]);
@@ -900,7 +903,10 @@ TEST_F(ResolvePoolTest, LatencyIsIgnoredWhenLatencyAwareSelectionIsOff)
 
     std::map<String, size_t> results;
     for (size_t i = 0; i < 50000; ++i)
-        ++results[*resolver->resolve()];
+    {
+        auto entry = resolver->resolve();
+        ++results[*entry];
+    }
 
     auto mean = getMean(results);
     auto diff = getMaxDiff(results, mean);
