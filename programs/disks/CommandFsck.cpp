@@ -145,8 +145,8 @@ public:
                          "the body, no action needed\n";
         if (report.intent_replaced > 0)
             std::cout << "note: " << report.intent_replaced
-                      << " deletion intent(s) name an incarnation that is no longer the body — GC removes them "
-                         "later, no action needed\n";
+                      << " deletion intent(s) name an incarnation that is no longer the body — GC removes each once "
+                         "no part references its blob, no action needed\n";
         if (report.pending_intent_absent > 0)
             std::cout << "note: " << report.pending_intent_absent
                       << " `pending` GC row(s) have no deletion intent, but their body is gone or replaced — the row is "

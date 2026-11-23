@@ -423,14 +423,14 @@ Two more `INFO` lines mark an intake that ended early:
   namespace. No action for an occasional line. If the same namespace appears round after round, the round deletes nothing; report it with these lines.
 
 **What a quiet namespace costs.** One `_ckpt` `GET` and one probe of the cursor's successor, which is the
-proof that nothing was appended. When the GC process does not remember the cursor's successor, the cold
-path costs one more `GET`.
+proof that nothing was appended. When the GC process does not remember the cursor's successor, resolving it
+can issue additional `GET`s: none in some cases, several when it follows links across epochs.
 
 **Read-ahead.** The checkpoint, walk-position, manifest-edge and (in phase 10) zero-candidate `HEAD`
 reads are hinted ahead onto a bounded pool (`cas_gc_io_concurrency`, default 16; `1` runs the reads inline) and
 taken by the walk at exactly the sites, and in exactly the order, of the inline reads, so every
-decision, decode, counter and event stays on the round thread and the phase's semantic metrics do
-not depend on the setting. Two things do: a request a worker performed lands on that worker's
+decision, decode, counter and event stays on the round thread and, for the same completed work, the
+phase's semantic metrics do not depend on the setting. Two things do: a request a worker performed lands on that worker's
 `ProfileEvents`, not the phase row's, and a hinted key the walk never takes (a namespace held below
 its lookahead, a `HEAD` candidate that kept an edge) is a wasted request. `CASGCReadAheadHit` and
 `CASGCReadAheadMiss` are charged to the phase that takes the result; `CASGCReadAheadWasted` is

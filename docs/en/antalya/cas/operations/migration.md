@@ -217,7 +217,8 @@ intents have ceiling 2 or 3. The behavior of those builds below follows from the
 
 - **A server that mounts after step M8** fails to start the disk with `UNKNOWN_FORMAT_VERSION`:
   `CAS pool meta: pool requires reader generation 4 but this build supports at most 1` (`at most 3` or `2` on a 26.8
-  build without deletion intents).
+  build without deletion intents). A 26.6.x server is refused the same way from step M6 on, even if a later step fails. Between M6 and M8 the
+  message names reader generation 3; after M8 it names 4.
 - **A server that stays up** cannot remount after a lost mount lease or a fence, and stays unmounted until it is
   upgraded.
 - **An older GC leader that stays up** holds every stamped namespace and suppresses destructive GC steps; see
