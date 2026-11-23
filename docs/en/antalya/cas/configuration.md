@@ -99,7 +99,7 @@ entirely before release. Treat this table as a snapshot of the current build, no
 | `skip_access_check` | `false` | Skip the boot-time capability probe (start now, fix later). Only the preflight probe is skipped — the check that the object storage supports single-attempt conditional writes still runs on every ordinary writable start. **Not available on a writable generation-token (GCS) disk**, which refuses to mount with it: there, the probe battery is the only proof that a token-exact delete carries its generation precondition. Mount such a disk read-only if you need to defer the check |
 | `cas_mount_lease_ttl_ms` | `40000` | How long this server may write after its last confirmed renewal; every other server waits at least this long before fencing or reclaiming its slot (≥ 1, at most 600000 — a larger value is clamped to 10 minutes with a warning at startup, so no holder declares a longer lease). Lower values shorten recovery after this server's crash but reduce tolerance for object-storage and scheduling delays. Set `30000` for faster recovery after a crash, at the costs [below](#mount-lease-costs) |
 | `cas_mount_renew_period_ms` | `10000` | Milliseconds between background mount-lease renewals (≥ 1). It must leave enough time for two attempt envelopes (a renewal write and its settlement read) and the lease safety margin before the TTL expires: `period + 2 × envelope + margin < TTL` |
-| `cas_gc_snapshot_generations_to_keep` | `3` | GC snapshot generations retained |
+| `cas_gc_snapshot_generations_to_keep` | `3` | GC snapshot generations retained. `0` is refused: set a large number instead. `1` is loaded as `2` with a warning: with one generation, a round that loses its commit can delete the generation the pool still adopts |
 | `cas_gc_shards` | `1` | Blob-hash-prefix reducer shards (≥ 1). Recorded in the pool at creation; a mismatching config is refused at mount |
 | `gcs_max_conditional_put_bytes` | 1 GiB | Largest conditional non-blob `PUT` on a generation-token store, including create-if-absent metadata/control artifacts and conditional replacements. Blob publication is unconditional, uses ordinary multipart, and is not subject to this cap |
 | `cas_part_folder_cache_bytes` | 64 MiB | Part-folder view cache byte budget (`0` disables retention) |
@@ -373,6 +373,14 @@ Upgrade order: stop every 26.6.x server that mounts the pool, run the tool, upgr
 Replication while the versions are mixed: fetch-by-relink is off in both directions, and a fetch from a 26.8 server into a 26.6.x replica can fail. A 26.6.x server advertises replication protocol version 11 and offers a relink only to a receiver that advertises 11; a 26.8 server advertises 10 plus the `relink_confirm` capability and offers a relink only to a receiver that sends the capability. Neither side offers the other a relink, so every fetch between them moves the part bytes. The byte fetch into 26.6.x can fail: 26.8 sends `invalidated_system_columns.txt`, which a 26.6.x receiver counts into the checksums; the replication queue retries until both sides run 26.8. This window exists only when the upgrade order above is not followed.
 
 What a 26.6.x server does if it meets a migrated pool: it refuses to mount after a restart (`UNKNOWN_FORMAT_VERSION` at startup: `CAS pool meta: pool requires reader generation 4 but this build supports at most 1`), and its GC is refused once the tool has rewritten `gc/state`. An already mounted 26.6.x server keeps serving what it recovered and reclaims nothing. Fetch-by-relink is protected by namespace ownership and the mount fence, not by the log version. No data is deleted or lost. Downgrading a migrated pool is not supported.
+
+## Upgrading the snapshot generation setting {#upgrading-snapshot-generations}
+
+`cas_gc_snapshot_generations_to_keep` of `0` (keep every generation) is no longer accepted: the disk refuses to load. Choose a large positive number before you upgrade. The diagnostic tools open the pool through the same configuration, so they refuse a configuration with `0` too.
+
+`1` is accepted with a warning and acts as `2`.
+
+Set `2` or more on every server that can be GC leader before the first upgraded server joins. An older server still configured with `1` can prune the generation the pool has just adopted, and an upgraded server then reports the missing seal as damage.
 
 ## Server-level settings {#server-settings}
 

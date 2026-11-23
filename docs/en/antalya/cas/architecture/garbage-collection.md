@@ -531,8 +531,8 @@ over `gc/state`. One phase because the prune is only safe as a pre-`CAS` action.
 - **Observability:** phase row `round_commit`; metrics `generations_visited`, `pruned_through`,
   `generations_referenced`, `round`, `generation`
 
-Prune bound: keep the last `cas_gc_snapshot_generations_to_keep` generations (default 3; `0` keeps
-everything), at most 64 prefixes a round. See [the one-pass commit](#gc-state) for the fold seal's
+Prune bound: keep the last `cas_gc_snapshot_generations_to_keep` generations (default 3; `1` acts as `2`, `0` is refused),
+at most 64 prefixes a round. See [the one-pass commit](#gc-state) for the fold seal's
 role as the coverage record.
 
 ### Post-commit failures {#post-commit-failures}
@@ -919,8 +919,8 @@ carry" (see [phase 10](#phase-10-fold-reduce)). A missing parent summary entry o
   snapshots strictly older than the checkpoint-named snapshot are deletable, that snapshot itself is
   always kept. Keys are write-once, so there is no `HEAD`: the plan is chunked, each chunk is
   preceded by a catalog and `gc/state` re-validation and sent as one batch `DELETE`.
-- **Generations** (phase 13) — keep the last `cas_gc_snapshot_generations_to_keep` (default 3; `0`
-  means keep everything, for forensics). Pruning is wholesale: `LIST` the generation prefix and
+- **Generations** (phase 13) — keep the last `cas_gc_snapshot_generations_to_keep` (default 3; `1` acts as `2`, `0` is refused).
+  Pruning is wholesale: `LIST` the generation prefix and
   delete everything under it, including deposed-leader debris and attempt-scoped outcome sets. A
   generation still referenced by the live seal is skipped, but the cursor still advances past it —
   leak-freedom then rests on the post-`CAS` hand-off reclaim in phase 14.

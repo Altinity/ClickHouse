@@ -1040,7 +1040,7 @@ private:
     /// There is deliberately NO per-round current-generation attempt-sweep (it cost a per-round LIST for a
     /// rare concurrent-leader collision, the GC-DISCOVERY-LIST-QUADRATIC concern). Deposed-leader
     /// current-generation debris is bounded space that waits at most `keep` completion-advances for the
-    /// wholesale prune to reclaim it. keep==0 prunes nothing (keep-all forensics mode). `attempt` is the
+    /// wholesale prune to reclaim it. keep==0 prunes nothing (reachable only through `PoolConfig`, not the disk setting); keep==1 acts as 2. `attempt` is the
     /// adopted attempt (`next.snap_attempt`); it is currently unused (retention keys on generation alone).
     ///
     /// `suppress_destructive` is the round's gate: a suppressed round prunes NOTHING and leaves

@@ -4513,9 +4513,11 @@ void Gc::pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attemp
     if (suppress_destructive)
         return;
 
-    const uint64_t keep = store->poolConfig().gc_snapshot_generations_to_keep;
-    if (keep == 0)
+    const uint64_t configured_keep = store->poolConfig().gc_snapshot_generations_to_keep;
+    if (configured_keep == 0)
         return;   /// keep ALL (debug/forensics — replay GC's in-degree view as-of a past round)
+    /// The adopted generation's seal must survive a round that loses, so one generation is never enough.
+    const uint64_t keep = std::max<uint64_t>(configured_keep, 2);
 
     CasOperation op = store->openRequests().admit();
     const Layout & layout = store->layout();

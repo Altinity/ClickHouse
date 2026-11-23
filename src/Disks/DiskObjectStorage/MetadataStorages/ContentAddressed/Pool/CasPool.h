@@ -80,8 +80,9 @@ struct PoolConfig
     /// bound exists so a later opt-in of per-namespace keys has one.
     uint64_t hot_key_cache_bytes = 16ULL << 20;
     /// How many superseded snapshot generations to retain. After committing
-    /// generation G, generations <= G - this are pruned (bounded per round). 0 = keep ALL
-    /// (debug/forensics — replay GC's in-degree view as-of a past round). Default 3 = the safety
+    /// generation G, generations <= G - this are pruned (bounded per round). 0 = keep ALL (only for direct callers: the disk setting refuses 0).
+    /// 1 acts as 2: the adopted generation's seal must survive a round that loses
+    /// (the disk setting loads 1 as 2). Default 3 = the safety
     /// margin covering any in-flight/resuming leader (a leader more than `keep` generations behind
     /// has lost its lease; its round-commit CAS fails).
     uint64_t gc_snapshot_generations_to_keep = 3;
