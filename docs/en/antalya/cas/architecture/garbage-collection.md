@@ -700,9 +700,11 @@ without that wait.
   body sends no `DELETE`
 - **Safety:** phase 10 exact-read and identity-validated each candidate and computed its source-edge
   retirements; phase 13's `CAS` adopted both those retirements and the sweep cursor, so a post-`CAS`
-  body delete cannot orphan a still-reachable edge. A manifest is deletable only once the sealed fold
-  cursor is in a strictly higher epoch than the manifest's build epoch and no tail record above the
-  cursor names it as a removal; any uncertainty retains.
+  body delete cannot orphan a still-reachable edge. Every nominated manifest has passed the mount-floor
+  check. For a namespace in the catalog, the sealed fold cursor must also be in a strictly higher
+  epoch than the build and no tail record above the cursor may name the manifest as a removal.
+  For a namespace absent from the initial catalog read, the sweep verifies that it is still absent
+  after the floor check. See the [nomination rules](/antalya/cas/architecture/manifests-and-refs#orphan-sweep).
 - **Fails the round if:** a `TokenMismatch` — an immutable manifest identity must never change token
   (illegal ABA); stricter than every other post-`CAS` delete (`CORRUPTED_DATA`)
 - **Observability:** phase row `orphan_sweep`; metrics `orphan_manifest_sweep_page_listed`,
@@ -1144,7 +1146,8 @@ No writes.
 | new run segments | `PUT` | one per written run |
 | `<pool_prefix>/cas/manifests/` | `LIST` | one bounded page, only when orphan planning runs |
 | manifest candidate body | `GET` | one per nominated candidate (≤ `cas_manifest_sweep_delete_budget_keys`), through the read-ahead; keys decided from their name alone are never read; only when orphan planning runs |
-| `gc/state`, adopted `fold_seal`, catalog | `GET` | one each, only when orphan planning runs |
+| `gc/state`, adopted `fold_seal` | `GET` | the page reads `gc/state` and the seal it names. After a namespace's removal walk it rereads `gc/state` and fetches the seal again if the adopted generation or attempt changed |
+| `<pool_prefix>/cas/ref_catalog` | `GET` | one initial read per planned page, plus one after the floor checks if the page has tentative candidates |
 | `<server_root_id>/mount` | `GET` | one memoized mount-floor lookup per namespace per page (`floor_lookups` / `floor_reads`), only when orphan planning runs |
 | `_ckpt`, the snapshot's same-id `_log`, the tombstone its backlink names, `_snap`, tail `_log` | `GET` | per namespace on the page (the recovery base plus the tail), only when orphan planning runs |
 

@@ -314,8 +314,9 @@ eligible on the next ordinary fold, even if the previous traversal completed rec
 ### Protocol version and retired settings {#protocol-version}
 
 A pool at generation 4 uses the [deletion-intent protocol](/antalya/cas/architecture/blob-protocol).
-There are no mixed versions on one pool: a server of this build refuses a pool below generation 4 at every
-open, and a server of an older build refuses a pool at generation 4. An older pool is converted once, offline,
+This build requires generation 4 when opening a pool. Servers that only support earlier protocol
+generations refuse a generation 4 pool. Builds that support generation 4 can share the pool during
+the [sweep schedule rollout](#orphan-manifest-sweep-schedule). An older pool is converted once, offline,
 by `clickhouse-disks cas-migrate-pool` with every server of the pool stopped; see
 [migrating a pool to generation 4](/antalya/cas/operations/migration).
 
