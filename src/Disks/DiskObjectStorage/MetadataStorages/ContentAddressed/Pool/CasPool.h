@@ -467,6 +467,8 @@ public:
     /// holding such a lock is refused at its next request instead of being waited out.
     void beginTeardown() noexcept;
     bool teardownBegun() const noexcept;
+    /// The GC scheduler's per-tick cleanup of this mount's own idle `Creating` catalog rows; stops at teardown.
+    void cancelIdleOwnCreatingRows();
     bool stopAndDrainDetachedWork(uint64_t deadline_ms);
     uint64_t detachedWorkInFlight() const;
     uint64_t detachedWorkInFlightForTest() const { return detachedWorkInFlight(); }

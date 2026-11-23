@@ -216,7 +216,8 @@ public:
     CasOperation admit(Liveness liveness = {});
     /// Admitted earlier: the generation came from a persisted runtime record, and an operation that
     /// resumes under a generation the fence has since moved past gives up rather than writing.
-    CasOperation resume(uint64_t admitted_generation, Liveness liveness = {});
+    /// A non-empty `sleep_ms` replaces the plane's inter-attempt sleep for this operation only.
+    CasOperation resume(uint64_t admitted_generation, Liveness liveness = {}, std::function<void(uint64_t)> sleep_ms = {});
 
     /// The capability predicates and `dialect()`.
     Backend & backendForCapabilityPredicates() { return *backend; }
@@ -304,7 +305,7 @@ public:
     /// A caller's own inter-iteration wait, paced through the same clock the engine's own sleeps use --
     /// so a test that replaces the sleep sees no real time pass in either. For the hand-written loops
     /// that reissue something the engine must not reissue for them.
-    void pause(uint64_t ms) { owner.sleep_ms(ms); }
+    void pause(uint64_t ms) { sleep(ms); }
     /// The pause before a loop re-decides after `unresolved`, gated like the engine's own reissue
     /// pause. Returns the give-up instead of sleeping when the fence is lost or the pause plus two
     /// attempt reservations (the re-read and the write) do not fit in `policy`.
@@ -378,10 +379,14 @@ private:
     /// needs the gate, the reservation, the resolve read and the give-up helpers, never the transport.
     friend class CasHotKeys;
 
-    CasOperation(CasRequests & owner_, uint64_t admitted_generation_, Liveness liveness_)
+    CasOperation(CasRequests & owner_, uint64_t admitted_generation_, Liveness liveness_,
+                 std::function<void(uint64_t)> own_sleep_ms_ = {})
         : owner(owner_), admitted_generation(admitted_generation_), liveness(std::move(liveness_))
+        , own_sleep_ms(std::move(own_sleep_ms_))
     {
     }
+
+    void sleep(uint64_t ms) { own_sleep_ms ? own_sleep_ms(ms) : owner.sleep_ms(ms); }
 
     enum class Gate : uint8_t { Ok, FenceLost, NoBudget };
     /// The admission point: the fence for `needed_ms` from now, then the caller's own facts.
@@ -516,6 +521,7 @@ private:
     CasRequests & owner;
     uint64_t admitted_generation;
     Liveness liveness;
+    std::function<void(uint64_t)> own_sleep_ms;
     /// Written immediately before a read-class give-up throws, cleared and read only by the resolve
     /// read that swallows it. Every other caller lets the exception carry the verdict.
     std::optional<ReadStop> last_read_stop;
@@ -603,7 +609,7 @@ auto CasOperation::readLoop(std::string_view verb, const String & subject, const
         if (!fits(needed, bound))
             giveUpReadDeadline(verb, subject, bound, attempt_no);
         detail::recordReissue();
-        owner.sleep_ms(pause_ms);
+        sleep(pause_ms);
     }
 }
 

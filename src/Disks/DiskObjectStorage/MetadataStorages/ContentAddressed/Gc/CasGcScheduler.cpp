@@ -369,6 +369,18 @@ void CasGcScheduler::loop()
 {
     setThreadName(ThreadName::CAS_GC_SCHEDULER);
     size_t consecutive_backoffs = 0;
+    const auto exit_if_pool_terminal = [this]
+    {
+        if (!poolTerminalOrForgetting())
+            return false;
+        i_am_leader.store(false, std::memory_order_relaxed);
+        {
+            std::lock_guard exit_lock(terminal_exit_mutex);
+            loop_exited_on_terminal_for_test.store(true, std::memory_order_release);
+        }
+        terminal_exit_cv.notify_all();
+        return true;
+    };
     while (true)
     {
         {
@@ -393,17 +405,8 @@ void CasGcScheduler::loop()
         /// `gcHealth` honest (a terminal, self-exited scheduler reports it no longer leads). The thread exits
         /// its OWN loop here — no join from this context (C6-safe); `stop()`/`~CasGcScheduler` still join the
         /// finished thread cleanly.
-        if (store->isVanished() || store->vanishedIntentPublished()
-            || store->lifecycle() == Cas::PoolLifecycle::IdentityLost)
-        {
-            i_am_leader.store(false, std::memory_order_relaxed);
-            {
-                std::lock_guard exit_lock(terminal_exit_mutex);
-                loop_exited_on_terminal_for_test.store(true, std::memory_order_release);
-            }
-            terminal_exit_cv.notify_all();
+        if (exit_if_pool_terminal())
             return;
-        }
         try
         {
             /// LOW/benign: if stop() flips `scheduler_state` while we're blocked here (a concurrent manual
@@ -417,6 +420,30 @@ void CasGcScheduler::loop()
             /// round mutex, so it also covers the tick queued behind a manual round; the extra round
             /// on a plain `stop` (above) is a different race and stays as described.
             if (store->teardownBegun())
+                return;
+
+            /// Before the round, so a follower runs it too.
+            try
+            {
+                store->cancelIdleOwnCreatingRows();
+            }
+            catch (...)
+            {
+                /// Nothing here may throw: a failed cleanup must not skip the round.
+                try
+                {
+                    if (store->teardownBegun() && isTransientGcRoundError(getCurrentExceptionCode()))
+                        LOG_INFO(log, "CA GC cleanup of this mount's own `Creating` rows stopped by the disk's teardown: {}",
+                            getCurrentExceptionMessage(false));
+                    else
+                        tryLogCurrentException(log, "CA GC cleanup of this mount's own `Creating` rows failed (will retry next tick)");
+                }
+                catch (...) // NOLINT(bugprone-empty-catch)
+                {
+                }
+            }
+            /// The pass can outlast a `FORGET` intent or a terminal transition, as it can a teardown.
+            if (store->teardownBegun() || exit_if_pool_terminal())
                 return;
 
             /// runRoundLogged emits the Start + Finish table rows (incl. the per-round
@@ -509,8 +536,7 @@ void CasGcScheduler::heartbeatLoop()
         /// rev.7 §3 [C1] + rev.8 §9 item 8: self-exit on ANY terminal (or FORGET-intent) pool, same as
         /// `loop()`. A terminal pool's advisory pulses would target a deleted `gc/hb` key (`IdentityLost`) or
         /// a FOREIGN pool's key (`VanishedReplaced`) — stop pulsing the moment the pool goes terminal.
-        if (store->isVanished() || store->vanishedIntentPublished()
-            || store->lifecycle() == Cas::PoolLifecycle::IdentityLost)
+        if (poolTerminalOrForgetting())
         {
             {
                 std::lock_guard exit_lock(terminal_exit_mutex);
@@ -556,6 +582,12 @@ CasGcScheduler::GcHealth CasGcScheduler::gcHealth() const
     }
     h.wedged_namespace_count = store->wedgedRefLaneCount();
     return h;
+}
+
+bool CasGcScheduler::poolTerminalOrForgetting() const
+{
+    return store->isVanished() || store->vanishedIntentPublished()
+        || store->lifecycle() == Cas::PoolLifecycle::IdentityLost;
 }
 
 bool CasGcScheduler::waitForTerminalSelfExitForTest(std::chrono::milliseconds timeout)

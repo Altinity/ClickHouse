@@ -1,10 +1,12 @@
 #include <gtest/gtest.h>
 
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasHotKeys.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCkptFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CatalogLifecycleReconciler.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
@@ -19,7 +21,10 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
+#include <future>
 #include <latch>
 #include <map>
 #include <mutex>
@@ -73,6 +78,7 @@ extern const Event CASGCRefWalkPlansBuilt;
 extern const Event CASGCUnmatchedAdoptedParentLives;
 extern const Event CASGCNamespaceCleanupLeaks;
 extern const Event CASGCStalledCreatingCancelled;
+extern const Event CASOwnCreatingCancelled;
 }
 
 namespace
@@ -4535,4 +4541,1284 @@ TEST(CASGCFrontierGate, CompletedRemovalDrainUsesNPlusOneCatalogReads)
         << "N+1 drain reads, one post-hot-LIST walk-plan cut, one orphan-manifest-sweep cut (now that "
            "the proved-empty gate has opened, unlocking that destructive family too), and one separate "
            "post-janitor-page cut";
+}
+
+/// ===================== THE OWNING MOUNT CANCELS ITS OWN IDLE `Creating` ROWS =====================
+///
+/// A cold admission that lands its `Creating` row and then fails leaves the row under this mount's live
+/// writer epoch, which no certificate covers. The scheduler's per-tick pass removes such a row once no
+/// admission of its name is in flight here.
+
+namespace
+{
+
+/// Counts the catalog requests the owner tests assert on, and holds, parks, loses or fails one
+/// conditional catalog write on demand. Every control is armed before the request it targets is sent.
+class OwnerCancelBackend final : public CountingBackend
+{
+public:
+    using CountingBackend::list;
+
+    const String catalog_key = Layout{"p"}.refCatalogKey();
+
+    size_t catalogGets() const
+    {
+        std::lock_guard lock(control_mutex);
+        return catalog_gets;
+    }
+    size_t catalogCasBegins() const
+    {
+        std::lock_guard lock(control_mutex);
+        return catalog_cas_begins;
+    }
+    size_t ckptWrites() const
+    {
+        std::lock_guard lock(control_mutex);
+        return ckpt_writes;
+    }
+    std::vector<String> catalogCasBodies() const
+    {
+        std::lock_guard lock(control_mutex);
+        return catalog_cas_bodies;
+    }
+    void resetCatalogCounts()
+    {
+        std::lock_guard lock(control_mutex);
+        catalog_gets = 0;
+        catalog_cas_begins = 0;
+        ckpt_writes = 0;
+        catalog_cas_bodies.clear();
+    }
+
+    /// The next conditional catalog write is not applied: `on_hold` runs, and the call fails as a lost
+    /// response would. `applyHeld` lands it later iff the catalog still has the bytes it was decided on.
+    void holdNextCatalogCasUnresolved(std::function<void()> on_hold)
+    {
+        std::lock_guard lock(control_mutex);
+        hold_next = true;
+        hold_hook = std::move(on_hold);
+    }
+    bool applyHeld(CasOperation & op)
+    {
+        std::optional<String> bytes;
+        String base;
+        {
+            std::lock_guard lock(control_mutex);
+            bytes = held_bytes;
+            base = held_base;
+        }
+        if (!bytes)
+            return false;
+        const std::optional<DB::Cas::Object> current = op.read(catalog_key, Retry::standard());
+        if (!current || current->bytes != base)
+            return false;
+        return std::holds_alternative<Committed>(op.replace(catalog_key, *bytes, current->etag, Retry::once()));
+    }
+
+    /// The next conditional catalog write waits inside the call until `releaseCatalogCas`.
+    void parkNextCatalogCas() { cas_park.arm(control_mutex); }
+    bool waitCatalogCasParked(const std::atomic<bool> & stop) { return cas_park.wait(control_mutex, stop); }
+    void releaseCatalogCas() { cas_park.release(control_mutex); }
+
+    /// The next write of exactly `key` waits inside the call until `releaseKeyWrite`.
+    void parkNextWriteOf(const String & key)
+    {
+        std::lock_guard lock(control_mutex);
+        park_key = key;
+        key_park.armLocked();
+    }
+    bool waitKeyWriteParked(const std::atomic<bool> & stop) { return key_park.wait(control_mutex, stop); }
+    void releaseKeyWrite() { key_park.release(control_mutex); }
+
+    /// Every conditional catalog write whose bytes satisfy `when` fails before it is applied, with an
+    /// error the engine never treats as possibly landed.
+    void failCatalogCasWhen(std::function<bool(const String &)> when)
+    {
+        std::lock_guard lock(control_mutex);
+        fail_when = std::move(when);
+    }
+
+    /// The next conditional catalog write is applied and its response lost; `after_landing` runs between.
+    void loseNextCatalogCasResponse(std::function<void()> after_landing = {})
+    {
+        std::lock_guard lock(control_mutex);
+        lose_next = true;
+        lose_hook = std::move(after_landing);
+    }
+    bool responseLost() const
+    {
+        std::lock_guard lock(control_mutex);
+        return response_lost;
+    }
+
+    /// Runs after each completed read of the catalog, including reads the hook itself makes.
+    void afterCatalogRead(std::function<void()> hook)
+    {
+        std::lock_guard lock(control_mutex);
+        after_read = std::move(hook);
+    }
+
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        std::optional<Raw> raw = CountingBackend::read(key, access);
+        if (key != catalog_key)
+            return raw;
+        std::function<void()> hook;
+        {
+            std::lock_guard lock(control_mutex);
+            ++catalog_gets;
+            hook = after_read;
+        }
+        if (hook)
+            hook();
+        return raw;
+    }
+
+    std::expected<String, RawConflict> write(
+        const String & key, const String & bytes, const std::optional<String> & expected_value,
+        TransportAccess & access) override
+    {
+        const bool catalog_cas = key == catalog_key && expected_value.has_value();
+        std::function<void()> on_hold;
+        std::function<void()> on_lost;
+        bool hold = false;
+        bool lose = false;
+        {
+            std::unique_lock lock(control_mutex);
+            if (key.find("_ckpt") != String::npos)
+                ++ckpt_writes;
+            if (catalog_cas)
+            {
+                ++catalog_cas_begins;
+                catalog_cas_bodies.push_back(bytes);
+                cas_park.parkIfArmed(lock);
+            }
+            if (!park_key.empty() && key == park_key)
+            {
+                park_key.clear();
+                key_park.parkIfArmed(lock);
+            }
+            if (catalog_cas && fail_when && fail_when(bytes))
+                throw std::runtime_error("OwnerCancelBackend: injected catalog write failure, not applied");
+            if (catalog_cas && std::exchange(hold_next, false))
+            {
+                hold = true;
+                held_bytes = bytes;
+                on_hold = std::move(hold_hook);
+            }
+            if (catalog_cas && std::exchange(lose_next, false))
+            {
+                lose = true;
+                on_lost = std::move(lose_hook);
+            }
+        }
+        if (hold)
+        {
+            const std::optional<Raw> base = CountingBackend::read(key, access);
+            {
+                std::lock_guard lock(control_mutex);
+                held_base = base ? base->bytes : String{};
+            }
+            if (on_hold)
+                on_hold();
+            throw Poco::TimeoutException("OwnerCancelBackend: held catalog write, not applied yet");
+        }
+        std::expected<String, RawConflict> result = CountingBackend::write(key, bytes, expected_value, access);
+        if (lose && result.has_value())
+        {
+            {
+                std::lock_guard lock(control_mutex);
+                response_lost = true;
+            }
+            if (on_lost)
+                on_lost();
+            throw Poco::TimeoutException("OwnerCancelBackend: lost catalog write response");
+        }
+        return result;
+    }
+
+private:
+    /// One request held inside the backend call, released by the test.
+    struct Park
+    {
+        bool armed = false;
+        bool parked = false;
+        bool released = false;
+        std::condition_variable cv;
+
+        void armLocked()
+        {
+            armed = true;
+            parked = false;
+            released = false;
+        }
+        void arm(std::mutex & mutex)
+        {
+            std::lock_guard lock(mutex);
+            armLocked();
+        }
+        void parkIfArmed(std::unique_lock<std::mutex> & lock)
+        {
+            if (!std::exchange(armed, false))
+                return;
+            parked = true;
+            cv.notify_all();
+            cv.wait_for(lock, std::chrono::minutes(1), [&] { return released; });
+        }
+        /// False when `stop` turns true or a minute passes before a request parks.
+        bool wait(std::mutex & mutex, const std::atomic<bool> & stop)
+        {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(1);
+            std::unique_lock lock(mutex);
+            while (!parked)
+            {
+                if (stop || std::chrono::steady_clock::now() >= deadline)
+                    return false;
+                cv.wait_for(lock, std::chrono::milliseconds(10));
+            }
+            return true;
+        }
+        void release(std::mutex & mutex)
+        {
+            std::lock_guard lock(mutex);
+            armed = false;
+            released = true;
+            cv.notify_all();
+        }
+    };
+
+    mutable std::mutex control_mutex;
+    size_t catalog_gets = 0;
+    size_t catalog_cas_begins = 0;
+    size_t ckpt_writes = 0;
+    std::vector<String> catalog_cas_bodies;
+    bool hold_next = false;
+    std::function<void()> hold_hook;
+    std::optional<String> held_bytes;
+    String held_base;
+    Park cas_park;
+    Park key_park;
+    String park_key;
+    std::function<bool(const String &)> fail_when;
+    bool lose_next = false;
+    std::function<void()> lose_hook;
+    bool response_lost = false;
+    std::function<void()> after_read;
+};
+
+/// Lease renewal parked an hour out, so only the test moves the mount deadline.
+PoolPtr openOwnerPool(const std::shared_ptr<OwnerCancelBackend> & backend, const String & root = "test")
+{
+    PoolConfig config{.pool_prefix = "p", .server_root_id = root, .gc_fold_max_defer_rounds = 0};
+    config.mount_renew_period = std::chrono::milliseconds{3'600'000};
+    return Pool::open(backend, config);
+}
+
+void expireLease(const PoolPtr & store)
+{
+    store->setMountDeadline(store->bootMsNow() - 5'000);
+}
+
+void restoreLease(const PoolPtr & store)
+{
+    store->setMountDeadline(store->bootMsNow() + 600'000);
+}
+
+CreatorFence liveFenceOf(const PoolPtr & store)
+{
+    return CreatorFence{.server_root_id = store->poolConfig().server_root_id,
+                        .writer_epoch = store->writerEpoch(), .fence_generation = store->fenceGeneration()};
+}
+
+uint64_t ownCancels()
+{
+    return ProfileEvents::global_counters[ProfileEvents::CASOwnCreatingCancelled];
+}
+
+/// An interrupted `CREATE`: step 1 lands, then the lease budget runs out before the `_ckpt` create.
+/// Returns the row left behind, with the lease restored at the same fence generation.
+CatalogEntry failBirthAfterStep1(const PoolPtr & store, CasOperation & op, const RootNamespace & ns)
+{
+    CasHotKeys & lane = store->mountRequests().admit().hotKeys();
+    bool fired = false;
+    lane.cache_fill_hook_for_test = [&]
+    {
+        if (!std::exchange(fired, true))
+            expireLease(store);
+    };
+    const uint64_t generation = store->fenceGeneration();
+    bool threw = false;
+    try
+    {
+        publishBirth(store, ns, "a");
+    }
+    catch (const DB::Exception & e)
+    {
+        threw = true;
+        EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR) << e.message();
+    }
+    lane.cache_fill_hook_for_test = {};
+    restoreLease(store);
+    EXPECT_TRUE(fired) << "the hook on the step 1 commit did not run";
+    EXPECT_TRUE(threw) << "the birth must fail after its step 1";
+    EXPECT_EQ(store->fenceGeneration(), generation);
+    const std::optional<CatalogEntry> row = catalogRow(op, store->layout(), ns);
+    if (!row)
+    {
+        ADD_FAILURE() << "the failed birth left no catalog row";
+        return {};
+    }
+    EXPECT_EQ(row->state, NsState::Creating);
+    EXPECT_EQ(row->creator, std::optional<CreatorFence>{liveFenceOf(store)});
+    return *row;
+}
+
+bool catalogBodyLacks(const String & bytes, const RootNamespace & ns)
+{
+    return bytes.find(ns.string()) == String::npos;
+}
+
+}
+
+TEST(CASOwnCreatingCancel, ABudgetRefusalAfterStep1IsCancelledOnceTheLeaseRecovers)
+{
+    auto backend = std::make_shared<OwnerCancelBackend>();
+    PoolPtr store = openOwnerPool(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const RootNamespace ns{"00/interrupted@cas@"};
+
+    backend->resetCatalogCounts();
+    const CatalogEntry row = failBirthAfterStep1(store, op, ns);
+    EXPECT_EQ(backend->ckptWrites(), 0u) << "the budget ran out before the `_ckpt` create";
+
+    expireLease(store);
+    backend->resetCatalogCounts();
+    store->cancelIdleOwnCreatingRows();
+    EXPECT_EQ(backend->catalogGets() + backend->catalogCasBegins(), 0u) << "an unadmitted pass sends nothing";
+    EXPECT_EQ(catalogRow(op, store->layout(), ns), std::optional<CatalogEntry>{row});
+
+    restoreLease(store);
+    const uint64_t before = ownCancels();
+    store->cancelIdleOwnCreatingRows();
+    EXPECT_FALSE(catalogRow(op, store->layout(), ns)) << "the owner pass cancels its own idle row";
+    EXPECT_EQ(ownCancels() - before, 1u);
+}
+
+TEST(CASOwnCreatingCancel, ALateFirstPutAfterAnEmptyPassIsCancelled)
+{
+    auto backend = std::make_shared<OwnerCancelBackend>();
+    PoolPtr store = openOwnerPool(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const RootNamespace ns{"00/late@cas@"};
+
+    backend->holdNextCatalogCasUnresolved([&] { expireLease(store); });
+    EXPECT_THROW(publishBirth(store, ns, "a"), DB::Exception);
+    restoreLease(store);
+    ASSERT_FALSE(catalogRow(op, store->layout(), ns)) << "step 1 is held, not applied";
+
+    backend->resetCatalogCounts();
+    store->cancelIdleOwnCreatingRows();
+    EXPECT_EQ(backend->catalogGets(), 1u) << "every pass scans the catalog once";
+    EXPECT_EQ(backend->catalogCasBegins(), 0u);
+
+    ASSERT_TRUE(backend->applyHeld(op)) << "the held step 1 lands on the unchanged catalog";
+    const std::optional<CatalogEntry> landed = catalogRow(op, store->layout(), ns);
+    ASSERT_TRUE(landed);
+    EXPECT_EQ(landed->creator, std::optional<CreatorFence>{liveFenceOf(store)});
+
+    const uint64_t before = ownCancels();
+    store->cancelIdleOwnCreatingRows();
+    EXPECT_FALSE(catalogRow(op, store->layout(), ns)) << "a row that lands after a pass is seen by the next one";
+    EXPECT_EQ(ownCancels() - before, 1u);
+}
+
+TEST(CASOwnCreatingCancel, ATakeoverThatGaveUpAfterLandingIsCancelled)
+{
+    auto backend = std::make_shared<OwnerCancelBackend>();
+    PoolPtr store = openOwnerPool(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    const CatalogEntry foreign = seedStalledCreating(op, store, "00/taken@cas@",
+        hexToU128("000000000000000000000000000000e1"), CreatorFence{.server_root_id = "gone", .writer_epoch = 1, .fence_generation = 1});
+    retireCreatorRootAt(*backend, layout, "gone", /*epoch*/ 2);
+
+    std::atomic<bool> fired = false;
+    backend->onWriteCommitted(layout.refCatalogKey(), [&]
+    {
+        if (!fired.exchange(true))
+            expireLease(store);
+    });
+    EXPECT_THROW(publishBirth(store, foreign.ns, "a"), DB::Exception);
+    backend->onWriteCommitted(layout.refCatalogKey(), {});
+    restoreLease(store);
+    ASSERT_TRUE(fired);
+
+    const std::optional<CatalogEntry> taken = catalogRow(op, layout, foreign.ns);
+    ASSERT_TRUE(taken);
+    EXPECT_EQ(taken->state, NsState::Creating);
+    EXPECT_EQ(taken->incarnation, foreign.incarnation);
+    EXPECT_EQ(taken->creator, std::optional<CreatorFence>{liveFenceOf(store)}) << "the takeover landed before the give-up";
+
+    const uint64_t before = ownCancels();
+    store->cancelIdleOwnCreatingRows();
+    EXPECT_FALSE(catalogRow(op, layout, foreign.ns));
+    EXPECT_EQ(ownCancels() - before, 1u);
+}
+
+TEST(CASOwnCreatingCancel, AHealthyMountSendsOneGetAndNoPut)
+{
+    auto backend = std::make_shared<OwnerCancelBackend>();
+    PoolPtr store = openOwnerPool(backend);
+    publishBirth(store, RootNamespace{"00/healthy@cas@"}, "a");
+
+    backend->resetCatalogCounts();
+    store->cancelIdleOwnCreatingRows();
+    EXPECT_EQ(backend->catalogGets(), 1u);
+    EXPECT_EQ(backend->catalogCasBegins(), 0u);
+}
+
+TEST(CASOwnCreatingCancel, ASiblingParkedInsideCompletionKeepsItsLife)
+{
+    auto backend = std::make_shared<OwnerCancelBackend>();
+    PoolPtr store = openOwnerPool(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    const RootNamespace a{"00/a@cas@"};
+    const RootNamespace b{"00/b@cas@"};
+    failBirthAfterStep1(store, op, a);
+
+    /// `b`'s `_ckpt` key names the life its step 1 mints, so the park is armed on that commit.
+    CasHotKeys & lane = store->mountRequests().admit().hotKeys();
+    std::optional<CatalogEntry> b_step1;
+    bool park_armed = false;
+    lane.cache_fill_hook_for_test = [&]
+    {
+        if (std::exchange(park_armed, true))
+            return;
+        CasOperation hook_op = requests.admit();
+        b_step1 = catalogRow(hook_op, layout, b);
+        if (b_step1)
+            backend->parkNextWriteOf(layout.refCkptKey(NamespaceLifeId::fromCatalogEntry(b, b_step1->incarnation)));
+    };
+    std::atomic<bool> b_returned = false;
+    std::thread sibling([&]
+    {
+        try
+        {
+            publishBirth(store, b, "b");
+        }
+        catch (...)
+        {
+            ADD_FAILURE() << DB::getCurrentExceptionMessage(false);
+        }
+        b_returned = true;
+    });
+    const bool b_parked = backend->waitKeyWriteParked(b_returned);
+    backend->resetCatalogCounts();
+
+    std::atomic<size_t> submissions = 0;
+    lane.enter_after_lane_hook_for_test = [&] { ++submissions; };
+    const uint64_t before = ownCancels();
+    if (b_parked)
+        store->cancelIdleOwnCreatingRows();
+    lane.enter_after_lane_hook_for_test = {};
+    backend->releaseKeyWrite();
+    sibling.join();
+    lane.cache_fill_hook_for_test = {};
+    ASSERT_TRUE(b_parked) << "the sibling did not park in its `_ckpt` create";
+    ASSERT_TRUE(b_step1);
+
+    EXPECT_EQ(submissions.load(), 1u) << "only `a` reaches the catalog lane";
+    EXPECT_EQ(ownCancels() - before, 1u);
+    EXPECT_FALSE(catalogRow(op, layout, a));
+    for (const String & body : backend->catalogCasBodies())
+        EXPECT_FALSE(catalogBodyLacks(body, b)) << "no catalog write after the park drops `b`";
+    const std::optional<CatalogEntry> b_now = catalogRow(op, layout, b);
+    ASSERT_TRUE(b_now);
+    EXPECT_EQ(b_now->state, NsState::Live);
+    EXPECT_EQ(b_now->incarnation, b_step1->incarnation);
+}
+
+TEST(CASOwnCreatingCancel, AnAdmissionStartingInsideTheLaneKeepsTheRow)
+{
+    auto backend = std::make_shared<OwnerCancelBackend>();
+    PoolPtr store = openOwnerPool(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    const String catalog_key = layout.refCatalogKey();
+    const RootNamespace a{"00/a@cas@"};
+    const CatalogEntry row = failBirthAfterStep1(store, op, a);
+
+    CasOperation lane_op = store->mountRequests().admit();
+    std::latch holding(1);
+    std::latch release(1);
+    std::thread holder([&]
+    {
+        CasOperation holder_op = store->mountRequests().admit();
+        (void)holder_op.hotKeys().submit(catalog_key, holder_op, holder_op.freeze(Retry::standard()),
+            [&](const std::optional<Object> &) -> std::optional<String>
+            {
+                holding.count_down();
+                release.wait();
+                return std::nullopt;
+            });
+    });
+    holding.wait();
+
+    backend->resetCatalogCounts();
+    const uint64_t before = ownCancels();
+    std::atomic<bool> pass_returned = false;
+    std::thread pass([&]
+    {
+        store->cancelIdleOwnCreatingRows();
+        pass_returned = true;
+    });
+    const bool queued = waitForLaneDepth(lane_op, catalog_key, 2, pass_returned);
+    std::optional<CasRefLedger::ColdAdmission> admission;
+    admission.emplace(store->beginColdAdmissionForTest(a));
+    release.count_down();
+    pass.join();
+    holder.join();
+    ASSERT_TRUE(queued) << "the pass returned, or did not queue for the catalog lane within a minute";
+
+    for (const String & body : backend->catalogCasBodies())
+        EXPECT_FALSE(catalogBodyLacks(body, a)) << "the admission that began while the cancel queued keeps the row";
+    EXPECT_EQ(ownCancels() - before, 0u);
+    EXPECT_EQ(catalogRow(op, layout, a), std::optional<CatalogEntry>{row});
+
+    admission.reset();
+    store->cancelIdleOwnCreatingRows();
+    EXPECT_FALSE(catalogRow(op, layout, a)) << "once the admission ends, the next pass removes the row";
+    EXPECT_EQ(ownCancels() - before, 1u);
+}
+
+TEST(CASOwnCreatingCancel, AFlipLandingFirstKeepsTheLiveRow)
+{
+    auto backend = std::make_shared<OwnerCancelBackend>();
+    PoolPtr store = openOwnerPool(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    const RootNamespace a{"00/a@cas@"};
+    const CatalogEntry row = failBirthAfterStep1(store, op, a);
+
+    backend->parkNextCatalogCas();
+    const uint64_t before = ownCancels();
+    std::atomic<bool> pass_returned = false;
+    std::thread pass([&]
+    {
+        store->cancelIdleOwnCreatingRows();
+        pass_returned = true;
+    });
+    const bool erase_held = backend->waitCatalogCasParked(pass_returned);
+    /// An independent lane, so the flip is not queued behind the parked erase.
+    CasRequests other = openRequestsForTest(backend);
+    CasOperation other_op = other.admit();
+    const auto flip = erase_held ? CasRefCatalog::completeCreation(other_op, layout, row)
+                                 : CasRefCatalog::NamespaceCreationOutcome::Superseded;
+    backend->releaseCatalogCas();
+    pass.join();
+    ASSERT_TRUE(erase_held) << "the owner pass sent no erase";
+    EXPECT_EQ(flip, CasRefCatalog::NamespaceCreationOutcome::Live);
+
+    const std::optional<CatalogEntry> now = catalogRow(op, layout, a);
+    ASSERT_TRUE(now);
+    EXPECT_EQ(now->state, NsState::Live);
+    EXPECT_EQ(now->incarnation, row.incarnation);
+    EXPECT_EQ(ownCancels() - before, 0u);
+}
+
+TEST(CASOwnCreatingCancel, AnEraseLandingFirstSendsTheCreatorToAFreshLife)
+{
+    auto backend = std::make_shared<OwnerCancelBackend>();
+    PoolPtr store = openOwnerPool(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    const RootNamespace a{"00/a@cas@"};
+
+    /// Step 1 and the `_ckpt` land; the flip fails before it is applied.
+    size_t catalog_writes = 0;
+    backend->failCatalogCasWhen([&](const String &) { return ++catalog_writes == 2; });
+    EXPECT_ANY_THROW(publishBirth(store, a, "a"));
+    backend->failCatalogCasWhen({});
+    const std::optional<CatalogEntry> row = catalogRow(op, layout, a);
+    ASSERT_TRUE(row);
+    ASSERT_EQ(row->state, NsState::Creating);
+    const String old_ckpt = layout.refCkptKey(NamespaceLifeId::fromCatalogEntry(a, row->incarnation));
+    ASSERT_TRUE(op.head(old_ckpt, Retry::once()));
+
+    backend->parkNextCatalogCas();
+    const uint64_t before = ownCancels();
+    std::atomic<bool> pass_returned = false;
+    std::thread pass([&]
+    {
+        store->cancelIdleOwnCreatingRows();
+        pass_returned = true;
+    });
+    const bool erase_held = backend->waitCatalogCasParked(pass_returned);
+
+    /// The retry reads the old row and waits in its `_ckpt` create; the erase lands; then the retry flips.
+    std::atomic<bool> retry_returned = false;
+    std::optional<RefTxnId> retried;
+    std::exception_ptr retry_error;
+    backend->parkNextWriteOf(old_ckpt);
+    std::thread retry([&]
+    {
+        try
+        {
+            retried = publishBirth(store, a, "b");
+        }
+        catch (...)
+        {
+            retry_error = std::current_exception();
+        }
+        retry_returned = true;
+    });
+    const bool retry_parked = backend->waitKeyWriteParked(retry_returned);
+    backend->releaseCatalogCas();
+    pass.join();
+    backend->releaseKeyWrite();
+    retry.join();
+    ASSERT_TRUE(erase_held) << "the owner pass sent no erase";
+    EXPECT_EQ(ownCancels() - before, 1u);
+    EXPECT_TRUE(retry_parked);
+    ASSERT_FALSE(retry_error) << DB::getExceptionMessage(retry_error, false);
+    ASSERT_TRUE(retried);
+
+    const std::optional<CatalogEntry> fresh = catalogRow(op, layout, a);
+    ASSERT_TRUE(fresh);
+    EXPECT_EQ(fresh->state, NsState::Live);
+    EXPECT_NE(fresh->incarnation, row->incarnation) << "the creator continues under a fresh life";
+    EXPECT_TRUE(op.head(old_ckpt, Retry::once())) << "the cancelled life's `_ckpt` is left to the janitor";
+    EXPECT_EQ(store->namespaceLife(a), NamespaceLifeId::fromCatalogEntry(a, fresh->incarnation));
+}
+
+TEST(CASOwnCreatingCancel, ALostEraseAcknowledgementCountsOnce)
+{
+    auto backend = std::make_shared<OwnerCancelBackend>();
+    PoolPtr store = openOwnerPool(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const RootNamespace a{"00/a@cas@"};
+    failBirthAfterStep1(store, op, a);
+
+    backend->loseNextCatalogCasResponse();
+    const uint64_t before = ownCancels();
+    EXPECT_NO_THROW(store->cancelIdleOwnCreatingRows());
+    EXPECT_TRUE(backend->responseLost());
+    EXPECT_FALSE(catalogRow(op, store->layout(), a));
+    EXPECT_EQ(ownCancels() - before, 1u);
+}
+
+TEST(CASOwnCreatingCancel, ALostEraseAcknowledgementSettledOnOtherBytesIsNotCounted)
+{
+    auto backend = std::make_shared<OwnerCancelBackend>();
+    PoolPtr store = openOwnerPool(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const RootNamespace a{"00/a@cas@"};
+    failBirthAfterStep1(store, op, a);
+
+    backend->loseNextCatalogCasResponse([&]
+    {
+        seedStalledCreating(op, store, "00/z@cas@", hexToU128("000000000000000000000000000000e9"),
+            CreatorFence{.server_root_id = "gone", .writer_epoch = 1, .fence_generation = 1});
+    });
+    const uint64_t before = ownCancels();
+    EXPECT_NO_THROW(store->cancelIdleOwnCreatingRows());
+    EXPECT_TRUE(backend->responseLost());
+    EXPECT_FALSE(catalogRow(op, store->layout(), a));
+    EXPECT_TRUE(catalogRow(op, store->layout(), RootNamespace{"00/z@cas@"}));
+    EXPECT_EQ(ownCancels() - before, 0u);
+}
+
+TEST(CASOwnCreatingCancel, RowsOfOtherCreatorsAreUntouched)
+{
+    auto backend = std::make_shared<OwnerCancelBackend>();
+    PoolPtr store = openOwnerPool(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const CreatorFence ours = liveFenceOf(store);
+    CreatorFence other_root = ours;
+    other_root.server_root_id = "other";
+    CreatorFence other_epoch = ours;
+    other_epoch.writer_epoch = ours.writer_epoch + 1;
+    CreatorFence other_generation = ours;
+    other_generation.fence_generation = ours.fence_generation + 1;
+    const CatalogEntry r1 = seedStalledCreating(op, store, "00/r1@cas@", UInt128{0xf1}, other_root);
+    const CatalogEntry r2 = seedStalledCreating(op, store, "00/r2@cas@", UInt128{0xf2}, other_epoch);
+    const CatalogEntry r3 = seedStalledCreating(op, store, "00/r3@cas@", UInt128{0xf3}, other_generation);
+    const CatalogEntry mine = seedStalledCreating(op, store, "00/r4@cas@", UInt128{0xf4}, ours);
+
+    const uint64_t before = ownCancels();
+    store->cancelIdleOwnCreatingRows();
+    EXPECT_EQ(catalogRow(op, store->layout(), r1.ns), std::optional<CatalogEntry>{r1});
+    EXPECT_EQ(catalogRow(op, store->layout(), r2.ns), std::optional<CatalogEntry>{r2});
+    EXPECT_EQ(catalogRow(op, store->layout(), r3.ns), std::optional<CatalogEntry>{r3});
+    EXPECT_FALSE(catalogRow(op, store->layout(), mine.ns));
+    EXPECT_EQ(ownCancels() - before, 1u);
+}
+
+TEST(CASOwnCreatingCancel, SixteenCancelsPerPass)
+{
+    auto backend = std::make_shared<OwnerCancelBackend>();
+    PoolPtr store = openOwnerPool(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    for (size_t i = 0; i < 17; ++i)
+        seedStalledCreating(op, store, fmt::format("00/r{:02}@cas@", i), UInt128{0x100 + i}, liveFenceOf(store));
+
+    store->cancelIdleOwnCreatingRows();
+    EXPECT_EQ(CasRefCatalog::read(op, store->layout()).catalog.entries.size(), 1u);
+    store->cancelIdleOwnCreatingRows();
+    EXPECT_TRUE(CasRefCatalog::read(op, store->layout()).catalog.entries.empty());
+}
+
+TEST(CASOwnCreatingCancel, AFailingRowDoesNotStarveTheOthers)
+{
+    auto backend = std::make_shared<OwnerCancelBackend>();
+    PoolPtr store = openOwnerPool(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const CatalogEntry r0 = seedStalledCreating(op, store, "00/r0@cas@", UInt128{0xa0}, liveFenceOf(store));
+    const CatalogEntry r1 = seedStalledCreating(op, store, "00/r1@cas@", UInt128{0xa1}, liveFenceOf(store));
+    backend->failCatalogCasWhen([&](const String & bytes) { return catalogBodyLacks(bytes, r0.ns); });
+
+    EXPECT_ANY_THROW(store->cancelIdleOwnCreatingRows());
+    EXPECT_TRUE(catalogRow(op, store->layout(), r0.ns));
+    EXPECT_TRUE(catalogRow(op, store->layout(), r1.ns));
+
+    EXPECT_ANY_THROW(store->cancelIdleOwnCreatingRows()) << "the second pass reaches `r0` again after `r1`";
+    EXPECT_TRUE(catalogRow(op, store->layout(), r0.ns));
+    EXPECT_FALSE(catalogRow(op, store->layout(), r1.ns)) << "the row after the failing one is cancelled";
+}
+
+namespace
+{
+
+void deleteCatalog(CasOperation & op, const Layout & layout)
+{
+    const std::optional<Object> catalog = op.read(layout.refCatalogKey(), Retry::standard());
+    ASSERT_TRUE(catalog);
+    ASSERT_EQ(op.remove(layout.refCatalogKey(), catalog->etag, Retry::standard()), Removal::Removed);
+}
+
+size_t countOf(const String & text, const String & needle)
+{
+    size_t n = 0;
+    for (size_t at = text.find(needle); at != String::npos; at = text.find(needle, at + 1))
+        ++n;
+    return n;
+}
+
+const String kAbsentLine = "mandatory catalog absent; skipping owner cleanup";
+
+}
+
+TEST(CASOwnCreatingCancel, AnAbsentCatalogIsReportedWithoutThrowing)
+{
+    auto backend = std::make_shared<OwnerCancelBackend>();
+    PoolPtr store = openOwnerPool(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    seedStalledCreating(op, store, "00/a@cas@", UInt128{0xb0}, liveFenceOf(store));
+    deleteCatalog(op, store->layout());
+
+    ScopedCasGcLogCapture log("CasRefLedger", "information");
+    backend->resetCatalogCounts();
+    EXPECT_NO_THROW(store->cancelIdleOwnCreatingRows());
+    EXPECT_EQ(backend->catalogCasBegins(), 0u);
+    EXPECT_EQ(countOf(log.captured(), kAbsentLine), 1u) << log.captured();
+}
+
+TEST(CASOwnCreatingCancel, ACatalogDeletedBeforeTheColdCancelDecidesIsReportedWithoutThrowing)
+{
+    auto backend = std::make_shared<OwnerCancelBackend>();
+    PoolPtr store = openOwnerPool(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    seedStalledCreating(op, store, "00/a@cas@", UInt128{0xb0}, liveFenceOf(store));
+    ASSERT_EQ(store->mountRequests().admit().hotKeys().cacheEntriesForTest(), 0u) << "the lane starts cold";
+
+    backend->afterCatalogRead([&]
+    {
+        backend->afterCatalogRead({});
+        deleteCatalog(op, store->layout());
+    });
+    ScopedCasGcLogCapture log("CasRefLedger", "information");
+    backend->resetCatalogCounts();
+    EXPECT_NO_THROW(store->cancelIdleOwnCreatingRows());
+    EXPECT_EQ(backend->catalogCasBegins(), 0u) << "absence reaches the decision; nothing is written";
+    EXPECT_EQ(countOf(log.captured(), kAbsentLine), 1u) << log.captured();
+}
+
+TEST(CASOwnCreatingCancel, ACatalogDeletedUnderTheWarmCancelIsReportedWithoutThrowing)
+{
+    auto backend = std::make_shared<OwnerCancelBackend>();
+    PoolPtr store = openOwnerPool(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    seedStalledCreating(op, store, "00/a@cas@", UInt128{0xb0}, liveFenceOf(store));
+    publishBirth(store, RootNamespace{"00/warm@cas@"}, "w");
+    ASSERT_EQ(store->mountRequests().admit().hotKeys().cacheEntriesForTest(), 1u) << "the lane remembers the catalog";
+
+    /// The scan reads the catalog, which is then deleted; the cancel writes from its cached body, is
+    /// refused, and the read settling that refusal is the last request the lease admits.
+    enum class Step { Scan, Deleting, Settle, Done };
+    Step step = Step::Scan;
+    backend->afterCatalogRead([&]
+    {
+        if (step == Step::Scan)
+        {
+            step = Step::Deleting;
+            deleteCatalog(op, store->layout());
+            step = Step::Settle;
+        }
+        else if (step == Step::Settle)
+        {
+            step = Step::Done;
+            expireLease(store);
+        }
+    });
+    ScopedCasGcLogCapture log("CasRefLedger", "information");
+    backend->resetCatalogCounts();
+    EXPECT_NO_THROW(store->cancelIdleOwnCreatingRows());
+    backend->afterCatalogRead({});
+    restoreLease(store);
+    EXPECT_TRUE(step == Step::Done) << "the refused write was settled by a read";
+    EXPECT_EQ(backend->catalogCasBegins(), 1u) << "one refused write from the cached body";
+    EXPECT_FALSE(op.head(store->layout().refCatalogKey(), Retry::once())) << "nothing was committed";
+    EXPECT_EQ(countOf(log.captured(), kAbsentLine), 1u) << log.captured();
+}
+
+/// Without the flag, absence stays the mandatory catalog's corruption verdict, which `DROP` and the GC
+/// leader rely on.
+TEST(CASOwnCreatingCancel, ACancelWithoutTheAbsenceFlagStillThrowsOnAnAbsentCatalog)
+{
+    auto backend = std::make_shared<OwnerCancelBackend>();
+    PoolPtr store = openOwnerPool(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const CatalogEntry row = seedStalledCreating(op, store, "00/a@cas@", UInt128{0xb0}, liveFenceOf(store));
+    deleteCatalog(op, store->layout());
+
+    CasOperation cancel_op = requests.admit();
+    const auto grant = [](const CreatorFence &) { return true; };
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+    {
+        (void)CasRefCatalog::cancelStalledCreating(cancel_op, store->layout(), row, grant, [](const Retry &) {});
+    });
+    bool absent = false;
+    EXPECT_EQ(CasRefCatalog::cancelStalledCreating(cancel_op, store->layout(), row, grant, [](const Retry &) {},
+                                                   Retry::standard(), &absent),
+              CasRefCatalog::StalledCreatingCancelOutcome::EntryChanged);
+    EXPECT_TRUE(absent);
+}
+
+/// A `DROP` of a `Creating` name whose mandatory catalog vanishes between its read and the cancel reports
+/// corruption. It does not treat the missing catalog as an already-absent namespace: only the owner pass does.
+TEST(CASOwnCreatingCancel, DropOfACreatingNameReportsAMissingCatalogAsCorruption)
+{
+    auto backend = std::make_shared<OwnerCancelBackend>();
+    PoolPtr store = openOwnerPool(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const CatalogEntry row = seedStalledCreating(op, store, "00/a@cas@", UInt128{0xb0}, liveFenceOf(store));
+
+    backend->afterCatalogRead([&]
+    {
+        backend->afterCatalogRead({});
+        deleteCatalog(op, store->layout());
+    });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)store->dropNamespace(row.ns); });
+}
+
+/// A catalog read that fails backs off on the open plane's sleep, which teardown wakes
+/// (`OpenPlaneSleepReturnsAtOnceOnceTeardownBegan`); the mount plane's sleep does not see teardown.
+/// Teardown begins inside the pause, and the pass ends without the mount plane's pause ever returning.
+TEST(CASOwnCreatingCancel, TeardownDuringARetryPauseEndsThePass)
+{
+    auto backend = std::make_shared<OwnerCancelBackend>();
+    PoolPtr store = openOwnerPool(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const CatalogEntry row = failBirthAfterStep1(store, op, RootNamespace{"00/a@cas@"});
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool mount_paused = false;
+    bool release_mount_pause = false;
+    bool pass_done = false;
+    size_t open_pauses = 0;
+    store->mountRequests().setSleepFnForTest([&](uint64_t)
+    {
+        store->beginTeardown();
+        std::unique_lock lock(mutex);
+        mount_paused = true;
+        cv.notify_all();
+        cv.wait_for(lock, std::chrono::minutes(1), [&] { return release_mount_pause; });
+    });
+    store->openRequests().setSleepFnForTest([&](uint64_t)
+    {
+        ++open_pauses;
+        store->beginTeardown();
+    });
+    backend->afterCatalogRead([&]
+    {
+        backend->afterCatalogRead({});
+        throw Poco::TimeoutException("OwnerCancelBackend: catalog read timed out");
+    });
+    backend->resetCatalogCounts();
+
+    auto pass = std::async(std::launch::async, [&]
+    {
+        try
+        {
+            store->cancelIdleOwnCreatingRows();
+        }
+        catch (...) // NOLINT(bugprone-empty-catch)
+        {
+        }
+        std::lock_guard lock(mutex);
+        pass_done = true;
+        cv.notify_all();
+    });
+    bool paused_on_mount_plane = false;
+    {
+        std::unique_lock lock(mutex);
+        cv.wait_for(lock, std::chrono::minutes(1), [&] { return pass_done || mount_paused; });
+        paused_on_mount_plane = mount_paused;
+        release_mount_pause = true;
+        cv.notify_all();
+    }
+    pass.get();
+
+    EXPECT_FALSE(paused_on_mount_plane) << "the retry pause ran on the mount plane, which teardown does not wake";
+    EXPECT_EQ(open_pauses, 1u) << "the failed catalog read backed off once on the open plane";
+    EXPECT_EQ(backend->catalogGets(), 1u) << "teardown refused the reissue";
+    EXPECT_EQ(backend->catalogCasBegins(), 0u);
+    EXPECT_EQ(catalogRow(op, store->layout(), row.ns), std::optional<CatalogEntry>{row});
+}
+
+/// ===================== THE SCHEDULER RUNS THE OWNER PASS =====================
+
+namespace
+{
+
+class OwnerRoundSink
+{
+public:
+    GcRoundLogger logger()
+    {
+        return [this](const GcRoundLogRecord & r)
+        {
+            std::lock_guard lock(mutex);
+            records.push_back(r);
+            cv.notify_all();
+        };
+    }
+
+    std::vector<GcRoundLogRecord> all()
+    {
+        std::lock_guard lock(mutex);
+        return records;
+    }
+
+    std::optional<GcRoundLogRecord> waitForFinish()
+    {
+        std::unique_lock lock(mutex);
+        const auto finish = [&]() -> const GcRoundLogRecord *
+        {
+            for (const GcRoundLogRecord & r : records)
+                if (r.event_type == GcRoundLogRecord::EventType::Finish)
+                    return &r;
+            return nullptr;
+        };
+        if (!cv.wait_for(lock, std::chrono::minutes(1), [&] { return finish() != nullptr; }))
+            return std::nullopt;
+        return *finish();
+    }
+
+private:
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::vector<GcRoundLogRecord> records;
+};
+
+size_t countRecords(const std::vector<GcRoundLogRecord> & rows, GcRoundLogRecord::EventType type)
+{
+    return std::count_if(rows.begin(), rows.end(), [&](const GcRoundLogRecord & r) { return r.event_type == type; });
+}
+
+}
+
+TEST(CASGCFrontierGate, ATeardownStopsThePassAndTheRound)
+{
+    auto backend = std::make_shared<OwnerCancelBackend>();
+    PoolPtr store = openOwnerPool(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const CatalogEntry row = failBirthAfterStep1(store, op, RootNamespace{"00/a@cas@"});
+
+    OwnerRoundSink sink;
+    CasGcScheduler scheduler(store, std::chrono::seconds(3600), "test::gc", "ca", sink.logger());
+    std::atomic<bool> fired = false;
+    backend->afterCatalogRead([&]
+    {
+        backend->afterCatalogRead({});
+        store->beginTeardown();
+        fired = true;
+    });
+    backend->resetCatalogCounts();
+    scheduler.start();
+    scheduler.requestRoundSoon();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(1);
+    while (!fired && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    scheduler.stop();
+
+    ASSERT_TRUE(fired) << "the tick never read the catalog";
+    EXPECT_EQ(backend->catalogCasBegins(), 0u) << "no cancel after teardown began";
+    EXPECT_EQ(countRecords(sink.all(), GcRoundLogRecord::EventType::Start), 0u)
+        << "the tick that read the catalog for the owner pass starts no round once teardown began";
+    EXPECT_EQ(catalogRow(op, store->layout(), row.ns), std::optional<CatalogEntry>{row});
+}
+
+TEST(CASGCFrontierGate, AFailedOwnerPassDoesNotSkipTheRound)
+{
+    auto backend = std::make_shared<OwnerCancelBackend>();
+    PoolPtr store = openOwnerPool(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const CatalogEntry row = failBirthAfterStep1(store, op, RootNamespace{"00/a@cas@"});
+    backend->failCatalogCasWhen([&](const String & bytes) { return catalogBodyLacks(bytes, row.ns); });
+
+    OwnerRoundSink sink;
+    CasGcScheduler scheduler(store, std::chrono::seconds(3600), "test::gc", "ca", sink.logger());
+    scheduler.start();
+    scheduler.requestRoundSoon();
+    const std::optional<GcRoundLogRecord> finish = sink.waitForFinish();
+    scheduler.stop();
+
+    ASSERT_TRUE(finish) << "the round after a failed owner pass did not run";
+    EXPECT_EQ(countRecords(sink.all(), GcRoundLogRecord::EventType::Start), 1u);
+    EXPECT_GE(backend->catalogCasBegins(), 1u) << "the owner pass tried the cancel";
+    EXPECT_TRUE(catalogRow(op, store->layout(), row.ns));
+}
+
+TEST(CASGCFrontierGate, AFollowerRunsThePass)
+{
+    auto backend = std::make_shared<OwnerCancelBackend>();
+    PoolPtr leader = openOwnerPool(backend, "leader");
+    Gc leader_gc(leader, kGc);
+    leader_gc.runRegularRound();
+    PoolPtr follower = openOwnerPool(backend, "follower");
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const CatalogEntry row = failBirthAfterStep1(follower, op, RootNamespace{"00/a@cas@"});
+
+    OwnerRoundSink sink;
+    CasGcScheduler scheduler(follower, std::chrono::seconds(3600), "test::gc", "ca", sink.logger());
+    const uint64_t before = ownCancels();
+    scheduler.start();
+    scheduler.requestRoundSoon();
+    const std::optional<GcRoundLogRecord> finish = sink.waitForFinish();
+    scheduler.stop();
+
+    ASSERT_TRUE(finish);
+    EXPECT_EQ(finish->outcome, GcRoundLogRecord::Outcome::NotALeader);
+    EXPECT_EQ(finish->trigger, GcRoundLogRecord::Trigger::Scheduled);
+    EXPECT_EQ(ownCancels() - before, 1u);
+    EXPECT_FALSE(catalogRow(op, follower->layout(), row.ns));
+}
+
+/// `FORGET` publishes its intent and trips the mount fence while the owner pass is inside its catalog read:
+/// the tick starts no round on the pool being forgotten, and `FORGET` joins the scheduler.
+TEST(CASGCFrontierGate, AForgetDuringThePassStartsNoRound)
+{
+    auto backend = std::make_shared<OwnerCancelBackend>();
+    PoolPtr store = openOwnerPool(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    failBirthAfterStep1(store, op, RootNamespace{"00/a@cas@"});
+
+    auto sink = std::make_shared<OwnerRoundSink>();
+    auto scheduler = std::make_shared<CasGcScheduler>(store, std::chrono::seconds(3600), "test::gc", "ca",
+        [sink](const GcRoundLogRecord & r) { sink->logger()(r); });
+    const uint64_t generation = store->fenceGeneration();
+    const auto forget_fenced = [store, generation] { return store->vanishedIntentPublished() && store->fenceGeneration() != generation; };
+    auto parked = std::make_shared<std::atomic<bool>>(false);
+    auto fenced = std::make_shared<std::atomic<bool>>(false);
+    backend->afterCatalogRead([backend_ptr = backend.get(), forget_fenced, parked, fenced]
+    {
+        backend_ptr->afterCatalogRead({});
+        *parked = true;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(1);
+        while (!forget_fenced() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        *fenced = forget_fenced();
+    });
+    backend->resetCatalogCounts();
+    scheduler->start();
+    scheduler->requestRoundSoon();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(1);
+    while (!*parked && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    ASSERT_TRUE(*parked) << "the tick never read the catalog";
+
+    /// A plain thread, not `std::async`: a deadlocked `FORGET` must fail the test in bounded time, and an
+    /// `std::async` future would block in its destructor on the very call that hangs.
+    auto forgot = std::make_shared<std::promise<void>>();
+    std::future<void> forgot_done = forgot->get_future();
+    std::thread forgetter([store, scheduler, forgot]
+    {
+        try
+        {
+            store->forgetDisk([&] { scheduler->stop(); }, "test decommission");
+            forgot->set_value();
+        }
+        catch (...)
+        {
+            forgot->set_exception(std::current_exception());
+        }
+    });
+    if (forgot_done.wait_for(std::chrono::minutes(1)) != std::future_status::ready)
+    {
+        /// Exit at once: the blocked scheduler worker would also hang the exit, which joins global pool threads.
+        ADD_FAILURE() << "FORGET did not join the scheduler";
+        std::fflush(stdout);
+        std::_Exit(1);
+    }
+    forgetter.join();
+    forgot_done.get();
+
+    EXPECT_TRUE(*fenced) << "the pass resumed before FORGET published its intent and tripped the fence";
+    EXPECT_EQ(countRecords(sink->all(), GcRoundLogRecord::EventType::Start), 0u)
+        << "the tick started a round on a pool whose FORGET was in progress";
+    EXPECT_EQ(backend->catalogCasBegins(), 0u) << "the tripped fence refused the cancel";
+    EXPECT_TRUE(store->isVanished());
+}
+
+/// The pool is replaced while the owner pass is inside its catalog read: the tick starts no round, which
+/// would address the replacement pool's `gc/state`.
+TEST(CASGCFrontierGate, APoolReplacedDuringThePassStartsNoRound)
+{
+    auto backend = std::make_shared<OwnerCancelBackend>();
+    PoolPtr store = openOwnerPool(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    failBirthAfterStep1(store, op, RootNamespace{"00/a@cas@"});
+
+    OwnerRoundSink sink;
+    CasGcScheduler scheduler(store, std::chrono::seconds(3600), "test::gc", "ca", sink.logger());
+    std::atomic<bool> fired = false;
+    backend->afterCatalogRead([&]
+    {
+        backend->afterCatalogRead({});
+        store->setLifecycleForTest(PoolLifecycle::VanishedReplaced);
+        fired = true;
+    });
+    backend->resetCatalogCounts();
+    scheduler.start();
+    scheduler.requestRoundSoon();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(1);
+    while (!fired && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    /// `stop` joins the tick; it does not cut a round already past the checks.
+    scheduler.stop();
+
+    ASSERT_TRUE(fired) << "the tick never read the catalog";
+    EXPECT_EQ(countRecords(sink.all(), GcRoundLogRecord::EventType::Start), 0u)
+        << "the tick started a round on a replaced pool";
+}
+
+/// A stopped scheduler performs no owner pass even when a round is requested; a restarted one does.
+/// The stopped half is a characterisation: it also passes on code that never ran the pass.
+TEST(CASGCFrontierGate, AStoppedSchedulerRunsNoPassAndARestartedOneDoes)
+{
+    auto backend = std::make_shared<OwnerCancelBackend>();
+    PoolPtr store = openOwnerPool(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+
+    OwnerRoundSink sink;
+    CasGcScheduler scheduler(store, std::chrono::seconds(3600), "test::gc", "ca", sink.logger());
+    scheduler.start();
+    scheduler.stop();
+    const CatalogEntry row = failBirthAfterStep1(store, op, RootNamespace{"00/a@cas@"});
+    backend->resetCatalogCounts();
+    scheduler.requestRoundSoon();
+    EXPECT_EQ(backend->catalogGets() + backend->catalogCasBegins(), 0u) << "a stopped scheduler runs no pass";
+    EXPECT_EQ(catalogRow(op, store->layout(), row.ns), std::optional<CatalogEntry>{row});
+
+    scheduler.start();
+    scheduler.requestRoundSoon();
+    const std::optional<GcRoundLogRecord> finish = sink.waitForFinish();
+    scheduler.stop();
+    ASSERT_TRUE(finish) << "the restarted scheduler did not tick";
+    EXPECT_FALSE(catalogRow(op, store->layout(), row.ns)) << "the restarted scheduler runs the pass";
+}
+
+TEST(CASGCFrontierGate, AnOwnerRemountHandsTheRowToTheLeader)
+{
+    auto backend = std::make_shared<OwnerCancelBackend>();
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    CatalogEntry row;
+    uint64_t first_epoch = 0;
+    {
+        PoolPtr first = openOwnerPool(backend);
+        Gc bootstrap(first, kGc);
+        runRoundCapturingGate(first, bootstrap, UniversePolicy::Authoritative);
+        first_epoch = first->writerEpoch();
+        row = failBirthAfterStep1(first, op, RootNamespace{"00/a@cas@"});
+    }
+    PoolPtr store = openOwnerPool(backend);
+    ASSERT_GT(store->writerEpoch(), first_epoch);
+    ASSERT_EQ(catalogRow(op, store->layout(), row.ns), std::optional<CatalogEntry>{row});
+
+    const uint64_t own_before = ownCancels();
+    const uint64_t leader_before = ProfileEvents::global_counters[ProfileEvents::CASGCStalledCreatingCancelled];
+    backend->resetCatalogCounts();
+    store->cancelIdleOwnCreatingRows();
+    EXPECT_EQ(backend->catalogGets(), 1u);
+    EXPECT_EQ(backend->catalogCasBegins(), 0u) << "a row of an earlier epoch is not the owner's";
+    EXPECT_EQ(catalogRow(op, store->layout(), row.ns), std::optional<CatalogEntry>{row});
+
+    Gc gc(store, kGc);
+    const GateVerdict round = runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
+    EXPECT_EQ(round.drain_cancelled, 1u);
+    EXPECT_FALSE(catalogRow(op, store->layout(), row.ns));
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCStalledCreatingCancelled] - leader_before, 1u);
+    EXPECT_EQ(ownCancels() - own_before, 0u);
+}
+
+TEST(CASGCFrontierGate, ACreatingOnlyCatalogRegainsAProvenFrontier)
+{
+    auto backend = std::make_shared<OwnerCancelBackend>();
+    PoolPtr store = openOwnerPool(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    failBirthAfterStep1(store, op, RootNamespace{"00/a@cas@"});
+    ASSERT_EQ(CasRefCatalog::read(op, store->layout()).catalog.entries.size(), 1u);
+
+    Gc gc(store, kGc);
+    const GateVerdict before = runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
+    ASSERT_TRUE(before.saw_fold);
+    EXPECT_TRUE(before.suppress_destructive) << "a Creating-only catalog suppresses destructive work";
+    EXPECT_FALSE(before.catalog_proved_empty);
+
+    store->cancelIdleOwnCreatingRows();
+    EXPECT_TRUE(CasRefCatalog::read(op, store->layout()).catalog.entries.empty());
+    const GateVerdict after = runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
+    ASSERT_TRUE(after.saw_fold);
+    EXPECT_TRUE(after.catalog_proved_empty);
+    EXPECT_TRUE(after.frontier_complete);
+    EXPECT_FALSE(after.suppress_destructive);
 }

@@ -347,9 +347,9 @@ CasOperation CasRequests::admit(Liveness liveness)
     return CasOperation(*this, fence.generation(), std::move(liveness));
 }
 
-CasOperation CasRequests::resume(uint64_t admitted_generation, Liveness liveness)
+CasOperation CasRequests::resume(uint64_t admitted_generation, Liveness liveness, std::function<void(uint64_t)> sleep_ms_)
 {
-    return CasOperation(*this, admitted_generation, std::move(liveness));
+    return CasOperation(*this, admitted_generation, std::move(liveness), std::move(sleep_ms_));
 }
 
 Dialect CasOperation::backendDialect() const
@@ -713,7 +713,7 @@ Removal CasOperation::removeCurrent(const String & key, const Retry & policy)
         if (!fits(needed, bound))
             giveUpReadDeadline("removeCurrent", key, bound, attempt);
         detail::recordReissue();
-        owner.sleep_ms(pause_ms);
+        sleep(pause_ms);
     }
 }
 
@@ -782,7 +782,7 @@ SentinelProbeResult CasOperation::probeSentinel(const String & key, const Retry 
             return result;
         last_probe = std::move(result);
         detail::recordReissue();
-        owner.sleep_ms(pause_ms);
+        sleep(pause_ms);
     }
 }
 
@@ -930,7 +930,7 @@ std::optional<WriteResult> CasOperation::gatedPause(uint64_t pause_ms, uint32_t 
     /// `Retry::backoff`'s full jitter includes zero -- so their call to `sleep_ms(0)` is kept
     /// unconditional here to leave their observable behaviour exactly as it was before this collapse.
     if (should_sleep)
-        owner.sleep_ms(pause_ms);
+        sleep(pause_ms);
     return std::nullopt;
 }
 

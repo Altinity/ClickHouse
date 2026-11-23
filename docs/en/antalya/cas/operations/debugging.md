@@ -116,9 +116,10 @@ and what the creator's mount slot says; a slot it cannot read is listed as `unre
 scan goes on. `stalled_creating` counts the `terminal` rows, `creating_unproven` the others. The `GC` leader
 cancels a row in the catalog cleanup each round runs before its fold. For each cancel it observes as successful
 it writes one INFO line and counts it in `CASGCStalledCreatingCancelled`; this is not an exact audit of which
-actor removed each row.
+actor removed each row. The table says what the leader does; the creating server also cancels its own idle rows,
+whatever its slot says (see below).
 
-| Mount slot | What `GC` does | Operator action |
+| Mount slot | What the `GC` leader does | Operator action |
 |---|---|---|
 | `terminal`: a slot at a later writer epoch than the row's, or at the row's own epoch a `GC` fence or a clean farewell | The next round cancels the row. | None. |
 | `live`: a slot at the row's own epoch with no fence or farewell, or at an older epoch, fenced or not (an older slot says nothing about this creator) | Nothing yet. The row turns `terminal` when the creator's server mounts again, which takes a new writer epoch, or when the leader fences its slot at the row's own epoch after watching it unrenewed for longer than the mount lease. | None for a server that comes back or is gone; for a server that keeps running, see below. To clear the rows of a server retired for good at once, drop the member with [`SYSTEM CAS DROP POOL MEMBER`](/antalya/cas/operations/migration#decommission), or offline with `clickhouse-disks cas-drop-member <server_root_id>`: it takes a later writer epoch, which makes those rows `terminal`, and cancels the rows under that server's namespaces itself. |
@@ -129,17 +130,22 @@ A store error reading one creator's slot keeps that creator's rows for the round
 cleanup goes on with the other rows.
 
 A cold admission that fails after it wrote the row, on a server that keeps running, leaves the row `live`.
-`cas-fsck` lists the row with its slot `live`. When no other row is walkable, the `GC` warning
-`destructive work SUPPRESSED` counts it among the `Creating` rows. What to do depends on whether the namespace
-is still wanted:
+That server cancels the row itself on a later tick of its `GC` scheduler, leader or not, once no statement on
+that server is creating the same namespace. Each such cancel writes one INFO line and counts in
+`CASOwnCreatingCancelled`. Until then `cas-fsck` lists the row with its slot `live`, and when no other row is
+walkable, the `GC` warning `destructive work SUPPRESSED` counts it among the `Creating` rows. What to do
+depends on whether the namespace is still wanted:
 
-- **Still wanted.** Run the statement again on the same server. The retry finds the row under its own writer
-  epoch and finishes the creation. This holds for an `INSERT` into the same table and for a `FREEZE` with the
-  same `WITH NAME`: each resolves the same namespace again.
+- **Still wanted.** Run the statement again on the same server. If the row is still there, the retry finds it
+  under its own writer epoch and finishes the creation; if the server already cancelled it, the retry creates
+  the namespace afresh. This holds for an `INSERT` into the same table and for a `FREEZE` with the same
+  `WITH NAME`: each resolves the same namespace again.
 - **Abandoned.** A retried `CREATE TABLE` without a `UUID` clause gets a new table UUID, and a `FREEZE` without
-  `WITH NAME` takes the next backup number, so each retry writes a new namespace and leaves the old row. `GC`
-  does not cancel that row until the server restarts or `GC` fences its slot. To clear it, restart that server;
-  when the server is gone for good, drop the member as in the table above.
+  `WITH NAME` takes the next backup number, so each retry writes a new namespace and leaves the old row. The
+  server cancels that row on a later `GC` tick. A server that is read-only for the disk, has `GC` disabled or
+  has it stopped with `SYSTEM CAS GC STOP` does not, and the row stays until the server restarts or `GC` fences
+  its slot. To clear it then, restart that server; when the server is gone for good, drop the member as in the
+  table above.
 
 ### GC refuses its bookkeeping {#gc-bookkeeping-corrupt}
 

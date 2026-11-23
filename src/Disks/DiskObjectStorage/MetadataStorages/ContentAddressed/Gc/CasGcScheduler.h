@@ -191,6 +191,9 @@ private:
     /// Heartbeat failures are advisory and are retried on the next cadence.
     void heartbeatLoop();
 
+    /// The pool is terminal, or a `FORGET` has published its intent: both loops exit, and no round starts.
+    bool poolTerminalOrForgetting() const;
+
     /// Runs synchronously when `Cas::Gc` acquires or renews the lease, before the round's potentially
     /// long fold begins. It marks this scheduler as the heartbeat owner and sends the first pulse
     /// immediately; otherwise a new leader's first round could appear inactive until it returned.

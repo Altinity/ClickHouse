@@ -581,6 +581,36 @@ TEST(CASFsck, TheCreatingRowNoteSaysWhatGcDoesForEachSlotStatus)
     EXPECT_NE(unreadable.find("unreadable (injected)"), String::npos) << unreadable;
 }
 
+/// The leader's keep or refusal is attributed to the leader, and the creating server's own cleanup is named
+/// apart from it on every row the leader does not cancel: that server never reads its slot.
+TEST(CASFsck, TheCreatingRowNoteNamesTheLeaderAndTheCreatorsOwnCleanup)
+{
+    const String owner_clause = "a writable creator with its GC scheduler running also cancels its own idle rows of its "
+                                "current writer epoch";
+    const auto note = [](CreatorSlotStatus slot)
+    {
+        return formatFsckCreatingRow(FsckCreatingRow{.ns = "00/t@cas@", .creator_root = "srv", .writer_epoch = 7, .slot = slot,
+            .slot_read_error = {}});
+    };
+    const String unreadable = formatFsckCreatingRow(FsckCreatingRow{.ns = "00/t@cas@", .creator_root = "srv",
+        .writer_epoch = 7, .slot = std::nullopt, .slot_read_error = "injected"});
+    for (const String & line : {note(CreatorSlotStatus::Live), note(CreatorSlotStatus::Absent),
+                                note(CreatorSlotStatus::Undecodable), unreadable})
+    {
+        EXPECT_NE(line.find("the GC leader"), String::npos) << line;
+        EXPECT_NE(line.find(owner_clause), String::npos) << line;
+    }
+    EXPECT_NE(unreadable.find("unreadable (injected)"), String::npos) << unreadable;
+    EXPECT_EQ(note(CreatorSlotStatus::Terminal).find(owner_clause), String::npos) << note(CreatorSlotStatus::Terminal);
+
+    FsckReport rep;
+    rep.pending_gc = 3;
+    rep.catalog_has_no_walkable_row = true;
+    const String pipeline = formatFsckPipelineNote(rep);
+    EXPECT_NE(pipeline.find("`stalled_creating` counts terminal rows, which the GC leader cancels"), String::npos) << pipeline;
+    EXPECT_NE(pipeline.find(owner_clause), String::npos) << pipeline;
+}
+
 #if USE_AWS_S3
 /// A store error reading one creator's mount slot marks that row unreadable and the scan goes on: the other
 /// `Creating` row is still classified.

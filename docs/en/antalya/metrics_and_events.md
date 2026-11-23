@@ -221,6 +221,7 @@ Day-to-day interpretation is on the [monitoring](/antalya/cas/operations/monitor
 | `CASGCUndecodableBlobBody` | `Number` | Number of blob bodies a CAS GC round met that are shorter than the pool's blob envelope. `GC` records no row for such a body, carries an existing row unchanged and deletes nothing. See [a body `GC` cannot decode](/antalya/cas/architecture/garbage-collection#undecodable-body). |
 | `CASGCUnmatchedAdoptedParentLives` | `Number` | Number of adopted-parent CAS ref-life rows dropped because the post-LIST catalog cut has no matching physical life. Each occurrence is inert for planning and suppression and is logged with its exact physical life id; a persistent nonzero rate indicates old generation state is outliving catalog removal. |
 | `CASGCUnmatchedRemoveDeltas` | `Number` | Number of CAS GC in-degree removal deltas that matched no existing source edge. The in-degree model is a set, not a counter, so this is a per-key no-op by design and never causes a false deletion — but a persistent nonzero rate means removal deltas are reaching the reducer without their matching activation, which is a correctness signal. |
+| `CASOwnCreatingCancelled` | `Number` | Number of cancels of this mount's own `Creating` catalog rows of its live writer epoch that it observed as successful, each decided while no admission of the name was in flight on this server. Each also writes one INFO log line. A cancel whose lost response settles on different catalog bytes is not counted. |
 
 #### References {#cas-references}
 

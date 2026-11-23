@@ -2165,14 +2165,18 @@ String formatFsckSummary(const FsckReport & report)
     return out.str();
 }
 
+constexpr std::string_view kOwnerCleanupClause
+    = "a writable creator with its GC scheduler running also cancels its own idle rows of its current writer epoch";
+
 String formatFsckPipelineNote(const FsckReport & report)
 {
     const uint64_t in_pipeline = report.pending_gc + report.awaiting_gc;
     if (in_pipeline == 0)
         return {};
     /// GC suppresses every delete while it has no namespace to walk and the catalog is not empty.
-    const char * const verdict = report.catalog_has_no_walkable_row
-        ? "GC deletes none of them while every catalog row is `Creating`; `stalled_creating` counts the rows GC cancels"
+    const String verdict = report.catalog_has_no_walkable_row
+        ? fmt::format("GC deletes none of them while every catalog row is `Creating`; `stalled_creating` counts terminal "
+                      "rows, which the GC leader cancels; {}", kOwnerCleanupClause)
         : "expected, no action needed";
     return fmt::format(
         "note: {} unreferenced object(s) are inside the normal GC deletion pipeline "
@@ -2184,8 +2188,8 @@ String formatFsckCreatingRow(const FsckCreatingRow & row)
 {
     if (!row.slot)
         return fmt::format("note: namespace '{}' is `Creating` under creator '{}' at writer epoch {}; its mount slot is "
-                           "unreadable ({}): GC keeps the row while the slot cannot be read",
-                           row.ns, row.creator_root, row.writer_epoch, row.slot_read_error);
+                           "unreadable ({}): the GC leader keeps the row while the slot cannot be read; {}",
+                           row.ns, row.creator_root, row.writer_epoch, row.slot_read_error, kOwnerCleanupClause);
     const char * verdict = "";
     switch (*row.slot)
     {
@@ -2193,18 +2197,19 @@ String formatFsckCreatingRow(const FsckCreatingRow & row)
             verdict = "terminal: the next GC round cancels the row";
             break;
         case CreatorSlotStatus::Live:
-            verdict = "live: the creator may still finish; GC cancels the row once that server remounts or GC fences "
-                      "its unrenewed mount slot";
+            verdict = "live: the creator may still finish; the GC leader cancels the row once that server remounts or GC "
+                      "fences its unrenewed mount slot";
             break;
         case CreatorSlotStatus::Absent:
-            verdict = "absent on this read: GC does not cancel the row while the slot is absent";
+            verdict = "absent on this read: the GC leader does not cancel the row while the slot is absent";
             break;
         case CreatorSlotStatus::Undecodable:
-            verdict = "undecodable: GC cannot cancel the row while the slot does not decode";
+            verdict = "undecodable: the GC leader cannot cancel the row while the slot does not decode";
             break;
     }
-    return fmt::format("note: namespace '{}' is `Creating` under creator '{}' at writer epoch {}; its mount slot is {}",
-                       row.ns, row.creator_root, row.writer_epoch, verdict);
+    const String owner_cleanup = *row.slot == CreatorSlotStatus::Terminal ? "" : fmt::format("; {}", kOwnerCleanupClause);
+    return fmt::format("note: namespace '{}' is `Creating` under creator '{}' at writer epoch {}; its mount slot is {}{}",
+                       row.ns, row.creator_root, row.writer_epoch, verdict, owner_cleanup);
 }
 
 }

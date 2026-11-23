@@ -328,6 +328,12 @@ public:
     /// orphaned runtime therefore fail closed instead of mutating state from the previous epoch.
     void quiesceRefTablesForRemount();
 
+    /// Cancels up to 16 `Creating` catalog rows minted under this mount's exact live creator fence whose
+    /// name has no cold admission in flight here; the check is repeated inside the catalog lane. One scan
+    /// read per call; each cancel may add its own catalog reads and conditional writes. `pause` replaces
+    /// the mount plane's retry sleep. An absent catalog is logged and ends the call; other failures throw.
+    void cancelIdleOwnCreatingRows(const Liveness & alive, std::function<void(uint64_t)> pause);
+
     /// One cold admission of a name, from the capture of its retirement count before the catalog read
     /// to the publish of its runtime. Until it is released, and unless a remount clears the map, the name's
     /// slot and its retirement count stay.
@@ -1088,6 +1094,9 @@ private:
     std::atomic<uint64_t> ref_table_access_tick{0};
     std::atomic<uint64_t> next_ref_runtime_id{0};
     std::atomic<uint64_t> recovery_install_count_for_test{0};
+    /// Where the next owner cleanup starts among its eligible rows, so a row whose cancel keeps failing
+    /// does not block the others.
+    std::atomic<size_t> own_creating_rotation{0};
     /// Latched by `drainRefLanesForShutdown` before it
     /// snapshots `ref_name_slots`/waits on each table's queue -- every ordinary ref mutation (`appendRefOps`)
     /// checks this under the SAME `ref_queue_mutex` critical section it uses to enqueue its item, so the
@@ -1207,6 +1216,9 @@ private:
     /// Erases the slot at `it` unless it has a runtime or an admission in flight. Caller holds
     /// `ref_queue_mutex`.
     void eraseNameSlotIfUnusedLocked(std::map<String, RefNameSlot>::iterator it);
+
+    /// Takes `ref_queue_mutex`; never creates a slot.
+    bool hasColdAdmissionInFlight(const RootNamespace & ns) const;
 
     /// Throws retry-later when `rt` (already recovered) has applied its namespace's terminal removal.
     void refuseTerminalLife(const RootNamespace & ns, RefTableRuntime & rt);

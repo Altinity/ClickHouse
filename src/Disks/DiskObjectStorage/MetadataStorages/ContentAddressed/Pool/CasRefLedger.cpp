@@ -82,6 +82,7 @@ namespace ProfileEvents
     extern const Event CASRefRecoveryStragglerAdopted;
     extern const Event CASRefRecoveryCancelled;
     extern const Event CASRefRecoveryStreamHole;
+    extern const Event CASOwnCreatingCancelled;
 }
 
 namespace DB::Cas
@@ -744,6 +745,68 @@ CasRefLedger::ColdAdmission::~ColdAdmission()
         return;
     std::lock_guard lock(ledger->ref_queue_mutex);
     ledger->releaseColdAdmissionLocked(*this);
+}
+
+void CasRefLedger::cancelIdleOwnCreatingRows(const Liveness & alive, std::function<void(uint64_t)> pause)
+{
+    static constexpr size_t kMaxCancelsPerPass = 16;
+    /// The order `Pool::captureMountIncarnation` uses: a generation that holds across the epoch read dates it.
+    const uint64_t generation = fence_generation_fn();
+    const uint64_t epoch = live_epoch_fn();
+    CasOperation op = mount_requests.resume(generation, alive, std::move(pause));
+    if (!op.admitted())
+        return;
+    const String key = layout.refCatalogKey();
+    const auto log_absent = [&]
+    {
+        LOG_ERROR(getLogger("CasRefLedger"), "CAS ref catalog '{}': mandatory catalog absent; skipping owner cleanup", key);
+    };
+    const Retry policy = op.freeze(Retry::standard());
+    const std::optional<Object> got = op.read(key, policy);
+    if (!got)
+    {
+        log_absent();
+        return;
+    }
+    const CreatorFence ours{server_root_id, epoch, generation};
+    std::vector<CatalogEntry> eligible;
+    for (const CatalogEntry & entry : decodeRefCatalog(got->bytes).entries)
+        if (entry.state == NsState::Creating && entry.creator == ours && !hasColdAdmissionInFlight(entry.ns))
+            eligible.push_back(entry);
+    const size_t start = own_creating_rotation.load();
+    for (size_t i = 0; i < std::min(kMaxCancelsPerPass, eligible.size()); ++i)
+    {
+        own_creating_rotation.store(start + i + 1);
+        const CatalogEntry & row = eligible[(start + i) % eligible.size()];
+        bool absent = false;
+        /// The idle check is repeated inside the lane, on the catalog the cancel writes over: an admission
+        /// that begins after it resolves through the exact-row compare-and-swap.
+        const auto outcome = CasRefCatalog::cancelStalledCreating(
+            op, layout, row, [&](const CreatorFence &) { return !hasColdAdmissionInFlight(row.ns); },
+            [](const Retry &) {}, policy, &absent);
+        if (absent)
+        {
+            log_absent();
+            return;
+        }
+        if (outcome == CasRefCatalog::StalledCreatingCancelOutcome::FencedOut)
+            return;
+        /// Otherwise the name became busy or the row changed: nothing was written for it.
+        if (outcome != CasRefCatalog::StalledCreatingCancelOutcome::Cancelled)
+            continue;
+        ProfileEvents::increment(ProfileEvents::CASOwnCreatingCancelled);
+        LOG_INFO(getLogger("CasRefLedger"),
+            "CAS namespace '{}': cancelled this mount's own `Creating` row, life {}, writer epoch {}: no admission "
+            "of the name was in flight when the cancel was decided",
+            row.ns.string(), renderIncarnation(row.incarnation), epoch);
+    }
+}
+
+bool CasRefLedger::hasColdAdmissionInFlight(const RootNamespace & ns) const
+{
+    std::lock_guard lock(ref_queue_mutex);
+    const auto it = ref_name_slots.find(ns.string());
+    return it != ref_name_slots.end() && it->second.admissions_in_flight > 0;
 }
 
 CasRefLedger::ColdAdmission CasRefLedger::beginColdAdmission(const RootNamespace & ns)
