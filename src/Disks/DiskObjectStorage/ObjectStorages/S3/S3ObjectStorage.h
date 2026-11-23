@@ -130,7 +130,7 @@ public:
     ConditionalRemoveResult removeObjectIfTokenMatches(
         const StoredObject & object, const std::string & etag, const ObjectStorageControlRequest & request) override;
 
-    std::vector<ConditionalRemoveResult> removeObjectsIfTokensMatch(
+    std::vector<ConditionalBatchRemoveResult> removeObjectsIfTokensMatch(
         const std::vector<ConditionalRemoveObject> & objects, const ObjectStorageControlRequest & request) override;
 
     /// One `DeleteObjects` for the given objects (the caller chunks to at most 1000); absence is success.

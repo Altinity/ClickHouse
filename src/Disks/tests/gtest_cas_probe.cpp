@@ -53,10 +53,10 @@ namespace
 class IgnoresConditionalBatchTokensBackend : public InMemoryBackend
 {
 public:
-    std::vector<RawRemoval> removeManyByConditional(
+    std::vector<RawBatchRemoveResult> removeManyByConditional(
         const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
     {
-        std::vector<RawRemoval> results;
+        std::vector<RawBatchRemoveResult> results;
         results.reserve(removals.size());
         for (const RawConditionalRemove & removal : removals)
         {
@@ -70,10 +70,10 @@ public:
 class NoOpConditionalBatchDeleteBackend : public InMemoryBackend
 {
 public:
-    std::vector<RawRemoval> removeManyByConditional(
+    std::vector<RawBatchRemoveResult> removeManyByConditional(
         const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
     {
-        std::vector<RawRemoval> results;
+        std::vector<RawBatchRemoveResult> results;
         results.reserve(removals.size());
         for (const RawConditionalRemove & removal : removals)
         {
@@ -92,11 +92,11 @@ public:
 class ReportsAbsentKeyAsRemovedBackend : public InMemoryBackend
 {
 public:
-    std::vector<RawRemoval> removeManyByConditional(
+    std::vector<RawBatchRemoveResult> removeManyByConditional(
         const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
     {
         auto results = InMemoryBackend::removeManyByConditional(removals, access);
-        EXPECT_EQ(results, (std::vector{RawRemoval::Removed, RawRemoval::Mismatch, RawRemoval::Removed, RawRemoval::Gone}));
+        EXPECT_EQ(results, (std::vector<RawBatchRemoveResult>{RawRemoval::Removed, RawRemoval::Mismatch, RawRemoval::Removed, RawRemoval::Gone}));
         for (auto & result : results)
             if (result == RawRemoval::Gone)
                 result = RawRemoval::Removed;
@@ -111,7 +111,7 @@ public:
     {
     }
 
-    std::vector<RawRemoval> removeManyByConditional(const std::vector<RawConditionalRemove> &, TransportAccess &) override
+    std::vector<RawBatchRemoveResult> removeManyByConditional(const std::vector<RawConditionalRemove> &, TransportAccess &) override
     {
         ++batch_attempts;
         std::rethrow_exception(failure);
@@ -175,6 +175,37 @@ TEST(CASProbe, RequiresGoneForAnAlreadyDeletedKeyInTheBatch)
     auto op = requests.admit();
 
     EXPECT_FALSE(runCapabilityProbe(op, "p/.cas_probe").conditional_batch_delete_supported);
+}
+
+TEST(CASProbe, SingletonMismatchCannotProveBatchTokenEnforcement)
+{
+    class PartialProbeBackend final : public IgnoresConditionalBatchTokensBackend
+    {
+    public:
+        std::vector<size_t> request_sizes;
+        std::vector<RawBatchRemoveResult> removeManyByConditional(
+            const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
+        {
+            request_sizes.push_back(removals.size());
+            if (request_sizes.size() == 1 && removals.size() == 4)
+            {
+                auto reply = InMemoryBackend::removeManyByConditional(removals, access);
+                reply[1] = std::unexpected(std::make_exception_ptr(Poco::TimeoutException("stale key throttled")));
+                return reply;
+            }
+            if (removals.size() == 1)
+                return InMemoryBackend::removeManyByConditional(removals, access);
+            return IgnoresConditionalBatchTokensBackend::removeManyByConditional(removals, access);
+        }
+    };
+
+    auto backend = std::make_shared<PartialProbeBackend>();
+    DB::Cas::tests::FakeClock clock;
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), nullptr, kDefaultRequestWindowMs);
+    auto op = requests.admit();
+    EXPECT_FALSE(runCapabilityProbe(op, "p/.cas_probe").conditional_batch_delete_supported);
+    EXPECT_EQ(backend->request_sizes, (std::vector<size_t>{4, 4}));
+    EXPECT_TRUE(op.list("p/.cas_probe", "", 10, Retry::once()).keys.empty());
 }
 
 TEST(CASProbe, ExplicitlyUnsupportedConditionalBatchReturnsFalseAndCleansUp)

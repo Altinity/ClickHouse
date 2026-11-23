@@ -124,6 +124,21 @@ void recordConditionalWriteOutcome(CasWriteOutcome outcome)
     }
 }
 
+Backend::RawRemoval toRawRemoval(const ConditionalRemoveResult & result)
+{
+    switch (result.outcome)
+    {
+        case ConditionalRemoveOutcome::Removed:
+            /// A delete marker can hide a version whose bytes still occupy storage.
+            return result.created_delete_marker ? Backend::RawRemoval::DeleteMarker : Backend::RawRemoval::Removed;
+        case ConditionalRemoveOutcome::TokenMismatch:
+            return Backend::RawRemoval::Mismatch;
+        case ConditionalRemoveOutcome::NotFound:
+            return Backend::RawRemoval::Gone;
+    }
+    UNREACHABLE();
+}
+
 }
 
 ObjectStorageBackend::ObjectStorageBackend(ObjectStoragePtr object_storage_, Mode mode_,
@@ -993,19 +1008,7 @@ Backend::RawRemoval ObjectStorageBackend::removeUnder(
     {
         /// `NOT_IMPLEMENTED` from a storage that does not enforce conditional removal propagates —
         /// fail-closed by construction.
-        auto result = object_storage->removeObjectIfTokenMatches(StoredObject(key), expected_value, request);
-        switch (result.outcome)
-        {
-            case ConditionalRemoveOutcome::Removed:
-                /// A delete marker means the storage archived a noncurrent version instead of
-                /// reclaiming the current object -- a removal that did not reclaim.
-                return result.created_delete_marker ? RawRemoval::DeleteMarker : RawRemoval::Removed;
-            case ConditionalRemoveOutcome::TokenMismatch:
-                return RawRemoval::Mismatch;
-            case ConditionalRemoveOutcome::NotFound:
-                return RawRemoval::Gone;
-        }
-        UNREACHABLE();
+        return toRawRemoval(object_storage->removeObjectIfTokenMatches(StoredObject(key), expected_value, request));
     }
 
     std::lock_guard lock(emu_mutex);
@@ -1079,14 +1082,14 @@ void ObjectStorageBackend::removeManyWriteOnce(const std::vector<WriteOnceKey> &
     }
 }
 
-std::vector<Backend::RawRemoval> ObjectStorageBackend::removeManyByConditional(
+std::vector<Backend::RawBatchRemoveResult> ObjectStorageBackend::removeManyByConditional(
     const std::vector<RawConditionalRemove> & removals, TransportAccess & access)
 {
     if (removals.empty())
         return {};
     if (mode != Mode::Native)
     {
-        std::vector<RawRemoval> results;
+        std::vector<RawBatchRemoveResult> results;
         results.reserve(removals.size());
         for (const RawConditionalRemove & removal : removals)
             results.push_back(removeUnder(removal.key, removal.expected_token, controlRequest(access.attemptNo())));
@@ -1095,29 +1098,23 @@ std::vector<Backend::RawRemoval> ObjectStorageBackend::removeManyByConditional(
 
     std::vector<ConditionalRemoveObject> objects;
     objects.reserve(removals.size());
+
     for (const RawConditionalRemove & removal : removals)
     {
         if (!isValidTokenValue(dialect(), removal.expected_token))
             throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS backend: malformed conditional removal token for {}", removal.key);
         objects.push_back({StoredObject(removal.key), removal.expected_token});
     }
+
     const auto storage_results = object_storage->removeObjectsIfTokensMatch(objects, controlRequest(access.attemptNo()));
     if (storage_results.size() != removals.size())
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS backend: conditional batch removal returned {} results for {} keys", storage_results.size(), removals.size());
 
-    std::vector<RawRemoval> results;
+    std::vector<RawBatchRemoveResult> results;
     results.reserve(storage_results.size());
-    for (const ConditionalRemoveResult & result : storage_results)
-    {
-        switch (result.outcome)
-        {
-            case ConditionalRemoveOutcome::Removed:
-                results.push_back(result.created_delete_marker ? RawRemoval::DeleteMarker : RawRemoval::Removed);
-                break;
-            case ConditionalRemoveOutcome::TokenMismatch: results.push_back(RawRemoval::Mismatch); break;
-            case ConditionalRemoveOutcome::NotFound: results.push_back(RawRemoval::Gone); break;
-        }
-    }
+
+    for (const auto & result : storage_results)
+        results.push_back(result.transform(toRawRemoval));
     return results;
 }
 

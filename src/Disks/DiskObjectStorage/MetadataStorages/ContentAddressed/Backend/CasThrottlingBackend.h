@@ -95,7 +95,7 @@ public:
         inner->removeManyWriteOnce(keys, access);
     }
 
-    std::vector<RawRemoval> removeManyByConditional(
+    std::vector<RawBatchRemoveResult> removeManyByConditional(
         const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
     {
         for (const RawConditionalRemove & removal : removals)

@@ -374,8 +374,9 @@ public:
 private:
     friend bool probeConditionalBatchDelete(CasOperation & op, const String & probe_prefix, const ConditionalRemove & absent_key);
 
+    enum class ConditionalDeletePurpose { Remove, Probe };
     std::vector<Removal> removeManyByConditional(
-        const std::vector<ConditionalRemove> & removals, const Retry & policy, const size_t limit);
+        const std::vector<ConditionalRemove> & removals, const Retry & policy, ConditionalDeletePurpose purpose);
 
     friend class CasRequests;
     /// The lane waits on this operation's own admission and reads and writes through its verbs; it

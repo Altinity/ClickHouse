@@ -130,7 +130,7 @@ public:
     /// carried, the request counter says how many requests it took. Out of line, like `publish`, so
     /// the header need not declare the `CASBulkDeleteRequests` extern.
     void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access) override;
-    std::vector<RawRemoval> removeManyByConditional(
+    std::vector<RawBatchRemoveResult> removeManyByConditional(
         const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override;
 
     /// Count a create and a replacement separately, and each of them separately from its refusal:

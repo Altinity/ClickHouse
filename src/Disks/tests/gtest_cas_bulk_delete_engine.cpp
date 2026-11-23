@@ -55,14 +55,15 @@ class RecordingConditionalBackend : public InMemoryBackend
 {
 public:
     std::vector<std::vector<RawConditionalRemove>> attempts;
-    bool lose_first_response = false;
+    bool lose_next_pair_response = false;
 
-    std::vector<RawRemoval> removeManyByConditional(
+    std::vector<RawBatchRemoveResult> removeManyByConditional(
         const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
     {
         attempts.push_back(removals);
-        if (lose_first_response && attempts.size() == 1 && removals.size() == 2)
+        if (lose_next_pair_response && removals.size() == 2)
         {
+            lose_next_pair_response = false;
             const auto & first = removals[0];
             const auto & second = removals[1];
             EXPECT_EQ(remove(first.key, first.expected_token, access), RawRemoval::Removed);
@@ -142,7 +143,7 @@ TEST(CASConditionalBatchDeleteEngine, PartialSuccessRetryKeepsOriginalTokens)
 {
     auto backend = std::make_shared<RecordingConditionalBackend>();
     backend->pinConditionalBatchDeleteSupport(true);
-    backend->lose_first_response = true;
+    backend->lose_next_pair_response = true;
     DB::Cas::tests::FakeClock clock;
     CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), nullptr, kDefaultRequestWindowMs);
     auto op = requests.admit();
@@ -162,6 +163,49 @@ TEST(CASConditionalBatchDeleteEngine, PartialSuccessRetryKeepsOriginalTokens)
         EXPECT_EQ(attempt[1].expected_token, PersistedEtag::capture(second).value);
     }
     EXPECT_FALSE(op.head("a", Retry::once()));
+    const auto replacement = op.read("b", Retry::once());
+    ASSERT_TRUE(replacement);
+    EXPECT_EQ(replacement->bytes, "replacement");
+}
+
+TEST(CASConditionalBatchDeleteEngine, LostResponseRetriesOnlyTheOutstandingPair)
+{
+    class PartialReplyBackend final : public RecordingConditionalBackend
+    {
+    public:
+        std::vector<RawBatchRemoveResult> removeManyByConditional(
+            const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
+        {
+            if (!attempts.empty() || removals.size() != 3)
+                return RecordingConditionalBackend::removeManyByConditional(removals, access);
+
+            attempts.push_back(removals);
+            const auto error = std::unexpected(std::make_exception_ptr(Poco::TimeoutException("retry key")));
+            return {error, remove(removals[1].key, removals[1].expected_token, access), error};
+        }
+    };
+
+    auto backend = std::make_shared<PartialReplyBackend>();
+    backend->pinConditionalBatchDeleteSupport(true);
+    backend->lose_next_pair_response = true;
+    DB::Cas::tests::FakeClock clock;
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), nullptr, kDefaultRequestWindowMs);
+    auto op = requests.admit();
+    std::vector<ConditionalRemove> input;
+    for (const String key : {"a", "settled", "b"})
+        input.push_back({key, std::get<Committed>(op.create(key, "old", Retry::once())).etag});
+
+    EXPECT_EQ(op.removeManyByConditional(input, Retry::standard()), (std::vector{Removal::Gone, Removal::Removed, Removal::Mismatch}));
+    ASSERT_EQ(backend->attempts.size(), 3u);
+    for (const size_t attempt : {1u, 2u})
+    {
+        const auto & pair = backend->attempts[attempt];
+        ASSERT_EQ(pair.size(), 2u);
+        EXPECT_EQ(pair[0].key, "a");
+        EXPECT_EQ(pair[0].expected_token, PersistedEtag::capture(input[0].expected_token).value);
+        EXPECT_EQ(pair[1].key, "b");
+        EXPECT_EQ(pair[1].expected_token, PersistedEtag::capture(input[2].expected_token).value);
+    }
     const auto replacement = op.read("b", Retry::once());
     ASSERT_TRUE(replacement);
     EXPECT_EQ(replacement->bytes, "replacement");

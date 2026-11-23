@@ -67,7 +67,7 @@ ObjectStorageIteratorPtr IObjectStorage::iterate(
     return std::make_shared<ObjectStorageIteratorFromList>(std::move(files));
 }
 
-std::vector<ConditionalRemoveResult> IObjectStorage::removeObjectsIfTokensMatch(
+std::vector<ConditionalBatchRemoveResult> IObjectStorage::removeObjectsIfTokensMatch(
     const std::vector<ConditionalRemoveObject> & objects, const ObjectStorageControlRequest & request)
 {
     if (objects.size() > 1)

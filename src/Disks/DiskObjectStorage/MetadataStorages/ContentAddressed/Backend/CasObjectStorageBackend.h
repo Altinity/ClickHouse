@@ -101,7 +101,7 @@ public:
     /// under the control-plane profile; `EmulatedSingleProcess` deletes each present key under the
     /// emulation lock with the same token bookkeeping as the single-key delete.
     void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access) override;
-    std::vector<RawRemoval> removeManyByConditional(
+    std::vector<RawBatchRemoveResult> removeManyByConditional(
         const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override;
 
     /// Native: the object storage's own limit. Emulated: `kBulkDeleteMaxKeys`, since this backend deletes

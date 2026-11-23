@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <exception>
 #include <expected>
 #include <functional>
 #include <memory>
@@ -174,6 +175,7 @@ public:
     /// `DeleteMarker` is a removal that did NOT reclaim: a versioned bucket archived a noncurrent
     /// version instead. Distinct from `Removed` because reclaiming the storage is the point.
     enum class RawRemoval : uint8_t { Removed, Gone, Mismatch, DeleteMarker };
+    using RawBatchRemoveResult = std::expected<RawRemoval, std::exception_ptr>;
     struct RawConditionalRemove
     {
         String key;
@@ -211,7 +213,8 @@ public:
     /// absence is success.
     virtual void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess &) = 0;
 
-    virtual std::vector<RawRemoval> removeManyByConditional(
+    /// One item per input key, in input order. A request-level failure throws without any per-key results.
+    virtual std::vector<RawBatchRemoveResult> removeManyByConditional(
         const std::vector<RawConditionalRemove> & removals, TransportAccess & access)
     {
         if (removals.size() > 1)

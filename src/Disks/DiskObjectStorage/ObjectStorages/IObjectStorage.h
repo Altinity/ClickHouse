@@ -3,6 +3,8 @@
 #include <string>
 #include <map>
 #include <optional>
+#include <exception>
+#include <expected>
 #include <filesystem>
 #include <variant>
 
@@ -297,6 +299,8 @@ struct ConditionalRemoveResult
     bool created_delete_marker = false;   /// backend reported a versioning delete marker
 };
 
+using ConditionalBatchRemoveResult = std::expected<ConditionalRemoveResult, std::exception_ptr>;
+
 struct ConditionalRemoveObject
 {
     StoredObject object;
@@ -453,7 +457,8 @@ public:
     virtual ConditionalRemoveResult removeObjectIfTokenMatches(
         const StoredObject & object, const std::string & etag, const ObjectStorageControlRequest & request);
 
-    virtual std::vector<ConditionalRemoveResult> removeObjectsIfTokensMatch(
+    /// A complete response has one outcome or store error per input key, in request order.
+    virtual std::vector<ConditionalBatchRemoveResult> removeObjectsIfTokensMatch(
         const std::vector<ConditionalRemoveObject> & objects, const ObjectStorageControlRequest & request);
 
     /// Removes every object in ONE request with no per-key precondition; an absent object is success.

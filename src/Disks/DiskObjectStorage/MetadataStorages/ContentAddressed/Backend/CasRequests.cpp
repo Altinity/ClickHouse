@@ -23,6 +23,7 @@
 #include <array>
 #include <ctime>
 #include <limits>
+#include <numeric>
 #include <set>
 #include <utility>
 
@@ -490,31 +491,58 @@ bool CasOperation::fits(uint64_t needed_ms, const Retry::Bound & bound) const
     return needed_ms <= bound.deadline_ms - now;
 }
 
-bool CasOperation::refreshAndClassifyReadFault(const std::exception & e, bool & refresh_attempted, bool & refreshed)
+namespace
+{
+
+/// Ordered by priority when a complete batch response reports different errors for different keys.
+enum class ReadFaultAction
+{
+    Retry,
+    RefreshCredentials,
+    Propagate,
+};
+
+ReadFaultAction classifyReadFault(const std::exception & e)
 {
     if (const auto * db_e = dynamic_cast<const Exception *>(&e); db_e && isDeterministicLocalFailure(db_e->code()))
-        return true;
-    /// A local failure -- a bad allocation, a logic error raised inside the attempt -- is not a
-    /// transport fault, and reissuing it would spend the whole deadline replaying the same bug. Every
-    /// exception the transport raises is a `Poco::Exception`, `DB::Exception` included.
+        return ReadFaultAction::Propagate;
+    /// Transport errors derive from Poco::Exception. Retrying a local failure such as bad_alloc would replay it to the deadline.
     if (!dynamic_cast<const Poco::Exception *>(&e))
-        return true;
-    /// A credential failure gets ONE refresh per call -- the storage hands back a fresh client every
-    /// time it is asked, so refreshing per attempt would reissue a permanent denial to the deadline.
-    /// Without new credentials nothing would sign differently, so a read propagates rather than
-    /// spending its policy on a request that cannot start succeeding.
+        return ReadFaultAction::Propagate;
     if (isRefreshableCredentialError(e))
+        return ReadFaultAction::RefreshCredentials;
+    if (isDefinitelyRefusedWrite(e) || isAuthoritativeAbsence(e))
+        return ReadFaultAction::Propagate;
+    /// Throttling, a 5xx, a misrouted bucket, or an unmodeled store error may still be transient.
+    return ReadFaultAction::Retry;
+}
+
+ReadFaultAction classifyReadFault(const std::exception_ptr & error)
+{
+    try
     {
-        if (refresh_attempted)
-            return true;
-        refresh_attempted = true;
-        refreshed = owner.backend->refreshCredentials();
-        return !refreshed;
+        std::rethrow_exception(error);
     }
-    /// The store's own answer decides. A refusal it proved never applied, and an authoritative absence,
-    /// both replay identically; everything else -- a throttle, a 5xx, a missing bucket, an unmodeled
-    /// name an S3-compatible store reports -- may still be transient.
-    return isDefinitelyRefusedWrite(e) || isAuthoritativeAbsence(e);
+    catch (const std::exception & e)
+    {
+        return classifyReadFault(e);
+    }
+}
+
+}
+
+bool CasOperation::refreshAndClassifyReadFault(const std::exception & e, bool & refresh_attempted, bool & refreshed)
+{
+    const auto action = classifyReadFault(e);
+    if (action != ReadFaultAction::RefreshCredentials)
+        return action == ReadFaultAction::Propagate;
+
+    /// Only one refresh per call. Another client signed with the same credentials would replay the denial.
+    if (refresh_attempted)
+        return true;
+    refresh_attempted = true;
+    refreshed = owner.backend->refreshCredentials();
+    return !refreshed;
 }
 
 void CasOperation::giveUpReadFenceLost(std::string_view verb, const String & subject, std::string_view when)
@@ -593,11 +621,8 @@ Removal CasOperation::removeUnder(const String & key, const String & expected_va
         case Backend::RawRemoval::Mismatch: return Removal::Mismatch;
         case Backend::RawRemoval::DeleteMarker: break;
     }
-    /// Thrown outside the attempt loop: a versioned bucket answers this way every time, so reissuing
-    /// would spend the whole deadline to be told the same thing.
-    throw Exception(ErrorCodes::CAS_DELETE_MARKER,
-        "CAS remove of '{}' archived a noncurrent version instead of reclaiming the object: "
-        "the bucket has object versioning enabled", key);
+    /// Report the observed marker outside the retry loop so a later attempt cannot mask it.
+    throw Exception(ErrorCodes::CAS_DELETE_MARKER, "CAS removal created a delete marker for '{}'", key);
 }
 
 std::optional<Object> CasOperation::read(const String & key, const Retry & policy)
@@ -650,34 +675,18 @@ void CasOperation::removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, c
     });
 }
 
-namespace
-{
-Removal toConditionalRemoval(const Backend::RawRemoval raw)
-{
-    switch (raw)
-    {
-        case Backend::RawRemoval::Removed: return Removal::Removed;
-        case Backend::RawRemoval::Gone: return Removal::Gone;
-        case Backend::RawRemoval::Mismatch: return Removal::Mismatch;
-        case Backend::RawRemoval::DeleteMarker:
-            throw Exception(ErrorCodes::CAS_DELETE_MARKER,
-                "CAS conditional batch removal archived a noncurrent version instead of reclaiming an object: "
-                "the bucket has object versioning enabled");
-    }
-    UNREACHABLE();
-}
-}
-
 std::vector<Removal> CasOperation::removeManyByConditional(
     const std::vector<ConditionalRemove> & removals, const Retry & policy)
 {
-    const size_t limit = std::min(kBulkDeleteMaxKeys, owner.backend->conditionalBatchDeleteKeyLimit());
-    return removeManyByConditional(removals, policy, limit);
+    return removeManyByConditional(removals, policy, ConditionalDeletePurpose::Remove);
 }
 
 std::vector<Removal> CasOperation::removeManyByConditional(
-    const std::vector<ConditionalRemove> & removals, const Retry & policy, const size_t limit)
+    const std::vector<ConditionalRemove> & removals, const Retry & policy, const ConditionalDeletePurpose purpose)
 {
+    const bool probing = purpose == ConditionalDeletePurpose::Probe;
+    const size_t limit = probing ? kBulkDeleteMaxKeys : std::min(kBulkDeleteMaxKeys, owner.backend->conditionalBatchDeleteKeyLimit());
+
     if (removals.size() > limit)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "CAS removeManyByConditional: {} keys in one chunk, the limit is {}; the consumer chunks its input",
@@ -698,19 +707,71 @@ std::vector<Removal> CasOperation::removeManyByConditional(
 
     const Retry::Bound bound = owner.bindPolicy(policy);
     const String subject = fmt::format("{} (+{} keys)", removals.front().key, removals.size() - 1);
-    const std::vector<Backend::RawRemoval> raw_results = readLoop(
-        "removeManyByConditional", subject, policy, bound, [&](auto & access)
-        {
-            return owner.backend->removeManyByConditional(raw_removals, access);
-        });
-    if (raw_results.size() != removals.size())
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "CAS removeManyByConditional: backend returned {} results for {} keys", raw_results.size(), removals.size());
 
-    std::vector<Removal> results;
-    results.reserve(raw_results.size());
-    for (const Backend::RawRemoval raw : raw_results)
-        results.push_back(toConditionalRemoval(raw));
+    std::vector<Removal> results(removals.size());
+    std::vector<size_t> original_positions(removals.size());
+
+    std::iota(original_positions.begin(), original_positions.end(), size_t{0});
+
+    const auto marker_position = readLoop(
+        "removeManyByConditional", subject, policy, bound, [&](auto & access) -> std::optional<size_t>
+        {
+            const auto reply = owner.backend->removeManyByConditional(raw_removals, access);
+            if (reply.size() != raw_removals.size())
+                throw Exception(ErrorCodes::LOGICAL_ERROR,
+                    "CAS removeManyByConditional: backend returned {} results for {} keys", reply.size(), raw_removals.size());
+
+            std::vector<Backend::RawConditionalRemove> failed_removals;
+            std::vector<size_t> failed_positions;
+            std::exception_ptr error_to_rethrow;
+            auto error_action = ReadFaultAction::Retry;
+
+            for (size_t i = 0; i < reply.size(); ++i)
+            {
+                const size_t position = original_positions[i];
+                if (reply[i])
+                {
+                    switch (*reply[i])
+                    {
+                        case Backend::RawRemoval::Removed: results[position] = Removal::Removed; break;
+                        case Backend::RawRemoval::Gone: results[position] = Removal::Gone; break;
+                        case Backend::RawRemoval::Mismatch: results[position] = Removal::Mismatch; break;
+                        case Backend::RawRemoval::DeleteMarker: return position;
+                    }
+                }
+                else
+                {
+                    const auto & error = reply[i].error();
+                    const auto action = classifyReadFault(error);
+                    if (!error_to_rethrow || action > error_action)
+                    {
+                        error_to_rethrow = error;
+                        error_action = action;
+                    }
+                    if (!probing)
+                    {
+                        failed_removals.push_back(std::move(raw_removals[i]));
+                        failed_positions.push_back(position);
+                    }
+                }
+            }
+            if (error_to_rethrow)
+            {
+                /// The probe needs every outcome from one multi-key request. A singleton retry would only prove DeleteObject.
+                if (!probing)
+                {
+                    raw_removals = std::move(failed_removals);
+                    original_positions = std::move(failed_positions);
+                }
+                std::rethrow_exception(error_to_rethrow);
+            }
+            return std::nullopt;
+        });
+
+    if (marker_position)
+        throw Exception(ErrorCodes::CAS_DELETE_MARKER,
+            "CAS conditional batch removal created a delete marker for '{}'",
+            removals[*marker_position].key);
     return results;
 }
 

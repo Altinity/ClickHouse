@@ -51,7 +51,7 @@ public:
     /// `hold_deletes_` exactly as `remove` does: a held delete is queued and lands only on
     /// `landPendingDelete`.
     void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access) override;
-    std::vector<RawRemoval> removeManyByConditional(
+    std::vector<RawBatchRemoveResult> removeManyByConditional(
         const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override;
     /// The next `removeManyWriteOnce` throws `error` instead of deleting anything; one-shot, like
     /// `failNextWriteWith`.

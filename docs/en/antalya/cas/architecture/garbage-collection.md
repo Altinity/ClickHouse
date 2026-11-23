@@ -93,7 +93,7 @@ exact-token deletes and prune that earlier phases justified from *previously* pu
 already have run; they are idempotent): unapplied transactions and a cursor/apply mismatch (both
 `CORRUPTED_DATA`, checked between phases 9 and 10), a missing adopted seal, a table with a snapshot
 but no surviving log and no cursor, a non-total condemned summary (all `CORRUPTED_DATA`), and an
-observed delete marker (`LOGICAL_ERROR`: bucket versioning is on). The per-phase "fails the round
+observed delete marker (`CAS_DELETE_MARKER`). The per-phase "fails the round
 if" lists below name the protocol checks; an uncaught backend or decode exception fails the round
 execution too.
 
@@ -435,8 +435,10 @@ sequence of requests needed to process many keys.
   `delete_pending` — durable state from an earlier commit, safe at any leader staleness. Exact token
   means a stale leader cannot delete a fresh incarnation; `NotFound` and `TokenMismatch` are
   tolerated. This round's own commit outcome does not affect the delete's safety.
-- **Fails the round if:** a backend delete marker appears in a response — object versioning on a
-  mis-provisioned pool (`LOGICAL_ERROR`)
+- **Fails the round if:** S3 reports a delete marker for any key. GC reports `CAS_DELETE_MARKER`
+  with that key, even if the same response reports `SlowDown` for another key. With versioning
+  enabled, S3 retains the previous version. With versioning suspended, S3 can create a marker
+  and remove the version whose `VersionId` is `null` in the same operation.
 - **Observability:** phase row `pending_deletes`; metrics `deleted`, `absent`, `redeleted`,
   `graduated`, `replaced`, `spared`, `outcome_logs_written`, `outcome_rows_dropped`, `delete_chunks`. `delete_chunks`
   counts logical conditional-delete chunks, including sequential execution. `read_blob_jobs_scheduled`
@@ -475,6 +477,12 @@ paths use `objects_chunk_size_to_delete` as a size limit. A request-level `NotIm
 the optional batch check leaves GC using one-key chunks. A request-level `InvalidRequest` or
 `InvalidArgument` propagates and fails the mount. After a successful probe, a batch request error
 follows the normal request retry policy and does not change the pinned capability.
+
+When S3 returns an outcome for every key, CAS keeps completed outcomes and retries only keys
+with retryable errors. Each retry uses the original `ETag`. If a response is lost, CAS retries
+the keys from that attempt because their outcomes are unknown. A single remaining key uses
+conditional `DeleteObject`. The mount probe retries its full four-key batch so that one
+`DeleteObjects` response demonstrates all four expected outcomes.
 
 CAS skips the optional conditional batch delete check on Google Cloud Storage in generation-token
 mode. The [S3-compatible XML `DeleteObjects` API](https://docs.cloud.google.com/storage/docs/object-deletion-overview)
@@ -1132,7 +1140,7 @@ checksum disagrees with its seal).
 |---|---|
 | `SYSTEM CAS GC RUN [<disk>]` | One synchronous round execution on the contacted node; only the lease holder (the GC leader, `is_leader = 1` in `system.cas_mounts`) makes progress, and on any other node the command does nothing. The disk is optional: without it every content-addressed disk on the node runs one round. It runs even while the scheduler is stopped |
 | `SYSTEM CAS GC STOP <disk>` / `SYSTEM CAS GC START <disk>` | Stop or resume future background rounds on that disk's scheduler, preserving its identity. The disk is required |
-| `SYSTEM CAS GC REBUILD [FORCE] <disk>` (`clickhouse-disks cas-gc-rebuild`) | Fail-closed disaster-recovery path for a lost or corrupt `GC` baseline — the `CORRUPTED_DATA` errors that name it in their message (missing adopted seal, snapshot without a surviving log, cursor/apply mismatch). An `ABORTED` commit conflict or a `LOGICAL_ERROR` delete marker is not a reason to rebuild. It deliberately over-protects — it prefers bounded leaks over risking an under-count — and cannot delete live data directly: deletions it produces still flow through the normal round's condemn, graduate, exact-token path. The disk is required |
+| `SYSTEM CAS GC REBUILD [FORCE] <disk>` (`clickhouse-disks cas-gc-rebuild`) | Fail-closed disaster-recovery path for a lost or corrupt `GC` baseline — the `CORRUPTED_DATA` errors that name it in their message (missing adopted seal, snapshot without a surviving log, cursor/apply mismatch). An `ABORTED` commit conflict or a `CAS_DELETE_MARKER` from a delete request is not a reason to rebuild. It deliberately over-protects — it prefers bounded leaks over risking an under-count — and cannot delete live data directly: deletions it produces still flow through the normal round's condemn, graduate, exact-token path. The disk is required |
 | `clickhouse-disks cas-gc-dryrun` | Opens the disk read-only, constructs a non-leader `GC`, and prints what would be deleted with a reason per entry. Write-free, resolves runs through the seal's references. Documented caveat: it does not fold new owner events, so away from quiescence it can **over-report** — the subset guarantee holds only at quiescence, and its output must never feed a real delete |
 
 `SYSTEM CAS DROP POOL MEMBER '<server_root_id>' FROM DISK '<disk>'` — removal of a dead

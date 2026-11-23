@@ -19,11 +19,7 @@ namespace DB::Cas
 namespace
 {
 
-/// `op.remove`'s own delete-marker signal (`CAS_DELETE_MARKER`, thrown outside the attempt loop because
-/// a versioned bucket answers this way every time) is re-signalled here as the operator-facing message
-/// the probe has always thrown for it — everything else propagates unchanged. Every `remove` the battery
-/// issues against a live incarnation goes through this: a store that ignores the delete precondition AND
-/// mints delete markers must still be reported with this message, not the engine's terse one.
+/// Report the bucket requirement even if a store creates a marker on a stale-token probe delete.
 Removal removeOrReportDeleteMarker(CasOperation & op, const String & key, const Etag & seen)
 {
     try
@@ -35,13 +31,9 @@ Removal removeOrReportDeleteMarker(CasOperation & op, const String & key, const 
         if (e.code() != DB::ErrorCodes::CAS_DELETE_MARKER)
             throw;
         throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
-            "CasProbe: remove succeeded but created a versioning delete marker — the bucket has "
-            "object VERSIONING enabled, and a content-addressed pool cannot run on a versioned bucket: "
-            "every GC delete would archive a noncurrent version instead of reclaiming storage (the bucket "
-            "grows forever), and the constantly-rewritten ref objects would pile up versions on every "
-            "commit. Use a bucket where versioning was NEVER enabled; skip_access_check skips this probe "
-            "but does not make a versioned bucket usable — note that merely SUSPENDING versioning is not enough (deletes on a "
-            "versioning-suspended bucket still mint delete markers, so this probe will refuse again)");
+            "CasProbe: removing '{}' created a delete marker. CAS requires a bucket where versioning has never been enabled. "
+            "A bucket with suspended versioning can still create delete markers. "
+            "Setting skip_access_check bypasses this probe but does not make a versioned bucket usable.", key);
     }
 }
 
@@ -87,7 +79,7 @@ bool probeConditionalBatchDelete(CasOperation & op, const String & probe_prefix,
         const auto removals = op.removeManyByConditional(
             {{first_matching_key, first_matching_token}, {replaced_key, stale_token},
              {second_matching_key, second_matching_token}, absent_key},
-            Retry::standard(), kBulkDeleteMaxKeys);
+            Retry::standard(), CasOperation::ConditionalDeletePurpose::Probe);
         if (removals.size() != 4 || removals[0] != Removal::Removed || removals[1] != Removal::Mismatch
             || removals[2] != Removal::Removed || removals[3] != Removal::Gone)
             return false;

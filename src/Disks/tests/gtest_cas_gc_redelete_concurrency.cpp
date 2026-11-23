@@ -84,7 +84,7 @@ public:
         return InMemoryBackend::remove(key, expected_value, access);
     }
 
-    std::vector<RawRemoval> removeManyByConditional(
+    std::vector<RawBatchRemoveResult> removeManyByConditional(
         const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
     {
         for (const RawConditionalRemove & removal : removals)
@@ -139,7 +139,7 @@ public:
         return InMemoryBackend::head(key, access);
     }
 
-    std::vector<RawRemoval> removeManyByConditional(
+    std::vector<RawBatchRemoveResult> removeManyByConditional(
         const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
     {
         if (!delete_chunk_hook)
@@ -209,10 +209,10 @@ public:
         return result;
     }
 
-    std::vector<RawRemoval> removeManyByConditional(
+    std::vector<RawBatchRemoveResult> removeManyByConditional(
         const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
     {
-        std::vector<RawRemoval> results;
+        std::vector<RawBatchRemoveResult> results;
         results.reserve(removals.size());
         for (const RawConditionalRemove & removal : removals)
             results.push_back(remove(removal.key, removal.expected_token, access));
