@@ -211,6 +211,10 @@ struct RelativePathWithMetadata
     std::optional<ObjectMetadata> metadata;
     /// Information about columns
     std::optional<DataFileMetaInfoPtr> file_meta_info;
+    /// If known (a data lake format with per-file statistics), the estimated size in bytes of the Parquet
+    /// footer of this object. It only sizes the initial tail read of the footer, see `Parquet::ReadOptions::footer_size_hint`.
+    /// Not serialized: a cluster worker that gets the object from the initiator does not have it.
+    std::optional<size_t> footer_size_hint;
     /// Retry request after short pause
     CommandInTaskResponse command;
 

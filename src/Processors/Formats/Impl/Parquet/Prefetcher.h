@@ -65,6 +65,14 @@ public:
     /// Pass-through read from the underlying ReadBuffer.
     void readSync(char * to, size_t n, size_t offset);
 
+    /// Retains a chunk of the file that was already read to parse the footer, so that a range that is
+    /// registered later and lies fully inside the chunk (notably the Column Index and the Offset Index, which
+    /// are just below the footer) is served from this copy instead of being read again.
+    /// `data` points at `length` bytes that are the file bytes [file_offset, file_offset + length).
+    /// Does nothing if the whole file is in memory already or `length` is 0.
+    /// Must be called at most once, before `finalizeRanges`, and from one thread.
+    void retainTail(const char * data, size_t length, size_t file_offset);
+
     size_t getFileSize() const { return file_size; }
     bool isLocalFile() const { return is_local_file; }
 
@@ -196,6 +204,12 @@ private:
     std::deque<RangeSet> range_sets;
 
     std::atomic<bool> ranges_finalized {false};
+
+    /// The chunk retained by `retainTail`: file bytes [retained_tail_start, retained_tail_end), empty if nothing
+    /// is retained. Written once before any range is finalized, read-only afterwards, so needs no locking.
+    PaddedPODArray<char> retained_tail;
+    size_t retained_tail_start = 0;
+    size_t retained_tail_end = 0;
 
     /// (One mutex for all tasks because it's not used frequently.)
     std::mutex exception_mutex;

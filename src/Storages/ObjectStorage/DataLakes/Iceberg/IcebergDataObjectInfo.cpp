@@ -21,6 +21,10 @@
 #include <Core/AntalyaProtocol.h>
 #include <Core/ProtocolDefines.h>
 
+#if USE_PARQUET
+#include <Processors/Formats/Impl/Parquet/ReadCommon.h>
+#endif
+
 namespace DB::ErrorCodes
 {
 extern const int NOT_IMPLEMENTED;
@@ -75,6 +79,47 @@ String computePartitionId(const Row & partition_key_value)
 
 #if USE_AVRO
 
+#if USE_PARQUET
+namespace
+{
+
+/// Estimates the size of the footer of a Parquet data file from its manifest entry, to size the initial tail read
+/// (see `Parquet::ReadOptions::footer_size_hint`). Returns nullopt for other file formats.
+std::optional<size_t> estimateParquetFooterSizeFromManifest(const Iceberg::ParsedManifestFileEntry & entry)
+{
+    if (Poco::toUpper(entry.file_format) != "PARQUET")
+        return std::nullopt;
+
+    /// The number of columns: manifests list statistics only for the columns that the writer tracks,
+    /// so take the larger of the available per-column maps.
+    const size_t num_columns = std::max(entry.columns_infos.size(), entry.value_bounds.size());
+    if (num_columns == 0)
+        return std::nullopt;
+
+    /// The footer repeats the min/max statistics of every column in every row group. The row groups are not in
+    /// the manifest. A writer closes a row group at a size limit (128 MiB by default in Iceberg, which is what
+    /// the Spark and Java writers use) or at a row count limit (1M rows by default in ClickHouse), so take
+    /// the larger count that follows from the file size and from the number of rows.
+    constexpr size_t assumed_row_group_bytes = 128ul << 20;
+    constexpr size_t assumed_row_group_rows = 1ul << 20;
+    const size_t file_size = static_cast<size_t>(std::max<Int64>(entry.file_size_in_bytes, 0));
+    const size_t record_count = static_cast<size_t>(std::max<Int64>(entry.record_count, 0));
+    const size_t num_row_groups = std::max<size_t>(
+        {1, (file_size + assumed_row_group_bytes - 1) / assumed_row_group_bytes, (record_count + assumed_row_group_rows - 1) / assumed_row_group_rows});
+
+    size_t bounds_bytes = 0;
+    for (const auto & [_, bounds] : entry.value_bounds)
+    {
+        for (const Field * bound : {&bounds.first, &bounds.second})
+            bounds_bytes += bound->getType() == Field::Types::String ? bound->safeGet<String>().size() : sizeof(UInt64);
+    }
+
+    return Parquet::estimateParquetFooterSize(num_columns, num_row_groups, bounds_bytes);
+}
+
+}
+#endif
+
 IcebergDataObjectInfo::IcebergDataObjectInfo(
     Iceberg::ProcessedManifestFileEntryPtr data_manifest_file_entry_,
     const String & metadata_path_,
@@ -100,6 +145,10 @@ IcebergDataObjectInfo::IcebergDataObjectInfo(
     , resolved_storage(std::move(resolved_storage_))
 {
     chassert(resolved_key_.empty() == (resolved_storage == nullptr));
+
+#if USE_PARQUET
+    relative_path_with_metadata.footer_size_hint = estimateParquetFooterSizeFromManifest(*data_manifest_file_entry_->parsed_entry);
+#endif
 }
 
 IcebergDataObjectInfo::IcebergDataObjectInfo(const RelativePathWithMetadata & path_)
