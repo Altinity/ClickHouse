@@ -443,6 +443,13 @@ public:
     /// DDL does not depend on the setting at attach time.
     String url_overridden_by_base_setting;
 
+    /// The Iceberg `table-uuid` a catalog has already returned for this table together with its metadata
+    /// location, empty if unknown. It is set only by a `DataLakeCatalog` database. The Iceberg metadata
+    /// layer uses it to key the metadata files cache for the very first metadata read, whose uuid
+    /// otherwise could only be learned by reading that file. It does not take part in the resolution
+    /// of the metadata file, which is why it is not an `iceberg_metadata_table_uuid` setting.
+    String catalog_iceberg_table_uuid;
+
 protected:
     void checkFormat() const;
 

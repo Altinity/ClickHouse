@@ -2541,7 +2541,10 @@ bool RestCatalog::getTableMetadataImpl(
     }
 
     if (!table_uuid.empty())
+    {
         result.setTableUUID(table_uuid);
+        result.setIcebergTableUUID(table_uuid);
+    }
 
     return true;
 }
