@@ -831,7 +831,7 @@ void S3ObjectStorage::pinConditionalOpsGenerationDialect(bool expect_generation_
     pinned_generation_dialect.store(expect_generation_tokens ? 1 : 0);
 }
 
-std::optional<bool> S3ObjectStorage::isBucketVersioningEnabled(const ObjectStorageControlRequest & control_request) const
+IObjectStorage::BucketVersioningStatus S3ObjectStorage::getBucketVersioningStatus(const ObjectStorageControlRequest & control_request) const
 {
     S3::GetBucketVersioningRequest request;
     request.SetBucket(uri.bucket);
@@ -850,10 +850,33 @@ std::optional<bool> S3ObjectStorage::isBucketVersioningEnabled(const ObjectStora
         /// The caller only learns "unknown"; the reason is what the operator needs to act on.
         LOG_WARNING(log, "GetBucketVersioning for bucket `{}` failed: {} ({})",
             uri.bucket, outcome.GetError().GetMessage(), outcome.GetError().GetExceptionName());
-        return std::nullopt;
+        return BucketVersioningStatus::Unknown;
     }
 
-    return outcome.GetResult().GetStatus() == Aws::S3::Model::BucketVersioningStatus::Enabled;
+    switch (outcome.GetResult().GetStatus())
+    {
+        case Aws::S3::Model::BucketVersioningStatus::Enabled:
+            return BucketVersioningStatus::Enabled;
+        case Aws::S3::Model::BucketVersioningStatus::Suspended:
+            return BucketVersioningStatus::Suspended;
+        default:
+            return BucketVersioningStatus::Disabled;
+    }
+}
+
+std::optional<bool> S3ObjectStorage::isBucketVersioningEnabled(const ObjectStorageControlRequest & control_request) const
+{
+    switch (getBucketVersioningStatus(control_request))
+    {
+        case BucketVersioningStatus::Enabled:
+            return true;
+        case BucketVersioningStatus::Disabled:
+        case BucketVersioningStatus::Suspended:
+            return false;
+        case BucketVersioningStatus::Unknown:
+            return std::nullopt;
+    }
+    return std::nullopt;
 }
 
 static void putObjectsTagOnS3(

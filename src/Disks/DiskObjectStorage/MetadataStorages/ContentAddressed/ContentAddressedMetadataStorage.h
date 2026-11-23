@@ -659,6 +659,7 @@ private:
     /// See `PoolConfig::unsafe_remount_no_delay` -- the operator's explicit acceptance of an
     /// unobserved same-uuid reclaim.
     const bool cas_unsafe_remount_no_delay;
+    const bool cas_allow_versioning_suspended;
     /// Part-folder view cache settings. `cas_part_folder_cache_bytes == 0` disables retention.
     const uint64_t cas_part_folder_cache_bytes;
     const uint64_t cas_part_folder_cache_max_entries;
