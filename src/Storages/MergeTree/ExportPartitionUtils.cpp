@@ -104,7 +104,6 @@ namespace ErrorCodes
 
 namespace Setting
 {
-    extern const SettingsBool export_merge_tree_part_allow_lossy_cast;
 #if USE_AVRO
     extern const SettingsBool allow_insert_into_iceberg;
     extern const SettingsTimezone iceberg_partition_timezone;
@@ -303,12 +302,6 @@ namespace ExportPartitionUtils
         /// able to execute the task regardless of its own profile - otherwise an export silently
         /// stalls when the setting is only set at the query level.
         context_copy->setSetting("allow_insert_into_iceberg", true);
-
-        /// Reapply the initiator's lossy-cast decision (persisted in the manifest) so the
-        /// worker's schema revalidation honors the user's choice. Without this, a task
-        /// scheduled without the opt-in could still apply a lossy cast if the destination
-        /// schema drifts to a lossy target between scheduling and execution.
-        context_copy->setSetting("export_merge_tree_part_allow_lossy_cast", manifest.allow_lossy_cast);
 
         if (manifest.iceberg_partition_timezone)
         {
@@ -1069,24 +1062,6 @@ namespace
             return true;
         }
 
-        void verifyExportColumnCastIsSafe(
-            const ColumnWithTypeAndName & source_column,
-            const ColumnWithTypeAndName & destination_column,
-            const StorageID & destination_storage_id)
-        {
-            if (canBeSafelyCast(source_column.type, destination_column.type))
-                return;
-
-            throw Exception(ErrorCodes::INCOMPATIBLE_COLUMNS,
-                "Cannot export to {}: column '{}' requires a lossy cast from {} to {}, "
-                "which may change values. Set `export_merge_tree_part_allow_lossy_cast = 1` "
-                "to allow lossy casts during export.",
-                destination_storage_id.getFullTableName(),
-                destination_column.name,
-                source_column.type->getName(),
-                destination_column.type->getName());
-        }
-
         void verifyPartitionKeyColumn(
             const ColumnWithTypeAndName & source_column,
             const ColumnWithTypeAndName & destination_column,
@@ -1196,8 +1171,6 @@ namespace
             partition_key_owner_columns.insert(column_name);
         }
 
-        const bool allow_lossy_cast = context->getSettingsRef()[Setting::export_merge_tree_part_allow_lossy_cast];
-
         switch (schema_match_mode)
         {
             case MergeTreePartExportSchemaMatchMode::NAME: {
@@ -1222,10 +1195,6 @@ namespace
                             source_it->second,
                             destination_storage_id,
                             /*match_by_name=*/true);
-
-                    /// Lossy casts may silently change values, so reject them unless the user opts in.
-                    if (!allow_lossy_cast)
-                        verifyExportColumnCastIsSafe(source_column, destination_column, destination_storage_id);
                 }
                 break;
             }
@@ -1240,10 +1209,6 @@ namespace
                             i,
                             destination_storage_id,
                             /*match_by_name=*/false);
-
-                    /// Lossy casts may silently change values, so reject them unless the user opts in.
-                    if (!allow_lossy_cast)
-                        verifyExportColumnCastIsSafe(source_columns[i], destination_columns[i], destination_storage_id);
                 }
                 break;
             }

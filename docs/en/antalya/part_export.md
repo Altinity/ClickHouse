@@ -50,7 +50,7 @@ SETTINGS allow_experimental_export_merge_tree_part = 1
 Source and destination tables must support positional schema conversion. The following differences between the two schemas are allowed:
 
 - **Column names** may differ between source and destination for non-partition-key columns when `export_merge_tree_part_schema_match_mode = 'POSITION'` (the default) - columns are matched by position, similar to `INSERT INTO dest SELECT * FROM src`, not by name. Set `export_merge_tree_part_schema_match_mode = 'NAME'` to match columns by their exact, case-sensitive name instead, allowing destination columns to be declared in a different order than the source.
-- **Column types** may differ, as long as the source type is safely castable to the destination type. Set `export_merge_tree_part_allow_lossy_cast = 1` to also permit lossy casts.
+- **Column types** may differ: values are cast the way `INSERT ... SELECT` casts them, so a narrowing cast (for example `Int64` to `Int32`) wraps out-of-range values instead of failing. For an Apache Iceberg destination, the destination column types are those of the Iceberg schema (for example `int` is `Int32` and `date` is `Date32`), not the ones the destination table was declared with.
 - **`Tuple` element names** may differ if either the source or destination declares the tuple without named elements: an unnamed `Tuple` (e.g. `Tuple(Int32, Int32)`) is matched against the destination by element position and type only, not by name. For example, exporting from `t Tuple(Int32, Int32)` to `t Tuple(x Int32, y Int32)` is allowed as long as element types match positionally.
 
 The following requirements apply to the source and destination:
@@ -126,16 +126,6 @@ In case a table function is used as the destination, the schema can be omitted a
 - **Default**: `{part_name}_{checksum}`
 - **Description**: Pattern for the filename of the exported merge tree part. The `part_name` and `checksum` are calculated and replaced on the fly. Additional macros are supported.
 
-### `export_merge_tree_part_allow_lossy_cast` (Optional)
-
-- **Type**: `Bool`
-- **Default**: `false`
-- **Description**: Allow `EXPORT PART`/`EXPORT PARTITION` to apply lossy (non-value-preserving) casts when the source and destination column types differ. When disabled, an export that would require a lossy cast throws instead.
-
-  When exporting to Apache Iceberg, the partition value written to the metadata is derived from the source partition columns by casting them to the destination partition-field types and applying the destination partition transform — the same computation the exported data files use. This keeps the Iceberg metadata consistent with the data files.
-
-  **Warning:** A lossy cast on a partition column remains semantically truncating. For example, if a table is partitioned by an `Int64` column and some partition values do not fit into a destination `Int32` partition column, both the data files and the Iceberg metadata will contain the truncated `Int32` value (they agree with each other, but the original `Int64` value is lost). Such casts require `export_merge_tree_part_allow_lossy_cast = 1`.
-
 ### `export_merge_tree_part_schema_match_mode` (Optional)
 
 - **Type**: `MergeTreePartExportSchemaMatchMode`
@@ -154,7 +144,7 @@ In case a table function is used as the destination, the schema can be omitted a
   - `false` (default) - such a source column is rejected: the source and destination must match exactly. A mismatch throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`.
   - `true` - a source column without a corresponding destination column is dropped and not exported, instead of throwing. The destination having a column absent from the source is still always rejected.
 
-  Extra source columns are still read and evaluated (including `MATERIALIZED`/`ALIAS` columns, and any column another kept column's `ALIAS`/`MATERIALIZED` expression depends on) before being dropped, so this setting only changes which columns end up in the destination, not what is computed while reading the part. Type conversion and `export_merge_tree_part_allow_lossy_cast` are applied after columns are matched.
+  Extra source columns are still read and evaluated (including `MATERIALIZED`/`ALIAS` columns, and any column another kept column's `ALIAS`/`MATERIALIZED` expression depends on) before being dropped, so this setting only changes which columns end up in the destination, not what is computed while reading the part. Type conversion is applied after columns are matched.
 
 
 ## Examples

@@ -137,7 +137,6 @@ namespace Setting
     extern const SettingsUInt64 export_merge_tree_part_max_rows_per_file;
     extern const SettingsBool export_merge_tree_part_throw_on_pending_mutations;
     extern const SettingsBool export_merge_tree_part_throw_on_pending_patch_parts;
-    extern const SettingsBool export_merge_tree_part_allow_lossy_cast;
     extern const SettingsExportPartitionAllOnError export_merge_tree_partition_all_on_error;
     extern const SettingsString export_merge_tree_part_filename_pattern;
     extern const SettingsBool write_full_path_in_iceberg_metadata;
@@ -4077,7 +4076,6 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
     descriptor.file_already_exists_policy = query_context->getSettingsRef()[Setting::export_merge_tree_part_file_already_exists_policy].value;
     descriptor.filename_pattern = query_context->getSettingsRef()[Setting::export_merge_tree_part_filename_pattern].value;
     descriptor.write_full_path_in_iceberg_metadata = query_context->getSettingsRef()[Setting::write_full_path_in_iceberg_metadata];
-    descriptor.allow_lossy_cast = query_context->getSettingsRef()[Setting::export_merge_tree_part_allow_lossy_cast];
     descriptor.iceberg_partition_timezone = query_context->getSettingsRef()[Setting::iceberg_partition_timezone].toString();
     descriptor.schema_match_mode = query_context->getSettingsRef()[Setting::export_merge_tree_part_schema_match_mode].value;
     descriptor.ignore_extra_source_columns = query_context->getSettingsRef()[Setting::export_merge_tree_part_ignore_extra_source_columns].value;

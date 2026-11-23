@@ -67,7 +67,7 @@ TO TABLE [destination_database.]destination_table
 
 ## Requirements
 
-`EXPORT PARTITION` exports each part via the same mechanism as [`EXPORT PART`](/docs/en/antalya/part_export.md#requirements), so the source and destination tables must satisfy the same compatibility requirements. Columns are matched by position by default, or by their exact, case-sensitive name if `export_merge_tree_part_schema_match_mode = 'NAME'` is set, and column types may differ as long as they are safely castable (or `export_merge_tree_part_allow_lossy_cast = 1` is set). Beyond that, the following requirements apply:
+`EXPORT PARTITION` exports each part via the same mechanism as [`EXPORT PART`](/docs/en/antalya/part_export.md#requirements), so the source and destination tables must satisfy the same compatibility requirements. Columns are matched by position by default, or by their exact, case-sensitive name if `export_merge_tree_part_schema_match_mode = 'NAME'` is set, and column types may differ: values are cast the way `INSERT ... SELECT` casts them, so a narrowing cast (for example `Int64` to `Int32`) wraps out-of-range values instead of failing. For an Apache Iceberg destination, the destination column types are those of the Iceberg schema (for example `int` is `Int32` and `date` is `Date32`), not the ones the destination table was declared with. When exporting to Apache Iceberg, the partition value written to the metadata is derived from the source partition columns by casting them to the destination partition-field types and applying the destination partition transform, the same computation the exported data files use, so the metadata stays consistent with the data files. Beyond that, the following requirements apply:
 
 1. **Column count** - by default, every source column must have a corresponding destination column, and vice versa; a mismatch throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`. Which source column corresponds to which destination column is determined by `export_merge_tree_part_schema_match_mode`. Set `export_merge_tree_part_ignore_extra_source_columns = 1` to relax this in one direction: a source column without a corresponding destination column is dropped and not exported, instead of throwing. The destination having a column absent from the source is always rejected, regardless of this setting.
 2. **`PARTITION BY` expressions** - the whole source partition must land in a single destination partition. Identical expressions always satisfy this; otherwise the destination expression has to be computable from the values the source partition key pins, or be proven single-valued over the partition's min/max range. The same requirement applies to the partition fields and transforms of an Apache Iceberg destination. See [Source partition key compatibility](#source-partition-key-compatibility).
@@ -140,16 +140,6 @@ When the timeout is exceeded the task transitions to KILLED (same terminal state
 Notes:
 - Enforcement is best-effort: actual kill latency is bounded by one manifest-updater poll cycle (~30s) plus ZooKeeper watch propagation.
 
-### `export_merge_tree_part_allow_lossy_cast` (Optional)
-
-- **Type**: `Bool`
-- **Default**: `false`
-- **Description**: Allow `EXPORT PART`/`EXPORT PARTITION` to apply lossy (non-value-preserving) casts when the source and destination column types differ. When disabled, an export that would require a lossy cast throws instead.
-
-  When exporting to Apache Iceberg, the partition value written to the metadata is derived from the source partition columns by casting them to the destination partition-field types and applying the destination partition transform — the same computation the exported data files use. This keeps the Iceberg metadata consistent with the data files.
-
-  **Warning:** A lossy cast on a partition column remains semantically truncating. For example, if a table is partitioned by an `Int64` column and some partition values do not fit into a destination `Int32` partition column, both the data files and the Iceberg metadata will contain the truncated `Int32` value (they agree with each other, but the original `Int64` value is lost). Such casts require `export_merge_tree_part_allow_lossy_cast = 1`.
-
 ### `export_merge_tree_part_schema_match_mode` (Optional)
 
 - **Type**: `MergeTreePartExportSchemaMatchMode`
@@ -168,7 +158,7 @@ Notes:
   - `false` (default) - such a source column is rejected: the source and destination must match exactly. A mismatch throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`.
   - `true` - a source column without a corresponding destination column is dropped and not exported, instead of throwing. The destination having a column absent from the source is still always rejected.
 
-  Extra source columns are still read and evaluated (including `MATERIALIZED`/`ALIAS` columns, and any column another kept column's `ALIAS`/`MATERIALIZED` expression depends on) before being dropped, so this setting only changes which columns end up in the destination, not what is computed while reading the part. Type conversion and `export_merge_tree_part_allow_lossy_cast` are applied after columns are matched.
+  Extra source columns are still read and evaluated (including `MATERIALIZED`/`ALIAS` columns, and any column another kept column's `ALIAS`/`MATERIALIZED` expression depends on) before being dropped, so this setting only changes which columns end up in the destination, not what is computed while reading the part. Type conversion is applied after columns are matched.
 
 ## Examples
 

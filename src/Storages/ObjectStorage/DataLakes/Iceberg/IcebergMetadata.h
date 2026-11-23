@@ -151,8 +151,7 @@ public:
 
     bool supportsImport(ContextPtr) const override { return true; }
 
-    NamesAndTypesList getExportDestinationColumns(
-        const std::string & iceberg_metadata_json_string, const NamesAndTypesList & declared_columns) const override;
+    NamesAndTypesList getExportDestinationColumns(const std::string & iceberg_metadata_json_string, ContextPtr context) const override;
 
     SinkToStoragePtr import(
         std::shared_ptr<DataLake::ICatalog> catalog,

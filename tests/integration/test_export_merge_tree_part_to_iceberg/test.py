@@ -1235,8 +1235,7 @@ def test_export_part_with_castable_widening(cluster):
 def test_export_part_with_unsigned_to_wider_signed_widening(cluster):
     """An unsigned column exported into a strictly wider signed column (UInt8 -> Int16,
     UInt16 -> Int32, UInt32 -> Int64, Nullable(UInt8) -> Nullable(Int16)) is a lossless
-    cast, so it is accepted without export_merge_tree_part_allow_lossy_cast and the
-    maximum values of the source types round-trip unchanged."""
+    cast, and the maximum values of the source types round-trip unchanged."""
     node = cluster.instances["node1"]
     sfx = unique_suffix()
     mt = f"mt_unsigned_widen_{sfx}"
@@ -1264,8 +1263,7 @@ def test_export_part_with_unsigned_to_wider_signed_widening(cluster):
 
 def test_export_part_unsigned_partition_column_widened_to_signed(cluster):
     """A partition column that is unsigned in the source (year UInt16) and a strictly wider
-    signed integer in the destination (year Int32) passes the lossy-cast gate without the
-    opt-in, and the partition value is preserved."""
+    signed integer in the destination (year Int32) is exported, and the partition value is preserved."""
     node = cluster.instances["node1"]
     sfx = unique_suffix()
     mt = f"mt_unsigned_pcol_{sfx}"
@@ -1289,43 +1287,9 @@ def test_export_part_unsigned_partition_column_widened_to_signed(cluster):
     node.query(f"DROP TABLE IF EXISTS {iceberg}")
 
 
-@pytest.mark.parametrize(
-    "source_type,destination_type",
-    [("UInt16", "Int16"), ("UInt32", "Int32"), ("UInt64", "Int64")],
-)
-def test_export_part_unsigned_to_same_size_signed_rejected_without_optin(cluster, source_type, destination_type):
-    """An unsigned column exported into a signed column of the same size is lossy (values above
-    the signed maximum wrap), so it is rejected synchronously with INCOMPATIBLE_COLUMNS unless
-    export_merge_tree_part_allow_lossy_cast is set."""
-    node = cluster.instances["node1"]
-    sfx = unique_suffix()
-    mt = f"mt_unsigned_same_size_{sfx}"
-    iceberg = f"iceberg_unsigned_same_size_{sfx}"
-
-    make_mt(node, mt, f"id {source_type}, year Int32", "year")
-    make_iceberg_s3(node, iceberg, f"id {destination_type}, year Int32", "year")
-
-    node.query(f"INSERT INTO {mt} VALUES (1, 2020)")
-    part_2020 = get_part(node, mt, "2020")
-
-    error = node.query_and_get_error(
-        f"ALTER TABLE {mt} EXPORT PART '{part_2020}' TO TABLE {iceberg} "
-        f"SETTINGS allow_experimental_export_merge_tree_part = 1, "
-        f"allow_experimental_insert_into_iceberg = 1"
-    )
-    assert "INCOMPATIBLE_COLUMNS" in error, f"Expected INCOMPATIBLE_COLUMNS, got: {error!r}"
-    assert "lossy cast" in error, f"Expected 'lossy cast' in error, got: {error!r}"
-
-    count = int(node.query(f"SELECT count() FROM {iceberg}").strip())
-    assert count == 0, f"Expected no rows after a rejected export, got {count}"
-
-    node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
-    node.query(f"DROP TABLE IF EXISTS {iceberg}")
-
-
 def test_export_part_with_castable_narrowing_values_fit(cluster):
-    """A lossy narrowing (id Int64 -> Int32) succeeds once the user opts in via
-    export_merge_tree_part_allow_lossy_cast."""
+    """A narrowing cast (id Int64 -> Int32) is applied like `INSERT ... SELECT` applies it, so values that fit
+    round-trip unchanged."""
     node = cluster.instances["node1"]
     sfx = unique_suffix()
     mt = f"mt_narrow_fit_{sfx}"
@@ -1337,7 +1301,7 @@ def test_export_part_with_castable_narrowing_values_fit(cluster):
     node.query(f"INSERT INTO {mt} VALUES (1, 2020), (2, 2020)")
     part_2020 = get_part(node, mt, "2020")
 
-    export_part(node, mt, part_2020, iceberg, "export_merge_tree_part_allow_lossy_cast = 1")
+    export_part(node, mt, part_2020, iceberg)
     wait_for_export_part(node, mt, part_2020)
 
     count = int(node.query(f"SELECT count() FROM {iceberg}").strip())
@@ -1358,8 +1322,7 @@ def test_export_part_with_castable_narrowing_values_fit(cluster):
 
 def test_export_part_runtime_cast_failure_propagates_async(cluster):
     """A String value that cannot be parsed as the destination Int32 passes the
-    synchronous lossy-cast gate (with export_merge_tree_part_allow_lossy_cast = 1) but
-    fails at runtime in the async worker; the failure surfaces in system.part_log and
+    synchronous schema check but fails at runtime in the async worker; the failure surfaces in system.part_log and
     Iceberg is left empty.
 
     (Integer overflow is not used because the internal cast uses CastType::nonAccurate,
@@ -1376,7 +1339,7 @@ def test_export_part_runtime_cast_failure_propagates_async(cluster):
     node.query(f"INSERT INTO {mt} VALUES ('not a number', 2020)")
     part_2020 = get_part(node, mt, "2020")
 
-    export_part(node, mt, part_2020, iceberg, "export_merge_tree_part_allow_lossy_cast = 1")
+    export_part(node, mt, part_2020, iceberg)
 
     exception = wait_for_failed_export_part(node, mt, part_2020)
     assert exception, (
