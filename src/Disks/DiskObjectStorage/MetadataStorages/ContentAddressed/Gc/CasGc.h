@@ -13,6 +13,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Common/Logger.h>
 #include <atomic>
 #include <exception>
@@ -259,6 +260,10 @@ struct RefScanSummary
     std::map<UInt128, RefTxnId> checkpoint_observations;
     /// Listed ids absent from the `RoundInput` catalog cut are inert dead-life debris.
     size_t dead_life_debris = 0;
+    /// Fingerprint of all `(key, etag)` pairs seen by `enumerateRefPrefix()`, used by the idle
+    /// short-circuit when every listed key carried a backend ETag (`stream_etags_complete == true`).
+    uint64_t stream_fingerprint = 0;
+    bool stream_etags_complete = true;
 };
 
 class RefPlan;
@@ -579,7 +584,9 @@ private:
     /// the one round-wide destructive verdict when it exists; DEFER passes suppression because it has
     /// no folded frontier verdict, which takes one page. This helper owns only janitor I/O and phase
     /// metrics, never lifecycle transitions or the hot stream walk plan.
-    void runNamespaceJanitor(
+    /// Returns `true` if any pending janitor work, dead-life debris, non-empty cursor, leak, or
+    /// anomaly remains (or if the pass threw).
+    bool runNamespaceJanitor(
         const GcState & leased_state, bool suppress_destructive, uint64_t cleanup_evidence_rows);
 
     /// The janitor's `RemoveWriteOnce`: one job per `bulkDeleteChunkKeys` keys on the GC I/O pool, waited for
@@ -1056,9 +1063,38 @@ private:
     /// leader (after a steal, or a process restart) starts empty, which only delays fencing an
     /// already-dead mount by one extra round (safe: never fences early).
     MountObservationMap mount_obs;
+    /// Leader-local cache of terminal (`gc_fenced` / clean-release) mount ETags so `computeHeartbeatFloor`
+    /// skips per-slot GETs for unchanged terminal slots.
+    MountTerminalCache mount_terminal_cache;
     /// Srids `computeHeartbeatFloor` already warned about for a lease length different from ours.
     /// In-memory: a new leader names each mismatched holder once more.
     std::set<String> lease_mismatch_warned;
+
+    /// Per-round cache for `readFoldSeal` (cleared on exit of `runRegularRound`) so a single round
+    /// never reads the same immutable `(generation, attempt)` fold seal multiple times.
+    struct RoundFoldSealCache
+    {
+        uint64_t generation = 0;
+        uint64_t attempt = 0;
+        std::optional<CasFoldSeal> seal;
+    };
+    bool round_seal_cache_active_ = false;
+    std::optional<RoundFoldSealCache> round_seal_cache_;
+    uint64_t round_seal_reads_ = 0;
+
+    /// Leader-local steady-state idle baseline recorded after a settled DEFER round with zero
+    /// changed shards, no pending catalog lifecycle transitions, and a clean janitor sweep.
+    /// When the next round sees the same `(snap_generation, snap_attempt)`, unchanged catalog ETag,
+    /// unchanged `cas/ns/stream/` fingerprint, and `!graduationDue`, it skips drain, walk-plan, and
+    /// janitor re-scans and does not force periodic empty folds at `gc_fold_max_defer_rounds`.
+    struct IdleBaseline
+    {
+        uint64_t snap_generation = 0;
+        uint64_t snap_attempt = 0;
+        Etag catalog_etag;
+        uint64_t stream_fingerprint = 0;
+    };
+    std::optional<IdleBaseline> idle_baseline_;
 
     /// Throttle for the orphan sweep's retention rollup. The premise retains on any pass whose epochs are
     /// not closed-and-folded, so an unconditional `LOG_INFO` would repeat the same sentence for as long as

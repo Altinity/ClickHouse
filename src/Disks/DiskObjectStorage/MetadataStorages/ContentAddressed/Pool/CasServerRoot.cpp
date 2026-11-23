@@ -1344,7 +1344,8 @@ void warnOnceIfHolderLeaseDiffers(
 HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64_t now_ms,
                                      const std::function<uint64_t()> & mono_ms_fn,
                                      uint64_t observer_lease_ms, uint64_t cadence_ms, MountObservationMap & obs,
-                                     std::set<String> & lease_mismatch_warned)
+                                     std::set<String> & lease_mismatch_warned,
+                                     MountTerminalCache * terminal_cache)
 {
     HeartbeatFloor floor;
     /// Taken before any read: it can confirm that a token held, never date a sighting.
@@ -1367,6 +1368,28 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
         const String srid = key.substr(prefix.size(), key.size() - prefix.size() - mount_suffix.size());
         seen_srids.insert(srid);
 
+        /// Fast path: a terminal slot (`gc_fenced` or clean release) whose `LIST` ETag matches our
+        /// previous observation cannot have changed, so skip the per-slot GET completely.
+        if (terminal_cache && listed.etag)
+        {
+            if (const auto cached = terminal_cache->find(srid); cached != terminal_cache->end()
+                && cached->second.etag == *listed.etag)
+            {
+                if (cached->second.gc_fenced)
+                {
+                    ++floor.already_fenced;
+                    obs.erase(srid);
+                    return true;
+                }
+                if (cached->second.clean_release)
+                {
+                    ++floor.terminated;
+                    obs.erase(srid);
+                    return true;
+                }
+            }
+        }
+
         /// One decision per re-read: a refused fence-out re-enters this lambda with the body the
         /// holder's own renewal installed, and the observation check below then sees the new
         /// incarnation and restarts the window -- which counts the slot `live` and declines the write.
@@ -1378,6 +1401,8 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
                 if (!observed)
                 {
                     obs.erase(srid);
+                    if (terminal_cache)
+                        terminal_cache->erase(srid);
                     return std::nullopt;   /// raced away (deleted) — nothing to classify
                 }
 
@@ -1387,14 +1412,21 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
                 {
                     ++floor.already_fenced;
                     obs.erase(srid);   /// terminal — no further observation needed
+                    if (terminal_cache)
+                        terminal_cache->insert_or_assign(srid, CachedMountSlot{observed->etag, /*gc_fenced=*/true, /*clean_release=*/false});
                     return std::nullopt;
                 }
                 if (m.isCleanRelease())
                 {
                     ++floor.terminated;
                     obs.erase(srid);   /// terminal — no further observation needed
+                    if (terminal_cache)
+                        terminal_cache->insert_or_assign(srid, CachedMountSlot{observed->etag, /*gc_fenced=*/false, /*clean_release=*/true});
                     return std::nullopt;
                 }
+
+                if (terminal_cache)
+                    terminal_cache->erase(srid);
 
                 warnOnceIfHolderLeaseDiffers(srid, m, observer_lease_ms, lease_mismatch_warned);
                 threshold_ms = mountObservationThresholdMs(observer_lease_ms, declaredMountLeaseMs(m), cadence_ms);
@@ -1428,6 +1460,9 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
             ++floor.fenced_now;
             floor.fenced_srids.push_back(srid);
             obs.erase(srid);
+            if (terminal_cache)
+                terminal_cache->insert_or_assign(
+                    srid, CachedMountSlot{std::get<Committed>(fenced_out).etag, /*gc_fenced=*/true, /*clean_release=*/false});
             LOG_INFO(getLogger("CasHeartbeatFloor"),
                 "CAS GC fenced out mount lease for content-addressed server root {} at "
                 "wall-clock ms {}: its write incarnation held unchanged for >= {} ms on the GC "
@@ -1447,6 +1482,8 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
     /// stay in both maps forever on a long-lived leader.
     std::erase_if(obs, [&](const auto & entry) { return !seen_srids.contains(entry.first); });
     std::erase_if(lease_mismatch_warned, [&](const String & s) { return !seen_srids.contains(s); });
+    if (terminal_cache)
+        std::erase_if(*terminal_cache, [&](const auto & entry) { return !seen_srids.contains(entry.first); });
 
     return floor;
 }

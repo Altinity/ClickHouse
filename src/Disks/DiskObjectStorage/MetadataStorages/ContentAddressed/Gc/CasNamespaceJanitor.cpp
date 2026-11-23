@@ -106,6 +106,9 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liven
     bool page_decided = !ambiguous && !suppress_deletes;
     std::vector<WriteOnceKey> dead_stream_keys;
 
+    if (ambiguous || !cursor.empty() || !page.next_cursor.empty())
+        result.has_pending_work = true;
+
     for (const ListedKey & listed : page.keys)
     {
         std::optional<NamespaceLifePhysicalId> life_id;
@@ -137,6 +140,8 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liven
             result.anomalies.push_back(listed.key + ": unrecognized namespace object key");
             continue;
         }
+        if (!ambiguous && !catalog_cut.life_index.resolve(*life_id))
+            result.has_pending_work = true;
         if (ambiguous || suppress_deletes || catalog_cut.life_index.resolve(*life_id))
             continue;
 
@@ -218,6 +223,8 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liven
     /// An unpublished page is listed again, so its failed keys are not leaked yet.
     if (!published)
         result.leaked = 0;
+    if (result.leaked > 0 || !result.anomalies.empty() || result.deleted > 0)
+        result.has_pending_work = true;
     return result;
 }
 
