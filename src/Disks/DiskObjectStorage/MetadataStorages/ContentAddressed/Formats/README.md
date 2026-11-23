@@ -41,8 +41,8 @@ The manifest sweep schedule uses the existing `manifest_sweep_cursor` and one ne
 timestamp, `orphan_manifest_sweep_completed_at_ms`, encoded as a decimal string. A nonempty cursor
 means that a traversal is in progress across rounds and leaders; an empty cursor means that no
 traversal is in progress. A zero completion timestamp means unknown or never recorded, so an empty
-cursor permits an immediate traversal. Legacy state without the timestamp reads it as zero. The
-completion timestamp is sampled near the `gc/state` commit and changes only when an accepted page
+cursor permits a traversal on the next ordinary fold. Legacy state without the timestamp reads it
+as zero. The completion timestamp is sampled near the `gc/state` commit and changes only when an accepted page
 reaches EOF. It does not mean that all later manifest body deletions succeeded. A zero LIST budget
 disables the sweep without clearing the cursor or completion timestamp.
 

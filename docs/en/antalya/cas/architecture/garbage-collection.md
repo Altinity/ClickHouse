@@ -230,7 +230,7 @@ phase 5 and builds a new in-degree snapshot; `defer` skips generation constructi
 - **Fails the round if:** the plan-building seal read reports an invalid adopted seal
 - **Observability:** phase row `defer_decision`; metrics `changed_shards` (despite the name, the
   number of changed namespace-life rows), `namespaces_seen`, `ref_log_keys_listed`,
-  `run_orphan_manifest_sweep`, `orphan_manifest_sweep_requires_fold`, `orphan_manifest_sweep_active`, and
+  `run_orphan_manifest_sweep`, `orphan_manifest_sweep_active`, and
   `orphan_manifest_sweep_waiting_for_clock`
 
 The plan has one row per admitted catalog life (`Live` or `Removing`; `Creating` excluded), joining
@@ -238,29 +238,23 @@ its last folded position, its greatest listed `_log` position, and the keys late
 is *changed* when the listed `_log` is newer than the last folded position. Phase 4 chooses `fold`
 if any of: changed rows ≥ `gc_fold_threshold` (default 1); an adopted shard has a published pending
 delete; an adopted shard has a condemned blob due to graduate
-(`oldest_nonpending_condemn_round < round + 1`); `orphan_manifest_sweep_requires_fold` is true; or
+(`oldest_nonpending_condemn_round < round + 1`); or
 `gc_fold_max_defer_rounds` (default 8)
 consecutive defers were reached. Both thresholds are internal `PoolConfig` fields, not disk
 settings. On `defer`, one suppressed namespace-janitor page runs (phase 16's work) and the round
 returns without a commit. On `fold`, phase 6 reuses this plan and the same `LIST`.
 
-`run_orphan_manifest_sweep` requests a new or continued traversal according to
-`cas_orphan_manifest_sweep_interval_sec`. Its first attempt forces a fold even on an idle pool.
-`orphan_manifest_sweep_requires_fold` reports when that request prevents an otherwise idle round
-from deferring. It does not mean that the sweep page was planned or any manifest was deleted.
+`run_orphan_manifest_sweep` makes the next page eligible inside an ordinary fold according to
+`cas_orphan_manifest_sweep_interval_sec`. Fold timing follows the changed-row, graduation and
+bounded-defer conditions above. An idle pool defers eight invocations by default before each fold,
+including the first page and every continuation page. Interval `0` permits a page on every ordinary
+fold. A nonempty cursor permits continuation without another interval wait.
 `orphan_manifest_sweep_active` is an observation derived from a nonempty accepted
 `manifest_sweep_cursor`; it is not a separate field in `gc/state`.
-After a suppressed attempt is committed, a leader-local marker names the newly adopted generation.
-A fold with a requested sweep saves its adopted parent generation before preparing the next
-generation. If planning the page, writing the fold seal, pruning old generations or encoding the next
-state throws, a scope guard records that saved generation in the marker. The exception propagates
-without committing sweep progress. The guard is disabled immediately before sending the round's
-state `CAS`, so a failed or conflicting commit adds no deferral.
-While that generation remains current, `orphan_manifest_sweep_requires_fold` is false and ordinary
-bounded defer applies. A fold started by any other trigger still plans the requested sweep when its
-safety gates permit it. A committed non-suppressed fold clears the marker, so successful active pages keep
-forcing the next fold. A new generation, rebuild or fresh `Gc` instance does not inherit the old
-generation's suppression of forced folds. No retry timestamp or marker is added to `gc/state`.
+Suppression and failures before the state commit preserve the accepted cursor and completion time.
+Exceptions propagate, and the next ordinary fold retries the requested page when its safety gates
+permit it. The same fold cadence applies after a successful page, restart or rebuild. Cursor and
+completion changes become authoritative through the round's state `CAS`.
 
 ## Phase 5 — parent seal read {#phase-5-parent-seal-read}
 
@@ -722,18 +716,18 @@ same object is the only other writer. Outside the round, `SYSTEM CAS GC REBUILD`
 baseline with a `CAS` of its own.
 
 The orphan-sweep cursor and completion timestamp control pacing, not deletion authority. A nonempty
-cursor denotes an unfinished traversal; its next page can run without waiting for the interval.
+cursor denotes an unfinished traversal; its next page can run on the next ordinary fold without an interval wait.
 An empty cursor means no traversal is in progress. At EOF, the round records a completion time
 sampled near commit in UTC milliseconds; `0` means unknown or never recorded. Legacy state without
-this timestamp resumes a nonempty cursor or permits an immediate first traversal for an empty
-cursor. The reader ignores the former `orphan_manifest_sweep_active` and
+this timestamp resumes a nonempty cursor or permits a first traversal for an empty cursor on the next
+ordinary fold. The reader ignores the former `orphan_manifest_sweep_active` and
 `orphan_manifest_sweep_started_at_ms` keys in three-field state. The intermediate three-field
 reader cannot read completion-only state, so rollback to it is unsupported. Renewal and takeover
 preserve the cursor and timestamp; rebuild resets both.
 
 A zero clock sample near commit preserves the previous completion timestamp, including an unknown
 value of `0`. The round still adopts the page's cursor through the same state `CAS`. If the page
-reaches EOF and the completion time remains unknown, another traversal is immediately eligible.
+reaches EOF and the completion time remains unknown, another traversal can start on the next ordinary fold.
 A later EOF with a positive clock sample records a known completion time and restores interval
 pacing. A conflicting state `CAS` adopts neither the cursor nor the timestamp.
 

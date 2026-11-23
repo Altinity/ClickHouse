@@ -352,9 +352,9 @@ uint64_t retiredLogicalSize(ObjectKind kind, uint64_t object_size, uint64_t blob
 }
 
 bool shouldDeferRound(size_t changed_shards, bool graduation_due, uint64_t rounds_since_last_fold,
-                      uint64_t fold_threshold, uint64_t fold_max_defer_rounds, bool orphan_manifest_sweep_requires_fold)
+                      uint64_t fold_threshold, uint64_t fold_max_defer_rounds)
 {
-    if (graduation_due || orphan_manifest_sweep_requires_fold)
+    if (graduation_due)
         return false;
     if (changed_shards >= fold_threshold)
         return false;
@@ -925,8 +925,6 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         store->poolConfig().manifest_sweep_list_budget_keys, orphan_manifest_sweep_decision_at_ms);
     const bool run_orphan_manifest_sweep = orphan_manifest_sweep_decision == OrphanManifestSweepDecision::StartSweep
         || orphan_manifest_sweep_decision == OrphanManifestSweepDecision::ContinueSweep;
-    const bool orphan_manifest_sweep_requires_fold = run_orphan_manifest_sweep
-        && orphan_manifest_sweep_forced_fold_suppression_generation != state.snap_generation;
     {
         GcPhaseTimer t(phase_sink, "defer_decision");
         const bool graduation_due = graduationDue(state, new_round);
@@ -936,7 +934,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         const size_t changed = walk_plan->changedRows();
         defer_round = shouldDeferRound(changed, graduation_due, rounds_since_last_fold_,
                                        store->poolConfig().gc_fold_threshold,
-                                       store->poolConfig().gc_fold_max_defer_rounds, orphan_manifest_sweep_requires_fold);
+                                       store->poolConfig().gc_fold_max_defer_rounds);
         uint64_t ref_log_keys = 0;
         for (const auto & [scanned_life, ids] : ref_scan.logs_by_life)
             ref_log_keys += ids.size();
@@ -946,7 +944,6 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         t.metric("ref_keys_listed", ref_scan.keys.size());
         t.metric("graduation_due", graduation_due ? 1 : 0);
         t.metric("run_orphan_manifest_sweep", run_orphan_manifest_sweep ? 1 : 0);
-        t.metric("orphan_manifest_sweep_requires_fold", orphan_manifest_sweep_requires_fold ? 1 : 0);
         t.metric("orphan_manifest_sweep_active", state.manifest_sweep_cursor.empty() ? 0 : 1);
         t.metric("orphan_manifest_sweep_waiting_for_clock", orphan_manifest_sweep_decision == OrphanManifestSweepDecision::SkipUntilIntervalElapsed
             && orphan_manifest_sweep_decision_at_ms < state.orphan_manifest_sweep_completed_at_ms ? 1 : 0);
@@ -1006,18 +1003,6 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         runNamespaceJanitor(state, /*suppress_destructive=*/true, /*cleanup_evidence_rows=*/0);
         return report;   /// no fold, no pre-CAS deletes, no gc/state CAS — sealed generation stays pinned
     }
-
-    /// `fold` changes `state.snap_generation` before commit, so a failed preparation must use the
-    /// adopted parent generation when pacing the next idle sweep attempt.
-    const uint64_t adopted_generation = state.snap_generation;
-    const int exceptions_at_entry = std::uncaught_exceptions();
-    bool gc_state_commit_started = false;
-    SCOPE_EXIT({
-        if (run_orphan_manifest_sweep
-            && !gc_state_commit_started
-            && std::uncaught_exceptions() > exceptions_at_entry)
-            orphan_manifest_sweep_forced_fold_suppression_generation = adopted_generation;
-    });
 
     /// Emit that the round's single pass begins.
     EventEmitter{*store}.emit([&](CasEvent & e)
@@ -1353,11 +1338,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         next.manifest_sweep_cursor = folded.orphan_sweep.next_cursor;
         updateOrphanManifestSweepSchedule(next, orphan_manifest_sweep_decision, folded.orphan_sweep.wrapped, now_ms_fn());
     }
-    const String state_key = layout.gcStateKey();
-    const String state_body = encodeGcState(next);
-    /// A failed or conflicting state CAS must not add retry deferral, including an unknown outcome.
-    gc_state_commit_started = true;
-    WriteResult commit = op.replace(state_key, state_body, *state_etag, Retry::standard());
+    WriteResult commit = op.replace(layout.gcStateKey(), encodeGcState(next), *state_etag,
+                                    Retry::standard());
     if (const auto * conflict = std::get_if<Conflict>(&commit))
     {
         /// A refused precondition whose resolve read settled nothing proves only that this commit did
@@ -1372,10 +1354,6 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     }
     state_etag = orThrow(std::move(commit), "CAS gc round commit");
     state = std::move(next);
-    if (run_orphan_manifest_sweep && suppress_destructive)
-        orphan_manifest_sweep_forced_fold_suppression_generation = state.snap_generation;
-    else
-        orphan_manifest_sweep_forced_fold_suppression_generation.reset();
     report.round = state.round;
     round_commit_timer->metric("round", report.round);
     round_commit_timer->metric("generation", generation);

@@ -269,26 +269,26 @@ counters are unaffected, except for a shard whose log an earlier attempt of the 
 
 ### Orphan-manifest sweep schedule {#orphan-manifest-sweep-schedule}
 
-The first eligible traversal starts without waiting. Once started, it continues in bounded pages
-without waiting for `cas_orphan_manifest_sweep_interval_sec` between successful pages. The interval
+The first eligible traversal starts on the next ordinary GC fold. Once started, it continues in bounded
+pages on subsequent ordinary folds without waiting for `cas_orphan_manifest_sweep_interval_sec`
+between successful pages. The interval
 starts after the traversal's completion is committed. Completion means reaching the end of the key
 space, not that every later manifest-body deletion succeeded. Repeated `SYSTEM CAS GC RUN` commands
 respect the same schedule. Setting the interval to `0` allows another traversal on the next eligible
-round; setting the `LIST` budget to `0` pauses progress.
+fold; setting the `LIST` budget to `0` pauses progress. Fold timing follows ref-log changes, due blob
+graduation and the ordinary bounded deferral. An idle pool defers eight invocations by default before
+each fold, including folds that start or continue a traversal.
 
 A zero wall-clock sample near commit allows page progress while preserving the previous completion
-timestamp. If no completion time is known, the next traversal can start immediately. A later
+timestamp. If no completion time is known, the next traversal can start on the next ordinary fold. A later
 completed traversal with a positive clock sample establishes the interval again.
 
 When destructive work is suppressed, the traversal's cursor and timestamps remain unchanged.
-After a suppressed fold is committed, or a requested sweep's fold fails before the round's state
-`CAS` is sent, idle retries on the same adopted generation use the existing bounded fold cadence:
-up to eight deferred invocations by default, then another fold. This includes failures while
-planning the page, writing the fold seal or pruning old generations. The exception still fails the
-round without advancing the traversal's cursor or timestamps. A failed or conflicting round-state
-`CAS` adds no deferral.
-Ref-log changes and due blob graduation can force
-a fold sooner. A new leader may make an immediate attempt. These retry controls are internal
+An exception while planning the page, writing the fold seal or pruning old generations fails the
+round without committing traversal progress. A conflicting round-state `CAS` also leaves that
+progress uncommitted. After an unknown write outcome, the next invocation reads `gc/state` to
+determine the accepted cursor. The next ordinary fold resumes from that cursor. Ref-log changes
+and due blob graduation can cause that fold to run sooner. The fold thresholds are internal
 `PoolConfig` fields, not additional disk settings.
 
 Normal blob reclamation and cleanup of manifests whose owners were removed keep their own GC rules;

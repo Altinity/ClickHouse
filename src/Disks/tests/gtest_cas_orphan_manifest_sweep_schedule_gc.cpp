@@ -128,24 +128,41 @@ void expectSameSchedule(const GcState & actual, const GcState & expected)
 
 }
 
-TEST(CASOrphanManifestSweepScheduleGc, DueForcesIdleFold)
+TEST(CASOrphanManifestSweepScheduleGc, IdleSweepFollowsOrdinaryFoldCadence)
 {
-    ScheduleFixture f(1000, 3600, 1000);
-    EXPECT_FALSE(f.run().deferred);
-    EXPECT_EQ(f.metric("defer_decision", "orphan_manifest_sweep_requires_fold"), 1);
-    EXPECT_EQ(f.state().orphan_manifest_sweep_completed_at_ms, 1000);
-}
-
-TEST(CASOrphanManifestSweepScheduleGc, ContinueForcesIdleFold)
-{
-    ScheduleFixture f(1, 3600, 1000);
-    f.addKeys();
-    ASSERT_TRUE(f.run().acquired_lease);
-    ASSERT_FALSE(f.state().manifest_sweep_cursor.empty());
-    const auto report = f.run();
-    ASSERT_TRUE(report.acquired_lease);
-    EXPECT_FALSE(report.deferred);
-    EXPECT_TRUE(f.state().manifest_sweep_cursor.empty());
+    for (const uint64_t interval : {0, 3600})
+    {
+        SCOPED_TRACE(interval);
+        ScheduleFixture f(1, interval, 8);
+        f.addKeys();
+        for (size_t page = 0; page < 3; ++page)
+        {
+            SCOPED_TRACE(page);
+            if (page == 1)
+                f.now = 1001;
+            if (page == 2)
+                f.now = 1001 + interval * 1000;
+            const auto adopted = f.state();
+            f.backend->resetCounts();
+            for (size_t tick = 0; tick < 8; ++tick)
+            {
+                const auto deferred = f.run();
+                ASSERT_TRUE(deferred.acquired_lease);
+                ASSERT_TRUE(deferred.deferred);
+                EXPECT_EQ(f.metric("defer_decision", "run_orphan_manifest_sweep"), 1);
+                EXPECT_EQ(f.state().snap_generation, adopted.snap_generation);
+                expectSameSchedule(f.state(), adopted);
+            }
+            EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 0);
+            const auto folded = f.run();
+            ASSERT_TRUE(folded.acquired_lease);
+            ASSERT_FALSE(folded.deferred);
+            EXPECT_EQ(f.state().snap_generation, adopted.snap_generation + 1);
+            EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 1);
+            EXPECT_EQ(f.state().manifest_sweep_cursor.empty(), page == 1);
+            EXPECT_EQ(f.state().orphan_manifest_sweep_completed_at_ms, page == 0 ? 0 : 1001);
+        }
+    }
 }
 
 TEST(CASOrphanManifestSweepScheduleGc, WaitingPreservesOldDeferDecision)
@@ -155,14 +172,8 @@ TEST(CASOrphanManifestSweepScheduleGc, WaitingPreservesOldDeferDecision)
     state.orphan_manifest_sweep_completed_at_ms = 1000;
     f.setState(state);
     EXPECT_TRUE(f.run().deferred);
-    EXPECT_EQ(f.metric("defer_decision", "orphan_manifest_sweep_requires_fold"), 0);
+    EXPECT_EQ(f.metric("defer_decision", "run_orphan_manifest_sweep"), 0);
     expectSameSchedule(f.state(), state);
-}
-
-TEST(CASOrphanManifestSweepScheduleGc, DisabledDoesNotForceFold)
-{
-    ScheduleFixture f(0, 3600, 1000);
-    EXPECT_TRUE(f.run().deferred);
 }
 
 TEST(CASOrphanManifestSweepScheduleGc, TwoPagesDoNotWaitAnHour)
@@ -258,7 +269,7 @@ TEST(CASOrphanManifestSweepScheduleGc, SuppressedRoundPreservesSchedule)
 
 TEST(CASOrphanManifestSweepScheduleGc, ZeroClockCommitsPagesAndResumesInterval)
 {
-    ScheduleFixture f(1, 3600, 1000);
+    ScheduleFixture f(1);
     f.addKeys();
     f.backend->before_manifest_list = [&] { f.now = 0; };
     ASSERT_NO_THROW(f.run());
@@ -285,15 +296,15 @@ TEST(CASOrphanManifestSweepScheduleGc, ZeroClockCommitsPagesAndResumesInterval)
 
     f.backend->resetCounts();
     ++f.now;
-    EXPECT_TRUE(f.run().deferred);
-    EXPECT_EQ(f.state().snap_generation, timed.snap_generation);
+    EXPECT_FALSE(f.run().deferred);
+    EXPECT_EQ(f.state().snap_generation, timed.snap_generation + 1);
     expectSameSchedule(f.state(), timed);
     EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 0);
 }
 
 TEST(CASOrphanManifestSweepScheduleGc, ZeroClockPreservesPreviousCompletion)
 {
-    ScheduleFixture f(1, 3600, 1000);
+    ScheduleFixture f(1);
     ASSERT_TRUE(f.run().acquired_lease);
     const auto baseline = f.state();
     ASSERT_EQ(baseline.orphan_manifest_sweep_completed_at_ms, 1000);
@@ -311,7 +322,7 @@ TEST(CASOrphanManifestSweepScheduleGc, ZeroClockPreservesPreviousCompletion)
     EXPECT_TRUE(completed.manifest_sweep_cursor.empty());
     EXPECT_EQ(completed.orphan_manifest_sweep_completed_at_ms, 1000);
     f.backend->resetCounts();
-    EXPECT_TRUE(f.run().deferred);
+    EXPECT_FALSE(f.run().deferred);
     expectSameSchedule(f.state(), completed);
     EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 0);
 
@@ -322,19 +333,19 @@ TEST(CASOrphanManifestSweepScheduleGc, ZeroClockPreservesPreviousCompletion)
     ++f.now;
     ASSERT_NO_THROW(f.run());
     const auto timed = f.state();
-    EXPECT_EQ(timed.snap_generation, baseline.snap_generation + 4);
+    EXPECT_EQ(timed.snap_generation, baseline.snap_generation + 5);
     EXPECT_TRUE(timed.manifest_sweep_cursor.empty());
     EXPECT_EQ(timed.orphan_manifest_sweep_completed_at_ms, 3601001);
     f.backend->resetCounts();
     ++f.now;
-    EXPECT_TRUE(f.run().deferred);
+    EXPECT_FALSE(f.run().deferred);
     expectSameSchedule(f.state(), timed);
     EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 0);
 }
 
 TEST(CASOrphanManifestSweepScheduleGc, ZeroClockWithZeroIntervalPreservesCompletion)
 {
-    ScheduleFixture f(1000, 0, 1000);
+    ScheduleFixture f(1000, 0);
     ASSERT_TRUE(f.run().acquired_lease);
     const auto baseline = f.state();
     ASSERT_EQ(baseline.orphan_manifest_sweep_completed_at_ms, 1000);
@@ -355,7 +366,7 @@ TEST(CASOrphanManifestSweepScheduleGc, ZeroClockWithZeroIntervalPreservesComplet
 
 TEST(CASOrphanManifestSweepScheduleGc, ZeroClockLostCasDoesNotAdvanceCursor)
 {
-    ScheduleFixture f(1, 3600, 1000);
+    ScheduleFixture f(1);
     f.addKeys();
     f.backend->before_manifest_list = [&] { f.now = 0; };
     bool fired = false;
@@ -514,6 +525,8 @@ TEST(CASOrphanManifestSweepScheduleGc, ListOnlyCanCompleteTraversal)
 TEST(CASOrphanManifestSweepScheduleGc, SuppressedSweepUsesBoundedDeferral)
 {
     ScheduleFixture f(1000, 3600, 2);
+    for (size_t tick = 0; tick < 2; ++tick)
+        ASSERT_TRUE(f.run(UniversePolicy::StageA_Suppressed).deferred);
     const auto first = f.run(UniversePolicy::StageA_Suppressed);
     ASSERT_TRUE(first.acquired_lease);
     ASSERT_FALSE(first.deferred);
@@ -545,6 +558,8 @@ TEST(CASOrphanManifestSweepScheduleGc, FailedSweepUsesBoundedDeferral)
     ScheduleFixture f(1000, 3600, 2);
     const RootNamespace ns{"test/checkpoint"};
     casAdmitRecoverableEntry(*f.backend, f.store->layout(), ns);
+    for (size_t tick = 0; tick < 2; ++tick)
+        ASSERT_TRUE(f.run().deferred);
     ASSERT_TRUE(f.run().acquired_lease);
     const auto adopted = f.state();
     ASSERT_EQ(adopted.orphan_manifest_sweep_completed_at_ms, 1000);
@@ -557,6 +572,8 @@ TEST(CASOrphanManifestSweepScheduleGc, FailedSweepUsesBoundedDeferral)
         throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "test sweep list failure");
     };
     f.backend->before_manifest_list = fail_list;
+    for (size_t tick = 0; tick < 2; ++tick)
+        ASSERT_TRUE(f.run().deferred);
     EXPECT_THROW(f.run(), DB::Exception);
     ASSERT_EQ(attempts, 1);
 
@@ -569,7 +586,6 @@ TEST(CASOrphanManifestSweepScheduleGc, FailedSweepUsesBoundedDeferral)
             const auto deferred = f.run();
             ASSERT_TRUE(deferred.acquired_lease);
             ASSERT_TRUE(deferred.deferred);
-            EXPECT_EQ(f.metric("defer_decision", "orphan_manifest_sweep_requires_fold"), 0);
             EXPECT_EQ(f.state().snap_generation, adopted.snap_generation);
             expectSameSchedule(f.state(), adopted);
         }
@@ -577,7 +593,6 @@ TEST(CASOrphanManifestSweepScheduleGc, FailedSweepUsesBoundedDeferral)
         EXPECT_EQ(f.backend->getCount(checkpoint_key), 0);
         EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 0);
         EXPECT_THROW(f.run(), DB::Exception);
-        EXPECT_EQ(f.metric("defer_decision", "orphan_manifest_sweep_requires_fold"), 0);
         EXPECT_EQ(attempts, cycle + 2);
         EXPECT_GT(f.backend->getCount(checkpoint_key), 0);
         EXPECT_EQ(f.state().snap_generation, adopted.snap_generation);
@@ -588,6 +603,8 @@ TEST(CASOrphanManifestSweepScheduleGc, FailedSweepUsesBoundedDeferral)
 TEST(CASOrphanManifestSweepScheduleGc, SealWriteFailureUsesBoundedDeferral)
 {
     ScheduleFixture f(1000, 3600, 2);
+    for (size_t tick = 0; tick < 2; ++tick)
+        ASSERT_TRUE(f.run().deferred);
     ASSERT_TRUE(f.run().acquired_lease);
     const auto adopted = f.state();
     f.now = 3601000;
@@ -600,6 +617,8 @@ TEST(CASOrphanManifestSweepScheduleGc, SealWriteFailureUsesBoundedDeferral)
             std::make_exception_ptr(DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "test seal write failure")));
     };
     f.backend->resetCounts();
+    for (size_t tick = 0; tick < 2; ++tick)
+        ASSERT_TRUE(f.run().deferred);
     EXPECT_THROW(f.run(), DB::Exception);
     ASSERT_FALSE(seal_key.empty());
     EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 1);
@@ -631,6 +650,8 @@ TEST(CASOrphanManifestSweepScheduleGc, PruneFailureUsesBoundedDeferral)
     ScheduleFixture f(1000, 3600, 2);
     for (size_t generation = 0; generation < 3; ++generation)
     {
+        for (size_t tick = 0; tick < 2; ++tick)
+            ASSERT_TRUE(f.run().deferred);
         ASSERT_TRUE(f.run().acquired_lease);
         f.now += 3600000;
     }
@@ -644,6 +665,8 @@ TEST(CASOrphanManifestSweepScheduleGc, PruneFailureUsesBoundedDeferral)
         seal_key = f.store->layout().foldSealKey(leased.snap_generation + 1, leased.lease.seq);
     };
     f.backend->resetCounts();
+    for (size_t tick = 0; tick < 2; ++tick)
+        ASSERT_TRUE(f.run().deferred);
     EXPECT_THROW(f.run(), DB::Exception);
     EXPECT_TRUE(f.backend->fail_list_prefix.empty());
     EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 1);
@@ -674,52 +697,7 @@ TEST(CASOrphanManifestSweepScheduleGc, PruneFailureUsesBoundedDeferral)
     EXPECT_EQ(f.state().orphan_manifest_sweep_completed_at_ms, f.now);
 }
 
-TEST(CASOrphanManifestSweepScheduleGc, FailedSweepForcedFoldSuppressionIsClearedByFoldWhileWaiting)
-{
-    ScheduleFixture f(1000, 3600, 2);
-    f.backend->before_manifest_list = []
-    {
-        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "test sweep list failure");
-    };
-    EXPECT_THROW(f.run(), DB::Exception);
-
-    auto state = f.state();
-    state.orphan_manifest_sweep_completed_at_ms = 1000;
-    f.setState(state);
-    const RootNamespace ns{"test/changed_while_waiting"};
-    const ManifestRef ref{1, 1, 1};
-    writeManifestRaw(*f.backend, f.store->layout(), ns, ref, {});
-    publishCommittedTransition(*f.backend, f.store->layout(), ns, "table", std::nullopt, ref);
-    f.now = 1001;
-    ASSERT_FALSE(f.run().deferred);
-    EXPECT_EQ(f.metric("defer_decision", "run_orphan_manifest_sweep"), 0);
-
-    f.now = 3601000;
-    const auto due = f.run();
-    ASSERT_TRUE(due.acquired_lease);
-    EXPECT_FALSE(due.deferred);
-    EXPECT_EQ(f.metric("defer_decision", "orphan_manifest_sweep_requires_fold"), 1);
-    EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 1);
-}
-
-TEST(CASOrphanManifestSweepScheduleGc, FailedSweepForcedFoldSuppressionIsLeaderLocal)
-{
-    ScheduleFixture f(1000, 3600, 2);
-    f.backend->before_manifest_list = []
-    {
-        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "test sweep list failure");
-    };
-    EXPECT_THROW(f.run(), DB::Exception);
-    f.makeGc();
-
-    const auto retried = f.run();
-    ASSERT_TRUE(retried.acquired_lease);
-    EXPECT_FALSE(retried.deferred);
-    EXPECT_EQ(f.metric("defer_decision", "orphan_manifest_sweep_requires_fold"), 1);
-    EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 1);
-}
-
-TEST(CASOrphanManifestSweepScheduleGc, SuccessfulPageAfterFailureRestoresImmediateContinuation)
+TEST(CASOrphanManifestSweepScheduleGc, SuccessfulPagesAfterFailureFollowOrdinaryFoldCadence)
 {
     ScheduleFixture f(1, 3600, 2);
     f.addKeys();
@@ -727,6 +705,8 @@ TEST(CASOrphanManifestSweepScheduleGc, SuccessfulPageAfterFailureRestoresImmedia
     {
         throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "test sweep list failure");
     };
+    for (size_t tick = 0; tick < 2; ++tick)
+        ASSERT_TRUE(f.run().deferred);
     EXPECT_THROW(f.run(), DB::Exception);
     for (size_t tick = 0; tick < 2; ++tick)
         ASSERT_TRUE(f.run().deferred);
@@ -734,6 +714,8 @@ TEST(CASOrphanManifestSweepScheduleGc, SuccessfulPageAfterFailureRestoresImmedia
     ASSERT_TRUE(recovered.acquired_lease);
     ASSERT_FALSE(recovered.deferred);
     ASSERT_FALSE(f.state().manifest_sweep_cursor.empty());
+    for (size_t tick = 0; tick < 2; ++tick)
+        ASSERT_TRUE(f.run().deferred);
     const auto continued = f.run();
     ASSERT_TRUE(continued.acquired_lease);
     EXPECT_FALSE(continued.deferred);
@@ -748,6 +730,8 @@ TEST(CASOrphanManifestSweepScheduleGc, ChangedRefsBypassFailedSweepDeferral)
     {
         throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "test sweep list failure");
     };
+    for (size_t tick = 0; tick < 2; ++tick)
+        ASSERT_TRUE(f.run().deferred);
     EXPECT_THROW(f.run(), DB::Exception);
     const RootNamespace ns{"test/changed"};
     const ManifestRef ref{1, 1, 1};
@@ -793,6 +777,8 @@ TEST(CASOrphanManifestSweepScheduleGc, CorruptCheckpointLimitsFoldReads)
     ASSERT_TRUE(checkpoint.has_value());
     orThrow((*op).replace(checkpoint_key, "invalid checkpoint", checkpoint->etag, Retry::once()), "test corrupt checkpoint");
     f.now = 3601000;
+    for (size_t tick = 0; tick < 2; ++tick)
+        ASSERT_TRUE(f.run().deferred);
     const auto suppressed = f.run();
     ASSERT_TRUE(suppressed.acquired_lease);
     ASSERT_FALSE(suppressed.deferred);
@@ -827,6 +813,8 @@ TEST(CASOrphanManifestSweepScheduleGc, RepairedCheckpointResumesSweepAtBoundedFo
     const RootNamespace ns{"test/empty_checkpoint"};
     const auto & layout = f.store->layout();
     casAdmitRecoverableEntry(*f.backend, layout, ns);
+    for (size_t tick = 0; tick < 2; ++tick)
+        ASSERT_TRUE(f.run().deferred);
     ASSERT_TRUE(f.run().acquired_lease);
     ASSERT_EQ(f.state().orphan_manifest_sweep_completed_at_ms, 1000);
 
@@ -836,6 +824,8 @@ TEST(CASOrphanManifestSweepScheduleGc, RepairedCheckpointResumesSweepAtBoundedFo
     ASSERT_TRUE(checkpoint.has_value());
     orThrow((*op).replace(checkpoint_key, "invalid checkpoint", checkpoint->etag, Retry::once()), "test corrupt checkpoint");
     f.now = 3601000;
+    for (size_t tick = 0; tick < 2; ++tick)
+        ASSERT_TRUE(f.run().deferred);
     ASSERT_TRUE(f.run().acquired_lease);
     ASSERT_EQ(f.metric("orphan_sweep", "suppressed"), 1);
     const auto corrupted = (*op).read(checkpoint_key, Retry::once());
@@ -853,27 +843,11 @@ TEST(CASOrphanManifestSweepScheduleGc, RepairedCheckpointResumesSweepAtBoundedFo
     EXPECT_EQ(f.state().orphan_manifest_sweep_completed_at_ms, 3601000);
 }
 
-TEST(CASOrphanManifestSweepScheduleGc, SuccessfulPageRestoresImmediateContinuation)
-{
-    ScheduleFixture f(1, 0, 2);
-    f.addKeys();
-    ASSERT_TRUE(f.run(UniversePolicy::StageA_Suppressed).acquired_lease);
-    for (size_t tick = 0; tick < 2; ++tick)
-        ASSERT_TRUE(f.run().deferred);
-    const auto first = f.run();
-    ASSERT_TRUE(first.acquired_lease);
-    ASSERT_FALSE(first.deferred);
-    ASSERT_FALSE(f.state().manifest_sweep_cursor.empty());
-    const auto continued = f.run();
-    ASSERT_TRUE(continued.acquired_lease);
-    EXPECT_FALSE(continued.deferred);
-    EXPECT_TRUE(f.state().manifest_sweep_cursor.empty());
-    EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 2);
-}
-
 TEST(CASOrphanManifestSweepScheduleGc, ChangedRefsBypassSweepRetryDeferral)
 {
     ScheduleFixture f(1000, 3600, 2);
+    for (size_t tick = 0; tick < 2; ++tick)
+        ASSERT_TRUE(f.run(UniversePolicy::StageA_Suppressed).deferred);
     ASSERT_TRUE(f.run(UniversePolicy::StageA_Suppressed).acquired_lease);
     const RootNamespace ns{"test/changed"};
     const ManifestRef ref{1, 1, 1};
@@ -884,71 +858,4 @@ TEST(CASOrphanManifestSweepScheduleGc, ChangedRefsBypassSweepRetryDeferral)
     EXPECT_FALSE(changed.deferred);
     EXPECT_EQ(f.metric("defer_decision", "changed_shards"), 1);
     EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 1);
-}
-
-TEST(CASOrphanManifestSweepScheduleGc, RestartRetriesSuppressedSweepImmediately)
-{
-    ScheduleFixture f(1000, 3600, 2);
-    ASSERT_TRUE(f.run(UniversePolicy::StageA_Suppressed).acquired_lease);
-    f.makeGc();
-    const auto restarted = f.run();
-    ASSERT_TRUE(restarted.acquired_lease);
-    EXPECT_FALSE(restarted.deferred);
-    EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 1);
-}
-
-TEST(CASOrphanManifestSweepScheduleGc, NewGenerationRetriesSuppressedSweepImmediately)
-{
-    ScheduleFixture f(1, 3600, 2);
-    f.addKeys();
-    ASSERT_TRUE(f.run(UniversePolicy::StageA_Suppressed).acquired_lease);
-    const auto suppressed = f.state();
-    Gc other(f.store, UInt128(0xAC), [&] { return f.now; });
-    ASSERT_FALSE(other.runRegularRound({}, true).acquired_lease);
-    ++f.now;
-    ASSERT_TRUE(other.runRegularRound({}, true).acquired_lease);
-    ASSERT_GT(f.state().snap_generation, suppressed.snap_generation);
-    ASSERT_FALSE(f.state().manifest_sweep_cursor.empty());
-    ++f.now;
-    ASSERT_FALSE(f.run().acquired_lease);
-    ++f.now;
-    const auto resumed = f.run();
-    ASSERT_TRUE(resumed.acquired_lease);
-    EXPECT_FALSE(resumed.deferred);
-    EXPECT_TRUE(f.state().manifest_sweep_cursor.empty());
-    EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 2);
-}
-
-TEST(CASOrphanManifestSweepScheduleGc, RebuildRetriesSuppressedSweepImmediately)
-{
-    ScheduleFixture f(1000, 3600, 2);
-    ASSERT_TRUE(f.run(UniversePolicy::StageA_Suppressed).acquired_lease);
-    const auto suppressed = f.state();
-    ASSERT_TRUE(f.gc->rebuildBaseline(true).performed);
-    ASSERT_GT(f.state().snap_generation, suppressed.snap_generation);
-    const auto rebuilt = f.run();
-    ASSERT_TRUE(rebuilt.acquired_lease);
-    EXPECT_FALSE(rebuilt.deferred);
-    EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 1);
-}
-
-TEST(CASOrphanManifestSweepScheduleGc, LostCasDoesNotArmSweepRetryDeferral)
-{
-    ScheduleFixture f(1000, 3600, 2);
-    bool fired = false;
-    f.backend->before_round_commit = [&]
-    {
-        fired = true;
-        auto state = f.state();
-        ++state.lease.seq;
-        f.setState(state);
-    };
-    EXPECT_THROW(f.run(UniversePolicy::StageA_Suppressed), DB::Exception);
-    ASSERT_TRUE(fired);
-    EXPECT_EQ(f.state().snap_generation, 0);
-    const auto retried = f.run(UniversePolicy::StageA_Suppressed);
-    ASSERT_TRUE(retried.acquired_lease);
-    EXPECT_FALSE(retried.deferred);
-    EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 0);
-    EXPECT_EQ(f.state().orphan_manifest_sweep_completed_at_ms, 0);
 }
