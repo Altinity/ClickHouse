@@ -37,7 +37,7 @@ def cluster():
             with_nginx=True,
             stay_alive=True,
             with_installed_binary=True,
-            image="altinity/clickhouse-server",
+            image="clickhouse/clickhouse-server",
             tag=CLICKHOUSE_CI_MIN_TESTED_VERSION,
         )
         cluster.add_instance(

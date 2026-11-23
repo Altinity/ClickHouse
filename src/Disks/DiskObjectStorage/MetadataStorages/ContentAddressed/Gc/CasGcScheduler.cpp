@@ -233,8 +233,14 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
     /// discipline as `emit`: a throwing sink must never break GC. Cleared on the way out (on the
     /// exception path too), so it never outlives the locals it captures -- this guard is declared after
     /// them, so it is destroyed before them.
+    UInt64 keys_listed = 0;
     round_gc.setPhaseSink([&](const Cas::GcPhaseRecord & p)
     {
+        if (p.phase == "defer_decision")
+        {
+            if (const auto it = p.metrics.find("ref_keys_listed"); it != p.metrics.end())
+                keys_listed = it->second;
+        }
         Rec row = start;
         row.event_type = Rec::EventType::Phase;
         row.phase = p.phase;
@@ -284,6 +290,25 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
         fin.fence_outs = r.fence_outs;
         fin.anomalies = r.anomalies.size();
     };
+    /// A follower ticks every interval and a deferred round did no work, so neither is worth an `Information` line.
+    const auto log_finish = [&]
+    {
+        const char * outcome_name = nullptr;
+        switch (fin.outcome)
+        {
+            case Rec::Outcome::Success: outcome_name = "Success"; break;
+            case Rec::Outcome::Aborted: outcome_name = "Aborted"; break;
+            case Rec::Outcome::Failed: outcome_name = "Error"; break;
+            case Rec::Outcome::Stopped: outcome_name = "Stopped"; break;
+            case Rec::Outcome::Unknown:
+            case Rec::Outcome::NotALeader:
+            case Rec::Outcome::Deferred:
+                return;
+        }
+        LOG_INFO(log, "GC round finished: round={} outcome={} trigger={} duration_ms={} deleted={} condemned={} error_code={} keys_listed={}",
+            fin.round, outcome_name, fin.trigger == Rec::Trigger::Manual ? "Manual" : "Scheduled",
+            fin.duration_ms, fin.objects_deleted, fin.entries_condemned, fin.error_code, keys_listed);
+    };
     try
     {
         (void)round_gc.runRegularRound(std::move(on_lease_acquired), allow_steal, Cas::UniversePolicy::kDefault, &rep);
@@ -306,6 +331,7 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
         fin.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
         fin.profile_events = collect_profile_events();
+        log_finish();
         emit(fin);
         return rep;
     }
@@ -322,6 +348,7 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
         fin.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
         fin.profile_events = collect_profile_events();
+        log_finish();
         emit(fin);
         throw;
     }

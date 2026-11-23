@@ -69,7 +69,7 @@ public:
         return std::make_unique<DeltaLakeMetadataDeltaKernel>(object_storage_, configuration);
     }
 
-    std::optional<size_t> totalRows(ContextPtr) const override;
+    std::optional<size_t> totalRows(ContextPtr, const std::optional<DataLakeTableStateSnapshot> &) const override;
 
     std::optional<size_t> totalBytes(ContextPtr) const override;
 

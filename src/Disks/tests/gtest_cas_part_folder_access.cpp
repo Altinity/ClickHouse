@@ -273,7 +273,7 @@ TEST(CASPartFolderAccess, GetViewFailsClosedOnMissingBody)
     const auto id = publishPart(store, ns, "part_1", {inlineEntry("checksums.txt", "cs")});
 
     /// Physically delete the live manifest body (a protocol violation). Retention is off and the
-    /// decode cache is cold (promote reads the body through the backend, not the reader), so every
+    /// decode cache is cold (publishing reads nothing through the reader), so every
     /// getView mode reaches the reader's miss path: one GET, no HEAD, FILE_DOESNT_EXIST.
     deleteManifestBody(*backend, layout, id);
     backend->resetCounts();

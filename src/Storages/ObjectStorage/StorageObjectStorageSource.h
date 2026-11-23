@@ -174,9 +174,10 @@ protected:
         size_t max_block_size,
         FormatParserSharedResourcesPtr parser_shared_resources,
         FormatFilterInfoPtr format_filter_info,
-        bool need_only_count);
+        bool need_only_count,
+        bool prefetch_input_format = false);
 
-    ReaderHolder createReader();
+    ReaderHolder createReader(bool prefetch_input_format = false);
 
     std::future<ReaderHolder> createReaderAsync();
 
@@ -391,6 +392,10 @@ public:
         bool isArchive() const override { return true; }
 
         size_t fileSizeInArchive() const override { return file_info.uncompressed_size; }
+
+        /// Bucket splitting copies through `clone`. The base implementation slices to `ObjectInfo`
+        /// and drops the archive path, reader, and file info.
+        std::shared_ptr<ObjectInfo> clone() const override { return std::make_shared<ObjectInfoInArchive>(*this); }
 
         const ObjectInfoPtr archive_object;
         const std::string path_in_archive;

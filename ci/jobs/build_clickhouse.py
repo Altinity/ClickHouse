@@ -215,9 +215,23 @@ def upload_thinlto_cache(s3_path, flavour):
     print(
         f"ThinLTO cache archive: {os.path.getsize(thinlto_cache_archive) / (1 << 30):.1f} GiB"
     )
-    S3.copy_file_to_s3(
-        s3_path=s3_path, local_path=thinlto_cache_archive, with_rename=True
-    )
+    # The cache only speeds up the next build, so a failed upload must not fail this one.
+    # Retry once, since Hetzner timeouts are usually short.
+    attempts = 2
+    for attempt in range(1, attempts + 1):
+        try:
+            S3.copy_file_to_s3(
+                s3_path=s3_path, local_path=thinlto_cache_archive, with_rename=True
+            )
+            break
+        except Exception as e:
+            print(
+                f"WARNING: ThinLTO cache upload failed (attempt {attempt}/{attempts}): {e}"
+            )
+            if attempt < attempts:
+                Utils.sleep(60)
+    else:
+        print("WARNING: ThinLTO cache was not uploaded, the next build will be slower")
     os.remove(thinlto_cache_archive)
     return True
 

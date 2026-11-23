@@ -82,6 +82,8 @@ void checkDeletionVectorBlobReadLimits(Int64 length, std::optional<UInt64> expec
 void validateDeletionVectorEnvelope(const UInt8 * header, Int64 length);
 
 /// Deserialize a deletion-vector-v1 blob (magic + CRC wrapper + roaring bitmap payload).
+/// `expected_cardinality` may be omitted. Materialization is still capped at
+/// `PUFFIN_DV_MAX_MATERIALIZED_POSITIONS`.
 std::vector<UInt64> deserializeDeletionVectorV1Blob(std::string_view blob_bytes, std::optional<UInt64> expected_cardinality = std::nullopt);
 
 /// Read a deletion-vector-v1 blob from a Puffin file at the given offset and length.

@@ -20,6 +20,9 @@
                      unreferenced content drains within the test. -->
                 <cas_gc_enabled>1</cas_gc_enabled>
                 <cas_gc_interval_sec>1</cas_gc_interval_sec>
+                <!-- Kill-and-restart tests wait out the lease; a 30 s lease keeps that wait short. -->
+                <cas_mount_lease_ttl_ms>30000</cas_mount_lease_ttl_ms>
+                <cas_mount_renew_period_ms>10000</cas_mount_renew_period_ms>
             </disk_cas_dpm>
             <!-- Read-only window over the SAME pool for the read-only consumer (fsck). fsck refuses a
                  writable pool; a read-only disk takes no mount lease, so it can inspect the pool the

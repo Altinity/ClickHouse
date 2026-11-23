@@ -135,6 +135,7 @@ namespace Setting
     extern const SettingsMergeTreePartExportFileAlreadyExistsPolicy export_merge_tree_part_file_already_exists_policy;
     extern const SettingsUInt64 export_merge_tree_part_max_bytes_per_file;
     extern const SettingsUInt64 export_merge_tree_part_max_rows_per_file;
+    extern const SettingsUInt64 min_bytes_to_use_direct_io;
     extern const SettingsBool export_merge_tree_part_throw_on_pending_mutations;
     extern const SettingsBool export_merge_tree_part_throw_on_pending_patch_parts;
     extern const SettingsBool export_merge_tree_part_allow_lossy_cast;
@@ -1327,6 +1328,11 @@ QueryPipeline StorageMergeTree::updateLightweight(const MutationCommands & comma
     context_copy->setPartitionIdToMaxBlock(getStorageID().uuid, std::move(partition_id_to_max_block));
     /// Updates currently don't work with parallel replicas.
     context_copy->setSetting("max_parallel_replicas", Field(1));
+
+    /// A snapshot cached by `enable_shared_storage_snapshot_in_query` before the wait for committing
+    /// inserts above (e.g. by the validation of `IN` operands in `InterpreterUpdateQuery`) would hide
+    /// the parts committed during the wait from the update. See `StorageReplicatedMergeTree::updateLightweight`.
+    discardSharedStorageSnapshot(context_copy);
 
     auto [pipeline, patch_metadata] = updateLightweightImpl(commands, context_copy);
 
@@ -4076,6 +4082,7 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
     descriptor.iceberg_partition_timezone = query_context->getSettingsRef()[Setting::iceberg_partition_timezone].toString();
     descriptor.schema_match_mode = query_context->getSettingsRef()[Setting::export_merge_tree_part_schema_match_mode].value;
     descriptor.ignore_extra_source_columns = query_context->getSettingsRef()[Setting::export_merge_tree_part_ignore_extra_source_columns].value;
+    descriptor.min_bytes_to_use_direct_io = query_context->getSettingsRef()[Setting::min_bytes_to_use_direct_io];
 
     if (dest_storage->isDataLake())
     {

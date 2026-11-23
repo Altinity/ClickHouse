@@ -73,9 +73,9 @@ Ordered steps in `PartWriteTxn::ensureBlobPresent`:
 6. `BlobSource::beginPublication` consumes the shared, monotonic `publication_attempted` state
    before backend I/O. A lost response cannot re-enable verbatim copy on a later attempt.
 7. Retryable or ambiguous failures restart at `HEAD`: up to 8 attempts, each with a fresh envelope.
-   The engine starts no new attempt after the 90-second deadline, but an attempt already started can
+   The engine starts no new attempt after the configured request window (`cas_request_window_ms`, default 120 s), but an attempt already started can
    run longer: each creating request waits up to the disk's `request_timeout_ms`, and multipart part
-   uploads keep their own retries. A write can therefore take longer than 90 seconds before it
+   uploads keep their own retries. A write can therefore take longer than the request window before it
    fails with a retryable error. No dependency
    proof is recorded until a present body with a `Clean` marker was observed, or publication and
    metadata reconciliation completed.
@@ -99,8 +99,7 @@ Its control-adjusted sequence ratios are not a code-version delta; performance a
 blocked pending a matched before/after pair and explicit human acceptance. The
 [real-GCS result](/superpowers/cas/unconditional-blob-publication-live-results) likewise records
 deterministic coverage but no credentialed Google run. Release readiness remains blocked until the
-OAuth and HMAC groups pass against real GCS; ordinary `test_storage_s3` is also externally blocked
-by the unavailable `clickhouse/clickhouse-server:23.3.19.33.altinitystable` image.
+OAuth and HMAC groups pass against real GCS.
 
 ## Dedup and the identity primitive {#dedup-identity}
 

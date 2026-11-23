@@ -585,12 +585,12 @@ TEST(CASBootstrapOrdering, WritableOpenRaisesTheFloorForOwnerMoves)
         EXPECT_FALSE(pool->refMoveAllowed());
     }
     auto pool = Pool::open(backend, makeConfig());
-    EXPECT_EQ(pool->poolMeta().min_reader_generation, 2u);
+    EXPECT_EQ(pool->poolMeta().min_reader_generation, Pool::mount_reader_floor);
     EXPECT_TRUE(pool->refMoveAllowed());
     DB::Cas::tests::OperationForTest op(*backend);
     const auto stored = (*op).read(kPoolMetaKey, Retry::once());
     ASSERT_TRUE(stored.has_value());
-    EXPECT_EQ(decodePoolMeta(stored->bytes).min_reader_generation, 2u) << "the raise must be durable";
+    EXPECT_EQ(decodePoolMeta(stored->bytes).min_reader_generation, Pool::mount_reader_floor) << "the raise must be durable";
 }
 
 TEST(CASBootstrapOrdering, ReadOnlyOpenNeverRaisesTheFloor)
@@ -638,9 +638,9 @@ TEST(CASBootstrapOrdering, FailedMountLeavesTheFloorUnchanged)
     EXPECT_EQ(PoolMeta::createOrValidate(*op, Layout(cfg.pool_prefix), 256).min_reader_generation, 1u);
 }
 
-TEST(CASBootstrapOrdering, NewPoolStartsAtGenerationTwo)
+TEST(CASBootstrapOrdering, NewPoolStartsAtTheMountFloor)
 {
     auto backend = std::make_shared<RecordingBackend>();
     auto pool = Pool::open(backend, makeConfig());
-    EXPECT_EQ(pool->poolMeta().min_reader_generation, 2u);
+    EXPECT_EQ(pool->poolMeta().min_reader_generation, G_REF_CHAIN);
 }

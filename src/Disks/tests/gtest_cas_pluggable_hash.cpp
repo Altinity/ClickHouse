@@ -742,20 +742,20 @@ TEST(CASPoolMetaFloor, RaiseMinReaderGenerationIsMonotone)
 /// ============================================================================================
 /// CAS reader-generation gate (`CasFormat.h`'s `G_BUILD`). This test's assertions read `G_BUILD`
 /// itself rather than a hardcoded generation number, so a future bump does not silently make them
-/// false. A new pool starts at `G_REF_MOVE`, and hash admission never raises it past the
+/// false. A new pool starts at `G_REF_CHAIN`, and hash admission never raises it past the
 /// algorithm's own requirement. `decodePoolMeta` fail-closes BOTH on a FUTURE `min_reader_generation` AND on a BACKWARD pool whose header
 /// `compatibility_version` is below the format-generation baseline (see `CasPoolMetaFormat.cpp`).
-TEST(CASPluggableHash, ReaderGenerationFloorIsGenerationTwoAndGatesFailClosed)
+TEST(CASPluggableHash, ReaderGenerationFloorIsTheMountFloorAndGatesFailClosed)
 {
-    /// A new pool is stamped at generation 2, not at the build's read ceiling.
+    /// A new pool is stamped at the mount floor.
     {
         auto backend = std::make_shared<InMemoryBackend>();
         auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-        EXPECT_EQ(store->poolMeta().min_reader_generation, G_REF_MOVE);
+        EXPECT_EQ(store->poolMeta().min_reader_generation, G_REF_CHAIN);
 
         const auto meta_bytes = readAt(*backend, store->layout().poolMetaKey());
         ASSERT_TRUE(meta_bytes.has_value());
-        EXPECT_EQ(decodePoolMeta(meta_bytes->bytes).min_reader_generation, G_REF_MOVE);
+        EXPECT_EQ(decodePoolMeta(meta_bytes->bytes).min_reader_generation, G_REF_CHAIN);
     }
     /// FORWARD gate: a pool-meta carrying `min_reader_generation == G_BUILD + 1` (one generation past
     /// THIS build's floor) fails closed at open -- the startup gate (`decodePoolMeta`) rejects it.
