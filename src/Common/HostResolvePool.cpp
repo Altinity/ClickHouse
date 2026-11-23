@@ -232,32 +232,6 @@ HostResolver::LatencySnapshot HostResolver::getLatencySnapshot()
     return snapshot;
 }
 
-double HostResolver::getLatencyMs(const Poco::Net::IPAddress & address)
-{
-    std::lock_guard lock(mutex);
-
-    auto it = find(address);
-    if (it == records.end())
-        return 0;
-
-    return it->latency_ms_ewma;
-}
-
-double HostResolver::getMinLatencyMs()
-{
-    std::lock_guard lock(mutex);
-
-    double best = 0;
-    for (const auto & rec : records)
-    {
-        if (rec.failed || rec.latency_ms_ewma <= 0)
-            continue;
-        if (best == 0 || rec.latency_ms_ewma < best)
-            best = rec.latency_ms_ewma;
-    }
-    return best;
-}
-
 void HostResolver::setFail(const Poco::Net::IPAddress & address)
 {
     Poco::Timestamp now;

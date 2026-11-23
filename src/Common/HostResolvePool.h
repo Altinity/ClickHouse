@@ -131,15 +131,6 @@ public:
     /// when the address is unknown; only recomputes weights when latency-aware selection is on.
     void reportLatency(const Poco::Net::IPAddress & address, UInt64 microseconds);
 
-    /// Current latency EWMA (milliseconds) for an address, or 0 if unknown/not measured.
-    /// Used to pick the best pooled connection at dispatch time under latency-aware selection.
-    double getLatencyMs(const Poco::Net::IPAddress & address);
-
-    /// Smallest latency EWMA (milliseconds) across all currently-known, non-failed addresses
-    /// that have a measurement, or 0 if none. Used to decide whether reusing a slow pooled
-    /// connection is worse than opening a fresh one to the fastest known front-end.
-    double getMinLatencyMs();
-
     /// Consistent point-in-time snapshot of per-address latency EWMAs, captured under a single
     /// `mutex` acquisition before `EndpointConnectionPool` takes its own lock. Keeps the resolver
     /// mutex completely out of the endpoint pool critical section and gives non-measured endpoints
@@ -149,7 +140,7 @@ public:
         /// Sorted by `first` (`records` in `HostResolver` is sorted by `address`), containing only
         /// addresses with `latency_ms_ewma > 0`. Empty when no address has a measurement.
         std::vector<std::pair<Poco::Net::IPAddress, double>> entries;
-        /// Smallest EWMA across non-failed measured addresses (0 if none), matching `getMinLatencyMs`.
+        /// Smallest EWMA across non-failed measured addresses (0 if none).
         double min_non_failed_ms = 0;
 
         bool empty() const noexcept { return entries.empty(); }

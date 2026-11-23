@@ -35,7 +35,6 @@
 #include <Access/MemoryAccessStorage.h>
 #include <Common/PoolId.h>
 #include <Common/Exception.h>
-#include <Common/HostResolvePool.h>
 #include <base/errnoToString.h>
 #include <Common/Macros.h>
 #include <Common/Config/ConfigProcessor.h>
@@ -239,7 +238,6 @@ namespace ServerSetting
     extern const ServerSettingsUInt64 memory_worker_decay_adjustment_period_ms;
     extern const ServerSettingsBool memory_worker_use_cgroup;
     extern const ServerSettingsDouble memory_worker_rss_speculative_reserve_ratio;
-    extern const ServerSettingsBool http_latency_aware_host_selection;
     extern const ServerSettingsBool memory_worker_dynamic_hard_limit;
     extern const ServerSettingsString allowed_disks_for_table_engines;
     extern const ServerSettingsUInt32 listen_backlog;
@@ -476,8 +474,6 @@ void LocalServer::initialize(Poco::Util::Application & self)
         server_settings[ServerSetting::max_format_parsing_thread_pool_size],
         server_settings[ServerSetting::max_format_parsing_thread_pool_free_size],
         server_settings[ServerSetting::format_parsing_thread_pool_queue_size]);
-
-    HostResolver::setLatencyAwareSelection(server_settings[ServerSetting::http_latency_aware_host_selection]);
 
     /// See the explanation near the same line in Server.cpp: `uploadPendingBlobs` reaches this
     /// pool unconditionally once a `cas` disk commits a part, so every entry point

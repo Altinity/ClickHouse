@@ -844,25 +844,25 @@ TEST_F(ResolvePoolTest, LatencyEwma)
     const Poco::Net::IPAddress slow("127.0.0.2");
     const Poco::Net::IPAddress unknown("127.0.0.9");
 
-    ASSERT_EQ(0.0, resolver->getLatencyMs(fast));
-    ASSERT_EQ(0.0, resolver->getMinLatencyMs());
+    ASSERT_EQ(0.0, resolver->getLatencySnapshot().lookupLatencyMs(fast));
+    ASSERT_EQ(0.0, resolver->getLatencySnapshot().min_non_failed_ms);
 
     resolver->reportLatency(fast, 1000);
-    ASSERT_DOUBLE_EQ(1.0, resolver->getLatencyMs(fast));
+    ASSERT_DOUBLE_EQ(1.0, resolver->getLatencySnapshot().lookupLatencyMs(fast));
 
     /// EWMA with alpha = 0.2: 0.2 * 2 + 0.8 * 1.
     resolver->reportLatency(fast, 2000);
-    ASSERT_DOUBLE_EQ(1.2, resolver->getLatencyMs(fast));
+    ASSERT_DOUBLE_EQ(1.2, resolver->getLatencySnapshot().lookupLatencyMs(fast));
 
     resolver->reportLatency(slow, 10000);
-    ASSERT_DOUBLE_EQ(10.0, resolver->getLatencyMs(slow));
-    ASSERT_DOUBLE_EQ(1.2, resolver->getMinLatencyMs());
+    ASSERT_DOUBLE_EQ(10.0, resolver->getLatencySnapshot().lookupLatencyMs(slow));
+    ASSERT_DOUBLE_EQ(1.2, resolver->getLatencySnapshot().min_non_failed_ms);
 
     /// A zero sample and an unknown address are ignored.
     resolver->reportLatency(fast, 0);
     resolver->reportLatency(unknown, 5000);
-    ASSERT_DOUBLE_EQ(1.2, resolver->getLatencyMs(fast));
-    ASSERT_EQ(0.0, resolver->getLatencyMs(unknown));
+    ASSERT_DOUBLE_EQ(1.2, resolver->getLatencySnapshot().lookupLatencyMs(fast));
+    ASSERT_EQ(0.0, resolver->getLatencySnapshot().lookupLatencyMs(unknown));
 }
 
 TEST_F(ResolvePoolTest, LatencyAwareSelectionPrefersFastAddress)

@@ -1310,7 +1310,7 @@ TEST_F(ConnectionPoolTest, LatencyAwareDispatchExtractsFastestConnectionInPlace)
     {
         auto conn = pool->getConnection(timeouts, nullptr);
         Poco::Net::IPAddress ip(conn->getResolvedHost());
-        const double lat = mock_resolver->getLatencyMs(ip);
+        const double lat = mock_resolver->getLatencySnapshot().lookupLatencyMs(ip);
         ASSERT_GE(lat, prev_latency);
         prev_latency = lat;
         echoRequest("check", *conn);

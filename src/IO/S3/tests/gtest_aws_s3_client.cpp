@@ -2200,30 +2200,30 @@ TEST(IOTestAwsS3Client, LatencyAwareSelectionIgnoresNon2xxReadResponses)
 
     /// 500 and 503 on GET: must not record any latency sample.
     EXPECT_FALSE(sendGet().IsSuccess());
-    EXPECT_EQ(0.0, mock_resolver->getLatencyMs(server_ip));
+    EXPECT_EQ(0.0, mock_resolver->getLatencySnapshot().lookupLatencyMs(server_ip));
 
     EXPECT_FALSE(sendGet().IsSuccess());
-    EXPECT_EQ(0.0, mock_resolver->getLatencyMs(server_ip));
+    EXPECT_EQ(0.0, mock_resolver->getLatencySnapshot().lookupLatencyMs(server_ip));
 
     /// 404 and 403 on HEAD: must not record any latency sample either.
     EXPECT_FALSE(sendHead().IsSuccess());
-    EXPECT_EQ(0.0, mock_resolver->getLatencyMs(server_ip));
+    EXPECT_EQ(0.0, mock_resolver->getLatencySnapshot().lookupLatencyMs(server_ip));
 
     EXPECT_FALSE(sendHead().IsSuccess());
-    EXPECT_EQ(0.0, mock_resolver->getLatencyMs(server_ip));
+    EXPECT_EQ(0.0, mock_resolver->getLatencySnapshot().lookupLatencyMs(server_ip));
 
     /// 200 on HEAD: records a positive latency sample.
     EXPECT_TRUE(sendHead().IsSuccess());
-    const double ewma_after_200 = mock_resolver->getLatencyMs(server_ip);
+    const double ewma_after_200 = mock_resolver->getLatencySnapshot().lookupLatencyMs(server_ip);
     EXPECT_GT(ewma_after_200, 0.0);
 
     /// Seed a high EWMA and verify a fast 206 Partial Content on GET updates (lowers) it.
     mock_resolver->reportLatency(server_ip, 5'000'000); /// 5000 ms
-    const double ewma_seeded = mock_resolver->getLatencyMs(server_ip);
+    const double ewma_seeded = mock_resolver->getLatencySnapshot().lookupLatencyMs(server_ip);
     EXPECT_GT(ewma_seeded, 500.0);
 
     EXPECT_TRUE(sendGet().IsSuccess());
-    EXPECT_LT(mock_resolver->getLatencyMs(server_ip), ewma_seeded);
+    EXPECT_LT(mock_resolver->getLatencySnapshot().lookupLatencyMs(server_ip), ewma_seeded);
 }
 
 #endif
