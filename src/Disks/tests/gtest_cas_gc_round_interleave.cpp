@@ -712,10 +712,12 @@ public:
 
     /// Whether pass 2 of `round` walks the pass-2 hop's pair in name order, one right after the other. Pass 2 starts at
     /// index `round mod n` of the unfinished walks in name order. They are the pair, and for a relay whose first source
-    /// is dropped after that hop's round also that source, whose drop record the pass-2 round reads.
+    /// is dropped after its copy or after that hop's round also that source, whose drop record the pass-2 round reads:
+    /// a drop inside a round lands past that round's stops.
     bool passTwoWalksThePairInOrder(uint64_t round) const
     {
-        const bool three_walks = cell.hops == Hops::Relay && cell.drop == SourceDrop::AfterTheRound;
+        const bool three_walks = cell.hops == Hops::Relay
+            && (cell.drop == SourceDrop::AfterTheRound || cell.drop == SourceDrop::AfterTheCopy);
         const uint64_t walks = three_walks ? 3 : 2;
         /// The relay's first source sorts last when the destination is walked first, and first otherwise.
         const uint64_t first_of_the_pair = three_walks && !cell.at.destination_first ? 1 : 0;

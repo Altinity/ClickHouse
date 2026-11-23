@@ -7,6 +7,9 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include "cas_test_helpers.h"
 
+#include <base/scope_guard.h>
+
+#include <limits>
 #include <mutex>
 #include <set>
 
@@ -581,4 +584,297 @@ TEST(CASGCArithmeticIntake, WhollyOmittedNamespaceFoldsThroughAuthoritativeCheck
     EXPECT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{1, 3}));
     for (uint64_t i = 1; i <= 3; ++i)
         EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(i)), 1) << "blob " << i;
+}
+
+/// ===================== EACH LIFE'S STOP IS PLANNED BEFORE THE WALK =====================
+
+namespace
+{
+
+/// One round of `gc` and the metrics of its `fold_ref_intake` row.
+std::map<String, UInt64> runRoundReadingIntake(Gc & gc)
+{
+    std::map<String, UInt64> metrics;
+    gc.setPhaseSink([&](const GcPhaseRecord & record)
+    {
+        if (record.phase == "fold_ref_intake")
+            metrics = record.metrics;
+    });
+    SCOPE_EXIT({ gc.setPhaseSink({}); });
+    EXPECT_TRUE(gc.runRegularRound().acquired_lease);
+    return metrics;
+}
+
+/// The journal entries since it was cleared that name `key`, of `verb`.
+size_t requestsOn(const CountingBackend & backend, JournalVerb verb, const String & key)
+{
+    size_t n = 0;
+    for (const JournalEntry & entry : backend.journal())
+        n += entry.verb == verb && std::find(entry.keys.begin(), entry.keys.end(), key) != entry.keys.end();
+    return n;
+}
+
+size_t deletesSent(const CountingBackend & backend)
+{
+    size_t n = 0;
+    for (const JournalEntry & entry : backend.journal())
+        n += entry.verb == JournalVerb::Remove || entry.verb == JournalVerb::RemoveMany;
+    return n;
+}
+
+/// A seal at `id` whose body names `next_epoch` as the epoch the chain continues in.
+void writeSealToEpoch(Backend & backend, const Layout & layout, const RootNamespace & ns, const RefTxnId & id,
+                      uint64_t next_epoch)
+{
+    RefLogTxn txn;
+    txn.ns = ns.string();
+    txn.txn_id = id;
+    txn.ops = {epochSealOp()};
+    txn.next_epoch = next_epoch;
+    writeRefLogTxnRaw(backend, layout, txn);
+}
+
+}
+
+/// A seal names the epoch the chain continues in. Planning follows it to that epoch's head and never reads past
+/// the seal in the sealed epoch, even when the listing omits the whole new epoch.
+TEST(CASGCArithmeticIntake, ASealSendsThePlannerToTheHeadItsBodyNames)
+{
+    const RootNamespace ns{"00/aa@cas@"};
+    const auto sealedPool = [&](auto & backend, const Layout & layout, Gc & gc)
+    {
+        fixture::admitLive(*backend, layout, ns);
+        publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
+        publishAt(*backend, layout, ns, RefTxnId{1, 2}, "ref_2", 2, DB::UInt128(2));
+        writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+            .life_epoch = 1,
+            .committed_through = RefTxnId{1, 2},
+            .checkpoint_snapshot_id = std::nullopt,
+            .last_epoch_seal = std::nullopt,
+        });
+        ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+        ASSERT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{1, 2}));
+        writeSealToEpoch(*backend, layout, ns, RefTxnId{1, 3}, /*next_epoch=*/5);
+    };
+
+    {
+        SCOPED_TRACE("the head is present");
+        auto backend = std::make_shared<HintHoleBackendOn<CountingBackend>>();
+        auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+        const Layout & layout = store->layout();
+        Gc gc(store, kGc);
+        ASSERT_NO_FATAL_FAILURE(sealedPool(backend, layout, gc));
+        publishAt(*backend, layout, ns, RefTxnId{5, 1}, "ref_51", 51, DB::UInt128(51),
+                  /*birth=*/false, /*prev_epoch_seal=*/RefTxnId{1, 3});
+        publishAt(*backend, layout, ns, RefTxnId{5, 2}, "ref_52", 52, DB::UInt128(52));
+        backend->hide(layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{5, 1}));
+        backend->hide(layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{5, 2}));
+
+        backend->clearJournal();
+        const auto intake = runRoundReadingIntake(gc);
+        ASSERT_FALSE(intake.empty());
+        EXPECT_GT(backend->holesServed(), 0u);
+        EXPECT_EQ(requestsOn(*backend, JournalVerb::Read, layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, 4})), 0u)
+            << "a key past the seal in the sealed epoch was read";
+        EXPECT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{5, 2}));
+        EXPECT_EQ(intake.at("frontier_proven"), intake.at("frontier_namespaces"));
+        EXPECT_EQ(intake.at("absent_probes"), 1u);
+        EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(51)), 1) << "the head's owner edge was not folded";
+        EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(52)), 1);
+    }
+    {
+        SCOPED_TRACE("the head is absent");
+        auto backend = std::make_shared<HintHoleBackendOn<CountingBackend>>();
+        auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+        const Layout & layout = store->layout();
+        Gc gc(store, kGc);
+        ASSERT_NO_FATAL_FAILURE(sealedPool(backend, layout, gc));
+
+        backend->clearJournal();
+        const auto intake = runRoundReadingIntake(gc);
+        ASSERT_FALSE(intake.empty());
+        EXPECT_EQ(requestsOn(*backend, JournalVerb::Read, layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, 4})), 0u)
+            << "a key past the seal in the sealed epoch was read";
+        EXPECT_EQ(requestsOn(*backend, JournalVerb::Read, layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{5, 1})), 1u);
+        EXPECT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{1, 3}));
+        EXPECT_EQ(intake.at("frontier_proven"), intake.at("frontier_namespaces"));
+        EXPECT_EQ(intake.at("absent_probes"), 1u);
+    }
+}
+
+/// A chain of seals longer than planning follows: the walk applies the planned prefix and stops at the first epoch
+/// planning did not reach, unproven, without a read there and without a hold. The next round goes on from there.
+TEST(CASGCArithmeticIntake, MoreSealCrossingsThanThePlannerFollowsLeaveTheLifeUnproven)
+{
+    constexpr uint64_t seal_only_epochs = 66;
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+    const NamespaceLifeId life = fixture::fixtureLife(ns);
+    fixture::admitLive(*backend, layout, ns);
+    publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
+    Gc gc(store, kGc);
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    ASSERT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{1, 1}));
+
+    /// `{1,2}` seals epoch 1; each later epoch holds only its own seal; epoch 67 holds a record.
+    RefTxnId seal{1, 2};
+    writeSealAt(*backend, layout, ns, seal);
+    for (uint64_t epoch = 2; epoch <= seal_only_epochs; ++epoch)
+    {
+        writeSealAt(*backend, layout, ns, RefTxnId{epoch, 1}, seal);
+        seal = RefTxnId{epoch, 1};
+    }
+    publishAt(*backend, layout, ns, RefTxnId{seal_only_epochs + 1, 1}, "ref_last", 2, DB::UInt128(2),
+              /*birth=*/false, /*prev_epoch_seal=*/seal);
+
+    backend->clearJournal();
+    std::map<String, UInt64> intake;
+    {
+        ScopedLogCapture capture("CasGc", "information");
+        intake = runRoundReadingIntake(gc);
+        EXPECT_EQ(capture.count("discovery_incomplete=1"), 1u) << capture.captured();
+        EXPECT_GT(capture.count("destructive work SUPPRESSED"), 0u);
+    }
+    ASSERT_FALSE(intake.empty());
+    EXPECT_LT(intake.at("frontier_proven"), intake.at("frontier_namespaces"));
+    EXPECT_EQ(deletesSent(*backend), 0u);
+    /// Planning crossed 64 seals: from `{1,2}` to the head of epoch 65, which is the 65th seal.
+    EXPECT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{65, 1})) << "the planned prefix was not kept";
+    EXPECT_EQ(requestsOn(*backend, JournalVerb::Read, layout.refLogKey(life, RefTxnId{66, 1})), 0u)
+        << "the walk read in an epoch planning did not reach";
+    const auto coverage = coverageOf(*backend, layout, ns);
+    ASSERT_TRUE(coverage.has_value());
+    EXPECT_FALSE(coverage->hold.has_value()) << "an unplanned epoch minted a hold";
+
+    const auto next = runRoundReadingIntake(gc);
+    ASSERT_FALSE(next.empty());
+    EXPECT_EQ(next.at("frontier_proven"), next.at("frontier_namespaces"));
+    EXPECT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{seal_only_epochs + 1, 1}));
+    EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(2)), 1);
+}
+
+/// Probing above a record near the top of the sequence range saturates at the greatest sequence instead of
+/// wrapping to a small one. The record at the greatest sequence has no successor, so the walk holds there.
+TEST(CASGCArithmeticIntake, ProbingSaturatesAtTheTopOfTheSequenceRange)
+{
+    constexpr uint64_t top = std::numeric_limits<uint64_t>::max();
+    auto backend = std::make_shared<HintHoleBackendOn<CountingBackend>>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+    const NamespaceLifeId life = fixture::fixtureLife(ns);
+    fixture::admitLive(*backend, layout, ns);
+    publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
+    Gc gc(store, kGc);
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+
+    /// Records `top-4 .. top`; the cursor sits on the first, the listing shows none above it. Doubling from
+    /// `top-3` probes `top-2`, `top-1` and then `top-3 + 4`, which only saturation keeps in range.
+    for (uint64_t back = 4;; --back)
+    {
+        publishAt(*backend, layout, ns, RefTxnId{1, top - back}, fmt::format("ref_top_{}", back), 100 + back,
+                  DB::UInt128(100 + back));
+        if (back < 4)
+            backend->hide(layout.refLogKey(life, RefTxnId{1, top - back}));
+        if (back == 0)
+            break;
+    }
+    seedFoldCursorForTest(*backend, layout, ns, RefTxnId{1, top - 4}, std::nullopt,
+                          currentGenerationOf(*backend, layout), currentAttemptOf(*backend, layout));
+
+    backend->clearJournal();
+    const auto intake = runRoundReadingIntake(gc);
+    ASSERT_FALSE(intake.empty());
+    EXPECT_GT(backend->holesServed(), 0u);
+    EXPECT_GT(requestsOn(*backend, JournalVerb::Read, layout.refLogKey(life, RefTxnId{1, top})), 0u)
+        << "positive control: the probe reached the greatest sequence";
+    for (const JournalEntry & entry : backend->journal())
+        for (const String & key : entry.keys)
+            if (const auto parsed = layout.parseRefObjectKey(key); parsed && parsed->txn_id.writer_epoch == 1)
+                EXPECT_GE(parsed->txn_id.ref_sequence, top - 4) << "a wrapped key was requested: " << key;
+    const auto coverage = coverageOf(*backend, layout, ns);
+    ASSERT_TRUE(coverage && coverage->hold);
+    EXPECT_EQ(coverage->hold->reason, HoldReason::BodyUndecodable);
+    EXPECT_EQ(coverage->hold->offending_position, (RefTxnId{1, top}));
+    EXPECT_EQ(coverage->last_folded_ref_id, (RefTxnId{1, top - 1}));
+    EXPECT_EQ(deletesSent(*backend), 0u);
+}
+
+/// A quiet life with a warm cursor costs its `_ckpt` read and one read of its next key, answered absent, and
+/// nothing else on its `_log` keys. Planning adds no `LIST`.
+TEST(CASGCArithmeticIntake, AQuietLifeCostsOneCheckpointReadAndOneAbsentFirstKey)
+{
+    /// The `LIST` requests of this round on the commit before planning was added.
+    constexpr size_t base_round_lists = 5;
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const std::vector<RootNamespace> quiet{RootNamespace{"00/aa@cas@"}, RootNamespace{"00/bb@cas@"},
+                                           RootNamespace{"00/cc@cas@"}};
+    uint64_t blob = 1;
+    for (const RootNamespace & ns : quiet)
+    {
+        fixture::admitLive(*backend, layout, ns);
+        publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", blob, DB::UInt128(blob), /*birth=*/true);
+        ++blob;
+        publishAt(*backend, layout, ns, RefTxnId{1, 2}, "ref_2", blob, DB::UInt128(blob));
+        ++blob;
+        writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+            .life_epoch = 1,
+            .committed_through = RefTxnId{1, 2},
+            .checkpoint_snapshot_id = std::nullopt,
+            .last_epoch_seal = std::nullopt,
+        });
+    }
+    Gc gc(store, kGc);
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+
+    backend->clearJournal();
+    const auto intake = runRoundReadingIntake(gc);
+    ASSERT_FALSE(intake.empty());
+    const auto journal = backend->journal();
+    for (const RootNamespace & ns : quiet)
+    {
+        SCOPED_TRACE(ns.string());
+        const NamespaceLifeId life = fixture::fixtureLife(ns);
+        const String checkpoint = layout.refCkptKey(life);
+        const String stop = layout.refLogKey(life, RefTxnId{1, 3});
+        const String logs = stop.substr(0, stop.find("/_log/") + 6);
+        size_t checkpoint_reads = 0;
+        size_t stop_reads = 0;
+        size_t other_log_requests = 0;
+        for (const JournalEntry & entry : journal)
+            for (const String & key : entry.keys)
+            {
+                if (key == checkpoint && entry.verb == JournalVerb::Read)
+                    ++checkpoint_reads;
+                else if (key == stop && entry.verb == JournalVerb::Read)
+                    ++stop_reads;
+                else if (key.starts_with(logs))
+                    ++other_log_requests;
+            }
+        EXPECT_EQ(checkpoint_reads, 1u);
+        EXPECT_EQ(stop_reads, 1u);
+        EXPECT_EQ(other_log_requests, 0u);
+        EXPECT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{1, 2}));
+    }
+    EXPECT_EQ(intake.at("frontier_proven"), intake.at("frontier_namespaces"));
+    EXPECT_EQ(intake.at("absent_probes"), quiet.size());
+    const size_t lists = std::count_if(journal.begin(), journal.end(),
+                                       [](const JournalEntry & entry) { return entry.verb == JournalVerb::List; });
+    EXPECT_EQ(lists, base_round_lists);
 }

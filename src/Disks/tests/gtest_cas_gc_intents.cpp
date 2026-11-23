@@ -3653,6 +3653,22 @@ String firstWrittenStreamPrefix(const CountingBackend & backend)
     return {};
 }
 
+/// Runs `event` once, right before the round's first `GET` of a ref log of `ns`'s life. A round reads every life's
+/// ref logs first while it plans where each walk stops, in name order, so `event` lands after the stops of the
+/// namespaces that sort before `ns` and before the stop of `ns`. Only at `gc_io_concurrency = 1`: a wider window
+/// fetches later lives' first keys ahead, on worker threads.
+void armBeforePlanning(GetHookBackend & backend, const PoolPtr & store, const String & ns, std::function<void()> event)
+{
+    ASSERT_EQ(store->poolConfig().gc_io_concurrency, 1u) << "the planning order holds only for sequential reads";
+    const Layout & layout = store->layout();
+    OperationForTest op(backend);
+    const std::optional<NamespaceLifeId> life = CasRefCatalog::lifeIfCataloged(*op, layout, RootNamespace{ns});
+    ASSERT_TRUE(life.has_value()) << ns;
+    const String first_key = layout.refLogKey(*life, RefTxnId{1, 1});
+    const String logs = first_key.substr(0, first_key.find("/_log/") + 6);
+    backend.armBeforeGet([logs](const String & key) { return key.starts_with(logs); }, std::move(event));
+}
+
 /// The `createHardLink` / relink path: a part in `ns` that names `payload`'s blob, with no request on the body.
 void copyWithoutBytes(const PoolPtr & store, const String & ns, const String & ref_name, const String & payload)
 {
@@ -3729,22 +3745,24 @@ public:
         t = row()->token;
     }
 
-    /// One round; after the walk of `copy_ns`, when the round walks `next_ns` next, `copy_ns` gets a no-bytes copy
-    /// named `copy_ref` and `drop_ns`'s part `drop_ref` is dropped. Expects the body kept by that round.
+    /// One round; between the stops of `copy_ns` and `next_ns`, `copy_ns` gets a no-bytes copy named `copy_ref` and
+    /// `drop_ns`'s part `drop_ref` is dropped. Expects the body kept by that round.
     RoundReport relayRound(const String & copy_ns, const String & next_ns, const String & copy_ref,
                            const String & drop_ns, const String & drop_ref)
     {
         const size_t from = backend->journal().size();
-        const RoundWithCallback round = runRoundWithCallback(
-            *gc, RoundInterleavePoint::AfterNamespaceWalk, {.first = copy_ns, .second = next_ns}, [&]
-            {
-                copyWithoutBytes(store, copy_ns, copy_ref, payload);
-                store->dropRef(RootNamespace{drop_ns}, drop_ref);
-            });
+        size_t fired = 0;
+        armBeforePlanning(*backend, store, std::max(copy_ns, next_ns), [&]
+        {
+            ++fired;
+            copyWithoutBytes(store, copy_ns, copy_ref, payload);
+            store->dropRef(RootNamespace{drop_ns}, drop_ref);
+        });
+        const RoundReport report = runRegularRoundReclaiming(*gc);
         store->renewWatermarkOnce();
-        EXPECT_EQ(round.fired, 1u) << "the round never walked " << next_ns << " after " << copy_ns;
-        expectBodyKept(*backend, *store, body_key, from, round.report);
-        return round.report;
+        EXPECT_EQ(fired, 1u) << "the round never planned " << copy_ns << " and " << next_ns;
+        expectBodyKept(*backend, *store, body_key, from, report);
+        return report;
     }
 
     std::optional<RetiredEntry> row() const
@@ -3762,7 +3780,7 @@ public:
         return (*op).read(body_key, Retry::standard()).has_value();
     }
 
-    std::shared_ptr<HeadHookBackend> backend = std::make_shared<HeadHookBackend>();
+    std::shared_ptr<GetHookBackend> backend = std::make_shared<GetHookBackend>();
     PoolPtr store;
     std::unique_ptr<Gc> gc;
     const String ns_w;
@@ -3774,8 +3792,8 @@ public:
 
 struct CrossNamespaceOrder
 {
-    /// The destination's namespace sorts first, so pass 1 proves its frontier before it reads the source.
-    /// Otherwise the source sorts first and the source's records past one read window are read in pass 2.
+    /// The destination's namespace sorts first, so the round fixes its stop before the event and the source's after
+    /// it. Otherwise the source's stop is fixed first and the destination's after the event.
     bool destination_first;
     /// The control: the copy and the drop land before round 2 starts, so its cut holds both.
     bool before_the_round = false;
@@ -3783,10 +3801,10 @@ struct CrossNamespaceOrder
     bool source_read_first = false;
 };
 
-/// Arms `event` in the next round of `gc` where `order` puts it: right after the walk of `ns_l` (the walk of the
-/// source follows it, in pass 1 or in pass 2), or after the intake for the control. Runs it at once for the
-/// control that lands before the round.
-std::unique_ptr<ScopedRoundCallback> armCrossNamespaceEvent(Gc & gc, const CrossNamespaceOrder & order, const String & ns_l,
+/// Arms `event` in the next round of `gc` where `order` puts it: between the stops of `ns_l` and `ns_w`, or after the
+/// intake for the control. Runs it at once for the control that lands before the round.
+std::unique_ptr<ScopedRoundCallback> armCrossNamespaceEvent(Gc & gc, GetHookBackend & backend, const PoolPtr & store,
+                                                            const CrossNamespaceOrder & order, const String & ns_l,
                                                             const String & ns_w, const std::function<void()> & event)
 {
     if (order.before_the_round)
@@ -3796,8 +3814,8 @@ std::unique_ptr<ScopedRoundCallback> armCrossNamespaceEvent(Gc & gc, const Cross
     }
     if (order.source_read_first)
         return std::make_unique<ScopedRoundCallback>(gc, RoundInterleavePoint::AfterIntake, RoundInterleaveSelector{}, event);
-    return std::make_unique<ScopedRoundCallback>(
-        gc, RoundInterleavePoint::AfterNamespaceWalk, RoundInterleaveSelector{.first = ns_l, .second = ns_w}, event);
+    armBeforePlanning(backend, store, std::max(ns_l, ns_w), event);
+    return nullptr;
 }
 
 String crossNamespaceOrderName(const ::testing::TestParamInfo<CrossNamespaceOrder> & param_info)
@@ -3824,9 +3842,9 @@ class CASGcIntentsTransitionSource : public ::testing::TestWithParam<CrossNamesp
 
 }
 
-/// Round 1 misses the edge of writer `W`, which adopts body `t`, and commits `pending(t)`. In round 2, after the
-/// round walked namespace `L` and before it reads the rest of `W`'s namespace, `L` copies `W`'s entry with no
-/// request on the body while `W`'s edge is live, and then `W`'s part is dropped. The body must survive: `L` names it.
+/// Round 1 misses the edge of writer `W`, which adopts body `t`, and commits `pending(t)`. In round 2, between the
+/// stops the round fixes for namespaces `L` and `W`, `L` copies `W`'s entry with no request on the body while `W`'s
+/// edge is live, and then `W`'s part is dropped. The body must survive: `L` names it.
 TEST_P(CASGcIntentsCrossNamespace, NoBytesCopyBetweenTwoFrontiersKeepsTheBody)
 {
     const bool destination_first = GetParam().destination_first;
@@ -3860,7 +3878,7 @@ TEST_P(CASGcIntentsCrossNamespace, NoBytesCopyBetweenTwoFrontiersKeepsTheBody)
         store->dropRef(RootNamespace{ns_w}, "w");
         copied = true;
     };
-    const auto armed = armCrossNamespaceEvent(gc, GetParam(), ns_l, ns_w, copy_then_drop);
+    const auto armed = armCrossNamespaceEvent(gc, *backend, store, GetParam(), ns_l, ns_w, copy_then_drop);
     const size_t round_begin = backend->journal().size();
     const RoundReport round2 = runGateRound(store, gc);
     ASSERT_TRUE(copied) << "the round never reached the hooked point";
@@ -3872,8 +3890,9 @@ TEST_P(CASGcIntentsCrossNamespace, NoBytesCopyBetweenTwoFrontiersKeepsTheBody)
                 << "the copy sent a request on the body or an intent: " << key;
 
     expectBodyKept(*backend, *store, body_key, round_begin, round2);
-    /// Between the frontiers the cut shows zero with `W`'s records folded; the controls show `L`'s or `W`'s edge.
-    expectRowOutcome(row(), /*carried=*/!before_the_round && !source_read_first, t);
+    /// With `L`'s stop fixed first the cut shows zero with `W`'s records folded. With `W`'s stop fixed first the cut
+    /// holds the copy and not the drop; the controls show `L`'s or `W`'s edge.
+    expectRowOutcome(row(), /*carried=*/destination_first && !before_the_round && !source_read_first, t);
 }
 
 INSTANTIATE_TEST_SUITE_P(CASOrder, CASGcIntentsCrossNamespace, kCrossNamespaceOrders, crossNamespaceOrderName);
@@ -3938,8 +3957,8 @@ INSTANTIATE_TEST_SUITE_P(CASCatalog, CASGcIntentsNewbornCopy,
 
 /// The `pending` row with a live reference comes from the ordinary reuse after condemnation: in round 2 writer `Y`
 /// meets `I(B,t)` after the cut and publishes `u`; the decision `HEAD` shows `u`, so the transition commits
-/// `pending(u)` although `Y`'s edge is not in the cut. In round 3, after the round walked `L`, a no-bytes
-/// copy of `Y`'s part into `L` and the drop of `Y`'s part.
+/// `pending(u)` although `Y`'s edge is not in the cut. In round 3, between the stops of `L` and of `Y`'s namespace, a
+/// no-bytes copy of `Y`'s part into `L` and the drop of `Y`'s part.
 TEST_P(CASGcIntentsTransitionSource, NoBytesCopyOfARepublishedBodyBetweenTwoFrontiersKeepsTheBody)
 {
     const bool destination_first = GetParam().destination_first;
@@ -3977,21 +3996,21 @@ TEST_P(CASGcIntentsTransitionSource, NoBytesCopyOfARepublishedBodyBetweenTwoFron
         store->dropRef(RootNamespace{ns_w}, "y");
         copied = true;
     };
-    const auto armed = armCrossNamespaceEvent(gc, GetParam(), ns_l, ns_w, copy_then_drop);
+    const auto armed = armCrossNamespaceEvent(gc, *backend, store, GetParam(), ns_l, ns_w, copy_then_drop);
     const size_t round_begin = backend->journal().size();
     const RoundReport round3 = runGateRound(store, gc);
     ASSERT_TRUE(copied) << "the round never reached the hooked point";
 
     expectBodyKept(*backend, *store, body_key, round_begin, round3);
-    expectRowOutcome(row(), /*carried=*/!before_the_round && !source_read_first, u);
+    expectRowOutcome(row(), /*carried=*/destination_first && !before_the_round && !source_read_first, u);
 }
 
 INSTANTIATE_TEST_SUITE_P(CASOrder, CASGcIntentsTransitionSource, kCrossNamespaceOrders, crossNamespaceOrderName);
 
 /// ---- A pending row whose blob the round touched is carried ----
 
-/// A relay over three namespaces: in each round the copy lands after the walk of its destination and before the
-/// walk of its source, and its source is dropped. The body survives every round, and the last copy keeps it in a quiet round.
+/// A relay over three namespaces: in each round the copy lands between the stops of its destination and of its source,
+/// and its source is dropped. The body survives every round, and the last copy keeps it in a quiet round.
 TEST(CASGcIntentsRelay, ThreeNamespaceRelayKeepsTheBody)
 {
     MissedWriterPool pool("test/c_source", {"test/a_last", "test/b_middle"}, "three-namespace-relay");
@@ -4008,17 +4027,19 @@ TEST(CASGcIntentsRelay, ThreeNamespaceRelayKeepsTheBody)
     expectRowOutcome(pool.row(), /*carried=*/false, pool.t);
 }
 
-/// A relay over two namespaces whose second copy goes back into the first: the source sorts first, so the first
-/// copy lands after the destination's walk while the source's records past one read window wait for pass 2.
+/// A relay over two namespaces whose second copy goes back into the first. The source sorts first, so the round
+/// fixes its stop before the first copy and the destination's after it: that cut holds the copy and not the drop,
+/// and spares the blob. The back copy lands between the two stops the other way round, and the row is pending again.
 TEST(CASGcIntentsRelay, TwoNamespaceRelayThatCopiesBackKeepsTheBody)
 {
     MissedWriterPool pool("test/a_source", {"test/b_copy"}, "two-namespace-relay-back");
     ASSERT_NO_FATAL_FAILURE(pool.commitPendingUnderAMissedWriter());
 
     pool.relayRound("test/b_copy", "test/a_source", "copy", "test/a_source", "w");
-    expectRowOutcome(pool.row(), /*carried=*/true, pool.t);
+    expectRowOutcome(pool.row(), /*carried=*/false, pool.t);
 
-    /// The source namespace now sorts first as the destination of the back copy.
+    /// The source namespace now sorts first as the destination of the back copy. Hop 1 dropped the row, so this cut,
+    /// which misses the back copy and sees the drop, commits `pending(t)` again under the same token.
     pool.relayRound("test/a_source", "test/b_copy", "back", "test/b_copy", "copy");
     expectRowOutcome(pool.row(), /*carried=*/true, pool.t);
 
@@ -4148,7 +4169,7 @@ namespace
 {
 
 /// Answers a `HEAD` of `gc/state` as the test sets it.
-class PausedLeaderBackend : public HeadHookBackend
+class PausedLeaderBackend : public GetHookBackend
 {
 public:
     enum class StateHead : uint8_t
@@ -4177,7 +4198,7 @@ public:
             if (key == hidden_key)
                 return std::nullopt;
         }
-        auto raw = HeadHookBackend::read(key, access);
+        auto raw = GetHookBackend::read(key, access);
         if (raw && weakened(key))
             raw->value = weak(raw->value);
         return raw;
@@ -4236,7 +4257,7 @@ std::vector<size_t> stateHeadIndices(const std::vector<JournalEntry> & journal)
 }
 
 /// Leader A holds a row of the blob of `payload` while writer W's precommit is the only record of W's namespace
-/// above A's cursor. A's next round parks after the walk of a quiet namespace and before the walk of W's. Meanwhile
+/// above A's cursor. A's next round parks right before it reads that record. Meanwhile
 /// W finishes and publishes a snapshot past that record, and leader B takes the lease, folds W's records, commits
 /// and removes the logs below the snapshot, that record included.
 struct PausedLeaderPool
@@ -4289,14 +4310,14 @@ struct PausedLeaderPool
         return last;
     }
 
-    /// Arms A's next round to park before the walk of W's namespace; `finish_writer` runs there. `precommit_key` is
-    /// W's precommit record, the one A expects next.
+    /// Arms A's next round to park right before it reads W's precommit record, the one A expects next;
+    /// `finish_writer` runs there.
     void parkLeaderA(std::function<void()> finish_writer, const String & precommit_key)
     {
-        parked = std::make_unique<ScopedRoundCallback>(
-            *gc_a, RoundInterleavePoint::AfterNamespaceWalk, RoundInterleaveSelector{.first = ns_quiet, .second = ns_w},
+        backend->armBeforeGet([precommit_key](const String & key) { return key == precommit_key; },
             [this, finish = std::move(finish_writer), key = precommit_key]
         {
+            ++parked_before_read;
             parked_key = key;
             parked_key_present = objectPresent(*backend, key);
             const RefTxnId parked_id = store->layout().parseRefObjectKey(key)->txn_id;
@@ -4321,6 +4342,8 @@ struct PausedLeaderPool
         });
     }
 
+    size_t parkedCount() const { return parked ? parked->fired() : parked_before_read; }
+
     /// A's parked round. Its commit loses to B and throws `ABORTED`; the round must have reached the validation
     /// read first, and it saw B's version there.
     void runLeaderA()
@@ -4339,7 +4362,7 @@ struct PausedLeaderPool
         {
             ASSERT_EQ(e.code(), DB::ErrorCodes::ABORTED) << e.message();
         }
-        ASSERT_EQ(parked->fired(), 1u) << "A's round never walked W's namespace after the quiet one";
+        ASSERT_EQ(parkedCount(), 1u) << "A's round never read W's precommit";
         parked.reset();
         ASSERT_EQ(metricOr(reduce, "parent_unconfirmed"), 1u) << "A's round never reached the validation read";
     }
@@ -4359,7 +4382,7 @@ struct PausedLeaderPool
             code = e.code();
             message = e.message();
         }
-        ASSERT_EQ(parked->fired(), 1u) << "A's round never reached the point where it parks";
+        ASSERT_EQ(parkedCount(), 1u) << "A's round never reached the point where it parks";
         parked.reset();
         ASSERT_TRUE(code.has_value()) << "A's round did not fail";
         EXPECT_EQ(*code, DB::ErrorCodes::ABORTED) << message;
@@ -4421,6 +4444,8 @@ struct PausedLeaderPool
     String stream;
 
     std::unique_ptr<ScopedRoundCallback> parked;
+    /// How often `parkLeaderA`'s park ran.
+    size_t parked_before_read = 0;
     std::vector<String> prune_until_absent;
     size_t resumed_at = 0;
     String parked_key;
@@ -5411,6 +5436,281 @@ TEST(CASGcIntents, ABucketLevelMissOnARefLogReadEndsTheRoundWithoutADelete)
 
 #endif
 
+/// ---- Where a round stops each life: planned before the first manifest read ----
+
+namespace
+{
+
+/// The stream `_log` keys written since the journal was cleared, in write order.
+std::vector<String> writtenRefLogKeys(const CountingBackend & backend)
+{
+    std::vector<String> keys;
+    for (const JournalEntry & entry : backend.journal())
+        if (entry.verb == JournalVerb::Write)
+            for (const String & key : entry.keys)
+                if (key.find("/_log/") != String::npos && key.find("/cas/ns/stream/") != String::npos)
+                    keys.push_back(key);
+    return keys;
+}
+
+/// The index of the first `verb` request on `key` at or after `from`, or `journal.size()`.
+size_t indexOfRequestFrom(const std::vector<JournalEntry> & journal, JournalVerb verb, const String & key, size_t from)
+{
+    for (size_t i = from; i < journal.size(); ++i)
+        if (journal[i].verb == verb && std::find(journal[i].keys.begin(), journal[i].keys.end(), key) != journal[i].keys.end())
+            return i;
+    return journal.size();
+}
+
+size_t indexOfMarkFrom(const std::vector<JournalEntry> & journal, const String & label, size_t from)
+{
+    for (size_t i = from; i < journal.size(); ++i)
+        if (journal[i].verb == JournalVerb::Mark && journal[i].detail == label)
+            return i;
+    return journal.size();
+}
+
+RefTxnId refIdOfKey(const Layout & layout, const String & key)
+{
+    const auto parsed = layout.parseRefObjectKey(key);
+    return parsed ? parsed->txn_id : RefTxnId{};
+}
+
+/// The coverage the newest fold seal records for the catalog life of `ns`.
+std::optional<RefCoverage> lifeCoverage(Backend & backend, const Layout & layout, const RootNamespace & ns)
+{
+    const uint64_t attempt = currentAttemptOf(backend, layout);
+    const UInt128 life_id = catalogLifeIdForTest(backend, layout, ns);
+    OperationForTest op(backend);
+    for (uint64_t g = currentGenerationOf(backend, layout); ; --g)
+    {
+        if (const auto got = (*op).read(layout.foldSealKey(g, attempt), Retry::once()))
+        {
+            const CasFoldSeal seal = decodeFoldSeal(got->bytes);
+            const auto it = seal.ref_lives.find(life_id);
+            return it == seal.ref_lives.end() ? std::nullopt : std::optional<RefCoverage>(it->second.coverage);
+        }
+        if (g == 0)
+            return std::nullopt;
+    }
+}
+
+}
+
+/// A record at or below the last one planning read present is absent when the walk reads it. That is a lost record,
+/// not the end of the life: the walk holds there, so the record above it, which names `t`, is not skipped and `t`
+/// keeps its body. The primary case is a record planning never read, between two of its probes; the second is a
+/// record planning read, with retention off so that the walk reads it again.
+TEST(CASGcIntents, ARecordSeenDuringPlanningThatLaterVanishesHolds)
+{
+    /// `fillers` parts, then the copy of `t`, in a new run of records above the cursor, all hidden from the listing but
+    /// the first. The record at `lost_index` of that run is removed at `AfterDiscovery`.
+    const auto vanish = [](size_t fillers, size_t lost_index, bool retain, bool planning_reads_lost)
+    {
+        IntakePool pool;
+        const Layout & layout = pool.store->layout();
+        const String ns = "test/v_vanish";
+        /// Seeded before `pending(t)`: the round right after that commit is the one that would delete the body.
+        ASSERT_EQ(writeOnePart(pool.store, ns, "r0", "vanish-seed"), BlobMaterializationAction::Published);
+        ASSERT_NO_FATAL_FAILURE(pool.commitPending());
+
+        pool.backend->clearJournal();
+        for (size_t i = 0; i < fillers; ++i)
+            writeOnePart(pool.store, ns, fmt::format("r{}", i + 1), fmt::format("vanish-filler-{}", i));
+        copyWithoutBytes(pool.store, ns, "c", pool.payload);
+        const std::vector<String> logs = writtenRefLogKeys(*pool.backend);
+        ASSERT_EQ(logs.size(), 2 * (fillers + 1)) << "each part write appends two ref-log records";
+        ASSERT_GT(logs.size(), lost_index + 1);
+        const String applied = logs[lost_index - 1];
+        const String lost = logs[lost_index];
+        for (size_t i = 1; i < logs.size(); ++i)
+            pool.backend->hide(logs[i]);
+        SCOPED_TRACE(fmt::format("first {}, lost {}, last {}", renderRefTxnId(refIdOfKey(layout, logs.front())),
+                                 renderRefTxnId(refIdOfKey(layout, lost)), renderRefTxnId(refIdOfKey(layout, logs.back()))));
+
+        if (!retain)
+            pool.gc->setRefPlanRetainedBytesForTest(0);
+        ScopedRoundCallback removal(*pool.gc, RoundInterleavePoint::AfterDiscovery, {}, [&]
+        {
+            pool.backend->mark("planned");
+            OperationForTest op(*pool.backend);
+            const auto meta = (*op).head(lost, Retry::standard());
+            ASSERT_TRUE(meta.has_value());
+            ASSERT_EQ((*op).remove(lost, meta->etag, Retry::standard()), Removal::Removed);
+        });
+        ScopedLogCapture capture("CasGc", "information");
+        const size_t from = pool.backend->journal().size();
+        const RoundReport round = runGateRound(pool.store, *pool.gc);
+        ASSERT_EQ(removal.fired(), 1u);
+        EXPECT_GT(pool.backend->holesServed(), 0u);
+
+        const auto journal = pool.backend->journal();
+        const size_t planned = indexOfMark(journal, "planned");
+        EXPECT_EQ(indexOfRequestFrom(journal, JournalVerb::Read, lost, from) < planned, planning_reads_lost)
+            << "positive control: whether planning read the record while it was stored";
+        bool read_above = false;
+        for (size_t i = lost_index + 1; i < logs.size(); ++i)
+            read_above |= indexOfRequestFrom(journal, JournalVerb::Read, logs[i], from) < planned;
+        EXPECT_TRUE(read_above) << "positive control: planning read a record above the lost one";
+
+        const auto coverage = lifeCoverage(*pool.backend, layout, RootNamespace{ns});
+        ASSERT_TRUE(coverage.has_value());
+        EXPECT_TRUE(coverage->hold.has_value()) << "the walk ended at the lost record without a hold";
+        if (coverage->hold)
+        {
+            EXPECT_EQ(coverage->hold->reason, HoldReason::GapBelowWitness);
+            EXPECT_EQ(coverage->hold->offending_position, refIdOfKey(layout, lost));
+        }
+        EXPECT_EQ(coverage->last_folded_ref_id, refIdOfKey(layout, applied));
+        EXPECT_TRUE(std::any_of(round.anomalies.begin(), round.anomalies.end(), [](const RoundAnomaly & a)
+                                { return std::string_view(a.reason).find("probed present, read absent") != std::string_view::npos; }))
+            << "no anomaly names the probed-present record";
+        EXPECT_GT(capture.count("destructive work SUPPRESSED"), 0u);
+        for (size_t i = from; i < journal.size(); ++i)
+            EXPECT_FALSE((journal[i].verb == JournalVerb::Remove || journal[i].verb == JournalVerb::RemoveMany)
+                         && std::find(journal[i].keys.begin(), journal[i].keys.end(), pool.body_key) != journal[i].keys.end())
+                << "the round deleted the body of t";
+        EXPECT_TRUE(pool.bodyStored());
+    };
+
+    {
+        /// The three filler parts and the copy append two records each: `F .. F+7`, where `F` is the first record above
+        /// the cursor. Planning reads `F, F+1, F+2, F+4`, then `F+8` absent, then bisects to `F+6`, `F+7`. `F+3` lies
+        /// between two probes and is never read.
+        SCOPED_TRACE("a record planning did not read");
+        vanish(/*fillers=*/3, /*lost_index=*/3, /*retain=*/true, /*planning_reads_lost=*/false);
+    }
+    {
+        SCOPED_TRACE("a record planning read, retention off");
+        vanish(/*fillers=*/2, /*lost_index=*/1, /*retain=*/false, /*planning_reads_lost=*/true);
+    }
+}
+
+/// Planning reads the next record of a life absent; a writer then appends it and the round fails. The next round
+/// reads that key again instead of reusing the absence, folds the record and keeps `t`, which the record names.
+/// After a clean round the key the walk stopped at is read again in the next round as well.
+TEST(CASGcIntents, ASavedAbsenceIsUsedOnlyInItsOwnAttempt)
+{
+    IntakePool pool;
+    const Layout & layout = pool.store->layout();
+    const String ns = "test/s_saved";
+    const RootNamespace root{ns};
+    /// Seeded before `pending(t)`: the round right after that commit is the one that would delete the body.
+    ASSERT_EQ(writeOnePart(pool.store, ns, "r0", "saved-seed"), BlobMaterializationAction::Published);
+    ASSERT_NO_FATAL_FAILURE(pool.commitPending());
+    const uint64_t cursor_before = foldCursorOf(*pool.backend, layout, root, 0);
+    ASSERT_GT(cursor_before, 0u);
+
+    String first;
+    {
+        ScopedRoundCallback write_then_fail(*pool.gc, RoundInterleavePoint::AfterDiscovery, {}, [&]
+        {
+            pool.backend->mark("planned");
+            const size_t before = pool.backend->journal().size();
+            copyWithoutBytes(pool.store, ns, "c", pool.payload);
+            /// Hidden from the listing, the records have no witness: only a read of `first` finds them.
+            const auto journal = pool.backend->journal();
+            for (size_t i = before; i < journal.size(); ++i)
+                if (journal[i].verb == JournalVerb::Write)
+                    for (const String & key : journal[i].keys)
+                        if (key.find("/_log/") != String::npos)
+                        {
+                            if (first.empty())
+                                first = key;
+                            pool.backend->hide(key);
+                        }
+            throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "the store went away after planning");
+        });
+        pool.backend->clearJournal();
+        expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { runGateRound(pool.store, *pool.gc); });
+        ASSERT_EQ(write_then_fail.fired(), 1u);
+    }
+    ASSERT_FALSE(first.empty()) << "the copy appended no record";
+    {
+        const auto journal = pool.backend->journal();
+        EXPECT_LT(indexOfRequestFrom(journal, JournalVerb::Read, first, 0), indexOfMark(journal, "planned"))
+            << "positive control: planning read the key before the record existed";
+    }
+    EXPECT_EQ(foldCursorOf(*pool.backend, layout, root, 0), cursor_before) << "the failed round adopted a cursor";
+
+    /// One round; whether planning, which ends at `AfterDiscovery`, read `key`. Later phases read logs too.
+    const auto planningReads = [&](const String & key)
+    {
+        ScopedRoundCallback planned(*pool.gc, RoundInterleavePoint::AfterDiscovery, {}, [&] { pool.backend->mark("planned"); });
+        const size_t from = pool.backend->journal().size();
+        runGateRound(pool.store, *pool.gc);
+        EXPECT_EQ(planned.fired(), 1u);
+        const auto journal = pool.backend->journal();
+        const size_t mark = indexOfMarkFrom(journal, "planned", from);
+        return indexOfRequestFrom(journal, JournalVerb::Read, key, from) < mark;
+    };
+
+    EXPECT_TRUE(planningReads(first)) << "the next round reused the failed round's absence";
+    EXPECT_GT(pool.backend->holesServed(), 0u);
+    EXPECT_GE(foldCursorOf(*pool.backend, layout, root, 0), refIdOfKey(layout, first).ref_sequence)
+        << "the next round did not fold the record";
+    for (size_t i = 0; i < 3; ++i)
+        runGateRound(pool.store, *pool.gc);
+    EXPECT_TRUE(pool.bodyStored()) << "the part in " << ns << " names the blob";
+    const FsckReport report = runFsck(*pool.store, /*detail=*/true);
+    EXPECT_EQ(report.dangling, 0u) << formatFsckSummary(report);
+
+    const std::optional<NamespaceLifeId> life = [&]
+    {
+        OperationForTest op(*pool.backend);
+        return CasRefCatalog::lifeIfCataloged(*op, layout, root);
+    }();
+    ASSERT_TRUE(life.has_value());
+    const String stop = layout.refLogKey(
+        *life, RefTxnId{refIdOfKey(layout, first).writer_epoch, foldCursorOf(*pool.backend, layout, root, 0) + 1});
+    EXPECT_TRUE(planningReads(stop)) << "positive control: the clean round read where the life ends";
+    EXPECT_TRUE(planningReads(stop)) << "the round after a clean round reused its stop";
+}
+
+/// A life whose parent seal carries a hold is planned like any other. The record the hold names has reappeared:
+/// planning reads it, the walk applies it and the hold clears.
+TEST(CASGcIntents, ALifeWithACarriedHoldIsStillPlanned)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+    fixture::admitLive(*backend, layout, ns);
+    publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
+    publishAt(*backend, layout, ns, RefTxnId{1, 2}, "ref_2", 2, DB::UInt128(2));
+    publishAt(*backend, layout, ns, RefTxnId{1, 4}, "ref_4", 4, DB::UInt128(4));
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 4},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
+
+    Gc gc(store, kGateLeaderA);
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    const auto held = lifeCoverage(*backend, layout, ns);
+    ASSERT_TRUE(held && held->hold) << "positive control: the gap at {1,3} holds the life";
+    ASSERT_EQ(held->hold->offending_position, (RefTxnId{1, 3}));
+
+    publishAt(*backend, layout, ns, RefTxnId{1, 3}, "ref_3", 3, DB::UInt128(3));
+    const String reappeared = layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, 3});
+    backend->clearJournal();
+    ScopedRoundCallback planned(gc, RoundInterleavePoint::AfterDiscovery, {}, [&] { backend->mark("planned"); });
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    ASSERT_EQ(planned.fired(), 1u);
+
+    const auto journal = backend->journal();
+    EXPECT_LT(indexOfRequestFrom(journal, JournalVerb::Read, reappeared, 0), indexOfMark(journal, "planned"))
+        << "planning skipped the held life";
+    const auto coverage = lifeCoverage(*backend, layout, ns);
+    ASSERT_TRUE(coverage.has_value());
+    EXPECT_FALSE(coverage->hold.has_value()) << "the hold did not clear";
+    EXPECT_EQ(coverage->last_folded_ref_id, (RefTxnId{1, 4}));
+    EXPECT_EQ(coverage->classification, CoverageClass::Folded);
+    EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(3)), 1);
+    EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(4)), 1);
+}
+
 /// The catalog read of a round follows the acquisition of its lease: the round of a leader that steals the
 /// lease from the previous one is checked, twice.
 TEST(CASGcIntakeRequirements, CatalogReadFollowsTheLeaseAcquisition)
@@ -5476,10 +5776,12 @@ public:
         runGateRound(store, *gc);
     }
 
-    void refill(const String & tag)
+    void refill(const String & tag, size_t parts = 1)
     {
         for (const String & ns : {first, second})
-            EXPECT_EQ(writeOnePart(store, ns, "fill_" + tag, "a filler of " + ns + " " + tag), BlobMaterializationAction::Published);
+            for (size_t i = 0; i < parts; ++i)
+                EXPECT_EQ(writeOnePart(store, ns, fmt::format("fill_{}_{}", tag, i), fmt::format("a filler of {} {} {}", ns, tag, i)),
+                          BlobMaterializationAction::Published);
     }
 
     /// Ends with `pending(t)` of a blob no part names.
@@ -5511,24 +5813,35 @@ public:
 
     bool isAnyLogRead(const JournalEntry & entry) const { return isLogRead(entry, first) || isLogRead(entry, second); }
 
-    /// Expects the mark after a read of `walked`'s log with no other log read in between, and the first log read
-    /// after the mark in `next`.
+    /// A walk reads the manifests of the records it applies; the reads that fix where it stops come before every walk.
+    bool isManifestRead(const JournalEntry & entry, const String & ns) const
+    {
+        return entry.verb == JournalVerb::Read
+            && entry.keys.front().starts_with(store->layout().manifestNamespacePrefix(RootNamespace{ns}));
+    }
+
+    bool isAnyManifestRead(const JournalEntry & entry) const { return isManifestRead(entry, first) || isManifestRead(entry, second); }
+
+    /// Expects the mark after a manifest read of `walked` with no other manifest read in between, and the first
+    /// manifest read after the mark in `next`.
     void expectMarkBetween(const std::vector<JournalEntry> & journal, const String & walked, const String & next) const
     {
         const size_t mark = indexOfMark(journal, "hook");
         ASSERT_LT(mark, journal.size());
         size_t before = journal.size();
         for (size_t i = 0; i < mark; ++i)
-            if (isAnyLogRead(journal[i]))
+            if (isAnyManifestRead(journal[i]))
                 before = i;
-        ASSERT_LT(before, journal.size()) << "no log read before the hook";
-        EXPECT_TRUE(isLogRead(journal[before], walked)) << "the last log read before the hook is " << journal[before].keys.front();
+        ASSERT_LT(before, journal.size()) << "no manifest read before the hook";
+        EXPECT_TRUE(isManifestRead(journal[before], walked))
+            << "the last manifest read before the hook is " << journal[before].keys.front();
         size_t after = journal.size();
         for (size_t i = mark + 1; i < journal.size() && after == journal.size(); ++i)
-            if (isAnyLogRead(journal[i]))
+            if (isAnyManifestRead(journal[i]))
                 after = i;
-        ASSERT_LT(after, journal.size()) << "no log read after the hook";
-        EXPECT_TRUE(isLogRead(journal[after], next)) << "the first log read after the hook is " << journal[after].keys.front();
+        ASSERT_LT(after, journal.size()) << "no manifest read after the hook";
+        EXPECT_TRUE(isManifestRead(journal[after], next))
+            << "the first manifest read after the hook is " << journal[after].keys.front();
     }
 
     std::shared_ptr<HeadHookBackend> backend = std::make_shared<HeadHookBackend>();
@@ -5588,7 +5901,9 @@ TEST(CASGcRoundPoint, BetweenNamespacesInPassTwoFiresInBothOrders)
     for (const char * tag : {"1", "2"})
     {
         SCOPED_TRACE(tag);
-        pool.refill(tag);
+        /// Two parts: pass 1 applies one record of each namespace, so pass 2 applies the second part's precommit and
+        /// reads its manifest.
+        pool.refill(tag, 2);
         const uint64_t round = committedRound(*pool.backend, pool.store->layout()) + 1;
         const String & walked = round % 2 == 0 ? pool.first : pool.second;
         const String & next = round % 2 == 0 ? pool.second : pool.first;
@@ -5976,11 +6291,15 @@ TEST(CASGcRoundPoint, NamespaceRemovedAndRecreatedBetweenTheReads)
     ASSERT_NO_FATAL_FAILURE(pool.commitPendingUnderAMissedWriter());
 
     const size_t from = pool.backend->journal().size();
-    const RoundWithCallback removed = runRoundWithCallback(
-        *pool.gc, RoundInterleavePoint::AfterNamespaceWalk, {.first = "test/a_seed", .second = "test/r_table"},
-        [&] { pool.store->dropNamespace(RootNamespace{"test/r_table"}); });
+    size_t removed = 0;
+    armBeforePlanning(*pool.backend, pool.store, "test/r_table", [&]
+    {
+        ++removed;
+        pool.store->dropNamespace(RootNamespace{"test/r_table"});
+    });
+    runRegularRoundReclaiming(*pool.gc);
     pool.store->renewWatermarkOnce();
-    ASSERT_EQ(removed.fired, 1u);
+    ASSERT_EQ(removed, 1u);
     const auto journal = pool.backend->journal();
     EXPECT_EQ(countOf(blobRequests(std::vector<JournalEntry>(journal.begin() + from, journal.end())), JournalVerb::Remove,
                       pool.body_key), 0u);

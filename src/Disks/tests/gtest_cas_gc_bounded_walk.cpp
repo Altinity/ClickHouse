@@ -741,7 +741,7 @@ TEST(CASGCBoundedWalk, PassOneIsNeverCutAndPassTwoRotatesByRound)
     auto store = openPoolWithSmallWindow(backend);
     const Layout & layout = store->layout();
     const std::vector<RootNamespace> names{RootNamespace{"00/a@cas@"}, RootNamespace{"00/b@cas@"}, RootNamespace{"00/c@cas@"}};
-    const uint64_t tail = 3 * kWindow;
+    const uint64_t tail = 4 * kWindow;
     for (const RootNamespace & ns : names)
     {
         publishRange(*backend, layout, ns, 1, tail);
@@ -756,12 +756,15 @@ TEST(CASGCBoundedWalk, PassOneIsNeverCutAndPassTwoRotatesByRound)
         EXPECT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{1, kWindow})) << ns.string();
     EXPECT_EQ(metric(intake, "frontier_proven"), 0u);
 
-    /// Each namespace ends at its `{1, tail + 1}`; the slice ends as the first one is read absent.
+    /// The slice ends as the first walk applies a namespace's last record `{1, tail}`, which only a walk reads
+    /// through its manifest; the walk then ends at the stop planning fixed, which takes no read.
     const auto armEnds = [&](const std::vector<RootNamespace> & which)
     {
         for (const RootNamespace & ns : which)
-            backend->stepAfterGet(logKey(layout, ns, RefTxnId{1, tail + 1}));
+            backend->stepAfterGet(layout.manifestKey(ManifestId{ns, ManifestRef{.writer_epoch = 1, .build_sequence = tail,
+                                                                               .manifest_ordinal = 1}}));
     };
+    /// Planning reads every namespace's end once per round.
     const auto endProbes = [&](const RootNamespace & ns)
     {
         return backend->getCount(logKey(layout, ns, RefTxnId{1, tail + 1}));
@@ -775,7 +778,7 @@ TEST(CASGCBoundedWalk, PassOneIsNeverCutAndPassTwoRotatesByRound)
     {
         EXPECT_EQ(cursorOf(*backend, layout, names[i]), (RefTxnId{1, i == completed ? tail : 2 * kWindow}))
             << names[i].string() << " in round " << second.round;
-        EXPECT_EQ(endProbes(names[i]), i == completed ? 1u : 0u) << names[i].string();
+        EXPECT_EQ(endProbes(names[i]), 1u) << names[i].string();
     }
     EXPECT_EQ(metric(intake, "frontier_proven"), 1u);
 
@@ -789,9 +792,9 @@ TEST(CASGCBoundedWalk, PassOneIsNeverCutAndPassTwoRotatesByRound)
     const size_t completed_third = third.round % unfinished.size();
     for (size_t i = 0; i < unfinished.size(); ++i)
     {
-        EXPECT_EQ(cursorOf(*backend, layout, unfinished[i]), (RefTxnId{1, tail})) << unfinished[i].string();
-        EXPECT_EQ(endProbes(unfinished[i]), i == completed_third ? 1u : 0u)
+        EXPECT_EQ(cursorOf(*backend, layout, unfinished[i]), (RefTxnId{1, i == completed_third ? tail : 3 * kWindow}))
             << unfinished[i].string() << " in round " << third.round;
+        EXPECT_EQ(endProbes(unfinished[i]), 1u) << unfinished[i].string();
     }
     EXPECT_EQ(metric(intake, "frontier_proven"), 2u);
 }

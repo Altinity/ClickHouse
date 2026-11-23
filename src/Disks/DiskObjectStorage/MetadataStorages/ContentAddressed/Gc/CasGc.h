@@ -32,8 +32,8 @@ namespace DB::Cas
 ///
 /// A round may destroy only while holding a FRONTIER PROOF for EVERY namespace that can hold a live
 /// edge — because reachability is a property of the whole pool, not of one namespace. The proof per
-/// namespace is cheap and exact (a read of the chain's first absent key or of a terminal record,
-/// `CasGc.cpp`'s intake walk). What those proofs cannot supply is the SET they must cover, and only the catalog supplies it:
+/// namespace is cheap and exact: each round fixes every namespace life's stop before it walks, and the walk
+/// ends at that stop or at a terminal record. What those proofs cannot supply is the SET they must cover, and only the catalog supplies it:
 /// a listing may omit a durable namespace, and a sealed fold cursor names only namespaces some round
 /// already folded, so neither source bounds the set on its own.
 ///
@@ -440,6 +440,10 @@ public:
     /// reads, so only time bounds the walk; one default `gc_interval_sec`.
     static constexpr uint64_t kRefIntakeBudgetMs = 60'000;
 
+    /// The ref-log bodies one round keeps from planning for its walk, summed over all lives. A body that
+    /// does not fit is read again by the walk.
+    static constexpr size_t kRefPlanRetainedBytes = 64ULL << 20;
+
     /// One full round. Returns acquired_lease=false (nothing else done) if another leader is alive.
     /// `on_lease_acquired`, if set, is invoked ONCE, synchronously, immediately after the lease is
     /// acquired/renewed and BEFORE the (potentially long) fold begins - the scheduler uses this to
@@ -591,6 +595,9 @@ public:
 
     /// Replaces the clock of the fold's intake family accounting, so a test can assert exact durations.
     void setIntakeClockForTest(UInt64 (*clock)() noexcept) { intake_clock_ns = clock; }
+
+    /// Replaces `kRefPlanRetainedBytes`, so a test can make the walk read again what planning read.
+    void setRefPlanRetainedBytesForTest(size_t bytes) { ref_plan_retained_bytes = bytes; }
 
     /// Abandoned-precommit cleanup belongs to the writer: it appends exact `owner_transition` removals in
     /// ref logs. GC never invents a ref transition, because doing so could make the fold disagree with the
@@ -753,6 +760,8 @@ private:
             Held,
             /// The ref intake's time slice ended before the walk reached an end.
             IntakeSliceCut,
+            /// The walk reached a key past what the round's planning observed, so no stop bounds it.
+            DiscoveryIncomplete,
             Unattributed,
         };
 
@@ -767,6 +776,7 @@ private:
             uint64_t checkpoint_unusable = 0;
             uint64_t held = 0;
             uint64_t intake_slice_cut = 0;
+            uint64_t discovery_incomplete = 0;
             uint64_t probe_budget = 0;
             uint64_t fold_aborted = 0;
             uint64_t unattributed = 0;
@@ -1097,6 +1107,8 @@ private:
     std::function<void(const RoundPointSiteForTest &)> round_point_hook_for_test;
     /// TEST SEAM ONLY: see setIntakeClockForTest.
     UInt64 (*intake_clock_ns)() noexcept = &steadyNowNs;
+    /// TEST SEAM ONLY: see setRefPlanRetainedBytesForTest.
+    size_t ref_plan_retained_bytes = kRefPlanRetainedBytes;
     /// Calls a copy, so a hook that replaces itself does not destroy the function it is running in.
     void runRoundPointHookForTest(const RoundPointSiteForTest & site) const
     {

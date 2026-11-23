@@ -25,6 +25,7 @@
 #include <Common/threadPoolCallbackRunner.h>
 #include <base/defines.h>
 #include <base/scope_guard.h>
+#include <unordered_map>
 #include <unordered_set>
 #include <algorithm>
 #include <deque>
@@ -32,6 +33,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <span>
 #include <variant>
 
 namespace CurrentMetrics
@@ -2014,7 +2016,7 @@ Gc::GenerationSealProbe Gc::probeGenerationForSeal(uint64_t generation)
 
 uint64_t Gc::FoldResult::FrontierDeficit::total() const
 {
-    return checkpoint_unusable + held + intake_slice_cut + probe_budget + fold_aborted + unattributed;
+    return checkpoint_unusable + held + intake_slice_cut + discovery_incomplete + probe_budget + fold_aborted + unattributed;
 }
 
 String Gc::FoldResult::FrontierDeficit::describe() const
@@ -2031,6 +2033,7 @@ String Gc::FoldResult::FrontierDeficit::describe() const
     add("checkpoint_unusable", checkpoint_unusable);
     add("held", held);
     add("intake_slice_cut", intake_slice_cut);
+    add("discovery_incomplete", discovery_incomplete);
     add("probe_budget", probe_budget);
     add("fold_aborted", fold_aborted);
     add("unattributed", unattributed);
@@ -2045,8 +2048,230 @@ void Gc::FoldResult::FrontierDeficit::count(FrontierUnproven reason)
         case FrontierUnproven::CheckpointUnusable: ++checkpoint_unusable; return;
         case FrontierUnproven::Held: ++held; return;
         case FrontierUnproven::IntakeSliceCut: ++intake_slice_cut; return;
+        case FrontierUnproven::DiscoveryIncomplete: ++discovery_incomplete; return;
         case FrontierUnproven::Unattributed: ++unattributed; return;
     }
+}
+
+namespace
+{
+
+/// The sorted `_log` ids of one physical life that the round's hint source names, possibly none. It chooses
+/// which keys planning reads first and decides nothing. A view: the source outlives the planning call.
+struct RefLifeHint
+{
+    std::span<const RefTxnId> logs;
+};
+
+RefLifeHint hintFromListing(const RefTableListing & listing)
+{
+    return RefLifeHint{.logs = listing.logs};
+}
+
+/// Where one life's walk ends in this attempt, fixed by exact `GET`s before the first manifest read. It is
+/// never carried to another attempt: a key read absent then may be present now.
+struct RefStopPlan
+{
+    /// Per epoch planning reached, the greatest sequence it read present; 0 when the first key it read there
+    /// was absent.
+    std::map<uint64_t, uint64_t> last_present;
+    /// The key read absent right after the last present record of the final epoch. Unset when planning ended
+    /// at a terminal record, an undecodable body or the crossing limit.
+    std::optional<RefTxnId> stop;
+    /// The hint's ids above the first key.
+    std::vector<RefTxnId> hint_ids;
+    bool first_present = false;
+    uint64_t crossings = 0;
+    bool crossing_limit_reached = false;
+
+    bool isStop(const RefTxnId & id) const { return stop && id == *stop; }
+
+    /// At or below a sequence planning read present in a reached epoch.
+    bool covers(const RefTxnId & id) const
+    {
+        const auto it = last_present.find(id.writer_epoch);
+        return it != last_present.end() && id.ref_sequence <= it->second;
+    }
+};
+
+/// Seal crossings one life's planning follows. A longer chain of epochs leaves the life unproven this round and
+/// the walk keeps the prefix it applied.
+constexpr uint64_t kRefPlanMaxCrossings = 64;
+
+/// Ref-log bodies planning read, kept by exact key for the walk under a byte cap summed over the round's lives.
+class RetainedRefBodies
+{
+public:
+    explicit RetainedRefBodies(size_t cap_bytes_) : cap_bytes(cap_bytes_) {}
+
+    void keep(const String & key, Object object)
+    {
+        if (object.bytes.size() > cap_bytes - kept_bytes)
+            return;
+        kept_bytes += object.bytes.size();
+        bodies.emplace(key, std::move(object));
+    }
+
+    std::optional<Object> take(const String & key)
+    {
+        const auto it = bodies.find(key);
+        if (it == bodies.end())
+            return std::nullopt;
+        Object object = std::move(it->second);
+        bodies.erase(it);
+        return object;
+    }
+
+    bool contains(const String & key) const { return bodies.contains(key); }
+    /// Bytes kept over the round, including bodies the walk has taken since.
+    size_t keptBytes() const { return kept_bytes; }
+
+private:
+    const size_t cap_bytes;
+    size_t kept_bytes = 0;
+    std::unordered_map<String, Object> bodies;
+};
+
+/// How the chain continues after a record planning read present.
+struct PlannedRecord
+{
+    enum class Kind : uint8_t
+    {
+        /// The successor is the next sequence of the same epoch.
+        Ordinary,
+        /// The successor is `head`, in a later epoch.
+        Seal,
+        /// A terminal record or a body the walk will hold at: planning has no key to read after it.
+        End,
+    };
+    Kind kind = Kind::End;
+    RefTxnId head{};
+};
+
+PlannedRecord classifyPlannedRecord(const Object & object, const NamespaceLifeId & life, const RefTxnId & id)
+{
+    std::optional<RefTxnId> successor;
+    std::optional<RefEpochTransition> transition;
+    try
+    {
+        const RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, object.bytes), life.ns.string(), id);
+        successor = refChainSuccessor(txn);
+        transition = refEpochTransitionOf(txn);
+    }
+    catch (const Exception &)
+    {
+        /// The walk decodes the same body when it reaches it and holds the life there.
+        return {};
+    }
+    if (!successor)
+        return {};
+    if (!transition)
+        return {.kind = PlannedRecord::Kind::Ordinary};
+    /// A seal must lead to a later epoch; planning stops at any other and the walk validates the link.
+    if (transition->next_epoch <= id.writer_epoch)
+        return {};
+    return {.kind = PlannedRecord::Kind::Seal, .head = *successor};
+}
+
+uint64_t saturatingAdd(uint64_t a, uint64_t b)
+{
+    return a > std::numeric_limits<uint64_t>::max() - b ? std::numeric_limits<uint64_t>::max() : a + b;
+}
+
+/// Fixes where the walk of `life` ends in this attempt, starting at its first expected key `first`, which it
+/// always reads. In each epoch it reads the greatest hinted id above the last record read present, doubles past
+/// that record to the first key read absent and bisects strictly between the two; a seal sends it to the head
+/// the seal's body names. Every absence it relies on is an exact `GET` answered absent, and every read error
+/// propagates. Bodies it reads go to `retained`; its absent reads are added to `absent_probes`.
+RefStopPlan planRefStops(GcReadAhead & reads, const Layout & layout, const NamespaceLifeId & life, const RefTxnId & first,
+                         const RefLifeHint & hint, RetainedRefBodies & retained, uint64_t & absent_probes)
+{
+    RefStopPlan plan;
+    plan.hint_ids.assign(std::upper_bound(hint.logs.begin(), hint.logs.end(), first), hint.logs.end());
+
+    const auto read = [&](const RefTxnId & id) -> std::optional<PlannedRecord>
+    {
+        const String key = layout.refLogKey(life, id);
+        std::optional<Object> got = reads.takeRead(key, ReadFamily::RefLog);
+        if (!got)
+        {
+            ++absent_probes;
+            return std::nullopt;
+        }
+        ProfileEvents::increment(ProfileEvents::CASRefLogBodyGets);
+        const PlannedRecord record = classifyPlannedRecord(*got, life, id);
+        retained.keep(key, std::move(*got));
+        return record;
+    };
+
+    RefTxnId head = first;
+    while (true)
+    {
+        const uint64_t epoch = head.writer_epoch;
+        uint64_t & last_present = plan.last_present[epoch];
+        std::optional<PlannedRecord> record = read(head);
+        if (head == first)
+            plan.first_present = record.has_value();
+        if (!record)
+        {
+            plan.stop = head;
+            return plan;
+        }
+        uint64_t lo = head.ref_sequence;
+        last_present = lo;
+        /// Set only from a key read absent.
+        std::optional<uint64_t> hi;
+        const auto probe = [&](uint64_t sequence)
+        {
+            if (auto got = read(RefTxnId{epoch, sequence}))
+            {
+                record = got;
+                lo = sequence;
+                last_present = sequence;
+            }
+            else
+                hi = sequence;
+        };
+
+        const auto past_epoch = std::upper_bound(
+            hint.logs.begin(), hint.logs.end(), RefTxnId{epoch, std::numeric_limits<uint64_t>::max()});
+        if (record->kind == PlannedRecord::Kind::Ordinary && past_epoch != hint.logs.begin()
+            && std::prev(past_epoch)->writer_epoch == epoch && lo < std::prev(past_epoch)->ref_sequence)
+            probe(std::prev(past_epoch)->ref_sequence);
+
+        const uint64_t base = lo;
+        for (uint64_t step = 1; record->kind == PlannedRecord::Kind::Ordinary && !hi; step = saturatingAdd(step, step))
+        {
+            const uint64_t sequence = saturatingAdd(base, step);
+            if (sequence <= lo)
+                break;
+            probe(sequence);
+        }
+
+        while (record->kind == PlannedRecord::Kind::Ordinary && hi && *hi - lo > 1)
+            probe(lo + (*hi - lo) / 2);
+
+        switch (record->kind)
+        {
+            case PlannedRecord::Kind::Ordinary:
+                if (hi && *hi - lo == 1)
+                    plan.stop = RefTxnId{epoch, *hi};
+                return plan;
+            case PlannedRecord::Kind::End:
+                return plan;
+            case PlannedRecord::Kind::Seal:
+                if (plan.crossings == kRefPlanMaxCrossings)
+                {
+                    plan.crossing_limit_reached = true;
+                    return plan;
+                }
+                ++plan.crossings;
+                head = record->head;
+                break;
+        }
+    }
+}
+
 }
 
 Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
@@ -2475,7 +2700,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
     /// sets `ref_folding_aborted` anymore.
     ///
     /// Phase `fold_ref_intake`: one GET per record (always owed -- the round read every body anyway),
-    /// plus one exact 404 probe per namespace to prove its frontier, the reads that resolve a cold cursor,
+    /// plus the exact 404 probes that fix each namespace's stop -- one for a quiet namespace, up to about
+    /// `1 + log2(m + 1)` for one `m` records past its listed tail -- the reads that resolve a cold cursor,
     /// and one GET per manifest edge, which on a busy pool is where the round's object-read budget goes.
     /// It also carries probe B1's two numbers -- reported on EVERY healthy round, so
     /// "logs_accounted always equals logs_applied" becomes an observable property of the table rather than
@@ -2542,12 +2768,13 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
     /// `backlog / (walker_rate - writer_rate)`, which diverges the moment a writer keeps up with the
     /// walker; then the fold seal, its cursors and ref-object cleanup stop too.
     ///
-    /// Two things end it. The CUT: a walk ends at the first key it reads absent or at a terminal record,
-    /// and nothing above that key is folded this round even if it lands later. The SLICE
-    /// (`kRefIntakeBudgetMs`): pass 1 gives every namespace its start and one read window and is never
-    /// cut, so every quiet namespace is proven; pass 2 continues the rest from `round mod n` and starts
-    /// no read once the slice is over. A namespace the slice cuts keeps the cursor it reached and is
-    /// unproven, which suppresses the round's destruction but not its fold.
+    /// Two things end it. The STOP: before the first manifest read, `planRefStops` fixes each life's end
+    /// by exact `GET`s, and the walk ends at that key or at a terminal record without another request;
+    /// nothing above it is folded this round even if it lands later. The SLICE (`kRefIntakeBudgetMs`):
+    /// pass 1 gives every namespace one read window and is never cut, so every quiet namespace is
+    /// proven; pass 2 continues the rest from `round mod n` and starts no read once the slice is over.
+    /// A namespace the slice cuts keeps the cursor it reached and is unproven, which suppresses the
+    /// round's destruction but not its fold.
     ///
     /// THE PROOF IS A READ. A quiet namespace costs one exact `GET` of its successor because that read
     /// IS the frontier proof: an unprovable namespace leaves `frontier_complete` false forever, which
@@ -2643,7 +2870,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         std::optional<RefHold> carried_hold;
         std::optional<RefCkpt> checkpoint;
         std::optional<RecoveryGrounding> grounding;
-        /// The cursor is nonzero and the memo does not name it: pass 1 resolves its successor first.
+        /// The cursor is nonzero and the memo does not name it: planning resolves its successor first.
         bool resolve_start = false;
         /// The next key on the chain. Unset once the walk ended: at an absent key, at a terminal record, or
         /// at a hold. Still set at the end of the round means the slice cut it.
@@ -2668,6 +2895,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         std::vector<std::pair<RefTxnId, RefTxnId>> segments;
         /// Read-ahead hinted in `expected`'s epoch and not yet taken, in key order.
         std::deque<std::pair<RefTxnId, String>> lookahead;
+        /// Empty until planning ran: the walk then reads nothing.
+        RefStopPlan plan;
     };
 
     /// The witness role: the smallest id above the absent `id` that SOMETHING says exists. An absent
@@ -2760,11 +2989,14 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         s.lookahead.clear();
     };
 
+    /// Bodies planning read, which the walk takes instead of reading them again.
+    RetainedRefBodies retained_ref_bodies(ref_plan_retained_bytes);
+
     /// READ-AHEAD inside `expected`'s epoch, up to the greatest id the listing shows in that epoch and at
-    /// most `budget` keys past `expected`. The walk takes results only in successor order, so a hint never
-    /// decides anything; bounding it by the listing keeps it off keys past the end of the chain, including
-    /// any key after a terminal record, and the budget keeps a walk that pauses from leaving fetched
-    /// results it would fetch again.
+    /// most `budget` keys past `expected`, skipping bodies planning kept. The walk takes results only in
+    /// successor order, so a hint never decides anything; bounding it by the listing keeps it off keys past
+    /// the end of the chain, including any key after a terminal record, and the budget keeps a walk that
+    /// pauses from leaving fetched results it would fetch again.
     const auto topUpLookahead = [&](NamespaceIntake & s, size_t budget)
     {
         const size_t limit = std::min<size_t>(reads.window(), budget);
@@ -2782,6 +3014,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         {
             next = RefTxnId{next.writer_epoch, next.ref_sequence + 1};
             String key = layout.refLogKey(s.life, next);
+            if (retained_ref_bodies.contains(key))
+                continue;
             reads.hintRead(key, ReadFamily::RefLog);
             s.lookahead.emplace_back(next, std::move(key));
         }
@@ -2903,7 +3137,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         }
 
         /// The first key: `{life_epoch,1}` on the first fold, the remembered successor of an unchanged
-        /// cursor, or else what `resolveRefCursorSuccessor` proves in pass 1.
+        /// cursor, or else what `resolveRefCursorSuccessor` proves when planning starts on this life.
         if (s.cursor == RefTxnId{})
             s.expected = RefTxnId{*s.checkpoint->life_epoch, 1};
         else if (const auto memo_it = ref_fold_memo.find(target.life_id);
@@ -2916,7 +3150,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
             s.resolve_start = true;
     }
 
-    /// FIRST WALK POSITIONS, hinted in walk order a window deep: only the ones setup already knows. A cold
+    /// FIRST WALK POSITIONS, hinted in planning order a window deep: only the ones setup already knows. A cold
     /// cursor's `cursor + 1` is never hinted, because after a tombstone that key may be one cleanup
     /// emptied and a late create refilled.
     std::vector<String> first_walk_keys;
@@ -2931,7 +3165,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
             reads.hintRead(first_walk_keys[next_first_walk_hint++], ReadFamily::RefLog);
     };
 
-    /// Pass 1 resolves where a cold cursor resumes. A cursor below the snapshot id is never read: cleanup
+    /// Planning resolves where a cold cursor resumes. A cursor below the snapshot id is never read: cleanup
     /// may have emptied its key and a late create refilled it.
     const auto resolveStart = [&](NamespaceIntake & s)
     {
@@ -2960,8 +3194,47 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         }
     };
 
-    /// Walk `s` in successor order: at most `take_limit` `_log` reads when it is set, and with `sliced` no
-    /// read once the slice is over.
+    /// What planning did this round.
+    struct RefPlanningCounters
+    {
+        uint64_t lives = 0;
+        uint64_t hot = 0;
+        uint64_t empty_hint = 0;
+        uint64_t crossings = 0;
+        uint64_t crossing_limit = 0;
+        uint64_t misses = 0;
+        uint64_t retained_bytes = 0;
+    };
+    RefPlanningCounters planning;
+
+    /// The walk reached the key planning read absent: the life's frontier, unless something witnesses a record
+    /// at or above it.
+    const auto endAtStop = [&](NamespaceIntake & s)
+    {
+        const RefTxnId absent = *s.expected;
+        s.expected.reset();
+        const auto witness = witnessAbove(s, absent);
+        if (!witness)
+        {
+            s.frontier_proven = true;
+            s.ended_absent_at = absent;
+        }
+        else if (*witness == absent)
+            hold(s, absent, HoldReason::GapBelowWitness,
+                 "ref intake: a checkpoint-committed ref log is absent -- its authoritative "
+                 "frontier cannot be complete");
+        else if (witness->writer_epoch == absent.writer_epoch)
+            hold(s, absent, HoldReason::GapBelowWitness,
+                 "ref intake: expected next id absent below a same-epoch witness -- "
+                 "contiguity says this cannot happen, so a durable record is missing");
+        else
+            hold(s, absent, HoldReason::UnconsumedSealCrossing,
+                 "ref intake: a later epoch's records are witnessed but the chain ends below them -- "
+                 "no record links to that epoch");
+    };
+
+    /// Walk `s` in successor order to the stop its plan fixed: at most `take_limit` records when it is set,
+    /// and with `sliced` no read once the slice is over. Ending at the stop reads nothing.
     const auto walkNamespace = [&](NamespaceIntake & s, std::optional<size_t> take_limit, bool sliced)
     {
         const String & ns_str = s.target->ns;
@@ -2970,40 +3243,46 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         std::optional<RefHold> & fired = s.fired;
         RefTxnId & resolved_through = s.resolved_through;
         size_t takes = 0;
-        while (s.expected && (!take_limit || takes < *take_limit) && (!sliced || mono_ms_fn() < intake_deadline_ms))
+        while (s.expected && (!take_limit || takes < *take_limit))
         {
-            /// GET + decode the expected record. Absence is the decision point of the whole walk, and
-            /// an invalid body is a per-namespace hold: the key belongs to exactly one namespace, so it
-            /// can never be grounds for discarding another namespace's fold.
+            if (s.plan.isStop(*s.expected))
+            {
+                endAtStop(s);
+                break;
+            }
+            /// Nothing this attempt observed bounds a key past the plan, so reading on would chase writers.
+            if (!s.plan.covers(*s.expected))
+            {
+                s.expected.reset();
+                s.unproven_reason = FoldResult::FrontierUnproven::DiscoveryIncomplete;
+                break;
+            }
+            if (sliced && mono_ms_fn() >= intake_deadline_ms)
+                break;
+
+            /// Take + decode the expected record. An invalid body is a per-namespace hold: the key belongs
+            /// to exactly one namespace, so it can never be grounds for discarding another namespace's fold.
             topUpLookahead(s, take_limit ? *take_limit - takes - 1 : std::numeric_limits<size_t>::max());
             const String expected_key = layout.refLogKey(life, *s.expected);
-            const auto got = reads.takeRead(expected_key, ReadFamily::RefLog);
+            std::optional<Object> got = retained_ref_bodies.take(expected_key);
+            if (!got)
+            {
+                got = reads.takeRead(expected_key, ReadFamily::RefLog);
+                if (got)
+                    ProfileEvents::increment(ProfileEvents::CASRefLogBodyGets);
+            }
             ++takes;
             if (!s.lookahead.empty() && s.lookahead.front().first == *s.expected)
                 s.lookahead.pop_front();
             if (!got)
             {
+                /// Planning read this key or a later one of its epoch present, so a record durable then is gone:
+                /// lost history, never the end of the chain.
                 ++intake_absent_probes;
                 const RefTxnId absent = *s.expected;
-                s.expected.reset();
-                const auto witness = witnessAbove(s, absent);
-                if (!witness)
-                {
-                    s.frontier_proven = true;
-                    s.ended_absent_at = absent;
-                }
-                else if (*witness == absent)
-                    hold(s, absent, HoldReason::GapBelowWitness,
-                         "ref intake: a checkpoint-committed ref log is absent -- its authoritative "
-                         "frontier cannot be complete");
-                else if (witness->writer_epoch == absent.writer_epoch)
-                    hold(s, absent, HoldReason::GapBelowWitness,
-                         "ref intake: expected next id absent below a same-epoch witness -- "
-                         "contiguity says this cannot happen, so a durable record is missing");
-                else
-                    hold(s, absent, HoldReason::UnconsumedSealCrossing,
-                         "ref intake: a later epoch's records are witnessed but the chain ends below them -- "
-                         "no record links to that epoch");
+                hold(s, absent, HoldReason::GapBelowWitness,
+                     "ref intake: probed present, read absent -- a ref log planning saw at or above this "
+                     "position is gone, so a durable record is missing");
                 break;
             }
             const RefTxnId log_id = *s.expected;
@@ -3012,7 +3291,6 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
             /// committed, so it is correctly not reported unapplied.
             const uint32_t txn_ordinal = ledger.open(ns, log_id);
 
-            ProfileEvents::increment(ProfileEvents::CASRefLogBodyGets);   /// one body GET per new log
             RefLogTxn txn;
             std::vector<RefManifestEdge> edges;
             std::optional<RefTxnId> successor;
@@ -3305,23 +3583,44 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
             ++intake_tables_clamped;
     };
 
-    /// PASS 1 is never cut: every namespace gets its start resolution and one read window, which proves
-    /// every quiet namespace in every round.
+    /// PASS 1 is never cut: every namespace gets one read window, which proves every quiet namespace in
+    /// every round.
     const auto afterWalkHook = [&](uint8_t pass, const NamespaceIntake & walked, const NamespaceIntake * next)
     {
         if (round_point_hook_for_test)
             runRoundPointHookForTest({.point = RoundPointForTest::AfterNamespaceWalk, .pass = pass,
                                       .walked = walked.target->ns, .next = next ? next->target->ns : String{}});
     };
+
+    /// PLANNING: every life that still has a key to read gets its stop before any manifest is read.
+    for (NamespaceIntake & s : intakes)
+    {
+        if (!s.expected && !s.resolve_start)
+            continue;
+        topUpFirstWalkHints();
+        if (s.resolve_start)
+            resolveStart(s);
+        if (!s.expected)
+            continue;
+        const uint64_t absent_before = intake_absent_probes;
+        s.plan = planRefStops(reads, layout, s.life, *s.expected, hintFromListing(*s.target->listing),
+                              retained_ref_bodies, intake_absent_probes);
+        ++planning.lives;
+        planning.hot += s.plan.first_present;
+        planning.empty_hint += s.plan.hint_ids.empty();
+        planning.crossings += s.plan.crossings;
+        planning.crossing_limit += s.plan.crossing_limit_reached;
+        planning.misses += intake_absent_probes - absent_before;
+    }
+    reads.closeApply();
+    planning.retained_bytes = retained_ref_bodies.keptBytes();
+
     if (round_point_hook_for_test)
         runRoundPointHookForTest(RoundPointForTest::AfterDiscovery);
     const size_t pass_one_takes = std::max<size_t>(reads.window(), 1);
     for (size_t i = 0; i < intakes.size(); ++i)
     {
         NamespaceIntake & s = intakes[i];
-        topUpFirstWalkHints();
-        if (s.resolve_start)
-            resolveStart(s);
         walkNamespace(s, pass_one_takes, /*sliced=*/false);
         if (i + 1 < intakes.size())
             afterWalkHook(1, s, &intakes[i + 1]);
