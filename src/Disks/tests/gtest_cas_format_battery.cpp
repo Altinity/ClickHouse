@@ -1,4 +1,7 @@
 #include "cas_format_test_battery.h"
+#include "cas_test_helpers.h"
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobIntentFormat.h>
+#include <IO/ReadBufferFromMemory.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPoolMetaFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 
@@ -59,4 +62,61 @@ TEST(CASPoolMeta, ValidateAlgosUsedRejectsUnknownByte)
 {
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [] { validatePoolAlgosUsed({7}, DB::ErrorCodes::CORRUPTED_DATA, "t"); });
+}
+
+CAS_BATTERY_COVERS(BlobIntent);
+
+/// The record has no codec of its own (consumers compare bytes), so the battery decodes it the way a
+/// header-gated reader would: header line, then a body line that must be exactly `{}`.
+namespace
+{
+
+void decodeBlobIntent(std::string_view stored)
+{
+    const String text(openObject(FormatId::BlobIntent, stored));
+    DB::ReadBufferFromMemory in(text.data(), text.size());
+    expectHeaderLine(in, FormatId::BlobIntent);
+    const String body = readLine(in, traitsFor(FormatId::BlobIntent).line_cap, "cas_blob_intent");
+    if (body != "{}" || !in.eof())
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "cas_blob_intent: unexpected body '{}'", body);
+}
+
+}
+
+TEST(CASFormatBattery, BlobIntent)
+{
+    const DB::Cas::tests::ScopedReadCeiling ceiling(G_BLOB_INTENTS);
+    runFormatBattery(FormatBatteryCase{
+        .id = FormatId::BlobIntent,
+        .encode = [] { return sealObject(FormatId::BlobIntent, blobIntentRecord()); },
+        .decode = decodeBlobIntent,
+        .golden = "{\"type\":\"cas_blob_intent\",\"v\":4}\n{}\n",
+        .make_future_version = [](std::string_view text)
+        {
+            String future(text);
+            const String now = "\"v\":4";
+            future.replace(future.find(now), now.size(), "\"v\":5");
+            return future;
+        }});
+}
+
+TEST(CASFormatBattery, BlobIntentTraitsAreThePinnedRecordClass)
+{
+    const FormatTraits & t = traitsFor(FormatId::BlobIntent);
+    EXPECT_EQ(t.type, "cas_blob_intent");
+    EXPECT_EQ(t.family, TextFamily::Control);
+    EXPECT_EQ(t.compression, CompressionPolicy::PinnedRaw);
+    EXPECT_EQ(t.object_cap, 4u * 1024);
+    EXPECT_EQ(t.line_cap, 1u * 1024);
+    EXPECT_EQ(storedSuffix(FormatId::BlobIntent), "");
+}
+
+TEST(CASFormatBattery, BlobIntentIsRefusedByAnOlderReader)
+{
+    {
+        const DB::Cas::tests::ScopedReadCeiling ceiling(G_BLOB_INTENTS);
+        decodeBlobIntent(blobIntentRecord());   /// positive control: the record decodes at its own generation
+    }
+    const DB::Cas::tests::ScopedReadCeiling ceiling(3);
+    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [] { decodeBlobIntent(blobIntentRecord()); });
 }

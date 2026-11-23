@@ -321,22 +321,9 @@ TEST(CASPersistedEtag, RoundTripsThroughEveryFormatAndNeverBecomesAnIncarnation)
         EXPECT_EQ(back.entries[0].token.dialect, recorded.dialect);
         EXPECT_EQ(back.entries[0].token.value, recorded.value);
     }
-
-    /// 4. The condemned row's packed byte form, whose dialect rides one byte rather than a word.
-    {
-        const CondemnedRow row{.delete_pending = false, .token = recorded, .size = 5,
-                               .condemn_round = 11, .marker_confirmed = true};
-        EXPECT_EQ(decodeCondemnedRow(encodeCondemnedRow(row)), row);
-    }
 }
 
-/// Both directions of the dialect vocabulary fail closed, so neither encoding can carry a value the
-/// other cannot name.
-TEST(CASPersistedEtag, UnknownDialectWordAndByteAreBothRefused)
+TEST(CASPersistedEtag, UnknownDialectWordIsRefused)
 {
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { dialectWordFromString("etags", "t"); });
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { dialectByteFromWord("etags", "t"); });
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { dialectWordFromByte(0, "t"); });
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { dialectWordFromByte(4, "t"); });
-    EXPECT_EQ(dialectWordFromByte(dialectByteFromWord("generation", "t"), "t"), "generation");
 }

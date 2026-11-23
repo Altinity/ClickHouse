@@ -19,6 +19,7 @@
 #include <Interpreters/Context.h>
 #include <Interpreters/ContentAddressedGarbageCollectionLog.h>
 #include <Interpreters/ContentAddressedLog.h>
+#include <atomic>
 #include <Common/CurrentThread.h>
 #include <base/getThreadId.h>
 #include <Common/DateLUT.h>
@@ -69,9 +70,10 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 gc_snapshot_generations_to_keep;
     extern const ContentAddressedSettingsUInt64 gc_shards;
     extern const ContentAddressedSettingsUInt64 manifest_sweep_list_budget_keys;
+    extern const ContentAddressedSettingsUInt64 intent_sweep_list_budget_keys;
     extern const ContentAddressedSettingsUInt64 manifest_sweep_delete_budget_keys;
     extern const ContentAddressedSettingsUInt64 orphan_manifest_sweep_interval_sec;
-    extern const ContentAddressedSettingsUInt64 gc_round_graduation_budget;
+    extern const ContentAddressedSettingsUInt64 gc_round_intent_create_budget;
     extern const ContentAddressedSettingsUInt64 gc_round_redelete_budget;
     extern const ContentAddressedSettingsUInt64 gc_round_sweep_namespace_budget;
     extern const ContentAddressedSettingsUInt64 gc_round_sweep_recovery_op_budget;
@@ -87,7 +89,6 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 part_folder_cache_max_entry_bytes;
     extern const ContentAddressedSettingsBool allow_packed_parts;
     extern const ContentAddressedSettingsUInt64 manifest_decode_cache_bytes;
-    extern const ContentAddressedSettingsUInt64 gc_meta_pool_size;
     extern const ContentAddressedSettingsUInt64 gc_io_concurrency;
     extern const ContentAddressedSettingsUInt64 gc_bulk_delete_chunk_keys;
     extern const ContentAddressedSettingsUInt64 attempt_timeout_ms;
@@ -296,9 +297,10 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , gc_snapshot_generations_to_keep(settings_[ContentAddressedSetting::gc_snapshot_generations_to_keep].value)
     , gc_shards(settings_[ContentAddressedSetting::gc_shards].value)
     , manifest_sweep_list_budget_keys(settings_[ContentAddressedSetting::manifest_sweep_list_budget_keys].value)
+    , intent_sweep_list_budget_keys(settings_[ContentAddressedSetting::intent_sweep_list_budget_keys].value)
     , manifest_sweep_delete_budget_keys(settings_[ContentAddressedSetting::manifest_sweep_delete_budget_keys].value)
     , orphan_manifest_sweep_interval_sec(settings_[ContentAddressedSetting::orphan_manifest_sweep_interval_sec].value)
-    , gc_round_graduation_budget(settings_[ContentAddressedSetting::gc_round_graduation_budget].value)
+    , gc_round_intent_create_budget(settings_[ContentAddressedSetting::gc_round_intent_create_budget].value)
     , gc_round_redelete_budget(settings_[ContentAddressedSetting::gc_round_redelete_budget].value)
     , gc_round_sweep_namespace_budget(settings_[ContentAddressedSetting::gc_round_sweep_namespace_budget].value)
     , gc_round_sweep_recovery_op_budget(settings_[ContentAddressedSetting::gc_round_sweep_recovery_op_budget].value)
@@ -314,7 +316,6 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , cas_part_folder_cache_max_entry_bytes(settings_[ContentAddressedSetting::part_folder_cache_max_entry_bytes].value)
     , allow_packed_parts(settings_[ContentAddressedSetting::allow_packed_parts].value)
     , manifest_decode_cache_bytes(settings_[ContentAddressedSetting::manifest_decode_cache_bytes].value)
-    , gc_meta_pool_size(settings_[ContentAddressedSetting::gc_meta_pool_size].value)
     , gc_io_concurrency(settings_[ContentAddressedSetting::gc_io_concurrency].value)
     , gc_bulk_delete_chunk_keys(settings_[ContentAddressedSetting::gc_bulk_delete_chunk_keys].value)
     , cas_attempt_timeout_ms(settings_[ContentAddressedSetting::attempt_timeout_ms].value)
@@ -557,9 +558,9 @@ Cas::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogger() const
         e.objects_spared = r.objects_spared;
         e.manifests_deleted = r.manifests_deleted;
         e.entries_condemned = r.entries_condemned;
-        e.entries_graduated = r.entries_graduated;
-        e.entries_redeleted = r.entries_redeleted;
-        e.entries_redelete_failed = r.entries_redelete_failed;
+        e.entries_intent_confirmed = r.entries_intent_confirmed;
+        e.entries_bodies_deleted = r.entries_bodies_deleted;
+        e.entries_body_delete_failed = r.entries_body_delete_failed;
         e.fence_outs = r.fence_outs;
         e.anomalies = r.anomalies;
         e.duration_ms = r.duration_ms;
@@ -721,7 +722,27 @@ std::optional<uint64_t> ContentAddressedMetadataStorage::freezeConnectTimeoutCap
 #endif
 }
 
-ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openPoolView(bool context_available) const
+namespace
+{
+std::atomic<bool> defer_pool_open_for_migration{false};
+}
+
+void setDeferPoolOpenForMigration(bool defer)
+{
+    defer_pool_open_for_migration.store(defer);
+}
+
+bool deferPoolOpenForMigration()
+{
+    return defer_pool_open_for_migration.load();
+}
+
+Cas::PoolPtr ContentAddressedMetadataStorage::openPoolForMigration() const
+{
+    return openPoolView(/*context_available=*/false, /*for_migration=*/true).pool;
+}
+
+ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openPoolView(bool context_available, bool for_migration) const
 {
     /// Native mode rides real conditional ops (probed fail-closed by Pool::open); Local object
     /// storage has none, so the backend emulates exact token semantics in-process (single server).
@@ -798,9 +819,10 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     pool_config.gc_snapshot_generations_to_keep = gc_snapshot_generations_to_keep;
     pool_config.gc_shards = gc_shards;
     pool_config.manifest_sweep_list_budget_keys = manifest_sweep_list_budget_keys;
+    pool_config.intent_sweep_list_budget_keys = intent_sweep_list_budget_keys;
     pool_config.manifest_sweep_delete_budget_keys = manifest_sweep_delete_budget_keys;
     pool_config.orphan_manifest_sweep_interval_sec = orphan_manifest_sweep_interval_sec;
-    pool_config.gc_round_graduation_budget = gc_round_graduation_budget;
+    pool_config.gc_round_intent_create_budget = gc_round_intent_create_budget;
     pool_config.gc_round_redelete_budget = gc_round_redelete_budget;
     pool_config.gc_round_sweep_namespace_budget = gc_round_sweep_namespace_budget;
     pool_config.gc_round_sweep_recovery_op_budget = gc_round_sweep_recovery_op_budget;
@@ -808,7 +830,6 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     pool_config.gc_round_prefix_wholesale_budget = gc_round_prefix_wholesale_budget;
     pool_config.gc_round_handoff_prefix_wholesale_budget = gc_round_handoff_prefix_wholesale_budget;
     pool_config.gc_round_outcome_entry_budget = gc_round_outcome_entry_budget;
-    pool_config.gc_meta_pool_size = gc_meta_pool_size;
     pool_config.gc_io_concurrency = gc_io_concurrency;
     pool_config.gc_bulk_delete_chunk_keys = gc_bulk_delete_chunk_keys;
     pool_config.cas_request_budget.attempt_timeout_ms = cas_attempt_timeout_ms;
@@ -842,7 +863,8 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     view.physical_key_prefix = physical_key_prefix_local;
     view.pool_prefix = pool_prefix;
     view.native_token_type = backend->nativeTokenType();
-    view.pool = Cas::Pool::open(std::move(backend), std::move(pool_config));
+    view.pool = for_migration ? Cas::Pool::openForMigration(std::move(backend), std::move(pool_config))
+                              : Cas::Pool::open(std::move(backend), std::move(pool_config));
     return view;
 }
 
@@ -865,6 +887,10 @@ void ContentAddressedMetadataStorage::startup()
     /// Observe-only mode (the disk's <readonly> config): skip the probe (a probe write would fail on
     /// a read-only backend), run no watermark, start no GC, and fail the mutating surface closed.
     read_only = object_storage->isReadOnly();
+
+    /// `cas-migrate-pool` opens the pool itself, at a floor no ordinary open accepts.
+    if (deferPoolOpenForMigration())
+        return;
 
     /// Explicit S3 staging can publish only by provider-native same-store copy. Validate the actual
     /// object-storage configuration before opening a writable mount; never infer capability from an
@@ -2430,7 +2456,7 @@ CaRelinkPrepare ContentAddressedMetadataStorage::prepareAdoptFromManifest(
     /// plainly that a confirmed relink is not proven dangle-free (`DataPartsExchange.cpp`, "What a
     /// `yes` does NOT prove"). Durable-before-asking is necessary, not sufficient.
     ///
-    /// Promotion trusts the adopted leaves via the durable manifest edge (no per-file HEAD/loadMeta
+    /// Promotion trusts the adopted leaves via the durable manifest edge (no per-file HEAD
     /// probe); a genuinely-absent adopted blob is an invariant violation caught by fsck, not here — the
     /// ordinary ReplicatedMergeTree interserver trust.
     out.reset();

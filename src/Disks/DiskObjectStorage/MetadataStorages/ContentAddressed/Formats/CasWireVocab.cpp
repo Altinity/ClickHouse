@@ -27,20 +27,6 @@ std::string_view dialectWordFromString(std::string_view w, std::string_view what
     return kTokenTypeWords.toWord(kTokenTypeWords.fromWord(w, what), what);
 }
 
-uint8_t dialectByteFromWord(std::string_view w, std::string_view what)
-{
-    return static_cast<uint8_t>(kTokenTypeWords.fromWord(w, what));
-}
-
-std::string_view dialectWordFromByte(uint8_t byte, std::string_view what)
-{
-    for (const auto & entry : kTokenTypeWords.entries)
-        if (static_cast<uint8_t>(entry.value) == byte)
-            return entry.word;
-    /// The byte comes off persisted media, so an unknown one is malformed data, not a caller bug.
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: unknown dialect byte {}", what, byte);
-}
-
 BlobHashAlgo blobHashAlgoFromWord(std::string_view w, std::string_view what)
 {
     return kBlobHashAlgoWords.fromWord(w, what);

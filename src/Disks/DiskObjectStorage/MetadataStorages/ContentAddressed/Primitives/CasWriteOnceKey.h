@@ -8,9 +8,10 @@ namespace DB::Cas
 class Layout;
 
 /// The key of an object that is written once and never rewritten: a part manifest, a ref log, a ref
-/// snapshot. Only `Layout` mints one, from the typed identity of such an object, so a verb that
-/// accepts this type can delete without a precondition: whatever body the key holds is the one body
-/// it ever held. A mutable control object (a checkpoint, the catalog, `gc/state`, a mount lease) has
+/// snapshot, a blob intent. Only `Layout` mints one, from the typed identity of such an object, so a
+/// verb that accepts this type can delete without a precondition: whatever the key holds is the one
+/// byte string it ever holds. A blob intent's key may be deleted and created again, always with the
+/// same constant bytes. A mutable control object (a checkpoint, the catalog, `gc/state`, a mount lease) has
 /// no path to this type.
 class WriteOnceKey
 {

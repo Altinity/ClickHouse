@@ -24,7 +24,6 @@ class AltinityArtifactConfigs:
 
 class AltinityJobNames:
     SIGN_RELEASE = "Sign release"
-    SOURCE_UPLOAD = "Source upload"
 
 
 class AltinityJobConfigs:
@@ -62,15 +61,6 @@ class AltinityJobConfigs:
             provides=[AltinityArtifactNames.SIGNED_ARM_RELEASE],
         ),
     )
-    # No digest_config: the job tars the whole source tree, which changes every
-    # commit, so it must never be skipped by the content-addressed CI cache.
-    source_upload_job = Job.Config(
-        name=AltinityJobNames.SOURCE_UPLOAD,
-        runs_on=RunnerLabels.STYLE_CHECK_AMD,
-        command="python3 ./ci/jobs/source_upload.py",
-        timeout=3600,
-        needs_submodules=True,
-    )
     # Stateless tests with a content-addressed disk as the default MergeTree storage.
     cas_functional_tests_jobs = common_ft_job_config.parametrize(
         # CAS over S3: RustFS, not MinIO OSS, because the incarnation pool needs
@@ -80,8 +70,10 @@ class AltinityJobConfigs:
             runs_on=RunnerLabels.AMD_MEDIUM_CPU,
             requires=[ArtifactNames.CH_AMD_BINARY_GH],
         ),
-        # The sanitizer lanes are sharded because an unsharded one exceeds the 6h
-        # GitHub job timeout and is killed before it uploads any results.
+        # The sanitizer lanes use the runner, shard count and timeout of the ordinary
+        # stateless parallel lane of the same sanitizer; they are sharded because an
+        # unsharded one exceeds the 6h GitHub job timeout and is killed before it uploads
+        # any results.
         *[
             Job.ParamSet(
                 parameter=f"amd_asan_ubsan, cas s3 storage, parallel, {batch}/{total_batches}",
@@ -102,19 +94,20 @@ class AltinityJobConfigs:
         *[
             Job.ParamSet(
                 parameter=f"amd_tsan, cas s3 storage, parallel, {batch}/{total_batches}",
-                runs_on=RunnerLabels.AMD_MEDIUM,
+                runs_on=RunnerLabels.AMD_LARGE,
                 requires=[ArtifactNames.CH_AMD_TSAN_GH],
             )
-            for total_batches in (2,)
+            for total_batches in (4,)
             for batch in range(1, total_batches + 1)
         ],
         *[
             Job.ParamSet(
                 parameter=f"amd_msan, cas s3 storage, parallel, {batch}/{total_batches}",
-                runs_on=RunnerLabels.FUNC_TESTER_AMD,
+                runs_on=RunnerLabels.AMD_LARGE,
                 requires=[ArtifactNames.CH_AMD_MSAN_GH],
+                timeout=3600 * 4,
             )
-            for total_batches in (3,)
+            for total_batches in (6,)
             for batch in range(1, total_batches + 1)
         ],
         Job.ParamSet(

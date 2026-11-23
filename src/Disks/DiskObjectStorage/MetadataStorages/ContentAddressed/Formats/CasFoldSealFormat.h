@@ -166,7 +166,7 @@ struct RefLifeFoldState
     bool operator==(const RefLifeFoldState &) const = default;
 };
 
-/// Per-shard summary of condemned rows carried in the sealed source-edge run. It lets graduation and
+/// Per-shard summary of condemned rows carried in the sealed source-edge run. It lets row-decision and
 /// pure reference-carry decisions inspect the seal without reading a run. Every newly written seal has
 /// an entry for every shard in `0..gc_shards-1`: a folding shard computes its entry from its remaining
 /// condemned rows, while a pure-carry shard copies the parent's entry. Missing entries are invalid and
@@ -174,7 +174,7 @@ struct RefLifeFoldState
 struct CondemnedSummary
 {
     uint64_t condemned_total = 0;   /// count of `RunMarker::Condemned` rows in this shard's sealed run
-    uint64_t pending_total = 0;     /// how many of those are `delete_pending` (a graduation is due)
+    uint64_t pending_total = 0;     /// how many of those are `delete_pending` (a row decision is due)
     uint64_t oldest_nonpending_condemn_round = UINT64_MAX;   /// min condemn_round over non-pending; UINT64_MAX = none
     bool operator==(const CondemnedSummary &) const = default;
 };

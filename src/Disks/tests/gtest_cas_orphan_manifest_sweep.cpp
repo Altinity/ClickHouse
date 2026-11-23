@@ -1055,7 +1055,6 @@ RefOp removing(const String & ref_name, const ManifestRef & m)
 
 TEST(CASOrphanManifestSweep, RemovalAboveTheCursorAcrossASkippedEpochStaysProtected)
 {
-    ScopedReadCeiling c(3);
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
     ChainSweepFixture f(*backend, store->layout(), RootNamespace{"00/sweep-skipped-epoch@cas@"});
@@ -1078,7 +1077,6 @@ TEST(CASOrphanManifestSweep, RemovalAboveTheCursorAcrossASkippedEpochStaysProtec
 
 TEST(CASOrphanManifestSweep, RemovalWalkDoesNotTrustAReclaimedCursorKey)
 {
-    ScopedReadCeiling c(3);
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
     ChainSweepFixture f(*backend, store->layout(), RootNamespace{"00/sweep-reclaimed-cursor@cas@"});
@@ -1138,7 +1136,6 @@ void seedLaggingSweep(Backend & backend, ChainSweepFixture & f)
 
 TEST(CASOrphanManifestSweep, LaggingSweepRestartsOnceWhenItsCursorMoved)
 {
-    ScopedReadCeiling c(3);
     {
         auto backend = std::make_shared<SweepReadHookBackend>();
         auto store = openPoolForTest(backend);
@@ -1173,7 +1170,6 @@ TEST(CASOrphanManifestSweep, LaggingSweepRestartsOnceWhenItsCursorMoved)
 
 TEST(CASOrphanManifestSweep, SweepNamespaceSkipsALifeErasedUnderItsWalk)
 {
-    ScopedReadCeiling c(3);
     auto backend = std::make_shared<SweepReadHookBackend>();
     auto store = openPoolForTest(backend);
     ChainSweepFixture f(*backend, store->layout(), RootNamespace{"00/sweep-erased-life@cas@"});
@@ -1234,7 +1230,6 @@ public:
 /// a terminal record read there proves the end only while `_ckpt` has not moved.
 TEST(CASOrphanManifestSweep, TerminalAtTheCursorUnderAMovedBaseKeepsEveryCandidate)
 {
-    ScopedReadCeiling c(3);
     auto backend = std::make_shared<SweepReadHookBackend>();
     auto store = openPoolForTest(backend);
     ChainSweepFixture f(*backend, store->layout(), RootNamespace{"00/sweep-terminal-cursor@cas@"});
@@ -1271,7 +1266,6 @@ TEST(CASOrphanManifestSweep, TerminalAtTheCursorUnderAMovedBaseKeepsEveryCandida
 
 TEST(CASOrphanManifestSweep, CheckpointMovingOnEveryWalkExhaustsTheRestartsAndKeepsEveryCandidate)
 {
-    ScopedReadCeiling c(3);
     auto backend = std::make_shared<CkptChurnBackend>();
     auto store = openPoolForTest(backend);
     ChainSweepFixture f(*backend, store->layout(), RootNamespace{"00/sweep-ckpt-churn@cas@"});

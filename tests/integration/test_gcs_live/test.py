@@ -1379,7 +1379,7 @@ def test_live_cas_condemned_staged_source_retags_by_streaming(auth_mode, staged_
     assert len(target_events) == 1, "the condemned target did not have one publication decision"
     retag = target_events[0]
     assert retag["event_type"] == "blob_put"
-    assert retag["detail"].get("publication_reason") == "condemned"
+    assert retag["detail"].get("publication_reason") == "intent_present"
     assert retag["detail"].get("transport") == "streaming"
     assert int(node.query("SELECT count() FROM {}".format(second_table))) == 64
     node.query("DROP TABLE {} SYNC".format(second_table))
@@ -1430,13 +1430,14 @@ def test_live_cas_queued_old_token_delete_misses_retagged_replacement(auth_mode,
     assert retired_count == 1, "the queued target did not record exactly one retirement generation"
     assert retired_numeric, "the queued incarnation left the numeric GCS generation domain"
     assert retired_generation_digest, "the queued incarnation produced no opaque generation evidence"
-    _gc_until(
-        node,
-        ambiguity_disk,
-        target_hash,
-        "gc_recheck_verdict",
-        outcome="pending",
-    )
+    # The round that retired the target also committed it as pending, so the event is already there. Another
+    # round would delete the body before the driver below is armed.
+    pending = [
+        event
+        for event in _cas_events(node, ambiguity_disk, event_types=("gc_recheck_verdict",), object_hash=target_hash)
+        if event["outcome"] == "pending"
+    ]
+    assert len(pending) == 1, "the round that retired the target did not commit it as pending"
     _create_payload_table(node, replacement_table, ambiguity_disk)
 
     scenario_id = _query_id("queued_delete_driver", auth_mode)
@@ -1472,7 +1473,7 @@ def test_live_cas_queued_old_token_delete_misses_retagged_replacement(auth_mode,
     )
     assert len(retag_events) == 1, "the held-delete target had no single writer decision"
     assert retag_events[0]["event_type"] == "blob_put"
-    assert retag_events[0]["detail"].get("publication_reason") == "condemned"
+    assert retag_events[0]["detail"].get("publication_reason") == "intent_present"
     assert retag_events[0]["detail"].get("transport") == "streaming"
 
     delete_events = _cas_events(

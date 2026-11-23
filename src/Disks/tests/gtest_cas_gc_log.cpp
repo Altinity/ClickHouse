@@ -7,8 +7,17 @@
 #include <Disks/tests/cas_test_helpers.h>
 
 #include <Common/Exception.h>
+#include <Common/ProfileEvents.h>
+#include <Common/CurrentThread.h>
+#include <Common/ThreadStatus.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobIntentFormat.h>
+#include <base/scope_guard.h>
+#include <Interpreters/ContentAddressedGarbageCollectionLog.h>
 
+#include <algorithm>
 #include <condition_variable>
+#include <map>
 #include <functional>
 #include <optional>
 #include <thread>
@@ -26,6 +35,11 @@
 /// ProfileEvents capture. The `profile_events` map is therefore EXPECTED to be empty here and this
 /// test does NOT assert it non-empty (the on-server paths are attached; the functional/soak coverage
 /// asserts non-empty there).
+
+namespace ProfileEvents
+{
+    extern const Event S3ListObjects;
+}
 
 namespace DB::ErrorCodes
 {
@@ -542,8 +556,8 @@ TEST(CASGCLog, AbortedFinishCarriesProgressiveCounters)
     /// is dropped whole and names the conflict rather than a transport error.
     EXPECT_EQ(fin.error_code, DB::ErrorCodes::ABORTED);
     EXPECT_EQ(fin.round, 0u) << "the commit never landed, so the round number must stay unstamped";
-    EXPECT_GT(fin.candidates_marked + fin.entries_condemned + fin.entries_graduated
-              + fin.entries_redeleted + fin.objects_deleted + fin.fence_outs, 0u)
+    EXPECT_GT(fin.candidates_marked + fin.entries_condemned + fin.entries_intent_confirmed
+              + fin.entries_bodies_deleted + fin.objects_deleted + fin.fence_outs, 0u)
         << "the pre-CAS work the round performed must survive into its failure row";
 }
 
@@ -749,9 +763,9 @@ TEST(CASGCLog, FoldingRoundEmitsEveryPhaseInOrder)
 
     const std::vector<String> expected = {
         "lease", "pre_fold_ref_drain", "heartbeat_floor", "defer_decision", "parent_seal_read",
-        "fold_ref_group", "fold_seal_read", "fold_ref_intake",
+        "fold_ref_group", "fold_seal_read", "fold_ref_intake", "intent_sweep_list",
         "fold_reduce", "fold_seal_write",
-        "pending_deletes", "meta_pool_wait", "round_commit", "handoff_reclaim",
+        "pending_deletes", "round_commit", "handoff_reclaim",
         "manifest_deletes", "namespace_cleanup", "ref_object_cleanup", "orphan_sweep"};
     EXPECT_EQ(phaseNames(rows, 0), expected);
 
@@ -786,12 +800,6 @@ TEST(CASGCLog, FoldingRoundEmitsEveryPhaseInOrder)
     /// reached its Finish -- which is the point: the column is the round's own attestation.
     EXPECT_EQ(metricsOf(rows, 0, "fold_reduce").at("transactions_unapplied"), 0u);
 
-    /// The honest gap: the meta pool's work runs on other threads, so this row's ProfileEvents delta is
-    /// empty by construction and these two counts are its ONLY signal. They must be real numbers.
-    const auto meta = metricsOf(rows, 0, "meta_pool_wait");
-    EXPECT_GT(meta.at("jobs_scheduled"), 0u) << "this round condemns, so it schedules condemn-marker writes";
-    EXPECT_EQ(meta.at("jobs_completed"), meta.at("jobs_scheduled"))
-        << "every scheduled job must have finished by the time the wait returns";
 }
 
 /// A round that never leads emits ONLY the phase it reached. `round` does not exist for such a round,
@@ -847,7 +855,7 @@ TEST(CASGCHealth, ReflectsLeadershipAndPendingReclaim)
     EXPECT_TRUE(h1.is_leader);
     EXPECT_TRUE(h1.ever_succeeded);
     EXPECT_EQ(h1.pending_reclaim,
-              static_cast<Int64>(rep.condemned) - static_cast<Int64>(rep.redeleted));
+              static_cast<Int64>(rep.condemned) - static_cast<Int64>(rep.bodies_deleted));
     EXPECT_EQ(h1.wedged_namespace_count, 0u);
     EXPECT_LT(h1.last_success_age_seconds, 60u);
 }
@@ -933,4 +941,86 @@ TEST(CASGCLog, NonTransientFailureCoincidingWithTeardownStaysFailed)
     EXPECT_EQ(round_rows[1].outcome, Rec::Outcome::Failed)
         << "a bug that coincides with a restart is not masked as Stopped";
     EXPECT_EQ(round_rows[1].error_code, DB::ErrorCodes::CORRUPTED_DATA);
+}
+
+namespace
+{
+
+/// Counts the `LIST` of `blob-intents/` as an S3 `ListObjects`, the counter a phase row of an S3 pool carries.
+class IntentListCountingBackend : public InMemoryBackend
+{
+public:
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
+    {
+        if (prefix.ends_with("/blob-intents/"))
+            ProfileEvents::increment(ProfileEvents::S3ListObjects);
+        return InMemoryBackend::list(prefix, cursor, limit, access);
+    }
+};
+
+}
+
+/// The intent sweep's `LIST` and its counts are in its own phase row and in no other row of the round.
+TEST(CASGcIntents, IntentSweepListIsMeasuredInItsOwnPhaseOnly)
+{
+    /// Phase rows carry the thread's `ProfileEvents` only on a thread with a `ThreadStatus`.
+    DB::ThreadStatus * const saved_thread = DB::current_thread;
+    DB::current_thread = nullptr;
+    SCOPE_EXIT({ DB::current_thread = saved_thread; });
+    DB::ThreadStatus thread_status;
+
+    auto backend = std::make_shared<IntentListCountingBackend>();
+    auto store = Pool::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0});
+    publishPart(store, "srv1/tbl", "all_0_0_0", "hello-intent-sweep");
+    store->dropRef(RootNamespace{"srv1/tbl"}, "all_0_0_0");
+    store->renewWatermarkOnce();
+    {
+        /// An intent with no row, so the page lists and nominates one key.
+        const BlobRef orphan{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of("orphan-of-the-sweep"))};
+        const String key = store->layout().blobIntentKey(orphan, *canonicalIdentity(Dialect::Emulated, "900001"));
+        DB::Cas::tests::OperationForTest op(*backend);
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(key, blobIntentRecord(), Retry::standard())));
+    }
+
+    std::vector<Rec> rows;
+    DB::Cas::CasGcScheduler sched(
+        store, std::chrono::seconds(1), "test::gc", "ca",
+        [&](const Rec & r) { rows.push_back(r); });
+    ASSERT_TRUE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
+
+    const auto sweep = metricsOf(rows, 0, "intent_sweep_list");
+    EXPECT_EQ(sweep.at("listed"), 1u);
+    EXPECT_EQ(sweep.at("nominated"), 1u);
+    EXPECT_EQ(sweep.at("unparsed"), 0u);
+    EXPECT_EQ(sweep.at("wrapped"), 1u);
+    EXPECT_EQ(sweep.at("list_budget_keys"), PoolConfig{}.intent_sweep_list_budget_keys);
+
+    std::map<String, UInt64> lists_by_phase;
+    for (const Rec & r : rows)
+        if (r.event_type == Rec::EventType::Phase)
+            if (const auto it = r.profile_events.find("S3ListObjects"); it != r.profile_events.end())
+                lists_by_phase[r.phase] += it->second;
+    EXPECT_EQ(lists_by_phase, (std::map<String, UInt64>{{"intent_sweep_list", 1}}));
+}
+
+/// The three columns that left the marker protocol's names keep their old names as aliases of the new ones.
+TEST(CASGCLog, RenamedColumnsKeepTheirOldNamesAsAliases)
+{
+    const DB::ColumnsDescription columns = DB::ContentAddressedGarbageCollectionLogElement::getColumnsDescription();
+    const DB::NamesAndAliases aliases = DB::ContentAddressedGarbageCollectionLogElement::getNamesAndAliases();
+    const std::map<String, String> expected{
+        {"entries_graduated", "entries_intent_confirmed"},
+        {"entries_redeleted", "entries_bodies_deleted"},
+        {"entries_redelete_failed", "entries_body_delete_failed"}};
+    ASSERT_EQ(aliases.size(), expected.size());
+    for (const auto & alias : aliases)
+    {
+        const auto it = expected.find(alias.name);
+        ASSERT_NE(it, expected.end()) << alias.name;
+        EXPECT_EQ(alias.expression, it->second);
+        EXPECT_TRUE(columns.has(it->second)) << "the alias names a column that exists";
+        EXPECT_FALSE(columns.has(alias.name)) << "the old name is not also a stored column";
+        EXPECT_TRUE(alias.type->equals(*columns.get(it->second).type));
+    }
 }

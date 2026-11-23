@@ -507,7 +507,8 @@ bool manifestDeletionPremise(const NamespaceFoldView & view, const ManifestKey &
     if (!(manifest.prefix.writer_epoch < cov.last_folded_ref_id.writer_epoch))
         return retain(SweepRetainClass::UnconsumedSeal,
                       "epoch " + build_epoch + "'s closing seal is not consumed: the sealed cursor is at "
-                      + renderRefTxnId(cov.last_folded_ref_id) + ", so a grant naming this build may "
+                      + (cov.last_folded_ref_id == RefTxnId{} ? String{"none"} : renderRefTxnId(cov.last_folded_ref_id))
+                      + ", so a grant naming this build may "
                       "still be unfolded above it");
 
     /// RULE 2 (spec §6). Removals DO cross epochs, so a record in a LATER epoch can name this build as a

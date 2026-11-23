@@ -226,11 +226,16 @@ TEST(CASOrphanManifestSweepScheduleGc, WaitingDoesNoSweepIo)
 {
     ScheduleFixture f;
     ASSERT_TRUE(f.run().acquired_lease);
-    const auto before = f.state();
+    auto before = f.state();
+    const auto intents_prefix = f.store->layout().blobIntentsPrefix();
+    before.intent_sweep_cursor = intents_prefix + "previous-key";
+    f.setState(before);
     f.backend->resetCounts();
     ++f.now;
     ASSERT_TRUE(f.run().acquired_lease);
     EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 0);
+    EXPECT_EQ(f.backend->listCount(intents_prefix), 1);
+    EXPECT_TRUE(f.state().intent_sweep_cursor.empty());
     EXPECT_EQ(f.metric("orphan_sweep", "orphan_manifest_sweep_page_listed"), 0);
     expectSameSchedule(f.state(), before);
 }

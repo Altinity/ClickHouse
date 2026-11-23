@@ -1,4 +1,5 @@
 #include "cas_format_test_battery.h"
+#include "cas_test_helpers.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 
@@ -7,6 +8,7 @@ using namespace DB::Cas;
 namespace DB::ErrorCodes
 {
     extern const int CORRUPTED_DATA;
+    extern const int UNKNOWN_FORMAT_VERSION;
     extern const int LOGICAL_ERROR;
 }
 
@@ -21,6 +23,7 @@ TEST(CASFormatBattery, GcState)
     s.snap_pruned_through = 7;
     s.snap_attempt = 3;
     s.manifest_sweep_cursor = "";
+    s.header_generation = G_WRITE_FLOOR;
     s.lease = GcLease{UInt128(1), 12};
     runFormatBattery({FormatId::GcState,
         [&] { return sealObject(FormatId::GcState, encodeGcState(s)); },
@@ -244,4 +247,106 @@ TEST(CASGCHeartbeatFormat, RejectsMissingIdentityFields)
 
     expectCorrupted(header + "{\"hb_seq\":\"1741\"}\n");
     expectCorrupted(header + "{\"owner\":\"00000000000000000000000000000001\"}\n");
+}
+
+namespace
+{
+
+GcState stateWithIntentCursor(uint32_t header_generation)
+{
+    GcState s;
+    s.round = 3;
+    s.header_generation = header_generation;
+    s.intent_sweep_cursor = "pool/blob-intents/01/ab/abcdef/etag/6162";
+    s.lease = GcLease{UInt128(1), 2};
+    return s;
+}
+
+}
+
+TEST(CASGCStateFormat, EncoderStampsTheHeaderGeneration)
+{
+    /// Every writer of this build stamps header 4, the barrier an older GC refuses.
+    EXPECT_EQ(GcState{}.header_generation, G_BLOB_INTENTS);
+    EXPECT_EQ(encodeGcState(GcState{}).substr(0, 29), "{\"type\":\"cas_gc_state\",\"v\":4}");
+
+    GcState s;
+    s.header_generation = G_WRITE_FLOOR;
+    EXPECT_EQ(encodeGcState(s).substr(0, 29), "{\"type\":\"cas_gc_state\",\"v\":1}");
+}
+
+TEST(CASGCStateFormat, DecoderReportsTheHeaderGeneration)
+{
+    DB::Cas::tests::ScopedReadCeiling c(G_BLOB_INTENTS);
+    for (const uint32_t generation : {1u, 3u, 4u})
+    {
+        GcState s;
+        s.header_generation = generation;
+        EXPECT_EQ(decodeGcState(encodeGcState(s)).header_generation, generation);
+    }
+}
+
+TEST(CASGCStateFormat, IntentSweepCursorRoundTrips)
+{
+    DB::Cas::tests::ScopedReadCeiling c(G_BLOB_INTENTS);
+    const GcState s = stateWithIntentCursor(G_BLOB_INTENTS);
+    const GcState d = decodeGcState(encodeGcState(s));
+    EXPECT_EQ(d.intent_sweep_cursor, s.intent_sweep_cursor);
+    EXPECT_EQ(d.manifest_sweep_cursor, s.manifest_sweep_cursor);
+    EXPECT_EQ(d.round, 3u);
+}
+
+TEST(CASGCStateFormat, AbsentIntentSweepCursorDecodesEmpty)
+{
+    DB::Cas::tests::ScopedReadCeiling c(G_BLOB_INTENTS);
+    GcState s;
+    s.header_generation = G_BLOB_INTENTS;
+    const String bytes = encodeGcState(s);
+    EXPECT_NE(bytes.find("intent_sweep_cursor"), String::npos);   /// header 4 always writes the field
+    const size_t at = bytes.find(",\"intent_sweep_cursor\":\"\"");
+    ASSERT_NE(at, String::npos);
+    String absent = bytes;
+    absent.erase(at, String(",\"intent_sweep_cursor\":\"\"").size());
+    EXPECT_TRUE(decodeGcState(absent).intent_sweep_cursor.empty());
+}
+
+TEST(CASGCStateFormat, EncodeRefusesACursorBelowHeader4)
+{
+    DB::Cas::tests::ScopedReadCeiling c(G_BLOB_INTENTS);
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { static_cast<void>(encodeGcState(stateWithIntentCursor(G_BLOB_INTENTS - 1))); });
+}
+
+TEST(CASGCStateFormat, IntentSweepCursorBelowHeader4IsCorrupted)
+{
+    DB::Cas::tests::ScopedReadCeiling c(G_BLOB_INTENTS);
+    String bytes = encodeGcState(stateWithIntentCursor(G_BLOB_INTENTS));
+    const size_t at = bytes.find("\"v\":4");
+    ASSERT_NE(at, String::npos);
+    bytes.replace(at, 5, "\"v\":3");
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { static_cast<void>(decodeGcState(bytes)); });
+}
+
+TEST(CASFormatBattery, GcStateHeader4)
+{
+    DB::Cas::tests::ScopedReadCeiling c(G_BLOB_INTENTS);
+    GcState s;
+    s.round = 4;
+    s.header_generation = G_BLOB_INTENTS;
+    s.intent_sweep_cursor = "k";
+    s.orphan_manifest_sweep_completed_at_ms = 500;
+    s.lease = GcLease{UInt128(1), 12};
+    runFormatBattery({FormatId::GcState,
+        [&] { return sealObject(FormatId::GcState, encodeGcState(s)); },
+        [](std::string_view d) { decodeGcState(std::string(openObject(FormatId::GcState, d))); },
+        "{\"type\":\"cas_gc_state\",\"v\":4}\n"
+        "{\"round\":\"4\",\"gc_shards\":1,\"snap_generation\":\"0\",\"snap_pruned_through\":\"0\",\"snap_attempt\":\"0\","
+        "\"manifest_sweep_cursor\":\"\",\"orphan_manifest_sweep_completed_at_ms\":\"500\",\"intent_sweep_cursor\":\"k\","
+        "\"lease_owner\":\"00000000000000000000000000000001\",\"lease_seq\":\"12\"}\n",
+        [](std::string_view text)
+        {
+            String future(text);
+            future.replace(future.find("\"v\":4"), 5, fmt::format("\"v\":{}", G_BLOB_INTENTS + 1));
+            return future;
+        }});
 }
