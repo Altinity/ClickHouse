@@ -482,6 +482,8 @@ std::unique_ptr<IQueryPlanStep> ReadFromObjectStorageStep::deserialize(Deseriali
     if (flags & 2)
         query_info.prewhere_info = std::make_shared<PrewhereInfo>(PrewhereInfo::deserialize(ctx));
     query_info.optimize_trivial_count = flags & 4;
+    /// There is no query on a worker: without the modifiers `SelectQueryInfo::isFinal` reads the missing AST.
+    query_info.table_expression_modifiers = TableExpressionModifiers(/*has_final_=*/ false, /*sample_size_ratio_=*/ {}, /*sample_offset_ratio_=*/ {});
 
     size_t distributed_read_bucket_count = 0;
     readVarUInt(distributed_read_bucket_count, ctx.in);
