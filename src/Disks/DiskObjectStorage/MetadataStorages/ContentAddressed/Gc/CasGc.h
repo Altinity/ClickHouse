@@ -561,6 +561,8 @@ public:
     {
         /// After the catalog read that fixes the round's universe, before any namespace is walked.
         AfterCatalogRead,
+        /// After the last intake setup read, before the first manifest read. Once per folding round.
+        AfterDiscovery,
         /// After one namespace's walk in pass 1 or pass 2, before the next walk.
         AfterNamespaceWalk,
         /// After the last intake read and the `gc/state` validation, before the intent sweep and the reduce.

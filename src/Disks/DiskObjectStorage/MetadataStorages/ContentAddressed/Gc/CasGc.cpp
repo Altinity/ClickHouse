@@ -3313,6 +3313,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
             runRoundPointHookForTest({.point = RoundPointForTest::AfterNamespaceWalk, .pass = pass,
                                       .walked = walked.target->ns, .next = next ? next->target->ns : String{}});
     };
+    if (round_point_hook_for_test)
+        runRoundPointHookForTest(RoundPointForTest::AfterDiscovery);
     const size_t pass_one_takes = std::max<size_t>(reads.window(), 1);
     for (size_t i = 0; i < intakes.size(); ++i)
     {

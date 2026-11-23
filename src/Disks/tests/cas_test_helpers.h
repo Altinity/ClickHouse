@@ -2397,6 +2397,41 @@ private:
     std::function<void()> on_head;
 };
 
+/// Runs a callback once, on the calling thread, before the first `GET` of a matching key is served.
+class GetHookBackend : public HeadHookBackend
+{
+public:
+    /// The callback may write through the pool; it is dropped after it fires.
+    void armBeforeGet(std::function<bool(const String &)> key_predicate, std::function<void()> callback)
+    {
+        std::lock_guard lock(get_hook_mutex);
+        get_hook_predicate = std::move(key_predicate);
+        get_hook_callback = std::move(callback);
+    }
+
+    std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        std::function<void()> fire;
+        {
+            std::lock_guard lock(get_hook_mutex);
+            if (get_hook_callback && get_hook_predicate(key))
+            {
+                fire = std::move(get_hook_callback);
+                get_hook_callback = nullptr;
+                get_hook_predicate = nullptr;
+            }
+        }
+        if (fire)
+            fire();
+        return HeadHookBackend::read(key, access);
+    }
+
+private:
+    std::mutex get_hook_mutex;
+    std::function<bool(const String &)> get_hook_predicate;
+    std::function<void()> get_hook_callback;
+};
+
 /// A `CountingBackend` that reports the given token dialect instead of `emulated`.
 class DialectOverrideBackend : public CountingBackend
 {
@@ -2454,6 +2489,7 @@ inline const char * roundInterleavePointName(RoundInterleavePoint point)
     switch (point)
     {
         case RoundInterleavePoint::AfterCatalogRead: return "AfterCatalogRead";
+        case RoundInterleavePoint::AfterDiscovery: return "AfterDiscovery";
         /// The name the generated test parameters and their gtest filters use.
         case RoundInterleavePoint::AfterNamespaceWalk: return "BetweenNamespaces";
         case RoundInterleavePoint::AfterIntake: return "AfterIntake";

@@ -5323,6 +5323,94 @@ TEST(CASGcIntakeRequirements, RecreatedNamespaceStartsFromItsOwnFirstRecord)
     pool.expectCarriedThenReclaimed(from, round);
 }
 
+#if USE_AWS_S3
+
+namespace
+{
+
+/// Answers every `GET` of `missing_key` with a bucket-level 404 while armed.
+class BucketMissBackend : public HeadHookBackend
+{
+public:
+    std::atomic<bool> armed{false};
+    String missing_key;
+    std::atomic<size_t> misses{0};
+
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        if (armed && key == missing_key)
+        {
+            ++misses;
+            throw DB::S3Exception("the store answered NoSuchBucket", Aws::S3::S3Errors::NO_SUCH_BUCKET, "NoSuchBucket");
+        }
+        return HeadHookBackend::read(key, access);
+    }
+};
+
+}
+
+/// A bucket-level 404 on the first record of a life is not the end of that life's log: the round throws, deletes
+/// nothing and moves no cursor. The next round folds the record, which owns the confirmed `pending(t)` blob.
+TEST(CASGcIntents, ABucketLevelMissOnARefLogReadEndsTheRoundWithoutADelete)
+{
+    auto backend = std::make_shared<BucketMissBackend>();
+    PoolConfig config{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0, .gc_io_concurrency = 1};
+    auto store = Pool::open(backend, std::move(config));
+    const auto clock = VirtualRetryClock::installOn(store);
+    const Layout & layout = store->layout();
+    Gc gc(store, kGateLeaderA);
+    const String payload = "bucket-miss-on-a-ref-log-read";
+    const BlobRef x = idOf(payload);
+    const String body_key = layout.blobKey(x);
+    const String ns_old = "test/a_old";
+    const String ns_new = "test/n_new";
+
+    ASSERT_EQ(writeOnePart(store, ns_old, "p0", payload), BlobMaterializationAction::Published);
+    runGateRound(store, gc);
+    store->dropRef(RootNamespace{ns_old}, "p0");
+    store->renewWatermarkOnce();
+    runGateRound(store, gc);
+    const auto row = retiredEntryFor(*backend, layout, x);
+    ASSERT_TRUE(row && row->delete_pending && !row->standing) << "the condemning round did not commit pending(t)";
+
+    backend->clearJournal();
+    copyWithoutBytes(store, ns_new, "c", payload);
+    String first_record;
+    for (const JournalEntry & entry : backend->journal())
+        if (entry.verb == JournalVerb::Write && first_record.empty())
+            for (const String & key : entry.keys)
+                if (key.find("/_log/") != String::npos && key.find("/cas/ns/stream/") != String::npos)
+                    first_record = key;
+    ASSERT_FALSE(first_record.empty());
+
+    const uint64_t round_before = committedRound(*backend, layout);
+    const uint64_t cursor_before = foldCursorOf(*backend, layout, RootNamespace{ns_new}, 0);
+    backend->missing_key = first_record;
+    backend->armed = true;
+    const size_t from = backend->journal().size();
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { runGateRound(store, gc); });
+    backend->armed = false;
+
+    EXPECT_GT(backend->misses.load(), 0u) << "positive control: the round read the record";
+    const auto journal = backend->journal();
+    for (size_t i = from; i < journal.size(); ++i)
+        EXPECT_FALSE(journal[i].verb == JournalVerb::Remove || journal[i].verb == JournalVerb::RemoveMany)
+            << "the round sent a delete: " << (journal[i].keys.empty() ? String{} : journal[i].keys.front());
+    EXPECT_TRUE(objectPresent(*backend, body_key));
+    EXPECT_EQ(committedRound(*backend, layout), round_before);
+    EXPECT_EQ(foldCursorOf(*backend, layout, RootNamespace{ns_new}, 0), cursor_before);
+
+    runGateRound(store, gc);
+    EXPECT_GT(foldCursorOf(*backend, layout, RootNamespace{ns_new}, 0), cursor_before) << "the next round did not fold the record";
+    for (size_t i = 0; i < 3; ++i)
+        runGateRound(store, gc);
+    EXPECT_TRUE(objectPresent(*backend, body_key)) << "the part in " << ns_new << " names the blob";
+    const FsckReport report = runFsck(*store, /*detail=*/true);
+    EXPECT_EQ(report.dangling, 0u) << formatFsckSummary(report);
+}
+
+#endif
+
 /// The catalog read of a round follows the acquisition of its lease: the round of a leader that steals the
 /// lease from the previous one is checked, twice.
 TEST(CASGcIntakeRequirements, CatalogReadFollowsTheLeaseAcquisition)
@@ -5726,6 +5814,58 @@ TEST(CASGcRoundPoint, LeaderDeposedAfterTheValidationDeletesOnlyBodiesNobodyName
     EXPECT_FALSE(objectPresent(*pool.backend, pool.bodyKey(unowned)));
     EXPECT_EQ(countOf(requests, JournalVerb::Remove, pool.bodyKey(rewritten)), 1u) << "A sent its delete for the rewritten blob";
     EXPECT_TRUE(objectPresent(*pool.backend, pool.bodyKey(rewritten))) << "A's delete removed the writer's new incarnation";
+    const FsckReport report = runFsck(*pool.store, /*detail=*/true);
+    EXPECT_EQ(report.dangling, 0u) << formatFsckSummary(report);
+}
+
+/// Leader B takes the lease right after A's discovery and before A reads any manifest: B folds, adopts, deletes the
+/// body of the unowned blob and cleans its logs. A then resumes. A sends no body delete, A's adoption is refused, B's
+/// adopted state is as B left it and no part is left dangling.
+TEST(CASGcRoundPoint, ALeaderDeposedAfterDiscoverySendsNoDelete)
+{
+    TwoLeaderPool pool;
+    const String payload = "deposed-after-discovery";
+    ASSERT_NO_FATAL_FAILURE(pool.commitPending({payload}));
+    const Layout & layout = pool.store->layout();
+    ASSERT_TRUE(pool.store->tryPublishSnapshotAndAdvanceCheckpointOnce(RootNamespace{pool.ns}));
+    pool.store->renewWatermarkOnce();
+
+    std::optional<GcState> b_state;
+    ScopedRoundCallback deposed(*pool.gc_a, RoundInterleavePoint::AfterDiscovery, {}, [&]
+    {
+        for (size_t i = 0; i < 3; ++i)
+            runGateRound(pool.store, *pool.gc_b);
+        OperationForTest op(*pool.backend);
+        b_state = decodeGcState((*op).read(layout.gcStateKey(), Retry::standard())->bytes);
+        pool.backend->mark("b_done");
+    });
+
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { runGateRound(pool.store, *pool.gc_a); });
+    ASSERT_EQ(deposed.fired(), 1u);
+    ASSERT_TRUE(b_state.has_value());
+    EXPECT_EQ(storedLeaseOwner(*pool.backend, layout), kGateLeaderB) << "A's commit landed after it lost the lease";
+
+    const auto journal = pool.backend->journal();
+    const size_t mark = indexOfMark(journal, "b_done");
+    ASSERT_LT(mark, journal.size());
+    const auto by_b = blobRequests(std::vector<JournalEntry>(journal.begin(), journal.begin() + mark));
+    const auto by_a = blobRequests(std::vector<JournalEntry>(journal.begin() + mark, journal.end()));
+    EXPECT_EQ(countOf(by_b, JournalVerb::Remove, pool.bodyKey(payload)), 1u) << "positive control: B deleted the body";
+    bool b_cleaned_a_log = false;
+    for (size_t i = 0; i < mark; ++i)
+        for (const String & key : journal[i].keys)
+            b_cleaned_a_log |= (journal[i].verb == JournalVerb::Remove || journal[i].verb == JournalVerb::RemoveMany)
+                && key.find("/_log/") != String::npos;
+    EXPECT_TRUE(b_cleaned_a_log) << "positive control: B cleaned a ref log";
+    for (const auto & [verb, key] : by_a)
+        EXPECT_FALSE((verb == JournalVerb::Remove || verb == JournalVerb::RemoveMany) && key.find("/blobs/") != String::npos)
+            << "A sent a body delete after it lost the lease: " << key;
+
+    OperationForTest op(*pool.backend);
+    const GcState after = decodeGcState((*op).read(layout.gcStateKey(), Retry::standard())->bytes);
+    EXPECT_EQ(after.round, b_state->round);
+    EXPECT_EQ(after.snap_generation, b_state->snap_generation);
+    EXPECT_EQ(after.snap_attempt, b_state->snap_attempt);
     const FsckReport report = runFsck(*pool.store, /*detail=*/true);
     EXPECT_EQ(report.dangling, 0u) << formatFsckSummary(report);
 }
