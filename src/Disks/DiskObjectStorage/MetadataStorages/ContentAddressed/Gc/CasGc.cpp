@@ -2781,7 +2781,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
     /// stops ref-object cleanup, so its listing never drains and it never becomes provable by any other
     /// route either.
     ///
-    /// The listed tail bounds no walk, only its read-ahead, and it is CLASSIFIED for the phase row, in three classes:
+    /// The listed tail bounds no walk; it is CLASSIFIED for the phase row, in three classes:
     ///   * `tail > cursor` -- the round has records to fold;
     ///   * `tail == cursor` -- the listing shows nothing new: a warm walk reads only its successor probe,
     ///     a cold one resolves its cursor first. On a wide pool this is most namespaces, most rounds;
@@ -2992,32 +2992,31 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
     /// Bodies planning read, which the walk takes instead of reading them again.
     RetainedRefBodies retained_ref_bodies(ref_plan_retained_bytes);
 
-    /// READ-AHEAD inside `expected`'s epoch, up to the greatest id the listing shows in that epoch and at
-    /// most `budget` keys past `expected`, skipping bodies planning kept. The walk takes results only in
-    /// successor order, so a hint never decides anything; bounding it by the listing keeps it off keys past
-    /// the end of the chain, including any key after a terminal record, and the budget keeps a walk that
-    /// pauses from leaving fetched results it would fetch again.
+    /// READ-AHEAD of the hint's ids in `expected`'s epoch, above `expected` and at or below the greatest
+    /// sequence planning read present there, skipping bodies planning kept. Only an id the hint names is
+    /// fetched speculatively: a key written after the hint was built is taken inline, and nothing past the plan
+    /// is read ahead. `budget` is how many more records the walk may take: neither the count of hints nor their
+    /// distance from `expected` exceeds it, so a walk that pauses leaves no fetched result it would fetch again.
     const auto topUpLookahead = [&](NamespaceIntake & s, size_t budget)
     {
         const size_t limit = std::min<size_t>(reads.window(), budget);
         if (limit == 0)
             return;
-        const RefTxnId & at = *s.expected;
-        const std::vector<RefTxnId> & listed = s.target->listing->logs;
-        const auto past_epoch = std::upper_bound(listed.begin(), listed.end(),
-                                                 RefTxnId{at.writer_epoch, std::numeric_limits<uint64_t>::max()});
-        if (past_epoch == listed.begin() || std::prev(past_epoch)->writer_epoch != at.writer_epoch)
+        const RefTxnId at = *s.expected;
+        const auto present = s.plan.last_present.find(at.writer_epoch);
+        if (present == s.plan.last_present.end())
             return;
-        const RefTxnId listed_tail = *std::prev(past_epoch);
-        RefTxnId next = s.lookahead.empty() ? at : s.lookahead.back().first;
-        while (s.lookahead.size() < limit && next < listed_tail)
+        const RefTxnId bound{at.writer_epoch, std::min(present->second, saturatingAdd(at.ref_sequence, budget))};
+        const RefTxnId after = s.lookahead.empty() ? at : s.lookahead.back().first;
+        const std::vector<RefTxnId> & hinted = s.plan.hint_ids;
+        for (auto it = std::upper_bound(hinted.begin(), hinted.end(), after);
+             it != hinted.end() && *it <= bound && s.lookahead.size() < limit; ++it)
         {
-            next = RefTxnId{next.writer_epoch, next.ref_sequence + 1};
-            String key = layout.refLogKey(s.life, next);
+            String key = layout.refLogKey(s.life, *it);
             if (retained_ref_bodies.contains(key))
                 continue;
             reads.hintRead(key, ReadFamily::RefLog);
-            s.lookahead.emplace_back(next, std::move(key));
+            s.lookahead.emplace_back(*it, std::move(key));
         }
     };
 

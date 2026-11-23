@@ -1066,3 +1066,30 @@ TEST(CASGCBoundedWalk, ColdCursorWhoseLogIsGoneHoldsTheNamespace)
     EXPECT_EQ(metric(intake, "frontier_proven"), 0u);
     EXPECT_EQ(backend->deleteTotal(), 0u) << "Deleted:" << deletedKeysMessage(*backend);
 }
+
+/// Pass 1 has a take budget, and its read-ahead stays within the records that budget can take, also when the listing
+/// omits the records right after the expected one and names later ones. A body fetched beyond the budget would be
+/// dropped at the end of pass 1 and fetched again in pass 2.
+TEST(CASGCBoundedWalk, PassOneReadsNothingAheadBeyondItsTakeBudget)
+{
+    auto backend = std::make_shared<CountingHintHoleBackend>();
+    auto store = openPoolWithSmallWindow(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/holes@cas@"};
+    const uint64_t tail = 3 * kWindow;
+    publishRange(*backend, layout, ns, 1, tail);
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, refCkptOf(1, RefTxnId{1, tail}));
+    std::vector<String> omitted;
+    for (uint64_t seq = 2; seq <= kWindow; ++seq)
+        omitted.push_back(logKey(layout, ns, RefTxnId{1, seq}));
+    backend->setListOmissions(omitted);
+    backend->resetCounts();
+
+    Gc gc(store, kGc);
+    const std::map<String, UInt64> intake = runRoundCapturingIntake(gc);
+    EXPECT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{1, tail}));
+    EXPECT_EQ(metric(intake, "frontier_proven"), 1u);
+    EXPECT_GT(metric(intake, "reflog_takes"), 0u);
+    EXPECT_EQ(metric(intake, "reflog_reads_issued"), metric(intake, "reflog_takes")) << "a ref log was fetched and dropped";
+    EXPECT_EQ(refLogGetsFor(*backend, layout, ns, 1, tail), tail) << "a ref log was read more than once";
+}

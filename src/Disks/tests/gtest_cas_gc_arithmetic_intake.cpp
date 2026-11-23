@@ -9,9 +9,12 @@
 
 #include <base/scope_guard.h>
 
+#include <bit>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <set>
+#include <thread>
 
 /// ARITHMETIC REF INTAKE (spec 2026-07-27 "ref chain complete cut" §5).
 ///
@@ -877,4 +880,427 @@ TEST(CASGCArithmeticIntake, AQuietLifeCostsOneCheckpointReadAndOneAbsentFirstKey
     const size_t lists = std::count_if(journal.begin(), journal.end(),
                                        [](const JournalEntry & entry) { return entry.verb == JournalVerb::List; });
     EXPECT_EQ(lists, base_round_lists);
+}
+
+/// ===================== READ-AHEAD FOLLOWS THE HINT =====================
+
+namespace
+{
+
+/// Records the threads that read each ref log, and runs a one-shot callback right after one chosen key is read absent.
+/// A hinted read runs on a read-ahead worker; a take nobody hinted runs on the round's thread.
+class ReadAheadObservingBackend : public CountingBackend
+{
+public:
+    void armAfterAbsentRead(const String & key, std::function<void()> callback)
+    {
+        std::lock_guard lock(observe_mutex);
+        after_absent_key = key;
+        after_absent_callback = std::move(callback);
+    }
+
+    std::set<String> logsReadOffThread(std::thread::id round_thread) const
+    {
+        std::lock_guard lock(observe_mutex);
+        std::set<String> out;
+        for (const auto & [key, readers] : log_readers)
+            if (std::any_of(readers.begin(), readers.end(), [&](std::thread::id reader) { return reader != round_thread; }))
+                out.insert(key);
+        return out;
+    }
+
+    void clearReaders()
+    {
+        std::lock_guard lock(observe_mutex);
+        log_readers.clear();
+    }
+
+    std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        if (key.find("/_log/") != String::npos)
+        {
+            std::lock_guard lock(observe_mutex);
+            log_readers[key].insert(std::this_thread::get_id());
+        }
+        std::optional<DB::Cas::Backend::Raw> got = CountingBackend::read(key, access);
+        std::function<void()> fire;
+        {
+            std::lock_guard lock(observe_mutex);
+            if (!got && after_absent_callback && key == after_absent_key)
+                fire = std::exchange(after_absent_callback, nullptr);
+        }
+        if (fire)
+            fire();
+        return got;
+    }
+
+private:
+    mutable std::mutex observe_mutex;
+    std::map<String, std::set<std::thread::id>> log_readers;
+    String after_absent_key;
+    std::function<void()> after_absent_callback;
+};
+
+using ObservedHintHoleBackend = HintHoleBackendOn<ReadAheadObservingBackend>;
+
+/// Publishes `{1,first} .. {1,last}` of `ns`; record `{1,i}` names blob `blob_base + i`.
+void publishRange(Backend & backend, const Layout & layout, const RootNamespace & ns, uint64_t first, uint64_t last,
+                  uint64_t blob_base = 0)
+{
+    for (uint64_t i = first; i <= last; ++i)
+        publishAt(backend, layout, ns, RefTxnId{1, i}, fmt::format("ref_{}", i), blob_base + i,
+                  DB::UInt128(blob_base + i), /*birth=*/i == 1);
+}
+
+/// A live `ns` whose records `{1,1}` and `{1,2}` a first round of `gc` folds.
+void foldTwoRecords(Backend & backend, const Layout & layout, const RootNamespace & ns, Gc & gc)
+{
+    fixture::admitLive(backend, layout, ns);
+    publishRange(backend, layout, ns, 1, 2);
+    writeRecoverableCkptForRawFixture(backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 2},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    ASSERT_EQ(cursorOf(backend, layout, ns), (RefTxnId{1, 2}));
+}
+
+}
+
+/// A life whose new records the listing omits has an empty hint. The walk folds every record, and none of them is
+/// read ahead: only the life's first key, which planning may fetch ahead, is read off the round's thread.
+TEST(CASGCArithmeticIntake, AnEmptyHintIsFoldedWithoutReadAhead)
+{
+    constexpr uint64_t hidden = 300;
+    auto backend = std::make_shared<ObservedHintHoleBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    ASSERT_GT(store->poolConfig().gc_io_concurrency, 1u) << "nothing is read ahead at concurrency 1";
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+    const NamespaceLifeId life = fixture::fixtureLife(ns);
+    Gc gc(store, kGc);
+    ASSERT_NO_FATAL_FAILURE(foldTwoRecords(*backend, layout, ns, gc));
+
+    publishRange(*backend, layout, ns, 3, 2 + hidden);
+    for (uint64_t i = 3; i <= 2 + hidden; ++i)
+        backend->hide(layout.refLogKey(life, RefTxnId{1, i}));
+
+    backend->clearJournal();
+    backend->clearReaders();
+    const auto intake = runRoundReadingIntake(gc);
+    ASSERT_FALSE(intake.empty());
+    EXPECT_GT(backend->holesServed(), 0u);
+    EXPECT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{1, 2 + hidden}));
+    EXPECT_EQ(intake.at("frontier_proven"), intake.at("frontier_namespaces"));
+    EXPECT_EQ(intake.at("reflog_reads_issued"), intake.at("reflog_takes")) << "a ref log was hinted and never taken";
+
+    std::set<String> read_ahead = backend->logsReadOffThread(std::this_thread::get_id());
+    const String first = layout.refLogKey(life, RefTxnId{1, 3});
+    EXPECT_TRUE(read_ahead.contains(first)) << "positive control: the first key was fetched ahead";
+    read_ahead.erase(first);
+    EXPECT_TRUE(read_ahead.empty()) << read_ahead.size() << " ref log(s) read ahead, the first " << *read_ahead.begin();
+    for (uint64_t i = 3; i <= 2 + hidden; ++i)
+        ASSERT_EQ(inDegreeOf(*backend, layout, DB::UInt128(i)), 1) << "record " << i << " was not applied";
+}
+
+/// The listing ends `hidden` records below the tail. Planning reads the listing's last id, doubles past it to its
+/// first miss, and a writer fills that slot right after the miss. Bisection still finds the first absent key above
+/// the tail: the walk adopts the record below it and stops there, the late record is not folded, and only listed ids
+/// are read ahead.
+TEST(CASGCArithmeticIntake, AHintBehindTheTailStopsAtTheObservedMiss)
+{
+    constexpr uint64_t listed_tail = 52;
+    constexpr uint64_t hidden = 200;
+    constexpr uint64_t tail = listed_tail + hidden;
+    constexpr uint64_t late_blob = 9000;
+    auto backend = std::make_shared<ObservedHintHoleBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+    const NamespaceLifeId life = fixture::fixtureLife(ns);
+    Gc gc(store, kGc);
+    ASSERT_NO_FATAL_FAILURE(foldTwoRecords(*backend, layout, ns, gc));
+
+    publishRange(*backend, layout, ns, 3, tail);
+    for (uint64_t i = listed_tail + 1; i <= tail; ++i)
+        backend->hide(layout.refLogKey(life, RefTxnId{1, i}));
+
+    /// Doubling from the listing's last id: `listed_tail + 1, + 2, + 4, ...`; the first of them above the tail misses.
+    uint64_t step = 1;
+    while (listed_tail + step <= tail)
+        step *= 2;
+    const RefTxnId late{1, listed_tail + step};
+    bool written = false;
+    backend->armAfterAbsentRead(layout.refLogKey(life, late), [&]
+    {
+        publishAt(*backend, layout, ns, late, "ref_late", late_blob, DB::UInt128(late_blob));
+        written = true;
+    });
+
+    backend->clearJournal();
+    backend->clearReaders();
+    const auto intake = runRoundReadingIntake(gc);
+    ASSERT_FALSE(intake.empty());
+    ASSERT_TRUE(written) << "planning never read " << late.ref_sequence;
+    EXPECT_GT(backend->holesServed(), 0u);
+    EXPECT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{1, tail}));
+    EXPECT_EQ(requestsOn(*backend, JournalVerb::Read, layout.refLogKey(life, RefTxnId{1, tail + 1})), 1u)
+        << "the stop was not read exactly once, by planning";
+    EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(late_blob)), 0) << "the record written after its miss was folded";
+    EXPECT_EQ(intake.at("frontier_proven"), intake.at("frontier_namespaces"));
+    /// `2 * ceil(log2(hidden + 1)) + 2`.
+    EXPECT_LE(intake.at("absent_probes"), 2 * std::bit_width(hidden) + 2);
+    EXPECT_GT(intake.at("absent_probes"), 0u);
+
+    for (const String & key : backend->logsReadOffThread(std::this_thread::get_id()))
+    {
+        const auto parsed = layout.parseRefObjectKey(key);
+        ASSERT_TRUE(parsed.has_value()) << key;
+        EXPECT_LE(parsed->txn_id.ref_sequence, listed_tail) << "an id the listing did not return was read ahead: " << key;
+    }
+}
+
+/// Read-ahead moves only the moment bytes are fetched. The same pool folded at `gc_io_concurrency` 1 and 16 adopts the
+/// same cursors, holds at the same positions and deletes the same keys; at 1 nothing is read ahead. A hold suppresses
+/// deletes, so the gap it holds at is filled after the first round.
+TEST(CASGCArithmeticIntake, ConcurrencyOneIsSequentialAndDecidesAsSixteen)
+{
+    constexpr size_t rounds = 6;
+    struct Outcome
+    {
+        std::map<String, RefTxnId> cursors;
+        /// After the first round.
+        std::map<String, std::optional<std::pair<HoldReason, RefTxnId>>> holds;
+        std::set<String> deleted;
+        std::vector<std::map<String, UInt64>> intakes;
+    };
+    const std::vector<RootNamespace> lives{RootNamespace{"00/aa@cas@"}, RootNamespace{"00/bb@cas@"},
+                                           RootNamespace{"00/cc@cas@"}, RootNamespace{"00/dd@cas@"}};
+    const auto fold = [&](uint64_t concurrency)
+    {
+        auto backend = std::make_shared<HintHoleBackendOn<CountingBackend>>();
+        auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
+                                                    .gc_fold_max_defer_rounds = 0, .gc_io_concurrency = concurrency});
+        const Layout & layout = store->layout();
+        const auto seed = [&](const RootNamespace & ns, uint64_t blob_base, uint64_t last)
+        {
+            fixture::admitLive(*backend, layout, ns);
+            publishRange(*backend, layout, ns, 1, last, blob_base);
+            writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+                .life_epoch = 1,
+                .committed_through = RefTxnId{1, last},
+                .checkpoint_snapshot_id = std::nullopt,
+                .last_epoch_seal = std::nullopt,
+            });
+        };
+        const auto hide = [&](const RootNamespace & ns, uint64_t first, uint64_t last)
+        {
+            for (uint64_t i = first; i <= last; ++i)
+                backend->hide(layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, i}));
+        };
+        /// All listed; then a record that drops `ref_1`, so its blob is reclaimed.
+        seed(lives[0], 0, 40);
+        writeTxnAt(*backend, layout, lives[0], RefTxnId{1, 41},
+                   {ownerTransitionOp(RefOwnerBinding{RefOwnerKind::Committed, "ref_1",
+                                                      ManifestRef{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 1}},
+                                      std::nullopt)});
+        /// The top half hidden.
+        seed(lives[1], 100, 40);
+        hide(lives[1], 21, 40);
+        /// A hidden run in the middle.
+        seed(lives[2], 200, 40);
+        hide(lives[2], 11, 20);
+        /// `{1,11}` missing below listed records: the walk holds there until it is written.
+        seed(lives[3], 300, 10);
+        for (uint64_t i = 12; i <= 15; ++i)
+            publishAt(*backend, layout, lives[3], RefTxnId{1, i}, fmt::format("ref_{}", i), 300 + i, DB::UInt128(300 + i));
+
+        Gc gc(store, kGc);
+        Outcome out;
+        for (size_t i = 0; i < rounds; ++i)
+        {
+            std::map<String, UInt64> metrics;
+            gc.setPhaseSink([&](const GcPhaseRecord & record)
+            {
+                if (record.phase == "fold_ref_intake")
+                    metrics = record.metrics;
+            });
+            runRegularRoundReclaiming(gc);
+            store->renewWatermarkOnce();
+            gc.setPhaseSink({});
+            out.intakes.push_back(std::move(metrics));
+            if (i != 0)
+                continue;
+            for (const RootNamespace & ns : lives)
+            {
+                const auto coverage = coverageOf(*backend, layout, ns);
+                if (coverage && coverage->hold)
+                    out.holds[ns.string()] = std::make_pair(coverage->hold->reason, coverage->hold->offending_position);
+                else
+                    out.holds[ns.string()] = std::nullopt;
+            }
+            publishAt(*backend, layout, lives[3], RefTxnId{1, 11}, "ref_11", 311, DB::UInt128(311));
+        }
+        for (const RootNamespace & ns : lives)
+            out.cursors[ns.string()] = cursorOf(*backend, layout, ns);
+        /// Probe keys carry a random name.
+        for (const JournalEntry & entry : backend->journal())
+            if (entry.verb == JournalVerb::Remove || entry.verb == JournalVerb::RemoveMany)
+                for (const String & key : entry.keys)
+                    if (key.find("/_probe/") == String::npos)
+                        out.deleted.insert(key);
+        EXPECT_FALSE(blobAbsent(*backend, layout, DB::UInt128(2))) << "positive control: a named blob is kept";
+        EXPECT_TRUE(blobAbsent(*backend, layout, DB::UInt128(1))) << "positive control: the dropped blob is reclaimed";
+        return out;
+    };
+
+    const Outcome sequential = fold(1);
+    const Outcome parallel = fold(16);
+
+    for (const auto & intake : sequential.intakes)
+    {
+        ASSERT_FALSE(intake.empty());
+        EXPECT_EQ(intake.at("reflog_reads_issued"), intake.at("reflog_takes"));
+    }
+    EXPECT_EQ(sequential.cursors, parallel.cursors);
+    EXPECT_EQ(sequential.cursors.at("00/aa@cas@"), (RefTxnId{1, 41})) << "positive control: the drop was folded";
+    EXPECT_EQ(sequential.cursors.at("00/dd@cas@"), (RefTxnId{1, 15})) << "positive control: the filled gap was folded";
+    EXPECT_EQ(sequential.holds, parallel.holds);
+    ASSERT_TRUE(sequential.holds.at("00/dd@cas@").has_value()) << "positive control: the gap holds";
+    EXPECT_EQ(sequential.holds.at("00/dd@cas@")->first, HoldReason::GapBelowWitness);
+    EXPECT_EQ(sequential.deleted, parallel.deleted);
+    EXPECT_FALSE(sequential.deleted.empty()) << "positive control: the rounds deleted something";
+}
+
+namespace
+{
+
+/// One round of `gc`: its report and the metrics of its `fold_ref_intake` row.
+std::pair<RoundReport, std::map<String, UInt64>> runRoundReadingReportAndIntake(Gc & gc)
+{
+    std::map<String, UInt64> metrics;
+    gc.setPhaseSink([&](const GcPhaseRecord & record)
+    {
+        if (record.phase == "fold_ref_intake")
+            metrics = record.metrics;
+    });
+    SCOPE_EXIT({ gc.setPhaseSink({}); });
+    RoundReport report = gc.runRegularRound();
+    EXPECT_TRUE(report.acquired_lease);
+    return {std::move(report), std::move(metrics)};
+}
+
+void removeStoredKey(Backend & backend, const String & key)
+{
+    OperationForTest op(backend);
+    const auto meta = (*op).head(key, Retry::standard());
+    ASSERT_TRUE(meta.has_value()) << key;
+    ASSERT_EQ((*op).remove(key, meta->etag, Retry::standard()), Removal::Removed) << key;
+}
+
+bool anyAnomalySays(const RoundReport & report, std::string_view text)
+{
+    return std::any_of(report.anomalies.begin(), report.anomalies.end(),
+                       [&](const RoundAnomaly & a) { return std::string_view(a.reason).find(text) != std::string_view::npos; });
+}
+
+}
+
+/// A key missing below the listed tail is not read ahead: only ids the listing returned are. The walk reaches the gap
+/// inline and holds there, since planning read a later record present.
+TEST(CASGCArithmeticIntake, AnUnlistedHoleBelowTheListedTailIsNotReadAhead)
+{
+    auto backend = std::make_shared<ObservedHintHoleBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+    const NamespaceLifeId life = fixture::fixtureLife(ns);
+    Gc gc(store, kGc);
+    ASSERT_NO_FATAL_FAILURE(foldTwoRecords(*backend, layout, ns, gc));
+
+    /// `{1,11}` is never written; `{1,12} .. {1,40}` are listed above it.
+    publishRange(*backend, layout, ns, 3, 10);
+    publishRange(*backend, layout, ns, 12, 40);
+    const String hole = layout.refLogKey(life, RefTxnId{1, 11});
+
+    backend->clearJournal();
+    backend->clearReaders();
+    const auto [report, intake] = runRoundReadingReportAndIntake(gc);
+    ASSERT_FALSE(intake.empty());
+    const std::set<String> read_ahead = backend->logsReadOffThread(std::this_thread::get_id());
+    EXPECT_TRUE(read_ahead.contains(layout.refLogKey(life, RefTxnId{1, 4}))) << "positive control: listed ids are read ahead";
+    EXPECT_FALSE(read_ahead.contains(hole)) << "the unlisted key was read ahead";
+    EXPECT_EQ(requestsOn(*backend, JournalVerb::Read, hole), 1u);
+    const auto coverage = coverageOf(*backend, layout, ns);
+    ASSERT_TRUE(coverage && coverage->hold);
+    EXPECT_EQ(coverage->hold->reason, HoldReason::GapBelowWitness);
+    EXPECT_EQ(coverage->hold->offending_position, (RefTxnId{1, 11}));
+    EXPECT_EQ(coverage->last_folded_ref_id, (RefTxnId{1, 10}));
+    EXPECT_TRUE(anyAnomalySays(report, "probed present, read absent"));
+}
+
+/// A listed key that disappears before the walk reads it. At or below the last record planning read present, the walk
+/// holds at that key and keeps the cursor below it. Above it, here the listed tail removed between the listing and
+/// planning, the key is the stop: planning reads it absent, the walk adopts the record below, and the key is never
+/// read ahead.
+TEST(CASGCArithmeticIntake, AListedKeyRemovedBeforeTheWalkHoldsOrBecomesTheStop)
+{
+    constexpr uint64_t tail = 40;
+    const RootNamespace ns{"00/aa@cas@"};
+    const NamespaceLifeId life = fixture::fixtureLife(ns);
+    const auto readAheadAbove = [&](const ObservedHintHoleBackend & backend, const Layout & layout, uint64_t sequence)
+    {
+        size_t n = 0;
+        for (const String & key : backend.logsReadOffThread(std::this_thread::get_id()))
+            if (const auto parsed = layout.parseRefObjectKey(key); parsed && parsed->txn_id.ref_sequence > sequence)
+                ++n;
+        return n;
+    };
+    {
+        SCOPED_TRACE("removed after planning, below the last record read present");
+        auto backend = std::make_shared<ObservedHintHoleBackend>();
+        auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+        const Layout & layout = store->layout();
+        Gc gc(store, kGc);
+        ASSERT_NO_FATAL_FAILURE(foldTwoRecords(*backend, layout, ns, gc));
+        publishRange(*backend, layout, ns, 3, tail);
+        const String lost = layout.refLogKey(life, RefTxnId{1, 20});
+
+        backend->clearJournal();
+        backend->clearReaders();
+        ScopedRoundCallback removal(gc, RoundInterleavePoint::AfterDiscovery, {}, [&] { removeStoredKey(*backend, lost); });
+        const auto [report, intake] = runRoundReadingReportAndIntake(gc);
+        ASSERT_EQ(removal.fired(), 1u);
+        ASSERT_FALSE(intake.empty());
+        const auto coverage = coverageOf(*backend, layout, ns);
+        ASSERT_TRUE(coverage && coverage->hold);
+        EXPECT_EQ(coverage->hold->reason, HoldReason::GapBelowWitness);
+        EXPECT_EQ(coverage->hold->offending_position, (RefTxnId{1, 20}));
+        EXPECT_EQ(coverage->last_folded_ref_id, (RefTxnId{1, 19}));
+        EXPECT_TRUE(anyAnomalySays(report, "probed present, read absent"));
+    }
+    {
+        SCOPED_TRACE("the listed tail removed between the listing and planning");
+        auto backend = std::make_shared<ObservedHintHoleBackend>();
+        auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+        const Layout & layout = store->layout();
+        Gc gc(store, kGc);
+        ASSERT_NO_FATAL_FAILURE(foldTwoRecords(*backend, layout, ns, gc));
+        publishRange(*backend, layout, ns, 3, tail);
+        const String lost = layout.refLogKey(life, RefTxnId{1, tail});
+
+        backend->clearJournal();
+        backend->clearReaders();
+        ScopedRoundCallback removal(gc, RoundInterleavePoint::AfterCatalogRead, {}, [&] { removeStoredKey(*backend, lost); });
+        const auto [report, intake] = runRoundReadingReportAndIntake(gc);
+        ASSERT_EQ(removal.fired(), 1u);
+        ASSERT_FALSE(intake.empty());
+        EXPECT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{1, tail - 1}));
+        EXPECT_EQ(intake.at("frontier_proven"), intake.at("frontier_namespaces"));
+        EXPECT_EQ(requestsOn(*backend, JournalVerb::Read, lost), 1u) << "the stop was not read exactly once, by planning";
+        EXPECT_EQ(readAheadAbove(*backend, layout, tail - 1), 0u) << "the removed listed key was read ahead";
+        EXPECT_EQ(intake.at("reflog_reads_issued"), intake.at("reflog_takes")) << "a ref log was hinted and never taken";
+    }
 }

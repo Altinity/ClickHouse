@@ -59,9 +59,9 @@ UInt64 steadyNowNs() noexcept;
 /// read lands yields the same hold a slightly earlier sequential read yields.
 ///
 /// Only the result TAKEN, in the walk's order, decides anything; a hint never does. So a hint can cost
-/// a wasted read, never change a verdict. The fold's ref-log hints stay inside the epoch of the key
-/// the walk reads next, up to the greatest id the round's listing shows in that epoch, and, while the
-/// walk has a read budget, within it. `walkRefChain`, through `ReadAheadKeyReader`, hints inside the
+/// a wasted read, never change a verdict. The walk's ref-log hints are ids the round's listing names,
+/// inside the epoch of the key the walk reads next, at or below the greatest key planning read present
+/// there, and, while the walk has a read budget, within it. `walkRefChain`, through `ReadAheadKeyReader`, hints inside the
 /// current epoch, up to a generation 1 or 2 `committed_through` when it has one. A hinted key the walk
 /// never takes -- past a tombstone, past the chain's end, or after a hold -- is discarded and counted
 /// wasted.
