@@ -16,10 +16,23 @@
 namespace DB::Cas
 {
 
-/// Optional progress sink for `runFsck`: called periodically during the listing and reachability
-/// walk so a long scan over a large/slow pool is visibly progressing (not hung). `phase` names the
-/// current step; `objects`/`pages` are running counts. Default {} = no progress (existing callers).
-using FsckProgress = std::function<void(std::string_view phase, uint64_t objects, uint64_t pages)>;
+/// What a progress call reports about a phase: its start, a tick inside it, or its normal end.
+enum class FsckProgressStep : uint8_t
+{
+    Start,
+    Tick,
+    End,
+};
+
+/// Optional progress sink for `runFsck`, so a long scan over a large or slow pool visibly progresses. A phase is one
+/// part of the scan that issues store requests in proportion to the pool. `done` counts `unit` items the phase has
+/// handled (0 on `Start`); `seconds` is the phase's wall time so far (0 on `Start`). Ticks follow item counts, not time.
+/// Called only on the thread that called `runFsck`. The sink only observes: an exception it throws is logged once per
+/// phase and dropped, the phase then calls it only for its end line, and it never changes the report. Default {} = no progress.
+using FsckProgress = std::function<void(FsckProgressStep step, std::string_view phase, std::string_view unit, uint64_t done, double seconds)>;
+
+/// The stderr line for one progress call, without a trailing newline.
+String formatFsckProgress(FsckProgressStep step, std::string_view phase, std::string_view unit, uint64_t done, double seconds);
 
 /// Classification assigned to each object examined by `runFsck`.
 ///

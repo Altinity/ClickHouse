@@ -89,12 +89,9 @@ public:
         /// Progress to stderr so a long scan is visibly working (the reachable=… summary stays on
         /// stdout, machine-parseable). The deadline bounds a slow-but-progressing scan with a clear
         /// error; for a single LIST page stuck in S3-client retries, lower the disk's S3 retry budget.
-        Cas::FsckProgress on_progress = [](std::string_view phase, uint64_t objects, uint64_t pages)
+        Cas::FsckProgress on_progress = [](Cas::FsckProgressStep step, std::string_view phase, std::string_view unit, uint64_t done, double seconds)
         {
-            std::cerr << "cas-fsck: " << phase << " — " << objects << " objects";
-            if (pages)
-                std::cerr << ", " << pages << " pages";
-            std::cerr << "\n";
+            std::cerr << Cas::formatFsckProgress(step, phase, unit, done, seconds) << "\n";
         };
         const Cas::PoolPtr store = ca->store();
         Cas::ToolDeadline deadline;

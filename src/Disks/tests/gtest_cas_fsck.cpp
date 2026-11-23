@@ -35,6 +35,7 @@
 namespace DB::ErrorCodes
 {
 extern const int BAD_ARGUMENTS;
+extern const int CORRUPTED_DATA;
 extern const int INVALID_STATE;
 extern const int NETWORK_ERROR;
 extern const int NOT_IMPLEMENTED;
@@ -108,6 +109,14 @@ public:
         pending_mutation = std::move(mutation);
     }
 
+    /// Runs `mutation` once, at the first read of any key under `prefix`; an empty prefix matches every key.
+    void armOnFirstGetUnder(String prefix, std::function<void()> mutation)
+    {
+        std::lock_guard<std::mutex> lock(arm_mutex);
+        armed_prefix = std::move(prefix);
+        pending_prefix_mutation = std::move(mutation);
+    }
+
     std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
         std::function<void()> to_run;
@@ -117,6 +126,11 @@ public:
             {
                 to_run = std::move(pending_mutation);
                 pending_mutation = nullptr;
+            }
+            else if (pending_prefix_mutation && key.starts_with(armed_prefix))
+            {
+                to_run = std::move(pending_prefix_mutation);
+                pending_prefix_mutation = nullptr;
             }
         }
         if (to_run)
@@ -128,6 +142,8 @@ private:
     std::mutex arm_mutex;
     String armed_key;
     std::function<void()> pending_mutation;
+    String armed_prefix;
+    std::function<void()> pending_prefix_mutation;
 };
 
 enum class FsckListingMode : uint8_t
@@ -2431,6 +2447,63 @@ TEST(CASFsck, FixLoopChecksTheDeadlineBeforeEachRequest)
     }
 }
 
+namespace
+{
+
+struct FsckProgressEvent
+{
+    FsckProgressStep step;
+    String phase;
+    String unit;
+    uint64_t done;
+    double seconds;
+};
+
+using FsckProgressLog = std::vector<FsckProgressEvent>;
+
+FsckProgress recordInto(FsckProgressLog & log)
+{
+    return [&log](FsckProgressStep step, std::string_view phase, std::string_view unit, uint64_t done, double seconds)
+    {
+        log.push_back({step, String(phase), String(unit), done, seconds});
+    };
+}
+
+std::vector<String> startsOf(const FsckProgressLog & log)
+{
+    std::vector<String> names;
+    for (const FsckProgressEvent & e : log)
+        if (e.step == FsckProgressStep::Start)
+            names.push_back(e.phase);
+    return names;
+}
+
+std::vector<uint64_t> ticksOf(const FsckProgressLog & log, std::string_view phase)
+{
+    std::vector<uint64_t> done;
+    for (const FsckProgressEvent & e : log)
+        if (e.step == FsckProgressStep::Tick && e.phase == phase)
+            done.push_back(e.done);
+    return done;
+}
+
+size_t countOf(const FsckProgressLog & log, std::string_view phase, FsckProgressStep step)
+{
+    return static_cast<size_t>(std::count_if(log.begin(), log.end(),
+        [&](const FsckProgressEvent & e) { return e.phase == phase && e.step == step; }));
+}
+
+/// The `End` of `phase`, or null when it has none.
+const FsckProgressEvent * endOf(const FsckProgressLog & log, std::string_view phase)
+{
+    for (const FsckProgressEvent & e : log)
+        if (e.phase == phase && e.step == FsckProgressStep::End)
+            return &e;
+    return nullptr;
+}
+
+}
+
 /// Both long loops report progress every thousand keys, so a slow scan is visibly working.
 TEST(CASFsck, IntentAndMarkerLoopsReportProgress)
 {
@@ -2440,18 +2513,32 @@ TEST(CASFsck, IntentAndMarkerLoopsReportProgress)
         f.staleIntent(b);
         f.marker(b);
     }
-    std::map<String, std::vector<uint64_t>> seen;
-    const FsckProgress on_progress = [&](std::string_view phase, uint64_t objects, uint64_t)
-    {
-        seen[String(phase)].push_back(objects);
-    };
+    FsckProgressLog log;
 
-    const FsckReport rep = runFsck(*f.store, false, on_progress, {}, false, {}, /*fix_legacy_markers=*/ true);
+    const FsckReport rep = runFsck(*f.store, false, recordInto(log), {}, false, {}, /*fix_legacy_markers=*/ true);
 
     ASSERT_EQ(rep.intents_listed, 1000u) << "positive control: the loops had keys to walk";
     ASSERT_EQ(rep.legacy_markers_deleted, 1000u);
-    EXPECT_EQ(seen["counting blob intents"], std::vector<uint64_t>{1000});
-    EXPECT_EQ(seen["removing legacy markers"], std::vector<uint64_t>{1000});
+    EXPECT_EQ(ticksOf(log, "counting blob intents"), std::vector<uint64_t>{1000});
+    EXPECT_EQ(ticksOf(log, "removing legacy markers"), std::vector<uint64_t>{1000});
+}
+
+/// The marker count is cumulative, so a partial last batch ticks the running total and the end repeats it.
+TEST(CASFsck, MarkerRemovalTicksTheCumulativeCount)
+{
+    FsckIntentFixture f;
+    for (uint64_t b = 1; b <= 1001; ++b)
+        f.marker(b);
+    FsckProgressLog log;
+
+    const FsckReport rep = runFsck(*f.store, false, recordInto(log), {}, false, {}, /*fix_legacy_markers=*/ true);
+
+    ASSERT_EQ(rep.legacy_markers_deleted, 1001u);
+    EXPECT_EQ((ticksOf(log, "removing legacy markers")), (std::vector<uint64_t>{1000, 1001}));
+    const FsckProgressEvent * end = endOf(log, "removing legacy markers");
+    ASSERT_NE(end, nullptr);
+    EXPECT_EQ(end->done, 1001u);
+    EXPECT_EQ(end->unit, "markers");
 }
 
 /// A scoped scan lists no markers, so a fix over it would silently do nothing: it is refused.
@@ -4755,4 +4842,421 @@ TEST(CASFsckPartial, DeadlineInTheBlobLoopReportsHeldDanglingsAsUnchecked)
     EXPECT_NE(uncheckedNoteContains(report, layout.blobKey(first.ref), note),
               uncheckedNoteContains(report, layout.blobKey(second.ref), note))
         << "exactly the first blob of the loop was held";
+}
+
+namespace
+{
+
+/// One namespace with committed refs `r000` to `r128`, each over a present manifest, and `zz`, whose manifest body is
+/// missing: 130 refs, the last of them a real finding.
+struct FsckManyRefsPool
+{
+    std::shared_ptr<InMemoryBackend> backend = std::make_shared<InMemoryBackend>();
+    PoolPtr store = openPoolForTest(backend);
+    RootNamespace ns{"00/aa@cas@"};
+
+    FsckManyRefsPool()
+    {
+        const Layout & layout = store->layout();
+        writeBlobBody(*backend, layout, numberedBlobHash(1));
+        uint64_t sequence = 0;
+        for (uint64_t i = 0; i <= 128; ++i)
+        {
+            const ManifestRef manifest = ref(1, 0x100 + i);
+            writeManifestRaw(*backend, layout, ns, manifest, {blobEntryFor("a", numberedBlobHash(1))});
+            sequence = publishCommittedTransition(*backend, layout, ns, fmt::format("r{:03}", i), std::nullopt, manifest);
+        }
+        sequence = publishCommittedTransition(*backend, layout, ns, "zz", std::nullopt, ref(1, 0x1FF));
+        writeFsckCheckpoint(*backend, layout, ns, RefTxnId{1, sequence});
+    }
+};
+
+}
+
+/// Each request-bound phase starts, ends, and counts items of its own unit; a skipped item is not counted.
+TEST(CASFsck, ProgressPhasesRunInOrderWithRealUnits)
+{
+    FsckGcFixture f(0, {1, 2, 3, 4, 5});
+    f.drop();
+    f.round();
+    FsckProgressLog log;
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/false, recordInto(log), {}, false, {}, false, /*verify_intents=*/true);
+
+    ASSERT_EQ(rep.pending_gc, 5u) << "positive control: five bodies waited in the pipeline";
+    const std::vector<String> expected{"listing namespaces", "walking refs", "listing blobs", "head-checking reachable blobs",
+        "reading gc snapshot runs", "head-checking retired bodies", "checking pending rows", "listing blob intents",
+        "verifying blob intents", "listing manifests"};
+    EXPECT_EQ(startsOf(log), expected);
+    for (const String & phase : expected)
+    {
+        EXPECT_EQ(countOf(log, phase, FsckProgressStep::Start), 1u) << phase;
+        EXPECT_EQ(countOf(log, phase, FsckProgressStep::End), 1u) << phase;
+        double last = 0;
+        for (const FsckProgressEvent & e : log)
+            if (e.phase == phase)
+            {
+                EXPECT_GE(e.seconds, last) << phase;
+                last = e.seconds;
+            }
+    }
+    ASSERT_NE(endOf(log, "head-checking retired bodies"), nullptr);
+    EXPECT_EQ(endOf(log, "head-checking retired bodies")->done, 5u);
+    EXPECT_EQ(endOf(log, "head-checking retired bodies")->unit, "bodies");
+    ASSERT_NE(endOf(log, "checking pending rows"), nullptr);
+    EXPECT_EQ(endOf(log, "checking pending rows")->done, 0u) << "every pending row was checked in the bodies loop";
+    ASSERT_NE(endOf(log, "verifying blob intents"), nullptr);
+    EXPECT_EQ(endOf(log, "verifying blob intents")->done, 5u);
+    EXPECT_EQ(endOf(log, "verifying blob intents")->unit, "keys");
+    ASSERT_NE(endOf(log, "reading gc snapshot runs"), nullptr);
+    EXPECT_EQ(endOf(log, "reading gc snapshot runs")->unit, "rows");
+}
+
+/// A ref whose manifest is missing is counted like any other, so the tick comes at the 64th and 128th ref.
+TEST(CASFsck, ProgressRefsTickEverySixtyFourthRef)
+{
+    FsckManyRefsPool pool;
+    FsckProgressLog log;
+
+    const FsckReport rep = runFsck(*pool.store, /*detail=*/true, recordInto(log));
+
+    ASSERT_EQ(rep.dangling, 1u) << "positive control: the ref without a manifest was reached";
+    EXPECT_EQ((ticksOf(log, "walking refs")), (std::vector<uint64_t>{64, 128}));
+    const FsckProgressEvent * end = endOf(log, "walking refs");
+    ASSERT_NE(end, nullptr);
+    EXPECT_EQ(end->done, 130u);
+    EXPECT_EQ(end->unit, "refs");
+}
+
+namespace
+{
+
+std::vector<std::tuple<String, FsckClass, std::vector<String>>> objectsOf(const FsckReport & report)
+{
+    std::vector<std::tuple<String, FsckClass, std::vector<String>>> rows;
+    for (const FsckObject & o : report.objects)
+        rows.emplace_back(o.key, o.cls, o.reachable_from);
+    std::sort(rows.begin(), rows.end());
+    return rows;
+}
+
+/// A sink that throws `code`: on every call, or only at the ticks of `walking refs`.
+FsckProgress throwingSink(int code, bool only_ref_ticks, size_t & calls)
+{
+    return [code, only_ref_ticks, &calls](FsckProgressStep step, std::string_view phase, std::string_view, uint64_t, double)
+    {
+        if (only_ref_ticks && !(step == FsckProgressStep::Tick && phase == "walking refs"))
+            return;
+        ++calls;
+        throw DB::Exception(code, "progress sink failure");
+    };
+}
+
+}
+
+/// A sink that throws changes nothing the checker reports, including a finding located after the throw.
+TEST(CASFsck, ThrowingSinkDoesNotChangeTheReport)
+{
+    FsckManyRefsPool pool_a;
+    FsckGcFixture pool_b(0, {1});
+    pool_b.drop();
+    pool_b.round();
+    pool_b.removeIntent(1);
+
+    struct Case
+    {
+        const char * name;
+        Pool * store;
+        bool verify;
+        bool only_ref_ticks;
+    };
+    const Case cases[] = {
+        {"A, throw at the 64th ref only", pool_a.store.get(), false, true},
+        {"A, throw on every call", pool_a.store.get(), false, false},
+        {"B, throw on every call", pool_b.store.get(), true, false},
+    };
+    for (const Case & c : cases)
+    {
+        for (const int code : {DB::ErrorCodes::CORRUPTED_DATA, DB::ErrorCodes::TIMEOUT_EXCEEDED})
+        {
+            SCOPED_TRACE(String(c.name) + ", code " + std::to_string(code));
+            const FsckReport baseline = runFsck(*c.store, true, {}, {}, /*partial_on_deadline=*/true, {}, false, c.verify);
+            size_t calls = 0;
+            const FsckReport with_sink
+                = runFsck(*c.store, true, throwingSink(code, c.only_ref_ticks, calls), {}, /*partial_on_deadline=*/true, {}, false, c.verify);
+
+            for (const FsckReport * r : {&baseline, &with_sink})
+            {
+                EXPECT_FALSE(r->clean());
+                EXPECT_EQ(r->unchecked, 0u);
+                EXPECT_FALSE(r->partial);
+            }
+            const bool is_a = c.store == pool_a.store.get();
+            EXPECT_EQ(baseline.dangling, is_a ? 1u : 0u);
+            EXPECT_EQ(with_sink.dangling, is_a ? 1u : 0u);
+            EXPECT_EQ(baseline.pending_without_intent, is_a ? 0u : 1u);
+            EXPECT_EQ(with_sink.pending_without_intent, is_a ? 0u : 1u);
+            EXPECT_GT(calls, 0u) << "the sink was never reached";
+            EXPECT_EQ(formatFsckSummary(with_sink), formatFsckSummary(baseline));
+            EXPECT_EQ(with_sink.partial_reason, baseline.partial_reason);
+            EXPECT_EQ(objectsOf(with_sink), objectsOf(baseline));
+        }
+    }
+}
+
+/// A sink that throws on every call neither stops the marker removal nor changes its result.
+TEST(CASFsck, ThrowingSinkDuringMarkerRemovalDoesNotChangeTheReport)
+{
+    const auto populate = [](FsckIntentFixture & f)
+    {
+        for (uint64_t b = 1; b <= 1000; ++b)
+            f.marker(b);
+    };
+    FsckIntentFixture plain;
+    populate(plain);
+    const FsckReport baseline = runFsck(*plain.store, false, {}, {}, false, {}, /*fix_legacy_markers=*/ true);
+
+    FsckIntentFixture f;
+    populate(f);
+    size_t calls = 0;
+    FsckReport rep;
+    ASSERT_NO_THROW(rep = runFsck(*f.store, false, throwingSink(DB::ErrorCodes::CORRUPTED_DATA, false, calls), {}, false, {},
+                                  /*fix_legacy_markers=*/ true));
+
+    EXPECT_GT(calls, 0u) << "the sink was never reached";
+    EXPECT_EQ(rep.legacy_markers_deleted, 1000u);
+    EXPECT_EQ(formatFsckSummary(rep), formatFsckSummary(baseline));
+}
+
+/// Each line names the unit of its count.
+TEST(CASFsck, ProgressLineNamesTheUnit)
+{
+    EXPECT_EQ(formatFsckProgress(FsckProgressStep::Start, "walking refs", "refs", 0, 0.0), "cas-fsck: walking refs: started");
+    EXPECT_EQ(formatFsckProgress(FsckProgressStep::Tick, "walking refs", "refs", 64, 12.5), "cas-fsck: walking refs: 64 refs, 12.5 s");
+    EXPECT_EQ(formatFsckProgress(FsckProgressStep::End, "reading gc snapshot runs", "rows", 65536, 3.0),
+              "cas-fsck: reading gc snapshot runs: done, 65536 rows, 3.0 s");
+}
+
+/// A phase left by the deadline has a start and no end, so the last line of a stopped run names it. The deadline
+/// passes on the pool's request clock, which the first body `HEAD` moves.
+TEST(CASFsck, ProgressStopsAtTheInterruptedPhase)
+{
+    FsckGcFixture f(/*create_budget=*/0, {1, 2, 3, 4});
+    f.drop();
+    f.round();
+    const auto clock = VirtualRetryClock::installOn(f.store);
+    const ToolDeadline deadline = fsckDeadlineIn(*f.store, std::chrono::seconds(1));
+    for (const uint64_t b : {1, 2, 3, 4})
+        f.backend->beforeHead(f.bodyKey(b), [clock] { clock->advance(2000); });
+    FsckProgressLog log;
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/false, recordInto(log), deadline, /*partial_on_deadline=*/true);
+
+    ASSERT_TRUE(rep.partial);
+    EXPECT_NE(rep.partial_reason.find("checking pending rows"), String::npos) << rep.partial_reason;
+    EXPECT_EQ(countOf(log, "head-checking retired bodies", FsckProgressStep::Start), 1u);
+    EXPECT_EQ(countOf(log, "head-checking retired bodies", FsckProgressStep::End), 0u);
+    ASSERT_FALSE(log.empty());
+    EXPECT_EQ(log.back().phase, "head-checking retired bodies");
+    EXPECT_EQ(log.back().step, FsckProgressStep::Start) << "no line follows the interrupted phase's start";
+}
+
+/// One progress tick per 16 list pages.
+constexpr uint64_t kListTickKeysForTest = 16 * CasOperation::kCasListPageKeys;
+
+/// Listing the manifests for the stale-edge check reports its own progress, in keys, before any manifest is read.
+TEST(CASFsck, StaleEdgeManifestListingReportsProgressInKeys)
+{
+    FsckGcFixture f(/*create_budget=*/0, {1});
+    f.drop();
+    deleteManifestBody(*f.backend, f.store->layout(), f.manifest_id);
+    f.round();   /// a round that cannot fold the edge: its manifest is gone
+    {
+        OperationForTest op(*f.backend);
+        const String prefix = f.store->layout().manifestNamespacePrefix(f.ns);
+        for (uint64_t i = 0; i < kListTickKeysForTest + 1; ++i)
+            (*op).create(prefix + fmt::format("junk{:06}", i), "x", Retry::standard());
+    }
+    FsckProgressLog log;
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true, recordInto(log));
+
+    ASSERT_EQ(rep.stale_edge, 1u) << "positive control: the stale-edge check ran";
+    const String listing = "listing manifests for the stale-edge check";
+    EXPECT_EQ(countOf(log, listing, FsckProgressStep::Start), 1u);
+    EXPECT_EQ(countOf(log, listing, FsckProgressStep::End), 1u);
+    EXPECT_FALSE(ticksOf(log, listing).empty());
+    const FsckProgressEvent * end = endOf(log, listing);
+    ASSERT_NE(end, nullptr);
+    EXPECT_EQ(end->unit, "keys");
+    const std::vector<String> started = startsOf(log);
+    const auto listing_at = std::find(started.begin(), started.end(), listing);
+    const auto reading_at = std::find(started.begin(), started.end(), "reading manifests for the stale-edge check");
+    ASSERT_NE(listing_at, started.end());
+    EXPECT_TRUE(reading_at == started.end() || listing_at < reading_at);
+}
+
+namespace
+{
+/// Two namespaces, each with live manifests and one dropped ref whose manifest body is gone: a stale-edge candidate in each.
+void publishStaleEdgesInTwoNamespaces(StaleEdgeFixture & f)
+{
+    f.publish("live_a1", {10});
+    f.publish("live_a2", {11});
+    f.publish("stale_a", {1});
+    f.publish("live_b1", {12}, kBaitNs);
+    f.publish("live_b2", {13}, kBaitNs);
+    f.publish("stale_b", {2}, kBaitNs);
+    f.gc.runRegularRound();
+    f.drop("stale_a");
+    f.drop("stale_b");
+    f.removeManifestBody("stale_a");
+    f.removeManifestBody("stale_b");
+}
+
+/// The Start and End steps of the two stale-edge phases, in emission order.
+std::vector<String> staleEdgePhaseSteps(const FsckProgressLog & log)
+{
+    std::vector<String> steps;
+    for (const FsckProgressEvent & e : log)
+    {
+        const String kind = e.phase == "listing manifests for the stale-edge check" ? "listing"
+            : e.phase == "reading manifests for the stale-edge check"               ? "reading"
+                                                                                    : "";
+        if (!kind.empty() && e.step != FsckProgressStep::Tick)
+            steps.push_back(kind + (e.step == FsckProgressStep::Start ? " start" : " end"));
+    }
+    return steps;
+}
+}
+
+/// The manifest-read phase of the stale-edge check is scoped to the namespace it reads, like its listing.
+TEST(CASFsck, StaleEdgeCheckListsAndReadsManifestsPerNamespace)
+{
+    StaleEdgeFixture f;
+    publishStaleEdgesInTwoNamespaces(f);
+    FsckProgressLog log;
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true, recordInto(log));
+
+    ASSERT_EQ(rep.stale_edge, 2u) << "positive control: both namespaces held a candidate";
+    EXPECT_EQ(staleEdgePhaseSteps(log), (std::vector<String>{"listing start", "listing end", "reading start", "reading end",
+                                                             "listing start", "listing end", "reading start", "reading end"}));
+}
+
+/// A read that stalls in the second namespace leaves that namespace's read phase as the last line.
+TEST(CASFsck, StaleEdgeReadInterruptedInTheSecondNamespaceEndsOnItsReadingStart)
+{
+    StaleEdgeFixture f;
+    publishStaleEdgesInTwoNamespaces(f);
+    const auto clock = VirtualRetryClock::installOn(f.store);
+    const ToolDeadline deadline = fsckDeadlineIn(*f.store, std::chrono::seconds(1));
+    bool fired = false;
+    FsckProgressLog log;
+    const FsckProgress record = recordInto(log);
+    /// The ref walk reads the live manifests too, so the stall is armed at the next read after the second listing starts.
+    size_t listings_started = 0;
+    const FsckProgress sink = [&](FsckProgressStep step, std::string_view phase, std::string_view unit, uint64_t done, double seconds)
+    {
+        record(step, phase, unit, done, seconds);
+        if (step == FsckProgressStep::Start && phase == "listing manifests for the stale-edge check" && ++listings_started == 2)
+            f.backend->armOnFirstGetUnder("", [&]
+            {
+                fired = true;
+                clock->advance(2000);
+            });
+    };
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true, sink, deadline, /*partial_on_deadline=*/true);
+
+    ASSERT_TRUE(fired) << "positive control: the second namespace's manifests were read";
+    ASSERT_TRUE(rep.partial);
+    ASSERT_FALSE(log.empty());
+    EXPECT_EQ(log.back().phase, "reading manifests for the stale-edge check");
+    EXPECT_EQ(log.back().step, FsckProgressStep::Start) << "no line follows the interrupted read phase's start";
+    EXPECT_EQ(staleEdgePhaseSteps(log), (std::vector<String>{"listing start", "listing end", "reading start", "reading end",
+                                                             "listing start", "listing end", "reading start"}));
+}
+
+/// A retired body with a `pending` row and no intent costs two `HEAD`s, so the phase counts bodies, not `HEAD`s.
+TEST(CASFsck, RetiredBodyWithTwoHeadsIsCountedAsOneBody)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    f.removeIntent(1);
+    f.backend->clearJournal();
+    FsckProgressLog log;
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/false, recordInto(log));
+
+    ASSERT_EQ(rep.pending_without_intent, 1u) << "positive control: the body took the pending-row path";
+    EXPECT_GE(countKeyRequests(f.backend->journal(), JournalVerb::Head, f.bodyKey(1)), 2u) << "positive control: more than one HEAD";
+    const FsckProgressEvent * end = endOf(log, "head-checking retired bodies");
+    ASSERT_NE(end, nullptr);
+    EXPECT_EQ(formatFsckProgress(end->step, end->phase, end->unit, end->done, 0.0),
+              "cas-fsck: head-checking retired bodies: done, 1 bodies, 0.0 s");
+}
+
+/// A reachable blob the listing missed costs one `HEAD`; the phase counts it as a blob, as the scoped scan's phase does.
+TEST(CASFsck, ReachableBlobHeadCheckCountsBlobs)
+{
+    FsckGcFixture f;
+    f.removeBody(1);
+    FsckProgressLog log;
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/false, recordInto(log));
+
+    ASSERT_EQ(rep.dangling, 1u) << "positive control: the reachable blob was head-checked";
+    const FsckProgressEvent * end = endOf(log, "head-checking reachable blobs");
+    ASSERT_NE(end, nullptr);
+    EXPECT_EQ(formatFsckProgress(end->step, end->phase, end->unit, end->done, 0.0),
+              "cas-fsck: head-checking reachable blobs: done, 1 blobs, 0.0 s");
+}
+
+/// Bodies the snapshot has not retired are classified without a request and are not counted; a pool GC never ran on
+/// counts none.
+TEST(CASFsck, BodyClassificationProgressCountsOnlyRetiredBodies)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    for (uint64_t b = 1; b <= 3; ++b)
+        writeBlobBody(*backend, store->layout(), numberedBlobHash(b));
+    FsckProgressLog log;
+
+    const FsckReport rep = runFsck(*store, /*detail=*/false, recordInto(log));
+
+    ASSERT_EQ(rep.awaiting_gc, 3u) << "positive control: three bodies were classified";
+    const FsckProgressEvent * end = endOf(log, "head-checking retired bodies");
+    ASSERT_NE(end, nullptr);
+    EXPECT_EQ(end->unit, "bodies");
+    EXPECT_EQ(end->done, 0u);
+    EXPECT_EQ(formatFsckProgress(end->step, end->phase, end->unit, end->done, 0.0),
+              "cas-fsck: head-checking retired bodies: done, 0 bodies, 0.0 s");
+}
+
+/// After the first failure of the sink in a phase it is not called again in that phase, except for the end line,
+/// and the phase logs one line; a failing end line adds none.
+TEST(CASFsck, FailingSinkIsLoggedOncePerPhase)
+{
+    FsckManyRefsPool pool;
+    const FsckReport baseline = runFsck(*pool.store, /*detail=*/true);
+    size_t refs_calls = 0;
+    FsckProgress sink = [&refs_calls](FsckProgressStep, std::string_view phase, std::string_view, uint64_t, double)
+    {
+        if (phase != "walking refs")
+            return;
+        ++refs_calls;
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "progress sink failure");
+    };
+    ScopedLogCapture own("CasFsck", "error");
+    ScopedLogCapture forced("ForcedCriticalErrorsLogger", "error");
+
+    const FsckReport rep = runFsck(*pool.store, /*detail=*/true, sink);
+
+    EXPECT_EQ(refs_calls, 2u) << "the start, then the end line once";
+    EXPECT_EQ(own.count("progress sink failure"), 1u) << own.captured();
+    EXPECT_EQ(forced.count("progress sink failure"), 0u) << forced.captured();
+    EXPECT_EQ(formatFsckSummary(rep), formatFsckSummary(baseline));
+    EXPECT_EQ(objectsOf(rep), objectsOf(baseline));
 }
