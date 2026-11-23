@@ -6290,12 +6290,9 @@ def test_liquid_clustering_data_skipping(started_cluster):
 
 
 def test_liquid_clustering_predicate_fallback(started_cluster):
-    """Verify that the clustering-column predicate fallback fires when the full
-    predicate cannot be translated, and that file skipping still works.
-
-    Uses a filter combining an untranslatable expression with a simple clustering
-    column filter. The fallback should push the clustering filter to the kernel
-    while ClickHouse evaluates the full expression on the remaining rows.
+    """Verify that the clustering-column predicate fallback replaces the scan after
+    the full predicate translation throws, that it skips files, and that it is never
+    stricter than the full filter.
     """
     instance = started_cluster.instances["node1"]
     spark = started_cluster.spark_session
@@ -6323,13 +6320,9 @@ def test_liquid_clustering_predicate_fallback(started_cluster):
 
     create_delta_table(instance, "s3", TABLE_NAME, started_cluster)
 
-    # Query with a clustering filter (a = 42) AND an untranslatable expression
-    # referencing non-clustering column `c` (cityHash64 cannot be translated by
-    # the delta-kernel engine predicate). `restrictFilterDAGToInputs` will
-    # replace the non-clustering conjunct with constant true, leaving only
-    # `a = 42` for the fallback predicate to push for file-level skipping.
-    # Unsupported nodes alone do not set an exception: the original scan already
-    # prunes on `a = 42` (AND(a = 42, Unknown)) and is kept, so the fallback is not used.
+    # `cityHash64(c) != 0` cannot be translated to a delta-kernel predicate. Without an
+    # exception it becomes Unknown inside `AND`, the original scan still prunes on `a = 42`,
+    # and no fallback scan is built.
     noop_query_id = f"{TABLE_NAME}_no_fallback"
     result = instance.query(
         f"SELECT a FROM {TABLE_NAME} WHERE a = 42 AND cityHash64(c) != 0",
@@ -6349,21 +6342,21 @@ def test_liquid_clustering_predicate_fallback(started_cluster):
         instance.query("SYSTEM DISABLE FAILPOINT delta_kernel_fail_literal_visitor")
     assert result.strip() == "42"
 
-    # The fallback predicate must never be stricter than the full filter.
-    # `startsWith(c, '43')` references a non-clustering column and appears both
-    # directly under `and` and under `not`. Dropping it must not turn the second
-    # branch into `false`, which would skip the files holding `a = 4043`
-    # (`c` = '4044'). `a = 42` and `a = 4043` are far apart, so they are in different files.
+    # The fallback predicate must never be stricter than the full filter. The clustering
+    # conjuncts `a >= 42` and `a <= 4043` are top-level `AND` atoms next to the non-clustering
+    # `NOT startsWith(c, '43')`; only the clustering conjuncts may be pushed.
+    range_query = (
+        f"SELECT count(), sum(a) FROM {TABLE_NAME} "
+        f"WHERE a >= 42 AND a <= 4043 AND NOT startsWith(c, '43')"
+    )
+    expected = instance.query(f"{range_query} SETTINGS delta_lake_enable_engine_predicate = 0")
+    range_query_id = f"{TABLE_NAME}_fallback_range"
     instance.query("SYSTEM ENABLE FAILPOINT delta_kernel_fail_literal_visitor")
     try:
-        result = instance.query(
-            f"SELECT a FROM {TABLE_NAME} "
-            f"WHERE (a = 42 AND startsWith(c, '43')) OR (a = 4043 AND NOT startsWith(c, '43')) "
-            f"ORDER BY a"
-        )
+        result = instance.query(range_query, query_id=range_query_id)
     finally:
         instance.query("SYSTEM DISABLE FAILPOINT delta_kernel_fail_literal_visitor")
-    assert result.split() == ["42", "4043"]
+    assert result == expected
 
     # Full scan as the baseline for file skipping.
     full_scan_id = f"{TABLE_NAME}_full_scan"
@@ -6386,6 +6379,9 @@ def test_liquid_clustering_predicate_fallback(started_cluster):
     assert profile_event(fallback_query_id, "DeltaLakeClusteringPredicateFallbacks") >= 1, (
         "Expected the clustering predicate fallback to fire after a translation exception"
     )
+    assert profile_event(range_query_id, "DeltaLakeClusteringPredicateFallbacks") >= 1, (
+        "Expected the clustering predicate fallback to fire for the range query"
+    )
 
     # The fallback scan must actually prune files, not just be counted.
     full_scan_files = profile_event(full_scan_id, "DeltaLakeScannedFiles")
@@ -6394,16 +6390,23 @@ def test_liquid_clustering_predicate_fallback(started_cluster):
         f"Expected the fallback predicate to enable file skipping: fallback query scanned "
         f"{fallback_scan_files} files but full scan scanned {full_scan_files} files"
     )
+    range_scan_files = profile_event(range_query_id, "DeltaLakeScannedFiles")
+    assert range_scan_files < full_scan_files, (
+        f"Expected the range fallback predicate to enable file skipping: range query scanned "
+        f"{range_scan_files} files but full scan scanned {full_scan_files} files"
+    )
 
 
 def test_clustering_metadata_stale_token_retry_keeps_snapshot_version(started_cluster):
     """A stale-credentials retry while reading the clustering metadata must stay on the
     table version the query already resolved.
 
-    The query is paused after its snapshot version is resolved and before the clustering
-    metadata is read. A newer version V+1 is committed while it is paused, then the read
-    fails once with `ExpiredToken` and the snapshot is rebuilt. If the rebuild resolved
-    "latest" again, the query would list V+1's files and return the row added by V+1.
+    The clustering metadata is read only after the full predicate translation throws, so
+    `delta_kernel_fail_literal_visitor` forces that. The query is paused after its snapshot
+    version is resolved and before the clustering metadata is read. A newer version V+1 is
+    committed while it is paused, then the read fails once with `ExpiredToken` and the scan
+    state is rebuilt. If the rebuild resolved "latest" again, the query would list V+1's
+    files and return the row added by V+1.
     """
     instance = started_cluster.instances["node1"]
     spark = started_cluster.spark_session
@@ -6426,10 +6429,10 @@ def test_clustering_metadata_stale_token_retry_keeps_snapshot_version(started_cl
     stale = "delta_kernel_force_stale_token_error_on_clustering_read"
     query_id = f"{TABLE_NAME}_retry"
     instance.query("SYSTEM ENABLE FAILPOINT object_storage_force_refresh_callback_success")
+    instance.query("SYSTEM ENABLE FAILPOINT delta_kernel_fail_literal_visitor")
     instance.query(f"SYSTEM ENABLE FAILPOINT {stale}")
     instance.query(f"SYSTEM ENABLE FAILPOINT {pause}")
     try:
-        # This must be the first filtered read of the table: the clustering columns are cached after it.
         request = instance.get_query_request(
             f"SELECT a FROM {TABLE_NAME} WHERE a = 42 ORDER BY a",
             query_id=query_id,
@@ -6448,6 +6451,7 @@ def test_clustering_metadata_stale_token_retry_keeps_snapshot_version(started_cl
     finally:
         instance.query(f"SYSTEM DISABLE FAILPOINT {pause}")
         instance.query(f"SYSTEM DISABLE FAILPOINT {stale}")
+        instance.query("SYSTEM DISABLE FAILPOINT delta_kernel_fail_literal_visitor")
         instance.query("SYSTEM DISABLE FAILPOINT object_storage_force_refresh_callback_success")
 
     # Only V's row. Two rows would mean the retry moved the query to V+1.
@@ -6457,9 +6461,57 @@ def test_clustering_metadata_stale_token_retry_keeps_snapshot_version(started_cl
     retry_hits = int(instance.query(
         "SELECT count() FROM system.text_log "
         f"WHERE query_id = '{query_id}' "
-        "  AND message ILIKE '%stale credentials during clustering metadata read; rebuilding%'"
+        "  AND message ILIKE '%stale credentials during scan iteration; rebuilding%'"
     ).strip())
     assert retry_hits >= 1, (
-        f"Expected the clustering metadata stale-token retry to fire for query {query_id}, "
+        f"Expected the stale-token retry of the clustering metadata read to fire for query {query_id}, "
         f"found {retry_hits} hits"
     )
+
+
+def test_clustering_metadata_not_read_for_non_clustered_table(started_cluster):
+    """On a table without the `clustering` table feature the clustering metadata must not be
+    read, even when the clustering predicate fallback would be used.
+
+    The full predicate translation is forced to throw, and the clustering metadata read is
+    forced to fail with `ExpiredToken`. No credentials refresh is available, so the query
+    would fail if the read happened.
+    """
+    instance = started_cluster.instances["node1"]
+    spark = started_cluster.spark_session
+    TABLE_NAME = randomize_table_name("test_clustering_not_read")
+
+    delta_path = f"/{TABLE_NAME}"
+    spark.sql(f"""
+        CREATE TABLE delta.`{delta_path}` (a INT, b STRING)
+        USING DELTA
+    """)
+    spark.sql(f"""
+        INSERT INTO delta.`{delta_path}`
+        SELECT id AS a, CAST(id AS STRING) AS b FROM range(100)
+    """)
+
+    default_upload_directory(started_cluster, "s3", delta_path, "")
+    create_delta_table(instance, "s3", TABLE_NAME, started_cluster)
+
+    stale = "delta_kernel_force_stale_token_error_on_clustering_read"
+    query_id = f"{TABLE_NAME}_query"
+    instance.query("SYSTEM ENABLE FAILPOINT delta_kernel_fail_literal_visitor")
+    instance.query(f"SYSTEM ENABLE FAILPOINT {stale}")
+    try:
+        result = instance.query(
+            f"SELECT a FROM {TABLE_NAME} WHERE a = 42",
+            query_id=query_id,
+        )
+    finally:
+        instance.query(f"SYSTEM DISABLE FAILPOINT {stale}")
+        instance.query("SYSTEM DISABLE FAILPOINT delta_kernel_fail_literal_visitor")
+
+    assert result.strip() == "42"
+
+    instance.query("SYSTEM FLUSH LOGS")
+    fallbacks = int(instance.query(
+        "SELECT ProfileEvents['DeltaLakeClusteringPredicateFallbacks'] "
+        f"FROM system.query_log WHERE query_id = '{query_id}' AND type = 'QueryFinish'"
+    ).strip())
+    assert fallbacks == 0
