@@ -827,7 +827,9 @@ ASTPtr IStorageCluster::getTableFunctionToSend(
     auto select_query = make_intrusive<ASTSelectQuery>();
     select_query->replaceDatabaseAndTable(getStorageID());
     ASTPtr query = select_query;
-    updateQueryToSendIfNeeded(query, storage_snapshot, context, /*make_cluster_function=*/read_initiator_file_tasks);
+    /// A `SELECT` is sent, so every node needs the structure and format to produce the initiator's header.
+    updateQueryToSendIfNeeded(
+        query, storage_snapshot, context, /*make_cluster_function=*/read_initiator_file_tasks, /*add_structure_and_format=*/true);
 
     auto table_function = extractTableFunctionASTPtrFromSelectQuery(query);
     if (!table_function)

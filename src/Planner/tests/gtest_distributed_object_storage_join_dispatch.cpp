@@ -108,7 +108,7 @@ public:
     }
 
 protected:
-    void updateQueryToSendIfNeeded(ASTPtr & query, const StorageSnapshotPtr &, const ContextPtr &, bool make_cluster_function) override
+    void updateQueryToSendIfNeeded(ASTPtr & query, const StorageSnapshotPtr &, const ContextPtr &, bool make_cluster_function, bool) override
     {
         rewriteFirstTableToFunction(query, make_cluster_function ? "driverClusterFunction" : "driverTableFunction");
     }
@@ -137,7 +137,7 @@ public:
     }
 
 protected:
-    void updateQueryToSendIfNeeded(ASTPtr & query, const StorageSnapshotPtr &, const ContextPtr &, bool make_cluster_function) override
+    void updateQueryToSendIfNeeded(ASTPtr & query, const StorageSnapshotPtr &, const ContextPtr &, bool make_cluster_function, bool) override
     {
         rewriteFirstTableToFunction(query, make_cluster_function ? "lookupClusterFunction" : "lookupTableFunction");
     }
