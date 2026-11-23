@@ -6126,6 +6126,8 @@ receiving new data files, so every merged output is then written to object stora
     DECLARE(Bool, use_puffin_files_cache, true, R"(
 If turned on, Iceberg reads may utilize the Puffin files cache for parsed puffin file content such as deletion vectors.
 
+A deletion-vector read that uses the cache is pinned to the etag from the object listing, even when `s3_validate_etag_on_read` or `azure_validate_etag_on_read` is off. If the object changes during the read, the query fails with an error that names `s3_validate_etag_on_read` or `azure_validate_etag_on_read`; disabling those settings does not avoid this. To read deletion vectors without the listed-etag pin, set `use_puffin_files_cache` to 0.
+
 Possible values:
 
 - 0 - Disabled
@@ -9285,6 +9287,9 @@ Default age threshold in seconds for orphan file removal in Iceberg tables. File
 )", EXPERIMENTAL) \
     DECLARE(Bool, allow_experimental_expire_snapshots, false, R"(
 Allow to execute experimental Iceberg command `ALTER TABLE ... EXECUTE expire_snapshots`.
+)", EXPERIMENTAL) \
+    DECLARE(Bool, allow_experimental_iceberg_add_files, false, R"(
+Allow to execute experimental Iceberg command `ALTER TABLE ... EXECUTE add_files`, which registers existing Parquet files under the table location without rewriting them.
 )", EXPERIMENTAL) \
     DECLARE(Bool, write_full_path_in_iceberg_metadata, false, R"(
 Write full paths (including s3://) into iceberg metadata files.

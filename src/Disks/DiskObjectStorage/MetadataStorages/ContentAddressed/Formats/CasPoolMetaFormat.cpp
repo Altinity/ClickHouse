@@ -1,3 +1,4 @@
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasEnvelopeLimits.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPoolMetaFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
@@ -25,6 +26,7 @@ namespace PoolMetaWire
     constexpr WireKey gc_shards{"gc_shards"};
     constexpr WireKey min_reader_generation{"min_reader_generation"};
     constexpr WireKey algos_used{"algos_used"};
+    constexpr WireKey token_dialect{"token_dialect"};
 }
 
 /// Minimum `blob_header_len` that provably fits the `cas_blob` JSON envelope's mandatory-descriptor
@@ -72,6 +74,13 @@ void validatePoolAlgosUsed(const std::vector<uint8_t> & algos_used, int error_co
 String encodePoolMeta(const PoolMeta & pm)
 {
     validatePoolAlgosUsed(pm.algos_used, ErrorCodes::CORRUPTED_DATA, "pool meta");
+    const bool dialect_required = pm.min_reader_generation >= G_BLOB_INTENTS;
+    if (pm.token_dialect && !dialect_required)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS pool meta: token_dialect is present at reader generation {}", pm.min_reader_generation);
+    if (!pm.token_dialect && dialect_required)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS pool meta: token_dialect is missing at reader generation {}", pm.min_reader_generation);
 
     CasJsonWriter out(256);
     writeHeaderLine(out, FormatId::PoolMeta);
@@ -88,6 +97,8 @@ String encodePoolMeta(const PoolMeta & pm)
     for (size_t i = 0; i < pm.algos_used.size(); ++i)
         algo_words[i] = kBlobHashAlgoWords.toWord(static_cast<BlobHashAlgo>(pm.algos_used[i]), "CAS pool meta");
     writeWordArrayField(out, PoolMetaWire::algos_used, std::span{algo_words}.first(pm.algos_used.size()), first);
+    if (pm.token_dialect)
+        writeWordField(out, PoolMetaWire::token_dialect, dialectWord(*pm.token_dialect), first);
     closeObject(out, first);
     writeChar('\n', out);
 
@@ -115,6 +126,7 @@ PoolMeta decodePoolMeta(std::string_view data)
     PoolMeta pm;
     bool saw_pid = false;
     bool saw_gc_shards = false;
+    std::optional<String> token_dialect_word;
     String key;
     while (r.nextKey(key))
     {
@@ -137,6 +149,8 @@ PoolMeta decodePoolMeta(std::string_view data)
             for (const String & word : r.readStringArray())
                 pm.algos_used.push_back(static_cast<uint8_t>(blobHashAlgoFromWord(word, "pool meta algo")));
         }
+        else if (key == PoolMetaWire::token_dialect)
+            token_dialect_word = r.readString();
         else
             r.skipUnknown(key);
     }
@@ -156,6 +170,20 @@ PoolMeta decodePoolMeta(std::string_view data)
         throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION,
             "CAS pool meta: pool requires reader generation {} but this build supports at most {}",
             pm.min_reader_generation, ceiling);
+
+    const bool dialect_required = pm.min_reader_generation >= G_BLOB_INTENTS;
+    if (token_dialect_word && !dialect_required)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS pool meta: token_dialect is present at reader generation {}", pm.min_reader_generation);
+    if (!token_dialect_word && dialect_required)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS pool meta: token_dialect is missing at reader generation {}", pm.min_reader_generation);
+    if (token_dialect_word)
+    {
+        pm.token_dialect = dialectFromWord(*token_dialect_word);
+        if (!pm.token_dialect)
+            throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION, "CAS pool meta: unknown token_dialect '{}'", *token_dialect_word);
+    }
 
     return pm;
 }

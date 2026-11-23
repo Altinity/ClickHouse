@@ -21,7 +21,7 @@ namespace ErrorCodes
     extern const int FILE_DOESNT_EXIST;
     extern const int ABORTED;
     extern const int LOGICAL_ERROR;
-    extern const int NETWORK_ERROR;
+    extern const int NO_REPLICA_HAS_PART;
 }
 }
 
@@ -396,6 +396,11 @@ bool PreparedPartWrite::commitIsUnresolved() const
     return build && build->commitState() == Cas::PartWriteTxn::CommitState::Uncertain;
 }
 
+bool PreparedPartWrite::destinationOccupied() const
+{
+    return build && build->promoteFoundDestinationOccupied();
+}
+
 Cas::CommitOutcome PreparedPartWrite::promote(Cas::PublishPolicy policy)
 {
     if (terminal)
@@ -428,6 +433,13 @@ Cas::CommitOutcome PreparedPartWrite::promote(Cas::PublishPolicy policy)
         terminal = abandonBuildBestEffort(*build, "abandoning the build of a failed PreparedPartWrite::promote");
         throw;
     }
+}
+
+void PreparedPartWrite::abortLoggingFailure() noexcept
+{
+    chassert(!terminal);
+    if (!terminal)
+        terminal = abandonBuildBestEffort(*build, "aborting a prepared part write for a caller that reports another error");
 }
 
 void PreparedPartWrite::abort()
@@ -479,85 +491,118 @@ Cas::CommitOutcome CachedPartFolderAccess::publishEntries(const PartRefKey & dst
     return prepared.promote(std::move(policy));
 }
 
-bool CachedPartFolderAccess::republishRef(const PartRefKey & src, const PartRefKey & dst)
+std::optional<RefRename> CachedPartFolderAccess::republishRef(const PartRefKey & src, const PartRefKey & dst,
+                                                            const std::optional<ManifestRef> & expected_source)
 {
     /// Content addressing has no rename, so move a committed ref by reading the source manifest
     /// through the pool's manifest cache after a fresh ref resolve, publishing equivalent entries at
     /// the destination, and then removing the source. The source blobs are adopted by evidence of the
     /// live source edge, never re-probed; the decode is never taken from a retained view.
-    auto resolved = store->resolveRef(src.ns, src.ref);
-    if (!resolved)
-        return false;
-    const Cas::ManifestRef src_manifest_ref = resolved->manifest_id.ref;
-    const auto src_manifest = store->readManifestShared(resolved->manifest_id);
+    const std::optional<CopySource> source = resolveCopySource(src);
+    if (!source)
+        return std::nullopt;
+    const Cas::ManifestRef src_manifest_ref = source->manifest_ref;
+    if (expected_source && !(src_manifest_ref == *expected_source))
+        throwCasOwnershipConflict("republishRef: source '{}' names another manifest than the one this rename read; "
+            "the part must be re-resolved", src.ns.string() + "/" + src.ref);
+    const auto & src_manifest = source->manifest;
 
-    const auto drop_source_or_abort = [&](const std::optional<Cas::CommitOutcome> & created_dst)
+    /// The manifest `dst` commits when its content equals the source's; any other content is a conflict. Manifest
+    /// ids differ between equal parts, so entries are compared.
+    const auto committed_equal_destination = [&]() -> std::optional<Cas::ManifestRef>
     {
-        runHookForTest(TestHook::BeforeSourceDrop);
-        /// The source is removed only while it still names the manifest we republished.
-        const Removal outcome = dropRefExact(src, src_manifest_ref);
-        if (outcome == Removal::Removed)
-            return;
-        /// Absent: the only writer that removes a part under rename is an identical concurrent rename
-        /// (a queue re-drive) that saw our byte-equal destination and finished the move; MergeTree holds
-        /// a part being renamed, so an independent removal cannot race here. Treat it as completed and
-        /// never compensate — that would delete the other rename's result.
-        if (outcome == Removal::Gone)
-            return;
-        /// Mismatch: another writer repointed the source, so a content-equal destination is stale,
-        /// whoever created it. Drop it by exact manifest (a destination holding anything else is never
-        /// touched) and report the conflict.
-        if (created_dst && created_dst->created)
-            dropRefIfMatches(dst, created_dst->manifest_ref);
-        throwCasOwnershipConflict("republishRef: source '{}' was repointed concurrently while being renamed to '{}'; the part must be re-resolved",
-            src.ns.string() + "/" + src.ref, dst.ns.string() + "/" + dst.ref);
-    };
-
-    /// If `dst` is already committed, a previous attempt may have completed its promote before the
-    /// source drop. Compare content rather than the whole manifest, whose ref/namespace/digest
-    /// legitimately differ: equal content completes the move by removing `src`; different content
-    /// is a conflict and leaves the source intact.
-    if (auto dst_resolved = store->resolveRef(dst.ns, dst.ref))
-    {
-        const auto dst_manifest = store->readManifestShared(dst_resolved->manifest_id);
-        if (dst_manifest->entries != src_manifest->entries)
-            throwCasOwnershipConflict("republishRef: destination '{}' is already committed with different content — refusing "
-                "(rename/attach conflict)", dst.ns.string() + "/" + dst.ref);
-        drop_source_or_abort(Cas::CommitOutcome{dst.ns, dst.ref, dst_resolved->manifest_id.ref, /*created=*/true});
-        return true;
-    }
-
-    runHookForTest(TestHook::BeforeDestinationPublish);
-
-    std::optional<Cas::CommitOutcome> oc;
-    try
-    {
-        oc = publishEntries(dst, src_manifest->entries, Cas::ProvenanceOp::Other);
-    }
-    catch (const Exception & e)
-    {
-        /// `throwCasWriteRetryLater` raises `NETWORK_ERROR` for many causes, so the code alone is not
-        /// the filter; the equality check below is. Completion requires `dst` to exist with entries equal
-        /// to the source manifest, which holds in exactly two cases: our promote landed but its response
-        /// was lost, or an identical concurrent rename promoted its content-equal manifest first and our
-        /// promote refused. Absent `dst` rethrows the original exception; `dst` with other content is an
-        /// ownership conflict, like the pre-publish check.
-        if (e.code() != ErrorCodes::NETWORK_ERROR)
-            throw;
         const auto dst_resolved = store->resolveRef(dst.ns, dst.ref);
         if (!dst_resolved)
-            throw;
+            return std::nullopt;
         if (store->readManifestShared(dst_resolved->manifest_id)->entries != src_manifest->entries)
             throwCasOwnershipConflict("republishRef: destination '{}' is already committed with different content — refusing "
                 "(rename/attach conflict)", dst.ns.string() + "/" + dst.ref);
-        drop_source_or_abort(Cas::CommitOutcome{dst.ns, dst.ref, dst_resolved->manifest_id.ref, /*created=*/true});
-        return true;
+        return dst_resolved->manifest_id.ref;
+    };
+
+    std::optional<Cas::ManifestRef> destination = committed_equal_destination();
+    if (!destination)
+    {
+        runHookForTest(TestHook::BeforeDestinationPublish);
+        PreparedPartWrite prepared = prepareEntries(dst, src_manifest->entries, Cas::ProvenanceOp::Other);
+        ConfirmAnswer source_answer = ConfirmAnswer::Unknown;
+        try
+        {
+            source_answer = confirmCopySource(*source);
+        }
+        catch (...)
+        {
+            prepared.abortLoggingFailure();
+            throw;
+        }
+        if (source_answer != ConfirmAnswer::Yes)
+        {
+            /// An identical rename may have completed the move first; its destination is then the result.
+            prepared.abortLoggingFailure();
+            destination = committed_equal_destination();
+            if (!destination)
+                throwCopySourceUnconfirmed(*source, dst, source_answer);
+        }
+        else
+        {
+            try
+            {
+                destination = prepared.promote().manifest_ref;
+            }
+            catch (...)
+            {
+                if (!prepared.destinationOccupied())
+                    throw;
+                destination = committed_equal_destination();
+                if (!destination)
+                    throw;
+            }
+        }
     }
-    drop_source_or_abort(oc);
-    return true;
+
+    runHookForTest(TestHook::BeforeSourceDrop);
+    /// From here `dst` is committed and is never removed: another rename may already have completed over it.
+    if (dropRefExact(src, src_manifest_ref) == Removal::Mismatch)
+        throwCasOwnershipConflict("republishRef: source '{}' was repointed concurrently while being renamed to '{}'; the part must be re-resolved",
+            src.ns.string() + "/" + src.ref, dst.ns.string() + "/" + dst.ref);
+    return RefRename{.source = src_manifest_ref, .destination = *destination};
 }
 
-std::optional<Cas::ManifestRef> CachedPartFolderAccess::renameCommittedRef(
+std::optional<CopySource> CachedPartFolderAccess::resolveCopySource(const PartRefKey & key) const
+{
+    auto pinned = store->resolveRefPinned(key.ns, key.ref);
+    if (!pinned)
+        return std::nullopt;
+    return CopySource{
+        .part = key,
+        .manifest_ref = pinned->resolved.manifest_id.ref,
+        .manifest = store->readManifestShared(pinned->resolved.manifest_id),
+        .table = std::move(pinned->table),
+    };
+}
+
+ConfirmAnswer CachedPartFolderAccess::confirmCopySource(const CopySource & source) const
+{
+    return store->confirmPinnedRef(source.table, source.part.ns, source.part.ref, source.manifest_ref);
+}
+
+void throwCopySourceUnconfirmed(const CopySource & source, const PartRefKey & destination, ConfirmAnswer answer)
+{
+    if (answer == ConfirmAnswer::No)
+        throw Exception(ErrorCodes::NO_REPLICA_HAS_PART,
+            "The source part '{}/{}' changed or was removed while it was being copied (it no longer commits manifest {}), "
+            "so nothing was copied into '{}/{}'. Run the statement again",
+            source.part.ns.string(), source.part.ref, manifestRefDebugString(source.manifest_ref),
+            destination.ns.string(), destination.ref);
+    throw Exception(ErrorCodes::NO_REPLICA_HAS_PART,
+        "The source part '{}/{}' could not be confirmed as still committing manifest {} while it was being copied: its "
+        "table stayed busy until the request deadline, was being changed, was recovering or was replaced, its write lane "
+        "was blocked, or this server lost its claim on it. Nothing was copied into '{}/{}'. Run the statement again",
+        source.part.ns.string(), source.part.ref, manifestRefDebugString(source.manifest_ref),
+        destination.ns.string(), destination.ref);
+}
+
+std::optional<RefRename> CachedPartFolderAccess::renameCommittedRef(
     const PartRefKey & src, const PartRefKey & dst, const std::optional<Cas::ManifestRef> & expected)
 {
     const auto resolved = resolve(src, Freshness::ForceFresh);
@@ -566,21 +611,16 @@ std::optional<Cas::ManifestRef> CachedPartFolderAccess::renameCommittedRef(
     if (expected && !(resolved->manifest_id.ref == *expected))
         Cas::throwCasOwnershipConflict("renameCommittedRef: source '{}' names another manifest than the one this rename read; "
             "the part must be re-resolved", src.ns.string() + "/" + src.ref);
-    /// A writable mount always admits owner moves (`mountWritable` raises the reader floor first), so inside
+    /// A writable mount always admits owner moves (every open requires a generation 4 pool), so inside
     /// one namespace the only reason to republish is a committed destination: an earlier attempt published
     /// it by republication and crashed before dropping the source. `republishRef` completes that re-drive
     /// when the content is equal and conflicts when it differs.
     if (src.ns.string() == dst.ns.string() && !existsRef(dst, Freshness::ForceFresh))
     {
         moveRefExact(src, dst, resolved->manifest_id.ref);
-        return resolved->manifest_id.ref;   /// a Move keeps the manifest
+        return RefRename{.source = resolved->manifest_id.ref, .destination = resolved->manifest_id.ref};   /// a Move keeps the manifest
     }
-    if (!republishRef(src, dst))
-        return std::nullopt;
-    const auto renamed = resolve(dst, Freshness::ForceFresh);
-    if (!renamed)
-        return std::nullopt;
-    return renamed->manifest_id.ref;
+    return republishRef(src, dst, expected);
 }
 
 bool CachedPartFolderAccess::moveRefExact(const PartRefKey & src, const PartRefKey & dst, const Cas::ManifestRef & expected)

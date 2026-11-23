@@ -79,8 +79,8 @@ Two questions, in order: is this node's scheduler leading, and did its recent ro
 SELECT server_root_id, is_leader, state, last_success_age_seconds, pending_reclaim
 FROM system.cas_mounts WHERE disk = 'cas';
 
-SELECT event_time, outcome, candidates_marked, entries_condemned, entries_graduated,
-       entries_redeleted, entries_redelete_failed, anomalies
+SELECT event_time, outcome, candidates_marked, entries_condemned, entries_intent_confirmed,
+       entries_bodies_deleted, entries_body_delete_failed, anomalies
 FROM system.cas_gc_log
 WHERE event_type = 'Finish' AND disk_name = 'cas'
 ORDER BY event_time DESC LIMIT 10;
@@ -88,11 +88,37 @@ ORDER BY event_time DESC LIMIT 10;
 
 A `NULL` `last_success_age_seconds` means this server's GC has not completed a round as leader since it
 started. A `0`/`false` `is_leader` means this node never reclaims for this disk — check the peer that holds
-leadership instead. A steady `entries_condemned` with `entries_graduated` stuck at `0` means objects
-are being found but never crossing the safety floor (recall the grace period is measured in full
-rounds, not acks — see [condemnation and deletion](/antalya/cas/architecture/garbage-collection#condemn-delete)).
+leadership instead. A steady `entries_condemned` with `entries_intent_confirmed` stuck at `0` means objects
+are being found but their deletion intents are never confirmed: check `CASGCIntentUnconfirmedCarry` and
+the bucket's rights on `blob-intents/` (see [condemnation and deletion](/antalya/cas/architecture/garbage-collection#condemn-delete)).
+A store that refuses an intent create or an intent delete outright fails the round instead: the `Finish` row carries
+the store's error in `error`, and the fix is the credential's rights on `blob-intents/` (see
+[rights on `blob-intents/`](/antalya/cas/operations/migration#migrate-generation-4-rights)).
+A body that `GC` cannot decode is neither condemned nor deleted: `CASGCUndecodableBlobBody` counts it, and the key is in
+the log and in a `corrupt_decode` event of `system.cas_log` (see
+[a body `GC` cannot decode](/antalya/cas/architecture/garbage-collection#undecodable-body)).
 A specific blob's own story — was it ever condemned, spared, or is it not being seen at all — is the
 per-object query in the previous section, filtered to `object_kind = 'blob'`.
+
+### GC refuses its bookkeeping {#gc-bookkeeping-corrupt}
+
+The refusals below fail a round with `CORRUPTED_DATA`, and each message ends with
+`GC bookkeeping is corrupt: GC stops reclaiming on this pool; stored data is not affected. See /antalya/cas/operations/debugging#gc-bookkeeping-corrupt in the CAS documentation`.
+
+| Message starts with | What GC found |
+|---|---|
+| `CAS GC: the adopted fold seal (generation <g>, attempt <a>) is missing under a live gc/state` | `gc/state` names a fold seal that is absent |
+| `CAS GC baseline guard: table <ns> has snapshot <id> but no surviving log` | A table has no sealed fold cursor, and its logs at or below its snapshot are gone |
+| `CAS GC fold: namespace <ns> sealed a cursor at <id> that does not close the run it walked` | A sealed cursor disagrees with the logs the round walked |
+| `CAS GC fold: <n> ref transaction(s) folded and merged into the round buffers but NONE of their blob deltas reached a shard reducer` | A folded transaction reached no reducer |
+| `CAS GC fold: the round sealed coverage over <n> ref log(s) but only <m> fully folded` | The coverage a round would seal exceeds what it folded |
+| ``CAS source-edge run `<key>` of GC shard <n>: the row of blob <b> source <s>`` | A run the adopted fold seal inherits breaks a row rule (a blob of another shard, rows out of order, a sentinel row or an active edge at the wrong key, a condemned row stamped after the parent round); the key, shard and row name what to inspect with `cas-inspect` |
+| ``CAS GC shard <n> (source-edge run `<key>`): its rows hold``, ``CAS GC shard <n> (no source-edge run): its rows hold`` | The condemned rows the adopted fold seal inherits for a shard differ from the seal's summary of that shard; the message gives both counts. A shard with several runs lists them as `` `<key>`, `<key>` `` |
+
+No repair for these refusals is available in this build. `gc/state` is present and its lease was held, and
+`cas-gc-rebuild` refuses that with `another GC leader holds the lease`.
+
+Collect what [What to collect before filing a bug](#filing-a-bug) lists before you change anything on the pool.
 
 ### What one GC round did {#gc-round-detail}
 
@@ -199,16 +225,63 @@ SYSTEM CAS FSCK cas;
 Returns one row: `disk`, `reachable`, `dangling`, `unreachable`, `pending_gc`, `awaiting_gc`,
 `unaccounted`, `stale_edge`, `corrupted_runs`, `chain_broken`, `unchecked`, `lifeless_keys`,
 `namespace_janitor_pending` (+`_bytes`/`_lives`), `ref_records_walked`, `physical_bytes`,
-`referenced_logical_bytes`, `distinct_blobs`, `total_blob_refs`. `dangling` is the one column that
-means data loss — `unreachable`, `pending_gc`, and `awaiting_gc` are objects still
-moving through the normal condemn/graduate/delete pipeline, not a problem on their own.
-`chain_broken` and `corrupted_runs` are the other two hard findings. `chain_broken` is a ref-log stream
+`referenced_logical_bytes`, `distinct_blobs`, `total_blob_refs`, and the deletion-intent columns `intents_listed`,
+`intent_malformed`, `intent_unread`, `pending_without_intent`, `pending_intent_absent`, `pending_token_rejected`,
+`standing_present` and `legacy_marker` (see [reading the intent classes](#fsck-intent-classes)). `dangling` is the
+one column that means data loss — `unreachable`, `pending_gc`, and `awaiting_gc` are objects still
+moving through the normal intent, body-delete and intent-delete rounds, not a problem on their own.
+`chain_broken`, `corrupted_runs`, `lifeless_keys`, `intent_malformed`, `intent_unread` and `pending_without_intent` are the other hard findings. `chain_broken` is a ref-log stream
 whose chain ends below a log listed above that end, or whose snapshot base, records or links are corrupt
-while `_ckpt` is unchanged. `corrupted_runs` is a GC source-edge run that failed its checksum. `unchecked` means the scan could not prove or
+while `_ckpt` is unchanged. `corrupted_runs` is a GC source-edge run or fold seal that a `GC` round refuses as corrupt; under `--detail` its row names the key and the reason. `unchecked` means the scan could not prove or
 refute a finding, for example because the checkpoint changed during the scan; rerun `fsck` and treat only
 a repeat as a finding. This summary-only form has
 no per-object `--detail` equivalent yet — for that, the offline `cas-fsck --detail` below is still
 needed.
+
+### Reading the intent classes {#fsck-intent-classes}
+
+A scan of the whole pool lists `blob-intents/` and classifies each intent from its key alone: it counts the
+keys that parse (`intents_listed`) and flags the ones that do not (`intent_malformed`). It sends no request per
+intent. It deletes no intent and no body, and it decides nothing from an absent body: a deletion intent outlives its
+body until a later `GC` round. A scan with `--namespace` lists no intents.
+
+The one place a default scan reads an intent is a `pending` row of `GC`, the only state from which `GC` deletes a
+body without reading the intent again. For each `pending` row whose body is present with the row's token, referenced
+by a ref or not, the scan sends one `GET` of the intent. When the intent is absent it sends a `HEAD` of the body and,
+if the body is still there, reads `gc/state` once more before it reports. Only a complete second read clears the
+row: when the seal it names is missing or a run fails its checksum, the scan reports `intent_unread` with the reason
+`inconclusive`. The first read of the `GC` snapshot is taken again, a bounded number of times, when the fold seal
+`gc/state` names is absent, or when a seal or run is refused and `gc/state` moved since: a newer round may have pruned
+it. Under a `gc/state` that did not move, an absent seal is counted in `intent_unread` and a refused seal or run in
+`corrupted_runs`. A `gc/state` that moved at every read is counted in `intent_unread`. An unreferenced blob whose
+shard's rows were not read is not examined: under `--detail` its row is `unchecked`. A referenced body is not counted in the backlog classes. A default scan does not see an intent whose bytes are not the
+intent record, nor an intent over a replaced or absent body: those need `cas-fsck --verify-intents`, which sends a
+`GET` and a `HEAD` for every intent (two requests per intent; raise `--timeout` for a large pool). `GC` does not
+accept an intent with other bytes as a confirmation.
+`SYSTEM CAS FSCK` and the soak poll never verify intents.
+
+| Class | State | Finding? | Action |
+|---|---|---|---|
+| `intents_listed` | A key under `blob-intents/` that parses | No | None. A count, not a verdict |
+| `intent_current` | `--verify-intents` only. The body now at the blob's key is the incarnation the intent names | No | None. The intent of a `pending` row, or of a blob that is referenced again |
+| `intent_replaced` | `--verify-intents` only. The body now at the key is another incarnation | No | None. `GC` removes the intent in a later round |
+| `intent_body_gone` | `--verify-intents` only. No body at the key | No | None. This is the normal state of a deleted blob until `GC` removes the intent |
+| `intent_malformed` | The key is not an intent key; with `--verify-intents` also: the bytes are not the intent record | **Yes**: the report is unclean and `cas-fsck` exits 1 | No build writes such an object. Keep the key from the `--detail` output and file a bug; do not delete it by hand while `GC` runs |
+| `intent_unread` | A read of an intent (a `pending` row's, or any with `--verify-intents`) or a `HEAD` of its body failed, the body's token has no canonical identity, the fold seal `gc/state` names is absent, `gc/state` moved at every read of the `GC` snapshot, or `gc/state` is below generation 4, which every `GC` round refuses, so the `pending` rows were not checked | **Yes**: the report is unclean and `cas-fsck` exits 1, naming the first failure | The scan could not check what it was asked to. A refused `blob-intents/` prefix (a 403) lands here. Fix the store or the credential's rights and run again |
+| `pending_without_intent` | A `pending` row, its intent absent, its body present with the row's token | **Yes**: the report is unclean and `cas-fsck` exits 1 | `GC` would delete this body without warning any writer. Stop `GC` on this pool and report it with the `--detail` output. The scan repairs nothing |
+| `pending_intent_absent` | A `pending` row, its intent absent, and its body gone or replaced (or the row moved on while the scan ran) | No | None. The row is about to become `standing` or to move; nothing is at risk |
+| `pending_token_rejected` | A `pending` row whose token has no canonical identity, so no intent key exists for it | No | None. `GC` never deletes such a body |
+| `standing_present` | A `standing` row, with the body present again under the row's token | No | `GC` records it and deletes nothing, and the intent is present, so a writer publishes fresh. Investigate only if it persists |
+| `legacy_marker` | A `.meta` object beside a body, left from the marker protocol | No | None needed: nothing reads it. `cas-migrate-pool` removes them; `cas-fsck --fix legacy-markers` removes any that remain |
+
+On a local object storage, which `cas-fsck` opens read-only and which then refuses every delete, `--fix
+legacy-markers` is refused before the scan; run `cas-migrate-pool` instead, which removes the markers of a migrated
+pool. `--fix legacy-markers` deletes each marker with a `HEAD` followed by a delete conditional on what the `HEAD` saw;
+`cas-migrate-pool` removes markers the same way. Only a key spelled exactly as a marker's is deleted. A marker
+replaced between the two requests is left and counted in `legacy_markers_changed`; run the fix again. It
+sends through the scan's own read-only operation: no mount, no lease, no write. A refused or unanswered delete
+stops the run with an error that carries the count deleted so far, and a rerun continues. `SYSTEM CAS FSCK` never
+fixes.
 
 ### SYSTEM CAS GC RUN {#sql-gc-run}
 
@@ -221,12 +294,14 @@ SYSTEM CAS GC RUN cas;
 ```
 
 Run it on the GC leader (`is_leader = 1` in `system.cas_mounts`). On any other node it does nothing and
-returns no error.
+returns no error. On a pool that `cas-migrate-pool` migrated before any GC ran, `gc/state` holds a lease that was
+never held, and a manual run takes it at once; a lease that was ever held is never taken by a manual run.
 
 One row per disk it ran on: `disk`, `acquired_lease`, `deferred`, `round`, `candidates_marked`,
 `objects_deleted`, `objects_absent`, `objects_replaced`, `objects_spared`, `manifests_deleted`,
-`entries_condemned`, `entries_graduated`, `entries_redeleted`, `entries_redelete_failed`, `fence_outs`,
-`anomalies`, `pending_candidates`, `pending_condemned`, `pending_retired`. Omitting
+`entries_condemned`, `entries_intent_confirmed`, `entries_bodies_deleted`, `entries_body_delete_failed`, `fence_outs`,
+`anomalies`, `pending_candidates`, `pending_condemned`, `pending_retired`, then the compatibility names `entries_graduated`, `entries_redeleted`,
+`entries_redelete_failed` (same values as the three `entries_*` columns renamed from them). Omitting
 the disk name runs one round on every content-addressed disk on the node. A manual run executes
 regardless of `SYSTEM CAS GC STOP` — `STOP` pauses only the background scheduler.
 
@@ -265,16 +340,19 @@ own local view of one disk.
 
 When the server cannot answer — it is down, or the access needs to be read-only forensic against the
 bucket directly, disaster recovery of `gc/state`, or a raw object decode — `clickhouse-disks` runs
-these against the pool's backend without a live server. All five require the disk to be opened with
+these against the pool's backend without a live server. All of them require the disk to be opened with
 `<readonly>true</readonly>` in the `clickhouse-disks` config; they must never claim a live server's
-mount.
+mount. `cas-fsck` and the other tools of this build refuse a pool below generation 4: inspect such a pool with the
+build that writes it, or [migrate it](/antalya/cas/operations/migration#migrate-generation-4) first. Two instances of
+the local object-storage backend on one path are not supported, so an offline tool must not run against the
+data directory of a server that is running on the local backend.
 
 | Command | Use it for |
 |---|---|
-| `cas-fsck [--detail] [--timeout N] [--namespace PREFIX] [--partial]` | The same reachability scan as `SYSTEM CAS FSCK`, offline. `--detail` adds a per-object `<class>\t<key>\t<size>` listing (`reachable`, `dangling`, `unreachable`, `pending-gc`, `awaiting-gc`, `unaccounted`, `stale-edge`, `corrupted-run`, `chain-broken`, `unchecked`, `lifeless-key`, `janitor-pending`) — the only way to get per-object, not just per-pool, findings. `--timeout`/`--partial` bound a scan on a large pool |
-| `cas-gc-dryrun` | Previews the next round's deletes, read-only, no lease. Over-reports away from quiescence (does not fold new owner events) — a diagnostic only, never a delete source |
+| `cas-fsck [--detail] [--timeout N] [--namespace PREFIX] [--partial] [--fix legacy-markers] [--concurrency N] [--verify-intents]` | The same reachability scan as `SYSTEM CAS FSCK`, offline. `--verify-intents` also reads every deletion intent and sends a `HEAD` for its body (two requests per intent; see [reading the intent classes](#fsck-intent-classes)); it needs a scan of the whole pool, so it cannot be combined with `--namespace`. `--detail` adds a per-object `<class>\t<key>\t<size>` listing (`reachable`, `dangling`, `unreachable`, `pending-gc`, `awaiting-gc`, `unaccounted`, `stale-edge`, `corrupted-run`, `chain-broken`, `unchecked`, `lifeless-key`, `janitor-pending`, `intent-current`, `intent-replaced`, `intent-body-gone`, `intent-malformed`, `intent-unread`, `pending-without-intent`, `pending-intent-absent`, `pending-token-rejected`, `standing-present`, `legacy-marker`) — the only way to get per-object, not just per-pool, findings. `--timeout`/`--partial` bound a scan on a large pool, the intent loop and the `--fix` loop included; progress goes to stderr every 1000 keys. `--fix legacy-markers` deletes the legacy markers and nothing else, `--concurrency` at a time (default 1); it needs a scan of the whole pool, so it cannot be combined with `--namespace`, and it is refused on a local object storage, where `cas-migrate-pool` removes them |
+| `cas-gc-dryrun` | Previews the next round's deletes, read-only, no lease. Over-reports away from quiescence (does not fold new owner events) — a diagnostic only, never a delete source. A `standing` row's line names its deletion intent, with the intent's size; a row whose token names no intent has no line. The preview sends no `HEAD`: the next round keeps the intent when the body is back under the row's token. A GC shard whose runs a round refuses as corrupt adds no row: it is printed as `refused_shards=N` and one `refused` line each, and the command exits non-zero. A refusal under a `gc/state` that moved meanwhile is not printed: the newer snapshot is read instead. When `gc/state` moves at every read, the command prints nothing and fails with `ABORTED` |
 | `cas-inspect '<raw-object-key>'` | Decodes one raw object-storage key (as printed by `cas-fsck`/`cas-gc-dryrun`) straight to JSON |
-| `cas-gc-rebuild [--force]` | Disaster recovery: rebuilds a `gc/state` baseline from raw owner state after the GC guard has refused every regular round. `--force` bypasses only the healthy-state refusal, never a competing leader or a failed `CAS`. See [`SYSTEM CAS GC REBUILD`](/sql-reference/statements/system#system-cas-gc-rebuild) for the destructive-tool caveats. Before rebuilding a lost `gc/state`, stop or restart every server of the pool; a request sent before a server stopped can still reach the object store afterwards, and this rule does not cover it. |
+| `cas-gc-rebuild [--force]` | Rebuilds a `gc/state` baseline from raw owner state. It runs when `gc/state` is absent or its lease was never held. A present `gc/state` whose lease was held is refused with `another GC leader holds the lease`; one that names a missing fold seal is refused before the lease is tried, with a message that says the pool must be recreated (see [GC refuses its bookkeeping](#gc-bookkeeping-corrupt)). `--force` bypasses only the healthy-state refusal, never a competing leader or a failed `CAS`. Before rebuilding a lost `gc/state`, stop or restart every server of the pool; a request sent before a server stopped can still reach the object store afterwards, and this rule does not cover it. |
 
 ```bash
 clickhouse-disks -C config.xml --disk cas cas-fsck --detail
@@ -283,8 +361,17 @@ clickhouse-disks -C config.xml --disk cas cas-inspect '<raw-object-key>'
 clickhouse-disks -C config.xml --disk cas cas-gc-rebuild --force
 ```
 
+A rebuild refuses when a live precommit's manifest cannot be read: the refusal names
+`live precommit '<ns>/<ref>'` and the manifest key. A writer still uploading that manifest causes it, and so does a
+writer that stopped before uploading it. Run the rebuild again after the writer finishes, or after its server mounts
+the table again and its stale-precommit sweep removes the precommit. A refused rebuild gives back the
+GC lease it claimed, so the command can run again. When that write fails, a warning `could not give back its GC lease` names the lease left behind. If the refused attempt
+created `gc/state`, the next attempt can read that state as healthy and then needs `--force`.
+A rebuild cannot start while another GC leader holds the lease. This includes a lease left by a stopped GC leader,
+and the lease of a pool migrated from an older generation whose GC ever ran, because the migration keeps the lease.
+
 Exit code of a non-interactive `--query`: 1 when any `cas-*` command in it threw (`cas-fsck` throws on
-`dangling`, `chain_broken`, `corrupted_runs` and `lifeless_keys`; `unreachable` is a soft count that
+`dangling`, `chain_broken`, `corrupted_runs`, `lifeless_keys`, `intent_malformed`, `intent_unread` and `pending_without_intent`; `unreachable` is a soft count that
 includes the GC pipeline and in-flight builds), and so does a `cas-*` command given bad arguments,
 whatever ran after it; the upstream commands keep `clickhouse-disks`'s "always 0" contract, as does an
 unknown command name.
@@ -295,21 +382,17 @@ decommissioning a pool member is a migration/scale-down operation, not an incide
 
 ## Upgrading a pool with GC enabled {#upgrade-gc}
 
-`cas_gc_enabled` is read once, when the disk is constructed: only a restart applies a change.
+A build that uses blob deletion intents refuses to mount a pool of an older generation. The pool is converted once,
+offline, with `clickhouse-disks cas-migrate-pool`, after every server and every tool of the pool has stopped. There
+is no in-place upgrade, and `cas_gc_enabled = false` on the older servers does not replace stopping them.
 
-1. On every server still on the old version, set `<cas_gc_enabled>false</cas_gc_enabled>` in each CAS disk's
-   configuration and restart the server. It then runs no GC and refuses `SYSTEM CAS GC RUN`, `START` and `REBUILD`.
-2. Only after step 1 has finished on every server, upgrade the servers, removing the setting on each upgraded one.
-3. Never run `SYSTEM CAS GC` commands on, or re-enable GC on, a server still on the old version.
+Before the conversion, a server of an older build that is still running can send delete requests that reach the object
+store after the tool finished. The tool waits for a grace interval for this; the residual cases it does not cover are
+listed under
+[What the migration does not cover](/antalya/cas/operations/migration#migrate-generation-4-residuals). The steps are on
+the [migration page](/antalya/cas/operations/migration#migrate-generation-4).
 
-A delete request sent before a restart can still reach the object store later and remove a marker GC relies on,
-so a blob can be lost; nothing bounds when such requests stop. Entries the old version already scheduled for
-deletion are deleted by the upgraded GC without a fresh marker read. A downgrade within 26.6.x follows the same
-procedure; a pool whose reader floor was raised to 2 or 3 by a writable 26.8 mount cannot be downgraded (see
-[Upgrading a pool from 26.6.x](../configuration.md#upgrading-from-26-6) and
-[Upgrading a pool to reader generation 3](/antalya/cas/operations/migration#upgrade-generation-3)).
-
-An older GC leader that is still mounted when a generation 3 mount stamps a namespace cannot read that
+An older GC leader that is still mounted when a server of this build stamps a namespace cannot read that
 namespace's `_ckpt`. It records the namespace as undecodable (the `checkpoint_undecodable` hold), folds
 nothing for it and suppresses every destructive step for the pool until it is stopped or upgraded.
 

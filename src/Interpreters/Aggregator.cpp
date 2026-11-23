@@ -1781,6 +1781,8 @@ void NO_INLINE Aggregator::executeImplBatch(
     state.resetCache();
 
     [[maybe_unused]] std::vector<DestroyedState> destroyed_states;
+    /// Assign at the branch tails so `no_more_keys` is not live across either loop.
+    bool all_places_are_non_null = false;
 
     /// For all rows.
     if (!no_more_keys)
@@ -1897,6 +1899,8 @@ void NO_INLINE Aggregator::executeImplBatch(
                 }
             }
         }
+
+        all_places_are_non_null = !top_k;
     }
     else
     {
@@ -1911,6 +1915,8 @@ void NO_INLINE Aggregator::executeImplBatch(
                 aggregate_data = overflow_row;
             places[i] = aggregate_data;
         }
+
+        all_places_are_non_null = false;
     }
 
     if constexpr (top_k)
@@ -1933,6 +1939,7 @@ void NO_INLINE Aggregator::executeImplBatch(
             key_start,
             has_only_one_value,
             all_keys_are_const,
+            all_places_are_non_null,
             use_jit);
 }
 
@@ -1945,6 +1952,7 @@ void Aggregator::executeAggregateInstructions(
     size_t key_start,
     bool has_only_one_value_since_last_reset,
     bool all_keys_are_const,
+    bool all_places_are_non_null,
     bool use_compiled_functions [[maybe_unused]]) const
 {
 #if USE_EMBEDDED_COMPILER
@@ -1997,7 +2005,7 @@ void Aggregator::executeAggregateInstructions(
         }
         else
         {
-            addBatch(row_begin, row_end, inst, places, aggregates_pool);
+            addBatch(row_begin, row_end, inst, places, aggregates_pool, all_places_are_non_null);
         }
     }
 
@@ -2061,7 +2069,8 @@ void Aggregator::addBatch(
     size_t row_begin, size_t row_end,
     const AggregateFunctionInstruction * inst,
     AggregateDataPtr * places,
-    Arena * arena)
+    Arena * arena,
+    bool all_places_are_non_null)
 {
     if (inst->offsets)
         inst->batch_that->addBatchArray(
@@ -2072,6 +2081,12 @@ void Aggregator::addBatch(
             arena);
     else if (inst->has_sparse_arguments)
         inst->batch_that->addBatchSparse(
+            row_begin, row_end, places,
+            inst->state_offset,
+            inst->batch_arguments,
+            arena);
+    else if (all_places_are_non_null)
+        inst->batch_that->addBatchWithNonNullPlaces(
             row_begin, row_end, places,
             inst->state_offset,
             inst->batch_arguments,

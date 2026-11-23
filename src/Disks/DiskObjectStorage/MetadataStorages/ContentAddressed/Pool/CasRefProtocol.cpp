@@ -128,7 +128,7 @@ void validateRefChainLink(const std::optional<RefEpochTransition> & open, const 
 bool ckptTokenMoved(CasOperation & op, const Layout & layout, const NamespaceLifeId & life, const Etag & token)
 {
     const std::optional<Object> current = op.read(layout.refCkptKey(life), Retry::standard());
-    return !current || !(current->etag == token);
+    return !current || !sameVersion(current->etag, token);
 }
 
 bool failureJudgedAgainstCkpt(int error_code)

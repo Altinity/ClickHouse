@@ -243,7 +243,7 @@ TEST(CASWriteResult, OrThrowMapsEveryAlternative)
     const Etag landed = std::get<Committed>(committed).etag;
     const auto returned = orThrow(std::move(committed), "create");
     ASSERT_TRUE(returned.has_value());
-    EXPECT_EQ(*returned, landed);
+    EXPECT_EQ(tokenText(*returned), tokenText(landed));
     EXPECT_FALSE(orThrow(WriteResult{Declined{ProvenAbsent{}}}, "declined").has_value());
 
     expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { orThrow(WriteResult{Conflict{ProvenAbsent{}}}, "t"); });
@@ -294,17 +294,17 @@ TEST(CASBackendPrimitives, InMemoryWriteReadRemoveRoundTripThroughOneOperation)
     const std::optional<Object> r = op.read("k", Retry::once());
     ASSERT_TRUE(r);
     EXPECT_EQ(r->bytes, "v1");
-    EXPECT_EQ(r->etag, *w1);
+    EXPECT_EQ(tokenText(r->etag), tokenText(*w1));
 
     const std::optional<Meta> h = op.head("k", Retry::once());
     ASSERT_TRUE(h);
     EXPECT_EQ(h->size, 2u);
-    EXPECT_EQ(h->etag, *w1);
+    EXPECT_EQ(tokenText(h->etag), tokenText(*w1));
 
     EXPECT_TRUE(std::holds_alternative<Conflict>(op.create("k", "v2", Retry::once())));   /// must be absent
     const std::optional<Etag> w3 = orThrow(op.replace("k", "v2", *w1, Retry::once()), "replace");
     ASSERT_TRUE(w3);
-    EXPECT_NE(*w3, *w1);                                  /// incarnations never repeat
+    EXPECT_NE(tokenText(*w3), tokenText(*w1));                                  /// incarnations never repeat
 
     EXPECT_EQ(op.remove("k", *w1, Retry::once()), Removal::Mismatch);
     EXPECT_EQ(op.remove("k", *w3, Retry::once()), Removal::Removed);
@@ -329,7 +329,7 @@ TEST(CASBackendPrimitives, ListSurfacesTheIncarnationAndPaginates)
     EXPECT_EQ(page.keys[0].key, "p/a");
     EXPECT_EQ(page.keys[0].size, 10u);
     ASSERT_TRUE(page.keys[0].etag.has_value());
-    EXPECT_EQ(*page.keys[0].etag, *a);
+    EXPECT_EQ(tokenText(*page.keys[0].etag), tokenText(*a));
     EXPECT_TRUE(page.next_cursor.empty());
 
     const ListPage first = op.list("p/", "", 1, Retry::once());
@@ -711,10 +711,10 @@ TEST(CASRequests, CreateThenReplaceThenRemove)
     const auto seen = op.read("k", Retry::standard());
     ASSERT_TRUE(seen.has_value());
     EXPECT_EQ(seen->bytes, "v1");
-    EXPECT_EQ(seen->etag, first);
+    EXPECT_EQ(tokenText(seen->etag), tokenText(first));
 
     const Etag second = *orThrow(op.replace("k", "v2", first, Retry::standard()), "replace");
-    EXPECT_NE(second, first);
+    EXPECT_NE(tokenText(second), tokenText(first));
 
     EXPECT_EQ(op.remove("k", first, Retry::standard()), Removal::Mismatch);    /// the incarnation is stale
     EXPECT_EQ(op.remove("k", second, Retry::standard()), Removal::Removed);
@@ -1501,7 +1501,7 @@ TEST(CASRequests, OnPresenceReportsMetaEvenWhenItHadToFetchTheBody)
     ASSERT_TRUE(rival_etag.has_value());
     const auto * meta_seen = std::get_if<Meta>(&conflict->seen);
     ASSERT_NE(meta_seen, nullptr);
-    EXPECT_EQ(meta_seen->etag, *rival_etag);
+    EXPECT_EQ(tokenText(meta_seen->etag), tokenText(*rival_etag));
     EXPECT_EQ(meta_seen->size, String("theirs").size());
     EXPECT_EQ(backend->getTotal(), 1u);
 }
@@ -1528,6 +1528,51 @@ TEST(CASRequests, AmbiguousReplaceWhoseResolveShowsThePreconditionUnchangedIsRei
     EXPECT_EQ(clock.sleeps.size(), 1u);
 }
 
+namespace
+{
+
+/// Quotes the token in every write's answer, as a store may quote an ETag in a write's answer and not in a read's; a
+/// precondition spelled that way reaches the store unquoted.
+class QuotedWriteAnswersBackend : public CountingBackend
+{
+public:
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value, TransportAccess & access) override
+    {
+        std::optional<String> sent = expected_value;
+        if (sent && sent->size() >= 2 && sent->front() == '"' && sent->back() == '"')
+            sent = sent->substr(1, sent->size() - 2);
+        auto answer = CountingBackend::write(key, bytes, sent, access);
+        if (answer)
+            answer = "\"" + *answer + "\"";
+        return answer;
+    }
+};
+
+}
+
+/// The resolve read spells the precondition's version without the quotes of the write's answer: the version is
+/// unchanged, so the write is reissued, not reported as a conflict.
+TEST(CASRequests, AmbiguousReplaceWhoseResolveSpellsThePreconditionUnquotedIsReissued)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<QuotedWriteAnswersBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    const Etag seen = *orThrow(op.create("k", "v1", Retry::standard()), "create");
+    ASSERT_NE(tokenText(seen), tokenText(op.head("k", Retry::standard())->etag))
+        << "fixture: the write's answer and the read's spell the token differently";
+    backend->resetCounts();
+
+    backend->failNextWriteWith("k", std::make_exception_ptr(Poco::TimeoutException("the write timed out")));
+    WriteResult result = op.replace("k", "v2", seen, Retry::standard());
+    const auto * committed = std::get_if<Committed>(&result);
+    ASSERT_NE(committed, nullptr) << "the resolve read was taken for another writer's version";
+    EXPECT_EQ(committed->attempts_sent, 2u);
+    EXPECT_EQ(backend->writeTotal(), 2u);
+    EXPECT_EQ(backend->getTotal(), 1u);
+}
+
 TEST(CASRequests, AmbiguousReplaceOfIdenticalBytesIsReissuedNotClaimedByByteEquality)
 {
     /// The key already holds exactly the bytes we are about to write, so byte equality alone can never
@@ -1550,7 +1595,7 @@ TEST(CASRequests, AmbiguousReplaceOfIdenticalBytesIsReissuedNotClaimedByByteEqua
         /// never made; the reissue is what actually put these bytes there under a new incarnation.
         EXPECT_EQ(committed->attempts_sent, 2u);
         EXPECT_FALSE(committed->resolved_by_read);
-        EXPECT_NE(committed->etag, seen);
+        EXPECT_NE(tokenText(committed->etag), tokenText(seen));
         EXPECT_EQ(backend->writeTotal(), 2u);
         EXPECT_EQ(backend->getTotal(), 1u);
         EXPECT_EQ(clock.sleeps.size(), 1u);
@@ -1594,7 +1639,7 @@ TEST(CASRequests, AmbiguousReplaceWhoseResolveShowsAnotherIncarnationIsAConflict
     const auto * occupant = std::get_if<Object>(&conflict->seen);
     ASSERT_NE(occupant, nullptr);
     EXPECT_EQ(occupant->bytes, "theirs");
-    EXPECT_NE(occupant->etag, stale);
+    EXPECT_NE(tokenText(occupant->etag), tokenText(stale));
     EXPECT_EQ(backend->writeTotal(), 1u);
     EXPECT_EQ(backend->getTotal(), 1u);
     /// The count the conflict reports is the count the transport saw, not a constant that happens to
@@ -3425,7 +3470,7 @@ TEST(CASRequests, ReservationIsTheEnvelopeThroughInstrumentedBackend)
     };
     FakeClock clock;
     auto inner = std::make_shared<EnvelopeBackend>();
-    auto wrapped = std::make_shared<InstrumentedBackend>(inner);
+    auto wrapped = std::make_shared<InstrumentedBackend>(inner, "p");
     ASSERT_EQ(wrapped->attemptTimeoutMs(), 5000u);
     ASSERT_EQ(wrapped->attemptEnvelopeMs(), 7000u) << "InstrumentedBackend must forward the envelope, not fall back to the bare attempt timeout";
     auto requests = makeRequests(wrapped, clock);

@@ -28,6 +28,7 @@
 #include <Storages/ObjectStorage/Utils.h>
 #include <Poco/JSON/Stringifier.h>
 #include <Poco/String.h>
+#include <Common/FailPoint.h>
 #include <Common/FieldVisitorDump.h>
 #include <Common/Logger.h>
 #include <boost/container_hash/hash.hpp>
@@ -42,6 +43,11 @@ namespace DB::ErrorCodes
     extern const int ICEBERG_SPECIFICATION_VIOLATION;
     extern const int QUERY_WAS_CANCELLED;
     extern const int UNFINISHED;
+}
+
+namespace DB::FailPoints
+{
+    extern const char iceberg_compaction_pause_before_metadata_commit[];
 }
 
 namespace DB::Setting
@@ -602,11 +608,16 @@ struct LatestMetadata
     Poco::JSON::Object::Ptr object;
     /// The catalog's metadata location the compaction is based on; empty without a catalog.
     String catalog_metadata_location;
+    /// The same location exactly as the catalog reports it, which is what `updateMetadataIfCurrent` compares.
+    String raw_catalog_metadata_location;
 };
 
-String getCatalogMetadataLocation(const DataLake::ICatalog & catalog, const StorageID & storage_id, ContextPtr context)
+/// The metadata location exactly as the catalog reports it. `table_metadata` receives the table metadata, which
+/// `getMetadataLocation` needs to turn the raw value into a storage-relative one.
+String getRawCatalogMetadataLocation(
+    const DataLake::ICatalog & catalog, const StorageID & storage_id, ContextPtr context, DataLake::TableMetadata & table_metadata)
 {
-    DataLake::TableMetadata table_metadata = DataLake::TableMetadata().withDataLakeSpecificProperties().withLocation();
+    table_metadata = DataLake::TableMetadata().withDataLakeSpecificProperties().withLocation();
     const auto & [namespace_name, table_name] = DataLake::parseTableName(storage_id.getTableName());
     catalog.getTableMetadata(namespace_name, table_name, context, table_metadata);
 
@@ -617,7 +628,14 @@ String getCatalogMetadataLocation(const DataLake::ICatalog & catalog, const Stor
             "Catalog did not return a metadata file location for table '{}.{}'",
             namespace_name, table_name);
 
-    return table_metadata.getMetadataLocation(specific_properties->iceberg_metadata_file_location);
+    return specific_properties->iceberg_metadata_file_location;
+}
+
+String getCatalogMetadataLocation(const DataLake::ICatalog & catalog, const StorageID & storage_id, ContextPtr context)
+{
+    DataLake::TableMetadata table_metadata;
+    const auto raw_location = getRawCatalogMetadataLocation(catalog, storage_id, context, table_metadata);
+    return table_metadata.getMetadataLocation(raw_location);
 }
 
 LatestMetadata readLatestMetadata(
@@ -633,7 +651,9 @@ LatestMetadata readLatestMetadata(
     {
         /// The catalog, not the newest file in the `metadata` directory, holds the current
         /// snapshot: a newer file may be left by a commit that failed before updating the catalog.
-        String catalog_metadata_location = getCatalogMetadataLocation(*catalog, storage_id, context);
+        DataLake::TableMetadata table_metadata;
+        String raw_catalog_metadata_location = getRawCatalogMetadataLocation(*catalog, storage_id, context, table_metadata);
+        String catalog_metadata_location = table_metadata.getMetadataLocation(raw_catalog_metadata_location);
 
         DataLakeStorageSettings effective_settings = data_lake_settings;
         effective_settings[DataLakeStorageSetting::iceberg_metadata_file_path] = catalog_metadata_location;
@@ -649,20 +669,20 @@ LatestMetadata readLatestMetadata(
             /* force_fetch_latest_metadata */ true,
             /* ignore_explicit_metadata_file_path */ false);
 
-        auto metadata_object = getMetadataJSONObject(
+        auto metadata_object = deepCopy(getMetadataJSONObject(
             catalog_metadata.path,
             object_storage,
             persistent_table_components.metadata_cache,
             context,
             log,
             catalog_metadata.compression_method,
-            persistent_table_components.table_uuid);
+            persistent_table_components.table_uuid));
 
         /// The new metadata file must not reuse the name of a newer file left in the directory.
         const auto max_directory_version = getMaxMetadataFileVersionInDirectory(object_storage, persistent_table_components.table_path);
         const Int32 version = std::max(catalog_metadata.version, max_directory_version.value_or(catalog_metadata.version));
 
-        return {version, metadata_object, std::move(catalog_metadata_location)};
+        return {version, metadata_object, std::move(catalog_metadata_location), std::move(raw_catalog_metadata_location)};
     }
 
     const auto [metadata_version, metadata_file_path, _] = getLatestOrExplicitMetadataFileAndVersion(
@@ -677,16 +697,16 @@ LatestMetadata readLatestMetadata(
         /* force_fetch_latest_metadata */ true,
         /* ignore_explicit_metadata_file_path */ true);
 
-    auto metadata_object = getMetadataJSONObject(
+    auto metadata_object = deepCopy(getMetadataJSONObject(
         metadata_file_path,
         object_storage,
         persistent_table_components.metadata_cache,
         context,
         log,
         persistent_table_components.metadata_compression_method,
-        persistent_table_components.table_uuid);
+        persistent_table_components.table_uuid));
 
-    return {metadata_version, metadata_object, {}};
+    return {metadata_version, metadata_object, {}, {}};
 }
 
 enum class MetadataFileOwner : uint8_t
@@ -1330,13 +1350,16 @@ BinPackCommitResult commitMetadata(
     const std::shared_ptr<DataLake::ICatalog> & catalog,
     const StorageID & storage_id,
     const String & catalog_metadata_location,
+    const String & raw_catalog_metadata_location,
     bool & keep_files_on_error,
     const std::function<void()> & cleanup,
     LoggerPtr log)
 {
-    /// A catalog may repoint the table without a compare-and-swap (Glue `UpdateTable` is unconditional),
-    /// so a snapshot built on a superseded metadata file would replace the newer history. This check
-    /// narrows that window; it cannot close it.
+    /// A snapshot built on a superseded metadata file would replace the newer history. This check only
+    /// narrows that window, since a commit can still land after it. The window is closed by the catalog,
+    /// which `updateMetadataIfCurrent` asks to apply the update only if it still points at the base:
+    /// REST does it through the update requirements, Glue by comparing the location and sending
+    /// `UpdateTable` with the `VersionId` of that same read.
     if (catalog)
     {
         const String current_location = getCatalogMetadataLocation(*catalog, storage_id, context);
@@ -1355,6 +1378,10 @@ BinPackCommitResult commitMetadata(
     /// must not remove them. Paths that know the snapshot did not land call `cleanup` themselves.
     keep_files_on_error = true;
 
+    /// Test hook for Altinity/ClickHouse#2733: suspend here so a test can land a concurrent commit
+    /// before the metadata file is written and the catalog pointer is updated.
+    FailPointInjection::pauseFailPoint(FailPoints::iceberg_compaction_pause_before_metadata_commit);
+
     /// A transactional catalog writes the metadata file itself and is the source of truth for the
     /// current metadata, so the storage-side metadata file and version hint are not written for it.
     const bool catalog_writes_metadata_file = catalog && catalog->isTransactional();
@@ -1372,7 +1399,8 @@ BinPackCommitResult commitMetadata(
     {
         const auto catalog_filename = path_resolver.resolveForCatalog(generated_metadata_info.path);
         const auto & [namespace_name, table_name] = DataLake::parseTableName(storage_id.getTableName());
-        if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, snapshot, context->getForwardedAuthToken()))
+        if (!catalog->updateMetadataIfCurrent(
+                namespace_name, table_name, catalog_filename, snapshot, raw_catalog_metadata_location, context->getForwardedAuthToken()))
         {
             /// A catalog reports both a lost race and a request whose outcome is unknown (a timeout or
             /// a 5xx response) as a rejection, so the snapshot may still be live: the files stay.
@@ -1405,7 +1433,7 @@ BinPackCommitResult executeBinPackCompaction(
     UInt64 target_size = settings[Setting::iceberg_target_data_file_size_bytes];
     UInt64 min_size = settings[Setting::iceberg_min_data_file_size_bytes];
 
-    const auto [metadata_version, metadata_object, catalog_metadata_location]
+    const auto [metadata_version, metadata_object, catalog_metadata_location, raw_catalog_metadata_location]
         = readLatestMetadata(persistent_table_components, object_storage, data_lake_settings, context, catalog, storage_id, log);
 
     /// Format version 3 requires row lineage (`_row_id`, `_last_updated_sequence_number`) to be carried
@@ -1530,7 +1558,8 @@ BinPackCommitResult executeBinPackCompaction(
         auto commit = commitMetadata(
             metadata_object, snapshot_result.snapshot, generated_metadata_info,
             generator, path_resolver, persistent_table_components, object_storage,
-            context, data_lake_settings, catalog, storage_id, catalog_metadata_location, keep_files_on_error, cleanup, log);
+            context, data_lake_settings, catalog, storage_id, catalog_metadata_location, raw_catalog_metadata_location,
+            keep_files_on_error, cleanup, log);
 
         if (commit != BinPackCommitResult::Committed)
             return commit;

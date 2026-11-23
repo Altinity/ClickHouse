@@ -183,7 +183,7 @@ CkptStampResult stampCkptGeneration3(CasOperation & op, const Layout & layout, c
 
 MissingBaseVerdict classifyMissingSampledBase(const Etag & sampled, const std::optional<Etag> & current)
 {
-    if (current && !(*current == sampled))
+    if (current && !identicalToken(*current, sampled))
         return MissingBaseVerdict::RestartRecovery;
     return MissingBaseVerdict::Corrupted;
 }

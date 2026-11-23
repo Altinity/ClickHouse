@@ -29,6 +29,7 @@ namespace RunWire
     constexpr WireKey size{"size"};
     constexpr WireKey condemn_round{"condemn_round"};
     constexpr WireKey confirmed{"confirmed"};
+    constexpr WireKey standing{"standing"};
 }
 
 namespace RunHeaderWire
@@ -176,6 +177,8 @@ void SourceEdgeRunWriter::append(const SourceEdgeRecord & rec)
 {
     if (finished)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS cas_run: append after finish");
+    if (rec.standing && (rec.marker != RunMarker::Condemned || !rec.delete_pending))
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: standing record is not a pending condemned record");
     /// Non-decreasing (ref, source_id) is a HARD writer contract (deterministic run + streaming merge).
     /// A regression is a programming bug at the producer, not corrupt on-disk data => LOGICAL_ERROR.
     if (have_prev)
@@ -202,6 +205,8 @@ void SourceEdgeRunWriter::append(const SourceEdgeRecord & rec)
         writeNumberField(scratch, RunWire::size, rec.size, first);
         writeU64StringField(scratch, RunWire::condemn_round, rec.condemn_round, first);
         writeBoolField(scratch, RunWire::confirmed, rec.marker_confirmed, first);
+        if (rec.standing)
+            writeBoolField(scratch, RunWire::standing, true, first);
     }
     closeObject(scratch, first);
     writeChar('\n', scratch);
@@ -285,6 +290,7 @@ bool SourceEdgeRunReader::next(SourceEdgeRecord & rec)
     bool have_size = false;
     bool have_condemn_round = false;
     bool have_confirmed = false;
+    bool have_standing = false;
     do
     {
         if (key == RunWire::ref) { b = r.readString(); have_ref = true; }
@@ -295,6 +301,7 @@ bool SourceEdgeRunReader::next(SourceEdgeRecord & rec)
         else if (key == RunWire::size) { out.size = r.readU64Number(); have_size = true; }
         else if (key == RunWire::condemn_round) { out.condemn_round = r.readU64String(); have_condemn_round = true; }
         else if (key == RunWire::confirmed) { out.marker_confirmed = r.readBool(); have_confirmed = true; }
+        else if (key == RunWire::standing) { out.standing = r.readBool(); have_standing = true; }
         else r.skipUnknown(key);
     } while (r.nextKey(key));
 
@@ -306,8 +313,11 @@ bool SourceEdgeRunReader::next(SourceEdgeRecord & rec)
         if (!have_pending || !have_size || !have_condemn_round || !have_confirmed)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: condemned record missing pending/size/condemn_round/confirmed");
         out.token = token_fields.build("cas_run");
+        if (out.standing && !out.delete_pending)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: standing record is not pending");
     }
-    else if (have_pending || token_fields.type_word || token_fields.value || have_size || have_condemn_round || have_confirmed)
+    else if (have_pending || token_fields.type_word || token_fields.value || have_size || have_condemn_round || have_confirmed
+             || have_standing)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: non-condemned record carries condemned fields");
 
     if (!line_in.eof())

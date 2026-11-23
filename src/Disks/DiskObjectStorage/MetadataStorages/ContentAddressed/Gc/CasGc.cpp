@@ -3,7 +3,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobMeta.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobIntents.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobIntentFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcPhaseTimer.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasNamespaceJanitor.h>
@@ -45,14 +46,20 @@ namespace ProfileEvents
     extern const Event CASGCDeadPrecommitSkipped;
     extern const Event CASGCRetiredCondemned;
     extern const Event CASGCRetiredSpared;
+    extern const Event CASGCRetiredIntentConfirmed;
+    extern const Event CASGCRetiredBodyDeleted;
+    extern const Event CASGCRetiredBodyDeleteFailed;
     extern const Event CASGCRetiredGraduated;
     extern const Event CASGCRetiredRedeleted;
     extern const Event CASGCRetiredRedeleteFailed;
     extern const Event CASGCRetireReplaced;
-    extern const Event CASGCCondemnMarkerUnconfirmedCarry;
     extern const Event CASGCHeartbeatFenceOuts;
-    extern const Event CASGCMetaWriteAnomaly;
-    extern const Event CASGCMetaOps;
+    extern const Event CASGCIntentCreated;
+    extern const Event CASGCIntentConfirmedExisting;
+    extern const Event CASGCIntentUnconfirmedCarry;
+    extern const Event CASGCIntentDeleted;
+    extern const Event CASGCIntentDeletedOnSpare;
+    extern const Event CASGCUndecodableBlobBody;
     extern const Event CASGCEnumerationPages;
     extern const Event CASGCRefWalkPlansBuilt;
     extern const Event CASGCUnmatchedAdoptedParentLives;
@@ -80,7 +87,10 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
     extern const int CANNOT_SCHEDULE_TASK;
     extern const int CORRUPTED_DATA;
+    extern const int INVALID_STATE;
+    extern const int UNKNOWN_FORMAT_VERSION;
     extern const int LOGICAL_ERROR;
+    extern const int NETWORK_ERROR;
     extern const int NOT_IMPLEMENTED;
 }
 }
@@ -93,6 +103,40 @@ namespace
 
 /// Soft limit on the namespace janitor's phase: no page starts after it, the page in progress finishes.
 constexpr uint64_t kJanitorBudgetMs = 20'000;
+
+enum class RetiredCount : uint8_t
+{
+    IntentConfirmed,
+    BodyDeleted,
+    BodyDeleteFailed,
+};
+
+/// Each of these counters keeps its released name beside it, for the dashboards and tests that read that name.
+void countRetired(RetiredCount count)
+{
+    switch (count)
+    {
+        case RetiredCount::IntentConfirmed:
+            ProfileEvents::increment(ProfileEvents::CASGCRetiredIntentConfirmed);
+            ProfileEvents::increment(ProfileEvents::CASGCRetiredGraduated);
+            return;
+        case RetiredCount::BodyDeleted:
+            ProfileEvents::increment(ProfileEvents::CASGCRetiredBodyDeleted);
+            ProfileEvents::increment(ProfileEvents::CASGCRetiredRedeleted);
+            return;
+        case RetiredCount::BodyDeleteFailed:
+            ProfileEvents::increment(ProfileEvents::CASGCRetiredBodyDeleteFailed);
+            ProfileEvents::increment(ProfileEvents::CASGCRetiredRedeleteFailed);
+            return;
+    }
+}
+
+GcState decodeGenerationFourGcState(std::string_view bytes)
+{
+    GcState state = decodeGcState(bytes);
+    requireGenerationFourGcState(state);
+    return state;
+}
 
 /// What one janitor delete job did with its chunk.
 struct WriteOnceJobResult
@@ -258,8 +302,6 @@ RefPlan buildRefWalkPlan(RoundInput && round_input)
             .fold_state = {},
             .removal_started_round = entry.removal_started_round,
             .has_parent_fold_state = false,
-            .listed_hint = false,
-            .checkpoint_observation = std::nullopt,
             .tail_observation = std::nullopt});
     }
 
@@ -285,36 +327,8 @@ RefPlan buildRefWalkPlan(RoundInput && round_input)
         it->second.has_parent_fold_state = true;
     }
     for (const UInt128 & life_id : ref_scan.listed_lives)
-    {
-        const auto it = plan.rows.find(life_id);
-        if (it == plan.rows.end())
-        {
+        if (!plan.rows.contains(life_id))
             ++plan.dropped_listed_lives;
-            continue;
-        }
-        it->second.listed_hint = true;
-    }
-    for (const auto & [life_id, hold] : ref_scan.holds)
-    {
-        const auto it = plan.rows.find(life_id);
-        if (it == plan.rows.end())
-        {
-            ++plan.dropped_holds;
-            continue;
-        }
-        it->second.fold_state.coverage.classification = CoverageClass::Clamped;
-        it->second.fold_state.coverage.hold = hold;
-    }
-    for (const auto & [life_id, checkpoint] : ref_scan.checkpoint_observations)
-    {
-        const auto it = plan.rows.find(life_id);
-        if (it == plan.rows.end())
-        {
-            ++plan.dropped_checkpoints;
-            continue;
-        }
-        it->second.checkpoint_observation = checkpoint;
-    }
     for (const auto & [life_id, tail] : ref_scan.max_log_by_life)
     {
         const auto it = plan.rows.find(life_id);
@@ -338,21 +352,10 @@ RefPlan buildRefWalkPlanForTest(RefScanSummary ref_scan, CasRefCatalog::Snapshot
 
 }
 
-uint64_t retiredLogicalSize(ObjectKind kind, uint64_t object_size, uint64_t blob_header_len)
-{
-    if (kind != ObjectKind::Blob)
-        return object_size;
-    if (object_size < blob_header_len)
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS gc retire: blob object of {} bytes is smaller than the pool's fixed blob header ({} bytes)",
-            object_size, blob_header_len);
-    return object_size - blob_header_len;
-}
-
-bool shouldDeferRound(size_t changed_shards, bool graduation_due, uint64_t rounds_since_last_fold,
+bool shouldDeferRound(size_t changed_shards, bool row_decision_due, uint64_t rounds_since_last_fold,
                       uint64_t fold_threshold, uint64_t fold_max_defer_rounds)
 {
-    if (graduation_due)
+    if (row_decision_due)
         return false;
     if (changed_shards >= fold_threshold)
         return false;
@@ -376,6 +379,9 @@ Gc::Gc(PoolPtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_,
     if (store->poolConfig().gc_stuck_removal_rounds == 0)
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
             "Cas::Gc: gc_stuck_removal_rounds must be nonzero");
+    if (store->poolConfig().intent_sweep_list_budget_keys == 0)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "Cas::Gc: intent_sweep_list_budget_keys must be nonzero");
     if (!now_ms_fn)
         now_ms_fn = []() -> uint64_t
         {
@@ -391,12 +397,9 @@ Gc::Gc(PoolPtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_,
     /// production (no test seam in play) is unaffected.
     if (!mono_ms_fn)
         mono_ms_fn = [s = store]() -> uint64_t { return s->bootMsNow(); };
-    /// Build the meta writer here (ctor body), not in a member-initializer, so it can safely read
-    /// `store->poolConfig()` AFTER the null check above.
-    meta_writer = std::make_unique<GcMetaWriter>(
-        store, logger, static_cast<size_t>(store->poolConfig().gc_meta_pool_size));
     /// The GC I/O pool (read-ahead, the `pending_deletes` fan-out and the namespace janitor's batch deletes),
-    /// built here for the same reason.
+    /// built here (ctor body), not in a member-initializer, so it can read `store->poolConfig()` after the null
+    /// check above.
     /// The queue is UNBOUNDED because the hinting sites throttle themselves against
     /// `GcReadAhead::window`; a bounded queue would only move the throttle into
     /// `scheduleOrThrowOnError`, blocking the round thread instead of the hint loop that already knows
@@ -580,17 +583,31 @@ size_t Gc::bulkDeleteChunkKeys() const
     return std::clamp<size_t>(std::min(configured, storage_limit), 1, kBulkDeleteMaxKeys);
 }
 
-Gc::RedeleteIo Gc::performRedeleteIo(const RetiredEntry & entry, const Layout & layout, CasOperation & op)
+void Gc::sendIntentDeletes(CasOperation & op, const std::vector<WriteOnceKey> & keys)
+{
+    const size_t request_keys = bulkDeleteChunkKeys();
+    for (size_t begin = 0; begin < keys.size(); begin += request_keys)
+    {
+        const std::vector<WriteOnceKey> chunk(keys.begin() + begin, keys.begin() + std::min(keys.size(), begin + request_keys));
+        try
+        {
+            removeChunkWriteOnceOrOneByOne(op, chunk, Retry::standard());
+        }
+        catch (Exception & e)
+        {
+            /// A refusal carries the store's text only; the round's error must name what it failed to delete.
+            e.addMessage("while deleting {} blob intents starting at '{}'", chunk.size(), chunk.front().str());
+            throw;
+        }
+    }
+}
+
+Gc::RedeleteIo Gc::performRedeleteIo(const BodyDelete & body_delete, const Layout & layout, CasOperation & op)
 {
     RedeleteIo io;
-    io.blob_key = layout.blobKey(entry.ref);
-    /// The condemned incarnation is a PERSISTED pair and cannot itself be a precondition, so
-    /// the round observes the blob and compares the two renderings. Observing first also
-    /// settles the absent case without spending a conditional delete against a key that is
-    /// already gone.
-    const std::optional<Meta> observed = op.head(io.blob_key, Retry::standard());
-    if (observed)
-        io.del = entry.token.matches(observed->etag) ? op.remove(io.blob_key, observed->etag, Retry::standard()) : Removal::Mismatch;
+    io.blob_key = layout.blobKey(body_delete.entry.ref);
+    /// Conditional on the raw token the fold's `HEAD` saw: a body replaced since then is refused by the store.
+    io.del = op.remove(io.blob_key, body_delete.observed->etag, Retry::standard());
     return io;
 }
 
@@ -615,7 +632,7 @@ void Gc::applyRedeleteOutcome(RedeleteRoundContext & ctx, const RetiredEntry & e
             e.round = ctx.new_round;
             e.gen = ctx.snap_generation;
             e.outcome = del_outcome;
-            e.reason = "delete_pending published by a prior pass; exact-incarnation delete (pre-CAS)";
+            e.reason = "pending row at zero whose HEAD showed its incarnation; exact-incarnation delete (pre-CAS)";
             e.detail = {{"condemn_round", std::to_string(entry.condemn_round)}, {"key", io.blob_key}};
         });
     /// The audit row is observability only -- the delete in `performRedeleteIo` already executed
@@ -624,20 +641,8 @@ void Gc::applyRedeleteOutcome(RedeleteRoundContext & ctx, const RetiredEntry & e
     ctx.outcome_tallies[ctx.shard].add(outcome_kind);
     if (ctx.round_work_budget.admitOutcomeRow(ctx.shard, outcome))
         ctx.outcomes[ctx.shard].entries.push_back(std::move(outcome));
-    ++ctx.report.redeleted;
-    ProfileEvents::increment(ProfileEvents::CASGCRetiredRedeleted);
-    /// Drop the per-hash meta only on a removal or a proven absence — a mismatch means a
-    /// writer already published a fresh incarnation at this hash, and that writer's own
-    /// republication path (`PartWriteTxn::ensureBlobPresent`) reconciles the meta back to Clean
-    /// right after the publication; deleting it here would race that legitimate Clean write for
-    /// no reason (the meta is advisory, but there is no reason to touch it on that path at all).
-    if (io.del == Removal::Removed || io.del == Removal::Gone)
-    {
-        /// The round before this one, not `entry.condemn_round`: the graduation gate re-stamps a marker it
-        /// refused at its own, later round. Deleting a marker is safe for writers that adopt only on `Clean`;
-        /// a 26.6.4 writer still backfills an absent marker and adopts.
-        meta_writer->scheduleConfirmedMetaDelete(entry.ref, ctx.new_round - 1);
-    }
+    ++ctx.report.bodies_deleted;
+    countRetired(RetiredCount::BodyDeleted);
 }
 
 void Gc::reportRedeleteFailure(
@@ -647,18 +652,18 @@ void Gc::reportRedeleteFailure(
     std::exception_ptr exception,
     std::optional<size_t> unsent_count)
 {
-    ProfileEvents::increment(ProfileEvents::CASGCRetiredRedeleteFailed);
-    ++ctx.report.redelete_failed;
+    countRetired(RetiredCount::BodyDeleteFailed);
+    ++ctx.report.body_delete_failed;
     LOG_WARNING(logger,
-        "CAS gc: pending delete of blob {} (key `{}`, condemned at round {}) failed; the entry stays delete_pending "
-        "and is retried in the next round: {}{}",
+        "CAS gc: pending delete of blob {} (key `{}`, condemned at round {}) failed; the round fails before its commit "
+        "and the row stays pending: {}{}",
         blobIdOf(entry.ref), layout.blobKey(entry.ref), entry.condemn_round, getExceptionMessage(exception, false),
         unsent_count ? fmt::format("; {} re-delete entries were not submitted", *unsent_count) : String{});
 }
 
 void Gc::redeleteBlobs(
     RedeleteRoundContext & ctx,
-    const std::vector<RetiredEntry> & entries,
+    const std::vector<BodyDelete> & entries,
     ThreadPool & pool,
     size_t concurrency,
     const Layout & layout,
@@ -702,13 +707,13 @@ void Gc::redeleteBlobs(
                 }
                 handles.emplace_back(runner.enqueueAndGiveOwnership(
                     [slot = &io_results[scheduled],
-                     entry = entries[scheduled],
+                     body_delete = entries[scheduled],
                      layout_ptr = &layout,
                      pool_store = store,
                      admitted_generation]
                     {
                         CasOperation job_op = pool_store->openRequests().resume(admitted_generation);
-                        *slot = performRedeleteIo(entry, *layout_ptr, job_op);
+                        *slot = performRedeleteIo(body_delete, *layout_ptr, job_op);
                     }));
             }
         }
@@ -737,14 +742,14 @@ void Gc::redeleteBlobs(
     {
         if (!io_errors[i])
             continue;
-        reportRedeleteFailure(ctx, entries[i], layout, io_errors[i]);
+        reportRedeleteFailure(ctx, entries[i].entry, layout, io_errors[i]);
         if (!first_error)
             first_error = IndexedException{i, io_errors[i]};
     }
     if (schedule_error)
     {
         reportRedeleteFailure(
-            ctx, entries[schedule_error->index], layout, schedule_error->exception, entries.size() - schedule_error->index);
+            ctx, entries[schedule_error->index].entry, layout, schedule_error->exception, entries.size() - schedule_error->index);
         if (!first_error || schedule_error->index < first_error->index)
             first_error = schedule_error;
     }
@@ -755,7 +760,7 @@ void Gc::redeleteBlobs(
     for (size_t i = 0; i < scheduled; ++i)
     {
         if (!io_errors[i])
-            applyRedeleteOutcome(ctx, entries[i], io_results[i]);
+            applyRedeleteOutcome(ctx, entries[i].entry, io_results[i]);
     }
 
     if (first_error)
@@ -771,16 +776,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     GcState state;
     std::optional<Etag> state_etag;
 
-    /// Every exit path waits for this round's meta jobs. The throwing `meta_pool_wait` phase below is
-    /// a protocol barrier -- this round's condemns must be durable no later than the ledger they are
-    /// paired with -- and covers only the successful path. This cleanup copy is explicitly
-    /// nonthrowing so a pool/framework failure cannot replace an exception already unwinding from
-    /// the round. Without it, a round that throws between the fold and the barrier would leave its
-    /// jobs running into the NEXT round, where their confirmations reach a graduation gate that
-    /// never scheduled them.
-    SCOPE_EXIT({ meta_writer->drainOnExitNoThrow(); });
-
-    /// PHASE 1/18 `lease`. Also the ONLY phase a `NotALeader` round emits, which is why the phase rows
+    /// Phase `lease`. Also the ONLY phase a `NotALeader` round emits, which is why the phase rows
     /// are correlated by `round_id` and not by the round number a follower never learns.
     {
         GcPhaseTimer t(phase_sink, "lease");
@@ -790,11 +786,6 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     }
     if (!report.acquired_lease)
         return report;
-
-    /// Baseline for the `meta_pool_wait` phase's job counts (the pool is per-`Gc`, the counters
-    /// cumulative), taken before anything in this round can schedule a job.
-    const uint64_t meta_jobs_scheduled_at_round_start = meta_writer->scheduled();
-    const uint64_t meta_jobs_completed_at_round_start = meta_writer->completed();
 
     /// Fire the acquire-time hook BEFORE the long fold below, not after the round
     /// returns - a new leader's first round could otherwise run for the whole fold with no
@@ -814,15 +805,17 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     const uint64_t new_round = state.round + 1;
 
     /// ONE budget instance for the WHOLE round, threaded into every destructive-or-observability-write
-    /// family below: `fold` (blob graduation/redelete, the `GcOutcomes` audit rows, the orphan-manifest
+    /// family below: `fold` (blob intent creates and body deletes, the `GcOutcomes` audit rows, the orphan-manifest
     /// planner), `pruneSupersededGenerations`, the post-CAS hand-off reclaim (its OWN reserve, never
     /// `pruneSupersededGenerations`' shared remainder), the post-CAS manifest-body cleanup, and
     /// `cleanupRefObjects`. A cap is therefore cumulative over the round, never reset between families or
     /// shards, except the outcome log byte limit, which is per shard. See `GcRoundWorkBudget`'s own
     /// comment for the fail-closed contract each family applies on exhaustion.
     GcRoundWorkBudget round_work_budget;
-    round_work_budget.max_graduations = store->poolConfig().gc_round_graduation_budget;
-    round_work_budget.max_redeletes = store->poolConfig().gc_round_redelete_budget;
+    round_work_budget.intent_creates.cap = store->poolConfig().gc_round_intent_create_budget;
+    round_work_budget.intent_creates.resume_after = creates_resume_after_;
+    round_work_budget.redeletes.cap = store->poolConfig().gc_round_redelete_budget;
+    round_work_budget.redeletes.resume_after = redeletes_resume_after_;
     round_work_budget.max_sweep_namespaces = store->poolConfig().gc_round_sweep_namespace_budget;
     round_work_budget.max_sweep_recovery_ops = store->poolConfig().gc_round_sweep_recovery_op_budget;
     round_work_budget.max_ref_cleanup_objects = store->poolConfig().gc_round_ref_cleanup_budget;
@@ -840,13 +833,13 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         uint64_t completed_erases = 0;
         /// Declared after `t`, so it runs before the timer emits its record, on a throw too.
         SCOPE_EXIT({ t.metric("deleted", completed_erases); });
-        const CatalogLifecycleReconcileResult drain_result = drainCompletedRemoving(state, completed_erases);
+        const CatalogLifecycleReconcileResult drain_result = drainCompletedRemoving(state, state_etag, completed_erases);
         if (drain_result.authority_status != AuthorityStatus::Authoritative
             || drain_result.catalog_resolution != CatalogResolution::DrainComplete)
             throwCasWriteRetryLater("CAS GC pre-fold drain lost authority before the catalog settled");
     }
 
-    /// Etag-guarded fence-out of dead mounts (liveness only — graduation itself paces on GC
+    /// Etag-guarded fence-out of dead mounts (liveness only — row decisions pace on GC
     /// rounds via `new_round`, not on heartbeat acks). A slot is fenced only after `mount_obs` has
     /// watched its token hold unchanged on this leader's own monotonic clock for
     /// `mountObservationThresholdMs` over the longer of this server's lease and the one the slot
@@ -854,7 +847,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     const uint64_t ttl_ms = static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count());
     const uint64_t renew_period_ms = static_cast<uint64_t>(store->poolConfig().mount_renew_period.count());
 
-    /// PHASE 3/18 `heartbeat_floor`: one LIST of `gc/server-roots/`, one GET per mount slot, and a fence
+    /// Phase `heartbeat_floor`: one LIST of `gc/server-roots/`, one GET per mount slot, and a fence
     /// PUT per newly-fenced mount.
     {
         GcPhaseTimer t(phase_sink, "heartbeat_floor");
@@ -904,27 +897,27 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// Decide DEFER vs FOLD from cheap pre-fold signals.
     /// A DEFER round re-adopts the sealed generation — no fold, no delete, no gc/state write — so a
     /// slow idle/small-delta round no longer rebuilds the whole in-degree snapshot. Safety: a due
-    /// graduation forces a FOLD (graduationDue), so no destructive decision runs on a stale snapshot.
+    /// row decision forces a FOLD (rowDecisionDue), so no destructive decision runs on a stale snapshot.
     ///
     /// `listRefPrefix` is the round's one full enumeration of `cas/ns/stream/`. Its result is retained
     /// (rather than discarded once the defer decision is taken) because `fold` regroups the very same
     /// keys instead of listing the prefix again. A deferred round simply drops it.
     ///
-    /// PHASE 4/18 `defer_decision`. `ref_scan` OUTLIVES the timer because the fold consumes it, and
+    /// Phase `defer_decision`. `ref_scan` OUTLIVES the timer because the fold consumes it, and
     /// `report.deferred` is set INSIDE the scope so the row already reflects the verdict when the
     /// timer's destructor fires on the deferred round's early return. This phase also performs TWO of
-    /// the round's reads of the adopted fold seal (`graduationDue` and `listRefPrefix` each read the
+    /// the round's reads of the adopted fold seal (`rowDecisionDue` and `listRefPrefix` each read the
     /// same key) -- see `fold_seal_reads` below.
     std::optional<RefPlan> walk_plan;
     bool defer_round = false;
     {
         GcPhaseTimer t(phase_sink, "defer_decision");
-        const bool graduation_due = graduationDue(state, new_round);
-        walk_plan.emplace(buildRefWalkPlan(listRefPrefix(state)));
+        const bool row_decision_due = rowDecisionDue(state, new_round);
+        walk_plan.emplace(buildRefWalkPlan(listRefPrefix(state, state_etag)));
         reportStuckRemovals(*walk_plan, state.round);
         const RefScanSummary & ref_scan = walk_plan->refScan();
         const size_t changed = walk_plan->changedRows();
-        defer_round = shouldDeferRound(changed, graduation_due, rounds_since_last_fold_,
+        defer_round = shouldDeferRound(changed, row_decision_due, rounds_since_last_fold_,
                                        store->poolConfig().gc_fold_threshold,
                                        store->poolConfig().gc_fold_max_defer_rounds);
         uint64_t ref_log_keys = 0;
@@ -934,7 +927,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         t.metric("namespaces_seen", ref_scan.max_log_by_life.size());
         t.metric("ref_log_keys_listed", ref_log_keys);
         t.metric("ref_keys_listed", ref_scan.keys.size());
-        t.metric("graduation_due", graduation_due ? 1 : 0);
+        t.metric("row_decision_due", row_decision_due ? 1 : 0);
         t.metric("dead_life_debris", ref_scan.dead_life_debris);
         t.metric("walk_plan_builds", 1);
         t.metric("walk_plan_rows", walk_plan->size());
@@ -945,7 +938,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         /// The number of consecutive rounds already deferred BEFORE this one (this round's own verdict is
         /// `deferred` above), so the pair reads unambiguously against `gc_fold_max_defer_rounds`.
         t.metric("rounds_deferred_before", rounds_since_last_fold_);
-        /// `graduationDue` and `listRefPrefix` each GET the adopted fold seal at the SAME
+        /// `rowDecisionDue` and `listRefPrefix` each GET the adopted fold seal at the SAME
         /// (generation, attempt). Recorded, not fixed -- see the `fold_seal_read` phase, which records
         /// the other duplicate pair; the round GETs that one key FIVE times on a folding round.
         t.metric("fold_seal_reads", 2);
@@ -971,7 +964,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                 e.round = state.round;
                 e.gen = state.snap_generation;
                 e.outcome = "deferred";
-                e.reason = "skip-unchanged: no changed shard reached the fold threshold and no graduation "
+                e.reason = "skip-unchanged: no changed shard reached the fold threshold and no row decision "
                            "is due; re-adopting the sealed generation (snapshot rebuild elided)";
                 e.detail = {{"changed_shards", std::to_string(changed)},
                             {"rounds_since_last_fold", std::to_string(rounds_since_last_fold_)}};
@@ -1008,7 +1001,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// wholesale prune skipped it while it was still referenced and its cursor advanced past it), and
     /// hand-off delete that generation's now-unreferenced leftover. Absent parent seal => empty.
     ///
-    /// PHASE 5/18 `parent_seal_read`: the round's THIRD GET of the adopted fold seal (`graduationDue`
+    /// Phase `parent_seal_read`: the round's THIRD GET of the adopted fold seal (`rowDecisionDue`
     /// and `listRefPrefix` already read it in `defer_decision`, and `fold` reads it twice more). One
     /// small GET, given its own row rather than left untimed, because "the same key, five times a round"
     /// is only actionable if each read is attributable to a phase.
@@ -1020,7 +1013,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         t.metric("parent_runs", parent_seal_runs.size());
     }
 
-    /// The pass performs discovery, windowing, and the three-cursor merge (spare / graduate / condemn).
+    /// The pass performs discovery, windowing, and the three-cursor merge (spare / confirm intent / condemn).
     /// It emits phases 5..10 of its own.
     FoldResult folded = fold(state, state_etag, report, new_round, *walk_plan, policy, round_work_budget);
 
@@ -1045,51 +1038,50 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     const uint64_t generation = state.snap_generation;   /// set in-memory by fold; committed below
     const uint64_t attempt = state.snap_attempt;
 
-    /// PRE-CAS deletes affect ONLY entries the PREVIOUS pass published as delete_pending (justified by
-    /// durable state and safe at any leader staleness), plus outcome bookkeeping for
-    /// every settled entry. THE SINGLE CONTENT-DELETE SITE.
+    /// PRE-CAS deletes: the body deletes of `pending` rows read from the adopted state, then the intent deletes
+    /// of incarnations observed gone, plus outcome bookkeeping for every settled entry. THE SINGLE
+    /// CONTENT-DELETE SITE. Any failed delete fails the round before its commit, so every row keeps its state.
     ///
-    /// PHASE 11/18 `pending_deletes`, covering both the exact-token delete loop and the outcome-log
+    /// Phase `pending_deletes`, covering both the exact-token delete loop and the outcome-log
     /// writes it feeds. Held in an `optional` rather than a `{ }` scope purely so this long, delicate
     /// block is not reindented wholesale; `reset()` below is what emits the row, and an exception
     /// escaping before it still emits from the destructor.
     std::optional<GcPhaseTimer> pending_deletes_timer;
     pending_deletes_timer.emplace(phase_sink, "pending_deletes");
-    const uint64_t redeleted_before = report.redeleted;
-    const uint64_t graduated_before = report.graduated;
-    const uint64_t redelete_failed_before = report.redelete_failed;
+    const uint64_t bodies_deleted_before = report.bodies_deleted;
+    const uint64_t intent_confirmed_before = report.intent_confirmed;
+    const uint64_t body_delete_failed_before = report.body_delete_failed;
     uint64_t redelete_jobs_scheduled = 0;
     const auto record_redelete_job_metrics = [&]
     {
         pending_deletes_timer->metric("jobs_scheduled", redelete_jobs_scheduled);
-        pending_deletes_timer->metric("jobs_failed", report.redelete_failed - redelete_failed_before);
+        pending_deletes_timer->metric("jobs_failed", report.body_delete_failed - body_delete_failed_before);
     };
     SCOPE_EXIT_SAFE({
         if (pending_deletes_timer)
             record_redelete_job_metrics();
     });
+    /// Called inside each emit callback, so a disabled event formats neither the hash nor the token.
+    const auto describeRow = [&](CasEvent & e, CasEventType type, const RetiredEntry & entry)
+    {
+        e.type = type;
+        e.object_kind = CasEventObjectKind::Blob;
+        e.object_hash = blobIdOf(entry.ref);
+        e.token = renderIncarnation(entry.token);
+        e.round = new_round;
+        e.gen = generation;
+    };
     std::map<uint64_t, OutcomeLog> outcomes;
     std::map<uint64_t, OutcomeTally> outcome_tallies;
     for (uint64_t shard = 0; shard < folded.retired_merge.size(); ++shard)
     {
         RetiredMergeResult & merge = folded.retired_merge[shard];
-        /// The gate, stated at the site, and scoped to the DELETES alone: the spare / graduate / replace
-        /// bookkeeping below is not destructive and must still run on a suppressed round (a suppressed
-        /// round still condemns, spares and carries -- only irreversible work stops). A suppressed pass
-        /// produces an EMPTY `redelete` by construction (`settleEntry` carries every pending entry
-        /// unchanged instead of promoting it), so this loop would already do nothing -- but "would
-        /// already do nothing" is a property of another file, and the content-delete site does not
-        /// delegate its own gate. If the two ever disagree, the round deletes nothing rather than
-        /// deleting on a frontier it cannot prove.
-        ///
-        /// WHAT THIS GUARD DOES AND DOES NOT COVER, measured rather than assumed: it stops the delete
-        /// I/O, and nothing else. `settleEntry`'s gate is the primary one because promoting an entry to
-        /// `redelete` also DROPS it from `still_retired` -- so a build with only this guard performs no
-        /// delete and still loses the entry from the pipeline, leaking the blob instead of reclaiming
-        /// it. Do not read this as a licence to relax the merge-side gate.
-        static const std::vector<RetiredEntry> kNothingToDelete;
-        const std::vector<RetiredEntry> & redelete_now =
-            suppress_destructive ? kNothingToDelete : merge.redelete;
+        /// The gate, stated at the site, and scoped to the deletes alone. The merge decides no delete in a
+        /// suppressed round; if the two ever disagree, the round deletes nothing rather than deleting on a
+        /// frontier it cannot prove.
+        static const std::vector<BodyDelete> kNothingToDelete;
+        const std::vector<BodyDelete> & redelete_now =
+            suppress_destructive ? kNothingToDelete : merge.body_deletes;
         RedeleteRoundContext redelete_ctx{
             .new_round = new_round,
             .snap_generation = generation,
@@ -1100,30 +1092,35 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             .outcome_tallies = outcome_tallies,
             .jobs_scheduled = redelete_jobs_scheduled};
         redeleteBlobs(redelete_ctx, redelete_now, *io_pool, store->poolConfig().gc_io_concurrency, layout, op);
-        for (const RetiredEntry & entry : merge.spared)
-        {
-            /// A fresh dedup-adopt raced the condemn (see the matching CasGcFold Debug log emitted
-            /// during the merge, which increments CASGCRetiredSparedByReref) -- not an ack-floor
-            /// violation, so this is Debug, not a page-worthy Warning.
-            if (entry.delete_pending)
-                LOG_DEBUG(logger,
-                    "CAS gc: delete_pending blob {} (condemned at round {}, this round {}) recovered "
-                    "in-degree -- a fresh dedup-adopt raced the condemn; spared (never a fail-closed delete)",
-                    blobIdOf(entry.ref), entry.condemn_round, new_round);
-            /// Emit the spare verdict — a publish re-pinned the candidate before graduation.
+        for (const RetiredEntry & entry : merge.to_standing)
             EventEmitter{*store}.emit([&](CasEvent & e)
             {
-                e.type = CasEventType::GcRecheckVerdict;
-                e.object_kind = CasEventObjectKind::Blob;
-                e.object_hash = blobIdOf(entry.ref);
-                e.token = renderIncarnation(entry.token);
-                e.round = new_round;
-                e.gen = generation;
+                describeRow(e, CasEventType::GcRecheckVerdict, entry);
+                e.outcome = "standing";
+                e.reason = "pending row at zero: the body delete was answered or the body is absent; the intent stays "
+                           "until a later cut at zero";
+                e.detail = {{"condemn_round", std::to_string(entry.condemn_round)}};
+            });
+        for (const RetiredEntry & entry : merge.adopted)
+            EventEmitter{*store}.emit([&](CasEvent & e)
+            {
+                describeRow(e, CasEventType::BlobIntentAdopt, entry);
+                e.outcome = entry.standing ? "standing" : "candidate";
+                e.reason = "a listed deletion intent had no row; the body's HEAD decided the row";
+                if (const auto identity = entry.token.canonical())
+                    e.detail = {{"key", layout.blobIntentKey(entry.ref, *identity)}};
+            });
+        for (const RetiredEntry & entry : merge.spared)
+        {
+            /// Emit the spare verdict: a reference reached the blob again, so the row is dropped and its intent stays.
+            EventEmitter{*store}.emit([&](CasEvent & e)
+            {
+                describeRow(e, CasEventType::GcRecheckVerdict, entry);
                 e.outcome = "spared";
                 e.reason = "in-degree recovered in the pass merge; entry dropped";
             });
             /// The audit row is observability only -- `settleEntry` already unconditionally spared this
-            /// entry (INV_NO_LOSS: recovery wins past any budget), so this cap can never re-condemn it;
+            /// entry (recovery wins past any budget), so this cap can never re-condemn it;
             /// it only bounds whether the decision gets a `GcOutcomes` row.
             OutcomeEntry spared_row{.kind = entry.kind, .ref = entry.ref,
                                     .token = entry.token, .outcome = OutcomeKind::Spared};
@@ -1131,39 +1128,23 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             if (round_work_budget.admitOutcomeRow(shard, spared_row))
                 outcomes[shard].entries.push_back(std::move(spared_row));
             ProfileEvents::increment(ProfileEvents::CASGCRetiredSpared);
-            /// A spare does NOT touch the
-            /// meta. GC freshness meta is add-only — GC never publishes `Clean`. The in-degree recovered,
-            /// but the meta stays `Condemned` (conservative marker) until a WRITER displaces the body with
-            /// a fresh incarnation token (unconditional publication + metadata reconciliation in
-            /// `PartWriteTxn::ensureBlobPresent`) — the SOLE
-            /// `Condemned -> Clean` transition. Clearing here on a
-            /// deposed leader that then lost its round CAS would strand a stray-`Clean` over a still-live
-            /// condemned token and lose the reuse to a stale exact-token redelete (INV_NO_LOSS).
-            /// The next `putBlob` self-heals
-            /// the marker: `PartWriteTxn::ensureBlobPresent` refuses adoption on `Condemned` and
-            /// publishes the writer's source under a fresh envelope.
         }
-        for (const RetiredEntry & entry : merge.graduated)
+        for (const RetiredEntry & entry : merge.confirmed)
         {
-            ++report.graduated;
-            ProfileEvents::increment(ProfileEvents::CASGCRetiredGraduated);
-            /// Floor-passed — republished pending; the NEXT pass executes the delete.
+            ++report.intent_confirmed;
+            countRetired(RetiredCount::IntentConfirmed);
+            /// The intent is confirmed; a later round whose cut shows zero deletes the body.
             EventEmitter{*store}.emit([&](CasEvent & e)
             {
-                e.type = CasEventType::GcRecheckVerdict;
-                e.object_kind = CasEventObjectKind::Blob;
-                e.object_hash = blobIdOf(entry.ref);
-                e.token = renderIncarnation(entry.token);
-                e.round = new_round;
-                e.gen = generation;
+                describeRow(e, CasEventType::GcRecheckVerdict, entry);
                 e.outcome = "pending";
-                e.reason = "condemn_round < current_round; published delete_pending (two-phase graduation)";
+                e.reason = "deletion intent confirmed; pending until a later cut shows in-degree 0";
                 e.detail = {{"condemn_round", std::to_string(entry.condemn_round)}};
             });
         }
         for (const ReplacedEntry & replaced : merge.replaced)
         {
-            const RetiredEntry & entry = replaced.fresh;
+            const RetiredEntry & entry = merge.still_retired[replaced.row];
             ProfileEvents::increment(ProfileEvents::CASGCRetireReplaced);
             /// RESURRECT-REUPLOAD-ORPHAN: the current object token differed from a stale retired entry;
             /// the fold superseded that entry and re-condemned the current token in the same window.
@@ -1172,21 +1153,86 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             /// this event cannot tell an operator WHICH incarnation was replaced.
             EventEmitter{*store}.emit([&](CasEvent & e)
             {
-                e.type = CasEventType::BlobRetireReplaced;
-                e.object_kind = CasEventObjectKind::Blob;
-                e.object_hash = blobIdOf(entry.ref);
-                e.token = renderIncarnation(entry.token);
-                e.round = new_round;
-                e.gen = generation;
+                describeRow(e, CasEventType::BlobRetireReplaced, entry);
                 e.outcome = "replaced";
-                e.reason = "current object token differs from the retired entry — republication replaced the "
-                           "incarnation; superseded the stale entry and re-condemned the current token";
+                e.reason = "current object token differs from the row's token: a republication replaced the "
+                           "incarnation; the row moved to the current token";
                 e.detail = {{"superseded_token", renderIncarnation(replaced.old_token)}};
             });
-            /// The supersede is also a blob entering the retired set: write its marker like a fresh
-            /// `head_blob` condemn, so a writer's point-read sees it. `peek_head` stays side-effect-free.
-            meta_writer->scheduleCondemnMarkerWrite(entry.ref, entry.condemn_round, entry.size);
         }
+    }
+
+    /// After every body delete answered: an intent removal never shares a job with the delete of its body.
+    {
+        std::vector<WriteOnceKey> intent_deletes;
+        CountWithExample unconfirmed_creates;
+        CountWithExample rejected_tokens;
+        CountWithExample standing_anomalies;
+        CountWithExample undecodable_bodies;
+        CountWithExample undecodable_spares;
+        for (const RetiredMergeResult & merge : folded.retired_merge)
+            intent_deletes.insert(intent_deletes.end(), merge.intent_deletes.begin(), merge.intent_deletes.end());
+        /// The spares' deletes share the batch and are the tail of it from here on.
+        const size_t first_spare_delete = intent_deletes.size();
+        for (const RetiredMergeResult & merge : folded.retired_merge)
+            intent_deletes.insert(intent_deletes.end(), merge.spare_intent_deletes.begin(), merge.spare_intent_deletes.end());
+        for (const RetiredMergeResult & merge : folded.retired_merge)
+        {
+            unconfirmed_creates.merge(merge.unconfirmed_creates);
+            rejected_tokens.merge(merge.rejected_tokens);
+            standing_anomalies.merge(merge.standing_anomalies);
+            undecodable_bodies.merge(merge.undecodable_bodies);
+            undecodable_spares.merge(merge.undecodable_spares);
+        }
+        if (!suppress_destructive && !intent_deletes.empty())
+        {
+            sendIntentDeletes(op, intent_deletes);
+            ProfileEvents::increment(ProfileEvents::CASGCIntentDeleted, intent_deletes.size());
+            ProfileEvents::increment(ProfileEvents::CASGCIntentDeletedOnSpare, intent_deletes.size() - first_spare_delete);
+            for (size_t i = 0; i < intent_deletes.size(); ++i)
+                EventEmitter{*store}.emit([&](CasEvent & e)
+                {
+                    const WriteOnceKey & key = intent_deletes[i];
+                    e.type = CasEventType::BlobIntentDelete;
+                    e.object_kind = CasEventObjectKind::Blob;
+                    if (const auto parsed = layout.parseBlobIntentKey(key.str()))
+                    {
+                        e.object_hash = blobIdOf(parsed->ref);
+                        if (const auto tag = opaqueTagFromHex(parsed->identity.dialect, parsed->identity.tag_hex))
+                            e.token = String(dialectWord(parsed->identity.dialect)) + ":" + *tag;
+                    }
+                    e.round = new_round;
+                    e.gen = generation;
+                    e.outcome = "deleted";
+                    e.reason = i >= first_spare_delete
+                        ? "the blob is referenced again and its body has another incarnation than the intent names; the "
+                          "deletion intent is removed"
+                        : "the incarnation the intent names is gone from the key; the deletion intent is removed";
+                    e.detail = {{"key", key.str()}};
+                });
+        }
+        pending_deletes_timer->metric("intents_deleted", suppress_destructive ? 0 : intent_deletes.size());
+        if (unconfirmed_creates.count)
+            LOG_WARNING(logger,
+                "CAS gc: {} deletion-intent creates were not confirmed this round; those blobs stay candidates and "
+                "are retried in a later round. First: {}", unconfirmed_creates.count, unconfirmed_creates.example);
+        if (rejected_tokens.count)
+            LOG_ERROR(logger,
+                "CAS gc: {} blob observations or rows this round carry a token that names no incarnation; GC never "
+                "deletes such a body. First: `{}`", rejected_tokens.count, rejected_tokens.example);
+        if (standing_anomalies.count)
+            LOG_ERROR(logger,
+                "CAS gc: {} standing rows observed their own token again after their body delete; carried, nothing "
+                "deleted. First: `{}`", standing_anomalies.count, standing_anomalies.example);
+        if (undecodable_bodies.count)
+            LOG_ERROR(logger,
+                "CAS gc: {} blob bodies this round are shorter than the pool's blob envelope; GC recorded no row for "
+                "them, carried their rows and deleted nothing. First: `{}`", undecodable_bodies.count, undecodable_bodies.example);
+        if (undecodable_spares.count)
+            LOG_ERROR(logger,
+                "CAS gc: {} blob bodies of spared rows this round are shorter than the pool's blob envelope; GC dropped "
+                "their rows, kept their intents and deleted nothing. First: `{}`", undecodable_spares.count,
+                undecodable_spares.example);
     }
 
     /// Outcome logs: write-once + byte-adopt (observation-bearing HEAD tokens — never the
@@ -1247,8 +1293,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         report.replaced += tally.replaced;
         report.spared += tally.spared;
     }
-    pending_deletes_timer->metric("redeleted", report.redeleted - redeleted_before);
-    pending_deletes_timer->metric("graduated", report.graduated - graduated_before);
+    pending_deletes_timer->metric("bodies_deleted", report.bodies_deleted - bodies_deleted_before);
+    pending_deletes_timer->metric("intents_confirmed", report.intent_confirmed - intent_confirmed_before);
     pending_deletes_timer->metric("deleted", report.deleted);
     pending_deletes_timer->metric("absent", report.absent);
     pending_deletes_timer->metric("replaced", report.replaced);
@@ -1258,38 +1304,14 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     record_redelete_job_metrics();
     pending_deletes_timer.reset();   /// emits the `pending_deletes` row
 
-    /// Wait for the round's whole batch of per-hash freshness-meta writes (condemned during the
-    /// fold above, spared/redeleted-confirmed during R3 above) BEFORE the round's retired-list publish and
-    /// its single gc/state CAS below — the writer's meta point-read gate must see this round's condemns
-    /// durable no later than the ledger it is paired with. Per-hash operation exceptions are caught
-    /// in `GcMetaWriter`, but `ThreadPool::wait` may still rethrow a pool/framework failure. That
-    /// exception must propagate here and prevent the round commit.
-    ///
-    /// PHASE 12/18 `meta_pool_wait`, AND THE ONE HONEST GAP IN THIS INSTRUMENTATION: the work being
-    /// waited on runs on `meta_pool` threads, so none of it appears in this thread's `ProfileEvents`
-    /// delta and the row's `ProfileEvents` map is EMPTY BY CONSTRUCTION. That is not a phase with no
-    /// cost -- it is a phase whose cost this mechanism cannot see, so it carries explicit job counts
-    /// instead: read `jobs_scheduled` / `jobs_completed` next to the duration to tell "the queue was
-    /// deep" from "the endpoint was slow". `jobs_completed` is sampled BEFORE the wait deliberately --
-    /// after it, it would always equal `jobs_scheduled` and say nothing.
-    {
-        GcPhaseTimer t(phase_sink, "meta_pool_wait");
-        const uint64_t scheduled = meta_writer->scheduled() - meta_jobs_scheduled_at_round_start;
-        const uint64_t completed_on_entry = meta_writer->completed() - meta_jobs_completed_at_round_start;
-        meta_writer->drain();
-        t.metric("jobs_scheduled", scheduled);
-        t.metric("jobs_completed_on_entry", completed_on_entry);
-        t.metric("jobs_completed", meta_writer->completed() - meta_jobs_completed_at_round_start);
-    }
-
     /// Retired-in-snapshot — there is NO separate retired-list object to publish anymore. The
     /// round's surviving condemned entries were already sealed as `RunMarker::Condemned` rows inside the fold's
     /// `blob_target_runs` (durable before this CAS, via `putDeterministicArtifact`), and the per-shard
-    /// `condemned_summary` the seal carries makes the next round's graduation/carry decisions zero-I/O.
+    /// `condemned_summary` the seal carries makes the next round's row-decision/carry decisions zero-I/O.
 
     /// The SINGLE round CAS publishes the round, adopted (generation, attempt), and retention cursor.
     ///
-    /// PHASE 13/18 `round_commit`. It deliberately covers BOTH the retention prune (heavy: LISTs and
+    /// Phase `round_commit`. It deliberately covers BOTH the retention prune (heavy: LISTs and
     /// wholesale deletes, bounded at 64 generations a round) and the single `gc/state` CAS (trivial),
     /// because the prune's writes are only safe as a pre-CAS action and splitting the two would suggest
     /// they are independently retryable. `generations_visited` vs the prune's actual deletes is what
@@ -1301,6 +1323,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     next.round = new_round;
     if (!suppress_destructive && store->poolConfig().manifest_sweep_list_budget_keys > 0)
         next.manifest_sweep_cursor = folded.orphan_sweep.next_cursor;
+    if (folded.intent_sweep_next_cursor)
+        next.intent_sweep_cursor = *folded.intent_sweep_next_cursor;
     /// The generations the adopted seal's runs physically live in (reference-parent carry can point a
     /// current shard's run back at an older generation's key). Retention must never reclaim these.
     std::set<uint64_t> referenced_generations;
@@ -1309,7 +1333,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// ALSO protect every generation the PARENT (currently-adopted, pre-fold) seal references
     /// (`parent_seal_runs`, captured above): this prune runs BEFORE the round's own gc/state CAS below, so
     /// a losing leader must not destroy what the winning leader's already-adopted seal still points at —
-    /// pre-CAS destructive actions may only rely on PREVIOUSLY PUBLISHED state (triage #5).
+    /// pre-CAS destructive actions may only rely on PREVIOUSLY PUBLISHED state.
     for (const RunRef & r : parent_seal_runs)
         referenced_generations.insert(r.key_generation);
     /// Retention floor uses THIS round's (post-fold) `generation`, so `gc_snapshot_generations_to_keep`
@@ -1323,6 +1347,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     round_commit_timer->metric("generations_visited", next.snap_pruned_through - pruned_through_before);
     round_commit_timer->metric("pruned_through", next.snap_pruned_through);
     round_commit_timer->metric("generations_referenced", referenced_generations.size());
+    if (round_point_hook_for_test)
+        runRoundPointHookForTest(RoundPointForTest::AfterRequestsBeforeCommit);
     WriteResult commit = op.replace(layout.gcStateKey(), encodeGcState(next), *state_etag,
                                     Retry::standard());
     if (const auto * conflict = std::get_if<Conflict>(&commit))
@@ -1339,6 +1365,10 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     }
     state_etag = orThrow(std::move(commit), "CAS gc round commit");
     state = std::move(next);
+    creates_resume_after_ = round_work_budget.intent_creates.nextResumeAfter();
+    /// A suppressed round takes no redelete slot, so its empty budget would look like the end of the queue.
+    if (!suppress_destructive)
+        redeletes_resume_after_ = round_work_budget.redeletes.nextResumeAfter();
     report.round = state.round;
     round_commit_timer->metric("round", report.round);
     round_commit_timer->metric("generation", generation);
@@ -1366,7 +1396,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// a crash between the CAS and here leaks the prefix to fsck (single-crash window, no permanent leak —
     /// but note the cursor already advanced, so a plain retry will NOT re-attempt it; fsck is the backstop).
     ///
-    /// PHASE 14/18 `handoff_reclaim`.
+    /// Phase `handoff_reclaim`.
     {
         GcPhaseTimer t(phase_sink, "handoff_reclaim");
         uint64_t objects_reclaimed = 0;
@@ -1385,7 +1415,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         /// the old generation on this very round and the next round's parent seal no longer names it.
         /// Nothing revisits it: `snap_pruned_through` is already past that generation and the wholesale
         /// prune only walks forward. The prefix is left to `fsck`, which is the same outcome this site
-        /// already documents for a crash in this window (see the PHASE 14/18 comment above). Bounded --
+        /// already documents for a crash in this window (see the `handoff_reclaim` comment above). Bounded --
         /// one small run per shard per occurrence of a suppressed round that also folded a delta -- and
         /// not a correctness problem, but it is the one place where the gate costs something permanent,
         /// so it is asserted rather than left to be discovered.
@@ -1403,7 +1433,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                 continue;   /// already reclaimed this round via another shard's ref
             /// `bounded_remaining` draws from the hand-off's OWN reserve, never `UINT64_MAX` and never
             /// `pruneSupersededGenerations`' shared remainder: this hand-off is a ONE-SHOT event (see the
-            /// PHASE 14/18 comment above) -- a generation this call reclaims only PARTIALLY is left
+            /// `handoff_reclaim` comment above) -- a generation this call reclaims only PARTIALLY is left
             /// exactly like a crash in this window already is -- to `fsck`, never revisited by a later
             /// round's hand-off (the parent-seal difference that triggers it does not recur once the ref
             /// has moved). The prune, by contrast, safely retries an under-served generation next round
@@ -1436,7 +1466,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// gate below) leaves an entry for the orphan-manifest sweep to reclaim later.
     /// The bodies go in batch requests of write-once keys; see the block.
     ///
-    /// PHASE 15/18 `manifest_deletes`.
+    /// Phase `manifest_deletes`.
     {
         GcPhaseTimer t(phase_sink, "manifest_deletes");
         const uint64_t manifests_deleted_before = report.manifests_deleted;
@@ -1510,7 +1540,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     for (const auto & [life_id, ref_life_state] : folded.fold_seal.ref_lives)
         cleanup_evidence_rows += ref_life_state.cleanup_evidence ? 1 : 0;
     runNamespaceJanitor(state, suppress_destructive, cleanup_evidence_rows);
-    /// PHASE 17/18 `ref_object_cleanup`. Emitted even when the whole pass is skipped (`trim_enabled` is
+    /// Phase `ref_object_cleanup`. Emitted even when the whole pass is skipped (`trim_enabled` is
     /// a test seam, `suppressed` gates the deletes), because "this phase did nothing and why" is exactly
     /// what a reader of a round that reclaimed nothing needs to see.
     {
@@ -1536,18 +1566,18 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// Bounded orphan-manifest backstop. The fold already exact-read each candidate, retired its exact
     /// source edges into the adopted runs and placed cursor progress in the SAME `gc/state` CAS above.
     /// Only this post-CAS tail may delete candidate bodies.
-    /// PHASE 18/18 `orphan_sweep`.
+    /// Phase `orphan_sweep`.
     {
         GcPhaseTimer t(phase_sink, "orphan_sweep");
         ManifestSweepResult & sweep = folded.orphan_sweep;
         for (const ManifestSweepResult::Nomination & nomination : sweep.nominations)
         {
-            /// The nominated incarnation is persisted, so the body is observed and the two renderings
-            /// compared before the removal names a precondition.
+            /// The nominated token was recorded from an earlier read, so the body is observed and compared by version
+            /// before the removal names a precondition.
             const std::optional<Meta> observed = op.head(nomination.key, Retry::standard());
             Removal outcome = Removal::Gone;
             if (observed)
-                outcome = nomination.token.matches(observed->etag)
+                outcome = sameVersion(nomination.token, observed->etag)
                     ? op.remove(nomination.key, observed->etag, Retry::standard())
                     : Removal::Mismatch;
             EventEmitter{*store}.emit([&](CasEvent & e)
@@ -1581,15 +1611,16 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         t.metric("deleted", sweep.deleted);
         t.metric("skipped", sweep.skipped);
         t.metric("undecodable", sweep.undecodable);
-        /// THE §6 PREMISE'S SHARE OF `skipped`, BY REASON CLASS. Rule (1) is satisfiable only for a
+        /// THE DELETION PREMISE'S SHARE OF `skipped`, BY REASON CLASS. The premise holds only for a
         /// closed-and-folded epoch, so a pass in which everything examined was RETAINED is an ordinary
         /// outcome, and without these numbers it is indistinguishable on the row from a pass that found
         /// nothing to do.
-        /// A row where `deleted` is 0 and all four are 0 means the sweep genuinely had no candidates.
+        /// A row where `deleted` is 0 and all five are 0 means the sweep genuinely had no candidates.
         t.metric("retained_no_coverage", sweep.retained_no_coverage);
         t.metric("retained_hold", sweep.retained_hold);
         t.metric("retained_unconsumed_seal", sweep.retained_unconsumed_seal);
         t.metric("retained_tail_removal", sweep.retained_tail_removal);
+        t.metric("retained_work_budget", sweep.retained_work_budget);
     }
 
     return report;
@@ -1785,7 +1816,7 @@ Gc::CheckpointWitnesses Gc::readCheckpointWitnesses(GcReadAhead & reads,
         }
         catch (const Exception & e)
         {
-            /// PER-NAMESPACE, NEVER ROUND-WIDE (spec §5: every per-namespace failure is a clamp or a
+            /// PER-NAMESPACE, NEVER ROUND-WIDE (every per-namespace failure is a clamp or a
             /// hold). This object belongs to exactly one namespace, so it can never be grounds for
             /// refusing to fold another one -- and refusing the whole round is what a single unreadable
             /// 4 KiB object used to do, stopping every namespace's cursor, seal and cleanup for as long
@@ -1842,7 +1873,7 @@ std::optional<std::pair<uint64_t, uint64_t>> Gc::newestFoldSealRef()
 
     /// STEP DOWN THROUGH THE GENERATIONS THE LISTING ITSELF REPORTED until one carries a seal. The
     /// newest generation routinely exists WITHOUT one: a round writes its runs during the reduce phase
-    /// and its fold seal only at phase 10/18, so an ordinary crash in between leaves exactly that
+    /// and its fold seal only in phase `fold_seal_write`, so an ordinary crash in between leaves exactly that
     /// shape. Stopping at the maximum would then refuse a pool whose holds are sitting readable one
     /// generation down -- turning a plain crash into "recreate the pool".
     ///
@@ -2012,7 +2043,7 @@ void Gc::FoldResult::FrontierDeficit::count(FrontierUnproven reason)
     }
 }
 
-Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
+Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
                         RoundReport & report,
                         uint64_t current_round, const RefPlan & walk_plan, UniversePolicy policy,
                         GcRoundWorkBudget & work_budget)
@@ -2034,14 +2065,14 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     /// because it does not consult the listing for completeness at all -- it walks by exact key from
     /// the cursor.
     ///
-    /// PHASE 6/18 `fold_ref_group`: the strict regrouping -- what this round will fold, decided before it
+    /// Phase `fold_ref_group`: the strict regrouping -- what this round will fold, decided before it
     /// reads a single body. No I/O: the keys are already in hand.
     std::optional<GcPhaseTimer> ref_list_timer;
     ref_list_timer.emplace(phase_sink, "fold_ref_group");
     const RefScanSummary & ref_scan = walk_plan.refScan();
     const std::vector<String> & ref_object_keys = ref_scan.keys;
 
-    /// The round's ONE catalog `GET` (spec INV-3). `live_incarnation` names, for every
+    /// The round's ONE catalog `GET`. `live_incarnation` names, for every
     /// namespace the catalog admits as `Live`/`Removing`, the ONE incarnation the fold may act on --
     /// `Creating` is excluded, matching `discoverUniverse` (no publication can exist yet). This is what
     /// makes the fold catalog-authoritative rather than LIST-authoritative: the pool-wide ref LIST
@@ -2051,7 +2082,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     const CasRefCatalog::Snapshot & catalog_snapshot = walk_plan.catalogCut();
     std::map<String, UInt128> live_incarnation;
     /// A `Creating` life IS named by the catalog -- `live_incarnation` excludes it
-    /// only because it is not yet WALKABLE (spec §3, no publication can exist), not because the
+    /// only because it is not yet WALKABLE (no publication can exist), not because the
     /// namespace is unaccounted. `completeCreation` publishes `_ckpt` (step 2) strictly BEFORE the
     /// `Creating -> Live` CAS (step 3), so every ordinary namespace creation has a real window --
     /// crash-stalled or merely mid-flight -- where a `Creating` entry's own `_ckpt` is durable and
@@ -2121,7 +2152,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     /// protected. NOTE the distinction from a PRESENT seal with empty `ref_lives` (a legitimate
     /// empty-universe generation) — the audit keys on object absence, not coverage emptiness.
     ///
-    /// PHASE 7/18 `fold_seal_read`. The scope reaches down to `discover_ref_seal` below, because that is
+    /// Phase `fold_seal_read`. The scope reaches down to `discover_ref_seal` below, because that is
     /// a SECOND GET of the SAME key at the SAME (generation, attempt) -- the two reads belong on one row
     /// or the redundancy is invisible. Everything between them is I/O-free (a `resize`, three lambda
     /// DEFINITIONS, and plain assignments), so the duration is honestly the two GETs and their decodes.
@@ -2131,11 +2162,14 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     seal_read_timer.emplace(phase_sink, "fold_seal_read");
     const std::optional<CasFoldSeal> adopted_seal = readFoldSeal(state.snap_generation, state.snap_attempt);
     if (!adopted_seal && state.snap_generation > 0)
+    {
+        /// A deposed leader hears only the fact: a rebuild does not repair a lost leadership.
+        const String missing = fmt::format(
+            "CAS GC: the adopted fold seal (generation {}, attempt {}) is missing", state.snap_generation, state.snap_attempt);
+        throwIfStateMoved(op, state_etag, missing);
         throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS GC: the adopted fold seal (generation {}, attempt {}) is missing under a live "
-            "gc/state — GC bookkeeping is corrupt. GC refuses to run; recover with "
-            "SYSTEM CAS GC REBUILD.",
-            state.snap_generation, state.snap_attempt);
+            "{} under a live gc/state. {}", missing, kCorruptBookkeeping);
+    }
     /// Every fold decision below starts from the immutable plan, never from the raw scan that supplied
     /// it. The successor seal owns its mutable copy; this separate const snapshot remains the prior
     /// coverage/hold view while the successor earns changes later in this fold.
@@ -2147,7 +2181,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     /// `RunMarker::Condemned` sentinel rows, so the round no longer reads any separate retired-list object —
     /// the parent seal's `blob_target_runs` ARE the retired input. The per-gc-shard `condemned_summary`
     /// the seal carries below is distilled from the `still_retired` rows each shard re-emits, making the
-    /// next round's `graduationDue` / pure-carry decisions zero-I/O.
+    /// next round's `rowDecisionDue` / pure-carry decisions zero-I/O.
     const uint64_t condemn_round = state.round + 1;
     result.retired_merge.resize(state.gc_shards);
 
@@ -2163,7 +2197,6 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     std::vector<std::vector<BlobRef>> head_candidates(state.gc_shards);
     size_t head_hint_shard = 0;
     size_t next_head_hint = 0;
-    /// Head hints count only heads, so outstanding graduation reads cannot starve them.
     const auto topUpHeadHints = [&]
     {
         const std::vector<BlobRef> & shard_candidates = head_candidates[head_hint_shard];
@@ -2172,14 +2205,47 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     };
 
     /// Condemn-time observation: ONE HEAD per new zero-transition captures the exact incarnation token
-    /// the eventual delete carries (absent => a prior landed delete => nothing to condemn). Emits the
-    /// Candidate trail (IndegZero / GcRetireObserve / BlobRetire) exactly where the decision is made.
+    /// the intent and the eventual delete name (absent, or a token with no identity => nothing to condemn).
+    /// Emits the Candidate trail (IndegZero / GcRetireObserve / BlobRetire) where the decision is made.
     ///
-    /// THE READ-AHEAD NEVER RUNS THIS LAMBDA, only feeds it. Everything below the HEAD is
-    /// side-effecting -- the trail, the counters, the condemn-marker write -- and running it over a
-    /// SUPERSET would stamp `Condemned` on blobs this round never condemns, forcing a live writer to
-    /// republish each one. The prefetch is a bare HEAD; the decision stays here.
-    const auto head_blob = [&](const BlobRef & ref) -> std::optional<Meta>
+    /// THE READ-AHEAD NEVER RUNS THIS LAMBDA, only feeds it: the trail and the counters below must not run
+    /// over a superset of the candidates. The prefetch is a bare HEAD issued after the cut.
+    /// A body shorter than the pool's envelope is not a blob GC can account for: counted and recorded, and the
+    /// fold neither condemns, adopts nor deletes it, so one bad object cannot stop every round.
+    const uint64_t blob_header_len = store->poolMeta().blob_header_len;
+    const auto undecodableHead = [&](const BlobRef & ref, const Meta & observed, bool spared) -> BlobHead
+    {
+        ProfileEvents::increment(ProfileEvents::CASGCUndecodableBlobBody);
+        EventEmitter{*store}.emit([&](CasEvent & e)
+        {
+            e.type = CasEventType::CorruptDecode;
+            e.object_kind = CasEventObjectKind::Blob;
+            e.object_hash = blobIdOf(ref);
+            e.token = observed.etag.render();
+            e.round = condemn_round;
+            e.gen = state.snap_generation + 1;
+            e.outcome = spared ? "spared" : "carried";
+            e.reason = spared
+                ? "the body is shorter than the pool's blob envelope; the blob is referenced again, so GC drops its row, "
+                  "keeps its intent and deletes nothing"
+                : "the body is shorter than the pool's blob envelope; GC neither condemns nor deletes it";
+            e.detail = {{"key", layout.blobKey(ref)}, {"size", std::to_string(observed.size)},
+                        {"envelope", std::to_string(blob_header_len)}};
+        });
+        return BlobHead::undecodableBody();
+    };
+    /// GC accounts a blob by its payload size, without the pool's envelope.
+    const auto blobHeadOf = [&](const BlobRef & ref, std::optional<Meta> observed, bool spared = false) -> BlobHead
+    {
+        if (!observed)
+            return std::nullopt;
+        if (observed->size < blob_header_len)
+            return undecodableHead(ref, *observed, spared);
+        observed->size -= blob_header_len;
+        return std::move(*observed);
+    };
+
+    const auto head_blob = [&](const BlobRef & ref) -> BlobHead
     {
         EventEmitter{*store}.emit([&](CasEvent & e)
         {
@@ -2203,8 +2269,9 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
             e.outcome = observed ? "present" : "absent";
             e.reason = "zero-in-degree candidate; observe the current incarnation";
         });
-        if (!observed)
-            return std::nullopt;
+        BlobHead head = blobHeadOf(ref, observed);
+        if (!head.meta || !head.meta->etag.canonical())
+            return head;
         ++report.candidates;
         ++report.condemned;
         ProfileEvents::increment(ProfileEvents::CASGCRetiredCondemned);
@@ -2213,82 +2280,112 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
             e.type = CasEventType::BlobRetire;
             e.object_kind = CasEventObjectKind::Blob;
             e.object_hash = blobIdOf(ref);
-            e.token = observed->etag.render();
+            e.token = head.meta->etag.render();
             e.round = condemn_round;
             e.gen = state.snap_generation + 1;
             e.outcome = "retired";
             e.reason = "condemned zero-in-degree candidate; entering the current retired list";
         });
-        Meta adjusted = *observed;
-        adjusted.size = retiredLogicalSize(ObjectKind::Blob, observed->size, store->poolMeta().blob_header_len);
-        /// This candidate always becomes a fresh `RetiredEntry` in `closeBlob` (the only caller of
-        /// `head_blob`), so this is the round's side-effecting condemn site. The job captures everything by
-        /// value: the fold mutates `cur_blob` while the job is queued.
-        meta_writer->scheduleCondemnMarkerWrite(ref, condemn_round, adjusted.size);
-        return adjusted;
+        return head;
     };
 
-    /// Side-effect-free peek: the fold's republication-supersede branch (inside
-    /// `foldDeltasIntoGeneration`) needs the CURRENT token to detect that republication replaced a stale
-    /// retired entry, but must NOT emit the fresh-condemn trail or bump `CASGCRetiredCondemned` — that
-    /// hook is `head_blob` above, reserved for a genuinely NEW zero-in-degree candidate. A supersede's
-    /// own event is `blob_retire_replaced`, emitted once below from `merge.replaced`. Plain HEAD, no
-    /// events, no counters.
-    ///
-    /// AND IT IS NOT READ AHEAD, deliberately, unlike `head_blob`'s. This HEAD is not data handed to a
-    /// decision made elsewhere -- it IS the decision: `hr && !stale.token.matches(hr->etag)` is the
-    /// supersede branch itself, so observing earlier narrows the window in which a republication can be
-    /// seen and would genuinely change which entries supersede. The consequence of a missed supersede is
-    /// benign (the stale entry graduates and its exact-token delete mismatches, so reclamation is
-    /// delayed, never wrong), but "only the moment of the fetch moves, never a decision" is the property
-    /// this whole read-ahead is worth trusting for, and it is not worth spending on the rare blob that
-    /// carries a condemned row AND is touched again in the same round.
-    const auto peek_head = [&](const BlobRef & ref) -> std::optional<Meta>
+    /// The decision `HEAD` of a touched key that has a row: every rule of that row in this round reads it,
+    /// whatever it answers. A plain HEAD with no events and no counters; a move to another incarnation emits
+    /// `blob_retire_replaced` once, from `merge.replaced`. It is sent inline, not read ahead, so it is
+    /// never older than the cut and the observations that preceded it.
+    const auto peek_head = [&](const BlobRef & ref) -> BlobHead
     {
-        std::optional<Meta> hr = op.head(layout.blobKey(ref), Retry::standard());
-        if (!hr)
-            return std::nullopt;
-        hr->size = retiredLogicalSize(ObjectKind::Blob, hr->size, store->poolMeta().blob_header_len);
-        return hr;
+        return blobHeadOf(ref, op.head(layout.blobKey(ref), Retry::standard()));
     };
 
-    /// Marker keys admitted to a graduation read and not yet taken: every outstanding hint and the entry at the
-    /// gate. With `graduations_used` it never exceeds the graduation budget.
-    std::unordered_set<String> graduation_reserved;
+    /// Blob keys of pending rows whose `HEAD` is hinted and not yet taken.
+    std::unordered_set<String> pending_head_reserved;
+    /// Blob keys of spared rows whose `HEAD` is hinted and not yet taken.
+    std::unordered_set<String> spare_head_reserved;
+    /// The pending row whose redelete slot the fold has taken and whose `HEAD` it takes next.
+    std::optional<String> settling_pending_head;
 
-    /// Graduation gate. Publishing `delete_pending` authorizes an irreversible delete, and the marker is the
-    /// writer's adopt gate, so the marker is read every time, after the round's cut. A writer that adopted saw
-    /// a non-`Condemned` marker before this read; its edge is then in the delete round's cut and spares the
-    /// entry. A refusal carries the entry and rewrites the marker; a failed read is missing evidence and
-    /// never wedges the round.
-    const auto confirm_condemned_marker = [&](const RetiredEntry & entry) -> bool
+    /// The `HEAD` before a pending row's body delete, taken when the merge settles the row. It is sent in the
+    /// merge, so after the round's cut and before the row's run is written. A failed `HEAD` fails the round before
+    /// any body delete and before its commit, so the row stays pending.
+    const auto pending_head = [&](const BlobRef & ref) -> BlobHead
     {
-        const String key = layout.blobMetaKey(entry.ref);
-        graduation_reserved.erase(key);
+        const String key = layout.blobKey(ref);
+        pending_head_reserved.erase(key);
+        settling_pending_head.reset();
         try
         {
-            /// An older round may be another incarnation's marker, which that incarnation's delete job may remove.
-            if (const auto lm = decodeLoadedMeta(reads.takeRead(key));
-                lm && lm->meta.state == MetaState::Condemned && lm->meta.condemn_round >= entry.condemn_round)
-                return true;
+            return blobHeadOf(ref, reads.takeHead(key));
         }
         catch (...)
         {
-            ProfileEvents::increment(ProfileEvents::CASGCMetaWriteAnomaly);
-            tryLogCurrentException(logger,
-                "CAS gc: the graduation gate failed to read the condemn marker (the entry is carried; "
-                "never wedges the round)");
+            countRetired(RetiredCount::BodyDeleteFailed);
+            ++report.body_delete_failed;
+            LOG_WARNING(logger,
+                "CAS gc: the HEAD before the pending delete of blob {} (key `{}`) failed; the round fails before its "
+                "commit and the row stays pending: {}",
+                blobIdOf(ref), key, getCurrentExceptionMessage(false));
+            throw;
         }
-        ProfileEvents::increment(ProfileEvents::CASGCCondemnMarkerUnconfirmedCarry);
-        /// This round, not the entry's: a publisher's late `Clean If-Match` names the bytes it read, and on S3
-        /// an entry-round rewrite recreates exactly those bytes.
-        meta_writer->scheduleCondemnMarkerWrite(entry.ref, condemn_round, entry.size);
-        return false;
     };
+
+    /// The `HEAD` of a spared row, sent in the merge, so after the round's cut. Only an answer of this round may
+    /// show that the row's token is gone: one read earlier can predate the body the row names.
+    const auto spare_head = [&](const BlobRef & ref) -> BlobHead
+    {
+        const String key = layout.blobKey(ref);
+        spare_head_reserved.erase(key);
+        try
+        {
+            return blobHeadOf(ref, reads.takeHead(key), /*spared*/ true);
+        }
+        catch (...)
+        {
+            LOG_WARNING(logger,
+                "CAS gc: the HEAD of spared blob {} (key `{}`) failed; the round fails before its commit and the row "
+                "keeps its state: {}", blobIdOf(ref), key, getCurrentExceptionMessage(false));
+            throw;
+        }
+    };
+
+    /// Sent in the fold, on the I/O pool up to `gc_io_concurrency` at a time, and answered before the row is
+    /// written: only a confirmed create may record `pending`. Once a create throws, the round fails with that
+    /// error, and `GcReadAhead::startCreate` sends none of the creates not started yet.
+    const auto create_request = [this, layout_ptr = &layout](const BlobRef & ref, const CanonicalIdentity & identity)
+    {
+        return [this, layout_ptr, ref, identity](CasOperation & worker) -> IntentCreateResult
+        {
+            IntentCreateResult created;
+            try
+            {
+                created = createBlobIntent(worker, *layout_ptr, ref, identity, Retry::standard());
+            }
+            catch (...)
+            {
+                LOG_WARNING(logger,
+                    "CAS gc: the deletion-intent create of blob {} failed; the round fails before its commit and sends no "
+                    "further create: {}", blobIdOf(ref), getCurrentExceptionMessage(false));
+                throw;
+            }
+            if (created.outcome == IntentCreate::Created)
+                ProfileEvents::increment(ProfileEvents::CASGCIntentCreated);
+            else if (created.outcome == IntentCreate::ConfirmedExisting)
+                ProfileEvents::increment(ProfileEvents::CASGCIntentConfirmedExisting);
+            else
+                ProfileEvents::increment(ProfileEvents::CASGCIntentUnconfirmedCarry);
+            return created;
+        };
+    };
+    IntentCreates create_intent;
+    create_intent.start = [&reads, &create_request](const BlobRef & ref, const CanonicalIdentity & identity)
+    {
+        return reads.startCreate(create_request(ref, identity));
+    };
+    create_intent.window = store->poolConfig().gc_io_concurrency;
 
     const uint64_t new_generation = state.snap_generation + 1;
     /// The fold mints THIS round's attempt id from `lease.seq` (the renew/steal paths bump it every
-    /// round, so it is a fresh monotonic per-round id). EVERY fold-artifact WRITE below lands under this
+    /// round; a rebuild's give-back resets it to 0). EVERY fold-artifact WRITE below lands under this
     /// attempt; the PARENT-generation READS keep using `state.snap_attempt` (the attempt the prior round
     /// adopted). The fold-adopt CAS #1 then commits `(new_generation, attempt)` together — a deposed
     /// leader's fold lands under its own unadopted attempt and is invisible to every reader.
@@ -2323,7 +2420,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     /// SECOND read of the key `adopted_seal` already holds: same generation, same attempt, same bytes
     /// (nothing between the two touches `state.snap_generation` / `snap_attempt` or writes that key).
     /// One redundant GET per folding round, and the round's FIFTH GET of this one key overall --
-    /// `graduationDue` and `listRefPrefix` make two in `defer_decision`, `parent_seal_read` a third,
+    /// `rowDecisionDue` and `listRefPrefix` make two in `defer_decision`, `parent_seal_read` a third,
     /// `adopted_seal` above a fourth. Recorded on this row, not fixed here.
     CasFoldSeal discover_ref_seal;
     if (const auto fold_seal = readFoldSeal(state.snap_generation, state.snap_attempt))
@@ -2365,12 +2462,12 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     /// or `{E+1,1}` for one without the field), and the head there must link back to it
     /// (`validateRefChainLink`). A cursor of unknown kind resumes by `resolveRefCursorSuccessor`.
     ///
-    /// PER-NAMESPACE FAILURES ARE PER-NAMESPACE (spec §5): an unreadable or undecodable body belongs to
+    /// PER-NAMESPACE FAILURES ARE PER-NAMESPACE: an unreadable or undecodable body belongs to
     /// exactly one namespace and clamps only it. The whole-round abort survives ONLY for a key that cannot
     /// be attributed to any namespace at all (`groupRefKeys` above), which is why nothing in this loop
     /// sets `ref_folding_aborted` anymore.
     ///
-    /// PHASE 8/18 `fold_ref_intake`: one GET per record (always owed -- the round read every body anyway),
+    /// Phase `fold_ref_intake`: one GET per record (always owed -- the round read every body anyway),
     /// plus one exact 404 probe per namespace to prove its frontier, the reads that resolve a cold cursor,
     /// and one GET per manifest edge, which on a busy pool is where the round's object-read budget goes.
     /// It also carries probe B1's two numbers -- reported on EVERY healthy round, so
@@ -2384,8 +2481,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     /// read happened, in the same order, and increments the same counters, so this row's semantic metrics
     /// do not depend on `gc_io_concurrency` unless the slice cuts the walk: pass 1 reads one read-ahead
     /// window, whose size follows `gc_io_concurrency`. Its S3 VERB counts are not: a request
-    /// a worker performed lands on that worker's ProfileEvents, the same gap `meta_pool_wait` has always
-    /// had. Read `CASGCReadAheadHit`/`Miss`/`Wasted` on this row for the read-ahead's own behaviour.
+    /// a worker performed lands on that worker's ProfileEvents. Read `CASGCReadAheadHit`/`Miss`/`Wasted` on this row for the read-ahead's own behaviour.
     std::optional<GcPhaseTimer> intake_timer;
     intake_timer.emplace(phase_sink, "fold_ref_intake");
     /// The slice of `kRefIntakeBudgetMs` that bounds pass 2 of the walk below.
@@ -2410,7 +2506,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     const std::map<String, RefTxnId> & checkpoint_witness = checkpoints.witnesses;
 
     /// WHICH NAMESPACES THIS ROUND WALKS -- i.e. THE ROUND'S UNIVERSE, the set the destructive gate owes
-    /// a frontier proof for (spec §5; `UniversePolicy` for why only the catalog can bound it): EVERY
+    /// a frontier proof for (`UniversePolicy` says why only the catalog can bound it): EVERY
     /// `Live`/`Removing` row of this round's frozen catalog cut, and nothing else.
     ///
     /// The listing is a HINT and cannot change that set in either direction. It cannot SHRINK it -- a
@@ -2722,9 +2818,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
             if (logs_below_snapshot_gone)
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
                     "CAS GC baseline guard: table {} has snapshot {} but no surviving log at or below it and "
-                    "no sealed fold cursor -- gc/state was lost after cleaning covered logs. GC refuses to "
-                    "run; recover with SYSTEM CAS GC REBUILD.",
-                    ns_str, renderRefTxnId(newest_snapshot));
+                    "no sealed fold cursor -- gc/state was lost after cleaning covered logs. {}",
+                    ns_str, renderRefTxnId(newest_snapshot), kCorruptBookkeeping);
         }
 
         /// The hold the PARENT seal left on this namespace, if any. It is three things at once: the
@@ -2762,7 +2857,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
             }
         }
 
-        /// An unavailable or invalid `_ckpt` quarantines its own namespace and nothing else (spec §5). The object
+        /// An unavailable or invalid `_ckpt` quarantines its own namespace and nothing else. The object
         /// belongs to exactly one namespace and both of its consumers are keyed by that namespace --
         /// `witnessAbove` below, and `cleanupRefObjects`' delete boundaries via `result.checkpoints` --
         /// so the damage is confinable, and confining it is the difference between one namespace waiting
@@ -3110,7 +3205,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         RefCoverage cov;
         cov.last_folded_ref_id = resolved_through;
 
-        /// THE CLEARING RULE (spec §5), and the only place it is decided. A hold clears by exactly one
+        /// THE CLEARING RULE, and the only place it is decided. A hold clears by exactly one
         /// event: this walk RESOLVING the offending position -- folding through it and sealing a cursor
         /// at or above it. It never clears by observing another absent, because an absent is precisely
         /// what a lying store produces and precisely what made the hold necessary; and it never clears
@@ -3198,13 +3293,22 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
 
     /// PASS 1 is never cut: every namespace gets its start resolution and one read window, which proves
     /// every quiet namespace in every round.
-    const size_t pass_one_takes = std::max<size_t>(reads.window(), 1);
-    for (NamespaceIntake & s : intakes)
+    const auto afterWalkHook = [&](uint8_t pass, const NamespaceIntake & walked, const NamespaceIntake * next)
     {
+        if (round_point_hook_for_test)
+            runRoundPointHookForTest({.point = RoundPointForTest::AfterNamespaceWalk, .pass = pass,
+                                      .walked = walked.target->ns, .next = next ? next->target->ns : String{}});
+    };
+    const size_t pass_one_takes = std::max<size_t>(reads.window(), 1);
+    for (size_t i = 0; i < intakes.size(); ++i)
+    {
+        NamespaceIntake & s = intakes[i];
         topUpFirstWalkHints();
         if (s.resolve_start)
             resolveStart(s);
         walkNamespace(s, pass_one_takes, /*sliced=*/false);
+        if (i + 1 < intakes.size())
+            afterWalkHook(1, s, &intakes[i + 1]);
     }
 
     /// PASS 2 continues the unfinished walks from index `round mod n`, so the slice does not always end
@@ -3213,10 +3317,14 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     for (NamespaceIntake & s : intakes)
         if (s.expected)
             unfinished.push_back(&s);
+    const auto pass_two_at = [&](size_t i) { return unfinished[(current_round + i) % unfinished.size()]; };
+    if (round_point_hook_for_test && !intakes.empty())
+        afterWalkHook(1, intakes.back(), unfinished.empty() ? nullptr : pass_two_at(0));
     for (size_t i = 0; i < unfinished.size(); ++i)
     {
-        NamespaceIntake & s = *unfinished[(current_round + i) % unfinished.size()];
+        NamespaceIntake & s = *pass_two_at(i);
         walkNamespace(s, std::nullopt, /*sliced=*/true);
+        afterWalkHook(2, s, i + 1 < unfinished.size() ? pass_two_at(i + 1) : nullptr);
     }
 
     for (NamespaceIntake & s : intakes)
@@ -3326,9 +3434,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
                 if (end.writer_epoch != first.writer_epoch || end < first)
                     throw Exception(ErrorCodes::CORRUPTED_DATA,
                         "CAS GC fold: namespace {} sealed a cursor at {} that does not close the run it "
-                        "walked (opened at {}). GC refuses to commit the round; recover with "
-                        "SYSTEM CAS GC REBUILD.",
-                        ns_str, end == RefTxnId{} ? "none" : renderRefTxnId(end), renderRefTxnId(first));
+                        "walked (opened at {}). {}",
+                        ns_str, end == RefTxnId{} ? "none" : renderRefTxnId(end), renderRefTxnId(first), kCorruptBookkeeping);
                 logs_accounted += end.ref_sequence - first.ref_sequence + 1;
             }
         }
@@ -3437,10 +3544,10 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     /// parent's `RunRef`s VERBATIM (key/checksum/shard/generation) so the next round resolves them. This
     /// is deterministic (same refs for the same inputs), so seal determinism / crash-replay adoption hold.
     /// An empty delta with a NON-EMPTY retired list still runs the merge: settlement must happen every
-    /// pass (carried/graduated/redeleted entries), and that pass reads the run to recompute in-degrees.
+    /// pass (carried, intent-confirmed and body-deleted entries), and that pass reads the run to recompute in-degrees.
     /// Distill one shard's `condemned_summary` entry from the `RunMarker::Condemned` rows it re-emitted this pass
     /// (`still_retired` mirrors those rows exactly). Folding shards call this; it makes the next
-    /// round's `graduationDue` and pure-carry decisions read only the seal, never a run.
+    /// round's `rowDecisionDue` and pure-carry decisions read only the seal, never a run.
     auto summarize = [](const std::vector<RetiredEntry> & still) -> CondemnedSummary
     {
         CondemnedSummary s;
@@ -3455,9 +3562,10 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         }
         return s;
     };
-    /// The parent seal's summary for a shard, used ONLY for the pure-carry DECISION (condemned_total==0).
-    /// Missing => zero: a fresh pool has no parent entry (correct baseline), and a snap_generation>0 seal
-    /// that is missing an entry we would pure-carry fails closed inside `carryParentRefs` when it copies.
+    /// The parent seal's summary for a shard, used for the pure-carry DECISION (condemned_total==0) and to skip the
+    /// condemned-row read-ahead sets when no parent row is pending, which costs read-ahead only.
+    /// Missing => zero only on a fresh pool, which has no parent seal: `readFoldSeal` refuses a seal whose summary
+    /// does not cover every shard, so the parent check below sees every shard's `pending_total`.
     auto summaryOfParent = [&](uint64_t shard) -> CondemnedSummary
     {
         const auto it = discover_ref_seal.condemned_summary.find(shard);
@@ -3495,18 +3603,15 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
 
 
     /// CLAMP SUPPRESSION: any clamp
-    /// this pass means landed-before-cut events may be UNFOLDED behind a clamped cursor — the
-    /// floor's "landed before cut => folded before graduation" lemma does not hold, so this pass
-    /// must not graduate NOR execute pending deletes (the merge carries everything; condemnation
-    /// and sparing continue). Deletes resume on the first clamp-free pass. This is the honest-mode
+    /// this pass means landed-before-cut events may be UNFOLDED behind a clamped cursor, so this pass
+    /// must not delete a body or an intent. Deletes resume on the first clamp-free pass. This is the honest-mode
     /// counterpart of the model's SabotageSkipChangedShard counterexample.
     ///
-    /// PHASE 9/18 `fold_reduce`: the prior-run streaming GETs, one HEAD per zero-transition candidate,
-    /// and the run PUTs -- the heaviest phase of a folding round on a pool with churn. It also carries
-    /// probe B2's verdict (`transactions_unapplied`), which is 0 on every committed round because a nonzero
+    /// Phase `fold_reduce`: the prior-run streaming GETs, one HEAD per zero-transition candidate and per
+    /// settled pending row, and the run PUTs -- the heaviest phase of a folding round on a pool with churn. It
+    /// also carries probe B2's verdict (`transactions_unapplied`), which is 0 on every committed round because a nonzero
     /// value throws a few lines below; the row is therefore the forensic record of a round that failed.
     std::optional<GcPhaseTimer> reduce_timer;
-    reduce_timer.emplace(phase_sink, "fold_reduce");
     const uint64_t deltas_in = deltas.size();
     const uint64_t condemned_before = report.condemned;
     uint64_t shards_pure_carry = 0;
@@ -3550,8 +3655,46 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         && (result.frontier_namespaces > 0 || result.catalog_cut_proved_empty);
     const bool frontier_incomplete = !result.frontier_complete;
 
-    result.suppress_destructive =
-        !report.anomalies.empty() || !carried_holds.empty() || frontier_incomplete;
+    const bool suppressed_by_intake = !report.anomalies.empty() || !carried_holds.empty() || frontier_incomplete;
+
+    /// Ref-log cleanup runs after its round commits a newer `gc/state`, so the leased version, still current
+    /// after the last intake read, shows that no newer leader removed a record this round read as absent.
+    /// Rounds with no `pending` or `standing` parent row skip the read.
+    /// That is safe: a delete that acts on a false zero needs such a row, and every other intent delete
+    /// follows a `HEAD` that showed another incarnation. The summary decides it before the merge: the reader refuses
+    /// a merged shard whose rows disagree with its summary, and every body and intent delete runs after the merge.
+    bool parent_has_pending_rows = false;
+    for (uint64_t shard = 0; shard < state.gc_shards; ++shard)
+        parent_has_pending_rows = parent_has_pending_rows || summaryOfParent(shard).pending_total != 0;
+    if (!suppressed_by_intake && parent_has_pending_rows)
+    {
+        String seen;
+        try
+        {
+            const std::optional<Meta> current = op.head(layout.gcStateKey(), Retry::standard());
+            if (!current)
+                seen = "no object";
+            else if (!state_etag || !sameVersion(current->etag, *state_etag))
+                seen = "another version";
+        }
+        catch (const Exception & e)
+        {
+            /// A read verb that gives up throws `NETWORK_ERROR`; any other failure fails the round, as elsewhere.
+            /// A lost fence or a spent lease budget throws the same code.
+            if (e.code() != ErrorCodes::NETWORK_ERROR)
+                throw;
+            seen = "no answer (" + e.message() + ")";
+        }
+        result.parent_unconfirmed = !seen.empty();
+        if (result.parent_unconfirmed)
+            LOG_WARNING(logger,
+                "CAS GC fold: the `HEAD` of `gc/state` after the intake shows {}, not the version this round "
+                "leased (parent_unconfirmed). A newer leader may have removed records this round read as absent; "
+                "no body or intent is deleted this pass.",
+                seen);
+    }
+
+    result.suppress_destructive = suppressed_by_intake || result.parent_unconfirmed;
     const bool suppress_destructive = result.suppress_destructive;
     if (suppress_destructive)
     {
@@ -3569,7 +3712,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         /// A catalog the cut DID prove empty is not a suppression cause at all: it satisfies
         /// `frontier_complete`, so a round reaching this block with one is suppressed by an anomaly or
         /// a hold, never by the frontier term.
-        const bool per_round_cause = !report.anomalies.empty() || !carried_holds.empty()
+        const bool per_round_cause = !report.anomalies.empty() || !carried_holds.empty() || result.parent_unconfirmed
             || result.frontier_proven != result.frontier_namespaces
             || (universe_authoritative && result.frontier_namespaces == 0 && !result.catalog_cut_proved_empty);
         const char * const universe_note =
@@ -3585,25 +3728,66 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         const String deficit_note = result.frontier_deficit.total() == 0
             ? String{}
             : fmt::format("; unproven: {}", result.frontier_deficit.describe());
+        const char * const parent_note = result.parent_unconfirmed ? "; the leased `gc/state` is unconfirmed" : "";
         if (per_round_cause)
             LOG_WARNING(logger,
                 "CAS GC fold: destructive work SUPPRESSED this pass — {} anomaly(ies), {} held "
-                "namespace(s), frontier {} ({} of {} namespace(s) proven{}{}{}). Graduations and pending "
-                "deletes are carried; nothing irreversible runs until a pass that clears all three.",
+                "namespace(s), frontier {} ({} of {} namespace(s) proven{}{}{}){}. Body deletes, intent removals "
+                "and the intent creates of carried candidates wait for a pass that clears every cause; fresh "
+                "condemnations and transitions still create intents and write `pending` rows.",
                 report.anomalies.size(), carried_holds.size(),
                 result.frontier_complete ? "complete" : "INCOMPLETE",
                 result.frontier_proven, result.frontier_namespaces, universe_note, catalog_empty_note,
-                deficit_note);
+                deficit_note, parent_note);
         else
             LOG_INFO(logger,
                 "CAS GC fold: destructive work SUPPRESSED this pass — {} anomaly(ies), {} held "
-                "namespace(s), frontier {} ({} of {} namespace(s) proven{}{}{}). Graduations and pending "
-                "deletes are carried; nothing irreversible runs until a pass that clears all three.",
+                "namespace(s), frontier {} ({} of {} namespace(s) proven{}{}{}). Body deletes, intent removals "
+                "and the intent creates of carried candidates wait for a pass that clears every cause; fresh "
+                "condemnations and transitions still create intents and write `pending` rows.",
                 report.anomalies.size(), carried_holds.size(),
                 result.frontier_complete ? "complete" : "INCOMPLETE",
                 result.frontier_proven, result.frontier_namespaces, universe_note, catalog_empty_note,
                 deficit_note);
     }
+
+    if (round_point_hook_for_test)
+        runRoundPointHookForTest(RoundPointForTest::AfterIntake);
+
+    /// One page of `blob-intents/` nominates intents that may have no row. It is listed after the cut, so the
+    /// adoption `HEAD`s in the merge follow both. A suppressed round lists nothing. A listed key only nominates:
+    /// the state comes from the `HEAD`. One nomination per blob per round.
+    std::vector<std::vector<Layout::ParsedBlobIntentKey>> intent_nominations(state.gc_shards);
+    if (!suppress_destructive)
+    {
+        GcPhaseTimer t(phase_sink, "intent_sweep_list");
+        const ListPage page = op.list(layout.blobIntentsPrefix(), state.intent_sweep_cursor,
+                                      store->poolConfig().intent_sweep_list_budget_keys, Retry::standard());
+        std::set<BlobRef> nominated;
+        uint64_t unparsed = 0;
+        for (const ListedKey & listed : page.keys)
+        {
+            if (layout.isBlobIntentProbeKey(listed.key))
+                continue;   /// the capability probe's scratch object, not an intent
+            const std::optional<Layout::ParsedBlobIntentKey> parsed = layout.parseBlobIntentKey(listed.key);
+            if (!parsed)
+            {
+                ++unparsed;
+                continue;
+            }
+            if (nominated.insert(parsed->ref).second)
+                intent_nominations[blobShard(parsed->ref, state.gc_shards)].push_back(*parsed);
+        }
+        result.intent_sweep_next_cursor = page.next_cursor;
+        t.metric("listed", page.keys.size());
+        t.metric("nominated", nominated.size());
+        t.metric("unparsed", unparsed);
+        t.metric("wrapped", page.next_cursor.empty() ? 1 : 0);
+        t.metric("list_budget_keys", store->poolConfig().intent_sweep_list_budget_keys);
+    }
+
+    /// Started after the intent sweep, so the sweep's `LIST` is counted in its own phase row only.
+    reduce_timer.emplace(phase_sink, "fold_reduce");
 
     std::vector<BlobSourceRetirement> orphan_source_retirements;
     if (!suppress_destructive && store->poolConfig().manifest_sweep_list_budget_keys > 0)
@@ -3625,24 +3809,18 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
                 nomination.source_retirements.end());
     }
 
-    /// WHICH BLOBS THE MERGE CAN CLOSE AT ZERO. `closeBlob` HEADs under `cur_edges == 0 && cur_touched`:
-    /// no key of the blob ended present, and at least one was touched. Every prior-run edge that survives
-    /// increments `cur_edges`, so reaching zero requires each of them to be killed at its own key by a
-    /// `-1` delta or a source retirement -- which puts a removal-last verdict in the map below -- while
-    /// any activation-last verdict leaves an edge standing and is the exclusion clause. Retirements are
-    /// folded in AFTER the deltas because the merge applies them that way, unconditionally: a key whose
-    /// deltas end in an activation but which a retirement then clears is a candidate too.
+    /// The blobs the merge may close at zero: a key whose last verdict is a removal, and none whose last verdict
+    /// is an activation. Retirements count after the deltas, as the merge applies them. The set is a superset, and
+    /// nothing may depend on it being exact: a blob that keeps an untouched prior edge costs one unused `HEAD`, and
+    /// a missed one is decided inline. Built after the sweep decided `orphan_source_retirements`, past the cut.
     ///
-    /// IT IS A SUPERSET, AND NOTHING MAY COME TO DEPEND ON IT BEING EXACT. A blob named here that keeps
-    /// an untouched prior edge costs one HEAD the merge never takes; a candidate this set misses is
-    /// HEADed inline, which is simply the behaviour with no read-ahead at all. Both are counted, and
-    /// neither is asserted.
-    ///
-    /// PLACED HERE, not at the top of the phase: `orphan_source_retirements` is decided just above by
-    /// the sweep, and a retirement is a removal like any other. The round's cut is frozen well before
-    /// this point -- intake has finished and `deltas` has taken its final form -- so no HEAD is issued
-    /// before the round knows what it folded.
+    /// The two sets below steer the condemned-row read-ahead and are disjoint. They stay empty when nothing reads
+    /// them: on the sequential setting, in a suppressed round, and when no parent row is `pending` or `standing`.
+    /// Blobs touched only by removals: their rows may be decided inline at zero.
     std::set<BlobRef> touched_blobs;
+    /// Blobs that end this merge with a reference, from an activation that is the last verdict at its key; their
+    /// rows are spared.
+    std::set<BlobRef> referenced_blobs;
     {
         std::map<std::pair<BlobRef, UInt128>, bool> last_verdict_is_remove;
         for (const BlobDelta & delta : deltas)
@@ -3653,136 +3831,187 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         std::set<BlobRef> removed;
         std::set<BlobRef> surviving_add;
         for (const auto & [edge, is_remove] : last_verdict_is_remove)
-        {
-            /// Only the graduation read-ahead reads the set; the sequential setting has none.
-            if (reads.window() > 0)
-                touched_blobs.insert(edge.first);
             (is_remove ? removed : surviving_add).insert(edge.first);
-        }
+        const bool keep_read_ahead_sets = reads.window() > 0 && !suppress_destructive && parent_has_pending_rows;
         for (const BlobRef & ref : removed)
-            if (!surviving_add.contains(ref))
-                head_candidates[blobShard(ref, state.gc_shards)].push_back(ref);
+        {
+            if (surviving_add.contains(ref))
+                continue;
+            head_candidates[blobShard(ref, state.gc_shards)].push_back(ref);
+            if (keep_read_ahead_sets)
+                touched_blobs.insert(ref);
+        }
+        if (keep_read_ahead_sets)
+            referenced_blobs = std::move(surviving_add);
     }
 
-    /// Graduation read-ahead. A carried row that no delta or retirement touches this round has no edge and is
-    /// not superseded, so it reaches the gate; its read is hinted once the budget admits it. Hints are issued in
-    /// the merge, after intake, and the fold writes no marker of a hinted hash before the gate takes the read.
-    const auto graduationBudgetFull = [&]
+    /// Pending-row read-ahead: hints the body `HEAD` of an untouched pending row while the redelete budget and the
+    /// window have room. Hints are issued in the merge, after intake.
+    const auto redeleteBudgetFull = [&]
     {
-        return work_budget.max_graduations != 0
-            && work_budget.graduations_used + graduation_reserved.size() >= work_budget.max_graduations;
+        return work_budget.redeletes.cap != 0
+            && work_budget.redeletes.used + pending_head_reserved.size() >= work_budget.redeletes.cap;
     };
-    const GraduationReadHints graduation_hints{
-        .admit = [&](const BlobRef & ref)
-        {
-            const String key = layout.blobMetaKey(ref);
-            if (graduation_reserved.contains(key))
-                return true;
-            if (graduationBudgetFull())
-                return false;
-            if (graduation_reserved.size() < reads.window())
-                reads.hintRead(key);
-            graduation_reserved.insert(key);
+    const auto offerPendingHead = [&](const BlobRef & ref)
+    {
+        /// A touched row may be spared or superseded inline; reserving past it would let later rows take its slot.
+        if (touched_blobs.contains(ref) || referenced_blobs.contains(ref))
+            return false;
+        const String key = layout.blobKey(ref);
+        if (key == settling_pending_head || pending_head_reserved.contains(key))
             return true;
-        },
+        /// A row past the budget is carried, or read inline if a reserved row is spared; it must not stop the scan.
+        if (redeleteBudgetFull())
+            return true;
+        /// A row the rotation skips this round is carried without its `HEAD`.
+        if (!work_budget.redeletes.admits(blobShard(ref, state.gc_shards), ref))
+            return true;
+        if (reads.pendingHeads() >= reads.window())
+            return false;
+        reads.hintHead(key);
+        pending_head_reserved.insert(key);
+        return true;
+    };
+    /// A spared row takes no redelete slot, so the scan goes on past it.
+    const auto offerSpareHead = [&](const BlobRef & ref, const CondemnedRow & row)
+    {
+        if (!row.token.canonical())
+            return true;
+        const String key = layout.blobKey(ref);
+        if (spare_head_reserved.contains(key))
+            return true;
+        if (reads.pendingHeads() >= reads.window())
+            return false;
+        reads.hintHead(key);
+        spare_head_reserved.insert(key);
+        return true;
+    };
+    const PendingHeadHints pending_head_hints{
         .offer = [&](const BlobRef & ref, const CondemnedRow & row)
         {
-            if (row.delete_pending || row.condemn_round >= current_round || suppress_destructive)
+            if (suppress_destructive || !row.delete_pending)
                 return true;
-            /// A touched row may still reach the gate; reserving past it would let later rows take its budget slot.
-            if (touched_blobs.contains(ref))
-                return false;
-            if (graduationBudgetFull() || graduation_reserved.size() >= reads.window())
-                return false;
-            if (const String key = layout.blobMetaKey(ref); graduation_reserved.insert(key).second)
-                reads.hintRead(key);
-            return true;
+            if (referenced_blobs.contains(ref))
+                return offerSpareHead(ref, row);
+            if (row.standing)
+                return true;
+            return offerPendingHead(ref);
+        },
+        /// The settling row's `HEAD` goes to the pool before the scan hints the rows behind it: sent inline beside a
+        /// full pool, it would be one request over `gc_io_concurrency`.
+        .take_pending = [&](const BlobRef & ref)
+        {
+            const String key = layout.blobKey(ref);
+            if (pending_head_reserved.erase(key) == 0)
+                reads.hintHead(key);
+            settling_pending_head = key;
+        },
+        .take_spare = [&](const BlobRef & ref)
+        {
+            const String key = layout.blobKey(ref);
+            if (spare_head_reserved.insert(key).second)
+                reads.hintHead(key);
         }};
-    const GraduationReadHints * graduation_reads = reads.window() > 0 ? &graduation_hints : nullptr;
-    /// A reservation left after a shard's merge belongs to no gate.
-    const auto discardGraduationReads = [&]
+    const PendingHeadHints * pending_hints = reads.window() > 0 ? &pending_head_hints : nullptr;
+    /// A reservation left after a shard's merge belongs to no settlement.
+    const auto discardReservedReads = [&]
     {
-        for (const String & key : graduation_reserved)
-            reads.discardRead(key);
-        graduation_reserved.clear();
+        for (const String & key : pending_head_reserved)
+            reads.discardHead(key);
+        pending_head_reserved.clear();
+        for (const String & key : spare_head_reserved)
+            reads.discardHead(key);
+        spare_head_reserved.clear();
     };
 
+    /// A nomination alone does not take a shard off the pure carry, or an idle pool with one intent left over a
+    /// referenced blob would rewrite that shard's run every round. A merge the shard runs anyway consumes its
+    /// nominations; otherwise they wait for a round whose number is a multiple of `gc_fold_max_defer_rounds + 1`,
+    /// and the sweep cursor stays at their page until then.
+    const uint64_t max_defer_rounds = store->poolConfig().gc_fold_max_defer_rounds;
+    const uint64_t nomination_period = max_defer_rounds == std::numeric_limits<uint64_t>::max() ? max_defer_rounds : max_defer_rounds + 1;
+    const bool nominations_due = current_round % nomination_period == 0;
+    uint64_t nominations_waiting = 0;
+    const auto pureCarry = [&](uint64_t shard, bool merges_anyway)
+    {
+        if (merges_anyway || (nominations_due && !intent_nominations[shard].empty()))
+            return false;
+        nominations_waiting += intent_nominations[shard].size();
+        return true;
+    };
+
+    /// Target-sharded reducers: `blobShard(blob_hash, gc_shards)` partitions the delta stream into disjoint
+    /// buckets, each folded into `blobTargetRunKey(new_generation, shard, 0)`. A promote that displaces a blob's
+    /// owner emits both its `-1` and `+1` at the same source event, so each delta routes independently to the
+    /// shard owning its blob and cross-shard displacement needs no fixup.
+    std::vector<std::vector<BlobDelta>> buckets(state.gc_shards);
+    std::vector<std::vector<BlobSourceRetirement>> retirement_buckets(state.gc_shards);
     if (state.gc_shards == 1)
     {
-        /// SINGLE-SHARD PATH (gc_shards == 1). Every blob routes to shard 0, so the entire delta stream
-        /// folds into one `blobTargetRunKey(new_generation, 0, 0)` run.
-        if (!folded_any && orphan_source_retirements.empty() && summaryOfParent(0).condemned_total == 0)
-        {
-            /// Pure ref-carry: nothing changed and no condemned entries to settle => zero run I/O. Carry the
-            /// parent shard-0 refs + summary into the seal so coverage/resume/graduation stay durable.
-            carryParentRefs(0);
-            ++shards_pure_carry;
-        }
-        else
-        {
-            /// Either a real delta or a non-empty retired input: run the merge (empty deltas still settle
-            /// the RunMarker::Condemned rows riding the parent run). The prior runs are the parent seal's shard-0 refs.
-            head_hint_shard = 0;
-            next_head_hint = 0;
-            foldDeltasIntoGeneration(op, layout, priorRunsFor(0),
-                                     new_generation, attempt, /*shard*/0,
-                                     std::move(deltas), result.fold_seal.blob_target_runs,
-                                     current_round, condemn_round, head_blob, peek_head,
-                                     confirm_condemned_marker,
-                                     result.retired_merge.data(), suppress_destructive,
-                                     &ledger.applied, std::move(orphan_source_retirements),
-                                     &work_budget, graduation_reads);
-            discardGraduationReads();
-            result.fold_seal.condemned_summary[0] = summarize(result.retired_merge[0].still_retired);
-        }
+        buckets[0] = std::move(deltas);
+        retirement_buckets[0] = std::move(orphan_source_retirements);
     }
     else
     {
-        /// SHARDED PATH (gc_shards > 1) — target-sharded reducers. Each blob's
-        /// `BlobDelta` carries its full signed edge stream; `blobShard(blob_hash, gc_shards)` partitions
-        /// the stream into `gc_shards` disjoint buckets. Each bucket folds via its own `ShardReducer`
-        /// into `blobTargetRunKey(new_generation, shard, 0)`. The `RootOwnerEvent`'s paired old/new
-        /// bindings produced the `-1`/`+1` deltas above, so a promote that displaces a blob's owner
-        /// emits BOTH the `-1` (old binding) and the `+1` (new binding) at the SAME source event. This
-        /// is why cross-shard displacement needs no special handling: each delta routes independently and
-        /// deterministically to whichever target shard owns its blob; the old/new pair is solved at the
-        /// source, not by a cross-shard fixup.
-        std::vector<std::vector<BlobDelta>> buckets(state.gc_shards);
         for (BlobDelta & d : deltas)
             buckets[blobShard(d.ref, state.gc_shards)].push_back(std::move(d));
-        std::vector<std::vector<BlobSourceRetirement>> retirement_buckets(state.gc_shards);
         for (BlobSourceRetirement & retirement : orphan_source_retirements)
             retirement_buckets[blobShard(retirement.ref, state.gc_shards)].push_back(std::move(retirement));
-
-        for (uint64_t shard = 0; shard < state.gc_shards; ++shard)
-        {
-            if (buckets[shard].empty() && retirement_buckets[shard].empty()
-                && summaryOfParent(shard).condemned_total == 0)
-            {
-                /// Pure ref-carry for this shard: empty delta + no condemned entries => zero run I/O.
-                carryParentRefs(shard);
-                ++shards_pure_carry;
-                continue;
-            }
-            /// A reducer owns exactly one disjoint shard. Two replicas may run reducers for DIFFERENT
-            /// shards concurrently (CasGcScheduler ownership); their run-key namespaces never collide.
-            std::vector<RunRef> shard_runs;
-            head_hint_shard = shard;
-            next_head_hint = 0;
-            foldDeltasIntoGeneration(
-                op, layout, priorRunsFor(shard), new_generation, attempt, shard,
-                std::move(buckets[shard]), shard_runs,
-                current_round, condemn_round, head_blob, peek_head,
-                confirm_condemned_marker,
-                &result.retired_merge[shard], suppress_destructive,
-                &ledger.applied, std::move(retirement_buckets[shard]),
-                &work_budget, graduation_reads);
-            discardGraduationReads();
-            for (RunRef & r : shard_runs)
-                result.fold_seal.blob_target_runs.push_back(std::move(r));
-            result.fold_seal.condemned_summary[shard] = summarize(result.retired_merge[shard].still_retired);
-        }
     }
+
+    for (uint64_t shard = 0; shard < state.gc_shards; ++shard)
+    {
+        /// One shard also merges when intake changed a table but produced no delta.
+        const bool has_input = state.gc_shards == 1 ? folded_any : !buckets[shard].empty();
+        if (pureCarry(shard, has_input || !retirement_buckets[shard].empty() || summaryOfParent(shard).condemned_total != 0))
+        {
+            /// Nothing changed and no condemned entries to settle => zero run I/O. Carry the parent refs and
+            /// summary into the seal so coverage and resume stay durable.
+            carryParentRefs(shard);
+            ++shards_pure_carry;
+            continue;
+        }
+        /// Empty deltas still settle the `RunMarker::Condemned` rows riding the parent run. Two replicas may
+        /// run reducers for DIFFERENT shards concurrently (CasGcScheduler ownership); their run keys never collide.
+        head_hint_shard = shard;
+        next_head_hint = 0;
+        RunRef shard_run;
+        try
+        {
+            shard_run = foldDeltasIntoGeneration(
+                op, layout, priorRunsFor(shard),
+                AdoptedRunContext{.gc_shards = state.gc_shards, .parent_round = state.round, .summary = summaryOfParent(shard)},
+                new_generation, attempt, shard, std::move(buckets[shard]),
+                ShardFoldOptions{
+                    .current_round = current_round,
+                    .condemn_round = condemn_round,
+                    .head_blob = head_blob,
+                    .peek_head = peek_head,
+                    .pending_head = pending_head,
+                    .spare_head = spare_head,
+                    .create_intent = create_intent,
+                    .out_retired = &result.retired_merge[shard],
+                    .suppress_destructive = suppress_destructive,
+                    .out_applied_by_txn_ordinal = &ledger.applied,
+                    .source_retirements = std::move(retirement_buckets[shard]),
+                    .work_budget = &work_budget,
+                    .pending_hints = pending_hints,
+                    .intent_nominations = std::move(intent_nominations[shard])});
+        }
+        catch (const Exception & e)
+        {
+            /// The parent runs this merge streams are what a newer leader's retention removes.
+            if (e.code() == ErrorCodes::CORRUPTED_DATA)
+                throwIfStateMoved(op, state_etag, e.message());
+            throw;
+        }
+        discardReservedReads();
+        result.fold_seal.blob_target_runs.push_back(std::move(shard_run));
+        result.fold_seal.condemned_summary[shard] = summarize(result.retired_merge[shard].still_retired);
+    }
+
+    if (nominations_waiting > 0)
+        result.intent_sweep_next_cursor.reset();
 
     /// Aggregate the unmatched-remove signal across every gc-shard this pass touched and log ONCE per
     /// round with the total plus one example, rather than from the hot per-edge inner loop that detects
@@ -3813,29 +4042,44 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     const std::vector<uint32_t> unapplied_txns = ledger.unapplied();
     transactions_unapplied_this_round = unapplied_txns.size();
     {
-        uint64_t graduated = 0;
+        uint64_t intent_confirmed = 0;
         uint64_t spared = 0;
-        uint64_t redelete_pending = 0;
+        uint64_t body_deletes_decided = 0;
+        uint64_t adopted = 0;
         for (const RetiredMergeResult & merge : result.retired_merge)
         {
-            graduated += merge.graduated.size();
+            intent_confirmed += merge.confirmed.size();
             spared += merge.spared.size();
-            redelete_pending += merge.redelete.size();
+            body_deletes_decided += merge.body_deletes.size();
+            adopted += merge.adopted.size();
         }
         reduce_timer->metric("shards_total", state.gc_shards);
         reduce_timer->metric("shards_pure_carry", shards_pure_carry);
         reduce_timer->metric("shards_reduced", state.gc_shards - shards_pure_carry);
+        reduce_timer->metric("nominations_waiting", nominations_waiting);
+        reduce_timer->metric("read_ahead_blobs", touched_blobs.size() + referenced_blobs.size());
         reduce_timer->metric("deltas_in", deltas_in);
         reduce_timer->metric("runs_written", result.fold_seal.blob_target_runs.size());
         reduce_timer->metric("condemned", report.condemned - condemned_before);
-        reduce_timer->metric("graduated", graduated);
+        reduce_timer->metric("intents_confirmed", intent_confirmed);
         reduce_timer->metric("spared", spared);
-        reduce_timer->metric("redelete_pending", redelete_pending);
+        reduce_timer->metric("body_deletes_decided", body_deletes_decided);
+        reduce_timer->metric("adopted", adopted);
         reduce_timer->metric("suppress_destructive", suppress_destructive ? 1 : 0);
         /// Published separately from `suppress_destructive` so a reader can tell the frontier term apart
         /// from the anomaly and hold terms without re-deriving the formula from the tally.
         reduce_timer->metric("frontier_complete", result.frontier_complete ? 1 : 0);
+        reduce_timer->metric("parent_unconfirmed", result.parent_unconfirmed ? 1 : 0);
         reduce_timer->metric("transactions_unapplied", transactions_unapplied_this_round);
+        uint64_t condemned_rows = 0;
+        uint64_t pending_rows = 0;
+        for (const auto & [shard, summary] : result.fold_seal.condemned_summary)
+        {
+            condemned_rows += summary.condemned_total;
+            pending_rows += summary.pending_total;
+        }
+        reduce_timer->metric("condemned_rows", condemned_rows);
+        reduce_timer->metric("pending_rows", pending_rows);
     }
     reduce_timer.reset();   /// emits the `fold_reduce` row
 
@@ -3871,9 +4115,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS GC fold: {} ref transaction(s) folded and merged into the round buffers but NONE of "
             "their blob deltas reached a shard reducer ({}{}). The round would have advanced its "
-            "cursor past a transaction it never applied. GC refuses to commit the round; recover with "
-            "SYSTEM CAS GC REBUILD.",
-            unapplied_txns.size(), detail, unapplied_txns.size() > 8 ? ", ..." : "");
+            "cursor past a transaction it never applied. {}",
+            unapplied_txns.size(), detail, unapplied_txns.size() > 8 ? ", ..." : "", kCorruptBookkeeping);
     }
 
     /// PROBE B1's comparison. Both terms were derived at the end of the ref intake (see the
@@ -3883,11 +4126,10 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     if (logs_accounted_this_round != logs_applied_this_round)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS GC fold: the round sealed coverage over {} ref log(s) but only {} fully folded -- "
-            "a cursor advanced past a log this round never applied. GC refuses to commit the round; "
-            "recover with SYSTEM CAS GC REBUILD.",
-            logs_accounted_this_round, logs_applied_this_round);
+            "a cursor advanced past a log this round never applied. {}",
+            logs_accounted_this_round, logs_applied_this_round, kCorruptBookkeeping);
 
-    /// PHASE 10/18 `fold_seal_write`: one PUT (or, on a deterministic replay, a byte-compare GET).
+    /// Phase `fold_seal_write`: one PUT (or, on a deterministic replay, a byte-compare GET).
     {
         GcPhaseTimer t(phase_sink, "fold_seal_write");
         validateFoldSealForWrite(result.fold_seal, layout, store->poolConfig().gc_shards);
@@ -3935,7 +4177,7 @@ void Gc::reportSweepRetention(const ManifestSweepResult & result)
     /// budget-deferred candidates -- so measuring the top class against it would understate the class's
     /// share of the very number this sentence just reported.
     const uint64_t retained = result.retained_no_coverage + result.retained_hold
-        + result.retained_unconsumed_seal + result.retained_tail_removal;
+        + result.retained_unconsumed_seal + result.retained_tail_removal + result.retained_work_budget;
     LOG_INFO(logger,
         "CAS gc orphan sweep: retained {} manifest body(ies) this pass, most of them ({} of {}) for "
         "'{}' -- see the fold seal's coverage for that namespace; deleted {}, listed {}, skipped {}",
@@ -4016,7 +4258,7 @@ void Gc::cleanupRefObjects(
             try
             {
                 const CasRefCatalog::Snapshot current_catalog = CasRefCatalog::read(op, layout);
-                catalog_etag_differs = current_catalog.etag != folded.catalog_cut->etag;
+                catalog_etag_differs = !identicalToken(current_catalog.etag, folded.catalog_cut->etag);
                 current_catalog.life_index.throwIfAmbiguous("CAS GC ref cleanup revalidation");
                 const auto current_entry_it = std::lower_bound(
                     current_catalog.catalog.entries.begin(), current_catalog.catalog.entries.end(), ns,
@@ -4116,7 +4358,7 @@ void Gc::cleanupRefObjects(
                 return;
             size_t end = std::min(cohort.size(), begin + chunk_keys);
             if (work_budget.max_ref_cleanup_objects != 0)
-                end = std::min(end, begin + (work_budget.max_ref_cleanup_objects - work_budget.ref_cleanup_objects_used));
+                end = std::min<size_t>(end, begin + (work_budget.max_ref_cleanup_objects - work_budget.ref_cleanup_objects_used));
             std::vector<WriteOnceKey> chunk(cohort.begin() + begin, cohort.begin() + end);
             const RefCleanupVerdict verdict = licenceForChunk(chunk.front().str());
             if (verdict.licence == RefCleanupLicence::SkipNamespace)
@@ -4323,6 +4565,28 @@ std::optional<CasFoldSeal> Gc::readFoldSeal(uint64_t generation, uint64_t attemp
     return std::nullopt;
 }
 
+void Gc::throwIfStateMoved(CasOperation & op, const std::optional<Etag> & state_etag, const String & failure)
+{
+    if (!state_etag)
+        return;
+    std::optional<Meta> current;
+    try
+    {
+        current = op.head(store->layout().gcStateKey(), Retry::standard());
+    }
+    catch (...)
+    {
+        /// Without an answer nothing shows a newer leader, so the caller's own error stands.
+        tryLogCurrentException(logger, "CAS GC: could not read gc/state to tell a newer leader from corruption", LogsLevel::warning);
+        return;
+    }
+    if (current && sameVersion(current->etag, *state_etag))
+        return;
+    throw Exception(ErrorCodes::ABORTED,
+        "CAS gc round: gc/state moved during the round ({}); {}; retry next round",
+        current ? "another leader advanced it, observed " + current->etag.render() : String("the object is gone"), failure);
+}
+
 namespace
 {
 
@@ -4357,8 +4621,8 @@ std::optional<ParsedRefObjectKey> parseRefObjectKeyForEnumeration(const Layout &
 std::vector<NamespaceLifeId> Gc::discoverUniverse()
 {
     /// One catalog GET replaces the pool-wide `LIST(cas/ns/stream/)` this used to run to
-    /// discover WHICH namespaces exist. `Creating` entries are excluded -- spec §3, "no publication can
-    /// exist" while a namespace is still being created, so there is nothing here for a discovery path to
+    /// discover WHICH namespaces exist. `Creating` entries are excluded -- no publication can
+    /// exist while a namespace is still being created, so there is nothing here for a discovery path to
     /// walk; `Live` and `Removing` entries are both returned. `fromCatalogEntry` mints each life directly
     /// from the row that is its own authority for both fields, never from a listed key (which could name
     /// a DEAD incarnation of the same namespace name).
@@ -4370,15 +4634,14 @@ std::vector<NamespaceLifeId> Gc::discoverUniverse()
     return CasRefCatalog::liveUniverse(op, store->layout());
 }
 
-bool Gc::graduationDue(const GcState & state, uint64_t current_round)
+bool Gc::rowDecisionDue(const GcState & state, uint64_t current_round)
 {
-    /// Retired-in-snapshot: the graduation signal is read from the adopted fold seal's per-shard
-    /// `condemned_summary` — ZERO backend I/O beyond the single seal read. A summary distilled from this
-    /// generation's `RunMarker::Condemned` rows says, per shard, how many entries are `delete_pending` (a graduation
-    /// is already published) and the oldest non-pending condemn round (one crosses the floor once
-    /// `condemn_round < current_round`).
+    /// Retired-in-snapshot: the signal is read from the adopted fold seal's per-shard `condemned_summary` — ZERO
+    /// backend I/O beyond the single seal read. A summary distilled from this generation's `RunMarker::Condemned`
+    /// rows says, per shard, how many entries are `delete_pending` (`pending` or `standing`) and the oldest
+    /// condemn round of a `candidate` (due once `condemn_round < current_round`).
     if (state.snap_generation == 0)
-        return false;   /// fresh pool: nothing condemned yet, nothing to graduate.
+        return false;   /// fresh pool: nothing condemned yet, nothing to decide.
 
     /// FAIL-CLOSED: a missing / undecodable seal, or a summary that is not TOTAL over gc_shards, is
     /// corrupt GC bookkeeping — force a FOLD so the round's own fail-closed path surfaces it, never a
@@ -4448,7 +4711,7 @@ RefScanSummary Gc::enumerateRefPrefix()
     return scan;
 }
 
-RoundInput Gc::listRefPrefix(const GcState & state)
+RoundInput Gc::listRefPrefix(const GcState & state, const std::optional<Etag> & state_etag)
 {
     /// The round's ONE hint enumeration, followed by the parent coverage and authoritative catalog cut
     /// needed to build the DEFER/FOLD walk plan. The caller computes the DEFER signal from that frozen
@@ -4467,14 +4730,20 @@ RoundInput Gc::listRefPrefix(const GcState & state)
         std::swap(hook_to_run, post_hot_scan_catalog_read_hook_for_test);
         hook_to_run();
     }
+    if (round_point_hook_for_test)
+        runRoundPointHookForTest(RoundPointForTest::AfterCatalogRead);
     catalog_cut.life_index.throwIfAmbiguous("CAS GC hot scan");
     store->reconcileRefCatalogCut(catalog_cut);
 
     const std::optional<CasFoldSeal> seal = readFoldSeal(state.snap_generation, state.snap_attempt);
     if (!seal && state.snap_generation > 0)
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
+    {
+        const String failure = fmt::format(
             "CAS GC hot scan: adopted fold seal (generation {}, attempt {}) is missing",
             state.snap_generation, state.snap_attempt);
+        throwIfStateMoved(op, state_etag, failure);
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "{}", failure);
+    }
     if (seal)
         scan.parent_ref_lives = seal->ref_lives;
 
@@ -4533,6 +4802,9 @@ RebuildReport Gc::rebuildBaseline(bool force)
                 /// undecodable state = scenario (а)
             }
         }
+        if (decoded && decoded->header_generation < G_BLOB_INTENTS)
+            throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION, "gc/state is at generation {} in a generation 4 pool",
+                decoded->header_generation);
         if (decoded)
         {
             const GcState & st = *decoded;
@@ -4657,17 +4929,25 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// explicitly rather than rely on that invariant.
     GcState state;
     std::optional<Etag> state_etag;
-    if (!acquireOrRenewLease(state, state_etag, /*allow_steal=*/false))
+    bool claimed_never_held = false;
+    if (!acquireOrRenewLease(state, state_etag, /*allow_steal=*/false, &claimed_never_held))
     {
         rep.refusal = "another GC leader holds the lease";
         return rep;
     }
+    /// Gives back a lease this call claimed over a never-held one: a rebuild never steals, so a claim it kept
+    /// would make every later rebuild, each with a fresh identity, refuse as a competing leader.
+    bool baseline_installed = false;
+    SCOPE_EXIT({
+        if (claimed_never_held && !baseline_installed)
+            giveBackRebuildLease(op, state, *state_etag);
+    });
 
     /// Healthy `FORCE REBUILD` shares the same parent-authorized barrier as an ordinary round. A
     /// damaged-state rebuild has no adopted parent (`snap_generation == 0`) and the barrier performs
     /// zero catalog mutations. Only after that distinction is resolved do we complete the hot LIST and
     /// take the sole fresh work cut.
-    const CatalogLifecycleReconcileResult drain_result = drainCompletedRemoving(state);
+    const CatalogLifecycleReconcileResult drain_result = drainCompletedRemoving(state, state_etag);
     if (drain_result.authority_status != AuthorityStatus::Authoritative
         || drain_result.catalog_resolution != CatalogResolution::DrainComplete)
         throwCasWriteRetryLater("CAS GC rebuild lost authority before the catalog settled");
@@ -4759,27 +5039,20 @@ RebuildReport Gc::rebuildBaseline(bool force)
     std::vector<std::vector<BlobDelta>> buckets(gc_shards);
     std::vector<std::vector<RunRef>> prior_runs(gc_shards);
     std::vector<uint64_t> attempt_of(gc_shards, 0);
-    /// The fold is EDGE-ONLY here: a rebuild condemns nothing (spec §7, and the deletion below), so no
-    /// condemn round is stamped and no head source is supplied. `current_round` 0 graduates nothing and
-    /// `condemn_round` 0 with an empty `head_blob` mints no `RunMarker::Condemned` row -- this call is
-    /// `foldDeltasIntoGeneration`'s pure edge form.
+    /// The fold is EDGE-ONLY here: a rebuild condemns nothing, so no head source and no create hook is
+    /// supplied. Its prior runs are its own earlier flushes, which hold no row, so no blob reaches the intent
+    /// rules -- this call is `foldDeltasIntoGeneration`'s pure edge form.
     auto flush_shard = [&](uint64_t shard)
     {
         if (buckets[shard].empty())
             return;
-        std::vector<RunRef> out;
-        foldDeltasIntoGeneration(op, layout, prior_runs[shard], generation, ++attempt_of[shard],
-                                 shard, std::move(buckets[shard]), out,
-                                 /*current_round*/0, /*condemn_round*/0, /*head_blob*/{},
-                                 /*peek_head*/{}, /*confirm_condemned_marker*/{},
-                                 /*out_retired*/nullptr, /*suppress_destructive*/false,
-                                 /// Probe B2 does not apply to the rebuild: it derives edges from raw
-                                 /// owner STATE, not from a stream of ref transactions, so there is no
-                                 /// transaction whose deltas could go unapplied and no fold cursor to
-                                 /// advance past one. Every delta it emits carries ordinal 0.
-                                 /*out_applied_by_txn_ordinal*/nullptr);
+        /// No applied-delta ledger either: the rebuild derives edges from owner state, not from ref transactions.
+        RunRef run = foldDeltasIntoGeneration(op, layout, prior_runs[shard],
+                                              AdoptedRunContext{.gc_shards = gc_shards, .parent_round = state.round,
+                                                                .summary = CondemnedSummary{}},
+                                              generation, ++attempt_of[shard], shard, std::move(buckets[shard]));
         buckets[shard].clear();
-        prior_runs[shard] = std::move(out);
+        prior_runs[shard] = {std::move(run)};
     };
     auto route_deltas = [&](std::vector<BlobDelta> & deltas)
     {
@@ -4803,9 +5076,6 @@ RebuildReport Gc::rebuildBaseline(bool force)
     seal.generation = generation;
     seal.parent_generation = state.snap_generation;
     seal.ref_lives = rebuild_walk_plan.successorFoldStates();
-    /// Life ids whose hold this rebuild MINTED (see `minted_here`); they are stamped with the retry
-    /// round once it is known, and nothing else is touched.
-    std::set<UInt128> minted_hold_lives;
     uint64_t max_fence_round = 0;
     std::map<ManifestId, Etag> mf_cleanup_unused;
 
@@ -4842,18 +5112,13 @@ RebuildReport Gc::rebuildBaseline(bool force)
         const RefTableState & st = recovered->state;
 
         RefCoverage cov;
-        cov.classification = CoverageClass::Folded;   /// unless a bodiless precommit clamps it below
+        cov.classification = CoverageClass::Folded;   /// unless the prior seal's hold is carried below
         cov.last_folded_ref_id = st.getGreatestApplied();
-        /// Whether the hold on this row was minted BY THIS REBUILD (and so still owes a retry round)
-        /// rather than carried from the prior seal. Tracked explicitly instead of by looking for a
-        /// `next_retry_round` of 0: 0 is a perfectly good wire value, and a carried hold that happened
-        /// to hold it would have its backoff silently rewritten by the stamping pass.
-        bool minted_here = false;
 
         std::vector<BlobDelta> deltas;
 
         /// Committed owners: a missing/invalid body under a committed ref is DATA LOSS the rebuild must
-        /// not bless (INV_NO_DANGLE) -- refuse.
+        /// not bless -- refuse.
         for (const auto [ref_name, row] : st.getCommitted())
         {
             const ManifestId id{ns, row.manifest_ref};
@@ -4868,39 +5133,27 @@ RebuildReport Gc::rebuildBaseline(bool force)
             ++rep.committed_refs;
         }
 
-        /// Live precommits: a present body contributes edges; a bodiless one is non-activating and clamps
-        /// (the fold barrier -- the first regular round folds it once the body lands).
+        /// Live precommits: an owner like a committed ref, so its manifest must be readable. A rebuild
+        /// cannot hold the namespace until the body lands: the precommit's log is below the rebuilt cursor,
+        /// no round re-reads it, and its promote emits no edge.
         for (const auto & [ref_name, manifest_ref] : st.getPrecommits())
         {
             const ManifestId id{ns, manifest_ref};
             owned_manifest_keys.insert(layout.manifestKey(id));
-            if (foldManifestEdges(reads, id, +1, deltas, mf_cleanup_unused, /*txn_ordinal=*/0))
-                ++rep.live_precommits;
-            else
+            if (!foldManifestEdges(reads, id, +1, deltas, mf_cleanup_unused, /*txn_ordinal=*/0))
             {
-                /// A bodiless live precommit leaves the rebuilt baseline INCOMPLETE for this namespace:
-                /// nothing can enumerate the blobs it pins, so nothing can protect them. That is a
-                /// durable hold, not a report field -- and it is the one hold the rebuild has to invent
-                /// a position for, because it derives edges from owner STATE and cannot name the log
-                /// that introduced the precommit (that log is below the rebuilt cursor and no round
-                /// re-reads it). It holds at the FIRST POSITION THE NEXT ROUND WILL READ, which makes a
-                /// quiet namespace stay held indefinitely -- the fail-close answer while the body is
-                /// still missing -- and clears once the namespace makes durable progress.
-                /// RESIDUAL, named rather than hidden: progress unrelated to this precommit also clears
-                /// it, and the precommit's edges stay missing until another rebuild.
-                cov.classification = CoverageClass::Clamped;
-                cov.hold = RefHold{.reason = HoldReason::ManifestBodyMissing,
-                                   .offending_position = RefTxnId{cov.last_folded_ref_id.writer_epoch,
-                                                                 cov.last_folded_ref_id.ref_sequence + 1},
-                                   .retry_count = 0,
-                                   .next_retry_round = 0};   /// stamped below, once `round` is minted
-                minted_here = true;
-                ++rep.clamped_shards;
+                rep.refusal = "live precommit '" + ns.string() + "/" + ref_name + "' names part manifest "
+                    + layout.manifestKey(id) + ", which cannot be read, so the blobs it references cannot be "
+                      "counted. Its writer is still uploading the manifest or stopped before it did; retry after "
+                      "the writer finishes, or after its server mounts the table again and its stale-precommit "
+                      "sweep removes the precommit";
+                return rep;
             }
+            ++rep.live_precommits;
         }
         route_deltas(deltas);
 
-        /// HOLDS RIDE THROUGH A REBUILD VERBATIM (spec §5/§7). The rebuild derives coverage from owner
+        /// HOLDS RIDE THROUGH A REBUILD VERBATIM. The rebuild derives coverage from owner
         /// state, which knows nothing about a ref-log position that would not resolve -- so without
         /// this every held row would be overwritten by a clean one and the rebuilt baseline would claim
         /// a frontier proof it does not have. `retry_count` and `next_retry_round` ride unchanged too:
@@ -4913,11 +5166,8 @@ RebuildReport Gc::rebuildBaseline(bool force)
             {
                 cov.classification = CoverageClass::Clamped;
                 cov.hold = pit->second.coverage.hold;
-                minted_here = false;   /// a carried hold rides VERBATIM; its retry fields are not ours
             }
         }
-        if (minted_here)
-            minted_hold_lives.insert(life.incarnation);
 
         RefLifeFoldState & row = seal.ref_lives.at(life.incarnation);
         row.coverage = cov;
@@ -4956,7 +5206,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
         }, Retry::standard(), CasOperation::kCasListPageKeys, onGcEnumerationPage);
     }
 
-    /// A REBUILD CONDEMNS NOTHING (spec §7).
+    /// A REBUILD CONDEMNS NOTHING.
     ///
     /// It used to end here with a LIST of `blobs/`, condemning every listed body its traversal had not
     /// reached ("pipeline blindness repair": the fold discovers candidates by TRANSITIONS to zero, so a
@@ -4978,15 +5228,6 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// Numbering, part 2: the round above every surviving fence/state/generation number.
     const uint64_t round = std::max({max_fence_round, state.round, max_gen}) + 1;
 
-    /// Stamp the retry round on the holds THIS rebuild minted (the bodiless-precommit ones, left unset
-    /// because the round was not minted yet). Carried holds are named by no key here and are not
-    /// touched: their `next_retry_round` and `retry_count` ride verbatim, since a rebuild retries
-    /// nothing.
-    for (const UInt128 life_id : minted_hold_lives)
-        if (const auto it = seal.ref_lives.find(life_id);
-            it != seal.ref_lives.end() && it->second.coverage.hold)
-            it->second.coverage.hold->next_retry_round = round + 1;
-
     for (uint64_t shard = 0; shard < gc_shards; ++shard)
         flush_shard(shard);   /// real-edge rows only: a rebuild condemns nothing, so it seeds nothing
 
@@ -4995,14 +5236,14 @@ RebuildReport Gc::rebuildBaseline(bool force)
             seal.blob_target_runs.push_back(r);
 
     /// Also fence out any dead mounts as part of the disaster-recovery pass (liveness cleanup; the
-    /// returned classification counts are not needed for the round mint — graduation paces on rounds).
+    /// returned classification counts are not needed for the round mint — row decisions pace on rounds).
     /// Use the same threshold/`mount_obs` as the regular round.
     const uint64_t ttl_ms = static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count());
     const uint64_t renew_period_ms = static_cast<uint64_t>(store->poolConfig().mount_renew_period.count());
     computeHeartbeatFloor(op, layout, now_ms_fn(), mono_ms_fn, ttl_ms, renew_period_ms, mount_obs, lease_mismatch_warned);
 
     /// Retired-in-snapshot: the rebuilt seal's `condemned_summary` must be TOTAL over gc_shards so a
-    /// subsequent regular round reads graduation/carry decisions zero-I/O off it (and its `carryParentRefs`
+    /// subsequent regular round reads row-decision/carry decisions zero-I/O off it (and its `carryParentRefs`
     /// totality check does not fail closed). Every entry is EMPTY -- a rebuild condemns nothing -- and
     /// the totality is still owed: an ABSENT row and a zero row are different claims, and the round that
     /// reads this seal fails closed on the absent one.
@@ -5026,6 +5267,8 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// family independently of that, and the two reasons are stated apart on purpose — a future reader
     /// must not take this line as evidence that REBUILD still produces condemnations somewhere.
     next.manifest_sweep_cursor = "";
+    /// The rebuilt state has no row, so every intent is an orphan again; the sweep starts over to meet each.
+    next.intent_sweep_cursor = "";
     WriteResult commit = op.replace(layout.gcStateKey(), encodeGcState(next), *state_etag,
                                     Retry::standard());
     if (std::holds_alternative<Conflict>(commit))
@@ -5034,6 +5277,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
         return rep;
     }
     orThrow(std::move(commit), "CAS gc rebuild: gc/state commit");
+    baseline_installed = true;
 
     rep.performed = true;
     rep.round = round;
@@ -5058,81 +5302,86 @@ RebuildReport Gc::rebuildBaseline(bool force)
     return rep;
 }
 
-std::vector<Gc::PreviewEntry> Gc::previewDeletes()
+Gc::DeletePreview Gc::previewDeletes()
 {
-    std::vector<PreviewEntry> out;
-
     CasOperation op = store->openRequests().admit();
-    const auto state_bytes = op.read(store->layout().gcStateKey(), Retry::standard());
-    if (!state_bytes)
-        return out;
-    const GcState state = decodeGcState(state_bytes->bytes);
-
     const Layout & layout = store->layout();
 
-    /// Resolve the run objects THROUGH the adopted seal's refs, never by
-    /// `blobTargetRunKey` construction: with reference-parent carry a shard's current run may physically
-    /// live under an older generation's key, and the seal ref is the only authority for the real key.
-    /// Group the adopted `blob_target_runs` by the ref's explicit `shard`. Absent seal => no candidates.
-    std::map<uint64_t, std::vector<RunRef>> runs_by_shard;
-    if (const auto adopted = readFoldSeal(state.snap_generation, state.snap_attempt))
-        for (const RunRef & r : adopted->blob_target_runs)
-            runs_by_shard[r.shard].push_back(r);
-
-    /// Scan every blob-target shard (see `retire`): a preview that only looked at shard 0 would miss the
-    /// zero-in-degree candidates owned by shards 1..N under `gc_shards > 1`.
-    for (uint64_t shard = 0; shard < state.gc_shards; ++shard)
+    const auto preview_of = [&](const GcState & state)
     {
-        const auto it = runs_by_shard.find(shard);
-        static const std::vector<RunRef> kEmptyRuns;
-        const std::vector<RunRef> & shard_runs = it != runs_by_shard.end() ? it->second : kEmptyRuns;
-        for (const BlobCandidate & cand : zeroInDegree(op, shard_runs))
+        DeletePreview preview;
+        /// Resolve the run objects THROUGH the adopted seal's refs, never by
+        /// `blobTargetRunKey` construction: with reference-parent carry a shard's current run may physically
+        /// live under an older generation's key, and the seal ref is the only authority for the real key.
+        /// Group the adopted `blob_target_runs` by the ref's explicit `shard`. Absent seal => no candidates.
+        std::map<uint64_t, std::vector<RunRef>> runs_by_shard;
+        std::map<uint64_t, CondemnedSummary> summaries;
+        if (const auto adopted = readFoldSeal(state.snap_generation, state.snap_attempt))
         {
-            const std::optional<Meta> observed = op.head(layout.blobKey(cand.ref), Retry::standard());
-            if (!observed)
-                continue;
-            PreviewEntry e;
-            e.kind = ObjectKind::Blob;
-            e.ref = cand.ref;
-            e.key = layout.blobKey(cand.ref);
-            e.size = observed->size;
-            e.reason = "unreachable";
-            out.push_back(std::move(e));
+            for (const RunRef & r : adopted->blob_target_runs)
+                runs_by_shard[r.shard].push_back(r);
+            summaries = adopted->condemned_summary;
         }
 
-        /// Retired-in-snapshot: stream the SAME adopted seal runs and emit every `RunMarker::Condemned`
-        /// sentinel row. The stored incarnation IS the authority — no observation here (one would defeat
-        /// the point and cost I/O). `delete_pending` rows are deleted next fold; the rest await graduation. Preview
-        /// stays WRITE-FREE (`openSourceEdgeRun` is a pure reader). Output is a superset of the above.
-        for (const RunRef & run : shard_runs)
+        /// Every shard, read the way a round reads it: a shard the round would refuse adds no row and is named instead.
+        for (uint64_t shard = 0; shard < state.gc_shards; ++shard)
         {
-            SourceEdgeRunView reader = openSourceEdgeRun(op, run.key);
-            String key;
-            String payload;
-            while (reader.next(key, payload))
+            const AdoptedShardPreview rows = previewAdoptedShard(op, runs_by_shard[shard], shard,
+                AdoptedRunContext{.gc_shards = state.gc_shards, .parent_round = state.round, .summary = summaries[shard]});
+            if (rows.refusal)
             {
-                if (payload.empty() || runMarkerFromByte(payload[0], "CAS source-edge run") != RunMarker::Condemned)
-                    continue;
-                BlobRef ref;
-                UInt128 source_id;
-                SourceEdgeKeyCodec::parse(key, ref, source_id);   // throws CORRUPTED_DATA on a malformed key
-                const CondemnedRow row = decodeCondemnedRow(payload);
-                PreviewEntry e;
-                e.kind = ObjectKind::Blob;
-                e.ref = ref;
-                e.key = layout.blobKey(ref);
-                e.size = row.size;
-                e.token = row.token;
-                e.condemn_round = row.condemn_round;
-                e.reason = row.delete_pending ? "delete_pending" : "awaiting_graduation";
-                out.push_back(std::move(e));
+                preview.refused_shards.push_back(rows.refusal->message);
+                continue;
             }
-            /// Whole-file seal-checksum: verify the drained run before its condemned
-            /// rows are trusted in the preview. Fail-closed on mismatch.
-            reader.verifyAgainst(run.checksum);
+            for (const BlobRef & ref : rows.zero)
+            {
+                const std::optional<Meta> observed = op.head(layout.blobKey(ref), Retry::standard());
+                if (!observed)
+                    continue;
+                preview.deletes.push_back(PreviewEntry{.kind = ObjectKind::Blob, .ref = ref, .key = layout.blobKey(ref),
+                    .size = observed->size, .reason = "unreachable", .token = {}, .condemn_round = 0});
+            }
+            /// A condemned row carries the incarnation it condemned, so it needs no observation.
+            for (const SourceEdgeRecord & rec : rows.condemned)
+            {
+                if (!rec.standing)
+                {
+                    preview.deletes.push_back(PreviewEntry{.kind = ObjectKind::Blob, .ref = rec.ref, .key = layout.blobKey(rec.ref),
+                        .size = rec.size, .reason = rec.delete_pending ? "pending" : "candidate", .token = rec.token,
+                        .condemn_round = rec.condemn_round});
+                    continue;
+                }
+                /// The next round removes the intent of a standing row's token, if it names one; no `HEAD` is sent here.
+                const std::optional<CanonicalIdentity> identity = rec.token.canonical();
+                if (!identity)
+                    continue;
+                preview.deletes.push_back(PreviewEntry{.kind = ObjectKind::Blob, .ref = rec.ref,
+                    .key = layout.blobIntentKey(rec.ref, *identity), .size = blobIntentRecord().size(), .reason = "standing",
+                    .token = rec.token, .condemn_round = rec.condemn_round});
+            }
+        }
+        return preview;
+    };
+
+    for (size_t attempt = 1;; ++attempt)
+    {
+        const auto state_bytes = op.read(layout.gcStateKey(), Retry::standard());
+        if (!state_bytes)
+            return {};
+        DeletePreview preview = preview_of(decodeGenerationFourGcState(state_bytes->bytes));
+        if (preview.refused_shards.empty())
+            return preview;
+        /// A refusal is the round's only under the `gc/state` it was read under: a newer round may have pruned the run.
+        const std::optional<Meta> state_now = op.head(layout.gcStateKey(), Retry::standard());
+        if (state_now && sameVersion(state_now->etag, state_bytes->etag))
+            return preview;
+        if (attempt == kAdoptedSnapshotReadAttempts)
+        {
+            DeletePreview unread;
+            unread.unread = fmt::format("gc/state moved during each of {} reads of the GC snapshot, so its rows were not read", attempt);
+            return unread;
         }
     }
-    return out;
 }
 
 void Gc::rememberObservation(const GcLease & lease)
@@ -5182,7 +5431,8 @@ void Gc::pulseHeartbeat(Pool & store, UInt128 gc_id)
         op.create(key, body, Retry::once());
 }
 
-bool Gc::acquireOrRenewLease(GcState & state, std::optional<Etag> & state_etag, bool allow_steal)
+bool Gc::acquireOrRenewLease(GcState & state, std::optional<Etag> & state_etag, bool allow_steal,
+                             bool * claimed_never_held)
 {
     CasOperation op = store->openRequests().admit();
     const String key = store->layout().gcStateKey();
@@ -5191,9 +5441,11 @@ bool Gc::acquireOrRenewLease(GcState & state, std::optional<Etag> & state_etag, 
     /// against what the losing write's own resolve read observed, so the last decision is the committed
     /// one, and a competing leader's write makes the next decision see a moved lease tuple.
     GcState decided;
+    bool decided_never_held = false;
     const std::optional<Etag> committed = orThrow(op.readModifyWrite(key,
         [&](const std::optional<Object> & current_object) -> std::optional<String>
     {
+        decided_never_held = false;
         if (!current_object)
         {
             if (has_observation)
@@ -5208,10 +5460,11 @@ bool Gc::acquireOrRenewLease(GcState & state, std::optional<Etag> & state_etag, 
             /// PoolConfig carries the configured value from the disk XML.
             fresh.gc_shards = store->poolConfig().gc_shards;
             decided = fresh;
+            decided_never_held = true;
             return encodeGcState(fresh);
         }
 
-        const GcState current = decodeGcState(current_object->bytes);
+        const GcState current = decodeGenerationFourGcState(current_object->bytes);
         if (current.gc_shards != store->poolConfig().gc_shards)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "CAS gc/state gc_shards {} disagrees with the pool-authoritative _pool_meta value {}",
@@ -5222,6 +5475,18 @@ bool Gc::acquireOrRenewLease(GcState & state, std::optional<Etag> & state_etag, 
             GcState next = current;
             ++next.lease.seq;
             decided = next;
+            return encodeGcState(next);
+        }
+
+        /// Owner 0 with seq 0 is a lease nobody holds: the migration tool creates `gc/state` so, and a refused
+        /// rebuild gives its claim back to it. No incumbent can be alive, so any caller claims it, and the
+        /// conditional write admits one claimant.
+        if (current.lease.owner == UInt128(0) && current.lease.seq == 0)
+        {
+            GcState next = current;
+            next.lease = GcLease{gc_id, 1};
+            decided = next;
+            decided_never_held = true;
             return encodeGcState(next);
         }
 
@@ -5253,9 +5518,8 @@ bool Gc::acquireOrRenewLease(GcState & state, std::optional<Etag> & state_etag, 
             /// loop's own very next tick treat THIS snapshot as one half of ITS two-observation window,
             /// without the real wall-time gap (>= H) the window's safety argument requires between the
             /// loop's own ticks (a manual command can land microseconds before a scheduled tick). Leaving
-            /// last_seen_* untouched here restores the pre-A7 invariant exactly: the frozen-tuple
-            /// comparison that can actually trigger a steal is only ever between two LOOP observations,
-            /// always >= interval apart.
+            /// last_seen_* untouched here keeps the frozen-tuple comparison that can trigger a steal
+            /// between two LOOP observations only, always >= interval apart.
             if (allow_steal)
             {
                 rememberObservation(current.lease);
@@ -5278,7 +5542,43 @@ bool Gc::acquireOrRenewLease(GcState & state, std::optional<Etag> & state_etag, 
     rememberObservation(decided.lease);
     state = std::move(decided);
     state_etag = committed;
+    if (claimed_never_held)
+        *claimed_never_held = decided_never_held;
     return true;
+}
+
+void Gc::giveBackRebuildLease(CasOperation & op, const GcState & claimed, const Etag & claim_etag) noexcept
+{
+    const auto warn = [&](const String & why)
+    {
+        LOG_WARNING(logger,
+            "CAS GC rebuild refused but could not give back its GC lease (owner {}, seq {}): {}. If gc/state still "
+            "holds that lease, the next rebuild reports 'another GC leader holds the lease'",
+            u128ToHex(claimed.lease.owner), claimed.lease.seq, why);
+    };
+    try
+    {
+        GcState restored = claimed;
+        restored.lease = GcLease{};
+        const WriteResult written = op.replace(store->layout().gcStateKey(), encodeGcState(restored), claim_etag,
+                                               Retry::once());
+        if (std::holds_alternative<Conflict>(written))
+            warn("gc/state changed after the claim");
+        else if (!std::holds_alternative<Committed>(written))
+            warn("the conditional write was not committed");
+    }
+    catch (...)
+    {
+        /// The warning allocates, and an exception that escapes this `noexcept` function terminates the process.
+        try
+        {
+            warn(getCurrentExceptionMessage(/*with_stacktrace=*/false));
+        }
+        catch (...)
+        {
+            tryLogCurrentException(logger, "CAS GC rebuild refused but could not give back its GC lease");
+        }
+    }
 }
 
 void Gc::OutcomeTally::add(OutcomeKind kind)
@@ -5292,13 +5592,14 @@ void Gc::OutcomeTally::add(OutcomeKind kind)
     }
 }
 
-CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(const GcState & leased_state)
+CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(const GcState & leased_state, const std::optional<Etag> & leased_etag)
 {
     uint64_t completed_erases = 0;
-    return drainCompletedRemoving(leased_state, completed_erases);
+    return drainCompletedRemoving(leased_state, leased_etag, completed_erases);
 }
 
-CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(const GcState & leased_state, uint64_t & completed_erases)
+CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(
+    const GcState & leased_state, const std::optional<Etag> & leased_etag, uint64_t & completed_erases)
 {
     if (leased_state.snap_generation == 0)
         return {
@@ -5309,9 +5610,14 @@ CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(const GcState & lease
     const std::optional<CasFoldSeal> parent = readFoldSeal(
         leased_state.snap_generation, leased_state.snap_attempt);
     if (!parent)
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
+    {
+        const String failure = fmt::format(
             "CAS GC pre-fold drain: adopted parent seal (generation {}, attempt {}) is missing",
             leased_state.snap_generation, leased_state.snap_attempt);
+        CasOperation probe = store->openRequests().admit();
+        throwIfStateMoved(probe, leased_etag, failure);
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "{}", failure);
+    }
 
     /// The drain erases catalog rows, so its operation carries this leader's authority as its
     /// liveness: `CatalogLifecycleReconciler` and `deleteCompletedRemovingAtSnapshot` decide

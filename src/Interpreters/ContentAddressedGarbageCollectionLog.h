@@ -43,11 +43,11 @@ struct ContentAddressedGarbageCollectionLogElement
     UInt64 objects_spared = 0;
     UInt64 manifests_deleted = 0;   /// owner-removed manifest bodies deleted (B11 — distinct from blob deletes)
     UInt64 entries_condemned = 0;   /// retired-cursor pipeline: entries newly condemned this round
-    UInt64 entries_graduated = 0;   /// retired-cursor pipeline: entries newly round-passed (delete_pending) this round
-    UInt64 entries_redeleted = 0;   /// retired-cursor pipeline: pending exact-token blob deletes executed this round
-    /// Counts one failed `HEAD`, conditional `DELETE`, or refused re-delete enqueue
-    /// per affected `delete_pending` entry.
-    UInt64 entries_redelete_failed = 0;
+    UInt64 entries_intent_confirmed = 0;   /// rows committed `pending` this round (intent created or found, and confirmed)
+    UInt64 entries_bodies_deleted = 0;   /// exact-token deletes of blob bodies of `pending` rows answered this round
+    /// Counts one failed `HEAD`, conditional `DELETE`, or refused body-delete enqueue
+    /// per affected `pending` row.
+    UInt64 entries_body_delete_failed = 0;
     UInt64 fence_outs = 0;          /// expired mounts fenced-out by the round's heartbeat floor
     UInt64 anomalies = 0;           /// fold clamps surfaced this round
     UInt64 duration_ms = 0;
@@ -62,7 +62,7 @@ struct ContentAddressedGarbageCollectionLogElement
 
     static std::string name() { return "ContentAddressedGarbageCollectionLog"; }
     static ColumnsDescription getColumnsDescription();
-    static NamesAndAliases getNamesAndAliases() { return {}; }
+    static NamesAndAliases getNamesAndAliases();
     void appendToBlock(MutableColumns & columns) const;
 };
 

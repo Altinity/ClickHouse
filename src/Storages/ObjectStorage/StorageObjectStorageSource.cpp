@@ -107,6 +107,7 @@ namespace DB
 namespace FailPoints
 {
 extern const char object_storage_source_pause_before_virtual_columns[];
+extern const char swarm_mode_before_task_request[];
 }
 
 namespace ErrorCodes
@@ -1938,7 +1939,8 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     const ContextPtr & context_,
     const LoggerPtr & log,
     const std::optional<ReadSettings> & read_settings,
-    bool allow_page_cache)
+    bool allow_page_cache,
+    bool pin_to_metadata_etag)
 {
     const auto & settings = context_->getSettingsRef();
     const auto & effective_read_settings = read_settings.has_value() ? read_settings.value() : context_->getReadSettings();
@@ -2067,7 +2069,9 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     /// Pin the read to the object generation seen here (etag from the LIST/HEAD): a GET with a
     /// different ETag means an in-place overwrite, reported as S3_OBJECT_CHANGED_DURING_READ or
     /// AZURE_OBJECT_CHANGED_DURING_READ instead of torn cross-generation data.
-    if (validate_etag_on_read && object_info.metadata.has_value())
+    /// `pin_to_metadata_etag` is independent of the backend setting: a caller that will cache the
+    /// bytes under this etag cannot opt out of the pin.
+    if (object_info.metadata.has_value() && (validate_etag_on_read || pin_to_metadata_etag))
         stored_object.etag = object_info.metadata->etag;
     pipeline.setSource(object_storage, StoredObjects{stored_object}, modified_read_settings);
 
@@ -2542,8 +2546,15 @@ ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::takeNextObject(bool 
 {
     while (true)
     {
-        /// Recheck after each `retry_after_us` wait. `SYSTEM STOP SWARM MODE` during that wait
-        /// must not be followed by another task request.
+        /// Test-only pause before the next task request. A concurrent `SYSTEM STOP SWARM MODE`
+        /// must complete before this worker asks the initiator for another task.
+        fiu_do_on(FailPoints::swarm_mode_before_task_request, {
+            FailPointInjection::notifyPauseAndWaitForResume(FailPoints::swarm_mode_before_task_request);
+        });
+
+        /// Recheck after each `retry_after_us` wait. The read-task callback checks again under
+        /// the admission lock before it sends, so a stop that lands after this check still
+        /// does not produce a request.
         if (!getContext()->isSwarmModeEnabled())
         {
             LOG_DEBUG(getLogger("StorageObjectStorageSource"), "STOP SWARM MODE called, stop getting new tasks");

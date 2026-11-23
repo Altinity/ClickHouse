@@ -56,6 +56,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"enable_sharding_aggregator", false, false, "Obsolete setting, the sharded aggregator has been removed in favor of the adaptive aggregator (`enable_adaptive_aggregator`)."},
             {"input_format_parquet_detect_variant_by_structure", false, true, "New setting to read Spark variant columns, which have no `VARIANT` logical type, as `Dynamic` instead of `Tuple`"},
             {"use_iceberg_manifest_list_partition_pruning", false, true, "New setting to skip Iceberg manifest files whose manifest-list partition summaries cannot match the query filter, without reading them."},
+            {"allow_experimental_iceberg_add_files", false, false, "New setting to gate the experimental Iceberg command `ALTER TABLE ... EXECUTE add_files`."},
         });
         addSettingsChanges(settings_changes_history, "26.8.27.20001.altinityantalya",
         {
