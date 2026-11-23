@@ -31,6 +31,7 @@
 #include <aws/s3/model/Delete.h>
 #include <aws/s3/model/ObjectIdentifier.h>
 
+#include <Common/HostResolvePool.h>
 #include <Common/ProfileEvents.h>
 #include <Common/RemoteHostFilter.h>
 #include <IO/ReadBufferFromS3.h>
@@ -2137,6 +2138,92 @@ TEST(IOTestAwsS3Client, CredentialCapDoesNotAffectDataPlaneTimeouts)
     auto credential = DB::S3::getCredentialAcquisitionTimeouts(data_plane);
     EXPECT_EQ(credential.receive_timeout, Poco::Timespan(DB::S3::DEFAULT_CREDENTIAL_REQUEST_TIMEOUT_MS * 1000));
     EXPECT_EQ(credential.connection_timeout, Poco::Timespan(10, 0));
+}
+
+/// Regression test: under `http_latency_aware_host_selection`, fast-fail / error HTTP responses
+/// (`4xx`/`5xx`) on `GET` and `HEAD` must not feed `HostResolver::reportLatency` (which would bias
+/// selection towards unhealthy or throttling front-ends), whereas `2xx` responses (`200`, `206`) do.
+TEST(IOTestAwsS3Client, LatencyAwareSelectionIgnoresNon2xxReadResponses)
+{
+    DB::HostResolver::setLatencyAwareSelection(true);
+    SCOPE_EXIT({
+        DB::HostResolver::setLatencyAwareSelection(false);
+        DB::HostResolversPool::instance().dropCache();
+        DB::HTTPConnectionPools::instance().dropCache();
+    });
+
+    const std::vector<ScriptedResponse> script{
+        {Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR, {}},
+        {Poco::Net::HTTPResponse::HTTP_SERVICE_UNAVAILABLE, {}},
+        {Poco::Net::HTTPResponse::HTTP_NOT_FOUND, {}},
+        {Poco::Net::HTTPResponse::HTTP_FORBIDDEN, {}},
+        {Poco::Net::HTTPResponse::HTTP_OK, {}},
+        {Poco::Net::HTTPResponse::HTTP_PARTIAL_CONTENT, {}},
+    };
+    ScriptedResponseServer server(script);
+
+    const Poco::URI server_uri(server.getUrl());
+    const String test_host = "latency-feedback-status-test.invalid";
+    const Poco::Net::IPAddress server_ip("127.0.0.1");
+
+    struct ResolveMock : public DB::HostResolver
+    {
+        using ResolveFunction = DB::HostResolver::ResolveFunction;
+        ResolveMock(String h, Poco::Timespan history_, ResolveFunction f)
+            : DB::HostResolver(std::move(f), std::move(h), history_)
+        {}
+    };
+
+    auto mock_resolver = std::make_shared<ResolveMock>(
+        test_host,
+        Poco::Timespan(60 * 1000 * 1000),
+        [server_ip](const String &) -> std::vector<Poco::Net::IPAddress> { return {server_ip}; });
+    DB::HostResolversPool::instance().injectResolverForTest(test_host, mock_resolver);
+
+    const std::string endpoint = "http://" + test_host + ":" + std::to_string(server_uri.getPort());
+    auto client = makeRecordingClient(endpoint, /*max_retries=*/0, /*max_redirects=*/0, /*http_client=*/"");
+
+    auto sendGet = [&]
+    {
+        DB::S3::GetObjectRequest req;
+        req.SetBucket("bucket");
+        req.SetKey("key");
+        return client->GetObject(req);
+    };
+    auto sendHead = [&]
+    {
+        DB::S3::HeadObjectRequest req;
+        req.SetBucket("bucket");
+        req.SetKey("key");
+        return client->HeadObject(req);
+    };
+
+    /// 500 and 503 on GET: must not record any latency sample.
+    EXPECT_FALSE(sendGet().IsSuccess());
+    EXPECT_EQ(0.0, mock_resolver->getLatencyMs(server_ip));
+
+    EXPECT_FALSE(sendGet().IsSuccess());
+    EXPECT_EQ(0.0, mock_resolver->getLatencyMs(server_ip));
+
+    /// 404 and 403 on HEAD: must not record any latency sample either.
+    EXPECT_FALSE(sendHead().IsSuccess());
+    EXPECT_EQ(0.0, mock_resolver->getLatencyMs(server_ip));
+
+    EXPECT_FALSE(sendHead().IsSuccess());
+    EXPECT_EQ(0.0, mock_resolver->getLatencyMs(server_ip));
+
+    /// 200 on HEAD: records a positive latency sample.
+    EXPECT_TRUE(sendHead().IsSuccess());
+    const double ewma_after_200 = mock_resolver->getLatencyMs(server_ip);
+    EXPECT_GT(ewma_after_200, 0.0);
+
+    /// Seed a high EWMA and verify a fast 206 Partial Content on GET updates (lowers) it.
+    mock_resolver->reportLatency(server_ip, 5'000'000); /// 5000 ms
+    const double ewma_seeded = mock_resolver->getLatencyMs(server_ip);
+    EXPECT_GT(ewma_seeded, 500.0);
+
+    EXPECT_TRUE(sendGet().IsSuccess());
+    EXPECT_LT(mock_resolver->getLatencyMs(server_ip), ewma_seeded);
 }
 
 #endif

@@ -729,16 +729,26 @@ void PocoHTTPClient::makeRequestInternalImpl(
             /// Measure time-to-first-byte: the wait for and read of the response status line and
             /// headers. This isolates request latency (network RTT + server/backend first-byte
             /// time) from the connect and body-transfer phases, and is fed back per resolved
-            /// address to drive latency-aware host selection when it is enabled. Only `GET` and `HEAD`
-            /// are fed back: for a request with a body the wait also covers the server-side processing
-            /// of the upload (for example `CompleteMultipartUpload`), which is not a property of the address.
+            /// address to drive latency-aware host selection when it is enabled. Only successful
+            /// (`2xx`) `GET` and `HEAD` responses are fed back: for a request with a body the wait
+            /// also covers the server-side processing of the upload (for example
+            /// `CompleteMultipartUpload`), and error or fast-fail responses (`4xx`/`5xx`, such as
+            /// edge throttling, `404` existence probes, or unhealthy front-ends returning `500`/
+            /// `503` without consulting storage) complete much faster than real storage reads and
+            /// would otherwise create positive feedback towards failing or misbehaving addresses.
             Stopwatch first_byte_watch;
             auto & response_body_stream = session->receiveResponse(poco_response);
             const UInt64 first_byte_us = first_byte_watch.elapsedMicroseconds();
 
+            watch.stop();
+            addMetric(request, S3MetricType::Microseconds, watch.elapsedMicroseconds());
+
+            int status_code = static_cast<int>(poco_response.getStatus());
+
             const bool is_read_request = request.GetMethod() == Aws::Http::HttpMethod::HTTP_GET
                 || request.GetMethod() == Aws::Http::HttpMethod::HTTP_HEAD;
-            if (is_read_request && HostResolver::latencyAwareSelectionEnabled() && proxy_configuration.isEmpty())
+            const bool is_success_status = status_code >= SUCCESS_RESPONSE_MIN && status_code <= SUCCESS_RESPONSE_MAX;
+            if (is_read_request && is_success_status && HostResolver::latencyAwareSelectionEnabled() && proxy_configuration.isEmpty())
             {
                 Poco::Net::IPAddress resolved_ip;
                 const std::string resolved_host = session->getResolvedHost();
@@ -752,11 +762,6 @@ void PocoHTTPClient::makeRequestInternalImpl(
                         resolver->reportLatency(resolved_ip, first_byte_us);
                 }
             }
-
-            watch.stop();
-            addMetric(request, S3MetricType::Microseconds, watch.elapsedMicroseconds());
-
-            int status_code = static_cast<int>(poco_response.getStatus());
 
             if (status_code >= SUCCESS_RESPONSE_MIN && status_code <= SUCCESS_RESPONSE_MAX)
             {
