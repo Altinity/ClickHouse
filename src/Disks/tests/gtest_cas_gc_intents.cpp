@@ -3715,11 +3715,13 @@ class MissedWriterPool
 {
 public:
     MissedWriterPool(const String & ns_w_, const std::vector<String> & copy_namespaces, const String & payload_,
-                     uint64_t gc_shards = 1)
+                     uint64_t gc_shards = 1, uint64_t create_budget = 0, uint64_t io_concurrency = 1)
         : ns_w(ns_w_), payload(payload_), x(idOf(payload_))
     {
-        PoolConfig config{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0, .gc_io_concurrency = 1};
+        PoolConfig config{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0,
+                          .gc_io_concurrency = io_concurrency};
         config.gc_shards = gc_shards;
+        config.gc_round_intent_create_budget = create_budget;
         store = Pool::open(backend, std::move(config));
         body_key = store->layout().blobKey(x);
         gc = std::make_unique<Gc>(store, kGateLeaderA);
@@ -4089,6 +4091,474 @@ TEST(CASGcIntentsRelay, NoBytesCopyInANonZeroShardKeepsTheBody)
     ASSERT_NO_FATAL_FAILURE(pool.commitPendingUnderAMissedWriter());
     pool.relayRound("test/a_copy", "test/b_source", "copy", "test/b_source", "w");
     expectRowOutcome(pool.row(), /*carried=*/true, pool.t);
+}
+
+namespace
+{
+
+/// One cell of the planning-gap matrix: a no-bytes copy and the drop of its source land after the stop of one life of
+/// the pair is fixed and before the other's.
+struct PlanningGapCell
+{
+    enum class Row : uint8_t { None, Candidate, Pending, Standing };
+
+    /// The event always lands right after the first life's stop is read absent. At `gc_io_concurrency` 16 planning
+    /// starts by reading ahead, on workers, every first key setup already knows; a quiet life's stop is that answer,
+    /// a hot life's is fixed by reads in its own turn.
+    enum class Schedule : uint8_t
+    {
+        /// `gc_io_concurrency` 1: before any read of the second life.
+        Sequential,
+        /// 16: the read ahead of the second life's first key is still outstanding and is served after the event.
+        ReadAheadOutstanding,
+        /// 16: the read ahead of the second life's first key was served before the event and is not yet taken.
+        ReadAheadAnswered,
+    };
+
+    uint64_t gc_shards;
+    /// The blob's row while the writer's part names the blob.
+    Row row;
+    /// Two hops in consecutive rounds, source to middle to last; otherwise one hop, source to last.
+    bool relay;
+    /// The source is dropped after the round of its copy; otherwise right after the copy, inside the gap.
+    bool drop_after_the_round;
+    /// The destination's namespace sorts first, so planning reaches it first; otherwise the source's does.
+    bool destination_first;
+    Schedule schedule;
+};
+
+const char * planningGapScheduleName(PlanningGapCell::Schedule schedule)
+{
+    switch (schedule)
+    {
+        case PlanningGapCell::Schedule::Sequential: return "Sequential";
+        case PlanningGapCell::Schedule::ReadAheadOutstanding: return "ReadAheadOutstanding";
+        case PlanningGapCell::Schedule::ReadAheadAnswered: return "ReadAheadAnswered";
+    }
+    return "?";
+}
+
+const char * planningGapRowName(PlanningGapCell::Row row)
+{
+    switch (row)
+    {
+        case PlanningGapCell::Row::None: return "NoRow";
+        case PlanningGapCell::Row::Candidate: return "Candidate";
+        case PlanningGapCell::Row::Pending: return "Pending";
+        case PlanningGapCell::Row::Standing: return "Standing";
+    }
+    return "?";
+}
+
+String planningGapCellName(const ::testing::TestParamInfo<PlanningGapCell> & param_info)
+{
+    const PlanningGapCell & cell = param_info.param;
+    return fmt::format("{}_{}_{}_{}_GcShards{}_{}", planningGapRowName(cell.row), cell.relay ? "Relay" : "OneHop",
+                       cell.drop_after_the_round ? "DroppedAfterTheRound" : "DroppedAfterTheCopy",
+                       cell.destination_first ? "DestinationFirst" : "SourceFirst", cell.gc_shards,
+                       planningGapScheduleName(cell.schedule));
+}
+
+std::vector<PlanningGapCell> planningGapCells()
+{
+    using Row = PlanningGapCell::Row;
+    using Schedule = PlanningGapCell::Schedule;
+    std::vector<PlanningGapCell> out;
+    for (uint64_t gc_shards : {uint64_t{1}, uint64_t{2}})
+        for (Row row : {Row::None, Row::Candidate, Row::Pending, Row::Standing})
+            for (bool relay : {false, true})
+                for (bool drop_after_the_round : {false, true})
+                    for (bool destination_first : {true, false})
+                        for (Schedule schedule : {Schedule::Sequential, Schedule::ReadAheadOutstanding,
+                                                  Schedule::ReadAheadAnswered})
+                            out.push_back({.gc_shards = gc_shards, .row = row, .relay = relay,
+                                           .drop_after_the_round = drop_after_the_round,
+                                           .destination_first = destination_first, .schedule = schedule});
+    return out;
+}
+
+/// A payload whose blob's row is in a shard other than the first when there are several.
+String planningGapPayload(uint64_t gc_shards)
+{
+    for (size_t i = 0;; ++i)
+        if (String candidate = "planning-gap-copy-" + std::to_string(i); gc_shards == 1 || blobShard(idOf(candidate), gc_shards) != 0)
+            return candidate;
+}
+
+/// A payload whose blob comes before `blob` in the order a round spends its intent creates (shard, then hash).
+String planningGapDecoy(const BlobRef & blob, uint64_t gc_shards)
+{
+    const auto position = [&](const BlobRef & ref) { return std::make_pair(blobShard(ref, gc_shards), ref); };
+    for (size_t i = 0;; ++i)
+        if (String candidate = "planning-gap-decoy-" + std::to_string(i); position(idOf(candidate)) < position(blob))
+            return candidate;
+}
+
+/// The `_log/` prefix of `ns`'s current life.
+String refLogPrefixOf(Backend & backend, const Layout & layout, const String & ns)
+{
+    OperationForTest op(backend);
+    const std::optional<NamespaceLifeId> life = CasRefCatalog::lifeIfCataloged(*op, layout, RootNamespace{ns});
+    if (!life)
+        return {};
+    const String key = layout.refLogKey(*life, RefTxnId{1, 1});
+    return key.substr(0, key.find("/_log/") + 6);
+}
+
+/// Whether `ns` holds the record right after its fold cursor, so the next round reads its first key present.
+bool hasUnfoldedRecord(Backend & backend, const Layout & layout, const String & ns)
+{
+    OperationForTest op(backend);
+    const std::optional<NamespaceLifeId> life = CasRefCatalog::lifeIfCataloged(*op, layout, RootNamespace{ns});
+    if (!life)
+        return false;
+    const uint64_t cursor = foldCursorOf(backend, layout, RootNamespace{ns}, 0);
+    return (*op).read(layout.refLogKey(*life, RefTxnId{1, cursor + 1}), Retry::standard()).has_value();
+}
+
+/// The premise of `ReadAheadOutstanding` at its event: a `GET` is in the hold, and a read-ahead worker issued it.
+bool readAheadOutstanding(const GetHookBackend & backend, std::thread::id round_thread)
+{
+    const std::optional<std::thread::id> held = backend.heldGetThread();
+    return held && *held != round_thread;
+}
+
+class CASInterleavePlanningGap : public ::testing::TestWithParam<PlanningGapCell>
+{
+};
+
+}
+
+/// The planning-gap cells of the copy-and-drop matrix (`CASInterleaveMatrix`), whose store cannot hook a `GET`. Between
+/// the planning reads of the two lives of a pair (see `PlanningGapCell::Schedule`), the destination gets a no-bytes copy
+/// of a part naming the blob, and the source's part is dropped then or after the round. No round deletes the body
+/// while a part names it, fsck finds no dangling reference, and the body is reclaimed once the last part naming it is
+/// dropped.
+///
+/// Every cell asserts, from the request journal, that the event ran inside planning at its place, and which records
+/// the round folded: a life folds its event records exactly when its stop is fixed after the event. The cut is mixed
+/// (drop folded, copy missed) only when the source's stop is fixed after the event and the destination's before it;
+/// every other cell asserts its clean cut.
+///
+/// Not crossed with the planning gap here: the matrix's copy paths (all three append the same ref-log records, which
+/// is all the round reads), a destination born after the catalog read (it is not planned), and drops inside the copy,
+/// before the round or in pass 2 (they place the event elsewhere than between two lives' planning).
+TEST_P(CASInterleavePlanningGap, ACopyBetweenTwoLivesProbesKeepsEveryNamedBody)
+{
+    using Row = PlanningGapCell::Row;
+    using Schedule = PlanningGapCell::Schedule;
+    const PlanningGapCell & cell = GetParam();
+    const String source = cell.destination_first ? "test/c_source" : "test/a_source";
+    const String middle = "test/b_middle";
+    const String last = cell.destination_first ? "test/a_last" : "test/c_last";
+    const std::vector<String> destinations = cell.relay ? std::vector<String>{middle, last} : std::vector<String>{last};
+    const bool second_answered_first = cell.schedule == Schedule::ReadAheadAnswered;
+    MissedWriterPool pool(source, destinations, planningGapPayload(cell.gc_shards), cell.gc_shards,
+                          /*create_budget=*/cell.row == Row::Candidate ? 1 : 0,
+                          /*io_concurrency=*/cell.schedule == Schedule::Sequential ? 1 : 16);
+    ASSERT_EQ(pool.store->poolMeta().gc_shards, cell.gc_shards);
+    const Layout & layout = pool.store->layout();
+    Gc & gc = *pool.gc;
+
+    switch (cell.row)
+    {
+        case Row::None:
+            ASSERT_EQ(writeOnePart(pool.store, source, "w", pool.payload), BlobMaterializationAction::Published);
+            runGateRound(pool.store, gc);
+            ASSERT_FALSE(pool.row().has_value());
+            break;
+        case Row::Candidate:
+        {
+            /// The decoy takes the round's one intent create, so the condemning round leaves the blob a candidate; the
+            /// writer adopts the body after that round's intake, so its edge is missed.
+            const String decoy = planningGapDecoy(pool.x, cell.gc_shards);
+            ASSERT_EQ(writeOnePart(pool.store, source, "p0", pool.payload), BlobMaterializationAction::Published);
+            ASSERT_EQ(writeOnePart(pool.store, source, "decoy", decoy), BlobMaterializationAction::Published);
+            runGateRound(pool.store, gc);
+            pool.store->dropRef(RootNamespace{source}, "p0");
+            pool.store->dropRef(RootNamespace{source}, "decoy");
+            pool.store->renewWatermarkOnce();
+            std::optional<BlobMaterializationAction> w;
+            const RoundWithCallback condemning = runRoundWithCallback(gc, RoundInterleavePoint::AfterIntake, {}, [&]
+            {
+                w = writeOnePart(pool.store, source, "w", pool.payload);
+            });
+            pool.store->renewWatermarkOnce();
+            ASSERT_EQ(condemning.fired, 1u);
+            ASSERT_EQ(w, BlobMaterializationAction::Observed);
+            ASSERT_TRUE(pool.row() && !pool.row()->delete_pending && !pool.row()->standing) << "the row is not a candidate";
+            break;
+        }
+        case Row::Pending:
+            ASSERT_NO_FATAL_FAILURE(pool.commitPendingUnderAMissedWriter());
+            break;
+        case Row::Standing:
+            /// The body is deleted and the row stands; the writer finds no body and uploads a new incarnation.
+            ASSERT_NO_FATAL_FAILURE(pool.publishAndDrop());
+            ASSERT_NO_FATAL_FAILURE(runRoundsUntil(pool.store, gc, [&] { return pool.row() && pool.row()->standing; }));
+            ASSERT_FALSE(pool.bodyStored());
+            ASSERT_EQ(writeOnePart(pool.store, source, "w", pool.payload), BlobMaterializationAction::Published);
+            ASSERT_TRUE(pool.row() && pool.row()->standing);
+            break;
+    }
+
+    /// The parts naming the blob, as (namespace, ref).
+    std::vector<std::pair<String, String>> holders{{source, "w"}};
+    const auto dropHolder = [&](const std::pair<String, String> holder)
+    {
+        pool.store->dropRef(RootNamespace{holder.first}, holder.second);
+        std::erase(holders, holder);
+    };
+    const size_t journal_from = pool.backend->journal().size();
+    const auto bodyDeletes = [&]
+    {
+        const auto journal = pool.backend->journal();
+        const auto requests = blobRequests(std::vector<JournalEntry>(journal.begin() + journal_from, journal.end()));
+        return countOf(requests, JournalVerb::Remove, pool.body_key) + countOf(requests, JournalVerb::RemoveMany, pool.body_key);
+    };
+    const auto check = [&](const String & where)
+    {
+        ASSERT_FALSE(holders.empty());
+        EXPECT_EQ(bodyDeletes(), 0u) << where << ": a body DELETE was sent while a part named the blob";
+        EXPECT_TRUE(pool.bodyStored()) << where << ": the body is gone while " << holders.size() << " part(s) name it";
+        const FsckReport report = runFsck(*pool.store, /*detail=*/true);
+        EXPECT_EQ(report.dangling, 0u) << where << ": " << formatFsckSummary(report);
+    };
+
+    /// The lives whose next round reads their first key present: the source's part was written after the last fold.
+    std::set<String> unfolded;
+    if (cell.row != Row::None)
+        unfolded.insert(source);
+
+    std::vector<std::pair<String, String>> hops{{source, cell.relay ? middle : last}};
+    if (cell.relay)
+        hops.emplace_back(middle, last);
+    std::pair<String, String> from{source, "w"};
+    for (size_t hop = 0; hop < hops.size(); ++hop)
+    {
+        const auto & [from_ns, to_ns] = hops[hop];
+        SCOPED_TRACE(fmt::format("hop {}: {} to {}", hop, from_ns, to_ns));
+        ASSERT_EQ(from.first, from_ns);
+        const std::pair<String, String> to{to_ns, "copy"};
+        const String first_planned = std::min(from_ns, to_ns);
+        const String second_planned = std::max(from_ns, to_ns);
+        const String first_logs = refLogPrefixOf(*pool.backend, layout, first_planned);
+        const String second_logs = refLogPrefixOf(*pool.backend, layout, second_planned);
+        const bool second_hot = unfolded.contains(second_planned);
+        EXPECT_EQ(hasUnfoldedRecord(*pool.backend, layout, first_planned), unfolded.contains(first_planned)) << first_planned;
+        EXPECT_EQ(hasUnfoldedRecord(*pool.backend, layout, second_planned), second_hot) << second_planned;
+
+        /// The first life's stop is fixed before the event. A quiet life's stop is its first key: answered before the
+        /// event, the second life misses what the event wrote to it unless that key was already present.
+        const auto foldsEvent = [&](const String & ns)
+        {
+            if (ns == first_planned)
+                return false;
+            return !second_answered_first || second_hot;
+        };
+
+        const String event_begin = fmt::format("event-{}", hop);
+        const String event_end = fmt::format("event-end-{}", hop);
+        const String discovered = fmt::format("discovered-{}", hop);
+        /// The event runs right after the first life's first absent read: with a complete listing that is its stop and
+        /// its last planning read. The second life's first read is held until the event ends, or awaited before it.
+        const auto isSecondLog = [second_logs](const String & key) { return key.starts_with(second_logs); };
+        if (second_answered_first)
+            pool.backend->watchGet(isSecondLog);
+        else
+            pool.backend->holdGet(isSecondLog);
+        size_t fired = 0;
+        /// The round runs on this thread.
+        const std::thread::id round_thread = std::this_thread::get_id();
+        pool.backend->armAfterGet(
+            [first_logs](const String & key, bool found) { return key.starts_with(first_logs) && !found; },
+            [&]
+            {
+                SCOPE_EXIT({ pool.backend->releaseHeldGet(); });
+                if (second_answered_first)
+                    pool.backend->waitForWatchedGet();
+                else if (cell.schedule == Schedule::ReadAheadOutstanding)
+                {
+                    pool.backend->waitForHeldGet();
+                    EXPECT_TRUE(readAheadOutstanding(*pool.backend, round_thread))
+                        << "the held read of " << second_planned << " was not issued by a read-ahead worker";
+                }
+                ++fired;
+                pool.backend->mark(event_begin);
+                copyWithoutBytes(pool.store, to.first, to.second, pool.payload);
+                holders.push_back(to);
+                if (!cell.drop_after_the_round)
+                    dropHolder(from);
+                pool.backend->mark(event_end);
+            });
+        const size_t round_from = pool.backend->journal().size();
+        {
+            ScopedRoundCallback discovery(gc, RoundInterleavePoint::AfterDiscovery, {}, [&] { pool.backend->mark(discovered); });
+            runGateRound(pool.store, gc);
+            ASSERT_EQ(discovery.fired(), 1u);
+        }
+        ASSERT_EQ(fired, 1u) << "the round never planned " << first_planned << " and " << second_planned;
+        if (!second_answered_first)
+            ASSERT_FALSE(pool.backend->holdArmed()) << "no read reached the hold";
+        check("after the round of the copy into " + to_ns);
+
+        /// The event ran inside planning, after the first life's stop; the second life's first key was read before it
+        /// only when its answer was awaited.
+        const auto journal = pool.backend->journal();
+        const size_t begin = indexOfMark(journal, event_begin);
+        const size_t end = indexOfMark(journal, event_end);
+        ASSERT_LT(end, indexOfMark(journal, discovered)) << "the event ran after planning";
+        size_t first_reads = 0;
+        size_t second_reads = 0;
+        for (size_t i = round_from; i < begin; ++i)
+            if (journal[i].verb == JournalVerb::Read)
+            {
+                first_reads += journal[i].keys.front().starts_with(first_logs);
+                second_reads += journal[i].keys.front().starts_with(second_logs);
+            }
+        EXPECT_GT(first_reads, 0u) << first_planned << " was not planned before the event";
+        EXPECT_EQ(second_reads, second_answered_first ? 1u : 0u) << second_planned << ": reads before the event";
+        /// After the event the pair reads only the second life, and only while its planning is open: a quiet second life
+        /// whose answer was taken before the event reads nothing more until planning ends.
+        const size_t discovered_at = indexOfMark(journal, discovered);
+        size_t next_pair_read = end + 1;
+        while (next_pair_read < discovered_at
+               && !(journal[next_pair_read].verb == JournalVerb::Read
+                    && (journal[next_pair_read].keys.front().starts_with(first_logs) || isSecondLog(journal[next_pair_read].keys.front()))))
+            ++next_pair_read;
+        if (second_answered_first && !second_hot)
+            EXPECT_EQ(next_pair_read, discovered_at) << "a pair read after the event: " << journal[next_pair_read].keys.front();
+        else
+        {
+            ASSERT_LT(next_pair_read, discovered_at) << "no read of " << second_planned << " after the event";
+            EXPECT_TRUE(isSecondLog(journal[next_pair_read].keys.front()))
+                << "the pair's read after the event is " << journal[next_pair_read].keys.front();
+        }
+        if (cell.schedule == Schedule::Sequential)
+        {
+            size_t next_read = end + 1;
+            while (next_read < journal.size() && journal[next_read].verb != JournalVerb::Read)
+                ++next_read;
+            ASSERT_LT(next_read, journal.size());
+            EXPECT_EQ(next_read, next_pair_read) << "the read after the event is " << journal[next_read].keys.front();
+        }
+
+        /// What the cut held.
+        const auto foldedEventRecords = [&](const String & ns) -> std::optional<bool>
+        {
+            const String logs = refLogPrefixOf(*pool.backend, layout, ns);
+            const uint64_t cursor = foldCursorOf(*pool.backend, layout, RootNamespace{ns}, 0);
+            size_t written = 0;
+            size_t folded = 0;
+            for (size_t i = begin; i < end; ++i)
+                if (journal[i].verb == JournalVerb::Write && journal[i].keys.front().starts_with(logs))
+                {
+                    const auto parsed = layout.parseRefObjectKey(journal[i].keys.front());
+                    if (!parsed)
+                        continue;
+                    ++written;
+                    folded += parsed->txn_id.ref_sequence <= cursor;
+                }
+            if (written == 0)
+                return std::nullopt;
+            EXPECT_TRUE(folded == 0 || folded == written) << ns << ": " << folded << " of " << written << " records folded";
+            return folded == written;
+        };
+        const std::optional<bool> copy_folded = foldedEventRecords(to_ns);
+        const std::optional<bool> drop_folded = foldedEventRecords(from_ns);
+        ASSERT_TRUE(copy_folded.has_value()) << "the copy wrote no ref log";
+        EXPECT_EQ(*copy_folded, foldsEvent(to_ns)) << "copy folded";
+        if (cell.drop_after_the_round)
+            EXPECT_FALSE(drop_folded.has_value()) << "the source was dropped inside the round";
+        else
+        {
+            ASSERT_TRUE(drop_folded.has_value()) << "the drop wrote no ref log";
+            EXPECT_EQ(*drop_folded, foldsEvent(from_ns)) << "drop folded";
+        }
+        /// Mixed when the destination is planned first and the source, planned second, folds the drop: always when its
+        /// first read follows the event, and only when it is hot when that answer came before. A quiet second life with
+        /// an earlier answer gives the clean cut that misses both the copy and the drop.
+        const bool mixed = !*copy_folded && drop_folded.value_or(false);
+        const bool source_folds = !second_answered_first || second_hot;
+        EXPECT_EQ(mixed, cell.destination_first && !cell.drop_after_the_round && source_folds) << "the cut's kind";
+        /// A pending row survives the mixed cut as the same row, carried.
+        if (mixed && cell.row == Row::Pending && hop == 0)
+            expectRowOutcome(pool.row(), /*carried=*/true, pool.t);
+
+        /// The round folds every record written before it; an event record only as asserted above.
+        unfolded.clear();
+        if (!foldsEvent(to_ns))
+            unfolded.insert(to_ns);
+        if (!cell.drop_after_the_round && !foldsEvent(from_ns))
+            unfolded.insert(from_ns);
+        if (cell.drop_after_the_round)
+        {
+            dropHolder(from);
+            pool.store->renewWatermarkOnce();
+            unfolded.insert(from_ns);
+        }
+        from = to;
+    }
+
+    for (int i = 0; i < 3; ++i)
+    {
+        runGateRound(pool.store, gc);
+        check(fmt::format("quiet round {}", i));
+    }
+
+    /// Liveness, and what makes the safety checks above non-vacuous in every cell: once nothing names the blob, the
+    /// rounds delete the body.
+    while (!holders.empty())
+        dropHolder(holders.front());
+    pool.store->renewWatermarkOnce();
+    std::optional<int> reclaimed_in;
+    for (int i = 1; i <= 16 && !reclaimed_in; ++i)
+    {
+        runGateRound(pool.store, gc);
+        if (!pool.bodyStored())
+            reclaimed_in = i;
+    }
+    ASSERT_TRUE(reclaimed_in.has_value()) << "the body was not reclaimed within 16 rounds after the last drop";
+    EXPECT_LE(*reclaimed_in, 4) << "the body was reclaimed only in round " << *reclaimed_in << " after the last drop";
+    EXPECT_GE(bodyDeletes(), 1u) << "positive control: the reclaiming DELETE is in the journal";
+    const FsckReport report = runFsck(*pool.store, /*detail=*/true);
+    EXPECT_EQ(report.dangling, 0u) << formatFsckSummary(report);
+}
+
+INSTANTIATE_TEST_SUITE_P(CASPlanningGap, CASInterleavePlanningGap, ::testing::ValuesIn(planningGapCells()), planningGapCellName);
+
+/// Negative control of `readAheadOutstanding`: at `gc_io_concurrency` 1 no read is ahead, so at the event the premise
+/// is false at once, and the second life's first `GET` is later issued, and held, on the round thread.
+TEST(CASInterleavePlanningGapPremise, AnInlineCellHasNoReadOutstandingAtItsEvent)
+{
+    const String source = "test/c_source";
+    const String last = "test/a_last";
+    MissedWriterPool pool(source, {last}, planningGapPayload(1), /*gc_shards=*/1, /*create_budget=*/0, /*io_concurrency=*/1);
+    const Layout & layout = pool.store->layout();
+    ASSERT_EQ(writeOnePart(pool.store, source, "w", pool.payload), BlobMaterializationAction::Published);
+    runGateRound(pool.store, *pool.gc);
+
+    const String first_logs = refLogPrefixOf(*pool.backend, layout, last);
+    const String second_logs = refLogPrefixOf(*pool.backend, layout, source);
+    pool.backend->holdGet([second_logs](const String & key) { return key.starts_with(second_logs); });
+    size_t fired = 0;
+    bool outstanding = true;
+    const std::thread::id round_thread = std::this_thread::get_id();
+    pool.backend->armAfterGet(
+        [first_logs](const String & key, bool found) { return key.starts_with(first_logs) && !found; },
+        [&]
+        {
+            SCOPE_EXIT({ pool.backend->releaseHeldGet(); });
+            ++fired;
+            outstanding = readAheadOutstanding(*pool.backend, round_thread);
+        });
+    runGateRound(pool.store, *pool.gc);
+
+    ASSERT_EQ(fired, 1u) << "the round never planned both lives";
+    EXPECT_FALSE(outstanding) << "an inline cell reported a read-ahead outstanding at its event";
+    ASSERT_FALSE(pool.backend->holdArmed()) << "positive control: the second life's first GET reached the hold";
+    EXPECT_EQ(pool.backend->heldGetThread(), std::optional<std::thread::id>(round_thread))
+        << "positive control: the inline GET was issued on the round thread";
 }
 
 /// A reference added and removed in one intake while the row is `pending`: the round carries the row, and the next
@@ -6267,9 +6737,10 @@ namespace
 class RoundPointPool
 {
 public:
-    RoundPointPool()
+    explicit RoundPointPool(uint64_t io_concurrency = 1)
     {
-        PoolConfig config{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0, .gc_io_concurrency = 1};
+        PoolConfig config{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0,
+                          .gc_io_concurrency = io_concurrency};
         store = Pool::open(backend, std::move(config));
         gc = std::make_unique<Gc>(store, kGateLeaderA);
         for (const String & ns : {first, second})
@@ -6350,7 +6821,7 @@ public:
             << "the first manifest read after the hook is " << journal[after].keys.front();
     }
 
-    std::shared_ptr<HeadHookBackend> backend = std::make_shared<HeadHookBackend>();
+    std::shared_ptr<GetHookBackend> backend = std::make_shared<GetHookBackend>();
     PoolPtr store;
     std::unique_ptr<Gc> gc;
     const String first = "test/a_first";
@@ -6380,6 +6851,40 @@ TEST(CASGcRoundPoint, AfterCatalogReadPrecedesEveryLogRead)
     EXPECT_TRUE(catalog_read_before);
     EXPECT_TRUE(std::any_of(journal.begin() + mark, journal.end(), [&](const JournalEntry & e) { return pool.isAnyLogRead(e); }))
         << "positive control: the round read the logs";
+}
+
+/// At width 16 the first log read of a round is a read ahead on a worker: the first key of a quiet life, whose absent
+/// answer is that life's stop. It still follows the catalog read. Red if planning's read-ahead started before it, for
+/// example from the remembered first keys during setup.
+TEST(CASGcRoundPoint, AfterCatalogReadPrecedesTheReadAheadOfAQuietLife)
+{
+    RoundPointPool pool(/*io_concurrency=*/16);
+    std::optional<std::thread::id> first_log_reader;
+    bool first_log_found = true;
+    pool.backend->armAfterGet(
+        [&pool, &first_log_found](const String & key, bool found)
+        {
+            const bool matches = key.find("/_log/") != String::npos
+                && (key.starts_with(pool.streams.at(pool.first)) || key.starts_with(pool.streams.at(pool.second)));
+            if (matches)
+                first_log_found = found;
+            return matches;
+        },
+        [&] { first_log_reader = std::this_thread::get_id(); });
+    const auto journal = pool.roundWithMark(RoundInterleavePoint::AfterCatalogRead);
+    ASSERT_EQ(pool.last.fired, 1u);
+    const size_t mark = indexOfMark(journal, "hook");
+    const String catalog_key = pool.store->layout().refCatalogKey();
+    bool catalog_read_before = false;
+    for (size_t i = 0; i < mark; ++i)
+    {
+        catalog_read_before |= journal[i].verb == JournalVerb::Read && journal[i].keys.front() == catalog_key;
+        EXPECT_FALSE(pool.isAnyLogRead(journal[i])) << "a log read before the hook: " << journal[i].keys.front();
+    }
+    EXPECT_TRUE(catalog_read_before);
+    ASSERT_TRUE(first_log_reader.has_value()) << "positive control: the round read the logs";
+    EXPECT_NE(*first_log_reader, std::this_thread::get_id()) << "positive control: the first log read was a read ahead";
+    EXPECT_FALSE(first_log_found) << "positive control: the first log read is the absent first key of a quiet life";
 }
 
 /// Pass 1 walks in name order: the hook between the two walks fires once, and the reverse pair is no site of pass 1

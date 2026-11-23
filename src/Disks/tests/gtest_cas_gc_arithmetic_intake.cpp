@@ -1071,23 +1071,31 @@ TEST(CASGCArithmeticIntake, AHintBehindTheTailStopsAtTheObservedMiss)
 
 /// Read-ahead moves only the moment bytes are fetched. The same pool folded at `gc_io_concurrency` 1 and 16 adopts the
 /// same cursors, holds at the same positions and deletes the same keys; at 1 nothing is read ahead. A hold suppresses
-/// deletes, so the gap it holds at is filled after the first round.
+/// deletes, so the gap it holds at is filled after the round that holds. After the first round two lives get records
+/// while the round remembers their first keys, which width 16 reads ahead: one finds records past the listed tail,
+/// the other a hole below listed records.
 TEST(CASGCArithmeticIntake, ConcurrencyOneIsSequentialAndDecidesAsSixteen)
 {
-    constexpr size_t rounds = 6;
+    constexpr size_t rounds = 8;
     struct Outcome
     {
         std::map<String, RefTxnId> cursors;
-        /// After the first round.
-        std::map<String, std::optional<std::pair<HoldReason, RefTxnId>>> holds;
+        /// After each of the first two rounds.
+        std::vector<std::map<String, std::optional<std::pair<HoldReason, RefTxnId>>>> holds;
         std::set<String> deleted;
         std::vector<std::map<String, UInt64>> intakes;
+        /// Ref logs some thread other than the round's read, and the first keys of the second round that should be among
+        /// them at width 16.
+        std::set<String> read_ahead;
+        String present_first_key;
+        String hole_key;
     };
     const std::vector<RootNamespace> lives{RootNamespace{"00/aa@cas@"}, RootNamespace{"00/bb@cas@"},
-                                           RootNamespace{"00/cc@cas@"}, RootNamespace{"00/dd@cas@"}};
+                                           RootNamespace{"00/cc@cas@"}, RootNamespace{"00/dd@cas@"},
+                                           RootNamespace{"00/ee@cas@"}, RootNamespace{"00/ff@cas@"}};
     const auto fold = [&](uint64_t concurrency)
     {
-        auto backend = std::make_shared<HintHoleBackendOn<CountingBackend>>();
+        auto backend = std::make_shared<ObservedHintHoleBackend>();
         auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                                                     .gc_fold_max_defer_rounds = 0, .gc_io_concurrency = concurrency});
         const Layout & layout = store->layout();
@@ -1123,6 +1131,9 @@ TEST(CASGCArithmeticIntake, ConcurrencyOneIsSequentialAndDecidesAsSixteen)
         seed(lives[3], 300, 10);
         for (uint64_t i = 12; i <= 15; ++i)
             publishAt(*backend, layout, lives[3], RefTxnId{1, i}, fmt::format("ref_{}", i), 300 + i, DB::UInt128(300 + i));
+        /// Quiet in the first round; the next two rounds start at the first key the first round read absent.
+        seed(lives[4], 400, 20);
+        seed(lives[5], 500, 10);
 
         Gc gc(store, kGc);
         Outcome out;
@@ -1138,17 +1149,29 @@ TEST(CASGCArithmeticIntake, ConcurrencyOneIsSequentialAndDecidesAsSixteen)
             store->renewWatermarkOnce();
             gc.setPhaseSink({});
             out.intakes.push_back(std::move(metrics));
-            if (i != 0)
+            if (i > 1)
                 continue;
+            auto & holds = out.holds.emplace_back();
             for (const RootNamespace & ns : lives)
             {
                 const auto coverage = coverageOf(*backend, layout, ns);
                 if (coverage && coverage->hold)
-                    out.holds[ns.string()] = std::make_pair(coverage->hold->reason, coverage->hold->offending_position);
+                    holds[ns.string()] = std::make_pair(coverage->hold->reason, coverage->hold->offending_position);
                 else
-                    out.holds[ns.string()] = std::nullopt;
+                    holds[ns.string()] = std::nullopt;
             }
-            publishAt(*backend, layout, lives[3], RefTxnId{1, 11}, "ref_11", 311, DB::UInt128(311));
+            if (i == 0)
+            {
+                publishAt(*backend, layout, lives[3], RefTxnId{1, 11}, "ref_11", 311, DB::UInt128(311));
+                /// Records past the listed tail.
+                publishRange(*backend, layout, lives[4], 21, 40, 400);
+                hide(lives[4], 31, 40);
+                /// `{1,11}` missing below listed records.
+                for (uint64_t j = 12; j <= 15; ++j)
+                    publishAt(*backend, layout, lives[5], RefTxnId{1, j}, fmt::format("ref_{}", j), 500 + j, DB::UInt128(500 + j));
+            }
+            else
+                publishAt(*backend, layout, lives[5], RefTxnId{1, 11}, "ref_11", 511, DB::UInt128(511));
         }
         for (const RootNamespace & ns : lives)
             out.cursors[ns.string()] = cursorOf(*backend, layout, ns);
@@ -1158,6 +1181,9 @@ TEST(CASGCArithmeticIntake, ConcurrencyOneIsSequentialAndDecidesAsSixteen)
                 for (const String & key : entry.keys)
                     if (key.find("/_probe/") == String::npos)
                         out.deleted.insert(key);
+        out.read_ahead = backend->logsReadOffThread(std::this_thread::get_id());
+        out.present_first_key = layout.refLogKey(fixture::fixtureLife(lives[4]), RefTxnId{1, 21});
+        out.hole_key = layout.refLogKey(fixture::fixtureLife(lives[5]), RefTxnId{1, 11});
         EXPECT_FALSE(blobAbsent(*backend, layout, DB::UInt128(2))) << "positive control: a named blob is kept";
         EXPECT_TRUE(blobAbsent(*backend, layout, DB::UInt128(1))) << "positive control: the dropped blob is reclaimed";
         return out;
@@ -1174,11 +1200,22 @@ TEST(CASGCArithmeticIntake, ConcurrencyOneIsSequentialAndDecidesAsSixteen)
     EXPECT_EQ(sequential.cursors, parallel.cursors);
     EXPECT_EQ(sequential.cursors.at("00/aa@cas@"), (RefTxnId{1, 41})) << "positive control: the drop was folded";
     EXPECT_EQ(sequential.cursors.at("00/dd@cas@"), (RefTxnId{1, 15})) << "positive control: the filled gap was folded";
+    EXPECT_EQ(sequential.cursors.at("00/ee@cas@"), (RefTxnId{1, 40})) << "positive control: the unlisted records were folded";
+    EXPECT_EQ(sequential.cursors.at("00/ff@cas@"), (RefTxnId{1, 15})) << "positive control: the filled hole was folded";
     EXPECT_EQ(sequential.holds, parallel.holds);
-    ASSERT_TRUE(sequential.holds.at("00/dd@cas@").has_value()) << "positive control: the gap holds";
-    EXPECT_EQ(sequential.holds.at("00/dd@cas@")->first, HoldReason::GapBelowWitness);
+    ASSERT_EQ(sequential.holds.size(), 2u);
+    ASSERT_TRUE(sequential.holds[0].at("00/dd@cas@").has_value()) << "positive control: the gap holds";
+    EXPECT_EQ(sequential.holds[0].at("00/dd@cas@")->first, HoldReason::GapBelowWitness);
+    EXPECT_FALSE(sequential.holds[0].at("00/ff@cas@").has_value());
+    EXPECT_FALSE(sequential.holds[1].at("00/ee@cas@").has_value()) << "records past the listed tail are no gap";
+    EXPECT_EQ(sequential.holds[1].at("00/ff@cas@"), std::make_pair(HoldReason::GapBelowWitness, RefTxnId{1, 11}))
+        << "positive control: the hole holds";
     EXPECT_EQ(sequential.deleted, parallel.deleted);
     EXPECT_FALSE(sequential.deleted.empty()) << "positive control: the rounds deleted something";
+
+    EXPECT_TRUE(sequential.read_ahead.empty()) << sequential.read_ahead.size() << " ref log(s) read ahead at width 1";
+    EXPECT_TRUE(parallel.read_ahead.contains(parallel.present_first_key)) << "positive control: a present first key was read ahead";
+    EXPECT_TRUE(parallel.read_ahead.contains(parallel.hole_key)) << "positive control: the hole was read ahead";
 }
 
 namespace
