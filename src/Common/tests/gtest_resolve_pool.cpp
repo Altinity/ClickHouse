@@ -820,3 +820,90 @@ TEST_F(ResolvePoolTest, UnbannedAfterConcurrentSuccess)
     ASSERT_EQ(3, CurrentMetrics::get(metrics.active_count));
     ASSERT_EQ(0, CurrentMetrics::get(metrics.banned_count));
 }
+
+namespace
+{
+
+/// The switch is process-wide, so a test that turns it on must not leak it into the next one.
+class LatencyAwareSelectionScope
+{
+public:
+    explicit LatencyAwareSelectionScope(bool enabled) { DB::HostResolver::setLatencyAwareSelection(enabled); }
+    ~LatencyAwareSelectionScope() { DB::HostResolver::setLatencyAwareSelection(false); }
+};
+
+}
+
+TEST_F(ResolvePoolTest, LatencyEwma)
+{
+    LatencyAwareSelectionScope scope(false);
+    auto resolver = make_resolver();
+    resolver->resolve(); /// populate the records
+
+    const Poco::Net::IPAddress fast("127.0.0.1");
+    const Poco::Net::IPAddress slow("127.0.0.2");
+    const Poco::Net::IPAddress unknown("127.0.0.9");
+
+    ASSERT_EQ(0.0, resolver->getLatencyMs(fast));
+    ASSERT_EQ(0.0, resolver->getMinLatencyMs());
+
+    resolver->reportLatency(fast, 1000);
+    ASSERT_DOUBLE_EQ(1.0, resolver->getLatencyMs(fast));
+
+    /// EWMA with alpha = 0.2: 0.2 * 2 + 0.8 * 1.
+    resolver->reportLatency(fast, 2000);
+    ASSERT_DOUBLE_EQ(1.2, resolver->getLatencyMs(fast));
+
+    resolver->reportLatency(slow, 10000);
+    ASSERT_DOUBLE_EQ(10.0, resolver->getLatencyMs(slow));
+    ASSERT_DOUBLE_EQ(1.2, resolver->getMinLatencyMs());
+
+    /// A zero sample and an unknown address are ignored.
+    resolver->reportLatency(fast, 0);
+    resolver->reportLatency(unknown, 5000);
+    ASSERT_DOUBLE_EQ(1.2, resolver->getLatencyMs(fast));
+    ASSERT_EQ(0.0, resolver->getLatencyMs(unknown));
+}
+
+TEST_F(ResolvePoolTest, LatencyAwareSelectionPrefersFastAddress)
+{
+    LatencyAwareSelectionScope scope(true);
+    auto resolver = make_resolver();
+    resolver->resolve(); /// populate the records
+
+    resolver->reportLatency(Poco::Net::IPAddress("127.0.0.1"), 1000);
+    resolver->reportLatency(Poco::Net::IPAddress("127.0.0.2"), 10000);
+    resolver->reportLatency(Poco::Net::IPAddress("127.0.0.3"), 10000);
+
+    std::map<String, size_t> results;
+    for (size_t i = 0; i < 3000; ++i)
+        ++results[*resolver->resolve()];
+
+    ASSERT_EQ(size_t(3), results.size());
+    ASSERT_GT(results["127.0.0.1"], 3 * results["127.0.0.2"]);
+    ASSERT_GT(results["127.0.0.1"], 3 * results["127.0.0.3"]);
+
+    /// A slow address keeps a floor of weight, so it is still probed and can recover.
+    ASSERT_GT(results["127.0.0.2"], 0);
+    ASSERT_GT(results["127.0.0.3"], 0);
+}
+
+TEST_F(ResolvePoolTest, LatencyIsIgnoredWhenLatencyAwareSelectionIsOff)
+{
+    LatencyAwareSelectionScope scope(false);
+    auto resolver = make_resolver();
+    resolver->resolve(); /// populate the records
+
+    resolver->reportLatency(Poco::Net::IPAddress("127.0.0.1"), 1000);
+    resolver->reportLatency(Poco::Net::IPAddress("127.0.0.2"), 100000);
+    resolver->reportLatency(Poco::Net::IPAddress("127.0.0.3"), 100000);
+
+    std::map<String, size_t> results;
+    for (size_t i = 0; i < 50000; ++i)
+        ++results[*resolver->resolve()];
+
+    auto mean = getMean(results);
+    auto diff = getMaxDiff(results, mean);
+
+    ASSERT_GT(0.3 * mean, diff);
+}
