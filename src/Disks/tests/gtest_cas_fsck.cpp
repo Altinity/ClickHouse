@@ -3158,7 +3158,13 @@ TEST(CASFsck, RunPrunedUnderAMovedStateIsReadFromTheNewState)
     });
     f.backend->clearJournal();
 
-    const FsckReport rep = runFsck(*f.store, /*detail=*/true);
+    std::optional<FsckReport> scanned;
+    {
+        ScopedLogCapture forced("ForcedCriticalErrorsLogger", "error");
+        scanned = runFsck(*f.store, /*detail=*/true);
+        EXPECT_EQ(forced.prioritiesOf("is absent").size(), 0u) << forced.captured();
+    }
+    const FsckReport & rep = *scanned;
 
     ASSERT_GE(pruned, 1u) << "the scan never read a run";
     const std::vector<RunRef> new_runs = adoptedRunsOf(f);
@@ -3214,7 +3220,13 @@ TEST(CASGcPreview, RunPrunedUnderAMovedStateIsPreviewedFromTheNewState)
             pruneUnderTheReader(f, 2, key);
     });
 
-    const Gc::DeletePreview racing = f.gc->previewDeletes();
+    std::optional<Gc::DeletePreview> previewed;
+    {
+        ScopedLogCapture forced("ForcedCriticalErrorsLogger", "error");
+        previewed = f.gc->previewDeletes();
+        EXPECT_EQ(forced.prioritiesOf("is absent").size(), 0u) << forced.captured();
+    }
+    const Gc::DeletePreview & racing = *previewed;
 
     ASSERT_GE(pruned, 1u) << "the preview never read a run";
     EXPECT_TRUE(racing.refused_shards.empty()) << racing.refused_shards.front();
@@ -3223,6 +3235,28 @@ TEST(CASGcPreview, RunPrunedUnderAMovedStateIsPreviewedFromTheNewState)
     const Gc::DeletePreview settled = f.gc->previewDeletes();
     EXPECT_TRUE(previewedKeys(settled).contains("pending " + f.bodyKey(2))) << "positive control: blob 2 is condemned";
     EXPECT_EQ(previewedKeys(racing), previewedKeys(settled));
+}
+
+/// A run absent under an unchanged `gc/state` is a refused shard named by today's text, and nothing logs it.
+TEST(CASGcPreview, RunAbsentUnderAnUnchangedStateIsARefusedShard)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    const std::vector<RunRef> runs = adoptedRunsOf(f);
+    ASSERT_EQ(runs.size(), 1u);
+    removeFsckFixtureKey(*f.backend, runs.front().key);
+
+    std::optional<Gc::DeletePreview> previewed;
+    {
+        ScopedLogCapture forced("ForcedCriticalErrorsLogger", "error");
+        previewed = f.gc->previewDeletes();
+        EXPECT_EQ(forced.prioritiesOf("is absent").size(), 0u) << forced.captured();
+    }
+
+    ASSERT_EQ(previewed->refused_shards.size(), 1u);
+    EXPECT_EQ(previewed->refused_shards.front(), "CAS source-edge run: object " + runs.front().key + " is absent");
+    EXPECT_TRUE(previewed->unread.empty()) << previewed->unread;
 }
 
 /// `gc/state` moves before every read of a run: the dry run is unread, not a refused shard.
@@ -3260,13 +3294,28 @@ TEST(CASFsck, BlobsOfARefusedShardAreNotExamined)
     FsckGcFixture f(/*create_budget=*/0, {in_shard[0], in_shard[1]}, shards);
     f.drop();
     f.round();
+    std::vector<String> removed;
     for (const RunRef & run : adoptedRunsOf(f))
         if (run.shard == 1)
+        {
             removeFsckFixtureKey(*f.backend, run.key);
+            removed.push_back(run.key);
+        }
+    ASSERT_FALSE(removed.empty());
 
-    const FsckReport rep = runFsck(*f.store, /*detail=*/true);
+    std::optional<FsckReport> scanned;
+    {
+        ScopedLogCapture forced("ForcedCriticalErrorsLogger", "error");
+        scanned = runFsck(*f.store, /*detail=*/true);
+        EXPECT_EQ(forced.prioritiesOf("is absent").size(), 0u) << forced.captured();
+    }
+    const FsckReport & rep = *scanned;
 
     EXPECT_EQ(rep.corrupted_runs, 1u) << formatFsckSummary(rep);
+    const auto corrupted = std::find_if(rep.objects.begin(), rep.objects.end(),
+        [&](const FsckObject & object) { return object.key == removed.front() && object.cls == FsckClass::CorruptedRun; });
+    ASSERT_NE(corrupted, rep.objects.end()) << formatFsckSummary(rep);
+    EXPECT_EQ(corrupted->reachable_from, std::vector<String>{"CAS source-edge run: object " + removed.front() + " is absent"});
     EXPECT_EQ(rep.unaccounted, 0u) << formatFsckSummary(rep);
     EXPECT_EQ(countVerdictsAtKey(rep, f.bodyKey(in_shard[1]), FsckClass::Unchecked), 1u);
     EXPECT_EQ(countVerdictsAtKey(rep, f.bodyKey(in_shard[0]), FsckClass::PendingGc), 1u) << "positive control: shard 0 was read";

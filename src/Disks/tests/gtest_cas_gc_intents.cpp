@@ -4522,7 +4522,11 @@ TEST(CASGcIntents, PausedLeaderAtTheDefaultRetentionEndsItsRoundAsLostLeadership
     ASSERT_FALSE(pool.prune_until_absent.empty());
     pool.parkLeaderA([&] { w->promote(); }, precommit_key);
     const size_t from = pool.backend->journal().size();
-    ASSERT_NO_FATAL_FAILURE(pool.runLeaderAExpectingLostLeadership("is absent"));
+    {
+        ScopedLogCapture forced("ForcedCriticalErrorsLogger", "error");
+        ASSERT_NO_FATAL_FAILURE(pool.runLeaderAExpectingLostLeadership("is absent"));
+        EXPECT_EQ(forced.prioritiesOf("is absent").size(), 0u) << forced.captured();
+    }
     EXPECT_TRUE(pool.anyAbsent(pool.prune_until_absent)) << "B's retention kept the parent runs A reads";
     ASSERT_NO_FATAL_FAILURE(pool.expectDeposedAndCleaned());
 
@@ -4626,6 +4630,113 @@ TEST(CASGcIntents, AdoptedSealGoneAtTheDrainOrTheFoldIsALostLeadershipOnlyWhenTh
         EXPECT_EQ(same_message.find("GC stops reclaiming on this pool; stored data is not affected") != String::npos,
                   site.states_the_consequence) << same_message;
     }
+}
+
+namespace
+{
+
+struct AdoptedRunGoneRound
+{
+    int code = 0;
+    String message;
+    /// Forced log lines naming an absent run.
+    size_t forced = 0;
+    /// `CasGc` warnings that `gc/state` could not be read.
+    size_t state_warnings = 0;
+    /// `HEAD`s of `gc/state` after the runs were removed.
+    size_t state_heads = 0;
+    std::vector<String> removed;
+};
+
+/// Runs a round over a pending row whose adopted source-edge runs are removed after the validation read of `gc/state`
+/// and before the fold opens them; from then on the `HEAD` of `gc/state` answers as `answer`.
+AdoptedRunGoneRound roundWithAdoptedRunGone(StateHead answer)
+{
+    IntentPool<PausedLeaderBackend> pool(std::make_shared<PausedLeaderBackend>());
+    pool.makePending({1});
+    AdoptedRunGoneRound out;
+    {
+        OperationForTest op(pool.backend);
+        const String seal_key = adoptedSealKeyOf(pool.backend, pool.layout());
+        for (const RunRef & run : decodeFoldSeal((*op).read(seal_key, Retry::standard())->bytes).blob_target_runs)
+            out.removed.push_back(run.key);
+    }
+    size_t mark = 0;
+    pool.gc->setPhaseSink([&](const GcPhaseRecord & record)
+    {
+        if (record.phase != "intent_sweep_list")
+            return;
+        OperationForTest op(pool.backend);
+        for (const String & key : out.removed)
+        {
+            const auto head = (*op).head(key, Retry::once());
+            if (head)
+                EXPECT_EQ((*op).remove(key, head->etag, Retry::once()), Removal::Removed) << key;
+        }
+        pool.backend->state_head = answer;
+        mark = pool.backend->journal().size();
+    });
+    {
+        ScopedLogCapture forced("ForcedCriticalErrorsLogger", "error");
+        ScopedLogCapture gc_log("CasGc", "warning");
+        try
+        {
+            pool.round();
+        }
+        catch (const DB::Exception & e)
+        {
+            out.code = e.code();
+            out.message = e.message();
+        }
+        out.forced = forced.prioritiesOf("is absent").size();
+        out.state_warnings = gc_log.prioritiesOf("could not read gc/state to tell a newer leader from corruption").size();
+    }
+    EXPECT_GT(mark, 0u) << "the round never listed the intents";
+    const auto journal = pool.backend->journal();
+    out.state_heads = stateHeadIndices(std::vector<JournalEntry>(journal.begin() + mark, journal.end())).size();
+    return out;
+}
+
+String absentRunText(const String & key)
+{
+    return "CAS source-edge run: object " + key + " is absent";
+}
+
+}
+
+/// A run gone under a `gc/state` that vanished is a lost leadership, and no `CORRUPTED_DATA` is ever built for it.
+TEST(CASGcIntents, AdoptedRunGoneUnderAVanishedStateIsAbortedWithoutACorruptionLine)
+{
+    const AdoptedRunGoneRound round = roundWithAdoptedRunGone(StateHead::Absent);
+    ASSERT_FALSE(round.removed.empty());
+    EXPECT_EQ(round.code, DB::ErrorCodes::ABORTED) << round.message;
+    EXPECT_NE(round.message.find("gc/state moved during the round"), String::npos) << round.message;
+    EXPECT_NE(round.message.find("the object is gone"), String::npos) << round.message;
+    EXPECT_NE(round.message.find(absentRunText(round.removed.front())), String::npos) << round.message;
+    EXPECT_EQ(round.forced, 0u);
+}
+
+/// Control: a run gone under an unchanged `gc/state` stays corruption, with today's text, after one probe.
+TEST(CASGcIntents, AdoptedRunGoneUnderAnUnchangedStateStaysCorruptedData)
+{
+    const AdoptedRunGoneRound round = roundWithAdoptedRunGone(StateHead::Store);
+    ASSERT_FALSE(round.removed.empty());
+    EXPECT_EQ(round.code, DB::ErrorCodes::CORRUPTED_DATA) << round.message;
+    EXPECT_EQ(round.message, absentRunText(round.removed.front()));
+    EXPECT_EQ(round.forced, 1u);
+    EXPECT_EQ(round.state_heads, 1u);
+}
+
+/// Control: when the probe of `gc/state` fails, the absent run stays corruption after one probe and one warning.
+TEST(CASGcIntents, AdoptedRunGoneWhenTheStateHeadFailsStaysCorruptedData)
+{
+    const AdoptedRunGoneRound round = roundWithAdoptedRunGone(StateHead::Refused);
+    ASSERT_FALSE(round.removed.empty());
+    EXPECT_EQ(round.code, DB::ErrorCodes::CORRUPTED_DATA) << round.message;
+    EXPECT_EQ(round.message, absentRunText(round.removed.front()));
+    EXPECT_EQ(round.forced, 1u);
+    EXPECT_EQ(round.state_heads, 1u);
+    EXPECT_EQ(round.state_warnings, 1u);
 }
 
 /// The validation read of `gc/state` answers with absence, or never answers: the round deletes nothing, throws

@@ -3990,11 +3990,17 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         head_hint_shard = shard;
         next_head_hint = 0;
         RunRef shard_run;
+        bool absence_classified = false;
         try
         {
             shard_run = foldDeltasIntoGeneration(
                 op, layout, priorRunsFor(shard),
-                AdoptedRunContext{.gc_shards = state.gc_shards, .parent_round = state.round, .summary = summaryOfParent(shard)},
+                AdoptedRunContext{.gc_shards = state.gc_shards, .parent_round = state.round, .summary = summaryOfParent(shard),
+                    .on_absent_run = [&](const String & failure)
+                    {
+                        absence_classified = true;
+                        throwIfStateMoved(op, state_etag, failure);
+                    }},
                 new_generation, attempt, shard, std::move(buckets[shard]),
                 ShardFoldOptions{
                     .current_round = current_round,
@@ -4014,8 +4020,9 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         }
         catch (const Exception & e)
         {
-            /// The parent runs this merge streams are what a newer leader's retention removes.
-            if (e.code() == ErrorCodes::CORRUPTED_DATA)
+            /// The parent runs this merge streams are what a newer leader's retention removes. An absent run was
+            /// classified by its own probe; a second probe could contradict it.
+            if (e.code() == ErrorCodes::CORRUPTED_DATA && !absence_classified)
                 throwIfStateMoved(op, state_etag, e.message());
             throw;
         }
