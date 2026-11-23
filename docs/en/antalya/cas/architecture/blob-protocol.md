@@ -99,8 +99,7 @@ Its control-adjusted sequence ratios are not a code-version delta; performance a
 blocked pending a matched before/after pair and explicit human acceptance. The
 [real-GCS result](/superpowers/cas/unconditional-blob-publication-live-results) likewise records
 deterministic coverage but no credentialed Google run. Release readiness remains blocked until the
-OAuth and HMAC groups pass against real GCS; ordinary `test_storage_s3` is also externally blocked
-by the unavailable `clickhouse/clickhouse-server:23.3.19.33.altinitystable` image.
+OAuth and HMAC groups pass against real GCS.
 
 ## Dedup and the identity primitive {#dedup-identity}
 

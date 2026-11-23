@@ -200,6 +200,15 @@ Maximum number of idle standby threads to keep in the thread pool for decoding I
     DECLARE(UInt64, iceberg_manifest_decode_thread_pool_queue_size, 10000, R"(
 The maximum number of jobs that can be scheduled on the thread pool for decoding Iceberg data manifest files.
 )", 0) \
+    DECLARE(NonZeroUInt64, ai_function_max_thread_pool_size, 1000, R"(
+Maximum total number of threads to use for requests to AI providers. One thread holds one request, so this caps how many AI provider requests the whole server has in flight at once, across all queries. [`ai_function_max_concurrent_requests_per_thread`](/reference/settings/session-settings/ai-function#ai_function_max_concurrent_requests_per_thread) bounds each query thread's share of it.
+)", 0) \
+    DECLARE(UInt64, ai_function_max_thread_pool_free_size, 0, R"(
+Maximum number of idle standby threads to keep in the thread pool for requests to AI providers.
+)", 0) \
+    DECLARE(UInt64, ai_function_thread_pool_queue_size, 10'000, R"(
+The maximum number of jobs that can be scheduled on the thread pool for requests to AI providers.
+)", 0) \
     DECLARE(UInt64, max_format_parsing_thread_pool_free_size, 0, R"(
 Maximum number of idle standby threads to keep in the thread pool for parsing input.
 )", 0) \
@@ -899,6 +908,11 @@ A value of `0` means no limitation.
 ```xml
 <max_named_collection_num_to_throw>400</max_named_collection_num_to_throw>
 ```
+)", 0) \
+    DECLARE(Bool, ai_function_allow_sql_named_collections, true, R"(
+Allows AI functions (such as `aiGenerate`, `aiEmbed`, `aiSimilarity`) to use named collections created with `CREATE NAMED COLLECTION`.
+When disabled, AI functions accept only named collections defined in the server configuration file, and using any other collection throws an exception.
+This applies both to the `credentials` parameter and to the `ai_function_text_default_credentials` and `ai_function_embedding_default_credentials` settings.
 )", 0) \
     DECLARE(UInt64, max_table_num_to_throw, 0lu, R"(
 If number of tables is greater than this value, server will throw an exception.
@@ -1952,7 +1966,7 @@ Configured as `named_collections_storage.type` (`<named_collections_storage><typ
     DECLARE(Bool, openssl_client_load_default_ca_file, true, R"(Determines whether built-in CA certificates for OpenSSL will be used. ClickHouse assumes that builtin CA certificates are in the file `</etc/ssl/cert.pem>` (resp. the directory `</etc/ssl/certs>`) or in file (resp. directory) specified by the environment variable `<SSL_CERT_FILE>` (resp. `<SSL_CERT_DIR>`).)", 0, "openSSL.client.loadDefaultCAFile") \
     DECLARE(String, openssl_client_chipher_list, "ALL:!ADH:!LOW:!EXP:!MD5:!3DES:@STRENGTH", R"(Supported OpenSSL encryptions.)", 0, "openSSL.client.cipherList") \
     DECLARE(Bool, openssl_client_cache_sessions, false, R"(Enables or disables caching sessions. Must be used in combination with `<sessionIdContext>`. Acceptable values: `<true>`, `<false>`.)", 0, "openSSL.client.cacheSessions") \
-    DECLARE(Bool, openssl_client_extended_verification, true, R"(If enabled, verify that the certificate CN or SAN matches the peer hostname.)", 0, "openSSL.client.extendedVerification") \
+    DECLARE(Bool, openssl_client_extended_verification, false, R"(If enabled, verify that the certificate CN or SAN matches the peer hostname.)", 0, "openSSL.client.extendedVerification") \
     DECLARE(Bool, openssl_client_required_tls_v1, false, R"(Require a TLSv1 connection. Acceptable values: `<true>`, `<false>`.)", 0, "openSSL.client.requireTLSv1") \
     DECLARE(Bool, openssl_client_required_tls_v1_1, false, R"(Require a TLSv1.1 connection. Acceptable values: `<true>`, `<false>`.)", 0, "openSSL.client.requireTLSv1_1") \
     DECLARE(Bool, openssl_client_required_tls_v1_2, false, R"(Require a TLSv1.2 connection. Acceptable values: `<true>`, `<false>`.)", 0, "openSSL.client.requireTLSv1_2") \
@@ -3707,6 +3721,12 @@ ChangeableSettingsMap collectChangeableServerSettings(ContextPtr context)
              {getIcebergManifestDecodeThreadPool().isInitialized() ? std::to_string(getIcebergManifestDecodeThreadPool().get().getMaxFreeThreads()) : "0", ChangeableWithoutRestart::Yes}},
             {"iceberg_manifest_decode_thread_pool_queue_size",
              {getIcebergManifestDecodeThreadPool().isInitialized() ? std::to_string(getIcebergManifestDecodeThreadPool().get().getQueueSize()) : "0", ChangeableWithoutRestart::Yes}},
+            {"ai_function_max_thread_pool_size",
+             {getAIRequestThreadPool().isInitialized() ? std::to_string(getAIRequestThreadPool().get().getMaxThreads()) : "0", ChangeableWithoutRestart::Yes}},
+            {"ai_function_max_thread_pool_free_size",
+             {getAIRequestThreadPool().isInitialized() ? std::to_string(getAIRequestThreadPool().get().getMaxFreeThreads()) : "0", ChangeableWithoutRestart::Yes}},
+            {"ai_function_thread_pool_queue_size",
+             {getAIRequestThreadPool().isInitialized() ? std::to_string(getAIRequestThreadPool().get().getQueueSize()) : "0", ChangeableWithoutRestart::Yes}},
 
             {"abort_on_logical_error", {std::to_string(DB::abort_on_logical_error), ChangeableWithoutRestart::Yes}},
 

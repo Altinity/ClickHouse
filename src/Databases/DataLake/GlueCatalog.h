@@ -87,6 +87,14 @@ public:
 
     bool updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr new_snapshot, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
+    bool updateMetadataIfCurrent(
+        const String & namespace_name,
+        const String & table_name,
+        const String & new_metadata_path,
+        Poco::JSON::Object::Ptr new_snapshot,
+        const String & expected_metadata_location,
+        const DB::ForwardedAuthTokenPtr & auth_token) const override;
+
     bool updateSchema(
         const String & namespace_name,
         const String & table_name,
@@ -189,14 +197,30 @@ private:
     Poco::JSON::Object::Ptr getOrFetchMetadataObject(
         const AuthenticatedClient & client, const String & metadata_uri, const TableMetadata & table_metadata) const;
 
+    struct TableVersion
+    {
+        String version_id;
+        /// The raw `metadata_location` table parameter; empty if the table has none.
+        String metadata_location;
+    };
+
+    /// Reads the table with one `GetTable` call. Throws if the call fails.
+    TableVersion getTableVersion(
+        const String & namespace_name,
+        const String & table_name,
+        const DB::ForwardedAuthTokenPtr & auth_token) const;
+
     /// Shared implementation for updateMetadata / updateSchema that optionally
     /// sets StorageDescriptor columns in the Glue UpdateTable call.
+    /// When `version_id` is non-empty, the Glue UpdateTable request includes it
+    /// for optimistic concurrency control; a version mismatch returns false.
     bool updateTableInGlue(
         const String & namespace_name,
         const String & table_name,
         const String & new_metadata_path,
         const DB::ForwardedAuthTokenPtr & auth_token,
-        const std::vector<Aws::Glue::Model::Column> & columns = {}) const;
+        const std::vector<Aws::Glue::Model::Column> & columns = {},
+        const String & version_id = {}) const;
 
     mutable DB::CacheBase<String, Poco::JSON::Object::Ptr> metadata_objects;
     mutable DB::CacheBase<String, FieldTypes, std::hash<String>, FieldTypesWeightFunction> current_schema_field_types;
