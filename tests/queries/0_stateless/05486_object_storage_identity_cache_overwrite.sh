@@ -5,15 +5,15 @@
 # Tag no-parallel-replicas: per-query S3 request counts change when a read is spread across replicas
 
 # Overwriting an object drops its identity-cache entry. The next read misses and HEADs, so it
-# sees the new size. The second insert is longer than the first. s3_validate_etag_on_read is off,
-# so a stale cached size would be the read bound and the new rows would be truncated.
+# sees the new size. The second insert is longer than the first. Without the drop, the next read
+# would send If-Match with the previous ETag and fail, so the drop is what makes it read the new rows.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
 
 URL="http://localhost:11111/test/${CLICKHOUSE_TEST_UNIQUE_NAME}.tsv"
-READ_SETTINGS="max_threads = 1, use_hive_partitioning = 0, parallel_replicas_for_cluster_engines = 0, enable_filesystem_cache = 0, use_page_cache_for_object_storage = 0, s3_validate_etag_on_read = 0, use_object_storage_list_objects_cache = 0"
+READ_SETTINGS="max_threads = 1, use_hive_partitioning = 0, parallel_replicas_for_cluster_engines = 0, enable_filesystem_cache = 0, use_page_cache_for_object_storage = 0, s3_validate_etag_on_read = 1, use_object_storage_list_objects_cache = 0"
 
 fail()
 {
