@@ -18,6 +18,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
+    extern const int TIMEOUT_EXCEEDED;
 }
 
 class CommandFsck final : public ICommand
@@ -33,13 +34,16 @@ public:
                       "stream (chain_broken), a corrupted GC run, a malformed key (lifeless_keys), a malformed "
                       "deletion intent (intent_malformed), a deletion intent or its body that could not be read "
                       "(intent_unread), or a `pending` GC row whose deletion intent is absent while its body is "
-                      "present (pending_without_intent).";
+                      "present (pending_without_intent). "
+                      "Also exits 1 with TIMEOUT_EXCEEDED when `--partial` cut the scan short at its deadline, "
+                      "unless a finding already failed it.";
         options_description.add_options()("detail", "list per-object rows (class, key, size, reachable_from)")(
             "timeout", po::value<UInt64>(), "abort the scan after N seconds with a clear error instead of hanging (default 600; 0 = unbounded)")(
             "namespace", po::value<String>(), "scope the scan to namespaces with this prefix (skips the pool-wide "
                                                "physical/pipeline classification; still reports the scoped namespaces' "
                                                "dangling refs and orphan-manifest debris as unreachable)")(
-            "partial", "on --timeout, print the counts accumulated so far flagged partial=1 instead of aborting empty-handed")(
+            "partial", "on --timeout, print the counts accumulated so far flagged partial=1 instead of aborting empty-handed; "
+                                                                                                           "the command still exits 1 with TIMEOUT_EXCEEDED unless a finding already failed it")(
             "fix", po::value<String>(), "repair: `legacy-markers` deletes the `.meta` markers left from the marker protocol "
                                         "(whole-pool scans only; nothing else is ever deleted; not on a local object "
                                         "storage, where `cas-migrate-pool` removes them)")(
@@ -276,6 +280,12 @@ public:
                 "cas-fsck: {} `pending` GC row(s) have no deletion intent while their body is present: GC would delete "
                 "those bodies without warning any writer. Stop GC on this pool and report it (the keys are listed as "
                 "`pending-without-intent` rows under --detail)", report.pending_without_intent);
+        /// A finding above has already thrown its own error; exit 0 here would read as "checked".
+        if (report.partial)
+            throw Exception(
+                ErrorCodes::TIMEOUT_EXCEEDED,
+                "cas-fsck: the scan was cut short by its deadline and is NOT a clean result: the counts are lower bounds "
+                "over the part scanned: {}", report.partial_reason);
         /// `unreachable` stays a soft finding: it counts every present blob no ref names, and that includes
         /// the GC pipeline's `pending_gc`/`awaiting_gc` and an in-flight build's not-yet-adopted blobs
         /// (`unaccounted`), so a healthy pool under load is never clean by that measure.

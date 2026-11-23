@@ -138,8 +138,7 @@ struct FsckObject
 /// total of all present-but-unreferenced objects, including the GC pipeline classes and manifest debris,
 /// and is intentionally retained as one monotone number for residual-settling monitoring. The detailed
 /// `objects` list is populated according to the scan's `detail` mode. In partial mode all counters are
-/// lower bounds over the portion walked before the deadline; `clean` must not be used as a claim about
-/// the unvisited part of the pool.
+/// lower bounds over the portion walked before the deadline, and `clean` is false.
 struct FsckReport
 {
     uint64_t reachable = 0;
@@ -201,7 +200,7 @@ struct FsckReport
     /// `chain_broken` counts namespaces with a proven hole (see `FsckClass::ChainBroken`) and is a HARD
     /// ERROR: part of `clean`, and the command exits nonzero on it. `unchecked` counts namespaces the
     /// walk could not prove either way; it is COVERAGE, not a finding, so it
-    /// is reported and printed but does not make a report unclean — exactly like `partial`. A pool with
+    /// is reported and printed but does not make a report unclean. A pool with
     /// nothing wrong reads `chain_broken=0 unchecked=0`, so `unchecked` is never a resting state.
     ///
     /// `ref_records_walked` is how many ref-log records the walk actually read and proved, summed over
@@ -245,7 +244,7 @@ struct FsckReport
     uint64_t distinct_blobs = 0;
 
     /// Set when the scan hit its deadline in partial mode: counts cover only what was walked
-    /// before the deadline — a lower bound, not the pool truth.
+    /// before the deadline — a lower bound, not the pool truth, so `clean` is false.
     bool partial = false;
     String partial_reason;
 
@@ -256,9 +255,9 @@ struct FsckReport
 
     /// Return whether the scan found no missing reachable object or hard integrity violation. Expected
     /// GC backlog classes do not make a report unclean, and neither do the informational intent classes
-    /// or `legacy_marker`; a partial report only covers the visited subset. `stale_edge` is a hard
-    /// finding, but it is only ever nonzero in `detail` mode — a clean summary report says nothing about
-    /// stale edges, exactly as a partial report says nothing about the unvisited part of the pool.
+    /// or `legacy_marker`. A partial report is never clean: it covers only the visited subset. `stale_edge` is a
+    /// hard finding, but it is only ever nonzero in `detail` mode — a clean summary report says nothing about
+    /// stale edges.
     /// `chain_broken` is a hard finding in every mode. `unchecked` deliberately is NOT one: it says the
     /// walk proved nothing about those namespaces, which is a statement about COVERAGE, and folding it
     /// in here would make "cannot prove" indistinguishable from "found broken".
@@ -275,7 +274,7 @@ struct FsckHardFinding
 };
 
 /// THE HARD FINDINGS, and the single authority on what they are. `FsckReport::clean` is computed from
-/// this list, so adding a term means adding a row here.
+/// this list and from `partial`, so adding a finding means adding a row here.
 ///
 /// The name is the one the text summary line and the SQL result column both use, which is what lets a
 /// test check a rendering surface by iterating this list instead of restating its contents.
@@ -336,6 +335,8 @@ static_assert(kFsckHardFindings.size() == 8,
 
 inline bool FsckReport::clean() const
 {
+    if (partial)
+        return false;
     for (const FsckHardFinding & finding : kFsckHardFindings)
         if (this->*finding.value != 0)
             return false;

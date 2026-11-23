@@ -1946,12 +1946,17 @@ void spinPast(const ToolDeadline & deadline)
     }
 }
 
-/// Spins until at most `ms` are left before `deadline`.
-void spinUntilLeft(const ToolDeadline & deadline, uint64_t ms)
+/// Moves the virtual clock just past `deadline`.
+void advancePast(VirtualRetryClock & clock, const ToolDeadline & deadline)
 {
-    while (deadline.remainingMs() > ms)
-    {
-    }
+    clock.advance(deadline.remainingMs() + 1);
+}
+
+/// Moves the virtual clock until at most `ms` are left before `deadline`.
+void advanceUntilLeft(VirtualRetryClock & clock, const ToolDeadline & deadline, uint64_t ms)
+{
+    if (deadline.remainingMs() > ms)
+        clock.advance(deadline.remainingMs() - ms);
 }
 
 /// A pool whose bodies, intents and legacy markers the tests plant one by one, with no GC round.
@@ -2928,13 +2933,14 @@ TEST(CASFsck, PresentPendingBodiesStopAtTheDeadline)
         ASSERT_TRUE(objectPresent(*f.backend, f.bodyKey(b))) << "fixture: the body is present";
         intent_keys.push_back(f.intentKey(b));
     }
+    const auto clock = VirtualRetryClock::installOn(f.store);
     const ToolDeadline deadline = fsckDeadlineIn(*f.store, std::chrono::seconds(1));
-    /// The pool's clock is the real one, so the first body `HEAD` waits for it to pass the deadline.
+    /// The first body `HEAD` moves the pool's virtual clock past the deadline.
     for (const uint64_t b : blobs)
-        f.backend->beforeHead(f.bodyKey(b), [&deadline] { spinPast(deadline); });
+        f.backend->beforeHead(f.bodyKey(b), [clock, &deadline] { advancePast(*clock, deadline); });
     f.backend->clearJournal();
 
-    expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, "during 'checking pending rows'", [&]
+    expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, "during 'head-checking retired bodies'", [&]
     {
         (void)runFsck(*f.store, /*detail=*/false, {}, deadline);
     });
@@ -2969,16 +2975,43 @@ TEST(CASFsck, DeadlinePassingDuringARowStopsBeforeTheNextRowsHead)
     FsckGcFixture f(/*create_budget=*/0, {1, 2});
     f.drop();
     f.round();
+    const auto clock = VirtualRetryClock::installOn(f.store);
     const ToolDeadline deadline = fsckDeadlineIn(*f.store, std::chrono::seconds(1));
     for (const uint64_t b : blobs)
-        f.backend->beforeRead(f.intentKey(b), 0, [&deadline] { spinPast(deadline); });
+        f.backend->beforeRead(f.intentKey(b), 0, [clock, &deadline] { advancePast(*clock, deadline); });
     f.backend->clearJournal();
 
-    expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, "during 'classifying unreferenced bodies'", [&]
+    expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, "during 'head-checking retired bodies'", [&]
     {
         (void)runFsck(*f.store, /*detail=*/false, {}, deadline);
     });
     EXPECT_EQ(bodyHeads(f, blobs), 1u) << "the second row's body HEAD was sent after the deadline";
+}
+
+/// A pending row whose body is already gone is checked after the bodies loop; a deadline passing there names that phase.
+TEST(CASFsck, DeadlinePassingInThePendingRowsPhaseNamesIt)
+{
+    FsckGcFixture f(/*create_budget=*/0, {1, 2});
+    f.drop();
+    f.round();
+    /// The intent key is derived from the live body, so it is taken before the body goes.
+    const std::vector<String> intents{f.intentKey(1), f.intentKey(2)};
+    f.removeBody(1);
+    f.removeBody(2);
+    const auto clock = VirtualRetryClock::installOn(f.store);
+    const ToolDeadline deadline = fsckDeadlineIn(*f.store, std::chrono::seconds(1));
+    for (const String & key : intents)
+        f.backend->beforeRead(key, 0, [clock, &deadline] { advancePast(*clock, deadline); });
+    f.backend->clearJournal();
+
+    expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, "during 'checking pending rows'", [&]
+    {
+        (void)runFsck(*f.store, /*detail=*/false, {}, deadline);
+    });
+    size_t intent_reads = 0;
+    for (const String & key : intents)
+        intent_reads += countKeyRequests(f.backend->journal(), JournalVerb::Read, key);
+    EXPECT_EQ(intent_reads, 1u) << "positive control: the first row was checked, the second was stopped";
 }
 
 /// A deadline that passes during the intent read stops the scan before the body `HEAD` that follows an absent intent.
@@ -2989,15 +3022,40 @@ TEST(CASFsck, DeadlinePassingDuringAnAbsentIntentReadStopsBeforeTheBodyHead)
     f.round();
     const String intent_key = f.intentKey(1);
     f.removeIntent(1);
+    const auto clock = VirtualRetryClock::installOn(f.store);
     const ToolDeadline deadline = fsckDeadlineIn(*f.store, std::chrono::seconds(1));
-    f.backend->beforeRead(intent_key, 0, [&deadline] { spinPast(deadline); });
+    f.backend->beforeRead(intent_key, 0, [clock, &deadline] { advancePast(*clock, deadline); });
     f.backend->clearJournal();
 
-    expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, "during 'checking pending rows'", [&]
+    expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, "during 'head-checking retired bodies'", [&]
     {
         (void)runFsck(*f.store, /*detail=*/false, {}, deadline);
     });
     EXPECT_EQ(bodyHeads(f, {1}), 1u) << "only the retired-body HEAD precedes the deadline; the pending check sent another";
+}
+
+/// A summary-only scan counts intents straight from the listing; a deadline refusing that listing names the counting phase.
+TEST(CASFsck, DeadlinePassingBeforeTheSummaryIntentListingNamesTheCountingPhase)
+{
+    FsckIntentFixture f;
+    f.staleIntent(1);
+    const auto clock = VirtualRetryClock::installOn(f.store);
+    const ToolDeadline deadline = fsckDeadlineIn(*f.store, std::chrono::seconds(1));
+    bool counting_started = false;
+    const FsckProgress passes_deadline = [&, clock](FsckProgressStep step, std::string_view phase, std::string_view, uint64_t, double)
+    {
+        if (step == FsckProgressStep::Start && phase == "counting blob intents")
+        {
+            counting_started = true;
+            advancePast(*clock, deadline);
+        }
+    };
+
+    expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, "during 'counting blob intents'", [&]
+    {
+        (void)runFsck(*f.store, /*detail=*/false, passes_deadline, deadline);
+    });
+    EXPECT_TRUE(counting_started) << "positive control: the counting phase started";
 }
 
 /// With intent verification, a deadline that passes during an intent's read stops the scan before that intent's body
@@ -3007,11 +3065,12 @@ TEST(CASFsck, DeadlinePassingDuringAVerifiedIntentReadStopsBeforeTheBodyHead)
     FsckIntentFixture f;
     f.body(1);
     const String intent = f.currentIntent(1);
+    const auto clock = VirtualRetryClock::installOn(f.store);
     const ToolDeadline deadline = fsckDeadlineIn(*f.store, std::chrono::seconds(1));
-    f.backend->beforeRead(intent, 0, [&deadline] { spinPast(deadline); });
+    f.backend->beforeRead(intent, 0, [clock, &deadline] { advancePast(*clock, deadline); });
     f.backend->clearJournal();
 
-    expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, "during 'reading blob intents'", [&]
+    expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, "during 'verifying blob intents'", [&]
     {
         (void)runFsck(*f.store, /*detail=*/false, {}, deadline, /*partial_on_deadline=*/false, {},
                       /*fix_legacy_markers=*/false, /*verify_intents=*/true);
@@ -3062,15 +3121,16 @@ TEST(CASFsckPartial, TimeLeftShorterThanOneAttemptEndsIntentVerificationAsPartia
     plantIntentForCurrentBody(*backend, layout, blobRefOf(1));
     const String intent = *intentKeyOfCurrentBody(*backend, layout, blobRefOf(1));
     const String body = layout.blobKey(blobRefOf(1));
+    const auto clock = VirtualRetryClock::installOn(store);
     const ToolDeadline deadline = fsckDeadlineIn(*store, std::chrono::seconds(2));
-    backend->beforeRead(intent, 0, [&deadline] { spinUntilLeft(deadline, kFsckEnvelopeMs / 2); });
+    backend->beforeRead(intent, 0, [clock, &deadline] { advanceUntilLeft(*clock, deadline, kFsckEnvelopeMs / 2); });
     backend->clearJournal();
 
     const FsckReport report = runFsck(*store, /*detail=*/false, {}, deadline, /*partial_on_deadline=*/true, {},
                                       /*fix_legacy_markers=*/false, /*verify_intents=*/true);
 
     ASSERT_TRUE(report.partial) << formatFsckSummary(report);
-    EXPECT_NE(report.partial_reason.find("exceeded the deadline during 'reading blob intents'"), String::npos)
+    EXPECT_NE(report.partial_reason.find("exceeded the deadline during 'verifying blob intents'"), String::npos)
         << report.partial_reason;
     EXPECT_EQ(report.intent_unread, 0u) << formatFsckSummary(report);
     const auto journal = backend->journal();
@@ -3088,16 +3148,17 @@ TEST(CASFsckPartial, AReadFailingWithLessThanOneAttemptLeftEndsTheScanAsPartial)
     writeBlobBody(*backend, layout, numberedBlobHash(1));
     plantIntentForCurrentBody(*backend, layout, blobRefOf(1));
     const String intent = *intentKeyOfCurrentBody(*backend, layout, blobRefOf(1));
+    const auto clock = VirtualRetryClock::installOn(store);
     const ToolDeadline deadline = fsckDeadlineIn(*store, std::chrono::seconds(2));
     backend->timed_out_reads.insert(intent);
-    backend->beforeRead(intent, 0, [&deadline] { spinUntilLeft(deadline, kFsckEnvelopeMs / 2); });
+    backend->beforeRead(intent, 0, [clock, &deadline] { advanceUntilLeft(*clock, deadline, kFsckEnvelopeMs / 2); });
     backend->clearJournal();
 
     const FsckReport report = runFsck(*store, /*detail=*/false, {}, deadline, /*partial_on_deadline=*/true, {},
                                       /*fix_legacy_markers=*/false, /*verify_intents=*/true);
 
     ASSERT_TRUE(report.partial) << formatFsckSummary(report);
-    EXPECT_NE(report.partial_reason.find("exceeded the deadline during 'reading blob intents'"), String::npos)
+    EXPECT_NE(report.partial_reason.find("exceeded the deadline during 'verifying blob intents'"), String::npos)
         << report.partial_reason;
     EXPECT_EQ(report.intent_unread, 0u) << formatFsckSummary(report);
     EXPECT_EQ(countKeyRequests(backend->journal(), JournalVerb::Read, intent), 1u) << "positive control: the intent read was sent";
@@ -3112,11 +3173,12 @@ TEST(CASFsckPartial, TimeLeftShorterThanOneAttemptEndsTheRefWalkAsPartial)
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/envelope_deadline@cas@"};
     const NamespaceLifeId life = writeFsckFixtureWithTail(*backend, layout, ns);
+    const auto clock = VirtualRetryClock::installOn(store);
     const ToolDeadline deadline = fsckDeadlineIn(*store, std::chrono::seconds(2));
     bool spun = false;
     backend->armOnFirstGet(layout.refLogKey(life, RefTxnId{1, 2}), [&]
     {
-        spinUntilLeft(deadline, kFsckEnvelopeMs / 2);
+        advanceUntilLeft(*clock, deadline, kFsckEnvelopeMs / 2);
         spun = true;
     });
 
@@ -3124,7 +3186,7 @@ TEST(CASFsckPartial, TimeLeftShorterThanOneAttemptEndsTheRefWalkAsPartial)
 
     ASSERT_TRUE(spun) << "positive control: the walk read the tail log";
     ASSERT_TRUE(report.partial) << formatFsckSummary(report);
-    EXPECT_NE(report.partial_reason.find("exceeded the deadline during 'ref stream'"), String::npos) << report.partial_reason;
+    EXPECT_NE(report.partial_reason.find("exceeded the deadline during 'walking refs'"), String::npos) << report.partial_reason;
     EXPECT_EQ(report.unchecked, 0u) << formatFsckSummary(report);
     EXPECT_FALSE(anyNoteContains(report, "could not")) << formatFsckSummary(report);
 }
@@ -4562,6 +4624,80 @@ TEST(CASFsckPartial, DeadlineReturnsAccumulatedCountsInsteadOfThrowing)
     EXPECT_FALSE(report.partial_reason.empty());
 }
 
+/// A scan cut short by its deadline has checked only part of the pool, so it cannot be a clean verdict.
+TEST(CASFsckPartial, DeadlineWithNoFindingIsNotClean)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xAA);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    const uint64_t sequence = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, sequence});
+
+    const ToolDeadline past = fsckDeadlineIn(*store, std::chrono::milliseconds(0));
+    const auto report = DB::Cas::runFsck(*store, false, {}, past, /*partial_on_deadline=*/true);
+
+    ASSERT_TRUE(report.partial);
+    for (const FsckHardFinding & finding : kFsckHardFindings)
+        EXPECT_EQ(report.*finding.value, 0u) << finding.name;
+    EXPECT_FALSE(report.clean());
+}
+
+/// A finding recorded before the cut stays in the report, and the line carries both facts.
+TEST(CASFsckPartial, FindingRecordedBeforeTheCutIsReportedAndNotClean)
+{
+    FsckGcFixture f(/*create_budget=*/0, {1, 2, 3, 4});
+    f.drop();
+    f.round();
+    const String lifeless = f.store->layout().casRefsPrefix() + f.ns.string() + "/_log/"
+        + renderRefTxnId(RefTxnId{1, 1}) + ".zst";
+    {
+        OperationForTest op(*f.backend);
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(lifeless, "garbage", Retry::once())));
+    }
+    const auto clock = VirtualRetryClock::installOn(f.store);
+    const ToolDeadline deadline = fsckDeadlineIn(*f.store, std::chrono::seconds(1));
+    for (const uint64_t b : {1, 2, 3, 4})
+        f.backend->beforeHead(f.bodyKey(b), [clock] { clock->advance(2000); });
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true, {}, deadline, /*partial_on_deadline=*/true);
+
+    ASSERT_TRUE(rep.partial);
+    EXPECT_NE(rep.partial_reason.find("during 'head-checking retired bodies'"), String::npos) << rep.partial_reason;
+    EXPECT_EQ(rep.lifeless_keys, 1u);
+    size_t rows = 0;
+    for (const FsckObject & o : rep.objects)
+        if (o.cls == FsckClass::LifelessKey)
+            ++rows;
+    EXPECT_EQ(rows, 1u);
+    EXPECT_FALSE(rep.clean());
+    const String line = formatFsckSummary(rep);
+    EXPECT_NE(line.find("lifeless_keys=1"), String::npos) << line;
+    EXPECT_NE(line.find("partial=1"), String::npos) << line;
+}
+
+/// A deadline that is not reached leaves the report clean: `clean` does not depend on a deadline existing.
+TEST(CASFsckPartial, CompleteScanWithADeadlineIsClean)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xAA);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    const uint64_t sequence = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, sequence});
+
+    const ToolDeadline later = fsckDeadlineIn(*store, std::chrono::hours(1));
+    const auto report = DB::Cas::runFsck(*store, false, {}, later, /*partial_on_deadline=*/true);
+
+    EXPECT_FALSE(report.partial);
+    EXPECT_TRUE(report.clean());
+    EXPECT_EQ(formatFsckSummary(report).find("partial="), String::npos);
+}
+
 /// A `namespace_prefix` scopes the scan to only the matching namespaces' refs (dangling-only): no
 /// pool-wide unreachable/pending/awaiting/unaccounted classification, since that needs the whole pool.
 TEST(CASFsckScoped, NamespacePrefixChecksOnlyMatchingRefsDanglingOnly)
@@ -4872,6 +5008,13 @@ TEST(CASFsckSummary, AdvisoryIntentCountersAndTheVerificationFlagArePrinted)
     EXPECT_NE(verified.find("intents_listed=5"), String::npos) << verified;
     EXPECT_NE(verified.find("standing_present=2"), String::npos) << verified;
     EXPECT_TRUE(report.clean()) << "the advisory counters never make a report unclean";
+}
+
+/// Pins the exact token order and set of a complete clean line, which scripts parse by key.
+TEST(CASFsckSummary, CompleteCleanLineIsUnchanged)
+{
+    EXPECT_EQ(formatFsckSummary(FsckReport{}), 
+        "reachable=0 dangling=0 unreachable=0 pending_gc=0 awaiting_gc=0 unaccounted=0 stale_edge=0 stale_edge_superseded=0 corrupted_runs=0 chain_broken=0 lifeless_keys=0 intents_listed=0 intent_current=0 intent_replaced=0 intent_body_gone=0 intent_malformed=0 intent_unread=0 pending_without_intent=0 pending_intent_absent=0 pending_token_rejected=0 standing_present=0 intents_verified=0 legacy_marker=0 legacy_markers_deleted=0 legacy_markers_changed=0 janitor_pending=0 janitor_pending_bytes=0 janitor_pending_lives=0 stalled_creating=0 creating_unproven=0 unchecked=0 ref_records_walked=0 physical_bytes=0 referenced_logical_bytes=0 distinct_blobs=0 total_blob_refs=0 dedup_ratio=0");
 }
 
 TEST(CASFsckSummary, PartialFlagAndReasonTravelWithTheCounts)
@@ -5362,7 +5505,7 @@ TEST(CASFsck, ProgressStopsAtTheInterruptedPhase)
     const FsckReport rep = runFsck(*f.store, /*detail=*/false, recordInto(log), deadline, /*partial_on_deadline=*/true);
 
     ASSERT_TRUE(rep.partial);
-    EXPECT_NE(rep.partial_reason.find("checking pending rows"), String::npos) << rep.partial_reason;
+    EXPECT_NE(rep.partial_reason.find("during 'head-checking retired bodies'"), String::npos) << rep.partial_reason;
     EXPECT_EQ(countOf(log, "head-checking retired bodies", FsckProgressStep::Start), 1u);
     EXPECT_EQ(countOf(log, "head-checking retired bodies", FsckProgressStep::End), 0u);
     ASSERT_FALSE(log.empty());

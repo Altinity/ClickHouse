@@ -413,7 +413,7 @@ and the lease of a pool migrated from an older generation whose GC ever ran, bec
 
 Exit code of a non-interactive `--query`: 1 when any `cas-*` command in it threw (`cas-fsck` throws on
 `dangling`, `chain_broken`, `corrupted_runs`, `lifeless_keys`, `intent_malformed`, `intent_unread` and `pending_without_intent`; `unreachable` is a soft count that
-includes the GC pipeline and in-flight builds), and so does a `cas-*` command given bad arguments,
+includes the GC pipeline and in-flight builds; a `--partial` scan cut short by its deadline also exits 1 with `TIMEOUT_EXCEEDED` unless a finding already failed it; the status is the same as a finding's, so a script tells them apart by the error name on stderr), and so does a `cas-*` command given bad arguments,
 whatever ran after it; the upstream commands keep `clickhouse-disks`'s "always 0" contract, as does an
 unknown command name.
 
