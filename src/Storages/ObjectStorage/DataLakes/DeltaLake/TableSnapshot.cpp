@@ -402,6 +402,9 @@ public:
             /// Rethrown to the stale-credentials retry in `scanDataFunc`, which keeps the snapshot version.
             if (isStaleCredentialsError(e))
                 throw;
+            /// Only a failed kernel read or malformed metadata skips the fallback; other errors propagate.
+            if (e.code() != DB::ErrorCodes::DELTA_KERNEL_ERROR && e.code() != DB::ErrorCodes::INCORRECT_DATA)
+                throw;
             LOG_WARNING(
                 log, "Cannot read the clustering columns of table {}, not using the clustering predicate fallback: {}",
                 getTableLocation(), e.message());
@@ -448,13 +451,13 @@ public:
         auto fallback_predicate = getEnginePredicate(*restricted_dag, fallback_exception, getContext());
 
         /// The predicate is translated inside `ffi::scan`, so its outcome is known only afterwards.
-        KernelScan fallback_scan = KernelUtils::unwrapResult(
+        KernelScan fallback_scan(KernelUtils::unwrapResult(
             ffi::scan(
                 kernel_snapshot_state->snapshot.get(),
                 kernel_snapshot_state->engine.get(),
                 fallback_predicate.get(),
                 /* schema */nullptr),
-            "scan");
+            "scan"));
 
         if (fallback_exception)
         {
