@@ -331,8 +331,10 @@ public:
     /// Cancels up to 16 `Creating` catalog rows minted under this mount's exact live creator fence whose
     /// name has no cold admission in flight here; the check is repeated inside the catalog lane. One scan
     /// read per call; each cancel may add its own catalog reads and conditional writes. `pause` replaces
-    /// the mount plane's retry sleep. An absent catalog is logged and ends the call; other failures throw.
-    void cancelIdleOwnCreatingRows(const Liveness & alive, std::function<void(uint64_t)> pause);
+    /// the mount plane's retry sleep. `stop_requested` is checked before the read and before each cancel, and
+    /// ends the call when true. An absent catalog is logged and ends the call; other failures throw.
+    void cancelIdleOwnCreatingRows(const Liveness & alive, std::function<void(uint64_t)> pause,
+                                   const std::function<bool()> & stop_requested = {});
 
     /// One cold admission of a name, from the capture of its retirement count before the catalog read
     /// to the publish of its runtime. Until it is released, and unless a remount clears the map, the name's

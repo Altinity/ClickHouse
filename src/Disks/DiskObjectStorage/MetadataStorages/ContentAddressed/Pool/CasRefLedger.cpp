@@ -747,9 +747,13 @@ CasRefLedger::ColdAdmission::~ColdAdmission()
     ledger->releaseColdAdmissionLocked(*this);
 }
 
-void CasRefLedger::cancelIdleOwnCreatingRows(const Liveness & alive, std::function<void(uint64_t)> pause)
+void CasRefLedger::cancelIdleOwnCreatingRows(
+    const Liveness & alive, std::function<void(uint64_t)> pause, const std::function<bool()> & stop_requested)
 {
     static constexpr size_t kMaxCancelsPerPass = 16;
+    const auto stopped = [&] { return stop_requested && stop_requested(); };
+    if (stopped())
+        return;
     /// The order `Pool::captureMountIncarnation` uses: a generation that holds across the epoch read dates it.
     const uint64_t generation = fence_generation_fn();
     const uint64_t epoch = live_epoch_fn();
@@ -776,6 +780,8 @@ void CasRefLedger::cancelIdleOwnCreatingRows(const Liveness & alive, std::functi
     const size_t start = own_creating_rotation.load();
     for (size_t i = 0; i < std::min(kMaxCancelsPerPass, eligible.size()); ++i)
     {
+        if (stopped())
+            return;
         own_creating_rotation.store(start + i + 1);
         const CatalogEntry & row = eligible[(start + i) % eligible.size()];
         bool absent = false;

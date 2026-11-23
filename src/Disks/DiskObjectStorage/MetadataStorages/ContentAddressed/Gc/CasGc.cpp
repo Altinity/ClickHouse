@@ -2098,6 +2098,9 @@ struct RefStopPlan
 /// the walk keeps the prefix it applied.
 constexpr uint64_t kRefPlanMaxCrossings = 64;
 
+/// Least gap between two progress lines of pass 2.
+constexpr uint64_t kRefIntakeProgressIntervalMs = 60 * 1000;
+
 /// Ref-log bodies planning read, kept by exact key for the walk under a byte cap summed over the round's lives.
 class RetainedRefBodies
 {
@@ -2182,15 +2185,24 @@ uint64_t saturatingAdd(uint64_t a, uint64_t b)
 /// always reads. In each epoch it reads the greatest hinted id above the last record read present, doubles past
 /// that record to the first key read absent and bisects strictly between the two; a seal sends it to the head
 /// the seal's body names. Every absence it relies on is an exact `GET` answered absent, and every read error
-/// propagates. Bodies it reads go to `retained`; its absent reads are added to `absent_probes`.
-RefStopPlan planRefStops(GcReadAhead & reads, const Layout & layout, const NamespaceLifeId & life, const RefTxnId & first,
-                         const RefLifeHint & hint, RetainedRefBodies & retained, uint64_t & absent_probes)
+/// propagates. Bodies it reads go to `retained`; its absent reads are added to `absent_probes`. It asks
+/// `stop_requested` before every read and returns no plan once it answers true, because what it read so far
+/// fixes no stop.
+std::optional<RefStopPlan> planRefStops(GcReadAhead & reads, const Layout & layout, const NamespaceLifeId & life,
+                                        const RefTxnId & first, const RefLifeHint & hint, RetainedRefBodies & retained,
+                                        uint64_t & absent_probes, const std::function<bool()> & stop_requested)
 {
     RefStopPlan plan;
     plan.hint_ids.assign(std::upper_bound(hint.logs.begin(), hint.logs.end(), first), hint.logs.end());
 
+    bool stopped = false;
     const auto read = [&](const RefTxnId & id) -> std::optional<PlannedRecord>
     {
+        if (stop_requested())
+        {
+            stopped = true;
+            return std::nullopt;
+        }
         const String key = layout.refLogKey(life, id);
         std::optional<Object> got = reads.takeRead(key, ReadFamily::RefLog);
         if (!got)
@@ -2210,6 +2222,8 @@ RefStopPlan planRefStops(GcReadAhead & reads, const Layout & layout, const Names
         const uint64_t epoch = head.writer_epoch;
         uint64_t & last_present = plan.last_present[epoch];
         std::optional<PlannedRecord> record = read(head);
+        if (stopped)
+            return std::nullopt;
         if (head == first)
             plan.first_present = record.has_value();
         if (!record)
@@ -2223,7 +2237,10 @@ RefStopPlan planRefStops(GcReadAhead & reads, const Layout & layout, const Names
         std::optional<uint64_t> hi;
         const auto probe = [&](uint64_t sequence)
         {
-            if (auto got = read(RefTxnId{epoch, sequence}))
+            std::optional<PlannedRecord> got = read(RefTxnId{epoch, sequence});
+            if (stopped)
+                return;
+            if (got)
             {
                 record = got;
                 lo = sequence;
@@ -2240,7 +2257,7 @@ RefStopPlan planRefStops(GcReadAhead & reads, const Layout & layout, const Names
             probe(std::prev(past_epoch)->ref_sequence);
 
         const uint64_t base = lo;
-        for (uint64_t step = 1; record->kind == PlannedRecord::Kind::Ordinary && !hi; step = saturatingAdd(step, step))
+        for (uint64_t step = 1; !stopped && record->kind == PlannedRecord::Kind::Ordinary && !hi; step = saturatingAdd(step, step))
         {
             const uint64_t sequence = saturatingAdd(base, step);
             if (sequence <= lo)
@@ -2248,8 +2265,10 @@ RefStopPlan planRefStops(GcReadAhead & reads, const Layout & layout, const Names
             probe(sequence);
         }
 
-        while (record->kind == PlannedRecord::Kind::Ordinary && hi && *hi - lo > 1)
+        while (!stopped && record->kind == PlannedRecord::Kind::Ordinary && hi && *hi - lo > 1)
             probe(lo + (*hi - lo) / 2);
+        if (stopped)
+            return std::nullopt;
 
         switch (record->kind)
         {
@@ -2717,7 +2736,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
     /// a worker performed lands on that worker's ProfileEvents. Read `CASGCReadAheadHit`/`Miss`/`Wasted` on this row for the read-ahead's own behaviour.
     std::optional<GcPhaseTimer> intake_timer;
     intake_timer.emplace(phase_sink, "fold_ref_intake");
-    /// The slice of `kRefIntakeBudgetMs` that bounds pass 2 of the walk below.
+    /// The slice of `kRefIntakeBudgetMs` that bounds pass 2 of the walk below. It starts before planning, so
+    /// planning time is taken from the walk.
     const uint64_t intake_deadline_ms = mono_ms_fn() + kRefIntakeBudgetMs;
     uint64_t intake_tables_changed = 0;
     uint64_t intake_tables_clamped = 0;
@@ -2771,8 +2791,9 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
     /// Two things end it. The STOP: before the first manifest read, `planRefStops` fixes each life's end
     /// by exact `GET`s, and the walk ends at that key or at a terminal record without another request;
     /// nothing above it is folded this round even if it lands later. The SLICE (`kRefIntakeBudgetMs`):
-    /// pass 1 gives every namespace one read window and is never cut, so every quiet namespace is
-    /// proven; pass 2 continues the rest from `round mod n` and starts no read once the slice is over.
+    /// the slice never cuts pass 1, which gives every namespace one read window, so a round not asked to stop
+    /// proves every quiet namespace; pass 2 continues the rest from `round mod n` and starts no read once the slice
+    /// is over.
     /// A namespace the slice cuts keeps the cursor it reached and is unproven, which suppresses the
     /// round's destruction but not its fold.
     ///
@@ -2982,6 +3003,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         s.segment_first.reset();
     };
 
+    /// Waits for the reads already sent, so a stop request returns only after they are answered.
     const auto dropLookahead = [&](NamespaceIntake & s)
     {
         for (const auto & [id, key] : s.lookahead)
@@ -3232,8 +3254,44 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
                  "no record links to that epoch");
     };
 
+    /// Pass 2 only, so a long walk is visible to an operator. It paces itself and never changes a decision.
+    std::optional<uint64_t> progress_logged_ms;
+    const auto logProgress = [&](const NamespaceIntake & s, uint64_t now_ms)
+    {
+        if (!progress_logged_ms)
+        {
+            progress_logged_ms = now_ms;
+            return;
+        }
+        if (now_ms - *progress_logged_ms < kRefIntakeProgressIntervalMs)
+            return;
+        progress_logged_ms = now_ms;
+        const size_t finished = std::count_if(intakes.begin(), intakes.end(), [](const NamespaceIntake & i) { return !i.expected; });
+        LOG_INFO(logger,
+            "CAS GC ref intake progress: round={} namespace={} applied={} stop={} logs_applied={} lives_finished={} lives={}",
+            current_round, s.target->ns, s.resolved_through == RefTxnId{} ? "none" : renderRefTxnId(s.resolved_through),
+            s.plan.stop ? renderRefTxnId(*s.plan.stop) : "none", logs_applied, finished, intakes.size());
+    };
+
+    /// Only the first life the walk ends past its plan is named in the log: one cause can end every life the same way.
+    bool discovery_incomplete_logged = false;
+
+    /// Once true, stays true for the rest of the intake: no further planning or walk step starts.
+    bool stop_seen = false;
+    const auto stopRequested = [&]
+    {
+        if (!stop_seen && stop_signal && stop_signal())
+        {
+            stop_seen = true;
+            LOG_INFO(logger, "CAS GC ref intake: round {} was asked to stop; it deletes nothing, and every namespace it "
+                     "has not finished stays unproven and keeps the cursor it reached", current_round);
+        }
+        return stop_seen;
+    };
+
     /// Walk `s` in successor order to the stop its plan fixed: at most `take_limit` records when it is set,
-    /// and with `sliced` no read once the slice is over. Ending at the stop reads nothing.
+    /// and with `sliced` no read once the slice is over. Ending at the stop reads nothing. A stop request ends
+    /// the walk where it is, in either pass, as the end of the slice does.
     const auto walkNamespace = [&](NamespaceIntake & s, std::optional<size_t> take_limit, bool sliced)
     {
         const String & ns_str = s.target->ns;
@@ -3244,6 +3302,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         size_t takes = 0;
         while (s.expected && (!take_limit || takes < *take_limit))
         {
+            if (stopRequested())
+                break;
             if (s.plan.isStop(*s.expected))
             {
                 endAtStop(s);
@@ -3252,12 +3312,26 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
             /// Nothing this attempt observed bounds a key past the plan, so reading on would chase writers.
             if (!s.plan.covers(*s.expected))
             {
+                if (!discovery_incomplete_logged)
+                {
+                    discovery_incomplete_logged = true;
+                    LOG_INFO(logger,
+                        "CAS GC ref intake: namespace {} (life {}) reached {}, past what planning observed; it stays "
+                        "unproven this round and keeps the cursor {}",
+                        ns_str, renderIncarnation(s.life.incarnation), renderRefTxnId(*s.expected),
+                        resolved_through == RefTxnId{} ? "none" : renderRefTxnId(resolved_through));
+                }
                 s.expected.reset();
                 s.unproven_reason = FoldResult::FrontierUnproven::DiscoveryIncomplete;
                 break;
             }
-            if (sliced && mono_ms_fn() >= intake_deadline_ms)
-                break;
+            if (sliced)
+            {
+                const uint64_t now_ms = mono_ms_fn();
+                if (now_ms >= intake_deadline_ms)
+                    break;
+                logProgress(s, now_ms);
+            }
 
             /// Take + decode the expected record. An invalid body is a per-namespace hold: the key belongs
             /// to exactly one namespace, so it can never be grounds for discarding another namespace's fold.
@@ -3487,7 +3561,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         const bool table_changed = s.table_changed;
 
         dropLookahead(s);
-        if (s.expected)
+        if (s.expected || s.resolve_start)
             unproven_reason = FoldResult::FrontierUnproven::IntakeSliceCut;
         closeSegment(s);
         if (!s.segments.empty())
@@ -3582,8 +3656,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
             ++intake_tables_clamped;
     };
 
-    /// PASS 1 is never cut: every namespace gets one read window, which proves every quiet namespace in
-    /// every round.
+    /// The slice never cuts PASS 1: every namespace gets one read window, which proves every quiet namespace in
+    /// every round not asked to stop.
     const auto afterWalkHook = [&](uint8_t pass, const NamespaceIntake & walked, const NamespaceIntake * next)
     {
         if (round_point_hook_for_test)
@@ -3591,19 +3665,26 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
                                       .walked = walked.target->ns, .next = next ? next->target->ns : String{}});
     };
 
-    /// PLANNING: every life that still has a key to read gets its stop before any manifest is read.
+    /// PLANNING: every life that still has a key to read gets its stop before any manifest is read. A life whose
+    /// planning a stop request ends keeps an empty plan and is not walked, like the lives after it.
+    const std::function<bool()> planning_stop_requested = stopRequested;
     for (NamespaceIntake & s : intakes)
     {
         if (!s.expected && !s.resolve_start)
             continue;
+        if (stopRequested())
+            break;
         topUpFirstWalkHints();
         if (s.resolve_start)
             resolveStart(s);
         if (!s.expected)
             continue;
         const uint64_t absent_before = intake_absent_probes;
-        s.plan = planRefStops(reads, layout, s.life, *s.expected, hintFromListing(*s.target->listing),
-                              retained_ref_bodies, intake_absent_probes);
+        std::optional<RefStopPlan> plan = planRefStops(reads, layout, s.life, *s.expected,
+            hintFromListing(*s.target->listing), retained_ref_bodies, intake_absent_probes, planning_stop_requested);
+        if (!plan)
+            break;
+        s.plan = std::move(*plan);
         ++planning.lives;
         planning.hot += s.plan.first_present;
         planning.empty_hint += s.plan.hint_ids.empty();
@@ -3613,6 +3694,11 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
     }
     reads.closeApply();
     planning.retained_bytes = retained_ref_bodies.keptBytes();
+    LOG_INFO(logger,
+        "CAS GC ref intake planned: round={} lives={} quiet={} hot={} empty_hint={} crossings={} crossing_limit={} "
+        "planner_misses={} retained_bytes={}",
+        current_round, planning.lives, planning.lives - planning.hot, planning.hot, planning.empty_hint,
+        planning.crossings, planning.crossing_limit, planning.misses, planning.retained_bytes);
 
     if (round_point_hook_for_test)
         runRoundPointHookForTest(RoundPointForTest::AfterDiscovery);
@@ -3640,6 +3726,9 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         walkNamespace(s, std::nullopt, /*sliced=*/true);
         afterWalkHook(2, s, i + 1 < unfinished.size() ? pass_two_at(i + 1) : nullptr);
     }
+    /// The final intake poll. An empty catalog gives the walk nothing to poll, and a stop after the last walk would
+    /// otherwise go unseen; either way the round must not delete.
+    stopRequested();
 
     for (NamespaceIntake & s : intakes)
         finishNamespace(s);
@@ -3983,7 +4072,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         && (result.frontier_namespaces > 0 || result.catalog_cut_proved_empty);
     const bool frontier_incomplete = !result.frontier_complete;
 
-    const bool suppressed_by_intake = !report.anomalies.empty() || !carried_holds.empty() || frontier_incomplete;
+    const bool suppressed_by_intake
+        = !report.anomalies.empty() || !carried_holds.empty() || frontier_incomplete || stop_seen;
 
     /// Ref-log cleanup runs after its round commits a newer `gc/state`, so the leased version, still current
     /// after the last intake read, shows that no newer leader removed a record this round read as absent.
@@ -4038,8 +4128,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         /// is a per-round cause and is named explicitly here, because the bare equality
         /// `frontier_proven != frontier_namespaces` reads `0 != 0` (false) and would otherwise miss it.
         /// A catalog the cut DID prove empty is not a suppression cause at all: it satisfies
-        /// `frontier_complete`, so a round reaching this block with one is suppressed by an anomaly or
-        /// a hold, never by the frontier term.
+        /// `frontier_complete`, so a round reaching this block with one is suppressed by an anomaly, a hold
+        /// or a stop request, never by the frontier term. A stop request alone is not a pool problem: Info.
         const bool per_round_cause = !report.anomalies.empty() || !carried_holds.empty() || result.parent_unconfirmed
             || result.frontier_proven != result.frontier_namespaces
             || (universe_authoritative && result.frontier_namespaces == 0 && !result.catalog_cut_proved_empty);
@@ -4065,8 +4155,19 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
             ? String{}
             : fmt::format("; unproven: {}", result.frontier_deficit.describe());
         const char * const parent_note = result.parent_unconfirmed ? "; the leased `gc/state` is unconfirmed" : "";
+        const char * const stop_note = stop_seen ? "; the round was asked to stop" : "";
         if (per_round_cause)
             LOG_WARNING(logger,
+                "CAS GC fold: destructive work SUPPRESSED this pass — {} anomaly(ies), {} held "
+                "namespace(s), frontier {} ({} of {} namespace(s) proven{}{}{}){}{}. Body deletes, intent removals "
+                "and the intent creates of carried candidates wait for a pass that clears every cause; fresh "
+                "condemnations and transitions still create intents and write `pending` rows.",
+                report.anomalies.size(), carried_holds.size(),
+                result.frontier_complete ? "complete" : "INCOMPLETE",
+                result.frontier_proven, result.frontier_namespaces, universe_note, catalog_empty_note,
+                deficit_note, parent_note, stop_note);
+        else
+            LOG_INFO(logger,
                 "CAS GC fold: destructive work SUPPRESSED this pass — {} anomaly(ies), {} held "
                 "namespace(s), frontier {} ({} of {} namespace(s) proven{}{}{}){}. Body deletes, intent removals "
                 "and the intent creates of carried candidates wait for a pass that clears every cause; fresh "
@@ -4074,17 +4175,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
                 report.anomalies.size(), carried_holds.size(),
                 result.frontier_complete ? "complete" : "INCOMPLETE",
                 result.frontier_proven, result.frontier_namespaces, universe_note, catalog_empty_note,
-                deficit_note, parent_note);
-        else
-            LOG_INFO(logger,
-                "CAS GC fold: destructive work SUPPRESSED this pass — {} anomaly(ies), {} held "
-                "namespace(s), frontier {} ({} of {} namespace(s) proven{}{}{}). Body deletes, intent removals "
-                "and the intent creates of carried candidates wait for a pass that clears every cause; fresh "
-                "condemnations and transitions still create intents and write `pending` rows.",
-                report.anomalies.size(), carried_holds.size(),
-                result.frontier_complete ? "complete" : "INCOMPLETE",
-                result.frontier_proven, result.frontier_namespaces, universe_note, catalog_empty_note,
-                deficit_note);
+                deficit_note, stop_note);
     }
 
     if (round_point_hook_for_test)

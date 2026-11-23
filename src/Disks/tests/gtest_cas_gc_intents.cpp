@@ -5711,6 +5711,508 @@ TEST(CASGcIntents, ALifeWithACarriedHoldIsStillPlanned)
     EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(4)), 1);
 }
 
+namespace
+{
+
+/// While armed, every served `GET` of a ref log under a registered stream runs the armed callback with that key,
+/// after the store answered. Each such `GET` is recorded with whether it found the key.
+class HotLogReadBackend : public GetHookBackend
+{
+public:
+    struct HotRead
+    {
+        String key;
+        bool present = false;
+    };
+
+    void addStream(const String & stream)
+    {
+        std::lock_guard lock(hot_mutex);
+        streams.push_back(stream);
+    }
+
+    void arm(std::function<void(const String &)> callback)
+    {
+        std::lock_guard lock(hot_mutex);
+        on_hot_read = std::move(callback);
+    }
+
+    void disarm()
+    {
+        std::lock_guard lock(hot_mutex);
+        on_hot_read = {};
+    }
+
+    std::vector<HotRead> hotReads() const
+    {
+        std::lock_guard lock(hot_mutex);
+        return hot_reads;
+    }
+
+    std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        auto result = GetHookBackend::read(key, access);
+        std::function<void(const String &)> callback;
+        {
+            std::lock_guard lock(hot_mutex);
+            if (!on_hot_read || key.find("/_log/") == String::npos
+                || std::none_of(streams.begin(), streams.end(), [&](const String & s) { return key.starts_with(s); }))
+                return result;
+            hot_reads.push_back({key, result.has_value()});
+            callback = on_hot_read;
+        }
+        callback(key);
+        return result;
+    }
+
+private:
+    mutable std::mutex hot_mutex;
+    std::vector<String> streams;
+    std::function<void(const String &)> on_hot_read;
+    std::vector<HotRead> hot_reads;
+};
+
+/// A confirmed `pending(t)`, a live sentinel part and two hot lives with a backlog above one read window. During
+/// `run`, every served `GET` of a hot life's log appends the next record to that life and advances the round's
+/// clock by `step_ms`: writers that keep pace with GC.
+class HotLivesPool
+{
+public:
+    static constexpr uint64_t kIoConcurrency = 2;
+    /// `GcReadAhead::window`: pass 1 takes this many records of each life.
+    static constexpr uint64_t kWindow = 4 * kIoConcurrency;
+
+    struct Life
+    {
+        String stream;
+        std::optional<NamespaceLifeId> life;
+        RefTxnId tail;
+        RefTxnId cursor_before;
+        uint64_t appended = 0;
+    };
+
+    struct Round
+    {
+        RoundReport report;
+        std::map<String, UInt64> intake;
+        String log;
+        uint64_t elapsed_ms = 0;
+        /// Per hot namespace, the least key planning read absent.
+        std::map<String, RefTxnId> stops;
+        /// The round's requests and the indices of the marks at `AfterDiscovery` and `AfterIntake` in them.
+        std::vector<JournalEntry> journal;
+        size_t planned = 0;
+        size_t intake_done = 0;
+    };
+
+    HotLivesPool()
+    {
+        PoolConfig config{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0,
+                          .gc_io_concurrency = kIoConcurrency};
+        /// No background snapshot publisher writes into the hot lives while the test appends to them.
+        config.snapshot_log_count_threshold = std::numeric_limits<uint64_t>::max();
+        store = Pool::open(backend, std::move(config));
+        gc = std::make_unique<Gc>(store, kGateLeaderA, std::function<uint64_t()>{}, [this] { return mono.load(); });
+        EXPECT_EQ(writeOnePart(store, ns_sentinel, "s", sentinel), BlobMaterializationAction::Published);
+        for (const String & ns : hot)
+        {
+            backend->clearJournal();
+            EXPECT_EQ(writeOnePart(store, ns, "seed", "the seed of " + ns), BlobMaterializationAction::Published);
+            lives[ns].stream = firstWrittenStreamPrefix(*backend);
+            EXPECT_FALSE(lives[ns].stream.empty()) << ns;
+            backend->addStream(lives[ns].stream);
+            OperationForTest op(*backend);
+            lives[ns].life = CasRefCatalog::lifeIfCataloged(*op, store->layout(), RootNamespace{ns});
+            EXPECT_TRUE(lives[ns].life.has_value()) << ns;
+        }
+    }
+
+    /// Ends with `pending(t)` committed and a backlog of `parts` parts in each hot life.
+    void prepare(size_t parts)
+    {
+        ASSERT_EQ(writeOnePart(store, ns_old, "p0", payload), BlobMaterializationAction::Published);
+        runGateRound(store, *gc);
+        store->dropRef(RootNamespace{ns_old}, "p0");
+        store->renewWatermarkOnce();
+        runGateRound(store, *gc);
+        ASSERT_TRUE(row() && row()->delete_pending && !row()->standing) << "the condemning round did not commit pending(t)";
+
+        for (const String & ns : hot)
+        {
+            Life & life = lives[ns];
+            life.cursor_before = cursorOf(ns);
+            backend->clearJournal();
+            for (size_t i = 0; i < parts; ++i)
+                ASSERT_EQ(writeOnePart(store, ns, fmt::format("b{}", i), fmt::format("backlog {} of {}", i, ns)),
+                          BlobMaterializationAction::Published);
+            for (const String & key : writtenRefLogKeys(*backend))
+                life.tail = std::max(life.tail, refIdOfKey(store->layout(), key));
+            ASSERT_GT(life.tail.ref_sequence, life.cursor_before.ref_sequence + kWindow)
+                << ns << ": the backlog does not exceed one read window";
+        }
+    }
+
+    /// One round; without `step_ms` the writers are idle.
+    Round run(std::optional<uint64_t> step_ms)
+    {
+        Round out;
+        uint64_t began_ms = 0;
+        size_t planning_reads = 0;
+        gc->setRoundPointHookForTest([&](const Gc::RoundPointSiteForTest & site)
+        {
+            if (site.point == RoundInterleavePoint::AfterCatalogRead)
+            {
+                began_ms = mono.load();
+                if (step_ms)
+                    backend->arm([this, step = *step_ms](const String & key) { appendAfter(key, step); });
+            }
+            else if (site.point == RoundInterleavePoint::AfterDiscovery)
+            {
+                backend->mark("planned");
+                planning_reads = backend->hotReads().size();
+            }
+            else if (site.point == RoundInterleavePoint::AfterIntake)
+            {
+                backend->mark("intake_done");
+                backend->disarm();
+                out.elapsed_ms = mono.load() - began_ms;
+            }
+        });
+        gc->setPhaseSink([&out](const GcPhaseRecord & record)
+        {
+            if (record.phase == "fold_ref_intake")
+                out.intake = record.metrics;
+        });
+        const size_t hot_from = backend->hotReads().size();
+        const size_t from = backend->journal().size();
+        {
+            ScopedLogCapture capture("CasGc", "information");
+            out.report = runGateRound(store, *gc);
+            out.log = capture.captured();
+        }
+        backend->disarm();
+        gc->setRoundPointHookForTest({});
+        gc->setPhaseSink({});
+
+        const auto reads = backend->hotReads();
+        for (size_t i = hot_from; i < std::max(planning_reads, hot_from); ++i)
+        {
+            if (reads[i].present)
+                continue;
+            for (const String & ns : hot)
+                if (reads[i].key.starts_with(lives[ns].stream))
+                {
+                    const RefTxnId id = refIdOfKey(store->layout(), reads[i].key);
+                    const auto it = out.stops.find(ns);
+                    if (it == out.stops.end() || id < it->second)
+                        out.stops[ns] = id;
+                }
+        }
+        const auto journal = backend->journal();
+        out.journal.assign(journal.begin() + from, journal.end());
+        out.planned = indexOfMark(out.journal, "planned");
+        out.intake_done = indexOfMark(out.journal, "intake_done");
+        return out;
+    }
+
+    RefTxnId cursorOf(const String & ns) const
+    {
+        const auto coverage = lifeCoverage(*backend, store->layout(), RootNamespace{ns});
+        return coverage ? coverage->last_folded_ref_id : RefTxnId{};
+    }
+
+    String logKey(const String & ns, const RefTxnId & id) const { return store->layout().refLogKey(lives.at(ns).life.value(), id); }
+
+    std::optional<RetiredEntry> row() const { return retiredEntryFor(*backend, store->layout(), idOf(payload)); }
+
+    std::shared_ptr<HotLogReadBackend> backend = std::make_shared<HotLogReadBackend>();
+    PoolPtr store;
+    std::unique_ptr<Gc> gc;
+    std::atomic<uint64_t> mono{1'000'000};
+    const String ns_old = "test/a_old";
+    const String ns_sentinel = "test/s_sentinel";
+    const std::vector<String> hot{"test/h_one", "test/h_two"};
+    const String payload = "hot-lives-pending";
+    const String sentinel = "hot-lives-sentinel";
+    std::map<String, Life> lives;
+
+private:
+    /// Appends under one lock, so a life never has a hole for the walk to read below a record planning saw.
+    void appendAfter(const String & key, uint64_t step_ms)
+    {
+        std::lock_guard lock(append_mutex);
+        for (const String & ns : hot)
+        {
+            Life & life = lives.at(ns);
+            if (!key.starts_with(life.stream))
+                continue;
+            life.tail = RefTxnId{life.tail.writer_epoch, life.tail.ref_sequence + 1};
+            const ManifestRef mref{.writer_epoch = life.tail.writer_epoch, .build_sequence = 1'000'000 + next_blob,
+                                   .manifest_ordinal = 1};
+            const DB::UInt128 blob(0xA00000 + next_blob);
+            ++next_blob;
+            writeBlobBody(*backend, store->layout(), blob);
+            writeManifestRaw(*backend, store->layout(), RootNamespace{ns}, mref, {blobEntryFor("data.bin", blob)});
+            RefLogTxn txn;
+            txn.ns = ns;
+            txn.txn_id = life.tail;
+            txn.ops = publishCommittedOps(fmt::format("late_{}", life.tail.ref_sequence), mref);
+            OperationForTest op(*backend);
+            EXPECT_TRUE(std::holds_alternative<Committed>((*op).create(
+                logKey(ns, life.tail), sealObject(FormatId::RefLog, encodeRefLogTxn(txn)), Retry::standard())));
+            ++life.appended;
+            mono.fetch_add(step_ms);
+            return;
+        }
+    }
+
+    std::mutex append_mutex;
+    uint64_t next_blob = 0;
+};
+
+}
+
+/// Two hot lives whose writers append one record per GC read of their logs, while each read takes 10 s: the intake
+/// runs past one minute. Each walk ends at the stop planning fixed, so every life is proven and the round deletes
+/// the confirmed `pending(t)`; the records appended at and past the stops wait for the next round.
+TEST(CASGCBoundedWalk, ARoundDeletesWhileWritersAppendPastItsStops)
+{
+    HotLivesPool pool;
+    ASSERT_NO_FATAL_FAILURE(pool.prepare(/*parts=*/5));
+    const String body_key = pool.store->layout().blobKey(idOf(pool.payload));
+    const String sentinel_key = pool.store->layout().blobKey(idOf(pool.sentinel));
+
+    const HotLivesPool::Round round = pool.run(/*step_ms=*/10'000);
+    EXPECT_GT(round.elapsed_ms, 60'000u) << "positive control: the intake ran past one minute";
+    EXPECT_LT(round.elapsed_ms, Gc::kRefIntakeBudgetMs);
+    EXPECT_GT(metricOr(round.intake, "frontier_namespaces"), 0u);
+    EXPECT_EQ(metricOr(round.intake, "frontier_proven"), metricOr(round.intake, "frontier_namespaces")) << round.log;
+    EXPECT_EQ(round.report.bodies_deleted, 1u) << round.log;
+    EXPECT_FALSE(objectPresent(*pool.backend, body_key)) << "the confirmed pending(t) was not deleted";
+    EXPECT_TRUE(objectPresent(*pool.backend, sentinel_key)) << "the sentinel's body is gone";
+    ASSERT_LT(round.planned, round.journal.size());
+
+    for (const String & ns : pool.hot)
+    {
+        SCOPED_TRACE(ns);
+        const HotLivesPool::Life & life = pool.lives.at(ns);
+        EXPECT_GT(life.appended, 0u) << "positive control: the writer appended";
+        ASSERT_TRUE(round.stops.contains(ns)) << "planning read no key absent";
+        const RefTxnId stop = round.stops.at(ns);
+        EXPECT_LT(stop, life.tail) << "positive control: records landed past the stop during the walk";
+        const RefTxnId cursor = pool.cursorOf(ns);
+        EXPECT_EQ(cursor, (RefTxnId{stop.writer_epoch, stop.ref_sequence - 1}));
+        EXPECT_GT(cursor.ref_sequence, life.cursor_before.ref_sequence + HotLivesPool::kWindow)
+            << "positive control: the walk went on past pass 1";
+        EXPECT_TRUE(objectPresent(*pool.backend, pool.logKey(ns, stop))) << "positive control: a record landed at the stop";
+        /// The walk runs between the two marks; later phases of the round read logs too.
+        ASSERT_LT(round.intake_done, round.journal.size());
+        EXPECT_GE(indexOfRequestFrom(round.journal, JournalVerb::Read, pool.logKey(ns, stop), round.planned), round.intake_done)
+            << "the walk read its stop";
+    }
+}
+
+/// The limit of the slice: when reading takes longer than the slice, pass 2 is cut. Each hot life keeps the records
+/// it applied and stays unproven, the round deletes nothing, and the next round continues from the cursor reached.
+TEST(CASGCBoundedWalk, ARoundSlowerThanItsSliceKeepsItsProgressAndDeletesNothing)
+{
+    HotLivesPool pool;
+    ASSERT_NO_FATAL_FAILURE(pool.prepare(/*parts=*/5));
+    const String body_key = pool.store->layout().blobKey(idOf(pool.payload));
+
+    const uint64_t deleted_before = pool.backend->deleteTotal();
+    const HotLivesPool::Round slow = pool.run(/*step_ms=*/Gc::kRefIntakeBudgetMs / 6);
+    EXPECT_GT(slow.elapsed_ms, Gc::kRefIntakeBudgetMs) << "positive control: reading took longer than the slice";
+    EXPECT_NE(slow.log.find("intake_slice_cut=2"), String::npos) << slow.log;
+    EXPECT_EQ(metricOr(slow.intake, "frontier_proven") + 2, metricOr(slow.intake, "frontier_namespaces"));
+    EXPECT_EQ(slow.report.bodies_deleted, 0u);
+    EXPECT_EQ(pool.backend->deleteTotal(), deleted_before) << "the cut round deleted an object";
+    EXPECT_TRUE(objectPresent(*pool.backend, body_key));
+    EXPECT_TRUE(pool.row() && pool.row()->delete_pending) << "the cut round dropped pending(t)";
+
+    std::map<String, RefTxnId> reached;
+    for (const String & ns : pool.hot)
+    {
+        SCOPED_TRACE(ns);
+        const HotLivesPool::Life & life = pool.lives.at(ns);
+        reached[ns] = pool.cursorOf(ns);
+        EXPECT_EQ(reached[ns], (RefTxnId{life.cursor_before.writer_epoch, life.cursor_before.ref_sequence + HotLivesPool::kWindow}))
+            << "pass 1 applied one read window and the cut kept it";
+        ASSERT_TRUE(slow.stops.contains(ns));
+        EXPECT_LT(reached[ns].ref_sequence + 1, slow.stops.at(ns).ref_sequence) << "positive control: the cut came before the stop";
+    }
+
+    const HotLivesPool::Round next = pool.run(/*step_ms=*/std::nullopt);
+    EXPECT_GT(metricOr(next.intake, "frontier_namespaces"), 0u) << "positive control: the next round folded";
+    EXPECT_EQ(metricOr(next.intake, "frontier_proven"), metricOr(next.intake, "frontier_namespaces")) << next.log;
+    for (const String & ns : pool.hot)
+    {
+        SCOPED_TRACE(ns);
+        const HotLivesPool::Life & life = pool.lives.at(ns);
+        /// The cut left no memo, so the next round resolves its start by reading the cursor's own record.
+        std::vector<RefTxnId> read_ids;
+        ASSERT_LT(next.intake_done, next.journal.size());
+        for (size_t i = 0; i < next.intake_done; ++i)
+            if (const JournalEntry & entry = next.journal[i]; entry.verb == JournalVerb::Read && entry.keys.front().starts_with(life.stream)
+                && entry.keys.front().find("/_log/") != String::npos)
+                read_ids.push_back(refIdOfKey(pool.store->layout(), entry.keys.front()));
+        ASSERT_FALSE(read_ids.empty());
+        EXPECT_EQ(read_ids.front(), reached[ns]) << "the next round did not start from the cursor the cut round reached";
+        EXPECT_EQ(*std::min_element(read_ids.begin(), read_ids.end()), reached[ns]) << "the next round read below the cursor";
+        EXPECT_EQ(pool.cursorOf(ns), life.tail);
+    }
+}
+
+namespace
+{
+
+/// The `_log` reads of the hot lives' streams in `journal[from, to)`.
+size_t hotLogReadsBetween(const HotLivesPool & pool, const std::vector<JournalEntry> & journal, size_t from, size_t to)
+{
+    size_t n = 0;
+    for (size_t i = from; i < std::min(to, journal.size()); ++i)
+    {
+        const JournalEntry & entry = journal[i];
+        if (entry.verb != JournalVerb::Read || entry.keys.front().find("/_log/") == String::npos)
+            continue;
+        for (const String & ns : pool.hot)
+            n += entry.keys.front().starts_with(pool.lives.at(ns).stream);
+    }
+    return n;
+}
+
+/// After a cut round, the next one starts each hot life at the cursor the cut round reached and finishes it.
+void expectTheNextRoundContinuesFrom(HotLivesPool & pool, const std::map<String, RefTxnId> & reached)
+{
+    const HotLivesPool::Round next = pool.run(/*step_ms=*/std::nullopt);
+    EXPECT_GT(metricOr(next.intake, "frontier_namespaces"), 0u);
+    EXPECT_EQ(metricOr(next.intake, "frontier_proven"), metricOr(next.intake, "frontier_namespaces")) << next.log;
+    for (const String & ns : pool.hot)
+    {
+        SCOPED_TRACE(ns);
+        const HotLivesPool::Life & life = pool.lives.at(ns);
+        std::vector<RefTxnId> read_ids;
+        ASSERT_LT(next.intake_done, next.journal.size());
+        for (size_t i = 0; i < next.intake_done; ++i)
+            if (const JournalEntry & entry = next.journal[i]; entry.verb == JournalVerb::Read && entry.keys.front().starts_with(life.stream)
+                && entry.keys.front().find("/_log/") != String::npos)
+                read_ids.push_back(refIdOfKey(pool.store->layout(), entry.keys.front()));
+        ASSERT_FALSE(read_ids.empty());
+        EXPECT_EQ(*std::min_element(read_ids.begin(), read_ids.end()), reached.at(ns)) << "the next round did not start at the cursor reached";
+        EXPECT_EQ(pool.cursorOf(ns), life.tail);
+    }
+}
+
+}
+
+/// A stop request in the middle of a walk ends it at the next step, with the clock standing still: every life
+/// not finished keeps the records it applied and stays unproven, the round deletes nothing, and the next round
+/// continues from the cursor reached.
+TEST(CASGCBoundedWalk, AStopRequestEndsTheWalkLikeASliceCut)
+{
+    HotLivesPool pool;
+    ASSERT_NO_FATAL_FAILURE(pool.prepare(/*parts=*/5));
+    const String body_key = pool.store->layout().blobKey(idOf(pool.payload));
+    const String & first = pool.hot.front();
+    const RefTxnId first_cursor = pool.lives.at(first).cursor_before;
+    /// Planning reads the first record above the cursor and the listed tail; the walk reads this one in pass 1.
+    const String raise_at = pool.logKey(first, RefTxnId{first_cursor.writer_epoch, first_cursor.ref_sequence + 3});
+
+    std::atomic<bool> stop{false};
+    std::atomic<size_t> hot_reads_at_stop{0};
+    pool.gc->setStopSignal([&stop] { return stop.load(); });
+    pool.backend->armBeforeGet([raise_at](const String & key) { return key == raise_at; }, [&]
+    {
+        hot_reads_at_stop = pool.backend->hotReads().size();
+        stop = true;
+    });
+    const uint64_t deleted_before = pool.backend->deleteTotal();
+    const uint64_t mono_before = pool.mono.load();
+    /// Writers keep appending, so planning's stops are recorded; each append leaves the clock where it is.
+    const HotLivesPool::Round cut = pool.run(/*step_ms=*/0);
+    pool.gc->setStopSignal({});
+    ASSERT_TRUE(stop.load()) << "positive control: the walk read the key that raises the stop";
+    EXPECT_EQ(pool.mono.load(), mono_before) << "the clock moved, so the slice could have cut the walk";
+
+    EXPECT_LE(pool.backend->hotReads().size() - hot_reads_at_stop.load(), HotLivesPool::kWindow)
+        << "the walk read on after the stop request, beyond the reads already in flight";
+    EXPECT_NE(cut.log.find("asked to stop"), String::npos) << cut.log;
+    EXPECT_NE(cut.log.find("intake_slice_cut="), String::npos) << cut.log;
+    EXPECT_GT(metricOr(cut.intake, "frontier_namespaces"), 0u);
+    EXPECT_LE(metricOr(cut.intake, "frontier_proven") + 2, metricOr(cut.intake, "frontier_namespaces"));
+    EXPECT_EQ(cut.report.bodies_deleted, 0u);
+    EXPECT_EQ(pool.backend->deleteTotal(), deleted_before) << "the stopped round deleted an object";
+    EXPECT_TRUE(objectPresent(*pool.backend, body_key));
+    EXPECT_TRUE(pool.row() && pool.row()->delete_pending) << "the stopped round dropped pending(t)";
+
+    std::map<String, RefTxnId> reached;
+    for (const String & ns : pool.hot)
+    {
+        SCOPED_TRACE(ns);
+        const HotLivesPool::Life & life = pool.lives.at(ns);
+        reached[ns] = pool.cursorOf(ns);
+        ASSERT_TRUE(cut.stops.contains(ns)) << "positive control: planning fixed a stop";
+        EXPECT_LT(reached[ns].ref_sequence + 1, cut.stops.at(ns).ref_sequence) << "the walk reached its stop";
+        EXPECT_LE(reached[ns].ref_sequence, life.cursor_before.ref_sequence + HotLivesPool::kWindow);
+    }
+    EXPECT_GT(reached.at(first), first_cursor) << "the stopped walk dropped the records it applied";
+    EXPECT_GE(reached.at(first).ref_sequence, first_cursor.ref_sequence + 1);
+
+    expectTheNextRoundContinuesFrom(pool, reached);
+}
+
+/// A stop request while planning ends the round before any walk: no life is walked, every cursor stays, the round
+/// deletes nothing, and the next round folds every life.
+TEST(CASGCBoundedWalk, AStopRequestDuringPlanningEndsTheRoundWithoutAWalk)
+{
+    HotLivesPool pool;
+    ASSERT_NO_FATAL_FAILURE(pool.prepare(/*parts=*/5));
+    const String body_key = pool.store->layout().blobKey(idOf(pool.payload));
+    const String & first = pool.hot.front();
+    const RefTxnId first_cursor = pool.lives.at(first).cursor_before;
+    /// The first key of the first hot life, which only planning reads.
+    const String raise_at = pool.logKey(first, RefTxnId{first_cursor.writer_epoch, first_cursor.ref_sequence + 1});
+
+    std::atomic<bool> stop{false};
+    pool.gc->setStopSignal([&stop] { return stop.load(); });
+    pool.backend->armBeforeGet([raise_at](const String & key) { return key == raise_at; }, [&] { stop = true; });
+    const uint64_t deleted_before = pool.backend->deleteTotal();
+    const HotLivesPool::Round cut = pool.run(/*step_ms=*/std::nullopt);
+    pool.gc->setStopSignal({});
+    ASSERT_TRUE(stop.load()) << "positive control: planning read the key that raises the stop";
+
+    ASSERT_LT(cut.planned, cut.journal.size());
+    ASSERT_LT(cut.intake_done, cut.journal.size());
+    EXPECT_EQ(hotLogReadsBetween(pool, cut.journal, cut.planned, cut.intake_done), 0u) << "a walk read a ref log";
+    /// A first key may be fetched ahead of its life's planning; any other read of the second life is its planning.
+    const HotLivesPool::Life & second = pool.lives.at(pool.hot.back());
+    const String second_first = pool.logKey(pool.hot.back(),
+        RefTxnId{second.cursor_before.writer_epoch, second.cursor_before.ref_sequence + 1});
+    size_t second_planning_reads = 0;
+    for (size_t i = 0; i < cut.planned; ++i)
+    {
+        const JournalEntry & entry = cut.journal[i];
+        second_planning_reads += entry.verb == JournalVerb::Read && entry.keys.front().starts_with(second.stream)
+            && entry.keys.front().find("/_log/") != String::npos && entry.keys.front() != second_first;
+    }
+    EXPECT_EQ(second_planning_reads, 0u) << "planning went on to the next life after the stop request";
+    EXPECT_GT(metricOr(cut.intake, "frontier_namespaces"), 0u);
+    EXPECT_EQ(metricOr(cut.intake, "frontier_proven"), 0u) << cut.log;
+    EXPECT_EQ(cut.report.bodies_deleted, 0u);
+    EXPECT_EQ(pool.backend->deleteTotal(), deleted_before) << "the stopped round deleted an object";
+    EXPECT_TRUE(objectPresent(*pool.backend, body_key));
+    EXPECT_TRUE(pool.row() && pool.row()->delete_pending) << "the stopped round dropped pending(t)";
+
+    std::map<String, RefTxnId> reached;
+    for (const String & ns : pool.hot)
+    {
+        SCOPED_TRACE(ns);
+        reached[ns] = pool.cursorOf(ns);
+        EXPECT_EQ(reached[ns], pool.lives.at(ns).cursor_before) << "a cursor moved without a walk";
+    }
+    expectTheNextRoundContinuesFrom(pool, reached);
+}
+
 /// The catalog read of a round follows the acquisition of its lease: the round of a leader that steals the
 /// lease from the previous one is checked, twice.
 TEST(CASGcIntakeRequirements, CatalogReadFollowsTheLeaseAcquisition)
@@ -6371,7 +6873,8 @@ TEST(CASGcRoundPoint, SnapshotOverAnUnreadAddAndDropTakesNoDestructiveStep)
 }
 
 /// The time budget cuts pass 2, so the writer's namespace is read over two rounds; the copy and the drop land at the
-/// cut. The cut round is suppressed; the next one reads the rest and the copy, and keeps the body.
+/// cut, past both stops. The cut round is suppressed by the cut; the next one reads the rest and the copy, and keeps
+/// the body.
 TEST(CASGcRoundPoint, IntakeSliceCutByTheTimeBudgetReadsANamespaceOverTwoRounds)
 {
     auto backend = std::make_shared<HeadHookBackend>();
@@ -6416,6 +6919,7 @@ TEST(CASGcRoundPoint, IntakeSliceCutByTheTimeBudgetReadsANamespaceOverTwoRounds)
 
     /// After the last walk of pass 1, before pass 2 continues the writer's namespace.
     size_t from = backend->journal().size();
+    std::optional<ScopedLogCapture> capture(std::in_place, "CasGc", "information");
     const RoundWithCallback cut = runRoundWithCallback(gc, RoundInterleavePoint::AfterNamespaceWalk, {.first = ns_w, .second = ns_w}, [&]
     {
         mono->fetch_add(Gc::kRefIntakeBudgetMs + 1);
@@ -6425,6 +6929,8 @@ TEST(CASGcRoundPoint, IntakeSliceCutByTheTimeBudgetReadsANamespaceOverTwoRounds)
     store->renewWatermarkOnce();
     ASSERT_EQ(cut.fired, 1u);
     EXPECT_EQ(metricOr(reduce, "suppress_destructive"), 1u) << "the cut round was not suppressed";
+    EXPECT_EQ(capture->count("intake_slice_cut=1"), 1u) << capture->captured();
+    capture.reset();
     EXPECT_GT(logReadsOfW(from), 0u) << "positive control: the cut round read part of the namespace";
     EXPECT_EQ(cut.report.bodies_deleted, 0u);
 

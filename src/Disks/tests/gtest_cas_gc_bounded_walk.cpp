@@ -1,23 +1,35 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
+#include <future>
 #include <map>
 #include <mutex>
+#include <numeric>
 #include <set>
+#include <thread>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include "cas_test_helpers.h"
 
+#include <Common/ProfileEvents.h>
+
+namespace ProfileEvents
+{
+extern const Event CASRefLogBodyGets;
+}
+
 /// THE BOUNDED FOLD WALK.
 ///
-/// Ref intake reads the chain by exact key in successor order and ends at the first key it reads absent,
+/// Ref intake reads the chain by exact key in successor order and ends at the stop planning read absent,
 /// or at a terminal record; nothing above that key is folded in this round, whatever lands meanwhile. A
-/// writer that keeps pace with the walker never lets that read happen, so a time slice bounds the walk:
-/// pass 1 gives every namespace its start and one read window and is never cut, pass 2 continues the
-/// rest from `round mod n`, and a namespace the slice cuts keeps its cursor and stays unproven.
+/// time slice bounds how long that takes: the slice never cuts pass 1, which gives every namespace its start and one
+/// read window, pass 2 continues the rest from `round mod n`, and a namespace the slice cuts keeps its cursor
+/// and stays unproven.
 ///
 /// So the properties these tests pin are:
 ///   * a round stops at its first absent key, and a quiet namespace costs its `_ckpt` and one probe;
@@ -704,6 +716,247 @@ TEST(CASGCBoundedWalk, SliceCutLeavesTheNamespaceUnprovenAndKeepsItsCursor)
     EXPECT_EQ(metric(second, "frontier_proven"), 1u);
 }
 
+/// The slice deadline is taken before planning ends (before `AfterDiscovery`), so planning time is charged to it:
+/// planning that takes the whole slice leaves pass 2 no read, and planning one millisecond shorter leaves a walk
+/// that takes no time enough to finish.
+TEST(CASGCBoundedWalk, PlanningTimeIsChargedToTheSlice)
+{
+    for (const uint64_t planning_ms : {Gc::kRefIntakeBudgetMs - 1, Gc::kRefIntakeBudgetMs})
+    {
+        SCOPED_TRACE(planning_ms);
+        auto backend = std::make_shared<CountingBackend>();
+        auto store = openPoolWithSmallWindow(backend);
+        const Layout & layout = store->layout();
+        const RootNamespace ns{"00/hot@cas@"};
+        const uint64_t tail = 3 * kWindow;
+        publishRange(*backend, layout, ns, 1, tail);
+        writeRecoverableCkptForRawFixture(*backend, layout, ns, refCkptOf(1, RefTxnId{1, tail}));
+
+        std::atomic<uint64_t> mono{1'000'000};
+        Gc gc(store, kGc, {}, [&mono] { return mono.load(); });
+        ScopedRoundCallback planning(gc, RoundInterleavePoint::AfterDiscovery, {}, [&] { mono.fetch_add(planning_ms); });
+        const std::map<String, UInt64> intake = runRoundCapturingIntake(gc);
+        ASSERT_EQ(planning.fired(), 1u);
+        const bool cut = planning_ms >= Gc::kRefIntakeBudgetMs;
+        EXPECT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{1, cut ? kWindow : tail}));
+        EXPECT_EQ(metric(intake, "frontier_proven"), cut ? 0u : 1u);
+    }
+}
+
+namespace
+{
+/// The text of the first line of `text` that contains `needle`, or empty.
+String lineContaining(const String & text, std::string_view needle)
+{
+    size_t from = 0;
+    while (from < text.size())
+    {
+        size_t end = text.find('\n', from);
+        if (end == String::npos)
+            end = text.size();
+        const String line = text.substr(from, end - from);
+        if (line.find(needle) != String::npos)
+            return line;
+        from = end + 1;
+    }
+    return {};
+}
+
+/// The number after `key=` in `line`, or nullopt when the line has no such field.
+std::optional<uint64_t> fieldOf(const String & line, const String & key)
+{
+    const size_t at = line.find(" " + key + "=");
+    if (at == String::npos)
+        return std::nullopt;
+    return std::stoull(line.substr(at + key.size() + 2));
+}
+
+constexpr std::string_view kPlanningLine = "ref intake planned";
+constexpr std::string_view kProgressLine = "ref intake progress";
+}
+
+/// One folding round plans once, whatever its lives look like: one quiet life, whose first key is absent, and one
+/// hot life with a backlog.
+TEST(CASGCLog, APlannedRoundLogsItsStopsOnce)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolWithSmallWindow(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace quiet{"00/quiet@cas@"};
+    const RootNamespace hot{"01/hot@cas@"};
+    publishRange(*backend, layout, quiet, 1, 3);
+    writeRecoverableCkptForRawFixture(*backend, layout, quiet, refCkptOf(1, RefTxnId{1, 3}));
+    publishRange(*backend, layout, hot, 1, 3);
+    writeRecoverableCkptForRawFixture(*backend, layout, hot, refCkptOf(1, RefTxnId{1, 3}));
+
+    Gc gc(store, kGc);
+    {
+        ScopedLogCapture capture("CasGc", "information");
+        runRoundCapturingIntake(gc);
+        EXPECT_EQ(capture.count(kPlanningLine), 1u) << "positive control: the first round folds and plans";
+    }
+
+    publishRange(*backend, layout, hot, 4, 12);
+    advanceRecoverableCkptForRawFixture(*backend, layout, hot, RefTxnId{1, 12});
+    ScopedLogCapture capture("CasGc", "information");
+    const std::map<String, UInt64> intake = runRoundCapturingIntake(gc);
+    ASSERT_EQ(metric(intake, "frontier_namespaces"), 2u);
+    EXPECT_EQ(capture.count(kPlanningLine), 1u) << capture.captured();
+    const String line = lineContaining(capture.captured(), kPlanningLine);
+    SCOPED_TRACE(line);
+    EXPECT_NE(line.find("round="), String::npos);
+    EXPECT_EQ(fieldOf(line, "lives"), 2u);
+    EXPECT_EQ(fieldOf(line, "hot"), 1u);
+    EXPECT_EQ(fieldOf(line, "quiet"), 1u);
+    EXPECT_EQ(fieldOf(line, "empty_hint"), 1u) << "the quiet life lists nothing above its first key";
+    EXPECT_EQ(fieldOf(line, "crossings"), 0u);
+    EXPECT_EQ(fieldOf(line, "crossing_limit"), 0u);
+    EXPECT_EQ(fieldOf(line, "planner_misses"), 2u) << "one absent key ends each life";
+    EXPECT_GT(fieldOf(line, "retained_bytes").value_or(0), 0u);
+}
+
+/// Planning keeps the bodies it read only up to a byte cap. A body larger than what is left under a nonzero cap is
+/// not kept, and the walk reads it again. Planning reads the first record and, through the listing's last id, the
+/// tail one; the walk then reads every record up to the stop.
+TEST(CASGCLog, ABodyBeyondTheRetentionCapIsReadAgainByTheWalk)
+{
+    const auto run = [](std::optional<size_t> cap_bytes)
+    {
+        struct Out
+        {
+            uint64_t retained_bytes = 0;
+            std::vector<uint64_t> gets;   /// per sequence 1..tail
+            size_t first_body_bytes = 0;
+            size_t last_body_bytes = 0;
+            uint64_t body_get_events = 0;
+        } out;
+        auto backend = std::make_shared<CountingBackend>();
+        auto store = openPoolWithSmallWindow(backend);
+        const Layout & layout = store->layout();
+        const RootNamespace ns{"00/capped@cas@"};
+        const uint64_t tail = 12;
+        publishRange(*backend, layout, ns, 1, tail);
+        writeRecoverableCkptForRawFixture(*backend, layout, ns, refCkptOf(1, RefTxnId{1, tail}));
+        {
+            OperationForTest op(*backend);
+            const auto first = (*op).read(logKey(layout, ns, RefTxnId{1, 1}), Retry::standard());
+            const auto last = (*op).read(logKey(layout, ns, RefTxnId{1, tail}), Retry::standard());
+            EXPECT_TRUE(first.has_value() && last.has_value());
+            out.first_body_bytes = first ? first->bytes.size() : 0;
+            out.last_body_bytes = last ? last->bytes.size() : 0;
+        }
+        backend->resetCounts();
+
+        Gc gc(store, kGc);
+        if (cap_bytes)
+            gc.setRefPlanRetainedBytesForTest(*cap_bytes);
+        ScopedLogCapture capture("CasGc", "information");
+        const uint64_t events_before = ProfileEvents::global_counters[ProfileEvents::CASRefLogBodyGets];
+        runRoundCapturingIntake(gc);
+        out.body_get_events = ProfileEvents::global_counters[ProfileEvents::CASRefLogBodyGets] - events_before;
+        const String line = lineContaining(capture.captured(), kPlanningLine);
+        EXPECT_FALSE(line.empty());
+        out.retained_bytes = fieldOf(line, "retained_bytes").value_or(0);
+        for (uint64_t seq = 1; seq <= tail; ++seq)
+            out.gets.push_back(backend->getCount(logKey(layout, ns, RefTxnId{1, seq})));
+        return out;
+    };
+
+    const auto uncapped = run(std::nullopt);
+    ASSERT_GT(uncapped.first_body_bytes, 0u);
+    EXPECT_EQ(uncapped.retained_bytes, uncapped.first_body_bytes + uncapped.last_body_bytes)
+        << "positive control: planning read the first and the tail record";
+    for (const uint64_t gets : uncapped.gets)
+        EXPECT_EQ(gets, 1u) << "under the default cap every record is read once";
+    EXPECT_EQ(uncapped.body_get_events, std::accumulate(uncapped.gets.begin(), uncapped.gets.end(), uint64_t{0}))
+        << "`CASRefLogBodyGets` does not count the ref-log bodies read";
+
+    /// Room for the first body and one byte short of the tail one.
+    const auto capped = run(uncapped.first_body_bytes + uncapped.last_body_bytes - 1);
+    EXPECT_EQ(capped.retained_bytes, capped.first_body_bytes) << "only the first body fits under the cap";
+    EXPECT_EQ(capped.gets.front(), 1u) << "the kept body is not read again";
+    EXPECT_EQ(capped.gets.back(), 2u) << "the body that did not fit is read again by the walk";
+    for (size_t i = 0; i + 1 < capped.gets.size(); ++i)
+        EXPECT_EQ(capped.gets[i], 1u) << "sequence " << i + 1;
+    EXPECT_EQ(capped.body_get_events, std::accumulate(capped.gets.begin(), capped.gets.end(), uint64_t{0}))
+        << "`CASRefLogBodyGets` does not count the body the walk read again";
+}
+
+/// Advances the monotonic clock by `step_ms` on every served `GET` of a ref log.
+class TickingLogBackend : public CountingBackend
+{
+public:
+    std::function<uint64_t()> monoMsFn()
+    {
+        return [this] { return now.load(); };
+    }
+
+    void setStep(uint64_t step_ms) { step.store(step_ms); }
+
+    std::optional<Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        auto result = CountingBackend::read(key, access);
+        if (key.find("/_log/") != String::npos)
+            now.fetch_add(step.load());
+        return result;
+    }
+
+private:
+    std::atomic<uint64_t> step{0};
+    std::atomic<uint64_t> now{1'000'000};
+};
+
+/// While pass 2 walks, the round logs its progress at most once per minute of the monotonic clock; a walk shorter
+/// than a minute logs none. The lines do not change what the round does.
+TEST(CASGCLog, ThePassTwoProgressLineIsPacedByTheMonotonicClock)
+{
+    const auto run = [](uint64_t step_ms)
+    {
+        struct Out
+        {
+            size_t lines = 0;
+            uint64_t pass_two_ms = 0;
+            RefTxnId cursor;
+        } out;
+        auto backend = std::make_shared<TickingLogBackend>();
+        auto store = openPoolWithSmallWindow(backend);
+        const Layout & layout = store->layout();
+        const RootNamespace ns{"00/long@cas@"};
+        const uint64_t tail = 3 * kWindow;
+        publishRange(*backend, layout, ns, 1, tail);
+        writeRecoverableCkptForRawFixture(*backend, layout, ns, refCkptOf(1, RefTxnId{1, tail}));
+        backend->setStep(step_ms);
+
+        Gc gc(store, kGc, {}, backend->monoMsFn());
+        const auto now = backend->monoMsFn();
+        uint64_t pass_two_began_ms = 0;
+        gc.setRoundPointHookForTest([&](const Gc::RoundPointSiteForTest & site)
+        {
+            if (site.point == RoundInterleavePoint::AfterNamespaceWalk && site.pass == 1)
+                pass_two_began_ms = now();
+            else if (site.point == RoundInterleavePoint::AfterIntake)
+                out.pass_two_ms = now() - pass_two_began_ms;
+        });
+        ScopedLogCapture capture("CasGc", "information");
+        runRoundCapturingIntake(gc);
+        gc.setRoundPointHookForTest({});
+        out.lines = capture.count(kProgressLine);
+        out.cursor = cursorOf(*backend, layout, ns);
+        return out;
+    };
+
+    const auto fast = run(/*step_ms=*/100);
+    EXPECT_LT(fast.pass_two_ms, 60'000u) << "positive control: the walk took under a minute";
+    EXPECT_EQ(fast.lines, 0u);
+
+    const auto slow = run(/*step_ms=*/11'000);
+    EXPECT_GE(slow.pass_two_ms, 120'000u) << "positive control: pass 2 spanned minutes";
+    EXPECT_LE(slow.lines, slow.pass_two_ms / 60'000);
+    EXPECT_GE(slow.lines + 1, slow.pass_two_ms / 60'000);
+    EXPECT_GE(slow.lines, 2u);
+    EXPECT_EQ(slow.cursor, fast.cursor) << "logging changed what the round folded";
+}
+
 /// Deleting objects outside the protocol is unsupported. This records what the walk then does: a tail
 /// above the cursor that vanished between rounds reads as the end of the log, so the namespace is proven,
 /// not held.
@@ -1065,6 +1318,48 @@ TEST(CASGCBoundedWalk, ColdCursorWhoseLogIsGoneHoldsTheNamespace)
     EXPECT_EQ(cov->last_folded_ref_id, (RefTxnId{1, 3}));
     EXPECT_EQ(metric(intake, "frontier_proven"), 0u);
     EXPECT_EQ(backend->deleteTotal(), 0u) << "Deleted:" << deletedKeysMessage(*backend);
+}
+
+/// `SYSTEM CAS GC STOP` does not wait for a long intake: the background round is parked inside a walk read with a
+/// backlog far beyond it, and once `stop` was called the round reads no further ref log, so `stop` returns.
+TEST(CASGCBoundedWalk, ASchedulerStopReturnsWhileARoundIsInsideALongIntake)
+{
+    auto backend = std::make_shared<GetHookBackend>();
+    auto store = Pool::open(backend, PoolConfig{
+        .pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0, .gc_io_concurrency = 1});
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/long@cas@"};
+    const uint64_t tail = 40;
+    publishRange(*backend, layout, ns, 1, tail);
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, refCkptOf(1, RefTxnId{1, tail}));
+
+    std::promise<void> entered;
+    std::promise<void> release;
+    std::shared_future<void> released = release.get_future().share();
+    /// Planning reads `{1,1}`, the listed tail and the key after it; at concurrency 1 the walk reads `{1,3}` inline.
+    /// At concurrency 1 the read-ahead window is 0 and pass 1 takes one record, so this read is in pass 2: the
+    /// pass-2 coverage of the stop request.
+    backend->armBeforeGet([key = logKey(layout, ns, RefTxnId{1, 3})](const String & k) { return k == key; }, [&]
+    {
+        entered.set_value();
+        (void)released.wait_for(std::chrono::seconds(60));
+    });
+    CasGcScheduler sched(store, std::chrono::seconds(3600), "test::gc", "ca");
+    sched.start();
+    sched.requestRoundSoon();
+    ASSERT_EQ(entered.get_future().wait_for(std::chrono::seconds(60)), std::future_status::ready)
+        << "the round never reached the walk";
+
+    auto stopping = std::async(std::launch::async, [&sched] { sched.stop(); });
+    while (!sched.stopRequested())
+        std::this_thread::yield();
+    const uint64_t gets_at_stop = refLogGetsFor(*backend, layout, ns, 1, tail + 1);
+    release.set_value();
+    ASSERT_EQ(stopping.wait_for(std::chrono::seconds(60)), std::future_status::ready) << "stop waited for the intake";
+    EXPECT_TRUE(sched.isQuiescent());
+    EXPECT_EQ(refLogGetsFor(*backend, layout, ns, 1, tail + 1), gets_at_stop + 1)
+        << "after the stop request the walk read more than the read it was parked in";
+    EXPECT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{1, 3})) << "the round did not keep the records it applied";
 }
 
 /// Pass 1 has a take budget, and its read-ahead stays within the records that budget can take, also when the listing

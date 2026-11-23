@@ -212,18 +212,19 @@ recent age across all servers of the disk:
 ```yaml
 - alert: CasGcStale
   # <disk> is the disk name with every character outside [a-zA-Z0-9_:] replaced by "_".
-  expr: absent(ClickHouseAsyncMetrics_CASGCLastSuccessAgeSeconds_<disk> < 900)
+  expr: absent(ClickHouseAsyncMetrics_CASGCLastSuccessAgeSeconds_<disk> < 2400)
   for: 5m
 ```
 
-The rule fires when no server of the disk reports an age below 900 s. Evaluate it over all servers of
+The rule fires when no server of the disk reports an age below 2400 s. Evaluate it over all servers of
 the disk, not per server: a server that led once keeps reporting an age that grows without bound after
 it loses leadership, so a per-server rule fires on every former leader. After a restart of every
 server the expression is true until the first round completes, because no server reports the metric
 before that; the alert fires only if that takes longer than 5 minutes.
 Do not deploy it for a disk whose GC is disabled on every server (`cas_gc_enabled = false`): no server
-ever reports the metric, so the rule fires forever. 900 s is 15 GC intervals at the default
-`cas_gc_interval_sec` of 60; scale it with that setting.
+ever reports the metric, so the rule fires forever. Treat 2400 s as an example. Set the
+threshold above the configured `cas_gc_interval_sec` plus the longest healthy full-round duration you expect, with a
+margin for slow storage. The 30-minute deadline only decides whether the second pass of the intake starts another record.
 
 Fold begin and end events in `system.cas_log` carry the candidate round number. A fold can emit begin alone,
 or both events, before its commit fails. A later successful attempt can use the same number. Filtering `Finish` to

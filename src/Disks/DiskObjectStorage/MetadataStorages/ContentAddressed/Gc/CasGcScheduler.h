@@ -129,6 +129,10 @@ public:
     /// leads GC; the durable `gc/state` lease is untouched (`SYSTEM CAS GC STOP`).
     void stop();
 
+    /// Whether `stop` was called since the last `start`. A background round asks it between ref-intake steps,
+    /// so `stop` does not wait for a long intake to finish.
+    bool stopRequested();
+
     /// Wake the periodic worker so it starts the next ordinary round promptly. This does not create a
     /// second execution path: the same worker, lease protocol, and `gc_round_mutex` remain the sole
     /// scheduled-round authority. Requests coalesce into one boolean while a round is pending.
@@ -172,6 +176,10 @@ public:
     /// no lost-wakeup window. Lets a test prove the self-exit path fired without relying on any wall-clock
     /// delay.
     bool waitForTerminalSelfExitForTest(std::chrono::milliseconds timeout);
+
+    /// Runs `hook` on the round worker at every tick, after its stop check and before it takes the round mutex.
+    /// Set it before `start`.
+    void setBeforeTickLockHookForTest(std::function<void()> hook) { before_tick_lock_hook_for_test = std::move(hook); }
 
 private:
     enum class SchedulerState
@@ -249,6 +257,8 @@ private:
     std::atomic<bool> hb_exited_on_terminal_for_test{false};
     std::mutex terminal_exit_mutex;
     std::condition_variable terminal_exit_cv;
+    /// See `setBeforeTickLockHookForTest`. Empty in production.
+    std::function<void()> before_tick_lock_hook_for_test;
 
     /// Cumulative condemned entries minus exact-token deletes completed by this scheduler while it
     /// led. It is an approximate health gauge, not durable GC state.

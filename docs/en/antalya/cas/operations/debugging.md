@@ -350,7 +350,9 @@ One row per disk it ran on: `disk`, `acquired_lease`, `deferred`, `round`, `cand
 `anomalies`, `pending_candidates`, `pending_condemned`, `pending_retired`, then the compatibility names `entries_graduated`, `entries_redeleted`,
 `entries_redelete_failed` (same values as the three `entries_*` columns renamed from them). Omitting
 the disk name runs one round on every content-addressed disk on the node. A manual run executes
-regardless of `SYSTEM CAS GC STOP` — `STOP` pauses only the background scheduler.
+regardless of `SYSTEM CAS GC STOP` — `STOP` pauses only the background scheduler. The run is synchronous, and on a large backlog its ref intake
+can exceed 30 minutes: the 30-minute slice bounds only its second pass. If the client's `receive_timeout` (300 s by default) expires first, the client
+disconnects but the round continues and may delete: run it with a larger `receive_timeout`.
 
 ### SYSTEM CAS GC STOP / START {#sql-gc-stop-start}
 
@@ -364,8 +366,11 @@ SYSTEM CAS GC START cas;
 ```
 
 `STOP` is idempotent and stops-in-place (the same scheduler instance resumes on `START`, keeping its
-`gc_id` and lease-observation history); it works even on a not-live disk. It does not stop a manual
-`SYSTEM CAS GC RUN`. See the [operational surface](/antalya/cas/architecture/garbage-collection#operational-surface)
+`gc_id` and lease-observation history); it works even on a not-live disk. A background
+round whose final intake poll sees the request ends its ref intake at the next step. After the intake that round deletes no blob bodies, deletion intents, ref logs, manifests or snapshot generations. Catalog rows cleaned up before the fold may already be erased. A round already past its final intake
+poll finishes normally, deletes included. `STOP` waits for the request in flight and for the rest of that round. The next round continues from the cursors the
+stopped one reached. `STOP` does not interrupt a manual `SYSTEM CAS GC RUN`; it waits until that round ends.
+See [a stop request](/antalya/cas/architecture/garbage-collection#phase-8-fold-ref-intake) for what a stop does not interrupt. See the [operational surface](/antalya/cas/architecture/garbage-collection#operational-surface)
 table for the full command list.
 
 ### SYSTEM CAS FORGET {#sql-forget}

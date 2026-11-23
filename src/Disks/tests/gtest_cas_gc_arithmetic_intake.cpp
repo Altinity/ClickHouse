@@ -744,6 +744,13 @@ TEST(CASGCArithmeticIntake, MoreSealCrossingsThanThePlannerFollowsLeaveTheLifeUn
         ScopedLogCapture capture("CasGc", "information");
         intake = runRoundReadingIntake(gc);
         EXPECT_EQ(capture.count("discovery_incomplete=1"), 1u) << capture.captured();
+        const String text = capture.captured();
+        const size_t at = text.find("past what planning observed");
+        ASSERT_NE(at, String::npos) << "no line names the life planning did not cover: " << text;
+        const size_t line_begin = text.rfind('\n', at) == String::npos ? 0 : text.rfind('\n', at) + 1;
+        const String line = text.substr(line_begin, text.find('\n', at) - line_begin);
+        EXPECT_NE(line.find(ns.string()), String::npos) << line;
+        EXPECT_NE(line.find(renderRefTxnId(RefTxnId{seal_only_epochs, 1})), String::npos) << line;
         EXPECT_GT(capture.count("destructive work SUPPRESSED"), 0u);
     }
     ASSERT_FALSE(intake.empty());

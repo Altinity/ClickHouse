@@ -436,9 +436,9 @@ public:
     Gc(PoolPtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_ = {},
        std::function<uint64_t()> mono_ms_fn_ = {}, LoggerPtr log_ = nullptr);
 
-    /// The time slice of one round's ref intake, on `mono_ms_fn`. A writer appends as fast as the walker
-    /// reads, so only time bounds the walk; one default `gc_interval_sec`.
-    static constexpr uint64_t kRefIntakeBudgetMs = 60'000;
+    /// The time slice of one round's ref intake, on `mono_ms_fn`. It cuts only pass 2; planning and pass 1 run to
+    /// their end, and their time counts against it.
+    static constexpr uint64_t kRefIntakeBudgetMs = 30 * 60 * 1000;
 
     /// The ref-log bodies one round keeps from planning for its walk, summed over all lives. A body that
     /// does not fit is read again by the walk.
@@ -532,6 +532,14 @@ public:
     /// scheduler locals it captures. Not thread-safe, like the rest of `Gc`: one pacing thread drives one
     /// instance, and the scheduler holds `gc_round_mutex` across both the install and the round.
     void setPhaseSink(GcPhaseSink sink) { phase_sink = std::move(sink); }
+
+    /// Install (or clear) the stop signal of the rounds that follow. Planning asks it before each read, the walk
+    /// before each step, and the intake once more after its last walk. Once it answers true, the intake reads no
+    /// further ref log, every namespace it has not finished stays unproven, and the round deletes nothing; the
+    /// reduce and the commit still run. A stop after the final intake poll does not affect the round. Not asked:
+    /// the pre-fold drain of catalog rows, the checkpoint reads before planning, and a cold cursor's resolution,
+    /// which may follow one backlink per epoch. Installed and cleared like `setPhaseSink`.
+    void setStopSignal(std::function<bool()> signal) { stop_signal = std::move(signal); }
 
     /// Keys per GC write-once delete request: `gc_bulk_delete_chunk_keys` capped by the storage's batch
     /// limit, clamped to [1, `kBulkDeleteMaxKeys`] because an empty request would never advance.
@@ -703,6 +711,7 @@ private:
         ///     suppress_destructive = any anomaly this round
         ///                         OR carriedHolds() is non-empty
         ///                         OR the frontier is incomplete
+        ///                         OR a stop request seen by the final intake poll
         ///                         OR parent_unconfirmed
         ///
         /// The second term is STRUCTURAL, not decorative. Every hold the fold seals also records an
@@ -758,7 +767,7 @@ private:
             Proven,
             CheckpointUnusable,
             Held,
-            /// The ref intake's time slice ended before the walk reached an end.
+            /// The ref intake's time slice ended, or the round was asked to stop, before the walk reached an end.
             IntakeSliceCut,
             /// The walk reached a key past what the round's planning observed, so no stop bounds it.
             DiscoveryIncomplete,
@@ -1078,6 +1087,8 @@ private:
     /// Where `GcPhaseTimer` sends one record per GC phase. Empty unless a `CasGcScheduler` installed one
     /// for the current round, in which case every phase of that round emits a row.
     GcPhaseSink phase_sink;
+    /// See `setStopSignal`. Empty: the intake is never stopped.
+    std::function<bool()> stop_signal;
     UInt128 gc_id{};   /// this leader's identity (random u128, never 0)
     /// Every round-engine log line goes through this logger (see the constructor's `log_` doc
     /// comment) so multi-disk processes can attribute GC logs to the disk/srid that produced them.

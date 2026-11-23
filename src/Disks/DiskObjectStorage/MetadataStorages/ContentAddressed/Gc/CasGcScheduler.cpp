@@ -163,6 +163,12 @@ void CasGcScheduler::stop()
     i_am_leader.store(false, std::memory_order_relaxed);
 }
 
+bool CasGcScheduler::stopRequested()
+{
+    std::lock_guard lock(mutex);
+    return scheduler_state == SchedulerState::Stopped;
+}
+
 void CasGcScheduler::requestRoundSoon()
 {
     {
@@ -407,6 +413,8 @@ void CasGcScheduler::loop()
         /// finished thread cleanly.
         if (exit_if_pool_terminal())
             return;
+        if (before_tick_lock_hook_for_test)
+            before_tick_lock_hook_for_test();
         try
         {
             /// LOW/benign: if stop() flips `scheduler_state` while we're blocked here (a concurrent manual
@@ -422,10 +430,12 @@ void CasGcScheduler::loop()
             if (store->teardownBegun())
                 return;
 
-            /// Before the round, so a follower runs it too.
+            /// Before the round, so a follower runs it too. A stop request ends it before its catalog read or its
+            /// next cancel.
+            const auto stop_requested = [this] { return stopRequested(); };
             try
             {
-                store->cancelIdleOwnCreatingRows();
+                store->cancelIdleOwnCreatingRows(stop_requested);
             }
             catch (...)
             {
@@ -454,6 +464,9 @@ void CasGcScheduler::loop()
             /// follower observing the frozen (owner, seq) across two of its own ticks would steal
             /// deterministically once that first round outlasts them. allow_steal defaults to true here
             /// (the loop is the ONLY caller allowed to execute the steal CAS).
+            /// Only the background round: a manual round runs on a stopped scheduler too.
+            gc.setStopSignal(stop_requested);
+            SCOPE_EXIT({ gc.setStopSignal({}); });
             const Cas::RoundReport report = runRoundLogged(gc, GcRoundLogRecord::Trigger::Scheduled, [this] { onLeaseAcquired(); });
             i_am_leader.store(report.acquired_lease, std::memory_order_relaxed);
             if (report.acquired_lease)

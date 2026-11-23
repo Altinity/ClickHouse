@@ -83,8 +83,9 @@ Orderings that are load-bearing:
   published state.
 
 **Clamp suppression.** `suppress_destructive = !anomalies.empty() || !carried_holds.empty() ||
-!frontier_complete || parent_unconfirmed` is computed once and threaded into the merge, current-life ref cleanup
-and the perpetual namespace janitor, so they cannot desynchronize. Under suppression no blob body and no
+!frontier_complete || stop_requested || parent_unconfirmed` is computed once and threaded into the merge, current-life ref cleanup
+and the perpetual namespace janitor, so they cannot desynchronize. `stop_requested` is true when the round saw a
+stop request before its final intake poll. Under suppression no blob body and no
 deletion intent is deleted, no intent is listed for adoption, and there is no ref or namespace
 deletion. Fresh condemnations and transitions still create intents and write rows, and sparing continues,
 because none of them removes anything a writer relies on. A carried `candidate` row waits for an unsuppressed
@@ -320,14 +321,16 @@ extracting blob source edges. Usually the dominant read phase on ref-log- and ma
 
 - **Runs on:** fold path only
 - **Reads:** one `_ckpt` per namespace in the universe; `_log` records from the successor of each
-  namespace's cursor to the first absent key or a terminal record; one manifest body per folded owner
-  edge; extra `_log` reads to find the successor of a cursor this GC process does not remember
+  namespace's cursor to the stop the round fixes for that namespace before it reads any manifest (see
+  *The stop* below), or to a terminal record; one manifest body per folded owner edge; extra `_log`
+  reads to find the successor of a cursor this GC process does not remember
 - **Writes / deletes:** none (the successor seal's `cleanup_evidence` rows are written between this
   phase's timer and phase 10's)
 - **Safety:** per-namespace failures stay per-namespace — a *hold*, never a whole-round abort. A
-  concurrent writer appending mid-round changes nothing: the walk is cut at the first key it reads
-  absent, and nothing above that key is folded this round even if it lands later. Transactions apply
-  atomically; the durable cursor advances once per fully folded record.
+  concurrent writer appending mid-round changes nothing: the round fixes where each namespace's walk
+  ends before it reads any manifest. A record appended after that is not folded this round, and the
+  next round folds it. Transactions apply atomically; the durable cursor advances once per fully
+  folded record.
 - **Fails the round if** (`CORRUPTED_DATA`): a manifest body whose ref / namespace disagrees with its
   key; a table with no sealed cursor whose baseline logs are already gone; a sealed cursor that does
   not close the run the walk produced; a `RemoveNamespace` for a namespace absent from the catalog
@@ -336,20 +339,88 @@ extracting blob source edges. Usually the dominant read phase on ref-log- and ma
 - **Observability:** phase row `fold_ref_intake`; metrics `frontier_namespaces` / `frontier_proven`
   (universe and its proven part), `tables_held`, `logs_accounted` / `logs_applied`; per-cause hold
   reasons are in [GC anomalies](#gc-anomalies)
+- **Log lines:** one `INFO` line per folding round when planning ends, `CAS GC ref intake planned`, and
+  while the walk is in its second pass at most one `CAS GC ref intake progress` line per minute. Neither
+  changes any decision; fields are listed under *The planning line* below
 
 **The universe** is exactly the `Live` and `Removing` rows of the frozen catalog cut. A namespace
 the phase-4 hint omitted, with no carried hold and no `_ckpt`, is walked only while
 `gc_frontier_probe_budget` lasts; once spent, the rest ride their cursors verbatim and the round is
 suppressed. **The walk** starts at the successor of the cursor (or at the namespace's first key,
-`{life_epoch, 1}`, when nothing is folded yet) and follows the chain by exact `GET`. A namespace is
-*proven* only when the walk reads an absent key or a terminal record. Any other exit — a hold, an
-unusable checkpoint, the probe budget, the time slice — leaves it unproven, which feeds phase 10's gate.
+`{life_epoch, 1}`, when nothing is folded yet) and follows the chain by exact `GET`.
 
-**The time slice.** The ref intake of one round has a fixed slice of 60 s (`kRefIntakeBudgetMs`). Pass 1
-gives every namespace its start and one read window and is never cut, so every quiet namespace is proven.
-Pass 2 continues the unfinished walks from `round mod n` and starts no read after the slice ends. A
-namespace the slice cuts keeps the cursor it reached and is unproven: the round still folds and seals
-but suppresses every destructive step.
+**The stop.** Before it reads any manifest, the round fixes each namespace's stop with exact `GET`s:
+
+- It reads the first key, then the greatest key the listing names in that epoch, if that one is higher.
+- From the higher present key it probes in doubling steps to the first absent key, then bisects back.
+- The stop is the absent key right after the last present one. For a quiet namespace it is the first key.
+- A seal sends planning to the epoch the seal names. A terminal record, a malformed ref record or
+  more than 64 seal crossings leave the namespace without a stop.
+
+The walk applies records up to the stop and ends there. A record appended at or above the stop after
+planning is left to the next round. A key at or below the greatest key planning read present in its epoch
+must hold a record. If the walk reads it absent, a record was lost: the namespace is held, not proven. Most
+such keys are ones planning skipped between two probes. A body planning read is applied without a second
+read, for at most 64 MiB of such bodies per round; beyond that the walk reads the body again.
+
+A namespace is *proven* only when its walk reaches the stop or a terminal record. Any other exit — a
+hold, an unusable checkpoint, the probe budget, the time slice, a stop request, or a key past what
+planning observed — leaves it unproven, which feeds phase 10's gate.
+
+**The time slice.** The ref intake of one round has a slice of 30 minutes. Planning time counts against
+it. The slice never cuts pass 1, which gives every namespace its start and one read window, so a round
+that is not stopped proves every quiet namespace. Pass 2 continues the unfinished walks from
+`round mod n` and starts no read after the slice ends. A namespace whose walk does not reach its stop
+inside the slice stays unproven. That round folds, seals and keeps the cursor it reached, but deletes
+nothing. The next round continues from that cursor.
+
+**A stop request** (`SYSTEM CAS GC STOP`, `SYSTEM CAS FORGET`) ends a background round's ref intake at its next
+step: before the next planning probe of a namespace, before the next record of the walk (in either pass), and
+between two cancellations of the mount's own unfinished table creations. Every namespace not finished then stays
+unproven, as at the end of the slice. The intake polls once more after its last walk. A stop request seen by
+that final intake poll suppresses the round's destructive work, even when every namespace finished or the
+catalog is empty. After the intake the round deletes no blob bodies, deletion intents, ref logs, manifests or
+snapshot generations. Catalog rows cleaned up before the fold may already be erased. The next round continues.
+
+A stop request does not interrupt:
+
+- the drain of catalog rows before the fold (phase 2): it can still cancel stalled table creations and drop
+  completed removals;
+- requests already sent;
+- the reads of checkpoints at the start of the intake;
+- the resolution of a namespace's starting position when it has no remembered one, which can follow one link per epoch;
+- a round past its final intake poll: it finishes, deletes included;
+- a manual `SYSTEM CAS GC RUN`: `SYSTEM CAS GC STOP` waits until that round ends.
+
+A manual `SYSTEM CAS GC RUN` is synchronous. The 30-minute slice bounds only pass 2, so on a large backlog its
+intake can exceed 30 minutes. If the
+client's `receive_timeout` (300 s by default) expires first, the client disconnects but the round continues and
+may delete. Run it with a larger `receive_timeout`.
+
+**The planning line.** Each folding round logs `CAS GC ref intake planned` once, with these fields. The counts
+cover the plans that completed; a plan a stop request interrupted is not counted. The retained-bytes number is the exception: it also includes bodies kept by a plan that a later probe interrupted.
+
+| Field | Meaning |
+|---|---|
+| `round` | the round number |
+| `lives` | namespace lives whose plan completed |
+| `quiet` / `hot` | lives whose first key is absent / present |
+| `empty_hint` | lives with no listed id above their first key |
+| `crossings` | epoch seals that planning followed |
+| `crossing_limit` | lives where planning stopped following seals at the limit; each is left unproven |
+| `planner_misses` | absent keys read by the plans that completed |
+| `retained_bytes` | bytes of log bodies kept from planning for the walk |
+
+`CAS GC ref intake progress` carries `round`, the namespace being walked, the id it has applied, its
+stop, `logs_applied`, and how many of the lives have finished.
+
+Two more `INFO` lines mark an intake that ended early:
+
+- `CAS GC ref intake: round <n> was asked to stop; it deletes nothing, and every namespace it has not finished stays unproven and keeps the cursor it reached`.
+  A stop request ended the intake, and the round deletes nothing. No action: the next round continues.
+- `CAS GC ref intake: namespace <ns> (life <life>) reached <id>, past what planning observed; it stays unproven this round and keeps the cursor <cursor>`.
+  The walk met a key that planning had not seen, such as an epoch beyond its 64 seal crossings. Each round logs it once, for the first such
+  namespace. No action for an occasional line. If the same namespace appears round after round, the round deletes nothing; report it with these lines.
 
 **What a quiet namespace costs.** One `_ckpt` `GET` and one probe of the cursor's successor, which is the
 proof that nothing was appended. When the GC process does not remember the cursor's successor, the cold
@@ -428,7 +499,8 @@ Recomputes the per-shard in-degree snapshot and computes the round's single dest
 
 `suppress_destructive` is true on any recorded anomaly, any hold in the seal about to be made
 durable, an incomplete frontier (`frontier_proven ≠ frontier_namespaces`, a universe neither
-non-empty nor proved empty, or a universe policy that is not authoritative), or an unconfirmed parent state. The
+non-empty nor proved empty, or a universe policy that is not authoritative), a stop request seen before the final
+intake poll, or an unconfirmed parent state. The
 parent check is one uncached `HEAD` of `gc/state`, sent after the intake when the adopted state holds a `pending` or
 `standing` row. The seal's per-shard summary decides that before the merge; the merge reads the whole run of
 every shard it merges, and refuses one whose rows differ from the summary, before any body or intent delete of the round. A round
@@ -712,7 +784,7 @@ and the `Finish` row of `system.cas_gc_log`. There are no per-anomaly rows.
 
 | Hold | Meaning | Effect |
 |---|---|---|
-| `gap_below_witness` | the next record on the chain is absent while a same-epoch witness at or above it exists: a listed log, a carried hold position, or the frontier of a generation 1 or 2 `_ckpt` | held |
+| `gap_below_witness` | the next record on the chain is absent while a same-epoch witness at or above it exists: a listed log, a carried hold position, the frontier of a generation 1 or 2 `_ckpt`, or a key of the same epoch that planning read present | held |
 | `unconsumed_seal_crossing` | the chain ends below a later epoch's records, or the successor of the sealed cursor cannot be proved from the chain | held |
 | `witness_disappeared` | an epoch-crossing chase resolves back to the absent position | held |
 | `body_undecodable` | a ref-log record exists at the walk position but its body cannot be decoded | held at that position |
@@ -720,15 +792,18 @@ and the `Finish` row of `system.cas_gc_log`. There are no per-anomaly rows.
 | `checkpoint_undecodable` | a live/removing life's `_ckpt` is undecodable, absent, or lacks `life_epoch` | folds nothing; held at `cursor + 1` when the life has a sealed cursor |
 
 **Per-round suppression signals** — not persisted; they force `suppress_destructive` for the
-round. `ref_folding_aborted` and `frontier_unprobed_budget` are `phase_metrics`; the checkpoint and
-slice states are counted only in the suppression log line's frontier-deficit breakdown:
+round. `ref_folding_aborted` and `frontier_unprobed_budget` are `phase_metrics`; the checkpoint, slice
+and discovery states are counted only in the suppression log line's frontier-deficit breakdown; a stop request is
+named in that line:
 
 | Signal | Phase | Meaning |
 |---|---|---|
 | `ref_folding_aborted` | 6 | a ref-object key under the stream prefix is unparseable: no ref delta, no cursor advance |
 | `CheckpointUnusable` | 8 | in-memory frontier state for a `_ckpt` that could not be used, recorded even when there is no cursor position to hold at |
-| `IntakeSliceCut` | 8 | the 60 s ref-intake slice ended before the namespace's walk reached an end: namespace unproven |
+| `IntakeSliceCut` | 8 | the 30-minute ref-intake slice ended, or the round was asked to stop, before the namespace's walk reached its stop: namespace unproven |
+| `DiscoveryIncomplete` | 8 | the walk reached a key past what planning observed, such as an epoch beyond planning's 64 seal crossings. The namespace is unproven and nothing is read there. Records applied before it are kept; nothing is deleted on its account. The round logs the first such namespace |
 | `frontier_unprobed_budget` | 8 | `gc_frontier_probe_budget` ran out before every hint-less namespace was walked |
+| stop request | 8 | a stop request was seen before the round's final intake poll: the round deletes nothing, even with a complete frontier |
 
 **Fatal pre-seal checks** — `CORRUPTED_DATA`, evaluated after phase 10 and before phase 11:
 `transactions_unapplied` (a folded transaction's deltas reached no shard reducer) and
@@ -1073,7 +1148,7 @@ phase 10 runs orphan planning it reads the same key once more.
 | Key | Operation | Requests |
 |---|---|---:|
 | `<life_id>/_ckpt` | `GET` | one per namespace life in the universe |
-| `_log` record from the cursor's successor | `GET` | one per record read, plus one absent probe per namespace that ends at an absent key |
+| `_log` record from the cursor's successor | `GET` | one per record read, plus the absent probes that fix the stop: one for a quiet namespace, up to about `1 + log2(m + 1)` for a namespace `m` records past its listed tail; with the present probes, about twice that many requests |
 | `_log` record that resolves a cold cursor | `GET` | at least one more per namespace, only when the GC process does not remember the cursor's successor |
 | manifest body | `GET` | one per folded owner edge |
 
