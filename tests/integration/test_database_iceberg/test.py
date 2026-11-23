@@ -1939,6 +1939,47 @@ def test_distributed_join_dispatch_falls_back(started_cluster):
     assert run(1) == run(0)
 
 
+def test_distributed_join_dispatch_declines_in_table_name(started_cluster):
+    """`x IN db.table` keeps the right side as a catalog table name, which is not sent as a table function.
+    A worker would resolve it in its own catalog, which node2 lacks here, and would read its latest snapshot
+    instead of the initiator's, so the query must not be dispatched."""
+    node1 = started_cluster.instances["node1"]
+
+    test_ref = f"test_distributed_join_in_table_{uuid.uuid4()}"
+    fact, dim, _ = _setup_distributed_join_tables(started_cluster, [node1], test_ref)
+
+    root_namespace = f"{test_ref}_namespace"
+    keys_table = f"{test_ref}_keys"
+    create_clickhouse_iceberg_table(started_cluster, node1, root_namespace, keys_table, "(k Int32)")
+    keys = f"{CATALOG_NAME}.`{root_namespace}.{keys_table}`"
+    node1.query(
+        f"INSERT INTO {keys} VALUES (1), (3)",
+        settings={"allow_insert_into_iceberg": 1, "write_full_path_in_iceberg_metadata": 1},
+    )
+
+    query = f"""
+        SELECT d.city, count() AS c
+        FROM {fact} AS f
+        INNER JOIN {dim} AS d ON f.tag = d.id
+        WHERE f.tag IN {keys}
+        GROUP BY d.city
+        ORDER BY ALL
+    """
+
+    def settings(distributed_join):
+        return {
+            "object_storage_cluster": "cluster_simple",
+            "allow_object_storage_cluster_distributed_join": distributed_join,
+        }
+
+    plan = node1.query(f"EXPLAIN {query}", settings=settings(1))
+    assert "ReadFromClusterQuery" not in plan, plan
+
+    expected = node1.query(query, settings=settings(0))
+    assert expected == "berlin\t2\n", expected
+    assert node1.query(query, settings=settings(1)) == expected
+
+
 def test_distributed_join_dispatch_ignores_parallel_replicas_settings(started_cluster):
     """A whole-query dispatch must not let the parallel-replicas settings change what a worker reads.
 

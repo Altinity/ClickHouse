@@ -620,6 +620,35 @@ TEST(DistributedObjectStorageJoinDispatch, PartnerWithoutPinnedSnapshotIsNotDisp
     EXPECT_EQ(plan_text.find("ReadFromClusterQuery"), String::npos) << plan_text;
 }
 
+/// The short form `x IN db.table` keeps the right side as a table name, which is serialized outside any table
+/// expression and so is not replaced by a table function. A worker would have to resolve it in its own catalog,
+/// which a swarm node usually lacks, and would read its latest snapshot instead of the initiator's.
+TEST(DistributedObjectStorageJoinDispatch, TableNameOnTheRightOfInIsNotDispatched)
+{
+    auto & state = State::instance();
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
+
+    auto plan_text = planAndExplain(
+        "SELECT driver.id, safe_lookup.lookup_id FROM driver INNER JOIN safe_lookup ON driver.id = safe_lookup.lookup_id "
+        "WHERE driver.id IN dim2",
+        state.context);
+    EXPECT_EQ(plan_text.find("ReadFromClusterQuery"), String::npos) << plan_text;
+}
+
+/// A subquery on the right of `IN` is a table expression, so its table is sent as a table function.
+TEST(DistributedObjectStorageJoinDispatch, SubqueryOnTheRightOfInIsDispatched)
+{
+    auto & state = State::instance();
+    state.context->setSetting("allow_object_storage_cluster_distributed_join", true);
+
+    auto plan_text = planAndExplain(
+        "SELECT driver.id, safe_lookup.lookup_id FROM driver INNER JOIN safe_lookup ON driver.id = safe_lookup.lookup_id "
+        "WHERE driver.id IN (SELECT lookup_id FROM dim2)",
+        state.context);
+    ASSERT_NE(plan_text.find("ReadFromClusterQuery"), String::npos) << plan_text;
+    expectEveryTableSentAsATableFunction(plan_text, /*partners=*/2);
+}
+
 /// A plan built for a shard is serialized and sent, and `ReadFromClusterQuery` has no serialized form.
 TEST(DistributedObjectStorageJoinDispatch, LogicalPlanForShardIsNotDispatched)
 {

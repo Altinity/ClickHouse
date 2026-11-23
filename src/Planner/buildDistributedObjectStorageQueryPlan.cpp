@@ -81,6 +81,20 @@ void collectAccessedTables(const QueryTreeNodePtr & node, AccessedTables & acces
             collectAccessedTables(child, accessed_tables);
 }
 
+/// A table name left in the query after `replaceTablesWithTableFunctions` would be resolved by each worker in its
+/// own catalog. The short form `x IN db.table` is one: it is not a table expression, so it is not replaced.
+bool hasTableName(const ASTPtr & ast)
+{
+    if (ast->as<ASTTableIdentifier>())
+        return true;
+
+    for (const auto & child : ast->children)
+        if (hasTableName(child))
+            return true;
+
+    return false;
+}
+
 /// Only the driver's `*Cluster` function consumes file tasks; partners use plain table functions.
 /// Count driver references after CTE expansion so repeated uses cannot share one task queue.
 /// Returns `std::nullopt` when a partner does not pin the snapshot the initiator resolved: each worker would then
@@ -177,6 +191,9 @@ std::optional<JoinTreeQueryPlan> buildDistributedObjectStorageQueryPlan(
     collectTableNodes(dispatch_boundary_node, table_nodes);
     const auto driver_references = replaceTablesWithTableFunctions(query_to_send, table_nodes, *candidate.driver, context);
     if (driver_references != 1)
+        return {};
+
+    if (hasTableName(query_to_send))
         return {};
 
     SelectQueryInfo query_info = select_query_info;
