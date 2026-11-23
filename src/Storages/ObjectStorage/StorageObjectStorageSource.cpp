@@ -1525,7 +1525,8 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
                 context_,
                 log,
                 std::nullopt,
-                !headers_requested,
+                /*allow_page_cache=*/ !headers_requested,
+                /*pin_to_metadata_etag=*/ false,
                 revalidate_identity_for_parquet_metadata_cache);
         }
 
@@ -2013,8 +2014,8 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     const LoggerPtr & log,
     const std::optional<ReadSettings> & read_settings,
     bool allow_page_cache,
-    bool revalidate_identity_for_parquet_metadata_cache,
-    bool pin_to_metadata_etag)
+    bool pin_to_metadata_etag,
+    bool revalidate_identity_for_parquet_metadata_cache)
 {
     const auto & settings = context_->getSettingsRef();
     const auto & effective_read_settings = read_settings.has_value() ? read_settings.value() : context_->getReadSettings();
