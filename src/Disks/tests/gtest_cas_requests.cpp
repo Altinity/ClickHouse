@@ -2494,6 +2494,108 @@ TEST(CASRequests, AMissingBucketOnAReadIsReissuedToTheDeadline)
     EXPECT_GE(clock.now - start, 85'000u) << "the policy's own deadline is what must end this read";
 }
 
+namespace
+{
+
+/// The message of the exception `f` throws; fails the test when it does not throw `NETWORK_ERROR`.
+template <typename F>
+String retryLaterMessageOf(F && f)
+{
+    try
+    {
+        f();
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR) << e.message();
+        return e.message();
+    }
+    ADD_FAILURE() << "no exception";
+    return {};
+}
+
+}
+
+/// A read that gives up says it was a read: no write was involved, and the code stays `NETWORK_ERROR`.
+TEST(CASRequests, AReadThatGivesUpIsReportedAsAReadNotAWrite)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<AlwaysFailingReadBackend>(
+        s3Error(Aws::S3::S3Errors::NO_SUCH_BUCKET, "NoSuchBucket"));
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+
+    const String message = retryLaterMessageOf([&] { (void)op.read("k", Retry::standard()); });
+
+    EXPECT_NE(message.find("read of 'k'"), String::npos) << message;
+    EXPECT_NE(message.find("gave up at the policy deadline after "), String::npos) << message;
+    EXPECT_NE(message.find("retrying later"), String::npos) << message;
+    EXPECT_EQ(message.find("write"), String::npos) << message;
+    EXPECT_GT(backend->getTotal(), 1u) << "positive control: the read was reissued before it gave up";
+}
+
+/// The same give-up for a request that is not a read names its own verb: a delete never claims to be a read.
+TEST(CASRequests, ARequestThatGivesUpNamesItsOwnVerb)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<IndeterminateProbeBackend>();
+    auto requests = makeRequests(backend, clock);
+    requests.setAttemptReservationForTest(0);
+    auto op = requests.admit();
+
+    const String message = retryLaterMessageOf([&] { (void)op.probeSentinel("k", Retry::within(0)); });
+
+    EXPECT_NE(message.find("probeSentinel of 'k'"), String::npos) << message;
+    EXPECT_EQ(message.find("write"), String::npos) << message;
+    EXPECT_EQ(message.find("read of"), String::npos) << message;
+}
+
+/// A write that gives up keeps its wording.
+TEST(CASRequests, AWriteThatGivesUpKeepsItsWriteWording)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    requests.setAttemptReservationForTest(0);
+    auto op = requests.admit();
+
+    const String message = retryLaterMessageOf([&] { (void)orThrow(op.create("k", "v", Retry::within(0)), "create"); });
+
+    EXPECT_EQ(message, "CAS write could not be committed (create: gave up at the policy deadline after zero attempt(s)); retrying later");
+}
+
+/// A read refused for lack of lease budget names the lease and does not claim a write.
+TEST(CASRequests, AReadRefusedForLackOfLeaseBudgetIsNotReportedAsAWrite)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    Fence fence{[] { return uint64_t{0}; }, [](uint64_t, uint64_t) { return Fence::Admit::NoBudget; }, [](uint64_t) {}};
+    auto requests = makeRequests(backend, clock, fence);
+    auto op = requests.admit();
+
+    const String message = retryLaterMessageOf([&] { (void)op.read("k", Retry::standard()); });
+
+    EXPECT_NE(message.find("no lease budget"), String::npos) << message;
+    EXPECT_NE(message.find("read of 'k'"), String::npos) << message;
+    EXPECT_EQ(message.find("write"), String::npos) << message;
+    EXPECT_EQ(backend->getTotal(), 0u) << "positive control: the refusal came before any request";
+}
+
+/// The same refusal of a write keeps the write wording and the lease deadline.
+TEST(CASRequests, AWriteRefusedForLackOfLeaseBudgetKeepsItsWriteWording)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    Fence fence{[] { return uint64_t{0}; }, [](uint64_t, uint64_t) { return Fence::Admit::NoBudget; }, [](uint64_t) {}};
+    auto requests = makeRequests(backend, clock, fence);
+    auto op = requests.admit();
+
+    const String message = retryLaterMessageOf([&] { (void)orThrow(op.create("k", "v", Retry::standard()), "create"); });
+
+    EXPECT_NE(message.find("CAS write could not be committed"), String::npos) << message;
+    EXPECT_NE(message.find("gave up at the lease deadline"), String::npos) << message;
+}
+
 /// The kept half of the same classification: a key miss IS an answer about the object, so reissuing it
 /// only replays the same authoritative absence until the deadline. One attempt, no pause.
 TEST(CASRequests, AnAuthoritativeKeyMissOnAReadEndsTheCallAtOnce)

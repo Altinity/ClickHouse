@@ -100,6 +100,13 @@ void logCasWriteRetryLater(const String & why)
     throw Exception(ErrorCodes::NETWORK_ERROR, "CAS write could not be committed ({}); retrying later", why);
 }
 
+[[noreturn]] void throwCasRequestRetryLater(const String & why)
+{
+    LogSeriesLimiter log(getLogger("CasRequestRetryLater"), /*allowed_count=*/1, /*interval_s=*/30);
+    LOG_WARNING(log, "CAS request did not complete ({}); retrying later", why);
+    throw Exception(ErrorCodes::NETWORK_ERROR, "CAS request did not complete ({}); retrying later", why);
+}
+
 std::exception_ptr makeCasWriteRetryLaterExceptionPtr(const String & why)
 {
     logCasWriteRetryLater(why);
@@ -399,7 +406,7 @@ namespace
                                    std::string_view when)
 {
     if (admit == Fence::Admit::NoBudget)
-        throwCasWriteRetryLater(fmt::format("{} of '{}': no lease budget {}", verb, subject, when));
+        throwCasRequestRetryLater(fmt::format("{} of '{}': no lease budget {}", verb, subject, when));
     throwCasTransientUnavailable(fmt::format("CAS {} of '{}'", verb, subject),
                                  fmt::format("mount fence tripped {}", when));
 }
@@ -566,8 +573,8 @@ void CasOperation::giveUpReadDeadline(std::string_view verb, const String & subj
                                       const Retry::Bound & bound, uint32_t attempts_made)
 {
     last_read_stop = ReadStop::PolicyExhausted;
-    throwCasWriteRetryLater(fmt::format("{} of '{}': gave up at the {} deadline after {} attempt(s)",
-                                        verb, subject, bound.lease_bound ? "lease" : "policy", attempts_made));
+    throwCasRequestRetryLater(fmt::format("{} of '{}': gave up at the {} deadline after {} attempt(s)",
+                                          verb, subject, bound.lease_bound ? "lease" : "policy", attempts_made));
 }
 
 std::optional<Object> CasOperation::readUnder(
@@ -705,7 +712,7 @@ Removal CasOperation::removeCurrent(const String & key, const Retry & policy)
         /// verb has to honour `once` itself, and its contract is that it never hands a `Mismatch` back.
         /// The message says what actually stopped it, which is the policy and not the deadline.
         if (policy.single_attempt)
-            throwCasWriteRetryLater(fmt::format(
+            throwCasRequestRetryLater(fmt::format(
                 "removeCurrent of '{}': the observed incarnation was replaced and the policy allows no reissue", key));
 
         /// Another incarnation became current between the observation and the delete. Re-observe, paced

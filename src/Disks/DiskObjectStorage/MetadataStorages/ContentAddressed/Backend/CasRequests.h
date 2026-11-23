@@ -102,6 +102,10 @@ String describeRequestFailure(std::string_view verb, const String & key, const s
 /// their meaning and are not rerouted here.
 [[noreturn]] void throwCasWriteRetryLater(const String & why);
 
+/// Same class as `throwCasWriteRetryLater` (`NETWORK_ERROR`, retry later), worded for a request that is not a
+/// commit: a read, a probe, a delete, or recovery and maintenance work.
+[[noreturn]] void throwCasRequestRetryLater(const String & why);
+
 /// Same classification as `throwCasWriteRetryLater`, but returns the exception as a
 /// `std::exception_ptr` for call sites that fail a pending future/promise rather than throw directly.
 /// Both entry points route through the SAME construction internally, so the error code / message shape

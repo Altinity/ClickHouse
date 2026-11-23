@@ -842,7 +842,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             = drainCompletedRemoving(state, state_etag, completed_erases, cancelled_creating);
         if (drain_result.authority_status != AuthorityStatus::Authoritative
             || drain_result.catalog_resolution != CatalogResolution::DrainComplete)
-            throwCasWriteRetryLater("CAS GC pre-fold drain lost authority before the catalog settled");
+            throwCasRequestRetryLater("CAS GC pre-fold drain lost authority before the catalog settled");
     }
 
     /// Etag-guarded fence-out of dead mounts (liveness only — row decisions pace on GC
@@ -4995,7 +4995,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
     const CatalogLifecycleReconcileResult drain_result = drainCompletedRemoving(state, state_etag);
     if (drain_result.authority_status != AuthorityStatus::Authoritative
         || drain_result.catalog_resolution != CatalogResolution::DrainComplete)
-        throwCasWriteRetryLater("CAS GC rebuild lost authority before the catalog settled");
+        throwCasRequestRetryLater("CAS GC rebuild lost authority before the catalog settled");
     const RefScanSummary rebuild_ref_scan = enumerateRefPrefix();
     const CasRefCatalog::Snapshot rebuild_work_catalog_cut = CasRefCatalog::read(op, layout);
 
@@ -5152,7 +5152,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
         const std::optional<RecoveredRefTable> recovered = recoverRefTableDetailedFromAuthority(
             op, layout, *entry_it, checkpoint);
         if (!recovered)
-            throwCasWriteRetryLater("CAS GC rebuild: the checkpoint of namespace '" + ns.string()
+            throwCasRequestRetryLater("CAS GC rebuild: the checkpoint of namespace '" + ns.string()
                 + "' moved while its ref chain was read");
         const RefTableState & st = recovered->state;
 

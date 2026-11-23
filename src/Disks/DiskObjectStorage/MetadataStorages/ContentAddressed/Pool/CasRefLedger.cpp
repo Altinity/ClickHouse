@@ -1128,14 +1128,14 @@ void CasRefLedger::checkRecoveryStillAdmitted(const RootNamespace & ns, RefTable
     {
         cancelled = true;
         ProfileEvents::increment(ProfileEvents::CASRefRecoveryCancelled);
-        throwCasWriteRetryLater(fmt::format(
+        throwCasRequestRetryLater(fmt::format(
             "CAS ref-table recovery for namespace '{}' was cancelled by a self-remount before the mount "
             "fence was re-armed; the last attempt's fate is unresolved and nothing is installed — the next "
             "touch recovers under the fresh incarnation", ns.string()));
     }
 
     if (rt.catalog_life_invalidated.load(std::memory_order_acquire))
-        throwCasWriteRetryLater(fmt::format(
+        throwCasRequestRetryLater(fmt::format(
             "CAS ref-table recovery for namespace '{}': catalog retirement invalidated life {} "
             "while recovery I/O was in flight — nothing further is written and nothing is installed",
             ns.string(), renderIncarnation(rt.life.incarnation)));
@@ -1144,7 +1144,7 @@ void CasRefLedger::checkRecoveryStillAdmitted(const RootNamespace & ns, RefTable
     /// whatever it recovers belongs to a dead incarnation's cache. Checked separately from the
     /// cancellation because the two are independent facts, exactly as `resolveWedgeOnce` checks them.
     if (rt.superseded_by_remount.load(std::memory_order_acquire))
-        throwCasWriteRetryLater(fmt::format(
+        throwCasRequestRetryLater(fmt::format(
             "CAS ref-table recovery for namespace '{}': this cached table was superseded by a self-remount "
             "mid-recovery — retry against the fresh mount incarnation", ns.string()));
 
@@ -1356,7 +1356,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
             if (stamp.outcome == CkptStampOutcome::TokenMismatch)
                 return std::nullopt;
             if (stamp.outcome == CkptStampOutcome::Unresolved)
-                throwCasWriteRetryLater(fmt::format(
+                throwCasRequestRetryLater(fmt::format(
                     "CAS ref-table recovery for namespace '{}': the generation 3 stamp of its `_ckpt` is "
                     "unresolved; nothing is installed", ns.string()));
             accepted = std::move(*stamp.stamped);
@@ -1392,7 +1392,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
         {
             const auto * occupant_object = std::get_if<Object>(&conflict->seen);
             if (!occupant_object)
-                throwCasWriteRetryLater(fmt::format(
+                throwCasRequestRetryLater(fmt::format(
                     "CAS ref-table recovery for namespace '{}': the tombstone at {}-{} lost its slot "
                     "to an occupant the settling read could not observe; the table stays unrecovered",
                     ns.string(), id.writer_epoch, id.ref_sequence));
@@ -1430,13 +1430,13 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
         }
 
         if (const auto * gave_up = std::get_if<GaveUp>(&created))
-            throwCasWriteRetryLater(fmt::format(
+            throwCasRequestRetryLater(fmt::format(
                 "CAS ref-table recovery for namespace '{}': the tombstone at {}-{} is UNRESOLVED ({}); the "
                 "table stays unrecovered", ns.string(), id.writer_epoch, id.ref_sequence,
                 gave_up->sent_any ? "the outcome of the attempt is unknown" : "nothing was sent"));
 
         const auto & refused = std::get<Refused>(created);
-        throwCasWriteRetryLater(fmt::format(
+        throwCasRequestRetryLater(fmt::format(
             "CAS ref-table recovery for namespace '{}': the store refused the tombstone at {}-{} ({}); "
             "the table stays unrecovered", ns.string(), id.writer_epoch, id.ref_sequence, refused.message));
     }
@@ -1701,7 +1701,7 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
                                 "CAS ref-table recovery for namespace '{}' found a hole in the durable ref-log "
                                 "stream that persisted across {} re-reads: {}",
                                 ns.string(), attempt - 1, *hole_detail);
-                        throwCasWriteRetryLater(fmt::format(
+                        throwCasRequestRetryLater(fmt::format(
                             "CAS ref-table recovery for namespace '{}' restarted {} times (a selected snapshot "
                             "kept vanishing between the checkpoint that named it and its GET) — giving up; this "
                             "bound is a runaway brake against a pathological cleanup race, not an expected "
@@ -1756,12 +1756,12 @@ RefRecoveryOutcome CasRefLedger::ensureRefTableRecovered(
                     recovery_install_probe_for_test();
                 refuseUnlessAdmitted(mount_requests.resume(admitted_generation), "ref recovery install");
                 if (rt.catalog_life_invalidated.load(std::memory_order_acquire))
-                    throwCasWriteRetryLater(fmt::format(
+                    throwCasRequestRetryLater(fmt::format(
                         "CAS ref-table recovery for namespace '{}': catalog retirement invalidated life {} "
                         "before recovery install — nothing is installed",
                         ns.string(), renderIncarnation(rt.life.incarnation)));
                 if (rt.superseded_by_remount.load(std::memory_order_acquire))
-                    throwCasWriteRetryLater(fmt::format(
+                    throwCasRequestRetryLater(fmt::format(
                         "CAS ref-table recovery for namespace '{}': this cached table was superseded by a "
                         "self-remount while the walk was in flight — nothing is installed",
                         ns.string()));

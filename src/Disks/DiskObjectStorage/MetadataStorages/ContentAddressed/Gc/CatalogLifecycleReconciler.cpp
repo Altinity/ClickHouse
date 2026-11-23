@@ -202,7 +202,7 @@ CatalogLifecycleReconcileResult CatalogLifecycleReconciler::reconcile(
                 "CAS catalog lifecycle reconciliation selected namespace '{}' without matching no-hold cleanup evidence",
                 eligible->ns.string());
         if (result.catalog_resolution == CatalogResolution::ExactRowStillPresent)
-            throwCasWriteRetryLater(fmt::format(
+            throwCasRequestRetryLater(fmt::format(
                 "CAS catalog lifecycle reconciliation left completed-removal namespace '{}' present",
                 eligible->ns.string()));
     }
