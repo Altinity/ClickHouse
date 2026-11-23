@@ -9,6 +9,7 @@
 #include <Columns/ColumnArray.h>
 #include <Interpreters/inplaceBlockConversions.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/RequiredSourceColumnsVisitor.h>
 
 
 namespace DB
@@ -52,10 +53,17 @@ IMergeTreeReader::IMergeTreeReader(
     columns_to_read.reserve(getColumns().size());
     serializations.reserve(getColumns().size());
 
+    const auto & storage_columns = storage_snapshot->metadata->getColumns();
     for (const auto & column : getColumns())
     {
         columns_to_read.emplace_back(getColumnInPart(column));
         serializations.emplace_back(getSerializationInPart(column));
+
+        if (!conversions_need_additional_columns
+            && isNullableOrLowCardinalityNullable(columns_to_read.back().type)
+            && !isNullableOrLowCardinalityNullable(column.type)
+            && storage_columns.hasDefault(column.name))
+            conversions_need_additional_columns = true;
 
         if (column.isSubcolumn())
         {
@@ -299,7 +307,7 @@ SerializationPtr IMergeTreeReader::getSerializationInPart(const NameAndTypePair 
     return IDataType::getSerialization(*column_in_part);
 }
 
-void IMergeTreeReader::performRequiredConversions(Columns & res_columns) const
+void IMergeTreeReader::performRequiredConversions(Columns & res_columns, const Block & additional_columns) const
 {
     try
     {
@@ -313,29 +321,63 @@ void IMergeTreeReader::performRequiredConversions(Columns & res_columns) const
                             "Expected {}, got {}", num_columns, res_columns.size());
         }
 
-        const auto & column_defaults = storage_snapshot->metadata->getColumns().getDefaults();
+        const auto & storage_columns = storage_snapshot->metadata->getColumns();
 
-        /// Keep columns used by DEFAULT expressions when converting Nullable to non-Nullable.
-        /// Otherwise, check types manually to avoid unnecessary copies.
+        /// Start with columns whose types need conversion, collecting any DEFAULT dependencies.
         Block copy_block;
-        auto name_and_type = getColumns().begin();
+        NameSet default_dependencies;
+        auto name_and_type = required_columns.begin();
         for (size_t pos = 0; pos < num_columns; ++pos, ++name_and_type)
         {
             if (res_columns[pos] == nullptr)
                 continue;
             auto column_in_part = getColumnInPart(*name_and_type);
-            if (column_defaults.empty() && column_in_part.type->equals(*name_and_type->type))
+            if (column_in_part.type->equals(*name_and_type->type))
                 continue;
             copy_block.insert({res_columns[pos], column_in_part.type, name_and_type->name});
+
+            /// Only Nullable-to-non-Nullable conversions evaluate DEFAULT expressions.
+            if (conversions_need_additional_columns
+                && isNullableOrLowCardinalityNullable(column_in_part.type)
+                && !isNullableOrLowCardinalityNullable(name_and_type->type))
+            {
+                if (auto column_default = storage_columns.getDefault(name_and_type->name))
+                {
+                    RequiredSourceColumnsVisitor::Data columns_context;
+                    RequiredSourceColumnsVisitor(columns_context).visit(column_default->expression);
+                    auto dependencies = columns_context.requiredColumns();
+                    default_dependencies.insert(dependencies.begin(), dependencies.end());
+                }
+            }
         }
 
         if (!copy_block.columns())
             return;
 
-        DB::performRequiredConversions(copy_block, getColumns(), data_part_info_for_read->getContext(), column_defaults);
+        /// A DEFAULT may reference an unchanged column, including one preceding the converted column.
+        /// Retain its available inputs; columns requiring conversion are already present.
+        if (!default_dependencies.empty())
+        {
+            name_and_type = required_columns.begin();
+            for (size_t pos = 0; pos < num_columns; ++pos, ++name_and_type)
+            {
+                if (!res_columns[pos] || !default_dependencies.contains(name_and_type->name) || copy_block.has(name_and_type->name))
+                    continue;
+                copy_block.insert({res_columns[pos], getColumnInPart(*name_and_type).type, name_and_type->name});
+            }
+
+            /// Inputs read by previous PREWHERE steps are already converted, so they keep their current type
+            for (const auto & dependency : default_dependencies)
+            {
+                if (!copy_block.has(dependency) && additional_columns.has(dependency))
+                    copy_block.insert(additional_columns.getByName(dependency));
+            }
+        }
+
+        DB::performRequiredConversions(copy_block, required_columns, data_part_info_for_read->getContext(), storage_columns.getDefaults());
 
         /// Move columns from block.
-        name_and_type = getColumns().begin();
+        name_and_type = required_columns.begin();
         for (size_t pos = 0; pos < num_columns; ++pos, ++name_and_type)
             if (copy_block.has(name_and_type->name))
                 res_columns[pos] = std::move(copy_block.getByName(name_and_type->name).column);
