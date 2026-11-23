@@ -32,6 +32,7 @@ namespace ProfileEvents
 {
     extern const Event CASMountReleaseSkippedForeignOccupant;
     extern const Event CASMountExclusivityViolation;
+    extern const Event CASGCAutoPrunedFencedMounts;
 }
 
 namespace DB
@@ -1386,6 +1387,7 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
                 if (m.gc_fenced)
                 {
                     ++floor.already_fenced;
+                    floor.all_fenced_srids.push_back(srid);
                     obs.erase(srid);   /// terminal — no further observation needed
                     return std::nullopt;
                 }
@@ -1427,6 +1429,7 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
         {
             ++floor.fenced_now;
             floor.fenced_srids.push_back(srid);
+            floor.all_fenced_srids.push_back(srid);
             obs.erase(srid);
             LOG_INFO(getLogger("CasHeartbeatFloor"),
                 "CAS GC fenced out mount lease for content-addressed server root {} at "
@@ -1449,6 +1452,104 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
     std::erase_if(lease_mismatch_warned, [&](const String & s) { return !seen_srids.contains(s); });
 
     return floor;
+}
+
+size_t pruneExpiredEmptyFencedServerRoots(
+    CasOperation & op,
+    const Layout & layout,
+    const RefCatalog & catalog,
+    const std::vector<String> & candidate_fenced_srids,
+    const String & own_srid,
+    uint64_t now_ms,
+    uint64_t after_sec,
+    const CasEventSink * event_sink)
+{
+    if (after_sec == 0 || candidate_fenced_srids.empty())
+        return 0;
+
+    const uint64_t after_ms = after_sec <= std::numeric_limits<uint64_t>::max() / 1000
+        ? after_sec * 1000
+        : std::numeric_limits<uint64_t>::max();
+    size_t pruned = 0;
+
+    for (const String & srid : candidate_fenced_srids)
+    {
+        if (srid.empty() || srid == own_srid)
+            continue;
+        if (!op.admitted())
+            break;
+
+        const String srid_prefix = srid + "/";
+        const bool owns_catalog_entry = std::any_of(
+            catalog.entries.begin(), catalog.entries.end(),
+            [&](const CatalogEntry & entry)
+            {
+                return entry.ns.string() == srid || entry.ns.string().starts_with(srid_prefix);
+            });
+        if (owns_catalog_entry)
+            continue;
+
+        const String mount_key = layout.mountKey(srid);
+        const std::optional<Object> mount_got = op.read(mount_key, Retry::standard());
+        if (!mount_got)
+            continue;
+
+        MountLease mount_lease;
+        try
+        {
+            mount_lease = decodeMountLease(mount_got->bytes);
+        }
+        catch (...)
+        {
+            continue;
+        }
+        if (!mount_lease.gc_fenced)
+            continue;
+        if (now_ms <= mount_lease.expires_at_ms || (now_ms - mount_lease.expires_at_ms) < after_ms)
+            continue;
+
+        if (prefixHasAnyKey(op, layout.casManifestsServerPrefix(srid))
+            || prefixHasAnyKey(op, layout.stagingPrefix(srid))
+            || prefixHasAnyKey(op, layout.serverRootDataPrefix(srid)))
+            continue;
+
+        if (!op.admitted())
+            break;
+
+        const Removal mount_rm = op.remove(mount_key, mount_got->etag, Retry::standard());
+        if (mount_rm == Removal::Mismatch)
+            continue;
+
+        auto remove_if_present = [&](const String & key) -> bool
+        {
+            const std::optional<Object> got = op.read(key, Retry::standard());
+            if (!got)
+                return true;
+            return op.remove(key, got->etag, Retry::standard()) != Removal::Mismatch;
+        };
+
+        if (remove_if_present(layout.epochKey(srid)))
+            (void)remove_if_present(layout.ownerKey(srid));
+
+        ++pruned;
+        ProfileEvents::increment(ProfileEvents::CASGCAutoPrunedFencedMounts);
+        LOG_INFO(getLogger("CasHeartbeatFloor"),
+            "Auto-pruned empty fenced CAS mount slot '{}' (expired {} ms ago, threshold {} ms)",
+            srid, now_ms - mount_lease.expires_at_ms, after_ms);
+        if (event_sink && *event_sink)
+        {
+            CasEvent e;
+            e.type = CasEventType::MemberDecommission;
+            e.outcome = "auto_pruned";
+            e.reason = "auto-pruned empty fenced mount slot past cas_auto_forget_fenced_empty_after_sec";
+            e.detail = {
+                {"server_root_id", srid},
+                {"expired_age_ms", std::to_string(now_ms - mount_lease.expires_at_ms)}};
+            (*event_sink)(std::move(e));
+        }
+    }
+
+    return pruned;
 }
 
 std::vector<NonTerminalMountSlot> probeNonTerminalMountSlots(CasOperation & op, const Layout & l)

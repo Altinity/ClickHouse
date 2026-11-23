@@ -3066,3 +3066,102 @@ TEST(CASRejoin, ZeroUuidDoesNotRejoin)
         EXPECT_EQ(readSlot(*backend, layout, "victim").seq, slot_before.seq);
     }
 }
+
+TEST(CASAutoPruneFencedMounts, PrunesEmptyExpiredFencedSlotAfterThreshold)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    const Layout layout("p");
+    auto now_ms = std::make_shared<std::atomic<uint64_t>>(1'000'000);
+    auto store = Pool::open(backend, PoolConfig{
+        .pool_prefix = "p",
+        .server_root_id = "leader",
+        .auto_forget_fenced_empty_after_sec = 86400});
+
+    OperationForTest seed_op(*backend);
+    const MountLease fenced_empty{
+        .server_uuid = UInt128(0xAA01),
+        .writer_epoch = 1,
+        .hostname = "asg-old",
+        .pid = 10,
+        .started_at_ms = 100,
+        .seq = 1,
+        .expires_at_ms = 1'000'000,
+        .min_active_build_sequence = 0,
+        .gc_fenced = true,
+        .write_attempt_id = UInt128(1)};
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        (*seed_op).create(layout.mountKey("asg-old"), encodeMountLease(fenced_empty), Retry::once())));
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        (*seed_op).create(layout.epochKey("asg-old"), encodeServerEpoch(ServerEpoch{.next_writer_epoch = 2}), Retry::once())));
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        (*seed_op).create(layout.ownerKey("asg-old"), encodeOwner(OwnerObject{.server_uuid = UInt128(0xAA01)}), Retry::once())));
+
+    /// Before TTL elapses: slot is preserved.
+    {
+        Gc gc(store, UInt128(0x9C01), [now_ms] { return now_ms->load(); });
+        ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+        EXPECT_TRUE((*seed_op).head(layout.mountKey("asg-old"), Retry::once()).has_value());
+    }
+
+    /// Advance wall clock past 86400s: empty fenced slot is pruned (mount, epoch, owner removed).
+    now_ms->store(1'000'000 + 86400ULL * 1000 + 1);
+    {
+        Gc gc(store, UInt128(0x9C02), [now_ms] { return now_ms->load(); });
+        ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+        EXPECT_FALSE((*seed_op).head(layout.mountKey("asg-old"), Retry::once()).has_value());
+        EXPECT_FALSE((*seed_op).head(layout.epochKey("asg-old"), Retry::once()).has_value());
+        EXPECT_FALSE((*seed_op).head(layout.ownerKey("asg-old"), Retry::once()).has_value());
+    }
+}
+
+TEST(CASAutoPruneFencedMounts, SkipsFencedSlotWithCatalogNamespaceOrManifestDebris)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    const Layout layout("p");
+    auto now_ms = std::make_shared<std::atomic<uint64_t>>(100'000'000);
+    auto store = Pool::open(backend, PoolConfig{
+        .pool_prefix = "p",
+        .server_root_id = "leader",
+        .auto_forget_fenced_empty_after_sec = 60});
+
+    OperationForTest seed_op(*backend);
+    const MountLease fenced_with_ns{
+        .server_uuid = UInt128(0xBB01),
+        .writer_epoch = 1,
+        .hostname = "asg-ns",
+        .pid = 11,
+        .started_at_ms = 100,
+        .seq = 1,
+        .expires_at_ms = 1000,
+        .min_active_build_sequence = 0,
+        .gc_fenced = true,
+        .write_attempt_id = UInt128(2)};
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        (*seed_op).create(layout.mountKey("asg-ns"), encodeMountLease(fenced_with_ns), Retry::once())));
+    CasRefCatalog::casAdmitEntry(*seed_op, layout, 1, CatalogEntry{
+        .ns = RootNamespace{"asg-ns/table1"},
+        .state = NsState::Live,
+        .incarnation = UInt128(0xCC01)});
+
+    const MountLease fenced_with_manifest{
+        .server_uuid = UInt128(0xBB02),
+        .writer_epoch = 1,
+        .hostname = "asg-manifest",
+        .pid = 12,
+        .started_at_ms = 100,
+        .seq = 1,
+        .expires_at_ms = 1000,
+        .min_active_build_sequence = 0,
+        .gc_fenced = true,
+        .write_attempt_id = UInt128(3)};
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        (*seed_op).create(layout.mountKey("asg-manifest"), encodeMountLease(fenced_with_manifest), Retry::once())));
+    const ManifestRef ref{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 1};
+    writeManifestRaw(*backend, layout, RootNamespace{"asg-manifest/t"}, ref, {});
+
+    Gc gc(store, UInt128(0x9C03), [now_ms] { return now_ms->load(); });
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    EXPECT_TRUE((*seed_op).head(layout.mountKey("asg-ns"), Retry::once()).has_value());
+    EXPECT_TRUE((*seed_op).head(layout.mountKey("asg-manifest"), Retry::once()).has_value());
+}
+
