@@ -1297,6 +1297,12 @@ public:
             objects.erase(object.remote_path);
     }
 
+    /// S3 sends an unconditional delete under every retry profile; the intent probe and GC use it.
+    void removeObjectsIfExistUnderProfile(const DB::StoredObjects & objects_to_remove, const DB::ObjectStorageControlRequest &) override
+    {
+        removeObjectsIfExist(objects_to_remove);
+    }
+
     /// `path` is a bare CAS-relative prefix (e.g. `"pool/"` or `"pool/_probe/<hex>"`) -- exactly what
     /// `Backend::list`'s Native-mode path passes through unchanged (it applies no prefix stripping of
     /// its own there) and expects back on every listed key. A plain string-prefix scan over the

@@ -1720,6 +1720,8 @@ TEST(CASRefGc, RefObjectCleanupFallsBackToOnePerKeyWhenBatchDeleteIsUnsupported)
     backend->failNextBulkRemoveWith(std::make_exception_ptr(
         DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "no batch delete")));
     const auto cleaned_before = ProfileEvents::global_counters[ProfileEvents::CASRefCleanupObjectsDeleted];
+    /// The open's intent probe sent a bulk delete of its own.
+    const size_t bulk_calls_before = backend->bulkRemoveCalls();
 
     OperationForTest op(*backend);
     Gc gc(store, kGc);
@@ -1732,7 +1734,7 @@ TEST(CASRefGc, RefObjectCleanupFallsBackToOnePerKeyWhenBatchDeleteIsUnsupported)
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefCleanupObjectsDeleted] - cleaned_before, cohort_size)
         << "the budget/profile-event accounting counts objects, unaffected by the fallback";
     /// 1 failed bulk attempt + one request per key in the cohort.
-    EXPECT_EQ(backend->bulkRemoveCalls(), 1 + cohort_size);
+    EXPECT_EQ(backend->bulkRemoveCalls() - bulk_calls_before, 1 + cohort_size);
 }
 
 /// Task 13 (spec §implementation-impact / §GC Budget): one fold+clean round increments every ref-intake

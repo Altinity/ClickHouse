@@ -69,11 +69,11 @@ that mounts the pool need these rights on that prefix:
 | `PUT` with `If-None-Match: *` | `s3:PutObject` | the `GC` leader | Creates the intent. An existing intent with the same bytes counts as created |
 | `GET` and `HEAD` | `s3:GetObject` | `cas-fsck` | One `GET` of the intent of each `pending` `GC` row, and a `HEAD` of its body when the intent is absent. With `--verify-intents`, one `GET` of each listed intent and one `HEAD` of the body a well-formed intent names. `cas-fsck` never writes or deletes under `blob-intents/` |
 | `LIST` | `s3:ListBucket` | the `GC` leader, `cas-fsck` | One page per `GC` round walks `blob-intents/` to find intents with no `GC` row. `cas-fsck` lists the whole prefix |
-| `DELETE`, single and batch (`DeleteObjects`) | `s3:DeleteObject` | the `GC` leader | A refusal fails every round that must delete an intent |
+| `DELETE` with no precondition, single and batch (`DeleteObjects`) | `s3:DeleteObject` | the `GC` leader | A refusal fails every round that must delete an intent. A policy that allows only a delete with `If-Match` is a refusal |
 
 A writable mount and pool creation (unless the disk sets `skip_access_check`) and `cas-migrate-pool` check these rights before they write; the probe and the
 message for each missing right are under
-[rights on `blob-intents/`](/antalya/cas/operations/migration#migrate-generation-4-rights).
+[rights on `blob-intents/`](/antalya/cas/operations/migration#migrate-generation-4-rights). For the delete, the probe checks that an unconditional delete of one object is allowed under `blob-intents/`. It does not check the batch-delete call.
 
 A pool uses exactly one token dialect (`etag`, `generation` or `emulated`), recorded in `_pool_meta` when
 the pool reaches generation 4. Every client of the pool must be configured to report the same dialect;
