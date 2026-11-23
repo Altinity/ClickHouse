@@ -475,6 +475,17 @@ HostResolver::Ptr HostResolversPool::getResolver(const String & host)
     return it->second;
 }
 
+HostResolver::Ptr HostResolversPool::tryGetResolver(const String & host) noexcept
+{
+    std::lock_guard lock(mutex);
+
+    auto it = host_pools.find(host);
+    if (it != host_pools.end())
+        return it->second;
+
+    return nullptr;
+}
+
 void HostResolversPool::injectResolverForTest(const String & host, HostResolver::Ptr resolver)
 {
     std::lock_guard lock(mutex);

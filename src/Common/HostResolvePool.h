@@ -303,6 +303,12 @@ public:
 
     HostResolver::Ptr getResolver(const String & host);
 
+    /// Return the cached resolver for `host`, or `nullptr` if none exists (for example after
+    /// `dropCache`, or for a proxied endpoint whose target was never resolved locally). Never
+    /// creates a resolver or runs DNS, so it is `noexcept` and safe to call under another lock
+    /// or after a response has already been received.
+    HostResolver::Ptr tryGetResolver(const String & host) noexcept;
+
     /// Pre-populate the pool with a resolver for `host`, replacing any cached entry.
     /// For tests: allows simulating multi-address DNS responses without injecting into
     /// the real `DNSResolver`, so the `prepareNewConnection` retry path can be exercised

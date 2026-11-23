@@ -743,7 +743,14 @@ void PocoHTTPClient::makeRequestInternalImpl(
                 Poco::Net::IPAddress resolved_ip;
                 const std::string resolved_host = session->getResolvedHost();
                 if (!resolved_host.empty() && Poco::Net::IPAddress::tryParse(resolved_host, resolved_ip))
-                    HostResolversPool::instance().getResolver(target_uri.getHost())->reportLatency(resolved_ip, first_byte_us);
+                {
+                    /// Use `tryGetResolver` rather than `getResolver`: if the DNS cache was just
+                    /// dropped (`SYSTEM DROP DNS CACHE`) and DNS is transiently failing, creating a
+                    /// resolver here would run DNS and throw, aborting a request whose HTTP response
+                    /// has already been received.
+                    if (auto resolver = HostResolversPool::instance().tryGetResolver(target_uri.getHost()))
+                        resolver->reportLatency(resolved_ip, first_byte_us);
+                }
             }
 
             watch.stop();

@@ -1112,3 +1112,111 @@ TEST_F(ConnectionPoolTest, ServerOverwriteMaxRequests)
     ASSERT_EQ(0, CurrentMetrics::get(metrics.active_count));
     ASSERT_EQ(0, CurrentMetrics::get(metrics.stored_count));
 }
+
+TEST_F(ConnectionPoolTest, LatencyAwareReuseAfterDropDnsCacheForUnresolvableHost)
+{
+    /// Regression test: if `stored_connections` already holds a live connection and the cached
+    /// `HostResolver` is dropped (e.g. `SYSTEM DROP DNS CACHE`) while DNS for `host` fails,
+    /// `getConnection` under `http_latency_aware_host_selection` must reuse the pooled connection
+    /// without running DNS (and without destroying drained `PooledConnection`s while holding the
+    /// endpoint mutex, which self-deadlocks in `atConnectionDestroy`).
+    DB::HostResolver::setLatencyAwareSelection(true);
+    SCOPE_EXIT({
+        DB::HostResolver::setLatencyAwareSelection(false);
+        DB::HostResolversPool::instance().dropCache();
+    });
+
+    const String test_host = "dropped-resolver-reuse.invalid";
+    const Poco::Net::IPAddress server_ip("127.0.0.1");
+
+    struct ResolveMock : public DB::HostResolver
+    {
+        using ResolveFunction = DB::HostResolver::ResolveFunction;
+        ResolveMock(String h, Poco::Timespan history_, ResolveFunction f)
+            : DB::HostResolver(std::move(f), std::move(h), history_)
+        {}
+    };
+
+    auto mock_resolver = std::make_shared<ResolveMock>(
+        test_host,
+        Poco::Timespan(60 * 1000 * 1000),
+        [server_ip](const String &) -> std::vector<Poco::Net::IPAddress> { return {server_ip}; });
+    DB::HostResolversPool::instance().injectResolverForTest(test_host, mock_resolver);
+
+    auto uri = Poco::URI("http://" + test_host + ":" + std::to_string(server_data.port));
+    auto pool = DB::HTTPConnectionPools::instance().getPool(
+        DB::HTTPConnectionGroupType::HTTP, uri, DB::ProxyConfiguration{});
+    auto metrics = pool->getMetrics();
+
+    /// Establish a connection and return it to `stored_connections`.
+    {
+        auto connection = pool->getConnection(timeouts, nullptr);
+        echoRequest("Hello", *connection);
+    }
+    ASSERT_EQ(1, CurrentMetrics::get(metrics.stored_count));
+
+    /// Drop the cached resolver so `test_host` (`.invalid` TLD) is now unresolvable via real DNS.
+    DB::HostResolversPool::instance().dropCache();
+    ASSERT_EQ(nullptr, DB::HostResolversPool::instance().tryGetResolver(test_host));
+
+    /// Borrowing again must reuse the pooled connection without attempting DNS.
+    {
+        auto connection = pool->getConnection(timeouts, nullptr);
+        echoRequest("World", *connection);
+    }
+
+    ASSERT_EQ(1, DB::CurrentThread::getProfileEvents()[metrics.created]);
+    ASSERT_EQ(1, DB::CurrentThread::getProfileEvents()[metrics.reused]);
+    ASSERT_EQ(2, DB::CurrentThread::getProfileEvents()[metrics.preserved]);
+    ASSERT_EQ(1, CurrentMetrics::get(metrics.stored_count));
+    ASSERT_EQ(nullptr, DB::HostResolversPool::instance().tryGetResolver(test_host));
+}
+
+TEST_F(ConnectionPoolTest, LatencyAwareProxyReuseSkipsTargetResolution)
+{
+    /// Regression test: a non-bypassed proxy pool never resolves the target host locally on
+    /// connect (`ProxyConnectSkipsTargetResolution`); reusing a pooled proxy connection under
+    /// `http_latency_aware_host_selection` must not resolve the proxy-only target host either
+    /// (which previously threw `DNS_ERROR` while `stored_connections` was drained under the
+    /// endpoint mutex, self-deadlocking in `~PooledConnection` -> `atConnectionDestroy`).
+    DB::HostResolver::setLatencyAwareSelection(true);
+    SCOPE_EXIT({
+        DB::HostResolver::setLatencyAwareSelection(false);
+        DB::HostResolversPool::instance().dropCache();
+    });
+
+    /// Point the HTTP proxy config at the local echo server: for plain HTTP proxy requests Poco
+    /// connects to `proxy_config.host:port` and sends the full target URI in the request line,
+    /// which `MockRequestHandler` echoes regardless of URI, while `proxy-only-reuse.invalid`
+    /// remains guaranteed unresolvable locally.
+    auto uri = Poco::URI("http://proxy-only-reuse.invalid:9999");
+
+    DB::ProxyConfiguration proxy_config;
+    proxy_config.host = "127.0.0.1";
+    proxy_config.port = server_data.port;
+    proxy_config.protocol = DB::ProxyConfiguration::Protocol::HTTP;
+
+    auto pool = DB::HTTPConnectionPools::instance().getPool(
+        DB::HTTPConnectionGroupType::HTTP, uri, proxy_config);
+    auto metrics = pool->getMetrics();
+
+    /// First borrow opens a connection to the proxy and returns it to `stored_connections`.
+    {
+        auto connection = pool->getConnection(timeouts, nullptr);
+        echoRequest("Hello", *connection);
+    }
+    ASSERT_EQ(1, CurrentMetrics::get(metrics.stored_count));
+    ASSERT_EQ(nullptr, DB::HostResolversPool::instance().tryGetResolver("proxy-only-reuse.invalid"));
+
+    /// Second borrow hits the non-empty `stored_connections` path under latency-aware selection.
+    {
+        auto connection = pool->getConnection(timeouts, nullptr);
+        echoRequest("World", *connection);
+    }
+
+    ASSERT_EQ(1, DB::CurrentThread::getProfileEvents()[metrics.created]);
+    ASSERT_EQ(1, DB::CurrentThread::getProfileEvents()[metrics.reused]);
+    ASSERT_EQ(2, DB::CurrentThread::getProfileEvents()[metrics.preserved]);
+    ASSERT_EQ(1, CurrentMetrics::get(metrics.stored_count));
+    ASSERT_EQ(nullptr, DB::HostResolversPool::instance().tryGetResolver("proxy-only-reuse.invalid"));
+}

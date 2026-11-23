@@ -734,7 +734,18 @@ public:
 
         ConnectionPtr reused_connection;
 
+        /// Look up the cached resolver before taking `mutex`: we only need per-address latency
+        /// measurements that are already recorded, and `tryGetResolver` never creates a resolver
+        /// or runs DNS. Calling `getResolver` while `stored_connections` is drained into a local
+        /// vector under `mutex` would both resolve proxy-only targets locally and, on a DNS error
+        /// (for example after `SYSTEM DROP DNS CACHE`), destroy `PooledConnection`s during stack
+        /// unwinding while `mutex` is still held, self-deadlocking in `atConnectionDestroy`.
+        HostResolver::Ptr latency_resolver;
+        if (HostResolver::latencyAwareSelectionEnabled() && usesTargetResolution())
+            latency_resolver = HostResolversPool::instance().tryGetResolver(host);
+
         {
+            MemoryTrackerSwitcher switcher{&total_memory_tracker};
             std::lock_guard lock(mutex);
             expired_connections.reserve(stored_connections.size());
 
@@ -742,76 +753,8 @@ public:
 
             if (!stored_connections.empty())
             {
-                if (HostResolver::latencyAwareSelectionEnabled())
-                {
-                    /// Latency-aware dispatch: among the pooled connections, hand out the one
-                    /// whose resolved front-end has the lowest observed latency EWMA, instead of
-                    /// the default least-recently-used pick. Because each concurrent caller
-                    /// removes its chosen connection under this lock, a burst of parallel requests
-                    /// spreads across the fastest-available connections rather than all contending
-                    /// for a single one, so parallelism is preserved while slow front-ends are
-                    /// avoided.
-                    std::vector<ConnectionPtr> candidates;
-                    candidates.reserve(stored_connections.size());
-                    while (!stored_connections.empty())
-                    {
-                        candidates.push_back(stored_connections.top());
-                        stored_connections.pop();
-                    }
-
-                    auto resolver = HostResolversPool::instance().getResolver(host);
-                    size_t best = 0;
-                    double best_latency = std::numeric_limits<double>::max();
-                    for (size_t i = 0; i < candidates.size(); ++i)
-                    {
-                        double latency = std::numeric_limits<double>::max();
-                        Poco::Net::IPAddress ip;
-                        if (Poco::Net::IPAddress::tryParse(candidates[i]->getResolvedHost(), ip))
-                        {
-                            const double ewma = resolver->getLatencyMs(ip);
-                            /// Unmeasured (0) is treated as worst so measured-fast connections
-                            /// win; unmeasured ones are still used once the fast ones are handed
-                            /// out (and reporting keeps every served address's EWMA fresh).
-                            if (ewma > 0)
-                                latency = ewma;
-                        }
-                        if (latency < best_latency)
-                        {
-                            best_latency = latency;
-                            best = i;
-                        }
-                    }
-
-                    /// Pool-composition bias: if even the fastest pooled connection's front-end is
-                    /// materially slower than the fastest front-end we know of, prefer opening a
-                    /// fresh connection (selectBest routes it to a fast front-end) over reusing a
-                    /// slow-backend one. Same-region the TCP connect cost is ~1 ms, negligible next
-                    /// to the tens-of-ms backend TTFB gap, so this trades a cheap connect for a big
-                    /// per-request win and shifts the pool's composition toward fast front-ends
-                    /// over time. Gated on the soft limit so it cannot grow the pool without bound.
-                    bool open_fast_instead = false;
-                    if (!group->isSoftLimitReached()
-                        && best_latency != std::numeric_limits<double>::max())
-                    {
-                        const double fleet_min = resolver->getMinLatencyMs();
-                        if (fleet_min > 0 && best_latency > fleet_min * 1.3 && best_latency - fleet_min > 15.0)
-                            open_fast_instead = true;
-                    }
-
-                    if (open_fast_instead)
-                    {
-                        /// Return everything to the pool; a fresh fast connection is opened below.
-                        for (auto & c : candidates)
-                            stored_connections.push(c);
-                    }
-                    else
-                    {
-                        reused_connection = candidates[best];
-                        for (size_t i = 0; i < candidates.size(); ++i)
-                            if (i != best)
-                                stored_connections.push(candidates[i]);
-                    }
-                }
+                if (latency_resolver)
+                    reused_connection = selectBestStoredConnectionImpl(*latency_resolver);
                 else
                 {
                     reused_connection = stored_connections.top();
@@ -896,6 +839,84 @@ private:
 
     WeakPtr getWeakFromThis() { return EndpointConnectionPool::weak_from_this(); }
 
+    /// Latency-aware dispatch: among the pooled connections, hand out the one whose resolved
+    /// front-end has the lowest observed latency EWMA, instead of the default least-recently-used
+    /// pick. Because each concurrent caller removes its chosen connection under `mutex`, a burst
+    /// of parallel requests spreads across the fastest-available connections rather than all
+    /// contending for a single one, so parallelism is preserved while slow front-ends are avoided.
+    /// Returns `nullptr` when even the fastest pooled connection is materially slower than the
+    /// fastest known front-end and the group is below its soft limit, so the caller opens a fresh
+    /// connection instead.
+    ConnectionPtr selectBestStoredConnectionImpl(HostResolver & resolver) TSA_REQUIRES(mutex)
+    {
+        struct CandidatesGuard
+        {
+            ConnectionsMinHeap & heap;
+            std::vector<ConnectionPtr> items;
+
+            explicit CandidatesGuard(ConnectionsMinHeap & heap_)
+                : heap(heap_)
+            {
+                items.reserve(heap.size());
+            }
+
+            /// Always return every remaining non-null connection to `heap` before `items` is
+            /// destroyed: running `~PooledConnection` while `mutex` is held would self-deadlock
+            /// in `atConnectionDestroy`, and dropping connections would leak `stored_count`.
+            ~CandidatesGuard() noexcept TSA_NO_THREAD_SAFETY_ANALYSIS
+            {
+                for (auto & c : items)
+                    if (c)
+                        heap.push(std::move(c));
+            }
+        } candidates(stored_connections);
+
+        while (!stored_connections.empty())
+        {
+            candidates.items.push_back(stored_connections.top());
+            stored_connections.pop();
+        }
+
+        size_t best = 0;
+        double best_latency = std::numeric_limits<double>::max();
+        for (size_t i = 0; i < candidates.items.size(); ++i)
+        {
+            double latency = std::numeric_limits<double>::max();
+            Poco::Net::IPAddress ip;
+            if (Poco::Net::IPAddress::tryParse(candidates.items[i]->getResolvedHost(), ip))
+            {
+                const double ewma = resolver.getLatencyMs(ip);
+                /// Unmeasured (0) is treated as worst so measured-fast connections win;
+                /// unmeasured ones are still used once the fast ones are handed out (and
+                /// reporting keeps every served address's EWMA fresh).
+                if (ewma > 0)
+                    latency = ewma;
+            }
+            if (latency < best_latency)
+            {
+                best_latency = latency;
+                best = i;
+            }
+        }
+
+        /// Pool-composition bias: if even the fastest pooled connection's front-end is materially
+        /// slower than the fastest front-end we know of, prefer opening a fresh connection
+        /// (`selectBest` routes it to a fast front-end) over reusing a slow-backend one.
+        /// Same-region the TCP connect cost is ~1 ms, negligible next to the tens-of-ms backend
+        /// TTFB gap, so this trades a cheap connect for a big per-request win and shifts the
+        /// pool's composition toward fast front-ends over time. Gated on the soft limit so it
+        /// cannot grow the pool without bound.
+        if (!group->isSoftLimitReached()
+            && best_latency != std::numeric_limits<double>::max())
+        {
+            const double fleet_min = resolver.getMinLatencyMs();
+            if (fleet_min > 0 && best_latency > fleet_min * 1.3 && best_latency - fleet_min > 15.0)
+                return nullptr;
+        }
+
+        return std::move(candidates.items[best]);
+    }
+
     bool isExpired(ConnectionPtr connection, bool isSoftLimitReached) TSA_REQUIRES(mutex)
     {
         if (isSoftLimitReached)
@@ -977,13 +998,13 @@ private:
         return connection;
     }
 
-    ConnectionPtr prepareNewConnection(const ConnectionTimeouts & timeouts, UInt64 * connect_time)
+    /// Whether connections in this pool resolve `host` locally and connect directly to a
+    /// resolved IP, rather than connecting to a proxy and letting the proxy resolve the target.
+    /// `Poco::Net::HTTPClientSession::reconnect` uses the proxy only when
+    /// `!_proxyConfig.host.empty() && !bypassProxy()`; when `no_proxy` matches `host`
+    /// (`bypassProxy()` true) Poco connects directly to `_resolved_host`.
+    bool usesTargetResolution(Poco::Net::HTTPClientSession::ProxyConfig * out_poco_proxy_config = nullptr) const
     {
-        /// `Poco::Net::HTTPClientSession::reconnect` uses the proxy only when
-        /// `!_proxyConfig.host.empty() && !bypassProxy()`; route that case to
-        /// `prepareConnectionViaProxy`, which does not touch the target `HostResolver`. When
-        /// `no_proxy` matches the target host (`bypassProxy()` true) Poco connects directly to
-        /// `_resolved_host`, so per-address retries and `setFail` apply as in the no-proxy case.
         auto poco_proxy_config = proxy_configuration.isEmpty()
             ? Poco::Net::HTTPClientSession::ProxyConfig{}
             : proxyConfigurationToPocoProxyConfig(proxy_configuration);
@@ -993,9 +1014,19 @@ private:
                 host,
                 poco_proxy_config.nonProxyHosts,
                 Poco::RegularExpression::RE_CASELESS | Poco::RegularExpression::RE_ANCHORED);
-        const bool retry_resolved_addresses = proxy_configuration.isEmpty() || proxy_bypassed_for_host;
+        if (out_poco_proxy_config)
+            *out_poco_proxy_config = std::move(poco_proxy_config);
+        return proxy_configuration.isEmpty() || proxy_bypassed_for_host;
+    }
 
-        if (!retry_resolved_addresses)
+    ConnectionPtr prepareNewConnection(const ConnectionTimeouts & timeouts, UInt64 * connect_time)
+    {
+        /// Route non-bypassed proxy connections to `prepareConnectionViaProxy`, which does not
+        /// touch the target `HostResolver`. When `no_proxy` matches the target host, Poco connects
+        /// directly to `_resolved_host`, so per-address retries and `setFail` apply as in the
+        /// no-proxy case.
+        Poco::Net::HTTPClientSession::ProxyConfig poco_proxy_config;
+        if (!usesTargetResolution(&poco_proxy_config))
             return prepareConnectionViaProxy(timeouts, connect_time, poco_proxy_config);
 
         /// When DNS returns several addresses (e.g. an IPv4 and an IPv6 record), try the next one
