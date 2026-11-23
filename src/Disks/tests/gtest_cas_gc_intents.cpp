@@ -62,11 +62,15 @@ namespace DB::ErrorCodes
 {
 extern const int ABORTED;
 extern const int BAD_ARGUMENTS;
+extern const int CANNOT_PARSE_ESCAPE_SEQUENCE;
 extern const int CORRUPTED_DATA;
+extern const int MEMORY_LIMIT_EXCEEDED;
 extern const int NO_REPLICA_HAS_PART;
 extern const int NETWORK_ERROR;
 extern const int NOT_IMPLEMENTED;
 extern const int READONLY;
+extern const int TOO_DEEP_RECURSION;
+extern const int UNKNOWN_FORMAT_VERSION;
 }
 
 /// The deletion-intent GC driven through `Gc::runRegularRound`: a blob's row is `candidate`, `pending` or
@@ -7128,4 +7132,247 @@ TEST(CASGcIntents, InheritedRunInDescendingOrderIsRefusedAsCorrupt)
     });
     expectRefusedAsCorrupt(round, "sorts before the row above it");
     expectRefusalNamesTheRow(round, /*shard*/ 0, /*blob*/ 2, /*source_id*/ 7);
+}
+
+/// ---- A ref log the walk cannot decode ----
+
+namespace
+{
+
+String refLogKeyOf(const IntentPool<> & pool, const RefTxnId & id)
+{
+    OperationForTest op(*pool.backend);
+    return pool.layout().refLogKey(*CasRefCatalog::lifeIfCataloged(*op, pool.layout(), pool.ns), id);
+}
+
+/// The namespace's row in the newest fold seal.
+std::optional<RefCoverage> sealedCoverage(const IntentPool<> & pool)
+{
+    OperationForTest op(*pool.backend);
+    const auto life = CasRefCatalog::lifeIfCataloged(*op, pool.layout(), pool.ns);
+    if (!life)
+        return std::nullopt;
+    const uint64_t attempt = currentAttemptOf(*pool.backend, pool.layout());
+    for (uint64_t g = currentGenerationOf(*pool.backend, pool.layout());; --g)
+    {
+        if (const auto got = (*op).read(pool.layout().foldSealKey(g, attempt), Retry::standard()))
+        {
+            const CasFoldSeal seal = decodeFoldSeal(got->bytes);
+            const auto it = seal.ref_lives.find(life->incarnation);
+            if (it == seal.ref_lives.end())
+                return std::nullopt;
+            return it->second.coverage;
+        }
+        if (g == 0)
+            return std::nullopt;
+    }
+}
+
+/// Blob 1 is `pending`, so the next round that is not suppressed deletes its body. Returns the next ref log id.
+RefTxnId pendingRowBeforeTheNextLog(IntentPool<> & pool)
+{
+    pool.makePending({1});
+    const auto coverage = sealedCoverage(pool);
+    EXPECT_TRUE(coverage.has_value());
+    const RefTxnId cursor = coverage ? coverage->last_folded_ref_id : RefTxnId{};
+    return RefTxnId{cursor.writer_epoch, cursor.ref_sequence + 1};
+}
+
+/// The text of a well-formed ref log at `id` that publishes one committed ref.
+String validLogText(const IntentPool<> & pool, const RefTxnId & id)
+{
+    RefLogTxn txn;
+    txn.ns = pool.ns.string();
+    txn.txn_id = id;
+    txn.ops = publishCommittedOps("other", ManifestRef{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 0x10});
+    return encodeRefLogTxn(txn);
+}
+
+/// `text` with `field` added to its header object.
+String withHeaderField(const String & text, const String & field)
+{
+    const size_t header_end = text.find("}\n");
+    return text.substr(0, header_end) + "," + field + text.substr(header_end);
+}
+
+/// Every step the walk runs on a ref log's bytes, in its order.
+void decodeAsTheWalkDoes(const String & bytes, const RootNamespace & ns, const RefTxnId & id)
+{
+    const RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, bytes), ns.string(), id);
+    validateRefChainLink(std::nullopt, txn);
+    (void)manifestEdgesOfTxn(txn);
+    (void)refChainSuccessor(txn);
+    (void)refEpochTransitionOf(txn);
+}
+
+using LogBytes = std::function<String(const IntentPool<> &, const RefTxnId &)>;
+
+/// The namespace's next ref log holds bytes with `defect` that fail with `code`: the round completes, the namespace is held at that
+/// log, and the round deletes nothing although blob 1 is `pending`.
+void expectHeldAtTheUndecodableLog(const char * defect, int code, const LogBytes & make_bytes)
+{
+    SCOPED_TRACE(defect);
+    auto pool = makePool();
+    const RefTxnId id = pendingRowBeforeTheNextLog(pool);
+    const String bytes = make_bytes(pool, id);
+    expectThrowsCode(code, [&] { decodeAsTheWalkDoes(bytes, pool.ns, id); });
+    {
+        OperationForTest op(*pool.backend);
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(refLogKeyOf(pool, id), bytes, Retry::standard())));
+    }
+    publishRecoverableCkptForSemanticWrapper(*pool.backend, pool.layout(), pool.ns, id);
+    const uint64_t deletes_before = pool.backend->deleteTotal();
+
+    RoundReport report;
+    try
+    {
+        report = pool.round();
+    }
+    catch (const DB::Exception & e)
+    {
+        FAIL() << "the round failed on an undecodable ref log, code " << e.code() << ": " << e.message();
+    }
+    EXPECT_TRUE(report.acquired_lease);
+    const auto coverage = sealedCoverage(pool);
+    ASSERT_TRUE(coverage && coverage->hold);
+    EXPECT_EQ(coverage->hold->reason, HoldReason::BodyUndecodable);
+    EXPECT_EQ(coverage->hold->offending_position, id);
+    EXPECT_EQ(coverage->last_folded_ref_id, (RefTxnId{id.writer_epoch, id.ref_sequence - 1}));
+    EXPECT_EQ(report.bodies_deleted, 0u);
+    EXPECT_EQ(pool.backend->deleteTotal(), deletes_before);
+    EXPECT_TRUE(pool.bodyMeta(1).has_value()) << "the pending row's body was deleted while its namespace is held";
+}
+
+}
+
+/// A memory limit says nothing about the bytes being decoded: the round fails and records no hold. The next round folds
+/// the same log, and its deletion of the pending body is the control that this fixture deletes when nothing holds.
+TEST(CASGcIntents, AMemoryLimitWhileTheWalkDecodesARecordFailsTheRoundAndHoldsNothing)
+{
+    auto pool = makePool();
+    const RefTxnId id = pendingRowBeforeTheNextLog(pool);
+    pool.writeBodies({2});
+    pool.commit("other", {2});
+    ASSERT_TRUE(pool.exists(refLogKeyOf(pool, id))) << "the commit wrote the next ref log";
+    const uint64_t round_before = committedRound(*pool.backend, pool.layout());
+    const auto coverage_before = sealedCoverage(pool);
+    ASSERT_TRUE(coverage_before.has_value());
+    const uint64_t deletes_before = pool.backend->deleteTotal();
+
+    std::atomic<size_t> walk_decodes{0};
+    setWalkRecordDecodeProbeForTest([&]
+    {
+        ++walk_decodes;
+        throw DB::Exception(DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED, "injected while the walk decodes a record");
+    });
+    {
+        SCOPE_EXIT({ setWalkRecordDecodeProbeForTest({}); });
+        expectThrowsCode(DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED, [&] { (void)pool.round(); });
+    }
+    EXPECT_GE(walk_decodes.load(), 1u) << "positive control: the walk reached the record";
+    EXPECT_EQ(committedRound(*pool.backend, pool.layout()), round_before);
+    EXPECT_EQ(sealedCoverage(pool), coverage_before) << "the failed round moved the cursor or sealed a hold";
+    EXPECT_EQ(pool.backend->deleteTotal(), deletes_before);
+    EXPECT_TRUE(pool.bodyMeta(1).has_value());
+
+    std::map<String, UInt64> intake;
+    pool.gc->setPhaseSink([&](const GcPhaseRecord & rec)
+    {
+        if (rec.phase == "fold_ref_intake")
+            intake = rec.metrics;
+    });
+    const RoundReport next = pool.round();
+    pool.gc->setPhaseSink({});
+    EXPECT_TRUE(next.acquired_lease);
+    EXPECT_TRUE(next.anomalies.empty()) << next.anomalies.front().reason;
+    const auto coverage = sealedCoverage(pool);
+    ASSERT_TRUE(coverage.has_value());
+    EXPECT_FALSE(coverage->hold.has_value());
+    EXPECT_EQ(coverage->last_folded_ref_id, id);
+    const auto proven = intake.find("frontier_proven");
+    EXPECT_TRUE(proven != intake.end() && proven->second == 1u) << "the next round proved the life";
+    EXPECT_FALSE(pool.bodyMeta(1).has_value()) << "the next round deleted the pending body";
+}
+
+TEST(CASGcIntents, ALogThatIsNotACasRefLogHoldsTheNamespaceAndDeletesNothing)
+{
+    expectHeldAtTheUndecodableLog("raw text", DB::ErrorCodes::CORRUPTED_DATA, [](const IntentPool<> &, const RefTxnId &)
+    {
+        return String("this is not a cas_ref_log object");
+    });
+    expectHeldAtTheUndecodableLog("another object type", DB::ErrorCodes::CORRUPTED_DATA, [](const IntentPool<> & pool, const RefTxnId & id)
+    {
+        String text = validLogText(pool, id);
+        text.replace(text.find("cas_ref_log"), strlen("cas_ref_log"), "cas_ref_snap");
+        return sealObject(FormatId::RefLog, text);
+    });
+}
+
+TEST(CASGcIntents, ALogOfANewerFormatHoldsTheNamespaceAndDeletesNothing)
+{
+    expectHeldAtTheUndecodableLog("header version above the read ceiling", DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [](const IntentPool<> & pool, const RefTxnId & id)
+    {
+        const String text = validLogText(pool, id);
+        const String header = fmt::format(R"({{"type":"cas_ref_log","v":{}}})", currentReadCeiling() + 1);
+        return sealObject(FormatId::RefLog, header + text.substr(text.find('\n')));
+    });
+    expectHeldAtTheUndecodableLog("critical key unknown to this build", DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [](const IntentPool<> & pool, const RefTxnId & id)
+    {
+        return sealObject(FormatId::RefLog, withHeaderField(validLogText(pool, id), R"("!future":1)"));
+    });
+}
+
+TEST(CASGcIntents, ALogWithCorruptCompressedDataHoldsTheNamespaceAndDeletesNothing)
+{
+    expectHeldAtTheUndecodableLog("flipped byte inside the frame", DB::ErrorCodes::CORRUPTED_DATA, [](const IntentPool<> & pool, const RefTxnId & id)
+    {
+        String bytes = sealObject(FormatId::RefLog, validLogText(pool, id));
+        bytes[bytes.size() / 2] = static_cast<char>(bytes[bytes.size() / 2] ^ 0x5A);
+        return bytes;
+    });
+    expectHeldAtTheUndecodableLog("frame truncated before its checksum", DB::ErrorCodes::CORRUPTED_DATA, [](const IntentPool<> & pool, const RefTxnId & id)
+    {
+        const String bytes = sealObject(FormatId::RefLog, validLogText(pool, id));
+        return bytes.substr(0, bytes.size() - 5);
+    });
+    expectHeldAtTheUndecodableLog("frame truncated inside its header", DB::ErrorCodes::CORRUPTED_DATA, [](const IntentPool<> & pool, const RefTxnId & id)
+    {
+        return sealObject(FormatId::RefLog, validLogText(pool, id)).substr(0, 5);
+    });
+}
+
+TEST(CASGcIntents, ALogBreakingTheRefLogGrammarHoldsTheNamespaceAndDeletesNothing)
+{
+    expectHeldAtTheUndecodableLog("body names another id than its key", DB::ErrorCodes::CORRUPTED_DATA, [](const IntentPool<> & pool, const RefTxnId & id)
+    {
+        return sealObject(FormatId::RefLog, validLogText(pool, RefTxnId{id.writer_epoch, id.ref_sequence + 1}));
+    });
+    expectHeldAtTheUndecodableLog("owner transition of no legal shape", DB::ErrorCodes::CORRUPTED_DATA, [](const IntentPool<> & pool, const RefTxnId & id)
+    {
+        const ManifestRef manifest{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 0x10};
+        RefLogTxn txn;
+        txn.ns = pool.ns.string();
+        txn.txn_id = id;
+        txn.ops = {ownerTransitionOp(RefOwnerBinding{RefOwnerKind::Committed, "other", manifest},
+                                     RefOwnerBinding{RefOwnerKind::Precommit, "other", manifest})};
+        return sealObject(FormatId::RefLog, encodeRefLogTxn(txn));
+    });
+}
+
+TEST(CASGcIntents, ALogWithABadJsonEscapeHoldsTheNamespaceAndDeletesNothing)
+{
+    expectHeldAtTheUndecodableLog("high surrogate without its low half", DB::ErrorCodes::CANNOT_PARSE_ESCAPE_SEQUENCE, [](const IntentPool<> & pool, const RefTxnId & id)
+    {
+        return sealObject(FormatId::RefLog, withHeaderField(validLogText(pool, id), R"("x":"\uD800")"));
+    });
+}
+
+TEST(CASGcIntents, ALogNestedTooDeepHoldsTheNamespaceAndDeletesNothing)
+{
+    expectHeldAtTheUndecodableLog("unknown header field nested beyond the JSON depth limit", DB::ErrorCodes::TOO_DEEP_RECURSION, [](const IntentPool<> & pool, const RefTxnId & id)
+    {
+        constexpr size_t depth = 2000;
+        return sealObject(FormatId::RefLog,
+                          withHeaderField(validLogText(pool, id), "\"x\":" + String(depth, '[') + String(depth, ']')));
+    });
 }

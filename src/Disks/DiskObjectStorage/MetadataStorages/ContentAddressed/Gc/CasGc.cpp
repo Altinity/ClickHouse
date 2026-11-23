@@ -345,12 +345,59 @@ RefPlan buildRefWalkPlan(RoundInput && round_input)
     return plan;
 }
 
+namespace
+{
+/// A test hook run inside a ref-log decode. `armed` keeps production decodes off the mutex: only a test that set a
+/// probe pays for it.
+class DecodeProbe
+{
+public:
+    void set(std::function<void()> probe_)
+    {
+        std::lock_guard lock(mutex);
+        probe = std::move(probe_);
+        armed.store(static_cast<bool>(probe), std::memory_order_relaxed);
+    }
+
+    void run()
+    {
+        if (!armed.load(std::memory_order_relaxed))
+            return;
+        std::function<void()> current;
+        {
+            std::lock_guard lock(mutex);
+            current = probe;
+        }
+        if (current)
+            current();
+    }
+
+private:
+    std::atomic<bool> armed{false};
+    std::mutex mutex;
+    std::function<void()> probe;
+};
+
+DecodeProbe planned_record_decode_probe;
+DecodeProbe walk_record_decode_probe;
+}
+
 namespace tests
 {
 
 RefPlan buildRefWalkPlanForTest(RefScanSummary ref_scan, CasRefCatalog::Snapshot catalog_cut)
 {
     return buildRefWalkPlan(RoundInput{std::move(ref_scan), std::move(catalog_cut)});
+}
+
+void setPlannedRecordDecodeProbeForTest(std::function<void()> probe)
+{
+    planned_record_decode_probe.set(std::move(probe));
+}
+
+void setWalkRecordDecodeProbeForTest(std::function<void()> probe)
+{
+    walk_record_decode_probe.set(std::move(probe));
 }
 
 }
@@ -2151,19 +2198,25 @@ struct PlannedRecord
     RefTxnId head{};
 };
 
-PlannedRecord classifyPlannedRecord(const Object & object, const NamespaceLifeId & life, const RefTxnId & id)
+PlannedRecord classifyPlannedRecord(const Object & object, const String & key, const NamespaceLifeId & life, const RefTxnId & id)
 {
     std::optional<RefTxnId> successor;
     std::optional<RefEpochTransition> transition;
     try
     {
+        planned_record_decode_probe.run();
         const RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, object.bytes), life.ns.string(), id);
         successor = refChainSuccessor(txn);
         transition = refEpochTransitionOf(txn);
     }
-    catch (const Exception &)
+    catch (Exception & e)
     {
-        /// The walk decodes the same body when it reaches it and holds the life there.
+        /// Planning ends at a malformed body; the walk holds the life when it decodes the same body.
+        if (!isMalformedStoredRecordError(e))
+        {
+            e.addMessage("while GC planning decodes the ref log `{}` of namespace `{}`", key, life.ns.string());
+            throw;
+        }
         return {};
     }
     if (!successor)
@@ -2211,7 +2264,7 @@ std::optional<RefStopPlan> planRefStops(GcReadAhead & reads, const Layout & layo
             return std::nullopt;
         }
         ProfileEvents::increment(ProfileEvents::CASRefLogBodyGets);
-        const PlannedRecord record = classifyPlannedRecord(*got, life, id);
+        const PlannedRecord record = classifyPlannedRecord(*got, key, life, id);
         retained.keep(key, std::move(*got));
         return record;
     };
@@ -3374,14 +3427,25 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
             /// `foldManifestEdges`: only intake shares this discipline.
             const char * invalid_reason = nullptr;
             String invalid_detail;
+            /// Called only from inside a catch: a bare `throw;` rethrows the exception being handled.
+            auto hold_or_rethrow = [&](Exception & e, const char * reason)
+            {
+                if (!isMalformedStoredRecordError(e))
+                {
+                    e.addMessage("while the GC walk folds the ref log `{}` of namespace `{}`", expected_key, ns_str);
+                    throw;
+                }
+                invalid_reason = reason;
+                invalid_detail = e.message();
+            };
             try
             {
+                walk_record_decode_probe.run();
                 txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns_str, log_id);
             }
-            catch (const Exception & e)
+            catch (Exception & e)
             {
-                invalid_reason = "ref log body invalid: namespace held below it";
-                invalid_detail = e.message();
+                hold_or_rethrow(e, "ref log body invalid: namespace held below it");
             }
             if (!invalid_reason)
             {
@@ -3389,10 +3453,9 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
                 {
                     validateRefChainLink(s.open_transition, txn);
                 }
-                catch (const Exception & e)
+                catch (Exception & e)
                 {
-                    invalid_reason = "ref intake: chain link invalid -- namespace held below it";
-                    invalid_detail = e.message();
+                    hold_or_rethrow(e, "ref intake: chain link invalid -- namespace held below it");
                 }
             }
             if (!invalid_reason)
@@ -3403,10 +3466,9 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
                     successor = refChainSuccessor(txn);
                     transition = refEpochTransitionOf(txn);
                 }
-                catch (const Exception & e)
+                catch (Exception & e)
                 {
-                    invalid_reason = "ref log body invalid: namespace held below it";
-                    invalid_detail = e.message();
+                    hold_or_rethrow(e, "ref log body invalid: namespace held below it");
                 }
             }
             if (invalid_reason)

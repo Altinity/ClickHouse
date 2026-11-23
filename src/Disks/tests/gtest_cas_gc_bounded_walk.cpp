@@ -15,8 +15,15 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include "cas_test_helpers.h"
+#include <base/scope_guard.h>
 
 #include <Common/ProfileEvents.h>
+
+namespace DB::ErrorCodes
+{
+extern const int CORRUPTED_DATA;
+extern const int MEMORY_LIMIT_EXCEEDED;
+}
 
 namespace ProfileEvents
 {
@@ -1360,6 +1367,39 @@ TEST(CASGCBoundedWalk, ASchedulerStopReturnsWhileARoundIsInsideALongIntake)
     EXPECT_EQ(refLogGetsFor(*backend, layout, ns, 1, tail + 1), gets_at_stop + 1)
         << "after the stop request the walk read more than the read it was parked in";
     EXPECT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{1, 3})) << "the round did not keep the records it applied";
+}
+
+/// Planning reads a record it cannot decode as the end of what it plans, and the walk decides what that record
+/// means when it reaches it. Any other error from the decode, here running out of memory, fails the round.
+TEST(CASGCBoundedWalk, AnErrorOtherThanAMalformedRecordFailsThePlanningRound)
+{
+    for (const int code : {DB::ErrorCodes::CORRUPTED_DATA, DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED})
+    {
+        SCOPED_TRACE(code);
+        auto backend = std::make_shared<CountingBackend>();
+        auto store = openPoolWithSmallWindow(backend);
+        const Layout & layout = store->layout();
+        const RootNamespace ns{"00/decoded@cas@"};
+        const uint64_t tail = 12;
+        publishRange(*backend, layout, ns, 1, tail);
+        writeRecoverableCkptForRawFixture(*backend, layout, ns, refCkptOf(1, RefTxnId{1, tail}));
+        backend->resetCounts();
+
+        Gc gc(store, kGc);
+        setPlannedRecordDecodeProbeForTest([code] { throw DB::Exception(code, "injected while planning decodes a record"); });
+        SCOPE_EXIT({ setPlannedRecordDecodeProbeForTest({}); });
+        if (code == DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED)
+        {
+            expectThrowsCode(code, [&] { (void)gc.runRegularRound(); });
+        }
+        else
+        {
+            const std::map<String, UInt64> intake = runRoundCapturingIntake(gc);
+            EXPECT_GT(metric(intake, "frontier_namespaces"), 0u) << "positive control: the round folded";
+            EXPECT_EQ(metric(intake, "frontier_proven"), 0u) << "planning observed nothing past the first record";
+        }
+        EXPECT_EQ(backend->deleteTotal(), 0u) << "Deleted:" << deletedKeysMessage(*backend);
+    }
 }
 
 /// Pass 1 has a take budget, and its read-ahead stays within the records that budget can take, also when the listing

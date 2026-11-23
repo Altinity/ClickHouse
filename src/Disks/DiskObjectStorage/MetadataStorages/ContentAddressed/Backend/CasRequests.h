@@ -24,6 +24,10 @@ namespace ProfileEvents
 namespace DB::ErrorCodes
 {
     extern const int CAS_OWNERSHIP_CONFLICT;
+    extern const int CANNOT_PARSE_ESCAPE_SEQUENCE;
+    extern const int CORRUPTED_DATA;
+    extern const int TOO_DEEP_RECURSION;
+    extern const int UNKNOWN_FORMAT_VERSION;
 }
 #include <optional>
 #include <string_view>
@@ -64,6 +68,18 @@ bool isFirstAttemptFuseTimeout(const std::exception & e, size_t attempt_no);
 bool isDeterministicLocalFailure(int code);
 /// A `MEMORY_LIMIT_EXCEEDED` raised by the memory tracker, whatever it was allocating for.
 bool isMemoryLimitExceeded(const std::exception & e);
+/// A GC decode of a stored ref log or manifest failed because the bytes are malformed. Any other error says nothing
+/// about the bytes and must propagate. The JSON reader does not translate a bad escape or an unknown key nested past
+/// its depth limit to `CORRUPTED_DATA`, so those two parse codes are listed here.
+inline bool isMalformedStoredRecordError(int code)
+{
+    return code == ErrorCodes::CORRUPTED_DATA || code == ErrorCodes::UNKNOWN_FORMAT_VERSION
+        || code == ErrorCodes::CANNOT_PARSE_ESCAPE_SEQUENCE || code == ErrorCodes::TOO_DEEP_RECURSION;
+}
+inline bool isMalformedStoredRecordError(const Exception & e)
+{
+    return isMalformedStoredRecordError(e.code());
+}
 /// An exception the store or the transport raised, as opposed to a local fault.
 bool isStoreAnswer(const std::exception & e);
 /// `VERB key: refused|transport code message`; `code` is the store's error name when it sent one.

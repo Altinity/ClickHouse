@@ -260,6 +260,11 @@ namespace tests
 {
 RefPlan buildRefWalkPlanForTest(RefScanSummary ref_scan, CasRefCatalog::Snapshot catalog_cut);
 class GcRoundPlanSignatureAccess;
+/// Runs `probe` where planning decodes a ref-log body it read, so a test can throw from inside the decode.
+/// Empty clears it.
+void setPlannedRecordDecodeProbeForTest(std::function<void()> probe);
+/// Runs `probe` where the fold's ordered walk decodes a ref-log body, before the decode. Empty clears it.
+void setWalkRecordDecodeProbeForTest(std::function<void()> probe);
 }
 
 /// The one owned observation boundary between the reconciled hot LIST and every ref-plan consumer.
