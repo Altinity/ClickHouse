@@ -587,6 +587,9 @@ public:
         round_point_hook_for_test = std::move(hook);
     }
 
+    /// Replaces the clock of the fold's intake family accounting, so a test can assert exact durations.
+    void setIntakeClockForTest(UInt64 (*clock)() noexcept) { intake_clock_ns = clock; }
+
     /// Abandoned-precommit cleanup belongs to the writer: it appends exact `owner_transition` removals in
     /// ref logs. GC never invents a ref transition, because doing so could make the fold disagree with the
     /// writer's durable ownership history.
@@ -1090,6 +1093,8 @@ private:
     std::function<void()> post_hot_scan_catalog_read_hook_for_test;
     /// TEST SEAM ONLY: see setRoundPointHookForTest. Empty in production.
     std::function<void(const RoundPointSiteForTest &)> round_point_hook_for_test;
+    /// TEST SEAM ONLY: see setIntakeClockForTest.
+    UInt64 (*intake_clock_ns)() noexcept = &steadyNowNs;
     /// Calls a copy, so a hook that replaces itself does not destroy the function it is running in.
     void runRoundPointHookForTest(const RoundPointSiteForTest & site) const
     {

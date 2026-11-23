@@ -294,6 +294,353 @@ TEST(CASGCReadAhead, CreateThatCannotBeScheduledLeavesNoCreateBehind)
     EXPECT_EQ(reads.untakenCreates(), 0u);
 }
 
+/// ============================ per-family accounting ============================
+
+namespace
+{
+
+/// A clock that moves only when a test or a backend advances it, so every duration below is exact.
+std::atomic<UInt64> fake_now_ns{0};
+
+UInt64 fakeClockNs() noexcept
+{
+    return fake_now_ns.load();
+}
+
+/// Advances `fake_now_ns` by a fixed amount inside the read of every key containing a given substring,
+/// while armed: the time a read of that key costs.
+class ClockAdvancingBackend : public CountingBackend
+{
+public:
+    void delayKeysContaining(const String & substr, UInt64 ns)
+    {
+        std::lock_guard lock(mutex);
+        delays.emplace_back(substr, ns);
+    }
+
+    void arm() { armed.store(true); }
+    void disarm() { armed.store(false); }
+
+    std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        if (armed.load())
+        {
+            std::lock_guard lock(mutex);
+            for (const auto & [substr, ns] : delays)
+                if (key.find(substr) != String::npos)
+                    fake_now_ns.fetch_add(ns);
+        }
+        return CountingBackend::read(key, access);
+    }
+
+private:
+    std::mutex mutex;
+    std::vector<std::pair<String, UInt64>> delays;
+    std::atomic<bool> armed{true};
+};
+
+struct FamilyRig
+{
+    std::shared_ptr<ClockAdvancingBackend> backend = std::make_shared<ClockAdvancingBackend>();
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    ThreadPool pool{CurrentMetrics::LocalThread, CurrentMetrics::LocalThreadActive,
+                    CurrentMetrics::LocalThreadScheduled,
+                    /*max_threads*/ 4, /*max_free_threads*/ 4, /*queue_size*/ 0};
+
+    FamilyRig() { fake_now_ns.store(0); }
+
+    void put(const String & key, const String & bytes)
+    {
+        ASSERT_TRUE(std::holds_alternative<Committed>(op.create(key, bytes, Retry::once()))) << key;
+    }
+};
+
+/// The calls of `FamilyCountersFollowTheCalls`, shared with the test that runs them without accounting.
+void runFamilyCalls(FamilyRig & rig, GcReadAhead & reads)
+{
+    reads.hintRead("k1", ReadFamily::RefLog);
+    reads.hintRead("k1", ReadFamily::RefLog);
+    rig.pool.wait();
+    ASSERT_TRUE(reads.takeRead("k1", ReadFamily::RefLog).has_value());
+    ASSERT_TRUE(reads.takeRead("k2", ReadFamily::Manifest).has_value());
+    reads.hintRead("k4", ReadFamily::Manifest);
+    rig.pool.wait();
+    ASSERT_TRUE(reads.takeRead("k4", ReadFamily::Manifest).has_value());
+    ASSERT_TRUE(reads.takeRead("k3").has_value());
+}
+
+void putFamilyKeys(FamilyRig & rig)
+{
+    for (const char * key : {"k1", "k2", "k3", "k4"})
+        rig.put(key, key);
+}
+
+}
+
+TEST(CASGCReadAhead, FamilyCountersFollowTheCalls)
+{
+    for (const size_t concurrency : {4, 1})
+    {
+        SCOPED_TRACE(concurrency);
+        FamilyRig rig;
+        putFamilyKeys(rig);
+        GcReadAhead reads(rig.op, rig.requests, rig.pool, concurrency);
+        reads.enableFamilyAccounting(&fakeClockNs);
+        ASSERT_NO_FATAL_FAILURE(runFamilyCalls(rig, reads));
+
+        const bool hinting = concurrency > 1;
+        EXPECT_EQ(reads.familyStats(ReadFamily::RefLog), (ReadFamilyStats{.issued = 1, .takes = 1, .awaited = hinting ? 0u : 1u}));
+        EXPECT_EQ(reads.familyStats(ReadFamily::Manifest), (ReadFamilyStats{.issued = 2, .takes = 2, .awaited = hinting ? 1u : 2u}));
+        EXPECT_EQ(reads.familyStats(ReadFamily::RefCheckpoint), ReadFamilyStats{});
+        EXPECT_EQ(reads.familyStats(ReadFamily::Other), ReadFamilyStats{});
+    }
+}
+
+namespace
+{
+
+std::atomic<UInt64> scripted_clock_calls{0};
+
+/// 0 at the first read, 10 at every later one: time passes between a take's entry and the rest of the take.
+UInt64 scriptedClockNs() noexcept
+{
+    return scripted_clock_calls.fetch_add(1) == 0 ? 0 : 10;
+}
+
+}
+
+TEST(CASGCReadAhead, AHintedTakesWaitStartsAtItsEntry)
+{
+    FamilyRig rig;
+    putFamilyKeys(rig);
+    GcReadAhead reads(rig.op, rig.requests, rig.pool, 4);
+    reads.hintRead("k1", ReadFamily::RefLog);
+    rig.pool.wait();
+    scripted_clock_calls.store(0);
+    reads.enableFamilyAccounting(&scriptedClockNs);
+
+    ASSERT_TRUE(reads.takeRead("k1", ReadFamily::RefLog).has_value());
+    EXPECT_EQ(reads.familyStats(ReadFamily::RefLog).wait_ns, 10u);
+}
+
+TEST(CASGCReadAhead, AccountingIsOffUnlessEnabled)
+{
+    for (const size_t concurrency : {4, 1})
+    {
+        SCOPED_TRACE(concurrency);
+        FamilyRig rig;
+        putFamilyKeys(rig);
+        GcReadAhead reads(rig.op, rig.requests, rig.pool, concurrency);
+        ASSERT_NO_FATAL_FAILURE(runFamilyCalls(rig, reads));
+        reads.closeApply();
+
+        for (const ReadFamily family : {ReadFamily::RefCheckpoint, ReadFamily::RefLog, ReadFamily::Manifest, ReadFamily::Other})
+            EXPECT_EQ(reads.familyStats(family), ReadFamilyStats{}) << static_cast<int>(family);
+    }
+}
+
+/// The instrumented path issues exactly the requests the plain path issues, checked against a literal
+/// rather than against the other rig, so a defect shared by both paths cannot hide.
+TEST(CASGCReadAhead, TaggedAccountingIssuesTheSameRequests)
+{
+    struct Outcome
+    {
+        std::vector<String> keys;
+        std::optional<String> a;
+        bool c_absent = false;
+        std::optional<String> d;
+    };
+
+    const auto run = [](size_t concurrency, bool accounted)
+    {
+        FamilyRig rig;
+        for (const char * key : {"a", "b", "d"})
+            rig.put(key, String("bytes-") + key);
+        GcReadAhead reads(rig.op, rig.requests, rig.pool, concurrency);
+        if (accounted)
+            reads.enableFamilyAccounting(&fakeClockNs);
+        const ReadFamily family = accounted ? ReadFamily::RefLog : ReadFamily::Other;
+        rig.backend->clearJournal();
+
+        Outcome out;
+        reads.hintRead("a", family);
+        reads.hintRead("b", family);
+        if (const auto got = reads.takeRead("a", family))
+            out.a = got->bytes;
+        reads.discardRead("b");
+        out.c_absent = !reads.takeRead("c", family).has_value();
+        if (const auto got = reads.takeRead("d", family))
+            out.d = got->bytes;
+
+        for (const JournalEntry & entry : rig.backend->journal())
+        {
+            EXPECT_EQ(entry.verb, JournalVerb::Read);
+            out.keys.insert(out.keys.end(), entry.keys.begin(), entry.keys.end());
+        }
+        return out;
+    };
+
+    for (const bool accounted : {true, false})
+    {
+        SCOPED_TRACE(accounted);
+        const Outcome one = run(1, accounted);
+        EXPECT_EQ(one.keys, (std::vector<String>{"a", "c", "d"}));
+        EXPECT_EQ(one.a, "bytes-a");
+        EXPECT_TRUE(one.c_absent);
+        EXPECT_EQ(one.d, "bytes-d");
+
+        Outcome four = run(4, accounted);
+        std::sort(four.keys.begin(), four.keys.end());
+        EXPECT_EQ(four.keys, (std::vector<String>{"a", "b", "c", "d"}));
+        EXPECT_EQ(four.a, "bytes-a");
+        EXPECT_TRUE(four.c_absent);
+        EXPECT_EQ(four.d, "bytes-d");
+    }
+}
+
+TEST(CASGCReadAhead, ApplyBelongsToThePrecedingTake)
+{
+    FamilyRig rig;
+    putFamilyKeys(rig);
+    rig.backend->delayKeysContaining("k2", 7);
+    GcReadAhead reads(rig.op, rig.requests, rig.pool, 1);
+    reads.enableFamilyAccounting(&fakeClockNs);
+
+    ASSERT_TRUE(reads.takeRead("k1", ReadFamily::RefLog).has_value());
+    fake_now_ns.fetch_add(10);
+    ASSERT_TRUE(reads.takeRead("k2", ReadFamily::Manifest).has_value());
+    fake_now_ns.fetch_add(20);
+    reads.closeApply();
+    fake_now_ns.fetch_add(50);
+    ASSERT_TRUE(reads.takeRead("k3").has_value());
+
+    EXPECT_EQ(reads.familyStats(ReadFamily::RefLog).apply_ns, 10u);
+    EXPECT_EQ(reads.familyStats(ReadFamily::RefLog).wait_ns, 0u);
+    EXPECT_EQ(reads.familyStats(ReadFamily::Manifest).wait_ns, 7u);
+    EXPECT_EQ(reads.familyStats(ReadFamily::Manifest).apply_ns, 20u);
+    EXPECT_EQ(reads.familyStats(ReadFamily::RefCheckpoint), ReadFamilyStats{});
+    EXPECT_EQ(reads.familyStats(ReadFamily::Other), ReadFamilyStats{});
+}
+
+namespace
+{
+
+/// Holds the read of one key inside the backend until `open`, bounded so a defect cannot hang the suite.
+class GatedReadBackend : public CountingBackend
+{
+public:
+    explicit GatedReadBackend(String gated_key_) : gated_key(std::move(gated_key_)) {}
+
+    std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        if (key == gated_key)
+        {
+            std::unique_lock lock(mutex);
+            inside = true;
+            cv.notify_all();
+            cv.wait_for(lock, std::chrono::seconds(10), [&] { return opened; });
+        }
+        return CountingBackend::read(key, access);
+    }
+
+    bool waitUntilInside()
+    {
+        std::unique_lock lock(mutex);
+        return cv.wait_for(lock, std::chrono::seconds(10), [&] { return inside; });
+    }
+
+    void open()
+    {
+        std::lock_guard lock(mutex);
+        opened = true;
+        cv.notify_all();
+    }
+
+private:
+    const String gated_key;
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool inside = false;
+    bool opened = false;
+};
+
+/// Moves by one per call; its second call after `reset` is the one after the readiness poll, and it
+/// signals the thread that opens the gate.
+std::atomic<UInt64> ticking_calls{0};
+std::atomic<bool> poll_passed{false};
+
+UInt64 tickingClockNs() noexcept
+{
+    const UInt64 call = ticking_calls.fetch_add(1);
+    if (call == 1)
+    {
+        poll_passed.store(true);
+        poll_passed.notify_all();
+    }
+    return call;
+}
+
+}
+
+TEST(CASGCReadAhead, AHintedUnreadyTakeIsAwaited)
+{
+    auto backend = std::make_shared<GatedReadBackend>("gated");
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    ThreadPool pool{CurrentMetrics::LocalThread, CurrentMetrics::LocalThreadActive,
+                    CurrentMetrics::LocalThreadScheduled,
+                    /*max_threads*/ 4, /*max_free_threads*/ 4, /*queue_size*/ 0};
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create("gated", "bytes", Retry::once())));
+    backend->resetCounts();
+
+    ticking_calls.store(0);
+    poll_passed.store(false);
+    std::thread releaser([&]
+    {
+        poll_passed.wait(false);
+        backend->open();
+    });
+    SCOPE_EXIT({
+        poll_passed.store(true);
+        poll_passed.notify_all();
+        releaser.join();
+    });
+
+    GcReadAhead reads(op, requests, pool, 4);
+    reads.enableFamilyAccounting(&tickingClockNs);
+    reads.hintRead("gated", ReadFamily::Manifest);
+    ASSERT_TRUE(backend->waitUntilInside());
+    const auto got = reads.takeRead("gated", ReadFamily::Manifest);
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->bytes, "bytes");
+
+    const ReadFamilyStats & stats = reads.familyStats(ReadFamily::Manifest);
+    EXPECT_EQ(stats.awaited, 1u);
+    EXPECT_EQ(stats.takes, 1u);
+    EXPECT_EQ(stats.wait_ns, 1u);
+    EXPECT_EQ(backend->getCount("gated"), 1u);
+}
+
+TEST(CASGCReadAhead, AWorkerFaultOnATaggedTakeStillThrows)
+{
+    FamilyRig rig;
+    rig.put("k3", "three");
+    rig.backend->failNextReadWith("k3", std::make_exception_ptr(std::runtime_error("injected read fault")));
+    GcReadAhead reads(rig.op, rig.requests, rig.pool, 4);
+    reads.enableFamilyAccounting(&fakeClockNs);
+
+    reads.hintRead("k3", ReadFamily::RefLog);
+    EXPECT_THROW(reads.takeRead("k3", ReadFamily::RefLog), std::runtime_error);
+    EXPECT_EQ(reads.familyStats(ReadFamily::RefLog).takes, 1u);
+    EXPECT_EQ(reads.pending(), 0u);
+
+    const auto again = reads.takeRead("k3", ReadFamily::RefLog);
+    ASSERT_TRUE(again.has_value());
+    EXPECT_EQ(again->bytes, "three");
+    EXPECT_EQ(reads.familyStats(ReadFamily::RefLog).takes, 2u);
+}
+
 /// ============================ the fold, at 1 against 8 ============================
 
 namespace
@@ -490,7 +837,26 @@ TEST(CASGCReadAhead, FoldIsIdenticalAtConcurrencyOneAndEight)
     for (size_t i = 0; i < kRounds; ++i)
         EXPECT_EQ(one.seals[i], eight.seals[i]) << "fold seal differs at round " << i;
 
-    EXPECT_EQ(one.intake, eight.intake);
+    /// Times differ between any two runs; the counts must not.
+    const auto withoutTimes = [](std::vector<std::map<String, UInt64>> rounds)
+    {
+        for (std::map<String, UInt64> & metrics : rounds)
+            std::erase_if(metrics, [](const auto & entry)
+            {
+                const String & key = entry.first;
+                return key.ends_with("_awaited") || key.ends_with("_wait_us") || key.ends_with("_apply_us")
+                    || key == "cursor_resolve_us";
+            });
+        return rounds;
+    };
+    EXPECT_EQ(withoutTimes(one.intake), withoutTimes(eight.intake));
+    /// `populate` hints nothing the walk does not take, so every hint is matched by its take.
+    for (const FoldRun * run : {&one, &eight})
+        for (size_t i = 0; i < run->intake.size(); ++i)
+            for (const char * family : {"ckpt", "reflog", "manifest"})
+                EXPECT_EQ(run->intake[i].at(fmt::format("{}_reads_issued", family)),
+                          run->intake[i].at(fmt::format("{}_takes", family)))
+                    << family << " at round " << i << (run == &one ? " (concurrency 1)" : " (concurrency 8)");
     EXPECT_EQ(one.reduce, eight.reduce);
     EXPECT_EQ(one.condemned, eight.condemned);
     EXPECT_EQ(one.deleted, eight.deleted);
@@ -662,4 +1028,172 @@ TEST(CASGCReadAhead, WorkerReadFaultFailsTheRoundAndTheNextRoundRecovers)
     store->renewWatermarkOnce();
     const RoundReport recovered = gc.runRegularRound();
     EXPECT_TRUE(recovered.acquired_lease);
+}
+
+/// ============================ the fold's intake telemetry ============================
+
+namespace
+{
+
+struct IntakeCapture
+{
+    std::map<String, UInt64> metrics;
+    UInt64 duration_us = 0;
+    size_t rows = 0;
+};
+
+/// One sink for both jobs: `markCutComplete` would replace a second one. Nothing between the
+/// `fold_seal_read` row and the start of intake reads, so the marks bracket the intake's requests.
+void captureIntake(Gc & gc, CountingBackend & backend, IntakeCapture & out)
+{
+    gc.setPhaseSink([&backend, &out](const GcPhaseRecord & rec)
+    {
+        if (rec.phase == "fold_seal_read")
+        {
+            backend.mark("intake_begin");
+        }
+        else if (rec.phase == "fold_ref_intake")
+        {
+            backend.mark("intake_end");
+            out.metrics = rec.metrics;
+            out.duration_us = rec.duration_us;
+            ++out.rows;
+        }
+    });
+}
+
+const std::vector<String> kFamilies{"ckpt", "reflog", "manifest"};
+const std::vector<String> kFamilySuffixes{"reads_issued", "takes", "awaited", "wait_us", "apply_us"};
+
+/// The key substring each family's objects carry in the layout.
+String familyKeyPart(const String & family)
+{
+    if (family == "ckpt")
+        return "_ckpt";
+    if (family == "reflog")
+        return "/_log/";
+    return "/cas/manifests/";
+}
+
+UInt64 intakeMetric(const std::map<String, UInt64> & metrics, const String & key)
+{
+    const auto it = metrics.find(key);
+    EXPECT_NE(it, metrics.end()) << "missing intake metric " << key;
+    return it == metrics.end() ? 0 : it->second;
+}
+
+size_t intakeReadsContaining(const std::vector<JournalEntry> & journal, const String & part)
+{
+    size_t n = 0;
+    bool inside = false;
+    for (const JournalEntry & entry : journal)
+    {
+        if (entry.verb == JournalVerb::Mark)
+            inside = entry.detail == "intake_begin";
+        else if (inside && entry.verb == JournalVerb::Read && entry.keys.front().find(part) != String::npos)
+            ++n;
+    }
+    return n;
+}
+
+PoolPtr openPopulated(const std::shared_ptr<CountingBackend> & backend, uint64_t concurrency)
+{
+    auto store = Pool::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test",
+                   .gc_fold_max_defer_rounds = 0, .gc_io_concurrency = concurrency});
+    populate(store);
+    return store;
+}
+
+}
+
+TEST(CASGCReadAhead, IntakeCountersMatchTheJournalAtConcurrencyOne)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPopulated(backend, 1);
+    Gc gc(store, kGc);
+    IntakeCapture intake;
+    captureIntake(gc, *backend, intake);
+    backend->clearJournal();
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    ASSERT_EQ(intake.rows, 1u);
+
+    for (const String & family : kFamilies)
+        for (const String & suffix : kFamilySuffixes)
+            ASSERT_TRUE(intake.metrics.contains(family + "_" + suffix)) << family << "_" << suffix;
+    ASSERT_TRUE(intake.metrics.contains("cursor_resolves"));
+    ASSERT_TRUE(intake.metrics.contains("cursor_resolve_us"));
+
+    const std::vector<JournalEntry> journal = backend->journal();
+    UInt64 timed_us = 0;
+    for (const String & family : kFamilies)
+    {
+        SCOPED_TRACE(family);
+        const size_t reads = intakeReadsContaining(journal, familyKeyPart(family));
+        EXPECT_GT(reads, 0u);
+        EXPECT_EQ(intakeMetric(intake.metrics, family + "_reads_issued"), reads);
+        EXPECT_EQ(intakeMetric(intake.metrics, family + "_takes"), reads);
+        EXPECT_EQ(intakeMetric(intake.metrics, family + "_awaited"), reads);
+        timed_us += intakeMetric(intake.metrics, family + "_wait_us") + intakeMetric(intake.metrics, family + "_apply_us");
+    }
+    EXPECT_EQ(intakeMetric(intake.metrics, "cursor_resolves"), 0u);
+    EXPECT_LE(timed_us, intake.duration_us);
+}
+
+TEST(CASGCReadAhead, ADelayedFamilyOwnsTheWait)
+{
+    constexpr UInt64 kDelayUs = 7;
+    for (const String & delayed : kFamilies)
+    {
+        SCOPED_TRACE(delayed);
+        auto backend = std::make_shared<ClockAdvancingBackend>();
+        backend->disarm();
+        auto store = openPopulated(backend, 1);
+        Gc gc(store, kGc);
+        gc.setIntakeClockForTest(&fakeClockNs);
+        IntakeCapture intake;
+        captureIntake(gc, *backend, intake);
+        backend->delayKeysContaining(familyKeyPart(delayed), kDelayUs * 1000);
+        backend->arm();
+        ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+        ASSERT_EQ(intake.rows, 1u);
+
+        const UInt64 takes = intakeMetric(intake.metrics, delayed + "_takes");
+        EXPECT_GT(takes, 0u);
+        EXPECT_EQ(intakeMetric(intake.metrics, delayed + "_wait_us"), takes * kDelayUs);
+        for (const String & other : kFamilies)
+            if (other != delayed)
+                EXPECT_EQ(intakeMetric(intake.metrics, other + "_wait_us"), 0u) << other;
+    }
+}
+
+TEST(CASGCReadAhead, ColdCursorResolveIsCounted)
+{
+    constexpr UInt64 kDelayUs = 7;
+    auto backend = std::make_shared<ClockAdvancingBackend>();
+    backend->disarm();
+    auto store = openPopulated(backend, 1);
+    {
+        Gc warm(store, kGc);
+        ASSERT_TRUE(warm.runRegularRound().acquired_lease);
+    }
+    store->renewWatermarkOnce();
+
+    Gc cold(store, kGc);
+    cold.setIntakeClockForTest(&fakeClockNs);
+    IntakeCapture intake;
+    captureIntake(cold, *backend, intake);
+    backend->clearJournal();
+    backend->delayKeysContaining(familyKeyPart("reflog"), kDelayUs * 1000);
+    backend->arm();
+    ASSERT_TRUE(cold.runRegularRound().acquired_lease);
+    ASSERT_EQ(intake.rows, 1u);
+
+    const UInt64 resolves = intakeMetric(intake.metrics, "cursor_resolves");
+    EXPECT_GE(resolves, 1u);
+    EXPECT_LE(resolves, intakeMetric(intake.metrics, "tables_scanned"));
+    const size_t reflog_reads = intakeReadsContaining(backend->journal(), familyKeyPart("reflog"));
+    const UInt64 resolve_reads = reflog_reads - intakeMetric(intake.metrics, "reflog_reads_issued");
+    EXPECT_GT(resolve_reads, 0u);
+    EXPECT_EQ(intakeMetric(intake.metrics, "cursor_resolve_us"), resolve_reads * kDelayUs);
 }

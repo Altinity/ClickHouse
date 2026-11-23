@@ -1662,7 +1662,7 @@ bool Gc::foldManifestEdges(GcReadAhead & reads, const ManifestId & id, int sign,
     /// The bytes may already have been fetched when the log that named this edge was decoded (all of
     /// that log's edges are hinted together, since one decode names them all). The absence signal, the
     /// decode and every decision below still happen HERE, in edge order, exactly as they always did.
-    const auto got = reads.takeRead(key);
+    const auto got = reads.takeRead(key, ReadFamily::Manifest);
     if (!got)
         return false;   /// absent body: caller decides (missing-body precommit OK; committed => fail closed)
     ProfileEvents::increment(ProfileEvents::CASRefManifestBodyFoldGets);   /// one body GET per manifest fold
@@ -1790,7 +1790,7 @@ Gc::CheckpointWitnesses Gc::readCheckpointWitnesses(GcReadAhead & reads,
     const auto topUpWitnessHints = [&]
     {
         while (next_hint < witness_keys.size() && reads.pending() < reads.window())
-            reads.hintRead(witness_keys[next_hint++].ckpt_key);
+            reads.hintRead(witness_keys[next_hint++].ckpt_key, ReadFamily::RefCheckpoint);
     };
 
     CheckpointWitnesses out;
@@ -1805,7 +1805,7 @@ Gc::CheckpointWitnesses Gc::readCheckpointWitnesses(GcReadAhead & reads,
         /// read anything -- into a per-namespace hold, silently narrowing a pool-wide outage to one
         /// namespace. A backend throw still propagates and fails the round, exactly as it always did --
         /// a read-ahead worker's failure is rethrown by the take below, at this same site.
-        const std::optional<Object> got = reads.takeRead(ckpt_key);
+        const std::optional<Object> got = reads.takeRead(ckpt_key, ReadFamily::RefCheckpoint);
         /// ABSENT IS NORMAL AND IS NOT A WITNESS: a namespace has no `_ckpt` until its first snapshot
         /// publication commits, and one that 404s mid-round is a namespace being reclaimed. Neither says
         /// anything about which ids exist, so neither may hold the walk -- and neither may throw
@@ -2061,6 +2061,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
     /// holds and its events are what they were; only the moment of the fetch moves. At
     /// `gc_io_concurrency` 1 it hints nothing and every take IS the original inline read.
     GcReadAhead reads(op, store->openRequests(), *io_pool, store->poolConfig().gc_io_concurrency);
+    reads.enableFamilyAccounting(intake_clock_ns);
     FoldResult result;
 
     /// 1. Group the round's one enumeration of `cas/ns/stream/` (taken before the defer decision) into
@@ -2498,6 +2499,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
     uint64_t intake_dead_precommits_skipped = 0;
     uint64_t intake_absent_probes = 0;
     uint64_t intake_epoch_crossings = 0;
+    uint64_t intake_cursor_resolves = 0;
+    uint64_t intake_cursor_resolve_ns = 0;
 
     /// Probe B1's raw material: per namespace, the CONTIGUOUS runs of ids this round walked, one per epoch
     /// entered, recorded as `[first, last]`. The recomputation below turns them back into a count and
@@ -2509,6 +2512,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
     /// for what it decides and why a listing alone cannot decide it. Its `undecodable` half names the
     /// namespaces whose `_ckpt` is present and unreadable; each of those is HELD below, and only those.
     const CheckpointWitnesses checkpoints = readCheckpointWitnesses(reads, ref_tables, catalog_snapshot);
+    reads.closeApply();
     const std::map<String, RefTxnId> & checkpoint_witness = checkpoints.witnesses;
 
     /// WHICH NAMESPACES THIS ROUND WALKS -- i.e. THE ROUND'S UNIVERSE, the set the destructive gate owes
@@ -2778,7 +2782,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         {
             next = RefTxnId{next.writer_epoch, next.ref_sequence + 1};
             String key = layout.refLogKey(s.life, next);
-            reads.hintRead(key);
+            reads.hintRead(key, ReadFamily::RefLog);
             s.lookahead.emplace_back(next, std::move(key));
         }
     };
@@ -2924,7 +2928,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
     const auto topUpFirstWalkHints = [&]
     {
         while (next_first_walk_hint < first_walk_keys.size() && reads.pending() < reads.window())
-            reads.hintRead(first_walk_keys[next_first_walk_hint++]);
+            reads.hintRead(first_walk_keys[next_first_walk_hint++], ReadFamily::RefLog);
     };
 
     /// Pass 1 resolves where a cold cursor resumes. A cursor below the snapshot id is never read: cleanup
@@ -2932,8 +2936,11 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
     const auto resolveStart = [&](NamespaceIntake & s)
     {
         s.resolve_start = false;
+        const UInt64 resolve_start_ns = intake_clock_ns();
         const RefCursorResume resume = resolveRefCursorSuccessor(
             op, layout, s.life, s.cursor, s.checkpoint->checkpoint_snapshot_id);
+        ++intake_cursor_resolves;
+        intake_cursor_resolve_ns += intake_clock_ns() - resolve_start_ns;
         intake_absent_probes += resume.absent_probes;
         ProfileEvents::increment(ProfileEvents::CASRefLogBodyGets, resume.body_gets);
         switch (resume.kind)
@@ -2970,7 +2977,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
             /// can never be grounds for discarding another namespace's fold.
             topUpLookahead(s, take_limit ? *take_limit - takes - 1 : std::numeric_limits<size_t>::max());
             const String expected_key = layout.refLogKey(life, *s.expected);
-            const auto got = reads.takeRead(expected_key);
+            const auto got = reads.takeRead(expected_key, ReadFamily::RefLog);
             ++takes;
             if (!s.lookahead.empty() && s.lookahead.front().first == *s.expected)
                 s.lookahead.pop_front();
@@ -3074,7 +3081,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
             /// one. A clamp mid-log leaves the rest of this log's bodies fetched and untaken, which is
             /// the bounded waste the read-ahead counts.
             for (const RefManifestEdge & edge : edges)
-                reads.hintRead(layout.manifestKey(edge.manifest_id));
+                reads.hintRead(layout.manifestKey(edge.manifest_id), ReadFamily::Manifest);
 
             std::vector<BlobDelta> log_deltas;
             std::map<ManifestId, Etag> log_mf_cleanup;
@@ -3185,6 +3192,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
             }
             s.expected = *successor;
         }
+        reads.closeApply();
         dropLookahead(s);
     };
 
@@ -3499,6 +3507,20 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
     intake_timer->metric("epoch_crossings", intake_epoch_crossings);
     intake_timer->metric("namespace_removals", new_removals.size());
     intake_timer->metric("ref_folding_aborted", ref_folding_aborted ? 1 : 0);
+    const auto familyMetrics = [&](const String & prefix, ReadFamily family)
+    {
+        const ReadFamilyStats & stats = reads.familyStats(family);
+        intake_timer->metric(prefix + "_reads_issued", stats.issued);
+        intake_timer->metric(prefix + "_takes", stats.takes);
+        intake_timer->metric(prefix + "_awaited", stats.awaited);
+        intake_timer->metric(prefix + "_wait_us", stats.wait_ns / 1000);
+        intake_timer->metric(prefix + "_apply_us", stats.apply_ns / 1000);
+    };
+    familyMetrics("ckpt", ReadFamily::RefCheckpoint);
+    familyMetrics("reflog", ReadFamily::RefLog);
+    familyMetrics("manifest", ReadFamily::Manifest);
+    intake_timer->metric("cursor_resolves", intake_cursor_resolves);
+    intake_timer->metric("cursor_resolve_us", intake_cursor_resolve_ns / 1000);
     intake_timer.reset();   /// emits the `fold_ref_intake` row
 
     result.frontier_unprobed_budget = intake_unprobed_budget;
