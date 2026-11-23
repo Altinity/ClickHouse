@@ -45,6 +45,7 @@ namespace DB::ErrorCodes
     extern const int CAS_DELETE_MARKER;
     extern const int CORRUPTED_DATA;
     extern const int LOGICAL_ERROR;
+    extern const int MEMORY_LIMIT_EXCEEDED;
     extern const int NETWORK_ERROR;
     extern const int NOT_IMPLEMENTED;
     extern const int READONLY;
@@ -230,6 +231,12 @@ WriteResult withoutBody(WriteResult result)
     return result;
 }
 
+}
+
+bool isMemoryLimitExceeded(const std::exception & e)
+{
+    const auto * db = dynamic_cast<const Exception *>(&e);
+    return db && db->code() == ErrorCodes::MEMORY_LIMIT_EXCEEDED;
 }
 
 bool isDeterministicLocalFailure(int code)
@@ -563,7 +570,8 @@ void CasOperation::giveUpReadDeadline(std::string_view verb, const String & subj
                                         verb, subject, bound.lease_bound ? "lease" : "policy", attempts_made));
 }
 
-std::optional<Object> CasOperation::readUnder(const String & key, const Retry & policy, const Retry::Bound & bound)
+std::optional<Object> CasOperation::readUnder(
+    const String & key, const Retry & policy, const Retry::Bound & bound, OnMemoryLimit on_memory_limit)
 {
     return readLoop("read", key, policy, bound, [&](auto & access) -> std::optional<Object>
     {
@@ -571,7 +579,7 @@ std::optional<Object> CasOperation::readUnder(const String & key, const Retry & 
         if (!raw)
             return std::nullopt;
         return Object{std::move(raw->bytes), owner.mint(key, std::move(raw->value))};
-    });
+    }, on_memory_limit);
 }
 
 std::optional<Meta> CasOperation::headUnder(const String & key, const Retry & policy, const Retry::Bound & bound)
@@ -626,9 +634,9 @@ Removal CasOperation::removeUnder(const String & key, const String & expected_va
         "the bucket has object versioning enabled", key);
 }
 
-std::optional<Object> CasOperation::read(const String & key, const Retry & policy)
+std::optional<Object> CasOperation::read(const String & key, const Retry & policy, OnMemoryLimit on_memory_limit)
 {
-    return readUnder(key, policy, owner.bindPolicy(policy));
+    return readUnder(key, policy, owner.bindPolicy(policy), on_memory_limit);
 }
 
 std::optional<Meta> CasOperation::head(const String & key, const Retry & policy)

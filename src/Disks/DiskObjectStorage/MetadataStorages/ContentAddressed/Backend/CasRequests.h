@@ -62,6 +62,8 @@ bool isFirstAttemptFuseTimeout(const std::exception & e, size_t attempt_no);
 /// same failure and buries the root cause behind a retryable exception. The set is `LOGICAL_ERROR`,
 /// `NOT_IMPLEMENTED`, `BAD_ARGUMENTS` and `CORRUPTED_DATA`.
 bool isDeterministicLocalFailure(int code);
+/// A `MEMORY_LIMIT_EXCEEDED` raised by the memory tracker, whatever it was allocating for.
+bool isMemoryLimitExceeded(const std::exception & e);
 /// An exception the store or the transport raised, as opposed to a local fault.
 bool isStoreAnswer(const std::exception & e);
 /// `VERB key: refused|transport code message`; `code` is the store's error name when it sent one.
@@ -182,6 +184,9 @@ void recordFirstAttemptFuse();
 }
 
 class CasOperation;
+
+/// What a read does when an admitted attempt fails with `MEMORY_LIMIT_EXCEEDED`.
+enum class OnMemoryLimit : uint8_t { Reissue, Propagate };
 
 /// The only caller of `Backend`. It owns the three things a physical request must be measured
 /// against -- the transport, the mount fence, and the clock -- and it is the sole minter of
@@ -330,7 +335,10 @@ public:
     /// its running out of time is its own error and not the verb's retry-later give-up.
     bool oneAttemptFitsBefore(uint64_t deadline_ms) const;
 
-    std::optional<Object> read(const String & key, const Retry & policy);
+    /// `OnMemoryLimit::Propagate` makes a `MEMORY_LIMIT_EXCEEDED` from an admitted attempt escape at once: the
+    /// reader that hit its own memory limit gains nothing from the loop replaying the GET until the window ends.
+    /// Only a read that loads data for its caller may ask; settlement and maintenance reads keep reissuing.
+    std::optional<Object> read(const String & key, const Retry & policy, OnMemoryLimit on_memory_limit = OnMemoryLimit::Reissue);
     std::optional<Meta>   head(const String & key, const Retry & policy);
     ListPage               list(const String & prefix, const String & cursor, size_t limit, const Retry & policy);
     /// The store returns at most 1000 keys per request, and a page needs one key more than its size to prove
@@ -438,9 +446,10 @@ private:
     /// Returns whatever `once` returns, or throws -- the read surface reports failure by exception.
     template <typename Fn>
     auto readLoop(std::string_view verb, const String & subject, const Retry & policy,
-                  const Retry::Bound & bound, Fn && once);
+                  const Retry::Bound & bound, Fn && once, OnMemoryLimit on_memory_limit = OnMemoryLimit::Reissue);
 
-    std::optional<Object> readUnder(const String & key, const Retry & policy, const Retry::Bound & bound);
+    std::optional<Object> readUnder(const String & key, const Retry & policy, const Retry::Bound & bound,
+                                    OnMemoryLimit on_memory_limit = OnMemoryLimit::Reissue);
     std::optional<Meta>   headUnder(const String & key, const Retry & policy, const Retry::Bound & bound);
     ListPage               listUnder(const String & prefix, const String & cursor, size_t limit,
                                     const Retry & policy, const Retry::Bound & bound);
@@ -530,7 +539,7 @@ private:
 
 template <typename Fn>
 auto CasOperation::readLoop(std::string_view verb, const String & subject, const Retry & policy,
-                            const Retry::Bound & bound, Fn && once)
+                            const Retry::Bound & bound, Fn && once, OnMemoryLimit on_memory_limit)
 {
     bool refresh_attempted = false;
     uint64_t attempt_started_ms = 0;
@@ -562,6 +571,8 @@ auto CasOperation::readLoop(std::string_view verb, const String & subject, const
         {
             if (observer.on_failure && verb == "read" && isStoreAnswer(e))
                 observer.on_failure("GET", subject, e);
+            if (on_memory_limit == OnMemoryLimit::Propagate && isMemoryLimitExceeded(e))
+                throw;
             bool refreshed = false;
             if (refreshAndClassifyReadFault(e, refresh_attempted, refreshed))
                 throw;

@@ -381,8 +381,9 @@ public:
     Removal dropRefExact(const PartRefKey & key, const Cas::ManifestRef & expected);
     /// Test seams inside a rename: each runs once right before the named step, so a test can inject a
     /// racing writer there. `republishRef` publishes the destination, then drops the source; `moveRefExact`
-    /// appends the Move.
-    enum class TestHook : uint8_t { BeforeDestinationPublish, BeforeSourceDrop, BeforeMoveAppend, Count };
+    /// appends the Move. `FollowerJoined` runs in a cold view build that found another build of the same
+    /// key in flight, right before it waits for that build's outcome.
+    enum class TestHook : uint8_t { BeforeDestinationPublish, BeforeSourceDrop, BeforeMoveAppend, FollowerJoined, Count };
     void setHookForTest(TestHook hook, std::function<void()> fn) { hooks_for_test[static_cast<size_t>(hook)] = std::move(fn); }
     /// Drops all refs in a namespace and removes every retained view belonging to that namespace.
     void dropNamespace(const Cas::RootNamespace & ns);
@@ -422,8 +423,8 @@ private:
     /// nullptr <=> retention disabled (cache_bytes == 0): same call graph, no retained map.
     std::unique_ptr<ViewCache> view_cache;
 
-    /// Single-flight per PartRefKey for the build path: concurrent cold builders of the same key
-    /// share ONE readManifestShared. NEVER held across I/O — the map only hands out futures.
+    /// Single-flight per PartRefKey and resolved manifest for the build path: concurrent cold builders of the
+    /// same manifest of one key share ONE readManifestShared. NEVER held across I/O — the map only hands out futures.
     mutable std::mutex inflight_mutex;
     mutable std::unordered_map<String, std::shared_future<std::shared_ptr<const PartFolderView>>> inflight;
 
@@ -431,6 +432,8 @@ private:
     /// fresh modes perform their own read.
     std::shared_ptr<const PartFolderView> buildView(
         const PartRefKey & key, const Cas::Resolved & resolved, Freshness freshness) const;
+    /// The retained view of `cache_key` if it was built from `manifest_id`, otherwise nullptr.
+    std::shared_ptr<const PartFolderView> retainedView(const String & cache_key, const Cas::ManifestId & manifest_id) const;
     /// Removes a retained view and records the invalidation for diagnostics.
     void eraseView(const PartRefKey & key);
     std::array<std::function<void()>, static_cast<size_t>(TestHook::Count)> hooks_for_test;

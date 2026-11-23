@@ -51,9 +51,11 @@ namespace DB::ErrorCodes
 {
 extern const int ABORTED;
 extern const int BAD_ARGUMENTS;
+extern const int CANNOT_ALLOCATE_MEMORY;
 extern const int CAS_DELETE_MARKER;
 extern const int CORRUPTED_DATA;
 extern const int LOGICAL_ERROR;
+extern const int MEMORY_LIMIT_EXCEEDED;
 extern const int S3_ERROR;
 extern const int NETWORK_ERROR;
 }
@@ -73,6 +75,8 @@ using DB::Cas::tests::FakeClock;
 using DB::Cas::tests::expectBytes;
 using DB::Cas::tests::expectThrowsCode;
 using DB::Cas::tests::expectThrowsCodeWithMessage;
+using DB::Cas::tests::JournalVerb;
+using DB::Cas::tests::messageOf;
 
 namespace
 {
@@ -2042,6 +2046,107 @@ TEST(CASRequests, ADeterministicLocalFailureSurfacesUnchangedWithoutAReissue)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)op.read("k", Retry::standard()); });
     EXPECT_EQ(backend->getTotal(), 1u);
     EXPECT_TRUE(clock.sleeps.empty());
+}
+
+namespace
+{
+
+std::exception_ptr memoryLimitFault()
+{
+    return std::make_exception_ptr(DB::Exception(
+        DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED, "Query memory limit exceeded: would use 1.22 MiB"));
+}
+
+}
+
+TEST(CASRequests, AReadThatAsksPropagatesTheMemoryLimitWithoutAnotherAttempt)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    orThrow(op.create("k", "v", Retry::standard()), "create");
+    backend->resetCounts();
+    backend->failNextReadWith("k", memoryLimitFault());
+    const auto reissues_before = ProfileEvents::global_counters[ProfileEvents::CASRequestReissue];
+
+    const String message = messageOf(DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED, [&]
+    {
+        (void)op.read("k", Retry::standard(), OnMemoryLimit::Propagate);
+    });
+
+    EXPECT_EQ(message, "Query memory limit exceeded: would use 1.22 MiB");
+    EXPECT_EQ(backend->getTotal(), 1u);
+    EXPECT_TRUE(clock.sleeps.empty());
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestReissue] - reissues_before, 0u);
+}
+
+TEST(CASRequests, AReadThatDoesNotAskStillReissuesTheMemoryLimit)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    orThrow(op.create("k", "v", Retry::standard()), "create");
+    backend->resetCounts();
+    backend->failNextReadWith("k", memoryLimitFault());
+
+    const auto seen = op.read("k", Retry::standard());
+
+    ASSERT_TRUE(seen.has_value());
+    EXPECT_EQ(seen->bytes, "v");
+    EXPECT_EQ(backend->getTotal(), 2u);
+    EXPECT_EQ(clock.sleeps.size(), 1u);
+}
+
+TEST(CASRequests, AReadThatAsksStillReissuesEveryOtherFault)
+{
+    const std::vector<std::exception_ptr> faults{
+        std::make_exception_ptr(Poco::TimeoutException("the read timed out")),
+        std::make_exception_ptr(DB::Exception(DB::ErrorCodes::CANNOT_ALLOCATE_MEMORY, "mmap failed")),
+    };
+    for (const auto & fault : faults)
+    {
+        FakeClock clock;
+        auto backend = std::make_shared<CountingBackend>();
+        auto requests = makeRequests(backend, clock);
+        auto op = requests.admit();
+        orThrow(op.create("k", "v", Retry::standard()), "create");
+        backend->resetCounts();
+        backend->failNextReadWith("k", fault);
+
+        const auto seen = op.read("k", Retry::standard(), OnMemoryLimit::Propagate);
+
+        ASSERT_TRUE(seen.has_value());
+        EXPECT_EQ(seen->bytes, "v");
+        EXPECT_EQ(backend->getTotal(), 2u);
+        EXPECT_EQ(clock.sleeps.size(), 1u);
+    }
+}
+
+/// A write settles a refused precondition by reading the occupant; that read keeps reissuing.
+TEST(CASRequests, ASettlingReadThatRunsOutOfMemoryStillReadsTheOccupant)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    orThrow(op.create("k", "old", Retry::standard()), "create");
+    backend->clearJournal();
+    backend->failNextReadWith("k", memoryLimitFault());
+
+    WriteResult result = op.create("k", "new", Retry::standard());
+
+    const auto * conflict = std::get_if<Conflict>(&result);
+    ASSERT_NE(conflict, nullptr);
+    const auto * occupant = std::get_if<Object>(&conflict->seen);
+    ASSERT_NE(occupant, nullptr);
+    EXPECT_EQ(occupant->bytes, "old");
+    const auto journal = backend->journal();
+    ASSERT_EQ(journal.size(), 3u);
+    EXPECT_EQ(journal[0].verb, JournalVerb::Write);
+    EXPECT_EQ(journal[1].verb, JournalVerb::Read);
+    EXPECT_EQ(journal[2].verb, JournalVerb::Read);
 }
 
 TEST(CASRequests, ATransportTimeoutIsReissuedAndALocalFailureIsNot)

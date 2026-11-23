@@ -34,6 +34,7 @@
 
 namespace DB::ErrorCodes
 {
+extern const int MEMORY_LIMIT_EXCEEDED;
 extern const int BAD_ARGUMENTS;
 extern const int CORRUPTED_DATA;
 extern const int INVALID_STATE;
@@ -4759,6 +4760,37 @@ TEST(CASFsckScoped, NamespacePrefixChecksOnlyMatchingRefsDanglingOnly)
     /// manifest bodies — zero in this clean setup, legitimately nonzero on a churned pool.
     EXPECT_EQ(scoped.unreachable, 0u);
     EXPECT_EQ(scoped.pending_gc + scoped.awaiting_gc + scoped.unaccounted, 0u);
+}
+
+/// A memory-limit fault on a manifest read is reissued by the fsck walk, so the dangle behind it is
+/// still recorded instead of the namespace being skipped as unchecked.
+TEST(CASFsckScoped, AMemoryLimitOnACommittedManifestReadStillRecordsTheDangle)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"nsa"};
+    const ManifestRef r_a = ref(1, 0xA1);
+    const ManifestRef r_other = ref(1, 0xB1);
+    /// A valid body that describes `r_other`, stored where the committed ref names `r_a`.
+    PartManifest body;
+    body.ref = r_other;
+    body.root_namespace_id = ns;
+    body.payload_digest = computePayloadDigest(body);
+    {
+        OperationForTest op(*backend);
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(
+            store->layout().manifestKey(ManifestId{ns, r_a}),
+            sealObject(FormatId::PartManifest, encodePartManifest(body)), Retry::standard())));
+    }
+    const uint64_t sequence = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r_a);
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, sequence});
+    backend->failNextReadWith(store->layout().manifestKey(ManifestId{ns, r_a}), std::make_exception_ptr(
+        DB::Exception(DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED, "Query memory limit exceeded")));
+
+    const auto scoped = DB::Cas::runFsck(*store, false, {}, {}, false, /*namespace_prefix=*/"nsa");
+
+    EXPECT_EQ(scoped.dangling, 1u);
+    EXPECT_EQ(scoped.unchecked, 0u);
 }
 
 /// B207: the ref-walk and the HEAD-confirm run minutes apart with no snapshot. A ref that gets

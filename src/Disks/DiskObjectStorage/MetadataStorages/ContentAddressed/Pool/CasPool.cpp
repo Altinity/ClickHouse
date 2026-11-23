@@ -1971,9 +1971,9 @@ PartWriteTxnPtr Pool::beginPartWrite(PartWriteInfo info)
 
 /// The manifest read path (readManifest / readManifestShared / locate) + its decode cache live in
 /// the `manifest_reader` component (Pool/CasManifestReader.h); these are thin delegates.
-std::shared_ptr<const PartManifest> Pool::readManifestShared(const ManifestId & id)
+std::shared_ptr<const PartManifest> Pool::readManifestShared(const ManifestId & id, OnMemoryLimit on_memory_limit)
 {
-    return manifest_reader.readManifestShared(id);
+    return manifest_reader.readManifestShared(id, on_memory_limit);
 }
 
 PartManifest Pool::readManifest(const ManifestId & id)

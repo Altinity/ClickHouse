@@ -664,7 +664,8 @@ public:
     /// Identical to `readManifest` (same fail-closed validation, same decode cache) but returns the
     /// SHARED immutable decode the manifest cache holds — no per-call copy. The wiring read path
     /// uses this variant.
-    std::shared_ptr<const PartManifest> readManifestShared(const ManifestId & id);
+    std::shared_ptr<const PartManifest> readManifestShared(
+        const ManifestId & id, OnMemoryLimit on_memory_limit = OnMemoryLimit::Reissue);
     BlobLocation locate(const ManifestEntry & entry) const;       /// Blob placement only
     std::map<String, Resolved> listRefs(const RootNamespace & ns);
     /// Pure existence probe: whether any committed ref name starts with `prefix`, without
