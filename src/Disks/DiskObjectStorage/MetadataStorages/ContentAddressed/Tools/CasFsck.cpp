@@ -382,8 +382,7 @@ std::optional<RefTableState> walkRefStream(
         /// leaves a life the confirmation cut no longer names. No exception is built for it, because the destructor
         /// of a `CORRUPTED_DATA` logs an error whether or not anyone catches it.
         verdicts.recordUnchecked(report, ns, layout.namespaceStreamPrefix(life),
-            "fsck could not examine this namespace: CAS recovery grounding: a Live or Removing namespace requires a "
-            "readable _ckpt with life_epoch");
+            "fsck could not examine this namespace: " + String(kRecoveryGroundingNoCkptMessage));
         return std::nullopt;
     }
     for (size_t restarts = 0;; ++restarts)
@@ -458,6 +457,12 @@ std::optional<RefTableState> walkRefStream(
             return std::nullopt;
         }
     }
+}
+
+String staleEdgeNote(uint64_t edges)
+{
+    return "all " + std::to_string(edges) + " source edges name manifests that no longer exist — unreclaimable by the "
+           "incremental GC (needs `cas-gc-rebuild`); NOT expected, investigate";
 }
 
 /// Counts one check the scan could not make, of an intent or of the GC snapshot, and keeps the first reason, shortened.
@@ -597,6 +602,8 @@ void classifyIntents(CasOperation & op, const Layout & layout, bool verify, bool
 struct GcSnapshotView
 {
     bool have_state = false;
+    /// The snapshot generation `gc/state` adopts; a round never lowers it.
+    uint64_t snap_generation = 0;
     /// `gc/state`, the seal it names and every run of it were read, and every run passed the checks a round applies.
     bool complete = false;
     uint64_t gc_shards = 1;
@@ -609,6 +616,8 @@ struct GcSnapshotView
     /// Every `pending` row, `wanted` or not: GC deletes its body when its own cut shows no reference, so a reference
     /// committed after that cut does not stop the delete.
     std::unordered_map<BlobRef, CondemnedRow, BlobRefHash> pending_rows;
+    /// The seals and runs refused under a `gc/state` that had not moved since, each with its reason.
+    std::vector<std::pair<String, String>> confirmed_refusals;
 
     bool speaksFor(const BlobRef & ref) const
     {
@@ -641,6 +650,7 @@ GcSnapshotAttempt readGcSnapshotOnce(CasOperation & op, const Layout & layout, c
     attempt.state_token = state_got->etag;
     view.have_state = true;
     const GcState gc_state = decodeGcState(state_got->bytes);
+    view.snap_generation = gc_state.snap_generation;
     try
     {
         requireGenerationFourGcState(gc_state);
@@ -727,11 +737,20 @@ GcSnapshotAttempt readGcSnapshotOnce(CasOperation & op, const Layout & layout, c
         if (const auto & refusal = reader.refusal())
         {
             view.unread_shards.insert(shard);
-            attempt.refusals.emplace_back(refusal->run_key, refusal->message);
+            /// A shard with no run has no run key; the shard itself identifies the finding.
+            attempt.refusals.emplace_back(
+                refusal->run_key.empty() ? fmt::format("{}#shard-{}", seal_key, shard) : refusal->run_key, refusal->message);
         }
     }
     view.complete = attempt.refusals.empty();
     return attempt;
+}
+
+void recordCorruptedRun(FsckReport & report, const String & key, const String & reason, bool detail)
+{
+    ++report.corrupted_runs;
+    if (detail)
+        report.objects.push_back(FsckObject{.key = key, .cls = FsckClass::CorruptedRun, .reachable_from = {reason}});
 }
 
 /// Reads `gc/state`, the adopted fold seal and every source-edge run of it, once each. A seal or run a GC round refuses
@@ -772,11 +791,8 @@ GcSnapshotView readGcSnapshot(CasOperation & op, const Layout & layout, const st
         if (!moved)
         {
             for (const auto & [key, reason] : attempt.refusals)
-            {
-                ++report.corrupted_runs;
-                if (detail)
-                    report.objects.push_back(FsckObject{.key = key, .cls = FsckClass::CorruptedRun, .reachable_from = {reason}});
-            }
+                recordCorruptedRun(report, key, reason, detail);
+            attempt.view.confirmed_refusals = std::move(attempt.refusals);
             return std::move(attempt.view);
         }
         if (attempt_no == kAdoptedSnapshotReadAttempts)
@@ -800,7 +816,7 @@ String retiredNote(const CondemnedRow & row)
         + ": the deletion intent is not confirmed yet; GC creates it in a later round (expected)";
 }
 
-/// `PendingWithoutIntent` is a suspect: a finding once a second read of `gc/state` agrees.
+/// `PendingWithoutIntent` is a suspect: a finding once a second snapshot read agrees.
 struct PendingVerdict
 {
     FsckClass cls = FsckClass::PendingGc;
@@ -1479,7 +1495,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
     }
 
     /// A `pending` row over a present body of its token whose intent is absent. Each is confirmed against a
-    /// second read of `gc/state` below: a round may have committed since the first.
+    /// second snapshot read below (`gc/state`, its seal and the runs): a round may have committed since the first.
     struct PendingSuspect
     {
         String key;
@@ -1489,6 +1505,16 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         bool referenced = false;   /// a ref names the body: kept out of the backlog counts
     };
     std::vector<PendingSuspect> suspects;
+    /// A stale edge is provisional until the second snapshot read below still holds one of its edges: a round that
+    /// committed after the first read folds them and deletes the manifest bodies they name. It is counted and
+    /// listed only once confirmed.
+    struct StaleCandidate
+    {
+        FsckObject row;
+        BlobRef ref;
+        std::vector<UInt128> sources;
+    };
+    std::vector<StaleCandidate> stale_candidates;
     /// The `pending` rows the scan of present bodies classified.
     std::unordered_set<BlobRef, BlobRefHash> pending_rows_checked;
 
@@ -1574,9 +1600,11 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
 
             if (all_edges_stale)
             {
-                cls = FsckClass::StaleEdge;
-                note = "all " + std::to_string(stale_edges) + " source edges name manifests that no longer "
-                       "exist — unreclaimable by the incremental GC (needs `cas-gc-rebuild`); NOT expected, investigate";
+                stale_candidates.push_back(StaleCandidate{
+                    FsckObject{.key = bkey, .kind = ObjectKind::Blob, .size = sz, .cls = FsckClass::StaleEdge,
+                               .reachable_from = {staleEdgeNote(stale_edges)}},
+                    hash, unref_edge_sources.at(hash)});
+                continue;
             }
             else
             {
@@ -1602,7 +1630,6 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             case FsckClass::PendingTokenRejected: ++report.pending_token_rejected; break;
             case FsckClass::StandingPresent:      ++report.standing_present; break;
             case FsckClass::AwaitingGc:  ++report.awaiting_gc;  break;
-            case FsckClass::StaleEdge:   ++report.stale_edge;   break;
             default:                     ++report.unaccounted;  break;
         }
         if (detail)
@@ -1647,13 +1674,64 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                 .reachable_from = {std::move(verdict.note)}});
     }
 
+    /// One second snapshot read (`gc/state`, its seal and the runs) confirms both the `pending` suspects and the
+    /// stale-edge candidates.
+    GcSnapshotView reread;
+    if (!suspects.empty() || !stale_candidates.empty())
+    {
+        std::unordered_set<BlobRef, BlobRefHash> reread_refs;
+        for (const PendingSuspect & suspect : suspects)
+            reread_refs.insert(suspect.ref);
+        for (const StaleCandidate & candidate : stale_candidates)
+            reread_refs.insert(candidate.ref);
+        FsckReport reread_report;   /// only its confirmed refusals are findings, merged below
+        reread = readGcSnapshot(op, layout, reread_refs, /*detail=*/!stale_candidates.empty(), on_progress, deadline, reread_report);
+        std::unordered_set<String> refused_keys;
+        for (const auto & [key, _] : snapshot.confirmed_refusals)
+            refused_keys.insert(key);
+        for (const auto & [key, reason] : reread.confirmed_refusals)
+            if (refused_keys.insert(key).second)
+                recordCorruptedRun(report, key, reason, detail);
+    }
+    /// A recreated `gc/state` holds no edge although no round folded one.
+    const bool reread_regressed = reread.have_state && reread.snap_generation < snapshot.snap_generation;
+
+    for (StaleCandidate & candidate : stale_candidates)
+    {
+        /// Only a snapshot that speaks for the candidate's shard can show its edges folded.
+        if (!reread.have_state || !reread.speaksFor(candidate.ref) || reread_regressed)
+        {
+            const String why = reread_regressed
+                ? fmt::format("went from snapshot generation {} back to {}", snapshot.snap_generation, reread.snap_generation)
+                : String("did not cover this blob's shard");
+            countIntentUnread(report, "inconclusive: the blob of " + candidate.row.key + " carries only stale edges, and the second read of "
+                "the GC snapshot " + why + ", so whether a GC round folded them is unknown");
+            candidate.row.cls = FsckClass::IntentUnread;
+            candidate.row.reachable_from = {"every source edge names an absent manifest; inconclusive: the second read of the GC snapshot "
+                                            + why};
+            report.objects.push_back(std::move(candidate.row));
+            continue;
+        }
+        /// A real stale edge is never folded, so any source still held in the re-read is one.
+        uint64_t still_held = 0;
+        if (const auto held = reread.edge_sources.find(candidate.ref); held != reread.edge_sources.end())
+        {
+            const std::unordered_set<UInt128, UInt128Hash> held_ids(held->second.begin(), held->second.end());
+            for (const UInt128 & source : candidate.sources)
+                still_held += held_ids.contains(source);
+        }
+        if (!still_held)
+        {
+            ++report.stale_edge_superseded;
+            continue;
+        }
+        ++report.stale_edge;
+        candidate.row.reachable_from = {staleEdgeNote(still_held)};
+        report.objects.push_back(std::move(candidate.row));
+    }
+
     if (!suspects.empty())
     {
-        std::unordered_set<BlobRef, BlobRefHash> suspect_refs;
-        for (const PendingSuspect & suspect : suspects)
-            suspect_refs.insert(suspect.ref);
-        FsckReport reread_report;   /// the run checksums were judged by the first read
-        const GcSnapshotView reread = readGcSnapshot(op, layout, suspect_refs, false, on_progress, deadline, reread_report);
         for (const PendingSuspect & suspect : suspects)
         {
             FsckObject o{.key = suspect.key, .kind = ObjectKind::Blob, .size = suspect.size, .cls = FsckClass::PendingWithoutIntent, .reachable_from = {}};
@@ -1882,6 +1960,7 @@ constexpr std::array kFsckFields{
     FsckField{"awaiting_gc", "awaiting_gc", 4, fsckCount<&FsckReport::awaiting_gc>},
     FsckField{"unaccounted", "unaccounted", 5, fsckCount<&FsckReport::unaccounted>},
     FsckField{"stale_edge", "stale_edge", 6, fsckCount<&FsckReport::stale_edge>},
+    FsckField{"stale_edge_superseded", "", 0, fsckCount<&FsckReport::stale_edge_superseded>},
     FsckField{"corrupted_runs", "corrupted_runs", 7, fsckCount<&FsckReport::corrupted_runs>},
     FsckField{"chain_broken", "chain_broken", 8, fsckCount<&FsckReport::chain_broken>},
     FsckField{"lifeless_keys", "lifeless_keys", 10, fsckCount<&FsckReport::lifeless_keys>},

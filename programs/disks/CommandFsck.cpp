@@ -268,8 +268,8 @@ public:
         if (report.intent_unread > 0)
             throw Exception(
                 ErrorCodes::BAD_ARGUMENTS,
-                "cas-fsck: {} read(s) of a deletion intent or of its body failed, so the intents could not be checked; "
-                "first failure: {}",
+                "cas-fsck: {} check(s) could not be completed (a deletion intent, its body or the GC snapshot could not be "
+                "read), so the pool could not be fully checked; first failure: {}",
                 report.intent_unread, report.intent_unread_reason);
         /// `pending` is the one GC state a body is deleted from without re-reading the intent.
         if (report.pending_without_intent > 0)

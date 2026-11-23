@@ -1660,6 +1660,65 @@ TEST(CASFsck, ResidualEdgeNamingAnAbsentManifestClassifiesStaleEdge)
     EXPECT_TRUE(saw);
 }
 
+/// A GC round commits between fsck's read of `gc/state` and its manifest pass: it folds the drop and deletes the
+/// manifest body, so the blob of the older snapshot names an absent manifest. That is the round at work, not a
+/// stale edge.
+TEST(CASFsck, EdgeFoldedByARoundDuringTheManifestPassIsSupersededNotStale)
+{
+    auto backend = std::make_shared<MutateOnFirstGetBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xA1);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    const ManifestId id = writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    const uint64_t publish_sequence = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, publish_sequence});
+    Gc gc(store, hexToU128("00000000000000000000000000000001"));
+    gc.runRegularRound();
+    const uint64_t drop_sequence = dropRefTransition(*backend, store->layout(), ns, "tbl", r);
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, drop_sequence});
+    bool round_ran = false;
+    backend->armOnFirstGet(store->layout().manifestKey(id), [&]
+    {
+        gc.runRegularRound();
+        round_ran = true;
+    });
+
+    const FsckReport rep = runFsck(*store, /*detail*/true);
+
+    ASSERT_TRUE(round_ran) << "the manifest pass read the body, so the round ran inside the scan";
+    EXPECT_EQ(rep.stale_edge, 0u);
+    EXPECT_EQ(rep.stale_edge_superseded, 1u);
+    EXPECT_TRUE(rep.clean());
+    for (const FsckObject & o : rep.objects)
+        EXPECT_NE(o.cls, FsckClass::StaleEdge) << o.key;
+}
+
+/// Control: with no round in between, the same blob is a stale edge and the superseded count stays zero.
+TEST(CASFsck, EdgeStillHeldInTheRereadStateIsReportedStale)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xA1);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    const ManifestId id = writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    const uint64_t publish_sequence = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, publish_sequence});
+    Gc gc(store, hexToU128("00000000000000000000000000000001"));
+    gc.runRegularRound();
+    const uint64_t drop_sequence = dropRefTransition(*backend, store->layout(), ns, "tbl", r);
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, drop_sequence});
+    deleteManifestBody(*backend, store->layout(), id);
+    gc.runRegularRound();   /// a round that cannot fold the edge: its manifest is gone
+
+    const FsckReport rep = runFsck(*store, /*detail*/true);
+
+    EXPECT_EQ(rep.stale_edge, 1u);
+    EXPECT_EQ(rep.stale_edge_superseded, 0u);
+    EXPECT_FALSE(rep.clean());
+}
+
 /// GC never ran on the pool: nothing is classifiable through the GC view — everything unreferenced
 /// is AwaitingGc ("GC has not run yet"), never a false Unaccounted alarm.
 TEST(CASFsck, GcNeverRanClassifiesAwaitingGc)
@@ -2468,6 +2527,7 @@ struct FsckGcFixture
     std::unique_ptr<Gc> gc;
     RootNamespace ns{"00/aa@cas@"};
     ManifestRef manifest = ref(1, 0xA1);
+    ManifestId manifest_id;
 
     explicit FsckGcFixture(uint64_t create_budget = 0, std::initializer_list<uint64_t> blobs = {1}, uint64_t gc_shards = 1)
     {
@@ -2481,7 +2541,7 @@ struct FsckGcFixture
             writeBlobBody(*backend, store->layout(), numberedBlobHash(b));
             entries.push_back(blobEntryFor("f" + std::to_string(b), numberedBlobHash(b)));
         }
-        writeManifestRaw(*backend, store->layout(), ns, manifest, entries);
+        manifest_id = writeManifestRaw(*backend, store->layout(), ns, manifest, entries);
         const uint64_t publish_sequence = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, manifest);
         writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, publish_sequence});
         gc = std::make_unique<Gc>(store, hexToU128("00000000000000000000000000000001"));
@@ -3210,6 +3270,374 @@ TEST(CASFsck, BlobsOfARefusedShardAreNotExamined)
     EXPECT_EQ(rep.unaccounted, 0u) << formatFsckSummary(rep);
     EXPECT_EQ(countVerdictsAtKey(rep, f.bodyKey(in_shard[1]), FsckClass::Unchecked), 1u);
     EXPECT_EQ(countVerdictsAtKey(rep, f.bodyKey(in_shard[0]), FsckClass::PendingGc), 1u) << "positive control: shard 0 was read";
+}
+
+namespace
+{
+const RootNamespace kBaitNs{"00/bb@cas@"};
+
+/// Committed refs over numbered blobs on a pool whose GC rounds the test runs itself.
+struct StaleEdgeFixture
+{
+    std::shared_ptr<MutateOnFirstGetBackend> backend = std::make_shared<MutateOnFirstGetBackend>();
+    PoolPtr store;
+    Gc gc;
+    uint64_t next_ref = 1;
+
+    explicit StaleEdgeFixture(uint64_t gc_shards = 1)
+        : store(Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_shards = gc_shards}))
+        , gc(store, hexToU128("00000000000000000000000000000001"))
+    {
+    }
+    struct Published
+    {
+        RootNamespace ns;
+        ManifestRef manifest;
+        ManifestId id;
+    };
+    std::map<String, Published> refs;
+
+    const Layout & layout() const { return store->layout(); }
+    String bodyKey(uint64_t b) const { return layout().blobKey(blobRefOf(b)); }
+    String manifestKeyOf(const String & name) const { return layout().manifestKey(refs.at(name).id); }
+
+    void checkpointThrough(const RootNamespace & ns, uint64_t sequence)
+    {
+        writeFsckCheckpoint(*backend, layout(), ns, RefTxnId{1, sequence});
+    }
+
+    /// A namespace holding a real stale edge keeps GC from folding anything beside it, so a round that has to fold
+    /// another ref's drop needs a namespace of its own.
+    void publish(const String & name, std::initializer_list<uint64_t> blobs, const RootNamespace & ns = RootNamespace{"00/aa@cas@"})
+    {
+        std::vector<ManifestEntry> entries;
+        for (const uint64_t b : blobs)
+        {
+            if (!objectPresent(*backend, bodyKey(b)))
+                writeBlobBody(*backend, layout(), numberedBlobHash(b));
+            entries.push_back(blobEntryFor("f" + std::to_string(b), numberedBlobHash(b)));
+        }
+        const ManifestRef manifest = ref(next_ref, 0xA0 + next_ref);
+        ++next_ref;
+        const ManifestId id = writeManifestRaw(*backend, layout(), ns, manifest, entries);
+        checkpointThrough(ns, publishCommittedTransition(*backend, layout(), ns, name, std::nullopt, manifest));
+        refs[name] = {ns, manifest, id};
+    }
+
+    void drop(const String & name)
+    {
+        const Published & p = refs.at(name);
+        checkpointThrough(p.ns, dropRefTransition(*backend, layout(), p.ns, name, p.manifest));
+    }
+
+    void removeManifestBody(const String & name) { deleteManifestBody(*backend, layout(), refs.at(name).id); }
+
+    /// Runs `mutation` at the first read of the named manifest's body: the scan's manifest pass, after its first `gc/state` read.
+    void armDuringManifestPass(const String & name, std::function<void()> mutation)
+    {
+        backend->armOnFirstGet(manifestKeyOf(name), std::move(mutation));
+    }
+
+    String gcStateBytes() const
+    {
+        OperationForTest op(*backend);
+        return (*op).read(layout().gcStateKey(), Retry::standard())->bytes;
+    }
+
+    /// A round, with proof that it committed a new `gc/state`.
+    void roundThatMovesTheState()
+    {
+        const String before = gcStateBytes();
+        gc.runRegularRound();
+        ASSERT_NE(before, gcStateBytes()) << "the round did not commit";
+    }
+
+    /// Removes the runs the adopted seal names, of every shard or of `shard` only, and returns their keys.
+    std::vector<String> removeAdoptedRuns(std::optional<uint64_t> shard = {})
+    {
+        const GcState state = decodeGcState(gcStateBytes());
+        OperationForTest op(*backend);
+        const auto seal = (*op).read(layout().foldSealKey(state.snap_generation, state.snap_attempt), Retry::standard());
+        std::vector<String> removed;
+        for (const RunRef & run : decodeFoldSeal(seal->bytes, state.snap_generation).blob_target_runs)
+            if (!shard || run.shard == *shard)
+            {
+                removeFsckFixtureKey(*backend, run.key);
+                removed.push_back(run.key);
+            }
+        return removed;
+    }
+
+    /// Replaces `gc/state` with a fresh one at snapshot generation zero, as a state recreated from nothing.
+    void recreateGcStateAtGenerationZero()
+    {
+        OperationForTest op(*backend);
+        const auto current = (*op).read(layout().gcStateKey(), Retry::standard());
+        GcState fresh;
+        fresh.gc_shards = decodeGcState(current->bytes).gc_shards;
+        ASSERT_TRUE(std::holds_alternative<Committed>(
+            (*op).replace(layout().gcStateKey(), encodeGcState(fresh), current->etag, Retry::once())));
+    }
+};
+
+/// The first blob numbers from 1 up that fall in each of `shards` GC shards.
+std::vector<uint64_t> firstBlobOfEachShard(uint64_t shards)
+{
+    std::vector<uint64_t> in_shard(shards, 0);
+    for (uint64_t b = 1, found = 0; found < shards; ++b)
+        if (!in_shard[blobShard(blobRefOf(b), shards)])
+        {
+            in_shard[blobShard(blobRefOf(b), shards)] = b;
+            ++found;
+        }
+    return in_shard;
+}
+}
+
+/// A round that commits between the scan's two `gc/state` reads cannot fold an edge whose manifest body is
+/// already gone: the edge is still held by the second read and is reported.
+TEST(CASFsck, RealStaleEdgeSurvivesARoundBetweenTheTwoReads)
+{
+    StaleEdgeFixture f;
+    f.publish("live", {2});
+    f.publish("stale", {1});
+    f.publish("bait", {2}, kBaitNs);   /// shares blob 2 with `live`, so its drop leaves no candidate of its own
+    f.gc.runRegularRound();
+    f.drop("stale");
+    f.drop("bait");
+    f.removeManifestBody("stale");
+    bool round_ran = false;
+    f.armDuringManifestPass("bait", [&]
+    {
+        f.roundThatMovesTheState();
+        round_ran = true;
+    });
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true);
+
+    ASSERT_TRUE(round_ran) << "the manifest pass read the bait body";
+    EXPECT_EQ(rep.stale_edge, 1u);
+    EXPECT_EQ(rep.stale_edge_superseded, 0u);
+    EXPECT_EQ(countVerdictsAtKey(rep, f.bodyKey(1), FsckClass::StaleEdge), 1u);
+    EXPECT_FALSE(rep.clean());
+}
+
+/// Of two candidates only the one whose edge the round folded is superseded; the other is reported. A round holds
+/// back body deletes while a stale edge exists, so the test removes the folded ref's body itself.
+TEST(CASFsck, OnlyTheCandidateTheRoundFoldedIsSuperseded)
+{
+    StaleEdgeFixture f;
+    f.publish("live", {2});
+    f.publish("stale", {1});
+    f.publish("bait", {3}, kBaitNs);
+    f.gc.runRegularRound();
+    f.drop("stale");
+    f.drop("bait");
+    f.removeManifestBody("stale");
+    bool round_ran = false;
+    f.armDuringManifestPass("bait", [&]
+    {
+        f.roundThatMovesTheState();
+        f.removeManifestBody("bait");
+        round_ran = true;
+    });
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true);
+
+    ASSERT_TRUE(round_ran);
+    EXPECT_EQ(rep.stale_edge, 1u);
+    EXPECT_EQ(rep.stale_edge_superseded, 1u);
+    EXPECT_EQ(countVerdictsAtKey(rep, f.bodyKey(1), FsckClass::StaleEdge), 1u);
+    EXPECT_EQ(countVerdictsAtKey(rep, f.bodyKey(3), FsckClass::StaleEdge), 0u);
+}
+
+/// A blob with two source edges, one folded by the round and one not: the held edge is reported, and only it is counted.
+TEST(CASFsck, CandidateWithSomeSourcesFoldedIsReportedForTheHeldOnes)
+{
+    StaleEdgeFixture f;
+    f.publish("stale", {1});
+    f.publish("bait", {1}, kBaitNs);
+    f.gc.runRegularRound();
+    f.drop("stale");
+    f.drop("bait");
+    f.removeManifestBody("stale");
+    bool round_ran = false;
+    f.armDuringManifestPass("bait", [&]
+    {
+        f.roundThatMovesTheState();
+        f.removeManifestBody("bait");
+        round_ran = true;
+    });
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true);
+
+    ASSERT_TRUE(round_ran);
+    EXPECT_EQ(rep.stale_edge, 1u);
+    EXPECT_EQ(rep.stale_edge_superseded, 0u);
+    EXPECT_TRUE(anyNoteContains(rep, FsckClass::StaleEdge, "all 1 source edges")) << "only the held source is listed";
+    EXPECT_FALSE(rep.clean());
+}
+
+/// The second read cannot speak for the candidate's shard: whether a round folded the edge is unknown, which is a
+/// hard `intent_unread`, not a stale edge and not a superseded one.
+TEST(CASFsck, UnreadableRereadOfTheCandidatesShardIsIntentUnread)
+{
+    StaleEdgeFixture f;
+    f.publish("live", {2});
+    f.publish("stale", {1});
+    f.publish("bait", {3}, kBaitNs);
+    f.gc.runRegularRound();
+    f.drop("stale");
+    f.drop("bait");
+    f.removeManifestBody("stale");
+    bool runs_removed = false;
+    f.armDuringManifestPass("bait", [&]
+    {
+        f.removeAdoptedRuns();
+        runs_removed = true;
+    });
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true);
+
+    ASSERT_TRUE(runs_removed);
+    EXPECT_EQ(rep.stale_edge, 0u);
+    EXPECT_EQ(rep.stale_edge_superseded, 0u);
+    EXPECT_EQ(rep.intent_unread, 1u);
+    EXPECT_EQ(countVerdictsAtKey(rep, f.bodyKey(1), FsckClass::IntentUnread), 1u);
+    EXPECT_FALSE(rep.clean());
+}
+
+/// A run that stays unreadable in one shard is that shard's own finding; a real stale edge in another shard is still
+/// reported.
+TEST(CASFsck, StaleEdgeInAReadShardIsReportedBesideARefusedShard)
+{
+    constexpr uint64_t shards = 2;
+    uint64_t in_shard[shards] = {0, 0};
+    for (uint64_t b = 1; !in_shard[0] || !in_shard[1]; ++b)
+        if (!in_shard[blobShard(blobRefOf(b), shards)])
+            in_shard[blobShard(blobRefOf(b), shards)] = b;
+    FsckGcFixture f(/*create_budget=*/0, {in_shard[0], in_shard[1]}, shards);
+    f.drop();
+    deleteManifestBody(*f.backend, f.store->layout(), f.manifest_id);
+    for (const RunRef & run : adoptedRunsOf(f))
+        if (run.shard == 1)
+            removeFsckFixtureKey(*f.backend, run.key);
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true);
+
+    EXPECT_EQ(rep.corrupted_runs, 1u) << formatFsckSummary(rep);
+    EXPECT_EQ(rep.stale_edge, 1u) << formatFsckSummary(rep);
+    EXPECT_EQ(rep.intent_unread, 0u) << formatFsckSummary(rep);
+    EXPECT_EQ(countVerdictsAtKey(rep, f.bodyKey(in_shard[0]), FsckClass::StaleEdge), 1u);
+    EXPECT_EQ(countVerdictsAtKey(rep, f.bodyKey(in_shard[1]), FsckClass::Unchecked), 1u);
+}
+
+/// A deadline that passes during the second read leaves the candidate unconfirmed: a partial report counts no stale
+/// edge and shows no row for it.
+TEST(CASFsck, DeadlineDuringTheRereadLeavesNoUnconfirmedStaleEdge)
+{
+    FsckGcFixture f;
+    f.drop();
+    deleteManifestBody(*f.backend, f.store->layout(), f.manifest_id);
+    const FsckReport control = runFsck(*f.store, /*detail=*/true);
+    ASSERT_EQ(control.stale_edge, 1u) << "positive control: the edge is stale without a deadline";
+
+    OperationForTest op(*f.backend);
+    const GcState state = decodeGcState((*op).read(f.store->layout().gcStateKey(), Retry::standard())->bytes);
+    const String seal_key = f.store->layout().foldSealKey(state.snap_generation, state.snap_attempt);
+    const auto clock = VirtualRetryClock::installOn(f.store);
+    const ToolDeadline deadline = fsckDeadlineIn(*f.store, std::chrono::seconds(1));
+    bool fired = false;
+    f.backend->beforeRead(seal_key, /*skip=*/1, [&]
+    {
+        clock->advance(2000);
+        fired = true;
+    });
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true, {}, deadline, /*partial_on_deadline=*/true);
+
+    ASSERT_TRUE(fired) << "the second read of the seal never ran";
+    EXPECT_TRUE(rep.partial);
+    EXPECT_EQ(rep.stale_edge, 0u);
+    EXPECT_EQ(countVerdictsAtKey(rep, f.bodyKey(1), FsckClass::StaleEdge), 0u);
+}
+
+/// A round between the two reads folds the candidate in one shard, and a run of the other shard is then missing: the
+/// re-read confirms that refusal under a `gc/state` that did not move, so it is a finding of the scan.
+TEST(CASFsck, RunRefusalConfirmedByTheRereadIsReported)
+{
+    const std::vector<uint64_t> in_shard = firstBlobOfEachShard(2);
+    StaleEdgeFixture f(/*gc_shards=*/2);
+    f.publish("live", {in_shard[1]});
+    f.publish("bait", {in_shard[0]}, kBaitNs);
+    f.gc.runRegularRound();
+    f.drop("bait");
+    std::vector<String> removed;
+    f.armDuringManifestPass("bait", [&]
+    {
+        f.roundThatMovesTheState();
+        removed = f.removeAdoptedRuns(/*shard=*/1);
+    });
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true);
+
+    ASSERT_EQ(removed.size(), 1u) << "the round's seal names one run of shard 1";
+    EXPECT_EQ(rep.stale_edge_superseded, 1u) << "positive control: the re-read ran and folded the candidate";
+    EXPECT_EQ(rep.corrupted_runs, 1u) << formatFsckSummary(rep);
+    EXPECT_EQ(countVerdictsAtKey(rep, removed.front(), FsckClass::CorruptedRun), 1u);
+    EXPECT_FALSE(rep.clean());
+}
+
+/// A run both reads refuse is one finding: counted once and listed once.
+TEST(CASFsck, RunRefusedByBothReadsIsCountedOnce)
+{
+    const std::vector<uint64_t> in_shard = firstBlobOfEachShard(2);
+    FsckGcFixture f(/*create_budget=*/0, {in_shard[0], in_shard[1]}, /*gc_shards=*/2);
+    f.drop();
+    deleteManifestBody(*f.backend, f.store->layout(), f.manifest_id);
+    std::vector<String> removed;
+    for (const RunRef & run : adoptedRunsOf(f))
+        if (run.shard == 1)
+        {
+            removeFsckFixtureKey(*f.backend, run.key);
+            removed.push_back(run.key);
+        }
+    ASSERT_EQ(removed.size(), 1u);
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true);
+
+    EXPECT_EQ(rep.stale_edge, 1u) << "positive control: the stale candidate made the scan re-read the snapshot";
+    EXPECT_EQ(rep.corrupted_runs, 1u) << formatFsckSummary(rep);
+    EXPECT_EQ(countVerdictsAtKey(rep, removed.front(), FsckClass::CorruptedRun), 1u);
+}
+
+/// `gc/state` recreated at generation zero between the two reads holds no edge, yet no round folded the candidate's:
+/// the re-read went backwards, so the candidate is inconclusive, not superseded.
+TEST(CASFsck, RereadOfARegressedStateLeavesTheCandidateInconclusive)
+{
+    StaleEdgeFixture f;
+    f.publish("live", {2});
+    f.publish("stale", {1});
+    f.publish("bait", {2}, kBaitNs);
+    f.gc.runRegularRound();
+    f.drop("stale");
+    f.drop("bait");
+    f.removeManifestBody("stale");
+    bool recreated = false;
+    f.armDuringManifestPass("bait", [&]
+    {
+        f.recreateGcStateAtGenerationZero();
+        recreated = true;
+    });
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true);
+
+    ASSERT_TRUE(recreated) << "the manifest pass read the bait body";
+    EXPECT_EQ(rep.stale_edge_superseded, 0u);
+    EXPECT_EQ(rep.stale_edge, 0u);
+    EXPECT_EQ(rep.intent_unread, 1u) << formatFsckSummary(rep);
+    EXPECT_EQ(countVerdictsAtKey(rep, f.bodyKey(1), FsckClass::IntentUnread), 1u);
+    EXPECT_FALSE(rep.clean());
 }
 
 /// The capability probe's scratch object under `blob-intents/_probe/` is not an intent and no finding.

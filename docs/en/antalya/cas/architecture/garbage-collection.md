@@ -1209,7 +1209,8 @@ outcome `standing`, and `corrupt_decode` for a body `GC` cannot decode (see
 `cas-fsck` separates `dangling` — referenced but missing, i.e. data loss — from the
 present-but-unreferenced family. The latter is reported as one `unreachable` total, broken down into
 `pending_gc` (already in the retired pipeline, deletion scheduled), `awaiting_gc` (the drop is not
-folded yet, or `GC` never ran), `unaccounted` (absent from the whole `GC` view) and pre-precommit
+folded yet, or `GC` never ran), `stale_edge_superseded` (a round that committed during the scan folded the
+edges that looked stale), `unaccounted` (absent from the whole `GC` view) and pre-precommit
 manifest debris. `pending_gc` and `awaiting_gc` are ordinary backlog; `unaccounted` that persists
 across rounds is an anomaly; and two further classes are hard findings rather than backlog:
 `stale_edge` (every remaining source edge on the blob names a missing manifest, so incremental

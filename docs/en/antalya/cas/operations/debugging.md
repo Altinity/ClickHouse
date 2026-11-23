@@ -273,7 +273,7 @@ one column that means data loss — `unreachable`, `pending_gc`, and `awaiting_g
 moving through the normal intent, body-delete and intent-delete rounds, not a problem on their own.
 `chain_broken`, `corrupted_runs`, `lifeless_keys`, `intent_malformed`, `intent_unread` and `pending_without_intent` are the other hard findings. `chain_broken` is a ref-log stream
 whose chain ends below a log listed above that end, or whose snapshot base, records or links are corrupt
-while `_ckpt` is unchanged. `corrupted_runs` is a GC source-edge run or fold seal that a `GC` round refuses as corrupt; under `--detail` its row names the key and the reason. `unchecked` means the scan could not prove or
+while `_ckpt` is unchanged. `corrupted_runs` is a GC source-edge run or fold seal that a `GC` round refuses as corrupt; under `--detail` its row names the finding and the reason. A refused shard that has no run is named `<seal key>#shard-N`: only the part before `#` is an object key for `cas-inspect`. `unchecked` means the scan could not prove or
 refute a finding, for example because the checkpoint changed during the scan; rerun `fsck` and treat only
 a repeat as a finding. This summary-only form has
 no per-object `--detail` equivalent yet — for that, the offline `cas-fsck --detail` below is still

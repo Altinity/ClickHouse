@@ -141,6 +141,9 @@ struct FsckReport
     /// `FsckClass::StaleEdge`). Populated only in `detail` mode: naming the live sources costs one GET
     /// per manifest body, which the summary path does not pay.
     uint64_t stale_edge = 0;
+    /// Stale-edge candidates that a later read of the GC snapshot no longer shows: a GC round committed after the
+    /// scan's first read and folded all their edges. Counted apart and not a finding, so the report stays clean.
+    uint64_t stale_edge_superseded = 0;
 
     /// Deletion intents under `blob-intents/` (see the `Intent*` classes of `FsckClass`). `intent_malformed`
     /// and `intent_unread` are hard findings; the others are informational. A scan with a namespace scope
