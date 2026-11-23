@@ -169,6 +169,19 @@ jobs:
           aws s3 mv "${DEST_URL}/packages/AMD_PACKAGES/clickhouse" "${DEST_URL}/packages/AMD_PACKAGES/amd64-bin/clickhouse"
           aws s3 mv "${DEST_URL}/packages/AMD_PACKAGES/clickhouse-stripped" "${DEST_URL}/packages/AMD_PACKAGES/amd64-bin/clickhouse-stripped"
 
+      - name: Copy ppc64le binary
+        run: |
+          src="${SRC_URL}/build_ppc64le/clickhouse"
+          dest="${DEST_URL}/packages/PPC_PACKAGES/ppc64le-bin/clickhouse"
+          if err=$(aws s3 cp --no-progress "$src" "$dest" 2>&1); then
+            echo "$err"
+          elif echo "$err" | grep -q -e '404' -e 'Not Found' -e 'does not exist'; then
+            echo "No ppc64le binary at ${src}; skipping"
+          else
+            echo "$err"
+            exit 1
+          fi
+
       - name: Process AMD binaries
         if: ${{ env.NEEDS_BINARY_PROCESSING == 'true' }}
         run: |
@@ -273,6 +286,16 @@ jobs:
           fi
           if ! aws s3 sync "${DEST_URL}/packages/AMD_PACKAGES/" /home/runner/.cache/tmp/packages --exact-timestamps; then
             echo "Failed to download AMD packages"
+            exit 1
+          fi
+          ppc_src="${DEST_URL}/packages/PPC_PACKAGES/ppc64le-bin/clickhouse"
+          mkdir -p /home/runner/.cache/tmp/packages/ppc64le-bin
+          if err=$(aws s3 cp --no-progress "$ppc_src" /home/runner/.cache/tmp/packages/ppc64le-bin/clickhouse 2>&1); then
+            echo "$err"
+          elif echo "$err" | grep -q -e '404' -e 'Not Found' -e 'does not exist'; then
+            echo "No ppc64le binary at ${ppc_src}; skipping"
+          else
+            echo "$err"
             exit 1
           fi
         env:

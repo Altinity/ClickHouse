@@ -55,6 +55,20 @@
     - arm64/v{{ pkgver }}/clickhouse-stripped
   when: (pkgver | regex_replace('^(\\d+).*$', '\\1')) is version('24', '<')
 
+- name: Publish ppc64le binary
+  when: (pkgver | regex_replace('^(\\d+).*$', '\\1')) is version('24', '>=')
+  shell:
+    cmd: |
+      src=/home/runner/.cache/tmp/packages/ppc64le-bin/clickhouse
+      if [ ! -f "$src" ]; then
+        echo "No ppc64le binary; skipping"
+        exit 0
+      fi
+      dest={{ local_repo_path }}/{{ repo_prefix }}bin-repo/ppc64le/v{{ pkgver }}/self-extracting
+      mkdir -p "$dest"
+      mv "$src" "$dest/clickhouse"
+      echo $(sha512sum "$dest/clickhouse" | cut -d ' ' -f 1) >> "$dest/clickhouse.sha512"
+
 - name: Sync remaining repos between source and target
   shell: 'aws s3 sync --delete "{{ local_repo_path }}/{{ item }}" "{{ s3_repo_target_path }}/{{ item }}"'
   loop: "{{ bin_repos }}"
