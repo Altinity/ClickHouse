@@ -3,6 +3,8 @@
 #include "cas_test_helpers.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
+#include <IO/WriteHelpers.h>
+#include <Storages/System/StorageSystemContentAddressedMounts.h>
 #include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
 #include <Poco/Exception.h>
@@ -2787,6 +2789,27 @@ TEST(CASListMounts, NestedSridIsNotTruncated)
     ASSERT_EQ(mounts.size(), 1u);
     EXPECT_EQ(mounts[0].srid, "shard-01/replica-a");
     EXPECT_EQ(mounts[0].state, "live");
+}
+
+/// `system.cas_mounts.server_uuid` must read as the server's uuid file does. The halves differ, so
+/// reading the number as a `UUID` directly swaps them.
+TEST(CASListMounts, ServerUuidRendersAsTheUuidFile)
+{
+    const String uuid_file = "35578f40-9661-41c4-a18d-426eec6f5a16";
+    String hex = uuid_file;
+    std::erase(hex, '-');
+
+    auto backend = std::make_shared<InMemoryBackend>();
+    Layout layout("pool");
+    const uint64_t now_ms = 1'000'000;
+    const uint64_t ttl_ms = 10'000;
+    Ops ops(backend);
+    ASSERT_EQ(claimMount(ops.op, layout, "a", hexToU128(hex), /*our_epoch=*/1, now_ms, ttl_ms).kind,
+              MountClaimResult::Claimed);
+
+    auto mounts = listMounts(ops.op, layout, now_ms, /*skew_margin_ms=*/ttl_ms / 2);
+    ASSERT_EQ(mounts.size(), 1u);
+    EXPECT_EQ(DB::toString(DB::casServerIdToUuid(mounts[0].lease.server_uuid)), uuid_file);
 }
 
 /// "A fence costs an epoch": a same-(uuid, epoch) re-claim must NOT refresh a `gc_fenced` body in
