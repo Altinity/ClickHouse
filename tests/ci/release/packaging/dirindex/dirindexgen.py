@@ -46,8 +46,8 @@ def is_bin_repo_arch_folder(folder):
     Check if the folder is a bin-repo architecture folder that should use natural sorting.
     Matches patterns like: bin-repo/arm64, antalya-bin-repo/amd64, fips-bin-repo/arm64, etc.
     """
-    # Match folders ending with (bin-repo|antalya-bin-repo|fips-bin-repo|hotfix-bin-repo)/(arm64|amd64)
-    pattern = r'(bin-repo|antalya-bin-repo|fips-bin-repo|hotfix-bin-repo)/(arm64|amd64)$'
+    # Match folders ending with (bin-repo|antalya-bin-repo|fips-bin-repo|hotfix-bin-repo)/(arm64|amd64|ppc64le)
+    pattern = r'(bin-repo|antalya-bin-repo|fips-bin-repo|hotfix-bin-repo)/(arm64|amd64|ppc64le)$'
     return bool(re.search(pattern, folder))
 
 
