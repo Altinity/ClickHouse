@@ -502,23 +502,6 @@ std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
         bool /* allow_no_password */,
         bool /* allow_plaintext_password */) const
 {
-<<<<<<< HEAD
-    std::lock_guard lock(mutex);
-    auto id = memory_storage.find<User>(credentials.getUserName());
-    UserPtr user = id ? memory_storage.read<User>(*id) : nullptr;
-
-    const auto & token_credentials = typeid_cast<const TokenCredentials &>(credentials);
-
-    if (!external_authenticators.checkTokenCredentials(token_credentials, provider_name))
-    {
-        // Even though token itself may be valid (especially in case of a jwt token), authentication has just failed.
-        if (throw_if_user_not_exists)
-            throwNotFound(AccessEntityType::USER, credentials.getUserName(), getStorageName());
-
-        return {};
-    }
-
-=======
     std::unique_lock lock(mutex);
 
     /// Accept TokenCredentials (normal JWT login) and AlwaysAllowCredentials
@@ -542,7 +525,6 @@ std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
     auto id = memory_storage.find<User>(credentials.getUserName());
     UserPtr user = id ? memory_storage.read<User>(*id) : nullptr;
 
->>>>>>> ef37b91cc12 (Merge pull request #2114 from Altinity/fix/antalya-26.3/oauth-distr-queries)
     std::shared_ptr<User> new_user;
     if (!user)
     {
@@ -556,8 +538,6 @@ std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
     if (!isAddressAllowed(*user, address))
         throwAddressNotAllowed(address);
 
-<<<<<<< HEAD
-=======
     /// Interserver mode: TCPHandler already verified the cluster secret and is
     /// trusting `client_info.initial_user`.
     if (always_allow_credentials)
@@ -576,7 +556,7 @@ std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
         }
 
         if (id)
-            return AuthResult{ .user_id = *id, .authentication_data = AuthenticationData(AuthenticationType::JWT), .user_name = user->getName() };
+            return AuthResult{ .user_id = *id, .authentication_data = AuthenticationData(AuthenticationType::JWT) };
         return std::nullopt;
     }
 
@@ -590,9 +570,6 @@ std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
         return {};
     }
 
-    /// Pipeline: incoming group --(roles_mapping)--> mapped name --(roles_filter)--> kept/dropped --(roles_transform)--> CH role name.
-    /// Each stage is independent and optional; groups absent from `roles_mapping` pass through unchanged.
->>>>>>> ef37b91cc12 (Merge pull request #2114 from Altinity/fix/antalya-26.3/oauth-distr-queries)
     std::set<String> external_roles;
     if (roles_filter.has_value() && roles_filter.value().ok())
     {
