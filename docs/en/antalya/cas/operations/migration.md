@@ -278,7 +278,7 @@ that is already migrated runs M9 only.
 Writers read and `GC` writes under `<pool>/blob-intents/`. The credential of every server of the pool needs the
 rights listed under [deletion intents](/antalya/cas/bucket-requirements#deletion-intents).
 
-A writable mount, pool creation and the tool (at M1) prove these rights before they write anything, with one object
+A writable mount and pool creation (unless the disk sets `skip_access_check`) and the tool (at M1) prove these rights before they write anything, with one object
 under `<pool>/blob-intents/_probe/<128-bit hex>/intent`: an exact `GET` of the absent key, a `LIST` of one key of
 `blob-intents/` itself (the request `GC`'s sweep sends; a store may grant `LIST` by the exact prefix; not sent on local
 object storage, which has no such grants), a conditional

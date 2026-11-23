@@ -95,7 +95,7 @@ exact-token deletes and prune that earlier phases justified from *previously* pu
 already have run; they are idempotent): unapplied transactions and a cursor/apply mismatch (both
 `CORRUPTED_DATA`, checked between phases 10 and 11), a missing adopted seal, a table with a snapshot
 but no surviving log and no cursor, a non-total condemned summary (all `CORRUPTED_DATA`), and an
-observed delete marker (`LOGICAL_ERROR`: bucket versioning is on). The per-phase "fails the round
+observed delete marker (`CAS_DELETE_MARKER`: bucket versioning is on). The per-phase "fails the round
 if" lists below name the protocol checks; an uncaught backend or decode exception fails the round
 execution too.
 
@@ -493,7 +493,7 @@ forensic outcome logs. Body deletes, and the phase 10 `HEAD`s that decide them, 
   before its commit and the row keeps its state
 - **Fails the round if:** a body or intent delete is refused or unanswered (the affected rows stay as
   they were); a backend delete marker appears in a response — object versioning on a mis-provisioned
-  pool (`LOGICAL_ERROR`). A store that refuses the intent deletes, for example a credential without `DELETE` on
+  pool (`CAS_DELETE_MARKER`). A store that refuses the intent deletes, for example a credential without `DELETE` on
   `blob-intents/`, fails every round that must delete an intent
 - **Observability:** phase row `pending_deletes`; metrics `deleted`, `absent`, `bodies_deleted`,
   `intents_confirmed`, `replaced`, `spared`, `intents_deleted`, `jobs_scheduled`, `jobs_failed`,

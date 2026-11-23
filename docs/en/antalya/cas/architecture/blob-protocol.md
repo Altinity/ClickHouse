@@ -144,8 +144,8 @@ never by a bare digest — a bare digest is ambiguous once more than one algorit
 pool. `cas_blob_hash_allow_new` gates admitting a second algorithm into an already-populated pool's
 `algos_used` set; it defaults to off.
 
-`cityhash128` is not cryptographically collision-resistant. A pool shared across mutually
-untrusted writers should run `sha256` — CAS enforces no policy choice here; the operator picks
+`cityhash128` is not cryptographically collision-resistant. A pool whose users are mutually
+untrusted, and insert only through trusted servers, should run `sha256` — CAS enforces no policy choice here; the operator picks
 the threat model via `cas_blob_hash`. This is why the materialization gate is a `HEAD` (occupancy)
 rather than a body compare: it tells the writer *something* already claims this key, and the
 digest is the only claim CAS trusts.
