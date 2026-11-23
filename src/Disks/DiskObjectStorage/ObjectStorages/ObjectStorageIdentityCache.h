@@ -111,9 +111,9 @@ public:
     /// Advance the epoch and drop the entry. A fetch already in flight will not put the old identity back.
     void invalidate(const String & key);
 
-    /// Drop every entry and advance the epoch. Hides `CacheBase::clear` so a fetch in flight across the
-    /// drop cannot store afterwards.
-    void clear();
+    /// Drop every entry and advance the epoch. Overrides `CacheBase::clear`, so a call through a
+    /// `CacheBase` pointer also advances the epoch and a fetch in flight across the drop cannot store afterwards.
+    void clear() override;
 
 private:
     mutable std::mutex epoch_mutex;
