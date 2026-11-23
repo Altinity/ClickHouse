@@ -229,7 +229,8 @@ workflow = Workflow.Config(
         #     for job in JobConfigs.clickbench_jobs
         # ],
         # JobConfigs.llvm_coverage_job,
-        JobConfigs.promql_compliance_job,
+        # NOTE (strtgbb): baseline is only published by upstream master, so this has nothing to compare against
+        # JobConfigs.promql_compliance_job,
         # NOTE (strtgbb): Inc-only — needs AWS SSM CI logs cluster credentials
         # JobConfigs.build_profile_diff_job.set_allow_failure(),
         JobConfigs.sqllogic_test_master_job.set_run_after(
@@ -244,7 +245,6 @@ workflow = Workflow.Config(
             .set_name("Keeper Stress Tests (PR)")
             .set_timeout(3 * 3600),
         *JobConfigs.toolchain_build_jobs,
-        AltinityJobConfigs.source_upload_job,
     ],
     additional_jobs=["GrypeScan", "RegressionPR", "CIReport"],
     artifacts=[

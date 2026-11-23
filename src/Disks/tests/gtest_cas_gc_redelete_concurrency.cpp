@@ -30,7 +30,7 @@
 
 namespace ProfileEvents
 {
-extern const Event CASGCRetiredRedeleteFailed;
+extern const Event CASGCRetiredBodyDeleteFailed;
 }
 
 namespace DB::ErrorCodes
@@ -51,12 +51,6 @@ constexpr uint64_t kFaultedBlob = 3;
 constexpr uint64_t kReplacedBlob = 5;
 constexpr uint64_t kAbsentBlob = 4;
 constexpr uint64_t kShards = 4;
-
-DB::UInt128 blobHash(uint64_t blob)
-{
-    const DB::UInt128 value(blob);
-    return (value << 64) | value;
-}
 
 class WorkerFaultBackend : public InMemoryBackend
 {
@@ -125,19 +119,7 @@ private:
 class RedeleteDiagnosticsBackend : public InMemoryBackend
 {
 public:
-    std::set<String> blob_keys;
-    std::function<void(const String &)> read_blob_hook;
     std::function<void(const std::vector<RawConditionalRemove> &, TransportAccess &)> delete_chunk_hook;
-
-    std::optional<RawMeta> head(const String & key, TransportAccess & access) override
-    {
-        if (!read_blob_hook || !blob_keys.contains(key))
-            return InMemoryBackend::head(key, access);
-
-        SCOPE_EXIT({ LOG_WARNING(logger, "Test blob read finished"); });
-        read_blob_hook(key);
-        return InMemoryBackend::head(key, access);
-    }
 
     std::vector<RawBatchRemoveResult> removeManyByConditional(
         const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
@@ -145,7 +127,6 @@ public:
         if (!delete_chunk_hook)
             return InMemoryBackend::removeManyByConditional(removals, access);
 
-        LOG_WARNING(logger, "Test delete chunk started");
         SCOPE_EXIT({ LOG_WARNING(logger, "Test delete chunk finished"); });
         delete_chunk_hook(removals, access);
         return InMemoryBackend::removeManyByConditional(removals, access);
@@ -254,7 +235,7 @@ PoolPtr openPoolWithIoConcurrency(
 
 String blobKeyOf(const Pool & store, uint64_t blob)
 {
-    return store.layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(blobHash(blob))});
+    return store.layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(numberedBlobHash(blob))});
 }
 
 std::set<String> allBlobKeys(const Pool & store)
@@ -268,7 +249,7 @@ std::set<String> allBlobKeys(const Pool & store)
 bool allBlobsAbsent(Backend & backend, const Pool & store)
 {
     for (uint64_t b = 1; b <= kBlobs; ++b)
-        if (!blobAbsent(backend, store.layout(), blobHash(b)))
+        if (!blobAbsent(backend, store.layout(), numberedBlobHash(b)))
             return false;
     return true;
 }
@@ -280,15 +261,15 @@ void publishThenDrop(Backend & backend, const PoolPtr & store, Gc & gc)
     std::vector<ManifestEntry> entries;
     for (uint64_t b = 1; b <= kBlobs; ++b)
     {
-        writeBlobBody(backend, store->layout(), blobHash(b));
-        entries.push_back(blobEntryFor("f" + std::to_string(b), blobHash(b)));
+        writeBlobBody(backend, store->layout(), numberedBlobHash(b));
+        entries.push_back(blobEntryFor("f" + std::to_string(b), numberedBlobHash(b)));
     }
     writeManifestRaw(backend, store->layout(), ns, r, entries);
     publishCommittedTransition(backend, store->layout(), ns, "tbl", std::nullopt, r);
 
     runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
-    ASSERT_FALSE(blobAbsent(backend, store->layout(), blobHash(1)));
+    ASSERT_FALSE(blobAbsent(backend, store->layout(), numberedBlobHash(1)));
 
     dropRefTransition(backend, store->layout(), ns, "tbl", r);
 }
@@ -329,7 +310,8 @@ void collectOutcomeLogs(Backend & backend, std::map<String, std::vector<OutcomeR
 void runRedeleteScenario(uint64_t concurrency, RedeleteRun & out, uint64_t outcome_entry_budget = 0)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolWithIoConcurrency(backend, concurrency, 1, outcome_entry_budget);
+    backend->pinConditionalBatchDeleteSupport(true);
+    auto store = openPoolWithIoConcurrency(backend, concurrency, 1, outcome_entry_budget, {}, std::nullopt, 2);
     Gc gc(store, kGc);
     ASSERT_NO_FATAL_FAILURE(publishThenDrop(*backend, store, gc));
 
@@ -337,7 +319,7 @@ void runRedeleteScenario(uint64_t concurrency, RedeleteRun & out, uint64_t outco
     {
         const RoundReport rep = runRegularRoundReclaiming(gc);
         store->renewWatermarkOnce();
-        out.reports.push_back({rep.redeleted, rep.deleted, rep.absent, rep.replaced, rep.spared});
+        out.reports.push_back({rep.bodies_deleted, rep.deleted, rep.absent, rep.replaced, rep.spared});
         collectOutcomeLogs(*backend, out.outcome_logs);
     }
     ASSERT_TRUE(allBlobsAbsent(*backend, *store));
@@ -373,8 +355,8 @@ GcPhaseSink recordPendingDeletes(std::shared_ptr<PendingDeletesRows> rows, GcPha
 std::vector<Gc::PreviewEntry> previewPendingDeletes(Gc & gc)
 {
     std::vector<Gc::PreviewEntry> result;
-    for (Gc::PreviewEntry entry : gc.previewDeletes())
-        if (entry.reason == "delete_pending")
+    for (Gc::PreviewEntry entry : gc.previewDeletes().deletes)
+        if (entry.reason == "pending")
             result.push_back(std::move(entry));
     return result;
 }
@@ -406,71 +388,75 @@ TEST(CASGCRedeleteConcurrency, ParallelRedeleteReclaimsEveryBlob)
     {
         const RoundReport rep = runRegularRoundReclaiming(gc);
         store->renewWatermarkOnce();
-        redeleted += rep.redeleted;
+        redeleted += rep.bodies_deleted;
         deleted += rep.deleted;
-        redelete_failed += rep.redelete_failed;
+        redelete_failed += rep.body_delete_failed;
     }
 
     EXPECT_TRUE(allBlobsAbsent(*backend, *store));
     EXPECT_EQ(redeleted, kBlobs);
     EXPECT_EQ(deleted, kBlobs);
     EXPECT_EQ(redelete_failed, 0u);
-    EXPECT_EQ(rows->total("read_blob_jobs_scheduled"), kBlobs);
+    EXPECT_EQ(rows->total("jobs_scheduled"), kBlobs);
+    EXPECT_EQ(rows->total("jobs_failed"), 0u);
     EXPECT_EQ(rows->total("delete_chunk_jobs_scheduled"), kBlobs);
-    EXPECT_EQ(rows->total("read_blob_jobs_failed"), 0u);
-    EXPECT_EQ(rows->total("delete_chunk_jobs_failed"), 0u);
-    EXPECT_EQ(rows->total("read_blob_job_schedule_failures"), 0u);
-    EXPECT_EQ(rows->total("delete_chunk_job_schedule_failures"), 0u);
+    EXPECT_EQ(rows->total("delete_chunks"), kBlobs);
 }
 
 TEST(CASGCRedeleteConcurrency, ConditionalDeleteBatchesAreRecorded)
 {
-    auto backend = std::make_shared<InMemoryBackend>();
+    auto backend = std::make_shared<RedeleteDiagnosticsBackend>();
     backend->pinConditionalBatchDeleteSupport(true);
     auto store = openPoolWithIoConcurrency(backend, 4, 1, 0, {}, std::nullopt, 2);
     Gc gc(store, kGc);
-    publishThenDrop(*backend, store, gc);
+    ASSERT_NO_FATAL_FAILURE(publishThenDrop(*backend, store, gc));
     ASSERT_NO_FATAL_FAILURE(driveUntilAllGraduated(*backend, gc, store, kReplacedBlob));
+    const auto pending = previewPendingDeletes(gc);
+    ASSERT_EQ(pending.size(), kBlobs);
+
+    /// The fold skips a missing body in the middle. Pack the remaining five keys in fold order.
+    OperationForTest op(*backend);
+    const auto gone = (*op).head(pending[2].key, Retry::once());
+    ASSERT_TRUE(gone);
+    ASSERT_EQ((*op).remove(pending[2].key, gone->etag, Retry::once()), Removal::Removed);
+    using Request = std::vector<std::pair<String, String>>;
+    std::vector<Request> sent;
+    std::mutex mutex;
+    backend->delete_chunk_hook = [&](const std::vector<Backend::RawConditionalRemove> & removals, TransportAccess &)
+    {
+        Request request;
+        for (const auto & removal : removals)
+            request.emplace_back(removal.key, removal.expected_token);
+        std::lock_guard lock(mutex);
+        sent.push_back(std::move(request));
+    };
 
     auto rows = std::make_shared<PendingDeletesRows>();
     gc.setPhaseSink(recordPendingDeletes(rows));
-    const RoundReport rep = runRegularRoundReclaiming(gc);
-    store->renewWatermarkOnce();
-
-    EXPECT_EQ(rep.deleted, kBlobs);
+    const auto report = runRegularRoundReclaiming(gc);
+    EXPECT_EQ(report.deleted, kBlobs - 1);
+    EXPECT_EQ(report.absent, 0u);
     ASSERT_EQ(rows->rows.size(), 1u);
-    EXPECT_EQ(rows->total("read_blob_jobs_scheduled"), kBlobs);
-    EXPECT_EQ(rows->total("delete_chunk_jobs_scheduled"), 3u);
-    EXPECT_EQ(rows->total("delete_chunks"), 3u);
-    ASSERT_TRUE(rows->lastRowHas("read_blob_jobs_failed"));
-    EXPECT_EQ(rows->total("read_blob_jobs_failed"), 0u);
-    ASSERT_TRUE(rows->lastRowHas("delete_chunk_jobs_failed"));
-    EXPECT_EQ(rows->total("delete_chunk_jobs_failed"), 0u);
-    ASSERT_TRUE(rows->lastRowHas("read_blob_job_schedule_failures"));
-    EXPECT_EQ(rows->total("read_blob_job_schedule_failures"), 0u);
-    ASSERT_TRUE(rows->lastRowHas("delete_chunk_job_schedule_failures"));
-    EXPECT_EQ(rows->total("delete_chunk_job_schedule_failures"), 0u);
-}
+    const auto & metrics = rows->rows.front();
+    EXPECT_EQ(metrics.at("jobs_scheduled"), 3u);
+    EXPECT_EQ(metrics.at("jobs_failed"), 0u);
+    EXPECT_EQ(metrics.at("delete_chunk_jobs_scheduled"), 3u);
+    EXPECT_EQ(metrics.at("delete_chunk_jobs_failed"), 0u);
+    EXPECT_EQ(metrics.at("delete_chunk_job_schedule_failures"), 0u);
+    EXPECT_EQ(metrics.at("delete_chunks"), 3u);
 
-TEST(CASGCRedeleteConcurrency, DeleteWaveEnqueueRefusalWaitsForSubmittedChunks)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    backend->pinConditionalBatchDeleteSupport(true);
-    auto store = openPoolWithIoConcurrency(backend, 4, 1, 0, {}, kBlobs + 1, 2);
-    Gc gc(store, kGc);
-    publishThenDrop(*backend, store, gc);
-    ASSERT_NO_FATAL_FAILURE(driveUntilAllGraduated(*backend, gc, store, kReplacedBlob));
+    const auto pair = [&](size_t i) { return std::pair{pending[i].key, pending[i].token.value}; };
+    std::vector<Request> expected{{pair(0), pair(1)}, {pair(3), pair(4)}, {pair(5)}};
+    /// Workers may reach the backend in any order. Preserve the order within each request.
+    std::sort(sent.begin(), sent.end());
+    std::sort(expected.begin(), expected.end());
+    EXPECT_EQ(sent, expected);
 
-    RoundReport progress;
-    EXPECT_THROW(
-        gc.runRegularRound({}, /*allow_steal*/ true, UniversePolicy::Authoritative, &progress),
-        DB::Exception);
+    sent.clear();
     store->renewWatermarkOnce();
-
-    EXPECT_EQ(progress.redeleted, 2u);
-    EXPECT_EQ(progress.redelete_failed, 1u);
-    EXPECT_EQ(runRegularRoundReclaiming(gc).redeleted, kBlobs);
-    EXPECT_TRUE(allBlobsAbsent(*backend, *store));
+    runRegularRoundReclaiming(gc);
+    EXPECT_TRUE(sent.empty());
+    EXPECT_EQ(rows->rows.back().at("delete_chunks"), 0u);
 }
 
 TEST(CASGCRedeleteConcurrency, BlobDeletesActuallyOverlap)
@@ -513,19 +499,10 @@ TEST(CASGCRedeleteConcurrency, ConcurrencyOneDeletesSequentially)
     EXPECT_TRUE(allBlobsAbsent(*backend, *store));
     EXPECT_EQ(backend->blobRemoves(), kBlobs);
     EXPECT_EQ(backend->peakInFlight(), 1u);
-    ASSERT_TRUE(rows->lastRowHas("read_blob_jobs_scheduled"));
-    ASSERT_TRUE(rows->lastRowHas("delete_chunk_jobs_scheduled"));
-    EXPECT_EQ(rows->total("read_blob_jobs_scheduled"), 0u) << "concurrency 1 must not use the pool";
+    ASSERT_TRUE(rows->lastRowHas("jobs_scheduled"));
+    EXPECT_EQ(rows->total("jobs_scheduled"), 0u) << "concurrency 1 must not use the pool";
     EXPECT_EQ(rows->total("delete_chunk_jobs_scheduled"), 0u);
     EXPECT_EQ(rows->total("delete_chunks"), kBlobs);
-    ASSERT_TRUE(rows->lastRowHas("read_blob_jobs_failed"));
-    EXPECT_EQ(rows->total("read_blob_jobs_failed"), 0u);
-    ASSERT_TRUE(rows->lastRowHas("delete_chunk_jobs_failed"));
-    EXPECT_EQ(rows->total("delete_chunk_jobs_failed"), 0u);
-    ASSERT_TRUE(rows->lastRowHas("read_blob_job_schedule_failures"));
-    EXPECT_EQ(rows->total("read_blob_job_schedule_failures"), 0u);
-    ASSERT_TRUE(rows->lastRowHas("delete_chunk_job_schedule_failures"));
-    EXPECT_EQ(rows->total("delete_chunk_job_schedule_failures"), 0u);
 }
 
 TEST(CASGCRedeleteConcurrency, WorkerRemoveFaultKeepsSiblingOutcomesAndPoolAlive)
@@ -537,7 +514,7 @@ TEST(CASGCRedeleteConcurrency, WorkerRemoveFaultKeepsSiblingOutcomesAndPoolAlive
     ASSERT_NO_FATAL_FAILURE(driveUntilAllGraduated(*backend, gc, store, kFaultedBlob));
 
     backend->armRemoveFaults({blobKeyOf(*store, kFaultedBlob)});
-    const auto failed_before = ProfileEvents::global_counters[ProfileEvents::CASGCRetiredRedeleteFailed];
+    const auto failed_before = ProfileEvents::global_counters[ProfileEvents::CASGCRetiredBodyDeleteFailed];
     std::map<String, std::vector<OutcomeRow>> outcome_logs_before;
     collectOutcomeLogs(*backend, outcome_logs_before);
     RoundReport progress;
@@ -549,17 +526,18 @@ TEST(CASGCRedeleteConcurrency, WorkerRemoveFaultKeepsSiblingOutcomesAndPoolAlive
     EXPECT_EQ(outcome_logs_after.size(), outcome_logs_before.size());
     for (const auto & log : outcome_logs_after)
         EXPECT_TRUE(outcome_logs_before.contains(log.first)) << "the failed round wrote outcome log " << log.first;
-    EXPECT_EQ(progress.redeleted, kBlobs - 1);
+    EXPECT_EQ(progress.bodies_deleted, kBlobs - 1);
     expectBodiesPresentOnlyFor(*backend, *store, {kFaultedBlob});
 
     const RoundReport next = runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
 
     EXPECT_TRUE(backend->allFired()) << "the faulted blob delete never ran on a pool worker";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRetiredRedeleteFailed] - failed_before, 1u);
-    EXPECT_EQ(next.redeleted, kBlobs);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRetiredBodyDeleteFailed] - failed_before, 1u);
+    /// The bodies the failed round deleted read absent at the next delete HEAD: `standing`, no request.
+    EXPECT_EQ(next.bodies_deleted, 1u);
     EXPECT_EQ(next.deleted, 1u);
-    EXPECT_EQ(next.absent, kBlobs - 1);
+    EXPECT_EQ(next.absent, 0u);
     EXPECT_TRUE(allBlobsAbsent(*backend, *store));
 }
 
@@ -590,8 +568,8 @@ TEST(CASGCRedeleteConcurrency, SequentialWorkerFailureStillAttemptsLaterEntries)
 
     EXPECT_NE(message.find(first_preview_key), String::npos);
     EXPECT_TRUE(backend->allFired());
-    EXPECT_EQ(progress.redeleted, preview.size() - 1);
-    EXPECT_EQ(progress.redelete_failed, 1u);
+    EXPECT_EQ(progress.bodies_deleted, preview.size() - 1);
+    EXPECT_EQ(progress.body_delete_failed, 1u);
     EXPECT_EQ(failedCounter() - failed_before, 1u);
     for (size_t i = 1; i < preview.size(); ++i)
     {
@@ -627,11 +605,6 @@ TEST(CASGCRedeleteConcurrency, SameOutcomesAtConcurrencyOneAndFour)
 namespace
 {
 
-BlobRef blobRefOf(uint64_t blob)
-{
-    return BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(blobHash(blob))};
-}
-
 void driveUntilAllGraduated(Backend & backend, Gc & gc, const PoolPtr & store, uint64_t marked_blob)
 {
     bool graduated = false;
@@ -639,19 +612,18 @@ void driveUntilAllGraduated(Backend & backend, Gc & gc, const PoolPtr & store, u
     {
         const RoundReport rep = runRegularRoundReclaiming(gc);
         store->renewWatermarkOnce();
-        ASSERT_EQ(rep.redeleted, 0u) << "no delete may run before the replacement is in place";
-        graduated = rep.graduated == kBlobs;
+        ASSERT_EQ(rep.bodies_deleted, 0u) << "no delete may run before the replacement is in place";
+        graduated = rep.intent_confirmed == kBlobs;
     }
-    ASSERT_TRUE(graduated) << "the six blobs never became delete_pending together";
+    ASSERT_TRUE(graduated) << "the six blobs never became pending together";
 
-    OperationForTest op(backend);
-    ASSERT_TRUE((*op).head(store->layout().blobMetaKey(blobRefOf(marked_blob)), Retry::standard()).has_value())
-        << "the condemn marker must exist before the redelete round, or the meta assertion is vacuous";
+    const auto intent = intentKeyOfCurrentBody(backend, store->layout(), blobRefOf(marked_blob));
+    ASSERT_TRUE(intent && objectPresent(backend, *intent)) << "the intent must exist before the delete round";
 }
 
 void expectOnlyReplacedBlobSurvives(Backend & backend, const Pool & store, const RoundReport & rep)
 {
-    EXPECT_EQ(rep.redeleted, kBlobs);
+    EXPECT_EQ(rep.bodies_deleted, kBlobs);
     EXPECT_EQ(rep.deleted, kBlobs - 1);
     EXPECT_EQ(rep.replaced, 1u);
 
@@ -659,9 +631,7 @@ void expectOnlyReplacedBlobSurvives(Backend & backend, const Pool & store, const
     {
         OperationForTest op(backend);
         const bool body_present = (*op).head(blobKeyOf(store, b), Retry::standard()).has_value();
-        const bool meta_present = (*op).head(store.layout().blobMetaKey(blobRefOf(b)), Retry::standard()).has_value();
         EXPECT_EQ(body_present, b == kReplacedBlob) << "blob " << b;
-        EXPECT_EQ(meta_present, b == kReplacedBlob) << "meta of blob " << b;
     }
 
     std::map<String, std::vector<OutcomeRow>> logs;
@@ -706,9 +676,17 @@ TEST(CASGCRedeleteConcurrency, ReplacedBlobInsideParallelBatchSurvivesWhileSibli
             (*op).replace(blobKeyOf(*store, kReplacedBlob), current->bytes, current->etag, Retry::standard())));
     }
 
+    /// The replaced body is seen at its delete HEAD: its row moves to the new token and no delete is sent.
     const RoundReport rep = runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
-    expectOnlyReplacedBlobSurvives(*backend, *store, rep);
+    EXPECT_EQ(rep.bodies_deleted, kBlobs - 1);
+    EXPECT_EQ(rep.deleted, kBlobs - 1);
+    EXPECT_EQ(rep.replaced, 0u);
+    for (uint64_t b = 1; b <= kBlobs; ++b)
+    {
+        OperationForTest op(*backend);
+        EXPECT_EQ((*op).head(blobKeyOf(*store, b), Retry::standard()).has_value(), b == kReplacedBlob) << "blob " << b;
+    }
 }
 
 TEST(CASGCRedeleteConcurrency, BlobReplacedBetweenHeadAndDeleteSurvivesWhileSiblingsDelete)
@@ -755,7 +733,7 @@ TEST(CASGCRedeleteConcurrency, BlobReplacedBetweenHeadAndDeleteSurvivesWhileSibl
     expectOnlyReplacedBlobSurvives(*backend, *store, rep);
 }
 
-TEST(CASGCRedeleteConcurrency, BlobAlreadyAbsentInsideParallelBatchIsRecordedAbsent)
+TEST(CASGCRedeleteConcurrency, BlobAlreadyAbsentInsideParallelBatchGoesStanding)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolWithIoConcurrency(backend, 4);
@@ -770,18 +748,18 @@ TEST(CASGCRedeleteConcurrency, BlobAlreadyAbsentInsideParallelBatchIsRecordedAbs
         ASSERT_EQ((*op).remove(blobKeyOf(*store, kAbsentBlob), current->etag, Retry::standard()), Removal::Removed);
     }
 
+    /// The absent body is seen at its delete HEAD: its row goes `standing` and no delete is sent.
     const RoundReport rep = runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
-    EXPECT_EQ(rep.redeleted, kBlobs);
+    EXPECT_EQ(rep.bodies_deleted, kBlobs - 1);
     EXPECT_EQ(rep.deleted, kBlobs - 1);
-    EXPECT_EQ(rep.absent, 1u);
+    EXPECT_EQ(rep.absent, 0u);
     EXPECT_EQ(rep.replaced, 0u);
 
     for (uint64_t b = 1; b <= kBlobs; ++b)
     {
         OperationForTest op(*backend);
         EXPECT_FALSE((*op).head(blobKeyOf(*store, b), Retry::standard()).has_value()) << "blob " << b;
-        EXPECT_FALSE((*op).head(store->layout().blobMetaKey(blobRefOf(b)), Retry::standard()).has_value()) << "meta of blob " << b;
     }
 
     std::map<String, std::vector<OutcomeRow>> logs;
@@ -804,7 +782,7 @@ TEST(CASGCRedeleteConcurrency, BlobAlreadyAbsentInsideParallelBatchIsRecordedAbs
             }
         }
     }
-    EXPECT_EQ(absent_rows, 1u);
+    EXPECT_EQ(absent_rows, 0u) << "no delete was sent for the absent body, so it has no outcome row";
     EXPECT_EQ(deleted_rows, kBlobs - 1);
 }
 
@@ -813,20 +791,20 @@ namespace
 
 uint64_t failedCounter()
 {
-    return ProfileEvents::global_counters[ProfileEvents::CASGCRetiredRedeleteFailed];
+    return ProfileEvents::global_counters[ProfileEvents::CASGCRetiredBodyDeleteFailed];
 }
 
 void expectBodiesPresentOnlyFor(Backend & backend, const Pool & store, const std::set<uint64_t> & present)
 {
     for (uint64_t b = 1; b <= kBlobs; ++b)
-        EXPECT_EQ(blobAbsent(backend, store.layout(), blobHash(b)), !present.contains(b)) << "blob " << b;
+        EXPECT_EQ(blobAbsent(backend, store.layout(), numberedBlobHash(b)), !present.contains(b)) << "blob " << b;
 }
 
-struct RecordHookState
+struct ApplyHookState
 {
     std::atomic<bool> armed{false};
     BlobRef target{};
-    size_t recorded = 0;
+    size_t applied = 0;
 };
 
 }
@@ -873,25 +851,22 @@ TEST(CASGCRedeleteConcurrency, TwoWorkerFailuresAreEachCountedAndTheRoundThrowsO
     EXPECT_NE(message.find(first_fault_key), String::npos);
     EXPECT_TRUE(backend->allFired()) << "both faulted deletes must have run on pool workers";
     EXPECT_EQ(failedCounter() - failed_before, 2u);
-    EXPECT_EQ(progress.redeleted, kBlobs - 2);
-    EXPECT_EQ(progress.redelete_failed, 2u);
+    EXPECT_EQ(progress.bodies_deleted, kBlobs - 2);
+    EXPECT_EQ(progress.body_delete_failed, 2u);
     ASSERT_EQ(rows->rows.size(), 1u);
-    ASSERT_TRUE(rows->lastRowHas("delete_chunk_jobs_failed")) << "the phase metrics must survive the round's exception";
-    EXPECT_EQ(rows->total("read_blob_jobs_scheduled"), kBlobs);
-    EXPECT_EQ(rows->total("read_blob_jobs_failed"), 0u);
-    EXPECT_EQ(rows->total("delete_chunk_jobs_failed"), 2u);
-    EXPECT_EQ(rows->total("read_blob_job_schedule_failures"), 0u);
-    EXPECT_EQ(rows->total("delete_chunk_job_schedule_failures"), 0u);
+    ASSERT_TRUE(rows->lastRowHas("jobs_failed")) << "the phase metrics must survive the round's exception";
+    EXPECT_EQ(rows->total("jobs_scheduled"), kBlobs);
+    EXPECT_EQ(rows->total("jobs_failed"), 2u);
     expectBodiesPresentOnlyFor(*backend, *store, {kFaultedBlob, kReplacedBlob});
 
     const RoundReport next = runRegularRoundReclaiming(gc);
-    EXPECT_EQ(next.redeleted, kBlobs);
+    EXPECT_EQ(next.bodies_deleted, 2u);
     EXPECT_EQ(next.deleted, 2u);
-    EXPECT_EQ(next.absent, kBlobs - 2);
+    EXPECT_EQ(next.absent, 0u);
     EXPECT_TRUE(allBlobsAbsent(*backend, *store));
 }
 
-TEST(CASGCRedeleteConcurrency, FailuresAreReportedAfterTheirWaveAndRethrowLowestBlobIndex)
+TEST(CASGCRedeleteConcurrency, ChunkFailuresAreReportedAfterWorkersFinishAndRethrowInFoldOrder)
 {
     for (const uint64_t concurrency : {1, 4})
     {
@@ -900,27 +875,20 @@ TEST(CASGCRedeleteConcurrency, FailuresAreReportedAfterTheirWaveAndRethrowLowest
         backend->pinConditionalBatchDeleteSupport(true);
         auto store = openPoolWithIoConcurrency(backend, concurrency, 1, 0, {}, std::nullopt, 2);
         Gc gc(store, kGc);
-        publishThenDrop(*backend, store, gc);
+        ASSERT_NO_FATAL_FAILURE(publishThenDrop(*backend, store, gc));
         ASSERT_NO_FATAL_FAILURE(driveUntilAllGraduated(*backend, gc, store, kFaultedBlob));
-        const auto preview = previewPendingDeletes(gc);
-        ASSERT_EQ(preview.size(), kBlobs);
+        const auto pending = previewPendingDeletes(gc);
+        ASSERT_EQ(pending.size(), kBlobs);
 
-        /// Identical messages require the GC diagnostic to identify the operation itself.
-        const auto read_error = std::make_exception_ptr(std::runtime_error("injected job fault"));
-        const auto delete_error = std::make_exception_ptr(std::runtime_error("injected job fault"));
-        backend->blob_keys = allBlobKeys(*store);
-        backend->read_blob_hook = [&](const String & key)
-        {
-            if (key == preview.back().key)
-                std::rethrow_exception(read_error);
-        };
+        const auto first = std::make_exception_ptr(std::runtime_error("injected chunk fault"));
+        const auto last = std::make_exception_ptr(std::runtime_error("injected chunk fault"));
         backend->delete_chunk_hook = [&](const std::vector<Backend::RawConditionalRemove> & removals, TransportAccess &)
         {
-            if (removals.front().key == preview.front().key)
-            {
-                EXPECT_EQ(removals.size(), 2u);
-                std::rethrow_exception(delete_error);
-            }
+            ASSERT_EQ(removals.size(), 2u);
+            if (removals.front().key == pending.front().key)
+                std::rethrow_exception(first);
+            if (removals.back().key == pending.back().key)
+                std::rethrow_exception(last);
         };
 
         ScopedLogCapture capture("CasGc", "warning");
@@ -937,92 +905,85 @@ TEST(CASGCRedeleteConcurrency, FailuresAreReportedAfterTheirWaveAndRethrowLowest
         {
             error = std::current_exception();
         }
-        backend->read_blob_hook = {};
         backend->delete_chunk_hook = {};
+        EXPECT_EQ(error, first);
+        EXPECT_EQ(progress.bodies_deleted, 2u);
+        EXPECT_EQ(progress.body_delete_failed, 4u);
+        EXPECT_EQ(failedCounter() - failed_before, 4u);
+        ASSERT_EQ(rows->rows.size(), 1u);
+        const auto & metrics = rows->rows.front();
+        EXPECT_EQ(metrics.at("jobs_failed"), 4u);
+        EXPECT_EQ(metrics.at("delete_chunk_jobs_failed"), 2u);
+        EXPECT_EQ(metrics.at("delete_chunk_job_schedule_failures"), 0u);
+        EXPECT_EQ(metrics.at("delete_chunks"), 3u);
+        EXPECT_EQ(metrics.at("delete_chunk_jobs_scheduled"), concurrency == 1 ? 0u : 3u);
 
         const String log = capture.captured();
-        const size_t read_warning = log.find("CAS gc: read blob job failed");
-        const size_t delete_warning = log.find("CAS gc: delete chunk job failed");
-        ASSERT_NE(read_warning, String::npos);
-        ASSERT_NE(delete_warning, String::npos);
-        EXPECT_LT(log.rfind("Test blob read finished"), read_warning);
-        EXPECT_LT(read_warning, log.find("Test delete chunk started"));
-        EXPECT_LT(log.rfind("Test delete chunk finished"), delete_warning);
-        EXPECT_EQ(capture.count("CAS gc: read blob job failed"), 1u);
-        EXPECT_EQ(capture.count("CAS gc: delete chunk job failed"), 2u);
-        EXPECT_EQ(error, delete_error) << "the lower blob index wins even though its wave is logged later";
-        EXPECT_EQ(progress.redeleted, 3u);
-        EXPECT_EQ(progress.redelete_failed, 3u);
-        EXPECT_EQ(failedCounter() - failed_before, 3u);
-        EXPECT_EQ(rows->total("read_blob_jobs_failed"), 1u);
-        EXPECT_EQ(rows->total("delete_chunk_jobs_failed"), 1u);
-        EXPECT_EQ(rows->total("read_blob_job_schedule_failures"), 0u);
-        EXPECT_EQ(rows->total("delete_chunk_job_schedule_failures"), 0u);
-        EXPECT_EQ(rows->total("delete_chunks"), 3u);
-        EXPECT_EQ(rows->total("read_blob_jobs_scheduled"), concurrency == 1 ? 0u : kBlobs);
-        EXPECT_EQ(rows->total("delete_chunk_jobs_scheduled"), concurrency == 1 ? 0u : 3u);
-        EXPECT_EQ(previewPendingDeletes(gc).size(), kBlobs);
-        for (size_t i = 0; i < preview.size(); ++i)
+        ASSERT_EQ(capture.count("Test delete chunk finished"), 3u);
+        const auto warning = log.find("CAS gc: delete chunk job failed");
+        ASSERT_NE(warning, String::npos);
+        EXPECT_LT(log.rfind("Test delete chunk finished"), warning);
+        EXPECT_EQ(capture.count("CAS gc: delete chunk job failed"), 4u);
+        EXPECT_EQ(previewPendingDeletes(gc).size(), pending.size());
+        for (size_t i = 0; i < pending.size(); ++i)
         {
-            OperationForTest op(*backend);
-            EXPECT_EQ((*op).head(preview[i].key, Retry::once()).has_value(), i < 2 || i == 5);
+            const bool failed = i < 2 || i >= 4;
+            EXPECT_EQ(objectPresent(*backend, pending[i].key), failed);
+            EXPECT_EQ(log.find(pending[i].key, warning) != String::npos, failed) << pending[i].key;
         }
         store->renewWatermarkOnce();
-        EXPECT_EQ(runRegularRoundReclaiming(gc).redeleted, kBlobs);
+        EXPECT_EQ(runRegularRoundReclaiming(gc).deleted, 4u);
         EXPECT_TRUE(allBlobsAbsent(*backend, *store));
     }
 }
 
-TEST(CASGCRedeleteConcurrency, EnqueueFailuresIdentifyWaveAndUnscheduledBlobCount)
+TEST(CASGCRedeleteConcurrency, EnqueueRefusalDrainsSubmittedChunksAndReportsUnsubmittedBodies)
 {
-    struct Case
+    constexpr size_t chunk_size = 4;
+    for (const size_t refused_chunk : {0, 1})
     {
-        bool delete_wave;
-        size_t refused_job;
-        size_t deleted;
-        size_t unscheduled;
-        size_t read_blob_jobs_scheduled;
-        size_t delete_chunk_jobs_scheduled;
-    };
-    for (const Case test : {Case{false, 0, 0, 6, 0, 0}, Case{false, 3, 3, 3, 3, 0}, Case{true, 0, 0, 6, 6, 0}, Case{true, 1, 4, 2, 6, 1}})
-    {
-        SCOPED_TRACE(test.delete_wave);
-        SCOPED_TRACE(test.refused_job);
+        SCOPED_TRACE(refused_chunk);
         auto backend = std::make_shared<InMemoryBackend>();
         backend->pinConditionalBatchDeleteSupport(true);
-        const size_t refused_index = (test.delete_wave ? kBlobs : 0) + test.refused_job;
-        auto store = openPoolWithIoConcurrency(backend, 4, 1, 0, {}, refused_index, 4);
+        auto store = openPoolWithIoConcurrency(backend, 4, 1, 0, {}, refused_chunk, chunk_size);
         Gc gc(store, kGc);
-        publishThenDrop(*backend, store, gc);
+        ASSERT_NO_FATAL_FAILURE(publishThenDrop(*backend, store, gc));
         ASSERT_NO_FATAL_FAILURE(driveUntilAllGraduated(*backend, gc, store, kFaultedBlob));
+        const auto pending = previewPendingDeletes(gc);
+        ASSERT_EQ(pending.size(), kBlobs);
+        const size_t submitted = refused_chunk * chunk_size;
+        const size_t unsent = pending.size() - submitted;
 
         ScopedLogCapture capture("CasGc", "warning");
         auto rows = std::make_shared<PendingDeletesRows>();
         gc.setPhaseSink(recordPendingDeletes(rows));
-        const auto failed_before = failedCounter();
         RoundReport progress;
         expectThrowsCode(DB::ErrorCodes::CANNOT_SCHEDULE_TASK, [&]
         {
             gc.runRegularRound({}, /*allow_steal*/ true, UniversePolicy::Authoritative, &progress);
         });
-        EXPECT_EQ(capture.count(test.delete_wave
-            ? "CAS gc: scheduling delete chunk job failed" : "CAS gc: scheduling read blob job failed"), 1u);
-        EXPECT_NE(capture.captured().find(std::to_string(test.unscheduled) + (test.delete_wave
-            ? " blob deletions were not submitted" : " blob reads were not submitted")), String::npos);
-        EXPECT_EQ(progress.redeleted, test.deleted);
-        EXPECT_EQ(progress.redelete_failed, 1u);
-        EXPECT_EQ(failedCounter() - failed_before, 1u);
-        ASSERT_TRUE(rows->lastRowHas("read_blob_jobs_scheduled"));
-        ASSERT_TRUE(rows->lastRowHas("delete_chunk_jobs_scheduled"));
-        EXPECT_EQ(rows->total("read_blob_jobs_scheduled"), test.read_blob_jobs_scheduled);
-        EXPECT_EQ(rows->total("delete_chunk_jobs_scheduled"), test.delete_chunk_jobs_scheduled);
-        EXPECT_EQ(rows->total("read_blob_jobs_failed"), 0u);
-        EXPECT_EQ(rows->total("delete_chunk_jobs_failed"), 0u);
-        EXPECT_EQ(rows->total("read_blob_job_schedule_failures"), test.delete_wave ? 0u : 1u);
-        EXPECT_EQ(rows->total("delete_chunk_job_schedule_failures"), test.delete_wave ? 1u : 0u);
-        EXPECT_EQ(previewPendingDeletes(gc).size(), kBlobs);
+        const String log = capture.captured();
+        EXPECT_EQ(capture.count("CAS gc: scheduling delete chunk job failed"), 1u);
+        EXPECT_NE(log.find(pending[submitted].key), String::npos);
+        EXPECT_NE(log.find(std::to_string(unsent) + " re-delete entries were not submitted"), String::npos);
+        EXPECT_EQ(progress.bodies_deleted, submitted);
+        EXPECT_EQ(progress.body_delete_failed, 1u);
+        ASSERT_EQ(rows->rows.size(), 1u);
+        const auto & metrics = rows->rows.front();
+        EXPECT_EQ(metrics.at("jobs_failed"), 1u);
+        EXPECT_EQ(metrics.at("jobs_scheduled"), refused_chunk);
+        EXPECT_EQ(metrics.at("delete_chunk_jobs_scheduled"), refused_chunk);
+        EXPECT_EQ(metrics.at("delete_chunk_jobs_failed"), 0u);
+        EXPECT_EQ(metrics.at("delete_chunk_job_schedule_failures"), 1u);
+        EXPECT_EQ(metrics.at("delete_chunks"), refused_chunk);
+        EXPECT_EQ(previewPendingDeletes(gc).size(), pending.size());
+        for (size_t i = 0; i < pending.size(); ++i)
+            EXPECT_EQ(objectPresent(*backend, pending[i].key), i >= submitted) << pending[i].key;
+
         store->renewWatermarkOnce();
-        EXPECT_EQ(runRegularRoundReclaiming(gc).redeleted, kBlobs);
+        const auto next = runRegularRoundReclaiming(gc);
+        EXPECT_EQ(next.deleted, unsent);
+        EXPECT_EQ(next.absent, 0u);
         EXPECT_TRUE(allBlobsAbsent(*backend, *store));
     }
 }
@@ -1043,22 +1004,18 @@ TEST(CASGCRedeleteConcurrency, WorkerHeadFaultIsCountedAndRetriedNextRound)
     EXPECT_ANY_THROW(gc.runRegularRound({}, /*allow_steal*/ true, UniversePolicy::Authoritative, &progress));
     store->renewWatermarkOnce();
 
-    EXPECT_TRUE(backend->allFired()) << "the faulted HEAD must have run on a pool worker";
+    EXPECT_TRUE(backend->allFired()) << "the faulted HEAD must have run on a read-ahead worker";
     EXPECT_EQ(failedCounter() - failed_before, 1u);
-    EXPECT_EQ(progress.redeleted, kBlobs - 1);
-    EXPECT_EQ(progress.redelete_failed, 1u);
-    ASSERT_EQ(rows->rows.size(), 1u);
-    EXPECT_EQ(rows->total("read_blob_jobs_scheduled"), kBlobs);
-    EXPECT_EQ(rows->total("read_blob_jobs_failed"), 1u);
-    EXPECT_EQ(rows->total("delete_chunk_jobs_failed"), 0u);
-    EXPECT_EQ(rows->total("read_blob_job_schedule_failures"), 0u);
-    EXPECT_EQ(rows->total("delete_chunk_job_schedule_failures"), 0u);
-    expectBodiesPresentOnlyFor(*backend, *store, {kFaultedBlob});
+    /// The HEAD runs in the fold, so its failure ends the round before the delete batch starts.
+    EXPECT_EQ(progress.bodies_deleted, 0u);
+    EXPECT_EQ(progress.body_delete_failed, 1u);
+    EXPECT_TRUE(rows->rows.empty());
+    expectBodiesPresentOnlyFor(*backend, *store, {1, 2, 3, 4, 5, 6});
 
     const RoundReport next = runRegularRoundReclaiming(gc);
-    EXPECT_EQ(next.redeleted, kBlobs);
-    EXPECT_EQ(next.deleted, 1u);
-    EXPECT_EQ(next.absent, kBlobs - 1);
+    EXPECT_EQ(next.bodies_deleted, kBlobs);
+    EXPECT_EQ(next.deleted, kBlobs);
+    EXPECT_EQ(next.absent, 0u);
     EXPECT_TRUE(allBlobsAbsent(*backend, *store));
 }
 
@@ -1103,20 +1060,20 @@ TEST(CASGCRedeleteConcurrency, SchedulingFailureAttemptsNothingAndTheNextRoundRe
 
     ASSERT_TRUE(injected->load()) << "the fault was never armed before pending_deletes";
     EXPECT_EQ(code, DB::ErrorCodes::CANNOT_SCHEDULE_TASK);
-    EXPECT_EQ(progress.redeleted, 0u);
-    EXPECT_EQ(progress.redelete_failed, 1u);
+    EXPECT_EQ(progress.bodies_deleted, 0u);
+    EXPECT_EQ(progress.body_delete_failed, 1u);
     EXPECT_EQ(failedCounter() - failed_before, 1u);
     ASSERT_EQ(rows->rows.size(), 1u);
-    ASSERT_TRUE(rows->lastRowHas("read_blob_jobs_scheduled"));
-    EXPECT_EQ(rows->total("read_blob_jobs_scheduled"), 0u);
-    EXPECT_EQ(rows->total("read_blob_jobs_failed"), 0u);
+    ASSERT_TRUE(rows->lastRowHas("jobs_scheduled"));
+    EXPECT_EQ(rows->total("jobs_scheduled"), 0u);
+    EXPECT_EQ(rows->total("jobs_failed"), 1u);
+    EXPECT_EQ(rows->total("delete_chunk_job_schedule_failures"), 1u);
     EXPECT_EQ(rows->total("delete_chunk_jobs_failed"), 0u);
-    EXPECT_EQ(rows->total("read_blob_job_schedule_failures"), 1u);
-    EXPECT_EQ(rows->total("delete_chunk_job_schedule_failures"), 0u);
+    EXPECT_EQ(rows->total("delete_chunks"), 0u);
     expectBodiesPresentOnlyFor(*backend, *store, {1, 2, 3, 4, 5, 6});
 
     const RoundReport next = runRegularRoundReclaiming(gc);
-    EXPECT_EQ(next.redeleted, kBlobs);
+    EXPECT_EQ(next.bodies_deleted, kBlobs);
     EXPECT_EQ(next.deleted, kBlobs);
     EXPECT_TRUE(allBlobsAbsent(*backend, *store));
 }
@@ -1148,13 +1105,13 @@ TEST(CASGCRedeleteConcurrency, EnqueueRefusalYieldsToLowerIndexWorkerFailure)
     }
     store->renewWatermarkOnce();
 
-    EXPECT_EQ(progress.redelete_failed, 2u);
+    EXPECT_EQ(progress.body_delete_failed, 2u);
     EXPECT_EQ(failedCounter() - failed_before, 2u);
-    EXPECT_EQ(rows->total("read_blob_jobs_scheduled"), 3u);
-    EXPECT_EQ(rows->total("read_blob_jobs_failed"), 0u);
+    EXPECT_EQ(rows->total("jobs_scheduled"), 3u);
+    EXPECT_EQ(rows->total("jobs_failed"), 2u);
+    EXPECT_EQ(rows->total("delete_chunk_jobs_scheduled"), 3u);
     EXPECT_EQ(rows->total("delete_chunk_jobs_failed"), 1u);
-    EXPECT_EQ(rows->total("read_blob_job_schedule_failures"), 1u);
-    EXPECT_EQ(rows->total("delete_chunk_job_schedule_failures"), 0u);
+    EXPECT_EQ(rows->total("delete_chunk_job_schedule_failures"), 1u);
     EXPECT_NE(message.find(first_preview_key), String::npos);
     EXPECT_EQ(message.find("Injected CAS GC re-delete enqueue refusal"), String::npos);
     EXPECT_TRUE(backend->allFired());
@@ -1167,8 +1124,10 @@ TEST(CASGCRedeleteConcurrency, EnqueueRefusalYieldsToLowerIndexWorkerFailure)
 
     const RoundReport next = runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
-    EXPECT_EQ(next.redelete_failed, 0u);
-    EXPECT_EQ(next.redeleted, kBlobs);
+    EXPECT_EQ(next.body_delete_failed, 0u);
+    /// Only the bodies the failed round left (the first and every unscheduled one) are deleted; the two it
+    /// deleted go `standing` at their delete HEAD.
+    EXPECT_EQ(next.bodies_deleted, kBlobs - 2);
     EXPECT_TRUE(allBlobsAbsent(*backend, *store));
 }
 
@@ -1204,15 +1163,13 @@ TEST(CASGCRedeleteConcurrency, SingletonWorkerFailureIsCountedWithoutScheduling)
 
     EXPECT_NE(message.find(first_preview_key), String::npos);
     EXPECT_TRUE(backend->allFired());
-    EXPECT_EQ(progress.redelete_failed, 1u);
+    EXPECT_EQ(progress.body_delete_failed, 1u);
     EXPECT_EQ(failedCounter() - failed_before, 1u);
-    EXPECT_EQ(rows->total("read_blob_jobs_scheduled"), 0u);
-    ASSERT_TRUE(rows->lastRowHas("delete_chunk_jobs_scheduled"));
+    EXPECT_EQ(rows->total("jobs_scheduled"), 0u);
+    EXPECT_EQ(rows->total("jobs_failed"), 1u);
     EXPECT_EQ(rows->total("delete_chunk_jobs_scheduled"), 0u);
-    EXPECT_EQ(rows->total("read_blob_jobs_failed"), 0u);
     EXPECT_EQ(rows->total("delete_chunk_jobs_failed"), 1u);
-    EXPECT_EQ(rows->total("read_blob_job_schedule_failures"), 0u);
-    EXPECT_EQ(rows->total("delete_chunk_job_schedule_failures"), 0u);
+    EXPECT_EQ(rows->total("delete_chunks"), 1u);
 }
 
 TEST(CASGCRedeleteConcurrency, ShardedPoolDeletesEveryShard)
@@ -1258,22 +1215,22 @@ TEST(CASGCRedeleteConcurrency, ShardedPoolDeletesEveryShard)
     EXPECT_EQ(shards_with_rows, expected_shards);
 }
 
-TEST(CASGCRedeleteConcurrency, RecordPhaseFaultLeavesEveryEntryForTheNextRound)
+TEST(CASGCRedeleteConcurrency, ApplyPhaseFaultLeavesEveryEntryForTheNextRound)
 {
-    auto state = std::make_shared<RecordHookState>();
+    auto state = std::make_shared<ApplyHookState>();
     auto backend = std::make_shared<InMemoryBackend>();
     PoolConfig config{.pool_prefix = "p", .server_root_id = "test"};
     config.gc_io_concurrency = 4;
-    config.gc_redelete_record_hook_for_test = [state](const BlobRef & ref)
+    config.gc_redelete_apply_hook_for_test = [state](const BlobRef & ref)
     {
         if (!state->armed.load())
             return;
         if (ref == state->target)
         {
             state->armed.store(false);
-            throw std::runtime_error("injected record fault");
+            throw std::runtime_error("injected apply fault");
         }
-        ++state->recorded;
+        ++state->applied;
     };
     auto store = Pool::open(backend, std::move(config));
     Gc gc(store, kGc);
@@ -1295,20 +1252,16 @@ TEST(CASGCRedeleteConcurrency, RecordPhaseFaultLeavesEveryEntryForTheNextRound)
     }
     store->renewWatermarkOnce();
 
-    EXPECT_NE(message.find("injected record fault"), String::npos) << message;
-    EXPECT_EQ(progress.redeleted, state->recorded);
-    EXPECT_EQ(failedCounter() - failed_before, 0u) << "a failed record is not a failed delete";
-    EXPECT_TRUE(allBlobsAbsent(*backend, *store)) << "every delete finished before the record walk started";
+    EXPECT_NE(message.find("injected apply fault"), String::npos) << message;
+    EXPECT_EQ(progress.bodies_deleted, state->applied);
+    EXPECT_EQ(failedCounter() - failed_before, 0u) << "a failed apply is not a failed delete";
+    EXPECT_TRUE(allBlobsAbsent(*backend, *store)) << "every delete finished before the apply walk started";
 
+    /// The next round's delete HEADs find every body gone: each row goes `standing` with no delete.
     const RoundReport next = runRegularRoundReclaiming(gc);
-    EXPECT_EQ(next.redeleted, kBlobs);
-    EXPECT_EQ(next.absent, kBlobs);
+    EXPECT_EQ(next.bodies_deleted, 0u);
     EXPECT_EQ(next.deleted, 0u);
-    for (uint64_t b = 1; b <= kBlobs; ++b)
-    {
-        OperationForTest op(*backend);
-        EXPECT_FALSE((*op).head(store->layout().blobMetaKey(blobRefOf(b)), Retry::standard()).has_value()) << "meta of blob " << b;
-    }
+    EXPECT_TRUE(previewPendingDeletes(gc).empty()) << "every row left `pending`";
 }
 
 namespace
@@ -1366,11 +1319,11 @@ TEST(CASGCRedeleteConcurrency, BlobDeleteEventsMatchAppliedEntriesInAFailedRound
         if (b != kFaultedBlob)
             EXPECT_EQ(failed_round[blobKeyOf(*store, b)], "deleted") << "blob " << b;
 
+    /// The next round deletes only the body the failed round left; the others read absent at their HEAD.
     runRegularRoundReclaiming(gc);
     auto [next_round, next_round_count] = events->take();
-    EXPECT_EQ(next_round_count, kBlobs);
-    for (uint64_t b = 1; b <= kBlobs; ++b)
-        EXPECT_EQ(next_round[blobKeyOf(*store, b)], b == kFaultedBlob ? "deleted" : "absent") << "blob " << b;
+    EXPECT_EQ(next_round_count, 1u);
+    EXPECT_EQ(next_round[blobKeyOf(*store, kFaultedBlob)], "deleted");
 }
 
 TEST(CASGCRedeleteConcurrency, ExhaustedMultiKeyRetryKeepsPublishedPendingState)
@@ -1391,6 +1344,8 @@ TEST(CASGCRedeleteConcurrency, ExhaustedMultiKeyRetryKeepsPublishedPendingState)
     const auto & layout = store->layout();
     const auto read_state = [&] { return decodeGcState((*op).read(layout.gcStateKey(), Retry::once()).value().bytes); };
     const auto before = read_state();
+    std::map<String, std::vector<OutcomeRow>> logs_before;
+    collectOutcomeLogs(*backend, logs_before);
     const auto runs_before = runsForShard(*backend, layout, 0);
     ASSERT_FALSE(runs_before.empty());
 
@@ -1439,9 +1394,9 @@ TEST(CASGCRedeleteConcurrency, ExhaustedMultiKeyRetryKeepsPublishedPendingState)
     ASSERT_EQ(rows->rows.size(), 1u);
     EXPECT_EQ(rows->total("delete_chunks"), 2u);
     EXPECT_EQ(rows->total("delete_chunk_jobs_failed"), 1u);
-    EXPECT_EQ(progress.redelete_failed, chunk_size);
+    EXPECT_EQ(progress.body_delete_failed, chunk_size);
     EXPECT_EQ(failedCounter() - failed_before, chunk_size);
-    EXPECT_EQ(progress.redeleted, chunk_size);
+    EXPECT_EQ(progress.bodies_deleted, chunk_size);
     /// GC copies per-outcome totals into the report after writing the outcome logs. This round threw before that step.
     EXPECT_EQ(progress.deleted, 0u);
     EXPECT_EQ(progress.absent, 0u);
@@ -1451,6 +1406,9 @@ TEST(CASGCRedeleteConcurrency, ExhaustedMultiKeyRetryKeepsPublishedPendingState)
     EXPECT_EQ(after.round, before.round);
     EXPECT_EQ(after.snap_generation, before.snap_generation);
     EXPECT_EQ(after.snap_attempt, before.snap_attempt);
+    std::map<String, std::vector<OutcomeRow>> logs_after;
+    collectOutcomeLogs(*backend, logs_after);
+    EXPECT_EQ(logs_after, logs_before);
     EXPECT_EQ(runsForShard(*backend, layout, 0), runs_before);
     const auto still_pending = previewPendingDeletes(gc);
     ASSERT_EQ(still_pending.size(), pending.size());
@@ -1464,7 +1422,8 @@ TEST(CASGCRedeleteConcurrency, ExhaustedMultiKeyRetryKeepsPublishedPendingState)
         EXPECT_EQ(still_pending[i].token.value, entry.token.value);
         const auto body = (*op).head(entry.key, Retry::once());
         EXPECT_EQ(body.has_value(), i == 1 || i == 2) << entry.key;
-        EXPECT_EQ((*op).head(layout.blobMetaKey(entry.ref), Retry::once()).has_value(), i < chunk_size) << entry.key;
+        ASSERT_TRUE(entry.token.canonical());
+        EXPECT_TRUE(objectPresent(*backend, layout.blobIntentKey(entry.ref, *entry.token.canonical()))) << entry.key;
         if (i >= chunk_size)
             expected_events.emplace(entry.key, "deleted");
     }
@@ -1473,36 +1432,45 @@ TEST(CASGCRedeleteConcurrency, ExhaustedMultiKeyRetryKeepsPublishedPendingState)
     rows->rows.clear();
     store->renewWatermarkOnce();
     const RoundReport next = runRegularRoundReclaiming(gc);
-    EXPECT_EQ(next.redeleted, pending.size());
-    EXPECT_EQ(next.absent, chunk_size + 1);
-    EXPECT_EQ(next.replaced, 1u);
+    /// The fold sees four absent bodies, the replacement, and just one body that still matches.
+    EXPECT_EQ(next.bodies_deleted, 1u);
+    EXPECT_EQ(next.absent, 0u);
+    EXPECT_EQ(next.replaced, 0u);
     EXPECT_EQ(next.deleted, 1u);
-    EXPECT_EQ(next.redelete_failed, 0u);
+    EXPECT_EQ(next.body_delete_failed, 0u);
     EXPECT_EQ(rows->total("delete_chunks"), 1u);
     EXPECT_EQ(read_state().round, before.round + 1);
-    EXPECT_TRUE(previewPendingDeletes(gc).empty());
-    expected_events.clear();
+    const auto recovered_preview = gc.previewDeletes();
+    ASSERT_EQ(recovered_preview.deletes.size(), pending.size());
     for (size_t i = 0; i < pending.size(); ++i)
     {
         const auto & entry = pending[i];
+        const auto & row = recovered_preview.deletes[i];
+        EXPECT_EQ(row.ref, entry.ref);
+        const String old_intent = layout.blobIntentKey(entry.ref, *entry.token.canonical());
         const auto body = (*op).head(entry.key, Retry::once());
         if (i == 1)
         {
+            EXPECT_EQ(row.reason, "pending");
+            EXPECT_EQ(row.key, entry.key);
+            EXPECT_EQ(row.token.value, *replacement_token);
             ASSERT_TRUE(body);
             EXPECT_EQ(PersistedEtag::capture(body->etag).value, *replacement_token);
+            ASSERT_TRUE(body->etag.canonical());
+            EXPECT_TRUE(objectPresent(*backend, layout.blobIntentKey(entry.ref, *body->etag.canonical())));
         }
         else
         {
+            EXPECT_EQ(row.reason, "standing");
+            EXPECT_EQ(row.key, old_intent);
             EXPECT_FALSE(body) << entry.key;
         }
-        EXPECT_EQ((*op).head(layout.blobMetaKey(entry.ref), Retry::once()).has_value(), i == 1) << entry.key;
-        expected_events.emplace(entry.key, "absent");
+        EXPECT_EQ(objectPresent(*backend, old_intent), i != 1) << entry.key;
     }
-    expected_events.at(pending[1].key) = "replaced";
-    expected_events.at(pending[2].key) = "deleted";
+    const std::map<String, String> expected_recovery{{pending[2].key, "deleted"}};
     const auto [recovered, recovered_count] = events->take();
-    EXPECT_EQ(recovered_count, pending.size());
-    EXPECT_EQ(recovered, expected_events);
+    EXPECT_EQ(recovered_count, 1u);
+    EXPECT_EQ(recovered, expected_recovery);
 }
 
 TEST(CASGCRedeleteConcurrency, OutcomeBudgetCapsAuditRowsButNotDeletes)
@@ -1553,9 +1521,9 @@ TEST(CASGCRedeleteConcurrency, RoundsWithoutRedeletesWriteNoOutcomeLog)
     {
         const RoundReport rep = runRegularRoundReclaiming(gc);
         store->renewWatermarkOnce();
-        ASSERT_EQ(rep.redeleted, 0u);
+        ASSERT_EQ(rep.bodies_deleted, 0u);
         ASSERT_EQ(rep.spared, 0u);
-        graduated = rep.graduated == kBlobs;
+        graduated = rep.intent_confirmed == kBlobs;
         collectOutcomeLogs(*backend, logs);
     }
     ASSERT_TRUE(graduated) << "the scenario must reach graduation, or the rounds under test did nothing";
@@ -1563,90 +1531,4 @@ TEST(CASGCRedeleteConcurrency, RoundsWithoutRedeletesWriteNoOutcomeLog)
     for (const auto & [key, rows] : logs)
         ADD_FAILURE() << "a round without redeletes or spares wrote the outcome log " << key << " with " << rows.size() << " row(s)";
     EXPECT_TRUE(logs.empty());
-}
-
-namespace
-{
-
-Gc::RedeleteBlobState liveRedeleteBlobState(CasOperation & op, const String & key)
-{
-    Gc::RedeleteBlobState redelete_blob_state;
-    redelete_blob_state.blob_key = key;
-    redelete_blob_state.live_token = std::get<Committed>(op.create(key, "v", Retry::once())).etag;
-    return redelete_blob_state;
-}
-
-Gc::RedeleteBlobState settledRedeleteBlobState(const String & key, const Removal removal_result)
-{
-    Gc::RedeleteBlobState redelete_blob_state;
-    redelete_blob_state.blob_key = key;
-    redelete_blob_state.removal_result = removal_result;
-    return redelete_blob_state;
-}
-
-std::vector<std::vector<size_t>> chunkBlobStateIndices(const std::vector<Gc::ConditionalDeleteChunk> & chunks)
-{
-    std::vector<std::vector<size_t>> blob_state_indices;
-    for (const auto & chunk : chunks)
-        blob_state_indices.push_back(chunk.blob_state_indices);
-    return blob_state_indices;
-}
-
-}
-
-TEST(CASGCConditionalDeleteChunks, OnlyLiveTokensWithoutErrorsAreChunked)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    OperationForTest op(backend);
-    std::vector<Gc::RedeleteBlobState> redelete_blob_states;
-    redelete_blob_states.push_back(liveRedeleteBlobState(*op, "a"));
-    redelete_blob_states.push_back(settledRedeleteBlobState("gone", Removal::Gone));
-    redelete_blob_states.push_back(liveRedeleteBlobState(*op, "b"));
-    redelete_blob_states.push_back(settledRedeleteBlobState("replaced", Removal::Mismatch));
-    redelete_blob_states.push_back(liveRedeleteBlobState(*op, "failed"));
-    redelete_blob_states.back().error = std::make_exception_ptr(std::runtime_error("head failed"));
-    redelete_blob_states.emplace_back();
-    redelete_blob_states.push_back(liveRedeleteBlobState(*op, "c"));
-
-    const auto chunks = Gc::prepareConditionalDeleteChunks(redelete_blob_states, 10);
-
-    ASSERT_EQ(chunkBlobStateIndices(chunks), (std::vector<std::vector<size_t>>{{0, 2, 6}}));
-    const auto & conditional_removals = chunks.front().conditional_removals;
-    ASSERT_EQ(conditional_removals.size(), 3u);
-    for (size_t pos = 0; pos < conditional_removals.size(); ++pos)
-    {
-        const auto & redelete_blob_state = redelete_blob_states[chunks.front().blob_state_indices[pos]];
-        EXPECT_EQ(conditional_removals[pos].key, redelete_blob_state.blob_key);
-        EXPECT_EQ(conditional_removals[pos].expected_token, *redelete_blob_state.live_token);
-    }
-}
-
-TEST(CASGCConditionalDeleteChunks, ChunksAreBoundedByChunkKeys)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    OperationForTest op(backend);
-    std::vector<Gc::RedeleteBlobState> redelete_blob_states;
-    for (const String key : {"a", "b", "c", "d", "e"})
-        redelete_blob_states.push_back(liveRedeleteBlobState(*op, key));
-
-    EXPECT_EQ(
-        chunkBlobStateIndices(Gc::prepareConditionalDeleteChunks(redelete_blob_states, 2)),
-        (std::vector<std::vector<size_t>>{{0, 1}, {2, 3}, {4}}));
-    EXPECT_EQ(
-        chunkBlobStateIndices(Gc::prepareConditionalDeleteChunks(redelete_blob_states, 1)),
-        (std::vector<std::vector<size_t>>{{0}, {1}, {2}, {3}, {4}}));
-    EXPECT_EQ(
-        chunkBlobStateIndices(Gc::prepareConditionalDeleteChunks(redelete_blob_states, 5)),
-        (std::vector<std::vector<size_t>>{{0, 1, 2, 3, 4}}));
-}
-
-TEST(CASGCConditionalDeleteChunks, NothingEligibleGivesNoChunks)
-{
-    std::vector<Gc::RedeleteBlobState> redelete_blob_states;
-    redelete_blob_states.push_back(settledRedeleteBlobState("gone", Removal::Gone));
-    redelete_blob_states.push_back(settledRedeleteBlobState("replaced", Removal::Mismatch));
-    redelete_blob_states.emplace_back();
-
-    EXPECT_TRUE(Gc::prepareConditionalDeleteChunks(redelete_blob_states, 2).empty());
-    EXPECT_TRUE(Gc::prepareConditionalDeleteChunks({}, 2).empty());
 }

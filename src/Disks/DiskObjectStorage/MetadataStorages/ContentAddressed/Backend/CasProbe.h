@@ -2,6 +2,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <base/types.h>
 
+#include <cstdint>
+
 namespace DB::Cas
 {
 
@@ -28,14 +30,29 @@ struct CapabilityProbeResult
 ///   4. Successful deletion does not create a versioning delete marker. A content-addressed pool cannot
 ///      reclaim storage correctly from a versioned bucket: garbage-collection deletes would archive old
 ///      versions instead of removing objects, and repeated ref updates would accumulate versions.
+///   5. The token returned by `HEAD` has a canonical form for the backend dialect.
 ///
-/// On any failed check, throws a DB::Exception(ErrorCodes::NOT_IMPLEMENTED) with a message naming the
-/// specific failed check. This is fail-closed: a backend that does not pass the battery MUST NOT be
-/// used to coordinate a content-addressed pool.
+/// A failed mandatory check throws. A refused write preserves the store's error code.
+/// After the mandatory checks pass, the result reports whether the store demonstrated conditional
+/// multi-key deletion. The generation dialect skips the optional XML batch probe.
 ///
 /// Cleanup of the probe key is best-effort and runs unconditionally: after the battery completes, or on
 /// the failure path immediately before the check-failing exception is rethrown. Cleanup itself suppresses
 /// exceptions so that it cannot hide the capability-check failure.
 CapabilityProbeResult runCapabilityProbe(CasOperation & op, const String & probe_prefix);
+
+class Layout;
+
+/// What the protocol needs under `blob-intents/`. A writer and `cas-fsck` need an exact `GET` of an absent key that
+/// answers absent, and a `LIST`; GC also creates with `If-None-Match` and deletes.
+enum class IntentPrefixRights : uint8_t
+{
+    Read,
+    ReadWrite,
+};
+
+/// Exercises `rights` under `Layout::blobIntentsProbePrefix`, which no intent key can name, and throws with a message
+/// that names the missing right. `Read` writes nothing. Its probe object is removed on every exit path.
+void runIntentPrefixProbe(CasOperation & op, const Layout & layout, IntentPrefixRights rights);
 
 }

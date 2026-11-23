@@ -106,8 +106,7 @@ entirely before release. Treat this table as a snapshot of the current build, no
 | `cas_part_folder_cache_max_entries` | `10000` | Part-folder view cache entry cap |
 | `cas_part_folder_cache_max_entry_bytes` | 16 MiB | Oversized part-folder views bypass retention above this size |
 | `cas_manifest_decode_cache_bytes` | 128 MiB | Manifest decode cache byte budget (`0` disables) |
-| `cas_gc_meta_pool_size` | `16` | Bounded pool size for GC per-hash freshness-meta writes |
-| `cas_gc_io_concurrency` | `16` | Bounded pool size for GC object-storage requests that run in parallel: the fold's read-ahead (checkpoints, ref logs, manifests, zero-candidate HEADs), the orphan-manifest sweep planning reads, the `SYSTEM CAS GC REBUILD` read-ahead, the `pending_deletes` blob `HEAD` + conditional `DELETE` chunks, and the namespace janitor's batch deletes of dead ref logs and snapshots. S3 multi-key conditional chunks are enabled only after the writable mount proves their per-object ETag semantics; unsupported storage and `skip_access_check` use one-key conditional deletes. Not covered: meta writes (`cas_gc_meta_pool_size`) and all other GC requests, which run on the round thread. `1` runs the covered requests sequentially. `cas_gc_read_concurrency` is rejected without an alias; use `cas_gc_io_concurrency` instead |
+| `cas_gc_io_concurrency` | `16` | Bounded pool size for GC object-storage requests that run in parallel: the fold's read-ahead (checkpoints, ref logs, manifests, zero-candidate HEADs), the fold's deletion-intent creates, the orphan-manifest sweep planning reads, the `SYSTEM CAS GC REBUILD` read-ahead, the conditional blob-delete chunks in `pending_deletes`, and the namespace janitor's batch deletes of dead ref logs and snapshots. Not covered: all other GC requests, which run on the round thread. `1` runs the covered requests sequentially. `cas_gc_read_concurrency` is rejected without an alias; use `cas_gc_io_concurrency` instead |
 | `cas_attempt_timeout_ms` | `5000` | Budget for one HTTP attempt of a writable Native mount's control-plane requests (read, head, list, remove, conditional write, the mount-time bucket-versioning probe), at least 1. Together with the connect cap it forms the attempt envelope (`cas_attempt_timeout_ms + 2 × cap`; the cap is `cas_attempt_timeout_ms` itself when the disk's `connect_timeout_ms` is `0`, else `min(connect_timeout_ms, cas_attempt_timeout_ms)`) that the lease arithmetic reserves: one TCP connect and one TLS handshake under the cap each, send/receive bounded per socket operation by `cas_attempt_timeout_ms`. With background renewal the cadence check requires `cas_mount_renew_period_ms + 2 × envelope + cas_lease_safety_margin_ms < cas_mount_lease_ttl_ms`, which puts an effective ceiling on the frozen connect cap: under the defaults (TTL 40000, period 10000, margin 2000) the envelope must stay under 14000, so with the default attempt timeout a disk `connect_timeout_ms` of `0` or of 4500 ms or more refuses to open writable — lower the connect timeout or raise the TTL if you hit this. Blob body publication does not use this budget: its object-creating request is sent once under the disk's `request_timeout_ms`, with the connect timeout under the same cap |
 | `cas_request_window_ms` | `120000` | How long a failing request keeps retrying before it gives up, measured from the start of the call. It applies to control-plane requests and to the blob publication loop. At the limit the request gives up with a retryable `NETWORK_ERROR`. A writable disk refuses to open unless the window is larger than twice the attempt envelope (a write reserves its attempt and the read that settles it); a read-only disk, unless it is larger than the envelope. On a writable disk every attempt also needs room left in the mount lease, so while renewals fail a request stops when the lease runs out, even inside a longer window. The ref-table recovery retry budget is derived as twice this value: 240 s by default, so a recovery attempt that spends one whole window inside a single write still has room for a second try. `90000` gives a 90 s window and a 180 s recovery budget |
 | `cas_lease_safety_margin_ms` | `2000` | Startup-only margin validated against the mount lease TTL: the attempt envelope + `cas_lease_safety_margin_ms` must be strictly less than the mount lease TTL, and `cas_mount_renew_period_ms` + 2 × envelope + `cas_lease_safety_margin_ms` too, or the disk refuses to open writable |
@@ -238,13 +237,12 @@ removes that churn, with no measured cost.
 These settings bound individual phases of a `GC` round. The first two accept any `UInt64` value;
 for the remaining caps, `0` means unbounded.
 
-Five of these caps (`cas_gc_round_graduation_budget`, `cas_gc_round_redelete_budget`,
+Five of these caps (`cas_gc_round_intent_create_budget`, `cas_gc_round_redelete_budget`,
 `cas_gc_round_ref_cleanup_budget`, `cas_gc_round_handoff_prefix_wholesale_budget`,
 `cas_gc_round_outcome_entry_budget`) default to `0` (unbounded). With no cap, each of those phases
 processes its whole eligible cohort in one round, so a round on a pool with a backlog can run long and
 issue many requests. Such a round also delays the dead-member fence-out, which runs only at the start
-of a round. One round still does not clear a backlog: a blob that graduates to `delete_pending` is
-deleted in a later round, and the sweep and prune caps stay finite.
+of a round. One round still does not clear a backlog: a blob that gets its deletion intent in a round loses its body in a later round, and the sweep and prune caps stay finite.
 
 A cap carries the rest of its cohort to the next round, with two exceptions. At the
 `cas_gc_round_handoff_prefix_wholesale_budget` cap the rest of the generation prefix is never
@@ -256,15 +254,36 @@ counters are unaffected, except for a shard whose log an earlier attempt of the 
 |---|---|---|---|
 | `cas_manifest_sweep_list_budget_keys` | `1000` | `UInt64` | Orphan-manifest sweep `LIST` budget per round |
 | `cas_manifest_sweep_delete_budget_keys` | `100` | `UInt64` | Orphan-manifest sweep `DELETE` budget per round |
-| `cas_gc_bulk_delete_chunk_keys` | `1000` | `1`–`1000` | Most keys per batch delete request in GC's write-once families (owner-removed manifest bodies, covered ref logs and snapshots, the namespace janitor's dead ref logs and snapshots), capped by the storage's batch-delete limit |
-| `cas_gc_round_graduation_budget` | `0` | `0` = unbounded | Blob-graduation (`condemned` → `delete_pending`) cohort cap per round |
-| `cas_gc_round_redelete_budget` | `0` | `0` = unbounded | Exact-token re-delete cohort cap for prior `delete_pending` rows per round |
+| `cas_gc_bulk_delete_chunk_keys` | `1000` | `1`–`1000` | Maximum keys per conditional blob-delete chunk or per ordinary batch of deletion intents, owner-removed manifests, covered ref logs and snapshots, or dead ref logs and snapshots. Each uses the storage limit for that operation. S3 uses one key per conditional blob delete unless the writable mount's probe verified per-key `ETag` conditions |
+| `cas_gc_round_intent_create_budget` | `0` | `0` = unbounded | Deletion-intent creates per round, summed over every GC shard and counted when a create is sent. The creates of a round run concurrently, at most `cas_gc_io_concurrency` at a time. A blob over the cap stays a `candidate` and its intent is created in a later round. When a round sends the whole cap, the next round resumes after the last key that was sent, so a key whose create cannot be confirmed does not starve the keys behind it: with `B` as the cap and `N` candidates, every candidate gets a create within `ceil(N / B) + 1` rounds that commit. The resume position is kept in memory: a new GC leader starts from the first key |
+| `cas_intent_sweep_list_budget_keys` | `999` | `1` to `999` | Keys of `blob-intents/` one GC round lists to find intents that have no GC row, in one `LIST` response. A value outside the range is refused at startup |
+| `cas_gc_round_redelete_budget` | `0` | `0` = unbounded | Untouched `pending` rows whose body `HEAD` one GC round sends, summed over every GC shard; this bounds the round's body deletes. A touched `pending` row that moves to `standing` also takes a slot. A row keeps its slot when it is carried after the `HEAD`. When a round uses the whole cap, the next round resumes after the last row that took a slot, so a row carried in every round does not starve the rows behind it; a round whose destructive work is suppressed keeps the position. The resume position is kept in memory: a new GC leader starts from the first row |
 | `cas_gc_round_sweep_namespace_budget` | `20` | `0` = unbounded | Distinct namespaces per orphan-manifest sweep page whose protection view may be built |
 | `cas_gc_round_sweep_recovery_op_budget` | `5000` | `0` = unbounded | Committed-tail ref-log `GET`/decode operations the orphan-manifest recovery walk may spend per round |
 | `cas_gc_round_ref_cleanup_budget` | `0` | `0` = unbounded | Ref-object cleanup cap for covered log and snapshot deletes per round |
 | `cas_gc_round_prefix_wholesale_budget` | `20000` | `0` = unbounded | Generation-prefix wholesale-delete object cap during pruning per round |
 | `cas_gc_round_handoff_prefix_wholesale_budget` | `0` | `0` = unbounded | Post-`CAS` hand-off generation-prefix reclaim cap per round, reserved separately so pruning cannot starve the one-shot hand-off. At the cap the rest of the prefix is never revisited; only `cas-fsck` reclaims it. Leave it at `0` |
 | `cas_gc_round_outcome_entry_budget` | `0` | `0` = unbounded | `GcOutcomes` entry cap across the re-delete/spared audit log per round. At `0` the audit log of one shard is still limited: rows are dropped once a conservative estimate of its size reaches 128 MiB per round, so the written log is smaller (about 52 MiB with 34-character S3 ETags and a 128-bit hash). Deletes are unaffected |
+
+### Protocol version and retired settings {#protocol-version}
+
+A pool at generation 4 uses the [deletion-intent protocol](/antalya/cas/architecture/blob-protocol).
+There are no mixed versions on one pool: a server of this build refuses a pool below generation 4 at every
+open, and a server of an older build refuses a pool at generation 4. An older pool is converted once, offline,
+by `clickhouse-disks cas-migrate-pool` with every server of the pool stopped; see
+[migrating a pool to generation 4](/antalya/cas/operations/migration).
+
+Two settings are retired. They stay declared so existing configurations still load, and the server logs a warning
+per disk at start when either is set, whatever the value:
+
+| Setting | Effect |
+|---|---|
+| `cas_gc_meta_pool_size` | None: `GC` writes no per-blob metadata objects |
+| `cas_gc_round_graduation_budget` | Its value applies to `cas_gc_round_intent_create_budget` when that is not set; when both are set, `cas_gc_round_intent_create_budget` wins. The warning names `cas_gc_round_intent_create_budget` |
+
+Every open of a pool logs one line with the pool's reader generation and token dialect:
+``CAS pool `<prefix>`: reader generation 4, token dialect etag``. The dialect is `etag`, `generation` or `emulated`. A
+pool that opens with another dialect than the one it recorded is refused.
 
 ## Migration from unprefixed keys {#migration-from-unprefixed-keys}
 
@@ -296,7 +315,7 @@ Builds that include this change move these defaults:
   from about 43 s to 47 s plus the start time (see [the lease costs](#mount-lease-costs)).
 - The request window moves from a fixed 90 s to `cas_request_window_ms`, default `120000`. The ref-table
   recovery budget moves from a fixed 120 s to twice the window, 240 s.
-- The five `cas_gc_round_graduation_budget`, `cas_gc_round_redelete_budget`,
+- The four `cas_gc_round_redelete_budget`,
   `cas_gc_round_ref_cleanup_budget`, `cas_gc_round_handoff_prefix_wholesale_budget` and
   `cas_gc_round_outcome_entry_budget` caps move from `5000` to `0` (unbounded). The first rounds of an
   upgraded leader can run long on a backlog and delay the fence-out of dead mounts; see the budget list
@@ -347,13 +366,13 @@ upgrade, or lower `cas_attempt_timeout_ms` or the disk's `connect_timeout_ms`.
 
 ## Upgrading a pool from 26.6.x {#upgrading-from-26-6}
 
-A 26.8 server renames a committed part with one ref-log `Move` record (`cas_log` event `ref_move`); a 26.6.x server cannot read such a record. A pool created by a writable 26.8 mount requires reader generation 3 from birth. The pool records the minimum reader generation it requires (`min_reader_generation`). The first writable mount by a 26.8 server raises it from 1 to 3 and logs a WARNING (`min_reader_generation raised 1 -> 3`); the raise is one-way and happens before any part is renamed. The same mount also switches the ref log to the one-request append: see [Upgrading a pool to reader generation 3](/antalya/cas/operations/migration#upgrade-generation-3). A mount with `readonly` set never raises it. That first writable start is the point of no return for 26.6.x mounts of the pool.
+A 26.8 server renames a committed part with one ref-log `Move` record (`cas_log` event `ref_move`); a 26.6.x server cannot read such a record. The pool records the minimum reader generation it requires (`min_reader_generation`). A pool created by this build starts at generation 4. A mount never changes the value: only `clickhouse-disks cas-migrate-pool` raises it, once, with every server and every tool of the pool stopped. A build that uses blob deletion intents refuses a pool below generation 4 at every open; convert it as described in [Migrating a pool to generation 4](/antalya/cas/operations/migration#migrate-generation-4). The tool's last write is the point of no return for 26.6.x mounts of the pool.
 
-Upgrade order: stop every 26.6.x server that mounts the pool, upgrade all of them to 26.8, then start them. There is no per-server switch: a 26.8 server always raises the floor on its first writable mount. With GC enabled on the 26.6.x servers, follow [Upgrading a pool with GC enabled](operations/debugging.md#upgrade-gc) first. A 26.6.x server that stays up after the raise cannot re-mount the pool on its own: after a lost mount lease or fence it stays unmounted until it is upgraded.
+Upgrade order: stop every 26.6.x server that mounts the pool, run the tool, upgrade the servers to 26.8, then start them. There is no per-server switch and no mixed-version operation. A 26.6.x server that stays up after the tool raised the floor cannot re-mount the pool on its own: after a lost mount lease or fence it stays unmounted until it is upgraded.
 
 Replication while the versions are mixed: fetch-by-relink is off in both directions, and a fetch from a 26.8 server into a 26.6.x replica can fail. A 26.6.x server advertises replication protocol version 11 and offers a relink only to a receiver that advertises 11; a 26.8 server advertises 10 plus the `relink_confirm` capability and offers a relink only to a receiver that sends the capability. Neither side offers the other a relink, so every fetch between them moves the part bytes. The byte fetch into 26.6.x can fail: 26.8 sends `invalidated_system_columns.txt`, which a 26.6.x receiver counts into the checksums; the replication queue retries until both sides run 26.8. This window exists only when the upgrade order above is not followed.
 
-What a 26.6.x server does if it meets a pool at reader generation 2 or higher: it refuses to mount after a restart (`UNKNOWN_FORMAT_VERSION` at startup: `CAS pool meta: pool requires reader generation 3 but this build supports at most 1`). An already mounted 26.6.x server keeps serving namespaces that have no `ref_move` record; direct recovery of a namespace that has one cannot cross the record until a later generation-1 snapshot gives it a new base; its GC round holds on the undecodable log and performs no deletions. Fetch-by-relink is protected by namespace ownership and the mount fence, not by the log version. No data is deleted or lost. Downgrading a pool whose floor is 2 or 3 is not supported.
+What a 26.6.x server does if it meets a migrated pool: it refuses to mount after a restart (`UNKNOWN_FORMAT_VERSION` at startup: `CAS pool meta: pool requires reader generation 4 but this build supports at most 1`), and its GC is refused once the tool has rewritten `gc/state`. An already mounted 26.6.x server keeps serving what it recovered and reclaims nothing. Fetch-by-relink is protected by namespace ownership and the mount fence, not by the log version. No data is deleted or lost. Downgrading a migrated pool is not supported.
 
 ## Server-level settings {#server-settings}
 

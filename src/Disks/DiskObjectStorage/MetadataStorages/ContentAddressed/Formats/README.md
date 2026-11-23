@@ -26,7 +26,7 @@ trailer, followed by a banner-framed raw payload zone for inline file bytes.
 | `cas/ref_catalog` | namespace lifecycle catalog (`kind:"entry"`, `ns`, `state`, `life`, `remove_round`, `creator`, `creator_epoch`, `creator_fence`) | `CasRefCatalogFormat` | namespace admission/removal |
 | `cas/manifests/<ns>/<epoch-hex>-<seq-hex>/<ordinal>.zst` | part manifest (`namespace`, `payload_digest`; entry `path`, `place`, `size`) | `CasPartManifestFormat` | part build |
 | blob keys (`CasLayout::blobKey`) | blob envelope (`type`, `v`, `tag`, `build`, `time_ms`, `creator`, `op`, `chver`, `ref`) + payload | `CasBlobEnvelopeFormat` | uploads |
-| blob-meta keys (`CasLayout::blobMetaKey`) | freshness sidecar (`state`, `condemn_round`, `size`) | `CasBlobMetaFormat` | dedup/GC |
+| blob-meta keys (`CasLayout::blobMetaKey`) | legacy marker (`state`, `condemn_round`, `size`) | `CasBlobMetaFormat` | no writer; read by `cas-migrate-pool` and `cas-inspect`; `cas-fsck` lists the keys and reads none |
 | `gc/state`, `gc/hb` | GC state (`round`, `gc_shards`, `snap_generation`, `snap_pruned_through`, `snap_attempt`, `manifest_sweep_cursor`, `lease_owner`, `lease_seq`) / heartbeat (`owner`, `hb_seq`) | `CasGcStateFormat` | GC |
 | `gc/maintenance_state` | leak-only namespace-janitor cursor (`janitor_cursor`) | `CasGcMaintenanceStateFormat` | future janitor |
 | `gc/gen/<g>/attempt/<a>/outcomes/…​.zst` | outcome log (`kind`, `outcome`) | `CasGcOutcomesFormat` (`.zst`) | GC |
@@ -90,7 +90,7 @@ use the corresponding `old_*` and `new_*` key bundles.
 ## Generation history {#generation-history}
 
 The generation history starts at a flat `{1, 1}` baseline (reset before 26.6.4, the first release whose
-pools persist). Current generations: `G_BUILD == 3` (the highest a reader accepts), `G_WRITE_FLOOR == 1` (stamped on
+pools persist). Current generations: `G_BUILD == 4` (the highest a reader accepts), `G_WRITE_FLOOR == 1` (stamped on
 ordinary objects). A ref-log transaction with `!next_epoch` or `!prev_epoch` and every `_ckpt` are stamped 3; any other
 ref-log transaction that carries a `Move` op is stamped 2.
 Every class's `changePoints` begins at generation 1; a future breaking change appends a real entry to

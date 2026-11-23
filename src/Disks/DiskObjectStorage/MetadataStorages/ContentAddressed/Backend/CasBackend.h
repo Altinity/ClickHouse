@@ -1,11 +1,15 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasTransportAccess.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobDigest.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobHashingWriteBuffer.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasWriteOnceKey.h>
+#include <Core/Defines.h>
 #include <IO/ReadBuffer.h>
 #include <IO/WriteBuffer.h>
 #include <Common/Exception.h>
+#include <Common/ProfileEvents.h>
 #include <base/defines.h>
 #include <base/types.h>
 #include <algorithm>
@@ -21,9 +25,15 @@
 #include <variant>
 #include <vector>
 
+namespace ProfileEvents
+{
+extern const Event CASBlobPublishDigestMismatch;
+}
+
 namespace DB::ErrorCodes
 {
-    extern const int NOT_IMPLEMENTED;
+extern const int CORRUPTED_DATA;
+extern const int NOT_IMPLEMENTED;
 }
 
 namespace DB::Cas
@@ -56,12 +66,14 @@ struct SentinelProbeResult
 
 /// Re-readable payload transport for one unconditional blob publication. `fresh_envelope` is the
 /// complete CAS envelope to prepend, while `payload_size` is the exact number of bytes the source
-/// must yield before the backend can make the destination visible.
+/// must yield before the backend can make the destination visible. The payload must hash to
+/// `expected_ref`; a backend refuses to complete the object otherwise.
 struct StreamingBlobPublication
 {
     uint64_t payload_size;
     String fresh_envelope;
     std::function<std::unique_ptr<ReadBuffer>()> open_payload;
+    BlobRef expected_ref;
 };
 
 /// A complete, already-size-verified CAS object that can be copied byte-for-byte to the destination.
@@ -85,6 +97,20 @@ struct BlobPublishRequest
 
 namespace blob_publication_detail
 {
+
+/// Buffer size for moving `bytes` of a blob body. A part's uploads run concurrently and each holds its
+/// buffers until it finishes, so a small blob gets a buffer no larger than itself.
+inline size_t blobTransferBufferSize(uint64_t bytes)
+{
+    return static_cast<size_t>(std::clamp<uint64_t>(bytes, 1, DBMS_DEFAULT_BUFFER_SIZE));
+}
+
+/// `blobTransferBufferSize` for writing a body of `bytes`, one byte larger: a body that fills its buffer exactly is
+/// flushed while the buffer is full, and the S3 and Azure buffers double a full first buffer before the upload.
+inline size_t blobWriteBufferSize(uint64_t bytes)
+{
+    return blobTransferBufferSize(bytes + 1);
+}
 
 struct BlobPayloadCopyResult
 {
@@ -121,6 +147,64 @@ inline BlobPayloadCopyResult copyBlobPayloadBounded(ReadBuffer & from, WriteBuff
     return result;
 }
 
+/// Counts and raises the refusal of a payload that does not hash to its key. `CORRUPTED_DATA` is
+/// deterministic, so the writer does not retry it.
+[[noreturn]] inline void throwPayloadDigestMismatch(const String & key)
+{
+    ::ProfileEvents::increment(::ProfileEvents::CASBlobPublishDigestMismatch);
+    throw Exception(ErrorCodes::CORRUPTED_DATA,
+        "payload of {} does not hash to its key; upload aborted, nothing published", key);
+}
+
+/// Arguments: "more than " or "", the bytes copied, the key, the declared size.
+using PayloadSizeMismatchMessage = FormatStringHelper<const char *, uint64_t, const String &, uint64_t>;
+
+/// `copyBlobPayloadBounded`, hashing exactly the payload bytes forwarded to `to` (never the envelope)
+/// with the hash of `publication.expected_ref`. A short or long source throws `CORRUPTED_DATA` with
+/// `size_mismatch`; otherwise a payload that does not hash to `key` throws `throwPayloadDigestMismatch`.
+/// Does not finalize or cancel `to`.
+inline void copyBlobPayloadVerified(ReadBuffer & from, WriteBuffer & to, const StreamingBlobPublication & publication,
+    const String & key, PayloadSizeMismatchMessage size_mismatch)
+{
+    auto hashing = makeBlobHashingWriteBuffer(publication.expected_ref.algo, to);
+    BlobPayloadCopyResult copy;
+    bool matches = false;
+    try
+    {
+        copy = copyBlobPayloadBounded(from, *hashing, publication.payload_size);
+        matches = hashing->getHashHex() == blobHexOf(publication.expected_ref);
+        hashing->finalize();
+    }
+    catch (...)
+    {
+        hashing->cancel();
+        throw;
+    }
+    if (!copy.exact(publication.payload_size))
+        throw Exception(ErrorCodes::CORRUPTED_DATA, std::move(size_mismatch),
+            static_cast<const char *>(copy.has_excess ? "more than " : ""), uint64_t{copy.copied}, key,
+            uint64_t{publication.payload_size});
+    if (!matches)
+        throwPayloadDigestMismatch(key);
+}
+
+/// `copyBlobPayloadVerified`, then finalizes `to`. A failed copy cancels `to` and rethrows; a failed finalize
+/// is not followed by a cancel.
+inline void copyVerifiedPayloadAndFinalize(ReadBuffer & from, WriteBuffer & to, const StreamingBlobPublication & publication,
+    const String & key, PayloadSizeMismatchMessage size_mismatch)
+{
+    try
+    {
+        copyBlobPayloadVerified(from, to, publication, key, std::move(size_mismatch));
+    }
+    catch (...)
+    {
+        to.cancel();
+        throw;
+    }
+    to.finalize();
+}
+
 }
 
 /// Etag-aware storage seam used by the content-addressed pool. INCARNATION SEMANTICS ARE THE
@@ -138,9 +222,10 @@ inline BlobPayloadCopyResult copyBlobPayloadBounded(ReadBuffer & from, WriteBuff
 /// (changed bytes ⟹ a new value, so a stale conditional write/delete is rejected), but `Cas::Pool`'s
 /// read-path decode cache (`readShardDecoded`) skips a re-`read`+decode on a value match, so a backend
 /// whose value could REPEAT across different content would make it serve stale manifests (wrong
-/// results). Holds for every backend in use: S3 ETag is content-derived; the emulated/in-memory
-/// backends mint a strictly-monotonic sequence that is never reused. A backend with a weak/recycled
-/// value must NOT be used as a Cas pool. The capability probe currently verifies conditional-operation
+/// results). S3 ETag is content-derived and the in-memory backend mints a strictly-monotonic
+/// sequence that is never reused. The emulated local backend can repeat a token inside one mtime
+/// tick, so it is accepted only when one process uses the pool's path: tests and a single-node pool.
+/// A backend with a weak/recycled value must NOT be used as a Cas pool. The capability probe currently verifies conditional-operation
 /// behavior but does not test value non-reuse across different contents, so this invariant remains a
 /// requirement of every backend implementation.
 ///
@@ -207,8 +292,9 @@ public:
     virtual void publish(const BlobPublishRequest & request, TransportAccess &) = 0;
 
     /// Removes up to 1000 WRITE-ONCE keys in one request with no per-key precondition; an absent key
-    /// is success. The caller proves the keys are write-once by minting them as `WriteOnceKey`, so a
-    /// backend never sees a mutable control key through this verb. Throws on any failure; the whole
+    /// is success. The caller proves the keys are write-once by minting them as `WriteOnceKey`: each
+    /// key holds one byte string in every life it has (a blob intent can be deleted and created again,
+    /// always with the same bytes), so a backend never sees a mutable control key through this verb. Throws on any failure; the whole
     /// chunk is reissued by the engine, which is sound because a key already deleted is absent, and
     /// absence is success.
     virtual void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess &) = 0;

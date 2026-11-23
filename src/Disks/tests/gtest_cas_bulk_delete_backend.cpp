@@ -120,7 +120,7 @@ TEST(CASBulkDeleteBackend, InMemoryArmedFailureFiresOnceAndTheHookRunsBeforeTheD
 TEST(CASBulkDeleteBackend, InstrumentedCountsOneRequestAndOneDeletePerKeyClass)
 {
     auto inner = std::make_shared<InMemoryBackend>();
-    auto backend = std::make_shared<InstrumentedBackend>(inner);
+    auto backend = std::make_shared<InstrumentedBackend>(inner, kLayout.poolPrefix());
     CasRequests requests = openRequestsForTest(backend);
     CasOperation op = requests.admit();
     Keys keys = seed(op);
@@ -145,7 +145,7 @@ TEST(CASConditionalBatchDeleteBackend, InstrumentedBackendForwardsMultiKeyCondit
 {
     auto inner = std::make_shared<InMemoryBackend>();
     inner->pinConditionalBatchDeleteSupport(true);
-    auto backend = std::make_shared<InstrumentedBackend>(inner);
+    auto backend = std::make_shared<InstrumentedBackend>(inner, kLayout.poolPrefix());
     CasRequests requests = openRequestsForTest(backend);
     CasOperation op = requests.admit();
     const String first_key = "p/conditional/instrumented/first";

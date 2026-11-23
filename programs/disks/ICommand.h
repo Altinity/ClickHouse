@@ -144,6 +144,7 @@ DB::CommandPtr makeCommandCaGcDryRun();
 DB::CommandPtr makeCommandCaGcRebuild();
 DB::CommandPtr makeCommandCaInspect();
 DB::CommandPtr makeCommandCaDropMember();
+DB::CommandPtr makeCommandCaMigratePool();
 DB::CommandPtr makeCommandReadChecksums();
 DB::CommandPtr makeCommandPackedIO();
 }

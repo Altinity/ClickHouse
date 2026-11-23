@@ -15,15 +15,16 @@ namespace DB::Cas
 /// backends. This backend-level chokepoint is needed because background PUTs are not attributable
 /// through the foreground request that scheduled them.
 
-/// Namespace of a CA key, classified by substring of the key path (6 classes; `Server` is currently
+/// Namespace of a CA key, classified by the path components after the pool prefix (7 classes; `Server` is currently
 /// unreachable through this classifier — the per-server control subtree lives under
-/// `/gc/server-roots/<server_root_id>/...` and classifies as Gc).
+/// `<prefix>/gc/server-roots/<server_root_id>/...` and classifies as Gc).
+///   <prefix>/blob-intents/.. → BlobIntent
 ///   <prefix>/blobs/..        → Blob
 ///   <prefix>/cas/ns/..        → Root  (immutable streams and point/path-addressed namespace state)
 ///   <prefix>/cas/manifests/.. → Manifest
 ///   <prefix>/roots/..        → Root  (loose mountpoint objects)
 ///   <prefix>/gc/..           → Gc
-///   else (e.g. _pool_meta, _probe) → Other
+///   else (e.g. _pool_meta, _probe, a key outside the prefix) → Other
 enum class CasNs : uint8_t
 {
     Blob = 0,
@@ -32,8 +33,9 @@ enum class CasNs : uint8_t
     Gc,
     Server,
     Other,
+    BlobIntent,
 };
-static constexpr size_t CAS_NS_COUNT = 6;
+static constexpr size_t CAS_NS_COUNT = 7;
 
 /// Operation + outcome class, mapped from the `Backend` primitive and its result.
 ///   write, no expected value   → a value ⇒ Put       ; RawConflict ⇒ PutDeduplicated
@@ -64,10 +66,10 @@ enum class CasOp : uint8_t
 };
 static constexpr size_t CAS_OP_COUNT = 11;
 
-/// Classify a key into its namespace by substring. The order is significant where a more specific
-/// layout such as `cas/ns/` must be recognized before a generic fallback; unknown key families
-/// are intentionally counted as `Other`.
-CasNs classifyCasNs(const String & key);
+/// Classify a key of the pool at `pool_prefix` into its namespace by the first path component after the prefix, and
+/// the second one under `cas/`, so a prefix that contains a component name classifies nothing by itself. Unknown key
+/// families are counted as `Other`.
+CasNs classifyCasNs(const String & key, std::string_view pool_prefix);
 
 /// Increment the `ProfileEvent` corresponding to `(ns, op)`. The row-major table is defined in the
 /// implementation and must remain aligned with the `CasNs` and `CasOp` enum values.
@@ -78,7 +80,7 @@ void incrementCasEvent(CasNs ns, CasOp op);
 class InstrumentedBackend final : public Backend
 {
 public:
-    explicit InstrumentedBackend(BackendPtr inner_) : inner(std::move(inner_)) {}
+    InstrumentedBackend(BackendPtr inner_, String pool_prefix_) : inner(std::move(inner_)), pool_prefix(std::move(pool_prefix_)) {}
 
     /// Capability checks are deliberately uninstrumented: they do not represent storage operations.
     void checkPoolPreconditions() override { inner->checkPoolPreconditions(); }
@@ -97,7 +99,7 @@ public:
     std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
         auto result = inner->read(key, access);
-        incrementCasEvent(classifyCasNs(key), CasOp::Read);
+        incrementCasEvent(classifyCasNs(key, pool_prefix), CasOp::Read);
         return result;
     }
 
@@ -105,7 +107,7 @@ public:
     std::optional<RawMeta> head(const String & key, TransportAccess & access) override
     {
         auto result = inner->head(key, access);
-        incrementCasEvent(classifyCasNs(key), result ? CasOp::Head : CasOp::HeadMiss);
+        incrementCasEvent(classifyCasNs(key, pool_prefix), result ? CasOp::Head : CasOp::HeadMiss);
         return result;
     }
 
@@ -113,7 +115,7 @@ public:
     RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
     {
         auto page = inner->list(prefix, cursor, limit, access);
-        incrementCasEvent(classifyCasNs(prefix), CasOp::List);
+        incrementCasEvent(classifyCasNs(prefix, pool_prefix), CasOp::List);
         return page;
     }
 
@@ -121,7 +123,7 @@ public:
     RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override
     {
         auto outcome = inner->remove(key, expected_value, access);
-        incrementCasEvent(classifyCasNs(key), CasOp::Delete);
+        incrementCasEvent(classifyCasNs(key, pool_prefix), CasOp::Delete);
         return outcome;
     }
 
@@ -142,7 +144,7 @@ public:
         auto result = inner->write(key, bytes, expected_value, access);
         const CasOp op = expected_value ? (result ? CasOp::Overwrite : CasOp::CasConflict)
                                         : (result ? CasOp::Put : CasOp::PutDeduplicated);
-        incrementCasEvent(classifyCasNs(key), op);
+        incrementCasEvent(classifyCasNs(key, pool_prefix), op);
         return result;
     }
 
@@ -150,7 +152,7 @@ public:
     std::unique_ptr<ReadBuffer> stream(const String & key, TransportAccess & access) override
     {
         auto result = inner->stream(key, access);
-        incrementCasEvent(classifyCasNs(key), CasOp::GetStream);
+        incrementCasEvent(classifyCasNs(key, pool_prefix), CasOp::GetStream);
         return result;
     }
 
@@ -170,6 +172,7 @@ public:
 
 private:
     BackendPtr inner;
+    const String pool_prefix;
 };
 
 }

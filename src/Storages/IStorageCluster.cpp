@@ -690,7 +690,8 @@ void IStorageCluster::read(
         /// The remote may resolve OSC, fall back locally, or use its own OSC when local OSC is empty.
         updateConfigurationIfNeeded(context);
         updateQueryWithJoinToSendIfNeeded(query_to_send, query_info, context);
-        updateQueryToSendIfNeeded(query_to_send, storage_snapshot, context, /*make_cluster_function*/ false);
+        updateQueryToSendIfNeeded(
+            query_to_send, storage_snapshot, context, /*make_cluster_function=*/false, /*add_structure_and_format=*/true);
 
         /// ENGINE tables keep object_storage_cluster on the storage, not in the initiator query context.
         /// Propagate it into the context copied for remote() so the remote sees the same OSC as alt-syntax.
@@ -739,7 +740,8 @@ void IStorageCluster::read(
         query_to_send = interpreter.getQueryInfo().query->clone();
     }
 
-    updateQueryToSendIfNeeded(query_to_send, storage_snapshot, context, /*make_cluster_function*/ true);
+    updateQueryToSendIfNeeded(
+        query_to_send, storage_snapshot, context, /*make_cluster_function=*/true, /*add_structure_and_format=*/true);
 
     /// In case the current node is not supposed to initiate the clustered query
     /// Sends this query to a remote initiator using the `remote` table function

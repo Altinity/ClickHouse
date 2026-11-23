@@ -146,8 +146,7 @@ CLICKHOUSE_ERROR_LOG_FILE = "/var/log/clickhouse-server/clickhouse-server.err.lo
 # Minimum version we use in integration tests to check compatibility with old releases
 # Keep in mind that we only support upgrading between releases that are at most 1 year different.
 # This means that this minimum need to be, at least, 1 year older than the current release
-# NOTE(vnemkov): this is a docker tag, make sure it doesn't include initial 'v'
-CLICKHOUSE_CI_MIN_TESTED_VERSION = "23.3.19.33.altinitystable"
+CLICKHOUSE_CI_MIN_TESTED_VERSION = "25.3"
 
 # `Nullable(Tuple)` experimental feature is introduced in 26.1. This has lead to changes in the output return type
 # of many aggregate functions from `Tuple(...)` to `Nullable(Tuple(...))`. This version can be used as baseline to do
@@ -3871,6 +3870,30 @@ class ClickHouseCluster:
                             input=password.encode(),
                         )
 
+    def _images_prefetched_and_present(self) -> bool:
+        """Whether this job pulled every image of this project and each is still in the daemon.
+
+        A reference this job did not pull may be a floating tag whose local copy is stale, and a
+        reference it did pull can still be gone (the image store is shared with everything else on
+        this daemon), so both questions are asked.
+
+        `docker image inspect` prints one id per reference it finds and nothing for one it does
+        not, so an equal count means none is missing. A non-zero exit or an empty enumeration
+        answers False.
+        """
+        prefetched = set(os.environ.get("CLICKHOUSE_TESTS_PREFETCHED_IMAGES", "").split())
+        if not prefetched:
+            return False
+        images = set(run_and_check(self.base_cmd + ["config", "--images"], nothrow=True).split())
+        if not images:
+            return False
+        if not images <= prefetched:
+            return False
+        found = run_and_check(
+            ["docker", "image", "inspect", "--format", "{{.Id}}"] + sorted(images), nothrow=True
+        ).split()
+        return len(found) == len(images)
+
     def start(self, connection_timeout=None):
         pytest_xdist_logging_to_separate_files.setup()
         logging.info("Running tests in {}".format(self.base_path))
@@ -3927,9 +3950,6 @@ class ClickHouseCluster:
 
             common_opts = ["--verbose", "up", "-d"]
 
-            images_pull_cmd = self.base_cmd + ["pull"]
-            # sometimes dockerhub/proxy can be flaky
-
             def logging_pulling_images(**kwargs):
                 if "exception" in kwargs:
                     logging.info(
@@ -3937,7 +3957,14 @@ class ClickHouseCluster:
                     )
 
             self.login_to_ecr()
-            retry(log_function=logging_pulling_images, retries=3, delay=8, jitter=8)(run_and_check, images_pull_cmd, timeout=600)
+            # `docker compose pull` re-verifies every service image against the registry even when
+            # it is cached, so a transient registry failure fails a module that needed no download.
+            if self._images_prefetched_and_present():
+                logging.debug("Skipping `docker compose pull`: all images are present locally")
+            else:
+                # sometimes dockerhub/proxy can be flaky
+                images_pull_cmd = self.base_cmd + ["pull"]
+                retry(log_function=logging_pulling_images, retries=3, delay=8, jitter=8)(run_and_check, images_pull_cmd, timeout=600)
 
             def logging_compose_up(**kwargs):
                 if "exception" in kwargs:
@@ -4469,10 +4496,6 @@ class ClickHouseCluster:
                 self.wait_ytsaurus_to_start()
 
             if self.with_letsencrypt_pebble and self.base_letsencrypt_pebble_cmd:
-                letsencrypt_pebble_pull_cmd = self.base_letsencrypt_pebble_cmd + ["pull"]
-                retry(log_function=logging_pulling_images, retries=3, delay=8, jitter=8)(
-                    run_and_check, letsencrypt_pebble_pull_cmd, timeout=600
-                )
                 letsencrypt_pebble_start_cmd = self.base_letsencrypt_pebble_cmd + common_opts
                 run_and_check(letsencrypt_pebble_start_cmd)
                 self.wait_letsencrypt_pebble_to_start()

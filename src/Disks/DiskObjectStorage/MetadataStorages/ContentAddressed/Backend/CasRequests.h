@@ -37,11 +37,12 @@ namespace DB::Cas
 class CasOperation;
 
 /// TRUE when the store's own answer proves this write never applied: a malformed request, an entity
-/// too large, an access denial, or a credential failure. Whether a STALE CREDENTIAL explains it is not
+/// too large, an access denial, or a credential failure; for a local store, `READONLY` or an `errno` of
+/// `EACCES`, `EPERM` or `EROFS`. Whether a STALE CREDENTIAL explains it is not
 /// asked here -- the engine asks the backend for fresh credentials first, and refuses only when no
 /// refresh HELPED: the error was outside the credential class, the one refresh this call is allowed
 /// installed nothing, or there is no reissue left to sign with what it did install. A refresh that
-/// helps re-sends the attempt, which is known not to have applied. A non-S3 exception is never a
+/// helps re-sends the attempt, which is known not to have applied. Any other exception is never a
 /// refusal: an unmodeled error may have landed.
 bool isDefinitelyRefusedWrite(const std::exception & e);
 
@@ -236,6 +237,9 @@ public:
     /// constant that predates this reservation -- reads it here instead of duplicating the backend call.
     uint64_t attemptReservationMs() const { return attempt_reservation_ms; }
 
+    /// The clock every policy on this plane is bound to.
+    uint64_t nowMs() const { return now_ms(); }
+
 private:
     friend class CasOperation;
     /// `CasOperation::owner` is a `CasRequests &`: `CasOperation`'s own friendship with `CasHotKeys`
@@ -303,6 +307,8 @@ public:
     CasOperation & operator=(const CasOperation &) = delete;
 
     uint64_t generation() const { return admitted_generation; }
+    /// The dialect of the backend this operation was admitted on.
+    Dialect backendDialect() const;
     /// A caller's own inter-iteration wait, paced through the same clock the engine's own sleeps use --
     /// so a test that replaces the sleep sees no real time pass in either. For the hand-written loops
     /// that reissue something the engine must not reissue for them.
@@ -326,6 +332,10 @@ public:
     /// of paced retrying. A policy that already carries a deadline is returned unchanged, so freezing
     /// twice cannot extend it.
     Retry freeze(const Retry & policy) const;
+    /// Would a read verb start its first attempt now under a policy frozen to `deadline_ms`? The same test the
+    /// verb applies before it sends, without any lease bound. A caller with a deadline of its own asks first, so
+    /// its running out of time is its own error and not the verb's retry-later give-up.
+    bool oneAttemptFitsBefore(uint64_t deadline_ms) const;
 
     std::optional<Object> read(const String & key, const Retry & policy);
     std::optional<Meta>   head(const String & key, const Retry & policy);

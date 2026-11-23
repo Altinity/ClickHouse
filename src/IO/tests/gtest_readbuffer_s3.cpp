@@ -1,6 +1,9 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
 #include <optional>
+#include <thread>
 #include <vector>
 
 #include <IO/S3/Credentials.h>
@@ -35,6 +38,8 @@ namespace DB::Setting
     extern const SettingsBool filesystem_cache_prefer_bigger_buffer_size;
     extern const SettingsBool read_from_filesystem_cache_if_exists_otherwise_bypass_cache;
     extern const SettingsUInt64 remote_read_min_bytes_for_seek;
+    extern const SettingsBool s3_validate_etag_on_read;
+    extern const SettingsBool table_engine_read_through_distributed_cache;
 }
 
 namespace DB::FileCacheSetting
@@ -86,10 +91,10 @@ public:
     static int OustandingObjects() { return total; }
 
 private:
-    static int total;
+    static std::atomic<int> total;
 };
 
-int CountedSession::total = 0;
+std::atomic<int> CountedSession::total = 0;
 
 using CountedSessionPtr = std::shared_ptr<CountedSession>;
 
@@ -108,6 +113,26 @@ private:
     {
         bodyStream.read(buf, n);
         return static_cast<int>(bodyStream.gcount());
+    }
+};
+
+/// Fails the response body on the very first read, so that `readBigAt` takes its retry path
+/// while the session of the failed request is still owned by the response stream.
+class ThrowingHTTPBasicStreamBuf : public Poco::Net::HTTPBasicStreamBuf
+{
+public:
+    explicit ThrowingHTTPBasicStreamBuf(std::atomic<bool> & read_attempted_)
+        : BasicBufferedStreamBuf(1, IOS::in), read_attempted(read_attempted_)
+    {
+    }
+
+private:
+    std::atomic<bool> & read_attempted;
+
+    int readFromDevice(char_type *, std::streamsize) override
+    {
+        read_attempted = true;
+        throw std::runtime_error("injected response body failure");
     }
 };
 
@@ -141,6 +166,7 @@ struct ClientFake : DB::S3::Client
     using ListObjectsV2Fn = std::function<Aws::S3::Model::ListObjectsV2Outcome(const Aws::S3::Model::ListObjectsV2Request &)>;
     std::optional<ListObjectsV2Fn> listObjectsV2Impl;
     mutable std::optional<std::string> last_start_after;
+    mutable std::string last_if_match;
     struct ListRequest
     {
         std::string start_after;
@@ -163,8 +189,9 @@ struct ClientFake : DB::S3::Client
         };
     }
 
-    Aws::S3::Model::GetObjectOutcome GetObject([[maybe_unused]] const Aws::S3::Model::GetObjectRequest & request) const override
+    Aws::S3::Model::GetObjectOutcome GetObject(const Aws::S3::Model::GetObjectRequest & request) const override
     {
+        last_if_match = request.GetIfMatch();
         chassert(getObjectImpl);
         return (*getObjectImpl)(request);
     }
@@ -253,6 +280,74 @@ TEST_F(ReadBufferFromS3Test, ReleaseSessionWhenReadUntilPosition)
 
     ASSERT_TRUE(subject.eof());
     ASSERT_FALSE(subject.nextImpl());
+}
+
+TEST_F(ReadBufferFromS3Test, ReadBigAtReleasesSessionBeforeRetryBackoff)
+{
+    /// Contract: when a `readBigAt` request fails mid-read and is going to be retried, its pooled
+    /// session must be given up before the back-off pause, not kept for its whole duration. The
+    /// `supportsReadAt` readers (Parquet, ORC) issue many such requests in parallel, and holding a
+    /// session per sleeping retry takes connections away from the rest of the same group.
+    const int baseline = CountedSession::OustandingObjects();
+
+    const auto client = std::make_shared<ClientFake>();
+    DB::ReadSettings read_settings;
+    auto subject = DB::ReadBufferFromS3(client, "test_bucket", "test_key", "test_version_id", DB::S3::S3RequestSettings(), read_settings);
+
+    std::atomic<bool> first_request_failed = false;
+    std::atomic<bool> retry_request_sent = false;
+    std::atomic<bool> released_before_retry = false;
+
+    const auto failing_stream_buf = std::make_shared<ThrowingHTTPBasicStreamBuf>(first_request_failed);
+    const auto good_stream_buf = std::make_shared<StringHTTPBasicStreamBuf>("1234567890");
+
+    size_t requests = 0;
+    client->getObjectImpl = [&](const Aws::S3::Model::GetObjectRequest &) -> Aws::S3::Model::GetObjectOutcome
+    {
+        const bool is_first = requests++ == 0;
+        if (!is_first)
+            retry_request_sent = true;
+
+        std::streambuf * sb = is_first
+            ? static_cast<std::streambuf *>(failing_stream_buf.get())
+            : static_cast<std::streambuf *>(good_stream_buf.get());
+
+        /// Owned by the response stream, exactly as a pooled session is.
+        auto session = std::make_shared<CountedSession>();
+        auto response_stream = Aws::Utils::Stream::ResponseStream(
+            Aws::New<DB::SessionAwareIOStream<CountedSessionPtr>>("test response stream", std::move(session), sb));
+        Aws::AmazonWebServiceResult<Aws::Utils::Stream::ResponseStream> aws_result(
+            std::move(response_stream), Aws::Http::HeaderValueCollection());
+        return DB::S3::Model::GetObjectOutcome(DB::S3::Model::GetObjectResult(std::move(aws_result)));
+    };
+
+    /// Watches the window between the failure and the retry request. Sampling cannot miss the
+    /// release when it happens before the back-off, because the whole pause is inside the window.
+    std::thread watcher([&]
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (!first_request_failed.load() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        while (!retry_request_sent.load() && std::chrono::steady_clock::now() < deadline)
+        {
+            if (CountedSession::OustandingObjects() == baseline)
+            {
+                released_before_retry = true;
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+    });
+
+    std::vector<char> data(10);
+    const size_t read = subject.readBigAt(data.data(), data.size(), /*range_begin=*/0, /*progress_callback=*/{});
+    watcher.join();
+
+    ASSERT_EQ(read, data.size());
+    ASSERT_EQ(std::string(data.data(), data.size()), "1234567890");
+    ASSERT_EQ(requests, 2u);
+    ASSERT_TRUE(released_before_retry.load());
+    ASSERT_EQ(CountedSession::OustandingObjects(), baseline);
 }
 
 TEST_F(ReadBufferFromS3Test, MissingResponseETagIsNotRejected)
@@ -437,5 +532,66 @@ TEST_F(ReadBufferFromS3Test, HavingZeroBytes)
     ASSERT_EQ(async_buf->available(), 0);
 
     DB::FileCacheFactory::instance().clear();
+}
+
+TEST_F(ReadBufferFromS3Test, CreateReadBufferCanPinListedEtagWhenValidationIsOff)
+{
+    /// The Puffin deletion-vector cache stores bytes under the etag from its HEAD. That read must
+    /// send `If-Match` even when `s3_validate_etag_on_read` is off, or a newer object can be cached
+    /// under the listed etag.
+    DB::ServerUUID::setRandomForUnitTests();
+    auto query_context = DB::Context::createCopy(getContext().context);
+    query_context->makeQueryContext();
+    query_context->setCurrentQueryId("puffin_etag_pin");
+    const auto & settings = query_context->getSettingsRef();
+    const_cast<DB::Settings &>(settings)[DB::Setting::s3_validate_etag_on_read] = false;
+    const_cast<DB::Settings &>(settings)[DB::Setting::filesystem_cache_name] = "";
+    const_cast<DB::Settings &>(settings)[DB::Setting::table_engine_read_through_distributed_cache] = false;
+
+    auto make_storage = []()
+    {
+        auto client = std::make_unique<ClientFake>();
+        auto * fake = client.get();
+        DB::S3::URI uri;
+        uri.bucket = "test_bucket";
+        DB::S3Capabilities cap;
+        DB::ObjectStorageKeyGeneratorPtr gen;
+        auto object_storage = std::make_shared<DB::S3ObjectStorage>(
+            std::move(client), std::make_unique<DB::S3Settings>(), std::move(uri), cap, gen, "s3");
+        return std::pair{object_storage, fake};
+    };
+
+    DB::ReadSettings read_settings;
+    read_settings.remote_fs_settings.method = DB::RemoteFSReadMethod::read;
+    read_settings.remote_fs_settings.prefetch = false;
+    read_settings.enable_filesystem_cache = false;
+    read_settings.use_page_cache_for_object_storage = false;
+
+    const auto read_with_pin = [&](bool pin_to_metadata_etag)
+    {
+        auto [object_storage, fake] = make_storage();
+        DB::ObjectMetadata object_metadata;
+        object_metadata.size_bytes = 4;
+        object_metadata.etag = "\"etag-at-listing\"";
+        DB::RelativePathWithMetadata relative_path("test_key", object_metadata);
+
+        auto session = std::make_shared<CountedSession>();
+        const auto stream_buf = std::make_shared<StringHTTPBasicStreamBuf>("abcd");
+        fake->setGetObjectSuccess(session, stream_buf.get());
+
+        auto buf = DB::createReadBuffer(
+            relative_path,
+            object_storage,
+            query_context,
+            getLogger("test"),
+            read_settings,
+            /*allow_page_cache=*/ false,
+            pin_to_metadata_etag);
+        EXPECT_TRUE(buf->next());
+        return fake->last_if_match;
+    };
+
+    EXPECT_EQ(read_with_pin(false), "");
+    EXPECT_EQ(read_with_pin(true), "\"etag-at-listing\"");
 }
 #endif

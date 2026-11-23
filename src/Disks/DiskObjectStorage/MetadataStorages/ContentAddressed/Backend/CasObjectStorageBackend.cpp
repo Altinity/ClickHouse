@@ -517,8 +517,9 @@ String ObjectStorageBackend::emuWrite(const String & key, const String & bytes)
     return emuMintToken(key, metadata ? metadata->etag : String{}, /*just_wrote=*/true);
 }
 
-void ObjectStorageBackend::emuPublishBlobAtomically(const String & key, const String & envelope, ReadBuffer & payload, uint64_t payload_size)
+void ObjectStorageBackend::emuPublishBlobAtomically(const String & key, const StreamingBlobPublication & publication, ReadBuffer & payload)
 {
+    const String & envelope = publication.fresh_envelope;
     if (object_storage->getType() != ObjectStorageType::Local)
         throw Exception(
             ErrorCodes::NOT_IMPLEMENTED,
@@ -538,21 +539,14 @@ void ObjectStorageBackend::emuPublishBlobAtomically(const String & key, const St
     /// or long source aborts on the temporary file, which is then removed.
     try
     {
-        auto out = object_storage->writeObject(StoredObject(temporary_object), WriteMode::Rewrite);
+        auto out = object_storage->writeObject(
+            StoredObject(temporary_object),
+            WriteMode::Rewrite,
+            /*attributes=*/std::nullopt,
+            blob_publication_detail::blobWriteBufferSize(envelope.size() + publication.payload_size));
         out->write(envelope.data(), envelope.size());
-        const auto copy_result = blob_publication_detail::copyBlobPayloadBounded(payload, *out, payload_size);
-        if (!copy_result.exact(payload_size))
-        {
-            out->cancel();
-            throw Exception(
-                ErrorCodes::CORRUPTED_DATA,
-                "ObjectStorageBackend::publish: source yielded {}{} payload bytes for {}, declared {} -- nothing was published",
-                copy_result.has_excess ? "more than " : "",
-                copy_result.copied,
-                key,
-                payload_size);
-        }
-        out->finalize();
+        blob_publication_detail::copyVerifiedPayloadAndFinalize(payload, *out, publication, key,
+            "ObjectStorageBackend::publish: source yielded {}{} payload bytes for {}, declared {} -- nothing was published");
     }
     catch (...)
     {
@@ -928,8 +922,7 @@ void ObjectStorageBackend::publish(const BlobPublishRequest & request, Transport
         if (mode != Mode::Native)
         {
             /// Streams straight into the temporary file and renames -- see emuPublishBlobAtomically.
-            emuPublishBlobAtomically(
-                request.destination_key, streaming->fresh_envelope, *payload, streaming->payload_size);
+            emuPublishBlobAtomically(request.destination_key, *streaming, *payload);
             return;
         }
 
@@ -939,31 +932,11 @@ void ObjectStorageBackend::publish(const BlobPublishRequest & request, Transport
             StoredObject(request.destination_key),
             WriteMode::Rewrite,
             /*attributes=*/std::nullopt,
-            DBMS_DEFAULT_BUFFER_SIZE,
+            blob_publication_detail::blobWriteBufferSize(streaming->fresh_envelope.size() + streaming->payload_size),
             blobPublicationWriteSettings());
         out->write(streaming->fresh_envelope.data(), streaming->fresh_envelope.size());
-        blob_publication_detail::BlobPayloadCopyResult copy_result;
-        try
-        {
-            copy_result = blob_publication_detail::copyBlobPayloadBounded(*payload, *out, streaming->payload_size);
-        }
-        catch (...)
-        {
-            out->cancel();
-            throw;
-        }
-        if (!copy_result.exact(streaming->payload_size))
-        {
-            out->cancel();
-            throw Exception(
-                ErrorCodes::CORRUPTED_DATA,
-                "ObjectStorageBackend::publish: source yielded {}{} payload bytes for {}, declared {} -- upload aborted, nothing published",
-                copy_result.has_excess ? "more than " : "",
-                copy_result.copied,
-                request.destination_key,
-                streaming->payload_size);
-        }
-        out->finalize();
+        blob_publication_detail::copyVerifiedPayloadAndFinalize(*payload, *out, *streaming, request.destination_key,
+            "ObjectStorageBackend::publish: source yielded {}{} payload bytes for {}, declared {} -- upload aborted, nothing published");
         return;
     }
 

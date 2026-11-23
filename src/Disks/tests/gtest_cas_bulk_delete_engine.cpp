@@ -139,6 +139,37 @@ TEST(CASConditionalBatchDeleteEngine, ReturnsMixedOutcomesInInputOrder)
     EXPECT_EQ(replaced->bytes, "v2");
 }
 
+TEST(CASConditionalBatchDeleteEngine, HeldDeletesRecheckTheSubmittedTokensWhenTheyLand)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    backend->pinConditionalBatchDeleteSupport(true);
+    auto requests = openRequestsForTest(backend);
+    auto op = requests.admit();
+    const auto stale = std::get<Committed>(op.create("already_replaced", "old", Retry::once())).etag;
+    const auto live = std::get<Committed>(op.create("replaced_later", "old", Retry::once())).etag;
+    const auto stable = std::get<Committed>(op.create("stable", "original", Retry::once())).etag;
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.replace("already_replaced", "new", stale, Retry::once())));
+    backend->setHoldDeletes(true);
+
+    /// Accept a stale token at submission so the token in the request differs from the one in the store.
+    backend->setEnforceTokens(false);
+    const auto results = op.removeManyByConditional({{"already_replaced", stale}, {"replaced_later", live}}, Retry::once());
+    ASSERT_EQ(results, (std::vector{Removal::Removed, Removal::Removed}));
+    backend->setEnforceTokens(true);
+    ASSERT_EQ(op.removeManyByConditional({{"stable", stable}}, Retry::once()), (std::vector{Removal::Removed}));
+    ASSERT_EQ(backend->pendingDeletes(), 3u);
+    ASSERT_TRUE(op.head("stable", Retry::once()));
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.replace("replaced_later", "new", live, Retry::once())));
+
+    EXPECT_EQ(backend->landPendingDelete(0), Backend::RawRemoval::Mismatch);
+    EXPECT_EQ(backend->landPendingDelete(0), Backend::RawRemoval::Mismatch);
+    EXPECT_EQ(backend->landPendingDelete(0), Backend::RawRemoval::Removed);
+    EXPECT_EQ(backend->pendingDeletes(), 0u);
+    EXPECT_TRUE(op.head("already_replaced", Retry::once()));
+    EXPECT_TRUE(op.head("replaced_later", Retry::once()));
+    EXPECT_FALSE(op.head("stable", Retry::once()));
+}
+
 TEST(CASConditionalBatchDeleteEngine, PartialSuccessRetryKeepsOriginalTokens)
 {
     auto backend = std::make_shared<RecordingConditionalBackend>();

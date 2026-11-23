@@ -22,12 +22,21 @@ these conditions is refused rather than trusted.
 | Conditional overwrite (`If-Match: <token>`) | `Backend::putOverwrite`, `Backend::casPut` | The one mutual-exclusion primitive: mount leases, `gc/state` |
 | Unconditional complete-object publication | `Backend::publishBlob` | An absent or condemned content-addressed body is replaced atomically; native stores may use multipart |
 | Native same-store copy when `cas_staging_backend = s3` | `IObjectStorage::copyObject` with `ObjectStorageCopyMode::NativeOnly` | The first absent staged publication may copy its complete object without a client-side fallback |
-| Exact-token delete | `Backend::deleteExact` | GC must delete only the incarnation it condemned, never a replacement |
+| Exact-token delete | `Backend::remove` | GC must delete only the incarnation it condemned, never a replacement |
 | Ranged same-store copy, for backups only | `UploadPartCopy` through `copyS3File` | A `BACKUP` to an `S3(...)` destination on the pool's own endpoint copies a blob's payload without its header. Optional, but only when the lack is recognized: `GCS` lacks it by its current XML API, so `Client::supportsMultiPartCopy` reports `false` there and the copy goes through the ClickHouse server, which is slower but correct. A store that instead refuses `UploadPartCopy` with an error other than `AccessDenied` fails the `BACKUP`; set `s3_allow_multipart_copy = 0` there |
 | Ranged `GET` | `Backend::get` / `Backend::getStream` with a `Range` | Opening one column file of a part costs one bounded read, not a whole-object fetch |
 | `LIST` with a resumable cursor | `Backend::list` | GC discovery and the orphan-manifest sweep page through the pool without a separate index |
 | No versioning / no delete markers | probed by `runCapabilityProbe`; `created_delete_marker` on `DeleteOutcome` | A delete marker over a live key would break exact-token semantics — GC would archive instead of reclaim |
 | `TOKEN ⟹ CONTENT` (a repeated token implies unchanged bytes) | standing requirement on every `Backend` implementation | Not probed — it cannot be tested cheaply. A backend that recycled tokens would serve stale manifests, i.e. wrong query results, not merely an inefficiency |
+| A body token never recurs at a key | standing requirement on the store | Not probed. A deletion intent and an exact-token delete both name one body incarnation; a store that gave a later body an earlier body's token would let a writer adopt a body `GC` is deleting. A token must also canonicalise to the pool's recorded dialect — the probe checks that the token of its own scratch object does and refuses the writable mount, pool creation and `cas-migrate-pool` otherwise |
+| `GET` of an absent key answers `404` | `Backend::get` on `blob-intents/` | Every blob reuse reads the intent of the body it found; `404` means "no intent exists for this incarnation now"; the writer adopts the body because its precommit edge was durable before the `HEAD`. Any other answer, including `403`, fails the part write; see [deletion intents](#deletion-intents) |
+
+A writable S3 mount also probes conditional batch deletion. It sends one `DeleteObjects`
+with four scratch keys and an individual `ETag` for each. The probe checks the per-key results
+for two matches, a stale `ETag` and an absent key, then verifies that both matching objects
+disappeared and the replacement survived. GC uses conditional `DeleteObject` for each blob
+when this capability is unavailable or the probe is skipped. GC can still use ordinary
+`DeleteObjects` requests to clean up `blob-intents/` on stores that support them.
 
 Bucket **versioning is not required** — in fact it must be **disabled** on the generation-token
 dialect (see below), because a token-exact delete on a versioned bucket archives a noncurrent
@@ -54,6 +63,28 @@ multipart upload leaves an incomplete upload under `staging/<server_root_id>/`. 
 not show it, so neither the transaction's own delete nor the mount-start sweep can remove it, and its
 parts stay billed. Add an `AbortIncompleteMultipartUpload` lifecycle rule on the bucket (one day is
 enough: a staging upload completes within its own transaction or never).
+
+## Deletion intents {#deletion-intents}
+
+`blob-intents/` holds one small object per condemned body incarnation (see the
+[blob protocol](/antalya/cas/architecture/blob-protocol#deletion-intent)). The credentials of a server
+that mounts the pool need these rights on that prefix:
+
+| Operation | S3 permission | Who | Notes |
+|---|---|---|---|
+| `GET` of a key that does not exist must answer `404` | `s3:GetObject`, and `s3:ListBucket` on the bucket | every writer | On S3 a missing key answers `404` only when the credential may also list the bucket; without it the store answers `403` and every reuse of an existing blob fails |
+| `PUT` with `If-None-Match: *` | `s3:PutObject` | the `GC` leader | Creates the intent. An existing intent with the same bytes counts as created |
+| `GET` and `HEAD` | `s3:GetObject` | `cas-fsck` | One `GET` of the intent of each `pending` `GC` row, and a `HEAD` of its body when the intent is absent. With `--verify-intents`, one `GET` of each listed intent and one `HEAD` of the body a well-formed intent names. `cas-fsck` never writes or deletes under `blob-intents/` |
+| `LIST` | `s3:ListBucket` | the `GC` leader, `cas-fsck` | One page per `GC` round walks `blob-intents/` to find intents with no `GC` row. `cas-fsck` lists the whole prefix |
+| `DELETE`, single and batch (`DeleteObjects`) | `s3:DeleteObject` | the `GC` leader | A refusal fails every round that must delete an intent |
+
+A writable mount, pool creation and `cas-migrate-pool` check these rights before they write; the probe and the
+message for each missing right are under
+[rights on `blob-intents/`](/antalya/cas/operations/migration#migrate-generation-4-rights).
+
+A pool uses exactly one token dialect (`etag`, `generation` or `emulated`), recorded in `_pool_meta` when
+the pool reaches generation 4. Every client of the pool must be configured to report the same dialect;
+a client whose dialect differs is refused at open.
 
 ## Soft delete is an operator precondition {#soft-delete}
 
@@ -94,7 +125,7 @@ That second limit is the one `CAS` meets first, because two of its objects are s
 A ref-log transaction is one create of its own key, `_log/<epoch>-<sequence>`, so a commit never repeats
 a write to a name. Only the catalog is written often enough to meet the per-name limit.
 
-Blob bodies and their metadata sidecars are named by content hash and are therefore spread the way
+Blob bodies and deletion intents are named by content hash and are therefore spread the way
 Google's own guidance asks for: it recommends "completely random object names" for the best load
 distribution, and a hashed prefix where names would otherwise be sequential. Ref-log transactions are
 sequential within a namespace but are written under a per-namespace prefix, so they scale with the
@@ -133,7 +164,7 @@ deployment where the bucket is not local to the server.
 ## Platform support {#platform-support}
 
 The deterministic request-construction coverage is green, but the
-[real-GCS release gate](/superpowers/cas/unconditional-blob-publication-live-results) remains blocked
+real-GCS release gate remains blocked
 until its credentialed OAuth and HMAC groups run against Google Cloud Storage. A fake service cannot
 establish acceptance of Google's multipart, native-copy, and exact-delete wire behavior.
 

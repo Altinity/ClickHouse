@@ -99,17 +99,15 @@ public:
 
     // ---- Fault-injection controls ----
 
-    /// When true, `remove` validates and enqueues deletes rather than applying them immediately.
-    /// The caller sees `Removed` (the send was accepted), but the object remains until
-    /// `landPendingDelete`, where the expected value is checked again.
+    /// When enabled, single-key and batched conditional deletes queue each accepted key with the
+    /// expected value from the request. The object remains until `landPendingDelete` checks that value again.
     void setHoldDeletes(bool hold);
 
     /// Returns the number of currently held deletes.
     size_t pendingDeletes() const;
 
-    /// Applies and removes the held delete at index `i`. The expected value is evaluated against the
-    /// current object at land time; the queue entry is removed whether the result is `Mismatch` or
-    /// `Removed`. An invalid index returns `NotFound`.
+    /// Consumes the held delete at index `i` and checks its expected value against the current object.
+    /// An invalid index returns `Gone`.
     RawRemoval landPendingDelete(size_t i);
 
     /// Refuses the next write of `key` once, as a clean precondition failure that leaves the store
@@ -184,9 +182,8 @@ private:
     /// backend instance, which also makes value equality a safe content-cache identity check in tests.
     String mintValue();
 
-    /// Applies an exact-value delete while `mutex_` is already held. Used by immediate deletes and by
-    /// `landPendingDelete` after its queue entry has been removed.
-    RawRemoval applyDelete(const String & key, const String & expected_value);
+    /// Caller holds `mutex_`. A held delete records the supplied value even when token checks are disabled.
+    RawRemoval removeUnderLock(const String & key, const String & expected_value, bool hold);
 
     using ArmedFailures = std::map<String, std::vector<std::exception_ptr>>;
     using Hooks = std::map<String, std::function<void()>>;

@@ -94,8 +94,13 @@ MountClaimResult racedDoubleStart(const Observation & seen)
 
 uint64_t defaultBootMs()
 {
+#if defined(OS_DARWIN)
+    constexpr clockid_t clock_id = CLOCK_MONOTONIC;
+#else
+    constexpr clockid_t clock_id = CLOCK_BOOTTIME;
+#endif
     struct timespec ts{};
-    clock_gettime(CLOCK_BOOTTIME, &ts);
+    clock_gettime(clock_id, &ts);
     return static_cast<uint64_t>(ts.tv_sec) * 1000 + static_cast<uint64_t>(ts.tv_nsec) / 1000000;
 }
 
@@ -1095,8 +1100,8 @@ MountClaimResult claimMount(
     /// clean-marked, not (yet) proven-dead, not unsafe-authorized lease may simply be a live twin, and
     /// `expires_at_ms` alone can never distinguish that from a dead predecessor across two different
     /// clocks.
-    const bool proven_dead = proven_dead_incarnation && *proven_dead_incarnation == got->etag;
-    const bool unsafe_authorized = unsafe_reclaim_authorization && *unsafe_reclaim_authorization == got->etag;
+    const bool proven_dead = proven_dead_incarnation && identicalToken(*proven_dead_incarnation, got->etag);
+    const bool unsafe_authorized = unsafe_reclaim_authorization && identicalToken(*unsafe_reclaim_authorization, got->etag);
     if (existing.gc_fenced || clean_marker || proven_dead || unsafe_authorized)
     {
         const MountPriorState prior = existing.gc_fenced ? MountPriorState::Fenced
@@ -1290,7 +1295,7 @@ MountClaimResult claimMountAwaitingExpiry(
             r.body = decodeMountLease(got->bytes);
         }
 
-        if (!observed || *observed != *current_etag)
+        if (!observed || !identicalToken(*observed, *current_etag))
         {
             if (observed && ++restarts > kMaxObservationRestarts)
                 /// The incarnation kept changing across bounded restarts — the holder is genuinely alive
@@ -1400,13 +1405,13 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
                 /// raced against our own fence-out attempt) — (re)starts the observation window and
                 /// counts as `live` this call.
                 const auto it = obs.find(srid);
-                const bool stable = it != obs.end() && it->second.etag == observed->etag
+                const bool stable = it != obs.end() && identicalToken(it->second.etag, observed->etag)
                     && it->second.heldFor(threshold_ms, round_start_ms);
 
                 if (!stable)
                 {
                     /// A sample from before this read would count the walk to the slot as time watched.
-                    if (it == obs.end() || it->second.etag != observed->etag)
+                    if (it == obs.end() || !identicalToken(it->second.etag, observed->etag))
                         obs.insert_or_assign(srid, MountIncarnationObservation{observed->etag, mono_ms_fn()});
                     ++floor.live;
                     return std::nullopt;
@@ -1697,7 +1702,7 @@ bool MountSlotOwnership::holds(const Object & slot) const
         return false;
     /// The pair alone is not enough: another writer of the same pair leaves a different ETag.
     std::lock_guard lock(mutex);
-    return (last_etag && slot.etag == *last_etag)
+    return (last_etag && sameVersion(slot.etag, *last_etag))
         || (in_flight_attempt_id && lease.write_attempt_id == *in_flight_attempt_id);
 }
 
@@ -2061,7 +2066,7 @@ MountRenewResult MountLeaseRenewer::renewOn(
                 /// safe because a call with an unclear attempt returns `Conflict` only once the token
                 /// moved, so this call left no copy of ours that could land.
                 const Object * seen = std::get_if<Object>(&conflict->seen);
-                if (!seen || seen->etag != expected || seen->bytes != last_body)
+                if (!seen || !sameVersion(seen->etag, expected) || seen->bytes != last_body)
                     break;
                 pause_ms = Retry::pauseAfterAttempt(*policy.attempt_spacing_ms, last_attempt_start_boot_ms, boot_clock());
             }
