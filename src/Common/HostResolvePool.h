@@ -140,6 +140,26 @@ public:
     /// connection is worse than opening a fresh one to the fastest known front-end.
     double getMinLatencyMs();
 
+    /// Consistent point-in-time snapshot of per-address latency EWMAs, captured under a single
+    /// `mutex` acquisition before `EndpointConnectionPool` takes its own lock. Keeps the resolver
+    /// mutex completely out of the endpoint pool critical section and gives non-measured endpoints
+    /// (for example non-S3 HTTP pools) an immediate O(1) fast exit without touching the heap.
+    struct LatencySnapshot
+    {
+        /// Sorted by `first` (`records` in `HostResolver` is sorted by `address`), containing only
+        /// addresses with `latency_ms_ewma > 0`. Empty when no address has a measurement.
+        std::vector<std::pair<Poco::Net::IPAddress, double>> entries;
+        /// Smallest EWMA across non-failed measured addresses (0 if none), matching `getMinLatencyMs`.
+        double min_non_failed_ms = 0;
+
+        bool empty() const noexcept { return entries.empty(); }
+
+        /// Returns the recorded EWMA (ms) for `address`, or 0 if unmeasured / absent.
+        double lookupLatencyMs(const Poco::Net::IPAddress & address) const noexcept;
+    };
+
+    LatencySnapshot getLatencySnapshot();
+
     static HostResolverMetrics getMetrics();
 
 protected:
@@ -281,6 +301,12 @@ protected:
 
     Poco::Timestamp last_resolve_time TSA_GUARDED_BY(mutex) = Poco::Timestamp::TIMEVAL_MIN;
     Records records TSA_GUARDED_BY(mutex);
+
+    /// True once at least one record in `records` has `latency_ms_ewma > 0`. Reset in `reset()`
+    /// and refreshed on `updateImpl` (an expired address may have held the only measurement).
+    /// Lets `getLatencySnapshot` return in O(1) without locking `mutex` on endpoints that never
+    /// report latency (for example non-S3 HTTP pools).
+    std::atomic<bool> has_measured_latency{false};
 
     /// Process-wide toggle for latency-aware selection. Shared by all resolvers.
     static std::atomic<bool> latency_aware_selection;

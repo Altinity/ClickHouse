@@ -1,7 +1,9 @@
 #include <Common/HTTPConnectionPool.h>
 #include <Common/HostResolvePool.h>
 
+#include <algorithm>
 #include <limits>
+#include <optional>
 #include <vector>
 
 #include <Common/ProfileEvents.h>
@@ -672,10 +674,23 @@ private:
             return request_stream_completed && response_stream_completed;
         }
 
+        void updateCachedResolvedIp() noexcept
+        {
+            Poco::Net::IPAddress ip;
+            const std::string resolved = Session::getResolvedHost();
+            if (!resolved.empty() && Poco::Net::IPAddress::tryParse(resolved, ip))
+                cached_resolved_ip = ip;
+            else
+                cached_resolved_ip.reset();
+        }
+
         EndpointConnectionPool::WeakPtr pool;
         ConnectionGroup::Ptr group;
         IHTTPConnectionPoolForEndpoint::Metrics metrics;
         bool isExpired = false;
+        /// Pre-parsed `_resolved_host` so `selectBestStoredConnectionImpl` never allocates a
+        /// `std::string` or runs `IPAddress::tryParse` per candidate while holding `mutex`.
+        std::optional<Poco::Net::IPAddress> cached_resolved_ip;
 
         LoggerPtr log = getLogger("PooledConnection");
 
@@ -697,7 +712,92 @@ private:
         }
     };
 
-    using ConnectionsMinHeap = std::priority_queue<ConnectionPtr, std::vector<ConnectionPtr>, GreaterByLastRequest>;
+    /// Thin min-heap wrapper over `std::vector<ConnectionPtr>` (`GreaterByLastRequest` keeps the
+    /// earliest-expiring connection at `front()`, matching `std::priority_queue::top()`). Unlike
+    /// `std::priority_queue`, it exposes read-only indexed access for an O(N) scan and O(log N)
+    /// removal of an arbitrary element (`extractAt`), so latency-aware dispatch does not drain
+    /// and re-push the entire pool in O(N log N) on every borrow.
+    class ConnectionsMinHeap
+    {
+    public:
+        bool empty() const noexcept { return items.empty(); }
+        size_t size() const noexcept { return items.size(); }
+
+        const ConnectionPtr & top() const noexcept { return items.front(); }
+        const ConnectionPtr & operator[](size_t index) const noexcept { return items[index]; }
+
+        void push(ConnectionPtr conn)
+        {
+            items.push_back(std::move(conn));
+            std::push_heap(items.begin(), items.end(), GreaterByLastRequest{});
+        }
+
+        void pop()
+        {
+            std::pop_heap(items.begin(), items.end(), GreaterByLastRequest{});
+            items.pop_back();
+        }
+
+        ConnectionPtr extractAt(size_t index) noexcept
+        {
+            chassert(index < items.size());
+            if (index == 0)
+            {
+                ConnectionPtr chosen = items.front();
+                pop();
+                return chosen;
+            }
+
+            ConnectionPtr chosen = std::move(items[index]);
+            const size_t last = items.size() - 1;
+            if (index == last)
+            {
+                items.pop_back();
+                return chosen;
+            }
+
+            items[index] = std::move(items[last]);
+            items.pop_back();
+
+            /// Restore min-heap order (`GreaterByLastRequest(parent, child) == false` means
+            /// `parent <= child` in expiry order, i.e. heap property holds). Either the moved
+            /// replacement expires earlier than its parent (sift up) or later than a child
+            /// (sift down), in at most O(log N) swaps with zero allocations.
+            GreaterByLastRequest cmp;
+            if (cmp(items[(index - 1) / 2], items[index]))
+            {
+                while (index > 0)
+                {
+                    const size_t parent = (index - 1) / 2;
+                    if (!cmp(items[parent], items[index]))
+                        break;
+                    std::swap(items[parent], items[index]);
+                    index = parent;
+                }
+            }
+            else
+            {
+                const size_t n = items.size();
+                while (true)
+                {
+                    const size_t left = 2 * index + 1;
+                    if (left >= n)
+                        break;
+                    const size_t right = left + 1;
+                    size_t smallest = (right < n && cmp(items[left], items[right])) ? right : left;
+                    if (!cmp(items[index], items[smallest]))
+                        break;
+                    std::swap(items[index], items[smallest]);
+                    index = smallest;
+                }
+            }
+
+            return chosen;
+        }
+
+    private:
+        std::vector<ConnectionPtr> items;
+    };
 
 public:
     template <class... Args>
@@ -734,27 +834,33 @@ public:
 
         ConnectionPtr reused_connection;
 
-        /// Look up the cached resolver before taking `mutex`: we only need per-address latency
-        /// measurements that are already recorded, and `tryGetResolver` never creates a resolver
-        /// or runs DNS. Calling `getResolver` while `stored_connections` is drained into a local
-        /// vector under `mutex` would both resolve proxy-only targets locally and, on a DNS error
-        /// (for example after `SYSTEM DROP DNS CACHE`), destroy `PooledConnection`s during stack
-        /// unwinding while `mutex` is still held, self-deadlocking in `atConnectionDestroy`.
-        HostResolver::Ptr latency_resolver;
+        /// Capture a single-lock latency snapshot from the cached resolver before taking `mutex`:
+        /// - `tryGetResolver` never creates a resolver or runs DNS, so proxy-only targets and
+        ///   dropped DNS caches cannot throw or self-deadlock under `mutex`;
+        /// - `getLatencySnapshot` returns immediately in O(1) without locking the resolver mutex
+        ///   when no address has a measurement (e.g. non-S3 HTTP pools), and otherwise takes the
+        ///   resolver mutex at most once per `getConnection` outside `mutex` rather than N + 1
+        ///   times inside `mutex`.
+        HostResolver::LatencySnapshot latency_snapshot;
         if (HostResolver::latencyAwareSelectionEnabled() && usesTargetResolution())
-            latency_resolver = HostResolversPool::instance().tryGetResolver(host);
+        {
+            MemoryTrackerSwitcher switcher{&total_memory_tracker};
+            if (auto latency_resolver = HostResolversPool::instance().tryGetResolver(host))
+                latency_snapshot = latency_resolver->getLatencySnapshot();
+        }
 
         {
             MemoryTrackerSwitcher switcher{&total_memory_tracker};
             std::lock_guard lock(mutex);
             expired_connections.reserve(stored_connections.size());
 
-            wipeExpiredImpl(expired_connections);
+            auto is_soft_limit_reached = group->isSoftLimitReached();
+            wipeExpiredImpl(expired_connections, is_soft_limit_reached);
 
             if (!stored_connections.empty())
             {
-                if (latency_resolver)
-                    reused_connection = selectBestStoredConnectionImpl(*latency_resolver);
+                if (!latency_snapshot.empty())
+                    reused_connection = selectBestStoredConnectionImpl(latency_snapshot, is_soft_limit_reached);
                 else
                 {
                     reused_connection = stored_connections.top();
@@ -801,17 +907,16 @@ public:
         });
 
         std::lock_guard lock(mutex);
-        return wipeExpiredImpl(expired_connections);
+        return wipeExpiredImpl(expired_connections, group->isSoftLimitReached());
     }
 
-    size_t wipeExpiredImpl(std::vector<ConnectionPtr> & expired_connections) TSA_REQUIRES(mutex)
+    size_t wipeExpiredImpl(std::vector<ConnectionPtr> & expired_connections, bool is_soft_limit_reached) TSA_REQUIRES(mutex)
     {
         SCOPE_EXIT({
             CurrentMetrics::sub(getMetrics().stored_count, expired_connections.size());
             ProfileEvents::increment(getMetrics().expired, expired_connections.size());
         });
 
-        auto is_soft_limit_reached = group->isSoftLimitReached();
         while (!stored_connections.empty())
         {
             auto connection = stored_connections.top();
@@ -841,51 +946,24 @@ private:
 
     /// Latency-aware dispatch: among the pooled connections, hand out the one whose resolved
     /// front-end has the lowest observed latency EWMA, instead of the default least-recently-used
-    /// pick. Because each concurrent caller removes its chosen connection under `mutex`, a burst
-    /// of parallel requests spreads across the fastest-available connections rather than all
-    /// contending for a single one, so parallelism is preserved while slow front-ends are avoided.
+    /// pick. Scans the underlying heap storage in-place in O(N) using pre-parsed `cached_resolved_ip`
+    /// and the pre-fetched `snapshot` (zero allocations and zero nested mutex acquisitions under
+    /// `mutex`), then extracts the chosen slot in O(log N) via `extractAt`.
     /// Returns `nullptr` when even the fastest pooled connection is materially slower than the
     /// fastest known front-end and the group is below its soft limit, so the caller opens a fresh
     /// connection instead.
-    ConnectionPtr selectBestStoredConnectionImpl(HostResolver & resolver) TSA_REQUIRES(mutex)
+    ConnectionPtr selectBestStoredConnectionImpl(
+        const HostResolver::LatencySnapshot & snapshot, bool is_soft_limit_reached) noexcept TSA_REQUIRES(mutex)
     {
-        struct CandidatesGuard
-        {
-            ConnectionsMinHeap & heap;
-            std::vector<ConnectionPtr> items;
-
-            explicit CandidatesGuard(ConnectionsMinHeap & heap_)
-                : heap(heap_)
-            {
-                items.reserve(heap.size());
-            }
-
-            /// Always return every remaining non-null connection to `heap` before `items` is
-            /// destroyed: running `~PooledConnection` while `mutex` is held would self-deadlock
-            /// in `atConnectionDestroy`, and dropping connections would leak `stored_count`.
-            ~CandidatesGuard() noexcept TSA_NO_THREAD_SAFETY_ANALYSIS
-            {
-                for (auto & c : items)
-                    if (c)
-                        heap.push(std::move(c));
-            }
-        } candidates(stored_connections);
-
-        while (!stored_connections.empty())
-        {
-            candidates.items.push_back(stored_connections.top());
-            stored_connections.pop();
-        }
-
         size_t best = 0;
         double best_latency = std::numeric_limits<double>::max();
-        for (size_t i = 0; i < candidates.items.size(); ++i)
+        const size_t n = stored_connections.size();
+        for (size_t i = 0; i < n; ++i)
         {
             double latency = std::numeric_limits<double>::max();
-            Poco::Net::IPAddress ip;
-            if (Poco::Net::IPAddress::tryParse(candidates.items[i]->getResolvedHost(), ip))
+            if (const auto & ip = stored_connections[i]->cached_resolved_ip)
             {
-                const double ewma = resolver.getLatencyMs(ip);
+                const double ewma = snapshot.lookupLatencyMs(*ip);
                 /// Unmeasured (0) is treated as worst so measured-fast connections win;
                 /// unmeasured ones are still used once the fast ones are handed out (and
                 /// reporting keeps every served address's EWMA fresh).
@@ -906,15 +984,14 @@ private:
         /// TTFB gap, so this trades a cheap connect for a big per-request win and shifts the
         /// pool's composition toward fast front-ends over time. Gated on the soft limit so it
         /// cannot grow the pool without bound.
-        if (!group->isSoftLimitReached()
-            && best_latency != std::numeric_limits<double>::max())
+        if (!is_soft_limit_reached && best_latency != std::numeric_limits<double>::max())
         {
-            const double fleet_min = resolver.getMinLatencyMs();
+            const double fleet_min = snapshot.min_non_failed_ms;
             if (fleet_min > 0 && best_latency > fleet_min * 1.3 && best_latency - fleet_min > 15.0)
                 return nullptr;
         }
 
-        return std::move(candidates.items[best]);
+        return stored_connections.extractAt(best);
     }
 
     bool isExpired(ConnectionPtr connection, bool isSoftLimitReached) TSA_REQUIRES(mutex)
@@ -1217,6 +1294,7 @@ private:
         {
             auto connection_to_store = PooledConnection::create(this->getWeakFromThis(), group, getMetrics(), host, port);
             connection_to_store->assign(connection);
+            connection_to_store->updateCachedResolvedIp();
             connection_to_store->notifySocketInode();
 
             {

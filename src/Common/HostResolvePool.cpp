@@ -135,6 +135,7 @@ void HostResolver::reset()
 
     CurrentMetrics::sub(metrics.active_count, records.size());
     records.clear();
+    has_measured_latency.store(false, std::memory_order_relaxed);
 }
 
 void HostResolver::updateWeights()
@@ -191,11 +192,44 @@ void HostResolver::reportLatency(const Poco::Net::IPAddress & address, UInt64 mi
         return;
 
     it->setLatency(microseconds);
+    has_measured_latency.store(true, std::memory_order_relaxed);
 
     /// A fresh latency sample shifts the EWMA, which changes the latency-biased weights even
     /// when the base (usage) weight is unchanged, so recompute when latency-aware selection is on.
     if (latency_aware_selection.load(std::memory_order_relaxed))
         updateWeights();
+}
+
+double HostResolver::LatencySnapshot::lookupLatencyMs(const Poco::Net::IPAddress & address) const noexcept
+{
+    auto it = std::lower_bound(
+        entries.begin(),
+        entries.end(),
+        address,
+        [](const auto & entry, const Poco::Net::IPAddress & value) { return entry.first < value; });
+    if (it != entries.end() && it->first == address)
+        return it->second;
+    return 0;
+}
+
+HostResolver::LatencySnapshot HostResolver::getLatencySnapshot()
+{
+    LatencySnapshot snapshot;
+    if (!has_measured_latency.load(std::memory_order_relaxed))
+        return snapshot;
+
+    std::lock_guard lock(mutex);
+
+    snapshot.entries.reserve(records.size());
+    for (const auto & rec : records)
+    {
+        if (rec.latency_ms_ewma <= 0)
+            continue;
+        snapshot.entries.emplace_back(rec.address, rec.latency_ms_ewma);
+        if (!rec.failed && (snapshot.min_non_failed_ms == 0 || rec.latency_ms_ewma < snapshot.min_non_failed_ms))
+            snapshot.min_non_failed_ms = rec.latency_ms_ewma;
+    }
+    return snapshot;
 }
 
 double HostResolver::getLatencyMs(const Poco::Net::IPAddress & address)
@@ -387,6 +421,17 @@ void HostResolver::updateImpl(Poco::Timestamp now, std::vector<Poco::Net::IPAddr
 
     last_resolve_time = now;
     records.swap(merged);
+
+    bool any_measured = false;
+    for (const auto & rec : records)
+    {
+        if (rec.latency_ms_ewma > 0)
+        {
+            any_measured = true;
+            break;
+        }
+    }
+    has_measured_latency.store(any_measured, std::memory_order_relaxed);
 
     if (records.empty())
         throw NetException(ErrorCodes::DNS_ERROR, "no endpoints resolved for host {}", host);

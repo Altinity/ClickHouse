@@ -15,8 +15,10 @@
 #include <Poco/Net/HTTPRequestHandlerFactory.h>
 #include <Poco/Net/ServerSocket.h>
 #include <Poco/Net/SocketAddress.h>
+#include <Poco/Net/StreamSocket.h>
 
 #include <atomic>
+#include <set>
 
 #include <gtest/gtest.h>
 
@@ -1219,4 +1221,103 @@ TEST_F(ConnectionPoolTest, LatencyAwareProxyReuseSkipsTargetResolution)
     ASSERT_EQ(2, DB::CurrentThread::getProfileEvents()[metrics.preserved]);
     ASSERT_EQ(1, CurrentMetrics::get(metrics.stored_count));
     ASSERT_EQ(nullptr, DB::HostResolversPool::instance().tryGetResolver("proxy-only-reuse.invalid"));
+}
+
+TEST_F(ConnectionPoolTest, LatencyAwareDispatchExtractsFastestConnectionInPlace)
+{
+    /// Exercises in-place heap scan + `ConnectionsMinHeap::extractAt` across multiple pooled
+    /// connections bound to distinct loopback addresses (`127.0.0.1`, `127.0.0.2`, `127.0.0.3`):
+    /// regardless of where the fastest connection sits in the min-heap (root, interior, or leaf),
+    /// `getConnection` must hand out pooled connections in ascending EWMA order and preserve heap
+    /// integrity across repeated borrows and returns.
+    DB::HostResolver::setLatencyAwareSelection(true);
+    SCOPE_EXIT({
+        DB::HostResolver::setLatencyAwareSelection(false);
+        DB::HostResolversPool::instance().dropCache();
+    });
+
+    const String test_host = "multi-frontend-dispatch.invalid";
+    const Poco::Net::IPAddress slow_ip("127.0.0.1");
+    const Poco::Net::IPAddress mid_ip("127.0.0.2");
+    const Poco::Net::IPAddress fast_ip("127.0.0.3");
+
+    /// Deterministic round-robin mock resolver so three simultaneous borrows open one connection
+    /// to each of the three loopback addresses (`server_data` listens on wildcard `0.0.0.0`).
+    /// Note: on macOS only `127.0.0.1` is configured on `lo0` by default, whereas the Linux test
+    /// container routes the entire `127.0.0.0/8` block on `lo`. Probe `127.0.0.2` first and fall
+    /// back to `127.0.0.1` only if the host OS lacks `127.0.0.2`.
+    bool has_full_loopback_subnet = false;
+    try
+    {
+        Poco::Net::StreamSocket probe;
+        probe.connect(Poco::Net::SocketAddress(mid_ip, server_data.port), Poco::Timespan(1, 0));
+        has_full_loopback_subnet = true;
+    }
+    catch (...) // NOLINT(bugprone-empty-catch)
+    {
+    }
+    if (!has_full_loopback_subnet)
+        GTEST_SKIP() << "127.0.0.2 is not routed on loopback on this OS";
+
+    struct SequentialMockResolver : public DB::HostResolver
+    {
+        using ResolveFunction = DB::HostResolver::ResolveFunction;
+        SequentialMockResolver(String h, Poco::Timespan history_, ResolveFunction f)
+            : DB::HostResolver(std::move(f), std::move(h), history_)
+        {}
+    };
+
+    auto mock_resolver = std::make_shared<SequentialMockResolver>(
+        test_host,
+        Poco::Timespan(60 * 1000 * 1000),
+        [slow_ip, mid_ip, fast_ip](const String &) -> std::vector<Poco::Net::IPAddress>
+        {
+            return {slow_ip, mid_ip, fast_ip};
+        });
+    DB::HostResolversPool::instance().injectResolverForTest(test_host, mock_resolver);
+
+    auto uri = Poco::URI("http://" + test_host + ":" + std::to_string(server_data.port));
+    auto pool = DB::HTTPConnectionPools::instance().getPool(
+        DB::HTTPConnectionGroupType::HTTP, uri, DB::ProxyConfiguration{});
+    auto metrics = pool->getMetrics();
+
+    /// Open concurrent connections until we hold at least one bound to each of the 3 addresses,
+    /// plus extras so `stored_connections` has depth >= 3 (root, interior, leaf positions).
+    std::vector<DB::IHTTPConnectionPoolForEndpoint::ConnectionPtr> held;
+    std::set<std::string> seen_ips;
+    for (size_t attempt = 0; attempt < 64 && (seen_ips.size() < 3 || held.size() < 6); ++attempt)
+    {
+        auto conn = pool->getConnection(timeouts, nullptr);
+        echoRequest("warmup", *conn);
+        seen_ips.insert(conn->getResolvedHost());
+        held.push_back(std::move(conn));
+    }
+    ASSERT_EQ(3u, seen_ips.size());
+    const size_t pooled_total = held.size();
+    held.clear(); /// Return all connections into `stored_connections`.
+    ASSERT_EQ(static_cast<Int64>(pooled_total), CurrentMetrics::get(metrics.stored_count));
+
+    /// Keep the spread within 15 ms (`best - fleet_min <= 15`) so pool-composition bias does not
+    /// open fresh connections and we strictly test in-place extraction from `stored_connections`.
+    mock_resolver->reportLatency(fast_ip, 2'000);  /// 2 ms
+    mock_resolver->reportLatency(mid_ip, 8'000);   /// 8 ms
+    mock_resolver->reportLatency(slow_ip, 14'000); /// 14 ms
+
+    /// Borrow all `pooled_total` connections simultaneously: every `fast_ip` connection must come
+    /// out before any `mid_ip`, and every `mid_ip` before any `slow_ip`.
+    double prev_latency = 0.0;
+    for (size_t i = 0; i < pooled_total; ++i)
+    {
+        auto conn = pool->getConnection(timeouts, nullptr);
+        Poco::Net::IPAddress ip(conn->getResolvedHost());
+        const double lat = mock_resolver->getLatencyMs(ip);
+        ASSERT_GE(lat, prev_latency);
+        prev_latency = lat;
+        echoRequest("check", *conn);
+        held.push_back(std::move(conn));
+    }
+    held.clear();
+    ASSERT_EQ(static_cast<Int64>(pooled_total), CurrentMetrics::get(metrics.stored_count));
+    ASSERT_EQ(pooled_total, DB::CurrentThread::getProfileEvents()[metrics.created]);
+    ASSERT_EQ(pooled_total, DB::CurrentThread::getProfileEvents()[metrics.reused]);
 }

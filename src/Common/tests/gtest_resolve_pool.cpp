@@ -913,3 +913,36 @@ TEST_F(ResolvePoolTest, LatencyIsIgnoredWhenLatencyAwareSelectionIsOff)
 
     ASSERT_GT(0.3 * mean, diff);
 }
+
+TEST_F(ResolvePoolTest, LatencySnapshotFastExitAndLookup)
+{
+    LatencyAwareSelectionScope scope(true);
+    auto resolver = make_resolver();
+    resolver->resolve();
+
+    /// Before any measurement, `getLatencySnapshot` takes the atomic fast path and returns empty.
+    ASSERT_TRUE(resolver->getLatencySnapshot().empty());
+
+    const Poco::Net::IPAddress fast("127.0.0.1");
+    const Poco::Net::IPAddress mid("127.0.0.2");
+    const Poco::Net::IPAddress unmeasured("127.0.0.3");
+    const Poco::Net::IPAddress unknown("127.0.0.9");
+
+    resolver->reportLatency(mid, 10000);
+    resolver->reportLatency(fast, 2000);
+
+    {
+        auto snap = resolver->getLatencySnapshot();
+        ASSERT_FALSE(snap.empty());
+        ASSERT_EQ(2u, snap.entries.size());
+        ASSERT_DOUBLE_EQ(2.0, snap.lookupLatencyMs(fast));
+        ASSERT_DOUBLE_EQ(10.0, snap.lookupLatencyMs(mid));
+        ASSERT_DOUBLE_EQ(0.0, snap.lookupLatencyMs(unmeasured));
+        ASSERT_DOUBLE_EQ(0.0, snap.lookupLatencyMs(unknown));
+        ASSERT_DOUBLE_EQ(2.0, snap.min_non_failed_ms);
+    }
+
+    /// `reset` clears the measured flag so the snapshot is empty again.
+    resolver->reset();
+    ASSERT_TRUE(resolver->getLatencySnapshot().empty());
+}
