@@ -163,8 +163,23 @@ private:
 
 }
 
+void ReadFromObjectStorageStep::applyPendingPrewhereFilter()
+{
+    if (!prewhere_pruning_filter_pending)
+        return;
+    prewhere_pruning_filter_pending = false;
+
+    if (!query_info.prewhere_info)
+        return;
+
+    const auto & prewhere = *query_info.prewhere_info;
+    if (const auto * node = prewhere.prewhere_actions.tryFindInOutputs(prewhere.prewhere_column_name))
+        applyFilters(ActionDAGNodes{{node}});
+}
+
 void ReadFromObjectStorageStep::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings & settings)
 {
+    applyPendingPrewhereFilter();
     createIterator();
 
     if (distributed_read_bucket_count > 0 && !distributed_read_iterator_applied)
@@ -492,12 +507,8 @@ std::unique_ptr<IQueryPlanStep> ReadFromObjectStorageStep::deserialize(Deseriali
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Reading from {} is expected to produce ReadFromObjectStorage", table_id.getNameForLogs());
 
     /// The files are pruned by the filter: the one the prewhere carries is the one the initiator pruned with.
-    if (query_info.prewhere_info)
-    {
-        const auto & prewhere = *query_info.prewhere_info;
-        if (const auto * node = prewhere.prewhere_actions.tryFindInOutputs(prewhere.prewhere_column_name))
-            read_step->applyFilters(ActionDAGNodes{{node}});
-    }
+    /// It is applied when the pipeline is built: the sets of an `IN` in it are not resolved before the plan is deserialized.
+    read_step->prewhere_pruning_filter_pending = query_info.prewhere_info != nullptr;
 
     if (distributed_read_bucket_count)
         read_step->setDistributedRead(distributed_read_bucket_count);

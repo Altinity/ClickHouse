@@ -84,6 +84,8 @@ static void buildSetsForDagImpl(const ActionsDAG & dag, const ContextPtr & conte
             if (column_set)
             {
                 auto future_set = column_set->getData();
+                if (!future_set)
+                    throw Exception(ErrorCodes::LOGICAL_ERROR, "The set of an IN is not resolved yet, as in a plan that is being deserialized");
                 if (!future_set->get())
                 {
                     if (auto * set_from_subquery = typeid_cast<FutureSetFromSubquery *>(future_set.get()))
@@ -133,6 +135,8 @@ void buildSetsForDAGExcludingGlobalIn(const ActionsDAG & dag, const ContextPtr &
             if (column_set)
             {
                 auto future_set = column_set->getData();
+                if (!future_set)
+                    throw Exception(ErrorCodes::LOGICAL_ERROR, "The set of an IN is not resolved yet, as in a plan that is being deserialized");
                 if (!future_set->get())
                 {
                     if (auto * set_from_subquery = typeid_cast<FutureSetFromSubquery *>(future_set.get()))

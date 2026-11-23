@@ -95,7 +95,12 @@ private:
     size_t distributed_read_bucket_count = 0;
     /// The iterator of a distributed read is wrapped to pass only the files of the task's bucket, once.
     bool distributed_read_iterator_applied = false;
+    /// A deserialized step prunes the files by the filter of its PREWHERE, like the initiator did.
+    /// The sets of an `IN` in that filter are placeholders until the whole plan is deserialized
+    /// (`QueryPlan::makeSets`), so the filter is applied when the pipeline is built, not on deserialization.
+    bool prewhere_pruning_filter_pending = false;
 
+    void applyPendingPrewhereFilter();
     void createIterator();
 };
 
