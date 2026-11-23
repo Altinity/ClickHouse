@@ -59,13 +59,17 @@ read_backup_and_check()
 ${CLICKHOUSE_CLIENT} -q "SYSTEM CLEAR OBJECT STORAGE IDENTITY CACHE" || fail "clear failed"
 ${CLICKHOUSE_CLIENT} -q "CREATE TABLE t (n UInt64) ENGINE = Memory" || fail "create failed"
 ${CLICKHOUSE_CLIENT} -q "INSERT INTO t VALUES (1)" || fail "insert failed"
-${CLICKHOUSE_CLIENT} -q "BACKUP TABLE t TO S3('${BACKUP_URL}', 'test', 'testtest')" >/dev/null || fail "first backup failed"
+# The checksum setting only silences a warning on stderr that the test runner treats as a failure.
+${CLICKHOUSE_CLIENT} --s3_disable_checksum=1 -q "BACKUP TABLE t TO S3('${BACKUP_URL}', 'test', 'testtest')" >/dev/null || fail "first backup failed"
 
 read_backup_and_check cold ge1
 read_backup_and_check warm eq0
 
 ${CLICKHOUSE_CLIENT} -q "INSERT INTO t VALUES (2)" || fail "second insert failed"
-${CLICKHOUSE_CLIENT} -q "BACKUP TABLE t TO S3('${BACKUP_URL}', 'test', 'testtest')" >/dev/null || fail "second backup failed"
+# BACKUP refuses a destination whose `.backup` already exists, so remove the first one and write the
+# second backup over the same object keys. The DELETE goes straight to the mock S3, not through ClickHouse.
+${CLICKHOUSE_CURL} -fsS -X DELETE "${OBJECT_URL}" || fail "delete first backup object failed"
+${CLICKHOUSE_CLIENT} --s3_disable_checksum=1 -q "BACKUP TABLE t TO S3('${BACKUP_URL}', 'test', 'testtest')" >/dev/null || fail "second backup failed"
 
 read_backup_and_check replaced ge1
 
