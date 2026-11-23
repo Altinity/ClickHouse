@@ -2261,7 +2261,8 @@ std::shared_ptr<FaultyLocalObjectStorage> makeFaultyStorageForTest()
     std::error_code ec;
     std::filesystem::remove_all(root, ec);
     std::filesystem::create_directories(root, ec);
-    return std::make_shared<FaultyLocalObjectStorage>(DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false));
+    return DB::Cas::tests::ownedByDirectory(
+        std::make_shared<FaultyLocalObjectStorage>(DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false)), root);
 }
 
 }
@@ -2322,8 +2323,8 @@ TEST(CASWiringReadOnly, ObserveOnlyOpenReadsButRejectsWrites)
     const auto root = (std::filesystem::temp_directory_path()
                        / ("ca_ro_" + std::to_string(::getpid()))).string();
     std::error_code ec; std::filesystem::remove_all(root, ec); std::filesystem::create_directories(root, ec);
-    auto writable_os = std::make_shared<DB::LocalObjectStorage>(
-        DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false));
+    auto writable_os = DB::Cas::tests::ownedByDirectory(
+        std::make_shared<DB::LocalObjectStorage>(DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false)), root);
     {
         auto w_settings = DB::Cas::tests::makeSettingsForTest(
             "test", std::filesystem::temp_directory_path() / "ca_ro_scratch");
@@ -2483,8 +2484,8 @@ std::shared_ptr<RecordingLocalObjectStorage> makeRecordingStorageForTest(const s
     std::error_code ec;
     std::filesystem::remove_all(root, ec);
     std::filesystem::create_directories(root, ec);
-    return std::make_shared<RecordingLocalObjectStorage>(
-        DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false));
+    return DB::Cas::tests::ownedByDirectory(
+        std::make_shared<RecordingLocalObjectStorage>(DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false)), root);
 }
 
 /// True for a durable ref-object write key under `/cas/ns/stream/`. In the snapshot+log ref model the

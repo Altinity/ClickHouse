@@ -2,6 +2,7 @@
 
 #include "config.h"
 
+#include <Disks/tests/cas_scoped_test_directory.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.h>
@@ -478,7 +479,7 @@ inline DB::ObjectStoragePtr makeLocalObjectStorageForTest()
         throw std::runtime_error("cannot create test object storage root " + root + ": " + ec.message());
 
     DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
-    return std::make_shared<DB::LocalObjectStorage>(std::move(settings));
+    return ownedByDirectory(std::make_shared<DB::LocalObjectStorage>(std::move(settings)), root);
 }
 
 /// Anchor a key under an object storage's own root, for the `Mode::Native` tests.

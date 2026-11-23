@@ -53,14 +53,15 @@ DiskFixture openDiskFixture()
 {
     static std::atomic<uint64_t> counter{0};
     const String unique = std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1));
-    auto settings = makeSettingsForTest(
-        "srv1", std::filesystem::temp_directory_path() / ("cas_ns_file_contract_scratch_" + unique));
+    const auto scratch = std::filesystem::temp_directory_path() / ("cas_ns_file_contract_scratch_" + unique);
+    auto settings = makeSettingsForTest("srv1", scratch);
     settings[DB::ContentAddressedSetting::gc_enabled] = false;
 
     DiskFixture fixture;
     fixture.object_storage = makeLocalObjectStorageForTest();
-    fixture.storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        fixture.object_storage, "pool", "srv1", "", nullptr, settings);
+    fixture.storage = ownedByDirectory(
+        std::make_shared<DB::ContentAddressedMetadataStorage>(fixture.object_storage, "pool", "srv1", "", nullptr, settings),
+        scratch);
     fixture.storage->startup();
     return fixture;
 }

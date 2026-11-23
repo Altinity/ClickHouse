@@ -272,7 +272,7 @@ DB::ObjectStoragePtr makeThrowingS3StorageForTest()
     std::filesystem::create_directories(root, ec);
 
     DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
-    return std::make_shared<ThrowingS3ObjectStorage>(std::move(settings));
+    return DB::Cas::tests::ownedByDirectory(std::make_shared<ThrowingS3ObjectStorage>(std::move(settings)), root);
 }
 
 }

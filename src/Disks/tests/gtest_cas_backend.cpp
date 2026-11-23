@@ -940,7 +940,7 @@ std::shared_ptr<PublicationRecordingLocalObjectStorage> makePublicationRecording
     std::filesystem::create_directories(root, ec);
 
     DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
-    return std::make_shared<PublicationRecordingLocalObjectStorage>(std::move(settings));
+    return DB::Cas::tests::ownedByDirectory(std::make_shared<PublicationRecordingLocalObjectStorage>(std::move(settings)), root);
 }
 
 String readStorageObject(const DB::ObjectStoragePtr & storage, const String & key)
@@ -1336,7 +1336,8 @@ public:
 /// is not an ordinary answer and stays loud.
 TEST(CASObjectStorageBackend, IfMatchWriteDeclaresAnAbsentKeyExpected)
 {
-    DB::LocalObjectStorageSettings settings("test", tests::makeLocalObjectStorageForTest()->getCommonKeyPrefix(), /*read_only_=*/false);
+    const auto root_owner = tests::makeLocalObjectStorageForTest();
+    DB::LocalObjectStorageSettings settings("test", root_owner->getCommonKeyPrefix(), /*read_only_=*/false);
     auto storage = std::make_shared<Expect404RecordingLocalObjectStorage>(std::move(settings));
     auto backend = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
 
@@ -1488,7 +1489,8 @@ ThrowOnReadFixture makeThrowOnReadStorageForTest(const std::string & key_suffix)
     std::filesystem::create_directories(root, ec);
 
     DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
-    auto storage = std::make_shared<NativeReadThrowsNoSuchKeyObjectStorage>(std::move(settings));
+    auto storage = DB::Cas::tests::ownedByDirectory(
+        std::make_shared<NativeReadThrowsNoSuchKeyObjectStorage>(std::move(settings)), root);
     const std::string key = DB::Cas::tests::nativeKeyUnder(storage, key_suffix);
 
     /// Write the object so tryGetObjectMetadata reports it present (HEAD succeeds).
@@ -1672,7 +1674,7 @@ DB::ObjectStoragePtr makeFixedEtagStorageForTest()
     std::filesystem::create_directories(root, ec);
 
     DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
-    return std::make_shared<FixedEtagLocalObjectStorage>(std::move(settings));
+    return DB::Cas::tests::ownedByDirectory(std::make_shared<FixedEtagLocalObjectStorage>(std::move(settings)), root);
 }
 
 }
@@ -1768,7 +1770,7 @@ DB::ObjectStoragePtr makeFixedNumericEtagStorageForTest(const String & etag)
     std::filesystem::create_directories(root, ec);
 
     DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
-    return std::make_shared<FixedNumericEtagLocalObjectStorage>(std::move(settings), etag);
+    return DB::Cas::tests::ownedByDirectory(std::make_shared<FixedNumericEtagLocalObjectStorage>(std::move(settings), etag), root);
 }
 
 class ClockEtagLocalObjectStorage final : public DB::LocalObjectStorage
@@ -1802,7 +1804,7 @@ DB::ObjectStoragePtr makeClockEtagStorageForTest(const std::shared_ptr<std::atom
     std::filesystem::create_directories(root, ec);
 
     DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
-    return std::make_shared<ClockEtagLocalObjectStorage>(std::move(settings), now_ns);
+    return DB::Cas::tests::ownedByDirectory(std::make_shared<ClockEtagLocalObjectStorage>(std::move(settings), now_ns), root);
 }
 
 }
