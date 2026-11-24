@@ -18,6 +18,7 @@ namespace ProfileEvents
     extern const Event AddressesDiscovered;
     extern const Event AddressesExpired;
     extern const Event AddressesMarkedAsFailed;
+    extern const Event AddressesLatencyReported;
 }
 
 namespace CurrentMetrics
@@ -195,6 +196,7 @@ void HostResolver::reportLatency(const Poco::Net::IPAddress & address, UInt64 mi
 
     it->setLatency(microseconds);
     has_measured_latency.store(true, std::memory_order_relaxed);
+    ProfileEvents::increment(ProfileEvents::AddressesLatencyReported);
 
     /// Defer the O(R) median + prefix-sum recomputation to `selectBest`: pooled requests report
     /// latency at the full S3 read rate while `resolve` runs only when opening a new connection,

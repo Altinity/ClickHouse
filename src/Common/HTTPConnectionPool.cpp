@@ -49,6 +49,7 @@
 
 namespace ProfileEvents
 {
+    extern const Event HTTPConnectionsSkippedAsSlow;
     extern const Event StorageConnectionsCreated;
     extern const Event StorageConnectionsReused;
     extern const Event StorageConnectionsReset;
@@ -1008,7 +1009,10 @@ private:
             {
                 const double fleet_min = snapshot.min_non_failed_ms;
                 if (fleet_min > 0 && best_latency > fleet_min * 1.3 && best_latency - fleet_min > 15.0)
+                {
+                    ProfileEvents::increment(ProfileEvents::HTTPConnectionsSkippedAsSlow);
                     return nullptr;
+                }
             }
 
             const bool is_validated = best == 0 && top_is_validated;

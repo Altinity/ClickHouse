@@ -26,6 +26,11 @@
 
 #include <gtest/gtest.h>
 
+namespace ProfileEvents
+{
+    extern const Event HTTPConnectionsSkippedAsSlow;
+}
+
 namespace
 {
 
@@ -1504,4 +1509,88 @@ TEST_F(ConnectionPoolTest, LatencyAwareSnapshotIsReleasedUnderTheTrackerItWasAll
     /// The snapshot was charged to `total_memory_tracker`, so it must be released there too:
     /// nothing may be credited back to the query tracker.
     ASSERT_GE(delta, 0) << "latency snapshot freed against the query tracker";
+}
+
+TEST_F(ConnectionPoolTest, LatencyAwareSlowPooledConnectionIsSkippedAndCounted)
+{
+    /// A pooled connection whose address is much slower than the fastest known one (`> 1.3x` and
+    /// `> 15 ms` above it) is not reused: a new connection is opened instead and the decision is
+    /// counted in `HTTPConnectionsSkippedAsSlow`.
+    DB::HostResolver::setLatencyAwareSelection(true);
+    SCOPE_EXIT({
+        DB::HostResolver::setLatencyAwareSelection(false);
+        DB::HostResolversPool::instance().dropCache();
+    });
+
+    const String test_host = "slow-pooled-connection-skipped.invalid";
+    const Poco::Net::IPAddress slow_ip("127.0.0.1");
+    const Poco::Net::IPAddress fast_ip("127.0.0.2");
+
+    /// macOS configures only `127.0.0.1` on `lo0`, whereas Linux routes the whole `127.0.0.0/8`.
+    bool has_full_loopback_subnet = false;
+    try
+    {
+        Poco::Net::StreamSocket probe;
+        probe.connect(Poco::Net::SocketAddress(fast_ip, server_data.port), Poco::Timespan(1, 0));
+        has_full_loopback_subnet = true;
+    }
+    catch (...) // NOLINT(bugprone-empty-catch)
+    {
+    }
+    if (!has_full_loopback_subnet)
+        GTEST_SKIP() << "127.0.0.2 is not routed on loopback on this OS";
+
+    struct SequentialMockResolver : public DB::HostResolver
+    {
+        using ResolveFunction = DB::HostResolver::ResolveFunction;
+        SequentialMockResolver(String h, Poco::Timespan history_, ResolveFunction f)
+            : DB::HostResolver(std::move(f), std::move(h), history_)
+        {}
+    };
+
+    auto mock_resolver = std::make_shared<SequentialMockResolver>(
+        test_host,
+        Poco::Timespan(60 * 1000 * 1000),
+        [slow_ip, fast_ip](const String &) -> std::vector<Poco::Net::IPAddress> { return {slow_ip, fast_ip}; });
+    DB::HostResolversPool::instance().injectResolverForTest(test_host, mock_resolver);
+
+    auto uri = Poco::URI("http://" + test_host + ":" + std::to_string(server_data.port));
+    auto pool = DB::HTTPConnectionPools::instance().getPool(
+        DB::HTTPConnectionGroupType::HTTP, uri, DB::ProxyConfiguration{});
+    auto metrics = pool->getMetrics();
+
+    /// Hold connections simultaneously until there is one bound to each address, then keep only
+    /// the slow one in the pool.
+    DB::IHTTPConnectionPoolForEndpoint::ConnectionPtr slow_connection;
+    {
+        std::vector<DB::IHTTPConnectionPoolForEndpoint::ConnectionPtr> held;
+        for (size_t attempt = 0; attempt < 64 && !slow_connection; ++attempt)
+        {
+            auto conn = pool->getConnection(timeouts, nullptr);
+            echoRequest("warmup", *conn);
+            if (conn->getResolvedHost() == slow_ip.toString())
+                slow_connection = std::move(conn);
+            else
+                held.push_back(std::move(conn));
+        }
+        for (auto & conn : held)
+            (*conn).reset();
+    }
+    ASSERT_TRUE(slow_connection);
+    slow_connection.reset(); /// Return the slow connection into `stored_connections`.
+    ASSERT_EQ(1, CurrentMetrics::get(metrics.stored_count));
+
+    mock_resolver->reportLatency(fast_ip, 2'000);   /// 2 ms
+    mock_resolver->reportLatency(slow_ip, 50'000);  /// 50 ms
+
+    const UInt64 skipped_before = DB::CurrentThread::getProfileEvents()[ProfileEvents::HTTPConnectionsSkippedAsSlow];
+    const UInt64 reused_before = DB::CurrentThread::getProfileEvents()[metrics.reused];
+
+    {
+        auto conn = pool->getConnection(timeouts, nullptr);
+        echoRequest("after-skip", *conn);
+    }
+
+    ASSERT_EQ(skipped_before + 1, DB::CurrentThread::getProfileEvents()[ProfileEvents::HTTPConnectionsSkippedAsSlow]);
+    ASSERT_EQ(reused_before, DB::CurrentThread::getProfileEvents()[metrics.reused]);
 }

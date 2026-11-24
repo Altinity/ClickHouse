@@ -16,6 +16,11 @@
 #include <thread>
 
 
+namespace ProfileEvents
+{
+    extern const Event AddressesLatencyReported;
+}
+
 using namespace std::literals::chrono_literals;
 
 
@@ -850,6 +855,8 @@ TEST_F(ResolvePoolTest, LatencyEwma)
     const Poco::Net::IPAddress slow("127.0.0.2");
     const Poco::Net::IPAddress unknown("127.0.0.9");
 
+    const UInt64 reported_before = DB::CurrentThread::getProfileEvents()[ProfileEvents::AddressesLatencyReported];
+
     ASSERT_EQ(0.0, resolver->getLatencySnapshot().lookupLatencyMs(fast));
     ASSERT_EQ(0.0, resolver->getLatencySnapshot().min_non_failed_ms);
 
@@ -869,6 +876,9 @@ TEST_F(ResolvePoolTest, LatencyEwma)
     resolver->reportLatency(unknown, 5000);
     ASSERT_DOUBLE_EQ(1.2, resolver->getLatencySnapshot().lookupLatencyMs(fast));
     ASSERT_EQ(0.0, resolver->getLatencySnapshot().lookupLatencyMs(unknown));
+
+    /// Only the three accepted samples are counted; the zero sample and the unknown address are not.
+    ASSERT_EQ(reported_before + 3, DB::CurrentThread::getProfileEvents()[ProfileEvents::AddressesLatencyReported]);
 }
 
 TEST_F(ResolvePoolTest, LatencyAwareSelectionPrefersFastAddress)
