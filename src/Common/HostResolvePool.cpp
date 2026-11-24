@@ -554,22 +554,45 @@ void HostResolversPool::dropCache()
 
 HostResolver::Ptr HostResolversPool::getResolver(const String & host)
 {
-    ResolverFactory factory;
     {
         SharedLockGuard lock(mutex);
         if (auto it = host_pools.find(host); it != host_pools.end())
             return it->second;
+    }
+
+    ResolverFactory factory;
+    std::shared_ptr<PendingResolver> pending;
+    {
+        std::lock_guard lock(mutex);
+        if (auto it = host_pools.find(host); it != host_pools.end())
+            return it->second;
         factory = resolver_factory_for_test;
+        auto & slot = pending_resolvers[host];
+        if (!slot)
+            slot = std::make_shared<PendingResolver>();
+        pending = slot;
     }
 
     /// Construct the resolver outside `mutex`: `HostResolver::create` runs the initial DNS lookup,
     /// and holding `mutex` across network I/O would block `tryGetResolver` and `getResolver` for
-    /// every other host in the process. If two threads race on a cold host, `try_emplace` keeps the
-    /// winner's instance and discards the duplicate.
+    /// every other host in the process. Concurrent callers for the same cold host queue on the
+    /// per-host `pending->mutex` instead, so the lookup runs once and the others reuse its result.
+    /// A failed lookup leaves the slot in place; the next caller reuses it and retries.
+    std::lock_guard creation_lock(pending->mutex);
+
+    {
+        SharedLockGuard lock(mutex);
+        if (auto it = host_pools.find(host); it != host_pools.end())
+            return it->second;
+    }
+
     auto created = factory ? factory(host) : HostResolver::create(host);
 
     std::lock_guard lock(mutex);
-    return host_pools.try_emplace(host, std::move(created)).first->second;
+    auto result = host_pools.try_emplace(host, std::move(created)).first->second;
+    if (auto it = pending_resolvers.find(host); it != pending_resolvers.end() && it->second == pending)
+        pending_resolvers.erase(it);
+    return result;
 }
 
 HostResolver::Ptr HostResolversPool::tryGetResolver(const String & host)

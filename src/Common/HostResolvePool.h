@@ -373,8 +373,16 @@ public:
     void setResolverFactoryForTest(ResolverFactory factory);
 
 private:
+    /// Serializes creation of the resolver for one host, so that concurrent callers for a cold host
+    /// run the DNS lookup once instead of each building a resolver and discarding all but one.
+    struct PendingResolver
+    {
+        std::mutex mutex;
+    };
+
     SharedMutex mutex;
     std::unordered_map<String, HostResolver::Ptr> host_pools TSA_GUARDED_BY(mutex);
+    std::unordered_map<String, std::shared_ptr<PendingResolver>> pending_resolvers TSA_GUARDED_BY(mutex);
     ResolverFactory resolver_factory_for_test TSA_GUARDED_BY(mutex);
 };
 

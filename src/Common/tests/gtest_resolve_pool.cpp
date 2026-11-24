@@ -1418,3 +1418,63 @@ TEST_F(ResolvePoolTest, FailedUpdateLeavesMetricsAndStateUnchanged)
     ASSERT_EQ(expired_before + 1, DB::CurrentThread::getProfileEvents()[metrics.expired]);
     ASSERT_EQ(discovered_before + 3, DB::CurrentThread::getProfileEvents()[metrics.discovered]);
 }
+
+TEST_F(ResolvePoolTest, ConcurrentGetResolverForColdHostRunsDnsOnce)
+{
+    /// Regression test: `getResolver` creates the resolver (and runs its initial DNS lookup)
+    /// outside the pool lock. Two threads racing on the same cold host each used to run their own
+    /// lookup and build their own resolver, and the loser was discarded after counting its
+    /// addresses in `AddressesDiscovered`. The second thread must wait for the first one instead,
+    /// while other hosts stay unaffected (see `ColdHostResolveDoesNotBlockHotResolverLookups`).
+    const String host = "single-flight-endpoint.invalid";
+
+    std::atomic<size_t> factory_calls{0};
+    std::promise<void> first_entered;
+    auto first_entered_future = first_entered.get_future();
+    std::promise<void> allow_finish;
+    auto allow_finish_future = allow_finish.get_future().share();
+    bool released = false;
+
+    /// Declared before the guard below: on a failed assertion the guard must release the blocked
+    /// lookups before the futures are destroyed (their destructors wait for the threads).
+    std::future<DB::HostResolver::Ptr> first;
+    std::future<DB::HostResolver::Ptr> second;
+
+    SCOPE_EXIT({
+        if (!released)
+            allow_finish.set_value();
+        DB::HostResolversPool::instance().setResolverFactoryForTest({});
+        DB::HostResolversPool::instance().dropCache();
+    });
+
+    DB::HostResolversPool::instance().setResolverFactoryForTest(
+        [&](const String & host_to_create) -> DB::HostResolver::Ptr
+        {
+            if (factory_calls.fetch_add(1) == 0)
+                first_entered.set_value();
+            allow_finish_future.wait();
+            return std::make_shared<ResolvePoolMock>(
+                host_to_create,
+                Poco::Timespan(60, 0),
+                [](const String &) -> std::vector<Poco::Net::IPAddress> { return {Poco::Net::IPAddress("127.0.0.1")}; });
+        });
+
+    first = std::async(std::launch::async, [&] { return DB::HostResolversPool::instance().getResolver(host); });
+    ASSERT_EQ(std::future_status::ready, first_entered_future.wait_for(5s));
+
+    second = std::async(std::launch::async, [&] { return DB::HostResolversPool::instance().getResolver(host); });
+
+    /// The second thread has every chance to start its own lookup while the first one is blocked
+    /// inside the factory. It must not: it has to wait for the first one to finish.
+    ASSERT_EQ(std::future_status::timeout, second.wait_for(300ms));
+    ASSERT_EQ(size_t(1), factory_calls.load());
+
+    allow_finish.set_value();
+    released = true;
+
+    auto first_resolver = first.get();
+    auto second_resolver = second.get();
+    ASSERT_NE(nullptr, first_resolver);
+    ASSERT_EQ(first_resolver, second_resolver);
+    ASSERT_EQ(size_t(1), factory_calls.load());
+}
