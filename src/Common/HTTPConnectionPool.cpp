@@ -860,7 +860,7 @@ public:
             if (!stored_connections.empty())
             {
                 if (!latency_snapshot.empty())
-                    reused_connection = selectBestStoredConnectionImpl(latency_snapshot, is_soft_limit_reached);
+                    reused_connection = selectBestStoredConnectionImpl(latency_snapshot, is_soft_limit_reached, expired_connections);
                 else
                 {
                     reused_connection = stored_connections.top();
@@ -947,51 +947,77 @@ private:
     /// Latency-aware dispatch: among the pooled connections, hand out the one whose resolved
     /// front-end has the lowest observed latency EWMA, instead of the default least-recently-used
     /// pick. Scans the underlying heap storage in-place in O(N) using pre-parsed `cached_resolved_ip`
-    /// and the pre-fetched `snapshot` (zero allocations and zero nested mutex acquisitions under
-    /// `mutex`), then extracts the chosen slot in O(log N) via `extractAt`.
+    /// and the pre-fetched `snapshot` (zero nested mutex acquisitions under `mutex`), then extracts
+    /// the chosen slot in O(log N) via `extractAt`.
     /// Returns `nullptr` when even the fastest pooled connection is materially slower than the
-    /// fastest known front-end and the group is below its soft limit, so the caller opens a fresh
-    /// connection instead.
+    /// fastest known front-end and the group is below its soft limit, or when no usable pooled
+    /// connection is left, so the caller opens a fresh connection instead.
+    ///
+    /// `wipeExpiredImpl` validates (`isExpired`, `isStale`) only `top()`, which is the connection the
+    /// default dispatch hands out. A connection picked by latency can be anywhere in the heap, so it
+    /// is validated here before it is handed out. An invalid one is moved to `expired_connections`
+    /// (destroyed by the caller outside `mutex`) and the selection is repeated.
     ConnectionPtr selectBestStoredConnectionImpl(
-        const HostResolver::LatencySnapshot & snapshot, bool is_soft_limit_reached) noexcept TSA_REQUIRES(mutex)
+        const HostResolver::LatencySnapshot & snapshot, bool is_soft_limit_reached, std::vector<ConnectionPtr> & expired_connections)
+        TSA_REQUIRES(mutex)
     {
-        size_t best = 0;
-        double best_latency = std::numeric_limits<double>::max();
-        const size_t n = stored_connections.size();
-        for (size_t i = 0; i < n; ++i)
+        /// `wipeExpiredImpl` has just validated the current `top()`.
+        bool top_is_validated = true;
+
+        while (!stored_connections.empty())
         {
-            double latency = std::numeric_limits<double>::max();
-            if (const auto & ip = stored_connections[i]->cached_resolved_ip)
+            size_t best = 0;
+            double best_latency = std::numeric_limits<double>::max();
+            const size_t n = stored_connections.size();
+            for (size_t i = 0; i < n; ++i)
             {
-                const double ewma = snapshot.lookupLatencyMs(*ip);
-                /// Unmeasured (0) is treated as worst so measured-fast connections win;
-                /// unmeasured ones are still used once the fast ones are handed out (and
-                /// reporting keeps every served address's EWMA fresh).
-                if (ewma > 0)
-                    latency = ewma;
+                double latency = std::numeric_limits<double>::max();
+                if (const auto & ip = stored_connections[i]->cached_resolved_ip)
+                {
+                    const double ewma = snapshot.lookupLatencyMs(*ip);
+                    /// Unmeasured (0) is treated as worst so measured-fast connections win;
+                    /// unmeasured ones are still used once the fast ones are handed out (and
+                    /// reporting keeps every served address's EWMA fresh).
+                    if (ewma > 0)
+                        latency = ewma;
+                }
+                if (latency < best_latency)
+                {
+                    best_latency = latency;
+                    best = i;
+                }
             }
-            if (latency < best_latency)
+
+            /// Pool-composition bias: if even the fastest pooled connection's front-end is materially
+            /// slower than the fastest front-end we know of, prefer opening a fresh connection
+            /// (`selectBest` routes it to a fast front-end) over reusing a slow-backend one.
+            /// Same-region the TCP connect cost is ~1 ms, negligible next to the tens-of-ms backend
+            /// TTFB gap, so this trades a cheap connect for a big per-request win and shifts the
+            /// pool's composition toward fast front-ends over time. Gated on the soft limit so it
+            /// cannot grow the pool without bound.
+            if (!is_soft_limit_reached && best_latency != std::numeric_limits<double>::max())
             {
-                best_latency = latency;
-                best = i;
+                const double fleet_min = snapshot.min_non_failed_ms;
+                if (fleet_min > 0 && best_latency > fleet_min * 1.3 && best_latency - fleet_min > 15.0)
+                    return nullptr;
             }
+
+            const bool is_validated = best == 0 && top_is_validated;
+            if (is_validated || (!isExpired(stored_connections[best], is_soft_limit_reached) && !isStale(*stored_connections[best])))
+                return stored_connections.extractAt(best);
+
+            /// `expired_connections` was reserved for the whole pool in `getConnection`, so this
+            /// `push_back` does not allocate. `wipeExpiredImpl` already accounted for its own entries,
+            /// so account for this one here.
+            auto invalid_connection = stored_connections.extractAt(best);
+            invalid_connection->markAsExpired();
+            expired_connections.push_back(std::move(invalid_connection));
+            CurrentMetrics::sub(getMetrics().stored_count, 1);
+            ProfileEvents::increment(getMetrics().expired, 1);
+            top_is_validated = false;
         }
 
-        /// Pool-composition bias: if even the fastest pooled connection's front-end is materially
-        /// slower than the fastest front-end we know of, prefer opening a fresh connection
-        /// (`selectBest` routes it to a fast front-end) over reusing a slow-backend one.
-        /// Same-region the TCP connect cost is ~1 ms, negligible next to the tens-of-ms backend
-        /// TTFB gap, so this trades a cheap connect for a big per-request win and shifts the
-        /// pool's composition toward fast front-ends over time. Gated on the soft limit so it
-        /// cannot grow the pool without bound.
-        if (!is_soft_limit_reached && best_latency != std::numeric_limits<double>::max())
-        {
-            const double fleet_min = snapshot.min_non_failed_ms;
-            if (fleet_min > 0 && best_latency > fleet_min * 1.3 && best_latency - fleet_min > 15.0)
-                return nullptr;
-        }
-
-        return stored_connections.extractAt(best);
+        return nullptr;
     }
 
     bool isExpired(ConnectionPtr connection, bool isSoftLimitReached) TSA_REQUIRES(mutex)

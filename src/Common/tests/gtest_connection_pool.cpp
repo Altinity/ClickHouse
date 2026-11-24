@@ -18,6 +18,7 @@
 #include <Poco/Net/StreamSocket.h>
 
 #include <atomic>
+#include <map>
 #include <set>
 
 #include <gtest/gtest.h>
@@ -1320,4 +1321,109 @@ TEST_F(ConnectionPoolTest, LatencyAwareDispatchExtractsFastestConnectionInPlace)
     ASSERT_EQ(static_cast<Int64>(pooled_total), CurrentMetrics::get(metrics.stored_count));
     ASSERT_EQ(pooled_total, DB::CurrentThread::getProfileEvents()[metrics.created]);
     ASSERT_EQ(pooled_total, DB::CurrentThread::getProfileEvents()[metrics.reused]);
+}
+
+TEST_F(ConnectionPoolTest, LatencyAwareDispatchSkipsStaleNonTopConnection)
+{
+    /// Regression test: the default dispatch hands out `top()` of the heap, which `wipeExpiredImpl`
+    /// has just validated (`isExpired`, `isStale`). Latency-aware dispatch picks the fastest pooled
+    /// connection wherever it sits in the heap, so it must validate that connection itself: a
+    /// connection that is no longer usable (here: the peer side is closed, as when a server drops
+    /// an idle keep-alive connection) must not be handed out, and the next best one must be used.
+    DB::HostResolver::setLatencyAwareSelection(true);
+    SCOPE_EXIT({
+        DB::HostResolver::setLatencyAwareSelection(false);
+        DB::HostResolversPool::instance().dropCache();
+    });
+
+    const String test_host = "stale-non-top-dispatch.invalid";
+    const Poco::Net::IPAddress slow_ip("127.0.0.1");
+    const Poco::Net::IPAddress fast_ip("127.0.0.2");
+
+    /// `server_data` listens on the wildcard address. macOS configures only `127.0.0.1` on `lo0`,
+    /// whereas Linux routes the whole `127.0.0.0/8` block, so skip where `127.0.0.2` is unreachable.
+    bool has_full_loopback_subnet = false;
+    try
+    {
+        Poco::Net::StreamSocket probe;
+        probe.connect(Poco::Net::SocketAddress(fast_ip, server_data.port), Poco::Timespan(1, 0));
+        has_full_loopback_subnet = true;
+    }
+    catch (...) // NOLINT(bugprone-empty-catch)
+    {
+    }
+    if (!has_full_loopback_subnet)
+        GTEST_SKIP() << "127.0.0.2 is not routed on loopback on this OS";
+
+    struct SequentialMockResolver : public DB::HostResolver
+    {
+        using ResolveFunction = DB::HostResolver::ResolveFunction;
+        SequentialMockResolver(String h, Poco::Timespan history_, ResolveFunction f)
+            : DB::HostResolver(std::move(f), std::move(h), history_)
+        {}
+    };
+
+    auto mock_resolver = std::make_shared<SequentialMockResolver>(
+        test_host,
+        Poco::Timespan(60 * 1000 * 1000),
+        [slow_ip, fast_ip](const String &) -> std::vector<Poco::Net::IPAddress>
+        {
+            return {slow_ip, fast_ip};
+        });
+    DB::HostResolversPool::instance().injectResolverForTest(test_host, mock_resolver);
+
+    auto uri = Poco::URI("http://" + test_host + ":" + std::to_string(server_data.port));
+    auto pool = DB::HTTPConnectionPools::instance().getPool(
+        DB::HTTPConnectionGroupType::HTTP, uri, DB::ProxyConfiguration{});
+    auto metrics = pool->getMetrics();
+
+    /// Hold connections simultaneously so that each borrow opens a new one, until there is one
+    /// bound to each address. Keep exactly one per address and close the rest.
+    std::map<std::string, DB::IHTTPConnectionPoolForEndpoint::ConnectionPtr> kept;
+    {
+        std::vector<DB::IHTTPConnectionPoolForEndpoint::ConnectionPtr> held;
+        for (size_t attempt = 0; attempt < 64 && kept.size() < 2; ++attempt)
+        {
+            auto conn = pool->getConnection(timeouts, nullptr);
+            echoRequest("warmup", *conn);
+            const std::string resolved_host = conn->getResolvedHost();
+            if (kept.contains(resolved_host))
+                held.push_back(std::move(conn));
+            else
+                kept.emplace(resolved_host, std::move(conn));
+        }
+        for (auto & conn : held)
+            (*conn).reset();
+    }
+    ASSERT_EQ(2u, kept.size());
+
+    /// The fast connection must not be `top()`: it is used after the slow one, so the slow one
+    /// expires first and is at the heap root.
+    echoRequest("slow", *kept.at(slow_ip.toString()));
+    echoRequest("fast", *kept.at(fast_ip.toString()));
+
+    /// Make the fast connection unusable while it stays "connected" from the pool's point of view:
+    /// after `SHUT_RD`, `recv` returns EOF, which `getSocketState` reports as `Closed`, exactly as
+    /// for a connection the peer has closed. It is neither expired nor flagged by `atConnectionDestroy`.
+    kept.at(fast_ip.toString())->socket().shutdownReceive();
+
+    kept.clear(); /// Return both connections into `stored_connections`.
+    ASSERT_EQ(2, CurrentMetrics::get(metrics.stored_count));
+
+    /// Keep the spread within 15 ms so the pool-composition bias does not open a fresh connection.
+    mock_resolver->reportLatency(fast_ip, 2'000);   /// 2 ms
+    mock_resolver->reportLatency(slow_ip, 10'000);  /// 10 ms
+
+    const UInt64 expired_before = DB::CurrentThread::getProfileEvents()[metrics.expired];
+    const UInt64 reused_before = DB::CurrentThread::getProfileEvents()[metrics.reused];
+
+    {
+        auto conn = pool->getConnection(timeouts, nullptr);
+        ASSERT_EQ(slow_ip.toString(), conn->getResolvedHost());
+        echoRequest("after-stale", *conn);
+    }
+
+    ASSERT_EQ(expired_before + 1, DB::CurrentThread::getProfileEvents()[metrics.expired]);
+    ASSERT_EQ(reused_before + 1, DB::CurrentThread::getProfileEvents()[metrics.reused]);
+    ASSERT_EQ(1, CurrentMetrics::get(metrics.stored_count));
 }
