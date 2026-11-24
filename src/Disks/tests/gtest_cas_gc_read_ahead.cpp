@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRetry.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
@@ -14,6 +15,7 @@
 
 #include <Common/CurrentMetrics.h>
 #include <Common/ThreadPool.h>
+#include <base/getThreadId.h>
 #include <base/scope_guard.h>
 
 #include <algorithm>
@@ -21,6 +23,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <fstream>
+#include <functional>
 #include <mutex>
 #include <map>
 #include <set>
@@ -31,6 +35,7 @@
 namespace DB::ErrorCodes
 {
     extern const int CANNOT_SCHEDULE_TASK;
+    extern const int CORRUPTED_DATA;
     extern const int READONLY;
 }
 
@@ -1196,4 +1201,1138 @@ TEST(CASGCReadAhead, ColdCursorResolveIsCounted)
     const UInt64 resolve_reads = reflog_reads - intakeMetric(intake.metrics, "reflog_reads_issued");
     EXPECT_GT(resolve_reads, 0u);
     EXPECT_EQ(intakeMetric(intake.metrics, "cursor_resolve_us"), resolve_reads * kDelayUs);
+}
+
+/// ============================ manifest read-ahead across logs ============================
+
+namespace
+{
+
+bool isManifestKey(const String & key)
+{
+    return key.find("/cas/manifests/") != String::npos;
+}
+
+/// Observes and steers the fold's reads. A read made off the thread that built this backend is a read-ahead worker's.
+/// Every wait is bounded, so a missing overlap fails an assertion instead of hanging the suite.
+class ManifestReadAheadBackend : public CountingBackend
+{
+public:
+    /// Holds worker manifest reads until `width` distinct keys are held at once. A wait that expires abandons the
+    /// barrier for good.
+    void armManifestBarrier(size_t width)
+    {
+        std::lock_guard lock(mutex);
+        barrier_width = width;
+    }
+
+    bool manifestBarrierFilled() const
+    {
+        std::lock_guard lock(mutex);
+        return barrier_filled;
+    }
+
+    /// Every worker read of `key` throws.
+    void failWorkerReadsOf(String key)
+    {
+        std::lock_guard lock(mutex);
+        fault_key = std::move(key);
+    }
+
+    size_t faultsServed() const
+    {
+        std::lock_guard lock(mutex);
+        return faults;
+    }
+
+    /// Runs `callback` once, on the reading thread, right after a read of `key` returns; it is told whether the key
+    /// was present.
+    void afterFirstRead(String key, std::function<void(bool)> callback)
+    {
+        std::lock_guard lock(mutex);
+        after_key = std::move(key);
+        after_callback = std::move(callback);
+    }
+
+    bool afterFirstReadFired() const
+    {
+        std::lock_guard lock(mutex);
+        return after_fired;
+    }
+
+    /// Holds every read of a key of `keys` until `releaseHeld`.
+    void holdReadsOf(std::set<String> keys)
+    {
+        std::lock_guard lock(mutex);
+        held_keys = std::move(keys);
+        held_released = false;
+    }
+
+    void releaseHeld()
+    {
+        std::lock_guard lock(mutex);
+        held_released = true;
+        cv.notify_all();
+    }
+
+    /// Waits until every key of `keys` was read to completion, on any thread.
+    bool waitUntilRead(const std::set<String> & keys)
+    {
+        std::unique_lock lock(mutex);
+        return cv.wait_for(lock, std::chrono::seconds(10), [&]
+        {
+            return std::all_of(keys.begin(), keys.end(), [&](const String & key) { return completed.contains(key); });
+        });
+    }
+
+    /// Waits until every key of `keys` was read, by this thread or by a worker that has since started another read.
+    /// A worker starts another read only after it published the result of the previous one, so the walk can then see
+    /// each of these results without waiting.
+    bool waitUntilVisible(const std::set<String> & keys)
+    {
+        std::unique_lock lock(mutex);
+        return cv.wait_for(lock, std::chrono::seconds(10), [&]
+        {
+            return std::all_of(keys.begin(), keys.end(), [&](const String & key)
+            {
+                const auto it = completed_by.find(key);
+                return it != completed_by.end()
+                    && (it->second.first == owner || reads_started.at(it->second.first) > it->second.second);
+            });
+        });
+    }
+
+    bool readCompleted(const String & key) const
+    {
+        std::lock_guard lock(mutex);
+        return completed.contains(key);
+    }
+
+    size_t readsInFlight() const
+    {
+        std::lock_guard lock(mutex);
+        return in_flight;
+    }
+
+    /// A `mono_ms_fn` that jumps by one intake slice right after the first read of the key given to
+    /// `stepClockAfterRead`.
+    std::function<uint64_t()> monoMsFn()
+    {
+        return [this] { return now_ms.load(); };
+    }
+
+    void stepClockAfterRead(String key)
+    {
+        std::lock_guard lock(mutex);
+        step_key = std::move(key);
+    }
+
+    std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        const bool worker = std::this_thread::get_id() != owner;
+        {
+            std::unique_lock lock(mutex);
+            if (worker && key == fault_key)
+            {
+                ++faults;
+                throw std::runtime_error("injected manifest read fault");
+            }
+            ++in_flight;
+            ++reads_started[std::this_thread::get_id()];
+            cv.notify_all();
+            if (held_keys.contains(key))
+                cv.wait_for(lock, std::chrono::seconds(10), [&] { return held_released; });
+            if (worker && isManifestKey(key))
+                holdForBarrier(lock, key);
+        }
+        std::optional<DB::Cas::Backend::Raw> got;
+        try
+        {
+            got = CountingBackend::read(key, access);
+        }
+        catch (...)
+        {
+            std::lock_guard lock(mutex);
+            --in_flight;
+            cv.notify_all();
+            throw;
+        }
+        std::function<void(bool)> fire;
+        {
+            std::lock_guard lock(mutex);
+            if (after_callback && key == after_key)
+            {
+                fire = std::exchange(after_callback, nullptr);
+                after_fired = true;
+            }
+            if (!step_key.empty() && key == step_key)
+            {
+                step_key.clear();
+                now_ms.fetch_add(Gc::kRefIntakeBudgetMs);
+            }
+        }
+        if (fire)
+            fire(got.has_value());
+        {
+            std::lock_guard lock(mutex);
+            --in_flight;
+            completed.insert(key);
+            completed_by[key] = {std::this_thread::get_id(), reads_started[std::this_thread::get_id()]};
+            cv.notify_all();
+        }
+        return got;
+    }
+
+private:
+    void holdForBarrier(std::unique_lock<std::mutex> & lock, const String & key)
+    {
+        if (barrier_width == 0 || barrier_filled || barrier_abandoned)
+            return;
+        barrier_held.insert(key);
+        if (barrier_held.size() >= barrier_width)
+        {
+            barrier_filled = true;
+            cv.notify_all();
+            return;
+        }
+        if (!cv.wait_for(lock, std::chrono::seconds(10), [&] { return barrier_filled; }))
+            barrier_abandoned = true;
+    }
+
+    const std::thread::id owner = std::this_thread::get_id();
+    mutable std::mutex mutex;
+    std::condition_variable cv;
+    size_t in_flight = 0;
+    std::set<String> completed;
+    size_t barrier_width = 0;
+    std::set<String> barrier_held;
+    bool barrier_filled = false;
+    bool barrier_abandoned = false;
+    String fault_key;
+    size_t faults = 0;
+    String after_key;
+    std::function<void(bool)> after_callback;
+    bool after_fired = false;
+    std::set<String> held_keys;
+    bool held_released = false;
+    /// Per thread, the reads it started; per key, the thread that completed it and that thread's count then.
+    std::map<std::thread::id, size_t> reads_started;
+    std::map<String, std::pair<std::thread::id, size_t>> completed_by;
+    String step_key;
+    std::atomic<uint64_t> now_ms{1'000'000};
+};
+
+using ManifestReadAheadHintHoleBackend = HintHoleBackendOn<ManifestReadAheadBackend>;
+
+const RootNamespace kLife{"00/aa@cas@"};
+
+template <typename BackendT>
+PoolPtr openAtWidth(const std::shared_ptr<BackendT> & backend, uint64_t width)
+{
+    return Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
+                                          .gc_fold_max_defer_rounds = 0, .gc_io_concurrency = width});
+}
+
+ManifestRef manifestRefOf(uint64_t epoch, uint64_t build)
+{
+    return ManifestRef{.writer_epoch = epoch, .build_sequence = build, .manifest_ordinal = 1};
+}
+
+/// The manifest `publishAt(..., {epoch, i}, ..., build, ...)` writes.
+String manifestKeyOf(const Layout & layout, uint64_t epoch, uint64_t build)
+{
+    return layout.manifestKey(ManifestId{kLife, manifestRefOf(epoch, build)});
+}
+
+String refLogKeyOf(const Layout & layout, const RefTxnId & id)
+{
+    return layout.refLogKey(fixture::fixtureLife(kLife), id);
+}
+
+std::set<String> refLogKeysOf(const Layout & layout, uint64_t first, uint64_t last)
+{
+    std::set<String> keys;
+    for (uint64_t i = first; i <= last; ++i)
+        keys.insert(refLogKeyOf(layout, RefTxnId{1, i}));
+    return keys;
+}
+
+/// Publishes `{1,first} .. {1,last}`; record `{1,i}` names its own manifest `{1, i}` and blob `i`.
+void publishRecords(Backend & backend, const Layout & layout, uint64_t first, uint64_t last)
+{
+    for (uint64_t i = first; i <= last; ++i)
+        publishAt(backend, layout, kLife, RefTxnId{1, i}, fmt::format("ref_{}", i), i, DB::UInt128(i), /*birth=*/i == 1);
+}
+
+/// A live life whose records `{1,1}` and `{1,2}` a first round of `gc` folds.
+void foldFirstTwo(Backend & backend, const Layout & layout, Gc & gc)
+{
+    fixture::admitLive(backend, layout, kLife);
+    publishRecords(backend, layout, 1, 2);
+    writeRecoverableCkptForRawFixture(backend, layout, kLife, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 2},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+}
+
+std::optional<RefCoverage> lifeCoverage(Backend & backend, const Layout & layout)
+{
+    const uint64_t gen = currentGenerationOf(backend, layout);
+    const uint64_t attempt = currentAttemptOf(backend, layout);
+    const UInt128 life_id = catalogLifeIdForTest(backend, layout, kLife);
+    for (uint64_t g = gen; ; --g)
+    {
+        OperationForTest op(backend);
+        if (const auto got = (*op).read(layout.foldSealKey(g, attempt), Retry::once()))
+        {
+            const CasFoldSeal seal = decodeFoldSeal(got->bytes);
+            const auto it = seal.ref_lives.find(life_id);
+            if (it == seal.ref_lives.end())
+                return std::nullopt;
+            return it->second.coverage;
+        }
+        if (g == 0)
+            return std::nullopt;
+    }
+}
+
+RefTxnId lifeCursor(Backend & backend, const Layout & layout)
+{
+    const auto coverage = lifeCoverage(backend, layout);
+    return coverage ? coverage->last_folded_ref_id : RefTxnId{};
+}
+
+std::optional<std::pair<HoldReason, RefTxnId>> lifeHold(Backend & backend, const Layout & layout)
+{
+    const auto coverage = lifeCoverage(backend, layout);
+    if (!coverage || !coverage->hold)
+        return std::nullopt;
+    return std::make_pair(coverage->hold->reason, coverage->hold->offending_position);
+}
+
+/// Requests of `verb` on `key` inside the ref intakes `runRoundReadingRows` marked.
+size_t intakeRequestsOf(const CountingBackend & backend, JournalVerb verb, const String & key)
+{
+    size_t n = 0;
+    bool inside = false;
+    for (const JournalEntry & entry : backend.journal())
+    {
+        if (entry.verb == JournalVerb::Mark && (entry.detail == "fold_seal_read" || entry.detail == "fold_ref_intake"))
+            inside = entry.detail == "fold_seal_read";
+        else if (entry.verb != JournalVerb::Mark)
+            n += inside && entry.verb == verb && entry.keys.front() == key;
+    }
+    return n;
+}
+
+size_t intakeReadsOf(const CountingBackend & backend, const String & key)
+{
+    return intakeRequestsOf(backend, JournalVerb::Read, key);
+}
+
+UInt64 rowMetric(const std::map<String, UInt64> & metrics, const String & key)
+{
+    const auto it = metrics.find(key);
+    EXPECT_NE(it, metrics.end()) << "missing metric " << key;
+    return it == metrics.end() ? 0 : it->second;
+}
+
+struct RoundRows
+{
+    RoundReport report;
+    std::map<String, UInt64> intake;
+    std::map<String, UInt64> reduce;
+};
+
+/// One round of `gc`. Marks the end of each phase in the journal of `backend`, so the requests between the
+/// `fold_seal_read` and `fold_ref_intake` marks are the ref intake's.
+RoundRows runRoundReadingRows(Gc & gc, CountingBackend & backend)
+{
+    RoundRows rows;
+    gc.setPhaseSink([&](const GcPhaseRecord & record)
+    {
+        backend.mark(record.phase);
+        if (record.phase == "fold_ref_intake")
+            rows.intake = record.metrics;
+        else if (record.phase == "fold_reduce")
+            rows.reduce = record.metrics;
+    });
+    SCOPE_EXIT({ gc.setPhaseSink({}); });
+    rows.report = gc.runRegularRound();
+    EXPECT_TRUE(rows.report.acquired_lease);
+    return rows;
+}
+
+/// Whether thread `tid` of this process is sleeping, from its `/proc` stat line.
+bool threadSleeps(uint64_t tid)
+{
+    std::ifstream stat(fmt::format("/proc/self/task/{}/stat", tid));
+    std::string line;
+    if (!std::getline(stat, line))
+        return false;
+    const size_t name_end = line.rfind(')');
+    return name_end != std::string::npos && name_end + 2 < line.size() && line[name_end + 2] == 'S';
+}
+
+/// Installs a walk decode probe for its lifetime.
+class ScopedWalkDecodeProbe
+{
+public:
+    explicit ScopedWalkDecodeProbe(std::function<void()> probe) { setWalkRecordDecodeProbeForTest(std::move(probe)); }
+    ~ScopedWalkDecodeProbe() { setWalkRecordDecodeProbeForTest({}); }
+
+    ScopedWalkDecodeProbe(const ScopedWalkDecodeProbe &) = delete;
+    ScopedWalkDecodeProbe & operator=(const ScopedWalkDecodeProbe &) = delete;
+};
+
+/// Holds the store reads of `later` now, and returns a probe for the walk's first decode that makes the results of
+/// `needed` visible to the walk before it looks past its current record. The probe waits until every key of `needed`
+/// is visible (see `waitUntilVisible`), releases `later` and waits until those were read too; `ready` records whether
+/// both happened. `later` must be hinted after `needed` and hold at least as many keys as there are workers: a worker
+/// done with a key of `needed` then always finds a key of `later` to start, and blocks on it. The probe runs a copy of
+/// the function, so the call count lives outside it.
+std::function<void()> readyAtFirstDecode(ManifestReadAheadBackend & backend, std::set<String> needed, std::set<String> later,
+                                         bool & ready)
+{
+    backend.holdReadsOf(later);
+    return [&backend, wanted = std::move(needed), held = std::move(later), &ready, calls = std::make_shared<size_t>(0)]
+    {
+        if (++*calls != 1)
+            return;
+        const bool visible = backend.waitUntilVisible(wanted);
+        backend.releaseHeld();
+        ready = visible && backend.waitUntilRead(held);
+    };
+}
+
+/// A seal at `id` whose body names `next_epoch` as the epoch the chain continues in.
+void writeSealNaming(Backend & backend, const Layout & layout, const RefTxnId & id, uint64_t next_epoch)
+{
+    RefLogTxn txn;
+    txn.ns = kLife.string();
+    txn.txn_id = id;
+    txn.ops = {epochSealOp()};
+    txn.next_epoch = next_epoch;
+    writeRefLogTxnRaw(backend, layout, txn);
+}
+
+}
+
+/// Single-edge logs of different records have their manifest reads in flight together, within what planning observed.
+/// The walk applies what it applies at width 1. No manifest of a record past a seal, a terminal record or a head with
+/// a bad backlink is read.
+TEST(CASGCReadAhead, SingleEdgeLogsOverlapWithinPlan)
+{
+    constexpr uint64_t tail = 60;
+    struct Outcome
+    {
+        RefTxnId cursor;
+        std::vector<int64_t> degrees;
+        bool filled = false;
+        bool refs_ready = false;
+        UInt64 manifest_issued = 0;
+        UInt64 manifest_takes = 0;
+    };
+    const auto run = [&](uint64_t width)
+    {
+        Outcome out;
+        auto backend = std::make_shared<ManifestReadAheadBackend>();
+        auto store = openAtWidth(backend, width);
+        const Layout & layout = store->layout();
+        Gc gc(store, kGc);
+        foldFirstTwo(*backend, layout, gc);
+        publishRecords(*backend, layout, 3, tail);
+
+        std::optional<ScopedWalkDecodeProbe> probe;
+        ScopedRoundCallback arm(gc, RoundInterleavePoint::AfterDiscovery, {}, [&]
+        {
+            if (width == 1)
+                return;
+            backend->armManifestBarrier(9);
+            probe.emplace(readyAtFirstDecode(*backend, refLogKeysOf(layout, 4, 30), refLogKeysOf(layout, 31, tail - 1),
+                                             out.refs_ready));
+        });
+        const RoundRows rows = runRoundReadingRows(gc, *backend);
+        probe.reset();
+        EXPECT_EQ(arm.fired(), 1u);
+        out.filled = backend->manifestBarrierFilled();
+        out.cursor = lifeCursor(*backend, layout);
+        for (uint64_t i = 3; i <= tail; ++i)
+            out.degrees.push_back(inDegreeOf(*backend, layout, DB::UInt128(i)));
+        out.manifest_issued = rowMetric(rows.intake, "manifest_reads_issued");
+        out.manifest_takes = rowMetric(rows.intake, "manifest_takes");
+        return out;
+    };
+    const Outcome sequential = run(1);
+    const Outcome wide = run(16);
+    EXPECT_TRUE(wide.refs_ready) << "the ref logs were never read ahead";
+    EXPECT_TRUE(wide.filled) << "nine distinct manifest reads were never in flight at once";
+    EXPECT_EQ(wide.cursor, sequential.cursor);
+    EXPECT_EQ(wide.degrees, sequential.degrees);
+    EXPECT_EQ(sequential.cursor, (RefTxnId{1, tail}));
+    EXPECT_EQ(sequential.degrees, std::vector<int64_t>(tail - 2, 1));
+    EXPECT_EQ(wide.manifest_issued, wide.manifest_takes) << "a manifest was read ahead and never taken";
+
+    const auto stray_reads = [&](const std::function<void(ManifestReadAheadBackend &, const Layout &)> & seed,
+                                 const std::function<std::vector<String>(const Layout &)> & strays,
+                                 const RefTxnId & stray_record)
+    {
+        auto backend = std::make_shared<ManifestReadAheadBackend>();
+        auto store = openAtWidth(backend, 16);
+        const Layout & layout = store->layout();
+        Gc gc(store, kGc);
+        foldFirstTwo(*backend, layout, gc);
+        publishRecords(*backend, layout, 3, 10);
+        seed(*backend, layout);
+        backend->clearJournal();
+        runRoundReadingRows(gc, *backend);
+        EXPECT_GT(intakeReadsOf(*backend, refLogKeyOf(layout, stray_record)), 0u) << "positive control: the stray was read";
+        size_t n = 0;
+        for (const String & key : strays(layout))
+            n += intakeReadsOf(*backend, key);
+        return std::make_pair(n, lifeHold(*backend, layout));
+    };
+    {
+        SCOPED_TRACE("past a seal");
+        const auto [reads, hold] = stray_reads([](ManifestReadAheadBackend & backend, const Layout & layout)
+        {
+            writeSealNaming(backend, layout, RefTxnId{1, 11}, 2);
+            publishAt(backend, layout, kLife, RefTxnId{2, 1}, "ref_e2", 2001, DB::UInt128(2001),
+                      /*birth=*/false, /*prev_epoch_seal=*/RefTxnId{1, 11});
+            publishAt(backend, layout, kLife, RefTxnId{1, 12}, "ref_stray", 1012, DB::UInt128(1012));
+        }, [](const Layout & layout) { return std::vector<String>{manifestKeyOf(layout, 1, 1012)}; }, RefTxnId{1, 12});
+        (void)hold;
+        EXPECT_EQ(reads, 0u);
+    }
+    {
+        SCOPED_TRACE("past a terminal record");
+        const auto [reads, hold] = stray_reads([](ManifestReadAheadBackend & backend, const Layout & layout)
+        {
+            RefOp remove_op;
+            remove_op.kind = RefOpKind::RemoveNamespace;
+            writeTxnAt(backend, layout, kLife, RefTxnId{1, 11}, {remove_op});
+            publishAt(backend, layout, kLife, RefTxnId{1, 12}, "ref_stray", 1012, DB::UInt128(1012));
+        }, [](const Layout & layout) { return std::vector<String>{manifestKeyOf(layout, 1, 1012)}; }, RefTxnId{1, 12});
+        (void)hold;
+        EXPECT_EQ(reads, 0u);
+    }
+    {
+        SCOPED_TRACE("past a bad backlink at the named head");
+        const auto [reads, hold] = stray_reads([](ManifestReadAheadBackend & backend, const Layout & layout)
+        {
+            writeSealNaming(backend, layout, RefTxnId{1, 11}, 2);
+            publishAt(backend, layout, kLife, RefTxnId{2, 1}, "ref_e2", 2001, DB::UInt128(2001),
+                      /*birth=*/false, /*prev_epoch_seal=*/RefTxnId{1, 10});
+            publishAt(backend, layout, kLife, RefTxnId{2, 2}, "ref_e2_2", 2002, DB::UInt128(2002));
+            publishAt(backend, layout, kLife, RefTxnId{2, 3}, "ref_e2_3", 2003, DB::UInt128(2003));
+        }, [](const Layout & layout)
+        {
+            return std::vector<String>{manifestKeyOf(layout, 2, 2001), manifestKeyOf(layout, 2, 2002),
+                                       manifestKeyOf(layout, 2, 2003)};
+        }, RefTxnId{2, 2});
+        ASSERT_TRUE(hold.has_value()) << "positive control: the bad backlink holds";
+        EXPECT_EQ(hold->second, (RefTxnId{2, 1}));
+        EXPECT_EQ(reads, 0u);
+    }
+}
+
+/// Pass 2 starts with the whole ref window read and not yet taken. Manifests of later records still go out: sixteen
+/// distinct manifest reads are in flight at once.
+TEST(CASGCReadAhead, ManifestsAreAdmittedWhileTheRefWindowIsFull)
+{
+    constexpr uint64_t width = 16;
+    constexpr uint64_t window = 4 * width;
+    constexpr uint64_t tail = 200;
+    /// Pass 1 takes `window` records from `{1,3}`.
+    constexpr uint64_t first_of_pass_two = 3 + window;
+    auto backend = std::make_shared<ManifestReadAheadBackend>();
+    auto store = openAtWidth(backend, width);
+    const Layout & layout = store->layout();
+    Gc gc(store, kGc);
+    ASSERT_NO_FATAL_FAILURE(foldFirstTwo(*backend, layout, gc));
+    publishRecords(*backend, layout, 3, tail);
+
+    bool refs_ready = false;
+    std::optional<ScopedWalkDecodeProbe> probe;
+    ScopedRoundCallback arm(gc, RoundInterleavePoint::AfterNamespaceWalk,
+                            RoundInterleaveSelector{.first = kLife.string(), .second = kLife.string(), .pass = 1}, [&]
+    {
+        backend->armManifestBarrier(16);
+        /// The window pass 2 hints before its first take is the `window` records right after it: the first 43 are made
+        /// visible, the other 21 held until then, and all are read before the walk looks ahead.
+        probe.emplace(readyAtFirstDecode(*backend, refLogKeysOf(layout, first_of_pass_two + 1, first_of_pass_two + 43),
+                                         refLogKeysOf(layout, first_of_pass_two + 44, first_of_pass_two + window), refs_ready));
+    });
+    const RoundRows rows = runRoundReadingRows(gc, *backend);
+    probe.reset();
+    ASSERT_EQ(arm.fired(), 1u) << "the walk did not reach pass 2";
+    EXPECT_TRUE(refs_ready) << "the ref window was not read before the first take of pass 2";
+    EXPECT_TRUE(backend->manifestBarrierFilled()) << "sixteen distinct manifest reads were never in flight at once";
+    EXPECT_EQ(lifeCursor(*backend, layout), (RefTxnId{1, tail}));
+    EXPECT_EQ(rowMetric(rows.intake, "frontier_proven"), rowMetric(rows.intake, "frontier_namespaces"));
+    for (uint64_t i = 3; i <= tail; ++i)
+        ASSERT_EQ(inDegreeOf(*backend, layout, DB::UInt128(i)), 1) << "record " << i << " was not applied";
+}
+
+namespace
+{
+
+/// At width 16 pass 1 takes 64 records from `{1,3}`, and pass 2 starts at `{1,67}`. The tests below hold the walk in
+/// pass 2, which a held life does not leave in the same round.
+constexpr uint64_t kFirstOfPassTwo = 3 + 4 * 16;
+
+/// Calls `make_probe` when pass 1 of `kLife` ends and installs the probe it returns, so it runs at the first decode of
+/// pass 2.
+class PassTwoProbe
+{
+public:
+    PassTwoProbe(Gc & gc, std::function<std::function<void()>()> make_probe)
+        : arm(gc, RoundInterleavePoint::AfterNamespaceWalk,
+              RoundInterleaveSelector{.first = kLife.string(), .second = kLife.string(), .pass = 1},
+              [this, make = std::move(make_probe)] { probe.emplace(make()); })
+    {
+    }
+
+    size_t fired() const { return arm.fired(); }
+
+private:
+    std::optional<ScopedWalkDecodeProbe> probe;
+    ScopedRoundCallback arm;
+};
+
+/// Record `{1,at}` names two manifests, the second one absent, so the walk holds there with `ManifestBodyMissing`.
+/// Blob 1010 is the first manifest's.
+void writeHoldingRecord(Backend & backend, const Layout & layout, uint64_t at)
+{
+    writeBlobBody(backend, layout, DB::UInt128(1010));
+    writeManifestRaw(backend, layout, kLife, manifestRefOf(1, 1010), {blobEntryFor("data.bin", DB::UInt128(1010))});
+    writeBlobBody(backend, layout, DB::UInt128(1011));
+    std::vector<RefOp> ops = publishCommittedOps("held_a", manifestRefOf(1, 1010));
+    for (const RefOp & op : publishCommittedOps("held_b", manifestRefOf(1, 1011)))
+        ops.push_back(op);
+    writeTxnAt(backend, layout, kLife, RefTxnId{1, at}, std::move(ops));
+}
+
+void publishMissingManifestOfTheHold(Backend & backend, const Layout & layout)
+{
+    writeManifestRaw(backend, layout, kLife, manifestRefOf(1, 1011), {blobEntryFor("data.bin", DB::UInt128(1011))});
+}
+
+/// Record `{1,i}` as `publishRecords` writes it, without its manifest.
+void publishRecordWithoutManifest(Backend & backend, const Layout & layout, uint64_t i)
+{
+    writeBlobBody(backend, layout, DB::UInt128(i));
+    writeTxnAt(backend, layout, kLife, RefTxnId{1, i}, publishCommittedOps(fmt::format("ref_{}", i), manifestRefOf(1, i)));
+}
+
+void publishManifestOf(Backend & backend, const Layout & layout, uint64_t i)
+{
+    writeManifestRaw(backend, layout, kLife, manifestRefOf(1, i), {blobEntryFor("data.bin", DB::UInt128(i))});
+}
+
+}
+
+/// Behind an earlier hold, what is read ahead decides nothing: a malformed record holds only when the walk reaches it,
+/// a manifest read absent before it is published is read again by the next round, and a worker fault on a manifest is
+/// dropped. A log the walk holds in the middle of applies none of its edges.
+TEST(CASGCReadAhead, OrderedTakeOwnsTheOutcome)
+{
+    constexpr uint64_t tail = 100;
+    constexpr uint64_t held = kFirstOfPassTwo + 3;
+    constexpr uint64_t malformed = held + 10;
+    constexpr uint64_t late = held + 5;
+    enum class Case : uint8_t
+    {
+        MalformedRecord,
+        LatePublishedManifest,
+        ManifestWorkerFault,
+    };
+    for (const Case c : {Case::MalformedRecord, Case::LatePublishedManifest, Case::ManifestWorkerFault})
+    {
+        SCOPED_TRACE(static_cast<int>(c));
+        auto backend = std::make_shared<ManifestReadAheadBackend>();
+        auto store = openAtWidth(backend, 16);
+        const Layout & layout = store->layout();
+        Gc gc(store, kGc);
+        ASSERT_NO_FATAL_FAILURE(foldFirstTwo(*backend, layout, gc));
+        for (uint64_t i = 3; i <= tail; ++i)
+        {
+            if (i == held)
+                writeHoldingRecord(*backend, layout, held);
+            else if (c == Case::MalformedRecord && i == malformed)
+            {
+                OperationForTest op(*backend);
+                (*op).create(refLogKeyOf(layout, RefTxnId{1, i}), "this is not a cas_ref_log object", Retry::once());
+            }
+            else if (c == Case::LatePublishedManifest && i == late)
+                publishRecordWithoutManifest(*backend, layout, i);
+            else
+                publishRecords(*backend, layout, i, i);
+        }
+        const String late_key = manifestKeyOf(layout, 1, late);
+        if (c == Case::LatePublishedManifest)
+            backend->afterFirstRead(late_key, [&](bool present)
+            {
+                if (!present)
+                    publishManifestOf(*backend, layout, late);
+            });
+        if (c == Case::ManifestWorkerFault)
+            backend->failWorkerReadsOf(late_key);
+
+        backend->clearJournal();
+        bool refs_ready = false;
+        {
+            PassTwoProbe probe(gc, [&]
+            {
+                return readyAtFirstDecode(*backend, refLogKeysOf(layout, kFirstOfPassTwo + 1, malformed),
+                                          refLogKeysOf(layout, malformed + 1, tail - 1), refs_ready);
+            });
+            runRoundReadingRows(gc, *backend);
+            EXPECT_EQ(probe.fired(), 1u);
+        }
+        EXPECT_TRUE(refs_ready);
+        EXPECT_EQ(lifeHold(*backend, layout), std::make_pair(HoldReason::ManifestBodyMissing, RefTxnId{1, held}));
+        EXPECT_EQ(lifeCursor(*backend, layout), (RefTxnId{1, held - 1}));
+        EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(1010)), 0) << "the held log applied an edge";
+        EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(late)), 0);
+
+        switch (c)
+        {
+            case Case::MalformedRecord:
+            {
+                EXPECT_EQ(intakeReadsOf(*backend, manifestKeyOf(layout, 1, malformed - 1)), 1u)
+                    << "positive control: the manifest of the record before the malformed one was read ahead";
+                for (uint64_t i = malformed + 1; i <= tail; ++i)
+                    EXPECT_EQ(intakeReadsOf(*backend, manifestKeyOf(layout, 1, i)), 0u) << "a manifest past the malformed record";
+                publishMissingManifestOfTheHold(*backend, layout);
+                runRoundReadingRows(gc, *backend);
+                EXPECT_EQ(lifeHold(*backend, layout), std::make_pair(HoldReason::BodyUndecodable, RefTxnId{1, malformed}));
+                EXPECT_EQ(lifeCursor(*backend, layout), (RefTxnId{1, malformed - 1}));
+                break;
+            }
+            case Case::LatePublishedManifest:
+            {
+                EXPECT_TRUE(backend->afterFirstReadFired()) << "the manifest was not read ahead behind the hold";
+                publishMissingManifestOfTheHold(*backend, layout);
+                runRoundReadingRows(gc, *backend);
+                EXPECT_EQ(lifeHold(*backend, layout), std::nullopt);
+                EXPECT_EQ(lifeCursor(*backend, layout), (RefTxnId{1, tail}));
+                EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(late)), 1);
+                EXPECT_EQ(intakeReadsOf(*backend, late_key), 2u) << "the next round did not read the manifest again";
+                break;
+            }
+            case Case::ManifestWorkerFault:
+            {
+                EXPECT_GT(backend->faultsServed(), 0u) << "the manifest was not read ahead behind the hold";
+                break;
+            }
+        }
+    }
+}
+
+/// Two edges naming one manifest each get their own read: the body removed after the first read is absent for the
+/// second, which holds. Once both edges are ahead of the walk when it first looks ahead; once the first is the current
+/// log's there, at the first record of pass 2, and the second is the record after it.
+TEST(CASGCReadAhead, ARepeatedManifestIdIsObservedOncePerEdge)
+{
+    constexpr uint64_t tail = 100;
+    constexpr uint64_t last_remover = kFirstOfPassTwo + 13;
+    for (const uint64_t width : {1u, 16u})
+    {
+        for (const auto & [adder, remover] : {std::pair{kFirstOfPassTwo + 5, last_remover},
+                                              std::pair{kFirstOfPassTwo, kFirstOfPassTwo + 1}})
+        {
+            SCOPED_TRACE(fmt::format("width {}, added at {}, removed at {}", width, adder, remover));
+            auto backend = std::make_shared<ManifestReadAheadBackend>();
+            auto store = openAtWidth(backend, width);
+            const Layout & layout = store->layout();
+            Gc gc(store, kGc);
+            ASSERT_NO_FATAL_FAILURE(foldFirstTwo(*backend, layout, gc));
+            const ManifestRef shared = manifestRefOf(1, 500);
+            for (uint64_t i = 3; i <= tail; ++i)
+            {
+                if (i == adder)
+                    publishAt(*backend, layout, kLife, RefTxnId{1, i}, "shared", 500, DB::UInt128(500));
+                else if (i == remover)
+                    writeTxnAt(*backend, layout, kLife, RefTxnId{1, i},
+                               {ownerTransitionOp(RefOwnerBinding{RefOwnerKind::Committed, "shared", shared}, std::nullopt)});
+                else
+                    publishRecords(*backend, layout, i, i);
+            }
+            const String key = layout.manifestKey(ManifestId{kLife, shared});
+            backend->afterFirstRead(key, [&](bool present)
+            {
+                if (present)
+                    deleteManifestBody(*backend, layout, ManifestId{kLife, shared});
+            });
+
+            backend->clearJournal();
+            bool refs_ready = false;
+            {
+                std::optional<PassTwoProbe> probe;
+                if (width > 1)
+                    probe.emplace(gc, [&]
+                    {
+                        return readyAtFirstDecode(*backend, refLogKeysOf(layout, kFirstOfPassTwo + 1, last_remover),
+                                                  refLogKeysOf(layout, last_remover + 1, tail - 1), refs_ready);
+                    });
+                runRoundReadingRows(gc, *backend);
+            }
+            EXPECT_TRUE(width == 1 || refs_ready);
+            EXPECT_TRUE(backend->afterFirstReadFired());
+            EXPECT_EQ(intakeReadsOf(*backend, key), 2u);
+            EXPECT_EQ(lifeHold(*backend, layout), std::make_pair(HoldReason::ManifestBodyMissing, RefTxnId{1, remover}));
+            EXPECT_EQ(lifeCursor(*backend, layout), (RefTxnId{1, remover - 1}));
+        }
+    }
+}
+
+/// A manifest the query cache holds is still read by its exact `GET`, and never by a `HEAD`. The cleanup of a dropped
+/// owner's manifest after the round is the same at width 1 and 16.
+TEST(CASGCReadAhead, AWarmManifestStillGetsAnExactGet)
+{
+    {
+        auto backend = std::make_shared<ManifestReadAheadBackend>();
+        auto store = openAtWidth(backend, 16);
+        const Layout & layout = store->layout();
+        Gc gc(store, kGc);
+        ASSERT_NO_FATAL_FAILURE(foldFirstTwo(*backend, layout, gc));
+        publishRecords(*backend, layout, 3, 10);
+        const ManifestId warm{kLife, manifestRefOf(1, 5)};
+        ASSERT_NE(store->readManifestShared(warm), nullptr);
+        backend->clearJournal();
+        runRoundReadingRows(gc, *backend);
+        EXPECT_EQ(lifeCursor(*backend, layout), (RefTxnId{1, 10}));
+        EXPECT_EQ(intakeReadsOf(*backend, layout.manifestKey(warm)), 1u);
+        EXPECT_EQ(intakeRequestsOf(*backend, JournalVerb::Head, layout.manifestKey(warm)), 0u);
+    }
+
+    const auto deleted_manifests = [&](uint64_t width)
+    {
+        auto backend = std::make_shared<ManifestReadAheadBackend>();
+        auto store = openAtWidth(backend, width);
+        const Layout & layout = store->layout();
+        Gc gc(store, kGc);
+        foldFirstTwo(*backend, layout, gc);
+        publishRecords(*backend, layout, 3, 10);
+        writeTxnAt(*backend, layout, kLife, RefTxnId{1, 11},
+                   {ownerTransitionOp(RefOwnerBinding{RefOwnerKind::Committed, "ref_5", manifestRefOf(1, 5)}, std::nullopt)});
+        backend->clearJournal();
+        for (size_t round = 0; round < 3; ++round)
+        {
+            runRegularRoundReclaiming(gc);
+            store->renewWatermarkOnce();
+        }
+        std::set<String> deleted;
+        for (const JournalEntry & entry : backend->journal())
+            if (entry.verb == JournalVerb::Remove || entry.verb == JournalVerb::RemoveMany)
+                for (const String & key : entry.keys)
+                    if (isManifestKey(key))
+                        deleted.insert(key);
+        EXPECT_TRUE(deleted.contains(manifestKeyOf(layout, 1, 5))) << "positive control: the dropped manifest is removed";
+        return deleted;
+    };
+    EXPECT_EQ(deleted_manifests(1), deleted_manifests(16));
+}
+
+/// A future manifest hint the pool refuses fails the round at once. The reads already sent are awaited before the
+/// round returns, and nothing is adopted.
+TEST(CASGCReadAhead, SubmissionRefusalPropagatesAndTeardownDrains)
+{
+    constexpr uint64_t tail = 40;
+    auto backend = std::make_shared<ManifestReadAheadHintHoleBackend>();
+    auto store = openAtWidth(backend, 16);
+    const Layout & layout = store->layout();
+    Gc gc(store, kGc);
+
+    /// `{1,2}` adds a precommit and `{1,3}` promotes it, so the walk's first record names no manifest. `{1,4}` is the
+    /// last record listed, so planning keeps its body and the walk at `{1,3}` finds it without waiting.
+    fixture::admitLive(*backend, layout, kLife);
+    publishRecords(*backend, layout, 1, 1);
+    const ManifestRef promoted = manifestRefOf(1, 700);
+    writeBlobBody(*backend, layout, DB::UInt128(700));
+    writeManifestRaw(*backend, layout, kLife, promoted, {blobEntryFor("data.bin", DB::UInt128(700))});
+    writeTxnAt(*backend, layout, kLife, RefTxnId{1, 2},
+               {ownerTransitionOp(std::nullopt, RefOwnerBinding{RefOwnerKind::Precommit, "promoted", promoted})});
+    writeRecoverableCkptForRawFixture(*backend, layout, kLife, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 2},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    ASSERT_EQ(lifeCursor(*backend, layout), (RefTxnId{1, 2}));
+    writeTxnAt(*backend, layout, kLife, RefTxnId{1, 3},
+               {ownerTransitionOp(RefOwnerBinding{RefOwnerKind::Precommit, "promoted", promoted},
+                                  RefOwnerBinding{RefOwnerKind::Committed, "promoted", promoted})});
+    publishRecords(*backend, layout, 4, tail);
+    for (uint64_t i = 5; i <= tail; ++i)
+        backend->hide(refLogKeyOf(layout, RefTxnId{1, i}));
+
+    /// Not a body planning keeps: planning probes `{1,4}`, then `{1,5}, {1,6}, {1,8}, ...` and bisects below `{1,68}`.
+    const String outstanding = refLogKeyOf(layout, RefTxnId{1, tail - 1});
+    backend->holdReadsOf({outstanding});
+    const uint64_t generation = currentGenerationOf(*backend, layout);
+    bool decoded_the_next_record = false;
+    SCOPE_EXIT({
+        CannotAllocateThreadFaultInjector::setFaultProbability(0);
+        backend->releaseHeld();
+    });
+    int code = 0;
+    bool returned_while_held = true;
+    {
+        size_t calls = 0;
+        std::atomic<uint64_t> round_tid{0};
+        std::atomic<bool> round_returned{false};
+        ScopedWalkDecodeProbe probe([&]
+        {
+            ++calls;
+            if (calls == 1)
+            {
+                /// From here every submission is refused; the next one is the first record's look past itself.
+                CannotAllocateThreadFaultInjector::setFaultProbability(1.0);
+                round_tid = getThreadId();
+            }
+            else
+                decoded_the_next_record = true;
+        });
+        std::thread round([&]
+        {
+            try
+            {
+                gc.runRegularRound();
+            }
+            catch (const DB::Exception & e)
+            {
+                code = e.code();
+            }
+            round_returned = true;
+        });
+        /// The read stays held until the round, after the refusal, returned or went to sleep: in the join, unless
+        /// something else made it wait first.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline && !round_returned
+               && (round_tid == 0 || !threadSleeps(round_tid)))
+            std::this_thread::yield();
+        returned_while_held = round_returned;
+        backend->releaseHeld();
+        round.join();
+    }
+    CannotAllocateThreadFaultInjector::setFaultProbability(0);
+    EXPECT_GT(backend->holesServed(), 0u);
+    EXPECT_EQ(code, DB::ErrorCodes::CANNOT_SCHEDULE_TASK);
+    EXPECT_FALSE(decoded_the_next_record) << "the refusal did not fail the round where the future manifest was hinted";
+    EXPECT_FALSE(returned_while_held) << "the round returned while a read it had sent was outstanding";
+    EXPECT_TRUE(backend->readCompleted(outstanding)) << "the round returned before an outstanding read was answered";
+    EXPECT_EQ(backend->readsInFlight(), 0u);
+    EXPECT_EQ(lifeCursor(*backend, layout), (RefTxnId{1, 2}));
+    EXPECT_EQ(currentGenerationOf(*backend, layout), generation) << "the failed round adopted a generation";
+}
+
+/// Manifests read ahead belong to the visit that read them. A stop request or the end of the slice leaves them unused
+/// and the next round reads them again; the last turn of pass 1 reads none; a log with more distinct manifests than
+/// the window still has all of them applied; a worker fault nobody takes is dropped, and a bad manifest the walk
+/// reaches fails the round.
+TEST(CASGCReadAhead, FutureManifestWorkEndsWithTheVisit)
+{
+    const auto expect_prefix_applied = [](ManifestReadAheadBackend & backend, const Layout & layout, uint64_t last,
+                                          uint64_t reached)
+    {
+        for (uint64_t i = 3; i <= last; ++i)
+            EXPECT_EQ(inDegreeOf(backend, layout, DB::UInt128(i)), i <= reached ? 1 : 0) << "record " << i;
+    };
+    {
+        SCOPED_TRACE("stop request");
+        constexpr uint64_t tail = 60;
+        auto backend = std::make_shared<ManifestReadAheadBackend>();
+        auto store = openAtWidth(backend, 16);
+        const Layout & layout = store->layout();
+        Gc gc(store, kGc);
+        ASSERT_NO_FATAL_FAILURE(foldFirstTwo(*backend, layout, gc));
+        publishRecords(*backend, layout, 3, tail);
+        std::atomic<bool> stop{false};
+        gc.setStopSignal([&stop] { return stop.load(); });
+        backend->afterFirstRead(manifestKeyOf(layout, 1, 50), [&](bool) { stop = true; });
+        RoundRows stopped;
+        bool refs_ready = false;
+        {
+            ScopedWalkDecodeProbe probe(
+                readyAtFirstDecode(*backend, refLogKeysOf(layout, 4, 20), refLogKeysOf(layout, 21, tail - 1), refs_ready));
+            stopped = runRoundReadingRows(gc, *backend);
+        }
+        gc.setStopSignal({});
+        EXPECT_TRUE(backend->afterFirstReadFired());
+        EXPECT_EQ(backend->readsInFlight(), 0u);
+        EXPECT_EQ(rowMetric(stopped.reduce, "suppress_destructive"), 1u);
+        const RefTxnId reached = lifeCursor(*backend, layout);
+        EXPECT_LE(reached.ref_sequence, 50u);
+        expect_prefix_applied(*backend, layout, tail, reached.ref_sequence);
+
+        backend->clearJournal();
+        runRoundReadingRows(gc, *backend);
+        EXPECT_EQ(lifeCursor(*backend, layout), (RefTxnId{1, tail}));
+        expect_prefix_applied(*backend, layout, tail, tail);
+        for (uint64_t i = reached.ref_sequence + 1; i <= tail; ++i)
+            EXPECT_EQ(intakeReadsOf(*backend, manifestKeyOf(layout, 1, i)), 1u) << "manifest " << i;
+    }
+    {
+        SCOPED_TRACE("slice");
+        constexpr uint64_t tail = 120;
+        constexpr uint64_t cut_at = 90;
+        auto backend = std::make_shared<ManifestReadAheadBackend>();
+        auto store = openAtWidth(backend, 16);
+        const Layout & layout = store->layout();
+        Gc gc(store, kGc, {}, backend->monoMsFn());
+        ASSERT_NO_FATAL_FAILURE(foldFirstTwo(*backend, layout, gc));
+        publishRecords(*backend, layout, 3, tail);
+        backend->stepClockAfterRead(manifestKeyOf(layout, 1, cut_at));
+        const RoundRows cut = runRoundReadingRows(gc, *backend);
+        EXPECT_EQ(backend->readsInFlight(), 0u);
+        EXPECT_EQ(rowMetric(cut.intake, "frontier_proven"), 0u);
+        EXPECT_EQ(rowMetric(cut.reduce, "frontier_complete"), 0u);
+        const RefTxnId reached = lifeCursor(*backend, layout);
+        EXPECT_GE(reached.ref_sequence, 2 + 64u) << "pass 1 is never cut";
+        EXPECT_LE(reached.ref_sequence, cut_at);
+        expect_prefix_applied(*backend, layout, tail, reached.ref_sequence);
+
+        backend->clearJournal();
+        runRoundReadingRows(gc, *backend);
+        EXPECT_EQ(lifeCursor(*backend, layout), (RefTxnId{1, tail}));
+        expect_prefix_applied(*backend, layout, tail, tail);
+        for (uint64_t i = reached.ref_sequence + 1; i <= tail; ++i)
+            EXPECT_EQ(intakeReadsOf(*backend, manifestKeyOf(layout, 1, i)), 1u) << "manifest " << i;
+    }
+    {
+        SCOPED_TRACE("last turn of pass 1");
+        /// With nothing listed, planning probes `{1,3}, {1,4}, {1,5}, {1,7}, ...`: `{1,67}`, the first record of pass 2,
+        /// is a body it keeps, which the last turn of pass 1 must not look into.
+        constexpr uint64_t tail = 150;
+        auto backend = std::make_shared<ManifestReadAheadHintHoleBackend>();
+        auto store = openAtWidth(backend, 16);
+        const Layout & layout = store->layout();
+        Gc gc(store, kGc);
+        ASSERT_NO_FATAL_FAILURE(foldFirstTwo(*backend, layout, gc));
+        publishRecords(*backend, layout, 3, tail);
+        for (uint64_t i = 3; i <= tail; ++i)
+            backend->hide(refLogKeyOf(layout, RefTxnId{1, i}));
+        backend->clearJournal();
+        const RoundRows rows = runRoundReadingRows(gc, *backend);
+        EXPECT_GT(backend->holesServed(), 0u);
+        EXPECT_EQ(lifeCursor(*backend, layout), (RefTxnId{1, tail}));
+        EXPECT_EQ(rowMetric(rows.intake, "manifest_reads_issued"), rowMetric(rows.intake, "manifest_takes"));
+        for (uint64_t i = 3; i <= tail; ++i)
+            ASSERT_EQ(intakeReadsOf(*backend, manifestKeyOf(layout, 1, i)), 1u) << "manifest " << i << " was read more than once";
+    }
+    {
+        SCOPED_TRACE("more distinct manifests in one log than the window");
+        /// Width 2: the window is 8, and pass 1 takes `{1,3} .. {1,10}`. `{1,11}` holds on its absent manifest;
+        /// `{1,12}` names 20 manifests. It is the last record listed, so planning keeps its body and the walk at
+        /// `{1,11}` finds it without waiting.
+        constexpr uint64_t width = 2;
+        constexpr uint64_t edges = 20;
+        constexpr uint64_t held = 11;
+        constexpr uint64_t wide = 12;
+        constexpr uint64_t tail = 20;
+        auto backend = std::make_shared<ManifestReadAheadHintHoleBackend>();
+        auto store = openAtWidth(backend, width);
+        const Layout & layout = store->layout();
+        Gc gc(store, kGc);
+        ASSERT_NO_FATAL_FAILURE(foldFirstTwo(*backend, layout, gc));
+        publishRecords(*backend, layout, 3, held - 1);
+        publishRecordWithoutManifest(*backend, layout, held);
+        std::vector<RefOp> ops;
+        std::vector<String> wide_keys;
+        for (uint64_t e = 0; e < edges; ++e)
+        {
+            const uint64_t build = 4000 + e;
+            writeBlobBody(*backend, layout, DB::UInt128(build));
+            writeManifestRaw(*backend, layout, kLife, manifestRefOf(1, build), {blobEntryFor("data.bin", DB::UInt128(build))});
+            for (const RefOp & op : publishCommittedOps(fmt::format("wide_{}", e), manifestRefOf(1, build)))
+                ops.push_back(op);
+            wide_keys.push_back(manifestKeyOf(layout, 1, build));
+        }
+        writeTxnAt(*backend, layout, kLife, RefTxnId{1, wide}, std::move(ops));
+        publishRecords(*backend, layout, wide + 1, tail);
+        for (uint64_t i = wide + 1; i <= tail; ++i)
+            backend->hide(refLogKeyOf(layout, RefTxnId{1, i}));
+
+        backend->clearJournal();
+        runRoundReadingRows(gc, *backend);
+        EXPECT_GT(backend->holesServed(), 0u);
+        EXPECT_EQ(lifeHold(*backend, layout), std::make_pair(HoldReason::ManifestBodyMissing, RefTxnId{1, held}));
+        size_t read_ahead = 0;
+        for (const String & key : wide_keys)
+            read_ahead += intakeReadsOf(*backend, key);
+        EXPECT_EQ(read_ahead, 4 * width) << "the read-ahead of one future log's manifests is not the window";
+
+        publishManifestOf(*backend, layout, held);
+        runRoundReadingRows(gc, *backend);
+        EXPECT_EQ(lifeCursor(*backend, layout), (RefTxnId{1, tail}));
+        for (uint64_t e = 0; e < edges; ++e)
+            EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(4000 + e)), 1) << "edge " << e;
+    }
+    {
+        SCOPED_TRACE("an untaken worker fault");
+        auto backend = std::make_shared<ManifestReadAheadBackend>();
+        auto store = openAtWidth(backend, 16);
+        const Layout & layout = store->layout();
+        Gc gc(store, kGc);
+        ASSERT_NO_FATAL_FAILURE(foldFirstTwo(*backend, layout, gc));
+        constexpr uint64_t held = kFirstOfPassTwo + 3;
+        publishRecords(*backend, layout, 3, held - 1);
+        writeHoldingRecord(*backend, layout, held);
+        publishRecords(*backend, layout, held + 1, 100);
+        backend->failWorkerReadsOf(manifestKeyOf(layout, 1, held + 5));
+        bool refs_ready = false;
+        {
+            PassTwoProbe probe(gc, [&]
+            {
+                return readyAtFirstDecode(*backend, refLogKeysOf(layout, kFirstOfPassTwo + 1, held + 5),
+                                          refLogKeysOf(layout, held + 6, 99), refs_ready);
+            });
+            runRoundReadingRows(gc, *backend);
+        }
+        EXPECT_TRUE(refs_ready);
+        EXPECT_GT(backend->faultsServed(), 0u) << "positive control: the faulty manifest was read ahead";
+        EXPECT_EQ(lifeHold(*backend, layout), std::make_pair(HoldReason::ManifestBodyMissing, RefTxnId{1, held}));
+    }
+    for (const bool mismatched : {false, true})
+    {
+        SCOPED_TRACE(mismatched ? "a reached mismatched manifest" : "a reached malformed manifest");
+        auto backend = std::make_shared<ManifestReadAheadBackend>();
+        auto store = openAtWidth(backend, 16);
+        const Layout & layout = store->layout();
+        Gc gc(store, kGc);
+        ASSERT_NO_FATAL_FAILURE(foldFirstTwo(*backend, layout, gc));
+        publishRecords(*backend, layout, 3, 14);
+        publishRecordWithoutManifest(*backend, layout, 15);
+        publishRecords(*backend, layout, 16, 30);
+        if (mismatched)
+        {
+            /// The body of manifest `{1,16}` stored under the key of `{1,15}`.
+            OperationForTest op(*backend);
+            const auto body = (*op).read(manifestKeyOf(layout, 1, 16), Retry::once());
+            ASSERT_TRUE(body.has_value());
+            (*op).create(manifestKeyOf(layout, 1, 15), body->bytes, Retry::once());
+        }
+        else
+        {
+            OperationForTest op(*backend);
+            (*op).create(manifestKeyOf(layout, 1, 15), "this is not a cas manifest", Retry::once());
+        }
+        int code = 0;
+        try
+        {
+            gc.runRegularRound();
+        }
+        catch (const DB::Exception & e)
+        {
+            code = e.code();
+        }
+        EXPECT_EQ(code, DB::ErrorCodes::CORRUPTED_DATA);
+        EXPECT_EQ(lifeCursor(*backend, layout), (RefTxnId{1, 2}));
+    }
 }

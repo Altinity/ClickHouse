@@ -86,6 +86,11 @@ public:
     std::optional<Object> takeRead(const String & key, ReadFamily family = ReadFamily::Other);
     std::optional<Meta> takeHead(const String & key);
 
+    /// The body of a hinted read whose worker already answered present, without taking it. Null when `key` is not
+    /// hinted, not answered yet, answered absent, or failed. Never blocks and counts nothing. Owner thread only; the
+    /// pointer is valid until `key` is taken or discarded.
+    const Object * peekRead(const String & key) const;
+
     /// Starts counting tagged reads on this object; off until called, and then an untagged read is still
     /// not counted, polls nothing and reads no clock. Per family: `issued` counts accepted hints and inline
     /// takes; `takes` every take, absent or throwing included; `awaited` inline takes and hinted takes
@@ -125,11 +130,14 @@ public:
     size_t window() const { return concurrency <= 1 ? 0 : 4 * concurrency; }
 
 private:
+    /// The worker writes `result` before it completes `promise`, so a ready `future` makes `result` readable on the
+    /// owner thread without taking it. A worker exception travels through `promise` and leaves `result` empty.
     template <typename T>
     struct Slot
     {
-        std::promise<std::optional<T>> promise;
-        std::future<std::optional<T>> future;
+        std::optional<T> result;
+        std::promise<void> promise;
+        std::future<void> future;
         Slot() : future(promise.get_future()) {}
     };
 

@@ -431,11 +431,11 @@ reads are hinted ahead onto a bounded pool (`cas_gc_io_concurrency`, default 16;
 taken by the walk at exactly the sites, and in exactly the order, of the inline reads, so every
 decision, decode, counter and event stays on the round thread and, for the same completed work, the
 phase's semantic metrics do not depend on the setting. Two things do: a request a worker performed lands on that worker's
-`ProfileEvents`, not the phase row's, and a hinted key the walk never takes (a namespace held below
-its lookahead, a `HEAD` candidate that kept an edge) is a wasted request. `CASGCReadAheadHit` and
-`CASGCReadAheadMiss` are charged to the phase that takes the result; `CASGCReadAheadWasted` is
-counted when the reader is destroyed after phase 11, so it shows up in the round-level
-`ProfileEvents`, not on the phase-8 or phase-9 row.
+`ProfileEvents`, not the phase row's, and a hinted key the walk never takes is a wasted request: ref logs and
+manifests of later ref logs read ahead of a walk that stops at a hold, at the end of its time slice or at a stop
+request, and a `HEAD` candidate that kept an edge. `CASGCReadAheadHit` and `CASGCReadAheadMiss` are charged to the
+phase that takes the result. `CASGCReadAheadWasted` is counted on the phase-8 row when a walk drops its unused reads,
+and in the round-level `ProfileEvents` for reads still untaken when the reader is destroyed after phase 11.
 
 ## Phase 9 — intent sweep list {#phase-9-intent-sweep-list}
 

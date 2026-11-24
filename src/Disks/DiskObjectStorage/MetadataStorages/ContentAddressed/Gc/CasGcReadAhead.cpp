@@ -59,7 +59,8 @@ void GcReadAhead::hint(Slots<T> & slots, const String & key, Request request, Re
             try
             {
                 CasOperation worker = requests_ptr->resume(gen);
-                slot->promise.set_value(request(worker, key));
+                slot->result = request(worker, key);
+                slot->promise.set_value();
             }
             catch (...)
             {
@@ -107,7 +108,10 @@ std::optional<T> GcReadAhead::take(Slots<T> & slots, const String & key, Inline 
     {
         /// Rethrows the worker's exception at the site that would otherwise have read inline, so a
         /// transport failure fails the round from the same place and with the same type it always did.
-        return slot ? slot->future.get() : inline_request(op, key);
+        if (!slot)
+            return inline_request(op, key);
+        slot->future.get();
+        return std::move(slot->result);
     }
 
     ++family_stats->takes;
@@ -130,7 +134,15 @@ std::optional<T> GcReadAhead::take(Slots<T> & slots, const String & key, Inline 
             returned_ns = clock_ns();
             family_stats->wait_ns += returned_ns - wait_from_ns;
         });
-        result = slot ? slot->future.get() : inline_request(op, key);
+        if (slot)
+        {
+            slot->future.get();
+            result = std::move(slot->result);
+        }
+        else
+        {
+            result = inline_request(op, key);
+        }
     }
     apply_family = family;
     apply_since_ns = returned_ns;
@@ -236,6 +248,17 @@ std::optional<Meta> GcReadAhead::takeHead(const String & key)
 {
     return take<Meta>(heads, key,
         [](CasOperation & inline_op, const String & k) { return inline_op.head(k, Retry::standard()); }, ReadFamily::Other);
+}
+
+const Object * GcReadAhead::peekRead(const String & key) const
+{
+    const auto it = reads.find(key);
+    if (it == reads.end())
+        return nullptr;
+    const Slot<Object> & slot = *it->second;
+    if (slot.future.wait_for(std::chrono::seconds(0)) != std::future_status::ready || !slot.result)
+        return nullptr;
+    return &*slot.result;
 }
 
 UInt64 steadyNowNs() noexcept

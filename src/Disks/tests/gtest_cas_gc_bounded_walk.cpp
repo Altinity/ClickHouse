@@ -262,6 +262,9 @@ public:
         armed.insert(key);
     }
 
+    /// Jumps by one intake slice now.
+    void step() { now.fetch_add(Gc::kRefIntakeBudgetMs); }
+
     std::optional<Raw> read(const String & key, DB::Cas::TransportAccess & access) override
     {
         auto result = CountingBackend::read(key, access);
@@ -1016,13 +1019,21 @@ TEST(CASGCBoundedWalk, PassOneIsNeverCutAndPassTwoRotatesByRound)
         EXPECT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{1, kWindow})) << ns.string();
     EXPECT_EQ(metric(intake, "frontier_proven"), 0u);
 
-    /// The slice ends as the first walk applies a namespace's last record `{1, tail}`, which only a walk reads
-    /// through its manifest; the walk then ends at the stop planning fixed, which takes no read.
-    const auto armEnds = [&](const std::vector<RootNamespace> & which)
+    /// The slice ends at the decode of the first pass-2 walk's last record `{1, tail}`, the `decodes`-th walk decode of
+    /// the round. That walk still applies the record and ends at the stop planning fixed, which it checks before the
+    /// slice; the next walk ends at its first slice check.
+    const auto runEndingTheSliceAtDecode = [&](size_t decodes)
     {
-        for (const RootNamespace & ns : which)
-            backend->stepAfterGet(layout.manifestKey(ManifestId{ns, ManifestRef{.writer_epoch = 1, .build_sequence = tail,
-                                                                               .manifest_ordinal = 1}}));
+        const auto seen = std::make_shared<size_t>(0);
+        setWalkRecordDecodeProbeForTest([clock = backend, seen, decodes]
+        {
+            if (++*seen == decodes)
+                clock->step();
+        });
+        SCOPE_EXIT({ setWalkRecordDecodeProbeForTest({}); });
+        const RoundReport report = runRoundCapturingIntakeAndReport(gc, intake);
+        EXPECT_GE(*seen, decodes) << "the slice never ended";
+        return report;
     };
     /// Planning reads every namespace's end once per round.
     const auto endProbes = [&](const RootNamespace & ns)
@@ -1030,9 +1041,9 @@ TEST(CASGCBoundedWalk, PassOneIsNeverCutAndPassTwoRotatesByRound)
         return backend->getCount(logKey(layout, ns, RefTxnId{1, tail + 1}));
     };
 
-    armEnds(names);
     backend->resetCounts();
-    const RoundReport second = runRoundCapturingIntakeAndReport(gc, intake);
+    /// Pass 1 takes `kWindow` records of each life, then the first pass-2 walk takes `{1, 2 * kWindow + 1} .. {1, tail}`.
+    const RoundReport second = runEndingTheSliceAtDecode(names.size() * kWindow + 2 * kWindow);
     const size_t completed = second.round % names.size();
     for (size_t i = 0; i < names.size(); ++i)
     {
@@ -1046,9 +1057,10 @@ TEST(CASGCBoundedWalk, PassOneIsNeverCutAndPassTwoRotatesByRound)
     for (size_t i = 0; i < names.size(); ++i)
         if (i != completed)
             unfinished.push_back(names[i]);
-    armEnds(unfinished);
     backend->resetCounts();
-    const RoundReport third = runRoundCapturingIntakeAndReport(gc, intake);
+    /// The life completed last round decodes nothing, the others take `kWindow` records each in pass 1, and the first
+    /// pass-2 walk takes `{1, 3 * kWindow + 1} .. {1, tail}`.
+    const RoundReport third = runEndingTheSliceAtDecode(unfinished.size() * kWindow + kWindow);
     const size_t completed_third = third.round % unfinished.size();
     for (size_t i = 0; i < unfinished.size(); ++i)
     {

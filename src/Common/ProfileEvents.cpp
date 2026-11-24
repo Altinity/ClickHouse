@@ -945,7 +945,7 @@ The server successfully detected this situation and will download merged part fr
     M(CASGCList,         "Number of CAS GC LIST requests. Growing values indicate more collection enumeration.", ValueType::Number) \
     M(CASGCReadAheadHit,    "Number of CAS GC fold reads and HEADs answered by the fold's read-ahead. Growth means the round's small-object round trips overlapped instead of serializing.", ValueType::Number) \
     M(CASGCReadAheadMiss,   "Number of CAS GC fold reads and HEADs performed inline because nothing was hinted for the key. A large value against hits means a hint set is narrower than the walk.", ValueType::Number) \
-    M(CASGCReadAheadWasted, "Number of CAS GC read-ahead results fetched and never taken: a namespace held below its lookahead, or a HEAD candidate that kept an edge. Bounded by the read-ahead window per namespace.", ValueType::Number) \
+    M(CASGCReadAheadWasted, "Number of CAS GC read-ahead results fetched and never taken: reads ahead of a namespace walk (ref logs, and manifests of later ref logs) when the walk stops early at a hold, at the end of its time slice or at a stop request, and HEAD candidates that kept an edge.", ValueType::Number) \
     M(CASServerPut,      "Number of CAS server-object PUT requests. Grows with server metadata writes.", ValueType::Number) \
     M(CASServerPutDeduplicated, "Number of deduplicating CAS server-object PUT requests. Growth indicates reused server objects.", ValueType::Number) \
     M(CASServerOverwrite,"Number of CAS server-object overwrite requests. Growing values indicate repeated replacement writes.", ValueType::Number) \

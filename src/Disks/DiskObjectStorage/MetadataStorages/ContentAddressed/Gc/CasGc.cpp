@@ -1708,9 +1708,9 @@ bool Gc::foldManifestEdges(GcReadAhead & reads, const ManifestId & id, int sign,
     /// what an absent body means for that edge (a missing-body precommit is a barrier; a committed one
     /// fails closed). Never a throw: a 404 during the fold is an observation, not an error.
     ///
-    /// The bytes may already have been fetched when the log that named this edge was decoded (all of
-    /// that log's edges are hinted together, since one decode names them all). The absence signal, the
-    /// decode and every decision below still happen HERE, in edge order, exactly as they always did.
+    /// The bytes may already have been fetched, when the log that named this edge or an earlier one was
+    /// decoded. The absence signal, the decode and every decision below still happen HERE, in edge
+    /// order, exactly as they always did.
     const auto got = reads.takeRead(key, ReadFamily::Manifest);
     if (!got)
         return false;   /// absent body: caller decides (missing-body precommit OK; committed => fail closed)
@@ -2173,6 +2173,14 @@ public:
     }
 
     bool contains(const String & key) const { return bodies.contains(key); }
+
+    /// The body kept for `key`, or null; valid until `take(key)`.
+    const Object * find(const String & key) const
+    {
+        const auto it = bodies.find(key);
+        return it == bodies.end() ? nullptr : &it->second;
+    }
+
     /// Bytes kept over the round, including bodies the walk has taken since.
     size_t keptBytes() const { return kept_bytes; }
 
@@ -2969,6 +2977,12 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         std::vector<std::pair<RefTxnId, RefTxnId>> segments;
         /// Read-ahead hinted in `expected`'s epoch and not yet taken, in key order.
         std::deque<std::pair<RefTxnId, String>> lookahead;
+        /// Manifests hinted for records after the current one and not yet taken.
+        std::unordered_set<String> manifest_ahead;
+        /// The last sequence of `expected`'s epoch the manifest read-ahead examined; 0 when none.
+        uint64_t scan_done = 0;
+        /// A record ahead that names no successor in its epoch or does not decode: nothing at or past it is hinted.
+        std::optional<RefTxnId> scan_stop_at;
         /// Empty until planning ran: the walk then reads nothing.
         RefStopPlan plan;
     };
@@ -3062,6 +3076,11 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         for (const auto & [id, key] : s.lookahead)
             reads.discardRead(key);
         s.lookahead.clear();
+        for (const String & key : s.manifest_ahead)
+            reads.discardRead(key);
+        s.manifest_ahead.clear();
+        s.scan_done = 0;
+        s.scan_stop_at.reset();
     };
 
     /// Bodies planning read, which the walk takes instead of reading them again.
@@ -3093,6 +3112,68 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
             reads.hintRead(key, ReadFamily::RefLog);
             s.lookahead.emplace_back(id, std::move(key));
         }
+    };
+
+    /// READ-AHEAD of the manifests of later records in `current`'s epoch whose bodies are already here (kept by planning,
+    /// or read ahead and answered present), so single-edge logs do not wait for their manifests one at a time. The walk
+    /// still takes each read at its own record's turn. It looks at most `min(window, turns)` records ahead and not past
+    /// the last one planning read present, and stops at a body not here yet, at a record that ends the epoch and at one
+    /// that does not decode. A manifest already hinted ahead or named by the current log waits for the hint of its own
+    /// turn, so every edge gets its own read.
+    const auto hintManifestsAhead = [&](NamespaceIntake & s, const RefTxnId & current,
+                                        const std::vector<String> & current_keys, size_t turns)
+    {
+        const size_t window = reads.window();
+        const auto present = s.plan.last_present.find(current.writer_epoch);
+        if (window == 0 || present == s.plan.last_present.end())
+            return;
+        const uint64_t last = std::min(present->second, saturatingAdd(current.ref_sequence, std::min(window, turns)));
+        uint64_t sequence = std::max(s.scan_done, current.ref_sequence);
+        while (sequence < last && s.manifest_ahead.size() < window)
+        {
+            const RefTxnId id{current.writer_epoch, sequence + 1};
+            if (id == s.scan_stop_at)
+                break;
+            const String key = layout.refLogKey(s.life, id);
+            const Object * body = retained_ref_bodies.find(key);
+            if (!body)
+                body = reads.peekRead(key);
+            if (!body)
+                break;
+            std::vector<RefManifestEdge> edges;
+            std::optional<RefTxnId> successor;
+            try
+            {
+                const RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, body->bytes), s.target->ns, id);
+                edges = manifestEdgesOfTxn(txn);
+                successor = refChainSuccessor(txn);
+            }
+            catch (Exception & e)
+            {
+                if (!isMalformedStoredRecordError(e))
+                    throw;
+                s.scan_stop_at = id;
+                break;
+            }
+            if (!successor || successor->writer_epoch != id.writer_epoch)
+            {
+                s.scan_stop_at = id;
+                break;
+            }
+            for (const RefManifestEdge & edge : edges)
+            {
+                String manifest_key = layout.manifestKey(edge.manifest_id);
+                if (s.manifest_ahead.contains(manifest_key)
+                    || std::find(current_keys.begin(), current_keys.end(), manifest_key) != current_keys.end())
+                    continue;
+                if (s.manifest_ahead.size() == window)
+                    break;
+                reads.hintRead(manifest_key, ReadFamily::Manifest);
+                s.manifest_ahead.insert(std::move(manifest_key));
+            }
+            ++sequence;
+        }
+        s.scan_done = sequence;
     };
 
     /// SETUP, without I/O: the authority each walk starts from, and where it starts when that is known
@@ -3488,19 +3569,28 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
             /// CLAMP (barrier), never a round abort: keep the cursor below THIS log and re-read it next
             /// round. A removed precommit whose body never existed emitted no edge -- skip, no clamp.
             ///
-            /// The decode above named every manifest key this log folds, so they are fetched together
-            /// here and taken one at a time in edge order below. A log with a single edge gains
-            /// nothing; a merge or a mutation log with dozens turns dozens of serial round trips into
-            /// one. A clamp mid-log leaves the rest of this log's bodies fetched and untaken, which is
-            /// the bounded waste the read-ahead counts.
+            /// The decode above named every manifest key this log folds, so they are hinted together
+            /// here and taken one at a time in edge order below.
+            /// A clamp mid-log leaves the rest of this log's bodies fetched and untaken, which is the
+            /// bounded waste the read-ahead counts.
+            std::vector<String> edge_keys;
+            edge_keys.reserve(edges.size());
             for (const RefManifestEdge & edge : edges)
-                reads.hintRead(layout.manifestKey(edge.manifest_id), ReadFamily::Manifest);
+            {
+                edge_keys.push_back(layout.manifestKey(edge.manifest_id));
+                reads.hintRead(edge_keys.back(), ReadFamily::Manifest);
+            }
+            if (successor && successor->writer_epoch == log_id.writer_epoch)
+                hintManifestsAhead(s, log_id, edge_keys,
+                                   take_limit ? *take_limit - takes : std::numeric_limits<size_t>::max());
 
             std::vector<BlobDelta> log_deltas;
             std::map<ManifestId, Etag> log_mf_cleanup;
-            for (const RefManifestEdge & edge : edges)
+            for (size_t edge_index = 0; edge_index < edges.size(); ++edge_index)
             {
+                const RefManifestEdge & edge = edges[edge_index];
                 ProfileEvents::increment(ProfileEvents::CASRefEmittedEdges);   /// one manifest-edge event
+                s.manifest_ahead.erase(edge_keys[edge_index]);
                 if (foldManifestEdges(reads, edge.manifest_id, edge.change, log_deltas, log_mf_cleanup,
                                       txn_ordinal))
                     continue;
