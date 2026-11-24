@@ -1,5 +1,8 @@
 #include <IO/ReadWriteBufferFromHTTP.h>
 #include <Common/CurrentThread.h>
+#include <Common/MemoryTracker.h>
+#include <Common/ThreadStatus.h>
+#include <Common/scope_guard_safe.h>
 #include <Common/HTTPConnectionPool.h>
 #include <Common/HostResolvePool.h>
 #include <base/scope_guard.h>
@@ -1426,4 +1429,79 @@ TEST_F(ConnectionPoolTest, LatencyAwareDispatchSkipsStaleNonTopConnection)
     ASSERT_EQ(expired_before + 1, DB::CurrentThread::getProfileEvents()[metrics.expired]);
     ASSERT_EQ(reused_before + 1, DB::CurrentThread::getProfileEvents()[metrics.reused]);
     ASSERT_EQ(1, CurrentMetrics::get(metrics.stored_count));
+}
+
+TEST_F(ConnectionPoolTest, LatencyAwareSnapshotIsReleasedUnderTheTrackerItWasAllocatedUnder)
+{
+    /// Regression test: `getConnection` captures the resolver latency snapshot under
+    /// `total_memory_tracker` (the pool is global, not charged to a query). Previously the snapshot
+    /// was destroyed at scope exit, after the `MemoryTrackerSwitcher` was gone, so its buffer was
+    /// freed against the query tracker: the query was credited with bytes it was never charged for
+    /// (and `total_memory_tracker` kept them accounted forever).
+    DB::MainThreadStatus::getInstance();
+    DB::HostResolver::setLatencyAwareSelection(true);
+    SCOPE_EXIT({
+        DB::HostResolver::setLatencyAwareSelection(false);
+        DB::HostResolversPool::instance().dropCache();
+    });
+
+    const String test_host = "snapshot-tracker-symmetry.invalid";
+    const Poco::Net::IPAddress ip("127.0.0.1");
+
+    struct SequentialMockResolver : public DB::HostResolver
+    {
+        using ResolveFunction = DB::HostResolver::ResolveFunction;
+        SequentialMockResolver(String h, Poco::Timespan history_, ResolveFunction f)
+            : DB::HostResolver(std::move(f), std::move(h), history_)
+        {}
+    };
+
+    auto mock_resolver = std::make_shared<SequentialMockResolver>(
+        test_host,
+        Poco::Timespan(60 * 1000 * 1000),
+        [ip](const String &) -> std::vector<Poco::Net::IPAddress> { return {ip}; });
+    DB::HostResolversPool::instance().injectResolverForTest(test_host, mock_resolver);
+
+    auto uri = Poco::URI("http://" + test_host + ":" + std::to_string(server_data.port));
+    auto pool = DB::HTTPConnectionPools::instance().getPool(
+        DB::HTTPConnectionGroupType::HTTP, uri, DB::ProxyConfiguration{});
+
+    {
+        auto conn = pool->getConnection(timeouts, nullptr);
+        echoRequest("warmup", *conn);
+    }
+    mock_resolver->reportLatency(ip, 2'000); /// Non-empty snapshot => `entries` is heap-allocated.
+
+    /// Interpose a "query" tracker between the thread tracker and `total_memory_tracker`.
+    auto * thread_tracker = DB::CurrentThread::getMemoryTracker();
+    MemoryTracker query_tracker(&total_memory_tracker, VariableContext::Process);
+    auto * prev_parent = thread_tracker->getParent();
+    const Int64 saved_untracked_limit = DB::CurrentThread::get().untracked_memory_limit;
+    SCOPE_EXIT_SAFE({
+        DB::CurrentThread::flushUntrackedMemory();
+        thread_tracker->setParent(prev_parent);
+        DB::CurrentThread::get().untracked_memory_limit = saved_untracked_limit;
+    });
+    DB::CurrentThread::get().untracked_memory_limit = 0;
+    DB::CurrentThread::flushUntrackedMemory();
+    thread_tracker->setParent(&query_tracker);
+
+    /// A tracker's amount is clamped at zero, so charge the "query" first to make an over-release
+    /// visible. This buffer is allocated and released while the query tracker is the parent.
+    auto pre_charge = std::make_unique<char[]>(1 << 20);
+    asm volatile("" : : "r"(pre_charge.get()) : "memory"); /// Keep the compiler from eliding the allocation.
+    DB::CurrentThread::flushUntrackedMemory();
+
+    const Int64 before = query_tracker.get();
+    auto conn = pool->getConnection(timeouts, nullptr);
+    DB::CurrentThread::flushUntrackedMemory();
+    const Int64 delta = query_tracker.get() - before;
+
+    pre_charge.reset();
+    DB::CurrentThread::flushUntrackedMemory();
+    thread_tracker->setParent(prev_parent);
+
+    /// The snapshot was charged to `total_memory_tracker`, so it must be released there too:
+    /// nothing may be credited back to the query tracker.
+    ASSERT_GE(delta, 0) << "latency snapshot freed against the query tracker";
 }

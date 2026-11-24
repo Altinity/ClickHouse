@@ -825,11 +825,21 @@ public:
 
     IHTTPConnectionPoolForEndpoint::ConnectionPtr getConnection(const ConnectionTimeouts & timeouts, UInt64 * connect_time) override
     {
+        /// Declared before the `SCOPE_EXIT` below: the snapshot's buffer is allocated under
+        /// `total_memory_tracker` (see below), so it must also be released under it. Letting it be
+        /// destroyed at scope exit would free it while the query's tracker is active, crediting the
+        /// query with bytes it was never charged for.
+        HostResolver::LatencySnapshot latency_snapshot;
+
         std::vector<ConnectionPtr> expired_connections;
 
         SCOPE_EXIT({
             MemoryTrackerSwitcher switcher{&total_memory_tracker};
-            expired_connections.clear();
+            /// Release the buffers, not just the elements: both were allocated under
+            /// `total_memory_tracker` (the `reserve` below, `getLatencySnapshot`), so `clear` would
+            /// leave the capacity to be freed later against the query's tracker.
+            std::vector<ConnectionPtr>().swap(expired_connections);
+            latency_snapshot = HostResolver::LatencySnapshot{};
         });
 
         ConnectionPtr reused_connection;
@@ -841,7 +851,6 @@ public:
         ///   when no address has a measurement (e.g. non-S3 HTTP pools), and otherwise takes the
         ///   resolver mutex at most once per `getConnection` outside `mutex` rather than N + 1
         ///   times inside `mutex`.
-        HostResolver::LatencySnapshot latency_snapshot;
         if (HostResolver::latencyAwareSelectionEnabled() && usesTargetResolution())
         {
             MemoryTrackerSwitcher switcher{&total_memory_tracker};
