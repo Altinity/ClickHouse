@@ -82,6 +82,12 @@ void ConnectionEstablisher::run(ConnectionEstablisher::TryResult & result, std::
     /// The next attempt is the one reconnect after a ping timeout. Its `Hello` wait is capped
     /// by `sync_request_timeout`, including when `handshake_timeout_ms` is `0` (no socket timeout).
     bool cap_handshake_after_ping_timeout = false;
+    /// The entry that failed on the first attempt and is reconnected by the one retry. It stays
+    /// checked out: releasing it and asking the pool again returns the first idle object, which
+    /// can be another still-connected socket that a concurrent query has just released. That
+    /// socket would be pinged or polled instead of reconnected, and the single retry would be
+    /// spent on it even though a new connection to the same server would succeed.
+    decltype(result.entry) entry_to_reconnect;
 
     auto try_establish = [&]()
     {
@@ -110,7 +116,10 @@ void ConnectionEstablisher::run(ConnectionEstablisher::TryResult & result, std::
 
         had_pooled_connection = false;
         pooled_ping_timed_out = false;
-        result.entry = pool->getUnchecked(attempt_timeouts, settings);
+        if (entry_to_reconnect.isNull())
+            result.entry = pool->getUnchecked(attempt_timeouts, settings);
+        else
+            result.entry = std::move(entry_to_reconnect);
         had_pooled_connection = result.entry->isConnected();
 
         AsyncCallbackSetter<Connection> async_setter(&*result.entry, std::move(async_callback));
@@ -256,9 +265,14 @@ void ConnectionEstablisher::run(ConnectionEstablisher::TryResult & result, std::
 
             fail_message = getCurrentExceptionMessage(/* with_stacktrace = */ false);
 
+            const bool will_reconnect = can_reconnect && tries == 0 && had_pooled_connection;
+
             if (!result.entry.isNull())
             {
                 result.entry->disconnect();
+                /// The retry reconnects this same entry, see `entry_to_reconnect`.
+                if (will_reconnect)
+                    entry_to_reconnect = std::move(result.entry);
                 result.reset();
             }
 
@@ -267,7 +281,7 @@ void ConnectionEstablisher::run(ConnectionEstablisher::TryResult & result, std::
             /// connection was closed before the request reached a live server. A ping that timed out
             /// is included: a new connection can succeed when the old flow was dropped and the server
             /// is up. `cap_handshake_after_ping_timeout` limits that `Hello` wait.
-            if (can_reconnect && tries == 0 && had_pooled_connection)
+            if (will_reconnect)
             {
                 if (pooled_ping_timed_out)
                     cap_handshake_after_ping_timeout = true;
