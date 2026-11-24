@@ -743,7 +743,9 @@ private:
             items.pop_back();
         }
 
-        ConnectionPtr extractAt(size_t index) noexcept
+        /// Not `noexcept`: it relies on the comparator and the heap algorithms, which are not
+        /// declared not to throw. The only caller runs under `getConnection`, which propagates.
+        ConnectionPtr extractAt(size_t index)
         {
             chassert(index < items.size());
             if (index == 0)
