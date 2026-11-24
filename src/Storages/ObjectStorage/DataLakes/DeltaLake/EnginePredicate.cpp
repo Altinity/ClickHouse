@@ -702,6 +702,20 @@ uintptr_t EngineIterator::getNextImpl(EngineIteratorData & iterator_data, const 
 
             break;
         }
+        case DB::ActionsDAG::ActionType::INPUT:
+        {
+            /// Only a `Bool` column can be a predicate by itself: `WHERE int_column` means
+            /// `int_column != 0`, which delta-kernel would not evaluate the same way.
+            if (!isBool(getTypeOrNestedType(node)))
+                break;
+
+            return KernelUtils::unwrapResult(
+                ffi::visit_expression_column(
+                    iterator_data.state,
+                    KernelUtils::toDeltaString(node->result_name),
+                    &KernelUtils::allocateError),
+                "visit_expression_column");
+        }
         default:
         {
             break;
