@@ -3,6 +3,7 @@
 #include <Common/CurrentThread.h>
 #include <Common/HostResolvePool.h>
 #include <Common/MemoryTracker.h>
+#include <Common/NetException.h>
 #include <Common/ThreadStatus.h>
 #include <Common/scope_guard_safe.h>
 #include <base/defines.h>
@@ -15,6 +16,11 @@
 #include <future>
 #include <thread>
 
+
+namespace DB::ErrorCodes
+{
+    extern const int DNS_ERROR;
+}
 
 namespace ProfileEvents
 {
@@ -1477,4 +1483,65 @@ TEST_F(ResolvePoolTest, ConcurrentGetResolverForColdHostRunsDnsOnce)
     ASSERT_NE(nullptr, first_resolver);
     ASSERT_EQ(first_resolver, second_resolver);
     ASSERT_EQ(size_t(1), factory_calls.load());
+}
+
+TEST_F(ResolvePoolTest, ConcurrentGetResolverForColdHostSharesFailedLookup)
+{
+    /// Regression test: when the initial lookup of a cold host fails, the threads waiting for it
+    /// must get that failure instead of each running their own (slow) lookup one after another,
+    /// and the failed attempt must not block or leak into the next one.
+    const String host = "single-flight-failing-endpoint.invalid";
+
+    std::atomic<size_t> factory_calls{0};
+    std::promise<void> first_entered;
+    auto first_entered_future = first_entered.get_future();
+    std::promise<void> allow_finish;
+    auto allow_finish_future = allow_finish.get_future().share();
+    bool released = false;
+
+    /// Declared before the guard below: on a failed assertion the guard must release the blocked
+    /// lookup before the futures are destroyed (their destructors wait for the threads).
+    std::future<DB::HostResolver::Ptr> first;
+    std::future<DB::HostResolver::Ptr> second;
+
+    SCOPE_EXIT({
+        if (!released)
+            allow_finish.set_value();
+        DB::HostResolversPool::instance().setResolverFactoryForTest({});
+        DB::HostResolversPool::instance().dropCache();
+    });
+
+    DB::HostResolversPool::instance().setResolverFactoryForTest(
+        [&](const String & host_to_create) -> DB::HostResolver::Ptr
+        {
+            if (factory_calls.fetch_add(1) == 0)
+            {
+                first_entered.set_value();
+                allow_finish_future.wait();
+                throw DB::NetException(DB::ErrorCodes::DNS_ERROR, "no endpoints resolved for host {}", host_to_create);
+            }
+            return std::make_shared<ResolvePoolMock>(
+                host_to_create,
+                Poco::Timespan(60, 0),
+                [](const String &) -> std::vector<Poco::Net::IPAddress> { return {Poco::Net::IPAddress("127.0.0.1")}; });
+        });
+
+    first = std::async(std::launch::async, [&] { return DB::HostResolversPool::instance().getResolver(host); });
+    ASSERT_EQ(std::future_status::ready, first_entered_future.wait_for(5s));
+
+    second = std::async(std::launch::async, [&] { return DB::HostResolversPool::instance().getResolver(host); });
+    ASSERT_EQ(std::future_status::timeout, second.wait_for(300ms));
+
+    allow_finish.set_value();
+    released = true;
+
+    EXPECT_THROW({ [[maybe_unused]] auto resolver = first.get(); }, DB::NetException);
+    EXPECT_THROW({ [[maybe_unused]] auto resolver = second.get(); }, DB::NetException);
+    ASSERT_EQ(size_t(1), factory_calls.load());
+
+    /// The failed attempt left nothing behind: the next call runs its own lookup and succeeds.
+    auto resolver = DB::HostResolversPool::instance().getResolver(host);
+    ASSERT_NE(nullptr, resolver);
+    ASSERT_EQ(size_t(2), factory_calls.load());
+    ASSERT_EQ(resolver, DB::HostResolversPool::instance().tryGetResolver(host));
 }

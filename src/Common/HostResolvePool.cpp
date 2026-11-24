@@ -562,37 +562,54 @@ HostResolver::Ptr HostResolversPool::getResolver(const String & host)
 
     ResolverFactory factory;
     std::shared_ptr<PendingResolver> pending;
+    std::shared_future<HostResolver::Ptr> in_flight;
     {
         std::lock_guard lock(mutex);
         if (auto it = host_pools.find(host); it != host_pools.end())
             return it->second;
-        factory = resolver_factory_for_test;
-        auto & slot = pending_resolvers[host];
-        if (!slot)
-            slot = std::make_shared<PendingResolver>();
-        pending = slot;
+
+        if (auto it = pending_resolvers.find(host); it != pending_resolvers.end())
+        {
+            in_flight = it->second->result;
+        }
+        else
+        {
+            factory = resolver_factory_for_test;
+            pending = std::make_shared<PendingResolver>();
+            pending_resolvers.emplace(host, pending);
+        }
     }
+
+    /// Another thread is already resolving this host: wait for its outcome (a resolver, or the
+    /// exception of its failed lookup) instead of running the same DNS lookup again.
+    if (!pending)
+        return in_flight.get();
 
     /// Construct the resolver outside `mutex`: `HostResolver::create` runs the initial DNS lookup,
     /// and holding `mutex` across network I/O would block `tryGetResolver` and `getResolver` for
-    /// every other host in the process. Concurrent callers for the same cold host queue on the
-    /// per-host `pending->mutex` instead, so the lookup runs once and the others reuse its result.
-    /// A failed lookup leaves the slot in place; the next caller reuses it and retries.
-    std::lock_guard creation_lock(pending->mutex);
-
+    /// every other host in the process. Concurrent callers for the same cold host wait on `pending`.
+    HostResolver::Ptr resolver;
+    try
     {
-        SharedLockGuard lock(mutex);
-        if (auto it = host_pools.find(host); it != host_pools.end())
-            return it->second;
+        auto created = factory ? factory(host) : HostResolver::create(host);
+
+        std::lock_guard lock(mutex);
+        resolver = host_pools.try_emplace(host, std::move(created)).first->second;
+        pending_resolvers.erase(host);
+    }
+    catch (...)
+    {
+        {
+            std::lock_guard lock(mutex);
+            pending_resolvers.erase(host);
+        }
+        /// Rethrown to every waiter and to this caller; nothing is retried or substituted here.
+        pending->promise.set_exception(std::current_exception());
+        throw;
     }
 
-    auto created = factory ? factory(host) : HostResolver::create(host);
-
-    std::lock_guard lock(mutex);
-    auto result = host_pools.try_emplace(host, std::move(created)).first->second;
-    if (auto it = pending_resolvers.find(host); it != pending_resolvers.end() && it->second == pending)
-        pending_resolvers.erase(it);
-    return result;
+    pending->promise.set_value(resolver);
+    return resolver;
 }
 
 HostResolver::Ptr HostResolversPool::tryGetResolver(const String & host)

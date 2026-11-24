@@ -13,6 +13,7 @@
 #include <array>
 #include <atomic>
 #include <functional>
+#include <future>
 #include <mutex>
 #include <memory>
 #include <vector>
@@ -373,11 +374,14 @@ public:
     void setResolverFactoryForTest(ResolverFactory factory);
 
 private:
-    /// Serializes creation of the resolver for one host, so that concurrent callers for a cold host
-    /// run the DNS lookup once instead of each building a resolver and discarding all but one.
+    /// The in-flight creation of the resolver for one host. The first caller for a cold host (the
+    /// leader) creates the resolver and publishes the outcome, a resolver or the exception of the
+    /// failed lookup, through `result`; concurrent callers wait on it instead of running the DNS
+    /// lookup again. The slot is removed from `pending_resolvers` on both outcomes.
     struct PendingResolver
     {
-        std::mutex mutex;
+        std::promise<HostResolver::Ptr> promise;
+        std::shared_future<HostResolver::Ptr> result{promise.get_future().share()};
     };
 
     SharedMutex mutex;
