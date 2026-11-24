@@ -24,8 +24,9 @@ Control surface, reserved under the bucket name ``_control``:
   - ``GET  /_control/minted`` — every generation and every ETag the fake has ever minted;
   - ``GET  /_control/counters`` — per-method request counts plus the counts of the two operations a
     mutable token-producing write must never issue, ``CreateMultipartUpload`` and ``UploadPart``;
-  - ``POST /_control/condemn?bucket=B&key=K`` — rewrite blob ``K``'s existing ``.meta`` sibling from
-    ``Clean`` to ``Condemned`` without adding a captured storage request. This is a deterministic
+  - ``POST /_control/condemn?bucket=B&key=K`` — create the deletion intent of the CURRENT incarnation
+    of blob ``K`` (the key ``<pool>/blob-intents/<algo>/<shard>/<hex>/generation/<tag>``, where the tag is
+    the hex of the decimal generation) without adding a captured storage request. This is a deterministic
     state seam for the writer retry test, not a model of the GC request sequence;
   - ``POST /_control/reset`` — drop the capture log and the counters (objects are kept), and clear the
     delay knob below;
@@ -130,6 +131,19 @@ def _unclaimed_subresources(query):
 
 
 _LOCK = threading.Lock()
+
+# The one byte string every deletion intent holds (`blobIntentRecord` in CasBlobIntentFormat.cpp).
+_BLOB_INTENT_RECORD = b'{"type":"cas_blob_intent","v":4}\n{}\n'
+
+
+def _blob_intent_key(pool_prefix, algo_shard_hex, generation):
+    """The key of the intent of one incarnation of a blob: `Layout::blobIntentKey` for the generation dialect.
+
+    `algo_shard_hex` is the tail of the blob's own key (`<algo>/<shard>/<hex>`); the tag is the hex of the
+    generation's decimal text. `test_cas_gcs/test.py` pins this against a golden that `gtest_cas_blob_intent.cpp`
+    pins too.
+    """
+    return "{}/blob-intents/{}/generation/{}".format(pool_prefix, algo_shard_hex, generation.encode().hex())
 
 
 class Store:
@@ -408,8 +422,10 @@ def _request_class(bucket, key):
         return "probe"
     if "/staging/" in "/" + key:
         return "staging"
-    if re.search(r"/blobs/(?:ch128|xxh3|sha256)/[0-9a-f]{2}/[0-9a-f]+\.meta$", "/" + key):
-        return "blob_meta"
+    if re.search(
+        r"/blob-intents/(?:ch128|xxh3|sha256)/[0-9a-f]{2}/[0-9a-f]+/generation/[0-9a-f]+$", "/" + key
+    ):
+        return "blob_intent"
     if re.search(r"/blobs/(?:ch128|xxh3|sha256)/[0-9a-f]{2}/[0-9a-f]+$", "/" + key):
         return "blob_body"
     return "cas_control"
@@ -430,7 +446,7 @@ def _request_operation(bucket, request_class, method, query, headers):
         return "blob_multipart_complete"
     if method == "DELETE" and generation_match:
         return "exact_delete"
-    if method == "HEAD" and request_class in ("blob_body", "blob_meta", "cas_control"):
+    if method == "HEAD" and request_class in ("blob_body", "blob_intent", "cas_control"):
         return "native_token_head"
     if method == "PUT" and generation_match:
         if request_class == "blob_body" and copy_source is not None:
@@ -852,23 +868,27 @@ def handle_control(path, method, query):
     if path == "/_control/condemn" and method == "POST":
         bucket = query.get("bucket", [""])[0]
         blob_key = query.get("key", [""])[0]
-        meta_key = blob_key + ".meta"
-        entry = STORE.objects.get((bucket, meta_key))
+        entry = STORE.objects.get((bucket, blob_key))
         if entry is None:
-            return _no_such_key(meta_key)
-        text = entry["body"].decode("utf-8", "strict")
-        rewritten, replacements = re.subn(
-            r'"state":"clean","condemn_round":"[0-9]+"', '"state":"condemned","condemn_round":"1"', text, count=1
-        )
-        if replacements != 1:
-            return _bad_request("blob metadata is not Clean: " + meta_key)
-        entry["body"] = rewritten.encode()
-        entry["generation"] = STORE.mint_generation()
-        entry["etag"] = STORE.mint_etag()
-        entry["mtime"] = time.time()
+            return _no_such_key(blob_key)
+        parsed_key = re.fullmatch(r"(.+)/blobs/([^/]+/[0-9a-f]{2}/[0-9a-f]+)", blob_key)
+        if parsed_key is None:
+            return _bad_request("not a blob body key: " + blob_key)
+        intent_key = _blob_intent_key(parsed_key.group(1), parsed_key.group(2), entry["generation"])
+        if (bucket, intent_key) in STORE.objects:
+            return _bad_request("blob is already condemned: " + intent_key)
+        STORE.objects[(bucket, intent_key)] = {
+            "body": _BLOB_INTENT_RECORD,
+            "generation": STORE.mint_generation(),
+            "etag": STORE.mint_etag(),
+            "meta": {},
+            "tags": "",
+            "mtime": time.time(),
+            "content_type": "application/octet-stream",
+        }
         return Reply(
             200,
-            json.dumps({"bucket": bucket, "key": blob_key, "state": "condemned"}).encode(),
+            json.dumps({"bucket": bucket, "key": blob_key, "state": "condemned", "intent_key": intent_key}).encode(),
             {"Content-Type": "application/json"},
         )
     if path == "/_control/delay" and method == "POST":
@@ -1040,7 +1060,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "operation": operation,
                         "request_body": (
                             body.decode("utf-8", "replace")
-                            if request_class in ("blob_meta", "cas_control")
+                            if request_class in ("blob_intent", "cas_control")
                             else ""
                         ),
                         "status": reply.status,

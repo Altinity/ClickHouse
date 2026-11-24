@@ -2549,9 +2549,9 @@ ColumnsDescription contentAddressedGcRoundColumns()
         {"objects_spared", std::make_shared<DataTypeUInt64>()},
         {"manifests_deleted", std::make_shared<DataTypeUInt64>()},
         {"entries_condemned", std::make_shared<DataTypeUInt64>()},
-        {"entries_graduated", std::make_shared<DataTypeUInt64>()},
-        {"entries_redeleted", std::make_shared<DataTypeUInt64>()},
-        {"entries_redelete_failed", std::make_shared<DataTypeUInt64>()},
+        {"entries_intent_confirmed", std::make_shared<DataTypeUInt64>()},
+        {"entries_bodies_deleted", std::make_shared<DataTypeUInt64>()},
+        {"entries_body_delete_failed", std::make_shared<DataTypeUInt64>()},
         {"fence_outs", std::make_shared<DataTypeUInt64>()},
         {"anomalies", std::make_shared<DataTypeUInt64>()},
         /// Task 7: the retire pipeline's REMAINING (not this-round-delta) sizes, read from the gc/state
@@ -2560,6 +2560,11 @@ ColumnsDescription contentAddressedGcRoundColumns()
         {"pending_candidates", std::make_shared<DataTypeUInt64>()},
         {"pending_condemned", std::make_shared<DataTypeUInt64>()},
         {"pending_retired", std::make_shared<DataTypeUInt64>()},
+        /// Compatibility names for tools that read the row: same values as `entries_intent_confirmed`,
+        /// `entries_bodies_deleted` and `entries_body_delete_failed`.
+        {"entries_graduated", std::make_shared<DataTypeUInt64>()},
+        {"entries_redeleted", std::make_shared<DataTypeUInt64>()},
+        {"entries_redelete_failed", std::make_shared<DataTypeUInt64>()},
     }};
 }
 
@@ -2577,14 +2582,17 @@ void appendContentAddressedGcRoundRow(MutableColumns & res_columns, const String
     res_columns[i++]->insert(rep.spared);
     res_columns[i++]->insert(rep.manifests_deleted);
     res_columns[i++]->insert(rep.condemned);
-    res_columns[i++]->insert(rep.graduated);
-    res_columns[i++]->insert(rep.redeleted);
-    res_columns[i++]->insert(rep.redelete_failed);
+    res_columns[i++]->insert(rep.intent_confirmed);
+    res_columns[i++]->insert(rep.bodies_deleted);
+    res_columns[i++]->insert(rep.body_delete_failed);
     res_columns[i++]->insert(rep.fence_outs);
     res_columns[i++]->insert(rep.anomalies.size());
     res_columns[i++]->insert(rep.pending_candidates);
     res_columns[i++]->insert(rep.pending_condemned);
     res_columns[i++]->insert(rep.pending_retired);
+    res_columns[i++]->insert(rep.intent_confirmed);
+    res_columns[i++]->insert(rep.bodies_deleted);
+    res_columns[i++]->insert(rep.body_delete_failed);
 }
 
 ColumnsDescription contentAddressedGcRebuildColumns()
@@ -2628,85 +2636,20 @@ void appendContentAddressedGcRebuildRow(MutableColumns & res_columns, const Stri
     res_columns[i++]->insert(rep.adopted_seal_generation);
 }
 
-/// SYSTEM CAS FSCK's one-row-per-disk summary. Named UInt64 columns only, no DETAIL
-/// keyword (YAGNI -- the offline `clickhouse-disks cas-fsck --detail` applet already covers per-object
-/// listing). Field order/names mirror `Cas::FsckReport`; the row was a deliberate SUBSET of it until
-/// 2026-07-29, and is no longer one where findings are concerned -- see the rule stated at
-/// `stale_edge` below. `CommandFsck.cpp`'s `formatFsckSummary` line carries the same fields.
 ColumnsDescription contentAddressedFsckColumns()
 {
-    return ColumnsDescription{NamesAndTypesList{
-        {"disk", std::make_shared<DataTypeString>()},
-        {"reachable", std::make_shared<DataTypeUInt64>()},
-        {"dangling", std::make_shared<DataTypeUInt64>()},
-        {"unreachable", std::make_shared<DataTypeUInt64>()},
-        {"pending_gc", std::make_shared<DataTypeUInt64>()},
-        {"awaiting_gc", std::make_shared<DataTypeUInt64>()},
-        {"unaccounted", std::make_shared<DataTypeUInt64>()},
-        /// EVERY TERM OF `FsckReport::clean` APPEARS HERE. This row is the only view of a report a SQL
-        /// consumer ever gets, so a hard finding the row omits is a finding no query can see — the same
-        /// shape that hid `corrupted_runs` from the text summary for months. The row was a deliberate
-        /// subset until 2026-07-29 and `stale_edge`/`corrupted_runs` were invisible from SQL while
-        /// `clickhouse-disks cas-fsck` surfaced them; then
-        /// `lifeless_keys` was added to `clean` in 2026-07-30 and missed here too. Every time, the rule
-        /// was written in prose, and every time the prose did not hold.
-        ///
-        /// So it no longer lives only in prose: `kFsckHardFindings` (`CasFsck.h`) is the list `clean` is
-        /// computed from, and the `static_assert` beside it breaks the build in THIS translation unit when
-        /// a term is added. Read that assert's message before bumping its count -- it names this site as
-        /// one of the three that owes an update, and says that two of the three have no test that can fail
-        /// on their behalf. WHICH two is in the comment above the assert, not in the message; this site is
-        /// one of them.
-        ///
-        /// `stale_edge` is nonzero only in `detail` mode and this row is built from a summary scan, so it
-        /// reads 0 here always — present because "absent" and "zero" are different facts to a consumer,
-        /// and a column that appears the day the scan gains detail is a schema change nobody asked for.
-        {"stale_edge", std::make_shared<DataTypeUInt64>()},
-        {"corrupted_runs", std::make_shared<DataTypeUInt64>()},
-        /// The ref-stream verdicts (spec §7). `chain_broken` is a HARD finding — it belongs on the row
-        /// for the same reason `dangling` does. `unchecked` is its honest companion: namespaces the audit
-        /// could not prove either way, so a zero here is what makes the other zeros mean something.
-        {"chain_broken", std::make_shared<DataTypeUInt64>()},
-        {"unchecked", std::make_shared<DataTypeUInt64>()},
-        /// A malformed/non-canonical namespace-tree key, or an ambiguous/unreadable catalog
-        /// incarnation — a term of `clean`.
-        {"lifeless_keys", std::make_shared<DataTypeUInt64>()},
-        /// A COMPLETE, canonical namespace-life key whose life is absent from a catalog cut taken after
-        /// the listing: janitor-pending debris, NOT a term of `clean` (see `FsckClass::JanitorPending`).
-        {"namespace_janitor_pending", std::make_shared<DataTypeUInt64>()},
-        {"namespace_janitor_pending_bytes", std::make_shared<DataTypeUInt64>()},
-        {"namespace_janitor_pending_lives", std::make_shared<DataTypeUInt64>()},
-        {"ref_records_walked", std::make_shared<DataTypeUInt64>()},
-        {"physical_bytes", std::make_shared<DataTypeUInt64>()},
-        {"referenced_logical_bytes", std::make_shared<DataTypeUInt64>()},
-        {"distinct_blobs", std::make_shared<DataTypeUInt64>()},
-        {"total_blob_refs", std::make_shared<DataTypeUInt64>()},
-    }};
+    NamesAndTypesList columns{{"disk", std::make_shared<DataTypeString>()}};
+    for (const Cas::FsckField & column : Cas::fsckSqlColumns())
+        columns.emplace_back(String(column.sql_column), std::make_shared<DataTypeUInt64>());
+    return ColumnsDescription{columns};
 }
 
 void appendContentAddressedFsckRow(MutableColumns & res_columns, const String & disk_name, const Cas::FsckReport & rep)
 {
     size_t i = 0;
     res_columns[i++]->insert(disk_name);
-    res_columns[i++]->insert(rep.reachable);
-    res_columns[i++]->insert(rep.dangling);
-    res_columns[i++]->insert(rep.unreachable);
-    res_columns[i++]->insert(rep.pending_gc);
-    res_columns[i++]->insert(rep.awaiting_gc);
-    res_columns[i++]->insert(rep.unaccounted);
-    res_columns[i++]->insert(rep.stale_edge);
-    res_columns[i++]->insert(rep.corrupted_runs);
-    res_columns[i++]->insert(rep.chain_broken);
-    res_columns[i++]->insert(rep.unchecked);
-    res_columns[i++]->insert(rep.lifeless_keys);
-    res_columns[i++]->insert(rep.namespace_janitor_pending);
-    res_columns[i++]->insert(rep.namespace_janitor_pending_bytes);
-    res_columns[i++]->insert(rep.namespace_janitor_pending_lives);
-    res_columns[i++]->insert(rep.ref_records_walked);
-    res_columns[i++]->insert(rep.physical_bytes);
-    res_columns[i++]->insert(rep.referenced_logical_bytes);
-    res_columns[i++]->insert(rep.distinct_blobs);
-    res_columns[i++]->insert(rep.total_blob_refs);
+    for (const Cas::FsckField & column : Cas::fsckSqlColumns())
+        res_columns[i++]->insert(column.value(rep));
 }
 
 }

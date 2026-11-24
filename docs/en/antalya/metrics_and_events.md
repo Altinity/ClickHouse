@@ -184,10 +184,9 @@ Day-to-day interpretation is on the [monitoring](/antalya/cas/operations/monitor
 
 | Event | Type | Description |
 | --- | --- | --- |
-| `CASGCClampSuppressedPasses` | `Number` | Number of CAS GC passes that deferred shard graduation and deletion because reachability was uncertain. In the current stage this is EVERY folding round by construction, not an anomaly: the namespace universe is not yet knowable, so the round's destructive gate is shut unconditionally and this counter tracks folding rounds rather than trouble. What does discriminate is the fold seal's hold set and the tables_held column of the fold_ref_intake phase row -- read those, not this, to tell a healthy suppressed round from a namespace that stopped. |
+| `CASGCClampSuppressedPasses` | `Number` | Number of CAS GC folding passes whose destructive work was suppressed: no body or intent was deleted because of an anomaly, a held namespace, an unproven reference frontier, or a gc/state HEAD that did not show the version the round leased. A healthy round does not count. The cause is in the server log and in the fold_reduce phase row of system.cas_gc_log (suppress_destructive, frontier_complete, parent_unconfirmed). |
 | `CASGCCompareSwap` | `Number` | Number of CAS GC compare-and-swap requests. Grows with GC state updates. |
 | `CASGCCompareSwapConflict` | `Number` | Number of CAS GC compare-and-swap conflicts. A non-zero value indicates concurrent GC or metadata updates. |
-| `CASGCCondemnMarkerUnconfirmedCarry` | `Number` | Number of CAS GC retirements delayed because a durable condemn marker could not be confirmed. A non-zero value indicates marker write or read failures and safely postpone deletion. |
 | `CASGCDeadPrecommitSkipped` | `Number` | Number of CAS GC edges skipped for precommits proven dead below the durable watermark. Growing values indicate stale or incomplete ref history. |
 | `CASGCDelete` | `Number` | Number of CAS GC DELETE requests. Grows with successful cleanup attempts. |
 | `CASGCEnumerationPages` | `Number` | Number of CAS GC LIST pages fetched while enumerating the object universe. Growing values indicate a larger universe or more frequent scans. |
@@ -197,8 +196,6 @@ Day-to-day interpretation is on the [monitoring](/antalya/cas/operations/monitor
 | `CASGCHeadMiss` | `Number` | Number of CAS GC HEAD requests that found no object. A non-zero value indicates already-removed or missing objects. |
 | `CASGCHeartbeatFenceOuts` | `Number` | Number of CAS GC operations fenced out for expired mounts. A non-zero value indicates stale mounts or heartbeat delays. |
 | `CASGCList` | `Number` | Number of CAS GC LIST requests. Growing values indicate more collection enumeration. |
-| `CASGCMetaOps` | `Number` | Number of per-hash metadata operations executed by CAS GC. Growing values indicate more GC candidates or metadata work. |
-| `CASGCMetaWriteAnomaly` | `Number` | Number of CAS GC metadata operations that failed on the bounded metadata pool. A non-zero value indicates backend or pool pressure and may delay metadata convergence. |
 | `CASGCNamespaceCleanupLeaks` | `Number` | Number of dead-life namespace objects whose reclamation the perpetual janitor could not confirm because HEAD or exact-delete failed. Each occurrence is logged with the exact key and remains leak-only: it neither suppresses destructive GC nor blocks catalog lifecycle progress. |
 | `CASGCOverwrite` | `Number` | Number of CAS GC overwrite requests. Growing values indicate repeated GC metadata replacement. |
 | `CASGCPut` | `Number` | Number of CAS GC PUT requests. Grows with GC metadata and object-management writes. |
@@ -209,13 +206,18 @@ Day-to-day interpretation is on the [monitoring](/antalya/cas/operations/monitor
 | `CASGCRebuildVirginByEnumeration` | `Number` | Number of times SYSTEM CAS GC REBUILD concluded FROM ENUMERATION ALONE that a pool had never sealed a baseline, and so carried no durable holds forward. The verdict rests on three pieces of evidence -- a wide LIST of the gc/gen prefix empty, a narrow probe of gc/gen/1/ empty, and gc/state absent -- and on no point read, because the fold seal key needs an attempt component that is a lease sequence number and has no arithmetic successor to probe. An enumeration that hid every seal INCLUDING generation 1 on a lived-in pool would therefore read as virgin here. Expected to be 0 on any pool that has ever completed a GC round; a nonzero value on such a pool means the rebuild was granted a clean slate it could not prove. |
 | `CASGCRefWalkPlansBuilt` | `Number` | Number of complete catalog-authoritative CAS ref walk plans constructed by ordinary GC and rebuild. A regular or rebuilding invocation that reaches the post-LIST catalog cut increments this exactly once, including a round that later defers. |
 | `CASGCRetireReplaced` | `Number` | Number of CAS GC re-condemnations after a resurrected object replaced a retired incarnation. Growth indicates object-generation churn. |
+| `CASGCRetiredBodyDeleted` | `Number` | Number of CAS GC blob body deletes answered, each conditional on the token the GC observed. Growth indicates physical cleanup activity. |
+| `CASGCRetiredBodyDeleteFailed` | `Number` | Number of CAS GC pending blob deletes whose `HEAD` or exact-token `DELETE` failed. A non-zero value indicates object storage errors; the round fails and the affected blobs are retried in the next round. |
 | `CASGCRetiredCondemned` | `Number` | Number of CAS GC entries newly condemned into the retired set. Growth indicates objects becoming eligible for later cleanup. |
-| `CASGCRetiredGraduated` | `Number` | Number of CAS GC retired entries that passed the safety floor and became pending deletion. Growth indicates cleanup progress. |
-| `CASGCRetiredRedeleted` | `Number` | Number of CAS GC pending deletes executed with an exact object token. Growth indicates physical cleanup activity. |
+| `CASGCRetiredGraduated` | `Number` | The earlier name of `CASGCRetiredIntentConfirmed`, incremented together with it. |
+| `CASGCRetiredIntentConfirmed` | `Number` | Number of CAS GC rows committed `pending` after their deletion intent was confirmed. Growth indicates cleanup progress. |
+| `CASGCRetiredRedeleted` | `Number` | The earlier name of `CASGCRetiredBodyDeleted`, incremented together with it. |
+| `CASGCRetiredRedeleteFailed` | `Number` | The earlier name of `CASGCRetiredBodyDeleteFailed`, incremented together with it. |
 | `CASGCRetiredSpared` | `Number` | Number of CAS GC retired entries spared after references returned. Growing values indicate reference churn or resurrection. |
-| `CASGCRetiredSparedByReref` | `Number` | Number of CAS GC delete_pending entries spared because a fresh deduplicating adopt re-referenced them after graduation (an ordinary observe/condemn race, not a fail-closed abort). Subset of CASGCRetiredSpared. |
+| `CASGCRetiredSparedByReref` | `Number` | Number of CAS GC pending or standing rows dropped because the blob was referenced again (an ordinary race, not a fail-closed abort). Subset of CASGCRetiredSpared. |
 | `CASGCStuckRemovals` | `Number` | Number of adopted CAS GC rounds that observed a Removing namespace at or beyond the diagnostic age threshold without terminal cleanup evidence. Incremented and warned every such round; diagnostic only, with no effect on folding, suppression, appends, or deletion. |
 | `CASGCUnappliedFoldedTransactions` | `Number` | Number of ref transactions a GC round folded and merged but whose blob deltas never reached a shard reducer. Always 0 on a healthy round; a nonzero value fails the round closed, because the round would otherwise advance its fold cursor past a transaction it never applied. |
+| `CASGCUndecodableBlobBody` | `Number` | Number of blob bodies a CAS GC round met that are shorter than the pool's blob envelope. `GC` records no row for such a body, carries an existing row unchanged and deletes nothing. See [a body `GC` cannot decode](/antalya/cas/architecture/garbage-collection#undecodable-body). |
 | `CASGCUnmatchedAdoptedParentLives` | `Number` | Number of adopted-parent CAS ref-life rows dropped because the post-LIST catalog cut has no matching physical life. Each occurrence is inert for planning and suppression and is logged with its exact physical life id; a persistent nonzero rate indicates old generation state is outliving catalog removal. |
 | `CASGCUnmatchedRemoveDeltas` | `Number` | Number of CAS GC in-degree removal deltas that matched no existing source edge. The in-degree model is a set, not a counter, so this is a per-key no-op by design and never causes a false deletion — but a persistent nonzero rate means removal deltas are reaching the reducer without their matching activation, which is a correctness signal. |
 
@@ -273,18 +275,30 @@ These counters cover ref-log appends, recovery, snapshots, and reachability edge
 | `CASRefSweepRearmed` | `Number` | Number of failed or partial stale-precommit sweeps scheduled for retry. Growing values indicate persistent cleanup or backend errors. |
 | `CASRefTableEvictions` | `Number` | Number of CAS ref-cache table evictions caused by the memory budget. Growing values indicate a small cache and more recovery I/O. |
 
-#### Blob metadata {#cas-blob-metadata}
+#### Deletion intents {#cas-deletion-intents}
 
-These counters cover per-blob metadata creates, rewrites, and deletes.
+These counters cover the deletion intents `GC` writes before it deletes a blob body, and the writer
+decisions that read them. The four `CASBlobIntent*` counters count requests on `blob-intents/`; the
+`CASBlob*` request counters do not include them.
 
 | Event | Type | Description |
 | --- | --- | --- |
-| `CASMetaAbsentRepublish` | `Number` | Number of blob publication attempts started because the body was present but its freshness marker was absent; such a body is republished, never adopted. Counts attempts, including ones that fail. |
-| `CASMetaCompareSwap` | `Number` | Number of conditional CAS blob-metadata rewrites, including lost races. Growing values indicate metadata updates or contention. |
-| `CASMetaCreateClean` | `Number` | Number of publications after an absent body or an absent marker that entered Clean metadata reconciliation. Counts the reason entry, not a guaranteed metadata creation. |
-| `CASMetaDelete` | `Number` | Number of exact-token CAS blob-metadata delete attempts. Growth indicates GC or cleanup activity. |
-| `CASMetaPut` | `Number` | Number of conditional CAS blob-metadata create attempts, including lost races. Growth indicates metadata reconciliation or write contention. |
-| `CASMetaResurrectClean` | `Number` | Number of condemned-body replacement paths that entered Clean metadata reconciliation. Counts the reason entry, not a guaranteed metadata reset. |
+| `CASBlobIntentDelete` | `Number` | Number of CAS blob deletion-intent DELETE requests. Grows as garbage collection removes intents. |
+| `CASBlobIntentGet` | `Number` | Number of CAS blob deletion-intent GET requests. |
+| `CASBlobIntentList` | `Number` | Number of CAS blob deletion-intent LIST requests. Growing values indicate more enumeration of intents. |
+| `CASBlobIntentPut` | `Number` | Number of CAS blob deletion-intent PUT requests. Grows as garbage collection condemns blobs. |
+| `CASBlobPublishDigestMismatch` | `Number` | Number of streamed CAS blob publications refused because the payload did not hash to the blob's key. Any non-zero value means a corrupted or changed source. |
+| `CASBlobReuseIntentPresent` | `Number` | Number of CAS blob writes that found the body's incarnation under a deletion intent and published the body again instead of adopting it. |
+| `CASBlobReuseTokenRejected` | `Number` | Number of CAS blob writes that found a body whose token names no incarnation and published the body again instead of adopting it. |
+| `CASGCIntentAdopted` | `Number` | Number of CAS GC rows created for a deletion intent that had no row: candidate when the body shows the intent's token, else standing. Nothing is deleted in the adopting round. |
+| `CASGCIntentConfirmedExisting` | `Number` | Number of CAS deletion-intent creates the GC confirmed by finding the record already present. |
+| `CASGCIntentCreated` | `Number` | Number of CAS deletion intents whose create the GC confirmed by an answered success, or by reading the record after an unanswered attempt. |
+| `CASGCIntentDeleted` | `Number` | Number of CAS deletion intents the GC deleted after their blob body was gone or replaced. |
+| `CASGCIntentLeftOnSpare` | `Number` | Number of CAS GC rows dropped because the blob was referenced again whose deletion intent stays for a later round to adopt. An intent deleted at the spare is counted in `CASGCIntentDeletedOnSpare` instead. |
+| `CASGCIntentDeletedOnSpare` | `Number` | Number of CAS deletion intents the GC deleted when the blob was referenced again and its `HEAD` showed another incarnation than the row's. Included in `CASGCIntentDeleted`. |
+| `CASGCIntentStandingAnomaly` | `Number` | Number of CAS GC `standing` rows whose decision `HEAD` showed their own token again after their body delete was answered. The row is carried and nothing is deleted. |
+| `CASGCIntentTokenRejected` | `Number` | Number of CAS GC blob observations whose token names no incarnation, so no deletion intent can be keyed by it. Such a body is never deleted by the GC. |
+| `CASGCIntentUnconfirmedCarry` | `Number` | Number of CAS deletion-intent creates the GC could not confirm; the blob stays a candidate and is retried in a later round. Sustained growth indicates object storage errors or foreign bytes at an intent key. |
 
 #### Mounts {#cas-mounts}
 

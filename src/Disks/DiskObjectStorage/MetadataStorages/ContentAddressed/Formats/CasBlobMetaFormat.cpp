@@ -44,7 +44,7 @@ MetaState metaStateFromWireWord(std::string_view w)
     return kMetaStateWords.fromWord(w, "CAS blob meta");
 }
 
-String encodeBlobMeta(const BlobMeta & meta)
+String encodeBlobMetaForTest(const BlobMeta & meta)
 {
     CasJsonWriter out(256);
     writeHeaderLine(out, FormatId::BlobMeta);

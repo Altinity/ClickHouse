@@ -13,16 +13,23 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/tests/S3ObjectCreationTestStorage.h>
 #include <Disks/tests/cas_test_helpers.h>
+#include <IO/ReadBufferFromMemory.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/S3/tests/CountingS3Server.h>
+#include <Common/CurrentThread.h>
+#include <Common/MemoryTracker.h>
 #include <Common/ProfileEvents.h>
+#include <Common/ThreadStatus.h>
+#include <Common/scope_guard_safe.h>
 #include <Common/tests/gtest_global_context.h>
 
 #include <algorithm>
 #include <atomic>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 /// Blob publication must put every object-creating request (`PutObject`, `CopyObject`,
@@ -65,7 +72,8 @@ DB::Cas::BlobPublishRequest streamingPublication()
             .open_payload = []
             {
                 return std::make_unique<DB::ReadBufferFromOwnString>(std::string(100, 'p'));
-            }}};
+            },
+            .expected_ref = DB::Cas::tests::idOf(std::string(100, 'p'))}};
 }
 
 /// One engine attempt of the backend's blob publication, so every counted request comes from below it.
@@ -282,6 +290,93 @@ TEST(CASBlobPublishTransport, LostStagedCopyIsRepublishedByStreaming)
     ASSERT_TRUE(published.has_value());
     EXPECT_NE(*published, staged_bytes);
     EXPECT_EQ(published->substr(pool->poolMeta().blob_header_len), payload);
+}
+
+namespace
+{
+
+/// The peak of what `fn` allocates, run on a thread of its own so nothing else is charged to the same tracker.
+Int64 peakAllocatedBytes(const std::function<void()> & fn)
+{
+    Int64 peak = 0;
+    std::exception_ptr error;
+    std::thread measured([&]
+    {
+        DB::ThreadStatus thread_status;
+        auto & thread_tracker = DB::CurrentThread::get().memory_tracker;
+        MemoryTracker scope_tracker(&total_memory_tracker, VariableContext::Process, /*log_peak_memory_usage_in_destructor_=*/false);
+        MemoryTracker * prev_parent = thread_tracker.getParent();
+        const Int64 prev_untracked_limit = DB::CurrentThread::get().untracked_memory_limit;
+        DB::CurrentThread::flushUntrackedMemory();
+        SCOPE_EXIT_SAFE({
+            DB::CurrentThread::flushUntrackedMemory();
+            DB::CurrentThread::get().untracked_memory_limit = prev_untracked_limit;
+            thread_tracker.setParent(prev_parent);
+        });
+        /// Smaller allocations would otherwise be batched below the default 4 MiB and never reach the tracker.
+        DB::CurrentThread::get().untracked_memory_limit = 1;
+        thread_tracker.setParent(&scope_tracker);
+        try
+        {
+            fn();
+        }
+        catch (...)
+        {
+            error = std::current_exception();
+        }
+        DB::CurrentThread::flushUntrackedMemory();
+        peak = scope_tracker.getPeak();
+    });
+    measured.join();
+    if (error)
+        std::rethrow_exception(error);
+    return peak;
+}
+
+/// A publication of `envelope` + `payload` whose reader allocates nothing: the payload is read in place.
+DB::Cas::BlobPublishRequest inPlacePublication(const std::string & key, const std::string & envelope,
+                                              const std::shared_ptr<const std::string> & payload)
+{
+    return DB::Cas::BlobPublishRequest{
+        .destination_key = key,
+        .publication = DB::Cas::StreamingBlobPublication{
+            .payload_size = payload->size(),
+            .fresh_envelope = envelope,
+            .open_payload = [payload] { return std::make_unique<DB::ReadBufferFromMemory>(payload->data(), payload->size()); },
+            .expected_ref = DB::Cas::tests::idOf(*payload)}};
+}
+
+}
+
+/// The S3 write buffer is sized to a small body. If the body filled it exactly, the buffer would double right before
+/// the upload.
+TEST(CASBlobPublishTransport, SmallBlobPublicationPeaksAtItsBodySize)
+{
+    (void)getContext();
+    CountingS3::ObjectStore store;
+    CountingS3Server server(store.responder());
+    auto storage = makeRetryingStorage(server.getUrl());
+    const std::string envelope = "envelope";
+    /// The request, its headers and the HTTP exchange; smaller than any body measured here.
+    constexpr Int64 overhead_allowance = 64 * 1024;
+
+    /// The first publication builds the transport's clients and connection; only later ones are measured.
+    publishOnce(storage, inPlacePublication("warm-up", envelope, std::make_shared<const std::string>(100, 'w')));
+
+    for (const size_t body_size : {size_t{100} * 1024, size_t{900} * 1024})
+    {
+        SCOPED_TRACE(fmt::format("body_size={}", body_size));
+        const std::string key = fmt::format("blob-{}", body_size);
+        const auto payload = std::make_shared<const std::string>(body_size - envelope.size(), 'p');
+        ASSERT_EQ(DB::Cas::blob_publication_detail::blobWriteBufferSize(body_size), body_size + 1)
+            << "positive control: the write buffer is sized to the body, not to the default";
+
+        const Int64 peak = peakAllocatedBytes([&] { publishOnce(storage, inPlacePublication(key, envelope, payload)); });
+
+        EXPECT_LE(peak, static_cast<Int64>(body_size) + overhead_allowance);
+        EXPECT_GE(peak, static_cast<Int64>(body_size)) << "positive control: the body's buffer was measured";
+        EXPECT_EQ(store.get(s3Path(key)), envelope + *payload);
+    }
 }
 
 #endif

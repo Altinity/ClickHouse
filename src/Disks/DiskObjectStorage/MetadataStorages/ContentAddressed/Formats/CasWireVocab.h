@@ -37,11 +37,6 @@ inline constexpr EnumWireTable<ObjectKind, 1> kObjectKindWords{{{
 /// rather than carried into a record no reader could decode.
 std::string_view dialectWordFromString(std::string_view w, std::string_view what);
 
-/// The same vocabulary in the one-byte form the condemned-row payload stores. Both directions are
-/// fail-closed: an unrecognized word or byte is `CORRUPTED_DATA`.
-uint8_t dialectByteFromWord(std::string_view w, std::string_view what);
-std::string_view dialectWordFromByte(uint8_t byte, std::string_view what);
-
 /// Parse a canonical blob-hash algorithm word. The write side uses `blobHashAlgoName` directly, so
 /// this is its fail-closed inverse. `what` identifies the containing codec or field in the
 /// `CORRUPTED_DATA` exception.

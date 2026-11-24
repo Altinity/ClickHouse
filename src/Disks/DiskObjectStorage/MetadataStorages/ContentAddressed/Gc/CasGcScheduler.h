@@ -54,11 +54,11 @@ struct GcRoundLogRecord
     UInt64 manifests_deleted = 0;   /// owner-removed manifest bodies deleted, distinct from blob deletes
     /// Counts for the three-stage deletion pipeline reported by `Cas::RoundReport`.
     UInt64 entries_condemned = 0;   /// entries newly condemned into the retired list this round
-    UInt64 entries_graduated = 0;   /// entries newly floor-passed (published delete_pending) this round
-    UInt64 entries_redeleted = 0;   /// pending exact-token blob deletes executed this round
+    UInt64 entries_intent_confirmed = 0;   /// entries newly floor-passed (published delete_pending) this round
+    UInt64 entries_bodies_deleted = 0;   /// pending exact-token blob deletes executed this round
     /// Counts one failed `HEAD`, conditional `DELETE`, or refused re-delete enqueue
     /// per affected `delete_pending` entry.
-    UInt64 entries_redelete_failed = 0;
+    UInt64 entries_body_delete_failed = 0;
     UInt64 fence_outs = 0;          /// expired mounts fenced-out by the round's heartbeat floor
     UInt64 anomalies = 0;           /// fold clamps surfaced (never wedging) this round
     UInt64 duration_ms = 0;
@@ -79,7 +79,7 @@ struct GcRoundLogRecord
     /// The GC phase this row describes; empty on `Start`/`Finish`. The literals are the ones passed to
     /// `Cas::GcPhaseTimer` at each phase's single instrumentation site.
     String phase;
-    /// Wall time of this phase. MICROseconds, not milliseconds: `meta_pool_wait`, `round_commit` and
+    /// Wall time of this phase. MICROseconds, not milliseconds: `round_commit` and
     /// `parent_seal_read` are routinely sub-millisecond and the whole point of the row is seeing when
     /// they are not.
     UInt64 phase_duration_microseconds = 0;
