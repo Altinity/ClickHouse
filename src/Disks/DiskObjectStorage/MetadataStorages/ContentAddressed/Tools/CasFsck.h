@@ -16,10 +16,23 @@
 namespace DB::Cas
 {
 
-/// Optional progress sink for `runFsck`: called periodically during the listing and reachability
-/// walk so a long scan over a large/slow pool is visibly progressing (not hung). `phase` names the
-/// current step; `objects`/`pages` are running counts. Default {} = no progress (existing callers).
-using FsckProgress = std::function<void(std::string_view phase, uint64_t objects, uint64_t pages)>;
+/// What a progress call reports about a phase: its start, a tick inside it, or its normal end.
+enum class FsckProgressStep : uint8_t
+{
+    Start,
+    Tick,
+    End,
+};
+
+/// Optional progress sink for `runFsck`, so a long scan over a large or slow pool visibly progresses. A phase is one
+/// part of the scan that issues store requests in proportion to the pool. `done` counts `unit` items the phase has
+/// handled (0 on `Start`); `seconds` is the phase's wall time so far (0 on `Start`). Ticks follow item counts, not time.
+/// Called only on the thread that called `runFsck`. The sink only observes: an exception it throws is logged once per
+/// phase and dropped, the phase then calls it only for its end line, and it never changes the report. Default {} = no progress.
+using FsckProgress = std::function<void(FsckProgressStep step, std::string_view phase, std::string_view unit, uint64_t done, double seconds)>;
+
+/// The stderr line for one progress call, without a trailing newline.
+String formatFsckProgress(FsckProgressStep step, std::string_view phase, std::string_view unit, uint64_t done, double seconds);
 
 /// Classification assigned to each object examined by `runFsck`.
 ///
@@ -39,7 +52,8 @@ enum class FsckClass : uint8_t
                    /// `pending` row is counted here only after its deletion intent was read and found.
     AwaitingGc,    /// edges still in the GC snapshot (drop/reclaim not folded yet) or GC never ran — EXPECTED
     Unaccounted,   /// absent from the whole GC view — transient for a fast create+drop between rounds;
-                   /// PERSISTENT occurrences should be impossible (INV-2 reachability-before-content)
+                   /// PERSISTENT occurrences should be impossible (INV-2 reachability-before-content).
+                   /// Also a key under `blobs/` that is not a blob key of this pool
     StaleEdge,     /// every source edge the GC snapshot still holds on this blob names a manifest that no
                    /// longer exists anywhere in the pool, so the matching `-1` can never fold: the blob's
                    /// in-degree can never reach zero and the incremental GC can never reclaim it. Only a
@@ -93,6 +107,18 @@ enum class FsckClass : uint8_t
     LegacyMarker,
 };
 
+/// One `Creating` catalog row, left by an interrupted or in-progress cold admission of its namespace, and
+/// what its creator's mount slot says about it. GC cancels the row only when the slot is `Terminal`.
+struct FsckCreatingRow
+{
+    String ns;
+    String creator_root;
+    uint64_t writer_epoch = 0;
+    /// No value when the slot read failed; `slot_read_error` then says why.
+    std::optional<CreatorSlotStatus> slot;
+    String slot_read_error;
+};
+
 /// One object or integrity finding emitted in detailed mode, or emitted for every missing reachable
 /// object even in summary mode. `key` identifies the physical or logical object; `size` is its listed
 /// size and is zero for a missing object. `reachable_from` contains `"namespace/ref"` owners for
@@ -112,8 +138,7 @@ struct FsckObject
 /// total of all present-but-unreferenced objects, including the GC pipeline classes and manifest debris,
 /// and is intentionally retained as one monotone number for residual-settling monitoring. The detailed
 /// `objects` list is populated according to the scan's `detail` mode. In partial mode all counters are
-/// lower bounds over the portion walked before the deadline; `clean` must not be used as a claim about
-/// the unvisited part of the pool.
+/// lower bounds over the portion walked before the deadline, and `clean` is false.
 struct FsckReport
 {
     uint64_t reachable = 0;
@@ -123,12 +148,15 @@ struct FsckReport
     uint64_t unreachable = 0;
     uint64_t pending_gc = 0;     /// blobs in the retired set — deletion scheduled (expected)
     uint64_t awaiting_gc = 0;    /// blobs whose drop is not folded yet / GC never ran (expected)
-    uint64_t unaccounted = 0;    /// blobs outside the GC view (transient or anomaly)
+    uint64_t unaccounted = 0;    /// blobs outside the GC view (transient or anomaly), and keys under `blobs/` that are no blob key
     /// Blobs whose every remaining source edge names a manifest that no longer exists — permanently
     /// stuck at a nonzero in-degree, unreclaimable by the incremental GC. A hard ERROR (see
     /// `FsckClass::StaleEdge`). Populated only in `detail` mode: naming the live sources costs one GET
     /// per manifest body, which the summary path does not pay.
     uint64_t stale_edge = 0;
+    /// Stale-edge candidates that a later read of the GC snapshot no longer shows: a GC round committed after the
+    /// scan's first read and folded all their edges. Counted apart and not a finding, so the report stays clean.
+    uint64_t stale_edge_superseded = 0;
 
     /// Deletion intents under `blob-intents/` (see the `Intent*` classes of `FsckClass`). `intent_malformed`
     /// and `intent_unread` are hard findings; the others are informational. A scan with a namespace scope
@@ -172,7 +200,7 @@ struct FsckReport
     /// `chain_broken` counts namespaces with a proven hole (see `FsckClass::ChainBroken`) and is a HARD
     /// ERROR: part of `clean`, and the command exits nonzero on it. `unchecked` counts namespaces the
     /// walk could not prove either way; it is COVERAGE, not a finding, so it
-    /// is reported and printed but does not make a report unclean — exactly like `partial`. A pool with
+    /// is reported and printed but does not make a report unclean. A pool with
     /// nothing wrong reads `chain_broken=0 unchecked=0`, so `unchecked` is never a resting state.
     ///
     /// `ref_records_walked` is how many ref-log records the walk actually read and proved, summed over
@@ -200,13 +228,23 @@ struct FsckReport
     uint64_t namespace_janitor_pending_bytes = 0;
     uint64_t namespace_janitor_pending_lives = 0;   /// distinct life ids counted above
 
+    /// Every `Creating` row in the scan's scope, listed in summary mode too, as there are few. Soft.
+    std::vector<FsckCreatingRow> creating_rows;
+    /// The `creating_rows` whose slot is `Terminal`: the next GC round cancels them.
+    uint64_t stalled_creating = 0;
+    /// The other `creating_rows`: GC does not cancel them while their slot says what it says.
+    uint64_t creating_unproven = 0;
+    /// The whole catalog, whatever the namespace scope, holds rows and every one is `Creating`. GC then has
+    /// no namespace to walk and deletes nothing.
+    bool catalog_has_no_walkable_row = false;
+
     uint64_t physical_bytes = 0;
     uint64_t referenced_logical_bytes = 0;
     uint64_t total_blob_refs = 0;
     uint64_t distinct_blobs = 0;
 
     /// Set when the scan hit its deadline in partial mode: counts cover only what was walked
-    /// before the deadline — a lower bound, not the pool truth.
+    /// before the deadline — a lower bound, not the pool truth, so `clean` is false.
     bool partial = false;
     String partial_reason;
 
@@ -217,9 +255,9 @@ struct FsckReport
 
     /// Return whether the scan found no missing reachable object or hard integrity violation. Expected
     /// GC backlog classes do not make a report unclean, and neither do the informational intent classes
-    /// or `legacy_marker`; a partial report only covers the visited subset. `stale_edge` is a hard
-    /// finding, but it is only ever nonzero in `detail` mode — a clean summary report says nothing about
-    /// stale edges, exactly as a partial report says nothing about the unvisited part of the pool.
+    /// or `legacy_marker`. A partial report is never clean: it covers only the visited subset. `stale_edge` is a
+    /// hard finding, but it is only ever nonzero in `detail` mode — a clean summary report says nothing about
+    /// stale edges.
     /// `chain_broken` is a hard finding in every mode. `unchecked` deliberately is NOT one: it says the
     /// walk proved nothing about those namespaces, which is a statement about COVERAGE, and folding it
     /// in here would make "cannot prove" indistinguishable from "found broken".
@@ -236,7 +274,7 @@ struct FsckHardFinding
 };
 
 /// THE HARD FINDINGS, and the single authority on what they are. `FsckReport::clean` is computed from
-/// this list, so adding a term means adding a row here.
+/// this list and from `partial`, so adding a finding means adding a row here.
 ///
 /// The name is the one the text summary line and the SQL result column both use, which is what lets a
 /// test check a rendering surface by iterating this list instead of restating its contents.
@@ -297,6 +335,8 @@ static_assert(kFsckHardFindings.size() == 8,
 
 inline bool FsckReport::clean() const
 {
+    if (partial)
+        return false;
     for (const FsckHardFinding & finding : kFsckHardFindings)
         if (this->*finding.value != 0)
             return false;
@@ -314,11 +354,14 @@ inline bool FsckReport::clean() const
 /// `deadline` bounds the WHOLE scan, each request's retries included, and throws `TIMEOUT_EXCEEDED` when it passes —
 /// unless `partial_on_deadline` is set, in which case the accumulated lower-bound counts are returned instead,
 /// flagged via `FsckReport::partial`. `namespace_prefix`, if non-empty, scopes the scan to namespaces with this
-/// prefix and skips the pool-wide unreachable classification (dangling-only mode).
+/// prefix and skips the pool-wide unreachable classification (dangling-only mode). `read_creator_slots` reads the
+/// mount slot of each `Creating` row's creator, once per creator and epoch, to fill `creating_rows`,
+/// `stalled_creating` and `creating_unproven`; without it they stay empty and no slot is read.
 FsckReport runFsck(Pool & store, bool detail, FsckProgress on_progress = {},
                    const ToolDeadline & deadline = {},
                    bool partial_on_deadline = false, const String & namespace_prefix = {},
-                   bool fix_legacy_markers = false, bool verify_intents = false, size_t fix_concurrency = 1);
+                   bool fix_legacy_markers = false, bool verify_intents = false, size_t fix_concurrency = 1,
+                   bool read_creator_slots = false);
 
 /// Render the single machine-parseable summary line (no trailing newline). This is the ONLY view of a
 /// report most consumers ever get -- the soak harness parses it, CI greps it, an operator reads it -- so
@@ -331,6 +374,12 @@ FsckReport runFsck(Pool & store, bool detail, FsckProgress on_progress = {},
 /// printed, never omitted: "absent" and "zero" are different facts, and consumers (e.g. the harness's
 /// `stale_edge_verdict`) fail closed on absence by design.
 String formatFsckSummary(const FsckReport & report);
+
+/// The note on blobs inside the normal GC deletion pipeline, or empty when there are none. No trailing newline.
+String formatFsckPipelineNote(const FsckReport & report);
+
+/// The note on one `Creating` row: its creator, the slot status and what GC does about it. No trailing newline.
+String formatFsckCreatingRow(const FsckCreatingRow & row);
 
 /// A count of `FsckReport` as both report surfaces render it: its key on the summary line, and its column of
 /// `SYSTEM CAS FSCK`, when it has one, with the column's position after the `disk` column.

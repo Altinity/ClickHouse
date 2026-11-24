@@ -94,7 +94,7 @@ std::shared_ptr<ContentAddressedMetadataStorage> openGcStorage()
     auto storage = std::make_shared<ContentAddressedMetadataStorage>(
         Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "", nullptr, settings);
     storage->startup();
-    return storage;
+    return DB::Cas::tests::ownedByDirectory(std::move(storage), scratch);
 }
 
 void commitOnePart(ContentAddressedMetadataStorage & storage)

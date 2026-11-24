@@ -18,6 +18,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
+    extern const int TIMEOUT_EXCEEDED;
 }
 
 class CommandFsck final : public ICommand
@@ -33,13 +34,16 @@ public:
                       "stream (chain_broken), a corrupted GC run, a malformed key (lifeless_keys), a malformed "
                       "deletion intent (intent_malformed), a deletion intent or its body that could not be read "
                       "(intent_unread), or a `pending` GC row whose deletion intent is absent while its body is "
-                      "present (pending_without_intent).";
+                      "present (pending_without_intent). "
+                      "Also exits 1 with TIMEOUT_EXCEEDED when `--partial` cut the scan short at its deadline, "
+                      "unless a finding already failed it.";
         options_description.add_options()("detail", "list per-object rows (class, key, size, reachable_from)")(
             "timeout", po::value<UInt64>(), "abort the scan after N seconds with a clear error instead of hanging (default 600; 0 = unbounded)")(
             "namespace", po::value<String>(), "scope the scan to namespaces with this prefix (skips the pool-wide "
                                                "physical/pipeline classification; still reports the scoped namespaces' "
                                                "dangling refs and orphan-manifest debris as unreachable)")(
-            "partial", "on --timeout, print the counts accumulated so far flagged partial=1 instead of aborting empty-handed")(
+            "partial", "on --timeout, print the counts accumulated so far flagged partial=1 instead of aborting empty-handed; "
+                                                                                                           "the command still exits 1 with TIMEOUT_EXCEEDED unless a finding already failed it")(
             "fix", po::value<String>(), "repair: `legacy-markers` deletes the `.meta` markers left from the marker protocol "
                                         "(whole-pool scans only; nothing else is ever deleted; not on a local object "
                                         "storage, where `cas-migrate-pool` removes them)")(
@@ -89,12 +93,9 @@ public:
         /// Progress to stderr so a long scan is visibly working (the reachable=… summary stays on
         /// stdout, machine-parseable). The deadline bounds a slow-but-progressing scan with a clear
         /// error; for a single LIST page stuck in S3-client retries, lower the disk's S3 retry budget.
-        Cas::FsckProgress on_progress = [](std::string_view phase, uint64_t objects, uint64_t pages)
+        Cas::FsckProgress on_progress = [](Cas::FsckProgressStep step, std::string_view phase, std::string_view unit, uint64_t done, double seconds)
         {
-            std::cerr << "cas-fsck: " << phase << " — " << objects << " objects";
-            if (pages)
-                std::cerr << ", " << pages << " pages";
-            std::cerr << "\n";
+            std::cerr << Cas::formatFsckProgress(step, phase, unit, done, seconds) << "\n";
         };
         const Cas::PoolPtr store = ca->store();
         Cas::ToolDeadline deadline;
@@ -103,7 +104,7 @@ public:
                                          "run against a QUIESCED pool or raise --timeout");
 
         const Cas::FsckReport report = Cas::runFsck(*store, detail, on_progress, deadline, partial, namespace_prefix, fix_legacy_markers, verify_intents,
-                                                     concurrency);
+                                                     concurrency, /*read_creator_slots=*/true);
 
         /// Built by `Cas::formatFsckSummary` rather than here, so the line is reachable from a unit test.
         /// It was assembled inline until 2026-07-26, and in that time `corrupted_runs` was added to the
@@ -115,11 +116,8 @@ public:
         /// deliberately NOT part of this sentence: those blobs look exactly like an `AwaitingGc`
         /// backlog but will never drain, and being swept into "expected, no action needed" is what
         /// hid them.
-        if (report.pending_gc + report.awaiting_gc > 0)
-            std::cout << "note: " << report.pending_gc + report.awaiting_gc
-                      << " unreferenced object(s) are inside the normal GC deletion pipeline "
-                         "(condemn and create the intent -> delete the body -> remove the intent takes ~3 rounds) — "
-                         "expected, no action needed\n";
+        if (const String note = Cas::formatFsckPipelineNote(report); !note.empty())
+            std::cout << note << "\n";
         if (report.stale_edge > 0)
             std::cout << "note: " << report.stale_edge
                       << " unreferenced object(s) carry ONLY source edges naming manifests that no longer "
@@ -147,8 +145,8 @@ public:
                          "the body, no action needed\n";
         if (report.intent_replaced > 0)
             std::cout << "note: " << report.intent_replaced
-                      << " deletion intent(s) name an incarnation that is no longer the body — GC removes them "
-                         "later, no action needed\n";
+                      << " deletion intent(s) name an incarnation that is no longer the body — GC removes each once "
+                         "no part references its blob, no action needed\n";
         if (report.pending_intent_absent > 0)
             std::cout << "note: " << report.pending_intent_absent
                       << " `pending` GC row(s) have no deletion intent, but their body is gone or replaced — the row is "
@@ -169,11 +167,14 @@ public:
         if (report.legacy_markers_changed > 0)
             std::cout << "note: " << report.legacy_markers_changed
                       << " legacy `.meta` marker(s) changed between their `HEAD` and the delete and were left; run the fix again\n";
+        for (const Cas::FsckCreatingRow & row : report.creating_rows)
+            std::cout << Cas::formatFsckCreatingRow(row) << "\n";
         if (report.unaccounted > 0)
             std::cout << "note: " << report.unaccounted
                       << " object(s) are outside the current GC view — normal only as a transient "
                          "(created+dropped between GC rounds); re-run cas-fsck after the next round and "
-                         "investigate any that persist\n";
+                         "investigate any that persist; a malformed key under `blobs/` also counts here "
+                         "(`--detail` names it; keys ending in `.meta` are not examined by this class)\n";
         /// Not a finding: a canonical namespace-life key whose life is absent from the catalog is the
         /// protocol-produced interval between a fenced GC exact-deleting a `Removing` row and the
         /// perpetual namespace janitor reaching it on a later bounded page (its own deletes are
@@ -269,8 +270,8 @@ public:
         if (report.intent_unread > 0)
             throw Exception(
                 ErrorCodes::BAD_ARGUMENTS,
-                "cas-fsck: {} read(s) of a deletion intent or of its body failed, so the intents could not be checked; "
-                "first failure: {}",
+                "cas-fsck: {} check(s) could not be completed (a deletion intent, its body or the GC snapshot could not be "
+                "read), so the pool could not be fully checked; first failure: {}",
                 report.intent_unread, report.intent_unread_reason);
         /// `pending` is the one GC state a body is deleted from without re-reading the intent.
         if (report.pending_without_intent > 0)
@@ -279,6 +280,12 @@ public:
                 "cas-fsck: {} `pending` GC row(s) have no deletion intent while their body is present: GC would delete "
                 "those bodies without warning any writer. Stop GC on this pool and report it (the keys are listed as "
                 "`pending-without-intent` rows under --detail)", report.pending_without_intent);
+        /// A finding above has already thrown its own error; exit 0 here would read as "checked".
+        if (report.partial)
+            throw Exception(
+                ErrorCodes::TIMEOUT_EXCEEDED,
+                "cas-fsck: the scan was cut short by its deadline and is NOT a clean result: the counts are lower bounds "
+                "over the part scanned: {}", report.partial_reason);
         /// `unreachable` stays a soft finding: it counts every present blob no ref names, and that includes
         /// the GC pipeline's `pending_gc`/`awaiting_gc` and an in-flight build's not-yet-adopted blobs
         /// (`unaccounted`), so a healthy pool under load is never clean by that measure.

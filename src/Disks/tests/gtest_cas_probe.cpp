@@ -351,7 +351,8 @@ using DB::Cas::tests::JournalVerb;
 class IntentRightsBackend : public DB::Cas::tests::CountingBackend
 {
 public:
-    enum class Deny : uint8_t { Nothing, Get, Put, List, Delete, ListOfThePrefix };
+    /// `Delete` refuses both delete verbs; `UnconditionalDelete` refuses only the one without a precondition.
+    enum class Deny : uint8_t { Nothing, Get, Put, List, Delete, UnconditionalDelete, ListOfThePrefix };
     Deny deny = Deny::Nothing;
     Dialect claimed_dialect = Dialect::Emulated;
 
@@ -384,6 +385,14 @@ public:
         if (deny == Deny::Delete && underProbe(key))
             throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "injected 403 on the DELETE of {}", key);
         return CountingBackend::remove(key, expected_value, access);
+    }
+    void removeManyWriteOnce(const std::vector<DB::Cas::WriteOnceKey> & keys, TransportAccess & access) override
+    {
+        if (deny == Deny::Delete || deny == Deny::UnconditionalDelete)
+            for (const DB::Cas::WriteOnceKey & key : keys)
+                if (underProbe(key.str()))
+                    throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "injected 403 on the unconditional DELETE of {}", key.str());
+        CountingBackend::removeManyWriteOnce(keys, access);
     }
 
     std::vector<String> keysUnderProbe()
@@ -427,7 +436,7 @@ TEST(CASProbe, IntentPrefixProbeUsesEveryRightAndLeavesNothing)
     for (const JournalEntry & e : backend.journal())
         if (!e.keys.empty() && e.keys.front().starts_with(Layout("p").blobIntentsProbePrefix()) && e.verb != JournalVerb::Head)
             verbs.insert(e.verb);
-    EXPECT_EQ(verbs, (std::set<JournalVerb>{JournalVerb::Read, JournalVerb::Write, JournalVerb::List, JournalVerb::Remove}));
+    EXPECT_EQ(verbs, (std::set<JournalVerb>{JournalVerb::Read, JournalVerb::Write, JournalVerb::List, JournalVerb::RemoveMany}));
 }
 
 TEST(CASProbe, IntentPrefixProbeNamesTheMissingRight)
@@ -437,7 +446,8 @@ TEST(CASProbe, IntentPrefixProbeNamesTheMissingRight)
         {Deny::Get, "the credential cannot tell an absent intent from a denied one: grant GET and LIST on 'p/blob-intents/'"},
         {Deny::Put, "grant PUT with If-None-Match on 'p/blob-intents/'"},
         {Deny::List, "grant LIST on 'p/blob-intents/'"},
-        {Deny::Delete, "grant DELETE on 'p/blob-intents/'"}};
+        {Deny::Delete, "grant DELETE on 'p/blob-intents/'"},
+        {Deny::UnconditionalDelete, "grant DELETE on 'p/blob-intents/'"}};
     for (const auto & [deny, expected] : cases)
     {
         SCOPED_TRACE(expected);

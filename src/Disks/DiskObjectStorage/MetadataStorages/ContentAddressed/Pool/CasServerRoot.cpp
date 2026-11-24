@@ -1596,9 +1596,15 @@ FenceCertificate classifyFenceCertificate(const MountLease & lease, uint64_t fen
 bool isCreatorFenceTerminal(CasOperation & op, const Layout & layout, const String & server_root_id,
                             uint64_t writer_epoch, const Retry & policy)
 {
+    return probeCreatorSlot(op, layout, server_root_id, writer_epoch, policy) == CreatorSlotStatus::Terminal;
+}
+
+CreatorSlotStatus probeCreatorSlot(CasOperation & op, const Layout & layout, const String & server_root_id,
+                                   uint64_t writer_epoch, const Retry & policy)
+{
     const auto got = op.read(layout.mountKey(server_root_id), policy);
     if (!got)
-        return false;   /// absence proves nothing about liveness -- see the header doc
+        return CreatorSlotStatus::Absent;   /// absence proves nothing about liveness -- see the header doc
 
     MountLease lease;
     try
@@ -1607,7 +1613,7 @@ bool isCreatorFenceTerminal(CasOperation & op, const Layout & layout, const Stri
     }
     catch (...)
     {
-        return false;   /// undecodable -- fail closed, never wave through
+        return CreatorSlotStatus::Undecodable;   /// fail closed, never wave through
     }
 
     /// EXHAUSTIVE switch, not a positive allowlist -- mirrors `CasPool.cpp`'s own exhaustive switch over
@@ -1619,19 +1625,19 @@ bool isCreatorFenceTerminal(CasOperation & op, const Layout & layout, const Stri
     /// is safe).
     /// The initializer is dead: the exhaustive switch below assigns every enumerator, and a future
     /// enumerator left unassigned fails the build via `-Wswitch`, not this value.
-    bool terminal = false;
+    CreatorSlotStatus status = CreatorSlotStatus::Live;
     switch (classifyFenceCertificate(lease, writer_epoch))
     {
         case FenceCertificate::None:
-            terminal = false;
+            status = CreatorSlotStatus::Live;
             break;
         case FenceCertificate::GcFenced:
         case FenceCertificate::CleanFarewell:
         case FenceCertificate::SupersededEpoch:
-            terminal = true;
+            status = CreatorSlotStatus::Terminal;
             break;
     }
-    return terminal;
+    return status;
 }
 
 /// The farewell's FLOOR, not its whole budget: a departing mount is holding shutdown open, so the

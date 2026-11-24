@@ -561,6 +561,182 @@ TEST(CASGCLog, AbortedFinishCarriesProgressiveCounters)
         << "the pre-CAS work the round performed must survive into its failure row";
 }
 
+namespace
+{
+/// The `GcFoldBegin`, `GcFoldEnd` and `GcFence` events and the `Finish` row of ONE round, sliced out of
+/// a growing sink and record vector by the counts taken before the round ran.
+struct RoundSlice
+{
+    std::vector<CasEvent> begins;
+    std::vector<CasEvent> ends;
+    std::vector<CasEvent> fences;
+    std::vector<Rec> finishes;
+};
+
+RoundSlice sliceRound(
+    const DB::Cas::tests::SharedEventLog & sink, size_t events_before, const std::vector<Rec> & rows, size_t rows_before)
+{
+    RoundSlice out;
+    const auto events = sink.snapshot();
+    for (size_t i = events_before; i < events.size(); ++i)
+    {
+        if (events[i].type == CasEventType::GcFoldBegin)
+            out.begins.push_back(events[i]);
+        else if (events[i].type == CasEventType::GcFoldEnd)
+            out.ends.push_back(events[i]);
+        else if (events[i].type == CasEventType::GcFence)
+            out.fences.push_back(events[i]);
+    }
+    for (size_t i = rows_before; i < rows.size(); ++i)
+        if (rows[i].event_type == Rec::EventType::Finish)
+            out.finishes.push_back(rows[i]);
+    return out;
+}
+}
+
+/// Both fold-boundary events carry the number the round's commit writes, which is `Finish.round`, so a
+/// `WHERE round = <Finish.round>` over `system.cas_log` finds them.
+TEST(CASGCLog, FoldBoundariesCarryTheCommittedRound)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto sink = std::make_shared<DB::Cas::tests::SharedEventLog>();
+    auto store = DB::Cas::tests::openPoolForTest(backend, 0);
+    store->setEventSink([sink](CasEvent e) { sink->push(std::move(e)); });
+
+    std::vector<Rec> rows;
+    DB::Cas::CasGcScheduler sched(
+        store, std::chrono::seconds(1), "test::gc", "ca",
+        [&](const Rec & r) { rows.push_back(r); });
+
+    UInt64 previous_round = 0;
+    UInt64 previous_gen = 0;
+    for (int i = 0; i < 2; ++i)
+    {
+        const size_t events_before = sink->snapshot().size();
+        const size_t rows_before = rows.size();
+        sched.runOneRoundNow(Rec::Trigger::Manual);
+        const RoundSlice slice = sliceRound(*sink, events_before, rows, rows_before);
+
+        ASSERT_EQ(slice.begins.size(), 1u) << "round " << i;
+        ASSERT_EQ(slice.ends.size(), 1u) << "round " << i;
+        ASSERT_EQ(slice.finishes.size(), 1u) << "round " << i;
+        const Rec & fin = slice.finishes[0];
+        ASSERT_EQ(fin.outcome, Rec::Outcome::Success) << "round " << i;
+        ASSERT_GT(fin.round, 0u) << "round " << i;
+
+        EXPECT_EQ(slice.begins[0].round, fin.round) << "begin of round " << i;
+        EXPECT_EQ(slice.ends[0].round, fin.round) << "end of round " << i;
+        if (i > 0)
+        {
+            EXPECT_EQ(fin.round, previous_round + 1);
+            EXPECT_EQ(slice.begins[0].gen, previous_gen) << "begin carries the parent generation";
+        }
+        EXPECT_EQ(slice.ends[0].gen, slice.begins[0].gen + 1) << "end carries the new generation";
+        previous_round = fin.round;
+        previous_gen = slice.ends[0].gen;
+    }
+}
+
+/// A round whose commit is lost still stamps its candidate number, and the retry that commits reuses it.
+TEST(CASGCLog, LostCommitKeepsCandidateAndRetryReusesIt)
+{
+    auto backend = std::make_shared<StateCommitRefusingBackend>();
+    auto sink = std::make_shared<DB::Cas::tests::SharedEventLog>();
+    auto store = DB::Cas::tests::openPoolForTest(backend, 0);
+    store->setEventSink([sink](CasEvent e) { sink->push(std::move(e)); });
+
+    std::vector<Rec> rows;
+    DB::Cas::CasGcScheduler sched(
+        store, std::chrono::seconds(1), "test::gc", "ca",
+        [&](const Rec & r) { rows.push_back(r); });
+
+    auto run = [&](bool expect_throw)
+    {
+        const size_t events_before = sink->snapshot().size();
+        const size_t rows_before = rows.size();
+        if (expect_throw)
+            EXPECT_THROW(sched.runOneRoundNow(Rec::Trigger::Manual), DB::Exception);
+        else
+            sched.runOneRoundNow(Rec::Trigger::Manual);
+        return sliceRound(*sink, events_before, rows, rows_before);
+    };
+
+    const RoundSlice first = run(false);
+    ASSERT_EQ(first.finishes.size(), 1u);
+    ASSERT_EQ(first.finishes[0].outcome, Rec::Outcome::Success);
+    const UInt64 n1 = first.finishes[0].round;
+    ASSERT_GT(n1, 0u);
+
+    backend->arm.store(true);
+    const RoundSlice lost = run(true);
+    ASSERT_EQ(lost.begins.size(), 1u);
+    ASSERT_EQ(lost.ends.size(), 1u);
+    ASSERT_EQ(lost.finishes.size(), 1u);
+    EXPECT_EQ(lost.finishes[0].outcome, Rec::Outcome::Aborted);
+    EXPECT_EQ(lost.finishes[0].round, 0u);
+    EXPECT_EQ(lost.begins[0].round, n1 + 1);
+    EXPECT_EQ(lost.ends[0].round, n1 + 1);
+
+    const RoundSlice retry = run(false);
+    ASSERT_EQ(retry.begins.size(), 1u);
+    ASSERT_EQ(retry.ends.size(), 1u);
+    ASSERT_EQ(retry.finishes.size(), 1u) << "the refusing backend disarms itself after one refusal";
+    ASSERT_EQ(retry.finishes[0].outcome, Rec::Outcome::Success);
+    EXPECT_EQ(retry.finishes[0].round, n1 + 1);
+    EXPECT_EQ(retry.begins[0].round, n1 + 1);
+    EXPECT_EQ(retry.ends[0].round, n1 + 1);
+    EXPECT_NE(lost.finishes[0].round_id, retry.finishes[0].round_id);
+}
+
+/// CONTROL: a deferred round emits no fold events, and its `deferred` fence carries the last committed
+/// round, not the candidate.
+TEST(CASGCLog, DeferredRoundKeepsTheLastCommittedRound)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto sink = std::make_shared<DB::Cas::tests::SharedEventLog>();
+    auto store = DB::Cas::tests::openPoolForTest(backend);
+    store->setEventSink([sink](CasEvent e) { sink->push(std::move(e)); });
+    publishPart(store, "srv1/tbl", "all_0_0_0", "deferred-control");
+
+    std::vector<Rec> rows;
+    DB::Cas::CasGcScheduler sched(
+        store, std::chrono::seconds(1), "test::gc", "ca",
+        [&](const Rec & r) { rows.push_back(r); });
+
+    UInt64 committed = 0;
+    bool reached = false;
+    for (int i = 0; i < 4 && !reached; ++i)
+    {
+        const size_t events_before = sink->snapshot().size();
+        const size_t rows_before = rows.size();
+        sched.runOneRoundNow(Rec::Trigger::Manual);
+        const RoundSlice slice = sliceRound(*sink, events_before, rows, rows_before);
+        ASSERT_EQ(slice.finishes.size(), 1u) << "round " << i;
+        const Rec & fin = slice.finishes[0];
+        if (fin.outcome == Rec::Outcome::Deferred)
+        {
+            reached = true;
+            ASSERT_GT(committed, 0u) << "a fold must precede the deferred round";
+            EXPECT_TRUE(slice.begins.empty());
+            EXPECT_TRUE(slice.ends.empty());
+            std::vector<CasEvent> deferred_fences;
+            for (const CasEvent & f : slice.fences)
+                if (f.outcome == "deferred")
+                    deferred_fences.push_back(f);
+            ASSERT_EQ(deferred_fences.size(), 1u);
+            EXPECT_EQ(deferred_fences[0].round, committed);
+            EXPECT_EQ(fin.round, committed);
+        }
+        else
+        {
+            ASSERT_EQ(fin.outcome, Rec::Outcome::Success) << "round " << i;
+            ASSERT_GT(fin.round, 0u);
+            committed = fin.round;
+        }
+    }
+    ASSERT_TRUE(reached) << "no round deferred within four rounds";
+}
+
 /// The pacing loop drops leadership only on a NON-transient round failure. A transient failure
 /// (backend outage class) keeps `i_am_leader` set, so the advisory heartbeat keeps pulsing and a
 /// live leader blocked on a flaky store is not deposed -- dropping the flag on every failure was

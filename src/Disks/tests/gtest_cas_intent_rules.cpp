@@ -788,6 +788,8 @@ void expectChunkFailureNamesItsKey(const std::function<void()> & raise)
 {
     auto backend = std::make_shared<FailingChunkBackend>();
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_bulk_delete_chunk_keys = 2});
+    /// The open's intent probe sent a request of its own.
+    const size_t requests_at_open = backend->requestSizes().size();
     Gc gc(store, kGcId);
     std::vector<WriteOnceKey> keys;
     for (uint64_t i = 1; i <= 5; ++i)
@@ -806,7 +808,8 @@ void expectChunkFailureNamesItsKey(const std::function<void()> & raise)
     {
         EXPECT_NE(e.message().find(keys[2].str()), String::npos) << e.message();
     }
-    EXPECT_EQ(backend->requestSizes(), std::vector<size_t>{2})
+    const std::vector<size_t> sizes = backend->requestSizes();
+    EXPECT_EQ(std::vector<size_t>(sizes.begin() + requests_at_open, sizes.end()), std::vector<size_t>{2})
         << "the chunk before the failed one was sent, and none after it";
 }
 

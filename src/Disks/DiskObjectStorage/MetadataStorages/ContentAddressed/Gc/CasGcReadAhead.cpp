@@ -3,6 +3,9 @@
 
 #include <Common/ProfileEvents.h>
 #include <base/defines.h>
+#include <base/scope_guard.h>
+
+#include <chrono>
 
 namespace ProfileEvents
 {
@@ -42,7 +45,7 @@ GcReadAhead::~GcReadAhead()
 }
 
 template <typename T, typename Request>
-void GcReadAhead::hint(Slots<T> & slots, const String & key, Request request)
+void GcReadAhead::hint(Slots<T> & slots, const String & key, Request request, ReadFamily family)
 {
     if (concurrency <= 1 || slots.contains(key))
         return;
@@ -56,7 +59,8 @@ void GcReadAhead::hint(Slots<T> & slots, const String & key, Request request)
             try
             {
                 CasOperation worker = requests_ptr->resume(gen);
-                slot->promise.set_value(request(worker, key));
+                slot->result = request(worker, key);
+                slot->promise.set_value();
             }
             catch (...)
             {
@@ -72,36 +76,89 @@ void GcReadAhead::hint(Slots<T> & slots, const String & key, Request request)
         slots.erase(key);
         throw;
     }
+    if (accounts(family))
+        ++stats[static_cast<size_t>(family)].issued;
 }
 
 template <typename T, typename Inline>
-std::optional<T> GcReadAhead::take(Slots<T> & slots, const String & key, Inline inline_request)
+std::optional<T> GcReadAhead::take(Slots<T> & slots, const String & key, Inline inline_request, ReadFamily family)
 {
-    const auto it = slots.find(key);
-    if (it == slots.end())
+    const bool tracked = accounts(family);
+    UInt64 wait_from_ns = 0;
+    if (tracked)
+    {
+        wait_from_ns = clock_ns();
+        closeApplyAt(wait_from_ns);
+    }
+    ReadFamilyStats * family_stats = tracked ? &stats[static_cast<size_t>(family)] : nullptr;
+
+    std::shared_ptr<Slot<T>> slot;
+    if (const auto it = slots.find(key); it != slots.end())
+    {
+        slot = std::move(it->second);
+        slots.erase(it);
+        ProfileEvents::increment(ProfileEvents::CASGCReadAheadHit);
+    }
+    else
     {
         ProfileEvents::increment(ProfileEvents::CASGCReadAheadMiss);
-        return inline_request(op, key);
     }
 
-    std::shared_ptr<Slot<T>> slot = std::move(it->second);
-    slots.erase(it);
-    ProfileEvents::increment(ProfileEvents::CASGCReadAheadHit);
-    /// Rethrows the worker's exception at the site that would otherwise have read inline, so a
-    /// transport failure fails the round from the same place and with the same type it always did.
-    return slot->future.get();
+    if (!tracked)
+    {
+        /// Rethrows the worker's exception at the site that would otherwise have read inline, so a
+        /// transport failure fails the round from the same place and with the same type it always did.
+        if (!slot)
+            return inline_request(op, key);
+        slot->future.get();
+        return std::move(slot->result);
+    }
+
+    ++family_stats->takes;
+    if (!slot)
+    {
+        ++family_stats->issued;
+        ++family_stats->awaited;
+    }
+    else
+    {
+        if (slot->future.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+            ++family_stats->awaited;
+    }
+
+    std::optional<T> result;
+    UInt64 returned_ns = 0;
+    {
+        /// Adds the wait on every exit, so a take that throws still reports the time it spent.
+        SCOPE_EXIT({
+            returned_ns = clock_ns();
+            family_stats->wait_ns += returned_ns - wait_from_ns;
+        });
+        if (slot)
+        {
+            slot->future.get();
+            result = std::move(slot->result);
+        }
+        else
+        {
+            result = inline_request(op, key);
+        }
+    }
+    apply_family = family;
+    apply_since_ns = returned_ns;
+    return result;
 }
 
-void GcReadAhead::hintRead(const String & key)
+void GcReadAhead::hintRead(const String & key, ReadFamily family)
 {
     hint<Object>(reads, key,
-        [](CasOperation & worker, const String & k) { return worker.read(k, Retry::standard()); });
+        [](CasOperation & worker, const String & k) { return worker.read(k, Retry::standard()); }, family);
 }
 
 void GcReadAhead::hintHead(const String & key)
 {
     hint<Meta>(heads, key,
-        [](CasOperation & worker, const String & k) { return worker.head(k, Retry::standard()); });
+        [](CasOperation & worker, const String & k) { return worker.head(k, Retry::standard()); }, ReadFamily::Other);
 }
 
 template <typename T>
@@ -181,16 +238,52 @@ std::function<IntentCreateResult()> GcReadAhead::startCreate(std::function<Inten
     };
 }
 
-std::optional<Object> GcReadAhead::takeRead(const String & key)
+std::optional<Object> GcReadAhead::takeRead(const String & key, ReadFamily family)
 {
     return take<Object>(reads, key,
-        [](CasOperation & inline_op, const String & k) { return inline_op.read(k, Retry::standard()); });
+        [](CasOperation & inline_op, const String & k) { return inline_op.read(k, Retry::standard()); }, family);
 }
 
 std::optional<Meta> GcReadAhead::takeHead(const String & key)
 {
     return take<Meta>(heads, key,
-        [](CasOperation & inline_op, const String & k) { return inline_op.head(k, Retry::standard()); });
+        [](CasOperation & inline_op, const String & k) { return inline_op.head(k, Retry::standard()); }, ReadFamily::Other);
+}
+
+const Object * GcReadAhead::peekRead(const String & key) const
+{
+    const auto it = reads.find(key);
+    if (it == reads.end())
+        return nullptr;
+    const Slot<Object> & slot = *it->second;
+    if (slot.future.wait_for(std::chrono::seconds(0)) != std::future_status::ready || !slot.result)
+        return nullptr;
+    return &*slot.result;
+}
+
+UInt64 steadyNowNs() noexcept
+{
+    return static_cast<UInt64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+void GcReadAhead::enableFamilyAccounting(UInt64 (*clock)() noexcept)
+{
+    clock_ns = clock;
+}
+
+void GcReadAhead::closeApply()
+{
+    if (clock_ns && apply_family)
+        closeApplyAt(clock_ns());
+}
+
+void GcReadAhead::closeApplyAt(UInt64 now_ns)
+{
+    if (!apply_family)
+        return;
+    stats[static_cast<size_t>(*apply_family)].apply_ns += now_ns - apply_since_ns;
+    apply_family.reset();
 }
 
 }

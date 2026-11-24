@@ -151,6 +151,8 @@ public:
     String blobIntentsProbePrefix() const { return blobIntentsPrefix() + "_probe/"; }
     bool isBlobIntentProbeKey(std::string_view key) const { return key.starts_with(blobIntentsProbePrefix()); }
     String blobIntentProbeKey(const String & probe_id) const { return blobIntentsProbePrefix() + probe_id + "/intent"; }
+    /// The probe object holds the intent bytes too, so it is deleted with the verb GC deletes intents with.
+    WriteOnceKey writeOnceBlobIntentProbeKey(const String & probe_id) const { return WriteOnceKey(blobIntentProbeKey(probe_id)); }
     /// `LOGICAL_ERROR` when the key exceeds `kBlobIntentKeyMaxBytes` or the identity's tag is not one
     /// `parseBlobIntentKey` accepts.
     String blobIntentKey(const BlobRef & ref, const CanonicalIdentity & identity) const;

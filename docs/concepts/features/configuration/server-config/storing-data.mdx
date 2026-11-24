@@ -530,7 +530,7 @@ disk-level and server-level settings surface.
 - Every physical blob materialization starts with `HEAD`. A present blob is reused after one `GET` of its
   deletion intent, which must be absent; an absent blob is published with one unconditional `PUT`.
   No other per-blob object is read or written.
-- `cas_gc_snapshot_generations_to_keep` — `3` by default. Number of past GC snapshot generations retained.
+- `cas_gc_snapshot_generations_to_keep` — GC snapshot generations retained (default `3`). `0` is refused: set a large number instead. `1` is loaded as `2` with a warning, because with one generation GC can remove the generation it has just adopted. Set `2` or more on every server that can be GC leader before the first upgraded server joins.
 - `gcs_max_conditional_put_bytes` — `1` GiB by default. Bounds every conditional non-blob `PUT` on
   generation-token backends, where the precondition must survive one request. This includes
   create-if-absent metadata/control artifacts and conditional replacements. Blob bodies do not

@@ -370,7 +370,7 @@ TEST(CASNamespaceJanitor, CancelledCreatingCheckpointIsReclaimedThroughPublicLif
 
     auto cancel_op = requests.admit();
     ASSERT_EQ(CasRefCatalog::cancelStalledCreating(
-        cancel_op, layout, creating, [](const CreatorFence &) { return true; }),
+        cancel_op, layout, creating, [](const CreatorFence &) { return true; }, [](const Retry &) {}),
         CasRefCatalog::StalledCreatingCancelOutcome::Cancelled);
     auto read_op = requests.admit();
     EXPECT_TRUE(CasRefCatalog::read(read_op, layout).catalog.entries.empty());

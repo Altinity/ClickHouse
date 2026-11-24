@@ -1720,6 +1720,8 @@ TEST(CASRefGc, RefObjectCleanupFallsBackToOnePerKeyWhenBatchDeleteIsUnsupported)
     backend->failNextBulkRemoveWith(std::make_exception_ptr(
         DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "no batch delete")));
     const auto cleaned_before = ProfileEvents::global_counters[ProfileEvents::CASRefCleanupObjectsDeleted];
+    /// The open's intent probe sent a bulk delete of its own.
+    const size_t bulk_calls_before = backend->bulkRemoveCalls();
 
     OperationForTest op(*backend);
     Gc gc(store, kGc);
@@ -1732,7 +1734,7 @@ TEST(CASRefGc, RefObjectCleanupFallsBackToOnePerKeyWhenBatchDeleteIsUnsupported)
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefCleanupObjectsDeleted] - cleaned_before, cohort_size)
         << "the budget/profile-event accounting counts objects, unaffected by the fallback";
     /// 1 failed bulk attempt + one request per key in the cohort.
-    EXPECT_EQ(backend->bulkRemoveCalls(), 1 + cohort_size);
+    EXPECT_EQ(backend->bulkRemoveCalls() - bulk_calls_before, 1 + cohort_size);
 }
 
 /// Task 13 (spec §implementation-impact / §GC Budget): one fold+clean round increments every ref-intake
@@ -1842,7 +1844,9 @@ TEST(CASRefGc, RefSnaplogLifecycleE2E)
     const FsckReport rep = runFsck(*store, /*detail*/true);
     EXPECT_TRUE(rep.clean());
     EXPECT_EQ(rep.dangling, 0u);
-    EXPECT_TRUE(gc.previewDeletes().deletes.empty()) << "cas-gc-dryrun equivalent: no pending content deletes";
+    const Gc::DeletePreview dry_run = gc.previewDeletes();
+    EXPECT_EQ(dry_run.snapshot, Gc::SnapshotVerdict::Adopted);
+    EXPECT_TRUE(dry_run.deletes.empty()) << "cas-gc-dryrun equivalent: no pending content deletes";
 }
 
 /// (8) A malformed/adversarial ref key aborts ref folding for the round: no partial delta, no cursor

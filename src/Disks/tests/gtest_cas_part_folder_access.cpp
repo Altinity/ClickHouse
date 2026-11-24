@@ -12,8 +12,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <future>
 #include <latch>
+#include <optional>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -1767,6 +1769,371 @@ TEST(CASPartFolderAccess, SingleFlightColdBuild)
     for (const auto & r : results)
         EXPECT_NE(r, nullptr);
     EXPECT_EQ(backend->getCount(manifest_key), 1u);   /// single-flight: ONE body GET for the burst
+}
+
+namespace
+{
+
+/// A pool whose manifest decode cache is off, so every view build reaches the manifest GET.
+Cas::PoolPtr openPoolWithoutDecodeCache(const std::shared_ptr<CountingBackend> & backend)
+{
+    return Cas::Pool::open(backend,
+        Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .manifest_decode_cache_bytes = 0});
+}
+
+}
+
+TEST(CASPartFolderAccess, AColdViewBuildFailsAtOnceOnTheQueryMemoryLimit)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolWithoutDecodeCache(backend);
+    const Cas::Layout layout("p");
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store, cacheOn());
+    const auto id = publishPart(store, ns, "part_1", {inlineEntry("f", "x")});
+    const Cas::PartRefKey key{ns, "part_1"};
+    const String manifest_key = layout.manifestKey(id);
+    backend->resetCounts();
+    backend->failNextReadWith(manifest_key, std::make_exception_ptr(
+        Exception(ErrorCodes::MEMORY_LIMIT_EXCEEDED, "Query memory limit exceeded: would use 1.22 MiB")));
+
+    const String message = messageOf(ErrorCodes::MEMORY_LIMIT_EXCEEDED, [&]
+    {
+        (void)access.getView(key, Cas::Freshness::CachedForLoad);
+    });
+
+    EXPECT_EQ(message, "Query memory limit exceeded: would use 1.22 MiB");
+    EXPECT_EQ(backend->getCount(manifest_key), 1u);
+    ASSERT_NE(access.getView(key, Cas::Freshness::CachedForLoad), nullptr);   /// nothing failed was cached
+    EXPECT_EQ(backend->getCount(manifest_key), 2u);
+}
+
+/// Opting in must not turn off the transport retries of the same GET.
+TEST(CASPartFolderAccess, AColdViewBuildStillReissuesATransportFault)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolWithoutDecodeCache(backend);
+    const Cas::Layout layout("p");
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store, cacheOn());
+    const auto id = publishPart(store, ns, "part_1", {inlineEntry("f", "x")});
+    const Cas::PartRefKey key{ns, "part_1"};
+    const String manifest_key = layout.manifestKey(id);
+    backend->resetCounts();
+    backend->failNextReadWith(manifest_key, std::make_exception_ptr(Poco::TimeoutException("the read timed out")));
+
+    ASSERT_NE(access.getView(key, Cas::Freshness::CachedForLoad), nullptr);
+
+    EXPECT_EQ(backend->getCount(manifest_key), 2u);
+}
+
+/// Only the cold `CachedForLoad` build opts in; the fresh modes serve write-side callers.
+TEST(CASPartFolderAccess, AFreshViewBuildStillReissuesTheQueryMemoryLimit)
+{
+    for (const auto freshness : {Cas::Freshness::ForceFresh, Cas::Freshness::StrictValidate})
+    {
+        auto backend = std::make_shared<CountingBackend>();
+        auto store = openPoolWithoutDecodeCache(backend);
+        const Cas::Layout layout("p");
+        const Cas::RootNamespace ns{"srv/t1"};
+        Cas::CachedPartFolderAccess access(store);   /// retention off: every mode reaches the reader
+        const auto id = publishPart(store, ns, "part_1", {inlineEntry("f", "x")});
+        const Cas::PartRefKey key{ns, "part_1"};
+        const String manifest_key = layout.manifestKey(id);
+        backend->resetCounts();
+        backend->failNextReadWith(manifest_key, std::make_exception_ptr(
+            Exception(ErrorCodes::MEMORY_LIMIT_EXCEEDED, "Query memory limit exceeded")));
+
+        ASSERT_NE(access.getView(key, freshness), nullptr);
+
+        EXPECT_EQ(backend->getCount(manifest_key), 2u);
+    }
+}
+
+namespace
+{
+
+/// Holds the first GET of `park_key` until the test releases it, so a second reader can join the build.
+class ParkFirstReadBackend final : public CountingBackend
+{
+public:
+    String park_key;
+    std::promise<void> parked;
+    std::shared_future<void> release;
+
+    std::optional<Cas::Backend::Raw> read(const String & key, Cas::TransportAccess & access) override
+    {
+        if (key == park_key && !park_taken.exchange(true))
+        {
+            parked.set_value();
+            release.wait();
+        }
+        return CountingBackend::read(key, access);
+    }
+
+private:
+    std::atomic<bool> park_taken{false};
+};
+
+struct ReaderOutcome
+{
+    std::shared_ptr<const Cas::PartFolderView> view;
+    int code = 0;
+    String message;
+};
+
+ReaderOutcome readColdView(const Cas::CachedPartFolderAccess & access, const Cas::PartRefKey & key)
+{
+    try
+    {
+        return {access.getView(key, Cas::Freshness::CachedForLoad), 0, {}};
+    }
+    catch (const Exception & e)
+    {
+        return {nullptr, e.code(), e.message()};
+    }
+}
+
+/// Bounds every rendezvous below, so a regression fails the test instead of hanging the binary.
+constexpr auto kRendezvousTimeout = std::chrono::minutes(1);
+
+struct LeaderAndFollower
+{
+    ReaderOutcome leader;
+    ReaderOutcome follower;
+    bool leader_parked = false;
+    bool follower_arrived = false;
+    bool follower_joined = false;
+};
+
+/// One reader leads the cold build of `key` and is held in its manifest GET; `while_parked` runs, then a
+/// second reader starts and the GET is released once that reader has joined the build or returned.
+LeaderAndFollower leaderAndFollower(
+    ParkFirstReadBackend & backend, Cas::CachedPartFolderAccess & access, const Cas::PartRefKey & key,
+    const std::function<void()> & while_parked = {})
+{
+    std::promise<void> release;
+    backend.release = release.get_future().share();
+    std::promise<void> arrived;
+    std::atomic<bool> arrived_once{false};
+    std::atomic<bool> joined{false};
+    const auto arrive = [&]
+    {
+        if (!arrived_once.exchange(true))
+            arrived.set_value();
+    };
+    access.setHookForTest(Cas::CachedPartFolderAccess::TestHook::FollowerJoined, [&]
+    {
+        joined = true;
+        arrive();
+    });
+
+    LeaderAndFollower run;
+    std::optional<std::thread> leader_thread;
+    std::optional<std::thread> follower_thread;
+    bool finished = false;
+    const auto finish = [&]
+    {
+        if (finished)
+            return;
+        finished = true;
+        release.set_value();
+        if (leader_thread)
+            leader_thread->join();
+        if (follower_thread)
+            follower_thread->join();
+        access.setHookForTest(Cas::CachedPartFolderAccess::TestHook::FollowerJoined, nullptr);
+    };
+    SCOPE_EXIT({ finish(); });
+
+    leader_thread.emplace([&] { run.leader = readColdView(access, key); });
+    run.leader_parked = backend.parked.get_future().wait_for(kRendezvousTimeout) == std::future_status::ready;
+    if (run.leader_parked)
+    {
+        if (while_parked)
+            while_parked();
+        follower_thread.emplace([&]
+        {
+            run.follower = readColdView(access, key);
+            arrive();
+        });
+        run.follower_arrived = arrived.get_future().wait_for(kRendezvousTimeout) == std::future_status::ready;
+    }
+    finish();
+    run.follower_joined = joined;
+    return run;
+}
+
+}
+
+/// A query waiting for another query's build of the same part must not inherit that query's memory limit.
+TEST(CASPartFolderAccess, AFollowerRebuildsAColdViewAfterTheLeadersMemoryLimit)
+{
+    auto backend = std::make_shared<ParkFirstReadBackend>();
+    auto store = openPoolWithoutDecodeCache(backend);
+    const Cas::Layout layout("p");
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store, cacheOn());
+    const auto id = publishPart(store, ns, "part_1", {inlineEntry("f", "x")});
+    const Cas::PartRefKey key{ns, "part_1"};
+    const String manifest_key = layout.manifestKey(id);
+    backend->resetCounts();
+    backend->park_key = manifest_key;
+    backend->failNextReadWith(manifest_key, std::make_exception_ptr(
+        Exception(ErrorCodes::MEMORY_LIMIT_EXCEEDED, "Query memory limit exceeded: the leader's")));
+
+    const auto [leader, follower, leader_parked, follower_arrived, follower_joined] = leaderAndFollower(*backend, access, key);
+    ASSERT_TRUE(leader_parked && follower_arrived && follower_joined);
+
+    EXPECT_EQ(leader.code, ErrorCodes::MEMORY_LIMIT_EXCEEDED);
+    EXPECT_EQ(leader.message, "Query memory limit exceeded: the leader's");
+    EXPECT_EQ(follower.code, 0) << follower.message;
+    EXPECT_NE(follower.view, nullptr);
+    EXPECT_EQ(backend->getCount(manifest_key), 2u);
+}
+
+/// Every other failure of the leader is the follower's outcome too, with no read of its own.
+TEST(CASPartFolderAccess, AFollowerSharesALeadersFailureOtherThanTheMemoryLimit)
+{
+    auto backend = std::make_shared<ParkFirstReadBackend>();
+    auto store = openPoolWithoutDecodeCache(backend);
+    const Cas::Layout layout("p");
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store, cacheOn());
+    const auto id = publishPart(store, ns, "part_1", {inlineEntry("f", "x")});
+    const Cas::PartRefKey key{ns, "part_1"};
+    const String manifest_key = layout.manifestKey(id);
+    backend->resetCounts();
+    backend->park_key = manifest_key;
+    backend->failNextReadWith(manifest_key, std::make_exception_ptr(
+        Exception(ErrorCodes::CORRUPTED_DATA, "the manifest body is damaged")));
+
+    const auto [leader, follower, leader_parked, follower_arrived, follower_joined] = leaderAndFollower(*backend, access, key);
+    ASSERT_TRUE(leader_parked && follower_arrived && follower_joined);
+
+    EXPECT_EQ(leader.code, ErrorCodes::CORRUPTED_DATA);
+    EXPECT_EQ(follower.code, ErrorCodes::CORRUPTED_DATA);
+    EXPECT_EQ(follower.message, "the manifest body is damaged");
+    EXPECT_EQ(backend->getCount(manifest_key), 1u);
+}
+
+/// The follower's own build is final: its own memory limit is reported, after exactly one read of its own.
+TEST(CASPartFolderAccess, AFollowersOwnMemoryLimitIsFinal)
+{
+    auto backend = std::make_shared<ParkFirstReadBackend>();
+    auto store = openPoolWithoutDecodeCache(backend);
+    const Cas::Layout layout("p");
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store, cacheOn());
+    const auto id = publishPart(store, ns, "part_1", {inlineEntry("f", "x")});
+    const Cas::PartRefKey key{ns, "part_1"};
+    const String manifest_key = layout.manifestKey(id);
+    backend->resetCounts();
+    backend->park_key = manifest_key;
+    backend->failNextReadWith(manifest_key, std::make_exception_ptr(
+        Exception(ErrorCodes::MEMORY_LIMIT_EXCEEDED, "Query memory limit exceeded: the leader's")));
+    backend->failNextReadWith(manifest_key, std::make_exception_ptr(
+        Exception(ErrorCodes::MEMORY_LIMIT_EXCEEDED, "Query memory limit exceeded: the follower's")));
+
+    const auto [leader, follower, leader_parked, follower_arrived, follower_joined] = leaderAndFollower(*backend, access, key);
+    ASSERT_TRUE(leader_parked && follower_arrived && follower_joined);
+
+    EXPECT_EQ(leader.message, "Query memory limit exceeded: the leader's");
+    EXPECT_EQ(follower.code, ErrorCodes::MEMORY_LIMIT_EXCEEDED);
+    EXPECT_EQ(follower.message, "Query memory limit exceeded: the follower's");
+    EXPECT_EQ(backend->getCount(manifest_key), 2u);
+}
+
+/// A reader that resolved a newer manifest of the same ref must not receive the build of the older one.
+TEST(CASPartFolderAccess, ReadersOfDifferentManifestsOfOneRefDoNotShareABuild)
+{
+    auto backend = std::make_shared<ParkFirstReadBackend>();
+    auto store = openPoolWithoutDecodeCache(backend);
+    const Cas::Layout layout("p");
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store, cacheOn());
+    const auto old_id = publishPart(store, ns, "part_1", {inlineEntry("f", "old")});
+    const Cas::PartRefKey key{ns, "part_1"};
+    backend->park_key = layout.manifestKey(old_id);
+    std::optional<Cas::ManifestId> new_id;
+
+    const auto run = leaderAndFollower(*backend, access, key, [&]
+    {
+        access.repointRef(key, {inlineEntry("f", "new")}, Cas::ProvenanceOp::Other, old_id.ref);
+        new_id = access.resolve(key, Cas::Freshness::ForceFresh)->manifest_id;
+    });
+
+    ASSERT_TRUE(run.leader_parked);
+    ASSERT_TRUE(run.follower_arrived);
+    ASSERT_TRUE(new_id);
+    ASSERT_NE(*new_id, old_id);
+    ASSERT_NE(run.leader.view, nullptr) << run.leader.message;
+    ASSERT_NE(run.follower.view, nullptr) << run.follower.message;
+    EXPECT_EQ(run.leader.view->manifestId(), old_id);
+    EXPECT_EQ(run.follower.view->manifestId(), *new_id);
+    EXPECT_FALSE(run.follower_joined);
+}
+
+/// A follower that wakes after another follower's rebuild has been retained takes that view without a read.
+TEST(CASPartFolderAccess, ALateFollowerTakesTheViewAnotherFollowerRebuilt)
+{
+    auto backend = std::make_shared<ParkFirstReadBackend>();
+    auto store = openPoolWithoutDecodeCache(backend);
+    const Cas::Layout layout("p");
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store, cacheOn());
+    const auto id = publishPart(store, ns, "part_1", {inlineEntry("f", "x")});
+    const Cas::PartRefKey key{ns, "part_1"};
+    const String manifest_key = layout.manifestKey(id);
+    backend->resetCounts();
+    backend->park_key = manifest_key;
+    backend->failNextReadWith(manifest_key, std::make_exception_ptr(
+        Exception(ErrorCodes::MEMORY_LIMIT_EXCEEDED, "Query memory limit exceeded: the leader's")));
+    std::promise<void> release;
+    backend->release = release.get_future().share();
+
+    /// The first follower to join rebuilds; the second waits in its join until the first has returned.
+    std::promise<void> first_joined;
+    std::promise<void> second_joined;
+    std::promise<void> first_done;
+    std::shared_future<void> first_done_future = first_done.get_future().share();
+    std::atomic<int> joins{0};
+    access.setHookForTest(Cas::CachedPartFolderAccess::TestHook::FollowerJoined, [&]
+    {
+        const int join = ++joins;
+        if (join == 1)
+            first_joined.set_value();
+        else if (join == 2)
+        {
+            second_joined.set_value();
+            first_done_future.wait_for(kRendezvousTimeout);
+        }
+    });
+    SCOPE_EXIT({ access.setHookForTest(Cas::CachedPartFolderAccess::TestHook::FollowerJoined, nullptr); });
+
+    ReaderOutcome leader;
+    ReaderOutcome first;
+    ReaderOutcome second;
+    std::thread leader_thread([&] { leader = readColdView(access, key); });
+    const bool leader_parked = backend->parked.get_future().wait_for(kRendezvousTimeout) == std::future_status::ready;
+    std::thread first_thread([&] { first = readColdView(access, key); });
+    const bool first_arrived = first_joined.get_future().wait_for(kRendezvousTimeout) == std::future_status::ready;
+    std::thread second_thread([&] { second = readColdView(access, key); });
+    const bool second_arrived = second_joined.get_future().wait_for(kRendezvousTimeout) == std::future_status::ready;
+    release.set_value();
+    leader_thread.join();
+    first_thread.join();
+    const size_t reads_before_second_resumes = backend->getCount(manifest_key);
+    first_done.set_value();
+    second_thread.join();
+
+    ASSERT_TRUE(leader_parked && first_arrived && second_arrived);
+    EXPECT_EQ(leader.code, ErrorCodes::MEMORY_LIMIT_EXCEEDED);
+    ASSERT_NE(first.view, nullptr) << first.message;
+    ASSERT_NE(second.view, nullptr) << second.message;
+    EXPECT_EQ(reads_before_second_resumes, 2u);
+    EXPECT_EQ(backend->getCount(manifest_key), 2u) << "the late follower read the manifest again";
+    EXPECT_EQ(second.view, first.view);
 }
 
 TEST(CASPartFolderAccess, DropNamespaceErasesAllViews)

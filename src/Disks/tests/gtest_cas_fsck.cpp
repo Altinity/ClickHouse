@@ -34,7 +34,9 @@
 
 namespace DB::ErrorCodes
 {
+extern const int MEMORY_LIMIT_EXCEEDED;
 extern const int BAD_ARGUMENTS;
+extern const int CORRUPTED_DATA;
 extern const int INVALID_STATE;
 extern const int NETWORK_ERROR;
 extern const int NOT_IMPLEMENTED;
@@ -108,6 +110,14 @@ public:
         pending_mutation = std::move(mutation);
     }
 
+    /// Runs `mutation` once, at the first read of any key under `prefix`; an empty prefix matches every key.
+    void armOnFirstGetUnder(String prefix, std::function<void()> mutation)
+    {
+        std::lock_guard<std::mutex> lock(arm_mutex);
+        armed_prefix = std::move(prefix);
+        pending_prefix_mutation = std::move(mutation);
+    }
+
     std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
         std::function<void()> to_run;
@@ -117,6 +127,11 @@ public:
             {
                 to_run = std::move(pending_mutation);
                 pending_mutation = nullptr;
+            }
+            else if (pending_prefix_mutation && key.starts_with(armed_prefix))
+            {
+                to_run = std::move(pending_prefix_mutation);
+                pending_prefix_mutation = nullptr;
             }
         }
         if (to_run)
@@ -128,6 +143,8 @@ private:
     std::mutex arm_mutex;
     String armed_key;
     std::function<void()> pending_mutation;
+    String armed_prefix;
+    std::function<void()> pending_prefix_mutation;
 };
 
 enum class FsckListingMode : uint8_t
@@ -480,6 +497,187 @@ TEST(CASFsck, LifelessKeyIsRecordedAndTheHealthyNamespaceIsStillReported)
     /// a present blob, which only a sweep that ran can report.
     EXPECT_GE(rep.reachable, 1u);
     EXPECT_EQ(rep.dangling, 0u);
+}
+
+namespace
+{
+/// A summary scan configured as `cas-fsck` runs it: it reads the creator slot of each `Creating` row.
+FsckReport runFsckReadingCreatorSlots(Pool & store)
+{
+    return runFsck(store, /*detail=*/false, {}, {}, /*partial_on_deadline=*/false, /*namespace_prefix=*/{},
+                   /*fix_legacy_markers=*/false, /*verify_intents=*/false, /*fix_concurrency=*/1, /*read_creator_slots=*/true);
+}
+}
+
+/// Every `Creating` row is reported with its creator and what the creator's slot says, in summary mode too:
+/// a higher epoch or a farewell is terminal, a slot at the row's epoch is live, no slot is absent, and a
+/// slot that does not decode is undecodable. Only the terminal ones count as `stalled_creating`.
+TEST(CASFsck, EveryCreatingRowIsReportedWithItsCreatorSlot)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    CasOperation op = store->openRequests().admit();
+    store->namespaceLife(RootNamespace{"00/live@cas@"});
+    const auto admit_creating = [&](const String & ns, UInt128 incarnation, const String & root)
+    {
+        CasRefCatalog::casAdmitEntry(op, layout, store->poolConfig().gc_shards, CatalogEntry{
+            .ns = RootNamespace{ns}, .state = NsState::Creating, .incarnation = incarnation,
+            .creator = CreatorFence{.server_root_id = root, .writer_epoch = 1, .fence_generation = 1}});
+    };
+    admit_creating("00/superseded@cas@", UInt128{0xa1}, "moved-creator");
+    admit_creating("00/farewell@cas@", UInt128{0xa2}, "retired-creator");
+    admit_creating("00/unproven@cas@", UInt128{0xa3}, "never-mounted");
+    admit_creating("00/running@cas@", UInt128{0xa4}, "running-creator");
+    admit_creating("00/garbled@cas@", UInt128{0xa5}, "garbled-creator");
+    setWatermarkMinActive(*backend, layout, "moved-creator", /*writer_epoch*/ 2, std::numeric_limits<uint64_t>::max());
+    setWatermarkMinActive(*backend, layout, "retired-creator", /*writer_epoch*/ 1, std::numeric_limits<uint64_t>::max());
+    setWatermarkMinActive(*backend, layout, "running-creator", /*writer_epoch*/ 1, /*min_active_build_sequence*/ 1);
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.mountKey("garbled-creator"), "not-a-lease", Retry::once())));
+
+    const FsckReport rep = runFsckReadingCreatorSlots(*store);
+
+    EXPECT_EQ(rep.stalled_creating, 2u) << formatFsckSummary(rep);
+    EXPECT_EQ(rep.creating_unproven, 3u) << formatFsckSummary(rep);
+    EXPECT_NE(formatFsckSummary(rep).find("stalled_creating=2"), String::npos) << formatFsckSummary(rep);
+    EXPECT_NE(formatFsckSummary(rep).find("creating_unproven=3"), String::npos) << formatFsckSummary(rep);
+    std::map<String, std::pair<String, CreatorSlotStatus>> rows;
+    for (const FsckCreatingRow & row : rep.creating_rows)
+    {
+        EXPECT_EQ(row.writer_epoch, 1u);
+        ASSERT_TRUE(row.slot) << row.ns << ": " << row.slot_read_error;
+        rows.emplace(row.ns, std::pair{row.creator_root, *row.slot});
+    }
+    EXPECT_EQ(rows, (std::map<String, std::pair<String, CreatorSlotStatus>>{
+        {"00/superseded@cas@", {"moved-creator", CreatorSlotStatus::Terminal}},
+        {"00/farewell@cas@", {"retired-creator", CreatorSlotStatus::Terminal}},
+        {"00/unproven@cas@", {"never-mounted", CreatorSlotStatus::Absent}},
+        {"00/running@cas@", {"running-creator", CreatorSlotStatus::Live}},
+        {"00/garbled@cas@", {"garbled-creator", CreatorSlotStatus::Undecodable}}}));
+    EXPECT_TRUE(rep.clean()) << "a `Creating` row is not a hard finding";
+    EXPECT_FALSE(rep.catalog_has_no_walkable_row) << "the `Live` namespace is walkable";
+}
+
+/// The line `cas-fsck` prints for a `Creating` row names the namespace, the creator, the epoch, and the
+/// slot status with what GC does about it.
+TEST(CASFsck, TheCreatingRowNoteSaysWhatGcDoesForEachSlotStatus)
+{
+    const auto note = [](CreatorSlotStatus slot)
+    {
+        return formatFsckCreatingRow(FsckCreatingRow{.ns = "00/t@cas@", .creator_root = "srv", .writer_epoch = 7, .slot = slot,
+            .slot_read_error = {}});
+    };
+    for (const CreatorSlotStatus slot :
+         {CreatorSlotStatus::Terminal, CreatorSlotStatus::Live, CreatorSlotStatus::Absent, CreatorSlotStatus::Undecodable})
+        EXPECT_NE(note(slot).find("namespace '00/t@cas@' is `Creating` under creator 'srv' at writer epoch 7"), String::npos)
+            << note(slot);
+    EXPECT_NE(note(CreatorSlotStatus::Terminal).find("terminal: the next GC round cancels"), String::npos);
+    EXPECT_NE(note(CreatorSlotStatus::Live).find("live: "), String::npos);
+    EXPECT_NE(note(CreatorSlotStatus::Absent).find("absent on this read: "), String::npos);
+    EXPECT_NE(note(CreatorSlotStatus::Undecodable).find("undecodable: "), String::npos);
+    const String unreadable = formatFsckCreatingRow(FsckCreatingRow{.ns = "00/t@cas@", .creator_root = "srv",
+        .writer_epoch = 7, .slot = std::nullopt, .slot_read_error = "injected"});
+    EXPECT_NE(unreadable.find("namespace '00/t@cas@' is `Creating` under creator 'srv' at writer epoch 7"), String::npos)
+        << unreadable;
+    EXPECT_NE(unreadable.find("unreadable (injected)"), String::npos) << unreadable;
+}
+
+/// The leader's keep or refusal is attributed to the leader, and the creating server's own cleanup is named
+/// apart from it on every row the leader does not cancel: that server never reads its slot.
+TEST(CASFsck, TheCreatingRowNoteNamesTheLeaderAndTheCreatorsOwnCleanup)
+{
+    const String owner_clause = "a writable creator with its GC scheduler running also cancels its own idle rows of its "
+                                "current writer epoch";
+    const auto note = [](CreatorSlotStatus slot)
+    {
+        return formatFsckCreatingRow(FsckCreatingRow{.ns = "00/t@cas@", .creator_root = "srv", .writer_epoch = 7, .slot = slot,
+            .slot_read_error = {}});
+    };
+    const String unreadable = formatFsckCreatingRow(FsckCreatingRow{.ns = "00/t@cas@", .creator_root = "srv",
+        .writer_epoch = 7, .slot = std::nullopt, .slot_read_error = "injected"});
+    for (const String & line : {note(CreatorSlotStatus::Live), note(CreatorSlotStatus::Absent),
+                                note(CreatorSlotStatus::Undecodable), unreadable})
+    {
+        EXPECT_NE(line.find("the GC leader"), String::npos) << line;
+        EXPECT_NE(line.find(owner_clause), String::npos) << line;
+    }
+    EXPECT_NE(unreadable.find("unreadable (injected)"), String::npos) << unreadable;
+    EXPECT_EQ(note(CreatorSlotStatus::Terminal).find(owner_clause), String::npos) << note(CreatorSlotStatus::Terminal);
+
+    FsckReport rep;
+    rep.pending_gc = 3;
+    rep.catalog_has_no_walkable_row = true;
+    const String pipeline = formatFsckPipelineNote(rep);
+    EXPECT_NE(pipeline.find("`stalled_creating` counts terminal rows, which the GC leader cancels"), String::npos) << pipeline;
+    EXPECT_NE(pipeline.find(owner_clause), String::npos) << pipeline;
+}
+
+#if USE_AWS_S3
+/// A store error reading one creator's mount slot marks that row unreadable and the scan goes on: the other
+/// `Creating` row is still classified.
+TEST(CASFsck, AnUnreadableCreatorSlotMarksItsRowAndTheScanGoesOn)
+{
+    auto backend = std::make_shared<FailExactGetBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    CasOperation op = store->openRequests().admit();
+    const auto admit_creating = [&](const String & ns, UInt128 incarnation, const String & root)
+    {
+        CasRefCatalog::casAdmitEntry(op, layout, store->poolConfig().gc_shards, CatalogEntry{
+            .ns = RootNamespace{ns}, .state = NsState::Creating, .incarnation = incarnation,
+            .creator = CreatorFence{.server_root_id = root, .writer_epoch = 1, .fence_generation = 1}});
+        setWatermarkMinActive(*backend, layout, root, /*writer_epoch*/ 1, /*min_active_build_sequence*/ 1);
+    };
+    admit_creating("00/a-unreadable@cas@", UInt128{0xb1}, "unreadable-creator");
+    admit_creating("00/b-running@cas@", UInt128{0xb2}, "running-creator");
+    backend->fail(layout.mountKey("unreadable-creator"));
+
+    FsckReport rep;
+    ASSERT_NO_THROW(rep = runFsckReadingCreatorSlots(*store));
+
+    ASSERT_EQ(rep.creating_rows.size(), 2u);
+    EXPECT_EQ(rep.stalled_creating, 0u);
+    EXPECT_EQ(rep.creating_unproven, 2u);
+    for (const FsckCreatingRow & row : rep.creating_rows)
+    {
+        if (row.creator_root == "unreadable-creator")
+        {
+            EXPECT_FALSE(row.slot);
+            EXPECT_NE(row.slot_read_error.find("injected access denial"), String::npos) << row.slot_read_error;
+        }
+        else
+        {
+            EXPECT_EQ(row.slot, std::optional<CreatorSlotStatus>{CreatorSlotStatus::Live});
+        }
+    }
+}
+#endif
+
+/// GC deletes nothing only while the catalog has rows and none of them is walkable, so only then does the
+/// note on the deletion pipeline stop calling the backlog "no action needed".
+TEST(CASFsck, ThePipelineNoteSaysNoActionNeededUnlessNoCatalogRowIsWalkable)
+{
+    FsckReport rep;
+    rep.pending_gc = 3;
+    rep.stalled_creating = 1;
+    EXPECT_NE(formatFsckPipelineNote(rep).find("no action needed"), String::npos) << formatFsckPipelineNote(rep);
+    rep.catalog_has_no_walkable_row = true;
+    const String note = formatFsckPipelineNote(rep);
+    EXPECT_EQ(note.find("no action needed"), String::npos) << note;
+    EXPECT_NE(note.find("Creating"), String::npos) << note;
+}
+
+TEST(CASFsck, ACatalogOfOnlyCreatingRowsHasNoWalkableRow)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    CasOperation op = store->openRequests().admit();
+    EXPECT_FALSE(runFsck(*store, /*detail*/ false).catalog_has_no_walkable_row) << "an empty catalog is proved empty";
+    CasRefCatalog::casAdmitEntry(op, layout, store->poolConfig().gc_shards, CatalogEntry{
+        .ns = RootNamespace{"00/only@cas@"}, .state = NsState::Creating, .incarnation = UInt128{0xb1},
+        .creator = CreatorFence{.server_root_id = "never-mounted", .writer_epoch = 1, .fence_generation = 1}});
+    EXPECT_TRUE(runFsck(*store, /*detail*/ false).catalog_has_no_walkable_row);
 }
 
 /// A COMPLETE, canonical namespace-life key (a real `_files` write under a real admitted life) whose
@@ -1270,6 +1468,73 @@ TEST(CASFsck, LiveNamespaceWithoutCheckpointIsUnchecked)
         << "fsck must not consume refs after the mandatory recovery authority was absent";
 }
 
+/// Hooks that run at the first `_ckpt` read of a walked life, standing for GC erasing the row of a dropped
+/// table and the namespace janitor deleting the life's `_ckpt`, both after the catalog cut.
+namespace
+{
+void eraseCatalogRow(Backend & backend, const Layout & layout, const RootNamespace & ns)
+{
+    OperationForTest op(backend);
+    CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(*op, layout);
+    const auto it = std::find_if(snapshot.catalog.entries.begin(), snapshot.catalog.entries.end(),
+        [&](const CatalogEntry & entry) { return entry.ns == ns; });
+    ASSERT_NE(it, snapshot.catalog.entries.end());
+    snapshot.catalog.entries.erase(it);
+    ASSERT_TRUE(snapshot.etag.has_value());
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        (*op).replace(layout.refCatalogKey(), encodeRefCatalog(snapshot.catalog), *snapshot.etag, Retry::standard())));
+}
+
+void removeCheckpoint(Backend & backend, const Layout & layout, const NamespaceLifeId & life)
+{
+    OperationForTest op(backend);
+    const auto head = (*op).head(layout.refCkptKey(life), Retry::once());
+    ASSERT_TRUE(head.has_value());
+    ASSERT_EQ((*op).remove(layout.refCkptKey(life), head->etag, Retry::once()), Removal::Removed);
+}
+}
+
+/// The walk's `_ckpt` read finds the key deleted and the catalog row erased since the cut. The life is
+/// janitor-pending, and no `CORRUPTED_DATA` exception is constructed: its destructor would log an error.
+TEST(CASFsck, CheckpointDeletedWithTheRowErasedAfterTheCutIsJanitorPendingAndLogsNothing)
+{
+    auto backend = std::make_shared<MutateOnFirstGetBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/ckpt_gone_row_erased@cas@"};
+    const NamespaceLifeId life = writeFsckFixtureWithTail(*backend, layout, ns);
+    backend->armOnFirstGet(layout.refCkptKey(life), [&]
+    {
+        eraseCatalogRow(*backend, layout, ns);
+        removeCheckpoint(*backend, layout, life);
+    });
+
+    ScopedLogCapture capture("ForcedCriticalErrorsLogger", "error");
+    const FsckReport report = runFsck(*store, /*detail=*/true);
+
+    EXPECT_EQ(report.namespace_janitor_pending_lives, 1u) << "the hook ran and the life is janitor-pending";
+    EXPECT_EQ(report.unchecked, 0u);
+    EXPECT_EQ(report.chain_broken, 0u);
+    EXPECT_EQ(capture.count("CORRUPTED_DATA"), 0u) << capture.captured();
+}
+
+/// Control: with the row still named at confirmation, a Live life without `_ckpt` is reported.
+TEST(CASFsck, CheckpointDeletedWhileTheRowStaysIsReportedUnchecked)
+{
+    auto backend = std::make_shared<MutateOnFirstGetBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/ckpt_gone_row_stays@cas@"};
+    const NamespaceLifeId life = writeFsckFixtureWithTail(*backend, layout, ns);
+    backend->armOnFirstGet(layout.refCkptKey(life), [&] { removeCheckpoint(*backend, layout, life); });
+
+    const FsckReport report = runFsck(*store, /*detail=*/true);
+
+    EXPECT_EQ(report.namespace_janitor_pending_lives, 0u);
+    EXPECT_EQ(report.unchecked, 1u);
+    EXPECT_EQ(countVerdictsAtKey(report, layout.namespaceStreamPrefix(life), FsckClass::Unchecked), 1u);
+}
+
 /// A rebirth during the scan replaces the walked life's catalog row. The catalog read after the per-life
 /// loop no longer names that life, so its missing manifest is janitor-pending, not a dangle.
 TEST(CASFsck, MissingManifestOfALifeRebornDuringTheScanIsJanitorPending)
@@ -1440,6 +1705,65 @@ TEST(CASFsck, ResidualEdgeNamingAnAbsentManifestClassifiesStaleEdge)
             EXPECT_NE(o.reachable_from[0].find("no longer exist"), String::npos);
         }
     EXPECT_TRUE(saw);
+}
+
+/// A GC round commits between fsck's read of `gc/state` and its manifest pass: it folds the drop and deletes the
+/// manifest body, so the blob of the older snapshot names an absent manifest. That is the round at work, not a
+/// stale edge.
+TEST(CASFsck, EdgeFoldedByARoundDuringTheManifestPassIsSupersededNotStale)
+{
+    auto backend = std::make_shared<MutateOnFirstGetBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xA1);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    const ManifestId id = writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    const uint64_t publish_sequence = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, publish_sequence});
+    Gc gc(store, hexToU128("00000000000000000000000000000001"));
+    gc.runRegularRound();
+    const uint64_t drop_sequence = dropRefTransition(*backend, store->layout(), ns, "tbl", r);
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, drop_sequence});
+    bool round_ran = false;
+    backend->armOnFirstGet(store->layout().manifestKey(id), [&]
+    {
+        gc.runRegularRound();
+        round_ran = true;
+    });
+
+    const FsckReport rep = runFsck(*store, /*detail*/true);
+
+    ASSERT_TRUE(round_ran) << "the manifest pass read the body, so the round ran inside the scan";
+    EXPECT_EQ(rep.stale_edge, 0u);
+    EXPECT_EQ(rep.stale_edge_superseded, 1u);
+    EXPECT_TRUE(rep.clean());
+    for (const FsckObject & o : rep.objects)
+        EXPECT_NE(o.cls, FsckClass::StaleEdge) << o.key;
+}
+
+/// Control: with no round in between, the same blob is a stale edge and the superseded count stays zero.
+TEST(CASFsck, EdgeStillHeldInTheRereadStateIsReportedStale)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xA1);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    const ManifestId id = writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    const uint64_t publish_sequence = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, publish_sequence});
+    Gc gc(store, hexToU128("00000000000000000000000000000001"));
+    gc.runRegularRound();
+    const uint64_t drop_sequence = dropRefTransition(*backend, store->layout(), ns, "tbl", r);
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, drop_sequence});
+    deleteManifestBody(*backend, store->layout(), id);
+    gc.runRegularRound();   /// a round that cannot fold the edge: its manifest is gone
+
+    const FsckReport rep = runFsck(*store, /*detail*/true);
+
+    EXPECT_EQ(rep.stale_edge, 1u);
+    EXPECT_EQ(rep.stale_edge_superseded, 0u);
+    EXPECT_FALSE(rep.clean());
 }
 
 /// GC never ran on the pool: nothing is classifiable through the GC view — everything unreferenced
@@ -1653,12 +1977,17 @@ void spinPast(const ToolDeadline & deadline)
     }
 }
 
-/// Spins until at most `ms` are left before `deadline`.
-void spinUntilLeft(const ToolDeadline & deadline, uint64_t ms)
+/// Moves the virtual clock just past `deadline`.
+void advancePast(VirtualRetryClock & clock, const ToolDeadline & deadline)
 {
-    while (deadline.remainingMs() > ms)
-    {
-    }
+    clock.advance(deadline.remainingMs() + 1);
+}
+
+/// Moves the virtual clock until at most `ms` are left before `deadline`.
+void advanceUntilLeft(VirtualRetryClock & clock, const ToolDeadline & deadline, uint64_t ms)
+{
+    if (deadline.remainingMs() > ms)
+        clock.advance(deadline.remainingMs() - ms);
 }
 
 /// A pool whose bodies, intents and legacy markers the tests plant one by one, with no GC round.
@@ -2154,6 +2483,63 @@ TEST(CASFsck, FixLoopChecksTheDeadlineBeforeEachRequest)
     }
 }
 
+namespace
+{
+
+struct FsckProgressEvent
+{
+    FsckProgressStep step;
+    String phase;
+    String unit;
+    uint64_t done;
+    double seconds;
+};
+
+using FsckProgressLog = std::vector<FsckProgressEvent>;
+
+FsckProgress recordInto(FsckProgressLog & log)
+{
+    return [&log](FsckProgressStep step, std::string_view phase, std::string_view unit, uint64_t done, double seconds)
+    {
+        log.push_back({step, String(phase), String(unit), done, seconds});
+    };
+}
+
+std::vector<String> startsOf(const FsckProgressLog & log)
+{
+    std::vector<String> names;
+    for (const FsckProgressEvent & e : log)
+        if (e.step == FsckProgressStep::Start)
+            names.push_back(e.phase);
+    return names;
+}
+
+std::vector<uint64_t> ticksOf(const FsckProgressLog & log, std::string_view phase)
+{
+    std::vector<uint64_t> done;
+    for (const FsckProgressEvent & e : log)
+        if (e.step == FsckProgressStep::Tick && e.phase == phase)
+            done.push_back(e.done);
+    return done;
+}
+
+size_t countOf(const FsckProgressLog & log, std::string_view phase, FsckProgressStep step)
+{
+    return static_cast<size_t>(std::count_if(log.begin(), log.end(),
+        [&](const FsckProgressEvent & e) { return e.phase == phase && e.step == step; }));
+}
+
+/// The `End` of `phase`, or null when it has none.
+const FsckProgressEvent * endOf(const FsckProgressLog & log, std::string_view phase)
+{
+    for (const FsckProgressEvent & e : log)
+        if (e.phase == phase && e.step == FsckProgressStep::End)
+            return &e;
+    return nullptr;
+}
+
+}
+
 /// Both long loops report progress every thousand keys, so a slow scan is visibly working.
 TEST(CASFsck, IntentAndMarkerLoopsReportProgress)
 {
@@ -2163,18 +2549,32 @@ TEST(CASFsck, IntentAndMarkerLoopsReportProgress)
         f.staleIntent(b);
         f.marker(b);
     }
-    std::map<String, std::vector<uint64_t>> seen;
-    const FsckProgress on_progress = [&](std::string_view phase, uint64_t objects, uint64_t)
-    {
-        seen[String(phase)].push_back(objects);
-    };
+    FsckProgressLog log;
 
-    const FsckReport rep = runFsck(*f.store, false, on_progress, {}, false, {}, /*fix_legacy_markers=*/ true);
+    const FsckReport rep = runFsck(*f.store, false, recordInto(log), {}, false, {}, /*fix_legacy_markers=*/ true);
 
     ASSERT_EQ(rep.intents_listed, 1000u) << "positive control: the loops had keys to walk";
     ASSERT_EQ(rep.legacy_markers_deleted, 1000u);
-    EXPECT_EQ(seen["counting blob intents"], std::vector<uint64_t>{1000});
-    EXPECT_EQ(seen["removing legacy markers"], std::vector<uint64_t>{1000});
+    EXPECT_EQ(ticksOf(log, "counting blob intents"), std::vector<uint64_t>{1000});
+    EXPECT_EQ(ticksOf(log, "removing legacy markers"), std::vector<uint64_t>{1000});
+}
+
+/// The marker count is cumulative, so a partial last batch ticks the running total and the end repeats it.
+TEST(CASFsck, MarkerRemovalTicksTheCumulativeCount)
+{
+    FsckIntentFixture f;
+    for (uint64_t b = 1; b <= 1001; ++b)
+        f.marker(b);
+    FsckProgressLog log;
+
+    const FsckReport rep = runFsck(*f.store, false, recordInto(log), {}, false, {}, /*fix_legacy_markers=*/ true);
+
+    ASSERT_EQ(rep.legacy_markers_deleted, 1001u);
+    EXPECT_EQ((ticksOf(log, "removing legacy markers")), (std::vector<uint64_t>{1000, 1001}));
+    const FsckProgressEvent * end = endOf(log, "removing legacy markers");
+    ASSERT_NE(end, nullptr);
+    EXPECT_EQ(end->done, 1001u);
+    EXPECT_EQ(end->unit, "markers");
 }
 
 /// A scoped scan lists no markers, so a fix over it would silently do nothing: it is refused.
@@ -2250,6 +2650,7 @@ struct FsckGcFixture
     std::unique_ptr<Gc> gc;
     RootNamespace ns{"00/aa@cas@"};
     ManifestRef manifest = ref(1, 0xA1);
+    ManifestId manifest_id;
 
     explicit FsckGcFixture(uint64_t create_budget = 0, std::initializer_list<uint64_t> blobs = {1}, uint64_t gc_shards = 1)
     {
@@ -2263,7 +2664,7 @@ struct FsckGcFixture
             writeBlobBody(*backend, store->layout(), numberedBlobHash(b));
             entries.push_back(blobEntryFor("f" + std::to_string(b), numberedBlobHash(b)));
         }
-        writeManifestRaw(*backend, store->layout(), ns, manifest, entries);
+        manifest_id = writeManifestRaw(*backend, store->layout(), ns, manifest, entries);
         const uint64_t publish_sequence = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, manifest);
         writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, publish_sequence});
         gc = std::make_unique<Gc>(store, hexToU128("00000000000000000000000000000001"));
@@ -2563,13 +2964,14 @@ TEST(CASFsck, PresentPendingBodiesStopAtTheDeadline)
         ASSERT_TRUE(objectPresent(*f.backend, f.bodyKey(b))) << "fixture: the body is present";
         intent_keys.push_back(f.intentKey(b));
     }
+    const auto clock = VirtualRetryClock::installOn(f.store);
     const ToolDeadline deadline = fsckDeadlineIn(*f.store, std::chrono::seconds(1));
-    /// The pool's clock is the real one, so the first body `HEAD` waits for it to pass the deadline.
+    /// The first body `HEAD` moves the pool's virtual clock past the deadline.
     for (const uint64_t b : blobs)
-        f.backend->beforeHead(f.bodyKey(b), [&deadline] { spinPast(deadline); });
+        f.backend->beforeHead(f.bodyKey(b), [clock, &deadline] { advancePast(*clock, deadline); });
     f.backend->clearJournal();
 
-    expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, "during 'checking pending rows'", [&]
+    expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, "during 'head-checking retired bodies'", [&]
     {
         (void)runFsck(*f.store, /*detail=*/false, {}, deadline);
     });
@@ -2604,16 +3006,43 @@ TEST(CASFsck, DeadlinePassingDuringARowStopsBeforeTheNextRowsHead)
     FsckGcFixture f(/*create_budget=*/0, {1, 2});
     f.drop();
     f.round();
+    const auto clock = VirtualRetryClock::installOn(f.store);
     const ToolDeadline deadline = fsckDeadlineIn(*f.store, std::chrono::seconds(1));
     for (const uint64_t b : blobs)
-        f.backend->beforeRead(f.intentKey(b), 0, [&deadline] { spinPast(deadline); });
+        f.backend->beforeRead(f.intentKey(b), 0, [clock, &deadline] { advancePast(*clock, deadline); });
     f.backend->clearJournal();
 
-    expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, "during 'classifying unreferenced bodies'", [&]
+    expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, "during 'head-checking retired bodies'", [&]
     {
         (void)runFsck(*f.store, /*detail=*/false, {}, deadline);
     });
     EXPECT_EQ(bodyHeads(f, blobs), 1u) << "the second row's body HEAD was sent after the deadline";
+}
+
+/// A pending row whose body is already gone is checked after the bodies loop; a deadline passing there names that phase.
+TEST(CASFsck, DeadlinePassingInThePendingRowsPhaseNamesIt)
+{
+    FsckGcFixture f(/*create_budget=*/0, {1, 2});
+    f.drop();
+    f.round();
+    /// The intent key is derived from the live body, so it is taken before the body goes.
+    const std::vector<String> intents{f.intentKey(1), f.intentKey(2)};
+    f.removeBody(1);
+    f.removeBody(2);
+    const auto clock = VirtualRetryClock::installOn(f.store);
+    const ToolDeadline deadline = fsckDeadlineIn(*f.store, std::chrono::seconds(1));
+    for (const String & key : intents)
+        f.backend->beforeRead(key, 0, [clock, &deadline] { advancePast(*clock, deadline); });
+    f.backend->clearJournal();
+
+    expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, "during 'checking pending rows'", [&]
+    {
+        (void)runFsck(*f.store, /*detail=*/false, {}, deadline);
+    });
+    size_t intent_reads = 0;
+    for (const String & key : intents)
+        intent_reads += countKeyRequests(f.backend->journal(), JournalVerb::Read, key);
+    EXPECT_EQ(intent_reads, 1u) << "positive control: the first row was checked, the second was stopped";
 }
 
 /// A deadline that passes during the intent read stops the scan before the body `HEAD` that follows an absent intent.
@@ -2624,15 +3053,40 @@ TEST(CASFsck, DeadlinePassingDuringAnAbsentIntentReadStopsBeforeTheBodyHead)
     f.round();
     const String intent_key = f.intentKey(1);
     f.removeIntent(1);
+    const auto clock = VirtualRetryClock::installOn(f.store);
     const ToolDeadline deadline = fsckDeadlineIn(*f.store, std::chrono::seconds(1));
-    f.backend->beforeRead(intent_key, 0, [&deadline] { spinPast(deadline); });
+    f.backend->beforeRead(intent_key, 0, [clock, &deadline] { advancePast(*clock, deadline); });
     f.backend->clearJournal();
 
-    expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, "during 'checking pending rows'", [&]
+    expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, "during 'head-checking retired bodies'", [&]
     {
         (void)runFsck(*f.store, /*detail=*/false, {}, deadline);
     });
     EXPECT_EQ(bodyHeads(f, {1}), 1u) << "only the retired-body HEAD precedes the deadline; the pending check sent another";
+}
+
+/// A summary-only scan counts intents straight from the listing; a deadline refusing that listing names the counting phase.
+TEST(CASFsck, DeadlinePassingBeforeTheSummaryIntentListingNamesTheCountingPhase)
+{
+    FsckIntentFixture f;
+    f.staleIntent(1);
+    const auto clock = VirtualRetryClock::installOn(f.store);
+    const ToolDeadline deadline = fsckDeadlineIn(*f.store, std::chrono::seconds(1));
+    bool counting_started = false;
+    const FsckProgress passes_deadline = [&, clock](FsckProgressStep step, std::string_view phase, std::string_view, uint64_t, double)
+    {
+        if (step == FsckProgressStep::Start && phase == "counting blob intents")
+        {
+            counting_started = true;
+            advancePast(*clock, deadline);
+        }
+    };
+
+    expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, "during 'counting blob intents'", [&]
+    {
+        (void)runFsck(*f.store, /*detail=*/false, passes_deadline, deadline);
+    });
+    EXPECT_TRUE(counting_started) << "positive control: the counting phase started";
 }
 
 /// With intent verification, a deadline that passes during an intent's read stops the scan before that intent's body
@@ -2642,11 +3096,12 @@ TEST(CASFsck, DeadlinePassingDuringAVerifiedIntentReadStopsBeforeTheBodyHead)
     FsckIntentFixture f;
     f.body(1);
     const String intent = f.currentIntent(1);
+    const auto clock = VirtualRetryClock::installOn(f.store);
     const ToolDeadline deadline = fsckDeadlineIn(*f.store, std::chrono::seconds(1));
-    f.backend->beforeRead(intent, 0, [&deadline] { spinPast(deadline); });
+    f.backend->beforeRead(intent, 0, [clock, &deadline] { advancePast(*clock, deadline); });
     f.backend->clearJournal();
 
-    expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, "during 'reading blob intents'", [&]
+    expectThrowsCodeWithMessage(DB::ErrorCodes::TIMEOUT_EXCEEDED, "during 'verifying blob intents'", [&]
     {
         (void)runFsck(*f.store, /*detail=*/false, {}, deadline, /*partial_on_deadline=*/false, {},
                       /*fix_legacy_markers=*/false, /*verify_intents=*/true);
@@ -2697,15 +3152,16 @@ TEST(CASFsckPartial, TimeLeftShorterThanOneAttemptEndsIntentVerificationAsPartia
     plantIntentForCurrentBody(*backend, layout, blobRefOf(1));
     const String intent = *intentKeyOfCurrentBody(*backend, layout, blobRefOf(1));
     const String body = layout.blobKey(blobRefOf(1));
+    const auto clock = VirtualRetryClock::installOn(store);
     const ToolDeadline deadline = fsckDeadlineIn(*store, std::chrono::seconds(2));
-    backend->beforeRead(intent, 0, [&deadline] { spinUntilLeft(deadline, kFsckEnvelopeMs / 2); });
+    backend->beforeRead(intent, 0, [clock, &deadline] { advanceUntilLeft(*clock, deadline, kFsckEnvelopeMs / 2); });
     backend->clearJournal();
 
     const FsckReport report = runFsck(*store, /*detail=*/false, {}, deadline, /*partial_on_deadline=*/true, {},
                                       /*fix_legacy_markers=*/false, /*verify_intents=*/true);
 
     ASSERT_TRUE(report.partial) << formatFsckSummary(report);
-    EXPECT_NE(report.partial_reason.find("exceeded the deadline during 'reading blob intents'"), String::npos)
+    EXPECT_NE(report.partial_reason.find("exceeded the deadline during 'verifying blob intents'"), String::npos)
         << report.partial_reason;
     EXPECT_EQ(report.intent_unread, 0u) << formatFsckSummary(report);
     const auto journal = backend->journal();
@@ -2723,16 +3179,17 @@ TEST(CASFsckPartial, AReadFailingWithLessThanOneAttemptLeftEndsTheScanAsPartial)
     writeBlobBody(*backend, layout, numberedBlobHash(1));
     plantIntentForCurrentBody(*backend, layout, blobRefOf(1));
     const String intent = *intentKeyOfCurrentBody(*backend, layout, blobRefOf(1));
+    const auto clock = VirtualRetryClock::installOn(store);
     const ToolDeadline deadline = fsckDeadlineIn(*store, std::chrono::seconds(2));
     backend->timed_out_reads.insert(intent);
-    backend->beforeRead(intent, 0, [&deadline] { spinUntilLeft(deadline, kFsckEnvelopeMs / 2); });
+    backend->beforeRead(intent, 0, [clock, &deadline] { advanceUntilLeft(*clock, deadline, kFsckEnvelopeMs / 2); });
     backend->clearJournal();
 
     const FsckReport report = runFsck(*store, /*detail=*/false, {}, deadline, /*partial_on_deadline=*/true, {},
                                       /*fix_legacy_markers=*/false, /*verify_intents=*/true);
 
     ASSERT_TRUE(report.partial) << formatFsckSummary(report);
-    EXPECT_NE(report.partial_reason.find("exceeded the deadline during 'reading blob intents'"), String::npos)
+    EXPECT_NE(report.partial_reason.find("exceeded the deadline during 'verifying blob intents'"), String::npos)
         << report.partial_reason;
     EXPECT_EQ(report.intent_unread, 0u) << formatFsckSummary(report);
     EXPECT_EQ(countKeyRequests(backend->journal(), JournalVerb::Read, intent), 1u) << "positive control: the intent read was sent";
@@ -2747,11 +3204,12 @@ TEST(CASFsckPartial, TimeLeftShorterThanOneAttemptEndsTheRefWalkAsPartial)
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/envelope_deadline@cas@"};
     const NamespaceLifeId life = writeFsckFixtureWithTail(*backend, layout, ns);
+    const auto clock = VirtualRetryClock::installOn(store);
     const ToolDeadline deadline = fsckDeadlineIn(*store, std::chrono::seconds(2));
     bool spun = false;
     backend->armOnFirstGet(layout.refLogKey(life, RefTxnId{1, 2}), [&]
     {
-        spinUntilLeft(deadline, kFsckEnvelopeMs / 2);
+        advanceUntilLeft(*clock, deadline, kFsckEnvelopeMs / 2);
         spun = true;
     });
 
@@ -2759,7 +3217,7 @@ TEST(CASFsckPartial, TimeLeftShorterThanOneAttemptEndsTheRefWalkAsPartial)
 
     ASSERT_TRUE(spun) << "positive control: the walk read the tail log";
     ASSERT_TRUE(report.partial) << formatFsckSummary(report);
-    EXPECT_NE(report.partial_reason.find("exceeded the deadline during 'ref stream'"), String::npos) << report.partial_reason;
+    EXPECT_NE(report.partial_reason.find("exceeded the deadline during 'walking refs'"), String::npos) << report.partial_reason;
     EXPECT_EQ(report.unchecked, 0u) << formatFsckSummary(report);
     EXPECT_FALSE(anyNoteContains(report, "could not")) << formatFsckSummary(report);
 }
@@ -2880,7 +3338,13 @@ TEST(CASFsck, RunPrunedUnderAMovedStateIsReadFromTheNewState)
     });
     f.backend->clearJournal();
 
-    const FsckReport rep = runFsck(*f.store, /*detail=*/true);
+    std::optional<FsckReport> scanned;
+    {
+        ScopedLogCapture forced("ForcedCriticalErrorsLogger", "error");
+        scanned = runFsck(*f.store, /*detail=*/true);
+        EXPECT_EQ(forced.prioritiesOf("is absent").size(), 0u) << forced.captured();
+    }
+    const FsckReport & rep = *scanned;
 
     ASSERT_GE(pruned, 1u) << "the scan never read a run";
     const std::vector<RunRef> new_runs = adoptedRunsOf(f);
@@ -2936,15 +3400,44 @@ TEST(CASGcPreview, RunPrunedUnderAMovedStateIsPreviewedFromTheNewState)
             pruneUnderTheReader(f, 2, key);
     });
 
-    const Gc::DeletePreview racing = f.gc->previewDeletes();
+    std::optional<Gc::DeletePreview> previewed;
+    {
+        ScopedLogCapture forced("ForcedCriticalErrorsLogger", "error");
+        previewed = f.gc->previewDeletes();
+        EXPECT_EQ(forced.prioritiesOf("is absent").size(), 0u) << forced.captured();
+    }
+    const Gc::DeletePreview & racing = *previewed;
 
     ASSERT_GE(pruned, 1u) << "the preview never read a run";
     EXPECT_TRUE(racing.refused_shards.empty()) << racing.refused_shards.front();
     EXPECT_TRUE(racing.unread.empty()) << racing.unread;
+    EXPECT_EQ(racing.snapshot, Gc::SnapshotVerdict::Adopted);
     f.backend->beforeEachStream("/blob_target/", {});
     const Gc::DeletePreview settled = f.gc->previewDeletes();
     EXPECT_TRUE(previewedKeys(settled).contains("pending " + f.bodyKey(2))) << "positive control: blob 2 is condemned";
     EXPECT_EQ(previewedKeys(racing), previewedKeys(settled));
+}
+
+/// A run absent under an unchanged `gc/state` is a refused shard named by today's text, and nothing logs it.
+TEST(CASGcPreview, RunAbsentUnderAnUnchangedStateIsARefusedShard)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    const std::vector<RunRef> runs = adoptedRunsOf(f);
+    ASSERT_EQ(runs.size(), 1u);
+    removeFsckFixtureKey(*f.backend, runs.front().key);
+
+    std::optional<Gc::DeletePreview> previewed;
+    {
+        ScopedLogCapture forced("ForcedCriticalErrorsLogger", "error");
+        previewed = f.gc->previewDeletes();
+        EXPECT_EQ(forced.prioritiesOf("is absent").size(), 0u) << forced.captured();
+    }
+
+    ASSERT_EQ(previewed->refused_shards.size(), 1u);
+    EXPECT_EQ(previewed->refused_shards.front(), "CAS source-edge run: object " + runs.front().key + " is absent");
+    EXPECT_TRUE(previewed->unread.empty()) << previewed->unread;
 }
 
 /// `gc/state` moves before every read of a run: the dry run is unread, not a refused shard.
@@ -2968,6 +3461,314 @@ TEST(CASGcPreview, StateMovingAtEveryRunReadLeavesThePreviewUnread)
     EXPECT_TRUE(preview.refused_shards.empty()) << preview.refused_shards.front();
     EXPECT_TRUE(preview.deletes.empty());
     EXPECT_NE(preview.unread.find("gc/state moved"), String::npos) << preview.unread;
+    EXPECT_EQ(preview.snapshot, Gc::SnapshotVerdict::Unread);
+}
+
+/// No `gc/state`, and a generation-0 `gc/state` with no seal, are a pool with no baseline: nothing was adopted.
+TEST(CASGcPreview, NoStateAndGenerationZeroWithoutSealAreNoBaseline)
+{
+    FsckIntentFixture f;
+    Gc gc(f.store, DB::UInt128(1));
+    const auto expect_no_baseline = [&](const Gc::DeletePreview & preview)
+    {
+        EXPECT_EQ(preview.snapshot, Gc::SnapshotVerdict::NoBaseline);
+        EXPECT_TRUE(preview.deletes.empty());
+        EXPECT_TRUE(preview.refused_shards.empty());
+        EXPECT_TRUE(preview.unread.empty()) << preview.unread;
+        EXPECT_TRUE(preview.missing_seal.empty()) << preview.missing_seal;
+    };
+    expect_no_baseline(gc.previewDeletes());
+
+    GcState state;
+    state.header_generation = G_BLOB_INTENTS;
+    state.gc_shards = f.store->poolConfig().gc_shards;
+    OperationForTest op(*f.backend);
+    ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(f.layout.gcStateKey(), encodeGcState(state), Retry::standard())));
+    expect_no_baseline(gc.previewDeletes());
+}
+
+/// A read snapshot is `Adopted` also when it holds no row to delete.
+TEST(CASGcPreview, ReadSnapshotIsAdoptedAlsoWhenEmpty)
+{
+    FsckGcFixture f;
+    const Gc::DeletePreview live = f.gc->previewDeletes();
+    EXPECT_EQ(live.snapshot, Gc::SnapshotVerdict::Adopted);
+    EXPECT_TRUE(live.deletes.empty());
+
+    f.drop();
+    f.round();
+    const Gc::DeletePreview dropped = f.gc->previewDeletes();
+    EXPECT_EQ(dropped.snapshot, Gc::SnapshotVerdict::Adopted);
+    EXPECT_TRUE(previewedKeys(dropped).contains("pending " + f.bodyKey(1))) << "positive control: the dropped blob is condemned";
+}
+
+/// The seal `gc/state` names is absent and `gc/state` did not move: damage, confirmed by one `HEAD` of `gc/state`.
+TEST(CASGcPreview, MissingSealUnderUnchangedStateIsReported)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    const String seal_key = adoptedSealKeyOf(f);
+    removeFsckFixtureKey(*f.backend, seal_key);
+    f.backend->clearJournal();
+
+    const Gc::DeletePreview preview = f.gc->previewDeletes();
+
+    EXPECT_EQ(preview.snapshot, Gc::SnapshotVerdict::SealMissing);
+    EXPECT_TRUE(preview.deletes.empty());
+    EXPECT_TRUE(preview.unread.empty()) << preview.unread;
+    EXPECT_TRUE(preview.refused_shards.empty());
+    EXPECT_NE(preview.missing_seal.find(seal_key), String::npos) << preview.missing_seal;
+    EXPECT_NE(preview.missing_seal.find("generation"), String::npos) << preview.missing_seal;
+    EXPECT_EQ(countKeyRequests(f.backend->journal(), JournalVerb::Head, f.store->layout().gcStateKey()), 1u);
+}
+
+/// The confirming `HEAD` of `gc/state` fails: the error propagates, no verdict is returned.
+TEST(CASGcPreview, ConfirmationHeadErrorPropagates)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    removeFsckFixtureKey(*f.backend, adoptedSealKeyOf(f));
+    f.backend->refused_heads.insert(f.store->layout().gcStateKey());
+
+    EXPECT_THROW(static_cast<void>(f.gc->previewDeletes()), DB::Exception);
+}
+
+/// A round prunes the seal being read and moves `gc/state`: the preview reads the seal of the new state.
+TEST(CASGcPreview, MissingSealPrunedUnderAMovedStateIsReadFromTheNewState)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    writeBlobBody(*f.backend, f.store->layout(), numberedBlobHash(2));
+    const String old_seal = adoptedSealKeyOf(f);
+    String new_seal;
+    bool fired = false;
+    f.backend->beforeRead(old_seal, 0, [&]
+    {
+        fired = true;
+        pruneUnderTheReader(f, 2, old_seal);
+        new_seal = adoptedSealKeyOf(f);
+    });
+    f.backend->clearJournal();
+
+    const Gc::DeletePreview preview = f.gc->previewDeletes();
+
+    ASSERT_TRUE(fired) << "the preview never read the seal";
+    ASSERT_NE(new_seal, old_seal) << "positive control: the round moved gc/state";
+    ASSERT_FALSE(objectPresent(*f.backend, old_seal)) << "positive control: the old seal is gone";
+    EXPECT_EQ(preview.snapshot, Gc::SnapshotVerdict::Adopted);
+    EXPECT_TRUE(preview.missing_seal.empty()) << preview.missing_seal;
+    EXPECT_GE(countKeyRequests(f.backend->journal(), JournalVerb::Read, new_seal), 1u);
+}
+
+/// `gc/state` moves before every read of the seal and the seal just read is gone each time: unread, not damaged.
+TEST(CASGcPreview, MissingSealUnderAStateMovingAtEveryReadIsUnread)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    for (uint64_t b = 2; b < 2 + kAdoptedSnapshotReadAttempts + 1; ++b)
+        writeBlobBody(*f.backend, f.store->layout(), numberedBlobHash(b));
+    size_t fired = 0;
+    std::function<void(const String &)> arm = [&](const String & seal)
+    {
+        f.backend->beforeRead(seal, 0, [&, seal]
+        {
+            pruneUnderTheReader(f, 2 + fired, seal);
+            ++fired;
+            const String next = adoptedSealKeyOf(f);
+            ASSERT_NE(next, seal) << "the round did not move gc/state";
+            arm(next);
+        });
+    };
+    arm(adoptedSealKeyOf(f));
+
+    const Gc::DeletePreview preview = f.gc->previewDeletes();
+
+    EXPECT_EQ(fired, kAdoptedSnapshotReadAttempts);
+    EXPECT_EQ(preview.snapshot, Gc::SnapshotVerdict::Unread);
+    EXPECT_NE(preview.unread.find("gc/state moved"), String::npos) << preview.unread;
+    EXPECT_TRUE(preview.missing_seal.empty()) << preview.missing_seal;
+    EXPECT_TRUE(preview.deletes.empty());
+}
+
+/// `gc/state` vanishes together with the seal while the preview confirms: unread, never "no baseline".
+TEST(CASGcPreview, StateVanishingWhileConfirmingIsUnread)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    const String seal = adoptedSealKeyOf(f);
+    bool fired = false;
+    f.backend->beforeRead(seal, 0, [&]
+    {
+        fired = true;
+        removeFsckFixtureKey(*f.backend, seal);
+        removeFsckFixtureKey(*f.backend, f.store->layout().gcStateKey());
+    });
+
+    const Gc::DeletePreview preview = f.gc->previewDeletes();
+
+    ASSERT_TRUE(fired) << "the preview never read the seal";
+    EXPECT_EQ(preview.snapshot, Gc::SnapshotVerdict::Unread);
+    EXPECT_NE(preview.unread.find("vanished"), String::npos) << preview.unread;
+    EXPECT_TRUE(preview.deletes.empty());
+}
+
+namespace
+{
+/// Arms `f` so that the next read of `gc/state` finds a fresh generation-zero state: a new GC leader's first write.
+void recreateGenerationZeroStateOnNextRead(FsckGcFixture & f)
+{
+    f.backend->beforeRead(f.store->layout().gcStateKey(), 0, [&f]
+    {
+        GcState fresh;
+        fresh.header_generation = G_BLOB_INTENTS;
+        fresh.gc_shards = f.store->poolConfig().gc_shards;
+        OperationForTest op(*f.backend);
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(f.store->layout().gcStateKey(), encodeGcState(fresh), Retry::standard())));
+    });
+}
+}
+
+/// `gc/state` vanishes and a fresh generation-zero state appears before the next read: this dry run saw a live state
+/// disappear, so the result is unread, never "no baseline".
+TEST(CASGcPreview, StateVanishingAndRecreatedAfterAMissingSealIsUnread)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    const String seal = adoptedSealKeyOf(f);
+    bool fired = false;
+    f.backend->beforeRead(seal, 0, [&]
+    {
+        fired = true;
+        removeFsckFixtureKey(*f.backend, seal);
+        removeFsckFixtureKey(*f.backend, f.store->layout().gcStateKey());
+        recreateGenerationZeroStateOnNextRead(f);
+    });
+
+    const Gc::DeletePreview preview = f.gc->previewDeletes();
+
+    ASSERT_TRUE(fired) << "the preview never read the seal";
+    EXPECT_EQ(preview.snapshot, Gc::SnapshotVerdict::Unread);
+    EXPECT_NE(preview.unread.find("vanished"), String::npos) << preview.unread;
+    EXPECT_TRUE(preview.deletes.empty());
+}
+
+/// Same schedule with a refused shard instead of a missing seal.
+TEST(CASGcPreview, StateVanishingAndRecreatedAfterARefusedShardIsUnread)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    bool fired = false;
+    f.backend->beforeEachStream("/blob_target/", [&](const String & key)
+    {
+        if (fired)
+            return;
+        fired = true;
+        removeFsckFixtureKey(*f.backend, key);
+        removeFsckFixtureKey(*f.backend, f.store->layout().gcStateKey());
+        recreateGenerationZeroStateOnNextRead(f);
+    });
+
+    const Gc::DeletePreview preview = f.gc->previewDeletes();
+
+    ASSERT_TRUE(fired) << "the preview never read a run";
+    EXPECT_EQ(preview.snapshot, Gc::SnapshotVerdict::Unread);
+    EXPECT_NE(preview.unread.find("vanished"), String::npos) << preview.unread;
+    EXPECT_TRUE(preview.refused_shards.empty());
+}
+
+namespace
+{
+/// Replaces `gc/state` with a fresh generation-zero state at once: a new GC leader's first write landing between two requests.
+void replaceStateWithGenerationZero(FsckGcFixture & f)
+{
+    removeFsckFixtureKey(*f.backend, f.store->layout().gcStateKey());
+    GcState fresh;
+    fresh.header_generation = G_BLOB_INTENTS;
+    fresh.gc_shards = f.store->poolConfig().gc_shards;
+    OperationForTest op(*f.backend);
+    ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(f.store->layout().gcStateKey(), encodeGcState(fresh), Retry::standard())));
+}
+}
+
+/// A fresh generation-zero `gc/state` appears before the confirming `HEAD`, so the `HEAD` sees a present, different
+/// token: the preview already read a positive generation, so a lower one is unread, never "no baseline".
+TEST(CASGcPreview, StateRecreatedAtGenerationZeroBeforeTheConfirmationIsUnread)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    const String seal = adoptedSealKeyOf(f);
+    bool fired = false;
+    f.backend->beforeRead(seal, 0, [&]
+    {
+        fired = true;
+        removeFsckFixtureKey(*f.backend, seal);
+        f.backend->beforeHead(f.store->layout().gcStateKey(), [&] { replaceStateWithGenerationZero(f); });
+    });
+
+    const Gc::DeletePreview preview = f.gc->previewDeletes();
+
+    ASSERT_TRUE(fired) << "the preview never read the seal";
+    EXPECT_EQ(preview.snapshot, Gc::SnapshotVerdict::Unread);
+    EXPECT_NE(preview.unread.find("generation"), String::npos) << preview.unread;
+    EXPECT_TRUE(preview.deletes.empty());
+}
+
+/// Same schedule with a refused shard instead of a missing seal.
+TEST(CASGcPreview, StateRecreatedAtGenerationZeroBeforeTheRefusalConfirmationIsUnread)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    bool fired = false;
+    f.backend->beforeEachStream("/blob_target/", [&](const String & key)
+    {
+        if (fired)
+            return;
+        fired = true;
+        removeFsckFixtureKey(*f.backend, key);
+        f.backend->beforeHead(f.store->layout().gcStateKey(), [&] { replaceStateWithGenerationZero(f); });
+    });
+
+    const Gc::DeletePreview preview = f.gc->previewDeletes();
+
+    ASSERT_TRUE(fired) << "the preview never read a run";
+    EXPECT_EQ(preview.snapshot, Gc::SnapshotVerdict::Unread);
+    EXPECT_NE(preview.unread.find("generation"), String::npos) << preview.unread;
+    EXPECT_TRUE(preview.refused_shards.empty());
+}
+
+/// Control: a seal that is present but undecodable keeps its own `CORRUPTED_DATA`; only absence is labelled `SealMissing`.
+TEST(CASGcPreview, UndecodableSealStillPropagates)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    const String seal_key = adoptedSealKeyOf(f);
+    {
+        OperationForTest op(*f.backend);
+        const auto current = (*op).read(seal_key, Retry::standard());
+        ASSERT_TRUE(current.has_value());
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).replace(seal_key, "truncated", current->etag, Retry::once())));
+    }
+
+    try
+    {
+        static_cast<void>(f.gc->previewDeletes());
+        FAIL() << "an undecodable seal did not throw";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA) << e.message();
+        EXPECT_NE(e.message().find("line without terminator"), String::npos) << e.message();
+    }
 }
 
 /// A run absent under an unchanged `gc/state` is one finding; the blobs of its shard are not examined, while the other
@@ -2982,6 +3783,280 @@ TEST(CASFsck, BlobsOfARefusedShardAreNotExamined)
     FsckGcFixture f(/*create_budget=*/0, {in_shard[0], in_shard[1]}, shards);
     f.drop();
     f.round();
+    std::vector<String> removed;
+    for (const RunRef & run : adoptedRunsOf(f))
+        if (run.shard == 1)
+        {
+            removeFsckFixtureKey(*f.backend, run.key);
+            removed.push_back(run.key);
+        }
+    ASSERT_FALSE(removed.empty());
+
+    std::optional<FsckReport> scanned;
+    {
+        ScopedLogCapture forced("ForcedCriticalErrorsLogger", "error");
+        scanned = runFsck(*f.store, /*detail=*/true);
+        EXPECT_EQ(forced.prioritiesOf("is absent").size(), 0u) << forced.captured();
+    }
+    const FsckReport & rep = *scanned;
+
+    EXPECT_EQ(rep.corrupted_runs, 1u) << formatFsckSummary(rep);
+    const auto corrupted = std::find_if(rep.objects.begin(), rep.objects.end(),
+        [&](const FsckObject & object) { return object.key == removed.front() && object.cls == FsckClass::CorruptedRun; });
+    ASSERT_NE(corrupted, rep.objects.end()) << formatFsckSummary(rep);
+    EXPECT_EQ(corrupted->reachable_from, std::vector<String>{"CAS source-edge run: object " + removed.front() + " is absent"});
+    EXPECT_EQ(rep.unaccounted, 0u) << formatFsckSummary(rep);
+    EXPECT_EQ(countVerdictsAtKey(rep, f.bodyKey(in_shard[1]), FsckClass::Unchecked), 1u);
+    EXPECT_EQ(countVerdictsAtKey(rep, f.bodyKey(in_shard[0]), FsckClass::PendingGc), 1u) << "positive control: shard 0 was read";
+}
+
+namespace
+{
+const RootNamespace kBaitNs{"00/bb@cas@"};
+
+/// Committed refs over numbered blobs on a pool whose GC rounds the test runs itself.
+struct StaleEdgeFixture
+{
+    std::shared_ptr<MutateOnFirstGetBackend> backend = std::make_shared<MutateOnFirstGetBackend>();
+    PoolPtr store;
+    Gc gc;
+    uint64_t next_ref = 1;
+
+    explicit StaleEdgeFixture(uint64_t gc_shards = 1)
+        : store(Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_shards = gc_shards}))
+        , gc(store, hexToU128("00000000000000000000000000000001"))
+    {
+    }
+    struct Published
+    {
+        RootNamespace ns;
+        ManifestRef manifest;
+        ManifestId id;
+    };
+    std::map<String, Published> refs;
+
+    const Layout & layout() const { return store->layout(); }
+    String bodyKey(uint64_t b) const { return layout().blobKey(blobRefOf(b)); }
+    String manifestKeyOf(const String & name) const { return layout().manifestKey(refs.at(name).id); }
+
+    void checkpointThrough(const RootNamespace & ns, uint64_t sequence)
+    {
+        writeFsckCheckpoint(*backend, layout(), ns, RefTxnId{1, sequence});
+    }
+
+    /// A namespace holding a real stale edge keeps GC from folding anything beside it, so a round that has to fold
+    /// another ref's drop needs a namespace of its own.
+    void publish(const String & name, std::initializer_list<uint64_t> blobs, const RootNamespace & ns = RootNamespace{"00/aa@cas@"})
+    {
+        std::vector<ManifestEntry> entries;
+        for (const uint64_t b : blobs)
+        {
+            if (!objectPresent(*backend, bodyKey(b)))
+                writeBlobBody(*backend, layout(), numberedBlobHash(b));
+            entries.push_back(blobEntryFor("f" + std::to_string(b), numberedBlobHash(b)));
+        }
+        const ManifestRef manifest = ref(next_ref, 0xA0 + next_ref);
+        ++next_ref;
+        const ManifestId id = writeManifestRaw(*backend, layout(), ns, manifest, entries);
+        checkpointThrough(ns, publishCommittedTransition(*backend, layout(), ns, name, std::nullopt, manifest));
+        refs[name] = {ns, manifest, id};
+    }
+
+    void drop(const String & name)
+    {
+        const Published & p = refs.at(name);
+        checkpointThrough(p.ns, dropRefTransition(*backend, layout(), p.ns, name, p.manifest));
+    }
+
+    void removeManifestBody(const String & name) { deleteManifestBody(*backend, layout(), refs.at(name).id); }
+
+    /// Runs `mutation` at the first read of the named manifest's body: the scan's manifest pass, after its first `gc/state` read.
+    void armDuringManifestPass(const String & name, std::function<void()> mutation)
+    {
+        backend->armOnFirstGet(manifestKeyOf(name), std::move(mutation));
+    }
+
+    String gcStateBytes() const
+    {
+        OperationForTest op(*backend);
+        return (*op).read(layout().gcStateKey(), Retry::standard())->bytes;
+    }
+
+    /// A round, with proof that it committed a new `gc/state`.
+    void roundThatMovesTheState()
+    {
+        const String before = gcStateBytes();
+        gc.runRegularRound();
+        ASSERT_NE(before, gcStateBytes()) << "the round did not commit";
+    }
+
+    /// Removes the runs the adopted seal names, of every shard or of `shard` only, and returns their keys.
+    std::vector<String> removeAdoptedRuns(std::optional<uint64_t> shard = {})
+    {
+        const GcState state = decodeGcState(gcStateBytes());
+        OperationForTest op(*backend);
+        const auto seal = (*op).read(layout().foldSealKey(state.snap_generation, state.snap_attempt), Retry::standard());
+        std::vector<String> removed;
+        for (const RunRef & run : decodeFoldSeal(seal->bytes, state.snap_generation).blob_target_runs)
+            if (!shard || run.shard == *shard)
+            {
+                removeFsckFixtureKey(*backend, run.key);
+                removed.push_back(run.key);
+            }
+        return removed;
+    }
+
+    /// Replaces `gc/state` with a fresh one at snapshot generation zero, as a state recreated from nothing.
+    void recreateGcStateAtGenerationZero()
+    {
+        OperationForTest op(*backend);
+        const auto current = (*op).read(layout().gcStateKey(), Retry::standard());
+        GcState fresh;
+        fresh.gc_shards = decodeGcState(current->bytes).gc_shards;
+        ASSERT_TRUE(std::holds_alternative<Committed>(
+            (*op).replace(layout().gcStateKey(), encodeGcState(fresh), current->etag, Retry::once())));
+    }
+};
+
+/// The first blob numbers from 1 up that fall in each of `shards` GC shards.
+std::vector<uint64_t> firstBlobOfEachShard(uint64_t shards)
+{
+    std::vector<uint64_t> in_shard(shards, 0);
+    for (uint64_t b = 1, found = 0; found < shards; ++b)
+        if (!in_shard[blobShard(blobRefOf(b), shards)])
+        {
+            in_shard[blobShard(blobRefOf(b), shards)] = b;
+            ++found;
+        }
+    return in_shard;
+}
+}
+
+/// A round that commits between the scan's two `gc/state` reads cannot fold an edge whose manifest body is
+/// already gone: the edge is still held by the second read and is reported.
+TEST(CASFsck, RealStaleEdgeSurvivesARoundBetweenTheTwoReads)
+{
+    StaleEdgeFixture f;
+    f.publish("live", {2});
+    f.publish("stale", {1});
+    f.publish("bait", {2}, kBaitNs);   /// shares blob 2 with `live`, so its drop leaves no candidate of its own
+    f.gc.runRegularRound();
+    f.drop("stale");
+    f.drop("bait");
+    f.removeManifestBody("stale");
+    bool round_ran = false;
+    f.armDuringManifestPass("bait", [&]
+    {
+        f.roundThatMovesTheState();
+        round_ran = true;
+    });
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true);
+
+    ASSERT_TRUE(round_ran) << "the manifest pass read the bait body";
+    EXPECT_EQ(rep.stale_edge, 1u);
+    EXPECT_EQ(rep.stale_edge_superseded, 0u);
+    EXPECT_EQ(countVerdictsAtKey(rep, f.bodyKey(1), FsckClass::StaleEdge), 1u);
+    EXPECT_FALSE(rep.clean());
+}
+
+/// Of two candidates only the one whose edge the round folded is superseded; the other is reported. A round holds
+/// back body deletes while a stale edge exists, so the test removes the folded ref's body itself.
+TEST(CASFsck, OnlyTheCandidateTheRoundFoldedIsSuperseded)
+{
+    StaleEdgeFixture f;
+    f.publish("live", {2});
+    f.publish("stale", {1});
+    f.publish("bait", {3}, kBaitNs);
+    f.gc.runRegularRound();
+    f.drop("stale");
+    f.drop("bait");
+    f.removeManifestBody("stale");
+    bool round_ran = false;
+    f.armDuringManifestPass("bait", [&]
+    {
+        f.roundThatMovesTheState();
+        f.removeManifestBody("bait");
+        round_ran = true;
+    });
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true);
+
+    ASSERT_TRUE(round_ran);
+    EXPECT_EQ(rep.stale_edge, 1u);
+    EXPECT_EQ(rep.stale_edge_superseded, 1u);
+    EXPECT_EQ(countVerdictsAtKey(rep, f.bodyKey(1), FsckClass::StaleEdge), 1u);
+    EXPECT_EQ(countVerdictsAtKey(rep, f.bodyKey(3), FsckClass::StaleEdge), 0u);
+}
+
+/// A blob with two source edges, one folded by the round and one not: the held edge is reported, and only it is counted.
+TEST(CASFsck, CandidateWithSomeSourcesFoldedIsReportedForTheHeldOnes)
+{
+    StaleEdgeFixture f;
+    f.publish("stale", {1});
+    f.publish("bait", {1}, kBaitNs);
+    f.gc.runRegularRound();
+    f.drop("stale");
+    f.drop("bait");
+    f.removeManifestBody("stale");
+    bool round_ran = false;
+    f.armDuringManifestPass("bait", [&]
+    {
+        f.roundThatMovesTheState();
+        f.removeManifestBody("bait");
+        round_ran = true;
+    });
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true);
+
+    ASSERT_TRUE(round_ran);
+    EXPECT_EQ(rep.stale_edge, 1u);
+    EXPECT_EQ(rep.stale_edge_superseded, 0u);
+    EXPECT_TRUE(anyNoteContains(rep, FsckClass::StaleEdge, "all 1 source edges")) << "only the held source is listed";
+    EXPECT_FALSE(rep.clean());
+}
+
+/// The second read cannot speak for the candidate's shard: whether a round folded the edge is unknown, which is a
+/// hard `intent_unread`, not a stale edge and not a superseded one.
+TEST(CASFsck, UnreadableRereadOfTheCandidatesShardIsIntentUnread)
+{
+    StaleEdgeFixture f;
+    f.publish("live", {2});
+    f.publish("stale", {1});
+    f.publish("bait", {3}, kBaitNs);
+    f.gc.runRegularRound();
+    f.drop("stale");
+    f.drop("bait");
+    f.removeManifestBody("stale");
+    bool runs_removed = false;
+    f.armDuringManifestPass("bait", [&]
+    {
+        f.removeAdoptedRuns();
+        runs_removed = true;
+    });
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true);
+
+    ASSERT_TRUE(runs_removed);
+    EXPECT_EQ(rep.stale_edge, 0u);
+    EXPECT_EQ(rep.stale_edge_superseded, 0u);
+    EXPECT_EQ(rep.intent_unread, 1u);
+    EXPECT_EQ(countVerdictsAtKey(rep, f.bodyKey(1), FsckClass::IntentUnread), 1u);
+    EXPECT_FALSE(rep.clean());
+}
+
+/// A run that stays unreadable in one shard is that shard's own finding; a real stale edge in another shard is still
+/// reported.
+TEST(CASFsck, StaleEdgeInAReadShardIsReportedBesideARefusedShard)
+{
+    constexpr uint64_t shards = 2;
+    uint64_t in_shard[shards] = {0, 0};
+    for (uint64_t b = 1; !in_shard[0] || !in_shard[1]; ++b)
+        if (!in_shard[blobShard(blobRefOf(b), shards)])
+            in_shard[blobShard(blobRefOf(b), shards)] = b;
+    FsckGcFixture f(/*create_budget=*/0, {in_shard[0], in_shard[1]}, shards);
+    f.drop();
+    deleteManifestBody(*f.backend, f.store->layout(), f.manifest_id);
     for (const RunRef & run : adoptedRunsOf(f))
         if (run.shard == 1)
             removeFsckFixtureKey(*f.backend, run.key);
@@ -2989,9 +4064,118 @@ TEST(CASFsck, BlobsOfARefusedShardAreNotExamined)
     const FsckReport rep = runFsck(*f.store, /*detail=*/true);
 
     EXPECT_EQ(rep.corrupted_runs, 1u) << formatFsckSummary(rep);
-    EXPECT_EQ(rep.unaccounted, 0u) << formatFsckSummary(rep);
+    EXPECT_EQ(rep.stale_edge, 1u) << formatFsckSummary(rep);
+    EXPECT_EQ(rep.intent_unread, 0u) << formatFsckSummary(rep);
+    EXPECT_EQ(countVerdictsAtKey(rep, f.bodyKey(in_shard[0]), FsckClass::StaleEdge), 1u);
     EXPECT_EQ(countVerdictsAtKey(rep, f.bodyKey(in_shard[1]), FsckClass::Unchecked), 1u);
-    EXPECT_EQ(countVerdictsAtKey(rep, f.bodyKey(in_shard[0]), FsckClass::PendingGc), 1u) << "positive control: shard 0 was read";
+}
+
+/// A deadline that passes during the second read leaves the candidate unconfirmed: a partial report counts no stale
+/// edge and shows no row for it.
+TEST(CASFsck, DeadlineDuringTheRereadLeavesNoUnconfirmedStaleEdge)
+{
+    FsckGcFixture f;
+    f.drop();
+    deleteManifestBody(*f.backend, f.store->layout(), f.manifest_id);
+    const FsckReport control = runFsck(*f.store, /*detail=*/true);
+    ASSERT_EQ(control.stale_edge, 1u) << "positive control: the edge is stale without a deadline";
+
+    OperationForTest op(*f.backend);
+    const GcState state = decodeGcState((*op).read(f.store->layout().gcStateKey(), Retry::standard())->bytes);
+    const String seal_key = f.store->layout().foldSealKey(state.snap_generation, state.snap_attempt);
+    const auto clock = VirtualRetryClock::installOn(f.store);
+    const ToolDeadline deadline = fsckDeadlineIn(*f.store, std::chrono::seconds(1));
+    bool fired = false;
+    f.backend->beforeRead(seal_key, /*skip=*/1, [&]
+    {
+        clock->advance(2000);
+        fired = true;
+    });
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true, {}, deadline, /*partial_on_deadline=*/true);
+
+    ASSERT_TRUE(fired) << "the second read of the seal never ran";
+    EXPECT_TRUE(rep.partial);
+    EXPECT_EQ(rep.stale_edge, 0u);
+    EXPECT_EQ(countVerdictsAtKey(rep, f.bodyKey(1), FsckClass::StaleEdge), 0u);
+}
+
+/// A round between the two reads folds the candidate in one shard, and a run of the other shard is then missing: the
+/// re-read confirms that refusal under a `gc/state` that did not move, so it is a finding of the scan.
+TEST(CASFsck, RunRefusalConfirmedByTheRereadIsReported)
+{
+    const std::vector<uint64_t> in_shard = firstBlobOfEachShard(2);
+    StaleEdgeFixture f(/*gc_shards=*/2);
+    f.publish("live", {in_shard[1]});
+    f.publish("bait", {in_shard[0]}, kBaitNs);
+    f.gc.runRegularRound();
+    f.drop("bait");
+    std::vector<String> removed;
+    f.armDuringManifestPass("bait", [&]
+    {
+        f.roundThatMovesTheState();
+        removed = f.removeAdoptedRuns(/*shard=*/1);
+    });
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true);
+
+    ASSERT_EQ(removed.size(), 1u) << "the round's seal names one run of shard 1";
+    EXPECT_EQ(rep.stale_edge_superseded, 1u) << "positive control: the re-read ran and folded the candidate";
+    EXPECT_EQ(rep.corrupted_runs, 1u) << formatFsckSummary(rep);
+    EXPECT_EQ(countVerdictsAtKey(rep, removed.front(), FsckClass::CorruptedRun), 1u);
+    EXPECT_FALSE(rep.clean());
+}
+
+/// A run both reads refuse is one finding: counted once and listed once.
+TEST(CASFsck, RunRefusedByBothReadsIsCountedOnce)
+{
+    const std::vector<uint64_t> in_shard = firstBlobOfEachShard(2);
+    FsckGcFixture f(/*create_budget=*/0, {in_shard[0], in_shard[1]}, /*gc_shards=*/2);
+    f.drop();
+    deleteManifestBody(*f.backend, f.store->layout(), f.manifest_id);
+    std::vector<String> removed;
+    for (const RunRef & run : adoptedRunsOf(f))
+        if (run.shard == 1)
+        {
+            removeFsckFixtureKey(*f.backend, run.key);
+            removed.push_back(run.key);
+        }
+    ASSERT_EQ(removed.size(), 1u);
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true);
+
+    EXPECT_EQ(rep.stale_edge, 1u) << "positive control: the stale candidate made the scan re-read the snapshot";
+    EXPECT_EQ(rep.corrupted_runs, 1u) << formatFsckSummary(rep);
+    EXPECT_EQ(countVerdictsAtKey(rep, removed.front(), FsckClass::CorruptedRun), 1u);
+}
+
+/// `gc/state` recreated at generation zero between the two reads holds no edge, yet no round folded the candidate's:
+/// the re-read went backwards, so the candidate is inconclusive, not superseded.
+TEST(CASFsck, RereadOfARegressedStateLeavesTheCandidateInconclusive)
+{
+    StaleEdgeFixture f;
+    f.publish("live", {2});
+    f.publish("stale", {1});
+    f.publish("bait", {2}, kBaitNs);
+    f.gc.runRegularRound();
+    f.drop("stale");
+    f.drop("bait");
+    f.removeManifestBody("stale");
+    bool recreated = false;
+    f.armDuringManifestPass("bait", [&]
+    {
+        f.recreateGcStateAtGenerationZero();
+        recreated = true;
+    });
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true);
+
+    ASSERT_TRUE(recreated) << "the manifest pass read the bait body";
+    EXPECT_EQ(rep.stale_edge_superseded, 0u);
+    EXPECT_EQ(rep.stale_edge, 0u);
+    EXPECT_EQ(rep.intent_unread, 1u) << formatFsckSummary(rep);
+    EXPECT_EQ(countVerdictsAtKey(rep, f.bodyKey(1), FsckClass::IntentUnread), 1u);
+    EXPECT_FALSE(rep.clean());
 }
 
 /// The capability probe's scratch object under `blob-intents/_probe/` is not an intent and no finding.
@@ -3058,6 +4242,78 @@ TEST(CASFsck, PendingRowOverAReferencedBodyIsCheckedToo)
     }
 }
 
+/// `Creating` rows of one creator root and writer epoch share one read of its mount slot, a failed one
+/// too: a slot that keeps failing would otherwise cost a request window per row. Every row is reported.
+TEST(CASFsck, CreatingRowsOfOneCreatorShareOneFailedSlotRead)
+{
+    auto backend = std::make_shared<FsckFaultBackend>();
+    PoolPtr store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    CasOperation op = store->openRequests().admit();
+    const auto admit_creating = [&](const String & ns, UInt128 incarnation, const String & root)
+    {
+        CasRefCatalog::casAdmitEntry(op, layout, store->poolConfig().gc_shards, CatalogEntry{
+            .ns = RootNamespace{ns}, .state = NsState::Creating, .incarnation = incarnation,
+            .creator = CreatorFence{.server_root_id = root, .writer_epoch = 1, .fence_generation = 1}});
+    };
+    admit_creating("00/a-first@cas@", UInt128{0xc1}, "shared-creator");
+    admit_creating("00/b-second@cas@", UInt128{0xc2}, "shared-creator");
+    admit_creating("00/c-third@cas@", UInt128{0xc3}, "shared-creator");
+    admit_creating("00/d-other@cas@", UInt128{0xc4}, "other-creator");
+    backend->refused_reads.insert(layout.mountKey("shared-creator"));
+    backend->refused_reads.insert(layout.mountKey("other-creator"));
+
+    FsckReport rep;
+    ASSERT_NO_THROW(rep = runFsckReadingCreatorSlots(*store));
+
+    EXPECT_EQ(backend->getCount(layout.mountKey("shared-creator")), 1u) << "three rows of one creator, one slot read";
+    EXPECT_EQ(backend->getCount(layout.mountKey("other-creator")), 1u) << "control: another creator costs its own read";
+    ASSERT_EQ(rep.creating_rows.size(), 4u);
+    EXPECT_EQ(rep.creating_unproven, 4u);
+    for (const FsckCreatingRow & row : rep.creating_rows)
+    {
+        EXPECT_FALSE(row.slot) << row.ns;
+        EXPECT_NE(row.slot_read_error.find("injected refusal of the read of " + layout.mountKey(row.creator_root)),
+                  String::npos) << row.ns << ": " << row.slot_read_error;
+    }
+}
+
+/// `SYSTEM CAS FSCK` has no column for `Creating` rows, so its scan reads no creator's mount slot; the scan
+/// `cas-fsck` runs reads each one and reports the rows.
+TEST(CASFsck, OnlyTheCliScanReadsCreatorSlots)
+{
+    auto backend = std::make_shared<FsckFaultBackend>();
+    PoolPtr store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    CasOperation op = store->openRequests().admit();
+    const auto admit_creating = [&](const String & ns, UInt128 incarnation, const String & root)
+    {
+        CasRefCatalog::casAdmitEntry(op, layout, store->poolConfig().gc_shards, CatalogEntry{
+            .ns = RootNamespace{ns}, .state = NsState::Creating, .incarnation = incarnation,
+            .creator = CreatorFence{.server_root_id = root, .writer_epoch = 1, .fence_generation = 1}});
+        setWatermarkMinActive(*backend, layout, root, /*writer_epoch*/ 1, /*min_active_build_sequence*/ 1);
+    };
+    admit_creating("00/a@cas@", UInt128{0xd1}, "creator-a");
+    admit_creating("00/b@cas@", UInt128{0xd2}, "creator-b");
+    const auto slot_reads = [&]
+    {
+        return backend->getCount(layout.mountKey("creator-a")) + backend->getCount(layout.mountKey("creator-b"));
+    };
+
+    const FsckReport sql = runFsck(*store, /*detail*/ false);
+
+    EXPECT_EQ(slot_reads(), 0u);
+    EXPECT_TRUE(sql.creating_rows.empty());
+    EXPECT_EQ(sql.stalled_creating + sql.creating_unproven, 0u);
+    EXPECT_TRUE(sql.catalog_has_no_walkable_row) << "the catalog is still read";
+
+    const FsckReport cli = runFsckReadingCreatorSlots(*store);
+
+    EXPECT_EQ(slot_reads(), 2u) << "one read per creator";
+    EXPECT_EQ(cli.creating_rows.size(), 2u);
+    EXPECT_EQ(cli.creating_unproven, 2u);
+}
+
 /// The row keeps the token as captured, quoted; the store answers the same tag bare. GC compares canonically and
 /// would delete that body, so fsck checks the row's intent the same way.
 TEST(CASFsck, PendingRowTokenIsComparedCanonically)
@@ -3077,6 +4333,210 @@ TEST(CASFsck, PendingRowTokenIsComparedCanonically)
     EXPECT_EQ(rep.pending_without_intent, 1u) << formatFsckSummary(rep);
     EXPECT_FALSE(rep.clean());
     EXPECT_EQ(countVerdictsAtKey(rep, body_key, FsckClass::PendingWithoutIntent), 1u);
+}
+
+namespace
+{
+/// An object listed under the blobs prefix that `Layout::parseBlobKey` refuses.
+String foreignBlobKey(const Layout & layout, std::string_view tail = "md5/aa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+{
+    const String key = layout.blobsPrefix() + String(tail);
+    EXPECT_FALSE(layout.parseBlobKey(key).has_value()) << "fixture: the key must be one the parser refuses";
+    return key;
+}
+
+void plantForeignBody(Backend & backend, const String & key)
+{
+    OperationForTest op(backend);
+    ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(key, "x", Retry::standard())));
+}
+
+const FsckObject * rowAt(const FsckReport & report, const String & key)
+{
+    for (const FsckObject & o : report.objects)
+        if (o.key == key)
+            return &o;
+    return nullptr;
+}
+
+/// The scan names the key `Unaccounted` with the fixed note and no other class.
+void expectForeignRow(const FsckReport & report, const String & key)
+{
+    const FsckObject * row = rowAt(report, key);
+    ASSERT_NE(row, nullptr) << key;
+    EXPECT_EQ(row->cls, FsckClass::Unaccounted) << key;
+    EXPECT_EQ(row->size, 1u) << key;
+    ASSERT_FALSE(row->reachable_from.empty()) << key;
+    EXPECT_NE(row->reachable_from[0].find("Malformed blob key"), String::npos) << row->reachable_from[0];
+    EXPECT_EQ(std::count_if(report.objects.begin(), report.objects.end(),
+        [&](const FsckObject & o) { return o.key == key; }), 1) << "exactly one row for the key";
+}
+}
+
+/// An unparsable key beside the zero-byte body, which the all-zero digest keys, is its own `Unaccounted` row and leaves
+/// the zero body's verdict alone.
+TEST(CASFsck, UnparsableBlobKeyIsNotTheZeroBodyAwaitingGc)
+{
+    ASSERT_EQ(blobRefOf(0), BlobRef{});
+    ASSERT_EQ(idOf(String()), BlobRef{});
+    for (const bool detail : {true, false})
+    {
+        SCOPED_TRACE(detail);
+        FsckGcFixture f(0, {0});
+        f.drop();
+        const String zero_key = f.bodyKey(0);
+        const String foreign = foreignBlobKey(f.store->layout());
+        const FsckReport before = runFsck(*f.store, detail);
+        ASSERT_EQ(before.awaiting_gc, 1u) << "positive control: the zero body awaits GC";
+
+        plantForeignBody(*f.backend, foreign);
+        const FsckReport after = runFsck(*f.store, detail);
+
+        EXPECT_EQ(after.unreachable, before.unreachable + 1);
+        EXPECT_EQ(after.unaccounted, before.unaccounted + 1);
+        EXPECT_EQ(after.awaiting_gc, 1u);
+        if (detail)
+        {
+            expectForeignRow(after, foreign);
+            EXPECT_EQ(countVerdictsAtKey(after, zero_key, FsckClass::AwaitingGc), 1u);
+        }
+    }
+}
+
+/// The zero body's own stale edge is hard and is reported once; the foreign key does not repeat it.
+TEST(CASFsck, UnparsableBlobKeyIsNotTheZeroBodyStaleEdge)
+{
+    ASSERT_EQ(blobRefOf(0), BlobRef{});
+    for (const bool detail : {true, false})
+    {
+        SCOPED_TRACE(detail);
+        FsckGcFixture f(0, {0});
+        f.drop();
+        deleteManifestBody(*f.backend, f.store->layout(), f.manifest_id);
+        f.round();
+        const String zero_key = f.bodyKey(0);
+        const String foreign = foreignBlobKey(f.store->layout());
+        const FsckReport before = runFsck(*f.store, detail);
+        ASSERT_EQ(before.stale_edge, detail ? 1u : 0u);
+
+        plantForeignBody(*f.backend, foreign);
+        const FsckReport after = runFsck(*f.store, detail);
+
+        EXPECT_EQ(after.unaccounted, before.unaccounted + 1);
+        EXPECT_EQ(after.stale_edge, before.stale_edge);
+        EXPECT_EQ(after.stale_edge_superseded, 0u);
+        EXPECT_EQ(after.awaiting_gc, before.awaiting_gc);
+        if (detail)
+        {
+            EXPECT_FALSE(after.clean());
+            EXPECT_EQ(countVerdictsAtKey(after, zero_key, FsckClass::StaleEdge), 1u) << "the genuine body stays a hard finding";
+            expectForeignRow(after, foreign);
+        }
+    }
+}
+
+/// No `gc/state` made every unreferenced body `AwaitingGc`, the foreign key included.
+TEST(CASFsck, UnparsableBlobKeyWithNoGcStateIsUnaccounted)
+{
+    const std::array<String, 3> tails = {
+        "md5/aa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "ch128/00/ff" + String(30, '0'),
+        "ch128/aa/aabbcc",
+    };
+    for (const String & tail : tails)
+        for (const bool detail : {true, false})
+        {
+            SCOPED_TRACE(tail);
+            SCOPED_TRACE(detail);
+            auto backend = std::make_shared<InMemoryBackend>();
+            auto store = openPoolForTest(backend);
+            writeBlobBody(*backend, store->layout(), numberedBlobHash(5));
+            const String foreign = foreignBlobKey(store->layout(), tail);
+            plantForeignBody(*backend, foreign);
+
+            const FsckReport rep = runFsck(*store, detail);
+
+            EXPECT_EQ(rep.unreachable, 2u);
+            EXPECT_EQ(rep.unaccounted, 1u);
+            EXPECT_EQ(rep.awaiting_gc, 1u) << "positive control: body 5 awaits GC";
+            if (detail)
+            {
+                expectForeignRow(rep, foreign);
+                EXPECT_EQ(countVerdictsAtKey(rep, store->layout().blobKey(blobRefOf(5)), FsckClass::AwaitingGc), 1u);
+            }
+        }
+}
+
+/// A `gc/state` the scan cannot read leaves real bodies `Unchecked`; a key that is no blob key is not one of them.
+TEST(CASFsck, UnparsableBlobKeyUnderAnUnreadSnapshotIsUnaccountedNotUnchecked)
+{
+    for (const bool detail : {true, false})
+    {
+        SCOPED_TRACE(detail);
+        auto backend = std::make_shared<InMemoryBackend>();
+        auto store = openPoolForTest(backend);
+        writeBlobBody(*backend, store->layout(), numberedBlobHash(5));
+        GcState state;
+        state.header_generation = G_REF_CHAIN;
+        state.gc_shards = store->poolConfig().gc_shards;
+        {
+            OperationForTest op(*backend);
+            ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(store->layout().gcStateKey(), encodeGcState(state), Retry::standard())));
+        }
+        const String foreign = foreignBlobKey(store->layout());
+        plantForeignBody(*backend, foreign);
+
+        const FsckReport rep = runFsck(*store, detail);
+
+        EXPECT_EQ(rep.unaccounted, 1u);
+        EXPECT_EQ(rep.intent_unread, 1u);
+        EXPECT_FALSE(rep.clean());
+        if (detail)
+        {
+            expectForeignRow(rep, foreign);
+            EXPECT_EQ(countVerdictsAtKey(rep, foreign, FsckClass::Unchecked), 0u);
+            EXPECT_EQ(countVerdictsAtKey(rep, store->layout().blobKey(blobRefOf(5)), FsckClass::Unchecked), 1u)
+                << "positive control: the real refusal is still reported";
+        }
+    }
+}
+
+/// The retired zero body gets the `HEAD` and the intent read; the foreign key gets neither.
+TEST(CASFsck, UnparsableBlobKeyIsNeverLookedUpAgainstARetiredZeroBody)
+{
+    ASSERT_EQ(blobRefOf(0), BlobRef{});
+    for (const bool detail : {true, false})
+    {
+        SCOPED_TRACE(detail);
+        auto backend = std::make_shared<FsckFaultBackend>();
+        PoolPtr store = openPoolForTest(backend);
+        const Layout & layout = store->layout();
+        const BlobRef blob = blobRefOf(0);
+        writeBlobBody(*backend, layout, numberedBlobHash(0));
+        const String zero_key = layout.blobKey(blob);
+        const PersistedEtag token{"emulated", "\"tag-1\""};
+        backend->head_values[zero_key] = "tag-1";
+        injectRetire(*backend, layout, /*round=*/3, /*shard=*/0, {RetiredEntry{
+            .kind = ObjectKind::Blob, .ref = blob, .token = token,
+            .size = 1, .condemn_round = 3, .delete_pending = true}});
+        const String intent = layout.blobIntentKey(blob, *token.canonical());
+        const String foreign = foreignBlobKey(layout);
+        const FsckReport before = runFsck(*store, detail);
+        ASSERT_EQ(before.pending_without_intent, 1u) << "positive control: the zero body's row has no intent";
+
+        plantForeignBody(*backend, foreign);
+        backend->head_values[foreign] = "tag-1";
+        backend->clearJournal();
+        const FsckReport after = runFsck(*store, detail);
+
+        EXPECT_EQ(countKeyRequests(backend->journal(), JournalVerb::Head, foreign), 0u);
+        EXPECT_EQ(countKeyRequests(backend->journal(), JournalVerb::Read, intent), 1u);
+        EXPECT_EQ(after.pending_without_intent, 1u);
+        EXPECT_EQ(after.unaccounted, before.unaccounted + 1);
+        EXPECT_EQ(countVerdictsAtKey(after, zero_key, FsckClass::PendingWithoutIntent), 1u);
+        if (detail)
+            expectForeignRow(after, foreign);
+    }
 }
 
 /// The second read of `gc/state` clears a suspect only when it is a complete snapshot: a seal it names that is
@@ -3195,6 +4655,80 @@ TEST(CASFsckPartial, DeadlineReturnsAccumulatedCountsInsteadOfThrowing)
     EXPECT_FALSE(report.partial_reason.empty());
 }
 
+/// A scan cut short by its deadline has checked only part of the pool, so it cannot be a clean verdict.
+TEST(CASFsckPartial, DeadlineWithNoFindingIsNotClean)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xAA);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    const uint64_t sequence = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, sequence});
+
+    const ToolDeadline past = fsckDeadlineIn(*store, std::chrono::milliseconds(0));
+    const auto report = DB::Cas::runFsck(*store, false, {}, past, /*partial_on_deadline=*/true);
+
+    ASSERT_TRUE(report.partial);
+    for (const FsckHardFinding & finding : kFsckHardFindings)
+        EXPECT_EQ(report.*finding.value, 0u) << finding.name;
+    EXPECT_FALSE(report.clean());
+}
+
+/// A finding recorded before the cut stays in the report, and the line carries both facts.
+TEST(CASFsckPartial, FindingRecordedBeforeTheCutIsReportedAndNotClean)
+{
+    FsckGcFixture f(/*create_budget=*/0, {1, 2, 3, 4});
+    f.drop();
+    f.round();
+    const String lifeless = f.store->layout().casRefsPrefix() + f.ns.string() + "/_log/"
+        + renderRefTxnId(RefTxnId{1, 1}) + ".zst";
+    {
+        OperationForTest op(*f.backend);
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(lifeless, "garbage", Retry::once())));
+    }
+    const auto clock = VirtualRetryClock::installOn(f.store);
+    const ToolDeadline deadline = fsckDeadlineIn(*f.store, std::chrono::seconds(1));
+    for (const uint64_t b : {1, 2, 3, 4})
+        f.backend->beforeHead(f.bodyKey(b), [clock] { clock->advance(2000); });
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true, {}, deadline, /*partial_on_deadline=*/true);
+
+    ASSERT_TRUE(rep.partial);
+    EXPECT_NE(rep.partial_reason.find("during 'head-checking retired bodies'"), String::npos) << rep.partial_reason;
+    EXPECT_EQ(rep.lifeless_keys, 1u);
+    size_t rows = 0;
+    for (const FsckObject & o : rep.objects)
+        if (o.cls == FsckClass::LifelessKey)
+            ++rows;
+    EXPECT_EQ(rows, 1u);
+    EXPECT_FALSE(rep.clean());
+    const String line = formatFsckSummary(rep);
+    EXPECT_NE(line.find("lifeless_keys=1"), String::npos) << line;
+    EXPECT_NE(line.find("partial=1"), String::npos) << line;
+}
+
+/// A deadline that is not reached leaves the report clean: `clean` does not depend on a deadline existing.
+TEST(CASFsckPartial, CompleteScanWithADeadlineIsClean)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xAA);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    const uint64_t sequence = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, sequence});
+
+    const ToolDeadline later = fsckDeadlineIn(*store, std::chrono::hours(1));
+    const auto report = DB::Cas::runFsck(*store, false, {}, later, /*partial_on_deadline=*/true);
+
+    EXPECT_FALSE(report.partial);
+    EXPECT_TRUE(report.clean());
+    EXPECT_EQ(formatFsckSummary(report).find("partial="), String::npos);
+}
+
 /// A `namespace_prefix` scopes the scan to only the matching namespaces' refs (dangling-only): no
 /// pool-wide unreachable/pending/awaiting/unaccounted classification, since that needs the whole pool.
 TEST(CASFsckScoped, NamespacePrefixChecksOnlyMatchingRefsDanglingOnly)
@@ -3226,6 +4760,37 @@ TEST(CASFsckScoped, NamespacePrefixChecksOnlyMatchingRefsDanglingOnly)
     /// manifest bodies — zero in this clean setup, legitimately nonzero on a churned pool.
     EXPECT_EQ(scoped.unreachable, 0u);
     EXPECT_EQ(scoped.pending_gc + scoped.awaiting_gc + scoped.unaccounted, 0u);
+}
+
+/// A memory-limit fault on a manifest read is reissued by the fsck walk, so the dangle behind it is
+/// still recorded instead of the namespace being skipped as unchecked.
+TEST(CASFsckScoped, AMemoryLimitOnACommittedManifestReadStillRecordsTheDangle)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"nsa"};
+    const ManifestRef r_a = ref(1, 0xA1);
+    const ManifestRef r_other = ref(1, 0xB1);
+    /// A valid body that describes `r_other`, stored where the committed ref names `r_a`.
+    PartManifest body;
+    body.ref = r_other;
+    body.root_namespace_id = ns;
+    body.payload_digest = computePayloadDigest(body);
+    {
+        OperationForTest op(*backend);
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(
+            store->layout().manifestKey(ManifestId{ns, r_a}),
+            sealObject(FormatId::PartManifest, encodePartManifest(body)), Retry::standard())));
+    }
+    const uint64_t sequence = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r_a);
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, sequence});
+    backend->failNextReadWith(store->layout().manifestKey(ManifestId{ns, r_a}), std::make_exception_ptr(
+        DB::Exception(DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED, "Query memory limit exceeded")));
+
+    const auto scoped = DB::Cas::runFsck(*store, false, {}, {}, false, /*namespace_prefix=*/"nsa");
+
+    EXPECT_EQ(scoped.dangling, 1u);
+    EXPECT_EQ(scoped.unchecked, 0u);
 }
 
 /// B207: the ref-walk and the HEAD-confirm run minutes apart with no snapshot. A ref that gets
@@ -3507,6 +5072,13 @@ TEST(CASFsckSummary, AdvisoryIntentCountersAndTheVerificationFlagArePrinted)
     EXPECT_TRUE(report.clean()) << "the advisory counters never make a report unclean";
 }
 
+/// Pins the exact token order and set of a complete clean line, which scripts parse by key.
+TEST(CASFsckSummary, CompleteCleanLineIsUnchanged)
+{
+    EXPECT_EQ(formatFsckSummary(FsckReport{}), 
+        "reachable=0 dangling=0 unreachable=0 pending_gc=0 awaiting_gc=0 unaccounted=0 stale_edge=0 stale_edge_superseded=0 corrupted_runs=0 chain_broken=0 lifeless_keys=0 intents_listed=0 intent_current=0 intent_replaced=0 intent_body_gone=0 intent_malformed=0 intent_unread=0 pending_without_intent=0 pending_intent_absent=0 pending_token_rejected=0 standing_present=0 intents_verified=0 legacy_marker=0 legacy_markers_deleted=0 legacy_markers_changed=0 janitor_pending=0 janitor_pending_bytes=0 janitor_pending_lives=0 stalled_creating=0 creating_unproven=0 unchecked=0 ref_records_walked=0 physical_bytes=0 referenced_logical_bytes=0 distinct_blobs=0 total_blob_refs=0 dedup_ratio=0");
+}
+
 TEST(CASFsckSummary, PartialFlagAndReasonTravelWithTheCounts)
 {
     FsckReport rep;
@@ -3784,4 +5356,421 @@ TEST(CASFsckPartial, DeadlineInTheBlobLoopReportsHeldDanglingsAsUnchecked)
     EXPECT_NE(uncheckedNoteContains(report, layout.blobKey(first.ref), note),
               uncheckedNoteContains(report, layout.blobKey(second.ref), note))
         << "exactly the first blob of the loop was held";
+}
+
+namespace
+{
+
+/// One namespace with committed refs `r000` to `r128`, each over a present manifest, and `zz`, whose manifest body is
+/// missing: 130 refs, the last of them a real finding.
+struct FsckManyRefsPool
+{
+    std::shared_ptr<InMemoryBackend> backend = std::make_shared<InMemoryBackend>();
+    PoolPtr store = openPoolForTest(backend);
+    RootNamespace ns{"00/aa@cas@"};
+
+    FsckManyRefsPool()
+    {
+        const Layout & layout = store->layout();
+        writeBlobBody(*backend, layout, numberedBlobHash(1));
+        uint64_t sequence = 0;
+        for (uint64_t i = 0; i <= 128; ++i)
+        {
+            const ManifestRef manifest = ref(1, 0x100 + i);
+            writeManifestRaw(*backend, layout, ns, manifest, {blobEntryFor("a", numberedBlobHash(1))});
+            sequence = publishCommittedTransition(*backend, layout, ns, fmt::format("r{:03}", i), std::nullopt, manifest);
+        }
+        sequence = publishCommittedTransition(*backend, layout, ns, "zz", std::nullopt, ref(1, 0x1FF));
+        writeFsckCheckpoint(*backend, layout, ns, RefTxnId{1, sequence});
+    }
+};
+
+}
+
+/// Each request-bound phase starts, ends, and counts items of its own unit; a skipped item is not counted.
+TEST(CASFsck, ProgressPhasesRunInOrderWithRealUnits)
+{
+    FsckGcFixture f(0, {1, 2, 3, 4, 5});
+    f.drop();
+    f.round();
+    FsckProgressLog log;
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/false, recordInto(log), {}, false, {}, false, /*verify_intents=*/true);
+
+    ASSERT_EQ(rep.pending_gc, 5u) << "positive control: five bodies waited in the pipeline";
+    const std::vector<String> expected{"listing namespaces", "walking refs", "listing blobs", "head-checking reachable blobs",
+        "reading gc snapshot runs", "head-checking retired bodies", "checking pending rows", "listing blob intents",
+        "verifying blob intents", "listing manifests"};
+    EXPECT_EQ(startsOf(log), expected);
+    for (const String & phase : expected)
+    {
+        EXPECT_EQ(countOf(log, phase, FsckProgressStep::Start), 1u) << phase;
+        EXPECT_EQ(countOf(log, phase, FsckProgressStep::End), 1u) << phase;
+        double last = 0;
+        for (const FsckProgressEvent & e : log)
+            if (e.phase == phase)
+            {
+                EXPECT_GE(e.seconds, last) << phase;
+                last = e.seconds;
+            }
+    }
+    ASSERT_NE(endOf(log, "head-checking retired bodies"), nullptr);
+    EXPECT_EQ(endOf(log, "head-checking retired bodies")->done, 5u);
+    EXPECT_EQ(endOf(log, "head-checking retired bodies")->unit, "bodies");
+    ASSERT_NE(endOf(log, "checking pending rows"), nullptr);
+    EXPECT_EQ(endOf(log, "checking pending rows")->done, 0u) << "every pending row was checked in the bodies loop";
+    ASSERT_NE(endOf(log, "verifying blob intents"), nullptr);
+    EXPECT_EQ(endOf(log, "verifying blob intents")->done, 5u);
+    EXPECT_EQ(endOf(log, "verifying blob intents")->unit, "keys");
+    ASSERT_NE(endOf(log, "reading gc snapshot runs"), nullptr);
+    EXPECT_EQ(endOf(log, "reading gc snapshot runs")->unit, "rows");
+}
+
+/// A ref whose manifest is missing is counted like any other, so the tick comes at the 64th and 128th ref.
+TEST(CASFsck, ProgressRefsTickEverySixtyFourthRef)
+{
+    FsckManyRefsPool pool;
+    FsckProgressLog log;
+
+    const FsckReport rep = runFsck(*pool.store, /*detail=*/true, recordInto(log));
+
+    ASSERT_EQ(rep.dangling, 1u) << "positive control: the ref without a manifest was reached";
+    EXPECT_EQ((ticksOf(log, "walking refs")), (std::vector<uint64_t>{64, 128}));
+    const FsckProgressEvent * end = endOf(log, "walking refs");
+    ASSERT_NE(end, nullptr);
+    EXPECT_EQ(end->done, 130u);
+    EXPECT_EQ(end->unit, "refs");
+}
+
+namespace
+{
+
+std::vector<std::tuple<String, FsckClass, std::vector<String>>> objectsOf(const FsckReport & report)
+{
+    std::vector<std::tuple<String, FsckClass, std::vector<String>>> rows;
+    for (const FsckObject & o : report.objects)
+        rows.emplace_back(o.key, o.cls, o.reachable_from);
+    std::sort(rows.begin(), rows.end());
+    return rows;
+}
+
+/// A sink that throws `code`: on every call, or only at the ticks of `walking refs`.
+FsckProgress throwingSink(int code, bool only_ref_ticks, size_t & calls)
+{
+    return [code, only_ref_ticks, &calls](FsckProgressStep step, std::string_view phase, std::string_view, uint64_t, double)
+    {
+        if (only_ref_ticks && !(step == FsckProgressStep::Tick && phase == "walking refs"))
+            return;
+        ++calls;
+        throw DB::Exception(code, "progress sink failure");
+    };
+}
+
+}
+
+/// A sink that throws changes nothing the checker reports, including a finding located after the throw.
+TEST(CASFsck, ThrowingSinkDoesNotChangeTheReport)
+{
+    FsckManyRefsPool pool_a;
+    FsckGcFixture pool_b(0, {1});
+    pool_b.drop();
+    pool_b.round();
+    pool_b.removeIntent(1);
+
+    struct Case
+    {
+        const char * name;
+        Pool * store;
+        bool verify;
+        bool only_ref_ticks;
+    };
+    const Case cases[] = {
+        {"A, throw at the 64th ref only", pool_a.store.get(), false, true},
+        {"A, throw on every call", pool_a.store.get(), false, false},
+        {"B, throw on every call", pool_b.store.get(), true, false},
+    };
+    for (const Case & c : cases)
+    {
+        for (const int code : {DB::ErrorCodes::CORRUPTED_DATA, DB::ErrorCodes::TIMEOUT_EXCEEDED})
+        {
+            SCOPED_TRACE(String(c.name) + ", code " + std::to_string(code));
+            const FsckReport baseline = runFsck(*c.store, true, {}, {}, /*partial_on_deadline=*/true, {}, false, c.verify);
+            size_t calls = 0;
+            const FsckReport with_sink
+                = runFsck(*c.store, true, throwingSink(code, c.only_ref_ticks, calls), {}, /*partial_on_deadline=*/true, {}, false, c.verify);
+
+            for (const FsckReport * r : {&baseline, &with_sink})
+            {
+                EXPECT_FALSE(r->clean());
+                EXPECT_EQ(r->unchecked, 0u);
+                EXPECT_FALSE(r->partial);
+            }
+            const bool is_a = c.store == pool_a.store.get();
+            EXPECT_EQ(baseline.dangling, is_a ? 1u : 0u);
+            EXPECT_EQ(with_sink.dangling, is_a ? 1u : 0u);
+            EXPECT_EQ(baseline.pending_without_intent, is_a ? 0u : 1u);
+            EXPECT_EQ(with_sink.pending_without_intent, is_a ? 0u : 1u);
+            EXPECT_GT(calls, 0u) << "the sink was never reached";
+            EXPECT_EQ(formatFsckSummary(with_sink), formatFsckSummary(baseline));
+            EXPECT_EQ(with_sink.partial_reason, baseline.partial_reason);
+            EXPECT_EQ(objectsOf(with_sink), objectsOf(baseline));
+        }
+    }
+}
+
+/// A sink that throws on every call neither stops the marker removal nor changes its result.
+TEST(CASFsck, ThrowingSinkDuringMarkerRemovalDoesNotChangeTheReport)
+{
+    const auto populate = [](FsckIntentFixture & f)
+    {
+        for (uint64_t b = 1; b <= 1000; ++b)
+            f.marker(b);
+    };
+    FsckIntentFixture plain;
+    populate(plain);
+    const FsckReport baseline = runFsck(*plain.store, false, {}, {}, false, {}, /*fix_legacy_markers=*/ true);
+
+    FsckIntentFixture f;
+    populate(f);
+    size_t calls = 0;
+    FsckReport rep;
+    ASSERT_NO_THROW(rep = runFsck(*f.store, false, throwingSink(DB::ErrorCodes::CORRUPTED_DATA, false, calls), {}, false, {},
+                                  /*fix_legacy_markers=*/ true));
+
+    EXPECT_GT(calls, 0u) << "the sink was never reached";
+    EXPECT_EQ(rep.legacy_markers_deleted, 1000u);
+    EXPECT_EQ(formatFsckSummary(rep), formatFsckSummary(baseline));
+}
+
+/// Each line names the unit of its count.
+TEST(CASFsck, ProgressLineNamesTheUnit)
+{
+    EXPECT_EQ(formatFsckProgress(FsckProgressStep::Start, "walking refs", "refs", 0, 0.0), "cas-fsck: walking refs: started");
+    EXPECT_EQ(formatFsckProgress(FsckProgressStep::Tick, "walking refs", "refs", 64, 12.5), "cas-fsck: walking refs: 64 refs, 12.5 s");
+    EXPECT_EQ(formatFsckProgress(FsckProgressStep::End, "reading gc snapshot runs", "rows", 65536, 3.0),
+              "cas-fsck: reading gc snapshot runs: done, 65536 rows, 3.0 s");
+}
+
+/// A phase left by the deadline has a start and no end, so the last line of a stopped run names it. The deadline
+/// passes on the pool's request clock, which the first body `HEAD` moves.
+TEST(CASFsck, ProgressStopsAtTheInterruptedPhase)
+{
+    FsckGcFixture f(/*create_budget=*/0, {1, 2, 3, 4});
+    f.drop();
+    f.round();
+    const auto clock = VirtualRetryClock::installOn(f.store);
+    const ToolDeadline deadline = fsckDeadlineIn(*f.store, std::chrono::seconds(1));
+    for (const uint64_t b : {1, 2, 3, 4})
+        f.backend->beforeHead(f.bodyKey(b), [clock] { clock->advance(2000); });
+    FsckProgressLog log;
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/false, recordInto(log), deadline, /*partial_on_deadline=*/true);
+
+    ASSERT_TRUE(rep.partial);
+    EXPECT_NE(rep.partial_reason.find("during 'head-checking retired bodies'"), String::npos) << rep.partial_reason;
+    EXPECT_EQ(countOf(log, "head-checking retired bodies", FsckProgressStep::Start), 1u);
+    EXPECT_EQ(countOf(log, "head-checking retired bodies", FsckProgressStep::End), 0u);
+    ASSERT_FALSE(log.empty());
+    EXPECT_EQ(log.back().phase, "head-checking retired bodies");
+    EXPECT_EQ(log.back().step, FsckProgressStep::Start) << "no line follows the interrupted phase's start";
+}
+
+/// One progress tick per 16 list pages.
+constexpr uint64_t kListTickKeysForTest = 16 * CasOperation::kCasListPageKeys;
+
+/// Listing the manifests for the stale-edge check reports its own progress, in keys, before any manifest is read.
+TEST(CASFsck, StaleEdgeManifestListingReportsProgressInKeys)
+{
+    FsckGcFixture f(/*create_budget=*/0, {1});
+    f.drop();
+    deleteManifestBody(*f.backend, f.store->layout(), f.manifest_id);
+    f.round();   /// a round that cannot fold the edge: its manifest is gone
+    {
+        OperationForTest op(*f.backend);
+        const String prefix = f.store->layout().manifestNamespacePrefix(f.ns);
+        for (uint64_t i = 0; i < kListTickKeysForTest + 1; ++i)
+            (*op).create(prefix + fmt::format("junk{:06}", i), "x", Retry::standard());
+    }
+    FsckProgressLog log;
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true, recordInto(log));
+
+    ASSERT_EQ(rep.stale_edge, 1u) << "positive control: the stale-edge check ran";
+    const String listing = "listing manifests for the stale-edge check";
+    EXPECT_EQ(countOf(log, listing, FsckProgressStep::Start), 1u);
+    EXPECT_EQ(countOf(log, listing, FsckProgressStep::End), 1u);
+    EXPECT_FALSE(ticksOf(log, listing).empty());
+    const FsckProgressEvent * end = endOf(log, listing);
+    ASSERT_NE(end, nullptr);
+    EXPECT_EQ(end->unit, "keys");
+    const std::vector<String> started = startsOf(log);
+    const auto listing_at = std::find(started.begin(), started.end(), listing);
+    const auto reading_at = std::find(started.begin(), started.end(), "reading manifests for the stale-edge check");
+    ASSERT_NE(listing_at, started.end());
+    EXPECT_TRUE(reading_at == started.end() || listing_at < reading_at);
+}
+
+namespace
+{
+/// Two namespaces, each with live manifests and one dropped ref whose manifest body is gone: a stale-edge candidate in each.
+void publishStaleEdgesInTwoNamespaces(StaleEdgeFixture & f)
+{
+    f.publish("live_a1", {10});
+    f.publish("live_a2", {11});
+    f.publish("stale_a", {1});
+    f.publish("live_b1", {12}, kBaitNs);
+    f.publish("live_b2", {13}, kBaitNs);
+    f.publish("stale_b", {2}, kBaitNs);
+    f.gc.runRegularRound();
+    f.drop("stale_a");
+    f.drop("stale_b");
+    f.removeManifestBody("stale_a");
+    f.removeManifestBody("stale_b");
+}
+
+/// The Start and End steps of the two stale-edge phases, in emission order.
+std::vector<String> staleEdgePhaseSteps(const FsckProgressLog & log)
+{
+    std::vector<String> steps;
+    for (const FsckProgressEvent & e : log)
+    {
+        const String kind = e.phase == "listing manifests for the stale-edge check" ? "listing"
+            : e.phase == "reading manifests for the stale-edge check"               ? "reading"
+                                                                                    : "";
+        if (!kind.empty() && e.step != FsckProgressStep::Tick)
+            steps.push_back(kind + (e.step == FsckProgressStep::Start ? " start" : " end"));
+    }
+    return steps;
+}
+}
+
+/// The manifest-read phase of the stale-edge check is scoped to the namespace it reads, like its listing.
+TEST(CASFsck, StaleEdgeCheckListsAndReadsManifestsPerNamespace)
+{
+    StaleEdgeFixture f;
+    publishStaleEdgesInTwoNamespaces(f);
+    FsckProgressLog log;
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true, recordInto(log));
+
+    ASSERT_EQ(rep.stale_edge, 2u) << "positive control: both namespaces held a candidate";
+    EXPECT_EQ(staleEdgePhaseSteps(log), (std::vector<String>{"listing start", "listing end", "reading start", "reading end",
+                                                             "listing start", "listing end", "reading start", "reading end"}));
+}
+
+/// A read that stalls in the second namespace leaves that namespace's read phase as the last line.
+TEST(CASFsck, StaleEdgeReadInterruptedInTheSecondNamespaceEndsOnItsReadingStart)
+{
+    StaleEdgeFixture f;
+    publishStaleEdgesInTwoNamespaces(f);
+    const auto clock = VirtualRetryClock::installOn(f.store);
+    const ToolDeadline deadline = fsckDeadlineIn(*f.store, std::chrono::seconds(1));
+    bool fired = false;
+    FsckProgressLog log;
+    const FsckProgress record = recordInto(log);
+    /// The ref walk reads the live manifests too, so the stall is armed at the next read after the second listing starts.
+    size_t listings_started = 0;
+    const FsckProgress sink = [&](FsckProgressStep step, std::string_view phase, std::string_view unit, uint64_t done, double seconds)
+    {
+        record(step, phase, unit, done, seconds);
+        if (step == FsckProgressStep::Start && phase == "listing manifests for the stale-edge check" && ++listings_started == 2)
+            f.backend->armOnFirstGetUnder("", [&]
+            {
+                fired = true;
+                clock->advance(2000);
+            });
+    };
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true, sink, deadline, /*partial_on_deadline=*/true);
+
+    ASSERT_TRUE(fired) << "positive control: the second namespace's manifests were read";
+    ASSERT_TRUE(rep.partial);
+    ASSERT_FALSE(log.empty());
+    EXPECT_EQ(log.back().phase, "reading manifests for the stale-edge check");
+    EXPECT_EQ(log.back().step, FsckProgressStep::Start) << "no line follows the interrupted read phase's start";
+    EXPECT_EQ(staleEdgePhaseSteps(log), (std::vector<String>{"listing start", "listing end", "reading start", "reading end",
+                                                             "listing start", "listing end", "reading start"}));
+}
+
+/// A retired body with a `pending` row and no intent costs two `HEAD`s, so the phase counts bodies, not `HEAD`s.
+TEST(CASFsck, RetiredBodyWithTwoHeadsIsCountedAsOneBody)
+{
+    FsckGcFixture f;
+    f.drop();
+    f.round();
+    f.removeIntent(1);
+    f.backend->clearJournal();
+    FsckProgressLog log;
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/false, recordInto(log));
+
+    ASSERT_EQ(rep.pending_without_intent, 1u) << "positive control: the body took the pending-row path";
+    EXPECT_GE(countKeyRequests(f.backend->journal(), JournalVerb::Head, f.bodyKey(1)), 2u) << "positive control: more than one HEAD";
+    const FsckProgressEvent * end = endOf(log, "head-checking retired bodies");
+    ASSERT_NE(end, nullptr);
+    EXPECT_EQ(formatFsckProgress(end->step, end->phase, end->unit, end->done, 0.0),
+              "cas-fsck: head-checking retired bodies: done, 1 bodies, 0.0 s");
+}
+
+/// A reachable blob the listing missed costs one `HEAD`; the phase counts it as a blob, as the scoped scan's phase does.
+TEST(CASFsck, ReachableBlobHeadCheckCountsBlobs)
+{
+    FsckGcFixture f;
+    f.removeBody(1);
+    FsckProgressLog log;
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/false, recordInto(log));
+
+    ASSERT_EQ(rep.dangling, 1u) << "positive control: the reachable blob was head-checked";
+    const FsckProgressEvent * end = endOf(log, "head-checking reachable blobs");
+    ASSERT_NE(end, nullptr);
+    EXPECT_EQ(formatFsckProgress(end->step, end->phase, end->unit, end->done, 0.0),
+              "cas-fsck: head-checking reachable blobs: done, 1 blobs, 0.0 s");
+}
+
+/// Bodies the snapshot has not retired are classified without a request and are not counted; a pool GC never ran on
+/// counts none.
+TEST(CASFsck, BodyClassificationProgressCountsOnlyRetiredBodies)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    for (uint64_t b = 1; b <= 3; ++b)
+        writeBlobBody(*backend, store->layout(), numberedBlobHash(b));
+    FsckProgressLog log;
+
+    const FsckReport rep = runFsck(*store, /*detail=*/false, recordInto(log));
+
+    ASSERT_EQ(rep.awaiting_gc, 3u) << "positive control: three bodies were classified";
+    const FsckProgressEvent * end = endOf(log, "head-checking retired bodies");
+    ASSERT_NE(end, nullptr);
+    EXPECT_EQ(end->unit, "bodies");
+    EXPECT_EQ(end->done, 0u);
+    EXPECT_EQ(formatFsckProgress(end->step, end->phase, end->unit, end->done, 0.0),
+              "cas-fsck: head-checking retired bodies: done, 0 bodies, 0.0 s");
+}
+
+/// After the first failure of the sink in a phase it is not called again in that phase, except for the end line,
+/// and the phase logs one line; a failing end line adds none.
+TEST(CASFsck, FailingSinkIsLoggedOncePerPhase)
+{
+    FsckManyRefsPool pool;
+    const FsckReport baseline = runFsck(*pool.store, /*detail=*/true);
+    size_t refs_calls = 0;
+    FsckProgress sink = [&refs_calls](FsckProgressStep, std::string_view phase, std::string_view, uint64_t, double)
+    {
+        if (phase != "walking refs")
+            return;
+        ++refs_calls;
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "progress sink failure");
+    };
+    ScopedLogCapture own("CasFsck", "error");
+    ScopedLogCapture forced("ForcedCriticalErrorsLogger", "error");
+
+    const FsckReport rep = runFsck(*pool.store, /*detail=*/true, sink);
+
+    EXPECT_EQ(refs_calls, 2u) << "the start, then the end line once";
+    EXPECT_EQ(own.count("progress sink failure"), 1u) << own.captured();
+    EXPECT_EQ(forced.count("progress sink failure"), 0u) << forced.captured();
+    EXPECT_EQ(formatFsckSummary(rep), formatFsckSummary(baseline));
+    EXPECT_EQ(objectsOf(rep), objectsOf(baseline));
 }

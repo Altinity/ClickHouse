@@ -8,6 +8,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobIntents.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <IO/WriteBufferFromString.h>
 #include "cas_test_helpers.h"
@@ -447,4 +448,36 @@ TEST(CASInspect, RendersCleanMarker)
 
     const String json = caInspectToJson(layout, layout.blobMetaKey(ref), encodeBlobMetaForTest(m));
     EXPECT_NE(json.find("\"clean\""), String::npos);
+}
+
+/// `cas-gc-dryrun` prints an intent key for each `standing` row, and the operator is sent to `cas-inspect` with it.
+TEST(CASInspect, RendersTheDeletionIntentAGcDryRunPrints)
+{
+    const Layout layout("p");
+    const BlobRef ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::Cas::tests::u128Of("hash-inspect-intent"))};
+    const auto identity = canonicalIdentity(Dialect::ETag, "\"0123456789abcdef0123456789abcdef\"");
+    ASSERT_TRUE(identity.has_value());
+    DB::Cas::InMemoryBackend backend;
+    DB::Cas::tests::OperationForTest op(backend);
+    ASSERT_TRUE(createBlobIntent(*op, layout, ref, *identity, Retry::standard()).confirmed());
+
+    const String key = layout.blobIntentKey(ref, *identity);
+    const auto stored = (*op).read(key, Retry::standard());
+    ASSERT_TRUE(stored.has_value());
+    const String json = caInspectToJson(layout, key, stored->bytes);
+    EXPECT_NE(json.find("\"object\":\"blob_intent\""), String::npos) << json;
+    EXPECT_NE(json.find("\"blob\":\"" + blobIdOf(ref) + "\""), String::npos) << json;
+    EXPECT_NE(json.find("\"type\":\"etag\""), String::npos) << json;
+    EXPECT_NE(json.find("\"tag_hex\":\"" + identity->tag_hex + "\""), String::npos) << json;
+}
+
+/// An intent holds one constant byte string, so anything else at an intent key is damage, not a version to decode.
+TEST(CASInspect, ADeletionIntentKeyWithOtherBytesIsCorrupted)
+{
+    const Layout layout("p");
+    const BlobRef ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::Cas::tests::u128Of("hash-inspect-intent-bad"))};
+    const auto identity = canonicalIdentity(Dialect::Generation, "1699999999999999");
+    ASSERT_TRUE(identity.has_value());
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { caInspectToJson(layout, layout.blobIntentKey(ref, *identity), "{}\n"); });
 }

@@ -976,13 +976,16 @@ ManifestSweepResult planManifestCursorPage(
         {
             body = decodePartManifest(openObject(FormatId::PartManifest, got->bytes));
         }
-        catch (const Exception &)
+        catch (Exception & e)
         {
-            /// A body we cannot decode cannot be shown safe to delete: proving that needs the source
-            /// edges this decode would have produced. So retain it, record it, and walk on. The object
-            /// stays visible to fsck, which counts it as unreachable; the alternative -- letting this
-            /// escape -- aborts the round and every later round on the same object, which stops
-            /// reclamation for the whole pool rather than for this one key.
+            /// Malformed bytes are retained and counted. Any other error fails the round: retaining would label a
+            /// valid object undecodable.
+            if (!isMalformedStoredRecordError(e))
+            {
+                e.addMessage("while the orphan sweep decodes the manifest `{}` of namespace `{}`", candidate.key,
+                             candidate.ns.string());
+                throw;
+            }
             LOG_ERROR(getLogger("CasOrphanManifestSweep"),
                 "CAS orphan sweep: manifest at {} cannot be decoded and was retained; run cas-fsck to "
                 "enumerate such objects", candidate.key);

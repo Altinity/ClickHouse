@@ -130,7 +130,8 @@ std::shared_ptr<FakeNativeCopyObjectStorage> makeFakeNativeCopyStorage(bool nati
     std::filesystem::create_directories(root, ec);
 
     DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
-    return std::make_shared<FakeNativeCopyObjectStorage>(std::move(settings), native_only_copy_supported);
+    return DB::Cas::tests::ownedByDirectory(
+        std::make_shared<FakeNativeCopyObjectStorage>(std::move(settings), native_only_copy_supported), root);
 }
 
 /// A fake object-store sink for Task 4 of the S3-native staging plan (`DB::Cas::CaContentWriteBuffer`'s
@@ -752,8 +753,10 @@ std::shared_ptr<DB::ContentAddressedMetadataStorage> makeS3StagingMetadataStorag
     auto settings = DB::Cas::tests::makeSettingsForTest(server_root_id, scratch);
     settings[DB::ContentAddressedSetting::staging_backend] = "s3";
     settings.validate();
-    return std::make_shared<DB::ContentAddressedMetadataStorage>(
-        object_storage, "pool", "srv1", /*disk_name_=*/"", /*context_=*/nullptr, settings);
+    return DB::Cas::tests::ownedByDirectory(
+        std::make_shared<DB::ContentAddressedMetadataStorage>(
+            object_storage, "pool", "srv1", /*disk_name_=*/"", /*context_=*/nullptr, settings),
+        scratch);
 }
 
 /// Mirrors gtest_ca_wiring.cpp's helper of the same shape.
@@ -1294,6 +1297,12 @@ public:
             objects.erase(object.remote_path);
     }
 
+    /// S3 sends an unconditional delete under every retry profile; the intent probe and GC use it.
+    void removeObjectsIfExistUnderProfile(const DB::StoredObjects & objects_to_remove, const DB::ObjectStorageControlRequest &) override
+    {
+        removeObjectsIfExist(objects_to_remove);
+    }
+
     /// `path` is a bare CAS-relative prefix (e.g. `"pool/"` or `"pool/_probe/<hex>"`) -- exactly what
     /// `Backend::list`'s Native-mode path passes through unchanged (it applies no prefix stripping of
     /// its own there) and expects back on every listed key. A plain string-prefix scan over the
@@ -1463,7 +1472,7 @@ std::shared_ptr<FakeGenerationObjectStorage> makeFakeGenerationObjectStorageForT
     std::filesystem::create_directories(root, ec);
 
     DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
-    return std::make_shared<FakeGenerationObjectStorage>(std::move(settings));
+    return DB::Cas::tests::ownedByDirectory(std::make_shared<FakeGenerationObjectStorage>(std::move(settings)), root);
 }
 
 }
