@@ -750,25 +750,19 @@ void PocoHTTPClient::makeRequestInternalImpl(
             const bool is_success_status = status_code >= SUCCESS_RESPONSE_MIN && status_code <= SUCCESS_RESPONSE_MAX;
             if (is_read_request && is_success_status && HostResolver::latencyAwareSelectionEnabled() && proxy_configuration.isEmpty())
             {
-                /// Best-effort telemetry: the HTTP response has already been received, so an
-                /// allocation failure (for example `MEMORY_LIMIT_EXCEEDED` in `getResolvedHost`
-                /// when `_resolved_host` exceeds SSO) must not abort the S3 request.
-                try
+                /// No `try`/`catch` here: `reportLatency` itself does not allocate, and the only
+                /// remaining failures are a memory limit exception from the address parsing below or
+                /// a query cancellation, which must propagate like in any other allocation of this
+                /// request instead of being swallowed and logged.
+                Poco::Net::IPAddress resolved_ip;
+                const std::string resolved_host = session->getResolvedHost();
+                if (!resolved_host.empty() && Poco::Net::IPAddress::tryParse(resolved_host, resolved_ip))
                 {
-                    Poco::Net::IPAddress resolved_ip;
-                    const std::string resolved_host = session->getResolvedHost();
-                    if (!resolved_host.empty() && Poco::Net::IPAddress::tryParse(resolved_host, resolved_ip))
-                    {
-                        /// Use `tryGetResolver` rather than `getResolver`: if the DNS cache was just
-                        /// dropped (`SYSTEM DROP DNS CACHE`) and DNS is transiently failing, creating
-                        /// a resolver here would run DNS and throw.
-                        if (auto resolver = HostResolversPool::instance().tryGetResolver(target_uri.getHost()))
-                            resolver->reportLatency(resolved_ip, first_byte_us);
-                    }
-                }
-                catch (...)
-                {
-                    tryLogCurrentException(log, "Failed to report S3 read latency");
+                    /// Use `tryGetResolver` rather than `getResolver`: if the DNS cache was just
+                    /// dropped (`SYSTEM DROP DNS CACHE`) and DNS is transiently failing, creating
+                    /// a resolver here would run DNS and throw.
+                    if (auto resolver = HostResolversPool::instance().tryGetResolver(target_uri.getHost()))
+                        resolver->reportLatency(resolved_ip, first_byte_us);
                 }
             }
 

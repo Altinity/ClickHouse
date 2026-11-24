@@ -135,8 +135,7 @@ public:
     /// when the address is unknown; marks weights dirty so `selectBest` recomputes them lazily on
     /// the next `resolve`. Does not allocate in the steady state (no heap use after the lock is
     /// taken), but it is not declared `noexcept`: the lock and `Poco::Net::IPAddress` comparisons
-    /// are not guaranteed not to throw, so callers that must not fail after an HTTP response has
-    /// been received (`PocoHTTPClient`) guard the call themselves.
+    /// are not guaranteed not to throw. Callers let such an exception propagate.
     void reportLatency(const Poco::Net::IPAddress & address, UInt64 microseconds);
 
     /// Consistent point-in-time snapshot of per-address latency EWMAs, captured under a single
