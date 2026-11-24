@@ -832,8 +832,9 @@ TEST(CASGCArithmeticIntake, ProbingSaturatesAtTheTopOfTheSequenceRange)
 /// nothing else on its `_log` keys. Planning adds no `LIST`.
 TEST(CASGCArithmeticIntake, AQuietLifeCostsOneCheckpointReadAndOneAbsentFirstKey)
 {
-    /// The `LIST` requests of this round on the commit before planning was added.
-    constexpr size_t base_round_lists = 5;
+    /// The `LIST` requests of a round that plans nothing new: planning adds none. The orphan manifest sweep, which
+    /// the previous round ran, is not due again inside its interval and lists nothing.
+    constexpr size_t base_round_lists = 4;
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
