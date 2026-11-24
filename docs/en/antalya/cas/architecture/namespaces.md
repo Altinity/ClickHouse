@@ -96,7 +96,8 @@ There is no explicit "create namespace" statement; a namespace is born the first
 resolves its ref table (`CasRefLedger::resolveNamespaceLife`, bounded at 32 loop attempts). If the
 catalog has no row for the name at all, the resolving mount admits a `Creating` entry stamped with
 its own creator fence and a freshly minted `life_id`
-(`CasRefCatalog::createNamespace` → `casAdmitEntry`). Two more steps make it usable:
+(`CasRefCatalog::createNamespace` → `createNamespaceStep1`). Each decision mints a new `life_id`. An
+attempt of unknown fate is decided again on a fresh read and is never resent. Two more steps make it usable:
 
 1. **Publish the genesis checkpoint.** The first `_ckpt` ever written for this `life_id` carries
    `life_epoch = creator.writer_epoch` — the only writer that will ever know this namespace's
@@ -125,6 +126,36 @@ committed and precommit binding and ends with a terminal `RemoveNamespace` op. R
 refused by an admission check — Constraint 13 in the catalog's own spec — it always succeeds once
 the fence holds.
 
+When the drop fails before the row is `Removing`, what happens to the lane depends on whether a write was sent:
+
+- No attempt of the `Live -> Removing` write was sent (for example a failed catalog read or
+  `gc/state` read, a lost lease, or a row that changed before the write): nothing can land. The lane
+  reopens if a fresh read still shows the original `Live` row under the same mount fence, and no
+  earlier attempt on this runtime left a write that may still land.
+- An attempt was sent and the row is not proven `Removing`: the write may have reached the store and
+  may still land. The lane stays closed, even if a fresh read shows the original `Live` row.
+
+A runtime acquired for a row that is already `Removing` (a presence probe, a retried `DROP TABLE`)
+refuses writes from the moment it exists with "is Removing" and serves no reads. A failed removal does
+not reopen it.
+
+A lane closed by an unresolved removal write has two ways out: a retried `DROP TABLE` that completes
+the removal, or a remount of the disk (a server restart, or the self-remount after a lost lease). A
+remount reopens the lane but does not cancel the write. Until one of the two happens:
+
+- Writes to the table fail with a retry-later error that says "a removal write may still land".
+- Reads see the table as absent, although the catalog row can still be `Live`.
+- The ref-table cache does not evict the table, because a fresh runtime would start with the lane open.
+- The server logs `the outcome of its Live -> Removing catalog write is unknown` once per drop attempt
+  that ends this way.
+
+If the write lands after a remount, the row becomes `Removing` while the table keeps accepting writes
+and serving reads. The stop comes when an admission reads the row: a restart, a remount, a
+`DROP TABLE`; on the server that is the `GC` leader, also its next `GC` round. An eviction of the
+runtime or a presence probe is not a reliable stop. From then on writes fail with "is Removing" and
+reads see no files. Without a terminal record `GC` does not erase the row and deletes none of the
+table's live data; it still cleans what the table itself dropped, as for a live table.
+
 Nothing is deleted by the writer at this point. No blob, no manifest, no ref-log object physically
 disappears here — only pointers move, exactly like an ordinary [`DROP TABLE`](/antalya/cas/architecture/part-lifecycle#operation-mapping)
 on any other ref.
@@ -150,7 +181,7 @@ proven its ref history is fully drained.
 |---|---|---|
 | Catalog row (`cas/ref_catalog` entry) | `GC` phase 2, `pre_fold_ref_drain` | The round after the fold that sealed cleanup evidence for this life |
 | Part manifest bodies | Ordinary owner-removal ([phase 15](/antalya/cas/architecture/garbage-collection#the-round)) for anything that had a committed or precommit binding, the [orphan-manifest sweep](/antalya/cas/architecture/manifests-and-refs#orphan-sweep) for anything that never got that far | As each owning ref is dropped by the removal transaction itself, independent of the catalog row |
-| Blob bodies | The ordinary condemn/graduate/delete pipeline | Whenever the manifests that named them stop being live, same as any other blob |
+| Blob bodies | The ordinary pipeline: condemn, delete the body, remove the intent | Whenever the manifests that named them stop being live, same as any other blob |
 | Ref stream/state objects (`_log`, `_snap`, `_ckpt`, `_files`) under the dead `life_id` | The perpetual namespace janitor ([phase 16](/antalya/cas/architecture/garbage-collection#the-round)) | Best-effort, in bounded `LIST` pages under a per-round time budget, whenever it next lists a key whose `life_id` a fresh catalog cut no longer names — independent of, and not gated on, catalog-row deletion |
 
 The janitor is leak-only: it never fails a round, never blocks progress on an unreadable key, and a

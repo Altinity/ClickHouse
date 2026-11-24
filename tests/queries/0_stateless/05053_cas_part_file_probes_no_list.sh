@@ -12,7 +12,7 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
 
-DISK="disk(type = object_storage, object_storage_type = local, metadata_type = cas,
+DISK="disk(type = object_storage, object_storage_type = local, metadata_type = cas, cas_unsafe_remount_no_delay = 1,
     cas_server_root_id = '${CLICKHOUSE_DATABASE}_cas95',
     name = '${CLICKHOUSE_DATABASE}_cas95_cas',
     path = '${CLICKHOUSE_DATABASE}_cas95_cas_pool/')"

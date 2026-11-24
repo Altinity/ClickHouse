@@ -233,8 +233,14 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
     /// discipline as `emit`: a throwing sink must never break GC. Cleared on the way out (on the
     /// exception path too), so it never outlives the locals it captures -- this guard is declared after
     /// them, so it is destroyed before them.
+    UInt64 keys_listed = 0;
     round_gc.setPhaseSink([&](const Cas::GcPhaseRecord & p)
     {
+        if (p.phase == "defer_decision")
+        {
+            if (const auto it = p.metrics.find("ref_keys_listed"); it != p.metrics.end())
+                keys_listed = it->second;
+        }
         Rec row = start;
         row.event_type = Rec::EventType::Phase;
         row.phase = p.phase;
@@ -278,11 +284,30 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
         fin.objects_spared = r.spared;
         fin.manifests_deleted = r.manifests_deleted;
         fin.entries_condemned = r.condemned;
-        fin.entries_graduated = r.graduated;
-        fin.entries_redeleted = r.redeleted;
-        fin.entries_redelete_failed = r.redelete_failed;
+        fin.entries_intent_confirmed = r.intent_confirmed;
+        fin.entries_bodies_deleted = r.bodies_deleted;
+        fin.entries_body_delete_failed = r.body_delete_failed;
         fin.fence_outs = r.fence_outs;
         fin.anomalies = r.anomalies.size();
+    };
+    /// A follower ticks every interval and a deferred round did no work, so neither is worth an `Information` line.
+    const auto log_finish = [&]
+    {
+        const char * outcome_name = nullptr;
+        switch (fin.outcome)
+        {
+            case Rec::Outcome::Success: outcome_name = "Success"; break;
+            case Rec::Outcome::Aborted: outcome_name = "Aborted"; break;
+            case Rec::Outcome::Failed: outcome_name = "Error"; break;
+            case Rec::Outcome::Stopped: outcome_name = "Stopped"; break;
+            case Rec::Outcome::Unknown:
+            case Rec::Outcome::NotALeader:
+            case Rec::Outcome::Deferred:
+                return;
+        }
+        LOG_INFO(log, "GC round finished: round={} outcome={} trigger={} duration_ms={} deleted={} condemned={} error_code={} keys_listed={}",
+            fin.round, outcome_name, fin.trigger == Rec::Trigger::Manual ? "Manual" : "Scheduled",
+            fin.duration_ms, fin.objects_deleted, fin.entries_condemned, fin.error_code, keys_listed);
     };
     try
     {
@@ -292,7 +317,7 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
             /// Keep health state per scheduler. Process-global gauges cannot distinguish multiple
             /// content-addressed disks in one server process.
             pending_reclaim.fetch_add(
-                static_cast<Int64>(rep.condemned) - static_cast<Int64>(rep.redeleted),
+                static_cast<Int64>(rep.condemned) - static_cast<Int64>(rep.bodies_deleted),
                 std::memory_order_relaxed);
             last_success_ms.store(
                 static_cast<UInt64>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -306,6 +331,7 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
         fin.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
         fin.profile_events = collect_profile_events();
+        log_finish();
         emit(fin);
         return rep;
     }
@@ -322,6 +348,7 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
         fin.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
         fin.profile_events = collect_profile_events();
+        log_finish();
         emit(fin);
         throw;
     }
@@ -412,7 +439,7 @@ void CasGcScheduler::loop()
                 /// instead of adding a boolean to the counters line.
                 if (report.deferred)
                     LOG_DEBUG(log, "CA GC round {}: deferred (skip-unchanged; no changed shard reached the "
-                        "fold threshold and no graduation was due; sealed generation re-adopted, no fold ran)",
+                        "fold threshold and no row decision was due; sealed generation re-adopted, no fold ran)",
                         report.round);
                 else
                     LOG_DEBUG(log, "CA GC round {}: candidates={} deleted={} absent={} replaced={} spared={} manifests_deleted={}",

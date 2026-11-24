@@ -25,7 +25,8 @@ namespace DB::Cas
 /// CRITICAL -- an unrecognized `!`-key fails closed with `UNKNOWN_FORMAT_VERSION` rather than being
 /// silently skipped, since dropping it would lose INV-2's chain evidence while still passing the
 /// structural grammar) chains to the transaction id of the seal that closed the PRECEDING epoch, and
-/// its own `writer_epoch` is exactly one below the referencing transaction's. `prev_epoch_seal` is
+/// its own `writer_epoch` is exactly one below the referencing transaction's (below header generation 3;
+/// from generation 3 it is only strictly below). `prev_epoch_seal` is
 /// required on exactly sequence 1 of every epoch above the namespace's genesis (`life_epoch`, the
 /// writer epoch of its `NamespaceBirth`) and forbidden elsewhere -- see
 /// `validateEpochSealGrammarStructural` and `validateEpochSealGrammarContextual`.
@@ -100,6 +101,9 @@ struct RefLogTxn
     /// spell out an explicit trailing `std::nullopt` -- appending is still the smaller, purely
     /// mechanical diff (one token per call site) compared to inserting a field in the middle.
     std::optional<RefTxnId> prev_epoch_seal;
+    /// Set only on an `EpochSeal` transaction (a tombstone): the epoch that follows the one it closes.
+    /// Wire key `!next_epoch`; present only under header 3.
+    std::optional<uint64_t> next_epoch = std::nullopt;
 
     bool operator==(const RefLogTxn &) const = default;
 };
@@ -129,6 +133,14 @@ inline constexpr size_t ref_op_max_bytes = 4096;
 /// non-canonical `ref_name`, an out-of-range `manifest_ref`, an unknown op kind, or an op-count/byte
 /// limit violation over the encoded text.
 String encodeRefLogTxn(const RefLogTxn & txn);
+
+/// The header generation `encodeRefLogTxn` stamps: `G_REF_CHAIN` iff `next_epoch` or `prev_epoch_seal` is set,
+/// else `G_REF_MOVE` iff the transaction has a `Move`, else `currentCompatibilityVersion`.
+uint32_t refLogTxnHeaderGeneration(const RefLogTxn & txn);
+
+/// Encodes under an explicit header generation. Throws CORRUPTED_DATA for a generation below what the
+/// content needs (a `Move` needs 2, `next_epoch` needs 3) or above `G_REF_CHAIN`.
+String encodeRefLogTxnAtGeneration(const RefLogTxn & txn, uint32_t header_generation);
 
 /// True iff the transaction carries an owner move; such a log is stamped `G_REF_MOVE`.
 bool refLogTxnContainsMove(const RefLogTxn & txn);
@@ -170,20 +182,22 @@ bool refLogTxnIsRemovalClass(const std::vector<RefOp> & ops);
 /// is `EpochSeal`. Unlike `refLogTxnIsRemovalClass` (a class predicate that tolerates other ops
 /// alongside `RemoveNamespace`), a seal transaction's grammar forbids any companion op (spec INV-2),
 /// so this checks the exact shape rather than mere presence -- callers that decode untrusted bytes
-/// and branch on "is this a seal" (Task 2's slot-occupy walk) get a precise answer.
+/// and branch on "is this a seal" get a precise answer.
 bool refLogTxnIsEpochSeal(const RefLogTxn & txn);
 
-/// The context-free half of the INV-2 seal grammar: a transaction carrying an `EpochSeal` op contains
-/// EXACTLY that one op, and `prev_epoch_seal`, when present, is well-formed (both `RefTxnId`
-/// components nonzero), appears ONLY at `txn_id.ref_sequence == 1`, and names the IMMEDIATELY
-/// preceding epoch (`prev_epoch_seal->writer_epoch + 1 == txn_id.writer_epoch`) -- a self, forward,
-/// or skipping pointer is rejected even though it cannot arise from `writeLogMeta`'s own writer,
-/// because Tasks 2/6 walk this pointer backwards over untrusted decoded bodies. Called by both
-/// `encodeRefLogTxn` and
-/// `decodeRefLogTxn`, so a caller-built transaction and a decoded one are held to the identical rule.
-/// Throws CORRUPTED_DATA on violation. Does NOT check the required-iff rule -- that needs
-/// `life_epoch`, which the codec never sees; see `validateEpochSealGrammarContextual`.
-void validateEpochSealGrammarStructural(const RefLogTxn & txn);
+/// The context-free half of the seal grammar, by `header_generation`. At every generation a transaction
+/// carrying an `EpochSeal` op contains EXACTLY that one op, and `prev_epoch_seal`, when present, is
+/// well-formed (both `RefTxnId` components nonzero), appears ONLY at `txn_id.ref_sequence == 1` and has a
+/// strictly lower `writer_epoch` (a self or forward pointer is rejected). Below generation 3 it must also name
+/// the IMMEDIATELY preceding epoch (`prev_epoch_seal->writer_epoch + 1 == txn_id.writer_epoch`); from
+/// generation 3 the adjacency is dropped. `next_epoch` is allowed only from generation 3 and only on an
+/// `EpochSeal` transaction, where it must exceed `txn_id.writer_epoch`; a generation 3 `EpochSeal`
+/// transaction must carry it. Called by both `encodeRefLogTxnAtGeneration` and `decodeRefLogTxn` (with the
+/// generation read from the header), so a caller-built transaction and a decoded one are held to the identical
+/// rule, because walkers follow these pointers over untrusted decoded bodies. Throws CORRUPTED_DATA on
+/// violation. Does NOT check the required-iff rule -- that needs `life_epoch`, which the codec never sees; see
+/// `validateEpochSealGrammarContextual`.
+void validateEpochSealGrammarStructural(const RefLogTxn & txn, uint32_t header_generation);
 
 /// The contextual half of the INV-2 seal grammar: `prev_epoch_seal` is required on exactly
 /// `txn_id.ref_sequence == 1` of every epoch with `txn_id.writer_epoch > life_epoch` (a namespace's

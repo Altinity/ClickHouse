@@ -29,16 +29,14 @@ struct CatalogLifecycleReconcileResult
 {
     AuthorityStatus authority_status;
     CatalogResolution catalog_resolution;
-    std::vector<NamespaceLifeId> retired_lives;
     std::optional<CasRefCatalog::Snapshot> final_catalog_cut;
-    uint64_t deleted = 0;
 };
 
 /// Settles catalog rows that an already-adopted parent fold seal proved safe to remove.
 ///
 /// This component owns only deterministic eligible-row selection and the catalog `N + 1` drain.
 /// It neither discovers the parent seal nor performs a hot ref LIST, ref walk, fold, publication,
-/// runtime invalidation, or physical deletion.
+/// or physical deletion. Runtime invalidation is the caller's `before_erase`.
 class CatalogLifecycleReconciler
 {
 public:
@@ -49,7 +47,23 @@ public:
     /// every erase is authorised by a reading taken in its own attempt, and it is run once more before
     /// the drain-complete verdict, which would otherwise report from the reading its last erase left.
     /// It is a refresh, not a verdict: the verdict stays `op.admitted()`.
-    CatalogLifecycleReconcileResult reconcile(const std::function<void()> & refresh_authority);
+    ///
+    /// `before_erase` is called with each life before its first erase attempt, so the caller can
+    /// record the retirement while the row still exists; the erase may not follow.
+    CatalogLifecycleReconcileResult reconcile(
+        const std::function<void()> & refresh_authority,
+        const std::function<void(const NamespaceLifeId &)> & before_erase);
+
+    /// The two records below grow as `reconcile` runs and stay readable after it throws.
+
+    /// Erases the store acknowledged, plus erases whose resolution read found the row absent after an
+    /// unacknowledged attempt; each erase counts once.
+    uint64_t completedErases() const { return completed_erases; }
+
+    /// Lives whose erase was acknowledged or whose row a resolution read found gone, in order: each was
+    /// announced to `before_erase` first. An admission that began after that announcement saw no
+    /// retirement, so the caller announces these lives again.
+    const std::vector<NamespaceLifeId> & retiredLives() const { return retired_lives; }
 
 private:
     std::optional<CatalogEntry> selectEligible(const CasRefCatalog::Snapshot & catalog) const;
@@ -59,6 +73,8 @@ private:
     CasOperation & op;
     const Layout & layout;
     const CasFoldSeal & adopted_parent;
+    uint64_t completed_erases = 0;
+    std::vector<NamespaceLifeId> retired_lives;
 };
 
 }

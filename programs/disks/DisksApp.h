@@ -32,6 +32,10 @@ public:
     void printCommandHelpMessage(CommandPtr command) const;
     void printAvailableCommandsHelpMessage() const;
 
+    /// The process arguments after the program name, parsed as `init` parses them; a message that prints a command
+    /// line can be checked against it.
+    static CommandLineOptions parseCommonArguments(const std::vector<String> & arguments);
+
 
     ~DisksApp() override;
 
@@ -39,6 +43,7 @@ private:
     void registerCommands();
 
     void addOptions();
+    static void describeCommonOptions(ProgramOptionsDescription & options, PositionalProgramOptionsDescription & positional);
 
     void processOptions();
 

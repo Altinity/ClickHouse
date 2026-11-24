@@ -47,8 +47,8 @@ CasRequests makeRequests(Backend & backend, DB::Cas::tests::FakeClock * clock = 
 {
     BackendPtr ptr(&backend, [](Backend *) {});
     if (clock)
-        return CasRequests(std::move(ptr), Fence::open(), clock->nowFn(), clock->sleepFn());
-    return CasRequests(std::move(ptr), Fence::open());
+        return CasRequests(std::move(ptr), Fence::open(), clock->nowFn(), clock->sleepFn(), nullptr, DB::Cas::kDefaultRequestWindowMs);
+    return CasRequests(std::move(ptr), Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
 }
 
 /// A Backend decorator whose read/head/list all throw an untyped runtime error when armed — modelling
@@ -102,7 +102,7 @@ TEST(CASSentinelProbe, AttemptNumberPropagates)
     };
     DB::Cas::tests::FakeClock clock;
     auto backend = std::make_shared<ProbeRecording>();
-    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn());
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), nullptr, DB::Cas::kDefaultRequestWindowMs);
     auto op = requests.admit();
     (void)op.probeSentinel("probe", Retry::standard());
     EXPECT_EQ(backend->attempts, (std::vector<size_t>{1, 2}));
@@ -357,7 +357,7 @@ TEST(CASSentinelProbe, InstrumentedBackendForwardsToInnerClassification)
     auto storage = std::static_pointer_cast<ThrowingS3ObjectStorage>(makeThrowingS3StorageForTest());
     storage->throwOnObjectAccess(Aws::S3::S3Errors::NO_SUCH_BUCKET);
     auto inner = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
-    InstrumentedBackend instrumented(inner);
+    InstrumentedBackend instrumented(inner, "pool");
 
     auto requests = makeRequests(instrumented);
     auto op = requests.admit();

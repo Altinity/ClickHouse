@@ -19,23 +19,37 @@ trailer, followed by a banner-framed raw payload zone for inline file bytes.
 | Key (under the pool prefix) | Object | Codec | Writer |
 |---|---|---|---|
 | `_pool_meta` | pool identity + floors (`pool_id`, `blob_header_len`, `gc_shards`, `min_reader_generation`, `algos_used` array) | `CasPoolMetaFormat` | pool create/admit |
-| `cas/ns/stream/<life_id>/_log/…​.zst` | ref transaction log (`namespace`, `txn_epoch`/`txn_seq`, optional critical `!prev_epoch`/`!prev_seq`; `set_published_at` uses `ref`/`published_ms`) | `CasRefLogFormat` (`.zst`) | writer commit path |
+| `cas/ns/stream/<life_id>/_log/…​.zst` | ref transaction log (`namespace`, `txn_epoch`/`txn_seq`, optional critical `!prev_epoch`/`!prev_seq`, and `!next_epoch` on a tombstone; `set_published_at` uses `ref`/`published_ms`) | `CasRefLogFormat` (`.zst`) | writer commit path |
 | `cas/ns/stream/<life_id>/_snap/…​.zst` | complete live ref table (`namespace`, `snapshot_epoch`/`snapshot_seq`, `lifecycle:"live"`; `kind` is `committed`/`precommit`, with `ref` and committed-only `published_ms`) | `CasRefSnapshotFormat` (`.zst`) | writer/GC fold |
-| `cas/ns/state/<life_id>/_ckpt` | mutable life checkpoint (`life_epoch`, `committed_epoch`/`committed_seq`, `snapshot_epoch`/`snapshot_seq`, `seal_epoch`/`seal_seq`) | `CasRefCkptFormat` | writer/GC fold |
+| `cas/ns/state/<life_id>/_ckpt` | mutable life checkpoint: generation 3 holds `life_epoch` and `snapshot_epoch`/`snapshot_seq`; generations 1 and 2 also `committed_epoch`/`committed_seq`, `seal_epoch`/`seal_seq` (read only) | `CasRefCkptFormat` | namespace creation, snapshot publication, the generation 3 stamp |
 | `cas/ns/state/<life_id>/_files/…​` | namespace-owned raw files | — | upper layers |
 | `cas/ref_catalog` | namespace lifecycle catalog (`kind:"entry"`, `ns`, `state`, `life`, `remove_round`, `creator`, `creator_epoch`, `creator_fence`) | `CasRefCatalogFormat` | namespace admission/removal |
 | `cas/manifests/<ns>/<epoch-hex>-<seq-hex>/<ordinal>.zst` | part manifest (`namespace`, `payload_digest`; entry `path`, `place`, `size`) | `CasPartManifestFormat` | part build |
 | blob keys (`CasLayout::blobKey`) | blob envelope (`type`, `v`, `tag`, `build`, `time_ms`, `creator`, `op`, `chver`, `ref`) + payload | `CasBlobEnvelopeFormat` | uploads |
-| blob-meta keys (`CasLayout::blobMetaKey`) | freshness sidecar (`state`, `condemn_round`, `size`) | `CasBlobMetaFormat` | dedup/GC |
-| `gc/state`, `gc/hb` | GC state (`round`, `gc_shards`, `snap_generation`, `snap_pruned_through`, `snap_attempt`, `manifest_sweep_cursor`, `lease_owner`, `lease_seq`) / heartbeat (`owner`, `hb_seq`) | `CasGcStateFormat` | GC |
+| blob-meta keys (`CasLayout::blobMetaKey`) | legacy marker (`state`, `condemn_round`, `size`) | `CasBlobMetaFormat` | no writer; read by `cas-migrate-pool` and `cas-inspect`; `cas-fsck` lists the keys and reads none |
+| `gc/state`, `gc/hb` | GC state (`round`, `gc_shards`, `snap_generation`, `snap_pruned_through`, `snap_attempt`, `manifest_sweep_cursor`, `orphan_manifest_sweep_completed_at_ms`, `intent_sweep_cursor`, `lease_owner`, `lease_seq`) / heartbeat (`owner`, `hb_seq`) | `CasGcStateFormat` | GC |
 | `gc/maintenance_state` | leak-only namespace-janitor cursor (`janitor_cursor`) | `CasGcMaintenanceStateFormat` | future janitor |
 | `gc/gen/<g>/attempt/<a>/outcomes/…​.zst` | outcome log (`kind`, `outcome`) | `CasGcOutcomesFormat` (`.zst`) | GC |
 | `gc/gen/<g>/attempt/<a>/fold_seal` | fold seal (deterministic; `generation`/`parent_generation`, `kind`: `ref_life`/`blob_run`/`condemned`) | `CasFoldSealFormat` | GC |
 | `gc/gen/<g>/…​/runs` | GC source-edge record-stream runs (`ref`, `src`, `mark`; condemned: `pending`, `size`, `condemn_round`, `confirmed`) | `CasRecordStreamFormat` | GC |
-| `gc/server-roots/<srid>/{owner,epoch,mount}` | server-root singletons (`server_uuid`, optional `retired_at_ms`; `next_writer_epoch`; `server_uuid`, `writer_epoch`, `hostname`, `pid`, `started_at_ms`, `seq`, `expires_at_ms`, `min_active_build_sequence`, `gc_fenced`, `write_attempt_id`) | `CasServerRootFormats` | mount |
+| `gc/server-roots/<srid>/{owner,epoch,mount}` | server-root singletons (`server_uuid`, optional `retired_at_ms`, optional `owner_life` (u64 decimal string; absent in 26.6.4 bodies, read as 0; additive, no `v` bump), optional `retirement_verified` (bool; absent = false); `next_writer_epoch`, optional `allocation_nonce` (32 lowercase hex, drawn once per allocation decision; absent in 26.6.4 bodies, which still decode; additive ordinary key, no `v` bump); `server_uuid`, `writer_epoch`, `hostname`, `pid`, `started_at_ms`, `seq`, `expires_at_ms`, `min_active_build_sequence`, `gc_fenced`, `write_attempt_id`) | `CasServerRootFormats` | mount |
 | `roots/…` | raw passthrough (verbatim) | — (never interpreted) | upper layers |
 
 ## Codec table
+
+The manifest sweep schedule uses the existing `manifest_sweep_cursor` and one new UTC millisecond
+timestamp, `orphan_manifest_sweep_completed_at_ms`, encoded as a decimal string. A nonempty cursor
+means that a traversal is in progress across rounds and leaders; an empty cursor means that no
+traversal is in progress. A zero completion timestamp means unknown or never recorded, so an empty
+cursor permits a traversal on the next ordinary fold. Legacy state without the timestamp reads it
+as zero. The completion timestamp is sampled near the `gc/state` commit and changes only when an accepted page
+reaches EOF. It does not mean that all later manifest body deletions succeeded. A zero LIST budget
+disables the sweep without clearing the cursor or completion timestamp.
+
+The previous three-field schedule also stored `orphan_manifest_sweep_active` and
+`orphan_manifest_sweep_started_at_ms`. This reader ignores those keys in old objects and keeps the
+cursor and completion timestamp. The intermediate three-field reader rejects a new completion-only
+object as an incomplete schedule group; rollback to that intermediate reader is unsupported.
 
 Authoritative per-format traits (type string, family, compression policy, caps) live
 in `CasFormat.cpp` (`TRAITS`), asserted complete by `gtest_cas_text_format.cpp`.
@@ -90,7 +104,8 @@ use the corresponding `old_*` and `new_*` key bundles.
 ## Generation history {#generation-history}
 
 The generation history starts at a flat `{1, 1}` baseline (reset before 26.6.4, the first release whose
-pools persist). Current generations: `G_BUILD == 2` (the highest a reader accepts), `G_WRITE_FLOOR == 1` (stamped on
-ordinary objects). Only ref-log transactions that carry a `Move` op are stamped 2.
+pools persist). Current generations: `G_BUILD == 4` (the highest a reader accepts), `G_WRITE_FLOOR == 1` (stamped on
+ordinary objects). A ref-log transaction with `!next_epoch` or `!prev_epoch` and every `_ckpt` are stamped 3; any other
+ref-log transaction that carries a `Move` op is stamped 2.
 Every class's `changePoints` begins at generation 1; a future breaking change appends a real entry to
 that class's own array and bumps `G_BUILD`, the same way it always has.

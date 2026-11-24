@@ -2,12 +2,18 @@
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasWriteResult.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobIntents.h>
 #include <Common/ThreadPool.h>
 
+#include <atomic>
+#include <exception>
+#include <functional>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <unordered_map>
+#include <vector>
 
 namespace DB::Cas
 {
@@ -22,16 +28,17 @@ namespace DB::Cas
 /// moves.
 ///
 /// Why a result may be fetched early: the objects the fold reads are write-once (a present body is
-/// the same body later), an absent position at or below a checkpoint's `committed_through` was
-/// durable before the round began (it is a gap whenever it is read), and a manifest body still being
-/// uploaded when the early read lands yields the same hold a slightly earlier sequential read yields
-/// today. Nothing is hinted above `committed_through`, so no request is issued that the sequential
-/// walk would not issue -- with one bounded exception: a ref-log hinting site does not yet know where
-/// an epoch's closing seal is (it learns that only by decoding the log at that position), so it may
-/// hint ids past the seal, inside the SAME epoch, that turn out not to exist. Those are discarded
-/// rather than taken, overshooting by at most one window per epoch crossing, and counted wasted.
-/// A blob marker is not write-once: the fold hints it only after the round's cut, which is all the
-/// graduation gate needs.
+/// the same body later), a ref log read absent early is still a key read absent during this round,
+/// which is all the fold's cut asks of it, and a manifest body still being uploaded when the early
+/// read lands yields the same hold a slightly earlier sequential read yields.
+///
+/// Only the result TAKEN, in the walk's order, decides anything; a hint never does. So a hint can cost
+/// a wasted read, never change a verdict. The fold's ref-log hints stay inside the epoch of the key
+/// the walk reads next, up to the greatest id the round's listing shows in that epoch, and, while the
+/// walk has a read budget, within it. `walkRefChain`, through `ReadAheadKeyReader`, hints inside the
+/// current epoch, up to a generation 1 or 2 `committed_through` when it has one. A hinted key the walk
+/// never takes -- past a tombstone, past the chain's end, or after a hold -- is discarded and counted
+/// wasted.
 ///
 /// Memory is the CALLER's to bound: `pending` counts hinted-but-untaken slots and `window` is how
 /// many a hinting site keeps in flight. A key hinted twice is one request. Results never taken are
@@ -60,6 +67,16 @@ public:
     /// the budget are re-observed by the very next request anyway. A key nobody hinted is a no-op.
     void discardRead(const String & key);
     void discardHead(const String & key);
+
+    /// Runs one intent create on the pool, under the same admitted generation, and returns the function that
+    /// waits for its answer or rethrows what it threw; call it once, on the owning thread, while this object lives.
+    /// Unlike a hint it always runs: at concurrency 1 it runs here, before this returns. Once a create on the pool
+    /// throws, a create that starts later sends nothing and rethrows that first exception, so the caller sees the
+    /// store's error whichever answer it takes first. The destructor waits for every create whose answer was not taken.
+    std::function<IntentCreateResult()> startCreate(std::function<IntentCreateResult(CasOperation &)> request);
+
+    /// Creates started on the pool whose answer is not taken yet; for tests.
+    size_t untakenCreates() const { return creates.size(); }
 
     /// Hinted but not yet taken, both verbs together: what a hinting site throttles itself against.
     size_t pending() const { return reads.size() + heads.size(); }
@@ -100,8 +117,19 @@ private:
     /// round's own -- never with a fresher admission the round itself would not have had.
     const uint64_t generation;
 
+    /// The first exception of a create on the pool. Shared with the jobs, which read it after the answers are taken.
+    struct CreateFailure
+    {
+        std::mutex mutex;
+        std::exception_ptr first;
+        std::atomic<bool> failed{false};
+    };
+
     Slots<Object> reads;
     Slots<Meta> heads;
+    std::unordered_map<uint64_t, std::future<IntentCreateResult>> creates;
+    uint64_t next_create = 0;
+    const std::shared_ptr<CreateFailure> create_failure = std::make_shared<CreateFailure>();
 };
 
 }

@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobMetaFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCkptFormat.h>
@@ -10,6 +11,9 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <IO/WriteBufferFromString.h>
 #include "cas_test_helpers.h"
+
+#include <algorithm>
+#include <sstream>
 
 using namespace DB::Cas;
 
@@ -73,7 +77,8 @@ TEST(CASInspect, RendersEpochSealTxnWithPrevEpochSeal)
     txn.ops.push_back(op);
 
     const String key = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), id);
-    const String bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(txn));
+    /// An old-format seal: only a header below 3 carries one without `next_epoch`.
+    const String bytes = sealObject(FormatId::RefLog, encodeRefLogTxnAtGeneration(txn, 1));
 
     const String json = caInspectToJson(layout, key, bytes, DB::Cas::tests::fixture::fixtureLife(ns));
     EXPECT_NE(json.find(R"("kind":"epoch_seal")"), String::npos) << json;
@@ -213,6 +218,7 @@ TEST(CASInspect, RendersBlobTargetRunEdgeAndCondemnedRows)
     condemned_rec.size = 123;
     condemned_rec.condemn_round = 7;
     condemned_rec.marker_confirmed = true;
+    condemned_rec.standing = true;
 
     SourceEdgeRecord edge_rec;
     edge_rec.ref = bh(2);
@@ -235,6 +241,7 @@ TEST(CASInspect, RendersBlobTargetRunEdgeAndCondemnedRows)
     EXPECT_NE(json.find(R"("kind":"edge")"), String::npos) << json;
     EXPECT_NE(json.find(R"("kind":"condemned")"), String::npos) << json;
     EXPECT_NE(json.find(R"("delete_pending":true)"), String::npos) << json;
+    EXPECT_NE(json.find(R"("standing":true)"), String::npos) << json;
     EXPECT_NE(json.find(R"("condemn_round":7)"), String::npos) << json;
     EXPECT_NE(json.find(R"("value":"etag-1")"), String::npos) << json;
     EXPECT_NE(json.find(R"("type":"emulated")"), String::npos) << json;
@@ -261,7 +268,7 @@ TEST(CASInspect, RendersRefCkptWithEveryFieldPresent)
                        .last_epoch_seal = RefTxnId{6, 4}};
 
     const String json = caInspectToJson(
-        layout, layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns)), encodeRefCkpt(ckpt),
+        layout, layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns)), encodeRefCkptAtGeneration(ckpt, 1),
         DB::Cas::tests::fixture::fixtureLife(ns));
     EXPECT_NE(json.find(R"("object":"ref_ckpt")"), String::npos) << json;
     /// The namespace comes from the KEY: a `_ckpt` body does not name it.
@@ -281,7 +288,7 @@ TEST(CASInspect, RendersRefCkptAbsencesAsExplicitNulls)
     const RootNamespace ns{"srv1/db/fresh"};
 
     const String json = caInspectToJson(
-        layout, layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns)), encodeRefCkpt(RefCkpt{}),
+        layout, layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns)), encodeRefCkptAtGeneration(RefCkpt{}, 1),
         DB::Cas::tests::fixture::fixtureLife(ns));
     EXPECT_NE(json.find(R"("object":"ref_ckpt")"), String::npos) << json;
     EXPECT_NE(json.find(R"("life_epoch":null)"), String::npos) << json;
@@ -336,4 +343,108 @@ TEST(CASInspect, RefObjectRequiresTheExactCatalogResolution)
         layout, key, bytes, NamespaceLifeId::fromCatalogEntry(RootNamespace{"redirected"}, life.incarnation)),
         DB::Exception);
     EXPECT_NO_THROW(caInspectToJson(layout, key, bytes, life));
+}
+
+TEST(CASInspect, PrintsGenerationNextEpochAndTheStrayNote)
+{
+    DB::Cas::tests::ScopedReadCeiling c(3);
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/db/tbl"};
+    const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(ns);
+
+    RefCkpt ckpt = DB::Cas::tests::refCkptOf(1, std::nullopt, RefTxnId{5, 1});
+    const String ckpt_json = caInspectToJson(layout, layout.refCkptKey(life), encodeRefCkptAtGeneration(ckpt, 3), life);
+    EXPECT_NE(ckpt_json.find("\"generation\":3"), String::npos) << ckpt_json;
+
+    const RefLogTxn tombstone = DB::Cas::tests::tombstoneTxn(ns.string(), RefTxnId{1, 2}, 5);
+    const String tombstone_json = caInspectToJson(
+        layout, layout.refLogKey(life, tombstone.txn_id), sealObject(FormatId::RefLog, encodeRefLogTxn(tombstone)), life);
+    EXPECT_NE(tombstone_json.find("\"next_epoch\":5"), String::npos) << tombstone_json;
+
+    RefLogTxn below;
+    below.ns = ns.string();
+    below.txn_id = RefTxnId{1, 3};
+    below.ops.push_back(DB::Cas::tests::namespaceBirthOp());
+    const String below_key = layout.refLogKey(life, below.txn_id);
+    const String below_bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(below));
+    const String stray_json = caInspectToJson(layout, below_key, below_bytes, life, RefTxnId{5, 1});
+    EXPECT_NE(stray_json.find("may be a stray"), String::npos) << stray_json;
+    EXPECT_EQ(caInspectToJson(layout, below_key, below_bytes, life, RefTxnId{1, 2}).find("may be a stray"), String::npos);
+}
+
+TEST(CASInspect, RendersTheMountLeaseLastUncleanEpoch)
+{
+    const Layout layout("p");
+    MountLease lease;
+    lease.server_uuid = DB::UInt128(1);
+    lease.write_attempt_id = DB::UInt128(2);
+    lease.writer_epoch = 7;
+    lease.last_unclean_epoch = 3;
+    const String json = caInspectToJson(layout, layout.mountKey("srv1"), encodeMountLease(lease));
+    EXPECT_NE(json.find("\"last_unclean_epoch\":3"), String::npos) << json;
+
+    lease.last_unclean_epoch.reset();
+    const String older = caInspectToJson(layout, layout.mountKey("srv1"), encodeMountLease(lease));
+    EXPECT_NE(older.find("\"last_unclean_epoch\":null"), String::npos) << older;
+}
+
+TEST(CASInspect, UndecodableCheckpointCostsOnlyTheStrayLabel)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    const Layout layout("p");
+    const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(RootNamespace{"srv1/db/tbl"});
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+
+    std::ostringstream absent_diagnostics;
+    EXPECT_EQ(readInspectBaseSnapshotId(op, layout, life, absent_diagnostics), std::nullopt);
+    EXPECT_TRUE(absent_diagnostics.str().empty());
+
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(life), "not a checkpoint", Retry::standard())));
+    std::ostringstream diagnostics;
+    std::optional<RefTxnId> base;
+    EXPECT_NO_THROW(base = readInspectBaseSnapshotId(op, layout, life, diagnostics));
+    EXPECT_EQ(base, std::nullopt);
+    const String printed = diagnostics.str();
+    EXPECT_NE(printed.find(layout.refCkptKey(life)), String::npos) << printed;
+    EXPECT_EQ(std::count(printed.begin(), printed.end(), '\n'), 1) << printed;
+    EXPECT_EQ(std::count(printed.begin(), printed.end(), '\n'), 1) << printed;
+
+    /// A required (`!`-prefixed) key this build does not know raises `UNKNOWN_FORMAT_VERSION`, not `CORRUPTED_DATA`.
+    const NamespaceLifeId critical_life = DB::Cas::tests::fixture::fixtureLife(RootNamespace{"srv1/db/critical"});
+    String with_critical = encodeRefCkptAtGeneration(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .committed_through = RefTxnId{1, 1},
+                                                             .checkpoint_snapshot_id = RefTxnId{1, 1}, .last_epoch_seal = std::nullopt}, 1);
+    with_critical.replace(with_critical.rfind('}'), 1, R"(,"!zz":"1"})");
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(critical_life), with_critical, Retry::standard())));
+    std::ostringstream critical_diagnostics;
+    std::optional<RefTxnId> critical_base;
+    EXPECT_NO_THROW(critical_base = readInspectBaseSnapshotId(op, layout, critical_life, critical_diagnostics));
+    EXPECT_EQ(critical_base, std::nullopt);
+    const String critical_printed = critical_diagnostics.str();
+    EXPECT_NE(critical_printed.find(layout.refCkptKey(critical_life)), String::npos) << critical_printed;
+    EXPECT_EQ(std::count(critical_printed.begin(), critical_printed.end(), '\n'), 1) << critical_printed;
+}
+
+/// A `.meta` key decodes as a legacy blob marker, not as a body: it shares the `blobs/` prefix with the body key.
+TEST(CASInspect, RendersCondemnedMarker)
+{
+    const Layout layout("p");
+    const BlobRef ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::Cas::tests::u128Of("hash-inspect"))};
+    const BlobMeta m{.version = 1, .state = MetaState::Condemned, .condemn_round = 9, .size = 123};
+
+    const String json = caInspectToJson(layout, layout.blobMetaKey(ref), encodeBlobMetaForTest(m));
+    EXPECT_NE(json.find("\"object\":\"blob_meta\""), String::npos);
+    EXPECT_NE(json.find("\"condemned\""), String::npos);
+    EXPECT_NE(json.find("\"condemn_round\":9"), String::npos);
+    EXPECT_NE(json.find("\"size\":123"), String::npos);
+}
+
+TEST(CASInspect, RendersCleanMarker)
+{
+    const Layout layout("p");
+    const BlobRef ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::Cas::tests::u128Of("hash-inspect-clean"))};
+    const BlobMeta m{.version = 1, .state = MetaState::Clean, .condemn_round = 0, .size = 7};
+
+    const String json = caInspectToJson(layout, layout.blobMetaKey(ref), encodeBlobMetaForTest(m));
+    EXPECT_NE(json.find("\"clean\""), String::npos);
 }

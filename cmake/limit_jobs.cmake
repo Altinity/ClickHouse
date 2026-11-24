@@ -28,6 +28,10 @@ if (NOT PARALLEL_COMPILE_JOBS AND MAX_COMPILER_MEMORY)
     endif()
 endif()
 
+# Remember whether the link-job limit was set explicitly: the ThinLTO memory
+# cap below only applies to the auto-calculated value.
+set (PARALLEL_LINK_JOBS_EXPLICIT ${PARALLEL_LINK_JOBS})
+
 if (NOT PARALLEL_LINK_JOBS AND MAX_LINKER_MEMORY)
     math(EXPR PARALLEL_LINK_JOBS ${TOTAL_PHYSICAL_MEMORY}/${MAX_LINKER_MEMORY})
 
@@ -54,7 +58,7 @@ endif ()
 # links than physically fit in memory - otherwise the linker is OOM-killed.
 # With debug info disabled (-g0, DISABLE_ALL_DEBUG_SYMBOLS) a link needs only
 # ~50 GB, so two still fit and we keep them parallel.
-if (CMAKE_BUILD_TYPE_UC STREQUAL "RELWITHDEBINFO" AND ENABLE_THINLTO AND PARALLEL_LINK_JOBS GREATER 1)
+if (CMAKE_BUILD_TYPE_UC STREQUAL "RELWITHDEBINFO" AND ENABLE_THINLTO AND PARALLEL_LINK_JOBS GREATER 1 AND NOT PARALLEL_LINK_JOBS_EXPLICIT)
     if (DISABLE_ALL_DEBUG_SYMBOLS)
         set (MAX_THINLTO_LINK_MEMORY 51200)  # megabytes per concurrent ThinLTO link, measured ~49 GB with -g0
     else ()

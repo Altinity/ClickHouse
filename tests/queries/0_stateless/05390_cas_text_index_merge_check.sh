@@ -11,7 +11,7 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 CLIENT="${CLICKHOUSE_CLIENT} --allow_experimental_full_text_index=1"
 
 disk() {
-    echo "disk(type = object_storage, object_storage_type = local, metadata_type = cas, cas_server_root_id = '${CLICKHOUSE_DATABASE}_$1', name = '${CLICKHOUSE_DATABASE}_$1', path = '${CLICKHOUSE_DATABASE}_$1_pool/')"
+    echo "disk(type = object_storage, object_storage_type = local, metadata_type = cas, cas_unsafe_remount_no_delay = 1, cas_server_root_id = '${CLICKHOUSE_DATABASE}_$1', name = '${CLICKHOUSE_DATABASE}_$1', path = '${CLICKHOUSE_DATABASE}_$1_pool/')"
 }
 
 # Per manifest that was renamed to a final name: one build_publish under a tmp name, no repoint.

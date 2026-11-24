@@ -63,7 +63,7 @@ Pool lifecycle and teardown. A non-zero value here is an incident signal.
 | `CASDataRootVanished` | `Number` | Counts CAS pools that entered a terminal Vanished lifecycle state (replaced / forgotten): the pool's data root was proven foreign (pool_id mismatch) or was decommissioned by SYSTEM CAS FORGET. The disk stays registered but store-class access fails loud with a typed error naming the sub-state; restart re-registers the name. |
 | `CASDetachedWorkDrainTimeouts` | `Number` | Counts CAS storage teardowns whose bounded wait for detached background work expired with work still in flight. The teardown proceeds, but for that teardown it could not be established that no tracked task still holds the pool. Expected to stay at zero. |
 | `CASEventDroppedContextExpired` | `Number` | Number of CAS system-log events dropped because the storage's `Context` reference expired before delivery. A non-zero value indicates event production outlived the owning server context. |
-| `CASIdentityLost` | `Number` | Counts CAS pools that entered the IdentityLost lifecycle state: the pool sentinels (_pool_meta and the owner anchor) were observed authoritatively absent (both KeyAbsent). IdentityLost is a fail-loud TERMINAL state -- store-class access fails loud from this point and this pool's background threads (remount + GC) self-exit; there is no observer. Recover by restart or SYSTEM CAS FORGET; a matching-sentinel restore does not auto-revive. |
+| `CASIdentityLost` | `Number` | Counts CAS pools that entered the IdentityLost lifecycle state: the pool sentinels (_pool_meta and the owner anchor) were observed authoritatively absent (both KeyAbsent), or a self-remount found the owner at another life. IdentityLost is a fail-loud TERMINAL state -- store-class access fails loud from this point and this pool's background threads (remount + GC) self-exit; there is no observer. Recover by restart or SYSTEM CAS FORGET; a matching-sentinel restore does not auto-revive. |
 
 #### Blob requests {#cas-blob-requests}
 
@@ -83,6 +83,8 @@ validation, and other callers.
 | `CASBlobHeadMiss` | `Number` | Number of successful backend HEAD requests under CAS blob paths that found no object, aggregated across all callers. |
 | `CASBlobList` | `Number` | Number of CAS blob LIST requests. Growing values indicate more object enumeration. |
 | `CASBlobOverwrite` | `Number` | Number of CAS blob overwrite requests. Growing values indicate repeated replacement writes. |
+| `CASBlobPublishAttemptFailed` | `Number` | Number of CAS blob publication attempts that failed with an ambiguous or retryable error. The writer observes the blob again and publishes a fresh envelope, up to the attempt limit. |
+| `CASBlobPublishGaveUp` | `Number` | Number of CAS blob publications that ended with an exception after at least one failed attempt, for example at the attempt limit or the deadline. |
 | `CASBlobPut` | `Number` | Number of CAS blob PUT requests. Grows with blob uploads and indicates storage write traffic. |
 | `CASBlobPutDeduplicated` | `Number` | Number of CAS blob deduplicating PUT requests. Grows when uploads reuse existing content. |
 
@@ -182,10 +184,9 @@ Day-to-day interpretation is on the [monitoring](/antalya/cas/operations/monitor
 
 | Event | Type | Description |
 | --- | --- | --- |
-| `CASGCClampSuppressedPasses` | `Number` | Number of CAS GC passes that deferred shard graduation and deletion because reachability was uncertain. In the current stage this is EVERY folding round by construction, not an anomaly: the namespace universe is not yet knowable, so the round's destructive gate is shut unconditionally and this counter tracks folding rounds rather than trouble. What does discriminate is the fold seal's hold set and the tables_held column of the fold_ref_intake phase row -- read those, not this, to tell a healthy suppressed round from a namespace that stopped. |
+| `CASGCClampSuppressedPasses` | `Number` | Number of CAS GC folding passes whose destructive work was suppressed: no body or intent was deleted because of an anomaly, a held namespace, an unproven reference frontier, or a gc/state HEAD that did not show the version the round leased. A healthy round does not count. The cause is in the server log and in the fold_reduce phase row of system.cas_gc_log (suppress_destructive, frontier_complete, parent_unconfirmed). |
 | `CASGCCompareSwap` | `Number` | Number of CAS GC compare-and-swap requests. Grows with GC state updates. |
 | `CASGCCompareSwapConflict` | `Number` | Number of CAS GC compare-and-swap conflicts. A non-zero value indicates concurrent GC or metadata updates. |
-| `CASGCCondemnMarkerUnconfirmedCarry` | `Number` | Number of CAS GC retirements delayed because a durable condemn marker could not be confirmed. A non-zero value indicates marker write or read failures and safely postpone deletion. |
 | `CASGCDeadPrecommitSkipped` | `Number` | Number of CAS GC edges skipped for precommits proven dead below the durable watermark. Growing values indicate stale or incomplete ref history. |
 | `CASGCDelete` | `Number` | Number of CAS GC DELETE requests. Grows with successful cleanup attempts. |
 | `CASGCEnumerationPages` | `Number` | Number of CAS GC LIST pages fetched while enumerating the object universe. Growing values indicate a larger universe or more frequent scans. |
@@ -195,8 +196,6 @@ Day-to-day interpretation is on the [monitoring](/antalya/cas/operations/monitor
 | `CASGCHeadMiss` | `Number` | Number of CAS GC HEAD requests that found no object. A non-zero value indicates already-removed or missing objects. |
 | `CASGCHeartbeatFenceOuts` | `Number` | Number of CAS GC operations fenced out for expired mounts. A non-zero value indicates stale mounts or heartbeat delays. |
 | `CASGCList` | `Number` | Number of CAS GC LIST requests. Growing values indicate more collection enumeration. |
-| `CASGCMetaOps` | `Number` | Number of per-hash metadata operations executed by CAS GC. Growing values indicate more GC candidates or metadata work. |
-| `CASGCMetaWriteAnomaly` | `Number` | Number of CAS GC metadata operations that failed on the bounded metadata pool. A non-zero value indicates backend or pool pressure and may delay metadata convergence. |
 | `CASGCNamespaceCleanupLeaks` | `Number` | Number of dead-life namespace objects whose reclamation the perpetual janitor could not confirm because HEAD or exact-delete failed. Each occurrence is logged with the exact key and remains leak-only: it neither suppresses destructive GC nor blocks catalog lifecycle progress. |
 | `CASGCOverwrite` | `Number` | Number of CAS GC overwrite requests. Growing values indicate repeated GC metadata replacement. |
 | `CASGCPut` | `Number` | Number of CAS GC PUT requests. Grows with GC metadata and object-management writes. |
@@ -207,13 +206,18 @@ Day-to-day interpretation is on the [monitoring](/antalya/cas/operations/monitor
 | `CASGCRebuildVirginByEnumeration` | `Number` | Number of times SYSTEM CAS GC REBUILD concluded FROM ENUMERATION ALONE that a pool had never sealed a baseline, and so carried no durable holds forward. The verdict rests on three pieces of evidence -- a wide LIST of the gc/gen prefix empty, a narrow probe of gc/gen/1/ empty, and gc/state absent -- and on no point read, because the fold seal key needs an attempt component that is a lease sequence number and has no arithmetic successor to probe. An enumeration that hid every seal INCLUDING generation 1 on a lived-in pool would therefore read as virgin here. Expected to be 0 on any pool that has ever completed a GC round; a nonzero value on such a pool means the rebuild was granted a clean slate it could not prove. |
 | `CASGCRefWalkPlansBuilt` | `Number` | Number of complete catalog-authoritative CAS ref walk plans constructed by ordinary GC and rebuild. A regular or rebuilding invocation that reaches the post-LIST catalog cut increments this exactly once, including a round that later defers. |
 | `CASGCRetireReplaced` | `Number` | Number of CAS GC re-condemnations after a resurrected object replaced a retired incarnation. Growth indicates object-generation churn. |
+| `CASGCRetiredBodyDeleted` | `Number` | Number of CAS GC blob body deletes answered, each conditional on the token the GC observed. Growth indicates physical cleanup activity. |
+| `CASGCRetiredBodyDeleteFailed` | `Number` | Number of CAS GC pending blob deletes whose `HEAD` or exact-token `DELETE` failed. A non-zero value indicates object storage errors; the round fails and the affected blobs are retried in the next round. |
 | `CASGCRetiredCondemned` | `Number` | Number of CAS GC entries newly condemned into the retired set. Growth indicates objects becoming eligible for later cleanup. |
-| `CASGCRetiredGraduated` | `Number` | Number of CAS GC retired entries that passed the safety floor and became pending deletion. Growth indicates cleanup progress. |
-| `CASGCRetiredRedeleted` | `Number` | Number of CAS GC pending deletes executed with an exact object token. Growth indicates physical cleanup activity. |
+| `CASGCRetiredGraduated` | `Number` | The earlier name of `CASGCRetiredIntentConfirmed`, incremented together with it. |
+| `CASGCRetiredIntentConfirmed` | `Number` | Number of CAS GC rows committed `pending` after their deletion intent was confirmed. Growth indicates cleanup progress. |
+| `CASGCRetiredRedeleted` | `Number` | The earlier name of `CASGCRetiredBodyDeleted`, incremented together with it. |
+| `CASGCRetiredRedeleteFailed` | `Number` | The earlier name of `CASGCRetiredBodyDeleteFailed`, incremented together with it. |
 | `CASGCRetiredSpared` | `Number` | Number of CAS GC retired entries spared after references returned. Growing values indicate reference churn or resurrection. |
-| `CASGCRetiredSparedByReref` | `Number` | Number of CAS GC delete_pending entries spared because a fresh deduplicating adopt re-referenced them after graduation (an ordinary observe/condemn race, not a fail-closed abort). Subset of CASGCRetiredSpared. |
+| `CASGCRetiredSparedByReref` | `Number` | Number of CAS GC pending or standing rows dropped because the blob was referenced again (an ordinary race, not a fail-closed abort). Subset of CASGCRetiredSpared. |
 | `CASGCStuckRemovals` | `Number` | Number of adopted CAS GC rounds that observed a Removing namespace at or beyond the diagnostic age threshold without terminal cleanup evidence. Incremented and warned every such round; diagnostic only, with no effect on folding, suppression, appends, or deletion. |
 | `CASGCUnappliedFoldedTransactions` | `Number` | Number of ref transactions a GC round folded and merged but whose blob deltas never reached a shard reducer. Always 0 on a healthy round; a nonzero value fails the round closed, because the round would otherwise advance its fold cursor past a transaction it never applied. |
+| `CASGCUndecodableBlobBody` | `Number` | Number of blob bodies a CAS GC round met that are shorter than the pool's blob envelope. `GC` records no row for such a body, carries an existing row unchanged and deletes nothing. See [a body `GC` cannot decode](/antalya/cas/architecture/garbage-collection#undecodable-body). |
 | `CASGCUnmatchedAdoptedParentLives` | `Number` | Number of adopted-parent CAS ref-life rows dropped because the post-LIST catalog cut has no matching physical life. Each occurrence is inert for planning and suppression and is logged with its exact physical life id; a persistent nonzero rate indicates old generation state is outliving catalog removal. |
 | `CASGCUnmatchedRemoveDeltas` | `Number` | Number of CAS GC in-degree removal deltas that matched no existing source edge. The in-degree model is a set, not a counter, so this is a per-key no-op by design and never causes a false deletion — but a persistent nonzero rate means removal deltas are reaching the reducer without their matching activation, which is a correctness signal. |
 
@@ -224,18 +228,25 @@ These counters cover ref-log appends, recovery, snapshots, and reachability edge
 | Event | Type | Description |
 | --- | --- | --- |
 | `CASRefAppendDefiniteFailure` | `Number` | Number of CAS ref-log appends rejected with certainty. A non-zero value indicates invalid requests or backend rejection requiring investigation. |
-| `CASRefAppendOccupantUnreadable` | `Number` | Number of CAS ref-log appends that met a DIFFERENT object at the id they derived and could not read it to tell a successor's epoch seal from a breach of mount write-exclusivity. The decision is deferred to the next attempt, which re-derives the same id. Sustained growth means a real breach may be going unreported: the loud interference path is only reached once the occupant can be read. |
+| `CASRefAppendOccupantUnreadable` | `Number` | Number of CAS ref-log appends that met a DIFFERENT object at the id they derived and could not read it to tell a successor's tombstone from a breach of mount write-exclusivity. The decision is deferred to the next attempt, which re-derives the same id. Sustained growth means a real breach may be going unreported: the loud interference path is only reached once the occupant can be read. |
 | `CASRefAppendPreAttemptRefused` | `Number` | Number of CAS ref-log append chunks refused BEFORE any request was sent (the mount fence or the operation deadline rejected while zero attempts had been made). Nothing can be durable, so the lane is deliberately NOT wedged and the caller retries. Counted separately from `CASRefAppendWedged` so a falling wedge count can be read as the availability fix working rather than as nothing happening. |
-| `CASRefAppendSealRejected` | `Number` | Number of CAS ref-log transactions conclusively rejected by a successor's epoch seal occupying the id they derived. This is the protocol working -- the writer was deposed and its operation was never acknowledged -- but a lane that keeps counting here is a writer that has lost its mount and does not yet know it. |
+| `CASRefAppendSealRejected` | `Number` | Number of CAS ref-log transactions conclusively rejected by a successor's tombstone occupying the id they derived. This is the protocol working -- the writer was deposed and its operation was never acknowledged -- but a lane that keeps counting here is a writer that has lost its mount and does not yet know it. |
+| `CASRefAppendTombstoneWritten` | `Number` | Number of CAS ref tombstones an append lane wrote before the first record of its epoch. After an unclean predecessor, recovery writes the tombstone instead (`CASRefRecoveryEpochSealed`). |
 | `CASRefAppendUnwedged` | `Number` | Number of CAS ref-log append lanes recovered after an uncertain PUT was later observed durable. A non-zero value indicates transient write uncertainty. |
 | `CASRefAppendWedged` | `Number` | Number of CAS ref-log append lanes that exhausted retries after an uncertain PUT. A non-zero value indicates ref-log progress may be stalled. |
 | `CASRefBatchFlushes` | `Number` | Number of committed CAS ref-log batch flushes. Compare with CASRefBatchedMutations to assess batching efficiency. |
 | `CASRefBatchScopeCuts` | `Number` | Number of CAS ref batches cut short by scope limits. Growing values indicate smaller batches and more write overhead. |
 | `CASRefBatchedMutations` | `Number` | Number of CAS ref mutations committed through the per-namespace batching queue. Growth indicates reference-write activity. |
-| `CASRefCheckpointIdenticalSkip` | `Number` | Number of CAS ref `_ckpt` updates that needed no write because the merged body already matched the stored one. A high ratio against CASRefCheckpointPublished is the intended steady state. |
-| `CASRefCheckpointNotAdvanced` | `Number` | Number of CAS ref-table snapshot publications whose `_ckpt` checkpoint could not be advanced (fenced out, contended, or failed). The snapshot body is durable but is not yet cleanup-authoritative; a non-zero value means recovery keeps replaying from an older base. |
-| `CASRefCheckpointPublished` | `Number` | Number of CAS ref `_ckpt` checkpoint objects durably updated by a token compare-and-swap. Growth tracks snapshot publication and namespace creation. |
+| `CASRefCheckpointIdenticalSkip` | `Number` | Number of CAS ref snapshot publications that needed no `_ckpt` write because the snapshot id was already published. |
+| `CASRefCheckpointNotAdvanced` | `Number` | Number of CAS ref-table snapshot publications whose `_ckpt` checkpoint could not be advanced (fenced out, refused, contended, or failed). The snapshot body is durable but is not yet cleanup-authoritative; a non-zero value means recovery keeps replaying from an older base. |
+| `CASRefCheckpointPublished` | `Number` | Number of CAS ref `_ckpt` writes by snapshot publication that committed. |
+| `CASRefCheckpointStamped` | `Number` | Number of CAS ref `_ckpt` objects replaced by their generation 3 form, by recovery or by an append lane before its first write. Grows about once per namespace written after an upgrade. |
+| `CASRefCleanupChunksUnderCatalogChange` | `Number` | Number of ref cleanup chunks deleted while the catalog etag differed from the one the fold read. The etag changed at some point since the fold; cleanup went on because the namespace's own row, its life and the GC lease passed their checks. |
+| `CASRefCleanupNamespacesSkipped` | `Number` | Number of namespaces whose ref cleanup was skipped because their own catalog row or life changed after the plan was built. Other namespaces continue; the skipped one is planned again next round. |
 | `CASRefCleanupObjectsDeleted` | `Number` | Number of old CAS ref logs and snapshots deleted after safe coverage was confirmed. Includes keys that were already absent, since a batch delete of write-once keys cannot tell the two apart. Growth indicates cleanup progress. |
+| `CASRefCleanupObjectsPlanned` | `Number` | Number of old CAS ref logs and snapshots that cleanup planned to delete, counted when each namespace's plan is built. Keys left undeleted are planned again next round, so the cumulative difference from `CASRefCleanupObjectsDeleted` is not a backlog; compare `objects_planned` and `objects_deleted` of one round in the phase metrics. |
+| `CASRefCleanupStoppedAuthorityUnverified` | `Number` | Number of ref cleanup passes stopped because the catalog or `gc/state` could not be read, `gc/state` was absent, or the catalog was ambiguous. A non-zero value means cleanup could not verify its authority; the warning log line names the cause. |
+| `CASRefCleanupStoppedLeaseMoved` | `Number` | Number of ref cleanup passes stopped because the GC lease moved. A non-zero value means another GC leader took over mid-pass; frequent stops point to lease contention. |
 | `CASRefEmittedEdges` | `Number` | Number of reachability edges emitted while GC folds CAS reference history. Growth indicates more reference relationships to process. |
 | `CASRefGlobalListPages` | `Number` | Number of CAS ref LIST pages fetched during GC. Growing values indicate more refs or smaller backend pages to scan. |
 | `CASRefLogBodyGets` | `Number` | Number of CAS ref-log bodies read and decoded during GC. Growth indicates more reference history to process. |
@@ -245,11 +256,11 @@ These counters cover ref-log appends, recovery, snapshots, and reachability edge
 | `CASRefNeedsRecovery` | `Number` | Number of CAS ref append lanes moved to `NeedsRecovery` because a known-durable transaction could not be installed. Such a lane refuses writes, snapshots, and confirmation until durable replay completes. |
 | `CASRefQueueWaitMicroseconds` | `Microseconds` | Total time CAS ref writers spent queued, in microseconds. A rising value indicates ref-write contention or backend latency. |
 | `CASRefRecoveryCancelled` | `Number` | Number of CAS ref-table recovery attempts abandoned because a self-remount requested cancellation before re-arming the mount fence. Non-zero means remounts are overlapping recoveries; nothing is written or installed on this path. |
-| `CASRefRecoveryEpochSealAdopted` | `Number` | Number of dead CAS ref writer epochs a recovery compare-and-swap walk found ALREADY closed by a concurrent recoverer's seal and adopted. A peer that got there first is the designed outcome, not contention to alarm on. |
-| `CASRefRecoveryEpochSealed` | `Number` | Number of CAS ref epoch-seal transactions MINTED by a recovery compare-and-swap walk, one per dead writer epoch it closed. Each seal occupies the exact log key a dying predecessor's in-flight PUT would take, so growth tracks epoch transitions over touched namespaces (including burned, never-written epochs), not anomalies. |
+| `CASRefRecoveryEpochSealAdopted` | `Number` | Number of CAS ref tombstones a recovery walk found ALREADY in the slot it tried to take and adopted. A peer that got there first is the designed outcome, not contention to alarm on. |
+| `CASRefRecoveryEpochSealed` | `Number` | Number of CAS ref tombstones written by recovery. Recovery writes one only when the epoch its chain ends in may have ended uncleanly, so growth follows unclean restarts; after a clean farewell the append lane writes the tombstone (`CASRefAppendTombstoneWritten`). |
 | `CASRefRecoveryRestarts` | `Number` | Number of CAS ref-table recovery retries after a snapshot or log vanished during reading. A non-zero value indicates concurrent cleanup or backend inconsistency. |
 | `CASRefRecoveryRetries` | `Number` | Number of CAS ref-table recovery attempts retried after a transient object-store error before the table's load fails. A non-zero value indicates transient object-store disruption during table startup. |
-| `CASRefRecoveryStragglerAdopted` | `Number` | Number of straggler ref-log transactions a recovery compare-and-swap walk met at the slot it tried to seal and adopted, re-sealing at the new T+1. Non-zero means writes from a dying epoch were still materializing when recovery ran. |
+| `CASRefRecoveryStragglerAdopted` | `Number` | Number of straggler ref-log transactions recovery met in the slot it tried to take with a tombstone and adopted, trying the tombstone again in the next slot. Non-zero means writes from a dying epoch were still materializing when recovery ran. |
 | `CASRefRecoveryStreamHole` | `Number` | Number of times CAS ref-table recovery found a 404 BELOW a durable same-epoch witness -- a hole in a stream INV-1 makes dense. Restarted while the restart budget lasts (a racing cleanup is the innocent explanation), then reported as corruption. Any sustained non-zero value is data loss, not noise. |
 | `CASRefRepoint` | `Number` | Number of CAS committed-reference repoints that republish a manifest. Growth indicates standalone part updates or removals. |
 | `CASRefMove` | `Number` | Number of CAS committed-reference renames done as one ref-log owner move, with no manifest republication. |
@@ -264,18 +275,30 @@ These counters cover ref-log appends, recovery, snapshots, and reachability edge
 | `CASRefSweepRearmed` | `Number` | Number of failed or partial stale-precommit sweeps scheduled for retry. Growing values indicate persistent cleanup or backend errors. |
 | `CASRefTableEvictions` | `Number` | Number of CAS ref-cache table evictions caused by the memory budget. Growing values indicate a small cache and more recovery I/O. |
 
-#### Blob metadata {#cas-blob-metadata}
+#### Deletion intents {#cas-deletion-intents}
 
-These counters cover per-blob metadata creates, rewrites, and deletes.
+These counters cover the deletion intents `GC` writes before it deletes a blob body, and the writer
+decisions that read them. The four `CASBlobIntent*` counters count requests on `blob-intents/`; the
+`CASBlob*` request counters do not include them.
 
 | Event | Type | Description |
 | --- | --- | --- |
-| `CASMetaAdoptBackfill` | `Number` | Number of blob-adoption paths that attempted a missing-metadata Clean backfill. Counts the attempt, not a guaranteed metadata creation. |
-| `CASMetaCompareSwap` | `Number` | Number of conditional CAS blob-metadata rewrites, including lost races. Growing values indicate metadata updates or contention. |
-| `CASMetaCreateClean` | `Number` | Number of absent-body publication paths that entered Clean metadata reconciliation. Counts the reason entry, not a guaranteed metadata creation. |
-| `CASMetaDelete` | `Number` | Number of exact-token CAS blob-metadata delete attempts. Growth indicates GC or cleanup activity. |
-| `CASMetaPut` | `Number` | Number of conditional CAS blob-metadata create attempts, including lost races. Growth indicates metadata reconciliation or write contention. |
-| `CASMetaResurrectClean` | `Number` | Number of condemned-body replacement paths that entered Clean metadata reconciliation. Counts the reason entry, not a guaranteed metadata reset. |
+| `CASBlobIntentDelete` | `Number` | Number of CAS blob deletion-intent DELETE requests. Grows as garbage collection removes intents. |
+| `CASBlobIntentGet` | `Number` | Number of CAS blob deletion-intent GET requests. |
+| `CASBlobIntentList` | `Number` | Number of CAS blob deletion-intent LIST requests. Growing values indicate more enumeration of intents. |
+| `CASBlobIntentPut` | `Number` | Number of CAS blob deletion-intent PUT requests. Grows as garbage collection condemns blobs. |
+| `CASBlobPublishDigestMismatch` | `Number` | Number of streamed CAS blob publications refused because the payload did not hash to the blob's key. Any non-zero value means a corrupted or changed source. |
+| `CASBlobReuseIntentPresent` | `Number` | Number of CAS blob writes that found the body's incarnation under a deletion intent and published the body again instead of adopting it. |
+| `CASBlobReuseTokenRejected` | `Number` | Number of CAS blob writes that found a body whose token names no incarnation and published the body again instead of adopting it. |
+| `CASGCIntentAdopted` | `Number` | Number of CAS GC rows created for a deletion intent that had no row: candidate when the body shows the intent's token, else standing. Nothing is deleted in the adopting round. |
+| `CASGCIntentConfirmedExisting` | `Number` | Number of CAS deletion-intent creates the GC confirmed by finding the record already present. |
+| `CASGCIntentCreated` | `Number` | Number of CAS deletion intents whose create the GC confirmed by an answered success, or by reading the record after an unanswered attempt. |
+| `CASGCIntentDeleted` | `Number` | Number of CAS deletion intents the GC deleted after their blob body was gone or replaced. |
+| `CASGCIntentLeftOnSpare` | `Number` | Number of CAS GC rows dropped because the blob was referenced again whose deletion intent stays for a later round to adopt. An intent deleted at the spare is counted in `CASGCIntentDeletedOnSpare` instead. |
+| `CASGCIntentDeletedOnSpare` | `Number` | Number of CAS deletion intents the GC deleted when the blob was referenced again and its `HEAD` showed another incarnation than the row's. Included in `CASGCIntentDeleted`. |
+| `CASGCIntentStandingAnomaly` | `Number` | Number of CAS GC `standing` rows whose decision `HEAD` showed their own token again after their body delete was answered. The row is carried and nothing is deleted. |
+| `CASGCIntentTokenRejected` | `Number` | Number of CAS GC blob observations whose token names no incarnation, so no deletion intent can be keyed by it. Such a body is never deleted by the GC. |
+| `CASGCIntentUnconfirmedCarry` | `Number` | Number of CAS deletion-intent creates the GC could not confirm; the blob stays a candidate and is retried in a later round. Sustained growth indicates object storage errors or foreign bytes at an intent key. |
 
 #### Mounts {#cas-mounts}
 
@@ -285,10 +308,10 @@ window.
 | Event | Type | Description |
 | --- | --- | --- |
 | `CASMountExclusivityViolation` | `Number` | Counts CAS mount releases where a runtime that still BELIEVED IT OWNED the mount (no deposition ever observed) found a FOREIGN occupant in the slot. This is the single-writer guarantee being broken, not a failover: the release refuses, the slot is left untouched, and the write fence is latched so the runtime stops trusting itself. This must always be zero. |
-| `CASMountLeaseLost` | `Number` | Counts exactly once per operational CAS mount-lease Live-to-TransientNotLive loss/recovery generation. The initiating external loss or the first ordinary terminal renewal consumer owns the increment, including external lease-safety deadline exhaustion; parked/classification/shutdown paths do not duplicate it. |
+| `CASMountLeaseLost` | `Number` | Counts exactly once per operational CAS mount-lease Live-to-TransientNotLive loss/recovery generation. The initiating external loss or the first ordinary terminal renewal consumer owns the increment; parked/classification/shutdown paths do not duplicate it. |
 | `CASMountReleaseSkippedForeignOccupant` | `Number` | Counts conclusive CAS mount-renewal observations that found a FOREIGN successor in the slot. This is the EXPECTED end state of a failover: renewal fences the deposed runtime, terminal teardown skips the farewell without backend I/O, and the successor's slot is left byte-for-byte untouched. Steady non-zero values on a cluster that is not failing over are worth investigating; a value that tracks failovers is normal. |
 | `CASMountRenewalAttempts` | `Number` | Number of physical conditional renewal PUTs sent for CAS mount leases. This counts transport attempts, not logical renewals. |
-| `CASMountRenewalDeadlineExceeded` | `Number` | Number of logical CAS mount-lease renewals stopped by the external lease-safety deadline. Growth means the last confirmed lease no longer had enough safe time for another physical attempt. |
+| `CASMountRenewalDeadlineExceeded` | `Number` | Number of bounded CAS mount-lease renewals (the startup and remount re-anchors, and the background renewal of a pool opened for decommission) stopped by the external lease-safety deadline. Growth means the last confirmed lease no longer had enough safe time for another physical attempt. |
 | `CASMountRenewalRecovered` | `Number` | Number of logical CAS mount-lease renewals that committed after a physical retry or exact resolving GET. |
 | `CASMountRenewalResolved` | `Number` | Number of CAS mount-lease renewals whose committed outcome was proved by an exact resolving GET. |
 | `CASMountRenewalRetries` | `Number` | Number of physical conditional renewal PUTs sent after the first attempt of one logical CAS mount-lease renewal. |
@@ -365,6 +388,8 @@ These counters cover fetch-by-relink confirms that this server answered `Unknown
 | `CASRelinkConfirmRefusedLaneWedged` | `Number` | Number of CAS fetch-by-relink confirms answered Unknown because the namespace's ref lane holds an unresolved append (a wedge). Lasts until the next flush or a remount resolves it. |
 | `CASRelinkConfirmRefusedMountCannotSpeak` | `Number` | Number of CAS fetch-by-relink confirms answered Unknown because this mount cannot speak for the namespace: its ref table is unrecovered or mid-recovery, its catalog life was invalidated, its runtime was superseded by a remount, or its mount fence is no longer held. Neither a lane defect nor write load. A growing value means this writer is losing, or has already lost, its claim to the namespace. |
 | `CASRelinkConfirmRefusedRefMutationInFlight` | `Number` | Number of CAS fetch-by-relink confirms this server answered Unknown because a queued or in-flight ref-lane mutation names the asked-about ref or the whole namespace. Expected under write load; the receiver retries the fetch. |
+| `CASRelinkConfirmRefusedSlotMoved` | `Number` | Number of CAS fetch-by-relink confirms that the ref ledger answered Yes but that answered Unknown because this mount could not show that it still owns its lease slot: the slot was absent, held by another writer, fenced by GC or released, a renewal committed between the read and the check, a remount replaced the renewer during the confirm, or no renewer exists (a read-only mount). A takeover, a remount or a read-only mount explains a sustained rise; an isolated increment on a healthy mount is a renewal that committed during the confirm. |
+| `CASRelinkConfirmRefusedSlotUnreadable` | `Number` | Number of CAS fetch-by-relink confirms that the ref ledger answered Yes but that answered Unknown because the read of this mount's lease slot failed: a request error, an admission refused because the mount fence was lost or the lease budget ran out, or an undecodable slot body. Expected during an object-store outage; otherwise check the mount slot. |
 | `CASRelinkConfirmRefusedStateLockBusy` | `Number` | Number of CAS fetch-by-relink confirms answered Unknown because the ref table's state lock was held. Under write load the usual holder is the table's own append leader, arming or installing a chunk; otherwise a recovery, a listing or a snapshot publish. The confirm never waits for it. |
 
 ### Data lakes {#data-lakes}
@@ -524,7 +549,7 @@ These counters cover client-side time of individual S3 and Azure list and head c
 | `AzureListObjectsMicroseconds` | `Microseconds` | Time of Azure blob storage API ListObjects execution. |
 | `S3HeadObjectMicroseconds` | `Microseconds` | Time of S3 API HeadObject execution. |
 | `S3ListObjectsMicroseconds` | `Microseconds` | Time of S3 API ListObjects execution. |
-| `S3SingleAttemptRetryConsultations` | `Number` | Number of AWS SDK retry consultations refused by the single-attempt S3 retry profile. Non-zero means the SDK attempted a transparent retry on a write that must make exactly one HTTP attempt. |
+| `S3SingleAttemptRetryConsultations` | `Number` | Number of AWS SDK retry consultations refused by a single-attempt S3 client: the clone used by the single-attempt retry profile, or the clone that sends the object-creating requests of a write that forbids a resend. Non-zero means a request on such a client failed and was not resent. |
 
 ### Other profile events {#other-profile-events}
 

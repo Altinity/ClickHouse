@@ -190,10 +190,10 @@ TEST(CASGCShardIncarnation, DeadLifeStreamIsOpaqueInertDebris)
     }
 
     const NamespaceLifeId current_life = NamespaceLifeId::fromCatalogEntry(ns, UInt128(22));
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(current_life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(current_life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = std::optional<uint64_t>{1},
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt}), Retry::once())));
+        .last_epoch_seal = std::nullopt}, 1), Retry::once())));
     const ManifestRef current_ref = testRef(2);
     writeBlobBody(*backend, layout, UInt128(22));
     writeManifestRaw(*backend, layout, ns, current_ref, {blobEntryFor("current", UInt128(22))});
@@ -250,8 +250,8 @@ TEST(CASGCShardIncarnation, CurrentLifeCheckpointIsReadByExactKeyOutsideHotList)
     /// LIST must be irrelevant because the walk obtains state only through exact GETs.
     const NamespaceLifeId current_life = NamespaceLifeId::fromCatalogEntry(ns, UInt128(22));
     createAt(*backend, layout.refCkptKey(current_life),
-        encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt,
-                              .last_epoch_seal = std::nullopt}));
+        encodeRefCkptAtGeneration(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt,
+                              .last_epoch_seal = std::nullopt}, 1));
     backend->hide(layout.refCkptKey(current_life));
     backend->resetCounts();
     std::vector<GcPhaseRecord> phases;
@@ -294,7 +294,7 @@ TEST(CASGCShardIncarnation, UncatalogedStreamLifeDefersWithoutInventingNamespace
     auto store = makePoolWithShards(backend, /*gc_shards=*/1);
     CasRequests requests = openRequestsForTest(backend);
     CasOperation op = requests.admit();
-    Gc gc(store, hexToU128("0000000000000000000000000000000a"));
+    Gc gc(store, hexToU128("0000000000000000000000000000000a"), [] { return 1001; });
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/tblForgotten"};
 
@@ -311,7 +311,12 @@ TEST(CASGCShardIncarnation, UncatalogedStreamLifeDefersWithoutInventingNamespace
             op.replace(layout.refCatalogKey(), encodeRefCatalog(snap.catalog), h->etag, Retry::once())));
     }
 
+    GcState state;
+    state.orphan_manifest_sweep_completed_at_ms = 1000;
+    state.lease = GcLease{hexToU128("0000000000000000000000000000000a"), 1};
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.gcStateKey(), encodeGcState(state), Retry::once())));
     const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::Authoritative);
+    EXPECT_TRUE(report.deferred);
     EXPECT_TRUE(report.anomalies.empty());
     EXPECT_FALSE(op.list(layout.namespaceStreamPrefix(forgotten_life), "", 100, Retry::once()).keys.empty());
 }
@@ -339,14 +344,14 @@ TEST(CASGCShardIncarnation, StateCheckpointsOutsideCatalogAreInertToHotWalk)
     /// crashes between its own steps 2 and 3.
     const NamespaceLifeId creating_life = NamespaceLifeId::fromCatalogEntry(creating_ns, UInt128(33));
     ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(creating_life),
-        encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt,
-                              .last_epoch_seal = std::nullopt}), Retry::once())));
+        encodeRefCkptAtGeneration(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt,
+                              .last_epoch_seal = std::nullopt}, 1), Retry::once())));
 
     /// Opaque state debris with no corresponding catalog entry.
     const NamespaceLifeId gone_life = NamespaceLifeId::fromCatalogEntry(unrelated_gone_ns, UInt128(44));
     ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(gone_life),
-        encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt,
-                              .last_epoch_seal = std::nullopt}), Retry::once())));
+        encodeRefCkptAtGeneration(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt,
+                              .last_epoch_seal = std::nullopt}, 1), Retry::once())));
 
     /// Add one fully current stream so the round performs a fold rather than stopping at an empty
     /// walk. Catalog and checkpoint admission keep this traffic out of the janitor's dead-life set,
@@ -355,8 +360,8 @@ TEST(CASGCShardIncarnation, StateCheckpointsOutsideCatalogAreInertToHotWalk)
     fixture::admitLive(*backend, layout, ordinary_ns);
     const NamespaceLifeId ordinary_life = fixture::fixtureLife(ordinary_ns);
     ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(ordinary_life),
-        encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt,
-                              .last_epoch_seal = std::nullopt}), Retry::once())));
+        encodeRefCkptAtGeneration(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt,
+                              .last_epoch_seal = std::nullopt}, 1), Retry::once())));
     appendRefLogSeed(*backend, layout, ordinary_ns, {});
 
     backend->resetCounts();

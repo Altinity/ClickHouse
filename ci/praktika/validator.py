@@ -206,13 +206,13 @@ class Validator:
                 # assert (
                 #     Settings.S3_REPORT_BUCKET
                 # ), f"S3_REPORT_BUCKET Setting must be defined if enable_html=True, workflow [{workflow.name}]"
+                report_bucket = Settings.S3_REPORT_BUCKET.split("/")[0]
+                http_endpoint = (
+                    (Settings.S3_EXTERNAL_BUCKETS or {}).get(report_bucket) or {}
+                ).get("http_endpoint")
                 assert (
-                    Settings.S3_BUCKET_TO_HTTP_ENDPOINT
-                ), f"S3_BUCKET_TO_HTTP_ENDPOINT Setting must be defined if enable_html=True, workflow [{workflow.name}]"
-                assert (
-                    Settings.S3_REPORT_BUCKET.split("/")[0]
-                    in Settings.S3_BUCKET_TO_HTTP_ENDPOINT
-                ), f"S3_BUCKET_TO_HTTP_ENDPOINT Setting must include bucket name [{Settings.S3_REPORT_BUCKET}] from S3_REPORT_BUCKET, workflow [{workflow.name}]"
+                    http_endpoint
+                ), f"S3_EXTERNAL_BUCKETS Setting must include http_endpoint for bucket [{report_bucket}] from S3_REPORT_BUCKET, workflow [{workflow.name}]"
 
             if workflow.enable_cache:
                 for artifact in workflow.artifacts or []:

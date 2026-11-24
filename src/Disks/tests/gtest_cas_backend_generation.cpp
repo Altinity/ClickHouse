@@ -38,6 +38,7 @@ using namespace DB::Cas;
 
 namespace DB::ErrorCodes
 {
+    extern const int CORRUPTED_DATA;
     extern const int NOT_IMPLEMENTED;
 }
 
@@ -138,7 +139,13 @@ public:
     {
     }
 
-    std::optional<bool> isBucketVersioningEnabled() const override { return versioned; }
+    std::optional<bool> isBucketVersioningEnabled(const DB::ObjectStorageControlRequest & request) const override
+    {
+        last_request = request;
+        return versioned;
+    }
+
+    mutable DB::ObjectStorageControlRequest last_request;
 
 private:
     const std::optional<bool> versioned;
@@ -302,6 +309,22 @@ TEST(CASBackendGeneration, CheckPoolPreconditionsAcceptsVerifiedDisabledVersioni
     ScopedBackendLogCapture capture;
     EXPECT_NO_THROW(b->checkPoolPreconditions());
     EXPECT_TRUE(capture.captured().empty()) << capture.captured();
+}
+
+/// The versioning probe carries the backend's control-plane request: profile, attempt timeout and connect cap.
+TEST(CASBackendGeneration, CheckPoolPreconditionsProbesVersioningSingleAttemptAndBounded)
+{
+    auto storage = makeVersioningObjectStorageForTest(false);
+    auto b = std::make_shared<ObjectStorageBackend>(
+        storage, ObjectStorageBackend::Mode::Native,
+        /*single_attempt_control_plane_=*/true, /*attempt_timeout_ms_=*/5000, /*connect_timeout_cap_ms_=*/3000);
+    b->setNativeTokenTypeForTest(Dialect::Generation);
+
+    b->checkPoolPreconditions();
+
+    EXPECT_EQ(storage->last_request.profile, DB::ObjectStorageRetryProfile::SingleAttempt);
+    EXPECT_EQ(storage->last_request.attempt_timeout_ms, 5000u);
+    EXPECT_EQ(storage->last_request.connect_timeout_cap_ms, 3000u);
 }
 
 /// The ETag-dialect (AWS-compatible) backend never consults bucket versioning at all — the check is
@@ -663,7 +686,8 @@ TEST(CASBackendGeneration, PublishBlobAboveFormerGenerationCapUsesOrdinaryMultip
             .open_payload = [payload]
             {
                 return std::make_unique<DB::ReadBufferFromOwnString>(payload);
-            }}}, Retry::once());
+            },
+            .expected_ref = DB::Cas::tests::idOf(payload)}}, Retry::once());
 
     EXPECT_EQ(client->put_object_calls, 0u);
     EXPECT_EQ(client->create_multipart_calls, 1u);
@@ -694,11 +718,55 @@ TEST(CASBackendGeneration, PublishBlobSucceedsWithoutResponseGeneration)
             .open_payload = [payload]
             {
                 return std::make_unique<DB::ReadBufferFromOwnString>(payload);
-            }}}, Retry::once()));
+            },
+            .expected_ref = DB::Cas::tests::idOf(payload)}}, Retry::once()));
 
     EXPECT_EQ(client->put_object_calls, 1u);
     EXPECT_EQ(client->head_object_calls, 0u);
     EXPECT_EQ(client->objects.at("p/gen/publish-no-generation"), "freshpayload");
+}
+
+/// A real `WriteBufferFromS3` in single-part and in multipart mode: a payload that does not hash to its key
+/// completes no object, and the same publication with the true payload does.
+TEST(CASBackendGeneration, PublishBlobWithAWrongDigestCreatesNoObject)
+{
+    (void)getContext();
+    for (const bool multipart : {false, true})
+    {
+        SCOPED_TRACE(multipart ? "multipart" : "single part");
+        FakeGenerationS3Client * client = nullptr;
+        auto storage = makeGenerationS3ObjectStorageForTest(client, /*force_multipart=*/multipart);
+        ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
+        backend.setNativeTokenTypeForTest(Dialect::Generation);
+
+        const String payload(1024, 'x');
+        String wrong = payload;
+        wrong[wrong.size() / 2] = 'y';
+        const auto publication = [&](const String & bytes)
+        {
+            return BlobPublishRequest{
+                .destination_key = "p/gen/publish-digest",
+                .publication = StreamingBlobPublication{
+                    .payload_size = bytes.size(),
+                    .fresh_envelope = "fresh",
+                    .open_payload = [bytes]
+                    {
+                        return std::make_unique<DB::ReadBufferFromOwnString>(bytes);
+                    },
+                    .expected_ref = DB::Cas::tests::idOf(payload)}};
+        };
+
+        DB::Cas::tests::OperationForTest op(backend);
+        DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { (*op).publish(publication(wrong), Retry::once()); });
+        EXPECT_FALSE(client->objects.contains("p/gen/publish-digest"));
+        EXPECT_EQ(client->put_object_calls, 0u);
+        EXPECT_EQ(client->complete_multipart_calls, 0u);
+        if (multipart)
+            EXPECT_GT(client->upload_part_calls, 0u) << "the refused payload must have reached the store in parts";
+
+        (*op).publish(publication(payload), Retry::once());
+        EXPECT_EQ(client->objects.at("p/gen/publish-digest"), "fresh" + payload);
+    }
 }
 
 /// The write-response half of the incarnation grammar: a write response that carries no ETag at all

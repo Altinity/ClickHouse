@@ -19,7 +19,8 @@ for artifact in ArtifactConfigs.clickhouse_binaries + ArtifactConfigs.clickhouse
 
 builds_for_release_branch = [
     job.unset_provides("unittest")
-    for job in JobConfigs.build_jobs + JobConfigs.release_build_jobs_with_examples
+    # NOTE (strtgbb): no clickhouse-examples, nothing uses it and it delays the ThinLTO link of clickhouse
+    for job in JobConfigs.build_jobs + JobConfigs.release_build_jobs
     if "coverage" not in job.name
 ]
 
@@ -47,7 +48,6 @@ workflow = Workflow.Config(
         JobConfigs.docker_keeper,
         *JobConfigs.install_check_master_jobs,
         *AltinityJobConfigs.sign_release_jobs,
-        AltinityJobConfigs.source_upload_job,
         *[
             job
             for job in FUNCTIONAL_TESTS_JOBS
@@ -58,7 +58,7 @@ workflow = Workflow.Config(
     artifacts=[
         *clickhouse_binaries_with_tags,
         *ArtifactConfigs.clickhouse_binaries_gh,
-        ArtifactConfigs.clickhouse_examples,
+        # ArtifactConfigs.clickhouse_examples,
         *ArtifactConfigs.clickhouse_debians,
         *ArtifactConfigs.clickhouse_rpms,
         *ArtifactConfigs.clickhouse_tgzs,

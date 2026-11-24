@@ -82,6 +82,10 @@ const UInt128 kGc = hexToU128("00000000000000000000000000000001");
 /// be said out loud.
 void noAuthorityRefresh() {}
 
+/// The retirement announcement is mandatory for the same reason: a drain that erases without it has to
+/// say so.
+void noRetirementRecord(const NamespaceLifeId &) {}
+
 /// The lying store, shared from `cas_test_helpers.h`: every key is served by exact GET while the
 /// selected ones are HIDDEN from every LIST. That is the only way to build the cross-namespace
 /// scenario -- the hidden namespace's records stay durable and readable, so a round that KNOWS to
@@ -114,6 +118,14 @@ public:
         std::lock_guard lock(control_mutex);
         catalog_key = key;
         conflict_next_catalog_cas = true;
+    }
+
+    /// Lets `allowed` conditional writes of `key` through, then throws from every further one.
+    void failCatalogCasesAfter(const String & key, size_t allowed)
+    {
+        std::lock_guard lock(control_mutex);
+        catalog_key = key;
+        catalog_cas_budget = allowed;
     }
 
     void waitForBlockedCatalogCas()
@@ -195,6 +207,12 @@ public:
                 lose_next_catalog_cas_response = false;
                 lose_response = true;
             }
+            if (conditional && key == catalog_key && catalog_cas_budget)
+            {
+                if (*catalog_cas_budget == 0)
+                    throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected catalog write failure");
+                --*catalog_cas_budget;
+            }
             if (conditional && key == catalog_key && conflict_next_catalog_cas)
             {
                 conflict_next_catalog_cas = false;
@@ -237,6 +255,7 @@ private:
     bool release_catalog_cas = false;
     bool lose_next_catalog_cas_response = false;
     bool conflict_next_catalog_cas = false;
+    std::optional<size_t> catalog_cas_budget;
     String after_read_key;
     std::function<void()> after_read_hook;
 };
@@ -276,7 +295,7 @@ public:
     bool existsIgnoringFault(const String & key)
     {
         bypass_fault = true;
-        CasRequests requests(BackendPtr(std::shared_ptr<void>(), this), Fence::open());
+        CasRequests requests(BackendPtr(std::shared_ptr<void>(), this), Fence::open(), {}, {}, nullptr, DB::Cas::kDefaultRequestWindowMs);
         CasOperation op = requests.admit();
         const bool present = op.head(key, Retry::once()).has_value();
         bypass_fault = false;
@@ -342,12 +361,12 @@ CompletedRemovingFixture seedCompletedRemoving(
         .ns = fixture.ns, .state = NsState::Live, .incarnation = fixture.life_id});
     fixture.checkpoint_key = layout.refCkptKey(
         NamespaceLifeId::fromCatalogEntry(fixture.ns, fixture.life_id));
-    fixture.checkpoint_bytes = encodeRefCkpt(RefCkpt{
+    fixture.checkpoint_bytes = encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = std::nullopt,
         .checkpoint_snapshot_id = std::nullopt,
         .last_epoch_seal = std::nullopt,
-    });
+    }, 1);
     op.create(fixture.checkpoint_key, fixture.checkpoint_bytes, Retry::once());
     EXPECT_TRUE(store->namespaceFilesLifeIfReadable(fixture.ns));
     CasRefCatalog::casUpdate(op, layout, [](const RefCatalog & current)
@@ -1019,24 +1038,11 @@ TEST(CASGCFrontierGate, ADecodedTokenBearingEmptyCatalogCompletesTheFrontierAndD
     Gc gc(store, kGc);
     backend->resetCounts();
 
-    /// `injectRetire` seeds the condemned entry WITHOUT the durable per-hash `Condemned` meta a real
-    /// condemn round writes (`fold`'s own `scheduleCondemnMarkerWrite` side effect) -- so this fixture's
-    /// round cadence is longer than the textbook condemn->graduate->delete: the lease is UNCLAIMED
-    /// (`injectRetire` writes `gc/state` directly, never through a real acquire), so the first round
-    /// only arms `acquireOrRenewLease`'s two-tick steal-safety window; the graduation gate's own
-    /// `confirm_condemned_marker` then fails its first sighting, schedules the meta write, and CARRIES
-    /// the entry (not yet delete_pending) while `meta_pool_wait` lands it durably by that round's end;
-    /// only the round after that sees the durable meta and actually graduates; and the physical delete
-    /// is the round after THAT. MEASURED (phase-sink instrumentation, not a guess): round 1 arms
-    /// (`saw_fold == false`), round 2 is the first to fold with the gate open while the blob is still
-    /// present (the carry round), round 3 graduates, round 4 executes the delete -- four rounds exactly.
-    /// Bound the drive at that plus one (5): enough slack for the fixture's own cadence to be measured
-    /// without hand-counting rounds against this gate, but tight enough that a real regression in the
-    /// confirm/retry cadence still fails loudly instead of silently absorbing into a generous loop.
+    /// The drive is bounded tightly, so slower pacing fails loudly instead of being absorbed by a generous loop.
     ASSERT_TRUE(op.head(layout.blobKey(blob_ref), Retry::once()).has_value())
         << "the scenario starts with the condemned blob present, or the loop below measures nothing";
 
-    constexpr int kMaxRounds = 5;   /// measured cadence (4) + 1; see the comment above
+    constexpr int kMaxRounds = 5;   /// bound on the drain; see the comment above
     /// Observe the TWO-PHASE PIPELINE explicitly: an open, unsuppressed gate while the blob was still
     /// present (the graduate side), and only a STRICTLY LATER round removing it (the delete side).
     /// Asserting only the final state and the last verdict would pass just as readily if the blob
@@ -1113,11 +1119,6 @@ TEST(CASGCFrontierGate, AZeroWalkableFrontierWithACreatingCatalogRowIsNotProvedE
 
     Gc gc(store, kGc);
     backend->resetCounts();
-    /// `injectRetire` leaves `gc/state`'s lease unclaimed (owner 0); the first round only arms the
-    /// steal-safety window (see `ADecodedTokenBearingEmptyCatalogCompletesTheFrontierAndDrainsRetiredWork`)
-    /// and folds nothing, so it is spent here rather than counted among the assertions below.
-    const GateVerdict warm_up = runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
-    EXPECT_FALSE(warm_up.saw_fold);
     for (int i = 0; i < 6; ++i)
     {
         const GateVerdict v = runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
@@ -1265,11 +1266,6 @@ TEST(CASGCFrontierGate, AProvedEmptyCatalogUnderStageASuppressedStaysSuppressed)
 
     Gc gc(store, kGc);
     backend->resetCounts();
-    /// `injectRetire` leaves `gc/state`'s lease unclaimed (owner 0); the first round only arms the
-    /// steal-safety window (see `ADecodedTokenBearingEmptyCatalogCompletesTheFrontierAndDrainsRetiredWork`)
-    /// and folds nothing, independent of policy -- lease acquisition precedes the destructive gate.
-    const GateVerdict warm_up = runRoundCapturingGate(store, gc, UniversePolicy::StageA_Suppressed);
-    EXPECT_FALSE(warm_up.saw_fold);
     for (int i = 0; i < 6; ++i)
     {
         const GateVerdict v = runRoundCapturingGate(store, gc, UniversePolicy::StageA_Suppressed);
@@ -1322,17 +1318,13 @@ TEST(CASGCFrontierGate, ANamespaceBornAfterTheEmptyCutResurrectsTheCondemnedBlob
     runRegularRoundReclaiming(gc);                                 /// folds the +1 edge
     store->renewWatermarkOnce();
     dropRefTransition(*backend, layout, doomed, "ref_1", mref);
-    runRegularRoundReclaiming(gc);                                 /// condemns: durable Condemned meta
+    runRegularRoundReclaiming(gc);                                 /// condemns: intent confirmed, row pending
     store->renewWatermarkOnce();
     const auto condemned_head = op.head(key, Retry::once());
     ASSERT_TRUE(condemned_head.has_value());
     const Etag condemned_token = condemned_head->etag;
-    const auto condemned_meta = loadMetaForTest(*backend, layout, hash);
-    ASSERT_TRUE(condemned_meta.has_value());
-    ASSERT_EQ(condemned_meta->meta.state, MetaState::Condemned)
-        << "the delete round R is about to execute must be backed by durable Condemned evidence";
-    runRegularRoundReclaiming(gc);                                 /// graduates: publishes delete_pending
-    store->renewWatermarkOnce();
+    ASSERT_TRUE(objectPresent(*backend, layout.blobIntentKey(id, *condemned_token.canonical())))
+        << "the delete round R is about to execute must be backed by a confirmed intent";
 
     /// Remove `doomed` entirely -- the ONLY way the catalog can become genuinely, provably empty. A raw
     /// `RemoveNamespace` op plus the Removing-state CAS mirrors
@@ -1353,7 +1345,7 @@ TEST(CASGCFrontierGate, ANamespaceBornAfterTheEmptyCutResurrectsTheCondemnedBlob
     });
 
     /// A SUPPRESSED round folds `doomed` through its removal terminal and records `cleanup_evidence` in
-    /// the seal, WITHOUT executing the delete_pending the graduate round above published -- suppressed
+    /// the seal, WITHOUT executing the delete of the pending row the condemning round wrote -- suppressed
     /// rounds carry pending deletes forward untouched. `StageA_Suppressed` here is the test's OWN
     /// control over timing, not the scenario under test: it exists only to keep blob X's delete pending
     /// until round R below, rather than letting it drain the ordinary way while `doomed` is still Live.
@@ -1384,8 +1376,8 @@ TEST(CASGCFrontierGate, ANamespaceBornAfterTheEmptyCutResurrectsTheCondemnedBlob
         const auto fresh_head = op.head(key, Retry::once());
         ASSERT_TRUE(fresh_head.has_value());
         fresh_token = fresh_head->etag;
-        EXPECT_NE(*fresh_token, condemned_token)
-            << "the writer must have observed Condemned and resurrected -- a fresh token, not an adopt "
+        EXPECT_NE(tokenText(*fresh_token), tokenText(condemned_token))
+            << "the writer must have met the intent and resurrected -- a fresh token, not an adopt "
                "of the dying incarnation";
     });
 
@@ -1400,7 +1392,7 @@ TEST(CASGCFrontierGate, ANamespaceBornAfterTheEmptyCutResurrectsTheCondemnedBlob
     EXPECT_TRUE(surviving_head.has_value())
         << "the resurrected incarnation must survive round R's delete";
     ASSERT_TRUE(fresh_token.has_value());
-    EXPECT_EQ(surviving_head->etag, *fresh_token) << "and it is still the writer's incarnation";
+    EXPECT_EQ(tokenText(surviving_head->etag), tokenText(*fresh_token)) << "and it is still the writer's incarnation";
     EXPECT_EQ(op.remove(key, condemned_token, Retry::once()), Removal::Mismatch)
         << "the condemned token can never remove the fresh object (INV_NO_LOSS)";
 
@@ -1663,105 +1655,7 @@ TEST(CASGCFrontierGate, APartialProbeBudgetPublishesATallyThatMatchesTheSealedSe
     }
 }
 
-/// A checkpoint boundary already equal to the carried cursor proves a quiet catalog life complete;
-/// GC must not manufacture a successor `GET` merely because its LIST is empty.
-TEST(CASGCFrontierGate, AQuietKnownNamespaceAtItsCheckpointFrontierCostsNoSuccessorGet)
-{
-    auto backend = std::make_shared<CountingHintHoleBackend>();
-    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
-    const Layout & layout = store->layout();
-    const RootNamespace quiet{"00/quiet@cas@"};
-
-    publish(*backend, layout, quiet, "ref_1", 1, DB::UInt128(0x11));
-    replaceRecoverableCkptForRawFixture(*backend, layout, quiet, RefCkpt{
-        .life_epoch = 1,
-        .committed_through = RefTxnId{1, 1},
-        .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt,
-    });
-
-    Gc gc(store, kGc);
-    runRegularRoundReclaiming(gc);
-    store->renewWatermarkOnce();
-
-    const RefTxnId sealed = sealedCursorOf(*backend, layout, quiet);
-    ASSERT_NE(sealed, (RefTxnId{})) << "the seeding round must have sealed a cursor to carry";
-
-    /// Now the store stops listing the namespace entirely.
-    backend->hidePrefix(layout.namespaceStreamPrefix(fixture::fixtureLife(quiet)));
-    backend->resetCounts();
-    std::map<String, UInt64> intake;
-    gc.setPhaseSink([&](const GcPhaseRecord & rec)
-    {
-        if (rec.phase == "fold_ref_intake")
-            intake = rec.metrics;
-    });
-    const RoundReport report = runRegularRoundReclaiming(gc);
-    gc.setPhaseSink({});
-
-    const String expected_next =
-        layout.refLogKey(fixture::fixtureLife(quiet), RefTxnId{sealed.writer_epoch, sealed.ref_sequence + 1});
-    EXPECT_EQ(backend->getCount(expected_next), 0u)
-        << "the inclusive checkpoint boundary proves this quiet life without a successor probe";
-    EXPECT_TRUE(report.anomalies.empty());
-    ASSERT_FALSE(intake.empty());
-    EXPECT_EQ(intake["frontier_proven"], intake["frontier_namespaces"])
-        << "the inherited cursor already at the checkpoint boundary is destructive-eligible";
-}
-
-/// A checkpoint must never retreat below a sealed cursor. Its inclusive frontier can prove a cursor
-/// already at that point, but cannot explain one that has advanced beyond it.
-TEST(CASGCFrontierGate, CheckpointFrontierBehindAnInheritedCursorFailsClosed)
-{
-    auto backend = std::make_shared<CountingBackend>();
-    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
-    CasRequests requests = openRequestsForTest(backend);
-    CasOperation op = requests.admit();
-    const Layout & layout = store->layout();
-    const RootNamespace ns{"00/checkpoint-behind-inherited-cursor@cas@"};
-
-    fixture::admitLive(*backend, layout, ns);
-    publish(*backend, layout, ns, "first", 1, DB::UInt128(0xfb));
-    publish(*backend, layout, ns, "second", 2, DB::UInt128(0xfc));
-    replaceRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
-        .life_epoch = 1,
-        .committed_through = RefTxnId{1, 2},
-        .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt,
-    });
-
-    Gc gc(store, kGc);
-    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
-    ASSERT_EQ(sealedCursorOf(*backend, layout, ns), (RefTxnId{1, 2}));
-
-    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(op, layout, ns);
-    const String checkpoint_key = layout.refCkptKey(life);
-    const auto checkpoint_head = op.head(checkpoint_key, Retry::once());
-    ASSERT_TRUE(checkpoint_head.has_value());
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(checkpoint_key, encodeRefCkpt(RefCkpt{
-        .life_epoch = 1,
-        .committed_through = RefTxnId{1, 1},
-        .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt,
-    }), checkpoint_head->etag, Retry::once())));
-
-    std::map<String, UInt64> intake;
-    gc.setPhaseSink([&](const GcPhaseRecord & rec)
-    {
-        if (rec.phase == "fold_ref_intake")
-            intake = rec.metrics;
-    });
-    const RoundReport report = runRegularRoundReclaiming(gc);
-    gc.setPhaseSink({});
-
-    EXPECT_FALSE(report.anomalies.empty());
-    ASSERT_FALSE(intake.empty());
-    EXPECT_LT(intake["frontier_proven"], intake["frontier_namespaces"]);
-}
-
-/// A carried `EpochSeal` may have its authoritative successor in the next epoch. The arithmetic
-/// successor in the sealed epoch is absent by design, so the exact checkpoint frontier must nominate
-/// the shared seal-chain crossing before that absence is classified as a same-epoch gap.
+/// A carried `EpochSeal` has its successor in the next epoch, and the next round folds it there.
 TEST(CASGCFrontierGate, CheckpointFrontierCrossesAnInheritedEpochSeal)
 {
     auto backend = std::make_shared<CountingBackend>();
@@ -1792,12 +1686,12 @@ TEST(CASGCFrontierGate, CheckpointFrontierCrossesAnInheritedEpochSeal)
     const String checkpoint_key = layout.refCkptKey(life);
     const auto checkpoint_head = op.head(checkpoint_key, Retry::once());
     ASSERT_TRUE(checkpoint_head.has_value());
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(checkpoint_key, encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(checkpoint_key, encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{2, 1},
         .checkpoint_snapshot_id = std::nullopt,
         .last_epoch_seal = RefTxnId{1, 2},
-    }), checkpoint_head->etag, Retry::once())));
+    }, 1), checkpoint_head->etag, Retry::once())));
 
     std::map<String, UInt64> intake;
     gc.setPhaseSink([&](const GcPhaseRecord & rec)
@@ -1882,12 +1776,12 @@ TEST(CASGCFrontierGate, AWronglyQuietNamespaceIsWalkedTheSameRound)
     const String checkpoint_key = layout.refCkptKey(life);
     const auto checkpoint_head = op.head(checkpoint_key, Retry::once());
     ASSERT_TRUE(checkpoint_head.has_value());
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(checkpoint_key, encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(checkpoint_key, encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{1, 2},
         .checkpoint_snapshot_id = std::nullopt,
         .last_epoch_seal = std::nullopt,
-    }), checkpoint_head->etag, Retry::once())));
+    }, 1), checkpoint_head->etag, Retry::once())));
     backend->hidePrefix(layout.namespaceStreamPrefix(fixture::fixtureLife(quiet)));
 
     runRegularRoundReclaiming(gc);
@@ -1896,163 +1790,6 @@ TEST(CASGCFrontierGate, AWronglyQuietNamespaceIsWalkedTheSameRound)
         << "the probe found the hidden record, so the walk folded it and the cursor advanced";
     EXPECT_GT(inDegreeOf(*backend, layout, late_blob), 0)
         << "the hidden publish's edge folded this round -- the hint never mentioned it";
-}
-
-/// The catalog life is grounded by its exact decoded `_ckpt`, not by the round's listing or a later
-/// absent probe. A durable `F+1` is physically present but not committed history, so this fold may apply
-/// only `F`; in particular it must not read `F+2`. Reaching `F` still proves the checkpoint-bounded
-/// cut, so the physical successor cannot suppress otherwise eligible destructive work.
-TEST(CASGCFrontierGate, CheckpointFrontierBoundsOrdinaryFoldBeforeDurableSuccessor)
-{
-    auto backend = std::make_shared<CountingBackend>();
-    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
-    CasRequests requests = openRequestsForTest(backend);
-    CasOperation op = requests.admit();
-    const Layout & layout = store->layout();
-    const RootNamespace ns{"00/checkpoint-bounds-fold@cas@"};
-    const DB::UInt128 committed_blob(0xf1);
-    const DB::UInt128 beyond_frontier_blob(0xf2);
-
-    fixture::admitLive(*backend, layout, ns);
-    publish(*backend, layout, ns, "committed", 1, committed_blob);
-    const ManifestRef uncommitted{.writer_epoch = 1, .build_sequence = 2, .manifest_ordinal = 1};
-    writeBlobBody(*backend, layout, beyond_frontier_blob);
-    writeManifestRaw(*backend, layout, ns, uncommitted, {blobEntryFor("data.bin", beyond_frontier_blob)});
-    fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
-        .ns = ns.string(),
-        .txn_id = RefTxnId{1, 2},
-        .ops = publishCommittedOps("durable_but_uncommitted", uncommitted),
-        .prev_epoch_seal = std::nullopt,
-    });
-    replaceRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
-        .life_epoch = 1,
-        .committed_through = RefTxnId{1, 1},
-        .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt,
-    });
-
-    std::map<String, UInt64> intake;
-    Gc gc(store, kGc);
-    gc.setPhaseSink([&](const GcPhaseRecord & rec)
-    {
-        if (rec.phase == "fold_ref_intake")
-            intake = rec.metrics;
-    });
-    backend->resetCounts();
-    const RoundReport report = runRegularRoundReclaiming(gc);
-    ASSERT_TRUE(report.acquired_lease);
-    gc.setPhaseSink({});
-
-    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(op, layout, ns);
-    EXPECT_EQ(sealedCursorOf(*backend, layout, ns), (RefTxnId{1, 1}));
-    EXPECT_EQ(inDegreeOf(*backend, layout, beyond_frontier_blob), 0)
-        << "a durable log above `_ckpt.committed_through` is not foldable history";
-    EXPECT_EQ(backend->getCount(layout.refLogKey(life, RefTxnId{1, 2})), 0u)
-        << "the checkpoint frontier stops the walk before `F+1`";
-    EXPECT_EQ(backend->getCount(layout.refLogKey(life, RefTxnId{1, 3})), 0u)
-        << "a 404 above `F+1` must not authorize the destructive frontier";
-    EXPECT_TRUE(report.anomalies.empty());
-    ASSERT_FALSE(intake.empty());
-    EXPECT_EQ(intake["frontier_proven"], intake["frontier_namespaces"])
-        << "the consumed checkpoint frontier, not the physical successor, authorizes this cut";
-}
-
-/// With no physical successor at all, consuming the exact inclusive checkpoint frontier proves this
-/// catalog life complete. This is the control for the same bounded-cut proof exercised with a durable
-/// uncommitted successor above.
-TEST(CASGCFrontierGate, ConsumedCheckpointFrontierProvesOrdinaryLifeWithoutSuccessor)
-{
-    auto backend = std::make_shared<CountingBackend>();
-    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
-    CasRequests requests = openRequestsForTest(backend);
-    CasOperation op = requests.admit();
-    const Layout & layout = store->layout();
-    const RootNamespace ns{"00/checkpoint-complete-fold@cas@"};
-
-    fixture::admitLive(*backend, layout, ns);
-    publish(*backend, layout, ns, "committed", 1, DB::UInt128(0xf3));
-    replaceRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
-        .life_epoch = 1,
-        .committed_through = RefTxnId{1, 1},
-        .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt,
-    });
-
-    std::map<String, UInt64> intake;
-    Gc gc(store, kGc);
-    gc.setPhaseSink([&](const GcPhaseRecord & rec)
-    {
-        if (rec.phase == "fold_ref_intake")
-            intake = rec.metrics;
-    });
-    backend->resetCounts();
-    const RoundReport report = runRegularRoundReclaiming(gc);
-    ASSERT_TRUE(report.acquired_lease);
-    gc.setPhaseSink({});
-
-    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(op, layout, ns);
-    EXPECT_EQ(sealedCursorOf(*backend, layout, ns), (RefTxnId{1, 1}));
-    EXPECT_EQ(backend->getCount(layout.refLogKey(life, RefTxnId{1, 2})), 0u)
-        << "the checkpoint boundary proves the cut without a post-frontier 404";
-    EXPECT_TRUE(report.anomalies.empty());
-    ASSERT_FALSE(intake.empty());
-    EXPECT_EQ(intake["frontier_proven"], intake["frontier_namespaces"]);
-}
-
-/// The same cut remains complete when the durable uncommitted successor is hidden from every LIST.
-/// Exact reads still serve that successor, but the checkpoint ceiling must leave it untouched and must
-/// not let the list omission suppress the checkpoint-bounded destructive path.
-TEST(CASGCFrontierGate, CheckpointFrontierProvesLifeWithHiddenDurableSuccessor)
-{
-    auto backend = std::make_shared<CountingHintHoleBackend>();
-    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
-    CasRequests requests = openRequestsForTest(backend);
-    CasOperation op = requests.admit();
-    const Layout & layout = store->layout();
-    const RootNamespace ns{"00/checkpoint-hidden-successor@cas@"};
-    const DB::UInt128 beyond_frontier_blob(0xf4);
-
-    fixture::admitLive(*backend, layout, ns);
-    publish(*backend, layout, ns, "committed", 1, DB::UInt128(0xf5));
-    const ManifestRef uncommitted{.writer_epoch = 1, .build_sequence = 2, .manifest_ordinal = 1};
-    writeBlobBody(*backend, layout, beyond_frontier_blob);
-    writeManifestRaw(*backend, layout, ns, uncommitted, {blobEntryFor("data.bin", beyond_frontier_blob)});
-    fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
-        .ns = ns.string(),
-        .txn_id = RefTxnId{1, 2},
-        .ops = publishCommittedOps("hidden_durable_but_uncommitted", uncommitted),
-        .prev_epoch_seal = std::nullopt,
-    });
-    replaceRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
-        .life_epoch = 1,
-        .committed_through = RefTxnId{1, 1},
-        .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt,
-    });
-
-    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(op, layout, ns);
-    backend->hide(layout.refLogKey(life, RefTxnId{1, 2}));
-
-    std::map<String, UInt64> intake;
-    Gc gc(store, kGc);
-    gc.setPhaseSink([&](const GcPhaseRecord & rec)
-    {
-        if (rec.phase == "fold_ref_intake")
-            intake = rec.metrics;
-    });
-    backend->resetCounts();
-    const RoundReport report = runRegularRoundReclaiming(gc);
-    ASSERT_TRUE(report.acquired_lease);
-    gc.setPhaseSink({});
-
-    EXPECT_GT(backend->holesServed(), 0u) << "the F+1 log must really be hidden from LIST";
-    EXPECT_EQ(sealedCursorOf(*backend, layout, ns), (RefTxnId{1, 1}));
-    EXPECT_EQ(inDegreeOf(*backend, layout, beyond_frontier_blob), 0);
-    EXPECT_EQ(backend->getCount(layout.refLogKey(life, RefTxnId{1, 2})), 0u)
-        << "the hidden durable successor is outside the checkpoint cut";
-    EXPECT_TRUE(report.anomalies.empty());
-    ASSERT_FALSE(intake.empty());
-    EXPECT_EQ(intake["frontier_proven"], intake["frontier_namespaces"]);
 }
 
 /// The checkpoint's inclusive endpoint is itself a durable witness. If that exact log is absent,
@@ -2143,8 +1880,7 @@ TEST(CASGCFrontierGate, HiddenCommittedCheckpointLogIsFoldedThroughTheAuthorityC
     EXPECT_EQ(intake["frontier_proven"], intake["frontier_namespaces"]);
 }
 
-/// A valid checkpoint with no committed record is an authoritative empty history. It is complete for
-/// a never-folded life without probing a fabricated first transaction.
+/// A never-folded life whose first key reads absent is complete.
 TEST(CASGCFrontierGate, EmptyCheckpointFrontierProvesAnUnfoldedLife)
 {
     auto backend = std::make_shared<CountingBackend>();
@@ -2168,56 +1904,6 @@ TEST(CASGCFrontierGate, EmptyCheckpointFrontierProvesAnUnfoldedLife)
     EXPECT_TRUE(report.anomalies.empty());
     ASSERT_FALSE(intake.empty());
     EXPECT_EQ(intake["frontier_proven"], intake["frontier_namespaces"]);
-}
-
-/// Empty history cannot explain an inherited cursor. An operator-corrupted checkpoint that erases its
-/// own committed boundary must clamp the life rather than silently authorize destruction.
-TEST(CASGCFrontierGate, EmptyCheckpointFrontierRejectsAnInheritedCursor)
-{
-    auto backend = std::make_shared<CountingBackend>();
-    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
-    CasRequests requests = openRequestsForTest(backend);
-    CasOperation op = requests.admit();
-    const Layout & layout = store->layout();
-    const RootNamespace ns{"00/empty-checkpoint-after-cursor@cas@"};
-
-    fixture::admitLive(*backend, layout, ns);
-    publish(*backend, layout, ns, "first", 1, DB::UInt128(0xfa));
-    replaceRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
-        .life_epoch = 1,
-        .committed_through = RefTxnId{1, 1},
-        .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt,
-    });
-
-    Gc gc(store, kGc);
-    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
-    ASSERT_EQ(sealedCursorOf(*backend, layout, ns), (RefTxnId{1, 1}));
-
-    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(op, layout, ns);
-    const String checkpoint_key = layout.refCkptKey(life);
-    const auto checkpoint_head = op.head(checkpoint_key, Retry::once());
-    ASSERT_TRUE(checkpoint_head.has_value());
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(checkpoint_key, encodeRefCkpt(RefCkpt{
-        .life_epoch = 1,
-        .committed_through = std::nullopt,
-        .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt,
-    }), checkpoint_head->etag, Retry::once())));
-
-    std::map<String, UInt64> intake;
-    gc.setPhaseSink([&](const GcPhaseRecord & rec)
-    {
-        if (rec.phase == "fold_ref_intake")
-            intake = rec.metrics;
-    });
-    const RoundReport report = runRegularRoundReclaiming(gc);
-    ASSERT_TRUE(report.acquired_lease);
-    gc.setPhaseSink({});
-
-    EXPECT_FALSE(report.anomalies.empty()) << "an empty checkpoint cannot explain a nonzero cursor";
-    ASSERT_FALSE(intake.empty());
-    EXPECT_LT(intake["frontier_proven"], intake["frontier_namespaces"]);
 }
 
 /// A catalog `Live` life without its exact checkpoint cannot derive either its genesis or a frontier
@@ -2455,11 +2141,9 @@ TEST(CASGCFrontierGate, ALateEdgeSparesADeletePendingBlobAtTheDeleteSite)
     runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
 
-    /// Condemn it, then graduate it to delete_pending.
+    /// Condemn it: the intent is confirmed and the row pending.
     dropRefTransition(*backend, layout, ns, "ref_1", mref);
     runRegularRoundReclaiming(gc);            /// condemn
-    store->renewWatermarkOnce();
-    runRegularRoundReclaiming(gc);            /// graduate: delete_pending published
     store->renewWatermarkOnce();
 
     /// A new owner appears BEFORE the delete pass. The pass recomputes the in-degree from the merge it
@@ -2478,7 +2162,7 @@ TEST(CASGCFrontierGate, ALateEdgeSparesADeletePendingBlobAtTheDeleteSite)
 }
 
 /// ARM (b): a TOKENED adoption of an already-delete-pending blob. The writer's admit gate reads the
-/// `Condemned` meta, refuses to adopt the dying incarnation, and rematerializes from its own source as
+/// incarnation's intent, refuses to adopt the dying incarnation, and rematerializes from its own source as
 /// a FRESH incarnation -- so the delayed exact-token delete the previous round published finds a
 /// different token and removes nothing. The blob's identity is preserved by re-upload, never by
 /// reviving the condemned object.
@@ -2509,23 +2193,19 @@ TEST(CASGCFrontierGate, AResurrectedIncarnationSurvivesTheDelayedStaleTokenDelet
     runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
     dropRefTransition(*backend, layout, ns, "ref_1", mref);
-    runRegularRoundReclaiming(gc);            /// condemn: writes the durable Condemned meta
-    store->renewWatermarkOnce();
-    runRegularRoundReclaiming(gc);            /// graduate: publishes delete_pending against THIS token
+    runRegularRoundReclaiming(gc);            /// condemn: the intent of THIS token, the row pending
     store->renewWatermarkOnce();
 
     OperationForTest raw_op(*backend);
     const auto condemned_head = (*raw_op).head(key, Retry::once());
     ASSERT_TRUE(condemned_head.has_value());
     const Etag condemned_token = condemned_head->etag;
-    const auto condemned_meta = loadMetaForTest(*backend, layout, hash);
-    ASSERT_TRUE(condemned_meta.has_value());
-    ASSERT_EQ(condemned_meta->meta.state, MetaState::Condemned)
-        << "the delete GC is about to execute must be backed by durable Condemned evidence";
+    ASSERT_TRUE(objectPresent(*backend, layout.blobIntentKey(id, *condemned_token.canonical())))
+        << "the delete GC is about to execute must be backed by a confirmed intent";
 
-    /// A writer now adopts the blob through the REAL admit gate. It point-reads the Condemned meta,
-    /// refuses to adopt the dying incarnation, and rematerializes from its OWN source bytes -- never by
-    /// reading the condemned object. The key ends up holding a DIFFERENT incarnation.
+    /// A writer now adopts the blob through the REAL admit gate. It reads the intent, refuses to adopt the
+    /// dying incarnation, and rematerializes from its OWN source bytes -- never by reading the condemned
+    /// object. The key ends up holding a DIFFERENT incarnation.
     PartWriteInfo info;
     info.intended_ref = ns.string() + "/republished";
     auto build = store->beginPartWrite(info);
@@ -2538,7 +2218,7 @@ TEST(CASGCFrontierGate, AResurrectedIncarnationSurvivesTheDelayedStaleTokenDelet
     const auto fresh_head = (*raw_op).head(key, Retry::once());
     ASSERT_TRUE(fresh_head.has_value());
     const Etag fresh_token = fresh_head->etag;
-    ASSERT_NE(fresh_token, condemned_token) << "republication must displace the condemned incarnation";
+    ASSERT_NE(tokenText(fresh_token), tokenText(condemned_token)) << "republication must displace the condemned incarnation";
 
     /// GC's delayed delete still names the OLD token. It cannot touch the new object.
     drive(store, gc, /*rounds*/ 2, UniversePolicy::Authoritative);
@@ -2546,7 +2226,7 @@ TEST(CASGCFrontierGate, AResurrectedIncarnationSurvivesTheDelayedStaleTokenDelet
     const auto surviving_head = (*raw_op).head(key, Retry::once());
     ASSERT_TRUE(surviving_head.has_value())
         << "the resurrected incarnation survives the delete published against its predecessor";
-    EXPECT_EQ(surviving_head->etag, fresh_token) << "and it is still the writer's incarnation";
+    EXPECT_EQ(tokenText(surviving_head->etag), tokenText(fresh_token)) << "and it is still the writer's incarnation";
     EXPECT_EQ((*raw_op).remove(key, condemned_token, Retry::once()), Removal::Mismatch)
         << "the condemned token can never remove the fresh object (INV-NO-RETURN)";
 }
@@ -2762,12 +2442,12 @@ TEST(CASGCFrontierGate, CleanupEvidenceLeavesRemovedNamespaceCheckpointForJanito
         return next;
     });
     const String ckpt_key = layout.refCkptKey(life);
-    op.create(ckpt_key, encodeRefCkpt(RefCkpt{
+    op.create(ckpt_key, encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{1, 2},
         .checkpoint_snapshot_id = std::nullopt,
         .last_epoch_seal = std::nullopt,
-    }), Retry::once());
+    }, 1), Retry::once());
 
     /// The removal evidence must arise from a replay-valid terminal lifecycle, rather than merely
     /// from a raw terminal record that the recovery state machine refuses.
@@ -2855,12 +2535,12 @@ TEST(CASGCFrontierGate, PostFoldUnreadableDeadCheckpointIsCountedWithoutSuppress
         it->removal_started_round = 1;
         return next;
     });
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(removed_life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(removed_life), encodeRefCkptAtGeneration(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{1, 2},
         .checkpoint_snapshot_id = std::nullopt,
         .last_epoch_seal = std::nullopt,
-    }), Retry::once())));
+    }, 1), Retry::once())));
 
     const DB::UInt128 blob(0xfeed);
     const ManifestRef manifest = publish(*backend, layout, progressing, "victim", 1, blob);
@@ -2975,14 +2655,14 @@ TEST(CASCatalogLifecycleReconciler, EmptyCatalogReturnsAuthoritativeCompleteCut)
 
     CasFoldSeal parent;
     CatalogLifecycleReconciler reconciler(op, layout, parent);
-    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh);
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh, noRetirementRecord);
 
     EXPECT_EQ(result.authority_status, AuthorityStatus::Authoritative);
     EXPECT_EQ(result.catalog_resolution, CatalogResolution::DrainComplete);
     ASSERT_TRUE(result.final_catalog_cut);
     EXPECT_TRUE(result.final_catalog_cut->catalog.entries.empty());
-    EXPECT_TRUE(result.retired_lives.empty());
-    EXPECT_EQ(result.deleted, 0);
+    EXPECT_TRUE(reconciler.retiredLives().empty());
+    EXPECT_EQ(reconciler.completedErases(), 0);
 }
 
 TEST(CASCatalogLifecycleReconciler, DeletesEligibleRowsFromReturnedResolutionCuts)
@@ -3001,17 +2681,49 @@ TEST(CASCatalogLifecycleReconciler, DeletesEligibleRowsFromReturnedResolutionCut
     backend->resetCounts();
 
     CatalogLifecycleReconciler reconciler(op, layout, parent);
-    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh);
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh, noRetirementRecord);
 
     EXPECT_EQ(result.authority_status, AuthorityStatus::Authoritative);
     EXPECT_EQ(result.catalog_resolution, CatalogResolution::DrainComplete);
-    EXPECT_EQ(result.deleted, deletes);
-    ASSERT_EQ(result.retired_lives.size(), deletes);
+    EXPECT_EQ(reconciler.completedErases(), deletes);
+    ASSERT_EQ(reconciler.retiredLives().size(), deletes);
     ASSERT_TRUE(result.final_catalog_cut);
     EXPECT_TRUE(result.final_catalog_cut->catalog.entries.empty());
     const std::vector<String> journal = backend->journalSnapshot();
     const String catalog_get = "get " + layout.refCatalogKey();
     EXPECT_EQ(std::count(journal.begin(), journal.end(), catalog_get), deletes + 1);
+}
+
+/// The retirement announcement precedes the erase of its row: a record made afterwards leaves a
+/// window in which the life is gone but unrecorded.
+TEST(CASCatalogLifecycleReconciler, AnnouncesEachLifeBeforeItsRowIsErased)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    constexpr size_t deletes = 3;
+    seedCompletedRemovingBatch(op, store, kGc, deletes);
+    const auto parent_object = op.read(layout.foldSealKey(1, 1), Retry::once());
+    ASSERT_TRUE(parent_object);
+    const CasFoldSeal parent = decodeFoldSeal(parent_object->bytes);
+
+    std::vector<NamespaceLifeId> announced;
+    size_t announced_while_cataloged = 0;
+    CatalogLifecycleReconciler reconciler(op, layout, parent);
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(
+        noAuthorityRefresh,
+        [&](const NamespaceLifeId & life)
+        {
+            announced.push_back(life);
+            if (CasRefCatalog::lifeIfCataloged(op, layout, life.ns) == std::optional<NamespaceLifeId>{life})
+                ++announced_while_cataloged;
+        });
+
+    EXPECT_EQ(reconciler.completedErases(), deletes);
+    EXPECT_EQ(announced, reconciler.retiredLives()) << "each life is announced exactly once, in erase order";
+    EXPECT_EQ(announced_while_cataloged, deletes) << "the announcement must precede the erase of its row";
 }
 
 TEST(CASCatalogLifecycleReconciler, ReturnsRetiredLifeWhenAuthorityMovesAfterResolution)
@@ -3038,15 +2750,47 @@ TEST(CASCatalogLifecycleReconciler, ReturnsRetiredLifeWhenAuthorityMovesAfterRes
     });
 
     CatalogLifecycleReconciler reconciler(fenced_op, layout, parent);
-    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh);
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh, noRetirementRecord);
 
     EXPECT_EQ(result.authority_status, AuthorityStatus::FencedOut);
     EXPECT_EQ(result.catalog_resolution, CatalogResolution::ExactRowAbsent);
-    ASSERT_EQ(result.retired_lives.size(), 1);
-    EXPECT_EQ(result.retired_lives.front(),
+    ASSERT_EQ(reconciler.retiredLives().size(), 1);
+    EXPECT_EQ(reconciler.retiredLives().front(),
         NamespaceLifeId::fromCatalogEntry(fixture.ns, fixture.life_id));
-    EXPECT_EQ(result.deleted, 1);
+    EXPECT_EQ(reconciler.completedErases(), 1);
     EXPECT_FALSE(result.final_catalog_cut);
+}
+
+/// The store acknowledged the erase and the resolution read that follows throws: the erase is
+/// counted and its life recorded anyway, because the drain's caller reads both after the throw.
+TEST(CASCatalogLifecycleReconciler, RecordsAnAcknowledgedEraseWhoseResolutionReadThrows)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    const CompletedRemovingFixture fixture = seedCompletedRemoving(op, store, kGc);
+    const auto parent_object = op.read(layout.foldSealKey(1, 1), Retry::once());
+    ASSERT_TRUE(parent_object);
+    const CasFoldSeal parent = decodeFoldSeal(parent_object->bytes);
+
+    /// The first catalog read selects the row; the second is the erase's resolution read.
+    size_t catalog_reads = 0;
+    backend->afterReadOf(layout.refCatalogKey(), [&]
+    {
+        if (++catalog_reads == 2)
+            throw std::runtime_error("injected resolution read failure");
+    });
+
+    CatalogLifecycleReconciler reconciler(op, layout, parent);
+    EXPECT_THROW(reconciler.reconcile(noAuthorityRefresh, noRetirementRecord), std::runtime_error);
+    backend->afterReadOf(layout.refCatalogKey(), {});
+
+    ASSERT_FALSE(CasRefCatalog::lifeIfCataloged(op, layout, fixture.ns)) << "the erase landed";
+    EXPECT_EQ(reconciler.completedErases(), 1u);
+    EXPECT_EQ(reconciler.retiredLives(),
+        std::vector<NamespaceLifeId>{NamespaceLifeId::fromCatalogEntry(fixture.ns, fixture.life_id)});
 }
 
 TEST(CASCatalogLifecycleReconciler, InitialFenceLossReportsEligibleRowStillPresent)
@@ -3068,12 +2812,12 @@ TEST(CASCatalogLifecycleReconciler, InitialFenceLossReportsEligibleRowStillPrese
     backend->afterReadOf(layout.refCatalogKey(), [&] { authority_held = false; });
 
     CatalogLifecycleReconciler reconciler(fenced_op, layout, parent);
-    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh);
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh, noRetirementRecord);
 
     EXPECT_EQ(result.authority_status, AuthorityStatus::FencedOut);
     EXPECT_EQ(result.catalog_resolution, CatalogResolution::ExactRowStillPresent);
-    EXPECT_TRUE(result.retired_lives.empty());
-    EXPECT_EQ(result.deleted, 0);
+    EXPECT_TRUE(reconciler.retiredLives().empty());
+    EXPECT_EQ(reconciler.completedErases(), 0);
     EXPECT_FALSE(result.final_catalog_cut);
     EXPECT_EQ(backend->getCount(layout.refCatalogKey()), 1)
         << "an operation whose admission is gone before the erase reports the selection cut it "
@@ -3099,16 +2843,41 @@ TEST(CASCatalogLifecycleReconciler, RetriesFromTheMandatoryConflictResolutionCut
     backend->conflictNextCatalogCas(layout.refCatalogKey());
 
     CatalogLifecycleReconciler reconciler(op, layout, parent);
-    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh);
+    size_t announcements = 0;
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(
+        noAuthorityRefresh, [&](const NamespaceLifeId &) { ++announcements; });
 
     EXPECT_EQ(result.authority_status, AuthorityStatus::Authoritative);
     EXPECT_EQ(result.catalog_resolution, CatalogResolution::DrainComplete);
-    EXPECT_EQ(result.deleted, 1);
+    EXPECT_EQ(reconciler.completedErases(), 1);
+    EXPECT_EQ(announcements, 1) << "one announcement per life, however many erase attempts it takes";
     const std::vector<String> journal = backend->journalSnapshot();
     const String catalog_get = "get " + layout.refCatalogKey();
     EXPECT_EQ(std::count(journal.begin(), journal.end(), catalog_get), 4)
         << "selection, the refused write's own resolve read, the mandatory resolution cut the retry "
            "reuses, and the committed erase's resolution -- the catalog takes no cut of its own";
+}
+
+/// A failing announcement aborts the drain before any erase is sent: no record means no erase.
+TEST(CASCatalogLifecycleReconciler, AFailingAnnouncementSendsNoErase)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    seedCompletedRemoving(op, store, kGc);
+    const auto parent_object = op.read(layout.foldSealKey(1, 1), Retry::once());
+    ASSERT_TRUE(parent_object);
+    const CasFoldSeal parent = decodeFoldSeal(parent_object->bytes);
+    backend->resetCounts();
+
+    CatalogLifecycleReconciler reconciler(op, layout, parent);
+    EXPECT_THROW(
+        (void)reconciler.reconcile(noAuthorityRefresh, [](const NamespaceLifeId &) { throw std::runtime_error("record failed"); }),
+        std::runtime_error);
+    EXPECT_EQ(backend->putOverwriteCount(layout.refCatalogKey()), 0) << "the erase must not be sent";
+    EXPECT_FALSE(CasRefCatalog::read(op, layout).catalog.entries.empty()) << "the row must still be cataloged";
 }
 
 /// THE DRAIN'S AUTHORITY, end to end. `CatalogLifecycleReconciler` and
@@ -3200,6 +2969,35 @@ TEST(CASGCFrontierGate, ALeaderDeposedBetweenTwoErasesStopsAfterTheFirst)
         << "one row was erased before the deposition; the other survives it";
 }
 
+/// A drain that throws after erasing a row still reports that row: the phase record is what an
+/// operator reads to learn how far the round got.
+TEST(CASGCFrontierGate, AnAbortedDrainReportsTheRowsItErased)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    /// The injected failure is retried until the request window ends; a virtual clock ends it at once.
+    const auto clock = DB::Cas::tests::VirtualRetryClock::installOn(store);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    seedCompletedRemovingBatch(op, store, kGc, /*count=*/2);
+    backend->failCatalogCasesAfter(layout.refCatalogKey(), /*allowed=*/1);
+
+    std::optional<std::map<String, UInt64>> drain_metrics;
+    Gc gc(store, kGc);
+    gc.setPhaseSink([&](const GcPhaseRecord & rec)
+    {
+        if (rec.phase == "pre_fold_ref_drain")
+            drain_metrics = rec.metrics;
+    });
+    EXPECT_THROW(gc.runRegularRound(), DB::Exception);
+    gc.setPhaseSink({});
+
+    ASSERT_TRUE(drain_metrics.has_value()) << "the drain phase emits its record even when it throws";
+    ASSERT_TRUE(drain_metrics->contains("deleted")) << "the aborted drain reports its erase count";
+    EXPECT_EQ(drain_metrics->at("deleted"), 1u);
+}
+
 TEST(CASGCFrontierGate, HealthyRebuildUsesTheCatalogLifecycleReconciler)
 {
     auto backend = std::make_shared<DrainRaceBackend>();
@@ -3209,6 +3007,9 @@ TEST(CASGCFrontierGate, HealthyRebuildUsesTheCatalogLifecycleReconciler)
     const Layout & layout = store->layout();
     const CompletedRemovingFixture fixture = seedCompletedRemoving(op, store, kGc);
     const uint64_t catalog_cas_before = backend->putOverwriteCount(layout.refCatalogKey());
+    /// An admission in flight keeps the name's slot, so each retirement record lands in it.
+    std::optional<CasRefLedger::ColdAdmission> admission = store->beginColdAdmissionForTest(fixture.ns);
+    const uint64_t retirements_before = store->refNameRetirementsForTest(fixture.ns);
 
     Gc gc(store, kGc);
     const RebuildReport result = gc.rebuildBaseline(/*force=*/true);
@@ -3216,6 +3017,8 @@ TEST(CASGCFrontierGate, HealthyRebuildUsesTheCatalogLifecycleReconciler)
     EXPECT_TRUE(result.performed);
     EXPECT_FALSE(CasRefCatalog::lifeIfCataloged(op, layout, fixture.ns));
     EXPECT_EQ(backend->putOverwriteCount(layout.refCatalogKey()), catalog_cas_before + 1);
+    EXPECT_EQ(store->refNameRetirementsForTest(fixture.ns), retirements_before + 2)
+        << "the rebuild drain records the retirement before the erase and again after it";
 }
 
 TEST(CASGCFrontierGate, DamagedStateRebuildDoesNotDeleteCompletedRemovingRows)
@@ -3283,6 +3086,7 @@ TEST(CASGCFrontierGate, DeferredRoundDrainsCompletedRemovingBeforeReturning)
     state.gc_shards = store->poolConfig().gc_shards;
     state.snap_generation = 1;
     state.snap_attempt = 1;
+    state.orphan_manifest_sweep_completed_at_ms = 1000;
     state.lease = GcLease{.owner = kGc, .seq = 1};
     ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.gcStateKey(), encodeGcState(state), Retry::once())));
 
@@ -3290,7 +3094,7 @@ TEST(CASGCFrontierGate, DeferredRoundDrainsCompletedRemovingBeforeReturning)
     ASSERT_TRUE(std::holds_alternative<Committed>(op.create(ckpt_key, "inert checkpoint debris", Retry::once())));
     const uint64_t catalog_cas_before = backend->putOverwriteCount(layout.refCatalogKey());
 
-    Gc gc(store, kGc);
+    Gc gc(store, kGc, [] { return 1001; });
     const RoundReport report = runRegularRoundReclaiming(gc);
     ASSERT_TRUE(report.acquired_lease);
     EXPECT_TRUE(report.deferred);
@@ -3523,12 +3327,12 @@ TEST_P(CASGCCompletedRemovalFenceRace, FencedLeaderStopsAfterWinnerRemovesOrRepl
         /// Mirror production's publish-then-flip order: the successor life needs a readable `_ckpt`
         /// before its catalog row can read `Live`, or `chooseRecoveryGrounding` rejects it.
         const NamespaceLifeId successor_life = NamespaceLifeId::fromCatalogEntry(fixture.ns, UInt128{178});
-        op.create(layout.refCkptKey(successor_life), encodeRefCkpt(RefCkpt{
+        op.create(layout.refCkptKey(successor_life), encodeRefCkptAtGeneration(RefCkpt{
             .life_epoch = 1,
             .committed_through = std::nullopt,
             .checkpoint_snapshot_id = std::nullopt,
             .last_epoch_seal = std::nullopt,
-        }), Retry::once());
+        }, 1), Retry::once());
     }
     ASSERT_TRUE(observed.etag);
     ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(

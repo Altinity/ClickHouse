@@ -112,7 +112,7 @@ void deleteCatalogLife(
     parent.ref_lives.emplace(life1.incarnation, RefLifeFoldState{
         .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 1}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 1}}});
-    if (CasRefCatalog::deleteCompletedRemoving(op, layout, *it, parent, noAuthorityRefresh)
+    if (deleteCompletedRemovingForTest(op, layout, *it, parent, noAuthorityRefresh)
         != CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted)
         throw DB::Exception(
             DB::ErrorCodes::LOGICAL_ERROR, "Failed to delete fixture catalog life '{}'", life1.ns.string());
@@ -211,7 +211,7 @@ TEST(CASNamespaceFileReadContract, DelayedInlineFinalizeCannotChangeSuccessorTok
 
     const auto life2_after = op.head(life2_key, Retry::standard());
     ASSERT_TRUE(life2_after.has_value());
-    EXPECT_EQ(life2_after->etag, life2_before->etag);
+    EXPECT_EQ(tokenText(life2_after->etag), tokenText(life2_before->etag));
     const auto life2_body_after = op.read(life2_key, Retry::standard());
     ASSERT_TRUE(life2_body_after.has_value());
     EXPECT_EQ(life2_body_after->bytes, "life-2-stable\n");
