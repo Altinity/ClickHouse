@@ -298,7 +298,7 @@ const Poco::Net::IPAddress & HostResolver::selectBest()
     /// `updateWeightsImpl` (not `updateWeights`) so a concurrent `resolve` during `setFail`'s
     /// DNS refresh window leaves `total_weight == 0` intact for the uniform fallback below
     /// rather than prematurely clearing bans.
-    if (weights_dirty)
+    if (weights_dirty || weights_latency_aware != latency_aware_selection.load(std::memory_order_relaxed))
         updateWeightsImpl();
 
     /// Every address can be banned at once, giving a zero total weight. This happens
@@ -449,6 +449,7 @@ void HostResolver::updateWeightsImpl()
     /// its EWMA fresh and lets it recover if it speeds up again.
     double median_latency_ms = 0;
     const bool latency_aware = latency_aware_selection.load(std::memory_order_relaxed);
+    weights_latency_aware = latency_aware;
     if (latency_aware)
     {
         /// `measured_latencies_scratch` is pre-reserved to `records.size()` in `updateImpl`,

@@ -305,6 +305,11 @@ protected:
     /// Set by `reportLatency` instead of recomputing weights on every sample; cleared whenever
     /// `updateWeightsImpl` runs (lazily in `selectBest`, or eagerly on `update`/`setFail`/`setSuccess`).
     bool weights_dirty TSA_GUARDED_BY(mutex) = false;
+    /// Value of `latency_aware_selection` that `updateWeightsImpl` last computed the weights with.
+    /// The toggle is process-wide and flips without touching the resolvers, so `selectBest` compares
+    /// it with the current value and recomputes when it differs; otherwise biased weights would
+    /// outlive turning the setting off (and unbiased ones would outlive turning it on).
+    bool weights_latency_aware TSA_GUARDED_BY(mutex) = false;
 
     /// True once at least one record in `records` has `latency_ms_ewma > 0`. Reset in `reset()`
     /// and refreshed on `updateImpl` (an expired address may have held the only measurement).

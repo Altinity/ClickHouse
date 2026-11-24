@@ -930,6 +930,51 @@ TEST_F(ResolvePoolTest, LatencyIsIgnoredWhenLatencyAwareSelectionIsOff)
     ASSERT_GT(0.3 * mean, diff);
 }
 
+TEST_F(ResolvePoolTest, TogglingLatencyAwareSelectionRecomputesWeights)
+{
+    LatencyAwareSelectionScope scope(false);
+    /// Large history so `resolve_interval` (history / 3) keeps the DNS refresh, which recomputes
+    /// the weights, out of the way: only the toggle may trigger a recomputation here.
+    auto resolver = make_resolver(100000);
+    resolver->resolve(); /// populate the records
+
+    const auto count_picks = [&](size_t n)
+    {
+        std::map<String, size_t> results;
+        for (size_t i = 0; i < n; ++i)
+        {
+            auto entry = resolver->resolve();
+            ++results[*entry];
+        }
+        return results;
+    };
+
+    /// Move every address past the last `usage` threshold of `Record::getWeight`; crossing one
+    /// recomputes the weights (`setSuccess`) and would hide a missing recomputation on a toggle flip.
+    count_picks(40000);
+
+    resolver->reportLatency(Poco::Net::IPAddress("127.0.0.1"), 1000);
+    resolver->reportLatency(Poco::Net::IPAddress("127.0.0.2"), 100000);
+    resolver->reportLatency(Poco::Net::IPAddress("127.0.0.3"), 100000);
+
+    /// Turning the setting on after the latencies were reported biases the next picks, although
+    /// no new sample marked the weights dirty.
+    DB::HostResolver::setLatencyAwareSelection(true);
+    {
+        auto results = count_picks(3000);
+        ASSERT_GT(results["127.0.0.1"], 3 * results["127.0.0.2"]);
+    }
+
+    /// Turning it off drops the bias on the next pick, without waiting for a DNS refresh.
+    DB::HostResolver::setLatencyAwareSelection(false);
+    {
+        auto results = count_picks(50000);
+        auto mean = getMean(results);
+        auto diff = getMaxDiff(results, mean);
+        ASSERT_GT(0.3 * mean, diff);
+    }
+}
+
 TEST_F(ResolvePoolTest, LatencySnapshotFastExitAndLookup)
 {
     LatencyAwareSelectionScope scope(true);
