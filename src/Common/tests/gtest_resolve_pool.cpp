@@ -1308,3 +1308,113 @@ TEST_F(ResolvePoolTest, DestroyingResolverReleasesItsStateUnderTheTotalTracker)
     /// few hundred bytes of slack are expected; the 200 records and their addresses are tens of KiB.
     ASSERT_GE(delta, -1024) << "resolver state freed against the query tracker";
 }
+
+TEST_F(ResolvePoolTest, FailedUpdateLeavesMetricsAndStateUnchanged)
+{
+    /// Regression test: `updateImpl` used to change the address metrics (and `last_resolve_time`)
+    /// while merging, and only then do the allocation that can still throw (the scratch buffer
+    /// reserve). A failure there left `records` unchanged but the metrics already moved, so the next
+    /// update counted the same expired addresses again.
+    ///
+    /// Fault injection sweep: allow `extra` more bytes than currently used, widening the budget one
+    /// byte at a time, so that every allocation of `updateImpl` fails once. Each failed attempt must
+    /// leave everything unchanged, and the attempt without a failure must apply the whole update.
+    DB::MainThreadStatus::getInstance();
+
+    struct UpdateInspector : public DB::HostResolver
+    {
+        using ResolveFunction = DB::HostResolver::ResolveFunction;
+        UpdateInspector(String h, Poco::Timespan history_, ResolveFunction f)
+            : DB::HostResolver(std::move(f), std::move(h), history_)
+        {}
+
+        /// Runs `updateImpl` under the lock, like `update` does after the DNS lookup.
+        void applyUpdate(Poco::Timestamp now, std::vector<Poco::Net::IPAddress> next_gen)
+        {
+            std::lock_guard lock(mutex);
+            updateImpl(now, next_gen);
+        }
+
+        size_t recordCount()
+        {
+            std::lock_guard lock(mutex);
+            return records.size();
+        }
+
+        Poco::Timestamp lastResolveTime()
+        {
+            std::lock_guard lock(mutex);
+            return last_resolve_time;
+        }
+    };
+
+    auto resolver = std::make_shared<UpdateInspector>(
+        "failed-update-host",
+        Poco::Timespan(1, 0),
+        [](const String &) -> std::vector<Poco::Net::IPAddress> { return {Poco::Net::IPAddress("10.0.0.1")}; });
+    ASSERT_EQ(size_t(1), resolver->recordCount());
+
+    /// The only known address expires (it is older than `history` at `future`), three others are discovered.
+    Poco::Timestamp now;
+    const Poco::Timestamp future = now + 10 * Poco::Timestamp::resolution();
+    const std::vector<Poco::Net::IPAddress> next_gen{
+        Poco::Net::IPAddress("10.1.0.1"), Poco::Net::IPAddress("10.1.0.2"), Poco::Net::IPAddress("10.1.0.3")};
+
+    auto & thread_tracker = DB::CurrentThread::get().memory_tracker;
+    const Int64 saved_untracked_limit = DB::CurrentThread::get().untracked_memory_limit;
+    const Int64 saved_thread_hard_limit = thread_tracker.getHardLimit();
+    const UInt64 saved_min_alloc_to_throw = CurrentMemoryTracker::getMinAllocationSizeBytesToThrow();
+    SCOPE_EXIT_SAFE({
+        thread_tracker.setHardLimit(saved_thread_hard_limit);
+        DB::CurrentThread::get().untracked_memory_limit = saved_untracked_limit;
+        CurrentMemoryTracker::setMinAllocationSizeBytesToThrow(saved_min_alloc_to_throw);
+    });
+    CurrentMemoryTracker::setMinAllocationSizeBytesToThrow(1);
+    DB::CurrentThread::get().untracked_memory_limit = 0;
+    DB::CurrentThread::flushUntrackedMemory();
+
+    const Int64 active_before = CurrentMetrics::get(metrics.active_count);
+    const Int64 banned_before = CurrentMetrics::get(metrics.banned_count);
+    const UInt64 expired_before = DB::CurrentThread::getProfileEvents()[metrics.expired];
+    const UInt64 discovered_before = DB::CurrentThread::getProfileEvents()[metrics.discovered];
+    const Poco::Timestamp last_resolve_before = resolver->lastResolveTime();
+
+    size_t failed_attempts = 0;
+    bool applied = false;
+    for (Int64 extra = 1; extra < (1 << 16) && !applied; ++extra)
+    {
+        thread_tracker.setHardLimit(thread_tracker.get() + extra);
+        bool failed = false;
+        try
+        {
+            resolver->applyUpdate(future, next_gen);
+        }
+        catch (const DB::Exception &)
+        {
+            failed = true;
+        }
+        thread_tracker.setHardLimit(saved_thread_hard_limit);
+
+        if (!failed)
+        {
+            applied = true;
+            break;
+        }
+
+        ++failed_attempts;
+        ASSERT_EQ(size_t(1), resolver->recordCount()) << "extra=" << extra;
+        ASSERT_EQ(active_before, CurrentMetrics::get(metrics.active_count)) << "extra=" << extra;
+        ASSERT_EQ(banned_before, CurrentMetrics::get(metrics.banned_count)) << "extra=" << extra;
+        ASSERT_EQ(expired_before, DB::CurrentThread::getProfileEvents()[metrics.expired]) << "extra=" << extra;
+        ASSERT_EQ(discovered_before, DB::CurrentThread::getProfileEvents()[metrics.discovered]) << "extra=" << extra;
+        ASSERT_EQ(last_resolve_before, resolver->lastResolveTime()) << "extra=" << extra;
+    }
+
+    ASSERT_TRUE(applied);
+    ASSERT_GT(failed_attempts, size_t(0)) << "the sweep never injected a failure";
+
+    ASSERT_EQ(size_t(3), resolver->recordCount());
+    ASSERT_EQ(active_before + 2, CurrentMetrics::get(metrics.active_count));
+    ASSERT_EQ(expired_before + 1, DB::CurrentThread::getProfileEvents()[metrics.expired]);
+    ASSERT_EQ(discovered_before + 3, DB::CurrentThread::getProfileEvents()[metrics.discovered]);
+}

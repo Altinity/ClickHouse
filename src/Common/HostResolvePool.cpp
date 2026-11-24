@@ -385,8 +385,20 @@ void HostResolver::updateImpl(Poco::Timestamp now, std::vector<Poco::Net::IPAddr
 {
     const auto last_effective_resolve = now - history;
 
+    /// Everything that can throw runs before the first change of shared state: the allocations of
+    /// the scratch buffer and of the merged records (including the `IPAddress` copies), then the
+    /// swap, which does not throw. The metrics are applied at the very end from local counters, so
+    /// a failure leaves `records`, `last_resolve_time` and the metrics as they were.
+    /// The scratch buffer is reserved first so `capacity() >= records.size()` holds on every exit
+    /// path (`merged` never has more records than the old and the new generation together).
+    measured_latencies_scratch.reserve(records.size() + next_gen.size());
+
     Records merged;
     merged.reserve(records.size() + next_gen.size());
+
+    size_t expired_count = 0;
+    size_t discovered_count = 0;
+    size_t banned_dropped_count = 0;
 
     auto it_before = records.begin();
     auto it_next = next_gen.begin();
@@ -399,10 +411,9 @@ void HostResolver::updateImpl(Poco::Timestamp now, std::vector<Poco::Net::IPAddr
                 merged.push_back(*it_before);
             else
             {
-                CurrentMetrics::sub(metrics.active_count, 1);
-                ProfileEvents::increment(metrics.expired, 1);
+                ++expired_count;
                 if (it_before->failed)
-                    CurrentMetrics::sub(metrics.banned_count);
+                    ++banned_dropped_count;
             }
             ++it_before;
         }
@@ -411,8 +422,7 @@ void HostResolver::updateImpl(Poco::Timestamp now, std::vector<Poco::Net::IPAddr
             /// there are could be duplicates in next_gen vector
             if (merged.empty() || merged.back().address != *it_next)
             {
-                CurrentMetrics::add(metrics.active_count, 1);
-                ProfileEvents::increment(metrics.discovered, 1);
+                ++discovered_count;
                 merged.push_back(Record(*it_next, now));
             }
             ++it_next;
@@ -437,7 +447,7 @@ void HostResolver::updateImpl(Poco::Timestamp now, std::vector<Poco::Net::IPAddr
         if (record.fail_time < banned_until)
         {
             record.failed = false;
-            CurrentMetrics::sub(metrics.banned_count);
+            ++banned_dropped_count;
         }
     }
 
@@ -445,11 +455,13 @@ void HostResolver::updateImpl(Poco::Timestamp now, std::vector<Poco::Net::IPAddr
     // check that merged contains unuque elements
     chassert(std::adjacent_find(merged.begin(), merged.end()) == merged.end());
 
-    last_resolve_time = now;
-    /// Reserve before mutating `records` so the invariant `measured_latencies_scratch.capacity() >=
-    /// records.size()` holds on every exit path, even if this allocation throws.
-    measured_latencies_scratch.reserve(merged.size());
     records.swap(merged);
+    last_resolve_time = now;
+
+    CurrentMetrics::add(metrics.active_count, static_cast<Int64>(discovered_count) - static_cast<Int64>(expired_count));
+    CurrentMetrics::sub(metrics.banned_count, static_cast<Int64>(banned_dropped_count));
+    ProfileEvents::increment(metrics.expired, expired_count);
+    ProfileEvents::increment(metrics.discovered, discovered_count);
 
     bool any_measured = false;
     for (const auto & rec : records)
