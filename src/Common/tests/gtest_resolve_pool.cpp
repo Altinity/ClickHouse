@@ -2,11 +2,13 @@
 #include <Common/CurrentThread.h>
 #include <Common/HostResolvePool.h>
 #include <base/defines.h>
+#include <base/scope_guard.h>
 
 #include <gtest/gtest.h>
 
 #include <optional>
 #include <chrono>
+#include <future>
 #include <thread>
 
 
@@ -945,4 +947,76 @@ TEST_F(ResolvePoolTest, LatencySnapshotFastExitAndLookup)
     /// `reset` clears the measured flag so the snapshot is empty again.
     resolver->reset();
     ASSERT_TRUE(resolver->getLatencySnapshot().empty());
+}
+
+TEST_F(ResolvePoolTest, ColdHostResolveDoesNotBlockHotResolverLookups)
+{
+    /// Regression test: latency-aware selection calls `tryGetResolver` on the request hot paths
+    /// (`getConnection` and after every successful S3 `GET`/`HEAD`). Creating a resolver for a
+    /// cold host runs its initial DNS lookup, so `HostResolversPool::getResolver` must not hold
+    /// the global pool lock across that lookup, or one slow DNS query stalls every other host.
+    SCOPE_EXIT({
+        DB::HostResolversPool::instance().setResolverFactoryForTest({});
+        DB::HostResolversPool::instance().dropCache();
+    });
+
+    const String hot_host = "hot-endpoint.invalid";
+    const String cold_host = "slow-dns-endpoint.invalid";
+    const Poco::Net::IPAddress hot_ip("127.0.0.1");
+    const Poco::Net::IPAddress cold_ip("127.0.0.2");
+
+    auto hot_resolver = std::make_shared<ResolvePoolMock>(
+        hot_host,
+        Poco::Timespan(60, 0),
+        [hot_ip](const String &) -> std::vector<Poco::Net::IPAddress> { return {hot_ip}; });
+    DB::HostResolversPool::instance().injectResolverForTest(hot_host, hot_resolver);
+
+    std::promise<void> dns_entered;
+    auto dns_entered_future = dns_entered.get_future();
+    std::promise<void> allow_dns_finish;
+    auto allow_dns_finish_future = allow_dns_finish.get_future().share();
+
+    DB::HostResolversPool::instance().setResolverFactoryForTest(
+        [&](const String & host) -> DB::HostResolver::Ptr
+        {
+            return std::make_shared<ResolvePoolMock>(
+                host,
+                Poco::Timespan(60, 0),
+                [&, cold_ip](const String &) -> std::vector<Poco::Net::IPAddress>
+                {
+                    dns_entered.set_value();
+                    allow_dns_finish_future.wait();
+                    return {cold_ip};
+                });
+        });
+
+    std::thread cold_resolve_thread([&]
+    {
+        auto resolver = DB::HostResolversPool::instance().getResolver(cold_host);
+        ASSERT_NE(nullptr, resolver);
+    });
+    SCOPE_EXIT({
+        if (cold_resolve_thread.joinable())
+            cold_resolve_thread.join();
+    });
+
+    ASSERT_EQ(std::future_status::ready, dns_entered_future.wait_for(5s));
+
+    /// While `cold_host` is blocked inside its initial DNS lookup, both `tryGetResolver` and
+    /// `getResolver` for `hot_host` (and `tryGetResolver` for an unknown host) must finish
+    /// immediately rather than waiting on `allow_dns_finish`.
+    auto lookup_done = std::async(std::launch::async, [&]
+    {
+        EXPECT_EQ(hot_resolver, DB::HostResolversPool::instance().tryGetResolver(hot_host));
+        EXPECT_EQ(hot_resolver, DB::HostResolversPool::instance().getResolver(hot_host));
+        EXPECT_EQ(nullptr, DB::HostResolversPool::instance().tryGetResolver("unregistered.invalid"));
+    });
+
+    const auto status = lookup_done.wait_for(500ms);
+    allow_dns_finish.set_value();
+    lookup_done.get();
+    cold_resolve_thread.join();
+
+    ASSERT_EQ(std::future_status::ready, status);
+    ASSERT_NE(nullptr, DB::HostResolversPool::instance().tryGetResolver(cold_host));
 }

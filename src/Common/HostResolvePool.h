@@ -3,6 +3,7 @@
 #include <Common/CurrentMetrics.h>
 #include <Common/HTTPConnectionPool.h>
 #include <Common/ProfileEvents.h>
+#include <Common/SharedMutex.h>
 #include <Common/logger_useful.h>
 
 #include <base/defines.h>
@@ -10,6 +11,7 @@
 #include <Poco/Net/IPAddress.h>
 
 #include <atomic>
+#include <functional>
 #include <mutex>
 #include <memory>
 
@@ -331,9 +333,15 @@ public:
     /// the real `DNSResolver`, so the `prepareNewConnection` retry path can be exercised
     /// deterministically.
     void injectResolverForTest(const String & host, HostResolver::Ptr resolver);
+
+    using ResolverFactory = std::function<HostResolver::Ptr(const String &)>;
+    /// Override how `getResolver` constructs a missing resolver. For tests only.
+    void setResolverFactoryForTest(ResolverFactory factory);
+
 private:
-    std::mutex mutex;
+    SharedMutex mutex;
     std::unordered_map<String, HostResolver::Ptr> host_pools TSA_GUARDED_BY(mutex);
+    ResolverFactory resolver_factory_for_test TSA_GUARDED_BY(mutex);
 };
 
 }

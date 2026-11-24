@@ -2,6 +2,7 @@
 
 #include <Common/DNSResolver.h>
 #include <Common/NetException.h>
+#include <Common/SharedLockGuard.h>
 #include <Common/thread_local_rng.h>
 #include <Common/MemoryTrackerSwitcher.h>
 
@@ -483,23 +484,29 @@ void HostResolversPool::dropCache()
 
 HostResolver::Ptr HostResolversPool::getResolver(const String & host)
 {
+    ResolverFactory factory;
+    {
+        SharedLockGuard lock(mutex);
+        if (auto it = host_pools.find(host); it != host_pools.end())
+            return it->second;
+        factory = resolver_factory_for_test;
+    }
+
+    /// Construct the resolver outside `mutex`: `HostResolver::create` runs the initial DNS lookup,
+    /// and holding `mutex` across network I/O would block `tryGetResolver` and `getResolver` for
+    /// every other host in the process. If two threads race on a cold host, `try_emplace` keeps the
+    /// winner's instance and discards the duplicate.
+    auto created = factory ? factory(host) : HostResolver::create(host);
+
     std::lock_guard lock(mutex);
-
-    auto it = host_pools.find(host);
-    if (it != host_pools.end())
-        return it->second;
-
-    it = host_pools.emplace(host, HostResolver::create(host)).first;
-
-    return it->second;
+    return host_pools.try_emplace(host, std::move(created)).first->second;
 }
 
 HostResolver::Ptr HostResolversPool::tryGetResolver(const String & host) noexcept
 {
-    std::lock_guard lock(mutex);
+    SharedLockGuard lock(mutex);
 
-    auto it = host_pools.find(host);
-    if (it != host_pools.end())
+    if (auto it = host_pools.find(host); it != host_pools.end())
         return it->second;
 
     return nullptr;
@@ -509,6 +516,12 @@ void HostResolversPool::injectResolverForTest(const String & host, HostResolver:
 {
     std::lock_guard lock(mutex);
     host_pools[host] = std::move(resolver);
+}
+
+void HostResolversPool::setResolverFactoryForTest(ResolverFactory factory)
+{
+    std::lock_guard lock(mutex);
+    resolver_factory_for_test = std::move(factory);
 }
 
 }
