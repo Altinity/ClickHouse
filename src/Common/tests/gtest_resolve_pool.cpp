@@ -1220,3 +1220,36 @@ TEST_F(ResolvePoolTest, ReportLatencyDoesNotAllocateOrThrowUnderMemoryLimit)
     }
     ASSERT_GT(fast_picks, trials * 8 / 10);
 }
+
+TEST_F(ResolvePoolTest, LatencySnapshotHoldsOnlyItsEntryBuffer)
+{
+    /// Regression test: `getLatencySnapshot` runs on every borrow, under the resolver mutex shared
+    /// with `reportLatency`. Storing `Poco::Net::IPAddress` copies in the snapshot cost one extra
+    /// heap allocation per address (the implementation object), so a snapshot of `R` addresses made
+    /// `1 + R` allocations under the mutex. The snapshot must hold nothing but its entry buffer.
+    DB::MainThreadStatus::getInstance();
+    LatencyAwareSelectionScope scope(true);
+
+    auto & thread_tracker = DB::CurrentThread::get().memory_tracker;
+    const Int64 saved_untracked_limit = DB::CurrentThread::get().untracked_memory_limit;
+    SCOPE_EXIT_SAFE({ DB::CurrentThread::get().untracked_memory_limit = saved_untracked_limit; });
+
+    /// Large history so no background `update` runs.
+    auto resolver = make_resolver(100000);
+    resolver->resolve().setUnused();
+    resolver->reportLatency(Poco::Net::IPAddress("127.0.0.1"), 1000);
+    resolver->reportLatency(Poco::Net::IPAddress("127.0.0.2"), 2000);
+    resolver->reportLatency(Poco::Net::IPAddress("127.0.0.3"), 3000);
+
+    /// Account every allocation precisely instead of batching it in the per-thread untracked counter.
+    DB::CurrentThread::get().untracked_memory_limit = 0;
+    DB::CurrentThread::flushUntrackedMemory();
+
+    const Int64 before = thread_tracker.get();
+    auto snapshot = resolver->getLatencySnapshot();
+    const Int64 held = thread_tracker.get() - before;
+
+    ASSERT_EQ(size_t(3), snapshot.entries.size());
+    using Entry = decltype(snapshot.entries)::value_type;
+    ASSERT_EQ(static_cast<Int64>(snapshot.entries.capacity() * sizeof(Entry)), held);
+}

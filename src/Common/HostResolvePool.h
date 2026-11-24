@@ -10,6 +10,7 @@
 
 #include <Poco/Net/IPAddress.h>
 
+#include <array>
 #include <atomic>
 #include <functional>
 #include <mutex>
@@ -144,9 +145,27 @@ public:
     /// (for example non-S3 HTTP pools) an immediate O(1) fast exit without touching the heap.
     struct LatencySnapshot
     {
+        /// Fixed-size copy of the identity of a `Poco::Net::IPAddress`. Copying an `IPAddress`
+        /// allocates its implementation object, which would cost one heap allocation per address
+        /// under the resolver mutex on every borrow. Orders exactly as `Poco::Net::IPAddress`
+        /// (length, then IPv6 scope, then bytes), so `entries` keeps the order of `records`.
+        struct AddressKey
+        {
+            static constexpr size_t MAX_ADDRESS_LENGTH = 16; /// `in6_addr`
+
+            static AddressKey from(const Poco::Net::IPAddress & address);
+
+            bool operator<(const AddressKey & other) const;
+            bool operator==(const AddressKey & other) const;
+
+            UInt32 scope = 0;
+            UInt8 length = 0;
+            std::array<UInt8, MAX_ADDRESS_LENGTH> bytes{};
+        };
+
         /// Sorted by `first` (`records` in `HostResolver` is sorted by `address`), containing only
         /// addresses with `latency_ms_ewma > 0`. Empty when no address has a measurement.
-        std::vector<std::pair<Poco::Net::IPAddress, double>> entries;
+        std::vector<std::pair<AddressKey, double>> entries;
         /// Smallest EWMA across non-failed measured addresses (0 if none).
         double min_non_failed_ms = 0;
 

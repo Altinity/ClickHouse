@@ -9,6 +9,7 @@
 #include <mutex>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <vector>
 #include <Poco/Timespan.h>
 
@@ -206,14 +207,41 @@ void HostResolver::reportLatency(const Poco::Net::IPAddress & address, UInt64 mi
         weights_dirty = true;
 }
 
+HostResolver::LatencySnapshot::AddressKey HostResolver::LatencySnapshot::AddressKey::from(const Poco::Net::IPAddress & address)
+{
+    AddressKey key;
+    const size_t address_length = address.length();
+    chassert(address_length <= MAX_ADDRESS_LENGTH);
+    key.length = static_cast<UInt8>(address_length);
+    key.scope = address.scope();
+    std::memcpy(key.bytes.data(), address.addr(), address_length);
+    return key;
+}
+
+bool HostResolver::LatencySnapshot::AddressKey::operator<(const AddressKey & other) const
+{
+    /// The same order as `Poco::Net::IPAddress::operator<`.
+    if (length != other.length)
+        return length < other.length;
+    if (scope != other.scope)
+        return scope < other.scope;
+    return std::memcmp(bytes.data(), other.bytes.data(), length) < 0;
+}
+
+bool HostResolver::LatencySnapshot::AddressKey::operator==(const AddressKey & other) const
+{
+    return length == other.length && scope == other.scope && std::memcmp(bytes.data(), other.bytes.data(), length) == 0;
+}
+
 double HostResolver::LatencySnapshot::lookupLatencyMs(const Poco::Net::IPAddress & address) const
 {
+    const auto key = AddressKey::from(address);
     auto it = std::lower_bound(
         entries.begin(),
         entries.end(),
-        address,
-        [](const auto & entry, const Poco::Net::IPAddress & value) { return entry.first < value; });
-    if (it != entries.end() && it->first == address)
+        key,
+        [](const auto & entry, const AddressKey & value) { return entry.first < value; });
+    if (it != entries.end() && it->first == key)
         return it->second;
     return 0;
 }
@@ -231,7 +259,7 @@ HostResolver::LatencySnapshot HostResolver::getLatencySnapshot()
     {
         if (rec.latency_ms_ewma <= 0)
             continue;
-        snapshot.entries.emplace_back(rec.address, rec.latency_ms_ewma);
+        snapshot.entries.emplace_back(LatencySnapshot::AddressKey::from(rec.address), rec.latency_ms_ewma);
         if (!rec.failed && (snapshot.min_non_failed_ms == 0 || rec.latency_ms_ewma < snapshot.min_non_failed_ms))
             snapshot.min_non_failed_ms = rec.latency_ms_ewma;
     }
