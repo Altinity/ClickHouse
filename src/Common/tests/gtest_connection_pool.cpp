@@ -1613,9 +1613,52 @@ TEST_F(ConnectionPoolTest, PreservingConnectionSurvivesAllocationFailureWhileCac
     const UInt64 reset_before = DB::CurrentThread::getProfileEvents()[metrics.reset];
     const UInt64 preserved_before = DB::CurrentThread::getProfileEvents()[metrics.preserved];
 
-    /// Interpose a "query" tracker with a 1-byte hard limit. Allocations done under
-    /// `MemoryTrackerSwitcher{&total_memory_tracker}` (pool-owned ones) bypass it, while the ones
-    /// done outside the switcher - such as the resolved IP cache - hit it.
+    /// The preserve path allocates under `total_memory_tracker` (the pool is global), so a 1-byte
+    /// hard limit on it makes every allocation of that path throw `MEMORY_LIMIT_EXCEEDED`.
+    const Int64 saved_untracked_limit = DB::CurrentThread::get().untracked_memory_limit;
+    const Int64 saved_total_hard_limit = total_memory_tracker.getHardLimit();
+    const UInt64 saved_min_alloc_to_throw = CurrentMemoryTracker::getMinAllocationSizeBytesToThrow();
+    SCOPE_EXIT_SAFE({
+        total_memory_tracker.setHardLimit(saved_total_hard_limit);
+        DB::CurrentThread::flushUntrackedMemory();
+        DB::CurrentThread::get().untracked_memory_limit = saved_untracked_limit;
+        CurrentMemoryTracker::setMinAllocationSizeBytesToThrow(saved_min_alloc_to_throw);
+    });
+
+    CurrentMemoryTracker::setMinAllocationSizeBytesToThrow(1);
+    DB::CurrentThread::get().untracked_memory_limit = 0;
+    DB::CurrentThread::flushUntrackedMemory();
+    total_memory_tracker.setHardLimit(1);
+
+    conn.reset(); /// Returns the connection to the pool: `atConnectionDestroy`.
+
+    total_memory_tracker.setHardLimit(saved_total_hard_limit);
+
+    /// Exactly one reset: the destructor of the half-built connection must not count another one.
+    ASSERT_EQ(reset_before + 1, DB::CurrentThread::getProfileEvents()[metrics.reset]);
+    ASSERT_EQ(preserved_before, DB::CurrentThread::getProfileEvents()[metrics.preserved]);
+    ASSERT_EQ(0, CurrentMetrics::get(metrics.stored_count));
+}
+
+TEST_F(ConnectionPoolTest, PreservingConnectionDoesNotChargeTheQueryMemoryLimit)
+{
+    /// Regression test: the pool is global, so everything `atConnectionDestroy` allocates to keep
+    /// a connection (`assign`, the cached resolved IP) belongs to `total_memory_tracker`, like the
+    /// `create` and `push` it already switched for. Part of it used to be allocated under the
+    /// query tracker, so a query at its memory limit lost the connection, and the bytes were
+    /// freed later under the total tracker.
+    DB::MainThreadStatus::getInstance();
+
+    auto pool = getPool();
+    auto metrics = pool->getMetrics();
+
+    auto conn = pool->getConnection(timeouts, nullptr);
+    echoRequest("Hello", *conn);
+
+    const UInt64 reset_before = DB::CurrentThread::getProfileEvents()[metrics.reset];
+    const UInt64 preserved_before = DB::CurrentThread::getProfileEvents()[metrics.preserved];
+
+    /// Interpose a "query" tracker with a 1-byte hard limit between the thread and the total tracker.
     auto * thread_tracker = DB::CurrentThread::getMemoryTracker();
     MemoryTracker query_tracker(&total_memory_tracker, VariableContext::Process);
     auto * prev_parent = thread_tracker->getParent();
@@ -1640,8 +1683,7 @@ TEST_F(ConnectionPoolTest, PreservingConnectionSurvivesAllocationFailureWhileCac
     query_tracker.setHardLimit(0);
     thread_tracker->setParent(prev_parent);
 
-    /// Exactly one reset: the destructor of the half-built connection must not count another one.
-    ASSERT_EQ(reset_before + 1, DB::CurrentThread::getProfileEvents()[metrics.reset]);
-    ASSERT_EQ(preserved_before, DB::CurrentThread::getProfileEvents()[metrics.preserved]);
-    ASSERT_EQ(0, CurrentMetrics::get(metrics.stored_count));
+    ASSERT_EQ(reset_before, DB::CurrentThread::getProfileEvents()[metrics.reset]);
+    ASSERT_EQ(preserved_before + 1, DB::CurrentThread::getProfileEvents()[metrics.preserved]);
+    ASSERT_EQ(1, CurrentMetrics::get(metrics.stored_count));
 }

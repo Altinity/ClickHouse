@@ -1334,6 +1334,13 @@ private:
             return;
         }
 
+        /// The pool is global: everything allocated to keep the connection (the new session, the
+        /// sockets taken over by `assign`, the cached resolved IP, the heap slot) belongs to
+        /// `total_memory_tracker`, not to the query whose thread returns the connection. It is freed
+        /// later under the total tracker, and a query at its memory limit must not lose the connection.
+        /// Declared before `connection_to_store` so it outlives the local reference as well.
+        MemoryTrackerSwitcher switcher{&total_memory_tracker};
+
         /// Declared outside the `try` so the `catch` can mark it expired: otherwise its destructor
         /// (a connected, completed connection that is not marked expired) would call
         /// `atConnectionDestroy` again, count a second reset and retry preserving it.
@@ -1346,7 +1353,6 @@ private:
             connection_to_store->notifySocketInode();
 
             {
-                MemoryTrackerSwitcher switcher{&total_memory_tracker};
                 std::lock_guard lock(mutex);
                 stored_connections.push(connection_to_store);
             }
