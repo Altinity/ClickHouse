@@ -1114,8 +1114,7 @@ private:
     /// `_resolved_host` is left empty (Poco then uses `_host` for the proxy request / `CONNECT`
     /// target). A connect failure here belongs to the proxy, so it propagates without resolver
     /// bookkeeping or per-address retry.
-    ConnectionPtr prepareConnectionViaProxy(
-        const ConnectionTimeouts & timeouts, UInt64 * connect_time, const Poco::Net::HTTPClientSession::ProxyConfig & poco_proxy_config)
+    ConnectionPtr prepareConnectionViaProxy(const ConnectionTimeouts & timeouts, UInt64 * connect_time)
     {
         auto connection = PooledConnection::create(this->getWeakFromThis(), group, getMetrics(), host, port);
         connection->setKeepAlive(true);
@@ -1147,7 +1146,7 @@ private:
         /// directly to `_resolved_host`, so per-address retries and `setFail` apply as in the
         /// no-proxy case.
         if (!uses_target_resolution)
-            return prepareConnectionViaProxy(timeouts, connect_time, poco_proxy_config);
+            return prepareConnectionViaProxy(timeouts, connect_time);
 
         /// When DNS returns several addresses (e.g. an IPv4 and an IPv6 record), try the next one
         /// if the first fails with a network error. `max_connect_attempts` bounds real connect
