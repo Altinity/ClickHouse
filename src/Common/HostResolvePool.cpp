@@ -3,6 +3,7 @@
 #include <Common/DNSResolver.h>
 #include <Common/NetException.h>
 #include <Common/SharedLockGuard.h>
+#include <Common/scope_guard_safe.h>
 #include <Common/thread_local_rng.h>
 #include <Common/MemoryTrackerSwitcher.h>
 
@@ -548,6 +549,7 @@ HostResolversPool & HostResolversPool::instance()
 
 void HostResolversPool::dropCache()
 {
+    MemoryTrackerSwitcher switcher{&total_memory_tracker};
     std::lock_guard lock(mutex);
     host_pools.clear();
 }
@@ -564,6 +566,10 @@ HostResolver::Ptr HostResolversPool::getResolver(const String & host)
     std::shared_ptr<PendingResolver> pending;
     std::shared_future<HostResolver::Ptr> in_flight;
     {
+        /// The pool is global: the `PendingResolver` slot, its future state, and its map node
+        /// belong to `total_memory_tracker`, not to whichever query reached this cold host first,
+        /// and may be freed later by another thread.
+        MemoryTrackerSwitcher switcher{&total_memory_tracker};
         std::lock_guard lock(mutex);
         if (auto it = host_pools.find(host); it != host_pools.end())
             return it->second;
@@ -584,6 +590,10 @@ HostResolver::Ptr HostResolversPool::getResolver(const String & host)
     /// exception of its failed lookup) instead of running the same DNS lookup again.
     if (!pending)
     {
+        SCOPE_EXIT_SAFE({
+            MemoryTrackerSwitcher switcher{&total_memory_tracker};
+            in_flight = {};
+        });
         try
         {
             return in_flight.get();
@@ -600,9 +610,20 @@ HostResolver::Ptr HostResolversPool::getResolver(const String & host)
     /// Construct the resolver outside `mutex`: `HostResolver::create` runs the initial DNS lookup,
     /// and holding `mutex` across network I/O would block `tryGetResolver` and `getResolver` for
     /// every other host in the process. Concurrent callers for the same cold host wait on `pending`.
+    /// Switch to `total_memory_tracker` for the whole leader path so the `HostResolver` object and
+    /// `host_pools` node are charged to the global pool (matching `dropCache`), and a query at its
+    /// own memory limit neither fails to resolve nor publishes its query-specific exception to
+    /// unrelated waiting queries. Declared outside `pending`'s release scope so `~PendingResolver`
+    /// also runs under `total_memory_tracker`.
+    SCOPE_EXIT_SAFE({
+        MemoryTrackerSwitcher switcher{&total_memory_tracker};
+        pending.reset();
+    });
+
     HostResolver::Ptr resolver;
     try
     {
+        MemoryTrackerSwitcher switcher{&total_memory_tracker};
         auto created = factory ? factory(host) : HostResolver::create(host);
 
         std::lock_guard lock(mutex);
@@ -612,12 +633,16 @@ HostResolver::Ptr HostResolversPool::getResolver(const String & host)
     catch (...)
     {
         {
+            MemoryTrackerSwitcher switcher{&total_memory_tracker};
             std::lock_guard lock(mutex);
             pending_resolvers.erase(host);
         }
         /// Store an immutable copy as the template for the waiters so this caller can mutate its
         /// own exception up the stack without racing with `copyMutableException` in a waiter.
-        pending->promise.set_exception(copyMutableException(std::current_exception()));
+        {
+            MemoryTrackerSwitcher switcher{&total_memory_tracker};
+            pending->promise.set_exception(copyMutableException(std::current_exception()));
+        }
         throw;
     }
 

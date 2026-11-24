@@ -1569,3 +1569,129 @@ TEST_F(ResolvePoolTest, ConcurrentGetResolverForColdHostSharesFailedLookup)
     ASSERT_EQ(size_t(2), factory_calls.load());
     ASSERT_EQ(resolver, DB::HostResolversPool::instance().tryGetResolver(host));
 }
+
+TEST_F(ResolvePoolTest, LeaderQueryMemoryLimitDoesNotFailGetResolverOrWaiter)
+{
+    /// Regression test: `HostResolversPool` is global, so the `PendingResolver` slot, the
+    /// `HostResolver` object, and the map nodes allocated during a cold-host `getResolver` belong
+    /// to `total_memory_tracker`, not to the query whose thread happened to arrive first (and must
+    /// be released under `total_memory_tracker` in `dropCache` as well). Charging them to the
+    /// leader's query tracker both made a query at its memory limit fail `getResolver` and
+    /// published that query-specific `MEMORY_LIMIT_EXCEEDED` to unrelated waiting queries.
+    DB::MainThreadStatus::getInstance();
+
+    /// Long host name so `String` heap-allocates (exceeds SSO) when emplaced into the pool maps.
+    const String host = "cold-host-with-long-name-exceeding-sso-for-tracker-test.invalid";
+
+    std::promise<void> leader_entered;
+    auto leader_entered_future = leader_entered.get_future();
+    std::promise<void> allow_finish;
+    auto allow_finish_future = allow_finish.get_future().share();
+    bool released = false;
+
+    std::future<DB::HostResolver::Ptr> waiter;
+
+    const UInt64 saved_min_alloc_to_throw = CurrentMemoryTracker::getMinAllocationSizeBytesToThrow();
+    SCOPE_EXIT_SAFE({
+        if (!released)
+            allow_finish.set_value();
+        CurrentMemoryTracker::setMinAllocationSizeBytesToThrow(saved_min_alloc_to_throw);
+        DB::HostResolversPool::instance().setResolverFactoryForTest({});
+        DB::HostResolversPool::instance().dropCache();
+    });
+
+    DB::HostResolversPool::instance().setResolverFactoryForTest(
+        [&](const String & host_to_create) -> DB::HostResolver::Ptr
+        {
+            /// Allocate a dummy buffer first so the leader enters the factory even if `PendingResolver`
+            /// was already switched to `total_memory_tracker`, allowing the waiter to attach before any
+            /// failure inside the factory could throw (and publish `MEMORY_LIMIT_EXCEEDED` to the waiter).
+            leader_entered.set_value();
+            allow_finish_future.wait();
+            /// Matches `HostResolver::create`: the resolver object itself is allocated here, while
+            /// `HostResolver::update` inside the constructor switches to `total_memory_tracker`.
+            return std::make_shared<ResolvePoolMock>(
+                host_to_create,
+                Poco::Timespan(60, 0),
+                [](const String &) -> std::vector<Poco::Net::IPAddress> { return {Poco::Net::IPAddress("127.0.0.1")}; });
+        });
+
+    CurrentMemoryTracker::setMinAllocationSizeBytesToThrow(1);
+
+    /// Run the leader on a worker thread with its own `ThreadStatus` whose query tracker has a
+    /// 1-byte hard limit, and start an unconstrained waiter on another thread while the leader is
+    /// in flight. Neither caller may fail with the leader's query memory limit.
+    std::future<DB::HostResolver::Ptr> leader = std::async(
+        std::launch::async,
+        [&]() -> DB::HostResolver::Ptr
+        {
+            DB::ThreadStatus thread_status;
+            MemoryTracker query_tracker(&total_memory_tracker, VariableContext::Process);
+            query_tracker.setHardLimit(1);
+
+            auto * thread_tracker = DB::CurrentThread::getMemoryTracker();
+            auto * prev_parent = thread_tracker->getParent();
+            DB::CurrentThread::get().untracked_memory_limit = 0;
+            DB::CurrentThread::flushUntrackedMemory();
+            thread_tracker->setParent(&query_tracker);
+            SCOPE_EXIT_SAFE({
+                DB::CurrentThread::flushUntrackedMemory();
+                thread_tracker->setParent(prev_parent);
+            });
+
+            return DB::HostResolversPool::instance().getResolver(host);
+        });
+
+    /// Either the leader already threw before reaching the factory (unfixed code fails on
+    /// `PendingResolver` allocation), or it entered the factory and is waiting for `allow_finish`.
+    if (leader_entered_future.wait_for(500ms) == std::future_status::ready)
+    {
+        waiter = std::async(
+            std::launch::async,
+            [&]() -> DB::HostResolver::Ptr
+            {
+                DB::ThreadStatus waiter_status;
+                return DB::HostResolversPool::instance().getResolver(host);
+            });
+        ASSERT_EQ(std::future_status::timeout, waiter.wait_for(200ms));
+    }
+
+    allow_finish.set_value();
+    released = true;
+
+    DB::HostResolver::Ptr leader_resolver = leader.get();
+    ASSERT_NE(nullptr, leader_resolver);
+    if (waiter.valid())
+        ASSERT_EQ(leader_resolver, waiter.get());
+
+    /// Dropping the cache while another query's tracker is active must also release the cached
+    /// resolver and map node under `total_memory_tracker`, not credit the caller's query tracker.
+    leader_resolver.reset();
+    auto * main_thread_tracker = DB::CurrentThread::getMemoryTracker();
+    MemoryTracker drop_query_tracker(&total_memory_tracker, VariableContext::Process);
+    auto * prev_parent = main_thread_tracker->getParent();
+    const Int64 saved_untracked_limit = DB::CurrentThread::get().untracked_memory_limit;
+    SCOPE_EXIT_SAFE({
+        DB::CurrentThread::flushUntrackedMemory();
+        main_thread_tracker->setParent(prev_parent);
+        DB::CurrentThread::get().untracked_memory_limit = saved_untracked_limit;
+    });
+    DB::CurrentThread::get().untracked_memory_limit = 0;
+    DB::CurrentThread::flushUntrackedMemory();
+    main_thread_tracker->setParent(&drop_query_tracker);
+
+    auto pre_charge = std::make_unique<char[]>(1 << 16);
+    asm volatile("" : : "r"(pre_charge.get()) : "memory");
+    DB::CurrentThread::flushUntrackedMemory();
+
+    const Int64 before_drop = drop_query_tracker.get();
+    DB::HostResolversPool::instance().dropCache();
+    DB::CurrentThread::flushUntrackedMemory();
+    const Int64 drop_delta = drop_query_tracker.get() - before_drop;
+
+    pre_charge.reset();
+    DB::CurrentThread::flushUntrackedMemory();
+    main_thread_tracker->setParent(prev_parent);
+
+    ASSERT_EQ(Int64(0), drop_delta) << "dropCache credited the caller's query tracker";
+}
