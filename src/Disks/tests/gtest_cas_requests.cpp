@@ -753,7 +753,7 @@ TEST(CASRequestsDeathTest, KeyBindingThrowsBeforeAnyRequest)
     auto op = requests.admit();
     const Etag of_a = *orThrow(op.create("a", "v", Retry::standard()), "create");
 
-    EXPECT_DEATH({ (void)op.replace("b", "w", of_a, Retry::standard()); }, "");
+    CAS_EXPECT_DEATH({ (void)op.replace("b", "w", of_a, Retry::standard()); }, "");
 }
 #endif
 

@@ -188,7 +188,7 @@ TEST(CASGCStateFormatDeathTest, RejectsZeroGcShardsOnEncodeAborts)
 {
     GcState state;
     state.gc_shards = 0;
-    EXPECT_DEATH({ (void)encodeGcState(state); }, "");
+    CAS_EXPECT_DEATH({ (void)encodeGcState(state); }, "");
 }
 #endif
 

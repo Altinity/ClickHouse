@@ -640,7 +640,7 @@ TEST(CASRefInstallSafety, WedgeResolutionInstallsExactlyOnce)
 #if defined(MEMORY_TRACKER_DEBUG_CHECKS)
 TEST(CASRefInstallSafetyDeathTest, DenyGuardStopsAnAllocation)
 {
-    EXPECT_DEATH(
+    CAS_EXPECT_DEATH(
         {
             DENY_ALLOCATIONS_IN_SCOPE;
             volatile auto * p = new char[64];

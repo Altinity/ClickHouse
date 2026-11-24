@@ -1174,7 +1174,7 @@ void expectThrowingRoundToDrain(IntentPool<> & pool, ManualBarrier & held, const
     /// Before the future's destructor, which waits for the round.
     SCOPE_EXIT({ held.release(); });
     wait_until_in_flight();
-    EXPECT_EQ(round.wait_for(std::chrono::seconds(2)), std::future_status::timeout)
+    EXPECT_EQ(round.wait_for(std::chrono::milliseconds(300)), std::future_status::timeout)
         << "the round returned while a " << held_job << " was still held";
     EXPECT_FALSE(held_done.load());
 

@@ -1410,14 +1410,14 @@ TEST(CASPartFolderAccessDeathTest, PreparedPartWriteRejectsASecondTerminalAborts
     auto promoted = access.prepareEntries({ns, "promoted"}, {inlineEntry("f", "one")}, Cas::ProvenanceOp::Insert);
     promoted.promote();
     EXPECT_TRUE(promoted.isTerminal());
-    EXPECT_DEATH(promoted.promote(), "owes exactly one terminal operation");
-    EXPECT_DEATH(promoted.abort(), "owes exactly one terminal operation");
+    CAS_EXPECT_DEATH(promoted.promote(), "owes exactly one terminal operation");
+    CAS_EXPECT_DEATH(promoted.abort(), "owes exactly one terminal operation");
 
     auto aborted = access.prepareEntries({ns, "aborted"}, {inlineEntry("f", "one")}, Cas::ProvenanceOp::Insert);
     aborted.abort();
     EXPECT_TRUE(aborted.isTerminal());
-    EXPECT_DEATH(aborted.abort(), "owes exactly one terminal operation");
-    EXPECT_DEATH(aborted.promote(), "owes exactly one terminal operation");
+    CAS_EXPECT_DEATH(aborted.abort(), "owes exactly one terminal operation");
+    CAS_EXPECT_DEATH(aborted.promote(), "owes exactly one terminal operation");
 
     EXPECT_TRUE(access.existsRef({ns, "promoted"}, Cas::Freshness::ForceFresh));
     EXPECT_FALSE(access.existsRef({ns, "aborted"}, Cas::Freshness::ForceFresh));
@@ -1449,7 +1449,7 @@ TEST(CASPartFolderAccess, PreparedPartWriteMoveTransfersTheTerminalDuty)
 #else
         /// LOGICAL_ERROR aborts the process in debug/sanitizer builds; EXPECT_DEATH forks, so the
         /// parent's state (and the rest of this test) is unaffected.
-        EXPECT_DEATH(source.abort(), "owes exactly one terminal operation");
+        CAS_EXPECT_DEATH(source.abort(), "owes exactly one terminal operation");
 #endif
         EXPECT_TRUE(store->livePrecommitsForTest(ns).contains({"part_1", id.ref}))
             << "the moved-from handle must not have aborted the transaction it handed over";

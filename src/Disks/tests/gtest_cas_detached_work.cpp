@@ -436,7 +436,7 @@ TEST(CASDetachedWork, DrainDoesNotReturnWhileWorkIsInFlight)
                             [&store] { return store->stopAndDrainDetachedWork(/*deadline_ms=*/60000); });
 
     awaitStopLatched(store);
-    EXPECT_EQ(drain.wait_for(std::chrono::seconds(2)), std::future_status::timeout)
+    EXPECT_EQ(drain.wait_for(std::chrono::milliseconds(300)), std::future_status::timeout)
         << "the drain returned while a tracked task was still in flight";
 
     release->open();
@@ -461,7 +461,7 @@ TEST(CASDetachedWork, ShutdownDoesNotReturnWhileWorkIsInFlight)
 
     auto done = std::async(std::launch::async, [&storage] { storage->shutdown(); });
     awaitStopLatched(pool);
-    EXPECT_EQ(done.wait_for(std::chrono::seconds(2)), std::future_status::timeout)
+    EXPECT_EQ(done.wait_for(std::chrono::milliseconds(300)), std::future_status::timeout)
         << "shutdown returned while tracked detached work was still in flight";
 
     release->open();
