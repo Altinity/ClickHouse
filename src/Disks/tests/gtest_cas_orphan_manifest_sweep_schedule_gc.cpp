@@ -756,7 +756,7 @@ TEST(CASOrphanManifestSweepScheduleGc, SuccessfulPagesAfterFailureFollowOrdinary
     EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 2);
 }
 
-TEST(CASOrphanManifestSweepScheduleGc, ChangedRefsBypassFailedSweepDeferral)
+TEST(CASOrphanManifestSweepScheduleGc, ChangedRefsTriggerFoldAfterSweepFailure)
 {
     ScheduleFixture f(1000, 3600, 2);
     f.backend->before_manifest_list = []
@@ -876,7 +876,7 @@ TEST(CASOrphanManifestSweepScheduleGc, RepairedCheckpointResumesSweepAtBoundedFo
     EXPECT_EQ(f.state().orphan_manifest_sweep_completed_at_ms, 3601000);
 }
 
-TEST(CASOrphanManifestSweepScheduleGc, ChangedRefsBypassSweepRetryDeferral)
+TEST(CASOrphanManifestSweepScheduleGc, ChangedRefsTriggerFoldAfterSweepSuppression)
 {
     ScheduleFixture f(1000, 3600, 2);
     for (size_t tick = 0; tick < 2; ++tick)
