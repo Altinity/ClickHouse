@@ -83,6 +83,13 @@ HostResolver::HostResolver(
 
 HostResolver::~HostResolver()
 {
+    /// The records (and the `IPAddress` implementations in them) and the scratch buffer were
+    /// allocated under `total_memory_tracker` (see `update`), while this destructor runs in whatever
+    /// thread drops the last reference, under that thread's query tracker. Release them under the
+    /// tracker they were charged to, and explicitly: members are destroyed only after the body,
+    /// when the switcher is already gone.
+    MemoryTrackerSwitcher switcher{&total_memory_tracker};
+
     std::lock_guard lock(mutex);
 
     auto banned_count = 0;
@@ -91,7 +98,8 @@ HostResolver::~HostResolver()
     CurrentMetrics::sub(metrics.banned_count, banned_count);
 
     CurrentMetrics::sub(metrics.active_count, records.size());
-    records.clear();
+    Records().swap(records);
+    std::vector<double>().swap(measured_latencies_scratch);
 }
 
 void HostResolver::Entry::setFail()
@@ -134,6 +142,9 @@ void HostResolver::update()
 
 void HostResolver::reset()
 {
+    /// `clear` destroys the `IPAddress` implementations allocated under `total_memory_tracker`.
+    MemoryTrackerSwitcher switcher{&total_memory_tracker};
+
     std::lock_guard lock(mutex);
 
     CurrentMetrics::sub(metrics.active_count, records.size());

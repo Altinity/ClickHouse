@@ -1253,3 +1253,58 @@ TEST_F(ResolvePoolTest, LatencySnapshotHoldsOnlyItsEntryBuffer)
     using Entry = decltype(snapshot.entries)::value_type;
     ASSERT_EQ(static_cast<Int64>(snapshot.entries.capacity() * sizeof(Entry)), held);
 }
+
+TEST_F(ResolvePoolTest, DestroyingResolverReleasesItsStateUnderTheTotalTracker)
+{
+    /// Regression test: the `records` and `measured_latencies_scratch` buffers and the
+    /// `IPAddress` implementations of every record are allocated by `update` under
+    /// `total_memory_tracker` (the resolver is global, not charged to a query), but the thread that
+    /// drops the last reference runs the destructor under its own query tracker. Freeing them there
+    /// credited the query with bytes it was never charged for.
+    DB::MainThreadStatus::getInstance();
+
+    constexpr size_t address_count = 200;
+    std::vector<Poco::Net::IPAddress> resolved;
+    resolved.reserve(address_count);
+    for (size_t i = 0; i < address_count; ++i)
+        resolved.emplace_back("10.0." + std::to_string(i / 250) + "." + std::to_string(i % 250 + 1));
+
+    /// Large history so no background `update` runs.
+    auto resolver = std::make_shared<ResolvePoolMock>(
+        "tracker-symmetry-host",
+        Poco::Timespan(60 * 1000 * 1000),
+        [&resolved](const String &) -> std::vector<Poco::Net::IPAddress> { return resolved; });
+
+    /// Interpose a "query" tracker between the thread tracker and `total_memory_tracker`.
+    auto * thread_tracker = DB::CurrentThread::getMemoryTracker();
+    MemoryTracker query_tracker(&total_memory_tracker, VariableContext::Process);
+    auto * prev_parent = thread_tracker->getParent();
+    const Int64 saved_untracked_limit = DB::CurrentThread::get().untracked_memory_limit;
+    SCOPE_EXIT_SAFE({
+        DB::CurrentThread::flushUntrackedMemory();
+        thread_tracker->setParent(prev_parent);
+        DB::CurrentThread::get().untracked_memory_limit = saved_untracked_limit;
+    });
+    DB::CurrentThread::get().untracked_memory_limit = 0;
+    DB::CurrentThread::flushUntrackedMemory();
+    thread_tracker->setParent(&query_tracker);
+
+    /// A tracker's amount is clamped at zero, so charge the "query" first to make an over-release
+    /// visible. This buffer is allocated and released while the query tracker is the parent.
+    auto pre_charge = std::make_unique<char[]>(1 << 20);
+    asm volatile("" : : "r"(pre_charge.get()) : "memory"); /// Keep the compiler from eliding the allocation.
+    DB::CurrentThread::flushUntrackedMemory();
+
+    const Int64 before = query_tracker.get();
+    resolver.reset();
+    DB::CurrentThread::flushUntrackedMemory();
+    const Int64 delta = query_tracker.get() - before;
+
+    pre_charge.reset();
+    DB::CurrentThread::flushUntrackedMemory();
+    thread_tracker->setParent(prev_parent);
+
+    /// The resolver object and its control block were allocated before the "query" existed, so a
+    /// few hundred bytes of slack are expected; the 200 records and their addresses are tens of KiB.
+    ASSERT_GE(delta, -1024) << "resolver state freed against the query tracker";
+}
