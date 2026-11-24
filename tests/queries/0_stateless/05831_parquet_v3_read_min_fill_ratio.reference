@@ -1,9 +1,16 @@
-guard off
+sparse, guard off
 120000	960000
-guard on
+sparse, guard on
 120000	960000
-1	0
-0	1
+dense, guard off
+120000	7199940000	960000	15360000
+dense, guard on
+120000	7199940000	960000	15360000
+dense: guard on does not change reads	1
+dense: guard on does not limit tasks	1
+sparse: guard off does not limit tasks	1
+sparse: guard on issues more reads	1
+sparse: guard on limits tasks	1
 invalid ratio
 BAD_ARGUMENTS
 invalid ratio does not affect schema inference
