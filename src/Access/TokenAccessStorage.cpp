@@ -1,4 +1,5 @@
 #include <Access/TokenAccessStorage.h>
+#include <Access/AccessChangesNotifier.h>
 #include <Access/AccessControl.h>
 #include <Access/ExternalAuthenticators.h>
 #include <Access/User.h>
@@ -314,6 +315,11 @@ bool TokenAccessStorage::areTokenCredentialsValidNoLock(const User & user, const
     if (credentials.getUserName() != user.getName())
         return false;
 
+    /// Interserver hops authenticate with the cluster secret and then trust
+    /// `initial_user` via AlwaysAllowCredentials (see TCPHandler). Mirror LDAP.
+    if (typeid_cast<const AlwaysAllowCredentials *>(&credentials))
+        return true;
+
     if (const auto * token_credentials = dynamic_cast<const TokenCredentials *>(&credentials))
         return external_authenticators.checkTokenCredentials(*token_credentials);
 
@@ -497,20 +503,28 @@ std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
         bool /* allow_no_password */,
         bool /* allow_plaintext_password */) const
 {
-    std::lock_guard lock(mutex);
-    auto id = memory_storage.find<User>(credentials.getUserName());
-    UserPtr user = id ? memory_storage.read<User>(*id) : nullptr;
+    std::unique_lock lock(mutex);
 
-    const auto & token_credentials = typeid_cast<const TokenCredentials &>(credentials);
-
-    if (!external_authenticators.checkTokenCredentials(token_credentials, provider_name))
+    /// Accept TokenCredentials (normal JWT login) and AlwaysAllowCredentials
+    /// (interserver hop after cluster-secret verification). Reject every other
+    /// credential type BEFORE any reference-form `typeid_cast` that would throw
+    /// a `LOGICAL_ERROR`. `MultipleAccessStorage::authenticateImpl` does not
+    /// catch per-storage exceptions -- so a single Basic / SSL-cert / Kerberos /
+    /// SSH login attempt would abort authentication for every later storage in
+    /// `user_directories`. Concretely, listing `<token>` ahead of `<users.xml>`
+    /// would lock out every Basic-auth user. Return nullopt cleanly, matching
+    /// the LDAP-side idiom in `LDAPAccessStorage::areLDAPCredentialsValidNoLock`.
+    const auto * always_allow_credentials = dynamic_cast<const AlwaysAllowCredentials *>(&credentials);
+    const auto * token_credentials_ptr = dynamic_cast<const TokenCredentials *>(&credentials);
+    if (!always_allow_credentials && !token_credentials_ptr)
     {
-        // Even though token itself may be valid (especially in case of a jwt token), authentication has just failed.
         if (throw_if_user_not_exists)
             throwNotFound(AccessEntityType::USER, credentials.getUserName(), getStorageName());
-
         return {};
     }
+
+    auto id = memory_storage.find<User>(credentials.getUserName());
+    UserPtr user = id ? memory_storage.read<User>(*id) : nullptr;
 
     std::shared_ptr<User> new_user;
     if (!user)
@@ -524,6 +538,38 @@ std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
 
     if (!isAddressAllowed(*user, address))
         throwAddressNotAllowed(address);
+
+    /// Interserver mode: TCPHandler already verified the cluster secret and is
+    /// trusting `client_info.initial_user`.
+    if (always_allow_credentials)
+    {
+        if (new_user)
+        {
+            /// TODO: mapped roles from the JWT are not available here without
+            /// the bearer token; grant common roles only. Session applies the
+            /// roles pushed by the initiator.
+            assignRolesNoLock(*new_user, /* external_roles= */ {});
+            assignProfileNoLock(*new_user);
+            id = memory_storage.insert(new_user);
+
+            lock.unlock();
+            access_control.getChangesNotifier().sendNotifications();
+        }
+
+        if (id)
+            return AuthResult{ .user_id = *id, .authentication_data = AuthenticationData(AuthenticationType::JWT) };
+        return std::nullopt;
+    }
+
+    const auto & token_credentials = *token_credentials_ptr;
+
+    if (!external_authenticators.checkTokenCredentials(token_credentials, provider_name))
+    {
+        if (throw_if_user_not_exists)
+            throwNotFound(AccessEntityType::USER, credentials.getUserName(), getStorageName());
+
+        return {};
+    }
 
     std::set<String> external_roles;
     if (roles_filter.has_value() && roles_filter.value().ok())
