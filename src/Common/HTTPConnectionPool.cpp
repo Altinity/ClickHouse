@@ -14,6 +14,7 @@
 #include <Common/ErrorCodes.h>
 #include <Common/ProxyConfiguration.h>
 #include <Common/CurrentThread.h>
+#include <Common/LockMemoryExceptionInThread.h>
 #include <Common/MemoryTrackerSwitcher.h>
 #include <Common/SipHash.h>
 #include <Common/Scheduler/ResourceGuard.h>
@@ -675,7 +676,10 @@ private:
             return request_stream_completed && response_stream_completed;
         }
 
-        void updateCachedResolvedIp() noexcept
+        /// Not `noexcept`: copying the resolved host and building `IPAddress` objects allocate. The
+        /// only caller, `atConnectionDestroy`, calls this inside its `try` block, so a failure
+        /// resets the connection instead of terminating the process.
+        void updateCachedResolvedIp()
         {
             Poco::Net::IPAddress ip;
             const std::string resolved = Session::getResolvedHost();
@@ -1347,6 +1351,9 @@ private:
         }
         catch (...)
         {
+            /// This handler runs in a `noexcept` function and must not throw: building the log message
+            /// allocates, and the failure being handled may itself be a memory limit exception.
+            LockMemoryExceptionInThread lock_memory_exception{VariableContext::Global};
             ProfileEvents::increment(getMetrics().reset, 1);
             tryLogCurrentException("HTTPConnectionPool", "Failed to preserve connection for reuse");
         }

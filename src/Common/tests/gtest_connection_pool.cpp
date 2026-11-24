@@ -1594,3 +1594,54 @@ TEST_F(ConnectionPoolTest, LatencyAwareSlowPooledConnectionIsSkippedAndCounted)
     ASSERT_EQ(skipped_before + 1, DB::CurrentThread::getProfileEvents()[ProfileEvents::HTTPConnectionsSkippedAsSlow]);
     ASSERT_EQ(reused_before, DB::CurrentThread::getProfileEvents()[metrics.reused]);
 }
+
+TEST_F(ConnectionPoolTest, PreservingConnectionSurvivesAllocationFailureWhileCachingResolvedIp)
+{
+    /// Regression test: `atConnectionDestroy` is `noexcept` and wraps the preparation of the
+    /// connection to store in `try`/`catch`, which resets the connection and logs. An allocation
+    /// failure there (`assign`, caching the resolved IP) must be handled by that `catch`, and the
+    /// handler itself must not throw while building the log message. Both `updateCachedResolvedIp`
+    /// being `noexcept` and an unprotected handler turned the exception into `std::terminate`.
+    DB::MainThreadStatus::getInstance();
+
+    auto pool = getPool();
+    auto metrics = pool->getMetrics();
+
+    auto conn = pool->getConnection(timeouts, nullptr);
+    echoRequest("Hello", *conn);
+
+    const UInt64 reset_before = DB::CurrentThread::getProfileEvents()[metrics.reset];
+    const UInt64 preserved_before = DB::CurrentThread::getProfileEvents()[metrics.preserved];
+
+    /// Interpose a "query" tracker with a 1-byte hard limit. Allocations done under
+    /// `MemoryTrackerSwitcher{&total_memory_tracker}` (pool-owned ones) bypass it, while the ones
+    /// done outside the switcher - such as the resolved IP cache - hit it.
+    auto * thread_tracker = DB::CurrentThread::getMemoryTracker();
+    MemoryTracker query_tracker(&total_memory_tracker, VariableContext::Process);
+    auto * prev_parent = thread_tracker->getParent();
+    const Int64 saved_untracked_limit = DB::CurrentThread::get().untracked_memory_limit;
+    const UInt64 saved_min_alloc_to_throw = CurrentMemoryTracker::getMinAllocationSizeBytesToThrow();
+    SCOPE_EXIT_SAFE({
+        DB::CurrentThread::flushUntrackedMemory();
+        thread_tracker->setParent(prev_parent);
+        DB::CurrentThread::get().untracked_memory_limit = saved_untracked_limit;
+        CurrentMemoryTracker::setMinAllocationSizeBytesToThrow(saved_min_alloc_to_throw);
+    });
+
+    CurrentMemoryTracker::setMinAllocationSizeBytesToThrow(1);
+    DB::CurrentThread::get().untracked_memory_limit = 0;
+    DB::CurrentThread::flushUntrackedMemory();
+    query_tracker.setHardLimit(1);
+    thread_tracker->setParent(&query_tracker);
+
+    conn.reset(); /// Returns the connection to the pool: `atConnectionDestroy`.
+
+    DB::CurrentThread::flushUntrackedMemory();
+    query_tracker.setHardLimit(0);
+    thread_tracker->setParent(prev_parent);
+
+    /// The `catch` and the destructor of the half-built connection both count a reset.
+    ASSERT_GT(DB::CurrentThread::getProfileEvents()[metrics.reset], reset_before);
+    ASSERT_EQ(preserved_before, DB::CurrentThread::getProfileEvents()[metrics.preserved]);
+    ASSERT_EQ(0, CurrentMetrics::get(metrics.stored_count));
+}
