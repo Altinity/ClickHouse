@@ -856,7 +856,7 @@ public:
         ///   when no address has a measurement (e.g. non-S3 HTTP pools), and otherwise takes the
         ///   resolver mutex at most once per `getConnection` outside `mutex` rather than N + 1
         ///   times inside `mutex`.
-        if (HostResolver::latencyAwareSelectionEnabled() && usesTargetResolution())
+        if (HostResolver::latencyAwareSelectionEnabled() && uses_target_resolution)
         {
             MemoryTrackerSwitcher switcher{&total_memory_tracker};
             if (auto latency_resolver = HostResolversPool::instance().tryGetResolver(host))
@@ -953,7 +953,29 @@ private:
         , https(https_)
         , proxy_configuration(std::move(proxy_configuration_))
         , group(group_)
+        , poco_proxy_config(
+              proxy_configuration.isEmpty() ? Poco::Net::HTTPClientSession::ProxyConfig{}
+                                            : proxyConfigurationToPocoProxyConfig(proxy_configuration))
+        , uses_target_resolution(computeUsesTargetResolution())
     {
+    }
+
+    /// Whether connections in this pool resolve `host` locally and connect directly to a
+    /// resolved IP, rather than connecting to a proxy and letting the proxy resolve the target.
+    /// `Poco::Net::HTTPClientSession::reconnect` uses the proxy only when
+    /// `!_proxyConfig.host.empty() && !bypassProxy()`; when `no_proxy` matches `host`
+    /// (`bypassProxy()` true) Poco connects directly to `_resolved_host`.
+    /// `host` and the proxy configuration never change, so this is evaluated once, in the
+    /// constructor, instead of building a regular expression on every borrow.
+    bool computeUsesTargetResolution() const
+    {
+        /// Mirrors `Poco::Net::HTTPClientSession::bypassProxy`; keep in sync on Poco upgrades.
+        const bool proxy_bypassed_for_host = !poco_proxy_config.nonProxyHosts.empty()
+            && Poco::RegularExpression::match(
+                host,
+                poco_proxy_config.nonProxyHosts,
+                Poco::RegularExpression::RE_CASELESS | Poco::RegularExpression::RE_ANCHORED);
+        return proxy_configuration.isEmpty() || proxy_bypassed_for_host;
     }
 
     WeakPtr getWeakFromThis() { return EndpointConnectionPool::weak_from_this(); }
@@ -1118,35 +1140,13 @@ private:
         return connection;
     }
 
-    /// Whether connections in this pool resolve `host` locally and connect directly to a
-    /// resolved IP, rather than connecting to a proxy and letting the proxy resolve the target.
-    /// `Poco::Net::HTTPClientSession::reconnect` uses the proxy only when
-    /// `!_proxyConfig.host.empty() && !bypassProxy()`; when `no_proxy` matches `host`
-    /// (`bypassProxy()` true) Poco connects directly to `_resolved_host`.
-    bool usesTargetResolution(Poco::Net::HTTPClientSession::ProxyConfig * out_poco_proxy_config = nullptr) const
-    {
-        auto poco_proxy_config = proxy_configuration.isEmpty()
-            ? Poco::Net::HTTPClientSession::ProxyConfig{}
-            : proxyConfigurationToPocoProxyConfig(proxy_configuration);
-        /// Mirrors `Poco::Net::HTTPClientSession::bypassProxy`; keep in sync on Poco upgrades.
-        const bool proxy_bypassed_for_host = !poco_proxy_config.nonProxyHosts.empty()
-            && Poco::RegularExpression::match(
-                host,
-                poco_proxy_config.nonProxyHosts,
-                Poco::RegularExpression::RE_CASELESS | Poco::RegularExpression::RE_ANCHORED);
-        if (out_poco_proxy_config)
-            *out_poco_proxy_config = std::move(poco_proxy_config);
-        return proxy_configuration.isEmpty() || proxy_bypassed_for_host;
-    }
-
     ConnectionPtr prepareNewConnection(const ConnectionTimeouts & timeouts, UInt64 * connect_time)
     {
         /// Route non-bypassed proxy connections to `prepareConnectionViaProxy`, which does not
         /// touch the target `HostResolver`. When `no_proxy` matches the target host, Poco connects
         /// directly to `_resolved_host`, so per-address retries and `setFail` apply as in the
         /// no-proxy case.
-        Poco::Net::HTTPClientSession::ProxyConfig poco_proxy_config;
-        if (!usesTargetResolution(&poco_proxy_config))
+        if (!uses_target_resolution)
             return prepareConnectionViaProxy(timeouts, connect_time, poco_proxy_config);
 
         /// When DNS returns several addresses (e.g. an IPv4 and an IPv6 record), try the next one
@@ -1365,6 +1365,8 @@ private:
     const bool https;
     const ProxyConfiguration proxy_configuration;
     const ConnectionGroup::Ptr group;
+    const Poco::Net::HTTPClientSession::ProxyConfig poco_proxy_config;
+    const bool uses_target_resolution;
 
     std::mutex mutex;
     ConnectionsMinHeap stored_connections TSA_GUARDED_BY(mutex);
