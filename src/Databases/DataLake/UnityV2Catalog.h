@@ -91,6 +91,14 @@ public:
         Poco::JSON::Object::Ptr new_snapshot,
         const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
+    bool updateMetadataAndProperties(
+        const String & namespace_name,
+        const String & table_name,
+        const String & new_metadata_path,
+        Poco::JSON::Object::Ptr new_snapshot,
+        const std::map<String, String> & properties_to_set,
+        const DB::ForwardedAuthTokenPtr & auth_token) const override;
+
     bool updateSchema(
         const String & namespace_name,
         const String & table_name,

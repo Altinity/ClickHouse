@@ -57,72 +57,6 @@ inline uint64_t blobShard(const BlobRef & ref, uint64_t gc_shards)
 ///   - Single-shard equivalence: gc_shards == 1 always returns 0.
 uint64_t manifestCleanupShard(const ManifestId & id, uint64_t gc_shards);
 
-/// Per-shard in-degree reducer for the sharded GC fold.
-///
-/// `ShardReducer` owns exactly ONE target shard (`shard` in [0, `gc_shards`)). It accepts the
-/// caller's per-shard slice of `BlobDelta`s — produced by `foldManifestEdges` and bucketed by
-/// `blobShard` — and merges them into a per-shard `CasBlobInDegree` generation run via
-/// `foldDeltasIntoGeneration`.
-///
-/// Ownership invariant: a reducer touches ONLY blobs it owns — i.e. `blobShard(h, gc_shards) == shard`.
-/// Two reducers for DIFFERENT shards may run concurrently; their key namespaces are disjoint
-/// (`blobTargetRunKey(gen, shard0, seq)` vs `blobTargetRunKey(gen, shard1, seq)`).
-///
-/// The `reduce` method delegates to `foldDeltasIntoGeneration` (the same path the non-sharded fold
-/// uses with `shard == 0`), so `gc_shards == 1` with `shard == 0` reproduces the non-sharded fold
-/// byte-for-byte. This keeps the one-shard configuration compatible with the original fold path.
-///
-/// NOTE on durable writes: `reduce` writes the per-shard in-degree run directly through `op`
-/// (under `blobTargetRunKey(new_generation, shard, 0)`), exactly as `foldDeltasIntoGeneration`
-/// does. Returning the durable write here (rather than an in-memory map) keeps the round driver
-/// stateless: it simply constructs a `ShardReducer` per shard, calls `reduce`, and the sealed
-/// run is already present for the `zeroInDegree` consumer (and the fold's two-cursor merge). An
-/// in-memory return value is unnecessary because the backend is directly queryable; tests read the
-/// sealed run back over an `InMemoryBackend`.
-class ShardReducer
-{
-public:
-    /// Construct a reducer that owns `shard` (in [0, `gc_shards`)).
-    ShardReducer(uint64_t shard_, uint64_t gc_shards_);
-
-    /// True iff this reducer owns `ref` — i.e. `blobShard(ref, gc_shards) == shard`.
-    bool owns(const BlobRef & ref) const;
-
-    /// Merge `shard_deltas` (the caller's per-shard `BlobDelta` slice produced by `foldManifestEdges`
-    /// and bucketed by `blobShard`) into a new in-degree generation for this shard. Writes the sealed
-    /// run under `blobTargetRunKey(new_generation, shard, 0)` through `op`, appends its `RunRef` to
-    /// `out_runs`, and returns the `RunRef`. The call is idempotent: the run is written once, and a
-    /// second call finds the identical object already there.
-    ///
-    /// `prior_runs` are the parent generation's run segments for this shard, resolved BY THE CALLER from
-    /// the parent fold seal's `blob_target_runs` filtered to `shard`. An empty vector is the
-    /// fresh-pool / empty baseline.
-    ///
-    /// PRECONDITION: every `BlobDelta` in `shard_deltas` must be owned by this reducer
-    /// (`blobShard(d.ref, gc_shards) == shard`). This is a caller contract; there is no
-    /// underflow throw backstopping it — pass a misbucketed delta and the fold silently misroutes it.
-    std::vector<RunRef> reduce(CasOperation & op, const Layout & layout,
-                               const std::vector<RunRef> & prior_runs,
-                               uint64_t new_generation, uint64_t attempt,
-                               std::vector<BlobDelta> shard_deltas,
-                               uint64_t current_round = 0, uint64_t condemn_round = 0,
-                               const BlobHeadFn & head_blob = {},
-                               const BlobHeadFn & peek_head = {},
-                               const std::function<bool(const RetiredEntry &)> & confirm_condemned_marker = {},
-                               RetiredMergeResult * out_retired = nullptr,
-                               bool suppress_destructive = false,
-                               /// PROBE B2: forwarded verbatim to `foldDeltasIntoGeneration` — see its
-                               /// declaration and `Cas::TxnApplyLedger`.
-                               std::vector<uint8_t> * out_applied_by_txn_ordinal = nullptr,
-                               /// Forwarded verbatim to `foldDeltasIntoGeneration`; the caller shares
-                               /// one instance across every shard's reduce within a round.
-                               GcRoundWorkBudget * work_budget = nullptr) const;
-
-private:
-    uint64_t shard;
-    uint64_t gc_shards;
-};
-
 /// Role split of a sharded GC round (`gc_shards > 1`):
 ///
 ///   - COORDINATOR (exactly one per round — the lease holder): owns input-seal, round-visibility,
@@ -132,8 +66,9 @@ private:
 ///     unsafe. `Gc::fence` therefore stays the single coordinator fence over the entire universe.
 ///
 ///   - REDUCERS / CLEANUP WORKERS (one per disjoint shard): own ONLY their shard's blob-target reduce
-///     (`ShardReducer`) or part-manifest cleanup (`manifestCleanupShard`). Their key namespaces are
-///     disjoint, so two replicas may reduce DIFFERENT shards concurrently. Reducer work needs NO lease:
-///     the lease is work-dedup only (see `CasGcScheduler`), not a coordination primitive.
+///     (`foldDeltasIntoGeneration` for that shard) or part-manifest cleanup (`manifestCleanupShard`).
+///     Their key namespaces are disjoint, so two replicas may reduce DIFFERENT shards concurrently.
+///     Reducer work needs NO lease: the lease is work-dedup only (see `CasGcScheduler`), not a
+///     coordination primitive.
 
 }

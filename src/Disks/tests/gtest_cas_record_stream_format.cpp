@@ -439,3 +439,112 @@ TEST(CASRecordStream, HeaderGates)
         }
     }
 }
+
+namespace
+{
+
+SourceEdgeRecord standingRecord(const BlobRef & ref)
+{
+    SourceEdgeRecord r = condemned(ref, PersistedEtag{"etag", "e-1"}, 4242, 7, /*pend*/ true);
+    r.marker_confirmed = true;
+    r.standing = true;
+    return r;
+}
+
+void expectEncodeRefused(const SourceEdgeRecord & r)
+{
+    cas_battery_detail::expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { static_cast<void>(encodeRun({r})); }, "encode");
+}
+
+void expectCorruptedRun(const String & bytes)
+{
+    cas_battery_detail::expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { static_cast<void>(decodeRun(bytes)); }, "decode");
+}
+
+}
+
+TEST(CASRecordStream, StandingRowRoundTrips)
+{
+    const String bytes = encodeRun({standingRecord(chRef(2))});
+    EXPECT_NE(bytes.find(R"(,"confirmed":true,"standing":true})"), String::npos) << bytes;
+    const auto back = decodeRun(bytes);
+    ASSERT_EQ(back.size(), 1u);
+    EXPECT_TRUE(back[0].standing);
+    EXPECT_TRUE(back[0].delete_pending);
+}
+
+TEST(CASRecordStream, AbsentStandingDecodesFalse)
+{
+    const String bytes = encodeRun({condemned(chRef(2), PersistedEtag{"etag", "e-1"}, 4242, 7, /*pend*/ true)});
+    EXPECT_EQ(bytes.find("standing"), String::npos) << bytes;
+    const auto back = decodeRun(bytes);
+    ASSERT_EQ(back.size(), 1u);
+    EXPECT_FALSE(back[0].standing);
+}
+
+TEST(CASRecordStream, StandingWithoutPendingIsCorrupted)
+{
+    String bytes = encodeRun({standingRecord(chRef(2))});
+    const String needle = R"("pending":true)";
+    const size_t at = bytes.find(needle);
+    ASSERT_NE(at, String::npos) << bytes;
+    bytes.replace(at, needle.size(), R"("pending":false)");
+    expectCorruptedRun(bytes);
+}
+
+TEST(CASRecordStream, EncodeRefusesStandingWithoutPending)
+{
+    SourceEdgeRecord r = standingRecord(chRef(2));
+    r.delete_pending = false;
+    expectEncodeRefused(r);
+}
+
+TEST(CASRecordStream, EncodeRefusesStandingOnANonCondemnedRecord)
+{
+    SourceEdgeRecord r = edge(chRef(1), 10);
+    r.standing = true;
+    expectEncodeRefused(r);
+}
+
+TEST(CASRecordStream, RefusedAppendLeavesTheWriterUsable)
+{
+    DB::WriteBufferFromOwnString out;
+    SourceEdgeRunWriter writer(out);
+    writer.append(edge(chRef(1), 10));
+    SourceEdgeRecord refused = standingRecord(chRef(3));
+    refused.delete_pending = false;
+    cas_battery_detail::expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { writer.append(refused); }, "append");
+    /// Orders after the last accepted record and before the refused one.
+    writer.append(edge(chRef(2), 10));
+    writer.finish();
+    out.finalize();
+
+    const auto back = decodeRun(out.str());
+    ASSERT_EQ(back.size(), 2u);
+    EXPECT_EQ(back[0].ref, chRef(1));
+    EXPECT_EQ(back[1].ref, chRef(2));
+}
+
+TEST(CASRecordStream, StandingOnANonCondemnedRecordIsCorrupted)
+{
+    String bytes = encodeRun({edge(chRef(1), 10)});
+    const String needle = R"(,"mark":"edge")";
+    const size_t at = bytes.find(needle);
+    ASSERT_NE(at, String::npos);
+    bytes.insert(at + needle.size(), R"(,"standing":true)");
+    expectCorruptedRun(bytes);
+}
+
+/// Pin: rows that carry no `standing` keep the bytes they had before the field existed.
+TEST(CASRecordStream, CandidateAndPendingBytesAreUnchanged)
+{
+    const String tok = R"("token_type":"etag","token":"e-1","size":4242,"condemn_round":"7")";
+    EXPECT_EQ(encodeRun({condemned(chRef(2), PersistedEtag{"etag", "e-1"}, 4242, 7, /*pend*/ false)}),
+        fmt::format("{{\"type\":\"cas_run\",\"v\":{},\"kind\":\"source_edge\"}}\n", currentCompatibilityVersion())
+        + R"({"ref":"0100000000000000000000000000000002","src":"00000000000000000000000000000000","mark":"condemned","pending":false,)"
+        + tok + ",\"confirmed\":false}\n{\"n\":1}\n");
+    EXPECT_EQ(encodeRun({condemned(chRef(2), PersistedEtag{"etag", "e-1"}, 4242, 7, /*pend*/ true)}),
+        fmt::format("{{\"type\":\"cas_run\",\"v\":{},\"kind\":\"source_edge\"}}\n", currentCompatibilityVersion())
+        + R"({"ref":"0100000000000000000000000000000002","src":"00000000000000000000000000000000","mark":"condemned","pending":true,)"
+        + tok + ",\"confirmed\":false}\n{\"n\":1}\n");
+}

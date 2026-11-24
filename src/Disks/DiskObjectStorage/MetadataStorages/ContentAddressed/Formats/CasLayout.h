@@ -1,4 +1,5 @@
 #pragma once
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobDigest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasNamespaceLifeId.h>
@@ -119,6 +120,10 @@ public:
     /// The per-hash meta descriptor sibling of the blob body.
     String blobMetaKey(const BlobRef & ref) const;
 
+    /// The suffix of the legacy marker's key, and the one place that tests for it.
+    static constexpr std::string_view kLegacyMarkerSuffix = ".meta";
+    static bool hasLegacyMarkerSuffix(std::string_view key) { return key.ends_with(kLegacyMarkerSuffix); }
+
     /// Inverse of `blobKey`/`blobMetaKey`: parses a listed object key of the shape
     /// `<prefix>/blobs/<algoName>/<shard2>/<hex>` (the `.meta` sibling is accepted identically -- its
     /// trailing `.meta` is stripped first, so a body and its meta parse to the SAME `BlobRef`).
@@ -129,6 +134,39 @@ public:
     /// it as foreign/unaccounted, mirroring the LIST sweep's existing `catch (...) continue`
     /// contract). Defined out-of-line in `CasLayout.cpp` alongside `blobKey` and `blobMetaKey`.
     std::optional<BlobRef> parseBlobKey(std::string_view key) const;
+    /// The blob of a legacy `.meta` marker key, only for the exact spelling `blobMetaKey` produces.
+    std::optional<BlobRef> parseLegacyMarkerKey(std::string_view key) const;
+
+    /// Deletion intents: `<prefix>/blob-intents/<algo>/<hex[0:2]>/<hex>/<dialect>/<tag_hex>`. The first
+    /// segments mirror `blobKey`; the last two are the canonical identity of the blob incarnation.
+    static constexpr size_t kBlobIntentKeyMaxBytes = 1024;
+    /// An upper bound on the key after the pool prefix: `/blob-intents/`, the widest algo and digest, and
+    /// the longest dialect word with a 128-byte tag in hex. No single dialect reaches it.
+    static constexpr size_t kBlobIntentKeySuffixMaxBytes = 356;
+    static constexpr size_t maxPoolPrefixBytesForBlobIntents() { return kBlobIntentKeyMaxBytes - kBlobIntentKeySuffixMaxBytes; }
+
+    String blobIntentsPrefix() const { return prefix + "/blob-intents/"; }
+    /// The capability probe's scratch space under `blob-intents/`: `_probe` is no hash algorithm word, so no intent
+    /// key is under it, and the parser, the orphan sweep and `cas-fsck` skip it by this test.
+    String blobIntentsProbePrefix() const { return blobIntentsPrefix() + "_probe/"; }
+    bool isBlobIntentProbeKey(std::string_view key) const { return key.starts_with(blobIntentsProbePrefix()); }
+    String blobIntentProbeKey(const String & probe_id) const { return blobIntentsProbePrefix() + probe_id + "/intent"; }
+    /// `LOGICAL_ERROR` when the key exceeds `kBlobIntentKeyMaxBytes` or the identity's tag is not one
+    /// `parseBlobIntentKey` accepts.
+    String blobIntentKey(const BlobRef & ref, const CanonicalIdentity & identity) const;
+    /// The intent is one constant byte string in every life of its key, so a delete needs no precondition.
+    WriteOnceKey writeOnceBlobIntentKey(const BlobRef & ref, const CanonicalIdentity & identity) const
+    {
+        return WriteOnceKey(blobIntentKey(ref, identity));
+    }
+
+    struct ParsedBlobIntentKey
+    {
+        BlobRef ref;
+        CanonicalIdentity identity;
+    };
+    /// Inverse of `blobIntentKey`, accepting only the spelling it produces. `nullopt` for anything else.
+    std::optional<ParsedBlobIntentKey> parseBlobIntentKey(std::string_view key) const;
 
     /// Immutable stream prefix for one physical life.
     String namespaceStreamPrefix(const NamespaceLifeId & life) const

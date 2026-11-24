@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRetry.h>
 
 #include <Common/ProfileEvents.h>
+#include <base/defines.h>
 
 namespace ProfileEvents
 {
@@ -23,6 +24,8 @@ GcReadAhead::~GcReadAhead()
     /// A worker holds its own slot and touches `requests`, which outlives this object; waiting here is
     /// what keeps every worker inside the round that issued it. `wait`, not `get`: an exception nobody
     /// took is dropped with the result it belongs to, and a destructor may not throw.
+    for (const auto & [id, create] : creates)
+        create.wait();
     size_t wasted = 0;
     for (auto & [key, slot] : reads)
     {
@@ -122,6 +125,60 @@ void GcReadAhead::discardRead(const String & key)
 void GcReadAhead::discardHead(const String & key)
 {
     discard<Meta>(heads, key);
+}
+
+std::function<IntentCreateResult()> GcReadAhead::startCreate(std::function<IntentCreateResult(CasOperation &)> request)
+{
+    if (concurrency <= 1)
+    {
+        IntentCreateResult answer = request(op);
+        return [result = std::move(answer)] { return result; };
+    }
+
+    auto promise = std::make_shared<std::promise<IntentCreateResult>>();
+    auto job = [promise, fn = std::move(request), requests_ptr = &requests, gen = generation, failure = create_failure]
+    {
+        if (failure->failed.load())
+        {
+            std::lock_guard lock(failure->mutex);
+            promise->set_exception(failure->first);
+            return;
+        }
+        try
+        {
+            CasOperation worker = requests_ptr->resume(gen);
+            promise->set_value(fn(worker));
+        }
+        catch (...)
+        {
+            {
+                std::lock_guard lock(failure->mutex);
+                if (!failure->first)
+                    failure->first = std::current_exception();
+            }
+            failure->failed.store(true);
+            promise->set_exception(std::current_exception());
+        }
+    };
+    const uint64_t id = next_create++;
+    /// Registered before the worker exists, so the destructor waits for every worker that was scheduled.
+    creates.emplace(id, promise->get_future());
+    try
+    {
+        pool.scheduleOrThrowOnError(std::move(job));
+    }
+    catch (...)
+    {
+        creates.erase(id);
+        throw;
+    }
+    /// Taking the answer releases the create's state, so a fold holds only the creates still outstanding.
+    return [this, id]
+    {
+        auto node = creates.extract(id);
+        chassert(!node.empty());
+        return node.mapped().get();
+    };
 }
 
 std::optional<Object> GcReadAhead::takeRead(const String & key)

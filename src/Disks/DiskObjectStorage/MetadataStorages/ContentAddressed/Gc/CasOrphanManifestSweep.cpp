@@ -507,7 +507,8 @@ bool manifestDeletionPremise(const NamespaceFoldView & view, const ManifestKey &
     if (!(manifest.prefix.writer_epoch < cov.last_folded_ref_id.writer_epoch))
         return retain(SweepRetainClass::UnconsumedSeal,
                       "epoch " + build_epoch + "'s closing seal is not consumed: the sealed cursor is at "
-                      + renderRefTxnId(cov.last_folded_ref_id) + ", so a grant naming this build may "
+                      + (cov.last_folded_ref_id == RefTxnId{} ? String{"none"} : renderRefTxnId(cov.last_folded_ref_id))
+                      + ", so a grant naming this build may "
                       "still be unfolded above it");
 
     /// RULE 2 (spec §6). Removals DO cross epochs, so a record in a LATER epoch can name this build as a
@@ -727,6 +728,7 @@ ManifestSweepResult planManifestCursorPage(
     else
         reader = std::make_unique<InlineKeyReader>(op);
     const ListPage page = op.list(layout.casManifestsPrefix(), cursor, list_budget, Retry::standard());
+    result.orphan_manifest_sweep_page_listed = true;
     /// This pass fetches exactly one page per round (the cursor advances across rounds, not within this
     /// call), so the metric increments once per call, not once per listed key.
     ProfileEvents::increment(ProfileEvents::CASGCEnumerationPages);

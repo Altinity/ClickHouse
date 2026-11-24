@@ -480,7 +480,7 @@ TEST(CASRefCheckpoint, AMissingSampledBaseRestartsOnAnAdvancedIncarnationAndIsCo
     ASSERT_TRUE(second.has_value());
     const Etag sampled = first->etag;
     const Etag advanced = second->etag;
-    ASSERT_FALSE(sampled == advanced) << "the rewrite must mint a different incarnation";
+    ASSERT_FALSE(identicalToken(sampled, advanced)) << "the rewrite must mint a different incarnation";
 
     EXPECT_EQ(classifyMissingSampledBase(sampled, advanced), MissingBaseVerdict::RestartRecovery)
         << "cleanup legitimately moved the checkpoint while we read; restart from the newer base";

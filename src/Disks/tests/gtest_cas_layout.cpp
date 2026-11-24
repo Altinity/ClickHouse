@@ -384,6 +384,41 @@ TEST(CASLayout, BlobKeyRoundTripsThroughParse)
     EXPECT_FALSE(layout.parseBlobKey("pool0/blobs/unknown-algo/aa/aa00").has_value());  /// foreign => nullopt
 }
 
+/// The body parser takes any spelling `fromHex` takes; the marker parser takes only the writer's own key.
+TEST(CASLayout, BlobAndMarkerKeyParsersAcceptExactlyTheirSpellings)
+{
+    const Layout layout("p");
+    const String hex = "aabbccddeeff00112233445566778899";
+    const String body = "p/blobs/ch128/aa/" + hex;
+    const BlobRef ref{BlobHashAlgo::CityHash128, codecFor(BlobHashAlgo::CityHash128).fromHex(hex)};
+    ASSERT_EQ(layout.blobKey(ref), body);
+
+    EXPECT_EQ(layout.parseBlobKey(body), ref);
+    EXPECT_EQ(layout.parseBlobKey(body + ".meta"), ref);
+    EXPECT_EQ(layout.parseBlobKey("p/blobs/ch128/AA/AABBCCDDEEFF00112233445566778899"), ref);
+    EXPECT_EQ(layout.parseLegacyMarkerKey(body + ".meta"), ref);
+
+    const std::vector<std::pair<String, String>> foreign{
+        {"unknown algo", "p/blobs/md5/aa/" + hex},
+        {"shard other than hex[0:2]", "p/blobs/ch128/ab/" + hex},
+        {"lowercase shard over an uppercase digest", "p/blobs/ch128/aa/AABBCCDDEEFF00112233445566778899"},
+        {"one-character shard", "p/blobs/ch128/a/" + hex},
+        {"digest of the wrong width", "p/blobs/ch128/aa/aabbcc"},
+        {"non-hex digest", "p/blobs/ch128/aa/aabbccddeeff0011223344556677889g"},
+        {"no shard segment", "p/blobs/ch128/" + hex},
+        {"one segment more", body + "/x"},
+        {"another pool prefix", "q/blobs/ch128/aa/" + hex},
+    };
+    for (const auto & [what, key] : foreign)
+    {
+        EXPECT_FALSE(layout.parseBlobKey(key).has_value()) << what << ": " << key;
+        EXPECT_FALSE(layout.parseLegacyMarkerKey(key + ".meta").has_value()) << what << ": " << key;
+    }
+    EXPECT_FALSE(layout.parseLegacyMarkerKey(body).has_value()) << "a body is not a marker";
+    EXPECT_FALSE(layout.parseLegacyMarkerKey("p/blobs/ch128/AA/AABBCCDDEEFF00112233445566778899.meta").has_value())
+        << "uppercase is a spelling the writer never emits";
+}
+
 TEST(CASLayout, StagingKeyCarriesTheWriterEpoch)
 {
     const Layout layout("p");

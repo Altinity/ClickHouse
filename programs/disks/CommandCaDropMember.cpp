@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.h>
 #include <Common/Exception.h>
 #include <ICommand.h>
+#include <Utils.h>
 
 #include <iostream>
 
@@ -36,14 +37,7 @@ public:
     {
         const String srid = getValueFromCommandLineOptionsThrow<String>(options, "member");
         auto disk = client.getCurrentDiskWithPath().getDisk();
-
-        auto * dos = dynamic_cast<DiskObjectStorage *>(disk.get());
-        if (!dos)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "cas-drop-member: '{}' is not an object-storage disk", disk->getName());
-
-        auto * ca = dynamic_cast<ContentAddressedMetadataStorage *>(dos->getMetadataStorage().get());
-        if (!ca)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "cas-drop-member: disk '{}' is not content-addressed", disk->getName());
+        auto * ca = &contentAddressedStorageOf(*disk, "cas-drop-member");
 
         if (!ca->isReadOnly())
             throw Exception(ErrorCodes::BAD_ARGUMENTS,
