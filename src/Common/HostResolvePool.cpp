@@ -140,7 +140,7 @@ void HostResolver::reset()
     has_measured_latency.store(false, std::memory_order_relaxed);
 }
 
-void HostResolver::updateWeights() noexcept
+void HostResolver::updateWeights()
 {
     updateWeightsImpl();
 
@@ -182,7 +182,7 @@ void HostResolver::setSuccess(const Poco::Net::IPAddress & address)
         updateWeights();
 }
 
-void HostResolver::reportLatency(const Poco::Net::IPAddress & address, UInt64 microseconds) noexcept
+void HostResolver::reportLatency(const Poco::Net::IPAddress & address, UInt64 microseconds)
 {
     if (microseconds == 0)
         return;
@@ -198,13 +198,13 @@ void HostResolver::reportLatency(const Poco::Net::IPAddress & address, UInt64 mi
 
     /// Defer the O(R) median + prefix-sum recomputation to `selectBest`: pooled requests report
     /// latency at the full S3 read rate while `resolve` runs only when opening a new connection,
-    /// and deferring also guarantees `reportLatency` neither allocates nor runs `updateWeights`
+    /// and deferring also keeps `reportLatency` allocation-free and keeps it from running `updateWeights`
     /// (whose all-banned fallback would un-ban addresses during `setFail`'s DNS refresh window).
     if (latency_aware_selection.load(std::memory_order_relaxed))
         weights_dirty = true;
 }
 
-double HostResolver::LatencySnapshot::lookupLatencyMs(const Poco::Net::IPAddress & address) const noexcept
+double HostResolver::LatencySnapshot::lookupLatencyMs(const Poco::Net::IPAddress & address) const
 {
     auto it = std::lower_bound(
         entries.begin(),
@@ -405,8 +405,10 @@ void HostResolver::updateImpl(Poco::Timestamp now, std::vector<Poco::Net::IPAddr
     chassert(std::adjacent_find(merged.begin(), merged.end()) == merged.end());
 
     last_resolve_time = now;
+    /// Reserve before mutating `records` so the invariant `measured_latencies_scratch.capacity() >=
+    /// records.size()` holds on every exit path, even if this allocation throws.
+    measured_latencies_scratch.reserve(merged.size());
     records.swap(merged);
-    measured_latencies_scratch.reserve(records.size());
 
     bool any_measured = false;
     for (const auto & rec : records)
@@ -434,7 +436,7 @@ size_t HostResolver::getTotalWeight() const noexcept
 }
 
 
-void HostResolver::updateWeightsImpl() noexcept
+void HostResolver::updateWeightsImpl()
 {
     weights_dirty = false;
 
@@ -448,7 +450,7 @@ void HostResolver::updateWeightsImpl() noexcept
     if (latency_aware)
     {
         /// `measured_latencies_scratch` is pre-reserved to `records.size()` in `updateImpl`,
-        /// so clearing and filling it here never allocates or throws under `mutex`.
+        /// so clearing and filling it here does not allocate under `mutex`.
         measured_latencies_scratch.clear();
         for (const auto & rec : records)
             if (rec.latency_ms_ewma > 0)
@@ -516,7 +518,7 @@ HostResolver::Ptr HostResolversPool::getResolver(const String & host)
     return host_pools.try_emplace(host, std::move(created)).first->second;
 }
 
-HostResolver::Ptr HostResolversPool::tryGetResolver(const String & host) noexcept
+HostResolver::Ptr HostResolversPool::tryGetResolver(const String & host)
 {
     SharedLockGuard lock(mutex);
 

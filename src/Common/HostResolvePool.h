@@ -132,9 +132,11 @@ public:
     /// Report a measured request latency (microseconds, typically time-to-first-byte) for an
     /// address. Feeds the per-address latency EWMA used by latency-aware selection. Cheap no-op
     /// when the address is unknown; marks weights dirty so `selectBest` recomputes them lazily on
-    /// the next `resolve`. Never allocates or throws, so it is safe to call after an HTTP response
-    /// has already been received.
-    void reportLatency(const Poco::Net::IPAddress & address, UInt64 microseconds) noexcept;
+    /// the next `resolve`. Does not allocate in the steady state (no heap use after the lock is
+    /// taken), but it is not declared `noexcept`: the lock and `Poco::Net::IPAddress` comparisons
+    /// are not guaranteed not to throw, so callers that must not fail after an HTTP response has
+    /// been received (`PocoHTTPClient`) guard the call themselves.
+    void reportLatency(const Poco::Net::IPAddress & address, UInt64 microseconds);
 
     /// Consistent point-in-time snapshot of per-address latency EWMAs, captured under a single
     /// `mutex` acquisition before `EndpointConnectionPool` takes its own lock. Keeps the resolver
@@ -151,7 +153,7 @@ public:
         bool empty() const noexcept { return entries.empty(); }
 
         /// Returns the recorded EWMA (ms) for `address`, or 0 if unmeasured / absent.
-        double lookupLatencyMs(const Poco::Net::IPAddress & address) const noexcept;
+        double lookupLatencyMs(const Poco::Net::IPAddress & address) const;
     };
 
     LatencySnapshot getLatencySnapshot();
@@ -280,8 +282,8 @@ protected:
     bool isUpdateNeeded();
 
     void updateImpl(Poco::Timestamp now, std::vector<Poco::Net::IPAddress> & next_gen) TSA_REQUIRES(mutex);
-    void updateWeights() noexcept TSA_REQUIRES(mutex);
-    void updateWeightsImpl() noexcept TSA_REQUIRES(mutex);
+    void updateWeights() TSA_REQUIRES(mutex);
+    void updateWeightsImpl() TSA_REQUIRES(mutex);
     size_t getTotalWeight() const noexcept TSA_REQUIRES(mutex);
     Poco::Timespan getRecordHistoryTime(const Record&) const;
 
@@ -333,9 +335,9 @@ public:
 
     /// Return the cached resolver for `host`, or `nullptr` if none exists (for example after
     /// `dropCache`, or for a proxied endpoint whose target was never resolved locally). Never
-    /// creates a resolver or runs DNS, so it is `noexcept` and safe to call under another lock
+    /// creates a resolver or runs DNS, so it is cheap and safe to call under another lock
     /// or after a response has already been received.
-    HostResolver::Ptr tryGetResolver(const String & host) noexcept;
+    HostResolver::Ptr tryGetResolver(const String & host);
 
     /// Pre-populate the pool with a resolver for `host`, replacing any cached entry.
     /// For tests: allows simulating multi-address DNS responses without injecting into
