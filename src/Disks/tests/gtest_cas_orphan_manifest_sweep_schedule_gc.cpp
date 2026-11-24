@@ -78,6 +78,14 @@ struct ScheduleFixture
         gc->setPhaseSink([this](const GcPhaseRecord & record) { phases[record.phase] = record; });
     }
 
+    void reopenPool()
+    {
+        gc.reset();
+        store.reset();
+        store = Pool::open(backend, config);
+        makeGc();
+    }
+
     RoundReport run(UniversePolicy policy = UniversePolicy::Authoritative)
     {
         phases.clear();
@@ -195,11 +203,8 @@ TEST(CASOrphanManifestSweepScheduleGc, TwoPagesDoNotWaitAnHour)
 TEST(CASOrphanManifestSweepScheduleGc, NominationBudgetPreservesPreviousCompletion)
 {
     ScheduleFixture f;
-    f.gc.reset();
-    f.store.reset();
     f.config.manifest_sweep_delete_budget_keys = 1;
-    f.store = Pool::open(f.backend, f.config);
-    f.makeGc();
+    f.reopenPool();
 
     const RootNamespace ns{"orphan/table"};
     writeManifestRaw(*f.backend, f.store->layout(), ns, ManifestRef{1, 1, 1}, {});
@@ -277,15 +282,36 @@ TEST(CASOrphanManifestSweepScheduleGc, ZeroIntervalRestoresCadence)
     EXPECT_EQ(f.metric("orphan_sweep", "orphan_manifest_sweep_page_listed"), 1);
 }
 
-TEST(CASOrphanManifestSweepScheduleGc, SkippedResultDoesNotResetCursor)
+TEST(CASOrphanManifestSweepScheduleGc, ReenablingListBudgetResumesFromSavedCursor)
 {
-    ScheduleFixture f(0);
-    auto state = f.state();
-    state.manifest_sweep_cursor = "cursor";
-    f.setState(state);
+    ScheduleFixture f(1);
     ASSERT_TRUE(f.run().acquired_lease);
-    expectSameSchedule(f.state(), state);
+    const uint64_t previous_completion = f.state().orphan_manifest_sweep_completed_at_ms;
+    ASSERT_EQ(previous_completion, f.now);
+
+    f.addKeys();
+    f.now += f.config.orphan_manifest_sweep_interval_sec * 1000;
+    ASSERT_TRUE(f.run().acquired_lease);
+    const GcState first_page = f.state();
+    ASSERT_FALSE(first_page.manifest_sweep_cursor.empty());
+    ASSERT_EQ(first_page.orphan_manifest_sweep_completed_at_ms, previous_completion);
+
+    f.config.manifest_sweep_list_budget_keys = 0;
+    f.reopenPool();
+    f.backend->resetCounts();
+    const RoundReport paused = f.run();
+    ASSERT_TRUE(paused.acquired_lease);
+    ASSERT_FALSE(paused.deferred);
+    expectSameSchedule(f.state(), first_page);
     EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 0);
+
+    f.config.manifest_sweep_list_budget_keys = 1;
+    f.reopenPool();
+    ASSERT_TRUE(f.run().acquired_lease);
+    EXPECT_EQ(f.backend->listCount(f.backend->manifests_prefix), 1);
+    const GcState last_page = f.state();
+    EXPECT_TRUE(last_page.manifest_sweep_cursor.empty());
+    EXPECT_EQ(last_page.orphan_manifest_sweep_completed_at_ms, f.now);
 }
 
 TEST(CASOrphanManifestSweepScheduleGc, SuppressedRoundPreservesSchedule)
@@ -507,10 +533,7 @@ TEST(CASOrphanManifestSweepScheduleGc, RestartReadsCommittedSchedule)
     ASSERT_TRUE(f.run().acquired_lease);
     const auto before = f.state();
     ASSERT_FALSE(before.manifest_sweep_cursor.empty());
-    f.gc.reset();
-    f.store.reset();
-    f.store = Pool::open(f.backend, f.config);
-    f.makeGc();
+    f.reopenPool();
     ++f.now;
     ASSERT_TRUE(f.run().acquired_lease);
     EXPECT_TRUE(f.state().manifest_sweep_cursor.empty());
@@ -545,11 +568,8 @@ TEST(CASOrphanManifestSweepScheduleGc, ListOnlyCanCompleteTraversal)
 {
     ScheduleFixture f;
     f.addKeys();
-    f.gc.reset();
-    f.store.reset();
     f.config.manifest_sweep_delete_budget_keys = 0;
-    f.store = Pool::open(f.backend, f.config);
-    f.makeGc();
+    f.reopenPool();
     ASSERT_TRUE(f.run().acquired_lease);
     EXPECT_EQ(f.state().orphan_manifest_sweep_completed_at_ms, 1000);
     EXPECT_EQ(f.metric("orphan_sweep", "orphan_manifest_sweep_page_listed"), 1);
