@@ -2158,7 +2158,6 @@ TEST(CASGCStuckRemoval, AdoptedRoundWarnsEveryRestartWithoutAppending)
     state.gc_shards = 1;
     state.snap_generation = 1;
     state.snap_attempt = 1;
-    state.orphan_manifest_sweep_completed_at_ms = 1000;
     seedObject(op, layout.gcStateKey(), encodeGcState(state));
 
     const uint64_t signals_before
@@ -2167,9 +2166,9 @@ TEST(CASGCStuckRemoval, AdoptedRoundWarnsEveryRestartWithoutAppending)
     const String unreadable_ref_log_key = layout.refLogKey(life, RefTxnId{5, 6});
     const uint64_t append_writes_before = backend->writes(unreadable_ref_log_key);
     ScopedCasGcLogCapture log_capture;
-    Gc first_process(store, gc_id, [] { return 1001; });
+    Gc first_process(store, gc_id);
     EXPECT_TRUE(first_process.runRegularRound().acquired_lease);
-    Gc restarted_process(store, gc_id, [] { return 1001; });
+    Gc restarted_process(store, gc_id);
     EXPECT_TRUE(restarted_process.runRegularRound().acquired_lease);
 
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCStuckRemovals] - signals_before, 2u);

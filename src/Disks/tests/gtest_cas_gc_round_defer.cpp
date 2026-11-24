@@ -427,7 +427,7 @@ TEST(CASGCRoundDefer, DeferredRoundRetriesPartialJanitorPageAtForcedFoldWithoutP
 
     backend->resetCounts();
     std::vector<GcPhaseRecord> phases;
-    Gc gc(store, kGc, [] { return 1001; });
+    Gc gc(store, kGc);
     gc.setPhaseSink([&](const GcPhaseRecord & phase) { phases.push_back(phase); });
     const uint64_t plans_before
         = ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt];
@@ -646,7 +646,7 @@ TEST(CASGCRoundDefer, BoundedDeferralForcesFoldWithinWindow)
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", UInt128(1))});
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
 
-    Gc gc(store, kGc, [] { return 1001; });
+    Gc gc(store, kGc);
     for (int i = 0; i < 3; ++i)
     {
         const RoundReport rep = gc.runRegularRound();
