@@ -1,6 +1,10 @@
 #include <IO/WriteBufferFromFile.h>
+#include <Common/CurrentMemoryTracker.h>
 #include <Common/CurrentThread.h>
 #include <Common/HostResolvePool.h>
+#include <Common/MemoryTracker.h>
+#include <Common/ThreadStatus.h>
+#include <Common/scope_guard_safe.h>
 #include <base/defines.h>
 #include <base/scope_guard.h>
 
@@ -1062,4 +1066,102 @@ TEST_F(ResolvePoolTest, LatencyReportDoesNotUnbanAddressDuringFailRefresh)
 
     ASSERT_TRUE(banned_during_refresh.has_value());
     ASSERT_EQ(1, *banned_during_refresh);
+}
+
+TEST_F(ResolvePoolTest, ReportLatencyDoesNotAllocateOrThrowUnderMemoryLimit)
+{
+    /// Regression test: `PocoHTTPClient` calls `reportLatency` after `receiveResponse` has already
+    /// read the HTTP response headers, and `reportLatency` runs under `HostResolver::mutex`.
+    /// Previously `reportLatency` called `updateWeightsImpl` on every sample, which allocated a
+    /// temporary `std::vector<double>` under `mutex` and threw `MEMORY_LIMIT_EXCEEDED` when the
+    /// query/server memory tracker was at its limit - aborting a completed S3 read and doing an
+    /// O(R) median + prefix-sum recomputation per request.
+    DB::MainThreadStatus::getInstance();
+    LatencyAwareSelectionScope scope(true);
+
+    struct ZeroAllocInspector : public DB::HostResolver
+    {
+        using ResolveFunction = DB::HostResolver::ResolveFunction;
+        ZeroAllocInspector(String h, Poco::Timespan history_, ResolveFunction f)
+            : DB::HostResolver(std::move(f), std::move(h), history_)
+        {}
+
+        const Poco::Net::IPAddress & pickBestZeroAlloc()
+        {
+            std::lock_guard lock(mutex);
+            return selectBest();
+        }
+    };
+
+    /// Large history so no background `update` runs.
+    const Poco::Net::IPAddress fast("127.0.0.1");
+    const Poco::Net::IPAddress mid("127.0.0.2");
+    const Poco::Net::IPAddress slow("127.0.0.3");
+    auto resolver = std::make_shared<ZeroAllocInspector>(
+        "zero_alloc_host",
+        Poco::Timespan(60, 0),
+        [fast, mid, slow](const String &) -> std::vector<Poco::Net::IPAddress> { return {fast, mid, slow}; });
+
+    auto & thread_tracker = DB::CurrentThread::get().memory_tracker;
+    const Int64 saved_untracked_limit = DB::CurrentThread::get().untracked_memory_limit;
+    const Int64 saved_thread_hard_limit = thread_tracker.getHardLimit();
+    const Int64 saved_total_hard_limit = total_memory_tracker.getHardLimit();
+    const UInt64 saved_min_alloc_to_throw = CurrentMemoryTracker::getMinAllocationSizeBytesToThrow();
+
+    SCOPE_EXIT_SAFE({
+        total_memory_tracker.setHardLimit(saved_total_hard_limit);
+        thread_tracker.setHardLimit(saved_thread_hard_limit);
+        DB::CurrentThread::get().untracked_memory_limit = saved_untracked_limit;
+        CurrentMemoryTracker::setMinAllocationSizeBytesToThrow(saved_min_alloc_to_throw);
+    });
+
+    /// Touch `thread_local_rng` via a warmup `resolve` before arming the memory limit, because
+    /// C++ `thread_local` initialization (`randomSeed`) runs on first ODR-use in the thread.
+    resolver->resolve().setUnused();
+
+    CurrentMemoryTracker::setMinAllocationSizeBytesToThrow(1);
+    DB::CurrentThread::get().untracked_memory_limit = 0;
+    DB::CurrentThread::flushUntrackedMemory();
+    total_memory_tracker.resetCounters();
+    thread_tracker.resetCounters();
+    total_memory_tracker.setHardLimit(1);
+    thread_tracker.setHardLimit(1);
+
+    /// Under a 1-byte hard limit, any heap allocation throws `MEMORY_LIMIT_EXCEEDED`. Both
+    /// `reportLatency` and the lazy weight recomputation inside `selectBest` -> `updateWeightsImpl`
+    /// must succeed with zero allocations (`Entry` construction is excluded because `Poco::Net::IPAddress`
+    /// allocates its `IPv4AddressImpl` on copy).
+    bool threw = false;
+    try
+    {
+        resolver->reportLatency(fast, 1'000);
+        resolver->reportLatency(mid, 20'000);
+        resolver->reportLatency(slow, 20'000);
+        const auto & picked = resolver->pickBestZeroAlloc();
+        (void)picked;
+    }
+    catch (...)
+    {
+        threw = true;
+    }
+
+    total_memory_tracker.setHardLimit(saved_total_hard_limit);
+    thread_tracker.setHardLimit(saved_thread_hard_limit);
+    DB::CurrentThread::get().untracked_memory_limit = saved_untracked_limit;
+    CurrentMemoryTracker::setMinAllocationSizeBytesToThrow(saved_min_alloc_to_throw);
+
+    ASSERT_FALSE(threw) << "reportLatency / selectBest allocated memory under hard limit";
+
+    /// Verify that the deferred weight recomputation actually took effect and biased `selectBest`
+    /// toward `fast` (`1 ms` vs median `20 ms`).
+    size_t fast_picks = 0;
+    constexpr size_t trials = 2000;
+    for (size_t i = 0; i < trials; ++i)
+    {
+        auto entry = resolver->resolve();
+        if (*entry == "127.0.0.1")
+            ++fast_picks;
+        entry.setUnused();
+    }
+    ASSERT_GT(fast_picks, trials * 8 / 10);
 }

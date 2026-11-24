@@ -136,10 +136,11 @@ void HostResolver::reset()
 
     CurrentMetrics::sub(metrics.active_count, records.size());
     records.clear();
+    weights_dirty = false;
     has_measured_latency.store(false, std::memory_order_relaxed);
 }
 
-void HostResolver::updateWeights()
+void HostResolver::updateWeights() noexcept
 {
     updateWeightsImpl();
 
@@ -181,7 +182,7 @@ void HostResolver::setSuccess(const Poco::Net::IPAddress & address)
         updateWeights();
 }
 
-void HostResolver::reportLatency(const Poco::Net::IPAddress & address, UInt64 microseconds)
+void HostResolver::reportLatency(const Poco::Net::IPAddress & address, UInt64 microseconds) noexcept
 {
     if (microseconds == 0)
         return;
@@ -195,17 +196,12 @@ void HostResolver::reportLatency(const Poco::Net::IPAddress & address, UInt64 mi
     it->setLatency(microseconds);
     has_measured_latency.store(true, std::memory_order_relaxed);
 
-    /// A fresh latency sample shifts the EWMA, which changes the latency-biased weights even
-    /// when the base (usage) weight is unchanged, so recompute when latency-aware selection is on.
-    ///
-    /// Use `updateWeightsImpl` (the plain prefix-sum recomputation), not `updateWeights`: the latter
-    /// also runs the "all addresses banned" fallback that un-bans every record once the total weight
-    /// reaches zero. A latency sample does not change which addresses are failed, so it must not
-    /// un-ban anything. In particular `setFail` zeroes the weight of the address it just failed and
-    /// releases the lock to refresh DNS, deliberately without that fallback, so applying it here
-    /// would un-ban the failed address before the refresh can discover a healthy replacement.
+    /// Defer the O(R) median + prefix-sum recomputation to `selectBest`: pooled requests report
+    /// latency at the full S3 read rate while `resolve` runs only when opening a new connection,
+    /// and deferring also guarantees `reportLatency` neither allocates nor runs `updateWeights`
+    /// (whose all-banned fallback would un-ban addresses during `setFail`'s DNS refresh window).
     if (latency_aware_selection.load(std::memory_order_relaxed))
-        updateWeightsImpl();
+        weights_dirty = true;
 }
 
 double HostResolver::LatencySnapshot::lookupLatencyMs(const Poco::Net::IPAddress & address) const noexcept
@@ -292,9 +288,16 @@ void HostResolver::setFail(const Poco::Net::IPAddress & address)
     }
 }
 
-Poco::Net::IPAddress HostResolver::selectBest()
+const Poco::Net::IPAddress & HostResolver::selectBest()
 {
     chassert(!records.empty());
+
+    /// Apply any latency samples accumulated since the last weight recomputation. Uses
+    /// `updateWeightsImpl` (not `updateWeights`) so a concurrent `resolve` during `setFail`'s
+    /// DNS refresh window leaves `total_weight == 0` intact for the uniform fallback below
+    /// rather than prematurely clearing bans.
+    if (weights_dirty)
+        updateWeightsImpl();
 
     /// Every address can be banned at once, giving a zero total weight. This happens
     /// transiently and without holding the lock continuously: `setFail` zeroes the
@@ -403,6 +406,7 @@ void HostResolver::updateImpl(Poco::Timestamp now, std::vector<Poco::Net::IPAddr
 
     last_resolve_time = now;
     records.swap(merged);
+    measured_latencies_scratch.reserve(records.size());
 
     bool any_measured = false;
     for (const auto & rec : records)
@@ -422,7 +426,7 @@ void HostResolver::updateImpl(Poco::Timestamp now, std::vector<Poco::Net::IPAddr
 }
 
 
-size_t HostResolver::getTotalWeight() const
+size_t HostResolver::getTotalWeight() const noexcept
 {
     if (records.empty())
         return 0;
@@ -430,8 +434,10 @@ size_t HostResolver::getTotalWeight() const
 }
 
 
-void HostResolver::updateWeightsImpl()
+void HostResolver::updateWeightsImpl() noexcept
 {
+    weights_dirty = false;
+
     /// When latency-aware selection is on, compute the median latency (TTFB EWMA) across the
     /// addresses that have a measurement, and bias each address's base weight by how its own
     /// latency compares to that median. The bias is clamped and floored so that no address is
@@ -441,16 +447,17 @@ void HostResolver::updateWeightsImpl()
     const bool latency_aware = latency_aware_selection.load(std::memory_order_relaxed);
     if (latency_aware)
     {
-        std::vector<double> measured;
-        measured.reserve(records.size());
+        /// `measured_latencies_scratch` is pre-reserved to `records.size()` in `updateImpl`,
+        /// so clearing and filling it here never allocates or throws under `mutex`.
+        measured_latencies_scratch.clear();
         for (const auto & rec : records)
             if (rec.latency_ms_ewma > 0)
-                measured.push_back(rec.latency_ms_ewma);
+                measured_latencies_scratch.push_back(rec.latency_ms_ewma);
 
-        if (!measured.empty())
+        if (!measured_latencies_scratch.empty())
         {
-            auto mid = measured.begin() + measured.size() / 2;
-            std::nth_element(measured.begin(), mid, measured.end());
+            auto mid = measured_latencies_scratch.begin() + measured_latencies_scratch.size() / 2;
+            std::nth_element(measured_latencies_scratch.begin(), mid, measured_latencies_scratch.end());
             median_latency_ms = *mid;
         }
     }

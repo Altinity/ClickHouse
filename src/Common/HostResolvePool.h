@@ -14,6 +14,7 @@
 #include <functional>
 #include <mutex>
 #include <memory>
+#include <vector>
 
 // That class resolves host into multiply addresses
 // Features:
@@ -105,7 +106,7 @@ public:
     private:
         friend class HostResolver;
 
-        Entry(HostResolver & pool_, Poco::Net::IPAddress address_)
+        Entry(HostResolver & pool_, const Poco::Net::IPAddress & address_)
             : pool(pool_.getWeakFromThis())
             , address(address_)
             , resolved_host(address.toString())
@@ -130,8 +131,10 @@ public:
 
     /// Report a measured request latency (microseconds, typically time-to-first-byte) for an
     /// address. Feeds the per-address latency EWMA used by latency-aware selection. Cheap no-op
-    /// when the address is unknown; only recomputes weights when latency-aware selection is on.
-    void reportLatency(const Poco::Net::IPAddress & address, UInt64 microseconds);
+    /// when the address is unknown; marks weights dirty so `selectBest` recomputes them lazily on
+    /// the next `resolve`. Never allocates or throws, so it is safe to call after an HTTP response
+    /// has already been received.
+    void reportLatency(const Poco::Net::IPAddress & address, UInt64 microseconds) noexcept;
 
     /// Consistent point-in-time snapshot of per-address latency EWMAs, captured under a single
     /// `mutex` acquisition before `EndpointConnectionPool` takes its own lock. Keeps the resolver
@@ -272,14 +275,14 @@ protected:
 
     using Records = std::vector<Record>;
 
-    Poco::Net::IPAddress selectBest() TSA_REQUIRES(mutex);
+    const Poco::Net::IPAddress & selectBest() TSA_REQUIRES(mutex);
     Records::iterator find(const Poco::Net::IPAddress & address) TSA_REQUIRES(mutex);
     bool isUpdateNeeded();
 
     void updateImpl(Poco::Timestamp now, std::vector<Poco::Net::IPAddress> & next_gen) TSA_REQUIRES(mutex);
-    void updateWeights() TSA_REQUIRES(mutex);
-    void updateWeightsImpl() TSA_REQUIRES(mutex);
-    size_t getTotalWeight() const TSA_REQUIRES(mutex);
+    void updateWeights() noexcept TSA_REQUIRES(mutex);
+    void updateWeightsImpl() noexcept TSA_REQUIRES(mutex);
+    size_t getTotalWeight() const noexcept TSA_REQUIRES(mutex);
     Poco::Timespan getRecordHistoryTime(const Record&) const;
 
     const String host;
@@ -294,6 +297,12 @@ protected:
 
     Poco::Timestamp last_resolve_time TSA_GUARDED_BY(mutex) = Poco::Timestamp::TIMEVAL_MIN;
     Records records TSA_GUARDED_BY(mutex);
+    /// Scratch buffer pre-reserved to `records.size()` during `updateImpl` so `updateWeightsImpl`
+    /// never heap-allocates or throws under `mutex`.
+    std::vector<double> measured_latencies_scratch TSA_GUARDED_BY(mutex);
+    /// Set by `reportLatency` instead of recomputing weights on every sample; cleared whenever
+    /// `updateWeightsImpl` runs (lazily in `selectBest`, or eagerly on `update`/`setFail`/`setSuccess`).
+    bool weights_dirty TSA_GUARDED_BY(mutex) = false;
 
     /// True once at least one record in `records` has `latency_ms_ewma > 0`. Reset in `reset()`
     /// and refreshed on `updateImpl` (an expired address may have held the only measurement).
