@@ -583,7 +583,19 @@ HostResolver::Ptr HostResolversPool::getResolver(const String & host)
     /// Another thread is already resolving this host: wait for its outcome (a resolver, or the
     /// exception of its failed lookup) instead of running the same DNS lookup again.
     if (!pending)
-        return in_flight.get();
+    {
+        try
+        {
+            return in_flight.get();
+        }
+        catch (...)
+        {
+            /// All waiters of one lookup get the same stored exception. Give each waiter its own
+            /// copy so a caller that mutates its exception (e.g. `addMessage`) does not race with
+            /// the others.
+            std::rethrow_exception(copyMutableException(std::current_exception()));
+        }
+    }
 
     /// Construct the resolver outside `mutex`: `HostResolver::create` runs the initial DNS lookup,
     /// and holding `mutex` across network I/O would block `tryGetResolver` and `getResolver` for
@@ -603,8 +615,9 @@ HostResolver::Ptr HostResolversPool::getResolver(const String & host)
             std::lock_guard lock(mutex);
             pending_resolvers.erase(host);
         }
-        /// Rethrown to every waiter and to this caller; nothing is retried or substituted here.
-        pending->promise.set_exception(std::current_exception());
+        /// Store an immutable copy as the template for the waiters so this caller can mutate its
+        /// own exception up the stack without racing with `copyMutableException` in a waiter.
+        pending->promise.set_exception(copyMutableException(std::current_exception()));
         throw;
     }
 

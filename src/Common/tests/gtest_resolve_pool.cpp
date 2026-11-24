@@ -1501,8 +1501,9 @@ TEST_F(ResolvePoolTest, ConcurrentGetResolverForColdHostSharesFailedLookup)
 
     /// Declared before the guard below: on a failed assertion the guard must release the blocked
     /// lookup before the futures are destroyed (their destructors wait for the threads).
-    std::future<DB::HostResolver::Ptr> first;
-    std::future<DB::HostResolver::Ptr> second;
+    std::future<String> first;
+    std::future<String> second;
+    std::future<String> third;
 
     SCOPE_EXIT({
         if (!released)
@@ -1526,17 +1527,40 @@ TEST_F(ResolvePoolTest, ConcurrentGetResolverForColdHostSharesFailedLookup)
                 [](const String &) -> std::vector<Poco::Net::IPAddress> { return {Poco::Net::IPAddress("127.0.0.1")}; });
         });
 
-    first = std::async(std::launch::async, [&] { return DB::HostResolversPool::instance().getResolver(host); });
+    /// Each caller catches `DB::NetException &` and appends its own context via `addMessage`, just
+    /// like `ReadBufferFromS3` and `copyS3File` do. Every caller (the leader and each waiter) must
+    /// receive its own exception object so one caller's `addMessage` cannot leak into or race with
+    /// another's.
+    auto call_and_annotate = [&](const String & caller_tag) -> String
+    {
+        try
+        {
+            [[maybe_unused]] auto resolver = DB::HostResolversPool::instance().getResolver(host);
+            return "DID_NOT_THROW";
+        }
+        catch (DB::NetException & e)
+        {
+            String before = e.message();
+            e.addMessage(caller_tag);
+            return before;
+        }
+    };
+
+    first = std::async(std::launch::async, [&] { return call_and_annotate("context=leader"); });
     ASSERT_EQ(std::future_status::ready, first_entered_future.wait_for(5s));
 
-    second = std::async(std::launch::async, [&] { return DB::HostResolversPool::instance().getResolver(host); });
+    second = std::async(std::launch::async, [&] { return call_and_annotate("context=waiter1"); });
+    third = std::async(std::launch::async, [&] { return call_and_annotate("context=waiter2"); });
     ASSERT_EQ(std::future_status::timeout, second.wait_for(300ms));
+    ASSERT_EQ(std::future_status::timeout, third.wait_for(50ms));
 
     allow_finish.set_value();
     released = true;
 
-    EXPECT_THROW({ [[maybe_unused]] auto resolver = first.get(); }, DB::NetException);
-    EXPECT_THROW({ [[maybe_unused]] auto resolver = second.get(); }, DB::NetException);
+    const String expected_message = "no endpoints resolved for host " + host;
+    EXPECT_EQ(expected_message, first.get());
+    EXPECT_EQ(expected_message, second.get());
+    EXPECT_EQ(expected_message, third.get());
     ASSERT_EQ(size_t(1), factory_calls.load());
 
     /// The failed attempt left nothing behind: the next call runs its own lookup and succeeds.
