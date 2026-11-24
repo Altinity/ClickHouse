@@ -1099,15 +1099,16 @@ def test_optimize_manifest_commit_state_unknown(started_cluster):
     assert node.query(f"SELECT symbol, bid, ask FROM {table_ref} ORDER BY ALL") == rows_before
 
 
-def test_optimize_manifest_catalog_conflict_cleans_up(started_cluster):
-    """When the catalog update really does not apply, the compaction removes its files and retries.
+def test_optimize_manifest_catalog_rejection_retries(started_cluster):
+    """When the catalog rejects the update without applying it, the compaction retries and commits once.
 
+    A rejection may also mean an unknown outcome, so the files of the rejected attempt are left in place.
     https://github.com/Altinity/ClickHouse/issues/2416
     """
     node = started_cluster.instances["node1"]
     num_inserts = 5
     catalog, table_identifier, table_ref = _create_table_for_manifest_compaction(
-        started_cluster, node, f"test_optimize_manifest_conflict_{uuid.uuid4()}", num_inserts
+        started_cluster, node, f"test_optimize_manifest_rejection_{uuid.uuid4()}", num_inserts
     )
 
     metadata_before = catalog.load_table(table_identifier).metadata
@@ -1115,30 +1116,52 @@ def test_optimize_manifest_catalog_conflict_cleans_up(started_cluster):
 
     _optimize_manifest_with_failpoint(node, table_ref, "iceberg_catalog_update_metadata_fail")
 
-    table = catalog.load_table(table_identifier)
-    metadata_after = table.metadata
+    metadata_after = catalog.load_table(table_identifier).metadata
     assert metadata_after.current_snapshot_id != metadata_before.current_snapshot_id
     assert len(metadata_after.snapshots) == len(metadata_before.snapshots) + 1
 
     _check_current_snapshot_files_exist(started_cluster, catalog, table_identifier, num_inserts)
 
-    # The rejected attempt's manifests and manifest list are not referenced by any snapshot, so they must be gone.
-    minio_client = started_cluster.minio_client
-    referenced = set()
-    for snapshot in metadata_after.snapshots:
-        referenced.add(_split_object_path(snapshot.manifest_list)[1])
-        for record in _read_avro_records(minio_client, snapshot.manifest_list):
-            referenced.add(_split_object_path(record["manifest_path"])[1])
+    node.query("SYSTEM DROP ICEBERG METADATA CACHE")
+    assert node.query(f"SELECT symbol, bid, ask FROM {table_ref} ORDER BY ALL") == rows_before
 
-    bucket, table_prefix = _split_object_path(table.location())
-    metadata_prefix = table_prefix.rstrip("/") + "/metadata/"
-    avro_objects = {
-        o.object_name
-        for o in minio_client.list_objects(bucket, prefix=metadata_prefix, recursive=True)
-        if o.object_name.endswith(".avro")
-    }
-    orphans = avro_objects - referenced
-    assert not orphans, f"rejected compaction attempt left files behind: {sorted(orphans)}"
+
+def test_optimize_manifest_catalog_throws_after_apply(started_cluster):
+    """`OPTIMIZE TABLE ... MANIFEST` must not delete the files of a snapshot the catalog applied before an error.
+
+    The failpoint makes the REST catalog apply the update and then throw, as for a lost response.
+    https://github.com/Altinity/ClickHouse/issues/2416
+    """
+    node = started_cluster.instances["node1"]
+    num_inserts = 5
+    catalog, table_identifier, table_ref = _create_table_for_manifest_compaction(
+        started_cluster, node, f"test_optimize_manifest_throw_{uuid.uuid4()}", num_inserts
+    )
+
+    metadata_before = catalog.load_table(table_identifier).metadata
+    rows_before = node.query(f"SELECT symbol, bid, ask FROM {table_ref} ORDER BY ALL")
+
+    failpoint = "iceberg_catalog_update_metadata_throw_after_apply"
+    node.query(f"SYSTEM ENABLE FAILPOINT {failpoint}")
+    try:
+        error = node.query_and_get_error(
+            f"OPTIMIZE TABLE {table_ref} MANIFEST",
+            settings={
+                "allow_experimental_iceberg_compaction": 1,
+                "iceberg_manifest_min_count_to_compact": 2,
+                "allow_insert_into_iceberg": 1,
+                "write_full_path_in_iceberg_metadata": 1,
+            },
+        )
+    finally:
+        node.query(f"SYSTEM DISABLE FAILPOINT {failpoint}")
+    assert "Injected failure after the catalog applied the update" in error, error
+
+    metadata_after = catalog.load_table(table_identifier).metadata
+    assert metadata_after.current_snapshot_id != metadata_before.current_snapshot_id
+    assert len(metadata_after.snapshots) == len(metadata_before.snapshots) + 1
+
+    _check_current_snapshot_files_exist(started_cluster, catalog, table_identifier, num_inserts)
 
     node.query("SYSTEM DROP ICEBERG METADATA CACHE")
     assert node.query(f"SELECT symbol, bid, ask FROM {table_ref} ORDER BY ALL") == rows_before

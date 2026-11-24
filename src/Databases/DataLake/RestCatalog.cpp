@@ -96,6 +96,7 @@ namespace DB::FailPoints
     extern const char iceberg_alter_catalog_commit_reported_as_failed[];
     extern const char iceberg_catalog_update_metadata_fail[];
     extern const char iceberg_catalog_update_metadata_reported_as_failed[];
+    extern const char iceberg_catalog_update_metadata_throw_after_apply[];
 }
 
 namespace ProfileEvents
@@ -2800,6 +2801,15 @@ bool RestCatalog::updateMetadata(const String & namespace_name, const String & t
     /// Simulates the Iceberg "commit state unknown" case: the catalog applied the update but the
     /// client observes a failure, e.g. because a proxy turned the response into a 5xx.
     fiu_do_on(DB::FailPoints::iceberg_catalog_update_metadata_reported_as_failed, { return false; });
+
+    /// Simulates a transport error after the catalog applied the update, e.g. a lost response.
+    fiu_do_on(DB::FailPoints::iceberg_catalog_update_metadata_throw_after_apply,
+    {
+        throw DB::Exception(
+            DB::ErrorCodes::DATALAKE_DATABASE_ERROR,
+            "Injected failure after the catalog applied the update of table {}.{}",
+            namespace_name, table_name);
+    });
 
     return true;
 }

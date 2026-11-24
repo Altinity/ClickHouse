@@ -44,7 +44,6 @@
 namespace DB::ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
-    extern const int DATALAKE_DATABASE_ERROR;
     extern const int LOGICAL_ERROR;
     extern const int CANNOT_UNLINK;
     extern const int ICEBERG_SPECIFICATION_VIOLATION;
@@ -491,53 +490,6 @@ static void writeDataFiles(
     }
 }
 
-/// Whether the table metadata that `catalog` currently points to contains a snapshot with `snapshot_id`.
-/// Used to resolve the "commit state unknown" case, where the catalog may have applied an update
-/// although the client observed a failure (e.g. a proxy turning the response into a 5xx).
-/// Throws if the catalog or the metadata file cannot be read, so that the caller never treats
-/// an unknown state as "not committed".
-static bool isSnapshotInCatalogMetadata(
-    const std::shared_ptr<DataLake::ICatalog> & catalog,
-    const StorageID & table_id,
-    Int64 snapshot_id,
-    const PersistentTableComponents & persistent_table_components,
-    const DataLakeStorageSettings & data_lake_settings,
-    ObjectStoragePtr object_storage,
-    ContextPtr context,
-    LoggerPtr log)
-{
-    const auto metadata_file_info = getLatestMetadataFileAndVersionWithCatalog(
-        object_storage,
-        catalog,
-        table_id.getTableName(),
-        persistent_table_components.table_path,
-        data_lake_settings,
-        persistent_table_components.metadata_cache,
-        context,
-        log.get(),
-        persistent_table_components.table_uuid,
-        persistent_table_components.metadata_compression_method);
-    auto metadata_object = getMetadataJSONObject(
-        metadata_file_info.path,
-        object_storage,
-        persistent_table_components.metadata_cache,
-        context,
-        log,
-        metadata_file_info.compression_method,
-        persistent_table_components.table_uuid);
-
-    if (!metadata_object->has(Iceberg::f_snapshots))
-        return false;
-
-    auto snapshots = metadata_object->get(Iceberg::f_snapshots).extract<Poco::JSON::Array::Ptr>();
-    for (size_t i = 0; i < snapshots->size(); ++i)
-    {
-        if (snapshots->getObject(static_cast<UInt32>(i))->getValue<Int64>(Iceberg::f_metadata_snapshot_id) == snapshot_id)
-            return true;
-    }
-    return false;
-}
-
 static bool writeConsolidatedManifestFile(
     int metadata_version,
     const String & metadata_file_path,
@@ -550,6 +502,7 @@ static bool writeConsolidatedManifestFile(
     const DataLakeStorageSettings & data_lake_settings,
     std::shared_ptr<DataLake::ICatalog> catalog,
     const StorageID & table_id,
+    const String & raw_catalog_metadata_location,
     ExternalStorageCache & external_storages)
 {
     auto log = getLogger("IcebergManifestConsolidation");
@@ -1071,68 +1024,31 @@ static bool writeConsolidatedManifestFile(
                 return false;
             }
 
-            /// The metadata file and version hint in storage now name the new snapshot.
-            if (!catalog_writes_metadata_file)
-                published = true;
+            /// From here on the new snapshot may be live: through the metadata file and version hint in storage,
+            /// or through a catalog request that may have landed even if it is reported as failed.
+            published = true;
 
             /// Advance the catalog pointer to the new metadata so catalog-based readers see the compacted snapshot.
+            /// `updateMetadataIfCurrent` applies the update only if the catalog still points at the base:
+            /// REST through the update requirements, Glue by comparing the location and sending `UpdateTable`
+            /// with the `VersionId` of that same read.
             if (catalog)
             {
                 auto catalog_filename = path_resolver.resolveForCatalog(generated_metadata_info.path);
                 const auto & [namespace_name, table_name] = DataLake::parseTableName(table_id.getTableName());
-
-                if (!catalog_writes_metadata_file)
+                if (!catalog->updateMetadataIfCurrent(
+                        namespace_name, table_name, catalog_filename, new_snapshot.snapshot, raw_catalog_metadata_location,
+                        context->getForwardedAuthToken()))
                 {
-                    /// The snapshot is already visible through storage, so a failed catalog update cannot be
-                    /// undone by deleting files. Retrying is not correct either: the retry would read the
-                    /// compacted metadata, find nothing to do and report success while the catalog pointer
-                    /// still names the previous metadata. Keep the files and report the error.
-                    if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot.snapshot, context->getForwardedAuthToken()))
-                        throw Exception(
-                            ErrorCodes::DATALAKE_DATABASE_ERROR,
-                            "Compacted Iceberg metadata {} of table {}.{} was committed to storage, but the catalog "
-                            "rejected the update of the table pointer. The table in storage is consistent; "
-                            "the catalog still names the previous metadata",
-                            catalog_filename, namespace_name, table_name);
-                }
-                else
-                {
-                    bool updated = false;
-                    std::exception_ptr update_exception;
-                    try
-                    {
-                        updated = catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot.snapshot, context->getForwardedAuthToken());
-                    }
-                    catch (...)
-                    {
-                        update_exception = std::current_exception();
-                    }
-
-                    if (!updated)
-                    {
-                        /// Commit state unknown: the catalog may have applied the update although the client
-                        /// saw a failure. Until the catalog proves otherwise, the new files may be live, so
-                        /// keep them even if the check below throws.
-                        published = true;
-                        const Int64 new_snapshot_id = new_snapshot.snapshot->getValue<Int64>(Iceberg::f_metadata_snapshot_id);
-                        if (isSnapshotInCatalogMetadata(
-                                catalog, table_id, new_snapshot_id, persistent_table_components, data_lake_settings, object_storage, context, log))
-                        {
-                            LOG_INFO(log, "Catalog update for snapshot {} was reported as failed, but the catalog has applied it", new_snapshot_id);
-                        }
-                        else
-                        {
-                            /// The update did not land: the new files are not referenced by any snapshot.
-                            published = false;
-                            if (update_exception)
-                                std::rethrow_exception(update_exception);
-
-                            LOG_INFO(log, "Metadata commit conflict detected via catalog, cleaning up temporary files");
-                            cleanup();
-                            return false;
-                        }
-                    }
-                    published = true;
+                    /// A catalog reports both a lost race and a request whose outcome is unknown (a timeout or
+                    /// a 5xx response) as a rejection, so the snapshot may still be live: the files stay.
+                    /// The retry reads the current metadata from the catalog: if this commit landed, there is
+                    /// nothing left to compact, otherwise it compacts again on top of the current snapshot.
+                    LOG_WARNING(
+                        log,
+                        "Catalog did not accept manifest compaction snapshot {}; files written by this attempt were left in place",
+                        new_snapshot.snapshot->getValue<Int64>(Iceberg::f_metadata_snapshot_id));
+                    return false;
                 }
             }
         }
@@ -1652,26 +1568,10 @@ void compactIcebergManifests(
 
         /// With a catalog, the catalog names the current metadata file. Listing the storage instead may pick the
         /// metadata of another table that shares the location, or miss a commit that is visible only in the catalog.
-        const auto [metadata_version, metadata_file_path, _] = getLatestMetadataFileAndVersionWithCatalog(
-            object_storage_,
-            catalog,
-            table_id.getTableName(),
-            persistent_table_components.table_path,
-            data_lake_settings,
-            persistent_table_components.metadata_cache,
-            context_,
-            log.get(),
-            persistent_table_components.table_uuid,
-            persistent_table_components.metadata_compression_method);
-
-        auto metadata_object = deepCopy(getMetadataJSONObject(
-            metadata_file_path,
-            object_storage_,
-            persistent_table_components.metadata_cache,
-            context_,
-            log,
-            persistent_table_components.metadata_compression_method,
-            persistent_table_components.table_uuid));
+        /// The new version is above every file in the directory, so a file left by an attempt whose catalog
+        /// update was rejected does not make every later attempt collide with it.
+        const auto [metadata_version, metadata_object, catalog_metadata_location, raw_catalog_metadata_location, metadata_file_path]
+            = readLatestMetadata(persistent_table_components, object_storage_, data_lake_settings, context_, catalog, table_id, log);
 
         /// Validate the format version on the freshly-fetched metadata (before the threshold early-return), since the table may have been upgraded to v3 by another writer after this table object was created.
         const Int32 format_version = metadata_object->getValue<Int32>(Iceberg::f_format_version);
@@ -1707,6 +1607,7 @@ void compactIcebergManifests(
                 data_lake_settings,
                 catalog,
                 table_id,
+                raw_catalog_metadata_location,
                 external_storages))
         {
             // Invalidate metadata cache so the next reader picks up the new state

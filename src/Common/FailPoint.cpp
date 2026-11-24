@@ -262,6 +262,7 @@ static struct InitFiu
     ONCE(iceberg_alter_catalog_commit_reported_as_failed) \
     ONCE(iceberg_catalog_update_metadata_fail) \
     ONCE(iceberg_catalog_update_metadata_reported_as_failed) \
+    ONCE(iceberg_catalog_update_metadata_throw_after_apply) \
     ONCE(iceberg_glue_update_table_fail) \
     PAUSEABLE_ONCE(iceberg_metadata_prefetch_pause) \
     REGULAR(storage_cluster_read_sleep) \

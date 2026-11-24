@@ -1270,7 +1270,7 @@ bool GlueCatalog::updateTableInGlue(
 
     request.SetTableInput(table_input);
 
-    /// Simulates Glue rejecting the update, e.g. because of a `VersionId` mismatch with a concurrent commit.
+    /// Simulates Glue rejecting the update with `CONCURRENT_MODIFICATION` or `VERSION_MISMATCH`, without applying it.
     fiu_do_on(DB::FailPoints::iceberg_glue_update_table_fail, { return false; });
 
     /// Optimistic concurrency: when a VersionId is supplied, Glue rejects the
