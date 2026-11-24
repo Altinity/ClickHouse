@@ -76,6 +76,7 @@ namespace ErrorCodes
     extern const int SUPPORT_IS_DISABLED;
     extern const int TYPE_MISMATCH;
     extern const int CANNOT_CONVERT_TYPE;
+    extern const int CANNOT_INSERT_NULL_IN_ORDINARY_COLUMN;
     extern const int ILLEGAL_TYPE_OF_ARGUMENT;
     extern const int ILLEGAL_COLUMN;
     extern const int NUMBER_OF_COLUMNS_DOESNT_MATCH;
@@ -135,6 +136,7 @@ namespace ExportPartitionUtils
             ErrorCodes::BAD_ARGUMENTS,
             ErrorCodes::TYPE_MISMATCH,
             ErrorCodes::CANNOT_CONVERT_TYPE,
+            ErrorCodes::CANNOT_INSERT_NULL_IN_ORDINARY_COLUMN,
             ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
             ErrorCodes::ILLEGAL_COLUMN,
             ErrorCodes::NUMBER_OF_COLUMNS_DOESNT_MATCH,
@@ -282,6 +284,7 @@ namespace ExportPartitionUtils
         context_copy->setSetting(
             "export_merge_tree_part_ignore_extra_source_columns",
             manifest.ignore_extra_source_columns.value_or(false));
+        context_copy->setSetting("export_merge_tree_part_check_destination_schema_unchanged", manifest.check_destination_schema_unchanged.value_or(true));
 
         context_copy->setSetting("max_threads", manifest.max_threads);
         context_copy->setSetting("export_merge_tree_part_file_already_exists_policy", String(magic_enum::enum_name(manifest.file_already_exists_policy)));

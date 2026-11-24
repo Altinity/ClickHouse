@@ -52,6 +52,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         });
         addSettingsChanges(settings_changes_history, "26.8.34.20001.altinityantalya",
         {
+            {"export_merge_tree_part_check_destination_schema_unchanged", false, true, "New setting to skip the check, done before each part export task, that the Iceberg destination schema and partition spec did not change since the export was scheduled."},
             {"export_merge_tree_part_allow_lossy_cast", false, false, "The setting is obsolete. `EXPORT PART` and `EXPORT PARTITION` cast values the way `INSERT ... SELECT` does."},
             {"input_format_parquet_detect_variant_by_structure", false, true, "New setting to read Spark variant columns, which have no `VARIANT` logical type, as `Dynamic` instead of `Tuple`"},
             {"use_iceberg_manifest_list_partition_pruning", false, true, "New setting to skip Iceberg manifest files whose manifest-list partition summaries cannot match the query filter, without reading them."},

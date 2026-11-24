@@ -200,6 +200,35 @@ def test_export_partition_retryable_error_killed_on_timeout(cluster, source_engi
     assert count == 0, f"Expected 0 rows in Iceberg table after a killed export, got {count}"
 
 
+def test_export_partition_null_into_required_column_fails_without_retry(cluster, source_engine):
+    """
+    A NULL exported into a required Iceberg field is a deterministic data error: the cast to the non-nullable
+    destination type throws CANNOT_INSERT_NULL_IN_ORDINARY_COLUMN on every attempt. It must be classified as
+    non-retryable, so the task goes to FAILED right away instead of being retried until the task timeout, which
+    is left at its large default.
+    """
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_null_required_{uid}"
+    iceberg_table = f"iceberg_null_required_{uid}"
+
+    make_source(node, mt_table, "id Nullable(Int32), year Int32", "year", replica_name="replica1", engine=source_engine)
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (NULL, 2020)")
+
+    # `id Int32` is created as a required Iceberg field.
+    make_iceberg_s3(node, iceberg_table, "id Int32, year Int32", partition_by="year")
+
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+
+    wait_for_export_status(node, mt_table, iceberg_table, "2020", "FAILED", timeout=60)
+
+    assert int(node.query(f"SELECT count() FROM {iceberg_table}").strip()) == 0
+
+
 def test_export_partition_retryable_error_recovers_after_failpoint_cleared(cluster, source_engine):
     """
     A retryable part-export error must keep the task PENDING (not FAILED) while the

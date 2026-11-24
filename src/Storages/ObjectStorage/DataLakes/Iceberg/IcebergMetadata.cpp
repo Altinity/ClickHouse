@@ -2811,10 +2811,44 @@ Poco::JSON::Object::Ptr IcebergMetadata::getMetadataJSON(ContextPtr local_contex
         persistent_components.table_uuid);
 }
 
+std::shared_ptr<const IcebergMetadata::ExportDestinationInfo>
+IcebergMetadata::getExportDestinationInfo(const std::string & iceberg_metadata_json_string, ContextPtr context) const
+{
+    {
+        std::lock_guard lock(export_destination_cache_mutex);
+        for (const auto & [cached_json, cached_info] : export_destination_cache)
+            if (cached_json == iceberg_metadata_json_string)
+                return cached_info;
+    }
+
+    Poco::JSON::Parser parser; /// For some reason base/base/JSON.h can not parse this json file
+    const auto metadata_json = parser.parse(iceberg_metadata_json_string).extract<Poco::JSON::Object::Ptr>();
+
+    auto info = std::make_shared<ExportDestinationInfo>();
+    info->schema_id = metadata_json->getValue<Int64>(Iceberg::f_current_schema_id);
+    info->spec_id = metadata_json->getValue<Int64>(Iceberg::f_default_spec_id);
+
+    /// A scratch processor: the live one of the table is not touched. It derives the columns the way a reader does, for
+    /// example `int` is `Int32` and `long` is `Int64`. The table already exists with these types, so geometry and
+    /// geography are accepted without `allow_experimental_geo_types_in_iceberg`, which a replica may not have set.
+    IcebergSchemaProcessor schema_processor(context, /* allow_geo_parser_ */ true);
+    schema_processor.addIcebergTableSchema(lookupSchema(metadata_json, info->schema_id), context);
+    info->columns = *schema_processor.getClickHouseTableSchemaById(static_cast<Int32>(info->schema_id));
+
+    std::lock_guard lock(export_destination_cache_mutex);
+    for (const auto & [cached_json, cached_info] : export_destination_cache)
+        if (cached_json == iceberg_metadata_json_string)
+            return cached_info;
+
+    if (export_destination_cache.size() >= export_destination_cache_capacity)
+        export_destination_cache.erase(export_destination_cache.begin());
+    export_destination_cache.emplace_back(iceberg_metadata_json_string, info);
+    return info;
+}
+
 void IcebergMetadata::checkExportDestinationUnchanged(const std::string & iceberg_metadata_json_string, ContextPtr context) const
 {
-    Poco::JSON::Parser parser; /// For some reason base/base/JSON.h can not parse this json file
-    const auto pinned_metadata = parser.parse(iceberg_metadata_json_string).extract<Poco::JSON::Object::Ptr>();
+    const auto pinned = getExportDestinationInfo(iceberg_metadata_json_string, context);
 
     /// The latest metadata is always read, like the commit does, not the one a query may have cached.
     const auto latest_metadata_file = getLatestOrExplicitMetadataFileAndVersion(
@@ -2836,7 +2870,7 @@ void IcebergMetadata::checkExportDestinationUnchanged(const std::string & iceber
         latest_metadata_file.compression_method,
         persistent_components.table_uuid);
 
-    const auto pinned_schema_id = pinned_metadata->getValue<Int64>(Iceberg::f_current_schema_id);
+    const auto pinned_schema_id = pinned->schema_id;
     const auto latest_schema_id = latest_metadata->getValue<Int64>(Iceberg::f_current_schema_id);
     if (latest_schema_id != pinned_schema_id)
         throw Exception(ErrorCodes::METADATA_MISMATCH,
@@ -2844,7 +2878,7 @@ void IcebergMetadata::checkExportDestinationUnchanged(const std::string & iceber
             "Restart the export operation.",
             pinned_schema_id, latest_schema_id);
 
-    const auto pinned_spec_id = pinned_metadata->getValue<Int64>(Iceberg::f_default_spec_id);
+    const auto pinned_spec_id = pinned->spec_id;
     const auto latest_spec_id = latest_metadata->getValue<Int64>(Iceberg::f_default_spec_id);
     if (latest_spec_id != pinned_spec_id)
         throw Exception(ErrorCodes::METADATA_MISMATCH,
@@ -2855,18 +2889,7 @@ void IcebergMetadata::checkExportDestinationUnchanged(const std::string & iceber
 
 NamesAndTypesList IcebergMetadata::getExportDestinationColumns(const std::string & iceberg_metadata_json_string, ContextPtr context) const
 {
-    Poco::JSON::Parser parser; /// For some reason base/base/JSON.h can not parse this json file
-    const auto metadata_json = parser.parse(iceberg_metadata_json_string).extract<Poco::JSON::Object::Ptr>();
-
-    const auto schema_id = metadata_json->getValue<Int64>(Iceberg::f_current_schema_id);
-    const auto schema = lookupSchema(metadata_json, schema_id);
-
-    /// A scratch processor: the live one of the table is not touched. It derives the columns the way a reader does, for
-    /// example `int` is `Int32` and `long` is `Int64`. The table already exists with these types, so geometry and
-    /// geography are accepted without `allow_experimental_geo_types_in_iceberg`, which a replica may not have set.
-    IcebergSchemaProcessor schema_processor(context, /* allow_geo_parser_ */ true);
-    schema_processor.addIcebergTableSchema(schema, context);
-    return *schema_processor.getClickHouseTableSchemaById(static_cast<Int32>(schema_id));
+    return getExportDestinationInfo(iceberg_metadata_json_string, context)->columns;
 }
 
 }

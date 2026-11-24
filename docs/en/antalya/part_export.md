@@ -147,6 +147,16 @@ In case a table function is used as the destination, the schema can be omitted a
   Extra source columns are still read and evaluated (including `MATERIALIZED`/`ALIAS` columns, and any column another kept column's `ALIAS`/`MATERIALIZED` expression depends on) before being dropped, so this setting only changes which columns end up in the destination, not what is computed while reading the part. Type conversion is applied after columns are matched.
 
 
+### `export_merge_tree_part_check_destination_schema_unchanged` (Optional)
+
+- **Type**: `Bool`
+- **Default**: `true`
+- **Description**: Controls whether each part export task, before it reads or writes anything, checks that the schema and the partition spec of an Apache Iceberg destination are still the ones the export was scheduled against.
+  - `true` (default) - the task reads the latest metadata of the destination and fails with `METADATA_MISMATCH` if the schema or the partition spec changed. This costs one forced metadata listing and read per part.
+  - `false` - the check is skipped. A change of the destination schema or partition spec is then noticed only by the commit, after the data files were written, which are left behind.
+
+  The destination column types of an export always come from the table metadata saved when the export was scheduled, whatever this setting is.
+
 ## Examples
 
 ### Basic Export to S3

@@ -70,6 +70,7 @@ namespace Setting
     extern const SettingsString export_merge_tree_part_filename_pattern;
     extern const SettingsMergeTreePartExportSchemaMatchMode export_merge_tree_part_schema_match_mode;
     extern const SettingsBool export_merge_tree_part_ignore_extra_source_columns;
+    extern const SettingsBool export_merge_tree_part_check_destination_schema_unchanged;
 }
 
 namespace
@@ -128,7 +129,8 @@ namespace
         /// The destination types come from the table metadata the export was validated against, so a destination whose
         /// schema changed since then is not noticed by the cast below. Fail now, before anything is read or written,
         /// instead of at the commit.
-        destination_storage.checkExportDestinationUnchanged(iceberg_metadata_json, local_context);
+        if (local_context->getSettingsRef()[Setting::export_merge_tree_part_check_destination_schema_unchanged])
+            destination_storage.checkExportDestinationUnchanged(iceberg_metadata_json, local_context);
 
         /// The destination types come from the destination metadata that the export was validated against, which the
         /// manifest carries, so every replica casts to the types the scheduling node validated.

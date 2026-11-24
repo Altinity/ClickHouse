@@ -8909,6 +8909,13 @@ Controls whether `EXPORT PART`/`EXPORT PARTITION` tolerates source `MergeTree` c
 
 Extra source columns are still read and evaluated (including `MATERIALIZED`/`ALIAS` columns, and any column another kept column's `ALIAS`/`MATERIALIZED` expression depends on) before being dropped, so this setting only changes which columns end up in the destination, not what is computed while reading the part.
 )", 0) \
+    DECLARE(Bool, export_merge_tree_part_check_destination_schema_unchanged, true, R"(
+Controls whether each part export task of `EXPORT PART`/`EXPORT PARTITION` to an Apache Iceberg table first checks that the destination's schema and partition spec are still the ones the export was scheduled against.
+- `true` (default) - the task reads the latest metadata of the destination table and fails with `METADATA_MISMATCH` before reading or writing anything if the schema or the partition spec changed. This costs one forced metadata listing and read per part.
+- `false` - the check is skipped. A change of the destination schema or partition spec is then noticed only by the commit, after the data files were written, and the files are left behind.
+
+The destination column types of an export always come from the table metadata saved when the export was scheduled, whatever this setting is.
+)", 0) \
     \
     /* ####################################################### */ \
     /* AI function settings */ \
