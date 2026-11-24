@@ -1020,3 +1020,46 @@ TEST_F(ResolvePoolTest, ColdHostResolveDoesNotBlockHotResolverLookups)
     ASSERT_EQ(std::future_status::ready, status);
     ASSERT_NE(nullptr, DB::HostResolversPool::instance().tryGetResolver(cold_host));
 }
+
+TEST_F(ResolvePoolTest, LatencyReportDoesNotUnbanAddressDuringFailRefresh)
+{
+    /// Regression: `setFail` zeroes the failed address's weight with `updateWeightsImpl` and then
+    /// releases the lock to refresh DNS. It deliberately does not run the "all addresses banned"
+    /// fallback (`updateWeights`) before the refresh, because that would un-ban the address it
+    /// just failed even if the refresh discovers a healthy one. A latency report that lands in that
+    /// window must not apply the fallback either.
+    ///
+    /// `update` calls `resolve_function` without the lock, exactly in that window, so reporting
+    /// latency from inside `resolve_function` reproduces the interleaving deterministically.
+    LatencyAwareSelectionScope scope(true);
+
+    const Poco::Net::IPAddress ip("127.0.0.1");
+    const std::vector<Poco::Net::IPAddress> current{ip};
+    DB::HostResolver * resolver_raw = nullptr;
+    bool report_in_refresh = false;
+    std::optional<Int64> banned_during_refresh;
+
+    auto resolve_func = [&](const String &)
+    {
+        if (report_in_refresh)
+        {
+            report_in_refresh = false;
+            resolver_raw->reportLatency(ip, 5000);
+            banned_during_refresh = CurrentMetrics::get(metrics.banned_count);
+        }
+        return current;
+    };
+
+    /// Large history so the ban does not expire and no background refresh fires.
+    auto resolver = std::make_shared<ResolvePoolMock>("some_host", Poco::Timespan(10 * 1000 * 1000), resolve_func);
+    resolver_raw = resolver.get();
+
+    auto addr = resolver->resolve();
+    ASSERT_EQ(*addr, "127.0.0.1");
+
+    report_in_refresh = true;
+    addr.setFail();
+
+    ASSERT_TRUE(banned_during_refresh.has_value());
+    ASSERT_EQ(1, *banned_during_refresh);
+}

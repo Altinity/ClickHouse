@@ -197,8 +197,15 @@ void HostResolver::reportLatency(const Poco::Net::IPAddress & address, UInt64 mi
 
     /// A fresh latency sample shifts the EWMA, which changes the latency-biased weights even
     /// when the base (usage) weight is unchanged, so recompute when latency-aware selection is on.
+    ///
+    /// Use `updateWeightsImpl` (the plain prefix-sum recomputation), not `updateWeights`: the latter
+    /// also runs the "all addresses banned" fallback that un-bans every record once the total weight
+    /// reaches zero. A latency sample does not change which addresses are failed, so it must not
+    /// un-ban anything. In particular `setFail` zeroes the weight of the address it just failed and
+    /// releases the lock to refresh DNS, deliberately without that fallback, so applying it here
+    /// would un-ban the failed address before the refresh can discover a healthy replacement.
     if (latency_aware_selection.load(std::memory_order_relaxed))
-        updateWeights();
+        updateWeightsImpl();
 }
 
 double HostResolver::LatencySnapshot::lookupLatencyMs(const Poco::Net::IPAddress & address) const noexcept
