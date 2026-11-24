@@ -60,4 +60,8 @@ echo "invalid ratio"
 ${CLICKHOUSE_CLIENT} --input_format_parquet_read_min_fill_ratio=2 \
     --query="select count() from file('${DATA_FILE}', Parquet, 'b String')" 2>&1 | grep -o 'BAD_ARGUMENTS' | head -1
 
+echo "invalid ratio does not affect schema inference"
+${CLICKHOUSE_CLIENT} --input_format_parquet_read_min_fill_ratio=2 \
+    --query="desc file('${DATA_FILE}', Parquet)" | cut -f1
+
 rm -f "${CLICKHOUSE_USER_FILES}/${DATA_FILE}"

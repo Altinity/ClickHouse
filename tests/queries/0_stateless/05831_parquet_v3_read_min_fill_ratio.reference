@@ -6,3 +6,7 @@ guard on
 0	1
 invalid ratio
 BAD_ARGUMENTS
+invalid ratio does not affect schema inference
+n
+b
+big

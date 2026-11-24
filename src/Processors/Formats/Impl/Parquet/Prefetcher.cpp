@@ -12,7 +12,6 @@
 
 namespace DB::ErrorCodes
 {
-    extern const int BAD_ARGUMENTS;
     extern const int INCORRECT_DATA;
     extern const int LOGICAL_ERROR;
 }
@@ -33,10 +32,8 @@ void Prefetcher::init(ReadBuffer * reader_, const ReadOptions & options, FormatP
 {
     min_bytes_for_seek = options.min_bytes_for_seek;
     bytes_per_read_task = options.bytes_per_read_task;
+    /// Range-checked in ReadManager::init, before any read is scheduled.
     read_min_fill_ratio = options.format.parquet.read_min_fill_ratio;
-    if (!(read_min_fill_ratio >= 0 && read_min_fill_ratio <= 1))
-        throw Exception(ErrorCodes::BAD_ARGUMENTS,
-            "input_format_parquet_read_min_fill_ratio must be in [0, 1], got {}", read_min_fill_ratio);
     parser_shared_resources = parser_shared_resources_;
     determineReadModeAndFileSize(reader_, options);
     range_sets.resize(1);
