@@ -139,7 +139,7 @@ flowchart TD
     I -->|no| BAD["CORRUPTED_DATA<br/>fail-closed round error"]
     I -->|yes| R["derive exact blob-source<br/>retirement records"]
     R --> F["round CAS adopts retirements<br/>and advanced cursor"]
-    F --> X["phase 18: deleteExact<br/>key and frozen token"]
+    F --> X["phase 18: HEAD, compare with the frozen token,<br/>delete conditional on the HEAD token"]
     X -->|Deleted| E["emit ManifestDelete audit event"]
     X -->|NotFound| NF["spared"]
     X -->|"token ABA"| ABA["retain replacement;<br/>CORRUPTED_DATA round error"]

@@ -35,6 +35,8 @@ constexpr FormatChangePoint REF_LOG_HISTORY[] = {{1, 1}, {2, 2}, {3, 3}};
 /// Generation 3 reduces `_ckpt` to `life_epoch` and `checkpoint_snapshot_id`; an older reader would take
 /// the missing `committed_through` for an empty frontier.
 constexpr FormatChangePoint REF_CKPT_HISTORY[] = {{1, 1}, {3, 3}};
+/// Born at generation 4: an older reader has no such object to read.
+constexpr FormatChangePoint BLOB_INTENT_HISTORY[] = {{4, 4}};
 /// `encodeRefLogTxn` and `encodeRefCkpt` stamp `G_REF_CHAIN` on what generation 3 introduced; the
 /// histories must say the same.
 static_assert(REF_LOG_HISTORY[std::size(REF_LOG_HISTORY) - 1].min_reader == G_REF_CHAIN);
@@ -52,6 +54,8 @@ std::span<const FormatChangePoint> changePoints(FormatId id)
             return REF_LOG_HISTORY;
         case FormatId::RefCkpt:
             return REF_CKPT_HISTORY;
+        case FormatId::BlobIntent:
+            return BLOB_INTENT_HISTORY;
         case FormatId::RefSnapshot:
         case FormatId::RefCatalog:
         case FormatId::GcMaintenanceState:
@@ -152,6 +156,7 @@ constexpr FormatTraits TRAITS[] =
     /// `checkLineBytes`) rather than writing an object no reader could later decode.
     {FormatId::RefCatalog,   "cas_ref_catalog",   TextFamily::Control,       CompressionPolicy::Never,     256 * kMiB, 4 * kKiB},
     {FormatId::GcMaintenanceState, "cas_gc_maintenance_state", TextFamily::Control, CompressionPolicy::Never, 512 * kKiB, 512 * kKiB},
+    {FormatId::BlobIntent,   "cas_blob_intent",   TextFamily::Control,       CompressionPolicy::PinnedRaw, 4 * kKiB,   1 * kKiB},
     {FormatId::PartManifest, "cas_part_manifest", TextFamily::PayloadHybrid, CompressionPolicy::Always,    256 * kMiB, 64 * kKiB},
     {FormatId::RunFile,      "cas_run",           TextFamily::RecordStream,  CompressionPolicy::PinnedRaw, 0,          4 * kKiB},
     {FormatId::FoldSeal,     "cas_fold_seal",     TextFamily::Control,       CompressionPolicy::PinnedRaw, 256 * kMiB, 64 * kKiB},

@@ -35,6 +35,7 @@
 #include <IO/SharedThreadPools.h>
 #include <Common/ThreadPool.h>
 #include <Common/scope_guard_safe.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.h>
 
 #include <Poco/FileChannel.h>
@@ -51,7 +52,7 @@ namespace ErrorCodes
 
 LineReader::Patterns DisksApp::query_extenders = {"\\"};
 LineReader::Patterns DisksApp::query_delimiters = {""};
-String DisksApp::word_break_characters = " \t\v\f\a\b\r\n";
+String DisksApp::word_break_characters{disks_word_break_characters};
 
 CommandPtr DisksApp::getCommandByName(const String & command) const
 {
@@ -319,14 +320,29 @@ void DisksApp::parseAndCheckOptions(
     po::store(parsed, options);
 }
 
-void DisksApp::addOptions()
+void DisksApp::describeCommonOptions(ProgramOptionsDescription & options, PositionalProgramOptionsDescription & positional)
 {
-    options_description.add_options()("help,h", "Print common help message")("config-file,C", po::value<String>(), "Set config file")(
+    options.add_options()("help,h", "Print common help message")("config-file,C", po::value<String>(), "Set config file")(
         "disk", po::value<String>(), "Set disk name")("save-logs", "Save logs to a file")(
         "log-level", po::value<String>(), "Logging level")("query,q", po::value<String>(), "Query for a non-interactive mode")(
         "test-mode", "Interactive interface in test regime");
 
-    positional_options_description.add("disk", 1);
+    positional.add("disk", 1);
+}
+
+void DisksApp::addOptions()
+{
+    describeCommonOptions(options_description, positional_options_description);
+}
+
+CommandLineOptions DisksApp::parseCommonArguments(const std::vector<String> & arguments)
+{
+    ProgramOptionsDescription options;
+    PositionalProgramOptionsDescription positional;
+    describeCommonOptions(options, positional);
+    CommandLineOptions parsed;
+    parseAndCheckOptions(arguments, options, positional, parsed);
+    return parsed;
 }
 
 void DisksApp::registerCommands()
@@ -353,6 +369,7 @@ void DisksApp::registerCommands()
     command_descriptions.emplace("cas-gc-rebuild", makeCommandCaGcRebuild());
     command_descriptions.emplace("cas-inspect", makeCommandCaInspect());
     command_descriptions.emplace("cas-drop-member", makeCommandCaDropMember());
+    command_descriptions.emplace("cas-migrate-pool", makeCommandCaMigratePool());
     command_descriptions.emplace("read-checksums", makeCommandReadChecksums());
     command_descriptions.emplace("help", makeCommandHelp(*this));
     command_descriptions.emplace("packed-io", makeCommandPackedIO());
@@ -608,6 +625,11 @@ int DisksApp::main(const std::vector<String> & /*args*/)
         if (fs::exists(uuid_file))
             ServerUUID::load(uuid_file, &logger());
     }
+
+    /// `cas-migrate-pool` opens a pool no ordinary open accepts, so a content-addressed disk created for this run
+    /// must not open its pool at startup.
+    if (query.has_value() && queryRunsCasMigratePool(*query))
+        setDeferPoolOpenForMigration(true);
 
     client = std::make_unique<DisksClient>(config(), global_context);
 

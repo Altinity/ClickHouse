@@ -24,8 +24,8 @@ TEST(CASFormat, RegistryTypeStringsArePinnedClosedSet)
         "cas_blob", "cas_blob_meta", "cas_pool_meta", "cas_ref_log", "cas_ref_snap",
         "cas_ref_ckpt", "cas_ref_catalog", "cas_gc_maintenance_state", "cas_part_manifest",
         "cas_run", "cas_fold_seal", "cas_gc_state", "cas_gc_hb", "cas_gc_outcomes",
-        "cas_owner", "cas_epoch", "cas_mount_lease"};
-    ASSERT_EQ(expected.size(), 17u);
+        "cas_owner", "cas_epoch", "cas_mount_lease", "cas_blob_intent"};
+    ASSERT_EQ(expected.size(), 18u);
 
     std::set<std::string_view> actual;
     for (const auto id : allRegisteredFormatIds())
@@ -49,7 +49,7 @@ TEST(CASFormat, EveryClassResetToTheBaselineGeneration)
 {
     for (auto id : allRegisteredFormatIds())
     {
-        if (id == FormatId::RefLog || id == FormatId::RefCkpt)
+        if (id == FormatId::RefLog || id == FormatId::RefCkpt || id == FormatId::BlobIntent)
             continue;
         const auto cps = changePoints(id);
         ASSERT_EQ(cps.size(), 1u) << "FormatId " << static_cast<int>(id);
@@ -63,6 +63,15 @@ TEST(CASFormat, EveryClassResetToTheBaselineGeneration)
     EXPECT_EQ(roster_cps.front().min_reader, 1u);
 }
 
+TEST(CASFormat, BlobIntentIsBornAtGenerationFour)
+{
+    const auto points = changePoints(FormatId::BlobIntent);
+    ASSERT_EQ(points.size(), 1u);
+    EXPECT_EQ(points.front().generation, G_BLOB_INTENTS);
+    EXPECT_EQ(points.front().min_reader, G_BLOB_INTENTS);
+    EXPECT_EQ(static_cast<uint16_t>(FormatId::BlobIntent), 26);
+}
+
 TEST(CASFormat, CurrentVersionsAreGBuild)
 {
     EXPECT_EQ(currentWriterVersion(), G_BUILD);
@@ -72,8 +81,8 @@ TEST(CASFormat, CurrentVersionsAreGBuild)
 TEST(CASFormat, RefLogAndRefCkptHistoriesRecordGenerationThree)
 {
     EXPECT_EQ(G_REF_CHAIN, 3u);
-    EXPECT_EQ(G_BUILD, 3u);
-    EXPECT_EQ(currentReadCeiling(), 3u);
+    EXPECT_EQ(G_BUILD, G_BLOB_INTENTS);
+    EXPECT_EQ(currentReadCeiling(), G_BUILD);
 
     const auto pair = [](const FormatChangePoint & cp) { return std::make_pair(cp.generation, cp.min_reader); };
     using Pair = std::pair<uint16_t, uint16_t>;
@@ -90,7 +99,7 @@ TEST(CASFormat, RefLogAndRefCkptHistoriesRecordGenerationThree)
 
     for (auto id : allRegisteredFormatIds())
     {
-        if (id == FormatId::RefLog || id == FormatId::RefCkpt)
+        if (id == FormatId::RefLog || id == FormatId::RefCkpt || id == FormatId::BlobIntent)
             continue;
         const auto cps = changePoints(id);
         ASSERT_EQ(cps.size(), 1u) << "FormatId " << static_cast<int>(id);
@@ -100,7 +109,7 @@ TEST(CASFormat, RefLogAndRefCkptHistoriesRecordGenerationThree)
 
 TEST(CASFormat, ReadCeilingIsAboveTheWriteFloor)
 {
-    EXPECT_EQ(G_BUILD, 3u);
+    EXPECT_EQ(G_BUILD, 4u);
     EXPECT_EQ(currentCompatibilityVersion(), G_WRITE_FLOOR);
     EXPECT_EQ(G_WRITE_FLOOR, 1u);
 }

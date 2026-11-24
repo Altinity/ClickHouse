@@ -91,18 +91,19 @@ struct PoolConfig
     /// Cursor-paced orphan part-manifest sweep. The LIST budget bounds cold-prefix enumeration
     /// per completed GC round; the delete budget separately bounds exact-token destructive work.
     uint64_t manifest_sweep_list_budget_keys = 1000;
+    /// Keys of `blob-intents/` one unsuppressed fold lists to nominate deletion intents that have no row; >= 1.
+    /// 999 fits one `LIST` response: a page also needs the next key to know the listing continues.
+    uint64_t intent_sweep_list_budget_keys = 999;
     uint64_t manifest_sweep_delete_budget_keys = 100;
     /// Keys per batch delete request for the write-once families; tests lower it to exercise chunk boundaries.
     uint64_t gc_bulk_delete_chunk_keys = 1000;
-    /// Per-round blob-deletion work envelope: caps how many entries the fold's graduation
-    /// (condemned -> delete_pending) and redelete (exact-token delete of a prior delete_pending row)
-    /// arms move out of the durable retired pipeline in one round. Excess entries are carried
-    /// unchanged in `still_retired` and retried next round (never dropped). 0 = unbounded.
-    /// Default UNBOUNDED. A count cap here is not backpressure: it throttles the consumer while the
-    /// producer (inserts, merges) is unaware of it, and the excess is carried in `still_retired`, which
-    /// the next round reads in full -- so a round's cost grows with the debt while its useful work stays
-    /// capped. Under sustained load that is a feedback loop, not a delay.
-    uint64_t gc_round_graduation_budget = 0;
+    /// Per-round blob-deletion work envelope. Excess rows are carried unchanged in `still_retired` and retried next
+    /// round (never dropped). 0 = unbounded, the default: a count cap is not backpressure, since it throttles the
+    /// consumer while the producer is unaware of it, and the carried debt is read in full every round.
+    /// Deletion-intent creates per round, summed over the GC shards; a blob over the cap stays a
+    /// candidate for a later round.
+    uint64_t gc_round_intent_create_budget = 0;
+    /// Body deletes of `pending` rows per round.
     uint64_t gc_round_redelete_budget = 0;
     /// Orphan-manifest sweep: caps on the expensive step the LIST/nomination budgets never covered —
     /// building a namespace's protection view (catalog-authoritative table recovery + committed-tail
@@ -168,16 +169,10 @@ struct PoolConfig
     /// (~32 B each => default ~256 MB); each full batch folds into the next attempt number with the
     /// previous attempt's runs as priors, so memory is O(budget), never O(edges).
     uint64_t rebuild_edge_budget = 8000000;
-    /// Bounded pool size for the per-hash freshness
-    /// meta writes GC schedules at condemn/spare/delete (mass-DROP: a round condemning ~1M blobs would
-    /// take hours sequential). Every job internally catches its own exceptions (never wedges the round;
-    /// feedback_ca_gc_never_throw_on_404) and `Gc::runRegularRound` waits for the round's whole batch
-    /// before the round's single gc/state CAS, so the meta writes are durable before that CAS commits.
-    uint64_t gc_meta_pool_size = 16;
     /// Bounded pool size for the GC requests that overlap: the fold's read-ahead of checkpoints, ref
-    /// logs, manifest bodies and zero-candidate HEADs, the orphan-manifest sweep planning reads, the
-    /// rebuild read-ahead, and the `pending_deletes` HEAD + conditional DELETE fan-out. Meta writes
-    /// have their own pool (`gc_meta_pool_size`); every other GC request runs on the round thread.
+    /// logs, manifest bodies and zero-candidate HEADs, the fold's deletion-intent creates, the
+    /// orphan-manifest sweep planning reads, the rebuild read-ahead, and the `pending_deletes` HEAD +
+    /// conditional DELETE fan-out. Every other GC request runs on the round thread.
     /// Every decision stays on the round thread, in the order it always ran; only the requests
     /// overlap. `1` issues no read-ahead and no fan-out at all and is the sequential round, request
     /// for request.
@@ -445,9 +440,18 @@ public:
     /// immediate `ABORTED` refusal; a tombstoned owner of the victim is accepted; a member without an epoch
     /// counter is refused (`CORRUPTED_DATA`). Throws `BAD_ARGUMENTS` when neither owner nor lease exists.
     static PoolPtr openForDecommission(BackendPtr backend, PoolConfig config, const String & victim_srid);
+    /// The pool `migratePool` works on: `_pool_meta` at floor 1 to 4 is accepted. No probe, mount, slot, writer or
+    /// GC: the instance reads, and `migratePool` writes through `openRequests`. Refuses an absent `_pool_meta`.
+    static PoolPtr openForMigration(BackendPtr backend, PoolConfig config);
+    /// The refusal of a migration whose pool prefix holds no `_pool_meta`.
+    [[noreturn]] static void throwNoPoolToMigrate(const PoolConfig & config);
 
-    /// The `min_reader_generation` every writable mount raises the pool to, and a new pool is created at.
-    static constexpr uint64_t mount_reader_floor = G_REF_CHAIN;
+    /// Raises the stored `min_reader_generation` to `G_REF_CHAIN` and mirrors it into `meta`; a floor already at
+    /// or above it sends nothing. Only `migratePool` calls it: a mount never raises the floor.
+    void raiseReaderFloorToRefChain();
+
+    /// The `min_reader_generation` a pool must already have to be opened, and a new pool is created at.
+    static constexpr uint64_t mount_reader_floor = G_BLOB_INTENTS;
     /// Stop the mount-renewal and remount activity, drain ref-log work, and release the owned
     /// backend-facing components in their dependency order. Destruction is also the clean-farewell
     /// path for a writable mount, so it must complete before the owning backend is released.
@@ -619,13 +623,24 @@ public:
     /// `ResolveAudit`'s doc comment (`CasRefLedger.h`) for the one `Deferred` call site.
     std::optional<Resolved> resolveRef(const RootNamespace & ns, const String & ref_name, bool allow_stale = false,
                                        ResolveAudit audit = ResolveAudit::Emit);
+    /// `resolveRef` that also returns the table runtime it read (`CasRefLedger::resolveRefPinned`).
+    std::optional<CasRefLedger::PinnedResolution> resolveRefPinned(const RootNamespace & ns, const String & ref_name);
     /// Gate 1 of the relink confirm. The ledger (`CasRefLedger::confirmExactRef`) decides from memory;
     /// only its `Yes` is re-checked, by one `GET` of the mount slot after the ledger locks are
     /// released, because local fence state cannot see a successor that claimed the slot. A slot this
     /// mount no longer holds, or no renewer to prove it, turns `Yes` into `Unknown`; a failed read
     /// throws, and the storage layer answers `Unknown`. Any other ledger answer issues no request.
-    ConfirmAnswer confirmExactRef(const RootNamespace & ns, const String & ref_name,
-                                  const ManifestRef & manifest_ref) const;
+    ConfirmAnswer confirmExactRef(const RootNamespace & ns, const String & ref_name, const ManifestRef & manifest_ref) const;
+    /// The same gate for an in-process copy, on the table runtime `table` pinned when the source was resolved
+    /// (`CasRefLedger::confirmPinnedRef`). One deadline, the request window from the call's start, decides whether the
+    /// ledger waits for a held state lock again and bounds the mount-slot read, which reissues a transient transport failure until then;
+    /// any other failure propagates at once. One wait for the lock is not bounded.
+    /// A pass that answers `Unknown` is asked again, paced by `Retry::backoff`, until `Yes`, `No`, the deadline, a
+    /// refusal of a state the pinned runtime cannot leave, or a pin that can never confirm
+    /// (`CasRefLedger::pinnedTableRetired`). No ledger lock is held between passes. Throws `ABORTED` once the pool's
+    /// teardown has begun.
+    ConfirmAnswer confirmPinnedRef(const CasRefLedger::TablePin & table, const RootNamespace & ns, const String & ref_name,
+                                   const ManifestRef & manifest_ref) const;
     /// TEST SEAM: runs between the ownership capture and the ledger snapshot.
     void setConfirmAfterOwnershipCaptureHookForTest(std::function<void()> hook)
     {
@@ -829,6 +844,9 @@ public:
     /// registration by another node) -- callers at the manifest-read boundary do this.
     bool isAlgoAdmitted(BlobHashAlgo algo) const;
 
+    /// True for the first caller only: a writer logs a body token that names no incarnation once per mount.
+    bool firstBlobTokenRejectionOfMount() const { return !blob_token_rejection_reported.exchange(true); }
+
     /// Re-reads `_pool_meta` and unions its CURRENT `algos_used` into the in-memory admitted-algo
     /// cache (mutex-guarded; monotone -- a concurrent shrink is impossible since `algos_used` is
     /// itself append-only). Returns the refreshed cache as a sorted vector, for callers that want to
@@ -921,6 +939,13 @@ private:
     /// exposed to callers.
     Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_);
 
+    /// Captures the slot ownership, takes `ledger_snapshot`, and re-checks a `Yes` with a mount-slot read under
+    /// `slot_read_policy`. `ns` and `ref_name` only name the ref in the log.
+    ConfirmVerdict confirmUnderSlot(const RootNamespace & ns, const String & ref_name,
+                                    const std::function<ConfirmVerdict()> & ledger_snapshot, const Retry & slot_read_policy) const;
+    /// Throws `ABORTED` once teardown began.
+    void throwIfConfirmTornDown(const RootNamespace & ns, const String & ref_name) const;
+
     /// Mount-claim policy for `mountWritable`.
     enum class MountClaimPolicy : uint8_t
     {
@@ -929,18 +954,13 @@ private:
     };
 
     /// The writable-mount startup tail shared by `open` and `openForDecommission`: owner claim →
-    /// writer_epoch → mount claim (+fence-recovery loop) → `MountLeaseRenewer` start → reader floor
-    /// raise (`raiseReaderFloor`) → watermark anchor. `our_uuid` is the identity to mount as -- `config.server_id` for a normal open, the
+    /// writer_epoch → mount claim (+fence-recovery loop) → `MountLeaseRenewer` start → watermark anchor. `our_uuid` is the identity to mount as -- `config.server_id` for a normal open, the
     /// victim's owner uuid for decommission (impersonation). `policy` changes only what happens when
     /// the mount claim does not resolve `Claimed`/`FencedSelf`: `WaitForExpiry` observes a stale-
     /// looking lease and refuses (`mountDoubleStartMessage`) only once it proves genuinely live;
     /// `NoWait` refuses immediately, with no observation wait.
     static void mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy policy);
 
-    /// Raises the stored `min_reader_generation` to `generation` and mirrors it into `meta`; a floor already at
-    /// or above it sends nothing. Called by `mountWritable`, so every writable mount, decommission included,
-    /// passes it.
-    static void raiseReaderFloor(const PoolPtr & store, uint64_t generation);
 
     /// The single serialized, reentrancy-safe event funnel. Declared BEFORE `event_sink_` so
     /// it constructs first and destructs last: the forwarder stored in `event_sink_` references it, and
@@ -1116,6 +1136,16 @@ public:
     void setInstallRegionProbeForTest(std::function<void()> probe)
     {
         ref_ledger.setInstallRegionProbeForTest(std::move(probe));
+    }
+    /// Test-only: forwards to `CasRefLedger::setConfirmBeforeStateLockWaitHookForTest`.
+    void setConfirmBeforeStateLockWaitHookForTest(std::function<void()> hook)
+    {
+        ref_ledger.setConfirmBeforeStateLockWaitHookForTest(std::move(hook));
+    }
+    /// Test-only: forwards to `CasRefLedger::setConfirmAfterStateLockWaitHookForTest`.
+    void setConfirmAfterStateLockWaitHookForTest(std::function<void()> hook)
+    {
+        ref_ledger.setConfirmAfterStateLockWaitHookForTest(std::move(hook));
     }
     void setSnapshotAfterCaptureHookForTest(std::function<void()> hook)
     {
@@ -1359,6 +1389,8 @@ private:
     /// ends its remount like any retired owner, but the reason names the run, not a decommissioned server.
     bool decommission_admin = false;
 
+    mutable std::atomic<bool> blob_token_rejection_reported{false};
+
     /// The single home of the per-lifecycle reason detail (spec §1) — the human-readable text that
     /// names the ACTUAL sub-state, WITHOUT the `content-addressed pool '<id>' ` prefix. Both
     /// `throwIfLifecycleTerminal` (which prefixes it and throws) and the non-gated `lifecycleSnapshot`
@@ -1371,5 +1403,22 @@ private:
     /// The ref-log is never trimmed here: trimming needs GC's fold state
     /// (`last_folded_ref_id`, INV-JOURNAL-COVERAGE).
 };
+
+/// The command that migrates a pool, as an operator types it. The two upper-case words are the operator's: the server's
+/// configuration file and the name of the disk.
+inline constexpr std::string_view kMigratePoolCommandLine
+    = "clickhouse-disks --config-file SERVER_CONFIG_FILE --disk DISK_NAME --query 'cas-migrate-pool'";
+
+/// What the open that meets a pool below generation 4 is for: its refusal says what to do first.
+enum class PoolOpenPurpose : uint8_t
+{
+    Write,
+    Read,
+};
+
+/// Refuses a pool below generation `G_BLOB_INTENTS`, and one whose recorded token dialect differs from
+/// `backend_dialect`. Throws `UNKNOWN_FORMAT_VERSION` for the first, `BAD_ARGUMENTS` for the second, and
+/// `CORRUPTED_DATA` for a meta at generation 4 or above that records no dialect.
+void requireGeneration4Pool(const PoolMeta & meta, Dialect backend_dialect, PoolOpenPurpose purpose = PoolOpenPurpose::Write);
 
 }

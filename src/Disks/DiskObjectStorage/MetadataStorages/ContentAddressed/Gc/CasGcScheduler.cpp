@@ -284,9 +284,9 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
         fin.objects_spared = r.spared;
         fin.manifests_deleted = r.manifests_deleted;
         fin.entries_condemned = r.condemned;
-        fin.entries_graduated = r.graduated;
-        fin.entries_redeleted = r.redeleted;
-        fin.entries_redelete_failed = r.redelete_failed;
+        fin.entries_intent_confirmed = r.intent_confirmed;
+        fin.entries_bodies_deleted = r.bodies_deleted;
+        fin.entries_body_delete_failed = r.body_delete_failed;
         fin.fence_outs = r.fence_outs;
         fin.anomalies = r.anomalies.size();
     };
@@ -317,7 +317,7 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
             /// Keep health state per scheduler. Process-global gauges cannot distinguish multiple
             /// content-addressed disks in one server process.
             pending_reclaim.fetch_add(
-                static_cast<Int64>(rep.condemned) - static_cast<Int64>(rep.redeleted),
+                static_cast<Int64>(rep.condemned) - static_cast<Int64>(rep.bodies_deleted),
                 std::memory_order_relaxed);
             last_success_ms.store(
                 static_cast<UInt64>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -439,7 +439,7 @@ void CasGcScheduler::loop()
                 /// instead of adding a boolean to the counters line.
                 if (report.deferred)
                     LOG_DEBUG(log, "CA GC round {}: deferred (skip-unchanged; no changed shard reached the "
-                        "fold threshold and no graduation was due; sealed generation re-adopted, no fold ran)",
+                        "fold threshold and no row decision was due; sealed generation re-adopted, no fold ran)",
                         report.round);
                 else
                     LOG_DEBUG(log, "CA GC round {}: candidates={} deleted={} absent={} replaced={} spared={} manifests_deleted={}",
