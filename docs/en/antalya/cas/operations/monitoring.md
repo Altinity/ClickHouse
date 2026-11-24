@@ -46,8 +46,17 @@ every `CAS*` name, is on [Antalya profile events and metrics](/antalya/metrics-a
 | `CASRefCheckpointNotAdvanced` | Zero | A snapshot was published but its `_ckpt` could not be advanced (fenced out, refused, contended or failed); recovery keeps replaying from an older base. Ref-log appends never write `_ckpt` |
 | `CASGCHeartbeatFenceOuts` | Zero on a healthy pool | GC fenced an expired mount; check `system.cas_mounts` for a member that should have cleanly unmounted |
 | `CASGCUnmatchedRemoveDeltas` | Occasional (benign per-key no-op by design) | A persistent nonzero rate means removal deltas are reaching the reducer without their matching activation — a correctness signal worth a look, not an automatic false deletion |
-| `CASGCCondemnMarkerUnconfirmedCarry` | Zero | The graduation read found no `Condemned` marker at the entry's round or later (absent, `Clean`, older round, or unreadable); deletion is postponed and the marker is rewritten, but investigate repeated carries |
-| `CASGCMetaWriteAnomaly` | Zero | The bounded GC metadata pool failed an operation; backend or pool pressure may delay metadata convergence |
+| `CASGCIntentUnconfirmedCarry` | Zero | A deletion-intent create did not confirm (a refused or unanswered request, or other bytes at the intent key); the blob stays a `candidate` and its deletion is postponed. Sustained growth means object-storage errors, or a bucket policy that refuses `PUT` on `blob-intents/` |
+| `CASGCIntentTokenRejected` | Zero | `GC` observed a body whose token names no incarnation, so no intent can be keyed by it; such a body is never deleted. Check the store's `ETag` form |
+| `CASBlobReuseTokenRejected` | Zero | A writer found a body whose token names no incarnation and uploaded it again instead of reusing it |
+| `CASBlobReuseIntentPresent` | Follows how often condemned content is written again | A writer found a deletion intent over the body and published a fresh body. Intents left over live bodies after a blob was referenced again also count here, once per next writer |
+| `CASBlobIntentGet` / `CASBlobIntentPut` / `CASBlobIntentDelete` / `CASBlobIntentList` | `Get` follows blob reuse; `Put`, `Delete` and `List` follow `GC` rounds | Requests on `blob-intents/`. They are not counted in the `CASBlob*` request counters |
+| `CASGCIntentAdopted` | Follows `CASGCIntentLeftOnSpare`; large after `SYSTEM CAS GC REBUILD` | The sweep gave a row to an intent that had none: an intent left on a spared blob, one whose leader died before its commit, or, after a rebuild, every intent of the pool |
+| `CASGCIntentStandingAnomaly` | Zero | A `standing` row, whose body `GC` had deleted, saw its own token at the key again. The row is carried and nothing is deleted; the log names the first blob |
+| `CASGCUndecodableBlobBody` | Zero | A body at a blob key is shorter than the pool's blob envelope. `GC` records nothing for it and deletes nothing; the key is in the log and in a `corrupt_decode` event (see [a body `GC` cannot decode](/antalya/cas/architecture/garbage-collection#undecodable-body)) |
+| `CASGCIntentLeftOnSpare` | Follows how often condemned blobs are referenced again | A row dropped because a reference returned; its intent stays until the blob is unreferenced again |
+| `CASGCIntentDeletedOnSpare` | Follows how often condemned content is written again and then referenced | A row dropped because a reference returned, whose body a writer had already replaced; the intent of the replaced body was deleted. Included in `CASGCIntentDeleted` |
+| `CASBlobPublishDigestMismatch` | Zero | A streamed publication was refused because the payload did not hash to the blob's key: a corrupted or changed source |
 | `CASRefRollbackBestEffortDropFailed` | Zero | A rollback cleanup drop hit a backend failure; refs may remain live and GC may be delayed on that namespace |
 
 `CASRefCheckpointPublished` and `CASRefCheckpointIdenticalSkip` count `_ckpt` writes by snapshot
@@ -124,11 +133,20 @@ ORDER BY disk_name, rounds DESC;
 ```
 
 A steady stream of `Success` and `Deferred` rows is healthy; `Deferred` means the round found no
-changed shard needing a fold and no graduation was due — a cheap round, not a stuck one (see
+changed shard needing a fold and no deletion was due — a cheap round, not a stuck one (see
 [the round](/antalya/cas/architecture/garbage-collection#the-round)). Recurring `Error` rows, or
 `NotALeader` outcomes for the disk's own scheduler, warrant investigation. `anomalies` in the
 `Finish` row is worth a steady watch: it is fold clamps surfaced and survived, so a non-zero value
 that persists across rounds is more interesting than an isolated one.
+
+A round that deletes nothing although rows are `pending` or `standing` may be suppressed because its parent
+check failed: the `fold_reduce` row of the round has `parent_unconfirmed = 1` in `phase_metrics`, the server log has
+a WARNING with that name, and `CASGCClampSuppressedPasses` counts the pass. The check does not fail the round, but
+when `gc/state` moved or is absent the round's commit is refused with `ABORTED`.
+
+A backlog that rounds carry without deleting shows in `pending_rows` of the `fold_reduce` row: the number of
+`pending` and `standing` rows on file after the round. A value that stays the same over many rounds, with the
+`bodies_deleted` metric of the `pending_deletes` row at 0, means the rows are carried, not reclaimed.
 
 A dashboard alert that filters on `outcome = 'Error'` alone misses `Aborted` and `Stopped` rows too
 — see the [`outcome` column](/operations/system-tables/cas_gc_log#columns) for what each one means.

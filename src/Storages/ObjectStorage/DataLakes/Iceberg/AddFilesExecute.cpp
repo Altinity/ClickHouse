@@ -1,0 +1,1480 @@
+#include <Storages/ObjectStorage/DataLakes/Iceberg/AddFilesExecute.h>
+
+#include "config.h"
+
+#if USE_AVRO
+
+#include <Columns/ColumnString.h>
+#include <Core/Block.h>
+#include <Core/Field.h>
+#include <DataTypes/DataTypeDate.h>
+#include <DataTypes/DataTypeDateTime64.h>
+#include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypeString.h>
+#include <DataTypes/DataTypesDecimal.h>
+#include <DataTypes/DataTypesNumber.h>
+#include <Databases/DataLake/Common.h>
+#include <Formats/FormatFactory.h>
+#include <Formats/FormatSettings.h>
+#include <IO/ReadSettings.h>
+#include <IO/WriteBufferFromFileBase.h>
+#include <IO/WriteBufferFromString.h>
+#include <IO/WriteHelpers.h>
+#include <IO/WriteSettings.h>
+#include <Interpreters/Context.h>
+#include <Processors/Sources/SourceFromSingleChunk.h>
+#include <QueryPipeline/Pipe.h>
+#include <Storages/ObjectStorage/DataLakes/Common/AvroForIcebergDeserializer.h>
+#include <Storages/ObjectStorage/DataLakes/DataLakeStorageSettings.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/ExecuteCommandArgs.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/FileNamesGenerator.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergDataFileEntry.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergWrites.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/MetadataGenerator.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/SchemaProcessor.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/StatelessMetadataFileGetter.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
+#include <Storages/StorageInMemoryMetadata.h>
+#include <Common/UTF8Helpers.h>
+#include <Common/logger_useful.h>
+
+#include <Poco/JSON/Object.h>
+#include <Poco/JSON/Stringifier.h>
+#include <Poco/String.h>
+
+#include <arrow/api.h>
+#include <parquet/file_reader.h>
+#include <parquet/metadata.h>
+#include <parquet/statistics.h>
+#include <Processors/Formats/Impl/ArrowBufferedStreams.h>
+#include <Common/FieldVisitorToString.h>
+
+#include <charconv>
+#include <cstring>
+#include <functional>
+#include <limits>
+#include <map>
+#include <optional>
+#include <sstream>
+#include <unordered_set>
+
+namespace DB
+{
+
+namespace ErrorCodes
+{
+extern const int BAD_ARGUMENTS;
+extern const int DATALAKE_DATABASE_ERROR;
+extern const int ICEBERG_SPECIFICATION_VIOLATION;
+extern const int LIMIT_EXCEEDED;
+extern const int LOGICAL_ERROR;
+extern const int METADATA_MISMATCH;
+extern const int SUPPORT_IS_DISABLED;
+}
+
+namespace DataLakeStorageSetting
+{
+extern const DataLakeStorageSettingsBool iceberg_use_version_hint;
+}
+
+namespace Iceberg
+{
+
+namespace
+{
+
+ExecuteCommandArgs makeSchema()
+{
+    ExecuteCommandArgs schema("add_files");
+    schema.addPositional("paths");
+    schema.addNamed("check_duplicate_files", Field::Types::UInt64);
+    schema.addNamed("allow_missing_columns", Field::Types::UInt64);
+    schema.addDefault("check_duplicate_files", Field(UInt64(1)));
+    schema.addDefault("allow_missing_columns", Field(UInt64(0)));
+    return schema;
+}
+
+std::vector<String> parsePathsArgument(const Field & field)
+{
+    std::vector<String> paths;
+    if (field.getType() == Field::Types::String)
+    {
+        paths.push_back(field.safeGet<String>());
+    }
+    else if (field.getType() == Field::Types::Array)
+    {
+        for (const auto & item : field.safeGet<Array>())
+            paths.push_back(item.safeGet<String>());
+    }
+    else
+    {
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "add_files expects 'paths' to be a String or an Array of Strings, got {}", field.getTypeName());
+    }
+    if (paths.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "add_files expects at least one path");
+    return paths;
+}
+
+bool hasHiddenPathComponent(const String & path)
+{
+    size_t start = 0;
+    while (start <= path.size())
+    {
+        size_t slash = path.find('/', start);
+        String component = path.substr(start, slash == String::npos ? String::npos : slash - start);
+        if (!component.empty() && component[0] == '.')
+            return true;
+        if (slash == String::npos)
+            break;
+        start = slash + 1;
+    }
+    return false;
+}
+
+bool endsWithParquet(const String & path)
+{
+    return Poco::toLower(path).ends_with(".parquet");
+}
+
+/// The files are read and registered through the table's storage and credentials, so only files under
+/// the table location may be registered. Otherwise `IcebergPathResolver::resolve` maps an outside path
+/// to some key of the table's storage, which lets a user expose objects the table does not own, and the
+/// manifest records a path that names a different object than the one ClickHouse read.
+void checkPathUnderTableLocation(const String & path, const String & table_location)
+{
+    if (table_location.empty() || !path.starts_with(table_location) || path.size() <= table_location.size()
+        || path[table_location.size()] != '/')
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "add_files: path '{}' is not under the table location '{}'; only files under the table location can be registered",
+            path, table_location);
+
+    std::string_view rest = std::string_view(path).substr(table_location.size() + 1);
+    while (true)
+    {
+        size_t slash = rest.find('/');
+        std::string_view component = rest.substr(0, slash);
+        if (component == "." || component == "..")
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "add_files: path '{}' contains a '{}' component; give the path without relative components", path, component);
+        if (slash == std::string_view::npos)
+            break;
+        rest = rest.substr(slash + 1);
+    }
+}
+
+/// The Iceberg `truncate[N]` transform of a string keeps the first N code points, as `icebergTruncate` does.
+String truncateToCodePoints(const String & value, size_t code_points)
+{
+    size_t pos = 0;
+    for (size_t i = 0; i < code_points && pos < value.size(); ++i)
+        pos += UTF8::seqLength(static_cast<UInt8>(value[pos]));
+    return value.substr(0, std::min(pos, value.size()));
+}
+
+/// Leaf fields (over nested structs) that must have a value in every row: the field and all its
+/// ancestors are required. A file without such a column cannot be registered.
+std::unordered_set<Int64> collectRequiredFieldIds(Poco::JSON::Array::Ptr schema_fields)
+{
+    std::unordered_set<Int64> result;
+    std::function<void(Poco::JSON::Object::Ptr)> collect;
+    collect = [&](Poco::JSON::Object::Ptr field)
+    {
+        if (!field->has(Iceberg::f_required) || !field->getValue<bool>(Iceberg::f_required))
+            return;
+        auto type_var = field->get(Iceberg::f_type);
+        if (type_var.isString())
+        {
+            result.insert(field->getValue<Int64>(Iceberg::f_id));
+            return;
+        }
+        const auto & type_obj = type_var.extract<Poco::JSON::Object::Ptr>();
+        if (type_obj->getValue<String>(Iceberg::f_type) == "struct")
+        {
+            for (const auto & nested : *type_obj->getArray(Iceberg::f_fields))
+                collect(nested.extract<Poco::JSON::Object::Ptr>());
+        }
+    };
+    for (const auto & field_var : *schema_fields)
+        collect(field_var.extract<Poco::JSON::Object::Ptr>());
+    return result;
+}
+
+/// Iceberg name mapping (`schema.name-mapping.default`) of a type: lets readers that resolve columns by
+/// field id (Spark, Trino, iceberg-java) map the columns of files written without field ids by name.
+/// Mirrors `MappingUtil.create` of iceberg-java: structs map their fields, lists map `element`, maps map
+/// `key` and `value`.
+Poco::JSON::Array::Ptr buildNameMappingOfType(const Poco::Dynamic::Var & type_var)
+{
+    if (type_var.isString())
+        return nullptr;
+
+    const auto & type_obj = type_var.extract<Poco::JSON::Object::Ptr>();
+    const String kind = type_obj->getValue<String>(Iceberg::f_type);
+
+    auto make_entry = [](Int64 id, const String & name, const Poco::JSON::Array::Ptr & nested)
+    {
+        Poco::JSON::Object::Ptr entry = new Poco::JSON::Object;
+        entry->set("field-id", id);
+        Poco::JSON::Array::Ptr names = new Poco::JSON::Array;
+        names->add(name);
+        entry->set("names", names);
+        if (nested)
+            entry->set("fields", nested);
+        return entry;
+    };
+
+    Poco::JSON::Array::Ptr result = new Poco::JSON::Array;
+    if (kind == "struct")
+    {
+        for (const auto & nested_var : *type_obj->getArray(Iceberg::f_fields))
+        {
+            const auto & nested = nested_var.extract<Poco::JSON::Object::Ptr>();
+            result->add(make_entry(
+                nested->getValue<Int64>(Iceberg::f_id), nested->getValue<String>(Iceberg::f_name),
+                buildNameMappingOfType(nested->get(Iceberg::f_type))));
+        }
+    }
+    else if (kind == "list")
+    {
+        result->add(make_entry(
+            type_obj->getValue<Int64>(Iceberg::f_element_id), "element", buildNameMappingOfType(type_obj->get(Iceberg::f_element))));
+    }
+    else if (kind == "map")
+    {
+        result->add(make_entry(type_obj->getValue<Int64>(Iceberg::f_key_id), "key", buildNameMappingOfType(type_obj->get(Iceberg::f_key))));
+        result->add(make_entry(
+            type_obj->getValue<Int64>(Iceberg::f_value_id), "value", buildNameMappingOfType(type_obj->get(Iceberg::f_value))));
+    }
+    else
+    {
+        return nullptr;
+    }
+    return result;
+}
+
+constexpr auto name_mapping_property = "schema.name-mapping.default";
+
+/// Registered files are written by other tools and usually carry no Iceberg field ids. Without a name
+/// mapping, readers that resolve columns by id read them as NULLs or by position. Like `add_files` of
+/// iceberg-java, set the default name mapping from the current schema unless the table already has one.
+/// An existing mapping is kept as is: keeping it current with schema changes is the job of the schema
+/// update (as `UpdateSchema` does in iceberg-java), not of `add_files`.
+/// Returns the value of the property if it was set; `metadata` is updated too.
+std::optional<String> updateDefaultNameMapping(Poco::JSON::Object::Ptr metadata, const Poco::JSON::Object::Ptr & current_schema)
+{
+    Poco::JSON::Object::Ptr properties;
+    if (metadata->has(Iceberg::f_properties) && !metadata->isNull(Iceberg::f_properties))
+        properties = metadata->getObject(Iceberg::f_properties);
+    if (!properties)
+    {
+        properties = new Poco::JSON::Object;
+        metadata->set(Iceberg::f_properties, properties);
+    }
+    if (properties->has(name_mapping_property))
+        return std::nullopt;
+
+    Poco::JSON::Object::Ptr schema_as_struct = new Poco::JSON::Object;
+    schema_as_struct->set(Iceberg::f_type, "struct");
+    schema_as_struct->set(Iceberg::f_fields, current_schema->getArray(Iceberg::f_fields));
+    String value = stringifyJSON(buildNameMappingOfType(Poco::Dynamic::Var(schema_as_struct)), /* indent */ 0);
+    properties->set(name_mapping_property, value);
+    return value;
+}
+
+/// Expand trailing-slash paths into concrete *.parquet files below them.
+std::vector<String> expandPaths(
+    const std::vector<String> & raw_paths,
+    const IcebergPathResolver & resolver,
+    const ObjectStoragePtr & object_storage,
+    LoggerPtr log)
+{
+    std::vector<String> result;
+    for (const auto & raw : raw_paths)
+    {
+        checkPathUnderTableLocation(raw, resolver.getTableLocation());
+        if (!raw.ends_with('/'))
+        {
+            result.push_back(raw);
+            continue;
+        }
+        const size_t files_before = result.size();
+        RelativePathsWithMetadata children;
+        object_storage->listObjects(resolver.resolve(IcebergPathFromMetadata::deserialize(raw)), children, /* max_keys */ 0);
+        for (const auto & child : children)
+        {
+            if (!endsWithParquet(child->relative_path) || hasHiddenPathComponent(child->relative_path))
+                continue;
+            /// Listed keys are storage paths; convert to the metadata (location-prefixed) form
+            /// that native writes register in manifests.
+            String path = resolver.reverseResolve(child->relative_path).serialize();
+            checkPathUnderTableLocation(path, resolver.getTableLocation());
+            result.push_back(std::move(path));
+        }
+        /// Registering nothing would commit an empty snapshot; a mistyped directory is the likely cause.
+        if (result.size() == files_before)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "add_files: directory '{}' contains no parquet files", raw);
+        LOG_DEBUG(log, "add_files: path {} expanded to {} parquet file(s)", raw, result.size() - files_before);
+    }
+    return result;
+}
+
+Int64 floorDiv(Int64 a, Int64 b)
+{
+    Int64 q = a / b;
+    if ((a % b != 0) && ((a < 0) != (b < 0)))
+        --q;
+    return q;
+}
+
+/// Howard Hinnant's civil-from-days algorithm.
+void civilFromDays(Int64 z, Int64 & y, unsigned & m, unsigned & d)
+{
+    z += 719468;
+    Int64 era = floorDiv(z, 146097);
+    unsigned doe = static_cast<unsigned>(z - era * 146097);
+    unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    Int64 year = static_cast<Int64>(yoe) + era * 400;
+    unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    unsigned mp = (5 * doy + 2) / 153;
+    d = doy - (153 * mp + 2) / 5 + 1;
+    m = mp + (mp < 10 ? 3 : static_cast<unsigned>(-9));
+    y = year + (m <= 2 ? 1 : 0);
+}
+
+enum class SourceValueKind
+{
+    Integer,   /// int32 / int64 (also date days and timestamp micros)
+    String,
+    Unsupported
+};
+
+/// Decoded min/max of one parquet column across all row groups, in encoded-bytes form
+/// for equality and in decoded form for transforms.
+struct ColumnBounds
+{
+    bool has_bounds = false;
+    /// Some row group with non-null values has no min/max, so the bounds do not cover every row.
+    bool incomplete = false;
+    /// For Integer bounds: whether the parquet physical type is INT32 (4-byte LE serialization)
+    /// rather than INT64 (8-byte). Decided by the physical type, never by the value range.
+    bool int_is_32bit = false;
+    Int64 min_int = 0;
+    Int64 max_int = 0;
+    String min_str;
+    String max_str;
+    SourceValueKind kind = SourceValueKind::Unsupported;
+};
+
+template <typename T>
+T decodeLE(const String & bytes)
+{
+    T value = 0;
+    memcpy(&value, bytes.data(), std::min(bytes.size(), sizeof(T)));
+    return value;
+}
+
+/// Statistics of one data file derived from its parquet footer.
+struct AnalyzedFile
+{
+    String registration_path;   /// path form stored in the manifest
+    String storage_path;        /// resolved path used for reads
+    IcebergSerializedFileStats stats;
+    /// Has an entry for every table column present in the file, with or without statistics.
+    std::unordered_map<Int32, ColumnBounds> bounds_by_field_id;
+    /// Field ids whose null count is known for every row group of the file.
+    std::unordered_map<Int32, Int64> complete_null_counts;
+    /// Field ids whose parquet column cannot hold nulls (it and all its parents are `REQUIRED`).
+    std::unordered_set<Int32> non_nullable_field_ids;
+};
+
+/// Check that the parquet column has exactly the representation that the Iceberg type requires,
+/// so that its statistics can be used as Iceberg bounds and partition values as they are.
+/// Other representations (e.g. decimals, millisecond or nanosecond timestamps, INT96, widening
+/// INT32 to long) are rejected rather than converted.
+void checkParquetColumnType(
+    const parquet::ColumnDescriptor & column, const String & iceberg_type, const String & registration_path)
+{
+    const auto physical_type = column.physical_type();
+    const auto & logical_type = column.logical_type();
+    const bool no_logical_type = !logical_type || logical_type->is_none();
+
+    auto is_int_of_width = [&](int bit_width)
+    {
+        if (no_logical_type)
+            return true;
+        if (!logical_type->is_int())
+            return false;
+        const auto & int_type = static_cast<const parquet::IntLogicalType &>(*logical_type);
+        return int_type.bit_width() == bit_width && int_type.is_signed();
+    };
+
+    bool matches = false;
+    if (iceberg_type == "int")
+        matches = physical_type == parquet::Type::INT32 && is_int_of_width(32);
+    else if (iceberg_type == "long")
+        matches = physical_type == parquet::Type::INT64 && is_int_of_width(64);
+    else if (iceberg_type == "string")
+        matches = physical_type == parquet::Type::BYTE_ARRAY && (no_logical_type || logical_type->is_string());
+    else if (iceberg_type == "date")
+        matches = physical_type == parquet::Type::INT32 && logical_type && logical_type->is_date();
+    else if (iceberg_type == "timestamp" || iceberg_type == "timestamptz")
+        matches = physical_type == parquet::Type::INT64 && logical_type && logical_type->is_timestamp()
+            && static_cast<const parquet::TimestampLogicalType &>(*logical_type).time_unit() == parquet::LogicalType::TimeUnit::MICROS;
+    else if (iceberg_type == "boolean")
+        matches = physical_type == parquet::Type::BOOLEAN;
+    else if (iceberg_type == "float")
+        matches = physical_type == parquet::Type::FLOAT;
+    else if (iceberg_type == "double")
+        matches = physical_type == parquet::Type::DOUBLE;
+    else
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+            "add_files: column '{}' of file {} has Iceberg type '{}', which add_files does not support yet",
+            column.path()->ToDotString(), registration_path, iceberg_type);
+
+    if (!matches)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "add_files: column '{}' of file {} is stored as parquet type {} ({}), which does not match the Iceberg type '{}' "
+            "of the table column",
+            column.path()->ToDotString(), registration_path, parquet::TypeToString(physical_type),
+            logical_type ? logical_type->ToString() : "no logical type", iceberg_type);
+}
+
+ColumnBounds aggregateColumnBounds(
+    const parquet::ColumnChunkMetaData & column,
+    ColumnBounds acc)
+{
+    std::shared_ptr<parquet::Statistics> stats = column.is_stats_set() ? column.statistics() : nullptr;
+    if (!stats || !stats->HasMinMax())
+    {
+        /// Only a row group whose values are all null may lack min/max.
+        if (!stats || !stats->HasNullCount() || stats->null_count() != column.num_values())
+            acc.incomplete = true;
+        return acc;
+    }
+
+    String encoded_min = stats->EncodeMin();
+    String encoded_max = stats->EncodeMax();
+    auto physical_type = stats->physical_type();
+
+    SourceValueKind kind = SourceValueKind::Unsupported;
+    if (physical_type == parquet::Type::INT32 || physical_type == parquet::Type::INT64)
+        kind = SourceValueKind::Integer;
+    else if (physical_type == parquet::Type::BYTE_ARRAY || physical_type == parquet::Type::FIXED_LEN_BYTE_ARRAY)
+        kind = SourceValueKind::String;
+
+    if (kind == SourceValueKind::Unsupported)
+        return acc;
+
+    if (!acc.has_bounds)
+    {
+        acc.kind = kind;
+        if (kind == SourceValueKind::Integer)
+        {
+            acc.int_is_32bit = physical_type == parquet::Type::INT32;
+            acc.min_int = physical_type == parquet::Type::INT32 ? Int64(decodeLE<Int32>(encoded_min)) : decodeLE<Int64>(encoded_min);
+            acc.max_int = physical_type == parquet::Type::INT32 ? Int64(decodeLE<Int32>(encoded_max)) : decodeLE<Int64>(encoded_max);
+        }
+        else
+        {
+            acc.min_str = encoded_min;
+            acc.max_str = encoded_max;
+        }
+        acc.has_bounds = true;
+        return acc;
+    }
+
+    if (kind != acc.kind)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "add_files: statistics of one column have different physical types");
+
+    if (kind == SourceValueKind::Integer)
+    {
+        Int64 this_min = physical_type == parquet::Type::INT32 ? Int64(decodeLE<Int32>(encoded_min)) : decodeLE<Int64>(encoded_min);
+        Int64 this_max = physical_type == parquet::Type::INT32 ? Int64(decodeLE<Int32>(encoded_max)) : decodeLE<Int64>(encoded_max);
+        acc.min_int = std::min(acc.min_int, this_min);
+        acc.max_int = std::max(acc.max_int, this_max);
+    }
+    else
+    {
+        acc.min_str = std::min(acc.min_str, encoded_min);
+        acc.max_str = std::max(acc.max_str, encoded_max);
+    }
+    return acc;
+}
+
+/// Read the parquet footer of one file and derive its Iceberg statistics and per-column bounds.
+AnalyzedFile analyzeFile(
+    const String & registration_path,
+    const IcebergPathResolver & resolver,
+    const ObjectStoragePtr & object_storage,
+    const std::unordered_map<String, Int64> & column_path_to_field_id,
+    const std::unordered_map<Int64, String> & iceberg_type_by_field_id,
+    const ContextPtr & context,
+    const FormatSettings & format_settings)
+{
+    AnalyzedFile result;
+    result.registration_path = registration_path;
+
+    IcebergPathFromMetadata metadata_path = IcebergPathFromMetadata::deserialize(registration_path);
+    result.storage_path = resolver.resolve(metadata_path);
+
+    auto object_metadata = object_storage->tryGetObjectMetadata(result.storage_path, /* with_tags */ false);
+    if (!object_metadata.has_value())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "add_files: file {} does not exist", registration_path);
+    result.stats.file_size_in_bytes = static_cast<Int64>(object_metadata->size_bytes);
+
+    std::shared_ptr<parquet::FileMetaData> parquet_metadata;
+    try
+    {
+        std::atomic<int> is_stopped = 0;
+        auto buffer = object_storage->readObject(StoredObject(result.storage_path), context->getReadSettings());
+        auto arrow_file = asArrowFile(*buffer, format_settings, is_stopped, "Parquet", PARQUET_MAGIC_BYTES, /* avoid_buffering */ true);
+        parquet_metadata = parquet::ReadMetaData(arrow_file);
+    }
+    catch (...)
+    {
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "add_files: failed to read the parquet footer of {} ({}). The file may be truncated "
+            "or still being written by another process; registering such a file is the caller's responsibility. "
+            "Original error: {}",
+            registration_path, result.storage_path, getCurrentExceptionMessage(false));
+    }
+
+    result.stats.record_count = parquet_metadata->num_rows();
+
+    /// Validate the type of every table column present in the file. Columns whose Iceberg type is not
+    /// known here (leaves of lists and maps) are registered without bounds.
+    std::unordered_set<Int32> columns_with_bounds;
+    const auto * parquet_schema = parquet_metadata->schema();
+    for (int col = 0; col < parquet_schema->num_columns(); ++col)
+    {
+        const auto * descriptor = parquet_schema->Column(col);
+        auto field_it = column_path_to_field_id.find(descriptor->path()->ToDotString());
+        if (field_it == column_path_to_field_id.end())
+            continue;
+        auto type_it = iceberg_type_by_field_id.find(field_it->second);
+        if (type_it == iceberg_type_by_field_id.end())
+            continue;
+        checkParquetColumnType(*descriptor, type_it->second, registration_path);
+        columns_with_bounds.insert(static_cast<Int32>(field_it->second));
+        if (descriptor->max_definition_level() == 0)
+            result.non_nullable_field_ids.insert(static_cast<Int32>(field_it->second));
+    }
+
+    std::unordered_map<Int32, Int64> column_sizes;
+    std::unordered_map<Int32, Int64> null_value_counts;
+    std::unordered_set<Int32> incomplete_null_counts;
+    std::unordered_map<Int32, ColumnBounds> bounds;
+
+    for (int rg = 0; rg < parquet_metadata->num_row_groups(); ++rg)
+    {
+        auto row_group = parquet_metadata->RowGroup(rg);
+        for (int col = 0; col < row_group->num_columns(); ++col)
+        {
+            auto column = row_group->ColumnChunk(col);
+            String dot_path = column->path_in_schema()->ToDotString();
+            auto field_it = column_path_to_field_id.find(dot_path);
+            if (field_it == column_path_to_field_id.end())
+                continue;
+            Int32 field_id = static_cast<Int32>(field_it->second);
+
+            column_sizes[field_id] += column->total_compressed_size();
+            std::shared_ptr<parquet::Statistics> stats = column->is_stats_set() ? column->statistics() : nullptr;
+            if (stats && stats->HasNullCount())
+                null_value_counts[field_id] += stats->null_count();
+            else
+                incomplete_null_counts.insert(field_id);
+
+            if (columns_with_bounds.contains(field_id))
+                bounds[field_id] = aggregateColumnBounds(*column, std::move(bounds[field_id]));
+            else
+                bounds.try_emplace(field_id);
+        }
+    }
+
+    for (const auto & [field_id, size] : column_sizes)
+        result.stats.column_sizes.emplace_back(field_id, size);
+    for (const auto & [field_id, count] : null_value_counts)
+    {
+        if (incomplete_null_counts.contains(field_id))
+            continue;
+        result.stats.null_value_counts.emplace_back(field_id, count);
+        result.complete_null_counts.emplace(field_id, count);
+    }
+    for (auto & [field_id, bound] : bounds)
+    {
+        if (bound.incomplete)
+            bound.has_bounds = false;
+        if (!bound.has_bounds)
+            continue;
+        if (bound.kind == SourceValueKind::Integer)
+        {
+            /// Pass the parquet plain encoding through: both parquet statistics and Iceberg
+            /// bounds store fixed-width numerics little-endian, with the width of the parquet
+            /// physical type (INT32 -> 4 bytes, INT64 -> 8 bytes).
+            std::vector<uint8_t> lower_bytes;
+            std::vector<uint8_t> upper_bytes;
+            if (bound.int_is_32bit)
+            {
+                Int32 lo = static_cast<Int32>(bound.min_int);
+                Int32 hi = static_cast<Int32>(bound.max_int);
+                lower_bytes.resize(sizeof(Int32));
+                upper_bytes.resize(sizeof(Int32));
+                memcpy(lower_bytes.data(), &lo, sizeof(Int32));
+                memcpy(upper_bytes.data(), &hi, sizeof(Int32));
+            }
+            else
+            {
+                Int64 lo = bound.min_int;
+                Int64 hi = bound.max_int;
+                lower_bytes.resize(sizeof(Int64));
+                upper_bytes.resize(sizeof(Int64));
+                memcpy(lower_bytes.data(), &lo, sizeof(Int64));
+                memcpy(upper_bytes.data(), &hi, sizeof(Int64));
+            }
+            result.stats.lower_bounds.emplace_back(field_id, std::move(lower_bytes));
+            result.stats.upper_bounds.emplace_back(field_id, std::move(upper_bytes));
+        }
+        else
+        {
+            std::vector<uint8_t> lower_bytes(bound.min_str.begin(), bound.min_str.end());
+            std::vector<uint8_t> upper_bytes(bound.max_str.begin(), bound.max_str.end());
+            result.stats.lower_bounds.emplace_back(field_id, std::move(lower_bytes));
+            result.stats.upper_bounds.emplace_back(field_id, std::move(upper_bytes));
+        }
+    }
+
+    result.bounds_by_field_id = std::move(bounds);
+    return result;
+}
+
+/// The value one partition field takes for a file, proven identical for every row in the file.
+struct PartitionFieldValue
+{
+    String column_name;
+    Field value;        /// Null when the transform is void or the column has only nulls
+    DataTypePtr type;   /// ClickHouse type used for manifest tuple serialization
+};
+
+/// Derive the partition tuple of one file from its per-column bounds and prove that every row
+/// in the file belongs to that single partition. Fails with an error naming the file and the
+/// offending column when a file spans partitions.
+PartitionFieldValue derivePartitionField(
+    const Poco::JSON::Object::Ptr & spec_field,
+    const AnalyzedFile & file,
+    const std::unordered_map<Int64, NameAndTypePair> & source_columns,
+    const std::unordered_map<Int64, String> & iceberg_type_by_field_id)
+{
+    Int64 source_id = spec_field->getValue<Int64>(Iceberg::f_source_id);
+    String transform = spec_field->getValue<String>(Iceberg::f_transform);
+    String field_name = spec_field->getValue<String>(Iceberg::f_name);
+
+    PartitionFieldValue result;
+    result.column_name = field_name;
+
+    auto source_it = source_columns.find(source_id);
+    if (source_it == source_columns.end())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "add_files: partition field '{}' refers to source id {} which is not in the current schema", field_name, source_id);
+    const NameAndTypePair & source_column = source_it->second;
+
+    if (transform == "void")
+    {
+        result.value = Null();
+        result.type = source_column.type;
+        return result;
+    }
+
+    /// Parse bucket[N] / truncate[N].
+    auto bracket = transform.find('[');
+    String transform_name = bracket == String::npos ? transform : transform.substr(0, bracket);
+    Int64 transform_argument = 0;
+    if (bracket != String::npos)
+    {
+        const char * begin = transform.data() + bracket + 1;
+        const char * end = transform.data() + transform.size() - 1;
+        auto [ptr, ec] = std::from_chars(begin, end, transform_argument);
+        if (ec != std::errc() || ptr != end || transform.back() != ']' || transform_argument <= 0)
+            throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                "add_files: partition field '{}' has malformed transform '{}'", field_name, transform);
+    }
+
+    if (transform_name == "bucket")
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+            "add_files: partition field '{}' uses the bucket transform, which cannot be validated from "
+            "file statistics alone (two different values may share a bucket with a third outside it). "
+            "Files for bucket-partitioned tables are not supported yet", field_name);
+
+    auto bounds_it = file.bounds_by_field_id.find(static_cast<Int32>(source_id));
+    if (bounds_it == file.bounds_by_field_id.end() || !bounds_it->second.has_bounds)
+    {
+        /// The partition value is null only if every row has null in the source column: the column is
+        /// absent from the file (allowed by `allow_missing_columns`), or the footer proves that all of its
+        /// values are null. Missing statistics alone prove nothing (writers drop them, e.g. for long values).
+        if (bounds_it != file.bounds_by_field_id.end())
+        {
+            auto null_count_it = file.complete_null_counts.find(static_cast<Int32>(source_id));
+            if (null_count_it == file.complete_null_counts.end() || null_count_it->second != file.stats.record_count)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "add_files: cannot derive the partition value of file {}: the parquet footer has no complete "
+                    "min/max statistics for the partition source column '{}'",
+                    file.registration_path, source_column.name);
+        }
+        result.value = Null();
+        result.type = transform_name == "identity" || transform_name == "truncate" ? source_column.type : DataTypePtr(std::make_shared<DataTypeInt32>());
+        return result;
+    }
+    const ColumnBounds & bounds = bounds_it->second;
+
+    auto iceberg_type_it = iceberg_type_by_field_id.find(source_id);
+    const String iceberg_type = iceberg_type_it != iceberg_type_by_field_id.end() ? iceberg_type_it->second : "";
+    bool is_timestamp = iceberg_type.starts_with("timestamp");
+    bool is_date = iceberg_type == "date";
+
+    if (transform_name == "identity")
+    {
+        bool equal = bounds.kind == SourceValueKind::Integer ? bounds.min_int == bounds.max_int : bounds.min_str == bounds.max_str;
+        if (!equal)
+            throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                "add_files: file {} spans more than one partition: column '{}' has distinct min and max values",
+                file.registration_path, source_column.name);
+        if (bounds.kind == SourceValueKind::Integer)
+        {
+            if (is_date)
+            {
+                /// Mirrors the native writer: identity Date partition values are the raw day number,
+                /// promoted to UInt64 for `Date` (ColumnVector<UInt16>) and Int64 for `Date32`.
+                if (WhichDataType(removeNullable(source_column.type)).isDate32())
+                    result.value = Field(Int64(bounds.min_int));
+                else if (bounds.min_int >= 0 && bounds.min_int <= std::numeric_limits<UInt16>::max())
+                    result.value = Field(UInt64(bounds.min_int));
+                else
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                        "add_files: date {} of column '{}' in file {} is out of the range of the table column type {}",
+                        bounds.min_int, source_column.name, file.registration_path, source_column.type->getName());
+            }
+            else if (is_timestamp)
+            {
+                /// Mirrors the native writer: a DateTime64 partition column carries its raw
+                /// decimal value (scale <= 6, i.e. microseconds for Iceberg timestamp types).
+                auto scale = getDecimalScale(*removeNullable(source_column.type));
+                result.value = Field(DecimalField<Decimal64>(Decimal64(bounds.min_int), scale));
+            }
+            else
+            {
+                result.value = Field(bounds.min_int);
+            }
+        }
+        else
+        {
+            result.value = Field(bounds.min_str);
+        }
+        result.type = source_column.type;
+        return result;
+    }
+
+    if (bounds.kind != SourceValueKind::Integer && transform_name != "truncate")
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "add_files: partition field '{}' applies transform '{}' to a non-numeric column '{}'",
+            field_name, transform, source_column.name);
+
+    auto days_of = [&](Int64 v) { return is_timestamp ? floorDiv(v, 86400000000LL) : v; };
+    auto year_of = [&](Int64 v)
+    {
+        Int64 y;
+        unsigned m, d;
+        civilFromDays(days_of(v), y, m, d);
+        return y - 1970;
+    };
+    auto month_of = [&](Int64 v)
+    {
+        Int64 y;
+        unsigned m, d;
+        civilFromDays(days_of(v), y, m, d);
+        return (y - 1970) * 12 + static_cast<Int64>(m) - 1;
+    };
+
+    Int64 lo = bounds.min_int;
+    Int64 hi = bounds.max_int;
+    Int64 lo_transformed = 0;
+    Int64 hi_transformed = 0;
+
+    if (transform_name == "year")
+    {
+        lo_transformed = year_of(lo);
+        hi_transformed = year_of(hi);
+    }
+    else if (transform_name == "month")
+    {
+        lo_transformed = month_of(lo);
+        hi_transformed = month_of(hi);
+    }
+    else if (transform_name == "day" || transform_name == "days" || transform_name == "date" || transform_name == "dates")
+    {
+        lo_transformed = days_of(lo);
+        hi_transformed = days_of(hi);
+    }
+    else if (transform_name == "hour" || transform_name == "hours")
+    {
+        lo_transformed = floorDiv(lo, 3600000000LL);
+        hi_transformed = floorDiv(hi, 3600000000LL);
+    }
+    else if (transform_name == "truncate")
+    {
+        if (bounds.kind == SourceValueKind::String)
+        {
+            String lo_trunc = truncateToCodePoints(bounds.min_str, static_cast<size_t>(transform_argument));
+            String hi_trunc = truncateToCodePoints(bounds.max_str, static_cast<size_t>(transform_argument));
+            if (lo_trunc != hi_trunc)
+                throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                    "add_files: file {} spans more than one partition: truncated values of column '{}' differ",
+                    file.registration_path, source_column.name);
+            result.value = Field(lo_trunc);
+            result.type = source_column.type;
+            return result;
+        }
+        lo_transformed = lo - ((lo % transform_argument + transform_argument) % transform_argument);
+        hi_transformed = hi - ((hi % transform_argument + transform_argument) % transform_argument);
+    }
+    else
+    {
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+            "add_files: partition field '{}' uses unsupported transform '{}'", field_name, transform);
+    }
+
+    if (lo_transformed != hi_transformed)
+        throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+            "add_files: file {} spans more than one partition: column '{}' maps to different '{}' buckets "
+            "(min {} -> {}, max {} -> {})",
+            file.registration_path, source_column.name, transform_name, lo, lo_transformed, hi, hi_transformed);
+
+    result.value = Field(lo_transformed);
+    result.type = transform_name == "truncate" ? source_column.type : DataTypePtr(std::make_shared<DataTypeInt32>());
+    return result;
+}
+
+String partitionKeyToString(const std::vector<Field> & values)
+{
+    WriteBufferFromOwnString buf;
+    for (const auto & value : values)
+        writeString(applyVisitor(FieldVisitorToString(), value), buf);
+    return buf.str();
+}
+
+/// Collect the paths of all data files live in the current snapshot, for duplicate detection.
+std::unordered_set<String> listLiveDataFiles(
+    Poco::JSON::Object::Ptr metadata,
+    const IcebergPathResolver & resolver,
+    const ObjectStoragePtr & object_storage,
+    const FormatSettings & format_settings)
+{
+    std::unordered_set<String> live_paths;
+    String manifest_list = getCurrentManifestListPath(metadata);
+    if (manifest_list.empty())
+        return live_paths;
+
+    auto read_avro = [&](const String & path)
+    {
+        auto buffer = object_storage->readObject(
+            StoredObject(resolver.resolve(IcebergPathFromMetadata::deserialize(path))), ReadSettings{});
+        return AvroForIcebergDeserializer(std::move(buffer), IcebergPathFromMetadata::deserialize(path), format_settings);
+    };
+
+    auto manifest_list_reader = read_avro(manifest_list);
+    for (size_t i = 0; i < manifest_list_reader.rows(); ++i)
+    {
+        /// Only data manifests (content == 0) hold data files.
+        if (manifest_list_reader.getValueFromRowByName(i, Iceberg::f_content, TypeIndex::Int32).safeGet<Int32>() != 0)
+            continue;
+        String manifest_path = manifest_list_reader.getValueFromRowByName(i, Iceberg::f_manifest_path).safeGet<String>();
+        auto manifest_reader = read_avro(manifest_path);
+        for (size_t j = 0; j < manifest_reader.rows(); ++j)
+        {
+            auto entry = manifest_reader.getParsedManifestFileEntry(j);
+            if (entry->status != ManifestEntryStatus::DELETED)
+                live_paths.insert(entry->file_path_key.serialize());
+        }
+    }
+    return live_paths;
+}
+
+/// Whether the table metadata that `catalog` currently points to contains a snapshot with `snapshot_id`.
+/// Resolves the "commit state unknown" case. Throws if the catalog or the metadata file cannot be read,
+/// so that the caller never treats an unknown state as "not committed".
+bool isSnapshotInCatalogMetadata(
+    const std::shared_ptr<DataLake::ICatalog> & catalog,
+    const String & table_name,
+    Int64 snapshot_id,
+    const PersistentTableComponents & persistent_components,
+    const DataLakeStorageSettings & data_lake_settings,
+    const ObjectStoragePtr & object_storage,
+    const ContextPtr & context,
+    LoggerPtr log)
+{
+    const auto metadata_file_info = getLatestMetadataFileAndVersionWithCatalog(
+        object_storage,
+        catalog,
+        table_name,
+        persistent_components.table_path,
+        data_lake_settings,
+        persistent_components.metadata_cache,
+        context,
+        log.get(),
+        persistent_components.table_uuid,
+        persistent_components.metadata_compression_method);
+    auto metadata = getMetadataJSONObject(
+        metadata_file_info.path,
+        object_storage,
+        persistent_components.metadata_cache,
+        context,
+        log,
+        metadata_file_info.compression_method,
+        persistent_components.table_uuid);
+
+    if (!metadata->has(Iceberg::f_snapshots))
+        return false;
+    for (const auto & snapshot_var : *metadata->getArray(Iceberg::f_snapshots))
+    {
+        if (snapshot_var.extract<Poco::JSON::Object::Ptr>()->getValue<Int64>(Iceberg::f_metadata_snapshot_id) == snapshot_id)
+            return true;
+    }
+    return false;
+}
+
+Pipe resultToPipe(const AddFilesResult & result)
+{
+    Block header{
+        ColumnWithTypeAndName(std::make_shared<DataTypeString>(), "metric_name"),
+        ColumnWithTypeAndName(std::make_shared<DataTypeInt64>(), "metric_value"),
+    };
+
+    MutableColumns columns = header.cloneEmptyColumns();
+    auto add = [&](const char * name, Int64 value)
+    {
+        columns[0]->insert(String(name));
+        columns[1]->insert(value);
+    };
+
+    add("files_registered", result.files_registered);
+    add("rows_registered", result.rows_registered);
+    add("bytes_registered", result.bytes_registered);
+    add("partitions_touched", result.partitions_touched);
+    add("manifests_written", result.manifests_written);
+
+    const size_t rows = columns[0]->size();
+    Chunk chunk(std::move(columns), rows);
+    return Pipe(std::make_shared<SourceFromSingleChunk>(std::make_shared<const Block>(std::move(header)), std::move(chunk)));
+}
+
+}
+
+AddFilesResult addFiles(
+    const std::vector<String> & raw_paths,
+    bool check_duplicate_files,
+    bool allow_missing_columns,
+    ContextPtr context,
+    ObjectStoragePtr object_storage,
+    const DataLakeStorageSettings & data_lake_settings,
+    const PersistentTableComponents & persistent_components,
+    const String & write_format,
+    std::shared_ptr<DataLake::ICatalog> catalog,
+    const String & table_name,
+    ExternalStorageCache & external_storages)
+{
+    if (Poco::toLower(write_format) != "parquet")
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+            "add_files currently supports only Parquet data files, the table's write format is '{}'", write_format);
+
+    const auto & resolver = persistent_components.path_resolver;
+    LoggerPtr log = getLogger("IcebergAddFiles");
+    FormatSettings format_settings = getFormatSettings(context);
+
+    FileNamesGenerator filename_generator(
+        resolver.getTableLocation(),
+        (catalog != nullptr && catalog->isTransactional()),
+        persistent_components.metadata_compression_method,
+        write_format);
+
+    /// With a catalog, the catalog names the current metadata file. Listing the storage instead may pick the
+    /// metadata of another table that shares the location, or miss a commit that is visible only in the catalog.
+    auto get_current_metadata_file = [&]()
+    {
+        return getLatestMetadataFileAndVersionWithCatalog(
+            object_storage,
+            catalog,
+            table_name,
+            persistent_components.table_path,
+            data_lake_settings,
+            persistent_components.metadata_cache,
+            context,
+            log.get(),
+            persistent_components.table_uuid,
+            persistent_components.metadata_compression_method,
+            /* ignore_explicit_metadata_file_path */ false);
+    };
+
+    auto [last_version, metadata_path, compression_method] = get_current_metadata_file();
+    filename_generator.setVersion(last_version + 1);
+
+    Poco::JSON::Object::Ptr metadata = getMetadataJSONObject(
+        metadata_path,
+        object_storage,
+        persistent_components.metadata_cache,
+        context,
+        log,
+        compression_method,
+        persistent_components.table_uuid);
+
+    const Int64 original_schema_id = metadata->getValue<Int64>(Iceberg::f_current_schema_id);
+    const Int64 partition_spec_id = metadata->getValue<Int64>(Iceberg::f_default_spec_id);
+    Poco::JSON::Object::Ptr partition_spec = lookupPartitionSpec(metadata, partition_spec_id);
+    Poco::JSON::Object::Ptr current_schema = lookupSchema(metadata, original_schema_id);
+    Poco::JSON::Array::Ptr schema_fields = current_schema->getArray(Iceberg::f_fields);
+
+    /// Column path -> field id and back, over all (including nested) leaf fields.
+    std::unordered_map<String, Int64> column_path_to_field_id = IcebergSchemaProcessor::traverseSchema(schema_fields);
+    std::unordered_map<Int64, String> field_id_to_column_path;
+    for (const auto & [path, id] : column_path_to_field_id)
+        field_id_to_column_path.emplace(id, path);
+
+    /// Iceberg primitive type per field id (for date/timestamp transform scaling).
+    auto iceberg_type_by_field_id = collectIcebergTypesByFieldId(schema_fields);
+
+    /// Source columns for partition fields, from the ClickHouse schema (top-level fields only).
+    /// The schema processor is populated lazily (e.g. by reads or native writes); on a freshly
+    /// created table this add_files call may be the first operation, so register the current
+    /// schema ourselves first.
+    if (!persistent_components.schema_processor->hasClickHouseTableSchemaById(static_cast<Int32>(original_schema_id)))
+        persistent_components.schema_processor->addIcebergTableSchema(current_schema, context);
+    auto clickhouse_schema = persistent_components.schema_processor->getClickHouseTableSchemaById(static_cast<Int32>(original_schema_id));
+    Block sample_block;
+    for (const auto & name_and_type : *clickhouse_schema)
+        sample_block.insert(ColumnWithTypeAndName(name_and_type.type, name_and_type.name));
+    SharedHeader shared_sample_block = std::make_shared<const Block>(sample_block);
+
+    std::unordered_map<Int64, NameAndTypePair> source_columns;
+    Poco::JSON::Array::Ptr spec_fields = partition_spec->getArray(Iceberg::f_fields);
+    for (const auto & spec_field_var : *spec_fields)
+    {
+        auto spec_field = spec_field_var.extract<Poco::JSON::Object::Ptr>();
+        Int64 source_id = spec_field->getValue<Int64>(Iceberg::f_source_id);
+        auto path_it = field_id_to_column_path.find(source_id);
+        if (path_it == field_id_to_column_path.end())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "add_files: partition spec refers to source id {} which is not in the current schema", source_id);
+        if (path_it->second.find('.') != String::npos)
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+                "add_files: partition source column '{}' is nested; only top-level partition columns are supported", path_it->second);
+        auto type_it = std::find_if(clickhouse_schema->begin(), clickhouse_schema->end(),
+            [&](const NameAndTypePair & nt) { return nt.name == path_it->second; });
+        if (type_it == clickhouse_schema->end())
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Column {} not found in ClickHouse schema", path_it->second);
+        source_columns.emplace(source_id, *type_it);
+    }
+
+    /// Expand trailing-slash paths. Registration paths are kept exactly as given (or produced
+    /// by expansion): they must be in metadata form, i.e. prefixed by the table location, which
+    /// is the same form native writes register in manifests.
+    std::vector<String> paths = expandPaths(raw_paths, resolver, object_storage, log);
+    for (const auto & path : paths)
+    {
+        if (!endsWithParquet(path))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "add_files: only .parquet files can be registered, got '{}'", path);
+    }
+
+    /// Read every file once: footer statistics + bounds.
+    std::vector<AnalyzedFile> analyzed_files;
+    analyzed_files.reserve(paths.size());
+    for (const auto & path : paths)
+        analyzed_files.push_back(analyzeFile(path, resolver, object_storage, column_path_to_field_id, iceberg_type_by_field_id, context, format_settings));
+
+    /// Validate the file's columns against the table schema. A missing column reads as NULL, which a
+    /// required field must never return, so `allow_missing_columns` applies to optional fields only.
+    const auto required_field_ids = collectRequiredFieldIds(schema_fields);
+    for (const auto & file : analyzed_files)
+    {
+        for (const auto & [field_path, field_id] : column_path_to_field_id)
+        {
+            if (!iceberg_type_by_field_id.contains(field_id))
+                continue;
+            if (file.bounds_by_field_id.contains(static_cast<Int32>(field_id)))
+            {
+                /// A required field must have a value in every row. Readers return the type default or fail
+                /// for nulls in it, so the file must prove that the column has none.
+                if (required_field_ids.contains(field_id) && !file.non_nullable_field_ids.contains(static_cast<Int32>(field_id)))
+                {
+                    auto null_count_it = file.complete_null_counts.find(static_cast<Int32>(field_id));
+                    if (null_count_it == file.complete_null_counts.end())
+                        throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                            "add_files: column '{}' of file {} is required in the table schema, but the file may contain "
+                            "nulls in it: the column is optional in the file and the parquet footer has no complete null counts",
+                            field_path, file.registration_path);
+                    if (null_count_it->second != 0)
+                        throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                            "add_files: column '{}' of file {} is required in the table schema, but the file contains {} null(s) in it",
+                            field_path, file.registration_path, null_count_it->second);
+                }
+                continue;
+            }
+            if (required_field_ids.contains(field_id))
+                throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                    "add_files: file {} lacks column '{}', which is required in the table schema",
+                    file.registration_path, field_path);
+            if (!allow_missing_columns)
+                throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                    "add_files: file {} lacks column '{}' present in the table schema; "
+                    "pass allow_missing_columns = 1 to register it anyway (its values will read as NULL)",
+                    file.registration_path, field_path);
+        }
+    }
+
+    /// Derive (and validate) the partition tuple of every file, then group files by tuple.
+    struct PartitionGroup
+    {
+        std::vector<String> partition_columns;
+        std::vector<Field> partition_values;
+        DataTypes partition_types;
+        std::vector<size_t> file_indices;
+    };
+    std::map<String, PartitionGroup> groups;
+    for (size_t i = 0; i < analyzed_files.size(); ++i)
+    {
+        std::vector<Field> tuple;
+        std::vector<String> names;
+        DataTypes types;
+        for (const auto & spec_field_var : *spec_fields)
+        {
+            auto field_value = derivePartitionField(
+                spec_field_var.extract<Poco::JSON::Object::Ptr>(), analyzed_files[i], source_columns, iceberg_type_by_field_id);
+            names.push_back(field_value.column_name);
+            tuple.push_back(field_value.value);
+            types.push_back(field_value.type);
+        }
+        String key = partitionKeyToString(tuple);
+        auto [it, inserted] = groups.try_emplace(key);
+        if (inserted)
+        {
+            it->second.partition_columns = names;
+            it->second.partition_values = tuple;
+            it->second.partition_types = types;
+        }
+        it->second.file_indices.push_back(i);
+    }
+
+    /// Duplicate detection against the current snapshot and inside the input set.
+    if (check_duplicate_files)
+    {
+        std::unordered_set<String> seen;
+        for (const auto & file : analyzed_files)
+        {
+            if (!seen.insert(file.registration_path).second)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "add_files: file '{}' is listed twice in the input", file.registration_path);
+        }
+    }
+
+    /// Repeated on every retry: a concurrent commit may have registered the same files.
+    auto check_files_not_registered = [&]()
+    {
+        if (!check_duplicate_files)
+            return;
+        auto live_files = listLiveDataFiles(metadata, resolver, object_storage, format_settings);
+        for (const auto & file : analyzed_files)
+        {
+            if (live_files.contains(file.registration_path))
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "add_files: file '{}' is already registered in the current snapshot", file.registration_path);
+        }
+    };
+    check_files_not_registered();
+
+    const bool catalog_is_transactional = catalog && catalog->isTransactional();
+
+    /// Commit: one manifest per partition tuple, one manifest list, one append snapshot.
+    AddFilesResult result;
+    result.partitions_touched = static_cast<Int64>(groups.size());
+
+    size_t retry = 0;
+    static constexpr size_t max_retries = 100;
+    while (true)
+    {
+        auto metadata_info = filename_generator.generateMetadataPathWithInfo();
+
+        Int64 parent_snapshot = -1;
+        if (metadata->has(Iceberg::f_current_snapshot_id) && !metadata->isNull(Iceberg::f_current_snapshot_id))
+            parent_snapshot = metadata->getValue<Int64>(Iceberg::f_current_snapshot_id);
+
+        Int64 total_files = 0;
+        Int64 total_rows = 0;
+        Int64 total_bytes = 0;
+        for (const auto & file : analyzed_files)
+        {
+            ++total_files;
+            total_rows += file.stats.record_count;
+            total_bytes += file.stats.file_size_in_bytes;
+        }
+
+        auto [new_snapshot, manifest_list_path] = MetadataGenerator(metadata).generateNextMetadata(
+            filename_generator, metadata_info.path, parent_snapshot,
+            total_files, total_rows, total_bytes, static_cast<Int64>(groups.size()),
+            /* added_delete_files */ 0, /* num_deleted_rows */ 0);
+        const auto storage_manifest_list_name = resolver.resolve(manifest_list_path);
+
+        std::vector<IcebergPathFromMetadata> manifest_paths;
+        std::vector<Int64> manifest_lengths;
+        std::vector<Int64> manifest_row_counts;
+        std::vector<std::vector<std::pair<Field, DataTypePtr>>> manifest_partition_summaries;
+        bool published = false;
+
+        auto cleanup = [&](bool retry_because_of_metadata_conflict)
+        {
+            /// The new snapshot may be visible: its files must stay, even if that leaves orphans.
+            if (published)
+            {
+                LOG_INFO(log, "Not removing the new manifest files: the new snapshot may already be visible");
+                return;
+            }
+            for (size_t i = 0; i < manifest_paths.size(); ++i)
+                object_storage->removeObjectIfExists(StoredObject(resolver.resolve(manifest_paths[i])));
+            object_storage->removeObjectIfExists(StoredObject(storage_manifest_list_name));
+
+            if (retry_because_of_metadata_conflict)
+            {
+                auto [new_version, new_metadata_path, new_compression] = get_current_metadata_file();
+                filename_generator.setVersion(new_version + 1);
+                metadata = getMetadataJSONObject(
+                    new_metadata_path, object_storage, persistent_components.metadata_cache,
+                    context, log, new_compression, persistent_components.table_uuid);
+
+                if (metadata->getValue<Int64>(Iceberg::f_current_schema_id) != original_schema_id)
+                    throw Exception(ErrorCodes::METADATA_MISMATCH,
+                        "Table schema changed during add_files; restart the command");
+                if (metadata->getValue<Int64>(Iceberg::f_default_spec_id) != partition_spec_id)
+                    throw Exception(ErrorCodes::METADATA_MISMATCH,
+                        "Table partition spec changed during add_files; restart the command");
+                check_files_not_registered();
+            }
+        };
+
+        try
+        {
+            /// Write one manifest per partition tuple.
+            for (const auto & [key, group] : groups)
+            {
+                auto manifest_path = filename_generator.generateManifestEntryName();
+                auto storage_manifest_name = resolver.resolve(manifest_path);
+                auto buffer = object_storage->writeObject(
+                    StoredObject(storage_manifest_name), WriteMode::Rewrite, std::nullopt,
+                    DBMS_DEFAULT_BUFFER_SIZE, context->getWriteSettings());
+
+                std::vector<IcebergPathFromMetadata> group_paths;
+                std::vector<UInt64> group_row_counts;
+                std::vector<UInt64> group_byte_counts;
+                std::vector<IcebergSerializedFileStats> group_stats;
+                Int64 group_rows = 0;
+                for (size_t idx : group.file_indices)
+                {
+                    group_paths.push_back(IcebergPathFromMetadata::deserialize(analyzed_files[idx].registration_path));
+                    group_row_counts.push_back(static_cast<UInt64>(analyzed_files[idx].stats.record_count));
+                    group_byte_counts.push_back(static_cast<UInt64>(analyzed_files[idx].stats.file_size_in_bytes));
+                    group_stats.push_back(analyzed_files[idx].stats);
+                    group_rows += analyzed_files[idx].stats.record_count;
+                }
+
+                generateManifestFile(
+                    metadata,
+                    group.partition_columns,
+                    group.partition_values,
+                    group.partition_types,
+                    group_paths,
+                    group_row_counts,
+                    group_byte_counts,
+                    /* data_file_statistics */ std::nullopt,
+                    shared_sample_block,
+                    new_snapshot,
+                    write_format,
+                    partition_spec,
+                    partition_spec_id,
+                    *buffer,
+                    FileContentType::DATA,
+                    /* user_defined_sequence_number */ std::nullopt,
+                    /* user_defined_snapshot_id */ std::nullopt,
+                    /* data_file_formats */ {},
+                    /* per_file_statistics */ {},
+                    /* data_file_sort_order_ids */ {},
+                    /* per_file_entry_lineage */ {},
+                    /* schema_to_serialize */ nullptr,
+                    /* per_file_fresh_statistics */ nullptr,
+                    /* per_file_stats */ group_stats);
+                buffer->finalize();
+
+                manifest_paths.push_back(manifest_path);
+                manifest_lengths.push_back(static_cast<Int64>(buffer->count()));
+                manifest_row_counts.push_back(group_rows);
+
+                std::vector<std::pair<Field, DataTypePtr>> summary;
+                summary.reserve(group.partition_values.size());
+                for (size_t i = 0; i < group.partition_values.size(); ++i)
+                    summary.emplace_back(group.partition_values[i], group.partition_types[i]);
+                manifest_partition_summaries.push_back(std::move(summary));
+            }
+
+            {
+                auto buffer_manifest_list = object_storage->writeObject(
+                    StoredObject(storage_manifest_list_name), WriteMode::Rewrite, std::nullopt,
+                    DBMS_DEFAULT_BUFFER_SIZE, context->getWriteSettings());
+                generateManifestList(
+                    resolver, metadata, object_storage, external_storages, context,
+                    manifest_paths, new_snapshot, manifest_lengths, *buffer_manifest_list,
+                    FileContentType::DATA, /* use_previous_snapshots */ true,
+                    /* per_entry_content_types */ {},
+                    /* entry_counts */ {},
+                    /* carry_forward_manifest_paths */ {},
+                    /* entry_partition_spec_ids */ {},
+                    /* entry_partition_summaries */ manifest_partition_summaries,
+                    /* previous_manifest_actions */ {},
+                    /* entry_row_counts */ manifest_row_counts);
+                buffer_manifest_list->finalize();
+            }
+
+            {
+                /// A transactional catalog builds the new metadata itself, so the changed property is sent with the commit.
+                std::map<String, String> properties_to_set;
+                if (auto name_mapping = updateDefaultNameMapping(metadata, lookupSchema(metadata, original_schema_id)))
+                    properties_to_set.emplace(name_mapping_property, *name_mapping);
+                std::string json_representation = stringifyJSON(metadata, 4);
+
+                /// A transactional catalog writes the metadata file itself, as for native inserts.
+                if (!catalog_is_transactional)
+                {
+                    auto hint_path = filename_generator.generateVersionHint();
+                    if (!writeMetadataFileAndVersionHint(
+                            resolver, metadata_info, json_representation, hint_path, object_storage, context,
+                            data_lake_settings[DataLakeStorageSetting::iceberg_use_version_hint]))
+                    {
+                        cleanup(true);
+                        if (++retry >= max_retries)
+                            throw Exception(ErrorCodes::LIMIT_EXCEEDED, "add_files: too many metadata conflicts, giving up");
+                        continue;
+                    }
+                    /// The metadata file and version hint in storage now name the new snapshot.
+                    published = true;
+                }
+
+                if (catalog)
+                {
+                    auto catalog_filename = resolver.resolveForCatalog(metadata_info.path);
+                    const auto & [namespace_name, table] = DataLake::parseTableName(table_name);
+
+                    if (!catalog_is_transactional)
+                    {
+                        /// The snapshot is already visible through storage: deleting its files would break it, and a
+                        /// retry would build on it. Keep the files and report the error.
+                        if (!catalog->updateMetadataAndProperties(
+                                namespace_name, table, catalog_filename, new_snapshot, properties_to_set, context->getForwardedAuthToken()))
+                            throw Exception(
+                                ErrorCodes::DATALAKE_DATABASE_ERROR,
+                                "add_files: Iceberg metadata {} of table {}.{} was committed to storage, but the catalog rejected "
+                                "the update of the table pointer. The table in storage is consistent; the catalog still names "
+                                "the previous metadata",
+                                catalog_filename, namespace_name, table);
+                    }
+                    else
+                    {
+                        bool updated = false;
+                        std::exception_ptr update_exception;
+                        try
+                        {
+                            updated = catalog->updateMetadataAndProperties(
+                                namespace_name, table, catalog_filename, new_snapshot, properties_to_set, context->getForwardedAuthToken());
+                        }
+                        catch (...)
+                        {
+                            update_exception = std::current_exception();
+                        }
+
+                        if (!updated)
+                        {
+                            /// Commit state unknown: the catalog may have applied the update although the client saw
+                            /// a failure. Until the catalog proves otherwise, keep the files, even if the check throws.
+                            published = true;
+                            const Int64 new_snapshot_id = new_snapshot->getValue<Int64>(Iceberg::f_metadata_snapshot_id);
+                            if (isSnapshotInCatalogMetadata(
+                                    catalog, table_name, new_snapshot_id, persistent_components, data_lake_settings,
+                                    object_storage, context, log))
+                            {
+                                LOG_INFO(log, "Catalog update for snapshot {} was reported as failed, but the catalog has applied it",
+                                    new_snapshot_id);
+                            }
+                            else
+                            {
+                                /// The update did not land: no snapshot references the new files.
+                                published = false;
+                                if (update_exception)
+                                    std::rethrow_exception(update_exception);
+                                cleanup(true);
+                                if (++retry >= max_retries)
+                                    throw Exception(ErrorCodes::LIMIT_EXCEEDED, "add_files: too many catalog conflicts, giving up");
+                                continue;
+                            }
+                        }
+                    }
+                }
+                published = true;
+            }
+
+            persistent_components.invalidateMetadataCache();
+        }
+        catch (...)
+        {
+            if (published)
+            {
+                tryLogCurrentException(log,
+                    "Post-publish work failed after Iceberg snapshot was committed by add_files; "
+                    "skipping manifest cleanup to preserve the published snapshot");
+            }
+            else
+            {
+                cleanup(false);
+            }
+            throw;
+        }
+
+        result.files_registered = total_files;
+        result.rows_registered = total_rows;
+        result.bytes_registered = total_bytes;
+        result.manifests_written = static_cast<Int64>(manifest_paths.size());
+        return result;
+    }
+}
+
+Pipe executeAddFiles(
+    const ASTPtr & args,
+    ContextPtr context,
+    ObjectStoragePtr object_storage,
+    const DataLakeStorageSettings & data_lake_settings,
+    const PersistentTableComponents & persistent_components,
+    const String & write_format,
+    std::shared_ptr<DataLake::ICatalog> catalog,
+    const String & table_name,
+    ExternalStorageCache & external_storages)
+{
+    auto parsed = makeSchema().parse(args);
+    std::vector<String> paths = parsePathsArgument(parsed.get("paths"));
+    bool check_duplicates = parsed.getAs<UInt64>("check_duplicate_files") != 0;
+    bool allow_missing = parsed.getAs<UInt64>("allow_missing_columns") != 0;
+
+    auto result = addFiles(
+        paths, check_duplicates, allow_missing,
+        context, object_storage, data_lake_settings, persistent_components,
+        write_format, catalog, table_name, external_storages);
+
+    return resultToPipe(result);
+}
+
+}
+}
+
+#endif

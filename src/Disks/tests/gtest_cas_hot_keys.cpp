@@ -155,10 +155,10 @@ TEST(CASHotKeys, SubmissionsOfOneKeyAreSerializedInArrivalOrder)
         etags.push_back(committed->etag);
     }
     for (size_t i = 1; i < etags.size(); ++i)
-        EXPECT_FALSE(etags[i] == etags[i - 1]);
+        EXPECT_FALSE(identicalToken(etags[i], etags[i - 1]));
     DB::Cas::tests::expectBytes(*backend, "k", "1,2,3,4");
     auto reader = requests.admit();
-    EXPECT_EQ(reader.read("k", Retry::standard())->etag, etags.back());
+    EXPECT_EQ(tokenText(reader.read("k", Retry::standard())->etag), tokenText(etags.back()));
     EXPECT_EQ(hot_keys.laneCountForTest(), 0u);
     EXPECT_EQ(hot_keys.queueDepthForTest("k"), 0u);
 }
@@ -766,6 +766,6 @@ TEST(CASHotKeys, AnIdenticalCandidateLandedByAnotherServerIsTheEnginesCommit)
     const auto * committed = std::get_if<Committed>(&result);
     ASSERT_NE(committed, nullptr);
     EXPECT_TRUE(committed->resolved_by_read);
-    EXPECT_TRUE(committed->etag == theirs);
+    EXPECT_TRUE(identicalToken(committed->etag, theirs));
     DB::Cas::tests::expectBytes(*backend, "k", "1,2");
 }

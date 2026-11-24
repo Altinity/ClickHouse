@@ -424,7 +424,7 @@ using MountObservationMap = std::map<String, MountIncarnationObservation>;
 
 /// GC heartbeat gate (GC round protocol step 1). Run by the GC leader at the top of a round: LIST
 /// `gc/server-roots/` (O(servers), single-digit counts), GET each mount body, and classify + fence out
-/// dead mounts (liveness only — graduation itself paces on GC rounds, not on heartbeat acks).
+/// dead mounts (liveness only — row decisions pace on GC rounds, not on heartbeat acks).
 /// Classification per body:
 ///   - `gc_fenced` already set → excluded (`already_fenced`); a fenced mount is terminal, no PUT;
 ///   - terminated (`min_active_build_sequence == UINT64_MAX`, the farewell sentinel stamped by

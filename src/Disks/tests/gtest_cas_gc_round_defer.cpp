@@ -24,12 +24,13 @@ extern const Event CASGCRefWalkPlansBuilt;
 namespace
 {
 const UInt128 kGc = UInt128(0xAB);
+
 }
 
 TEST(CASGCRoundDefer, PredicateTruthTable)
 {
-    /// threshold=1 (default): defer ONLY when zero shards changed AND no graduation due AND within bound.
-    EXPECT_TRUE (shouldDeferRound(/*changed*/0, /*grad_due*/false, /*since*/0, /*threshold*/1, /*max*/8));
+    /// threshold=1 (default): defer ONLY when zero shards changed, no graduation is due, and within bound.
+    EXPECT_TRUE (shouldDeferRound(0, false, 0, 1, 8));
     EXPECT_FALSE(shouldDeferRound(1, false, 0, 1, 8));   // a shard changed => fold
     EXPECT_FALSE(shouldDeferRound(0, true,  0, 1, 8));   // graduation due => force fold
     EXPECT_FALSE(shouldDeferRound(0, false, 8, 1, 8));   // defer bound reached => force fold
@@ -41,7 +42,7 @@ TEST(CASGCRoundDefer, PredicateTruthTable)
     EXPECT_FALSE(shouldDeferRound(2, false, 8, 3, 8));   // bound reached => force fold
 }
 
-/// `graduationDue` reads ZERO-I/O from the adopted seal's `condemned_summary`. An
+/// `rowDecisionDue` reads ZERO-I/O from the adopted seal's `condemned_summary`. An
 /// entry whose oldest non-pending condemn round crosses current_round forces it true; a delete_pending
 /// entry forces it true regardless of the round; otherwise false.
 TEST(CASGCRoundDefer, GraduationDueDetectsDuePendingAndRoundCrossing)
@@ -59,9 +60,9 @@ TEST(CASGCRoundDefer, GraduationDueDetectsDuePendingAndRoundCrossing)
     OperationForTest raw_op(*backend);
     const GcState state = decodeGcState((*raw_op).read(layout.gcStateKey(), Retry::once())->bytes);
 
-    EXPECT_FALSE(gc.graduationDueForTest(state, /*current_round=*/2))
+    EXPECT_FALSE(gc.rowDecisionDueForTest(state, /*current_round=*/2))
         << "oldest non-pending condemn round (2) is not < current_round (2); not yet due to graduate";
-    EXPECT_TRUE(gc.graduationDueForTest(state, /*current_round=*/3))
+    EXPECT_TRUE(gc.rowDecisionDueForTest(state, /*current_round=*/3))
         << "oldest non-pending condemn round (2) < current_round (3) => due to graduate";
 
     /// Re-adopt a seal whose summary entry is delete_pending: due regardless of the round.
@@ -70,11 +71,11 @@ TEST(CASGCRoundDefer, GraduationDueDetectsDuePendingAndRoundCrossing)
                               .oldest_nonpending_condemn_round = std::numeric_limits<uint64_t>::max()}}});
     const GcState state_pending = decodeGcState((*raw_op).read(layout.gcStateKey(), Retry::once())->bytes);
 
-    EXPECT_TRUE(gc.graduationDueForTest(state_pending, /*current_round=*/0))
-        << "a delete_pending entry must force graduationDue true regardless of current_round";
+    EXPECT_TRUE(gc.rowDecisionDueForTest(state_pending, /*current_round=*/0))
+        << "a delete_pending entry must force rowDecisionDue true regardless of current_round";
 }
 
-/// graduationDue fail-closed: when the adopted seal OBJECT is deleted out from under gc/state, the signal
+/// rowDecisionDue fail-closed: when the adopted seal OBJECT is deleted out from under gc/state, the signal
 /// must be TRUE (forces the fold so the round's own fail-closed path surfaces the corrupt bookkeeping),
 /// never a silent defer.
 TEST(CASGCRoundDefer, GraduationDueFailsClosedWhenSealMissing)
@@ -95,11 +96,11 @@ TEST(CASGCRoundDefer, GraduationDueFailsClosedWhenSealMissing)
     ASSERT_EQ((*raw_op).remove(seal_key, h->etag, Retry::once()), Removal::Removed);
 
     Gc gc(store, kGc);
-    EXPECT_TRUE(gc.graduationDueForTest(state, /*current_round=*/5))
+    EXPECT_TRUE(gc.rowDecisionDueForTest(state, /*current_round=*/5))
         << "a missing adopted seal must fail-closed to a forced fold";
 }
 
-/// graduationDue is FALSE on a TOTAL all-zero summary: nothing condemned in any shard => nothing due.
+/// rowDecisionDue is FALSE on a TOTAL all-zero summary: nothing condemned in any shard => nothing due.
 TEST(CASGCRoundDefer, GraduationDueFalseOnAllZeroSummary)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -113,14 +114,14 @@ TEST(CASGCRoundDefer, GraduationDueFalseOnAllZeroSummary)
     const GcState state = decodeGcState((*raw_op).read(layout.gcStateKey(), Retry::once())->bytes);
 
     Gc gc(store, kGc);
-    EXPECT_FALSE(gc.graduationDueForTest(state, /*current_round=*/9))
+    EXPECT_FALSE(gc.rowDecisionDueForTest(state, /*current_round=*/9))
         << "an all-zero total summary means nothing is due to graduate";
 
     /// Fail-closed if the summary is NOT total over gc_shards (shard 1 missing).
     injectCondemnedSummarySeal(*backend, layout, /*generation*/1, /*attempt*/1, /*gc_shards*/2,
         {{0, CondemnedSummary{}}});
     const GcState partial = decodeGcState((*raw_op).read(layout.gcStateKey(), Retry::once())->bytes);
-    EXPECT_TRUE(gc.graduationDueForTest(partial, /*current_round=*/9))
+    EXPECT_TRUE(gc.rowDecisionDueForTest(partial, /*current_round=*/9))
         << "a summary not total over gc_shards is corrupt => fail-closed force-fold";
 }
 
@@ -426,7 +427,7 @@ TEST(CASGCRoundDefer, DeferredRoundRetriesPartialJanitorPageAtForcedFoldWithoutP
 
     backend->resetCounts();
     std::vector<GcPhaseRecord> phases;
-    Gc gc(store, kGc);
+    Gc gc(store, kGc, [] { return 1001; });
     gc.setPhaseSink([&](const GcPhaseRecord & phase) { phases.push_back(phase); });
     const uint64_t plans_before
         = ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt];
@@ -490,7 +491,7 @@ TEST(CASGCRoundDefer, DeferredRoundRetriesPartialJanitorPageAtForcedFoldWithoutP
     EXPECT_TRUE(completed.state->janitor_cursor.empty());
 }
 
-/// The same idle-defer property under a sharded blob-target GC (gc_shards=2): graduationDue's loop
+/// The same idle-defer property under a sharded blob-target GC (gc_shards=2): rowDecisionDue's loop
 /// over state.retired_refs and `listRefPrefix`'s discovery must both settle to "nothing due" once
 /// quiesced, regardless of how many gc-shards partition the retired bookkeeping.
 TEST(CASGCRoundDefer, IdleRoundDefersUnderShardedGc)
@@ -536,18 +537,11 @@ TEST(CASGCRoundDefer, DueGraduationForcesFoldAndSparesReReferencedBlob)
     runRegularRoundReclaiming(gc);                 /// the condemning round
     store->renewWatermarkOnce();
 
-    /// Drive rounds until the entry graduates (published delete_pending) -- mirrors
-    /// CASGCAckFloor.CondemnThenDeleteNextRoundAfterAcks. It is still PRESENT at that pass, and the
-    /// ack floor is by construction already past its condemn_round (that is what graduated it).
+    /// The condemning round confirmed the intent: the row is pending and the blob still present.
     bool saw_pending = false;
-    for (int i = 0; i < 6 && !saw_pending; ++i)
-    {
-        runRegularRoundReclaiming(gc);
-        store->renewWatermarkOnce();
-        for (const RetiredEntry & e : currentRetiredSet(*backend, store->layout(), /*shard*/0))
-            if (e.ref == DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(blob)} && e.delete_pending)
-                saw_pending = true;
-    }
+    for (const RetiredEntry & e : currentRetiredSet(*backend, store->layout(), /*shard*/0))
+        if (e.ref == DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(blob)} && e.delete_pending)
+            saw_pending = true;
     ASSERT_TRUE(saw_pending) << "entry never reached delete_pending";
     ASSERT_FALSE(blobAbsent(*backend, store->layout(), blob)) << "pending: still present this pass";
 
@@ -557,7 +551,7 @@ TEST(CASGCRoundDefer, DueGraduationForcesFoldAndSparesReReferencedBlob)
     writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("b", blob)});
     publishCommittedTransition(*backend, store->layout(), ns, "tbl2", std::nullopt, r2);
 
-    /// The next pass would otherwise execute B's pending exact-token delete; graduationDue must force
+    /// The next pass would otherwise execute B's pending exact-token delete; rowDecisionDue must force
     /// a FOLD (never a DEFER) so the +1 is folded in and the blob is spared, not deleted.
     const RoundReport rep = runRegularRoundReclaiming(gc);
     EXPECT_FALSE(rep.deferred) << "a due graduation must force a fold, never defer";
@@ -567,15 +561,15 @@ TEST(CASGCRoundDefer, DueGraduationForcesFoldAndSparesReReferencedBlob)
     EXPECT_EQ(fsck.dangling, 0u);
 }
 
-/// Companion to the test above: it proves `graduationDue` is the SOLE fold trigger at the assertion
+/// Companion to the test above: it proves `rowDecisionDue` is the SOLE fold trigger at the assertion
 /// round. `DueGraduationForcesFoldAndSparesReReferencedBlob` opens its store at the DEFAULT
 /// `gc_fold_threshold` (1), so at its assertion round the +1 re-reference ALSO makes
 /// `changed_shards (>= 1) >= fold_threshold (1)` true -- that branch of `shouldDeferRound` would force
-/// the very same fold even if `graduationDue` were deleted or hard-wired false. Here `gc_fold_threshold`
+/// the very same fold even if `rowDecisionDue` were deleted or hard-wired false. Here `gc_fold_threshold`
 /// and `gc_fold_max_defer_rounds` are both set to 1000, so neither the changed-shards branch (one
 /// changed shard is nowhere near 1000) nor the liveness-bound branch (this is round 1) can fire --
-/// `graduationDue` is the ONLY thing in `shouldDeferRound` that can force this round's fold, making
-/// `EXPECT_FALSE(rep.deferred)` below load-bearing for `graduationDue` specifically.
+/// `rowDecisionDue` is the ONLY thing in `shouldDeferRound` that can force this round's fold, making
+/// `EXPECT_FALSE(rep.deferred)` below load-bearing for `rowDecisionDue` specifically.
 TEST(CASGCRoundDefer, DueGraduationIsSoleFoldTriggerAtHighThreshold)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -593,23 +587,30 @@ TEST(CASGCRoundDefer, DueGraduationIsSoleFoldTriggerAtHighThreshold)
     /// object's FIRST-EVER `acquireOrRenewLease` call against a PRE-EXISTING lease it has never observed
     /// refuses to steal it (two-observation safety against stealing from a live incumbent) -- it would
     /// return `acquired_lease=false` and the round would bail out BEFORE the fold-decision code, making
-    /// `EXPECT_FALSE(rep.deferred)` below vacuously true regardless of `graduationDue`. Running this
+    /// `EXPECT_FALSE(rep.deferred)` below vacuously true regardless of `rowDecisionDue`. Running this
     /// warm-up round FIRST makes `gc_id` the observed incumbent, so the assertion round's lease RENEWAL
     /// (not a steal) succeeds unconditionally and the round actually reaches the decision it's testing.
     gc.runRegularRound();
 
     writeBlobBody(*backend, layout, blob);
 
-    /// Seed the adopted fold seal's condemned_summary with B already `delete_pending` (pending_total = 1).
-    /// `graduationDue`
-    /// reads this summary ZERO-I/O from the adopted seal — a `delete_pending` entry forces
-    /// it true regardless of the round. At `gc_fold_threshold = 1000` a real condemn -> graduate pipeline of
-    /// `runRegularRound` calls is not usable to set this up: every round before graduation would ITSELF
-    /// defer (nothing due yet, and changed_shards never nears 1000), so the due-pending summary is injected
-    /// directly instead of driven through real rounds.
-    injectCondemnedSummarySeal(*backend, layout, /*generation*/1, /*attempt*/1, /*gc_shards*/1,
-        {{0, CondemnedSummary{.condemned_total = 1, .pending_total = 1,
-                              .oldest_nonpending_condemn_round = std::numeric_limits<uint64_t>::max()}}});
+    /// Seed the adopted fold seal with B already `delete_pending`: a run holding its row, and a summary that counts it
+    /// (pending_total = 1). `rowDecisionDue` reads this summary ZERO-I/O from the adopted seal — a `delete_pending`
+    /// entry forces it true regardless of the round. At `gc_fold_threshold = 1000` a real condemn -> graduate pipeline
+    /// of `runRegularRound` calls is not usable to set this up: every round before graduation would ITSELF defer
+    /// (nothing due yet, and changed_shards never nears 1000), so the due-pending row is injected directly instead of
+    /// driven through real rounds.
+    {
+        const BlobRef blob_ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(blob)};
+        OperationForTest op(*backend);
+        const std::optional<Meta> body = (*op).head(layout.blobKey(blob_ref), Retry::standard());
+        ASSERT_TRUE(body.has_value());
+        const GcState state = decodeGcState((*op).read(layout.gcStateKey(), Retry::standard())->bytes);
+        injectSourceEdgeRun(*backend, layout, /*shard*/ 0,
+            {SourceEdgeRecord{.ref = blob_ref, .source_id = DB::UInt128{0}, .marker = RunMarker::Condemned,
+                              .delete_pending = true, .token = PersistedEtag::capture(body->etag), .size = 1,
+                              .condemn_round = state.round}});
+    }
 
     /// The +1: a fresh manifest re-references B while it sits `delete_pending` -- one changed shard,
     /// far below the threshold of 1000.
@@ -619,8 +620,8 @@ TEST(CASGCRoundDefer, DueGraduationIsSoleFoldTriggerAtHighThreshold)
 
     const RoundReport rep = gc.runRegularRound();
 
-    /// DISCRIMINATING (load-bearing): with graduationDue intact, the due delete_pending entry forces
-    /// the fold. If graduationDue were broken/hard-wired false, changed_shards (1) < threshold (1000)
+    /// DISCRIMINATING (load-bearing): with rowDecisionDue intact, the due delete_pending entry forces
+    /// the fold. If rowDecisionDue were broken/hard-wired false, changed_shards (1) < threshold (1000)
     /// and the defer bound (1000) is nowhere near reached, so `shouldDeferRound` would return true and
     /// this round would DEFER instead.
     EXPECT_FALSE(rep.deferred) << "a due graduation must be the SOLE fold trigger at a high fold threshold";
@@ -645,7 +646,7 @@ TEST(CASGCRoundDefer, BoundedDeferralForcesFoldWithinWindow)
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", UInt128(1))});
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
 
-    Gc gc(store, kGc);
+    Gc gc(store, kGc, [] { return 1001; });
     for (int i = 0; i < 3; ++i)
     {
         const RoundReport rep = gc.runRegularRound();
@@ -653,4 +654,38 @@ TEST(CASGCRoundDefer, BoundedDeferralForcesFoldWithinWindow)
     }
     const RoundReport rep4 = gc.runRegularRound();
     EXPECT_FALSE(rep4.deferred) << "the 4th round hits the defer bound and must force-fold";
+}
+
+/// With one gc-shard, a table the intake changed makes the shard merge even when the change carries no
+/// blob delta; the next round, with nothing new, carries the shard unchanged.
+TEST(CASGCRoundDefer, OneShardMergesWhenATableChangedWithoutAnyBlobDelta)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Pool::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_shards = 1, .gc_fold_max_defer_rounds = 0});
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 0xAA};
+    writeManifestRaw(*backend, store->layout(), ns, r, {});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    Gc gc(store, kGc);
+    std::vector<GcPhaseRecord> phases;
+    gc.setPhaseSink([&](const GcPhaseRecord & phase) { phases.push_back(phase); });
+    const auto reduceMetrics = [&]() -> std::map<String, UInt64>
+    {
+        const auto it = std::find_if(phases.begin(), phases.end(),
+            [](const GcPhaseRecord & phase) { return phase.phase == "fold_reduce"; });
+        EXPECT_NE(it, phases.end());
+        return it == phases.end() ? std::map<String, UInt64>{} : it->metrics;
+    };
+
+    ASSERT_FALSE(runRegularRoundReclaiming(gc).deferred);
+    const auto changed = reduceMetrics();
+    EXPECT_EQ(changed.at("shards_total"), 1u);
+    EXPECT_EQ(changed.at("deltas_in"), 0u) << "the change must carry no blob delta, or the test proves nothing";
+    EXPECT_EQ(changed.at("shards_pure_carry"), 0u) << "a changed table must merge the shard";
+
+    phases.clear();
+    ASSERT_FALSE(runRegularRoundReclaiming(gc).deferred);
+    EXPECT_EQ(reduceMetrics().at("shards_pure_carry"), 1u) << "positive control: nothing changed, so the shard is carried";
 }

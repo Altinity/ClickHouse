@@ -35,6 +35,11 @@ struct GcState
     uint64_t snap_pruned_through = 0;   /// highest snap generation fully pruned (retention cursor)
     uint64_t snap_attempt = 0;     /// adopted attempt id (folding leader's lease.seq) for snap_generation
     String manifest_sweep_cursor;  /// best-effort orphan part-manifest cleanup cursor; reachability ignores it
+    uint64_t orphan_manifest_sweep_completed_at_ms = 0;
+    String intent_sweep_cursor;    /// best-effort orphan blob-intent cleanup cursor; header 4 only
+    /// The header generation: `encodeGcState` stamps it, `decodeGcState` reports it. `G_BLOB_INTENTS` is the
+    /// barrier an older GC refuses; `intent_sweep_cursor` is valid only at that header.
+    uint32_t header_generation = G_BLOB_INTENTS;
     GcLease lease;
 };
 
@@ -48,6 +53,10 @@ String encodeGcState(const GcState & state);
 /// input, trailing bytes, a missing `gc_shards`, or a zero shard count raises `CORRUPTED_DATA` rather than
 /// falling back to a default state.
 GcState decodeGcState(std::string_view data);
+
+/// Throws `UNKNOWN_FORMAT_VERSION` for a state below header 4: in a generation 4 pool only an older GC bootstrapping
+/// over a deleted state writes one, and its rows do not follow the intent rules.
+void requireGenerationFourGcState(const GcState & state);
 
 /// Advisory liveness state for the GC leader lease. The leader increments `hb_seq` on a fast cadence
 /// independently of round progress, because its lease renewal counter can remain unchanged during a
