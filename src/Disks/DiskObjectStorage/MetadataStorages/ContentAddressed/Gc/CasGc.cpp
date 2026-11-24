@@ -2125,8 +2125,8 @@ struct RefStopPlan
     /// The key read absent right after the last present record of the final epoch. Unset when planning ended
     /// at a terminal record, an undecodable body or the crossing limit.
     std::optional<RefTxnId> stop;
-    /// The hint's ids above the first key.
-    std::vector<RefTxnId> hint_ids;
+    /// The listing named no id above the first key.
+    bool hint_empty = true;
     bool first_present = false;
     uint64_t crossings = 0;
     bool crossing_limit_reached = false;
@@ -2246,7 +2246,7 @@ std::optional<RefStopPlan> planRefStops(GcReadAhead & reads, const Layout & layo
                                         uint64_t & absent_probes, const std::function<bool()> & stop_requested)
 {
     RefStopPlan plan;
-    plan.hint_ids.assign(std::upper_bound(hint.logs.begin(), hint.logs.end(), first), hint.logs.end());
+    plan.hint_empty = std::upper_bound(hint.logs.begin(), hint.logs.end(), first) == hint.logs.end();
 
     bool stopped = false;
     const auto read = [&](const RefTxnId & id) -> std::optional<PlannedRecord>
@@ -2760,7 +2760,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
     ///         absent, a listed id above it   => impossible on the chain, so the store is lying or a
     ///                                           durable record was lost: HOLD the namespace at
     ///                                           classification `Clamped` with its cursor unmoved;
-    ///   (b) the bound of the read-ahead inside an epoch.
+    ///   (b) where planning starts probing in an epoch; the greatest key it reads present bounds the read-ahead.
     ///
     /// An epoch is crossed only through a tombstone, to the successor its body names (`{next_epoch,1}`,
     /// or `{E+1,1}` for one without the field), and the head there must link back to it
@@ -3067,11 +3067,11 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
     /// Bodies planning read, which the walk takes instead of reading them again.
     RetainedRefBodies retained_ref_bodies(ref_plan_retained_bytes);
 
-    /// READ-AHEAD of the hint's ids in `expected`'s epoch, above `expected` and at or below the greatest
-    /// sequence planning read present there, skipping bodies planning kept. Only an id the hint names is
-    /// fetched speculatively: a key written after the hint was built is taken inline, and nothing past the plan
-    /// is read ahead. `budget` is how many more records the walk may take: neither the count of hints nor their
-    /// distance from `expected` exceeds it, so a walk that pauses leaves no fetched result it would fetch again.
+    /// READ-AHEAD of the ids in `expected`'s epoch above `expected` and at or below the greatest sequence planning
+    /// read present there, skipping bodies planning kept. The stop lies above that sequence, so nothing at or past
+    /// it is fetched; a seal below it can waste at most the window, dropped at the crossing. `budget` is how many more records the
+    /// walk may take: neither the count of hints nor their distance from `expected` exceeds it, so a walk that
+    /// pauses leaves no fetched result it would fetch again.
     const auto topUpLookahead = [&](NamespaceIntake & s, size_t budget)
     {
         const size_t limit = std::min<size_t>(reads.window(), budget);
@@ -3081,17 +3081,17 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         const auto present = s.plan.last_present.find(at.writer_epoch);
         if (present == s.plan.last_present.end())
             return;
-        const RefTxnId bound{at.writer_epoch, std::min(present->second, saturatingAdd(at.ref_sequence, budget))};
-        const RefTxnId after = s.lookahead.empty() ? at : s.lookahead.back().first;
-        const std::vector<RefTxnId> & hinted = s.plan.hint_ids;
-        for (auto it = std::upper_bound(hinted.begin(), hinted.end(), after);
-             it != hinted.end() && *it <= bound && s.lookahead.size() < limit; ++it)
+        const uint64_t bound = std::min(present->second, saturatingAdd(at.ref_sequence, budget));
+        uint64_t sequence = (s.lookahead.empty() ? at : s.lookahead.back().first).ref_sequence;
+        while (sequence < bound && s.lookahead.size() < limit)
         {
-            String key = layout.refLogKey(s.life, *it);
+            ++sequence;
+            const RefTxnId id{at.writer_epoch, sequence};
+            String key = layout.refLogKey(s.life, id);
             if (retained_ref_bodies.contains(key))
                 continue;
             reads.hintRead(key, ReadFamily::RefLog);
-            s.lookahead.emplace_back(*it, std::move(key));
+            s.lookahead.emplace_back(id, std::move(key));
         }
     };
 
@@ -3749,7 +3749,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & state_etag,
         s.plan = std::move(*plan);
         ++planning.lives;
         planning.hot += s.plan.first_present;
-        planning.empty_hint += s.plan.hint_ids.empty();
+        planning.empty_hint += s.plan.hint_empty;
         planning.crossings += s.plan.crossings;
         planning.crossing_limit += s.plan.crossing_limit_reached;
         planning.misses += intake_absent_probes - absent_before;
